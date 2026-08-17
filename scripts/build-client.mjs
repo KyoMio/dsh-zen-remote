@@ -36,11 +36,16 @@ async function collectSources(dir, { rel = '' } = {}) {
 const sources = await collectSources(buildDir)
 
 const REQUIRE_RE = /require\("(\.[^"]+\.js)"\)/g
-// Resolve a `./x.js` child relative to its parent module to the canonical
-// forward-slash key used in __modules (e.g. styles/index.js requires
-// "./base.css.js" -> "styles/base.css.js").
+// Resolve a `./x.js` or `../x.js` require relative to its parent module to
+// the canonical forward-slash key used in __modules (e.g. styles/index.js
+// requires "./base.css.js" -> "styles/base.css.js"; effects/header-status.js
+// requires "../session-dot.js" -> "session-dot.js"). posix.join already
+// interprets the leading "./"/"../" itself, so passing the FULL relative
+// string (not the old rel.slice(2), which only stripped "./" and silently
+// mis-resolved "../" into a bogus same-directory path) is both correct and
+// simpler.
 const resolveChild = (parent, rel) => {
-  const joined = posix.join(posix.dirname(parent), rel.slice(2))
+  const joined = posix.join(posix.dirname(parent), rel)
   return joined === '.' ? '' : joined
 }
 

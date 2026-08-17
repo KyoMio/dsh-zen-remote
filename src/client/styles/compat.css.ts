@@ -193,7 +193,7 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     height: 100dvh !important;
     max-height: none !important;
     box-sizing: border-box !important;
-    padding-top: env(safe-area-inset-top, 0px) !important;
+    padding-top: var(--mnav-sat) !important;
     border-radius: 0 !important;
     box-shadow: none !important;
     z-index: 57 !important;
@@ -202,7 +202,7 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
   /* Fullscreen: the column fills the viewport, so the button follows the
      titlebar row down below the notch. */
   [data-mobile-nav="frame"][data-mobile-preview-full] [data-aionui-preview-col] [data-mobile-nav="preview-full-toggle"] {
-    top: calc(env(safe-area-inset-top, 0px) + 8px) !important;
+    top: calc(var(--mnav-sat) + 8px) !important;
   }
   @media (prefers-reduced-motion: reduce) {
     [data-aionui-preview-col],
@@ -422,16 +422,19 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     display: none !important;
   }
 
-  /* ---------- dsh-web-ui polish: conversation stats line ----------
+  /* ---------- conversation stats line ----------
      The official session-status row (turns / steps / LLM time / TTFT /
-     cache) is long. The client marks the exact row with
-     [data-mobile-nav="stats"] (text-anchored, hashed classes can't be
-     targeted). Layout: ONE fixed-height (28px) flex strip that scrolls
-     horizontally — the full metrics stream stays reachable by swiping,
-     the row never grows vertically, no ellipsis or fade, 12px gaps
-     between metric groups, a 2px scrollbar as the swipe affordance. */
+     cache) is long. It is the single entry the official StatsLine puts in
+     conversation.composer.dock, so the structural anchor below reaches it
+     without any DOM marking (S3 deleted the text-matching effect that used
+     to set [data-slot="conversation.composer.dock"] > [class$="_root"]). Layout: ONE fixed-height (28px) flex
+     strip that scrolls horizontally — the full metrics stream stays
+     reachable by swiping, the row never grows vertically, no ellipsis or
+     fade, 12px gaps between metric groups, a 2px scrollbar as the swipe
+     affordance. The phone breakpoint hides the strip outright instead
+     (styles/composer.css.ts — its data moves into the session info card). */
 
-  [data-mobile-nav="stats"] {
+  [data-slot="conversation.composer.dock"] > [class$="_root"] {
     display: flex !important;
     flex-flow: row nowrap !important;
     align-items: center !important;
@@ -453,17 +456,17 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     line-height: 20px !important;
     font-size: 12px !important;
   }
-  [data-mobile-nav="stats"]::-webkit-scrollbar {
+  [data-slot="conversation.composer.dock"] > [class$="_root"]::-webkit-scrollbar {
     height: 2px !important;
   }
-  [data-mobile-nav="stats"]::-webkit-scrollbar-thumb {
+  [data-slot="conversation.composer.dock"] > [class$="_root"]::-webkit-scrollbar-thumb {
     background: var(--dsw-alias-label-tertiary, rgba(0, 0, 0, .3)) !important;
     border-radius: 2px !important;
   }
-  [data-mobile-nav="stats"]::-webkit-scrollbar-track {
+  [data-slot="conversation.composer.dock"] > [class$="_root"]::-webkit-scrollbar-track {
     background: transparent !important;
   }
-  [data-mobile-nav="stats"] > * {
+  [data-slot="conversation.composer.dock"] > [class$="_root"] > * {
     display: flex !important;
     flex: 0 0 auto !important;
     flex-flow: row nowrap !important;
@@ -475,10 +478,10 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     margin-right: 12px !important;
     padding: 0 !important;
   }
-  [data-mobile-nav="stats"] > *:last-child {
+  [data-slot="conversation.composer.dock"] > [class$="_root"] > *:last-child {
     margin-right: 0 !important;
   }
-  [data-mobile-nav="stats"] * {
+  [data-slot="conversation.composer.dock"] > [class$="_root"] * {
     white-space: nowrap !important;
   }
 
@@ -548,5 +551,131 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
   }
   [data-mobile-nav="frame"] [class$="_card"]:has([data-gitgraph-chip-anchor]) {
     padding-top: 40px !important;
+  }
+
+  /* ---------- dsh-better-sidebar: safe area (S2.1, 2026-08-17) ----------
+     THIRD-PARTY COMPAT RULE — dsh-better-sidebar (the workbench the session
+     header's panel button opens). Its shell is viewport-fixed and starts at
+     y=0: the panel at inset 0 (100vw drawer below 768px, a right column
+     above it) and the toggle cluster at top:3px. Neither knows about
+     env(safe-area-inset-*), so on a notched iPhone the whole tab strip —
+     including the one button that CLOSES the panel — sits behind the status
+     bar and cannot be tapped: the user opened the workbench and was stuck
+     there (real-device report, 2026-08-17).
+     Applied across the plugin's whole mobile band, not just <768px: the
+     panel is fixed at top:0 in the 768-1023px range too, so the same notch
+     covers the same tab strip. Zero effect wherever the inset is 0 (every
+     desktop browser, every non-notched device) — desktop is >=1024px and
+     out of this media block entirely.
+     Anchors: the plugin's own mount marker [data-dsh-better-sidebar]
+     (index.tsx) plus class-suffix selectors, per this repo's hashed-class
+     convention. --dsh-title-bar-strip is the plugin's own title-bar-compat
+     offset (set only while that mode is on, 0px fallback otherwise): adding
+     to it keeps both offsets rather than clobbering theirs.
+     !important because their :global(body[...]) rules outrank a plain
+     attribute selector.
+     No box-sizing here on purpose: the panel is position:fixed with BOTH
+     top and bottom set, so its used height already resolves to
+     "containing block - insets - padding - border" (CSS 2.1 10.6.4) and the
+     padding shrinks the content box without any help. Forcing border-box
+     also folds their 1px left border into the inline width — measured as a
+     1px panel-width change at 768px, i.e. a regression outside this
+     hotfix's remit. */
+  [data-dsh-better-sidebar] [class$="_panel"],
+  [data-dsh-better-sidebar] [class$="_panelHidden"] {
+    padding-top: calc(var(--mnav-sat) + var(--dsh-title-bar-strip, 0px)) !important;
+  }
+  /* Only the tablet/desktop range still shows the cluster (see the hide
+     rule below) — the notch offset is now dead weight below 768px, so it
+     is scoped out rather than left applying invisibly. min-width:768px
+     rather than the more common max-width pairing: this offset was
+     already a harmless no-op at >=1024px before S3.1 (--mnav-sat is 0 on
+     every desktop browser), so narrowing its floor to 768px changes
+     nothing there either — it only stops evaluating on phone. */
+  @media (min-width: 768px) {
+    [data-dsh-better-sidebar] [class$="_toggleCluster"] {
+      top: calc(var(--mnav-sat) + var(--dsh-title-bar-strip, 0px) + 3px) !important;
+    }
+  }
+
+  /* ---------- dsh-better-sidebar: hide the phone toggle cluster (S3.1, 2026-08-17) ----------
+     Real-device round 2 feedback: this fixed top-right cluster duplicates
+     — and visually overlaps — the session header's own workbench button
+     (MobileSessionHeader.tsx), which already opens/closes the same panel
+     by clicking this cluster's toggle button through. Hidden below 768px
+     only; the 768-1023px tablet range has no workbench button (header.css.ts
+     scopes that entire reflow to <768px) and still depends on this cluster
+     as its only entry point, so it stays exactly as v1.0.0/S2.1 shipped it
+     there. The cluster also holds the panel's own close affordance — see
+     [data-mobile-nav="better-sidebar-close"] below for the phone
+     replacement, wired up in MobileSessionHeader.tsx. */
+  @media (max-width: 767px) {
+    [data-dsh-better-sidebar] [class$="_toggleCluster"] {
+      display: none !important;
+    }
+  }
+
+  /* ---------- dsh-better-sidebar: phone close button (S3.1 follow-up, 2026-08-17) ----------
+     Appended to document.body by MobileSessionHeader.tsx's
+     MobileHeaderUtilities effect — never inside the panel's own subtree
+     (the third party's React re-renders would wipe it) and never under any
+     transformed/backdrop-filter ancestor (the S4 info-card WebKit lesson in
+     AGENTS.md: position:fixed re-anchors to the nearest such ancestor
+     instead of the viewport). Default hidden — belt-and-braces, same
+     reasoning as header.css.ts's [data-mobile-nav="header-info"] etc list:
+     React does not know about media queries. Shown only below 768px AND
+     only while the panel is actually open: the panel's own class name ends
+     in "_panel" exclusively in the open state (the "_panelHidden" suffix is
+     appended once closed, so the string no longer ends in "_panel") — a
+     pure-CSS :has() open/closed read, no MutationObserver required.
+
+     Bottom-center pill, not a top-right circle (real-device follow-up,
+     2026-08-17): a top-right position collided with the panel's own
+     per-tab toolbar controls — measured live at 390px with the explorer
+     tab open, the panel's Refresh button sits at x:354-382 y:93-121, and a
+     44px circle at top:8px+safe-area/right:8px lands at x:338-382
+     y:(safe-area+8)-(safe-area+52), a direct overlap once the safe-area
+     offset is small (or zero on non-notched phones). Every per-tab toolbar
+     (explorer/git/tabBar) lives at the panel's TOP; nothing in the
+     default explorer or git tabs reaches the bottom 90px of the viewport
+     (checked live, both tabs, 2026-08-17), so bottom-center is clear
+     regardless of which tab is open — one fixed position that does not
+     need per-tab-type coordinates to dodge. */
+  /* Default-hidden for this pill lives in header.css.ts, NOT here: this
+     whole file sits inside the shared (max-width: 1023px) block, so a rule
+     here can never hide anything at desktop widths (learned the hard way,
+     2026-08-17 desktop leak). */
+  @media (max-width: 767px) {
+    body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"] {
+      display: flex !important;
+      position: fixed;
+      left: 50%;
+      bottom: calc(var(--mnav-sab) + 12px);
+      transform: translateX(-50%);
+      z-index: 70;
+      align-items: center;
+      gap: 6px;
+      height: 44px;
+      padding: 0 18px;
+      border: none;
+      border-radius: 999px;
+      background: var(--dsw-alias-bg-base, #fff);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, .2);
+      color: var(--dsw-alias-label-primary, inherit);
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+    body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"] svg {
+      width: 14px;
+      height: 14px;
+      flex: none;
+    }
+    body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"]:active {
+      background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
+    }
   }
 `

@@ -26,10 +26,20 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
      clears the status bar / notch for every in-flow surface (session header,
      messages, composer); the absolutely-positioned drawer is unaffected (its
      containing block is the frame's padding box, i.e. still the frame top). */
+  /* box-sizing: border-box is load-bearing (S2.1, 2026-08-17). The official
+     frame carries height: 100% with the default content-box, so the
+     safe-area padding ADDED 54px to its height instead of taking 54px out
+     of the content area: the frame grew past the viewport, the document
+     became scrollable by exactly the inset, and the very first scroll put
+     the header right back under the notch — measured with
+     ?mobile-nav-inset=54 (frame 898px tall inside an 844px root, html at
+     y=-54). Invisible on every desktop browser because the inset is 0
+     there, which is how it shipped. */
   [data-mobile-nav="frame"] {
     position: relative !important;
+    box-sizing: border-box !important;
     grid-template-columns: minmax(0, 1fr) 0 0 !important;
-    padding-top: env(safe-area-inset-top, 0px) !important;
+    padding-top: var(--mnav-sat) !important;
   }
 
   /* The sidebar column (first grid child) becomes a left drawer. The drawer
@@ -56,7 +66,7 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
        frame's padding box, so the frame's own safe-area padding does NOT
        reach it). The drawer background paints the status-bar strip, which
        the client's theme-color meta matches, so the strip reads seamless. */
-    padding-top: env(safe-area-inset-top, 0px) !important;
+    padding-top: var(--mnav-sat) !important;
     /* Kill the official sidebarCol right border: with the backdrop the edge
        reads cleanly, and the settings dialog (width:100% of this box) stays
        pixel-flush with the drawer. */
@@ -371,15 +381,15 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
        panel overflowing the max-content drawer shifts the fixed overlay's
        coordinate frame, dragging the whole sidebar content off-screen. The
        safe-area inset keeps the sheet below the status bar / notch. */
-    top: calc(env(safe-area-inset-top, 0px) + 12px) !important;
+    top: calc(var(--mnav-sat) + 12px) !important;
     width: calc(100vw - 16px) !important;
     max-width: calc(100vw - 16px) !important;
     /* Height follows the content (no dead space under a short page); it
        caps at 100dvh-24 (less the safe-area top) and the options area
        scrolls only then. */
     height: auto !important;
-    max-height: min(800px, calc(100vh - 24px - env(safe-area-inset-top, 0px))) !important;
-    max-height: min(800px, calc(100dvh - 24px - env(safe-area-inset-top, 0px))) !important;
+    max-height: min(800px, calc(100vh - 24px - var(--mnav-sat))) !important;
+    max-height: min(800px, calc(100dvh - 24px - var(--mnav-sat))) !important;
     flex-direction: column !important;
     border-radius: 14px !important;
     animation: dsh-mobile-nav-sheet-in .22s var(--ds-ease-out, ease-in-out);
@@ -396,8 +406,15 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
     }
   }
   /* The export dialog (not the settings sheet) must never overflow the
-     viewport: the official centered card can be wider than 390px. */
-  [aria-modal="true"]:not(:has(> :first-child > :last-child > button)) {
+     viewport: the official centered card can be wider than 390px.
+     :not([data-mobile-nav="info-sheet"]) (S4, 2026-08-17): the session-info
+     sheet also carries role="dialog" aria-modal="true" (correct a11y
+     semantics for a bottom sheet with a scrim) and has no button as its
+     first-child's last-child, so without this exclusion it silently matched
+     this generic selector too — measured 358px (100vw-32px) instead of the
+     374px its own left:8px/right:8px margins specify. Same category of bug
+     as the ZuhsRW directory-picker collision below; same fix shape. */
+  [aria-modal="true"]:not(:has(> :first-child > :last-child > button)):not([data-mobile-nav="info-sheet"]) {
     max-width: calc(100vw - 32px) !important;
   }
   /* Nav bar: hide the "Settings" caption (redundant on a full-width sheet)

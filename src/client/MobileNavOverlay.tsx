@@ -12,16 +12,29 @@ export interface MobileNavOverlayProps extends PropsRuntime<'shell.overlay'>, Pr
 /** Same breakpoint as the shell's SIDEBAR_AUTO_COLLAPSE (viewport < 1024). */
 const MOBILE_QUERY = '(max-width: 1023px)'
 
-/** Live matchMedia hook for the narrow breakpoint. */
-function useMobile(): boolean {
-  const [mobile, setMobile] = useState(() => window.matchMedia(MOBILE_QUERY).matches)
+/**
+ * The tablet range, where the sidebar is still a drawer. Below 768px the
+ * phone app shell (MobileHome) replaced the drawer entirely — the sidebar is
+ * display:none there, so every drawer affordance below (backdrop, floating
+ * opener, Escape, close-on-navigate) would operate an invisible panel.
+ */
+const TABLET_QUERY = '(min-width: 768px) and (max-width: 1023px)'
+
+/**
+ * Live matchMedia hook.
+ * @param query - the media query to follow.
+ * @returns whether it currently matches.
+ */
+function useMedia(query: string): boolean {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches)
   useEffect(() => {
-    const query = window.matchMedia(MOBILE_QUERY)
-    const onChange = (event: MediaQueryListEvent) => setMobile(event.matches)
-    query.addEventListener('change', onChange)
-    return () => query.removeEventListener('change', onChange)
-  }, [])
-  return mobile
+    const list = window.matchMedia(query)
+    const onChange = (event: MediaQueryListEvent) => setMatches(event.matches)
+    setMatches(list.matches)
+    list.addEventListener('change', onChange)
+    return () => list.removeEventListener('change', onChange)
+  }, [query])
+  return matches
 }
 
 /** The AppFrame element: direct parent of the shell overlay layer. */
@@ -36,7 +49,8 @@ function findFrame(): HTMLElement | null {
  * directory button for the hero/blank phases that have no session header.
  */
 export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
-  const mobile = useMobile()
+  const mobile = useMedia(MOBILE_QUERY)
+  const tablet = useMedia(TABLET_QUERY)
   const [open, setOpen] = useState(false)
   const [fabVisible, setFabVisible] = useState(false)
 
@@ -63,8 +77,9 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
 
   // The floating button is a fallback for surfaces without a session header:
   // phase "active" means the header (and its toggle) is rendered already.
+  // Tablet only — on a phone the home screen owns navigation.
   useEffect(() => {
-    if (!mobile) {
+    if (!tablet) {
       setFabVisible(false)
       return
     }
@@ -80,12 +95,12 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
       attributeFilter: ['data-phase'],
     })
     return () => observer.disconnect()
-  }, [mobile])
+  }, [tablet])
 
   // Escape closes the drawer — but yields to an open modal dialog (e.g. the
   // settings panel), which owns its own Escape handling.
   useEffect(() => {
-    if (!mobile || !open) return
+    if (!tablet || !open) return
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && document.querySelector('[aria-modal="true"]') === null) toggleSidebar()
     }
@@ -93,7 +108,7 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
     // handler, so the modal is still present when we yield to it.
     document.addEventListener('keydown', onKeyDown, true)
     return () => document.removeEventListener('keydown', onKeyDown, true)
-  }, [mobile, open, toggleSidebar])
+  }, [tablet, open, toggleSidebar])
 
   // Navigation inside the drawer closes it: tapping a session row or a
   // plugin takeover entry (task board / ssh) must hand the screen to the
@@ -108,7 +123,7 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
   // - Workspace folder chevrons, the logo: pure UI toggles, not navigation.
   // - Anything while a modal dialog is open: the dialog owns the screen.
   useEffect(() => {
-    if (!mobile || !open) return
+    if (!tablet || !open) return
     const onDrawerClick = (event: MouseEvent) => {
       if (document.querySelector('[aria-modal="true"]') !== null) return
       const target = event.target as HTMLElement | null
@@ -127,7 +142,7 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
     }
     document.addEventListener('click', onDrawerClick, true)
     return () => document.removeEventListener('click', onDrawerClick, true)
-  }, [mobile, open, toggleSidebar])
+  }, [tablet, open, toggleSidebar])
 
   // Fullscreen toggle for the aionui preview sheet. The button is appended
   // INTO the preview column (position: absolute against it), so it rides
@@ -237,7 +252,7 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
     return () => observer?.disconnect()
   }, [mobile])
 
-  if (!mobile) return null
+  if (!tablet) return null
   return (
     <>
       {open && (
