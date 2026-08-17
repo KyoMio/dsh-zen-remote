@@ -8,10 +8,13 @@
 export const CHIPS_CSS = `/* ---------- chips row + settings entry (S5) ---------- */
 
 @media (max-width: 767px) {
-  /* --- settings dialog / usage-stats panel portal fix ---
-     Both dsh-client-ui-settings-general's SettingsRoot (trigger button +
-     position:fixed;z-index:1000 modal) and dsh-usage-stats' sidebar-footer
-     badge (position:fixed panel) mount as PLAIN CHILDREN of the sidebar
+  /* --- settings dialog / usage-stats panel / scheduled-tasks dialog portal fix ---
+     dsh-client-ui-settings-general's SettingsRoot (trigger button +
+     position:fixed;z-index:1000 modal), dsh-usage-stats' sidebar-footer
+     badge (position:fixed panel), and @opendsh/dsh-plugin-scheduled-tasks'
+     "定时任务" trigger (position:fixed;z-index:120 \`.dshst-overlay\`,
+     verified against 0.2.0 — real-device report 2026-08-17: chip click
+     produced no visible window) all mount as PLAIN CHILDREN of the sidebar
      tree — not a React portal to document.body — inside
      sidebar.settings / sidebar.footer.action
      (dsh-client-ui-sidebar's SidebarRoot: footArea > settingsArea /
@@ -52,12 +55,12 @@ export const CHIPS_CSS = `/* ---------- chips row + settings entry (S5) --------
      logoRow/newSession/regionArea at \`display: flex\`, which is only
      hidden from view by being fully underneath the usage-stats panel's
      opaque body, not by this rule. */
-  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel]) {
+  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) {
     display: contents !important;
   }
-  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel]) [class$="_logoRow"],
-  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel]) [class$="_newSession"],
-  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel]) [class$="_regionArea"] {
+  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_logoRow"],
+  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_newSession"],
+  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_regionArea"] {
     display: none !important;
   }
 
