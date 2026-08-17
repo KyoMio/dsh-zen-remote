@@ -77,7 +77,7 @@ cd the gateway half
 dsh plugin --profile web add ./the gateway half
 ```
 
-Static mount is also available (see [`cordis.patch.yml.example`](cordis.patch.yml.example) — swap in the absolute checkout path) or dynamic-plugin mount (see the header comment in `lan-gate.mjs`), for setups that skip `dsh plugin add`.
+Static mount is also available (see [`cordis.patch.yml.example`](../cordis.patch.yml.example) — swap in the absolute checkout path) or dynamic-plugin mount (see the header comment in `lan-gate.mjs`), for setups that skip `dsh plugin add`.
 
 ### 2. Put your own reverse proxy in front
 
@@ -296,7 +296,7 @@ npm test   # boots a mock upstream, runs the gateway/auth/push suites: proxy+inj
 | `test/push.test.cjs` | Push subscribe/send, VAPID encryption, expired-subscription cleanup |
 | `test/util.cjs` | Shared test harness (boot/request/pair helpers) — not a test file itself |
 
-See [`AGENTS.md`](AGENTS.md) for development conventions.
+See [`AGENTS.md`](../AGENTS.md) for development conventions.
 
 ---
 
@@ -333,4 +333,4 @@ Installing a plugin runs third-party code with your own permissions; being liste
 
 ## License
 
-MIT. The gateway `lib/lan-gate-server.cjs` extends `dsh-mobile-gate`; original MIT copyright/license retained — see [LICENSE](LICENSE).
+MIT. The gateway `lib/lan-gate-server.cjs` extends `dsh-mobile-gate`; original MIT copyright/license retained — see [LICENSE](../LICENSE).

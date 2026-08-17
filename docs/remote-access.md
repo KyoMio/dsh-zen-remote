@@ -344,4 +344,4 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 
 ## License
 
-MIT。网关 `lib/lan-gate-server.cjs` 基于 `dsh-mobile-gate` 扩展，保留原 MIT 版权与许可，详见 [LICENSE](LICENSE)。
+MIT。网关 `lib/lan-gate-server.cjs` 基于 `dsh-mobile-gate` 扩展，保留原 MIT 版权与许可，详见 [LICENSE](../LICENSE)。

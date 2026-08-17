@@ -197,4 +197,4 @@ pnpm build   # 产物 lib/ 与源码同步入库,改动源码后重新构建再�
 
 ## License
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
