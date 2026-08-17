@@ -16,6 +16,9 @@ export const zh = {
   'newSessionIn': '在工作区新建会话',
   'noSessions': '还没有会话，点右下角加号开始',
   'backToList': '返回会话列表',
+  'sessionInfo': '会话信息',
+  'workbench': '工作台',
+  'switchView': '切换视图',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -33,6 +36,9 @@ export const en: Record<MobileNavKey, string> = {
   'newSessionIn': 'New session in workspace',
   'noSessions': 'No sessions yet — tap + to start one',
   'backToList': 'Back to sessions',
+  'sessionInfo': 'Session info',
+  'workbench': 'Workbench',
+  'switchView': 'Switch view',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

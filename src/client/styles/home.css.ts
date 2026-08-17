@@ -15,14 +15,10 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     display: none !important;
   }
   /* The header's drawer toggle opened that sidebar; with it gone the button
-     has nothing to open. (The Files button still opens the dsh-web-ui
-     explorer sheet, so it stays.) */
+     has nothing to open. (S2 owns the rest of the header layout —
+     styles/header.css.ts — including the Files button's replacement.) */
   [data-mobile-nav="toggle"] {
     display: none !important;
-  }
-  /* Leave a lane for the provisional back button at the header's left edge. */
-  [data-phase] header > :first-child {
-    padding-left: 44px !important;
   }
 
   /* --- level 1: the session list ---
@@ -258,28 +254,6 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
   }
   [data-mobile-nav="home-sheet-item"]:active {
     background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
-  }
-
-  /* Provisional back control — S2 folds this into the session header. */
-  [data-mobile-nav="home-back"] {
-    position: absolute;
-    left: 8px;
-    top: calc(env(safe-area-inset-top, 0px) + 8px);
-    z-index: 5;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 32px;
-    height: 32px;
-    padding: 0;
-    border: none;
-    border-radius: 50%;
-    background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
-    color: var(--dsw-alias-label-primary, inherit);
-    pointer-events: auto;
-    cursor: pointer;
-    touch-action: manipulation;
-    -webkit-tap-highlight-color: transparent;
   }
 }
 `

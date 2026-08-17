@@ -2,15 +2,15 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import {
   IconChevronDownOutline14,
-  IconChevronLeftOutline14,
   IconPlusOutline16,
   StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { SessionId, SessionSummary, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SessionId, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
 import { NS } from './locales.ts'
+import { GO_HOME_EVENT } from './nav-store.ts'
 import type { createNavStore } from './nav-store.ts'
 import type { WorkspaceFilter } from './nav-store.ts'
+import { dotState } from './session-dot.ts'
 
 /** Full props for the phone home screen (shell.overlay entry). */
 export type MobileHomeProps =
@@ -62,18 +62,6 @@ function relativeTime(at: number): string {
   if (elapsed < 86_400_000) return relative.format(-Math.floor(elapsed / 3_600_000), 'hour')
   if (elapsed < 604_800_000) return relative.format(-Math.floor(elapsed / 86_400_000), 'day')
   return shortDate.format(at)
-}
-
-/**
- * Status dot of one row, matching the official sidebar semantics.
- * @param row - session summary.
- * @returns the dot state, or undefined when the row needs no dot.
- */
-function dotState(row: SessionSummary): StateDotState | undefined {
-  if (row.pendingInteraction !== undefined) return 'warning'
-  if (row.running) return 'ongoing'
-  if (row.completed === true) return 'done'
-  return undefined
 }
 
 /**
@@ -142,6 +130,16 @@ export function MobileHome({
   }
   useEffect(() => cancelPress, [])
 
+  // The session header's back button (session scope) cannot hold this
+  // store directly — a handle mounts under exactly one scope, and this one
+  // is already root-scoped here (see nav-store.ts) — so it dispatches
+  // GO_HOME_EVENT instead and this, the store's actual owner, applies it.
+  useEffect(() => {
+    const onGoHome = (): void => actions.show('home')
+    window.addEventListener(GO_HOME_EVENT, onGoHome)
+    return () => window.removeEventListener(GO_HOME_EVENT, onGoHome)
+  }, [actions])
+
   const enter = (start: () => void): void => {
     start()
     setSheet(null)
@@ -153,135 +151,119 @@ export function MobileHome({
   const title = selectedWorkspace?.title ?? t('allWorkspaces')
 
   return (
-    <>
-      <div data-mobile-nav="home" data-view={view} aria-hidden={view === 'session'}>
-        <div data-mobile-nav="home-top">
-          <button
-            type="button"
-            data-mobile-nav="ws-switch"
-            aria-haspopup="menu"
-            onClick={() => setSheet('filter')}
-          >
-            <span>{title}</span>
-            <IconChevronDownOutline14 size={14} />
-          </button>
-        </div>
-
-        <ul data-mobile-nav="home-list">
-          {rows.map((row) => {
-            const dot = dotState(row)
-            return (
-              <li key={row.id}>
-                <button
-                  type="button"
-                  data-mobile-nav="home-row"
-                  data-current={row.id === sessions.current ? '' : undefined}
-                  onClick={() => enter(() => openSession(row.id))}
-                >
-                  <span data-mobile-nav="home-row-title">{row.displayTitle}</span>
-                  <span data-mobile-nav="home-row-meta">
-                    {dot !== undefined && <StateDot state={dot} size={8} />}
-                    <time dateTime={new Date(row.updatedAt).toISOString()}>
-                      {relativeTime(row.updatedAt)}
-                    </time>
-                  </span>
-                </button>
-              </li>
-            )
-          })}
-          {rows.length === 0 && <li data-mobile-nav="home-empty">{t('noSessions')}</li>}
-        </ul>
-
+    <div data-mobile-nav="home" data-view={view} aria-hidden={view === 'session'}>
+      <div data-mobile-nav="home-top">
         <button
           type="button"
-          data-mobile-nav="home-fab"
-          aria-label={t('newSession')}
-          title={t('newSession')}
-          onContextMenu={(event) => event.preventDefault()}
-          onPointerDown={() => {
-            longPressed.current = false
-            cancelPress()
-            timer.current = window.setTimeout(() => {
-              longPressed.current = true
-              timer.current = null
-              setSheet('create')
-            }, LONG_PRESS_MS)
-          }}
-          onPointerUp={() => {
-            cancelPress()
-            if (longPressed.current) return
-            enter(() => startSession(selectedWorkspace?.workspaceId))
-          }}
-          onPointerLeave={cancelPress}
-          onPointerCancel={cancelPress}
+          data-mobile-nav="ws-switch"
+          aria-haspopup="menu"
+          onClick={() => setSheet('filter')}
         >
-          <IconPlusOutline16 size={22} />
+          <span>{title}</span>
+          <IconChevronDownOutline14 size={14} />
         </button>
-
-        {sheet !== null && (
-          <div data-mobile-nav="home-sheet-layer">
-            <div
-              data-mobile-nav="home-sheet-mask"
-              role="button"
-              tabIndex={-1}
-              aria-label={t('close')}
-              onClick={() => setSheet(null)}
-            />
-            <div data-mobile-nav="home-sheet" role="menu">
-              <div data-mobile-nav="home-sheet-title">
-                {sheet === 'filter' ? t('switchWorkspace') : t('newSessionIn')}
-              </div>
-              {sheet === 'filter' && (
-                <button
-                  type="button"
-                  role="menuitem"
-                  data-mobile-nav="home-sheet-item"
-                  data-selected={selected === 'all' ? '' : undefined}
-                  onClick={() => {
-                    actions.filter('all')
-                    setSheet(null)
-                  }}
-                >
-                  {t('allWorkspaces')}
-                </button>
-              )}
-              {workspaces.items.map((item) => (
-                <button
-                  key={item.workspaceId}
-                  type="button"
-                  role="menuitem"
-                  data-mobile-nav="home-sheet-item"
-                  data-selected={sheet === 'filter' && selected === item.workspaceId ? '' : undefined}
-                  onClick={() => {
-                    if (sheet === 'filter') {
-                      actions.filter(item.workspaceId)
-                      setSheet(null)
-                      return
-                    }
-                    enter(() => startSession(item.workspaceId))
-                  }}
-                >
-                  {item.title}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
 
-      {/* Provisional back control: S2 rebuilds the session header and moves
-          this action into `conversation.session.header.actions`. */}
-      {view === 'session' && (
-        <button
-          type="button"
-          data-mobile-nav="home-back"
-          aria-label={t('backToList')}
-          title={t('backToList')}
-          onClick={() => actions.show('home')}
-        >
-          <IconChevronLeftOutline14 size={14} />
-        </button>
+      <ul data-mobile-nav="home-list">
+        {rows.map((row) => {
+          const dot = dotState(row)
+          return (
+            <li key={row.id}>
+              <button
+                type="button"
+                data-mobile-nav="home-row"
+                data-current={row.id === sessions.current ? '' : undefined}
+                onClick={() => enter(() => openSession(row.id))}
+              >
+                <span data-mobile-nav="home-row-title">{row.displayTitle}</span>
+                <span data-mobile-nav="home-row-meta">
+                  {dot !== undefined && <StateDot state={dot} size={8} />}
+                  <time dateTime={new Date(row.updatedAt).toISOString()}>
+                    {relativeTime(row.updatedAt)}
+                  </time>
+                </span>
+              </button>
+            </li>
+          )
+        })}
+        {rows.length === 0 && <li data-mobile-nav="home-empty">{t('noSessions')}</li>}
+      </ul>
+
+      <button
+        type="button"
+        data-mobile-nav="home-fab"
+        aria-label={t('newSession')}
+        title={t('newSession')}
+        onContextMenu={(event) => event.preventDefault()}
+        onPointerDown={() => {
+          longPressed.current = false
+          cancelPress()
+          timer.current = window.setTimeout(() => {
+            longPressed.current = true
+            timer.current = null
+            setSheet('create')
+          }, LONG_PRESS_MS)
+        }}
+        onPointerUp={() => {
+          cancelPress()
+          if (longPressed.current) return
+          enter(() => startSession(selectedWorkspace?.workspaceId))
+        }}
+        onPointerLeave={cancelPress}
+        onPointerCancel={cancelPress}
+      >
+        <IconPlusOutline16 size={22} />
+      </button>
+
+      {sheet !== null && (
+        <div data-mobile-nav="home-sheet-layer">
+          <div
+            data-mobile-nav="home-sheet-mask"
+            role="button"
+            tabIndex={-1}
+            aria-label={t('close')}
+            onClick={() => setSheet(null)}
+          />
+          <div data-mobile-nav="home-sheet" role="menu">
+            <div data-mobile-nav="home-sheet-title">
+              {sheet === 'filter' ? t('switchWorkspace') : t('newSessionIn')}
+            </div>
+            {sheet === 'filter' && (
+              <button
+                type="button"
+                role="menuitem"
+                data-mobile-nav="home-sheet-item"
+                data-selected={selected === 'all' ? '' : undefined}
+                onClick={() => {
+                  actions.filter('all')
+                  setSheet(null)
+                }}
+              >
+                {t('allWorkspaces')}
+              </button>
+            )}
+            {workspaces.items.map((item) => (
+              <button
+                key={item.workspaceId}
+                type="button"
+                role="menuitem"
+                data-mobile-nav="home-sheet-item"
+                data-selected={sheet === 'filter' && selected === item.workspaceId ? '' : undefined}
+                onClick={() => {
+                  if (sheet === 'filter') {
+                    actions.filter(item.workspaceId)
+                    setSheet(null)
+                    return
+                  }
+                  enter(() => startSession(item.workspaceId))
+                }}
+              >
+                {item.title}
+              </button>
+            ))}
+          </div>
+        </div>
       )}
-    </>
+    </div>
   )
 }

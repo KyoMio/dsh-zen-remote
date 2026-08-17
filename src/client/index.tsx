@@ -3,12 +3,14 @@ import { MobileNavToggle } from './MobileNavToggle.tsx'
 import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
 import { MobileHome } from './MobileHome.tsx'
+import { MobileHeaderActions, MobileHeaderUtilities } from './MobileSessionHeader.tsx'
 import { createNavStore } from './nav-store.ts'
 import { MOBILE_CSS } from './styles/index.ts'
 import { installDebugBadge } from './debug.ts'
 import { installPhoneChrome } from './effects/phone-chrome.ts'
 import { installAionuiCompat } from './effects/aionui-compat.ts'
 import { installStatsLine } from './effects/stats-line.ts'
+import { installHeaderStatusDot } from './effects/header-status.ts'
 import { NS, en, zh } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 
@@ -51,6 +53,15 @@ export function apply(ctx: ClientContext): void {
 
   installStatsLine(ctx)
 
+  // Session header running-status dot (S2): no official element exists to
+  // reposition, so this reads ctx.sessions directly and self-draws via CSS.
+  installHeaderStatusDot(ctx)
+
+  // Page-stack store (apply world) — created before any registration so
+  // every slot below (the phone home screen, the session header's back
+  // button) shares the exact same handle/instance.
+  const nav = createNavStore()
+
   ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
     name: 'conversation.session.header.actions',
     id: 'mobile-nav-toggle',
@@ -60,6 +71,31 @@ export function apply(ctx: ClientContext): void {
       toggleSidebar: () => ctx.layout.toggleSidebar(),
     }),
   }, MobileNavToggle))
+
+  // Session header back button + Chat/Trajectory view-switch row (S2).
+  // Renders unconditionally; CSS (styles/header.css.ts) keeps it hidden at
+  // >= 768px. Order is irrelevant here — the phone stylesheet hides every
+  // other header.actions entry and only re-shows this one.
+  //
+  // No `store: nav` here: this slot is session-scope while `nav` already
+  // mounts at shell.overlay's root scope, and a handle can only mount
+  // under one scope (runtime throws otherwise — see nav-store.ts). The
+  // back button dispatches GO_HOME_EVENT and MobileHome applies it.
+  ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
+    name: 'conversation.session.header.actions',
+    id: 'mobile-header-actions',
+    order: 0,
+    locale: NS,
+  }, MobileHeaderActions))
+
+  // Session-info entry (placeholder — S4 owns the sheet) + workbench entry
+  // (dsh-better-sidebar, see MobileSessionHeader.tsx for the trigger).
+  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+    name: 'conversation.session.header.utilities',
+    id: 'mobile-header-utilities',
+    order: 0,
+    locale: NS,
+  }, MobileHeaderUtilities))
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
@@ -72,10 +108,9 @@ export function apply(ctx: ClientContext): void {
   }, MobileNavOverlay))
 
   // Phone app shell (< 768px): the full-screen session list that is level 1
-  // of the page stack. The store handle is created here (apply world) so a
-  // later registration — the S2 session header back button — can share the
-  // same instance by declaring the same handle.
-  const nav = createNavStore()
+  // of the page stack. Owns the `nav` handle created above (root scope);
+  // the session header's back button listens for GO_HOME_EVENT instead of
+  // sharing the handle directly (see nav-store.ts and the comment above).
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',
     id: 'mobile-home',

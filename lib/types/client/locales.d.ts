@@ -15,6 +15,9 @@ export declare const zh: {
     readonly newSessionIn: "在工作区新建会话";
     readonly noSessions: "还没有会话，点右下角加号开始";
     readonly backToList: "返回会话列表";
+    readonly sessionInfo: "会话信息";
+    readonly workbench: "工作台";
+    readonly switchView: "切换视图";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

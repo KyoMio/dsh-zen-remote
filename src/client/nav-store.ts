@@ -13,13 +13,34 @@ export type MobileView = 'home' | 'session'
 export type WorkspaceFilter = WorkspaceId | 'all' | null
 
 /**
+ * `window` event a `conversation.session.header.*` slot (session scope)
+ * fires to move the ROOT-scope nav store back to `home` — see
+ * {@link GO_HOME_EVENT} below for why a store handle cannot cross this
+ * particular scope boundary directly.
+ */
+export const GO_HOME_EVENT = 'dsh-mobile-nav:go-home'
+
+/**
  * Phone page-stack store (phone breakpoint only; the tablet/desktop layouts
  * never read it). Deliberately NOT persisted: the spec's launch rule is
  * "always land on the session list", so a reload must reset to `home`.
  *
  * Built by a factory instead of a module-level constant: a module-scope
  * handle is a disguised singleton across plugin reloads (ui-slots docs).
- * @returns a fresh store handle, shared by every registration of one apply().
+ *
+ * One handle IS shared by every registration of one apply() — but only
+ * within the SAME slot scope. This handle mounts at `shell.overlay`, a
+ * ROOT-scope slot (MobileHome.tsx); declaring the identical handle on a
+ * SESSION-scope slot (e.g. `conversation.session.header.actions`) throws at
+ * runtime ("store handle mounted under ... is already mounted under scope
+ * ...", confirmed 2026-08-17) — the framework creates one live instance per
+ * (handle, scope), and root/session are different scopes even for the same
+ * handle. A session-scope registration that needs to move the page stack
+ * (the S2 header back button) cannot hold `actions.show` directly; it
+ * dispatches {@link GO_HOME_EVENT} instead, and MobileHome — already
+ * mounted with this store — is the one that calls `actions.show('home')`.
+ * @returns a fresh store handle, shared by every SAME-SCOPE registration of
+ * one apply().
  */
 export function createNavStore() {
   return defineStore({
