@@ -193,6 +193,23 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
     }
   }, [t])
 
+  // Presence gate (2026-08-17 user question): without dsh-better-sidebar
+  // installed the workbench button was a dead control — rendered, clickable,
+  // did nothing. Same live-probe pattern as the home chips: observe until the
+  // plugin's root marker exists, hide the button while it doesn't. The close
+  // pill never had this problem (its CSS :has() gate needs the panel node).
+  const [workbenchPresent, setWorkbenchPresent] = useState(
+    () => document.querySelector('[data-dsh-better-sidebar]') !== null,
+  )
+  useEffect(() => {
+    const check = () =>
+      setWorkbenchPresent(document.querySelector('[data-dsh-better-sidebar]') !== null)
+    const observer = new MutationObserver(check)
+    observer.observe(document.body, { childList: true, subtree: true })
+    check()
+    return () => observer.disconnect()
+  }, [])
+
   return (
     <>
       <button
@@ -204,7 +221,7 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
       >
         <IconInfoOutline16 size={20} />
       </button>
-      <button
+      {workbenchPresent && <button
         type="button"
         data-mobile-nav="header-workbench"
         aria-label={t('workbench')}
@@ -219,7 +236,7 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
             icon's "left column" reads as "right column" flipped, which is
             exactly the workbench's own right-side-panel semantics. */}
         <IconPanelLeftOutline16 size={20} />
-      </button>
+      </button>}
     </>
   )
 }
