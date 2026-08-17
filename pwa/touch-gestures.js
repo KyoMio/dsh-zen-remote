@@ -1,7 +1,15 @@
 /* dsh-mobile-pwa · touch gestures
  * Touch-first gestures for the DSH Web UI on phones:
- *   - Edge-swipe back navigation
  *   - Pinch to resize code / markdown font size
+ *
+ * Edge-swipe back (history.back) used to live here too; removed (design
+ * doc "手势" row, 2026-08-17 fourth revision): history.back() is a no-op
+ * against this SPA's own client-side routing, and the 24px left-edge hot
+ * zone div (z-index 2147483001, touch-action:none) silently ate every touch
+ * that started there — including dsh-mobile-nav's own new left-edge
+ * swipe-back gesture (effects/gestures.ts in the dsh-web-mobile plugin),
+ * which now owns that same 24px strip and actually does something useful
+ * with it (close the open sheet/panel, or return to the session list).
  *
  * Pull-to-refresh used to live here too; it was removed (real-device
  * feedback: any accidental overscroll fired a full page reload, which S1's
@@ -16,33 +24,6 @@
 (function () {
   'use strict'
   if (window.matchMedia('(pointer: coarse)').matches === false) return
-
-  // ---- Edge-swipe back (history.back) --------------------------------
-  const EDGE = 24
-  let swipeState = null
-  const edge = document.createElement('div')
-  edge.style.cssText =
-    'position:fixed;left:0;top:0;bottom:0;width:' + EDGE + 'px;z-index:2147483001;' +
-    'background:transparent;touch-action:none'
-  document.documentElement.appendChild(edge)
-
-  edge.addEventListener('touchstart', (e) => {
-    swipeState = { x: e.touches[0].clientX, y: e.touches[0].clientY }
-  }, { passive: true })
-
-  edge.addEventListener('touchmove', (e) => {
-    if (!swipeState) return
-    e.preventDefault()
-  }, { passive: false })
-
-  edge.addEventListener('touchend', (e) => {
-    if (!swipeState) return
-    const dx = e.changedTouches[0].clientX - swipeState.x
-    const dy = e.changedTouches[0].clientY - swipeState.y
-    const traveledRight = dx > 90 && Math.abs(dy) < dx * 0.5
-    swipeState = null
-    if (traveledRight) { try { window.history.back() } catch (err) { /* ignore */ } }
-  }, { passive: true })
 
   // ---- Pinch to resize font -------------------------------------------
   const FONT_KEY = 'dsh-pwa-fontscale'
