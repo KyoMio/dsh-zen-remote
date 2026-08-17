@@ -28,15 +28,20 @@
   - host：`src/index.ts` 空 `apply()`，仅让插件出现在 host Loader。
   - client：`src/client/index.tsx` 注册 locale、注入样式、安装 viewport/状态栏/兼容性 effect，并注册所有 slot。
 - 客户端 fiber `inject = ['slots', 'layout', 'locale', 'sessionLogDownload']`。
+- **断点分层（2026-08-17 S1 起）**：<768px 走 app 化两级页面栈（会话列表主页 + 会话页），官方 sidebar `display:none`；768–1023px 保持 v1.0.0 抽屉；≥1024px 严格 no-op。`MobileNavOverlay` 里抽屉相关的四段逻辑（backdrop / 浮动开关 / Escape / 点击关闭）只在 768–1023 生效，frame 标记与 aionui/settings/git-chip 三个 DOM effect 仍是 ≤1023。
 - slot 注册：
-  - `conversation.session.header.actions` → `MobileNavToggle`（目录开关 + 文件树按钮）
-  - `shell.overlay` → `MobileNavOverlay`（遮罩 / 浮动按钮 / Escape 与点击关闭）
+  - `conversation.session.header.actions` → `MobileNavToggle`（目录开关 + 文件树按钮；<768px 目录开关被 CSS 隐藏）
+  - `shell.overlay` → `MobileNavOverlay`（遮罩 / 浮动按钮 / Escape 与点击关闭，仅平板）
+  - `shell.overlay` → `MobileHome`（<768px 全屏会话列表主页，order 20）
   - `sidebar.footer.action` → `MobileDrawerFooter`（文件 + 会话日志下载）
 - 核心文件：
   - `src/client/MobileNavOverlay.tsx`：维护 `data-mobile-nav="frame"`，导航关闭启发式。
   - `src/client/MobileNavToggle.tsx`：会话头部控件。
   - `src/client/MobileDrawerFooter.tsx`：抽屉底部操作。
   - `src/client/styles/`：全部移动端样式，拆为 `base/layout/compat/misc.css.ts` + `index.ts`（导出 `MOBILE_CSS` = 四者按序 `join('\n')`，注入为单一 `<style data-plugin>`）。拆分是纯搬移：组件文件**不要手改 CSS 内容**，用切片脚本按原字节序切（见下 Pitfall「styles/ 按节切片」）。
+  - `src/client/MobileHome.tsx`：手机主页（workspace 切换器 / 会话列表 / FAB / 底部 sheet），数据全走标准 kit `useSessions` / `useWorkspaces`，动作走注入的 `ctx.sessions.open` / `ctx.workspaces.startSession`，不读官方 DOM。
+  - `src/client/nav-store.ts`：`createNavStore()` — 页面栈 `defineStore`（`view: 'home' | 'session'` + workspace 过滤），**不 persist**（启动必须落主页）；handle 在 `apply()` 里建，后续薄片注册同一 handle 即共享实例。
+  - `src/client/styles/home.css.ts`：手机 app 壳样式，整块在 `@media (max-width: 767px)` 内，且**必须排在 index.ts 拼接的最后**（要压过 ≤1023px 那一大块的同权重规则）。
   - `src/client/effects/`：客户端 effect，按域拆 3 文件（phone-chrome / aionui-compat / stats-line）；`index.tsx` 只做编排（locale、样式注入、install 调用、slot 注册）。
   - `src/client/locales.ts`：`mobileNav` i18n；`zh` 是 key 源真相，`en` 是类型镜像。
   - `scripts/build-client.mjs`：自定义打包器。
@@ -85,6 +90,8 @@
 - **整块替换 CSS/代码前先确认替换区间边界**：用脚本按起止标记替换大块时，区间内的独立规则会一起被吞（1779cd4 事故：重写 toggle 块把「全屏几何规则」删了，功能表现为「标记/图标正常切换但浮层不变全屏」）。改完必须 grep 关键选择器/属性（如 `inset: 0`）确认没丢规则；这类回归用户实测前难以察觉。
 - 2026-08-16「手机全屏 md」事故真相：全屏内容 = 会话消息里的 GenUI（dsh-ui fence）卡片（「当前结构」表格），不是任何文件/预览。当前 bundle + 当前 genui CSS 均无全屏渲染路径（aionui 列是底部浮层且被门控、genui block/panel 无 fixed 规则）→ 手机端再复现时先抓 URL 栏：裸文件页 = 浏览器导航到了文件 URL；有 app UI = 旧 JS 缓存。别凭截图猜「旧 bundle」。**补充（当晚续接会话验证，「无全屏路径」的判断不成立）**：Playwright 复用长期挂着的旧页面 context（带旧 localStorage）时，harness web 会把**最后一条 dsh-ui fence 以 `pI_x6G_frame` 兄弟节点挂到 app 根级**，并给 frame 内联 `display: none`（inline style；grid 5 轨仍是 aionui 写的）——任意宽度（360~1280）、`/` 与 `/settings`、当前与重构前 bundle 均复现，与 dsh-mobile-nav 无关（插件从不写 display、桌面宽度同样出现、旧 bundle 同样出现）。**全新 context（无旧存储）** + 会话打开则渲染完全正常，抽屉验证可正常执行。再遇「手机全屏卡」先让用户清站点数据/换新浏览器 context 验证，别据此改 mobile-nav 代码。
 - **用户手机浏览器是 Via（WebView 内核 + 激进缓存，会无视 `cache-control: no-cache`）**：旧 HTML/资源会被固化 →「怎么刷新都跳不过、清缓存才好、重建 bundle（rev 变化触发整页重载）后也消失」。诊断此类问题用 `?mobile-nav-debug=1` 徽章（提交 2300b82）：右上角实时显示 URL/宽高/媒体查询/头部/composer/aionui 浮层/genui 数量/捕获的 JS 错误。**未复现时不要重建 bundle**——重建会冲掉手机端卡死状态，反而不利于取证。
+- **手机端时间戳走 `Intl`，不要用 `document.documentElement.lang`**：页面 html 上写死 `lang="zh-CN"`，而官方 UI 文案跟的是 `navigator.languages`（2026-08-17 实测：html=zh-CN、UI=English）。用 html lang 建格式化器会出现「英文界面里的中文时间」。传 `undefined` 让 Intl 跟浏览器语言，与官方文案一致。
+- **本机（macOS）CDP 探针**：`scripts/cdp-probe.mjs` 里的 chrome 路径/session id 是 Termux 环境遗留，macOS 上跑不了；照它的骨架临时写一份到 scratchpad，chrome 路径用 `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`，其余（`net.listen(0)` 动态端口、独立 profile、退出 SIGKILL + 删 profile、stdout flush 后再 exit）照抄。
 - 没有测试框架：改布局后需在真实 DSH web profile + 窄屏（约 390px）和桌面（≥1024px）手动验证。**Playwright 验证配方（2026-08-16 沉淀）**：① 用**全新 browser context**（`browser.newContext()`），`addInitScript` 写入 `localStorage['dsh.sessions.current'] = JSON.stringify({sessionId})` 后直接开会话页——**不要复用长活 context**（旧 localStorage 会触发 harness「fence-only」状态：frame 内联 `display:none`、最后一条 dsh-ui fence 挂 app 根级，抽屉无法验证，且与 mobile-nav 无关，见「手机全屏 md」pitfall）；② 点 backdrop 关闭抽屉时 Playwright 默认点元素中心会被抽屉盖住（hit-test 拦截）→ 用 `page.mouse.click(x, y)` 点抽屉右侧露出区域；③ **不要用 route 拦截插件 client.js 做 A/B**——fulfill 空 body 会被浏览器缓存，后续加载报 `loaded without registering` 并挂起 goto；A/B 用 `git show <commit>:lib/client.js > lib/client.js` 直接换文件（rev 自动变化，验完恢复）；④ 本机模型无图像输入时，用 `browser_snapshot` + `browser_evaluate` 查几何/计算样式代替截图判读。⑤ **CDP 裸探针**：`node scripts/cdp-probe.mjs`（无 Playwright 依赖，直接 CDP 驱动 chromium）——直连 `/usr/lib/chromium/chrome`（**不要用 `chromium-browser` launcher**，它会注入 `--extra-plugin-dir` 等参数）、`net.listen(0)` 动态空闲端口、`~/.cache/cdp-probe-<ts>` 独立 profile、退出时 SIGKILL chrome 并重试删除 profile（zygote 短时持锁）、stdout flush 后再 `process.exit`（否则管道输出被截断）；seed session 用 `Page.reload` 而非 evaluate 里 `location.reload()`（在途 evaluate 会报 `Inspected target navigated or closed`），workspace 切换/seed 后的 evaluate 要带跨导航重试。
 - **Playwright MCP 是并列会话共享单例**（一个 node 服务 + 按需拉起的浏览器）：一个会话长操作时其他会话显示「被占用」是正常的，别去重启/杀 MCP 服务或它的浏览器；probe 必须自备浏览器（见上配方⑤）并**自清理**——早前 probe 用固定端口 + `process.exit` 不杀子进程，孤儿 chrome 树能把设备 CPU 打满（zygote 60%+），让 MCP 浏览器看起来「卡住/被占用」。清理孤儿时 **`pkill -f` 会匹配到自己的命令行把自己杀掉**（bash -c 里含同样字符串）→ 用 PID 或唯一 profile 串。并列会话里别人可能同时在跑同款 probe：动态端口 + 独立 profile 是硬要求，别用固定 9333 之类的端口。
 - **`[data-phase="hero"]` 不是会话 composer 的 phase**（2026-08-16 实测）：会话页 textarea 自带 `data-phase="plain"`，位于 `[data-slot="conversation.composer.bar"]` 内；`hero` 是无会话落地页。用 `hero` 锚 composer 的选择器/JS 会**静默失效**（chip reparent 不触发、样式不命中），Playwright 一测即现形。composer 稳定锚点 = `[data-slot="conversation.composer.bar"] textarea`。

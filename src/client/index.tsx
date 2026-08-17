@@ -1,7 +1,9 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, SessionId, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
 import { MobileNavToggle } from './MobileNavToggle.tsx'
 import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
+import { MobileHome } from './MobileHome.tsx'
+import { createNavStore } from './nav-store.ts'
 import { MOBILE_CSS } from './styles/index.ts'
 import { installDebugBadge } from './debug.ts'
 import { installPhoneChrome } from './effects/phone-chrome.ts'
@@ -18,7 +20,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 }
 
 /** Required services (cordis fiber inject — the loader passes all module exports as an object plugin). */
-export const inject = ['slots', 'layout', 'locale', 'sessionLogDownload']
+export const inject = ['slots', 'layout', 'locale', 'sessionLogDownload', 'sessions', 'workspaces']
 
 /**
  * Mobile-adaptive shell, browser half: injects the mobile stylesheet, then
@@ -68,6 +70,23 @@ export function apply(ctx: ClientContext): void {
       toggleSidebar: () => ctx.layout.toggleSidebar(),
     }),
   }, MobileNavOverlay))
+
+  // Phone app shell (< 768px): the full-screen session list that is level 1
+  // of the page stack. The store handle is created here (apply world) so a
+  // later registration — the S2 session header back button — can share the
+  // same instance by declaring the same handle.
+  const nav = createNavStore()
+  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+    name: 'shell.overlay',
+    id: 'mobile-home',
+    order: 20,
+    locale: NS,
+    store: nav,
+    inject: () => ({
+      openSession: (id: SessionId) => ctx.sessions.open(id),
+      startSession: (workspaceId?: WorkspaceId) => ctx.workspaces.startSession(workspaceId),
+    }),
+  }, MobileHome))
 
   // Session log download, relocated from the session header to the drawer
   // footer on mobile (the header capsule is hidden by CSS); the drawer

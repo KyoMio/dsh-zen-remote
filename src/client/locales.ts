@@ -10,6 +10,12 @@ export const zh = {
   'files': '文件浏览',
   'previewFullscreen': '全屏预览',
   'previewExitFullscreen': '退出全屏',
+  'allWorkspaces': '全部',
+  'switchWorkspace': '切换工作区',
+  'newSession': '新建会话',
+  'newSessionIn': '在工作区新建会话',
+  'noSessions': '还没有会话，点右下角加号开始',
+  'backToList': '返回会话列表',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -21,6 +27,12 @@ export const en: Record<MobileNavKey, string> = {
   'files': 'Files',
   'previewFullscreen': 'Fullscreen preview',
   'previewExitFullscreen': 'Exit fullscreen',
+  'allWorkspaces': 'All',
+  'switchWorkspace': 'Switch workspace',
+  'newSession': 'New session',
+  'newSessionIn': 'New session in workspace',
+  'noSessions': 'No sessions yet — tap + to start one',
+  'backToList': 'Back to sessions',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */
