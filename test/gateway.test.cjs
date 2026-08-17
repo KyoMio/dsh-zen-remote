@@ -186,3 +186,22 @@ test('device gating: a device explicitly pinned to "desktop" does NOT get the sh
     assert.ok(!touchGesturesLoad(page.body), 'touch-gestures.js does not load for an explicit desktop device')
   } finally { await stop() }
 })
+
+// ---- DEVICE_CSS removal: the gateway used to inject a second, separate
+// inline <style> block (the `DEVICE_CSS` constant in lib/lan-gate-server.cjs)
+// ahead of app.css, carrying its own stale copy of the old mobile-layout
+// rules gated on the literal `[data-lan-device="phone"]` value. It was
+// removed outright (nothing in it was both correct and not already covered
+// by app.css or dsh-mobile-nav) — guard against it silently coming back.
+test('injected HTML carries no trace of the old inline DEVICE_CSS block', async () => {
+  const { stop } = await boot()
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.ok(!page.body.includes('.Sh0Q9G_triggerLabel'), 'no hashed composer-label selector')
+    assert.ok(!page.body.includes('--dsw-font-s-14-font-size'), 'no old font-size-variable compression block')
+    assert.ok(!page.body.includes('min-height:44px'), 'no old touch-target min-height rule')
+    assert.ok(!page.body.includes('@media (max-width:820px)'), 'no old 820px fallback block')
+    // app.css is still the one place mobile shell CSS is injected from.
+    assert.ok(page.body.includes('<link rel="stylesheet" href="/pwa/app.css">'), 'app.css link still present')
+  } finally { await stop() }
+})
