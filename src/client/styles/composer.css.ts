@@ -22,6 +22,17 @@ const PERM = `${ROW} > [class$="_tools"] > [class$="_modes"]`
 
 export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- */
 
+/* The file picker the attachment button drives (S7) — hidden at EVERY width,
+   deliberately OUTSIDE the phone media block below. A bare <input type="file">
+   renders as a native "Choose Files" control, and the slot wrapper around it is
+   \`display: contents\`, so an un-hidden one becomes a flex item of the official
+   tool row. Scoping this to < 768px once put that control in the DESKTOP
+   composer (caught on a live deploy, 2026-08-17): the button that drives it is
+   phone-only, but the input it drives is in the DOM at all widths. */
+[data-mobile-nav="attach-picker"] {
+  display: none !important;
+}
+
 @media (max-width: 767px) {
   /* --- 1. flatten the two official groups ---
      \`_tools\` and \`_trailing\` only exist to cluster controls left/right.
@@ -283,8 +294,10 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     display: none !important;
   }
 
-  /* --- 9. the attachment placeholder (S7 wires it to a real picker) --- */
+  /* --- 9. the attachment button (S7; its file input is hidden at the top of
+     this file, at every width) --- */
   [data-mobile-nav="attach"] {
+    position: relative;
     width: 28px !important;
     height: 28px !important;
     flex: none !important;
@@ -301,6 +314,49 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   [data-mobile-nav="attach"]:active {
     transform: scale(.94);
     transition: transform .12s;
+  }
+  /* Busy: a ring sweeps around the paperclip. Drawn with a conic gradient in
+     a pseudo-element rather than a spinner node, so the official React tree
+     around us has nothing extra to re-render (same reasoning as the model
+     pill's mask icon, S3.1). */
+  [data-mobile-nav="attach"][data-busy]::after {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: 999px;
+    background: conic-gradient(from 0deg, transparent 0 65%, currentColor 100%);
+    mask: radial-gradient(closest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+    -webkit-mask: radial-gradient(closest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+    animation: mnav-attach-spin .9s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes mnav-attach-spin {
+    to { transform: rotate(1turn); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    [data-mobile-nav="attach"][data-busy]::after {
+      animation-duration: 3s;
+    }
+  }
+  /* Failure note: one line above the button, tap-to-dismiss. Sits on the
+     composer card (z 2) rather than in an overlay layer — nothing here needs
+     to clear the permission/model sheets. */
+  [data-mobile-nav="attach-error"] {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    z-index: 2;
+    max-width: 62vw;
+    padding: 5px 8px;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    background: var(--dsw-alias-bg-layer-2, rgba(0, 0, 0, .82));
+    color: var(--dsw-alias-label-primary, #fff);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, .24);
   }
 
   /* --- 9. home-indicator clearance (S4.1, 2026-08-17) ---

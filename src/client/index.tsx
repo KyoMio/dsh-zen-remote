@@ -1,4 +1,5 @@
 import type { ClientContext, SessionId, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { PromptContentPart } from '@deepseek-ai/dsh-api-remotes/client'
 import { MobileNavToggle } from './MobileNavToggle.tsx'
 import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
@@ -140,14 +141,23 @@ export function apply(ctx: ClientContext): void {
     }),
   }, MobileSessionInfo))
 
-  // Composer attachment seat (S3 placeholder, S7 wires it to a real picker).
-  // Registered unconditionally; styles/composer.css.ts hides it at >= 768px
-  // and orders it into the leftmost seat of the phone composer row.
+  // Composer attachment seat (S7). Registered unconditionally;
+  // styles/composer.css.ts hides it at >= 768px and orders it into the
+  // leftmost seat of the phone composer row.
+  //
+  // The image path is the only public browser->host byte channel there is
+  // (appendix F): session.prompt with inline base64 image parts. It is bound
+  // here rather than called from the component so the component keeps no
+  // ctx reference — same pattern as MobileSessionInfo's action bindings.
   ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
     name: 'conversation.input.left',
     id: 'mobile-attach',
     order: 0,
     locale: NS,
+    inject: (_sessionId: SessionId) => ({
+      promptImages: (id: SessionId, content: PromptContentPart[]) =>
+        ctx.sessions.binding(id)?.session.prompt(content, 'queue'),
+    }),
   }, MobileAttachButton))
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({

@@ -5,7 +5,7 @@
 - 纯客户端 DSH（DeepSeek Harness）Web UI 插件；npm 包名 `@dsh-external/dsh-mobile-nav`，Git 仓库/README 名 `dsh-web-mobile`，patch 行 id `dsh-mobile-nav`。
 - 作用：窄屏（<1024px）把官方 Web UI 的侧栏 rail 改为 overlay 抽屉、会话区全宽，并适配状态栏/安全区/`theme-color`、设置弹窗、文件树/预览底部浮层、统计栏等；桌面端（≥1024px）刻意无操作，与未安装插件一致。
 - 单包仓库（非 monorepo），没有 workspace 配置；`packageManager` 为 `pnpm@11.7.0`。
-- 入口/边界：host 半区 `src/index.ts` 只导出空 `apply()` 占位；浏览器半区 `src/client/index.tsx` 是真正入口，通过 `package.json` 的 `exports["./client"]` 和 `dsh.client.platform: "web"` 被发现。
+- 入口/边界：host 半区 `src/index.ts` 自 S7 起有实体（唯一一条路由：附件上传端点，见 Architecture）；浏览器半区 `src/client/index.tsx` 是真正入口，通过 `package.json` 的 `exports["./client"]` 和 `dsh.client.platform: "web"` 被发现。
 - 发布包 `files` 包含 `lib`、`src`、`assets`、`cordis.patch.yml`、`README.md`、`LICENSE`；`lib/` 已提交，GitHub 分发无需构建脚本。
 
 ## Commands
@@ -18,6 +18,11 @@
   - 等价于：`tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit`
 - 打包/发布前：`npm run prepack`（内部执行 `npm run build`）；`npm pack` 会触发它。
 - **没有 test/lint/CI 脚本**；用 `pnpm verify`、`git diff --check` 和手动浏览器检查。
+- 自检脚本（无框架，纯 `node:assert`，靠 Node ≥23.6 的类型剥离直接 import `.ts`）：
+  - `node scripts/check-sunk-viewport.mjs` — iOS 视口下沉判定（S1.2）
+  - `node scripts/check-attach-upload.mjs` — 附件的纯函数（S7：图片 MIME 分流、`session.prompt` payload、base64、@路径拼接）
+  - `node scripts/check-upload-endpoint.mjs` — 上传端点集成检查（S7：真 node:http + 假 sessions，覆盖 201/413/404/403/405/400 与符号链接逃逸）
+  **注意**：这三个脚本 import 的 `src/**.ts` 不能用「构造函数参数属性」（`constructor(readonly x: T)`）——strip-only 模式直接报 `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`，字段要在函数体里赋值。
 - 本地开发安装：`dsh plugin --profile web add link:/path/to/dsh-mobile-nav`，然后重启 `dsh web`。
 - 配置 sanity check：`dsh --profile web --dump-config` 应能看到 `dsh-mobile-nav` 插件行。
 - 用户安装（README）：`dsh plugin --profile web add github:mexiaosqwq/dsh-web-mobile`。
@@ -25,13 +30,13 @@
 ## Architecture
 
 - 双半区插件：
-  - host：`src/index.ts` 空 `apply()`，仅让插件出现在 host Loader。
+  - host：`src/index.ts`——S7 之前是空 `apply()`（仅让插件出现在 host Loader），现在注册 `POST /_dsh/mobile-nav/upload`（手机 composer 的附件落盘端点）。用 `ctx.inject(['webServer','sessions'], …)` 在 apply **内部**取服务，不写顶层 `inject` 导出——否则没有 webServer 的组合（Electron）整个插件都不加载，浏览器半区跟着消失。
   - client：`src/client/index.tsx` 注册 locale、注入样式、安装 viewport/状态栏/兼容性 effect，并注册所有 slot。
 - 客户端 fiber `inject = ['slots', 'layout', 'locale', 'sessionLogDownload']`。
 - **断点分层（2026-08-17 S1 起）**：<768px 走 app 化两级页面栈（会话列表主页 + 会话页），官方 sidebar `display:none`；768–1023px 保持 v1.0.0 抽屉；≥1024px 严格 no-op。`MobileNavOverlay` 里抽屉相关的四段逻辑（backdrop / 浮动开关 / Escape / 点击关闭）只在 768–1023 生效，frame 标记与 aionui/settings/git-chip 三个 DOM effect 仍是 ≤1023。
 - slot 注册：
   - `conversation.session.header.actions` → `MobileNavToggle`（目录开关 + 文件树按钮；<768px 目录开关被 CSS 隐藏）
-  - `conversation.input.left` → `MobileAttachButton`（S3 附件占位钮，只在 <768px 显示，S7 接真上传）
+  - `conversation.input.left` → `MobileAttachButton`（S7 附件按钮，只在 <768px 显示；session scope，所以标准 props 自带 `useInput`/`inputActions`——往输入框写 `@路径` 走的就是 `inputActions.setDraft` 这条官方通路，不碰 DOM value）
   - `shell.overlay` → `MobileNavOverlay`（遮罩 / 浮动按钮 / Escape 与点击关闭，仅平板）
   - `shell.overlay` → `MobileHome`（<768px 全屏会话列表主页，order 20）
   - `conversation.session.header.utilities` → `MobileSessionInfo`（S4 会话信息卡，order 10，session scope；监听 `SESSION_INFO_EVENT` 打开，见下方核心文件说明）
@@ -48,6 +53,7 @@
   - `src/client/effects/`：客户端 effect，按域拆 3 文件（phone-chrome / aionui-compat / header-status）；`index.tsx` 只做编排（locale、样式注入、install 调用、slot 注册）。**S3 删掉了 `stats-line.ts`**（原来靠文本匹配给官方统计行打 `data-mobile-nav="stats"`）——统计行改用结构选择器 `[data-slot="conversation.composer.dock"] > [class$="_root"]` 命中，平板保留横滚条带、手机整行隐藏（数据 S4 进信息卡）。
   - `src/client/styles/composer.css.ts`：S3 手机 composer 重排，整块在 `@media (max-width: 767px)` 内，拼在 index.ts 最后。
   - `src/client/styles/info.css.ts`：S4 信息卡 sheet 样式，整块在 `@media (max-width: 767px)` 内，**必须排在 index.ts 拼接的最末尾**（要压过 `header.css.ts` 给 `header.utilities` 子元素的默认隐藏规则，见下方 pitfall）。
+  - `src/client/attach-upload.ts`：S7 附件的纯函数层（无 React / 无 DOM import，所以 `scripts/check-attach-upload.mjs` 能直接 import）。图片通路终点是 `session.prompt`（**会真的发消息**），所以能自动化验证的只有它构造出来的 payload，调用本身留给实机。
   - `src/client/locales.ts`：`mobileNav` i18n；`zh` 是 key 源真相，`en` 是类型镜像。
   - `scripts/build-client.mjs`：自定义打包器。
 - 构建流程：client tsc 输出到 `.client-build/`，`build-client.mjs` 把相对模块内联成 `window.__ModuleLoader__.load({...})` 并写入 `lib/client.js`，平台模块保留 `require()`；随后删除 `.client-build/` 和 `lib/client.js.map`。**bundle 支持递归内联 `styles/` 子目录模块**（`require` 按宿主模块目录解析到规范相对路径，再改写进扁平 `__modules` map；运行时 `__localRequire` 不变）。
@@ -160,6 +166,9 @@
 - **keyed slot（`conversation.chat.node`）只能「顶替」不能「包裹」**（S8 探路结论）：同一个 key 上第二次注册按 `priority` 升序取最低者渲染（dsh-client-ui-slots index.d.ts:542），没有 wrap 形式，也拿不到被顶替组件的可用引用——`ctx.slots.entries()` 里的 `component` 虽然能读到，但四份 props 是渲染机在**注册条目自己的** locale namespace 和 inject face 上合成的，外人渲染它拿不到对的 `t` 和服务。接管 `tool-call` 等于自己重写每个工具的展示，且注册是全局的（桌面就不再是 no-op）。**凡是「想给官方节点加壳」的需求，一律走 DOM 标记 + CSS，不要指望 keyed slot。**
 - **消息流里被隐藏的行必须整行 `display:none`，不能只藏内容**：`Md3f7G_column` 是 `display:flex; gap:16px`，空的 flex item 照样占一份 gap——只藏 `assistant-step` 里的 think 块、留下空壳行，读者会看到一列 16px 空带。S8 的判定：think 块的父容器到 flow item 之间每一层都是独棒子（`childElementCount === 1`）且 think 数 == 父容器子元素数时，折叠整行；否则只折叠 think 块本身（那行还有正文要显示）。
 - **effect 里挂在 attach/detach 之外的订阅会绕过断点门控**（S8，真 WebKit 1280px 实测抓到）：`installTurnFold` 把 `ctx.locale.subscribe(schedule)` 写在 `attach()` 外面（语言切换要刷新所有摘要行文案），结果 boot 期一次迟到的 dictionary 注册在桌面宽度触发了一次 `scan()`，1280px 下真的长出了 chip 和 `data-mnav-fold` 标记——因为所有会隐藏内容的规则都在手机 media query 里，**视觉上完全看不出来**（96 行全可见），只有探针查属性才发现。Chromium 三次都没复现，WebKit 复现。修法是在 `schedule()` 开头 `if (observer === null) return`。以后凡是效果里有「不随断点开关的订阅」，都要在回调入口再判一次挂载状态；验收探针也要查属性，不能只查可见性。
+
+- **`layout` / `compat` / `misc` 三个 CSS 文件共处一个跨文件的 `@media (max-width: 1023px)` 块**（layout 开头开、misc 结尾关，2026-08-17 ae0dfc6 修工作台关闭胶囊时确认）：所以往 compat.css.ts「顶层」写的规则，看着像全局默认，其实在 ≥1024px 完全不生效——「默认隐藏、窄屏再显示」这类写法会在桌面漏出控件。凡是要**不分断点**生效的规则（默认隐藏、reset、只在 DOM 里存在但永不该被看见的元素），一律放 `header/composer/chips/info/turn-fold` 这些**自己配平媒体块**的文件里，写在它们的 `@media` 之外。改前先 grep 目标文件有没有未闭合的 `@media`。
+- **`<input type="file">` 在任何宽度都必须显式隐藏（S7，2026-08-17 线上踩到）**：附件按钮是手机专属（`[data-mobile-nav="attach"]` 在 ≥768px 被隐藏），但它驱动的那个 input 在**所有宽度**都在 DOM 里。第一版把 `[data-mobile-nav="attach-picker"] { display: none }` 写进了 composer.css.ts 的 `@media (max-width: 767px)` 块里，桌面 composer 于是长出一个原生「Choose Files」控件——而且因为官方 slot 包装是 `display: contents`，它直接变成官方工具行的一个 flex item。该规则现在在 composer.css.ts **文件顶部、所有媒体块之外**。教训通用：隐藏某个手机控件时，同时清点它带进 DOM 的**所有**节点，不要只管那个看得见的按钮。
 
 ## Maintenance
 

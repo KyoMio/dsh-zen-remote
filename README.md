@@ -35,6 +35,7 @@
 - **设置弹窗重构**:分类标签收进单行横向滚动(细滚动条提示可滚动),顶部工具栏并入标签行共用一行,手机上隐藏「打开配置文件」按钮;
 - **分支胶囊**:git 分支芯片移入输入卡片内(todo 卡片上方),点击目标加大并带按压反馈;
 - **会话头部紧凑**:模式徽标在窄处省略、subagent 按钮居中,文件按钮固定保留;
+- **手机端附件上传**:composer 最左的回形针按钮打开**手机本地**的选择器(不设 accept,iOS 弹出 相册 / 拍照 / 选取文件 全选单;官方那套是在跑 DSH 的电脑上弹窗,手机远程用不了)。可内联的图片(png/jpeg/webp/gif)直接作为一条消息发进会话;其余文件(HEIC、PDF、压缩包……)上传到会话工作目录的 `.dsh-uploads/`,并把 `@.dsh-uploads/文件名` 追加到输入框,由你确认后再发送。**这会在插件的 host 半区注册一条 HTTP 路由** `POST /_dsh/mobile-nav/upload`:只接受同源请求、文件名清洗后只取叶子名、写入路径校验不得越出工作目录、单个文件默认上限 20MB(在 profile 的 `dsh-mobile-nav` 插件行加 `maxUploadBytes` 可调)。远程访问时它和其它请求一样在 dsh-mobile-pwa 网关的配对墙之后。仅 <768px 可见。
 - **诊断徽章**:访问 `?mobile-nav-debug=1` 显示悬浮诊断条(URL/视口/媒体查询/浮层状态/JS 错误),手机端问题取证用。
 
 ## 更新日志
@@ -107,6 +108,7 @@ pnpm build
 ## 验证
 
 - `pnpm verify` 类型检查;`dsh --profile web --dump-config` 应出现插件层;
+- 自检脚本:`node scripts/check-sunk-viewport.mjs`、`node scripts/check-attach-upload.mjs`、`node scripts/check-upload-endpoint.mjs`(需 Node ≥ 23.6);
 - 移动端(390px):rail 消失、抽屉开合/遮罩/Escape、设置弹窗适配、会话行三点菜单弹出时抽屉保持;
 - 桌面端(≥1024px):与未安装时一致。
 

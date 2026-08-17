@@ -22,7 +22,8 @@ export declare const zh: {
     readonly workbenchClose: "关闭工作台";
     readonly switchView: "切换视图";
     readonly attach: "添加附件";
-    readonly attachPending: "附件上传即将上线";
+    readonly attachBusy: "上传中…";
+    readonly attachFailed: "上传失败，点按重试";
     readonly infoClose: "关闭";
     readonly infoMode: "模式";
     readonly infoCwdFallback: "未知目录";
