@@ -255,3 +255,20 @@ test('injected HTML carries no trace of the old inline DEVICE_CSS block', async 
     assert.ok(page.body.includes('<link rel="stylesheet" href="/pwa/app.css">'), 'app.css link still present')
   } finally { await stop() }
 })
+
+test('manifest + icons are readable without the device cookie (credential-less browser fetch)', async () => {
+  const { stop } = await boot()
+  try {
+    // Browsers fetch the manifest (and the icons it lists) WITHOUT cookies by
+    // spec. Behind the pairing wall Chrome got the 401 pairing page instead:
+    // no install prompt, install name fell back to the upstream <title>.
+    const manifest = await request(PORT, { path: '/pwa/manifest.json', headers: REMOTE_HEADERS })
+    assert.equal(manifest.status, 200, 'manifest served without auth')
+    assert.ok(manifest.body.includes('"DeepSeek Harness Mobile"'), 'gateway manifest, not the pairing page')
+    const icon = await request(PORT, { path: '/pwa/icons/icon-192.png', headers: REMOTE_HEADERS })
+    assert.equal(icon.status, 200, 'icons served without auth')
+    // Everything else under /pwa/ stays behind the wall for unpaired remotes.
+    const sw = await request(PORT, { path: '/pwa/sw.js', headers: REMOTE_HEADERS })
+    assert.notEqual(sw.status, 200, 'sw.js still requires pairing')
+  } finally { await stop() }
+})

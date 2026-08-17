@@ -38,8 +38,12 @@ test('unpaired remote gets 401 pairing page; local-only surface rejects proxied 
       assert.strictEqual(r.status, 403, p + ' must be local-only')
     }
 
-    // /pwa assets are not served to unpaired clients either.
-    const asset = await request(PORT, { path: '/pwa/manifest.json', headers: REMOTE_HEADERS })
+    // Shell metadata (manifest + icons) is deliberately public — browsers
+    // fetch it credential-less, and behind the wall Chrome's install prompt
+    // silently broke (2026-08-17). Executable/app assets stay behind the wall.
+    const manifest = await request(PORT, { path: '/pwa/manifest.json', headers: REMOTE_HEADERS })
+    assert.strictEqual(manifest.status, 200)
+    const asset = await request(PORT, { path: '/pwa/sw.js', headers: REMOTE_HEADERS })
     assert.strictEqual(asset.status, 401)
   } finally { await stop() }
 })
