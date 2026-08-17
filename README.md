@@ -27,6 +27,10 @@ dsh plugin add dsh-mobile-remote
 
 装完重启 `dsh web`，手机界面与网关一起生效，不需要再手写任何配置行。
 
+> 兼容性：在 DSH `0.1.0-rc.6`（web profile）上开发并实测，最后验证 2026-08-18。
+
+卸载：`dsh plugin remove dsh-mobile-remote`（或从 profile 的 `dependencies` 与 `bundles` 里删掉那两行），重启 `dsh web` 即恢复原状；要清掉配对数据再删 `~/.dsh/lan-gate-state.json` 与 `~/.dsh/lan-gate.config.json`。
+
 <details>
 <summary>手动写法 / 本地开发</summary>
 
@@ -213,6 +217,14 @@ open http://127.0.0.1:3088/lan-gate/admin
 **经反代访问时设置页的插件配置列表空白**：直连 `127.0.0.1:3080` 正常。根因在 DSH 官方客户端的连接就绪超时判定，不在网关。绕法是要改插件配置时回本机浏览器改，配置存在后端，改完手机侧其它功能不受影响。
 
 ---
+
+## 权限与数据
+
+- **网络**：网关只监听本机（默认 `127.0.0.1:3088`），对外暴露完全由你的反代/隧道决定；推送经浏览器推送服务商中转（内容 aes128gcm 端到端加密，服务商读不到）；插件自身不向任何第三方上报数据。
+- **文件**：附件上传只写入当前会话工作目录下的 `.dsh-uploads/`；配对状态与配置存在 `~/.dsh/lan-gate-state.json` / `lan-gate.config.json`。
+- **凭据**：不收集、不存储任何账号密码；设备身份是本插件自己签发的随机令牌（HttpOnly Cookie）。
+
+排障：运行日志在 `~/.dsh/logs/web.log`（网关与推送的行带 `[dsh-mobile-remote-*]` 前缀）；手机端界面自检可用调试徽章（首页顶栏连点 5 下开关）。安全问题请走 GitHub Security Advisories 私下报告，不要公开提 issue。
 
 ## 上游致谢
 
