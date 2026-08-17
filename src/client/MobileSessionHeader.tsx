@@ -104,7 +104,7 @@ export function MobileHeaderActions({ t }: MobileHeaderActionsProps) {
         title={t('backToList')}
         onClick={() => window.dispatchEvent(new CustomEvent(GO_HOME_EVENT))}
       >
-        <IconChevronLeftOutline14 size={14} />
+        <IconChevronLeftOutline14 size={18} />
       </button>
       {tabs.length > 1 && active !== undefined && (
         <button
@@ -202,7 +202,7 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
         title={t('sessionInfo')}
         onClick={() => window.dispatchEvent(new CustomEvent(SESSION_INFO_EVENT))}
       >
-        <IconInfoOutline16 size={16} />
+        <IconInfoOutline16 size={20} />
       </button>
       <button
         type="button"
@@ -218,7 +218,7 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
             header.css.ts) instead of hand-drawing a new glyph. The panel
             icon's "left column" reads as "right column" flipped, which is
             exactly the workbench's own right-side-panel semantics. */}
-        <IconPanelLeftOutline16 size={16} />
+        <IconPanelLeftOutline16 size={20} />
       </button>
     </>
   )

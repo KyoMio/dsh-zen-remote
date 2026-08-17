@@ -206,7 +206,7 @@ export function MobileHome({
           aria-label={t('backToList')}
           onClick={() => actions.show('home')}
         >
-          <IconChevronLeftOutline14 size={14} />
+          <IconChevronLeftOutline14 size={18} />
         </button>
       )}
     <div data-mobile-nav="home" data-view={view} aria-hidden={view === 'session'}>
