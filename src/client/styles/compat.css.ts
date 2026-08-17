@@ -641,9 +641,10 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
      (checked live, both tabs, 2026-08-17), so bottom-center is clear
      regardless of which tab is open — one fixed position that does not
      need per-tab-type coordinates to dodge. */
-  [data-mobile-nav="better-sidebar-close"] {
-    display: none;
-  }
+  /* Default-hidden for this pill lives in header.css.ts, NOT here: this
+     whole file sits inside the shared (max-width: 1023px) block, so a rule
+     here can never hide anything at desktop widths (learned the hard way,
+     2026-08-17 desktop leak). */
   @media (max-width: 767px) {
     body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"] {
       display: flex !important;

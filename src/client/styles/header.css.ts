@@ -25,7 +25,16 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
 [data-mobile-nav="header-back"],
 [data-mobile-nav="header-viewrow"],
 [data-mobile-nav="header-info"],
-[data-mobile-nav="header-workbench"] {
+[data-mobile-nav="header-workbench"],
+/* The workbench close pill's default-hidden used to live in compat.css.ts —
+   but EVERYTHING in layout/compat/misc sits inside one shared
+   (max-width: 1023px) block (opened at the top of layout, closed at the end
+   of misc), so that "top-level" rule silently never applied at >=1024 and
+   the pill rendered as an unstyled button on desktop (2026-08-17 report).
+   This file is appended after the shared block closes, so here it is truly
+   global; the <=767px :has() show rule in compat overrides it with
+   !important. */
+[data-mobile-nav="better-sidebar-close"] {
   display: none;
 }
 
