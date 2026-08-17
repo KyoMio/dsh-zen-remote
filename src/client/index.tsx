@@ -1,5 +1,4 @@
 import type { ClientContext, SessionId, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
-import type { PromptContentPart } from '@deepseek-ai/dsh-api-remotes/client'
 import { MobileNavToggle } from './MobileNavToggle.tsx'
 import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
@@ -7,6 +6,7 @@ import { MobileHome } from './MobileHome.tsx'
 import { MobileHeaderActions, MobileHeaderUtilities } from './MobileSessionHeader.tsx'
 import { MobileSessionInfo } from './MobileSessionInfo.tsx'
 import { MobileAttachButton } from './MobileAttachButton.tsx'
+import { MobileAttachChips } from './MobileAttachChips.tsx'
 import { createNavStore } from './nav-store.ts'
 import { MOBILE_CSS } from './styles/index.ts'
 import { installDebugBadge } from './debug.ts'
@@ -145,20 +145,26 @@ export function apply(ctx: ClientContext): void {
   // styles/composer.css.ts hides it at >= 768px and orders it into the
   // leftmost seat of the phone composer row.
   //
-  // The image path is the only public browser->host byte channel there is
-  // (appendix F): session.prompt with inline base64 image parts. It is bound
-  // here rather than called from the component so the component keeps no
-  // ctx reference — same pattern as MobileSessionInfo's action bindings.
+  // No `inject` here: every attachment now rides the host upload route and
+  // the standard session props (`sessionId`, `inputActions`), so the button
+  // needs nothing bound off ctx. S7.1 removed the session.prompt binding that
+  // used to send inlineable images straight into the conversation.
   ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
     name: 'conversation.input.left',
     id: 'mobile-attach',
     order: 0,
     locale: NS,
-    inject: (_sessionId: SessionId) => ({
-      promptImages: (id: SessionId, content: PromptContentPart[]) =>
-        ctx.sessions.binding(id)?.session.prompt(content, 'queue'),
-    }),
   }, MobileAttachButton))
+
+  // Attachment preview row (S7.1), above the composer card. Renders purely
+  // off the draft's @.dsh-uploads/ tokens — see MobileAttachChips.tsx. Order 0
+  // puts it left of the git branch chip (order 100) on the shared dock line.
+  ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
+    name: 'conversation.input.dock',
+    id: 'mobile-attach-chips',
+    order: 0,
+    locale: NS,
+  }, MobileAttachChips))
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',

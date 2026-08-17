@@ -126,7 +126,10 @@ export function ensurePathInside(root: string, target: string): void {
  * Everything that could steer the write out of the upload directory is gone
  * after this: only the basename survives (so `../../etc/passwd` becomes
  * `passwd`), separators and control characters become `_`, leading dots are
- * dropped, and the Windows reserved device names are prefixed. Length is
+ * dropped, and the Windows reserved device names are prefixed. Whitespace
+ * folds to `_` rather than being kept: the client appends the result to the
+ * composer draft as an `@path` mention, and a mention with a space in it is
+ * broken for the agent reading it, not just for the chip parser. Length is
  * capped in BYTES because the label arrives as UTF-8.
  * @param raw - browser-supplied filename.
  * @returns a single safe leaf name, never empty.
@@ -135,7 +138,7 @@ export function safeUploadName(raw: string): string {
   const leaf = basename(raw.replaceAll('\\', '/')).normalize('NFC')
   let cleaned = leaf
     .replace(/[<>:"|?*\u0000-\u001f/\\]/gu, '_')
-    .replace(/\s+/gu, ' ')
+    .replace(/\s+/gu, '_')
     .replace(/^\.+/u, '')
     .trim()
     .replace(/[. ]+$/u, '')

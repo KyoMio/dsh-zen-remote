@@ -37,6 +37,7 @@
 - slot 注册：
   - `conversation.session.header.actions` → `MobileNavToggle`（目录开关 + 文件树按钮；<768px 目录开关被 CSS 隐藏）
   - `conversation.input.left` → `MobileAttachButton`（S7 附件按钮，只在 <768px 显示；session scope，所以标准 props 自带 `useInput`/`inputActions`——往输入框写 `@路径` 走的就是 `inputActions.setDraft` 这条官方通路，不碰 DOM value）
+  - `conversation.input.dock` → `MobileAttachChips`（S7.1 附件预览行，order 0，排在 git chip（order 100）左边，共用同一条可横滑的 dock 行）
   - `shell.overlay` → `MobileNavOverlay`（遮罩 / 浮动按钮 / Escape 与点击关闭，仅平板）
   - `shell.overlay` → `MobileHome`（<768px 全屏会话列表主页，order 20）
   - `conversation.session.header.utilities` → `MobileSessionInfo`（S4 会话信息卡，order 10，session scope；监听 `SESSION_INFO_EVENT` 打开，见下方核心文件说明）
@@ -53,7 +54,8 @@
   - `src/client/effects/`：客户端 effect，按域拆 3 文件（phone-chrome / aionui-compat / header-status）；`index.tsx` 只做编排（locale、样式注入、install 调用、slot 注册）。**S3 删掉了 `stats-line.ts`**（原来靠文本匹配给官方统计行打 `data-mobile-nav="stats"`）——统计行改用结构选择器 `[data-slot="conversation.composer.dock"] > [class$="_root"]` 命中，平板保留横滚条带、手机整行隐藏（数据 S4 进信息卡）。
   - `src/client/styles/composer.css.ts`：S3 手机 composer 重排，整块在 `@media (max-width: 767px)` 内，拼在 index.ts 最后。
   - `src/client/styles/info.css.ts`：S4 信息卡 sheet 样式，整块在 `@media (max-width: 767px)` 内，**必须排在 index.ts 拼接的最末尾**（要压过 `header.css.ts` 给 `header.utilities` 子元素的默认隐藏规则，见下方 pitfall）。
-  - `src/client/attach-upload.ts`：S7 附件的纯函数层（无 React / 无 DOM import，所以 `scripts/check-attach-upload.mjs` 能直接 import）。图片通路终点是 `session.prompt`（**会真的发消息**），所以能自动化验证的只有它构造出来的 payload，调用本身留给实机。
+  - `src/client/attach-upload.ts`：S7 附件的字符串层 + 缩略图登记表。**这个功能唯一的状态就是草稿本身**——每个附件在草稿里是一个 `@.dsh-uploads/名字` 令牌，chip 行是这段文本的纯函数（`mentionsIn`），× 就是 `draftWithoutMention`。所以没有任何列表要同步：用户手删文字、官方发送后清空草稿，chips 自己就没了。缩略图 URL 存模块级 Map（按钮和 chip 行是两个互不相邻的 slot entry，没有共同 React 祖先），chip 行每次重渲染把不再被引用的 object URL revoke 掉。
+  - `src/client/MobileAttachChips.tsx`：S7.1 附件预览行，挂 `conversation.input.dock`（不往官方卡里注入 DOM）。图片是 48px 缩略图方块，其余是名字胶囊（中段省略）；`<img>` **叠在**回形针图标上而不是二选一渲染——解不了的格式（HEIC 在非 WebKit）画不出来就自然露出图标，不需要 onError 状态。
   - `src/client/locales.ts`：`mobileNav` i18n；`zh` 是 key 源真相，`en` 是类型镜像。
   - `scripts/build-client.mjs`：自定义打包器。
 - 构建流程：client tsc 输出到 `.client-build/`，`build-client.mjs` 把相对模块内联成 `window.__ModuleLoader__.load({...})` 并写入 `lib/client.js`，平台模块保留 `require()`；随后删除 `.client-build/` 和 `lib/client.js.map`。**bundle 支持递归内联 `styles/` 子目录模块**（`require` 按宿主模块目录解析到规范相对路径，再改写进扁平 `__modules` map；运行时 `__localRequire` 不变）。
@@ -169,6 +171,9 @@
 
 - **`layout` / `compat` / `misc` 三个 CSS 文件共处一个跨文件的 `@media (max-width: 1023px)` 块**（layout 开头开、misc 结尾关，2026-08-17 ae0dfc6 修工作台关闭胶囊时确认）：所以往 compat.css.ts「顶层」写的规则，看着像全局默认，其实在 ≥1024px 完全不生效——「默认隐藏、窄屏再显示」这类写法会在桌面漏出控件。凡是要**不分断点**生效的规则（默认隐藏、reset、只在 DOM 里存在但永不该被看见的元素），一律放 `header/composer/chips/info/turn-fold` 这些**自己配平媒体块**的文件里，写在它们的 `@media` 之外。改前先 grep 目标文件有没有未闭合的 `@media`。
 - **`<input type="file">` 在任何宽度都必须显式隐藏（S7，2026-08-17 线上踩到）**：附件按钮是手机专属（`[data-mobile-nav="attach"]` 在 ≥768px 被隐藏），但它驱动的那个 input 在**所有宽度**都在 DOM 里。第一版把 `[data-mobile-nav="attach-picker"] { display: none }` 写进了 composer.css.ts 的 `@media (max-width: 767px)` 块里，桌面 composer 于是长出一个原生「Choose Files」控件——而且因为官方 slot 包装是 `display: contents`，它直接变成官方工具行的一个 flex item。该规则现在在 composer.css.ts **文件顶部、所有媒体块之外**。教训通用：隐藏某个手机控件时，同时清点它带进 DOM 的**所有**节点，不要只管那个看得见的按钮。
+- **官方没给第三方留「往 composer 挂附件 chip」的口子（S7.1 结论）**：`createDraftImages`/`addImages`/`draftImages` 只在 `ConversationController` 具体类和 InputBar 私有 inject 上，`ctx.conversation` 对外只暴露 `IConversation`（`input`/`blocks`/`send`/`updateQueue`/`cancel`/`loadOlder`），拿不到。**替代做法（现在用的）：把附件表示成草稿里的 `@路径` 文本令牌，chip 行从草稿解析出来渲染**——零状态同步、跟着官方发送/用户手删自动消失，也不需要任何私有 API。凡是「想在官方输入区加一排东西」的需求，先想想能不能用草稿文本当唯一真相。
+- **上传的文件名必须把空白折成 `_`（S7.1）**：`safeUploadName` 里 `\s+ → _` 不是洁癖——落盘路径会被拼成 `@.dsh-uploads/名字` 塞进草稿，带空格的路径对读它的 agent 就是断的（对 chip 行的 `\S+` 解析同样断）。改这个清洗函数时别把这条改回空格。
+- **Playwright 的 `setInputFiles` 对 `display:none` 的 `<input type="file">` 会一直挂住**（S7 探针踩到，两次超时才发现）：探针要驱动隐藏 picker，改用页内 `new DataTransfer()` + `input.files = dt.files` + 派发 `change`——这样测的也正是组件自己的 handler，而不是浏览器的文件选择对话框。
 
 ## Maintenance
 

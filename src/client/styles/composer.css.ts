@@ -287,6 +287,106 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     font-size: 11.5px !important;
   }
 
+  /* --- 7b. attachment chips (S7.1) ---
+     Our own dock entry opts OUT of the 26px pill cage above: an image chip is
+     a 48px tile. The row sits tight under the card's top edge, so the chips
+     read as part of the composer rather than as a floating strip. */
+  [data-slot="conversation.input.dock"] > [data-mobile-nav="attach-chips"] {
+    display: flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+    max-width: none !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    border-radius: 0 !important;
+    overflow: visible !important;
+    margin-bottom: -2px;
+  }
+  [data-mobile-nav="attach-chip"] {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    max-width: 62vw;
+    background: var(--dsw-alias-interactive-bg-hover, rgba(127, 127, 127, .12));
+    color: var(--dsw-alias-label-primary, inherit);
+  }
+  [data-mobile-nav="attach-chip"][data-kind="file"] {
+    height: 26px;
+    padding: 0 4px 0 8px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    line-height: 18px;
+  }
+  /* An image chip is the thumbnail: no name line, the filename lives in the
+     title attribute (and in the draft text right below). */
+  [data-mobile-nav="attach-chip"][data-kind="image"] {
+    width: 48px;
+    height: 48px;
+    padding: 0;
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  [data-mobile-nav="attach-chip-art"] {
+    position: relative;
+    display: grid;
+    place-items: center;
+    flex: none;
+    overflow: hidden;
+  }
+  [data-kind="file"] > [data-mobile-nav="attach-chip-art"] {
+    width: 16px;
+    height: 16px;
+    opacity: .7;
+  }
+  [data-kind="image"] > [data-mobile-nav="attach-chip-art"] {
+    width: 100%;
+    height: 100%;
+  }
+  /* The <img> is stacked over the paperclip, not swapped for it: a format the
+     engine cannot decode (HEIC outside WebKit) simply paints nothing and the
+     icon shows through — no onError state to carry. */
+  [data-mobile-nav="attach-chip-art"] img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: var(--dsw-alias-bg-layer-2, rgba(127, 127, 127, .18));
+  }
+  [data-mobile-nav="attach-chip-name"] {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  [data-mobile-nav="attach-chip-remove"] {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  /* On a tile the × floats in the corner over the picture, so it needs its own
+     ground to stay legible against an arbitrary photo. */
+  [data-kind="image"] > [data-mobile-nav="attach-chip-remove"] {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    background: rgba(0, 0, 0, .55);
+    color: #fff;
+  }
+  [data-mobile-nav="attach-chip-remove"]:active {
+    transform: scale(.9);
+  }
+
   /* --- 8. the official stats strip leaves the composer ---
      Its data moves into the session info card (S4). The row is the composer
      dock's own \`_root\` entry; the slot itself stays live for later entries. */
@@ -390,9 +490,14 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   }
 }
 
-/* The attachment button only exists for the phone shell. */
+/* The attachment button and its preview row only exist for the phone shell.
+   Both render at every width (the slots are not breakpoint-aware), so both
+   need hiding here — the dock-row rules that shape the chips live in the
+   < 768px block and would otherwise leave a bare, unstyled chip line in the
+   desktop composer. */
 @media (min-width: 768px) {
-  [data-mobile-nav="attach"] {
+  [data-mobile-nav="attach"],
+  [data-mobile-nav="attach-chips"] {
     display: none !important;
   }
 }

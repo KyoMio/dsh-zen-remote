@@ -52,7 +52,10 @@ try {
   // Dots and hyphens are ordinary filename characters and must be preserved
   // (a character-class typo here silently mangles every extension).
   assert.equal(safeUploadName('my-photo.2026.jpg'), 'my-photo.2026.jpg')
-  assert.equal(safeUploadName('照片 (1).png'), '照片 (1).png')
+  // Whitespace folds to _ so the client's @path mention stays one token.
+  assert.equal(safeUploadName('照片 (1).png'), '照片_(1).png')
+  assert.equal(safeUploadName('my  notes\tv2.txt'), 'my_notes_v2.txt')
+  assert.ok(!/\s/u.test(safeUploadName('a b c d.txt')))
   // Dotfiles, empty labels, and Windows device names.
   assert.equal(safeUploadName('...'), 'upload.bin')
   assert.equal(safeUploadName(''), 'upload.bin')
