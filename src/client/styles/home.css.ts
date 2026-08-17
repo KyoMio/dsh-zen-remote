@@ -8,6 +8,46 @@
 export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
 
 @media (max-width: 767px) {
+  /* --- the document never scrolls (S1.1, 2026-08-17) ---
+     Real-device symptom: the workspace title bar, the session header, the
+     composer and the FAB all slid with the finger — every fixed surface
+     "followed the drag". They are not misplaced; the whole DOCUMENT was
+     rubber-banding under them (they are absolute/in-flow inside the frame,
+     so a document-level bounce moves them all as one).
+
+     After the S2.1 box-sizing fix the document has no overflow at all
+     (scrollHeight === clientHeight, measured with ?mobile-nav-inset=54), so
+     this is not scrolling — it is iOS's elastic overscroll, which happens on
+     an unscrollable document too, and which an inner scroller chains into as
+     soon as it hits its own end.
+
+     overscroll-behavior: none on the viewport kills both halves at once: the
+     document itself gets no bounce, and overscroll chained up from the
+     message flow / session list is absorbed without moving anything.
+     overflow: hidden then hard-locks the document scroller so future content
+     can never reintroduce a real scroll. Set on html AND body: the spec
+     propagates the viewport's value from html, but engines have historically
+     read body, and neither is a scroll container we ever want.
+
+     Deliberately NOT position: fixed on body — the app shell does not need
+     it, and it is the variant that strands iOS's fixed elements behind the
+     on-screen keyboard. With plain overflow: hidden, iOS still pans the
+     visual viewport to reveal a focused textarea, so the composer stays
+     visible while typing without any visualViewport JS. */
+  html,
+  body {
+    overflow: hidden !important;
+    overscroll-behavior: none !important;
+  }
+
+  /* The message flow is the one scroller that regularly hits its end under a
+     finger. Root-level \`none\` already absorbs the chain, but containing it
+     at the source keeps the guarantee if the root rule is ever weakened
+     (the home list and both sheets already declare it). */
+  [data-phase] [class$="_scrollBody"] {
+    overscroll-behavior: contain !important;
+  }
+
   /* The official sidebar is no longer a drawer on a phone — the home screen
      replaced it. Hidden outright (not translated off-screen) so it cannot
      capture taps or hold layout. */
