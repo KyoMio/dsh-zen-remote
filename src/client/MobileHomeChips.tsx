@@ -178,42 +178,82 @@ function cloneIconHtml(svg: SVGElement): string {
 }
 
 /**
- * The harvest scan (S5.1). Walks the DIRECT children of the footer-action
- * slot root; each child is one plugin's entire rendered output for this
- * slot (verified live: our own {@link MobileDrawerFooter}'s
- * `data-mobile-nav="drawer-actions"` wrapper is one such child, a bare
- * icon-only `<button>` from a "scheduled tasks" plugin is another, and
- * dsh-usage-stats' `.usg_layer` wrapper is a third).
+ * True when `el` (or an ancestor up to and including `boundary`) looks like
+ * a transient dialog/overlay rather than a stable entry control: `role`
+ * `"dialog"`, `aria-modal="true"`, or a computed `position: fixed` (the
+ * shape every popup/panel in this codebase and its verified third-party
+ * plugins uses — settings, usage-stats' panel, scheduled-tasks' overlay).
+ * `getComputedStyle` resolves `position` from the cascade regardless of
+ * whether an ancestor is `display: none` (verified live 2026-08-17 against
+ * the hidden <768px sidebar), so this is reliable even though the subtree
+ * being scanned is not currently painted.
+ */
+function hasDialogAncestor(el: HTMLElement, boundary: HTMLElement): boolean {
+  let node: HTMLElement | null = el
+  while (node !== null) {
+    if (node.getAttribute('role') === 'dialog' || node.getAttribute('aria-modal') === 'true') return true
+    if (getComputedStyle(node).position === 'fixed') return true
+    if (node === boundary) break
+    node = node.parentElement
+  }
+  return false
+}
+
+/**
+ * The harvest scan (S5.1, stability fix S5.2 2026-08-17). Walks the DIRECT
+ * children of the footer-action slot root. The "one child = one plugin's
+ * entire output" assumption from S5.1 only holds when the plugin's
+ * component returns a single root element — it does NOT hold when a
+ * component returns a Fragment with multiple top-level nodes (e.g. a
+ * trigger button plus a conditionally-rendered dialog): the slot renderer
+ * has no per-entry wrapper, so a Fragment's second root node lands as its
+ * OWN direct child of the slot container the moment it mounts. Real-device
+ * report (2026-08-17): the "定时任务" (scheduled-tasks) plugin does exactly
+ * this — clicking its trigger inserts a NEW direct sibling child
+ * (`position: fixed` overlay + dialog) carrying several of its own buttons
+ * (close, "+ 新建任务", …), and the old querySelectorAll-everything scan
+ * harvested every one of them as a brand new chip on the next
+ * MutationObserver tick, while the dialog itself stayed invisible (nested
+ * under the <768px sidebar's `display: none` root — same class of bug
+ * chips.css.ts already portal-fixes for settings/usage-stats, see below).
  *
- * Two exclusions, in order:
+ * Three exclusions, in order:
  * 1. **Self**: any child that IS or CONTAINS a `[data-mobile-nav]` node —
  *    every element this plugin itself renders carries that attribute
  *    (AGENTS.md Conventions), so this one check keeps the harvest from
  *    re-discovering our own Files/Session-log buttons as "new" chips.
- * 2. **Already precisely wired**: a harvested button that is the SAME DOM
+ * 2. **Dialog/overlay children**: a child that IS, or whose first clickable
+ *    sits inside, a dialog-like element ({@link hasDialogAncestor}) is
+ *    skipped ENTIRELY — such children are the transient expanded content of
+ *    an entry this scan already harvested elsewhere (or will, from its own
+ *    always-present trigger), not a new plugin's persistent entry point.
+ * 3. **Already precisely wired**: a harvested button that is the SAME DOM
  *    node a {@link CHIP_DEFS} selector already resolves to (dsh-usage-stats'
  *    badge is both — verified live) is dropped, so the precise entry (better
  *    icon/label) always wins and the row never shows the plugin twice.
+ *
+ * Identity is bound to the CHILD, not to individual buttons: at most one
+ * candidate — the first clickable in DOM order (`querySelector`, not
+ * `querySelectorAll`) — is taken per direct child. A child that later grows
+ * MORE buttons in its own subtree (an inline, non-dialog expansion) keeps
+ * resolving to the same first button on every rescan, so it never mints
+ * additional chips either.
  */
 function scanHarvest(): HarvestedChip[] {
   const container = document.querySelector(FOOTER_ACTION_SLOT_SELECTOR)
   if (container === null) return []
   const result: HarvestedChip[] = []
-  const seen = new Set<HTMLElement>()
-  for (const child of Array.from(container.children)) {
+  for (const raw of Array.from(container.children)) {
+    const child = raw as HTMLElement
     if (child.hasAttribute('data-mobile-nav') || child.querySelector('[data-mobile-nav]') !== null) continue
-    const clickable: HTMLElement[] = child.matches('button, a[href]')
-      ? [child as HTMLElement]
-      : Array.from(child.querySelectorAll<HTMLElement>('button, a[href]'))
-    for (const el of clickable) {
-      if (seen.has(el)) continue
-      seen.add(el)
-      if (CHIP_DEFS.some((def) => def.selector !== null && document.querySelector(def.selector) === el)) continue
-      const name = harvestName(el)
-      if (name === '') continue
-      const svg = el.querySelector('svg')
-      result.push({ id: `harvest:${name}`, name, iconHtml: svg === null ? '' : cloneIconHtml(svg), el })
-    }
+    const el: HTMLElement | null = child.matches('button, a[href]') ? child : child.querySelector('button, a[href]')
+    if (el === null) continue
+    if (hasDialogAncestor(el, child)) continue
+    if (CHIP_DEFS.some((def) => def.selector !== null && document.querySelector(def.selector) === el)) continue
+    const name = harvestName(el)
+    if (name === '') continue
+    const svg = el.querySelector('svg')
+    result.push({ id: `harvest:${name}`, name, iconHtml: svg === null ? '' : cloneIconHtml(svg), el })
   }
   return result
 }

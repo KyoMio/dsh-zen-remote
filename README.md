@@ -165,6 +165,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 - [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)(移动端全宽抽屉,本插件在会话页头部给它留入口位)——本机实测 **0.12.2**
 - [dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats)(用量与余额,主屏 chips 行可直接打开)
+- [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins)(定时任务,主屏 chips 行自动收割入口)——本机实测 **0.2.0**
 - dsh-at-file(@文件引用)
 - [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit)(图像 Q&A/OCR,配合手机端附件上传使用)
 - [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all)(文件树 / 预览 / 任务看板 / SSH / 宠物 / 会话统计 / 远程配对 / 设置)——沿用上游兼容规则,本次未扩展
