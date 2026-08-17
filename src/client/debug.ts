@@ -118,12 +118,22 @@ export function installDebugBadge(ctx: ClientContext): void {
        enable gesture lives on the home screen, which a user deep inside a
        session cannot reach without first getting out of the way of the badge
        — so the off switch belongs on the badge itself. */
+    /* The full read-out is tall enough to cover the session list, and with
+       pointer-events:auto (required for the escape hatch) it swallowed every
+       tap under it — the user could not open a session with debug on. The
+       badge therefore starts COLLAPSED (a one-line pill showing vh, the
+       number that matters for the viewport-shrink bug) and only expands on
+       demand. Single tap toggles collapsed/expanded (deferred 620ms so it
+       can be distinguished from the exit gesture); double tap still exits. */
     let lastTap = 0
+    let collapsed = true
+    let singleTapTimer: ReturnType<typeof setTimeout> | undefined
     const onBadgeTap = (event: Event) => {
       event.preventDefault()
       event.stopPropagation()
       const now = Date.now()
       if (now - lastTap < 600) {
+        if (singleTapTimer !== undefined) clearTimeout(singleTapTimer)
         localStorage.removeItem(DEBUG_KEY)
         const url = new URL(location.href)
         url.searchParams.delete('mobile-nav-debug')
@@ -131,6 +141,10 @@ export function installDebugBadge(ctx: ClientContext): void {
         return
       }
       lastTap = now
+      singleTapTimer = setTimeout(() => {
+        collapsed = !collapsed
+        paint()
+      }, 620)
     }
     badge.addEventListener('click', onBadgeTap)
 
@@ -141,8 +155,9 @@ export function installDebugBadge(ctx: ClientContext): void {
         return el === null ? 'absent' : getComputedStyle(el).visibility
       }
       const frame = document.querySelector<HTMLElement>('[data-mobile-nav="frame"]')
+      if (collapsed) return `DBG vh ${innerHeight}/${screen.height} ▸ 单击展开 双击关闭`
       return [
-        '⟳ 双击本框关闭 debug',
+        '▾ 单击收起 · 双击关闭 debug',
         `URL ${location.pathname}${location.search}`,
         `W ${innerWidth} x ${innerHeight} dpr ${devicePixelRatio}`,
         `mq≤1023 ${matchMedia('(max-width: 1023px)').matches}  mq≥1024 ${matchMedia('(min-width: 1024px)').matches}`,
