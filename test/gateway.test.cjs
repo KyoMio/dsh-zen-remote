@@ -41,6 +41,11 @@ test('gateway: serves PWA assets (/pwa/manifest.json, /pwa/sw.js)', async () => 
     const manifest = await request(PORT, { path: '/pwa/manifest.json' })
     assert.strictEqual(manifest.status, 200)
     assert.strictEqual(JSON.parse(manifest.body).display, 'standalone')
+    // background_color is load-bearing, not decoration: iOS 26.x leaves a dead
+    // ~59px strip below a standalone PWA's viewport (see AGENTS.md) and paints
+    // it with this colour. It must stay equal to the mobile plugin's light
+    // page background so the strip disappears into the page.
+    assert.strictEqual(JSON.parse(manifest.body).background_color, '#f9fafb')
 
     const sw = await request(PORT, { path: '/pwa/sw.js' })
     assert.strictEqual(sw.status, 200)

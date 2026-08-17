@@ -47,6 +47,19 @@ service worker, touch layout, gestures, agent-done push) into the served HTML.
 
 ## Key behaviours — don't break these
 
+0. **`manifest.json` 的 `background_color` 是功能性的，不是装饰**（2026-08-17，iOS 26.5
+   实机）：iOS 26.x 有一族 standalone PWA 全屏回归，在用户机器上表现为**网页区比屏幕矮
+   一条状态栏（393x852 屏上 vh 793，底部留下约 59px 死区）**，冷启动即存在、与键盘无关、
+   删掉重加主屏图标也不消失，同一台机器用 Safari 浏览器打开则完全正常（vh 695、各项贴合
+   全对）。那条死区在页面之外，任何 CSS 都够不着，系统用 manifest 的 `background_color`
+   画它——所以该值已从 `#0f1115` 改成 `#f9fafb`，与 dsh-mobile-nav 插件浅色主题的页面底色
+   （`--dsw-specific-sidebar-fill`）一致，让白带融进页面。这是**视觉缓解，不是修复**：
+   深色主题下反而更显眼（暂无办法，manifest 不支持随主题切换），系统修好之后该值也无副
+   作用（死区不存在就画不出来）。副作用要知道：`background_color` 同时是启动闪屏底色，
+   所以闪屏从深色变浅色了。改这个值前先读 `test/gateway.test.cjs` 里钉住它的断言。
+   顺带澄清一条反复被重新提出的候选修法：`lan-gate-server.cjs` 的 `APPLE_META`
+   **自 v0.1.0 起就一直注入 `apple-mobile-web-app-status-bar-style=black-translucent`**
+   （对所有 kind 无条件注入），它在位且跟这个毛病无关，别再当作"还没做的修法"。
 1. **Isolation**: the gateway is a child process. Never import its server code into
    the DSH process; keep spawn + lifecycle in `lan-gate.mjs`.
 2. **`pwa/` serves the real browser scripts**: `/pwa/manifest.json`, `/pwa/sw.js`,
