@@ -183,7 +183,7 @@ Besides env vars, the **recommended way is the config file** `~/.dsh/lan-gate.co
 ```json
 {
   "host": "0.0.0.0",
-  "trustedProxies": "192.168.3.2",
+  "trustedProxies": "192.168.1.2",
   "rateLimit": 600,
   "pushSummary": true
 }
@@ -290,7 +290,6 @@ npm test   # boots a mock upstream, runs the gateway/auth/push suites: proxy+inj
 | `pwa/offline.html` | Offline fallback page |
 | `pwa/icons/` | SVG source + rasterized PNGs (192/512 + maskable) |
 | `cordis.patch.yml` / `.example` | Bundle patch layer / static-mount example |
-| `docs/spec-public-auth-push.md`, `docs/plan-public-auth-push.md` | Design spec and implementation plan for this rework |
 | `test/gateway.test.cjs` | Smoke tests: gateway boot, `/pwa` asset serving, HTML injection |
 | `test/auth.test.cjs` | Pairing flow, tokens, lockout, v1-state archival, survives restart |
 | `test/push.test.cjs` | Push subscribe/send, VAPID encryption, expired-subscription cleanup |

@@ -99,9 +99,10 @@ server {
     }
 }
 ```
+
 </details>
 
-<details>
+<details open>
 <summary><b>Caddy</b></summary>
 
 ```
@@ -109,9 +110,10 @@ dsh.example.com {
     reverse_proxy 127.0.0.1:3088
 }
 ```
+
 </details>
 
-<details>
+<details open>
 <summary><b>没有公网 IP？用 Cloudflare Tunnel</b></summary>
 
 家宽拿不到公网 IP、或者不想在路由器上开端口时用这个：`cloudflared` 从你这台机器主动连出去，Cloudflare 那边负责域名、证书和入口，路由器一个端口都不用开。免费版够用。

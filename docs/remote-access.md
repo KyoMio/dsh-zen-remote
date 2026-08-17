@@ -258,7 +258,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 ```json
 {
   "host": "0.0.0.0",
-  "trustedProxies": "192.168.3.2",
+  "trustedProxies": "192.168.1.2",
   "rateLimit": 600,
   "pushSummary": true
 }
@@ -361,7 +361,6 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 | `pwa/offline.html` | 离线回退页 |
 | `pwa/icons/` | SVG 源 + 192/512 PNG + maskable 图标 |
 | `cordis.patch.yml` / `.example` | 插件 bundle 挂载层 / 静态挂载示例 |
-| `docs/spec-public-auth-push.md`、`docs/plan-public-auth-push.md` | 这次公网开放改造的设计文档与实施计划 |
 | `test/gateway.test.cjs` | 网关启停、`/pwa` 资源、HTML 注入的冒烟测试 |
 | `test/auth.test.cjs` | 配对流程、令牌、错码锁定、v1 状态归档、重启后设备存活 |
 | `test/push.test.cjs` | 推送订阅与发送、VAPID 加密、失效订阅自动清理 |

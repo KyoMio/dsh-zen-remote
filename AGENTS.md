@@ -38,10 +38,6 @@ pnpm test      # 网关 43 个 node:test 用例 + 三个界面自检脚本，一
 | --- | --- |
 | [`docs/remote-access.md`](docs/remote-access.md) | 通道半边：反代配置（nginx/Caddy/Lucky）、配对流程、环境变量表、管理 API、推送、安全边界 |
 | [`docs/interface.md`](docs/interface.md) | 界面半边：断点策略、调试徽章、安全区体系、兼容插件清单 |
-| [`docs/dev-channel.md`](docs/dev-channel.md) | 通道半边的开发约定与「别踩」清单 |
-| [`docs/dev-interface.md`](docs/dev-interface.md) | 界面半边的开发约定与大量实机踩坑记录 |
-| [`docs/spec-public-auth-push.md`](docs/spec-public-auth-push.md) / [`docs/plan-public-auth-push.md`](docs/plan-public-auth-push.md) | 公网开放改造的设计与实施计划 |
-| `docs/superpowers/**` | 界面 app 化重写各切片的设计与计划 |
 
 ## 合仓后仍然成立的硬约束
 
@@ -52,5 +48,4 @@ pnpm test      # 网关 43 个 node:test 用例 + 三个界面自检脚本，一
   是历史事故的根源，加规则前先确认归属。
 - **`lib/` 是产物，不手改**：改 `src/` → `pnpm build` → 提交 `lib/`。
 - **桌面必须 no-op**：≥1024px 逐像素与未安装时一致。
-- 其余「别踩」条目见 `docs/dev-channel.md` 与 `docs/dev-interface.md`——它们
   是从真机事故里攒出来的，改相关代码前先读。

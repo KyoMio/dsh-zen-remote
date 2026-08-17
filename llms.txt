@@ -17,5 +17,4 @@
 - README.md (中文，安装与配置为主), AGENTS.md (repo guide), LICENSE.
 - docs/remote-access.md(.en.md) — gateway detail: reverse proxy, pairing, env, admin API, push, security boundary.
 - docs/interface.md — interface detail: breakpoints, debug badge, safe-area system, compatible plugins.
-- docs/dev-channel.md, docs/dev-interface.md — developer guides for the two halves.
 - .ai/ — AI Project OS state, memory, decisions, tasks.
