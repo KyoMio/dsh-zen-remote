@@ -40,7 +40,10 @@ export interface MobileHomeChipsProps {
  * only when both true: the user has not hidden it (useChipsPrefs) AND its
  * target actually exists right now (useDetectedIds / sessionId) — an
  * uninstalled plugin's chip never appears, matching the plan's "按用户实装
- * 插件逐个接入口".
+ * 插件逐个接入口". Chips beyond {@link CHIP_DEFS} (S5.1: any OTHER plugin's
+ * own sidebar-footer-action entry) are auto-discovered by
+ * {@link useHarvestedChips} and appended after the hand-registered ones —
+ * "装了新插件、chips 行零代码长出对应入口".
  */
 export declare function MobileHomeChips({ t, sessionId, downloadSessionLog, onCustomize }: MobileHomeChipsProps): import("react").JSX.Element;
 /**

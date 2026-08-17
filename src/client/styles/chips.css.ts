@@ -136,6 +136,20 @@ export const CHIPS_CSS = `/* ---------- chips row + settings entry (S5) --------
     background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
   }
 
+  /* Harvested chip icon (S5.1): the cloned <svg> keeps whatever width/height
+     the source plugin gave it (18px for the one verified live example) —
+     force it down to the same 16px box every hand-registered chip icon
+     uses, CSS wins over the presentational SVG attributes. */
+  [data-mobile-nav="chip-harvest-icon"] {
+    display: inline-flex;
+    flex: none;
+  }
+  [data-mobile-nav="chip-harvest-icon"] svg {
+    display: block;
+    width: 16px;
+    height: 16px;
+  }
+
   /* Customize sheet: toggle rows inside the SAME home-sheet-layer/mask/sheet
      chrome the workspace switcher declares in home.css.ts — S6's
      drag-to-close and mask-click-close bind to
