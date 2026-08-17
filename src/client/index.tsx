@@ -12,6 +12,7 @@ import { installDebugBadge } from './debug.ts'
 import { installPhoneChrome } from './effects/phone-chrome.ts'
 import { installAionuiCompat } from './effects/aionui-compat.ts'
 import { installHeaderStatusDot } from './effects/header-status.ts'
+import { installGestures } from './effects/gestures.ts'
 import { NS, en, zh } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 
@@ -55,6 +56,9 @@ export function apply(ctx: ClientContext): void {
   // Session header running-status dot (S2): no official element exists to
   // reposition, so this reads ctx.sessions directly and self-draws via CSS.
   installHeaderStatusDot(ctx)
+
+  // S6: content-area swipe (Chat/Trajectory) + sheet drag-to-close.
+  installGestures(ctx)
 
   // Page-stack store (apply world) — created before any registration so
   // every slot below (the phone home screen, the session header's back

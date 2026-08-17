@@ -40,8 +40,13 @@ export interface ViewTabInfo {
  * classes) — the plan's one sanctioned official-DOM read: ChatStore's view
  * selection has no public setter (design doc Appendix C), so switching
  * views means clicking the official tab button ourselves.
+ *
+ * Exported: effects/gestures.ts (S6) reuses this exact read for the
+ * content-area swipe gesture instead of re-querying the tablist a second
+ * way — it runs outside React (a document-level touch listener), so it
+ * needs the plain function, not the {@link useViewTabs} hook below.
  */
-function readViewTabs(): ViewTabInfo[] {
+export function readViewTabs(): ViewTabInfo[] {
   const list = document.querySelector('header [role="tablist"]')
   if (list === null) return []
   return [...list.querySelectorAll<HTMLButtonElement>('[role="tab"]')].map((el) => ({

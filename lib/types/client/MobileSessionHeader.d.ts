@@ -9,6 +9,18 @@ export interface ViewTabInfo {
     el: HTMLButtonElement;
 }
 /**
+ * Reads the official session-header tablist by role/aria only (no hashed
+ * classes) — the plan's one sanctioned official-DOM read: ChatStore's view
+ * selection has no public setter (design doc Appendix C), so switching
+ * views means clicking the official tab button ourselves.
+ *
+ * Exported: effects/gestures.ts (S6) reuses this exact read for the
+ * content-area swipe gesture instead of re-querying the tablist a second
+ * way — it runs outside React (a document-level touch listener), so it
+ * needs the plain function, not the {@link useViewTabs} hook below.
+ */
+export declare function readViewTabs(): ViewTabInfo[];
+/**
  * Live view-tab mirror. The tablist mounts/unmounts with the session header
  * and its `aria-selected` flips on every view switch (ours or the suite's
  * own), so a MutationObserver — not a one-time read — keeps the mirror
