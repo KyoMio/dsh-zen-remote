@@ -12,7 +12,6 @@ export declare const zh: {
     readonly allWorkspaces: "全部";
     readonly switchWorkspace: "切换工作区";
     readonly newSession: "新建会话";
-    readonly newSessionIn: "在工作区新建会话";
     readonly noSessions: "还没有会话，点右下角加号开始";
     readonly backToList: "返回会话列表";
     readonly sessionInfo: "会话信息";

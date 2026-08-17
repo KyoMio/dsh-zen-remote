@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import {
   IconChevronDownOutline14,
+  IconChevronLeftOutline14,
   IconPlusOutline16,
   StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -27,8 +28,6 @@ export type MobileHomeProps =
 /** Phone breakpoint: below the tablet range, where the app-shell layout applies. */
 const PHONE_QUERY = '(max-width: 767px)'
 
-/** Long-press threshold for the FAB's workspace menu. */
-const LONG_PRESS_MS = 450
 
 /** Live matchMedia hook for the phone breakpoint. */
 function usePhone(): boolean {
@@ -89,7 +88,7 @@ export function MobileHome({
   // list re-renders on any session change anyway (the running dots live here).
   const sessions = useSessions((s) => s)
   const workspaces = useWorkspaces((s) => s)
-  const [sheet, setSheet] = useState<'filter' | 'create' | null>(null)
+  const [sheet, setSheet] = useState<'filter' | null>(null)
 
   // Workspace of the current session — the untouched filter default.
   const currentWorkspaceId = useMemo(() => {
@@ -119,17 +118,6 @@ export function MobileHome({
       .sort((a, b) => b.updatedAt - a.updatedAt)
   }, [sessions.ids, sessions.byId, workspaces.archivedSessionIds, selectedWorkspace])
 
-  // FAB press: a tap starts a session in the selected workspace, a long press
-  // opens the workspace menu first.
-  const timer = useRef<number | null>(null)
-  const longPressed = useRef(false)
-  const cancelPress = (): void => {
-    if (timer.current === null) return
-    window.clearTimeout(timer.current)
-    timer.current = null
-  }
-  useEffect(() => cancelPress, [])
-
   // The session header's back button (session scope) cannot hold this
   // store directly — a handle mounts under exactly one scope, and this one
   // is already root-scoped here (see nav-store.ts) — so it dispatches
@@ -151,6 +139,20 @@ export function MobileHome({
   const title = selectedWorkspace?.title ?? t('allWorkspaces')
 
   return (
+    <>
+      {/* Hero (new blank session) renders no conversation.session.header, so the
+        * header-slot back button doesn't exist there. This floating fallback is
+        * hidden by CSS whenever the real header back is mounted. */}
+      {view === 'session' && (
+        <button
+          type="button"
+          data-mobile-nav="hero-back"
+          aria-label={t('backToList')}
+          onClick={() => actions.show('home')}
+        >
+          <IconChevronLeftOutline14 size={14} />
+        </button>
+      )}
     <div data-mobile-nav="home" data-view={view} aria-hidden={view === 'session'}>
       <div data-mobile-nav="home-top">
         <button
@@ -194,23 +196,7 @@ export function MobileHome({
         data-mobile-nav="home-fab"
         aria-label={t('newSession')}
         title={t('newSession')}
-        onContextMenu={(event) => event.preventDefault()}
-        onPointerDown={() => {
-          longPressed.current = false
-          cancelPress()
-          timer.current = window.setTimeout(() => {
-            longPressed.current = true
-            timer.current = null
-            setSheet('create')
-          }, LONG_PRESS_MS)
-        }}
-        onPointerUp={() => {
-          cancelPress()
-          if (longPressed.current) return
-          enter(() => startSession(selectedWorkspace?.workspaceId))
-        }}
-        onPointerLeave={cancelPress}
-        onPointerCancel={cancelPress}
+        onClick={() => enter(() => startSession(selectedWorkspace?.workspaceId))}
       >
         <IconPlusOutline16 size={22} />
       </button>
@@ -225,37 +211,29 @@ export function MobileHome({
             onClick={() => setSheet(null)}
           />
           <div data-mobile-nav="home-sheet" role="menu">
-            <div data-mobile-nav="home-sheet-title">
-              {sheet === 'filter' ? t('switchWorkspace') : t('newSessionIn')}
-            </div>
-            {sheet === 'filter' && (
-              <button
-                type="button"
-                role="menuitem"
-                data-mobile-nav="home-sheet-item"
-                data-selected={selected === 'all' ? '' : undefined}
-                onClick={() => {
-                  actions.filter('all')
-                  setSheet(null)
-                }}
-              >
-                {t('allWorkspaces')}
-              </button>
-            )}
+            <div data-mobile-nav="home-sheet-title">{t('switchWorkspace')}</div>
+            <button
+              type="button"
+              role="menuitem"
+              data-mobile-nav="home-sheet-item"
+              data-selected={selected === 'all' ? '' : undefined}
+              onClick={() => {
+                actions.filter('all')
+                setSheet(null)
+              }}
+            >
+              {t('allWorkspaces')}
+            </button>
             {workspaces.items.map((item) => (
               <button
                 key={item.workspaceId}
                 type="button"
                 role="menuitem"
                 data-mobile-nav="home-sheet-item"
-                data-selected={sheet === 'filter' && selected === item.workspaceId ? '' : undefined}
+                data-selected={selected === item.workspaceId ? '' : undefined}
                 onClick={() => {
-                  if (sheet === 'filter') {
-                    actions.filter(item.workspaceId)
-                    setSheet(null)
-                    return
-                  }
-                  enter(() => startSession(item.workspaceId))
+                  actions.filter(item.workspaceId)
+                  setSheet(null)
                 }}
               >
                 {item.title}
@@ -265,5 +243,6 @@ export function MobileHome({
         </div>
       )}
     </div>
+    </>
   )
 }

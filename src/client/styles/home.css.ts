@@ -255,5 +255,33 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
   [data-mobile-nav="home-sheet-item"]:active {
     background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
   }
+
+  /* --- hero fallback back button ---
+     The hero (new blank session) page renders no conversation.session.header,
+     so the header-slot back button (S2) does not exist there. This floating
+     fallback covers that page and hides itself as soon as the real header
+     back mounts. */
+  [data-mobile-nav="hero-back"] {
+    position: absolute;
+    top: calc(env(safe-area-inset-top, 0px) + 8px);
+    left: 8px;
+    z-index: 6;
+    width: 44px;
+    height: 44px;
+    display: grid;
+    place-items: center;
+    border: none;
+    border-radius: 14px;
+    background: transparent;
+    color: var(--dsw-alias-label-secondary, inherit);
+    pointer-events: auto;
+  }
+  [data-mobile-nav="hero-back"]:active {
+    background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
+  }
+  [data-mobile-nav="frame"]:has([data-mobile-nav="header-back"]) ~ [data-mobile-nav="hero-back"],
+  body:has([data-mobile-nav="header-back"]) [data-mobile-nav="hero-back"] {
+    display: none;
+  }
 }
 `
