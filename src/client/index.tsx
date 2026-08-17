@@ -9,7 +9,7 @@ import { MobileAttachButton } from './MobileAttachButton.tsx'
 import { createNavStore } from './nav-store.ts'
 import { MOBILE_CSS } from './styles/index.ts'
 import { installDebugBadge } from './debug.ts'
-import { installPhoneChrome } from './effects/phone-chrome.ts'
+import { installPhoneChrome, installViewportHeal } from './effects/phone-chrome.ts'
 import { installAionuiCompat } from './effects/aionui-compat.ts'
 import { installHeaderStatusDot } from './effects/header-status.ts'
 import { installGestures } from './effects/gestures.ts'
@@ -50,6 +50,11 @@ export function apply(ctx: ClientContext): void {
   installDebugBadge(ctx)
 
   installPhoneChrome(ctx)
+
+  // Standalone-PWA only: undo the WebKit keyboard bug that permanently steals
+  // the status-bar height from the viewport (the ~60px band under the
+  // composer and the session list). No-op in any browser tab.
+  installViewportHeal(ctx)
 
   installAionuiCompat(ctx)
 
