@@ -8,7 +8,11 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert')
-const { startMockTarget, startGateway, request, stopAll } = require('./util.cjs')
+const { startMockTarget, startGateway, request, stopAll, pairDevice, REMOTE_HEADERS } = require('./util.cjs')
+
+const VIEWPORT_RE = /<meta[^>]*name=["']?viewport["']?[^>]*>/gi
+// Exactly what DSH itself serves today — the tag the gateway has to rewrite.
+const DSH_VIEWPORT = '<meta name="viewport" content="width=device-width, initial-scale=1" />'
 
 const PORT = 39202
 const TARGET_PORT = 39201
@@ -72,6 +76,46 @@ function balanced(s) {
   }
   return depth === 0
 }
+
+// The cold-start safe area depends on viewport-fit=cover being in the HTML
+// itself, not added later by the plugin bundle.
+test('gateway: adds a viewport meta with viewport-fit=cover when upstream has none', async () => {
+  const { stop } = await boot()
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    const metas = page.body.match(VIEWPORT_RE) || []
+    assert.strictEqual(metas.length, 1, 'exactly one viewport meta')
+    assert.match(metas[0], /viewport-fit=cover/)
+  } finally { await stop() }
+})
+
+test('gateway: rewrites an existing viewport meta instead of duplicating it', async () => {
+  const target = await startMockTarget(TARGET_PORT, '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' + DSH_VIEWPORT + '</head><body>ok</body></html>')
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    const metas = page.body.match(VIEWPORT_RE) || []
+    assert.strictEqual(metas.length, 1, 'exactly one viewport meta')
+    assert.match(metas[0], /viewport-fit=cover/)
+  } finally { await stopAll(target, gw.child) }
+})
+
+// Devices pinned to "desktop" keep the upstream viewport untouched.
+test('gateway: leaves the viewport alone for kind=desktop devices', async () => {
+  const target = await startMockTarget(TARGET_PORT, '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' + DSH_VIEWPORT + '</head><body>ok</body></html>')
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  try {
+    const { cookie, id } = await pairDevice(PORT, 'desk')
+    await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'set-kind', id, kind: 'desktop' } })
+    const page = await request(PORT, { path: '/', headers: Object.assign({ accept: 'text/html', cookie }, REMOTE_HEADERS) })
+    assert.ok(page.body.includes('data-lan-device="desktop"'), 'served as a desktop device')
+    const metas = page.body.match(VIEWPORT_RE) || []
+    assert.strictEqual(metas.length, 1)
+    assert.doesNotMatch(metas[0], /viewport-fit/)
+  } finally { await stopAll(target, gw.child) }
+})
 
 test('gateway: injected inline scripts have balanced braces (quoting bug guard)', async () => {
   const { stop } = await boot()
