@@ -53,6 +53,51 @@ test('gateway: serves PWA assets (/pwa/manifest.json, /pwa/sw.js)', async () => 
   } finally { await stop() }
 })
 
+// sw.js is served from /pwa/sw.js, so its default scope is only /pwa/ and it
+// would never control the app itself (start_url "/"). Chrome only allows a
+// register({scope}) wider than the script's directory when the response
+// carries this header (paired with inject.js passing { scope: '/' }).
+test('gateway: /pwa/sw.js response carries Service-Worker-Allowed: / so it can control the whole app', async () => {
+  const { stop } = await boot()
+  try {
+    const sw = await request(PORT, { path: '/pwa/sw.js' })
+    assert.strictEqual(sw.status, 200)
+    assert.strictEqual(sw.headers['service-worker-allowed'], '/')
+
+    // Other /pwa/ assets must NOT get this header — it's meaningless (and
+    // pointless clutter) for anything that isn't the worker script itself.
+    const manifest = await request(PORT, { path: '/pwa/manifest.json' })
+    assert.strictEqual(manifest.headers['service-worker-allowed'], undefined)
+  } finally { await stop() }
+})
+
+test('gateway: injected bootstrap registers the service worker with scope "/"', async () => {
+  const { stop } = await boot()
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.match(page.body, /navigator\.serviceWorker\.register\(['"]\/pwa\/sw\.js['"],\s*\{\s*scope:\s*['"]\/['"]\s*\}\)/, 'register() call passes an explicit scope of "/"')
+  } finally { await stop() }
+})
+
+// DSH's own page already ships its own <link rel="manifest" href="/manifest.webmanifest">
+// (generic name, single icon, display:fullscreen). Left in place it sits
+// BEFORE the gateway's own manifest link in <head>, and a document only ever
+// honors the FIRST rel="manifest" link — so the gateway's mobile-tailored
+// manifest.json (proper icons, branding, the background_color the iOS
+// dead-strip fix depends on) was silently shadowed and never took effect.
+test('gateway: strips an upstream-supplied manifest link so the gateway\'s own /pwa/manifest.json is the only one and actually governs', async () => {
+  const target = await startMockTarget(TARGET_PORT, '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><link rel="manifest" href="/manifest.webmanifest" /></head><body>ok</body></html>')
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    const links = page.body.match(/<link[^>]*rel=["']?manifest["']?[^>]*>/gi) || []
+    assert.strictEqual(links.length, 1, 'exactly one manifest link survives')
+    assert.ok(links[0].includes('/pwa/manifest.json'), 'the surviving link is the gateway\'s own')
+    assert.ok(!page.body.includes('/manifest.webmanifest'), 'the shadowed upstream manifest link is gone')
+  } finally { await stopAll(target, gw.child) }
+})
+
 test('gateway: injects manifest link, PWA bootstrap & app.css into HTML (local)', async () => {
   const { stop } = await boot()
   try {

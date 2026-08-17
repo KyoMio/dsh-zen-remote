@@ -9,9 +9,13 @@
   if (!window.__DSH_PWA__) window.__DSH_PWA__ = {}
 
   // ---- Register service worker ----------------------------------------
+  // Explicit scope: '/' — the script lives at /pwa/sw.js, so its default
+  // scope is only /pwa/ and it would never control the app itself (start_url
+  // "/"). The gateway sends Service-Worker-Allowed: / with the sw.js
+  // response so Chrome permits a scope wider than the script's own directory.
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/pwa/sw.js').then((reg) => {
+      navigator.serviceWorker.register('/pwa/sw.js', { scope: '/' }).then((reg) => {
         window.__DSH_PWA__.reg = reg
       }).catch((err) => {
         console.warn('[dsh-pwa] SW registration failed:', err)
