@@ -42,6 +42,8 @@ export const zh = {
   'infoArchive': '归档',
   'infoArchiveConfirm': '归档后将从会话列表隐藏，确定继续？',
   'infoActionError': '操作失败：{message}',
+  'turnFold': '过程 · {count} 步',
+  'turnFoldRunning': '进行中 · {count} 步',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -85,6 +87,8 @@ export const en: Record<MobileNavKey, string> = {
   'infoArchive': 'Archive',
   'infoArchiveConfirm': 'Archiving hides this session from the list. Continue?',
   'infoActionError': 'Action failed: {message}',
+  'turnFold': 'Process · {count} steps',
+  'turnFoldRunning': 'Working · {count} steps',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

@@ -41,6 +41,8 @@ export declare const zh: {
     readonly infoArchive: "归档";
     readonly infoArchiveConfirm: "归档后将从会话列表隐藏，确定继续？";
     readonly infoActionError: "操作失败：{message}";
+    readonly turnFold: "过程 · {count} 步";
+    readonly turnFoldRunning: "进行中 · {count} 步";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

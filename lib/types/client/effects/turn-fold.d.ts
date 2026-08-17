@@ -1,0 +1,25 @@
+import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+/**
+ * S8 — collapse a turn's process into one summary row (< 768px only).
+ *
+ * Route taken: DOM marking, not the `conversation.chat.node` keyed slot.
+ * That slot dispatches on node kind and a second registration at a key
+ * SHADOWS the official renderer (dsh-client-ui-slots index.d.ts:542 — the
+ * cell's lowest-priority live entry renders, there is no wrapping form and
+ * no `children` handle to the shadowed component). Taking `tool-call` would
+ * mean re-implementing every tool's presentation, its `t` seat comes from
+ * the entry's own declared locale namespace and its services from the
+ * registrant's own inject face — neither is reachable from here — and the
+ * registration is global, so the desktop no-op would be gone too.
+ *
+ * The DOM route needs no class names: ChatNodeSeat stamps every row with
+ * `data-chat-flow-kind` / `data-chat-flow-key` (lib/client.js:5228) and
+ * ReasoningRow stamps `data-variant="think"` — turn grouping is pure
+ * structure (the run of rows following one `user` row), never text.
+ *
+ * ponytail: one rAF-coalesced full rescan per DOM mutation batch, O(rows).
+ * If a very long session ever makes streaming feel heavy, narrow the
+ * observer to the flow column's own childList and diff instead.
+ */
+export declare function installTurnFold(ctx: ClientContext): void;
+//# sourceMappingURL=turn-fold.d.ts.map

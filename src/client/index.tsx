@@ -13,6 +13,7 @@ import { installPhoneChrome, installViewportHeal } from './effects/phone-chrome.
 import { installAionuiCompat } from './effects/aionui-compat.ts'
 import { installHeaderStatusDot } from './effects/header-status.ts'
 import { installGestures } from './effects/gestures.ts'
+import { installTurnFold } from './effects/turn-fold.ts'
 import { NS, en, zh } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 
@@ -64,6 +65,12 @@ export function apply(ctx: ClientContext): void {
 
   // S6: content-area swipe (Chat/Trajectory) + sheet drag-to-close.
   installGestures(ctx)
+
+  // S8: fold a turn's process (tool calls, injected context, slash commands,
+  // Think rows) behind one summary chip. Chat view only, phone only — see
+  // effects/turn-fold.ts for why the keyed conversation.chat.node seat could
+  // not carry this.
+  installTurnFold(ctx)
 
   // Page-stack store (apply world) — created before any registration so
   // every slot below (the phone home screen, the session header's back
