@@ -1,6 +1,8 @@
 <h1 align="center">dsh-mobile-pwa</h1>
 <p align="center">Turn DeepSeek Harness into a mobile PWA you can safely reach from the public internet: pairing-code auth + token identity + real Web Push, with your own reverse proxy terminating TLS.</p>
 
+> This package is `packages/gateway` (package name `dsh-mobile-pwa`) of [dsh-mobile-remote](../../README.md). See the [root README](../../README.md) for the overall picture, the split with the mobile-UI package, installation and known issues; this file is the package's own detailed documentation.
+
 Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate) secure-gateway base, with PWA differentiation.
 
 [![npm version](https://img.shields.io/npm/v/dsh-mobile-pwa)](https://www.npmjs.com/package/dsh-mobile-pwa)

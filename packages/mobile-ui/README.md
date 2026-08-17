@@ -1,5 +1,7 @@
 # dsh-web-mobile
 
+> 本包是 [dsh-mobile-remote](../../README.md) 的 `packages/mobile-ui`（包名 `@dsh-external/dsh-mobile-nav`）。整体定位、与网关包的分工、安装与已知问题见 [根 README](../../README.md)；本文是本包自己的详细文档。
+
 尽可能的使dsh适配竖屏等移动端设备
 
 [![Release v2.0.0](https://img.shields.io/badge/release-v2.0.0-5B4CF0?style=flat-square)](package.json)

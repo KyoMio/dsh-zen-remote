@@ -1,6 +1,8 @@
 <h1 align="center">dsh-mobile-pwa</h1>
 <p align="center">把 DeepSeek Harness 变成能安全接到公网的手机 PWA：配对码认证 + 令牌身份 + 真 Web Push，你自己的反代终结 TLS。</p>
 
+> 本包是 [dsh-mobile-remote](../../README.md) 的 `packages/gateway`（包名 `dsh-mobile-pwa`）。整体定位、与界面包的分工、安装与已知问题见 [根 README](../../README.md)；本文是本包自己的详细文档。
+
 基于 MIT 的 [`dsh-mobile-gate`](https://github.com/Bernardxu123/dsh-mobile-gate)（安全网关基座）做差异化增强。
 
 [![npm version](https://img.shields.io/npm/v/dsh-mobile-pwa)](https://www.npmjs.com/package/dsh-mobile-pwa)

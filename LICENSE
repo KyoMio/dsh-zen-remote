@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 dsh-mobile-remote contributors
+Copyright (c) 2026 mexiaosqwq — original dsh-web-mobile (upstream of packages/mobile-ui)
+Copyright (c) 2026 dsh-mobile-pwa contributors — upstream of packages/gateway
+Copyright (c) 2026 Bernardxu123 — original dsh-mobile-gate (base for packages/gateway/lib/lan-gate-server.cjs)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+NOTICE — provenance of the two packages merged into this repository:
+
+* `packages/mobile-ui` derives from `dsh-web-mobile` (MIT, mexiaosqwq), rewritten
+  into an app-shell information architecture for phone widths (v2.0).
+* `packages/gateway` derives from `dsh-mobile-pwa` (MIT), which itself derives
+  from `dsh-mobile-gate` (MIT, Bernardxu123). The gateway
+  `packages/gateway/lib/lan-gate-server.cjs` is based on that original, extended
+  with pairing-code authentication, per-device tokens, PWA manifest/service-worker
+  injection and VAPID Web Push.
+
+Each package keeps its own LICENSE file with the upstream copyright lines intact.
