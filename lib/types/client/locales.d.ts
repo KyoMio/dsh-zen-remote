@@ -16,6 +16,7 @@ export declare const zh: {
     readonly backToList: "返回会话列表";
     readonly sessionInfo: "会话信息";
     readonly workbench: "工作台";
+    readonly workbenchClose: "关闭工作台";
     readonly switchView: "切换视图";
     readonly attach: "添加附件";
     readonly attachPending: "附件上传即将上线";

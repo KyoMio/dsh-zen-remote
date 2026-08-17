@@ -76,55 +76,73 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     order: 7 !important;
   }
 
-  /* --- 3. permission + model as icon-and-label capsules ---
-     The official PermissionSelect hides its label through a container query
-     (\`@container (width <= 460px)\`) — on a phone the row is always narrower
-     than that, so the label must be re-shown explicitly. Both triggers then
-     get the same filled-capsule shell; the logic underneath is untouched. */
-  ${PERM} [class$="_triggerLabel"] {
-    display: block !important;
+  /* --- 3. permission + model as icon-only pills (real-device round 2, 2026-08-17) ---
+     S3's icon-and-label capsules read as noise on an actual phone — there
+     is no room to usefully show a preset name or a model id, so the label
+     text is now hidden outright and both triggers collapse to a plain
+     ~44x30 icon button. This AGREES with (rather than fights) the official
+     container query (\`@container (width <= 460px) { .trigger:has(.triggerIcon)
+     .triggerLabel { display: none } }\`) that S3 had to override — no need
+     to override it back. Accessible name is unaffected: both official
+     triggers already ship a descriptive aria-label independent of the
+     visible text (PermissionSelect: t('input.accessMode', {name}); the
+     model trigger: t('trigger.aria'/'trigger.ariaEffort')) — verified live
+     in dsh-client-ui-conversation / dsh-client-ui-model-selection lib/
+     client.js, 2026-08-17 — so hiding the label costs nothing for screen
+     readers. The permission trigger only renders an icon for the
+     "read-only" / "workspace-write" presets (permissionGlyphs in
+     dsh-client-ui-conversation) — "Full access" and any host-configured
+     preset name fall back to chevron-only, a known gap in the official
+     markup this plugin cannot fill without inventing new icon meaning.
+     The model trigger never renders an icon at all (only label + optional
+     effort text + chevron), so its ::before below draws one from a
+     primitives icon path (Sparkle — the closest existing "model" glyph) as
+     a CSS-only pseudo-element: it survives React re-renders for free
+     (unlike a DOM-injected node, which would need a MutationObserver, see
+     the preview-full-toggle pitfall in AGENTS.md) and does not touch
+     accessible-name computation (empty generated content). S3's
+     rtl-ellipsis trick on the model label is simply inert under
+     display:none now; left alone rather than unpicked. */
+  ${PERM} [class$="_triggerLabel"],
+  ${MODEL} > [class$="_trigger"] > [class$="_triggerLabel"],
+  ${MODEL} > [class$="_trigger"] > [class$="_triggerEffort"] {
+    display: none !important;
   }
   ${PERM} button[class$="_trigger"],
   ${MODEL} > [class$="_trigger"] {
     background: var(--dsw-specific-selector, rgba(127, 127, 127, .12)) !important;
+    width: 44px !important;
     height: 30px !important;
     max-width: none !important;
     min-width: 0 !important;
-    padding: 0 6px 0 8px !important;
-    gap: 3px !important;
-    font-size: 12px !important;
+    padding: 0 !important;
+    gap: 2px !important;
+    justify-content: center !important;
     border-radius: 999px !important;
     touch-action: manipulation !important;
   }
-  /* Width budget at 390px: 340px of row minus attach 28 + "+" 28 + ring 28 +
-     send 34 and five 5px gaps leaves 197px for the two capsules. 116px caps
-     the permission capsule at exactly its natural width with the full preset
-     name ("Workspace Write"), and the model seat takes the rest. */
-  ${PERM} button[class$="_trigger"] {
-    max-width: 116px !important;
-  }
-  ${PERM} button[class$="_trigger"] > [class$="_triggerLabel"],
-  ${MODEL} > [class$="_trigger"] > [class$="_triggerLabel"] {
-    flex: 1 1 auto !important;
-    min-width: 0 !important;
-  }
-  /* The model ID physically cannot fit on a 390px row (AGENTS.md: the full
-     default ID needs a >= ~415px viewport), so it always ellipsizes. Clip the
-     HEAD instead of the tail — "…-V4-Flash" identifies the model, whereas the
-     official tail clip leaves the useless shared prefix ("DeepSee…"). rtl
-     only moves the ellipsis; the Latin run itself still reads left to right. */
-  ${MODEL} > [class$="_trigger"] > [class$="_triggerLabel"] {
-    direction: rtl !important;
-    text-align: left !important;
-  }
   /* PermissionSelect wraps its trigger in the Menu primitive's root span,
-     which must shrink with the capsule. */
+     which must shrink to the icon button's fixed width. */
   ${PERM} > span:has(> button[class$="_trigger"]) {
-    flex: 0 1 auto !important;
+    flex: 0 0 auto !important;
     min-width: 0 !important;
   }
-  ${MODEL} > [class$="_trigger"] {
-    width: 100% !important;
+  /* ic_ds_sparkle_16 (@deepseek-ai/dsh-client-ui-primitives IconSparkle16
+     path, copied verbatim) as a mask so it inherits currentColor like every
+     other icon in the row — the model trigger has no official icon slot to
+     hook into. */
+  ${MODEL} > [class$="_trigger"]::before {
+    content: '';
+    width: 16px;
+    height: 16px;
+    flex: none;
+    background: currentColor;
+    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.1 3.1Q6.6 7.8 11.3 8.3Q6.6 8.8 6.1 13.5Q5.6 8.8 0.9 8.3Q5.6 7.8 6.1 3.1Z'/%3E%3Cpath d='M11.9 1Q12.2 3.7 14.9 4Q12.2 4.3 11.9 7Q11.6 4.3 8.9 4Q11.6 3.7 11.9 1Z'/%3E%3C/svg%3E");
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.1 3.1Q6.6 7.8 11.3 8.3Q6.6 8.8 6.1 13.5Q5.6 8.8 0.9 8.3Q5.6 7.8 6.1 3.1Z'/%3E%3Cpath d='M11.9 1Q12.2 3.7 14.9 4Q12.2 4.3 11.9 7Q11.6 4.3 8.9 4Q11.6 3.7 11.9 1Z'/%3E%3C/svg%3E");
+    -webkit-mask-size: contain;
+    mask-size: contain;
+    -webkit-mask-repeat: no-repeat;
+    mask-repeat: no-repeat;
   }
 
   /* --- 4. both menus become bottom sheets ---
@@ -175,14 +193,22 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     --dsh-composer-text-max-height: 124px;
   }
 
-  /* --- 6. no divider above the composer ---
-     Instead of a rule the messages butt against, the message scroller fades
-     out over its last 26px. The mask lives on the scroll body (NOT on the
-     composer): a mask clips everything it paints, and the composer now hosts
-     two position:fixed bottom sheets that must not be clipped. */
+  /* --- 6. no divider above OR below the message list ---
+     Instead of a rule the messages butt against, the message scroller
+     fades out over its last 26px (S3, no divider above the composer) AND
+     fades in over its first 20px (S3.1 real-device round 2: the header's
+     own bottom line is removed too, styles/header.css.ts's
+     \`header::after\` rule). The mask lives on the scroll body (NOT on the
+     header or the composer): a mask clips everything it paints, and both
+     surfaces host position:fixed children (composer's permission/model
+     sheets, any future header overlay) that must not be clipped.
+     \`mask-image\` can only be declared once per element, so both fades are
+     ONE linear-gradient rather than two separate declarations (the second
+     would silently replace the first) — this is the merge of what used to
+     be S3's bottom-only mask. */
   [class$="_scrollBody"] {
-    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 26px), transparent);
-    mask-image: linear-gradient(to bottom, #000 calc(100% - 26px), transparent);
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 20px, #000 calc(100% - 26px), transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 20px, #000 calc(100% - 26px), transparent 100%);
   }
   [class$="_composerSeat"],
   [class$="_composerStack"] {

@@ -111,6 +111,18 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     min-height: 52px;
     padding: 4px 16px 6px;
   }
+  /* Site logo (real-device round 2, 2026-08-17): rendered only when
+     document.head actually has a <link rel="icon"> (MobileHome.tsx never
+     ships a placeholder box), so this rule only ever needs to size the
+     image, not reserve space for its absence. */
+  [data-mobile-nav="home-logo"] {
+    width: 24px;
+    height: 24px;
+    margin-right: 6px;
+    flex: none;
+    border-radius: 6px;
+    object-fit: contain;
+  }
   [data-mobile-nav="ws-switch"] {
     display: inline-flex;
     align-items: center;

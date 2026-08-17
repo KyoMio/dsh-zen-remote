@@ -585,7 +585,79 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
   [data-dsh-better-sidebar] [class$="_panelHidden"] {
     padding-top: calc(var(--mnav-sat) + var(--dsh-title-bar-strip, 0px)) !important;
   }
-  [data-dsh-better-sidebar] [class$="_toggleCluster"] {
-    top: calc(var(--mnav-sat) + var(--dsh-title-bar-strip, 0px) + 3px) !important;
+  /* Only the tablet/desktop range still shows the cluster (see the hide
+     rule below) — the notch offset is now dead weight below 768px, so it
+     is scoped out rather than left applying invisibly. min-width:768px
+     rather than the more common max-width pairing: this offset was
+     already a harmless no-op at >=1024px before S3.1 (--mnav-sat is 0 on
+     every desktop browser), so narrowing its floor to 768px changes
+     nothing there either — it only stops evaluating on phone. */
+  @media (min-width: 768px) {
+    [data-dsh-better-sidebar] [class$="_toggleCluster"] {
+      top: calc(var(--mnav-sat) + var(--dsh-title-bar-strip, 0px) + 3px) !important;
+    }
+  }
+
+  /* ---------- dsh-better-sidebar: hide the phone toggle cluster (S3.1, 2026-08-17) ----------
+     Real-device round 2 feedback: this fixed top-right cluster duplicates
+     — and visually overlaps — the session header's own workbench button
+     (MobileSessionHeader.tsx), which already opens/closes the same panel
+     by clicking this cluster's toggle button through. Hidden below 768px
+     only; the 768-1023px tablet range has no workbench button (header.css.ts
+     scopes that entire reflow to <768px) and still depends on this cluster
+     as its only entry point, so it stays exactly as v1.0.0/S2.1 shipped it
+     there. The cluster also holds the panel's own close affordance — see
+     [data-mobile-nav="better-sidebar-close"] below for the phone
+     replacement, wired up in MobileSessionHeader.tsx. */
+  @media (max-width: 767px) {
+    [data-dsh-better-sidebar] [class$="_toggleCluster"] {
+      display: none !important;
+    }
+  }
+
+  /* ---------- dsh-better-sidebar: phone close button (S3.1 follow-up, 2026-08-17) ----------
+     Appended to document.body by MobileSessionHeader.tsx's
+     MobileHeaderUtilities effect — never inside the panel's own subtree
+     (the third party's React re-renders would wipe it) and never under any
+     transformed/backdrop-filter ancestor (the S4 info-card WebKit lesson in
+     AGENTS.md: position:fixed re-anchors to the nearest such ancestor
+     instead of the viewport). Default hidden — belt-and-braces, same
+     reasoning as header.css.ts's [data-mobile-nav="header-info"] etc list:
+     React does not know about media queries. Shown only below 768px AND
+     only while the panel is actually open: the panel's own class name ends
+     in "_panel" exclusively in the open state (the "_panelHidden" suffix is
+     appended once closed, so the string no longer ends in "_panel") — a
+     pure-CSS :has() open/closed read, no MutationObserver required. */
+  [data-mobile-nav="better-sidebar-close"] {
+    display: none;
+  }
+  @media (max-width: 767px) {
+    body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"] {
+      display: flex !important;
+      position: fixed;
+      top: calc(var(--mnav-sat) + 8px);
+      right: 8px;
+      z-index: 70;
+      align-items: center;
+      justify-content: center;
+      width: 44px;
+      height: 44px;
+      padding: 0;
+      border: none;
+      border-radius: 50%;
+      background: var(--dsw-alias-bg-base, #fff);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, .2);
+      color: var(--dsw-alias-label-primary, inherit);
+      cursor: pointer;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+    body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"] svg {
+      width: 16px;
+      height: 16px;
+    }
+    body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"]:active {
+      opacity: .6;
+    }
   }
 `

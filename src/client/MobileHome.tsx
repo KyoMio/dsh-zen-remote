@@ -41,6 +41,20 @@ function usePhone(): boolean {
   return phone
 }
 
+/**
+ * The site's own favicon, read at runtime from `document.head` (real-device
+ * round 2 feedback: a home-screen logo, without shipping any trademarked
+ * asset in this repo). A one-time lazy read is enough — the gateway/host
+ * writes this `<link>` before the client bundle ever runs (same "first
+ * frame" guarantee AGENTS.md documents for `viewport-fit=cover`), and
+ * favicons do not change at runtime in practice, so there is no case here
+ * that justifies a MutationObserver.
+ */
+function useSiteIconHref(): string | undefined {
+  const [href] = useState(() => document.querySelector<HTMLLinkElement>('link[rel~="icon"]')?.href)
+  return href
+}
+
 // Timestamps use the browser's own locale data — no dictionary keys, correct
 // plurals everywhere. Deliberately NOT `document.documentElement.lang`: the
 // shell stamps zh-CN there while the UI copy follows the browser languages
@@ -82,6 +96,8 @@ export function MobileHome({
   t,
 }: MobileHomeProps) {
   const phone = usePhone()
+  const iconHref = useSiteIconHref()
+  const [iconBroken, setIconBroken] = useState(false)
   const view = useStore((s) => s.view)
   const pinned = useStore((s) => s.workspace)
   // Whole snapshots: both stores keep unchanged rows identity-stable, and the
@@ -155,6 +171,15 @@ export function MobileHome({
       )}
     <div data-mobile-nav="home" data-view={view} aria-hidden={view === 'session'}>
       <div data-mobile-nav="home-top">
+        {iconHref !== undefined && !iconBroken && (
+          <img
+            src={iconHref}
+            alt=""
+            aria-hidden="true"
+            data-mobile-nav="home-logo"
+            onError={() => setIconBroken(true)}
+          />
+        )}
         <button
           type="button"
           data-mobile-nav="ws-switch"

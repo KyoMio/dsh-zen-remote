@@ -57,6 +57,20 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     position: relative;
     padding: 0 8px 28px !important;
   }
+  /* No header bottom line — fade instead (real-device round 2, 2026-08-17).
+     The official header draws its border as a \`::after\` 1px bar (the
+     \`border-bottom\` on the header itself is transparent, just a layout
+     reserve — dsh-client-ui-conversation lib/client.js ".wSkVaW_header{
+     border-bottom:1px solid #0000}.wSkVaW_header:after{...height:1px;
+     position:absolute;bottom:1px...}", verified live 2026-08-17), so
+     hiding the pseudo-element is enough; the header's own border-bottom
+     never had a visible color to begin with. The message scroller now
+     fades in from under the header instead (styles/composer.css.ts, "no
+     divider above OR below the message list" — the two edges share one
+     mask-image on [class$="_scrollBody"]). */
+  [data-phase] header::after {
+    display: none !important;
+  }
   /* grid-row: 1 on every item is load-bearing, not decoration (S2.1 fix for
      the "标题被挤下去" report). The three items are placed with explicit
      grid-column but arrive in DOM order crumbs(2) → headerActions(1) →
@@ -259,9 +273,16 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   [data-mobile-nav="header-workbench"]:active {
     background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
   }
-  [data-mobile-nav="header-info"] > span {
-    font-size: 17px;
-    line-height: 1;
+  /* Icon family unification (real-device round 2, 2026-08-17): the ⓘ text
+     glyph is gone (MobileSessionHeader.tsx now renders IconInfoOutline16,
+     a local 16px SVG built to match the primitives icon family) and the
+     workbench button's IconPanelLeftOutline16 is mirrored into a
+     panel-RIGHT glyph — there's no IconPanelRightOutline16 in primitives
+     (checked lib/types/icons/index.d.ts), and the plugin's own right-side
+     panel semantics are exactly the left icon flipped. Both buttons now
+     carry a same-size (16px), same-stroke-weight icon. */
+  [data-mobile-nav="header-workbench"] svg {
+    transform: scaleX(-1);
   }
 
   /* Official Chat/Trajectory tablist: removed from layout entirely (S2.1 —
