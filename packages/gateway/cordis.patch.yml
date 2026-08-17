@@ -1,0 +1,9 @@
+# dsh-mobile-pwa — bundle patch layer
+#
+# Applied when a profile lists this package in dsh.profile.bundles
+# (installed via `dsh plugin --profile web add dsh-mobile-pwa`).
+# The row references the package by name; Node resolution finds
+# lan-gate.mjs inside the installed package.
+- insert:
+    - id: dsh-mobile-pwa
+      name: dsh-mobile-pwa

@@ -1,0 +1,61 @@
+{
+  "name": "dsh-mobile-pwa",
+  "version": "0.3.0",
+  "description": "Complete mobile PWA for DeepSeek Harness (DSH): pairing-code + device-token gateway for public-internet access behind your own reverse proxy (nginx/Caddy), install-to-homescreen (manifest), offline-capable service worker, touch-first gestures, real Web Push agent-done notifications, and dark compact mobile UI. 配对码 + 反代对接的公网 PWA 完整方案 for DeepSeek Harness.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lan-gate.mjs",
+  "files": [
+    "lan-gate.mjs",
+    "dsh-push.mjs",
+    "lib",
+    "pwa",
+    "cordis.patch.yml",
+    "cordis.patch.yml.example",
+    "AGENTS.md",
+    "llms.txt",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.cjs\""
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-plugin-add",
+    "deepseek-harness",
+    "deepseek-harness-plugin",
+    "pwa",
+    "progressive-web-app",
+    "mobile",
+    "phone",
+    "mobile-ui",
+    "remote-access",
+    "pairing",
+    "public",
+    "service-worker",
+    "web-push",
+    "offline",
+    "reverse-proxy",
+    "gateway",
+    "ai-agent"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zylzyqzz/dsh-mobile-pwa.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "web-push": "^3.6.7"
+  }
+}

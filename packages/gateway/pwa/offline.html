@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f1115">
+  <title>离线 · DSH</title>
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      min-height: 100dvh; display: flex; align-items: center; justify-content: center;
+      font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(1100px 700px at 50% -10%, #1b2233 0%, #0f1115 55%);
+      color: #e6e8ec; padding: max(20px, env(safe-area-inset-top)) 16px;
+      -webkit-text-size-adjust: 100%;
+    }
+    .card { width: 100%; max-width: 420px; text-align: center; }
+    .dot { width: 80px; height: 80px; margin: 0 auto 20px; border-radius: 24px;
+      background: linear-gradient(135deg, #4c8dff, #7a5cff); display: flex; align-items: center;
+      justify-content: center; font-size: 34px; font-weight: 700; color: #fff; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    p { font-size: 14px; line-height: 1.8; color: #9aa3b2; margin: 0; }
+    .spin { width: 38px; height: 38px; margin: 26px auto 0; border-radius: 50%;
+      border: 3px solid #2a2f3a; border-top-color: #4c8dff; animation: a .9s linear infinite; }
+    @keyframes a { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="dot">DSH</div>
+    <h1>离线 / Offline</h1>
+    <p>无法连接到 DSH 服务器。<br>请在服务器侧确认网关与 DSH 仍在运行。</p>
+    <div class="spin"></div>
+  </div>
+  <script>setInterval(() => location.reload(), 5000)</script>
+</body>
+</html>

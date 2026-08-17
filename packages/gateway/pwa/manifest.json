@@ -1,0 +1,29 @@
+{
+  "name": "DeepSeek Harness Mobile",
+  "short_name": "DSH Mobile",
+  "description": "DeepSeek Harness on your phone. Secure remote access to your own DSH server.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f9fafb",
+  "theme_color": "#0f1115",
+  "categories": ["developer tools", "productivity", "ai"],
+  "lang": "zh-CN",
+  "dir": "auto",
+  "prefer_related_applications": false,
+  "shortcuts": [
+    {
+      "name": "New conversation",
+      "short_name": "New chat",
+      "url": "/",
+      "icons": [{ "src": "/pwa/icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+    }
+  ],
+  "icons": [
+    { "src": "/pwa/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/pwa/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
