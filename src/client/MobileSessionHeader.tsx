@@ -104,7 +104,7 @@ export function MobileHeaderActions({ t }: MobileHeaderActionsProps) {
         title={t('backToList')}
         onClick={() => window.dispatchEvent(new CustomEvent(GO_HOME_EVENT))}
       >
-        <IconChevronLeftOutline14 size={18} />
+        <IconChevronLeftOutline14 size={20} />
       </button>
       {tabs.length > 1 && active !== undefined && (
         <button
