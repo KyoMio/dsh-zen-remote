@@ -17,6 +17,42 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
  *   zoom; modern browsers are covered by the stylesheet's
  *   touch-action: manipulation (which keeps pan and pinch zoom).
  */
+/**
+ * Candidate test for the "sunk viewport" model of the iOS standalone-PWA
+ * quirk (S1.2, 2026-08-17). NOT WIRED TO ANY STYLE — deliberately.
+ *
+ * Real-device numbers (iPhone, standalone PWA, 393x852 screen): innerHeight
+ * 793, env top 59 (= 852 - 793), env bottom 34, frame bottom 793 flush.
+ * One reading is that the system already pushed the layout viewport below the
+ * status bar while env() still reports the full notch, so --mnav-sat pads a
+ * second time. But the user reports the session header sits correctly right
+ * under the notch, and a ~60px white band at the BOTTOM — which instead fits
+ * a viewport anchored at screen y=0 and merely 59px short of the screen
+ * bottom. Both models predict the same innerHeight; only the viewport's
+ * on-screen ORIGIN separates them, and that is what the debug badge now
+ * measures (screenY / visualViewport offsets / the two edge markers).
+ *
+ * So this stays a pure, tested predicate that the badge merely displays.
+ * Wiring it to zero --mnav-sat is a one-liner once the screenshot settles
+ * which model is real; doing it now would break a top edge that is correct.
+ * See scripts/check-sunk-viewport.mjs — no desktop browser can enter the mode.
+ *
+ * The `envTop > 0` guard is what keeps every other standalone install out:
+ * landscape iPhone (top inset 0, the notch moves to left/right), iPad, and
+ * Android — where standalone also loses status-bar height off innerHeight but
+ * reports env top 0 — all fall through to false.
+ */
+export function isViewportSunkBelowStatusBar(input: {
+  standalone: boolean
+  screenHeight: number
+  innerHeight: number
+  envTop: number
+}): boolean {
+  return input.standalone
+    && input.envTop > 0
+    && input.screenHeight - input.innerHeight >= input.envTop
+}
+
 export function installPhoneChrome(ctx: ClientContext): void {
   ctx.effect(() => {
     const narrow = window.matchMedia('(max-width: 1023px)')
