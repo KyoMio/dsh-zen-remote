@@ -1,4 +1,4 @@
-// dsh-mobile-remote · dsh-push.mjs — agent-done push host plugin (OPTIONAL)
+// dsh-zen-remote · dsh-push.mjs — agent-done push host plugin (OPTIONAL)
 //
 // Sends a mobile push notification (via the gateway's local /pwa/push/send)
 // when a DSH agent finishes a turn, and (optionally) registers a
@@ -25,7 +25,7 @@
 //     {"pushTool": false} in lan-gate.config.json to turn it off. Same
 //     encrypted delivery path as above, throttled independently (see
 //     registerPushTool below) so a chatty model can't spam the lock screen.
-export const name = 'dsh-mobile-remote-push'
+export const name = 'dsh-zen-remote-push'
 export const inject = []
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -100,7 +100,7 @@ const PUSH_TOOL_GLOBAL_MAX = 20
 // tests get isolated state without needing a fresh module import).
 function registerPushTool(ctx) {
   if (!PUSH_TOOL_ENABLED) {
-    console.log('[dsh-mobile-remote-push] push_notify disabled (DSH_PUSH_TOOL=0 / pushTool:false)')
+    console.log('[dsh-zen-remote-push] push_notify disabled (DSH_PUSH_TOOL=0 / pushTool:false)')
     return
   }
   // ctx.inject, NOT ctx.get: the tools service may be provided by a plugin
@@ -114,7 +114,7 @@ function registerPushTool(ctx) {
 
 function registerPushToolWith(ctx, tools) {
   if (!tools) {
-    console.log('[dsh-mobile-remote-push] "tools" service not present — push_notify not registered')
+    console.log('[dsh-zen-remote-push] "tools" service not present — push_notify not registered')
     return
   }
 
@@ -180,12 +180,12 @@ function registerPushToolWith(ctx, tools) {
         const result = await sendPush(args.title, args.body)
         return { delivered: (result && typeof result.sent === 'number') ? result.sent : 0 }
       } catch (e) {
-        console.warn(`[dsh-mobile-remote-push] push_notify send failed: ${String(e && e.message || e)}`)
+        console.warn(`[dsh-zen-remote-push] push_notify send failed: ${String(e && e.message || e)}`)
         return { delivered: 0 }
       }
     }
   })))
-  console.log('[dsh-mobile-remote-push] push_notify tool registered')
+  console.log('[dsh-zen-remote-push] push_notify tool registered')
 }
 
 export function apply(ctx) {
@@ -204,10 +204,10 @@ export function apply(ctx) {
     try {
       ctx.on(event, notify)
     } catch (e) {
-      console.warn(`[dsh-mobile-remote-push] cannot listen on "${event}": ${String(e && e.message || e)}`)
+      console.warn(`[dsh-zen-remote-push] cannot listen on "${event}": ${String(e && e.message || e)}`)
     }
   }
-  console.log(`[dsh-mobile-remote-push] listening for: ${EVENTS.join(', ')} (set DSH_PUSH_EVENTS to adjust)`)
+  console.log(`[dsh-zen-remote-push] listening for: ${EVENTS.join(', ')} (set DSH_PUSH_EVENTS to adjust)`)
 
   registerPushTool(ctx)
 }

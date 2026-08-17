@@ -1,6 +1,6 @@
-# AGENTS.md — dsh-mobile-remote
+# AGENTS.md — dsh-zen-remote
 
-单一 npm 包 `dsh-mobile-remote`，DSH（DeepSeek Harness）的 bundle 插件。
+单一 npm 包 `dsh-zen-remote`，DSH（DeepSeek Harness）的 bundle 插件。
 一个包里有两半代码，但**对用户是一个插件**：文档、安装说明、README 都不要
 再按「两个包」叙述（2026-08-17 由 monorepo 的 `packages/gateway` +
 `packages/mobile-ui` 合并而来，包名 `dsh-mobile-pwa` 与
@@ -12,15 +12,15 @@
 | --- | --- |
 | `package.json` | 单包声明：`dsh.bundle.patch` → `cordis.patch.yml`，`dsh.client` → `exports["./client"]` |
 | `cordis.patch.yml` | 组合层，三行 insert（界面 / 网关 / 推送），随包自带 |
-| `src/index.ts` → `lib/index.js` | host 半边入口（插件行 `dsh-mobile-remote`）：唯一一条路由 `POST /_dsh/mobile-nav/upload` |
+| `src/index.ts` → `lib/index.js` | host 半边入口（插件行 `dsh-zen-remote`）：唯一一条路由 `POST /_dsh/mobile-nav/upload` |
 | `src/client/**` → `lib/client.js` | 浏览器半边（同一插件行，经 `dsh.client` 发现）：app 外壳、slot、样式 |
-| `lan-gate.mjs` | 网关 Cordis entry（插件行 `dsh-mobile-remote-gateway`）：spawn 子进程 |
+| `lan-gate.mjs` | 网关 Cordis entry（插件行 `dsh-zen-remote-gateway`）：spawn 子进程 |
 | `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，Node stdlib + `web-push`） |
-| `dsh-push.mjs` | 推送 entry（插件行 `dsh-mobile-remote-push`）：回合结束推送 + `push_notify` 工具 |
+| `dsh-push.mjs` | 推送 entry（插件行 `dsh-zen-remote-push`）：回合结束推送 + `push_notify` 工具 |
 | `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标 |
 | `test/*.test.cjs` | 网关侧测试（真子进程 + mock 上游） |
 | `scripts/check-*.mjs` | 界面侧自检（纯 `node:assert`，靠 Node ≥23.6 类型剥离直接 import `.ts`） |
-| `scripts/build-client.mjs` | client 打包器（内联相对模块 → `__ModuleLoader__.load({id:"dsh-mobile-remote"})`） |
+| `scripts/build-client.mjs` | client 打包器（内联相对模块 → `__ModuleLoader__.load({id:"dsh-zen-remote"})`） |
 | `docs/**` | 深度文档，见下 |
 
 ## 命令

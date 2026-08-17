@@ -39,8 +39,8 @@ export function apply(ctx: ClientContext): void {
 
   ctx.effect(() => {
     const tag = document.createElement('style')
-    tag.dataset.plugin = 'dsh-mobile-remote'
-    tag.dataset.pluginCss = 'dsh-mobile-remote/mobile.css'
+    tag.dataset.plugin = 'dsh-zen-remote'
+    tag.dataset.pluginCss = 'dsh-zen-remote/mobile.css'
     tag.textContent = MOBILE_CSS
     document.head.appendChild(tag)
     return () => {

@@ -1,12 +1,12 @@
-# dsh-mobile-remote
+# dsh-zen-remote
 
 > Complete mobile plugin for DeepSeek Harness (DSH), shipped as ONE npm package: app-shell mobile UI (two-level page stack, session-list home, reworked composer, gestures, phone-local attachment upload) + pairing-code/device-token gateway for public-internet access behind your own reverse proxy + installable PWA + offline service worker + real Web Push agent-done notifications.
 
 ## Key facts
-- One npm package `dsh-mobile-remote`, MIT. Install: `dsh plugin add dsh-mobile-remote`, then restart `dsh web`.
+- One npm package `dsh-zen-remote`, MIT. Install: `dsh plugin add dsh-zen-remote`, then restart `dsh web`.
 - Declares `dsh.bundle.patch` → `cordis.patch.yml` with three insert rows, all self-contained (no manual profile patching needed):
-  `dsh-mobile-remote` (host upload route + browser client via `dsh.client`), `dsh-mobile-remote-gateway` (`lan-gate.mjs`), `dsh-mobile-remote-push` (`dsh-push.mjs`).
-- Interface half: browser client bundle (`lib/client.js`, registered as `__ModuleLoader__.load({id:"dsh-mobile-remote"})`); <768px app shell, 768–1023px drawer, ≥1024px strict no-op. Host route `POST /_dsh/mobile-nav/upload` writes phone-picked files into the session workspace's `.dsh-uploads/`.
+  `dsh-zen-remote` (host upload route + browser client via `dsh.client`), `dsh-zen-remote-gateway` (`lan-gate.mjs`), `dsh-zen-remote-push` (`dsh-push.mjs`).
+- Interface half: browser client bundle (`lib/client.js`, registered as `__ModuleLoader__.load({id:"dsh-zen-remote"})`); <768px app shell, 768–1023px drawer, ≥1024px strict no-op. Host route `POST /_dsh/mobile-nav/upload` writes phone-picked files into the session workspace's `.dsh-uploads/`.
 - Gateway half: standalone child-process Node gateway (`lib/lan-gate-server.cjs`, Node stdlib + one runtime dep `web-push`), listens on `127.0.0.1:3088`, sits behind a user-run TLS-terminating reverse proxy (nginx/Caddy/Lucky). Device identity = pairing token (cookie `lg_device`), not source IP. Reverse-proxies paired devices to DSH on `127.0.0.1:3080`; DSH webserver untouched. HTML injection adds the PWA manifest link, service-worker bootstrap, `viewport-fit=cover`, shell CSS, randomUUID polyfill.
 - Push half: listens on `agent/turn-stopping` (configurable) and registers the model-callable `push_notify` tool; both deliver through the gateway's local `/pwa/push/send` (VAPID + aes128gcm).
 - Env: `LAN_GATE_PORT` (3088), `LAN_GATE_HOST` (127.0.0.1), `LAN_GATE_TARGET_PORT` (3080), `LAN_GATE_RATE_LIMIT` (120), `LAN_GATE_TRUSTED_PROXIES`, `LAN_GATE_VAPID_SUBJECT`, `DSH_PUSH_EVENTS`, `DSH_PUSH_DEBOUNCE_MS`, `DSH_PUSH_SUMMARY`, `DSH_PUSH_TOOL`. Same keys (lowerCamelCase) in `~/.dsh/lan-gate.config.json`.

@@ -1,16 +1,16 @@
-# dsh-mobile-remote — 静态挂载示例
+# dsh-zen-remote — 静态挂载示例
 #
 # 不想走 `dsh plugin add` 的话，把下面这段抄进你 DSH profile 的
 # cordis.patch.yml，并把 <ABSOLUTE_PATH> 换成本仓库的 clone 目录。
 # 走 `dsh plugin add` 的正常安装不需要这个文件——包自带的
 # cordis.patch.yml 已经把三行都挂好了。
 - insert:
-    - id: dsh-mobile-remote
-      name: dsh-mobile-remote
-      path: file:///ABSOLUTE_PATH/dsh-mobile-remote/lib/index.js
-    - id: dsh-mobile-remote-gateway
-      name: dsh-mobile-remote-gateway
-      path: file:///ABSOLUTE_PATH/dsh-mobile-remote/lan-gate.mjs
-    - id: dsh-mobile-remote-push
-      name: dsh-mobile-remote-push
-      path: file:///ABSOLUTE_PATH/dsh-mobile-remote/dsh-push.mjs
+    - id: dsh-zen-remote
+      name: dsh-zen-remote
+      path: file:///ABSOLUTE_PATH/dsh-zen-remote/lib/index.js
+    - id: dsh-zen-remote-gateway
+      name: dsh-zen-remote-gateway
+      path: file:///ABSOLUTE_PATH/dsh-zen-remote/lan-gate.mjs
+    - id: dsh-zen-remote-push
+      name: dsh-zen-remote-push
+      path: file:///ABSOLUTE_PATH/dsh-zen-remote/dsh-push.mjs

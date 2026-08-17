@@ -1,17 +1,17 @@
-# dsh-mobile-remote — bundle patch layer（一个包，三行 insert）
+# dsh-zen-remote — bundle patch layer（一个包，三行 insert）
 #
 # 当 profile 的 dsh.profile.bundles 列了这个包时整层生效
-# （`dsh plugin --profile web add dsh-mobile-remote` 会自动写进去）。
+# （`dsh plugin --profile web add dsh-zen-remote` 会自动写进去）。
 # 三行都随包自带，用户不需要在自己的 profile patch 里手挂任何一行。
 - insert:
     # 界面半边：浏览器端 app 外壳（经 package.json 的 dsh.client 发现）
     # + host 侧唯一一条路由（手机附件上传端点）。
-    - id: dsh-mobile-remote
-      name: dsh-mobile-remote
+    - id: dsh-zen-remote
+      name: dsh-zen-remote
     # 通道半边：spawn 网关子进程（配对认证 / PWA 注入 / 反代到 DSH）。
-    - id: dsh-mobile-remote-gateway
-      name: dsh-mobile-remote/lan-gate.mjs
+    - id: dsh-zen-remote-gateway
+      name: dsh-zen-remote/lan-gate.mjs
     # 推送半边：agent 回合结束推送 + 模型工具 push_notify。
     # 以前要用户自己在 profile 的 cordis.patch.yml 里手挂，现在随包自带。
-    - id: dsh-mobile-remote-push
-      name: dsh-mobile-remote/dsh-push.mjs
+    - id: dsh-zen-remote-push
+      name: dsh-zen-remote/dsh-push.mjs

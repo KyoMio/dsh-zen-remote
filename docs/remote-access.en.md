@@ -1,7 +1,7 @@
 <h1 align="center">Remote access (gateway half)</h1>
 <p align="center">Turn DeepSeek Harness into a mobile PWA you can safely reach from the public internet: pairing-code auth + token identity + real Web Push, with your own reverse proxy terminating TLS.</p>
 
-> Full documentation for the gateway half of `dsh-mobile-remote`: reverse proxy, pairing, environment variables, admin API, push, security boundary.
+> Full documentation for the gateway half of `dsh-zen-remote`: reverse proxy, pairing, environment variables, admin API, push, security boundary.
 > Installation and quick start live in the [root README](../README.md) (Chinese); interface-side detail in [interface.md](interface.md).
 
 Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate) secure-gateway base, with PWA differentiation.

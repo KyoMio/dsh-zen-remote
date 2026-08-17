@@ -1,4 +1,4 @@
-<h1 align="center">dsh-mobile-remote</h1>
+<h1 align="center">dsh-zen-remote</h1>
 <p align="center">把 DeepSeek Harness 变成一个能从公网安全访问的手机 App：移动端界面重排 + 配对认证网关 + 装到主屏 + 锁屏推送。</p>
 
 <p align="center">
@@ -22,14 +22,14 @@
 ## 安装
 
 ```sh
-dsh plugin add dsh-mobile-remote
+dsh plugin add dsh-zen-remote
 ```
 
 装完重启 `dsh web`，手机界面与网关一起生效，不需要再手写任何配置行。
 
 > 兼容性：在 DSH `0.1.0-rc.6`（web profile）上开发并实测，最后验证 2026-08-18。
 
-卸载：`dsh plugin remove dsh-mobile-remote`（或从 profile 的 `dependencies` 与 `bundles` 里删掉那两行），重启 `dsh web` 即恢复原状；要清掉配对数据再删 `~/.dsh/lan-gate-state.json` 与 `~/.dsh/lan-gate.config.json`。
+卸载：`dsh plugin remove dsh-zen-remote`（或从 profile 的 `dependencies` 与 `bundles` 里删掉那两行），重启 `dsh web` 即恢复原状；要清掉配对数据再删 `~/.dsh/lan-gate-state.json` 与 `~/.dsh/lan-gate.config.json`。
 
 <details>
 <summary>手动写法 / 本地开发</summary>
@@ -39,12 +39,12 @@ dsh plugin add dsh-mobile-remote
 ```jsonc
 {
   "dependencies": {
-    "dsh-mobile-remote": "^1.0.0"        // 本地开发换成 "link:/path/to/dsh-mobile-remote"
+    "dsh-zen-remote": "^1.0.0"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
   },
   "dsh": { "profile": { "bundles": [
     "@deepseek-ai/dsh-base",
     "@deepseek-ai/dsh-web-app",
-    "dsh-mobile-remote"
+    "dsh-zen-remote"
   ] } }
 }
 ```
@@ -226,7 +226,7 @@ open http://127.0.0.1:3088/lan-gate/admin
 - **文件**：附件上传只写入当前会话工作目录下的 `.dsh-uploads/`；配对状态与配置存在 `~/.dsh/lan-gate-state.json` / `lan-gate.config.json`。
 - **凭据**：不收集、不存储任何账号密码；设备身份是本插件自己签发的随机令牌（HttpOnly Cookie）。
 
-排障：运行日志在 `~/.dsh/logs/web.log`（网关与推送的行带 `[dsh-mobile-remote-*]` 前缀）；手机端界面自检可用调试徽章（首页顶栏连点 5 下开关）。安全问题请走 GitHub Security Advisories 私下报告，不要公开提 issue。
+排障：运行日志在 `~/.dsh/logs/web.log`（网关与推送的行带 `[dsh-zen-remote-*]` 前缀）；手机端界面自检可用调试徽章（首页顶栏连点 5 下开关）。安全问题请走 GitHub Security Advisories 私下报告，不要公开提 issue。
 
 ## 上游致谢
 

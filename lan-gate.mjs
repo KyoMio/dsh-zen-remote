@@ -1,4 +1,4 @@
-// dsh-mobile-remote-gateway — Cordis plugin entry
+// dsh-zen-remote-gateway — Cordis plugin entry
 // Spawns the enhanced LAN/remote PWA gateway (lib/lan-gate-server.cjs) as an
 // isolated child process, reverse-proxying the local DSH Web UI with:
 //   - secure remote access (first-visit approval, one-token-per-browser, rate limit)
@@ -8,7 +8,7 @@
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
-export const name = 'dsh-mobile-remote-gateway'
+export const name = 'dsh-zen-remote-gateway'
 export const inject = ['subprocess']
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -51,20 +51,20 @@ export function apply(ctx, config) {
         graceMs: 3000
       })
       handle.done.then((outcome) => {
-        console.log(`[dsh-mobile-remote-gateway] gateway exited code=${outcome.exitCode} signal=${outcome.signal}`)
+        console.log(`[dsh-zen-remote-gateway] gateway exited code=${outcome.exitCode} signal=${outcome.signal}`)
       }).catch((err) => {
-        console.error(`[dsh-mobile-remote-gateway] spawn failed: ${String(err && err.message || err)}`)
+        console.error(`[dsh-zen-remote-gateway] spawn failed: ${String(err && err.message || err)}`)
       })
       if (timer) {
         timer.timeout(() => {
           const r = handle && handle.collected && handle.collected.stdout
-          if (r) { const read = r.readFrom(0); if (read && read.text) console.log(`[dsh-mobile-remote-gateway] ${read.text.trim()}`) }
+          if (r) { const read = r.readFrom(0); if (read && read.text) console.log(`[dsh-zen-remote-gateway] ${read.text.trim()}`) }
           const e = handle && handle.collected && handle.collected.stderr
-          if (e) { const eread = e.readFrom(0); if (eread && eread.text) console.error(`[dsh-mobile-remote-gateway] stderr: ${eread.text.trim()}`) }
+          if (e) { const eread = e.readFrom(0); if (eread && eread.text) console.error(`[dsh-zen-remote-gateway] stderr: ${eread.text.trim()}`) }
         }, 1500)
       }
     } catch (err) {
-      console.error(`[dsh-mobile-remote-gateway] ${String(err && err.message || err)}`)
+      console.error(`[dsh-zen-remote-gateway] ${String(err && err.message || err)}`)
     }
   }
 
