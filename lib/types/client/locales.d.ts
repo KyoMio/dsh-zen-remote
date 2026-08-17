@@ -43,6 +43,11 @@ export declare const zh: {
     readonly infoActionError: "操作失败：{message}";
     readonly turnFold: "过程 · {count} 步";
     readonly turnFoldRunning: "进行中 · {count} 步";
+    readonly settings: "设置";
+    readonly chipTaskboard: "任务看板";
+    readonly chipSsh: "SSH";
+    readonly chipUsage: "用量";
+    readonly chipCustomize: "自定义入口";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

@@ -4,6 +4,7 @@ import {
   IconChevronDownOutline14,
   IconChevronLeftOutline14,
   IconPlusOutline16,
+  IconSettingsOutline16,
   StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -14,6 +15,7 @@ import type { createNavStore } from './nav-store.ts'
 import type { WorkspaceFilter } from './nav-store.ts'
 import type { MobileNavKey } from './locales.ts'
 import { dotState } from './session-dot.ts'
+import { MobileHomeChips, MobileHomeChipsSheetBody } from './MobileHomeChips.tsx'
 
 /** Full props for the phone home screen (shell.overlay entry). */
 export type MobileHomeProps =
@@ -25,6 +27,8 @@ export type MobileHomeProps =
     openSession: (id: SessionId) => void
     /** Bound ctx.workspaces.startSession(workspaceId?). */
     startSession: (workspaceId?: WorkspaceId) => void
+    /** Bound ctx.sessionLogDownload.download() — the session-log chip (S5). */
+    downloadSessionLog: (id: SessionId) => void
   }
 
 /** Phone breakpoint: below the tablet range, where the app-shell layout applies. */
@@ -112,6 +116,7 @@ export function MobileHome({
   actions,
   openSession,
   startSession,
+  downloadSessionLog,
   t,
 }: MobileHomeProps) {
   const phone = usePhone()
@@ -123,7 +128,7 @@ export function MobileHome({
   // list re-renders on any session change anyway (the running dots live here).
   const sessions = useSessions((s) => s)
   const workspaces = useWorkspaces((s) => s)
-  const [sheet, setSheet] = useState<'filter' | null>(null)
+  const [sheet, setSheet] = useState<'filter' | 'chips' | null>(null)
 
   // Workspace of the current session — the untouched filter default.
   const currentWorkspaceId = useMemo(() => {
@@ -169,6 +174,22 @@ export function MobileHome({
     actions.show('session')
   }
 
+  // Opens the OFFICIAL settings modal (dsh-client-ui-settings-general's
+  // SettingsRoot) by clicking its real trigger button — its "open" state is
+  // component-local React state with no public setter, same reasoning as
+  // MobileSessionHeader's Chat/Trajectory tab click. The trigger mounts
+  // inside the sidebar's `sidebar.settings` footer slot
+  // (`[class$="_settingsArea"]`, the sidebar shell's stable class suffix —
+  // see dsh-client-ui-sidebar's SidebarRoot), which is display:none on the
+  // phone breakpoint (home.css.ts): `.click()` still dispatches (bypasses
+  // hit-testing, S2.1 precedent) and flips `open`, but the resulting
+  // `aria-modal="true"` dialog would still paint nothing without the portal
+  // fix in styles/chips.css.ts (`:has([aria-modal="true"])` un-hides exactly
+  // the ancestor chain down to it, not the whole sidebar).
+  const openSettings = (): void => {
+    document.querySelector<HTMLButtonElement>('[class$="_settingsArea"] button[aria-haspopup="dialog"]')?.click()
+  }
+
   if (!phone) return null
 
   const title = selectedWorkspace?.title ?? t('allWorkspaces')
@@ -208,7 +229,23 @@ export function MobileHome({
           <span>{title}</span>
           <IconChevronDownOutline14 size={14} />
         </button>
+        <button
+          type="button"
+          data-mobile-nav="home-settings"
+          aria-label={t('settings')}
+          title={t('settings')}
+          onClick={openSettings}
+        >
+          <IconSettingsOutline16 size={18} />
+        </button>
       </div>
+
+      <MobileHomeChips
+        t={t}
+        sessionId={sessions.current}
+        downloadSessionLog={(id) => downloadSessionLog(id as SessionId)}
+        onCustomize={() => setSheet('chips')}
+      />
 
       <ul data-mobile-nav="home-list">
         {rows.map((row) => {
@@ -262,35 +299,46 @@ export function MobileHome({
             aria-label={t('close')}
             onClick={() => setSheet(null)}
           />
-          <div data-mobile-nav="home-sheet" role="menu">
-            <div data-mobile-nav="home-sheet-title">{t('switchWorkspace')}</div>
-            <button
-              type="button"
-              role="menuitem"
-              data-mobile-nav="home-sheet-item"
-              data-selected={selected === 'all' ? '' : undefined}
-              onClick={() => {
-                actions.filter('all')
-                setSheet(null)
-              }}
-            >
-              {t('allWorkspaces')}
-            </button>
-            {workspaces.items.map((item) => (
-              <button
-                key={item.workspaceId}
-                type="button"
-                role="menuitem"
-                data-mobile-nav="home-sheet-item"
-                data-selected={selected === item.workspaceId ? '' : undefined}
-                onClick={() => {
-                  actions.filter(item.workspaceId)
-                  setSheet(null)
-                }}
-              >
-                {item.title}
-              </button>
-            ))}
+          {/* Two sheets share this one container (chrome + S6 drag-to-close
+            * + mask-click-close, all keyed off data-mobile-nav="home-sheet"
+            * generically — effects/gestures.ts): the workspace switcher
+            * (role="menu", unchanged) and the S5 chip-customize toggle list
+            * (MobileHomeChipsSheetBody, no menu semantics — its rows are
+            * switches, not menu items that close the sheet on click). */}
+          <div data-mobile-nav="home-sheet" role={sheet === 'filter' ? 'menu' : undefined}>
+            {sheet === 'filter' && (
+              <>
+                <div data-mobile-nav="home-sheet-title">{t('switchWorkspace')}</div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  data-mobile-nav="home-sheet-item"
+                  data-selected={selected === 'all' ? '' : undefined}
+                  onClick={() => {
+                    actions.filter('all')
+                    setSheet(null)
+                  }}
+                >
+                  {t('allWorkspaces')}
+                </button>
+                {workspaces.items.map((item) => (
+                  <button
+                    key={item.workspaceId}
+                    type="button"
+                    role="menuitem"
+                    data-mobile-nav="home-sheet-item"
+                    data-selected={selected === item.workspaceId ? '' : undefined}
+                    onClick={() => {
+                      actions.filter(item.workspaceId)
+                      setSheet(null)
+                    }}
+                  >
+                    {item.title}
+                  </button>
+                ))}
+              </>
+            )}
+            {sheet === 'chips' && <MobileHomeChipsSheetBody t={t} />}
           </div>
         </div>
       )}

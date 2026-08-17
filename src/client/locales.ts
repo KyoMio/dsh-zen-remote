@@ -44,6 +44,11 @@ export const zh = {
   'infoActionError': '操作失败：{message}',
   'turnFold': '过程 · {count} 步',
   'turnFoldRunning': '进行中 · {count} 步',
+  'settings': '设置',
+  'chipTaskboard': '任务看板',
+  'chipSsh': 'SSH',
+  'chipUsage': '用量',
+  'chipCustomize': '自定义入口',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -89,6 +94,11 @@ export const en: Record<MobileNavKey, string> = {
   'infoActionError': 'Action failed: {message}',
   'turnFold': 'Process · {count} steps',
   'turnFoldRunning': 'Working · {count} steps',
+  'settings': 'Settings',
+  'chipTaskboard': 'Task board',
+  'chipSsh': 'SSH',
+  'chipUsage': 'Usage',
+  'chipCustomize': 'Customize shortcuts',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

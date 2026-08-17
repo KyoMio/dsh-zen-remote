@@ -173,6 +173,8 @@ export function apply(ctx: ClientContext): void {
     inject: () => ({
       openSession: (id: SessionId) => ctx.sessions.open(id),
       startSession: (workspaceId?: WorkspaceId) => ctx.workspaces.startSession(workspaceId),
+      // S5 session-log chip — the same service call MobileDrawerFooter uses.
+      downloadSessionLog: (id: SessionId) => ctx.sessionLogDownload.download(id),
     }),
   }, MobileHome))
 
