@@ -67,14 +67,22 @@ html:not([data-lan-device="desktop"]) [data-slot="conversation"] [data-phase] {
   font-size: calc(1em * var(--dsh-pwa-font-scale));
 }
 
-/* Keep the composer clear of the iOS home-indicator gesture bar.
- * dsh-mobile-nav does not add this safe-area padding anywhere, so it stays;
- * the decorative pill border-radius that used to live here was dropped —
- * that's composer chrome, dsh-mobile-nav's job. */
-html:not([data-lan-device="desktop"]) [data-slot="conversation.composer"],
-html:not([data-lan-device="desktop"]) [data-slot="conversation.input.bar"] {
-  padding-bottom: max(env(safe-area-inset-bottom), 8px);
-}
+/* Home-indicator clearance for the composer USED to live here, as
+ *   [data-slot="conversation.composer"], [data-slot="conversation.input.bar"]
+ *   { padding-bottom: max(env(safe-area-inset-bottom), 8px) }
+ * It is gone (S4.1, 2026-08-17) and should not come back. Two reasons:
+ *
+ * 1. It never did anything. Both of those slot elements are `display:
+ *    contents` in the current DSH shell — they generate no box, so padding on
+ *    them is discarded. Measured 2026-08-17: forcing the declaration to a
+ *    literal 34px moved the composer capsule by exactly 0px.
+ * 2. Composer chrome is dsh-mobile-nav's job (see the file header). The real
+ *    clearance now lives in that plugin's styles/composer.css.ts, on an
+ *    element that actually lays out, and reads its --mnav-sab variable so it
+ *    can be regression-tested off-device with ?mobile-nav-inset=54,34.
+ *    env() here was untestable on any desktop browser, which is how an inert
+ *    rule survived this long.
+ */
 
 /* Scroll long code lines horizontally instead of letting them widen the
  * page. dsh-mobile-nav has no equivalent rule; dropping this would let a
