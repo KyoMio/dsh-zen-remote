@@ -177,9 +177,9 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     min-width: 0;
     max-width: 100%;
     /* Real-device feedback (2026-08-17): the session title read too small
-       next to the enlarged header icons — 21px sits just under the home
+       next to the enlarged header icons — 19px sits just under the home
        screen's 22px workspace title, keeping the two-level hierarchy. */
-    font-size: 21px;
+    font-size: 19px;
     font-weight: 600;
   }
 
