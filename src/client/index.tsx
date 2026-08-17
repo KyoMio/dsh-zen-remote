@@ -4,12 +4,12 @@ import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
 import { MobileHome } from './MobileHome.tsx'
 import { MobileHeaderActions, MobileHeaderUtilities } from './MobileSessionHeader.tsx'
+import { MobileAttachButton } from './MobileAttachButton.tsx'
 import { createNavStore } from './nav-store.ts'
 import { MOBILE_CSS } from './styles/index.ts'
 import { installDebugBadge } from './debug.ts'
 import { installPhoneChrome } from './effects/phone-chrome.ts'
 import { installAionuiCompat } from './effects/aionui-compat.ts'
-import { installStatsLine } from './effects/stats-line.ts'
 import { installHeaderStatusDot } from './effects/header-status.ts'
 import { NS, en, zh } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
@@ -50,8 +50,6 @@ export function apply(ctx: ClientContext): void {
   installPhoneChrome(ctx)
 
   installAionuiCompat(ctx)
-
-  installStatsLine(ctx)
 
   // Session header running-status dot (S2): no official element exists to
   // reposition, so this reads ctx.sessions directly and self-draws via CSS.
@@ -96,6 +94,16 @@ export function apply(ctx: ClientContext): void {
     order: 0,
     locale: NS,
   }, MobileHeaderUtilities))
+
+  // Composer attachment seat (S3 placeholder, S7 wires it to a real picker).
+  // Registered unconditionally; styles/composer.css.ts hides it at >= 768px
+  // and orders it into the leftmost seat of the phone composer row.
+  ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
+    name: 'conversation.input.left',
+    id: 'mobile-attach',
+    order: 0,
+    locale: NS,
+  }, MobileAttachButton))
 
   ctx.slots.inject('shell.overlay', () => ctx.slots.register({
     name: 'shell.overlay',

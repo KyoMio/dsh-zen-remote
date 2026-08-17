@@ -18,6 +18,8 @@ export const zh = {
   'sessionInfo': '会话信息',
   'workbench': '工作台',
   'switchView': '切换视图',
+  'attach': '添加附件',
+  'attachPending': '附件上传即将上线',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -37,6 +39,8 @@ export const en: Record<MobileNavKey, string> = {
   'sessionInfo': 'Session info',
   'workbench': 'Workbench',
   'switchView': 'Switch view',
+  'attach': 'Add attachment',
+  'attachPending': 'Attachments coming soon',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

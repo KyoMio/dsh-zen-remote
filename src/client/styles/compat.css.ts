@@ -422,16 +422,19 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     display: none !important;
   }
 
-  /* ---------- dsh-web-ui polish: conversation stats line ----------
+  /* ---------- conversation stats line ----------
      The official session-status row (turns / steps / LLM time / TTFT /
-     cache) is long. The client marks the exact row with
-     [data-mobile-nav="stats"] (text-anchored, hashed classes can't be
-     targeted). Layout: ONE fixed-height (28px) flex strip that scrolls
-     horizontally — the full metrics stream stays reachable by swiping,
-     the row never grows vertically, no ellipsis or fade, 12px gaps
-     between metric groups, a 2px scrollbar as the swipe affordance. */
+     cache) is long. It is the single entry the official StatsLine puts in
+     conversation.composer.dock, so the structural anchor below reaches it
+     without any DOM marking (S3 deleted the text-matching effect that used
+     to set [data-slot="conversation.composer.dock"] > [class$="_root"]). Layout: ONE fixed-height (28px) flex
+     strip that scrolls horizontally — the full metrics stream stays
+     reachable by swiping, the row never grows vertically, no ellipsis or
+     fade, 12px gaps between metric groups, a 2px scrollbar as the swipe
+     affordance. The phone breakpoint hides the strip outright instead
+     (styles/composer.css.ts — its data moves into the session info card). */
 
-  [data-mobile-nav="stats"] {
+  [data-slot="conversation.composer.dock"] > [class$="_root"] {
     display: flex !important;
     flex-flow: row nowrap !important;
     align-items: center !important;
@@ -453,17 +456,17 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     line-height: 20px !important;
     font-size: 12px !important;
   }
-  [data-mobile-nav="stats"]::-webkit-scrollbar {
+  [data-slot="conversation.composer.dock"] > [class$="_root"]::-webkit-scrollbar {
     height: 2px !important;
   }
-  [data-mobile-nav="stats"]::-webkit-scrollbar-thumb {
+  [data-slot="conversation.composer.dock"] > [class$="_root"]::-webkit-scrollbar-thumb {
     background: var(--dsw-alias-label-tertiary, rgba(0, 0, 0, .3)) !important;
     border-radius: 2px !important;
   }
-  [data-mobile-nav="stats"]::-webkit-scrollbar-track {
+  [data-slot="conversation.composer.dock"] > [class$="_root"]::-webkit-scrollbar-track {
     background: transparent !important;
   }
-  [data-mobile-nav="stats"] > * {
+  [data-slot="conversation.composer.dock"] > [class$="_root"] > * {
     display: flex !important;
     flex: 0 0 auto !important;
     flex-flow: row nowrap !important;
@@ -475,10 +478,10 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     margin-right: 12px !important;
     padding: 0 !important;
   }
-  [data-mobile-nav="stats"] > *:last-child {
+  [data-slot="conversation.composer.dock"] > [class$="_root"] > *:last-child {
     margin-right: 0 !important;
   }
-  [data-mobile-nav="stats"] * {
+  [data-slot="conversation.composer.dock"] > [class$="_root"] * {
     white-space: nowrap !important;
   }
 

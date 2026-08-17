@@ -17,6 +17,8 @@ export declare const zh: {
     readonly sessionInfo: "会话信息";
     readonly workbench: "工作台";
     readonly switchView: "切换视图";
+    readonly attach: "添加附件";
+    readonly attachPending: "附件上传即将上线";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

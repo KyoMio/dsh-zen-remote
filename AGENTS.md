@@ -31,6 +31,7 @@
 - **断点分层（2026-08-17 S1 起）**：<768px 走 app 化两级页面栈（会话列表主页 + 会话页），官方 sidebar `display:none`；768–1023px 保持 v1.0.0 抽屉；≥1024px 严格 no-op。`MobileNavOverlay` 里抽屉相关的四段逻辑（backdrop / 浮动开关 / Escape / 点击关闭）只在 768–1023 生效，frame 标记与 aionui/settings/git-chip 三个 DOM effect 仍是 ≤1023。
 - slot 注册：
   - `conversation.session.header.actions` → `MobileNavToggle`（目录开关 + 文件树按钮；<768px 目录开关被 CSS 隐藏）
+  - `conversation.input.left` → `MobileAttachButton`（S3 附件占位钮，只在 <768px 显示，S7 接真上传）
   - `shell.overlay` → `MobileNavOverlay`（遮罩 / 浮动按钮 / Escape 与点击关闭，仅平板）
   - `shell.overlay` → `MobileHome`（<768px 全屏会话列表主页，order 20）
   - `sidebar.footer.action` → `MobileDrawerFooter`（文件 + 会话日志下载）
@@ -42,7 +43,8 @@
   - `src/client/MobileHome.tsx`：手机主页（workspace 切换器 / 会话列表 / FAB / 底部 sheet），数据全走标准 kit `useSessions` / `useWorkspaces`，动作走注入的 `ctx.sessions.open` / `ctx.workspaces.startSession`，不读官方 DOM。
   - `src/client/nav-store.ts`：`createNavStore()` — 页面栈 `defineStore`（`view: 'home' | 'session'` + workspace 过滤），**不 persist**（启动必须落主页）；handle 在 `apply()` 里建，后续薄片注册同一 handle 即共享实例。
   - `src/client/styles/home.css.ts`：手机 app 壳样式，整块在 `@media (max-width: 767px)` 内，且**必须排在 index.ts 拼接的最后**（要压过 ≤1023px 那一大块的同权重规则）。
-  - `src/client/effects/`：客户端 effect，按域拆 3 文件（phone-chrome / aionui-compat / stats-line）；`index.tsx` 只做编排（locale、样式注入、install 调用、slot 注册）。
+  - `src/client/effects/`：客户端 effect，按域拆 3 文件（phone-chrome / aionui-compat / header-status）；`index.tsx` 只做编排（locale、样式注入、install 调用、slot 注册）。**S3 删掉了 `stats-line.ts`**（原来靠文本匹配给官方统计行打 `data-mobile-nav="stats"`）——统计行改用结构选择器 `[data-slot="conversation.composer.dock"] > [class$="_root"]` 命中，平板保留横滚条带、手机整行隐藏（数据 S4 进信息卡）。
+  - `src/client/styles/composer.css.ts`：S3 手机 composer 重排，整块在 `@media (max-width: 767px)` 内，拼在 index.ts 最后。
   - `src/client/locales.ts`：`mobileNav` i18n；`zh` 是 key 源真相，`en` 是类型镜像。
   - `scripts/build-client.mjs`：自定义打包器。
 - 构建流程：client tsc 输出到 `.client-build/`，`build-client.mjs` 把相对模块内联成 `window.__ModuleLoader__.load({...})` 并写入 `lib/client.js`，平台模块保留 `require()`；随后删除 `.client-build/` 和 `lib/client.js.map`。**bundle 支持递归内联 `styles/` 子目录模块**（`require` 按宿主模块目录解析到规范相对路径，再改写进扁平 `__modules` map；运行时 `__localRequire` 不变）。
@@ -104,6 +106,11 @@
 - **「退回」语义（2026-08-16 教训）**：用户说「退回」= 撤销本轮改动、恢复到**之前的工作区状态**（未提交的脏状态），不是 git reset 到旧提交。被 rebase 掉的提交对象仍在 reflog（90 天内），`git cat-file -t <commit>` + `git show <commit>:<path>` 可恢复文件内容——e174f62 就是这么救回来的（compat/layout 的初始版 = 被 rebase 提交里的内容）。
 - **vision_glance 的像素间距判断不可靠**（2026-08-16）：把 6px 间隙误判成「文字与胶囊重叠」。几何真值用 Playwright `getBoundingClientRect()` 测量，vision 只用于定性描述/OCR。
 - **write 工具写 `docs/superpowers/specs/` 报 EACCES**（2026-08-16 遇两次）：用 bash heredoc 写文件可绕过。
+- **composer 底排重排靠 `display: contents`（S3，2026-08-17）**：官方 InputBar 的底排是 `_row > [_tools | _trailing]` 两个分组，控件被封在分组里，`order` 够不着。把 `_tools`/`_trailing` 双双改成 `display: contents !important`，六个控件就成了 `_row` 的直接 flex item，纯 `order` 即可排成 [附件 · + · 权限 · 模型 · 弹性 · 上下文环 · 发送]（弹性空隙 = 模型胶囊上的 `margin-right: auto`，不新增元素）。注意 **`display: contents` 不改变选择器匹配**——写规则时仍要按真实 DOM 层级写 `>`（`_row > _trailing > span[class$="_root"]`），不能按视觉上的扁平结构写。
+- **权限胶囊的文字是被官方容器查询藏掉的**：`PermissionSelect.module.css` 里有 `@container (width <= 460px) { .trigger:has(.triggerIcon) .triggerLabel { display: none } }`，而 `_row` 自带 `container-type: inline-size` → 手机上永远命中。要「图标+文字」胶囊必须显式把 `_triggerLabel` 改回 `display: block`。
+- **mask 会连 `position: fixed` 后代一起裁掉**：composer 顶部的「无分割线淡入」不能用 `mask-image` 挂在 composer 上——权限/模型底部 sheet 是 composer 内的 fixed 元素，会被裁没。改挂在消息滚动区 `[class$="_scrollBody"]` 的底部 26px（视觉等价：消息淡入 composer）。
+- **官方浮层 sheet 化的前提是祖先链无 transform**：`position: fixed` 遇到带 transform/filter/contain 的祖先会退化成相对该祖先定位。S3 实测 composer card 到 `<html>` 的整条链干净（探针里保留了 `transformChain` 检查项）；S1 的页面栈 transform 挂在 `[data-mobile-nav="home"]` 自己身上，不在 composer 的祖先链上。以后往会话层加 transform 动画前先跑这个检查。
+- **模型胶囊在 390px 必然省略**：S3 给 `_triggerLabel` 加了 `direction: rtl`，让省略号落在**开头**（「…-V4-Flash」而不是「DeepSee…」）——同样宽度下能认出模型。
 - **codegraph 已启用**：`codegraph init` 生成 `.codegraph/`（已加 .gitignore）；查询用 codegraph_explore（CSS 模板字符串模块也能索引），不用再跑 grep 全家桶。
 
 ## Maintenance
