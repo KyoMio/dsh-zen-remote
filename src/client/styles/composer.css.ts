@@ -302,6 +302,36 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     transform: scale(.94);
     transition: transform .12s;
   }
+
+  /* --- 9. home-indicator clearance (S4.1, 2026-08-17) ---
+     Owned HERE, not by dsh-mobile-pwa. That plugin used to carry
+       [data-slot="conversation.composer"] { padding-bottom: max(env(safe-area-inset-bottom), 8px) }
+     in both pwa/app.css and the gateway's inline DEVICE_CSS. Both were
+     INERT and had always been: that slot element is \`display: contents\`
+     (measured 2026-08-17 — the slot wrapper generates no box, so padding on
+     it is discarded), which is why raising it never moved anything. The rule
+     is deleted on the PWA side and restated here on an element that actually
+     lays out, reading --mnav-sab so ?mobile-nav-inset=54,34 can regress it
+     off-device (env() is hard 0 on desktop — the whole reason S2.1 exists).
+
+     Target: the card should look EQUALLY inset on all four sides. This same
+     element carries the card's side inset (\`padding: 0 16px\` officially,
+     measured 16px left and 16px right at 390px), so the bottom gap is simply
+     capped at that same 16px. Clearing the FULL 34px inset — the naive
+     max(sab, 8px) — is what read as "too thick": it is more than double the
+     side margin, so the card looked shoved up off the bottom edge.
+
+     clamp() says all three requirements at once:
+       - floor 8px  -> a device with no home indicator (sab: 0) keeps the
+                       official 8px exactly, so this is a strict no-op there;
+       - track sab  -> a shallower inset than 16px is honoured as-is;
+       - cap 16px   -> a full-size indicator (sab: 34) lands on 16px, equal
+                       to the side inset, which is the look being asked for.
+     Keep the 16px in step with the side padding above if that ever changes;
+     that equality IS the spec here, not a coincidence. */
+  [data-slot="conversation.composer.bar"] > [class$="_root"] {
+    padding-bottom: clamp(8px, var(--mnav-sab), 16px) !important;
+  }
 }
 
 /* The attachment button only exists for the phone shell. */

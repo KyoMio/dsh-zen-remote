@@ -41,11 +41,33 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
   }
 
   /* The message flow is the one scroller that regularly hits its end under a
-     finger. Root-level \`none\` already absorbs the chain, but containing it
+     finger. Root-level \`none\` already absorbs the chain, but declaring it
      at the source keeps the guarantee if the root rule is ever weakened
-     (the home list and both sheets already declare it). */
+     (the home list and both sheets already declare it).
+
+     \`none\`, NOT \`contain\` (S4.1 fix, 2026-08-17). The two differ in exactly
+     the way that bit us: \`contain\` stops overscroll from CHAINING OUT to the
+     document but deliberately KEEPS this element's own local elastic bounce,
+     while \`none\` suppresses that local bounce too. S1.1 only reasoned about
+     the chain, so it picked \`contain\` — and the composer went on twitching
+     upward on every drag-past-the-end while the header and FAB stayed put.
+
+     Why only the composer moved: the official composer seat
+     (\`[class$="_composerSeat"]\`) is \`position: sticky; bottom: 0\` and lives
+     INSIDE this scroller (measured 2026-08-17: seat 0,710 390x134 inside
+     _scrollBody 0,131 390x713, contains() === true). A sticky box is laid out
+     against its scroll container's content, so the container's own rubber-band
+     drags it along. The header/FAB are absolute on the frame, outside this
+     scroller entirely — which is precisely why S1.1's document-level fix
+     pinned them and left this one surface behind.
+
+     Deliberately NOT re-pinning the seat with position: fixed: sticky inside
+     the scroller is what keeps the focused textarea visible when iOS pans the
+     visual viewport for the keyboard, and fixed is the variant that strands
+     it behind the keyboard (same trap as the body rule above). Kill the
+     bounce, keep the sticky. */
   [data-phase] [class$="_scrollBody"] {
-    overscroll-behavior: contain !important;
+    overscroll-behavior: none !important;
   }
 
   /* The official sidebar is no longer a drawer on a phone — the home screen
@@ -200,9 +222,43 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     cursor: pointer;
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
+    /* Card edge definition (2026-08-17). Light theme only — see the dark
+       override below. Two stacked shadows in the iOS idiom: a tight 1px
+       contact shadow that draws the edge itself, plus a wide soft one that
+       lifts the card off the page. Both are deliberately weak (.06/.05):
+       the page sits on --dsw-specific-sidebar-fill and the card on
+       --dsw-alias-bg-base, so there is already a slight tonal step here and
+       the shadow only has to sharpen it, not carry it alone. */
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .06), 0 4px 12px rgba(0, 0, 0, .05);
   }
   [data-mobile-nav="home-row"]:active {
     background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
+    /* Press = settle toward the page. Dropping the wide shadow and keeping a
+       tighter contact one reads as the card pushing in, which is what the
+       darkening background already implies; leaving the lifted shadow under
+       a pressed card is the combination that looks wrong. */
+    box-shadow: 0 1px 2px rgba(0, 0, 0, .05);
+  }
+  /* Dark theme: a black shadow on a near-black page is invisible, so the
+     edge is drawn instead of cast. A 1px hairline at --dsw-alias-border-l2
+     weight, delivered as an INSET box-shadow rather than a real border so
+     the card's geometry is untouched (a real 1px border would grow every
+     row by 2px unless box-sizing cooperated) and so it overrides the light
+     shadow through the same property instead of fighting it.
+
+     Chosen over "brighten the card face" because in dark theme the card
+     (--dsw-alias-bg-base, bluish-950) is already DARKER than the page
+     (--dsw-specific-sidebar-fill, bluish-900); lightening the card past the
+     page would invert the layering that the light theme establishes, while
+     a hairline keeps both themes reading as "page behind, card in front".
+
+     Theme is read from body[data-ds-dark-theme], never prefers-color-scheme:
+     the app hardcodes color-scheme: light on <html> and switches themes with
+     this attribute, so a media query would never fire (AGENTS.md). This
+     selector also outranks the :active rule above (0,2,1 vs 0,2,0), so one
+     declaration covers the pressed state too. */
+  body[data-ds-dark-theme] [data-mobile-nav="home-row"] {
+    box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2, rgba(255, 255, 255, .12));
   }
   [data-mobile-nav="home-row"][data-current] [data-mobile-nav="home-row-title"] {
     font-weight: 600;
@@ -315,20 +371,32 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     border: none;
     animation: dsh-mobile-nav-fade .18s var(--ds-ease-out, ease-in-out);
   }
+  /* Docked to the screen edge, matching the composer's permission/model
+     sheets (styles/composer.css.ts section 4) rather than floating.
+
+     It used to sit at \`bottom: calc(var(--mnav-sab) + 8px)\` with all four
+     corners rounded, which left a 42px strip of bare mask under it at
+     sab: 34 (measured). Docking removes the strip instead of dimming it, and
+     the safe area moves INSIDE the card as bottom padding — so the white
+     card body runs all the way to the physical screen edge and the last row
+     still clears the home indicator. Same reason the corners go top-only:
+     a rounded bottom corner on a card flush with the screen edge reads as a
+     rendering mistake. */
   [data-mobile-nav="home-sheet"] {
     position: absolute;
-    left: 8px;
-    right: 8px;
-    bottom: calc(var(--mnav-sab) + 8px);
+    left: 0;
+    right: 0;
+    bottom: 0;
     max-height: 70%;
     overflow-y: auto;
     overscroll-behavior: contain;
-    padding: 6px;
-    border-radius: 16px;
+    box-sizing: border-box;
+    padding: 6px 6px calc(var(--mnav-sab) + 14px);
+    border-radius: 20px 20px 0 0;
     /* layer-2, not bg-base: in dark mode the sheet must lift off a page that
        shares bg-base, or only the shadow separates them. */
     background: var(--dsw-alias-bg-layer-2, #ffffff);
-    box-shadow: 0 8px 32px rgba(0, 0, 0, .28);
+    box-shadow: 0 -8px 32px rgba(0, 0, 0, .28);
     animation: dsh-mobile-nav-sheet-up .22s var(--ds-ease-out, ease-in-out);
   }
   @media (prefers-reduced-motion: reduce) {

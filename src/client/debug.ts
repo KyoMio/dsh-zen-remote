@@ -7,19 +7,35 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
  */
 export function installDebugBadge(ctx: ClientContext): void {
   /**
-   * Fake safe-area inset — ?mobile-nav-inset=54
+   * Fake safe-area inset — ?mobile-nav-inset=54 or ?mobile-nav-inset=54,34
    * env(safe-area-inset-*) is hard 0 on every desktop browser (CDP included),
    * so notch bugs are invisible until a real phone loads the page — the S2.1
-   * hotfix exists because of exactly that. Overriding --mnav-sat (see
-   * styles/base.css.ts) on the root element reproduces a notch anywhere.
-   * No param = the variable keeps its env() value = zero behaviour change.
+   * hotfix exists because of exactly that. Overriding --mnav-sat / --mnav-sab
+   * (see styles/base.css.ts) on the root element reproduces a notch anywhere.
+   * No param = the variables keep their env() values = zero behaviour change.
+   *
+   * One value fakes the TOP inset only (the historic behaviour — every S1-S3
+   * verification recipe passes `=54`, and they must keep meaning what they
+   * did). A second, comma-separated value fakes the BOTTOM inset too:
+   * `=54,34` is the iPhone notch + home-indicator pair. The bottom half was
+   * added in S4.1 because the home-bar padding it guards (composer clearance
+   * over the indicator) is otherwise untestable off-device for exactly the
+   * same reason the top half exists.
    */
   ctx.effect(() => {
     const raw = new URLSearchParams(location.search).get('mobile-nav-inset')
-    const px = Number(raw)
-    if (raw === null || !Number.isFinite(px)) return () => {}
-    document.documentElement.style.setProperty('--mnav-sat', `${px}px`)
-    return () => document.documentElement.style.removeProperty('--mnav-sat')
+    if (raw === null) return () => {}
+    const [topRaw, bottomRaw] = raw.split(',')
+    const top = Number(topRaw)
+    if (!Number.isFinite(top)) return () => {}
+    const root = document.documentElement
+    root.style.setProperty('--mnav-sat', `${top}px`)
+    const bottom = bottomRaw === undefined ? Number.NaN : Number(bottomRaw)
+    if (Number.isFinite(bottom)) root.style.setProperty('--mnav-sab', `${bottom}px`)
+    return () => {
+      root.style.removeProperty('--mnav-sat')
+      root.style.removeProperty('--mnav-sab')
+    }
   }, 'dsh-mobile-nav: fake safe-area inset')
 
   ctx.effect(() => {
