@@ -149,9 +149,85 @@ dsh.example.com {
 
 > 具体开关名称可能随 Lucky 版本略有差异，认准三样东西即可：HTTPS 证书、反向代理到 3088、转发头（万事大吉）。
 
+#### Cloudflare Tunnel（没有公网 IP 时的接入方式）
+
+家宽运营商不给公网 IP（大多数国内宽带的现状）、或者不想在路由器上开端口映射时，用 Cloudflare Tunnel：`cloudflared` 从你这台机器**主动向外**建一条长连接，Cloudflare 负责域名解析、TLS 证书和公网入口，再把请求从这条连接送回本机的 `127.0.0.1:3088`。路由器一个端口都不用开，家里的 IP 也不暴露。免费版就够用。
+
+前置条件只有一个：域名托管在 Cloudflare（NS 指向 Cloudflare）。
+
+网关这边**零改动**：`LAN_GATE_HOST` 保持默认的 `127.0.0.1` 就行，`cloudflared` 与它同机。
+
+##### 方式一：Zero Trust 控制台的 token 流（推荐）
+
+隧道配置存在 Cloudflare 那边，本机只存一个 token，改配置不用碰机器。
+
+1. 打开 [Zero Trust 控制台](https://one.dash.cloudflare.com/) → **Networks → Tunnels → Create a tunnel** → 选 **Cloudflared**，起个名字。
+2. 创建完页面会给出一条带 token 的安装命令，在跑 DSH 的机器上执行：
+
+   ```sh
+   cloudflared service install eyJhIjoi...你的token
+   ```
+
+   这会把 `cloudflared` 装成常驻服务并开机自启。macOS 上装之前先 `brew install cloudflared`，Debian/Ubuntu 用官方 `.deb`。
+
+3. 回到隧道详情页 → **Public Hostname** → **Add a public hostname**：
+
+   | 字段 | 填什么 |
+   | --- | --- |
+   | Subdomain | `dsh` |
+   | Domain | `example.com` |
+   | Path | 留空 |
+   | Service Type | `HTTP` |
+   | URL | `127.0.0.1:3088` |
+
+   保存即生效，DNS 记录 Cloudflare 自动建，证书自动签。
+
+4. 直接跳到下一节做 403 自检。
+
+##### 方式二：命令行 + config.yml（进阶）
+
+想把隧道配置也放进版本管理、或者一条隧道要挂多个服务时用这个流程：
+
+```sh
+cloudflared tunnel login                      # 浏览器里授权域名，证书落到 ~/.cloudflared/
+cloudflared tunnel create dsh                 # 记下输出里的 <TUNNEL-ID>
+cloudflared tunnel route dns dsh dsh.example.com
+```
+
+`~/.cloudflared/config.yml`：
+
+```yaml
+tunnel: <TUNNEL-ID>
+credentials-file: /home/you/.cloudflared/<TUNNEL-ID>.json
+
+ingress:
+  - hostname: dsh.example.com
+    service: http://127.0.0.1:3088
+  - service: http_status:404          # 兜底规则，必须是最后一条
+```
+
+```sh
+cloudflared tunnel run dsh            # 先前台跑通
+sudo cloudflared service install      # 通了再装成常驻服务
+```
+
+##### 为什么隧道场景下自检格外重要
+
+`cloudflared` 是从**本机回环**连到网关的，也就是说网关看到的 socket 来源永远是 `127.0.0.1`。网关区分「公网访客」和「坐在这台电脑前的人」，靠的是请求里有没有 `X-Forwarded-*` 转发头（判定见 `lib/lan-gate-server.cjs` 的 `isLocalDirect`：带任何转发头就一定不是本机用户）。`cloudflared` 默认会带上 `X-Forwarded-For` 和 `X-Forwarded-Proto`，所以配对墙正常生效；但**万一你的版本或某条 ingress 配置把它去掉了，公网请求就会被当成本机管理员，管理页直接对外**。这个风险 nginx/Caddy 同机部署时同样存在（Lucky 的「万事大吉」开关就是这件事），只是隧道场景下更容易被忽略，因为你没有亲手写过任何一行转发头配置。
+
+**不需要设 `LAN_GATE_TRUSTED_PROXIES=127.0.0.1`**：网关的 `resolveClient()` 本来就把回环来的连接当作可信反代（`isLoopbackIp(sockIp) || TRUSTED_PROXIES.indexOf(sockIp) >= 0`），填 `127.0.0.1` 是个空操作，既不会报错也不会改变任何行为——更要紧的是它**不能**替代下面的自检。这条语义有测试钉住（`test/auth.test.cjs` 的 `same-host tunnel:` 两个用例，填与不填结果完全一致）。`LAN_GATE_TRUSTED_PROXIES` 真正要填的场合只有一个：反代/隧道进程**不在**这台机器上（比如跑在路由器或另一台服务器），那时来源 IP 不是回环，必须把它列进来网关才会信任它带来的转发头。
+
+##### 常见坑
+
+- **`Error 1033` / 隧道离线**：`cloudflared` 服务没起来或 token 过期。`cloudflared tunnel info <名字>` 看连接数，`sudo launchctl list | grep cloudflared`（macOS）或 `systemctl status cloudflared`（Linux）看服务状态。
+- **502 Bad Gateway**：隧道通了但回源失败——网关没在跑，或 Public Hostname 的 URL 写成了 `3080`（DSH 本体）而不是 `3088`（网关）。写 3080 会绕开整个配对墙，**等于把 DSH 裸奔到公网**，务必确认是 3088。
+- **对话流卡住 / 消息不出来**：WebSocket 没通。Cloudflare 免费版支持 WebSocket，一般是 Zero Trust 里给这个 hostname 挂了 Access 策略拦住了升级请求，或者 ingress 里写了 `disableChunkedEncoding`。
+- **上传大文件失败**：Cloudflare 免费版单请求体上限 100MB。本插件默认上传上限 20MB，低于它，正常不会撞上；真要传更大的文件，先调 Cloudflare 套餐再调 `maxUploadBytes`。
+- **想再收紧一层**：可以在 Zero Trust → Access 里给这个 hostname 加一条策略（邮箱 OTP 之类），叠在配对码之前。不是必须的，配对墙本身已经是一道认证。
+
 #### 配好后自检（任何反代都做一遍）
 
-用**手机流量**（不要连家里 Wi-Fi）访问 `https://你的域名/lan-gate/admin`——正确结果是 **403**。如果居然能看到管理页，说明反代没有带上 `X-Forwarded-*` 转发头，网关把公网请求误判成了本机用户，**立即回去检查转发头配置**（nginx 检查 `proxy_set_header` 两行；Lucky 检查「万事大吉」）。自检通过后再开始配对设备。
+用**手机流量**（不要连家里 Wi-Fi）访问 `https://你的域名/lan-gate/admin`——正确结果是 **403**。如果居然能看到管理页，说明反代没有带上 `X-Forwarded-*` 转发头，网关把公网请求误判成了本机用户，**立即回去检查转发头配置**（nginx 检查 `proxy_set_header` 两行；Lucky 检查「万事大吉」；Cloudflare Tunnel 见上一节）。自检通过后再开始配对设备。
 
 ### 3. 生成配对码、配对设备
 

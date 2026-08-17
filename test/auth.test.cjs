@@ -203,3 +203,48 @@ test('paired devices survive a gateway restart', async () => {
     assert.ok(page.body.includes('upstream-ok'))
   } finally { await stopAll(target, gw2.child) }
 })
+
+// Cloudflare Tunnel / any same-host tunnel: cloudflared talks to the gateway
+// over a LOOPBACK socket, so the only thing separating "internet visitor" from
+// "the human at this keyboard" is the forwarded headers the tunnel adds. Two
+// facts this pins down, both of which the README leans on:
+//   1. Listing 127.0.0.1 in LAN_GATE_TRUSTED_PROXIES is accepted and changes
+//      nothing — resolveClient() already trusts a loopback peer as a proxy, so
+//      the wall holds either way. (Users are told to run the step-2 403 probe
+//      rather than to trust a config line.)
+//   2. A tunnel that forwards NOTHING is indistinguishable from the local user
+//      and hands the admin surface to the internet. That is the actual footgun,
+//      and it is a property of the deployment, not something a gateway setting
+//      can fix — so it is asserted here rather than silently assumed.
+const TUNNEL_PORT = 39232
+const TUNNEL_TARGET_PORT = 39231
+
+for (const trustedProxies of ['', '127.0.0.1']) {
+  test(`same-host tunnel: forwarded headers decide, LAN_GATE_TRUSTED_PROXIES="${trustedProxies}" is not what holds the wall`, async () => {
+    const target = await startMockTarget(TUNNEL_TARGET_PORT)
+    const gw = startGateway(TUNNEL_PORT, TUNNEL_TARGET_PORT, trustedProxies ? { LAN_GATE_TRUSTED_PROXIES: trustedProxies } : undefined)
+    await gw.ready
+    try {
+      // What cloudflared actually sends: loopback socket + client IP + proto.
+      const tunnel = { 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' }
+
+      const page = await request(TUNNEL_PORT, { path: '/', headers: tunnel })
+      assert.strictEqual(page.status, 401, 'tunnel visitor hits the pairing wall')
+      assert.ok(page.body.includes('设备配对'))
+
+      const admin = await request(TUNNEL_PORT, { path: '/lan-gate/admin', headers: tunnel })
+      assert.strictEqual(admin.status, 403, 'tunnel visitor cannot reach the admin surface')
+
+      const { cookie } = await pairDevice(TUNNEL_PORT, 'tunnel-phone')
+      const proxied = await request(TUNNEL_PORT, { path: '/', headers: { ...tunnel, cookie } })
+      assert.strictEqual(proxied.status, 200, 'paired tunnel device is proxied through')
+      assert.ok(proxied.body.includes('upstream-ok'))
+
+      // Same socket, no forwarded headers: still the local admin. A tunnel that
+      // strips them therefore publishes the admin page — the 403 probe in the
+      // README's step 2 is what catches that, not this env var.
+      const bare = await request(TUNNEL_PORT, { path: '/lan-gate/admin' })
+      assert.strictEqual(bare.status, 200, 'loopback without forwarded headers is still the local user')
+    } finally { await stopAll(target, gw.child) }
+  })
+}

@@ -63,7 +63,7 @@ cd ~/.dsh/profiles/web && pnpm install
 
 ### 1. 配一个反代终结 HTTPS
 
-网关默认只监听 `127.0.0.1:3088`，必须由你自己的反代对外。
+网关默认只监听 `127.0.0.1:3088`，必须由你自己的反代对外。**家宽没有公网 IP、或者不想开路由器端口**，就跳过 nginx/Caddy 直接看第三个块（Cloudflare Tunnel）。
 
 <details open>
 <summary><b>nginx</b></summary>
@@ -105,6 +105,40 @@ dsh.example.com {
     reverse_proxy 127.0.0.1:3088
 }
 ```
+</details>
+
+<details>
+<summary><b>没有公网 IP？用 Cloudflare Tunnel</b></summary>
+
+家宽拿不到公网 IP、或者不想在路由器上开端口时用这个：`cloudflared` 从你这台机器主动连出去，Cloudflare 那边负责域名、证书和入口，路由器一个端口都不用开。免费版够用。
+
+前置：域名托管在 Cloudflare（NS 指过去）。
+
+1. 打开 [Zero Trust 控制台](https://one.dash.cloudflare.com/) → **Networks → Tunnels → Create a tunnel** → 选 **Cloudflared**，起个名字，创建后页面会给你一条带 token 的安装命令；
+2. 在跑 DSH 的这台机器上执行那条命令（就是下面这个形状，token 用页面给的）：
+
+   ```sh
+   # macOS / Linux：装成常驻服务，开机自启
+   cloudflared service install eyJhIjoi...你的token
+   ```
+
+3. 回到隧道详情页 → **Public Hostname** → **Add a public hostname**：
+
+   | 字段 | 填什么 |
+   | --- | --- |
+   | Subdomain / Domain | `dsh` / `example.com`（即 `dsh.example.com`） |
+   | Service Type | `HTTP` |
+   | URL | `127.0.0.1:3088` |
+
+   保存后 `https://dsh.example.com` 就通了，证书 Cloudflare 自动签。网关的 `LAN_GATE_HOST` 保持默认 `127.0.0.1` 即可——`cloudflared` 就在本机。
+
+**装完必须做第 2 步的 403 自检**，这一步对隧道尤其要紧：`cloudflared` 和网关走的是本机回环连接，网关区分「公网访客」和「坐在这台电脑前的你」，全靠隧道有没有带上 `X-Forwarded-For`。`cloudflared` 默认是带的，所以配对墙正常生效；但万一你的版本或配置把它去掉了，公网请求就会被当成本机管理员，配对墙形同虚设——**用手机流量访问 `/lan-gate/admin`，看到 403 才算安全**。
+
+> 提示：不用设 `LAN_GATE_TRUSTED_PROXIES`——网关本来就把回环来的连接当作可信反代，填 `127.0.0.1` 是空操作，也**不能**替代上面那个自检。
+>
+> Cloudflare 免费版支持 WebSocket（DSH 对话流需要），单个请求体上限 100MB，高于本插件默认的 20MB 上传上限，不影响使用。
+
+命令行流程（`cloudflared tunnel login` / `create` / `route dns` + `config.yml` 里写 ingress）见 [docs/remote-access.md](docs/remote-access.md#cloudflare-tunnel没有公网-ip-时的接入方式)。
 </details>
 
 Lucky（路由器/NAS）的配法见 [docs/remote-access.md](docs/remote-access.md#lucky)。反代与网关不在同一台机器时，要把反代出口 IP 填进 `LAN_GATE_TRUSTED_PROXIES`。
