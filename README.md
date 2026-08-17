@@ -21,6 +21,7 @@
 | 🌐 **离线可用** | service worker（v3）：只有真正的静态壳（manifest/图标/离线页）缓存优先，其余（DSH 客户端 JS/CSS、API、页面 HTML）一律网络优先——装了新版本手机上立刻吃到，不会像早期版本那样在部署之后还残留旧 CSS |
 | 👆 **触屏手势** | 捏合缩放字体（可重置）；左缘返回手势已让位给 `@dsh-external/dsh-mobile-nav`（见下方「分工」），下拉刷新已整体移除（误触发全页重载会把人从对话中间弹回列表） |
 | 🔔 **任务完成推送** | 真 Web Push（VAPID 签名 + aes128gcm 加密），agent 干完活推送到手机，通知里不带对话内容 |
+| 🛎️ **`push_notify` 工具** | 模型可主动调用的推送工具（在 `dsh-push.mjs` 里注册）：任务中途要用户拿主意、跑到关键节点、或出错需要人来处理时，模型自己决定推一条到锁屏。纪律写在工具描述里明确要求模型别高频用；宿主侧再兜底限流（同会话 60 秒最多 1 条、全局每小时最多 20 条），超额直接不发送、不报错。同样是 aes128gcm 端到端加密，推送服务器只见密文，暴露面只有你自己的锁屏。`lan-gate.config.json` 里 `pushTool: false`（或 `DSH_PUSH_TOOL=0`）可整体关掉；宿主没装工具注册服务（`ctx.tools`）时自动跳过，不影响插件其余功能 |
 | 📐 **触屏布局** | 本仓库只留壳级规则（iOS 输入框防缩放、安全区滚动补偿、代码横向滚动）——排版类规则（44px 触摸目标、弹窗、composer 外观等）已交给 `@dsh-external/dsh-mobile-nav`，见下方「分工」——桌面零影响 |
 | 🔒 **桌面不受影响** | 所有规则都以 `html:not([data-lan-device="desktop"])`（或带同样排除条件的 `@media`）为根——只有显式标成「桌面」才会被排除，其余（包括真机默认的「自动」）都生效 |
 | 🛡️ **管理面本机独占** | 生成配对码、管理设备、触发推送——这些接口只认本机直连，经反代进来的请求一律 403 |
@@ -202,7 +203,7 @@ dsh.example.com {
 }
 ```
 
-字段名 = 环境变量去掉前缀转小驼峰：`port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`，推送半边是 `pushEvents` / `pushDebounceMs` / `pushSummary`。挂载行支持 Cordis config 的 DSH 版本也可以把网关配置写在 insert 行的 `config:` 下（同名小驼峰字段），效果等同。
+字段名 = 环境变量去掉前缀转小驼峰：`port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`，推送半边是 `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool`（`push_notify` 工具开关，默认 `true`）。挂载行支持 Cordis config 的 DSH 版本也可以把网关配置写在 insert 行的 `config:` 下（同名小驼峰字段），效果等同。
 
 推送宿主插件（可选）在 profile 的 `~/.dsh/profiles/web/cordis.patch.yml` 里挂载：
 
@@ -237,6 +238,7 @@ dsh.example.com {
 - 设备被吊销时，它的推送订阅一并删除；推送目标返回 404/410（订阅已失效）时网关会自动清掉这条订阅。
 - 手机浏览器要求页面必须是 HTTPS 才会注册 Service Worker，所以推送和离线能力都依赖第 2 步配好的反代——反代没配好之前，这两项在真机上都不会生效。
 - 「agent 干完活自动推送」由可选宿主插件 `dsh-push.mjs` 负责：它监听 DSH 事件总线并调用本机 `/pwa/push/send`。事件名通过 `DSH_PUSH_EVENTS`（逗号分隔）配置，默认 `agent/turn-stopping`——官方文档定义的「回合即将关闭」检查点（模型不再欠响应、无存活工具调用时触发，每回合一次）；如果你的 DSH 版本更旧/更新导致事件名不同，用该环境变量覆盖即可。`DSH_PUSH_DEBOUNCE_MS`（默认 15000）控制两条通知的最小间隔。想让通知带上这回合的结果摘要？设 `DSH_PUSH_SUMMARY=1`，通知正文会换成本回合最后一条助手消息（截 120 字）——推送 payload 本身是 aes128gcm 端到端加密的，Google/Apple 的推送服务器只见密文，剩下的暴露面是你自己的锁屏和通知中心（两大系统都支持「锁屏隐藏通知内容」，介意就开）。不装它也可以自己在任何脚本里 `curl -X POST http://127.0.0.1:3088/pwa/push/send -H 'Content-Type: application/json' -d '{"title":"DSH 任务完成"}'` 手动触发。
+- 「模型主动推送」由同一个 `dsh-push.mjs` 额外注册一个模型工具 `push_notify`（`title` 必填、`body` 可选），走的是同一条 `/pwa/push/send` 加密发送通道。宿主装了工具注册服务（`ctx.tools`）且没关闭时才会出现；`lan-gate.config.json` 的 `pushTool: false`（或环境变量 `DSH_PUSH_TOOL=0`）可以整体关掉。宿主侧限流独立于上面的自动推送：同一会话 60 秒内最多发 1 条，全部会话合计每小时最多 20 条，超出直接跳过（不发送、不算错误），避免模型高频调用把你手机刷成消息轰炸。
 
 ---
 
@@ -292,7 +294,7 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 | 路径 | 作用 |
 | --- | --- |
 | `lan-gate.mjs` | Cordis 插件入口：spawn 网关子进程 + 生命周期管理 |
-| `dsh-push.mjs` | （可选）agent 完成推送宿主插件，调网关本机 `/pwa/push/send` |
+| `dsh-push.mjs` | （可选）agent 完成推送宿主插件，调网关本机 `/pwa/push/send`；同时注册模型工具 `push_notify` |
 | `lib/lan-gate-server.cjs` | 网关本体：单文件 CommonJS（Node stdlib + `web-push` 一个运行时依赖），HTTP/WebSocket 反代 + 配对/令牌 + 限流 + PWA 注入 + Web Push |
 | `pwa/manifest.json` | PWA 安装清单 |
 | `pwa/sw.js` | service worker（离线缓存 + 推送通知） |
@@ -329,7 +331,8 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 
 - 与 `@dsh-external/dsh-mobile-nav` 明确分工：排版类规则全部让出，本仓库只保留壳级 CSS（详见「与 dsh-mobile-nav 的分工」一节）；
 - service worker 升到 v3：缓存策略从「静态壳 + 客户端资产都 stale-while-revalidate」改成「只有静态壳（manifest/图标/离线页）缓存优先，客户端 JS/CSS/API/页面 HTML 一律网络优先」，装了新版本手机上立刻吃到，不会跨部署残留旧 CSS；
-- 首帧 HTML 直接带 `viewport-fit=cover`，独立 PWA 冷启动第一帧就有安全区，不用等客户端脚本补。
+- 首帧 HTML 直接带 `viewport-fit=cover`，独立 PWA 冷启动第一帧就有安全区，不用等客户端脚本补；
+- `dsh-push.mjs` 新增模型工具 `push_notify`：agent 可以自己判断「该推一条给用户了」（需要决策/关键节点/出错需人工介入）主动触发锁屏推送，不必等到整个回合结束。同一条 aes128gcm 加密通道，宿主侧限流（会话 60 秒 1 条、全局每小时 20 条）与开关 `pushTool`（`lan-gate.config.json`）独立于原有的「回合结束自动推送」。
 
 **修复**
 

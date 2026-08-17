@@ -18,6 +18,7 @@ Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-ga
 | 🌐 **Offline** | SW v3: only the true static shell (manifest/icons/offline page) is cache-first, everything else (DSH client bundle JS/CSS, API, page HTML) is network-first — a new deploy is picked up immediately instead of lingering behind stale cached CSS |
 | 👆 **Touch gestures** | Pinch-to-resize font (resettable); edge-swipe-back has been handed off to `@dsh-external/dsh-mobile-nav` (see "Division of labor" below), pull-to-refresh has been removed entirely (an accidental overscroll used to fire a full reload mid-conversation) |
 | 🔔 **Agent-done push** | Real Web Push (VAPID-signed, aes128gcm-encrypted). Notified when the agent finishes, even from another app — the notification never carries conversation content |
+| 🛎️ **`push_notify` tool** | A model-callable push tool (registered by `dsh-push.mjs`): the model can decide mid-task that the user needs a decision, that a key milestone was reached, or that an error needs a human — and push straight to the lock screen instead of waiting for the turn to end. Usage discipline (don't call this often) is spelled out in the tool description; the host also enforces it with rate limits (max 1 per 60s per session, 20/hour globally) — over the limit, the call is silently dropped, never an error. Same aes128gcm end-to-end encryption, same lock-screen-only exposure. Turn it off entirely with `pushTool: false` in `lan-gate.config.json` (or `DSH_PUSH_TOOL=0`); it's also skipped automatically on hosts without a tool registry (`ctx.tools`), with no effect on the rest of the plugin |
 | 📐 **Touch layout** | This repo now only keeps shell-level rules (iOS input-zoom fix, safe-area scroll padding, horizontal-scrolling code) — layout rules (44px targets, dialogs, composer chrome) moved to `@dsh-external/dsh-mobile-nav`, see "Division of labor" below — desktop never affected |
 | 🔒 **Desktop unaffected** | Every rule is rooted at `html:not([data-lan-device="desktop"])` (or an `@media(max-width:820px)` with the same exclusion) — an explicit "desktop" kind opts out, everything else (including a real phone's default "auto" kind) opts in |
 | 🛡️ **Admin surface is local-only** | Generating pairing codes, managing devices, triggering pushes — these endpoints only accept direct local connections; anything arriving through the proxy gets 403 |
@@ -185,7 +186,7 @@ Besides env vars, the **recommended way is the config file** `~/.dsh/lan-gate.co
 }
 ```
 
-Field names = env var names minus the prefix, camelCased: `port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`, plus the push half `pushEvents` / `pushDebounceMs` / `pushSummary`. On DSH versions whose insert rows support Cordis config, the same camelCase fields under the row's `config:` work too.
+Field names = env var names minus the prefix, camelCased: `port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`, plus the push half `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool` (the `push_notify` tool switch, defaults to `true`). On DSH versions whose insert rows support Cordis config, the same camelCase fields under the row's `config:` work too.
 
 The optional push host plugin mounts via the profile patch (`~/.dsh/profiles/web/cordis.patch.yml`):
 
@@ -220,6 +221,7 @@ The exception is `/lan-gate/pair/claim` (POST) — the one endpoint reachable fr
 - Revoking a device deletes its push subscription too; a 404/410 from the push endpoint (expired subscription) gets it auto-cleaned on the next send.
 - Mobile browsers require HTTPS before they'll register a service worker at all, so both push and offline support depend on step 2's reverse proxy — neither works on a real device until HTTPS is in place.
 - The "notify when the agent finishes" wiring lives in the optional host plugin `dsh-push.mjs`: it listens on the DSH event bus and calls the local `/pwa/push/send`. Event names come from `DSH_PUSH_EVENTS` (comma-separated); the default `agent/turn-stopping` is the official turn-close checkpoint (fires once per turn when the model owes no response and no tool calls are live). Override the env var if your DSH version names it differently. `DSH_PUSH_DEBOUNCE_MS` (default 15000) sets the minimum gap between notifications. Want the turn's outcome in the notification body? Set `DSH_PUSH_SUMMARY=1` and the body becomes the turn's final assistant message (truncated to 120 chars). The push payload is aes128gcm-encrypted end to end — Google/Apple push servers only ever see ciphertext; the remaining exposure is your own lock screen / notification center (both OSes can hide notification content on the lock screen if that matters to you). You can also skip the plugin entirely and trigger pushes yourself: `curl -X POST http://127.0.0.1:3088/pwa/push/send -H 'Content-Type: application/json' -d '{"title":"DSH task complete"}'`.
+- "The model pushes on its own" is the same `dsh-push.mjs` additionally registering a model tool, `push_notify` (`title` required, `body` optional), over the same encrypted `/pwa/push/send` path. It only shows up when the host has a tool registry (`ctx.tools`) and hasn't disabled it; `pushTool: false` in `lan-gate.config.json` (or `DSH_PUSH_TOOL=0`) turns it off entirely. Rate limiting is independent from the turn-close notifier above: at most 1 push per session per 60 seconds, 20 total per hour across all sessions — over the limit, the call is silently skipped (not sent, not an error), so a chatty model can't turn your phone into a notification firehose.
 
 ---
 
@@ -275,7 +277,7 @@ npm test   # boots a mock upstream, runs the gateway/auth/push suites: proxy+inj
 | Path | Role |
 | --- | --- |
 | `lan-gate.mjs` | Cordis entry: spawns the gateway child process and manages its lifecycle |
-| `dsh-push.mjs` | Optional agent-done push host plugin, calls the gateway's local `/pwa/push/send` |
+| `dsh-push.mjs` | Optional agent-done push host plugin, calls the gateway's local `/pwa/push/send`; also registers the `push_notify` model tool |
 | `lib/lan-gate-server.cjs` | The gateway itself: single-file CommonJS (Node stdlib + one runtime dependency, `web-push`) — HTTP/WebSocket reverse proxy, pairing/tokens, rate limiting, PWA injection, Web Push |
 | `pwa/manifest.json` | PWA install manifest |
 | `pwa/sw.js` | Service worker (offline caching + push notifications) |
@@ -303,7 +305,8 @@ See [`AGENTS.md`](AGENTS.md) for development conventions.
 
 - Clear division of labor with `@dsh-external/dsh-mobile-nav`: layout rules handed off entirely, this repo keeps only shell-level CSS (see "Division of labor" above);
 - Service worker bumped to v3: cache strategy changed from "shell and client assets both stale-while-revalidate" to "only the static shell is cache-first, everything else is network-first" — a new deploy is picked up immediately instead of leaving stale CSS behind across devices;
-- First-frame HTML now carries `viewport-fit=cover` directly, so a standalone PWA's safe area is correct from the very first frame instead of waiting for the client bundle to patch it in.
+- First-frame HTML now carries `viewport-fit=cover` directly, so a standalone PWA's safe area is correct from the very first frame instead of waiting for the client bundle to patch it in;
+- `dsh-push.mjs` adds a model tool, `push_notify`: the agent can decide for itself that a push is warranted (needs a decision, hit a key milestone, needs a human after an error) and fire it mid-task instead of waiting for the whole turn to close. Same aes128gcm-encrypted channel; host-side rate limiting (1/60s per session, 20/hour globally) and the `pushTool` switch (`lan-gate.config.json`) are independent of the existing turn-close auto-push.
 
 **Fixed**
 
