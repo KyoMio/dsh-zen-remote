@@ -34,7 +34,7 @@ service worker, touch layout, gestures, agent-done push) into the served HTML.
 | `pwa/manifest.json` | PWA install manifest. |
 | `pwa/sw.js` | Service worker: cache strategies + push notifications. |
 | `pwa/inject.js` | Injected page bootstrap: SW register, gesture loader, push subscribe. |
-| `pwa/touch-gestures.js` | Pull-to-refresh / edge-swipe / pinch-zoom. |
+| `pwa/touch-gestures.js` | Edge-swipe back / pinch-zoom. |
 | `pwa/app.css` | Mobile touch-first CSS (< 44px targets, safe-area, compact type). |
 | `pwa/offline.html` | Offline fallback page. |
 | `pwa/icons/` | SVG source + rasterized PNGs (192/512 + maskable). |
@@ -47,6 +47,19 @@ service worker, touch layout, gestures, agent-done push) into the served HTML.
 
 ## Key behaviours — don't break these
 
+0. **`manifest.json` 的 `background_color` 是功能性的，不是装饰**（2026-08-17，iOS 26.5
+   实机）：iOS 26.x 有一族 standalone PWA 全屏回归，在用户机器上表现为**网页区比屏幕矮
+   一条状态栏（393x852 屏上 vh 793，底部留下约 59px 死区）**，冷启动即存在、与键盘无关、
+   删掉重加主屏图标也不消失，同一台机器用 Safari 浏览器打开则完全正常（vh 695、各项贴合
+   全对）。那条死区在页面之外，任何 CSS 都够不着，系统用 manifest 的 `background_color`
+   画它——所以该值已从 `#0f1115` 改成 `#f9fafb`，与 dsh-mobile-nav 插件浅色主题的页面底色
+   （`--dsw-specific-sidebar-fill`）一致，让白带融进页面。这是**视觉缓解，不是修复**：
+   深色主题下反而更显眼（暂无办法，manifest 不支持随主题切换），系统修好之后该值也无副
+   作用（死区不存在就画不出来）。副作用要知道：`background_color` 同时是启动闪屏底色，
+   所以闪屏从深色变浅色了。改这个值前先读 `test/gateway.test.cjs` 里钉住它的断言。
+   顺带澄清一条反复被重新提出的候选修法：`lan-gate-server.cjs` 的 `APPLE_META`
+   **自 v0.1.0 起就一直注入 `apple-mobile-web-app-status-bar-style=black-translucent`**
+   （对所有 kind 无条件注入），它在位且跟这个毛病无关，别再当作"还没做的修法"。
 1. **Isolation**: the gateway is a child process. Never import its server code into
    the DSH process; keep spawn + lifecycle in `lan-gate.mjs`.
 2. **`pwa/` serves the real browser scripts**: `/pwa/manifest.json`, `/pwa/sw.js`,
@@ -54,8 +67,11 @@ service worker, touch layout, gestures, agent-done push) into the served HTML.
    The service worker MUST live at a fixed path (`/pwa/sw.js`) for registration to
    scope correctly.
 3. **Scope mobile CSS**: every mobile rule must be prefixed with
-   `html[data-lan-device="phone"]` (or the `@media (max-width:820px)` fallback that
-   excludes `desktop`). Desktop must never be affected.
+   `html:not([data-lan-device="desktop"])`, never the literal `[data-lan-device=
+   "phone"]` value — a real paired phone defaults to kind "auto" and never
+   carries that attribute, so a literal-phone gate silently never fires on an
+   actual device (see `pwa/app.css`'s header comment and `lib/lan-gate-server.cjs`
+   near `injectHtml` for the history). Desktop must never be affected.
 4. **Stable selectors**: prefer `[data-slot]`/ARIA selectors over hashed build class
    names (`Sh0Q9G_` etc.), which change per frontend build.
 5. **Persistence**: devices, VAPID keys, and push subscriptions are stored at
@@ -79,8 +95,13 @@ service worker, touch layout, gestures, agent-done push) into the served HTML.
   `lib/lan-gate-server.cjs` or env vars `LAN_GATE_PORT`, `LAN_GATE_HOST`,
   `LAN_GATE_TARGET_PORT`, `LAN_GATE_RATE_LIMIT`, `LAN_GATE_TRUSTED_PROXIES`,
   `LAN_GATE_VAPID_SUBJECT`.
-- **Add a mobile CSS tweak**: append a `html[data-lan-device="phone"] ...` rule to
-  `pwa/app.css` (kept in the file loaded by the injected `<link>`).
+- **Add a mobile CSS tweak**: mobile *layout* (typography, dialogs, composer
+  chrome, popovers, touch targets) belongs to the separate
+  `@dsh-external/dsh-mobile-nav` plugin, not this repo. `pwa/app.css` only
+  keeps PWA-shell-level rules (browser-behavior workarounds, this plugin's
+  own gesture CSS) — see its header comment before adding anything here.
+  There is no second inline CSS block in `lib/lan-gate-server.cjs` any more;
+  `pwa/app.css` (loaded via the injected `<link>`) is the only place.
 - **Change injected page behaviour**: edit `pwa/inject.js` (wired into the injected
   bootstrap) and touch gestures in `pwa/touch-gestures.js`.
 - **Change PWA metadata/icons**: edit `pwa/manifest.json` and `pwa/icons/*`; re-run

@@ -1,16 +1,21 @@
 /* dsh-mobile-pwa · PWA bootstrap (injected into DSH page)
- * Registers the service worker (offline cache + notifications), loads touch
- * gestures, and wires agent-done push. Runs only on phone devices
- * (`html[data-lan-device="phone"]`).
+ * Runs on every device (desktop included): registers the service worker
+ * (offline cache + notifications) and wires the agent-done push opt-in
+ * unconditionally. Touch gestures are the only piece gated by device kind —
+ * loaded on everything that isn't explicitly marked "desktop", see below.
  */
 (function () {
   'use strict'
   if (!window.__DSH_PWA__) window.__DSH_PWA__ = {}
 
   // ---- Register service worker ----------------------------------------
+  // Explicit scope: '/' — the script lives at /pwa/sw.js, so its default
+  // scope is only /pwa/ and it would never control the app itself (start_url
+  // "/"). The gateway sends Service-Worker-Allowed: / with the sw.js
+  // response so Chrome permits a scope wider than the script's own directory.
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
-      navigator.serviceWorker.register('/pwa/sw.js').then((reg) => {
+      navigator.serviceWorker.register('/pwa/sw.js', { scope: '/' }).then((reg) => {
         window.__DSH_PWA__.reg = reg
       }).catch((err) => {
         console.warn('[dsh-pwa] SW registration failed:', err)
@@ -18,9 +23,15 @@
     })
   }
 
-  // ---- Load touch gestures when on a phone device ---------------------
-  var isPhone = document.documentElement.getAttribute('data-lan-device') === 'phone'
-  if (isPhone) {
+  // ---- Load touch gestures on every non-desktop device -----------------
+  // A paired device defaults to kind "auto" — the gateway never sets
+  // data-lan-device for it (see lib/lan-gate-server.cjs), only for an
+  // explicit "phone" or "desktop". Gating on the literal "phone" value meant
+  // this never loaded on a real phone left at its default kind. Matching
+  // app.css's own `:not([data-lan-device="desktop"])` gate here instead:
+  // anything that isn't explicitly desktop gets touch gestures.
+  var isNonDesktop = document.documentElement.getAttribute('data-lan-device') !== 'desktop'
+  if (isNonDesktop) {
     var g = document.createElement('script')
     g.src = '/pwa/touch-gestures.js'
     g.async = true

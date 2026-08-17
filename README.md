@@ -18,11 +18,12 @@
 | 🔑 **公网身份** | 网关只监听 `127.0.0.1`，放在你自己的反代后面；新设备用配对码换取长期设备令牌（Cookie `lg_device`），身份跟着令牌走，与来源 IP 完全无关 |
 | 📱 **真 PWA** | `manifest.json` + service worker：反代带来 HTTPS 后，手机浏览器「添加到主屏」真正生效，全屏独立窗口运行，带图标/启动屏/主题色 |
 | 🧩 **可安装** | 主屏图标、`standalone` 显示、`apple-touch-icon`、maskable 图标 |
-| 🌐 **离线可用** | service worker：静态壳缓存优先、API 网络优先，断网时给离线回退页 |
-| 👆 **触屏手势** | 下拉刷新、边缘右滑返回、捏合缩放字体（可重置） |
+| 🌐 **离线可用** | service worker（v3）：只有真正的静态壳（manifest/图标/离线页）缓存优先，其余（DSH 客户端 JS/CSS、API、页面 HTML）一律网络优先——装了新版本手机上立刻吃到，不会像早期版本那样在部署之后还残留旧 CSS |
+| 👆 **触屏手势** | 捏合缩放字体（可重置）；左缘返回手势已让位给 `@dsh-external/dsh-mobile-nav`（见下方「分工」），下拉刷新已整体移除（误触发全页重载会把人从对话中间弹回列表） |
 | 🔔 **任务完成推送** | 真 Web Push（VAPID 签名 + aes128gcm 加密），agent 干完活推送到手机，通知里不带对话内容 |
-| 📐 **触屏布局** | 44px 触摸目标、safe-area 适配、全屏弹窗、紧凑排版、代码横向滚动——桌面零影响 |
-| 🔒 **桌面不受影响** | 所有规则都以 `html[data-lan-device="phone"]` 或排除 `data-lan-device="desktop"` 的 `@media` 为根 |
+| 🛎️ **`push_notify` 工具** | 模型可主动调用的推送工具（在 `dsh-push.mjs` 里注册）：任务中途要用户拿主意、跑到关键节点、或出错需要人来处理时，模型自己决定推一条到锁屏。纪律写在工具描述里明确要求模型别高频用；宿主侧再兜底限流（同会话 60 秒最多 1 条、全局每小时最多 20 条），超额直接不发送、不报错。同样是 aes128gcm 端到端加密，推送服务器只见密文，暴露面只有你自己的锁屏。`lan-gate.config.json` 里 `pushTool: false`（或 `DSH_PUSH_TOOL=0`）可整体关掉；宿主没装工具注册服务（`ctx.tools`）时自动跳过，不影响插件其余功能 |
+| 📐 **触屏布局** | 本仓库只留壳级规则（iOS 输入框防缩放、安全区滚动补偿、代码横向滚动）——排版类规则（44px 触摸目标、弹窗、composer 外观等）已交给 `@dsh-external/dsh-mobile-nav`，见下方「分工」——桌面零影响 |
+| 🔒 **桌面不受影响** | 所有规则都以 `html:not([data-lan-device="desktop"])`（或带同样排除条件的 `@media`）为根——只有显式标成「桌面」才会被排除，其余（包括真机默认的「自动」）都生效 |
 | 🛡️ **管理面本机独占** | 生成配对码、管理设备、触发推送——这些接口只认本机直连，经反代进来的请求一律 403 |
 
 ---
@@ -46,6 +47,29 @@
 - 网关是独立子进程，与 DSH 主进程隔离：挂掉不影响主服务，插件停止时自动终止。
 - DSH 主服务本身仍然只监听 `127.0.0.1`，网关不改它的任何配置，也不碰它 `/api` 的信任栅栏。
 - 唯一保留的「按 IP 信任」：回环 socket 且不带任何 `X-Forwarded-*` 头的请求，判定为坐在这台机器前面的本机用户——这是管理面的唯一入口。经反代进来的请求一定带转发头，天然进不去。
+
+---
+
+## 🧩 与 `@dsh-external/dsh-mobile-nav` 的分工
+
+如果你同时装了 [`@dsh-external/dsh-mobile-nav`](https://www.npmjs.com/package/@dsh-external/dsh-mobile-nav)（手机端 app 化外壳插件），两者边界是：
+
+- **本仓库只管「壳」和「通道」**：配对认证、令牌、限流、PWA 安装清单、service worker、首帧安全区注入；
+- **排版全部交给 dsh-mobile-nav**：字号、弹窗、composer 外观、气泡样式这些「长什么样」的规则一律不在本仓库管。
+
+这不是设计初衷，是一次热修的结果：`pwa/app.css` 早期有 163 行,和 dsh-mobile-nav 抢同一批元素的样式,现在裁到 95 行,只剩壳级规则(iOS 输入框防缩放、安全区滚动补偿、pinch 缩放变量、代码块横向滚动)。裁剪时漏了一处——网关 `lib/lan-gate-server.cjs` 里还内联着一份没人记得的 `DEVICE_CSS` 副本,和裁剪前的 `app.css` 一样,其中一条「全屏弹窗」规则会把**任何**带 `role="dialog" aria-modal="true"` 的浮层撑满整个视口,包括 dsh-mobile-nav 自己的会话信息卡——症状是「经网关访问时信息卡整卡溢出屏幕、直连 DSH 却正常」,看着像内核差异,其实是网关注入的这份死代码在捣鬼。这份 `DEVICE_CSS` 现已整体删除。
+
+手势也重新分了工:下拉刷新已经从 `touch-gestures.js` 里整体移除(用户反馈:不小心多滑一下就触发全页重载,把人从对话中间弹回会话列表);左缘右滑返回的 24px 边缘热区也让了出来,现在归 dsh-mobile-nav 的手势系统(关掉打开的浮层、或回到会话列表),本仓库这边原来的边缘返回本来就对 DSH 的前端路由不起作用(`history.back()` 在单页应用里是空操作)。捏合缩放字体保留在本仓库。
+
+---
+
+## 📲 安装细节的几处修复
+
+- **manifest 不再被上游标签挡住**:DSH 自己的页面已经带了一个 `<link rel="manifest">`,浏览器只认页面里第一个 manifest 链接——网关这边手机定制的 manifest(正确图标、背景色、安装名)以前排在后面,被上游那份通用 manifest 静默盖掉。现在网关会把上游的 manifest 标签剥掉,只留自己注入的这份。
+- **manifest 与图标享有凭证豁免**:manifest 和它引用的三个图标现在不挡在配对墙后面——浏览器抓取 manifest/图标时按规范是不带 Cookie 的,挡在墙后会让 Chrome/Android 直接看不到安装按钮(iOS Safari 因为这次请求照样带 Cookie,所以之前只有 iOS 能装,不是巧合是 bug)。
+- **service worker 作用域修复**:注册时显式声明 `scope: '/'`,网关也在 `sw.js` 响应上带 `Service-Worker-Allowed: /`——以前没声明作用域,SW 默认只管它自己所在的 `/pwa/` 目录,从来没真正接管过整个 app。
+- **安装名固定为「DSH Mobile」**:`pwa/manifest.json` 的 `short_name` 就是安装到主屏后图标下面显示的名字。
+- **首帧就有安全区**:`viewport-fit=cover` 现在直接写在网关转发的第一帧 HTML 里,不用等 dsh-mobile-nav 的客户端脚本启动后才补——独立 PWA 冷启动那一刻起安全区就生效,不再是「刚打开时贴着刘海,拖一下才弹回去」。
 
 ---
 
@@ -179,7 +203,7 @@ dsh.example.com {
 }
 ```
 
-字段名 = 环境变量去掉前缀转小驼峰：`port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`，推送半边是 `pushEvents` / `pushDebounceMs` / `pushSummary`。挂载行支持 Cordis config 的 DSH 版本也可以把网关配置写在 insert 行的 `config:` 下（同名小驼峰字段），效果等同。
+字段名 = 环境变量去掉前缀转小驼峰：`port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`，推送半边是 `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool`（`push_notify` 工具开关，默认 `true`）。挂载行支持 Cordis config 的 DSH 版本也可以把网关配置写在 insert 行的 `config:` 下（同名小驼峰字段），效果等同。
 
 推送宿主插件（可选）在 profile 的 `~/.dsh/profiles/web/cordis.patch.yml` 里挂载：
 
@@ -214,6 +238,7 @@ dsh.example.com {
 - 设备被吊销时，它的推送订阅一并删除；推送目标返回 404/410（订阅已失效）时网关会自动清掉这条订阅。
 - 手机浏览器要求页面必须是 HTTPS 才会注册 Service Worker，所以推送和离线能力都依赖第 2 步配好的反代——反代没配好之前，这两项在真机上都不会生效。
 - 「agent 干完活自动推送」由可选宿主插件 `dsh-push.mjs` 负责：它监听 DSH 事件总线并调用本机 `/pwa/push/send`。事件名通过 `DSH_PUSH_EVENTS`（逗号分隔）配置，默认 `agent/turn-stopping`——官方文档定义的「回合即将关闭」检查点（模型不再欠响应、无存活工具调用时触发，每回合一次）；如果你的 DSH 版本更旧/更新导致事件名不同，用该环境变量覆盖即可。`DSH_PUSH_DEBOUNCE_MS`（默认 15000）控制两条通知的最小间隔。想让通知带上这回合的结果摘要？设 `DSH_PUSH_SUMMARY=1`，通知正文会换成本回合最后一条助手消息（截 120 字）——推送 payload 本身是 aes128gcm 端到端加密的，Google/Apple 的推送服务器只见密文，剩下的暴露面是你自己的锁屏和通知中心（两大系统都支持「锁屏隐藏通知内容」，介意就开）。不装它也可以自己在任何脚本里 `curl -X POST http://127.0.0.1:3088/pwa/push/send -H 'Content-Type: application/json' -d '{"title":"DSH 任务完成"}'` 手动触发。
+- 「模型主动推送」由同一个 `dsh-push.mjs` 额外注册一个模型工具 `push_notify`（`title` 必填、`body` 可选），走的是同一条 `/pwa/push/send` 加密发送通道。宿主装了工具注册服务（`ctx.tools`）且没关闭时才会出现；`lan-gate.config.json` 的 `pushTool: false`（或环境变量 `DSH_PUSH_TOOL=0`）可以整体关掉。宿主侧限流独立于上面的自动推送：同一会话 60 秒内最多发 1 条，全部会话合计每小时最多 20 条，超出直接跳过（不发送、不算错误），避免模型高频调用把你手机刷成消息轰炸。
 
 ---
 
@@ -230,6 +255,16 @@ dsh.example.com {
 - 令牌被别人拿到——这是单用户工具，令牌等于访问权限，没有更细的权限分级；谁拿到令牌谁就能用，怀疑泄露就去管理页吊销重配。
 - DSH 自身的能力边界——网关只负责把 HTTPS 流量安全地转发给 DSH，不会也不能给 DSH 本身加它没有的安全措施（比如 `/api` 自己的信任栅栏是 DSH 那边的事）。
 - 状态文件 `~/.dsh/lan-gate-state.json` 明文存着 VAPID 私钥和所有设备的令牌——这个文件本身就等于全部访问权限，注意宿主机上它的文件权限，别把 `~/.dsh` 目录同步进公共网盘或备份到不受信的地方。
+
+---
+
+## ⚠️ 已知问题：iOS 26.x 视口收缩
+
+现象:iPhone 上把 DSH 加到主屏、以独立 PWA 打开后,视口底部会凭空少掉一截(实测 iPhone 一台 26.5 系统上是 852 屏幕高度对 793 视口高度,少了正好一条状态栏的高度),从冷启动那一刻就在,直到你把整个 app 彻底退出重开才会恢复;在普通 Safari 标签页里打开同一个网址则完全正常。
+
+这不是本插件的 bug,是 iOS 26.x 的系统级缺陷(独立 PWA 里第一次弹出软键盘后,布局视口永久性变矮,`innerHeight`/`visualViewport.height`/`100dvh` 三个值一起变小,社区已有记录)。少掉的那截视口在文档范围之外,任何 CSS 都够不着,只能由系统自己拿背景色画上——本仓库把 `manifest.json` 的 `background_color` 从深色改成了 `#f9fafb`(和 dsh-mobile-nav 浅色主题背景一致),让这条系统画的死区尽量看起来像页面背景的延伸,而不是一条突兀的黑条。
+
+这只是视觉缓解,不是根治:深色主题下这条带反而会更显眼(系统画的是 manifest 里那个固定颜色,没法跟着页面主题切换),而且它同时也是启动闪屏的颜色,所以闪屏从深色变成了浅色。真正的坏行为(视口变矮本身)只能等苹果修复系统缺陷。dsh-mobile-nav 那边另外做了两层缓解(检测 + 主动摘窗重排),细节见该插件的 README。
 
 ---
 
@@ -259,12 +294,12 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 | 路径 | 作用 |
 | --- | --- |
 | `lan-gate.mjs` | Cordis 插件入口：spawn 网关子进程 + 生命周期管理 |
-| `dsh-push.mjs` | （可选）agent 完成推送宿主插件，调网关本机 `/pwa/push/send` |
+| `dsh-push.mjs` | （可选）agent 完成推送宿主插件，调网关本机 `/pwa/push/send`；同时注册模型工具 `push_notify` |
 | `lib/lan-gate-server.cjs` | 网关本体：单文件 CommonJS（Node stdlib + `web-push` 一个运行时依赖），HTTP/WebSocket 反代 + 配对/令牌 + 限流 + PWA 注入 + Web Push |
 | `pwa/manifest.json` | PWA 安装清单 |
 | `pwa/sw.js` | service worker（离线缓存 + 推送通知） |
 | `pwa/inject.js` | 注入页引导：注册 SW + 加载手势 + 通知订阅 |
-| `pwa/touch-gestures.js` | 下拉刷新 / 边缘返弹 / 捏合缩放 |
+| `pwa/touch-gestures.js` | 边缘返弹 / 捏合缩放 |
 | `pwa/app.css` | 移动触屏布局（`data-lan-device` 前缀，桌面零影响） |
 | `pwa/offline.html` | 离线回退页 |
 | `pwa/icons/` | SVG 源 + 192/512 PNG + maskable 图标 |
@@ -280,10 +315,38 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 ## 🧑‍💻 开发贴士
 
 - **隔离**：网关是子进程，`lan-gate.mjs` 只负责 spawn + 生命周期，永不 import 它的服务代码进 DSH 进程。
-- **移动 CSS 前缀**：新规则一律挂 `html[data-lan-device="phone"]` 或排除 `desktop` 的 `@media(max-width:820px)`，**桌面必须永不受影响**。
+- **移动 CSS 前缀**：新规则一律挂 `html:not([data-lan-device="desktop"])`（不是字面量 `="phone"`——真机配对后默认是 `"auto"`，从来不会被打成 `"phone"`，挂字面量等于永远不生效），**桌面必须永不受影响**。
+- **app.css 只放壳级规则**：字号、弹窗、composer 外观这类排版规则不要往这里加，那是 `@dsh-external/dsh-mobile-nav` 的地盘（见 README「与 dsh-mobile-nav 的分工」一节）；新规则先问一句「这条是不是在跟 dsh-mobile-nav 抢同一个元素」。
 - **稳定选择器**：用 `[data-slot=...]` / ARIA 而非 hash 类名，避免前端构建后失效。
 - **注入页的单引号坑**：`lib/lan-gate-server.cjs` 里的注入脚本字符串，历史上有「双引号套双引号」bug，注意字面量转义。
 - **本机直连判定**：新增/修改路由前先看 `isLocalDirect`——它是管理面 403 防护的唯一依据，别绕过它。
+
+---
+
+## 📝 更新日志
+
+### v0.3.0
+
+**新增**
+
+- 与 `@dsh-external/dsh-mobile-nav` 明确分工：排版类规则全部让出，本仓库只保留壳级 CSS（详见「与 dsh-mobile-nav 的分工」一节）；
+- service worker 升到 v3：缓存策略从「静态壳 + 客户端资产都 stale-while-revalidate」改成「只有静态壳（manifest/图标/离线页）缓存优先，客户端 JS/CSS/API/页面 HTML 一律网络优先」，装了新版本手机上立刻吃到，不会跨部署残留旧 CSS；
+- 首帧 HTML 直接带 `viewport-fit=cover`，独立 PWA 冷启动第一帧就有安全区，不用等客户端脚本补；
+- `dsh-push.mjs` 新增模型工具 `push_notify`：agent 可以自己判断「该推一条给用户了」（需要决策/关键节点/出错需人工介入）主动触发锁屏推送，不必等到整个回合结束。同一条 aes128gcm 加密通道，宿主侧限流（会话 60 秒 1 条、全局每小时 20 条）与开关 `pushTool`（`lan-gate.config.json`）独立于原有的「回合结束自动推送」。
+
+**修复**
+
+- manifest/图标凭证豁免，不再挡在配对墙后（此前 Android/桌面 Chrome 因此看不到安装按钮，只有 iOS Safari 碰巧能装）；
+- 网关剥掉 DSH 页面里排在前面的上游 manifest 标签，避免网关自己那份手机定制 manifest 被浏览器忽略；
+- service worker 注册补 `scope: '/'` + 响应头 `Service-Worker-Allowed: /`，此前默认作用域只有 `/pwa/`，从未真正接管过整站；
+- 删掉网关内联的 `DEVICE_CSS` 死代码副本——其中一条全屏弹窗规则会把 dsh-mobile-nav 的会话信息卡撑满屏并溢出视口，此前一直被误判为「iOS 内核差异」；
+- CSS/手势的 `data-lan-device` 判定从字面量 `"phone"` 改成排除 `"desktop"`——真机配对后默认是 `"auto"`，此前这个判定条件让相关补丁在真机上从未生效过；
+- 下拉刷新移除（误触发全页重载会把人从对话中间弹回列表）；边缘返回手势移除，让位给 dsh-mobile-nav 的左缘手势（原实现对 SPA 路由本就是空操作）；
+- manifest 的 `background_color` 改成浅色，视觉缓解 iOS 26.x 独立 PWA 视口收缩留下的系统死区（已知系统缺陷，非根治，见「已知问题」一节）。
+
+**内部**
+
+- `pwa/app.css` 从 163 行裁到 95 行；补充 `test/sw.test.cjs` 覆盖 service worker 的新缓存策略。
 
 ---
 

@@ -13,10 +13,11 @@ const GATEWAY = path.join(__dirname, '..', 'lib', 'lan-gate-server.cjs')
 // Simulates the reverse proxy: loopback socket + forwarded headers = remote client.
 const REMOTE_HEADERS = { 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' }
 
-function startMockTarget(port) {
+function startMockTarget(port, html) {
+  const page = html || '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>DSH Test</title></head><body><main data-slot="conversation">upstream-ok</main></body></html>'
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end('<!doctype html><html lang="en"><head><meta charset="utf-8"><title>DSH Test</title></head><body><main data-slot="conversation">upstream-ok</main></body></html>')
+    res.end(page)
   })
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)))
 }
