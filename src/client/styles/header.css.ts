@@ -163,14 +163,21 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   [data-phase] header [class$="_crumbSeg"]:last-child [class$="_crumbSep"] {
     display: none !important;
   }
-  [data-phase] header [class$="_crumb"] {
+  /* BOTH selectors are required: [class$=] matches the whole class
+     ATTRIBUTE's suffix, and the current-session title button's attribute is
+     "wSkVaW_crumb wSkVaW_crumbCurrent" — it ends in _crumbCurrent, so the _crumb
+     suffix selector alone silently missed the one element that matters
+     (measured live: the title stayed 14px while the rule sat in the bundle,
+     2026-08-17). */
+  [data-phase] header [class$="_crumb"],
+  [data-phase] header [class$="_crumbCurrent"] {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
     max-width: 100%;
     /* Real-device feedback (2026-08-17): the session title read too small
-       next to the enlarged header icons — 19px sits just under the home
+       next to the enlarged header icons — 21px sits just under the home
        screen's 22px workspace title, keeping the two-level hierarchy. */
     font-size: 21px;
     font-weight: 600;
