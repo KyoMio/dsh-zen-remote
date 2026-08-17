@@ -16,6 +16,16 @@ export type WorkspaceFilter = WorkspaceId | 'all' | null;
  */
 export declare const GO_HOME_EVENT = "dsh-mobile-nav:go-home";
 /**
+ * `window` event the header's ⓘ button (`conversation.session.header.utilities`,
+ * session scope) fires to open the session-info sheet (S4, MobileSessionInfo.tsx)
+ * — a second, sibling entry on the SAME slot. Not a store handle for the same
+ * reason {@link GO_HOME_EVENT} isn't: two independent registrations sharing
+ * one scope could hold a common handle instead, but keeping the info sheet's
+ * open/closed state fully local (a plain `useState`) is simpler than adding a
+ * second store, and the event is one line either way.
+ */
+export declare const SESSION_INFO_EVENT = "dsh-mobile-nav:session-info";
+/**
  * Phone page-stack store (phone breakpoint only; the tablet/desktop layouts
  * never read it). Deliberately NOT persisted: the spec's launch rule is
  * "always land on the session list", so a reload must reset to `home`.

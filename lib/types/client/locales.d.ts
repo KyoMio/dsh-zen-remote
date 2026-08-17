@@ -19,6 +19,24 @@ export declare const zh: {
     readonly switchView: "切换视图";
     readonly attach: "添加附件";
     readonly attachPending: "附件上传即将上线";
+    readonly infoClose: "关闭";
+    readonly infoMode: "模式";
+    readonly infoCwdFallback: "未知目录";
+    readonly infoSubagents: "{count} 个子代理";
+    readonly infoStatTurns: "轮次";
+    readonly infoStatSteps: "步骤";
+    readonly infoStatTtft: "首字延迟";
+    readonly infoStatLlm: "模型耗时";
+    readonly infoStatTool: "工具耗时";
+    readonly infoStatTokens: "Token";
+    readonly infoCacheHit: "缓存 {percent}%";
+    readonly infoExport: "导出日志";
+    readonly infoRename: "重命名";
+    readonly infoRenamePrompt: "会话新名称";
+    readonly infoFork: "Fork 会话";
+    readonly infoArchive: "归档";
+    readonly infoArchiveConfirm: "归档后将从会话列表隐藏，确定继续？";
+    readonly infoActionError: "操作失败：{message}";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

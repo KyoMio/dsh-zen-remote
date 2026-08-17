@@ -39,6 +39,21 @@ importers:
         specifier: ^18.2.0
         version: 18.3.1
     devDependencies:
+      '@deepseek-ai/dsh-api-remotes':
+        specifier: 0.1.0-rc.6
+        version: 0.1.0-rc.6(963f21f11cddd09def26a2473cddd8c5)
+      '@deepseek-ai/dsh-client-connection':
+        specifier: 0.1.0-rc.6
+        version: 0.1.0-rc.6(4d97f918f32bf0a0e5cc153682aa7b50)
+      '@deepseek-ai/dsh-host-apiproxy':
+        specifier: 0.1.0-rc.6
+        version: 0.1.0-rc.6(e9efce95e5e57cd2168691beebd30eb1)
+      '@deepseek-ai/dsh-session-stats':
+        specifier: 0.1.0-rc.6
+        version: 0.1.0-rc.6(ca49b783a5ef5f368229b025afc7d63c)
+      '@deepseek-ai/dsh-token-meter':
+        specifier: 0.1.0-rc.6
+        version: 0.1.0-rc.6(50a09c61b97e6ab96816ffb04cbb9bd3)
       '@types/react':
         specifier: ~18.3.1
         version: 18.3.31

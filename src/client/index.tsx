@@ -4,6 +4,7 @@ import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
 import { MobileHome } from './MobileHome.tsx'
 import { MobileHeaderActions, MobileHeaderUtilities } from './MobileSessionHeader.tsx'
+import { MobileSessionInfo } from './MobileSessionInfo.tsx'
 import { MobileAttachButton } from './MobileAttachButton.tsx'
 import { createNavStore } from './nav-store.ts'
 import { MOBILE_CSS } from './styles/index.ts'
@@ -94,6 +95,29 @@ export function apply(ctx: ClientContext): void {
     order: 0,
     locale: NS,
   }, MobileHeaderUtilities))
+
+  // Session-info sheet (S4): a second, sibling entry on the SAME slot as
+  // the ⓘ button above — it listens for the CustomEvent that button fires
+  // instead of sharing render state with it. Session scope gives this
+  // entry useProjection/sessionId (the stats grid) for free alongside the
+  // always-present useSessions/useWorkspaces (see MobileSessionInfo.tsx's
+  // header comment for the full mount-point tradeoff against shell.overlay).
+  ctx.slots.inject('conversation.session.header.utilities', () => ctx.slots.register({
+    name: 'conversation.session.header.utilities',
+    id: 'mobile-session-info',
+    order: 10,
+    locale: NS,
+    // The factory's own sessionId param is unused: every function below
+    // takes its own session id explicitly (they're generic action bindings
+    // reused verbatim, not closures over one particular session).
+    inject: (_sessionId: SessionId) => ({
+      forkSession: (id: SessionId) => ctx.sessions.fork({ sessionId: id }),
+      openSession: (id: SessionId) => ctx.sessions.open(id),
+      renameSession: (id: SessionId, title: string) => ctx.sessions.binding(id)?.session.rename(title),
+      archiveSession: (id: SessionId) => ctx.workspaces.archiveSession(id),
+      downloadSessionLog: (id: SessionId) => ctx.sessionLogDownload.download(id),
+    }),
+  }, MobileSessionInfo))
 
   // Composer attachment seat (S3 placeholder, S7 wires it to a real picker).
   // Registered unconditionally; styles/composer.css.ts hides it at >= 768px

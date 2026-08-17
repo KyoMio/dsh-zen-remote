@@ -47,10 +47,15 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      "header-viewrow"]) on purpose: :has() is silently dropped by pre-105
      WebViews (see AGENTS.md) and a 28px overlap on the first message is a
      worse failure than 28px of empty band in the (never observed in
-     practice) single-view session. Total header chrome: 48 + 28 = 76px. */
+     practice) single-view session. Total header chrome: 48 + 28 = 76px.
+     Left/right 8px (S2.1 report leftover, fixed in S4): the official header
+     had zero horizontal padding, so the utilities button cluster's right
+     edge sat flush against the screen edge (x=390 at 390px width, no
+     margin). The 92px grid columns absorb this fine — they're fixed track
+     widths, only the center 1fr column shrinks by 16px. */
   [data-phase] header {
     position: relative;
-    padding: 0 0 28px !important;
+    padding: 0 8px 28px !important;
   }
   /* grid-row: 1 on every item is load-bearing, not decoration (S2.1 fix for
      the "标题被挤下去" report). The three items are placed with explicit

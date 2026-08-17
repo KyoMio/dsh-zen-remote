@@ -1,10 +1,13 @@
 /**
  * All mobile styles, concatenated in the exact order of the original
  * single-file stylesheet (base → layout → compat → misc, where misc keeps
- * composer → tablet → desktop), followed by the phone app shell (home) and
- * the session-header reflow (header) and the composer reflow (composer), which must come last so their <768px
- * rules win ties against the shared <=1023px block. Injected as ONE
- * <style data-plugin> tag — do not reorder.
+ * composer → tablet → desktop), followed by the phone app shell (home), the
+ * session-header reflow (header), the composer reflow (composer), and the
+ * session-info sheet (info, which must come last of all: it re-shows a
+ * header.utilities child header.css.ts hides by default, so its rule has to
+ * win that tie too) — all appended in this order so their <768px rules win
+ * ties against the shared <=1023px block. Injected as ONE <style
+ * data-plugin> tag — do not reorder.
  */
 export declare const MOBILE_CSS: string;
 //# sourceMappingURL=index.d.ts.map

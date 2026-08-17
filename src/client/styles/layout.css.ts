@@ -406,8 +406,15 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
     }
   }
   /* The export dialog (not the settings sheet) must never overflow the
-     viewport: the official centered card can be wider than 390px. */
-  [aria-modal="true"]:not(:has(> :first-child > :last-child > button)) {
+     viewport: the official centered card can be wider than 390px.
+     :not([data-mobile-nav="info-sheet"]) (S4, 2026-08-17): the session-info
+     sheet also carries role="dialog" aria-modal="true" (correct a11y
+     semantics for a bottom sheet with a scrim) and has no button as its
+     first-child's last-child, so without this exclusion it silently matched
+     this generic selector too — measured 358px (100vw-32px) instead of the
+     374px its own left:8px/right:8px margins specify. Same category of bug
+     as the ZuhsRW directory-picker collision below; same fix shape. */
+  [aria-modal="true"]:not(:has(> :first-child > :last-child > button)):not([data-mobile-nav="info-sheet"]) {
     max-width: calc(100vw - 32px) !important;
   }
   /* Nav bar: hide the "Settings" caption (redundant on a full-width sheet)

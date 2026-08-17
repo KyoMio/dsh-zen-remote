@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { IconChevronLeftOutline14, IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS } from './locales.ts'
-import { GO_HOME_EVENT } from './nav-store.ts'
+import { GO_HOME_EVENT, SESSION_INFO_EVENT } from './nav-store.ts'
 
 /** Full props for the session header's back button + view-switch row. */
 export type MobileHeaderActionsProps =
@@ -10,7 +10,7 @@ export type MobileHeaderActionsProps =
   & PropsLocale<typeof NS>
 
 /** One tab read off the official (now visually hidden) Chat/Trajectory tablist. */
-interface ViewTabInfo {
+export interface ViewTabInfo {
   label: string
   active: boolean
   el: HTMLButtonElement
@@ -39,8 +39,12 @@ function readViewTabs(): ViewTabInfo[] {
  * current. Scoped to `document.body` like the existing aionui-compat
  * effects (styles/aionui-compat.ts): the tablist itself may not exist yet
  * at mount time.
+ *
+ * Exported: MobileSessionInfo.tsx (S4) reuses this exact hook for the info
+ * sheet's Chat/Trajectory segmented control instead of re-reading the
+ * tablist a second way.
  */
-function useViewTabs(): ViewTabInfo[] {
+export function useViewTabs(): ViewTabInfo[] {
   const [tabs, setTabs] = useState<ViewTabInfo[]>(() => [])
   useEffect(() => {
     const sync = (): void => setTabs(readViewTabs())
@@ -121,7 +125,7 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
         data-mobile-nav="header-info"
         aria-label={t('sessionInfo')}
         title={t('sessionInfo')}
-        onClick={() => window.dispatchEvent(new CustomEvent('dsh-mobile-nav:session-info'))}
+        onClick={() => window.dispatchEvent(new CustomEvent(SESSION_INFO_EVENT))}
       >
         <span aria-hidden="true">ⓘ</span>
       </button>

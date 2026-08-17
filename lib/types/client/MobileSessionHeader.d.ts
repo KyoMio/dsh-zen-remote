@@ -2,6 +2,25 @@ import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots
 import { NS } from './locales.ts';
 /** Full props for the session header's back button + view-switch row. */
 export type MobileHeaderActionsProps = PropsRuntime<'conversation.session.header.actions'> & PropsLocale<typeof NS>;
+/** One tab read off the official (now visually hidden) Chat/Trajectory tablist. */
+export interface ViewTabInfo {
+    label: string;
+    active: boolean;
+    el: HTMLButtonElement;
+}
+/**
+ * Live view-tab mirror. The tablist mounts/unmounts with the session header
+ * and its `aria-selected` flips on every view switch (ours or the suite's
+ * own), so a MutationObserver — not a one-time read — keeps the mirror
+ * current. Scoped to `document.body` like the existing aionui-compat
+ * effects (styles/aionui-compat.ts): the tablist itself may not exist yet
+ * at mount time.
+ *
+ * Exported: MobileSessionInfo.tsx (S4) reuses this exact hook for the info
+ * sheet's Chat/Trajectory segmented control instead of re-reading the
+ * tablist a second way.
+ */
+export declare function useViewTabs(): ViewTabInfo[];
 /**
  * Session header, left lane: the back button (returns the phone page stack
  * to the session list) plus the "current view + dots" row that mirrors the

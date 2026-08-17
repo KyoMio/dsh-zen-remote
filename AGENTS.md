@@ -34,6 +34,7 @@
   - `conversation.input.left` → `MobileAttachButton`（S3 附件占位钮，只在 <768px 显示，S7 接真上传）
   - `shell.overlay` → `MobileNavOverlay`（遮罩 / 浮动按钮 / Escape 与点击关闭，仅平板）
   - `shell.overlay` → `MobileHome`（<768px 全屏会话列表主页，order 20）
+  - `conversation.session.header.utilities` → `MobileSessionInfo`（S4 会话信息卡，order 10，session scope；监听 `SESSION_INFO_EVENT` 打开，见下方核心文件说明）
   - `sidebar.footer.action` → `MobileDrawerFooter`（文件 + 会话日志下载）
 - 核心文件：
   - `src/client/MobileNavOverlay.tsx`：维护 `data-mobile-nav="frame"`，导航关闭启发式。
@@ -41,10 +42,12 @@
   - `src/client/MobileDrawerFooter.tsx`：抽屉底部操作。
   - `src/client/styles/`：全部移动端样式，拆为 `base/layout/compat/misc.css.ts` + `index.ts`（导出 `MOBILE_CSS` = 四者按序 `join('\n')`，注入为单一 `<style data-plugin>`）。拆分是纯搬移：组件文件**不要手改 CSS 内容**，用切片脚本按原字节序切（见下 Pitfall「styles/ 按节切片」）。
   - `src/client/MobileHome.tsx`：手机主页（workspace 切换器 / 会话列表 / FAB / 底部 sheet），数据全走标准 kit `useSessions` / `useWorkspaces`，动作走注入的 `ctx.sessions.open` / `ctx.workspaces.startSession`，不读官方 DOM。
-  - `src/client/nav-store.ts`：`createNavStore()` — 页面栈 `defineStore`（`view: 'home' | 'session'` + workspace 过滤），**不 persist**（启动必须落主页）；handle 在 `apply()` 里建，后续薄片注册同一 handle 即共享实例。
+  - `src/client/nav-store.ts`：`createNavStore()` — 页面栈 `defineStore`（`view: 'home' | 'session'` + workspace 过滤），**不 persist**（启动必须落主页）；handle 在 `apply()` 里建，后续薄片注册同一 handle 即共享实例。同文件还导出 `GO_HOME_EVENT`（跨 scope 返回主页）与 `SESSION_INFO_EVENT`（S4，打开信息卡）两个 `window` 事件名常量。
+  - `src/client/MobileSessionInfo.tsx`：S4 会话信息卡 sheet——挂在 `conversation.session.header.utilities`（session scope，与 ⓘ 按钮同 slot 的第二个 entry），而非 `shell.overlay`：需要 `useProjection`/`sessionId`（session-scope-only 标准 props）读统计，且 `shell.overlay` 渲染进 `pI_x6G_overlayLayer`（z-index:20 的 stacking context，见下方 pitfall）会被 composer 自己的底部 sheet（z:60）盖住。内容：Chat/Trajectory 分段控件（复用 `MobileSessionHeader.tsx` 导出的 `useViewTabs`，UI 用 `role="group"`+`aria-pressed` 而非 `role="tablist"`，理由见 pitfall）、徽标行（agentPreset/subagent 数/cwd，全部来自 `useSessions`——`GlobalStandardProps` 在任何 slot scope 都无条件可用）、统计六格（`useProjection('sessionStats'|'tokenUsage')`，格式化函数从官方 StatsLine 原样搬运）、四个动作（导出日志/重命名/Fork/归档）。
   - `src/client/styles/home.css.ts`：手机 app 壳样式，整块在 `@media (max-width: 767px)` 内，且**必须排在 index.ts 拼接的最后**（要压过 ≤1023px 那一大块的同权重规则）。
   - `src/client/effects/`：客户端 effect，按域拆 3 文件（phone-chrome / aionui-compat / header-status）；`index.tsx` 只做编排（locale、样式注入、install 调用、slot 注册）。**S3 删掉了 `stats-line.ts`**（原来靠文本匹配给官方统计行打 `data-mobile-nav="stats"`）——统计行改用结构选择器 `[data-slot="conversation.composer.dock"] > [class$="_root"]` 命中，平板保留横滚条带、手机整行隐藏（数据 S4 进信息卡）。
   - `src/client/styles/composer.css.ts`：S3 手机 composer 重排，整块在 `@media (max-width: 767px)` 内，拼在 index.ts 最后。
+  - `src/client/styles/info.css.ts`：S4 信息卡 sheet 样式，整块在 `@media (max-width: 767px)` 内，**必须排在 index.ts 拼接的最末尾**（要压过 `header.css.ts` 给 `header.utilities` 子元素的默认隐藏规则，见下方 pitfall）。
   - `src/client/locales.ts`：`mobileNav` i18n；`zh` 是 key 源真相，`en` 是类型镜像。
   - `scripts/build-client.mjs`：自定义打包器。
 - 构建流程：client tsc 输出到 `.client-build/`，`build-client.mjs` 把相对模块内联成 `window.__ModuleLoader__.load({...})` 并写入 `lib/client.js`，平台模块保留 `require()`；随后删除 `.client-build/` 和 `lib/client.js.map`。**bundle 支持递归内联 `styles/` 子目录模块**（`require` 按宿主模块目录解析到规范相对路径，再改写进扁平 `__modules` map；运行时 `__localRequire` 不变）。
@@ -116,6 +119,10 @@
 - **官方浮层 sheet 化的前提是祖先链无 transform**：`position: fixed` 遇到带 transform/filter/contain 的祖先会退化成相对该祖先定位。S3 实测 composer card 到 `<html>` 的整条链干净（探针里保留了 `transformChain` 检查项）；S1 的页面栈 transform 挂在 `[data-mobile-nav="home"]` 自己身上，不在 composer 的祖先链上。以后往会话层加 transform 动画前先跑这个检查。
 - **模型胶囊在 390px 必然省略**：S3 给 `_triggerLabel` 加了 `direction: rtl`，让省略号落在**开头**（「…-V4-Flash」而不是「DeepSee…」）——同样宽度下能认出模型。
 - **codegraph 已启用**：`codegraph init` 生成 `.codegraph/`（已加 .gitignore）；查询用 codegraph_explore（CSS 模板字符串模块也能索引），不用再跑 grep 全家桶。
+- **`useProjection('sessionStats' | 'tokenUsage')` 等深层交叉包类型需要补 `paths` 映射（S4，2026-08-17）**：`tsconfig.client.json` 用 `moduleResolution: "node"`（Node10 经典解析），不认包的 `exports` 字段子路径映射——`@deepseek-ai/dsh-session-stats/client`、`@deepseek-ai/dsh-token-meter/client` 这类由 `SessionProjectionMap` 声明合并承载类型的包，若无 `paths` 显式指到 `lib/types/client.d.ts`，`skipLibCheck` 会静默吞掉解析失败，症状是**同一接口的某些字段"凭空消失"**（如 `SubagentCatalogSnapshot extends SubagentCatalog` 却读不到 `entries`/`parentAvailable`——base 类型跨 3 层再导出 `dsh-api-remotes/client → dsh-client-connection/client → dsh-host-apiproxy/api`，每一跳都需要 `paths` 映射到其 `lib/types/**/index.d.ts` 实际文件，缺一跳全链断）。诊断法：把可疑类型单独 `declare const c: X; c.someField` 写进一个临时 `src/client/scratch-check.ts` 跑 `tsc --noEmit`，报 `Property 'x' does not exist` 而不是 `Cannot find module` 就是这个模式；再用 `--traceResolution` 找 `was not resolved` 的那一跳。已修的包都要以 devDependency 显式声明（纯类型用途，`import type {}` 不会进产物）+ `tsconfig.client.json` 加 `paths` 条目，照抄现有 9 条的写法。新增 `useProjection` key 或跨包深类型前，先用这个诊断法探一遍，别急着改代码"绕过"类型报错。
+- **别在自定义控件上复用官方 DOM 读取用的 ARIA role（S4，2026-08-17）**：`MobileSessionHeader.tsx` 的 `readViewTabs()` 用 `document.querySelector('header [role="tablist"]')` 定位官方 Chat/Trajectory 页签——若自己的浮层也渲染在 `<header>` 内且自带 `role="tablist"`/`role="tab"`（哪怕只是语义化考虑），一旦浮层打开，这条 selector 会先撞上自己的控件，导致「代点」递归点自己、官方视图纹丝不动。**症状极具迷惑性**：sheet 正常打开/关闭，点击有反应，唯独视图不切——用 `HTMLElement.prototype.click` 打补丁记录调用链最容易揪出来（会看到自己反复点自己）。凡是要「镜像 + 代点」某个官方部件的自定义控件，一律用不冲突的 role（`role="group"` + `aria-pressed`，而非 `role="tablist"`/`role="tab"`），哪怕看起来语义更贴切。
+- **`aria-modal="true"` 会撞上 layout.css.ts 的通用 export-dialog 选择器**：`[aria-modal="true"]:not(:has(> :first-child > :last-child > button))` 是给「非 settings 结构的官方弹窗」限宽用的（`max-width: calc(100vw - 32px)`），specificity 比单属性选择器高得多（(0,3,1) vs (0,1,0)），**同选择器同 `!important` 时源顺序赢不了它**。自定义 sheet 若给自己 `role="dialog" aria-modal="true"`（正确的可访问性写法）又没有「首子的末子是 button」这种结构，会被这条通用规则限宽——症状是「盒子几何看起来对，`getBoundingClientRect().width` 却比 `left`/`right` 算出来的小一截」。修法沿用 issue #12 的 ZuhsRW 先例：给通用选择器追加 `:not([data-mobile-nav="你的sheet标记"])`，而不是试图在自己的规则里堆 `!important`/提高特异性去硬顶。全仓库 `[aria-modal="true"]` 選択器已知有十几处（layout/compat/misc 三个文件），新增会被官方弹窗结构命中的自定义 modal 前，先 `grep 'aria-modal="true"'` 全部过一遍。
+- **CDP/headless 环境下 `document.hidden=true` 会冻结 CSS 动画（不是真 bug）**：Claude Browser 工具在某些状态下报的页面 `visibilityState` 是 `"hidden"`（即便 `computer` 截图仍能工作），此时 `Element.getAnimations()[0].currentTime` 会卡在 0，`transform`/`opacity` 类入场动画的初始帧（如 `translateY(28px)`）永久不推进，实机/前台标签页不会有这个问题——用 `el.getAnimations()` 查 `currentTime` 确认是否环境节流，别当成真的动画没触发去改代码。同一原因下 `computer{action:"left_click"}` 常年超时（"Browser pane is currently hidden"），但 `javascript_tool` 的 DOM 读写/`element.click()` 分发照常生效——这类环境下驱动交互一律走 `javascript_tool` 合成点击 + `getBoundingClientRect()`/`getComputedStyle()` 断言，不要死等 `computer` 工具。
 
 ## Maintenance
 

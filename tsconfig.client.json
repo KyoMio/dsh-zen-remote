@@ -33,6 +33,15 @@
       "@deepseek-ai/dsh-client-runtime/client": [
         "./node_modules/@deepseek-ai/dsh-client-runtime/lib/types/client/index.d.ts"
       ],
+      "@deepseek-ai/dsh-api-remotes/client": [
+        "./node_modules/@deepseek-ai/dsh-api-remotes/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-connection/client": [
+        "./node_modules/@deepseek-ai/dsh-client-connection/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-host-apiproxy/api": [
+        "./node_modules/@deepseek-ai/dsh-host-apiproxy/lib/types/api/index.d.ts"
+      ],
       "@deepseek-ai/dsh-client-ui-slots": [
         "./node_modules/@deepseek-ai/dsh-client-ui-slots/lib/types/index.d.ts"
       ],
@@ -53,6 +62,12 @@
       ],
       "@deepseek-ai/dsh-session-log-export/client": [
         "./node_modules/@deepseek-ai/dsh-session-log-export/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-session-stats/client": [
+        "./node_modules/@deepseek-ai/dsh-session-stats/lib/types/client.d.ts"
+      ],
+      "@deepseek-ai/dsh-token-meter/client": [
+        "./node_modules/@deepseek-ai/dsh-token-meter/lib/types/client.d.ts"
       ]
     },
     "allowImportingTsExtensions": true,
