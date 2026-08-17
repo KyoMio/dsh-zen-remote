@@ -38,13 +38,51 @@ export function installDebugBadge(ctx: ClientContext): void {
     }
   }, 'dsh-mobile-nav: fake safe-area inset')
 
+  /**
+   * No-URL toggle — 5 quick taps on the home workspace title.
+   * A standalone PWA has no address bar, and the paired-device cookie lives
+   * in the PWA's own jar (Safari hits the pairing wall instead), so the
+   * ?mobile-nav-debug=1 param is unreachable exactly where the badge is
+   * needed most. Five taps within 2.5s on [data-mobile-nav="ws-switch"]
+   * flip a localStorage flag and reload.
+   */
   ctx.effect(() => {
-    if (!new URLSearchParams(location.search).has('mobile-nav-debug')) return () => {}
+    let taps = 0
+    let firstTap = 0
+    const onTap = (event: Event) => {
+      if (!(event.target instanceof Element)) return
+      if (event.target.closest('[data-mobile-nav="ws-switch"]') === null) return
+      const now = Date.now()
+      if (now - firstTap > 2500) { taps = 0; firstTap = now }
+      taps += 1
+      if (taps >= 5) {
+        const key = 'dsh-mobile-nav.debug'
+        if (localStorage.getItem(key) === '1') localStorage.removeItem(key)
+        else localStorage.setItem(key, '1')
+        location.reload()
+      }
+    }
+    document.addEventListener('click', onTap, true)
+    return () => document.removeEventListener('click', onTap, true)
+  }, 'dsh-mobile-nav: debug badge tap toggle')
+
+  ctx.effect(() => {
+    const enabled = new URLSearchParams(location.search).has('mobile-nav-debug')
+      || localStorage.getItem('dsh-mobile-nav.debug') === '1'
+    if (!enabled) return () => {}
     const errors: string[] = []
     const onError = (event: ErrorEvent) => errors.push(`ERR ${event.message.slice(0, 120)}`)
     const onRejection = (event: PromiseRejectionEvent) => errors.push(`REJ ${String(event.reason).slice(0, 120)}`)
     window.addEventListener('error', onError)
     window.addEventListener('unhandledrejection', onRejection)
+
+    /* Probe element: reads the REAL env(safe-area-inset-*) as computed padding
+       — the --mnav-* vars can be faked by the inset param, this cannot. */
+    const probe = document.createElement('div')
+    probe.style.cssText =
+      'position:fixed;visibility:hidden;pointer-events:none;' +
+      'padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)'
+    document.body.appendChild(probe)
 
     const badge = document.createElement('div')
     badge.style.cssText = [
@@ -69,15 +107,40 @@ export function installDebugBadge(ctx: ClientContext): void {
         `previewCol ${vis('[data-aionui-preview-col]')}  explorerCol ${vis('[data-aionui-explorer-col]')}`,
         `previewOpen ${frame?.hasAttribute('data-aionui-preview-open') ?? '?'}  explorerOpen ${frame?.hasAttribute('data-aionui-explorer-open') ?? '?'}  previewFull ${frame?.hasAttribute('data-mobile-preview-full') ?? '?'}`,
         `header ${vis('[data-phase] header')} h${Math.round(document.querySelector('[data-phase] header')?.getBoundingClientRect().height ?? 0)}  composer ${q('textarea')}`,
-        `sat ${getComputedStyle(document.documentElement).getPropertyValue('--mnav-sat').trim() || '?'}`,
+        `sat ${getComputedStyle(document.documentElement).getPropertyValue('--mnav-sat').trim() || '?'}  sab ${getComputedStyle(document.documentElement).getPropertyValue('--mnav-sab').trim() || '?'}`,
+        (() => {
+          /* Bottom-gap forensics: real env values + who ends where. */
+          const ps = getComputedStyle(probe)
+          const bottomOf = (sel: string): string => {
+            const el = document.querySelector(sel)
+            return el === null ? '—' : String(Math.round(el.getBoundingClientRect().bottom))
+          }
+          return [
+            `env sat ${ps.paddingTop} sab ${ps.paddingBottom}`,
+            `vh ${innerHeight} vv ${Math.round(window.visualViewport?.height ?? -1)}`,
+            `botFrame ${bottomOf('[data-mobile-nav="frame"]')} composer ${bottomOf('[data-phase] textarea')}`,
+            `botList ${bottomOf('[data-mobile-nav="home-list"]')} fab ${bottomOf('[data-mobile-nav="home-fab"]')}`,
+            `cssLen ${document.querySelector('style[data-plugin-css*="mobile"]')?.textContent?.length ?? 0}`,
+          ].join('\n')
+        })(),
         `genui cards ${document.querySelectorAll('[data-genui]').length}  panel ${q('[data-genui-panel]')}`,
         `phase ${document.querySelector('[data-phase]')?.getAttribute('data-phase') ?? '?'}`,
         `errs ${errors.slice(-5).join(' | ') || 'none'}`,
       ].join('\n')
     }
-    const paint = (): void => { badge.textContent = read() }
+    /* Feedback-loop guards: painting the badge mutates the body subtree the
+       observer watches — without these two checks the observer retriggers
+       itself forever and freezes the page (the badge was rarely actually
+       enabled before, which is how this survived). */
+    const paint = (): void => {
+      const next = read()
+      if (next !== badge.textContent) badge.textContent = next
+    }
     paint()
-    const observer = new MutationObserver(paint)
+    const observer = new MutationObserver((mutations) => {
+      if (mutations.every((m) => m.target === badge || badge.contains(m.target) || m.target === probe)) return
+      paint()
+    })
     observer.observe(document.body, { childList: true, subtree: true, attributes: true })
     const timer = setInterval(paint, 1500)
     document.body.appendChild(badge)
@@ -86,6 +149,7 @@ export function installDebugBadge(ctx: ClientContext): void {
       window.removeEventListener('unhandledrejection', onRejection)
       observer.disconnect()
       clearInterval(timer)
+      probe.remove()
       badge.remove()
     }
   }, 'dsh-mobile-nav: debug badge')
