@@ -6,6 +6,22 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
  * diagnosed without guessing. No-op unless the query param is present.
  */
 export function installDebugBadge(ctx: ClientContext): void {
+  /**
+   * Fake safe-area inset — ?mobile-nav-inset=54
+   * env(safe-area-inset-*) is hard 0 on every desktop browser (CDP included),
+   * so notch bugs are invisible until a real phone loads the page — the S2.1
+   * hotfix exists because of exactly that. Overriding --mnav-sat (see
+   * styles/base.css.ts) on the root element reproduces a notch anywhere.
+   * No param = the variable keeps its env() value = zero behaviour change.
+   */
+  ctx.effect(() => {
+    const raw = new URLSearchParams(location.search).get('mobile-nav-inset')
+    const px = Number(raw)
+    if (raw === null || !Number.isFinite(px)) return () => {}
+    document.documentElement.style.setProperty('--mnav-sat', `${px}px`)
+    return () => document.documentElement.style.removeProperty('--mnav-sat')
+  }, 'dsh-mobile-nav: fake safe-area inset')
+
   ctx.effect(() => {
     if (!new URLSearchParams(location.search).has('mobile-nav-debug')) return () => {}
     const errors: string[] = []
@@ -36,7 +52,8 @@ export function installDebugBadge(ctx: ClientContext): void {
         `css ${q('style[data-plugin-css*="mobile"]')}  frame ${!!frame}`,
         `previewCol ${vis('[data-aionui-preview-col]')}  explorerCol ${vis('[data-aionui-explorer-col]')}`,
         `previewOpen ${frame?.hasAttribute('data-aionui-preview-open') ?? '?'}  explorerOpen ${frame?.hasAttribute('data-aionui-explorer-open') ?? '?'}  previewFull ${frame?.hasAttribute('data-mobile-preview-full') ?? '?'}`,
-        `header ${vis('[data-phase] header')}  composer ${q('textarea')}`,
+        `header ${vis('[data-phase] header')} h${Math.round(document.querySelector('[data-phase] header')?.getBoundingClientRect().height ?? 0)}  composer ${q('textarea')}`,
+        `sat ${getComputedStyle(document.documentElement).getPropertyValue('--mnav-sat').trim() || '?'}`,
         `genui cards ${document.querySelectorAll('[data-genui]').length}  panel ${q('[data-genui-panel]')}`,
         `phase ${document.querySelector('[data-phase]')?.getAttribute('data-phase') ?? '?'}`,
         `errs ${errors.slice(-5).join(' | ') || 'none'}`,

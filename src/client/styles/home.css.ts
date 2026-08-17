@@ -35,7 +35,7 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     pointer-events: auto;
     background: var(--dsw-alias-bg-base, #ffffff);
     color: var(--dsw-alias-label-primary, inherit);
-    padding-top: env(safe-area-inset-top, 0px);
+    padding-top: var(--mnav-sat);
     transform: translateX(0);
     opacity: 1;
     transition:
@@ -107,7 +107,7 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     flex: 1 1 auto;
     min-height: 0;
     margin: 0;
-    padding: 0 0 calc(env(safe-area-inset-bottom, 0px) + 96px);
+    padding: 0 0 calc(var(--mnav-sab) + 96px);
     list-style: none;
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -167,7 +167,7 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
   [data-mobile-nav="home-fab"] {
     position: absolute;
     right: 18px;
-    bottom: calc(env(safe-area-inset-bottom, 0px) + 22px);
+    bottom: calc(var(--mnav-sab) + 22px);
     z-index: 6;
     display: inline-flex;
     align-items: center;
@@ -208,7 +208,7 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     position: absolute;
     left: 8px;
     right: 8px;
-    bottom: calc(env(safe-area-inset-bottom, 0px) + 8px);
+    bottom: calc(var(--mnav-sab) + 8px);
     max-height: 70%;
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -263,7 +263,7 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
      back mounts. */
   [data-mobile-nav="hero-back"] {
     position: absolute;
-    top: calc(env(safe-area-inset-top, 0px) + 8px);
+    top: calc(var(--mnav-sat) + 8px);
     left: 8px;
     z-index: 6;
     width: 44px;

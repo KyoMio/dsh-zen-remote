@@ -149,7 +149,7 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     box-sizing: border-box !important;
     border-radius: 16px 16px 0 0 !important;
     border-bottom: none !important;
-    padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px)) !important;
+    padding: 8px 8px calc(8px + var(--mnav-sab)) !important;
     z-index: 60 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, .18) !important;
   }

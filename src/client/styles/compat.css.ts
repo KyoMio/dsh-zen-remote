@@ -193,7 +193,7 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     height: 100dvh !important;
     max-height: none !important;
     box-sizing: border-box !important;
-    padding-top: env(safe-area-inset-top, 0px) !important;
+    padding-top: var(--mnav-sat) !important;
     border-radius: 0 !important;
     box-shadow: none !important;
     z-index: 57 !important;
@@ -202,7 +202,7 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
   /* Fullscreen: the column fills the viewport, so the button follows the
      titlebar row down below the notch. */
   [data-mobile-nav="frame"][data-mobile-preview-full] [data-aionui-preview-col] [data-mobile-nav="preview-full-toggle"] {
-    top: calc(env(safe-area-inset-top, 0px) + 8px) !important;
+    top: calc(var(--mnav-sat) + 8px) !important;
   }
   @media (prefers-reduced-motion: reduce) {
     [data-aionui-preview-col],
@@ -551,5 +551,41 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
   }
   [data-mobile-nav="frame"] [class$="_card"]:has([data-gitgraph-chip-anchor]) {
     padding-top: 40px !important;
+  }
+
+  /* ---------- dsh-better-sidebar: safe area (S2.1, 2026-08-17) ----------
+     THIRD-PARTY COMPAT RULE — dsh-better-sidebar (the workbench the session
+     header's panel button opens). Its shell is viewport-fixed and starts at
+     y=0: the panel at inset 0 (100vw drawer below 768px, a right column
+     above it) and the toggle cluster at top:3px. Neither knows about
+     env(safe-area-inset-*), so on a notched iPhone the whole tab strip —
+     including the one button that CLOSES the panel — sits behind the status
+     bar and cannot be tapped: the user opened the workbench and was stuck
+     there (real-device report, 2026-08-17).
+     Applied across the plugin's whole mobile band, not just <768px: the
+     panel is fixed at top:0 in the 768-1023px range too, so the same notch
+     covers the same tab strip. Zero effect wherever the inset is 0 (every
+     desktop browser, every non-notched device) — desktop is >=1024px and
+     out of this media block entirely.
+     Anchors: the plugin's own mount marker [data-dsh-better-sidebar]
+     (index.tsx) plus class-suffix selectors, per this repo's hashed-class
+     convention. --dsh-title-bar-strip is the plugin's own title-bar-compat
+     offset (set only while that mode is on, 0px fallback otherwise): adding
+     to it keeps both offsets rather than clobbering theirs.
+     !important because their :global(body[...]) rules outrank a plain
+     attribute selector.
+     No box-sizing here on purpose: the panel is position:fixed with BOTH
+     top and bottom set, so its used height already resolves to
+     "containing block - insets - padding - border" (CSS 2.1 10.6.4) and the
+     padding shrinks the content box without any help. Forcing border-box
+     also folds their 1px left border into the inline width — measured as a
+     1px panel-width change at 768px, i.e. a regression outside this
+     hotfix's remit. */
+  [data-dsh-better-sidebar] [class$="_panel"],
+  [data-dsh-better-sidebar] [class$="_panelHidden"] {
+    padding-top: calc(var(--mnav-sat) + var(--dsh-title-bar-strip, 0px)) !important;
+  }
+  [data-dsh-better-sidebar] [class$="_toggleCluster"] {
+    top: calc(var(--mnav-sat) + var(--dsh-title-bar-strip, 0px) + 3px) !important;
   }
 `

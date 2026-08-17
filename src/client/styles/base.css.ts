@@ -2,6 +2,19 @@
 // Do not reorder: styles/index.ts concatenates in this exact order.
 
 export const BASE_CSS = `
+/* ---------- safe-area variables (S2.1, 2026-08-17) ----------
+   Every safe-area use in this stylesheet reads --mnav-sat / --mnav-sab
+   instead of env() directly. Same computed value by default, but the
+   indirection gives one place to override: ?mobile-nav-inset=54 (client/
+   debug.ts) writes a fake inset onto the root element, so a desktop CDP
+   run can regress notch layout — env(safe-area-inset-*) is hard 0 in every
+   desktop browser, which is exactly why the header and the workbench
+   panel shipped broken to a real iPhone. */
+:root {
+  --mnav-sat: env(safe-area-inset-top, 0px);
+  --mnav-sab: env(safe-area-inset-bottom, 0px);
+}
+
 /* ---------- base control styles (rendered at any width, hidden where unused) ---------- */
 
 [data-mobile-nav="toggle"],
@@ -69,7 +82,7 @@ export const BASE_CSS = `
    set viewport-fit=cover the safe-area inset moves it below the notch too. */
 [data-mobile-nav="fab"] {
   position: absolute;
-  top: calc(env(safe-area-inset-top, 0px) + 72px);
+  top: calc(var(--mnav-sat) + 72px);
   left: 10px;
   z-index: 21;
   display: inline-flex;

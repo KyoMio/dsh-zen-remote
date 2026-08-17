@@ -39,16 +39,34 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   }
 
   /* --- three-column header: [back 92px] [title, truly centered] [utilities 92px] --- */
+  /* The bottom padding is the view-switch row's seat: that row is
+     position:absolute (see the bottom of this file — it renders two levels
+     deep inside headerActions and can never be a grid item of titleRow), so
+     without a reserve it would hang over the message list. 28px = its
+     height. Unconditional rather than header:has([data-mobile-nav=
+     "header-viewrow"]) on purpose: :has() is silently dropped by pre-105
+     WebViews (see AGENTS.md) and a 28px overlap on the first message is a
+     worse failure than 28px of empty band in the (never observed in
+     practice) single-view session. Total header chrome: 48 + 28 = 76px. */
   [data-phase] header {
     position: relative;
-    padding: 0 !important;
+    padding: 0 0 28px !important;
   }
+  /* grid-row: 1 on every item is load-bearing, not decoration (S2.1 fix for
+     the "标题被挤下去" report). The three items are placed with explicit
+     grid-column but arrive in DOM order crumbs(2) → headerActions(1) →
+     headerUtilities(3): sparse auto-placement never moves its cursor
+     backwards, so headerActions and headerUtilities were pushed onto an
+     implicit SECOND row. Measured at 390px: row1 = crumbs 28px, row2 =
+     back button 44px, titleRow = 72px with the title stuck at the top
+     instead of centered. Pinning the row makes it one 48px band again. */
   [data-phase] header [class$="_titleRow"] {
     position: relative;
     display: grid;
     grid-template-columns: 92px 1fr 92px;
+    grid-template-rows: minmax(48px, auto);
     align-items: center;
-    min-height: 44px;
+    min-height: 48px;
     padding: 0 !important;
   }
   /* Flatten the official cluster so its two children (crumbs, headerActions)
@@ -64,6 +82,7 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      between the button's content width and the 92px column). */
   [data-phase] header [class$="_headerActions"] {
     grid-column: 1;
+    grid-row: 1;
     justify-self: start;
     margin-left: 0 !important;
     display: flex;
@@ -79,6 +98,7 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   [data-phase] header [class$="_headerUtilities"],
   [data-phase] header > :first-child > :last-child {
     grid-column: 3;
+    grid-row: 1;
     justify-self: end;
     display: flex !important;
     align-items: center;
@@ -100,6 +120,7 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      none here too. */
   [data-phase] header [class$="_crumbs"] {
     grid-column: 2;
+    grid-row: 1;
     justify-self: stretch;
     max-width: none !important;
     display: flex;
@@ -238,14 +259,17 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     line-height: 1;
   }
 
-  /* Official Chat/Trajectory tablist: visually hidden but NOT display:none —
-     visibility:hidden keeps it in layout (so the view-switch row below has
-     somewhere to sit without overlapping the scroll body) and keeps it
-     genuinely clickable via .click() (only real pointer hit-testing is
-     removed, which this plugin never relies on: the view-switch row always
-     dispatches a programmatic click). */
+  /* Official Chat/Trajectory tablist: removed from layout entirely (S2.1 —
+     visibility:hidden still held a 27px row, so the header carried the
+     view-switch row's band TWICE: 72 + 27 + gap = 104px measured at 390px,
+     and a real iPhone added ~54px of notch on top of that). The header's own
+     padding-bottom above is now the row's seat.
+     display:none does NOT break the view switch: HTMLElement.click()
+     dispatches synthetically and fires React's handler regardless of
+     rendering — only real pointer hit-testing needs a box, and this plugin
+     never relies on it (MobileSessionHeader always calls .click()). */
   [data-phase] header [class$="_tabs"][role="tablist"] {
-    visibility: hidden;
+    display: none;
   }
 
   /* View-switch row: "current view name + dots", replacing the (still
