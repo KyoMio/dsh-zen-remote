@@ -4,3 +4,6 @@ node_modules/
 .pnpm-store/
 .learnings/
 .codegraph/
+.client-build/
+test/.tmp/
+*.tgz

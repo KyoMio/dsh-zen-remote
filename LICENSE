@@ -1,9 +1,9 @@
 MIT License
 
 Copyright (c) 2026 dsh-mobile-remote contributors
-Copyright (c) 2026 mexiaosqwq — original dsh-web-mobile (upstream of packages/mobile-ui)
-Copyright (c) 2026 dsh-mobile-pwa contributors — upstream of packages/gateway
-Copyright (c) 2026 Bernardxu123 — original dsh-mobile-gate (base for packages/gateway/lib/lan-gate-server.cjs)
+Copyright (c) 2026 mexiaosqwq — original dsh-web-mobile — 界面层上游 / upstream of the interface half
+Copyright (c) 2026 dsh-mobile-pwa contributors — 通道层上游 / upstream of the gateway half
+Copyright (c) 2026 Bernardxu123 — original dsh-mobile-gate (base for lib/lan-gate-server.cjs)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
