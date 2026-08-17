@@ -73,7 +73,20 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     display: flex;
     flex-direction: column;
     pointer-events: auto;
-    background: var(--dsw-alias-bg-base, #ffffff);
+    /* dsw-specific-sidebar-fill, not an alias bg-layer-* token (real-device
+       round 2 follow-up, 2026-08-17): fetched and diffed the live theme
+       CSS (both light/dark blocks in /assets/index-*.css) because computed
+       values, not source-read guesses, are what actually matter here —
+       --dsw-alias-bg-base/-layer-1/-layer-2 all resolve to the exact same
+       color in the LIGHT theme (neutral-bluish-00, i.e. plain white); they
+       only diverge in dark mode. A layer-* token would have made the page
+       and its cards indistinguishable in light mode specifically — the
+       opposite of what was asked. --dsw-specific-sidebar-fill differs from
+       bg-base in BOTH themes (bluish-50 vs -00 light, bluish-900 vs -950
+       dark) and is the exact token dsh-better-sidebar's own panel already
+       uses for this same "secondary surface next to bg-base content"
+       role, so it is the correct reuse rather than a new hardcoded gray. */
+    background: var(--dsw-specific-sidebar-fill, #f5f5f5);
     color: var(--dsw-alias-label-primary, inherit);
     padding-top: var(--mnav-sat);
     transform: translateX(0);
@@ -154,12 +167,18 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     opacity: .6;
   }
 
-  /* Session list: 60px rows, iOS-style inset separators. */
+  /* Session list: rounded cards, not bordered rows (real-device round 2
+     follow-up, 2026-08-17 — reference: Claude Code mobile app's session
+     list). \`gap\` on the flex column IS the inter-card spacing; no
+     per-row margin bookkeeping. */
   [data-mobile-nav="home-list"] {
     flex: 1 1 auto;
     min-height: 0;
     margin: 0;
-    padding: 0 0 calc(var(--mnav-sab) + 96px);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 16px calc(var(--mnav-sab) + 96px);
     list-style: none;
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -171,12 +190,10 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     gap: 12px;
     width: 100%;
     min-height: 60px;
-    padding: 8px 16px;
+    padding: 14px 16px;
     border: none;
-    /* border-l1 is 4% — invisible as a list separator; l2 (10%/12%) is the
-       official divider weight and reads in both themes. */
-    border-bottom: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, .1));
-    background: transparent;
+    border-radius: 22px;
+    background: var(--dsw-alias-bg-base, #ffffff);
     color: inherit;
     font-family: inherit;
     text-align: left;
@@ -190,32 +207,72 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
   [data-mobile-nav="home-row"][data-current] [data-mobile-nav="home-row-title"] {
     font-weight: 600;
   }
-  [data-mobile-nav="home-row-title"] {
+  /* Avatar: a running/warning/done session shows its existing StateDot
+     (same component, same semantics as the old inline dot — just bigger
+     and re-homed); otherwise the title's own first character stands in
+     for it, so every row has a mark even when idle. interactive-bg-hover,
+     not a bg-layer-* token: same reason as the page background above —
+     bg-layer-2 is IDENTICAL to the card's own bg-base in light theme
+     (verified against the live theme CSS), so it would render invisible
+     there. interactive-bg-hover is a translucent rgba tint rather than a
+     solid layer color, so it always reads as "a shade over the card" in
+     both themes regardless of what the card's base color resolves to. */
+  [data-mobile-nav="home-row-avatar"] {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
+    color: var(--dsw-alias-label-secondary, rgba(0, 0, 0, .55));
+    font-size: 16px;
+    font-weight: 600;
+  }
+  [data-mobile-nav="home-row-body"] {
     flex: 1 1 auto;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  [data-mobile-nav="home-row-title"] {
     font-size: 16px;
-    line-height: 22px;
+    line-height: 21px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  [data-mobile-nav="home-row-meta"] {
-    flex: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
+  [data-mobile-nav="home-row-status"] {
     color: var(--dsw-alias-label-secondary, rgba(0, 0, 0, .5));
-    font-size: 13px;
+    font-size: 12.5px;
+    line-height: 17px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  [data-mobile-nav="home-row-time"] {
+    flex: none;
+    align-self: flex-start;
+    color: var(--dsw-alias-label-tertiary, rgba(0, 0, 0, .4));
+    font-size: 12.5px;
     line-height: 18px;
   }
   [data-mobile-nav="home-empty"] {
+    margin: 12px 16px;
     padding: 48px 24px;
+    border-radius: 22px;
+    background: var(--dsw-alias-bg-base, #ffffff);
     color: var(--dsw-alias-label-secondary, rgba(0, 0, 0, .5));
     font-size: 15px;
     text-align: center;
   }
 
-  /* New-session FAB: tap starts in the shown workspace, long press picks one. */
+  /* New-session FAB: a labeled pill (real-device round 2 follow-up), not a
+     bare circle — tap starts in the shown workspace, long press picks
+     one. Inverted-surface tokens (not a hardcoded accent color): the same
+     pair the official git-commit button in dsh-better-sidebar uses for
+     its own solid CTA. */
   [data-mobile-nav="home-fab"] {
     position: absolute;
     right: 18px;
@@ -223,14 +280,16 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     z-index: 6;
     display: inline-flex;
     align-items: center;
-    justify-content: center;
-    width: 56px;
-    height: 56px;
-    padding: 0;
+    gap: 6px;
+    height: 48px;
+    padding: 0 20px 0 16px;
     border: none;
-    border-radius: 50%;
-    background: var(--dsw-alias-state-business-primary, #4f6ef7);
-    color: #ffffff;
+    border-radius: 999px;
+    background: var(--dsw-alias-button-primary-fill, #1a1a1a);
+    color: var(--dsw-alias-label-primary-inverted, #ffffff);
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 600;
     cursor: pointer;
     box-shadow: 0 6px 20px rgba(0, 0, 0, .24);
     touch-action: manipulation;
@@ -240,7 +299,7 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     -webkit-tap-highlight-color: transparent;
   }
   [data-mobile-nav="home-fab"]:active {
-    transform: scale(.94);
+    transform: scale(.96);
   }
 
   /* Workspace sheet (switcher and long-press New Session share it). */

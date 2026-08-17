@@ -165,10 +165,18 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
     button.dataset.mobileNav = 'better-sidebar-close'
     button.setAttribute('aria-label', t('workbenchClose'))
     button.title = t('workbenchClose')
+    // Bottom-center labeled pill (real-device follow-up, 2026-08-17): the
+    // icon markup is a static trusted string (safe as innerHTML), but the
+    // locale label is untrusted-shaped text — built as a real text node via
+    // textContent, not string-concatenated into the same innerHTML, so a
+    // translation can never be parsed as markup.
     button.innerHTML = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true">'
       + '<path d="M14.1168 13.197L13.197 14.1167L1.8833 2.80303L2.80309 1.88324L14.1168 13.197Z" fill="currentColor"/>'
       + '<path d="M13.197 1.88326L14.1168 2.80305L2.80309 14.1168L1.8833 13.197L13.197 1.88326Z" fill="currentColor"/>'
       + '</svg>'
+    const label = document.createElement('span')
+    label.textContent = t('workbenchClose')
+    button.appendChild(label)
     const onClick = (): void => {
       document.querySelector<HTMLButtonElement>('[data-dsh-better-sidebar] button[class$="_toggleButton"]')?.click()
     }

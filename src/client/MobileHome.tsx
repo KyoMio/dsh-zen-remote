@@ -6,11 +6,13 @@ import {
   IconPlusOutline16,
   StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { SessionId, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { SessionId, SessionSummary, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT } from './nav-store.ts'
 import type { createNavStore } from './nav-store.ts'
 import type { WorkspaceFilter } from './nav-store.ts'
+import type { MobileNavKey } from './locales.ts'
 import { dotState } from './session-dot.ts'
 
 /** Full props for the phone home screen (shell.overlay entry). */
@@ -75,6 +77,23 @@ function relativeTime(at: number): string {
   if (elapsed < 86_400_000) return relative.format(-Math.floor(elapsed / 3_600_000), 'hour')
   if (elapsed < 604_800_000) return relative.format(-Math.floor(elapsed / 86_400_000), 'day')
   return shortDate.format(at)
+}
+
+/**
+ * Card status subline (real-device round 2 follow-up, 2026-08-17): reuses
+ * `dotState`'s own state read (the same ongoing/warning/done semantics the
+ * dot already encodes) plus `agentPreset` from the same `SessionSummary`
+ * row — no new data source. Returns undefined when there is neither a
+ * state nor a preset to show, so the caller can skip the subline entirely
+ * rather than render an empty row.
+ */
+function statusLine(row: SessionSummary, dot: StateDotState | undefined, t: (key: MobileNavKey) => string): string | undefined {
+  const state = dot === 'ongoing' ? t('homeStatusOngoing')
+    : dot === 'warning' ? t('homeStatusWarning')
+    : dot === 'done' ? t('homeStatusDone')
+    : undefined
+  if (state !== undefined && row.agentPreset !== undefined) return `${state} · ${row.agentPreset}`
+  return state ?? row.agentPreset
 }
 
 /**
@@ -194,6 +213,8 @@ export function MobileHome({
       <ul data-mobile-nav="home-list">
         {rows.map((row) => {
           const dot = dotState(row)
+          const status = statusLine(row, dot, t)
+          const initial = row.displayTitle.trim().charAt(0).toUpperCase()
           return (
             <li key={row.id}>
               <button
@@ -202,13 +223,18 @@ export function MobileHome({
                 data-current={row.id === sessions.current ? '' : undefined}
                 onClick={() => enter(() => openSession(row.id))}
               >
-                <span data-mobile-nav="home-row-title">{row.displayTitle}</span>
-                <span data-mobile-nav="home-row-meta">
-                  {dot !== undefined && <StateDot state={dot} size={8} />}
-                  <time dateTime={new Date(row.updatedAt).toISOString()}>
-                    {relativeTime(row.updatedAt)}
-                  </time>
+                <span data-mobile-nav="home-row-avatar" aria-hidden="true">
+                  {dot !== undefined ? <StateDot state={dot} size={10} /> : initial}
                 </span>
+                <span data-mobile-nav="home-row-body">
+                  <span data-mobile-nav="home-row-title">{row.displayTitle}</span>
+                  {status !== undefined && (
+                    <span data-mobile-nav="home-row-status">{status}</span>
+                  )}
+                </span>
+                <time data-mobile-nav="home-row-time" dateTime={new Date(row.updatedAt).toISOString()}>
+                  {relativeTime(row.updatedAt)}
+                </time>
               </button>
             </li>
           )
@@ -223,7 +249,8 @@ export function MobileHome({
         title={t('newSession')}
         onClick={() => enter(() => startSession(selectedWorkspace?.workspaceId))}
       >
-        <IconPlusOutline16 size={22} />
+        <IconPlusOutline16 size={18} />
+        <span>{t('newSession')}</span>
       </button>
 
       {sheet !== null && (

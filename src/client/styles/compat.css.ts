@@ -627,7 +627,20 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
      only while the panel is actually open: the panel's own class name ends
      in "_panel" exclusively in the open state (the "_panelHidden" suffix is
      appended once closed, so the string no longer ends in "_panel") — a
-     pure-CSS :has() open/closed read, no MutationObserver required. */
+     pure-CSS :has() open/closed read, no MutationObserver required.
+
+     Bottom-center pill, not a top-right circle (real-device follow-up,
+     2026-08-17): a top-right position collided with the panel's own
+     per-tab toolbar controls — measured live at 390px with the explorer
+     tab open, the panel's Refresh button sits at x:354-382 y:93-121, and a
+     44px circle at top:8px+safe-area/right:8px lands at x:338-382
+     y:(safe-area+8)-(safe-area+52), a direct overlap once the safe-area
+     offset is small (or zero on non-notched phones). Every per-tab toolbar
+     (explorer/git/tabBar) lives at the panel's TOP; nothing in the
+     default explorer or git tabs reaches the bottom 90px of the viewport
+     (checked live, both tabs, 2026-08-17), so bottom-center is clear
+     regardless of which tab is open — one fixed position that does not
+     need per-tab-type coordinates to dodge. */
   [data-mobile-nav="better-sidebar-close"] {
     display: none;
   }
@@ -635,29 +648,33 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"] {
       display: flex !important;
       position: fixed;
-      top: calc(var(--mnav-sat) + 8px);
-      right: 8px;
+      left: 50%;
+      bottom: calc(var(--mnav-sab) + 12px);
+      transform: translateX(-50%);
       z-index: 70;
       align-items: center;
-      justify-content: center;
-      width: 44px;
+      gap: 6px;
       height: 44px;
-      padding: 0;
+      padding: 0 18px;
       border: none;
-      border-radius: 50%;
+      border-radius: 999px;
       background: var(--dsw-alias-bg-base, #fff);
       box-shadow: 0 4px 16px rgba(0, 0, 0, .2);
       color: var(--dsw-alias-label-primary, inherit);
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 600;
       cursor: pointer;
       touch-action: manipulation;
       -webkit-tap-highlight-color: transparent;
     }
     body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"] svg {
-      width: 16px;
-      height: 16px;
+      width: 14px;
+      height: 14px;
+      flex: none;
     }
     body:has([data-dsh-better-sidebar] [class$="_panel"]) [data-mobile-nav="better-sidebar-close"]:active {
-      opacity: .6;
+      background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
     }
   }
 `

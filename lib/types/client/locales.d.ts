@@ -13,6 +13,9 @@ export declare const zh: {
     readonly switchWorkspace: "切换工作区";
     readonly newSession: "新建会话";
     readonly noSessions: "还没有会话，点右下角加号开始";
+    readonly homeStatusOngoing: "运行中";
+    readonly homeStatusWarning: "待处理";
+    readonly homeStatusDone: "已完成";
     readonly backToList: "返回会话列表";
     readonly sessionInfo: "会话信息";
     readonly workbench: "工作台";

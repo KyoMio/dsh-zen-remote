@@ -180,6 +180,28 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 12px !important;
     font-size: 15px !important;
   }
+  /* --- 4b. the official scroll-to-bottom button must not poke through the
+     sheet (real-device follow-up, 2026-08-17) ---
+     ChatView's own "jump to latest" button (aria-label t("chat.toBottom"))
+     is \`position: sticky; z-index: 8\` inside the message column, not
+     \`position: fixed\` — it never escapes to the same top-level stacking
+     context our sheets get promoted to, so raising the sheet's z-index
+     further does nothing (measured live: it still rendered on top at
+     z-index 60 vs 8). Rather than chase engine-specific stacking-context
+     semantics (Chromium and WebKit do not always agree here — see AGENTS.md
+     CDP/document.hidden lesson for another instance of that), this hides
+     the button outright while either sheet is open and lets it reappear on
+     close: a plain \`display: none\` behind a live \`:has()\` read is correct
+     regardless of which stacking rules the engine happens to apply.
+     Selector: no hashed classes (dsh-client-ui-conversation lib/client.js,
+     verified 2026-08-17) — \`data-chat-flow\` is the one stable attribute on
+     the message column, and the button's wrapper is its only sibling
+     (ChatView only ever renders the column and, conditionally, this one
+     slot), so the adjacent-sibling combinator pins it precisely. */
+  body:has(${PERM} [role="menu"]) [data-chat-flow] + div,
+  body:has(${MODEL} > [class$="_menu"]) [data-chat-flow] + div {
+    display: none !important;
+  }
   /* --- 5. input box: two lines minimum, five lines maximum ---
      The official autosizer drives the box off the hidden mirror's height, so
      a min-height on the mirror IS the min-height of the field; the scroll cap
