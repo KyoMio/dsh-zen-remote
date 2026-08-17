@@ -170,21 +170,36 @@ export function MobileHomeChips({ t, sessionId, downloadSessionLog, onCustomize 
 }
 
 /**
- * Customize-sheet body (S5): one toggle row per registered chip, regardless
- * of current detection — a plugin installed later should not need its
- * toggle to "discover" itself, and a user may want to pre-hide a chip for a
- * plugin they plan to remove. Rendered by MobileHome inside the SAME
- * home-sheet-layer/mask/sheet chrome the workspace switcher uses (S6's
- * drag-to-close and mask-click-close already bind generically to
+ * Customize-sheet body (S5, existence filter added 2026-08-17 real-device
+ * follow-up): one toggle row per chip whose target actually exists —
+ * `useDetectedIds()`, the SAME live probe `MobileHomeChips` uses for the row
+ * itself. Originally listed every `CHIP_DEFS` entry unconditionally, on the
+ * theory that a not-yet-installed plugin's toggle should still be
+ * pre-settable; real-device feedback was that this instead surfaces dead
+ * switches for plugins the user never installed (taskboard/ssh). Detection
+ * is a live MutationObserver subscription, so installing the plugin later
+ * still makes its toggle appear with no reload needed — "将来装了自动出现"
+ * survives the change, it just also stops showing before that. `sessionLog`
+ * (selector: null) is exempt: its existence is a runtime session-scope
+ * question, not a plugin-install question, so it always lists regardless of
+ * whether a session happens to be open right now. Stale prefs entries for a
+ * chip that no longer renders (e.g. an uninstalled plugin's old toggle
+ * value) are simply never read — `isChipEnabled`/`toggleChip`
+ * (chips-store.ts) key off `CHIP_DEFS` ids already, so leftover keys in the
+ * persisted object are inert, not an error. Rendered by MobileHome inside
+ * the SAME home-sheet-layer/mask/sheet chrome the workspace switcher uses
+ * (S6's drag-to-close and mask-click-close already bind generically to
  * `[data-mobile-nav="home-sheet"]`, so this second use needs no new gesture
  * wiring — see styles/chips.css.ts).
  */
 export function MobileHomeChipsSheetBody({ t }: { t: Translate<MobileNavKey> }) {
   const prefs = useChipsPrefs()
+  const detected = useDetectedIds()
+  const listed = CHIP_DEFS.filter((def) => def.selector === null || detected.has(def.id))
   return (
     <>
       <div data-mobile-nav="home-sheet-title">{t('chipCustomize')}</div>
-      {CHIP_DEFS.map((def) => {
+      {listed.map((def) => {
         const enabled = isChipEnabled(prefs, def.id)
         return (
           <div key={def.id} data-mobile-nav="chip-toggle-row">

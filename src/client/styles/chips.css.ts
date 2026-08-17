@@ -146,6 +146,14 @@ export const CHIPS_CSS = `/* ---------- chips row + settings entry (S5) --------
     align-items: center;
     gap: 10px;
     width: 100%;
+    /* Real-device fix: without border-box this row's used width is
+       100% (of the sheet's own already-padded content box) PLUS the
+       12px+12px padding below, overflowing the sheet by 24px and
+       shoving the flex:none toggle off its right edge (2026-08-17
+       report: "开关跑到屏幕外"). home-sheet-item next door in
+       home.css.ts has the identical width:100%+padding shape and the
+       same latent bug, just with no trailing element to visibly clip. */
+    box-sizing: border-box;
     min-height: 48px;
     padding: 0 12px;
     color: inherit;

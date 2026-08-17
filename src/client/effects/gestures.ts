@@ -1,128 +1,16 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-import { readViewTabs } from '../MobileSessionHeader.tsx'
+import { GO_HOME_EVENT } from '../nav-store.ts'
 
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
 const PHONE_QUERY = '(max-width: 767px)'
 
-/** The official message scroll region (AGENTS.md: the real scroller behind
- * `data-chat-flow`, not ChatView's own `.scroll` which the suite forces to
- * `overflow: visible`). Scoped with `[data-phase]` exactly like every other
- * reader of this element in styles/layout.css.ts and styles/home.css.ts. */
-const CONTENT_SELECTOR = '[data-phase] [class$="_scrollBody"]'
-
-/** The sticky composer footer lives INSIDE the scroll body (AGENTS.md
- * S4.1 pitfall); a horizontal drag started on the input itself must not be
- * read as a page-turn gesture. */
-const COMPOSER_SEAT_SELECTOR = '[class$="_composerSeat"]'
-
-/** This plugin's two dismissible sheets (session-info, home workspace
- * picker). Official popupSelect menus (permission/model) are deliberately
- * excluded — the design spec leaves those mask-tap-only. */
+/** This plugin's two dismissible sheets (session-info, home workspace/chips
+ * picker — MobileHome.tsx's home-sheet hosts both the workspace switcher and
+ * the S5 chip-customize list under the same marker). Official popupSelect
+ * menus (permission/model) are deliberately excluded — the design spec
+ * leaves those mask-tap-only, and they are the suite's own DOM, not ours to
+ * add gesture handling to. */
 const SHEET_SELECTOR = '[data-mobile-nav="info-sheet"], [data-mobile-nav="home-sheet"]'
-
-/** Every dismissible surface this plugin or the official suite can have
- * open at once. Content-area swipe must not fight a control underneath one
- * of these — both of our own sheets render unconditionally (React returns
- * null when closed, see MobileSessionInfo.tsx / MobileHome.tsx), so their
- * presence in the DOM IS their open state, no extra tracking needed. */
-function anyOverlayOpen(): boolean {
-  return document.querySelector(
-    '[data-mobile-nav="info-layer"], [data-mobile-nav="home-sheet-layer"], [role="menu"], [aria-modal="true"]',
-  ) !== null
-}
-
-/**
- * Walks from `el` up to (not including) `boundary`, true if any ancestor
- * can itself scroll horizontally — code blocks, wide tables, the stats
- * strip's own horizontal scroller. Generic scrollWidth/overflow-x check
- * rather than hardcoding selectors: covers every "chip row" and markdown
- * element in this stylesheet without keeping a duplicate list in sync.
- */
-function hasHorizontalScrollAncestor(el: Element, boundary: Element): boolean {
-  let node: Element | null = el
-  while (node !== null && node !== boundary) {
-    if (node.scrollWidth > node.clientWidth + 1) {
-      const overflowX = getComputedStyle(node).overflowX
-      if (overflowX === 'auto' || overflowX === 'scroll') return true
-    }
-    node = node.parentElement
-  }
-  return false
-}
-
-const SWIPE_MIN_DX = 60
-const SWIPE_RATIO = 1.6
-/** pwa's edge-swipe-back hot zone (dsh-mobile-pwa touch-gestures.js) — never ours to take. */
-const EDGE_GUARD = 24
-
-/**
- * S6.1 — content-area swipe: a horizontal drag across the message scroll
- * region switches Chat/Trajectory by clicking the official (hidden)
- * tablist, the same "no public setView" workaround MobileSessionHeader.tsx
- * already uses for the header's own view row (design doc Appendix C).
- *
- * Passive, and this never calls preventDefault — the whole gesture is
- * decided from the touchstart/touchend endpoints, never mid-drag, so
- * vertical scrolling of the message list is completely unaffected. With
- * exactly two views, "the other tab" is the only possible target regardless
- * of swipe direction, so direction never needs to be computed — this
- * mirrors MobileHeaderActions' own `tabs.find((tab) => !tab.active)`.
- */
-function installContentSwipe(ctx: ClientContext): void {
-  ctx.effect(() => {
-    const narrow = window.matchMedia(PHONE_QUERY)
-    let start: { x: number; y: number; eligible: boolean } | null = null
-
-    const onTouchStart = (event: TouchEvent): void => {
-      if (event.touches.length !== 1) {
-        start = null
-        return
-      }
-      const touch = event.touches[0]
-      const target = event.target
-      if (touch === undefined || !(target instanceof Element)) {
-        start = null
-        return
-      }
-      const contentEl = target.closest(CONTENT_SELECTOR)
-      const eligible = contentEl !== null
-        && touch.clientX >= EDGE_GUARD
-        && target.closest(COMPOSER_SEAT_SELECTOR) === null
-        && !anyOverlayOpen()
-        && !hasHorizontalScrollAncestor(target, contentEl)
-      start = { x: touch.clientX, y: touch.clientY, eligible }
-    }
-
-    const onTouchEnd = (event: TouchEvent): void => {
-      const state = start
-      start = null
-      if (state === null || !state.eligible) return
-      const touch = event.changedTouches[0]
-      if (touch === undefined) return
-      const dx = touch.clientX - state.x
-      const dy = touch.clientY - state.y
-      if (Math.abs(dx) <= SWIPE_MIN_DX || Math.abs(dx) <= SWIPE_RATIO * Math.abs(dy)) return
-      readViewTabs().find((tab) => !tab.active)?.el.click()
-    }
-
-    const attach = (): void => {
-      document.addEventListener('touchstart', onTouchStart, { passive: true })
-      document.addEventListener('touchend', onTouchEnd, { passive: true })
-    }
-    const detach = (): void => {
-      document.removeEventListener('touchstart', onTouchStart)
-      document.removeEventListener('touchend', onTouchEnd)
-      start = null
-    }
-    if (narrow.matches) attach()
-    const onChange = (event: MediaQueryListEvent): void => (event.matches ? attach() : detach())
-    narrow.addEventListener('change', onChange)
-    return () => {
-      narrow.removeEventListener('change', onChange)
-      detach()
-    }
-  }, 'dsh-mobile-nav: content-area swipe (Chat/Trajectory)')
-}
 
 const CLOSE_DISTANCE = 80
 /** px/ms — a fast flick closes the sheet even short of CLOSE_DISTANCE. */
@@ -138,7 +26,10 @@ function prefersReducedMotion(): boolean {
 /** The sheet's own mask sibling — both this plugin's sheets name theirs
  * with a "-mask" suffix (info-mask, home-sheet-mask) and already wire a
  * click handler that calls the sheet's close(). Reusing that handler (a
- * synthetic click) needs no access to the sheet's React state at all. */
+ * synthetic click) needs no access to the sheet's React state at all.
+ * Shared with the S6.1 edge-swipe-back priority chain below — both "drag
+ * down to dismiss" and "swipe back from the edge" close a sheet the exact
+ * same way. */
 function closeSheet(sheet: HTMLElement): void {
   sheet.parentElement?.querySelector<HTMLElement>('[data-mobile-nav$="-mask"]')?.click()
 }
@@ -151,9 +42,9 @@ function closeSheet(sheet: HTMLElement): void {
  * mask-tap-only, and they are the suite's own DOM, not ours to add gesture
  * handling to.
  *
- * touchmove is registered non-passive (unlike the content swipe above)
- * because this gesture needs to preventDefault once it takes over, so the
- * sheet's own translateY tracks the finger instead of fighting the
+ * touchmove is registered non-passive (unlike the edge-swipe-back gesture
+ * below) because this gesture needs to preventDefault once it takes over, so
+ * the sheet's own translateY tracks the finger instead of fighting the
  * scroller's native rubber-band. Before that handoff — while the sheet's
  * inner content isn't scrolled to top — nothing is intercepted at all, so
  * a pull down first scrolls the content as normal (spec requirement).
@@ -254,11 +145,121 @@ function installSheetDragClose(ctx: ClientContext): void {
   }, 'dsh-mobile-nav: sheet drag-to-close')
 }
 
-/** S6: the two-gesture set — content-area swipe and sheet drag-to-close.
+/** Left-edge start zone for S6.1's swipe-back, in CSS px from the viewport's
+ * left edge. This used to be dsh-mobile-pwa's own edge-swipe-back hot zone
+ * (history.back, useless against an SPA) — that gesture is removed in the
+ * same revision that adds this one, so the 24px strip changes owner instead
+ * of staying carved out (design doc "手势" row, 2026-08-17 fourth revision). */
+const EDGE_ZONE_PX = 24
+const EDGE_SWIPE_MIN_DX = 90
+const EDGE_SWIPE_RATIO = 1.6
+
+/**
+ * dsh-better-sidebar's panel-open read (AGENTS.md pitfall "第三方浮层的开合
+ * 态可以纯 CSS `:has()` 读"): the panel's class ends in "_panel" only while
+ * open — "_panelHidden" is appended once closed, so the string no longer
+ * ends in "_panel" and this selector stops matching. Same anchor
+ * MobileSessionHeader.tsx's workbench button and its own close button use.
+ */
+function betterSidebarPanelOpen(): boolean {
+  return document.querySelector('[data-dsh-better-sidebar] [class$="_panel"]') !== null
+}
+
+/**
+ * S6.1 — left-edge swipe-back priority chain (design doc "手势" row, fourth
+ * revision): a swipe starting in the left {@link EDGE_ZONE_PX} always closes
+ * the TOPMOST dismissible surface rather than always navigating, so a user
+ * mid-workflow (info card open, workbench panel open) gets "close that"
+ * instead of "leave the session" from the same gesture. Checked in the
+ * design doc's own order:
+ *   1. this plugin's session-info sheet, if open
+ *   2. this plugin's home sheet (workspace switcher or S5 chip-customize),
+ *      if open
+ *   3. dsh-better-sidebar's workbench panel, if open (代点 its own toggle —
+ *      same anchor MobileSessionHeader.tsx's workbench/close buttons use)
+ *   4. otherwise, GO_HOME_EVENT — but only from the session view; the design
+ *      doc calls out "在 home 层→无动作" explicitly, and the phone page
+ *      stack's current level is read straight off MobileHome's own
+ *      `data-view` attribute (no store handle needed here — effects/*.ts is
+ *      already all DOM reads, matching every sibling effect in this file).
+ */
+function handleEdgeSwipeBack(): void {
+  const sheet = document.querySelector<HTMLElement>(SHEET_SELECTOR)
+  if (sheet !== null) {
+    closeSheet(sheet)
+    return
+  }
+  if (betterSidebarPanelOpen()) {
+    document.querySelector<HTMLButtonElement>('[data-dsh-better-sidebar] button[class$="_toggleButton"]')?.click()
+    return
+  }
+  if (document.querySelector('[data-mobile-nav="home"]')?.getAttribute('data-view') === 'session') {
+    window.dispatchEvent(new CustomEvent(GO_HOME_EVENT))
+  }
+}
+
+/**
+ * S6.1 — left-edge swipe-back gesture install. Passive throughout (never
+ * calls preventDefault) and decided purely from the touchstart/touchend
+ * endpoints, exactly like the S6.1-predecessor content-area swipe this
+ * revision removes — so it never fights vertical (or, at the 24px strip,
+ * horizontal chip-row) scrolling, and needs no mid-drag tracking: the design
+ * doc explicitly allows "一步到位" over a followed-finger animation.
+ */
+function installEdgeSwipeBack(ctx: ClientContext): void {
+  ctx.effect(() => {
+    const narrow = window.matchMedia(PHONE_QUERY)
+    let start: { x: number; y: number; eligible: boolean } | null = null
+
+    const onTouchStart = (event: TouchEvent): void => {
+      if (event.touches.length !== 1) {
+        start = null
+        return
+      }
+      const touch = event.touches[0]
+      if (touch === undefined) {
+        start = null
+        return
+      }
+      start = { x: touch.clientX, y: touch.clientY, eligible: touch.clientX <= EDGE_ZONE_PX }
+    }
+
+    const onTouchEnd = (event: TouchEvent): void => {
+      const state = start
+      start = null
+      if (state === null || !state.eligible) return
+      const touch = event.changedTouches[0]
+      if (touch === undefined) return
+      const dx = touch.clientX - state.x
+      const dy = touch.clientY - state.y
+      if (dx <= EDGE_SWIPE_MIN_DX || Math.abs(dx) <= EDGE_SWIPE_RATIO * Math.abs(dy)) return
+      handleEdgeSwipeBack()
+    }
+
+    const attach = (): void => {
+      document.addEventListener('touchstart', onTouchStart, { passive: true })
+      document.addEventListener('touchend', onTouchEnd, { passive: true })
+    }
+    const detach = (): void => {
+      document.removeEventListener('touchstart', onTouchStart)
+      document.removeEventListener('touchend', onTouchEnd)
+      start = null
+    }
+    if (narrow.matches) attach()
+    const onChange = (event: MediaQueryListEvent): void => (event.matches ? attach() : detach())
+    narrow.addEventListener('change', onChange)
+    return () => {
+      narrow.removeEventListener('change', onChange)
+      detach()
+    }
+  }, 'dsh-mobile-nav: left-edge swipe-back')
+}
+
+/** S6: the two-gesture set — left-edge swipe-back and sheet drag-to-close.
  * Both install/uninstall their own document listeners on the phone
  * breakpoint's matchMedia change, so at >= 768px this is a true no-op (no
  * listeners attached at all), matching every other effect in this file. */
 export function installGestures(ctx: ClientContext): void {
-  installContentSwipe(ctx)
+  installEdgeSwipeBack(ctx)
   installSheetDragClose(ctx)
 }
