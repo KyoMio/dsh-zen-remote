@@ -28,6 +28,9 @@ https://claude.ai/code/artifact/0f0169c4-c3f7-4dbb-8084-2b670ca95d60
    localStorage。
 5. 每片改动后 `pnpm build && pnpm verify`，Playwright 双宽度探针
    （390px 生效 / 1280px no-op），提交信息按上游惯例。
+6. **（2026-08-17 用户硬约束）验证时禁止在 DSH 新建/fork 会话、
+   禁止发送消息**（耗用户 token）。替代：接线走查、只读操作实测、
+   可逆操作实测后立即还原；发送/新建的端到端行为留给用户实机验收。
 
 ## 薄片拆分
 
