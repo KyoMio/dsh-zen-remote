@@ -34,7 +34,7 @@ service worker, touch layout, gestures, agent-done push) into the served HTML.
 | `pwa/manifest.json` | PWA install manifest. |
 | `pwa/sw.js` | Service worker: cache strategies + push notifications. |
 | `pwa/inject.js` | Injected page bootstrap: SW register, gesture loader, push subscribe. |
-| `pwa/touch-gestures.js` | Pull-to-refresh / edge-swipe / pinch-zoom. |
+| `pwa/touch-gestures.js` | Edge-swipe back / pinch-zoom. |
 | `pwa/app.css` | Mobile touch-first CSS (< 44px targets, safe-area, compact type). |
 | `pwa/offline.html` | Offline fallback page. |
 | `pwa/icons/` | SVG source + rasterized PNGs (192/512 + maskable). |

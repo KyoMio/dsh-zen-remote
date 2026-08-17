@@ -127,3 +127,62 @@ test('gateway: injected inline scripts have balanced braces (quoting bug guard)'
     assert.ok(page.body.includes('randomUUID'), 'uuid polyfill present')
   } finally { await stop() }
 })
+
+// ---- device-kind gating: app.css / touch-gestures.js must key off
+// "not explicitly desktop", not the literal "phone" value, because a real
+// paired phone defaults to kind "auto" and the gateway never stamps
+// data-lan-device for it (only "phone"/"desktop" are explicit). See
+// pwa/app.css and the `isNonDesktop` gate in pwa/inject.js.
+function deviceAttr(html) {
+  const m = html.match(/<html[^>]*\bdata-lan-device="([^"]*)"/)
+  return m ? m[1] : null
+}
+// Mirrors app.css's `html:not([data-lan-device="desktop"])` selector.
+function cssShellApplies(html) { return deviceAttr(html) !== 'desktop' }
+// Mirrors inject.js's `getAttribute('data-lan-device') !== 'desktop'` gate.
+function touchGesturesLoad(html) { return deviceAttr(html) !== 'desktop' }
+
+test('app.css no longer gates on the literal "phone" value; it gates on non-desktop', async () => {
+  const { stop } = await boot()
+  try {
+    const css = await request(PORT, { path: '/pwa/app.css' })
+    assert.strictEqual(css.status, 200)
+    // Strip comments first — the file's own header comment mentions the old
+    // literal-phone selector by name while explaining why it changed.
+    const rulesOnly = css.body.replace(/\/\*[\s\S]*?\*\//g, '')
+    assert.ok(!rulesOnly.includes('[data-lan-device="phone"]'), 'no rule left gated on literal phone')
+    assert.ok(rulesOnly.includes(':not([data-lan-device="desktop"])'), 'rules gate on non-desktop instead')
+  } finally { await stop() }
+})
+
+test('inject.js loads touch-gestures.js for non-desktop, not only literal "phone"', async () => {
+  const { stop } = await boot()
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.ok(page.body.includes("!== 'desktop'"), 'load gate checks non-desktop')
+    assert.ok(!page.body.includes("=== 'phone'"), 'no lingering literal-phone gate')
+  } finally { await stop() }
+})
+
+test('device gating: an auto-kind paired device (a real phone\'s default) gets the shell CSS + touch gestures', async () => {
+  const { stop } = await boot()
+  try {
+    const { cookie } = await pairDevice(PORT, '手机-auto')
+    const page = await request(PORT, { path: '/', headers: Object.assign({ accept: 'text/html', cookie }, REMOTE_HEADERS) })
+    assert.strictEqual(deviceAttr(page.body), null, 'auto kind carries no data-lan-device attribute')
+    assert.ok(cssShellApplies(page.body), 'app.css :not(desktop) selector matches an auto device')
+    assert.ok(touchGesturesLoad(page.body), 'touch-gestures.js loads for an auto device')
+  } finally { await stop() }
+})
+
+test('device gating: a device explicitly pinned to "desktop" does NOT get the shell CSS or touch gestures', async () => {
+  const { stop } = await boot()
+  try {
+    const { cookie, id } = await pairDevice(PORT, '电脑')
+    await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'set-kind', id, kind: 'desktop' } })
+    const page = await request(PORT, { path: '/', headers: Object.assign({ accept: 'text/html', cookie }, REMOTE_HEADERS) })
+    assert.strictEqual(deviceAttr(page.body), 'desktop')
+    assert.ok(!cssShellApplies(page.body), 'app.css :not(desktop) selector excludes an explicit desktop device')
+    assert.ok(!touchGesturesLoad(page.body), 'touch-gestures.js does not load for an explicit desktop device')
+  } finally { await stop() }
+})

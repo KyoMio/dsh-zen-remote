@@ -15,11 +15,11 @@ Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-ga
 | --- | --- |
 | 🔑 **Public-internet identity** | The gateway listens on `127.0.0.1` only, sitting behind your own reverse proxy. New devices trade a pairing code for a long-lived device token (cookie `lg_device`) — identity follows the token, not the source IP |
 | 📱 **Real PWA** | `manifest.json` + service worker: once the proxy provides HTTPS, "Add to Home Screen" actually works — standalone full-screen app with icon, splash, theme-color, maskable assets |
-| 🌐 **Offline** | SW: shell assets cache-first, API network-first, offline fallback page when the network drops |
-| 👆 **Touch gestures** | Pull-to-refresh, edge-swipe back, pinch-to-resize font (resettable) |
+| 🌐 **Offline** | SW: true static shell (manifest/icons) cache-first, everything else (client bundle JS/CSS, API, page HTML) network-first, offline fallback page when the network drops |
+| 👆 **Touch gestures** | Edge-swipe back, pinch-to-resize font (resettable) |
 | 🔔 **Agent-done push** | Real Web Push (VAPID-signed, aes128gcm-encrypted). Notified when the agent finishes, even from another app — the notification never carries conversation content |
 | 📐 **Touch layout** | 44px targets, safe-area, full-screen dialogs, compact type, horizontal-scrolling code — **desktop never affected** |
-| 🔒 **Desktop unaffected** | Every rule is rooted at `html[data-lan-device="phone"]` or an `@media(max-width:820px)` that excludes `data-lan-device="desktop"` |
+| 🔒 **Desktop unaffected** | Every rule is rooted at `html:not([data-lan-device="desktop"])` (or an `@media(max-width:820px)` with the same exclusion) — an explicit "desktop" kind opts out, everything else (including a real phone's default "auto" kind) opts in |
 | 🛡️ **Admin surface is local-only** | Generating pairing codes, managing devices, triggering pushes — these endpoints only accept direct local connections; anything arriving through the proxy gets 403 |
 
 ---
@@ -262,7 +262,7 @@ npm test   # boots a mock upstream, runs the gateway/auth/push suites: proxy+inj
 | `pwa/manifest.json` | PWA install manifest |
 | `pwa/sw.js` | Service worker (offline caching + push notifications) |
 | `pwa/inject.js` | Injected page bootstrap: SW register, gesture loader, push subscribe |
-| `pwa/touch-gestures.js` | Pull-to-refresh / edge-swipe back / pinch-zoom |
+| `pwa/touch-gestures.js` | Edge-swipe back / pinch-zoom |
 | `pwa/app.css` | Mobile touch-first CSS (`data-lan-device`-prefixed, desktop unaffected) |
 | `pwa/offline.html` | Offline fallback page |
 | `pwa/icons/` | SVG source + rasterized PNGs (192/512 + maskable) |

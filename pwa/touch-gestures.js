@@ -1,62 +1,21 @@
 /* dsh-mobile-pwa · touch gestures
  * Touch-first gestures for the DSH Web UI on phones:
- *   - Pull-to-refresh on the conversation view
  *   - Edge-swipe back navigation
  *   - Pinch to resize code / markdown font size
  *
- * Loaded only on `html[data-lan-device="phone"]` via the injected PWA script.
- * Keeps out of the way on desktop.
+ * Pull-to-refresh used to live here too; it was removed (real-device
+ * feedback: any accidental overscroll fired a full page reload, which S1's
+ * page-stack rules always land on the conversation *list*, not back on the
+ * chat the user was in — trigger-happy and disorienting mid-conversation).
+ * app.css still disables the browser's own native overscroll/rubber-band at
+ * the document edge on its own merits, independent of this file.
+ *
+ * Loaded on every device that isn't explicitly marked "desktop" via the
+ * injected PWA script. Keeps out of the way on desktop.
  */
 (function () {
   'use strict'
   if (window.matchMedia('(pointer: coarse)').matches === false) return
-
-  // ---- Pull to refresh ------------------------------------------------
-  const PULL_THRESHOLD = 96 // px
-  let pullStartY = null
-  let pulling = false
-  const indicator = document.createElement('div')
-  indicator.id = 'dsh-pwa-pull'
-  const holder = document.createElement('div')
-  holder.style.cssText =
-    'position:fixed;inset-inline:0;top:0;z-index:2147483000;' +
-    'display:flex;align-items:center;justify-content:center;height:0;overflow:hidden;' +
-    'background:rgba(15,17,21,.85);color:#9cc0ff;font:600 13px/1 system-ui,sans-serif;' +
-    'border-bottom:1px solid #2a2f3a;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)'
-  indicator.appendChild(holder)
-  document.documentElement.appendChild(indicator)
-
-  function setPull(px) {
-    const h = Math.min(px, PULL_THRESHOLD + 24)
-    holder.style.height = h + 'px'
-    holder.style.opacity = px >= PULL_THRESHOLD ? '1' : String(px / PULL_THRESHOLD)
-    holder.textContent = px >= PULL_THRESHOLD ? '松开刷新' : '下拉刷新'
-  }
-  function clearPull() {
-    holder.style.height = '0px'
-    holder.style.opacity = '0'
-  }
-
-  document.addEventListener('touchstart', (e) => {
-    if (window.scrollY <= 0) pullStartY = e.touches[0].clientY
-  }, { passive: true })
-
-  document.addEventListener('touchmove', (e) => {
-    if (pullStartY == null) return
-    const dy = e.touches[0].clientY - pullStartY
-    if (dy > 0 && window.scrollY <= 0) {
-      pulling = true
-      setPull(dy)
-    }
-  }, { passive: true })
-
-  document.addEventListener('touchend', () => {
-    const wasPulling = pulling
-    pullStartY = null
-    pulling = false
-    clearPull()
-    if (wasPulling) window.location.reload()
-  }, { passive: true })
 
   // ---- Edge-swipe back (history.back) --------------------------------
   const EDGE = 24

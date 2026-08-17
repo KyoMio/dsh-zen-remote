@@ -18,11 +18,11 @@
 | 🔑 **公网身份** | 网关只监听 `127.0.0.1`，放在你自己的反代后面；新设备用配对码换取长期设备令牌（Cookie `lg_device`），身份跟着令牌走，与来源 IP 完全无关 |
 | 📱 **真 PWA** | `manifest.json` + service worker：反代带来 HTTPS 后，手机浏览器「添加到主屏」真正生效，全屏独立窗口运行，带图标/启动屏/主题色 |
 | 🧩 **可安装** | 主屏图标、`standalone` 显示、`apple-touch-icon`、maskable 图标 |
-| 🌐 **离线可用** | service worker：静态壳缓存优先、API 网络优先，断网时给离线回退页 |
-| 👆 **触屏手势** | 下拉刷新、边缘右滑返回、捏合缩放字体（可重置） |
+| 🌐 **离线可用** | service worker：只有真正的静态壳（manifest/图标）缓存优先，其余（客户端 JS/CSS、API、页面 HTML）一律网络优先，断网时给离线回退页 |
+| 👆 **触屏手势** | 边缘右滑返回、捏合缩放字体（可重置） |
 | 🔔 **任务完成推送** | 真 Web Push（VAPID 签名 + aes128gcm 加密），agent 干完活推送到手机，通知里不带对话内容 |
 | 📐 **触屏布局** | 44px 触摸目标、safe-area 适配、全屏弹窗、紧凑排版、代码横向滚动——桌面零影响 |
-| 🔒 **桌面不受影响** | 所有规则都以 `html[data-lan-device="phone"]` 或排除 `data-lan-device="desktop"` 的 `@media` 为根 |
+| 🔒 **桌面不受影响** | 所有规则都以 `html:not([data-lan-device="desktop"])`（或带同样排除条件的 `@media`）为根——只有显式标成「桌面」才会被排除，其余（包括真机默认的「自动」）都生效 |
 | 🛡️ **管理面本机独占** | 生成配对码、管理设备、触发推送——这些接口只认本机直连，经反代进来的请求一律 403 |
 
 ---
@@ -264,7 +264,7 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 | `pwa/manifest.json` | PWA 安装清单 |
 | `pwa/sw.js` | service worker（离线缓存 + 推送通知） |
 | `pwa/inject.js` | 注入页引导：注册 SW + 加载手势 + 通知订阅 |
-| `pwa/touch-gestures.js` | 下拉刷新 / 边缘返弹 / 捏合缩放 |
+| `pwa/touch-gestures.js` | 边缘返弹 / 捏合缩放 |
 | `pwa/app.css` | 移动触屏布局（`data-lan-device` 前缀，桌面零影响） |
 | `pwa/offline.html` | 离线回退页 |
 | `pwa/icons/` | SVG 源 + 192/512 PNG + maskable 图标 |

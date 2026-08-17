@@ -1,5 +1,13 @@
 /* dsh-mobile-pwa · mobile shell CSS
- * Loaded on `html[data-lan-device="phone"]` only. Desktop is never affected.
+ * Loaded on every device that isn't explicitly marked "desktop"
+ * (`html:not([data-lan-device="desktop"])`). A real phone paired through the
+ * gateway defaults to kind "auto" — which never gets a `data-lan-device`
+ * attribute at all (see lib/lan-gate-server.cjs) — so gating on the literal
+ * `[data-lan-device="phone"]` value (only set when an admin manually flips a
+ * device to "phone") meant these patches never actually applied on a real
+ * phone. `:not([data-lan-device="desktop"])` matches both "no attribute" and
+ * an explicit "phone", so auto devices get them too. Desktop is still never
+ * affected.
  *
  * Division of labor (2026-08-17): mobile UI layout — font-size scale,
  * fullscreen dialogs, composer chrome, popover positioning, touch-target
@@ -7,7 +15,7 @@
  * @dsh-external/dsh-mobile-nav plugin. This file keeps only rules the PWA
  * shell itself needs: browser-behavior workarounds (iOS input zoom, text
  * auto-resize) and the CSS side of this plugin's own touch gestures
- * (pull-to-refresh, pinch-to-resize) implemented in touch-gestures.js.
+ * (pinch-to-resize) implemented in touch-gestures.js.
  * None of the rules below duplicate dsh-mobile-nav, and the page does not
  * depend on dsh-mobile-nav being installed for them to make sense.
  *
@@ -24,34 +32,38 @@
    the tap-highlight flash, respect the safe-area inset. These apply to the
    whole page (not just dsh-mobile-nav's own elements), so they stay here
    rather than move to dsh-mobile-nav. ----- */
-html[data-lan-device="phone"] {
+html:not([data-lan-device="desktop"]) {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   -webkit-tap-highlight-color: transparent;
   scroll-padding-bottom: max(env(safe-area-inset-bottom), 0px);
 }
 
-/* touch-gestures.js implements its own pull-to-refresh gesture (see the
- * "Pull to refresh" section there); disable the native one so the two
- * don't fight. */
-html[data-lan-device="phone"] body {
+/* Suppress the browser's own overscroll "rubber band"/pull-to-refresh at the
+ * document edge. This plugin's touch-gestures.js used to implement its own
+ * pull-to-refresh gesture here too, but that was removed (users found it
+ * trigger-happy and disorienting: any accidental overscroll reloaded the
+ * page and dropped them back to the conversation list mid-chat). This rule
+ * stands on its own now — it just stops the browser's native gesture from
+ * firing an unwanted reload inside the standalone PWA. */
+html:not([data-lan-device="desktop"]) body {
   overscroll-behavior-y: none;
 }
 
 /* iOS Safari zooms the whole page when a focused input's font-size is below
  * 16px. dsh-mobile-nav does not add this workaround, so it stays here. */
-html[data-lan-device="phone"] [data-slot="conversation"] input,
-html[data-lan-device="phone"] [data-slot="conversation"] textarea {
+html:not([data-lan-device="desktop"]) [data-slot="conversation"] input,
+html:not([data-lan-device="desktop"]) [data-slot="conversation"] textarea {
   font-size: 16px;
 }
 
 /* Apply the pinch-to-resize font scale. touch-gestures.js sets
  * --dsh-pwa-font-scale via root.style.setProperty() on pinch; this is this
  * plugin's own gesture feature, not a dsh-mobile-nav concern. */
-html[data-lan-device="phone"] {
+html:not([data-lan-device="desktop"]) {
   --dsh-pwa-font-scale: 1;
 }
-html[data-lan-device="phone"] [data-slot="conversation"] [data-phase] {
+html:not([data-lan-device="desktop"]) [data-slot="conversation"] [data-phase] {
   font-size: calc(1em * var(--dsh-pwa-font-scale));
 }
 
@@ -59,16 +71,16 @@ html[data-lan-device="phone"] [data-slot="conversation"] [data-phase] {
  * dsh-mobile-nav does not add this safe-area padding anywhere, so it stays;
  * the decorative pill border-radius that used to live here was dropped —
  * that's composer chrome, dsh-mobile-nav's job. */
-html[data-lan-device="phone"] [data-slot="conversation.composer"],
-html[data-lan-device="phone"] [data-slot="conversation.input.bar"] {
+html:not([data-lan-device="desktop"]) [data-slot="conversation.composer"],
+html:not([data-lan-device="desktop"]) [data-slot="conversation.input.bar"] {
   padding-bottom: max(env(safe-area-inset-bottom), 8px);
 }
 
 /* Scroll long code lines horizontally instead of letting them widen the
  * page. dsh-mobile-nav has no equivalent rule; dropping this would let a
  * long code block push the whole phone layout into horizontal scroll. */
-html[data-lan-device="phone"] pre,
-html[data-lan-device="phone"] code {
+html:not([data-lan-device="desktop"]) pre,
+html:not([data-lan-device="desktop"]) code {
   white-space: pre;
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
