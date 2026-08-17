@@ -103,7 +103,16 @@ function registerPushTool(ctx) {
     console.log('[dsh-mobile-pwa-push] push_notify disabled (DSH_PUSH_TOOL=0 / pushTool:false)')
     return
   }
-  const tools = ctx.get('tools')
+  // ctx.inject, NOT ctx.get: the tools service may be provided by a plugin
+  // that loads AFTER this one, and get() reads the registry at call time —
+  // measured live 2026-08-17: get() came back empty and the tool was never
+  // registered. inject() defers the callback until the service exists (the
+  // same pattern vision-toolkit uses for webServer) and still degrades
+  // gracefully: hosts without a tools service simply never fire it.
+  ctx.inject(['tools'], (toolsCtx) => registerPushToolWith(toolsCtx, toolsCtx.tools))
+}
+
+function registerPushToolWith(ctx, tools) {
   if (!tools) {
     console.log('[dsh-mobile-pwa-push] "tools" service not present — push_notify not registered')
     return

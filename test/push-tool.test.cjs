@@ -28,15 +28,18 @@ function freshImport() {
 }
 
 // Fake Cordis context: only what dsh-push.mjs actually touches (ctx.on,
-// ctx.get('tools'), ctx.effect). `withTools:false` simulates an environment
-// where the tool registry service was never installed.
+// ctx.inject(['tools'], cb), ctx.effect). inject mirrors Cordis semantics:
+// the callback fires only when the service exists — `withTools:false`
+// simulates a host where the tool registry service is never provided, so
+// the callback simply never runs (that IS the graceful-skip path).
 function makeCtx({ withTools = true } = {}) {
   const registered = []
+  const tools = { register: (tool) => { registered.push(tool); return () => { const i = registered.indexOf(tool); if (i >= 0) registered.splice(i, 1) } } }
   const ctx = {
     on: () => {},
-    get: (service) => {
-      if (service !== 'tools' || !withTools) return undefined
-      return { register: (tool) => { registered.push(tool); return () => { const i = registered.indexOf(tool); if (i >= 0) registered.splice(i, 1) } } }
+    inject: (deps, cb) => {
+      if (deps.includes('tools') && !withTools) return
+      cb(Object.assign(Object.create(ctx), { tools }))
     },
     effect: (fn) => fn()
   }
