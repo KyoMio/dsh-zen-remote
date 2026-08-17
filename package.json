@@ -83,7 +83,6 @@
   },
   "packageManager": "pnpm@11.7.0",
   "dependencies": {
-    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
     "web-push": "^3.6.7"
   },
   "peerDependencies": {
@@ -98,13 +97,17 @@
     "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session": "^0.1.0-rc.6",
     "@deepseek-ai/dsh-session-log-export": "^0.1.0-rc.6",
-    "react": "^18.2.0"
+    "react": "^18.2.0",
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-host-webserver": {
       "optional": true
     },
     "@deepseek-ai/dsh-session": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
       "optional": true
     }
   },
@@ -119,6 +122,7 @@
     "@types/node": "^26.2.0",
     "@types/react": "~18.3.1",
     "@types/react-dom": "~18.3.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6"
   }
 }

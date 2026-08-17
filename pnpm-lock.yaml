@@ -35,9 +35,6 @@ importers:
       '@deepseek-ai/dsh-session-log-export':
         specifier: ^0.1.0-rc.6
         version: 0.1.0-rc.6(3be6cf76fd8957b0d2e0346ebb49b9f8)
-      '@deepseek-ai/dsh-tools':
-        specifier: 0.1.0-rc.6
-        version: 0.1.0-rc.6(f8724372086ccc1457fc84e7becee2e0)
       react:
         specifier: ^18.2.0
         version: 18.3.1
@@ -66,6 +63,9 @@ importers:
       '@deepseek-ai/dsh-token-meter':
         specifier: 0.1.0-rc.6
         version: 0.1.0-rc.6(50a09c61b97e6ab96816ffb04cbb9bd3)
+      '@deepseek-ai/dsh-tools':
+        specifier: 0.1.0-rc.6
+        version: 0.1.0-rc.6(f8724372086ccc1457fc84e7becee2e0)
       '@types/node':
         specifier: ^26.2.0
         version: 26.2.0
