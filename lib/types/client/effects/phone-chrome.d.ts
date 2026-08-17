@@ -16,30 +16,28 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
  *   zoom; modern browsers are covered by the stylesheet's
  *   touch-action: manipulation (which keeps pan and pinch zoom).
  */
+export declare function installPhoneChrome(ctx: ClientContext): void;
 /**
- * Candidate test for the "sunk viewport" model of the iOS standalone-PWA
- * quirk (S1.2, 2026-08-17). NOT WIRED TO ANY STYLE — deliberately.
+ * Does the layout viewport sit shorter than the screen by at least the top
+ * inset env() still claims? (S1.2 predicate, wired in S1.3.)
  *
- * Real-device numbers (iPhone, standalone PWA, 393x852 screen): innerHeight
+ * Device numbers (iPhone, iOS 26.5, standalone PWA, 393x852): innerHeight
  * 793, env top 59 (= 852 - 793), env bottom 34, frame bottom 793 flush.
- * One reading is that the system already pushed the layout viewport below the
- * status bar while env() still reports the full notch, so --mnav-sat pads a
- * second time. But the user reports the session header sits correctly right
- * under the notch, and a ~60px white band at the BOTTOM — which instead fits
- * a viewport anchored at screen y=0 and merely 59px short of the screen
- * bottom. Both models predict the same innerHeight; only the viewport's
- * on-screen ORIGIN separates them, and that is what the debug badge now
- * measures (screenY / visualViewport offsets / the two edge markers).
+ * The same device in a Safari TAB reads innerHeight 695 with every surface
+ * flush and every design value correct, which is what rules our own CSS out.
  *
- * So this stays a pure, tested predicate that the badge merely displays.
- * Wiring it to zero --mnav-sat is a one-liner once the screenshot settles
- * which model is real; doing it now would break a top edge that is correct.
- * See scripts/check-sunk-viewport.mjs — no desktop browser can enter the mode.
+ * What the true-branch means, settled by S1.2 + S1.3 device evidence: the
+ * viewport is anchored at screen y=0 and merely cut 59px short at the BOTTOM
+ * — not pushed down below the status bar. So the top inset is paid exactly
+ * once and must be left alone, while the bottom inset is a lie: the home
+ * indicator lives in the dead strip below the page. installSunkInset() acts
+ * on that, and only on --mnav-sab.
  *
  * The `envTop > 0` guard is what keeps every other standalone install out:
  * landscape iPhone (top inset 0, the notch moves to left/right), iPad, and
  * Android — where standalone also loses status-bar height off innerHeight but
- * reports env top 0 — all fall through to false.
+ * reports env top 0 — all fall through to false. Kept pure so the boundaries
+ * are checkable off-device: scripts/check-sunk-viewport.mjs.
  */
 export declare function isViewportSunkBelowStatusBar(input: {
     standalone: boolean;
@@ -47,7 +45,6 @@ export declare function isViewportSunkBelowStatusBar(input: {
     innerHeight: number;
     envTop: number;
 }): boolean;
-export declare function installPhoneChrome(ctx: ClientContext): void;
 /**
  * iOS standalone-PWA keyboard shrink (S1.2, 2026-08-17) — the ~60px white
  * band under the composer AND under the session list.
@@ -84,4 +81,26 @@ export declare function installPhoneChrome(ctx: ClientContext): void;
  * and has to be confirmed on the device.
  */
 export declare function installViewportHeal(ctx: ClientContext): void;
+/**
+ * Sunk-viewport compensation (S1.3, 2026-08-17) — zeroes --mnav-sab ONLY.
+ *
+ * When isViewportSunkBelowStatusBar() holds, the layout viewport is 59px
+ * shorter than the screen while env() still reports the full pair of insets.
+ * The bottom one is then a lie with a cost: the home indicator sits in the
+ * dead strip BELOW the page, so the 34px we reserve for it is 34px of blank
+ * page stacked on top of an already-blank system band. Zeroing it does not
+ * fix the band (nothing in the page can) but stops us widening it.
+ *
+ * --mnav-sat is deliberately left alone: the top edge is measured correct on
+ * the device (header sits right under the notch), and the S1.2 round already
+ * burned a cycle on the theory that it was double-counted.
+ *
+ * Reversible by design. The predicate is re-evaluated on every resize, so a
+ * viewport that comes back to full height — the heal above winning, or Apple
+ * shipping the fix — drops the override and the normal env() compensation
+ * returns without a reload. `data-mnav-sunk` on <html> is what the debug
+ * badge reads, so the badge reports the state that is actually in force
+ * rather than re-deriving it.
+ */
+export declare function installSunkInset(ctx: ClientContext): void;
 //# sourceMappingURL=phone-chrome.d.ts.map

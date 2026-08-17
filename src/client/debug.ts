@@ -1,5 +1,4 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-import { isViewportSunkBelowStatusBar } from './effects/phone-chrome.ts'
 /**
  * Debug badge — ?mobile-nav-debug=1
  * Renders a live state overlay (URL, viewport, media queries, shell chrome,
@@ -206,13 +205,12 @@ export function installDebugBadge(ctx: ClientContext): void {
             `screen ${screen.width}x${screen.height} avail ${screen.availWidth}x${screen.availHeight}`,
             `vh ${innerHeight} vv ${Math.round(vv?.height ?? -1)} outH ${outerHeight}`,
             `scrXY ${screenX},${screenY} vvOff ${Math.round(vv?.offsetTop ?? -1)} vvPage ${Math.round(vv?.pageTop ?? -1)} vvScale ${vv?.scale ?? '?'}`,
-            `sunk? ${isViewportSunkBelowStatusBar({
-              standalone: matchMedia('(display-mode: standalone)').matches
-                || (navigator as Navigator & { standalone?: boolean }).standalone === true,
-              screenHeight: screen.height,
-              innerHeight,
-              envTop: Number.parseFloat(ps.paddingTop) || 0,
-            })} standalone ${matchMedia('(display-mode: standalone)').matches}`,
+            /* The ENFORCED state, not a re-derivation: installSunkInset()
+               stamps data-mnav-sunk, and its absence means the override is
+               not running at all (the inset param owns the variables). sabOvr
+               is the receipt — the inline value it wrote, or (env) when the
+               normal compensation is in force. */
+            `sunk? ${document.documentElement.dataset.mnavSunk ?? 'n/a'} standalone ${matchMedia('(display-mode: standalone)').matches} sabOvr ${document.documentElement.style.getPropertyValue('--mnav-sab') || '(env)'}`,
             `frameTop ${topOf('[data-mobile-nav="frame"]')} padTop ${framePadTop} headerTop ${topOf('[data-phase] header')} homeTopY ${topOf('[data-mobile-nav="home-top"]')}`,
             `botFrame ${bottomOf('[data-mobile-nav="frame"]')} composer ${bottomOf('[data-phase] textarea')}`,
             `taB ${pair('[data-phase] textarea')} cardB ${pair('[data-slot="conversation.composer.bar"] [class$="_card"]')}`,

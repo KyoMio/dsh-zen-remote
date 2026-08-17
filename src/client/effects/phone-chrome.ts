@@ -17,42 +17,6 @@ import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
  *   zoom; modern browsers are covered by the stylesheet's
  *   touch-action: manipulation (which keeps pan and pinch zoom).
  */
-/**
- * Candidate test for the "sunk viewport" model of the iOS standalone-PWA
- * quirk (S1.2, 2026-08-17). NOT WIRED TO ANY STYLE — deliberately.
- *
- * Real-device numbers (iPhone, standalone PWA, 393x852 screen): innerHeight
- * 793, env top 59 (= 852 - 793), env bottom 34, frame bottom 793 flush.
- * One reading is that the system already pushed the layout viewport below the
- * status bar while env() still reports the full notch, so --mnav-sat pads a
- * second time. But the user reports the session header sits correctly right
- * under the notch, and a ~60px white band at the BOTTOM — which instead fits
- * a viewport anchored at screen y=0 and merely 59px short of the screen
- * bottom. Both models predict the same innerHeight; only the viewport's
- * on-screen ORIGIN separates them, and that is what the debug badge now
- * measures (screenY / visualViewport offsets / the two edge markers).
- *
- * So this stays a pure, tested predicate that the badge merely displays.
- * Wiring it to zero --mnav-sat is a one-liner once the screenshot settles
- * which model is real; doing it now would break a top edge that is correct.
- * See scripts/check-sunk-viewport.mjs — no desktop browser can enter the mode.
- *
- * The `envTop > 0` guard is what keeps every other standalone install out:
- * landscape iPhone (top inset 0, the notch moves to left/right), iPad, and
- * Android — where standalone also loses status-bar height off innerHeight but
- * reports env top 0 — all fall through to false.
- */
-export function isViewportSunkBelowStatusBar(input: {
-  standalone: boolean
-  screenHeight: number
-  innerHeight: number
-  envTop: number
-}): boolean {
-  return input.standalone
-    && input.envTop > 0
-    && input.screenHeight - input.innerHeight >= input.envTop
-}
-
 export function installPhoneChrome(ctx: ClientContext): void {
   ctx.effect(() => {
     const narrow = window.matchMedia('(max-width: 1023px)')
@@ -87,6 +51,39 @@ export function installPhoneChrome(ctx: ClientContext): void {
       restore()
     }
   }, 'dsh-mobile-nav: status bar theme + viewport + zoom guard')
+}
+
+/**
+ * Does the layout viewport sit shorter than the screen by at least the top
+ * inset env() still claims? (S1.2 predicate, wired in S1.3.)
+ *
+ * Device numbers (iPhone, iOS 26.5, standalone PWA, 393x852): innerHeight
+ * 793, env top 59 (= 852 - 793), env bottom 34, frame bottom 793 flush.
+ * The same device in a Safari TAB reads innerHeight 695 with every surface
+ * flush and every design value correct, which is what rules our own CSS out.
+ *
+ * What the true-branch means, settled by S1.2 + S1.3 device evidence: the
+ * viewport is anchored at screen y=0 and merely cut 59px short at the BOTTOM
+ * — not pushed down below the status bar. So the top inset is paid exactly
+ * once and must be left alone, while the bottom inset is a lie: the home
+ * indicator lives in the dead strip below the page. installSunkInset() acts
+ * on that, and only on --mnav-sab.
+ *
+ * The `envTop > 0` guard is what keeps every other standalone install out:
+ * landscape iPhone (top inset 0, the notch moves to left/right), iPad, and
+ * Android — where standalone also loses status-bar height off innerHeight but
+ * reports env top 0 — all fall through to false. Kept pure so the boundaries
+ * are checkable off-device: scripts/check-sunk-viewport.mjs.
+ */
+export function isViewportSunkBelowStatusBar(input: {
+  standalone: boolean
+  screenHeight: number
+  innerHeight: number
+  envTop: number
+}): boolean {
+  return input.standalone
+    && input.envTop > 0
+    && input.screenHeight - input.innerHeight >= input.envTop
 }
 
 /**
@@ -145,13 +142,16 @@ export function installViewportHeal(ctx: ClientContext): void {
       if (window.innerHeight > tallest) tallest = window.innerHeight
     }
 
-    /* Give up after three ineffective attempts: on a device whose viewport is
-       short for some other reason (the separate iOS 26.1 top-bar regression,
-       say) the reflow can never win, and retrying on every keyboard dismiss
-       for the life of the app buys nothing. */
-    let failures = 0
-    const heal = (): void => {
-      if (failures >= 3 || ceiling() - window.innerHeight <= 4) return
+    /* Give up after three ineffective attempts per trigger: on a device whose
+       viewport is short for a reason a reflow cannot fix (the iOS 26.x
+       standalone regression family) retrying forever buys nothing. The two
+       budgets are separate on purpose — the cold-start attempts would
+       otherwise spend the whole allowance before the user ever types, and the
+       keyboard shrink IS reflow-curable even on a device whose cold start is
+       not. */
+    const strikes = { boot: 0, blur: 0 }
+    const heal = (kind: 'boot' | 'blur'): void => {
+      if (strikes[kind] >= 3 || ceiling() - window.innerHeight <= 4) return
       const frame = document.querySelector<HTMLElement>('[data-mobile-nav="frame"]')
       if (frame === null) return
       const scroller = document.querySelector<HTMLElement>('[class$="_scrollBody"]')
@@ -161,8 +161,7 @@ export function installViewportHeal(ctx: ClientContext): void {
       void frame.offsetHeight /* forces the synchronous reflow that re-measures */
       frame.style.display = previous
       if (scroller !== null) scroller.scrollTop = scrollTop
-      if (ceiling() - window.innerHeight > 4) failures += 1
-      else failures = 0
+      strikes[kind] = ceiling() - window.innerHeight > 4 ? strikes[kind] + 1 : 0
     }
 
     /* Blur is when the keyboard starts closing; the viewport settles a beat
@@ -172,15 +171,95 @@ export function installViewportHeal(ctx: ClientContext): void {
     const onFocusOut = (event: FocusEvent): void => {
       if (!(event.target instanceof HTMLElement)) return
       if (event.target.matches('textarea, input') !== true) return
-      timers.push(window.setTimeout(heal, 300), window.setTimeout(heal, 900))
+      timers.push(window.setTimeout(() => heal('blur'), 300), window.setTimeout(() => heal('blur'), 900))
+    }
+
+    /* Cold start (S1.3): the user's iOS 26.5 device is already 59px short on
+       a freshly killed-and-reopened app that never saw the keyboard, so the
+       keyboard trigger alone is not the whole story. Same reflow, tried once
+       the shell has mounted and again after it has settled, plus every return
+       to the foreground — iOS re-lays a backgrounded PWA out and that is
+       another moment the height can come back wrong. Whether a reflow can win
+       against a system-level regression is unknowable off-device; the strike
+       budget is what keeps a losing attempt cheap. */
+    timers.push(window.setTimeout(() => heal('boot'), 1000), window.setTimeout(() => heal('boot'), 3000))
+    const onVisible = (): void => {
+      if (document.visibilityState !== 'visible') return
+      timers.push(window.setTimeout(() => heal('boot'), 300))
     }
 
     window.addEventListener('resize', onResize)
     document.addEventListener('focusout', onFocusOut, true)
+    document.addEventListener('visibilitychange', onVisible)
     return () => {
       window.removeEventListener('resize', onResize)
       document.removeEventListener('focusout', onFocusOut, true)
+      document.removeEventListener('visibilitychange', onVisible)
       for (const t of timers) clearTimeout(t)
     }
-  }, 'dsh-mobile-nav: iOS keyboard viewport-shrink heal')
+  }, 'dsh-mobile-nav: iOS viewport-shrink heal (boot / foreground / keyboard)')
+}
+
+/**
+ * Sunk-viewport compensation (S1.3, 2026-08-17) — zeroes --mnav-sab ONLY.
+ *
+ * When isViewportSunkBelowStatusBar() holds, the layout viewport is 59px
+ * shorter than the screen while env() still reports the full pair of insets.
+ * The bottom one is then a lie with a cost: the home indicator sits in the
+ * dead strip BELOW the page, so the 34px we reserve for it is 34px of blank
+ * page stacked on top of an already-blank system band. Zeroing it does not
+ * fix the band (nothing in the page can) but stops us widening it.
+ *
+ * --mnav-sat is deliberately left alone: the top edge is measured correct on
+ * the device (header sits right under the notch), and the S1.2 round already
+ * burned a cycle on the theory that it was double-counted.
+ *
+ * Reversible by design. The predicate is re-evaluated on every resize, so a
+ * viewport that comes back to full height — the heal above winning, or Apple
+ * shipping the fix — drops the override and the normal env() compensation
+ * returns without a reload. `data-mnav-sunk` on <html> is what the debug
+ * badge reads, so the badge reports the state that is actually in force
+ * rather than re-deriving it.
+ */
+export function installSunkInset(ctx: ClientContext): void {
+  ctx.effect(() => {
+    /* ?mobile-nav-inset outranks this: both write the same inline property on
+       <html>, and the debug param exists precisely to fake insets that this
+       would then erase. Param present = stay out entirely, attribute included,
+       so the badge shows "n/a" instead of a state nobody is enforcing. */
+    if (new URLSearchParams(location.search).has('mobile-nav-inset')) return () => {}
+    const root = document.documentElement
+    /* env() is only readable through a real element's computed style. */
+    const probe = document.createElement('div')
+    probe.style.cssText =
+      'position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;' +
+      'padding-top:env(safe-area-inset-top,0px)'
+    document.body.appendChild(probe)
+
+    const sync = (): void => {
+      const sunk = isViewportSunkBelowStatusBar({
+        standalone: window.matchMedia('(display-mode: standalone)').matches
+          || (navigator as Navigator & { standalone?: boolean }).standalone === true,
+        screenHeight: window.screen.height,
+        innerHeight: window.innerHeight,
+        envTop: Number.parseFloat(getComputedStyle(probe).paddingTop) || 0,
+      })
+      root.dataset.mnavSunk = sunk ? '1' : '0'
+      if (sunk) root.style.setProperty('--mnav-sab', '0px')
+      else root.style.removeProperty('--mnav-sab')
+    }
+    sync()
+    /* resize covers rotation and any height the heal above wins back.
+       Deliberately not visualViewport: it fires on every keyboard show/hide
+       while innerHeight, the value read here, does not move on iOS. */
+    window.addEventListener('resize', sync)
+    window.addEventListener('orientationchange', sync)
+    return () => {
+      window.removeEventListener('resize', sync)
+      window.removeEventListener('orientationchange', sync)
+      probe.remove()
+      root.style.removeProperty('--mnav-sab')
+      delete root.dataset.mnavSunk
+    }
+  }, 'dsh-mobile-nav: sunk-viewport bottom-inset override')
 }

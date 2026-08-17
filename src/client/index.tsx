@@ -9,7 +9,7 @@ import { MobileAttachButton } from './MobileAttachButton.tsx'
 import { createNavStore } from './nav-store.ts'
 import { MOBILE_CSS } from './styles/index.ts'
 import { installDebugBadge } from './debug.ts'
-import { installPhoneChrome, installViewportHeal } from './effects/phone-chrome.ts'
+import { installPhoneChrome, installSunkInset, installViewportHeal } from './effects/phone-chrome.ts'
 import { installAionuiCompat } from './effects/aionui-compat.ts'
 import { installHeaderStatusDot } from './effects/header-status.ts'
 import { installGestures } from './effects/gestures.ts'
@@ -56,6 +56,11 @@ export function apply(ctx: ClientContext): void {
   // the status-bar height from the viewport (the ~60px band under the
   // composer and the session list). No-op in any browser tab.
   installViewportHeal(ctx)
+
+  // Registered after the heal so a viewport that heals is measured healed:
+  // when the strip is real, drop the home-indicator padding that would only
+  // stack more blank page on top of it.
+  installSunkInset(ctx)
 
   installAionuiCompat(ctx)
 
