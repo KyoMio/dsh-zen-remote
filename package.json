@@ -1,6 +1,6 @@
 {
   "name": "dsh-mobile-pwa",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Complete mobile PWA for DeepSeek Harness (DSH): pairing-code + device-token gateway for public-internet access behind your own reverse proxy (nginx/Caddy), install-to-homescreen (manifest), offline-capable service worker, touch-first gestures, real Web Push agent-done notifications, and dark compact mobile UI. 配对码 + 反代对接的公网 PWA 完整方案 for DeepSeek Harness.",
   "license": "MIT",
   "type": "module",

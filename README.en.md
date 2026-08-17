@@ -15,10 +15,10 @@ Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-ga
 | --- | --- |
 | 🔑 **Public-internet identity** | The gateway listens on `127.0.0.1` only, sitting behind your own reverse proxy. New devices trade a pairing code for a long-lived device token (cookie `lg_device`) — identity follows the token, not the source IP |
 | 📱 **Real PWA** | `manifest.json` + service worker: once the proxy provides HTTPS, "Add to Home Screen" actually works — standalone full-screen app with icon, splash, theme-color, maskable assets |
-| 🌐 **Offline** | SW: true static shell (manifest/icons) cache-first, everything else (client bundle JS/CSS, API, page HTML) network-first, offline fallback page when the network drops |
-| 👆 **Touch gestures** | Edge-swipe back, pinch-to-resize font (resettable) |
+| 🌐 **Offline** | SW v3: only the true static shell (manifest/icons/offline page) is cache-first, everything else (DSH client bundle JS/CSS, API, page HTML) is network-first — a new deploy is picked up immediately instead of lingering behind stale cached CSS |
+| 👆 **Touch gestures** | Pinch-to-resize font (resettable); edge-swipe-back has been handed off to `@dsh-external/dsh-mobile-nav` (see "Division of labor" below), pull-to-refresh has been removed entirely (an accidental overscroll used to fire a full reload mid-conversation) |
 | 🔔 **Agent-done push** | Real Web Push (VAPID-signed, aes128gcm-encrypted). Notified when the agent finishes, even from another app — the notification never carries conversation content |
-| 📐 **Touch layout** | 44px targets, safe-area, full-screen dialogs, compact type, horizontal-scrolling code — **desktop never affected** |
+| 📐 **Touch layout** | This repo now only keeps shell-level rules (iOS input-zoom fix, safe-area scroll padding, horizontal-scrolling code) — layout rules (44px targets, dialogs, composer chrome) moved to `@dsh-external/dsh-mobile-nav`, see "Division of labor" below — desktop never affected |
 | 🔒 **Desktop unaffected** | Every rule is rooted at `html:not([data-lan-device="desktop"])` (or an `@media(max-width:820px)` with the same exclusion) — an explicit "desktop" kind opts out, everything else (including a real phone's default "auto" kind) opts in |
 | 🛡️ **Admin surface is local-only** | Generating pairing codes, managing devices, triggering pushes — these endpoints only accept direct local connections; anything arriving through the proxy gets 403 |
 
@@ -44,6 +44,14 @@ Public device (phone/laptop) --HTTPS--> your own reverse proxy (nginx/Caddy, ter
 - The gateway is an isolated child process: if it crashes, DSH's main service is unaffected; it's torn down automatically when the plugin stops.
 - DSH's own web server still binds `127.0.0.1` only. The gateway never touches DSH's config or its `/api` trust fence.
 - The one IP-based trust left: a loopback socket carrying **no** `X-Forwarded-*` headers is treated as the local user sitting at this machine — the only path into the admin surface. Requests that came through the proxy always carry forwarded headers, so they can never look local.
+
+---
+
+## Division of labor with `@dsh-external/dsh-mobile-nav`
+
+If you also install [`@dsh-external/dsh-mobile-nav`](https://www.npmjs.com/package/@dsh-external/dsh-mobile-nav) (the mobile app-shell UI plugin), the boundary is: **this repo only owns the shell and the channel** (pairing auth, tokens, rate limiting, the PWA install manifest, the service worker, first-frame safe-area injection); **all layout — typography, dialogs, composer chrome, bubble styling — belongs to dsh-mobile-nav**.
+
+`pwa/app.css` was trimmed from 163 lines down to 95, keeping only shell-level rules. A stale inline `DEVICE_CSS` copy left inside the gateway (`lib/lan-gate-server.cjs`) went further than that — one of its rules stretched *any* `role="dialog" aria-modal="true"` overlay to fill the viewport, including dsh-mobile-nav's own session-info card, which is why it used to overflow the screen only when accessed through the gateway. That dead copy has been removed entirely. Pull-to-refresh and edge-swipe-back have also been removed from this repo's `touch-gestures.js`: the former kept firing full-page reloads on an accidental overscroll, and the latter's `history.back()` was always a no-op against DSH's own client-side routing — dsh-mobile-nav's own left-edge swipe gesture now owns that 24px hot zone instead. Pinch-to-resize stays here.
 
 ---
 
@@ -231,6 +239,16 @@ The exception is `/lan-gate/pair/claim` (POST) — the one endpoint reachable fr
 
 ---
 
+## Known issue: iOS 26.x viewport shrink
+
+On iOS 26.x, once DSH is added to the home screen and opened as a standalone PWA, the layout viewport loses a chunk of its bottom edge (measured on one iPhone on 26.5: 852px screen vs. 793px viewport — exactly one status-bar's worth) from cold start onward, until the app is fully quit and reopened. The same URL in a plain Safari tab is unaffected.
+
+This is not a bug in this plugin — it's a known iOS 26.x system defect (the layout viewport permanently shrinks the first time the on-screen keyboard is shown inside a standalone PWA; `innerHeight`, `visualViewport.height` and `100dvh` all shrink together). The missing strip sits outside the document, so no stylesheet can reach it — only the system paints it, using the manifest's `background_color`. This repo changed that value to a light `#f9fafb` (matching dsh-mobile-nav's light theme background) so the dead strip blends into the page instead of standing out as a dark bar.
+
+That's a visual mitigation, not a fix: in dark theme the strip is actually more visible (the manifest color can't follow the page theme), and it's also the launch-splash color, so the splash went from dark to light. The underlying shrink can only be fixed by Apple. dsh-mobile-nav applies two further mitigation layers (detection + an active reflow "heal") on its own side — see that plugin's README for details.
+
+---
+
 ## FAQ
 
 **Upgrading from an older version — what do I need to do?**
@@ -274,6 +292,32 @@ npm test   # boots a mock upstream, runs the gateway/auth/push suites: proxy+inj
 | `test/util.cjs` | Shared test harness (boot/request/pair helpers) — not a test file itself |
 
 See [`AGENTS.md`](AGENTS.md) for development conventions.
+
+---
+
+## Changelog
+
+### v0.3.0
+
+**Added**
+
+- Clear division of labor with `@dsh-external/dsh-mobile-nav`: layout rules handed off entirely, this repo keeps only shell-level CSS (see "Division of labor" above);
+- Service worker bumped to v3: cache strategy changed from "shell and client assets both stale-while-revalidate" to "only the static shell is cache-first, everything else is network-first" — a new deploy is picked up immediately instead of leaving stale CSS behind across devices;
+- First-frame HTML now carries `viewport-fit=cover` directly, so a standalone PWA's safe area is correct from the very first frame instead of waiting for the client bundle to patch it in.
+
+**Fixed**
+
+- Manifest and icons are now credential-less (no longer stuck behind the pairing wall) — this used to hide the install prompt on Android/desktop Chrome, with iOS Safari the accidental exception since it sends cookies on that fetch anyway;
+- The gateway now strips an upstream manifest `<link>` tag that used to shadow the gateway's own mobile-tailored manifest (browsers only honor the first manifest link);
+- Service worker registration now declares `scope: '/'` plus a `Service-Worker-Allowed: /` response header — previously its default scope was only `/pwa/` and it never actually controlled the app;
+- Removed the gateway's dead inline `DEVICE_CSS` copy, whose fullscreen-dialog rule used to stretch dsh-mobile-nav's session-info card off-screen — long misdiagnosed as an iOS/Chromium engine difference;
+- CSS/gesture gating switched from the literal `"phone"` value to "not desktop" — a real paired device defaults to kind `"auto"`, so the old gate never actually fired on a real phone;
+- Removed pull-to-refresh (an accidental overscroll used to fire a full reload mid-conversation); removed edge-swipe-back, handing that 24px zone to dsh-mobile-nav's own gesture (the old handler was a no-op against DSH's client-side routing anyway);
+- `manifest.json`'s `background_color` switched to a light color as a visual mitigation for the iOS 26.x standalone-PWA viewport shrink dead strip (known OS defect, not a fix — see "Known issue" above).
+
+**Internal**
+
+- `pwa/app.css` trimmed from 163 to 95 lines; added `test/sw.test.cjs` covering the service worker's new cache strategy.
 
 ---
 
