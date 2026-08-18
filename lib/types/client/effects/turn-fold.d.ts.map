@@ -1,1 +1,1 @@
-{"version":3,"file":"turn-fold.d.ts","sourceRoot":"","sources":["../../../../src/client/effects/turn-fold.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,wCAAwC,CAAA;AAqH3E;;;;;;;;;;;;;;;;;;;;;GAqBG;AACH,wBAAgB,eAAe,CAAC,GAAG,EAAE,aAAa,GAAG,IAAI,CAsHxD"}
+{"version":3,"file":"turn-fold.d.ts","sourceRoot":"","sources":["../../../../src/client/effects/turn-fold.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,wCAAwC,CAAA;AAqH3E;;;;;;;;;;;;;;;;;;;;;GAqBG;AACH,wBAAgB,eAAe,CAAC,GAAG,EAAE,aAAa,GAAG,IAAI,CAoIxD"}

@@ -16,6 +16,7 @@ import { installHeaderStatusDot } from './effects/header-status.ts'
 import { installGestures } from './effects/gestures.ts'
 import { installTurnFold } from './effects/turn-fold.ts'
 import { installWelcomeNoticeOptOut } from './effects/welcome-notice.ts'
+import { installKeyboardGuard } from './effects/keyboard-guard.ts'
 import { NS, en, zh } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 
@@ -83,6 +84,11 @@ export function apply(ctx: ClientContext): void {
   // dialog's #root inert lock — see effects/welcome-notice.ts) and offer a
   // per-browser "不再弹出" opt-out instead.
   installWelcomeNoticeOptOut(ctx)
+
+  // S9: opening a session must not pop the phone keyboard — the official
+  // composer autofocuses on every sessionId change; keep focus only when the
+  // user tapped the composer (or typed) themselves.
+  installKeyboardGuard(ctx)
 
   // Page-stack store (apply world) — created before any registration so
   // every slot below (the phone home screen, the session header's back

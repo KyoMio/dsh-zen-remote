@@ -86,9 +86,14 @@ html:not([data-lan-device="desktop"]) [data-slot="conversation"] [data-phase] {
 
 /* Scroll long code lines horizontally instead of letting them widen the
  * page. dsh-mobile-nav has no equivalent rule; dropping this would let a
- * long code block push the whole phone layout into horizontal scroll. */
+ * long code block push the whole phone layout into horizontal scroll.
+ * pre + pre code ONLY: the old bare `code` selector also hit INLINE code,
+ * whose white-space:pre vetoed every wrapping property and clipped long
+ * paths off-screen on phones — while desktop loopback (which never loads
+ * this file) wrapped fine. Days of "why only on the phone" (2026-08-18);
+ * inline-code wrapping is owned by styles/content.css.ts. */
 html:not([data-lan-device="desktop"]) pre,
-html:not([data-lan-device="desktop"]) code {
+html:not([data-lan-device="desktop"]) pre code {
   white-space: pre;
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;

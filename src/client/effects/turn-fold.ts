@@ -160,11 +160,13 @@ export function installTurnFold(ctx: ClientContext): void {
       const running = flow.querySelector(':scope > [role="status"]') !== null
       const groups = groupsOf(flow)
       const live = new Set<string>()
+      const liveItems = new Set<Element>()
 
       groups.forEach((group, index) => {
         if (group.items.length === 0) return
         const open = expanded.has(group.key)
         for (const item of group.items) {
+          liveItems.add(item)
           item.setAttribute(FOLD, '')
           if (open) item.setAttribute(OPEN, '')
           else item.removeAttribute(OPEN)
@@ -188,6 +190,18 @@ export function installTurnFold(ctx: ClientContext): void {
       for (const chip of flow.querySelectorAll<HTMLElement>(CHIP_SELECTOR)) {
         const key = chip.dataset['foldGroup']
         if (key === undefined || !live.has(key)) chip.remove()
+      }
+
+      // Unmark elements that stopped being process items. Without this, an
+      // assistant-step row folded whole while it streamed ONLY reasoning kept
+      // its row-level fold after prose started arriving in the same DOM node
+      // (React updates the row in place), hiding the streaming reply until a
+      // completion re-render rebuilt the row — the "reply only appears when
+      // the turn finishes" phone bug (2026-08-18).
+      for (const stale of flow.querySelectorAll(`[${FOLD}]`)) {
+        if (liveItems.has(stale)) continue
+        stale.removeAttribute(FOLD)
+        stale.removeAttribute(OPEN)
       }
     }
 
