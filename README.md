@@ -213,6 +213,25 @@ open http://127.0.0.1:3088/lan-gate/admin
 
 ---
 
+## 已适配的第三方插件
+
+移动端 UI 对下列插件做了专门适配。所有适配都锚定对应插件自己的 DOM 标记：
+没装该插件时规则不生效，装了未列出的插件也不会被误伤。
+
+| 插件 | 移动端适配内容 | 实测版本 |
+| --- | --- | --- |
+| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 会话页头部提供工作台入口按钮；面板变手机全宽抽屉并避让刘海安全区；底部居中的关闭按钮 | 0.12.2 |
+| [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | AgentTeams 活动浮层挪到会话头部下方（原位置压住头部按钮）、会话列表页自动隐藏；子代理会话头部保留可点的父会话标题，一键切回主会话 | 0.1.6 |
+| [dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | 用量与余额入口收进主屏 chips 行 | — |
+| [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | 定时任务入口收进主屏 chips 行 | 0.2.0 |
+| dsh-at-file | @文件引用，配合附件上传的 `@` 路径引用使用 | — |
+| [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit) | 图像 Q&A/OCR，配合手机端附件上传使用 | — |
+| [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all) | 沿用上游 dsh-web-mobile 的兼容规则（文件树 / 预览浮层限宽居中等） | — |
+
+各项适配的技术细节（锚点选择器、断点、取舍记录）见[界面文档](docs/interface.md)的「兼容插件」一节。
+
+---
+
 ## 已知问题
 
 **iOS 26.x 独立 PWA 视口缩水**：加到主屏后视口底部会少掉一条状态栏高度，普通 Safari 标签页正常。这是 iOS 系统缺陷，缺掉的区域在文档之外，CSS 够不着；本插件做了三层缓解（浅色 manifest 背景 + 安全区补偿 + 强制重排），能减轻但不保证复原。彻底恢复只能整个 App 退出重开。
