@@ -158,14 +158,21 @@ export const BASE_CSS = `
 [class$="_previewBadge"] {
   display: none !important;
 }
+/* Mirrors the official primitives Button (md capsule, outline variant):
+   36px height, 18px radius, --dsw-alias-border-l2 hairline. */
 .zen-welcome-optout {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   height: 36px;
   padding: 0 14px;
   margin-right: 8px;
-  border: 1px solid var(--dsw-alias-line-border, rgba(0, 0, 0, .15));
-  border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, .15));
+  border-radius: 18px;
   background: transparent;
-  color: var(--dsw-alias-label-secondary, inherit);
+  color: var(--dsw-alias-label-primary, inherit);
+  font-size: 14px;
+  line-height: 22px;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
 }
