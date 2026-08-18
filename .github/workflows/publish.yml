@@ -1,5 +1,6 @@
 # tag 推送（v*）→ 构建 + 全量校验 + 发布 npm。
-# 唯一需要的外部配置：仓库 secret NPM_TOKEN（见 README / AGENTS.md 发布一节）。
+# 认证走 npm Trusted Publishing（OIDC，无令牌）：npmjs.com 包设置里需登记
+# 可信发布者 KyoMio/dsh-zen-remote + 本文件名 publish.yml，此外零配置。
 name: publish
 
 on:
@@ -11,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # npm provenance 签名（公开仓自动生效）
+      id-token: write # OIDC：Trusted Publishing 认证 + provenance 签名都靠它
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +46,6 @@ jobs:
             exit 1
           fi
 
-      - run: pnpm publish --no-git-checks --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Trusted Publishing：pnpm ≥10.14 原生支持 OIDC（packageManager 钉的
+      # 11.7.0 满足），provenance 随可信发布自动生成，无需令牌与 --provenance。
+      - run: pnpm publish --no-git-checks
