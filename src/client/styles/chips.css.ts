@@ -88,10 +88,14 @@ export const CHIPS_CSS = `/* ---------- chips row + settings entry (S5) --------
   }
 
   /* Plugin-entry chips row: one horizontally-scrolling line of 34px pills
-     between the workspace title and the session list (prototype spec). A
-     thin scrollbar is the overflow affordance (AGENTS.md: an early
-     no-scrollbar version silently cut off the last tab with no way to
-     discover more content). */
+     between the workspace title and the session list (prototype spec).
+     Scrollbar hidden on BOTH engines (2026-08-18 user decision): iOS
+     overlay scrollbars never showed anyway, but desktop browsers painted a
+     permanent 2px strip under the pills. This revisits the AGENTS.md
+     "silently cut off the last tab" lesson deliberately — with 4+ chips the
+     row now always overflows mid-chip (a partially visible pill is the
+     scroll affordance), unlike the early incident where the chips fit
+     flush and the hidden overflow was undiscoverable. */
   [data-mobile-nav="chip-row"] {
     flex: 0 0 auto;
     display: flex;
@@ -101,14 +105,10 @@ export const CHIPS_CSS = `/* ---------- chips row + settings entry (S5) --------
     overflow-x: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
-    scrollbar-width: thin;
+    scrollbar-width: none;
   }
   [data-mobile-nav="chip-row"]::-webkit-scrollbar {
-    height: 2px;
-  }
-  [data-mobile-nav="chip-row"]::-webkit-scrollbar-thumb {
-    background: var(--dsw-alias-border-l2, rgba(0, 0, 0, .16));
-    border-radius: 2px;
+    display: none;
   }
   [data-mobile-nav="chip"],
   [data-mobile-nav="chip-more"] {
