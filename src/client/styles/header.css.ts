@@ -157,11 +157,44 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     min-width: 0;
     overflow: hidden;
   }
-  /* Only the current session's own name is the "title" — the parent chain
-     (subagent breadcrumbs) is the "多余项" the design calls out to hide,
-     while the current segment (and its running dot, see below) stays. */
-  [data-phase] header [class$="_crumbSeg"]:not(:last-child) {
+  /* Subagent sessions keep ONE ancestor crumb (2026-08-18): the PC header
+     lets you tap the parent session's title to switch back — that affordance
+     was lost on phone when the whole parent chain was hidden as "多余项".
+     Show only the immediate parent (for agent-teams member sessions that IS
+     the captain/main session; deeper ancestors stay hidden — a 3-level chain
+     cannot fit the ~206px center column at 390px). The parent crumb is the
+     official breadcrumb <button> (dsh-client-ui-conversation renders
+     open(parentId) as its onClick), so tapping needs no JS from this plugin,
+     and main sessions (chain length 1) have no :nth-last-child(2) seg at
+     all — the centered single title is pixel-identical to before. */
+  [data-phase] header [class$="_crumbSeg"]:not(:nth-last-child(-n+2)) {
     display: none !important;
+  }
+  [data-phase] header [class$="_crumbSeg"]:nth-last-child(2) {
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+    min-width: 0;
+    max-width: 38%;
+  }
+  /* Ancestors BEFORE the parent seg are hidden, which would leave the
+     parent seg's own leading "/" dangling at the start of the title. */
+  [data-phase] header [class$="_crumbSeg"]:nth-last-child(2) [class$="_crumbSep"] {
+    display: none !important;
+  }
+  /* Parent crumb: small tertiary text so the 19px current title stays the
+     visual anchor; min-height keeps a finger-sized target inside the 48px
+     row. Specificity (0,4,1) outranks the shared 19px _crumb rule below. */
+  [data-phase] header [class$="_crumbSeg"]:nth-last-child(2) [class$="_crumb"] {
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--dsw-alias-label-tertiary, rgba(0, 0, 0, .45));
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 2px 0 6px;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
   [data-phase] header [class$="_crumbSeg"]:last-child {
     display: flex;
@@ -169,9 +202,10 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     min-width: 0;
     max-width: 100%;
   }
-  [data-phase] header [class$="_crumbSeg"]:last-child [class$="_crumbSep"] {
-    display: none !important;
-  }
+  /* The last seg's own "/" is the divider between parent and current title —
+     it only exists when there IS an ancestor (index > 0), so it can simply
+     stay visible now that the parent seg shows. (It used to be hidden here:
+     with the parent hidden it dangled before the title.) */
   /* BOTH selectors are required: [class$=] matches the whole class
      ATTRIBUTE's suffix, and the current-session title button's attribute is
      "wSkVaW_crumb wSkVaW_crumbCurrent" — it ends in _crumbCurrent, so the _crumb

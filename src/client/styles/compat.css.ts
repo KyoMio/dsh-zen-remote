@@ -678,4 +678,55 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
       background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
     }
   }
+
+  /* ---------- dsh-agent-teams: phone floater reposition (2026-08-18) ----------
+     THIRD-PARTY COMPAT RULE — @nanmicoder/dsh-agent-teams (the AgentTeams
+     activity floater: a collapsed badge + expandable panel, body-portaled
+     under its own mount marker div[data-agent-teams-host]). Its own CSS
+     fixes both at top:56px (<=640px) viewport coordinates and never reads
+     env(safe-area-inset-*), so on a notched iPhone the badge lands INSIDE
+     the safe-area + this plugin's 76px session header band — overlapping
+     the info and workbench buttons (real-device report, 2026-08-18).
+     Move both below the header instead: safe-area + 76px header chrome
+     (48px title row + 28px view-switch row, header.css.ts) + 8px gap.
+     Anchored on the plugin's own mount marker + class-suffix selectors per
+     this repo's hashed-class convention — when dsh-agent-teams is not
+     installed the marker never exists and this whole section is inert
+     (same presence-gating as the dsh-better-sidebar rules above).
+     !important because their positions come from html-level CSS vars
+     (--agent-teams-panel-top et al.) whose style tag order vs ours is not
+     guaranteed. z-index: their 2147483000 would float the badge over every
+     one of this plugin's own overlays (drawer 40, info sheet 55-57, close
+     pill 70); 30 keeps it above content but below all of them. */
+  @media (max-width: 767px) {
+    [data-agent-teams-host] [class$="_badge"],
+    [data-agent-teams-host] [class$="_panel"] {
+      top: calc(var(--mnav-sat) + 84px) !important;
+      right: 10px !important;
+      z-index: 30 !important;
+    }
+    [data-agent-teams-host] [class$="_panel"] {
+      left: 10px !important;
+      width: auto !important;
+      /* Their min-height:min(560px, calc(100dvh - 56 - 56)) resolves against
+         the OLD top var — on short phones it exceeds the space left below
+         the moved-down top edge and would force overflow; content-sized with
+         a hard cap replaces it. 76px bottom clearance keeps the collapsed
+         composer's top edge visible under the panel. */
+      min-height: 0 !important;
+      max-height: calc(100dvh - var(--mnav-sat) - 84px - var(--mnav-sab) - 76px) !important;
+    }
+    /* The floater belongs to the SESSION page: on the home list it hovered
+       over the session rows (user feedback, 2026-08-18). The phone page
+       stack is this plugin's own overlay — the official conversation (and
+       with it the floater's "current session") stays mounted underneath, so
+       agent-teams keeps rendering it; hide it whenever the home level is the
+       visible one (data-view flips to "session" inside a session, and the
+       badge/panel come right back). :has() is already a documented
+       requirement of this plugin (Chromium 105+, docs/interface.md). */
+    body:has([data-mobile-nav="home"][data-view="home"]) [data-agent-teams-host] [class$="_badge"],
+    body:has([data-mobile-nav="home"][data-view="home"]) [data-agent-teams-host] [class$="_panel"] {
+      display: none !important;
+    }
+  }
 `
