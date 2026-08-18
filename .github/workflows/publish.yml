@@ -1,0 +1,50 @@
+# tag 推送（v*）→ 构建 + 全量校验 + 发布 npm。
+# 唯一需要的外部配置：仓库 secret NPM_TOKEN（见 README / AGENTS.md 发布一节）。
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance 签名（公开仓自动生效）
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4 # 版本读 package.json 的 packageManager 字段
+
+      - uses: actions/setup-node@v4
+        with:
+          # engines 声明 >=18，但 pnpm test 的界面自检脚本直接 import .ts，
+          # 依赖 Node >=23.6 的类型剥离 —— CI 用 24（当前 LTS）。
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      # lib/ 是入库产物：tag 里的产物必须与 src 重新构建的结果一致，
+      # 防止「改了 src 忘了重跑 build 就打 tag」发出旧代码。
+      - run: git diff --exit-code -- lib
+
+      - run: pnpm verify
+
+      - run: pnpm test
+
+      # tag 名与 package.json 版本一致（v1.0.2 ↔ "version": "1.0.2"）。
+      - run: |
+          pkg="v$(node -p "require('./package.json').version")"
+          if [ "$pkg" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME != package.json $pkg" >&2
+            exit 1
+          fi
+
+      - run: pnpm publish --no-git-checks --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
