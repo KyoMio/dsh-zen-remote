@@ -145,23 +145,31 @@ export const BASE_CSS = `
   }
 }
 
-/* ---------- beta-notice suppression (ALL widths — deliberate exception) ----
-   User-directed (2026-08-17): hide DSH's beta/preview notices everywhere,
-   including desktop. This is the ONE place this plugin intentionally breaks
-   its own ">=1024px strict no-op" rule — do not "fix" it back.
-   Selector notes:
+/* ---------- beta-notice handling (ALL widths — deliberate exception) ----
+   User-directed (2026-08-17): tone down DSH's beta/preview notices
+   everywhere, including desktop. This is the ONE place this plugin
+   intentionally breaks its own ">=1024px strict no-op" rule.
    - The hero "预览版" badge only carries a hashed class; per repo convention
      the stable part is the suffix (_previewBadge), matched with [class$=].
-   - The first-run "内测声明" modal is hidden via its ARIA label. The label is
-     LOCALIZED — zh is covered; if the UI runs in another language the dialog
-     shows (harmless, dismiss by hand). Hiding targets the presentation
-     wrapper via :has() so the modal's backdrop cannot linger invisibly and
-     block taps; the app never requires acknowledging this dialog to work. */
+   - The first-run "内测声明" modal must NOT be hidden with CSS: while it is
+     mounted it holds document #root inert, so display:none leaves the whole
+     app unclickable (2026-08-18 incident). effects/welcome-notice.ts instead
+     injects a "不再弹出" opt-out button; this styles it. */
 [class$="_previewBadge"] {
   display: none !important;
 }
-[role="presentation"]:has(> [role="dialog"][aria-label="内测声明"]),
-[role="dialog"][aria-label="内测声明"] {
-  display: none !important;
+.zen-welcome-optout {
+  height: 36px;
+  padding: 0 14px;
+  margin-right: 8px;
+  border: 1px solid var(--dsw-alias-line-border, rgba(0, 0, 0, .15));
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary, inherit);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.zen-welcome-optout:hover {
+  background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
 }
 `

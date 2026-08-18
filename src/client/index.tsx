@@ -15,6 +15,7 @@ import { installAionuiCompat } from './effects/aionui-compat.ts'
 import { installHeaderStatusDot } from './effects/header-status.ts'
 import { installGestures } from './effects/gestures.ts'
 import { installTurnFold } from './effects/turn-fold.ts'
+import { installWelcomeNoticeOptOut } from './effects/welcome-notice.ts'
 import { NS, en, zh } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 
@@ -77,6 +78,11 @@ export function apply(ctx: ClientContext): void {
   // effects/turn-fold.ts for why the keyed conversation.chat.node seat could
   // not carry this.
   installTurnFold(ctx)
+
+  // "内测声明" first-run notice: keep it visible (CSS-hiding it leaked the
+  // dialog's #root inert lock — see effects/welcome-notice.ts) and offer a
+  // per-browser "不再弹出" opt-out instead.
+  installWelcomeNoticeOptOut(ctx)
 
   // Page-stack store (apply world) — created before any registration so
   // every slot below (the phone home screen, the session header's back

@@ -207,6 +207,7 @@ open http://127.0.0.1:3088/lan-gate/admin
 - 真 PWA：manifest + service worker，可装到主屏、可离线打开
 - 真 Web Push：VAPID + aes128gcm，通知默认不带对话正文
 - `push_notify` 工具：模型可在关键节点自己推一条，带限流
+- 「内测声明」弹窗注入「不再弹出」可选项：远程访问每次刷新都会重弹这个官方声明，点一次后本设备记住选择、以后自动替你确认关闭（不能用 CSS 藏它——弹窗挂载期间锁着整页 `#root` 的 inert）
 
 深度说明：[界面](docs/interface.md) · [公网接入](docs/remote-access.md)
 
