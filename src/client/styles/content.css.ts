@@ -32,6 +32,30 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
     overflow-wrap: anywhere;
   }
 
+  /* Transcript density (2026-08-20): the desktop prose rhythm is 28px of
+     leading on 15px text — a 1.87 ratio that reads generously on a wide
+     column but wastes a phone screen, where the same paragraph is three
+     times as many lines. Unitless 1.65 so nested blocks (code, quotes,
+     lists) recompute from their OWN font-size instead of inheriting a fixed
+     28px that is far too loose for 12-13px chrome text. 1.65 is the floor I
+     am willing to go to for mixed CJK/Latin: the glyphs are full-height with
+     no descender relief, so tighter starts to look stacked. Phone only —
+     the desktop column keeps the official rhythm. */
+  [class*="_markdown_"] {
+    line-height: 1.65;
+  }
+  /* Paragraph rhythm. Each paragraph is its own markdown block and the
+     separation comes from the flex container's row-gap, not from margins —
+     at the stock 16px the paragraph baseline step was 40.75px against a
+     24.75px line step, i.e. 1.65x, which is what reads as airy. 12px brings
+     the step to ~36.75px: still clearly more than one line so paragraphs
+     never run together, but noticeably denser. Scoped by :has() to
+     containers that actually hold prose blocks, so tool cards and other
+     flex bodies with the same hashed suffix keep their own spacing. */
+  [data-phase] [class$="_body"]:has(> [class*="_markdown_"]) {
+    row-gap: 12px !important;
+  }
+
   /* Markdown tables: the official _tableScroll_ wrapper is already a
      horizontal scroll viewport around a width:max-content table, but its
      cells are capped at min(30vw, 320px) — barely 120px on a phone, which

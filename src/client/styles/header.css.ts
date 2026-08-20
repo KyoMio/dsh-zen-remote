@@ -24,6 +24,7 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
    list in misc.css.ts. */
 [data-mobile-nav="header-back"],
 [data-mobile-nav="header-viewrow"],
+[data-mobile-nav="header-activity"],
 [data-mobile-nav="header-info"],
 [data-mobile-nav="header-workbench"],
 /* The workbench close pill's default-hidden used to live in compat.css.ts —
@@ -266,14 +267,47 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   [data-phase] header [data-slot="conversation.session.header.utilities"] > * {
     display: none !important;
   }
-  /* Native DSH task surfaces are real header actions, not phone-shell
-     controls. Keep their roots visible so the background-task and subagent
-     menus can still be opened on a phone. Restore the root's containing block
-     as well: both native menus are absolutely positioned from this element,
-     and layout.css.ts's compact-header rule otherwise changes it to static. */
+  /* Native background-task / subagent entries: kept mounted, but parked as
+     ZERO-WIDTH INVISIBLE ANCHORS at the right end of the view-switch band.
+     Our activity pill is the visible control and forwards the tap to the
+     official trigger, so the official popover — a child of this root — still
+     mounts and positions from here.
+
+     Why not just leave them visible in the header: each is ~103px wide while
+     headerActions' grid column is 92px, and flex children that cannot shrink
+     simply overflow — measured at 375px the subagent entry ran x=60..163
+     straight across the centred title at x=100..275.
+
+     Why not display:none them either: the menu lives inside the root, so
+     hiding the root takes the popover with it and the pill would have
+     nothing to open. Hide the TRIGGER (below) and keep the root as a box. */
   [data-phase] header [data-slot="conversation.session.header.actions"] > [class$="_root"]:has(> button[class$="_trigger"]) {
     display: block !important;
-    position: relative !important;
+    position: absolute !important;
+    right: 0 !important;
+    top: 100% !important;
+    width: 0 !important;
+    height: 28px !important;
+    overflow: visible !important;
+    order: 0 !important;
+  }
+  /* The official trigger never shows — the pill replaced it. Programmatic
+     .click() still reaches React's handler on a display:none button. */
+  [data-phase] header [data-slot="conversation.session.header.actions"] > [class$="_root"] > button[class$="_trigger"] {
+    display: none !important;
+  }
+  /* Anchor the popover to the RIGHT edge and clamp it to the viewport. The
+     root now sits at the right edge with zero width, so the official
+     \`left: 0\` would start the 336px panel off-screen; layout.css.ts's
+     \`left: 8px\` re-anchor was written for a viewport-width containing block
+     that this element is not. Right-anchoring is the one that holds for both
+     (2026-08-20: the old pairing put the panel 29px past the right edge). */
+  [data-phase] header [data-slot="conversation.session.header.actions"] [class$="_menu"] {
+    left: auto !important;
+    right: 0 !important;
+    width: min(336px, calc(100vw - 32px)) !important;
+    max-width: none !important;
+    max-height: min(420px, calc(100dvh - 140px)) !important;
   }
   /* The agent-preset mode badge specifically survives the blanket hide
      above: layout.css.ts's shared <=1023px block targets it directly
@@ -291,6 +325,12 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      display value must match the flex layout its own rule declares. */
   [data-phase] header [data-slot="conversation.session.header.actions"] > [data-mobile-nav="header-viewrow"] {
     display: flex !important;
+  }
+  /* Our own chip lives in the same slot, so the blanket hide above swallows
+     it unless it is named here too (it was, on the first build: the chip
+     rendered with the right counts and painted nothing). */
+  [data-phase] header [data-slot="conversation.session.header.actions"] > [data-mobile-nav="header-activity"] {
+    display: inline-flex !important;
   }
   [data-phase] header [data-slot="conversation.session.header.utilities"] > [data-mobile-nav="header-info"],
   [data-phase] header [data-slot="conversation.session.header.utilities"] > [data-mobile-nav="header-workbench"] {
@@ -369,6 +409,80 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      display:contents on titleCluster does not break that search — so
      top:100% sits directly under the title regardless of the title row's
      actual height, with no hardcoded offset to keep in sync. */
+  /* Activity chip (subagents / background tasks) rides the right end of the
+     same band. It is a SIBLING of the switch button, not a child — that
+     button spans the full row, so nesting would make every tap on the chip
+     switch views too — and it shares titleRow as its containing block, so
+     top:100% lands both on the same 28px line. z-index puts it above the
+     row it overlaps. */
+  [data-mobile-nav="header-activity"] {
+    position: absolute;
+    right: 0;
+    top: 100%;
+    z-index: 1;
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    height: 28px;
+    padding: 0 2px 0 10px;
+    border: none;
+    background: transparent;
+    color: var(--dsw-alias-label-secondary, rgba(0, 0, 0, .5));
+    font-family: inherit;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  [data-mobile-nav="activity-pill"] {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    height: 28px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-family: inherit;
+    font-size: 12px;
+    line-height: 18px;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  [data-mobile-nav="activity-pill"]:active {
+    opacity: .55;
+  }
+  [data-mobile-nav="activity-count"] {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Steady green = everything settled. */
+  [data-mobile-nav="activity-dot"] {
+    display: block;
+    width: 6px;
+    height: 6px;
+    margin-left: 1px;
+    border-radius: 50%;
+    background: var(--dsw-alias-state-success-primary, #16a34a);
+  }
+  /* A job that failed or was killed is not a success — never paint it green. */
+  [data-activity-state="warning"] [data-mobile-nav="activity-dot"] {
+    background: var(--dsw-alias-state-warn-primary, #d97706);
+  }
+  /* Pulsing blue = still running. Same state palette as the session dot. */
+  [data-activity-state="running"] [data-mobile-nav="activity-dot"] {
+    background: var(--dsw-alias-state-business-primary, #4f6ef7);
+    animation: dsh-zen-activity-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes dsh-zen-activity-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: .45; transform: scale(.72); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    [data-activity-state="running"] [data-mobile-nav="activity-dot"] {
+      animation: none;
+    }
+  }
+
   [data-mobile-nav="header-viewrow"] {
     position: absolute;
     left: 0;

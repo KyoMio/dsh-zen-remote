@@ -165,6 +165,12 @@ export const BASE_CSS = `
   align-items: center;
   justify-content: center;
   height: 36px;
+  /* The notice's action row is a flex row and the official confirm button
+     takes the slack; without an explicit shrink guard this button collapsed
+     to about two characters wide on a phone. Content width, never squeezed. */
+  flex: 0 0 auto;
+  min-width: max-content;
+  white-space: nowrap;
   padding: 0 14px;
   margin-right: 8px;
   border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, .15));

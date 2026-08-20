@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import type { ReactElement } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { IconChevronLeftOutline14, IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS } from './locales.ts'
@@ -20,6 +21,93 @@ function IconInfoOutline16({ size = 16 }: { size?: number }) {
       <circle cx="8" cy="4.7" r="0.95" fill="currentColor" />
       <rect x="7.25" y="6.9" width="1.5" height="4.7" rx="0.75" fill="currentColor" />
     </svg>
+  )
+}
+
+/**
+ * Two more hand-built 14px glyphs, same reason as IconInfoOutline16 above:
+ * the primitives family has no subagent or background-task icon. Drawn on
+ * the same 16-box with the same 1.3 stroke so the activity chip reads as
+ * part of the header icon family.
+ */
+/** Three linked nodes — a parent delegating to children. */
+function IconSubagentOutline14({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="8" cy="3.2" r="2" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="3.4" cy="12.6" r="2" stroke="currentColor" strokeWidth="1.3" />
+      <circle cx="12.6" cy="12.6" r="2" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M8 5.4v2.2M8 7.6H3.4v3M8 7.6h4.6v3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+/** A clock face — work still ticking in the background. */
+function IconTaskOutline14({ size = 14 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.1" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M8 4.4V8l2.5 1.7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+/**
+ * What the status dot says. `running` pulses blue, `done` is a steady green,
+ * `warning` covers a job that ended on request or failed — showing that as
+ * "done" green would call a failure a success.
+ */
+type ActivityState = 'running' | 'done' | 'warning'
+
+/**
+ * The official triggers our pills stand in for. Both are hidden and parked
+ * as invisible anchors at the right end of the view-switch band
+ * (styles/header.css.ts) so their own popovers still mount and position from
+ * there; the pill is the visible control and forwards the tap.
+ *
+ * Told apart by `aria-haspopup`, not by class: the subagent entry declares
+ * `tree` (its menu is a session tree) while the jobs entry declares none.
+ * Both roots/triggers only expose build-hashed class names, so the ARIA
+ * contract is the one stable discriminator between two otherwise identical
+ * `[class$="_root"] > button[class$="_trigger"]` shapes.
+ */
+const ACTIONS_SLOT = '[data-slot="conversation.session.header.actions"]'
+const SUBAGENT_TRIGGER = `${ACTIONS_SLOT} button[aria-haspopup="tree"]`
+const JOBS_TRIGGER = `${ACTIONS_SLOT} > [class$="_root"] > button[class$="_trigger"]:not([aria-haspopup])`
+
+/** One glanceable group: icon + count + state dot; opens the official popover. */
+function ActivityPill(
+  { kind, count, state, label, trigger, onFallback, Icon }: {
+    kind: string
+    count: number
+    state: ActivityState
+    label: string
+    /** CSS selector for the official trigger this pill stands in for. */
+    trigger: string
+    /** Used when the official entry is absent — never leave a tap dead. */
+    onFallback: () => void
+    Icon: (props: { size?: number }) => ReactElement
+  },
+) {
+  if (count === 0) return null
+  return (
+    <button
+      type="button"
+      data-mobile-nav="activity-pill"
+      data-activity-kind={kind}
+      data-activity-state={state}
+      aria-label={label}
+      title={label}
+      onClick={() => {
+        const el = document.querySelector<HTMLButtonElement>(trigger)
+        if (el === null) onFallback()
+        else el.click()
+      }}
+    >
+      <Icon />
+      <span data-mobile-nav="activity-count">{count}</span>
+      <i data-mobile-nav="activity-dot" aria-hidden="true" />
+    </button>
   )
 }
 
@@ -92,9 +180,29 @@ export function useViewTabs(): ViewTabInfo[] {
  * (styles/header.css.ts) keeps them hidden at >= 768px so the tablet drawer
  * and the desktop layout stay exactly as they were.
  */
-export function MobileHeaderActions({ t }: MobileHeaderActionsProps) {
+export function MobileHeaderActions({ sessionId, useSessions, t }: MobileHeaderActionsProps) {
   const tabs = useViewTabs()
   const active = tabs.find((tab) => tab.active) ?? tabs[0]
+
+  /* At-a-glance activity, right end of the view-switch row. The native
+     header entries these replace were hidden on phone: both are ~103px wide
+     and the header's left grid column is 92px, so they overflowed straight
+     across the centred session title. Reading the counts from the sessions
+     snapshot instead of re-homing the official DOM keeps React's ownership
+     of its own nodes intact — the detail lives one tap away in the info
+     card, which this chip opens. */
+  const subagents = useSessions((s) => s.subagentsByParent[sessionId]?.entries ?? [])
+  const jobs = useSessions((s) => s.jobsBySession[sessionId] ?? [])
+  const subagentRunning = subagents.some((e) => e.kind === 'child' && e.activity === 'running')
+  const jobRunning = jobs.some((j) => j.status === 'running' || j.status === 'stopping')
+  const jobBad = jobs.some((j) => j.status === 'failed' || j.status === 'killed')
+  const subagentState: ActivityState = subagentRunning ? 'running' : 'done'
+  const jobState: ActivityState = jobRunning ? 'running' : jobBad ? 'warning' : 'done'
+  const hasActivity = subagents.length > 0 || jobs.length > 0
+  /* Only reached when the official entry is missing entirely — the info
+     card still carries both counts, so the tap explains something. */
+  const openInfoCard = (): void => { window.dispatchEvent(new CustomEvent(SESSION_INFO_EVENT)) }
+
   return (
     <>
       <button
@@ -120,6 +228,31 @@ export function MobileHeaderActions({ t }: MobileHeaderActionsProps) {
             ))}
           </span>
         </button>
+      )}
+      {hasActivity && (
+        /* A sibling of the view-switch button, not a child: that button
+           spans the whole row, so nesting this would make every tap on the
+           chip also switch views. */
+        <div data-mobile-nav="header-activity">
+          <ActivityPill
+            kind="subagent"
+            count={subagents.length}
+            state={subagentState}
+            label={t('infoSubagents', { count: subagents.length })}
+            trigger={SUBAGENT_TRIGGER}
+            onFallback={openInfoCard}
+            Icon={IconSubagentOutline14}
+          />
+          <ActivityPill
+            kind="job"
+            count={jobs.length}
+            state={jobState}
+            label={t('infoJobs', { count: jobs.length })}
+            trigger={JOBS_TRIGGER}
+            onFallback={openInfoCard}
+            Icon={IconTaskOutline14}
+          />
+        </div>
       )}
     </>
   )

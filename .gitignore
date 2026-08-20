@@ -7,3 +7,8 @@ node_modules/
 .client-build/
 test/.tmp/
 *.tgz
+
+# Local planning note, deliberately not shipped: it records the pre-implementation
+# guesses (several of which turned out wrong) and is superseded by README's
+# notification section and docs/remote-access.md.
+docs/push-policy.md

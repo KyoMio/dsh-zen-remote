@@ -120,7 +120,10 @@ export const CHIPS_CSS = `/* ---------- chips row + settings entry (S5) --------
     padding: 0 14px;
     border: none;
     border-radius: 17px;
-    background: var(--dsw-alias-bg-base, #ffffff);
+    /* Same surface as the list rows: the home page is bg-base since the
+       2026-08-20 swap (see home.css.ts), so a bg-base chip would disappear
+       into it. */
+    background: var(--dsw-specific-sidebar-fill, #f5f5f5);
     color: var(--dsw-alias-label-primary, inherit);
     font-family: inherit;
     font-size: 13px;

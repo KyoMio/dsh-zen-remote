@@ -46,6 +46,7 @@ pnpm test      # 网关 node:test 用例 + 三个界面自检脚本 + 文档版�
 | [`docs/remote-access.md`](docs/remote-access.md) | 通道半边：反代配置（nginx/Caddy/Lucky）、配对流程、环境变量表、管理 API、推送、安全边界 |
 | [`docs/interface.md`](docs/interface.md) | 界面半边：断点策略、调试徽章、安全区体系、兼容插件清单 |
 
+
 ## 合仓后仍然成立的硬约束
 
 - **网关是子进程**：`lan-gate.mjs` 只负责 spawn + 生命周期，永远不要把

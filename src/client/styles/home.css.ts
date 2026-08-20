@@ -101,14 +101,19 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
        values, not source-read guesses, are what actually matter here —
        --dsw-alias-bg-base/-layer-1/-layer-2 all resolve to the exact same
        color in the LIGHT theme (neutral-bluish-00, i.e. plain white); they
-       only diverge in dark mode. A layer-* token would have made the page
-       and its cards indistinguishable in light mode specifically — the
-       opposite of what was asked. --dsw-specific-sidebar-fill differs from
-       bg-base in BOTH themes (bluish-50 vs -00 light, bluish-900 vs -950
-       dark) and is the exact token dsh-better-sidebar's own panel already
-       uses for this same "secondary surface next to bg-base content"
-       role, so it is the correct reuse rather than a new hardcoded gray. */
-    background: var(--dsw-specific-sidebar-fill, #f5f5f5);
+       only diverge in dark mode.
+
+       2026-08-20: the page and the CARDS swapped tokens. This surface used
+       to be --dsw-specific-sidebar-fill, which made the list page a
+       different shade from the session page — measured on-device in dark
+       theme, rgb(27,27,28) here against rgb(21,21,23) there, a visible step
+       every time you opened a session. The page now takes bg-base, the same
+       token the session page and <body> resolve to, so the two screens are
+       literally the same colour; the cards took sidebar-fill in exchange, so
+       the contrast that separates a row from the page is preserved — it
+       just runs the other way (raised card on a base page, the more
+       conventional reading of the two anyway). */
+    background: var(--dsw-alias-bg-base, #ffffff);
     color: var(--dsw-alias-label-primary, inherit);
     padding-top: var(--mnav-sat);
     transform: translateX(0);
@@ -226,7 +231,10 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     padding: 14px 16px;
     border: none;
     border-radius: 22px;
-    background: var(--dsw-alias-bg-base, #ffffff);
+    /* The page's old colour (see the swap note on [data-mobile-nav="home"]):
+       differs from bg-base in BOTH themes, and is the token
+       dsh-better-sidebar's panel already uses for a secondary surface. */
+    background: var(--dsw-specific-sidebar-fill, #f5f5f5);
     color: inherit;
     font-family: inherit;
     text-align: left;
@@ -329,7 +337,8 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     margin: 12px 16px;
     padding: 48px 24px;
     border-radius: 22px;
-    background: var(--dsw-alias-bg-base, #ffffff);
+    /* Stands in for the rows, so it carries the rows' surface. */
+    background: var(--dsw-specific-sidebar-fill, #f5f5f5);
     color: var(--dsw-alias-label-secondary, rgba(0, 0, 0, .5));
     font-size: 15px;
     text-align: center;

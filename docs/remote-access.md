@@ -15,7 +15,7 @@
 | 🧩 **可安装** | 主屏图标、`standalone` 显示、`apple-touch-icon`、maskable 图标 |
 | 🌐 **离线可用** | service worker（v3）：只有真正的静态壳（manifest/图标/离线页）缓存优先，其余（DSH 客户端 JS/CSS、API、页面 HTML）一律网络优先——装了新版本手机上立刻吃到，不会像早期版本那样在部署之后还残留旧 CSS |
 | 👆 **触屏手势** | 捏合缩放字体（可重置）；左缘返回手势已让位给界面半边（见下方「分工」），下拉刷新已整体移除（误触发全页重载会把人从对话中间弹回列表） |
-| 🔔 **任务完成推送** | 真 Web Push（VAPID 签名 + aes128gcm 加密），agent 干完活推送到手机，通知里不带对话内容 |
+| 🔔 **卡住了就推送** | 真 Web Push（VAPID 签名 + aes128gcm 加密）。默认只在**真正需要你**的时候推：某个工具在等授权、模型在等你回答问题。「回合结束」默认不推（设 `DSH_PUSH_TURN_END=1` 打开）。通知里默认不带对话内容 |
 | 🛎️ **`push_notify` 工具** | 模型可主动调用的推送工具（在 `dsh-push.mjs` 里注册）：任务中途要用户拿主意、跑到关键节点、或出错需要人来处理时，模型自己决定推一条到锁屏。纪律写在工具描述里明确要求模型别高频用；宿主侧再兜底限流（同会话 60 秒最多 1 条、全局每小时最多 20 条），超额直接不发送、不报错。同样是 aes128gcm 端到端加密，推送服务器只见密文，暴露面只有你自己的锁屏。`lan-gate.config.json` 里 `pushTool: false`（或 `DSH_PUSH_TOOL=0`）可整体关掉；宿主没装工具注册服务（`ctx.tools`）时自动跳过，不影响插件其余功能 |
 | 📐 **触屏布局** | 本仓库只留壳级规则（iOS 输入框防缩放、安全区滚动补偿、代码横向滚动）——排版类规则（44px 触摸目标、弹窗、composer 外观等）已交给界面半边，见下方「分工」——桌面零影响 |
 | 🔒 **桌面不受影响** | 所有规则都以 `html:not([data-lan-device="desktop"])`（或带同样排除条件的 `@media`）为根——只有显式标成「桌面」才会被排除，其余（包括真机默认的「自动」）都生效 |
@@ -264,7 +264,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 }
 ```
 
-字段名 = 环境变量去掉前缀转小驼峰：`port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`，推送半边是 `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool`（`push_notify` 工具开关，默认 `true`）。挂载行支持 Cordis config 的 DSH 版本也可以把网关配置写在 insert 行的 `config:` 下（同名小驼峰字段），效果等同。
+字段名 = 环境变量去掉前缀转小驼峰：`port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`，推送半边是 `pushTurnEnd`（回合结束是否推送，默认 `false`）/ `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool`（`push_notify` 工具开关，默认 `true`）。挂载行支持 Cordis config 的 DSH 版本也可以把网关配置写在 insert 行的 `config:` 下（同名小驼峰字段），效果等同。
 
 推送半边（`dsh-push.mjs`）随包自带，装包即挂载，**不需要在 profile 的
 `cordis.patch.yml` 里手写任何一行**。从旧的两包结构升级上来的话，profile patch
@@ -294,8 +294,8 @@ sudo cloudflared service install      # 通了再装成常驻服务
 - 推送内容只有标题和一句简短正文（比如「DSH 任务完成」），**不携带任何对话内容**——走的是标准 Web Push（VAPID 签名 + aes128gcm 加密），只有推送服务商和你的浏览器能看到密文。
 - 设备被吊销时，它的推送订阅一并删除；推送目标返回 404/410（订阅已失效）时网关会自动清掉这条订阅。
 - 手机浏览器要求页面必须是 HTTPS 才会注册 Service Worker，所以推送和离线能力都依赖第 2 步配好的反代——反代没配好之前，这两项在真机上都不会生效。
-- 「agent 干完活自动推送」由可选宿主插件 `dsh-push.mjs` 负责：它监听 DSH 事件总线并调用本机 `/pwa/push/send`。事件名通过 `DSH_PUSH_EVENTS`（逗号分隔）配置，默认 `agent/turn-stopping`——官方文档定义的「回合即将关闭」检查点（模型不再欠响应、无存活工具调用时触发，每回合一次）；如果你的 DSH 版本更旧/更新导致事件名不同，用该环境变量覆盖即可。`DSH_PUSH_DEBOUNCE_MS`（默认 15000）控制两条通知的最小间隔。想让通知带上这回合的结果摘要？设 `DSH_PUSH_SUMMARY=1`，通知正文会换成本回合最后一条助手消息（截 120 字）——推送 payload 本身是 aes128gcm 端到端加密的，Google/Apple 的推送服务器只见密文，剩下的暴露面是你自己的锁屏和通知中心（两大系统都支持「锁屏隐藏通知内容」，介意就开）。不装它也可以自己在任何脚本里 `curl -X POST http://127.0.0.1:3088/pwa/push/send -H 'Content-Type: application/json' -d '{"title":"DSH 任务完成"}'` 手动触发。
-- 「模型主动推送」由同一个 `dsh-push.mjs` 额外注册一个模型工具 `push_notify`（`title` 必填、`body` 可选），走的是同一条 `/pwa/push/send` 加密发送通道。宿主装了工具注册服务（`ctx.tools`）且没关闭时才会出现；`lan-gate.config.json` 的 `pushTool: false`（或环境变量 `DSH_PUSH_TOOL=0`）可以整体关掉。宿主侧限流独立于上面的自动推送：同一会话 60 秒内最多发 1 条，全部会话合计每小时最多 20 条，超出直接跳过（不发送、不算错误），避免模型高频调用把你手机刷成消息轰炸。
+- 「什么时候推」由可选宿主插件 `dsh-push.mjs` 决定：它监听 DSH 事件总线并调用本机 `/pwa/push/send`。分两条腿。**事件腿（默认开、必推）**：某个工具在等你授权（会话事件 `approval/asked` 一秒半内没等到配对的 `approval/decided`），或者模型调了 `ask_user_question` 在等你回答（会话事件 `tool/call`）——这两类不受去抖压制，子代理里发生的也照推。**回合结束（默认关）**：想要「干完活就响一下」的老行为，设 `DSH_PUSH_TURN_END=1`（1.0.3 之前这是默认行为，现在改成了要显式打开）；打开之后只有顶层会话会推，子代理跑完永远不推。算哪些事件仍由 `DSH_PUSH_EVENTS`（逗号分隔）配置，默认 `agent/turn-stopping`——官方文档定义的「回合即将关闭」检查点；DSH 版本不同导致事件名对不上时用它覆盖。`DSH_PUSH_DEBOUNCE_MS`（默认 15000）控制两条通知的最小间隔。想让通知带上这回合的结果摘要？设 `DSH_PUSH_SUMMARY=1`，正文会换成本回合的**最终文本回复**（只取 `text` 内容块，思考过程不会漏出来；整回合没说话就退回「最后执行了 <工具名>」；截 120 字）——推送 payload 本身是 aes128gcm 端到端加密的，Google/Apple 的推送服务器只见密文，剩下的暴露面是你自己的锁屏和通知中心（两大系统都支持「锁屏隐藏通知内容」，介意就开）。不装它也可以自己在任何脚本里 `curl -X POST http://127.0.0.1:3088/pwa/push/send -H 'Content-Type: application/json' -d '{"title":"DSH 任务完成"}'` 手动触发。
+- 「模型主动推送」由同一个 `dsh-push.mjs` 额外注册一个模型工具 `push_notify`（`title` 必填、`body` 可选），走的是同一条 `/pwa/push/send` 加密发送通道。工具描述里同时写清了**该调**和**不该调**的场景（只写前者会变成每回合都调），同一段文字还通过 `ctx.systemPrompt` 作为会话上下文再强化一遍，两处共用同一个常量、不会各改各的。宿主装了工具注册服务（`ctx.tools`）且没关闭时才会出现；`lan-gate.config.json` 的 `pushTool: false`（或环境变量 `DSH_PUSH_TOOL=0`）可以整体关掉。宿主侧限流独立于上面的自动推送：同一会话 60 秒内最多发 1 条，全部会话合计每小时最多 20 条，超出直接跳过（不发送、不算错误），避免模型高频调用把你手机刷成消息轰炸；发出去之后它会把去抖时钟拨到当下，所以紧跟其后的自动推送会被压掉。
 
 ---
 
@@ -319,7 +319,9 @@ sudo cloudflared service install      # 通了再装成常驻服务
 
 现象:iPhone 上把 DSH 加到主屏、以独立 PWA 打开后,视口底部会凭空少掉一截(实测 iPhone 一台 26.5 系统上是 852 屏幕高度对 793 视口高度,少了正好一条状态栏的高度),从冷启动那一刻就在,直到你把整个 app 彻底退出重开才会恢复;在普通 Safari 标签页里打开同一个网址则完全正常。
 
-这不是本插件的 bug,是 iOS 26.x 的系统级缺陷(独立 PWA 里第一次弹出软键盘后,布局视口永久性变矮,`innerHeight`/`visualViewport.height`/`100dvh` 三个值一起变小,社区已有记录)。少掉的那截视口在文档范围之外,任何 CSS 都够不着,只能由系统自己拿背景色画上——本仓库把 `manifest.json` 的 `background_color` 从深色改成了 `#f9fafb`(和界面半边浅色主题背景一致),让这条系统画的死区尽量看起来像页面背景的延伸,而不是一条突兀的黑条。
+这不是本插件的 bug,是 iOS 26.x 的系统级缺陷(独立 PWA 里第一次弹出软键盘后,布局视口永久性变矮,`innerHeight`/`visualViewport.height`/`100dvh` 三个值一起变小,社区已有记录)。少掉的那截视口在文档范围之外,任何 CSS 都够不着,只能由系统自己拿背景色画上——本仓库把 `manifest.json` 的 `background_color` 设成 `#f9fafb`(和界面半边浅色主题背景一致),让这条系统画的死区尽量看起来像页面背景的延伸,而不是一条突兀的黑条。
+
+> 安卓底部那条**不是**这个值画的,别顺手改这里去治它:那是 Android 系统导航栏,跟随系统夜间模式,网页够不着(见下方「安卓导航栏」)。
 
 这只是视觉缓解,不是根治:深色主题下这条带反而会更显眼(系统画的是 manifest 里那个固定颜色,没法跟着页面主题切换),而且它同时也是启动闪屏的颜色,所以闪屏从深色变成了浅色。真正的坏行为(视口变矮本身)只能等苹果修复系统缺陷。界面半边那边另外做了两层缓解(检测 + 主动摘窗重排),细节见该插件的 README。
 
@@ -398,7 +400,7 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 - 删掉网关内联的 `DEVICE_CSS` 死代码副本——其中一条全屏弹窗规则会把界面半边的会话信息卡撑满屏并溢出视口，此前一直被误判为「iOS 内核差异」；
 - CSS/手势的 `data-lan-device` 判定从字面量 `"phone"` 改成排除 `"desktop"`——真机配对后默认是 `"auto"`，此前这个判定条件让相关补丁在真机上从未生效过；
 - 下拉刷新移除（误触发全页重载会把人从对话中间弹回列表）；边缘返回手势移除，让位给界面半边的左缘手势（原实现对 SPA 路由本就是空操作）；
-- manifest 的 `background_color` 改成浅色，视觉缓解 iOS 26.x 独立 PWA 视口收缩留下的系统死区（已知系统缺陷，非根治，见「已知问题」一节）。
+- manifest 的 `background_color` 改成浅色，视觉缓解 iOS 26.x 独立 PWA 视口收缩留下的系统死区（已知系统缺陷，非根治，见「已知问题」一节）。安卓底部导航栏与该值无关。
 
 **内部**
 

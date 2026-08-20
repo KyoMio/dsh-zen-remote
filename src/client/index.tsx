@@ -15,6 +15,7 @@ import { installAionuiCompat } from './effects/aionui-compat.ts'
 import { installHeaderStatusDot } from './effects/header-status.ts'
 import { installGestures } from './effects/gestures.ts'
 import { installTurnFold } from './effects/turn-fold.ts'
+import { installModalBack } from './effects/modal-back.ts'
 import { installWelcomeNoticeOptOut } from './effects/welcome-notice.ts'
 import { installKeyboardGuard } from './effects/keyboard-guard.ts'
 import { NS, en, zh } from './locales.ts'
@@ -79,6 +80,7 @@ export function apply(ctx: ClientContext): void {
   // effects/turn-fold.ts for why the keyed conversation.chat.node seat could
   // not carry this.
   installTurnFold(ctx)
+  installModalBack(ctx)
 
   // "内测声明" first-run notice: keep it visible (CSS-hiding it leaked the
   // dialog's #root inert lock — see effects/welcome-notice.ts) and offer a

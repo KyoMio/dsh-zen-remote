@@ -29,13 +29,15 @@ export declare const zh: {
     readonly infoMode: "模式";
     readonly infoCwdFallback: "未知目录";
     readonly infoSubagents: "{count} 个子代理";
+    readonly infoJobs: "{count} 个后台任务";
+    readonly activityOpen: "查看子代理与后台任务";
     readonly infoStatTurns: "轮次";
     readonly infoStatSteps: "步骤";
     readonly infoStatTtft: "首字延迟";
     readonly infoStatLlm: "模型耗时";
     readonly infoStatTool: "工具耗时";
-    readonly infoStatTokens: "Token";
-    readonly infoCacheHit: "缓存 {percent}%";
+    readonly infoStatCacheHit: "缓存命中";
+    readonly infoTokenFlow: "Token {io}";
     readonly infoExport: "导出日志";
     readonly infoRename: "重命名";
     readonly infoRenamePrompt: "会话新名称";

@@ -40,7 +40,7 @@ export declare function useViewTabs(): ViewTabInfo[];
  * (styles/header.css.ts) keeps them hidden at >= 768px so the tablet drawer
  * and the desktop layout stay exactly as they were.
  */
-export declare function MobileHeaderActions({ t }: MobileHeaderActionsProps): import("react").JSX.Element;
+export declare function MobileHeaderActions({ sessionId, useSessions, t }: MobileHeaderActionsProps): import("react").JSX.Element;
 /** Full props for the session header's right-edge utility buttons. */
 export type MobileHeaderUtilitiesProps = PropsRuntime<'conversation.session.header.utilities'> & PropsLocale<typeof NS>;
 /**

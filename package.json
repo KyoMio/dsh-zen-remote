@@ -34,7 +34,8 @@
     "llms.txt",
     "AGENTS.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "!docs/push-policy.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",

@@ -11,6 +11,10 @@ import { workspaceTitleOf } from '@deepseek-ai/dsh-client-runtime/client'
 import type { SessionFace, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT, SESSION_INFO_EVENT } from './nav-store.ts'
+import { hasLayer, popLayer, pushLayer } from './history-nav.ts'
+
+/** Layer id for the info sheet, so Android back closes it before leaving the session. */
+const INFO_LAYER = 'session-info'
 import { useViewTabs } from './MobileSessionHeader.tsx'
 
 // Type-only: pulls the 'sessionStats' / 'tokenUsage' SessionProjectionMap
@@ -66,10 +70,14 @@ function billedInputTokens(usage: { uncachedInputTokens: number; cacheReadTokens
   return usage.uncachedInputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
 }
 
-/** Cache-hit share of prompt-side input over the whole durable log; null when nothing was billed. */
+/**
+ * Cache-hit share of prompt-side input over the whole durable log; null when
+ * nothing was billed. Returned unrounded — the cell is the headline figure
+ * now and shows one decimal, so rounding here would throw that digit away.
+ */
 function cacheHitPercent(usage: { cacheReadTokens: number; uncachedInputTokens: number; cacheWriteTokens: number }): number | null {
   const denominator = billedInputTokens(usage)
-  return denominator === 0 ? null : Math.round((usage.cacheReadTokens / denominator) * 100)
+  return denominator === 0 ? null : (usage.cacheReadTokens / denominator) * 100
 }
 
 /** Data-missing / not-yet-observed placeholder for a stat cell. */
@@ -117,6 +125,9 @@ export function MobileSessionInfo({
     const onOpen = (): void => {
       setError(null)
       setOpen(true)
+      // Stack a history entry on top of the session's: Android back now
+      // closes this sheet first and only then leaves the session.
+      pushLayer({ id: INFO_LAYER, close: () => setOpen(false) })
     }
     window.addEventListener(SESSION_INFO_EVENT, onOpen)
     return () => window.removeEventListener(SESSION_INFO_EVENT, onOpen)
@@ -125,12 +136,19 @@ export function MobileSessionInfo({
   const tabs = useViewTabs()
   const row = useSessions((s) => s.byId[sessionId])
   const subagentCount = useSessions((s) => s.subagentsByParent[sessionId]?.entries.length ?? 0)
+  const jobCount = useSessions((s) => s.jobsBySession[sessionId]?.length ?? 0)
   const stats = useProjection('sessionStats')
   const usage = useProjection('tokenUsage')
 
   if (!open) return null
 
-  const close = (): void => setOpen(false)
+  // Rewind rather than flip the flag — see the one-direction rule in
+  // history-nav.ts. Falls back to a plain close if the layer is gone (the
+  // sheet was opened before this wiring existed, or pushState is unavailable).
+  const close = (): void => {
+    if (hasLayer(INFO_LAYER)) popLayer(INFO_LAYER)
+    else setOpen(false)
+  }
 
   const run = async (action: () => Promise<void>): Promise<void> => {
     setBusy(true)
@@ -199,12 +217,19 @@ export function MobileSessionInfo({
       value: stats === undefined || stats.toolMs === 0 ? NA : formatDuration(stats.toolMs),
       sub: undefined,
     },
+    /* Cache hit is the headline, token flow the sub-line (2026-08-20): on a
+       long session the ratio is the number worth glancing at — it moves, and
+       it is what the bill turns on — while the absolute in→out figure is
+       reference detail. One decimal, because "100%" and "99.6%" are very
+       different answers and integer rounding hid that. */
     {
-      label: t('infoStatTokens'),
-      value: tokensEmpty || usage === undefined
-        ? NA
-        : `${formatTokens(billedInputTokens(usage))}→${formatTokens(usage.outputTokens)}`,
-      sub: cacheHit === null ? undefined : t('infoCacheHit', { percent: cacheHit }),
+      label: t('infoStatCacheHit'),
+      value: cacheHit === null ? NA : `${cacheHit.toFixed(1)}%`,
+      sub: tokensEmpty || usage === undefined
+        ? undefined
+        : t('infoTokenFlow', {
+          io: `${formatTokens(billedInputTokens(usage))}→${formatTokens(usage.outputTokens)}`,
+        }),
     },
   ]
 
@@ -257,6 +282,11 @@ export function MobileSessionInfo({
           {row?.agentPreset !== undefined && <span data-mobile-nav="info-badge">{row.agentPreset}</span>}
           {subagentCount > 0 && (
             <span data-mobile-nav="info-badge">{t('infoSubagents', { count: subagentCount })}</span>
+          )}
+          {/* The header activity chip points here, so the count it shows has
+              to be readable here too — otherwise tapping it explains nothing. */}
+          {jobCount > 0 && (
+            <span data-mobile-nav="info-badge">{t('infoJobs', { count: jobCount })}</span>
           )}
           <span data-mobile-nav="info-badge-cwd">{cwd ?? t('infoCwdFallback')}</span>
         </div>

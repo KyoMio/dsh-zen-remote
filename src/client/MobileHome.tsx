@@ -11,6 +11,10 @@ import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SessionId, SessionSummary, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT } from './nav-store.ts'
+import { hasLayer, popLayer, pushLayer } from './history-nav.ts'
+
+/** The phone shell's one page-stack step: session list -> session. */
+const SESSION_LAYER = 'session'
 import type { createNavStore } from './nav-store.ts'
 import type { WorkspaceFilter } from './nav-store.ts'
 import type { MobileNavKey } from './locales.ts'
@@ -162,8 +166,19 @@ export function MobileHome({
   // store directly — a handle mounts under exactly one scope, and this one
   // is already root-scoped here (see nav-store.ts) — so it dispatches
   // GO_HOME_EVENT instead and this, the store's actual owner, applies it.
+  //
+  // Both directions go through the history layer (history-nav.ts) so
+  // Android's system back gesture lands on the session→list step instead of
+  // exiting the PWA. GO_HOME_EVENT rewinds rather than setting the store: the
+  // store is only ever moved home by the layer's own close callback, so the
+  // history stack and the page stack cannot drift apart. The direct
+  // `show('home')` fallback covers a session view that was somehow entered
+  // without a layer (a restored session, a host that blocks pushState).
   useEffect(() => {
-    const onGoHome = (): void => actions.show('home')
+    const onGoHome = (): void => {
+      if (hasLayer(SESSION_LAYER)) popLayer(SESSION_LAYER)
+      else actions.show('home')
+    }
     window.addEventListener(GO_HOME_EVENT, onGoHome)
     return () => window.removeEventListener(GO_HOME_EVENT, onGoHome)
   }, [actions])
@@ -172,6 +187,7 @@ export function MobileHome({
     start()
     setSheet(null)
     actions.show('session')
+    pushLayer({ id: SESSION_LAYER, close: () => actions.show('home') })
   }
 
   // Opens the OFFICIAL settings modal (dsh-client-ui-settings-general's

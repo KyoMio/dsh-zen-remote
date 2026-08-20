@@ -45,6 +45,11 @@ test('gateway: serves PWA assets (/pwa/manifest.json, /pwa/sw.js)', async () => 
     // ~59px strip below a standalone PWA's viewport (see AGENTS.md) and paints
     // it with this colour. It must stay equal to the mobile plugin's light
     // page background so the strip disappears into the page.
+    //
+    // It is NOT what paints the Android bottom band — that is the system
+    // navigation bar, which follows the OS dark-mode setting and ignores the
+    // page entirely (proven on-device 2026-08-20). Changing this value to
+    // chase that band was tried and did nothing; don't repeat it.
     assert.strictEqual(JSON.parse(manifest.body).background_color, '#f9fafb')
 
     const sw = await request(PORT, { path: '/pwa/sw.js' })

@@ -660,7 +660,14 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
       border: none;
       border-radius: 999px;
       background: var(--dsw-alias-bg-base, #fff);
-      box-shadow: 0 4px 16px rgba(0, 0, 0, .2);
+      /* Drop shadow alone does not draw an edge: the fill is bg-base, which in
+         dark theme is the same colour as the surface behind it, and a black
+         shadow on a dark ground is invisible — the pill read as floating text
+         with no boundary. The inset hairline is the edge; the drop shadow only
+         lifts it. Same token the session rows use for their dark-mode ring. */
+      box-shadow:
+        inset 0 0 0 1px var(--dsw-alias-border-l2, rgba(0, 0, 0, .14)),
+        0 4px 16px rgba(0, 0, 0, .2);
       color: var(--dsw-alias-label-primary, inherit);
       font-family: inherit;
       font-size: 14px;

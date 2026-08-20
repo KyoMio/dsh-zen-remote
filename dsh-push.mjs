@@ -1,37 +1,41 @@
-// dsh-zen-remote · dsh-push.mjs — agent-done push host plugin (OPTIONAL)
+// dsh-zen-remote · dsh-push.mjs — mobile push host plugin (OPTIONAL)
 //
-// Sends a mobile push notification (via the gateway's local /pwa/push/send)
-// when a DSH agent finishes a turn, and (optionally) registers a
-// model-callable push_notify tool. Deliberately minimal and defensive:
+// Two-legged notification policy (docs/push-policy.md):
 //
-//   - inject: [] — uses only the Cordis event bus (ctx.on), no services, so
-//     0811 strict injection can never block loading. The push_notify tool
-//     registration below fetches the "tools" service via ctx.get('tools')
-//     (not a hard inject) and no-ops when it isn't present.
-//   - Event names are configurable: DSH_PUSH_EVENTS (comma-separated).
-//     Default "agent/turn-stopping" — the official turn-close checkpoint
-//     ("the turn is about to close: the model owes no response"), payload
-//     { agent, turn, signal }, per deepseek-harness docs/subsystems/core
-//     and the scoped-events catalog. An unknown name simply never fires.
-//   - Debounced: at most one notification per DSH_PUSH_DEBOUNCE_MS (default
-//     15s), so event bursts produce a single nudge.
+//   Event leg (deterministic, always fires) — the things that BLOCK the user:
+//     · a tool approval is waiting on a human  (session event `approval/asked`
+//       with no `approval/decided` within APPROVAL_PENDING_MS)
+//     · a question is waiting on a human       (session event `tool/call` for
+//       `ask_user_question`)
+//   Model leg (judgement call) — the `push_notify` tool.
+//   Turn end is OPT-IN (DSH_PUSH_TURN_END=1). Finishing a turn is not by
+//   itself a reason to buzz someone's pocket.
+//
+// Deliberately minimal and defensive:
+//   - inject: [] — only the Cordis event bus (ctx.on), no hard service deps,
+//     so 0811 strict injection can never block loading. The push_notify tool
+//     and the system-prompt reinforcement are attached via ctx.inject() and
+//     no-op when the host provides no such service.
+//   - Only top-level sessions notify on turn end: the session header's
+//     `delegationDepth` is ABSENT for a top-level session and parent+1 for a
+//     subagent child (see @deepseek-ai/dsh-session SessionHeader), so the test
+//     is `(delegationDepth ?? 0) === 0`. Subagent turn ends never push.
+//   - Debounced (DSH_PUSH_DEBOUNCE_MS, default 15s) across the turn-end and
+//     model legs. Approval/question notifications are NEVER swallowed by it —
+//     those are exactly the ones you cannot afford to miss.
 //   - By default the notification carries NO conversation content. Set
-//     DSH_PUSH_SUMMARY=1 to include the turn's final assistant message
-//     (truncated). The payload is aes128gcm-encrypted end-to-end, so the
-//     push service (FCM/APNs/Mozilla) only ever sees ciphertext — the
-//     remaining exposure is your own lock screen / notification center.
-//   - push_notify (model tool, on by default): lets the agent itself ask for
-//     a push mid-task instead of only on turn-close. Set DSH_PUSH_TOOL=0 or
-//     {"pushTool": false} in lan-gate.config.json to turn it off. Same
-//     encrypted delivery path as above, throttled independently (see
-//     registerPushTool below) so a chatty model can't spam the lock screen.
+//     DSH_PUSH_SUMMARY=1 to include the turn's final TEXT output (reasoning
+//     excluded) or the pending question. The payload is aes128gcm-encrypted
+//     end-to-end, so the push service (FCM/APNs/Mozilla) only ever sees
+//     ciphertext — the remaining exposure is your own lock screen.
 export const name = 'dsh-zen-remote-push'
 export const inject = []
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 // Shares the gateway's optional config file <DSH_HOME>/lan-gate.config.json
-// (keys: port, pushEvents, pushDebounceMs, pushSummary). Explicit env wins.
+// (keys: port, pushEvents, pushDebounceMs, pushSummary, pushTurnEnd, pushTool).
+// Explicit env wins.
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -41,17 +45,30 @@ function fileConfig() {
     return raw !== null && typeof raw === 'object' ? raw : {}
   } catch { return {} }
 }
+const truthy = (v) => v === true || v === 1 || v === '1'
 const FILE = fileConfig()
 const GATEWAY_PORT = Number(process.env.LAN_GATE_PORT ?? FILE.port ?? 3088)
 const EVENTS = String(process.env.DSH_PUSH_EVENTS ?? FILE.pushEvents ?? 'agent/turn-stopping').split(',').map((s) => s.trim()).filter(Boolean)
 const DEBOUNCE_MS = Number(process.env.DSH_PUSH_DEBOUNCE_MS ?? FILE.pushDebounceMs ?? 15000)
-const INCLUDE_SUMMARY = process.env.DSH_PUSH_SUMMARY !== undefined ? process.env.DSH_PUSH_SUMMARY === '1' : FILE.pushSummary === true || FILE.pushSummary === 1 || FILE.pushSummary === '1'
+const INCLUDE_SUMMARY = process.env.DSH_PUSH_SUMMARY !== undefined ? process.env.DSH_PUSH_SUMMARY === '1' : truthy(FILE.pushSummary)
+const TURN_END_ENABLED = process.env.DSH_PUSH_TURN_END !== undefined ? process.env.DSH_PUSH_TURN_END === '1' : truthy(FILE.pushTurnEnd)
 const PUSH_TOOL_ENABLED = process.env.DSH_PUSH_TOOL !== undefined ? process.env.DSH_PUSH_TOOL !== '0' : FILE.pushTool !== false
 
-// Low-level sender shared by the turn-close notify() below and the
-// push_notify tool: POSTs to the gateway's local /pwa/push/send, which does
-// the actual VAPID + aes128gcm encrypted delivery to every subscribed
-// device and replies { ok, sent, failed }.
+// The model-facing tool of @deepseek-ai/dsh-tool-ask-user. Its `tool/call`
+// session event is appended BEFORE dispatch (dsh-agent-loop appendToolCall),
+// and the call then blocks in ctx.userQuestions.ask() until a human answers —
+// so the call event IS the "a question is pending" signal.
+const ASK_USER_TOOL = 'ask_user_question'
+
+// @deepseek-ai/dsh-user-approval appends `approval/asked` before consulting
+// the answerer chain and `approval/decided` after. A policy-resolved or
+// hook-answered request settles in the same tick, so only an ask still
+// undecided after this grace period is actually waiting on a human.
+const APPROVAL_PENDING_MS = 1500
+
+// Low-level sender shared by every leg: POSTs to the gateway's local
+// /pwa/push/send, which does the actual VAPID + aes128gcm encrypted delivery
+// to every subscribed device and replies { ok, sent, failed }.
 async function sendPush(title, body) {
   const res = await fetch(`http://127.0.0.1:${GATEWAY_PORT}/pwa/push/send`, {
     method: 'POST',
@@ -62,32 +79,148 @@ async function sendPush(title, body) {
   return res.json()
 }
 
-// AssistantMessage content may be a plain string or an array of parts.
-function messageText(message) {
-  if (!message) return ''
-  const c = message.content !== undefined ? message.content : message
-  if (typeof c === 'string') return c
-  if (Array.isArray(c)) {
-    return c.map((p) => (typeof p === 'string' ? p : (p && typeof p.text === 'string' ? p.text : ''))).join(' ').trim()
+const SUMMARY_MAX = 120
+const clip = (s) => String(s).replace(/\s+/g, ' ').trim().slice(0, SUMMARY_MAX)
+
+// ---------------------------------------------------------------------------
+// Pure decision layer. Everything below this line up to `apply()` is a pure
+// function of its arguments — that is the only way to test push timing
+// without creating a real DSH session (workspace hard rule). See
+// test/push-policy.test.cjs.
+// ---------------------------------------------------------------------------
+
+// Model-facing TEXT of one assistant message: `type: 'text'` blocks only.
+// Reasoning arrives as `{ type: 'reasoning', text }` blocks on the very same
+// message (@deepseek-ai/dsh-llm ContentBlockMap) — taking every part that
+// happens to own a `.text` is what made DSH_PUSH_SUMMARY quote the model's
+// thinking instead of its answer.
+export function assistantText(message) {
+  const c = message && message.content !== undefined ? message.content : message
+  if (typeof c === 'string') return clip(c)
+  if (!Array.isArray(c)) return ''
+  const parts = []
+  for (const p of c) {
+    if (typeof p === 'string') parts.push(p)
+    else if (p && p.type === 'text' && typeof p.text === 'string') parts.push(p.text)
   }
-  return ''
+  return clip(parts.join(' '))
 }
 
-// Last `assistant/message` of the closing turn, from the session's
-// append-only event log (agent.session.events, see docs/subsystems/session).
-function turnSummary(payload) {
-  try {
-    const events = payload && payload.agent && payload.agent.session && payload.agent.session.events
-    if (!events || !events.length) return ''
-    for (let i = events.length - 1; i >= 0; i--) {
-      const ev = events[i]
-      if (ev && ev.type === 'assistant/message' && ev.data && (payload.turn === undefined || ev.data.turn === payload.turn)) {
-        return messageText(ev.data.message).replace(/\s+/g, ' ').trim().slice(0, 120)
-      }
+// Summary of the closing turn, from the session's append-only event log:
+// the LAST assistant message that produced real text, or — when the whole
+// turn was tool work with no prose — the last tool name. Never thinking text.
+export function turnSummary(events, turn) {
+  if (!Array.isArray(events)) return ''
+  let lastTool = ''
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]
+    if (!ev || !ev.data) continue
+    // Stop at the turn boundary instead of reaching back into older turns.
+    if (turn !== undefined && ev.data.turn !== undefined && ev.data.turn !== turn) break
+    if (ev.type === 'assistant/message') {
+      const text = assistantText(ev.data.message)
+      if (text) return text
+    } else if (!lastTool && ev.type === 'tool/call' && typeof ev.data.name === 'string') {
+      lastTool = ev.data.name
     }
-  } catch (e) { /* summary is best-effort */ }
-  return ''
+  }
+  return lastTool ? `最后执行了 ${lastTool}` : ''
 }
+
+// First question of an ask_user_question call, from the raw (unparsed)
+// arguments string the model produced. Best-effort: garbage in, '' out.
+export function pendingQuestionText(rawArguments) {
+  try {
+    const q = JSON.parse(String(rawArguments)).questions
+    return Array.isArray(q) && q[0] && typeof q[0].question === 'string' ? clip(q[0].question) : ''
+  } catch { return '' }
+}
+
+const skip = (reason) => ({ shouldNotify: false, title: '', body: '', reason })
+
+/**
+ * The whole notification policy, as one pure function.
+ *
+ * @param {object} input
+ *   kind            'turn-end' | 'approval' | 'question'
+ *   now             current epoch ms
+ *   lastSent        epoch ms of the previous push (0 for none)
+ *   delegationDepth session header's delegationDepth (undefined = top level)
+ *   summary         already-extracted turn summary  ('turn-end')
+ *   toolName        tool awaiting approval          ('approval')
+ *   question        pending question text           ('question')
+ * @param {object} cfg { turnEndEnabled, debounceMs, includeSummary }
+ * @returns {{shouldNotify: boolean, title: string, body: string, reason: string}}
+ */
+export function decideNotification(input, cfg) {
+  const debounced = (input.now - input.lastSent) < cfg.debounceMs
+
+  switch (input.kind) {
+    // Event leg. Exempt from the debounce on purpose: "a tool is waiting for
+    // your OK" is the one notification that must never be swallowed.
+    case 'approval':
+      return {
+        shouldNotify: true,
+        title: 'DSH 等你授权',
+        body: input.toolName ? `${input.toolName} 需要授权才能继续` : '有操作需要授权才能继续',
+        reason: 'approval-pending'
+      }
+    case 'question':
+      return {
+        shouldNotify: true,
+        title: 'DSH 等你回答',
+        body: (cfg.includeSummary && input.question) || '智能体提了一个问题，正在等你回答',
+        reason: 'question-pending'
+      }
+
+    // Turn end. Opt-in, top-level only, debounced.
+    case 'turn-end':
+      if (!cfg.turnEndEnabled) return skip('turn-end-disabled')
+      if ((input.delegationDepth ?? 0) !== 0) return skip('subagent')
+      if (debounced) return skip('debounced')
+      return { shouldNotify: true, title: 'DSH 任务完成', body: input.summary || '智能体已完成当前回合', reason: 'turn-end' }
+
+    default:
+      return skip('unknown-kind')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// push_notify (model leg)
+// ---------------------------------------------------------------------------
+
+// THE single source of "when should you notify me". Both the tool description
+// and the system-prompt reinforcement below embed this exact string, so the
+// two can never drift apart. Listing only the when-to-call half is what turns
+// push_notify into a per-turn reflex — the when-NOT-to half is load-bearing.
+export const PUSH_NOTIFY_GUIDANCE =
+  'Notify the user when: (1) they asked to be told once something is finished or a result is ready; ' +
+  '(2) you cannot go on without them — a question that needs answering, an operation that needs ' +
+  'authorization, a call only they can make; (3) something happened they almost certainly want to know ' +
+  'immediately — the task failed, or you hit a blocker you cannot route around. ' +
+  'Do NOT call this for: an ordinary end of turn, progress or status reports, intermediate milestones, ' +
+  'or anything you can keep making headway on by yourself. Finishing a turn is not by itself a reason ' +
+  'to buzz someone\'s phone.'
+
+const PUSH_NOTIFY_DESCRIPTION =
+  'Push a notification to the user\'s phone lock screen via the DSH mobile PWA. ' +
+  PUSH_NOTIFY_GUIDANCE +
+  ' Pushes are throttled (at most 1 per 60 seconds in this session, 20 total per hour across all sessions) ' +
+  'specifically to keep them meaningful; calling it too often gets it silently dropped instead of sent. ' +
+  '`title` must be a short, complete sentence that fits on one lock-screen line; `body` is optional extra ' +
+  'detail shown when the notification is expanded. Delivery is end-to-end encrypted (aes128gcm) — the push ' +
+  'provider (FCM/APNs/Mozilla) only ever sees ciphertext, and the only exposure is the phone\'s own lock ' +
+  'screen / notification center. Sends to every device the user has paired and subscribed; returns how many ' +
+  'actually received it, or throttled:true if the rate limit dropped the call before sending.'
+
+// Same guidance, restated as standing context: a tool description sitting far
+// up a long conversation gets diluted, and the failure mode that costs the
+// user is a model that quietly stops notifying at all.
+export const PUSH_NOTIFY_SECTION =
+  'Reaching the user away from the screen: this deployment can push to the user\'s phone lock screen ' +
+  'with the `push_notify` tool. ' + PUSH_NOTIFY_GUIDANCE +
+  ' The harness already pushes on its own whenever a tool is waiting for authorization or an ' +
+  '`ask_user_question` is unanswered, so you never need `push_notify` for those two.'
 
 // Rate limits for the push_notify tool. Fixed on purpose (not config knobs)
 // — these exist to keep pushes meaningful, not to be tuned per-deployment.
@@ -98,7 +231,7 @@ const PUSH_TOOL_GLOBAL_MAX = 20
 // Registers the push_notify model tool against ctx.tools, if present and not
 // disabled. Throttle state lives in this closure (fresh per apply() call, so
 // tests get isolated state without needing a fresh module import).
-function registerPushTool(ctx) {
+function registerPushTool(ctx, gate) {
   if (!PUSH_TOOL_ENABLED) {
     console.log('[dsh-zen-remote-push] push_notify disabled (DSH_PUSH_TOOL=0 / pushTool:false)')
     return
@@ -109,10 +242,22 @@ function registerPushTool(ctx) {
   // registered. inject() defers the callback until the service exists (the
   // same pattern vision-toolkit uses for webServer) and still degrades
   // gracefully: hosts without a tools service simply never fire it.
-  ctx.inject(['tools'], (toolsCtx) => registerPushToolWith(toolsCtx, toolsCtx.tools))
+  ctx.inject(['tools'], (toolsCtx) => registerPushToolWith(toolsCtx, toolsCtx.tools, gate))
+
+  // Standing reinforcement of the same guidance. Order 150 is the documented
+  // tool-guidance band (@deepseek-ai/dsh-system-prompt PromptSection.order).
+  ctx.inject(['systemPrompt'], (promptCtx) => {
+    if (!promptCtx.systemPrompt) return
+    try {
+      promptCtx.systemPrompt.section({ name: 'dsh-zen-remote-push', order: 150, text: PUSH_NOTIFY_SECTION })
+      console.log('[dsh-zen-remote-push] notification guidance added to the system prompt')
+    } catch (e) {
+      console.warn(`[dsh-zen-remote-push] cannot register prompt section: ${String(e && e.message || e)}`)
+    }
+  })
 }
 
-function registerPushToolWith(ctx, tools) {
+function registerPushToolWith(ctx, tools, gate) {
   if (!tools) {
     console.log('[dsh-zen-remote-push] "tools" service not present — push_notify not registered')
     return
@@ -134,7 +279,7 @@ function registerPushToolWith(ctx, tools) {
 
   ctx.effect(() => tools.register(defineTool({
     name: 'push_notify',
-    description: 'Push a notification to the user\'s phone lock screen via the DSH mobile PWA. Reserve this for moments that genuinely need the user\'s attention away from the screen: a decision is required to continue a long-running task, a significant milestone just completed, or an error needs human intervention before you can proceed. Do NOT call this for routine progress updates, minor sub-steps, or anything the user can find by just re-opening the chat — pushes are throttled (at most 1 per 60 seconds in this session, 20 total per hour across all sessions) specifically to keep them meaningful; calling it too often gets it silently dropped instead of sent. `title` must be a short, complete sentence that fits on one lock-screen line; `body` is optional extra detail shown when the notification is expanded. Delivery is end-to-end encrypted (aes128gcm) — the push provider (FCM/APNs/Mozilla) only ever sees ciphertext, and the only exposure is the phone\'s own lock screen / notification center. Sends to every device the user has paired and subscribed; returns how many actually received it, or throttled:true if the rate limit dropped the call before sending.',
+    description: PUSH_NOTIFY_DESCRIPTION,
     parameters: {
       title: {
         type: 'string',
@@ -176,6 +321,12 @@ function registerPushToolWith(ctx, tools) {
       const now = Date.now()
       if (isThrottled(sessionId, now)) return { delivered: 0, throttled: true }
       reserve(sessionId, now)
+      // Counts toward the shared debounce clock, so an automatic turn-end
+      // push landing right behind this one is suppressed. Not gated BY it:
+      // this leg's own 1-per-60s-per-session limit is already stricter than
+      // the 15s window, and stacking both would only make the tool lie about
+      // why it dropped a call.
+      gate.arm(now)
       try {
         const result = await sendPush(args.title, args.body)
         return { delivered: (result && typeof result.sent === 'number') ? result.sent : 0 }
@@ -188,26 +339,83 @@ function registerPushToolWith(ctx, tools) {
   console.log('[dsh-zen-remote-push] push_notify tool registered')
 }
 
-export function apply(ctx) {
-  let lastSent = 0
+// ---------------------------------------------------------------------------
 
-  const notify = (payload) => {
-    const now = Date.now()
-    if (now - lastSent < DEBOUNCE_MS) return
-    lastSent = now
-    const summary = INCLUDE_SUMMARY ? turnSummary(payload) : ''
+export function apply(ctx) {
+  const cfg = { turnEndEnabled: TURN_END_ENABLED, debounceMs: DEBOUNCE_MS, includeSummary: INCLUDE_SUMMARY }
+
+  // The one piece of mutable state: when the last push went out. Wrapped so
+  // every leg runs the same pure decision and shares the same debounce clock.
+  let lastSent = 0
+  const gate = {
+    decide(input) {
+      const decision = decideNotification({ ...input, now: Date.now(), lastSent }, cfg)
+      if (decision.shouldNotify) lastSent = Date.now()
+      return decision
+    },
+    arm(now) { lastSent = now }
+  }
+  const fire = (input) => {
+    const decision = gate.decide(input)
     // Best-effort; never raise into the host.
-    sendPush('DSH 任务完成', summary || '智能体已完成当前回合').catch(() => {})
+    if (decision.shouldNotify) sendPush(decision.title, decision.body).catch(() => {})
+    return decision
   }
 
+  // --- Turn-end leg (opt-in) -----------------------------------------------
+  const onTurnEnd = (payload) => {
+    const session = payload && payload.agent && payload.agent.session
+    const header = session && session.header
+    // An ABSENT delegationDepth on a PRESENT header means top level, and the
+    // decision function reads it that way. A missing header is a different
+    // thing entirely — "could not tell whose turn this was" — and passing its
+    // undefined through would be read as top level too, failing OPEN and
+    // letting subagent turn ends back in. Turn-end is the low-value leg, so
+    // when the session cannot be identified, stay quiet.
+    if (!header) return
+    fire({
+      kind: 'turn-end',
+      delegationDepth: header && header.delegationDepth,
+      summary: INCLUDE_SUMMARY ? turnSummary(session && session.events, payload && payload.turn) : ''
+    })
+  }
   for (const event of EVENTS) {
     try {
-      ctx.on(event, notify)
+      ctx.on(event, onTurnEnd)
     } catch (e) {
       console.warn(`[dsh-zen-remote-push] cannot listen on "${event}": ${String(e && e.message || e)}`)
     }
   }
-  console.log(`[dsh-zen-remote-push] listening for: ${EVENTS.join(', ')} (set DSH_PUSH_EVENTS to adjust)`)
 
-  registerPushTool(ctx)
+  // --- Event leg: approvals and questions ----------------------------------
+  // `session/event` is the post-commit append feed for EVERY session, subagent
+  // children included — those notify through here, they just never notify on
+  // turn end.
+  const armed = new Map() // ApprovalRequestId -> grace timer
+  try {
+    ctx.on('session/event', (_session, event) => {
+      if (!event || !event.data) return
+      if (event.type === 'approval/asked') {
+        const id = event.data.id
+        const toolName = event.data.toolName
+        const timer = setTimeout(() => {
+          armed.delete(id)
+          fire({ kind: 'approval', toolName })
+        }, APPROVAL_PENDING_MS)
+        if (typeof timer.unref === 'function') timer.unref()
+        armed.set(id, timer)
+      } else if (event.type === 'approval/decided') {
+        const timer = armed.get(event.data.id)
+        if (timer !== undefined) { clearTimeout(timer); armed.delete(event.data.id) }
+      } else if (event.type === 'tool/call' && event.data.name === ASK_USER_TOOL) {
+        fire({ kind: 'question', question: pendingQuestionText(event.data.arguments) })
+      }
+    })
+  } catch (e) {
+    console.warn(`[dsh-zen-remote-push] cannot listen on "session/event": ${String(e && e.message || e)}`)
+  }
+
+  console.log(`[dsh-zen-remote-push] approval/question notifications on; turn-end (${EVENTS.join(', ')}) ${TURN_END_ENABLED ? 'on' : 'off — set DSH_PUSH_TURN_END=1 to enable'}`)
+
+  registerPushTool(ctx, gate)
 }
