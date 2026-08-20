@@ -3,7 +3,7 @@
 
 <p align="center">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0B7285?style=flat-square" alt="MIT"></a>
-<img src="https://img.shields.io/badge/release-v1.0.0-5B4CF0?style=flat-square" alt="v1.0.0">
+<img src="https://img.shields.io/badge/release-v1.0.2-5B4CF0?style=flat-square" alt="v1.0.2">
 <img src="https://img.shields.io/badge/DSH-Web%20Profile-5B4CF0?style=flat-square" alt="DSH Web Profile">
 </p>
 
@@ -27,7 +27,7 @@ dsh plugin add dsh-zen-remote
 
 装完重启 `dsh web`，手机界面与网关一起生效，不需要再手写任何配置行。
 
-> 兼容性：在 DSH `0.1.0-rc.6`（web profile）上开发并实测，最后验证 2026-08-18。
+> 兼容性：在 DSH `0.1.0-rc.7`（web profile）上开发并实测，最后验证 2026-08-20。
 
 卸载：`dsh plugin remove dsh-zen-remote`（或从 profile 的 `dependencies` 与 `bundles` 里删掉那两行），重启 `dsh web` 即恢复原状；要清掉配对数据再删 `~/.dsh/lan-gate-state.json` 与 `~/.dsh/lan-gate.config.json`。
 
@@ -39,7 +39,7 @@ dsh plugin add dsh-zen-remote
 ```jsonc
 {
   "dependencies": {
-    "dsh-zen-remote": "^1.0.0"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^1.0.2"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
   },
   "dsh": { "profile": { "bundles": [
     "@deepseek-ai/dsh-base",
@@ -220,11 +220,11 @@ open http://127.0.0.1:3088/lan-gate/admin
 
 | 插件 | 移动端适配内容 | 实测版本 |
 | --- | --- | --- |
-| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 会话页头部提供工作台入口按钮；面板变手机全宽抽屉并避让刘海安全区；底部居中的关闭按钮 | 0.12.2 |
-| [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | AgentTeams 活动浮层挪到会话头部下方（原位置压住头部按钮）、会话列表页自动隐藏；子代理会话头部保留可点的父会话标题，一键切回主会话 | 0.1.6 |
-| [dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | 用量与余额入口收进主屏 chips 行 | — |
-| [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | 定时任务入口收进主屏 chips 行 | 0.2.0 |
-| dsh-at-file | @文件引用，配合附件上传的 `@` 路径引用使用 | — |
+| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 会话页头部提供工作台入口按钮；面板变手机全宽抽屉并避让刘海安全区；底部居中的关闭按钮 | 0.14.0 |
+| [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | AgentTeams 活动浮层挪到会话头部下方（原位置压住头部按钮）、会话列表页自动隐藏；子代理会话头部保留可点的父会话标题，一键切回主会话 | 0.1.7 |
+| [dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | 用量与余额入口收进主屏 chips 行 | 0.2.5 |
+| [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | 定时任务入口收进主屏 chips 行 | 0.2.2 |
+| dsh-at-file | @文件引用，配合附件上传的 `@` 路径引用使用 | 0.6.5 |
 | [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit) | 图像 Q&A/OCR，配合手机端附件上传使用 | — |
 | [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all) | 沿用上游 dsh-web-mobile 的兼容规则（文件树 / 预览浮层限宽居中等） | — |
 

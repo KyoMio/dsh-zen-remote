@@ -286,6 +286,31 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     padding: 0 10px !important;
     font-size: 11.5px !important;
   }
+  /* --- 7a. the native to-do card opts OUT of the 26px pill cage ---
+     conversation.input.dock is not only a chip rail: DSH's own TodoPanel
+     (dsh-client-ui-conversation) registers here, and it is an expandable
+     card, not a pill — tapping its header renders the to-do list INSIDE
+     itself. The cage's max-height:26px + overflow:hidden left that list
+     rendered but clipped to nothing, so on a phone the bar looked dead:
+     aria-expanded flipped, 8 rows mounted at 216px, and the card still
+     painted 26px tall (measured live, 2026-08-20). Give it the official
+     geometry back — full row, natural height, 12px radius. Its list caps
+     itself at 180px with its own scroller, so this cannot run into the
+     composer. Anchored on the official data-testid, a stable contract
+     marker rather than a hashed class name. */
+  [data-slot="conversation.input.dock"] > [data-testid="todo-panel"] {
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    border-radius: 12px !important;
+    /* The cage shrinks dock text to 11.5px/18px; the card's rows inherit it
+       and turn cramped. Restore the official 13px body scale. */
+    font-size: 13px !important;
+    line-height: normal !important;
+  }
 
   /* --- 7b. attachment chips (S7.1) ---
      Our own dock entry opts OUT of the 26px pill cage above: an image chip is

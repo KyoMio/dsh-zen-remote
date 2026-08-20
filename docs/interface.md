@@ -42,7 +42,8 @@ v1.0.0（fork 自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-
 
 - 底排控件全部图标化（附件 · 权限 · 模型 · 上下文环 · 发送），不再是挤在一起的文字按钮；
 - 权限、模型这两个官方弹出菜单被 CSS 整成从底部升起的 sheet 样式（结构还是官方的，只换了皮肤）；
-- 分支/Todo 这类 mini chips 挪到输入卡外上方；
+- `conversation.input.dock` 里的入口（git 分支等）压成一行可横滚的 mini chips，挪到输入卡外上方；
+- 例外是 DSH 原生的待办卡片（`data-testid="todo-panel"`）：它不是 chip 而是可就地展开的卡片，因此单独豁免出 26px 胶囊笼子，保持整行宽度与自然高度——展开后的列表由官方自己限高 180px 并内部滚动，不会顶到输入框；
 - composer 顶部不画分割线，改用渐变 mask——消息滚动到顶部/底部时自然淡入淡出，比一条硬边界更贴近原生 app。
 
 ### 会话信息卡
@@ -92,6 +93,25 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 | ≥ 1024px（桌面） | 严格 no-op，逐像素与未安装时一致 |
 
 ## 更新日志
+
+> 小节标题用的是手机端界面的代次（v2.0 = app 化重写），与 npm 包版本号（当前
+> `1.0.2`）不是同一条线。
+
+### 未发布
+
+**修复**
+
+- DSH 原生待办卡片在手机端点了没反应：`conversation.input.dock` 的 mini chip
+  规则给槽内所有条目套了 `max-height: 26px` + `overflow: hidden`，而官方待办
+  是就地展开的卡片而非 chip。展开动作其实一直是成功的（`aria-expanded` 翻了、
+  8 行待办以 216px 挂载完毕），只是整张卡被剪在 26px 里，看上去像点不动。已按
+  `data-testid="todo-panel"` 单独豁免（2026-08-20 真机视口实测）。
+
+**内部**
+
+- 构建与实测基准从 DSH `0.1.0-rc.6` 升到 `0.1.0-rc.7`（peer 与 dev 依赖同步）；
+- README 的 release 徽章与依赖示例改由 `scripts/sync-doc-version.mjs` 跟着
+  `package.json` 走，挂在 `version` 生命周期脚本上，`pnpm test` 里带一致性检查。
 
 ### v2.0.0
 
@@ -161,11 +181,11 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 ## 兼容插件
 
-- [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)(移动端全宽抽屉,本插件在会话页头部给它留入口位)——本机实测 **0.12.2**
-- [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams)(AgentTeams 活动浮层:手机端挪到会话头部下方、避开安全区,会话列表页隐藏;子代理会话头部保留可点的父会话面包屑用于切回)——本机实测 **0.1.6**
-- [dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats)(用量与余额,主屏 chips 行可直接打开)
-- [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins)(定时任务,主屏 chips 行自动收割入口)——本机实测 **0.2.0**
-- dsh-at-file(@文件引用)
+- [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)(移动端全宽抽屉,本插件在会话页头部给它留入口位)——本机实测 **0.14.0**
+- [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams)(AgentTeams 活动浮层:手机端挪到会话头部下方、避开安全区,会话列表页隐藏;子代理会话头部保留可点的父会话面包屑用于切回)——本机实测 **0.1.7**
+- [dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats)(用量与余额,主屏 chips 行可直接打开)——本机实测 **0.2.5**
+- [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins)(定时任务,主屏 chips 行自动收割入口)——本机实测 **0.2.2**
+- dsh-at-file(@文件引用)——本机实测 **0.6.5**
 - [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit)(图像 Q&A/OCR,配合手机端附件上传使用)
 - [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all)(文件树 / 预览 / 任务看板 / SSH / 宠物 / 会话统计 / 远程配对 / 设置)——沿用上游兼容规则,本次未扩展
 

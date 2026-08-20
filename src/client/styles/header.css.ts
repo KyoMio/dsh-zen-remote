@@ -266,6 +266,15 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   [data-phase] header [data-slot="conversation.session.header.utilities"] > * {
     display: none !important;
   }
+  /* Native DSH task surfaces are real header actions, not phone-shell
+     controls. Keep their roots visible so the background-task and subagent
+     menus can still be opened on a phone. Restore the root's containing block
+     as well: both native menus are absolutely positioned from this element,
+     and layout.css.ts's compact-header rule otherwise changes it to static. */
+  [data-phase] header [data-slot="conversation.session.header.actions"] > [class$="_root"]:has(> button[class$="_trigger"]) {
+    display: block !important;
+    position: relative !important;
+  }
   /* The agent-preset mode badge specifically survives the blanket hide
      above: layout.css.ts's shared <=1023px block targets it directly
      (header [class$="_label"]:has(> svg) { display: block !important }),
