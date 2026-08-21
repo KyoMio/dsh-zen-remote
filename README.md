@@ -191,6 +191,16 @@ open http://127.0.0.1:3088/lan-gate/admin
 
 上传大小上限（默认 20MB）在插件行的 `config.maxUploadBytes` 里改。
 
+想在电脑端也启用回合过程折叠（默认只在手机宽度生效），在插件行的 `config.turnFoldDesktop` 里设 `true`——即在 profile 的 `cordis.patch.yml` 加一条：
+
+```yaml
+- id: dsh-zen-remote
+  config:
+    turnFoldDesktop: true
+```
+
+改完重启 `dsh web`。不改服务端配置的话，单个浏览器也可以访问一次 `?mobile-nav-turn-fold=1` 自己开启（`=0` 关闭，按浏览器记忆）。
+
 ---
 
 ## 通知什么时候会响

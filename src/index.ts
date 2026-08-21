@@ -26,6 +26,11 @@ import type {} from '@deepseek-ai/dsh-session'
 /** Exact route the phone composer POSTs one file body to. */
 export const UPLOAD_ROUTE = '/_dsh/mobile-nav/upload'
 
+/** Exact route the browser GETs the plugin row's client-facing knobs from.
+ * The client bundle ships statically and never sees the row config, so the
+ * host republishes the client-relevant subset here (issue #2). */
+export const CLIENT_CONFIG_ROUTE = '/_dsh/mobile-nav/client-config'
+
 /** Workspace-relative directory uploads land in (also the `@` prefix the composer inserts). */
 export const UPLOAD_DIR = '.dsh-uploads'
 
@@ -38,10 +43,14 @@ const MAX_NAME_BYTES = 180
 /** Distinct leaf names tried before a collision is given up on. */
 const MAX_COLLISION_TRIES = 100
 
-/** Host half config; the only knob is the body cap. */
+/** Host half config. */
 export interface MobileNavConfig {
   /** Max upload body in bytes; larger bodies get 413. Default {@link DEFAULT_MAX_UPLOAD_BYTES}. */
   maxUploadBytes?: number
+  /** Fold each turn's process at every viewport width, not just below the
+   * phone breakpoint. Default false (phone-only). A browser can still opt
+   * itself in via `?mobile-nav-turn-fold=1` when this is off. */
+  turnFoldDesktop?: boolean
 }
 
 /**
@@ -339,5 +348,21 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       path: UPLOAD_ROUTE,
       handler: (req, res) => handleUpload(webCtx, maxBytes, req, res),
     }), 'dsh-mobile-nav: upload route')
+  })
+  // Needs only the webServer: the client-config route must exist even in a
+  // composition without live sessions.
+  ctx.inject(['webServer'], (webCtx) => {
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: CLIENT_CONFIG_ROUTE,
+      handler: (req, res) => {
+        if (req.method !== 'GET') {
+          res.setHeader('Allow', 'GET')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
+          return
+        }
+        responseJson(res, 200, { turnFoldDesktop: config.turnFoldDesktop === true })
+      },
+    }), 'dsh-mobile-nav: client config route')
   })
 }

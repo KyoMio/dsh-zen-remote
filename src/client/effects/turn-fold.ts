@@ -4,6 +4,41 @@ import { NS } from '../locales.ts'
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
 const PHONE_QUERY = '(max-width: 767px)'
 
+/** Desktop fold (issue #2) is switched on either way:
+ * - plugin row `config.turnFoldDesktop: true` — the host republishes it at
+ *   {@link CLIENT_CONFIG_ROUTE} because the client bundle ships statically
+ *   and never sees the row config;
+ * - per-browser override, same convention as the debug flag: a URL param
+ *   writes localStorage (`?mobile-nav-turn-fold=1` opts this browser in,
+ *   `=0` opts back out). */
+const DESKTOP_KEY = 'dsh-mobile-nav.turn-fold-desktop'
+const DESKTOP_PARAM = 'mobile-nav-turn-fold'
+/** Root attribute the stylesheet keys the width-independent rules on. */
+const DESKTOP_ATTR = 'data-mnav-desktop-fold'
+/** Mirror of src/index.ts CLIENT_CONFIG_ROUTE (client tsconfig cannot reach it). */
+const CLIENT_CONFIG_ROUTE = '/_dsh/mobile-nav/client-config'
+
+/** Read (and, when the URL param is present, persist) the per-browser opt-in. */
+function desktopOptIn(): boolean {
+  const param = new URLSearchParams(location.search).get(DESKTOP_PARAM)
+  if (param === '1') localStorage.setItem(DESKTOP_KEY, '1')
+  else if (param === '0') localStorage.removeItem(DESKTOP_KEY)
+  return localStorage.getItem(DESKTOP_KEY) === '1'
+}
+
+/** True when the plugin row asks for desktop fold; false on any failure. */
+async function desktopConfigured(): Promise<boolean> {
+  try {
+    const res = await fetch(CLIENT_CONFIG_ROUTE, { cache: 'no-store' })
+    if (!res.ok) return false
+    const body: unknown = await res.json()
+    return typeof body === 'object' && body !== null
+      && (body as { turnFoldDesktop?: unknown }).turnFoldDesktop === true
+  } catch {
+    return false
+  }
+}
+
 /** ChatView's flow column (dsh-client-ui-conversation lib/client.js:5512).
  * Trajectory and every other view render their own tree and never carry this
  * marker, so scoping here is what keeps this effect Chat-only. */
@@ -116,7 +151,9 @@ function groupsOf(flow: Element): readonly Group[] {
 }
 
 /**
- * S8 — collapse a turn's process into one summary row (< 768px only).
+ * S8 — collapse a turn's process into one summary row (< 768px by default;
+ * every width when the plugin row sets `config.turnFoldDesktop` or a browser
+ * opts itself in via `?mobile-nav-turn-fold=1`).
  *
  * Route taken: DOM marking, not the `conversation.chat.node` keyed slot.
  * That slot dispatches on node kind and a second registration at a key
@@ -258,12 +295,32 @@ export function installTurnFold(ctx: ClientContext): void {
       clear()
     }
 
-    if (narrow.matches) attach()
     const onChange = (event: MediaQueryListEvent): void => (event.matches ? attach() : detach())
+    let disposed = false
+    let desktop = false
+    /** Attach at every width and drop the breakpoint listener — the
+     * stylesheet's html[DESKTOP_ATTR] rules take over from the phone media
+     * query. Idempotent: the config answer and the local opt-in may both
+     * ask for it. */
+    const enableDesktop = (): void => {
+      if (desktop || disposed) return
+      desktop = true
+      document.documentElement.setAttribute(DESKTOP_ATTR, '')
+      narrow.removeEventListener('change', onChange)
+      attach()
+    }
+
+    if (narrow.matches) attach()
     narrow.addEventListener('change', onChange)
+    if (desktopOptIn()) enableDesktop()
+    // The row config arrives async; a late enable just attaches then. Not
+    // awaited before phone attach — folding must not wait on a round-trip.
+    else void desktopConfigured().then((on) => (on ? enableDesktop() : undefined))
     // A language switch changes the chip copy of every already-rendered turn.
     const stopLocale = ctx.locale.subscribe(schedule)
     return () => {
+      disposed = true
+      document.documentElement.removeAttribute(DESKTOP_ATTR)
       narrow.removeEventListener('change', onChange)
       stopLocale()
       detach()
