@@ -1,4 +1,18 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+/** The safety pad this platform gets: the clearance above, or nothing off
+ * Android. UA sniffing is the right tool here — the target is a platform
+ * defect, not a feature that could be detected. */
+export declare function safetyPad(userAgent: string): number;
+/**
+ * Fallback lift for a keyboard the browser cannot see (issue #1 确诊根因:
+ * 微信输入法在该设备上不向系统 insets 上报键盘高度, Chrome 键盘高度恒 0).
+ * There is no signal to measure, so this is an estimate: the reporter's
+ * measured WeType is ~315 CSS px on a 858px viewport (~37%); 42% capped at
+ * 400px covers taller IME toolbars without stranding the composer mid-screen.
+ * ponytail: single heuristic constant; per-IME calibration only if reports
+ * show it misses.
+ */
+export declare function estimatedLift(innerHeight: number): number;
 /** One visualViewport reading, in CSS pixels. */
 export interface ViewportReading {
     /** Layout viewport height (window.innerHeight). */
@@ -27,6 +41,17 @@ export interface ViewportReading {
  */
 export declare function keyboardLift(reading: ViewportReading): number;
 /**
+ * The lift the composer actually gets, from the three sources in priority
+ * order.
+ * @param geometric - {@link keyboardLift} of the current reading.
+ * @param estimate - the dumb-keyboard estimate, 0 when not in that mode.
+ * @param keyboardShrunk - the viewport lost {@link KEYBOARD_MIN_SHRINK_PX}
+ *   or more against its no-keyboard baseline, i.e. the browser reacted.
+ * @param pad - this platform's safety clearance, from {@link safetyPad}.
+ * @returns pixels to translate the composer up by.
+ */
+export declare function composerLift(geometric: number, estimate: number, keyboardShrunk: boolean, pad: number): number;
+/**
  * S10 — keep the composer above the software keyboard (< 768px).
  *
  * The shell deliberately relies on the browser's own focus-reveal behaviour
@@ -36,13 +61,32 @@ export declare function keyboardLift(reading: ViewportReading): number;
  * is the increment that covers it: mirror the occluded band into a root CSS
  * variable, and let the stylesheet translate the composer up by it. In every
  * environment where the browser already handles the keyboard the band
- * computes to zero and nothing changes; if the IME reports no height at all
- * (the research's候选 1/2) no event fires and this is inert — that class
- * needs the polling fallback, deliberately not built until confirmed.
+ * computes to zero and nothing changes.
  *
  * `scroll` is listened to as well as `resize`: panning the visual viewport
  * changes offsetTop without a resize (CSSOM View §13.2), and both sides of
  * the subtraction must stay fresh.
+ *
+ * Second layer (2026-08-21, after on-device confirmation): the reporter's
+ * 小米 + 微信输入法 keyboard is INVISIBLE to Chrome — vv.height stayed 859/858
+ * with the keyboard open, so no event ever fires and the geometry above is
+ * honestly zero. For that class only, a touch-granted composer focus starts a
+ * short probe; if the viewport has not moved at all by the end, the composer
+ * gets an ESTIMATED lift until blur. Guards against false positives:
+ * - probe only after a recent touch pointerdown (a hardware-keyboard focus
+ *   never lifts anything);
+ * - any viewport movement ≥ {@link PROBE_EPSILON_PX} cancels the probe — a
+ *   browser that shows any reaction owns the reveal itself (iOS pans,
+ *   working Android resizes);
+ * - a non-zero geometric lift always wins over the estimate.
+ *
+ * Third layer: an IME that under-reports its height (toolbar strip left out
+ * of what it declares) makes the browser shrink the viewport by less than the
+ * keyboard covers — every number the page can read is self-consistent, so no
+ * occlusion is computable. Whenever a keyboard is up and the browser DID
+ * react, the composer therefore also gets {@link safetyPad} of clearance —
+ * Android only, where the under-reporting happens.
+ * See {@link composerLift} for how the three sources compose.
  */
 export declare function installKeyboardAvoid(ctx: ClientContext): void;
 //# sourceMappingURL=keyboard-avoid.d.ts.map

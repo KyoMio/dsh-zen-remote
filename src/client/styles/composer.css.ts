@@ -520,8 +520,12 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      a resting transform, even translateY(0), would silently become the
      containing block for any fixed-position descendant of the bar. In every
      environment where the browser's own focus-reveal works the attribute is
-     simply never set. */
-  html[data-mnav-kb] [data-slot="conversation.composer.bar"] {
+     simply never set.
+     The target is the slot's _root CHILD, not the slot wrapper: the wrapper
+     is display:contents — it generates no box, so a transform on it is a
+     silent no-op (found live on-device via CDP, 2026-08-21; the variable and
+     attribute were set and nothing moved). */
+  html[data-mnav-kb] [data-slot="conversation.composer.bar"] > [class$="_root"] {
     transform: translateY(calc(-1 * var(--mnav-kb-lift, 0px)));
   }
 }

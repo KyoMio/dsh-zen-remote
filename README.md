@@ -282,6 +282,8 @@ open http://127.0.0.1:3088/lan-gate/admin
 
 **iOS 26.x 独立 PWA 视口缩水**：加到主屏后视口底部会少掉一条状态栏高度，普通 Safari 标签页正常。这是 iOS 系统缺陷，缺掉的区域在文档之外，CSS 够不着；本插件做了三层缓解（浅色 manifest 背景 + 安全区补偿 + 强制重排），能减轻但不保证复原。彻底恢复只能整个 App 退出重开。
 
+**个别环境软键盘对浏览器完全不可见，输入框抬升靠估算兜底**：部分组合（实测过：某些第三方输入法 + Chrome；小米浏览器安装的 PWA 壳）里，键盘弹出/收起时系统不把键盘高度告知页面——视口不变、无任何事件（visualViewport、VirtualKeyboard API 一并失效，均已实测排除）。插件的兜底是：聚焦后探测约 1.2 秒，判定「键盘不可见」就按估计高度抬升输入框（判定按浏览器记忆，之后聚焦即时抬升）。代价有两条：抬升高度是估算的，可能与实际键盘有几十像素出入；键盘收起同样无信号，输入框要等你点击或滑动输入框以外的区域才回落。正常环境完全不走这条路径，不受影响。
+
 **经反代访问时设置页打不开（插件配置列表空白、模型卡片报「settings are unavailable in this browser」）**：直连 `127.0.0.1:3080/3088` 正常。
 
 根因是 DSH 官方的设计，不在网关：设置类 RPC **只对回环连接开放**。客户端按 `location.hostname` 判定（`dsh-client-connection` 的 `isLoopback`），非回环时 `dsh-client-ui-settings` 把持久化降级为 `memory`，设置镜像初始状态就是 `unavailable`——官方源码注释原话是「remote browsers remain process-local because settings RPCs are loopback-only」。所有依赖这个镜像的卡片（模型、插件配置）因此一起空白，与本插件、与 service worker 缓存都无关（2026-08-20 真机 USB 调试 + 本机对照实测）。
