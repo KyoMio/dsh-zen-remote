@@ -18,6 +18,7 @@ import { installTurnFold } from './effects/turn-fold.ts'
 import { installModalBack } from './effects/modal-back.ts'
 import { installWelcomeNoticeOptOut } from './effects/welcome-notice.ts'
 import { installKeyboardGuard } from './effects/keyboard-guard.ts'
+import { installKeyboardAvoid } from './effects/keyboard-avoid.ts'
 import { NS, en, zh } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 
@@ -91,6 +92,11 @@ export function apply(ctx: ClientContext): void {
   // composer autofocuses on every sessionId change; keep focus only when the
   // user tapped the composer (or typed) themselves.
   installKeyboardGuard(ctx)
+
+  // S10: when the keyboard shrinks the visual viewport but the browser fails
+  // to reveal the focused composer (issue #1 的「视口缩了页面没跟上」类环境),
+  // translate the composer up by the occluded band. Inert everywhere else.
+  installKeyboardAvoid(ctx)
 
   // Page-stack store (apply world) — created before any registration so
   // every slot below (the phone home screen, the session header's back

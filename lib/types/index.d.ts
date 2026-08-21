@@ -18,14 +18,22 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
 /** Exact route the phone composer POSTs one file body to. */
 export declare const UPLOAD_ROUTE = "/_dsh/mobile-nav/upload";
+/** Exact route the browser GETs the plugin row's client-facing knobs from.
+ * The client bundle ships statically and never sees the row config, so the
+ * host republishes the client-relevant subset here (issue #2). */
+export declare const CLIENT_CONFIG_ROUTE = "/_dsh/mobile-nav/client-config";
 /** Workspace-relative directory uploads land in (also the `@` prefix the composer inserts). */
 export declare const UPLOAD_DIR = ".dsh-uploads";
 /** Body cap when the plugin row sets no `maxUploadBytes`. */
 export declare const DEFAULT_MAX_UPLOAD_BYTES: number;
-/** Host half config; the only knob is the body cap. */
+/** Host half config. */
 export interface MobileNavConfig {
     /** Max upload body in bytes; larger bodies get 413. Default {@link DEFAULT_MAX_UPLOAD_BYTES}. */
     maxUploadBytes?: number;
+    /** Fold each turn's process at every viewport width, not just below the
+     * phone breakpoint. Default false (phone-only). A browser can still opt
+     * itself in via `?mobile-nav-turn-fold=1` when this is off. */
+    turnFoldDesktop?: boolean;
 }
 /**
  * Accept a state-changing request only from this DSH Web application's origin.

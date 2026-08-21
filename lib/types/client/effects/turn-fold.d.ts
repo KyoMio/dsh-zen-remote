@@ -1,6 +1,8 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
 /**
- * S8 — collapse a turn's process into one summary row (< 768px only).
+ * S8 — collapse a turn's process into one summary row (< 768px by default;
+ * every width when the plugin row sets `config.turnFoldDesktop` or a browser
+ * opts itself in via `?mobile-nav-turn-fold=1`).
  *
  * Route taken: DOM marking, not the `conversation.chat.node` keyed slot.
  * That slot dispatches on node kind and a second registration at a key

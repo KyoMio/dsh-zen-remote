@@ -513,6 +513,17 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   [data-slot="conversation.composer.bar"] > [class$="_root"] {
     padding-bottom: clamp(8px, var(--mnav-sab), 16px) !important;
   }
+
+  /* S10 keyboard avoid: effects/keyboard-avoid.ts mirrors the band of the
+     layout viewport hidden behind the software keyboard into --mnav-kb-lift
+     and stamps the html attribute while (and only while) it is non-zero —
+     a resting transform, even translateY(0), would silently become the
+     containing block for any fixed-position descendant of the bar. In every
+     environment where the browser's own focus-reveal works the attribute is
+     simply never set. */
+  html[data-mnav-kb] [data-slot="conversation.composer.bar"] {
+    transform: translateY(calc(-1 * var(--mnav-kb-lift, 0px)));
+  }
 }
 
 /* The attachment button and its preview row only exist for the phone shell.
