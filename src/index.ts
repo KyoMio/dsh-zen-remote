@@ -51,6 +51,35 @@ export interface MobileNavConfig {
    * phone breakpoint. Default false (phone-only). A browser can still opt
    * itself in via `?mobile-nav-turn-fold=1` when this is off. */
   turnFoldDesktop?: boolean
+  /** Calibration for the composer lift used when a phone's keyboard is
+   * invisible to the browser (src/client/effects/keyboard-avoid.ts). Leave
+   * every one of these unset to keep the shipped estimate — the route omits
+   * what the row never set, and the client half owns the defaults, so there
+   * is one place each default is written.
+   *
+   * Share of the layout viewport the estimated lift starts from (shipped
+   * 0.42). Clamped to 0-1. */
+  keyboardLiftRatio?: number
+  /** Ceiling on that estimate in CSS pixels (shipped 400). Clamped to 0-2000. */
+  keyboardLiftMaxPx?: number
+  /** Extra clearance above a keyboard the browser DID react to, Android only
+   * (shipped 15). Clamped to 0-200. */
+  keyboardSafetyPadPx?: number
+}
+
+/**
+ * One configured number on its way to the browser, clamped into a band that
+ * cannot break the composer — a ratio of 5 or a 9000px lift would push the
+ * input clean off the screen with no way back except editing the YAML again.
+ * Absent from the result when the row left it unset or wrote something that
+ * is not a finite number, which leaves the client on its shipped default.
+ *
+ * Exported for scripts/check-keyboard-avoid.mjs — this is the trust boundary
+ * between a hand-edited YAML row and the browser, so it is asserted directly.
+ */
+export function clamped(key: string, value: number | undefined, min: number, max: number): Record<string, number> {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return {}
+  return { [key]: Math.min(Math.max(value, min), max) }
 }
 
 /**
@@ -361,7 +390,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
           return
         }
-        responseJson(res, 200, { turnFoldDesktop: config.turnFoldDesktop === true })
+        responseJson(res, 200, {
+          turnFoldDesktop: config.turnFoldDesktop === true,
+          ...clamped('keyboardLiftRatio', config.keyboardLiftRatio, 0, 1),
+          ...clamped('keyboardLiftMaxPx', config.keyboardLiftMaxPx, 0, 2000),
+          ...clamped('keyboardSafetyPadPx', config.keyboardSafetyPadPx, 0, 200),
+        })
       },
     }), 'dsh-mobile-nav: client config route')
   })

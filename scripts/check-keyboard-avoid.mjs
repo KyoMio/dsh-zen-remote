@@ -5,6 +5,8 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { composerLift, estimatedLift, keyboardLift as lift, safetyPad } from '../src/client/effects/keyboard-avoid.ts'
+import { KEYBOARD_DEFAULTS, parseClientConfig } from '../src/client/client-config.ts'
+import { clamped } from '../src/index.ts'
 
 // The reported class of bug: keyboard shrinks the visual viewport, browser
 // does not pan it — the whole shrink is an occluded band at the bottom.
@@ -87,5 +89,42 @@ assert.match(
   /html\[data-mnav-kb\] \[data-slot="conversation\.composer\.bar"\] > \[class\$="_root"\]\s*\{\s*transform/,
   'keyboard-avoid transform must hit the box-generating _root child',
 )
+
+// --- the tuning knobs (2026-08-22) -----------------------------------------
+// The two estimates above are guesses about someone else's hardware, so the
+// plugin row can retune them. What must hold: an install that sets nothing
+// behaves EXACTLY as it did before the knobs existed, and a set value cannot
+// push the composer somewhere there is no way back from.
+
+// Shipped defaults are the values the assertions above were written against.
+assert.deepEqual(KEYBOARD_DEFAULTS, { liftRatio: 0.42, liftMaxPx: 400, safetyPadPx: 15 })
+assert.equal(estimatedLift(858, KEYBOARD_DEFAULTS), estimatedLift(858), 'defaults are the no-config path')
+assert.equal(safetyPad(ANDROID, KEYBOARD_DEFAULTS.safetyPadPx), safetyPad(ANDROID))
+
+// A retuned row moves both halves of the estimate, and the pad.
+assert.equal(estimatedLift(700, { liftRatio: 0.5, liftMaxPx: 400, safetyPadPx: 15 }), 350)
+assert.equal(estimatedLift(858, { liftRatio: 0.5, liftMaxPx: 500, safetyPadPx: 15 }), 429)
+assert.equal(estimatedLift(858, { liftRatio: 0.5, liftMaxPx: 380, safetyPadPx: 15 }), 380, 'cap still wins')
+assert.equal(safetyPad(ANDROID, 40), 40)
+assert.equal(safetyPad(IPHONE, 40), 0, 'a configured pad stays Android-only')
+
+// An empty / failed / garbage route body leaves every default in place — the
+// client half is where the defaults live, so this is the whole contract.
+for (const body of [undefined, null, {}, 'not json', { keyboardLiftRatio: 'big' }, { keyboardLiftRatio: NaN }]) {
+  assert.deepEqual(parseClientConfig(body).keyboard, KEYBOARD_DEFAULTS, `body ${JSON.stringify(body) ?? 'undefined'} keeps defaults`)
+}
+assert.equal(parseClientConfig({ keyboardLiftRatio: 0.5 }).keyboard.liftRatio, 0.5)
+assert.equal(parseClientConfig({ keyboardSafetyPadPx: 0 }).keyboard.safetyPadPx, 0, 'zero is a real value, not "unset"')
+assert.equal(parseClientConfig({ turnFoldDesktop: true }).turnFoldDesktop, true)
+
+// The host clamps before publishing: a typo in the YAML must not be able to
+// push the composer off-screen with no way back except editing the YAML.
+assert.deepEqual(clamped('keyboardLiftRatio', 5, 0, 1), { keyboardLiftRatio: 1 })
+assert.deepEqual(clamped('keyboardLiftRatio', -2, 0, 1), { keyboardLiftRatio: 0 })
+assert.deepEqual(clamped('keyboardLiftMaxPx', 9000, 0, 2000), { keyboardLiftMaxPx: 2000 })
+assert.deepEqual(clamped('keyboardLiftRatio', undefined, 0, 1), {}, 'unset stays absent so the client default wins')
+for (const bad of [Number.NaN, Infinity, '0.5', null]) {
+  assert.deepEqual(clamped('keyboardLiftRatio', bad, 0, 1), {}, `${String(bad)} is not a number`)
+}
 
 console.log('KEYBOARD AVOID CHECK OK')

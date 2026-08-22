@@ -1,4 +1,5 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import { clientConfig, KEYBOARD_DEFAULTS, type KeyboardTuning } from '../client-config.ts'
 
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
 const PHONE_QUERY = '(max-width: 767px)'
@@ -27,14 +28,19 @@ const MAX_SCALE = 1.01
  *
  * ANDROID ONLY ({@link safetyPad}). The under-reporting is an Android IME
  * behaviour; iOS has one system keyboard whose height WebKit reports exactly,
- * so padding there would be a visible gap bought for nothing. */
-const SAFETY_PAD_PX = 15
+ * so padding there would be a visible gap bought for nothing.
+ *
+ * The 15px default is what shipped; a device whose IME hides more of the
+ * composer than that can raise it through the plugin row's
+ * `config.keyboardSafetyPadPx` ({@link KeyboardTuning}). */
+const SAFETY_PAD_PX = KEYBOARD_DEFAULTS.safetyPadPx
 
-/** The safety pad this platform gets: the clearance above, or nothing off
- * Android. UA sniffing is the right tool here — the target is a platform
- * defect, not a feature that could be detected. */
-export function safetyPad(userAgent: string): number {
-  return /Android/iu.test(userAgent) ? SAFETY_PAD_PX : 0
+/** The safety pad this platform gets: the configured clearance, or nothing
+ * off Android. UA sniffing is the right tool here — the target is a platform
+ * defect, not a feature that could be detected.
+ * @param padPx - the row's clearance; defaults to the shipped 15px. */
+export function safetyPad(userAgent: string, padPx: number = SAFETY_PAD_PX): number {
+  return /Android/iu.test(userAgent) ? padPx : 0
 }
 
 /** A viewport that lost at least this much against its no-keyboard baseline
@@ -66,11 +72,16 @@ const PROBE_EPSILON_PX = 8
  * There is no signal to measure, so this is an estimate: the reporter's
  * measured WeType is ~315 CSS px on a 858px viewport (~37%); 42% capped at
  * 400px covers taller IME toolbars without stranding the composer mid-screen.
- * ponytail: single heuristic constant; per-IME calibration only if reports
- * show it misses.
+ *
+ * Both numbers are a guess about someone else's hardware, so both are knobs:
+ * `config.keyboardLiftRatio` / `config.keyboardLiftMaxPx` on the plugin row
+ * ({@link KeyboardTuning}). The shipped pair stays the default — an install
+ * that never touches them behaves exactly as before.
+ *
+ * @param tuning - the row's tuning; defaults to the shipped estimate.
  */
-export function estimatedLift(innerHeight: number): number {
-  return Math.min(Math.round(innerHeight * 0.42), 400)
+export function estimatedLift(innerHeight: number, tuning: KeyboardTuning = KEYBOARD_DEFAULTS): number {
+  return Math.min(Math.round(innerHeight * tuning.liftRatio), tuning.liftMaxPx)
 }
 
 /** One visualViewport reading, in CSS pixels. */
@@ -188,7 +199,16 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
      * it. Re-read on every sync that finds the composer unfocused, so a
      * rotation or a URL-bar change rebases it without extra listeners. */
     let baseline = 0
-    const pad = safetyPad(navigator.userAgent)
+    /** Row tuning for the estimate path. Starts on the shipped defaults and
+     * is replaced once the config request lands (a few ms into the page, and
+     * always long before a touch focus can raise a keyboard) — no re-sync is
+     * forced, the next focus or viewport event picks the new values up. */
+    let tuning = KEYBOARD_DEFAULTS
+    let pad = safetyPad(navigator.userAgent)
+    void clientConfig().then((loaded) => {
+      tuning = loaded.keyboard
+      pad = safetyPad(navigator.userAgent, tuning.safetyPadPx)
+    })
 
     const composerTextarea = (node: unknown): boolean =>
       node instanceof HTMLElement && node.tagName === 'TEXTAREA' && node.closest(COMPOSER) !== null
@@ -265,7 +285,7 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
       // the probe below still runs and revokes the verdict if the viewport
       // turns out to react after all.
       if (localStorage.getItem(DUMB_KEY) === '1') {
-        estimate = estimatedLift(window.innerHeight)
+        estimate = estimatedLift(window.innerHeight, tuning)
         sync()
       }
       const h0 = viewport.height
@@ -297,7 +317,7 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
         // remember the verdict so the next focus skips the wait.
         if (!composerTextarea(document.activeElement)) return
         localStorage.setItem(DUMB_KEY, '1')
-        estimate = estimatedLift(window.innerHeight)
+        estimate = estimatedLift(window.innerHeight, tuning)
         sync()
       }
       probeTimer = window.setTimeout(step, PROBE_INTERVAL_MS)

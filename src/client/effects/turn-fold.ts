@@ -1,4 +1,5 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import { clientConfig } from '../client-config.ts'
 import { NS } from '../locales.ts'
 
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
@@ -15,8 +16,6 @@ const DESKTOP_KEY = 'dsh-mobile-nav.turn-fold-desktop'
 const DESKTOP_PARAM = 'mobile-nav-turn-fold'
 /** Root attribute the stylesheet keys the width-independent rules on. */
 const DESKTOP_ATTR = 'data-mnav-desktop-fold'
-/** Mirror of src/index.ts CLIENT_CONFIG_ROUTE (client tsconfig cannot reach it). */
-const CLIENT_CONFIG_ROUTE = '/_dsh/mobile-nav/client-config'
 
 /** Read (and, when the URL param is present, persist) the per-browser opt-in. */
 function desktopOptIn(): boolean {
@@ -26,17 +25,10 @@ function desktopOptIn(): boolean {
   return localStorage.getItem(DESKTOP_KEY) === '1'
 }
 
-/** True when the plugin row asks for desktop fold; false on any failure. */
+/** True when the plugin row asks for desktop fold; false on any failure —
+ * the shared reader in client-config.ts already swallows those. */
 async function desktopConfigured(): Promise<boolean> {
-  try {
-    const res = await fetch(CLIENT_CONFIG_ROUTE, { cache: 'no-store' })
-    if (!res.ok) return false
-    const body: unknown = await res.json()
-    return typeof body === 'object' && body !== null
-      && (body as { turnFoldDesktop?: unknown }).turnFoldDesktop === true
-  } catch {
-    return false
-  }
+  return (await clientConfig()).turnFoldDesktop
 }
 
 /** ChatView's flow column (dsh-client-ui-conversation lib/client.js:5512).

@@ -7,6 +7,8 @@ const read = (...parts) => fs.readFileSync(path.join(__dirname, '..', ...parts),
 const effect = read('src', 'client', 'effects', 'turn-fold.ts')
 const css = read('src', 'client', 'styles', 'turn-fold.css.ts')
 const host = read('src', 'index.ts')
+/** The shared row-config reader both effects go through (2026-08-22). */
+const clientConfig = read('src', 'client', 'client-config.ts')
 
 /*
  * Desktop fold (issue #2), switched on either way: the plugin row's
@@ -21,9 +23,10 @@ test('the host republishes turnFoldDesktop at the client-config route', () => {
   assert.match(host, /turnFoldDesktop\?: boolean/, 'the config knob exists')
   assert.match(host, /CLIENT_CONFIG_ROUTE = '\/_dsh\/mobile-nav\/client-config'/, 'route path is fixed')
   assert.match(host, /turnFoldDesktop: config\.turnFoldDesktop === true/, 'the route serves the knob as a strict boolean')
-  const route = effect.match(/const CLIENT_CONFIG_ROUTE = '([^']+)'/)
+  const route = clientConfig.match(/export const CLIENT_CONFIG_ROUTE = '([^']+)'/)
   assert.ok(route, 'the client mirrors the route path')
   assert.ok(host.includes(`'${route[1]}'`), 'client and host route strings agree')
+  assert.match(effect, /clientConfig\(\)/, 'the fold reads the row through the shared reader')
 })
 
 test('the URL param persists the per-browser override, both directions', () => {
