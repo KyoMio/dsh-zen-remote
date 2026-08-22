@@ -288,6 +288,7 @@ open http://127.0.0.1:3088/lan-gate/admin
 | [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | 用量与余额入口收进主屏 chips 行 | 0.2.9 |
 | [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | 定时任务入口收进主屏 chips 行 | 0.2.3 |
 | dsh-at-file | @文件引用，配合附件上传的 `@` 路径引用使用；它和本插件的附件 chip 读同一份草稿 token，手机端隐藏它 `.dsh-uploads/` 下那几行以免同一个文件被画两遍（缩略图 + 文件名），其余 `@` 引用不动 | 0.6.7 |
+| [@ace-zone/dsh-market](https://www.npmjs.com/package/@ace-zone/dsh-market) | 插件市场弹窗顶栏在手机上放不下，关闭的 × 被挤出面板外（触屏没有 Esc，等于关不掉）；隐藏标语 / 版本号 / 官网链接三个装饰位，标题改成省略号收缩，语言切换和 × 保留并加大点按面积 | 0.1.66 |
 | [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit) | 图像 Q&A/OCR，配合手机端附件上传使用 | — |
 | [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all) | 沿用上游 dsh-web-mobile 的兼容规则（文件树 / 预览浮层限宽居中等） | — |
 

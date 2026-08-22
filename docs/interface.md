@@ -229,6 +229,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 - [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats)(用量与余额,主屏 chips 行可直接打开;旧包名 `dsh-usage-stats` 已废弃,两个名字同时留在 profile 里会因重复的 `usage-stats` 行让 DSH 起不来)——本机实测 **0.2.9**
 - [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins)(定时任务,主屏 chips 行自动收割入口)——本机实测 **0.2.3**
 - dsh-at-file(@文件引用;它和本插件的附件 chip 读的是同一份草稿 token,手机端会为一个上传文件同时画出缩略图和文件名两条,故隐藏它 `.dsh-uploads/` 下那几行,其余 @ 引用不动;桌面端不隐藏——那边本插件的 chip 是关掉的,它是唯一的呈现)——本机实测 **0.6.7**
+- [@ace-zone/dsh-market](https://www.npmjs.com/package/@ace-zone/dsh-market)(插件市场;它的弹窗顶栏在手机上放不下,关闭的 × 被挤出面板外,故隐藏标语/版本号/官网链接三个装饰位并让标题省略号收缩,语言切换和 × 保留;认插件自己渲染的 `.dshm-ver[title="@ace-zone/dsh-market"]` 版本片,同名的其他"市场"插件不会被误伤)——本机实测 **0.1.66**
 - [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit)(图像 Q&A/OCR,配合手机端附件上传使用)
 - [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all)(文件树 / 预览 / 任务看板 / SSH / 宠物 / 会话统计 / 远程配对 / 设置)——沿用上游兼容规则,本次未扩展
 
