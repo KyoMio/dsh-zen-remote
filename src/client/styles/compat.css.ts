@@ -1,6 +1,8 @@
 // compat — split from src/client/mobile.css.ts (2026-08-16), order preserved.
 // Do not reorder: styles/index.ts concatenates in this exact order.
 
+import { UPLOAD_DIR } from '../attach-upload.ts'
+
 export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility ----------
      The linxin666 plugin suite extends the shell frame directly:
        - aionui-panel appends two trailing grid columns (explorer / preview)
@@ -733,6 +735,37 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
        requirement of this plugin (Chromium 105+, docs/interface.md). */
     body:has([data-mobile-nav="home"][data-view="home"]) [data-agent-teams-host] [class$="_badge"],
     body:has([data-mobile-nav="home"][data-view="home"]) [data-agent-teams-host] [class$="_panel"] {
+      display: none !important;
+    }
+  }
+
+  /* ---------- dsh-at-file compatibility ----------
+     dsh-at-file registers its own \`conversation.input.dock\` entry
+     ([data-at-file-dock]) and renders one row per \`@path\` token in the
+     draft. That is exactly the same source this plugin's attachment chips
+     read, so on a phone a single uploaded image produced TWO entries on the
+     composer rail: our 48px thumbnail tile AND at-file's file-name row for
+     the same token (reported 2026-08-22).
+
+     Drop at-file's row for the upload directory only. Everything else the
+     user @-mentions by hand is at-file's own job and stays — this is not a
+     blanket hide. The path is readable from the row's own title attribute
+     (FilesDock passes \`title={mention.relative}\`), which is a rendered
+     contract rather than a hashed class name.
+
+     Phone only, and deliberately so: at \u003e= 768px our chips are hidden by
+     composer.css.ts, which leaves at-file's row as the ONLY thing on screen
+     representing the attachment. Hiding it there would make an uploaded file
+     invisible.
+
+     When every row was an upload the container itself is left empty, and an
+     empty flex item still claims the rail's 6px gap — so the dock goes too
+     unless at least one non-upload row survives. */
+  @media (max-width: 767px) {
+    [data-at-file-dock] [data-at-file-row]:has([title^="${UPLOAD_DIR}/"]) {
+      display: none !important;
+    }
+    [data-at-file-dock]:not(:has([data-at-file-row] [title]:not([title^="${UPLOAD_DIR}/"]))) {
       display: none !important;
     }
   }

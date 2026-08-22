@@ -315,9 +315,18 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   /* --- 7b. attachment chips (S7.1) ---
      Our own dock entry opts OUT of the 26px pill cage above: an image chip is
      a 48px tile. The row sits tight under the card's top edge, so the chips
-     read as part of the composer rather than as a floating strip. */
+     read as part of the composer rather than as a floating strip.
+
+     It also takes the LAST line of its own (line policy in 7c): a 48px tile
+     beside the to-do chip on one nowrap line squeezed that chip down to an
+     unreadable stub, with a long file name pushing the rest off-screen
+     (reported 2026-08-22). Its own chips wrap rather than overflow, so
+     several attachments stack instead of scrolling out of reach. */
   [data-slot="conversation.input.dock"] > [data-mobile-nav="attach-chips"] {
     display: flex !important;
+    flex: 1 0 100% !important;
+    flex-wrap: wrap !important;
+    order: 2 !important;
     align-items: center !important;
     gap: 6px !important;
     max-width: none !important;
@@ -327,6 +336,57 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     overflow: visible !important;
     margin-bottom: -2px;
   }
+
+  /* --- 7c. the queue strip opts OUT of the cage, on a line of its own ---
+     Third entry that is not a pill. conversation.input.dock is a \`list\` slot
+     and DSH's own QueueDock registers into it at order 20 (id \`queue\`,
+     dsh-client-ui-conversation) — a 36px row per queued message, or a
+     collapsible "N 条排队消息" header once there is more than one. The 26px
+     cage above clipped it to a sliver: on a phone a queued message showed as
+     a grey stub poking out from behind the input card, unreadable and with
+     its edit / delete / send buttons cut off (reported 2026-08-22, same
+     failure the to-do card hit in 7a).
+
+     Two things are restored. Geometry: the official row height back, and the
+     dock's own composer-column sizing dropped — its width/max-width are
+     calc()s over the composer card variables and its bottom margin is
+     negative by design (upstream tucks the strip UNDER the card), none of
+     which survives being a flex item of our chip rail.
+
+     Layout — the line policy for the whole rail, now that three things want
+     room on it. The pills (the to-do card, a branch chip, whatever else
+     registers) keep order 0 and share the top line, still scrolling
+     horizontally. The queue takes the next line (order 1). The attachment
+     chips take the last one (order 2, 7b), so what the user is about to send
+     sits closest to the input it will be sent from. The rail only wraps
+     while one of the two full-width entries exists, so a session with
+     neither keeps the original single scrolling chip line. */
+  [data-slot="conversation.input.dock"]:has(> [data-queue-dock], > [data-mobile-nav="attach-chips"]) {
+    flex-wrap: wrap !important;
+  }
+  [data-slot="conversation.input.dock"] > [data-queue-dock] {
+    flex: 1 0 100% !important;
+    order: 1 !important;
+    max-width: none !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border-radius: 0 !important;
+    overflow: visible !important;
+    font-size: 13px !important;
+    line-height: normal !important;
+  }
+  /* The panel is the dock's only child; upstream rounds its top corners only
+     and drops the bottom border, because there it is half-hidden behind the
+     card. On its own line it is a free-standing strip, so close it up. */
+  [data-slot="conversation.input.dock"] > [data-queue-dock] > * {
+    border-radius: 12px !important;
+  }
+  [data-slot="conversation.input.dock"] > [data-queue-dock] > *::after {
+    border-bottom: 1px solid var(--dsw-alias-border-l1) !important;
+  }
+
   [data-mobile-nav="attach-chip"] {
     position: relative;
     display: inline-flex;

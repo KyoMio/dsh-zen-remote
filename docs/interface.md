@@ -228,7 +228,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 - [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams)(AgentTeams 活动浮层:手机端挪到会话头部下方、避开安全区,会话列表页隐藏;子代理会话头部保留可点的父会话面包屑用于切回)——本机实测 **0.1.7**
 - [dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats)(用量与余额,主屏 chips 行可直接打开)——本机实测 **0.2.5**
 - [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins)(定时任务,主屏 chips 行自动收割入口)——本机实测 **0.2.2**
-- dsh-at-file(@文件引用)——本机实测 **0.6.5**
+- dsh-at-file(@文件引用;它和本插件的附件 chip 读的是同一份草稿 token,手机端会为一个上传文件同时画出缩略图和文件名两条,故隐藏它 `.dsh-uploads/` 下那几行,其余 @ 引用不动;桌面端不隐藏——那边本插件的 chip 是关掉的,它是唯一的呈现)——本机实测 **0.6.7**
 - [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit)(图像 Q&A/OCR,配合手机端附件上传使用)
 - [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all)(文件树 / 预览 / 任务看板 / SSH / 宠物 / 会话统计 / 远程配对 / 设置)——沿用上游兼容规则,本次未扩展
 
