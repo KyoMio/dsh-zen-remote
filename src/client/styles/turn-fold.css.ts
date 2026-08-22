@@ -1,15 +1,52 @@
 // turn-fold — the folded turn process and its summary row (S8, 2026-08-17).
-// Everything that can hide content lives inside (max-width: 767px) OR behind
-// html[data-mnav-desktop-fold] (the per-browser desktop opt-in, issue #2);
-// the two markers this file reads (data-mnav-fold on a process element,
-// data-mobile-nav="turn-fold" on the injected summary row) are only ever
-// written by effects/turn-fold.ts, which detaches and wipes them when it is
-// not active — so a non-opted-in tablet/desktop is a no-op twice over, by
-// attribute and by scope. The rule block is authored once and emitted twice
-// (phone media query / desktop attribute scope) so the two can never drift.
+// Two blocks, both inert unless the fold is actually running:
+//   * BORN_FOLDED, keyed on html[data-mnav-fold-on] — the root attribute
+//     effects/turn-fold.ts holds for as long as it is attached, so the block
+//     is live at exactly the widths the fold is. It hides process rows by
+//     the HOST's own markers, which means a row is folded at its first paint
+//     rather than a frame after the effect notices it (2026-08-22).
+//   * the `rules()` block below, scoped to (max-width: 767px) OR
+//     html[data-mnav-desktop-fold] (the per-browser desktop opt-in, issue
+//     #2), reading markers this plugin writes: data-mnav-fold on a process
+//     element, data-mobile-nav="turn-fold" on the injected summary row.
+//     effects/turn-fold.ts wipes both when it detaches, so a non-opted-in
+//     tablet/desktop is a no-op twice over, by attribute and by scope. It is
+//     authored once and emitted twice so the two scopes can never drift.
 // Appended last in styles/index.ts; it shares no selector with any other
 // file, the position just keeps the "phone files come after the shared
 // <=1023px block" ordering intact.
+
+import { OPEN, PROCESS_KINDS, THINK } from '../effects/turn-fold.ts'
+
+/** Mirror of the root attribute effects/turn-fold.ts holds while attached. */
+const ACTIVE = 'data-mnav-fold-on'
+
+/**
+ * Born folded — the reason a new tool call no longer blinks into view.
+ *
+ * These selectors read the HOST's own markers (ChatNodeSeat's
+ * `data-chat-flow-kind`, ReasoningRow's `data-variant`), which React sets in
+ * the same commit that inserts the row, so the row is already
+ * `display: none` at its first paint. effects/turn-fold.ts still rescans on
+ * the next animation frame, but by then it is only writing the per-turn
+ * {@link OPEN} override and the summary chip — it is no longer what hides
+ * anything, which is what the reader used to see as a one-frame flash
+ * (2026-08-22).
+ *
+ * Keyed on the root attribute the effect holds while it is attached, so this
+ * block is live for exactly the widths the fold is, and hides nothing at all
+ * when the effect never ran.
+ *
+ * One case stays with the effect: an assistant-step row whose whole body is
+ * reasoning has to be hidden as a row (an emptied-out flex item still claims
+ * the flow column's 16px gap), and "this row has nothing but Think in it" is
+ * not a selector. Its rows therefore still fold a frame late — as blank
+ * space, not as content, since the Think rows below are hidden here.
+ */
+const BORN_FOLDED = [
+  ...PROCESS_KINDS.map((kind) => `html[${ACTIVE}] [data-chat-flow] > [data-chat-flow-kind="${kind}"]:not([${OPEN}])`),
+  `html[${ACTIVE}] [data-chat-flow] > [data-chat-flow-kind="assistant-step"] ${THINK}:not([${OPEN}])`,
+].join(',\n')
 
 /** The fold + chip rules, with every selector prefixed by `scope`. */
 const rules = (scope: string): string => `
@@ -96,6 +133,12 @@ const rules = (scope: string): string => `
 `
 
 export const TURN_FOLD_CSS = `/* ---------- turn process fold (< 768px, or desktop opt-in) ---------- */
+
+/* Process rows and Think disclosures start folded, before any script has
+   looked at them — see BORN_FOLDED above. */
+${BORN_FOLDED} {
+  display: none !important;
+}
 
 /* The summary row never paints outside its active scope, even if a
    media-query change raced the effect's own cleanup. */

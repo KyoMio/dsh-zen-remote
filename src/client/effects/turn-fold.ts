@@ -56,19 +56,30 @@ const CHIP_SELECTOR = '[data-mobile-nav="turn-fold"]'
  * per-block below), `turn-tail` (the footer with its actions), and the
  * error notices `turn-error` / `turn-max-tokens` / `model-retry`, which are
  * exactly what a reader must not have to hunt for. */
-const PROCESS_KINDS = new Set(['context', 'tool-call', 'command'])
+export const PROCESS_KINDS = ['context', 'tool-call', 'command'] as const
+const PROCESS_KIND_SET: ReadonlySet<string> = new Set(PROCESS_KINDS)
 
 /** Node kinds that open a new turn group. */
 const TURN_HEAD_KINDS = new Set(['user', 'steering'])
 
 /** ReasoningRow's own marker (lib/client.js:8966) — the Think disclosure
  * rendered inside an assistant-step row, beside that step's prose. */
-const THINK = '[data-variant="think"]'
+export const THINK = '[data-variant="think"]'
 
-/** Attribute the phone stylesheet turns into `display: none`. */
+/** Attribute the phone stylesheet turns into `display: none`. Still written
+ * per element for the one case the stylesheet cannot express on its own: an
+ * assistant-step row whose entire body is reasoning, which has to go as a
+ * whole row (see {@link foldsWholeRow}). */
 const FOLD = 'data-mnav-fold'
 /** Per-item override written while its turn is expanded. */
-const OPEN = 'data-mnav-fold-open'
+export const OPEN = 'data-mnav-fold-open'
+/** Root attribute written for as long as this effect is attached — i.e. for
+ * exactly the widths where the fold is live. The stylesheet keys its
+ * born-folded rules on it, which is what makes a newly inserted tool call
+ * hidden at its FIRST paint instead of after the next rescan (the "row
+ * flashes in, then folds away" report, 2026-08-22); it also keeps the
+ * stylesheet a no-op — content visible — if this effect never runs. */
+const ACTIVE_ATTR = 'data-mnav-fold-on'
 
 /**
  * True when the reasoning rows are the ONLY thing this row renders, so the
@@ -98,7 +109,7 @@ function foldsWholeRow(row: Element, thinks: readonly Element[]): boolean {
 function processItems(row: Element): readonly Element[] {
   const kind = row.getAttribute('data-chat-flow-kind')
   if (kind === null) return []
-  if (PROCESS_KINDS.has(kind)) return [row]
+  if (PROCESS_KIND_SET.has(kind)) return [row]
   if (kind !== 'assistant-step') return []
   const thinks = [...row.querySelectorAll(THINK)]
   if (thinks.length === 0) return []
@@ -280,12 +291,14 @@ export function installTurnFold(ctx: ClientContext): void {
 
     const attach = (): void => {
       if (observer !== null) return
+      document.documentElement.setAttribute(ACTIVE_ATTR, '')
       observer = new MutationObserver(schedule)
       observer.observe(document.body, { childList: true, subtree: true })
       document.addEventListener('click', onClick)
       scan()
     }
     const detach = (): void => {
+      document.documentElement.removeAttribute(ACTIVE_ATTR)
       observer?.disconnect()
       observer = null
       document.removeEventListener('click', onClick)

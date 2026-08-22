@@ -53,16 +53,112 @@ test('the stylesheet emits the same rule block for phone and for the opt-in scop
   assert.ok(hides !== null && hides.length === 1, 'the hiding rule lives only inside the shared template')
 })
 
+/** The constants the stylesheet imports from the effect, read back out of
+ * the effect's own source: the eval harness below has to stand in for that
+ * import, and parsing them here is what keeps a stale hand-written copy in
+ * either file from passing. */
+const constantOf = (name, pattern) => {
+  const found = effect.match(pattern)
+  assert.ok(found, `effects/turn-fold.ts no longer exports ${name}`)
+  return found[1]
+}
+const PROCESS_KINDS = constantOf('PROCESS_KINDS', /export const PROCESS_KINDS = \[([^\]]+)\]/)
+  .split(',').map((s) => s.trim().replace(/^'|'$/g, ''))
+const THINK = constantOf('THINK', /export const THINK = '([^']+)'/)
+const OPEN = constantOf('OPEN', /export const OPEN = '([^']+)'/)
+const ACTIVE = constantOf('ACTIVE_ATTR', /const ACTIVE_ATTR = '([^']+)'/)
+
+/** The stylesheet's emitted text, evaluated the way the bundle does. */
+const emit = () => {
+  const body = css
+    .replace(/^\/\/.*$/gm, '')
+    .replace(/^import .*$/gm, '')
+    .replace(/\(scope: string\): string =>/, '(scope) =>')
+    .replace(/^export const TURN_FOLD_CSS/m, 'const TURN_FOLD_CSS')
+  const head = `const PROCESS_KINDS = ${JSON.stringify(PROCESS_KINDS)},`
+    + ` THINK = ${JSON.stringify(THINK)}, OPEN = ${JSON.stringify(OPEN)};`
+  // eslint-disable-next-line no-eval
+  return eval(`${head} ${body}; TURN_FOLD_CSS`)
+}
+
 test('the compiled CSS string really contains both copies', () => {
   // Belt over the regexes above: evaluate the template the way the bundle
   // does and check the emitted text, not the source.
-  const body = css
-    .replace(/^\/\/.*$/gm, '')
-    .replace(/\(scope: string\): string =>/, '(scope) =>')
-    .replace(/^export const TURN_FOLD_CSS/m, 'const TURN_FOLD_CSS')
-  // eslint-disable-next-line no-eval
-  const emitted = eval(`${body}; TURN_FOLD_CSS`)
+  const emitted = emit()
   assert.match(emitted, /@media \(max-width: 767px\) \{[\s\S]*\[data-mnav-fold\]:not\(\[data-mnav-fold-open\]\) \{\s*display: none !important;/)
   assert.match(emitted, /html\[data-mnav-desktop-fold\] \[data-mnav-fold\]:not\(\[data-mnav-fold-open\]\) \{\s*display: none !important;/)
   assert.match(emitted, /html\[data-mnav-desktop-fold\] \[data-chat-flow\] > \[data-mobile-nav="turn-fold"\] \{/)
+})
+
+
+/*
+ * Born folded (2026-08-22). The effect marks process rows on the animation
+ * frame AFTER React inserts them, so a new tool call used to paint once,
+ * visible, and then vanish. The stylesheet now hides those rows by the
+ * host's own markers, which React sets in the same commit that inserts the
+ * row — nothing to flash. The effect's rescan still runs; it just no longer
+ * owns the hiding.
+ */
+
+test('the effect holds a root attribute for exactly as long as it is attached', () => {
+  const attach = effect.match(/const attach = \(\): void => \{([\s\S]*?)\n {4}\}/)
+  const detach = effect.match(/const detach = \(\): void => \{([\s\S]*?)\n {4}\}/)
+  assert.ok(attach && detach, 'attach/detach still exist')
+  assert.match(attach[1], /setAttribute\(ACTIVE_ATTR, ''\)/, 'attach stamps the attribute')
+  assert.match(detach[1], /removeAttribute\(ACTIVE_ATTR\)/, 'detach drops it — nothing stays hidden')
+})
+
+test('every process kind the effect folds is also born folded', () => {
+  const emitted = emit()
+  assert.ok(PROCESS_KINDS.length > 0, 'the kind list parsed')
+  for (const kind of PROCESS_KINDS) {
+    assert.ok(
+      emitted.includes(`html[${ACTIVE}] [data-chat-flow] > [data-chat-flow-kind="${kind}"]:not([${OPEN}])`),
+      `"${kind}" folds a frame late — it will flash in and then fold away`,
+    )
+  }
+  assert.ok(
+    emitted.includes(`[data-chat-flow-kind="assistant-step"] ${THINK}:not([${OPEN}])`),
+    'Think disclosures are not born folded',
+  )
+  // The step's prose is the reply itself; only the effect may hide such a row
+  // whole, and only when reasoning is all it holds (foldsWholeRow).
+  assert.ok(
+    !emitted.includes(`> [data-chat-flow-kind="assistant-step"]:not([${OPEN}])`),
+    'born-folded would hide whole assistant-step rows — that hides the reply',
+  )
+})
+
+test('no rule can hide host content outside an active fold', () => {
+  // The dangerous regression this file exists to catch: an unscoped
+  // display:none here blanks tool calls and reasoning for every desktop
+  // reader of the plain web UI, with no chip to bring them back.
+  const emitted = emit().replace(/\/\*[\s\S]*?\*\//g, '')
+  const phone = emitted.indexOf('@media (max-width: 767px) {')
+  assert.notEqual(phone, -1, 'the phone media query disappeared')
+  let depth = 0
+  let phoneEnd = -1
+  for (let i = emitted.indexOf('{', phone); i < emitted.length && phoneEnd === -1; i += 1) {
+    if (emitted[i] === '{') depth += 1
+    else if (emitted[i] === '}' && (depth -= 1) === 0) phoneEnd = i
+  }
+  assert.notEqual(phoneEnd, -1, 'unbalanced braces in the phone media query')
+
+  for (let at = emitted.indexOf('display: none'); at !== -1; at = emitted.indexOf('display: none', at + 1)) {
+    const brace = emitted.lastIndexOf('{', at)
+    const from = Math.max(emitted.lastIndexOf('}', brace), emitted.lastIndexOf('{', brace - 1))
+    // Comma lists are checked one selector at a time: a gated sibling must
+    // not vouch for an ungated one.
+    for (const selector of emitted.slice(from + 1, brace).split(',').map((one) => one.trim())) {
+      // The one deliberate exception: our OWN summary row, hidden by default
+      // so it can never paint outside the scope that created it.
+      if (selector === '[data-mobile-nav="turn-fold"]') continue
+      assert.ok(
+        selector.includes(`html[${ACTIVE}]`)
+          || selector.includes('html[data-mnav-desktop-fold]')
+          || (brace > phone && brace < phoneEnd),
+        `ungated display:none — hides host content at every width:\n  ${selector}`,
+      )
+    }
+  }
 })

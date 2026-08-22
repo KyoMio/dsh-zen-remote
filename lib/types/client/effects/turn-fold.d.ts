@@ -1,4 +1,18 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+/** Whole-row node kinds that are turn *process*, not conversation content.
+ * Keys are ChatNodeSeat's own `data-chat-flow-kind` dispatch values
+ * (registerChatNodeRenderers, lib/client.js:9322): tool calls, injected
+ * context rows, and slash-command rows. Everything else stays visible —
+ * `user`/`steering` (the question), `assistant-step` (the prose, folded
+ * per-block below), `turn-tail` (the footer with its actions), and the
+ * error notices `turn-error` / `turn-max-tokens` / `model-retry`, which are
+ * exactly what a reader must not have to hunt for. */
+export declare const PROCESS_KINDS: readonly ["context", "tool-call", "command"];
+/** ReasoningRow's own marker (lib/client.js:8966) — the Think disclosure
+ * rendered inside an assistant-step row, beside that step's prose. */
+export declare const THINK = "[data-variant=\"think\"]";
+/** Per-item override written while its turn is expanded. */
+export declare const OPEN = "data-mnav-fold-open";
 /**
  * S8 — collapse a turn's process into one summary row (< 768px by default;
  * every width when the plugin row sets `config.turnFoldDesktop` or a browser
