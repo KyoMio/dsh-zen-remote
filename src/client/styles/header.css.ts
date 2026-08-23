@@ -65,6 +65,13 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      widths, only the center 1fr column shrinks by 16px. */
   [data-phase] header {
     position: relative;
+    /* Above the scroller's plain and relative-positioned message content, so
+       the ::after fade strip below actually paints over the messages sliding
+       under it (positioned z-auto boxes otherwise win by DOM order — the
+       scroller comes after the header). Deliberately tiny: the seat (7),
+       scroll-to-bottom (8) and every overlay this plugin owns (30+) stay
+       above. */
+    z-index: 2;
     padding: 0 8px 28px !important;
   }
   /* No header bottom line — fade instead (real-device round 2, 2026-08-17).
@@ -72,14 +79,20 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      \`border-bottom\` on the header itself is transparent, just a layout
      reserve — dsh-client-ui-conversation lib/client.js ".wSkVaW_header{
      border-bottom:1px solid #0000}.wSkVaW_header:after{...height:1px;
-     position:absolute;bottom:1px...}", verified live 2026-08-17), so
-     hiding the pseudo-element is enough; the header's own border-bottom
-     never had a visible color to begin with. The message scroller now
-     fades in from under the header instead (styles/composer.css.ts, "no
-     divider above OR below the message list" — the two edges share one
-     mask-image on [class$="_scrollBody"]). */
+     position:absolute;bottom:1px...}", verified live 2026-08-17), so the
+     bar is repurposed rather than hidden: restyled into a 20px strip
+     hanging just below the header that fades the messages in — the same
+     look the scroller's mask-image used to produce, without a mask on a
+     scroll container (iOS WebKit renders that as fog over the header, see
+     composer.css.ts "no divider above OR below the message list",
+     2026-08-23). color-mix instead of the transparent keyword: the host
+     writes its own seat gradient that way, and plain \`transparent\` is
+     rgba(0,0,0,0) — WebKit interpolates it through grey. */
   [data-phase] header::after {
-    display: none !important;
+    height: 20px !important;
+    top: 100% !important;
+    bottom: auto !important;
+    background: linear-gradient(to bottom, var(--dsw-alias-bg-base), color-mix(in srgb, var(--dsw-alias-bg-base) 0%, transparent)) !important;
   }
   /* grid-row: 1 on every item is load-bearing, not decoration (S2.1 fix for
      the "标题被挤下去" report). The three items are placed with explicit

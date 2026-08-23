@@ -227,22 +227,29 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   }
 
   /* --- 6. no divider above OR below the message list ---
-     Instead of a rule the messages butt against, the message scroller
-     fades out over its last 26px (S3, no divider above the composer) AND
-     fades in over its first 20px (S3.1 real-device round 2: the header's
-     own bottom line is removed too, styles/header.css.ts's
-     \`header::after\` rule). The mask lives on the scroll body (NOT on the
-     header or the composer): a mask clips everything it paints, and both
-     surfaces host position:fixed children (composer's permission/model
-     sheets, any future header overlay) that must not be clipped.
-     \`mask-image\` can only be declared once per element, so both fades are
-     ONE linear-gradient rather than two separate declarations (the second
-     would silently replace the first) — this is the merge of what used to
-     be S3's bottom-only mask. */
-  [class$="_scrollBody"] {
-    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 20px, #000 calc(100% - 26px), transparent 100%);
-    mask-image: linear-gradient(to bottom, transparent 0, #000 20px, #000 calc(100% - 26px), transparent 100%);
-  }
+     Instead of a rule the messages butt against, they fade near both edges.
+     This used to be ONE mask-image on the message scroller; iOS WebKit
+     turned that into fog over the header (user report 2026-08-23): a mask
+     on a scroll container is applied in CONTENT coordinates there (the fade
+     bands scroll away with the messages) and, worse, it breaks the
+     container's own overflow clipping — content scrolled out of view keeps
+     painting, straight over the header and status bar. Engine bug with no
+     iOS escape hatch (every iOS browser is WebKit), so the fades moved off
+     the scroller entirely:
+
+     - fade-IN under the header: the header's own ::after, restyled into a
+       20px gradient strip — styles/header.css.ts ("no header bottom line").
+     - fade-OUT above the composer: nothing of ours. The official composer
+       seat already carries \`background: linear-gradient(transparent 0,
+       bg 36px)\` on its sticky self (dsh-client-ui-conversation lib/
+       client.js .wSkVaW_composerSeat) and that is the entire visible
+       effect; the mask's own bottom band landed inside the safe-area
+       padding below the card and painted nothing. If the bottom edge ever
+       reads harsh, hang a ::before strip off the seat the same way the
+       header does — do NOT put a mask back on the scroller.
+
+     Painted strips instead of a mask is a fair trade only because the page
+     background is one flat color — which it is (--dsw-alias-bg-base). */
   [class$="_composerSeat"],
   [class$="_composerStack"] {
     border-top: none !important;
