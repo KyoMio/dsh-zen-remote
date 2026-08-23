@@ -267,47 +267,39 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   [data-phase] header [data-slot="conversation.session.header.utilities"] > * {
     display: none !important;
   }
-  /* Native background-task / subagent entries: kept mounted, but parked as
-     ZERO-WIDTH INVISIBLE ANCHORS at the right end of the view-switch band.
-     Our activity pill is the visible control and forwards the tap to the
-     official trigger, so the official popover — a child of this root — still
-     mounts and positions from here.
+  /* Native background-task / subagent entries (rewritten for DSH 0.1.1,
+     2026-08-21). Three upstream changes killed the old "park the root as a
+     zero-width anchor, hide the trigger, forward the tap" design at once:
 
-     Why not just leave them visible in the header: each is ~103px wide while
-     headerActions' grid column is 92px, and flex children that cannot shrink
-     simply overflow — measured at 375px the subagent entry ran x=60..163
-     straight across the centred title at x=100..275.
+     - the subagent entry moved out of header.actions into the new
+       conversation.session.header.lineage slot (inside the breadcrumb);
+     - its root's class attribute is now "ZKlsPq_root " — with a TRAILING
+       SPACE — so a [class$="_root"] anchor matches nothing at all;
+     - the trigger only reacts to TRUSTED input: .click() and synthetic
+       pointer/mouse events leave aria-expanded untouched (measured on device
+       with every plugin override stripped), so forwarding a tap in JS can
+       never open it again.
 
-     Why not display:none them either: the menu lives inside the root, so
-     hiding the root takes the popover with it and the pill would have
-     nothing to open. Hide the TRIGGER (below) and keep the root as a box. */
-  [data-phase] header [data-slot="conversation.session.header.actions"] > [class$="_root"]:has(> button[class$="_trigger"]) {
-    display: block !important;
-    position: absolute !important;
-    right: 0 !important;
-    top: 100% !important;
-    width: 0 !important;
-    height: 28px !important;
-    overflow: visible !important;
-    order: 0 !important;
+     The trigger's geometry is therefore owned at runtime by
+     effects/native-trigger-overlay.ts, which lays the REAL button
+     transparently over the activity pill — a genuine finger tap lands on the
+     official element. Nothing in this stylesheet may size, hide, or set
+     pointer-events on the trigger: that is exactly what would take the tap
+     target away again.
+
+     CSS keeps only two chores. Dissolve the root so its box (and its
+     stray separator, hidden below) stops occupying the breadcrumb, and let
+     the trigger participate from wherever the overlay pins it. And no menu
+     re-anchoring anymore: the 0.1.1 popover portals to <body> as
+     position:fixed and positions itself from the trigger's viewport rect
+     (measured 336px wide, fully on screen at 411px). */
+  [data-phase] header [data-slot="conversation.session.header.actions"] > *:has(> button[class$="_trigger"]),
+  [data-phase] header [data-slot="conversation.session.header.lineage"] > *:has(> button[class$="_trigger"]) {
+    display: contents !important;
   }
-  /* The official trigger never shows — the pill replaced it. Programmatic
-     .click() still reaches React's handler on a display:none button. */
-  [data-phase] header [data-slot="conversation.session.header.actions"] > [class$="_root"] > button[class$="_trigger"] {
+  [data-phase] header [data-slot="conversation.session.header.actions"] [class$="_separator"],
+  [data-phase] header [data-slot="conversation.session.header.lineage"] [class$="_separator"] {
     display: none !important;
-  }
-  /* Anchor the popover to the RIGHT edge and clamp it to the viewport. The
-     root now sits at the right edge with zero width, so the official
-     \`left: 0\` would start the 336px panel off-screen; layout.css.ts's
-     \`left: 8px\` re-anchor was written for a viewport-width containing block
-     that this element is not. Right-anchoring is the one that holds for both
-     (2026-08-20: the old pairing put the panel 29px past the right edge). */
-  [data-phase] header [data-slot="conversation.session.header.actions"] [class$="_menu"] {
-    left: auto !important;
-    right: 0 !important;
-    width: min(336px, calc(100vw - 32px)) !important;
-    max-width: none !important;
-    max-height: min(420px, calc(100dvh - 140px)) !important;
   }
   /* The agent-preset mode badge specifically survives the blanket hide
      above: layout.css.ts's shared <=1023px block targets it directly
@@ -433,7 +425,11 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
   }
+  /* pointer-events:none so the invisible official trigger laid over this pill
+     (effects/native-trigger-overlay.ts) is what a tap reaches. The pill is
+     visuals only. */
   [data-mobile-nav="activity-pill"] {
+    pointer-events: none;
     display: inline-flex;
     align-items: center;
     gap: 3px;

@@ -16,6 +16,7 @@ import { installHeaderStatusDot } from './effects/header-status.ts'
 import { installGestures } from './effects/gestures.ts'
 import { installTurnFold } from './effects/turn-fold.ts'
 import { installModalBack } from './effects/modal-back.ts'
+import { installNativeTriggerOverlay } from './effects/native-trigger-overlay.ts'
 import { installWelcomeNoticeOptOut } from './effects/welcome-notice.ts'
 import { installKeyboardGuard } from './effects/keyboard-guard.ts'
 import { installKeyboardAvoid } from './effects/keyboard-avoid.ts'
@@ -82,6 +83,7 @@ export function apply(ctx: ClientContext): void {
   // not carry this.
   installTurnFold(ctx)
   installModalBack(ctx)
+  installNativeTriggerOverlay(ctx)
 
   // "内测声明" first-run notice: keep it visible (CSS-hiding it leaked the
   // dialog's #root inert lock — see effects/welcome-notice.ts) and offer a

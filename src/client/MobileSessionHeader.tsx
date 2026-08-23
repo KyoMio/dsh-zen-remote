@@ -60,20 +60,30 @@ function IconTaskOutline14({ size = 14 }: { size?: number }) {
 type ActivityState = 'running' | 'done' | 'warning'
 
 /**
- * The official triggers our pills stand in for. Both are hidden and parked
- * as invisible anchors at the right end of the view-switch band
- * (styles/header.css.ts) so their own popovers still mount and position from
+ * The official triggers our pills stand in for. Both are hidden and parked as
+ * invisible anchors at the right end of the view-switch band
+ * (styles/header.css.ts) so their popovers still mount and position from
  * there; the pill is the visible control and forwards the tap.
  *
- * Told apart by `aria-haspopup`, not by class: the subagent entry declares
- * `tree` (its menu is a session tree) while the jobs entry declares none.
- * Both roots/triggers only expose build-hashed class names, so the ARIA
- * contract is the one stable discriminator between two otherwise identical
- * `[class$="_root"] > button[class$="_trigger"]` shapes.
+ * Told apart by `aria-haspopup`: the subagent entry declares `tree` (its menu
+ * is a session tree), the jobs entry declares none.
+ *
+ * Scoped to the HEADER, not to a slot (2026-08-21). DSH 0.1.1 moved the
+ * subagent entry out of `conversation.session.header.actions` into a new
+ * `conversation.session.header.lineage` slot inside the breadcrumb; every
+ * slot-scoped lookup here silently stopped matching and the pill fell back to
+ * opening the info card. The header is the stable boundary — which slot
+ * inside it owns the entry is the suite's business, and it has changed once.
+ *
+ * Also deliberately NOT keyed on the root's class. In 0.1.1 that attribute is
+ * `"ZKlsPq_root "` — with a TRAILING SPACE — so `[class$="_root"]` does not
+ * match it at all (`[class$=]` tests the whole attribute string). The
+ * trigger's own class has no such tail, so anchor on the trigger and reach
+ * the root through `:has()` instead of naming it.
  */
-const ACTIONS_SLOT = '[data-slot="conversation.session.header.actions"]'
-const SUBAGENT_TRIGGER = `${ACTIONS_SLOT} button[aria-haspopup="tree"]`
-const JOBS_TRIGGER = `${ACTIONS_SLOT} > [class$="_root"] > button[class$="_trigger"]:not([aria-haspopup])`
+const HEADER = '[data-phase] header'
+const SUBAGENT_TRIGGER = `${HEADER} button[aria-haspopup="tree"]`
+const JOBS_TRIGGER = `${HEADER} button[class$="_trigger"]:not([aria-haspopup])`
 
 /** One glanceable group: icon + count + state dot; opens the official popover. */
 function ActivityPill(
@@ -98,10 +108,12 @@ function ActivityPill(
       data-activity-state={state}
       aria-label={label}
       title={label}
+      /* Reached only when the official trigger is absent — when it exists,
+         effects/native-trigger-overlay.ts lays it transparently over this
+         pill and the tap never gets here. Scripting the official click is
+         not an option: 0.1.1 ignores synthetic events (see that file). */
       onClick={() => {
-        const el = document.querySelector<HTMLButtonElement>(trigger)
-        if (el === null) onFallback()
-        else el.click()
+        if (document.querySelector(trigger) === null) onFallback()
       }}
     >
       <Icon />

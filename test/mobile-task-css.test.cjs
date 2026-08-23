@@ -21,40 +21,31 @@ const headerTsx = read('src', 'client', 'MobileSessionHeader.tsx')
  * child of the root and disappeared with it, leaving the pill opening the
  * info card instead of the real list.
  */
-test('the native task/subagent roots are parked as invisible anchors, not shown or removed', () => {
-  // Shown as-is they overflow the 92px header column across the title;
-  // display:none'd they take their own popover with them and the pill has
-  // nothing to open. Zero-width root + hidden trigger is the middle ground.
-  const root = headerCss.match(
-    /\[data-slot="conversation\.session\.header\.actions"\] > \[class\$="_root"\]:has\(> button\[class\$="_trigger"\]\)\s*\{([\s\S]*?)\}/,
-  )
-  assert.ok(root, 'the native roots must be addressed explicitly')
-  assert.match(root[1], /position: absolute !important/)
-  assert.match(root[1], /width: 0 !important/)
-  assert.doesNotMatch(root[1], /display:\s*none/, 'hiding the root would kill the popover')
-
-  const trigger = headerCss.match(
-    /> \[class\$="_root"\] > button\[class\$="_trigger"\]\s*\{([\s\S]*?)\}/,
-  )
-  assert.ok(trigger, 'the official trigger must be addressed')
-  assert.match(trigger[1], /display: none !important/, 'the pill replaces the official trigger')
+test('CSS never re-arms a size or pointer-events on the official trigger', () => {
+  // The overlay owns the trigger's geometry at runtime. A stylesheet rule that
+  // sized it, hid it, or set pointer-events would take the tap target away —
+  // which is exactly how the pill went dead once already.
+  const rules = headerCss.match(/> \* > button\[class\$="_trigger"\][\s\S]*?\}/g) || []
+  for (const r of rules) {
+    assert.doesNotMatch(r, /pointer-events/, 'the overlay needs the trigger tappable')
+    assert.doesNotMatch(r, /display:\s*none/, 'a hidden trigger cannot receive a real tap')
+  }
 })
 
-test('the popover is right-anchored and viewport-clamped', () => {
-  // Left-anchoring from a zero-width root at the right edge puts a 336px
-  // panel off-screen — the exact 29px overflow measured on 2026-08-20.
-  const menu = headerCss.match(/header\.actions"\] \[class\$="_menu"\]\s*\{([\s\S]*?)\}/)
-  assert.ok(menu, 'the popover must be re-anchored')
-  assert.match(menu[1], /right: 0 !important/)
-  assert.match(menu[1], /left: auto !important/)
-  assert.match(menu[1], /width: min\(336px, calc\(100vw - 32px\)\)/)
-})
-
-test('the pill opens the official popover rather than the info card', () => {
-  assert.match(headerTsx, /aria-haspopup="tree"/, 'subagent trigger is found by its ARIA contract')
-  assert.match(headerTsx, /button\[class\$="_trigger"\]:not\(\[aria-haspopup\]\)/, 'jobs trigger is the one without it')
-  assert.match(headerTsx, /el === null \? onFallback\(\) : undefined|if \(el === null\) onFallback\(\)/, 'a missing entry still does something')
-  assert.match(headerTsx, /else el\.click\(\)/, 'present entry gets the tap forwarded')
+test('the overlay lays the official trigger over the pill instead of scripting it', () => {
+  const overlay = read('src', 'client', 'effects', 'native-trigger-overlay.ts')
+  // Strip comments first — the file deliberately explains why .click() is not
+  // used, and matching that prose would be a false positive.
+  const code = overlay.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
+  // Real tap on the real element: 0.1.1 ignores .click() and synthetic
+  // pointer/mouse events; only trusted input opens the popover.
+  assert.doesNotMatch(code, /\.click\(\)/, 'must not script the official trigger')
+  assert.match(overlay, /'position', 'fixed'/, 'fixed rect is what the portalled popover measures against')
+  assert.match(overlay, /'pointer-events', 'auto'/)
+  assert.match(overlay, /'opacity', '0'/, 'invisible, but present')
+  assert.match(overlay, /aria-haspopup="tree"/, 'subagent pairing keeps the ARIA split')
+  // The pill must not eat the tap meant for the trigger on top of it.
+  assert.match(headerCss, /\[data-mobile-nav="activity-pill"\]\s*\{[^}]*pointer-events: none/)
 })
 
 test('the activity chip reports subagents and background jobs from the sessions snapshot', () => {
