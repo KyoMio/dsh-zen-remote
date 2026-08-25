@@ -213,6 +213,8 @@ export function apply(ctx: ClientContext): void {
       startSession: (workspaceId?: WorkspaceId) => ctx.workspaces.startSession(workspaceId),
       // S5 session-log chip — the same service call MobileDrawerFooter uses.
       downloadSessionLog: (id: SessionId) => ctx.sessionLogDownload.download(id),
+      // Row swipe action — the same binding MobileSessionInfo archives with.
+      archiveSession: (id: SessionId) => ctx.workspaces.archiveSession(id),
     }),
   }, MobileHome))
 

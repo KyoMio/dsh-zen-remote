@@ -222,6 +222,70 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
   }
+  /* Swipe-to-archive wrapper (redone 2026-08-25, real-device round): iOS-mail
+     mechanics. The wrapper CLIPS (overflow hidden, same 22px radius as the
+     card) and the archive button is parked past the right edge, sliding in
+     lock-step with the card — a 1px drag reveals a 1px slice, never a
+     fully-drawn button behind a gap. Clipping would eat the card's cast
+     shadow, so the light-theme shadow moves up to this wrapper (identical
+     values; the dark theme's INSET hairline on the card survives clipping
+     untouched). pan-y keeps vertical list scrolling native; the direction
+     lock in MobileHome.tsx decides horizontal-vs-vertical once per touch. */
+  [data-mobile-nav="home-swipe"] {
+    position: relative;
+    overflow: hidden;
+    border-radius: 22px;
+    /* The list is a flex column: without this, an overflowing list SHRINKS
+       every row and the clip above slices the squashed card's bottom edge
+       flat (real-device report, 2026-08-25). Rows keep natural height; the
+       list scrolls. */
+    flex: 0 0 auto;
+    touch-action: pan-y;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .06), 0 4px 12px rgba(0, 0, 0, .05);
+  }
+  body[data-ds-dark-theme] [data-mobile-nav="home-swipe"] {
+    box-shadow: none;
+  }
+  /* Press = settle toward the page (mirrors the card's own :active swap,
+     which the clip made invisible at wrapper level). */
+  [data-mobile-nav="home-swipe"]:has([data-mobile-nav="home-row"]:active) {
+    box-shadow: 0 1px 2px rgba(0, 0, 0, .05);
+  }
+  body[data-ds-dark-theme] [data-mobile-nav="home-swipe"]:has([data-mobile-nav="home-row"]:active) {
+    box-shadow: none;
+  }
+  [data-mobile-nav="home-swipe-card"] {
+    position: relative;
+    z-index: 1;
+    transition: transform .22s var(--ds-ease-out, ease-out);
+    will-change: transform;
+  }
+  /* Inset pill, not a full-bleed slab (real-device feedback: hard edges).
+     5px breathing room on three sides inside the 88px reveal; its own
+     radius echoes the card family. It still slides in lock-step from past
+     the right edge (transform driven from MobileHome.tsx). */
+  [data-mobile-nav="home-archive"] {
+    position: absolute;
+    z-index: 0;
+    top: 5px;
+    bottom: 5px;
+    right: 5px;
+    width: 78px;
+    border: none;
+    border-radius: 17px;
+    background: var(--dsw-alias-state-error-primary, #d4494c);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: transform .22s var(--ds-ease-out, ease-out);
+    will-change: transform;
+  }
+  [data-mobile-nav="home-archive"]:active {
+    filter: brightness(.9);
+  }
+
   [data-mobile-nav="home-row"] {
     display: flex;
     align-items: center;

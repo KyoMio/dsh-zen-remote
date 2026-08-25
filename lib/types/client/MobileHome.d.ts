@@ -10,6 +10,8 @@ export type MobileHomeProps = PropsRuntime<'shell.overlay'> & PropsStore<ReturnT
     startSession: (workspaceId?: WorkspaceId) => void;
     /** Bound ctx.sessionLogDownload.download() — the session-log chip (S5). */
     downloadSessionLog: (id: SessionId) => void;
+    /** Bound ctx.workspaces.archiveSession(id) — the row swipe action. */
+    archiveSession: (id: SessionId) => Promise<void>;
 };
 /**
  * Phone home screen: the full-screen session list that owns the first level
@@ -20,5 +22,5 @@ export type MobileHomeProps = PropsRuntime<'shell.overlay'> & PropsStore<ReturnT
  * all navigation from the injected official actions; nothing here reads the
  * official DOM.
  */
-export declare function MobileHome({ useSessions, useWorkspaces, useStore, actions, openSession, startSession, downloadSessionLog, t, }: MobileHomeProps): import("react").JSX.Element | null;
+export declare function MobileHome({ useSessions, useWorkspaces, useStore, actions, openSession, startSession, downloadSessionLog, archiveSession, t, }: MobileHomeProps): import("react").JSX.Element | null;
 //# sourceMappingURL=MobileHome.d.ts.map

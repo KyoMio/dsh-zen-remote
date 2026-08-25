@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode, TouchEvent as ReactTouchEvent } from 'react'
 import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import {
   IconChevronDownOutline14,
@@ -33,10 +34,135 @@ export type MobileHomeProps =
     startSession: (workspaceId?: WorkspaceId) => void
     /** Bound ctx.sessionLogDownload.download() — the session-log chip (S5). */
     downloadSessionLog: (id: SessionId) => void
+    /** Bound ctx.workspaces.archiveSession(id) — the row swipe action. */
+    archiveSession: (id: SessionId) => Promise<void>
   }
 
 /** Phone breakpoint: below the tablet range, where the app-shell layout applies. */
 const PHONE_QUERY = '(max-width: 767px)'
+
+/** Swipe geometry: reveal width of the archive action / settle threshold. */
+const SWIPE_REVEAL = 88
+const SWIPE_SETTLE = 44
+
+/**
+ * Direction-lock slop: total displacement before the gesture commits to
+ * horizontal (card drag) or vertical (native scroll) — decided ONCE per
+ * touch, the way native swipe rows do it. Before the lock nothing moves.
+ */
+const SWIPE_SLOP = 10
+/** Horizontal wins only when clearly flatter than ~35° (|dx| > 1.4·|dy|). */
+const SWIPE_SLOPE = 1.4
+
+/**
+ * One session row with swipe-left-to-archive (user request, 2026-08-25;
+ * interaction redone after real-device feedback the same day).
+ *
+ * Native-pattern mechanics:
+ * - **One-shot direction lock.** The first ~10px of displacement decides the
+ *   whole gesture: clearly-flat movement (|dx| > 1.4·|dy|) locks to the card
+ *   drag, anything else locks to native vertical scroll and the card never
+ *   moves again for that touch. The first version re-judged every move
+ *   sample, so a curvy upward scroll could flip mid-gesture into a drag.
+ * - **Progressive reveal, iOS-mail style.** The wrapper clips (overflow:
+ *   hidden) and the archive button is PARKED past the right edge, sliding in
+ *   lock-step with the card (button shift = reveal + card shift). Nothing is
+ *   pre-painted under the card, so a 1px drag shows a 1px slice of button
+ *   edge — not a fully drawn button popping through a gap.
+ * - At most one row open at a time (parent owns `open`); tapping an open or
+ *   mid-drag card closes it instead of navigating.
+ *
+ * Touch-only by design — the list only exists on the phone breakpoint.
+ */
+function SwipeRow({ open, onOpenChange, onArchive, archiveLabel, children }: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onArchive: () => void
+  archiveLabel: string
+  children: (guardClick: (navigate: () => void) => void) => ReactNode
+}) {
+  const start = useRef<{ x: number, y: number } | null>(null)
+  const lock = useRef<'h' | 'v' | null>(null)
+  const [drag, setDrag] = useState<number | null>(null)
+  // Ref mirror of `drag`: touchend must read the LATEST position even when
+  // the browser delivers move+end in one task (coalesced touch events) —
+  // the state value in this render's closure can be a frame stale.
+  const dragRef = useRef<number | null>(null)
+  const moveTo = (value: number | null): void => {
+    dragRef.current = value
+    setDrag(value)
+  }
+
+  const base = open ? -SWIPE_REVEAL : 0
+  const shift = drag ?? base
+  const dragging = drag !== null
+
+  const onTouchStart = (e: ReactTouchEvent): void => {
+    const t = e.touches[0]
+    if (t === undefined) return
+    start.current = { x: t.clientX, y: t.clientY }
+    lock.current = null
+  }
+  const onTouchMove = (e: ReactTouchEvent): void => {
+    const s = start.current
+    const t = e.touches[0]
+    if (s === null || t === undefined) return
+    const dx = t.clientX - s.x
+    const dy = t.clientY - s.y
+    if (lock.current === null) {
+      if (Math.hypot(dx, dy) < SWIPE_SLOP) return
+      lock.current = Math.abs(dx) > SWIPE_SLOPE * Math.abs(dy) ? 'h' : 'v'
+      if (lock.current === 'v') return
+      // Re-anchor so the card starts moving from here, not with a 10px jump.
+      start.current = { x: t.clientX, y: t.clientY }
+      return
+    }
+    if (lock.current === 'v') return
+    moveTo(Math.max(-SWIPE_REVEAL, Math.min(0, base + dx)))
+  }
+  const onTouchEnd = (): void => {
+    start.current = null
+    if (lock.current !== 'h') return
+    const settled = (dragRef.current ?? base) < -SWIPE_SETTLE
+    moveTo(null)
+    onOpenChange(settled)
+  }
+
+  const guardClick = (navigate: () => void): void => {
+    // A tap on an open (or mid-drag) card closes it; navigation needs a
+    // second, clean tap. Matches every list app's swipe convention.
+    if (open || lock.current === 'h') onOpenChange(false)
+    else navigate()
+  }
+
+  const motion = dragging ? { transition: 'none' as const } : {}
+  return (
+    <li
+      data-mobile-nav="home-swipe"
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+      onTouchCancel={onTouchEnd}
+    >
+      <button
+        type="button"
+        data-mobile-nav="home-archive"
+        tabIndex={open ? 0 : -1}
+        aria-hidden={!open}
+        style={{ transform: `translateX(${SWIPE_REVEAL + shift}px)`, ...motion }}
+        onClick={onArchive}
+      >
+        {archiveLabel}
+      </button>
+      <div
+        data-mobile-nav="home-swipe-card"
+        style={{ transform: `translateX(${shift}px)`, ...motion }}
+      >
+        {children(guardClick)}
+      </div>
+    </li>
+  )
+}
 
 
 /** Live matchMedia hook for the phone breakpoint. */
@@ -121,6 +247,7 @@ export function MobileHome({
   openSession,
   startSession,
   downloadSessionLog,
+  archiveSession,
   t,
 }: MobileHomeProps) {
   const phone = usePhone()
@@ -133,6 +260,17 @@ export function MobileHome({
   const sessions = useSessions((s) => s)
   const workspaces = useWorkspaces((s) => s)
   const [sheet, setSheet] = useState<'filter' | 'chips' | null>(null)
+  /** The one row whose archive action is swiped open (null = none). */
+  const [swipeOpen, setSwipeOpen] = useState<SessionId | null>(null)
+
+  /** Archive with the same confirm gate the session-info card uses. */
+  const onArchiveRow = (id: SessionId): void => {
+    if (!window.confirm(t('infoArchiveConfirm'))) { setSwipeOpen(null); return }
+    setSwipeOpen(null)
+    // The store removes the row reactively (archivedSessionIds frame echo);
+    // failures leave the row in place, which is the honest outcome.
+    void archiveSession(id)
+  }
 
   // Workspace of the current session — the untouched filter default.
   const currentWorkspaceId = useMemo(() => {
@@ -159,8 +297,22 @@ export function MobileHome({
       .filter((row) => !row.blank && row.parentId === undefined && row.origin !== 'subagent')
       .filter((row) => !archived.has(row.id))
       .filter((row) => scope === null || scope.has(row.id))
+      // A session that never completed a single turn is not established yet —
+      // creating one from the FAB and backing out leaves these behind, and
+      // they pile up as basename-titled rows (user report, 2026-08-25). The
+      // host's sessionStats projection rides every list row; `turns` counts
+      // turns with at least one CLOSED step, and cancelled steps count too,
+      // so an interrupted first reply still shows. Keep when: it is the
+      // current session (highlight row), it is running (first reply in
+      // flight), it earned a title, or the projection is absent (no signal —
+      // show rather than silently hide).
+      .filter((row) => {
+        if (row.id === sessions.current || row.running || row.title !== undefined) return true
+        const stats = (row.projectionValues as { sessionStats?: { turns?: number } } | undefined)?.sessionStats
+        return stats?.turns === undefined || stats.turns > 0
+      })
       .sort((a, b) => b.updatedAt - a.updatedAt)
-  }, [sessions.ids, sessions.byId, workspaces.archivedSessionIds, selectedWorkspace])
+  }, [sessions.ids, sessions.byId, sessions.current, workspaces.archivedSessionIds, selectedWorkspace])
 
   // The session header's back button (session scope) cannot hold this
   // store directly — a handle mounts under exactly one scope, and this one
@@ -269,27 +421,35 @@ export function MobileHome({
           const status = statusLine(row, dot, t)
           const initial = row.displayTitle.trim().charAt(0).toUpperCase()
           return (
-            <li key={row.id}>
-              <button
-                type="button"
-                data-mobile-nav="home-row"
-                data-current={row.id === sessions.current ? '' : undefined}
-                onClick={() => enter(() => openSession(row.id))}
-              >
-                <span data-mobile-nav="home-row-avatar" aria-hidden="true">
-                  {dot !== undefined ? <StateDot state={dot} size={10} /> : initial}
-                </span>
-                <span data-mobile-nav="home-row-body">
-                  <span data-mobile-nav="home-row-title">{row.displayTitle}</span>
-                  {status !== undefined && (
-                    <span data-mobile-nav="home-row-status">{status}</span>
-                  )}
-                </span>
-                <time data-mobile-nav="home-row-time" dateTime={new Date(row.updatedAt).toISOString()}>
-                  {relativeTime(row.updatedAt)}
-                </time>
-              </button>
-            </li>
+            <SwipeRow
+              key={row.id}
+              open={swipeOpen === row.id}
+              onOpenChange={(open) => setSwipeOpen(open ? row.id : null)}
+              onArchive={() => onArchiveRow(row.id)}
+              archiveLabel={t('infoArchive')}
+            >
+              {(guardClick) => (
+                <button
+                  type="button"
+                  data-mobile-nav="home-row"
+                  data-current={row.id === sessions.current ? '' : undefined}
+                  onClick={() => guardClick(() => enter(() => openSession(row.id)))}
+                >
+                  <span data-mobile-nav="home-row-avatar" aria-hidden="true">
+                    {dot !== undefined ? <StateDot state={dot} size={10} /> : initial}
+                  </span>
+                  <span data-mobile-nav="home-row-body">
+                    <span data-mobile-nav="home-row-title">{row.displayTitle}</span>
+                    {status !== undefined && (
+                      <span data-mobile-nav="home-row-status">{status}</span>
+                    )}
+                  </span>
+                  <time data-mobile-nav="home-row-time" dateTime={new Date(row.updatedAt).toISOString()}>
+                    {relativeTime(row.updatedAt)}
+                  </time>
+                </button>
+              )}
+            </SwipeRow>
           )
         })}
         {rows.length === 0 && <li data-mobile-nav="home-empty">{t('noSessions')}</li>}
