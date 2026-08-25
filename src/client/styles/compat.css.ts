@@ -832,11 +832,22 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
      preset change, so a CSS pseudo-element is the survives-re-render fix
      (same reasoning as the old model Sparkle ::before above).
 
-     Presence gate: the trigger's aria-label is t('input.accessMode',
-     {name}) with the raw preset display name embedded untranslated —
-     "…Auto" only ever appears when dsh-auto-approve's preset patch is
-     installed AND selected. Plugin absent → selector never matches →
-     section inert (compat discipline). Paths are the plugin's own
+     Presence gates, honestly stated (2026-08-25 review):
+     - Trigger rule: aria-label is t('input.accessMode', {name}) with the
+       raw preset display name embedded untranslated and (zh/en verified)
+       at the END of the string — [aria-label$="Auto"] matches exactly the
+       auto-approve preset being selected, and cannot match a future
+       "Autopilot"-style preset. Plugin absent → the name never renders →
+       inert. This is a DIRECT gate on the plugin's own preset name.
+     - Menu-item rule: INDIRECT gate only. It matches "permission-menu item
+       without an official icon span"; the official three presets all ship
+       icon spans in the menu (verified live), so with the plugin absent
+       nothing matches. Known boundary: another plugin's icon-less preset,
+       or a host redesign dropping icon spans, would wrongly receive this
+       shield. A direct gate is not possible: menu items carry no
+       id/data attributes to anchor on, CSS cannot match text, and gating
+       on the plugin's own JS-injected markers would kill this fallback in
+       exactly the JS-did-not-run case it exists for. Paths are the plugin's own
      shield outline + four-point sparkle (permission-glyph.ts), stroke
      shield + filled sparkle, drawn as a currentColor mask. */
   @media (max-width: 767px) {
@@ -849,7 +860,7 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
        injection: once its svg lands it arrives inside a cloned icon span,
        the :not() stops matching, no double icon. */
     [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] [role="menu"] button[role="menuitem"]:not(:has([class*="_itemIcon_"]))::before,
-    [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] button[class$="_trigger"][aria-label*="Auto"]::before {
+    [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] button[class$="_trigger"][aria-label$="Auto"]::before {
       content: '';
       width: 16px;
       height: 16px;
