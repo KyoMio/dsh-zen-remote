@@ -821,4 +821,46 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
       padding: 6px 12px !important;
     }
   }
+
+  /* ---------- dsh-auto-approve compatibility ----------
+     The composer.css.ts phone rules collapse the permission trigger to an
+     icon-only pill, but the official permissionGlyphs table only draws
+     icons for read-only / workspace-write — the auto-approve plugin's
+     "auto" preset gets none, so its pill showed a bare chevron. The plugin
+     injects its shield+sparkle svg into the MENU items itself (DOM,
+     content-anchored), but the collapsed TRIGGER re-renders on every
+     preset change, so a CSS pseudo-element is the survives-re-render fix
+     (same reasoning as the old model Sparkle ::before above).
+
+     Presence gate: the trigger's aria-label is t('input.accessMode',
+     {name}) with the raw preset display name embedded untranslated —
+     "…Auto" only ever appears when dsh-auto-approve's preset patch is
+     installed AND selected. Plugin absent → selector never matches →
+     section inert (compat discipline). Paths are the plugin's own
+     shield outline + four-point sparkle (permission-glyph.ts), stroke
+     shield + filled sparkle, drawn as a currentColor mask. */
+  @media (max-width: 767px) {
+    /* Fallback for the MENU items too (real-phone report 2026-08-25: the
+       plugin's DOM injection did not run in that page instance while this
+       CSS did — bundle load timing differs per plugin). Any permission-menu
+       item WITHOUT the official icon span gets the shield drawn by CSS;
+       today that is exactly the plugin "auto" preset (the official three
+       all ship icons in the menu). Self-coordinating with the plugin's own
+       injection: once its svg lands it arrives inside a cloned icon span,
+       the :not() stops matching, no double icon. */
+    [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] [role="menu"] button[role="menuitem"]:not(:has([class*="_itemIcon_"]))::before,
+    [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] button[class$="_trigger"][aria-label*="Auto"]::before {
+      content: '';
+      width: 16px;
+      height: 16px;
+      flex: none;
+      background: currentColor;
+      -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8.20554 0.899994L14.7901 3.36857V7.01026C14.7901 12 11.0466 14.2103 8.20554 15.3C5.36446 14.2103 1.62012 12 1.62012 7.01026V3.36857L8.20554 0.899994Z' fill='none' stroke='black' stroke-width='1.31831' stroke-linejoin='round'/%3E%3Cpath d='M8.35 5.4C8.35 7.2 7.15 8.4 5.35 8.4C7.15 8.4 8.35 9.6 8.35 11.4C8.35 9.6 9.55 8.4 11.35 8.4C9.55 8.4 8.35 7.2 8.35 5.4Z'/%3E%3C/svg%3E");
+      mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8.20554 0.899994L14.7901 3.36857V7.01026C14.7901 12 11.0466 14.2103 8.20554 15.3C5.36446 14.2103 1.62012 12 1.62012 7.01026V3.36857L8.20554 0.899994Z' fill='none' stroke='black' stroke-width='1.31831' stroke-linejoin='round'/%3E%3Cpath d='M8.35 5.4C8.35 7.2 7.15 8.4 5.35 8.4C7.15 8.4 8.35 9.6 8.35 11.4C8.35 9.6 9.55 8.4 11.35 8.4C9.55 8.4 8.35 7.2 8.35 5.4Z'/%3E%3C/svg%3E");
+      -webkit-mask-size: contain;
+      mask-size: contain;
+      -webkit-mask-repeat: no-repeat;
+      mask-repeat: no-repeat;
+    }
+  }
 `

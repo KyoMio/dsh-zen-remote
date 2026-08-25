@@ -43,6 +43,10 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     justify-content: flex-start !important;
     gap: 5px !important;
     padding: 2px 8px 8px !important;
+    /* One line, always: the model pill is the only shrinkable item (its
+       label ellipsizes), so wrapping would only ever push the send button
+       to a second row (real-device report, 2026-08-25). */
+    flex-wrap: nowrap !important;
   }
   ${ROW} > [class$="_tools"],
   ${ROW} > [class$="_trailing"] {
@@ -69,8 +73,14 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      the right edge, so no spacer element is needed. */
   ${MODEL} {
     order: 4 !important;
-    flex: 0 1 auto !important;
+    /* A definite flex-basis (not auto) breaks the circular sizing between
+       this seat and the trigger's max-width:100%: the seat's width comes
+       from flex resolution, the trigger fills up to it, the label
+       ellipsizes inside. Under nowrap pressure this is the only
+       min-width:0 seat, so it absorbs all shrink. */
+    flex: 0 1 min(48vw, 200px) !important;
     min-width: 0 !important;
+    max-width: min(48vw, 200px) !important;
     margin-right: auto !important;
   }
   /* Third-party input.right entries park next to the ring rather than
@@ -87,11 +97,11 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     order: 7 !important;
   }
 
-  /* --- 3. permission + model as icon-only pills (real-device round 2, 2026-08-17) ---
-     S3's icon-and-label capsules read as noise on an actual phone — there
-     is no room to usefully show a preset name or a model id, so the label
-     text is now hidden outright and both triggers collapse to a plain
-     ~44x30 icon button. This AGREES with (rather than fights) the official
+  /* --- 3. permission as icon-only pill; model as name+effort pill ---
+     (real-device round 2, 2026-08-17; model pill reworked 2026-08-25:
+     the user wants to SEE which model/effort is active, so only the
+     permission trigger stays icon-only — its label is hidden and it
+     collapses to a plain ~44x30 icon button. This AGREES with (rather than fights) the official
      container query (\`@container (width <= 460px) { .trigger:has(.triggerIcon)
      .triggerLabel { display: none } }\`) that S3 had to override — no need
      to override it back. Accessible name is unaffected: both official
@@ -114,13 +124,10 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      accessible-name computation (empty generated content). S3's
      rtl-ellipsis trick on the model label is simply inert under
      display:none now; left alone rather than unpicked. */
-  ${PERM} [class$="_triggerLabel"],
-  ${MODEL} > [class$="_trigger"] > [class$="_triggerLabel"],
-  ${MODEL} > [class$="_trigger"] > [class$="_triggerEffort"] {
+  ${PERM} [class$="_triggerLabel"] {
     display: none !important;
   }
-  ${PERM} button[class$="_trigger"],
-  ${MODEL} > [class$="_trigger"] {
+  ${PERM} button[class$="_trigger"] {
     background: var(--dsw-specific-selector, rgba(127, 127, 127, .12)) !important;
     width: 44px !important;
     height: 30px !important;
@@ -132,29 +139,47 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 999px !important;
     touch-action: manipulation !important;
   }
+  /* Model trigger: name + effort pill (2026-08-25 user request — the
+     icon-only form hid which model was active). The effort text must stay
+     whole; the model NAME is the elastic part and ellipsizes. max-width
+     caps the pill so the row's elastic gap survives extreme model ids;
+     the label rules below override the <=1023px grow rules in
+     layout.css.ts (flex 1 1 auto) that would otherwise pad the pill. */
+  ${MODEL} > [class$="_trigger"] {
+    background: var(--dsw-specific-selector, rgba(127, 127, 127, .12)) !important;
+    height: 30px !important;
+    width: auto !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    padding: 0 10px !important;
+    gap: 4px !important;
+    justify-content: flex-start !important;
+    border-radius: 999px !important;
+    touch-action: manipulation !important;
+    font-size: 12px !important;
+  }
+  ${MODEL} > [class$="_trigger"] > [class$="_triggerLabel"] {
+    display: block !important;
+    flex: 0 1 auto !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+  }
+  ${MODEL} > [class$="_trigger"] > [class$="_triggerEffort"] {
+    display: block !important;
+    flex: none !important;
+    white-space: nowrap !important;
+  }
   /* PermissionSelect wraps its trigger in the Menu primitive's root span,
      which must shrink to the icon button's fixed width. */
   ${PERM} > span:has(> button[class$="_trigger"]) {
     flex: 0 0 auto !important;
     min-width: 0 !important;
   }
-  /* ic_ds_sparkle_16 (@deepseek-ai/dsh-client-ui-primitives IconSparkle16
-     path, copied verbatim) as a mask so it inherits currentColor like every
-     other icon in the row — the model trigger has no official icon slot to
-     hook into. */
-  ${MODEL} > [class$="_trigger"]::before {
-    content: '';
-    width: 16px;
-    height: 16px;
-    flex: none;
-    background: currentColor;
-    -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.1 3.1Q6.6 7.8 11.3 8.3Q6.6 8.8 6.1 13.5Q5.6 8.8 0.9 8.3Q5.6 7.8 6.1 3.1Z'/%3E%3Cpath d='M11.9 1Q12.2 3.7 14.9 4Q12.2 4.3 11.9 7Q11.6 4.3 8.9 4Q11.6 3.7 11.9 1Z'/%3E%3C/svg%3E");
-    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.1 3.1Q6.6 7.8 11.3 8.3Q6.6 8.8 6.1 13.5Q5.6 8.8 0.9 8.3Q5.6 7.8 6.1 3.1Z'/%3E%3Cpath d='M11.9 1Q12.2 3.7 14.9 4Q12.2 4.3 11.9 7Q11.6 4.3 8.9 4Q11.6 3.7 11.9 1Z'/%3E%3C/svg%3E");
-    -webkit-mask-size: contain;
-    mask-size: contain;
-    -webkit-mask-repeat: no-repeat;
-    mask-repeat: no-repeat;
-  }
+  /* (2026-08-25) The model trigger's CSS-only Sparkle ::before icon is gone:
+     the pill now shows the model name + effort text itself, so an icon would
+     just eat label width. */
 
   /* --- 4. both menus become bottom sheets ---
      The permission menu is the Menu primitive (role=menu, absolute, side=top)
