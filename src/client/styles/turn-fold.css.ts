@@ -21,6 +21,9 @@ import { OPEN, PROCESS_KINDS, THINK } from '../effects/turn-fold.ts'
 /** Mirror of the root attribute effects/turn-fold.ts holds while attached. */
 const ACTIVE = 'data-mnav-fold-on'
 
+/** One assistant-step row, inside an active fold. */
+const STEP = `html[${ACTIVE}] [data-chat-flow] > [data-chat-flow-kind="assistant-step"]`
+
 /**
  * Born folded — the reason a new tool call no longer blinks into view.
  *
@@ -37,22 +40,45 @@ const ACTIVE = 'data-mnav-fold-on'
  * block is live for exactly the widths the fold is, and hides nothing at all
  * when the effect never ran.
  *
- * One case stays with the effect: an assistant-step row whose whole body is
- * reasoning has to be hidden as a row (an emptied-out flex item still claims
- * the flow column's 16px gap), and "this row has nothing but Think in it" is
- * not a selector. Its rows therefore still fold a frame late — as blank
- * space, not as content, since the Think rows below are hidden here.
+ * The Think rule reads {@link OPEN} off the ROW as well as off the block:
+ * a row folded whole (see {@link WHOLE_STEP}) is the item the effect marks,
+ * so an expanded turn carries the override on the row and its reasoning
+ * would otherwise stay hidden behind this rule — the reader clicked the chip
+ * and got an empty band (issue #3, 2026-08-25).
  */
 const BORN_FOLDED = [
   ...PROCESS_KINDS.map((kind) => `html[${ACTIVE}] [data-chat-flow] > [data-chat-flow-kind="${kind}"]:not([${OPEN}])`),
-  `html[${ACTIVE}] [data-chat-flow] > [data-chat-flow-kind="assistant-step"] ${THINK}:not([${OPEN}])`,
+  `${STEP}:not([${OPEN}]) ${THINK}:not([${OPEN}])`,
 ].join(',\n')
+
+/*
+ * The one folded item with no selector of its own: an assistant-step row that
+ * holds reasoning and nothing else. It has to go as a ROW — the flow column is
+ * `display: flex` with `gap: 16px`, so a row whose every child is hidden still
+ * claims its gap and the reader sees a blank band — and "this row has nothing
+ * but Think in it" cannot be written as a selector.
+ *
+ * `:has()` looks like it can: "holds reasoning, holds no content block that is
+ * not reasoning". It cannot, safely. Every wrapper between the row and the
+ * blocks is itself a non-reasoning element, so the guard has to name the exact
+ * depth of the blocks — and the real tree is
+ * flowItem > seat > AssistantMarkdown root > body > blocks, one level deeper
+ * than the host's own component suggests, because the slot seat adds a wrapper
+ * the component never sees. A selector pinned to that depth silently stops
+ * matching the day a wrapper moves, with nothing to say why.
+ *
+ * So the row stays with effects/turn-fold.ts, which walks the tree instead of
+ * assuming its shape — but marks it synchronously in the MutationObserver
+ * callback (a microtask, before the frame paints) rather than a rAF later.
+ */
 
 /** The fold + chip rules, with every selector prefixed by `scope`. */
 const rules = (scope: string): string => `
-  /* Folded process: tool-call / context / command rows and the Think
-     disclosures inside an assistant step. !important because the official
-     flow item and ReasoningRow both set their own display. */
+  /* The reasoning-only row (see above), which effects/turn-fold.ts marks
+     itself because no selector can find it. Everything else is already hidden
+     by BORN_FOLDED, by the host's own markers — this rule is what that one
+     case rides on. !important because the official flow item and ReasoningRow
+     both set their own display. */
   ${scope} [data-mnav-fold]:not([data-mnav-fold-open]) {
     display: none !important;
   }

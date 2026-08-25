@@ -36,12 +36,29 @@ test('the URL param persists the per-browser override, both directions', () => {
   assert.match(effect, /localStorage\.removeItem\(DESKTOP_KEY\)/, '=0 opts back out')
 })
 
+/* The config fetch is a round-trip and first paint is not, so a desktop
+ * reader watched the whole session render unfolded and then collapse, every
+ * page load (issue #3). The answer is remembered; the row stays the
+ * authority, so a knob turned back off forgets it again. */
+test('the row answer is remembered, and forgotten when the row says no', () => {
+  assert.match(effect, /DESKTOP_CACHE_KEY = 'dsh-mobile-nav\.turn-fold-desktop-seen'/, 'cache key exists')
+  assert.notEqual(
+    effect.match(/DESKTOP_CACHE_KEY = '([^']+)'/)[1],
+    effect.match(/DESKTOP_KEY = '([^']+)'/)[1],
+    'the remembered answer must not collide with the explicit per-browser override',
+  )
+  const answer = effect.match(/desktopConfigured\(\)\.then\(\(on\) => \{([\s\S]*?)\n {4}\}\)/)
+  assert.ok(answer, 'the config answer still drives the switch')
+  assert.match(answer[1], /setItem\(DESKTOP_CACHE_KEY, '1'\)/, 'a yes is remembered')
+  assert.match(answer[1], /removeItem\(DESKTOP_CACHE_KEY\)/, 'a no is forgotten — the row stays the authority')
+})
+
 test('either switch attaches at every width and drops the breakpoint listener', () => {
   const wiring = effect.match(/const enableDesktop = ([\s\S]*?)\n {2}\}, 'dsh-mobile-nav/)
   assert.ok(wiring, 'the desktop switch must drive the attach wiring')
   assert.match(wiring[1], /setAttribute\(DESKTOP_ATTR, ''\)/, 'root attribute is stamped')
   assert.match(wiring[1], /removeAttribute\(DESKTOP_ATTR\)/, 'and removed on cleanup')
-  assert.match(wiring[1], /if \(desktopOptIn\(\)\) enableDesktop\(\)/, 'local override wins without a round-trip')
+  assert.match(wiring[1], /if \(desktopOptIn\(\) \|\| localStorage\.getItem\(DESKTOP_CACHE_KEY\) === '1'\) enableDesktop\(\)/, 'both switches are read synchronously, without a round-trip')
   assert.match(wiring[1], /desktopConfigured\(\)\.then/, 'row config is honoured when the override is absent')
   assert.match(wiring[1], /if \(narrow\.matches\) attach\(\)\s*\n\s*narrow\.addEventListener/, 'phone breakpoint attaches before the config answer arrives')
   assert.match(effect, /if \(desktop \|\| disposed\) return/, 'a late config answer after dispose is a no-op')
@@ -121,14 +138,56 @@ test('every process kind the effect folds is also born folded', () => {
     )
   }
   assert.ok(
-    emitted.includes(`[data-chat-flow-kind="assistant-step"] ${THINK}:not([${OPEN}])`),
+    emitted.includes(`[data-chat-flow-kind="assistant-step"]:not([${OPEN}]) ${THINK}:not([${OPEN}])`),
     'Think disclosures are not born folded',
   )
-  // The step's prose is the reply itself; only the effect may hide such a row
-  // whole, and only when reasoning is all it holds (foldsWholeRow).
-  assert.ok(
-    !emitted.includes(`> [data-chat-flow-kind="assistant-step"]:not([${OPEN}])`),
-    'born-folded would hide whole assistant-step rows — that hides the reply',
+})
+
+/*
+ * issue #3 (2026-08-25). Two defects, one cause: the reasoning-only row was
+ * the one folded item the stylesheet could not express, so the effect marked
+ * it a frame after React committed — long enough to paint a blank band on the
+ * way in, and to keep the row hidden for a frame after prose arrived in it.
+ * `:has()` does express it, which lets the stylesheet own every hide.
+ */
+
+test('the reasoning-only row is marked in the observer callback, not a frame later', () => {
+  // The rAF scan lands a painted frame after React commits. Everything else
+  // folded is already hidden by BORN_FOLDED before the effect looks; this row
+  // is not, so its marking has to happen in the microtask — otherwise the
+  // reader sees the flow column's 16px gap as a blank band on the way in, and
+  // the row stays hidden for a frame after prose arrives (issue #3).
+  const wiring = effect.match(/observer = new MutationObserver\(([\s\S]*?)\n {6}\}\)/)
+  assert.ok(wiring, 'the observer wiring moved — re-check what runs synchronously')
+  assert.match(wiring[1], /markWholeRows\(records\)/, 'the whole-row fold must be applied synchronously')
+  assert.match(wiring[1], /schedule\(\)/, 'the full rescan still coalesces on an animation frame')
+  const mark = effect.match(/const markWholeRows = [\s\S]*?\n {4}\}/)
+  assert.ok(mark, 'markWholeRows disappeared')
+  assert.match(mark[0], /foldsWholeRow\(row, thinks\)\) row\.setAttribute\(FOLD, ''\)/, 'it folds a reasoning-only row')
+  assert.match(mark[0], /else row\.removeAttribute\(FOLD\)/, 'and releases the row the moment it stops being one')
+  // Insertions report the flow column as target, not the new row, so the added
+  // nodes have to be walked too or a fresh row is never marked in time.
+  assert.match(mark[0], /record\.addedNodes/, 'a newly inserted row is only reachable through addedNodes')
+  assert.match(mark[0], /querySelectorAll\(STEP_SELECTOR\)/, 'a row nested inside an inserted subtree counts too')
+  // Mutation records reach the whole document, unlike scan()'s own walk of the
+  // flow column. Without this the effect stops being Chat-only and hides rows
+  // in any other view that seats chat nodes, with no chip to bring them back.
+  assert.match(mark[0], /parent === null \|\| !parent\.matches\(FLOW\)/, 'the sync marker must be scoped to the chat flow column')
+})
+
+test('the stale sweep clears open marks, not just folds', () => {
+  // A stale attribute outliving the DOM change that ended the fold is the
+  // 2026-08-18 bug; OPEN needs the sweep on its own account now, because it is
+  // what releases a row from the stylesheet's reasoning rules.
+  assert.match(
+    effect,
+    /for \(const stale of flow\.querySelectorAll\(`\[\$\{FOLD\}\], \[\$\{OPEN\}\]`\)\)/,
+    'the stale sweep must clear stale open marks too, not just folds',
+  )
+  assert.match(
+    effect,
+    /for \(const item of document\.querySelectorAll\(`\[\$\{FOLD\}\], \[\$\{OPEN\}\]`\)\)/,
+    'detach must clear them too, or a folded turn stays folded with no chip to open it',
   )
 })
 

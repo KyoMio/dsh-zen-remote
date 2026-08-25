@@ -14,6 +14,14 @@ const PHONE_QUERY = '(max-width: 767px)'
  *   `=0` opts back out). */
 const DESKTOP_KEY = 'dsh-mobile-nav.turn-fold-desktop'
 const DESKTOP_PARAM = 'mobile-nav-turn-fold'
+/** Last answer the row config gave. The fetch is a round-trip and the phone
+ * breakpoint is not, so a desktop reader used to watch a whole session render
+ * unfolded and then collapse at once, every page load (issue #3). Remembering
+ * the answer switches the fold on before first paint from the second load on.
+ * Enable-only: turning the row knob back off clears this, so that load still
+ * folds and the next one does not — a stale fold is a chip click away, a
+ * one-way `disableDesktop` is a state machine nobody asked for. */
+const DESKTOP_CACHE_KEY = 'dsh-mobile-nav.turn-fold-desktop-seen'
 /** Root attribute the stylesheet keys the width-independent rules on. */
 const DESKTOP_ATTR = 'data-mnav-desktop-fold'
 
@@ -58,10 +66,12 @@ const TURN_HEAD_KINDS = new Set(['user', 'steering'])
  * rendered inside an assistant-step row, beside that step's prose. */
 export const THINK = '[data-variant="think"]'
 
-/** Attribute the phone stylesheet turns into `display: none`. Still written
- * per element for the one case the stylesheet cannot express on its own: an
- * assistant-step row whose entire body is reasoning, which has to go as a
- * whole row (see {@link foldsWholeRow}). */
+/** Attribute the phone stylesheet turns into `display: none`. Written for the
+ * one case the stylesheet cannot express on its own: an assistant-step row
+ * whose entire body is reasoning, which has to go as a whole row (see
+ * {@link foldsWholeRow}). Because it is the only thing hiding that row, it is
+ * written from {@link markWholeRows} in the observer callback rather than the
+ * scan a frame later — see that function for what the frame cost. */
 const FOLD = 'data-mnav-fold'
 /** Per-item override written while its turn is expanded. */
 export const OPEN = 'data-mnav-fold-open'
@@ -72,6 +82,9 @@ export const OPEN = 'data-mnav-fold-open'
  * flashes in, then folds away" report, 2026-08-22); it also keeps the
  * stylesheet a no-op — content visible — if this effect never runs. */
 const ACTIVE_ATTR = 'data-mnav-fold-on'
+
+/** Selector of the one row kind that can fold whole — see {@link foldsWholeRow}. */
+const STEP_SELECTOR = '[data-chat-flow-kind="assistant-step"]'
 
 /**
  * True when the reasoning rows are the ONLY thing this row renders, so the
@@ -237,11 +250,64 @@ export function installTurnFold(ctx: ClientContext): void {
       // its row-level fold after prose started arriving in the same DOM node
       // (React updates the row in place), hiding the streaming reply until a
       // completion re-render rebuilt the row — the "reply only appears when
-      // the turn finishes" phone bug (2026-08-18).
-      for (const stale of flow.querySelectorAll(`[${FOLD}]`)) {
+      // the turn finishes" phone bug (2026-08-18). {@link OPEN} needs the
+      // same sweep on its own account: it is what releases a row from the
+      // stylesheet's reasoning rules, so a stale one shows the reasoning of
+      // a turn the reader has since folded.
+      for (const stale of flow.querySelectorAll(`[${FOLD}], [${OPEN}]`)) {
         if (liveItems.has(stale)) continue
         stale.removeAttribute(FOLD)
         stale.removeAttribute(OPEN)
+      }
+    }
+
+    /**
+     * Fold (or release) the reasoning-only rows this mutation batch touched,
+     * synchronously.
+     *
+     * The full {@link scan} is rAF-coalesced, and React commits after that
+     * frame's rAF phase, so a scan scheduled from a mutation lands one PAINTED
+     * frame later. For everything else that is invisible — the stylesheet
+     * already hid it by the host's own markers before the effect looked. For
+     * the whole-row fold, which nothing but {@link FOLD} hides, the reader saw
+     * that frame: a blank 16px band on the way in (the flow column's gap,
+     * which an emptied flex item still claims), and — worse — the row still
+     * hidden for a frame after prose started arriving into it, so the reply
+     * appeared to stutter (issue #3).
+     *
+     * A MutationObserver callback is a microtask: it runs at the end of the
+     * task that mutated the DOM, before that frame's rendering update. Marking
+     * here is therefore never a frame late, in either direction.
+     *
+     * ponytail: O(rows touched by the batch), not O(rows). If streaming ever
+     * feels heavy, the cheap win is skipping batches whose records are all
+     * characterData — the fold verdict only changes when elements do.
+     */
+    const markWholeRows = (records: readonly MutationRecord[]): void => {
+      const rows = new Set<Element>()
+      for (const record of records) {
+        const target = record.target
+        if (target instanceof Element) {
+          const row = target.closest(STEP_SELECTOR)
+          if (row !== null) rows.add(row)
+        }
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) continue
+          if (node.matches(STEP_SELECTOR)) rows.add(node)
+          for (const nested of node.querySelectorAll(STEP_SELECTOR)) rows.add(nested)
+        }
+      }
+      for (const row of rows) {
+        // Exactly what {@link groupsOf} walks: a direct child of the chat flow
+        // column. This is the scoping that keeps the effect Chat-only — the
+        // mutation records reach the whole document, so without it a row in
+        // any other view that seats chat nodes would get hidden with no chip
+        // to bring it back. It also drops rows detached since the batch.
+        const parent = row.parentElement
+        if (parent === null || !parent.matches(FLOW)) continue
+        const thinks = [...row.querySelectorAll(THINK)]
+        if (thinks.length > 0 && foldsWholeRow(row, thinks)) row.setAttribute(FOLD, '')
+        else row.removeAttribute(FOLD)
       }
     }
 
@@ -275,7 +341,7 @@ export function installTurnFold(ctx: ClientContext): void {
 
     const clear = (): void => {
       for (const chip of document.querySelectorAll(CHIP_SELECTOR)) chip.remove()
-      for (const item of document.querySelectorAll(`[${FOLD}]`)) {
+      for (const item of document.querySelectorAll(`[${FOLD}], [${OPEN}]`)) {
         item.removeAttribute(FOLD)
         item.removeAttribute(OPEN)
       }
@@ -284,7 +350,10 @@ export function installTurnFold(ctx: ClientContext): void {
     const attach = (): void => {
       if (observer !== null) return
       document.documentElement.setAttribute(ACTIVE_ATTR, '')
-      observer = new MutationObserver(schedule)
+      observer = new MutationObserver((records) => {
+        markWholeRows(records)
+        schedule()
+      })
       observer.observe(document.body, { childList: true, subtree: true })
       document.addEventListener('click', onClick)
       scan()
@@ -317,10 +386,17 @@ export function installTurnFold(ctx: ClientContext): void {
 
     if (narrow.matches) attach()
     narrow.addEventListener('change', onChange)
-    if (desktopOptIn()) enableDesktop()
-    // The row config arrives async; a late enable just attaches then. Not
-    // awaited before phone attach — folding must not wait on a round-trip.
-    else void desktopConfigured().then((on) => (on ? enableDesktop() : undefined))
+    // Both switches are synchronous reads, so a returning reader folds before
+    // first paint. Not awaited before phone attach either — folding must not
+    // wait on a round-trip.
+    if (desktopOptIn() || localStorage.getItem(DESKTOP_CACHE_KEY) === '1') enableDesktop()
+    // The row config still arrives async, and remains the authority: a late
+    // yes attaches then and is remembered, a no forgets. A late answer after
+    // dispose is a no-op inside enableDesktop.
+    void desktopConfigured().then((on) => {
+      if (on) { localStorage.setItem(DESKTOP_CACHE_KEY, '1'); enableDesktop() }
+      else localStorage.removeItem(DESKTOP_CACHE_KEY)
+    })
     // A language switch changes the chip copy of every already-rendered turn.
     const stopLocale = ctx.locale.subscribe(schedule)
     return () => {
