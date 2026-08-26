@@ -16,8 +16,14 @@ const compat = fs.readFileSync(
  * else: "dsh market" is a name several unrelated plugins use, so the gate is
  * the version chip's title attribute, which carries the exact package name.
  */
-const section = compat.slice(compat.indexOf('@ace-zone/dsh-market: modal header'))
-assert.ok(section.length > 0, 'the dsh-market compat section must exist')
+/* Bounded at the next section divider, not at EOF: the file gained sections
+ * after this one (dsh-auto-approve, 2026-08-25), and an EOF slice fed their
+ * comment lines into the selector scan — a comment continuation ending in a
+ * comma reads exactly like a selector line (the 1.1.8-era false failure). */
+const sliced = compat.slice(compat.indexOf('@ace-zone/dsh-market: modal header'))
+assert.ok(sliced.length > 0, 'the dsh-market compat section must exist')
+const nextDivider = sliced.indexOf('/* ---------- ')
+const section = nextDivider === -1 ? sliced : sliced.slice(0, nextDivider)
 
 test('the gate is the exact package name, not the dshm- class prefix', () => {
   assert.match(compat, /const MARKET = '\.dshm-ver\[title="@ace-zone\/dsh-market"\]'/)
