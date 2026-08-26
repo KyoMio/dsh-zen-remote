@@ -12,6 +12,7 @@ import { MOBILE_CSS } from './styles/index.ts'
 import { installDebugBadge } from './debug.ts'
 import { installPhoneChrome, installSunkInset, installViewportHeal } from './effects/phone-chrome.ts'
 import { installAionuiCompat } from './effects/aionui-compat.ts'
+import { installWorkbenchRefClose } from './effects/workbench-ref-close.ts'
 import { installHeaderStatusDot } from './effects/header-status.ts'
 import { installGestures } from './effects/gestures.ts'
 import { installTurnFold } from './effects/turn-fold.ts'
@@ -69,6 +70,10 @@ export function apply(ctx: ClientContext): void {
   installSunkInset(ctx)
 
   installAionuiCompat(ctx)
+
+  // Phone: tapping a file's @-reference in the workbench closes the panel —
+  // the conversation returning with the fresh mention IS the tap feedback.
+  installWorkbenchRefClose(ctx)
 
   // Session header running-status dot (S2): no official element exists to
   // reposition, so this reads ctx.sessions directly and self-draws via CSS.

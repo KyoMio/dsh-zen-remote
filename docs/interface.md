@@ -239,7 +239,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 ## 兼容插件
 
-- [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)(移动端全宽抽屉,本插件在会话页头部给它留入口位)——本机实测 **0.15.0**
+- [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)(移动端全宽抽屉,本插件在会话页头部给它留入口位;手机上文件树里点 @ 引用后代点开关自动收起面板——面板全屏盖住会话页,草稿变化看不见,收起本身就是点击反馈)——本机实测 **0.15.0**
 - [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams)(AgentTeams 活动浮层:手机端挪到会话头部下方、避开安全区,会话列表页隐藏;子代理会话头部保留可点的父会话面包屑用于切回)——本机实测 **0.1.9**
 - [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats)(用量与余额,主屏 chips 行可直接打开;旧包名 `dsh-usage-stats` 已废弃,两个名字同时留在 profile 里会因重复的 `usage-stats` 行让 DSH 起不来)——本机实测 **0.2.9**
 - [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins)(定时任务,主屏 chips 行自动收割入口)——本机实测 **0.2.3**
