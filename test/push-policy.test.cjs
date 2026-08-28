@@ -220,6 +220,8 @@ test('apply registers the standing prompt section, and survives a host without o
 // --- wiring: the event leg reaches the pure layer with the right kinds -----
 
 test('session/event wiring: a decided approval is not pushed, an undecided one is', async () => {
+  // Shrink the grace so the test stays fast; the wiring under test is the same.
+  process.env.DSH_PUSH_APPROVAL_GRACE_MS = '200'
   const mod = await freshImport()
   const listeners = new Map()
   const ctx = {
@@ -246,11 +248,51 @@ test('session/event wiring: a decided approval is not pushed, an undecided one i
     onSessionEvent({}, { type: 'tool/call', data: { turn: 1, name: 'ask_user_question', arguments: '{"questions":[{"id":"q","question":"ok?"}]}' } })
     onSessionEvent({}, { type: 'tool/call', data: { turn: 1, name: 'bash', arguments: '{}' } })
 
-    await new Promise((r) => setTimeout(r, 1800))
+    await new Promise((r) => setTimeout(r, 500))
     const titles = sent.map((s) => s.title)
     assert.deepStrictEqual(titles, ['DSH 等你回答', 'DSH 等你授权'], 'question fires immediately, the still-pending approval after its grace period')
     assert.match(sent[1].body, /write_file/)
-  } finally { global.fetch = original }
+  } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
+})
+
+test('a machine answerer that takes seconds must not trigger a notification', async () => {
+  // The 1500ms window assumed every answerer settles in the same tick. A
+  // model-backed one (dsh-auto-approve) takes 2-3s: at 1500ms the timer won
+  // the race and pushed "waiting for your approval" for a request that was
+  // auto-approved a second later — notification arrived, prompt never did.
+  process.env.DSH_PUSH_APPROVAL_GRACE_MS = '400'
+  const mod = await freshImport()
+  const listeners = new Map()
+  mod.apply({ on: (e, cb) => { listeners.set(e, cb); return () => {} }, inject: () => {}, effect: (fn) => fn() })
+  const onSessionEvent = listeners.get('session/event')
+
+  const sent = []
+  const original = global.fetch
+  global.fetch = async (url, opts) => { sent.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) } }
+  try {
+    onSessionEvent({}, { type: 'approval/asked', data: { id: 'slow', toolName: 'bash' } })
+    // Answerer takes a while, but still lands inside the grace window.
+    await new Promise((r) => setTimeout(r, 250))
+    onSessionEvent({}, { type: 'approval/decided', data: { id: 'slow', outcome: 'allowed-once' } })
+    await new Promise((r) => setTimeout(r, 400))
+    assert.deepStrictEqual(sent, [], 'an approval answered inside the grace window must stay silent')
+  } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
+})
+
+test('an answerer slower than the grace still notifies — the window is a bet, not a guarantee', async () => {
+  process.env.DSH_PUSH_APPROVAL_GRACE_MS = '150'
+  const mod = await freshImport()
+  const listeners = new Map()
+  mod.apply({ on: (e, cb) => { listeners.set(e, cb); return () => {} }, inject: () => {}, effect: (fn) => fn() })
+  const onSessionEvent = listeners.get('session/event')
+  const sent = []
+  const original = global.fetch
+  global.fetch = async (url, opts) => { sent.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) } }
+  try {
+    onSessionEvent({}, { type: 'approval/asked', data: { id: 'tooslow', toolName: 'bash' } })
+    await new Promise((r) => setTimeout(r, 350))
+    assert.strictEqual(sent.length, 1, 'past the window it notifies — raising the window is the only lever')
+  } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
 })
 
 test('turn-end: an unreadable session header stays quiet instead of assuming top level', () => {

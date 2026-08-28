@@ -61,10 +61,24 @@ const PUSH_TOOL_ENABLED = process.env.DSH_PUSH_TOOL !== undefined ? process.env.
 const ASK_USER_TOOL = 'ask_user_question'
 
 // @deepseek-ai/dsh-user-approval appends `approval/asked` before consulting
-// the answerer chain and `approval/decided` after. A policy-resolved or
-// hook-answered request settles in the same tick, so only an ask still
+// the answerer chain and `approval/decided` after — so only an ask still
 // undecided after this grace period is actually waiting on a human.
-const APPROVAL_PENDING_MS = 1500
+//
+// The window used to be 1500ms on the assumption that "a policy-resolved or
+// hook-answered request settles in the same tick". That held while every
+// answerer was synchronous. A model-backed answerer (dsh-auto-approve and
+// anything like it) takes seconds: measured 2.4s average, 3.4s worst on a
+// small model, and more on a slower one. At 1500ms the timer won the race and
+// pushed "waiting for your approval" for requests that were auto-approved a
+// second later — the notification arrived, the prompt never did.
+//
+// 5000ms covers a machine answerer with margin while still reaching a phone
+// promptly when a human really is needed. Raise it if your answerer is slower
+// than that; the cost of a longer window is only that genuine prompts notify
+// later.
+const APPROVAL_PENDING_MS = Number(
+  process.env.DSH_PUSH_APPROVAL_GRACE_MS ?? FILE.pushApprovalGraceMs ?? 5000
+)
 
 // Low-level sender shared by every leg: POSTs to the gateway's local
 // /pwa/push/send, which does the actual VAPID + aes128gcm encrypted delivery
@@ -415,7 +429,7 @@ export function apply(ctx) {
     console.warn(`[dsh-zen-remote-push] cannot listen on "session/event": ${String(e && e.message || e)}`)
   }
 
-  console.log(`[dsh-zen-remote-push] approval/question notifications on; turn-end (${EVENTS.join(', ')}) ${TURN_END_ENABLED ? 'on' : 'off — set DSH_PUSH_TURN_END=1 to enable'}`)
+  console.log(`[dsh-zen-remote-push] approval/question notifications on (approval grace ${APPROVAL_PENDING_MS}ms); turn-end (${EVENTS.join(', ')}) ${TURN_END_ENABLED ? 'on' : 'off — set DSH_PUSH_TURN_END=1 to enable'}`)
 
   registerPushTool(ctx, gate)
 }
