@@ -2,7 +2,7 @@
 <p align="center">Turn DeepSeek Harness into a mobile PWA you can safely reach from the public internet: pairing-code auth + token identity + real Web Push, with your own reverse proxy terminating TLS.</p>
 
 > Full documentation for the gateway half of `dsh-zen-remote`: reverse proxy, pairing, environment variables, admin API, push, security boundary.
-> Installation and quick start live in the [root README](../README.md) (Chinese); interface-side detail in [interface.md](interface.md).
+> Installation and quick start live in the [root README](../README.md); interface-side detail in [interface.md](interface.md) (Chinese).
 
 Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate) secure-gateway base, with PWA differentiation.
 
@@ -150,9 +150,85 @@ dsh.example.com {
 
 > Exact toggle names may vary slightly across Lucky versions — the three things that matter: HTTPS cert, reverse proxy to 3088, forwarded headers (万事大吉).
 
+#### Cloudflare Tunnel — getting in without a public IP
+
+When your ISP won't hand you a public IP, or you'd rather not open a port on the router, use a Cloudflare Tunnel: `cloudflared` opens a long-lived connection **outbound** from your machine, Cloudflare handles DNS, the TLS certificate and the public entry point, and requests come back down that connection to `127.0.0.1:3088` on your box. Not a single router port is opened and your home IP is never exposed. The free tier is enough.
+
+There is exactly one prerequisite: the domain is hosted on Cloudflare (nameservers pointed at it).
+
+**Zero gateway-side changes**: leave `LAN_GATE_HOST` at its `127.0.0.1` default — `cloudflared` runs on the same machine.
+
+##### Option A: the Zero Trust dashboard token flow (recommended)
+
+The tunnel config lives on Cloudflare's side and the machine only stores a token, so you never have to touch the machine to change it.
+
+1. Open the [Zero Trust dashboard](https://one.dash.cloudflare.com/) → **Networks → Tunnels → Create a tunnel** → pick **Cloudflared** and name it.
+2. Once created, the page hands you an install command with a token. Run it on the machine running DSH:
+
+   ```sh
+   cloudflared service install eyJhIjoi...your-token
+   ```
+
+   That installs `cloudflared` as a service that starts at boot. On macOS, `brew install cloudflared` first; on Debian/Ubuntu use the official `.deb`.
+
+3. Back on the tunnel's detail page → **Public Hostname** → **Add a public hostname**:
+
+   | Field | Value |
+   | --- | --- |
+   | Subdomain | `dsh` |
+   | Domain | `example.com` |
+   | Path | leave empty |
+   | Service Type | `HTTP` |
+   | URL | `127.0.0.1:3088` |
+
+   It takes effect on save; Cloudflare creates the DNS record and issues the certificate for you.
+
+4. Skip straight to the next section and do the 403 self-check.
+
+##### Option B: CLI plus config.yml (advanced)
+
+Use this when you want the tunnel config in version control too, or when one tunnel fronts several services:
+
+```sh
+cloudflared tunnel login                      # authorize the domain in a browser; certs land in ~/.cloudflared/
+cloudflared tunnel create dsh                 # note the <TUNNEL-ID> in the output
+cloudflared tunnel route dns dsh dsh.example.com
+```
+
+`~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <TUNNEL-ID>
+credentials-file: /home/you/.cloudflared/<TUNNEL-ID>.json
+
+ingress:
+  - hostname: dsh.example.com
+    service: http://127.0.0.1:3088
+  - service: http_status:404          # catch-all, must be last
+```
+
+```sh
+cloudflared tunnel run dsh            # prove it works in the foreground first
+sudo cloudflared service install      # then install it as a service
+```
+
+##### Why the self-check matters even more with a tunnel
+
+`cloudflared` connects to the gateway over **local loopback**, which means the socket the gateway sees always originates at `127.0.0.1`. What separates "a visitor from the internet" from "the person sitting at this computer" is whether the request carries `X-Forwarded-*` headers (see `isLocalDirect` in `lib/lan-gate-server.cjs`: any forwarded header at all means this is definitely not the local user). `cloudflared` sends `X-Forwarded-For` and `X-Forwarded-Proto` by default, so the pairing wall works — but **if your version or one of your ingress rules strips them, public requests get treated as the local admin and the admin page is served straight to the internet**. The same risk exists for a same-machine nginx/Caddy deployment (Lucky's 万事大吉 switch is exactly this), it's just easier to miss with a tunnel because you never hand-wrote a single line of forwarded-header config.
+
+**You do not need `LAN_GATE_TRUSTED_PROXIES=127.0.0.1`**: the gateway's `resolveClient()` already treats a loopback connection as a trusted proxy (`isLoopbackIp(sockIp) || TRUSTED_PROXIES.indexOf(sockIp) >= 0`), so setting it to `127.0.0.1` is a no-op — it neither errors nor changes any behaviour, and more importantly it is **not** a substitute for the self-check below. This semantic is pinned by tests (the two `same-host tunnel:` cases in `test/auth.test.cjs` — identical results with and without it). There is exactly one situation that calls for `LAN_GATE_TRUSTED_PROXIES`: the proxy or tunnel process is **not** on this machine (a router, another server), where the source IP isn't loopback and the gateway needs it listed before it will trust the forwarded headers it brings.
+
+##### Common traps
+
+- **`Error 1033` / tunnel offline**: `cloudflared` isn't running, or the token expired. `cloudflared tunnel info <name>` shows the connection count; `sudo launchctl list | grep cloudflared` (macOS) or `systemctl status cloudflared` (Linux) shows the service.
+- **502 Bad Gateway**: the tunnel is up but the origin isn't reachable — either the gateway isn't running, or the Public Hostname URL says `3080` (DSH itself) instead of `3088` (the gateway). Pointing it at 3080 bypasses the entire pairing wall, i.e. **puts DSH bare on the internet**; make sure it says 3088.
+- **The conversation stream stalls / messages never appear**: WebSockets aren't getting through. Cloudflare's free tier supports them, so usually there's an Access policy on that hostname in Zero Trust blocking the upgrade request, or `disableChunkedEncoding` in the ingress rule.
+- **Large uploads fail**: Cloudflare's free tier caps a request body at 100MB. This plugin's 20MB upload default sits below that, so you shouldn't hit it; for genuinely larger files, raise the Cloudflare plan before raising `maxUploadBytes`.
+- **Want one more layer**: you can add an Access policy for this hostname in Zero Trust → Access (email OTP or similar) stacked in front of the pairing code. Not required — the pairing wall is already an authentication step.
+
 #### Post-setup self-check (do this for any proxy)
 
-From **cellular data** (not your home Wi-Fi), open `https://your-domain/lan-gate/admin` — the correct result is **403**. If you can see the admin page, your proxy is not sending `X-Forwarded-*` headers and the gateway mistook a public request for the local user — **go fix the header config immediately** (nginx: the two `proxy_set_header` lines; Lucky: the 万事大吉 switch). Only start pairing devices after this check passes.
+From **cellular data** (not your home Wi-Fi), open `https://your-domain/lan-gate/admin` — the correct result is **403**. If you can see the admin page, your proxy is not sending `X-Forwarded-*` headers and the gateway mistook a public request for the local user — **go fix the header config immediately** (nginx: the two `proxy_set_header` lines; Lucky: the 万事大吉 switch; Cloudflare Tunnel: see the previous section). Only start pairing devices after this check passes.
 
 ### 3. Generate a pairing code and pair devices
 

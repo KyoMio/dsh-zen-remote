@@ -1,5 +1,5 @@
 /**
- * Rewrite the version strings embedded in README.md to match package.json.
+ * Rewrite the version strings embedded in both READMEs to match package.json.
  *
  * Runs from the `version` npm lifecycle script, which fires AFTER the version
  * bump and BEFORE the release commit — so `npm version patch` carries the
@@ -23,27 +23,32 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version
 const checkOnly = process.argv.includes('--check')
 
-/** Each target names the file, what it looks for, and what it becomes. */
-const targets = [
+/**
+ * Each target names the file, what it looks for, and what it becomes. Both
+ * READMEs carry the same three markers, and both are required: a missing one
+ * means the docs moved and this script has to be updated, which is the whole
+ * point of failing loudly.
+ */
+const targets = ['README.md', 'README.zh-CN.md'].flatMap((file) => [
   {
-    file: 'README.md',
+    file,
     label: 'release badge',
     pattern: /badge\/release-v\d+\.\d+\.\d+-/,
     replace: `badge/release-v${version}-`,
   },
   {
-    file: 'README.md',
+    file,
     label: 'release badge alt text',
     pattern: /alt="v\d+\.\d+\.\d+"/,
     replace: `alt="v${version}"`,
   },
   {
-    file: 'README.md',
+    file,
     label: 'profile dependency example',
     pattern: /"dsh-zen-remote": "\^\d+\.\d+\.\d+"/,
     replace: `"dsh-zen-remote": "^${version}"`,
   },
-]
+])
 
 const edits = new Map()
 const missing = []

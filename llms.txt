@@ -14,7 +14,7 @@
 - Security: 8-char one-time pairing code (10 min TTL), 5-wrong-code lockout (15 min), revocable per-device tokens, 120 req/min per resolved client IP, admin surface rejects any request carrying `X-Forwarded-*`.
 
 ## Docs
-- README.md (中文，安装与配置为主), AGENTS.md (repo guide), LICENSE.
+- README.md (English, install + config), README.zh-CN.md (same in Chinese), AGENTS.md (repo guide), LICENSE.
 - docs/remote-access.md(.en.md) — gateway detail: reverse proxy, pairing, env, admin API, push, security boundary.
 - docs/interface.md — interface detail: breakpoints, debug badge, safe-area system, compatible plugins.
 - .ai/ — AI Project OS state, memory, decisions, tasks.

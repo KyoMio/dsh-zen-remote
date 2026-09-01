@@ -1,7 +1,7 @@
 # 手机界面（界面半边详解）
 
 > `dsh-zen-remote` 的界面半边完整文档：信息架构、断点策略、安全区体系、调试徽章、兼容插件。
-> 安装与快速上手见[根 README](../README.md)；通道侧细节见 [remote-access.md](remote-access.md)。
+> 安装与快速上手见[根 README](../README.zh-CN.md)；通道侧细节见 [remote-access.md](remote-access.md)。
 > 界面基座衍生自 MIT 的 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-web-mobile)。
 
 ## v2.0：从「窄屏适配」到「app 化外壳」
@@ -257,7 +257,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 dsh plugin add dsh-zen-remote
 ```
 
-装完重启 `dsh web`。手动写法与本地开发装法见[根 README](../README.md#安装)。
+装完重启 `dsh web`。手动写法与本地开发装法见[根 README](../README.zh-CN.md#安装)。
 
 ## 构建
 

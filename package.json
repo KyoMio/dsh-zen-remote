@@ -34,6 +34,7 @@
     "llms.txt",
     "AGENTS.md",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE",
     "!docs/push-policy.md"
   ],
@@ -41,7 +42,7 @@
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
     "verify": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "node --test \"test/*.test.cjs\" && node scripts/check-sunk-viewport.mjs && node scripts/check-keyboard-avoid.mjs && node scripts/check-attach-upload.mjs && node scripts/check-upload-endpoint.mjs && node scripts/sync-doc-version.mjs --check",
-    "version": "node scripts/sync-doc-version.mjs && git add README.md",
+    "version": "node scripts/sync-doc-version.mjs && git add README.md README.zh-CN.md",
     "prepack": "npm run build"
   },
   "dsh": {
