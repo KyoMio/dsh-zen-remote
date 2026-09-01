@@ -25,7 +25,7 @@ test('unpaired remote gets 401 pairing page; local-only surface rejects proxied 
   try {
     const page = await request(PORT, { path: '/', headers: REMOTE_HEADERS })
     assert.strictEqual(page.status, 401)
-    assert.ok(page.body.includes('设备配对'), 'pairing page shown')
+    assert.ok(page.body.includes('/lan-gate/pair/claim'), 'pairing page shown')
     assert.ok(!page.body.includes('?t='), 'no URL token flow anywhere')
 
     const api = await request(PORT, { path: '/api/session', headers: REMOTE_HEADERS })
@@ -230,7 +230,7 @@ for (const trustedProxies of ['', '127.0.0.1']) {
 
       const page = await request(TUNNEL_PORT, { path: '/', headers: tunnel })
       assert.strictEqual(page.status, 401, 'tunnel visitor hits the pairing wall')
-      assert.ok(page.body.includes('设备配对'))
+      assert.ok(page.body.includes('/lan-gate/pair/claim'))
 
       const admin = await request(TUNNEL_PORT, { path: '/lan-gate/admin', headers: tunnel })
       assert.strictEqual(admin.status, 403, 'tunnel visitor cannot reach the admin surface')

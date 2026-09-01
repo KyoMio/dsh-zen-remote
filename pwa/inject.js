@@ -43,7 +43,7 @@
   // triggers push. Grant & subscribe are opt-in via the button appended below.
   window.__DSH_PWA__.subscribe = function subscribe() {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      alert('当前浏览器不支持推送通知')
+      alert('This browser does not support push notifications')
       return Promise.reject(new Error('push unsupported'))
     }
     return new Promise(function (resolve, reject) {
@@ -133,9 +133,9 @@
     document.body.appendChild(el)
     return el
   }
-  var BTN_ON = '<button data-act="on" style="flex:1;background:#4c8dff;color:#fff;border:0;border-radius:9px;padding:9px 0;font-weight:600">开启</button>'
-  var BTN_OFF = '<button data-act="off" style="flex:1;background:#2a2f3a;color:#9aa3b2;border:0;border-radius:9px;padding:9px 0">暂不</button>'
-  var BTN_CLOSE = '<button data-act="off" style="flex:1;background:#2a2f3a;color:#9aa3b2;border:0;border-radius:9px;padding:9px 0">知道了</button>'
+  var BTN_ON = '<button data-act="on" style="flex:1;background:#4c8dff;color:#fff;border:0;border-radius:9px;padding:9px 0;font-weight:600">Enable</button>'
+  var BTN_OFF = '<button data-act="off" style="flex:1;background:#2a2f3a;color:#9aa3b2;border:0;border-radius:9px;padding:9px 0">Not now</button>'
+  var BTN_CLOSE = '<button data-act="off" style="flex:1;background:#2a2f3a;color:#9aa3b2;border:0;border-radius:9px;padding:9px 0">Got it</button>'
 
   // Callable by hand at any time: window.__DSH_PWA__.askPush()
   window.__DSH_PWA__.askPush = function askPush(manual) {
@@ -143,28 +143,28 @@
     if (old) old.remove()
     if (!pushSupported) {
       if (isIOS && !isStandalone) {
-        card('🔔 任务完成提醒', '在 iPhone 上，推送通知只对「添加到主屏幕」后的应用生效。请先用 Safari 的分享菜单添加到主屏幕，再从主屏图标打开本页。', BTN_CLOSE)
+        card('🔔 Task Completion Reminder', 'On iPhone, push notifications only work for apps added to the Home Screen. First use Safari’s Share menu to add this page to the Home Screen, then open it from the Home Screen icon.', BTN_CLOSE)
           .querySelector('[data-act="off"]').addEventListener('click', function () { document.getElementById('dsh-pwa-notif-hint').remove() })
       } else if (manual) {
-        alert('当前浏览器不支持 Web Push 通知')
+        alert('This browser does not support Web Push notifications')
       }
       return
     }
     if (window.Notification.permission === 'denied') {
-      if (manual) alert('通知权限已被拒绝，请到浏览器/系统的站点设置里重新允许')
+      if (manual) alert('Notification permission was denied. Please allow it again in the browser or system site settings.')
       return
     }
     if (window.Notification.permission === 'granted') { resyncPush(); return }
 
-    var el = card('🔔 任务完成提醒',
-      '开启后，智能体干完活会推送通知到这台设备，即使你切到别的 App。通知不含对话内容。',
+    var el = card('🔔 Task Completion Reminder',
+      'When enabled, the agent will push a notification to this device when it finishes work, even if you switch to another app. Notifications do not include conversation content.',
       BTN_ON + BTN_OFF)
     el.querySelector('[data-act="on"]').addEventListener('click', function () {
       el.remove()
       // Must run inside the click gesture: Safari rejects subscribe() otherwise.
       window.__DSH_PWA__.subscribe().catch(function (err) {
         console.warn('[dsh-pwa] subscribe failed:', err)
-        alert('开启失败：' + (err && err.message ? err.message : err))
+        alert('Enable failed: ' + (err && err.message ? err.message : err))
       })
     })
     el.querySelector('[data-act="off"]').addEventListener('click', function () {
