@@ -138,7 +138,7 @@ export function turnSummary(events, turn) {
       lastTool = ev.data.name
     }
   }
-  return lastTool ? `最后执行了 ${lastTool}` : ''
+  return lastTool ? `Last executed: ${lastTool}` : ''
 }
 
 // First question of an ask_user_question call, from the raw (unparsed)
@@ -175,15 +175,15 @@ export function decideNotification(input, cfg) {
     case 'approval':
       return {
         shouldNotify: true,
-        title: 'DSH 等你授权',
-        body: input.toolName ? `${input.toolName} 需要授权才能继续` : '有操作需要授权才能继续',
+        title: 'DSH needs your approval',
+        body: input.toolName ? `${input.toolName} needs approval to continue` : 'An action needs approval to continue',
         reason: 'approval-pending'
       }
     case 'question':
       return {
         shouldNotify: true,
-        title: 'DSH 等你回答',
-        body: (cfg.includeSummary && input.question) || '智能体提了一个问题，正在等你回答',
+        title: 'DSH is waiting for your answer',
+        body: (cfg.includeSummary && input.question) || 'The agent asked a question and is waiting for your answer',
         reason: 'question-pending'
       }
 
@@ -192,7 +192,7 @@ export function decideNotification(input, cfg) {
       if (!cfg.turnEndEnabled) return skip('turn-end-disabled')
       if ((input.delegationDepth ?? 0) !== 0) return skip('subagent')
       if (debounced) return skip('debounced')
-      return { shouldNotify: true, title: 'DSH 任务完成', body: input.summary || '智能体已完成当前回合', reason: 'turn-end' }
+      return { shouldNotify: true, title: 'DSH task finished', body: input.summary || 'The agent finished the current turn', reason: 'turn-end' }
 
     default:
       return skip('unknown-kind')

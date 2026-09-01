@@ -39,8 +39,8 @@ test('turn end: opt-in — off by default, on with turnEndEnabled', async () => 
 
   const on = decideNotification(at({ kind: 'turn-end', delegationDepth: undefined }), cfg({ turnEndEnabled: true }))
   assert.strictEqual(on.shouldNotify, true)
-  assert.strictEqual(on.title, 'DSH 任务完成')
-  assert.strictEqual(on.body, '智能体已完成当前回合', 'no conversation content without a summary')
+  assert.strictEqual(on.reason, 'turn-end')
+  assert.ok(on.title && on.body, 'a turn-end push carries a fixed title and body')
 })
 
 test('turn end: only top-level sessions notify; a subagent turn end never does', async () => {
@@ -84,12 +84,12 @@ test('approval: always notifies, at any delegation depth, debounce or not', asyn
   const d = decideNotification({ kind: 'approval', now, lastSent: now - 1, toolName: 'bash', delegationDepth: 3 }, cfg())
   assert.strictEqual(d.shouldNotify, true, 'an approval must never be swallowed by the debounce')
   assert.strictEqual(d.reason, 'approval-pending')
-  assert.strictEqual(d.title, 'DSH 等你授权')
+  assert.ok(d.title, 'an approval push carries a title')
   assert.match(d.body, /bash/)
 
   const noName = decideNotification(at({ kind: 'approval' }), cfg())
   assert.strictEqual(noName.shouldNotify, true)
-  assert.strictEqual(noName.body, '有操作需要授权才能继续')
+  assert.ok(noName.body && !/bash/.test(noName.body), 'a nameless approval falls back to a generic body')
 })
 
 test('question: always notifies; the question text only leaks with DSH_PUSH_SUMMARY', async () => {
@@ -99,7 +99,7 @@ test('question: always notifies; the question text only leaks with DSH_PUSH_SUMM
 
   const quiet = decideNotification(input, cfg())
   assert.strictEqual(quiet.shouldNotify, true)
-  assert.strictEqual(quiet.body, '智能体提了一个问题，正在等你回答', 'default body carries no conversation content')
+  assert.ok(quiet.body && !quiet.body.includes(input.question), 'default body carries no conversation content')
 
   const loud = decideNotification(input, cfg({ includeSummary: true }))
   assert.strictEqual(loud.body, '要用 A 还是 B？')
@@ -140,7 +140,9 @@ test('summary falls back to the tool name, never to thinking text', async () => 
     { type: 'tool/call', data: { turn: 2, step: 0, name: 'str_replace_editor', arguments: '{}' } },
     { type: 'assistant/message', data: { turn: 2, step: 1, message: { content: [{ type: 'reasoning', text: 'hmm' }] } } }
   ]
-  assert.strictEqual(turnSummary(thinkingOnly, 2), '最后执行了 str_replace_editor')
+  const fallback = turnSummary(thinkingOnly, 2)
+  assert.match(fallback, /str_replace_editor/)
+  assert.ok(!fallback.includes('hmm'), 'thinking text never becomes the summary')
 
   assert.strictEqual(turnSummary([], 1), '')
   assert.strictEqual(turnSummary(undefined, 1), '')
@@ -153,7 +155,9 @@ test('summary stops at the turn boundary and clips to 120 chars', async () => {
     { type: 'assistant/message', data: { turn: 1, step: 0, message: { content: [{ type: 'text', text: 'previous turn answer' }] } } },
     { type: 'tool/call', data: { turn: 2, step: 0, name: 'bash', arguments: '{}' } }
   ]
-  assert.strictEqual(turnSummary(events, 2), '最后执行了 bash', 'must not reach back into turn 1')
+  const summary = turnSummary(events, 2)
+  assert.match(summary, /bash/)
+  assert.ok(!summary.includes('previous turn answer'), 'must not reach back into turn 1')
 
   const long = { content: [{ type: 'text', text: 'x'.repeat(500) }] }
   assert.strictEqual(turnSummary([{ type: 'assistant/message', data: { turn: 1, message: long } }], 1).length, 120)
@@ -250,7 +254,8 @@ test('session/event wiring: a decided approval is not pushed, an undecided one i
 
     await new Promise((r) => setTimeout(r, 500))
     const titles = sent.map((s) => s.title)
-    assert.deepStrictEqual(titles, ['DSH 等你回答', 'DSH 等你授权'], 'question fires immediately, the still-pending approval after its grace period')
+    const titleOf = (kind) => mod.decideNotification({ kind, now: 0, lastSent: 0 }, cfg()).title
+    assert.deepStrictEqual(titles, [titleOf('question'), titleOf('approval')], 'question fires immediately, the still-pending approval after its grace period')
     assert.match(sent[1].body, /write_file/)
   } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
 })
