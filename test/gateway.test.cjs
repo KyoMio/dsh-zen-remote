@@ -111,7 +111,7 @@ test('gateway: injects manifest link, PWA bootstrap & app.css into HTML (local)'
     assert.ok(page.body.includes('rel="manifest"'), 'manifest link injected')
     assert.ok(page.body.includes('/pwa/app.css'), 'app.css linked')
     assert.ok(page.body.includes('window.__DSH_PWA__'), 'PWA bootstrap present')
-    assert.match(page.body, /window\.__DSH_PWA__=\{vapid:"[A-Za-z0-9_-]{20,}"\}/, 'real VAPID public key injected')
+    assert.match(page.body, /window\.__DSH_PWA__=\{vapid:"[A-Za-z0-9_-]{20,}",lang:"(zh|en)"\}/, 'real VAPID public key and resolved page language injected')
     assert.ok(page.body.includes('href="/lan-gate/admin"'), 'local user gets the admin entry chip')
   } finally { await stop() }
 })

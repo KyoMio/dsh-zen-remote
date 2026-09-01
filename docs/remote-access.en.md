@@ -177,6 +177,8 @@ The admin page also lets you set a device's kind (phone / desktop / auto layout)
 | `LAN_GATE_RATE_LIMIT` | `120` | Per-real-client-IP per-minute cap **for unpaired/unauthenticated requests only** (protects the pairing surface). Local users and paired devices are exempt — their guardrail is the token + revocation |
 | `LAN_GATE_TRUSTED_PROXIES` | empty | Comma-separated IP list. When the proxy and gateway aren't on the same host (i.e. not a loopback socket), list the proxy's egress IP here so the gateway trusts the `X-Forwarded-For`/`X-Forwarded-Proto` it sends |
 | `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | VAPID contact for Web Push. **Set this to a real mailto: address or https:// URL**: Apple rejects placeholder subjects with `403 BadJwtToken`, silently killing push to every iOS device (Google/Mozilla do not check). The gateway warns at startup if it looks invalid |
+| `LAN_GATE_LANG` | `auto` | Language of the pages the gateway serves itself (pairing, rate-limit, admin) and of the push opt-in card it injects into the app. `auto` follows the request's `Accept-Language` — the only language signal a pairing visitor ever volunteers; with no such header it falls back to Chinese. `zh`/`en` pin it and ignore the browser |
+| `DSH_PUSH_LANG` | `zh` | Language of the notification copy itself (approval pending / question pending / turn finished). Deliberately **not** autodetected: a notification is produced host-side, where there is no request header and launchd hands the process no `LANG` (`Intl` reports `en-US` even on a Chinese user's machine). Set `en` explicitly for English |
 
 Besides env vars, the **recommended way is the config file** `~/.dsh/lan-gate.config.json` (shared by the gateway and the push plugin; restart `dsh web` after editing; explicit env vars win over the file):
 
@@ -189,7 +191,7 @@ Besides env vars, the **recommended way is the config file** `~/.dsh/lan-gate.co
 }
 ```
 
-Field names = env var names minus the prefix, camelCased: `port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`, plus the push half `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool` (the `push_notify` tool switch, defaults to `true`). On DSH versions whose insert rows support Cordis config, the same camelCase fields under the row's `config:` work too.
+Field names = env var names minus the prefix, camelCased: `port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`, plus the push half `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool` (the `push_notify` tool switch, defaults to `true`). Language is a single shared key, `lang`: the gateway understands `auto` (follow the browser) / `zh` / `en`, the push half understands only `en` and treats everything else as Chinese — so `"lang": "auto"` means "pages follow the browser, notifications stay Chinese". On DSH versions whose insert rows support Cordis config, the same camelCase fields under the row's `config:` work too.
 
 The optional push host plugin mounts via the profile patch (`~/.dsh/profiles/web/cordis.patch.yml`):
 

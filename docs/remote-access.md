@@ -252,6 +252,8 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `LAN_GATE_RATE_LIMIT` | `120` | **只对未配对/未认证请求**按真实客户端 IP 计的每分钟上限（保护配对页和配对接口）。本机和已配对设备不受限——它们的防线是令牌与吊销 |
 | `LAN_GATE_TRUSTED_PROXIES` | 空 | 逗号分隔的 IP 列表。反代和网关不在同一台机器（回环地址）时，把反代的出口 IP 填进来，网关才会信任它带来的 `X-Forwarded-For`/`X-Forwarded-Proto` |
 | `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | Web Push 的 VAPID 联系人字段。**务必改成真实邮箱或 https 网址**：Apple 会用 `403 BadJwtToken` 拒绝占位符，导致 iOS 设备静默收不到推送（Google/Mozilla 不校验）。填错时启动日志有告警 |
+| `LAN_GATE_LANG` | `auto` | 网关自己那几个页面（配对页、限流页、管理页）和注入到应用里的推送开关卡片用什么语言。`auto` 按请求的 `Accept-Language` 决定——配对访客唯一会主动交出的语言信号；没有这个头就用中文。`zh`/`en` 写死，不再看浏览器 |
+| `DSH_PUSH_LANG` | `zh` | 推送通知本身的文案语言（等授权 / 等回答 / 回合完成）。这里**不做自动探测**：通知是宿主进程生成的，既没有请求头，`launchd` 也不给它 `LANG`（中文用户的机器上 `Intl` 照样报 `en-US`）。要英文就显式设 `en` |
 
 除了环境变量，**推荐用配置文件** `~/.dsh/lan-gate.config.json`（网关和推送插件两半共用一份，改完重启 `dsh web` 生效；显式环境变量优先于文件）：
 
@@ -264,7 +266,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 }
 ```
 
-字段名 = 环境变量去掉前缀转小驼峰：`port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`，推送半边是 `pushTurnEnd`（回合结束是否推送，默认 `false`）/ `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool`（`push_notify` 工具开关，默认 `true`）。挂载行支持 Cordis config 的 DSH 版本也可以把网关配置写在 insert 行的 `config:` 下（同名小驼峰字段），效果等同。
+字段名 = 环境变量去掉前缀转小驼峰：`port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`，推送半边是 `pushTurnEnd`（回合结束是否推送，默认 `false`）/ `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool`（`push_notify` 工具开关，默认 `true`）。语言只有一个键 `lang`，两边共用：网关认 `auto`（跟随浏览器）/`zh`/`en`，推送半边只认 `en`，其余一律中文——所以 `"lang": "auto"` 的意思是「页面跟随浏览器、通知保持中文」。挂载行支持 Cordis config 的 DSH 版本也可以把网关配置写在 insert 行的 `config:` 下（同名小驼峰字段），效果等同。
 
 推送半边（`dsh-push.mjs`）随包自带，装包即挂载，**不需要在 profile 的
 `cordis.patch.yml` 里手写任何一行**。从旧的两包结构升级上来的话，profile patch

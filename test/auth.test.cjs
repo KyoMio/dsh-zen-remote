@@ -20,6 +20,29 @@ async function boot(extraEnv) {
   return { target, gw, stop: () => stopAll(target, gw.child) }
 }
 
+test('gate pages follow Accept-Language, and LAN_GATE_LANG pins them', async () => {
+  const { stop } = await boot()
+  try {
+    const zh = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'zh-CN,zh;q=0.9' } })
+    assert.ok(zh.body.includes('设备配对') && zh.body.includes('lang="zh-CN"'), 'a Chinese browser gets the Chinese pairing page')
+
+    const en = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'en-US,en;q=0.9' } })
+    assert.ok(en.body.includes('Device Pairing') && en.body.includes('lang="en"'), 'an English browser gets the English one')
+
+    // No header at all keeps the pre-i18n behaviour rather than guessing.
+    const bare = await request(PORT, { path: '/', headers: REMOTE_HEADERS })
+    assert.ok(bare.body.includes('设备配对'), 'no Accept-Language falls back to zh')
+  } finally { await stop() }
+})
+
+test('LAN_GATE_LANG=en overrides what the browser asks for', async () => {
+  const { stop } = await boot({ LAN_GATE_LANG: 'en' })
+  try {
+    const page = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'zh-CN,zh;q=0.9' } })
+    assert.ok(page.body.includes('Device Pairing'), 'a pinned language ignores Accept-Language')
+  } finally { await stop() }
+})
+
 test('unpaired remote gets 401 pairing page; local-only surface rejects proxied requests', async () => {
   const { stop } = await boot()
   try {

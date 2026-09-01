@@ -74,6 +74,21 @@ test('turn end: debounced, and carries the summary when one was extracted', asyn
   assert.strictEqual(ok.body, '改完了三个文件')
 })
 
+// --- language --------------------------------------------------------------
+
+test('notification copy follows DSH_PUSH_LANG; zh is the default', async () => {
+  const zh = await freshImport()
+  assert.match(zh.decideNotification(at({ kind: 'approval', toolName: 'bash' }), cfg()).body, /需要授权/)
+  assert.match(zh.turnSummary([{ type: 'tool/call', data: { turn: 1, name: 'bash', arguments: '{}' } }], 1), /^最后执行了/)
+
+  process.env.DSH_PUSH_LANG = 'en'
+  try {
+    const en = await freshImport()
+    assert.match(en.decideNotification(at({ kind: 'approval', toolName: 'bash' }), cfg()).body, /needs approval/)
+    assert.match(en.turnSummary([{ type: 'tool/call', data: { turn: 1, name: 'bash', arguments: '{}' } }], 1), /^Last executed/)
+  } finally { delete process.env.DSH_PUSH_LANG }
+})
+
 // --- approvals and questions ---------------------------------------------
 
 test('approval: always notifies, at any delegation depth, debounce or not', async () => {
