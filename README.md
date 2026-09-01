@@ -1,5 +1,5 @@
 <h1 align="center">dsh-zen-remote</h1>
-<p align="center">把 DeepSeek Harness 变成一个能从公网安全访问的手机 App：移动端界面重排 + 配对认证网关 + 装到主屏 + 锁屏推送。</p>
+<p align="center">Turn DeepSeek Harness into a phone app you can safely reach from the public internet: a mobile UI, a pairing-code gateway, install-to-home-screen, and lock-screen push.</p>
 
 <p align="center">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0B7285?style=flat-square" alt="MIT"></a>
@@ -7,39 +7,41 @@
 <img src="https://img.shields.io/badge/DSH-Web%20Profile-5B4CF0?style=flat-square" alt="DSH Web Profile">
 </p>
 
-| 会话列表主屏 | 会话页 | 会话信息卡 |
+<p align="center"><a href="README.zh-CN.md">中文文档</a></p>
+
+| Session list home | Session page | Session info card |
 | --- | --- | --- |
-| ![会话列表主屏](assets/home.png) | ![会话页](assets/session.png) | ![会话信息卡](assets/info.png) |
+| ![Session list home](assets/home.png) | ![Session page](assets/session.png) | ![Session info card](assets/info.png) |
 
-| composer 权限 sheet | 公网设备看到的配对页 |
+| Composer permission sheet | Pairing page a public visitor sees |
 | --- | --- |
-| ![composer 权限 sheet](assets/sheet.png) | ![配对页](assets/pairing.png) |
+| ![Composer permission sheet](assets/sheet.png) | ![Pairing page](assets/pairing.png) |
 
-> 截图为 390×844 手机视口、浅色主题；深浅主题均适配。配对页是网关自绘页面，固定深色设计。
+> Screenshots are a 390×844 phone viewport in the light theme; both themes are supported. The pairing page is drawn by the gateway itself and is always dark.
 
 ---
 
-## 安装
+## Install
 
 ```sh
 dsh plugin add dsh-zen-remote
 ```
 
-装完重启 `dsh web`，手机界面与网关一起生效，不需要再手写任何配置行。
+Restart `dsh web` afterwards. The mobile UI and the gateway both come up — there is no config line to hand-write.
 
-> 兼容性：在 DSH `0.1.1-rc.2`（web profile）上开发并实测，最后验证 2026-08-22。
+> Compatibility: developed and tested against DSH `0.1.1-rc.2` (web profile); last verified 2026-08-22.
 
-卸载：`dsh plugin remove dsh-zen-remote`（或从 profile 的 `dependencies` 与 `bundles` 里删掉那两行），重启 `dsh web` 即恢复原状；要清掉配对数据再删 `~/.dsh/lan-gate-state.json` 与 `~/.dsh/lan-gate.config.json`。
+To uninstall: `dsh plugin remove dsh-zen-remote` (or delete the two lines from your profile's `dependencies` and `bundles`) and restart `dsh web`. To also wipe the pairing data, delete `~/.dsh/lan-gate-state.json` and `~/.dsh/lan-gate.config.json`.
 
 <details>
-<summary>手动写法 / 本地开发</summary>
+<summary>Manual install / local development</summary>
 
-手动改 `~/.dsh/profiles/web/package.json`——`dependencies` 一行、`bundles` 一行：
+Edit `~/.dsh/profiles/web/package.json` by hand — one line under `dependencies`, one under `bundles`:
 
 ```jsonc
 {
   "dependencies": {
-    "dsh-zen-remote": "^1.1.10"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^1.1.10"        // for local development: "link:/path/to/dsh-zen-remote"
   },
   "dsh": { "profile": { "bundles": [
     "@deepseek-ai/dsh-base",
@@ -51,28 +53,28 @@ dsh plugin add dsh-zen-remote
 
 ```sh
 cd ~/.dsh/profiles/web && pnpm install
-# 重启 dsh web
+# restart dsh web
 ```
 
-不想走 profile 安装流程的静态挂载写法见 [`cordis.patch.yml.example`](cordis.patch.yml.example)。
+If you would rather not go through the profile install flow at all, see the static mount in [`cordis.patch.yml.example`](cordis.patch.yml.example).
 
 </details>
 
 ---
 
-## 配置公网访问
+## Setting up public access
 
-装完在本机 `127.0.0.1:3080` 就能用手机界面。要从外面访问，按下面三步走。
+Once installed, the mobile UI already works at `127.0.0.1:3080` on the machine itself. To reach it from outside, three steps.
 
-### 1. 配一个反代中继 HTTPS
+### 1. Put a reverse proxy in front for HTTPS
 
-网关默认只监听 `127.0.0.1:3088`，必须由你自己的反代对外。**家宽没有公网 IP、或者不想开路由器端口**，就跳过 nginx/Caddy 直接看第三个块（Cloudflare Tunnel）。
+The gateway listens on `127.0.0.1:3088` only — exposing it is your reverse proxy's job. **If your home connection has no public IP, or you'd rather not open a port on your router**, skip nginx/Caddy and jump to the third block (Cloudflare Tunnel).
 
 <details open>
 <summary><b>nginx</b></summary>
 
 ```nginx
-# http {} 块里加一次
+# once, inside the http {} block
 map $http_upgrade $connection_upgrade { default upgrade; '' close; }
 
 server {
@@ -113,88 +115,88 @@ dsh.example.com {
 </details>
 
 <details open>
-<summary><b>没有公网 IP？用 Cloudflare Tunnel</b></summary>
+<summary><b>No public IP? Use a Cloudflare Tunnel</b></summary>
 
-家宽拿不到公网 IP、或者不想在路由器上开端口时用这个：`cloudflared` 从你这台机器主动连出去，Cloudflare 那边负责域名、证书和入口，路由器一个端口都不用开。免费版够用。
+For when your home connection gets no public IP, or you don't want to open a router port: `cloudflared` dials out from your machine, and Cloudflare handles the domain, the certificate and the entry point. Not a single port needs opening. The free tier is enough.
 
-前置：域名托管在 Cloudflare（NS 指过去）。
+Prerequisite: the domain is hosted on Cloudflare (nameservers pointed at it).
 
-1. 打开 [Zero Trust 控制台](https://one.dash.cloudflare.com/) → **Networks → Tunnels → Create a tunnel** → 选 **Cloudflared**，起个名字，创建后页面会给你一条带 token 的安装命令；
-2. 在跑 DSH 的这台机器上执行那条命令（就是下面这个形状，token 用页面给的）：
+1. Open the [Zero Trust dashboard](https://one.dash.cloudflare.com/) → **Networks → Tunnels → Create a tunnel** → pick **Cloudflared**, name it. After creating it the page hands you an install command with a token in it;
+2. Run that command on the machine running DSH (it looks like this, with the token from the page):
 
    ```sh
-   # macOS / Linux：装成常驻服务，开机自启
-   cloudflared service install eyJhIjoi...你的token
+   # macOS / Linux: install as a service that starts at boot
+   cloudflared service install eyJhIjoi...your-token
    ```
 
-3. 回到隧道详情页 → **Public Hostname** → **Add a public hostname**：
+3. Back on the tunnel's detail page → **Public Hostname** → **Add a public hostname**:
 
-   | 字段 | 填什么 |
+   | Field | Value |
    | --- | --- |
-   | Subdomain / Domain | `dsh` / `example.com`（即 `dsh.example.com`） |
+   | Subdomain / Domain | `dsh` / `example.com` (i.e. `dsh.example.com`) |
    | Service Type | `HTTP` |
    | URL | `127.0.0.1:3088` |
 
-   保存后 `https://dsh.example.com` 就通了，证书 Cloudflare 自动签。网关的 `LAN_GATE_HOST` 保持默认 `127.0.0.1` 即可——`cloudflared` 就在本机。
+   Save, and `https://dsh.example.com` is live with a Cloudflare-issued certificate. Leave the gateway's `LAN_GATE_HOST` at its `127.0.0.1` default — `cloudflared` runs on the same machine.
 
-**装完必须做第 2 步的 403 自检**，这一步对隧道尤其要紧：`cloudflared` 和网关走的是本机回环连接，网关区分「公网访客」和「坐在这台电脑前的你」，全靠隧道有没有带上 `X-Forwarded-For`。`cloudflared` 默认是带的，所以配对墙正常生效；但万一你的版本或配置把它去掉了，公网请求就会被当成本机管理员，配对墙形同虚设——**用手机流量访问 `/lan-gate/admin`，看到 403 才算安全**。
+**Step 2's 403 self-check is mandatory**, and it matters most for a tunnel: `cloudflared` reaches the gateway over a loopback connection, so the only thing separating "a visitor from the internet" from "you, sitting at this computer" is whether the tunnel forwards `X-Forwarded-For`. `cloudflared` does by default, so the pairing wall works; but if your version or config strips it, public requests get treated as the local admin and the pairing wall is decorative. **Load `/lan-gate/admin` over mobile data — a 403 is the only safe answer.**
 
-> 提示：不用设 `LAN_GATE_TRUSTED_PROXIES`——网关本来就把回环来的连接当作可信反代，填 `127.0.0.1` 是空操作，也**不能**替代上面那个自检。
+> Note: you do not need `LAN_GATE_TRUSTED_PROXIES` here. The gateway already trusts a loopback connection as a reverse proxy, so setting it to `127.0.0.1` is a no-op — and it is **not** a substitute for the self-check above.
 >
-> Cloudflare 免费版支持 WebSocket（DSH 对话流需要），单个请求体上限 100MB，高于本插件默认的 20MB 上传上限，不影响使用。
+> Cloudflare's free tier supports WebSockets (DSH's conversation stream needs them) and caps a request body at 100MB, above this plugin's 20MB upload default, so nothing is affected.
 
-命令行流程（`cloudflared tunnel login` / `create` / `route dns` + `config.yml` 里写 ingress）见 [docs/remote-access.md](docs/remote-access.md#cloudflare-tunnel没有公网-ip-时的接入方式)。
+The CLI route (`cloudflared tunnel login` / `create` / `route dns` plus an `ingress` block in `config.yml`) is in [docs/remote-access.en.md](docs/remote-access.en.md#cloudflare-tunnel--getting-in-without-a-public-ip).
 </details>
 
-Lucky（路由器/NAS）的配法见 [docs/remote-access.md](docs/remote-access.md#lucky)。反代与网关不在同一台机器时，要把反代出口 IP 填进 `LAN_GATE_TRUSTED_PROXIES`。
+For Lucky (routers/NAS), see [docs/remote-access.en.md](docs/remote-access.en.md#lucky). When the proxy and the gateway are on different machines, put the proxy's egress IP in `LAN_GATE_TRUSTED_PROXIES`.
 
-### 2. 自检
+### 2. Self-check
 
-用**手机流量**（别连家里 Wi-Fi）访问 `https://你的域名/lan-gate/admin`，正确结果是 **403**。
+From **mobile data** (not your home Wi-Fi), open `https://your-domain/lan-gate/admin`. The correct result is a **403**.
 
-能看到管理页说明反代没带 `X-Forwarded-*` 头，公网请求被当成了本机用户——回去检查转发头再往下走。
+If you can see the admin page, your proxy isn't sending the `X-Forwarded-*` headers and public requests are being treated as local ones. Go back and fix the forwarded headers before continuing.
 
-### 3. 配对设备
+### 3. Pair a device
 
 ```sh
-# 在跑 DSH 的这台机器上，用本机浏览器打开
+# on the machine running DSH, in a browser on that machine
 open http://127.0.0.1:3088/lan-gate/admin
 ```
 
-1. 点「生成配对码」，得到 8 位码（10 分钟有效、只能用一次）；
-2. 手机打开你的 HTTPS 域名，在配对页输入这个码；
-3. 配对成功即进入 DSH，身份存在长期 Cookie 里，换网络不掉线；
-4. 浏览器菜单「添加到主屏幕」装成 App；
-5. 同意通知权限，agent 干完活推到锁屏。
+1. Click "Generate pairing code" for an 8-character code (valid 10 minutes, single use);
+2. On the phone, open your HTTPS domain and enter the code on the pairing page;
+3. Once paired you land in DSH. Identity lives in a long-lived cookie, so switching networks doesn't log you out;
+4. Use the browser's "Add to Home Screen" to install it as an app;
+5. Grant notification permission, and the agent reaches your lock screen when it needs you.
 
-管理页还能改设备名、设备类型，或单独/全部吊销设备。
+The admin page can also rename devices, change a device's type, and revoke devices one at a time or all at once.
 
 ---
 
-## 可选配置
+## Optional configuration
 
-环境变量，或 `~/.dsh/lan-gate.config.json`（键名是变量去前缀转小驼峰，如 `port` / `trustedProxies`；显式环境变量优先）。改完重启 `dsh web`。
+Environment variables, or `~/.dsh/lan-gate.config.json` (keys are the variable names minus the prefix, camelCased — `port`, `trustedProxies`; an explicit env var wins). Restart `dsh web` after changing anything.
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | What it does |
 | --- | --- | --- |
-| `LAN_GATE_PORT` | `3088` | 网关端口；被占用自动往上试（最多 +20） |
-| `LAN_GATE_HOST` | `127.0.0.1` | 监听地址；反代不在本机时才需要放开 |
-| `LAN_GATE_TARGET_PORT` | `3080` | 本机 DSH Web UI 端口 |
-| `LAN_GATE_RATE_LIMIT` | `120` | 未配对请求的每分钟上限（按真实客户端 IP） |
-| `LAN_GATE_TRUSTED_PROXIES` | 空 | 逗号分隔 IP；反代不在本机时必填 |
-| `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | 推送联系人。**iOS 必须改成真实邮箱或 https 网址**，否则 Apple 拒发 |
-| `LAN_GATE_LANG` | `auto` | 配对页、管理页、推送开关卡片的语言。`auto` 跟随浏览器的 `Accept-Language`（认不出就用中文），`zh`/`en` 写死 |
-| `DSH_PUSH_TURN_END` | **关** | 设 `1` 让「回合结束」也推一条。默认不推——回合结束不代表需要你（1.0.3 之前是默认推的，这是行为变更）。等授权、等回答这两类通知不受它影响，永远推 |
-| `DSH_PUSH_EVENTS` | `agent/turn-stopping` | 「回合结束」算哪些事件，逗号分隔；只在 `DSH_PUSH_TURN_END=1` 时有意义 |
-| `DSH_PUSH_DEBOUNCE_MS` | `15000` | 两条自动推送的最小间隔；等授权/等回答的通知不受压制 |
-| `DSH_PUSH_SUMMARY` | 关 | 设 `1` 让通知带上本回合的最终回复（只取正文，不含思考过程；截 120 字）和提问原文 |
-| `DSH_PUSH_TOOL` | 开 | 设 `0` 关掉模型可调用的 `push_notify` 工具 |
-| `DSH_PUSH_LANG` | `zh` | 推送通知文案的语言。通知没有「读者是谁」的信号，宿主进程也拿不到可靠的系统语言（launchd 不带 `LANG`），所以这里不自动探测：设 `en` 才是英文 |
-| `DSH_PUSH_APPROVAL_GRACE_MS` | `5000` | 「等授权」推送前的等待窗口。装了会自动答复审批的插件时（如 dsh-auto-approve），要等它答完再决定推不推——答完了就不推。判定器比这个慢就还是会推，那时把它调大 |
+| `LAN_GATE_PORT` | `3088` | Gateway port; if taken it retries upward (up to +20) |
+| `LAN_GATE_HOST` | `127.0.0.1` | Listen address; only open this up when the proxy is on another machine |
+| `LAN_GATE_TARGET_PORT` | `3080` | Local DSH Web UI port |
+| `LAN_GATE_RATE_LIMIT` | `120` | Per-minute cap on unpaired requests, counted per real client IP |
+| `LAN_GATE_TRUSTED_PROXIES` | empty | Comma-separated IPs; required when the proxy is on another machine |
+| `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | Push contact. **On iOS this must be a real email or https URL**, or Apple refuses to deliver |
+| `LAN_GATE_LANG` | `auto` | Language of the pairing page, the admin page and the push opt-in card. `auto` follows the browser's `Accept-Language` (falling back to Chinese when there is none); `zh`/`en` pin it |
+| `DSH_PUSH_TURN_END` | **off** | Set `1` to also push when a turn ends. Off by default — a finished turn doesn't mean you're needed (it pushed by default before 1.0.3; this was a behaviour change). Approval-pending and question-pending notifications are unaffected and always fire |
+| `DSH_PUSH_EVENTS` | `agent/turn-stopping` | Which events count as "turn ended", comma-separated; only meaningful with `DSH_PUSH_TURN_END=1` |
+| `DSH_PUSH_DEBOUNCE_MS` | `15000` | Minimum gap between two automatic pushes; approval/question notifications are never suppressed by it |
+| `DSH_PUSH_SUMMARY` | off | Set `1` to include this turn's final reply (prose only, never the reasoning; clipped to 120 chars) and the question text |
+| `DSH_PUSH_TOOL` | on | Set `0` to remove the model-callable `push_notify` tool |
+| `DSH_PUSH_LANG` | `zh` | Language of the notification copy. A notification carries no signal about who will read it, and the host process has no reliable system locale either (launchd starts it without `LANG`), so this is not autodetected: set `en` for English |
+| `DSH_PUSH_APPROVAL_GRACE_MS` | `5000` | How long to wait before pushing "approval pending". With a plugin that answers approvals automatically (dsh-auto-approve and the like) installed, the push waits for its verdict — answered means no push. A slower judge still gets pushed over, so raise this if yours is |
 
-上传大小上限（默认 20MB）在插件行的 `config.maxUploadBytes` 里改。
+The upload size limit (20MB by default) is `config.maxUploadBytes` on the plugin row.
 
-想在电脑端也启用回合过程折叠（默认只在手机宽度生效），在插件行的 `config.turnFoldDesktop` 里设 `true`——即在 profile 的 `cordis.patch.yml` 加一条：
+To enable turn-process folding on desktop too (it only applies at phone widths by default), set `config.turnFoldDesktop` to `true` on the plugin row — that is, add this to the profile's `cordis.patch.yml`:
 
 ```yaml
 - id: dsh-zen-remote
@@ -202,15 +204,15 @@ open http://127.0.0.1:3088/lan-gate/admin
     turnFoldDesktop: true
 ```
 
-改完重启 `dsh web`。不改服务端配置的话，单个浏览器也可以访问一次 `?mobile-nav-turn-fold=1` 自己开启（`=0` 关闭，按浏览器记忆）。
+Restart `dsh web` afterwards. Without touching the server config, a single browser can also turn it on for itself by visiting `?mobile-nav-turn-fold=1` once (`=0` turns it off; remembered per browser).
 
-**软键盘抬升的三个校准值**。少数手机上，键盘弹出时系统压根不告诉浏览器键盘有多高（实测过：某些第三方输入法 + Chrome；小米浏览器装的 PWA 壳）。这时插件没有任何可测的信号，只能按估算把输入框抬起来。估算值是照一台报告过的机器定的，别的机器可能偏高或偏低，所以三个数都能在插件行里改：
+**Three calibration values for the soft-keyboard lift.** On a few phones the system never tells the browser how tall the keyboard is (measured: certain third-party IMEs plus Chrome; the PWA shell Xiaomi's browser installs). With no measurable signal at all, the plugin has to lift the input box by estimate. The estimate is tuned to one reported device, so it may be too high or too low on yours — all three numbers are adjustable on the plugin row:
 
-| 配置项 | 默认 | 含义 | 允许范围 |
+| Setting | Default | Meaning | Allowed range |
 | --- | --- | --- | --- |
-| `keyboardLiftRatio` | `0.42` | 抬升高度按屏幕高度的这个比例估算 | 0 ~ 1 |
-| `keyboardLiftMaxPx` | `400` | 估算值的上限（像素），防止在长屏手机上把输入框顶到屏幕中间 | 0 ~ 2000 |
-| `keyboardSafetyPadPx` | `15` | 键盘顶部再留出的一点余量，**仅安卓**。第三方输入法常常少报自己的高度（把键盘上方那条工具栏漏掉），这一点余量就是补它的 | 0 ~ 200 |
+| `keyboardLiftRatio` | `0.42` | Estimate the lift as this fraction of screen height | 0 – 1 |
+| `keyboardLiftMaxPx` | `400` | Cap on the estimate (pixels), so the input box doesn't end up mid-screen on a tall phone | 0 – 2000 |
+| `keyboardSafetyPadPx` | `15` | A little extra clearance above the keyboard, **Android only**. Third-party IMEs routinely under-report their own height (leaving out the toolbar strip above the keys); this makes up for it | 0 – 200 |
 
 ```yaml
 - id: dsh-zen-remote
@@ -219,118 +221,104 @@ open http://127.0.0.1:3088/lan-gate/admin
     keyboardSafetyPadPx: 30
 ```
 
-怎么调：输入框抬得**不够**（还被键盘挡住一截）就调大 `keyboardLiftRatio`，一次加 0.03 试；抬得**过头**（输入框和键盘之间空出一条）就调小。只差一点点（几十像素以内、且是安卓）优先加 `keyboardSafetyPadPx`。三个值一个都不写就是现在的行为，不受影响；写超出范围的值会被自动收进上表的区间，不会把输入框顶出屏幕。正常手机走的是实测路径，这几个值对它们完全没有影响。
+How to tune: if the box is lifted **too little** (the keyboard still covers part of it), raise `keyboardLiftRatio` in steps of 0.03; if it's lifted **too far** (a gap opens between the box and the keyboard), lower it. If it's off by only a little (tens of pixels, on Android), reach for `keyboardSafetyPadPx` first. Leaving all three unset keeps today's behaviour exactly; out-of-range values are clamped to the table above, so the input box can never be pushed off-screen. Phones that report properly take the measured path and none of these values affect them.
 
 ---
 
-## 通知什么时候会响
+## When notifications fire
 
-默认只在**真正需要你**的时候响，分两条互不依赖的线。
+By default only when you are **actually needed**, along two independent lines.
 
-**一、系统自己判断的（恒开，且不受最小间隔压制）**
+**1. Decided by the system (always on, never suppressed by the debounce)**
 
-| 情况 | 通知 |
+| Situation | Notification |
 | --- | --- |
-| 某个工具在等你授权 | 「DSH 等你授权」，带工具名 |
-| 模型调用 `ask_user_question` 在等你回答 | 「DSH 等你回答」 |
+| A tool is waiting for your authorization | "DSH needs your approval", with the tool name |
+| The model called `ask_user_question` and is waiting | "DSH is waiting for your answer" |
 
-这两类不看会话层级——子代理自己卡在授权上，照样喊你，因为等的还是你。也**不受
-`DSH_PUSH_DEBOUNCE_MS` 压制**：「有操作等你点头」是最不能被吞掉的一条。
+Neither looks at session depth — a subagent stuck on an approval still calls out, because it's still you it's waiting for. Neither is suppressed by `DSH_PUSH_DEBOUNCE_MS` either: "something needs your nod" is the one notification that must never be swallowed.
 
-**有机器答复者时的时机**：审批事件的顺序是「先记 asked → 问答复者 → 记 decided」，
-所以推送并不是一见到 asked 就发，而是等 `DSH_PUSH_APPROVAL_GRACE_MS`（默认 5 秒）
-——这段时间内被答复掉的就不推。这个窗口原来是 1.5 秒，按「答复者都在同一个 tick
-内结算」设计的；那对同步答复者成立，但对模型答复者不成立（实测平均 2.4 秒），
-结果是自动通过的请求照样推了一条「等你授权」，通知到了、框却从来没出现。
-换了更慢的判定模型就把这个值调大。
+**Timing when a machine answers**: approval events arrive as "record asked → consult the answerer → record decided", so the push doesn't fire the moment `asked` appears — it waits `DSH_PUSH_APPROVAL_GRACE_MS` (5 seconds by default) and skips anything answered within it. That window used to be 1.5s, designed around "every answerer settles in the same tick". True for a synchronous answerer, not for a model-backed one (measured: 2.4s average), and the result was a "needs your approval" push for a request that was auto-allowed — notification delivered, dialog never shown. Raise it if you switch to a slower judge.
 
-策略自动放行的授权不会打扰你：请求发起后先等 1.5 秒，配对的「已决定」到了就取消，
-只有真正悬着没人管的才推。
+Approvals a policy waves through don't disturb you: after the request lands, the push waits 1.5s and cancels if the matching "decided" arrives. Only genuinely unattended ones go out.
 
-**二、模型自己决定的**
+**2. Decided by the model**
 
-`push_notify` 工具，模型在这些时候该调：你明确要求做完通知、需要你介入才能继续、
-出现你大概率想立刻知道的意外。不该调的场景（常规回合结束、进度汇报、它自己能推进
-的事）同样写在工具描述里——只写前者会让它每回合都调。会话开始还会注入一段同源的
-上下文强化，和工具描述共用一个常量，不会各改各的。
+The `push_notify` tool. The model should call it when you explicitly asked to be told when something finished, when it needs you to continue, or when something unexpected happened that you'd probably want to know right away. The tool description also spells out when *not* to call it (routine turn ends, progress reports, anything it can push forward on its own) — listing only the former turns it into a per-turn reflex. The same guidance is injected as standing session context, from one shared constant, so the two cannot drift apart.
 
-**默认不会响的**
+**What does not fire by default**
 
-- **普通跑完一轮不推**（1.0.3 起的行为变更，此前每回合都推）。干完活本身不等于
-  需要你。想要旧行为设 `DSH_PUSH_TURN_END=1`。
-- **子代理跑完永远不推**，无论上面那个开关。
+- **A plain finished turn does not push** (changed in 1.0.3; before that every turn did). Getting work done isn't the same as needing you. Set `DSH_PUSH_TURN_END=1` for the old behaviour.
+- **A subagent finishing never pushes**, regardless of that switch.
 
-**通知里写什么**：默认只有标题，不带对话内容。开 `DSH_PUSH_SUMMARY=1` 才带这一轮
-的最终回复——只取正文，不含思考过程；这一轮没说话就退回「最后执行了 xx 工具」，不拿思考内容凑数。
-推送 payload 是 aes128gcm 端到端加密的。
+**What's in a notification**: by default the title only, with no conversation content. With `DSH_PUSH_SUMMARY=1` the body carries this turn's final reply — prose only, never the reasoning; a turn that produced no prose falls back to "Last executed: <tool>" rather than padding it out with thinking text. The push payload is aes128gcm end-to-end encrypted.
 
 ---
 
-## 功能
+## Features
 
-- 会话列表主屏 + 独立会话页两级页面栈，横向推入推出
-- 主屏插件入口 chips，按已装插件自动出现，显隐可自定义
-- composer 重排：控件图标化，权限/模型菜单变成底部 sheet
-- 会话信息卡：六格统计 + 导出日志 / 重命名 / Fork / 归档
-- 同一回合的推理与工具调用默认折叠成一条「过程 · N 步」
-- 手势：左边缘右滑返回、底部 sheet 下滑关闭；安卓系统返回手势接管为「先关弹层 → 退回列表 → 退出应用」，不再一按就退出 PWA
-- 手机本地附件上传：落到会话工作目录 `.dsh-uploads/`，输入框追加 `@` 引用，发不发你说了算
-- 配对码换长期设备令牌，认令牌不认 IP，可随时吊销
-- 管理面（生成配对码 / 管理设备 / 触发推送）只认本机直连，经反代一律 403
-- 真 PWA：manifest + service worker，可装到主屏、可离线打开
-- 真 Web Push：VAPID + aes128gcm，通知默认不带对话正文；默认只在等授权/等回答时响，回合结束不再打扰（见上）
-- `push_notify` 工具：模型可在关键节点自己推一条，带限流
-- 「内测声明」弹窗注入「不再弹出」可选项：远程访问每次刷新都会重弹声明，点一次后本设备记住选择、以后自动关闭
+- Two-level page stack — session list home plus a standalone session page, pushed in and out horizontally
+- Plugin entry chips on the home screen, appearing automatically for what you have installed, individually hideable
+- Reworked composer: controls become icons, the permission and model menus become bottom sheets
+- Session info card: six stats plus export log / rename / fork / archive
+- Reasoning and tool calls within one turn fold into a single "process · N steps" row by default
+- Gestures: swipe right from the left edge to go back, swipe down to dismiss a bottom sheet. Android's system back gesture is taken over as "close the overlay → back to the list → leave the app", instead of quitting the PWA on the first press
+- Local attachment upload from the phone: files land in the session's working directory under `.dsh-uploads/` and an `@` reference is appended to the composer — sending it is still your call
+- A pairing code buys a long-lived device token; identity follows the token, not the IP, and can be revoked at any time
+- The admin surface (generate a code / manage devices / trigger a push) only accepts direct local connections; anything through the proxy gets a 403
+- A real PWA: manifest plus service worker, installable to the home screen, opens offline
+- Real Web Push: VAPID plus aes128gcm, no conversation body by default; fires only for approvals and questions, no longer on every turn end (see above)
+- The `push_notify` tool: the model can push at a moment that matters, rate-limited
+- The "internal testing notice" dialog gets a "don't show again" option: remote access re-shows the notice on every reload, and one click makes this device remember and dismiss it from then on
 
-深度说明：[界面](docs/interface.md) · [公网接入](docs/remote-access.md)
+In depth: [interface](docs/interface.md) · [public access](docs/remote-access.en.md)
 
 ---
 
-## 已适配的第三方插件
+## Third-party plugins with mobile support
 
-移动端 UI 对下列插件做了专门适配。所有适配都锚定对应插件自己的 DOM 标记：
-没装该插件时规则不生效，装了未列出的插件也不会被误伤。
+The mobile UI has specific adaptations for the plugins below. Every adaptation is anchored on that plugin's own DOM markers: if you don't have it installed the rules simply don't match, and installing a plugin that isn't listed here can't be caught in the crossfire.
 
-| 插件 | 移动端适配内容 | 实测版本 |
+| Plugin | What the mobile adaptation does | Version tested |
 | --- | --- | --- |
-| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 会话页头部提供工作台入口按钮；面板变手机全宽抽屉并避让刘海安全区；底部居中的关闭按钮 | 0.15.0 |
-| [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | AgentTeams 活动浮层挪到会话头部下方（原位置压住头部按钮）、会话列表页自动隐藏；子代理会话头部保留可点的父会话标题，一键切回主会话 | 0.1.9 |
-| [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | 用量与余额入口收进主屏 chips 行 | 0.2.9 |
-| [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | 定时任务入口收进主屏 chips 行 | 0.2.3 |
-| dsh-at-file | @文件引用，配合附件上传的 `@` 路径引用使用；它和本插件的附件 chip 读同一份草稿 token，手机端隐藏它 `.dsh-uploads/` 下那几行以免同一个文件被画两遍（缩略图 + 文件名），其余 `@` 引用不动 | 0.6.7 |
-| [@ace-zone/dsh-market](https://www.npmjs.com/package/@ace-zone/dsh-market) | 插件市场弹窗顶栏在手机上放不下，关闭的 × 被挤出面板外（触屏没有 Esc，等于关不掉）；隐藏标语 / 版本号 / 官网链接三个装饰位，标题改成省略号收缩，语言切换和 × 保留并加大点按面积 | 0.1.66 |
-| [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit) | 图像 Q&A/OCR，配合手机端附件上传使用 | — |
-| [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all) | 沿用上游 dsh-web-mobile 的兼容规则（文件树 / 预览浮层限宽居中等） | — |
+| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | A workbench entry button in the session page header; the panel becomes a full-width phone drawer that respects the notch safe area, with a centred close button at the bottom | 0.15.0 |
+| [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | The AgentTeams activity overlay moves below the session header (its original position covered the header buttons) and hides itself on the session list; a subagent session keeps a tappable parent-session title in its header for jumping back | 0.1.9 |
+| [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | Usage and balance entries fold into the home-screen chips row | 0.2.9 |
+| [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | The scheduled-tasks entry folds into the home-screen chips row | 0.2.3 |
+| dsh-at-file | `@` file references, used alongside attachment upload's `@` paths. It and this plugin's attachment chips read the same draft token, so on the phone its `.dsh-uploads/` rows are hidden to stop one file being drawn twice (thumbnail plus filename); other `@` references are left alone | 0.6.7 |
+| [@ace-zone/dsh-market](https://www.npmjs.com/package/@ace-zone/dsh-market) | The plugin market dialog's top bar doesn't fit on a phone and the × gets squeezed out of the panel (no Esc on a touchscreen, so it can't be closed at all). Three decorative slots — tagline, version, homepage link — are hidden, the title shrinks with an ellipsis, and the language switch and × stay with a bigger tap target | 0.1.66 |
+| [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit) | Image Q&A / OCR, used with phone-side attachment upload | — |
+| [dsh-web-ui suite](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all) | Inherits the compatibility rules from upstream dsh-web-mobile (file tree, width-capped centred preview overlay, and so on) | — |
 
-各项适配的技术细节（锚点选择器、断点、取舍记录）见[界面文档](docs/interface.md)的「兼容插件」一节。
-
----
-
-## 已知问题
-
-**iOS 26.x 独立 PWA 视口缩水**：加到主屏后视口底部会少掉一条状态栏高度，普通 Safari 标签页正常。这是 iOS 系统缺陷，缺掉的区域在文档之外，CSS 够不着；本插件做了三层缓解（浅色 manifest 背景 + 安全区补偿 + 强制重排），能减轻但不保证复原。彻底恢复只能整个 App 退出重开。
-
-**个别环境软键盘对浏览器完全不可见，输入框抬升靠估算兜底**：部分组合（实测过：某些第三方输入法 + Chrome；小米浏览器安装的 PWA 壳）里，键盘弹出/收起时系统不把键盘高度告知页面——视口不变、无任何事件（visualViewport、VirtualKeyboard API 一并失效，均已实测排除）。插件的兜底是：聚焦后探测约 1.2 秒，判定「键盘不可见」就按估计高度抬升输入框（判定按浏览器记忆，之后聚焦即时抬升）。代价有两条：抬升高度是估算的，可能与实际键盘有几十像素出入；键盘收起同样无信号，输入框要等你点击或滑动输入框以外的区域才回落。正常环境完全不走这条路径，不受影响。抬升高度差得明显的话不用改代码，插件行的 `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` 三个值可以照着自己的机器调，见上面「配置」一节。
-
-**经反代访问时设置页打不开（插件配置列表空白、模型卡片报「settings are unavailable in this browser」）**：直连 `127.0.0.1:3080/3088` 正常。
-
-根因是 DSH 官方的设计，不在网关：设置类 RPC **只对回环连接开放**。客户端按 `location.hostname` 判定（`dsh-client-connection` 的 `isLoopback`），非回环时 `dsh-client-ui-settings` 把持久化降级为 `memory`，设置镜像初始状态就是 `unavailable`——官方源码注释原话是「remote browsers remain process-local because settings RPCs are loopback-only」。所有依赖这个镜像的卡片（模型、插件配置）因此一起空白，与本插件、与 service worker 缓存都无关（2026-08-20 真机 USB 调试 + 本机对照实测）。
-
-绕法：要改配置就回跑 DSH 的那台机器上用本机浏览器改，配置存在后端，改完手机侧其它功能不受影响。想让远程也能改设置，得由上游放开这条限制。
+The technical detail behind each adaptation — anchor selectors, breakpoints, what was traded away — is in the "compatible plugins" section of the [interface doc](docs/interface.md).
 
 ---
 
-## 权限与数据
+## Known issues
 
-- **网络**：网关只监听本机（默认 `127.0.0.1:3088`），对外暴露完全由你的反代/隧道决定；推送经浏览器推送服务商中转（内容 aes128gcm 端到端加密，服务商读不到）；插件自身不向任何第三方上报数据。
-- **文件**：附件上传只写入当前会话工作目录下的 `.dsh-uploads/`；配对状态与配置存在 `~/.dsh/lan-gate-state.json` / `lan-gate.config.json`。
-- **凭据**：不收集、不存储任何账号密码；设备身份是本插件自己签发的随机令牌（HttpOnly Cookie）。
+**iOS 26.x standalone PWA viewport shrinkage**: after adding to the home screen, the viewport loses a status-bar's height at the bottom; an ordinary Safari tab is fine. This is an iOS defect — the missing region is outside the document and CSS cannot reach it. The plugin ships three layers of mitigation (light manifest background, safe-area compensation, forced reflow) which reduce it without guaranteeing a fix. Only quitting and reopening the whole app restores it fully.
 
-排障：运行日志在 `~/.dsh/logs/web.log`（网关与推送的行带 `[dsh-zen-remote-*]` 前缀）；手机端界面自检可用调试徽章（首页顶栏连点 5 下开关）。安全问题请走 GitHub Security Advisories 私下报告，不要公开提 issue。
+**In a few environments the soft keyboard is completely invisible to the browser, and the lift falls back to an estimate**: in some combinations (measured: certain third-party IMEs plus Chrome; the PWA shell installed by Xiaomi's browser) the system never tells the page the keyboard's height when it opens or closes — the viewport doesn't change and no event fires (visualViewport and the VirtualKeyboard API both fail; both ruled out by measurement). The fallback: probe for about 1.2s after focus, and if the keyboard is judged invisible, lift the input box by the estimated height (the verdict is remembered per browser, so later focuses lift immediately). Two costs: the lift is an estimate and can be tens of pixels off the real keyboard, and there's no signal for the keyboard closing either, so the box only drops back once you tap or scroll outside it. Normal environments never take this path. If the lift is visibly off you don't need to change code — `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` on the plugin row are there to be tuned to your device; see the configuration section above.
 
-## 上游致谢
+**Settings pages don't open through the reverse proxy (the plugin config list is blank, model cards report "settings are unavailable in this browser")**: connecting directly to `127.0.0.1:3080/3088` works fine.
 
-本插件的界面层衍生自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-web-mobile)，通道层衍生自 [zylzyqzz/dsh-mobile-pwa](https://github.com/zylzyqzz/dsh-mobile-pwa)（其自身衍生自 [Bernardxu123/dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate)），均为 MIT，原始版权行保留在 [LICENSE](LICENSE)。
+The root cause is DSH's own design, not the gateway: settings RPCs are **loopback-only**. The client decides from `location.hostname` (`isLoopback` in `dsh-client-connection`), and off-loopback `dsh-client-ui-settings` degrades persistence to `memory`, so the settings mirror starts out `unavailable` — the upstream source comment reads, verbatim, "remote browsers remain process-local because settings RPCs are loopback-only". Every card that depends on that mirror (models, plugin config) goes blank together. Nothing to do with this plugin or with service worker caching (verified 2026-08-20 by USB-debugging a real device against a local control).
+
+Workaround: change settings from a browser on the machine running DSH. The config lives in the backend, and nothing else on the phone side is affected. Making settings remotely editable requires upstream to relax that restriction.
+
+---
+
+## Permissions and data
+
+- **Network**: the gateway listens on the local machine only (`127.0.0.1:3088` by default); what gets exposed is entirely up to your reverse proxy or tunnel. Push travels through the browser vendor's push service (the content is aes128gcm end-to-end encrypted, so the vendor can't read it). The plugin itself reports nothing to any third party.
+- **Files**: attachment uploads are written only to `.dsh-uploads/` inside the current session's working directory; pairing state and config live in `~/.dsh/lan-gate-state.json` and `lan-gate.config.json`.
+- **Credentials**: no account or password is ever collected or stored; a device's identity is a random token this plugin issues itself, in an HttpOnly cookie.
+
+Troubleshooting: runtime logs are in `~/.dsh/logs/web.log` (gateway and push lines are prefixed `[dsh-zen-remote-*]`); the phone UI has a debug badge for self-checks (tap the home screen's top bar five times to toggle it). Please report security issues privately through GitHub Security Advisories rather than opening a public issue.
+
+## Upstream credits
+
+This plugin's interface layer derives from [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-web-mobile), and its channel layer from [zylzyqzz/dsh-mobile-pwa](https://github.com/zylzyqzz/dsh-mobile-pwa) (itself derived from [Bernardxu123/dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate)), both MIT. The original copyright lines are preserved in [LICENSE](LICENSE).
 
 ## License
 

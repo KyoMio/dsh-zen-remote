@@ -1,7 +1,7 @@
 # 公网接入（通道半边详解）
 
 > `dsh-zen-remote` 的通道半边完整文档：反代对接、配对流程、环境变量、管理 API、推送、安全边界。
-> 安装与快速上手见[根 README](../README.md)；界面侧细节见 [interface.md](interface.md)。
+> 安装与快速上手见[根 README](../README.zh-CN.md)；界面侧细节见 [interface.md](interface.md)。
 > 网关基座衍生自 MIT 的 [`dsh-mobile-gate`](https://github.com/Bernardxu123/dsh-mobile-gate)。
 
 ---
@@ -76,7 +76,7 @@
 dsh plugin add dsh-zen-remote
 ```
 
-装完重启 `dsh web`。手动写法与本地开发装法见[根 README](../README.md#安装)；不走 `dsh plugin add` 的静态挂载见 [`cordis.patch.yml.example`](../cordis.patch.yml.example)。
+装完重启 `dsh web`。手动写法与本地开发装法见[根 README](../README.zh-CN.md#安装)；不走 `dsh plugin add` 的静态挂载见 [`cordis.patch.yml.example`](../cordis.patch.yml.example)。
 
 ### 2. 配你自己的反代
 

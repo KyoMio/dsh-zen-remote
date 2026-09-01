@@ -32,9 +32,10 @@ pnpm verify    # 两个 tsconfig 的 --noEmit 类型检查
 pnpm test      # 网关 node:test 用例 + 三个界面自检脚本 + 文档版本号一致性检查，一条命令全跑
 ```
 
-**版本号**：README 里的 release 徽章和 profile 依赖示例由
-`scripts/sync-doc-version.mjs` 按 `package.json` 改写，挂在 `version` 生命周期
-脚本上——`npm version patch` 会把改好的 README 带进同一个发版提交，不用手改
+**版本号**：两份 README（`README.md` 英文为主文档，`README.zh-CN.md` 中文）里的
+release 徽章和 profile 依赖示例由 `scripts/sync-doc-version.mjs` 按 `package.json`
+改写，挂在 `version` 生命周期脚本上——`npm version patch` 会把改好的两份 README
+带进同一个发版提交，不用手改
 （徽章曾经一路卡在 v1.0.0 到 1.0.2）。`pnpm test` 里的 `--check` 会在漏同步时
 把测试挂掉。文档里的锚点变了就更新那个脚本：找不到标记它直接非零退出，不会
 默默通过。
