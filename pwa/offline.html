@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="zh-CN">
+<html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#0f1115">
-  <title>离线 · DSH</title>
+  <title>Offline · DSH</title>
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body { margin: 0; padding: 0; }
@@ -29,10 +29,21 @@
 <body>
   <div class="card">
     <div class="dot">DSH</div>
-    <h1>离线 / Offline</h1>
-    <p>无法连接到 DSH 服务器。<br>请在服务器侧确认网关与 DSH 仍在运行。</p>
+    <h1>Offline</h1>
+    <p></p>
     <div class="spin"></div>
   </div>
-  <script>setInterval(() => location.reload(), 5000)</script>
+  <script>
+    // Served straight from disk with no gateway injection, so the language
+    // comes from the browser itself.
+    var zh = String(navigator.language || '').toLowerCase().indexOf('zh') === 0
+    document.documentElement.lang = zh ? 'zh-CN' : 'en'
+    document.title = (zh ? '离线' : 'Offline') + ' · DSH'
+    document.querySelector('h1').textContent = zh ? '离线' : 'Offline'
+    document.querySelector('p').innerHTML = zh
+      ? '无法连接到 DSH 服务器。<br>请在服务器侧确认网关与 DSH 仍在运行。'
+      : 'Cannot reach the DSH server.<br>Check on the server side that the gateway and DSH are still running.'
+    setInterval(() => location.reload(), 5000)
+  </script>
 </body>
 </html>

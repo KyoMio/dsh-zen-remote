@@ -183,11 +183,13 @@ open http://127.0.0.1:3088/lan-gate/admin
 | `LAN_GATE_RATE_LIMIT` | `120` | 未配对请求的每分钟上限（按真实客户端 IP） |
 | `LAN_GATE_TRUSTED_PROXIES` | 空 | 逗号分隔 IP；反代不在本机时必填 |
 | `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | 推送联系人。**iOS 必须改成真实邮箱或 https 网址**，否则 Apple 拒发 |
+| `LAN_GATE_LANG` | `auto` | 配对页、管理页、推送开关卡片的语言。`auto` 跟随浏览器的 `Accept-Language`（认不出就用中文），`zh`/`en` 写死 |
 | `DSH_PUSH_TURN_END` | **关** | 设 `1` 让「回合结束」也推一条。默认不推——回合结束不代表需要你（1.0.3 之前是默认推的，这是行为变更）。等授权、等回答这两类通知不受它影响，永远推 |
 | `DSH_PUSH_EVENTS` | `agent/turn-stopping` | 「回合结束」算哪些事件，逗号分隔；只在 `DSH_PUSH_TURN_END=1` 时有意义 |
 | `DSH_PUSH_DEBOUNCE_MS` | `15000` | 两条自动推送的最小间隔；等授权/等回答的通知不受压制 |
 | `DSH_PUSH_SUMMARY` | 关 | 设 `1` 让通知带上本回合的最终回复（只取正文，不含思考过程；截 120 字）和提问原文 |
 | `DSH_PUSH_TOOL` | 开 | 设 `0` 关掉模型可调用的 `push_notify` 工具 |
+| `DSH_PUSH_LANG` | `zh` | 推送通知文案的语言。通知没有「读者是谁」的信号，宿主进程也拿不到可靠的系统语言（launchd 不带 `LANG`），所以这里不自动探测：设 `en` 才是英文 |
 | `DSH_PUSH_APPROVAL_GRACE_MS` | `5000` | 「等授权」推送前的等待窗口。装了会自动答复审批的插件时（如 dsh-auto-approve），要等它答完再决定推不推——答完了就不推。判定器比这个慢就还是会推，那时把它调大 |
 
 上传大小上限（默认 20MB）在插件行的 `config.maxUploadBytes` 里改。

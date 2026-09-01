@@ -37,6 +37,23 @@ const SHELL_PATHS = new Set([
   '/pwa/offline.html'
 ])
 
+// ---- Copy -------------------------------------------------------------
+// A worker has no window and no gateway injection, so the language comes from
+// the worker's own navigator (guarded: the test sandbox has none). Only two
+// surfaces need it — the offline fallback and the push payload's defaults,
+// which the gateway normally fills in anyway.
+const T = (String((typeof navigator !== 'undefined' && navigator.language) || '').toLowerCase().indexOf('zh') === 0 ? {
+  offlineTitle: '离线',
+  offlineBody: '无法连接到 DSH 服务器，正在重试…<br>请确认你的网关与服务仍在运行。',
+  pushTitle: 'DSH 任务完成',
+  pushBody: '你的智能体已完成某一步。'
+} : {
+  offlineTitle: 'Offline',
+  offlineBody: 'Cannot reach the DSH server, retrying…<br>Check that your gateway and DSH are still running.',
+  pushTitle: 'DSH task finished',
+  pushBody: 'Your agent finished a step.'
+})
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(SHELL_CACHE).then((cache) => cache.addAll([
@@ -140,7 +157,7 @@ async function networkFirstNavigation(req) {
     if (cached) return cached
     // Last resort: offline fallback hint.
     return new Response(
-      '<!doctype html><meta charset="utf-8"><title>离线</title><style>body{font-family:system-ui;background:#0f1115;color:#e6e8ec;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}p{max-width:24em;text-align:center;line-height:1.7}</style><script>setInterval(()=>location.reload(),4000)</script><p>无法连接到 DSH 服务器，正在重试…<br>请确认你的网关与服务仍在运行。</p>',
+      '<!doctype html><meta charset="utf-8"><title>' + T.offlineTitle + '</title><style>body{font-family:system-ui;background:#0f1115;color:#e6e8ec;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}p{max-width:24em;text-align:center;line-height:1.7}</style><script>setInterval(()=>location.reload(),4000)</script><p>' + T.offlineBody + '</p>',
       { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
     )
   }
@@ -150,9 +167,9 @@ async function networkFirstNavigation(req) {
 self.addEventListener('push', (event) => {
   let data = {}
   try { data = event.data ? event.data.json() : {} } catch (e) { /* ignore */ }
-  const title = data.title || 'DSH 任务完成'
+  const title = data.title || T.pushTitle
   const options = {
-    body: data.body || '你的智能体已完成某一步。',
+    body: data.body || T.pushBody,
     icon: '/pwa/icons/icon-192.png',
     badge: '/pwa/icons/icon-192.png',
     tag: data.tag || 'dsh-agent-done',

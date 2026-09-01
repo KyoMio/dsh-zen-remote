@@ -77,7 +77,9 @@
   // Add a small floating reset button when scale != 1.
   if (baseScale !== 1) {
     const reset = document.createElement('button')
-    reset.textContent = '字AA'
+    var zh = String(navigator.language || '').toLowerCase().indexOf('zh') === 0
+    reset.textContent = zh ? '字AA' : 'AA'
+    reset.setAttribute('aria-label', zh ? '恢复默认字号' : 'Reset font size')
     reset.style.cssText =
       'position:fixed;right:max(10px,env(safe-area-inset-right));' +
       'bottom:max(110px,calc(env(safe-area-inset-bottom) + 110px));z-index:2147483002;' +

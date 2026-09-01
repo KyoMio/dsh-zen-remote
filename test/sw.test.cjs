@@ -134,7 +134,7 @@ test('sw: HTML navigation falls back to the built-in offline hint when nothing i
 
   const res = await dispatchFetch(sw, req)
   const text = await res.text()
-  assert.ok(text.includes('离线'), 'built-in offline hint served when no cached page exists')
+  assert.match(text, /location\.reload/, 'built-in offline hint served, and it retries on its own')
 })
 
 test('sw: cross-origin requests are left alone (event.respondWith never called)', async () => {

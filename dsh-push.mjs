@@ -34,7 +34,7 @@ export const inject = []
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 // Shares the gateway's optional config file <DSH_HOME>/lan-gate.config.json
-// (keys: port, pushEvents, pushDebounceMs, pushSummary, pushTurnEnd, pushTool).
+// (keys: port, lang, pushEvents, pushDebounceMs, pushSummary, pushTurnEnd, pushTool).
 // Explicit env wins.
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -53,6 +53,36 @@ const DEBOUNCE_MS = Number(process.env.DSH_PUSH_DEBOUNCE_MS ?? FILE.pushDebounce
 const INCLUDE_SUMMARY = process.env.DSH_PUSH_SUMMARY !== undefined ? process.env.DSH_PUSH_SUMMARY === '1' : truthy(FILE.pushSummary)
 const TURN_END_ENABLED = process.env.DSH_PUSH_TURN_END !== undefined ? process.env.DSH_PUSH_TURN_END === '1' : truthy(FILE.pushTurnEnd)
 const PUSH_TOOL_ENABLED = process.env.DSH_PUSH_TOOL !== undefined ? process.env.DSH_PUSH_TOOL !== '0' : FILE.pushTool !== false
+
+// Notification language. The gateway resolves the same `lang` key to the
+// requesting browser's Accept-Language when it is "auto"; a notification has
+// no such reader signal, and the host process has no usable locale either
+// (launchd starts it with no LANG — Intl reports en-US on a Chinese machine),
+// so anything other than "en" here means Chinese.
+const LANG = String(process.env.DSH_PUSH_LANG ?? FILE.lang ?? 'zh') === 'en' ? 'en' : 'zh'
+const COPY = {
+  zh: {
+    lastTool: '最后执行了 {tool}',
+    approvalTitle: 'DSH 等你授权',
+    approvalBody: '{tool} 需要授权才能继续',
+    approvalBodyPlain: '有操作需要授权才能继续',
+    questionTitle: 'DSH 等你回答',
+    questionBody: '智能体提了一个问题，正在等你回答',
+    turnEndTitle: 'DSH 任务完成',
+    turnEndBody: '智能体已完成当前回合'
+  },
+  en: {
+    lastTool: 'Last executed: {tool}',
+    approvalTitle: 'DSH needs your approval',
+    approvalBody: '{tool} needs approval to continue',
+    approvalBodyPlain: 'An action needs approval to continue',
+    questionTitle: 'DSH is waiting for your answer',
+    questionBody: 'The agent asked a question and is waiting for your answer',
+    turnEndTitle: 'DSH task finished',
+    turnEndBody: 'The agent finished the current turn'
+  }
+}
+const T = COPY[LANG]
 
 // The model-facing tool of @deepseek-ai/dsh-tool-ask-user. Its `tool/call`
 // session event is appended BEFORE dispatch (dsh-agent-loop appendToolCall),
@@ -138,7 +168,7 @@ export function turnSummary(events, turn) {
       lastTool = ev.data.name
     }
   }
-  return lastTool ? `Last executed: ${lastTool}` : ''
+  return lastTool ? T.lastTool.replace('{tool}', lastTool) : ''
 }
 
 // First question of an ask_user_question call, from the raw (unparsed)
@@ -175,15 +205,15 @@ export function decideNotification(input, cfg) {
     case 'approval':
       return {
         shouldNotify: true,
-        title: 'DSH needs your approval',
-        body: input.toolName ? `${input.toolName} needs approval to continue` : 'An action needs approval to continue',
+        title: T.approvalTitle,
+        body: input.toolName ? T.approvalBody.replace('{tool}', input.toolName) : T.approvalBodyPlain,
         reason: 'approval-pending'
       }
     case 'question':
       return {
         shouldNotify: true,
-        title: 'DSH is waiting for your answer',
-        body: (cfg.includeSummary && input.question) || 'The agent asked a question and is waiting for your answer',
+        title: T.questionTitle,
+        body: (cfg.includeSummary && input.question) || T.questionBody,
         reason: 'question-pending'
       }
 
@@ -192,7 +222,7 @@ export function decideNotification(input, cfg) {
       if (!cfg.turnEndEnabled) return skip('turn-end-disabled')
       if ((input.delegationDepth ?? 0) !== 0) return skip('subagent')
       if (debounced) return skip('debounced')
-      return { shouldNotify: true, title: 'DSH task finished', body: input.summary || 'The agent finished the current turn', reason: 'turn-end' }
+      return { shouldNotify: true, title: T.turnEndTitle, body: input.summary || T.turnEndBody, reason: 'turn-end' }
 
     default:
       return skip('unknown-kind')
