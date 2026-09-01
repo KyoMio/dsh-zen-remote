@@ -3,7 +3,7 @@
 
 <p align="center">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0B7285?style=flat-square" alt="MIT"></a>
-<img src="https://img.shields.io/badge/release-v1.1.10-5B4CF0?style=flat-square" alt="v1.1.10">
+<img src="https://img.shields.io/badge/release-v1.1.11-5B4CF0?style=flat-square" alt="v1.1.11">
 <img src="https://img.shields.io/badge/DSH-Web%20Profile-5B4CF0?style=flat-square" alt="DSH Web Profile">
 </p>
 
@@ -41,7 +41,7 @@ Edit `~/.dsh/profiles/web/package.json` by hand — one line under `dependencies
 ```jsonc
 {
   "dependencies": {
-    "dsh-zen-remote": "^1.1.10"        // for local development: "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^1.1.11"        // for local development: "link:/path/to/dsh-zen-remote"
   },
   "dsh": { "profile": { "bundles": [
     "@deepseek-ai/dsh-base",
