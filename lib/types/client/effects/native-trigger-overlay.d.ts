@@ -20,6 +20,6 @@
  * trigger on top keeps the behaviour. Pills are `pointer-events: none` so a
  * tap can only ever reach the real thing — no double handling.
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from '../compat/types.ts';
 export declare function installNativeTriggerOverlay(ctx: ClientContext): void;
 //# sourceMappingURL=native-trigger-overlay.d.ts.map

@@ -1,5 +1,5 @@
-import { defineStore } from '@deepseek-ai/dsh-client-runtime/client'
-import type { WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
+import { defineStore } from './compat/store.ts'
+import type { WorkspaceId } from './compat/types.ts'
 
 /** The two levels of the phone page stack. */
 export type MobileView = 'home' | 'session'

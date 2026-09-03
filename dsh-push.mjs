@@ -180,6 +180,30 @@ export function pendingQuestionText(rawArguments) {
   } catch { return '' }
 }
 
+/**
+ * Session event log, read compatibly across both DSH versions: 0.1.1 exposes
+ * `session.events` as an array getter; 0.1.2 replaced it with the
+ * `session.snapshotEvents()` method. When neither is available, return [] so
+ * turnSummary walks its own "not an array → ''" path.
+ * @param session - the session object, possibly undefined.
+ * @returns the event array.
+ */
+export function sessionEvents(session) {
+  if (session && Array.isArray(session.events)) return session.events
+  if (session && typeof session.snapshotEvents === 'function') {
+    // ponytail: snapshotEvents() with no argument copies the WHOLE event log
+    // on every call. That is acceptable here — this branch only runs when
+    // INCLUDE_SUMMARY is on (dsh-push.mjs:53, off by default) and at most once
+    // per turn end. Slicing would need the turn's start seq, and the
+    // agent/turn-stopping payload carries none: its emitter (0.1.2
+    // dsh-agent-loop) sends only `{ turn, signal }` plus the injected
+    // `agent` — a turn NUMBER, not an event-log seq, and the two are not the
+    // same thing. If a future payload adds a start seq, pass it as fromSeq.
+    return session.snapshotEvents()
+  }
+  return []
+}
+
 const skip = (reason) => ({ shouldNotify: false, title: '', body: '', reason })
 
 /**
@@ -420,7 +444,7 @@ export function apply(ctx) {
     fire({
       kind: 'turn-end',
       delegationDepth: header && header.delegationDepth,
-      summary: INCLUDE_SUMMARY ? turnSummary(session && session.events, payload && payload.turn) : ''
+      summary: INCLUDE_SUMMARY ? turnSummary(sessionEvents(session), payload && payload.turn) : ''
     })
   }
   for (const event of EVENTS) {

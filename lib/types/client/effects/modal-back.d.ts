@@ -17,6 +17,6 @@
  * Phone only. On desktop the back gesture is not a thing and the official
  * dialogs keep their own behaviour untouched (the repo's desktop no-op rule).
  */
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from '../compat/types.ts';
 export declare function installModalBack(ctx: ClientContext): void;
 //# sourceMappingURL=modal-back.d.ts.map

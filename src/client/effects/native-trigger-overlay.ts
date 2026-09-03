@@ -21,7 +21,7 @@
  * tap can only ever reach the real thing — no double handling.
  */
 
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext } from '../compat/types.ts'
 
 const PHONE = '(max-width: 767px)'
 const HEADER = '[data-phase] header'

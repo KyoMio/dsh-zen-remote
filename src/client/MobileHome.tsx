@@ -9,7 +9,8 @@ import {
   StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { SessionId, SessionSummary, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
+import { agentPresetOf } from './compat/types.ts'
+import type { MobileSessionRow, SessionId, UsePendingInteractions, WorkspaceId } from './compat/types.ts'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT } from './nav-store.ts'
 import { hasLayer, popLayer, pushLayer } from './history-nav.ts'
@@ -36,10 +37,28 @@ export type MobileHomeProps =
     downloadSessionLog: (id: SessionId) => void
     /** Bound ctx.workspaces.archiveSession(id) — the row swipe action. */
     archiveSession: (id: SessionId) => Promise<void>
+    /**
+     * 0.1.2 的待处理交互选择器标准 prop；0.1.1 没有这个 prop，运行时读到
+     * undefined（见组件里 EMPTY_PENDING_HOOK 兜底）。
+     */
+    useSessionPendingInteraction?: UsePendingInteractions
   }
 
 /** Phone breakpoint: below the tablet range, where the app-shell layout applies. */
 const PHONE_QUERY = '(max-width: 767px)'
+
+/**
+ * Empty pending-interaction map singleton: when the 0.1.2 source is absent
+ * the fallback hook returns THIS map, so the selector sees one stable
+ * reference across renders — a fresh Map per render would make every
+ * selector result a new reference and loop the list into infinite
+ * re-renders. Module-level on purpose.
+ */
+const EMPTY_PENDING_MAP: ReadonlyMap<SessionId, unknown> = new Map()
+
+/** 0.1.1 兜底：恒返回空 Map 的替身 hook（见组件里 useSessionPendingInteraction ?? EMPTY_PENDING_HOOK）。 */
+const EMPTY_PENDING_HOOK: UsePendingInteractions =
+  <S,>(sel: (m: ReadonlyMap<SessionId, unknown>) => S) => sel(EMPTY_PENDING_MAP)
 
 /** Swipe geometry: reveal width of the archive action / settle threshold. */
 const SWIPE_REVEAL = 88
@@ -216,18 +235,19 @@ function relativeTime(at: number): string {
 /**
  * Card status subline (real-device round 2 follow-up, 2026-08-17): reuses
  * `dotState`'s own state read (the same ongoing/warning/done semantics the
- * dot already encodes) plus `agentPreset` from the same `SessionSummary`
- * row — no new data source. Returns undefined when there is neither a
+ * dot already encodes) plus `agentPreset` from the same session row — no
+ * new data source. Returns undefined when there is neither a
  * state nor a preset to show, so the caller can skip the subline entirely
  * rather than render an empty row.
  */
-function statusLine(row: SessionSummary, dot: StateDotState | undefined, t: (key: MobileNavKey) => string): string | undefined {
+function statusLine(row: MobileSessionRow, dot: StateDotState | undefined, t: (key: MobileNavKey) => string): string | undefined {
+  const preset = agentPresetOf(row)
   const state = dot === 'ongoing' ? t('homeStatusOngoing')
     : dot === 'warning' ? t('homeStatusWarning')
     : dot === 'done' ? t('homeStatusDone')
     : undefined
-  if (state !== undefined && row.agentPreset !== undefined) return `${state} · ${row.agentPreset}`
-  return state ?? row.agentPreset
+  if (state !== undefined && preset !== undefined) return `${state} · ${preset}`
+  return state ?? preset
 }
 
 /**
@@ -242,6 +262,7 @@ function statusLine(row: SessionSummary, dot: StateDotState | undefined, t: (key
 export function MobileHome({
   useSessions,
   useWorkspaces,
+  useSessionPendingInteraction,
   useStore,
   actions,
   openSession,
@@ -262,6 +283,11 @@ export function MobileHome({
   const [sheet, setSheet] = useState<'filter' | 'chips' | null>(null)
   /** The one row whose archive action is swiped open (null = none). */
   const [swipeOpen, setSwipeOpen] = useState<SessionId | null>(null)
+  // 0.1.2 的待处理交互来源；0.1.1 没有这个标准 prop，读到 undefined 时用一个
+  // 恒返回空 Map 的替身，保证 hook 调用次数与顺序在两版之间一致（hooks 规则：
+  // 真实 hook 只在 0.1.2 被调用，且每次渲染同一位置无条件调用一次）。
+  const pendingHook = useSessionPendingInteraction ?? EMPTY_PENDING_HOOK
+  const pending = pendingHook((m) => m)
 
   /** Archive with the same confirm gate the session-info card uses. */
   const onArchiveRow = (id: SessionId): void => {
@@ -417,7 +443,7 @@ export function MobileHome({
 
       <ul data-mobile-nav="home-list">
         {rows.map((row) => {
-          const dot = dotState(row)
+          const dot = dotState(row, pending.has(row.id))
           const status = statusLine(row, dot, t)
           const initial = row.displayTitle.trim().charAt(0).toUpperCase()
           return (

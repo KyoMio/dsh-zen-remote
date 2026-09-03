@@ -1,5 +1,5 @@
 import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots';
-import type { SessionId, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client';
+import type { SessionId, UsePendingInteractions, WorkspaceId } from './compat/types.ts';
 import { NS } from './locales.ts';
 import type { createNavStore } from './nav-store.ts';
 /** Full props for the phone home screen (shell.overlay entry). */
@@ -12,6 +12,11 @@ export type MobileHomeProps = PropsRuntime<'shell.overlay'> & PropsStore<ReturnT
     downloadSessionLog: (id: SessionId) => void;
     /** Bound ctx.workspaces.archiveSession(id) — the row swipe action. */
     archiveSession: (id: SessionId) => Promise<void>;
+    /**
+     * 0.1.2 的待处理交互选择器标准 prop；0.1.1 没有这个 prop，运行时读到
+     * undefined（见组件里 EMPTY_PENDING_HOOK 兜底）。
+     */
+    useSessionPendingInteraction?: UsePendingInteractions;
 };
 /**
  * Phone home screen: the full-screen session list that owns the first level
@@ -22,5 +27,5 @@ export type MobileHomeProps = PropsRuntime<'shell.overlay'> & PropsStore<ReturnT
  * all navigation from the injected official actions; nothing here reads the
  * official DOM.
  */
-export declare function MobileHome({ useSessions, useWorkspaces, useStore, actions, openSession, startSession, downloadSessionLog, archiveSession, t, }: MobileHomeProps): import("react").JSX.Element | null;
+export declare function MobileHome({ useSessions, useWorkspaces, useSessionPendingInteraction, useStore, actions, openSession, startSession, downloadSessionLog, archiveSession, t, }: MobileHomeProps): import("react").JSX.Element | null;
 //# sourceMappingURL=MobileHome.d.ts.map

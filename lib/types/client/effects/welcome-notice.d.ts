@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from '../compat/types.ts';
 /**
  * "内测声明" first-run notice, opt-out half (ALL widths — same user-directed
  * exception as the _previewBadge rule in styles/base.css.ts).

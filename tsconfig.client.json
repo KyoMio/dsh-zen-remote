@@ -30,17 +30,17 @@
       "@deepseek-ai/cordis": [
         "./node_modules/@deepseek-ai/cordis/lib/types/index.d.ts"
       ],
-      "@deepseek-ai/dsh-client-runtime/client": [
-        "./node_modules/@deepseek-ai/dsh-client-runtime/lib/types/client/index.d.ts"
-      ],
       "@deepseek-ai/dsh-api-remotes/client": [
         "./node_modules/@deepseek-ai/dsh-api-remotes/lib/types/client/index.d.ts"
       ],
+      "@deepseek-ai/dsh-api-session-controller/client": [
+        "./node_modules/@deepseek-ai/dsh-api-session-controller/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-api-workspace-controller/client": [
+        "./node_modules/@deepseek-ai/dsh-api-workspace-controller/lib/types/client/index.d.ts"
+      ],
       "@deepseek-ai/dsh-client-connection/client": [
         "./node_modules/@deepseek-ai/dsh-client-connection/lib/types/client/index.d.ts"
-      ],
-      "@deepseek-ai/dsh-host-apiproxy/api": [
-        "./node_modules/@deepseek-ai/dsh-host-apiproxy/lib/types/api/index.d.ts"
       ],
       "@deepseek-ai/dsh-client-ui-slots": [
         "./node_modules/@deepseek-ai/dsh-client-ui-slots/lib/types/index.d.ts"
@@ -57,8 +57,14 @@
       "@deepseek-ai/dsh-client-ui-primitives": [
         "./node_modules/@deepseek-ai/dsh-client-ui-primitives/lib/types/index.d.ts"
       ],
+      "@deepseek-ai/dsh-client-ui-renderer/client": [
+        "./node_modules/@deepseek-ai/dsh-client-ui-renderer/lib/types/client/index.d.ts"
+      ],
       "@deepseek-ai/dsh-client-ui-sidebar/client": [
         "./node_modules/@deepseek-ai/dsh-client-ui-sidebar/lib/types/client/index.d.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-session/client": [
+        "./node_modules/@deepseek-ai/dsh-client-ui-session/lib/types/client/index.d.ts"
       ],
       "@deepseek-ai/dsh-session-log-export/client": [
         "./node_modules/@deepseek-ai/dsh-session-log-export/lib/types/client/index.d.ts"
@@ -66,8 +72,17 @@
       "@deepseek-ai/dsh-session-stats/client": [
         "./node_modules/@deepseek-ai/dsh-session-stats/lib/types/client.d.ts"
       ],
+      "@deepseek-ai/dsh-session/types": [
+        "./node_modules/@deepseek-ai/dsh-session/lib/types/types.d.ts"
+      ],
+      "@deepseek-ai/dsh-subagent/client": [
+        "./node_modules/@deepseek-ai/dsh-subagent/lib/types/client.d.ts"
+      ],
       "@deepseek-ai/dsh-token-meter/client": [
         "./node_modules/@deepseek-ai/dsh-token-meter/lib/types/client.d.ts"
+      ],
+      "@deepseek-ai/dsh-workspace/types": [
+        "./node_modules/@deepseek-ai/dsh-workspace/lib/types/types.d.ts"
       ]
     },
     "allowImportingTsExtensions": true,
