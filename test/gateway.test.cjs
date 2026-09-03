@@ -8,7 +8,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert')
-const { startMockTarget, startGateway, request, stopAll, pairDevice, REMOTE_HEADERS } = require('./util.cjs')
+const { startMockTarget, startMockAuthTarget, startGateway, request, stopAll, pairDevice, REMOTE_HEADERS } = require('./util.cjs')
 
 const VIEWPORT_RE = /<meta[^>]*name=["']?viewport["']?[^>]*>/gi
 // Exactly what DSH itself serves today — the tag the gateway has to rewrite.
@@ -113,6 +113,41 @@ test('gateway: injects manifest link, PWA bootstrap & app.css into HTML (local)'
     assert.ok(page.body.includes('window.__DSH_PWA__'), 'PWA bootstrap present')
     assert.match(page.body, /window\.__DSH_PWA__=\{vapid:"[A-Za-z0-9_-]{20,}",lang:"(zh|en)"\}/, 'real VAPID public key and resolved page language injected')
     assert.ok(page.body.includes('href="/lan-gate/admin"'), 'local user gets the admin entry chip')
+  } finally { await stop() }
+})
+
+// The 0.1.2 homepage loads its client bundle from a blocking bootstrap
+// <script> in <head> and settles with __DSH_BOOT_READY__ at the end of
+// <body>. If the gateway ever injected BEFORE that bootstrap script, or past
+// </head> into the body tail, the module table would not be ready when our
+// injected code runs (or our inline scripts would sit after the settlement
+// marker) — 0.1.2's client boot would break. This guards the order.
+test('injects after DSH bootstrap, before </head>', async () => {
+  const { stop } = await boot()
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.strictEqual(page.status, 200)
+    const html = page.body
+    const BOOTSTRAP = '<script src="/plugins/??@deepseek-ai/dsh-client-modules/client.js&rev=testrev"></script>'
+    const headEnd = html.indexOf('</head>')
+    assert.ok(html.includes(BOOTSTRAP), 'fixture bootstrap script present after proxying')
+    // 1. Our injection lands after DSH's own bootstrap script.
+    assert.ok(html.indexOf('/pwa/app.css') > html.indexOf(BOOTSTRAP),
+      '注入位置改了会让 0.1.2 的客户端引导拿不到模块表：app.css must come after the DSH bootstrap script')
+    // 2. Everything we inject into <head> still lands before </head>.
+    //    (The local-user admin chip is a body-side element and is not part of
+    //    this head-ordering contract.)
+    for (const marker of ['/pwa/app.css', 'window.__DSH_PWA__', '/pwa/manifest.json']) {
+      const at = html.indexOf(marker)
+      assert.ok(at !== -1 && at < headEnd, `injected marker "${marker}" sits before </head>`)
+    }
+    // 3. __DSH_BOOT_READY__ is the last thing in <body>: nothing of ours
+    // follows it, only the closing tags.
+    const bootReady = html.indexOf('__DSH_BOOT_READY__')
+    assert.ok(bootReady > headEnd, '__DSH_BOOT_READY__ lives in the body tail')
+    const tail = html.slice(bootReady)
+    assert.ok(!tail.includes('/pwa/app.css') && !tail.includes('__DSH_PWA__') && !tail.includes('/pwa/manifest.json'),
+      'nothing the gateway injected may follow the __DSH_BOOT_READY__ settlement script')
   } finally { await stop() }
 })
 
@@ -275,5 +310,99 @@ test('manifest + icons are readable without the device cookie (credential-less b
     // Everything else under /pwa/ stays behind the wall for unpaired remotes.
     const sw = await request(PORT, { path: '/pwa/sw.js', headers: REMOTE_HEADERS })
     assert.notEqual(sw.status, 200, 'sw.js still requires pairing')
+  } finally { await stop() }
+})
+
+// ---- 0.1.2 browser-auth exchange (M3): the gateway swaps the upstream
+// token for a cookie on the phone's behalf --------------------------------
+const UPSTREAM_TOKEN_URL = () => 'http://127.0.0.1:' + TARGET_PORT + '/?token=TESTTOKEN'
+
+async function bootAuth(opts) {
+  const target = await startMockAuthTarget(TARGET_PORT, opts)
+  const gw = startGateway(PORT, TARGET_PORT, { LAN_GATE_UPSTREAM_TOKEN_URL: UPSTREAM_TOKEN_URL() })
+  await gw.ready
+  return { target, gw, stop: () => stopAll(target.server, gw.child) }
+}
+
+test('auth exchange: a cookie-less HTML GET is swapped for the upstream token, then lands on the injected page', async () => {
+  const { stop } = await bootAuth()
+  try {
+    const first = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.strictEqual(first.status, 303, 'a cookie-less HTML navigation is answered with 303')
+    const cookies = first.headers['set-cookie'] || []
+    assert.ok(Array.isArray(cookies) && cookies.length > 0, 'the upstream set-cookie is passed through')
+    assert.match(cookies[0], /^dsh-auth-x=v;/, 'the upstream cookie value arrives verbatim')
+    assert.ok(String(first.headers.location || '').indexOf('dsh-auth-retry=1') >= 0, 'location carries the retry marker')
+
+    const cookie = String(cookies[0]).split(';')[0]
+    const second = await request(PORT, { path: first.headers.location, headers: { accept: 'text/html', cookie } })
+    assert.strictEqual(second.status, 200, 'following the redirect with the cookie reaches the page')
+    assert.ok(second.body.includes('/pwa/app.css'), 'the served page carries the gateway injection')
+  } finally { await stop() }
+})
+
+test('auth exchange: 0.1.1 mode (no token env) passes the upstream 401 through untouched', async () => {
+  // Gateway WITHOUT LAN_GATE_UPSTREAM_TOKEN_URL against an auth-acting target:
+  // the 401 must reach the client verbatim — no set-cookie, no redirect.
+  const target = await startMockAuthTarget(TARGET_PORT)
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  try {
+    const res = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.strictEqual(res.status, 401)
+    assert.strictEqual(res.headers['set-cookie'], undefined, 'no cookie is minted in 0.1.1 mode')
+    assert.strictEqual(res.headers['location'], undefined, 'no redirect in 0.1.1 mode')
+  } finally { await stopAll(target.server, gw.child) }
+})
+
+test('auth exchange guard: an upstream that rejects even the token gets the tap-through page, never a redirect loop', async () => {
+  const { stop } = await bootAuth({ tokenOk: false })
+  try {
+    const res = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.notEqual(res.status, 303, 'the guard must not redirect again')
+    assert.ok(res.status >= 200 && res.status < 300, 'the guard serves a page')
+    assert.ok(res.body.indexOf('href="/"') >= 0, 'the guard page carries the same-site tap-through link')
+    assert.strictEqual(res.headers['location'], undefined)
+  } finally { await stop() }
+})
+
+// The marker guard, exercised end-to-end: the token WORKS, but the follow-up
+// arrives WITHOUT the cookie — exactly what SameSite=Strict does on a
+// cross-app top-level navigation. The marked 401 must produce the tap-through
+// page, not another 303 (which would loop forever in a redirect-following
+// browser).
+test('auth exchange guard: a marked request that still 401s is answered with the tap-through page, never exchanged again', async () => {
+  const { stop } = await bootAuth() // tokenOk: true
+  try {
+    const first = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.strictEqual(first.status, 303)
+    const marked = first.headers.location
+    assert.ok(String(marked).indexOf('dsh-auth-retry=1') >= 0)
+
+    // Follow WITHOUT the cookie (Strict cookie withheld on cross-site nav).
+    const second = await request(PORT, { path: marked, headers: { accept: 'text/html' } })
+    assert.strictEqual(second.status, 200, 'a marked 401 is served the tap-through page, not redirected')
+    assert.ok(second.body.indexOf('href="') >= 0, 'the tap-through page carries a same-site link')
+    assert.strictEqual(second.headers['location'], undefined, 'no third redirect')
+  } finally { await stop() }
+})
+
+test('auth exchange: an /api 401 passes through untouched (XHR is not a page navigation)', async () => {
+  const { stop } = await bootAuth()
+  try {
+    const res = await request(PORT, { path: '/api/x', headers: { accept: 'text/html' } })
+    assert.strictEqual(res.status, 401)
+    assert.strictEqual(res.headers['set-cookie'], undefined, 'no cookie minted for an API call')
+    assert.strictEqual(res.headers['location'], undefined, 'no redirect for an API call')
+  } finally { await stop() }
+})
+
+test('auth exchange: the token request reaches upstream with the rewritten loopback Host', async () => {
+  const { target, stop } = await bootAuth()
+  try {
+    await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    const exchange = target.seen.find((r) => r.method === 'GET' && String(r.path).indexOf('token=') >= 0)
+    assert.ok(exchange, 'the gateway performed one token exchange')
+    assert.strictEqual(exchange.headers.host, '127.0.0.1:' + TARGET_PORT, 'exchange Host is the loopback target, not the public domain')
   } finally { await stop() }
 })

@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from '../compat/types.ts';
 /**
  * Phone: an @-file reference tap in the workbench closes the workbench.
  *

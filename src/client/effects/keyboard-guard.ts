@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext } from '../compat/types.ts'
 
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
 const PHONE_QUERY = '(max-width: 767px)'

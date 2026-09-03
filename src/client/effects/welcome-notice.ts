@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext } from '../compat/types.ts'
 
 /** Per-browser opt-out flag; localStorage because remote (non-loopback)
     connections never persist the acknowledgement host-side. */

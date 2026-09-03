@@ -1,4 +1,4 @@
-import type { ClientContext, SessionId, WorkspaceId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, SessionId, WorkspaceId } from './compat/types.ts'
 import { MobileNavToggle } from './MobileNavToggle.tsx'
 import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
@@ -33,6 +33,23 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 
 /** Required services (cordis fiber inject — the loader passes all module exports as an object plugin). */
 export const inject = ['slots', 'layout', 'locale', 'sessionLogDownload', 'sessions', 'workspaces']
+
+/**
+ * 0.1.2 把新建会话和归档会话的界面级操作挪到了 uiWorkspace 服务；
+ * 0.1.1 没有这个服务，那两个操作还在 ctx.workspaces 上。这里按存在探测，
+ * 不把 uiWorkspace 写进 inject（写了 0.1.1 就永远不激活）。
+ * 类型用本地最小接口，不 import 那个 dsh-client-ui-workspace 包
+ * ——0.1.1 装不到。
+ */
+interface UiWorkspaceLike {
+  startSession(workspaceId?: WorkspaceId): void
+  archiveSession(sessionId: SessionId): Promise<void>
+}
+
+/** 0.1.1 的 ctx.workspaces 上还有 startSession；0.1.2 的类型里没有了。 */
+interface LegacyWorkspacesLike {
+  startSession(workspaceId?: WorkspaceId): void
+}
 
 /**
  * Mobile-adaptive shell, browser half: injects the mobile stylesheet, then
@@ -163,7 +180,13 @@ export function apply(ctx: ClientContext): void {
       forkSession: (id: SessionId) => ctx.sessions.fork({ sessionId: id }),
       openSession: (id: SessionId) => ctx.sessions.open(id),
       renameSession: (id: SessionId, title: string) => ctx.sessions.binding(id)?.session.rename(title),
-      archiveSession: (id: SessionId) => ctx.workspaces.archiveSession(id),
+      // 0.1.2 的界面级归档在 uiWorkspace（顺带清当前选中）；懒查——回调是用户
+      // 点击才跑，那时服务必已注册。本插件的 inject 不包含 uiWorkspace（0.1.1
+      // 没有它），所以启动时不能查一次就用：可能早于它注册。
+      archiveSession: (id: SessionId) => {
+        const ui = ctx.get('uiWorkspace') as UiWorkspaceLike | undefined
+        return ui === undefined ? ctx.workspaces.archiveSession(id) : ui.archiveSession(id)
+      },
       downloadSessionLog: (id: SessionId) => ctx.sessionLogDownload.download(id),
     }),
   }, MobileSessionInfo))
@@ -215,11 +238,26 @@ export function apply(ctx: ClientContext): void {
     store: nav,
     inject: () => ({
       openSession: (id: SessionId) => ctx.sessions.open(id),
-      startSession: (workspaceId?: WorkspaceId) => ctx.workspaces.startSession(workspaceId),
+      // uiWorkspace 懒查：回调是用户点击才跑，服务那时必已注册（inject 不含
+      // uiWorkspace，启动时可能先于它注册，不能启动查一次就用）。0.1.1 上恒
+      // undefined，退回 ctx.workspaces.startSession——0.1.1 专用分支，0.1.2 的
+      // 类型里该方法已不存在，故对类型做 LegacyWorkspacesLike cast，运行时走不到。
+      startSession: (workspaceId?: WorkspaceId) => {
+        const ui = ctx.get('uiWorkspace') as UiWorkspaceLike | undefined
+        return ui === undefined
+          ? (ctx.workspaces as unknown as LegacyWorkspacesLike).startSession(workspaceId)
+          : ui.startSession(workspaceId)
+      },
       // S5 session-log chip — the same service call MobileDrawerFooter uses.
       downloadSessionLog: (id: SessionId) => ctx.sessionLogDownload.download(id),
-      // Row swipe action — the same binding MobileSessionInfo archives with.
-      archiveSession: (id: SessionId) => ctx.workspaces.archiveSession(id),
+      // Row swipe action — the same binding MobileSessionInfo archives with;
+      // on 0.1.2 the uiWorkspace variant also clears the current selection
+      // when the archived session is the one selected. Same lazy lookup as
+      // the session-info sheet's archive binding above.
+      archiveSession: (id: SessionId) => {
+        const ui = ctx.get('uiWorkspace') as UiWorkspaceLike | undefined
+        return ui === undefined ? ctx.workspaces.archiveSession(id) : ui.archiveSession(id)
+      },
     }),
   }, MobileHome))
 
@@ -240,7 +278,10 @@ export function apply(ctx: ClientContext): void {
     order: 5,
     locale: NS,
     inject: () => ({
-      downloadSessionLog: (sessionId: string) => ctx.sessionLogDownload.download(sessionId),
+      // The footer slot contract hands the id over as a loose string;
+      // download() wants the branded SessionId — pure type-layer narrowing
+      // (runtime value is a session id either way, same as MobileHome.tsx).
+      downloadSessionLog: (sessionId: string) => ctx.sessionLogDownload.download(sessionId as SessionId),
       toggleSidebar: () => ctx.layout.toggleSidebar(),
     }),
   }, MobileDrawerFooter))
@@ -254,3 +295,22 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-session-log-export/client'
+// 0.1.2-only package: augments GlobalStandardProps with
+// useSessions/useSessionPendingInteraction and SessionStandardProps with
+// sessionId/useSession/useProjection, and declares the `ctx.uiSession`
+// service. 0.1.1 has no such package — but this is `import type`, so the
+// build output carries no trace of it and the runtime is unaffected.
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+// 0.1.2-only controller packages: their `/client` type entries merge
+// `ctx.sessions` / `ctx.workspaces` onto the cordis Context (0.1.1 declared
+// both from dsh-client-runtime). Type-only again — nothing to load at
+// runtime, so a 0.1.1 installation is unaffected.
+import type {} from '@deepseek-ai/dsh-api-session-controller/client'
+import type {} from '@deepseek-ai/dsh-api-workspace-controller/client'
+// 0.1.2-only, type-only: the renderer declares `ctx.slots` on the cordis
+// Context (the service this plugin registers every slot through) and
+// `dsh-subagent/client` types the subagent catalog rows the session header
+// reads (SessionListState.subagentsByParent). 0.1.1 had both declared in the
+// dsh-client-runtime bundle that no longer exists.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-subagent/client'

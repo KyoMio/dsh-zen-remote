@@ -7,8 +7,9 @@ import {
   IconDownloadOutline16,
   IconEditOutline16,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import { workspaceTitleOf } from '@deepseek-ai/dsh-client-runtime/client'
-import type { SessionFace, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import { workspaceTitleOf } from './compat/store.ts'
+import { agentPresetOf } from './compat/types.ts'
+import type { RenameResult, SessionId } from './compat/types.ts'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT, SESSION_INFO_EVENT } from './nav-store.ts'
 import { hasLayer, popLayer, pushLayer } from './history-nav.ts'
@@ -36,7 +37,7 @@ export type MobileSessionInfoProps =
     /** Bound ctx.sessions.open(id) — lands on the freshly forked session. */
     openSession: (id: SessionId) => void
     /** Bound ctx.sessions.binding(id)?.session.rename(title); undefined when the binding is gone. */
-    renameSession: (sessionId: SessionId, title: string) => ReturnType<SessionFace['rename']> | undefined
+    renameSession: (sessionId: SessionId, title: string) => RenameResult | undefined
     /** Bound ctx.workspaces.archiveSession(sessionId). */
     archiveSession: (sessionId: SessionId) => Promise<void>
     /** Bound ctx.sessionLogDownload.download(sessionId) — owns its own progress/result modal. */
@@ -198,6 +199,7 @@ export function MobileSessionInfo({
   const cacheHit = usage === undefined ? null : cacheHitPercent(usage)
   const tokensEmpty = usage === undefined || (billedInputTokens(usage) === 0 && usage.outputTokens === 0)
   const cwd = row?.cwd === undefined || row.cwd === '' ? undefined : workspaceTitleOf(row.cwd)
+  const preset = agentPresetOf(row)
 
   const cells: Array<{ label: string; value: string; sub: string | undefined }> = [
     { label: t('infoStatTurns'), value: stats === undefined ? NA : String(stats.turns), sub: undefined },
@@ -279,7 +281,7 @@ export function MobileSessionInfo({
         </div>
 
         <div data-mobile-nav="info-badges">
-          {row?.agentPreset !== undefined && <span data-mobile-nav="info-badge">{row.agentPreset}</span>}
+          {preset !== undefined && <span data-mobile-nav="info-badge">{preset}</span>}
           {subagentCount > 0 && (
             <span data-mobile-nav="info-badge">{t('infoSubagents', { count: subagentCount })}</span>
           )}

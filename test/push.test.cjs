@@ -89,3 +89,45 @@ test('expired subscription (410) is dropped after send', async () => {
     assert.strictEqual(status.pushSubscriptions, 0, 'dead subscription removed')
   } finally { await stop(); await new Promise(r=>server.close(r)) }
 })
+
+// ---- sessionEvents: the turn-summary event log read, both DSH versions ----
+// Pure-module cases; they need no gateway. The turnSummary expected text is
+// derived by feeding the SAME events array straight in, so this locks the
+// two readers (0.1.1 array getter / 0.1.2 snapshotEvents method) to produce
+// identical summaries without restating the summary rules here.
+const path = require('node:path')
+const { pathToFileURL } = require('node:url')
+const PUSH_MODULE = pathToFileURL(path.join(__dirname, '..', 'dsh-push.mjs')).href
+let importSeq = 0
+const loadPushModule = () => import(`${PUSH_MODULE}?push-test=${++importSeq}`)
+
+test('sessionEvents: 0.1.1 array form feeds turnSummary identically to a bare array', async () => {
+  const { sessionEvents, turnSummary } = await loadPushModule()
+  const events = [
+    { type: 'tool/call', data: { turn: 7, step: 0, name: 'bash', arguments: '{}' } },
+    { type: 'assistant/message', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: '改完收工' }] } } }
+  ]
+  const direct = turnSummary(events, 7)
+  const viaGetter = turnSummary(sessionEvents({ events }), 7)
+  assert.strictEqual(viaGetter, direct)
+  assert.match(viaGetter, /改完收工/)
+})
+
+test('sessionEvents: 0.1.2 method form produces the exact same summary as the array form', async () => {
+  const { sessionEvents, turnSummary } = await loadPushModule()
+  const events = [
+    { type: 'tool/call', data: { turn: 7, step: 0, name: 'bash', arguments: '{}' } },
+    { type: 'assistant/message', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: '改完收工' }] } } }
+  ]
+  const direct = turnSummary(events, 7)
+  const viaMethod = turnSummary(sessionEvents({ snapshotEvents: () => events }), 7)
+  assert.strictEqual(viaMethod, direct, 'both DSH readers must yield byte-identical summaries')
+})
+
+test('sessionEvents: no reader available ({} or undefined) yields [] → empty summary', async () => {
+  const { sessionEvents, turnSummary } = await loadPushModule()
+  assert.deepStrictEqual(sessionEvents({}), [])
+  assert.deepStrictEqual(sessionEvents(undefined), [])
+  assert.strictEqual(turnSummary(sessionEvents({}), 7), '')
+  assert.strictEqual(turnSummary(sessionEvents(undefined), 7), '')
+})

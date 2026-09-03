@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from '../compat/types.ts';
 /**
  * Session header running-status dot (S2). No official element exists to
  * reposition (ConversationSessionHeader renders only the crumb title, the

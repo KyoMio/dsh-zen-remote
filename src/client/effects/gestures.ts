@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext } from '../compat/types.ts'
 import { GO_HOME_EVENT } from '../nav-store.ts'
 
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */

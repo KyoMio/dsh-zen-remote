@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext } from '../compat/types.ts'
 import { clientConfig } from '../client-config.ts'
 import { NS } from '../locales.ts'
 

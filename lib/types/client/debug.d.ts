@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from './compat/types.ts';
 /**
  * Debug badge — ?mobile-nav-debug=1
  * Renders a live state overlay (URL, viewport, media queries, shell chrome,

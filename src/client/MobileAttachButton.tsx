@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { IconPaperclipOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SessionId } from './compat/types.ts'
 import { NS } from './locales.ts'
 import { draftWithMention, rememberThumbnail, uploadUrl } from './attach-upload.ts'
 

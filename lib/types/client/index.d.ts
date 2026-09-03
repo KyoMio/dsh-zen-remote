@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from './compat/types.ts';
 import type { MobileNavKey } from './locales.ts';
 declare module '@deepseek-ai/dsh-client-ui-slots' {
     interface LocaleNamespaceMap {

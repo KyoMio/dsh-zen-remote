@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from '../compat/types.ts';
 import { type KeyboardTuning } from '../client-config.ts';
 /** The safety pad this platform gets: the configured clearance, or nothing
  * off Android. UA sniffing is the right tool here — the target is a platform

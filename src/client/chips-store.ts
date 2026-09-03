@@ -1,4 +1,4 @@
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import { createSnapshotStore } from './compat/store.ts'
 import { useSyncExternalStore } from 'react'
 
 /**

@@ -13,13 +13,67 @@ const GATEWAY = path.join(__dirname, '..', 'lib', 'lan-gate-server.cjs')
 // Simulates the reverse proxy: loopback socket + forwarded headers = remote client.
 const REMOTE_HEADERS = { 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' }
 
+// Mock DSH homepage in the 0.1.2 shape (mirrors the real index.html's
+// structure, rev hashes made deterministic): head carries preload links for
+// the client-modules combo script, the blocking bootstrap <script>, the
+// manifest link and a viewport meta; the body ends with the
+// __DSH_BOOT_READY__ settlement script. The gateway's injection lands before
+// </head> — i.e. after DSH's bootstrap lines and before __DSH_BOOT_READY__ —
+// and the ordering test in gateway.test.cjs guards that. `upstream-ok` is
+// the marker older tests assert on, kept inside the conversation main.
+function defaultPage() {
+  return [
+    '<!doctype html><html lang="en"><head>',
+    '<meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width, initial-scale=1" />',
+    '<link rel="preload" as="script" href="/plugins/??@deepseek-ai/dsh-client-ui-layout/client.js&rev=testrev-a">',
+    '<link rel="preload" as="script" href="/plugins/??@deepseek-ai/dsh-client-modules/client.js&rev=testrev-b">',
+    '<script src="/plugins/??@deepseek-ai/dsh-client-modules/client.js&rev=testrev"></script>',
+    '<link rel="manifest" href="./manifest.webmanifest" />',
+    '</head><body>',
+    '<main data-slot="conversation">upstream-ok</main>',
+    '<script>window.__DSH_BOOT_READY__ = true</script>',
+    '</body></html>'
+  ].join('\n')
+}
+
 function startMockTarget(port, html) {
-  const page = html || '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>DSH Test</title></head><body><main data-slot="conversation">upstream-ok</main></body></html>'
+  const page = html || defaultPage()
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(page)
   })
   return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)))
+}
+
+// Mock DSH upstream that acts like 0.1.2's browser auth: no signed cookie →
+// 401; `GET /?token=T` → 303 + Set-Cookie (unless opts.tokenOk is false, the
+// "even the token fails" guard case); cookie present → 200 HTML page;
+// /api/* always 401. Every request is recorded in `seen` so tests can assert
+// on what the gateway actually sent (e.g. the Host header of the exchange).
+function startMockAuthTarget(port, opts) {
+  const tokenOk = !opts || opts.tokenOk !== false
+  const page = defaultPage()
+  const seen = []
+  const server = http.createServer((req, res) => {
+    const url = req.url || '/'
+    seen.push({ method: req.method, path: url, headers: req.headers })
+    if (String(url).indexOf('token=') >= 0) {
+      if (!tokenOk) { res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' }); res.end('401 Unauthorized'); return }
+      res.writeHead(303, { location: '/', 'set-cookie': 'dsh-auth-x=v; Path=/; HttpOnly; SameSite=Strict' })
+      res.end()
+      return
+    }
+    if (String(req.headers.cookie || '').indexOf('dsh-auth-x=') >= 0) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(page)
+      return
+    }
+    if (String(url).indexOf('/api/') === 0) { res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' }); res.end('401 Unauthorized'); return }
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('401 Unauthorized')
+  })
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve({ server, seen })))
 }
 
 function startGateway(port, targetPort, extraEnv) {
@@ -90,4 +144,4 @@ function stopAll(target, child) {
   })
 }
 
-module.exports = { GATEWAY, REMOTE_HEADERS, startMockTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, stopAll }
+module.exports = { GATEWAY, REMOTE_HEADERS, startMockTarget, startMockAuthTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, stopAll }

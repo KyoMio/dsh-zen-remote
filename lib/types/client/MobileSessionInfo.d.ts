@@ -1,5 +1,5 @@
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
-import type { SessionFace, SessionId } from '@deepseek-ai/dsh-client-runtime/client';
+import type { RenameResult, SessionId } from './compat/types.ts';
 import { NS } from './locales.ts';
 /** Full props for the session-info sheet (header.utilities, second entry). */
 export type MobileSessionInfoProps = PropsRuntime<'conversation.session.header.utilities'> & PropsLocale<typeof NS> & {
@@ -8,7 +8,7 @@ export type MobileSessionInfoProps = PropsRuntime<'conversation.session.header.u
     /** Bound ctx.sessions.open(id) — lands on the freshly forked session. */
     openSession: (id: SessionId) => void;
     /** Bound ctx.sessions.binding(id)?.session.rename(title); undefined when the binding is gone. */
-    renameSession: (sessionId: SessionId, title: string) => ReturnType<SessionFace['rename']> | undefined;
+    renameSession: (sessionId: SessionId, title: string) => RenameResult | undefined;
     /** Bound ctx.workspaces.archiveSession(sessionId). */
     archiveSession: (sessionId: SessionId) => Promise<void>;
     /** Bound ctx.sessionLogDownload.download(sessionId) — owns its own progress/result modal. */

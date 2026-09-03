@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from '../compat/types.ts';
 /**
  * Phone chrome: KEEP the system status bar (no fullscreen) and make it
  * blend into the page. On narrow screens:

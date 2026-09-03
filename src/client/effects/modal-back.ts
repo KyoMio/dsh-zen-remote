@@ -18,7 +18,7 @@
  * dialogs keep their own behaviour untouched (the repo's desktop no-op rule).
  */
 
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext } from '../compat/types.ts'
 import { hasLayer, popLayer, pushLayer } from '../history-nav.ts'
 
 const PHONE = '(max-width: 767px)'

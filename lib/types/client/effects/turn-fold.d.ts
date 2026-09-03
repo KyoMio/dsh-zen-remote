@@ -1,4 +1,4 @@
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client';
+import type { ClientContext } from '../compat/types.ts';
 /** Whole-row node kinds that are turn *process*, not conversation content.
  * Keys are ChatNodeSeat's own `data-chat-flow-kind` dispatch values
  * (registerChatNodeRenderers, lib/client.js:9322): tool calls, injected
