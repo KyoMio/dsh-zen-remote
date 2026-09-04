@@ -29,7 +29,11 @@ dsh plugin add dsh-zen-remote
 
 装完重启 `dsh web`，手机界面与网关一起生效，不需要再手写任何配置行。
 
-> 兼容性：在 DSH `0.1.1-rc.2`（web profile）上开发并实测，最后验证 2026-08-22。
+> **兼容性——同一份产物，两个运行时。** 在 DSH `0.1.1-rc.2` 与 `0.1.2-rc.1`（web profile）上均实机验证，2026-09-04。
+>
+> 0.1.2 删掉了 `@deepseek-ai/dsh-client-runtime`，并把网页界面挪到签名 cookie 之后——照原样会让手机界面加载失败、手机经网关也进不来。本插件改为自带 store 实现而不 import 那个包；对 0.1.2 搬了家的服务（`uiWorkspace`、`uiSession`）按存在探测、取不到就走 0.1.1 的老路；回合事件 `session.events` 和 `session.snapshotEvents()` 两种读法都认；浏览器 token 交换由网关代手机完成——这些在 0.1.1 上全部惰性，因为那边根本没有 token 端点。
+>
+> 0.1.2 上有一点要知道：网页界面现在会拒绝 `Host` 不受信的请求。经本插件网关访问不受影响（网关把每个请求都以 `127.0.0.1` 的身份递上去），但拿浏览器直接开 `http://<局域网IP>:3080` 会得到 403，除非启动时加 `dsh web --trusted-host <host>`。
 
 卸载：`dsh plugin remove dsh-zen-remote`（或从 profile 的 `dependencies` 与 `bundles` 里删掉那两行），重启 `dsh web` 即恢复原状；要清掉配对数据再删 `~/.dsh/lan-gate-state.json` 与 `~/.dsh/lan-gate.config.json`。
 
