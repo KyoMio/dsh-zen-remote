@@ -1,4 +1,4 @@
-# tag 推送（v*）→ 构建 + 全量校验 + 发布 npm。
+# tag 推送（v*）→ 构建 + 全量校验 + 发布 npm + 建 GitHub Release。
 # 认证走 npm Trusted Publishing（OIDC，无令牌）：npmjs.com 包设置里需登记
 # 可信发布者 KyoMio/dsh-zen-remote + 本文件名 publish.yml，此外零配置。
 name: publish
@@ -11,7 +11,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # write（原来是 read）：最后一步要用 GITHUB_TOKEN 建 Release。
+      # 提权到仓库内容写入，作用域仅本仓、仅本次运行，够 gh release create 用。
+      contents: write
       id-token: write # OIDC：Trusted Publishing 认证 + provenance 签名都靠它
     steps:
       - uses: actions/checkout@v4
@@ -49,3 +51,25 @@ jobs:
       # Trusted Publishing：pnpm ≥10.14 原生支持 OIDC（packageManager 钉的
       # 11.7.0 满足），provenance 随可信发布自动生成，无需令牌与 --provenance。
       - run: pnpm publish --no-git-checks
+
+      # Release 排在 npm 之后：它宣告的是「这个版本已经发出去了」。npm 那步失败
+      # 就不该留下 Release，顺序反过来会得到一个指向不存在版本的发布页。
+      #
+      # gh 是 ubuntu-latest 自带的，不引第三方 action；--generate-notes 让
+      # GitHub 按上一个 tag 以来的提交自动写发布说明，不用维护 changelog 文件。
+      # --verify-tag 拒绝给不存在的 tag 建 Release（手滑删过 tag 又重跑时会挡住）。
+      #
+      # 先 view 再 create：重跑一次失败的 workflow 是常事，而 create 撞上已存在的
+      # Release 会直接失败。查到就跳过，这一步便可重入。
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME 已存在，跳过"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
