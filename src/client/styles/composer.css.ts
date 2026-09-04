@@ -65,8 +65,20 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   }
   ${ROW} > [class$="_tools"] > [class$="_modes"] {
     order: 3 !important;
-    flex: 0 1 auto !important;
-    min-width: 0 !important;
+    /* Rigid on purpose. This seat holds the permission chip, whose own
+       wrapper (the plugin's element inside _modes) is \`flex: 0 0 auto\` and
+       will NOT follow the seat down — so a shrinkable seat does not make the
+       chip narrower, it just slices the seat out from under a chip that
+       stays 44px wide, and the overflow lands on top of the model pill.
+       Measured 2026-09-04 on DSH 0.1.2 at 390px: seat 90-120 (29.7px) with
+       the chip still 90-134, model starting at 125 — a 9px overlap, exactly
+       the "the two chips touch" report. With the seat rigid: seat 90-134,
+       model 139-246, overlap 0; and at 320px the model pill shrinks to 52px
+       and still nothing overlaps.
+       This also restores what section 1 says out loud — the model pill is
+       the ONLY shrinkable item in the row. \`min-width: 0\` is gone with the
+       shrink: it only ever mattered as the companion of \`flex: 0 1\`. */
+    flex: 0 0 auto !important;
     gap: 6px !important;
   }
   /* The model seat carries the elastic gap: everything after it is pushed to
