@@ -41,7 +41,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
     "verify": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
-    "test": "node --test \"test/*.test.cjs\" && node scripts/check-sunk-viewport.mjs && node scripts/check-keyboard-avoid.mjs && node scripts/check-attach-upload.mjs && node scripts/check-upload-endpoint.mjs && node scripts/check-host-shadow.mjs && node scripts/check-compat-store.mjs && node scripts/check-client-externals.mjs && node scripts/sync-doc-version.mjs --check",
+    "test": "node --test \"test/*.test.cjs\" && node scripts/check-sunk-viewport.mjs && node scripts/check-keyboard-avoid.mjs && node scripts/check-attach-upload.mjs && node scripts/check-upload-endpoint.mjs && node scripts/check-host-shadow.mjs && node scripts/check-compat-store.mjs && node scripts/check-client-externals.mjs && node scripts/check-info-sheet-stacking.mjs && node scripts/sync-doc-version.mjs --check",
     "version": "node scripts/sync-doc-version.mjs && git add README.md README.zh-CN.md",
     "prepack": "npm run build"
   },

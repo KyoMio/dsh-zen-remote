@@ -34,6 +34,27 @@ export const INFO_CSS = `/* ---------- session-info sheet (< 768px) ---------- *
     display: block !important;
   }
 
+  /* The sheet renders inside the header, and \`[data-phase] header\` is a
+     stacking context of its own (position: relative + z-index: 2, set in
+     header.css.ts so the header's fade strip paints over the scroller). A
+     child's z-index is scoped to that context, so the z:70 below competes not
+     with the page but with the header's own 2 — and the host's composer seat
+     (.wSkVaW_composerSeat, z:7, from dsh-client-ui-conversation) outranks
+     it. Measured live on DSH 0.1.2, 2026-09-04: with the sheet open, the
+     topmost element over the composer band was the composer's own trigger
+     button, i.e. the input row painted THROUGH the card.
+     Promote the header itself for exactly as long as the sheet is mounted —
+     MobileSessionInfo returns null when closed (\`if (!open) return null\`),
+     so the header drops back to 2 on close (verified: 70 while open, 2
+     after). Descendant :has(), never \`>\`: the utilities slot wrapper is
+     \`display: contents\` and the host owns the depth (AGENTS.md — do not
+     encode host DOM depth in a selector).
+     Not raising the seat's own z-index instead: it belongs to the host and
+     is shared with the scroll-to-bottom button and the composer sheets. */
+  [data-phase] header:has([data-mobile-nav="info-layer"]) {
+    z-index: 70;
+  }
+
   [data-mobile-nav="info-layer"] {
     position: fixed;
     inset: 0;
