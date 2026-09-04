@@ -877,22 +877,39 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
 
   /* ---------- dsh-vision-router: composer vision toggle (2026-08-26) ----------
      THIRD-PARTY COMPAT RULE — dsh-vision-router registers a Vision mode
-     toggle into conversation.input.right (lib/client-presentation-boundary-
-     main.js, slot id "vision-router-mode-toggle"): a bordered pill with
-     THREE text spans (an eye emoji, the localized label, and a check mark
-     while active) sized by INLINE styles — minHeight 28, padding 4px 8px,
-     fontSize 12, white-space nowrap — roughly 90px of unshrinkable width.
+     toggle into conversation.input.right (slot id
+     "vision-router-mode-toggle"): a bordered pill sized by INLINE styles —
+     minHeight 28, padding 4px 8px, fontSize 12, white-space nowrap —
+     roughly 90px of unshrinkable width.
+
+     Its children changed shape in 2.1.x (re-measured on the real UI
+     2026-09-04, plugin 2.1.1). Both forms are handled:
+       - text form (<= 2.0.x): <span>👁</span><span>label</span> plus a
+         <span>✓</span> while active;
+       - svg form (2.1.x, lib/client-presentation-boundary.js): a 14px eye
+         <svg>, <span>label</span>, plus a SECOND 12px check <svg> while
+         active.
+     The 2.1.1 update is what the user hit: the label span was still hidden
+     but the new eye svg was not, so it rendered NEXT TO our ::before eye —
+     two eyes in a 28px button — and the active check svg had nothing hiding
+     it at all, eating width the phone row does not have.
 
      The phone composer row is nowrap by design (composer.css.ts section 1)
      and the model seat is its only shrinkable item, so that pill squeezes
      the model name out of the row (user report, 2026-08-26).
 
      Phone treatment: a 28x28 round icon button in the attach button's
-     language (same size, same neutral fill). All three spans are hidden and
-     ONE 16px eye is drawn by a CSS mask on ::before with currentColor — the
-     same survives-React-re-render reasoning as the auto-approve shield
-     below: the button re-renders on every state flip, so a DOM-injected
-     icon would need an observer while generated content does not. The
+     language (same size, same neutral fill), showing exactly ONE 16px eye
+     and nothing else. Every span is hidden (label, and the text form's
+     emoji and check); of the svg form's icons only the first survives, the
+     trailing check svg is hidden by a sibling combinator so the count is
+     never assumed. Our own ::before eye is now a FALLBACK, gated on
+     :has(svg) so it draws only for the text form — the plugin ships its own
+     icon from 2.1.x on, and drawing over it is what produced the double
+     eye. Generated content rather than a DOM-injected icon, for the same
+     survives-React-re-render reason as the auto-approve shield below: the
+     button re-renders on every state flip, so an injected node would need
+     an observer while ::before does not. The
      accessible name is unaffected: the button ships aria-label + title with
      the full enable/disable copy, and aria-pressed keeps conveying the
      state; visually the plugin's own inline styles still flip border +
@@ -935,12 +952,27 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
       background: var(--dsw-specific-selector, rgba(127, 127, 127, .12)) !important;
       box-shadow: none !important;
     }
-    /* Eye emoji + label + active check: all three spans out. */
+    /* Text form: emoji + label + active check are all spans — all out. */
     [data-slot="conversation.composer.bar"] [data-vision-router-mode-toggle] > span {
+      display: none !important;
+    }
+    /* Svg form (2.1.x): the first svg IS the eye, so keep it and match the
+       row's other icons at 16px. */
+    [data-slot="conversation.composer.bar"] [data-vision-router-mode-toggle] > svg:first-of-type {
+      width: 16px !important;
+      height: 16px !important;
+    }
+    /* ...and drop every svg after it — today that is the active-state check
+       mark. A sibling combinator rather than :nth-child(2): the count is the
+       plugin's business, this only says "one icon, the first one". */
+    [data-slot="conversation.composer.bar"] [data-vision-router-mode-toggle] > svg ~ svg {
       display: none !important;
     }
     /* The one svg: eye outline + iris as a currentColor mask — brand while
        active, dimmed with the button by the plugin's own disabled opacity. */
+    [data-slot="conversation.composer.bar"] [data-vision-router-mode-toggle]:has(svg)::before {
+      content: none !important;
+    }
     [data-slot="conversation.composer.bar"] [data-vision-router-mode-toggle]::before {
       content: '';
       width: 16px;

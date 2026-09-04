@@ -119,7 +119,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 **修复**
 
-- 适配 dsh-vision-router(2.0.1):composer 识图开关在手机端压成 28px 圆形
+- 适配 dsh-vision-router(2.0.1 / 2.1.1):composer 识图开关在手机端压成 28px 圆形
   图标钮(眼睛为 CSS mask 图标,aria-label / aria-pressed 照旧),不再把
   模型名挤出 composer 行;桌面端保持插件原样(见兼容插件清单)。
 - 适配 DSH `0.1.1`：活动 chip 点击失效（点了退回信息卡）。三处上游变化同时命中
@@ -248,7 +248,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 - [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins)(定时任务,主屏 chips 行自动收割入口)——本机实测 **0.2.3**
 - dsh-at-file(@文件引用;它和本插件的附件 chip 读的是同一份草稿 token,手机端会为一个上传文件同时画出缩略图和文件名两条,故隐藏它 `.dsh-uploads/` 下那几行,其余 @ 引用不动;桌面端不隐藏——那边本插件的 chip 是关掉的,它是唯一的呈现)——本机实测 **0.6.7**
 - [@ace-zone/dsh-market](https://www.npmjs.com/package/@ace-zone/dsh-market)(插件市场;它的弹窗顶栏在手机上放不下,关闭的 × 被挤出面板外,故隐藏标语/版本号/官网链接三个装饰位并让标题省略号收缩,语言切换和 × 保留;认插件自己渲染的 `.dshm-ver[title="@ace-zone/dsh-market"]` 版本片,同名的其他"市场"插件不会被误伤)——本机实测 **0.1.66**
-- [dsh-vision-router](https://github.com/ysr666/dsh-vision-router)(视觉桥,composer 行内的识图开关胶囊;手机端压成 28px 圆形图标钮——原胶囊 👁+文字+激活 ✓ 约 90px 定宽,而手机 composer 行不换行、模型座位是唯一可收缩项,会被它挤没;三条文字 span 全部隐藏,改由 CSS mask 画一只 currentColor 眼睛,开合状态仍走插件自己的品牌描边/着色与 `aria-pressed`,可访问名走按钮自带的 aria-label)——本机实测 **2.0.1**
+- [dsh-vision-router](https://github.com/ysr666/dsh-vision-router)(视觉桥,composer 行内的识图开关胶囊;手机端压成 28px 圆形图标钮——原胶囊 👁+文字+激活 ✓ 约 90px 定宽,而手机 composer 行不换行、模型座位是唯一可收缩项,会被它挤没;按钮里只留一只 16px 眼睛:span 一律隐藏;2.1.x 起插件自带 svg 图标,只保留第一个 svg、用兄弟选择器隐掉其后的(当前是激活态的对钩),我们自己的 `::before` mask 眼睛降级为 `:has(svg)` 兜底、只给 2.0.x 的文字写法用;开合状态仍走插件自己的品牌描边/着色与 `aria-pressed`,可访问名走按钮自带的 aria-label)——本机实测 **2.0.1** 与 **2.1.1**。2.1.1 把 👁/✓ 从文字 span 换成 svg,只按 2.0.x 写的规则会渲染出**两只眼**且对钩无人隐藏(2026-09-04 用户报);回归由 `test/vision-router-compat-css.test.cjs` 守着
 - [dsh-web-ui 全家桶](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all)(文件树 / 预览 / 任务看板 / SSH / 宠物 / 会话统计 / 远程配对 / 设置)——沿用上游兼容规则,本次未扩展
 
 ## 安装
