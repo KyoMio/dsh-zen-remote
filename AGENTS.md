@@ -40,6 +40,30 @@ release 徽章和 profile 依赖示例由 `scripts/sync-doc-version.mjs` 按 `pa
 把测试挂掉。文档里的锚点变了就更新那个脚本：找不到标记它直接非零退出，不会
 默默通过。
 
+**发版**：全部由 tag 驱动，本地只做一步。
+
+```sh
+npm version patch      # 改 package.json + 同步两份 README + 建 commit 和 v* tag
+git push --follow-tags # 推 tag 才是真正的触发器
+```
+
+推上去之后 `.github/workflows/publish.yml` 依次做：装依赖 → `pnpm build` →
+**`git diff --exit-code -- lib`**（入库产物必须与重新构建的结果一致，挡住
+「改了 src 忘了 build 就打 tag」）→ `pnpm verify` → `pnpm test` →
+tag 名与 `package.json` 版本一致性 → `pnpm publish`（npm Trusted Publishing，
+OIDC 无令牌，provenance 自动生成）→ **建 GitHub Release**。
+
+Release 那步刻意排在 npm 之后：它宣告的是「这个版本已经发出去了」，npm 失败就
+不该留下一个指向不存在版本的发布页。发布说明用 `--generate-notes` 按上一个 tag
+以来的提交自动生成，所以**提交信息就是 changelog**，不另外维护文件。这一步可重入
+（先 `gh release view` 查在不在，在就跳过），重跑失败的 workflow 不会因为
+Release 已存在而挂掉。
+
+需要人工配置的只有一处：npmjs.com 的包设置里登记可信发布者
+`KyoMio/dsh-zen-remote` + 文件名 `publish.yml`。GitHub Release 那步用的是
+workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `permissions` 里
+`contents` 必须是 `write`（原来是 `read`）。
+
 ## 深度文档
 
 | 文件 | 内容 |
