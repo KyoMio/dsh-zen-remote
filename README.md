@@ -29,7 +29,11 @@ dsh plugin add dsh-zen-remote
 
 Restart `dsh web` afterwards. The mobile UI and the gateway both come up — there is no config line to hand-write.
 
-> Compatibility: developed and tested against DSH `0.1.1-rc.2` (web profile); last verified 2026-08-22.
+> **Compatibility — one build, both runtimes.** Verified live on DSH `0.1.1-rc.2` and `0.1.2-rc.1` (web profile), 2026-09-04.
+>
+> 0.1.2 removed `@deepseek-ai/dsh-client-runtime` and put the web UI behind a signed cookie, which would have broken the mobile UI and locked the phone out of the gateway. The plugin carries its own store engine instead of importing that package, probes for the services 0.1.2 moved (`uiWorkspace`, `uiSession`) and falls back to the 0.1.1 shapes when they are absent, reads a turn's events through either `session.events` or `session.snapshotEvents()`, and lets the gateway do the browser-token handshake on the phone's behalf — all of it inert on 0.1.1, where the token endpoint does not exist.
+>
+> One thing to know on 0.1.2: the web UI now rejects requests whose `Host` is not trusted. Reaching DSH through this plugin's gateway is unaffected (the gateway presents every request as `127.0.0.1`), but pointing a browser straight at `http://<LAN-IP>:3080` returns 403 unless you start `dsh web --trusted-host <host>`.
 
 To uninstall: `dsh plugin remove dsh-zen-remote` (or delete the two lines from your profile's `dependencies` and `bundles`) and restart `dsh web`. To also wipe the pairing data, delete `~/.dsh/lan-gate-state.json` and `~/.dsh/lan-gate.config.json`.
 
