@@ -40,6 +40,13 @@ test('the row hide is opt-in: only a container the effect claimed disappears', (
   assert.doesNotMatch(decls, /:not\(\[data-zen-sheet-extras\]\)/)
 })
 
+test('nothing is claimed when there is no model pill to open a sheet from', () => {
+  // Subagent sessions have no model pill. Claiming there would hide the
+  // controls from the row with nowhere to show them instead.
+  assert.match(effect, /const MODEL_SEAT_SELECTOR/)
+  assert.match(effect, /seat === null \|\| !worthMoving\(extras\)/)
+})
+
 test('nothing is claimed unless the slot holds more than the vision toggle', () => {
   // The vision toggle alone is a 28px icon the row fits; moving it on its own
   // would cost a tap to buy width nobody needed. The wide entry (today the

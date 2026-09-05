@@ -81,8 +81,12 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     flex: 0 0 auto !important;
     gap: 6px !important;
   }
-  /* The model seat carries the elastic gap: everything after it is pushed to
-     the right edge, so no spacer element is needed. */
+  /* The elastic gap used to live here as \`margin-right: auto\`, which broke
+     the moment a session had no model pill: a subagent session has none, so
+     the gap vanished and the stop / send buttons bunched up in the middle of
+     the row instead of sitting at the right edge (reported 2026-09-06). The
+     gap belongs to the RIGHT group, not to the last item of the left one —
+     see the two rules below the order list. */
   ${MODEL} {
     order: 4 !important;
     /* A definite flex-basis (not auto) breaks the circular sizing between
@@ -93,7 +97,6 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     flex: 0 1 min(48vw, 200px) !important;
     min-width: 0 !important;
     max-width: min(48vw, 200px) !important;
-    margin-right: auto !important;
   }
   /* Third-party input.right entries park next to the ring rather than
      landing at order 0 (= far left) once the groups are flattened. */
@@ -107,6 +110,22 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   }
   ${ROW} > [class$="_trailing"] > [class$="_primary"] {
     order: 7 !important;
+  }
+  /* The elastic gap. It sits in front of whichever of the two right-hand
+     items comes first, so the group hugs the right edge no matter what the
+     left side happens to contain — with a model pill, without one (subagent
+     sessions), with or without the third-party entries at order 5.
+     Both get \`margin-left: auto\` and the last rule takes it back off the
+     send button whenever a ring precedes it: two auto margins would SHARE
+     the free space and open a second gap between the ring and send. A
+     sibling combinator answers "is there a ring before me" without assuming
+     anything about the host's nesting. */
+  ${ROW} > [class$="_trailing"] > span[class$="_root"],
+  ${ROW} > [class$="_trailing"] > [class$="_primary"] {
+    margin-left: auto !important;
+  }
+  ${ROW} > [class$="_trailing"] > span[class$="_root"] ~ [class$="_primary"] {
+    margin-left: 0 !important;
   }
 
   /* --- 3. permission as icon-only pill; model as name+effort pill ---
@@ -462,7 +481,13 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      composer. Anchored on the official data-testid, a stable contract
      marker rather than a hashed class name. */
   [data-slot="conversation.input.dock"] > [data-testid="todo-panel"] {
-    flex: 1 1 auto !important;
+    /* A whole line to itself. It shared line 0 with the pills until the goal
+       bar turned up (2026-09-06): two full-width things on one nowrap line
+       meant the to-do header shrank to a stub and the goal bar ran off the
+       right edge. Both are status strips you read at a glance, so they stack
+       — see the line policy in 7c. */
+    flex: 1 0 100% !important;
+    order: 1 !important;
     min-width: 0 !important;
     max-width: none !important;
     min-height: 0 !important;
@@ -489,7 +514,7 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     display: flex !important;
     flex: 1 0 100% !important;
     flex-wrap: wrap !important;
-    order: 2 !important;
+    order: 4 !important;
     align-items: center !important;
     gap: 6px !important;
     max-width: none !important;
@@ -524,12 +549,12 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      sits closest to the input it will be sent from. The rail only wraps
      while one of the two full-width entries exists, so a session with
      neither keeps the original single scrolling chip line. */
-  [data-slot="conversation.input.dock"]:has(> [data-queue-dock], > [data-mobile-nav="attach-chips"]) {
+  [data-slot="conversation.input.dock"]:has(> [data-queue-dock], > [data-mobile-nav="attach-chips"], > [data-testid="todo-panel"], > [data-goal-bar]) {
     flex-wrap: wrap !important;
   }
   [data-slot="conversation.input.dock"] > [data-queue-dock] {
     flex: 1 0 100% !important;
-    order: 1 !important;
+    order: 3 !important;
     max-width: none !important;
     min-height: 0 !important;
     max-height: none !important;
@@ -540,6 +565,24 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     font-size: 13px !important;
     line-height: normal !important;
   }
+  /* dsh-client-ui-goal's status strip (its own \`data-goal-bar\` marker; it
+     registers into this dock at order 10). Fourth thing here that is not a
+     pill: a row carrying the objective text plus pause / edit / delete
+     buttons, so the 26px cage clipped its buttons off the right edge and the
+     nowrap line pushed what was left off screen (reported 2026-09-06). Same
+     treatment the queue gets — a line of its own, official geometry back. */
+  [data-slot="conversation.input.dock"] > [data-goal-bar] {
+    flex: 1 0 100% !important;
+    order: 2 !important;
+    max-width: none !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    border-radius: 12px !important;
+    overflow: visible !important;
+    font-size: 13px !important;
+    line-height: normal !important;
+  }
+
   /* The panel is the dock's only child; upstream rounds its top corners only
      and drops the bottom border, because there it is half-hidden behind the
      card. On its own line it is a free-standing strip, so close it up. */
