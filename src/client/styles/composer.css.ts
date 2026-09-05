@@ -390,6 +390,17 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   [class$="_composerSeat"] {
     --dsh-composer-text-max-height: 124px;
   }
+  /* Pull the text in from the card's left border. Upstream insets the editing
+     host by 16px while the control row below it starts 8px in (row padding,
+     section 1), so the placeholder sat noticeably further out than the
+     buttons under it and the field read as over-padded on a phone (reported
+     2026-09-06). 12px squares it with the 12px of clear space on the right,
+     giving the text a symmetric box, and closes most of the gap with the
+     button row. Anchored on the editing host's own contract attribute rather
+     than a hashed class. */
+  [data-slot="conversation.composer.bar"] [data-composer-input] {
+    padding-left: 12px !important;
+  }
 
   /* --- 6. no divider above OR below the message list ---
      Instead of a rule the messages butt against, they fade near both edges.
