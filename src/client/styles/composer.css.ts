@@ -233,12 +233,20 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      container inside the model menu while that menu is open and puts it back
      when it closes; these rules are the two halves of that trip.
 
-     In the row (not parked): gone. The row is nowrap and the model name is
-     the only thing that can give up width, so leaving these here is what
-     squeezed it in the first place. Hiding by ancestor rather than by a
-     display rule on the container itself is what lets the parked copy style
-     itself freely — same element, two homes, two rule sets. */
-  ${ROW} > [class$="_trailing"] > [data-slot="conversation.input.right"]:not([data-zen-sheet-extras]) {
+     In the row: hidden, but ONLY once the effect has marked the container as
+     one it manages. Keying the hide off the marker rather than off "not
+     currently parked" is what makes the failure direction safe — if the
+     effect declines to act (nothing in the slot but the vision toggle, so
+     nothing worth moving) or never runs at all, the marker is absent, this
+     rule does not match, and the controls stay exactly where the host put
+     them. The inverse spelling hid them in the row whenever they were not in
+     the sheet, which in those same cases left them reachable from neither
+     place (caught in review, 2026-09-06).
+     Hiding by ancestor rather than by a display rule on the container itself
+     is what lets the parked copy style itself freely — same element, two
+     homes, two rule sets. \`!important\` because the slot container carries an
+     inline \`display: contents\`. */
+  ${ROW} > [class$="_trailing"] > [data-slot="conversation.input.right"][data-zen-sheet-extras] {
     display: none !important;
   }
   /* Parked in the sheet: a column of full-width rows in the sheet's own

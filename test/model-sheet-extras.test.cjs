@@ -28,13 +28,25 @@ const section = composer.slice(
 )
 assert.ok(section.length > 0, 'the 4a section must exist')
 
-test('the container is hidden in the row only while it is NOT parked', () => {
-  // The :not() is what lets one element have two homes: gone from the row,
-  // styled as sheet rows once the effect moves it.
+test('the row hide is opt-in: only a container the effect claimed disappears', () => {
+  // Opt-in, never opt-out. Keyed off "not parked" instead, the controls would
+  // be hidden in the row AND absent from the sheet in exactly the cases where
+  // the effect declines to act — reachable from nowhere.
+  const decls = strip(section)
   assert.match(
-    strip(section),
-    /\[data-slot="conversation\.input\.right"\]:not\(\[data-zen-sheet-extras\]\)\s*\{\s*display: none !important;/,
+    decls,
+    /\[data-slot="conversation\.input\.right"\]\[data-zen-sheet-extras\]\s*\{\s*display: none !important;/,
   )
+  assert.doesNotMatch(decls, /:not\(\[data-zen-sheet-extras\]\)/)
+})
+
+test('nothing is claimed unless the slot holds more than the vision toggle', () => {
+  // The vision toggle alone is a 28px icon the row fits; moving it on its own
+  // would cost a tap to buy width nobody needed. The wide entry (today the
+  // subscriptions speed chip) is what justifies the move.
+  assert.match(effect, /function worthMoving/)
+  assert.match(effect, /!child\.matches\(VISION_SELECTOR\)/)
+  assert.match(effect, /worthMoving\(extras\)/)
 })
 
 test('parked controls become full-width 48px rows, left aligned like the sheet cells', () => {
@@ -66,7 +78,10 @@ test('phone only — the desktop composer keeps every control in the row', () =>
 test('the effect restores the container instead of letting the sheet take it', () => {
   // The sheet unmounts on close; without this the controls go with it.
   assert.match(effect, /const unpark = \(\)/)
-  assert.match(effect, /return \(\) => \{[\s\S]*unpark\(\)/, 'teardown must unpark')
+  // Teardown goes through release(), which unparks and drops the marker — so
+  // an unloaded plugin leaves the host's own row exactly as it found it.
+  assert.match(effect, /const release = [\s\S]{0,120}unpark\(\)/)
+  assert.match(effect, /return \(\) => \{[\s\S]*release\(/, 'teardown must release')
   // Held as a reference, not re-queried: once the menu detaches, a document
   // query can no longer find the node.
   assert.match(effect, /let parked: \{ node: Element/)
