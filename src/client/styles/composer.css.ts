@@ -228,6 +228,107 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 12px !important;
     font-size: 15px !important;
   }
+  /* --- 4a. third-party composer entries live in the model sheet ---
+     effects/model-sheet-extras.ts parks the \`conversation.input.right\`
+     container inside the model menu while that menu is open and puts it back
+     when it closes; these rules are the two halves of that trip.
+
+     In the row (not parked): gone. The row is nowrap and the model name is
+     the only thing that can give up width, so leaving these here is what
+     squeezed it in the first place. Hiding by ancestor rather than by a
+     display rule on the container itself is what lets the parked copy style
+     itself freely — same element, two homes, two rule sets. */
+  ${ROW} > [class$="_trailing"] > [data-slot="conversation.input.right"]:not([data-zen-sheet-extras]) {
+    display: none !important;
+  }
+  /* Parked in the sheet: a column of full-width rows in the sheet's own
+     language, so a relocated control reads as a sibling of 模型 and 推理等级
+     rather than a chip that wandered in. */
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 2px !important;
+    width: 100% !important;
+  }
+  /* Undo the row's compaction on every parked control: back to full width and
+     the 48px the sheet's own cells use. \`> * > *\` reaches both shapes without
+     naming either plugin — subscriptions wraps its trigger in a positioning
+     div, vision-router puts its button straight in the slot. */
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] > *,
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] > * > button {
+    width: 100% !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    justify-content: flex-start !important;
+  }
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] button {
+    box-sizing: border-box !important;
+    min-height: 48px !important;
+    height: auto !important;
+    padding: 0 12px !important;
+    gap: 10px !important;
+    border-radius: 12px !important;
+    border: none !important;
+    background: transparent !important;
+    font-size: 15px !important;
+    /* Both plugins center their chip label, which is right for a pill in the
+       row and wrong for a full-width row: the sheet's own cells start their
+       label at the left edge. justify-content covers the flex triggers,
+       text-align the ones that are not flex containers. */
+    text-align: left !important;
+    justify-content: flex-start !important;
+  }
+  /* Order comes from the row (compat.css.ts puts the vision toggle at 5 so it
+     parks beside the context ring), and that rule still matches in here — the
+     sheet is a DOM descendant of the composer bar even though it paints as a
+     fixed layer. Reset it so the sheet follows DOM order instead of
+     inheriting a decision that was about a different layout. */
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] > * {
+    order: 0 !important;
+  }
+  /* The vision toggle is squeezed to a 28px icon in the row (compat.css.ts);
+     in the sheet it is a row, so its label comes back and the icon leads. */
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > span {
+    display: inline !important;
+  }
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > svg:first-of-type {
+    width: 18px !important;
+    height: 18px !important;
+  }
+  /* The speed chip opens a menu of its own, anchored \`bottom: 100%\` to its
+     trigger. Inside the sheet — which is \`overflow: hidden\` so its rounded
+     top clips its content — that menu would be cut off. Same escape section 4
+     uses for the host's two menus: position: fixed leaves the clip behind
+     (the sheet sets \`transform: none\`, so nothing between here and the
+     viewport captures fixed positioning) and it lands as its own sheet on top
+     of this one. */
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] [role="menu"] {
+    position: fixed !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    top: auto !important;
+    margin: 0 !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    max-height: min(70dvh, 520px) !important;
+    box-sizing: border-box !important;
+    border-radius: 16px 16px 0 0 !important;
+    border-bottom: none !important;
+    padding: 8px 8px calc(8px + var(--mnav-sab)) !important;
+    /* Above the model sheet it sits on (60, section 4), below the session-info
+       sheet's 70 (info.css.ts) — it is a child of the model sheet, not a peer
+       of the page's own layers. */
+    z-index: 61 !important;
+    box-shadow: 0 -8px 32px rgba(0, 0, 0, .18) !important;
+  }
+  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] [role="menu"] [role="menuitemradio"] {
+    min-height: 48px !important;
+    border-radius: 12px !important;
+    font-size: 15px !important;
+  }
+
   /* --- 4b. the official scroll-to-bottom button must not poke through the
      sheet (real-device follow-up, 2026-08-17) ---
      ChatView's own "jump to latest" button (aria-label t("chat.toBottom"))
