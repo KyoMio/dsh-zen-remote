@@ -3,6 +3,9 @@ import type { ClientContext } from '../compat/types.ts'
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
 const PHONE_QUERY = '(max-width: 767px)'
 
+/** The model pill itself. Absent in a subagent session — see `sync`. */
+const MODEL_SEAT_SELECTOR = '[data-slot="conversation.input.model"]'
+
 /** The model pill's own popup, which section 4 of composer.css.ts turns into a bottom sheet. */
 const MENU_SELECTOR = '[data-slot="conversation.input.model"] [class$="_menu"]'
 
@@ -119,7 +122,12 @@ export function installModelSheetExtras(ctx: ClientContext): void {
     const sync = (): void => {
       const extras = document.querySelector(EXTRAS_SELECTOR)
       if (extras === null) { unpark(); return }
-      if (!phone.matches || !worthMoving(extras)) { release(extras); return }
+      // No model pill, no sheet to park into — a subagent session has none.
+      // Claiming the slot there would hide the controls from the row with
+      // nowhere to show them instead, which is the unreachable state the
+      // marker is meant to prevent.
+      const seat = document.querySelector(MODEL_SEAT_SELECTOR)
+      if (!phone.matches || seat === null || !worthMoving(extras)) { release(extras); return }
       extras.setAttribute(MANAGED, '')
       const menu = document.querySelector(MENU_SELECTOR)
       if (menu === null) unpark()

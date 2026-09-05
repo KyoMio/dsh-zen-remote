@@ -51,9 +51,24 @@ html:not([data-lan-device="desktop"]) body {
 }
 
 /* iOS Safari zooms the whole page when a focused input's font-size is below
- * 16px. dsh-mobile-nav does not add this workaround, so it stays here. */
-html:not([data-lan-device="desktop"]) [data-slot="conversation"] input,
-html:not([data-lan-device="desktop"]) [data-slot="conversation"] textarea {
+ * 16px, and it does NOT zoom back out when focus leaves — the page just stays
+ * magnified until the user pinches it back (reported 2026-09-06: the UI came
+ * back enlarged after a trip through a subagent session, and only leaving to
+ * the session list and re-entering cleared it).
+ *
+ * This was scoped to [data-slot="conversation"], which is an exact attribute
+ * match: it covers inputs inside the element whose slot is literally
+ * "conversation" and nothing in the dozens of conversation.* subtrees around
+ * it. Measured on the running UI: one input matched, while a visible 12px
+ * text field sat outside the rule — and the composer never triggered the zoom
+ * at all because it is contenteditable, not an input, which is why this went
+ * unnoticed for so long. So the guard now covers the whole mobile shell.
+ *
+ * File / checkbox / radio are excluded: they carry no text, the file inputs
+ * here are hidden anyway, and forcing 16px on them only disturbs layout.
+ * dsh-mobile-nav does not add this workaround, so it stays here. */
+html:not([data-lan-device="desktop"]) input:not([type="file"]):not([type="checkbox"]):not([type="radio"]),
+html:not([data-lan-device="desktop"]) textarea {
   font-size: 16px;
 }
 
