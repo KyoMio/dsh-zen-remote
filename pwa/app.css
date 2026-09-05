@@ -50,6 +50,16 @@ html:not([data-lan-device="desktop"]) body {
   overscroll-behavior-y: none;
 }
 
+/* Apply the pinch-to-resize font scale. touch-gestures.js sets
+ * --dsh-pwa-font-scale via root.style.setProperty() on pinch; this is this
+ * plugin's own gesture feature, not a dsh-mobile-nav concern. */
+html:not([data-lan-device="desktop"]) {
+  --dsh-pwa-font-scale: 1;
+}
+html:not([data-lan-device="desktop"]) [data-slot="conversation"] [data-phase] {
+  font-size: calc(1em * var(--dsh-pwa-font-scale));
+}
+
 /* iOS Safari zooms the whole page when a focused input's font-size is below
  * 16px, and it does NOT zoom back out when focus leaves — the page just stays
  * magnified until the user pinches it back (reported 2026-09-06: the UI came
@@ -66,20 +76,35 @@ html:not([data-lan-device="desktop"]) body {
  *
  * File / checkbox / radio are excluded: they carry no text, the file inputs
  * here are hidden anyway, and forcing 16px on them only disturbs layout.
+ *
+ * `[contenteditable]` is in the list because the thing users actually focus
+ * — the message composer — is one: a contenteditable div with role=textbox,
+ * not an input or a textarea. iOS treats it like any other editing host and
+ * zooms on it just the same, so covering only inputs left the single most
+ * focused element on the page unprotected, which is why widening this rule to
+ * every input still did not stop the page coming back magnified (2026-09-06).
+ * Measured before changing it: the composer computes 14px, and raising it to
+ * 16px moves no geometry at all — its line-height is a fixed 24px rather than
+ * a ratio, so the line box, the editor height and the card height are
+ * identical either way, and section 5 of composer.css.ts can go on counting
+ * lines in 24px units.
+ *
+ * It has to come AFTER the pinch-scale rule above, and say max() rather than
+ * a flat 16px. The composer's editing host carries `data-phase` of its own,
+ * so `[data-slot="conversation"] [data-phase]` matches it too — at exactly the
+ * same specificity as this rule (0,3,1). Source order was therefore the whole
+ * ballgame, and with this block sitting first the pinch rule quietly won and
+ * put the composer back to 1em. That is why the composer stayed at 14px even
+ * after this selector learned about contenteditable, and why the page went on
+ * zooming (measured 2026-09-06: both rules matched, the later one applied).
+ * max() keeps the two goals from fighting — a hard 16px floor so iOS never
+ * zooms, and everything above it still scaling with the pinch gesture.
+ *
  * dsh-mobile-nav does not add this workaround, so it stays here. */
 html:not([data-lan-device="desktop"]) input:not([type="file"]):not([type="checkbox"]):not([type="radio"]),
-html:not([data-lan-device="desktop"]) textarea {
-  font-size: 16px;
-}
-
-/* Apply the pinch-to-resize font scale. touch-gestures.js sets
- * --dsh-pwa-font-scale via root.style.setProperty() on pinch; this is this
- * plugin's own gesture feature, not a dsh-mobile-nav concern. */
-html:not([data-lan-device="desktop"]) {
-  --dsh-pwa-font-scale: 1;
-}
-html:not([data-lan-device="desktop"]) [data-slot="conversation"] [data-phase] {
-  font-size: calc(1em * var(--dsh-pwa-font-scale));
+html:not([data-lan-device="desktop"]) textarea,
+html:not([data-lan-device="desktop"]) [contenteditable]:not([contenteditable="false"]) {
+  font-size: max(16px, calc(1em * var(--dsh-pwa-font-scale, 1)));
 }
 
 /* Home-indicator clearance for the composer USED to live here, as
