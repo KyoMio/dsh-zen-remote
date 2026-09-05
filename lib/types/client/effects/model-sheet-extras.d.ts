@@ -2,12 +2,8 @@ import type { ClientContext } from '../compat/types.ts';
 /**
  * Phone: park the composer row's third-party controls inside the model sheet.
  *
- * The row is one nowrap flex line and the model pill is its only shrinkable
- * item (composer.css.ts section 1), so every entry a plugin adds to
- * `conversation.input.right` comes straight out of the model name. With
- * dsh-plugin-subscriptions' speed chip ("速度 · 标准", ~70px of text) and
- * dsh-vision-router's 28px vision toggle both present on a GPT model, the row
- * runs out of width. Both are model-scoped settings, so the model sheet —
+ * With the speed chip and the vision toggle both present on a GPT model the
+ * row runs out of width. Both are model-scoped settings, so the model sheet —
  * which already holds 模型 and 推理等级 — is where they belong (user request,
  * 2026-09-06).
  *

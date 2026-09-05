@@ -13,18 +13,55 @@ const MENU_SELECTOR = '[data-slot="conversation.input.model"] [class$="_menu"]'
  */
 const EXTRAS_SELECTOR = '[data-slot="conversation.input.right"]'
 
-/** Marks the container while it is parked in the sheet — the styling hook for composer.css.ts. */
-const PARKED = 'data-zen-sheet-extras'
+/**
+ * dsh-vision-router's own mount marker. Used here only to answer "is there
+ * anything in this slot BESIDES the vision toggle" — see `worthMoving`.
+ */
+const VISION_SELECTOR = '[data-vision-router-mode-toggle]'
+
+/**
+ * Set on the container while this effect manages it, in the row and in the
+ * sheet alike. It is the styling hook for both halves in composer.css.ts, and
+ * it is deliberately what the row's `display: none` keys off: without the
+ * marker the controls stay exactly where the host put them, so a version of
+ * this file that declines to act — or never runs at all — cannot leave them
+ * hidden in the row and absent from the sheet, i.e. unreachable.
+ */
+const MANAGED = 'data-zen-sheet-extras'
+
+/**
+ * Is the slot holding anything that actually costs the row width?
+ *
+ * The row is one nowrap flex line whose only elastic item is the model pill
+ * (composer.css.ts section 1), so entries here are paid for out of the model
+ * name. But that is only a problem once something WIDE lands in the slot —
+ * today dsh-plugin-subscriptions' speed chip, which renders "速度 · 标准" and
+ * eats ~70px. dsh-vision-router's toggle alone is a 28px icon that the row
+ * accommodates fine, and moving it on its own would cost a tap (it becomes
+ * two: open the sheet, then toggle) to buy width nobody needed.
+ *
+ * So: relocate only when the slot holds an entry that is not the vision
+ * toggle. With no such entry — subscriptions not installed, or installed but
+ * not contributing on this model — nothing moves and the row keeps its one
+ * icon, which is the behaviour asked for (user review, 2026-09-06).
+ *
+ * Why this rather than sniffing for subscriptions by name: the slot system
+ * adds no per-registration marker (measured — entries render straight into the
+ * container) and subscriptions marks nothing of its own, so naming it would
+ * mean adding a marker to our fork of that plugin and anchoring on it. That
+ * marker dies the day the fork is dropped, and the feature would go quiet
+ * with nothing to catch it. The width question is the real question anyway,
+ * and this asks it directly.
+ */
+function worthMoving(extras: Element): boolean {
+  return [...extras.children].some(child => !child.matches(VISION_SELECTOR))
+}
 
 /**
  * Phone: park the composer row's third-party controls inside the model sheet.
  *
- * The row is one nowrap flex line and the model pill is its only shrinkable
- * item (composer.css.ts section 1), so every entry a plugin adds to
- * `conversation.input.right` comes straight out of the model name. With
- * dsh-plugin-subscriptions' speed chip ("速度 · 标准", ~70px of text) and
- * dsh-vision-router's 28px vision toggle both present on a GPT model, the row
- * runs out of width. Both are model-scoped settings, so the model sheet —
+ * With the speed chip and the vision toggle both present on a GPT model the
+ * row runs out of width. Both are model-scoped settings, so the model sheet —
  * which already holds 模型 and 推理等级 — is where they belong (user request,
  * 2026-09-06).
  *
@@ -53,17 +90,12 @@ const PARKED = 'data-zen-sheet-extras'
 export function installModelSheetExtras(ctx: ClientContext): void {
   ctx.effect(() => {
     const phone = window.matchMedia(PHONE_QUERY)
-    /** The container while parked, plus where to put it back. */
+    /** The container while parked in the sheet, plus where to put it back. */
     let parked: { node: Element, parent: Element, next: Node | null } | null = null
 
-    const park = (menu: Element): void => {
-      if (parked !== null) return
-      const node = document.querySelector(EXTRAS_SELECTOR)
-      // Nothing registered into the slot: leave the sheet exactly as it was.
-      if (node === null || node.childElementCount === 0) return
-      if (node.parentElement === null) return
+    const park = (node: Element, menu: Element): void => {
+      if (parked !== null || node.parentElement === null) return
       parked = { node, parent: node.parentElement, next: node.nextSibling }
-      node.setAttribute(PARKED, '')
       menu.appendChild(node)
     }
 
@@ -71,7 +103,6 @@ export function installModelSheetExtras(ctx: ClientContext): void {
       if (parked === null) return
       const { node, parent, next } = parked
       parked = null
-      node.removeAttribute(PARKED)
       // The menu may already be detached, having taken the container with it.
       // The node itself is still live either way; re-home it only if its old
       // parent is still on the page (when the whole composer went away, the
@@ -79,11 +110,20 @@ export function installModelSheetExtras(ctx: ClientContext): void {
       if (parent.isConnected) parent.insertBefore(node, next)
     }
 
+    /** Hand the container back to the host, marker and all. */
+    const release = (node: Element | null): void => {
+      unpark()
+      node?.removeAttribute(MANAGED)
+    }
+
     const sync = (): void => {
-      if (!phone.matches) { unpark(); return }
+      const extras = document.querySelector(EXTRAS_SELECTOR)
+      if (extras === null) { unpark(); return }
+      if (!phone.matches || !worthMoving(extras)) { release(extras); return }
+      extras.setAttribute(MANAGED, '')
       const menu = document.querySelector(MENU_SELECTOR)
       if (menu === null) unpark()
-      else park(menu)
+      else park(extras, menu)
     }
 
     // Synchronous in the observer callback, never behind rAF: the callback is
@@ -105,7 +145,7 @@ export function installModelSheetExtras(ctx: ClientContext): void {
     return () => {
       observer.disconnect()
       phone.removeEventListener('change', sync)
-      unpark()
+      release(document.querySelector(EXTRAS_SELECTOR))
     }
   }, 'dsh-mobile-nav: model sheet extras')
 }
