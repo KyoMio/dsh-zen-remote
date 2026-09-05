@@ -119,6 +119,9 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 **修复**
 
+- composer 行里第三方插件的入口(`conversation.input.right`)在手机端整体移进模型弹层,
+  与「模型」「推理等级」并列成行——行是不换行的,模型名是唯一能让宽度的东西,
+  订阅插件的速度 chip(带文字约 70px)加上识图开关会把它挤没(2026-09-06 用户报)
 - 适配 dsh-vision-router(2.0.1 / 2.1.1):composer 识图开关在手机端压成 28px 圆形
   图标钮(眼睛为 CSS mask 图标,aria-label / aria-pressed 照旧),不再把
   模型名挤出 composer 行;桌面端保持插件原样(见兼容插件清单)。
