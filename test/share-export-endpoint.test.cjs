@@ -11,7 +11,9 @@
  * The fixture log below encodes every admission rule of foldShareTurns as one
  * concrete event, so a single deepEqual over the response pins the whole
  * fold (append-origin retention, role/source/block filters, and the events
- * that must fall out of a human transcript).
+ * that must fall out of a human transcript). Two more fixtures pin the
+ * range=last slicing: a fork log that opens on assistant rows (turn 0) and
+ * a log whose turns fold to zero blocks.
  */
 'use strict'
 const { test, before, after } = require('node:test')
@@ -89,6 +91,48 @@ const EXPECTED_TURNS = [
   { role: 'assistant', seq: 11, blocks: [{ kind: 'text', text: 'Here you go.' }] },
 ]
 
+/** Fork-inherited history: the log OPENS on an assistant row with no user
+ * anchor in front of it (turn 0), then one anchored turn follows. */
+function forkEvents() {
+  return [
+    ev(0, 'turn/start', { turn: 0 }),
+    ev(1, 'assistant/message', { turn: 0, step: 0, message: { id: 'a-0', role: 'assistant', content: [{ type: 'text', text: 'Inherited answer from before the fork.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(2, 'user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'Continue from there.' }], source: { kind: 'user', rpcId: 'r1' } }, 'append'),
+    ev(3, 'assistant/message', { turn: 0, step: 1, message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'Continuing.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+  ]
+}
+
+const FORK_ALL = [
+  { role: 'assistant', seq: 1, blocks: [{ kind: 'text', text: 'Inherited answer from before the fork.' }] },
+  { role: 'user', seq: 2, blocks: [{ kind: 'text', text: 'Continue from there.' }] },
+  { role: 'assistant', seq: 3, blocks: [{ kind: 'text', text: 'Continuing.' }] },
+]
+
+/** Four turns of which two fold to zero blocks across every row: the
+ * seq-1/2 turn (a file-only human message answered by a tool-call-only
+ * step) and the seq-6/7 turn (file-only again, reasoning-only answer).
+ * The seq-4 tool-call-only step sits INSIDE a contentful turn. */
+function gappyEvents() {
+  return [
+    ev(1, 'user/message', { id: 'u-1', role: 'user', content: [{ type: 'file', attachment: { id: 'file-1' } }], source: { kind: 'user', rpcId: 'r1' } }, 'append'),
+    ev(2, 'assistant/message', { turn: 0, step: 0, message: { id: 'a-1', role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(3, 'user/message', { id: 'u-2', role: 'user', content: [{ type: 'text', text: 'What changed?' }], source: { kind: 'user', rpcId: 'r2' } }, 'append'),
+    ev(4, 'assistant/message', { turn: 1, step: 0, message: { id: 'a-2', role: 'assistant', content: [{ type: 'tool-call', id: 'c2', name: 'read', arguments: '{}' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(5, 'assistant/message', { turn: 1, step: 1, message: { id: 'a-3', role: 'assistant', content: [{ type: 'text', text: 'Nothing yet.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(6, 'user/message', { id: 'u-3', role: 'user', content: [{ type: 'file', attachment: { id: 'file-2' } }], source: { kind: 'user', rpcId: 'r3' } }, 'append'),
+    ev(7, 'assistant/message', { turn: 1, step: 2, message: { id: 'a-4', role: 'assistant', content: [{ type: 'reasoning', text: 'reading the files silently' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(8, 'user/message', { id: 'u-4', role: 'user', content: [{ type: 'text', text: 'Summarize.' }], source: { kind: 'user', rpcId: 'r4' } }, 'append'),
+    ev(9, 'assistant/message', { turn: 2, step: 0, message: { id: 'a-5', role: 'assistant', content: [{ type: 'text', text: 'Two files, no changes.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+  ]
+}
+
+const GAPPY_ALL = [
+  { role: 'user', seq: 3, blocks: [{ kind: 'text', text: 'What changed?' }] },
+  { role: 'assistant', seq: 5, blocks: [{ kind: 'text', text: 'Nothing yet.' }] },
+  { role: 'user', seq: 8, blocks: [{ kind: 'text', text: 'Summarize.' }] },
+  { role: 'assistant', seq: 9, blocks: [{ kind: 'text', text: 'Two files, no changes.' }] },
+]
+
 /** Fake sessionQuery: observeSession serves an exact cut per session id and
  * hands out caller-owned leases whose disposals are counted, so the tests can
  * prove the route releases what it acquires. */
@@ -126,6 +170,8 @@ before(async () => {
   const { query, state } = makeSessionQuery({
     'sess-live': { header: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
     'sess-empty': { header: { version: 3, id: 'sess-empty', createdAt: CREATED_AT, isSeeded: false }, events: [] },
+    'sess-fork': { header: { version: 3, id: 'sess-fork', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: forkEvents() },
+    'sess-gappy': { header: { version: 3, id: 'sess-gappy', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: gappyEvents() },
   })
   queryState = state
   warned = 0
@@ -172,16 +218,73 @@ test('unknown session is a 404 with the shared error envelope', async () => {
   assert.equal(body.error.code, 'session-not-found')
 })
 
+test('range=last&turns=1 returns the final turn, anchor and all', async () => {
+  const { status, body } = await get('?session=sess-live&range=last&turns=1')
+  assert.equal(status, 200)
+  assert.equal(body.ok, true)
+  assert.equal(body.truncated, false)
+  // sess-live folds into two anchored turns: [user seq2, assistant seq4+7]
+  // and [user seq10, assistant seq11]. One from the end keeps the whole
+  // second turn — its user anchor plus its assistant row — and nothing
+  // before it.
+  assert.deepEqual(body.turns, EXPECTED_TURNS.slice(3))
+})
+
+test('turns=500 is the valid upper bound; past the count means all', async () => {
+  const { status, body } = await get('?session=sess-live&range=last&turns=500')
+  assert.equal(status, 200)
+  assert.deepEqual(body.turns, EXPECTED_TURNS)
+})
+
+test('leading assistant rows with no user anchor form turn 0', async () => {
+  const last1 = await get('?session=sess-fork&range=last&turns=1')
+  assert.equal(last1.status, 200)
+  // The inherited answer is a turn of its own (turn 0), so turns=1 drops it
+  // whole — the all↔last difference is never half a turn.
+  assert.deepEqual(last1.body.turns, FORK_ALL.slice(1))
+  const last2 = await get('?session=sess-fork&range=last&turns=2')
+  assert.deepEqual(last2.body.turns, FORK_ALL)
+  const all = await get('?session=sess-fork&range=all')
+  assert.deepEqual(all.body.turns, FORK_ALL)
+})
+
+test('turns folded to zero blocks take no slot and never serialize', async () => {
+  const all = await get('?session=sess-gappy&range=all')
+  assert.equal(all.status, 200)
+  assert.deepEqual(all.body.turns, GAPPY_ALL)
+  // turns=2 skips the two fully-emptied turns (seq 1/2 and 6/7) without
+  // spending slots on them and still reaches back to the seq-3 turn; the
+  // tool-call-only step at seq 4 inside that kept turn stays invisible.
+  const last2 = await get('?session=sess-gappy&range=last&turns=2')
+  assert.deepEqual(last2.body.turns, GAPPY_ALL)
+  const last1 = await get('?session=sess-gappy&range=last&turns=1')
+  assert.deepEqual(last1.body.turns, GAPPY_ALL.slice(2))
+})
+
 test('query validation', async () => {
   // session is required exactly once, non-empty.
   assert.equal((await get('?range=all')).status, 400)
   assert.equal((await get('?session=')).status, 400)
   assert.equal((await get('?session=a&session=b&range=all')).status, 400)
-  // range must be 'all' — 'last' arrives with the range-slicing ticket, and
-  // anything else is a client bug worth a loud 400 over a silent wrong answer.
-  assert.equal((await get('?session=sess-live&range=last&turns=5')).status, 400)
+  // range is all or last, at most once; anything else is a client bug worth
+  // a loud 400 over a silent wrong answer.
   assert.equal((await get('?session=sess-live&range=bogus')).status, 400)
   assert.equal((await get('?session=sess-live&range=all&range=all')).status, 400)
+  // turns rides with range=last only, exactly once, as a plain integer
+  // 1–500: missing, empty, repeated, zero, negative, fractional,
+  // exponent-notation, non-numeric, and above-cap values are all 400s.
+  assert.equal((await get('?session=sess-live&range=last')).status, 400)
+  assert.equal((await get('?session=sess-live&range=last&turns=')).status, 400)
+  assert.equal((await get('?session=sess-live&range=last&turns=3&turns=3')).status, 400)
+  assert.equal((await get('?session=sess-live&range=last&turns=0')).status, 400)
+  assert.equal((await get('?session=sess-live&range=last&turns=-1')).status, 400)
+  assert.equal((await get('?session=sess-live&range=last&turns=2.5')).status, 400)
+  assert.equal((await get('?session=sess-live&range=last&turns=1e2')).status, 400)
+  assert.equal((await get('?session=sess-live&range=last&turns=abc')).status, 400)
+  assert.equal((await get('?session=sess-live&range=last&turns=501')).status, 400)
+  // turns without range=last is a client bug, not a silent all.
+  assert.equal((await get('?session=sess-live&range=all&turns=3')).status, 400)
+  assert.equal((await get('?session=sess-live&turns=3')).status, 400)
 })
 
 test('only GET is allowed', async () => {
@@ -192,17 +295,22 @@ test('only GET is allowed', async () => {
 })
 
 test('every acquired observation lease is disposed', async () => {
-  // Three 200s so far (all ×2, empty) → three leases taken and released; the
-  // 400s short-circuit before observeSession and the 404 throws before any
-  // lease exists, so nothing may be left pinned.
-  assert.equal(queryState.disposed, 3)
+  // Eleven 200s so far (live ×4, empty, fork ×3, gappy ×3) → eleven leases
+  // taken and released; the 16 validation 400s short-circuit before
+  // observeSession and the 404 throws before any lease exists.
+  assert.equal(queryState.disposed, 11)
   assert.equal(queryState.leases, 0)
-  assert.deepEqual(queryState.observed, ['sess-live', 'sess-live', 'sess-empty', 'sess-gone'])
+  assert.deepEqual(queryState.observed, [
+    'sess-live', 'sess-live', 'sess-empty', 'sess-gone',
+    'sess-live', 'sess-live',
+    'sess-fork', 'sess-fork', 'sess-fork',
+    'sess-gappy', 'sess-gappy', 'sess-gappy',
+  ])
 })
 
 test('rejections are logged once each, the method guard is not', async () => {
-  // 1×404 + 6×400 reached the try block and logged; the 405 answers before it.
-  assert.equal(warned, 7)
+  // 1×404 + 16×400 reached the try block and logged; the 405 answers before it.
+  assert.equal(warned, 17)
 })
 
 /** Fake Cordis context for apply(): inject runs its callback only when every

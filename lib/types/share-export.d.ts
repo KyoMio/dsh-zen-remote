@@ -21,6 +21,10 @@ import type { Context } from '@deepseek-ai/cordis';
 import type { SessionEvent } from '@deepseek-ai/dsh-session';
 /** Exact route the browser GETs a session's share transcript from. */
 export declare const SHARE_EXPORT_ROUTE = "/_dsh/mobile-nav/share-export";
+/** Upper bound on `turns` for `range=last` (PLAN §4). 500 exchanges is
+ * already more wall of text than any share card wants, and the cap keeps a
+ * careless `turns=99999999` from quietly meaning "the whole log". */
+export declare const MAX_SHARE_TURNS = 500;
 /** One exportable content block of a transcript row. */
 export type ShareBlock = {
     kind: 'text';
@@ -29,8 +33,8 @@ export type ShareBlock = {
     kind: 'image';
 };
 /** One transcript row. `seq` is the source event's log position — stable
- * across re-renders, usable as a React key, and (in the range=last ticket)
- * the anchor the server slices turns by. */
+ * across re-renders and usable as a React key; a range=last body keeps whole
+ * turns, so its seqs always arrive turn-contiguous. */
 export interface ShareTurn {
     role: 'user' | 'assistant';
     seq: number;
@@ -47,33 +51,15 @@ export interface ShareExportBody {
     truncated: false;
 }
 /**
- * Fold one session's complete event log into transcript rows, in log order.
- *
- * Row admission, in the order the filters run:
- * - append-origin surface events only (`isAppendSurfaceEvent`): a replacement
- *   copy is model-only and must not add itself to the transcript, while the
- *   ranges it shadowed stay in place — that is what makes this a human
- *   transcript rather than the model surface;
- * - `deriveEventMessage` drops events that produce no message, which covers
- *   turn/step boundaries AND the usage-only empty assistant message;
- * - system never renders in a shared conversation;
- * - user rows must be human-authored (`source.kind === 'user'`): injected
- *   contexts (file notices, skill content, …) are also user-role messages,
- *   and the Chat view renders them as context rows, not conversation — a
- *   share card shows the words people exchanged, not the machinery. Steering
- *   messages ARE human-authored and stay;
- * - blocks: text passes verbatim, image becomes a `{kind:'image'}` placeholder
- *   (attachments live on the host disk and stay out of v1), everything else —
- *   reasoning (folded on the phone anyway), tool-call/tool-result, file, and
- *   block types this fold does not know — is dropped;
- * - a row left with no blocks (a tool-result message, for one) is omitted
- *   entirely rather than shipped as an empty bubble.
+ * The `range=all` body: {@link foldRows} minus the rows with no exportable
+ * blocks — an empty bubble is not worth shipping.
  * @param events - complete log, contiguous ascending seq.
  * @returns the transcript rows in conversation order.
  */
 export declare function foldShareTurns(events: readonly SessionEvent[]): ShareTurn[];
 /**
- * Handle one `GET {@link SHARE_EXPORT_ROUTE}?session=<id>&range=all` request.
+ * Handle one `GET {@link SHARE_EXPORT_ROUTE}?session=<id>&range=all|last&turns=N`
+ * request.
  *
  * Exported so an integration test can drive it with a plain node:http server
  * and a fake sessionQuery service instead of booting a harness.

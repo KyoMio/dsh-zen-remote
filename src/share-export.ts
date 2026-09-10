@@ -32,14 +32,19 @@ import { deriveEventMessage, isAppendSurfaceEvent } from '@deepseek-ai/dsh-sessi
 /** Exact route the browser GETs a session's share transcript from. */
 export const SHARE_EXPORT_ROUTE = '/_dsh/mobile-nav/share-export'
 
+/** Upper bound on `turns` for `range=last` (PLAN §4). 500 exchanges is
+ * already more wall of text than any share card wants, and the cap keeps a
+ * careless `turns=99999999` from quietly meaning "the whole log". */
+export const MAX_SHARE_TURNS = 500
+
 /** One exportable content block of a transcript row. */
 export type ShareBlock =
   | { kind: 'text'; text: string }
   | { kind: 'image' }
 
 /** One transcript row. `seq` is the source event's log position — stable
- * across re-renders, usable as a React key, and (in the range=last ticket)
- * the anchor the server slices turns by. */
+ * across re-renders and usable as a React key; a range=last body keeps whole
+ * turns, so its seqs always arrive turn-contiguous. */
 export interface ShareTurn {
   role: 'user' | 'assistant'
   seq: number
@@ -103,22 +108,47 @@ function singleQuery(url: URL, key: string): string {
   return value
 }
 
+/** One parsed `range` query: the whole transcript, or the tail N
+ * contentful turns (count already validated). */
+type ShareRange = { kind: 'all' } | { kind: 'last'; turns: number }
+
 /**
- * Validate the `range` parameter. Absent means `all` (the only shape this
- * ticket ships); anything else is a 400 until the range=last ticket widens
- * the accepted set — a clear contract beat a silent wrong answer.
+ * Validate the `range`/`turns` pair. Absent `range` means `all`; `last`
+ * must carry exactly one `turns` that is a plain integer 1–500 — the phone
+ * only offers presets, so a fractional/negative/oversized/repeated value is
+ * a hand-typed URL or a client bug, and a loud 400 beats slicing to a
+ * guessed intent. `turns` next to any other range (or to none) is rejected
+ * rather than ignored: silently dropping it would answer a different
+ * question than the URL asks.
  */
-function parseRange(url: URL): 'all' {
+function parseRange(url: URL): ShareRange {
   const values = url.searchParams.getAll('range')
   const value = values[0]
-  if (values.length === 0) return 'all'
+  if (values.length === 0) return { kind: 'all' }
   if (values.length !== 1 || value === undefined || value === '') {
     throw new ShareExportError(400, 'bad-request', 'range is allowed at most once')
   }
-  if (value !== 'all') {
+  if (value === 'all') return { kind: 'all' }
+  if (value !== 'last') {
     throw new ShareExportError(400, 'bad-request', `unsupported range: ${value}`)
   }
-  return 'all'
+  const turnsList = url.searchParams.getAll('turns')
+  const turns = turnsList[0]
+  if (turnsList.length !== 1 || turns === undefined || turns === '') {
+    throw new ShareExportError(400, 'bad-request', 'turns is required exactly once when range=last')
+  }
+  const count = /^[0-9]+$/.test(turns) ? Number(turns) : Number.NaN
+  if (!Number.isInteger(count) || count < 1 || count > MAX_SHARE_TURNS) {
+    throw new ShareExportError(400, 'bad-request', `turns must be an integer between 1 and ${MAX_SHARE_TURNS}`)
+  }
+  return { kind: 'last', turns: count }
+}
+
+/** Reject a `turns` parameter on a request that is not range=last. */
+function rejectStrayTurns(url: URL): void {
+  if (url.searchParams.has('turns')) {
+    throw new ShareExportError(400, 'bad-request', 'turns is only valid with range=last')
+  }
 }
 
 /** `SESSION_QUERY_SESSION_NOT_FOUND`, read structurally: the error class
@@ -148,12 +178,14 @@ function isSessionNotFound(error: unknown): boolean {
  *   (attachments live on the host disk and stay out of v1), everything else —
  *   reasoning (folded on the phone anyway), tool-call/tool-result, file, and
  *   block types this fold does not know — is dropped;
- * - a row left with no blocks (a tool-result message, for one) is omitted
- *   entirely rather than shipped as an empty bubble.
+ * - a row that survives every filter above but yields no exportable block
+ *   (a file-only human message, a tool-call-only assistant step) is KEPT
+ *   here with `blocks: []`: the turn grouping below needs the conversation's
+ *   true anchor shape, and only the serializers drop the empties.
  * @param events - complete log, contiguous ascending seq.
- * @returns the transcript rows in conversation order.
+ * @returns the admitted rows in conversation order, empty ones included.
  */
-export function foldShareTurns(events: readonly SessionEvent[]): ShareTurn[] {
+function foldRows(events: readonly SessionEvent[]): ShareTurn[] {
   const turns: ShareTurn[] = []
   for (const event of events) {
     if (!isAppendSurfaceEvent(event)) continue
@@ -166,14 +198,69 @@ export function foldShareTurns(events: readonly SessionEvent[]): ShareTurn[] {
       if (block.type === 'text') blocks.push({ kind: 'text', text: block.text })
       else if (block.type === 'image') blocks.push({ kind: 'image' })
     }
-    if (blocks.length === 0) continue
     turns.push({ role: msg.role, seq: event.seq, blocks })
   }
   return turns
 }
 
 /**
- * Handle one `GET {@link SHARE_EXPORT_ROUTE}?session=<id>&range=all` request.
+ * The `range=all` body: {@link foldRows} minus the rows with no exportable
+ * blocks — an empty bubble is not worth shipping.
+ * @param events - complete log, contiguous ascending seq.
+ * @returns the transcript rows in conversation order.
+ */
+export function foldShareTurns(events: readonly SessionEvent[]): ShareTurn[] {
+  return foldRows(events).filter((row) => row.blocks.length > 0)
+}
+
+/**
+ * Group folded rows into conversation turns (PLAN §4): one turn is a user
+ * anchor — every user row the fold admits is human-authored by its source
+ * filter — plus the assistant rows up to the next anchor. Assistant rows
+ * before the FIRST anchor form turn 0: a fork inherits history that begins
+ * mid-conversation, and those rows belong to no anchor yet.
+ */
+function groupRowsIntoTurns(rows: readonly ShareTurn[]): ShareTurn[][] {
+  const groups: ShareTurn[][] = []
+  let current: ShareTurn[] = []
+  for (const row of rows) {
+    // An empty `current` on an anchor means the log OPENED on this anchor:
+    // nothing was inherited, so turn 0 simply does not exist here.
+    if (row.role === 'user' && current.length > 0) {
+      groups.push(current)
+      current = []
+    }
+    current.push(row)
+  }
+  if (current.length > 0) groups.push(current)
+  return groups
+}
+
+/**
+ * The `range=last&turns=N` body: the transcript of the last N turns that
+ * fold to at least one block. Walked from the end so a turn whose every row
+ * went empty (a file-only message answered by tool-call-only steps — the
+ * exchange happened, but a share card has nothing to show) is skipped
+ * WITHOUT eating one of the N slots; rows that went empty INSIDE a kept
+ * turn still never serialize. Only the selected tail is returned — the cut
+ * head never reaches the response body.
+ */
+function sliceLastTurns(rows: readonly ShareTurn[], count: number): ShareTurn[] {
+  const groups = groupRowsIntoTurns(rows)
+  const selected: ShareTurn[] = []
+  let remaining = count
+  for (let i = groups.length - 1; i >= 0 && remaining > 0; i -= 1) {
+    const group = groups[i]
+    if (group.every((row) => row.blocks.length === 0)) continue
+    selected.unshift(...group)
+    remaining -= 1
+  }
+  return selected.filter((row) => row.blocks.length > 0)
+}
+
+/**
+ * Handle one `GET {@link SHARE_EXPORT_ROUTE}?session=<id>&range=all|last&turns=N`
+ * request.
  *
  * Exported so an integration test can drive it with a plain node:http server
  * and a fake sessionQuery service instead of booting a harness.
@@ -191,15 +278,19 @@ export async function handleShareExport(ctx: Context, req: IncomingMessage, res:
   try {
     const url = new URL(req.url ?? SHARE_EXPORT_ROUTE, 'http://dsh.internal')
     const sessionId = singleQuery(url, 'session')
-    parseRange(url)
+    const range = parseRange(url)
+    if (range.kind === 'all') rejectStrayTurns(url)
     // Caller-owned observation lease (see SessionObservation): the cut is
     // pinned for this read and released in the finally below, so a burst of
     // share requests cannot pin every prepared cache entry.
     observation = await ctx.sessionQuery.observeSession(sessionId as SessionId)
+    // One fold of the whole log (the last N turns cannot be found from the
+    // tail alone); the range decides which slice of it is serialized.
+    const rows = foldRows(observation.events)
     const body: ShareExportBody = {
       ok: true,
       createdAt: observation.header.createdAt,
-      turns: foldShareTurns(observation.events),
+      turns: range.kind === 'last' ? sliceLastTurns(rows, range.turns) : rows.filter((row) => row.blocks.length > 0),
       truncated: false,
     }
     responseJson(res, 200, body)
