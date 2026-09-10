@@ -1,17 +1,24 @@
-// Integration check for the S7 upload route (src/index.ts handleUpload).
+// Integration check for the S7 upload route (lib/index.js handleUpload).
 //
 // Drives the real handler over a real node:http socket with a fake sessions
 // service and a throwaway workspace, so the accept/reject decisions and the
 // bytes that reach disk are the ones the phone would produce. No harness, no
 // session, no message: writing a file into a workspace is not a prompt.
 //
-// Run: node scripts/check-upload-endpoint.mjs   (needs Node >= 23.6 type stripping)
+// Imports the BUILT lib/index.js rather than src/index.ts: since the host
+// source became multi-file (src/share-export.js import), strip-only type
+// stripping can no longer load the source graph — relative specifiers need
+// their .js extension for the runtime, and nothing rewrites them back to .ts.
+// lib/ is the committed build artifact, the same one check-client-externals
+// reads, so run pnpm build first when editing src/.
+//
+// Run: node scripts/check-upload-endpoint.mjs
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { UPLOAD_DIR, handleUpload, safeUploadName, sameOriginPost } from '../src/index.ts'
+import { UPLOAD_DIR, handleUpload, safeUploadName, sameOriginPost } from '../lib/index.js'
 
 const MAX_BYTES = 4096
 

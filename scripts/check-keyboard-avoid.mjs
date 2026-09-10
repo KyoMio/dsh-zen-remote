@@ -1,12 +1,14 @@
 // Self-check for the composer keyboard-avoid lift (S10, issue #1 方案 2).
 // The failing environment (小米 + 微信输入法) cannot be reproduced off-device,
 // so the boundary cases of the pure geometry are asserted numerically.
-// Run: node scripts/check-keyboard-avoid.mjs   (needs Node >= 23.6 type stripping)
+// Run: node scripts/check-keyboard-avoid.mjs   (needs Node >= 23.6 type stripping;
+// clamped comes from lib/index.js — the host source is multi-file since the
+// share-export route, so strip-only cannot load src/index.ts. Build first.)
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { composerLift, estimatedLift, keyboardLift as lift, safetyPad } from '../src/client/effects/keyboard-avoid.ts'
 import { KEYBOARD_DEFAULTS, parseClientConfig } from '../src/client/client-config.ts'
-import { clamped } from '../src/index.ts'
+import { clamped } from '../lib/index.js'
 
 // The reported class of bug: keyboard shrinks the visual viewport, browser
 // does not pan it — the whole shrink is an occluded band at the bottom.
