@@ -22,6 +22,7 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'nod
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session'
+import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 
 /** Exact route the phone composer POSTs one file body to. */
 export const UPLOAD_ROUTE = '/_dsh/mobile-nav/upload'
@@ -398,5 +399,17 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         })
       },
     }), 'dsh-mobile-nav: client config route')
+  })
+  // Share-image transcript route (issue #7): needs the sessionQuery service
+  // every standard dsh-base composition provides. Injected lazily like the
+  // two routes above, so a composition without it (Electron carries neither
+  // webServer nor sessionQuery) simply never mounts the route — the browser
+  // half's fetch then 404s into its "needs full DSH" message.
+  ctx.inject(['webServer', 'sessionQuery'], (webCtx) => {
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: SHARE_EXPORT_ROUTE,
+      handler: (req, res) => handleShareExport(webCtx, req, res),
+    }), 'dsh-mobile-nav: share export route')
   })
 }

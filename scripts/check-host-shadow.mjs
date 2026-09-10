@@ -8,12 +8,13 @@
 // means the host half silently loads whatever version this plugin last
 // installed — "it links and starts" proves nothing.
 //
-// Instead of hand-maintaining a package list, the three files the host half
-// actually loads (dsh-push.mjs, lan-gate.mjs, lib/index.js) are scanned for
-// @deepseek-ai specifiers — static import, dynamic import() and require() —
-// so a new import added there gets watched automatically. src/index.ts is
-// type-only imports (erased at runtime) and the gateway subprocess uses only
-// stdlib + web-push, so this scan is the whole runtime story.
+// Instead of hand-maintaining a package list, the files the host half
+// actually loads (dsh-push.mjs, lan-gate.mjs, lib/index.js and the modules
+// it statically pulls in) are scanned for @deepseek-ai specifiers — static
+// import, dynamic import() and require() — so a new import added there gets
+// watched automatically. src/index.ts is type-only imports (erased at
+// runtime) and the gateway subprocess uses only stdlib + web-push, so this
+// scan is the whole runtime story.
 //
 // Run: node scripts/check-host-shadow.mjs
 import assert from 'node:assert/strict'
@@ -47,15 +48,36 @@ const require = createRequire(import.meta.url)
 //   first, or temporarily accept the drift).
 // - npm-published tarballs contain no node_modules, so this shadow only
 //   exists on dev machines where the plugin is link-installed.
-const SHADOW_ALLOWED = ['@deepseek-ai/dsh-tools']
+//
+// @deepseek-ai/dsh-session:
+// - Why allowed at all: src/share-export.ts (the share-image transcript
+//   route) statically imports the two pure fold helpers
+//   (isAppendSurfaceEvent, deriveEventMessage) from the browser-safe
+//   `@deepseek-ai/dsh-session/surface` subpath. They are THE canonical
+//   per-node projection rule per their own doc; reimplementing them locally
+//   would be a second fold that silently drifts, and no host service exposes
+//   them, so a module import is the only way to reuse them.
+// - Why 0.1.2-rc.1: same release line as every other devDep; the package is
+//   also needed in node_modules for pnpm verify's type check regardless. The
+//   shadow only bites the two pure functions — both take plain event records
+//   and touch no class identity, and their signatures are identical on the
+//   0.1.2 and 0.1.5 lines — so a version-skewed copy cannot diverge the fold
+//   the way a service-class mismatch could.
+// - WHEN TO ACT: a future DSH that renames the surface subpath or changes
+//   event shapes will break this import loudly at plugin load; re-pin the
+//   devDep then.
+// - npm-published tarballs contain no node_modules, so this shadow only
+//   exists on dev machines where the plugin is link-installed.
+const SHADOW_ALLOWED = ['@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-session']
 
 // Packages that must never exist in this plugin's node_modules at all: DSH
 // 0.1.2 dropped them, and a stale copy would let the type check quietly pass
 // against outdated declarations. NOT exemptible via SHADOW_ALLOWED.
 const BANNED_PACKAGES = ['@deepseek-ai/dsh-client-runtime', '@deepseek-ai/dsh-host-apiproxy']
 
-// The three files the host half actually loads.
-const HOST_ENTRY_FILES = ['dsh-push.mjs', 'lan-gate.mjs', 'lib/index.js']
+// The files the host half actually loads. lib/share-export.js is statically
+// imported by lib/index.js, so it is part of the same runtime graph.
+const HOST_ENTRY_FILES = ['dsh-push.mjs', 'lan-gate.mjs', 'lib/index.js', 'lib/share-export.js']
 
 // Matches the specifier of real module statements only — `... from 'pkg'`,
 // `import 'pkg'`, `import('pkg')`, `require('pkg')` — so @deepseek-ai names
