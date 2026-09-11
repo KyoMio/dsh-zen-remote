@@ -22,6 +22,7 @@ import { installNativeTriggerOverlay } from './effects/native-trigger-overlay.ts
 import { installWelcomeNoticeOptOut } from './effects/welcome-notice.ts'
 import { installKeyboardGuard } from './effects/keyboard-guard.ts'
 import { installKeyboardAvoid } from './effects/keyboard-avoid.ts'
+import { SharePreview } from './share/share-preview.tsx'
 import { NS, en, zh } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 
@@ -289,6 +290,21 @@ export function apply(ctx: ClientContext): void {
       toggleSidebar: () => ctx.layout.toggleSidebar(),
     }),
   }, MobileDrawerFooter))
+
+  // Share-card debug preview (ticket 03): renders the share-card template at
+  // the top of the page so its layout is inspectable before the rasterizer
+  // (ticket 04) exists. Registered ONLY with the URL param, so the no-param
+  // path — including desktop — stays bit-for-bit untouched (same debug-param
+  // exemption as ?mobile-nav-inset=, see debug.ts).
+  if (new URLSearchParams(location.search).has('mobile-nav-share-preview')) {
+    ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+      name: 'shell.overlay',
+      id: 'share-preview',
+      // Above the phone home screen (order 20) within the same overlay layer.
+      order: 30,
+      locale: NS,
+    }, SharePreview))
+  }
 }
 
 // Type-only augmentation imports: pull the layout / conversation / sidebar
