@@ -8,12 +8,17 @@
  * transcript rules asserted below are the ones production applies. No
  * harness, no session, no message: folding a log is a read.
  *
- * The fixture log below encodes every admission rule of foldShareTurns as one
- * concrete event, so a single deepEqual over the response pins the whole
- * fold (append-origin retention, role/source/block filters, and the events
- * that must fall out of a human transcript). Two more fixtures pin the
- * range=last slicing: a fork log that opens on assistant rows (turn 0) and
- * a log whose turns fold to zero blocks.
+ * The data source is readSession's SessionLogSnapshot — the COMPLETE raw log
+ * in log order (the `agent/inbox/spliced` choreography the steering
+ * classification folds only ever exists there). The fixture logs encode every
+ * admission rule of the fold (foldRows in src/share-export.ts) as one
+ * concrete event, so deepEquals over the responses pin the whole fold
+ * (append-origin retention, role/source/block filters, the next-step inbox
+ * state machine, and the events that must fall out of a human transcript):
+ * fixtureEvents walks every fold rule, steeringEvents replays the exact
+ * inbox choreography a real steered session writes (pure insert → cancel →
+ * entered claim), forkEvents opens on assistant rows (turn 0), and
+ * gappyEvents folds turns to zero blocks.
  */
 'use strict'
 const { test, before, after } = require('node:test')
@@ -42,11 +47,17 @@ function ev(seq, type, data, surfaceOp) {
   return event
 }
 
+/** One message as the durable Inbox stores it inside `inserted` (the full
+ * frozen message, id included — the inbox machine keys on that id). */
+function inboxMessage(id, text, source) {
+  return { id, role: 'user', content: [{ type: 'text', text }], source }
+}
+
 const MODEL_SOURCE = { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }
 
 /** One conversation exercising every fold rule: a tool round, a usage-only
  * assistant event, an injected context, a mixed-block human message, an
- * unknown block type, and a replacement (compaction-style) user message
+ * unknown block type, and a replacement (compaction checkpoint) user message
  * shadowing the first human turn. */
 function fixtureEvents() {
   return [
@@ -91,6 +102,150 @@ const EXPECTED_TURNS = [
   { role: 'assistant', seq: 11, blocks: [{ kind: 'text', text: 'Here you go.' }] },
 ]
 
+/** The next-step inbox choreography of one steered conversation, replayed in
+ * the exact shape the real harness writes (verified against a live session
+ * log: pure insert for everything queued mid-turn, `outcome: 'canceled'` for
+ * every public cancel, and an outcome-less REMOVING splice for the entered
+ * claim at a step boundary):
+ *
+ *  - seq 1/2: the turn's pending input assembles — plugin instructions into
+ *    next-step, the queued human question into NEXT-TURN (whose splices the
+ *    classification machine must ignore entirely);
+ *  - seq 3: the boundary CLAIMS the plugin message (removing splice, no
+ *    outcome) → currentClaimed = {p-1};
+ *  - seq 4: the claimed plugin batch logs its user/message — plugin source,
+ *    so the fold drops it as a context row (being claimed changes nothing);
+ *  - seq 5: the first true question (claimed via next-turn) is NOT in the
+ *    next-step claim set → anchors turn 1;
+ *  - seq 8/9: mid-turn, two human messages queue into next-step (PURE
+ *    inserts — they must not claim anything yet);
+ *  - seq 10: the second queued message is CANCELED before any boundary
+ *    (removing splice WITH 'canceled') — a cancel never claims, and s-2
+ *    never logs a user/message at all;
+ *  - seq 11: the boundary claims what is left → currentClaimed = {s-1}
+ *    (REPLACING {p-1}: only the current claim classifies);
+ *  - seq 12: the steering message logs as user/message s-1, its id claimed
+ *    → STEERING: stays in the transcript in place, opens no turn;
+ *  - seq 14: the second true question is not in the claim set → anchors
+ *    turn 2.
+ */
+function steeringEvents() {
+  return [
+    ev(0, 'turn/start', { turn: 0 }),
+    ev(1, 'agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [inboxMessage('p-1', 'Verifier tools are available…', { kind: 'plugin', plugin: 'dsh-llm-verifier', form: 'instructions' })] }),
+    ev(2, 'agent/inbox/spliced', { target: 'next-turn', start: 0, inserted: [inboxMessage('u-1', 'First question: summarize the repo.', { kind: 'user', rpcId: 'r1' })] }),
+    ev(3, 'agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 1, inserted: [] }),
+    ev(4, 'user/message', { id: 'p-1', role: 'user', content: [{ type: 'text', text: 'Verifier tools are available…' }], source: { kind: 'plugin', plugin: 'dsh-llm-verifier', form: 'instructions' } }, 'append'),
+    ev(5, 'user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'First question: summarize the repo.' }], source: { kind: 'user', rpcId: 'r1' } }, 'append'),
+    ev(6, 'assistant/message', { turn: 0, step: 0, message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'Working on it.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(7, 'step/start', { turn: 0, step: 1 }),
+    ev(8, 'agent/inbox/spliced', { target: 'next-step', start: 0, inserted: [inboxMessage('s-1', 'yes, use the other approach.', { kind: 'user', rpcId: 'r2' })] }),
+    ev(9, 'agent/inbox/spliced', { target: 'next-step', start: 1, inserted: [inboxMessage('s-2', 'never mind, canceled while queued.', { kind: 'user', rpcId: 'r3' })] }),
+    ev(10, 'agent/inbox/spliced', { target: 'next-step', start: 1, removedCount: 1, outcome: 'canceled', inserted: [] }),
+    ev(11, 'agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 1, inserted: [] }),
+    ev(12, 'user/message', { id: 's-1', role: 'user', content: [{ type: 'text', text: 'yes, use the other approach.' }], source: { kind: 'user', rpcId: 'r2' } }, 'append'),
+    ev(13, 'assistant/message', { turn: 0, step: 1, message: { id: 'a-2', role: 'assistant', content: [{ type: 'text', text: 'Done, switching.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(14, 'user/message', { id: 'u-2', role: 'user', content: [{ type: 'text', text: 'Second question: ship it?' }], source: { kind: 'user', rpcId: 'r4' } }, 'append'),
+    ev(15, 'assistant/message', { turn: 1, step: 0, message: { id: 'a-3', role: 'assistant', content: [{ type: 'text', text: 'Shipped.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+  ]
+}
+
+const STEERING_ALL = [
+  { role: 'user', seq: 5, blocks: [{ kind: 'text', text: 'First question: summarize the repo.' }] },
+  { role: 'assistant', seq: 6, blocks: [{ kind: 'text', text: 'Working on it.' }] },
+  // The steering row: still a user bubble in the transcript, exactly where
+  // the user saw it — but it opened no turn.
+  { role: 'user', seq: 12, blocks: [{ kind: 'text', text: 'yes, use the other approach.' }] },
+  { role: 'assistant', seq: 13, blocks: [{ kind: 'text', text: 'Done, switching.' }] },
+  { role: 'user', seq: 14, blocks: [{ kind: 'text', text: 'Second question: ship it?' }] },
+  { role: 'assistant', seq: 15, blocks: [{ kind: 'text', text: 'Shipped.' }] },
+]
+
+/** The cancel+insert orchestration (review 07+08): one public next-step
+ * mutation with removedCount>0 AND outcome:'canceled' AND a non-empty
+ * inserted batch — the in-place replace path. Choreography: the user edits
+ * the queued q-2 into q-2b (removed in place, replacement inserted at the
+ * same slot) while the aborted half of an already-claimed pair, q-1, returns
+ * to the queue; the host coalesces both edits into one splice. The fold must
+ * read the combination EXACTLY as cancel + insert separately, and each of
+ * the three machine rules is observable in the response body:
+ *
+ *  - pending 原位替换: after [q-2,q-3] → [q-1,q-2b,q-3], the partial claim at
+ *    seq 10 (start 0, two messages) removes exactly [q-2b,q-3] — had the
+ *    insert appended instead of replacing in place, the queue would be
+ *    [q-3,q-1,q-2b], that claim would take [q-1,q-2b] (q-1 already logged —
+ *    classification happens at log time), and q-3 would ANCHOR a turn,
+ *    shifting every range=last slice below;
+ *  - claimed 减 inserted: q-1 was claimed at seq 5 but re-enters the inbox at
+ *    seq 6, so when it logs at seq 8 — before any new claim — it is NOT
+ *    steering: it opens turn 2 as a true question;
+ *  - 不认领: the splice never becomes a claim itself — the pre-existing
+ *    {q-0} half of the seq-5 claim SURVIVES it, so q-0's log at seq 7 stays
+ *    a steering row inside turn 1 (a claim would have replaced the set with
+ *    {q-2}, and q-0 would have anchored a turn of its own).
+ */
+function replaceEvents() {
+  return [
+    ev(0, 'turn/start', { turn: 0 }),
+    ev(1, 'user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'First question: summarize the repo.' }], source: { kind: 'user', rpcId: 'r1' } }, 'append'),
+    ev(2, 'assistant/message', { turn: 0, step: 0, message: { id: 'a-1', role: 'assistant', content: [{ type: 'text', text: 'Working on it.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(3, 'step/start', { turn: 0, step: 1 }),
+    // Four questions queue into next-step mid-turn: [q-0, q-1, q-2, q-3].
+    ev(4, 'agent/inbox/spliced', {
+      target: 'next-step', start: 0,
+      inserted: [
+        inboxMessage('q-0', 'tweak the summary into bullet points', { kind: 'user', rpcId: 'r2' }),
+        inboxMessage('q-1', 'actually, resend this one as its own question', { kind: 'user', rpcId: 'r3' }),
+        inboxMessage('q-2', 'an early draft that will be edited', { kind: 'user', rpcId: 'r4' }),
+        inboxMessage('q-3', 'one more queued note', { kind: 'user', rpcId: 'r5' }),
+      ],
+    }),
+    // Boundary claims the head pair: claimed={q-0,q-1}, pending=[q-2,q-3].
+    ev(5, 'agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 2, inserted: [] }),
+    // THE case: the edit of q-2 (removed in place → q-2b) folded together
+    // with the aborted q-1 returning to the queue.
+    ev(6, 'agent/inbox/spliced', {
+      target: 'next-step', start: 0, removedCount: 1, outcome: 'canceled',
+      inserted: [
+        inboxMessage('q-1', 'actually, resend this one as its own question', { kind: 'user', rpcId: 'r3' }),
+        inboxMessage('q-2b', 'the edited replacement of the early draft', { kind: 'user', rpcId: 'r6' }),
+      ],
+    }),
+    // q-0 stayed claimed: its log is STEERING inside turn 1 (不认领).
+    ev(7, 'user/message', { id: 'q-0', role: 'user', content: [{ type: 'text', text: 'tweak the summary into bullet points' }], source: { kind: 'user', rpcId: 'r2' } }, 'append'),
+    // q-1 re-entered the inbox at seq 6, so its log is NOT steering: it
+    // anchors turn 2 as a true question (claimed 减 inserted).
+    ev(8, 'user/message', { id: 'q-1', role: 'user', content: [{ type: 'text', text: 'actually, resend this one as its own question' }], source: { kind: 'user', rpcId: 'r3' } }, 'append'),
+    // The stale queue entry for the already-logged q-1 is cleared; the queue
+    // is [q-2b, q-3].
+    ev(9, 'agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 1, outcome: 'canceled', inserted: [] }),
+    // Partial claim from position 0: removes exactly [q-2b, q-3] — the
+    // in-place-replace position pin (原位替换).
+    ev(10, 'agent/inbox/spliced', { target: 'next-step', start: 0, removedCount: 2, inserted: [] }),
+    ev(11, 'user/message', { id: 'q-2b', role: 'user', content: [{ type: 'text', text: 'the edited replacement of the early draft' }], source: { kind: 'user', rpcId: 'r6' } }, 'append'),
+    ev(12, 'user/message', { id: 'q-3', role: 'user', content: [{ type: 'text', text: 'one more queued note' }], source: { kind: 'user', rpcId: 'r5' } }, 'append'),
+    ev(13, 'assistant/message', { turn: 0, step: 1, message: { id: 'a-2', role: 'assistant', content: [{ type: 'text', text: 'Done.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+    ev(14, 'user/message', { id: 'u-2', role: 'user', content: [{ type: 'text', text: 'Second question: ship it?' }], source: { kind: 'user', rpcId: 'r7' } }, 'append'),
+    ev(15, 'assistant/message', { turn: 1, step: 0, message: { id: 'a-3', role: 'assistant', content: [{ type: 'text', text: 'Shipped.' }], source: MODEL_SOURCE }, stream: [] }, 'append'),
+  ]
+}
+
+const REPLACE_ALL = [
+  { role: 'user', seq: 1, blocks: [{ kind: 'text', text: 'First question: summarize the repo.' }] },
+  { role: 'assistant', seq: 2, blocks: [{ kind: 'text', text: 'Working on it.' }] },
+  // q-0: still claimed through the cancel+insert → steering, inside turn 1.
+  { role: 'user', seq: 7, blocks: [{ kind: 'text', text: 'tweak the summary into bullet points' }] },
+  // q-1: re-inserted by the cancel+insert → unclaimed when it logs → anchor.
+  { role: 'user', seq: 8, blocks: [{ kind: 'text', text: 'actually, resend this one as its own question' }] },
+  // q-2b and q-3: claimed by the position-pinning partial claim at seq 10 →
+  // steering rows inside turn 2, never anchors.
+  { role: 'user', seq: 11, blocks: [{ kind: 'text', text: 'the edited replacement of the early draft' }] },
+  { role: 'user', seq: 12, blocks: [{ kind: 'text', text: 'one more queued note' }] },
+  { role: 'assistant', seq: 13, blocks: [{ kind: 'text', text: 'Done.' }] },
+  { role: 'user', seq: 14, blocks: [{ kind: 'text', text: 'Second question: ship it?' }] },
+  { role: 'assistant', seq: 15, blocks: [{ kind: 'text', text: 'Shipped.' }] },
+]
+
 /** Fork-inherited history: the log OPENS on an assistant row with no user
  * anchor in front of it (turn 0), then one anchored turn follows. */
 function forkEvents() {
@@ -133,30 +288,35 @@ const GAPPY_ALL = [
   { role: 'assistant', seq: 9, blocks: [{ kind: 'text', text: 'Two files, no changes.' }] },
 ]
 
-/** Fake sessionQuery: observeSession serves an exact cut per session id and
- * hands out caller-owned leases whose disposals are counted, so the tests can
- * prove the route releases what it acquires. */
+/** A log whose ITERATION explodes: the fake service returns it fine, but the
+ * route's fold loop (for..of) throws — the exact window between a successful
+ * readSession and serialization the catch block must cover with a 500. */
+function explosiveEvents() {
+  const events = [
+    ev(2, 'user/message', { id: 'u-1', role: 'user', content: [{ type: 'text', text: 'never serialized' }], source: { kind: 'user', rpcId: 'r1' } }, 'append'),
+  ]
+  events[Symbol.iterator] = () => { throw new Error('fold stage exploded') }
+  return events
+}
+
+/** Fake sessionQuery: readSession serves one detached SessionLogSnapshot per
+ * session id — the snapshot shape is plain cloned data with no dispose/
+ * retain (the real SessionLogSnapshot declares none, unlike
+ * SessionObservation's lease), so there is nothing to release and the old
+ * lease-accounting test is gone with it. Reads are recorded in order so the
+ * tests can still prove routing went through readSession. */
 function makeSessionQuery(sessions) {
-  const state = { observed: [], leases: 0, disposed: 0 }
+  const state = { read: [] }
   const query = {
-    async observeSession(id) {
-      state.observed.push(id)
+    async readSession(id) {
+      state.read.push(id)
       const session = sessions[id]
       if (session === undefined) {
         const error = new Error(`session "${id}" not found`)
         error.code = 'SESSION_QUERY_SESSION_NOT_FOUND'
         throw error
       }
-      state.leases += 1
-      return {
-        source: 'live',
-        header: session.header,
-        inheritedEventCount: 0,
-        events: session.events,
-        cursor: session.events.at(-1)?.seq ?? -1,
-        retain() { throw new Error('retain is not part of this route') },
-        [Symbol.dispose]() { state.leases -= 1; state.disposed += 1 },
-      }
+      return { session: session.session, inheritedEventCount: 0, events: session.events }
     },
   }
   return { query, state }
@@ -168,10 +328,13 @@ before(async () => {
   share = await import(SHARE_URL)
   index = await import(INDEX_URL)
   const { query, state } = makeSessionQuery({
-    'sess-live': { header: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
-    'sess-empty': { header: { version: 3, id: 'sess-empty', createdAt: CREATED_AT, isSeeded: false }, events: [] },
-    'sess-fork': { header: { version: 3, id: 'sess-fork', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: forkEvents() },
-    'sess-gappy': { header: { version: 3, id: 'sess-gappy', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: gappyEvents() },
+    'sess-live': { session: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
+    'sess-empty': { session: { version: 3, id: 'sess-empty', createdAt: CREATED_AT, isSeeded: false }, events: [] },
+    'sess-steer': { session: { version: 3, id: 'sess-steer', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: steeringEvents() },
+    'sess-replace': { session: { version: 3, id: 'sess-replace', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: replaceEvents() },
+    'sess-fork': { session: { version: 3, id: 'sess-fork', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: forkEvents() },
+    'sess-gappy': { session: { version: 3, id: 'sess-gappy', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: gappyEvents() },
+    'sess-boom': { session: { version: 3, id: 'sess-boom', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: explosiveEvents() },
   })
   queryState = state
   warned = 0
@@ -236,6 +399,84 @@ test('turns=500 is the valid upper bound; past the count means all', async () =>
   assert.deepEqual(body.turns, EXPECTED_TURNS)
 })
 
+test('a steering interjection stays inside its turn and still serializes', async () => {
+  const all = await get('?session=sess-steer&range=all')
+  assert.equal(all.status, 200)
+  assert.deepEqual(all.body.turns, STEERING_ALL)
+
+  // THE fix this route exists for: turn 1 is [u-1 a-1 s-1 a-2] — the steering
+  // row stays but must not split it. turns=1 therefore returns ONLY the last
+  // question's turn; under the old every-user-is-an-anchor rule this body
+  // started at seq 12 (the steering row) instead.
+  const last1 = await get('?session=sess-steer&range=last&turns=1')
+  assert.equal(last1.status, 200)
+  assert.deepEqual(last1.body.turns, STEERING_ALL.slice(4))
+  // turns=2 spans both true questions and keeps the steering row inside
+  // turn 1 — two turns total, not the three the old anchor rule counted.
+  const last2 = await get('?session=sess-steer&range=last&turns=2')
+  assert.deepEqual(last2.body.turns, STEERING_ALL)
+})
+
+test('a pure insert splice claims nothing and a cancel never claims', async () => {
+  const { body } = await get('?session=sess-steer&range=all')
+  const transcript = JSON.stringify(body.turns)
+  // s-2 was queued by a PURE INSERT (seq 9) then canceled (seq 10): it never
+  // logged a user/message, and neither the insert nor the cancel may leave a
+  // claim behind — the claim at seq 11 replaced the set with {s-1} alone, so
+  // u-2 (seq 14) still opens turn 2 (asserted by the turns=1 slice above).
+  assert.ok(!transcript.includes('never mind, canceled while queued.'))
+  // p-1 WAS claimed (seq 3) and logged (seq 4), but as an injected context:
+  // claimed ≠ transcript material, and its id in the claim set must not leak
+  // onto the human question that follows.
+  assert.ok(!transcript.includes('Verifier tools are available'))
+})
+
+test('a cancel+insert splice replaces pending in place, unclaims the inserted, and claims nothing', async () => {
+  // THE review 07+08 case: removedCount>0 + outcome 'canceled' + non-empty
+  // inserted must fold exactly as cancel and insert separately. Turn shape is
+  // the whole pin (see replaceEvents for which wrong implementation shifts
+  // which row): turn 1 = the question + answer + the still-claimed q-0;
+  // turn 2 = the re-inserted q-1 (a true question now) + the two
+  // position-claimed steering rows + the answer; turn 3 = the closer.
+  const all = await get('?session=sess-replace&range=all')
+  assert.equal(all.status, 200)
+  assert.deepEqual(all.body.turns, REPLACE_ALL)
+
+  // claimed 减 inserted made q-1 an anchor, so turns=1 is exactly the final
+  // question's turn — under a fold that kept q-1 claimed, turn 2 would not
+  // exist and this slice would start at seq 8 (q-1 folded into turn 1 as
+  // steering).
+  const last1 = await get('?session=sess-replace&range=last&turns=1')
+  assert.deepEqual(last1.body.turns, REPLACE_ALL.slice(7))
+  // 原位替换 + 不认领: turns=2 spans the q-1 turn with BOTH seq-10-claimed
+  // steering rows inside it (q-3 included); an appended insert would have
+  // left q-3 unclaimed, anchoring a fourth turn and pushing it out of this
+  // slice — and a splice-turned-claim would have folded q-0 into an anchor,
+  // adding a turn in front.
+  const last2 = await get('?session=sess-replace&range=last&turns=2')
+  assert.deepEqual(last2.body.turns, REPLACE_ALL.slice(3))
+  // 不认领, the sharp edge: the pre-existing {q-0} claim must SURVIVE the
+  // cancel+insert, so turn 1 keeps THREE rows and turns=3 is the whole
+  // transcript. Under a fold where the splice itself claimed (set replaced
+  // with {q-2}), q-0 would have anchored its own turn, turn 1 would shrink
+  // to [u-1, a-1], and this slice would drop those two rows — the turns=1/2
+  // slices alone cannot see that (a later splice re-claims the same ids), so
+  // this boundary is pinned explicitly.
+  const last3 = await get('?session=sess-replace&range=last&turns=3')
+  assert.deepEqual(last3.body.turns, REPLACE_ALL)
+})
+
+test('a compaction checkpoint replacement never enters the transcript', async () => {
+  const { body } = await get('?session=sess-live&range=all')
+  // The checkpoint at seq 12 is an isReplacementSurfaceEvent user/message
+  // with source plugin 'compact' — model-only by the append-origin rule (the
+  // Chat view's messageDefinition excludes it the same way), while the range
+  // it shadowed (seq 2) stays exported.
+  const transcript = JSON.stringify(body.turns)
+  assert.ok(!transcript.includes('COMPACTED SUMMARY'))
+  assert.ok(transcript.includes('What is 2+2?'))
+})
+
 test('leading assistant rows with no user anchor form turn 0', async () => {
   const last1 = await get('?session=sess-fork&range=last&turns=1')
   assert.equal(last1.status, 200)
@@ -294,23 +535,40 @@ test('only GET is allowed', async () => {
   assert.equal((await response.json()).error.code, 'method-not-allowed')
 })
 
-test('every acquired observation lease is disposed', async () => {
-  // Eleven 200s so far (live ×4, empty, fork ×3, gappy ×3) → eleven leases
-  // taken and released; the 16 validation 400s short-circuit before
-  // observeSession and the 404 throws before any lease exists.
-  assert.equal(queryState.disposed, 11)
-  assert.equal(queryState.leases, 0)
-  assert.deepEqual(queryState.observed, [
+test('every export reads the log through readSession exactly once', async () => {
+  // Twenty-one reads so far: twenty 200s (live ×5, empty, steer ×4,
+  // replace ×4, fork ×3, gappy ×3) plus the 404 (the fake records the id,
+  // then throws); the 16 validation 400s short-circuit before readSession.
+  assert.deepEqual(queryState.read, [
     'sess-live', 'sess-live', 'sess-empty', 'sess-gone',
     'sess-live', 'sess-live',
+    'sess-steer', 'sess-steer', 'sess-steer', 'sess-steer',
+    'sess-replace', 'sess-replace', 'sess-replace', 'sess-replace',
+    'sess-live',
     'sess-fork', 'sess-fork', 'sess-fork',
     'sess-gappy', 'sess-gappy', 'sess-gappy',
   ])
 })
 
 test('rejections are logged once each, the method guard is not', async () => {
-  // 1×404 + 16×400 reached the try block and logged; the 405 answers before it.
+  // 1×404 + 16×400 reached the try block and logged; the 405 answers before
+  // it and the 200s (replace's included) never log.
   assert.equal(warned, 17)
+})
+
+test('a fold-stage throw after a successful readSession is a clean 500', async () => {
+  const warnedBefore = warned
+  const { status, body } = await get('?session=sess-boom&range=all')
+  // The failure is server-side (not the client's query, not a missing
+  // session), so the generic 500/export-failed envelope answers; the snapshot
+  // is detached data with no lease, so there is nothing to release — the
+  // guard under test is that the catch still owns the response end to end.
+  assert.equal(status, 500)
+  assert.equal(body.ok, false)
+  assert.equal(body.error.code, 'export-failed')
+  assert.match(body.error.message, /fold stage exploded/)
+  assert.equal(queryState.read[queryState.read.length - 1], 'sess-boom')
+  assert.equal(warned, warnedBefore + 1, 'the failure was logged')
 })
 
 /** Fake Cordis context for apply(): inject runs its callback only when every

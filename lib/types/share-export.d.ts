@@ -9,16 +9,18 @@
  * `sessionQuery` service (standard dsh-base composition), which no browser
  * half can reach.
  *
- * Why append-origin folding instead of the model-visible surface: the surface
+ * Why the RAW log (`readSession`) and not the observed surface: the surface
  * deliberately shadows replaced ranges, so once a replacement lands it shows
  * LESS than the user already saw — wrong source for a human transcript (the
- * official trap note on `isAppendSurfaceEvent`). The fold below keeps every
- * append-origin message in log order and never applies the shadows, so a
- * steered or compacted session still exports everything the user saw.
+ * official trap note on `isAppendSurfaceEvent`: append-origin events are the
+ * transcript's durable source material). The raw log additionally carries the
+ * `agent/inbox/spliced` bookkeeping the steering classification below folds —
+ * it never exists on the surface. The fold keeps every append-origin message
+ * in log order and never applies the shadows, so a steered or compacted
+ * session still exports everything the user saw.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
-import type { SessionEvent } from '@deepseek-ai/dsh-session';
 /** Exact route the browser GETs a session's share transcript from. */
 export declare const SHARE_EXPORT_ROUTE = "/_dsh/mobile-nav/share-export";
 /** Upper bound on `turns` for `range=last` (PLAN §4). 500 exchanges is
@@ -50,13 +52,6 @@ export interface ShareExportBody {
      * budget is the only truncation that exists. */
     truncated: false;
 }
-/**
- * The `range=all` body: {@link foldRows} minus the rows with no exportable
- * blocks — an empty bubble is not worth shipping.
- * @param events - complete log, contiguous ascending seq.
- * @returns the transcript rows in conversation order.
- */
-export declare function foldShareTurns(events: readonly SessionEvent[]): ShareTurn[];
 /**
  * Handle one `GET {@link SHARE_EXPORT_ROUTE}?session=<id>&range=all|last&turns=N`
  * request.
