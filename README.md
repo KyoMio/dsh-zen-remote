@@ -268,6 +268,7 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 - Reasoning and tool calls within one turn fold into a single "process · N steps" row by default
 - Gestures: swipe right from the left edge to go back, swipe down to dismiss a bottom sheet. Android's system back gesture is taken over as "close the overlay → back to the list → leave the app", instead of quitting the PWA on the first press
 - Local attachment upload from the phone: files land in the session's working directory under `.dsh-uploads/` and an `@` reference is appended to the composer — sending it is still your call
+- Share image export from the session info card: the whole conversation or the last 3/5/10 turns (counted by real prompts) as ONE long PNG — slices are only an internal render budget and are streamed-stitched into a single file, past the length cap the tail is kept and the omission marked, wide code lines and tables are never cropped sideways, assistant prose renders as a markdown subset, and the file goes through the system share panel with multi-file download as the legacy-browser fallback
 - A pairing code buys a long-lived device token; identity follows the token, not the IP, and can be revoked at any time
 - The admin surface (generate a code / manage devices / trigger a push) only accepts direct local connections; anything through the proxy gets a 403
 - A real PWA: manifest plus service worker, installable to the home screen, opens offline
