@@ -13,6 +13,11 @@
 //         nav.crumbs             breadcrumb chain, last segment = the title
 //         div.headerActions      [data-slot="conversation.session.header.actions"]
 //       div.headerUtilities    [data-slot="conversation.session.header.utilities"]
+//       div.headerCorner       [data-conversation-header-corner]
+//                               [data-slot="conversation.session.header.corner"]
+//                               (DSH 0.1.5: the right sidebar's ExpandButton —
+//                               hidden below, our workbench button routes to
+//                               its controls instead)
 //     div.tabs[role="tablist"]  Chat/Trajectory, only when there is >1 view
 
 export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768px) ---------- */
@@ -278,6 +283,31 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      third-party header action is hidden by default too. */
   [data-phase] header [data-slot="conversation.session.header.actions"] > *,
   [data-phase] header [data-slot="conversation.session.header.utilities"] > * {
+    display: none !important;
+  }
+  /* DSH 0.1.5's third titleRow child: the right sidebar's ExpandButton
+     (dsh-client-ui-sidebar-right, slot conversation.session.header.corner
+     inside div.headerCorner). Left alone it auto-placed into an implicit
+     4th grid column at the screen's top-right corner — a second panel-left
+     icon next to our Workbench button, reading as "the hidden official
+     sidebar toggle is back" (reported 2026-09-11). The button itself is the
+     one our workbench control forwards to when better-sidebar is absent
+     (MobileSessionHeader's toggleSidebarTarget), and a display:none button
+     still receives synthetic .click() (the tablist precedent), so hiding it
+     costs nothing.
+     Anchors, in the specificity order they NEED (measured live, 2026-09-11):
+     the corner div must be beaten with (0,3,1) — the utilities un-hide rule
+     above spells header > :first-child > :last-child at exactly that
+     weight, and with 0.1.5's third titleRow child the corner IS that
+     :last-child now, so its flex !important outranks any lighter hide (a
+     single-attribute hide loses at (0,2,1) — both spellings were tried
+     live). Chaining BOTH of the corner's own anchors on one selector — the
+     host's data-conversation-header-corner contract attribute AND the
+     class suffix — reaches the tie, and the later source order here wins
+     it. The slot wrapper rule below needs no help: nothing !important
+     fights it, so its (0,2,1) settles the button. */
+  [data-phase] header [data-conversation-header-corner][class$="_headerCorner"],
+  [data-phase] header [data-slot="conversation.session.header.corner"] {
     display: none !important;
   }
   /* Native background-task / subagent entries (rewritten for DSH 0.1.1,

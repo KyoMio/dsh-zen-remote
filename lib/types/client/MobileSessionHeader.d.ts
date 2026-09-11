@@ -45,14 +45,13 @@ export declare function MobileHeaderActions({ sessionId, useSessions, t }: Mobil
 export type MobileHeaderUtilitiesProps = PropsRuntime<'conversation.session.header.utilities'> & PropsLocale<typeof NS>;
 /**
  * Session header, right lane: the session-info entry (S4 owns the actual
- * sheet — this fires a hook event for it to pick up) and the workbench
- * entry, which triggers dsh-better-sidebar's own toggle. There is no public
- * API for "open the panel" (BetterSidebarService.openTab only auto-expands
- * for a content open, not a bare type-only open), so this clicks the
- * plugin's real toggle button through a stable, non-hashed anchor: its root
- * mount marker `[data-dsh-better-sidebar]` plus the `_toggleButton` class
- * suffix (verified live: 2026-08-17). Safe no-op when the plugin, or any
- * other workbench-style plugin sharing that convention, is not installed.
+ * sheet — this fires a hook event for it to pick up) and the sidebar entry.
+ * The sidebar button routes per {@link SidebarTarget}: better-sidebar's own
+ * toggle (no public "open the panel" API — BetterSidebarService.openTab only
+ * auto-expands for a content open, not a bare type-only open, so it clicks
+ * the plugin's real toggle through its root marker `[data-dsh-better-
+ * sidebar]` plus the `_toggleButton` class suffix, verified live 2026-08-17),
+ * the official right sidebar's controls, or nothing when neither exists.
  */
 export declare function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps): import("react").JSX.Element;
 //# sourceMappingURL=MobileSessionHeader.d.ts.map

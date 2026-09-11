@@ -10,6 +10,7 @@ import {
   releaseThumbnailsExcept,
   thumbnailFor,
 } from './attach-upload.ts'
+import { useOwnAttachUi } from './host-attach.ts'
 
 /** Full props for the attachment preview row. */
 export type MobileAttachChipsProps =
@@ -44,12 +45,18 @@ export type MobileAttachChipsProps =
  */
 export function MobileAttachChips({ t, useInput, inputActions }: MobileAttachChipsProps) {
   const draft = useInput((state) => state.draft)
-  const attachments = mentionsIn(draft)
+  const ownUi = useOwnAttachUi()
 
   useEffect(() => {
     releaseThumbnailsExcept(mentionsIn(draft))
   }, [draft])
 
+  // Same gate as MobileAttachButton (host-attach.ts): where the host ships
+  // its own attachment flow, our chips row stands down too — the official
+  // rail owns the preview seat. The effect above still runs, so object URLs
+  // from OUR flow get revoked even after the switch.
+  if (!ownUi) return null
+  const attachments = mentionsIn(draft)
   if (attachments.length === 0) return null
 
   return (
