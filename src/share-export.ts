@@ -9,19 +9,22 @@
  * `sessionQuery` service (standard dsh-base composition), which no browser
  * half can reach.
  *
- * Why append-origin folding instead of the model-visible surface: the surface
+ * Why the RAW log (`readSession`) and not the observed surface: the surface
  * deliberately shadows replaced ranges, so once a replacement lands it shows
  * LESS than the user already saw — wrong source for a human transcript (the
- * official trap note on `isAppendSurfaceEvent`). The fold below keeps every
- * append-origin message in log order and never applies the shadows, so a
- * steered or compacted session still exports everything the user saw.
+ * official trap note on `isAppendSurfaceEvent`: append-origin events are the
+ * transcript's durable source material). The raw log additionally carries the
+ * `agent/inbox/spliced` bookkeeping the steering classification below folds —
+ * it never exists on the surface. The fold keeps every append-origin message
+ * in log order and never applies the shadows, so a steered or compacted
+ * session still exports everything the user saw.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 // Type-only: pulls in the `Context.sessionQuery` augmentation. The service
 // itself is provided by the composition; this plugin never imports its code.
-import type { SessionObservation } from '@deepseek-ai/dsh-session-query'
+import type { SessionLogSnapshot } from '@deepseek-ai/dsh-session-query'
 import type {} from '@deepseek-ai/dsh-session-query'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 // The two pure projection helpers are the canonical per-node rules from the
@@ -49,6 +52,17 @@ export interface ShareTurn {
   role: 'user' | 'assistant'
   seq: number
   blocks: ShareBlock[]
+}
+
+/**
+ * Internal fold row: a {@link ShareTurn} plus the turn-anchor verdict. Only
+ * rows the inbox machine classifies as a TRUE question anchor — not steering
+ * — open a new turn; the flag never reaches a response body (the serializers
+ * below strip it), so the wire contract stays exactly `ShareTurn`.
+ */
+interface FoldedRow extends ShareTurn {
+  /** True when this row opens a turn: a user row not claimed as steering. */
+  anchor: boolean
 }
 
 /** Response body of a successful export (PLAN §4 contract). */
@@ -159,21 +173,116 @@ function isSessionNotFound(error: unknown): boolean {
 }
 
 /**
- * Fold one session's complete event log into transcript rows, in log order.
+ * Data of one `agent/inbox/spliced` event, as the AgentLoop's durable Inbox
+ * writes it (dsh-agent-loop `ReactLoopInbox.mutate`, closure 0.1.5-rc.2):
+ * `{ target, start, removedCount?, inserted: Message[], outcome? }` —
+ * `removedCount` is omitted for pure inserts, and `outcome: 'canceled'` marks
+ * every public-API removal (cancel/remove/replace); only an entered CLAIM
+ * (the boundary consuming the pending batch) removes without an outcome.
+ *
+ * The plugin's pinned dsh-session 0.1.2-rc.1 predates this event type, so the
+ * SessionEvent union cannot narrow it — the guard below widens the same
+ * runtime object. Shape is guaranteed upstream: `readSession` replay-validates
+ * the log and the standard inbox projection rejects an invalid splice history.
+ */
+interface InboxSpliceData {
+  target: string
+  start: number
+  removedCount?: number
+  inserted: readonly { id: string | number }[]
+  outcome?: string
+}
+
+/** `agent/inbox/spliced` for the NEXT-STEP inbox, or null for anything else
+ * (including next-turn splices: the Chat classifier reads only the next-step
+ * node, and turn claiming is none of this fold's business). */
+function nextStepSpliceOf(event: SessionEvent): InboxSpliceData | null {
+  // The double cast widens deliberately: the 0.1.2-rc.1 union cannot even
+  // NAME the newer event type, so a same-type cast would keep narrowing the
+  // literal and reject the comparison outright.
+  const widened = event as unknown as { type: string; data: InboxSpliceData }
+  return widened.type === 'agent/inbox/spliced' && widened.data.target === 'next-step'
+    ? widened.data
+    : null
+}
+
+/** State of the next-step Inbox fold — the machine the host Chat view uses to
+ * tell a true question from a steering interjection. */
+interface NextStepInboxState {
+  /** Pending next-step message ids in inbox order. */
+  pending: string[]
+  /** Ids claimed by the most recent entered claim: the user/message events
+   * logging these ids are steering (mid-turn interjections, e.g. an
+   * authorization reply), not new turns. */
+  currentClaimed: ReadonlySet<string>
+}
+
+const NO_CLAIM: ReadonlySet<string> = new Set()
+
+/**
+ * Apply one next-step splice, replicated from the host Chat client's
+ * conversation-node fold (`nextStepInboxDefinition` → `applySplice` /
+ * `materializePending` / `withoutInserted` in dsh-client-ui-chat lib/client.js,
+ * closure @deepseek-ai/dsh-client-ui-chat 0.1.5-rc.2 — re-pin and re-verify
+ * that block when the harness version moves):
+ *
+ * - a REMOVING splice with no `canceled` outcome is an entered claim: the
+ *   pending list loses the removed ids (an insert/cancel chain is materialized
+ *   first, since the host keeps pending lazily) and `currentClaimed` is
+ *   REPLACED by exactly the removed ids — the comment there: "An entered claim
+ *   logs its complete message batch before another claim; a rejected claim
+ *   logs no messages, so only the current claim can classify a later
+ *   `user/message`";
+ * - a pure insert or a cancel (including a cancel that also inserts — the
+ *   in-place replace path) leaves the claim verdict alone except that any
+ *   INSERTED id leaves the claimed set: a message back in the inbox is pending
+ *   again, not steering.
+ *
+ * Deviations from the closure source, none observable in the fold result: the
+ * pending list is an eager array (the host's lazy splice chain only defers the
+ * same materialization), and ids are `String()`-normalized on BOTH sides (the
+ * host stores raw inserted ids and String()-coerces only the lookup key —
+ * identical while message ids are strings, which `MessageId` brands them to
+ * be).
+ */
+function applyNextStepSplice(previous: NextStepInboxState, splice: InboxSpliceData): NextStepInboxState {
+  const insertedIds = splice.inserted.map((identity) => String(identity.id))
+  const removedCount = splice.removedCount ?? 0
+  const pending = previous.pending.slice()
+  const removedIds = pending.splice(splice.start, removedCount, ...insertedIds).map(String)
+  if (removedCount > 0 && splice.outcome !== 'canceled') {
+    return { pending, currentClaimed: new Set(removedIds) }
+  }
+  const currentClaimed = new Set(previous.currentClaimed)
+  for (const id of insertedIds) currentClaimed.delete(id)
+  return { pending, currentClaimed }
+}
+
+/**
+ * Fold one session's complete raw event log into transcript rows, in log order.
  *
  * Row admission, in the order the filters run:
+ * - `agent/inbox/spliced` (next-step) events are not rows at all: they only
+ *   advance the Inbox state that classifies the user rows below;
  * - append-origin surface events only (`isAppendSurfaceEvent`): a replacement
- *   copy is model-only and must not add itself to the transcript, while the
- *   ranges it shadowed stay in place — that is what makes this a human
- *   transcript rather than the model surface;
+ *   copy is model-only and must not add itself to the transcript — this also
+ *   keeps a compaction checkpoint (`isReplacementSurfaceEvent` user/message
+ *   with `source.plugin === 'compact'`) out, exactly as the Chat view's
+ *   `messageDefinition` excludes it — while the ranges a replacement shadowed
+ *   stay in place; that is what makes this a human transcript rather than the
+ *   model surface;
  * - `deriveEventMessage` drops events that produce no message, which covers
  *   turn/step boundaries AND the usage-only empty assistant message;
  * - system never renders in a shared conversation;
  * - user rows must be human-authored (`source.kind === 'user'`): injected
  *   contexts (file notices, skill content, …) are also user-role messages,
  *   and the Chat view renders them as context rows, not conversation — a
- *   share card shows the words people exchanged, not the machinery. Steering
- *   messages ARE human-authored and stay;
+ *   share card shows the words people exchanged, not the machinery;
+ * - a human user row then gets its turn verdict from the Inbox state: claimed
+ *   (`currentClaimed.has(id)`, `String()`-normalized like the host) means
+ *   STEERING — it stays in the transcript and in its turn as an ordinary
+ *   user bubble, but never anchors a new one; unclaimed means a true question
+ *   that opens the next turn;
  * - blocks: text passes verbatim, image becomes a `{kind:'image'}` placeholder
  *   (attachments live on the host disk and stay out of v1), everything else —
  *   reasoning (folded on the phone anyway), tool-call/tool-result, file, and
@@ -182,12 +291,18 @@ function isSessionNotFound(error: unknown): boolean {
  *   (a file-only human message, a tool-call-only assistant step) is KEPT
  *   here with `blocks: []`: the turn grouping below needs the conversation's
  *   true anchor shape, and only the serializers drop the empties.
- * @param events - complete log, contiguous ascending seq.
+ * @param events - complete raw log, contiguous ascending seq.
  * @returns the admitted rows in conversation order, empty ones included.
  */
-function foldRows(events: readonly SessionEvent[]): ShareTurn[] {
-  const turns: ShareTurn[] = []
+function foldRows(events: readonly SessionEvent[]): FoldedRow[] {
+  const rows: FoldedRow[] = []
+  let inbox: NextStepInboxState = { pending: [], currentClaimed: NO_CLAIM }
   for (const event of events) {
+    const splice = nextStepSpliceOf(event)
+    if (splice !== null) {
+      inbox = applyNextStepSplice(inbox, splice)
+      continue
+    }
     if (!isAppendSurfaceEvent(event)) continue
     const msg = deriveEventMessage(event)
     if (msg === null) continue
@@ -198,35 +313,43 @@ function foldRows(events: readonly SessionEvent[]): ShareTurn[] {
       if (block.type === 'text') blocks.push({ kind: 'text', text: block.text })
       else if (block.type === 'image') blocks.push({ kind: 'image' })
     }
-    turns.push({ role: msg.role, seq: event.seq, blocks })
+    rows.push({
+      role: msg.role,
+      seq: event.seq,
+      blocks,
+      // Assistant rows are never anchors; a user row anchors unless the Inbox
+      // state claims its id as steering.
+      anchor: msg.role === 'user' && !inbox.currentClaimed.has(String(msg.id)),
+    })
   }
-  return turns
+  return rows
 }
 
 /**
- * The `range=all` body: {@link foldRows} minus the rows with no exportable
- * blocks — an empty bubble is not worth shipping.
- * @param events - complete log, contiguous ascending seq.
- * @returns the transcript rows in conversation order.
+ * Rows with at least one exportable block — an empty bubble is not worth
+ * shipping, so every serializer (the all-body and the last-N tail) drops
+ * them and strips the internal anchor flag through this one helper, leaving
+ * the plain `ShareTurn` wire shape.
  */
-export function foldShareTurns(events: readonly SessionEvent[]): ShareTurn[] {
-  return foldRows(events).filter((row) => row.blocks.length > 0)
+function serializeRows(rows: readonly FoldedRow[]): ShareTurn[] {
+  return rows.flatMap(({ anchor: _anchor, ...turn }) => (turn.blocks.length > 0 ? [turn] : []))
 }
 
 /**
- * Group folded rows into conversation turns (PLAN §4): one turn is a user
- * anchor — every user row the fold admits is human-authored by its source
- * filter — plus the assistant rows up to the next anchor. Assistant rows
- * before the FIRST anchor form turn 0: a fork inherits history that begins
+ * Group folded rows into conversation turns (PLAN §4.5): one turn is a true
+ * question — a user row the Inbox state left unclaimed — plus everything up
+ * to the next question. A steering row never opens a turn: it belongs to the
+ * turn it interrupted, exactly where the user saw it. Assistant rows before
+ * the FIRST question form turn 0: a fork inherits history that begins
  * mid-conversation, and those rows belong to no anchor yet.
  */
-function groupRowsIntoTurns(rows: readonly ShareTurn[]): ShareTurn[][] {
-  const groups: ShareTurn[][] = []
-  let current: ShareTurn[] = []
+function groupRowsIntoTurns(rows: readonly FoldedRow[]): FoldedRow[][] {
+  const groups: FoldedRow[][] = []
+  let current: FoldedRow[] = []
   for (const row of rows) {
     // An empty `current` on an anchor means the log OPENED on this anchor:
     // nothing was inherited, so turn 0 simply does not exist here.
-    if (row.role === 'user' && current.length > 0) {
+    if (row.anchor && current.length > 0) {
       groups.push(current)
       current = []
     }
@@ -238,16 +361,17 @@ function groupRowsIntoTurns(rows: readonly ShareTurn[]): ShareTurn[][] {
 
 /**
  * The `range=last&turns=N` body: the transcript of the last N turns that
- * fold to at least one block. Walked from the end so a turn whose every row
- * went empty (a file-only message answered by tool-call-only steps — the
- * exchange happened, but a share card has nothing to show) is skipped
- * WITHOUT eating one of the N slots; rows that went empty INSIDE a kept
- * turn still never serialize. Only the selected tail is returned — the cut
- * head never reaches the response body.
+ * fold to at least one block, counted in the true-question sense above.
+ * Walked from the end so a turn whose every row went empty (a file-only
+ * message answered by tool-call-only steps — the exchange happened, but a
+ * share card has nothing to show) is skipped WITHOUT eating one of the N
+ * slots; rows that went empty INSIDE a kept turn still never serialize.
+ * Only the selected tail is returned — the cut head never reaches the
+ * response body.
  */
-function sliceLastTurns(rows: readonly ShareTurn[], count: number): ShareTurn[] {
+function sliceLastTurns(rows: readonly FoldedRow[], count: number): ShareTurn[] {
   const groups = groupRowsIntoTurns(rows)
-  const selected: ShareTurn[] = []
+  const selected: FoldedRow[] = []
   let remaining = count
   for (let i = groups.length - 1; i >= 0 && remaining > 0; i -= 1) {
     const group = groups[i]
@@ -255,7 +379,7 @@ function sliceLastTurns(rows: readonly ShareTurn[], count: number): ShareTurn[] 
     selected.unshift(...group)
     remaining -= 1
   }
-  return selected.filter((row) => row.blocks.length > 0)
+  return serializeRows(selected)
 }
 
 /**
@@ -274,23 +398,27 @@ export async function handleShareExport(ctx: Context, req: IncomingMessage, res:
     responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
     return
   }
-  let observation: SessionObservation | undefined
   try {
     const url = new URL(req.url ?? SHARE_EXPORT_ROUTE, 'http://dsh.internal')
     const sessionId = singleQuery(url, 'session')
     const range = parseRange(url)
     if (range.kind === 'all') rejectStrayTurns(url)
-    // Caller-owned observation lease (see SessionObservation): the cut is
-    // pinned for this read and released in the finally below, so a burst of
-    // share requests cannot pin every prepared cache entry.
-    observation = await ctx.sessionQuery.observeSession(sessionId as SessionId)
+    // readSession (not observeSession): the fold needs the COMPLETE raw log in
+    // log order — the surface observation is model-ordered, shadows replaced
+    // ranges, and never carries `agent/inbox/spliced`. The returned
+    // SessionLogSnapshot is detached and fully cloned: unlike
+    // SessionObservation it declares no dispose/retain (checked against
+    // @deepseek-ai/dsh-session-query 0.1.2-rc.1 types), so there is no lease
+    // to release — its replay validation is what guarantees the contiguous
+    // ascending events the fold and the Inbox machine rely on.
+    const snapshot: SessionLogSnapshot = await ctx.sessionQuery.readSession(sessionId as SessionId)
     // One fold of the whole log (the last N turns cannot be found from the
     // tail alone); the range decides which slice of it is serialized.
-    const rows = foldRows(observation.events)
+    const rows = foldRows(snapshot.events)
     const body: ShareExportBody = {
       ok: true,
-      createdAt: observation.header.createdAt,
-      turns: range.kind === 'last' ? sliceLastTurns(rows, range.turns) : rows.filter((row) => row.blocks.length > 0),
+      createdAt: snapshot.session.createdAt,
+      turns: range.kind === 'last' ? sliceLastTurns(rows, range.turns) : serializeRows(rows),
       truncated: false,
     }
     responseJson(res, 200, body)
@@ -299,9 +427,5 @@ export async function handleShareExport(ctx: Context, req: IncomingMessage, res:
     const code = error instanceof ShareExportError ? error.code : isSessionNotFound(error) ? 'session-not-found' : 'export-failed'
     ctx.logger.warn('dsh-mobile-nav share-export rejected: %s', message(error))
     responseJson(res, status, { ok: false, error: { code, message: message(error) } })
-  } finally {
-    // The lease is disposed on every exit path that acquired it; a failed
-    // observeSession never returned one.
-    observation?.[Symbol.dispose]()
   }
 }

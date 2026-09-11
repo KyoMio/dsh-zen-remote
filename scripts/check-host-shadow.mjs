@@ -63,6 +63,16 @@ const require = createRequire(import.meta.url)
 //   and touch no class identity, and their signatures are identical on the
 //   0.1.2 and 0.1.5 lines — so a version-skewed copy cannot diverge the fold
 //   the way a service-class mismatch could.
+//   The fact BEHIND that "signatures identical" conclusion, verified against
+//   both closures (2026-09-10): the SURFACE_EVENT_TYPES set differs across
+//   the lines — 0.1.2-rc.1 admits user/message, assistant/message,
+//   tool/result, while 0.1.5-rc.2 also admits system/message (and its
+//   deriveEventMessage projects it to a system-role message). The fold in
+//   src/share-export.ts neutralizes the difference: its role filter keeps
+//   only 'user'/'assistant' rows, so a system/message is dropped on 0.1.5 by
+//   the filter and on 0.1.2 by isAppendSurfaceEvent itself — the exported
+//   transcript is byte-identical either way. A future DSH that adds another
+//   role-bearing surface type must re-run this equivalence, not assume it.
 // - WHEN TO ACT: a future DSH that renames the surface subpath or changes
 //   event shapes will break this import loudly at plugin load; re-pin the
 //   devDep then.
