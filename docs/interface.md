@@ -34,7 +34,9 @@ v1.0.0（fork 自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-
 
 ### 会话页头部五件套
 
-会话页头部只留五样东西：返回 · 会话名（+ 运行状态点）· 当前视图名（对话/轨迹，带双点指示）· 信息卡入口 · better-sidebar 入口。官方的 Chat/Trajectory 页签视觉隐藏但 DOM 还在，点信息卡里的分段控件相当于代点它。
+会话页头部只留五样东西：返回 · 会话名（+ 运行状态点）· 当前视图名（对话/轨迹，带双点指示）· 信息卡入口 · 侧栏入口。官方的 Chat/Trajectory 页签视觉隐藏但 DOM 还在，点信息卡里的分段控件相当于代点它。
+
+侧栏入口按「现场有哪个侧栏」三态路由（2026-09-11，DSH 0.1.5 长出官方右侧栏之后定的规矩）：装了 dsh-better-sidebar 就代点它自己的开关（原设计）；没装而宿主有右侧栏（0.1.5+）就代点官方角位的展开钮 / 面板里的收起钮；两者都没有就不渲染。无论哪种，官方角位的 ExpandButton 与 better-sidebar 自己的按钮在手机端都隐藏——头部只有我们这一枚侧栏钮。探测全部锚在稳定 DOM 标记（`[data-dsh-better-sidebar]`、`[data-sidebar-right-panel]` 及两个开合控件的 `data-sidebar-right-*`），不看语言、不看类名散列。
 
 ### composer 重排
 
@@ -81,6 +83,8 @@ PWA，再进来就是冷启动。插件自己的边缘手势也触发不了—�
 
 composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 上会弹相册/拍照/选取文件三选一）——官方那套文件选择器是在跑 DSH 的电脑上弹窗，手机远程用不了。图片和文件一视同仁：都上传到会话工作目录的 `.dsh-uploads/`，composer 上方出现可删除的预览 chip（图片缩略图、文件图标+文件名），并把 `@.dsh-uploads/文件名` 追加到输入框——发不发、什么时候发，由你按官方发送键决定,不会替你自动发出。
 
+**宿主原生附件让位（2026-09-11）**：DSH 0.1.5 起官方工具行自带了一枚回形针（原生附件流，文件落 `~/.dsh/attachments`），手机上于是出现过两枚一样的回形针。现在 `host-attach.ts` 运行时探测官方工具行里自带的 `<input type="file">`（`_tools` 直接子元素、结构性选择器、不依赖语言）：探测命中就整组不加载我们的附件 UI（按钮连隐藏 file input、chips 行都不渲染），输入区只留官方一枚；宿主没有（DSH ≤ 0.1.2）则一切照旧。首轮判定走 layout effect，首帧就不会闪出第二枚。
+
 安全上的几句话：这个功能给插件的 host 半区新增了一条 HTTP 路由（`POST /_dsh/mobile-nav/upload`），只接受同源请求，文件名清洗后只取叶子名，写入路径校验不允许越出工作目录，单文件默认上限 20MB（可在 profile 里的插件行用 `maxUploadBytes` 调整）。远程访问时，这条路由和其它请求一样在 网关半边的配对墙之后。
 
 ### 设置页与用量面板打通
@@ -117,8 +121,25 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 ### 未发布
 
+**新增**
+
+
 **修复**
 
+- 适配 DSH `0.1.5`（0.1.2 → 0.1.5-rc.2 的一批回归，2026-09-11 真机报告、逐项实测）：
+  - 官方工具行新增了原生附件回形针，手机端一度出现两枚——现在运行时探测宿主
+    自带的 `<input type="file">`，命中即整组让位（见「附件上传」一节），不命中
+    照旧加载；
+  - 官方右侧栏的 ExpandButton 落在**新的** `conversation.session.header.corner`
+    槽里，逃过了头部两条 blanket hide，顶到右上角——已隐藏（隐藏它的选择器
+    必须 ≥(0,3,1)：老的 utilities 反隐藏规则在 0.1.5 下恰好命中这个 `:last-child`
+    角位，轻量级 hide 会被它的 `flex !important` 压掉，实测两次才定位），
+    头部侧栏钮改为三态路由（见「会话页头部五件套」）；
+  - composer 从 `<textarea>` 换成 Lexical contenteditable（`[data-composer-input]`），
+    S9 键盘守卫与 S10 的聚焦探针只认 TEXTAREA、全体失明——点官方附件钮的
+    `keepFocus` 强制聚焦会直接弹键盘并把输入框顶上去，开 会话自动聚焦也复发。
+    两个 effect 的识别同步扩到 contenteditable，实测：附件钮的强制聚焦被糊掉、
+    用户直接点输入框的聚焦保留。
 - composer 行里第三方插件的入口(`conversation.input.right`)在手机端整体移进模型弹层,
   与「模型」「推理等级」并列成行——行是不换行的,模型名是唯一能让宽度的东西,
   订阅插件的速度 chip(带文字约 70px)加上识图开关会把它挤没(2026-09-06 用户报)
@@ -135,6 +156,9 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
   0.1.1 里 portal 到 body 自行定位（336px，屏内），旧的锚定/重锚 CSS 一并删除。
   选择器统一改为按 header 定位、按 ARIA（`aria-haspopup="tree"`）区分，不再依赖
   槽名与根节点类名。
+
+**内部**
+
 
 ### 1.1.0
 
@@ -272,8 +296,8 @@ pnpm build   # 产物 lib/ 与源码同步入库,改动源码后重新构建再�
 ## 验证
 
 - `pnpm verify` 类型检查、`pnpm test` 全量测试;`dsh --profile web --dump-config` 应出现插件层;
-- 自检脚本:`node scripts/check-sunk-viewport.mjs`、`node scripts/check-attach-upload.mjs`、`node scripts/check-upload-endpoint.mjs`(需 Node ≥ 23.6);
-- 移动端(390px):启动落会话列表、进出会话页转场、composer 权限/模型 sheet、信息卡统计与四个操作、附件上传;
+- 自检脚本:`node scripts/check-sunk-viewport.mjs`、`node scripts/check-attach-upload.mjs`、`node scripts/check-upload-endpoint.mjs`、`node scripts/check-share-image.mjs`(需 Node ≥ 23.6);
+- 移动端(390px):启动落会话列表、进出会话页转场、composer 权限/模型 sheet、信息卡统计与五个操作(导出/重命名/Fork/归档/分享图)、附件上传;
 - 平板(768px):抽屉 + 限宽居中,与 v1.0.0 一致;
 - 桌面端(≥1024px):与未安装时一致。
 

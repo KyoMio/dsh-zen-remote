@@ -210,11 +210,18 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
       pad = safetyPad(navigator.userAgent, tuning.safetyPadPx)
     })
 
-    const composerTextarea = (node: unknown): boolean =>
-      node instanceof HTMLElement && node.tagName === 'TEXTAREA' && node.closest(COMPOSER) !== null
+    /** The composer's editing host: the `data-composer-input` contenteditable
+     * DSH 0.1.5 binds Lexical to, or the textarea of older hosts (the
+     * attribute sat on that textarea too). Same recognition as S9's guard —
+     * while this checked TEXTAREA only, the whole focus machinery below was
+     * blind to the 0.1.5 contenteditable and the dumb-keyboard estimate
+     * never ran. */
+    const composerField = (node: unknown): boolean =>
+      node instanceof HTMLElement && node.closest(COMPOSER) !== null
+        && (node.hasAttribute('data-composer-input') || node.tagName === 'TEXTAREA')
 
     const sync = (): void => {
-      const focused = composerTextarea(document.activeElement)
+      const focused = composerField(document.activeElement)
       if (!focused) baseline = viewport.height
       const geometric = keyboardLift({
         innerHeight: window.innerHeight,
@@ -256,7 +263,7 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
         sync()
       }
       const el = document.activeElement
-      if (composerTextarea(el) && el instanceof HTMLElement) el.blur()
+      if (composerField(el) && el instanceof HTMLElement) el.blur()
     }
     /** True when a touch outside the composer means "the reader moved on". */
     const outside = (target: EventTarget | null): boolean =>
@@ -276,7 +283,7 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
       if (outside(event.target)) retract()
     }
     const onFocusIn = (event: FocusEvent): void => {
-      if (!composerTextarea(event.target)) return
+      if (!composerField(event.target)) return
       // Focus not born from a touch (hardware keyboard, programmatic) raises
       // no on-screen keyboard — never estimate for it.
       if (Date.now() - lastTouch > 1000) return
@@ -315,7 +322,7 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
         // Keyboard is up (touch focus on a phone) yet the viewport never
         // reacted: the browser cannot see it. Estimate until blur, and
         // remember the verdict so the next focus skips the wait.
-        if (!composerTextarea(document.activeElement)) return
+        if (!composerField(document.activeElement)) return
         localStorage.setItem(DUMB_KEY, '1')
         estimate = estimatedLift(window.innerHeight, tuning)
         sync()
@@ -323,7 +330,7 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
       probeTimer = window.setTimeout(step, PROBE_INTERVAL_MS)
     }
     const onFocusOut = (event: FocusEvent): void => {
-      if (!composerTextarea(event.target)) return
+      if (!composerField(event.target)) return
       stopProbe()
       if (estimate === 0) return
       estimate = 0

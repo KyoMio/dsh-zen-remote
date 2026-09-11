@@ -5,6 +5,7 @@ import { IconPaperclipOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SessionId } from './compat/types.ts'
 import { NS } from './locales.ts'
 import { draftWithMention, rememberThumbnail, uploadUrl } from './attach-upload.ts'
+import { useOwnAttachUi } from './host-attach.ts'
 
 /** Full props for the composer attachment seat. */
 export type MobileAttachButtonProps =
@@ -40,6 +41,13 @@ async function uploadFile(sessionId: SessionId, file: File): Promise<string> {
  * the CLIENT's picker — no `accept` attribute on purpose, so iOS offers the
  * full 相册 / 拍照 / 选取文件 sheet rather than one of them.
  *
+ * DSH 0.1.5 gave the official tool row its own paperclip (the host attachment
+ * flow), which made TWO identical controls on a phone. This button now stands
+ * down entirely while the host ships its own picker (`host-attach.ts` probes
+ * for it) — the official flow uploads into `~/.dsh/attachments` and renders
+ * its own rail, so the composer keeps exactly one attach affordance. On a
+ * host without one (DSH ≤ 0.1.2) everything below loads exactly as before.
+ *
  * Every picked file takes the SAME path: upload to the node half, then append
  * `@.dsh-uploads/name` to the draft through `inputActions.setDraft` (the
  * official write path — no DOM value poking). S7.1 removed the split that used
@@ -55,12 +63,17 @@ export function MobileAttachButton({ t, sessionId, useInput, inputActions }: Mob
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const draft = useInput((state) => state.draft)
+  const ownUi = useOwnAttachUi()
   // Uploads are awaited, so the `draft` captured at pick time goes stale — the
   // user can keep typing while a file is in flight. The ref is refreshed on
   // every render (useInput re-renders us on each draft change), so the loop
   // below can rebase onto whatever the composer holds right now.
   const liveDraft = useRef(draft)
   liveDraft.current = draft
+
+  // The host's own attach button owns this seat now — render nothing (the
+  // hidden picker input goes with it). All hooks stay above this line.
+  if (!ownUi) return null
 
   const pick = async (event: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? [])
