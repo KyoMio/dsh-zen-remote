@@ -220,7 +220,8 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      the items, the two-level model panes and every selection handler stay
      official. */
   ${PERM} [role="menu"],
-  ${MODEL} > [class$="_menu"] {
+  ${MODEL} > [class$="_menu"],
+  body > [id$="-menu"][role="menu"] {
     position: fixed !important;
     left: 0 !important;
     right: 0 !important;
@@ -235,17 +236,25 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 16px 16px 0 0 !important;
     border-bottom: none !important;
     padding: 8px 8px calc(8px + var(--mnav-sab)) !important;
-    z-index: 60 !important;
+    z-index: 1200 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, .18) !important;
   }
   /* 44pt+ rows in both sheets (Menu items, model options, and the model
      sheet's two root cells that drill into the model / effort panes). */
   ${PERM} [role="menu"] [role="menuitem"],
-  ${MODEL} > [class$="_menu"] [class$="_option"],
-  ${MODEL} > [class$="_menu"] [class$="_cell"] {
+  ${MODEL} > [class$="_menu"] [class$="_cell"],
+  body > [id$="-menu"][role="menu"] [class$="_cell"] {
     min-height: 48px !important;
     border-radius: 12px !important;
     font-size: 15px !important;
+  }
+  /* 模型选项：变矮紧凑（38px），完全沿用官方原有排列与对齐 */
+  ${MODEL} > [class$="_menu"] [class$="_option"],
+  body > [id$="-menu"][role="menu"] [class$="_option"] {
+    min-height: 38px !important;
+    height: 38px !important;
+    border-radius: 10px !important;
+    font-size: 14px !important;
   }
   /* --- 4a. third-party composer entries live in the model sheet ---
      effects/model-sheet-extras.ts parks the \`conversation.input.right\`
@@ -375,7 +384,8 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      (ChatView only ever renders the column and, conditionally, this one
      slot), so the adjacent-sibling combinator pins it precisely. */
   body:has(${PERM} [role="menu"]) [data-chat-flow] + div,
-  body:has(${MODEL} > [class$="_menu"]) [data-chat-flow] + div {
+  body:has(${MODEL} > [class$="_menu"]) [data-chat-flow] + div,
+  body:has(> [id$="-menu"][role="menu"]) [data-chat-flow] + div {
     display: none !important;
   }
   /* --- 5. input box: two lines minimum, five lines maximum ---

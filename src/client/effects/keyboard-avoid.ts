@@ -215,10 +215,10 @@ export function installKeyboardAvoid(ctx: ClientContext): void {
      * attribute sat on that textarea too). Same recognition as S9's guard —
      * while this checked TEXTAREA only, the whole focus machinery below was
      * blind to the 0.1.5 contenteditable and the dumb-keyboard estimate
-     * never ran. */
+     * never ran. Also matches descendants within contenteditable. */
     const composerField = (node: unknown): boolean =>
       node instanceof HTMLElement && node.closest(COMPOSER) !== null
-        && (node.hasAttribute('data-composer-input') || node.tagName === 'TEXTAREA')
+        && (node.closest('[data-composer-input]') !== null || node.tagName === 'TEXTAREA')
 
     const sync = (): void => {
       const focused = composerField(document.activeElement)

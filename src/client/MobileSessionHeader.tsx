@@ -300,10 +300,17 @@ const OFFICIAL_PANEL = '[data-sidebar-right-panel]'
 const OFFICIAL_EXPAND = '[data-sidebar-right-expand]'
 const OFFICIAL_COLLAPSE = '[data-sidebar-right-toggle]'
 
-/** Synchronous read of which sidebar backend this host offers. */
+/** Synchronous read of which sidebar backend this host offers.
+ *
+ * In DSH 0.1.5+ (v0.19.0+ of dsh-better-sidebar), the right sidebar is the
+ * host's native right sidebar (`data-sidebar-right-panel`), while older
+ * better-sidebar versions drew their own right panel under `BETTER_ROOT`.
+ * If the official panel exists, prioritize it so the header button controls
+ * the right sidebar panel; otherwise fall back to legacy better-sidebar.
+ */
 function readSidebarTarget(): SidebarTarget {
-  if (document.querySelector(BETTER_ROOT) !== null) return 'better'
   if (document.querySelector(OFFICIAL_PANEL) !== null) return 'official'
+  if (document.querySelector(BETTER_ROOT) !== null) return 'better'
   return null
 }
 

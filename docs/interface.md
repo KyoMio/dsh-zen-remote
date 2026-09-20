@@ -149,12 +149,20 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
     槽里，逃过了头部两条 blanket hide，顶到右上角——已隐藏（隐藏它的选择器
     必须 ≥(0,3,1)：老的 utilities 反隐藏规则在 0.1.5 下恰好命中这个 `:last-child`
     角位，轻量级 hide 会被它的 `flex !important` 压掉，实测两次才定位），
-    头部侧栏钮改为三态路由（见「会话页头部五件套」）；
+    头部侧栏钮改为三态路由（见「会话页头部五件套」）；在新版 DSH 0.1.5+（dsh-better-sidebar v0.19.0+）
+    退役自绘面板改走宿主原生右侧栏时优先唤起原生侧栏，同时完整保留旧版本 better-sidebar 的自绘兼容；
   - composer 从 `<textarea>` 换成 Lexical contenteditable（`[data-composer-input]`），
     S9 键盘守卫与 S10 的聚焦探针只认 TEXTAREA、全体失明——点官方附件钮的
     `keepFocus` 强制聚焦会直接弹键盘并把输入框顶上去，开 会话自动聚焦也复发。
     两个 effect 的识别同步扩到 contenteditable，实测：附件钮的强制聚焦被糊掉、
-    用户直接点输入框的聚焦保留。
+    用户直接点输入框的聚焦保留；
+  - 修复移动端切后台再切回时输入框卡死不可用（无法再点击输入）：Lexical 在富文本
+    内生成段落与 span 文本节点，切回聚焦时事件目标命中这些子元素而非外层容器，
+    导致 `keyboard-guard` 误判为未获交互授权而自动强行 `blur()`。判定函数
+    升级为 `.closest('[data-composer-input]')` 后彻底解决；
+  - 模型下拉菜单弹层（DSH 0.1.5 Portal 到底部）移动端适配：将 body 直属的
+    `[id$="-menu"][role="menu"]` 纳入底部抽屉 sheet，选项紧凑化（38px 高度），
+    并保持官方原生靠左排版，避免选项过高与首屏留白。
 - composer 行里第三方插件的入口(`conversation.input.right`)在手机端整体移进模型弹层,
   与「模型」「推理等级」并列成行——行是不换行的,模型名是唯一能让宽度的东西,
   订阅插件的速度 chip(带文字约 70px)加上识图开关会把它挤没(2026-09-06 用户报)

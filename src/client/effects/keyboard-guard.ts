@@ -49,12 +49,16 @@ export function installKeyboardGuard(ctx: ClientContext): void {
     /** The composer's editing host: the `data-composer-input` contenteditable
      * DSH 0.1.5 binds Lexical to, or the textarea older hosts rendered (the
      * attribute also sat on that textarea — both spellings match both hosts,
-     * belt and braces). */
-    const composerField = (node: unknown): HTMLElement | null =>
-      node instanceof HTMLElement && node.closest(COMPOSER) !== null
-        && (node.hasAttribute('data-composer-input') || node.tagName === 'TEXTAREA')
-        ? node
-        : null
+     * belt and braces). Also matches descendants of the contenteditable, as
+     * mobile browsers frequently report inner text nodes / spans / paragraphs
+     * as the event target or activeElement. */
+    const composerField = (node: unknown): HTMLElement | null => {
+      if (!(node instanceof HTMLElement)) return null
+      if (node.closest(COMPOSER) === null) return null
+      const editable = node.closest<HTMLElement>('[data-composer-input]')
+      if (editable !== null) return editable
+      return node.tagName === 'TEXTAREA' ? node : null
+    }
 
     const onPointerDown = (event: PointerEvent): void => {
       // Only the textarea itself grants the keyboard. A tap on any other
