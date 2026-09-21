@@ -19,6 +19,17 @@ const ROW = '[data-slot="conversation.composer.bar"] [class$="_card"] > [class$=
 const MODEL = `${ROW} > [class$="_trailing"] > [data-slot="conversation.input.model"] > [class$="_root"]`
 /** The permission select's trigger button (structure only — the PermissionSelect hashed classes are never named). */
 const PERM = `${ROW} > [class$="_tools"] > [class$="_modes"]`
+/**
+ * ModelSelect's popup, wherever the host renders it: inline under the pill
+ * (≤ 0.1.2) or portaled to document.body (0.1.5+: `createPortal(..., body)`,
+ * id `${useId()}-menu`, role=menu — measured on 0.1.5-rc.2, the only body-
+ * level menu that carries such an id; the Menu primitive's menus have none).
+ * `:is()` takes the specificity of its heaviest argument, so the body form
+ * inherits the long inline path's weight instead of needing its own.
+ * The one place this cannot be used is the body:has() gate below — a
+ * relative selector inside :has() cannot start at body — which spells both.
+ */
+const MODEL_MENU = `:is(${MODEL} > [class$="_menu"], body > [id$="-menu"][role="menu"])`
 
 export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- */
 
@@ -214,14 +225,14 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
 
   /* --- 4. both menus become bottom sheets ---
      The permission menu is the Menu primitive (role=menu, absolute, side=top)
-     and the model menu is ModelSelect's own \`_menu\` (absolute, bottom+right).
+     and the model menu is ModelSelect's own \`_menu\` (absolute, bottom+right
+     under the pill on ≤ 0.1.2; a body portal on 0.1.5+ — see MODEL_MENU).
      Neither has a transformed ancestor between it and the viewport, so
      position:fixed re-anchors both to the screen edge. Only the shell moves —
      the items, the two-level model panes and every selection handler stay
      official. */
   ${PERM} [role="menu"],
-  ${MODEL} > [class$="_menu"],
-  body > [id$="-menu"][role="menu"] {
+  ${MODEL_MENU} {
     position: fixed !important;
     left: 0 !important;
     right: 0 !important;
@@ -236,25 +247,21 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 16px 16px 0 0 !important;
     border-bottom: none !important;
     padding: 8px 8px calc(8px + var(--mnav-sab)) !important;
-    z-index: 1200 !important;
+    /* 60 for the body-portaled menu too: the host gives it 1100 for desktop
+       stacking, but nothing of ours or the host's sits between 60 and the
+       sheet on a phone (hit-tested at four points on 0.1.5-rc.2, 2026-09-21),
+       and 60 keeps it under the session-info sheet's 70 like the PERM one. */
+    z-index: 60 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, .18) !important;
   }
   /* 44pt+ rows in both sheets (Menu items, model options, and the model
      sheet's two root cells that drill into the model / effort panes). */
   ${PERM} [role="menu"] [role="menuitem"],
-  ${MODEL} > [class$="_menu"] [class$="_cell"],
-  body > [id$="-menu"][role="menu"] [class$="_cell"] {
+  ${MODEL_MENU} [class$="_option"],
+  ${MODEL_MENU} [class$="_cell"] {
     min-height: 48px !important;
     border-radius: 12px !important;
     font-size: 15px !important;
-  }
-  /* 模型选项：变矮紧凑（38px），完全沿用官方原有排列与对齐 */
-  ${MODEL} > [class$="_menu"] [class$="_option"],
-  body > [id$="-menu"][role="menu"] [class$="_option"] {
-    min-height: 38px !important;
-    height: 38px !important;
-    border-radius: 10px !important;
-    font-size: 14px !important;
   }
   /* --- 4a. third-party composer entries live in the model sheet ---
      effects/model-sheet-extras.ts parks the \`conversation.input.right\`
@@ -280,7 +287,7 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   /* Parked in the sheet: a column of full-width rows in the sheet's own
      language, so a relocated control reads as a sibling of 模型 and 推理等级
      rather than a chip that wandered in. */
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] {
+  ${MODEL_MENU} > [data-zen-sheet-extras] {
     display: flex !important;
     flex-direction: column !important;
     gap: 2px !important;
@@ -290,14 +297,14 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      the 48px the sheet's own cells use. \`> * > *\` reaches both shapes without
      naming either plugin — subscriptions wraps its trigger in a positioning
      div, vision-router puts its button straight in the slot. */
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] > *,
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] > * > button {
+  ${MODEL_MENU} > [data-zen-sheet-extras] > *,
+  ${MODEL_MENU} > [data-zen-sheet-extras] > * > button {
     width: 100% !important;
     max-width: none !important;
     min-width: 0 !important;
     justify-content: flex-start !important;
   }
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] button {
+  ${MODEL_MENU} > [data-zen-sheet-extras] button {
     box-sizing: border-box !important;
     min-height: 48px !important;
     height: auto !important;
@@ -315,19 +322,20 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     justify-content: flex-start !important;
   }
   /* Order comes from the row (compat.css.ts puts the vision toggle at 5 so it
-     parks beside the context ring), and that rule still matches in here — the
-     sheet is a DOM descendant of the composer bar even though it paints as a
-     fixed layer. Reset it so the sheet follows DOM order instead of
-     inheriting a decision that was about a different layout. */
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] > * {
+     parks beside the context ring), and that rule still matches in here on
+     ≤ 0.1.2 — the inline sheet is a DOM descendant of the composer bar even
+     though it paints as a fixed layer (the 0.1.5 body portal is not, where
+     this is a harmless no-op). Reset it so the sheet follows DOM order
+     instead of inheriting a decision that was about a different layout. */
+  ${MODEL_MENU} > [data-zen-sheet-extras] > * {
     order: 0 !important;
   }
   /* The vision toggle is squeezed to a 28px icon in the row (compat.css.ts);
      in the sheet it is a row, so its label comes back and the icon leads. */
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > span {
+  ${MODEL_MENU} > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > span {
     display: inline !important;
   }
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > svg:first-of-type {
+  ${MODEL_MENU} > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > svg:first-of-type {
     width: 18px !important;
     height: 18px !important;
   }
@@ -338,7 +346,7 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      (the sheet sets \`transform: none\`, so nothing between here and the
      viewport captures fixed positioning) and it lands as its own sheet on top
      of this one. */
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] [role="menu"] {
+  ${MODEL_MENU} > [data-zen-sheet-extras] [role="menu"] {
     position: fixed !important;
     left: 0 !important;
     right: 0 !important;
@@ -359,7 +367,7 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     z-index: 61 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, .18) !important;
   }
-  ${MODEL} > [class$="_menu"] > [data-zen-sheet-extras] [role="menu"] [role="menuitemradio"] {
+  ${MODEL_MENU} > [data-zen-sheet-extras] [role="menu"] [role="menuitemradio"] {
     min-height: 48px !important;
     border-radius: 12px !important;
     font-size: 15px !important;

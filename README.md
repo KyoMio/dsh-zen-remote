@@ -286,7 +286,7 @@ The mobile UI has specific adaptations for the plugins below. Every adaptation i
 
 | Plugin | What the mobile adaptation does | Version tested |
 | --- | --- | --- |
-| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | A workbench entry button in the session page header; the panel becomes a full-width phone drawer that respects the notch safe area, with a centred close button at the bottom | 0.15.0 |
+| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 0.19+: all its tabs live in DSH 0.1.5's native right sidebar, which the host takes full screen on a phone — the session header keeps an entry button for it, the left-edge swipe-back closes it, and tapping an @-reference in the file tree closes it. ≤ 0.18 (own right panel, DSH < 0.1.5 only): full-width phone drawer with notch safe area and a centred close pill | 0.19.1 (legacy rules: 0.15.0) |
 | [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | The AgentTeams activity overlay moves below the session header (its original position covered the header buttons) and hides itself on the session list; a subagent session keeps a tappable parent-session title in its header for jumping back | 0.1.9 |
 | [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | Usage and balance entries fold into the home-screen chips row | 0.2.9 |
 | [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | The scheduled-tasks entry folds into the home-screen chips row | 0.2.3 |

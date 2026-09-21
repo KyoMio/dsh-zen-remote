@@ -7,6 +7,8 @@ const read = (...parts) => fs.readFileSync(path.join(__dirname, '..', ...parts),
 const effect = read('src', 'client', 'effects', 'workbench-ref-close.ts')
 const index = read('src', 'client', 'index.tsx')
 const gestures = read('src', 'client', 'effects', 'gestures.ts')
+const header = read('src', 'client', 'MobileSessionHeader.tsx')
+const panels = read('src', 'client', 'sidebar-panels.ts')
 
 /*
  * Phone: an @-file tap in the workbench closes the panel (real-device
@@ -32,8 +34,10 @@ test('the close waits for the reference to land, and re-checks open state', () =
   // dispatch — the deferral is what orders "mention lands" before "panel
   // closes". The re-check matters because the toggle is a toggle: clicking
   // it against an already-closed panel would reopen it.
-  assert.match(effect, /setTimeout\(/, 'the close must be deferred past the tap\'s own handler')
-  assert.match(effect, /document\.querySelector\(PANEL_OPEN_SELECTOR\) === null\) return/, 'a closed panel must not be toggled back open')
+  assert.match(effect, /setTimeout\(\(\) => \{ closeOpenSidebar\(\) \}, 0\)/, 'the close must be deferred past the tap\'s own handler')
+  // closeOpenSidebar is the re-check: it reads the open state when it runs
+  // and never clicks a toggle against a closed panel.
+  assert.match(panels, /if \(officialSidebarOpen\(\)\)[\s\S]*?OFFICIAL_COLLAPSE[\s\S]*?if \(betterSidebarOpen\(\)\)[\s\S]*?BETTER_TOGGLE/, 'closeOpenSidebar must read open state before clicking either control')
 })
 
 test('phone-gated per tap, desktop untouched', () => {
@@ -41,9 +45,20 @@ test('phone-gated per tap, desktop untouched', () => {
   assert.match(effect, /if \(!phone\.matches\) return/, 'checked per tap — a mid-session resize must not leave a stale arm')
 })
 
-test('the anchors match the ones the rest of the plugin already trusts', () => {
-  // One convention, one place to update if better-sidebar renames things.
-  assert.match(effect, /\[data-dsh-better-sidebar\] button\[class\$="_toggleButton"\]/, 'toggle anchor drifted from gestures.ts')
-  assert.ok(gestures.includes('[data-dsh-better-sidebar] button[class$="_toggleButton"]'), 'gestures.ts moved off the shared toggle anchor — update both or extract it')
-  assert.match(effect, /\[data-dsh-better-sidebar\] \[class\$="_panel"\]/, 'open-state read drifted from the shared convention')
+test('the anchors live in one module, shared by every caller', () => {
+  // One convention, one place to update if better-sidebar or the host
+  // renames things: sidebar-panels.ts owns the selectors; the header
+  // button, the edge swipe-back and this effect all import from it.
+  assert.match(panels, /BETTER_TOGGLE = '\[data-dsh-better-sidebar\] button\[class\$="_toggleButton"\]'/, 'legacy toggle anchor drifted')
+  assert.match(panels, /BETTER_PANEL_OPEN = '\[data-dsh-better-sidebar\] \[class\$="_panel"\]'/, 'legacy open-state read drifted')
+  assert.match(panels, /OFFICIAL_PANEL_OPEN = '\[data-sidebar-right-panel\]\[data-sidebar-right-open\]'/, 'official open-state read drifted')
+  assert.match(panels, /OFFICIAL_COLLAPSE = '\[data-sidebar-right-toggle\]'/, 'official collapse anchor drifted')
+  for (const [name, src] of [['workbench-ref-close.ts', effect], ['gestures.ts', gestures], ['MobileSessionHeader.tsx', header]]) {
+    assert.match(src, /from '\.\.?\/sidebar-panels\.ts'/, `${name} no longer imports the shared anchors`)
+    assert.doesNotMatch(src, /'\[data-dsh-better-sidebar\] button\[class\$="_toggleButton"\]'|'\[data-sidebar-right-toggle\]'/, `${name} spells a sidebar anchor out again — use sidebar-panels.ts`)
+  }
+  // The explorer's @ button is looked up under BOTH hosts: better-sidebar
+  // 0.19+ renders the tree inside the native right panel, older versions
+  // inside their own root.
+  assert.match(effect, /\$\{OFFICIAL_PANEL\} \[class\$="_explorerRef"\], \$\{BETTER_ROOT\} \[class\$="_explorerRef"\]/, 'REF_SELECTOR must cover the native panel and the legacy root')
 })

@@ -6,8 +6,14 @@ const PHONE_QUERY = '(max-width: 767px)'
 /** The model pill itself. Absent in a subagent session — see `sync`. */
 const MODEL_SEAT_SELECTOR = '[data-slot="conversation.input.model"]'
 
-/** The model pill's own popup, which section 4 of composer.css.ts turns into a bottom sheet. */
-const MENU_SELECTOR = '[data-slot="conversation.input.model"] [class$="_menu"]'
+/** The model pill's own popup, which section 4 of composer.css.ts turns into
+ * a bottom sheet — inline under the pill on ≤ 0.1.2, portaled to body on
+ * 0.1.5+ (same two spellings as composer.css.ts's MODEL_MENU; the body form
+ * is the only body-level `role=menu` with an `-menu` id, measured on
+ * 0.1.5-rc.2). Appending into the portal root is no different from the
+ * inline case: React leaves nodes it did not create alone, and the sheet
+ * still unmounts on close, which is what the detached-menu path handles. */
+const MENU_SELECTOR = '[data-slot="conversation.input.model"] [class$="_menu"], body > [id$="-menu"][role="menu"]'
 
 /**
  * The third-party composer controls this effect relocates. Both register into

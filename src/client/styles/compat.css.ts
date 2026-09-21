@@ -567,6 +567,16 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
   }
 
   /* ---------- dsh-better-sidebar: safe area (S2.1, 2026-08-17) ----------
+     LEGACY — this and the two better-sidebar blocks after it (toggle-cluster
+     hide, phone close pill) are written against dsh-better-sidebar ≤ 0.18,
+     which drew its own right panel (\`_panel\` / \`_panelHidden\`, a
+     \`_toggleCluster\`). 0.19 retired that panel: its tabs live in DSH 0.1.5's
+     native right sidebar (which the host itself takes full screen on a
+     phone, with its own collapse control), and what remains plugin-owned is
+     a bottom workbench (\`_bottomPanel\`) the phone never opens. Every
+     selector below therefore matches NOTHING on 0.19+ — by design, not by
+     accident (issue #11, verified live 2026-09-21); they stay for the older
+     combination and are inert otherwise, like every other compat rule here.
      THIRD-PARTY COMPAT RULE — dsh-better-sidebar (the workbench the session
      header's panel button opens). Its shell is viewport-fixed and starts at
      y=0: the panel at inset 0 (100vw drawer below 768px, a right column

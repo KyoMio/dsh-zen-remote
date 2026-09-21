@@ -4,6 +4,8 @@ import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots
 import { IconChevronLeftOutline14, IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT, SESSION_INFO_EVENT } from './nav-store.ts'
+import { BETTER_TOGGLE, readSidebarTarget, toggleSidebarTarget } from './sidebar-panels.ts'
+import type { SidebarTarget } from './sidebar-panels.ts'
 
 /**
  * ic_ds_info_outline_16 — @deepseek-ai/dsh-client-ui-primitives has no
@@ -276,68 +278,27 @@ export type MobileHeaderUtilitiesProps =
   & PropsLocale<typeof NS>
 
 /**
- * Where the header's sidebar button routes. Three ways, resolved at runtime
- * (user decision 2026-09-11, after DSH 0.1.5 grew an official right sidebar):
+ * Where the header's sidebar button routes — three ways, resolved at runtime
+ * (user decision 2026-09-11 after DSH 0.1.5 grew an official right sidebar;
+ * priority flipped 2026-09-21, issue #11 / PR #12, once dsh-better-sidebar
+ * 0.19 retired its own right panel):
  *
- * - `'better'` — dsh-better-sidebar is installed: the original design, the
- *   button clicks the plugin's own (CSS-hidden) toggle.
- * - `'official'` — no better-sidebar but the host ships the right sidebar:
- *   the button drives the official controls instead.
+ * - `'official'` — the host ships the right sidebar (0.1.5+): the button
+ *   drives the official controls. This is the phone's one entry to every
+ *   better-sidebar tab too (0.19+ registers them all into the native panel,
+ *   which the host takes full screen on a phone), so it wins whenever the
+ *   panel exists, better-sidebar installed or not.
+ * - `'better'` — no official panel but dsh-better-sidebar ≤ 0.18 is drawing
+ *   its own right panel (DSH < 0.1.5): the original design, the button
+ *   clicks the plugin's own (CSS-hidden) toggle.
  * - `null` — neither: the button does not render at all.
  *
  * In every case the OTHER sidebar buttons (the official corner ExpandButton,
- * better-sidebar's toggle cluster) stay hidden on the phone — this button is
- * the one visible affordance. Detection is by stable, non-hashed DOM
- * markers, never by locale: better-sidebar's root mount marker, and the
- * official rightbar's always-mounted panel (`data-sidebar-right-panel`; its
- * corner ExpandButton unmounts while expanded, so the PANEL is the probe).
+ * better-sidebar's own toggle) stay hidden on the phone — this button is the
+ * one visible affordance. Anchors, detection and the click-through live in
+ * sidebar-panels.ts, shared with the edge swipe-back and the @-reference
+ * auto-close: stable, non-hashed DOM markers, never locale.
  */
-type SidebarTarget = 'better' | 'official' | null
-
-const BETTER_ROOT = '[data-dsh-better-sidebar]'
-const BETTER_TOGGLE = '[data-dsh-better-sidebar] button[class$="_toggleButton"]'
-const OFFICIAL_PANEL = '[data-sidebar-right-panel]'
-const OFFICIAL_EXPAND = '[data-sidebar-right-expand]'
-const OFFICIAL_COLLAPSE = '[data-sidebar-right-toggle]'
-
-/** Synchronous read of which sidebar backend this host offers.
- *
- * In DSH 0.1.5+ (v0.19.0+ of dsh-better-sidebar), the right sidebar is the
- * host's native right sidebar (`data-sidebar-right-panel`), while older
- * better-sidebar versions drew their own right panel under `BETTER_ROOT`.
- * If the official panel exists, prioritize it so the header button controls
- * the right sidebar panel; otherwise fall back to legacy better-sidebar.
- */
-function readSidebarTarget(): SidebarTarget {
-  if (document.querySelector(OFFICIAL_PANEL) !== null) return 'official'
-  if (document.querySelector(BETTER_ROOT) !== null) return 'better'
-  return null
-}
-
-/**
- * Toggle whichever sidebar `target` names, by clicking the official/plugin
- * control through its stable marker. The official pair is open-only in the
- * corner (`ExpandButton` unmounts once shown) and close-only inside the
- * panel (`data-sidebar-right-toggle` rides the panel's own strip), so the
- * open state is read off the panel's `data-sidebar-right-open` attribute and
- * the matching control is clicked. Synthetic `.click()` fires both React
- * handlers through `display: none` (the tablist precedent this plugin
- * already relies on for the view switch).
- */
-function toggleSidebarTarget(target: SidebarTarget): void {
-  if (target === 'better') {
-    document.querySelector<HTMLButtonElement>(BETTER_TOGGLE)?.click()
-    return
-  }
-  if (target === 'official') {
-    const shown = document.querySelector(`${OFFICIAL_PANEL}[data-sidebar-right-open]`) !== null
-    const control = shown
-      ? document.querySelector<HTMLButtonElement>(OFFICIAL_COLLAPSE)
-      : document.querySelector<HTMLButtonElement>(OFFICIAL_EXPAND)
-    control?.click()
-  }
-}
-
 /** Live mirror of {@link readSidebarTarget} — same observer pattern as the
  * old workbench presence gate it replaces (plugins load after us; the right
  * panel mounts with the frame). */
@@ -356,16 +317,20 @@ function useSidebarTarget(): SidebarTarget {
 /**
  * Session header, right lane: the session-info entry (S4 owns the actual
  * sheet — this fires a hook event for it to pick up) and the sidebar entry.
- * The sidebar button routes per {@link SidebarTarget}: better-sidebar's own
- * toggle (no public "open the panel" API — BetterSidebarService.openTab only
- * auto-expands for a content open, not a bare type-only open, so it clicks
- * the plugin's real toggle through its root marker `[data-dsh-better-
- * sidebar]` plus the `_toggleButton` class suffix, verified live 2026-08-17),
- * the official right sidebar's controls, or nothing when neither exists.
+ * The sidebar button routes per {@link SidebarTarget}: the official right
+ * sidebar's controls, else legacy better-sidebar's own toggle (no public
+ * "open the panel" API — BetterSidebarService.openTab only auto-expands for
+ * a content open, not a bare type-only open, so it clicks the plugin's real
+ * toggle through its root marker plus the `_toggleButton` class suffix,
+ * verified live on 0.15.0, 2026-08-17), or nothing when neither exists.
  */
 export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
-  // Better-sidebar phone close button (S3.1 follow-up, 2026-08-17): the
-  // panel's own top-right toggle cluster is hidden below 768px
+  // LEGACY better-sidebar (≤ 0.18, own right panel) phone close button
+  // (S3.1 follow-up, 2026-08-17). On 0.19+ / DSH 0.1.5 the phone opens the
+  // host's full-screen native panel instead, which carries its own collapse
+  // control, and this pill's CSS gate below matches nothing (the 0.19 panel
+  // class is `_bottomPanel`) — it stays for the older combination only.
+  // The panel's own top-right toggle cluster is hidden below 768px
   // (styles/compat.css.ts) because it duplicates the workbench button
   // below — but that cluster is also the panel's ONLY close control, so
   // hiding it blindly leaves an open panel with no way out. This button is
@@ -405,7 +370,7 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
     label.textContent = t('workbenchClose')
     button.appendChild(label)
     const onClick = (): void => {
-      document.querySelector<HTMLButtonElement>('[data-dsh-better-sidebar] button[class$="_toggleButton"]')?.click()
+      document.querySelector<HTMLButtonElement>(BETTER_TOGGLE)?.click()
     }
     button.addEventListener('click', onClick)
     document.body.appendChild(button)
@@ -415,12 +380,12 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
     }
   }, [t])
 
-  // Sidebar routing (2026-09-11): better-sidebar installed → its toggle (the
-  // original design); else the official right sidebar (DSH 0.1.5+); else the
-  // button stays hidden — it used to be a dead control without the plugin
-  // (2026-08-17 user question), and the same must hold for a host with no
-  // right sidebar either. The close pill above keeps its own better-sidebar
-  // CSS :has() gate, unchanged.
+  // Sidebar routing: the official right sidebar (DSH 0.1.5+) when the host
+  // has one; else legacy better-sidebar's toggle; else the button stays
+  // hidden — it used to be a dead control without the plugin (2026-08-17
+  // user question), and the same must hold for a host with no right sidebar
+  // either. The close pill above keeps its own better-sidebar CSS :has()
+  // gate, unchanged.
   const sidebar = useSidebarTarget()
 
   return (

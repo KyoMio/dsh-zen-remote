@@ -46,12 +46,12 @@ export type MobileHeaderUtilitiesProps = PropsRuntime<'conversation.session.head
 /**
  * Session header, right lane: the session-info entry (S4 owns the actual
  * sheet — this fires a hook event for it to pick up) and the sidebar entry.
- * The sidebar button routes per {@link SidebarTarget}: better-sidebar's own
- * toggle (no public "open the panel" API — BetterSidebarService.openTab only
- * auto-expands for a content open, not a bare type-only open, so it clicks
- * the plugin's real toggle through its root marker `[data-dsh-better-
- * sidebar]` plus the `_toggleButton` class suffix, verified live 2026-08-17),
- * the official right sidebar's controls, or nothing when neither exists.
+ * The sidebar button routes per {@link SidebarTarget}: the official right
+ * sidebar's controls, else legacy better-sidebar's own toggle (no public
+ * "open the panel" API — BetterSidebarService.openTab only auto-expands for
+ * a content open, not a bare type-only open, so it clicks the plugin's real
+ * toggle through its root marker plus the `_toggleButton` class suffix,
+ * verified live on 0.15.0, 2026-08-17), or nothing when neither exists.
  */
 export declare function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps): import("react").JSX.Element;
 //# sourceMappingURL=MobileSessionHeader.d.ts.map

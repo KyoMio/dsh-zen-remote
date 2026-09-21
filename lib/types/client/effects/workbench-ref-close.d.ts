@@ -2,7 +2,8 @@ import type { ClientContext } from '../compat/types.ts';
 /**
  * Phone: an @-file reference tap in the workbench closes the workbench.
  *
- * On a phone the panel is a full-screen surface over the conversation, so
+ * On a phone the panel is a full-screen surface over the conversation (the
+ * host's own native panel on 0.1.5+, better-sidebar's on older combos), so
  * after tapping a row's @ button the user is still looking at the file tree
  * — the ONLY feedback for the tap is a draft change on a composer they
  * cannot see (real-device report, 2026-08-26: reads as "nothing happened",

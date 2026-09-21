@@ -36,7 +36,7 @@ v1.0.0（fork 自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-
 
 会话页头部只留五样东西：返回 · 会话名（+ 运行状态点）· 当前视图名（对话/轨迹，带双点指示）· 信息卡入口 · 侧栏入口。官方的 Chat/Trajectory 页签视觉隐藏但 DOM 还在，点信息卡里的分段控件相当于代点它。
 
-侧栏入口按「现场有哪个侧栏」三态路由（2026-09-11，DSH 0.1.5 长出官方右侧栏之后定的规矩）：装了 dsh-better-sidebar 就代点它自己的开关（原设计）；没装而宿主有右侧栏（0.1.5+）就代点官方角位的展开钮 / 面板里的收起钮；两者都没有就不渲染。无论哪种，官方角位的 ExpandButton 与 better-sidebar 自己的按钮在手机端都隐藏——头部只有我们这一枚侧栏钮。探测全部锚在稳定 DOM 标记（`[data-dsh-better-sidebar]`、`[data-sidebar-right-panel]` 及两个开合控件的 `data-sidebar-right-*`），不看语言、不看类名散列。
+侧栏入口按「现场有哪个侧栏」三态路由（2026-09-11 DSH 0.1.5 长出官方右侧栏之后定的规矩；2026-09-21 起官方优先，issue #11 / PR #12）：宿主有右侧栏（0.1.5+）就代点官方角位的展开钮 / 面板里的收起钮——装没装 dsh-better-sidebar 都一样，因为 better-sidebar 0.19 起自己不画右栏了，它注册的全部 tab（文件树 / 文件变动 / 终端 / 浏览器 / 第三方 `registerTab()`）都进了官方右侧栏，而这个面板在手机上由宿主自己切成全屏、自带收起钮；0.19 只剩一个底部工作台（`[data-dsh-bottom-toggle]` / `_bottomPanel`），手机上不开放。没有官方右栏但装了老版 better-sidebar（≤ 0.18，DSH < 0.1.5）就代点它自己的开关（原设计）；两者都没有就不渲染。无论哪种，官方角位的 ExpandButton 与 better-sidebar 自己的按钮在手机端都隐藏——头部只有我们这一枚侧栏钮。锚点、探测和代点集中在 `src/client/sidebar-panels.ts`，头部按钮、左缘回退手势、文件树 @ 引用后自动收起三处共用；全部锚在稳定 DOM 标记（`[data-sidebar-right-panel]` 及两个开合控件的 `data-sidebar-right-*`、老版的 `[data-dsh-better-sidebar]`），不看语言、不看类名散列。
 
 ### composer 重排
 
@@ -149,20 +149,30 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
     槽里，逃过了头部两条 blanket hide，顶到右上角——已隐藏（隐藏它的选择器
     必须 ≥(0,3,1)：老的 utilities 反隐藏规则在 0.1.5 下恰好命中这个 `:last-child`
     角位，轻量级 hide 会被它的 `flex !important` 压掉，实测两次才定位），
-    头部侧栏钮改为三态路由（见「会话页头部五件套」）；在新版 DSH 0.1.5+（dsh-better-sidebar v0.19.0+）
-    退役自绘面板改走宿主原生右侧栏时优先唤起原生侧栏，同时完整保留旧版本 better-sidebar 的自绘兼容；
+    头部侧栏钮改为三态路由（见「会话页头部五件套」）；
   - composer 从 `<textarea>` 换成 Lexical contenteditable（`[data-composer-input]`），
     S9 键盘守卫与 S10 的聚焦探针只认 TEXTAREA、全体失明——点官方附件钮的
     `keepFocus` 强制聚焦会直接弹键盘并把输入框顶上去，开 会话自动聚焦也复发。
     两个 effect 的识别同步扩到 contenteditable，实测：附件钮的强制聚焦被糊掉、
-    用户直接点输入框的聚焦保留；
-  - 修复移动端切后台再切回时输入框卡死不可用（无法再点击输入）：Lexical 在富文本
-    内生成段落与 span 文本节点，切回聚焦时事件目标命中这些子元素而非外层容器，
-    导致 `keyboard-guard` 误判为未获交互授权而自动强行 `blur()`。判定函数
-    升级为 `.closest('[data-composer-input]')` 后彻底解决；
-  - 模型下拉菜单弹层（DSH 0.1.5 Portal 到底部）移动端适配：将 body 直属的
-    `[id$="-menu"][role="menu"]` 纳入底部抽屉 sheet，选项紧凑化（38px 高度），
-    并保持官方原生靠左排版，避免选项过高与首屏留白。
+    用户直接点输入框的聚焦保留。
+- 适配 dsh-better-sidebar `0.19`（issue #11、PR #12 及其补齐，2026-09-21，本机 0.1.5-rc.2 +
+  0.19.1 真界面逐项核过）：
+  - 头部侧栏钮点了没反应——0.19 退役了自己的右栏，老锚点
+    `[data-dsh-better-sidebar] button[class$="_toggleButton"]` 命中 0 个元素，`?.click()`
+    静默空操作。路由改为**官方右侧栏优先**（0.19 把全部 tab 都注册进去了，手机上宿主自己
+    切全屏），老版 better-sidebar 分支只在 DSH < 0.1.5 时走；同一根因下死掉的另外几处
+    （左缘回退手势收面板、文件树 @ 引用后自动收起）改为对官方面板生效，锚点集中到
+    `sidebar-panels.ts`。首页「文件」chip、关闭 pill、`compat.css.ts` 的三段 better-sidebar
+    规则都是老版专用，0.19 上按设计不命中（chip 因此不显示）——保留给老组合，不改。
+  - 输入框打字后切后台再切回，点到文字上就瞬间失焦：Lexical 在 contenteditable 里生成
+    `<p>` / `<span>`，pointerdown 落在子节点上，`hasAttribute('data-composer-input')`
+    判空 → 视为未授权 → focusin 时被 S9 守卫 blur。不只切后台会触发，任何 focusout 之后
+    再点到文字上都会。识别改为 `.closest('[data-composer-input]')`（PR #12）。
+  - 模型弹层没变成底部抽屉、退化成原生小浮窗：0.1.5 的 ModelSelect 把菜单 portal 到了
+    `document.body`（`id` 为 `${useId()}-menu`、`role=menu`，rc.2 上唯一带这种 id 的
+    body 级菜单），`${MODEL} > [class$="_menu"]` 不再命中。抽屉规则、行高、
+    `model-sheet-extras` 的搬家目标都改成两种写法并存（`:is()`）；z-index 保持 60
+    （四点命中实测没有东西盖住它，也仍在信息卡的 70 之下），选项行高保持 48px 的 44pt 规矩。
 - composer 行里第三方插件的入口(`conversation.input.right`)在手机端整体移进模型弹层,
   与「模型」「推理等级」并列成行——行是不换行的,模型名是唯一能让宽度的东西,
   订阅插件的速度 chip(带文字约 70px)加上识图开关会把它挤没(2026-09-06 用户报)
@@ -296,7 +306,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 ## 兼容插件
 
-- [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)(移动端全宽抽屉,本插件在会话页头部给它留入口位;手机上文件树里点 @ 引用后代点开关自动收起面板——面板全屏盖住会话页,草稿变化看不见,收起本身就是点击反馈)——本机实测 **0.15.0**
+- [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)(0.19+:它的全部 tab 都在 DSH 0.1.5 官方右侧栏里,手机上宿主自己切全屏,本插件在会话页头部给它留入口位、左缘回退手势收它、文件树里点 @ 引用后自动收起——面板全屏盖住会话页,草稿变化看不见,收起本身就是点击反馈;≤ 0.18 自绘右栏的老版本:全宽抽屉 + 安全区 + 底部关闭 pill,只在 DSH < 0.1.5 上还会走到)——本机实测 **0.19.1**(老版规则实测 0.15.0)
 - [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams)(AgentTeams 活动浮层:手机端挪到会话头部下方、避开安全区,会话列表页隐藏;子代理会话头部保留可点的父会话面包屑用于切回)——本机实测 **0.1.9**
 - [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats)(用量与余额,主屏 chips 行可直接打开;旧包名 `dsh-usage-stats` 已废弃,两个名字同时留在 profile 里会因重复的 `usage-stats` 行让 DSH 起不来)——本机实测 **0.2.9**
 - [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins)(定时任务,主屏 chips 行自动收割入口)——本机实测 **0.2.3**

@@ -300,7 +300,7 @@ open http://127.0.0.1:3088/lan-gate/admin
 
 | 插件 | 移动端适配内容 | 实测版本 |
 | --- | --- | --- |
-| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 会话页头部提供工作台入口按钮；面板变手机全宽抽屉并避让刘海安全区；底部居中的关闭按钮 | 0.15.0 |
+| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 0.19+：它的全部 tab 都在 DSH 0.1.5 官方右侧栏里、手机上宿主自己切全屏——会话页头部留入口按钮，左缘回退手势收它，文件树里点 @ 引用后自动收起。≤ 0.18（自绘右栏，只在 DSH < 0.1.5 上）：手机全宽抽屉并避让刘海安全区、底部居中的关闭按钮 | 0.19.1（老版规则 0.15.0） |
 | [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | AgentTeams 活动浮层挪到会话头部下方（原位置压住头部按钮）、会话列表页自动隐藏；子代理会话头部保留可点的父会话标题，一键切回主会话 | 0.1.9 |
 | [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | 用量与余额入口收进主屏 chips 行 | 0.2.9 |
 | [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | 定时任务入口收进主屏 chips 行 | 0.2.3 |

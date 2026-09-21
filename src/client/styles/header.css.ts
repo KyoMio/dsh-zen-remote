@@ -291,10 +291,14 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      4th grid column at the screen's top-right corner — a second panel-left
      icon next to our Workbench button, reading as "the hidden official
      sidebar toggle is back" (reported 2026-09-11). The button itself is the
-     one our workbench control forwards to when better-sidebar is absent
-     (MobileSessionHeader's toggleSidebarTarget), and a display:none button
-     still receives synthetic .click() (the tablist precedent), so hiding it
-     costs nothing.
+     one our sidebar control forwards to whenever the host has this panel
+     (sidebar-panels.ts, official first since 2026-09-21 — better-sidebar
+     0.19+ puts all its tabs in here), and a display:none button still
+     receives synthetic .click() (the tablist precedent), so hiding it costs
+     nothing. better-sidebar 0.19's own bottom-workbench toggle
+     (\`[data-dsh-bottom-toggle]\`) registers into the utilities slot and is
+     caught by the blanket hide above — intended: that surface is not for
+     the phone.
      Anchors, in the specificity order they NEED (measured live, 2026-09-11):
      the corner div must be beaten with (0,3,1) — the utilities un-hide rule
      above spells header > :first-child > :last-child at exactly that

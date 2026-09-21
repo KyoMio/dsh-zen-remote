@@ -1,30 +1,25 @@
 import type { ClientContext } from '../compat/types.ts'
+import { BETTER_ROOT, OFFICIAL_PANEL, closeOpenSidebar } from '../sidebar-panels.ts'
 
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
 const PHONE_QUERY = '(max-width: 767px)'
 
 /**
- * The file tree's per-row @-reference button (dsh-better-sidebar's
- * `_explorerRef` class suffix — same anchoring convention as every other
- * better-sidebar hook in this plugin: the plugin's own root marker plus a
- * stable class suffix, so the selector misses entirely when the plugin is
- * not installed). Covers the search results too: TreePanel renders both
- * through the same row-actions slot.
+ * The file tree's per-row @-reference button: dsh-better-sidebar's
+ * `_explorerRef` class suffix (stable across its releases; the hash prefix
+ * is not), scoped to the panel hosting the tree so the selector misses
+ * entirely when the plugin is not installed. Two hosts: the plugin's own
+ * panel under its root marker (≤ 0.18), or DSH 0.1.5's native right panel
+ * (0.19+ renders the explorer in there). Covers the search results too:
+ * TreePanel renders both through the same row-actions slot.
  */
-const REF_SELECTOR = '[data-dsh-better-sidebar] [class$="_explorerRef"]'
-
-/** The panel's own (phone-hidden) toggle — the one official way to close it.
- * Same anchor gestures.ts and MobileSessionHeader.tsx already use. */
-const TOGGLE_SELECTOR = '[data-dsh-better-sidebar] button[class$="_toggleButton"]'
-
-/** Open-state read, shared convention with gestures.ts: the class ends in
- * "_panel" only while open ("_panelHidden" is appended once closed). */
-const PANEL_OPEN_SELECTOR = '[data-dsh-better-sidebar] [class$="_panel"]'
+const REF_SELECTOR = `${OFFICIAL_PANEL} [class$="_explorerRef"], ${BETTER_ROOT} [class$="_explorerRef"]`
 
 /**
  * Phone: an @-file reference tap in the workbench closes the workbench.
  *
- * On a phone the panel is a full-screen surface over the conversation, so
+ * On a phone the panel is a full-screen surface over the conversation (the
+ * host's own native panel on 0.1.5+, better-sidebar's on older combos), so
  * after tapping a row's @ button the user is still looking at the file tree
  * — the ONLY feedback for the tap is a draft change on a composer they
  * cannot see (real-device report, 2026-08-26: reads as "nothing happened",
@@ -55,13 +50,11 @@ export function installWorkbenchRefClose(ctx: ClientContext): void {
       const target = event.target
       if (!(target instanceof Element)) return
       if (target.closest(REF_SELECTOR) === null) return
-      setTimeout(() => {
-        // Re-check open state at fire time: the tap's own handler chain (or
-        // a second tap) may already have closed the panel — the toggle is a
-        // toggle, and blind-clicking it would REOPEN what just closed.
-        if (document.querySelector(PANEL_OPEN_SELECTOR) === null) return
-        document.querySelector<HTMLButtonElement>(TOGGLE_SELECTOR)?.click()
-      }, 0)
+      // closeOpenSidebar re-reads the open state at fire time: the tap's own
+      // handler chain (or a second tap) may already have closed the panel —
+      // better-sidebar's toggle is a toggle, and blind-clicking it would
+      // REOPEN what just closed.
+      setTimeout(() => { closeOpenSidebar() }, 0)
     }
     document.addEventListener('click', onClick, true)
     return () => document.removeEventListener('click', onClick, true)

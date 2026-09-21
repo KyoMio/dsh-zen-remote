@@ -11,6 +11,7 @@ import {
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
 import type { MobileNavKey } from './locales.ts'
 import { isChipEnabled, toggleChip, useChipsPrefs } from './chips-store.ts'
+import { BETTER_TOGGLE } from './sidebar-panels.ts'
 
 /** One icon component's minimal shared shape (every `@deepseek-ai/dsh-client-ui-primitives` icon accepts `size`, regardless of the fixed number in its own name — see e.g. IconDownloadOutline16 used at size 14 elsewhere in this codebase). */
 type IconFC = (props: { size?: number }) => React.JSX.Element
@@ -54,12 +55,15 @@ const TASKBOARD_SELECTOR = 'button[data-dsh-taskboard-entry]'
 const SSH_SELECTOR = 'button[data-dsh-ssh-entry]'
 
 /**
- * Better-sidebar's own workbench toggle — the exact selector
- * MobileSessionHeader.tsx's header workbench button already clicks. Its
- * panel is better-sidebar's own top-level mount (`[data-dsh-better-sidebar]`),
- * not nested in our sidebar tree, so it needs no portal fix either.
+ * LEGACY better-sidebar's (≤ 0.18) own workbench toggle — the same anchor
+ * sidebar-panels.ts's BETTER_TOGGLE names. Its panel is better-sidebar's own
+ * top-level mount (`[data-dsh-better-sidebar]`), not nested in our sidebar
+ * tree, so it needs no portal fix either. On 0.19+ this matches nothing, so
+ * the presence gate below simply drops the chip: the file tree now lives in
+ * the host's native right sidebar, reached from the session header, and the
+ * home page has no per-session panel to open it into.
  */
-const FILES_SELECTOR = '[data-dsh-better-sidebar] button[class$="_toggleButton"]'
+const FILES_SELECTOR = BETTER_TOGGLE
 
 /**
  * dsh-usage-stats' sidebar-footer badge (`sidebar.footer.action`, order 10 —

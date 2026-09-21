@@ -1,5 +1,6 @@
 import type { ClientContext } from '../compat/types.ts'
 import { GO_HOME_EVENT } from '../nav-store.ts'
+import { closeOpenSidebar } from '../sidebar-panels.ts'
 
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
 const PHONE_QUERY = '(max-width: 767px)'
@@ -155,17 +156,6 @@ const EDGE_SWIPE_MIN_DX = 90
 const EDGE_SWIPE_RATIO = 1.6
 
 /**
- * dsh-better-sidebar's panel-open read (AGENTS.md pitfall "第三方浮层的开合
- * 态可以纯 CSS `:has()` 读"): the panel's class ends in "_panel" only while
- * open — "_panelHidden" is appended once closed, so the string no longer
- * ends in "_panel" and this selector stops matching. Same anchor
- * MobileSessionHeader.tsx's workbench button and its own close button use.
- */
-function betterSidebarPanelOpen(): boolean {
-  return document.querySelector('[data-dsh-better-sidebar] [class$="_panel"]') !== null
-}
-
-/**
  * S6.1 — left-edge swipe-back priority chain (design doc "手势" row, fourth
  * revision): a swipe starting in the left {@link EDGE_ZONE_PX} always closes
  * the TOPMOST dismissible surface rather than always navigating, so a user
@@ -175,8 +165,12 @@ function betterSidebarPanelOpen(): boolean {
  *   1. this plugin's session-info sheet, if open
  *   2. this plugin's home sheet (workspace switcher or S5 chip-customize),
  *      if open
- *   3. dsh-better-sidebar's workbench panel, if open (代点 its own toggle —
- *      same anchor MobileSessionHeader.tsx's workbench/close buttons use)
+ *   3. the right-hand panel, if open — the host's own full-screen sidebar
+ *      on DSH 0.1.5+, or legacy better-sidebar's panel (代点 whichever's own
+ *      close control; anchors shared with the header button, sidebar-
+ *      panels.ts). The native panel is a fixed layer over the whole page,
+ *      so without this step a swipe under it navigated home BEHIND the
+ *      panel while the panel stayed put.
  *   4. otherwise, GO_HOME_EVENT — but only from the session view; the design
  *      doc calls out "在 home 层→无动作" explicitly, and the phone page
  *      stack's current level is read straight off MobileHome's own
@@ -189,10 +183,7 @@ function handleEdgeSwipeBack(): void {
     closeSheet(sheet)
     return
   }
-  if (betterSidebarPanelOpen()) {
-    document.querySelector<HTMLButtonElement>('[data-dsh-better-sidebar] button[class$="_toggleButton"]')?.click()
-    return
-  }
+  if (closeOpenSidebar()) return
   if (document.querySelector('[data-mobile-nav="home"]')?.getAttribute('data-view') === 'session') {
     window.dispatchEvent(new CustomEvent(GO_HOME_EVENT))
   }
