@@ -73,6 +73,26 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
     border-right: none !important;
   }
 
+  /* The official right sidebar (DSH 0.1.5+) in its full-screen mode — the
+     one the phone's header sidebar button opens (sidebar-panels.ts). The
+     host promotes the panel to position:fixed; inset:0 there, so exactly
+     like the drawer above it escapes the frame's safe-area padding and its
+     tab strip + chrome buttons landed under the status bar (real-device
+     report, 2026-09-21). Both insets: the status bar / notch on top, the
+     home indicator at the bottom. Padding, no box-sizing change: fixed
+     with both top and bottom set resolves its used height from the
+     containing block minus padding (CSS 2.1 10.6.4), so the content box
+     shrinks by itself — the same reasoning the legacy better-sidebar panel
+     rule in compat.css.ts spells out. \`fullscreen\` is the host's own
+     attribute value (\`push\` while docked, dsh-client-ui-sidebar-right), so
+     the docked panel is untouched; a manual full-screen on desktop is
+     outside this media block anyway. Verify with ?mobile-nav-inset=54,34 —
+     env() is 0 in every desktop browser. */
+  [data-sidebar-right-panel="fullscreen"] {
+    padding-top: var(--mnav-sat) !important;
+    padding-bottom: var(--mnav-sab) !important;
+  }
+
   /* Expanded state (frame without data-sidebar-collapsed) slides the drawer in.
      The open state must be transform:none — NOT translateX(0): an identity
      transform still makes the drawer the containing block for fixed-position

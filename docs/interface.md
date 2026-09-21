@@ -164,6 +164,11 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
     （左缘回退手势收面板、文件树 @ 引用后自动收起）改为对官方面板生效，锚点集中到
     `sidebar-panels.ts`。首页「文件」chip、关闭 pill、`compat.css.ts` 的三段 better-sidebar
     规则都是老版专用，0.19 上按设计不命中（chip 因此不显示）——保留给老组合，不改。
+  - 官方右栏全屏打开时顶部没留安全区，tab 条和「退出全屏 / 收起」钮压在手机状态栏下面
+    （真机报告）：宿主把全屏面板设成 `position: fixed; inset: 0`，和左抽屉一样逃出了
+    frame 的安全区 padding。给 `[data-sidebar-right-panel="fullscreen"]` 补上下两个
+    安全区 padding（`layout.css.ts`，紧挨着左抽屉那条；`?mobile-nav-inset=54,34` 验过，
+    tab 条落到 y=54、面板高度不变）。
   - 输入框打字后切后台再切回，点到文字上就瞬间失焦：Lexical 在 contenteditable 里生成
     `<p>` / `<span>`，pointerdown 落在子节点上，`hasAttribute('data-composer-input')`
     判空 → 视为未授权 → focusin 时被 S9 守卫 blur。不只切后台会触发，任何 focusout 之后
