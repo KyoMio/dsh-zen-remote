@@ -386,3 +386,321 @@ test('a declared oversized body is refused before reading', async () => {
   assert.equal(JSON.parse(res.body).error.code, 'bad-request')
   assert.equal(seen.length, before)
 })
+
+// ---- T33a: shares routes ----------------------------------------------------------
+//
+// These routes are host-native: the table, the typert lookup and the agent
+// roster are injected options, so the mock gateway above stays untouched.
+// Each test builds its own handler over a fresh store (the module-level
+// admin server deliberately has none — the 404 degradation is itself a test).
+
+const { createShareStore } = require('../lib/share-store.js')
+
+/** A shares-capable handler plus its seams. `projection: null` answers the
+ * "no such live session" projection; `failTitles` makes those sessions'
+ * lookup throw (title null on GET, 502 on share); `subagentIdentity` plants
+ * a `values.subagent` in every projection (the dsh-subagent identity object,
+ * or null — the no-descriptor answer); `hang` makes invoke never settle. */
+function makeShareParts(overrides = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-admin-shares-'))
+  const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+  const invokes = []
+  const typert = {
+    invoke: async (call) => {
+      invokes.push(call)
+      if (overrides.hang) return new Promise(() => {})
+      if (overrides.projection === null) return null
+      if (overrides.failTitles !== undefined && overrides.failTitles.includes(call.args.request.sessionId)) {
+        throw new Error('projection blew up')
+      }
+      return {
+        asOfSeq: 1,
+        values: {
+          title: `title of ${call.args.request.sessionId}`,
+          ...(overrides.subagentIdentity === undefined ? {} : { subagent: overrides.subagentIdentity }),
+        },
+      }
+    },
+  }
+  const options = {
+    admit: overrides.admit || (() => ({ peer: {} })),
+    gatewayBase: `http://127.0.0.1:${gwPort}`,
+    getConfig: () => ({ values: { role: 'host', port: gwPort, lang: 'zh' }, sources: {} }),
+    store,
+    typert: overrides.noTypert ? () => undefined : () => typert,
+    listAgents: () => (overrides.roster !== undefined ? overrides.roster : []),
+    ...(overrides.viewerCount !== undefined ? { viewerCount: overrides.viewerCount } : {}),
+    ...(overrides.projectionTimeoutMs !== undefined ? { projectionTimeoutMs: overrides.projectionTimeoutMs } : {}),
+  }
+  return { store, invokes, options }
+}
+
+async function startShareServer(options) {
+  return startAdminServer(options)
+}
+
+test('GET shares lists every row with derived fields; busy Infinity serializes as null', async () => {
+  const parts = makeShareParts()
+  parts.store.share('s-idle')
+  parts.store.share('s-busy')
+  parts.store.setBusy('s-busy', true)
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    const res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.ok, true)
+    assert.deepEqual(
+      [...body.shares.map((s) => s.sessionId)].sort(),
+      ['s-busy', 's-idle'],
+      'both rows listed (order is sharedAt-ascending and clock-dependent here)',
+    )
+    const idle = body.shares.find((s) => s.sessionId === 's-idle')
+    const busy = body.shares.find((s) => s.sessionId === 's-busy')
+    assert.equal(typeof idle.sharedAt, 'number')
+    assert.equal(typeof idle.lastActivityAt, 'number')
+    assert.equal(idle.busy, false)
+    assert.equal(typeof idle.remainingMs, 'number', 'an idle session reports a finite countdown')
+    assert.ok(idle.remainingMs > 0)
+    assert.equal(idle.viewers, 0, 'viewers default to zero without an injected counter')
+    assert.equal(idle.title, 'title of s-idle')
+    assert.equal(busy.busy, true)
+    assert.equal(busy.remainingMs, null, 'busy means Infinity in the table, null on the wire')
+    // The titles really came through session/projections with the wire shape
+    // the typert gateway speaks. (Order-insensitive: the listing order is
+    // sharedAt-ascending and both rows may share a millisecond.)
+    assert.deepEqual(
+      parts.invokes.map((c) => ({ namespace: c.namespace, method: c.method, sessionId: c.args.request.sessionId })).sort((a, b) => (a.sessionId < b.sessionId ? -1 : 1)),
+      [
+        { namespace: 'session', method: 'projections', sessionId: 's-busy' },
+        { namespace: 'session', method: 'projections', sessionId: 's-idle' },
+      ],
+    )
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('GET shares: one failed title lookup is null and never fails the listing', async () => {
+  const parts = makeShareParts({ failTitles: ['s-boom'] })
+  parts.store.share('s-ok')
+  parts.store.share('s-boom')
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    const res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.shares.find((s) => s.sessionId === 's-ok').title, 'title of s-ok')
+    assert.equal(body.shares.find((s) => s.sessionId === 's-boom').title, null)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('GET shares: an injected viewerCount is consulted per session, a missing typert leaves titles null', async () => {
+  const parts = makeShareParts({ noTypert: true, viewerCount: (id) => (id === 's-1' ? 2 : 0) })
+  parts.store.share('s-1')
+  parts.store.share('s-2')
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    const res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.shares.find((s) => s.sessionId === 's-1').viewers, 2)
+    assert.equal(body.shares.find((s) => s.sessionId === 's-2').viewers, 0)
+    assert.equal(body.shares.find((s) => s.sessionId === 's-1').title, null, 'no typert gateway, no titles')
+    assert.equal(parts.invokes.length, 0)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('POST share: a live session joins the table; a null projection is 404 no-session', async () => {
+  const ok = makeShareParts()
+  {
+    const { server, port } = await startShareServer(ok.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-live' } })
+      assert.equal(res.status, 200)
+      assert.deepEqual(JSON.parse(res.body), { ok: true })
+      assert.equal(ok.store.isShared('s-live'), true)
+      assert.equal(ok.invokes.length, 1, 'the existence check went through projections')
+    } finally { await closeServer(server) }
+  }
+  const gone = makeShareParts({ projection: null })
+  {
+    const { server, port } = await startShareServer(gone.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-ghost' } })
+      assert.equal(res.status, 404)
+      assert.equal(JSON.parse(res.body).error.code, 'no-session')
+      assert.equal(gone.store.isShared('s-ghost'), false, 'nothing entered the table')
+    } finally { await closeServer(server) }
+  }
+})
+
+test('POST share: a failed lookup is 502, and a successful share restores busy from the roster', async () => {
+  const broken = makeShareParts({ failTitles: ['s-1'] })
+  {
+    const { server, port } = await startShareServer(broken.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-1' } })
+      assert.equal(res.status, 502, 'a projection failure is not a "no such session" answer')
+      assert.equal(JSON.parse(res.body).error.code, 'gateway-unreachable')
+      assert.equal(broken.store.isShared('s-1'), false)
+    } finally { await closeServer(server) }
+  }
+  const running = makeShareParts({ roster: [{ id: 's-new', status: 'running' }, { id: 's-other', status: 'idle' }] })
+  {
+    const { server, port } = await startShareServer(running.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-new' } })
+      assert.equal(res.status, 200)
+      const row = running.store.list().find((e) => e.sessionId === 's-new')
+      assert.equal(row.busy, true, 'a session whose agent is mid-turn is marked busy right after share')
+      assert.equal(running.store.isShared('s-other'), false, 'the rest of the roster is none of the route\'s business')
+    } finally { await closeServer(server) }
+  }
+})
+
+test('POST share without a typert gateway still works, trusting the table alone', async () => {
+  const parts = makeShareParts({ noTypert: true })
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-blind' } })
+    assert.equal(res.status, 200)
+    assert.equal(parts.store.isShared('s-blind'), true)
+    assert.equal(parts.invokes.length, 0)
+  } finally { await closeServer(server) }
+})
+
+test('POST share refuses a subagent session: the projection identity object is 400 subagent-session, null is not', async () => {
+  // dsh-subagent's subagent identity projection answers the identity OBJECT
+  // for a child, and null when no valid descriptor exists — null is what an
+  // ordinary session carries, so only the object shape may refuse.
+  const child = makeShareParts({ subagentIdentity: { mode: 'continuable', label: 'explorer', seq: 12 } })
+  {
+    const { server, port } = await startShareServer(child.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-child' } })
+      assert.equal(res.status, 400)
+      assert.equal(JSON.parse(res.body).error.code, 'subagent-session')
+      assert.equal(child.store.isShared('s-child'), false, 'a child never enters the table')
+    } finally { await closeServer(server) }
+  }
+  const plain = makeShareParts({ subagentIdentity: null })
+  {
+    const { server, port } = await startShareServer(plain.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-plain' } })
+      assert.equal(res.status, 200, 'subagent: null means no descriptor — an ordinary session')
+      assert.equal(plain.store.isShared('s-plain'), true)
+    } finally { await closeServer(server) }
+  }
+})
+
+test('a hung projections call times out per call: titles go null on GET, share refuses with 502', async () => {
+  const parts = makeShareParts({ hang: true, projectionTimeoutMs: 30 })
+  parts.store.share('s-1')
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    const startedAt = Date.now()
+    const get = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+    assert.equal(get.status, 200, 'the listing survives a hung title lookup')
+    const body = JSON.parse(get.body)
+    assert.equal(body.shares.find((s) => s.sessionId === 's-1').title, null, 'the timed-out title is null')
+    assert.ok(Date.now() - startedAt < 2000, 'the 30ms timeout — not a 5s default — freed the listing')
+
+    const post = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-new' } })
+    assert.equal(post.status, 502, 'an existence check that cannot answer is a refusal, not a silent share')
+    assert.equal(JSON.parse(post.body).error.code, 'gateway-unreachable')
+    assert.equal(parts.store.isShared('s-new'), false)
+  } finally { await closeServer(server) }
+})
+
+test('POST unshare and unshare-all leave the table with reason manual', async () => {
+  const parts = makeShareParts()
+  parts.store.share('s-1')
+  parts.store.share('s-2')
+  const reasons = []
+  parts.store.subscribe((event) => { if (event.type === 'unshared') reasons.push([event.sessionId, event.reason]) })
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    const one = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'unshare', sessionId: 's-1' } })
+    assert.equal(one.status, 200)
+    assert.equal(parts.store.isShared('s-1'), false)
+    assert.equal(parts.store.isShared('s-2'), true)
+
+    const all = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'unshare-all' } })
+    assert.equal(all.status, 200)
+    assert.deepEqual(parts.store.list(), [])
+    assert.deepEqual(reasons, [['s-1', 'manual'], ['s-2', 'manual']], 'both closes are manual server-side acts')
+  } finally { await closeServer(server) }
+})
+
+test('POST shares refuses unknown actions and missing session ids before touching the table', async () => {
+  const parts = makeShareParts()
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    const bad = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'unshare-everything' } })
+    assert.equal(bad.status, 400)
+    assert.equal(JSON.parse(bad.body).error.code, 'bad-action')
+
+    const noId = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share' } })
+    assert.equal(noId.status, 400)
+    assert.equal(JSON.parse(noId.body).error.code, 'bad-request')
+
+    const emptyId = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'unshare', sessionId: '' } })
+    assert.equal(emptyId.status, 400)
+
+    assert.deepEqual(parts.store.list(), [], 'the table never moved')
+  } finally { await closeServer(server) }
+})
+
+test('shares routes admit gateway-forwarded requests: a via-gateway device may list and toggle', async () => {
+  const parts = makeShareParts()
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    // The shape the gateway forwards: its own via marker plus Origin/Host
+    // rewritten onto the upstream origin — which passes sameOriginPost.
+    const viaHeaders = { 'x-zen-remote-via': 'gateway', ...sameOrigin(port) }
+    const get = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE, headers: viaHeaders })
+    assert.equal(get.status, 200)
+    assert.equal(JSON.parse(get.body).ok, true)
+
+    const post = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: viaHeaders, body: { action: 'share', sessionId: 's-remote' } })
+    assert.equal(post.status, 200, 'the marker wall does NOT apply to the shares route')
+    assert.equal(parts.store.isShared('s-remote'), true)
+  } finally { await closeServer(server) }
+})
+
+test('shares routes still apply admit and same-origin', async () => {
+  const denied = makeShareParts({ admit: () => ({ rejection: 401 }) })
+  {
+    const { server, port } = await startShareServer(denied.options)
+    try {
+      const get = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+      assert.equal(get.status, 401)
+      const post = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'unshare-all' } })
+      assert.equal(post.status, 401)
+    } finally { await closeServer(server) }
+  }
+  const parts = makeShareParts()
+  const { server, port } = await startShareServer(parts.options)
+  try {
+    const cross = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: { 'sec-fetch-site': 'cross-site' }, body: { action: 'unshare-all' } })
+    assert.equal(cross.status, 403)
+    assert.equal(JSON.parse(cross.body).error.code, 'origin-rejected')
+    assert.deepEqual(parts.store.list(), [])
+  } finally { await closeServer(server) }
+})
+
+test('without a store the shares routes answer 404 like any unknown admin path', async () => {
+  const { server, port } = await startAdminServer(makeOptions(gwPort))
+  try {
+    const get = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+    assert.equal(get.status, 404)
+    const post = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's' } })
+    assert.equal(post.status, 404)
+  } finally { await closeServer(server) }
+})

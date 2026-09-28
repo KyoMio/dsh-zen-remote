@@ -25,6 +25,13 @@
  *      same-origin (the gateway rewrites Origin/Host), so the marker is the
  *      only thing identifying it.
  *
+ * The ONE deliberate exception is the shares route (T33a): toggling session
+ * sharing is exactly what the spec grants the Web application端 (devices
+ * behind the gateway have full server permissions), so there the marker wall
+ * is skipped and a forwarded POST passes once it clears admit and
+ * same-origin. Desktop application clients can never reach any admin route —
+ * the gateway only forwards them into the relay prefix.
+ *
  * Every POST additionally passes sameOriginPost, and bodies are capped at
  * 16 KiB of JSON object. The handler is built by a factory so the tests can
  * drive it over a real socket with a mock gateway and a mock admit.
@@ -34,6 +41,10 @@ import { request as httpRequest } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ConfigSource, ZenRemoteConfig } from './config.js'
 import { responseJson, sameOriginPost } from './http.js'
+import type { RelayGateway } from './relay-server.js'
+import { restoreBusy } from './share-ops.js'
+import type { AgentStatusLike } from './share-ops.js'
+import type { ShareStore } from './share-store.js'
 
 /** Prefix all admin routes live under (one webServer prefix registration). */
 export const ADMIN_ROUTE_PREFIX = '/_dsh/zen-remote/admin'
@@ -51,6 +62,10 @@ export const ADMIN_ACTION_ROUTE = `${ADMIN_ROUTE_PREFIX}/action`
 /** POST: fire one fixed test notification through the gateway. */
 export const ADMIN_PUSH_TEST_ROUTE = `${ADMIN_ROUTE_PREFIX}/push-test`
 
+/** GET: every shared session with its clocks, viewers and titles.
+ * POST `{action, sessionId?}`: share / unshare / unshare-all (T33a). */
+export const ADMIN_SHARES_ROUTE = `${ADMIN_ROUTE_PREFIX}/shares`
+
 /** Longest wait for one gateway round-trip. */
 const GATEWAY_TIMEOUT_MS = 5000
 
@@ -64,6 +79,13 @@ const TEST_PUSH_TAG = 'dsh-zen-remote-test'
  * deliberately absent: minting codes is the pair route's job, and forwarding
  * it twice would only blur which surface created the live code. */
 const FORWARDABLE_ACTIONS: ReadonlySet<string> = new Set(['set-role', 'set-kind', 'rename', 'revoke', 'revoke-all'])
+
+/** The share-toggle verbs POST shares understands (T33a). */
+const SHARE_ACTIONS: ReadonlySet<string> = new Set(['share', 'unshare', 'unshare-all'])
+
+/** Longest wait for one session/projections call (titles, share existence).
+ * A hung typert gateway must not hold a route open forever. */
+const PROJECTION_TIMEOUT_MS = 5000
 
 /** Fixed test-push copy — Chinese by default, English for `lang: 'en'`
  * (`'auto'` has no requester signal here, so it falls to Chinese). */
@@ -112,6 +134,28 @@ export interface AdminHandlerOptions {
   /** Longest wait for one gateway round-trip, defaulting to 5s. Tests inject
    * a short value so a silent gateway fails the request in milliseconds. */
   timeoutMs?: number
+  /** The shared-session table backing the shares routes (T33a). Absent — a
+   * composition that never built the table — and both shares routes answer
+   * 404 like any unknown admin path. */
+  store?: ShareStore
+  /** The typertGateway service, looked up PER REQUEST through the host
+   * context's reflection layer (`ctx.get`: no inject requirement, undefined
+   * when the composition has none). Titles and the share action's existence
+   * check go through it; a failed lookup degrades — titles are null and
+   * share trusts the table alone. The lookup itself must never be allowed to
+   * throw into the route, so callers wrap it. */
+  typert?: () => RelayGateway | undefined
+  /** Live agent roster for the busy restore a successful `share` performs.
+   * Absent or throwing means "no information": nothing is marked busy. */
+  listAgents?: () => readonly AgentStatusLike[]
+  /** Current viewer count per shared session; T22b will inject the real
+   * relay counter. Defaults to zero. */
+  viewerCount?: (sessionId: string) => number
+  /** Longest wait for one session/projections call (titles and the share
+   * existence check). Default {@link PROJECTION_TIMEOUT_MS}; a timed-out
+   * title is null and a timed-out existence check is a 502. Tests inject a
+   * short value. */
+  projectionTimeoutMs?: number
 }
 
 export type AdminHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -251,6 +295,116 @@ async function respondStatus(options: AdminHandlerOptions, req: IncomingMessage,
   responseJson(res, 200, { ok: true, gateway, gatewayReachable, gatewayStatus, config, viaGateway })
 }
 
+/** One rejection after the per-call projection timeout. Timer unref'd: a
+ * settled call must not keep the process alive for the leftover tail. */
+function rejectAfter(ms: number): Promise<never> {
+  return new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new Error('projection timed out')), ms)
+    if (typeof timer === 'object' && timer !== null && typeof (timer as { unref?: unknown }).unref === 'function') {
+      ;(timer as { unref: () => void }).unref()
+    }
+  })
+}
+
+/** What one `session/projections` call can turn out to be. `no-gateway` is
+ * the composition without the service; `no-session` is DSH's own null
+ * answer for a dead session id; `values` carries the projection values
+ * (empty object when they arrived in an unexpected shape). */
+type ProjectionOutcome =
+  | { kind: 'no-gateway' }
+  | { kind: 'no-session' }
+  | { kind: 'values'; values: Record<string, unknown> }
+
+/**
+ * One call to the typert gateway's `session/projections`, under the per-call
+ * timeout. Every failure mode the route can survive is a VALUE here — only
+ * a transport failure or a timeout throws, and the caller decides what those
+ * mean (titles: null; existence: 502). The typert lookup runs INSIDE the
+ * guard: a throwing lookup is a degraded composition, not a route failure.
+ */
+async function projectionOf(options: AdminHandlerOptions, sessionId: string): Promise<ProjectionOutcome> {
+  let gateway: RelayGateway | undefined
+  try {
+    gateway = options.typert?.()
+  } catch {
+    return { kind: 'no-gateway' }
+  }
+  if (gateway === undefined) return { kind: 'no-gateway' }
+  const value = await Promise.race([
+    gateway.invoke({ namespace: 'session', method: 'projections', args: { request: { sessionId } } }),
+    rejectAfter(options.projectionTimeoutMs ?? PROJECTION_TIMEOUT_MS),
+  ])
+  if (value === null || value === undefined) return { kind: 'no-session' }
+  const values = (value as { values?: unknown }).values
+  return {
+    kind: 'values',
+    values: values !== null && typeof values === 'object' ? (values as Record<string, unknown>) : {},
+  }
+}
+
+/**
+ * One session title through `session/projections`. Anything other than a
+ * string answer — a null projection (session gone), a service-less or
+ * degraded composition, a transport failure, a timeout — is `null`, and one
+ * failed title must never fail the listing around it.
+ */
+async function titleOf(options: AdminHandlerOptions, sessionId: string): Promise<string | null> {
+  try {
+    const outcome = await projectionOf(options, sessionId)
+    if (outcome.kind !== 'values') return null
+    const title = outcome.values.title
+    return typeof title === 'string' ? title : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Prove a session exists before `share` enters it into the table, and hand
+ * back its projection values for the caller's follow-up checks. The same
+ * `session/projections` call the titles use, where a `null` projection IS
+ * the "no such live session" answer. A transport failure or timeout is NOT
+ * a null — it refuses with 502 rather than quietly sharing a session nobody
+ * could see. Without a typert gateway there is nothing to ask, and the table
+ * alone is the truth available (empty values, no objection).
+ */
+async function requireSession(options: AdminHandlerOptions, sessionId: string): Promise<Record<string, unknown>> {
+  let outcome: ProjectionOutcome
+  try {
+    outcome = await projectionOf(options, sessionId)
+  } catch {
+    throw new AdminError(502, 'gateway-unreachable', 'The session lookup failed')
+  }
+  if (outcome.kind === 'no-gateway') return {}
+  if (outcome.kind === 'no-session') throw new AdminError(404, 'no-session', `no live session "${sessionId}"`)
+  return outcome.values
+}
+
+/** GET shares: the table verbatim, plus the derived fields the settings page
+ * renders — the idle countdown (busy reads `Infinity` from the store, `null`
+ * on the wire), the current viewer count, and the session titles, fetched
+ * concurrently so one slow or failing lookup delays nobody else. */
+async function respondShares(options: AdminHandlerOptions, res: ServerResponse): Promise<void> {
+  const store = options.store as ShareStore
+  const viewerCount = options.viewerCount ?? (() => 0)
+  const shares = store.list().map((entry) => {
+    const remaining = store.remainingMs(entry.sessionId)
+    return {
+      sessionId: entry.sessionId,
+      sharedAt: entry.sharedAt,
+      lastActivityAt: entry.lastActivityAt,
+      busy: entry.busy,
+      remainingMs: remaining === Infinity ? null : remaining,
+      viewers: viewerCount(entry.sessionId),
+      title: null as string | null,
+    }
+  })
+  await Promise.all(shares.map(async (row) => {
+    row.title = await titleOf(options, row.sessionId)
+  }))
+  responseJson(res, 200, { ok: true, shares })
+}
+
 /**
  * Build the admin route handler for one plugin row. The returned handler
  * owns the full response lifecycle of every request under
@@ -278,6 +432,80 @@ export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
           return
         }
         await respondStatus(options, req, res)
+        return
+      }
+      if (route === ADMIN_SHARES_ROUTE) {
+        // No table, no route: a composition that never built the share store
+        // answers like any unknown admin path.
+        if (options.store === undefined) {
+          responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown admin route' } })
+          return
+        }
+        if (method === 'GET') {
+          await respondShares(options, res)
+          return
+        }
+        if (method === 'POST') {
+          // The deliberate exception to the marker wall (see the module
+          // comment): the Web application端 behind the gateway may toggle
+          // sharing, so a via-gateway POST is NOT refused here. Same-origin
+          // still applies — a forwarded request passes it because the
+          // gateway rewrites Origin/Host onto the upstream origin.
+          if (!sameOriginPost(req)) {
+            responseJson(res, 403, {
+              ok: false,
+              error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+            })
+            return
+          }
+          const body = await readJsonBody(req)
+          const action = body.action
+          if (typeof action !== 'string' || !SHARE_ACTIONS.has(action)) {
+            responseJson(res, 400, {
+              ok: false,
+              error: { code: 'bad-action', message: `action must be one of ${[...SHARE_ACTIONS].join(', ')}` },
+            })
+            return
+          }
+          const store: ShareStore = options.store
+          if (action === 'unshare-all') {
+            for (const entry of store.list()) store.unshare(entry.sessionId, 'manual')
+            responseJson(res, 200, { ok: true })
+            return
+          }
+          const sessionId = body.sessionId
+          if (typeof sessionId !== 'string' || sessionId === '') {
+            responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'sessionId is required' } })
+            return
+          }
+          if (action === 'share') {
+            const values = await requireSession(options, sessionId)
+            // Subagent children never enter the table — they inherit
+            // reachability through the parent chain. DSH marks the identity
+            // in the projection's `subagent` field (dsh-subagent folds
+            // `subagent/descriptor` events; the view is the identity object
+            // or null — null ⟺ no valid descriptor, so OBJECT is the
+            // subagent answer, never merely "not undefined").
+            if (values.subagent !== null && typeof values.subagent === 'object') {
+              responseJson(res, 400, {
+                ok: false,
+                error: { code: 'subagent-session', message: 'subagent sessions are reachable through their parent and cannot be shared alone' },
+              })
+              return
+            }
+            store.share(sessionId)
+            // A session whose agent is mid-turn must not look idle: the same
+            // restore a restart runs, scoped to whatever runs right now.
+            restoreBusy(store, options.listAgents ?? (() => []))
+            responseJson(res, 200, { ok: true })
+            return
+          }
+          store.unshare(sessionId, 'manual')
+          responseJson(res, 200, { ok: true })
+          return
+        }
+        res.setHeader('Allow', 'GET, POST')
+        responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET or POST' } })
         return
       }
       if (route === ADMIN_PAIR_ROUTE || route === ADMIN_ACTION_ROUTE || route === ADMIN_PUSH_TEST_ROUTE) {

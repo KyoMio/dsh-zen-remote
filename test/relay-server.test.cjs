@@ -509,6 +509,69 @@ test('invoke: a body past the 1 MiB cap drains and answers 400', async () => {
   } finally { await server.stop() }
 })
 
+// ---- client unshare (T33a) -----------------------------------------------------------
+
+test('unshare: a session in the table is closed with reason client', async () => {
+  const parts = makeParts('unshare-ok')
+  parts.store.share('session-a')
+  const reasons = []
+  parts.store.subscribe((event) => { if (event.type === 'unshared') reasons.push([event.sessionId, event.reason]) })
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/unshare', post('/u', { sessionId: 'session-a' }, AUTH))
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { ok: true })
+    assert.equal(parts.store.isShared('session-a'), false)
+    assert.deepEqual(reasons, [['session-a', 'client']], 'the close is a desktop-client act, not a manual one')
+  } finally { await server.stop() }
+})
+
+test('unshare: a session outside the table is 403 not-shared — children cannot be closed alone', async () => {
+  // parentOf says session-child hangs under a shared parent: isAccessible
+  // would answer true, but the route deliberately consults the TABLE only
+  // (a child leaves remote access with its family or not at all).
+  const parts = makeParts('unshare-child', { parentOf: (id) => (id === 'session-child' ? 'session-parent' : undefined) })
+  parts.store.share('session-parent')
+  const server = await startServer(parts.handler)
+  try {
+    const child = await server.fetch('/_dsh/zen-remote/relay/v1/unshare', post('/u', { sessionId: 'session-child' }, AUTH))
+    assert.equal(child.status, 403)
+    assert.deepEqual(await child.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.store.isShared('session-parent'), true, 'the parent share is untouched')
+
+    const stranger = await server.fetch('/_dsh/zen-remote/relay/v1/unshare', post('/u', { sessionId: 'never-shared' }, AUTH))
+    assert.equal(stranger.status, 403)
+    assert.deepEqual(await stranger.json(), { ok: false, error: { code: 'not-shared' } })
+  } finally { await server.stop() }
+})
+
+test('unshare: malformed bodies and fields are 400, bad auth is the uniform 401', async () => {
+  const parts = makeParts('unshare-bad')
+  parts.store.share('session-a')
+  const server = await startServer(parts.handler)
+  try {
+    const cases = [
+      ['no body', { method: 'POST', headers: AUTH }],
+      ['missing sessionId', post('/u', {}, AUTH)],
+      ['empty sessionId', post('/u', { sessionId: '' }, AUTH)],
+      ['non-string sessionId', post('/u', { sessionId: 3 }, AUTH)],
+    ]
+    for (const [label, opts] of cases) {
+      const res = await server.fetch('/_dsh/zen-remote/relay/v1/unshare', opts)
+      assert.equal(res.status, 400, label)
+      assert.deepEqual(await res.json(), { ok: false, error: { code: 'bad-request' } }, label)
+    }
+    assert.equal(parts.store.isShared('session-a'), true, 'nothing was closed')
+
+    const anonymous = await server.fetch('/_dsh/zen-remote/relay/v1/unshare', post('/u', { sessionId: 'session-a' }, {}))
+    assert.equal(anonymous.status, 401)
+    assert.deepEqual(await anonymous.json(), { ok: false, error: { code: 'relay-unauthorized' } })
+
+    const wrongMethod = await server.fetch('/_dsh/zen-remote/relay/v1/unshare', { method: 'GET', headers: AUTH })
+    assert.equal(wrongMethod.status, 404)
+  } finally { await server.stop() }
+})
+
 // ---- routing ---------------------------------------------------------------------------
 
 test('routing: unknown paths, wrong methods, and %2F-shaped paths are all 404', async () => {

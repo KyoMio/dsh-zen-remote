@@ -427,6 +427,25 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       return
     }
 
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/unshare`) {
+      const body = await readJsonObject(req)
+      const sessionId = body?.sessionId
+      if (typeof sessionId !== 'string' || sessionId === '') {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      // The TABLE only — isShared, not isAccessible: a subagent or fork
+      // session never entered the table, so it cannot be closed alone; it
+      // leaves remote access together with its family or not at all.
+      if (!store.isShared(sessionId)) {
+        responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+        return
+      }
+      store.unshare(sessionId, 'client')
+      responseJson(res, 200, { ok: true })
+      return
+    }
+
     if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/invoke`) {
       const body = await readJsonObject(req)
       const namespace = body?.namespace
