@@ -43,5 +43,10 @@ test('send gives the gap back whenever a ring precedes it', () => {
 test('the ContextMeter dock is lifted back beside send on the phone', () => {
   // 0.1.7 renders the ring in a _dock line under the card; unlifted it
   // falls to the bottom of the phone screen.
-  assert.match(strip(section), /\$\{ROOT\} > \[class\$="_dock"\] \{\s*position: absolute !important;/)
+  // Anchored to the CARD (shared grid cell), not to ROOT's safe-area-padded
+  // bottom edge — an absolute bottom offset sat low on a real iPhone.
+  assert.match(strip(section), /\$\{ROOT\} > \[class\$="_dock"\] \{\s*grid-area: 1 \/ 1 !important;\s*align-self: end !important;\s*justify-self: end !important;/)
+  assert.doesNotMatch(strip(section), /_dock"\] \{\s*position: absolute/)
+  // Ring only on the phone: the percentage label is hidden.
+  assert.match(strip(section), /_dock"\] button\[class\$="_trigger"\] > span \{\s*display: none !important;/)
 })
