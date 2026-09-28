@@ -21,9 +21,10 @@
  * failed refresh keeps the last ready data and says so in a banner — only a
  * failed FIRST load enters the error state, because saving a restart-required
  * field reloads the plugin row (T17) and the first post-save refresh can land
- * inside that reload window (a second pull follows 1.5s later). Every status
- * request carries a latest-wins ticket (T15-fix 4), so an earlier request
- * that answers late cannot overwrite newer data.
+ * inside that reload window (further pulls follow at 1.5s, and for a
+ * row-reloading save at 3s and 6s, T17b). Every status request carries a
+ * latest-wins ticket (T15-fix 4), so an earlier request that answers late
+ * cannot overwrite newer data.
  *
  * Opened through the gateway (`viaGateway`, i.e. on a phone or another
  * browser) the server-local buttons disable and a notice says so — and until

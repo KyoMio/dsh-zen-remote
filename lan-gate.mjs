@@ -121,12 +121,32 @@ export function apply(ctx, config) {
         console.error(`[dsh-zen-remote-gateway] spawn failed: ${String(err && err.message || err)}`)
       })
       if (timer) {
-        timer.timeout(() => {
-          const r = handle && handle.collected && handle.collected.stdout
-          if (r) { const read = r.readFrom(0); if (read && read.text) console.log(`[dsh-zen-remote-gateway] ${read.text.trim()}`) }
-          const e = handle && handle.collected && handle.collected.stderr
-          if (e) { const eread = e.readFrom(0); if (eread && eread.text) console.error(`[dsh-zen-remote-gateway] stderr: ${eread.text.trim()}`) }
-        }, 1500)
+        // 子进程输出读两拍（T17b-fix）：1.5s 的一拍是老习惯，但网关遇到端口
+        // 被占会在同端口重试最多约 3 秒（lib/lan-gate-server.cjs），最终的
+        // `falling back to port N` / `listening on …:N` 都可能晚于它——桌面
+        // 端不写日志文件，这条 console 是用户看到网关最终端口的唯一出口。
+        // 所以 4.5s 再读一拍增量：用上一拍返回的 nextOffset 继续 readFrom
+        // （dsh-subprocess-local OutputCollector 的全流字节坐标），已打印过
+        // 的内容不会重复；offset 滑出内存尾窗口（lossy）时没有可靠增量，
+        // 宁可跳过也不重印整段尾——网关输出量级（131072 上限）远达不到。
+        const offsets = { stdout: 0, stderr: 0 }
+        const drainOnce = () => {
+          const collected = handle && handle.collected
+          if (!collected) return
+          const streams = [
+            ['stdout', (text) => console.log(`[dsh-zen-remote-gateway] ${text}`)],
+            ['stderr', (text) => console.error(`[dsh-zen-remote-gateway] stderr: ${text}`)],
+          ]
+          for (const [stream, log] of streams) {
+            const collector = collected[stream]
+            if (!collector) continue
+            const read = collector.readFrom(offsets[stream])
+            if (read && read.text && !read.lossy) log(read.text.trim())
+            if (read && typeof read.nextOffset === 'number') offsets[stream] = read.nextOffset
+          }
+        }
+        timer.timeout(drainOnce, 1500)
+        timer.timeout(drainOnce, 4500)
       }
     } catch (err) {
       console.error(`[dsh-zen-remote-gateway] ${String(err && err.message || err)}`)

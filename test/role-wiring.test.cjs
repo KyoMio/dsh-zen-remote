@@ -478,9 +478,11 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
   index.apply(host.ctx, {})
   assert.deepEqual(
     host.listeners.map((l) => l.event),
-    // T33a adds the fresh-creation feed right behind the activity feed.
-    ['session/event', 'agent/created'],
-    'the host role subscribes the session/event and agent/created feeds',
+    // T33a adds the fresh-creation feed right behind the activity feed; T17b
+    // adds the loader's volatile-update signal (the restart watcher's
+    // immediate trigger) with the watcher effect.
+    ['session/event', 'agent/created', 'loader/volatile-update'],
+    'the host role subscribes the session/event and agent/created feeds plus the volatile-update signal',
   )
   assert.equal(typeof host.listeners[0].listener, 'function')
   // The sweeper is registered through ctx.effect, whose callback returns the
@@ -496,7 +498,11 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
 
   const client = makeCtx()
   index.apply(client.ctx, { role: 'client' })
-  assert.equal(client.listeners.length, 0, "the client role never subscribes session/event")
+  assert.deepEqual(
+    client.listeners.map((l) => l.event),
+    ['loader/volatile-update'],
+    'the client role never subscribes the session feeds but still watches for volatile updates',
+  )
   assert.equal(client.effects.length, 1, "the client role starts only the restart watcher")
   assert.equal(typeof client.effects[0], 'function', 'the watcher effect returned a stop function')
   client.effects[0]()
@@ -893,6 +899,46 @@ test('T17: a restart-required row change reloads the row exactly once; a live-re
   assert.equal(restarts.length, 1, 'the watcher stopped after firing')
 })
 
+test('T17b: a loader/volatile-update dispatch reloads the row immediately, without waiting for the poll', async () => {
+  const index = await import(INDEX_URL)
+  const restarts = []
+  const { ctx, listeners } = makeCtx()
+  ctx.fiber = { restart: () => { restarts.push(1); return Promise.resolve() } }
+  const row = { port: 4000, serverName: 'before' }
+  index.apply(ctx, row)
+  const update = listeners.find((l) => l.event === 'loader/volatile-update')
+  assert.ok(update, 'apply subscribes loader/volatile-update on the row context')
+
+  // A volatile-only save lands and the loader announces it — dispatched
+  // synchronously, BEFORE any 2s poll tick can run. The restart must not
+  // wait for the poll.
+  row.port = 4001
+  update.listener()
+  assert.equal(restarts.length, 1, 'the dispatch reloaded the row on the spot')
+  // Exactly once: later dispatches and the (already stopped) poll stay quiet.
+  row.port = 4002
+  update.listener()
+  await sleep(2300)
+  assert.equal(restarts.length, 1, 'the watcher is disarmed after the event fired')
+})
+
+test('T17b: a volatile-update dispatch touching only live-read fields never reloads', async () => {
+  const index = await import(INDEX_URL)
+  const restarts = []
+  const { ctx, listeners } = makeCtx()
+  ctx.fiber = { restart: () => { restarts.push(1); return Promise.resolve() } }
+  const row = { port: 4000, serverName: 'before' }
+  index.apply(ctx, row)
+  const update = listeners.find((l) => l.event === 'loader/volatile-update')
+  row.serverName = 'after'
+  update.listener()
+  assert.equal(restarts.length, 0, 'the fingerprint did not move: no reload')
+  // The watcher stays armed: a real restart-field move still reloads.
+  row.port = 4001
+  update.listener()
+  assert.equal(restarts.length, 1, 'the same watcher still catches the restart-field move')
+})
+
 test('resolveRole normalizes to host or client', async () => {
   const index = await import(INDEX_URL)
   assert.equal(index.resolveRole(undefined), 'host')
@@ -903,6 +949,12 @@ test('resolveRole normalizes to host or client', async () => {
   assert.equal(index.resolveRole({ role: 'x' }), 'host')
   assert.equal(index.resolveRole({ role: 'Host' }), 'host')
   assert.equal(index.resolveRole({ role: 123 }), 'host')
+  // T17b: since every field is volatile, the row hands over `{ get() }`
+  // live references — resolveRole must unwrap before comparing, or a client
+  // row would always answer host.
+  assert.equal(index.resolveRole({ role: { get: () => 'client' } }), 'client', 'the volatile wrapper is unwrapped')
+  assert.equal(index.resolveRole({ role: { get: () => 'host' } }), 'host')
+  assert.equal(index.resolveRole({ role: { get: () => 'x' } }), 'host')
 })
 
 test('cordis.patch.yml carries exactly one insert row: the main entry', () => {

@@ -21,9 +21,10 @@
  * failed refresh keeps the last ready data and says so in a banner — only a
  * failed FIRST load enters the error state, because saving a restart-required
  * field reloads the plugin row (T17) and the first post-save refresh can land
- * inside that reload window (a second pull follows 1.5s later). Every status
- * request carries a latest-wins ticket (T15-fix 4), so an earlier request
- * that answers late cannot overwrite newer data.
+ * inside that reload window (further pulls follow at 1.5s, and for a
+ * row-reloading save at 3s and 6s, T17b). Every status request carries a
+ * latest-wins ticket (T15-fix 4), so an earlier request that answers late
+ * cannot overwrite newer data.
  *
  * Opened through the gateway (`viaGateway`, i.e. on a phone or another
  * browser) the server-local buttons disable and a notice says so — and until
@@ -481,8 +482,10 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
 
   // T17: saving any restart-required field (the role among them) moves the
   // row, and the host half's watcher reloads it — the gateway child restarts
-  // with it. The note rides the staged-drafts flag, so it appears the moment
-  // such a field is edited and vanishes on discard or save.
+  // with it. T17b narrowed the flag to drafts that would actually change the
+  // effective value (a re-typed identical value or an env-locked field no
+  // longer promise a reload), so the note appears exactly when a save will
+  // move the row, and vanishes on discard or save.
   const reloadPending = form.restartPending
 
   // The code shown under the pairing controls: the refreshed status's, or the
@@ -660,20 +663,33 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
   )
 
   const clientView = clientLoad.state === 'ready' || clientLoad.state === 'stale' ? clientLoad.view : undefined
-  const saveLanded = (): void => {
+  // Whether a landed save moved a restart-required field — read BEFORE save()
+  // clears the staged drafts (T17b): the projected snapshot's restartPending
+  // is exactly "the plan writes a restart-field op" (value actually differs,
+  // not env-locked), which is what decides the refresh cadence below.
+  const saveReloadsRow = (): boolean => config.getSnapshot().restartPending
+  const saveLanded = (reloadsRow: boolean): void => {
     // A landed save that switched the role drops the OTHER role's data right
     // away (T16-fix 3) — a stale device list or connection line must not
     // survive the switch, and the poll effect alone would leave the old
-    // body on screen. The delayed second pull re-reads the role at fire
-    // time: the first pull can land inside a row-restart window.
+    // body on screen. The delayed pulls re-read the role at fire time: the
+    // first pull can land inside a row-restart window.
     if (config.savedRoleIsClient()) setLoad({ state: 'loading' })
     else setClientLoad({ state: 'loading' })
     const refresh = config.savedRoleIsClient() ? loadClientStatus : loadStatus
     refresh()
-    refreshTimers.current.push(window.setTimeout(() => {
-      if (config.savedRoleIsClient()) loadClientStatus()
-      else loadStatus()
-    }, 1500))
+    // Immediate pull + 1.5s covers a hot-only save. A save that reloads the
+    // plugin row (T17) restarts the row and the gateway child with it — the
+    // reload and the gateway's rebinding of its port both take longer than
+    // one slot, so two more pulls at 3s and 6s cover the whole window
+    // (T17b); each pull re-reads the role in case the switch lands mid-way.
+    const pulls: readonly number[] = reloadsRow ? [1500, 3000, 6000] : [1500]
+    for (const delay of pulls) {
+      refreshTimers.current.push(window.setTimeout(() => {
+        if (config.savedRoleIsClient()) loadClientStatus()
+        else loadStatus()
+      }, delay))
+    }
   }
 
   return (
@@ -701,7 +717,10 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
         <SettingsForm
           labels={labels}
           state={form}
-          onSave={() => { void config.save().then((landed) => { if (landed) saveLanded() }) }}
+          onSave={() => {
+            const reloadsRow = saveReloadsRow()
+            void config.save().then((landed) => { if (landed) saveLanded(reloadsRow) })
+          }}
           onDiscard={() => { config.discard() }}
         >
           <h3 className="zr-settings-card-title">{t('settings.roleTitle')}</h3>
