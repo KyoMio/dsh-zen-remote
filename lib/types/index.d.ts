@@ -28,6 +28,12 @@ export declare const UPLOAD_DIR = ".dsh-uploads";
 export declare const DEFAULT_MAX_UPLOAD_BYTES: number;
 /** Host half config. */
 export interface MobileNavConfig {
+    /** Which parts of the plugin run in this DSH process. `'host'` — the
+     * default, and the fallback for any value that is not exactly `'client'` —
+     * additionally loads the gateway and push sub-plugins; `'client'` mounts
+     * only the three host routes, for setups where another DSH process owns
+     * the channel. */
+    role?: 'host' | 'client';
     /** Max upload body in bytes; larger bodies get 413. Default {@link DEFAULT_MAX_UPLOAD_BYTES}. */
     maxUploadBytes?: number;
     /** Fold each turn's process at every viewport width, not just below the
@@ -60,6 +66,13 @@ export interface MobileNavConfig {
  * between a hand-edited YAML row and the browser, so it is asserted directly.
  */
 export declare function clamped(key: string, value: number | undefined, min: number, max: number): Record<string, number>;
+/**
+ * The normalized role behind the row's `role` knob. Anything but the exact
+ * string `'client'` means host, so a typo degrades to the full plugin rather
+ * than silently dropping the gateway and push halves. Exported for
+ * test/role-wiring.test.cjs.
+ */
+export declare function resolveRole(config: MobileNavConfig | undefined): 'host' | 'client';
 /**
  * Accept a state-changing request only from this DSH Web application's origin.
  *
@@ -109,6 +122,14 @@ export declare function handleUpload(ctx: Context, maxBytes: number, req: Incomi
  * exist. Both are injected INSIDE apply rather than declared as a top-level
  * `inject`, so the plugin row still loads (and the browser half still ships)
  * in a composition without them — Electron carries no webServer.
+ *
+ * On the host role (the default) this row also loads the gateway and push
+ * sub-plugins, each with the SAME config object this apply received. Cordis
+ * honors a sub-plugin's own `inject` before calling its apply and routes
+ * fiber failures into the context logger, so a fire-and-forget call is the
+ * whole contract. The optional call exists for the route tests' fake
+ * contexts, which predate this wiring and carry no `plugin`; production
+ * cordis contexts always do.
  * @param ctx - host plugin context.
  * @param config - optional body cap override.
  */

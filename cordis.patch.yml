@@ -1,17 +1,18 @@
-# dsh-zen-remote — bundle patch layer（一个包，三行 insert）
+# dsh-zen-remote — bundle patch layer（一个包，一行 insert）
 #
 # 当 profile 的 dsh.profile.bundles 列了这个包时整层生效
 # （`dsh plugin --profile web add dsh-zen-remote` 会自动写进去）。
-# 三行都随包自带，用户不需要在自己的 profile patch 里手挂任何一行。
+# 随包自带，用户不需要在自己的 profile patch 里手挂任何一行。
+#
+# 2.0.0 起网关（lan-gate.mjs）和推送（dsh-push.mjs）不再各占一行：它们的
+# 行配置拿不到别的行的配置，而 2.0.0 要给插件加一个按行生效的 role 开关，
+# 所以改由主入口读行配置里的 role，再按角色用 ctx.plugin() 加载这两个
+# 子插件。role 缺省或非法值一律按 host，也就是原来的三行行为。旧的
+# dsh-zen-remote-gateway / dsh-zen-remote-push 行如果还残留在你的 profile
+# patch 里，loader 只会打一条警告并跳过，删掉即可。
 - insert:
-    # 界面半边：浏览器端 app 外壳（经 package.json 的 dsh.client 发现）
-    # + host 侧唯一一条路由（手机附件上传端点）。
+    # 界面半边（浏览器端 app 外壳，经 package.json 的 dsh.client 发现）
+    # + host 侧路由（附件上传 / 客户端配置 / 分享导出）
+    # + 按角色加载的网关与推送子插件。
     - id: dsh-zen-remote
       name: dsh-zen-remote
-    # 通道半边：spawn 网关子进程（配对认证 / PWA 注入 / 反代到 DSH）。
-    - id: dsh-zen-remote-gateway
-      name: dsh-zen-remote/lan-gate.mjs
-    # 推送半边：agent 回合结束推送 + 模型工具 push_notify。
-    # 以前要用户自己在 profile 的 cordis.patch.yml 里手挂，现在随包自带。
-    - id: dsh-zen-remote-push
-      name: dsh-zen-remote/dsh-push.mjs
