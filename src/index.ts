@@ -26,6 +26,7 @@ import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session'
 import { readFileConfig, resolveConfig } from './config.js'
+import { createActivityTracker, createParentIndex, startSweeper } from './activity.js'
 import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
 import { responseJson, sameOriginPost } from './http.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
@@ -403,14 +404,52 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         }),
       }), 'dsh-zen-remote: admin routes')
     })
-    // The shared-session table backing the relay's access control. Only the
-    // relay route consumes it in this task: idle sweeps, event listeners and
-    // the settings surface are later tasks.
+    // The shared-session table backing the relay's access control. The relay
+    // route consumes it below; the activity tracker and idle sweeper (T22c)
+    // keep its "quiet for idleHours → close" promise. The settings surface is
+    // a later task.
     const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
     const store = createShareStore({
       file: join(home, 'zen-remote-shares.json'),
       idleHours: effective.values.idleHours,
     })
+    // Keep the table's clocks honest (T22c). The subscription mirrors
+    // dsh-push.mjs's session/event listener — post-commit append feed for
+    // EVERY session, subagent children included. The session id is read off
+    // the Session object itself: `session.id` (a getter over the durable
+    // header's single copy, per @deepseek-ai/dsh-session's Session type),
+    // same field the push half reads through exec.agent.session.id. An event
+    // that somehow arrives without a usable id is ignored, and listener
+    // registration failure degrades to a warning like the push half's.
+    // The parent index (T22c-fix) records subagent→parent links off the same
+    // events' headers — DSH 0.2.0 dsh-session's validateSessionHeader pins
+    // the two fields (`origin` is only ever 'subagent', `parentSession` a
+    // string) — so a background child's motion refreshes its ancestors'
+    // clocks and the relay can walk the same chain for reachability.
+    const parentIndex = createParentIndex()
+    const tracker = createActivityTracker(store, parentIndex.parentOf)
+    try {
+      ctx.on('session/event', (session, event) => {
+        // Record the parent link BEFORE tracking, so a child's very first
+        // event already reaches its ancestors.
+        parentIndex.observe(session)
+        const sessionId: unknown = session?.id
+        if (typeof sessionId !== 'string' || sessionId === '') return
+        tracker.onEvent(sessionId, event.type)
+      })
+    } catch (error) {
+      ctx.logger.warn('dsh-zen-remote cannot listen on "session/event": %s', message(error))
+    }
+    // The idle sweeper (T22c): every minute, hand the table the CURRENT
+    // idleHours and let it close sessions quiet past that. idleHours is a
+    // volatile row field, so getIdleHours re-resolves from the SAME row
+    // object apply() received at every tick — never snapshotted (the same
+    // discipline as serverName in the relay route above); an illegal value
+    // falls back inside resolveConfig, and share-store ignores the rest.
+    ctx.effect(
+      () => startSweeper({ store, getIdleHours: () => resolveConfig(config, readFileConfig(), process.env).values.idleHours }),
+      'dsh-zen-remote: idle sweeper',
+    )
     // The relay routes live where the typertGateway service does (0.2.0
     // compositions): a composition without it — 0.1.7, Electron — simply
     // never mounts them, and the relay prefix stays unrouted.
@@ -425,6 +464,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           secret: relaySecret,
           store,
           gateway: gatewayService,
+          // Subagent reachability (T22c-fix): isAccessible walks the same
+          // child→parent chain the activity tracker keeps fresh.
+          parentOf: parentIndex.parentOf,
           serverInfo: {
             serverId: loadServerId(home),
             // serverName is a volatile row setting ({ get() } wrapped) that

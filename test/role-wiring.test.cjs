@@ -53,17 +53,22 @@ test.after(() => {
 })
 
 /** Fake Cordis context: records every plugin() call (module namespace +
- * config), no-ops inject/effect like the route tests do. Neither sub-plugin
- * is executed — the namespace objects are only inspected. */
+ * config) and every ctx.on subscription + ctx.effect return, no-ops
+ * inject/effect like the route tests do. Neither sub-plugin is executed —
+ * the namespace objects are only inspected. The `on` record and the effect
+ * returns are what the T22c wiring test asserts on. */
 function makeCtx() {
   const calls = []
+  const listeners = []
+  const effects = []
   const ctx = {
     plugin(module, config) { calls.push({ module, config }) },
+    on(event, listener) { listeners.push({ event, listener }) },
     inject() {},
-    effect() {},
+    effect(fn) { effects.push(fn()) },
     logger: { warn() {} },
   }
-  return { ctx, calls }
+  return { ctx, calls, listeners, effects }
 }
 
 test('apply loads both sub-plugins with the resolved values on the default role', async () => {
@@ -152,6 +157,7 @@ test("role 'client' mounts all three routes through a real inject and never call
   // wanted proof the client role still serves the phone's three routes.
   const ctx = {
     plugin: (module, config) => { pluginCalls.push({ module, config }) },
+    on() {},
     effect(fn) { fn() },
     inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
   }
@@ -170,6 +176,7 @@ test("role 'client' mounts all three routes through a real inject and never call
   const hostServices = { ...services, webServer: { register: (route) => { hostRoutes.push(route); return () => {} } } }
   const hostCtx = {
     plugin: (module, config) => { pluginCalls.push({ module, config }) },
+    on() {},
     effect(fn) { fn() },
     inject(deps, cb) { if (deps.every((d) => hostServices[d] !== undefined)) cb(Object.assign(Object.create(hostCtx), hostServices)) },
   }
@@ -197,6 +204,7 @@ test('admin routes register on the host role only', async () => {
     }
     const ctx = {
       plugin() {},
+      on() {},
       effect(fn) { fn() },
       inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
     }
@@ -242,6 +250,7 @@ test('the admin handler resolves config per request, volatile fields included', 
   }
   const ctx = {
     plugin() {},
+    on() {},
     effect(fn) { fn() },
     inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
   }
@@ -284,6 +293,7 @@ function makeWiringCtx(record) {
   }
   const ctx = {
     plugin: (module, config) => { record.plugins.push({ module, config }) },
+    on() {},
     effect(fn) { fn() },
     inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
   }
@@ -365,6 +375,64 @@ test('T22a-fix: the minted relaySecret opens the registered relay handler, a wro
   assert.equal(wrong.status, 401, 'any other secret is refused')
   const absent = await call(undefined)
   assert.equal(absent.status, 401, 'no secret is refused')
+})
+
+// ---- T22c: activity tracking wiring ------------------------------------------
+
+test('T22c: the host role subscribes session/event and registers the sweeper stop; the client role does neither', async () => {
+  const index = await import(INDEX_URL)
+
+  const host = makeCtx()
+  index.apply(host.ctx, {})
+  assert.deepEqual(
+    host.listeners.map((l) => l.event),
+    ['session/event'],
+    'the host role subscribes exactly the session/event feed',
+  )
+  assert.equal(typeof host.listeners[0].listener, 'function')
+  // The sweeper is registered through ctx.effect, whose callback returns the
+  // stop function Cordis calls on disposal — captured here as the effect's
+  // return value. makeCtx's no-op inject never fires, so the ONLY effect on
+  // this ctx is the sweeper.
+  assert.equal(host.effects.length, 1, 'the host role starts exactly the idle sweeper')
+  assert.equal(typeof host.effects[0], 'function', 'the effect returned a stop function')
+  host.effects[0]() // calling it right away must be safe (and stops the real 60s timer)
+
+  const client = makeCtx()
+  index.apply(client.ctx, { role: 'client' })
+  assert.equal(client.listeners.length, 0, "the client role never subscribes session/event")
+  assert.equal(client.effects.length, 0, "the client role never starts the sweeper")
+})
+
+test('T22c-fix: the captured session/event listener refreshes the shared table and ignores id-less sessions', async () => {
+  const index = await import(INDEX_URL)
+  // The store is born inside apply() reading <DSH_HOME>/zen-remote-shares.json,
+  // so the test pre-seeds session 'x' with an hour-old stamp BEFORE apply and
+  // watches that file afterwards: the first touch after a load is written
+  // through immediately (share-store's 60s throttle only caps REPEAT writes).
+  const sharesFile = path.join(TEMP_HOME, 'zen-remote-shares.json')
+  const oldStamp = Date.now() - 3_600_000
+  fs.writeFileSync(sharesFile, JSON.stringify({
+    version: 1,
+    sessions: { x: { sharedAt: oldStamp, lastActivityAt: oldStamp } },
+  }))
+  const { ctx, listeners } = makeCtx()
+  index.apply(ctx, {})
+  const listener = listeners.find((l) => l.event === 'session/event').listener
+
+  // A session-shaped stub carrying the DSH header fields the parent index
+  // reads (validateSessionHeader: origin only ever 'subagent', parentSession
+  // a string). The event must reach the table's clock for 'x'.
+  listener({ id: 'x', header: { origin: 'subagent', parentSession: 'p' } }, { type: 'user/message' })
+  const after = JSON.parse(fs.readFileSync(sharesFile, 'utf8'))
+  assert.ok(after.sessions.x.lastActivityAt > oldStamp, 'the event refreshed the shared session clock')
+
+  listener({}, { type: 'user/message' })
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(sharesFile, 'utf8')),
+    after,
+    'an id-less session is ignored end to end — the file does not move',
+  )
 })
 
 test('resolveRole normalizes to host or client', async () => {
