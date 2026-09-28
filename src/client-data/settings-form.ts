@@ -25,6 +25,8 @@
  * (devices / pairing) plus the T14 envelope (ok / gateway / config / viaGateway).
  */
 
+import { RESTART_FIELDS } from '../restart-fields.ts'
+
 // --- wire shapes -----------------------------------------------------------
 
 /** Where a resolved field value came from (mirror of src/config.ts's union; the client half cannot import the host module). */
@@ -243,28 +245,15 @@ export function settingsPollOf(
 // --- T17: the plugin-reload note ------------------------------------------------
 
 /**
- * The row fields whose changed value reloads the plugin row after a save
- * (the mirror of RESTART_FIELDS in the host half's src/restart-watcher.ts;
- * the host re-resolves these and restarts itself when they move). Only the
- * fields this page edits can appear here — the note reads staged drafts, and
- * `targetPort` / `pushEvents` are not page fields — but the list is the full
- * mirror so a host-side change surfaces in the diff.
+ * The row fields whose changed value reloads the plugin row after a save —
+ * re-exported from src/restart-fields.ts, the single list the host half's
+ * restart watcher fingerprints too (T17b collapsed the two copies; the leaf
+ * module is dependency-free so the client bundler can inline it). Only the
+ * fields this page edits can ever stage a draft here — `targetPort` /
+ * `pushEvents` are not page fields — but the list is the full shared set so
+ * a host-side change surfaces in the diff.
  */
-export const RESTART_FIELDS: readonly string[] = [
-  'role',
-  'port',
-  'host',
-  'targetPort',
-  'rateLimit',
-  'trustedProxies',
-  'vapidSubject',
-  'lang',
-  'pushEvents',
-  'pushDebounceMs',
-  'pushSummary',
-  'pushTurnEnd',
-  'pushTool',
-]
+export { RESTART_FIELDS } from '../restart-fields.ts'
 
 // --- staged form (row layer) -----------------------------------------------
 
@@ -655,9 +644,13 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
   idleHours: SettingsFieldState
   autoShareNewSessions: SettingsFieldState
   deviceToken: SettingsSecretFieldState
-  /** A restart-required field ({@link RESTART_FIELDS}) has a staged change:
-   * the save will move the row and the host reloads it, briefly restarting
-   * the gateway — the page shows the reload note while this is true. */
+  /** A restart-required field ({@link RESTART_FIELDS}) has a staged change a
+   * save would actually write: the save will move the row and the host
+   * reloads it, briefly restarting the gateway — the page shows the reload
+   * note while this is true. Since T17b it is not merely "a draft exists":
+   * a draft equal to the displayed effective value is no change at all, an
+   * invalid draft blocks the save instead of saving anything, and an
+   * env-locked field never stages (nor counts if locked after staging). */
   restartPending: boolean
 }
 
@@ -1039,15 +1032,23 @@ export class ZenRemoteSettingsForm {
         locked: this.lockedFields.has(spec.field),
       }
     }
+    // One plan drives both flags: dirty is "any write at all", and
+    // restartPending (T17b) is "a write touching a restart-required field" —
+    // derived from plan()'s own op decisions (T17b-fix), never restated, so
+    // the reload note can never disagree with what a save would actually
+    // send: an identical draft, an invalid draft, a locked field and a clear
+    // of a field the row layer does not carry all plan no op here either.
+    const ops = this.plan()
+    const restartFields = RESTART_FIELDS as readonly string[]
     return {
       available: snap.status === 'ready',
       writable: snap.writable,
       scopeStatus: snap.status,
-      dirty: this.plan().length > 0,
+      dirty: ops.length > 0,
       invalid: this.anyInvalid(),
       saving: this.saving,
       failed: this.failed,
-      restartPending: RESTART_FIELDS.some((field) => this.staged.has(field)),
+      restartPending: ops.some((op) => op.path[0] !== undefined && restartFields.includes(op.path[0])),
       ...fields,
       deviceToken: { configured: this.secretConfigured() },
     }

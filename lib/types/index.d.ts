@@ -16,6 +16,11 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
+declare module '@deepseek-ai/cordis' {
+    interface Events {
+        'loader/volatile-update'(paths: string[][]): void;
+    }
+}
 import type { AdminAdmission } from './admin-routes.js';
 import type { RelayClient } from './relay-client.js';
 export { Config, resolveRole } from './config.js';
@@ -32,20 +37,27 @@ export declare const UPLOAD_DIR = ".dsh-uploads";
 export declare const DEFAULT_MAX_UPLOAD_BYTES: number;
 /** The live client-role relay client, if one was built. */
 export declare function getRelayClient(): RelayClient | undefined;
-/** Host half config. */
+/** Host half config. Every field below arrives through the loader as a
+ * volatile live reference — a `{ get() }` wrapper over the stored value, not
+ * the value itself (src/config.ts explains why every field is volatile) — so
+ * the types name the value each field RESOLVES to, and every read goes
+ * through `unwrapVolatile` at use time (this file's route handlers) or
+ * through `resolveConfig`, which unwraps per field (T17b). */
 export interface MobileNavConfig {
     /** Which parts of the plugin run in this DSH process. `'host'` — the
      * default, and the fallback for any value that is not exactly `'client'` —
      * additionally loads the gateway and push sub-plugins; `'client'` mounts
      * only the three host routes, for setups where another DSH process owns
-     * the channel. */
-    role?: 'host' | 'client';
-    /** Max upload body in bytes; larger bodies get 413. Default {@link DEFAULT_MAX_UPLOAD_BYTES}. */
-    maxUploadBytes?: number;
+     * the channel. Volatile: resolved per use, never snapshotted. */
+    role?: unknown;
+    /** Max upload body in bytes; larger bodies get 413. Default {@link DEFAULT_MAX_UPLOAD_BYTES}.
+     * Volatile: re-read per request through `unwrapVolatile`. */
+    maxUploadBytes?: unknown;
     /** Fold each turn's process at every viewport width, not just below the
      * phone breakpoint. Default false (phone-only). A browser can still opt
-     * itself in via `?mobile-nav-turn-fold=1` when this is off. */
-    turnFoldDesktop?: boolean;
+     * itself in via `?mobile-nav-turn-fold=1` when this is off. Volatile:
+     * re-read per request through `unwrapVolatile`. */
+    turnFoldDesktop?: unknown;
     /** Calibration for the composer lift used when a phone's keyboard is
      * invisible to the browser (src/client/effects/keyboard-avoid.ts). Leave
      * every one of these unset to keep the shipped estimate — the route omits
@@ -53,13 +65,14 @@ export interface MobileNavConfig {
      * is one place each default is written.
      *
      * Share of the layout viewport the estimated lift starts from (shipped
-     * 0.42). Clamped to 0-1. */
-    keyboardLiftRatio?: number;
-    /** Ceiling on that estimate in CSS pixels (shipped 400). Clamped to 0-2000. */
-    keyboardLiftMaxPx?: number;
+     * 0.42). Clamped to 0-1. Volatile: re-read per request. */
+    keyboardLiftRatio?: unknown;
+    /** Ceiling on that estimate in CSS pixels (shipped 400). Clamped to 0-2000.
+     * Volatile: re-read per request. */
+    keyboardLiftMaxPx?: unknown;
     /** Extra clearance above a keyboard the browser DID react to, Android only
-     * (shipped 15). Clamped to 0-200. */
-    keyboardSafetyPadPx?: number;
+     * (shipped 15). Clamped to 0-200. Volatile: re-read per request. */
+    keyboardSafetyPadPx?: unknown;
 }
 /**
  * One configured number on its way to the browser, clamped into a band that
@@ -124,7 +137,12 @@ export declare function handleUpload(ctx: Context, maxBytes: number, req: Incomi
  * failures into the context logger, so a fire-and-forget call is the whole
  * contract. The route tests' fake contexts carry a no-op `plugin` for it.
  * @param ctx - host plugin context.
- * @param config - optional body cap override.
+ * @param config - the plugin row config as the loader handed it over (see
+ *   {@link MobileNavConfig}): every field is a volatile live reference
+ *   (`{ get() }` wrapper, T17), so nothing here is snapshotted —
+ *   `resolveConfig` merges the row with `lan-gate.config.json` and the
+ *   environment per read, and the route handlers unwrap their knobs per
+ *   request.
  */
 export declare function apply(ctx: Context, config?: MobileNavConfig): void;
 //# sourceMappingURL=index.d.ts.map
