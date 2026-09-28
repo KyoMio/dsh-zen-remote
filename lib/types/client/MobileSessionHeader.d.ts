@@ -1,7 +1,18 @@
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
+import type { SessionId, UseJobs } from './compat/types.ts';
 import { NS } from './locales.ts';
 /** Full props for the session header's back button + view-switch row. */
-export type MobileHeaderActionsProps = PropsRuntime<'conversation.session.header.actions'> & PropsLocale<typeof NS>;
+export type MobileHeaderActionsProps = PropsRuntime<'conversation.session.header.actions'> & PropsLocale<typeof NS> & {
+    /**
+     * Job-roster hook, bound from the `jobs` service through the renderer's
+     * inject face. Always present: the binding substitutes a fixed empty
+     * source when the service is absent (see index.tsx activityInject), so
+     * this hook is called on every render and the hook count never varies.
+     */
+    useJobs: UseJobs;
+    /** Keeps the session's job roster stream open while mounted (empty no-op without the service). */
+    watchRows: (sessionId: SessionId) => () => void;
+};
 /** One tab read off the official (now visually hidden) Chat/Trajectory tablist. */
 export interface ViewTabInfo {
     label: string;
@@ -40,7 +51,7 @@ export declare function useViewTabs(): ViewTabInfo[];
  * (styles/header.css.ts) keeps them hidden at >= 768px so the tablet drawer
  * and the desktop layout stay exactly as they were.
  */
-export declare function MobileHeaderActions({ sessionId, useSessions, t }: MobileHeaderActionsProps): import("react").JSX.Element;
+export declare function MobileHeaderActions({ sessionId, useSessions, useSessionStatus, useJobs, watchRows, t, }: MobileHeaderActionsProps): import("react").JSX.Element;
 /** Full props for the session header's right-edge utility buttons. */
 export type MobileHeaderUtilitiesProps = PropsRuntime<'conversation.session.header.utilities'> & PropsLocale<typeof NS>;
 /**

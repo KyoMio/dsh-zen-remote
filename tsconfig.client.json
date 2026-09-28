@@ -75,6 +75,9 @@
       "@deepseek-ai/dsh-session/types": [
         "./node_modules/@deepseek-ai/dsh-session/lib/types/types.d.ts"
       ],
+      "@deepseek-ai/dsh-session-projection/types": [
+        "./node_modules/@deepseek-ai/dsh-session-projection/lib/types/types.d.ts"
+      ],
       "@deepseek-ai/dsh-subagent/client": [
         "./node_modules/@deepseek-ai/dsh-subagent/lib/types/client.d.ts"
       ],

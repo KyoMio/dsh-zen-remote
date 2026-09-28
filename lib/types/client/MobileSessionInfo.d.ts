@@ -1,11 +1,11 @@
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
-import type { RenameResult, SessionId } from './compat/types.ts';
+import type { RenameResult, SessionId, UseJobs } from './compat/types.ts';
 import { NS } from './locales.ts';
 /** Full props for the session-info sheet (header.utilities, second entry). */
 export type MobileSessionInfoProps = PropsRuntime<'conversation.session.header.utilities'> & PropsLocale<typeof NS> & {
     /** Bound ctx.sessions.fork({sessionId}). */
     forkSession: (sessionId: SessionId) => Promise<SessionId>;
-    /** Bound ctx.sessions.open(id) — lands on the freshly forked session. */
+    /** Bound ctx.uiWorkspace.openSession(id) — lands on the freshly forked session. */
     openSession: (id: SessionId) => void;
     /** Bound ctx.sessions.binding(id)?.session.rename(title); undefined when the binding is gone. */
     renameSession: (sessionId: SessionId, title: string) => RenameResult | undefined;
@@ -13,6 +13,14 @@ export type MobileSessionInfoProps = PropsRuntime<'conversation.session.header.u
     archiveSession: (sessionId: SessionId) => Promise<void>;
     /** Bound ctx.sessionLogDownload.download(sessionId) — owns its own progress/result modal. */
     downloadSessionLog: (sessionId: SessionId) => Promise<void>;
+    /**
+     * Job-roster hook, always present (fixed empty source when the `jobs`
+     * service is absent — see index.tsx activityInject — so the hook is
+     * called on every render and the hook count never varies).
+     */
+    useJobs: UseJobs;
+    /** Keeps the session's job roster stream open while the sheet's session is mounted. */
+    watchRows: (sessionId: SessionId) => () => void;
 };
 /**
  * Session-info sheet: the bottom sheet that gathers everything S3 pulled off
@@ -37,5 +45,5 @@ export type MobileSessionInfoProps = PropsRuntime<'conversation.session.header.u
  * menu. Mounting inside the header's own DOM (outside that capped layer)
  * lets this sheet's z-index clear every other phone-shell float.
  */
-export declare function MobileSessionInfo({ sessionId, useSessions, useProjection, forkSession, openSession, renameSession, archiveSession, downloadSessionLog, t, }: MobileSessionInfoProps): import("react").JSX.Element | null;
+export declare function MobileSessionInfo({ sessionId, useSessions, useProjection, forkSession, openSession, renameSession, archiveSession, downloadSessionLog, useJobs, watchRows, t, }: MobileSessionInfoProps): import("react").JSX.Element | null;
 //# sourceMappingURL=MobileSessionInfo.d.ts.map

@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { IconPaperclipOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconPaperclipOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SessionId } from './compat/types.ts'
 import { NS } from './locales.ts'
 import { draftWithMention, rememberThumbnail, uploadUrl } from './attach-upload.ts'
@@ -126,7 +126,7 @@ export function MobileAttachButton({ t, sessionId, useInput, inputActions }: Mob
           picker.current?.click()
         }}
       >
-        <IconPaperclipOutline16 size={16} />
+        <IconPaperclipOutlineRegular size={16} />
         {error === null ? null : (
           <span data-mobile-nav="attach-error" role="status" onClick={(e) => { e.stopPropagation(); setError(null) }}>
             {t('attachFailed')}

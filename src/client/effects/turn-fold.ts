@@ -44,6 +44,31 @@ async function desktopConfigured(): Promise<boolean> {
  * marker, so scoping here is what keeps this effect Chat-only. */
 const FLOW = '[data-chat-flow]'
 
+/** DSH 0.1.7's official process-group root (ChatGroupSeat). A group nests
+ * its OWN `data-chat-flow` layer whose rows BORN_FOLDED would hide by kind,
+ * while {@link groupsOf} only walks the outer column — so a folded tool call
+ * inside a group would vanish with no chip to recover it. While the page has
+ * any official group the whole fold steps aside (rules too: the stylesheet
+ * keys its born-folded block on {@link ACTIVE_ATTR}, which the suppress path
+ * removes), and returns when the last group leaves the DOM. */
+const OFFICIAL_GROUP = '[data-chat-group-key]'
+
+/**
+ * One suppression state transition, given whether an official group is on
+ * the page and whether the fold is currently suppressed. `'enter'`: groups
+ * appeared — drop every mark and the ACTIVE_ATTR the stylesheet keys on.
+ * `'exit'`: the last group left — re-arm and fold again. `'hold'`: nothing
+ * to do. Exported pure so the state machine itself is testable off-DOM
+ * (test/fold-suppression.test.cjs); {@link scan} applies it.
+ */
+export function foldSuppressionTransition(
+  officialGroupPresent: boolean,
+  suppressed: boolean,
+): 'enter' | 'exit' | 'hold' {
+  if (officialGroupPresent) return suppressed ? 'hold' : 'enter'
+  return suppressed ? 'exit' : 'hold'
+}
+
 /** Marker + selector of the injected summary row. */
 const CHIP = 'turn-fold'
 const CHIP_SELECTOR = '[data-mobile-nav="turn-fold"]'
@@ -199,6 +224,10 @@ export function installTurnFold(ctx: ClientContext): void {
     const expanded = new Set<string>()
     let observer: MutationObserver | null = null
     let frame = 0
+    /** True while an official process group is on the page (see OFFICIAL_GROUP):
+     *  ACTIVE_ATTR is off and every mark is cleared; the observer stays open so
+     *  the fold resumes by itself once the last group leaves. */
+    let suppressed = false
 
     const label = (chip: HTMLElement, count: number, running: boolean): void => {
       const next = running ? t('turnFoldRunning', { count }) : t('turnFold', { count })
@@ -208,6 +237,20 @@ export function installTurnFold(ctx: ClientContext): void {
     const scan = (): void => {
       const flow = document.querySelector(FLOW)
       if (flow === null) return
+      const transition = foldSuppressionTransition(
+        document.querySelector(OFFICIAL_GROUP) !== null,
+        suppressed,
+      )
+      if (transition === 'enter') {
+        suppressed = true
+        document.documentElement.removeAttribute(ACTIVE_ATTR)
+        clear()
+        return
+      }
+      if (transition === 'exit') {
+        suppressed = false
+        document.documentElement.setAttribute(ACTIVE_ATTR, '')
+      }
       // TurnStatus, ChatView's own running banner — present only while the
       // last turn is still working (lib/client.js:5548).
       const running = flow.querySelector(':scope > [role="status"]') !== null
@@ -284,6 +327,11 @@ export function installTurnFold(ctx: ClientContext): void {
      * characterData — the fold verdict only changes when elements do.
      */
     const markWholeRows = (records: readonly MutationRecord[]): void => {
+      // Suppressed (an official group is on the page): reasoning-only rows in
+      // the OUTER column would still get marked here — the synchronous path
+      // runs before the next scan flips anything — and a marked row stays
+      // hidden with no chip to recover it.
+      if (suppressed) return
       const rows = new Set<Element>()
       for (const record of records) {
         const target = record.target
@@ -305,6 +353,9 @@ export function installTurnFold(ctx: ClientContext): void {
         // to bring it back. It also drops rows detached since the batch.
         const parent = row.parentElement
         if (parent === null || !parent.matches(FLOW)) continue
+        // A group's inner flow layer also matches FLOW; rows inside an
+        // official group are never ours to fold (see OFFICIAL_GROUP).
+        if (row.closest(OFFICIAL_GROUP) !== null) continue
         const thinks = [...row.querySelectorAll(THINK)]
         if (thinks.length > 0 && foldsWholeRow(row, thinks)) row.setAttribute(FOLD, '')
         else row.removeAttribute(FOLD)
@@ -366,6 +417,7 @@ export function installTurnFold(ctx: ClientContext): void {
       if (frame !== 0) cancelAnimationFrame(frame)
       frame = 0
       expanded.clear()
+      suppressed = false
       clear()
     }
 

@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { IconCloseFill14, IconPaperclipOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconCloseFillRegular, IconPaperclipOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS } from './locales.ts'
 import {
   draftWithoutMention,
@@ -72,7 +72,7 @@ export function MobileAttachChips({ t, useInput, inputActions }: MobileAttachChi
             title={name}
           >
             <span data-mobile-nav="attach-chip-art">
-              <IconPaperclipOutline16 size={16} />
+              <IconPaperclipOutlineRegular size={16} />
               {preview === undefined ? null : <img src={preview} alt="" />}
             </span>
             {preview === undefined ? <span data-mobile-nav="attach-chip-name">{middleEllipsis(name)}</span> : null}
@@ -82,7 +82,7 @@ export function MobileAttachChips({ t, useInput, inputActions }: MobileAttachChi
               aria-label={t('attachRemove', { name })}
               onClick={() => inputActions.setDraft(draftWithoutMention(draft, relPath))}
             >
-              <IconCloseFill14 size={14} />
+              <IconCloseFillRegular size={14} />
             </button>
           </span>
         )

@@ -48,9 +48,12 @@ test('the overlay lays the official trigger over the pill instead of scripting i
   assert.match(headerCss, /\[data-mobile-nav="activity-pill"\]\s*\{[^}]*pointer-events: none/)
 })
 
-test('the activity chip reports subagents and background jobs from the sessions snapshot', () => {
-  assert.match(headerTsx, /s\.subagentsByParent\[sessionId\]/, 'subagent count comes from the snapshot')
-  assert.match(headerTsx, /s\.jobsBySession\[sessionId\]/, 'job count comes from the snapshot')
+test('the activity chip reports subagents and background jobs from the 0.1.7 sources', () => {
+  // 0.1.7 deleted SessionListState.subagentsByParent / .jobsBySession: the
+  // catalog comes from the explicit-read subagentCatalog projection, the job
+  // rows from the renderer-bound useJobs hook (see compat/types.ts mirrors).
+  assert.match(headerTsx, /s\.projectionsBySession\[sessionId\]\?\.values\.subagentCatalog/, 'subagent count comes from the catalog projection')
+  assert.match(headerTsx, /useJobs\(\(s\) => s\.rows\[sessionId\]\)/, 'job count comes from the job roster')
   // Read, never re-parent: moving React-owned nodes across trees is what the
   // chip exists to avoid. Scoped to MobileHeaderActions — elsewhere in this
   // file the workbench-close pill legitimately appends an element it created

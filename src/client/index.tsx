@@ -1,4 +1,5 @@
-import type { ClientContext, SessionId, WorkspaceId } from './compat/types.ts'
+import type { ClientContext, JobsLike, SessionId, WorkspaceId } from './compat/types.ts'
+import { isDesktopShell } from './compat/desktop.ts'
 import { MobileNavToggle } from './MobileNavToggle.tsx'
 import { MobileNavOverlay } from './MobileNavOverlay.tsx'
 import { MobileDrawerFooter } from './MobileDrawerFooter.tsx'
@@ -37,20 +38,50 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 export const inject = ['slots', 'layout', 'locale', 'sessionLogDownload', 'sessions', 'workspaces']
 
 /**
- * 0.1.2 把新建会话和归档会话的界面级操作挪到了 uiWorkspace 服务；
- * 0.1.1 没有这个服务，那两个操作还在 ctx.workspaces 上。这里按存在探测，
- * 不把 uiWorkspace 写进 inject（写了 0.1.1 就永远不激活）。
- * 类型用本地最小接口，不 import 那个 dsh-client-ui-workspace 包
- * ——0.1.1 装不到。
+ * 0.1.2 把新建会话、归档会话与打开会话的界面级操作挪到了 uiWorkspace
+ * 服务（0.1.7 删掉了 ctx.sessions.open，这是它唯一的替代入口）。类型用
+ * 本地最小接口，不 import 那个 dsh-client-ui-workspace 包——本插件的
+ * peerDependencies 不含它，运行时实例由宿主提供，类型自己声明就够。
  */
 interface UiWorkspaceLike {
+  openSession(target: SessionId): void
   startSession(workspaceId?: WorkspaceId): void
   archiveSession(sessionId: SessionId): Promise<void>
 }
 
-/** 0.1.1 的 ctx.workspaces 上还有 startSession；0.1.2 的类型里没有了。 */
-interface LegacyWorkspacesLike {
-  startSession(workspaceId?: WorkspaceId): void
+/**
+ * Activity data both session-header entries read (0.1.7 sources — 0.1.5's
+ * per-parent subagent snapshot and per-session job snapshot are gone):
+ * - the subagent catalog is read straight off the sessions snapshot's
+ *   explicit-read store (`projectionsBySession[id].values.subagentCatalog`),
+ *   exactly like the official SubagentHeaderLineage — no refresh is issued
+ *   from here: every projection refresh call registers another session in
+ *   the controller's load table, and all of them are re-read on every
+ *   reconnect (manager handleConnected), so per-open refreshes would grow
+ *   into a batch of re-reads forever;
+ * - job rows come from the `jobs` client service; the inject face mirrors
+ *   the official JobListAction registration (`hooks.jobs` observable → the
+ *   renderer hands the component a `useJobs` hook prop). When the service is
+ *   absent (a build without the job controller) a fixed empty source keeps
+ *   the prop present, so the component's hook count never varies — the
+ *   counts simply read zero instead of the pill silently disappearing.
+ */
+const NO_JOBS_SNAPSHOT = Object.freeze({ rows: Object.freeze({}) }) as {
+  readonly rows: Readonly<Record<string, readonly never[]>>
+}
+/** Module-level singleton: one stable observable identity across renders. */
+const NO_JOBS_SOURCE = {
+  getSnapshot: () => NO_JOBS_SNAPSHOT,
+  subscribe: (): (() => void) => () => {},
+}
+const NO_WATCH_ROWS = (): (() => void) => () => {}
+
+function activityInject(ctx: ClientContext) {
+  const jobs = ctx.get('jobs') as JobsLike | undefined
+  return {
+    hooks: { jobs: jobs === undefined ? NO_JOBS_SOURCE : jobs.state },
+    watchRows: jobs === undefined ? NO_WATCH_ROWS : (id: SessionId) => jobs.watchRows(id),
+  }
 }
 
 /**
@@ -60,6 +91,15 @@ interface LegacyWorkspacesLike {
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
+  // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
+  // down to ~520px wide, where every width-based gate would flip the phone
+  // shell on inside the desktop app. Inside that shell this plugin is a
+  // complete no-op — no stylesheet, no effects, no slot entries, which is
+  // bit-for-bit "not installed" and also retires the desktop-fold knobs
+  // there (they exist for narrow desktop *browsers*, which never carry the
+  // dshDesktop bridge). See compat/desktop.ts for the marker's provenance.
+  if (isDesktopShell()) return
+
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-mobile-nav: dictionaries')
 
   ctx.effect(() => {
@@ -156,6 +196,8 @@ export function apply(ctx: ClientContext): void {
     id: 'mobile-header-actions',
     order: 0,
     locale: NS,
+    // Activity-pill data (subagent catalog + job roster), see activityInject.
+    inject: () => activityInject(ctx),
   }, MobileHeaderActions))
 
   // Session-info entry (placeholder — S4 owns the sheet) + workbench entry
@@ -180,14 +222,25 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     // The factory's own sessionId param is unused: every function below
     // takes its own session id explicitly (they're generic action bindings
-    // reused verbatim, not closures over one particular session).
+    // reused verbatim, not closures over one particular session). The
+    // spread adds the activity-pill data (subagent catalog + job roster for
+    // the info-sheet badges), see activityInject.
     inject: (_sessionId: SessionId) => ({
+      ...activityInject(ctx),
       forkSession: (id: SessionId) => ctx.sessions.fork({ sessionId: id }),
-      openSession: (id: SessionId) => ctx.sessions.open(id),
+      // 0.1.7: ctx.sessions.open is gone; uiWorkspace.openSession is the one
+      // navigation entry (also what the official subagent catalog uses).
+      // Lazy lookup like every other uiWorkspace binding here: the callback
+      // runs on a user tap, by which time the service is registered.
+      openSession: (id: SessionId) => {
+        const ui = ctx.get('uiWorkspace') as UiWorkspaceLike | undefined
+        if (ui === undefined) console.warn('[dsh-zen-remote] uiWorkspace service unavailable; cannot open session', id)
+        else ui.openSession(id)
+      },
       renameSession: (id: SessionId, title: string) => ctx.sessions.binding(id)?.session.rename(title),
       // 0.1.2 的界面级归档在 uiWorkspace（顺带清当前选中）；懒查——回调是用户
-      // 点击才跑，那时服务必已注册。本插件的 inject 不包含 uiWorkspace（0.1.1
-      // 没有它），所以启动时不能查一次就用：可能早于它注册。
+      // 点击才跑，那时服务必已注册。本插件的 inject 不包含 uiWorkspace，
+      // 所以启动时不能查一次就用：可能早于它注册。
       archiveSession: (id: SessionId) => {
         const ui = ctx.get('uiWorkspace') as UiWorkspaceLike | undefined
         return ui === undefined ? ctx.workspaces.archiveSession(id) : ui.archiveSession(id)
@@ -242,16 +295,18 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     store: nav,
     inject: () => ({
-      openSession: (id: SessionId) => ctx.sessions.open(id),
+      // Same uiWorkspace.openSession binding as the session-info sheet above.
+      openSession: (id: SessionId) => {
+        const ui = ctx.get('uiWorkspace') as UiWorkspaceLike | undefined
+        if (ui === undefined) console.warn('[dsh-zen-remote] uiWorkspace service unavailable; cannot open session', id)
+        else ui.openSession(id)
+      },
       // uiWorkspace 懒查：回调是用户点击才跑，服务那时必已注册（inject 不含
-      // uiWorkspace，启动时可能先于它注册，不能启动查一次就用）。0.1.1 上恒
-      // undefined，退回 ctx.workspaces.startSession——0.1.1 专用分支，0.1.2 的
-      // 类型里该方法已不存在，故对类型做 LegacyWorkspacesLike cast，运行时走不到。
+      // uiWorkspace，启动时可能先于它注册，不能启动查一次就用）。
       startSession: (workspaceId?: WorkspaceId) => {
         const ui = ctx.get('uiWorkspace') as UiWorkspaceLike | undefined
-        return ui === undefined
-          ? (ctx.workspaces as unknown as LegacyWorkspacesLike).startSession(workspaceId)
-          : ui.startSession(workspaceId)
+        if (ui === undefined) console.warn('[dsh-zen-remote] uiWorkspace service unavailable; cannot start a session')
+        else ui.startSession(workspaceId)
       },
       // S5 session-log chip — the same service call MobileDrawerFooter uses.
       downloadSessionLog: (id: SessionId) => ctx.sessionLogDownload.download(id),
@@ -315,22 +370,19 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-session-log-export/client'
-// 0.1.2-only package: augments GlobalStandardProps with
-// useSessions/useSessionPendingInteraction and SessionStandardProps with
-// sessionId/useSession/useProjection, and declares the `ctx.uiSession`
-// service. 0.1.1 has no such package — but this is `import type`, so the
-// build output carries no trace of it and the runtime is unaffected.
+// ui-session: augments GlobalStandardProps with useSessions /
+// useSessionPendingInteraction / useSessionStatus and SessionStandardProps
+// with sessionId/useSession/useProjection, and declares the `ctx.uiSession`
+// service.
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
-// 0.1.2-only controller packages: their `/client` type entries merge
-// `ctx.sessions` / `ctx.workspaces` onto the cordis Context (0.1.1 declared
-// both from dsh-client-runtime). Type-only again — nothing to load at
-// runtime, so a 0.1.1 installation is unaffected.
+// Controller packages: their `/client` type entries merge `ctx.sessions` /
+// `ctx.workspaces` onto the cordis Context. Type-only — nothing to load at
+// runtime.
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-api-workspace-controller/client'
-// 0.1.2-only, type-only: the renderer declares `ctx.slots` on the cordis
-// Context (the service this plugin registers every slot through) and
-// `dsh-subagent/client` types the subagent catalog rows the session header
-// reads (SessionListState.subagentsByParent). 0.1.1 had both declared in the
-// dsh-client-runtime bundle that no longer exists.
+// Type-only: the renderer declares `ctx.slots` on the cordis Context (the
+// service this plugin registers every slot through) and `dsh-subagent/client`
+// types the subagent catalog projection entries the session header reads
+// (projectionsBySession[].values.subagentCatalog on 0.1.7).
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-subagent/client'

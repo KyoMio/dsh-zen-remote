@@ -1,19 +1,19 @@
 import { useEffect, useState } from 'react'
 import {
-  IconChecklistOutline14,
-  IconCodeOutline16,
-  IconCordisPluginOutline14,
-  IconDataOutline16,
-  IconDownloadOutline16,
-  IconEllipsisOutline16,
-  IconPanelLeftOutline16,
+  IconChecklistOutlineRegular,
+  IconCodeOutlineRegular,
+  IconCordisPluginOutlineRegular,
+  IconDataOutlineRegular,
+  IconDownloadOutlineRegular,
+  IconEllipsisOutlineRegular,
+  IconPanelLeftOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots'
 import type { MobileNavKey } from './locales.ts'
 import { isChipEnabled, toggleChip, useChipsPrefs } from './chips-store.ts'
 import { BETTER_TOGGLE } from './sidebar-panels.ts'
 
-/** One icon component's minimal shared shape (every `@deepseek-ai/dsh-client-ui-primitives` icon accepts `size`, regardless of the fixed number in its own name — see e.g. IconDownloadOutline16 used at size 14 elsewhere in this codebase). */
+/** One icon component's minimal shared shape (every `@deepseek-ai/dsh-client-ui-primitives` icon accepts `size`, regardless of the fixed number in its own name — see e.g. IconDownloadOutlineRegular used at size 14 elsewhere in this codebase). */
 type IconFC = (props: { size?: number }) => React.JSX.Element
 
 /**
@@ -81,11 +81,11 @@ const USAGE_SELECTOR = 'button[data-usage-stats-badge]'
 
 /** Static chip registry (S5). Order here is the default row order. */
 export const CHIP_DEFS: readonly ChipDef[] = [
-  { id: 'taskboard', label: 'chipTaskboard', Icon: IconChecklistOutline14, selector: TASKBOARD_SELECTOR },
-  { id: 'ssh', label: 'chipSsh', Icon: IconCodeOutline16, selector: SSH_SELECTOR },
-  { id: 'files', label: 'files', Icon: IconPanelLeftOutline16, selector: FILES_SELECTOR },
-  { id: 'usage', label: 'chipUsage', Icon: IconDataOutline16, selector: USAGE_SELECTOR },
-  { id: 'sessionLog', label: 'sessionLog', Icon: IconDownloadOutline16, selector: null },
+  { id: 'taskboard', label: 'chipTaskboard', Icon: IconChecklistOutlineRegular, selector: TASKBOARD_SELECTOR },
+  { id: 'ssh', label: 'chipSsh', Icon: IconCodeOutlineRegular, selector: SSH_SELECTOR },
+  { id: 'files', label: 'files', Icon: IconPanelLeftOutlineRegular, selector: FILES_SELECTOR },
+  { id: 'usage', label: 'chipUsage', Icon: IconDataOutlineRegular, selector: USAGE_SELECTOR },
+  { id: 'sessionLog', label: 'sessionLog', Icon: IconDownloadOutlineRegular, selector: null },
 ]
 
 /**
@@ -141,7 +141,7 @@ interface HarvestedChip {
   id: string
   name: string
   /** Sanitized cloned `<svg>…</svg>` markup, or `''` when the source
-   * button has no icon (falls back to {@link IconCordisPluginOutline14}). */
+   * button has no icon (falls back to {@link IconCordisPluginOutlineRegular}). */
   iconHtml: string
   /** The plugin's OWN button/link — `.click()`ed directly, same "代点"
    * precedent as every selector-backed {@link ChipDef}. */
@@ -285,7 +285,7 @@ function useHarvestedChips(): readonly HarvestedChip[] {
 
 /** One harvested chip's icon: the plugin's own (sanitized, cloned) SVG, or the generic plugin glyph when it has none. */
 function HarvestIcon({ html }: { html: string }) {
-  if (html === '') return <IconCordisPluginOutline14 size={16} />
+  if (html === '') return <IconCordisPluginOutlineRegular size={16} />
   return <span data-mobile-nav="chip-harvest-icon" dangerouslySetInnerHTML={{ __html: html }} />
 }
 
@@ -354,7 +354,7 @@ export function MobileHomeChips({ t, sessionId, downloadSessionLog, onCustomize 
         title={t('chipCustomize')}
         onClick={onCustomize}
       >
-        <IconEllipsisOutline16 size={16} />
+        <IconEllipsisOutlineRegular size={16} />
       </button>
     </div>
   )
