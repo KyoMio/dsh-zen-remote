@@ -22,6 +22,7 @@ const { pathToFileURL } = require('node:url')
 const { request } = require('./util.cjs')
 
 const ROUTES_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'client-routes.js')).href
+const { RelayError, relayCredentialsDigest } = require('../lib/relay-client.js')
 
 function sendJson(res, status, body) {
   const bytes = Buffer.from(JSON.stringify(body))
@@ -81,6 +82,7 @@ function startClientServer(row, overrides = {}) {
     admit: overrides.admit || (() => ({ peer: {} })),
     getRowConfig: overrides.getRowConfig || (() => row),
     ...(overrides.fetchImpl !== undefined ? { fetchImpl: overrides.fetchImpl } : {}),
+    ...(overrides.getRelayClient !== undefined ? { getRelayClient: overrides.getRelayClient } : {}),
   })
   const server = http.createServer((req, res) => { void handler(req, res) })
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })))
@@ -557,6 +559,280 @@ test('status reads the volatile row PER REQUEST: a re-pair without re-apply is v
     const third = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
     assert.equal(third.serverUrl, `http://127.0.0.1:${deadPort}`, 'the fresh row value is probed, not the apply-time snapshot')
     assert.equal(third.state, 'unreachable')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+// ---- T23a-fix: the status route over a relay client ----------------------------
+
+const INFO = (name) => ({ relayProtocol: 1, serverId: 'abcd1234', serverName: name, dshVersion: '2.0.0', fingerprints: {} })
+
+/** A relay-client stand-in with exactly the surface the status route reads
+ * (state / handshakeInfo / lastHandshakeDigest / connect); every test wires
+ * its own behavior. The default connect mirrors the REAL client's contract
+ * (T23a-fix2): a call racing an unsettled attempt joins it. */
+function fakeRelay(overrides = {}) {
+  const relay = {
+    state: 'unpaired',
+    handshakeInfo: undefined,
+    lastHandshakeDigest: undefined,
+    connectCount: 0,
+    connectError: undefined,
+    connectResult: undefined,
+    connectDelay: 0,
+    digest: undefined,
+    inFlight: undefined,
+    subscribe: () => () => {},
+    invoke: async () => { throw new Error('fake relay: invoke not wired') },
+    openStream: () => { throw new Error('fake relay: openStream not wired') },
+    ...overrides,
+  }
+  relay.connect = overrides.connect ?? (() => {
+    if (relay.inFlight !== undefined) return relay.inFlight
+    relay.connectCount += 1
+    relay.inFlight = (async () => {
+      try {
+        // Always a real await (even for 0): the in-flight slot must be
+        // VISIBLE to concurrent callers, which a fully synchronous body
+        // would race past.
+        await new Promise((resolve) => setTimeout(resolve, relay.connectDelay))
+        if (relay.connectError !== undefined) throw relay.connectError
+        if (relay.connectResult === undefined) throw new Error('fake relay: no connect wiring')
+        relay.state = 'online'
+        relay.handshakeInfo = relay.connectResult
+        relay.lastHandshakeDigest = relay.digest
+        return relay.connectResult
+      } finally {
+        relay.inFlight = undefined
+      }
+    })()
+    return relay.inFlight
+  })
+  return relay
+}
+
+test('T23a-fix status: an online relay over UNCHANGED credentials answers state + serverName and never probes', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('书房服务器'),
+    lastHandshakeDigest: relayCredentialsDigest(gwUrl, 'tok-row'),
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const before = gwSeen.length
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { state: 'online', serverName: '书房服务器', serverUrl: gwUrl })
+    assert.equal(gwSeen.length, before, 'the cached verdict short-circuits — nothing left the box')
+    assert.equal(relay.connectCount, 0, 'no live connect either')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T23a-fix status: an online relay whose credentials changed does NOT leak the cached verdict — it reconnects', async () => {
+  let token = 'tok-row'
+  const row = { serverUrl: { get: () => gwUrl }, deviceToken: { get: () => token } }
+  const relay = fakeRelay({
+    // A verdict earned under a DIFFERENT token: the digest cannot match.
+    state: 'online',
+    handshakeInfo: INFO('旧名字'),
+    lastHandshakeDigest: 'stale-digest-from-another-life',
+    digest: relayCredentialsDigest(gwUrl, 'tok-row'),
+    connectResult: INFO('新名字'),
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'online')
+    assert.equal(body.serverName, '新名字', 'the FRESH handshake name, never the stale cached one')
+    assert.equal(relay.connectCount, 1, 'a live connect ran for the changed credentials')
+    // Aging the token flips the digest again — the next answer reconnects.
+    token = 'tok-fresh'
+    const again = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(again.serverName, '新名字')
+    assert.equal(relay.connectCount, 2)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T23a-fix status: a cleared token answers unpaired and connects nothing', async () => {
+  const row = makeRow({ deviceToken: '' })
+  const relay = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('不应被采用'),
+    lastHandshakeDigest: relayCredentialsDigest(gwUrl, 'tok-row'),
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const before = gwSeen.length
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.deepEqual(JSON.parse(res.body), { state: 'unpaired' })
+    assert.equal(gwSeen.length, before, 'nothing was probed')
+    assert.equal(relay.connectCount, 0, 'nothing was connected')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T23a-fix status: an invalid stored address answers invalid-url and sends nothing', async () => {
+  const row = makeRow({ serverUrl: 'http://8.8.8.8' })
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('x'), lastHandshakeDigest: 'digest' })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.deepEqual(JSON.parse(res.body), { state: 'invalid-url' })
+    assert.equal(relay.connectCount, 0)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T23a-fix status: a relay that never connected gets a live connect on the spot', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    state: 'unpaired',
+    handshakeInfo: undefined,
+    lastHandshakeDigest: undefined,
+    digest: relayCredentialsDigest(gwUrl, 'tok-row'),
+    connectResult: INFO('现场握手'),
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.deepEqual(body, { state: 'online', serverName: '现场握手', serverUrl: gwUrl })
+    assert.equal(relay.connectCount, 1)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T23a-fix status: live-connect failures map — relay-unauthorized is unexpected, only unpaired is revoked', async () => {
+  const row = makeRow()
+  const cases = [
+    [new RelayError('relay-unauthorized', 'server secret mismatch', 401), 'unexpected'],
+    [new RelayError('revoked', 'unpaired wall', 401), 'revoked'],
+    [new RelayError('offline', 'connection refused'), 'unreachable'],
+    [new RelayError('incompatible', 'not a 2.0.0 relay'), 'unexpected'],
+  ]
+  for (const [error, expected] of cases) {
+    const relay = fakeRelay({
+      state: 'offline',
+      connectError: error,
+    })
+    const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+    try {
+      const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+      assert.deepEqual(body, { state: expected, serverUrl: gwUrl }, error.code)
+    } finally {
+      await closeServer(server)
+    }
+  }
+})
+
+test('T23a-fix status: a live connect that exceeds the probe timeout answers unreachable', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    state: 'offline',
+    connect: () => new Promise(() => {}), // never settles
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.deepEqual(body, { state: 'unreachable', serverUrl: gwUrl })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T23a-fix status: the token (and its digest) never appear in a relay answer', async () => {
+  const TOKEN = 'super-secret-token-value'
+  const digest = relayCredentialsDigest(gwUrl, TOKEN)
+  const row = makeRow({ deviceToken: TOKEN })
+  const online = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('令牌测试'),
+    lastHandshakeDigest: digest,
+  })
+  const failing = fakeRelay({ state: 'offline', connectError: new RelayError('revoked', 'wall', 401) })
+  for (const [name, relay] of [['fast path', online], ['live failure', failing]]) {
+    const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+    try {
+      const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+      assert.equal(res.status, 200, name)
+      assert.equal(res.body.includes(TOKEN), false, `${name}: the token must not appear`)
+      assert.equal(res.body.includes(digest), false, `${name}: even the one-way digest is not echoed`)
+    } finally {
+      await closeServer(server)
+    }
+  }
+})
+
+test('T23a-fix probe: a 401 relay-unauthorized classifies as unexpected — only the unpaired wall is revoked', async () => {
+  const { server, port } = await startClientServer(makeRow())
+  try {
+    gwState.pingReply = () => [401, { ok: false, error: { code: 'relay-unauthorized' } }]
+    const unexpected = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.deepEqual(unexpected, { state: 'unexpected', serverUrl: gwUrl })
+
+    gwState.pingReply = () => [401, { ok: false, reason: 'unpaired' }]
+    const revoked = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.deepEqual(revoked, { state: 'revoked', serverUrl: gwUrl })
+  } finally {
+    gwState.pingReply = () => [200, { ok: true }]
+    await closeServer(server)
+  }
+})
+
+// ---- T23a-fix2 ----------------------------------------------------------------
+
+test('T23a-fix2 status: a second status during an unsettled connect joins it — one connect, both answer online', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    digest: relayCredentialsDigest(gwUrl, 'tok-row'),
+    connectResult: INFO('并发握手'),
+    connectDelay: 300,
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const [first, second] = await Promise.all([
+      request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE }),
+      request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE }),
+    ])
+    assert.deepEqual(JSON.parse(first.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl })
+    assert.deepEqual(JSON.parse(second.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl })
+    assert.equal(relay.connectCount, 1, 'the second status joined the in-flight connect')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T23a-fix2 status: a changed ADDRESS (token unchanged) never serves the cached verdict — it reconnects', async () => {
+  // A legal but already-dead local address plays the "new address": the row
+  // check passes, the relay's digest (earned under the OLD address) cannot
+  // match it, and the fake connect means nothing ever dials it.
+  const dead = http.createServer()
+  await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve))
+  const newPort = dead.address().port
+  await new Promise((resolve) => dead.close(resolve))
+  const newUrl = `http://127.0.0.1:${newPort}`
+
+  const row = makeRow({ serverUrl: newUrl })
+  const relay = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('旧地址的名字'),
+    lastHandshakeDigest: relayCredentialsDigest(gwUrl, 'tok-row'),
+    digest: relayCredentialsDigest(newUrl, 'tok-row'),
+    connectResult: INFO('新地址的名字'),
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.deepEqual(body, { state: 'online', serverName: '新地址的名字', serverUrl: newUrl }, 'the fresh connect answers, never the stale cache')
+    assert.equal(relay.connectCount, 1, 'the digest mismatch forced a live connect')
   } finally {
     await closeServer(server)
   }
