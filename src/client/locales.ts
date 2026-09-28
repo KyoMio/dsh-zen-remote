@@ -156,7 +156,12 @@ export const zh = {
   'settings.revokeAllConfirm': '将吊销全部已配对设备，确定继续？',
   'settings.actionFail': '操作失败',
   'settings.shareTitle': '远程共享',
-  'settings.sharePlaceholder': '共享会话列表将在后续版本提供',
+  'settings.shareListEmpty': '当前没有已开启远程的会话',
+  'settings.shareViewers': '{count} 人在看',
+  'settings.shareClose': '关闭远程',
+  'settings.shareCloseAll': '全部关闭',
+  'settings.shareCloseAllConfirm': '将关闭全部已开启远程的会话，确定继续？',
+  'settings.shareActionFail': '操作失败',
   'settings.fieldServerName': '服务端名称',
   'settings.fieldServerNameHint': '远程界面上显示的服务端名称，1–40 个字符。留空恢复默认。',
   'settings.fieldIdleHours': '闲置休眠（小时）',
@@ -208,6 +213,15 @@ export const zh = {
   'settings.client.unpairBusy': '解除中…',
   'settings.client.unpairConfirm': '本机将忘记已保存的服务端令牌（服务端的设备记录不受影响）。确定继续？',
   'settings.client.unpairDone': '本机已忘记令牌；如需彻底失效，请在服务端设备列表中吊销该设备',
+  // --- 会话共享（T33b）：标题行图标、右键菜单项、设置页共享列表 ---
+  'shareRemoteOn': '开启远程',
+  'shareRemoteOff': '关闭远程',
+  'shareRemoteStateOff': '未开启远程',
+  'shareRemoteBusy': '运行中，不计时',
+  'shareRemoteRemainingHours': '剩余闲置时间 {count} 小时',
+  'shareRemoteRemainingMinutes': '剩余闲置时间 {count} 分钟',
+  'shareRemoteConfirmOn': '开启远程后，已配对的桌面应用端将可以查看并操作此会话。确定开启？',
+  'shareRemoteConfirmOff': '关闭后，桌面应用端将无法再访问此会话。确定关闭？',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -364,7 +378,12 @@ export const en: Record<MobileNavKey, string> = {
   'settings.revokeAllConfirm': 'This revokes every paired device. Continue?',
   'settings.actionFail': 'The action failed',
   'settings.shareTitle': 'Remote sharing',
-  'settings.sharePlaceholder': 'The shared-session list will arrive in a later release',
+  'settings.shareListEmpty': 'No sessions are currently shared',
+  'settings.shareViewers': '{count} viewing',
+  'settings.shareClose': 'Stop sharing',
+  'settings.shareCloseAll': 'Close all',
+  'settings.shareCloseAllConfirm': 'This disables remote access for every shared session. Continue?',
+  'settings.shareActionFail': 'The action failed',
   'settings.fieldServerName': 'Server name',
   'settings.fieldServerNameHint': 'Server name shown in the remote UI, 1–40 characters. Empty restores the default.',
   'settings.fieldIdleHours': 'Idle sleep (hours)',
@@ -415,6 +434,14 @@ export const en: Record<MobileNavKey, string> = {
   'settings.client.unpairBusy': 'Unpairing…',
   'settings.client.unpairConfirm': 'This machine will forget the saved server token (the server\u2019s device record is untouched). Continue?',
   'settings.client.unpairDone': 'The token was forgotten on this machine; to invalidate it fully, revoke the device in the server\u2019s device list',
+  'shareRemoteOn': 'Enable remote',
+  'shareRemoteOff': 'Disable remote',
+  'shareRemoteStateOff': 'Remote access off',
+  'shareRemoteBusy': 'Running — not counting down',
+  'shareRemoteRemainingHours': 'Idle time remaining: {count} h',
+  'shareRemoteRemainingMinutes': 'Idle time remaining: {count} min',
+  'shareRemoteConfirmOn': 'Once enabled, paired desktop apps will be able to view and operate this session. Enable?',
+  'shareRemoteConfirmOff': 'Desktop apps will no longer be able to access this session. Disable?',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

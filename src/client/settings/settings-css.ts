@@ -207,6 +207,22 @@ export const SETTINGS_CSS = `
   height: 28px;
   max-width: 170px;
 }
+[data-zen-remote="settings"] .zr-settings-share-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0;
+}
+[data-zen-remote="settings"] .zr-settings-share-row + .zr-settings-share-row {
+  border-top: 1px solid var(--dsw-alias-border-l2);
+}
+[data-zen-remote="settings"] .zr-settings-share-row .zr-settings-device-head {
+  flex: 1;
+  min-width: 0;
+}
+[data-zen-remote="settings"] .zr-settings-badge[data-live="true"] {
+  color: var(--dsw-alias-state-success-primary, #16a34a);
+}
 [data-zen-remote="settings"] .zr-settings-footer {
   display: flex;
   align-items: center;

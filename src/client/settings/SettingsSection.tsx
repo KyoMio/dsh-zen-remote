@@ -62,10 +62,15 @@ import type {
   ZenRemoteSettingsForm,
 } from '../../client-data/settings-form.ts'
 import { NS } from '../locales.ts'
+import { describeShare } from '../../client-data/shares.ts'
+import type { ShareEntryView, SharesStore } from '../../client-data/shares.ts'
 
 export interface SettingsSectionProps extends PropsRuntime<'plugins.row.config'>, PropsLocale<typeof NS> {
   /** The staged configuration form (injected share). */
   config: ZenRemoteSettingsForm
+  /** The shared shares store (injected share, T33b) — the same singleton the
+   * title-row icon and the session menu read. */
+  shares: SharesStore
 }
 
 /** Device roles the pairing picker offers, in display order. */
@@ -182,7 +187,7 @@ function pairFailText(fail: PairFail, t: SectionT): string {
   }
 }
 
-function SettingsSectionPage({ config, t }: SettingsSectionProps) {
+function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   const form = useSyncExternalStore(
     useCallback((cb: () => void) => config.subscribe(cb), [config]),
     () => config.getSnapshot(),
@@ -812,7 +817,7 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
             {pushTest.state === 'fail' && <p className="zr-settings-hint" data-invalid="true">{t('settings.pushTestFail')}</p>}
           </div>
 
-          <p className="zr-settings-hint" style={{ paddingBottom: 12 }}>{t('settings.sharePlaceholder')}</p>
+          <SharesList shares={shares} t={t} />
         </div>
       )}
 
@@ -906,4 +911,82 @@ function sourceName(source: SettingsFieldView['source'], t: SectionT): string {
   if (source === 'env') return t('settings.sourceEnv')
   if (source === 'file') return t('settings.sourceFile')
   return t('settings.sourceDefault')
+}
+
+/**
+ * The shared-session list (T33b entry 3), inside the host instant-operations
+ * card — outside the settings-form frame like the pairing and device areas,
+ * so it renders while the configuration namespace is unavailable or
+ * read-only. It reads the SAME shares store singleton as the title-row icon
+ * and the session menu (one poll loop for all three, started by this page's
+ * subscription while mounted). Renders nothing until the first GET answers
+ * and nothing at all on a 404-latched deployment (the shares route exists
+ * only on the host role — this component additionally sits inside the
+ * page's `!clientRole` branch, judged the T16 way off the saved row role).
+ *
+ * Unlike pairing and device management these actions are NOT gated by
+ * `viaGateway`: toggling shares through the gateway is the T33a-sanctioned
+ * exception, so a phone may close a session's remote access.
+ */
+function SharesList({ shares, t }: { shares: SharesStore, t: SectionT }) {
+  const snap = useSyncExternalStore(
+    useCallback((onStoreChange: () => void) => shares.subscribe(onStoreChange), [shares]),
+    () => shares.getSnapshot(),
+  )
+  const [shareBusy, setShareBusy] = useState(false)
+  const [shareFailed, setShareFailed] = useState(false)
+
+  if (!snap.ready || !snap.available) return null
+  const entries = snap.entries
+  // Fresh clock per render — the 30 s poll replaces the snapshot, which is
+  // the re-render that keeps every countdown text within one poll of truth.
+  const now = Date.now()
+
+  const runUnshare = async (sessionId: string): Promise<void> => {
+    setShareBusy(true)
+    setShareFailed(false)
+    if (!await shares.unshare(sessionId)) setShareFailed(true)
+    setShareBusy(false)
+  }
+
+  const runUnshareAll = async (): Promise<void> => {
+    if (!window.confirm(t('settings.shareCloseAllConfirm'))) return
+    setShareBusy(true)
+    setShareFailed(false)
+    if (!await shares.unshareAll()) setShareFailed(true)
+    setShareBusy(false)
+  }
+
+  const shareRow = (entry: ShareEntryView) => (
+    <div className="zr-settings-share-row" key={entry.sessionId}>
+      <div className="zr-settings-device-head">
+        <span className="zr-settings-device-name">{entry.title ?? entry.sessionId}</span>
+        {entry.viewers > 0 && (
+          <span className="zr-settings-badge" data-live="true">
+            {t('settings.shareViewers', { count: entry.viewers })}
+          </span>
+        )}
+        <span className="zr-settings-hint">{describeShare(entry, now, t).remainingText}</span>
+      </div>
+      <Button variant="ghost" size="sm" disabled={shareBusy} onClick={() => { void runUnshare(entry.sessionId) }}>
+        {t('settings.shareClose')}
+      </Button>
+    </div>
+  )
+
+  return (
+    <>
+      <h3 className="zr-settings-card-title">{t('settings.shareTitle')}</h3>
+      {entries.length === 0 && <p className="zr-settings-hint">{t('settings.shareListEmpty')}</p>}
+      {entries.map(shareRow)}
+      {shareFailed && <p className="zr-settings-hint" data-invalid="true">{t('settings.shareActionFail')}</p>}
+      {entries.length > 0 && (
+        <div className="zr-settings-row" style={{ paddingBottom: 12 }}>
+          <Button variant="ghost" size="sm" disabled={shareBusy} onClick={() => { void runUnshareAll() }}>
+            {t('settings.shareCloseAll')}
+          </Button>
+        </div>
+      )}
+    </>
+  )
 }

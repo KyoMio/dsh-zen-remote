@@ -43,6 +43,20 @@ function fakeCtx() {
         return () => {}
       },
     },
+    // The T33b remote-share registration records through the same calls
+    // object; register-settings never touches slots at the top level, so
+    // the existing deepEqual([]) assertions below stay valid.
+    slots: {
+      inject(name, factory) {
+        calls.slotsInjected.push({ name })
+        factory()
+        return () => {}
+      },
+      register(options, component) {
+        calls.slotsRegistered.push({ options, component })
+        return () => {}
+      },
+    },
   }
   return { ctx, calls }
 }
@@ -192,4 +206,73 @@ test('T16-fix2: an admin/status 200 whose body is not ok:true is a failed load',
   assert.notEqual(thenAt, -1, 'loadStatus has a body handler')
   const handler = source.slice(thenAt, source.indexOf('.catch', thenAt))
   assert.ok(handler.includes('body?.ok !== true'), 'a 200 body without ok:true must throw into the catch (stale data kept)')
+})
+
+// --- T33b: session-sharing parts on the desktop shell -------------------------
+
+test('T33b: desktop shell — the remote icon and menu item still register (both slots + styles)', async () => {
+  globalThis.dshDesktop = {}
+  try {
+    const { registerRemoteShareUi } = await import('../src/client/remote-share-register.ts')
+    const { ctx, calls } = fakeCtx()
+    registerRemoteShareUi(ctx, () => null, () => null)
+    // The styles effect touches `document`, so like every effect here it is
+    // asserted present, not invoked.
+    assert.notEqual(
+      calls.effects.find((candidate) => candidate.label === 'dsh-zen-remote: remote-share styles'),
+      undefined,
+      'the remote-share stylesheet effect is registered',
+    )
+    const names = calls.slotsInjected.map((call) => call.name)
+    assert.ok(names.includes('conversation.session.header.actions'), 'the title-row icon slot is injected')
+    assert.ok(names.includes('sidebar.workspaces.session.menu.item'), 'the session-menu slot is injected')
+    const byName = new Map(calls.slotsRegistered.map((entry) => [entry.options.name, entry]))
+    const header = byName.get('conversation.session.header.actions')
+    const menu = byName.get('sidebar.workspaces.session.menu.item')
+    assert.notEqual(header, undefined, 'the title-row icon registers on the desktop shell')
+    assert.equal(header.options.id, 'remote-share-icon')
+    assert.equal(header.options.locale, 'mobileNav')
+    assert.notEqual(menu, undefined, 'the menu item registers on the desktop shell')
+    assert.equal(menu.options.id, 'remote-share')
+    assert.equal(menu.options.locale, 'mobileNav')
+    assert.equal(typeof menu.component, 'function')
+  } finally {
+    delete globalThis.dshDesktop
+  }
+})
+
+test('T33b: apply order guard — the remote-share registration runs before the desktop gate', () => {
+  // Same textual pin as the settings-page guard above: registerRemoteShareUi
+  // is gate-independent by design, so desktop coverage rests on the call
+  // sitting before `if (isDesktopShell()) return` in apply.
+  const source = readFileSync(join(ROOT, 'src', 'client', 'index.tsx'), 'utf8')
+  const registerAt = source.indexOf('registerRemoteShareUi(ctx, RemoteHeaderIcon, RemoteShareMenuItem)')
+  const gateAt = source.indexOf('if (isDesktopShell()) return')
+  assert.ok(registerAt !== -1, 'apply registers the remote-share parts')
+  assert.ok(registerAt < gateAt, 'the remote-share parts register BEFORE the desktop gate')
+})
+
+test('T33b: client role — the shares route 404 latch renders both parts empty', async () => {
+  // Behavioral, at the layer Node CAN drive: the shares store. A client
+  // deployment has no admin/shares route; its 404 latches available:false
+  // and stops the polling (the parts never learn of a table to render).
+  const { createSharesStore, describeShare } = await import('../src/client-data/shares.ts')
+  let calls = 0
+  const store = createSharesStore(async () => {
+    calls += 1
+    return { ok: false, status: 404, json: async () => ({ ok: false }) }
+  })
+  const off = store.subscribe(() => {})
+  await new Promise((resolve) => setImmediate(resolve))
+  off()
+  assert.equal(store.getSnapshot().available, false, 'the 404 latched unavailable')
+  assert.equal(calls, 1, 'the latch stopped the poll loop after the first pull')
+  assert.equal(describeShare(undefined, Date.now()).state, 'off', 'no entry reads off')
+  // Render-level: the .tsx parts cannot load under Node, so their
+  // render-empty rule is pinned textually — each gates its JSX behind the
+  // same latch (and the menu item additionally behind subagent rows).
+  for (const file of ['RemoteHeaderIcon.tsx', 'RemoteShareMenu.tsx']) {
+    const source = readFileSync(join(ROOT, 'src', 'client', file), 'utf8')
+    assert.ok(source.includes('!snap.available'), `${file} renders empty while the route is latched absent`)
+  }
 })
