@@ -49,7 +49,9 @@ const resolveChild = (parent, rel) => {
   return joined === '.' ? '' : joined
 }
 
-// Dependency-first topological order from the entry.
+// Dependency-first topological order from the entry. The client tsconfig's
+// rootDir is `src` (so src/client-data can sit beside src/client), which puts
+// the emit under .client-build/client/.
 const visited = new Set()
 const order = []
 const visit = (file) => {
@@ -62,7 +64,7 @@ const visit = (file) => {
   }
   order.push(file)
 }
-visit('index.js')
+visit('client/index.js')
 
 const modules = order
   .map((file) => {
@@ -89,7 +91,7 @@ const wrapped = [
   '  return module.exports;',
   '}',
   'var module = { exports: {} };',
-  '__modules["index.js"](__localRequire, module, module.exports);',
+  '__modules["client/index.js"](__localRequire, module, module.exports);',
   'return module.exports; } });',
   '',
 ].join('\n')
