@@ -20,15 +20,21 @@ import type { FileHandle } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session'
 import { readFileConfig, resolveConfig } from './config.js'
+import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
+import { responseJson, sameOriginPost } from './http.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 
 // The loader's config schema (settings form) and the role normalizer live in
 // src/config.ts next to the resolution they describe; re-exported so the
-// plugin row's public surface stays on the main entry.
+// plugin row's public surface stays on the main entry. The same-origin gate
+// moved to src/http.ts next to the response envelope (T14) but its export
+// stays here for scripts/check-upload-endpoint.mjs.
 export { Config, resolveRole } from './config.js'
+export { sameOriginPost } from './http.js'
 
 // The two sub-plugin entries the host role loads. They ship as plain .mjs at
 // the package root, and `..` resolves there both from this file (via the
@@ -127,42 +133,6 @@ function message(error: unknown): string {
 
 function isErrnoCode(error: unknown, code: string): boolean {
   return error instanceof Error && 'code' in error && (error as { code?: unknown }).code === code
-}
-
-function responseJson(res: ServerResponse, status: number, body: unknown): void {
-  const bytes = Buffer.from(JSON.stringify(body))
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.setHeader('Content-Length', String(bytes.length))
-  res.setHeader('Cache-Control', 'no-store')
-  res.setHeader('X-Content-Type-Options', 'nosniff')
-  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
-  res.writeHead(status)
-  res.end(bytes)
-}
-
-/**
- * Accept a state-changing request only from this DSH Web application's origin.
- *
- * The gateway half rewrites `Origin`/`Host` to the upstream origin
- * before forwarding (lan-gate-server.cjs `cleanHeaders`), so a phone request
- * that already cleared the pairing wall presents here as same-origin; a
- * request with neither header falls back to the Fetch metadata.
- * @param req - the inbound request.
- * @returns true when the request may mutate the workspace.
- */
-export function sameOriginPost(req: IncomingMessage): boolean {
-  const fetchSite = req.headers['sec-fetch-site']
-  if (fetchSite === 'cross-site') return false
-  const origin = req.headers.origin
-  if (origin === undefined) return fetchSite === 'same-origin' || fetchSite === 'same-site' || fetchSite === 'none'
-  const host = req.headers.host
-  if (host === undefined) return false
-  try {
-    const parsed = new URL(origin)
-    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host === host
-  } catch {
-    return false
-  }
 }
 
 /**
@@ -403,6 +373,27 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   if (effective.values.role === 'host') {
     ctx.plugin(gateway, effective.values)
     ctx.plugin(push, effective.values)
+    // Settings-surface admin routes (T14). The browser cannot call the
+    // gateway's loopback-only admin API from DSH's origin, so the host
+    // process re-exposes it same-origin and the handler calls the gateway AS
+    // the local machine. `connection` supplies admit() — webServer routes
+    // skip DSH's /api authentication — so a composition without one (Electron
+    // carries no webServer either) simply never mounts the routes. Everything
+    // config-shaped is resolved PER REQUEST inside the handler (volatile row
+    // fields change without a restart, and the test-push copy follows the
+    // live `lang`); only the non-volatile gateway port is captured here,
+    // which a row restart re-reads anyway.
+    ctx.inject(['webServer', 'connection'], (webCtx) => {
+      webCtx.effect(() => webCtx.webServer.register({
+        kind: 'prefix',
+        path: ADMIN_ROUTE_PREFIX,
+        handler: createAdminHandler({
+          admit: (req) => webCtx.connection.admit(req),
+          gatewayBase: `http://127.0.0.1:${effective.values.port}`,
+          getConfig: () => resolveConfig(config, readFileConfig(), process.env),
+        }),
+      }), 'dsh-zen-remote: admin routes')
+    })
   }
   ctx.inject(['webServer', 'sessions'], (webCtx) => {
     webCtx.effect(() => webCtx.webServer.register({

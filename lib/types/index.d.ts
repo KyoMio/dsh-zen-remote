@@ -17,6 +17,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
 export { Config, resolveRole } from './config.js';
+export { sameOriginPost } from './http.js';
 /** Exact route the phone composer POSTs one file body to. */
 export declare const UPLOAD_ROUTE = "/_dsh/mobile-nav/upload";
 /** Exact route the browser GETs the plugin row's client-facing knobs from.
@@ -67,17 +68,6 @@ export interface MobileNavConfig {
  * between a hand-edited YAML row and the browser, so it is asserted directly.
  */
 export declare function clamped(key: string, value: number | undefined, min: number, max: number): Record<string, number>;
-/**
- * Accept a state-changing request only from this DSH Web application's origin.
- *
- * The gateway half rewrites `Origin`/`Host` to the upstream origin
- * before forwarding (lan-gate-server.cjs `cleanHeaders`), so a phone request
- * that already cleared the pairing wall presents here as same-origin; a
- * request with neither header falls back to the Fetch metadata.
- * @param req - the inbound request.
- * @returns true when the request may mutate the workspace.
- */
-export declare function sameOriginPost(req: IncomingMessage): boolean;
 /**
  * Reject a resolved path that is not rooted below the expected directory.
  * @param root - the directory the target must stay inside.
