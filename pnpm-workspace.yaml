@@ -4,6 +4,7 @@
 # do not exist. Everything needed is declared explicitly in devDependencies.
 autoInstallPeers: false
 minimumReleaseAgeExclude:
+  - '@deepseek-ai/*'
   - '@deepseek-ai/dsh-agent-default-model@0.1.1-rc.2'
   - '@deepseek-ai/dsh-agent@0.1.1-rc.2'
   - '@deepseek-ai/dsh-api-remotes@0.1.2-rc.1'
