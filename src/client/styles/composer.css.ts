@@ -19,8 +19,8 @@
 const ROW = '[data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"]'
 /** The composer's outer column: `_card` on top, 0.1.7's `_dock` (ContextMeter + stats slot) below it. */
 const ROOT = '[data-slot="conversation.composer.bar"] > [class$="_root"]'
-/** Width the row reserves in front of send for the lifted ContextMeter (ring + "100%" at 12px, compact padding). */
-const RING_W = '56px'
+/** Width the row reserves in front of send for the lifted ContextMeter (14px ring + 8px padding each side; no percentage on the phone). */
+const RING_W = '30px'
 /** DSH 0.1.7's wrapper around input.right + input.model inside `_trailing`. */
 const STD = `${ROW} > [class$="_trailing"] > [class$="_standardControls"]`
 /** The model seat's own root inside the trailing group (long form so it beats the <=1023px pill rules in layout.css.ts). */
@@ -126,29 +126,40 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   /* ContextMeter. 0.1.7 moved it out of the row into ROOT's \`_dock\`, a
      line UNDER the card — on the phone that dropped the ring to the very
      bottom of the screen (user report, 2026-09-28). Lifted back beside send
-     without moving any official node: the dock is absolutely positioned
+     without moving any official node: ROOT becomes a one-cell grid and the
+     dock shares the card's cell, pinned to the card's bottom-right corner,
      over a placeholder the row reserves in front of send (row::before at
-     order 6, below). Vertical: ROOT's 4px bottom pad + the row's 8px bottom
-     pad, 34px tall = the send button's box, so both centre on one line.
-     Horizontal: ROOT's side clearance + row pad 8 + send 34 + gap 5. */
-  ${ROOT} {
-    position: relative !important;
+     order 6, below). Anchoring to the card — not to ROOT's bottom edge —
+     matters: ROOT's bottom padding follows the safe-area inset, so an
+     absolute \`bottom\` offset measured in the emulator sat low on a real
+     iPhone (user screenshot, 2026-09-29). Vertical: the row's 8px bottom
+     pad, 34px tall = the send button's box. Horizontal: row pad 8 + send 34
+     + gap 5. The percentage is dropped on the phone (user call): ring only. */
+  ${ROOT}:has(> [class$="_dock"] button) {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) !important;
+    justify-items: center !important;
+  }
+  ${ROOT}:has(> [class$="_dock"] button) > [class$="_card"] {
+    grid-area: 1 / 1 !important;
   }
   ${ROOT} > [class$="_dock"] {
-    position: absolute !important;
-    right: calc(var(--dsh-composer-side-clearance, 16px) + 47px) !important;
-    bottom: 12px !important;
+    grid-area: 1 / 1 !important;
+    align-self: end !important;
+    justify-self: end !important;
+    position: relative !important;
+    z-index: 1;
     height: 34px !important;
-    width: ${RING_W} !important;
+    margin: 0 47px 8px 0 !important;
     padding: 0 !important;
     gap: 0 !important;
-    justify-content: flex-end !important;
-    z-index: 1;
   }
   ${ROOT} > [class$="_dock"] button[class$="_trigger"] {
-    padding: 1px 4px !important;
-    gap: 4px !important;
-    font-size: 12px !important;
+    padding: 8px !important;
+    gap: 0 !important;
+  }
+  ${ROOT} > [class$="_dock"] button[class$="_trigger"] > span {
+    display: none !important;
   }
   ${ROOT}:has(> [class$="_dock"] button) > [class$="_card"] > [class$="_row"]::before {
     content: '';
