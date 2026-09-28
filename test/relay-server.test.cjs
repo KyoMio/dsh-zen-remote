@@ -34,11 +34,23 @@ function makeParts(name, overrides = {}) {
   const home = path.join(ROOT, name)
   fs.mkdirSync(home, { recursive: true })
   const calls = []
+  const streamCalls = []
   const gateway = {
     invoke: async (call) => {
       calls.push(call)
       if (overrides.throw !== undefined) throw overrides.throw
       return overrides.value !== undefined ? overrides.value : { echo: { namespace: call.namespace, method: call.method, args: call.args } }
+    },
+    // T22b: the ownership check for job/kill (and the ownership probe for
+    // job/follow) opens a throwaway job/list stream. The fake answers it
+    // from `overrides.rows` (default: an empty recent set) and finishes.
+    stream: async (call) => {
+      streamCalls.push(call)
+      if (overrides.stream !== undefined) return overrides.stream(call)
+      const rows = call.namespace === 'job' && call.method === 'list' ? (overrides.rows ?? []) : []
+      return (async function* () {
+        yield { type: 'rows', jobs: rows }
+      })()
     },
   }
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
@@ -53,7 +65,7 @@ function makeParts(name, overrides = {}) {
     },
     ...(overrides.parentOf ? { parentOf: overrides.parentOf } : {}),
   })
-  return { handler, calls, gateway, store, home }
+  return { handler, calls, streamCalls, gateway, store, home }
 }
 
 /** Mount the handler alone on an OS-assigned port. */
@@ -76,6 +88,10 @@ async function startServer(handler) {
 }
 
 const post = (pathName, body, headers) => ({ method: 'POST', headers, body: JSON.stringify(body) })
+
+/** One job row shaped like the `job/list` codec (owner optional — ownerless
+ * jobs are exactly what the relay must hide). */
+const JOB = (id, owner) => ({ id, ...(owner === undefined ? {} : { owner }), kind: 'process', label: id, status: 'running', startedAt: 1, output: { total: 0, earliest: 0 } })
 
 // ---- authentication -----------------------------------------------------------
 
@@ -219,11 +235,14 @@ test('invoke: a subagent address is judged by its shared parent', async () => {
 })
 
 test('invoke: parentOf wiring — a child of a shared ancestor passes through the injected lookup', async () => {
-  const parts = makeParts('invoke-parentof', { parentOf: (id) => (id === 'session-child' ? 'session-parent' : undefined) })
+  const parts = makeParts('invoke-parentof', {
+    parentOf: (id) => (id === 'session-child' ? 'session-parent' : undefined),
+    rows: [JOB('job-child', 'session-child')],
+  })
   parts.store.share('session-parent')
   const server = await startServer(parts.handler)
   try {
-    const args = { request: { sessionId: 'session-child' } }
+    const args = { request: { sessionId: 'session-child', jobId: 'job-child' } }
     const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'job', method: 'kill', args }, AUTH))
     assert.equal(res.status, 200, 'the child borrows the parent share through parentOf')
     assert.equal((await res.json()).ok, true)
@@ -283,9 +302,11 @@ test('invoke: unregistered methods are 403 forbidden-method, registered ones wit
   const parts = makeParts('invoke-registry')
   const server = await startServer(parts.handler)
   try {
-    const unregistered = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'list', args: { _request: {} } }, AUTH))
-    assert.equal(unregistered.status, 403)
-    assert.deepEqual(await unregistered.json(), { ok: false, error: { code: 'forbidden-method' } }, 'session/list is not in the registry')
+    // session/list is registered since T22b (invoke + result filter); the
+    // fake's echo value carries no items array, so it passes through as-is.
+    const list = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'list', args: { _request: {} } }, AUTH))
+    assert.equal(list.status, 200, 'session/list invokes through the filtered controlled path')
+    assert.equal((await list.json()).ok, true)
 
     const withDecoy = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'anything', method: 'else', args: { request: { sessionId: 'whatever' } } }, AUTH))
     assert.equal(withDecoy.status, 403)
@@ -294,7 +315,6 @@ test('invoke: unregistered methods are 403 forbidden-method, registered ones wit
     const noId = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'projections', args: {} }, AUTH))
     assert.equal(noId.status, 403)
     assert.deepEqual(await noId.json(), { ok: false, error: { code: 'no-session' } }, 'a registered method with no id in its field is no-session')
-    assert.equal(parts.calls.length, 0)
   } finally { await server.stop() }
 })
 
@@ -337,6 +357,65 @@ test('invoke: a code-less error reports internal with NO message, long DSH messa
     const body = await res.json()
     assert.equal(body.error.code, 'session/too-long')
     assert.equal(body.error.message.length, 500)
+  } finally { await server2.stop() }
+})
+
+test('invoke: a Node system error (ENOENT) reports internal with NO path-leaking message', async () => {
+  // 4b: Node errors carry string `code`s too, and their messages quote
+  // server-side absolute paths. Only the DSH `namespace/name` code shape
+  // travels with a message.
+  const enoent = Object.assign(new Error("ENOENT: no such file or directory, open '/Users/x/secret'"), { code: 'ENOENT' })
+  const parts = makeParts('invoke-enoent', { throw: enoent })
+  parts.store.share('session-a')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'page', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } }, AUTH))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.deepEqual(body, { ok: false, error: { code: 'internal' } })
+    assert.equal(JSON.stringify(body).includes('/Users/x'), false, 'the server path never leaves')
+  } finally { await server.stop() }
+})
+
+// ---- job ownership (4b) -----------------------------------------------------------
+
+test('invoke: job/kill forwards when the job belongs to the claimed session', async () => {
+  const parts = makeParts('kill-owned', { rows: [JOB('job-1', 'session-a'), JOB('job-2', undefined), JOB('job-3', 'session-b')] })
+  parts.store.share('session-a')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'job', method: 'kill', args: { request: { sessionId: 'session-a', jobId: 'job-1' } } }, AUTH))
+    assert.equal(res.status, 200)
+    assert.equal((await res.json()).ok, true)
+    assert.equal(parts.calls.length, 1, 'the kill reached the gateway')
+    // The throwaway job/list probe ran through the stream carrier.
+    assert.equal(parts.streamCalls.length, 1)
+    assert.equal(parts.streamCalls[0].method, 'list')
+  } finally { await server.stop() }
+})
+
+test('invoke: job/kill refuses foreign and ownerless jobs, and a cache hit skips the probe', async () => {
+  const parts = makeParts('kill-foreign', { rows: [JOB('job-2', undefined), JOB('job-3', 'session-b')] })
+  parts.store.share('session-a')
+  const server = await startServer(parts.handler)
+  try {
+    for (const jobId of ['job-2', 'job-3', 'job-unknown']) {
+      const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'job', method: 'kill', args: { request: { sessionId: 'session-a', jobId } } }, AUTH))
+      assert.equal(res.status, 403, `${jobId} is not owned by the claimed session`)
+      assert.deepEqual(await res.json(), { ok: false, error: { code: 'forbidden' } })
+    }
+    assert.equal(parts.calls.length, 0, 'no kill ever reached the gateway')
+  } finally { await server.stop() }
+
+  // The probe reads whatever the fake's job/list reports — an owned job the
+  // list DOES mention goes through.
+  const parts2 = makeParts('kill-probe-owned', { rows: [JOB('job-9', 'session-a')] })
+  parts2.store.share('session-a')
+  const server2 = await startServer(parts2.handler)
+  try {
+    const res = await server2.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'job', method: 'kill', args: { request: { sessionId: 'session-a', jobId: 'job-9' } } }, AUTH))
+    assert.equal(res.status, 200, 'the probe found the job owned by the claimed session')
+    assert.equal((await res.json()).ok, true)
   } finally { await server2.stop() }
 })
 
