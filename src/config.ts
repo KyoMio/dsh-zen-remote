@@ -370,14 +370,17 @@ export function readFileConfig(env: NodeJS.ProcessEnv = process.env): Record<str
 /**
  * The normalized role behind a row's `role` knob. Anything but the exact
  * string `'client'` means host, so a typo degrades to the full plugin rather
- * than silently dropping the gateway and push halves. Resolution-order note:
+ * than silently dropping the gateway and push halves. The value is read
+ * through {@link unwrapVolatile} first: since T17 every row field arrives as
+ * a `{ get() }` live reference, and comparing the wrapper itself against
+ * `'client'` would always answer host (T17b). Resolution-order note:
  * {@link resolveConfig} validates each layer against the two-member enum
  * first, so an invalid row role can still be rescued by the file layer; this
  * function answers the final merged value. Kept on the main entry's export
  * surface for test/role-wiring.test.cjs.
  */
 export function resolveRole(row: unknown): 'host' | 'client' {
-  return (row as { role?: unknown } | null | undefined)?.role === 'client' ? 'client' : 'host'
+  return unwrapVolatile((row as { role?: unknown } | null | undefined)?.role) === 'client' ? 'client' : 'host'
 }
 
 /**
@@ -405,10 +408,12 @@ export function resolveRole(row: unknown): 'host' | 'client' {
  * wrapper instead of the value, so EVERY row read goes through
  * {@link unwrapVolatile} at use time (or through {@link resolveConfig},
  * which unwraps per field). "Changed value requires a restart" therefore
- * cannot ride the volatility flag: the fields in
- * `RESTART_FIELDS` (src/restart-watcher.ts) are re-resolved on a 2-second
- * poll and reload the plugin row when their fingerprint moves — a row reload
- * re-runs `apply()`, which restarts the gateway child and the push half.
+ * cannot ride the volatility flag: the fields in `RESTART_FIELDS`
+ * (src/restart-fields.ts) are re-resolved the moment the loader announces a
+ * volatile-only change (`loader/volatile-update`, T17b) and on a 2-second
+ * poll besides, and reload the plugin row when their fingerprint moves — a
+ * row reload re-runs `apply()`, which restarts the gateway child and the
+ * push half.
  */
 export const Config = z.object({
   role: z.any().volatile(),
