@@ -33,9 +33,13 @@
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
 import type { ZenRemoteSettingsForm } from '../../client-data/settings-form.ts';
 import { NS } from '../locales.ts';
+import type { SharesStore } from '../../client-data/shares.ts';
 export interface SettingsSectionProps extends PropsRuntime<'plugins.row.config'>, PropsLocale<typeof NS> {
     /** The staged configuration form (injected share). */
     config: ZenRemoteSettingsForm;
+    /** The shared shares store (injected share, T33b) — the same singleton the
+     * title-row icon and the session menu read. */
+    shares: SharesStore;
 }
 export declare function SettingsSection(props: SettingsSectionProps): import("react").JSX.Element;
 //# sourceMappingURL=SettingsSection.d.ts.map

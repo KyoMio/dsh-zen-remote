@@ -28,6 +28,9 @@ import { NS } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 import { SettingsSection } from './settings/SettingsSection.tsx'
 import { registerSettingsPage } from './settings/register-settings.ts'
+import { RemoteHeaderIcon } from './RemoteHeaderIcon.tsx'
+import { RemoteShareMenuItem } from './RemoteShareMenu.tsx'
+import { registerRemoteShareUi } from './remote-share-register.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -98,6 +101,14 @@ export function apply(ctx: ClientContext): void {
   // 的按需注入都在 registerSettingsPage 里（那个服务名绝不进顶层的 inject
   // 数组，否则没有该服务的环境整个界面半边都加载不了）。
   registerSettingsPage(ctx, SettingsSection)
+
+  // T33b 会话共享的三个入口里前两个（标题行远程图标、会话右键菜单项）：
+  // 同样必须在桌面门之前注册——桌面端 App 就是主服务端，图标和菜单恰好
+  // 住在它的标题行与会话菜单里。部件自身按数据降级：shares 路由 404
+  // （子客户端部署没有这条路由）时渲染为空，手机外壳则由样式表兜底隐藏
+  // （styles/header.css.ts 的 header.actions 全量隐藏）。设置页的共享
+  // 列表在 SettingsSection 内部，随设置页已在门之前。
+  registerRemoteShareUi(ctx, RemoteHeaderIcon, RemoteShareMenuItem)
 
   // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
   // down to ~520px wide, where every width-based gate would flip the phone
