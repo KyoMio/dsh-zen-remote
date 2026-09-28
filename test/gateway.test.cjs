@@ -112,7 +112,9 @@ test('gateway: injects manifest link, PWA bootstrap & app.css into HTML (local)'
     assert.ok(page.body.includes('/pwa/app.css'), 'app.css linked')
     assert.ok(page.body.includes('window.__DSH_PWA__'), 'PWA bootstrap present')
     assert.match(page.body, /window\.__DSH_PWA__=\{vapid:"[A-Za-z0-9_-]{20,}",lang:"(zh|en)"\}/, 'real VAPID public key and resolved page language injected')
-    assert.ok(page.body.includes('href="/lan-gate/admin"'), 'local user gets the admin entry chip')
+    // T13: the admin entry chip is gone — administration moved to the
+    // dsh-zen-remote settings page inside DSH's Plugins page.
+    assert.ok(!page.body.includes('href="/lan-gate/admin"'), 'no admin entry chip in injected HTML anymore')
   } finally { await stop() }
 })
 
@@ -135,8 +137,7 @@ test('injects after DSH bootstrap, before </head>', async () => {
     assert.ok(html.indexOf('/pwa/app.css') > html.indexOf(BOOTSTRAP),
       '注入位置改了会让 0.1.2 的客户端引导拿不到模块表：app.css must come after the DSH bootstrap script')
     // 2. Everything we inject into <head> still lands before </head>.
-    //    (The local-user admin chip is a body-side element and is not part of
-    //    this head-ordering contract.)
+    //    (All of it is head-side since the admin chip was removed in T13.)
     for (const marker of ['/pwa/app.css', 'window.__DSH_PWA__', '/pwa/manifest.json']) {
       const at = html.indexOf(marker)
       assert.ok(at !== -1 && at < headEnd, `injected marker "${marker}" sits before </head>`)

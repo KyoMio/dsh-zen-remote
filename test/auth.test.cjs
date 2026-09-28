@@ -96,7 +96,7 @@ test('pairing flow: code -> cookie -> proxied access; kind & revoke via admin', 
     await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'set-kind', id, kind: 'phone' } })
     const phonePage = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
     assert.ok(phonePage.body.includes('data-lan-device="phone"'), 'phone kind injected')
-    assert.ok(!phonePage.body.includes('href="/lan-gate/admin"'), 'paired remote device gets no admin entry chip')
+    assert.ok(!phonePage.body.includes('href="/lan-gate/admin"'), 'no admin entry chip for anyone (removed in T13)')
 
     // Regression guard: the push opt-in must not be gated on device kind —
     // devices left at the default 'auto' carry no data-lan-device attribute
