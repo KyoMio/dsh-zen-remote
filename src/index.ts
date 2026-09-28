@@ -22,6 +22,7 @@ import { randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session'
@@ -30,6 +31,8 @@ import { createActivityTracker, createParentIndex, startSweeper } from './activi
 import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
 import { CLIENT_ROUTE_PREFIX, createClientHandler } from './client-routes.js'
 import { responseJson, sameOriginPost } from './http.js'
+import { onSessionCreated, restoreBusy } from './share-ops.js'
+import type { AgentStatusLike } from './share-ops.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 import { createShareStore } from './share-store.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
@@ -384,27 +387,6 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     const relaySecret = randomBytes(32).toString('hex')
     ctx.plugin(gateway, { ...effective.values, relaySecret })
     ctx.plugin(push, effective.values)
-    // Settings-surface admin routes (T14). The browser cannot call the
-    // gateway's loopback-only admin API from DSH's origin, so the host
-    // process re-exposes it same-origin and the handler calls the gateway AS
-    // the local machine. `connection` supplies admit() — webServer routes
-    // skip DSH's /api authentication — so a composition without one (Electron
-    // carries no webServer either) simply never mounts the routes. Everything
-    // config-shaped is resolved PER REQUEST inside the handler (volatile row
-    // fields change without a restart, and the test-push copy follows the
-    // live `lang`); only the non-volatile gateway port is captured here,
-    // which a row restart re-reads anyway.
-    ctx.inject(['webServer', 'connection'], (webCtx) => {
-      webCtx.effect(() => webCtx.webServer.register({
-        kind: 'prefix',
-        path: ADMIN_ROUTE_PREFIX,
-        handler: createAdminHandler({
-          admit: (req) => webCtx.connection.admit(req),
-          gatewayBase: `http://127.0.0.1:${effective.values.port}`,
-          getConfig: () => resolveConfig(config, readFileConfig(), process.env),
-        }),
-      }), 'dsh-zen-remote: admin routes')
-    })
     // The shared-session table backing the relay's access control. The relay
     // route consumes it below; the activity tracker and idle sweeper (T22c)
     // keep its "quiet for idleHours → close" promise. The settings surface is
@@ -441,6 +423,85 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     } catch (error) {
       ctx.logger.warn('dsh-zen-remote cannot listen on "session/event": %s', message(error))
     }
+    // Auto-share and fork-following (T33a), off `agent/created` — the only
+    // host event that fires EXACTLY ONCE per NEW session. Its `source` is
+    // 'startup' for fresh creation (top-level, fork and subagent all go
+    // through the same factory call) and 'resume' when a persisted session
+    // re-enters the live store, so filtering on 'startup' is what keeps a
+    // manually-closed session closed across reopens — `session/created`
+    // re-fires on resume and `api-session/added` also fires when an agent is
+    // disposed, so neither qualifies. The payload's agent id IS the session
+    // id (dsh-agent keys its registry by it; its typert wire type is
+    // `dsh-session/types#SessionId`), and by announce time the fresh header
+    // already carries the subagent/fork markers the share decision reads.
+    // autoShareNewSessions is a volatile row setting: resolved at EVENT time,
+    // never snapshotted here.
+    try {
+      ctx.on('agent/created', ({ agent, source }) => {
+        // The feed dispatches SERIALLY: a throwing listener rolls the whole
+        // session creation back (dsh-agent's announce awaits every listener
+        // and fails the creation on the first rejection). Sharing is
+        // best-effort bookkeeping — it must never be able to fail the
+        // creation that triggered it.
+        try {
+          if (source !== 'startup') return
+          onSessionCreated(agent.session.header, {
+            store,
+            autoShare: resolveConfig(config, readFileConfig(), process.env).values.autoShareNewSessions,
+            parentOf: parentIndex.parentOf,
+          })
+        } catch (error) {
+          ctx.logger.warn('dsh-zen-remote cannot share new session "%s": %s', agent.id, message(error))
+        }
+      })
+    } catch (error) {
+      ctx.logger.warn('dsh-zen-remote cannot listen on "agent/created": %s', message(error))
+    }
+    // Busy restore (T33a): `busy` is never persisted, so right after a row
+    // restart every shared session believes itself idle — including one whose
+    // agent is mid-turn, which would then idle out from under the turn. Once
+    // the agents service exists, re-mark whatever is actually running (the
+    // flags clear again through the tracker's turn/end above).
+    ctx.inject(['agents'], (agentsCtx) => {
+      const agents = (agentsCtx as Context & { agents: { list(): readonly AgentStatusLike[] } }).agents
+      restoreBusy(store, () => agents.list())
+    })
+    // Settings-surface admin routes (T14). The browser cannot call the
+    // gateway's loopback-only admin API from DSH's origin, so the host
+    // process re-exposes it same-origin and the handler calls the gateway AS
+    // the local machine. `connection` supplies admit() — webServer routes
+    // skip DSH's /api authentication — so a composition without one (Electron
+    // carries no webServer either) simply never mounts the routes. Everything
+    // config-shaped is resolved PER REQUEST inside the handler (volatile row
+    // fields change without a restart, and the test-push copy follows the
+    // live `lang`); only the non-volatile gateway port is captured here,
+    // which a row restart re-reads anyway. Registered AFTER the store exists
+    // above: an inject callback whose services are already present runs
+    // synchronously during apply, and the shares options close over `store`.
+    ctx.inject(['webServer', 'connection'], (webCtx) => {
+      webCtx.effect(() => webCtx.webServer.register({
+        kind: 'prefix',
+        path: ADMIN_ROUTE_PREFIX,
+        handler: createAdminHandler({
+          admit: (req) => webCtx.connection.admit(req),
+          gatewayBase: `http://127.0.0.1:${effective.values.port}`,
+          getConfig: () => resolveConfig(config, readFileConfig(), process.env),
+          // Shares routes (T33a): the table above is the truth they serve and
+          // mutate. typertGateway and agents are deliberately NOT in this
+          // inject's declaration list — adding them would keep the WHOLE
+          // admin prefix off 0.1.7 / Electron compositions that lack them —
+          // so they are read PER REQUEST through the reflection layer's
+          // store lookup (runtime `ctx.get`, declared `ctx.reflect.get`),
+          // which answers undefined when the service is absent. Property
+          // access is not an option: cordis refuses reads of services the
+          // context did not declare (`cannot get property … without inject`),
+          // which would turn every shares request into a 500.
+          store,
+          typert: () => webCtx.reflect.get('typertGateway') as RelayGateway | undefined,
+          listAgents: () => (webCtx.reflect.get('agents') as { list(): readonly AgentStatusLike[] } | undefined)?.list() ?? [],
+        }),
+      }), 'dsh-zen-remote: admin routes')
+    })
     // The idle sweeper (T22c): every minute, hand the table the CURRENT
     // idleHours and let it close sessions quiet past that. idleHours is a
     // volatile row field, so getIdleHours re-resolves from the SAME row

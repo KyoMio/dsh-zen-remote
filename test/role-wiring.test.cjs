@@ -56,19 +56,49 @@ test.after(() => {
  * config) and every ctx.on subscription + ctx.effect return, no-ops
  * inject/effect like the route tests do. Neither sub-plugin is executed —
  * the namespace objects are only inspected. The `on` record and the effect
- * returns are what the T22c wiring test asserts on. */
+ * returns are what the T22c wiring test asserts on; `warns` captures
+ * logger.warn calls (the T33a-fix listener-swallow test reads them). */
 function makeCtx() {
   const calls = []
   const listeners = []
   const effects = []
+  const warns = []
   const ctx = {
     plugin(module, config) { calls.push({ module, config }) },
     on(event, listener) { listeners.push({ event, listener }) },
     inject() {},
     effect(fn) { effects.push(fn()) },
-    logger: { warn() {} },
+    logger: { warn: (...args) => warns.push(args) },
   }
-  return { ctx, calls, listeners, effects }
+  return { ctx, calls, listeners, effects, warns }
+}
+
+/** Cordis-faithful `inject` for fakes that EXECUTE their callbacks. The
+ * callback context exposes ONLY the services the inject declares — any
+ * other property read throws the same error the real proxy throws (RT
+ * cordis ReflectService.handler.get: `cannot get property "X" without
+ * inject`) — plus `get(name)` / `reflect.get(name)`, the reflection-layer
+ * store lookup that answers the service or undefined WITHOUT the inject
+ * requirement. Production wiring must use the lookup, never property
+ * access, for services outside its declaration list; these fakes hold it
+ * to that. */
+function tightInject(services) {
+  return (deps, cb) => {
+    if (!deps.every((d) => services[d] !== undefined)) return
+    const target = {
+      get: (name) => services[name],
+      reflect: { get: (name) => services[name] },
+      effect: (fn) => fn(),
+    }
+    const scoped = new Proxy(target, {
+      get(t, prop) {
+        if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
+        if (deps.includes(prop)) return services[prop]
+        throw new Error(`cannot get property "${String(prop)}" without inject`)
+      },
+    })
+    cb(scoped)
+  }
 }
 
 test('apply loads both sub-plugins with the resolved values on the default role', async () => {
@@ -159,7 +189,7 @@ test("role 'client' mounts all three routes through a real inject and never call
     plugin: (module, config) => { pluginCalls.push({ module, config }) },
     on() {},
     effect(fn) { fn() },
-    inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
+    inject: tightInject(services),
   }
   index.apply(ctx, { role: 'client' })
   assert.equal(pluginCalls.length, 0, 'the client role must not load the gateway or push halves')
@@ -178,7 +208,7 @@ test("role 'client' mounts all three routes through a real inject and never call
     plugin: (module, config) => { pluginCalls.push({ module, config }) },
     on() {},
     effect(fn) { fn() },
-    inject(deps, cb) { if (deps.every((d) => hostServices[d] !== undefined)) cb(Object.assign(Object.create(hostCtx), hostServices)) },
+    inject: tightInject(hostServices),
   }
   index.apply(hostCtx, {})
   assert.equal(pluginCalls.length, 2, 'the host role loads gateway and push on top of the routes')
@@ -206,7 +236,7 @@ test('admin routes register on the host role only', async () => {
       plugin() {},
       on() {},
       effect(fn) { fn() },
-      inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
+      inject: tightInject(services),
     }
     return ctx
   }
@@ -293,7 +323,7 @@ test('the admin handler resolves config per request, volatile fields included', 
     plugin() {},
     on() {},
     effect(fn) { fn() },
-    inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
+    inject: tightInject(services),
   }
   index.apply(ctx, row)
 
@@ -336,7 +366,7 @@ function makeWiringCtx(record) {
     plugin: (module, config) => { record.plugins.push({ module, config }) },
     on() {},
     effect(fn) { fn() },
-    inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
+    inject: tightInject(services),
   }
   return ctx
 }
@@ -427,8 +457,9 @@ test('T22c: the host role subscribes session/event and registers the sweeper sto
   index.apply(host.ctx, {})
   assert.deepEqual(
     host.listeners.map((l) => l.event),
-    ['session/event'],
-    'the host role subscribes exactly the session/event feed',
+    // T33a adds the fresh-creation feed right behind the activity feed.
+    ['session/event', 'agent/created'],
+    'the host role subscribes the session/event and agent/created feeds',
   )
   assert.equal(typeof host.listeners[0].listener, 'function')
   // The sweeper is registered through ctx.effect, whose callback returns the
@@ -473,6 +504,163 @@ test('T22c-fix: the captured session/event listener refreshes the shared table a
     JSON.parse(fs.readFileSync(sharesFile, 'utf8')),
     after,
     'an id-less session is ignored end to end — the file does not move',
+  )
+})
+
+// ---- T33a: share-ops wiring -----------------------------------------------------
+
+test('T33a: the host role restores busy on startup, auto-shares fresh top-level sessions, follows forks, and skips children; the client role does none of it', async () => {
+  const index = await import(INDEX_URL)
+  const sharesFile = path.join(TEMP_HOME, 'zen-remote-shares.json')
+
+  // A wiring ctx whose inject EXECUTES whenever every service exists — the
+  // admin routes need connection, the busy restore needs agents, the relay
+  // (registered as a side effect here) needs typertGateway. The callback
+  // contexts are the TIGHT fakes: only declared services resolve as
+  // properties, everything else throws like cordis does.
+  function makeFullCtx(routes, agentRoster) {
+    const listeners = []
+    const services = {
+      logger: { warn() {} },
+      webServer: { register: (route) => { routes.push(route); return () => {} } },
+      sessions: { get: () => undefined },
+      sessionQuery: {},
+      connection: { admit: () => ({ peer: {} }) },
+      typertGateway: { invoke: async () => ({ values: {} }) },
+      agents: { list: () => agentRoster },
+    }
+    const ctx = {
+      plugin() {},
+      on(event, listener) { listeners.push({ event, listener }) },
+      effect(fn) { fn() },
+      inject: tightInject(services),
+    }
+    return { ctx, listeners }
+  }
+
+  // A minimal async-iterable JSON request the route handlers can drain.
+  const jsonReq = (method, url, headers, body) => {
+    const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
+    let i = 0
+    return {
+      method,
+      url,
+      headers,
+      [Symbol.asyncIterator]() {
+        return { next: () => Promise.resolve(i < chunks.length ? { value: chunks[i++], done: false } : { value: undefined, done: true }) }
+      },
+    }
+  }
+
+  // The store is born inside apply() reading the shares file, so the busy
+  // restore has something to find: one shared session whose agent is
+  // "running", one whose agent is idle.
+  const stamp = Date.now()
+  fs.writeFileSync(sharesFile, JSON.stringify({
+    version: 1,
+    sessions: {
+      'live-1': { sharedAt: stamp, lastActivityAt: stamp },
+      'idle-1': { sharedAt: stamp, lastActivityAt: stamp },
+    },
+  }))
+  const routes = []
+  const { ctx, listeners } = makeFullCtx(routes, [{ id: 'live-1', status: 'running' }, { id: 'idle-1', status: 'idle' }])
+  index.apply(ctx, { autoShareNewSessions: true })
+
+  // Startup busy restore: the running one is busy again, the idle one is not.
+  const adminRoute = routes.find((r) => String(r.path).startsWith('/_dsh/zen-remote/admin'))
+  assert.ok(adminRoute, 'the host role registered the admin route carrying the shares surface')
+  const res = { status: 0, body: '', setHeader() {}, writeHead(code) { this.status = code }, end(bytes) { if (bytes !== undefined) this.body = bytes.toString() } }
+  await adminRoute.handler({ method: 'GET', url: '/_dsh/zen-remote/admin/shares', headers: {} }, res)
+  assert.equal(res.status, 200)
+  const listed = JSON.parse(res.body)
+  assert.equal(listed.ok, true)
+  const live = listed.shares.find((s) => s.sessionId === 'live-1')
+  const idle = listed.shares.find((s) => s.sessionId === 'idle-1')
+  assert.equal(live.busy, true, 'the restore re-marked the running session busy')
+  assert.equal(live.remainingMs, null, 'busy serializes as null remaining')
+  assert.equal(idle.busy, false)
+
+  // Regression (T33a-fix): the same tight-context wiring must also carry a
+  // POST share through — before the fix the handler read typertGateway/
+  // agents by PROPERTY access on an inject scope that never declared them,
+  // and every shares request died in a 500.
+  const postRes = { status: 0, body: '', setHeader() {}, writeHead(code) { this.status = code }, end(bytes) { if (bytes !== undefined) this.body = bytes.toString() } }
+  await adminRoute.handler(
+    jsonReq('POST', '/_dsh/zen-remote/admin/shares', { 'sec-fetch-site': 'same-origin' }, { action: 'share', sessionId: 'posted-1' }),
+    postRes,
+  )
+  assert.equal(postRes.status, 200, 'POST share survives the tight context (reflect.get lookup)')
+  assert.equal(JSON.parse(postRes.body).ok, true)
+  assert.ok(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['posted-1'], 'the posted session entered the table')
+  const postListed = { status: 0, body: '', setHeader() {}, writeHead(code) { this.status = code }, end(bytes) { if (bytes !== undefined) this.body = bytes.toString() } }
+  await adminRoute.handler({ method: 'GET', url: '/_dsh/zen-remote/admin/shares', headers: {} }, postListed)
+  assert.equal(JSON.parse(postListed.body).shares.some((s) => s.sessionId === 'posted-1'), true, 'GET shares (non-empty table) works end to end')
+
+  // The creation feed: a fresh top-level session is auto-shared (row knob on).
+  const created = listeners.find((l) => l.event === 'agent/created').listener
+  const startup = (id, header) => created({ agent: { id, session: { header: { version: 4, id, createdAt: stamp, isSeeded: false, ...header } } }, source: 'startup' })
+  startup('auto-1')
+  const after = JSON.parse(fs.readFileSync(sharesFile, 'utf8'))
+  assert.ok(after.sessions['auto-1'], 'a fresh top-level session entered the table (autoShare on)')
+
+  // Resume is NOT a fresh creation: a resumed session stays out.
+  created({ agent: { id: 'resumed-1', session: { header: { version: 4, id: 'resumed-1', createdAt: stamp, isSeeded: false } } }, source: 'resume' })
+  const afterResume = JSON.parse(fs.readFileSync(sharesFile, 'utf8'))
+  assert.equal(afterResume.sessions['resumed-1'], undefined, "source 'resume' never shares")
+
+  // A subagent child never enters the table — not even under autoShare.
+  startup('child-1', { origin: 'subagent', parentSession: 'auto-1' })
+  assert.equal(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['child-1'], undefined)
+
+  // A fork of a shared source follows it into the table; a fork of an
+  // unknown source follows the autoShare knob instead (T33a-fix: a fork is
+  // an ordinary new session) — and this row has the knob ON.
+  startup('fork-1', { parentSession: 'auto-1', isSeeded: true })
+  assert.ok(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['fork-1'], 'the fork of a shared source is shared')
+  startup('fork-2', { parentSession: 'never-heard-of', isSeeded: true })
+  assert.ok(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['fork-2'], 'an unreachable fork still follows autoShare (knob on here)')
+  // And a fresh top-level resume-shaped event is still ignored.
+  created({ agent: { id: 'resumed-2', session: { header: { version: 4, id: 'resumed-2', createdAt: stamp, isSeeded: true, parentSession: 'also-unknown' } } }, source: 'resume' })
+  assert.equal(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['resumed-2'], undefined, "source 'resume' never shares, fork header or not")
+
+  // Same wiring, client role: no creation feed, no admin prefix — the
+  // service being present changes nothing.
+  const clientRoutes = []
+  const client = makeFullCtx(clientRoutes, [])
+  index.apply(client.ctx, { role: 'client' })
+  assert.equal(client.listeners.filter((l) => l.event === 'agent/created').length, 0, "the client role never subscribes agent/created")
+  assert.equal(clientRoutes.filter((r) => String(r.path).startsWith('/_dsh/zen-remote/admin')).length, 0, 'no admin prefix on the client role')
+})
+
+test('T33a-fix: a throwing agent/created listener is swallowed and warned, never propagated', async () => {
+  const index = await import(INDEX_URL)
+  // The feed dispatches SERIALLY: a rejection rolls the whole session
+  // creation back, so the listener must contain its own failures.
+  fs.rmSync(path.join(TEMP_HOME, 'zen-remote-shares.json'), { force: true })
+  const { ctx, listeners, warns } = makeCtx()
+  index.apply(ctx, { autoShareNewSessions: true })
+  const created = listeners.find((l) => l.event === 'agent/created').listener
+
+  // An agent whose session read explodes mid-flight (a hostile getter, the
+  // simplest faithful stand-in for any bookkeeping failure below).
+  assert.doesNotThrow(() => created({
+    agent: { id: 'hostile', get session() { throw new Error('probe') } },
+    source: 'startup',
+  }), 'the listener must not let the error escape')
+  assert.ok(
+    warns.some((args) => String(args[0]).includes('cannot share new session')),
+    'the failure is warned through the logger',
+  )
+
+  // And it survives: the next well-formed creation still shares.
+  created({
+    agent: { id: 'after-boom', session: { header: { version: 4, id: 'after-boom', createdAt: 1, isSeeded: false } } },
+    source: 'startup',
+  })
+  assert.ok(
+    JSON.parse(fs.readFileSync(path.join(TEMP_HOME, 'zen-remote-shares.json'), 'utf8')).sessions['after-boom'],
+    'the listener keeps working after a swallowed failure',
   )
 })
 
