@@ -29,6 +29,7 @@ import type {} from '@deepseek-ai/dsh-session'
 import { readFileConfig, resolveConfig } from './config.js'
 import { createActivityTracker, createParentIndex, startSweeper } from './activity.js'
 import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
+import type { SessionQueryLike } from './admin-routes.js'
 import { CLIENT_ROUTE_PREFIX, createClientHandler } from './client-routes.js'
 import { responseJson, sameOriginPost } from './http.js'
 import { onSessionCreated, restoreBusy } from './share-ops.js'
@@ -36,7 +37,7 @@ import type { AgentStatusLike } from './share-ops.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 import { createShareStore } from './share-store.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
-import type { RelayGateway } from './relay-server.js'
+import type { RelayGateway, RelayHandler } from './relay-server.js'
 
 // The loader's config schema (settings form) and the role normalizer live in
 // src/config.ts next to the resolution they describe; re-exported so the
@@ -396,6 +397,13 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       file: join(home, 'zen-remote-shares.json'),
       idleHours: effective.values.idleHours,
     })
+    // The live relay handler, kept so the admin shares route can read viewer
+    // counts through it (T33a2): the handler is the only piece that knows
+    // who is connected. Assigned when the relay route mounts, cleared in its
+    // teardown (identity-checked: a row reload builds a NEW handler before
+    // the old one's disposer runs) — the admin route reads whatever is live
+    // at request time and answers 0 viewers when none is mounted.
+    let relayHandler: RelayHandler | undefined
     // Keep the table's clocks honest (T22c). The subscription mirrors
     // dsh-push.mjs's session/event listener — post-commit append feed for
     // EVERY session, subagent children included. The session id is read off
@@ -499,6 +507,13 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           store,
           typert: () => webCtx.reflect.get('typertGateway') as RelayGateway | undefined,
           listAgents: () => (webCtx.reflect.get('agents') as { list(): readonly AgentStatusLike[] } | undefined)?.list() ?? [],
+          // The "who is looking" badge (T33a2): read through whichever relay
+          // handler is live right now. sessionQuery likewise — the share
+          // action reads the durable session header through it to judge
+          // subagent sessions, degrading to the projection identity when the
+          // composition lacks the service.
+          viewerCount: (id) => relayHandler?.viewerCount(id) ?? 0,
+          sessionQuery: () => webCtx.reflect.get('sessionQuery') as SessionQueryLike | undefined,
         }),
       }), 'dsh-zen-remote: admin routes')
     })
@@ -542,13 +557,20 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           path: RELAY_PREFIX,
           handler,
         })
+        // Publish the handler for the admin shares route's viewer counts
+        // (T33a2) BEFORE the route is reachable, so no request can hit a
+        // mounted route with an unpublished handler.
+        relayHandler = handler
         // A row reload builds a NEW handler over a NEW share table; the open
         // streams of this one would push forever, unreachable by any unshare
         // (T22b-fix) — so the teardown ends them with a server-restart error
-        // line before the route itself is unregistered.
+        // line before the route itself is unregistered, and the pointer
+        // follows (identity-checked: the new handler is already live by the
+        // time this old disposer runs).
         return () => {
           handler.closeAll('plugin row reloaded')
           unregister()
+          if (relayHandler === handler) relayHandler = undefined
         }
       }, 'dsh-zen-remote: relay route')
     })

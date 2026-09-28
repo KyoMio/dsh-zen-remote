@@ -99,6 +99,25 @@ export interface AdminHandlerOptions {
      * title is null and a timed-out existence check is a 502. Tests inject a
      * short value. */
     projectionTimeoutMs?: number;
+    /** The host's sessionQuery service, looked up PER REQUEST through the
+     * reflection layer like `typert`. The share action reads a session's
+     * durable header through it to judge subagent sessions; absent (or a
+     * failing read) falls back to the projection identity. */
+    sessionQuery?: () => SessionQueryLike | undefined;
+}
+/** The slice of the sessionQuery service the share action reads (RT
+ * dsh-session-query): `observeSession` answers a caller-owned lease over an
+ * immutable cut — `header` is the session's durable header — and the lease
+ * is released through the standard `Symbol.dispose` protocol. Declared
+ * structurally: the providing package is optional here and the tests feed
+ * plain objects. */
+export interface SessionObservationLike {
+    header?: {
+        origin?: unknown;
+    } | undefined;
+}
+export interface SessionQueryLike {
+    observeSession(sessionId: string): Promise<SessionObservationLike>;
 }
 export type AdminHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 /**

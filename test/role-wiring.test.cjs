@@ -88,7 +88,13 @@ function tightInject(services) {
     const target = {
       get: (name) => services[name],
       reflect: { get: (name) => services[name] },
-      effect: (fn) => fn(),
+      effect: (fn) => {
+        const out = fn()
+        // When the fake provides an `effectReturns` array, disposer returns
+        // land there — the T33a2 test drives the relay teardown from it.
+        if (Array.isArray(services.effectReturns)) services.effectReturns.push(out)
+        return out
+      },
     }
     const scoped = new Proxy(target, {
       get(t, prop) {
@@ -520,14 +526,18 @@ test('T33a: the host role restores busy on startup, auto-shares fresh top-level 
   // properties, everything else throws like cordis does.
   function makeFullCtx(routes, agentRoster) {
     const listeners = []
+    const effectReturns = []
     const services = {
       logger: { warn() {} },
-      webServer: { register: (route) => { routes.push(route); return () => {} } },
+      // The fake unregister is MARKED so the test can tell it apart from the
+      // real teardown disposers among the captured effect returns.
+      webServer: { register: (route) => { const unregister = () => {}; unregister.isFakeUnregister = true; routes.push(route); return unregister } },
       sessions: { get: () => undefined },
       sessionQuery: {},
       connection: { admit: () => ({ peer: {} }) },
       typertGateway: { invoke: async () => ({ values: {} }) },
       agents: { list: () => agentRoster },
+      effectReturns,
     }
     const ctx = {
       plugin() {},
@@ -535,7 +545,7 @@ test('T33a: the host role restores busy on startup, auto-shares fresh top-level 
       effect(fn) { fn() },
       inject: tightInject(services),
     }
-    return { ctx, listeners }
+    return { ctx, listeners, effectReturns }
   }
 
   // A minimal async-iterable JSON request the route handlers can drain.
@@ -564,7 +574,7 @@ test('T33a: the host role restores busy on startup, auto-shares fresh top-level 
     },
   }))
   const routes = []
-  const { ctx, listeners } = makeFullCtx(routes, [{ id: 'live-1', status: 'running' }, { id: 'idle-1', status: 'idle' }])
+  const { ctx, listeners, effectReturns } = makeFullCtx(routes, [{ id: 'live-1', status: 'running' }, { id: 'idle-1', status: 'idle' }])
   index.apply(ctx, { autoShareNewSessions: true })
 
   // Startup busy restore: the running one is busy again, the idle one is not.
@@ -596,6 +606,34 @@ test('T33a: the host role restores busy on startup, auto-shares fresh top-level 
   const postListed = { status: 0, body: '', setHeader() {}, writeHead(code) { this.status = code }, end(bytes) { if (bytes !== undefined) this.body = bytes.toString() } }
   await adminRoute.handler({ method: 'GET', url: '/_dsh/zen-remote/admin/shares', headers: {} }, postListed)
   assert.equal(JSON.parse(postListed.body).shares.some((s) => s.sessionId === 'posted-1'), true, 'GET shares (non-empty table) works end to end')
+
+  // Viewer counts (T33a2): the admin route reads them through the LIVE relay
+  // handler — the same object the relay prefix registered. No relay stream is
+  // open here, so everything answers 0; stubbing the handler's viewerCount
+  // (what T22b drives when a stream opens) shows up in the next GET.
+  const relayRoute = routes.find((r) => r.path === '/_dsh/zen-remote/relay')
+  assert.ok(relayRoute, 'the host role registered the relay prefix in this composition too')
+  const fetchShares = async () => {
+    const r = { status: 0, body: '', setHeader() {}, writeHead(code) { this.status = code }, end(bytes) { if (bytes !== undefined) this.body = bytes.toString() } }
+    await adminRoute.handler({ method: 'GET', url: '/_dsh/zen-remote/admin/shares', headers: {} }, r)
+    return JSON.parse(r.body)
+  }
+  assert.equal((await fetchShares()).shares.find((s) => s.sessionId === 'live-1').viewers, 0, 'no relay stream, zero viewers')
+  relayRoute.handler.viewerCount = (id) => (id === 'live-1' ? 3 : 0)
+  const withViewers = await fetchShares()
+  assert.equal(withViewers.shares.find((s) => s.sessionId === 'live-1').viewers, 3, 'the relay handler answer flows into the listing')
+  assert.equal(withViewers.shares.find((s) => s.sessionId === 'idle-1').viewers, 0, 'per session, not global')
+  delete relayRoute.handler.viewerCount
+
+  // The teardown clears the pointer: after the relay effect's disposer runs
+  // (closeAll + unregister + pointer clear), the same admin handler falls
+  // back to zero viewers instead of reading a dead handler. The disposer is
+  // the effect callback's return, captured by the fake's effectReturns —
+  // the only captured return that is not a fake webServer unregister.
+  const relayTeardown = effectReturns.find((d) => typeof d === 'function' && !d.isFakeUnregister)
+  assert.equal(typeof relayTeardown, 'function', 'the relay registration carries a teardown')
+  relayTeardown()
+  assert.equal((await fetchShares()).shares.find((s) => s.sessionId === 'live-1').viewers, 0, 'a disposed relay handler reads as zero viewers, not a crash')
 
   // The creation feed: a fresh top-level session is auto-shared (row knob on).
   const created = listeners.find((l) => l.event === 'agent/created').listener
