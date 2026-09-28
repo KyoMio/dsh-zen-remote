@@ -4,7 +4,7 @@ import { NS } from './locales.ts';
 import type { createNavStore } from './nav-store.ts';
 /** Full props for the phone home screen (shell.overlay entry). */
 export type MobileHomeProps = PropsRuntime<'shell.overlay'> & PropsStore<ReturnType<typeof createNavStore>> & PropsLocale<typeof NS> & {
-    /** Bound ctx.sessions.open(id). */
+    /** Bound ctx.uiWorkspace.openSession(id). */
     openSession: (id: SessionId) => void;
     /** Bound ctx.workspaces.startSession(workspaceId?). */
     startSession: (workspaceId?: WorkspaceId) => void;

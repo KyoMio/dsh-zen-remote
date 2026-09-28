@@ -30,7 +30,7 @@
 import { useState } from 'react'
 import type { CSSProperties, ReactNode } from 'react'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
-import { IconCheckOutline16, IconCloseOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconCheckOutlineRegular, IconCloseOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS } from '../locales.ts'
 import { SHARE_TURNS_PRESETS } from './fetch-share.ts'
 
@@ -174,7 +174,7 @@ export function ShareRangeSheet({ busy, onConfirm, onClose, t }: ShareRangeSheet
         <div style={HEAD_STYLE}>
           <span style={TITLE_STYLE}>{t('sharePickerTitle')}</span>
           <button type="button" aria-label={t('infoClose')} onClick={onClose} style={CLOSE_STYLE}>
-            <IconCloseOutline16 size={16} />
+            <IconCloseOutlineRegular size={16} />
           </button>
         </div>
 
@@ -200,7 +200,7 @@ export function ShareRangeSheet({ busy, onConfirm, onClose, t }: ShareRangeSheet
                 <span>{option.label}</span>
                 {selected && (
                   <span style={{ marginLeft: 'auto', display: 'inline-flex', color: 'var(--dsw-alias-label-primary, inherit)' }}>
-                    <IconCheckOutline16 size={16} />
+                    <IconCheckOutlineRegular size={16} />
                   </span>
                 )}
               </button>

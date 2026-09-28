@@ -1,39 +1,29 @@
 import { useEffect, useState } from 'react'
 import type { ReactElement } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { IconChevronLeftOutline14, IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconChevronLeftOutlineRegular, IconInfoOutlineRegular, IconPanelLeftOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { SessionId, UseJobs } from './compat/types.ts'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT, SESSION_INFO_EVENT } from './nav-store.ts'
 import { BETTER_TOGGLE, readSidebarTarget, toggleSidebarTarget } from './sidebar-panels.ts'
 import type { SidebarTarget } from './sidebar-panels.ts'
 
-/**
- * ic_ds_info_outline_16 — @deepseek-ai/dsh-client-ui-primitives has no
- * info-circle icon (grepped lib/types/icons/index.d.ts, 2026-08-17: 71
- * icons, nearest is IconQuestionOutline14, wrong glyph AND wrong size).
- * Hand-built to the same 16x16 box the rest of the header icon family
- * uses, so the ⓘ button in MobileHeaderUtilities below reads as one
- * family with the workbench button's mirrored IconPanelLeftOutline16
- * (real-device round 2 feedback: "same size (16), same stroke weight").
+/*
+ * The ⓘ button used to render a hand-built info glyph because the
+ * primitives family had no info-circle icon (grepped 2026-08-17: 71
+ * icons). DSH 0.1.7 ships IconInfoOutlineRegular, so the hand-built twin
+ * is retired in favour of the official one — same 16x16 box the rest of
+ * the header icon family uses.
  */
-function IconInfoOutline16({ size = 16 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-      <circle cx="8" cy="8" r="6.7" stroke="currentColor" strokeWidth="1.3" />
-      <circle cx="8" cy="4.7" r="0.95" fill="currentColor" />
-      <rect x="7.25" y="6.9" width="1.5" height="4.7" rx="0.75" fill="currentColor" />
-    </svg>
-  )
-}
 
 /**
- * Two more hand-built 14px glyphs, same reason as IconInfoOutline16 above:
- * the primitives family has no subagent or background-task icon. Drawn on
- * the same 16-box with the same 1.3 stroke so the activity chip reads as
- * part of the header icon family.
+ * Two hand-built 14px glyphs: the primitives family still has no subagent
+ * or background-task icon (re-checked against the 0.1.7-rc.2 exports).
+ * Drawn on the same 16-box with the same stroke so the activity chip
+ * reads as part of the header icon family.
  */
 /** Three linked nodes — a parent delegating to children. */
-function IconSubagentOutline14({ size = 14 }: { size?: number }) {
+function IconSubagentGlyph({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
       <circle cx="8" cy="3.2" r="2" stroke="currentColor" strokeWidth="1.3" />
@@ -45,7 +35,7 @@ function IconSubagentOutline14({ size = 14 }: { size?: number }) {
 }
 
 /** A clock face — work still ticking in the background. */
-function IconTaskOutline14({ size = 14 }: { size?: number }) {
+function IconTaskGlyph({ size = 14 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
       <circle cx="8" cy="8" r="6.1" stroke="currentColor" strokeWidth="1.3" />
@@ -129,6 +119,17 @@ function ActivityPill(
 export type MobileHeaderActionsProps =
   & PropsRuntime<'conversation.session.header.actions'>
   & PropsLocale<typeof NS>
+  & {
+    /**
+     * Job-roster hook, bound from the `jobs` service through the renderer's
+     * inject face. Always present: the binding substitutes a fixed empty
+     * source when the service is absent (see index.tsx activityInject), so
+     * this hook is called on every render and the hook count never varies.
+     */
+    useJobs: UseJobs
+    /** Keeps the session's job roster stream open while mounted (empty no-op without the service). */
+    watchRows: (sessionId: SessionId) => () => void
+  }
 
 /** One tab read off the official (now visually hidden) Chat/Trajectory tablist. */
 export interface ViewTabInfo {
@@ -194,7 +195,14 @@ export function useViewTabs(): ViewTabInfo[] {
  * (styles/header.css.ts) keeps them hidden at >= 768px so the tablet drawer
  * and the desktop layout stay exactly as they were.
  */
-export function MobileHeaderActions({ sessionId, useSessions, t }: MobileHeaderActionsProps) {
+export function MobileHeaderActions({
+  sessionId,
+  useSessions,
+  useSessionStatus,
+  useJobs,
+  watchRows,
+  t,
+}: MobileHeaderActionsProps) {
   const tabs = useViewTabs()
   const active = tabs.find((tab) => tab.active) ?? tabs[0]
 
@@ -204,10 +212,23 @@ export function MobileHeaderActions({ sessionId, useSessions, t }: MobileHeaderA
      across the centred session title. Reading the counts from the sessions
      snapshot instead of re-homing the official DOM keeps React's ownership
      of its own nodes intact — the detail lives one tap away in the info
-     card, which this chip opens. */
-  const subagents = useSessions((s) => s.subagentsByParent[sessionId]?.entries ?? [])
-  const jobs = useSessions((s) => s.jobsBySession[sessionId] ?? [])
-  const subagentRunning = subagents.some((e) => e.kind === 'child' && e.activity === 'running')
+     card, which this chip opens.
+     0.1.7 sources (0.1.5's per-parent subagent / per-session job snapshots
+     are deleted): the catalog is read straight off the explicit-read
+     projection store — no refresh from here, exactly like the official
+     SubagentHeaderLineage (every projection refresh call registers a
+     session the controller re-reads on each reconnect); job rows come from
+     the `jobs` service the renderer exposes as the useJobs hook prop, with
+     a fixed empty source substituted when the service is absent. */
+  useEffect(() => watchRows(sessionId), [sessionId, watchRows])
+  const subagents = useSessions((s) => s.projectionsBySession[sessionId]?.values.subagentCatalog) ?? []
+  const jobs = useJobs((s) => s.rows[sessionId]) ?? []
+  /* Running派生式与官方 SubagentHeaderLineage 一致：状态表优先，目录行兜底。 */
+  const statuses = useSessionStatus((m) => m)
+  const byId = useSessions((s) => s.byId)
+  const runningOf = (id: SessionId): boolean | undefined =>
+    statuses.get(id)?.running ?? byId[id]?.running
+  const subagentRunning = subagents.some((e) => runningOf(e.id) === true)
   const jobRunning = jobs.some((j) => j.status === 'running' || j.status === 'stopping')
   const jobBad = jobs.some((j) => j.status === 'failed' || j.status === 'killed')
   const subagentState: ActivityState = subagentRunning ? 'running' : 'done'
@@ -226,7 +247,7 @@ export function MobileHeaderActions({ sessionId, useSessions, t }: MobileHeaderA
         title={t('backToList')}
         onClick={() => window.dispatchEvent(new CustomEvent(GO_HOME_EVENT))}
       >
-        <IconChevronLeftOutline14 size={20} />
+        <IconChevronLeftOutlineRegular size={20} />
       </button>
       {tabs.length > 1 && active !== undefined && (
         <button
@@ -255,7 +276,7 @@ export function MobileHeaderActions({ sessionId, useSessions, t }: MobileHeaderA
             label={t('infoSubagents', { count: subagents.length })}
             trigger={SUBAGENT_TRIGGER}
             onFallback={openInfoCard}
-            Icon={IconSubagentOutline14}
+            Icon={IconSubagentGlyph}
           />
           <ActivityPill
             kind="job"
@@ -264,7 +285,7 @@ export function MobileHeaderActions({ sessionId, useSessions, t }: MobileHeaderA
             label={t('infoJobs', { count: jobs.length })}
             trigger={JOBS_TRIGGER}
             onFallback={openInfoCard}
-            Icon={IconTaskOutline14}
+            Icon={IconTaskGlyph}
           />
         </div>
       )}
@@ -348,9 +369,9 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
   // open, "_panelHidden" is appended once closed), so this effect only
   // has to guarantee the node exists — no MutationObserver needed to
   // track open/closed state. Icon paths copied verbatim from
-  // IconCloseOutline16 (primitives) for the same reason IconInfoOutline16
-  // above is hand-built: this button lives outside the React tree, so it
-  // cannot render a primitives component directly.
+  // IconCloseOutlineRegular (primitives) for the same reason the subagent
+  // and task glyphs above are hand-built: this button lives outside the
+  // React tree, so it cannot render a primitives component directly.
   useEffect(() => {
     const button = document.createElement('button')
     button.type = 'button'
@@ -397,7 +418,7 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
         title={t('sessionInfo')}
         onClick={() => window.dispatchEvent(new CustomEvent(SESSION_INFO_EVENT))}
       >
-        <IconInfoOutline16 size={20} />
+        <IconInfoOutlineRegular size={20} />
       </button>
       {sidebar !== null && <button
         type="button"
@@ -407,12 +428,12 @@ export function MobileHeaderUtilities({ t }: MobileHeaderUtilitiesProps) {
         title={t(sidebar === 'better' ? 'workbench' : 'sidebar')}
         onClick={() => { toggleSidebarTarget(sidebar) }}
       >
-        {/* No IconPanelRightOutline16 in primitives (grepped lib/types/
-            icons/index.d.ts, 2026-08-17) — mirrored via CSS (styles/
-            header.css.ts) instead of hand-drawing a new glyph. The panel
-            icon's "left column" reads as "right column" flipped, which is
-            exactly the workbench's own right-side-panel semantics. */}
-        <IconPanelLeftOutline16 size={20} />
+        {/* No panel-RIGHT glyph in primitives (re-checked against the
+            0.1.7-rc.2 exports) — mirrored via CSS (styles/header.css.ts)
+            instead of hand-drawing a new glyph. The panel icon's "left
+            column" reads as "right column" flipped, which is exactly the
+            workbench's own right-side-panel semantics. */}
+        <IconPanelLeftOutlineRegular size={20} />
       </button>}
     </>
   )

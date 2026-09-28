@@ -39,9 +39,66 @@ export interface MobileSessionRow {
     completed?: boolean;
     blank: boolean;
     updatedAt: number;
+    /**
+     * 0.1.7 的本地引用计数（retainedBy.mainView > 0 即「主视图正打开这个
+     * 会话」）。0.1.5 的 SessionListState.current 删掉了，主视图会话从行上
+     * 派生——与官方 uiSession.publishMain 同款读法（见 {@link mainSessionIdOf}）。
+     */
+    retainedBy?: Readonly<{
+        mainView?: number;
+    }>;
     /** 宿主投影值；本插件只读 sessionStats.turns，读的地方自己 cast。 */
     projectionValues?: unknown;
 }
+/**
+ * 0.1.5 的 `SessionListState.current` 在 0.1.7 删除；主视图会话改为从目录
+ * 行派生：被 mainView 来源 retain 的那一行。这正是官方 uiSession
+ * publishMain 的挑选方式（client/ui-session index.ts：先看当前绑定是否
+ * mainView，否则全表找第一条 mainView retain），本插件读同一条事实。
+ * @param byId - 会话目录表（useSessions 的 byId）。
+ * @returns 主视图会话 id；没有主视图会话时 undefined。
+ */
+export declare function mainSessionIdOf(byId: Readonly<Record<string, MobileSessionRow>>): SessionId | undefined;
+/**
+ * 子代理目录条目的本地镜像（0.1.7 `subagentCatalog` projection 的元素）。
+ * 0.1.5 的「按父会话的子代理快照」字段删除；目录改经
+ * `projectionsBySession[parentId].values.subagentCatalog` 显式读，条目只
+ * 镜像本插件读到的字段（id；运行态按官方派生式从状态表/目录行取，见
+ * MobileSessionHeader.tsx）。
+ */
+export interface SubagentCatalogEntryLike {
+    readonly id: SessionId;
+    readonly mode: 'one-shot' | 'continuable' | 'unknown';
+    readonly label?: string;
+}
+/** 0.1.7 job roster 行的本地镜像：本插件只读 status。 */
+export interface JobRowLike {
+    readonly status: 'running' | 'stopping' | 'completed' | 'killed' | 'failed';
+}
+/**
+ * `ctx.jobs` 服务的本地最小接口（0.1.7 `dsh-api-job-controller` 的 client
+ * 面）。0.1.5 的「按会话的任务快照」字段删除；任务列表改由 job roster 服务给出，
+ * 官方 JobListAction 用同一条路（hooks.jobs + watchRows）。
+ */
+export interface JobsLike {
+    /** Rosters and observations snapshot: `{ rows: Record<sessionId, JobRow[]> }`. */
+    readonly state: {
+        getSnapshot(): {
+            readonly rows: Readonly<Record<string, readonly JobRowLike[]>>;
+        };
+        subscribe(listener: () => void): () => void;
+    };
+    /** Keep one session's roster stream open while a viewer is mounted (ref-counted). */
+    watchRows(sessionId: SessionId): () => void;
+}
+/**
+ * 渲染器把 inject 工厂里 `hooks.jobs`（{@link JobsLike.state} 形状的
+ * observable）包装成的标准 hook prop（官方 ui-jobs 同款约定：`jobs` →
+ * `useJobs`）。可选：服务缺席（懒查失败）时组件收不到它，任务计数隐藏。
+ */
+export type UseJobs = <S>(sel: (snapshot: {
+    readonly rows: Readonly<Record<string, readonly JobRowLike[]>>;
+}) => S, eq?: (a: S, b: S) => boolean) => S;
 /**
  * 0.1.1's session row carries `agentPreset`; 0.1.2 dropped it. Reading it
  * must not depend on which version's types are in scope in the current

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconPanelLeftOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS } from './locales.ts'
 
 /** Full props for the shell overlay entry. */
@@ -271,7 +271,7 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
           title={t('open')}
           onClick={() => toggleSidebar()}
         >
-          <IconPanelLeftOutline16 size={18} />
+          <IconPanelLeftOutlineRegular size={18} />
         </button>
       )}
     </>

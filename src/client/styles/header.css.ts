@@ -417,13 +417,13 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, .06));
   }
   /* Icon family unification (real-device round 2, 2026-08-17): the ⓘ text
-     glyph is gone (MobileSessionHeader.tsx now renders IconInfoOutline16,
-     a local 16px SVG built to match the primitives icon family) and the
-     workbench button's IconPanelLeftOutline16 is mirrored into a
-     panel-RIGHT glyph — there's no IconPanelRightOutline16 in primitives
-     (checked lib/types/icons/index.d.ts), and the plugin's own right-side
-     panel semantics are exactly the left icon flipped. Both buttons now
-     carry a same-size (16px), same-stroke-weight icon. */
+     glyph is gone (MobileSessionHeader.tsx renders the official
+     IconInfoOutlineRegular since DSH 0.1.7) and the workbench button's
+     IconPanelLeftOutlineRegular is mirrored into a panel-RIGHT glyph —
+     there's no panel-RIGHT glyph in primitives (re-checked against the
+     0.1.7-rc.2 exports), and the plugin's own right-side panel semantics
+     are exactly the left icon flipped. Both buttons carry a same-size
+     (16px) icon. */
   [data-mobile-nav="header-workbench"] svg {
     transform: scaleX(-1);
   }

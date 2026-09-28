@@ -1,5 +1,6 @@
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { IconDownloadOutline16, IconPanelLeftOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { IconDownloadOutlineRegular, IconPanelLeftOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
+import { mainSessionIdOf } from './compat/types.ts'
 import { NS } from './locales.ts'
 
 /** Full props for the sidebar footer action entry. */
@@ -21,7 +22,9 @@ export interface MobileDrawerFooterProps extends PropsRuntime<'sidebar.footer.ac
  * Hidden entirely on wide screens (CSS media query).
  */
 export function MobileDrawerFooter({ useSessions, downloadSessionLog, toggleSidebar, t }: MobileDrawerFooterProps) {
-  const sessionId = useSessions((state) => state.current)
+  // 0.1.7: SessionListState.current is gone — derive the main-view session
+  // from the catalog rows instead (official uiSession.publishMain's pick).
+  const sessionId = useSessions((state) => mainSessionIdOf(state.byId))
   const openExplorer = (): void => {
     document.querySelector('[data-mobile-nav="frame"]')?.setAttribute('data-aionui-explorer-open', '')
     toggleSidebar()
@@ -35,7 +38,7 @@ export function MobileDrawerFooter({ useSessions, downloadSessionLog, toggleSide
         title={t('files')}
         onClick={openExplorer}
       >
-        <IconPanelLeftOutline16 size={14} />
+        <IconPanelLeftOutlineRegular size={14} />
         <span>{t('files')}</span>
       </button>
       <button
@@ -48,7 +51,7 @@ export function MobileDrawerFooter({ useSessions, downloadSessionLog, toggleSide
           if (sessionId !== undefined) downloadSessionLog(sessionId)
         }}
       >
-        <IconDownloadOutline16 size={14} />
+        <IconDownloadOutlineRegular size={14} />
         <span>{t('sessionLog')}</span>
       </button>
     </div>

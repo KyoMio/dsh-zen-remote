@@ -1,4 +1,13 @@
 import type { ClientContext } from '../compat/types.ts';
+/**
+ * One suppression state transition, given whether an official group is on
+ * the page and whether the fold is currently suppressed. `'enter'`: groups
+ * appeared — drop every mark and the ACTIVE_ATTR the stylesheet keys on.
+ * `'exit'`: the last group left — re-arm and fold again. `'hold'`: nothing
+ * to do. Exported pure so the state machine itself is testable off-DOM
+ * (test/fold-suppression.test.cjs); {@link scan} applies it.
+ */
+export declare function foldSuppressionTransition(officialGroupPresent: boolean, suppressed: boolean): 'enter' | 'exit' | 'hold';
 /** Whole-row node kinds that are turn *process*, not conversation content.
  * Keys are ChatNodeSeat's own `data-chat-flow-kind` dispatch values
  * (registerChatNodeRenderers, lib/client.js:9322): tool calls, injected

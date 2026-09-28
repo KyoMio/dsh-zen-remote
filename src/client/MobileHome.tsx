@@ -2,14 +2,14 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode, TouchEvent as ReactTouchEvent } from 'react'
 import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import {
-  IconChevronDownOutline14,
-  IconChevronLeftOutline14,
-  IconPlusOutline16,
-  IconSettingsOutline16,
+  IconChevronDownOutlineRegular,
+  IconChevronLeftOutlineRegular,
+  IconPlusOutlineRegular,
+  IconSettingsOutlineRegular,
   StateDot,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
-import { agentPresetOf } from './compat/types.ts'
+import { agentPresetOf, mainSessionIdOf } from './compat/types.ts'
 import type { MobileSessionRow, SessionId, UsePendingInteractions, WorkspaceId } from './compat/types.ts'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT } from './nav-store.ts'
@@ -29,7 +29,7 @@ export type MobileHomeProps =
   & PropsStore<ReturnType<typeof createNavStore>>
   & PropsLocale<typeof NS>
   & {
-    /** Bound ctx.sessions.open(id). */
+    /** Bound ctx.uiWorkspace.openSession(id). */
     openSession: (id: SessionId) => void
     /** Bound ctx.workspaces.startSession(workspaceId?). */
     startSession: (workspaceId?: WorkspaceId) => void
@@ -298,12 +298,16 @@ export function MobileHome({
     void archiveSession(id)
   }
 
+  // 0.1.7: SessionListState.current is gone — the main-view session derives
+  // from the catalog rows (mainSessionIdOf = official uiSession.publishMain's
+  // pick). One read shared by the filter default, the highlight row, and the
+  // two page-stack props below.
+  const current = mainSessionIdOf(sessions.byId)
   // Workspace of the current session — the untouched filter default.
   const currentWorkspaceId = useMemo(() => {
-    const current = sessions.current
     if (current === undefined) return undefined
     return workspaces.items.find((item) => item.sessionIds.includes(current))?.workspaceId
-  }, [sessions.current, workspaces.items])
+  }, [current, workspaces.items])
 
   const selected: WorkspaceFilter = pinned ?? currentWorkspaceId ?? 'all'
   const selectedWorkspace = selected === 'all'
@@ -336,12 +340,12 @@ export function MobileHome({
       // flight), it earned a title, or the projection is absent (no signal —
       // show rather than silently hide).
       .filter((row) => {
-        if (row.id === sessions.current || row.running || row.title !== undefined) return true
+        if (row.id === current || row.running || row.title !== undefined) return true
         const stats = (row.projectionValues as { sessionStats?: { turns?: number } } | undefined)?.sessionStats
         return stats?.turns === undefined || stats.turns > 0
       })
       .sort((a, b) => b.updatedAt - a.updatedAt)
-  }, [sessions.ids, sessions.byId, sessions.current, workspaces.archivedSessionIds, selectedWorkspace])
+  }, [sessions.ids, sessions.byId, current, workspaces.archivedSessionIds, selectedWorkspace])
 
   // The session header's back button (session scope) cannot hold this
   // store directly — a handle mounts under exactly one scope, and this one
@@ -403,7 +407,7 @@ export function MobileHome({
           aria-label={t('backToList')}
           onClick={() => actions.show('home')}
         >
-          <IconChevronLeftOutline14 size={20} />
+          <IconChevronLeftOutlineRegular size={20} />
         </button>
       )}
     <div data-mobile-nav="home" data-view={view} aria-hidden={view === 'session'}>
@@ -424,7 +428,7 @@ export function MobileHome({
           onClick={() => setSheet('filter')}
         >
           <span>{title}</span>
-          <IconChevronDownOutline14 size={14} />
+          <IconChevronDownOutlineRegular size={14} />
         </button>
         <button
           type="button"
@@ -433,13 +437,13 @@ export function MobileHome({
           title={t('settings')}
           onClick={openSettings}
         >
-          <IconSettingsOutline16 size={18} />
+          <IconSettingsOutlineRegular size={18} />
         </button>
       </div>
 
       <MobileHomeChips
         t={t}
-        sessionId={sessions.current}
+        sessionId={current}
         downloadSessionLog={(id) => downloadSessionLog(id as SessionId)}
         onCustomize={() => setSheet('chips')}
       />
@@ -461,7 +465,7 @@ export function MobileHome({
                 <button
                   type="button"
                   data-mobile-nav="home-row"
-                  data-current={row.id === sessions.current ? '' : undefined}
+                  data-current={row.id === current ? '' : undefined}
                   onClick={() => guardClick(() => enter(() => openSession(row.id)))}
                 >
                   <span data-mobile-nav="home-row-avatar" aria-hidden="true">
@@ -491,7 +495,7 @@ export function MobileHome({
         title={t('newSession')}
         onClick={() => enter(() => startSession(selectedWorkspace?.workspaceId))}
       >
-        <IconPlusOutline16 size={18} />
+        <IconPlusOutlineRegular size={18} />
         <span>{t('newSession')}</span>
       </button>
 

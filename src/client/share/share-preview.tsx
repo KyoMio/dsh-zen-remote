@@ -20,7 +20,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { agentPresetOf } from '../compat/types.ts'
+import { agentPresetOf, mainSessionIdOf } from '../compat/types.ts'
 import { NS } from '../locales.ts'
 import { fetchShareExport } from './fetch-share.ts'
 import { ShareFetchError } from './fetch-share.ts'
@@ -162,8 +162,11 @@ export function SharePreview({ useSessions, t }: SharePreviewProps) {
   const [exportNote, setExportNote] = useState<string | null>(null)
   const cardHostRef = useRef<HTMLDivElement>(null)
 
-  const currentId = useSessions((s) => s.current)
-  const row = useSessions((s) => (s.current === undefined ? undefined : s.byId[s.current]))
+  // 0.1.7: SessionListState.current is gone — the main-view session derives
+  // from the catalog rows (mainSessionIdOf = official uiSession.publishMain's
+  // pick).
+  const currentId = useSessions((s) => mainSessionIdOf(s.byId))
+  const row = useSessions((s) => (currentId === undefined ? undefined : s.byId[currentId]))
 
   // Try the real route whenever a session is open; any failure (route not
   // mounted on this host, network, bad body) silently reverts to the fixture

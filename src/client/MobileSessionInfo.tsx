@@ -1,16 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import {
-  IconArchiveOutline20,
-  IconBranchOutline16,
-  IconCloseOutline16,
-  IconDownloadOutline16,
-  IconEditOutline16,
-  IconShareOutline16,
+  IconArchiveOutlineRegular,
+  IconBranchOutlineRegular,
+  IconCloseOutlineRegular,
+  IconDownloadOutlineRegular,
+  IconEditOutlineRegular,
+  IconShareOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { workspaceTitleOf } from './compat/store.ts'
 import { agentPresetOf } from './compat/types.ts'
-import type { RenameResult, SessionId } from './compat/types.ts'
+import type { RenameResult, SessionId, UseJobs } from './compat/types.ts'
 import { NS } from './locales.ts'
 import { GO_HOME_EVENT, SESSION_INFO_EVENT } from './nav-store.ts'
 import { hasLayer, popLayer, pushLayer } from './history-nav.ts'
@@ -50,7 +50,7 @@ export type MobileSessionInfoProps =
   & {
     /** Bound ctx.sessions.fork({sessionId}). */
     forkSession: (sessionId: SessionId) => Promise<SessionId>
-    /** Bound ctx.sessions.open(id) — lands on the freshly forked session. */
+    /** Bound ctx.uiWorkspace.openSession(id) — lands on the freshly forked session. */
     openSession: (id: SessionId) => void
     /** Bound ctx.sessions.binding(id)?.session.rename(title); undefined when the binding is gone. */
     renameSession: (sessionId: SessionId, title: string) => RenameResult | undefined
@@ -58,6 +58,14 @@ export type MobileSessionInfoProps =
     archiveSession: (sessionId: SessionId) => Promise<void>
     /** Bound ctx.sessionLogDownload.download(sessionId) — owns its own progress/result modal. */
     downloadSessionLog: (sessionId: SessionId) => Promise<void>
+    /**
+     * Job-roster hook, always present (fixed empty source when the `jobs`
+     * service is absent — see index.tsx activityInject — so the hook is
+     * called on every render and the hook count never varies).
+     */
+    useJobs: UseJobs
+    /** Keeps the session's job roster stream open while the sheet's session is mounted. */
+    watchRows: (sessionId: SessionId) => () => void
   }
 
 /* ---- StatsLine-identical formatting -------------------------------------
@@ -132,6 +140,8 @@ export function MobileSessionInfo({
   renameSession,
   archiveSession,
   downloadSessionLog,
+  useJobs,
+  watchRows,
   t,
 }: MobileSessionInfoProps) {
   const [open, setOpen] = useState(false)
@@ -161,8 +171,15 @@ export function MobileSessionInfo({
 
   const tabs = useViewTabs()
   const row = useSessions((s) => s.byId[sessionId])
-  const subagentCount = useSessions((s) => s.subagentsByParent[sessionId]?.entries.length ?? 0)
-  const jobCount = useSessions((s) => s.jobsBySession[sessionId]?.length ?? 0)
+  /* 0.1.7 sources — 0.1.5's per-parent subagent / per-session job snapshots
+     are deleted. The catalog is read straight off the explicit-read
+     projection store, no refresh from here (the official lineage reads the
+     same way; a refresh call would register this session for a re-read on
+     every reconnect); job rows come from the renderer-bound
+     useJobs hook, with a fixed empty source when the service is absent. */
+  useEffect(() => watchRows(sessionId), [sessionId, watchRows])
+  const subagentCount = useSessions((s) => s.projectionsBySession[sessionId]?.values.subagentCatalog?.length ?? 0)
+  const jobCount = useJobs((s) => s.rows[sessionId]?.length ?? 0)
   const stats = useProjection('sessionStats')
   const usage = useProjection('tokenUsage')
 
@@ -444,7 +461,7 @@ export function MobileSessionInfo({
             </div>
           )}
           <button type="button" data-mobile-nav="info-close" aria-label={t('infoClose')} onClick={close}>
-            <IconCloseOutline16 size={16} />
+            <IconCloseOutlineRegular size={16} />
           </button>
         </div>
 
@@ -497,15 +514,15 @@ export function MobileSessionInfo({
 
         <div data-mobile-nav="info-actions">
           <button type="button" data-mobile-nav="info-action" disabled={busy} onClick={onExport}>
-            <IconDownloadOutline16 size={16} />
+            <IconDownloadOutlineRegular size={16} />
             <span>{t('infoExport')}</span>
           </button>
           <button type="button" data-mobile-nav="info-action" disabled={busy} onClick={onRename}>
-            <IconEditOutline16 size={16} />
+            <IconEditOutlineRegular size={16} />
             <span>{t('infoRename')}</span>
           </button>
           <button type="button" data-mobile-nav="info-action" disabled={busy} onClick={onFork}>
-            <IconBranchOutline16 size={16} />
+            <IconBranchOutlineRegular size={16} />
             <span>{t('infoFork')}</span>
           </button>
           <button
@@ -515,7 +532,7 @@ export function MobileSessionInfo({
             disabled={busy}
             onClick={onArchive}
           >
-            <IconArchiveOutline20 size={20} />
+            <IconArchiveOutlineRegular size={20} />
             <span>{t('infoArchive')}</span>
           </button>
           <button
@@ -524,7 +541,7 @@ export function MobileSessionInfo({
             disabled={busy || shareEmpty}
             onClick={onShare}
           >
-            <IconShareOutline16 size={16} />
+            <IconShareOutlineRegular size={16} />
             <span>{t('shareAction')}</span>
           </button>
         </div>

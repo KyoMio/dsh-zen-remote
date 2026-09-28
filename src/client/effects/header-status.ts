@@ -1,4 +1,5 @@
 import type { ClientContext } from '../compat/types.ts'
+import { mainSessionIdOf } from '../compat/types.ts'
 import { dotState } from '../session-dot.ts'
 
 /**
@@ -18,30 +19,33 @@ export function installHeaderStatusDot(ctx: ClientContext): void {
     const apply = (): void => {
       const frame = document.querySelector('[data-mobile-nav="frame"]')
       if (frame === null) return
-      const { current, byId } = ctx.sessions.list.getSnapshot()
+      // 0.1.7: SessionListState.current is gone — the main-view session
+      // derives from the catalog rows (mainSessionIdOf). The pending flag
+      // moved with it: uiSession.pendingInteractions is gone too, the fact
+      // now rides ctx.uiSession.sessionStatus (running + pendingInteraction
+      // per session). Probed fresh on every dot recompute so registration
+      // order never matters, same as before.
+      const { byId } = ctx.sessions.list.getSnapshot()
+      const current = mainSessionIdOf(byId)
       const row = current === undefined ? undefined : byId[current]
-      // 0.1.2 的待处理交互来源，每次现查：本插件的 inject 不含 uiSession（加了
-      // 0.1.1 就不激活），apply 此刻服务未必注册好；每次算 dot 时现查，注册顺序
-      // 就不再是问题。0.1.1 上没有这个服务，这里恒 undefined，黄点只由行字段决定。
-      const uiSession = ctx.get('uiSession')
-      const pending = current === undefined ? false
-        : uiSession?.pendingInteractions.getSnapshot().has(current) === true
+      const status = current === undefined ? undefined
+        : ctx.get('uiSession')?.sessionStatus.getSnapshot().get(current)
+      const pending = status?.pendingInteraction !== undefined && status.pendingInteraction !== null
       const state = row === undefined ? undefined : dotState(row, pending)
       if (state === undefined) frame.removeAttribute('data-mobile-nav-dot')
       else frame.setAttribute('data-mobile-nav-dot', state)
     }
     apply()
-    // Two sources can push the dot now (session list + the 0.1.2 pending
-    // map); probe uiSession once more right here and subscribe to whichever
-    // exist. 0.1.1 only ever has the first. Degradation note: if uiSession
-    // has not registered by this moment (this plugin ran before it), only
-    // the list subscription is attached — the dot stays correct because
-    // every later list change re-runs apply(), whose fresh probe then sees
-    // the service; a pending-only change before any list change would be
-    // missed until then.
+    // Two sources can push the dot (session list + the unified session
+    // status table); probe uiSession once more right here and subscribe to
+    // whichever exist. Degradation note: if uiSession has not registered by
+    // this moment (this plugin ran before it), only the list subscription
+    // is attached — the dot stays correct because every later list change
+    // re-runs apply(), whose fresh probe then sees the service; a
+    // pending-only change before any list change would be missed until then.
     const unsubscribes: Array<() => void> = [ctx.sessions.list.subscribe(apply)]
-    const pendingSource = ctx.get('uiSession')?.pendingInteractions
-    if (pendingSource !== undefined) unsubscribes.push(pendingSource.subscribe(apply))
+    const statusSource = ctx.get('uiSession')?.sessionStatus
+    if (statusSource !== undefined) unsubscribes.push(statusSource.subscribe(apply))
     return () => {
       for (const off of unsubscribes) off()
     }

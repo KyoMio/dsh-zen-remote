@@ -1,6 +1,6 @@
 import type { Translate } from '@deepseek-ai/dsh-client-ui-slots';
 import type { MobileNavKey } from './locales.ts';
-/** One icon component's minimal shared shape (every `@deepseek-ai/dsh-client-ui-primitives` icon accepts `size`, regardless of the fixed number in its own name — see e.g. IconDownloadOutline16 used at size 14 elsewhere in this codebase). */
+/** One icon component's minimal shared shape (every `@deepseek-ai/dsh-client-ui-primitives` icon accepts `size`, regardless of the fixed number in its own name — see e.g. IconDownloadOutlineRegular used at size 14 elsewhere in this codebase). */
 type IconFC = (props: {
     size?: number;
 }) => React.JSX.Element;
