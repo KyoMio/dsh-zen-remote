@@ -1,13 +1,26 @@
 /**
  * The dsh-zen-remote plugin row's settings block on the Plugins manager
- * (T15 + T15-fix): the staged row fields (role, gateway & reverse proxy,
- * push, remote sharing) inside the official settings-form frame ending in its
- * one save control, and BELOW the form — outside it, so they still render
- * when the configuration namespace is not served — the instant-operation
- * areas: gateway status line, pairing, device list, push probe and the
- * remote-sharing placeholder. Those POST the same-origin admin routes and
- * re-read `admin/status`; only field edits stage and save through
- * `ZenRemoteSettingsForm`.
+ * (T15 + T15-fix + T16): the staged row fields inside the official
+ * settings-form frame ending in its one save control, and BELOW the form —
+ * outside it, so they still render when the configuration namespace is not
+ * served — the instant-operation areas. Which areas render follows the row's
+ * SAVED role, read from the configForms snapshot's row document — never from
+ * a status body (T16-fix 3): a host shows gateway status, pairing, device
+ * list and the push probe (POSTing the same-origin admin routes and
+ * re-reading `admin/status`); a client shows the server connection form, the
+ * connection status line and unpairing (against `client/status`, T16) and
+ * NEVER polls `admin/*` — on a client deployment those routes do not exist,
+ * and a stale kept body would pin the page to the old role. The poll choice
+ * waits out the snapshot's loading state for the same reason. Only field
+ * edits stage and save through `ZenRemoteSettingsForm`.
+ *
+ * Status refreshes never clear what is already on screen (T15-fix 1): a
+ * failed refresh keeps the last ready data and says so in a banner — only a
+ * failed FIRST load enters the error state, because saving a non-hot field
+ * restarts the plugin row and the first post-save refresh can land inside
+ * that restart window (a second pull follows 1.5s later). Every status
+ * request carries a latest-wins ticket (T15-fix 4), so an earlier request
+ * that answers late cannot overwrite newer data.
  *
  * Opened through the gateway (`viaGateway`, i.e. on a phone or another
  * browser) the server-local buttons disable and a notice says so — and until
@@ -15,7 +28,7 @@
  * summary view renders its one-liner alone and never fetches a thing.
  */
 
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { Button, SettingsForm, SettingsValueField } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -25,10 +38,18 @@ import {
   ADMIN_PAIR_ROUTE,
   ADMIN_PUSH_TEST_ROUTE,
   ADMIN_STATUS_ROUTE,
+  CLIENT_CLAIM_ROUTE,
+  CLIENT_STATUS_ROUTE,
+  createLatestGate,
+  deriveClientStatusView,
   deriveSettingsView,
+  normalizePairingCode,
 } from '../../client-data/settings-form.ts'
 import type {
   AdminStatusBody,
+  ClaimRouteBody,
+  ClientConnectionView,
+  ClientStatusBody,
   SettingsDeviceView,
   SettingsFieldState,
   SettingsFieldView,
@@ -49,20 +70,37 @@ type PairRole = (typeof PAIR_ROLES)[number]
 /** Display layouts a device can be pinned to (the gateway's `kind` field). */
 const DEVICE_KINDS = ['auto', 'phone', 'desktop'] as const
 
+/** Longest device name, mirroring the gateway's rename cap. */
+const DEVICE_NAME_MAX = 40
+
 type PushTest =
   | { state: 'idle' }
   | { state: 'busy' }
   | { state: 'ok', sent: number, failed: number }
   | { state: 'fail' }
 
-/** One status load's outcome; `error.status` is undefined for network / non-JSON failures. */
+/** One admin-status load's outcome; `error.status` is undefined for network /
+ * non-JSON failures. `stale` keeps the last ready body on screen after a
+ * failed refresh (T15-fix 1). */
 type Load =
   | { state: 'loading' }
   | { state: 'ready', body: AdminStatusBody }
+  | { state: 'stale', body: AdminStatusBody }
   | { state: 'error', status: number | undefined }
 
-/** Longest device name, mirroring the gateway's rename cap. */
-const DEVICE_NAME_MAX = 40
+/** One client-status load's outcome, same stale contract as {@link Load}. */
+type ClientLoad =
+  | { state: 'loading' }
+  | { state: 'ready', view: ClientConnectionView }
+  | { state: 'stale', view: ClientConnectionView }
+  | { state: 'error' }
+
+/** One pairing attempt's classified failure, rendered by code. */
+interface PairFail {
+  code: string
+  message?: string
+  retryAfterMs?: number
+}
 
 async function postJson(url: string, payload: Record<string, unknown>): Promise<{ ok: boolean, sent: number, failed: number }> {
   try {
@@ -106,13 +144,52 @@ class StatusError extends Error {
   }
 }
 
+type SectionT = SettingsSectionProps['t']
+
+/** Copy of the client group's connection line, one case per probe state. */
+function clientStatusText(view: ClientConnectionView, t: SectionT): string {
+  switch (view.state) {
+    case 'connected': return t('settings.client.statusConnected', { serverUrl: view.serverUrl })
+    case 'revoked': return t('settings.client.statusRevoked')
+    case 'unreachable': return t('settings.client.statusUnreachable')
+    case 'unexpected': return t('settings.client.statusUnexpected')
+    case 'invalid-url': return t('settings.client.statusInvalidUrl')
+    default: return t('settings.client.statusUnpaired')
+  }
+}
+
+/** Copy of the pairing failure line, one case per claim failure code. */
+function pairFailText(fail: PairFail, t: SectionT): string {
+  switch (fail.code) {
+    case 'invalid': return t('settings.client.failInvalid')
+    case 'insecure-http': return t('settings.client.failInsecureHttp')
+    case 'bad-code': return t('settings.client.failBadCode')
+    case 'locked': {
+      const minutes = Math.max(1, Math.ceil((fail.retryAfterMs ?? 0) / 60000))
+      return t('settings.client.failLocked', { minutes })
+    }
+    case 'unreachable': return t('settings.client.failUnreachable')
+    case 'role-mismatch':
+      return fail.message !== undefined && fail.message !== ''
+        ? fail.message
+        : t('settings.client.failRoleMismatch')
+    default: return t('settings.client.failUnexpected')
+  }
+}
+
 function SettingsSectionPage({ config, t }: SettingsSectionProps) {
   const form = useSyncExternalStore(
     useCallback((cb: () => void) => config.subscribe(cb), [config]),
     () => config.getSnapshot(),
   )
 
+  // Latest-wins gates (T15-fix 4): every status request takes a ticket and
+  // only the newest may apply its result.
+  const statusGate = useMemo(createLatestGate, [])
+  const clientGate = useMemo(createLatestGate, [])
+
   const [load, setLoad] = useState<Load>({ state: 'loading' })
+  const [clientLoad, setClientLoad] = useState<ClientLoad>({ state: 'loading' })
   const [now, setNow] = useState(() => Date.now())
   const [pairRole, setPairRole] = useState<PairRole>('web')
   const [pairBusy, setPairBusy] = useState(false)
@@ -127,31 +204,91 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
   const [renaming, setRenaming] = useState<{ id: string, draft: string } | null>(null)
   const [pushTest, setPushTest] = useState<PushTest>({ state: 'idle' })
 
+  // The client group's pairing form (T16). The address prefills from the row
+  // (once the shared form's document is served) until the user types into it;
+  // the name defaults to the display copy; the code normalizes as typed.
+  const [pairUrl, setPairUrl] = useState('')
+  const [pairUrlTouched, setPairUrlTouched] = useState(false)
+  const [pairName, setPairName] = useState(() => t('settings.client.deviceNameDefault'))
+  const [pairCode, setPairCode] = useState('')
+  const [claimBusy, setClaimBusy] = useState(false)
+  const [claimFail, setClaimFail] = useState<PairFail | null>(null)
+  const [claimWriteFailed, setClaimWriteFailed] = useState(false)
+  const [unpairBusy, setUnpairBusy] = useState(false)
+  const [unpairDone, setUnpairDone] = useState(false)
+
   const loadStatus = useCallback(() => {
+    const ticket = statusGate.next()
     fetch(ADMIN_STATUS_ROUTE)
       .then((res) => {
         if (!res.ok) return Promise.reject(new StatusError(res.status))
         return res.json() as Promise<AdminStatusBody>
       })
       .then((body) => {
+        // A 200 whose body is not ok:true is a FAILED load (T16-fix2): it
+        // throws into the catch, which keeps the last ready data instead of
+        // letting a broken body overwrite it.
         if (body?.ok !== true) throw new StatusError(undefined)
+        if (!statusGate.isLatest(ticket)) return
         setLoad({ state: 'ready', body })
         setNow(Date.now())
         setFreshPairing(null)
       })
       .catch((error: unknown) => {
-        setLoad({ state: 'error', status: error instanceof StatusError ? error.status : undefined })
+        if (!statusGate.isLatest(ticket)) return
+        // T15-fix 1: a failed REFRESH keeps the last ready data on screen and
+        // says so; only a failed FIRST load enters the error state. Saving a
+        // non-hot field restarts the plugin row, so the first post-save
+        // refresh can land inside that restart window — the second pull
+        // (1.5s later) then lands the fresh values.
+        setLoad((prev) => prev.state === 'ready' || prev.state === 'stale'
+          ? { state: 'stale', body: prev.body }
+          : { state: 'error', status: error instanceof StatusError ? error.status : undefined })
       })
-  }, [])
-  useEffect(loadStatus, [loadStatus])
+  }, [statusGate])
+
+  const loadClientStatus = useCallback(() => {
+    const ticket = clientGate.next()
+    fetch(CLIENT_STATUS_ROUTE)
+      .then((res) => {
+        if (!res.ok) return Promise.reject(new StatusError(res.status))
+        return res.json() as Promise<ClientStatusBody>
+      })
+      .then((body) => {
+        if (!clientGate.isLatest(ticket)) return
+        setClientLoad({ state: 'ready', view: deriveClientStatusView(body) })
+      })
+      .catch(() => {
+        if (!clientGate.isLatest(ticket)) return
+        setClientLoad((prev) => prev.state === 'ready' || prev.state === 'stale'
+          ? { state: 'stale', view: prev.view }
+          : { state: 'error' })
+      })
+  }, [clientGate])
+
+  // The page's role is the SAVED row role from the configForms snapshot —
+  // nothing else (T16-fix 3): a client deployment has no admin route at all,
+  // so a role judged from admin/status either 404s into host, or — with a
+  // stale kept body after a role switch — stays pinned to the old role. The
+  // poll choice waits out the snapshot's loading state, so a client row never
+  // fires a wasted admin/status; once settled, client polls ONLY
+  // client/status.
+  const data = load.state === 'ready' || load.state === 'stale'
+    ? deriveSettingsView(load.body, { now, rowUser: config.rowUser() })
+    : undefined
+  const clientRole = config.savedRoleIsClient()
+  const statusPoll = config.statusPoll()
+
+  useEffect(() => {
+    if (statusPoll === 'client') loadClientStatus()
+    else if (statusPoll === 'admin') loadStatus()
+  }, [statusPoll, loadClientStatus, loadStatus])
 
   // Feed the effective values the fields display (and compare drafts against).
   useEffect(() => {
     if (load.state !== 'ready') return
     config.setBaseline(load.body.config?.values)
   }, [load, config])
-
-  const data = load.state === 'ready' ? deriveSettingsView(load.body, { now, rowUser: config.rowUser() }) : undefined
 
   // Re-render every second while a pairing code is on screen so the countdown
   // follows; both display paths drop the code once `expiresAt` passes.
@@ -165,14 +302,33 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
 
   // Environment-locked fields cannot be staged: a written value would be
   // shadowed by the variable anyway. The controller refuses them; this effect
-  // keeps its lock set in step with admin/status.
-  const lockedKey = data === undefined ? '' : Object.entries(data.fields)
+  // keeps its lock set in step with admin/status. The same pass feeds the
+  // saved-invalid set (T15-fix 3): those fields keep showing the RAW stored
+  // value instead of the resolved one.
+  const fieldEntries = data === undefined ? [] : Object.entries(data.fields)
+  const lockedKey = fieldEntries
     .filter(([, fv]) => fv.locked)
+    .map(([field]) => field)
+    .join(',')
+  const rowInvalidKey = fieldEntries
+    .filter(([, fv]) => fv.savedRowInvalid)
     .map(([field]) => field)
     .join(',')
   useEffect(() => {
     config.setLockedFields(lockedKey === '' ? [] : lockedKey.split(','))
   }, [lockedKey, config])
+  useEffect(() => {
+    config.setRowInvalidFields(rowInvalidKey === '' ? [] : rowInvalidKey.split(','))
+  }, [rowInvalidKey, config])
+
+  // Post-save double refresh (T15-fix 1): once immediately, once after 1.5s —
+  // saving a non-hot field restarts the plugin row and the first refresh can
+  // land inside that window. Timers are released if the page unmounts.
+  const refreshTimers = useRef<number[]>([])
+  useEffect(() => () => {
+    for (const timer of refreshTimers.current) window.clearTimeout(timer)
+    refreshTimers.current = []
+  }, [])
 
   // Pairing, device management and the push probe are server-local acts: they
   // stay disabled until a status load answers AND it answered as the local
@@ -230,9 +386,71 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
     setPushTest(result.ok ? { state: 'ok', sent: result.sent, failed: result.failed } : { state: 'fail' })
   }
 
+  // --- client group (T16) ----------------------------------------------------
+
+  // The address prefill reads the row's stored serverUrl while the user has
+  // not typed anything of their own.
+  const rowServerUrl = typeof config.rowValue('serverUrl') === 'string' ? config.rowValue('serverUrl') as string : ''
+  useEffect(() => {
+    if (pairUrlTouched || pairUrl !== '' || rowServerUrl === '') return
+    setPairUrl(rowServerUrl)
+  }, [pairUrlTouched, pairUrl, rowServerUrl])
+
+  const codeNormalized = normalizePairingCode(pairCode)
+  const claimAllowed = form.available && form.writable && !claimBusy && codeNormalized.length === 8
+
+  const runClaim = async (): Promise<void> => {
+    setClaimBusy(true)
+    setClaimFail(null)
+    setClaimWriteFailed(false)
+    try {
+      const res = await fetch(CLIENT_CLAIM_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serverUrl: pairUrl.trim(), code: codeNormalized, name: pairName.trim() }),
+      })
+      const body = await res.json().catch(() => ({})) as ClaimRouteBody
+      if (res.ok && body.ok === true && typeof body.token === 'string' && body.token !== '') {
+        // The backend echoes the address it validated; write both through ONE
+        // mutate, then clear the code and re-read the connection state.
+        const urlToWrite = typeof body.serverUrl === 'string' && body.serverUrl !== '' ? body.serverUrl : pairUrl.trim()
+        const landed = await config.writeClientPairing(urlToWrite, body.token)
+        if (landed) {
+          setPairCode('')
+          setPairUrl(urlToWrite)
+          setUnpairDone(false)
+          loadClientStatus()
+        } else {
+          setClaimWriteFailed(true)
+        }
+      } else {
+        // Every other shape is a failure (T16-fix): a non-OK status, a body
+        // whose `ok` is not true, a missing token — shown with the classified
+        // code when the route sent one.
+        const fail: PairFail = { code: typeof body.code === 'string' && body.code !== '' ? body.code : 'unexpected' }
+        if (typeof body.message === 'string') fail.message = body.message
+        if (typeof body.retryAfterMs === 'number') fail.retryAfterMs = body.retryAfterMs
+        setClaimFail(fail)
+      }
+    } catch {
+      setClaimFail({ code: 'unexpected' })
+    }
+    setClaimBusy(false)
+  }
+
+  const runUnpair = async (): Promise<void> => {
+    if (!window.confirm(t('settings.client.unpairConfirm'))) return
+    setUnpairBusy(true)
+    const landed = await config.clearDeviceToken()
+    setUnpairBusy(false)
+    if (landed) {
+      setUnpairDone(true)
+      loadClientStatus()
+    }
+  }
+
   const formDisabled = !form.available || !form.writable
-  const clientRole = data?.role === 'client'
-  const roleChanged = form.role.text !== (data?.role ?? 'host')
+  const roleChanged = form.role.text !== (clientRole ? 'client' : 'host')
 
   // The code shown under the pairing controls: the refreshed status's, or the
   // one the pair route just returned while the refresh is in flight.
@@ -270,6 +488,10 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
     )
   }
 
+  /** The "saving a staged clear reverts to the next layer" hint (T15-fix 2). */
+  const clearPreviewNote = (state: SettingsFieldState): ReactNode =>
+    state.cleared ? <p className="zr-settings-hint">{t('settings.resetPreview')}</p> : null
+
   const text = (state: SettingsFieldState, field: string, label: string, hint: string, invalidLabel: string, numeric = false, note?: string) => (
     <div className="zr-settings-field" key={field}>
       <SettingsValueField
@@ -288,6 +510,7 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
         onReset={() => { config.resetField(field) }}
       />
       {note !== undefined && <p className="zr-settings-hint">{note}</p>}
+      {clearPreviewNote(state)}
       {annotations(field)}
     </div>
   )
@@ -312,6 +535,7 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
         {options.map((option) => <option key={option} value={option}>{optionLabel(option)}</option>)}
       </select>
       {hint !== '' && <p className="zr-settings-hint">{hint}</p>}
+      {clearPreviewNote(state)}
       {annotations(field)}
     </div>
   )
@@ -336,6 +560,7 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
         </span>
       </div>
       <p className="zr-settings-hint">{hint}</p>
+      {clearPreviewNote(state)}
       {annotations(field)}
     </div>
   )
@@ -401,14 +626,40 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
     </div>
   )
 
+  const clientView = clientLoad.state === 'ready' || clientLoad.state === 'stale' ? clientLoad.view : undefined
+  const saveLanded = (): void => {
+    // A landed save that switched the role drops the OTHER role's data right
+    // away (T16-fix 3) — a stale device list or connection line must not
+    // survive the switch, and the poll effect alone would leave the old
+    // body on screen. The delayed second pull re-reads the role at fire
+    // time: the first pull can land inside a row-restart window.
+    if (config.savedRoleIsClient()) setLoad({ state: 'loading' })
+    else setClientLoad({ state: 'loading' })
+    const refresh = config.savedRoleIsClient() ? loadClientStatus : loadStatus
+    refresh()
+    refreshTimers.current.push(window.setTimeout(() => {
+      if (config.savedRoleIsClient()) loadClientStatus()
+      else loadStatus()
+    }, 1500))
+  }
+
   return (
     <div data-zen-remote="settings">
-      {load.state === 'error' && (
+      {!clientRole && load.state === 'error' && (
         <p className="zr-settings-hint" data-invalid="true">
           {load.status === undefined
             ? t('settings.statusUnknown')
             : t('settings.statusUnavailable', { code: load.status })}
         </p>
+      )}
+      {!clientRole && load.state === 'stale' && (
+        <p className="zr-settings-hint" data-invalid="true">{t('settings.refreshFailed')}</p>
+      )}
+      {clientRole && clientLoad.state === 'error' && (
+        <p className="zr-settings-hint" data-invalid="true">{t('settings.statusUnknown')}</p>
+      )}
+      {clientRole && clientLoad.state === 'stale' && (
+        <p className="zr-settings-hint" data-invalid="true">{t('settings.refreshFailed')}</p>
       )}
       {data?.viaGateway === true && <p className="zr-settings-notice">{t('settings.remoteNotice')}</p>}
 
@@ -417,7 +668,7 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
         <SettingsForm
           labels={labels}
           state={form}
-          onSave={() => { void config.save().then((landed) => { if (landed) loadStatus() }) }}
+          onSave={() => { void config.save().then((landed) => { if (landed) saveLanded() }) }}
           onDiscard={() => { config.discard() }}
         >
           <h3 className="zr-settings-card-title">{t('settings.roleTitle')}</h3>
@@ -425,7 +676,6 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
             option === 'host' ? t('settings.roleHost') : t('settings.roleClient')
           ))}
           {roleChanged && <p className="zr-settings-status-line">{t('settings.roleRestartNote')}</p>}
-          {clientRole && <p className="zr-settings-hint" style={{ paddingBottom: 12 }}>{t('settings.clientOnlyNote')}</p>}
 
           {!clientRole && (
             <>
@@ -532,12 +782,94 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
           <p className="zr-settings-hint" style={{ paddingBottom: 12 }}>{t('settings.sharePlaceholder')}</p>
         </div>
       )}
+
+      {/* The client group (T16): server connection, connection status and
+          unpairing — same outside-the-frame placement as the host's instant
+          operations, so they render even while the namespace is read-only. */}
+      {clientRole && (
+        <div className="zr-settings-card">
+          <h3 className="zr-settings-card-title">{t('settings.client.connectTitle')}</h3>
+          <div className="zr-settings-field">
+            <div className="zr-settings-head">
+              <label htmlFor="zr-settings-client-server">{t('settings.client.serverUrl')}</label>
+            </div>
+            <input
+              id="zr-settings-client-server"
+              className="zr-settings-input"
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              value={pairUrl}
+              onChange={(e) => { setPairUrl(e.currentTarget.value); setPairUrlTouched(true) }}
+            />
+            <p className="zr-settings-hint">{t('settings.client.serverUrlHint')}</p>
+          </div>
+          <div className="zr-settings-field">
+            <div className="zr-settings-head">
+              <label htmlFor="zr-settings-client-name">{t('settings.client.deviceName')}</label>
+            </div>
+            <input
+              id="zr-settings-client-name"
+              className="zr-settings-input"
+              type="text"
+              maxLength={DEVICE_NAME_MAX}
+              value={pairName}
+              onChange={(e) => { setPairName(e.currentTarget.value) }}
+            />
+          </div>
+          <div className="zr-settings-field">
+            <div className="zr-settings-head">
+              <label htmlFor="zr-settings-client-code">{t('settings.client.pairingCode')}</label>
+            </div>
+            <input
+              id="zr-settings-client-code"
+              className="zr-settings-input zr-settings-code-input"
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              // No maxLength: the draft is normalized (uppercased, spaces and
+              // hyphens stripped) on every keystroke, and only the
+              // NORMALIZED length gates the pair button — a code pasted with
+              // separators must survive pasting intact.
+              value={pairCode}
+              onChange={(e) => { setPairCode(normalizePairingCode(e.currentTarget.value)) }}
+            />
+            <p className="zr-settings-hint">{t('settings.client.pairingCodeHint')}</p>
+          </div>
+          <div className="zr-settings-row" style={{ paddingBottom: 12 }}>
+            <Button variant="outline" size="sm" disabled={!claimAllowed} onClick={() => { void runClaim() }}>
+              {claimBusy ? t('settings.client.pairing') : t('settings.client.pair')}
+            </Button>
+            {claimFail !== null && <span className="zr-settings-hint" data-invalid="true">{pairFailText(claimFail, t)}</span>}
+            {claimWriteFailed && <span className="zr-settings-hint" data-invalid="true">{t('settings.client.failWrite')}</span>}
+          </div>
+
+          <h3 className="zr-settings-card-title">{t('settings.client.statusTitle')}</h3>
+          <div className="zr-settings-row" style={{ paddingBottom: 4 }}>
+            <p className="zr-settings-status-line" style={{ flex: 1 }} data-down={clientView !== undefined && (clientView.state === 'unreachable' || clientView.state === 'unexpected' || clientView.state === 'revoked' || clientView.state === 'invalid-url') ? 'true' : undefined}>
+              {clientView === undefined ? '' : clientStatusText(clientView, t)}
+            </p>
+            <Button variant="outline" size="sm" disabled={clientLoad.state === 'loading'} onClick={loadClientStatus}>
+              {clientLoad.state === 'loading' ? t('settings.client.statusRefreshing') : t('settings.client.statusRefresh')}
+            </Button>
+          </div>
+          {form.deviceToken.configured && (
+            <div className="zr-settings-row" style={{ paddingBottom: 12 }}>
+              <span className="zr-settings-badge">{t('settings.client.tokenSet')}</span>
+              <Button variant="ghost" size="sm" disabled={!form.available || !form.writable || unpairBusy} onClick={() => { void runUnpair() }}>
+                {unpairBusy ? t('settings.client.unpairBusy') : t('settings.client.unpair')}
+              </Button>
+            </div>
+          )}
+          {unpairDone && <p className="zr-settings-hint" style={{ paddingBottom: 12 }}>{t('settings.client.unpairDone')}</p>}
+        </div>
+      )}
     </div>
   )
 }
 
 /** Display name of a value's source layer for the invalid-saved-value note. */
-function sourceName(source: SettingsFieldView['source'], t: SettingsSectionProps['t']): string {
+function sourceName(source: SettingsFieldView['source'], t: SectionT): string {
   if (source === 'env') return t('settings.sourceEnv')
   if (source === 'file') return t('settings.sourceFile')
   return t('settings.sourceDefault')

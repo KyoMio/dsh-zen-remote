@@ -5,12 +5,19 @@
 // `gatewayStatus` is the HTTP status the route saw (null = no answer).
 // Covers the status -> view mapping, the staged row form against a FAKE
 // shared form object (validation, env locking, the effective-value display
-// baseline, set/unset plans, the expectedRevision fence).
+// baseline, set/unset plans, the expectedRevision fence), and the T16 client
+// group's pure pieces: the client status -> view mapping, the pairing-code
+// input normalization, the direct pairing writes and the latest-wins gate.
 //
 // Run: node scripts/check-settings-form.mjs   (needs Node >= 23.6 type stripping)
 import assert from 'node:assert/strict'
 import {
+  createLatestGate,
+  deriveClientStatusView,
   deriveSettingsView,
+  normalizePairingCode,
+  savedRowRole,
+  settingsPollOf,
   ZenRemoteSettingsForm,
 } from '../src/client-data/settings-form.ts'
 
@@ -212,13 +219,31 @@ test('fields display the EFFECTIVE value while the row layer stores nothing', ()
   assert.equal(snap.trustedProxies.text, '', 'an empty effective value stays an empty box')
 })
 
-test('a field the row layer stores shows the stored raw value', () => {
+test('a field the row layer stores shows the RESOLVED value unless the saved value is invalid (T15-fix 3)', () => {
   const { scope } = fakeScope({ user: { port: 99999, serverName: '  ' } })
   const form = new ZenRemoteSettingsForm(scope)
   form.setBaseline(VALUES)
+  // resolveConfig skipped the stored port 99999 (out of range) — the file
+  // layer supplies 4000 and admin/status flags savedRowInvalid for port. The
+  // page feeds that set in; the box then shows the RAW stored value so the
+  // user sees (and can fix) the mistake.
+  form.setRowInvalidFields(['port'])
   const snap = form.getSnapshot()
   assert.equal(snap.port.text, '99999', 'the raw (illegal) stored value shows, with the invalid-saved note')
   assert.equal(snap.port.invalid, false, 'a stored value is not a DRAFT; nothing is flagged invalid')
+
+  // Same stored shape, but the row value is LEGAL: the box shows the
+  // normalized resolved value, not the raw one (T15-fix 3).
+  const normalized = fakeScope({ user: { trustedProxies: ['10.0.0.1', '10.0.0.2'], pushTool: 1 } })
+  const normForm = new ZenRemoteSettingsForm(normalized.scope)
+  normForm.setBaseline({ ...VALUES, trustedProxies: '10.0.0.1,10.0.0.2', pushTool: true })
+  const normSnap = normForm.getSnapshot()
+  assert.equal(normSnap.trustedProxies.text, '10.0.0.1,10.0.0.2', 'a stored array shows the comma string resolveConfig produces')
+  assert.equal(normSnap.pushTool.text, 'true', 'a stored 1 shows true, matching what a save writes')
+
+  // Re-typing the shown (normalized) value is not a phantom change.
+  normForm.stage('pushTool', 'true')
+  assert.equal(normForm.canSave(), false, 'the draft equals the displayed baseline')
 })
 
 test('env-locked fields show the effective value and cannot be staged', async () => {
@@ -369,4 +394,175 @@ test('rowUser exposes the raw user layer for the savedRowInvalid check', () => {
   const { scope } = fakeScope({ user: { port: 4000, host: '0.0.0.0', rateLimit: 60 } })
   const form = new ZenRemoteSettingsForm(scope)
   assert.deepEqual(form.rowUser(), { port: 4000, host: '0.0.0.0', rateLimit: 60 })
+})
+
+// ---- T15-fix 2: the staged-clear display ------------------------------------
+
+test('a staged clear keeps showing the current value and flags `cleared` (T15-fix 2)', async () => {
+  // This plugin's base layer is empty, so the old `spec.format(base[field])`
+  // preview always rendered an empty string — a fake "new value" that was
+  // never true. Now the box keeps the CURRENT value and the field carries
+  // `cleared` for the "reverts on save" hint.
+  const { scope, state } = fakeScope({ user: { port: 4000 } })
+  const form = new ZenRemoteSettingsForm(scope)
+  form.setBaseline(VALUES) // effective port: 4000 (file layer wins over nothing here)
+  form.resetField('port')
+  const snap = form.getSnapshot()
+  assert.equal(snap.port.cleared, true)
+  assert.equal(snap.port.text, '4000', 'the current value keeps showing; no fake preview of the next layer')
+  assert.equal(snap.port.overridden, false)
+  assert.equal(form.canSave(), true, 'the clear still plans an unset for a stored field')
+
+  // Selects (role/lang) stay renderable too: the box shows a REAL option.
+  const withRole = fakeScope({ user: { role: 'client' } })
+  const roleForm = new ZenRemoteSettingsForm(withRole.scope)
+  roleForm.resetField('role')
+  assert.equal(roleForm.getSnapshot().role.text, 'client')
+  assert.equal(roleForm.getSnapshot().role.cleared, true)
+
+  await form.save()
+  assert.deepEqual(state.mutateCalls[0].ops, [{ op: 'unset', path: ['port'] }], 'the clear still writes the unset')
+})
+
+// ---- T15-fix 4: the latest-wins gate -----------------------------------------
+
+test('the latest-wins gate drops tickets that are no longer newest (T15-fix 4)', () => {
+  const gate = createLatestGate()
+  const first = gate.next()
+  assert.equal(gate.isLatest(first), true)
+  const second = gate.next()
+  assert.equal(gate.isLatest(second), true)
+  assert.equal(gate.isLatest(first), false, 'an earlier request answering LATE is dropped')
+  assert.notEqual(first, second)
+})
+
+// ---- T16: the client group ----------------------------------------------------
+
+test('deriveClientStatusView maps every probe state and tolerates garbage', () => {
+  assert.deepEqual(deriveClientStatusView({ state: 'unpaired' }), { state: 'unpaired', serverUrl: '' })
+  assert.deepEqual(deriveClientStatusView({ state: 'connected', serverUrl: 'http://192.168.3.129:3088' }), {
+    state: 'connected',
+    serverUrl: 'http://192.168.3.129:3088',
+  })
+  assert.deepEqual(deriveClientStatusView({ state: 'revoked', serverUrl: 'https://dsh.example.com' }), {
+    state: 'revoked',
+    serverUrl: 'https://dsh.example.com',
+  })
+  assert.deepEqual(deriveClientStatusView({ state: 'unreachable', serverUrl: 'http://x.local:1' }), {
+    state: 'unreachable',
+    serverUrl: 'http://x.local:1',
+  })
+  assert.deepEqual(deriveClientStatusView({ state: 'unexpected', serverUrl: 'http://x.local:1' }).state, 'unexpected')
+  // T16-fix 1: the stored address failed re-validation; nothing was probed.
+  assert.deepEqual(deriveClientStatusView({ state: 'invalid-url' }), { state: 'invalid-url', serverUrl: '' })
+  // Degraded shapes: unknown state words and non-objects fall back to unpaired.
+  assert.equal(deriveClientStatusView({ state: 'gibberish', serverUrl: 'http://x' }).state, 'unpaired')
+  assert.deepEqual(deriveClientStatusView({}), { state: 'unpaired', serverUrl: '' })
+  assert.deepEqual(deriveClientStatusView(undefined), { state: 'unpaired', serverUrl: '' })
+})
+
+test('normalizePairingCode uppercases and strips spaces and hyphens', () => {
+  assert.equal(normalizePairingCode('ab cd-12'), 'ABCD12')
+  assert.equal(normalizePairingCode('  abcd12ef  '), 'ABCD12EF')
+  assert.equal(normalizePairingCode('abcd-12-ef'), 'ABCD12EF')
+  assert.equal(normalizePairingCode(''), '')
+})
+
+test('writeClientPairing lands one mutate with both ops and clears the draft fence', async () => {
+  const { scope, state } = fakeScope()
+  const form = new ZenRemoteSettingsForm(scope)
+  assert.equal(await form.writeClientPairing('http://192.168.3.129:3088', 'tok-xyz'), true)
+  assert.equal(state.mutateCalls.length, 1)
+  assert.deepEqual(state.mutateCalls[0].ops, [
+    { op: 'set', path: ['serverUrl'], value: 'http://192.168.3.129:3088' },
+    { op: 'set', path: ['deviceToken'], value: 'tok-xyz' },
+  ])
+  assert.equal(state.mutateCalls[0].expectedRevision, 7, 'fenced with the current revision')
+
+  // Staged drafts survive the direct write, and their fence refreshes: a
+  // draft staged BEFORE the pairing write must save against the NEW revision,
+  // not the one it was staged under.
+  const staged = fakeScope()
+  const stForm = new ZenRemoteSettingsForm(staged.scope)
+  stForm.stage('host', '0.0.0.0')
+  assert.equal(await stForm.writeClientPairing('http://x.local', 'tok'), true)
+  await stForm.save()
+  assert.equal(staged.state.mutateCalls[1].expectedRevision, 8, 'the fence moved with the row, not with the stale stage time')
+  assert.deepEqual(staged.state.mutateCalls[1].ops, [{ op: 'set', path: ['host'], value: '0.0.0.0' }])
+})
+
+test('clearDeviceToken unsets only the token and keeps the address', async () => {
+  const { scope, state } = fakeScope()
+  const form = new ZenRemoteSettingsForm(scope)
+  assert.equal(await form.clearDeviceToken(), true)
+  assert.deepEqual(state.mutateCalls[0].ops, [{ op: 'unset', path: ['deviceToken'] }])
+})
+
+test('the direct writes refuse when the form is unavailable, read-only or already saving', async () => {
+  const unavailable = new ZenRemoteSettingsForm(fakeScope({ ready: false }).scope)
+  assert.equal(await unavailable.writeClientPairing('http://x.local', 'tok'), false)
+  assert.equal(await unavailable.clearDeviceToken(), false)
+
+  const readOnly = new ZenRemoteSettingsForm(fakeScope({ writable: false }).scope)
+  assert.equal(await readOnly.writeClientPairing('http://x.local', 'tok'), false)
+
+  // A refused mutate reports failure through the return value; the frame's
+  // staged-save `failed` flag stays untouched (pairing has its own copy).
+  const refused = fakeScope({ mutateResult: false })
+  const refusedForm = new ZenRemoteSettingsForm(refused.scope)
+  assert.equal(await refusedForm.clearDeviceToken(), false)
+  assert.equal(refusedForm.getSnapshot().failed, false)
+})
+
+test('the device token rides the snapshot as presence only, and rowValue reads the saved document', () => {
+  let configured = false
+  const { scope } = fakeScope({ value: { role: 'client', serverUrl: 'http://192.168.3.129:3088' } })
+  const form = new ZenRemoteSettingsForm(scope, () => configured)
+  assert.equal(form.getSnapshot().deviceToken.configured, false)
+  assert.equal(form.rowValue('role'), 'client')
+  assert.equal(form.rowValue('serverUrl'), 'http://192.168.3.129:3088')
+  assert.equal(form.rowValue('deviceToken'), undefined, 'secrets never ride the form document')
+
+  configured = true
+  form.refresh()
+  assert.equal(form.getSnapshot().deviceToken.configured, true, 'the describe follow republishes')
+})
+
+// ---- T16-fix 3: the page's role + poll-source decisions -----------------------
+
+test('savedRowRole reads the SAVED role from the snapshot, never a display draft', () => {
+  // The schema-resolved section carries the role…
+  assert.equal(savedRowRole({ value: { role: 'client' }, user: {} }), 'client')
+  // …but a row value kept only in the raw user layer counts too…
+  assert.equal(savedRowRole({ value: {}, user: { role: 'client' } }), 'client')
+  // …and an empty row — or anything but the exact 'client' — means host.
+  assert.equal(savedRowRole({ value: {}, user: {} }), 'host')
+  assert.equal(savedRowRole({ value: { role: 'host' }, user: {} }), 'host')
+  assert.equal(savedRowRole({ value: { role: 'Client' }, user: {} }), 'host', 'exact match only')
+  assert.equal(savedRowRole({}), 'host')
+  assert.equal(savedRowRole({ value: undefined, user: undefined }), 'host')
+})
+
+test('settingsPollOf: loading polls nothing; client polls client/status only; host polls admin', () => {
+  assert.equal(settingsPollOf('loading', { value: { role: 'client' } }), 'none', 'the role is not knowable while the mirror loads')
+  assert.equal(settingsPollOf('ready', { value: { role: 'client' } }), 'client')
+  assert.equal(settingsPollOf('ready', { user: { role: 'client' } }), 'client')
+  assert.equal(settingsPollOf('ready', { value: {} }), 'admin')
+  assert.equal(settingsPollOf('unavailable', { value: {} }), 'admin', 'an unavailable namespace cannot answer the role — host is the default')
+})
+
+test('the poll source follows a role switch at the NEXT snapshot, admin never on client', () => {
+  // host → client: the new snapshot's decision references only its own role.
+  const before = settingsPollOf('ready', { value: { role: 'host' } })
+  assert.equal(before, 'admin')
+  const after = settingsPollOf('ready', { value: { role: 'client' } })
+  assert.equal(after, 'client', 'after switching to client, only client/status is polled')
+  // Reverse direction.
+  assert.equal(settingsPollOf('ready', { value: { role: 'host' } }), 'admin')
+  // The controller reads the same decisions off its live scope.
+  const clientScope = fakeScope({ value: { role: 'client' } }).scope
+  const clientForm = new ZenRemoteSettingsForm(clientScope)
+  assert.equal(clientForm.savedRoleIsClient(), true)
+  assert.equal(clientForm.statusPoll(), 'client')
+  assert.equal(clientForm.scopeStatus(), 'ready')
 })

@@ -74,6 +74,12 @@ function driveConfigForms(ctx) {
     },
     configForms: {
       get: () => formsScope,
+      // The device token's configured flag reads the describe view's secrets
+      // sidecar (T16); the fake carries the empty sidecar.
+      describe: () => ({
+        getSnapshot: () => ({ view: { namespaces: [{ ns: 'dsh-zen-remote', secrets: [] }] } }),
+        subscribe: () => () => {},
+      }),
       whileServed(namespaces, register) {
         formsCalls.whileServed.push({ namespaces })
         return register(new Set(namespaces))
@@ -174,4 +180,16 @@ test('apply order guard: registerSettingsPage runs before the desktop gate retur
   const injectMatch = source.match(/export const inject = \[([^\]]*)\]/)
   assert.notEqual(injectMatch, null)
   assert.equal(injectMatch[1].includes('configForms'), false, 'configForms stays out of the required services')
+})
+
+test('T16-fix2: an admin/status 200 whose body is not ok:true is a failed load', () => {
+  // Same Node limitation as the guard above: loadStatus is React-internal, so
+  // the contract is pinned textually. The throw must sit where a non-ok body
+  // lands in the catch — which keeps the last ready data (T15-fix 1) instead
+  // of letting a broken 200 overwrite it.
+  const source = readFileSync(join(ROOT, 'src', 'client', 'settings', 'SettingsSection.tsx'), 'utf8')
+  const thenAt = source.indexOf('.then((body) => {', source.indexOf('loadStatus'))
+  assert.notEqual(thenAt, -1, 'loadStatus has a body handler')
+  const handler = source.slice(thenAt, source.indexOf('.catch', thenAt))
+  assert.ok(handler.includes('body?.ok !== true'), 'a 200 body without ok:true must throw into the catch (stale data kept)')
 })
