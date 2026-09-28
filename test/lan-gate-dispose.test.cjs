@@ -14,6 +14,17 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+
+// T22a: the entry now re-resolves its config (readFileConfig reads
+// <DSH_HOME>/lan-gate.config.json), so this file needs a hermetic home or a
+// developer's real config file would flip these expectations machine-by-
+// machine. Same isolation role-wiring.test.cjs uses.
+const TEMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-lan-gate-dispose-'))
+process.env.DSH_HOME = TEMP_HOME
+process.on('exit', () => { try { fs.rmSync(TEMP_HOME, { recursive: true, force: true }) } catch { /* best effort */ } })
 
 const FLUSH = () => new Promise((resolve) => setImmediate(resolve))
 
@@ -76,9 +87,11 @@ test('a normal dispose after the child spawned still terminates it', async () =>
 
 test('a resolved config value overrides even a stale or illegal host env var', async () => {
   // T12-fix: the config arriving here is already resolved (src/config.ts
-  // folded every LEGAL env var into it), so it wins unconditionally — a
-  // hand-exported LAN_GATE_PORT=abc must not get a second vote. With no
-  // config value the host env keeps its original say.
+  // folded every LEGAL env var into it), so a hand-exported LAN_GATE_PORT=abc
+  // must not get a second vote over the row. T22a goes one step further: the
+  // entry re-resolves its input (same as dsh-push), so an ILLEGAL env var is
+  // skipped by the resolver and must not leak verbatim into the child either —
+  // with no row value the child gets the default, never the raw 'abc'.
   const entry = await import('../lan-gate.mjs')
   const saved = process.env.LAN_GATE_PORT
   process.env.LAN_GATE_PORT = 'abc'
@@ -94,7 +107,7 @@ test('a resolved config value overrides even a stale or illegal host env var', a
     entry.apply(passthrough.ctx, {})
     passthrough.resolveExecutable('/node')
     await FLUSH()
-    assert.equal(passthrough.spawned[0].opts.env.LAN_GATE_PORT, 'abc', 'no config value means the host env keeps its original say')
+    assert.equal(passthrough.spawned[0].opts.env.LAN_GATE_PORT, '3088', 'an illegal env value is skipped by the resolver; the child gets the default')
   } finally {
     if (saved === undefined) delete process.env.LAN_GATE_PORT
     else process.env.LAN_GATE_PORT = saved

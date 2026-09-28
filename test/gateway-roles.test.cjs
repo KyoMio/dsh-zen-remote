@@ -10,77 +10,16 @@ const net = require('node:net')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const crypto = require('node:crypto')
-const { REMOTE_HEADERS, startGateway, startGatewayAt, request, cookieFrom, pairDevice, stopAll } = require('./util.cjs')
+const { REMOTE_HEADERS, startGateway, startGatewayAt, request, cookieFrom, pairDevice, pairDesktop, startRecordingTarget, rawUpgrade, stopAll } = require('./util.cjs')
 
 const PORT = 39241
 const TARGET_PORT = 39242
-
-// Mock DSH upstream: records every request, serves a trivial page, and
-// accepts any WebSocket upgrade with a minimal (RFC6455-shaped) 101 — the
-// gateway only pipes raw bytes, no frames are exchanged. opts.statusFor(path,
-// req) may return a status code to force instead of the default 200.
-// close() first destroys the tunnel sockets: a revoked tunnel leaves this
-// side half-open, and server.close() would wait on it forever.
-function startRecordingTarget(port, opts) {
-  const o = opts || {}
-  const seen = []
-  const upgrades = []
-  const tunnels = new Set()
-  const server = http.createServer((req, res) => {
-    seen.push({ method: req.method, path: req.url, headers: req.headers })
-    const forced = o.statusFor ? o.statusFor(req.url || '/', req) : 0
-    if (forced) { res.writeHead(forced, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('upstream-' + forced); return }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end('<!doctype html><html lang="en"><head><meta charset="utf-8"></head><body><main>roles-ok</main></body></html>')
-  })
-  server.on('upgrade', (req, socket) => {
-    upgrades.push({ path: req.url, headers: req.headers })
-    tunnels.add(socket)
-    socket.on('close', () => tunnels.delete(socket))
-    const accept = crypto.createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
-    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n')
-    socket.on('error', () => {})
-  })
-  const close = () => new Promise((resolve) => {
-    tunnels.forEach((s) => { try { s.destroy() } catch (e) {} })
-    server.close(resolve)
-  })
-  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve({ server, seen, upgrades, close })))
-}
 
 async function boot(extraEnv, targetOpts) {
   const target = await startRecordingTarget(TARGET_PORT, targetOpts)
   const gw = startGateway(PORT, TARGET_PORT, extraEnv)
   await gw.ready
   return { target, gw, stop: () => stopAll({ close: (done) => target.close().then(done, done) }, gw.child) }
-}
-
-async function pairDesktop(port, name) {
-  const gen = await request(port, { method: 'POST', path: '/lan-gate/pair', body: { role: 'desktop-client' } })
-  const code = JSON.parse(gen.body).code
-  const claim = await request(port, { method: 'POST', path: '/lan-gate/pair/claim-desktop', headers: REMOTE_HEADERS, body: { code, name: name || '台式机' } })
-  const j = JSON.parse(claim.body)
-  return { gen, claim, j, token: j.token, id: j.id }
-}
-
-// Raw-socket WebSocket upgrade against the gateway: resolves as soon as the
-// first response line is readable (101 = tunnel up, 403 = refused). The
-// socket is returned open so the caller can wait for it to be closed.
-function rawUpgrade(port, urlPath, headers) {
-  return new Promise((resolve) => {
-    const lines = ['GET ' + urlPath + ' HTTP/1.1', 'Host: 127.0.0.1', 'Connection: Upgrade', 'Upgrade: websocket', 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==', 'Sec-WebSocket-Version: 13']
-    for (const k of Object.keys(headers || {})) lines.push(k + ': ' + headers[k])
-    const sock = net.connect(port, '127.0.0.1', () => { sock.write(lines.join('\r\n') + '\r\n\r\n') })
-    let buf = ''
-    let done = false
-    let timer = null
-    const finish = () => { if (done) return; done = true; if (timer) clearTimeout(timer); resolve({ sock, buf }) }
-    timer = setTimeout(finish, 3000)
-    sock.on('data', (d) => { buf += d.toString('utf8'); if (/HTTP\/1\.1 (101|403|429)/.test(buf)) finish() })
-    sock.on('close', finish)
-    sock.on('error', finish)
-  })
 }
 
 function socketClosed(sock) {
@@ -392,7 +331,7 @@ test('T13-fix-1b: a double-slash relay path normalizes to itself and is forwarde
 })
 
 test('T13-fix-1c: the WebSocket upgrade applies the same normalization-aware gate', async () => {
-  const { stop } = await boot()
+  const { target, stop } = await boot()
   try {
     const { token } = await pairDesktop(PORT)
     const headers = { ...REMOTE_HEADERS, authorization: 'Bearer ' + token }
@@ -401,6 +340,10 @@ test('T13-fix-1c: the WebSocket upgrade applies the same normalization-aware gat
       assert.ok(/HTTP\/1\.1 403/.test(up.buf), p + ' upgrade refused, saw: ' + up.buf.slice(0, 40))
       try { up.sock.destroy() } catch (e) {}
     }
+    // T22a review follow-up: refusal is not just "no 101" — the recording
+    // upstream must have received ZERO upgrade requests, i.e. the tunnel was
+    // never opened toward DSH, not merely closed right after.
+    assert.strictEqual(target.upgrades.length, 0, 'no escape attempt may reach the upstream as an upgrade')
   } finally { await stop() }
 })
 

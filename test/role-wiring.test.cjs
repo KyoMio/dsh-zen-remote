@@ -75,9 +75,13 @@ test('apply loads both sub-plugins with the resolved values on the default role'
   // Same order as the rows used to sit in the bundle patch: gateway, push.
   assert.equal(calls[0].module.name, 'dsh-zen-remote-gateway')
   assert.equal(calls[1].module.name, 'dsh-zen-remote-push')
-  // T12: the halves get the RESOLVED values object, not the raw row — one
-  // shared object, defaults filled in (row/file/env are all empty here).
-  assert.equal(calls[0].config, calls[1].config)
+  // T22a: the gateway additionally carries the per-apply relay secret, so the
+  // two configs are no longer the same object — push sees the identical
+  // resolved values MINUS the secret (omitted via destructuring so the key
+  // really disappears instead of sitting there as undefined).
+  const { relaySecret: _gatewaySecret, ...gatewayValues } = calls[0].config
+  assert.deepEqual(gatewayValues, calls[1].config)
+  assert.match(calls[0].config.relaySecret, /^[0-9a-f]{64}$/, 'the secret is 64 hex chars (32 random bytes)')
   assert.equal(calls[0].config.port, 3088)
   assert.equal(calls[0].config.role, 'host')
   // Their own inject declarations ride along on the namespace, which is what
@@ -97,7 +101,8 @@ test("apply loads both sub-plugins for role 'host'", async () => {
   assert.equal(calls.length, 2)
   assert.equal(calls[0].module.name, 'dsh-zen-remote-gateway')
   assert.equal(calls[1].module.name, 'dsh-zen-remote-push')
-  assert.equal(calls[0].config, calls[1].config)
+  const { relaySecret: _hostSecret, ...hostGatewayValues } = calls[0].config
+  assert.deepEqual(hostGatewayValues, calls[1].config)
   assert.equal(calls[0].config.role, 'host')
 })
 
@@ -157,7 +162,10 @@ test("role 'client' mounts all three routes through a real inject and never call
     [index.UPLOAD_ROUTE, index.CLIENT_CONFIG_ROUTE, share.SHARE_EXPORT_ROUTE].sort(),
   )
 
-  // Same wiring under the host role: the routes AND both sub-plugins.
+  // Same wiring under the host role: the routes AND both sub-plugins. The
+  // relay route is absent here only because this fake carries no
+  // typertGateway service (its inject never fires) — the dedicated test
+  // below covers the composition that has one.
   const hostRoutes = []
   const hostServices = { ...services, webServer: { register: (route) => { hostRoutes.push(route); return () => {} } } }
   const hostCtx = {
@@ -258,6 +266,105 @@ test('the admin handler resolves config per request, volatile fields included', 
   } finally {
     await new Promise((resolve) => server.close(resolve))
   }
+})
+
+// ---- T22a: relay wiring -------------------------------------------------------
+
+const RELAY_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'relay-server.js')).href
+
+/** Fake ctx like the one above, plus a typertGateway service, so the relay
+ * inject actually fires and the route registration can be inspected. */
+function makeWiringCtx(record) {
+  const services = {
+    logger: { warn() {} },
+    webServer: { register: (route) => { record.routes.push(route); return () => {} } },
+    sessions: { get: () => undefined },
+    sessionQuery: {},
+    typertGateway: { invoke: async () => ({}) },
+  }
+  const ctx = {
+    plugin: (module, config) => { record.plugins.push({ module, config }) },
+    effect(fn) { fn() },
+    inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
+  }
+  return ctx
+}
+
+test('T22a: the host role registers the relay prefix route and mints a fresh 64-hex relaySecret per apply', async () => {
+  const index = await import(INDEX_URL)
+  const { RELAY_PREFIX } = await import(RELAY_URL)
+  const first = { plugins: [], routes: [] }
+  index.apply(makeWiringCtx(first), {})
+  const relay = first.routes.find((r) => r.kind === 'prefix')
+  assert.ok(relay, 'the relay route is registered as a prefix route')
+  assert.equal(relay.path, RELAY_PREFIX)
+  assert.equal(relay.path, '/_dsh/zen-remote/relay')
+  assert.equal(typeof relay.handler, 'function')
+  const gwConfig = first.plugins.find((c) => c.module.name === 'dsh-zen-remote-gateway').config
+  assert.match(gwConfig.relaySecret, /^[0-9a-f]{64}$/, 'the gateway sub-plugin carries a 64-hex relaySecret')
+  const pushConfig = first.plugins.find((c) => c.module.name === 'dsh-zen-remote-push').config
+  assert.equal(pushConfig.relaySecret, undefined, 'the push half never sees the secret')
+
+  const second = { plugins: [], routes: [] }
+  index.apply(makeWiringCtx(second), {})
+  const secondSecret = second.plugins.find((c) => c.module.name === 'dsh-zen-remote-gateway').config.relaySecret
+  assert.match(secondSecret, /^[0-9a-f]{64}$/)
+  assert.notEqual(secondSecret, gwConfig.relaySecret, 'every apply mints a NEW secret')
+})
+
+test("T22a: role 'client' registers no relay route even with typertGateway available", async () => {
+  const index = await import(INDEX_URL)
+  const share = await import(SHARE_URL)
+  const record = { plugins: [], routes: [] }
+  index.apply(makeWiringCtx(record), { role: 'client' })
+  assert.equal(record.plugins.length, 0)
+  assert.deepEqual(
+    record.routes.map((r) => r.path).sort(),
+    [index.UPLOAD_ROUTE, index.CLIENT_CONFIG_ROUTE, share.SHARE_EXPORT_ROUTE].sort(),
+    'exactly the three phone routes — no relay prefix',
+  )
+  assert.ok(!record.routes.some((r) => r.kind === 'prefix'), 'no prefix route at all on the client role')
+})
+
+// A minimal ServerResponse stand-in: responseJson only sets headers, writes
+// the status and ends with the body bytes.
+function fakeRes() {
+  return {
+    status: 0,
+    body: '',
+    setHeader() {},
+    writeHead(code) { this.status = code },
+    end(bytes) { if (bytes !== undefined) this.body = bytes.toString() },
+    on() {},
+    off() {},
+  }
+}
+
+test('T22a-fix: the minted relaySecret opens the registered relay handler, a wrong one does not', async () => {
+  const index = await import(INDEX_URL)
+  const record = { plugins: [], routes: [] }
+  index.apply(makeWiringCtx(record), {})
+  const relayRoute = record.routes.find((r) => r.kind === 'prefix')
+  const secret = record.plugins.find((c) => c.module.name === 'dsh-zen-remote-gateway').config.relaySecret
+  const call = (requestSecret) => {
+    const headers = {
+      'x-zen-remote-via': 'gateway',
+      'x-zen-remote-role': 'desktop-client',
+      'x-zen-remote-device': 'dev-1',
+    }
+    if (requestSecret !== undefined) headers['x-zen-remote-secret'] = requestSecret
+    const res = fakeRes()
+    return relayRoute.handler({ method: 'GET', url: '/_dsh/zen-remote/relay/ping', headers }, res).then(() => res)
+  }
+
+  const ok = await call(secret)
+  assert.equal(ok.status, 200, 'the secret handed to the gateway sub-plugin is THE relay secret')
+  assert.equal(JSON.parse(ok.body).ok, true)
+
+  const wrong = await call('f'.repeat(64))
+  assert.equal(wrong.status, 401, 'any other secret is refused')
+  const absent = await call(undefined)
+  assert.equal(absent.status, 401, 'no secret is refused')
 })
 
 test('resolveRole normalizes to host or client', async () => {

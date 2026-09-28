@@ -13,10 +13,24 @@
  * service is a declared inject, so apply() runs with the listener ready),
  * and the entry must never mutate the host process.env — every variable is
  * assembled in the child's env copy only.
+ * T22a adds two more pinned behaviors: the entry RE-RESOLVES its input exactly
+ * like dsh-push does (so a legal env var wins again at the resolver and an
+ * illegal one is skipped — `LAN_GATE_TARGET_PORT=xyz` used to leak verbatim
+ * into the child and became 127.0.0.1:NaN), and the relay shared secret rides
+ * the config into LAN_GATE_RELAY_SECRET, overriding (or deleting) any host
+ * value. Both need a hermetic DSH_HOME: re-resolution reads
+ * <DSH_HOME>/lan-gate.config.json.
  */
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+
+const TEMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-lan-gate-port-'))
+process.env.DSH_HOME = TEMP_HOME
+process.on('exit', () => { try { fs.rmSync(TEMP_HOME, { recursive: true, force: true }) } catch { /* best effort */ } })
 
 /** Runs apply() on a mocked ctx and resolves the spawn options it produced. */
 async function spawnWith({ env = {}, config, webServerPort }) {
@@ -70,14 +84,58 @@ test('lan-gate: webServer absent or port undefined falls back to 3080', async ()
   }
 })
 
-test('lan-gate: the resolved config overrides a leftover env var (env wins at the resolver, not here)', async () => {
-  // Pre-T12 this entry took the raw row and env had to win at this layer.
-  // Now the config arriving here is already resolved (src/config.ts folded
-  // every LEGAL env var into it), so it must win unconditionally — letting a
-  // stale or illegal host env var override the row would defeat the resolver.
+test('lan-gate: re-resolution gives a legal env var its say again, an illegal one none', async () => {
+  // T22a (1a): the entry now re-resolves its input exactly like dsh-push —
+  // resolveConfig(config, readFileConfig(), process.env) — so a LEGAL env var
+  // beats the config object passed in (in the real host flow that config
+  // already carries the same env value, so nothing changes there; this is
+  // for standalone loads like the old single-row setups), while an ILLEGAL
+  // one is skipped by the resolver instead of leaking into the child.
   const { opts } = await spawnWith({ env: { LAN_GATE_TARGET_PORT: '3998' }, config: { targetPort: 3996 }, webServerPort: 3999 })
-  assert.equal(opts.env.LAN_GATE_TARGET_PORT, '3996')
-  assert.ok(opts.env.LAN_GATE_UPSTREAM_TOKEN_URL.includes('127.0.0.1:3996'))
+  assert.equal(opts.env.LAN_GATE_TARGET_PORT, '3998', 'a legal env var wins at the resolver again')
+
+  const illegal = await spawnWith({ env: { LAN_GATE_TARGET_PORT: 'xyz' }, config: { targetPort: 3996 }, webServerPort: 3999 })
+  assert.equal(illegal.opts.env.LAN_GATE_TARGET_PORT, '3996', 'an illegal env value is skipped; the config value stands')
+})
+
+test('lan-gate: an illegal LAN_GATE_TARGET_PORT falls back to the host port', async () => {
+  // T22a (1a) pinned regression: LAN_GATE_TARGET_PORT=xyz used to be passed
+  // through verbatim and the child authenticated against 127.0.0.1:NaN. The
+  // resolver now skips it, and the child env var is DELETED so the host's
+  // real listening port takes over.
+  const { opts } = await spawnWith({ env: { LAN_GATE_TARGET_PORT: 'xyz' }, webServerPort: 3999 })
+  assert.equal(opts.env.LAN_GATE_TARGET_PORT, '3999')
+  assert.ok(opts.env.LAN_GATE_UPSTREAM_TOKEN_URL.includes('127.0.0.1:3999'))
+})
+
+test('lan-gate: a standalone row port re-resolves against the env (same as push)', async () => {
+  // Old-style single-row setup: the gateway insert carries config {port:
+  // 4000} while the environment exports LAN_GATE_PORT=5000. Re-resolution
+  // puts env first, so the child gets 5000 — the exact behavior dsh-push
+  // already ships.
+  const { opts } = await spawnWith({ env: { LAN_GATE_PORT: '5000' }, config: { port: 4000 }, webServerPort: 3999 })
+  assert.equal(opts.env.LAN_GATE_PORT, '5000')
+})
+
+test('lan-gate: undefined resolved values delete the child env var instead of leaking the host value', async () => {
+  // The delete half of the override rule: targetPort is the one CONFIG_ENV
+  // field that can resolve to undefined. A host env value that lost at the
+  // resolver (here: illegal) must not survive in the child copy when no
+  // fallback fires (no webServer port available).
+  const { opts } = await spawnWith({ env: { LAN_GATE_TARGET_PORT: 'xyz' } })
+  assert.equal(opts.env.LAN_GATE_TARGET_PORT, undefined)
+})
+
+test('lan-gate: relaySecret overrides the host env, absence deletes the variable', async () => {
+  // T22a: the shared relay secret is minted per apply by the main entry and
+  // may never be dictated from the outside — a host env value is overridden
+  // unconditionally, and a config without one deletes the variable so the
+  // child cannot keep serving a stale secret.
+  const minted = await spawnWith({ env: { LAN_GATE_RELAY_SECRET: 'host-forged' }, config: { relaySecret: 'a'.repeat(64) }, webServerPort: 3999 })
+  assert.equal(minted.opts.env.LAN_GATE_RELAY_SECRET, 'a'.repeat(64), 'the plugin-minted secret wins, never the host env')
+
+  const absent = await spawnWith({ env: { LAN_GATE_RELAY_SECRET: 'stale' }, config: {}, webServerPort: 3999 })
+  assert.equal(absent.opts.env.LAN_GATE_RELAY_SECRET, undefined, 'no config secret means the variable is gone from the child')
 })
 
 test('lan-gate: cordis config beats the host port', async () => {

@@ -5,6 +5,7 @@
 //   - PWA serving (/pwa/*) + mobile layout + touch gesture + offline + notifications
 //
 // Mount via cordis.patch.yml (see cordis.patch.yml.example) or `dsh plugin add`.
+import { readFileConfig, resolveConfig } from './lib/config.js'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
@@ -24,7 +25,9 @@ const serverFile = join(here, 'lib', 'lan-gate-server.cjs')
 // through the DSH settings form — T12 resolves the row against
 // lan-gate.config.json and env before handing it here):
 //   { port, host, targetPort, rateLimit, trustedProxies, vapidSubject, lang }
-// Values are translated to LAN_GATE_* env vars; explicit env vars win.
+// Each RESOLVED value is translated to its LAN_GATE_* env var, unconditionally
+// overriding any host value; an undefined value DELETES the variable instead of
+// letting a leftover host value leak into the child.
 const CONFIG_ENV = {
   port: 'LAN_GATE_PORT',
   host: 'LAN_GATE_HOST',
@@ -36,6 +39,11 @@ const CONFIG_ENV = {
 }
 
 export function apply(ctx, config) {
+  // T12 复审遗留：与 dsh-push 相同，输入一律重新解析（resolveConfig 幂等——主
+  // 入口传来的已解析值再走一遍结果不变），旧式独立网关行传来的部分行或 `{}` 也
+  // 能拿到 env 和 lan-gate.config.json 的发言权，而不是被对象里恰好有什么所掩
+  // 盖。precedence：env > row > lan-gate.config.json > defaults（src/config.ts）。
+  const values = resolveConfig(config ?? {}, readFileConfig(), process.env).values
   const timer = ctx.get('timer')
   let handle = null
   // 行销毁标志：resolveExecutable 的 await 期间插件行可能正好被销毁（配置变更
@@ -47,19 +55,23 @@ export function apply(ctx, config) {
 
   /* 子进程 env：宿主环境的副本，叠加本行的决策。不再写回宿主 process.env——
      插件行不该有进程级副作用（此前 config 翻译和端口回写都会泄给宿主和其它
-     插件行）。传入的 config 是主入口解析后的值，环境变量在解析层已经考虑过
-     （非法的被跳过），所以有值就无条件覆盖宿主里的同名变量——否则一个手滑
-     export 的非法 LAN_GATE_PORT 会反过来盖掉行配置；没有值（undefined）的字
-     段才保留宿主原值。 */
+     插件行）。上面的 values 是重新解析后的生效值，环境变量在解析层已经考虑过
+     （非法的被跳过），所以有值就无条件覆盖宿主里的同名变量；值为 undefined
+     的字段必须删掉子进程里的同名变量——宿主环境里残留的非法值（如
+     LAN_GATE_TARGET_PORT=xyz）若原样漏过去，子进程鉴权地址会变成
+     127.0.0.1:NaN。 */
   const childEnv = () => {
     const env = { ...process.env }
-    if (config && typeof config === 'object') {
-      for (const [key, envName] of Object.entries(CONFIG_ENV)) {
-        if (config[key] !== undefined && config[key] !== null) {
-          env[envName] = String(config[key])
-        }
-      }
+    for (const [key, envName] of Object.entries(CONFIG_ENV)) {
+      if (values[key] !== undefined) env[envName] = String(values[key])
+      else delete env[envName]
     }
+    // T22a 中继共享密钥：主入口每次 apply 现生成、只经这里进子进程，不允许由
+    // 外部环境指定——所以无条件覆盖宿主里的同名变量；插件没带（client 角色、
+    // 旧式独立加载）就删掉，密钥头功能随之关闭（子进程对空密钥不加头）。
+    const relaySecret = config && typeof config === 'object' ? config.relaySecret : undefined
+    if (typeof relaySecret === 'string' && relaySecret !== '') env.LAN_GATE_RELAY_SECRET = relaySecret
+    else delete env.LAN_GATE_RELAY_SECRET
     // 0.1.7 桌面版的 Web UI 端口可配置、甚至可为 0（OS 派发），
     // ctx.webServer.port 才是权威值（inject 已声明，apply 时监听已就绪）；
     // 拿不到有效数字时保持 3080 兜底。
