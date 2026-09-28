@@ -26,6 +26,17 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session'
+
+// The loader's volatile-only config announcement (T17b): committed volatile
+// changes ride `loader/volatile-update` on the row context with the changed
+// field paths (cordis-plugin-loader/lib/index.js, ~line 420, DSH 0.2.0). The
+// loader package is not a dependency here, so its Events augmentation is
+// restated locally to keep the ctx.on call typed.
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'loader/volatile-update'(paths: string[][]): void
+  }
+}
 import { readFileConfig, resolveConfig, unwrapVolatile } from './config.js'
 import { createActivityTracker, createParentIndex, startSweeper } from './activity.js'
 import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
@@ -93,20 +104,27 @@ export function getRelayClient(): RelayClient | undefined {
   return clientRelayClient
 }
 
-/** Host half config. */
+/** Host half config. Every field below arrives through the loader as a
+ * volatile live reference — a `{ get() }` wrapper over the stored value, not
+ * the value itself (src/config.ts explains why every field is volatile) — so
+ * the types name the value each field RESOLVES to, and every read goes
+ * through `unwrapVolatile` at use time (this file's route handlers) or
+ * through `resolveConfig`, which unwraps per field (T17b). */
 export interface MobileNavConfig {
   /** Which parts of the plugin run in this DSH process. `'host'` — the
    * default, and the fallback for any value that is not exactly `'client'` —
    * additionally loads the gateway and push sub-plugins; `'client'` mounts
    * only the three host routes, for setups where another DSH process owns
-   * the channel. */
-  role?: 'host' | 'client'
-  /** Max upload body in bytes; larger bodies get 413. Default {@link DEFAULT_MAX_UPLOAD_BYTES}. */
-  maxUploadBytes?: number
+   * the channel. Volatile: resolved per use, never snapshotted. */
+  role?: unknown
+  /** Max upload body in bytes; larger bodies get 413. Default {@link DEFAULT_MAX_UPLOAD_BYTES}.
+   * Volatile: re-read per request through `unwrapVolatile`. */
+  maxUploadBytes?: unknown
   /** Fold each turn's process at every viewport width, not just below the
    * phone breakpoint. Default false (phone-only). A browser can still opt
-   * itself in via `?mobile-nav-turn-fold=1` when this is off. */
-  turnFoldDesktop?: boolean
+   * itself in via `?mobile-nav-turn-fold=1` when this is off. Volatile:
+   * re-read per request through `unwrapVolatile`. */
+  turnFoldDesktop?: unknown
   /** Calibration for the composer lift used when a phone's keyboard is
    * invisible to the browser (src/client/effects/keyboard-avoid.ts). Leave
    * every one of these unset to keep the shipped estimate — the route omits
@@ -114,13 +132,14 @@ export interface MobileNavConfig {
    * is one place each default is written.
    *
    * Share of the layout viewport the estimated lift starts from (shipped
-   * 0.42). Clamped to 0-1. */
-  keyboardLiftRatio?: number
-  /** Ceiling on that estimate in CSS pixels (shipped 400). Clamped to 0-2000. */
-  keyboardLiftMaxPx?: number
+   * 0.42). Clamped to 0-1. Volatile: re-read per request. */
+  keyboardLiftRatio?: unknown
+  /** Ceiling on that estimate in CSS pixels (shipped 400). Clamped to 0-2000.
+   * Volatile: re-read per request. */
+  keyboardLiftMaxPx?: unknown
   /** Extra clearance above a keyboard the browser DID react to, Android only
-   * (shipped 15). Clamped to 0-200. */
-  keyboardSafetyPadPx?: number
+   * (shipped 15). Clamped to 0-200. Volatile: re-read per request. */
+  keyboardSafetyPadPx?: unknown
 }
 
 /**
@@ -411,7 +430,12 @@ export async function handleUpload(
  * failures into the context logger, so a fire-and-forget call is the whole
  * contract. The route tests' fake contexts carry a no-op `plugin` for it.
  * @param ctx - host plugin context.
- * @param config - optional body cap override.
+ * @param config - the plugin row config as the loader handed it over (see
+ *   {@link MobileNavConfig}): every field is a volatile live reference
+ *   (`{ get() }` wrapper, T17), so nothing here is snapshotted —
+ *   `resolveConfig` merges the row with `lan-gate.config.json` and the
+ *   environment per read, and the route handlers unwrap their knobs per
+ *   request.
  */
 export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   const effective = resolveConfig(config, readFileConfig(), process.env)
@@ -662,13 +686,24 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       }), 'dsh-zen-remote: client routes')
     })
   }
-  // Restart watcher (T17), both roles: every Config field is volatile (the
-  // settings surface would not exist otherwise), so the restart-required
+  // Restart watcher (T17 + T17b), both roles: every Config field is volatile
+  // (the settings surface would not exist otherwise), so the restart-required
   // fields are watched by fingerprint instead — when their resolved values
-  // (row, lan-gate.config.json, or environment — all re-read per tick) move,
-  // the plugin row reloads through cordis and apply() runs again, restarting
-  // the gateway child and push half with it. ctx.fiber is the row's own
-  // Fiber (cordis 4.0.4 assigns it in the Fiber constructor: `this.ctx =
+  // (row, lan-gate.config.json, or environment — all re-read per trigger)
+  // move, the plugin row reloads through cordis and apply() runs again,
+  // restarting the gateway child and push half with it. Two triggers share
+  // the one fire-at-most-once guard: the 2s poll (the fallback for the
+  // layers a settings save never touches — lan-gate.config.json and the
+  // LAN_GATE_* / DSH_PUSH_* environment) and, immediately, the loader's
+  // `loader/volatile-update` event: DSH 0.2.0 commits a volatile-only
+  // settings change WITHOUT restarting the row and announces it on the row
+  // context (`fiber.ctx.emit(self, "loader/volatile-update", paths)`, the
+  // listener filter being `owner.fiber === fiber` — verified in
+  // cordis-plugin-loader/lib/index.js of loader 1.0.5 / DSH 0.2.0-rc.1,
+  // ~line 420). Subscribing here on the row context receives exactly this
+  // row's updates, so a saved restart-required field reloads the row within
+  // the same tick instead of waiting out the poll. ctx.fiber is the row's
+  // own Fiber (cordis 4.0.4 assigns it in the Fiber constructor: `this.ctx =
   // parent.extend({ fiber: this })`), and restart() is its public
   // dispose-and-reload entry. A fake context without a fiber (the route
   // tests) only ever reaches the warn.
@@ -686,13 +721,20 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       ctx.logger.warn('dsh-zen-remote: plugin row reload failed: %s', message(error))
     }
   }
-  ctx.effect(
-    () => startRestartWatcher({
+  ctx.effect(() => {
+    const watcher = startRestartWatcher({
       getValues: () => resolveConfig(config, readFileConfig(), process.env).values,
       onChange: reload,
-    }),
-    'dsh-zen-remote: restart watcher',
-  )
+    })
+    // Registration failure degrades to a warning, like the session feeds
+    // above: the poll trigger keeps the watcher fully functional without it.
+    try {
+      ctx.on('loader/volatile-update', () => { watcher.checkNow() })
+    } catch (error) {
+      ctx.logger.warn('dsh-zen-remote: cannot listen on "loader/volatile-update": %s', message(error))
+    }
+    return watcher.stop
+  }, 'dsh-zen-remote: restart watcher')
   // The upload route carries the T17 admission wall too: webServer routes
   // skip DSH's /api authentication, so without the connection service's
   // admit this 1.x-era route was the one unauthenticated write path left. A
@@ -711,7 +753,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         const maxBytes = typeof rawMax === 'number' && Number.isFinite(rawMax) && rawMax > 0
           ? rawMax
           : DEFAULT_MAX_UPLOAD_BYTES
-        void handleUpload(
+        // Returned, not fire-and-forget: handleUpload owns res end to end,
+        // and a rejection escaping it must reach webServer's unified error
+        // handling instead of vanishing into an unhandled rejection (T17b
+        // restored the await-shaped contract the route used to have).
+        return handleUpload(
           webCtx,
           maxBytes,
           req,

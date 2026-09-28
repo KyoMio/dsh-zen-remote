@@ -186,14 +186,15 @@ export declare function settingsPollOf(status: 'loading' | 'ready' | 'unavailabl
     user?: unknown;
 }, probed?: 'host' | 'client'): 'none' | 'admin' | 'client';
 /**
- * The row fields whose changed value reloads the plugin row after a save
- * (the mirror of RESTART_FIELDS in the host half's src/restart-watcher.ts;
- * the host re-resolves these and restarts itself when they move). Only the
- * fields this page edits can appear here — the note reads staged drafts, and
- * `targetPort` / `pushEvents` are not page fields — but the list is the full
- * mirror so a host-side change surfaces in the diff.
+ * The row fields whose changed value reloads the plugin row after a save —
+ * re-exported from src/restart-fields.ts, the single list the host half's
+ * restart watcher fingerprints too (T17b collapsed the two copies; the leaf
+ * module is dependency-free so the client bundler can inline it). Only the
+ * fields this page edits can ever stage a draft here — `targetPort` /
+ * `pushEvents` are not page fields — but the list is the full shared set so
+ * a host-side change surfaces in the diff.
  */
-export declare const RESTART_FIELDS: readonly string[];
+export { RESTART_FIELDS } from '../restart-fields.ts';
 /** One path-addressed edit a save sends (the wire `SettingsPathOpView` shape). */
 export type SettingsFormOp = {
     op: 'set';
@@ -405,9 +406,13 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
     idleHours: SettingsFieldState;
     autoShareNewSessions: SettingsFieldState;
     deviceToken: SettingsSecretFieldState;
-    /** A restart-required field ({@link RESTART_FIELDS}) has a staged change:
-     * the save will move the row and the host reloads it, briefly restarting
-     * the gateway — the page shows the reload note while this is true. */
+    /** A restart-required field ({@link RESTART_FIELDS}) has a staged change a
+     * save would actually write: the save will move the row and the host
+     * reloads it, briefly restarting the gateway — the page shows the reload
+     * note while this is true. Since T17b it is not merely "a draft exists":
+     * a draft equal to the displayed effective value is no change at all, an
+     * invalid draft blocks the save instead of saving anything, and an
+     * env-locked field never stages (nor counts if locked after staging). */
     restartPending: boolean;
 }
 /**

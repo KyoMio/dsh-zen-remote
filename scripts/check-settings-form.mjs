@@ -10,7 +10,9 @@
 // input normalization, the direct pairing writes and the latest-wins gate,
 // the T16-fix 3 role/poll decisions extended by T17's two-level role (saved
 // row role first, the client-config probe as fallback), and T17's
-// restartPending flag behind the plugin-reload note.
+// restartPending flag behind the plugin-reload note (T17b: it fires only
+// when a save would actually write a restart-field change, never for an
+// identical draft, an invalid draft or an env-locked field).
 //
 // Run: node scripts/check-settings-form.mjs   (needs Node >= 23.6 type stripping)
 import assert from 'node:assert/strict'
@@ -637,4 +639,43 @@ test('restartPending tracks staged drafts over the restart-required fields only'
     { op: 'unset', path: ['port'] },
   ], 'both restart-field drafts landed, in field order')
   assert.equal(form.getSnapshot().restartPending, false, 'a landed save clears the staged drafts — the reload takes over from here')
+})
+
+test('restartPending only promises a reload when a save would actually write a change (T17b)', async () => {
+  // A draft equal to the displayed effective value plans no op → no note.
+  const { scope } = fakeScope({ value: { port: 4000 }, user: { port: 4000 } })
+  const form = new ZenRemoteSettingsForm(scope)
+  form.setBaseline(VALUES) // effective port: 4000
+  form.stage('port', '4000')
+  assert.equal(form.getSnapshot().restartPending, false, 'a draft equal to the effective value is no change at all')
+  assert.equal(form.getSnapshot().dirty, false)
+
+  // An invalid draft blocks the save instead of saving anything → no note.
+  form.stage('port', '70000')
+  const invalidSnap = form.getSnapshot()
+  assert.equal(invalidSnap.restartPending, false, 'an out-of-range draft never saves, so no reload is promised')
+  assert.equal(invalidSnap.invalid, true)
+
+  // An env-locked restart field stages nothing — and a draft staged before
+  // the lock landed does not count either (a written value would be
+  // shadowed by the variable, and plan() skips locked fields).
+  const env = fakeScope({ user: { port: 4000 } })
+  const envForm = new ZenRemoteSettingsForm(env.scope)
+  envForm.setBaseline(VALUES)
+  envForm.stage('port', '4001')
+  assert.equal(envForm.getSnapshot().restartPending, true, 'still a plain staged change here')
+  envForm.setLockedFields(['port'])
+  assert.equal(envForm.getSnapshot().restartPending, false, 'an env-sourced field never promises a reload')
+
+  // A staged clear of a restart field the row layer does NOT carry plans
+  // no op → no note.
+  const clear = fakeScope()
+  const clearForm = new ZenRemoteSettingsForm(clear.scope)
+  clearForm.setBaseline(VALUES)
+  clearForm.resetField('port')
+  assert.equal(clearForm.getSnapshot().restartPending, false, 'nothing to revert: the row stores no port')
+
+  // A real value change still promises the reload.
+  clearForm.stage('port', '4001')
+  assert.equal(clearForm.getSnapshot().restartPending, true, 'a real change keeps the note')
 })
