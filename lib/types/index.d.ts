@@ -17,6 +17,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
 import type { AdminAdmission } from './admin-routes.js';
+import type { RelayClient } from './relay-client.js';
 export { Config, resolveRole } from './config.js';
 export { sameOriginPost } from './http.js';
 /** Exact route the phone composer POSTs one file body to. */
@@ -29,6 +30,8 @@ export declare const CLIENT_CONFIG_ROUTE = "/_dsh/mobile-nav/client-config";
 export declare const UPLOAD_DIR = ".dsh-uploads";
 /** Body cap when the plugin row sets no `maxUploadBytes`. */
 export declare const DEFAULT_MAX_UPLOAD_BYTES: number;
+/** The live client-role relay client, if one was built. */
+export declare function getRelayClient(): RelayClient | undefined;
 /** Host half config. */
 export interface MobileNavConfig {
     /** Which parts of the plugin run in this DSH process. `'host'` — the
