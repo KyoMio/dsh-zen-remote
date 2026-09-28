@@ -22,7 +22,14 @@ import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'nod
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session'
+import { readFileConfig, resolveConfig } from './config.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
+
+// The loader's config schema (settings form) and the role normalizer live in
+// src/config.ts next to the resolution they describe; re-exported so the
+// plugin row's public surface stays on the main entry.
+export { Config, resolveRole } from './config.js'
+
 // The two sub-plugin entries the host role loads. They ship as plain .mjs at
 // the package root, and `..` resolves there both from this file (via the
 // hand-written lan-gate.d.mts / dsh-push.d.mts declarations) and from the
@@ -93,16 +100,6 @@ export interface MobileNavConfig {
 export function clamped(key: string, value: number | undefined, min: number, max: number): Record<string, number> {
   if (typeof value !== 'number' || !Number.isFinite(value)) return {}
   return { [key]: Math.min(Math.max(value, min), max) }
-}
-
-/**
- * The normalized role behind the row's `role` knob. Anything but the exact
- * string `'client'` means host, so a typo degrades to the full plugin rather
- * than silently dropping the gateway and push halves. Exported for
- * test/role-wiring.test.cjs.
- */
-export function resolveRole(config: MobileNavConfig | undefined): 'host' | 'client' {
-  return config?.role === 'client' ? 'client' : 'host'
 }
 
 /**
@@ -391,20 +388,21 @@ export async function handleUpload(
  * in a composition without them — Electron carries no webServer.
  *
  * On the host role (the default) this row also loads the gateway and push
- * sub-plugins, each with the SAME config object this apply received. Cordis
- * honors a sub-plugin's own `inject` before calling its apply and routes
- * fiber failures into the context logger, so a fire-and-forget call is the
- * whole contract. The optional call exists for the route tests' fake
- * contexts, which predate this wiring and carry no `plugin`; production
- * cordis contexts always do.
+ * sub-plugins, each with the RESOLVED config — every field merged from env >
+ * row > lan-gate.config.json > defaults (src/config.ts) — not the raw row,
+ * so the halves see the same effective values the row does. Cordis honors a
+ * sub-plugin's own `inject` before calling its apply and routes fiber
+ * failures into the context logger, so a fire-and-forget call is the whole
+ * contract. The route tests' fake contexts carry a no-op `plugin` for it.
  * @param ctx - host plugin context.
  * @param config - optional body cap override.
  */
 export function apply(ctx: Context, config: MobileNavConfig = {}): void {
+  const effective = resolveConfig(config, readFileConfig(), process.env)
   const maxBytes = config.maxUploadBytes ?? DEFAULT_MAX_UPLOAD_BYTES
-  if (resolveRole(config) === 'host') {
-    ctx.plugin?.(gateway, config)
-    ctx.plugin?.(push, config)
+  if (effective.values.role === 'host') {
+    ctx.plugin(gateway, effective.values)
+    ctx.plugin(push, effective.values)
   }
   ctx.inject(['webServer', 'sessions'], (webCtx) => {
     webCtx.effect(() => webCtx.webServer.register({

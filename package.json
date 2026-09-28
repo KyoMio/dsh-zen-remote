@@ -99,6 +99,7 @@
     "@deepseek-ai/dsh-session-query": "^0.1.7-rc.2 || ^0.2.0-rc.1",
     "@deepseek-ai/dsh-tools": "^0.1.7-rc.2 || ^0.2.0-rc.1",
     "@deepseek-ai/dsh-workspace": "^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "*",
     "react": "^18.2.0"
   },
   "peerDependenciesMeta": {

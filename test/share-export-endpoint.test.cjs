@@ -579,6 +579,10 @@ function makeApplyCtx({ webServer = true, ...services } = {}) {
   const all = {
     logger: { warn: () => {} },
     effect: (fn) => fn(),
+    // T12: apply() calls ctx.plugin unconditionally on the default host role
+    // (loading the gateway/push halves). The namespace objects are never
+    // executed here, so a no-op sink is all the fake context needs.
+    plugin: () => {},
     ...(webServer ? { webServer: { register: (route) => { routes.push(route); return () => {} } } } : {}),
     ...services,
   }

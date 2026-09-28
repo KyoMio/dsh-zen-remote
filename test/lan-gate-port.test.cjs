@@ -1,7 +1,12 @@
 /* dsh-zen-remote · lan-gate entry target-port test (T-017 / T-017-fix)
  * The gateway entry (lan-gate.mjs) decides which local port the child
  * gateway should forward to, resolved as:
- *     explicit env > cordis config > ctx.webServer.port (host truth) > 3080
+ *     incoming config (already merged from env > row > file by src/config.ts)
+ *       > ctx.webServer.port (host truth) > 3080
+ * Since T12-fix the entry receives RESOLVED values, so a config value
+ * overrides any host env var unconditionally — a LEGAL env var has already
+ * been folded into that config by the resolver, and an illegal one must not
+ * get a second vote.
  * These cases run the real apply() against a mocked ctx whose subprocess
  * records the spawn environment instead of starting a process, and pin two
  * review findings: the host port must win whenever nothing overrides it (the
@@ -65,10 +70,14 @@ test('lan-gate: webServer absent or port undefined falls back to 3080', async ()
   }
 })
 
-test('lan-gate: an explicit env var beats config and the host port', async () => {
+test('lan-gate: the resolved config overrides a leftover env var (env wins at the resolver, not here)', async () => {
+  // Pre-T12 this entry took the raw row and env had to win at this layer.
+  // Now the config arriving here is already resolved (src/config.ts folded
+  // every LEGAL env var into it), so it must win unconditionally — letting a
+  // stale or illegal host env var override the row would defeat the resolver.
   const { opts } = await spawnWith({ env: { LAN_GATE_TARGET_PORT: '3998' }, config: { targetPort: 3996 }, webServerPort: 3999 })
-  assert.equal(opts.env.LAN_GATE_TARGET_PORT, '3998')
-  assert.ok(opts.env.LAN_GATE_UPSTREAM_TOKEN_URL.includes('127.0.0.1:3998'))
+  assert.equal(opts.env.LAN_GATE_TARGET_PORT, '3996')
+  assert.ok(opts.env.LAN_GATE_UPSTREAM_TOKEN_URL.includes('127.0.0.1:3996'))
 })
 
 test('lan-gate: cordis config beats the host port', async () => {

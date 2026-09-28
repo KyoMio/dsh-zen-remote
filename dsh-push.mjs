@@ -32,34 +32,21 @@ export const name = 'dsh-zen-remote-push'
 export const inject = []
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
-
-// Shares the gateway's optional config file <DSH_HOME>/lan-gate.config.json
-// (keys: port, lang, pushEvents, pushDebounceMs, pushSummary, pushTurnEnd, pushTool).
-// Explicit env wins.
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { homedir } from 'node:os'
-function fileConfig() {
-  try {
-    const raw = JSON.parse(readFileSync(join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'lan-gate.config.json'), 'utf8'))
-    return raw !== null && typeof raw === 'object' ? raw : {}
-  } catch { return {} }
-}
-const truthy = (v) => v === true || v === 1 || v === '1'
-const FILE = fileConfig()
-const GATEWAY_PORT = Number(process.env.LAN_GATE_PORT ?? FILE.port ?? 3088)
-const EVENTS = String(process.env.DSH_PUSH_EVENTS ?? FILE.pushEvents ?? 'agent/turn-stopping').split(',').map((s) => s.trim()).filter(Boolean)
-const DEBOUNCE_MS = Number(process.env.DSH_PUSH_DEBOUNCE_MS ?? FILE.pushDebounceMs ?? 15000)
-const INCLUDE_SUMMARY = process.env.DSH_PUSH_SUMMARY !== undefined ? process.env.DSH_PUSH_SUMMARY === '1' : truthy(FILE.pushSummary)
-const TURN_END_ENABLED = process.env.DSH_PUSH_TURN_END !== undefined ? process.env.DSH_PUSH_TURN_END === '1' : truthy(FILE.pushTurnEnd)
-const PUSH_TOOL_ENABLED = process.env.DSH_PUSH_TOOL !== undefined ? process.env.DSH_PUSH_TOOL !== '0' : FILE.pushTool !== false
+// Config arrives as apply(ctx, config)'s already-resolved values — every
+// field merged from env > plugin row > lan-gate.config.json > defaults
+// (src/config.ts). Standalone loads (old single-row setups, tests) resolve
+// the same way on the spot. No module-top-level config constants: everything
+// below is computed per apply() call and passed down as arguments.
+import { readFileConfig, resolveConfig } from './lib/config.js'
 
 // Notification language. The gateway resolves the same `lang` key to the
 // requesting browser's Accept-Language when it is "auto"; a notification has
 // no such reader signal, and the host process has no usable locale either
 // (launchd starts it with no LANG — Intl reports en-US on a Chinese machine),
-// so anything other than "en" here means Chinese.
-const LANG = String(process.env.DSH_PUSH_LANG ?? FILE.lang ?? 'zh') === 'en' ? 'en' : 'zh'
+// so anything other than "en" here means Chinese. DSH_PUSH_LANG keeps
+// precedence over the resolved `lang` field. Resolved at call time (not at
+// import) so policy tests can flip the variable per call.
+const resolveLang = (lang) => String(process.env.DSH_PUSH_LANG ?? lang ?? 'zh') === 'en' ? 'en' : 'zh'
 const COPY = {
   zh: {
     lastTool: '最后执行了 {tool}',
@@ -82,7 +69,6 @@ const COPY = {
     turnEndBody: 'The agent finished the current turn'
   }
 }
-const T = COPY[LANG]
 
 // The model-facing tool of @deepseek-ai/dsh-tool-ask-user. Its `tool/call`
 // session event is appended BEFORE dispatch (dsh-agent-loop appendToolCall),
@@ -105,16 +91,19 @@ const ASK_USER_TOOL = 'ask_user_question'
 // 5000ms covers a machine answerer with margin while still reaching a phone
 // promptly when a human really is needed. Raise it if your answerer is slower
 // than that; the cost of a longer window is only that genuine prompts notify
-// later.
-const APPROVAL_PENDING_MS = Number(
-  process.env.DSH_PUSH_APPROVAL_GRACE_MS ?? FILE.pushApprovalGraceMs ?? 5000
-)
+// later. Not part of the T12 config table: DSH_PUSH_APPROVAL_GRACE_MS and the
+// legacy `pushApprovalGraceMs` file key keep working as before, read per
+// apply() so tests can shrink the window.
+function approvalPendingMs(fileConfig) {
+  return Number(process.env.DSH_PUSH_APPROVAL_GRACE_MS ?? fileConfig.pushApprovalGraceMs ?? 5000)
+}
 
 // Low-level sender shared by every leg: POSTs to the gateway's local
 // /pwa/push/send, which does the actual VAPID + aes128gcm encrypted delivery
 // to every subscribed device and replies { ok, sent, failed }.
-async function sendPush(title, body) {
-  const res = await fetch(`http://127.0.0.1:${GATEWAY_PORT}/pwa/push/send`, {
+// gatewayPort comes from the resolved config's `port` (default 3088).
+async function sendPush(title, body, gatewayPort) {
+  const res = await fetch(`http://127.0.0.1:${gatewayPort}/pwa/push/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, body: body || '' })
@@ -153,7 +142,10 @@ export function assistantText(message) {
 // Summary of the closing turn, from the session's append-only event log:
 // the LAST assistant message that produced real text, or — when the whole
 // turn was tool work with no prose — the last tool name. Never thinking text.
-export function turnSummary(events, turn) {
+// lang is the resolved language ('en' | 'zh'); omitted (tests, ad-hoc calls)
+// it falls back to DSH_PUSH_LANG, then Chinese.
+export function turnSummary(events, turn, lang) {
+  const copy = COPY[resolveLang(lang)]
   if (!Array.isArray(events)) return ''
   let lastTool = ''
   for (let i = events.length - 1; i >= 0; i--) {
@@ -168,7 +160,7 @@ export function turnSummary(events, turn) {
       lastTool = ev.data.name
     }
   }
-  return lastTool ? T.lastTool.replace('{tool}', lastTool) : ''
+  return lastTool ? copy.lastTool.replace('{tool}', lastTool) : ''
 }
 
 // First question of an ask_user_question call, from the raw (unparsed)
@@ -193,8 +185,7 @@ export function sessionEvents(session) {
   if (session && typeof session.snapshotEvents === 'function') {
     // ponytail: snapshotEvents() with no argument copies the WHOLE event log
     // on every call. That is acceptable here — this branch only runs when
-    // INCLUDE_SUMMARY is on (dsh-push.mjs:53, off by default) and at most once
-    // per turn end. Slicing would need the turn's start seq, and the
+    // includeSummary is on (off by default) and at most once per turn end. Slicing would need the turn's start seq, and the
     // agent/turn-stopping payload carries none: its emitter (0.1.2
     // dsh-agent-loop) sends only `{ turn, signal }` plus the injected
     // `agent` — a turn NUMBER, not an event-log seq, and the two are not the
@@ -217,10 +208,13 @@ const skip = (reason) => ({ shouldNotify: false, title: '', body: '', reason })
  *   summary         already-extracted turn summary  ('turn-end')
  *   toolName        tool awaiting approval          ('approval')
  *   question        pending question text           ('question')
- * @param {object} cfg { turnEndEnabled, debounceMs, includeSummary }
+ * @param {object} cfg { turnEndEnabled, debounceMs, includeSummary, lang }
+ *   lang is the resolved notification language ('en' | 'zh'); when absent
+ *   (policy tests build their own cfg) DSH_PUSH_LANG decides, else Chinese.
  * @returns {{shouldNotify: boolean, title: string, body: string, reason: string}}
  */
 export function decideNotification(input, cfg) {
+  const copy = COPY[resolveLang(cfg.lang)]
   const debounced = (input.now - input.lastSent) < cfg.debounceMs
 
   switch (input.kind) {
@@ -229,15 +223,15 @@ export function decideNotification(input, cfg) {
     case 'approval':
       return {
         shouldNotify: true,
-        title: T.approvalTitle,
-        body: input.toolName ? T.approvalBody.replace('{tool}', input.toolName) : T.approvalBodyPlain,
+        title: copy.approvalTitle,
+        body: input.toolName ? copy.approvalBody.replace('{tool}', input.toolName) : copy.approvalBodyPlain,
         reason: 'approval-pending'
       }
     case 'question':
       return {
         shouldNotify: true,
-        title: T.questionTitle,
-        body: (cfg.includeSummary && input.question) || T.questionBody,
+        title: copy.questionTitle,
+        body: (cfg.includeSummary && input.question) || copy.questionBody,
         reason: 'question-pending'
       }
 
@@ -246,7 +240,7 @@ export function decideNotification(input, cfg) {
       if (!cfg.turnEndEnabled) return skip('turn-end-disabled')
       if ((input.delegationDepth ?? 0) !== 0) return skip('subagent')
       if (debounced) return skip('debounced')
-      return { shouldNotify: true, title: T.turnEndTitle, body: input.summary || T.turnEndBody, reason: 'turn-end' }
+      return { shouldNotify: true, title: copy.turnEndTitle, body: input.summary || copy.turnEndBody, reason: 'turn-end' }
 
     default:
       return skip('unknown-kind')
@@ -298,9 +292,10 @@ const PUSH_TOOL_GLOBAL_MAX = 20
 
 // Registers the push_notify model tool against ctx.tools, if present and not
 // disabled. Throttle state lives in this closure (fresh per apply() call, so
-// tests get isolated state without needing a fresh module import).
-function registerPushTool(ctx, gate) {
-  if (!PUSH_TOOL_ENABLED) {
+// tests get isolated state without needing a fresh module import). Both the
+// enabled flag and the gateway port arrive from apply()'s resolved config.
+function registerPushTool(ctx, gate, pushToolEnabled, gatewayPort) {
+  if (!pushToolEnabled) {
     console.log('[dsh-zen-remote-push] push_notify disabled (DSH_PUSH_TOOL=0 / pushTool:false)')
     return
   }
@@ -310,7 +305,7 @@ function registerPushTool(ctx, gate) {
   // registered. inject() defers the callback until the service exists (the
   // same pattern vision-toolkit uses for webServer) and still degrades
   // gracefully: hosts without a tools service simply never fire it.
-  ctx.inject(['tools'], (toolsCtx) => registerPushToolWith(toolsCtx, toolsCtx.tools, gate))
+  ctx.inject(['tools'], (toolsCtx) => registerPushToolWith(toolsCtx, toolsCtx.tools, gate, gatewayPort))
 
   // Standing reinforcement of the same guidance. Order 150 is the documented
   // tool-guidance band (@deepseek-ai/dsh-system-prompt PromptSection.order).
@@ -325,7 +320,7 @@ function registerPushTool(ctx, gate) {
   })
 }
 
-function registerPushToolWith(ctx, tools, gate) {
+function registerPushToolWith(ctx, tools, gate, gatewayPort) {
   if (!tools) {
     console.log('[dsh-zen-remote-push] "tools" service not present — push_notify not registered')
     return
@@ -396,7 +391,7 @@ function registerPushToolWith(ctx, tools, gate) {
       // why it dropped a call.
       gate.arm(now)
       try {
-        const result = await sendPush(args.title, args.body)
+        const result = await sendPush(args.title, args.body, gatewayPort)
         return { delivered: (result && typeof result.sent === 'number') ? result.sent : 0 }
       } catch (e) {
         console.warn(`[dsh-zen-remote-push] push_notify send failed: ${String(e && e.message || e)}`)
@@ -409,8 +404,26 @@ function registerPushToolWith(ctx, tools, gate) {
 
 // ---------------------------------------------------------------------------
 
-export function apply(ctx) {
-  const cfg = { turnEndEnabled: TURN_END_ENABLED, debounceMs: DEBOUNCE_MS, includeSummary: INCLUDE_SUMMARY }
+export function apply(ctx, config) {
+  // The input is ALWAYS re-resolved, whatever it is: the main entry passes
+  // its already-resolved effective values (idempotent — legal values stay
+  // put), while an old-style standalone load passing `{}` or a partial row
+  // still gets env and lan-gate.config.json their say instead of being
+  // masked by whatever the object happened to contain. Precedence:
+  // env > row > lan-gate.config.json > defaults (src/config.ts).
+  const values = resolveConfig(config ?? {}, readFileConfig(), process.env).values
+  const gatewayPort = Number(values.port ?? 3088)
+  const events = String(values.pushEvents ?? 'agent/turn-stopping').split(',').map((s) => s.trim()).filter(Boolean)
+  const lang = resolveLang(values.lang)
+  // Legacy knob, deliberately outside the T12 config table: honored from
+  // env/file exactly as before so existing files keep working.
+  const graceMs = approvalPendingMs(readFileConfig())
+  const cfg = {
+    turnEndEnabled: values.pushTurnEnd === true,
+    debounceMs: Number(values.pushDebounceMs ?? 15000),
+    includeSummary: values.pushSummary === true,
+    lang
+  }
 
   // The one piece of mutable state: when the last push went out. Wrapped so
   // every leg runs the same pure decision and shares the same debounce clock.
@@ -426,7 +439,7 @@ export function apply(ctx) {
   const fire = (input) => {
     const decision = gate.decide(input)
     // Best-effort; never raise into the host.
-    if (decision.shouldNotify) sendPush(decision.title, decision.body).catch(() => {})
+    if (decision.shouldNotify) sendPush(decision.title, decision.body, gatewayPort).catch(() => {})
     return decision
   }
 
@@ -444,10 +457,10 @@ export function apply(ctx) {
     fire({
       kind: 'turn-end',
       delegationDepth: header && header.delegationDepth,
-      summary: INCLUDE_SUMMARY ? turnSummary(sessionEvents(session), payload && payload.turn) : ''
+      summary: cfg.includeSummary ? turnSummary(sessionEvents(session), payload && payload.turn, lang) : ''
     })
   }
-  for (const event of EVENTS) {
+  for (const event of events) {
     try {
       ctx.on(event, onTurnEnd)
     } catch (e) {
@@ -469,7 +482,7 @@ export function apply(ctx) {
         const timer = setTimeout(() => {
           armed.delete(id)
           fire({ kind: 'approval', toolName })
-        }, APPROVAL_PENDING_MS)
+        }, graceMs)
         if (typeof timer.unref === 'function') timer.unref()
         armed.set(id, timer)
       } else if (event.type === 'approval/decided') {
@@ -483,7 +496,7 @@ export function apply(ctx) {
     console.warn(`[dsh-zen-remote-push] cannot listen on "session/event": ${String(e && e.message || e)}`)
   }
 
-  console.log(`[dsh-zen-remote-push] approval/question notifications on (approval grace ${APPROVAL_PENDING_MS}ms); turn-end (${EVENTS.join(', ')}) ${TURN_END_ENABLED ? 'on' : 'off — set DSH_PUSH_TURN_END=1 to enable'}`)
+  console.log(`[dsh-zen-remote-push] approval/question notifications on (approval grace ${graceMs}ms); turn-end (${events.join(', ')}) ${cfg.turnEndEnabled ? 'on' : 'off — set DSH_PUSH_TURN_END=1 to enable'}`)
 
-  registerPushTool(ctx, gate)
+  registerPushTool(ctx, gate, values.pushTool !== false, gatewayPort)
 }
