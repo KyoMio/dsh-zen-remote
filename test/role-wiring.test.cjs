@@ -18,9 +18,11 @@
 const { test } = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
+const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
+const { request } = require('./util.cjs')
 
 const INDEX_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'index.js')).href
 const SHARE_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'share-export.js')).href
@@ -166,6 +168,96 @@ test("role 'client' mounts all three routes through a real inject and never call
   index.apply(hostCtx, {})
   assert.equal(pluginCalls.length, 2, 'the host role loads gateway and push on top of the routes')
   assert.equal(hostRoutes.length, 3)
+})
+
+test('admin routes register on the host role only', async () => {
+  const index = await import(INDEX_URL)
+  const PREFIX = '/_dsh/zen-remote/admin'
+
+  // A fake context whose inject EXECUTES whenever every service exists —
+  // including `connection`, which only the admin routes (T14) need. The
+  // earlier three-route test runs WITHOUT a connection service, which is the
+  // Electron shape: there the admin routes stay unmounted on either role,
+  // so the role gate is only observable with the service present.
+  function ctxRecording(routes) {
+    const services = {
+      logger: { warn() {} },
+      webServer: { register: (route) => { routes.push(route); return () => {} } },
+      sessions: { get: () => undefined },
+      sessionQuery: {},
+      connection: { admit: () => ({ peer: {} }) },
+    }
+    const ctx = {
+      plugin() {},
+      effect(fn) { fn() },
+      inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
+    }
+    return ctx
+  }
+
+  const clientRoutes = []
+  index.apply(ctxRecording(clientRoutes), { role: 'client' })
+  assert.equal(clientRoutes.filter((r) => String(r.path).startsWith(PREFIX)).length, 0, "the client role must not register admin routes")
+
+  const hostRoutes = []
+  index.apply(ctxRecording(hostRoutes), {})
+  const adminRoutes = hostRoutes.filter((r) => String(r.path).startsWith(PREFIX))
+  assert.equal(adminRoutes.length, 1, 'the host role registers the admin prefix route')
+  assert.equal(adminRoutes[0].kind, 'prefix')
+})
+
+test('the admin handler resolves config per request, volatile fields included', async () => {
+  const index = await import(INDEX_URL)
+  // A port that is closed NOW, so the handler's status call refuses instantly
+  // and this test only watches config.values — it must never reach a real
+  // gateway on 3088.
+  const dead = http.createServer()
+  await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve))
+  const deadPort = dead.address().port
+  await new Promise((resolve) => dead.close(resolve))
+
+  let serverName = 'Name-Before'
+  const row = {
+    port: deadPort,
+    // The loader wraps volatile fields in { get() } references before apply()
+    // ever sees the row (src/config.ts unwrapVolatile) — this is that shape,
+    // with the returned value mutable so the test can age it mid-stream.
+    serverName: { get: () => serverName },
+  }
+  const routes = []
+  const services = {
+    logger: { warn() {} },
+    webServer: { register: (route) => { routes.push(route); return () => {} } },
+    sessions: { get: () => undefined },
+    sessionQuery: {},
+    connection: { admit: () => ({ peer: {} }) },
+  }
+  const ctx = {
+    plugin() {},
+    effect(fn) { fn() },
+    inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
+  }
+  index.apply(ctx, row)
+
+  const adminRoute = routes.find((r) => String(r.path).startsWith('/_dsh/zen-remote/admin'))
+  assert.ok(adminRoute, 'the host role registers the admin route')
+  const server = http.createServer((req, res) => { void adminRoute.handler(req, res) })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const port = server.address().port
+    const first = JSON.parse((await request(port, { method: 'GET', path: '/_dsh/zen-remote/admin/status' })).body)
+    assert.equal(first.config.values.serverName, 'Name-Before')
+
+    // Same process, same handler, same row object: only the volatile getter's
+    // return value changed. An apply-time snapshot would keep answering the
+    // old name (T14-fix item 4).
+    serverName = 'Name-After'
+    const second = JSON.parse((await request(port, { method: 'GET', path: '/_dsh/zen-remote/admin/status' })).body)
+    assert.equal(second.config.values.serverName, 'Name-After', 'config must be resolved per request')
+    assert.equal(second.config.sources.serverName, 'row')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
 })
 
 test('resolveRole normalizes to host or client', async () => {
