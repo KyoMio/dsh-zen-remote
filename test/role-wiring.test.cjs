@@ -240,6 +240,10 @@ test('T16: client routes register on the client role only', async () => {
     }
     const ctx = {
       plugin() {},
+      // The host role (since T22c) subscribes to session/event and warns
+      // through ctx.logger if that fails; both must exist on this fake.
+      on() { return () => {} },
+      logger: { warn() {} },
       effect(fn) { fn() },
       inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
     }
