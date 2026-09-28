@@ -23,6 +23,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
+// The two sub-plugin entries the host role loads. They ship as plain .mjs at
+// the package root, and `..` resolves there both from this file (via the
+// hand-written lan-gate.d.mts / dsh-push.d.mts declarations) and from the
+// built lib/index.js (via the real files).
+import * as gateway from '../lan-gate.mjs'
+import * as push from '../dsh-push.mjs'
 
 /** Exact route the phone composer POSTs one file body to. */
 export const UPLOAD_ROUTE = '/_dsh/mobile-nav/upload'
@@ -46,6 +52,12 @@ const MAX_COLLISION_TRIES = 100
 
 /** Host half config. */
 export interface MobileNavConfig {
+  /** Which parts of the plugin run in this DSH process. `'host'` — the
+   * default, and the fallback for any value that is not exactly `'client'` —
+   * additionally loads the gateway and push sub-plugins; `'client'` mounts
+   * only the three host routes, for setups where another DSH process owns
+   * the channel. */
+  role?: 'host' | 'client'
   /** Max upload body in bytes; larger bodies get 413. Default {@link DEFAULT_MAX_UPLOAD_BYTES}. */
   maxUploadBytes?: number
   /** Fold each turn's process at every viewport width, not just below the
@@ -81,6 +93,16 @@ export interface MobileNavConfig {
 export function clamped(key: string, value: number | undefined, min: number, max: number): Record<string, number> {
   if (typeof value !== 'number' || !Number.isFinite(value)) return {}
   return { [key]: Math.min(Math.max(value, min), max) }
+}
+
+/**
+ * The normalized role behind the row's `role` knob. Anything but the exact
+ * string `'client'` means host, so a typo degrades to the full plugin rather
+ * than silently dropping the gateway and push halves. Exported for
+ * test/role-wiring.test.cjs.
+ */
+export function resolveRole(config: MobileNavConfig | undefined): 'host' | 'client' {
+  return config?.role === 'client' ? 'client' : 'host'
 }
 
 /**
@@ -367,11 +389,23 @@ export async function handleUpload(
  * exist. Both are injected INSIDE apply rather than declared as a top-level
  * `inject`, so the plugin row still loads (and the browser half still ships)
  * in a composition without them — Electron carries no webServer.
+ *
+ * On the host role (the default) this row also loads the gateway and push
+ * sub-plugins, each with the SAME config object this apply received. Cordis
+ * honors a sub-plugin's own `inject` before calling its apply and routes
+ * fiber failures into the context logger, so a fire-and-forget call is the
+ * whole contract. The optional call exists for the route tests' fake
+ * contexts, which predate this wiring and carry no `plugin`; production
+ * cordis contexts always do.
  * @param ctx - host plugin context.
  * @param config - optional body cap override.
  */
 export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   const maxBytes = config.maxUploadBytes ?? DEFAULT_MAX_UPLOAD_BYTES
+  if (resolveRole(config) === 'host') {
+    ctx.plugin?.(gateway, config)
+    ctx.plugin?.(push, config)
+  }
   ctx.inject(['webServer', 'sessions'], (webCtx) => {
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact',
