@@ -315,6 +315,32 @@ test('an answerer slower than the grace still notifies — the window is a bet, 
   } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
 })
 
+test('apply(ctx, {}) re-resolves config: DSH_PUSH_TURN_END=1 still lands', async () => {
+  // T12-fix: an old-style caller passing an empty row object must not mask
+  // the env and file layers — apply re-resolves whatever it receives, and
+  // re-resolving an already-resolved values object is a no-op. (Env wins over
+  // any real ~/.dsh file too, so this stays machine-independent.)
+  process.env.DSH_PUSH_TURN_END = '1'
+  const mod = await freshImport()
+  const listeners = new Map()
+  mod.apply({
+    on: (e, cb) => { listeners.set(e, cb); return () => {} },
+    inject: () => {},
+    effect: (fn) => fn()
+  }, {})
+  const onTurnEnd = listeners.get('agent/turn-stopping')
+  assert.ok(onTurnEnd, 'turn-end leg still wired')
+
+  const sent = []
+  const original = global.fetch
+  global.fetch = async (url, opts) => { sent.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) } }
+  try {
+    onTurnEnd({ agent: { session: { header: {} } } })
+    await new Promise((r) => setTimeout(r, 100))
+    assert.strictEqual(sent.length, 1, 'the env layer must survive an empty config object')
+  } finally { global.fetch = original; delete process.env.DSH_PUSH_TURN_END }
+})
+
 test('turn-end: an unreadable session header stays quiet instead of assuming top level', () => {
   // decideNotification treats undefined as top level, which is correct for a
   // header that simply omits the field. The listener must therefore never

@@ -16,6 +16,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
+export { Config, resolveRole } from './config.js';
 /** Exact route the phone composer POSTs one file body to. */
 export declare const UPLOAD_ROUTE = "/_dsh/mobile-nav/upload";
 /** Exact route the browser GETs the plugin row's client-facing knobs from.
@@ -67,13 +68,6 @@ export interface MobileNavConfig {
  */
 export declare function clamped(key: string, value: number | undefined, min: number, max: number): Record<string, number>;
 /**
- * The normalized role behind the row's `role` knob. Anything but the exact
- * string `'client'` means host, so a typo degrades to the full plugin rather
- * than silently dropping the gateway and push halves. Exported for
- * test/role-wiring.test.cjs.
- */
-export declare function resolveRole(config: MobileNavConfig | undefined): 'host' | 'client';
-/**
  * Accept a state-changing request only from this DSH Web application's origin.
  *
  * The gateway half rewrites `Origin`/`Host` to the upstream origin
@@ -124,12 +118,12 @@ export declare function handleUpload(ctx: Context, maxBytes: number, req: Incomi
  * in a composition without them — Electron carries no webServer.
  *
  * On the host role (the default) this row also loads the gateway and push
- * sub-plugins, each with the SAME config object this apply received. Cordis
- * honors a sub-plugin's own `inject` before calling its apply and routes
- * fiber failures into the context logger, so a fire-and-forget call is the
- * whole contract. The optional call exists for the route tests' fake
- * contexts, which predate this wiring and carry no `plugin`; production
- * cordis contexts always do.
+ * sub-plugins, each with the RESOLVED config — every field merged from env >
+ * row > lan-gate.config.json > defaults (src/config.ts) — not the raw row,
+ * so the halves see the same effective values the row does. Cordis honors a
+ * sub-plugin's own `inject` before calling its apply and routes fiber
+ * failures into the context logger, so a fire-and-forget call is the whole
+ * contract. The route tests' fake contexts carry a no-op `plugin` for it.
  * @param ctx - host plugin context.
  * @param config - optional body cap override.
  */

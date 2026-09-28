@@ -20,8 +20,10 @@ export const inject = ['subprocess', 'connection', 'webServer']
 const here = dirname(fileURLToPath(import.meta.url))
 const serverFile = join(here, 'lib', 'lan-gate-server.cjs')
 
-// Optional cordis config (set on the insert row in your profile patch):
-//   { port, host, targetPort, rateLimit, trustedProxies, vapidSubject }
+// Optional cordis config (set on the insert row in your profile patch, or
+// through the DSH settings form — T12 resolves the row against
+// lan-gate.config.json and env before handing it here):
+//   { port, host, targetPort, rateLimit, trustedProxies, vapidSubject, lang }
 // Values are translated to LAN_GATE_* env vars; explicit env vars win.
 const CONFIG_ENV = {
   port: 'LAN_GATE_PORT',
@@ -30,21 +32,30 @@ const CONFIG_ENV = {
   rateLimit: 'LAN_GATE_RATE_LIMIT',
   trustedProxies: 'LAN_GATE_TRUSTED_PROXIES',
   vapidSubject: 'LAN_GATE_VAPID_SUBJECT',
+  lang: 'LAN_GATE_LANG',
 }
 
 export function apply(ctx, config) {
   const timer = ctx.get('timer')
   let handle = null
+  // 行销毁标志：resolveExecutable 的 await 期间插件行可能正好被销毁（配置变更
+  // 重启），此时清理函数看到的 handle 还是 null、无从 terminate；等 await 返回
+  // 后照样 spawn 的话，子进程从此没人管（子进程归 subprocess 服务管，不随调用
+  // 方插件自动清理）。所以在 await 之后、spawn 之前补一次检查，spawn 之后再兜
+  // 一层——真发生时宁可立刻 terminate，也不留孤儿。
+  let disposed = false
 
   /* 子进程 env：宿主环境的副本，叠加本行的决策。不再写回宿主 process.env——
      插件行不该有进程级副作用（此前 config 翻译和端口回写都会泄给宿主和其它
-     插件行）。变量解析优先级与网关子进程原有约定一致：
-     显式 env > cordis config > 宿主实际监听端口 > 3080。 */
+     插件行）。传入的 config 是主入口解析后的值，环境变量在解析层已经考虑过
+     （非法的被跳过），所以有值就无条件覆盖宿主里的同名变量——否则一个手滑
+     export 的非法 LAN_GATE_PORT 会反过来盖掉行配置；没有值（undefined）的字
+     段才保留宿主原值。 */
   const childEnv = () => {
     const env = { ...process.env }
     if (config && typeof config === 'object') {
       for (const [key, envName] of Object.entries(CONFIG_ENV)) {
-        if (config[key] !== undefined && config[key] !== null && env[envName] === undefined) {
+        if (config[key] !== undefined && config[key] !== null) {
           env[envName] = String(config[key])
         }
       }
@@ -71,6 +82,7 @@ export function apply(ctx, config) {
         ? ctx.connection.authenticatedUrl('http://127.0.0.1:' + targetPort)
         : undefined
       const nodePath = await ctx.subprocess.resolveExecutable('node')
+      if (disposed) return // 行在 await 期间被销毁：不再 spawn
       if (tokenUrl !== undefined) env['LAN_GATE_UPSTREAM_TOKEN_URL'] = tokenUrl
       else delete env['LAN_GATE_UPSTREAM_TOKEN_URL'] // 0.1.1 模式：变量不能残留
       handle = ctx.subprocess.spawn({
@@ -84,6 +96,13 @@ export function apply(ctx, config) {
         },
         graceMs: 3000
       })
+      if (disposed) {
+        // spawn 与本检查之间没有 await，外部代码插不进来；这层是给未来改动
+        // 留的保险——一旦 disposed 为真，立刻收回刚拉起的孩子。
+        try { handle.terminate() } catch (e) { /* ignore */ }
+        handle = null
+        return
+      }
       handle.done.then((outcome) => {
         console.log(`[dsh-zen-remote-gateway] gateway exited code=${outcome.exitCode} signal=${outcome.signal}`)
       }).catch((err) => {
@@ -106,6 +125,7 @@ export function apply(ctx, config) {
 
   ctx.effect(() => {
     return () => {
+      disposed = true
       if (handle) { try { handle.terminate() } catch (e) { /* ignore */ } }
     }
   })
