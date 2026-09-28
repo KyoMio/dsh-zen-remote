@@ -3,6 +3,7 @@
  * HTTP surface. */
 'use strict'
 const http = require('node:http')
+const net = require('node:net')
 const os = require('node:os')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -130,6 +131,69 @@ async function pairDevice(port, name) {
   return { claim, cookie: cookieFrom(claim), id: JSON.parse(claim.body).id }
 }
 
+// Desktop-client pairing: mints a desktop-client code locally, redeems it via
+// /lan-gate/pair/claim-desktop, returns the Bearer token + device id.
+async function pairDesktop(port, name) {
+  const gen = await request(port, { method: 'POST', path: '/lan-gate/pair', body: { role: 'desktop-client' } })
+  const code = JSON.parse(gen.body).code
+  const claim = await request(port, { method: 'POST', path: '/lan-gate/pair/claim-desktop', headers: REMOTE_HEADERS, body: { code, name: name || '台式机' } })
+  const j = JSON.parse(claim.body)
+  return { gen, claim, j, token: j.token, id: j.id }
+}
+
+// Mock DSH upstream that RECORDS every request and every WebSocket upgrade
+// (and serves a trivial page): the gateway only pipes raw bytes, no frames
+// are exchanged. opts.statusFor(path, req) may return a status code to force
+// instead of the default 200. close() first destroys the tunnel sockets: a
+// revoked tunnel leaves this side half-open, and server.close() would wait
+// on it forever.
+function startRecordingTarget(port, opts) {
+  const o = opts || {}
+  const seen = []
+  const upgrades = []
+  const tunnels = new Set()
+  const server = http.createServer((req, res) => {
+    seen.push({ method: req.method, path: req.url, headers: req.headers })
+    const forced = o.statusFor ? o.statusFor(req.url || '/', req) : 0
+    if (forced) { res.writeHead(forced, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('upstream-' + forced); return }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    res.end('<!doctype html><html lang="en"><head><meta charset="utf-8"></head><body><main>roles-ok</main></body></html>')
+  })
+  server.on('upgrade', (req, socket) => {
+    upgrades.push({ path: req.url, headers: req.headers })
+    tunnels.add(socket)
+    socket.on('close', () => tunnels.delete(socket))
+    const crypto = require('node:crypto')
+    const accept = crypto.createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n')
+    socket.on('error', () => {})
+  })
+  const close = () => new Promise((resolve) => {
+    tunnels.forEach((s) => { try { s.destroy() } catch (e) {} })
+    server.close(resolve)
+  })
+  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve({ server, seen, upgrades, close })))
+}
+
+// Raw-socket WebSocket upgrade against the gateway: resolves as soon as the
+// first response line is readable (101 = tunnel up, 403 = refused). The
+// socket is returned open so the caller can wait for it to be closed.
+function rawUpgrade(port, urlPath, headers) {
+  return new Promise((resolve) => {
+    const lines = ['GET ' + urlPath + ' HTTP/1.1', 'Host: 127.0.0.1', 'Connection: Upgrade', 'Upgrade: websocket', 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==', 'Sec-WebSocket-Version: 13']
+    for (const k of Object.keys(headers || {})) lines.push(k + ': ' + headers[k])
+    const sock = net.connect(port, '127.0.0.1', () => { sock.write(lines.join('\r\n') + '\r\n\r\n') })
+    let buf = ''
+    let done = false
+    let timer = null
+    const finish = () => { if (done) return; done = true; if (timer) clearTimeout(timer); resolve({ sock, buf }) }
+    timer = setTimeout(finish, 3000)
+    sock.on('data', (d) => { buf += d.toString('utf8'); if (/HTTP\/1\.1 (101|403|429)/.test(buf)) finish() })
+    sock.on('close', finish)
+    sock.on('error', finish)
+  })
+}
+
 // Awaits child exit + server close so the next test can rebind the same ports.
 function stopAll(target, child) {
   return new Promise((resolve) => {
@@ -144,4 +208,4 @@ function stopAll(target, child) {
   })
 }
 
-module.exports = { GATEWAY, REMOTE_HEADERS, startMockTarget, startMockAuthTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, stopAll }
+module.exports = { GATEWAY, REMOTE_HEADERS, startMockTarget, startMockAuthTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, pairDesktop, startRecordingTarget, rawUpgrade, stopAll }
