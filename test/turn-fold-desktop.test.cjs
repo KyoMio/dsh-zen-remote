@@ -22,7 +22,9 @@ const clientConfig = read('src', 'client', 'client-config.ts')
 test('the host republishes turnFoldDesktop at the client-config route', () => {
   assert.match(host, /turnFoldDesktop\?: boolean/, 'the config knob exists')
   assert.match(host, /CLIENT_CONFIG_ROUTE = '\/_dsh\/mobile-nav\/client-config'/, 'route path is fixed')
-  assert.match(host, /turnFoldDesktop: config\.turnFoldDesktop === true/, 'the route serves the knob as a strict boolean')
+  // T17: the knob is a volatile row field ({ get() } wrapped), so the route
+  // unwraps it live per request and keeps serving a strict boolean.
+  assert.match(host, /turnFoldDesktop: unwrapVolatile\(config\.turnFoldDesktop\) === true/, 'the route serves the knob as a strict boolean')
   const route = clientConfig.match(/export const CLIENT_CONFIG_ROUTE = '([^']+)'/)
   assert.ok(route, 'the client mirrors the route path')
   assert.ok(host.includes(`'${route[1]}'`), 'client and host route strings agree')

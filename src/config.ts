@@ -389,34 +389,41 @@ export function resolveRole(row: unknown): 'host' | 'client' {
  * promise that a botched `role` degrades to host instead of killing the
  * plugin. So this schema only declares: WHICH fields exist (the form's
  * field list), WHICH one is a secret (`deviceToken`, redacted from every
- * settings wire surface), and WHICH are volatile (edits apply live).
+ * settings wire surface), and that every field is volatile (live).
  *
  * No `.default()` anywhere: a schema default would be written into every row
  * at load and `lan-gate.config.json`'s fallback would never get a turn — the
  * real defaults live in {@link DEFAULTS}.
  *
- * Exactly five fields are volatile — `serverName`, `idleHours`,
- * `autoShareNewSessions`, `serverUrl`, `deviceToken` — because later tasks
- * read them at operation time (through {@link unwrapVolatile}), so an edit
- * applies without restarting the row. Everything else is read once at
- * `apply()` (the gateway's values even become the child process's
- * environment), so those intentionally require a full row restart, which
- * also restarts the gateway and push halves.
+ * EVERY field is volatile, and that is not an optimization: DSH 0.2.0's
+ * settings service builds the form from volatile fields ONLY (its
+ * `volatileForm` drops non-volatile ones, and a `mutate` outside the volatile
+ * subtree is refused), so a non-volatile field is invisible in the settings
+ * page and unsaveable from it — T12 made the restart-required fields
+ * non-volatile and the whole settings surface went dark for them. The cost
+ * is that the loader hands every volatile field to `apply()` as a `{ get() }`
+ * wrapper instead of the value, so EVERY row read goes through
+ * {@link unwrapVolatile} at use time (or through {@link resolveConfig},
+ * which unwraps per field). "Changed value requires a restart" therefore
+ * cannot ride the volatility flag: the fields in
+ * `RESTART_FIELDS` (src/restart-watcher.ts) are re-resolved on a 2-second
+ * poll and reload the plugin row when their fingerprint moves — a row reload
+ * re-runs `apply()`, which restarts the gateway child and the push half.
  */
 export const Config = z.object({
-  role: z.any(),
-  port: z.any(),
-  host: z.any(),
-  targetPort: z.any(),
-  rateLimit: z.any(),
-  trustedProxies: z.any(),
-  vapidSubject: z.any(),
-  lang: z.any(),
-  pushEvents: z.any(),
-  pushDebounceMs: z.any(),
-  pushSummary: z.any(),
-  pushTurnEnd: z.any(),
-  pushTool: z.any(),
+  role: z.any().volatile(),
+  port: z.any().volatile(),
+  host: z.any().volatile(),
+  targetPort: z.any().volatile(),
+  rateLimit: z.any().volatile(),
+  trustedProxies: z.any().volatile(),
+  vapidSubject: z.any().volatile(),
+  lang: z.any().volatile(),
+  pushEvents: z.any().volatile(),
+  pushDebounceMs: z.any().volatile(),
+  pushSummary: z.any().volatile(),
+  pushTurnEnd: z.any().volatile(),
+  pushTool: z.any().volatile(),
   serverName: z.any().volatile(),
   idleHours: z.any().volatile(),
   autoShareNewSessions: z.any().volatile(),
@@ -425,10 +432,11 @@ export const Config = z.object({
   // settings wire surface, like the verifier plugin's API key.
   serverUrl: z.any().volatile(),
   deviceToken: z.string().role('secret').volatile(),
-  // Interface-half knobs, read straight off the row by src/index.ts.
-  turnFoldDesktop: z.any(),
-  keyboardLiftRatio: z.any(),
-  keyboardLiftMaxPx: z.any(),
-  keyboardSafetyPadPx: z.any(),
-  maxUploadBytes: z.any(),
+  // Interface-half knobs, read live off the row by src/index.ts (unwrapped
+  // per request, like every volatile field).
+  turnFoldDesktop: z.any().volatile(),
+  keyboardLiftRatio: z.any().volatile(),
+  keyboardLiftMaxPx: z.any().volatile(),
+  keyboardSafetyPadPx: z.any().volatile(),
+  maxUploadBytes: z.any().volatile(),
 })

@@ -40,6 +40,11 @@ export const SHARE_EXPORT_ROUTE = '/_dsh/mobile-nav/share-export'
  * careless `turns=99999999` from quietly meaning "the whole log". */
 export const MAX_SHARE_TURNS = 500
 
+/** What `connection.admit` answers: the operator peer, or the refusal status.
+ * Declared locally (same union as admin-routes.ts's AdminAdmission) so this
+ * module stays import-free of the entry file. */
+export type ShareExportAdmission = { readonly peer: unknown } | { readonly rejection: 401 | 403 }
+
 /** One exportable content block of a transcript row. */
 export type ShareBlock =
   | { kind: 'text'; text: string }
@@ -391,8 +396,28 @@ function sliceLastTurns(rows: readonly FoldedRow[], count: number): ShareTurn[] 
  * @param ctx - host context carrying the sessionQuery service and logger.
  * @param req - inbound request; no body is read.
  * @param res - the response this call owns end to end.
+ * @param admit - DSH's connection-service admission, passed by the apply()
+ *   wiring (T17): webServer routes skip DSH's /api authentication, so every
+ *   request must ask the connection service itself, its refusal relayed
+ *   verbatim — same first wall as the admin and client routes. Optional only
+ *   for the direct-drive tests; production always passes it.
  */
-export async function handleShareExport(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleShareExport(
+  ctx: Context,
+  req: IncomingMessage,
+  res: ServerResponse,
+  admit?: (req: IncomingMessage) => ShareExportAdmission,
+): Promise<void> {
+  if (admit !== undefined) {
+    const admission = admit(req)
+    if ('rejection' in admission) {
+      responseJson(res, admission.rejection, {
+        ok: false,
+        error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
+      })
+      return
+    }
+  }
   if (req.method !== 'GET') {
     res.setHeader('Allow', 'GET')
     responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })

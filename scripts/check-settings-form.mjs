@@ -5,9 +5,12 @@
 // `gatewayStatus` is the HTTP status the route saw (null = no answer).
 // Covers the status -> view mapping, the staged row form against a FAKE
 // shared form object (validation, env locking, the effective-value display
-// baseline, set/unset plans, the expectedRevision fence), and the T16 client
+// baseline, set/unset plans, the expectedRevision fence), the T16 client
 // group's pure pieces: the client status -> view mapping, the pairing-code
-// input normalization, the direct pairing writes and the latest-wins gate.
+// input normalization, the direct pairing writes and the latest-wins gate,
+// the T16-fix 3 role/poll decisions extended by T17's two-level role (saved
+// row role first, the client-config probe as fallback), and T17's
+// restartPending flag behind the plugin-reload note.
 //
 // Run: node scripts/check-settings-form.mjs   (needs Node >= 23.6 type stripping)
 import assert from 'node:assert/strict'
@@ -528,27 +531,62 @@ test('the device token rides the snapshot as presence only, and rowValue reads t
   assert.equal(form.getSnapshot().deviceToken.configured, true, 'the describe follow republishes')
 })
 
-// ---- T16-fix 3: the page's role + poll-source decisions -----------------------
+// ---- T16-fix 3 + T17: the page's role and status-source decisions -----------
 
 test('savedRowRole reads the SAVED role from the snapshot, never a display draft', () => {
   // The schema-resolved section carries the role…
   assert.equal(savedRowRole({ value: { role: 'client' }, user: {} }), 'client')
   // …but a row value kept only in the raw user layer counts too…
   assert.equal(savedRowRole({ value: {}, user: { role: 'client' } }), 'client')
-  // …and an empty row — or anything but the exact 'client' — means host.
-  assert.equal(savedRowRole({ value: {}, user: {} }), 'host')
+  // …an explicit host is known…
   assert.equal(savedRowRole({ value: { role: 'host' }, user: {} }), 'host')
-  assert.equal(savedRowRole({ value: { role: 'Client' }, user: {} }), 'host', 'exact match only')
-  assert.equal(savedRowRole({}), 'host')
-  assert.equal(savedRowRole({ value: undefined, user: undefined }), 'host')
+  assert.equal(savedRowRole({ value: {}, user: { role: 'host' } }), 'host')
+  // …and T17: a row without any role — or with an unrecognized one — answers
+  // undefined, meaning "ask the client-config probe", NOT a host assumption.
+  assert.equal(savedRowRole({ value: {}, user: {} }), undefined)
+  assert.equal(savedRowRole({ value: { role: 'Client' }, user: {} }), undefined, 'exact match only')
+  assert.equal(savedRowRole({}), undefined)
+  assert.equal(savedRowRole({ value: undefined, user: undefined }), undefined)
 })
 
-test('settingsPollOf: loading polls nothing; client polls client/status only; host polls admin', () => {
+test('settingsPollOf: loading polls nothing; a known row role decides; otherwise wait for the probe', () => {
   assert.equal(settingsPollOf('loading', { value: { role: 'client' } }), 'none', 'the role is not knowable while the mirror loads')
   assert.equal(settingsPollOf('ready', { value: { role: 'client' } }), 'client')
   assert.equal(settingsPollOf('ready', { user: { role: 'client' } }), 'client')
-  assert.equal(settingsPollOf('ready', { value: {} }), 'admin')
-  assert.equal(settingsPollOf('unavailable', { value: {} }), 'admin', 'an unavailable namespace cannot answer the role — host is the default')
+  assert.equal(settingsPollOf('ready', { value: { role: 'host' } }), 'admin')
+  // T17: no row role (the value lives only in lan-gate.config.json) — the
+  // page polls NOTHING until the client-config probe answers, so a file-layer
+  // client never sees a wasted admin/status 404.
+  assert.equal(settingsPollOf('ready', { value: {} }), 'none')
+  assert.equal(settingsPollOf('unavailable', { value: {} }), 'none')
+  assert.equal(settingsPollOf('ready', { value: {} }, 'client'), 'client', 'the probe answers client')
+  assert.equal(settingsPollOf('ready', { value: {} }, 'host'), 'admin', 'the probe answers host')
+  // A stored row role always beats the probe.
+  assert.equal(settingsPollOf('ready', { value: { role: 'host' } }, 'client'), 'admin')
+  assert.equal(settingsPollOf('ready', { value: { role: 'client' } }, 'host'), 'client')
+})
+
+test('the controller falls back to the probed role; a stored row role wins over it', () => {
+  const noRole = new ZenRemoteSettingsForm(fakeScope({ value: {} }).scope)
+  assert.equal(noRole.savedRoleIsClient(), false, 'no row role, no probe yet: host default')
+  assert.equal(noRole.statusPoll(), 'none', 'the poll waits for the probe')
+  noRole.setProbedRole('client')
+  assert.equal(noRole.savedRoleIsClient(), true, 'the probe flips the page to client mode')
+  assert.equal(noRole.statusPoll(), 'client')
+  noRole.setProbedRole('host')
+  assert.equal(noRole.savedRoleIsClient(), false)
+  assert.equal(noRole.statusPoll(), 'admin')
+  noRole.setProbedRole(undefined)
+  assert.equal(noRole.statusPoll(), 'none', 'clearing the probe re-arms the wait')
+
+  const hostRow = new ZenRemoteSettingsForm(fakeScope({ value: { role: 'host' } }).scope)
+  hostRow.setProbedRole('client')
+  assert.equal(hostRow.savedRoleIsClient(), false, 'a stored row role beats a stale probe')
+  assert.equal(hostRow.statusPoll(), 'admin')
+  const clientRow = new ZenRemoteSettingsForm(fakeScope({ user: { role: 'client' } }).scope)
+  clientRow.setProbedRole('host')
+  assert.equal(clientRow.savedRoleIsClient(), true)
+  assert.equal(clientRow.statusPoll(), 'client')
 })
 
 test('the poll source follows a role switch at the NEXT snapshot, admin never on client', () => {
@@ -565,4 +603,38 @@ test('the poll source follows a role switch at the NEXT snapshot, admin never on
   assert.equal(clientForm.savedRoleIsClient(), true)
   assert.equal(clientForm.statusPoll(), 'client')
   assert.equal(clientForm.scopeStatus(), 'ready')
+})
+
+// ---- T17: the plugin-reload note ---------------------------------------------
+
+test('restartPending tracks staged drafts over the restart-required fields only', async () => {
+  // The row layer stores port, so the staged clear below plans an unset.
+  const { scope, state } = fakeScope({ value: { port: 4000 }, user: { port: 4000 } })
+  const form = new ZenRemoteSettingsForm(scope)
+  form.setBaseline(VALUES)
+  assert.equal(form.getSnapshot().restartPending, false, 'nothing staged yet')
+
+  form.stage('serverName', 'renamed')
+  assert.equal(form.getSnapshot().restartPending, false, 'serverName is live-read; no reload')
+
+  form.stage('port', '4001')
+  const pending = form.getSnapshot()
+  assert.equal(pending.restartPending, true, 'a staged port reloads the row')
+  assert.equal(pending.dirty, true)
+
+  form.discard()
+  assert.equal(form.getSnapshot().restartPending, false, 'discard clears the note')
+
+  form.stage('role', 'client')
+  assert.equal(form.getSnapshot().restartPending, true, 'the role is a restart field too')
+  form.resetField('port')
+  assert.equal(form.getSnapshot().restartPending, true, 'a staged clear of a restart field counts as well')
+
+  assert.equal(await form.save(), true)
+  const savedOps = state.mutateCalls[0].ops
+  assert.deepEqual(savedOps, [
+    { op: 'set', path: ['role'], value: 'client' },
+    { op: 'unset', path: ['port'] },
+  ], 'both restart-field drafts landed, in field order')
+  assert.equal(form.getSnapshot().restartPending, false, 'a landed save clears the staged drafts — the reload takes over from here')
 })

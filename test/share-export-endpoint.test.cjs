@@ -573,7 +573,10 @@ test('a fold-stage throw after a successful readSession is a clean 500', async (
 
 /** Fake Cordis context for apply(): inject runs its callback only when every
  * requested service exists (that IS the no-mount path), effect runs eagerly.
- * Pass webServer:false to simulate a composition with no web server at all. */
+ * A `connection` service is present by default (T17: the upload and
+ * share-export routes mount only where it exists); pass one explicitly to
+ * override its admit. Pass webServer:false to simulate a composition with no
+ * web server at all. */
 function makeApplyCtx({ webServer = true, ...services } = {}) {
   const routes = []
   const all = {
@@ -583,6 +586,7 @@ function makeApplyCtx({ webServer = true, ...services } = {}) {
     // (loading the gateway/push halves). The namespace objects are never
     // executed here, so a no-op sink is all the fake context needs.
     plugin: () => {},
+    connection: { admit: () => ({ peer: {} }) },
     ...(webServer ? { webServer: { register: (route) => { routes.push(route); return () => {} } } } : {}),
     ...services,
   }
@@ -614,4 +618,47 @@ test('apply mounts the share route only where sessionQuery exists', async () => 
   const noWeb = makeApplyCtx({ webServer: false, sessions, sessionQuery })
   index.apply(noWeb.ctx)
   assert.equal(noWeb.routes.length, 0)
+})
+
+test('T17: the registered share route admits through the connection service', async () => {
+  const { query } = makeSessionQuery({
+    'sess-live': { session: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
+  })
+
+  // A refusing connection service: the wall answers before anything else —
+  // even a wrong method gets the refusal, not the method check.
+  for (const [admission, method] of [[{ rejection: 401 }, 'GET'], [{ rejection: 403 }, 'GET'], [{ rejection: 401 }, 'POST']]) {
+    const denying = makeApplyCtx({ sessionQuery: query, connection: { admit: () => admission } })
+    index.apply(denying.ctx)
+    const route = denying.routes.find((r) => r.path === share.SHARE_EXPORT_ROUTE)
+    assert.ok(route, 'the route mounts where a connection service exists')
+    const server = createServer((req, res) => { void route.handler(req, res) })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const base = `http://127.0.0.1:${server.address().port}`
+      const response = await fetch(`${base}/_dsh/mobile-nav/share-export?session=sess-live`, { method })
+      assert.equal(response.status, admission.rejection)
+      const body = await response.json()
+      assert.equal(body.ok, false)
+      assert.equal(body.error.code, admission.rejection === 401 ? 'unauthorized' : 'forbidden')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
+  }
+
+  // An admitting service changes nothing else: the exact same envelope the
+  // direct-drive tests assert above.
+  const allowing = makeApplyCtx({ sessionQuery: query })
+  index.apply(allowing.ctx)
+  const allowRoute = allowing.routes.find((r) => r.path === share.SHARE_EXPORT_ROUTE)
+  const server = createServer((req, res) => { void allowRoute.handler(req, res) })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`
+    const ok = await fetch(`${base}/_dsh/mobile-nav/share-export?session=sess-live&range=all`)
+    assert.equal(ok.status, 200)
+    assert.deepEqual(await ok.json(), { ok: true, createdAt: CREATED_AT, turns: EXPECTED_TURNS, truncated: false })
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
 })

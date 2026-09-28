@@ -88,7 +88,7 @@ export declare const zh: {
     readonly 'settings.roleHint': "本 DSH 进程在远程访问体系里的角色。";
     readonly 'settings.roleHost': "主服务端（host）";
     readonly 'settings.roleClient': "子客户端（client）";
-    readonly 'settings.roleRestartNote': "角色变更将在重启 DeepSeek Harness 后生效";
+    readonly 'settings.reloadNote': "保存后插件会自动重载，网关短暂中断";
     readonly 'settings.gatewayTitle': "网关与反代";
     readonly 'settings.gatewayRunning': "运行中 · 端口 {port} · 转发到 {target}";
     readonly 'settings.gatewayDown': "网关未运行";

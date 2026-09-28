@@ -157,15 +157,71 @@ try {
   await rm(trapWorkspace, { recursive: true, force: true })
 
   // Every rejection that reached the body is logged once, so a failing phone
-  // leaves a trail: 2x413, 404, 3x400 query, 1x400 symlink. The 405 and 403
-  // short-circuit before the try block and deliberately log nothing — they are
-  // the two an unpaired scanner can trigger at will.
+  // leaves a trail: 2x413, 404, 3x400 query, 1x400 symlink. The 405, 403 and
+  // (T17) the admission refusals short-circuit before the try block and
+  // deliberately log nothing — they are what an unpaired scanner can trigger
+  // at will, and they would otherwise flood the log.
   assert.equal(logged, 7, `expected the rejections to be logged, saw ${logged}`)
 
   // ---- the workspace holds exactly what was uploaded, nothing partial ------
   assert.deepEqual((await readdir(join(workspace, UPLOAD_DIR))).sort(), [
     'blob.bin', 'evil.txt', 'notes-1.txt', 'notes.txt',
   ])
+
+  // ---- T17: the admission wall the apply() wiring passes in ----------------
+  // The direct drives above pass no admit; production always does (the
+  // connection service, same first wall as the admin/client routes). A
+  // refusing admit answers before anything else — no log, no disk write; an
+  // admitting one leaves every behavior unchanged.
+  // The symlink trap section pointed sessions elsewhere; point them back.
+  ctx.sessions.get = (id) => (id === 'session-live' ? { header: { cwd: workspace } } : undefined)
+  let admitted = 0
+  const admits = (admission) => createServer((req, res) => {
+    void handleUpload(ctx, MAX_BYTES, req, res, () => {
+      if (admission === 'peer') {
+        admitted += 1
+        return { peer: {} }
+      }
+      return { rejection: admission }
+    })
+  })
+  const admitServers = [admits(401), admits(403), admits('peer')].map((server) => server)
+  const admitBases = []
+  for (const server of admitServers) {
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    admitBases.push(`http://127.0.0.1:${server.address().port}`)
+  }
+  try {
+    for (const [i, status] of [401, 403].entries()) {
+      const denied = await fetch(`${admitBases[i]}/_dsh/mobile-nav/upload?session=session-live&name=denied.txt`, {
+        method: 'POST',
+        headers: { origin: admitBases[i] },
+        body: 'x',
+        duplex: 'half',
+      })
+      assert.equal(denied.status, status)
+      const body = await denied.json()
+      assert.equal(body.ok, false)
+      assert.equal(body.error.code, status === 401 ? 'unauthorized' : 'forbidden')
+    }
+    assert.deepEqual(await readdir(join(workspace, UPLOAD_DIR)), [
+      'blob.bin', 'evil.txt', 'notes-1.txt', 'notes.txt',
+    ], 'a refused admit writes nothing')
+    assert.equal(logged, 7, 'the admission wall short-circuits before the logger, like the 405/403')
+
+    const allowed = await fetch(`${admitBases[2]}/_dsh/mobile-nav/upload?session=session-live&name=admitted.txt`, {
+      method: 'POST',
+      headers: { origin: admitBases[2] },
+      body: 'through the wall',
+      duplex: 'half',
+    })
+    assert.equal(allowed.status, 201)
+    assert.equal((await allowed.json()).relPath, `${UPLOAD_DIR}/admitted.txt`)
+    assert.equal(admitted, 1, 'the admitting admit was consulted exactly once')
+    assert.equal(await readFile(join(workspace, UPLOAD_DIR, 'admitted.txt'), 'utf8'), 'through the wall')
+  } finally {
+    for (const server of admitServers) await new Promise((resolve) => server.close(resolve))
+  }
 
   console.log('UPLOAD ENDPOINT CHECK OK')
 } finally {

@@ -1,24 +1,27 @@
 /**
  * The dsh-zen-remote plugin row's settings block on the Plugins manager
- * (T15 + T15-fix + T16): the staged row fields inside the official
+ * (T15 + T15-fix + T16 + T17): the staged row fields inside the official
  * settings-form frame ending in its one save control, and BELOW the form —
  * outside it, so they still render when the configuration namespace is not
  * served — the instant-operation areas. Which areas render follows the row's
  * SAVED role, read from the configForms snapshot's row document — never from
- * a status body (T16-fix 3): a host shows gateway status, pairing, device
- * list and the push probe (POSTing the same-origin admin routes and
- * re-reading `admin/status`); a client shows the server connection form, the
- * connection status line and unpairing (against `client/status`, T16) and
- * NEVER polls `admin/*` — on a client deployment those routes do not exist,
- * and a stale kept body would pin the page to the old role. The poll choice
- * waits out the snapshot's loading state for the same reason. Only field
- * edits stage and save through `ZenRemoteSettingsForm`.
+ * a status body (T16-fix 3); when that document carries no role at all (the
+ * value lives only in `lan-gate.config.json`), the page probes the
+ * lightweight client-config route (both roles register it) for the EFFECTIVE
+ * role (T17). A host shows gateway status, pairing, device list and the push
+ * probe (POSTing the same-origin admin routes and re-reading `admin/status`);
+ * a client shows the server connection form, the connection status line and
+ * unpairing (against `client/status`, T16) and NEVER polls `admin/*` — on a
+ * client deployment those routes do not exist, and a stale kept body would
+ * pin the page to the old role. The poll choice waits out the snapshot's
+ * loading state — and the probe, when the row cannot answer — for the same
+ * reason. Only field edits stage and save through `ZenRemoteSettingsForm`.
  *
  * Status refreshes never clear what is already on screen (T15-fix 1): a
  * failed refresh keeps the last ready data and says so in a banner — only a
- * failed FIRST load enters the error state, because saving a non-hot field
- * restarts the plugin row and the first post-save refresh can land inside
- * that restart window (a second pull follows 1.5s later). Every status
+ * failed FIRST load enters the error state, because saving a restart-required
+ * field reloads the plugin row (T17) and the first post-save refresh can land
+ * inside that reload window (a second pull follows 1.5s later). Every status
  * request carries a latest-wins ticket (T15-fix 4), so an earlier request
  * that answers late cannot overwrite newer data.
  *
@@ -39,6 +42,7 @@ import {
   ADMIN_PUSH_TEST_ROUTE,
   ADMIN_STATUS_ROUTE,
   CLIENT_CLAIM_ROUTE,
+  CLIENT_CONFIG_ROUTE,
   CLIENT_STATUS_ROUTE,
   createLatestGate,
   deriveClientStatusView,
@@ -48,6 +52,7 @@ import {
 import type {
   AdminStatusBody,
   ClaimRouteBody,
+  ClientConfigBody,
   ClientConnectionView,
   ClientStatusBody,
   SettingsDeviceView,
@@ -238,9 +243,9 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
         if (!statusGate.isLatest(ticket)) return
         // T15-fix 1: a failed REFRESH keeps the last ready data on screen and
         // says so; only a failed FIRST load enters the error state. Saving a
-        // non-hot field restarts the plugin row, so the first post-save
-        // refresh can land inside that restart window — the second pull
-        // (1.5s later) then lands the fresh values.
+        // restart-required field reloads the plugin row (T17), so the first
+        // post-save refresh can land inside that reload window — the second
+        // pull (1.5s later) then lands the fresh values.
         setLoad((prev) => prev.state === 'ready' || prev.state === 'stale'
           ? { state: 'stale', body: prev.body }
           : { state: 'error', status: error instanceof StatusError ? error.status : undefined })
@@ -284,6 +289,28 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
     else if (statusPoll === 'admin') loadStatus()
   }, [statusPoll, loadClientStatus, loadStatus])
 
+  // T17: when the row document cannot answer the saved role (the value lives
+  // only in lan-gate.config.json), probe the client-config route — registered
+  // wherever a webServer exists, on either role — for the EFFECTIVE role. A
+  // stored row role always wins, so this only fills the gap; a failed probe
+  // keeps the pre-T17 host default. Waits out the mirror's loading phase,
+  // like the poll choice above.
+  const scopeStatus = form.scopeStatus
+  const roleKnown = config.rowRoleKnown()
+  useEffect(() => {
+    if (scopeStatus === 'loading' || roleKnown) return
+    let cancelled = false
+    fetch(CLIENT_CONFIG_ROUTE)
+      .then((res) => (res.ok ? (res.json() as Promise<ClientConfigBody>) : undefined))
+      .then((body) => {
+        if (!cancelled) config.setProbedRole(body?.role === 'client' ? 'client' : 'host')
+      })
+      .catch(() => {
+        if (!cancelled) config.setProbedRole('host')
+      })
+    return () => { cancelled = true }
+  }, [scopeStatus, roleKnown, config])
+
   // Feed the effective values the fields display (and compare drafts against).
   useEffect(() => {
     if (load.state !== 'ready') return
@@ -322,8 +349,9 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
   }, [rowInvalidKey, config])
 
   // Post-save double refresh (T15-fix 1): once immediately, once after 1.5s —
-  // saving a non-hot field restarts the plugin row and the first refresh can
-  // land inside that window. Timers are released if the page unmounts.
+  // saving a restart-required field reloads the plugin row (T17) and the
+  // first refresh can land inside that window. Timers are released if the
+  // page unmounts.
   const refreshTimers = useRef<number[]>([])
   useEffect(() => () => {
     for (const timer of refreshTimers.current) window.clearTimeout(timer)
@@ -450,7 +478,12 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
   }
 
   const formDisabled = !form.available || !form.writable
-  const roleChanged = form.role.text !== (clientRole ? 'client' : 'host')
+
+  // T17: saving any restart-required field (the role among them) moves the
+  // row, and the host half's watcher reloads it — the gateway child restarts
+  // with it. The note rides the staged-drafts flag, so it appears the moment
+  // such a field is edited and vanishes on discard or save.
+  const reloadPending = form.restartPending
 
   // The code shown under the pairing controls: the refreshed status's, or the
   // one the pair route just returned while the refresh is in flight.
@@ -675,7 +708,7 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
           {select(form.role, 'role', t('settings.role'), t('settings.roleHint'), ['host', 'client'], (option) => (
             option === 'host' ? t('settings.roleHost') : t('settings.roleClient')
           ))}
-          {roleChanged && <p className="zr-settings-status-line">{t('settings.roleRestartNote')}</p>}
+          {reloadPending && <p className="zr-settings-status-line">{t('settings.reloadNote')}</p>}
 
           {!clientRole && (
             <>
