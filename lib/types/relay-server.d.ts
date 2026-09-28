@@ -1,8 +1,8 @@
 /**
- * Server-side relay routes for the desktop client (T22a, first half of the
- * 2.0.0 remote-session work): authentication, ping, handshake, and the single
- * invoke passthrough. Streaming subscriptions, event forwarding and activity
- * stats are T22b.
+ * Server-side relay routes for the desktop client (T22a routes, T22b
+ * streaming): authentication, ping, handshake, the single invoke passthrough,
+ * and the NDJSON stream subscription route with share-change synchronization.
+ * Event forwarding (`$events`) and activity stats are later tasks.
  *
  * Why the secret: the desktop client is a Node process on another machine —
  * it has no DSH login cookie, so the gateway authenticates it with a Bearer
@@ -31,9 +31,11 @@ import type { ShareStore } from './share-store.js';
 export declare const RELAY_PREFIX = "/_dsh/zen-remote/relay";
 /** Shape of the `typertGateway` service this route needs (measured live,
  * docs/spike-relay.md §2.1: invoke returns the unwrapped business value and
- * throws errors carrying a string `code`). Declared structurally instead of
- * augmenting `Context`: the providing package is not a devDependency here,
- * and a local augmentation could collide with its own once that changes. */
+ * throws errors carrying a string `code`; stream opens one `mode: 'stream'`
+ * method and resolves to an async iterable of its frames). Declared
+ * structurally instead of augmenting `Context`: the providing package is not
+ * a devDependency here, and a local augmentation could collide with its own
+ * once that changes. */
 export interface RelayGateway {
     invoke(call: {
         namespace: string;
@@ -41,6 +43,12 @@ export interface RelayGateway {
         args: unknown;
         signal?: AbortSignal;
     }): Promise<unknown>;
+    stream(call: {
+        namespace: string;
+        method: string;
+        args: unknown;
+        signal?: AbortSignal;
+    }): Promise<AsyncIterable<unknown>>;
 }
 /** What the handshake reports about this server. `serverName` is a CALLBACK
  * on purpose: the row value is a volatile (`{ get() }` wrapped) setting that
@@ -56,12 +64,35 @@ export interface RelayHandlerOptions {
     secret: string;
     /** The shared-session table deciding reachability. */
     store: ShareStore;
-    /** The host gateway service invokes go through. */
+    /** The host gateway service invokes and streams go through. */
     gateway: RelayGateway;
     /** Handshake facts. */
     serverInfo: RelayServerInfo;
     /** Ancestor lookup for subagent reachability; defaults to "no parent". */
     parentOf?: (id: string) => string | undefined;
+    /** Stream heartbeat interval in ms (a `{"type":"ping"}` line that keeps
+     * reverse proxies from timing the idle stream away); defaults to 15000.
+     * Tests inject a small value. */
+    heartbeatMs?: number;
+}
+/**
+ * The relay route handler plus its introspection surface. A function WITH
+ * properties on purpose: the webServer registration wants exactly a request
+ * handler, and the "who is looking" badge (a later UI task) wants the
+ * per-session viewer counts — while the row-reload path (T22b-fix) needs to
+ * tear every open stream down with the handler that owns it.
+ */
+export interface RelayHandler {
+    (req: IncomingMessage, res: ServerResponse): Promise<void>;
+    /** How many session-scoped relay streams currently reference the session
+     * (across all devices). */
+    viewerCount(sessionId: string): number;
+    /** End every currently open stream: each client gets one
+     * `error{code:'server-restart'}` line, then the response ends, the upstream
+     * subscription aborts and every counter/listener cleans up. A plugin row
+     * reload builds a new handler and share table; without this the streams of
+     * the OLD handler would keep pushing, unreachable by any unshare. */
+    closeAll(reason: string): void;
 }
 /**
  * Read the persisted server id, creating (and persisting) one on first use.
@@ -85,11 +116,12 @@ export declare function resolveDshVersion(): string;
  * Every request passes the same gate first: gateway secret, then the two
  * marking headers. Failures answer a uniform 401 that does not say WHICH
  * check failed — the difference would only help someone probing the wall.
- * After the gate, `x-zen-remote-device` is the caller's device id (T22b
- * activity stats hang off it).
+ * After the gate, `x-zen-remote-device` is the caller's device id (the
+ * per-device stream budget hangs off it).
  *
  * @param options - secret, share store, gateway service and server facts.
- * @returns a handler owning the full response lifecycle of one request.
+ * @returns the handler owning the full response lifecycle of one request,
+ *   with `viewerCount` alongside for the "who is looking" surface.
  */
-export declare function createRelayHandler(options: RelayHandlerOptions): (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+export declare function createRelayHandler(options: RelayHandlerOptions): RelayHandler;
 //# sourceMappingURL=relay-server.d.ts.map

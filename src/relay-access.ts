@@ -1,5 +1,6 @@
 /**
- * Pure access control for the relay invoke route (2.0.0 desktop-client).
+ * Pure access control for the relay invoke and stream routes (2.0.0
+ * desktop-client).
  *
  * PER-METHOD ALLOWLIST, not a generic id scan. The first draft extracted
  * whatever session ids it could find in `args.request` and checked those —
@@ -11,7 +12,9 @@
  * goes unchecked. The fix: every invokable method is registered below with
  * EXACTLY the fields that locate its session, authorization looks at those
  * fields and nothing else, and any method not in the table is refused
- * (`forbidden-method`) before an id is ever read.
+ * (`forbidden-method`) before an id is ever read. The stream route
+ * ({@link decideStream}) reads the SAME table: only `stream: true` entries
+ * may ride it, and the field rules are identical.
  *
  * Field verification (T22a-fix, against the 0.2.0-rc.1 wire inventory in the
  * review's keys.txt and the local `typert.remote-client.js` — the spike
@@ -32,14 +35,29 @@
 /** The argument fields that can locate a session, as registered per method. */
 type SessionField = 'request.sessionId' | 'request.address'
 
+/** Which standing filter the caller must apply to a global stream's frames
+ * (`src/relay-filter.ts` owns both implementations). */
+export type StreamFilter = 'workspace' | 'control'
+
+/** Which standing filter the caller must apply to an invoke result before it
+ * travels (currently only the unscoped `session/list`). */
+export type InvokeFilter = 'session-list'
+
 interface RelayMethod {
   /** Every field that carries session ownership for this method. ALL of
-   * them must exist, be strings, and pass the share-table check. */
+   * them must exist, be strings, and pass the share-table check. Global
+   * entries (`workspace/follow`, `session/control`, `session/list`) own no
+   * field — reachability is enforced by filtering their output instead. */
   fields: SessionField[]
-  /** Stream-delivered methods (`[stream]` in the wire inventory): callable
-   * ONLY through the streaming route T22b will add — an invoke carrying one
-   * is refused, and so will be a stream carrying a non-stream method. */
+  /** Stream-delivered methods (`mode: 'stream'` in the wire inventory):
+   * callable ONLY through the streaming route — an invoke carrying one is
+   * refused, and so is a stream carrying a non-stream method. */
   stream?: boolean
+  /** Set on the two GLOBAL streams: every frame of such a subscription must
+   * go through the named filter before it is written. */
+  streamFilter?: StreamFilter
+  /** Set on invoke methods whose RESULT needs a standing filter. */
+  resultFilter?: InvokeFilter
 }
 
 /**
@@ -48,10 +66,13 @@ interface RelayMethod {
  * `session/fork` (new sessions must auto-share, T31), `subagents/*` (T31
  * re-verifies ownership first), the methods located by other ids
  * (`schedule/update|delete|history`, `goals/*`, `fileReferences/*`,
- * `fileUploads/*`, `workspaceFiles/*` — P4 verifies DSH's ownership checks),
- * and the unscoped lists T22b will serve through filtered controlled paths
- * (`session/list`, `session/control`, `workspace/follow`) — is refused by
- * default.
+ * `fileUploads/*`, `workspaceFiles/*` — P4 verifies DSH's ownership checks) —
+ * is refused by default.
+ *
+ * The unscoped reads are registered as FILTERED controlled paths (T22b):
+ * `workspace/follow` and `session/control` stream globally but every frame
+ * passes `streamFilter` first; `session/list` invokes but its items pass
+ * `resultFilter` first. Nothing unlisted ever reaches the gateway.
  */
 const RELAY_METHODS: Record<string, RelayMethod> = {
   // session/* — ownership via the address envelope
@@ -65,6 +86,9 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'session/selectModel': { fields: ['request.sessionId'] },
   'session/updateQueue': { fields: ['request.sessionId'] },
   'session/attachment': { fields: ['request.sessionId'] },
+  // session/* — the global control stream and the unscoped list
+  'session/control': { fields: [], stream: true, streamFilter: 'control' },
+  'session/list': { fields: [], resultFilter: 'session-list' },
   // job/*
   'job/list': { fields: ['request.sessionId'], stream: true },
   'job/follow': { fields: ['request.sessionId'], stream: true },
@@ -81,12 +105,22 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'workspace/unpinSession': { fields: ['request.sessionId'] },
   'workspace/archiveSession': { fields: ['request.sessionId'] },
   'workspace/unarchiveSession': { fields: ['request.sessionId'] },
+  // workspace — the global follow stream
+  'workspace/follow': { fields: [], stream: true, streamFilter: 'workspace' },
 }
 
-/** One invoke decision: allow, or the reason that goes into the 403 body. */
+/** One invoke decision: allow (optionally through a standing result filter),
+ * or the reason that goes into the 403 body. */
 export type InvokeDenyReason = 'no-session' | 'not-shared' | 'forbidden-method'
 
-export type InvokeDecision = { allow: true } | { allow: false; reason: InvokeDenyReason }
+export type InvokeDecision = { allow: true; filter?: InvokeFilter } | { allow: false; reason: InvokeDenyReason }
+
+/** One stream decision: allow (global streams carry a `streamFilter`, scoped
+ * streams list the session ids the subscription depends on — the relay kills
+ * the stream and counts viewers with them), or the 403 reason. */
+export type StreamDecision =
+  | { allow: true; filter?: StreamFilter; sessionIds: string[] }
+  | { allow: false; reason: InvokeDenyReason }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -109,6 +143,10 @@ function ownedId(value: unknown): string | undefined {
  * kind, or a missing id, makes the method unauthorizable.
  */
 function claimedSessionIds(entry: RelayMethod, args: unknown): { ids: string[] } | { reason: InvokeDenyReason } {
+  // Field-less entries (the global reads) claim nothing by construction —
+  // their safety comes from output filtering, and their wire shape is their
+  // own (`session/list` takes `_request`, not `request`).
+  if (entry.fields.length === 0) return { ids: [] }
   if (!isPlainObject(args)) return { reason: 'no-session' }
   const request = args.request
   if (!isPlainObject(request)) return { reason: 'no-session' }
@@ -149,6 +187,10 @@ function claimedSessionIds(entry: RelayMethod, args: unknown): { ids: string[] }
  * 3. every claimed id must pass `isAccessible` — one unreachable id refuses
  *    the whole call (`not-shared`): an unshared session must not become
  *    readable through a shared one riding in the same arguments.
+ *
+ * A method registered with `resultFilter` allows with that marker attached;
+ * the caller filters the result before it travels (never the reverse — the
+ * filter is an OUTPUT discipline, the access check above stays input-only).
  */
 export function decideInvoke(
   namespace: string,
@@ -163,5 +205,35 @@ export function decideInvoke(
   for (const id of claimed.ids) {
     if (!isAccessible(id)) return { allow: false, reason: 'not-shared' }
   }
-  return { allow: true }
+  return entry.resultFilter !== undefined ? { allow: true, filter: entry.resultFilter } : { allow: true }
+}
+
+/**
+ * Decide one relayed STREAM subscription against the same table:
+ *
+ * 1. the method must be registered AND stream-delivered — an invoke-only
+ *    method riding the stream route is `forbidden-method`, exactly like a
+ *    stream method riding the invoke route;
+ * 2. a global entry (`streamFilter` set) allows unconditionally — its frames
+ *    are filtered per frame, so there is nothing to check up front;
+ * 3. any other entry follows the {@link decideInvoke} field rules verbatim:
+ *    all registered fields must yield owned ids and every id must be
+ *    accessible, and the claimed ids ride back to the caller, which kills the
+ *    subscription when one of them stops being shared.
+ */
+export function decideStream(
+  namespace: string,
+  method: string,
+  args: unknown,
+  isAccessible: (sessionId: string) => boolean,
+): StreamDecision {
+  const entry = RELAY_METHODS[`${namespace}/${method}`]
+  if (entry === undefined || entry.stream !== true) return { allow: false, reason: 'forbidden-method' }
+  if (entry.streamFilter !== undefined) return { allow: true, filter: entry.streamFilter, sessionIds: [] }
+  const claimed = claimedSessionIds(entry, args)
+  if ('reason' in claimed) return { allow: false, reason: claimed.reason }
+  for (const id of claimed.ids) {
+    if (!isAccessible(id)) return { allow: false, reason: 'not-shared' }
+  }
+  return { allow: true, sessionIds: claimed.ids }
 }

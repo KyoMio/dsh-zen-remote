@@ -1,5 +1,6 @@
 /**
- * Pure access control for the relay invoke route (2.0.0 desktop-client).
+ * Pure access control for the relay invoke and stream routes (2.0.0
+ * desktop-client).
  *
  * PER-METHOD ALLOWLIST, not a generic id scan. The first draft extracted
  * whatever session ids it could find in `args.request` and checked those —
@@ -11,7 +12,9 @@
  * goes unchecked. The fix: every invokable method is registered below with
  * EXACTLY the fields that locate its session, authorization looks at those
  * fields and nothing else, and any method not in the table is refused
- * (`forbidden-method`) before an id is ever read.
+ * (`forbidden-method`) before an id is ever read. The stream route
+ * ({@link decideStream}) reads the SAME table: only `stream: true` entries
+ * may ride it, and the field rules are identical.
  *
  * Field verification (T22a-fix, against the 0.2.0-rc.1 wire inventory in the
  * review's keys.txt and the local `typert.remote-client.js` — the spike
@@ -28,10 +31,29 @@
  *
  * Pure functions: no I/O, no clock, the share-table lookup is injected.
  */
-/** One invoke decision: allow, or the reason that goes into the 403 body. */
+/** Which standing filter the caller must apply to a global stream's frames
+ * (`src/relay-filter.ts` owns both implementations). */
+export type StreamFilter = 'workspace' | 'control';
+/** Which standing filter the caller must apply to an invoke result before it
+ * travels (currently only the unscoped `session/list`). */
+export type InvokeFilter = 'session-list';
+/** One invoke decision: allow (optionally through a standing result filter),
+ * or the reason that goes into the 403 body. */
 export type InvokeDenyReason = 'no-session' | 'not-shared' | 'forbidden-method';
 export type InvokeDecision = {
     allow: true;
+    filter?: InvokeFilter;
+} | {
+    allow: false;
+    reason: InvokeDenyReason;
+};
+/** One stream decision: allow (global streams carry a `streamFilter`, scoped
+ * streams list the session ids the subscription depends on — the relay kills
+ * the stream and counts viewers with them), or the 403 reason. */
+export type StreamDecision = {
+    allow: true;
+    filter?: StreamFilter;
+    sessionIds: string[];
 } | {
     allow: false;
     reason: InvokeDenyReason;
@@ -46,6 +68,24 @@ export type InvokeDecision = {
  * 3. every claimed id must pass `isAccessible` — one unreachable id refuses
  *    the whole call (`not-shared`): an unshared session must not become
  *    readable through a shared one riding in the same arguments.
+ *
+ * A method registered with `resultFilter` allows with that marker attached;
+ * the caller filters the result before it travels (never the reverse — the
+ * filter is an OUTPUT discipline, the access check above stays input-only).
  */
 export declare function decideInvoke(namespace: string, method: string, args: unknown, isAccessible: (sessionId: string) => boolean): InvokeDecision;
+/**
+ * Decide one relayed STREAM subscription against the same table:
+ *
+ * 1. the method must be registered AND stream-delivered — an invoke-only
+ *    method riding the stream route is `forbidden-method`, exactly like a
+ *    stream method riding the invoke route;
+ * 2. a global entry (`streamFilter` set) allows unconditionally — its frames
+ *    are filtered per frame, so there is nothing to check up front;
+ * 3. any other entry follows the {@link decideInvoke} field rules verbatim:
+ *    all registered fields must yield owned ids and every id must be
+ *    accessible, and the claimed ids ride back to the caller, which kills the
+ *    subscription when one of them stops being shared.
+ */
+export declare function decideStream(namespace: string, method: string, args: unknown, isAccessible: (sessionId: string) => boolean): StreamDecision;
 //# sourceMappingURL=relay-access.d.ts.map

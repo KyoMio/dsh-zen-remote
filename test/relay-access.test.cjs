@@ -11,7 +11,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { decideInvoke } = require('../lib/relay-access.js')
+const { decideInvoke, decideStream } = require('../lib/relay-access.js')
 
 const yes = () => true
 const no = () => false
@@ -46,9 +46,7 @@ test('decideInvoke: any unregistered method refuses, with or without a request o
     ['terminal', 'create', { agentId: 'a', request: { shellPath: '/bin/zsh' } }],
     ['account', 'getProfile', { client: {} }],
     ['pluginManager', 'listPlugins', {}],
-    ['session', 'list', { _request: {} }],
     ['session', 'fork', { request: { sessionId: 'S-shared', atSeq: 1 } }],
-    ['workspace', 'follow', {}],
     ['schedule', 'delete', { request: { id: 's1', sessionId: 'S-shared' } }],
     ['anything', 'atAll', 'garbage'],
     ['nope', 'x', undefined],
@@ -68,17 +66,95 @@ test('decideInvoke: a stream-only entry is forbidden on the invoke route', () =>
   assert.deepEqual(
     decideInvoke('session', 'follow', { request: { address: { kind: 'session', sessionId: 'S-shared' } } }, only(shared)),
     { allow: false, reason: 'forbidden-method' },
-    'session/follow is stream-only; T22b streams it',
+    'session/follow is stream-only; the stream route serves it',
+  )
+  for (const [namespace, method, args] of [
+    ['job', 'list', { request: { sessionId: 'S-shared' } }],
+    ['job', 'follow', { request: { sessionId: 'S-shared', jobId: 'j1' } }],
+    // The two global streams are registered since T22b — but only for the
+    // stream route; riding them through invoke stays forbidden.
+    ['workspace', 'follow', {}],
+    ['session', 'control', {}],
+  ]) {
+    assert.deepEqual(
+      decideInvoke(namespace, method, args, only(shared)),
+      { allow: false, reason: 'forbidden-method' },
+      `${namespace}/${method} is stream-only`,
+    )
+  }
+})
+
+// -- session/list: allowed on invoke, result marked for filtering --------------------
+
+test('decideInvoke: session/list is allowed without any session field, result marked session-list', () => {
+  // No session fields to check: the access decision does not depend on the
+  // share table at all — the RESULT filter (relay-filter.ts) is what keeps
+  // unshared sessions out of the client's list.
+  assert.deepEqual(decideInvoke('session', 'list', { _request: {} }, no), { allow: true, filter: 'session-list' })
+  assert.deepEqual(decideInvoke('session', 'list', { _request: { cursor: 'c1' } }, yes), {
+    allow: true,
+    filter: 'session-list',
+  })
+  assert.deepEqual(decideInvoke('session', 'list', {}, no), { allow: true, filter: 'session-list' })
+  // Ordinary registered methods carry NO filter marker (strict deep-equal on
+  // purpose: an undefined-valued key would be a different decision object).
+  assert.deepEqual(decideInvoke('session', 'rename', { request: { sessionId: 'S-a', title: 'x' } }, yes), {
+    allow: true,
+  })
+})
+
+// -- decideStream: the stream route reads the same table -----------------------------
+
+test('decideStream: the global streams allow unconditionally and carry their filter', () => {
+  assert.deepEqual(decideStream('workspace', 'follow', {}, no), { allow: true, filter: 'workspace', sessionIds: [] })
+  assert.deepEqual(decideStream('session', 'control', {}, no), { allow: true, filter: 'control', sessionIds: [] })
+  // Garbage args ride through too — DSH's own argument validation answers
+  // them as a business error on the stream, which the relay forwards.
+  assert.deepEqual(decideStream('workspace', 'follow', { junk: 1 }, no), {
+    allow: true,
+    filter: 'workspace',
+    sessionIds: [],
+  })
+})
+
+test('decideStream: scoped streams follow the decideInvoke field rules verbatim', () => {
+  const shared = ['S-a']
+  assert.deepEqual(
+    decideStream('session', 'follow', { request: { address: { kind: 'session', sessionId: 'S-a' } } }, only(shared)),
+    { allow: true, sessionIds: ['S-a'] },
   )
   assert.deepEqual(
-    decideInvoke('job', 'list', { request: { sessionId: 'S-shared' } }, only(shared)),
-    { allow: false, reason: 'forbidden-method' },
-    'job/list is stream-only too',
+    decideStream('job', 'list', { request: { sessionId: 'S-a' } }, only(shared)),
+    { allow: true, sessionIds: ['S-a'] },
   )
   assert.deepEqual(
-    decideInvoke('job', 'follow', { request: { sessionId: 'S-shared' } }, only(shared)),
-    { allow: false, reason: 'forbidden-method' },
+    decideStream('job', 'follow', { request: { sessionId: 'S-a', jobId: 'j1' } }, only(shared)),
+    { allow: true, sessionIds: ['S-a'] },
   )
+  assert.deepEqual(
+    decideStream('session', 'follow', { request: { address: { kind: 'session', sessionId: 'S-victim' } } }, only(shared)),
+    { allow: false, reason: 'not-shared' },
+  )
+  assert.deepEqual(decideStream('session', 'follow', { request: {} }, yes), { allow: false, reason: 'no-session' })
+})
+
+test('decideStream: non-stream and unregistered methods are forbidden-method', () => {
+  for (const [namespace, method, args] of [
+    // session/list is invoke-only: a stream subscription of a snapshot call
+    // is not a thing.
+    ['session', 'list', { _request: {} }],
+    ['session', 'page', { request: { address: { kind: 'session', sessionId: 'S-a' } } }],
+    ['job', 'kill', { request: { sessionId: 'S-a', jobId: 'j1' } }],
+    ['session', 'projections', { request: { sessionId: 'S-a' } }],
+    ['settings', 'update', {}],
+    ['anything', 'atAll', 'garbage'],
+  ]) {
+    assert.deepEqual(
+      decideStream(namespace, method, args, yes),
+      { allow: false, reason: 'forbidden-method' },
+      `${namespace}/${method} is not stream-delivered`,
+    )
+  }
 })
 
 // -- registered methods: request.sessionId field -----------------------------------
