@@ -156,6 +156,25 @@ export interface AdminHandlerOptions {
    * title is null and a timed-out existence check is a 502. Tests inject a
    * short value. */
   projectionTimeoutMs?: number
+  /** The host's sessionQuery service, looked up PER REQUEST through the
+   * reflection layer like `typert`. The share action reads a session's
+   * durable header through it to judge subagent sessions; absent (or a
+   * failing read) falls back to the projection identity. */
+  sessionQuery?: () => SessionQueryLike | undefined
+}
+
+/** The slice of the sessionQuery service the share action reads (RT
+ * dsh-session-query): `observeSession` answers a caller-owned lease over an
+ * immutable cut — `header` is the session's durable header — and the lease
+ * is released through the standard `Symbol.dispose` protocol. Declared
+ * structurally: the providing package is optional here and the tests feed
+ * plain objects. */
+export interface SessionObservationLike {
+  header?: { origin?: unknown } | undefined
+}
+
+export interface SessionQueryLike {
+  observeSession(sessionId: string): Promise<SessionObservationLike>
 }
 
 export type AdminHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -295,17 +314,6 @@ async function respondStatus(options: AdminHandlerOptions, req: IncomingMessage,
   responseJson(res, 200, { ok: true, gateway, gatewayReachable, gatewayStatus, config, viaGateway })
 }
 
-/** One rejection after the per-call projection timeout. Timer unref'd: a
- * settled call must not keep the process alive for the leftover tail. */
-function rejectAfter(ms: number): Promise<never> {
-  return new Promise((_, reject) => {
-    const timer = setTimeout(() => reject(new Error('projection timed out')), ms)
-    if (typeof timer === 'object' && timer !== null && typeof (timer as { unref?: unknown }).unref === 'function') {
-      ;(timer as { unref: () => void }).unref()
-    }
-  })
-}
-
 /** What one `session/projections` call can turn out to be. `no-gateway` is
  * the composition without the service; `no-session` is DSH's own null
  * answer for a dead session id; `values` carries the projection values
@@ -321,6 +329,9 @@ type ProjectionOutcome =
  * a transport failure or a timeout throws, and the caller decides what those
  * mean (titles: null; existence: 502). The typert lookup runs INSIDE the
  * guard: a throwing lookup is a degraded composition, not a route failure.
+ * The timeout rides the call's cancellation signal (`AbortSignal.timeout`,
+ * the same shape the relay passes into gateway calls), so a timed-out
+ * invocation is actually STOPPED, not merely abandoned by the waiter.
  */
 async function projectionOf(options: AdminHandlerOptions, sessionId: string): Promise<ProjectionOutcome> {
   let gateway: RelayGateway | undefined
@@ -330,10 +341,12 @@ async function projectionOf(options: AdminHandlerOptions, sessionId: string): Pr
     return { kind: 'no-gateway' }
   }
   if (gateway === undefined) return { kind: 'no-gateway' }
-  const value = await Promise.race([
-    gateway.invoke({ namespace: 'session', method: 'projections', args: { request: { sessionId } } }),
-    rejectAfter(options.projectionTimeoutMs ?? PROJECTION_TIMEOUT_MS),
-  ])
+  const value = await gateway.invoke({
+    namespace: 'session',
+    method: 'projections',
+    args: { request: { sessionId } },
+    signal: AbortSignal.timeout(options.projectionTimeoutMs ?? PROJECTION_TIMEOUT_MS),
+  })
   if (value === null || value === undefined) return { kind: 'no-session' }
   const values = (value as { values?: unknown }).values
   return {
@@ -378,6 +391,60 @@ async function requireSession(options: AdminHandlerOptions, sessionId: string): 
   if (outcome.kind === 'no-gateway') return {}
   if (outcome.kind === 'no-session') throw new AdminError(404, 'no-session', `no live session "${sessionId}"`)
   return outcome.values
+}
+
+/** Release one sessionQuery lease: the observation is a plain
+ * `Symbol.dispose` carrier (RT dsh-session-query SessionObservationReader —
+ * every lease pins a cold-cache entry until released). */
+function releaseObservation(observation: SessionObservationLike): void {
+  const disposable = observation as Partial<Record<symbol, () => void>>
+  disposable[Symbol.dispose]?.()
+}
+
+/**
+ * Whether the session is a subagent child, judged off the DURABLE HEADER
+ * first: `sessionQuery.observeSession` reads the live-or-persisted session's
+ * immutable header (released immediately), and `origin === 'subagent'` is
+ * authoritative — per dsh-session's `validateSessionHeader` that marker is
+ * the one subagent signal, and a header WITHOUT it is an ordinary session
+ * (top-level or fork), full stop.
+ *
+ * Why the header wins over the projection's `subagent` identity: a fork of a
+ * subagent session REPLAYS the source's `subagent/descriptor` events, so the
+ * projection would wrongly condemn an ordinary fork — while a child whose
+ * descriptor turned corrupt projects null and would slip through.
+ *
+ * The projection identity stays as the fallback for compositions without
+ * sessionQuery and for reads that fail (session gone between the two
+ * lookups, unreadable log) — degraded knowledge beats none.
+ */
+async function isSubagentSession(
+  options: AdminHandlerOptions,
+  sessionId: string,
+  projectionValues: Record<string, unknown>,
+): Promise<boolean> {
+  let query: SessionQueryLike | undefined
+  try {
+    query = options.sessionQuery?.()
+  } catch {
+    query = undefined
+  }
+  if (query !== undefined) {
+    let observation: SessionObservationLike | undefined
+    try {
+      observation = await query.observeSession(sessionId)
+    } catch {
+      observation = undefined
+    }
+    if (observation !== undefined) {
+      try {
+        return observation.header?.origin === 'subagent'
+      } finally {
+        releaseObservation(observation)
+      }
+    }
+  }
+  return projectionValues.subagent !== null && typeof projectionValues.subagent === 'object'
 }
 
 /** GET shares: the table verbatim, plus the derived fields the settings page
@@ -481,12 +548,11 @@ export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
           if (action === 'share') {
             const values = await requireSession(options, sessionId)
             // Subagent children never enter the table — they inherit
-            // reachability through the parent chain. DSH marks the identity
-            // in the projection's `subagent` field (dsh-subagent folds
-            // `subagent/descriptor` events; the view is the identity object
-            // or null — null ⟺ no valid descriptor, so OBJECT is the
-            // subagent answer, never merely "not undefined").
-            if (values.subagent !== null && typeof values.subagent === 'object') {
+            // reachability through the parent chain. Judged off the durable
+            // header when sessionQuery is reachable (a fork of a subagent
+            // replays the descriptor events, so the projection alone would
+            // both over- and under-reject — see isSubagentSession).
+            if (await isSubagentSession(options, sessionId, values)) {
               responseJson(res, 400, {
                 ok: false,
                 error: { code: 'subagent-session', message: 'subagent sessions are reachable through their parent and cannot be shared alone' },

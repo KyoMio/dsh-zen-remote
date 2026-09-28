@@ -400,15 +400,23 @@ const { createShareStore } = require('../lib/share-store.js')
  * "no such live session" projection; `failTitles` makes those sessions'
  * lookup throw (title null on GET, 502 on share); `subagentIdentity` plants
  * a `values.subagent` in every projection (the dsh-subagent identity object,
- * or null — the no-descriptor answer); `hang` makes invoke never settle. */
+ * or null — the no-descriptor answer); `hang` makes invoke wait forever —
+ * honouring its cancellation signal, like the real gateway; `sessionHeaders`
+ * mounts a sessionQuery fake answering those headers (null = not found,
+ * mirroring observeSession's throw), each lease recording its release. */
 function makeShareParts(overrides = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-admin-shares-'))
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
   const invokes = []
+  const released = []
   const typert = {
     invoke: async (call) => {
       invokes.push(call)
-      if (overrides.hang) return new Promise(() => {})
+      if (overrides.hang) {
+        return new Promise((_, reject) => {
+          call.signal?.addEventListener('abort', () => reject(call.signal.reason))
+        })
+      }
       if (overrides.projection === null) return null
       if (overrides.failTitles !== undefined && overrides.failTitles.includes(call.args.request.sessionId)) {
         throw new Error('projection blew up')
@@ -422,6 +430,20 @@ function makeShareParts(overrides = {}) {
       }
     },
   }
+  const sessionQuery = overrides.sessionHeaders === undefined ? undefined : {
+    observeSession: async (sessionId) => {
+      const header = overrides.sessionHeaders[sessionId]
+      if (header === null) throw Object.assign(new Error('no such session'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
+      let releasedOnce = false
+      return {
+        header,
+        [Symbol.dispose]() {
+          if (!releasedOnce) released.push(sessionId)
+          releasedOnce = true
+        },
+      }
+    },
+  }
   const options = {
     admit: overrides.admit || (() => ({ peer: {} })),
     gatewayBase: `http://127.0.0.1:${gwPort}`,
@@ -429,10 +451,11 @@ function makeShareParts(overrides = {}) {
     store,
     typert: overrides.noTypert ? () => undefined : () => typert,
     listAgents: () => (overrides.roster !== undefined ? overrides.roster : []),
+    ...(sessionQuery !== undefined ? { sessionQuery: () => sessionQuery } : {}),
     ...(overrides.viewerCount !== undefined ? { viewerCount: overrides.viewerCount } : {}),
     ...(overrides.projectionTimeoutMs !== undefined ? { projectionTimeoutMs: overrides.projectionTimeoutMs } : {}),
   }
-  return { store, invokes, options }
+  return { store, invokes, released, options }
 }
 
 async function startShareServer(options) {
@@ -575,8 +598,9 @@ test('POST share without a typert gateway still works, trusting the table alone'
 })
 
 test('POST share refuses a subagent session: the projection identity object is 400 subagent-session, null is not', async () => {
-  // dsh-subagent's subagent identity projection answers the identity OBJECT
-  // for a child, and null when no valid descriptor exists — null is what an
+  // No sessionQuery on this composition: the projection identity is the only
+  // signal left. dsh-subagent's projection answers the identity OBJECT for a
+  // child, and null when no valid descriptor exists — null is what an
   // ordinary session carries, so only the object shape may refuse.
   const child = makeShareParts({ subagentIdentity: { mode: 'continuable', label: 'explorer', seq: 12 } })
   {
@@ -595,6 +619,55 @@ test('POST share refuses a subagent session: the projection identity object is 4
       const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-plain' } })
       assert.equal(res.status, 200, 'subagent: null means no descriptor — an ordinary session')
       assert.equal(plain.store.isShared('s-plain'), true)
+    } finally { await closeServer(server) }
+  }
+})
+
+test('POST share judges subagent sessions off the session HEADER first (T33a2)', async () => {
+  // A FORK of a subagent session: its header has no origin (an ordinary
+  // user-created session), but forking replayed the source's
+  // subagent/descriptor events, so the projection still carries an identity.
+  // The header is authoritative — share must succeed.
+  const fork = makeShareParts({
+    subagentIdentity: { mode: 'continuable', label: 'inherited descriptor', seq: 99 },
+    sessionHeaders: { 's-fork-of-child': { version: 4, id: 's-fork-of-child', isSeeded: true, parentSession: 'some-child' } },
+  })
+  {
+    const { server, port } = await startShareServer(fork.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-fork-of-child' } })
+      assert.equal(res.status, 200, 'a fork is ordinary no matter what its inherited projection says')
+      assert.equal(fork.store.isShared('s-fork-of-child'), true)
+      assert.deepEqual(fork.released, ['s-fork-of-child'], 'the observation lease is released after the read')
+    } finally { await closeServer(server) }
+  }
+  // A real child: header origin 'subagent' → 400, even though the
+  // (descriptor-corrupt) projection answers null.
+  const child = makeShareParts({
+    subagentIdentity: null,
+    sessionHeaders: { 's-child': { version: 4, id: 's-child', origin: 'subagent', parentSession: 'p' } },
+  })
+  {
+    const { server, port } = await startShareServer(child.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-child' } })
+      assert.equal(res.status, 400)
+      assert.equal(JSON.parse(res.body).error.code, 'subagent-session')
+      assert.equal(child.store.isShared('s-child'), false)
+    } finally { await closeServer(server) }
+  }
+  // Header unreadable (session gone between the two lookups): fall back to
+  // the projection identity.
+  const degraded = makeShareParts({
+    subagentIdentity: { mode: 'one-shot', seq: 3 },
+    sessionHeaders: { 's-vanished': null },
+  })
+  {
+    const { server, port } = await startShareServer(degraded.options)
+    try {
+      const res = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's-vanished' } })
+      assert.equal(res.status, 400, 'with no header to read, the projection identity still refuses a child')
+      assert.equal(degraded.store.isShared('s-vanished'), false)
     } finally { await closeServer(server) }
   }
 })
