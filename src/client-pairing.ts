@@ -12,6 +12,8 @@
  * LAN users out or open plain-http pairing to the public internet).
  */
 
+import { unwrapVolatile } from './config.js'
+
 /** The gateway claim endpoint, resolved against the normalized server URL. */
 export const CLAIM_PATH = '/lan-gate/pair/claim-desktop'
 
@@ -117,6 +119,24 @@ export function normalizeServerUrl(input: string): NormalizeResult {
   return { ok: true, url: parsed.origin }
 }
 
+/**
+ * The volatile row field's current server address, read through the loader's
+ * `{ get() }` wrapper and normalized exactly like the claim route validates
+ * user input. undefined when the field is unset or no longer legal: a
+ * hand-edited row must never have the pairing token sent to an address the
+ * claim route would have refused. Used by the relay client's address getter
+ * in src/index.ts; the status route reads the row itself because it needs
+ * the unset / invalid distinction its own two states answer with.
+ */
+export function normalizedRowServerUrl(row: unknown): string | undefined {
+  const record = row !== null && typeof row === 'object' && !Array.isArray(row) ? (row as Record<string, unknown>) : {}
+  const value = unwrapVolatile(record.serverUrl)
+  const serverUrl = typeof value === 'string' ? value.trim() : ''
+  if (serverUrl === '') return undefined
+  const normalized = normalizeServerUrl(serverUrl)
+  return normalized.ok ? normalized.url : undefined
+}
+
 /** The gateway claim reply, exactly as lib/lan-gate-server.cjs answers
  * `/lan-gate/pair/claim-desktop` for a desktop client. */
 export interface ClaimSuccessBody {
@@ -189,8 +209,13 @@ export type ProbeState = 'unreachable' | 'revoked' | 'unexpected' | 'connected'
  * Classify one probe of `<serverUrl>${RELAY_PING_PATH}`:
  *
  * - no HTTP answer at all → `unreachable` (down, wrong address, timeout);
- * - 401 → `revoked` — the gateway treats an invalid or revoked desktop-client
- *   token as unpaired and answers its 401 wall;
+ * - 401 with the relay route's own `relay-unauthorized` error → `unexpected`
+ *   (T23a-fix): the gateway ACCEPTED the token but the server's internal
+ *   secret disagrees — a server-side fault that must not unpair a valid
+ *   device; only the gateway's own pairing wall (`reason: 'unpaired'`) is
+ *   a dead token;
+ * - any other 401 → `revoked` — the gateway treats an invalid or revoked
+ *   desktop-client token as unpaired and answers its 401 wall;
  * - 403 with `reason: 'relay-only'` → `unexpected`: the token was ACCEPTED
  *   but the server refuses the relay prefix — only possible when the server
  *   is not running the 2.0.0 gateway;
@@ -199,7 +224,16 @@ export type ProbeState = 'unreachable' | 'revoked' | 'unexpected' | 'connected'
  */
 export function classifyProbe(result: ProbeResult): ProbeState {
   if (result.kind === 'error') return 'unreachable'
-  if (result.status === 401) return 'revoked'
+  if (result.status === 401) {
+    const body = result.body !== null && typeof result.body === 'object' && !Array.isArray(result.body)
+      ? (result.body as Record<string, unknown>)
+      : undefined
+    const error = body !== undefined && body.error !== null && typeof body.error === 'object' && !Array.isArray(body.error)
+      ? (body.error as Record<string, unknown>)
+      : undefined
+    if (error !== undefined && error.code === 'relay-unauthorized') return 'unexpected'
+    return 'revoked'
+  }
   if (result.status === 403) {
     const reason = result.body !== null && typeof result.body === 'object' && !Array.isArray(result.body)
       ? (result.body as Record<string, unknown>).reason

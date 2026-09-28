@@ -25,13 +25,16 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-session'
-import { readFileConfig, resolveConfig } from './config.js'
+import { readFileConfig, resolveConfig, unwrapVolatile } from './config.js'
 import { createActivityTracker, createParentIndex, startSweeper } from './activity.js'
 import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
+import { normalizedRowServerUrl } from './client-pairing.js'
 import { CLIENT_ROUTE_PREFIX, createClientHandler } from './client-routes.js'
 import { responseJson, sameOriginPost } from './http.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 import { createShareStore } from './share-store.js'
+import { createRelayClient, RelayError } from './relay-client.js'
+import type { RelayClient } from './relay-client.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway } from './relay-server.js'
 
@@ -69,6 +72,20 @@ const MAX_NAME_BYTES = 180
 
 /** Distinct leaf names tried before a collision is given up on. */
 const MAX_COLLISION_TRIES = 100
+
+/**
+ * The client role's relay client (T23a), created inside apply() and kept on
+ * the module so other halves of the plugin can reach it without reaching
+ * into a context. T23b's request interception reads it through
+ * {@link getRelayClient}; it stays undefined on the host role (and in
+ * compositions that never ran this module's apply).
+ */
+let clientRelayClient: RelayClient | undefined
+
+/** The live client-role relay client, if one was built. */
+export function getRelayClient(): RelayClient | undefined {
+  return clientRelayClient
+}
 
 /** Host half config. */
 export interface MobileNavConfig {
@@ -378,6 +395,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   const effective = resolveConfig(config, readFileConfig(), process.env)
   const maxBytes = config.maxUploadBytes ?? DEFAULT_MAX_UPLOAD_BYTES
   if (effective.values.role === 'host') {
+    // A row that switched from client to host must not leave a stale relay
+    // client where getRelayClient() can find it (T23a-fix).
+    clientRelayClient = undefined
     // The relay shared secret (T22a): minted fresh per apply, handed to the
     // gateway child through LAN_GATE_RELAY_SECRET and kept here for the
     // relay routes below. The push half never sees it.
@@ -492,7 +512,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       }, 'dsh-zen-remote: relay route')
     })
   } else {
-    // Sub-client half (T16): pairing claim + connection status, talking to
+    // Sub-client half (T16, T23a): pairing claim + connection status, talking to
     // the SERVER's gateway instead of running one. Same admission wall as
     // the admin routes — and, like them, a composition without a connection
     // service (Electron carries none) simply never mounts the routes. The
@@ -500,6 +520,36 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // ({ get() } wrapped), so every request reads them live through
     // unwrapVolatile — an apply-time snapshot would go stale the moment the
     // settings page pairs or unpairs.
+    //
+    // The relay client (T23a) reads the SAME volatile fields live at every
+    // request; the address passes the claim route's normalizer, and an
+    // address that no longer normalizes counts as missing — a hand-edited
+    // row must not receive the pairing token.
+    const row = config as Record<string, unknown>
+    const relayClient = createRelayClient({
+      getServerUrl: () => normalizedRowServerUrl(row),
+      getToken: () => {
+        const value = unwrapVolatile(row.deviceToken)
+        return typeof value === 'string' && value !== '' ? value : undefined
+      },
+    })
+    clientRelayClient = relayClient
+    // A stopped or reloaded row must not leave a stale instance where the
+    // module getter can hand it out (T23a-fix). The identity guard keeps a
+    // slow dispose from clearing a NEWER row's instance that a reload
+    // already installed.
+    ctx.effect(() => () => {
+      if (clientRelayClient === relayClient) clientRelayClient = undefined
+    }, 'dsh-zen-remote: relay client disposal')
+    // One connection attempt at startup (T23a). Failures only log — the
+    // status route surfaces the resulting state, and reconnection is T23b's
+    // job alongside the request interception. An unpaired row is the normal
+    // not-configured shape and stays silent.
+    void relayClient.connect().catch((error) => {
+      if (error instanceof RelayError && error.code === 'unpaired') return
+      const code = error instanceof RelayError ? error.code : 'error'
+      ctx.logger.warn('dsh-zen-remote relay client initial connect failed (%s): %s', code, message(error))
+    })
     ctx.inject(['webServer', 'connection'], (clientCtx) => {
       clientCtx.effect(() => clientCtx.webServer.register({
         kind: 'prefix',
@@ -507,6 +557,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         handler: createClientHandler({
           admit: (req) => clientCtx.connection.admit(req),
           getRowConfig: () => config,
+          getRelayClient: () => relayClient,
         }),
       }), 'dsh-zen-remote: client routes')
     })

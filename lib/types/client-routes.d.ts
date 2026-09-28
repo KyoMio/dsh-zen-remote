@@ -19,6 +19,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission } from './admin-routes.js';
+import type { RelayClient } from './relay-client.js';
 /** Prefix all client routes live under (one webServer prefix registration). */
 export declare const CLIENT_ROUTE_PREFIX = "/_dsh/zen-remote/client";
 /** POST `{serverUrl, code, name}`: redeem a desktop pairing code. */
@@ -36,6 +37,13 @@ export interface ClientHandlerOptions {
     getRowConfig: () => unknown;
     /** Outbound fetch, defaulting to the global one. */
     fetchImpl?: FetchLike;
+    /** The live relay client (T23a), once apply() built one. When it has LEFT
+     * its initial `unpaired` state — a connection attempt ran — the status
+     * route reports ITS verdict (state + handshake server name) and skips the
+     * ping probe; the probe below stays as the fallback for a client that
+     * never connected, so the settings page still gets a fresh answer while
+     * the startup `connect()` is still unpaired. */
+    getRelayClient?: () => RelayClient | undefined;
 }
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 /**

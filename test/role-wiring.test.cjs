@@ -442,7 +442,21 @@ test('T22c: the host role subscribes session/event and registers the sweeper sto
   const client = makeCtx()
   index.apply(client.ctx, { role: 'client' })
   assert.equal(client.listeners.length, 0, "the client role never subscribes session/event")
-  assert.equal(client.effects.length, 0, "the client role never starts the sweeper")
+  // The client role's ONLY effect is the relay client's disposal (T23a-fix):
+  // its stop clears the module slot — never the sweeper, which stays host-only.
+  assert.equal(client.effects.length, 1, 'the client role starts exactly one effect: the relay client disposal')
+  assert.equal(typeof client.effects[0], 'function', 'the effect returned a stop function')
+  assert.notEqual(index.getRelayClient(), undefined, 'the client role installs its relay client in the module slot')
+  client.effects[0]()
+  assert.equal(index.getRelayClient(), undefined, 'the disposal clears the module slot')
+
+  // A row switching from client to host clears the stale instance too.
+  const reinstall = makeCtx()
+  index.apply(reinstall.ctx, { role: 'client' })
+  assert.notEqual(index.getRelayClient(), undefined, 'a fresh client apply installs a new instance')
+  const switched = makeCtx()
+  index.apply(switched.ctx, {})
+  assert.equal(index.getRelayClient(), undefined, 'a host-role apply clears any stale client instance')
 })
 
 test('T22c-fix: the captured session/event listener refreshes the shared table and ignores id-less sessions', async () => {
