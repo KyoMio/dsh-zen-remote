@@ -27,11 +27,21 @@ test('the model seat no longer carries the gap', () => {
 })
 
 test('the gap sits in front of the right-hand group', () => {
-  assert.match(strip(section), /span\[class\$="_root"\],\s*\$\{ROW\} > \[class\$="_trailing"\] > \[class\$="_primary"\] \{\s*margin-left: auto !important;/)
+  // Send carries the auto margin on its own (no ring, e.g. a subagent session).
+  assert.match(strip(section), /\$\{ROW\} > \[class\$="_trailing"\] > \[class\$="_primary"\] \{\s*margin-left: auto !important;/)
+  // With the lifted ring (DSH 0.1.7 moved it into ROOT's _dock), the row's
+  // placeholder in front of send takes the auto margin instead.
+  assert.match(strip(section), /\[class\$="_row"\]::before \{\s*content: '';\s*order: 6;\s*flex: 0 0 \$\{RING_W\};\s*margin-left: auto;/)
 })
 
 test('send gives the gap back whenever a ring precedes it', () => {
   // Two auto margins would share the free space and open a second gap
   // between the ring and the send button.
-  assert.match(strip(section), /span\[class\$="_root"\] ~ \[class\$="_primary"\] \{\s*margin-left: 0 !important;/)
+  assert.match(strip(section), /\$\{ROOT\}:has\(> \[class\$="_dock"\] button\) > \[class\$="_card"\] > \[class\$="_row"\] > \[class\$="_trailing"\] > \[class\$="_primary"\] \{\s*margin-left: 0 !important;/)
+})
+
+test('the ContextMeter dock is lifted back beside send on the phone', () => {
+  // 0.1.7 renders the ring in a _dock line under the card; unlifted it
+  // falls to the bottom of the phone screen.
+  assert.match(strip(section), /\$\{ROOT\} > \[class\$="_dock"\] \{\s*position: absolute !important;/)
 })
