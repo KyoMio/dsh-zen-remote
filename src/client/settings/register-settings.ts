@@ -23,7 +23,7 @@ import type { ClientContext } from '../compat/types.ts'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: the renderer declares `ctx.slots` on the cordis Context.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-import { ZenRemoteSettingsForm } from '../../client-data/settings-form.ts'
+import { DEVICE_TOKEN_FIELD, ZenRemoteSettingsForm } from '../../client-data/settings-form.ts'
 import { NS, en, zh } from '../locales.ts'
 import { SETTINGS_CSS } from './settings-css.ts'
 import type { SettingsSection } from './SettingsSection.tsx'
@@ -82,10 +82,25 @@ export function registerSettingsPage(ctx: ClientContext, section: typeof Setting
   // over, and the plugin row must still load.
   ctx.inject(['configForms'], (formsCtx) => {
     const scope = formsCtx.configForms.get(SETTINGS_ENTRY_ID)
-    const config = new ZenRemoteSettingsForm(scope)
-    // The controller holds a scope subscription; release it when the fiber
-    // that built it is disposed (same cleanup the verifier plugin wires).
-    formsCtx.effect(() => () => config.dispose(), 'dsh-zen-remote: settings form')
+    // The device token's configured flag rides the describe view's secrets
+    // sidecar: the key literal never rides a response, so presence is all
+    // the client learns (same seam as dsh-llm-verifier). A token can be
+    // written or cleared from elsewhere (pairing runs through the same
+    // entry); the scope subscription misses a secrets-only move, so follow
+    // the describe mirror too.
+    const describe = formsCtx.configForms.describe()
+    const secretConfigured = (): boolean => {
+      const namespaces = describe.getSnapshot().view?.namespaces ?? []
+      const row = namespaces.find((candidate) => candidate.ns === SETTINGS_ENTRY_ID)
+      return (row?.secrets ?? []).some(
+        (secret) => secret.path.length === 1 && secret.path[0] === DEVICE_TOKEN_FIELD && secret.set,
+      )
+    }
+    const config = new ZenRemoteSettingsForm(scope, secretConfigured)
+    // The controller holds a scope subscription; release it (and the
+    // describe follow) when the fiber that built it is disposed.
+    const offDescribe = describe.subscribe(() => { config.refresh() })
+    formsCtx.effect(() => () => { offDescribe(); config.dispose() }, 'dsh-zen-remote: settings form')
     formsCtx.effect(() => formsCtx.configForms.whileServed([SETTINGS_ENTRY_ID], () =>
       formsCtx.slots.inject('plugins.row.config', () => formsCtx.slots.register({
         name: 'plugins.row.config',

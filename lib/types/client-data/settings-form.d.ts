@@ -2,16 +2,20 @@
  * Staged configuration form for the `dsh-zen-remote` plugin row, in the same
  * shape the dsh-llm-verifier page uses (a control stages what the user types,
  * one save writes every staged edit as a single revision-fenced path mutation
- * through the shared `configForms` form). Two pieces, both free of browser
- * imports so tests drive them directly:
+ * through the shared `configForms` form). Browser-import-free so tests drive
+ * it directly:
  *
  * - `deriveSettingsView(status)` maps the `GET /_dsh/zen-remote/admin/status`
  *   body (T14's same-origin route wrapping the gateway's local admin API) into
  *   what the settings block renders: per-field effective value + source layer,
  *   the device list, the live pairing code with its remaining seconds, and the
  *   `viaGateway` flag that disables every server-local operation.
+ * - `deriveClientStatusView(status)` maps the `GET /_dsh/zen-remote/client/status`
+ *   body (T16's sub-client probe) into the client group's connection line.
  * - `ZenRemoteSettingsForm` stages the row-layer field edits and saves them as
- *   one `mutate(ops, expectedRevision)` call.
+ *   one `mutate(ops, expectedRevision)` call, and owns the two DIRECT writes
+ *   of the client group (pairing write / token clear) plus the device token's
+ *   configured flag read from the describe view's secrets sidecar.
  *
  * The wire contract lives here because the host half that serves it is a
  * separate task; the shapes mirror `lib/lan-gate-server.cjs`'s status payload
@@ -71,6 +75,87 @@ export declare const ADMIN_STATUS_ROUTE = "/_dsh/zen-remote/admin/status";
 export declare const ADMIN_PAIR_ROUTE = "/_dsh/zen-remote/admin/pair";
 export declare const ADMIN_ACTION_ROUTE = "/_dsh/zen-remote/admin/action";
 export declare const ADMIN_PUSH_TEST_ROUTE = "/_dsh/zen-remote/admin/push-test";
+/** Same-origin client routes the sub-client block talks to (host half: T16). */
+export declare const CLIENT_CLAIM_ROUTE = "/_dsh/zen-remote/client/claim";
+export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
+/** Field name of the row secret the pairing flow writes (never echoed back
+ * anywhere; the describe view's secrets sidecar is the only "is it set"). */
+export declare const DEVICE_TOKEN_FIELD = "deviceToken";
+/** The `GET /_dsh/zen-remote/client/status` body, exactly as
+ * src/client-routes.ts answers it: `serverUrl` is present only once a token
+ * exists (the unpaired answer is `{ state: 'unpaired' }` alone). The token
+ * itself never rides any status response. */
+export interface ClientStatusBody {
+    state?: string;
+    serverUrl?: string;
+}
+/** One client connection as the block renders it. */
+export interface ClientConnectionView {
+    state: 'unpaired' | 'connected' | 'revoked' | 'unreachable' | 'unexpected' | 'invalid-url';
+    serverUrl: string;
+}
+/**
+ * Map one `client/status` body into the view the client group renders.
+ * Tolerant like {@link deriveSettingsView}: an unexpected shape degrades to
+ * "unpaired" instead of throwing into the plugin page.
+ */
+export declare function deriveClientStatusView(body: ClientStatusBody): ClientConnectionView;
+/** The `POST /_dsh/zen-remote/client/claim` body (T16's pairing round-trip;
+ * on success `token` is the gateway-minted device token — it appears exactly
+ * once, on its way into the row's secret field). */
+export interface ClaimRouteBody {
+    ok?: boolean;
+    token?: unknown;
+    deviceId?: unknown;
+    deviceName?: unknown;
+    /** The normalized address the backend validated — what the form writes. */
+    serverUrl?: unknown;
+    code?: string;
+    message?: string;
+    retryAfterMs?: number;
+}
+/** What the pairing-code box keeps as its draft: uppercase, no spaces or
+ * hyphens (the gateway strips every other character at claim time anyway). */
+export declare function normalizePairingCode(input: string): string;
+/**
+ * Latest-wins sequencing for the status loads: every request takes a ticket,
+ * and only the newest ticket may still apply its result. An earlier request
+ * that answers LATE is dropped, so a stale body can never overwrite a fresh
+ * one (a revoked device reappearing, an old "no pairing code" answer wiping
+ * a just-minted code, an unpair racing a refresh).
+ */
+export interface LatestGate {
+    /** Issue the ticket for one new in-flight request. */
+    next(): number;
+    /** Whether that ticket is still the newest issued one. */
+    isLatest(ticket: number): boolean;
+}
+export declare function createLatestGate(): LatestGate;
+/**
+ * The SAVED role of the plugin row, read from the configForms snapshot's row
+ * document — the settings page's ONLY role signal (T16-fix 3). The resolved
+ * role an admin/status body reports is unusable here: a client deployment has
+ * no admin route at all, and a stale kept body pinned the page to the old
+ * role after a switch. `value` is the schema-resolved section the Host
+ * accepted; a row value that only lives in the raw user layer reads from
+ * there. Anything but the exact string `'client'` — an empty row included —
+ * means host, matching resolveRole.
+ */
+export declare function savedRowRole(snapshot: {
+    value?: unknown;
+    user?: unknown;
+}): 'host' | 'client';
+/**
+ * Which status source the page polls for one scope snapshot. While the
+ * namespace mirror is still loading the role is not knowable and NOTHING is
+ * polled — a client deployment must never see a wasted `admin/status` 404;
+ * once settled, a client row polls ONLY `client/status` and a host row
+ * `admin/status`.
+ */
+export declare function settingsPollOf(status: 'loading' | 'ready' | 'unavailable', snapshot: {
+    value?: unknown;
+    user?: unknown;
+}): 'none' | 'admin' | 'client';
 /** One path-addressed edit a save sends (the wire `SettingsPathOpView` shape). */
 export type SettingsFormOp = {
     op: 'set';
@@ -103,6 +188,30 @@ export interface SettingsFormScope {
     mutate(ops: readonly SettingsFormOp[], expectedRevision?: number): Promise<boolean>;
 }
 /**
+ * One secret path in the describe view's sidecar: the path plus whether it
+ * is set — the VALUE itself never rides any describe surface.
+ */
+export interface DescribeSecret {
+    path: string[];
+    set: boolean;
+}
+/**
+ * The `configForms.describe()` mirror (structural, like {@link ConfigFormsLike}
+ * — the dsh-client-ui-settings package is not a dependency). Read only for
+ * the secrets sidecar: whether the row's `deviceToken` is set.
+ */
+export interface ConfigFormsDescribe {
+    getSnapshot(): {
+        view?: {
+            namespaces?: ReadonlyArray<{
+                ns: string;
+                secrets?: ReadonlyArray<DescribeSecret>;
+            }>;
+        };
+    };
+    subscribe(listener: () => void): () => void;
+}
+/**
  * The `configForms` service face this plugin uses, mirrored onto the cordis
  * Context. Declared locally (the dsh-client-ui-settings package is not a
  * dependency — same trick as the local `UiWorkspaceLike`): the runtime
@@ -111,6 +220,7 @@ export interface SettingsFormScope {
  */
 export interface ConfigFormsLike {
     get(entryId: string): SettingsFormScope;
+    describe(): ConfigFormsDescribe;
     whileServed(namespaces: readonly string[], register: (served: ReadonlySet<string>) => () => void): () => void;
 }
 /** The write one staged draft performs when the form is saved. */
@@ -225,8 +335,17 @@ export interface SettingsFieldState {
     text: string;
     overridden: boolean;
     invalid: boolean;
+    /** A clear is staged: the box keeps showing the CURRENT value — the next
+     * layer's value only exists after the save — and the field renders the
+     * "reverts on save" hint instead of a fake preview. */
+    cleared: boolean;
     /** `admin/status` reported this field's value locked by an environment variable. */
     locked: boolean;
+}
+/** The row secret's face: presence only, never a value. */
+export interface SettingsSecretFieldState {
+    /** The describe view's secrets sidecar reports `deviceToken` set. */
+    configured: boolean;
 }
 /** The whole staged-form snapshot the page renders. */
 export interface ZenRemoteFormState extends SettingsFormShellState {
@@ -244,6 +363,7 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
     serverName: SettingsFieldState;
     idleHours: SettingsFieldState;
     autoShareNewSessions: SettingsFieldState;
+    deviceToken: SettingsSecretFieldState;
 }
 /**
  * Stages one page's edits over the plugin row's shared form and writes them on
@@ -255,7 +375,14 @@ export declare class ZenRemoteSettingsForm {
     private readonly listeners;
     private readonly staged;
     private readonly lockedFields;
+    /** Fields whose saved row value `admin/status` reported invalid
+     * (savedRowInvalid): those display the RAW stored value instead of the
+     * resolved one, so the user can see (and fix) what they actually wrote. */
+    private readonly rowInvalidFields;
     private readonly scope;
+    /** Reads the describe view's secrets sidecar for `deviceToken`'s
+     * configured flag; injectable so tests run without a describe mirror. */
+    private readonly secretConfigured;
     /** Effective values from `admin/status`'s `config.values` — what a field
      * displays while the row layer does not carry it. Empty until the page's
      * first status load feeds it via {@link setBaseline}. */
@@ -268,11 +395,13 @@ export declare class ZenRemoteSettingsForm {
     private readonly unsubscribe;
     /**
      * @param scope - the shared configuration form for the plugin row entry.
-     * (`scope` is assigned in the body rather than as a parameter property:
-     * scripts/check-settings-form.mjs imports this module through Node's
-     * strip-only type stripping, which rejects that syntax.)
+     * (`scope` and `secretConfigured` are assigned in the body rather than as
+     * parameter properties: scripts/check-settings-form.mjs imports this module
+     * through Node's strip-only type stripping, which rejects that syntax.)
+     * @param secretConfigured - whether the row's device token is set, read
+     * from the describe view's secrets sidecar; defaults to "not set".
      */
-    constructor(scope: SettingsFormScope);
+    constructor(scope: SettingsFormScope, secretConfigured?: () => boolean);
     /** @returns the current form snapshot (stable reference until the next change). */
     getSnapshot(): ZenRemoteFormState;
     /** Observe snapshot replacements (the renderer binds this as its store). */
@@ -281,6 +410,56 @@ export declare class ZenRemoteSettingsForm {
     refresh(): void;
     /** Replace the set of environment-locked fields reported by admin/status. */
     setLockedFields(fields: Iterable<string>): void;
+    /**
+     * Replace the set of fields whose saved row value resolveConfig rejected
+     * (admin/status's savedRowInvalid). Those keep showing the RAW stored
+     * value — the resolved value belongs to another layer and would hide the
+     * mistake the user needs to fix.
+     */
+    setRowInvalidFields(fields: Iterable<string>): void;
+    /**
+     * The entry document's stored value for one field (the shared form
+     * snapshot's `value` — the redacted section: secrets never ride it). What
+     * the client group prefills the server address from, and what the page
+     * reads the SAVED role from (the role field's display text also carries
+     * staged drafts, which must not flip the page's mode).
+     */
+    rowValue(field: string): unknown;
+    /**
+     * The scope sync state as the shared form sees it. The page waits it out
+     * before choosing a status source: a 'loading' snapshot cannot answer the
+     * role yet (T16-fix 3).
+     */
+    scopeStatus(): 'loading' | 'ready' | 'unavailable';
+    /**
+     * Which status source the page should poll right now ({@link settingsPollOf}
+     * over the live snapshot): `none` while the mirror loads, `client` for a
+     * client row — never admin there — and `admin` otherwise.
+     */
+    statusPoll(): 'none' | 'admin' | 'client';
+    /**
+     * Whether the SAVED row role is client ({@link savedRowRole} over the live
+     * snapshot) — the page mode's single source of truth.
+     */
+    savedRoleIsClient(): boolean;
+    /**
+     * One direct write for the pairing flow (T16): the normalized server
+     * address and the token just redeemed from the server ride ONE
+     * revision-fenced mutate. Not a staged edit — both fields are volatile row
+     * settings and apply immediately. @returns whether the write landed.
+     */
+    writeClientPairing(serverUrl: string, token: string): Promise<boolean>;
+    /**
+     * One direct write for unpairing: forget the token, keep the address so
+     * the next pairing only needs a fresh code.
+     */
+    clearDeviceToken(): Promise<boolean>;
+    /**
+     * The shared write path of the two pairing flows. Deliberately does NOT
+     * touch the frame's `failed` flag — a refused pairing write surfaces in
+     * the client group's own copy, not as a staged-save failure.
+     */
+    private directWrite;
     /**
      * Feed the effective values (`admin/status`'s `config.values`) the fields
      * display while the row layer does not carry them; also the baseline the
@@ -317,10 +496,14 @@ export declare class ZenRemoteSettingsForm {
      * The value one field DISPLAYS, which is also the baseline a draft must
      * differ from to count as a change: an env-locked field shows the effective
      * value (a written one would be shadowed anyway); a field the row layer
-     * stores shows the stored raw value verbatim (alongside the invalid-saved
-     * note when resolveConfig skipped it); otherwise the effective value wins.
-     * Before the first status load the shared form's own effective layer stands
-     * in, so drafts behave sensibly even with no admin/status yet.
+     * stores shows the RESOLVED value from admin/status — resolveConfig
+     * normalizes stored shapes (a trustedProxies array becomes the comma
+     * string, pushTool 1 becomes true) and the box must match what a save
+     * writes — EXCEPT when the saved row value was rejected (savedRowInvalid):
+     * then the raw stored value shows, so the user sees the mistake; before
+     * the first status load the stored raw value stands in, and otherwise the
+     * shared form's own effective layer does, so drafts behave sensibly even
+     * with no admin/status yet.
      */
     private displayValue;
     private anyInvalid;

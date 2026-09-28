@@ -164,6 +164,12 @@ export const SETTINGS_CSS = `
   height: 15px;
   accent-color: var(--dsw-alias-label-primary);
 }
+[data-zen-remote="settings"] .zr-settings-code-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  max-width: 220px;
+}
 [data-zen-remote="settings"] .zr-settings-pair-code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 28px;

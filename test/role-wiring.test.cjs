@@ -222,6 +222,43 @@ test('admin routes register on the host role only', async () => {
   assert.equal(adminRoutes[0].kind, 'prefix')
 })
 
+test('T16: client routes register on the client role only', async () => {
+  const index = await import(INDEX_URL)
+  const CLIENT_PREFIX = '/_dsh/zen-remote/client'
+  const ADMIN_PREFIX = '/_dsh/zen-remote/admin'
+
+  // Same executing-inject fake as the admin test above: the client routes
+  // need webServer + connection, so this is the composition where the role
+  // gate is observable at all.
+  function ctxRecording(routes) {
+    const services = {
+      logger: { warn() {} },
+      webServer: { register: (route) => { routes.push(route); return () => {} } },
+      sessions: { get: () => undefined },
+      sessionQuery: {},
+      connection: { admit: () => ({ peer: {} }) },
+    }
+    const ctx = {
+      plugin() {},
+      effect(fn) { fn() },
+      inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
+    }
+    return ctx
+  }
+
+  const clientRoutes = []
+  index.apply(ctxRecording(clientRoutes), { role: 'client' })
+  const clientPrefix = clientRoutes.filter((r) => String(r.path).startsWith(CLIENT_PREFIX))
+  assert.equal(clientPrefix.length, 1, "the client role registers the client prefix route")
+  assert.equal(clientPrefix[0].kind, 'prefix')
+  assert.equal(clientRoutes.filter((r) => String(r.path).startsWith(ADMIN_PREFIX)).length, 0, 'still no admin routes on the client role')
+
+  const hostRoutes = []
+  index.apply(ctxRecording(hostRoutes), {})
+  assert.equal(hostRoutes.filter((r) => String(r.path).startsWith(CLIENT_PREFIX)).length, 0, 'the host role must not register client routes')
+  assert.equal(hostRoutes.filter((r) => String(r.path).startsWith(ADMIN_PREFIX)).length, 1, 'the host keeps its admin prefix route')
+})
+
 test('the admin handler resolves config per request, volatile fields included', async () => {
   const index = await import(INDEX_URL)
   // A port that is closed NOW, so the handler's status call refuses instantly
