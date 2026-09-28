@@ -1,0 +1,688 @@
+/**
+ * Staged configuration form for the `dsh-zen-remote` plugin row, in the same
+ * shape the dsh-llm-verifier page uses (a control stages what the user types,
+ * one save writes every staged edit as a single revision-fenced path mutation
+ * through the shared `configForms` form). Two pieces, both free of browser
+ * imports so tests drive them directly:
+ *
+ * - `deriveSettingsView(status)` maps the `GET /_dsh/zen-remote/admin/status`
+ *   body (T14's same-origin route wrapping the gateway's local admin API) into
+ *   what the settings block renders: per-field effective value + source layer,
+ *   the device list, the live pairing code with its remaining seconds, and the
+ *   `viaGateway` flag that disables every server-local operation.
+ * - `ZenRemoteSettingsForm` stages the row-layer field edits and saves them as
+ *   one `mutate(ops, expectedRevision)` call.
+ *
+ * The wire contract lives here because the host half that serves it is a
+ * separate task; the shapes mirror `lib/lan-gate-server.cjs`'s status payload
+ * (devices / pairing) plus the T14 envelope (ok / gateway / config / viaGateway).
+ */
+
+// --- wire shapes -----------------------------------------------------------
+
+/** Where a resolved field value came from (mirror of src/config.ts's union; the client half cannot import the host module). */
+export type ConfigSource = 'env' | 'row' | 'file' | 'default'
+
+/** One paired gateway device, as the gateway's status payload lists it. */
+export interface AdminDevice {
+  id: string
+  name: string
+  role: 'web' | 'desktop-client'
+  kind: 'auto' | 'phone' | 'desktop'
+  createdAt: number
+  lastSeen: number
+  ua?: string
+  hasPush: boolean
+}
+
+/** The one currently-live pairing code, if any. */
+export interface AdminPairing {
+  code: string
+  expiresAt: number
+  role: 'web' | 'desktop-client'
+}
+
+/**
+ * The gateway's `/lan-gate/status` reply, relayed verbatim inside
+ * `admin/status`'s `gateway` field (see lib/lan-gate-server.cjs's
+ * statusHandler — this mirror keeps only what the settings block reads).
+ */
+export interface GatewayStatus {
+  state?: string
+  port?: number
+  target?: string
+  devices?: AdminDevice[]
+  pairing?: AdminPairing | null
+  pushSubscriptions?: number
+}
+
+/**
+ * The `GET /_dsh/zen-remote/admin/status` body, exactly as src/admin-routes.ts
+ * answers it: the gateway payload lives NESTED under `gateway` (null when the
+ * gateway did not answer healthily) and `gatewayStatus` is the HTTP status the
+ * route saw (`null` when there was no answer at all).
+ */
+export interface AdminStatusBody {
+  ok?: boolean
+  gateway?: GatewayStatus | null
+  gatewayReachable?: boolean
+  gatewayStatus?: number | null
+  config?: {
+    values?: Record<string, unknown>
+    sources?: Record<string, string>
+  }
+  viaGateway?: boolean
+}
+
+/** Same-origin admin routes the settings block talks to (host half: T14). */
+export const ADMIN_STATUS_ROUTE = '/_dsh/zen-remote/admin/status'
+export const ADMIN_PAIR_ROUTE = '/_dsh/zen-remote/admin/pair'
+export const ADMIN_ACTION_ROUTE = '/_dsh/zen-remote/admin/action'
+export const ADMIN_PUSH_TEST_ROUTE = '/_dsh/zen-remote/admin/push-test'
+
+// --- staged form (row layer) -----------------------------------------------
+
+/** One path-addressed edit a save sends (the wire `SettingsPathOpView` shape). */
+export type SettingsFormOp =
+  | { op: 'set', path: string[], value: unknown }
+  | { op: 'unset', path: string[] }
+
+/** Structural subset of the shared `ConfigForm` snapshot this form reads. */
+export interface SettingsFormScopeSnapshot {
+  status: 'loading' | 'ready' | 'unavailable'
+  value: Record<string, unknown> | undefined
+  /** Composition layer; what a field reverts to once cleared. */
+  base: unknown
+  /** Raw user layer as stored; field PRESENCE here marks an override. */
+  user: unknown
+  /** Revision fencing the next write; sent back as `expectedRevision`. */
+  revision: number | undefined
+  writable: boolean
+}
+
+/**
+ * The form face this controller stages over (structural subset of
+ * ui-settings' `ConfigForm` — declared locally because this package does not
+ * depend on the ui-settings types).
+ */
+export interface SettingsFormScope {
+  getSnapshot(): SettingsFormScopeSnapshot
+  subscribe(listener: () => void): () => void
+  mutate(ops: readonly SettingsFormOp[], expectedRevision?: number): Promise<boolean>
+}
+
+/**
+ * The `configForms` service face this plugin uses, mirrored onto the cordis
+ * Context. Declared locally (the dsh-client-ui-settings package is not a
+ * dependency — same trick as the local `UiWorkspaceLike`): the runtime
+ * instance is provided by the host, and the lazy `ctx.inject(['configForms'], …)`
+ * in register-settings keeps a composition without the service loadable.
+ */
+export interface ConfigFormsLike {
+  get(entryId: string): SettingsFormScope
+  whileServed(namespaces: readonly string[], register: (served: ReadonlySet<string>) => () => void): () => void
+}
+
+/** The write one staged draft performs when the form is saved. */
+export type SettingsFieldWrite = { kind: 'set', value: unknown } | { kind: 'clear' }
+
+/** How one field converts between its stored value and draft text. */
+export interface SettingsFieldSpec {
+  field: string
+  format(value: unknown): string
+  /** The staged write, or undefined when the draft is not a value this field accepts. */
+  parse(text: string): SettingsFieldWrite | undefined
+}
+
+/** Free-text field: an empty draft clears, so the field re-inherits its default. */
+export function textField(field: string): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (typeof value === 'string' ? value : ''),
+    parse: (text) => (text === '' ? { kind: 'clear' } : { kind: 'set', value: text }),
+  }
+}
+
+/** Whole-number field within inclusive bounds; empty clears, anything else out of range blocks the save. */
+export function intField(field: string, min: number, max: number): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (typeof value === 'number' && Number.isFinite(value) ? String(value) : ''),
+    parse: (text) => {
+      if (text.trim() === '') return { kind: 'clear' }
+      const n = Number(text)
+      if (!Number.isInteger(n) || n < min || n > max) return undefined
+      return { kind: 'set', value: n }
+    },
+  }
+}
+
+/** Finite number in (min, max] — the `idleHours` shape: zero excluded, 8760 allowed. */
+export function hoursField(field: string, max: number): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (typeof value === 'number' && Number.isFinite(value) ? String(value) : ''),
+    parse: (text) => {
+      if (text.trim() === '') return { kind: 'clear' }
+      const n = Number(text)
+      if (!Number.isFinite(n) || n <= 0 || n > max) return undefined
+      return { kind: 'set', value: n }
+    },
+  }
+}
+
+/** `serverName`: an empty draft clears; a blank-but-nonempty draft or one over
+ * the 40-character cap is invalid and blocks the save (src/config.ts clips at
+ * resolve time, so an over-long write would silently lose its tail). */
+export function nameField(field: string, max: number): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (typeof value === 'string' ? value : ''),
+    parse: (text) => {
+      if (text === '') return { kind: 'clear' }
+      if (text.trim() === '' || text.length > max) return undefined
+      return { kind: 'set', value: text }
+    },
+  }
+}
+
+/** One-of field over a fixed vocabulary (rendered as a select). */
+export function oneOfField(field: string, options: readonly string[]): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (typeof value === 'string' && options.includes(value) ? value : options[0] ?? ''),
+    parse: (text) => (options.includes(text) ? { kind: 'set', value: text } : undefined),
+  }
+}
+
+/** Boolean field staged as 'true'/'false' draft text (rendered as a checkbox). */
+export function boolField(field: string): SettingsFieldSpec {
+  return {
+    field,
+    format: (value) => (value === true ? 'true' : 'false'),
+    parse: (text) => (text === 'true' || text === 'false' ? { kind: 'set', value: text === 'true' } : undefined),
+  }
+}
+
+/** Names of the row fields the settings page edits, in group order. */
+export type SettingsFieldName =
+  | 'role'
+  | 'host'
+  | 'port'
+  | 'trustedProxies'
+  | 'rateLimit'
+  | 'vapidSubject'
+  | 'pushSummary'
+  | 'pushTurnEnd'
+  | 'pushTool'
+  | 'pushDebounceMs'
+  | 'lang'
+  | 'serverName'
+  | 'idleHours'
+  | 'autoShareNewSessions'
+
+/** Longest legal `serverName`, mirroring src/config.ts's cap. */
+export const SERVER_NAME_MAX = 40
+
+/** Upper bound of `idleHours`, mirroring src/config.ts. */
+export const IDLE_HOURS_MAX = 8760
+
+/** The row fields the settings page edits, in render order. */
+export const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
+  oneOfField('role', ['host', 'client']),
+  textField('host'),
+  intField('port', 1, 65535),
+  textField('trustedProxies'),
+  intField('rateLimit', 1, Number.MAX_SAFE_INTEGER),
+  textField('vapidSubject'),
+  boolField('pushSummary'),
+  boolField('pushTurnEnd'),
+  boolField('pushTool'),
+  intField('pushDebounceMs', 0, Number.MAX_SAFE_INTEGER),
+  oneOfField('lang', ['auto', 'zh', 'en']),
+  nameField('serverName', SERVER_NAME_MAX),
+  hoursField('idleHours', IDLE_HOURS_MAX),
+  boolField('autoShareNewSessions'),
+]
+
+// --- the status -> view mapping ---------------------------------------------
+
+/** Per-field presentation facts the block renders next to each control. */
+export interface SettingsFieldView {
+  /** Effective value (the resolved `config.values[field]`). */
+  value: unknown
+  /** Layer that supplied the effective value. */
+  source: ConfigSource
+  /** `source === 'env'`: shown locked, edits would be shadowed. */
+  locked: boolean
+  /** `source === 'file'`: the legacy lan-gate.config.json supplies this. */
+  fromFile: boolean
+  /** The row layer stores this field but another layer supplied the value —
+   * i.e. the saved value was illegal and resolveConfig skipped it. */
+  savedRowInvalid: boolean
+}
+
+/** One device row the block renders. */
+export interface SettingsDeviceView {
+  id: string
+  name: string
+  role: 'web' | 'desktop-client'
+  kind: 'auto' | 'phone' | 'desktop'
+  lastSeen: number
+  hasPush: boolean
+}
+
+/** The live pairing code with its countdown, or null when none is active. */
+export interface SettingsPairingView {
+  code: string
+  role: 'web' | 'desktop-client'
+  remainingSeconds: number
+}
+
+/** Everything the settings block renders, derived from one status body. */
+export interface SettingsView {
+  /** The status route answered ok. */
+  available: boolean
+  /** Which half this DSH process runs as (`client` shows only the role group). */
+  role: 'host' | 'client'
+  /** Opened through the gateway (a remote device): server-local operations disabled. */
+  viaGateway: boolean
+  /** Whether the gateway child answers. */
+  gatewayReachable: boolean
+  gatewayPort: number | undefined
+  gatewayTarget: string | undefined
+  /** The probe status the admin route saw from the gateway; null = no answer. */
+  gatewayStatus: number | null
+  /** `gatewayStatus` is a non-2xx reply: the status line shows the abnormal message instead. */
+  gatewayAbnormal: boolean
+  fields: Record<SettingsFieldName, SettingsFieldView>
+  devices: SettingsDeviceView[]
+  pairing: SettingsPairingView | null
+}
+
+export interface DeriveSettingsOptions {
+  /** Clock for the pairing countdown; defaults to `Date.now()`. */
+  now?: number
+  /** The shared form snapshot's raw user layer; field presence marks a row-layer override. */
+  rowUser?: unknown
+}
+
+const asRecord = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+
+const asStringSet = (value: unknown): string =>
+  typeof value === 'string' ? value : ''
+
+/**
+ * Map one `admin/status` body into the view the settings block renders.
+ * Tolerant by design: every wire field is optional, an unexpected shape
+ * degrades to the conservative rendering (status unavailable, gateway down,
+ * no devices, no pairing) instead of throwing into the plugin page.
+ */
+export function deriveSettingsView(status: AdminStatusBody, options: DeriveSettingsOptions = {}): SettingsView {
+  const now = options.now ?? Date.now()
+  const values = asRecord(status.config?.values)
+  const sources = asRecord(status.config?.sources)
+  const rowUser = asRecord(options.rowUser)
+  // The gateway payload rides NESTED (`gateway` = /lan-gate/status verbatim);
+  // null means the gateway did not answer healthily — devices and the pairing
+  // code both render as empty then.
+  const gateway = status.gateway === null || typeof status.gateway !== 'object' ? undefined : status.gateway
+
+  const fields = {} as Record<SettingsFieldName, SettingsFieldView>
+  for (const spec of SETTINGS_FIELDS) {
+    const rawSource = sources[spec.field]
+    const source: ConfigSource =
+      rawSource === 'env' || rawSource === 'row' || rawSource === 'file' || rawSource === 'default'
+        ? rawSource
+        : 'default'
+    fields[spec.field as SettingsFieldName] = {
+      value: values[spec.field],
+      source,
+      locked: source === 'env',
+      fromFile: source === 'file',
+      // Being shadowed by an environment variable is not "invalid" (the lock
+      // badge already says so) — only a skipped row value under a non-env
+      // winner marks the saved value as rejected by resolveConfig.
+      savedRowInvalid: Object.hasOwn(rowUser, spec.field) && source !== 'row' && source !== 'env',
+    }
+  }
+
+  const devices: SettingsDeviceView[] = (Array.isArray(gateway?.devices) ? gateway.devices : [])
+    .map((device) => {
+      const record = asRecord(device)
+      const kind = record.kind === 'phone' ? 'phone' as const : record.kind === 'desktop' ? 'desktop' as const : 'auto' as const
+      return {
+        id: asStringSet(record.id),
+        name: asStringSet(record.name),
+        role: record.role === 'desktop-client' ? 'desktop-client' as const : 'web' as const,
+        kind,
+        lastSeen: typeof record.lastSeen === 'number' && Number.isFinite(record.lastSeen) ? record.lastSeen : 0,
+        hasPush: record.hasPush === true,
+      }
+    })
+    .filter((device) => device.id !== '')
+
+  const rawPairing = asRecord(gateway?.pairing)
+  const code = asStringSet(rawPairing.code)
+  const expiresAt = rawPairing.expiresAt
+  const pairing: SettingsPairingView | null =
+    code !== '' && typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt > now
+      ? {
+          code,
+          role: rawPairing.role === 'desktop-client' ? 'desktop-client' : 'web',
+          remainingSeconds: Math.max(0, Math.ceil((expiresAt - now) / 1000)),
+        }
+      : null
+
+  const gatewayStatus = typeof status.gatewayStatus === 'number' && Number.isFinite(status.gatewayStatus)
+    ? status.gatewayStatus
+    : null
+  return {
+    available: status.ok === true,
+    role: values.role === 'client' ? 'client' : 'host',
+    viaGateway: status.viaGateway === true,
+    gatewayReachable: status.gatewayReachable === true,
+    gatewayPort: typeof gateway?.port === 'number' && Number.isFinite(gateway.port) ? gateway.port : undefined,
+    gatewayTarget: typeof gateway?.target === 'string' ? gateway.target : undefined,
+    gatewayStatus,
+    // A non-null, non-2xx probe reply: the status line swaps to the abnormal message.
+    gatewayAbnormal: gatewayStatus !== null && !(gatewayStatus >= 200 && gatewayStatus < 300),
+    fields,
+    devices,
+    pairing,
+  }
+}
+
+// --- the controller ----------------------------------------------------------
+
+/** Card-level state the shared form frame renders. */
+export interface SettingsFormShellState {
+  available: boolean
+  writable: boolean
+  dirty: boolean
+  invalid: boolean
+  saving: boolean
+  failed: boolean
+}
+
+/** One control's state as its field renders it. */
+export interface SettingsFieldState {
+  text: string
+  overridden: boolean
+  invalid: boolean
+  /** `admin/status` reported this field's value locked by an environment variable. */
+  locked: boolean
+}
+
+/** The whole staged-form snapshot the page renders. */
+export interface ZenRemoteFormState extends SettingsFormShellState {
+  role: SettingsFieldState
+  host: SettingsFieldState
+  port: SettingsFieldState
+  trustedProxies: SettingsFieldState
+  rateLimit: SettingsFieldState
+  vapidSubject: SettingsFieldState
+  pushSummary: SettingsFieldState
+  pushTurnEnd: SettingsFieldState
+  pushTool: SettingsFieldState
+  pushDebounceMs: SettingsFieldState
+  lang: SettingsFieldState
+  serverName: SettingsFieldState
+  idleHours: SettingsFieldState
+  autoShareNewSessions: SettingsFieldState
+}
+
+/** One staged draft: typed text, or an explicit clear back to the composition layer. */
+type Staged = { text: string } | { clear: true }
+
+/**
+ * Stages one page's edits over the plugin row's shared form and writes them on
+ * save as one atomic, revision-fenced mutation. Fields whose `admin/status`
+ * source is `env` are locked via {@link setLockedFields}: they cannot be
+ * staged, because a written value would be shadowed by the environment anyway.
+ */
+export class ZenRemoteSettingsForm {
+  private readonly listeners = new Set<() => void>()
+  private readonly staged = new Map<string, Staged>()
+  private readonly lockedFields = new Set<string>()
+  private readonly scope: SettingsFormScope
+  /** Effective values from `admin/status`'s `config.values` — what a field
+   * displays while the row layer does not carry it. Empty until the page's
+   * first status load feeds it via {@link setBaseline}. */
+  private baseline: Record<string, unknown> = {}
+  private saving = false
+  private failed = false
+  /** Revision the drafts started from; the save's `expectedRevision` fence. */
+  private stagedRevision: number | undefined
+  private cache: ZenRemoteFormState | undefined
+  private readonly unsubscribe: () => void
+
+  /**
+   * @param scope - the shared configuration form for the plugin row entry.
+   * (`scope` is assigned in the body rather than as a parameter property:
+   * scripts/check-settings-form.mjs imports this module through Node's
+   * strip-only type stripping, which rejects that syntax.)
+   */
+  constructor(scope: SettingsFormScope) {
+    this.scope = scope
+    this.unsubscribe = scope.subscribe(() => { this.publish() })
+  }
+
+  /** @returns the current form snapshot (stable reference until the next change). */
+  getSnapshot(): ZenRemoteFormState {
+    if (this.cache === undefined) this.cache = this.project()
+    return this.cache
+  }
+
+  /** Observe snapshot replacements (the renderer binds this as its store). */
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  /** Republish from the current reads (admin/status moved underneath). */
+  refresh(): void {
+    this.publish()
+  }
+
+  /** Replace the set of environment-locked fields reported by admin/status. */
+  setLockedFields(fields: Iterable<string>): void {
+    this.lockedFields.clear()
+    for (const field of fields) this.lockedFields.add(field)
+    this.publish()
+  }
+
+  /**
+   * Feed the effective values (`admin/status`'s `config.values`) the fields
+   * display while the row layer does not carry them; also the baseline the
+   * "did the user change anything" comparison reads.
+   */
+  setBaseline(values: unknown): void {
+    this.baseline = asRecord(values)
+    this.publish()
+  }
+
+  /** Stage draft text for one row field; ignored for env-locked fields. */
+  stage(field: string, text: string): void {
+    if (this.lockedFields.has(field)) return
+    this.staged.set(field, { text })
+    this.noteStage()
+  }
+
+  /** Stage a clear so the field re-inherits the composition layer; ignored for env-locked fields. */
+  resetField(field: string): void {
+    if (this.lockedFields.has(field)) return
+    this.staged.set(field, { clear: true })
+    this.noteStage()
+  }
+
+  /** Drop every staged edit. */
+  discard(): void {
+    if (this.staged.size === 0 && !this.failed) return
+    this.staged.clear()
+    this.stagedRevision = undefined
+    this.failed = false
+    this.publish()
+  }
+
+  /**
+   * The raw user layer as the shared form stores it; a field's presence here
+   * marks a row-layer override, which is what `savedRowInvalid` compares
+   * against.
+   */
+  rowUser(): Record<string, unknown> {
+    return asRecord(this.scope.getSnapshot().user)
+  }
+
+  /** Whether a save would do anything and is allowed to run right now. */
+  canSave(): boolean {
+    const snap = this.scope.getSnapshot()
+    return snap.status === 'ready'
+      && snap.writable
+      && !this.saving
+      && this.plan().length > 0
+      && !this.anyInvalid()
+  }
+
+  /**
+   * Write every staged edit as one mutation fenced by the revision the drafts
+   * started from. The Host is the only authority on acceptance: a refused
+   * save keeps its drafts for correction.
+   * @returns whether the save landed.
+   */
+  async save(): Promise<boolean> {
+    const ops = this.plan()
+    const snap = this.scope.getSnapshot()
+    if (ops.length === 0 || this.saving || snap.status !== 'ready' || !snap.writable || this.anyInvalid()) return false
+    this.saving = true
+    this.failed = false
+    this.publish()
+    try {
+      const landed = await this.scope.mutate(ops, this.stagedRevision ?? snap.revision)
+      if (!landed) {
+        this.failed = true
+        return false
+      }
+      this.staged.clear()
+      this.stagedRevision = undefined
+      return true
+    } catch {
+      this.failed = true
+      return false
+    } finally {
+      this.saving = false
+      this.publish()
+    }
+  }
+
+  /** Release the scope subscription. */
+  dispose(): void {
+    this.unsubscribe()
+    this.listeners.clear()
+  }
+
+  private noteStage(): void {
+    if (this.stagedRevision === undefined) this.stagedRevision = this.scope.getSnapshot().revision
+    this.failed = false
+    this.publish()
+  }
+
+  /** Whether the user layer currently carries an entry for one field. */
+  private stored(field: string): boolean {
+    return Object.hasOwn(asRecord(this.scope.getSnapshot().user), field)
+  }
+
+  /**
+   * The value one field DISPLAYS, which is also the baseline a draft must
+   * differ from to count as a change: an env-locked field shows the effective
+   * value (a written one would be shadowed anyway); a field the row layer
+   * stores shows the stored raw value verbatim (alongside the invalid-saved
+   * note when resolveConfig skipped it); otherwise the effective value wins.
+   * Before the first status load the shared form's own effective layer stands
+   * in, so drafts behave sensibly even with no admin/status yet.
+   */
+  private displayValue(field: string): unknown {
+    if (this.lockedFields.has(field)) return this.baseline[field]
+    const user = asRecord(this.scope.getSnapshot().user)
+    if (Object.hasOwn(user, field)) return user[field]
+    if (Object.hasOwn(this.baseline, field)) return this.baseline[field]
+    return this.scope.getSnapshot().value?.[field]
+  }
+
+  private anyInvalid(): boolean {
+    return SETTINGS_FIELDS.some((spec) => {
+      const draft = this.staged.get(spec.field)
+      return draft !== undefined && 'text' in draft && spec.parse(draft.text) === undefined
+    })
+  }
+
+  /**
+   * Every staged edit a save would send, in field order, mirroring the
+   * upstream form model's plan: a draft equal to the field's current value is
+   * no change at all; a reset only writes when the user layer actually
+   * carries the field; an invalid draft produces none — the save refuses
+   * rather than dropping the edit; a locked field never produces one.
+   */
+  private plan(): SettingsFormOp[] {
+    const ops: SettingsFormOp[] = []
+    for (const spec of SETTINGS_FIELDS) {
+      if (this.lockedFields.has(spec.field)) continue
+      const draft = this.staged.get(spec.field)
+      if (draft === undefined) continue
+      if ('clear' in draft) {
+        if (this.stored(spec.field)) ops.push({ op: 'unset', path: [spec.field] })
+        continue
+      }
+      if (draft.text === spec.format(this.displayValue(spec.field))) continue
+      const write = spec.parse(draft.text)
+      if (write === undefined) continue
+      ops.push(write.kind === 'clear'
+        ? { op: 'unset', path: [spec.field] }
+        : { op: 'set', path: [spec.field], value: write.value })
+    }
+    return ops
+  }
+
+  private project(): ZenRemoteFormState {
+    const snap = this.scope.getSnapshot()
+    const base = asRecord(snap.base)
+    const user = asRecord(snap.user)
+    const fields = {} as Record<SettingsFieldName, SettingsFieldState>
+    for (const spec of SETTINGS_FIELDS) {
+      const draft = this.staged.get(spec.field)
+      const stagedClear = draft !== undefined && 'clear' in draft
+      const stagedText = draft !== undefined && 'text' in draft ? draft.text : undefined
+      // A staged clear previews what the field reverts to: the composition layer.
+      const text = stagedText ?? (stagedClear ? spec.format(base[spec.field]) : spec.format(this.displayValue(spec.field)))
+      const overridden = draft === undefined
+        ? Object.hasOwn(user, spec.field)
+        : 'clear' in draft
+          ? false
+          : spec.parse(draft.text)?.kind === 'set'
+      const invalid = stagedText !== undefined && spec.parse(stagedText) === undefined
+      fields[spec.field as SettingsFieldName] = {
+        text,
+        overridden,
+        invalid,
+        locked: this.lockedFields.has(spec.field),
+      }
+    }
+    return {
+      available: snap.status === 'ready',
+      writable: snap.writable,
+      dirty: this.plan().length > 0,
+      invalid: this.anyInvalid(),
+      saving: this.saving,
+      failed: this.failed,
+      ...fields,
+    }
+  }
+
+  private publish(): void {
+    this.cache = this.project()
+    for (const listener of this.listeners) listener()
+  }
+}

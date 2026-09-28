@@ -5,10 +5,10 @@
     "moduleResolution": "node",
     "ignoreDeprecations": "6.0",
     "jsx": "react-jsx",
-    "rootDir": "src/client",
+    "rootDir": "src",
     "outDir": ".client-build",
     "declaration": true,
-    "declarationDir": "lib/types/client",
+    "declarationDir": "lib/types",
     "sourceMap": true,
     "declarationMap": true,
     "strict": true,
@@ -93,7 +93,8 @@
   },
   "include": [
     "src/client/**/*.ts",
-    "src/client/**/*.tsx"
+    "src/client/**/*.tsx",
+    "src/client-data/**/*.ts"
   ],
   "exclude": [
     "lib",

@@ -24,8 +24,10 @@ import { installWelcomeNoticeOptOut } from './effects/welcome-notice.ts'
 import { installKeyboardGuard } from './effects/keyboard-guard.ts'
 import { installKeyboardAvoid } from './effects/keyboard-avoid.ts'
 import { SharePreview } from './share/share-preview.tsx'
-import { NS, en, zh } from './locales.ts'
+import { NS } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
+import { SettingsSection } from './settings/SettingsSection.tsx'
+import { registerSettingsPage } from './settings/register-settings.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -91,6 +93,12 @@ function activityInject(ctx: ClientContext) {
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
+  // 2.0.0 设置页：必须在桌面门之前注册——桌面端 App 里手机外壳整体不生效，
+  // 但设置页必须生效（主服务端就是桌面端）。字典、设置页样式与设置表单服务
+  // 的按需注入都在 registerSettingsPage 里（那个服务名绝不进顶层的 inject
+  // 数组，否则没有该服务的环境整个界面半边都加载不了）。
+  registerSettingsPage(ctx, SettingsSection)
+
   // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
   // down to ~520px wide, where every width-based gate would flip the phone
   // shell on inside the desktop app. Inside that shell this plugin is a
@@ -99,8 +107,6 @@ export function apply(ctx: ClientContext): void {
   // there (they exist for narrow desktop *browsers*, which never carry the
   // dshDesktop bridge). See compat/desktop.ts for the marker's provenance.
   if (isDesktopShell()) return
-
-  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-mobile-nav: dictionaries')
 
   ctx.effect(() => {
     const tag = document.createElement('style')

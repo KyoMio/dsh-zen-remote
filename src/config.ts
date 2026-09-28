@@ -71,7 +71,9 @@ export interface ZenRemoteConfig {
   pushTool: boolean
   /** Server display name, at most {@link SERVER_NAME_MAX} characters. */
   serverName: string
-  /** Hours an auto-generated pairing QR stays valid; (0, 8760]. */
+  /** Idle-sleep window of a remote-enabled session: after this many hours
+   * without new activity the remote connection closes on its own; running or
+   * waiting sessions never count. (0, 8760]. */
   idleHours: number
   /** Auto-share every newly created session to the paired phone (T16). */
   autoShareNewSessions: boolean
