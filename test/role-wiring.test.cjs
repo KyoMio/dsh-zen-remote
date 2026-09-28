@@ -187,6 +187,9 @@ test("role 'client' mounts all three routes through a real inject and never call
     webServer: { register: (route) => { routes.push(route); return () => {} } },
     sessions: { get: () => undefined },
     sessionQuery: {},
+    // T17: the upload and share-export routes additionally need the
+    // connection service (their admission wall) to mount at all.
+    connection: { admit: () => ({ peer: {} }) },
   }
   // Unlike makeCtx, this fake EXECUTES the inject callbacks (when their
   // services exist), so the route registrations really run — the T11 review
@@ -199,15 +202,18 @@ test("role 'client' mounts all three routes through a real inject and never call
   }
   index.apply(ctx, { role: 'client' })
   assert.equal(pluginCalls.length, 0, 'the client role must not load the gateway or push halves')
+  // T17: with a connection service present, the client routes (T16) mount as
+  // well — the three phone routes plus the client prefix route.
   assert.deepEqual(
     routes.map((r) => r.path).sort(),
-    [index.UPLOAD_ROUTE, index.CLIENT_CONFIG_ROUTE, share.SHARE_EXPORT_ROUTE].sort(),
+    [index.UPLOAD_ROUTE, index.CLIENT_CONFIG_ROUTE, share.SHARE_EXPORT_ROUTE, '/_dsh/zen-remote/client'].sort(),
   )
 
   // Same wiring under the host role: the routes AND both sub-plugins. The
   // relay route is absent here only because this fake carries no
   // typertGateway service (its inject never fires) — the dedicated test
-  // below covers the composition that has one.
+  // below covers the composition that has one. The admin prefix (T14) does
+  // mount: this fake carries a connection service.
   const hostRoutes = []
   const hostServices = { ...services, webServer: { register: (route) => { hostRoutes.push(route); return () => {} } } }
   const hostCtx = {
@@ -218,7 +224,7 @@ test("role 'client' mounts all three routes through a real inject and never call
   }
   index.apply(hostCtx, {})
   assert.equal(pluginCalls.length, 2, 'the host role loads gateway and push on top of the routes')
-  assert.equal(hostRoutes.length, 3)
+  assert.equal(hostRoutes.length, 4)
 })
 
 test('admin routes register on the host role only', async () => {
@@ -359,7 +365,9 @@ test('the admin handler resolves config per request, volatile fields included', 
 const RELAY_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'relay-server.js')).href
 
 /** Fake ctx like the one above, plus a typertGateway service, so the relay
- * inject actually fires and the route registration can be inspected. */
+ * inject actually fires and the route registration can be inspected. The
+ * connection service is present too (T17): the upload and share-export
+ * routes mount only where it exists. */
 function makeWiringCtx(record) {
   const services = {
     logger: { warn() {} },
@@ -367,6 +375,7 @@ function makeWiringCtx(record) {
     sessions: { get: () => undefined },
     sessionQuery: {},
     typertGateway: { invoke: async () => ({}) },
+    connection: { admit: () => ({ peer: {} }) },
   }
   const ctx = {
     plugin: (module, config) => { record.plugins.push({ module, config }) },
@@ -382,9 +391,11 @@ test('T22a: the host role registers the relay prefix route and mints a fresh 64-
   const { RELAY_PREFIX } = await import(RELAY_URL)
   const first = { plugins: [], routes: [] }
   index.apply(makeWiringCtx(first), {})
-  const relay = first.routes.find((r) => r.kind === 'prefix')
+  // T17: makeWiringCtx carries a connection service, so the admin prefix
+  // route registers too — the relay is picked by PATH, not by being the only
+  // prefix.
+  const relay = first.routes.find((r) => r.path === RELAY_PREFIX)
   assert.ok(relay, 'the relay route is registered as a prefix route')
-  assert.equal(relay.path, RELAY_PREFIX)
   assert.equal(relay.path, '/_dsh/zen-remote/relay')
   assert.equal(typeof relay.handler, 'function')
   const gwConfig = first.plugins.find((c) => c.module.name === 'dsh-zen-remote-gateway').config
@@ -405,12 +416,14 @@ test("T22a: role 'client' registers no relay route even with typertGateway avail
   const record = { plugins: [], routes: [] }
   index.apply(makeWiringCtx(record), { role: 'client' })
   assert.equal(record.plugins.length, 0)
+  // T17: the connection service in this fake also mounts the client routes
+  // (T16) — the phone routes plus that prefix, still no relay anywhere.
   assert.deepEqual(
     record.routes.map((r) => r.path).sort(),
-    [index.UPLOAD_ROUTE, index.CLIENT_CONFIG_ROUTE, share.SHARE_EXPORT_ROUTE].sort(),
-    'exactly the three phone routes — no relay prefix',
+    [index.UPLOAD_ROUTE, index.CLIENT_CONFIG_ROUTE, share.SHARE_EXPORT_ROUTE, '/_dsh/zen-remote/client'].sort(),
+    'exactly the phone routes and the client prefix — no relay prefix',
   )
-  assert.ok(!record.routes.some((r) => r.kind === 'prefix'), 'no prefix route at all on the client role')
+  assert.ok(!record.routes.some((r) => r.path === '/_dsh/zen-remote/relay'), 'no relay route on the client role')
 })
 
 // A minimal ServerResponse stand-in: responseJson only sets headers, writes
@@ -431,7 +444,9 @@ test('T22a-fix: the minted relaySecret opens the registered relay handler, a wro
   const index = await import(INDEX_URL)
   const record = { plugins: [], routes: [] }
   index.apply(makeWiringCtx(record), {})
-  const relayRoute = record.routes.find((r) => r.kind === 'prefix')
+  // By path: T17 gave this fake a connection service, so the admin prefix
+  // registers alongside the relay's.
+  const relayRoute = record.routes.find((r) => r.path === '/_dsh/zen-remote/relay')
   const secret = record.plugins.find((c) => c.module.name === 'dsh-zen-remote-gateway').config.relaySecret
   const call = (requestSecret) => {
     const headers = {
@@ -456,7 +471,7 @@ test('T22a-fix: the minted relaySecret opens the registered relay handler, a wro
 
 // ---- T22c: activity tracking wiring ------------------------------------------
 
-test('T22c: the host role subscribes session/event and registers the sweeper stop; the client role does neither', async () => {
+test('T22c + T17: the host role subscribes session/event and starts sweeper + restart watcher; the client role only the watcher', async () => {
   const index = await import(INDEX_URL)
 
   const host = makeCtx()
@@ -470,16 +485,21 @@ test('T22c: the host role subscribes session/event and registers the sweeper sto
   assert.equal(typeof host.listeners[0].listener, 'function')
   // The sweeper is registered through ctx.effect, whose callback returns the
   // stop function Cordis calls on disposal — captured here as the effect's
-  // return value. makeCtx's no-op inject never fires, so the ONLY effect on
-  // this ctx is the sweeper.
-  assert.equal(host.effects.length, 1, 'the host role starts exactly the idle sweeper')
-  assert.equal(typeof host.effects[0], 'function', 'the effect returned a stop function')
+  // return value. makeCtx's no-op inject never fires, so the only effects on
+  // this ctx are the sweeper (T22c) and the T17 restart watcher, in
+  // registration order.
+  assert.equal(host.effects.length, 2, 'the host role starts the idle sweeper and the restart watcher')
+  assert.equal(typeof host.effects[0], 'function', 'the sweeper effect returned a stop function')
+  assert.equal(typeof host.effects[1], 'function', 'the restart watcher effect returned a stop function')
   host.effects[0]() // calling it right away must be safe (and stops the real 60s timer)
+  host.effects[1]() // same for the 2s poll
 
   const client = makeCtx()
   index.apply(client.ctx, { role: 'client' })
   assert.equal(client.listeners.length, 0, "the client role never subscribes session/event")
-  assert.equal(client.effects.length, 0, "the client role never starts the sweeper")
+  assert.equal(client.effects.length, 1, "the client role starts only the restart watcher")
+  assert.equal(typeof client.effects[0], 'function', 'the watcher effect returned a stop function')
+  client.effects[0]()
 })
 
 test('T22c-fix: the captured session/event listener refreshes the shared table and ignores id-less sessions', async () => {
@@ -700,6 +720,177 @@ test('T33a-fix: a throwing agent/created listener is swallowed and warned, never
     JSON.parse(fs.readFileSync(path.join(TEMP_HOME, 'zen-remote-shares.json'), 'utf8')).sessions['after-boom'],
     'the listener keeps working after a swallowed failure',
   )
+})
+
+// ---- T17: live volatile reads, restart watcher, admission walls ---------------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function waitFor(fn, timeoutMs, message) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (fn()) return
+    await sleep(50)
+  }
+  assert.ok(fn(), message)
+}
+
+/** Fake ctx with an EXECUTING inject over exactly the given services, for
+ * grabbing the routes apply() registers (same shape as the admin test's
+ * ctxRecording, parameterized). */
+function ctxExecuting(services) {
+  const routes = []
+  const all = {
+    logger: { warn() {} },
+    plugin() {},
+    on() {},
+    effect(fn) { fn() },
+    webServer: { register: (route) => { routes.push(route); return () => {} } },
+    ...services,
+  }
+  const ctx = { ...all, inject(deps, cb) { if (deps.every((d) => all[d] !== undefined)) cb(Object.assign(Object.create(ctx), all)) } }
+  return { ctx, routes }
+}
+
+async function listen(server) {
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return `http://127.0.0.1:${server.address().port}`
+}
+
+async function close(server) {
+  await new Promise((resolve) => server.close(resolve))
+}
+
+test('T17: the client-config route re-reads volatile row fields and the effective role per request', async () => {
+  const index = await import(INDEX_URL)
+  let turnFold = false
+  let liftRatio
+  const row = {
+    role: 'host',
+    // The loader wraps volatile fields in { get() } references — this is
+    // that shape, with mutable returns so the test can age them mid-stream.
+    turnFoldDesktop: { get: () => turnFold },
+    keyboardLiftRatio: { get: () => liftRatio },
+  }
+  const { ctx, routes } = ctxExecuting({})
+  index.apply(ctx, row)
+  const route = routes.find((r) => r.path === index.CLIENT_CONFIG_ROUTE)
+  assert.ok(route, 'the client-config route mounts with just a webServer')
+  const server = http.createServer((req, res) => { void route.handler(req, res) })
+  const base = await listen(server)
+  try {
+    const first = JSON.parse((await request(server.address().port, { method: 'GET', path: '/_dsh/mobile-nav/client-config' })).body)
+    assert.equal(first.role, 'host', 'the effective role rides the response (T17 role probe)')
+    assert.equal(first.turnFoldDesktop, false)
+    assert.ok(!('keyboardLiftRatio' in first), 'an unset knob is omitted, not zeroed')
+
+    // Same process, same route, same row object: only the volatile getters
+    // moved. An apply-time snapshot would keep answering the old values.
+    turnFold = true
+    liftRatio = 0.9
+    row.role = 'client'
+    const second = JSON.parse((await request(server.address().port, { method: 'GET', path: '/_dsh/mobile-nav/client-config' })).body)
+    assert.equal(second.turnFoldDesktop, true)
+    assert.equal(second.keyboardLiftRatio, 0.9)
+    assert.equal(second.role, 'client', 'the role follows the row without a reload')
+  } finally {
+    await close(server)
+  }
+})
+
+test('T17: the upload and share-export routes stay unmounted without a connection service', async () => {
+  const index = await import(INDEX_URL)
+  const share = await import(SHARE_URL)
+  const { ctx, routes } = ctxExecuting({
+    sessions: { get: () => undefined },
+    sessionQuery: {},
+  })
+  index.apply(ctx, {})
+  const paths = routes.map((r) => r.path)
+  assert.ok(!paths.includes(index.UPLOAD_ROUTE), 'no upload route without connection')
+  assert.ok(!paths.includes(share.SHARE_EXPORT_ROUTE), 'no share-export route without connection')
+  assert.ok(paths.includes(index.CLIENT_CONFIG_ROUTE), 'client-config needs no connection and still mounts')
+})
+
+test('T17: the upload route refuses an unadmitted request and passes an admitted one', async () => {
+  const index = await import(INDEX_URL)
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-t17-upload-'))
+  try {
+    for (const admission of [{ rejection: 401 }, { rejection: 403 }]) {
+      const { ctx, routes } = ctxExecuting({
+        sessions: { get: (id) => (id === 's' ? { header: { cwd: workspace } } : undefined) },
+        connection: { admit: () => admission },
+      })
+      index.apply(ctx, {})
+      const route = routes.find((r) => r.path === index.UPLOAD_ROUTE)
+      const server = http.createServer((req, res) => { void route.handler(req, res) })
+      const base = await listen(server)
+      try {
+        const response = await fetch(`${base}${index.UPLOAD_ROUTE}?session=s&name=a.txt`, {
+          method: 'POST',
+          headers: { origin: base },
+          body: 'x',
+        })
+        assert.equal(response.status, admission.rejection)
+        const body = await response.json()
+        assert.equal(body.ok, false)
+        assert.equal(body.error.code, admission.rejection === 401 ? 'unauthorized' : 'forbidden')
+      } finally {
+        await close(server)
+      }
+    }
+
+    // An admitting connection service changes nothing else: 201, bytes on
+    // disk, same envelope as before T17.
+    const { ctx, routes } = ctxExecuting({
+      sessions: { get: (id) => (id === 's' ? { header: { cwd: workspace } } : undefined) },
+      connection: { admit: () => ({ peer: {} }) },
+    })
+    index.apply(ctx, {})
+    const route = routes.find((r) => r.path === index.UPLOAD_ROUTE)
+    const server = http.createServer((req, res) => { void route.handler(req, res) })
+    const base = await listen(server)
+    try {
+      const response = await fetch(`${base}${index.UPLOAD_ROUTE}?session=s&name=ok.txt`, {
+        method: 'POST',
+        headers: { origin: base },
+        body: 'payload',
+      })
+      assert.equal(response.status, 201)
+      const body = await response.json()
+      assert.equal(body.ok, true)
+      assert.equal(body.bytes, 7)
+    } finally {
+      await close(server)
+    }
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
+test('T17: a restart-required row change reloads the row exactly once; a live-read change never does', async () => {
+  const index = await import(INDEX_URL)
+  const restarts = []
+  const { ctx } = makeCtx()
+  // cordis 4.0.4: ctx.fiber is the row's own Fiber and restart() its public
+  // dispose-and-reload entry — this fake stands in for it.
+  ctx.fiber = { restart: () => { restarts.push(1); return Promise.resolve() } }
+  const row = { port: 4000, serverName: 'before' }
+  index.apply(ctx, row)
+  assert.equal(restarts.length, 0)
+
+  // A live-read field alone never triggers, even across a full poll window.
+  row.serverName = 'after'
+  await sleep(2300)
+  assert.equal(restarts.length, 0, 'a serverName change never reloads the row')
+
+  // A restart-required field triggers exactly one reload; the watcher is
+  // then disarmed (the reload's fresh apply() starts a new one).
+  row.port = 4001
+  await waitFor(() => restarts.length === 1, 5000, 'the port change reloads the row')
+  row.port = 4002
+  await sleep(2300)
+  assert.equal(restarts.length, 1, 'the watcher stopped after firing')
 })
 
 test('resolveRole normalizes to host or client', async () => {

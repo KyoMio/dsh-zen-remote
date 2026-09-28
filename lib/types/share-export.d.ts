@@ -27,6 +27,14 @@ export declare const SHARE_EXPORT_ROUTE = "/_dsh/mobile-nav/share-export";
  * already more wall of text than any share card wants, and the cap keeps a
  * careless `turns=99999999` from quietly meaning "the whole log". */
 export declare const MAX_SHARE_TURNS = 500;
+/** What `connection.admit` answers: the operator peer, or the refusal status.
+ * Declared locally (same union as admin-routes.ts's AdminAdmission) so this
+ * module stays import-free of the entry file. */
+export type ShareExportAdmission = {
+    readonly peer: unknown;
+} | {
+    readonly rejection: 401 | 403;
+};
 /** One exportable content block of a transcript row. */
 export type ShareBlock = {
     kind: 'text';
@@ -61,6 +69,11 @@ export interface ShareExportBody {
  * @param ctx - host context carrying the sessionQuery service and logger.
  * @param req - inbound request; no body is read.
  * @param res - the response this call owns end to end.
+ * @param admit - DSH's connection-service admission, passed by the apply()
+ *   wiring (T17): webServer routes skip DSH's /api authentication, so every
+ *   request must ask the connection service itself, its refusal relayed
+ *   verbatim — same first wall as the admin and client routes. Optional only
+ *   for the direct-drive tests; production always passes it.
  */
-export declare function handleShareExport(ctx: Context, req: IncomingMessage, res: ServerResponse): Promise<void>;
+export declare function handleShareExport(ctx: Context, req: IncomingMessage, res: ServerResponse, admit?: (req: IncomingMessage) => ShareExportAdmission): Promise<void>;
 //# sourceMappingURL=share-export.d.ts.map

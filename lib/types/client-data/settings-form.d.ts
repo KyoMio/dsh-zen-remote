@@ -15,7 +15,10 @@
  * - `ZenRemoteSettingsForm` stages the row-layer field edits and saves them as
  *   one `mutate(ops, expectedRevision)` call, and owns the two DIRECT writes
  *   of the client group (pairing write / token clear) plus the device token's
- *   configured flag read from the describe view's secrets sidecar.
+ *   configured flag read from the describe view's secrets sidecar. Since T17
+ *   it also carries the page's two-level role decision — the saved row role
+ *   first, the client-config probe as fallback — and the `restartPending`
+ *   flag behind the "saving reloads the plugin" note.
  *
  * The wire contract lives here because the host half that serves it is a
  * separate task; the shapes mirror `lib/lan-gate-server.cjs`'s status payload
@@ -78,6 +81,21 @@ export declare const ADMIN_PUSH_TEST_ROUTE = "/_dsh/zen-remote/admin/push-test";
 /** Same-origin client routes the sub-client block talks to (host half: T16). */
 export declare const CLIENT_CLAIM_ROUTE = "/_dsh/zen-remote/client/claim";
 export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
+/** The lightweight client-facing config route (host half, both roles): the
+ * settings page's FALLBACK role probe (T17) — it registers wherever a
+ * webServer exists, and since T17 its body carries the effective `role`
+ * (resolveConfig's merged value, nothing sensitive). */
+export declare const CLIENT_CONFIG_ROUTE = "/_dsh/mobile-nav/client-config";
+/** The body of `GET /_dsh/mobile-nav/client-config` — the interface-half knobs
+ * the client bundle reads, plus (T17) the effective role the settings page
+ * falls back to. */
+export interface ClientConfigBody {
+    role?: unknown;
+    turnFoldDesktop?: boolean;
+    keyboardLiftRatio?: number;
+    keyboardLiftMaxPx?: number;
+    keyboardSafetyPadPx?: number;
+}
 /** Field name of the row secret the pairing flow writes (never echoed back
  * anywhere; the describe view's secrets sidecar is the only "is it set"). */
 export declare const DEVICE_TOKEN_FIELD = "deviceToken";
@@ -133,29 +151,49 @@ export interface LatestGate {
 export declare function createLatestGate(): LatestGate;
 /**
  * The SAVED role of the plugin row, read from the configForms snapshot's row
- * document — the settings page's ONLY role signal (T16-fix 3). The resolved
+ * document — the settings page's FIRST role signal (T16-fix 3). The resolved
  * role an admin/status body reports is unusable here: a client deployment has
  * no admin route at all, and a stale kept body pinned the page to the old
  * role after a switch. `value` is the schema-resolved section the Host
  * accepted; a row value that only lives in the raw user layer reads from
- * there. Anything but the exact string `'client'` — an empty row included —
- * means host, matching resolveRole.
+ * there. Since T17 every row field is volatile, so the form (and this
+ * snapshot) carries every stored field — `role` included, with any volatile
+ * wrapper already peeled by the host's plainConfig (the dsh-settings
+ * describe path calls `value.get()` recursively before the wire).
+ *
+ * `undefined` when NEITHER layer carries a role: the field's value lives only
+ * in a lower layer (`lan-gate.config.json`) or nowhere. That is not "host" —
+ * the caller falls back to the effective role the client-config route
+ * reports ({@link settingsPollOf}), because a file-layer client row must
+ * still render the client page.
  */
 export declare function savedRowRole(snapshot: {
     value?: unknown;
     user?: unknown;
-}): 'host' | 'client';
+}): 'host' | 'client' | undefined;
 /**
  * Which status source the page polls for one scope snapshot. While the
  * namespace mirror is still loading the role is not knowable and NOTHING is
- * polled — a client deployment must never see a wasted `admin/status` 404;
- * once settled, a client row polls ONLY `client/status` and a host row
- * `admin/status`.
+ * polled — a client deployment must never see a wasted `admin/status` 404.
+ * A snapshot whose row carries a role decides from it; one that does not
+ * waits (`'none'`) for the client-config probe ({@link savedRowRole}'s
+ * undefined case), and only the probe's answer picks the source. `probed` is
+ * the effective role the page fetched from `/_dsh/mobile-nav/client-config`,
+ * or undefined while that probe has not answered.
  */
 export declare function settingsPollOf(status: 'loading' | 'ready' | 'unavailable', snapshot: {
     value?: unknown;
     user?: unknown;
-}): 'none' | 'admin' | 'client';
+}, probed?: 'host' | 'client'): 'none' | 'admin' | 'client';
+/**
+ * The row fields whose changed value reloads the plugin row after a save
+ * (the mirror of RESTART_FIELDS in the host half's src/restart-watcher.ts;
+ * the host re-resolves these and restarts itself when they move). Only the
+ * fields this page edits can appear here — the note reads staged drafts, and
+ * `targetPort` / `pushEvents` are not page fields — but the list is the full
+ * mirror so a host-side change surfaces in the diff.
+ */
+export declare const RESTART_FIELDS: readonly string[];
 /** One path-addressed edit a save sends (the wire `SettingsPathOpView` shape). */
 export type SettingsFormOp = {
     op: 'set';
@@ -349,6 +387,9 @@ export interface SettingsSecretFieldState {
 }
 /** The whole staged-form snapshot the page renders. */
 export interface ZenRemoteFormState extends SettingsFormShellState {
+    /** The shared form's scope sync state, reactively exposed so the page's
+     * role probe can wait out the mirror's loading phase. */
+    scopeStatus: 'loading' | 'ready' | 'unavailable';
     role: SettingsFieldState;
     host: SettingsFieldState;
     port: SettingsFieldState;
@@ -364,6 +405,10 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
     idleHours: SettingsFieldState;
     autoShareNewSessions: SettingsFieldState;
     deviceToken: SettingsSecretFieldState;
+    /** A restart-required field ({@link RESTART_FIELDS}) has a staged change:
+     * the save will move the row and the host reloads it, briefly restarting
+     * the gateway — the page shows the reload note while this is true. */
+    restartPending: boolean;
 }
 /**
  * Stages one page's edits over the plugin row's shared form and writes them on
@@ -387,6 +432,11 @@ export declare class ZenRemoteSettingsForm {
      * displays while the row layer does not carry it. Empty until the page's
      * first status load feeds it via {@link setBaseline}. */
     private baseline;
+    /** The effective role the page probed from the client-config route (T17):
+     * the fallback for {@link savedRoleIsClient} / {@link statusPoll} when the
+     * row document cannot answer the saved role (role only in
+     * lan-gate.config.json). Undefined until that probe answers. */
+    private probedRole;
     private saving;
     private failed;
     /** Revision the drafts started from; the save's `expectedRevision` fence. */
@@ -433,15 +483,30 @@ export declare class ZenRemoteSettingsForm {
     scopeStatus(): 'loading' | 'ready' | 'unavailable';
     /**
      * Which status source the page should poll right now ({@link settingsPollOf}
-     * over the live snapshot): `none` while the mirror loads, `client` for a
+     * over the live snapshot): `none` while the mirror loads — and while a row
+     * without a stored role waits for the client-config probe — `client` for a
      * client row — never admin there — and `admin` otherwise.
      */
     statusPoll(): 'none' | 'admin' | 'client';
     /**
+     * Feed the fallback role the page probed from the client-config route
+     * (T17). Only consulted when the row document carries no `role` — a stored
+     * row role always wins, so a staged-then-saved switch is never masked by a
+     * stale probe.
+     */
+    setProbedRole(role: 'host' | 'client' | undefined): void;
+    /**
      * Whether the SAVED row role is client ({@link savedRowRole} over the live
-     * snapshot) — the page mode's single source of truth.
+     * snapshot, falling back to the probed role) — the page mode's single
+     * source of truth.
      */
     savedRoleIsClient(): boolean;
+    /**
+     * Whether the row document answers the saved role at all (T17): false when
+     * neither snapshot layer carries one — the page then probes the
+     * client-config route for the effective role instead of assuming host.
+     */
+    rowRoleKnown(): boolean;
     /**
      * One direct write for the pairing flow (T16): the normalized server
      * address and the token just redeemed from the server ride ONE

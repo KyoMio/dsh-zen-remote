@@ -83,8 +83,8 @@ class ClientRouteError extends Error {
 /**
  * Read the whole body under the cap and demand one JSON object. Same contract
  * as the admin routes' reader: an empty body counts as `{}`, a declared
- * oversized Content-Length is refused before a byte is read, and the
- * streaming cap stays as the chunked-body guard.
+ * oversized body length is refused before a byte is read, and the streaming
+ * cap stays as the chunked-body guard.
  */
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   const declared = req.headers['content-length']
@@ -202,9 +202,15 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         let status: number
         let gatewayBody: unknown
         try {
+          // No hand-set body-length (or host/connection/transfer-encoding)
+          // header here: DSH swaps the global fetch's dispatcher for its
+          // bundled undici 8.x, which refuses any fetch that carries one
+          // (UND_ERR_INVALID_ARG → the whole pairing round-trip answers
+          // "unreachable"), while the dispatcher computes the length itself
+          // from the string body.
           const response = await fetchImpl(new URL(CLAIM_PATH, normalized.url), {
             method: 'POST',
-            headers: { 'content-type': 'application/json; charset=utf-8', 'content-length': String(Buffer.byteLength(payload)) },
+            headers: { 'content-type': 'application/json; charset=utf-8' },
             body: payload,
             // A wrong server must not walk the pairing round-trip through a
             // redirect chain (T16-fix): any 3xx lands in the classifier's

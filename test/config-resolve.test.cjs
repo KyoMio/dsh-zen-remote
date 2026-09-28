@@ -232,8 +232,8 @@ test('targetPort is undefined unless env or the row supplies a legal port — ne
 
 test('volatile row fields are unwrapped from the loader references before validation', async () => {
   const { resolveConfig, Config } = await load()
-  // Config's output is EXACTLY what the loader hands apply(): volatile
-  // fields arrive as { get() } reference objects, plain fields as values.
+  // Config's output is EXACTLY what the loader hands apply(): since T17 every
+  // field is volatile, so every field arrives as a { get() } reference.
   const row = Config({ serverName: 'MyBox', idleHours: 12, autoShareNewSessions: true, port: 4000 })
   const resolved = resolveConfig(row, {}, {})
   assert.equal(resolved.values.serverName, 'MyBox')
@@ -241,7 +241,7 @@ test('volatile row fields are unwrapped from the loader references before valida
   assert.equal(resolved.values.idleHours, 12)
   assert.equal(resolved.sources.idleHours, 'row')
   assert.equal(resolved.values.autoShareNewSessions, true)
-  assert.equal(resolved.values.port, 4000, 'plain row fields keep flowing through')
+  assert.equal(resolved.values.port, 4000, 'the row port unwraps through the same reference path')
 
   // The references are live: a changed get() must change the next resolution
   // — that is the whole point of volatile (edit without restarting the row).
@@ -322,11 +322,12 @@ test('Config parses a fully populated row and leaves an empty row free of defaul
     turnFoldDesktop: true, keyboardLiftRatio: 0.5, keyboardLiftMaxPx: 300, keyboardSafetyPadPx: 10, maxUploadBytes: 1024,
   }
   const parsed = Config(full)
-  assert.equal(parsed.role, 'client')
-  assert.equal(parsed.port, 4000)
-  assert.deepEqual(parsed.trustedProxies, ['10.0.0.1'])
-  assert.equal(parsed.maxUploadBytes, 1024)
-  // Volatile fields arrive as live references; the stored value sits behind get().
+  // EVERY field is volatile (T17): each arrives as a live reference, stored
+  // value behind get().
+  assert.equal(parsed.role.get(), 'client')
+  assert.equal(parsed.port.get(), 4000)
+  assert.deepEqual(parsed.trustedProxies.get(), ['10.0.0.1'])
+  assert.equal(parsed.maxUploadBytes.get(), 1024)
   assert.equal(parsed.deviceToken.get(), 'tok')
 
   const empty = Config({})
@@ -334,10 +335,54 @@ test('Config parses a fully populated row and leaves an empty row free of defaul
   assert.ok(!json.includes('3088'), 'no default port may leak into a parsed empty row')
   assert.ok(!json.includes('48'), 'no default idleHours may leak')
   assert.ok(!json.includes('15000'), 'no default debounce may leak')
-  assert.ok(!('port' in empty) || empty.port === undefined, 'port stays unset on an empty row')
-  // Volatile fields materialize as live reference objects, plain fields do
-  // not exist until set — pinning which is which, because that distinction
-  // is what decides restart-vs-live for every knob.
-  assert.equal(typeof empty.serverName, 'object', 'serverName must be volatile')
-  assert.equal(typeof empty.deviceToken, 'object', 'deviceToken must be volatile')
+  // Every field materializes as a live reference object whose get() answers
+  // undefined — present in shape, unset in value.
+  for (const [name, schema] of Object.entries(Config.dict)) {
+    const value = empty[name]
+    assert.ok(
+      value !== null && typeof value === 'object' && typeof value.get === 'function',
+      `${name} must materialize as a live reference on an empty row`,
+    )
+    assert.equal(value.get(), undefined, `${name} stays unset on an empty row`)
+    // Schemastery schema nodes are callable (typeof 'function') but carry
+    // their meta as properties — that access is what the marker test needs.
+    assert.ok(schema !== null && typeof schema.meta === 'object', `${name} exposes its meta`)
+  }
+})
+
+// --- T17: all-volatile schema ----------------------------------------------
+
+test('every Config field carries the volatile marker; deviceToken keeps its secret role', async () => {
+  const { Config, DEFAULTS } = await load()
+  // The settings surface exists ONLY for volatile fields (dsh-settings'
+  // volatileForm drops the rest), so a single non-volatile field would go
+  // dark in the settings page — assert the whole dict.
+  const expected = [...Object.keys(DEFAULTS), 'serverUrl', 'deviceToken', 'turnFoldDesktop', 'keyboardLiftRatio', 'keyboardLiftMaxPx', 'keyboardSafetyPadPx', 'maxUploadBytes']
+  assert.deepEqual(Object.keys(Config.dict).sort(), expected.sort(), 'the schema declares exactly the known fields')
+  for (const [name, schema] of Object.entries(Config.dict)) {
+    assert.equal(schema.meta?.volatile, true, `Config.${name} must be volatile`)
+  }
+  assert.equal(Config.dict.deviceToken.meta.role, 'secret', 'the pairing token stays redacted from every wire surface')
+})
+
+test('a fully populated Config row resolves with EVERY source = row (T17)', async () => {
+  const { Config, resolveConfig, DEFAULTS } = await load()
+  const full = {
+    role: 'client', port: 4000, host: '0.0.0.0', targetPort: 3080, rateLimit: 60,
+    trustedProxies: ['10.0.0.1'], vapidSubject: 'mailto:x@y.z', lang: 'zh',
+    pushEvents: 'a/b', pushDebounceMs: 1000, pushSummary: true, pushTurnEnd: true, pushTool: false,
+    serverName: 'phone', idleHours: 24, autoShareNewSessions: true,
+    serverUrl: 'https://gw.example', deviceToken: 'tok',
+    turnFoldDesktop: true, keyboardLiftRatio: 0.5, keyboardLiftMaxPx: 300, keyboardSafetyPadPx: 10, maxUploadBytes: 1024,
+  }
+  const resolved = resolveConfig(Config(full), {}, {})
+  for (const key of Object.keys(DEFAULTS)) {
+    assert.equal(resolved.sources[key], 'row', `${key} must come from the row layer`)
+  }
+  // Spot-check the unwrapped values ride through.
+  assert.equal(resolved.values.role, 'client')
+  assert.equal(resolved.values.port, 4000)
+  assert.equal(resolved.values.trustedProxies, '10.0.0.1')
+  assert.equal(resolved.values.pushSummary, true)
+  assert.equal(resolved.values.serverName, 'phone')
 })

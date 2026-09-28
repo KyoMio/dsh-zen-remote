@@ -16,6 +16,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Context } from '@deepseek-ai/cordis';
+import type { AdminAdmission } from './admin-routes.js';
 export { Config, resolveRole } from './config.js';
 export { sameOriginPost } from './http.js';
 /** Exact route the phone composer POSTs one file body to. */
@@ -99,8 +100,13 @@ export declare function safeUploadName(raw: string): string;
  * @param maxBytes - body cap.
  * @param req - inbound request; its body is the raw file.
  * @param res - the response this call owns end to end.
+ * @param admit - DSH's connection-service admission, passed by the apply()
+ *   wiring (T17): webServer routes skip DSH's /api authentication, so every
+ *   request must ask the connection service itself, its refusal relayed
+ *   verbatim — same first wall as the admin and client routes. Optional only
+ *   for the direct-drive check scripts; production always passes it.
  */
-export declare function handleUpload(ctx: Context, maxBytes: number, req: IncomingMessage, res: ServerResponse): Promise<void>;
+export declare function handleUpload(ctx: Context, maxBytes: number, req: IncomingMessage, res: ServerResponse, admit?: (req: IncomingMessage) => AdminAdmission): Promise<void>;
 /**
  * Host half: mount the upload route wherever a webServer and live sessions
  * exist. Both are injected INSIDE apply rather than declared as a top-level

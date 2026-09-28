@@ -8,7 +8,10 @@
  * → same-origin → body), the claim forwarding and its classification, and
  * the status probe's five states. One scenario also drives the row through
  * the loader's volatile `{ get() }` wrappers to prove serverUrl/deviceToken
- * are read PER REQUEST, never snapshotted.
+ * are read PER REQUEST, never snapshotted. T17-cl pins the outbound-fetch
+ * header discipline: no hand-set content-length (DSH's bundled undici
+ * dispatcher refuses it with UND_ERR_INVALID_ARG), nor host/connection/
+ * transfer-encoding.
  */
 'use strict'
 const { test, before, after } = require('node:test')
@@ -128,6 +131,74 @@ test('a successful claim forwards {code, name} and returns the token plus the no
     assert.deepEqual(JSON.parse(forwarded.body), { code: '  ab-cd 12ef ', name: '书房电脑' })
     assert.equal(forwarded.headers.authorization, undefined, 'the claim carries no Authorization header')
   } finally {
+    await closeServer(server)
+  }
+})
+
+// ---- T17-cl: no hand-set transport headers on the outbound fetches ----------
+
+test('T17-cl: the claim fetch hands fetchImpl no content-length (nor host/connection/transfer-encoding)', async () => {
+  // DSH's dsh-http-proxy replaces the global fetch dispatcher with its
+  // bundled undici 8.x, which REFUSES a fetch carrying a hand-set
+  // content-length (UND_ERR_INVALID_ARG → the claim always answered
+  // "unreachable"). The header must not be set at all — the dispatcher
+  // computes it from the body. Checked case-insensitively, and extended to
+  // the other transport-owned headers the same class of dispatcher forbids.
+  const inits = []
+  const recordingFetch = (url, init = {}) => {
+    inits.push(init)
+    return fetch(url, init)
+  }
+  const { server, port } = await startClientServer(makeRow(), { fetchImpl: recordingFetch })
+  try {
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: gwUrl, code: 'AAAAAA11', name: 'n' },
+    })
+    assert.equal(res.status, 200)
+    assert.equal(JSON.parse(res.body).ok, true, 'the claim round-trip succeeded')
+    assert.equal(inits.length, 1, 'exactly one outbound fetch (the claim forward)')
+    const headers = inits[0].headers ?? {}
+    const forbidden = ['content-length', 'host', 'connection', 'transfer-encoding']
+    const offenders = Object.keys(headers).filter((name) => forbidden.includes(name.toLowerCase()))
+    assert.deepEqual(offenders, [], `none of ${forbidden.join('/')} may be hand-set, got ${JSON.stringify(Object.keys(headers))}`)
+    assert.equal(headers['content-type'], 'application/json; charset=utf-8', 'the content-type survives')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+/** The regression leg needs the undici PACKAGE (setGlobalDispatcher) to
+ * mimic what DSH's dsh-http-proxy does at boot. This repo does not depend on
+ * undici (Node ships one internally, unresolvable from here), so wherever
+ * `require('undici')` fails — every plain checkout — the leg is skipped with
+ * that note; inside an environment that has undici (e.g. against DSH's own
+ * node_modules) it runs for real. */
+let undici = null
+try { undici = require('undici') } catch { /* left null — the leg below skips */ }
+
+test('T17-cl: under a swapped undici global dispatcher the claim still round-trips', { skip: undici === null && 'undici is not resolvable in this environment; run where DSH-style undici is installed' }, async () => {
+  const previous = undici.getGlobalDispatcher()
+  // What dsh-http-proxy does at DSH boot: a fresh Agent over the global
+  // fetch. Under the old hand-set content-length this fetch failed with
+  // UND_ERR_INVALID_ARG and the claim answered unreachable.
+  undici.setGlobalDispatcher(new undici.Agent())
+  const { server, port } = await startClientServer(makeRow())
+  try {
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: gwUrl, code: 'AAAAAA22', name: 'n' },
+    })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.ok, true, 'the dispatcher accepted the claim fetch')
+    assert.equal(body.token, 'tok-gateway', 'the pairing round-trip completed end to end')
+  } finally {
+    undici.setGlobalDispatcher(previous)
     await closeServer(server)
   }
 })
