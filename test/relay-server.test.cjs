@@ -66,6 +66,7 @@ function makeParts(name, overrides = {}) {
     },
     ...(overrides.parentOf ? { parentOf: overrides.parentOf } : {}),
     ...(overrides.getApiFetch ? { getApiFetch: overrides.getApiFetch } : {}),
+    ...(overrides.uploadCapBytes !== undefined ? { uploadCapBytes: overrides.uploadCapBytes } : {}),
   })
   return { handler, calls, streamCalls, gateway, store, home }
 }
@@ -1278,4 +1279,276 @@ test('T41b-fix parser differential: what the share check approves is EXACTLY wha
     assert.equal(clean.status, 200)
     assert.equal(api.seen[0].url, 'http://relay.local/api/changes.diff?sessionId=session-1&seq=3&index=0')
   } finally { await server.stop() }
+})
+
+// ---- T51: relay/v1/upload (the binary attachment-upload channel) ----------------
+
+/** A recording dispatch that reads the SYNTHETIC request's body stream to the
+ * end and answers the host route's receipt shape. Like fakeApiFetch, but for
+ * a streaming body — the read is the observable for "the bytes arrived". */
+function fakeUploadApiFetch(answer) {
+  const seen = []
+  const dispatch = async (request) => {
+    const chunks = []
+    let bodyError
+    if (request.body !== null) {
+      try {
+        for await (const chunk of request.body) chunks.push(Buffer.from(chunk))
+      } catch (error) {
+        bodyError = error
+      }
+    }
+    seen.push({ request, bytes: Buffer.concat(chunks), bodyError })
+    if (typeof answer === 'function') return answer(request)
+    return answer
+  }
+  return { seen, dispatch }
+}
+
+/** makeParts with the upload tests' small cap, so the 413 paths stay cheap. */
+function makeUploadParts(name, overrides = {}) {
+  return makeParts(name, { uploadCapBytes: 1024, ...overrides })
+}
+
+test('T51 upload: an unshared session answers 403 not-shared and nothing is dispatched', async () => {
+  const api = fakeUploadApiFetch(new Response('{}', { status: 200 }))
+  const parts = makeUploadParts('t51-upload-unshared', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-secret&name=a.txt', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: 'x' })
+    assert.equal(res.status, 403)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(api.seen.length, 0, 'the unshared upload was never dispatched')
+  } finally { await server.stop() }
+})
+
+test('T51 upload: a Content-Length past the cap answers 413 before the query is read', async () => {
+  const api = fakeUploadApiFetch(new Response('{}', { status: 200 }))
+  const parts = makeUploadParts('t51-upload-cl', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    // 2048 declared bytes against the injected 1024 cap — no unshared-id
+    // decoy can matter: the body fact is answered first, like invoke's.
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-secret&name=a.txt', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream', 'content-length': '2048' }, body: 'x'.repeat(2048) })
+    assert.equal(res.status, 413)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'payload-too-large', details: {} } })
+    assert.equal(api.seen.length, 0, 'an oversize upload never reached the host handler')
+  } finally { await server.stop() }
+})
+
+test('T51 upload: a chunked body past the cap is cut mid-stream and answers 413', async () => {
+  // No Content-Length header (the sub-client's undici sends chunked): the
+  // counting pump is the only gate. The dispatch IS entered — the cap trips
+  // while the host handler is mid-read — and its forward dies with the pump.
+  // Sent with a RAW request: undici's fetch sets a content-length for a
+  // string body, which would turn this into the CL branch above.
+  const api = fakeUploadApiFetch(new Response('{}', { status: 200 }))
+  const parts = makeUploadParts('t51-upload-chunked', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1',
+        port: server.port,
+        method: 'POST',
+        path: '/_dsh/zen-remote/relay/v1/upload?sessionId=session-1&name=a.txt',
+        headers: { ...AUTH, 'content-type': 'application/octet-stream', 'transfer-encoding': 'chunked' },
+        agent: false,
+      }, (res) => {
+        const chunks = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+      })
+      req.on('error', reject)
+      // Four chunks, each inside the cap; the total crosses it on the second.
+      for (let i = 0; i < 4; i += 1) req.write('y'.repeat(1024))
+      req.end()
+    })
+    assert.equal(status.status, 413)
+    assert.deepEqual(JSON.parse(status.body), { ok: false, error: { code: 'payload-too-large', details: {} } })
+    // The route answers only after the dispatch settled — the errored body
+    // read has already been recorded by then.
+    assert.equal(api.seen.length, 1)
+    assert.ok(api.seen[0].bodyError !== undefined, 'the synthetic body errored out of the host read')
+  } finally { await server.stop() }
+})
+
+test('T51 upload: a shared session dispatches the exact bytes with the original id and a normalized query', async () => {
+  const RECEIPT = JSON.stringify({ ok: true, value: { receiptId: 'r-9', file: { attachmentId: 'att-9', name: 'note.txt', bytes: 8 } } })
+  const api = fakeUploadApiFetch(new Response(RECEIPT, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } }))
+  const parts = makeUploadParts('t51-upload-ok', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const bytes = Buffer.from('raw-bytes')
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-1&name=note.txt', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: bytes })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.equal(api.seen.length, 1)
+    // The synthetic Request is the contract: POST to the host's exact route,
+    // the ORIGINAL session id, the octet-stream content type the host route
+    // mandates, and the byte stream intact.
+    assert.equal(api.seen[0].request.method, 'POST')
+    assert.equal(api.seen[0].request.url, 'http://relay.local/api/session/uploadFileBinary?sessionId=session-1&name=note.txt')
+    assert.equal(api.seen[0].request.headers.get('content-type'), 'application/octet-stream')
+    assert.ok(api.seen[0].bytes.equals(bytes), 'the exact bytes arrived, in order')
+    // The upstream answer rides the envelope verbatim.
+    assert.equal(body.value.status, 200)
+    assert.equal(body.value.contentType, 'application/json; charset=utf-8')
+    assert.equal(body.value.body, RECEIPT)
+  } finally { await server.stop() }
+})
+
+test('T51 upload: an upstream business failure keeps its status, content type and details inside the envelope', async () => {
+  const FAILURE = JSON.stringify({ ok: false, error: { code: 'session/attachment-invalid', message: 'bad file', details: { reason: 'TOO_BIG' } } })
+  const api = fakeUploadApiFetch(new Response(FAILURE, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } }))
+  const parts = makeUploadParts('t51-upload-fail', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-1', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: 'x' })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.equal(body.value.status, 200)
+    assert.deepEqual(JSON.parse(body.value.body), { ok: false, error: { code: 'session/attachment-invalid', message: 'bad file', details: { reason: 'TOO_BIG' } } })
+  } finally { await server.stop() }
+})
+
+test('T51 upload: query injection cannot smuggle a second sessionId past the share check', async () => {
+  // The T41b-fix parser differential, now for the upload: control characters
+  // in key names, duplicate ids, and a name value carrying a percent-encoded
+  // `&sessionId=…` all collapse to ONE parsed world, and the synthetic URL is
+  // rebuilt from the decision alone.
+  // A fresh Response per dispatch: a shared instance's body is consumed by
+  // the first read and every later .text() would throw.
+  const api = fakeUploadApiFetch(() => new Response('{}', { status: 200 }))
+  const parts = makeUploadParts('t51-upload-inject', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  const assertOneId = (label) => {
+    assert.equal(api.seen.length, 1, label)
+    const dispatched = new URL(api.seen[0].request.url)
+    assert.equal(dispatched.searchParams.get('sessionId'), 'session-1', label)
+    assert.equal(dispatched.searchParams.getAll('sessionId').length, 1, label)
+    return dispatched
+  }
+  try {
+    // A tab-carrying decoy key next to the real id.
+    let res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?session%09Id=session-secret&sessionId=session-1&name=a.txt', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: 'x' })
+    assert.equal(res.status, 200)
+    assertOneId('control-character key name')
+    assert.ok(!api.seen[0].request.url.includes('session-secret'), 'the decoy id never travels')
+    assert.equal(await res.text(), JSON.stringify({ ok: true, value: { status: 200, contentType: 'text/plain;charset=UTF-8', body: '{}' } }))
+    api.seen.length = 0
+    // A name whose VALUE embeds `&sessionId=…` — decoded as data by the one
+    // parse, re-encoded as data by the rebuild. The literal `session-secret`
+    // legitimately appears INSIDE the name value here; what must not happen
+    // is a second sessionId PARAMETER.
+    res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-1&name=%26sessionId%3Dsession-secret', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: 'x' })
+    assert.equal(res.status, 200)
+    const dispatched = assertOneId('name value smuggling a second id')
+    assert.equal(dispatched.searchParams.get('name'), '&sessionId=session-secret', 'the name value travels as a VALUE')
+    await res.text()
+    api.seen.length = 0
+    // A duplicate id is a malformed coordinate, refused before anything is
+    // dispatched — whichever duplicate comes first.
+    res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-1&sessionId=session-secret', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: 'x' })
+    assert.equal(res.status, 400)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'no-session' } })
+    res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-secret&sessionId=session-1', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: 'x' })
+    assert.equal(res.status, 400)
+    // A duplicated name is the same kind of malformed.
+    res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-1&name=a&name=b', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: 'x' })
+    assert.equal(res.status, 400)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'bad-query' } })
+    assert.equal(api.seen.length, 0, 'refused queries dispatched nothing')
+  } finally { await server.stop() }
+})
+
+test('T51 upload: a missing shared handler answers 501, and GET is not the upload channel', async () => {
+  const parts = makeUploadParts('t51-upload-nohandler')
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/upload?sessionId=session-1&name=a.txt', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, body: 'x' })
+    assert.equal(res.status, 501)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'unsupported' } })
+  } finally { await server.stop() }
+})
+
+test('T51-fix upload: the 9th concurrent upload of one device answers 429, a released slot admits the next', async () => {
+  // The dispatch fake holds every forward open (a stalled upload the host
+  // never finishes reading): slots are countable as `inFlight`, and a
+  // release is observable when one rejects on its abort signal.
+  const pending = []
+  let inFlight = 0
+  let abortedCount = 0
+  const api = {
+    seen: [],
+    dispatch: (request) => {
+      inFlight += 1
+      return new Promise((resolve, reject) => {
+        const onAbort = () => { abortedCount += 1; inFlight -= 1; reject(new Error("aborted")) }
+        if (request.signal.aborted) return onAbort()
+        request.signal.addEventListener("abort", onAbort, { once: true })
+        pending.push((response) => { inFlight -= 1; resolve(response) })
+      })
+    },
+  }
+  const parts = makeUploadParts('t51-fix-budget', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  const waitFor = async (predicate, ms = 3000) => {
+    const start = Date.now()
+    while (!predicate()) {
+      if (Date.now() - start > ms) throw new Error('waitFor timeout')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  const uploadPath = '/_dsh/zen-remote/relay/v1/upload?sessionId=session-1'
+  /** One request whose body STAYS OPEN (1 byte, never ended): it holds a slot. */
+  const stalled = []
+  const stallOnce = () => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: server.port, method: 'POST', path: uploadPath, headers: { ...AUTH, 'content-type': 'application/octet-stream' }, agent: false }, (res) => { res.resume(); resolve(res.statusCode) })
+    req.on('error', () => resolve(0))
+    req.write('x')
+    stalled.push(req)
+  })
+  /** One request with an EMPTY, ended body: the refusal drain resolves at once. */
+  const emptyUpload = () => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: server.port, method: 'POST', path: uploadPath, headers: { ...AUTH, 'content-type': 'application/octet-stream', 'content-length': '0' }, agent: false }, (res) => {
+      const chunks = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+    })
+    req.on('error', reject)
+    req.end()
+  })
+  try {
+    for (let i = 0; i < 8; i += 1) void stallOnce()
+    await waitFor(() => inFlight === 8)
+    const ninth = await emptyUpload()
+    assert.equal(ninth.status, 429, 'the over-budget upload is refused')
+    assert.deepEqual(JSON.parse(ninth.body), { ok: false, error: { code: 'too-many-uploads' } })
+    assert.equal(inFlight, 8, 'the refused one never entered dispatch')
+    // A different device is not crowded out by the first one's budget.
+    // (Single-device saturation is the case above; the counter is keyed by
+    // x-zen-remote-device, covered by the shared gate test shape.)
+    stalled[0].destroy()
+    await waitFor(() => abortedCount === 1 && inFlight === 7)
+    const tenth = emptyUpload()
+    await waitFor(() => inFlight === 8)
+    pending[pending.length - 1](new Response(JSON.stringify({ ok: true, value: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const done = await tenth
+    assert.equal(done.status, 200, 'the released slot admits the next upload')
+    assert.equal(inFlight, 7)
+  } finally {
+    for (const req of stalled) { try { req.destroy() } catch { /* gone */ } }
+    await server.stop()
+  }
 })

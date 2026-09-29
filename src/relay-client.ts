@@ -59,6 +59,7 @@ const STREAM_PATH = '/_dsh/zen-remote/relay/v1/stream'
 const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
 const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 const HTTP_PATH = '/_dsh/zen-remote/relay/v1/http'
+const UPLOAD_PATH = '/_dsh/zen-remote/relay/v1/upload'
 
 /** How long a stream may stay line-silent before it is judged dead. */
 const DEFAULT_IDLE_TIMEOUT_MS = 45_000
@@ -78,12 +79,23 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 const INVOKE_TIMEOUT_PER_MIB_MS = 2_000
 const INVOKE_TIMEOUT_CAP_MS = 300_000
 
-/** The budget one invoke exchange gets, from its serialized body size. Whole
- * MiB only (floored): a small call keeps the plain base budget — the extra
- * time exists for the big inline-image bodies, not for every round-trip. */
-function invokeTimeoutMs(requestTimeoutMs: number, bodyJson: string): number {
-  const mib = Math.floor(Buffer.byteLength(bodyJson, 'utf8') / (1024 * 1024))
+/**
+ * The budget one size-backed exchange gets (invoke since T31-fix, upload
+ * since T51): whole MiB only (floored), so a small call keeps the plain
+ * base budget. The upload's size is the DECLARED `Content-Length` of the
+ * local request when it carried one; an unknown size (a chunked body has no
+ * length header, and this process's undici forbids hand-set length headers)
+ * gets the full cap — the honest budget for an upload whose end is not in
+ * sight.
+ */
+function sizeBackedTimeoutMs(requestTimeoutMs: number, bytes: number | undefined): number {
+  const mib = bytes === undefined ? Number.POSITIVE_INFINITY : Math.floor(bytes / (1024 * 1024))
   return Math.min(requestTimeoutMs + INVOKE_TIMEOUT_PER_MIB_MS * mib, Math.max(requestTimeoutMs, INVOKE_TIMEOUT_CAP_MS))
+}
+
+/** The budget one invoke exchange gets, from its serialized body size. */
+function invokeTimeoutMs(requestTimeoutMs: number, bodyJson: string): number {
+  return sizeBackedTimeoutMs(requestTimeoutMs, Buffer.byteLength(bodyJson, 'utf8'))
 }
 
 /**
@@ -263,6 +275,31 @@ export interface RelayClient {
    * success envelope, so a 404 from the underlying route is a RESOLVED
    * result here, never a RelayError. */
   http(route: string, query: string, signal?: AbortSignal): Promise<RelayHttpResult>
+  /** One binary upload round-trip (T51): `sessionId` is the ORIGINAL
+   * session id, `name` the optional display filename, `body` the raw byte
+   * stream forwarded verbatim. The upstream answer (its status, content
+   * type and body text — the host route answers its business failures as
+   * 200-with-envelope, so those ride RESOLVED like `http`'s) comes back in
+   * the success envelope; every refusal or link death throws RelayError.
+   * The round-trip budget scales with `bytes` (the local request's declared
+   * `Content-Length`, when it had one) and a timeout there never moves the
+   * connection state — the invoke route's rules (T31-fix). */
+  upload(options: RelayUploadOptions, signal?: AbortSignal): Promise<RelayHttpResult>
+}
+
+/** The inputs of one {@link RelayClient.upload} round-trip. */
+export interface RelayUploadOptions {
+  /** The ORIGINAL (non-virtual) session id, already restored by the caller. */
+  sessionId: string
+  /** The file's display name, when the local request carried one. */
+  name?: string
+  /** The raw request body. `null` (a bodyless upload — the host route would
+   * answer its own empty-stream business failure) forwards as an empty
+   * stream. */
+  body: ReadableStream<Uint8Array> | null
+  /** The local request's declared byte count, when its `Content-Length` was
+   * readable — sizes the round-trip budget and nothing else. */
+  bytes?: number
 }
 
 /** The upstream answer one {@link RelayClient.http} round-trip carries. */
@@ -500,16 +537,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * here — content-length, host, connection and transfer-encoding are the
    * dispatcher's business and must never be set by hand: DSH's process
    * swaps the global fetch dispatcher for its own undici, which rejects a
-   * manual content-length outright (fetch failed / UND_ERR_INVALID_ARG). */
-  /**
-   * The shared request face of every route. ONLY endpoint headers live
-   * here — content-length, host, connection and transfer-encoding are the
-   * dispatcher's business and must never be set by hand: DSH's process
-   * swaps the global fetch dispatcher for its own undici, which rejects a
    * manual content-length outright (fetch failed / UND_ERR_INVALID_ARG).
-   * The body arrives PRE-SERIALIZED: the invoke caller needs the JSON once
-   * for its size-based timeout, so every route stringifies exactly one.
-   */
+   * The JSON body arrives PRE-SERIALIZED: the invoke caller needs the JSON
+   * once for its size-based timeout, so every route stringifies exactly
+   * one. */
   function requestInit(token: string, bodyJson: string): RequestInit {
     return {
       method: 'POST',
@@ -524,6 +555,35 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       // A wrong server must not walk the pairing token through a redirect.
       redirect: 'manual',
     }
+  }
+
+  /**
+   * The binary upload's init (T51): the same endpoint-headers-only
+   * discipline as {@link requestInit} — the body rides as the raw byte
+   * stream with `content-type: application/octet-stream` (the ONE header
+   * the host's upload route mandates, RT dsh-client-file-upload
+   * lib/index.js:18) and no content-length: DSH's undici refuses a hand-set
+   * length outright, so a stream body goes chunked and the server's
+   * streaming byte count is the size gate. `duplex: 'half'` is what a
+   * streaming request body requires.
+   */
+  function uploadInit(token: string, body: ReadableStream<Uint8Array>): RequestInit {
+    const init: RequestInit = {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/octet-stream',
+        accept: 'application/json',
+      },
+      body,
+      redirect: 'manual',
+    }
+    // `duplex` is what a streaming request body requires — the resolved
+    // RequestInit type here hides it (the DOM-vs-undici conditional in
+    // @types/node collapses to the DOM face, which has no such field), so
+    // the assignment carries its own cast.
+    ;(init as { duplex?: string }).duplex = 'half'
+    return init
   }
 
   /**
@@ -594,30 +654,39 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
   }
 
   /**
-   * One request/response exchange (handshake, invoke) with the shared
-   * timeout wiring. The CALLER resolves the credentials first and passes
-   * them in — connect() must know exactly which address+token its handshake
-   * used, for the digest it records. Resolves only on a success envelope —
-   * 2xx plus `ok:true` — and then lifts a stale `offline` back to `online`,
-   * because a success proves the link. EVERY other outcome throws the
-   * mapped RelayError; transport failures (fetch rejection, mid-body cut,
-   * timeout) set `offline` first — EXCEPT a timeout on a route that opted
-   * out (`timeoutSetsOffline: false`, the invoke route): a slow call — a
-   * 28 MiB inline-image prompt crawling up a slow link — is not a dead
-   * LINK, so it fails the call and leaves the connection state exactly
-   * where it was. Only the handshake / stream-header legs and real
-   * network-layer failures judge the link.
+   * One request/response exchange (handshake, invoke, upload) with the
+   * shared timeout wiring. The URL and the RequestInit arrive PREBUILT —
+   * the JSON routes compose theirs from {@link requestInit}, the upload
+   * from {@link uploadInit} — so the body shape (serialized string or byte
+   * stream) stays the caller's business. Resolves only on a success
+   * envelope — 2xx plus `ok:true` — and then lifts a stale `offline` back
+   * to `online`, because a success proves the link. EVERY other outcome
+   * throws the mapped RelayError; transport failures (fetch rejection,
+   * mid-body cut, timeout) set `offline` first — EXCEPT on a route that
+   * opted out (`timeoutSetsOffline: false`, the invoke and upload routes):
+   * a slow call — a 28 MiB inline-image prompt or a 100 MiB attachment
+   * crawling up a slow link — and, since T51-fix, an upload CUT MID-STREAM
+   * (a reset under a huge body is the size gate and the drain doing their
+   * job, not a dead link) both fail THIS call and leave the connection
+   * state exactly where it was; the diagnostics still record the failure
+   * code. Only the handshake / stream-header legs and real network-layer
+   * failures on the opted-in routes judge the link.
    */
-  async function exchange(
-    pathName: string,
-    bodyJson: string,
+  async function exchangeRequest(
+    url: string,
+    init: RequestInit,
     signal: AbortSignal | undefined,
     applySuccessState: boolean,
-    creds: { url: string; token: string },
-    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean } = {},
+    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean; transportSetsOffline?: boolean } = {},
   ): Promise<Record<string, unknown>> {
     const timeoutMs = opts.timeoutMs ?? requestTimeoutMs
     const timeoutSetsOffline = opts.timeoutSetsOffline ?? true
+    // The transport-failure opt-out (T51-fix) is SEPARATE from the timeout
+    // one: the invoke route opts out of the timeout judging the link but
+    // keeps real transport deaths offline (the T43 reconnect ladder hangs
+    // off them); the upload route opts out of BOTH — a reset under a huge
+    // body is the size gate doing its job, not a dead link.
+    const transportSetsOffline = opts.transportSetsOffline ?? true
     const controller = new AbortController()
     const onExternalAbort = (): void => {
       controller.abort()
@@ -633,11 +702,9 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     }, timeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
     try {
-      const url = creds.url
-      const token = creds.token
       let response: Response
       try {
-        response = await fetchImpl(`${url}${pathName}`, { ...requestInit(token, bodyJson), signal: controller.signal })
+        response = await fetchImpl(url, { ...init, signal: controller.signal })
       } catch (error) {
         if (signal?.aborted) throw abortedError()
         if (timedOut && !timeoutSetsOffline) {
@@ -645,7 +712,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           throw new RelayError('request-timeout', `no response within ${timeoutMs} ms`)
         }
         noteFailure('offline')
-        setState('offline')
+        if (transportSetsOffline) setState('offline')
         throw new RelayError('offline', timedOut ? `no response within ${timeoutMs} ms` : messageOf(error))
       }
       let payload: unknown
@@ -654,7 +721,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       } catch (error) {
         if (signal?.aborted) throw abortedError()
         noteFailure('offline')
-        setState('offline')
+        if (transportSetsOffline) setState('offline')
         throw new RelayError('offline', messageOf(error))
       }
       if (response.status >= 200 && response.status < 300 && isRecord(payload) && payload.ok === true) {
@@ -668,6 +735,19 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       clearTimeout(timer)
       if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
     }
+  }
+
+  /** The JSON routes' one exchange: path + pre-serialized body over
+   * {@link exchangeRequest}. */
+  async function exchange(
+    pathName: string,
+    bodyJson: string,
+    signal: AbortSignal | undefined,
+    applySuccessState: boolean,
+    creds: { url: string; token: string },
+    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean } = {},
+  ): Promise<Record<string, unknown>> {
+    return exchangeRequest(`${creds.url}${pathName}`, requestInit(creds.token, bodyJson), signal, applySuccessState, opts)
   }
 
   function connect(): Promise<RelayHandshake> {
@@ -841,6 +921,47 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       typeof value.body !== 'string'
     ) {
       throw new RelayError('internal', 'the relay http answer carries no upstream response')
+    }
+    return {
+      status: value.status,
+      contentType: typeof value.contentType === 'string' ? value.contentType : undefined,
+      body: value.body,
+    }
+  }
+
+  async function upload(options: RelayUploadOptions, signal?: AbortSignal): Promise<RelayHttpResult> {
+    const creds = requireCredentials()
+    const params = new URLSearchParams()
+    params.set('sessionId', options.sessionId)
+    if (options.name !== undefined) params.set('name', options.name)
+    // The empty-body upload still rides a (closed) stream: the wire route
+    // always speaks a request body, and a missing one would be a transport
+    // error, not the host's own empty-upload business failure.
+    const body =
+      options.body ??
+      new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          controller.close()
+        },
+      })
+    // The budget scales with the DECLARED size (T31-fix's rule); a timeout
+    // deliberately does not move the connection state — a slow upload is a
+    // slow call, not a dead link.
+    const payload = await exchangeRequest(
+      `${creds.url}${UPLOAD_PATH}?${params.toString()}`,
+      uploadInit(creds.token, body),
+      signal,
+      true,
+      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, options.bytes), timeoutSetsOffline: false, transportSetsOffline: false },
+    )
+    const value = payload.value
+    if (
+      !isRecord(value) ||
+      typeof value.status !== 'number' ||
+      !Number.isSafeInteger(value.status) ||
+      typeof value.body !== 'string'
+    ) {
+      throw new RelayError('internal', 'the relay upload answer carries no upstream response')
     }
     return {
       status: value.status,
@@ -1042,5 +1163,6 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     postEventResult,
     openStream,
     http,
+    upload,
   }
 }

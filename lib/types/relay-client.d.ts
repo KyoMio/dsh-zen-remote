@@ -188,6 +188,30 @@ export interface RelayClient {
      * success envelope, so a 404 from the underlying route is a RESOLVED
      * result here, never a RelayError. */
     http(route: string, query: string, signal?: AbortSignal): Promise<RelayHttpResult>;
+    /** One binary upload round-trip (T51): `sessionId` is the ORIGINAL
+     * session id, `name` the optional display filename, `body` the raw byte
+     * stream forwarded verbatim. The upstream answer (its status, content
+     * type and body text — the host route answers its business failures as
+     * 200-with-envelope, so those ride RESOLVED like `http`'s) comes back in
+     * the success envelope; every refusal or link death throws RelayError.
+     * The round-trip budget scales with `bytes` (the local request's declared
+     * `Content-Length`, when it had one) and a timeout there never moves the
+     * connection state — the invoke route's rules (T31-fix). */
+    upload(options: RelayUploadOptions, signal?: AbortSignal): Promise<RelayHttpResult>;
+}
+/** The inputs of one {@link RelayClient.upload} round-trip. */
+export interface RelayUploadOptions {
+    /** The ORIGINAL (non-virtual) session id, already restored by the caller. */
+    sessionId: string;
+    /** The file's display name, when the local request carried one. */
+    name?: string;
+    /** The raw request body. `null` (a bodyless upload — the host route would
+     * answer its own empty-stream business failure) forwards as an empty
+     * stream. */
+    body: ReadableStream<Uint8Array> | null;
+    /** The local request's declared byte count, when its `Content-Length` was
+     * readable — sizes the round-trip budget and nothing else. */
+    bytes?: number;
 }
 /** The upstream answer one {@link RelayClient.http} round-trip carries. */
 export interface RelayHttpResult {
