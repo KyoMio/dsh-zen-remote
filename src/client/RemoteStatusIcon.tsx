@@ -3,12 +3,14 @@
  * `conversation.session.header.actions` entry beside the T33b share icon,
  * drawn entirely off the shared remote-status store: lit (brand colour) =
  * the relay is online, grey = the link is down (offline / connecting /
- * incompatible, and also `revoked` / `unpaired` — the group title carries
- * the precise word), yellow = online but the interface fingerprints differ.
- * The native `title` carries the hover prompt; clicking closes the session's
- * remote access from THIS machine behind a `window.confirm` (the backend
- * forwards it to the server as an unshare with reason `client`). While the
- * link is down the click only explains itself — there is nothing to reach.
+ * incompatible), dim grey = `revoked` / `unpaired` — states of their own
+ * (T34-fix): the hover and the click say the precise word, never
+ * "reconnecting", because neither recovers without a user action — and
+ * yellow = online but the interface fingerprints differ. The native `title`
+ * carries the hover prompt; clicking closes the session's remote access from
+ * THIS machine behind a `window.confirm` (the backend forwards it to the
+ * server as an unshare with reason `client`). While the link is not serving
+ * the click only explains itself — there is nothing to reach.
  *
  * Renders NOTHING on a local session (the id is not a virtual id), so the
  * two roles' icons never appear at once, and nothing before the store's
@@ -52,8 +54,14 @@ export function RemoteStatusIcon({ sessionId, status, t }: RemoteStatusIconProps
   if (!isVirtual(sessionId) || !snap.ready) return null
   const description = describeRemoteStatus(snap.view, t)
   const close = (): void => {
+    // Offline recovers on its own; revoked / unpaired do not (T34-fix) —
+    // each says its own word instead of "reconnecting".
     if (description.state === 'offline') {
       window.alert(t('remoteStatusOfflineClick'))
+      return
+    }
+    if (description.state === 'revoked' || description.state === 'unpaired') {
+      window.alert(description.hoverText)
       return
     }
     if (!window.confirm(t('remoteStatusUnshareConfirm'))) return

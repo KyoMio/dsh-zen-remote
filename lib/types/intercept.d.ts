@@ -114,33 +114,42 @@ export type DispatchEnvelope = {
     };
 };
 /**
- * The WRITE methods of the client registry (T34): every registered method
- * that MUTATES server-side session state, refused locally with
- * `remote-offline` while the relay is not `online` — a write can only fail
- * out there, and the honest local answer beats a dead round-trip. The
- * classification, method by method, against the T31-less reality (tasks/T31
- * does not exist; the source of truth is `RELAY_METHODS` in relay-access.ts
- * minus the reads):
+ * The READ methods of the client registry (T34, whitelist form per T34-fix):
+ * the methods allowed through while the relay is not `online`. Everything in
+ * {@link CLIENT_METHOD_FIELDS} NOT listed here is a WRITE and is refused
+ * locally with `remote-offline` while offline — a write can only fail out
+ * there, and the honest local answer beats a dead round-trip. Maintaining
+ * the READ side keeps the failure mode safe: a future table entry nobody
+ * classified lands on the write side (refused offline), never silently
+ * forwarded into a dead link.
  *
- * - `session/prompt` sends a message; `session/cancel` cancels a turn;
- *   `session/rename` renames; `session/selectModel` switches the session's
- *   model; `session/updateQueue` mutates the pending inbox queue (RT:
- *   "Mutate one pending Inbox occurrence") — all session-state mutations;
- * - `job/kill` kills a server-side background job;
- * - `messageFeedback/put` / `messageFeedback/delete` write and remove
- *   message feedback records;
- * - `workspace/pinSession` / `unpinSession` / `archiveSession` /
- *   `unarchiveSession` mutate the workspace's session lists.
+ * The read list, method by method:
  *
- * Deliberately READS (forwarded as today, whatever the state):
- * `session/follow|page|projections|attachment|control|list`, `job/list`,
- * `job/follow`, `skills/list`, `messageFeedback/list`, `schedule/list`,
- * `workspace/follow` — observation only, and `session/attachment` is
- * verified against RT: it READS one durable image back (base64), it does
- * not attach anything. Every `stream: true` entry is a read by
- * construction.
+ * - every `stream: true` entry of the server table — a subscription
+ *   observes, it never mutates: `session/follow`, `session/control`,
+ *   `job/list`, `job/follow`, `workspace/follow`, and the T32
+ *   `$zr/events` pair entry (never client-dialed, listed for the table
+ *   guard);
+ * - `session/list` — the unscoped first-page read the merge route folds in;
+ * - `session/page` (history read), `session/projections` (control-key
+ *   read), `session/attachment` — verified against RT: it READS one durable
+ *   image back (base64), it does not attach anything;
+ * - `skills/list`, `messageFeedback/list`, `schedule/list` — list reads;
+ * - `fileReferences/list` (T31) — the @-reference listing; its put/delete
+ *   siblings would be writes, but only this listing is in the table.
+ *
+ * Everything else — `session/prompt|cancel|rename|selectModel|updateQueue`
+ * (send, cancel, rename, model switch, inbox mutation), `session/create` /
+ * `session/fork` (T31: new sessions on the server), `subagents/prompt` /
+ * `subagents/interruptByParent` (T31: prompt/interrupt a remote subagent),
+ * `fileUploads/upload` (T31: attachments into a remote session), `job/kill`,
+ * `messageFeedback/put|delete`, and the workspace session-list mutations —
+ * is a write.
  */
-export declare const REMOTE_WRITE_METHODS: ReadonlySet<string>;
+export declare const REMOTE_READ_METHODS: ReadonlySet<string>;
+/** Whether `endpoint` (a client-table method) is a remote WRITE: anything
+ * the read whitelist does not name (T34-fix). */
+export declare function isRemoteWrite(endpoint: string): boolean;
 /** One remote-call failure in the diagnostics ring. */
 export interface InterceptFailureRecord {
     /** ISO timestamp of the moment the failure was recorded. */
@@ -186,14 +195,17 @@ export type SelfCheckResult = {
     reason: string;
 };
 /**
- * One remote session whose stream the server closed with an `unshared` frame
- * (T34): the virtual id plus the server's structured close reason
- * ('manual' | 'client' | 'idle'; a frame without a usable reason reads
- * 'manual'). Drives the session page's 远程已关闭 banner and the
- * `remote-status` route's `closed` map. Cleared per session the next time a
- * call for it SUCCEEDS (re-shared and served again), and wholesale when the
- * relay returns to `online` (a reopened stream re-registers the closure if
- * the server still holds it).
+ * One remote session the SERVER is no longer serving to this device (T34,
+ * refined by T34-fix): the virtual id plus the close reason ('manual' |
+ * 'client' | 'idle'; anything uncertain reads 'manual'). Two sources: an
+ * `unshared` error frame on a session stream that was OPEN, and a
+ * session-scoped stream refused `not-shared` at open (the closure happened
+ * before this page arrived — no event was ever observed, so the reason
+ * degrades to manual). Drives the session page's 远程已关闭 banner and the
+ * `remote-status` route's `closed` map. Cleared PER SESSION only, when a
+ * call for it succeeds again (re-shared and served) — never wholesale on a
+ * reconnect: a link that flapped while the server still holds the closure
+ * would otherwise flash the banner away and back (T34-fix).
  */
 export interface ClosedSessionRecord {
     sessionId: string;

@@ -226,7 +226,9 @@ test("role 'client' mounts all three routes through a real inject and never call
   }
   index.apply(hostCtx, {})
   assert.equal(pluginCalls.length, 2, 'the host role loads gateway and push on top of the routes')
-  assert.equal(hostRoutes.length, 4)
+  // T34-fix: the client prefix joined the host too (the remote-status route
+  // must answer on both roles), so the host mounts 5 routes.
+  assert.equal(hostRoutes.length, 5)
 })
 
 test('admin routes register on the host role only', async () => {
@@ -266,7 +268,7 @@ test('admin routes register on the host role only', async () => {
   assert.equal(adminRoutes[0].kind, 'prefix')
 })
 
-test('T16: client routes register on the client role only', async () => {
+test('T16: client routes register on the client role (and, since T34-fix, the client prefix on the host too)', async () => {
   const index = await import(INDEX_URL)
   const CLIENT_PREFIX = '/_dsh/zen-remote/client'
   const ADMIN_PREFIX = '/_dsh/zen-remote/admin'
@@ -303,7 +305,13 @@ test('T16: client routes register on the client role only', async () => {
 
   const hostRoutes = []
   index.apply(ctxRecording(hostRoutes), {})
-  assert.equal(hostRoutes.filter((r) => String(r.path).startsWith(CLIENT_PREFIX)).length, 0, 'the host role must not register client routes')
+  // T34-fix: the CLIENT prefix mounts on the host as well — with no relay
+  // client wired, every route answers its empty conclusion (remote-status
+  // reads `{state:'unpaired', …}`); that empty answer is the point, so the
+  // T34 parts find their route whatever the role.
+  const hostClientPrefix = hostRoutes.filter((r) => String(r.path).startsWith(CLIENT_PREFIX))
+  assert.equal(hostClientPrefix.length, 1, 'the host registers the client prefix too (T34-fix)')
+  assert.equal(hostClientPrefix[0].kind, 'prefix')
   assert.equal(hostRoutes.filter((r) => String(r.path).startsWith(ADMIN_PREFIX)).length, 1, 'the host keeps its admin prefix route')
 })
 

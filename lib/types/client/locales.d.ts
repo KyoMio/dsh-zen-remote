@@ -239,6 +239,8 @@ export declare const zh: {
     readonly remoteStatusOnline: "远程会话 · 已连接";
     readonly remoteStatusOffline: "服务端离线，正在重连";
     readonly remoteStatusMismatch: "与服务端版本不一致，部分功能可能不可用";
+    readonly remoteStatusRevoked: "令牌已吊销，请在设置页重新配对";
+    readonly remoteStatusUnpaired: "已解除配对";
     readonly remoteBannerOffline: "服务端离线，远程会话暂时只读，恢复连接后自动可用";
     readonly remoteBannerClosedIdle: "远程已关闭：闲置超过设定时间，已自动休眠";
     readonly remoteBannerClosedManual: "远程已关闭：服务端已关闭此会话的远程";

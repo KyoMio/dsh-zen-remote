@@ -429,10 +429,18 @@ test('T34: desktop shell — the status icon and composer banner still register 
     assert.notEqual(banner, undefined, 'the composer banner registers on the desktop shell')
     assert.equal(banner.options.id, 'remote-status-banner')
     assert.equal(banner.options.order, 15)
-    // The inject face hands both parts the page-wide store singleton.
+    // The inject face hands both parts the page-wide store singleton, and
+    // the banner a per-session composer-block binding (T34-fix: the disable
+    // rides the host's ctx.conversation.blocks contract).
     const share = icon.options.inject()
     assert.equal(typeof share.status.subscribe, 'function')
     assert.equal(typeof share.status.getSnapshot, 'function')
+    const bannerShare = banner.options.inject('zr~abcd1234~session-a')
+    assert.equal(typeof bannerShare.setComposerBlock, 'function')
+    // A composition whose conversation service is absent degrades to a no-op
+    // binding (the fake ctx has no `get`), not a crash.
+    bannerShare.setComposerBlock('reason')
+    bannerShare.setComposerBlock(undefined)
   } finally {
     delete globalThis.dshDesktop
   }
@@ -455,6 +463,16 @@ test('T34: the parts render only for virtual-id sessions (textual pins — .tsx 
     assert.ok(source.includes(marker), `${file} gates its render on the virtual id`)
     assert.ok(source.includes('return null'), `${file} renders nothing off the gate`)
   }
+  // T34-fix: the disable rides the host's composer-block contract, not a CSS
+  // override — the banner raises the block while it stands and the cleanup
+  // clears it.
+  const banner = readFileSync(join(ROOT, 'src', 'client', 'RemoteComposerBanner.tsx'), 'utf8')
+  assert.ok(banner.includes('setComposerBlock(text)'), 'the banner raises the block')
+  assert.ok(banner.includes('setComposerBlock(undefined)'), 'the cleanup clears it')
+  const css = readFileSync(join(ROOT, 'src', 'client', 'remote-status-css.ts'), 'utf8')
+  assert.ok(!css.includes('data-zr-remote-readonly'), 'the CSS override is gone')
+  // and the banner no longer stacks an explicit width onto its side margins
+  assert.ok(!css.includes('width: 100%'), 'no width+margins overflow')
 })
 
 test('T34: describeRemoteStatus — the three icon states, revoked/unpaired read offline, a mismatch only while online', async () => {
@@ -464,8 +482,10 @@ test('T34: describeRemoteStatus — the three icon states, revoked/unpaired read
   assert.deepEqual(describeRemoteStatus(view(), t), { state: 'online', hoverText: '#remoteStatusOnline' })
   assert.deepEqual(describeRemoteStatus(view({ versionMismatch: true }), t), { state: 'mismatch', hoverText: '#remoteStatusMismatch' })
   assert.deepEqual(describeRemoteStatus(view({ state: 'offline' }), t), { state: 'offline', hoverText: '#remoteStatusOffline' })
-  assert.deepEqual(describeRemoteStatus(view({ state: 'revoked' }), t), { state: 'offline', hoverText: '#remoteStatusOffline' })
-  assert.deepEqual(describeRemoteStatus(view({ state: 'unpaired' }), t), { state: 'offline', hoverText: '#remoteStatusOffline' })
+  // T34-fix: revoked / unpaired are states of their own — the word is theirs,
+  // never "reconnecting"
+  assert.deepEqual(describeRemoteStatus(view({ state: 'revoked' }), t), { state: 'revoked', hoverText: '#remoteStatusRevoked' })
+  assert.deepEqual(describeRemoteStatus(view({ state: 'unpaired' }), t), { state: 'unpaired', hoverText: '#remoteStatusUnpaired' })
   assert.deepEqual(describeRemoteStatus(undefined, t), { state: 'offline', hoverText: '#remoteStatusOffline' })
   // offline outranks the mismatch (the verdict may predate the outage)
   assert.equal(describeRemoteStatus(view({ state: 'offline', versionMismatch: true }), t).state, 'offline')

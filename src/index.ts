@@ -663,6 +663,23 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         }
       }, 'dsh-zen-remote: relay route')
     })
+    // The client routes live on BOTH roles (T34-fix): the T34 remote-status
+    // route especially is what the client-half parts poll, and a desktop app
+    // can switch roles without a code path change. On a host the row carries
+    // no server credentials, so every route answers its empty conclusion —
+    // remote-status reads `{state:'unpaired', versionMismatch:false, …}`,
+    // the settings probe reads unpaired, unshare finds no relay client.
+    // Same admission wall as the client role's mount.
+    ctx.inject(['webServer', 'connection'], (clientCtx) => {
+      clientCtx.effect(() => clientCtx.webServer.register({
+        kind: 'prefix',
+        path: CLIENT_ROUTE_PREFIX,
+        handler: createClientHandler({
+          admit: (req) => clientCtx.connection.admit(req),
+          getRowConfig: () => config,
+        }),
+      }), 'dsh-zen-remote: client routes (host)')
+    })
   } else {
     // Sub-client half (T16, T23a): pairing claim + connection status, talking to
     // the SERVER's gateway instead of running one. Same admission wall as

@@ -1,18 +1,15 @@
 /**
  * Styles for the T34 sub-client status parts — the title-row connection
- * icon's three states and the composer's readonly banner + disabled card.
- * Injected as one `<style data-plugin="dsh-zen-remote-remote-status">` tag
- * BEFORE apply's desktop gate (a desktop app in the client role has remote
- * sessions too; on a host the parts render nothing for local sessions, so
- * the desktop stays pixel-identical).
+ * icon's states and the composer's readonly banner. Injected as one
+ * `<style data-plugin="dsh-zen-remote-remote-status">` tag BEFORE apply's
+ * desktop gate (a desktop app in the client role has remote sessions too; on
+ * a host the parts render nothing for local sessions, so the desktop stays
+ * pixel-identical).
  *
- * Selectors are scoped under the parts' own attributes and the two
- * host-published contract markers (`data-composer-seat`,
- * `data-composer-card`) — no hashed class names, no layer-count
- * assumptions. The disabled-card rule only ever fires when the banner
- * component marked the seat itself (`data-zr-remote-readonly`, set by JS
- * traversal from the banner's own DOM position, per the AGENTS.md rule
- * against guessing host DOM depth with selectors).
+ * T34-fix: the input itself is disabled through the HOST's component
+ * capability — `ctx.conversation.blocks.set(sessionId, { reason })`, the
+ * composer-block contract — not through any CSS override; what remains here
+ * is scoped under the parts' own attributes and can reach nothing but them.
  */
 
 export const REMOTE_STATUS_CSS = `
@@ -36,9 +33,11 @@ button.zr-remote-status[data-zen-remote="remote-status"]:hover {
 button.zr-remote-status[data-zen-remote="remote-status"][data-state="online"] {
   color: var(--dsw-alias-state-business-primary, #4f6ef7);
 }
-/* offline: the default grey above is the state; keep the glyph at reduced
-   weight so a dead link reads instantly */
-button.zr-remote-status[data-zen-remote="remote-status"][data-state="offline"] {
+/* offline / revoked / unpaired: the default grey is the state, dimmed a
+   little so a dead or unpaired link reads instantly */
+button.zr-remote-status[data-zen-remote="remote-status"][data-state="offline"],
+button.zr-remote-status[data-zen-remote="remote-status"][data-state="revoked"],
+button.zr-remote-status[data-zen-remote="remote-status"][data-state="unpaired"] {
   color: var(--dsw-alias-label-tertiary);
   opacity: 0.75;
 }
@@ -47,11 +46,13 @@ button.zr-remote-status[data-zen-remote="remote-status"][data-state="mismatch"] 
 }
 
 /* The composer banner: a dock entry, so on desktop it is one full-width row
-   of the composer column (the slot anchor is display:contents). Styled after
-   the host's own composer notice, standalone. */
+   of the composer column (the slot anchor is display:contents and the
+   composer column is a flex column — the item stretches to the column
+   width WITHOUT an explicit width, which would stack with the side margins
+   and overflow the input column, T34-fix). Styled after the host's own
+   composer notice, standalone. */
 .zr-remote-banner[data-zen-remote="remote-banner"] {
   box-sizing: border-box;
-  width: 100%;
   margin: 0 max(16px, var(--dsh-composer-side-clearance, 16px));
   border-radius: var(--dsw-radius-md, 8px);
   background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.04));
@@ -59,17 +60,5 @@ button.zr-remote-status[data-zen-remote="remote-status"][data-state="mismatch"] 
   padding: 6px 10px;
   font-size: 12px;
   line-height: 18px;
-}
-
-/* The disabled composer: the banner marked the seat (JS traversal, not a
-   structural selector), and only the host-published card inside it dims and
-   stops pointing. The real enforcement is the interceptor's remote-offline
-   refusal — this is the display half. */
-[data-composer-seat][data-zr-remote-readonly] [data-composer-card] {
-  pointer-events: none;
-  opacity: 0.55;
-}
-[data-composer-seat][data-zr-remote-readonly] [data-composer-card] [contenteditable] {
-  caret-color: transparent;
 }
 `
