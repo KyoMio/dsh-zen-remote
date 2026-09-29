@@ -25,6 +25,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission } from './admin-routes.js';
+import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js';
 import type { InterceptDiagnostics } from './intercept.js';
 import type { RelayClient } from './relay-client.js';
 /** Prefix all client routes live under (one webServer prefix registration). */
@@ -74,6 +75,11 @@ export interface ClientHandlerOptions {
      * Shapes, counters and failure codes only — never a token. Undefined when
      * this composition never even attempted an install (no typertGateway). */
     getIntercept?: () => InterceptDiagnostics | undefined;
+    /** The exact-fetch-route interception's diagnostics (T51), read live per
+     * request: the local upload route's remote-forwarding install state and
+     * its refusal counters. Undefined when this composition never attempted
+     * one (no connection service, or no fileUploads service to inject). */
+    getFetchRouteIntercept?: () => FetchRouteInterceptDiagnostics | undefined;
     /** Serve ONLY the remote-status route (T41a-fix2, the host role's mount):
      * every other route under the prefix answers the same 404 an unknown path
      * would. The claim / status / reconnect / unshare routes exist for a

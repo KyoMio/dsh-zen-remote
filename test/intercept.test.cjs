@@ -1564,6 +1564,134 @@ test('the wiring uninstalls when the self-check fails (unreachable wrap)', async
   for (const disposer of effects) disposer()
 })
 
+// -- T51: the fetch-route wiring -----------------------------------------------------
+
+const { FILE_UPLOAD_PATH, SESSION_EXPORT_PATH } = require('../lib/fetch-route-intercept.js')
+
+/** A fake connection service with the raw instance the wiring unwraps: an
+ * admit wall plus a fetchRoutes Map carrying the two entries the wrap gates
+ * on. The upload route records what reached it. */
+function makeFakeConnectionService(uploadEntry) {
+  const seen = []
+  const routes = new Map()
+  if (uploadEntry !== undefined) routes.set(FILE_UPLOAD_PATH, uploadEntry)
+  routes.set(SESSION_EXPORT_PATH, {
+    methods: new Set(['GET', 'HEAD']),
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      seen.push(request)
+      return new Response('local-export')
+    },
+  })
+  const raw = {
+    admit: () => ({}),
+    fetchRoutes: routes,
+  }
+  return { proxy: { [symbols.original]: raw, admit: raw.admit }, raw, routes, seen }
+}
+
+function uploadEntryOf(fetch) {
+  return {
+    methods: new Set(['POST']),
+    requestBody: 'streaming',
+    fetch,
+  }
+}
+
+const uploadRequestOf = (sessionId) =>
+  new Request(`http://dsh.internal/api/session/uploadFileBinary?sessionId=${encodeURIComponent(sessionId)}&name=x.bin`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/octet-stream' },
+    body: Buffer.from('bytes'),
+    duplex: 'half',
+  })
+
+test('T51: the fetch-route wiring installs beside the typert wrap and the status route surfaces it', async () => {
+  const { apply } = await import(INDEX_URL)
+  const gateway = new FakeTypertGateway()
+  const uploadSeen = []
+  const connection = makeFakeConnectionService(
+    uploadEntryOf(async (request) => {
+      uploadSeen.push(request)
+      return new Response('local-upload')
+    }),
+  )
+  const originalExportFetch = connection.routes.get(SESSION_EXPORT_PATH).fetch
+  const originalUploadFetch = connection.routes.get(FILE_UPLOAD_PATH).fetch
+  const { ctx, effects, registered } = makeWiringCtx({
+    connection: connection.proxy,
+    fileUploads: {},
+    typertGateway: { [symbols.original]: gateway },
+  })
+  apply(ctx, { role: 'client' })
+  assert.notEqual(connection.routes.get(FILE_UPLOAD_PATH).fetch, uploadSeen, 'the entry is wrapped')
+
+  // The status answer carries the new diagnostics block — the row is
+  // unpaired, so the wrapper reports the offline refusal shape.
+  const status = await serveOnce(registered, '/_dsh/zen-remote/client/status')
+  assert.equal(status.fetchRouteIntercept.installed, true)
+  assert.equal(status.fetchRouteIntercept.uploadWrapped, true)
+  assert.equal(status.fetchRouteIntercept.exportWrapped, true)
+  assert.equal(status.fetchRouteIntercept.shape.ok, true)
+
+  // A virtual upload is refused locally (the row is unpaired → 503
+  // remote-offline); a local id reaches the original route untouched.
+  const virtual = toVirtual(SERVER_ID, LOCAL_ID)
+  const refused = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(virtual))
+  assert.equal(refused.status, 503)
+  assert.equal((await refused.json()).error.code, 'remote-offline')
+  assert.equal(uploadSeen.length, 0)
+  const local = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(LOCAL_ID))
+  assert.equal(await local.text(), 'local-upload')
+  assert.equal(uploadSeen.length, 1)
+  const blocked = await connection.routes.get(SESSION_EXPORT_PATH).fetch(
+    new Request(`http://dsh.internal/api/session.export?sessionId=${encodeURIComponent(virtual)}`, { method: 'HEAD' }),
+  )
+  assert.equal(blocked.status, 403)
+  assert.equal(connection.seen.length, 0)
+
+  // Disposal restores the exact original entries.
+  for (const disposer of effects) disposer()
+  assert.equal(connection.routes.get(FILE_UPLOAD_PATH).fetch, originalUploadFetch, 'the original upload fetch came back')
+  assert.equal(connection.routes.get(SESSION_EXPORT_PATH).fetch, originalExportFetch, 'the original export fetch came back')
+  // A disposed row answers without the block at all — the honest "nothing
+  // is installed here" the typert diagnostics degrade to as well.
+  const afterStatus = await serveOnce(registered, '/_dsh/zen-remote/client/status')
+  assert.equal(afterStatus.fetchRouteIntercept, undefined)
+})
+
+test('T51: a shape refusal leaves the routes untouched and the status route says why', async () => {
+  const { apply } = await import(INDEX_URL)
+  const gateway = new FakeTypertGateway()
+  // The upload entry is missing entirely (a composition without the upload
+  // service, or a reshaped future DSH): the wiring refuses and records.
+  const uploadSeen = []
+  const connection = makeFakeConnectionService(undefined)
+  connection.routes.set(FILE_UPLOAD_PATH, {
+    methods: new Set(['POST']),
+    requestBody: 'buffered',
+    fetch: async (request) => {
+      uploadSeen.push(request)
+      return new Response('local-upload')
+    },
+  })
+  const { ctx, effects, registered } = makeWiringCtx({
+    connection: connection.proxy,
+    fileUploads: {},
+    typertGateway: { [symbols.original]: gateway },
+  })
+  apply(ctx, { role: 'client' })
+  const status = await serveOnce(registered, '/_dsh/zen-remote/client/status')
+  assert.equal(status.fetchRouteIntercept.installed, false)
+  assert.equal(status.fetchRouteIntercept.shape.ok, false)
+  assert.ok(status.fetchRouteIntercept.shape.reasons.some((reason) => reason.includes('streaming')))
+  // The route answers exactly as it did before the plugin existed.
+  const local = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(LOCAL_ID))
+  assert.equal(await local.text(), 'local-upload')
+  assert.equal(uploadSeen.length, 1)
+  for (const disposer of effects) disposer()
+})
+
 // -- T34: offline writes, status annotations, closed sessions ------------------------
 
 test('T34: every write method is refused remote-offline while the relay is not online, and never reaches the relay', async () => {

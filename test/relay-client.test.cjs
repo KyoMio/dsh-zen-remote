@@ -21,6 +21,7 @@ const HANDSHAKE = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM = '/_dsh/zen-remote/relay/v1/stream'
 const UNSHARE = '/_dsh/zen-remote/relay/v1/unshare'
+const UPLOAD = '/_dsh/zen-remote/relay/v1/upload'
 
 const HANDSHAKE_OK = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: { algo: 'sha256' } }]
 
@@ -43,22 +44,31 @@ function startFakeRelay() {
     invoke: () => [200, { ok: true, value: { answer: 42 } }],
     stream: undefined,
     unshare: () => [200, { ok: true }],
+    upload: () => [200, { ok: true, value: { status: 200, contentType: 'application/json; charset=utf-8', body: JSON.stringify({ ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'att-1', name: 'note.txt', bytes: 5 } } }) } }],
   }
   const server = http.createServer((req, res) => {
     const chunks = []
     req.on('data', (c) => chunks.push(c))
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8')
+      const rawBody = Buffer.concat(chunks)
       let body
       try { body = raw === '' ? {} : JSON.parse(raw) } catch { body = undefined }
       const closed = { beforeEnd: false }
       res.on('close', () => { closed.beforeEnd = !res.writableEnded })
-      seen.push({ method: req.method, url: String(req.url).split('?')[0], headers: req.headers, body, req, res, closed })
+      seen.push({ method: req.method, url: String(req.url).split('?')[0], query: new URL(req.url || '/', 'http://x').search, headers: req.headers, body, rawBody, req, res, closed })
       const route = String(req.url).split('?')[0]
       if (route === HANDSHAKE) {
         // A scenario either RETURNS [status, body] to be answered for it, or
         // answers the response itself (a stall that must outlive timers).
         const answered = scenario.handshake(req, res)
+        if (answered !== undefined) sendJson(res, answered[0], answered[1])
+        return
+      }
+      if (route === UPLOAD) {
+        // T51: the binary channel — the body is raw bytes, never JSON. Same
+        // scenario contract as the JSON routes.
+        const answered = scenario.upload(req, res)
         if (answered !== undefined) sendJson(res, answered[0], answered[1])
         return
       }
@@ -494,6 +504,122 @@ test('invoke: a caller abort is an aborted error, not offline', async () => {
     setTimeout(() => controller.abort(), 30)
     await assert.rejects(() => pending, (error) => error.code === 'aborted')
     await waitFor(() => relay.seen[relay.seen.length - 1].closed.beforeEnd)
+  } finally { await relay.stop() }
+})
+
+// ---- T51: the binary upload channel ---------------------------------------------
+
+const RECEIPT_ENVELOPE = { ok: true, value: { status: 200, contentType: 'application/json; charset=utf-8', body: JSON.stringify({ ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'att-1', name: 'note.txt', bytes: 5 } } }) } }
+
+function byteStreamOf(buffer, chunkSize = 3) {
+  let offset = 0
+  return new ReadableStream({
+    pull(controller) {
+      if (offset >= buffer.length) {
+        controller.close()
+        return
+      }
+      controller.enqueue(new Uint8Array(buffer.subarray(offset, offset + chunkSize)))
+      offset += chunkSize
+    },
+  })
+}
+
+test('upload: the byte stream rides out, the query carries the original id + name, and the upstream answer comes back', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    const bytes = Buffer.from('hello')
+    const result = await client.upload({ sessionId: 'session-a', name: 'note.txt', body: byteStreamOf(bytes), bytes: 5 })
+    assert.equal(result.status, 200)
+    assert.equal(result.contentType, 'application/json; charset=utf-8')
+    assert.deepEqual(JSON.parse(result.body), { ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'att-1', name: 'note.txt', bytes: 5 } } })
+    const hits = relay.seen.filter((r) => r.url === UPLOAD)
+    assert.equal(hits.length, 1)
+    const hit = hits[0]
+    assert.equal(hit.method, 'POST')
+    assert.equal(hit.query, '?sessionId=session-a&name=note.txt')
+    assert.equal(hit.headers['content-type'], 'application/octet-stream')
+    assert.equal(hit.headers['content-length'], undefined, 'the body goes chunked — a hand-set length breaks DSH undici')
+    assert.ok(hit.rawBody.equals(bytes), 'the exact bytes arrived, in order')
+    assert.equal(hit.headers.authorization, 'Bearer tok-1')
+  } finally { await relay.stop() }
+})
+
+test('upload: refusals keep their code and status, and an unknown-size body gets no content-length anyway', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.upload = () => [403, { ok: false, error: { code: 'not-shared' } }]
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    await assert.rejects(
+      () => client.upload({ sessionId: 'session-secret', body: byteStreamOf(Buffer.from('x')) }),
+      (error) => error instanceof RelayError && error.code === 'not-shared' && error.status === 403,
+    )
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('upload: 413 payload-too-large answers its body code without a state change', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.upload = () => [413, { ok: false, error: { code: 'payload-too-large', details: {} } }]
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    await assert.rejects(
+      () => client.upload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')) }),
+      (error) => error instanceof RelayError && error.code === 'payload-too-large' && error.status === 413,
+    )
+    assert.equal(client.state, 'online', 'an oversize refusal is an answer about the call, not the link')
+  } finally { await relay.stop() }
+})
+
+test('upload: a timeout fails the CALL and leaves the connection state alone (the T31-fix rule)', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.upload = () => undefined // stalls forever
+  try {
+    const { client } = makeClient(relay.port, { requestTimeoutMs: 80 })
+    await client.connect()
+    assert.equal(client.state, 'online')
+    // A DECLARED size of 0 keeps the base budget (80 ms); an UNDECLARED one
+    // would get the five-minute cap — exactly why the bytes hint exists.
+    await assert.rejects(
+      () => client.upload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')), bytes: 0 }),
+      (error) => error.code === 'request-timeout',
+    )
+    assert.equal(client.state, 'online', 'an upload timeout never judges the link')
+    assert.equal(client.nextRetryAt, null, 'no reconnect was armed for a slow upload')
+    assert.equal(client.lastError, 'request-timeout')
+  } finally { await relay.stop() }
+})
+
+test('upload: the budget scales with the declared size (the T31-fix rule)', async () => {
+  // Base budget 30 ms; a declared 2 MiB buys +4 s. A server that answers in
+  // 120 ms — four times the base budget, far inside the scaled one — must
+  // succeed; it would have timed out under a flat budget.
+  const relay = await startFakeRelay()
+  relay.scenario.upload = (req, res) => {
+    setTimeout(() => { if (!res.destroyed) sendJson(res, 200, RECEIPT_ENVELOPE) }, 120)
+  }
+  try {
+    const { client } = makeClient(relay.port, { requestTimeoutMs: 30 })
+    await client.connect()
+    const result = await client.upload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')), bytes: 2 * 1024 * 1024 })
+    assert.equal(result.status, 200)
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('upload: a null body rides as an empty stream', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    const result = await client.upload({ sessionId: 'session-a', body: null })
+    assert.equal(result.status, 200)
+    const hit = relay.seen.find((r) => r.url === UPLOAD)
+    assert.equal(hit.rawBody.length, 0)
   } finally { await relay.stop() }
 })
 

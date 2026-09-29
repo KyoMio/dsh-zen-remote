@@ -34,6 +34,24 @@ import type { ShareStore } from './share-store.js';
  * `…/relay//…` shapes and never `…/relay/ping`.
  */
 export declare const RELAY_PREFIX = "/_dsh/zen-remote/relay";
+/**
+ * Body ceiling for the binary upload channel alone (T51): a shared session's
+ * non-image file attachments. DSH's own upload route has NO byte cap — the
+ * host stores the stream verbatim (`saveFileStreamVerbatim` →
+ * `publishImmutableObjectStream`, RT dsh-attachment-local lib/index.js
+ * ~699-716; the 20 MiB `maxImageBytes` there covers INLINE images only), so
+ * there is no host number to mirror and this relay picks its own: 100 MiB
+ * per upload, checked first against `Content-Length` (refused before a byte
+ * moves) and then counted while the stream is pumped (a chunked body has no
+ * length header — the sub-client's undici forbids hand-set length headers,
+ * so the streaming count is the path its uploads normally take). Past the
+ * cap the forward is aborted, the rest of the request is drained and the
+ * answer is 413 `payload-too-large`.
+ */
+export declare const MAX_UPLOAD_BYTES: number;
+/** The `/api` route the upload channel dispatches into, verbatim from the
+ * host's own registration (RT dsh-client-file-upload lib/index.js:73). */
+export declare const UPLOAD_HTTP_PATH = "/api/session/uploadFileBinary";
 /** Shape of the `typertGateway` service this route needs (measured live,
  * docs/spike-relay.md §2.1: invoke returns the unwrapped business value and
  * throws errors carrying a string `code`; stream opens one `mode: 'stream'`
@@ -118,6 +136,10 @@ export interface RelayHandlerOptions {
      * reading must not pin the viewer count and the device budget forever);
      * defaults to 5000. Tests inject a small value. */
     endDrainTimeoutMs?: number;
+    /** The binary upload channel's byte cap (T51); defaults to
+     * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
+     * Content-Length and streaming-count refusals stay cheap to drive. */
+    uploadCapBytes?: number;
 }
 /**
  * The relay route handler plus its introspection surface. A function WITH

@@ -57,6 +57,8 @@ import { runSelfCheck, installIntercept } from './intercept.js'
 import type { InterceptDiagnostics, InterceptHandle } from './intercept.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
+import { checkFetchRouteShape, installFetchRouteIntercept } from './fetch-route-intercept.js'
+import type { FetchRouteInterceptDiagnostics, FetchRouteInterceptHandle, FetchRouteShapeCheck } from './fetch-route-intercept.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 
@@ -828,6 +830,71 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // verdict via noteSelfCheck.
       void runSelfCheck(raw, { handle, log: logWarn })
     })
+    // The exact-fetch-route interception (T51): the local backend's
+    // `/api/session/uploadFileBinary` entry forwards REMOTE sessions'
+    // non-image attachments through the relay's binary channel (the
+    // browser's Web-Worker upload bypasses window.fetch and the typert
+    // gateway entirely — it lands here), and `/api/session.export` refuses
+    // virtual ids. Injected on `fileUploads` beside `connection` on purpose:
+    // the upload route is registered inside the FileUploads service's
+    // CONSTRUCTOR (RT dsh-client-file-upload lib/index.js:171-176), so
+    // requiring the service both guarantees the entry exists and skips
+    // compositions that have no upload service at all — the same
+    // absent-half-loads-anyway posture the typertGateway inject keeps. The
+    // diagnostics flow to the client status route like the typert
+    // interception's, refused installs included.
+    let fetchRouteHandle: FetchRouteInterceptHandle | undefined
+    let fetchRouteRefused: FetchRouteShapeCheck | undefined
+    const fetchRouteDiagnostics = (): FetchRouteInterceptDiagnostics | undefined => {
+      if (fetchRouteHandle !== undefined) return fetchRouteHandle.diagnostics()
+      if (fetchRouteRefused !== undefined) {
+        return {
+          installed: false,
+          shape: fetchRouteRefused,
+          uploadWrapped: false,
+          exportWrapped: false,
+          uploadCalls: 0,
+          uploadForwarded: 0,
+          uploadRefused: 0,
+          exportBlocked: 0,
+          recentFailures: [],
+        }
+      }
+      return undefined
+    }
+    ctx.inject(['connection', 'fileUploads'], (connectionCtx) => {
+      const logWarn = (...args: Parameters<Context['logger']['warn']>): void => { ctx.logger?.warn(...args) }
+      const logInfo = (...args: Parameters<Context['logger']['info']>): void => { ctx.logger?.info(...args) }
+      const proxy = (connectionCtx as Context & { connection?: unknown }).connection
+      const raw = proxy !== null && typeof proxy === 'object'
+        ? (proxy as unknown as Record<PropertyKey, unknown>)[symbols.original]
+        : undefined
+      if (raw === null || typeof raw !== 'object') {
+        fetchRouteRefused = { ok: false, reasons: ['original: connection[symbols.original] is not an object'] }
+        logWarn('dsh-zen-remote fetch-route intercept not installed: %s', fetchRouteRefused.reasons[0])
+        return
+      }
+      // Shape first, like the typert wrap: a failed check leaves every route
+      // exactly as it was — local uploads untouched, remote uploads keep
+      // failing with the honest local error.
+      const shape = checkFetchRouteShape(raw)
+      if (!shape.ok) {
+        fetchRouteRefused = shape
+        logWarn('dsh-zen-remote fetch-route intercept not installed: %s', shape.reasons.join('; '))
+        return
+      }
+      const handle = installFetchRouteIntercept({
+        connection: raw,
+        relay: relayClient,
+        getServerId: () => relayClient.handshakeInfo?.serverId,
+        log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
+      })
+      fetchRouteHandle = handle
+      connectionCtx.effect(() => () => {
+        handle.uninstall()
+        if (fetchRouteHandle === handle) fetchRouteHandle = undefined
+      }, 'dsh-zen-remote: fetch-route intercept')
+    })
     ctx.inject(['webServer', 'connection'], (clientCtx) => {
       clientCtx.effect(() => clientCtx.webServer.register({
         kind: 'prefix',
@@ -837,6 +904,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           getRowConfig: () => config,
           getRelayClient: () => relayClient,
           getIntercept: interceptDiagnostics,
+          getFetchRouteIntercept: fetchRouteDiagnostics,
         }),
       }), 'dsh-zen-remote: client routes')
     })

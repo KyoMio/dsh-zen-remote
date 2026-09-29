@@ -27,6 +27,7 @@ const { createShareStore } = require('../lib/share-store.js')
 const { createRelayClient, RelayError } = require('../lib/relay-client.js')
 const { createClientHandler } = require('../lib/client-routes.js')
 const { installIntercept } = require('../lib/intercept.js')
+const { installFetchRouteIntercept, FILE_UPLOAD_PATH, SESSION_EXPORT_PATH } = require('../lib/fetch-route-intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
@@ -1153,4 +1154,112 @@ test('e2e T41b: the changes diff crosses the sub-client http route with the orig
       await new Promise((resolve) => { clientServer.closeAllConnections(); clientServer.close(resolve) })
     }
   } finally { await env.stop() }
+})
+
+// ---- T51: the binary upload channel end to end ------------------------------------
+
+test('e2e T51: an upload through the wrapped local route crosses the whole chain with the original id and the same bytes; export refuses locally', async () => {
+  // The fake shared handler records the synthetic Request and reads its body
+  // stream to the end — the byte-exact observable of the whole chain. The
+  // read happens HERE (once): the pushed Request's body is consumed by this
+  // callback, so the assertions below use the recorded bytes.
+  const seenUploads = []
+  const env = await boot({
+    shared: ['session-a'],
+    apiFetch: async (request) => {
+      const chunks = []
+      if (request.body !== null) {
+        for await (const chunk of request.body) chunks.push(Buffer.from(chunk))
+      }
+      const bytes = Buffer.concat(chunks)
+      seenUploads.push({ url: request.url, method: request.method, bytes })
+      const receipt = { ok: true, value: { receiptId: 'r-e2e', file: { attachmentId: 'att-e2e', name: 'note.txt', bytes: bytes.length } } }
+      return new Response(JSON.stringify(receipt), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } })
+    },
+  })
+  let handle
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    // The fake connection service: exactly the surface the wrap installs
+    // over. The local upload route is a canary — a virtual id must NEVER
+    // reach it.
+    const routes = new Map()
+    routes.set(FILE_UPLOAD_PATH, {
+      methods: new Set(['POST']),
+      requestBody: 'streaming',
+      fetch: async () => {
+        throw new Error('the local upload route ran for a virtual id')
+      },
+    })
+    routes.set(SESSION_EXPORT_PATH, {
+      methods: new Set(['GET', 'HEAD']),
+      requestBody: 'buffered',
+      fetch: async () => new Response('local-export'),
+    })
+    const connection = { fetchRoutes: routes }
+    handle = installFetchRouteIntercept({
+      connection,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+    })
+    assert.equal(handle.diagnostics().uploadWrapped, true)
+    assert.equal(handle.diagnostics().exportWrapped, true)
+
+    const virtual = toVirtual(info.serverId, 'session-a')
+    const bytes = Buffer.from('e2e-uploaded-bytes')
+    const query = new URLSearchParams({ sessionId: virtual, name: 'note.txt' })
+    const request = new Request(`http://dsh.internal/api/session/uploadFileBinary?${query.toString()}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: bytes,
+      duplex: 'half',
+    })
+    const response = await routes.get(FILE_UPLOAD_PATH).fetch(request)
+    assert.equal(response.status, 200)
+    assert.deepEqual(JSON.parse(await response.text()), {
+      ok: true,
+      value: { receiptId: 'r-e2e', file: { attachmentId: 'att-e2e', name: 'note.txt', bytes: bytes.length } },
+    })
+    await waitFor(() => env.apiFetchCalls.length === 1)
+    // The synthetic Request carries the ORIGINAL session id and the exact
+    // bytes — through the real gateway child, binary wire, relay route and
+    // shared handler.
+    assert.equal(seenUploads[0].method, 'POST')
+    assert.equal(
+      seenUploads[0].url,
+      'http://relay.local/api/session/uploadFileBinary?sessionId=session-a&name=note.txt',
+    )
+    assert.ok(seenUploads[0].bytes.equals(bytes), 'the exact bytes crossed the chain')
+    assert.equal(handle.diagnostics().uploadForwarded, 1)
+
+    // A local id on the same wrapped entry reaches the local route (which
+    // would answer its own business failure for an unknown id — here the
+    // canary throws, so observe the passthrough by the refusal counter).
+    const localRequest = new Request(`http://dsh.internal/api/session/uploadFileBinary?sessionId=${encodeURIComponent('session-local')}&name=x.bin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: Buffer.from('x'),
+      duplex: 'half',
+    })
+    await assert.rejects(() => routes.get(FILE_UPLOAD_PATH).fetch(localRequest), /local upload route/, 'the local id reached the local route')
+    assert.equal(handle.diagnostics().uploadCalls, 2)
+    assert.equal(env.apiFetchCalls.length, 1, 'the local upload never traveled')
+
+    // The export refusal stays LOCAL: the server's /api dispatch is never
+    // consulted.
+    const exportResponse = await routes.get(SESSION_EXPORT_PATH).fetch(
+      new Request(`http://dsh.internal/api/session.export?sessionId=${encodeURIComponent(virtual)}&includeDescendants=true`, { method: 'HEAD' }),
+    )
+    assert.equal(exportResponse.status, 403)
+    assert.deepEqual(await exportResponse.json(), { ok: false, error: { code: 'remote-unsupported', message: '远程会话不支持导出', details: {} } })
+    assert.equal(env.apiFetchCalls.length, 1, 'the export never reached the server')
+    assert.equal(handle.diagnostics().exportBlocked, 1)
+
+    handle.uninstall()
+    assert.equal(handle.diagnostics().installed, false)
+  } finally {
+    if (handle !== undefined) handle.uninstall()
+    await env.stop()
+  }
 })
