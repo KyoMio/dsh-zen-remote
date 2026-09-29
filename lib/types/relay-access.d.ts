@@ -51,14 +51,76 @@
  *   check. A shared `request.sessionId` padded next to it buys nothing —
  *   only the registered field is read.
  *
+ * T41a additions (the panel long tail where the session id hides in another
+ * argument), each verified against the 0.2.0 sources before registering:
+ *
+ * - the `agentId` group grows: `goals/get|edit|pause|resume|clear`,
+ *   `commands/list|execute`, `agentPresets/select`,
+ *   `sessionReferenceResolver/candidates` and the whole `terminal/*` agent
+ *   half — every one takes `agent` as its first parameter, wire `agentId`,
+ *   source `lookup: 'agent'`, wireTypeSymbol `SessionId` (the same shape
+ *   T31 verified for fileUploads/fileReferences).
+ * - `workspaceFiles/list|changes|read|readBytes|stat` carry a TOP-LEVEL
+ *   `workspaceFileScopeId`: the host registers the `workspaceFileScope`
+ *   lookup with wireTypeSymbol `SessionId` and resolves it by session —
+ *   `sessions.get(sessionId).header.cwd` is only the BASE for relative
+ *   paths (dsh-api-workspace-files lib/index.js, the lookup registration),
+ *   not a containment: absolute paths anywhere the server process can read
+ *   are served (see the registry note below). The field itself is
+ *   share-checked like any session id.
+ * - `terminal/list` and `terminal/retain` take a plain TOP-LEVEL json
+ *   `sessionId` (source `'json'`, not a lookup) — same check.
+ * - `sessionFeedback/record` carries `request.sessionId` — a plain B-type.
+ * - `sessionReferenceResolver/candidates` (@ mentions) answers with EVERY
+ *   server session — title, cwd, and a ready-made `dsh-session:` mention
+ *   — so its result travels only through the row filter that drops
+ *   inaccessible sessions (relay-server.ts, the session/list discipline).
+ * - `subagents/prompt` (`request.parentSessionId` +
+ *   `request.childSessionId`) and `subagents/interruptByParent` (TOP-LEVEL
+ *   `parentSessionId` + `childSessionId`) now claim BOTH ids: the parent is
+ *   share-checked directly, the child through the injected `parentOf`
+ *   inheritance (`store.isAccessible(id, parentOf)` — a subagent session
+ *   never enters the table, it borrows its ancestor's share). A child that
+ *   does not descend from the claimed parent fails its own check, so the
+ *   "shared parent + foreign child" decoy refuses here before DSH's own
+ *   lineage validation is ever reached.
+ *
+ * PROMPT TEXT REFERENCES ARE CHECKED TOO: a prompt whose text carries a
+ * canonical `dsh-session:<base64url(id)>` address makes DSH inject that
+ * session's content (`prepareDirectMessages` → `readSurface`, with no
+ * access check of its own), so the relay scans the text blocks of
+ * `session/prompt` / `subagents/prompt` and refuses any address naming an
+ * inaccessible session (relay-server.ts). The client restores its virtual
+ * ids inside those addresses before the call travels (intercept.ts).
+ *
+ * TERMINALS ARE DELIBERATE (SPEC user story 45, explicit user request):
+ * remote terminals open SERVER-side, so a paired desktop client working a
+ * shared session gets a real PTY in the server's workspace — a shell
+ * running as the server user WITHOUT the agent sandbox or approval
+ * restrictions (RT dsh-api-terminal-controller create), the session cwd
+ * being only the starting directory. The authorization boundary is exactly
+ * the standing one — the session must be shared AND the caller must be a
+ * paired desktop application client (the gateway's device auth + relay
+ * secret), a TRUSTED DEVICE: the shared-only rule constrains session data,
+ * not the machine. No extra switch is added on top; closing the session's
+ * remote access closes its terminals with it (the stream route kills
+ * `terminal/follow` / `terminal/retain` with `unshared`, like every other
+ * session-scoped stream). The terminal ids and attachment ids inside these
+ * calls are CLIENT-generated (`WebTerminalId` / `TerminalAttachmentId` type
+ * symbols, distinct from `SessionId`) and pass through untouched.
+ *
  * Pure functions: no I/O, no clock, the share-table lookup is injected.
  */
 /** Which standing filter the caller must apply to a global stream's frames
  * (`src/relay-filter.ts` owns both implementations). */
 export type StreamFilter = 'workspace' | 'control';
 /** Which standing filter the caller must apply to an invoke result before it
- * travels (currently only the unscoped `session/list`). */
-export type InvokeFilter = 'session-list';
+ * travels: `session-list` narrows the unscoped `session/list` items
+ * (relay-filter.ts), `session-reference-candidates` drops the @-mention
+ * candidate rows whose session is not accessible (relay-server.ts — the host
+ * lists EVERY server session with title, cwd and a ready-made mention, so
+ * unshared rows must never leave the box). */
+export type InvokeFilter = 'session-list' | 'session-reference-candidates';
 /** One invoke decision: allow (optionally through a standing result filter),
  * or the reason that goes into the 403 body. */
 export type InvokeDenyReason = 'no-session' | 'not-shared' | 'forbidden-method';

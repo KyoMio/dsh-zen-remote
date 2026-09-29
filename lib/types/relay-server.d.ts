@@ -137,4 +137,14 @@ export declare function resolveDshVersion(): string;
  *   with `viewerCount` alongside for the "who is looking" surface.
  */
 export declare function createRelayHandler(options: RelayHandlerOptions): RelayHandler;
+/** Encode one session id into the canonical reference URI (the mirror of
+ * {@link decodeSessionReferenceUri}, matching the host's encoder). */
+export declare function encodeSessionReferenceUri(sessionId: string): string;
+/**
+ * Decode one `dsh-session:` URI the way the host does, or `undefined` when
+ * it is not canonical. The host parser THROWS on non-canonical addresses —
+ * those become gateway business errors — so an address this decoder rejects
+ * can never inject anything and needs no guarding.
+ */
+export declare function decodeSessionReferenceUri(uri: string): string | undefined;
 //# sourceMappingURL=relay-server.d.ts.map

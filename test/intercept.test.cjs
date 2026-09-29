@@ -32,6 +32,7 @@ for (const key of Object.keys(process.env)) {
 const { checkGatewayShape } = require('../lib/intercept-shape.js')
 const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS } = require('../lib/intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
+const { encodeSessionReferenceUri, decodeSessionReferenceUri } = require('../lib/relay-server.js')
 const { RelayError } = require('../lib/relay-client.js')
 const { symbols } = require('@deepseek-ai/cordis')
 
@@ -491,7 +492,7 @@ test('an unregistered method carrying a virtual id is refused before anything ru
   assert.equal(relay.invokes.length, 0)
 
   await assert.rejects(
-    async () => gateway.wireTap('terminal/create', { args: { request: { agentId: VIRTUAL_ID } } }, undefined, undefined, undefined, { signal: undefined }),
+    async () => gateway.wireTap('goals/create', { args: { agentId: VIRTUAL_ID, request: { objective: 'x', maxGoalRounds: 1 } } }, undefined, undefined, undefined, { signal: undefined }),
     (error) => error.isDSHRemoteError === true && error.code === 'remote-unsupported' && typeof error.details === 'object',
   )
   assert.equal(gateway.streamCalls.length, 0)
@@ -1113,6 +1114,25 @@ test('CLIENT_METHOD_FIELDS is method-for-method and field-for-field identical to
   }
   assert.ok(Object.keys(serverTable).length >= 20, `the regex still finds the server table (${Object.keys(serverTable).length} entries)`)
   assert.deepEqual(CLIENT_METHOD_FIELDS, serverTable)
+  // T41a: the NEW field types are compared too — string equality would hide a
+  // typo only if both sides misspelled it the same way, so pin the shapes the
+  // registry grew by name.
+  assert.deepEqual(serverTable['terminal/create'], ['agentId'])
+  assert.deepEqual(serverTable['terminal/list'], ['sessionId'])
+  assert.deepEqual(serverTable['terminal/retain'], ['sessionId'])
+  assert.deepEqual(serverTable['workspaceFiles/list'], ['workspaceFileScopeId'])
+  assert.deepEqual(serverTable['sessionFeedback/record'], ['request.sessionId'])
+  assert.deepEqual(serverTable['subagents/prompt'], ['request.parentSessionId', 'request.childSessionId'])
+  assert.deepEqual(serverTable['subagents/interruptByParent'], ['parentSessionId', 'childSessionId'])
+  // Every field either table names is one of the known field types — a typo
+  // on either side fails here instead of silently matching itself.
+  const KNOWN = new Set([
+    'request.sessionId', 'request.address', 'request.parentSessionId', 'request.childSessionId', 'request.workspaceId',
+    'parentSessionId', 'childSessionId', 'sessionId', 'workspaceFileScopeId', 'agentId',
+  ])
+  for (const fields of Object.values(serverTable)) {
+    for (const field of fields) assert.ok(KNOWN.has(field), `unknown field type: ${field}`)
+  }
 })
 
 // -- diagnostics -------------------------------------------------------------------
@@ -1564,28 +1584,30 @@ test('session/fork forwards the restored source id and virtualizes the child id'
   handle.uninstall()
 })
 
-test('subagents calls rewrite only the parent slot (request envelope and top level alike)', async () => {
+test('subagents calls rewrite BOTH id slots (request envelope and top level alike, T41a)', async () => {
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()
   const { handle } = install(gateway, relay)
-  const childId = 'session-child-original'
 
+  // Both ids arrive VIRTUALIZED (the UI knows server sessions only through
+  // session/follow snapshots, whose header.id is virtualized) — both are
+  // restored before the call travels.
   await gateway.rpcBridge('subagents/prompt', {
-    args: { request: { requestId: 'r1', parentSessionId: toVirtual(SERVER_ID, 'session-parent'), childSessionId: childId, mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: 'hi' }] } },
+    args: { request: { requestId: 'r1', parentSessionId: toVirtual(SERVER_ID, 'session-parent'), childSessionId: toVirtual(SERVER_ID, 'session-child'), mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: 'hi' }] } },
   }, undefined, undefined)
   assert.deepEqual(relay.invokes[0].args.request, {
     requestId: 'r1',
     parentSessionId: 'session-parent',
-    childSessionId: childId,
+    childSessionId: 'session-child',
     mode: 'continuable',
     delivery: 'queue',
     content: [{ type: 'text', text: 'hi' }],
-  }, 'the parent id is restored; the child id is already the server-side original')
+  }, 'parent AND child are restored inside the request envelope')
 
   await gateway.rpcBridge('subagents/interruptByParent', {
-    args: { childSessionId: childId, parentSessionId: toVirtual(SERVER_ID, 'session-parent'), mode: 'continuable' },
+    args: { childSessionId: toVirtual(SERVER_ID, 'session-child'), parentSessionId: toVirtual(SERVER_ID, 'session-parent'), mode: 'continuable' },
   }, undefined, undefined)
-  assert.deepEqual(relay.invokes[1].args, { childSessionId: childId, parentSessionId: 'session-parent', mode: 'continuable' }, 'the TOP-LEVEL parent slot is restored')
+  assert.deepEqual(relay.invokes[1].args, { childSessionId: 'session-child', parentSessionId: 'session-parent', mode: 'continuable' }, 'both TOP-LEVEL slots are restored')
   handle.uninstall()
 })
 
@@ -1618,4 +1640,220 @@ test('an unregistered agentId-located method with a virtual agentId is still ref
   assert.equal(relay.invokes.length, 0)
   assert.equal(gateway.rpcCalls.length, 0)
   handle.uninstall()
+})
+
+// -- T41a: the panel long tail — goals, commands, presets, @ candidates, feedback,
+// -- workspace files, and the terminal half; both field halves, results, and streams ----
+
+test('the T41a agentId group restores the top-level agentId; candidates rows virtualize back', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = [
+    { mention: '@调试', sessionId: 'session-candidate', label: '调试登录', sameWorkspace: true, createdAt: 1 },
+  ]
+  const { handle } = install(gateway, relay)
+
+  // goals/edit: only agentId is touched; the goal ref and request ride as-is.
+  const goalArgs = { agentId: VIRTUAL_ID, ref: { id: 'goal-1', revision: 2 }, request: { objective: '发版' } }
+  const goal = await gateway.rpcBridge('goals/edit', { args: goalArgs }, undefined, undefined)
+  assert.equal(goal.ok, true)
+  assert.deepEqual(relay.invokes[0].args, { agentId: LOCAL_ID, ref: { id: 'goal-1', revision: 2 }, request: { objective: '发版' } })
+
+  // commands/execute: the slash line and attachments are not session data.
+  await gateway.rpcBridge('commands/execute', { args: { agentId: VIRTUAL_ID, line: '/model deepseek-chat', submittedAttachments: [] } }, undefined, undefined)
+  assert.deepEqual(relay.invokes[1].args, { agentId: LOCAL_ID, line: '/model deepseek-chat', submittedAttachments: [] })
+
+  // agentPresets/select and the @ resolver travel the same way.
+  await gateway.rpcBridge('agentPresets/select', { args: { agentId: VIRTUAL_ID, agentPreset: 'default' } }, undefined, undefined)
+  await gateway.rpcBridge('sessionReferenceResolver/candidates', { args: { agentId: VIRTUAL_ID, query: '调试' } }, undefined, undefined)
+  assert.deepEqual(relay.invokes[2].args, { agentId: LOCAL_ID, agentPreset: 'default' })
+  assert.deepEqual(relay.invokes[3].args, { agentId: LOCAL_ID, query: '调试' })
+
+  // The candidates RESULT carries OTHER sessions' ids — each row virtualized,
+  // everything else in the row untouched.
+  const candidates = await gateway.rpcBridge('sessionReferenceResolver/candidates', { args: { agentId: VIRTUAL_ID, query: '调试' } }, undefined, undefined)
+  assert.deepEqual(candidates.value, [
+    { mention: '@调试', sessionId: toVirtual(SERVER_ID, 'session-candidate'), label: '调试登录', sameWorkspace: true, createdAt: 1 },
+  ])
+  handle.uninstall()
+})
+
+test('sessionFeedback/record forwards request.sessionId and virtualizes the not-found error id', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { ok: false, error: { code: 'session-not-found', sessionId: 'session-gone' } }
+  const { handle } = install(gateway, relay)
+  const envelope = await gateway.rpcBridge('sessionFeedback/record', { args: { request: { sessionId: VIRTUAL_ID, category: 'other' } } }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(envelope.value, { ok: false, error: { code: 'session-not-found', sessionId: toVirtual(SERVER_ID, 'session-gone') } })
+  assert.deepEqual(relay.invokes[0].args, { request: { sessionId: LOCAL_ID, category: 'other' } })
+  // A success answer carries no ids and passes through untouched.
+  relay.invokeValue = { ok: true, value: { recorded: true } }
+  const ok = await gateway.rpcBridge('sessionFeedback/record', { args: { request: { sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  assert.deepEqual(ok.value, { ok: true, value: { recorded: true } })
+  handle.uninstall()
+})
+
+test('workspaceFiles calls restore the top-level workspaceFileScopeId; local scopes stay local', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { path: 'src', entries: [{ name: 'index.ts', type: 'file', size: 10 }], truncated: false }
+  const { handle } = install(gateway, relay)
+  const scopeVirtual = toVirtual(SERVER_ID, 'session-scope')
+  const envelope = await gateway.rpcBridge('workspaceFiles/list', { args: { workspaceFileScopeId: scopeVirtual, path: 'src' } }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(envelope.value, relay.invokeValue, 'listings carry no session ids — untouched')
+  assert.deepEqual(relay.invokes[0].args, { workspaceFileScopeId: 'session-scope', path: 'src' })
+  // A LOCAL scope id passes through to the local gateway untouched (the
+  // forwarded list call above never reached it — rpcCalls holds locals only).
+  await gateway.rpcBridge('workspaceFiles/stat', { args: { workspaceFileScopeId: 'session-local', path: '.' } }, undefined, undefined)
+  assert.equal(relay.invokes.length, 1)
+  assert.equal(gateway.rpcCalls.length, 1)
+  assert.deepEqual(gateway.rpcCalls[0].payload.args, { workspaceFileScopeId: 'session-local', path: '.' })
+  handle.uninstall()
+})
+
+test('terminal calls restore BOTH field halves: agentId for the PTY half, sessionId for retain/list', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { id: 'term-1', title: 'zsh', shell: { path: '/bin/zsh', args: [], name: 'zsh' }, cwd: '/srv', cols: 80, rows: 24, state: 'running', exitCode: null }
+  const { handle } = install(gateway, relay)
+
+  // create: agentId restored; the CLIENT-generated terminal id inside request
+  // rides as-is (it is not a session id).
+  const created = await gateway.rpcBridge('terminal/create', { args: { agentId: VIRTUAL_ID, request: { id: 'term-1', cols: 80, rows: 24 } } }, undefined, undefined)
+  assert.equal(created.ok, true)
+  assert.equal(created.value, relay.invokeValue, 'the terminal info carries no session id — untouched')
+  assert.deepEqual(relay.invokes[0].args, { agentId: LOCAL_ID, request: { id: 'term-1', cols: 80, rows: 24 } })
+
+  // write/resize/rename/close shape the same way.
+  await gateway.rpcBridge('terminal/write', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-9', data: 'ls\n' } }, undefined, undefined)
+  assert.deepEqual(relay.invokes[1].args, { agentId: LOCAL_ID, id: 'term-1', attachmentId: 'att-9', data: 'ls\n' })
+  await gateway.rpcBridge('terminal/close', { args: { agentId: VIRTUAL_ID, id: 'term-1' } }, undefined, undefined)
+  assert.deepEqual(relay.invokes[2].args, { agentId: LOCAL_ID, id: 'term-1' })
+
+  // list and retain locate by the plain top-level sessionId instead.
+  await gateway.rpcBridge('terminal/list', { args: { sessionId: VIRTUAL_ID } }, undefined, undefined)
+  assert.deepEqual(relay.invokes[3].args, { sessionId: LOCAL_ID })
+  await gateway.rpcBridge('terminal/retain', { args: { sessionId: VIRTUAL_ID, id: 'term-1' } }, undefined, undefined)
+  assert.deepEqual(relay.invokes[4].args, { sessionId: LOCAL_ID, id: 'term-1' })
+
+  // A LOCAL session keeps its terminals local — both halves (the five
+  // forwarded calls above never touched the local gateway).
+  await gateway.rpcBridge('terminal/environment', { args: { agentId: 'session-local' } }, undefined, undefined)
+  await gateway.rpcBridge('terminal/list', { args: { sessionId: 'session-local' } }, undefined, undefined)
+  assert.equal(relay.invokes.length, 5)
+  assert.equal(gateway.rpcCalls.length, 2)
+  handle.uninstall()
+})
+
+test('terminal/follow forwards as a stream with the restored agentId and passes frames through', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.streamFrames = [
+    { type: 'snapshot', sequence: 0, screen: '$ ', info: { id: 'term-1', title: 'zsh', cols: 80, rows: 24, state: 'running', exitCode: null } },
+    { type: 'output', sequence: 1, data: 'hello\n' },
+  ]
+  const { handle } = install(gateway, relay)
+  const frames = []
+  for await (const frame of gateway.wireTap('terminal/follow', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-9' } }, { add: () => {} }, undefined, undefined, { signal: undefined })) {
+    frames.push(frame)
+  }
+  assert.deepEqual(frames, relay.streamFrames, 'snapshot/output frames carry no session id — untouched')
+  assert.deepEqual(relay.streams, [{ namespace: 'terminal', method: 'follow', args: { agentId: LOCAL_ID, id: 'term-1', attachmentId: 'att-9' }, signal: undefined }])
+  handle.uninstall()
+})
+
+test('workspaceFiles/changes forwards as a stream with the restored workspaceFileScopeId', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.streamFrames = [{ kind: 'ready' }, { kind: 'change', change: { absolutePath: '/srv/src/index.ts', version: 'v2' } }]
+  const { handle } = install(gateway, relay)
+  const frames = []
+  for await (const frame of gateway.wireTap('workspaceFiles/changes', { args: { workspaceFileScopeId: VIRTUAL_ID, path: '.' } }, { add: () => {} }, undefined, undefined, { signal: undefined })) {
+    frames.push(frame)
+  }
+  assert.deepEqual(frames, relay.streamFrames)
+  assert.deepEqual(relay.streams, [{ namespace: 'workspaceFiles', method: 'changes', args: { workspaceFileScopeId: LOCAL_ID, path: '.' }, signal: undefined }])
+  handle.uninstall()
+})
+
+// -- T41a-fix: session-reference discipline — mention virtualization, prompt-text
+// -- restore, local-reference refusal, and the shared dsh-session codec ---------------
+
+test('candidates rows virtualize the mention URI together with sessionId (T41a-fix)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = [
+    { sessionId: 'session-candidate', label: '调试', displayTitle: '调试登录', mention: `@[调试登录](${encodeSessionReferenceUri('session-candidate')})`, sameWorkspace: true, createdAt: 1 },
+  ]
+  const { handle } = install(gateway, relay)
+  const envelope = await gateway.rpcBridge('sessionReferenceResolver/candidates', { args: { agentId: VIRTUAL_ID, query: '调试' } }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(envelope.value, [
+    { sessionId: toVirtual(SERVER_ID, 'session-candidate'), label: '调试', displayTitle: '调试登录', mention: `@[调试登录](${encodeSessionReferenceUri(toVirtual(SERVER_ID, 'session-candidate'))})`, sameWorkspace: true, createdAt: 1 },
+  ], 'the mention URI carries the VIRTUAL id so the prompt restore can decode it again')
+  // A row whose mention carries no decodable URI travels with the mention untouched.
+  relay.invokeValue = [{ sessionId: 'session-x', label: 'y', mention: '@[y](not-a-uri)' }]
+  const second = await gateway.rpcBridge('sessionReferenceResolver/candidates', { args: { agentId: VIRTUAL_ID, query: '' } }, undefined, undefined)
+  assert.deepEqual(second.value, [{ sessionId: toVirtual(SERVER_ID, 'session-x'), label: 'y', mention: '@[y](not-a-uri)' }])
+  handle.uninstall()
+})
+
+test('prompt references restore virtual ids in text; a LOCAL reference refuses the call (T41a-fix)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const enc = encodeSessionReferenceUri
+  const text = `对照 @[另一个](${enc(toVirtual(SERVER_ID, 'session-b'))}) 与裸地址 ${enc(toVirtual(SERVER_ID, 'session-a'))}`
+  const envelope = await gateway.rpcBridge('session/prompt', {
+    args: { request: { requestId: 'r1', sessionId: VIRTUAL_ID, mode: 'queue', content: [{ type: 'text', text }, { type: 'image', mediaType: 'image/png', data: 'Zm9v' }] } },
+  }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(relay.invokes[0].args.request.content[0].text, `对照 @[另一个](${enc('session-b')}) 与裸地址 ${enc('session-a')}`, 'both address forms carry the ORIGINAL ids')
+  assert.equal(relay.invokes[0].args.request.sessionId, LOCAL_ID, 'the registered-field restore still ran')
+
+  // A reference to a LOCAL session refuses the whole call — the server does
+  // not have it, and DSH would answer the address with whatever it found.
+  const local = await gateway.rpcBridge('session/prompt', {
+    args: { request: { requestId: 'r2', sessionId: VIRTUAL_ID, mode: 'queue', content: [{ type: 'text', text: `本地结论 ${enc('session-local-uuid')}` }] } },
+  }, undefined, undefined)
+  assert.deepEqual(local, { ok: false, error: { code: 'remote-unsupported', message: '引用的会话不在服务端上，无法转发', details: {} } })
+  assert.equal(relay.invokes.length, 1, 'the refused prompt never traveled')
+
+  // Non-canonical tokens are not references: they pass through untouched.
+  const junk = `畸形 dsh-session:!!! 与伪地址 dsh-session:${Buffer.from('session-x', 'utf8').toString('base64url')}`
+  await gateway.rpcBridge('session/prompt', {
+    args: { request: { requestId: 'r3', sessionId: VIRTUAL_ID, mode: 'queue', content: [{ type: 'text', text: junk }] } },
+  }, undefined, undefined)
+  assert.deepEqual(relay.invokes[1].args.request.content[0].text, junk, 'malformed tokens travel for DSH to refuse')
+  handle.uninstall()
+})
+
+test('subagents/prompt references restore the same way (T41a-fix)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const enc = encodeSessionReferenceUri
+  const envelope = await gateway.rpcBridge('subagents/prompt', {
+    args: { request: { requestId: 'r1', parentSessionId: toVirtual(SERVER_ID, 'session-parent'), childSessionId: toVirtual(SERVER_ID, 'session-child'), mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: `引用 ${enc(toVirtual(SERVER_ID, 'session-parent'))}` }] } },
+  }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(relay.invokes[0].args.request.content[0].text, `引用 ${enc('session-parent')}`)
+  assert.deepEqual(relay.invokes[0].args.request.parentSessionId, 'session-parent')
+  assert.deepEqual(relay.invokes[0].args.request.childSessionId, 'session-child')
+  handle.uninstall()
+})
+
+test('the relay server and the interceptor implement the SAME dsh-session codec (T41a-fix)', () => {
+  // Both ends must decode byte-identically or a restored address would fail
+  // the server's canonical check. The server's exports are the reference;
+  // the interceptor's own copy is exercised through the forward tests above.
+  for (const id of ['session-a', toVirtual(SERVER_ID, 'session-b'), '含中文与~/字符', '"quoted"']) {
+    const uri = encodeSessionReferenceUri(id)
+    assert.ok(uri.startsWith('dsh-session:'))
+    assert.equal(decodeSessionReferenceUri(uri), id)
+  }
+  assert.equal(decodeSessionReferenceUri('dsh-session:not-base64url!'), undefined)
+  assert.equal(encodeSessionReferenceUri('a'), 'dsh-session:ImEi', 'base64url of the JSON-QUOTED id, matching the host encoder')
 })

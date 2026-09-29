@@ -38,14 +38,18 @@ test('decideInvoke: the three reviewer bypass requests are forbidden-method, dec
 test('decideInvoke: any unregistered method refuses, with or without a request object', () => {
   for (const [namespace, method, args] of [
     ['settings', 'update', { ns: 'x', patch: {} }],
-    ['terminal', 'create', { agentId: 'a', request: { shellPath: '/bin/zsh' } }],
-    ['account', 'getProfile', { client: {} }],
-    ['pluginManager', 'listPlugins', {}],
-    ['schedule', 'delete', { request: { id: 's1', sessionId: 'S-shared' } }],
-    // T31 registered the six calls with a verified ownership story — the
-    // other agentId-located calls (goals, workspaceFiles) stay closed.
+    // T41a registered the goals bar, commands, the preset switches, the
+    // workspace-files group and the whole terminal half — the REST of those
+    // namespaces stay closed (global data, third-party surfaces, or calls
+    // the panels do not make remotely).
     ['goals', 'create', { agentId: 'VICTIM', request: {} }],
-    ['workspaceFiles', 'list', { agentId: 'VICTIM', request: { path: '.' } }],
+    ['goals', 'complete', { agentId: 'VICTIM', ref: {} }],
+    ['agentPresets', 'list', {}],
+    ['agentPresets', 'read', { agentPreset: 'p' }],
+    ['permissionPresets', 'catalog', {}],
+    ['officeToPdf', 'render', { request: { path: 'x' } }],
+    ['dynamicCordisRunner', 'invoke', { agentId: 'VICTIM', request: {} }],
+    ['schedule', 'delete', { request: { id: 's1', sessionId: 'S-shared' } }],
     ['anything', 'atAll', 'garbage'],
     ['nope', 'x', undefined],
   ]) {
@@ -296,14 +300,26 @@ test('decideInvoke: session/fork judges by the SOURCE session id', () => {
   assert.deepEqual(decideInvoke('session', 'fork', { request: { atSeq: 1 } }, yes), { allow: false, reason: 'no-session' })
 })
 
-// -- T31: subagents — judged by the parent --------------------------------------------
+// -- T31/T41a: subagents — BOTH ids are checked ----------------------------------------
 
-test('decideInvoke: subagents/prompt judges by request.parentSessionId, child id is dead weight', () => {
+test('decideInvoke: subagents/prompt checks parent AND child (child via ancestor inheritance)', () => {
   const args = { request: { requestId: 'r', parentSessionId: 'S-parent', childSessionId: 'S-child', mode: 'continuable', delivery: 'queue', content: [] } }
-  assert.deepEqual(decideInvoke('subagents', 'prompt', args, only(['S-parent'])), { allow: true })
+  // The stub stands for store.isAccessible AFTER the parentOf walk: a real
+  // child is not in the table but borrows its parent's share, so with only
+  // 'S-parent' shared BOTH ids come back accessible. The inheritance itself
+  // is store behavior (relay-server's parentOf wiring test); what is pinned
+  // here is that BOTH registered fields are read and BOTH checked.
+  const family = (shared, child) => (id) => shared.includes(id) || id === child
+  assert.deepEqual(decideInvoke('subagents', 'prompt', args, family(['S-parent'], 'S-child')), { allow: true })
   assert.deepEqual(decideInvoke('subagents', 'prompt', args, only([])), { allow: false, reason: 'not-shared' })
-  // A shared CHILD cannot smuggle an unshared parent through: only the
-  // registered field is read.
+  // The task's decoy: a shared parent with a child that belongs to nobody
+  // (its own ancestor walk finds nothing shared) refuses.
+  assert.deepEqual(
+    decideInvoke('subagents', 'prompt', { request: { requestId: 'r', parentSessionId: 'S-parent', childSessionId: 'S-foreign', mode: 'continuable', delivery: 'queue', content: [] } }, family(['S-parent'], 'S-child')),
+    { allow: false, reason: 'not-shared' },
+    'a shared parent cannot smuggle a foreign child through',
+  )
+  // ...and the mirror image: a shared CHILD cannot smuggle an unshared parent.
   assert.deepEqual(
     decideInvoke('subagents', 'prompt', { request: { parentSessionId: 'VICTIM', childSessionId: 'S-shared' } }, only(['S-shared'])),
     { allow: false, reason: 'not-shared' },
@@ -311,11 +327,18 @@ test('decideInvoke: subagents/prompt judges by request.parentSessionId, child id
   assert.deepEqual(decideInvoke('subagents', 'prompt', { request: { childSessionId: 'C' } }, yes), { allow: false, reason: 'no-session' })
 })
 
-test('decideInvoke: subagents/interruptByParent reads the TOP-LEVEL parentSessionId', () => {
-  // Top-level arguments — no request envelope at all.
+test('decideInvoke: subagents/interruptByParent reads BOTH top-level ids', () => {
+  // Top-level arguments — no request envelope at all. Same family stub as
+  // above: the child borrows the parent's share through the ancestor walk.
+  const family = (shared, child) => (id) => shared.includes(id) || id === child
   const args = { childSessionId: 'S-child', parentSessionId: 'S-parent', mode: 'continuable' }
-  assert.deepEqual(decideInvoke('subagents', 'interruptByParent', args, only(['S-parent'])), { allow: true })
+  assert.deepEqual(decideInvoke('subagents', 'interruptByParent', args, family(['S-parent'], 'S-child')), { allow: true })
   assert.deepEqual(decideInvoke('subagents', 'interruptByParent', args, only([])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(
+    decideInvoke('subagents', 'interruptByParent', { childSessionId: 'S-foreign', parentSessionId: 'S-parent', mode: 'continuable' }, family(['S-parent'], 'S-child')),
+    { allow: false, reason: 'not-shared' },
+    'a foreign child refuses',
+  )
   assert.deepEqual(
     decideInvoke('subagents', 'interruptByParent', { childSessionId: 'C', mode: 'continuable' }, yes),
     { allow: false, reason: 'no-session' },
@@ -345,6 +368,182 @@ test('decideInvoke: fileUploads/upload and fileReferences/list are gated on the 
       decideInvoke('fileUploads', 'upload', args, yes),
       { allow: false, reason: 'no-session' },
       JSON.stringify(args) + ' claims no agent',
+    )
+  }
+})
+
+// -- T41a: the agentId group grows (goals bar, commands, preset switches, @ candidates) --
+
+test('decideInvoke: the T41a agentId group authorizes strictly on the top-level agentId', () => {
+  const shared = ['S-a']
+  const cases = [
+    ['goals', 'get', { agentId: 'S-a' }],
+    ['goals', 'edit', { agentId: 'S-a', ref: { id: 'g1', revision: 2 }, request: { objective: 'x' } }],
+    ['goals', 'pause', { agentId: 'S-a', ref: { id: 'g1', revision: 2 } }],
+    ['goals', 'resume', { agentId: 'S-a', ref: { id: 'g1', revision: 2 } }],
+    ['goals', 'clear', { agentId: 'S-a', ref: { id: 'g1', revision: 3 } }],
+    ['commands', 'list', { agentId: 'S-a' }],
+    ['commands', 'execute', { agentId: 'S-a', line: '/model deepseek-chat', submittedAttachments: [] }],
+    ['agentPresets', 'select', { agentId: 'S-a', agentPreset: 'default' }],
+    ['sessionReferenceResolver', 'candidates', { agentId: 'S-a', query: '调试' }],
+  ]
+  for (const [namespace, method, args] of cases) {
+    // candidates carries a resultFilter marker: its answer is narrowed to
+    // accessible rows before it travels (relay-server.ts).
+    const allowed =
+      namespace === 'sessionReferenceResolver'
+        ? { allow: true, filter: 'session-reference-candidates' }
+        : { allow: true }
+    assert.deepEqual(decideInvoke(namespace, method, args, only(shared)), allowed, `${namespace}/${method} with a shared id`)
+    assert.deepEqual(
+      decideInvoke(namespace, method, args, only([])),
+      { allow: false, reason: 'not-shared' },
+      `${namespace}/${method} with an unshared id`,
+    )
+  }
+  // The task's decoy: `commands/execute` names an UNSHARED agentId while a
+  // shared id rides in a field the method does not own — refusal, not a pass.
+  const decoy = { agentId: 'VICTIM', line: '/permission acceptEdits', request: { sessionId: 'S-shared' } }
+  assert.deepEqual(decideInvoke('commands', 'execute', decoy, only(['S-shared'])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideInvoke('goals', 'get', { agentId: 'VICTIM', request: { sessionId: 'S-shared' } }, only(['S-shared'])), {
+    allow: false,
+    reason: 'not-shared',
+  })
+  // Missing, empty or non-string agentId claims no session.
+  for (const args of [{ agentId: '' }, { agentId: 42 }, {}, 'garbage', undefined]) {
+    assert.deepEqual(
+      decideInvoke('commands', 'list', args, yes),
+      { allow: false, reason: 'no-session' },
+      JSON.stringify(args) + ' claims no agent',
+    )
+  }
+})
+
+// -- T41a: sessionFeedback/record — a plain request.sessionId method --------------------
+
+test('decideInvoke: sessionFeedback/record is a plain request.sessionId method', () => {
+  const args = { request: { sessionId: 'S-a', category: 'task-result', text: '慢' } }
+  assert.deepEqual(decideInvoke('sessionFeedback', 'record', args, only(['S-a'])), { allow: true })
+  assert.deepEqual(decideInvoke('sessionFeedback', 'record', args, only([])), { allow: false, reason: 'not-shared' })
+  // The same decoy discipline: a shared id next to the real field buys nothing.
+  assert.deepEqual(
+    decideInvoke('sessionFeedback', 'record', { request: { sessionId: 'VICTIM' }, extra: { sessionId: 'S-shared' } }, only(['S-shared'])),
+    { allow: false, reason: 'not-shared' },
+  )
+  assert.deepEqual(decideInvoke('sessionFeedback', 'record', { request: {} }, yes), { allow: false, reason: 'no-session' })
+})
+
+// -- T41a: workspaceFiles — the top-level workspaceFileScopeId IS the session id ----------
+
+test('decideInvoke: workspaceFiles reads read share-check the top-level workspaceFileScopeId', () => {
+  const shared = ['S-a']
+  const cases = [
+    ['workspaceFiles', 'list', { workspaceFileScopeId: 'S-a', path: 'src' }],
+    ['workspaceFiles', 'read', { workspaceFileScopeId: 'S-a', path: 'src/index.ts', range: { offset: 0 } }],
+    ['workspaceFiles', 'readBytes', { workspaceFileScopeId: 'S-a', path: 'logo.png', options: {} }],
+    ['workspaceFiles', 'stat', { workspaceFileScopeId: 'S-a', path: '.' }],
+  ]
+  for (const [namespace, method, args] of cases) {
+    assert.deepEqual(decideInvoke(namespace, method, args, only(shared)), { allow: true }, `${namespace}/${method} with a shared scope`)
+    assert.deepEqual(
+      decideInvoke(namespace, method, args, only([])),
+      { allow: false, reason: 'not-shared' },
+      `${namespace}/${method} with an unshared scope`,
+    )
+  }
+  // The scope field is the ONLY thing checked: a shared id padded into
+  // request.sessionId must not unlock an unshared scope.
+  assert.deepEqual(
+    decideInvoke('workspaceFiles', 'read', { workspaceFileScopeId: 'VICTIM', path: 'x', request: { sessionId: 'S-shared' } }, only(['S-shared'])),
+    { allow: false, reason: 'not-shared' },
+  )
+  for (const args of [{ workspaceFileScopeId: '' }, { workspaceFileScopeId: 7 }, { path: 'x' }, {}]) {
+    assert.deepEqual(
+      decideInvoke('workspaceFiles', 'stat', args, yes),
+      { allow: false, reason: 'no-session' },
+      JSON.stringify(args) + ' claims no scope',
+    )
+  }
+})
+
+// -- T41a: terminal — server-side PTYs, the standing boundary, both field halves ----------
+
+test('decideInvoke: the terminal agentId half authorizes on the top-level agentId', () => {
+  const shared = ['S-a']
+  const cases = [
+    ['terminal', 'environment', { agentId: 'S-a' }],
+    ['terminal', 'shells', { agentId: 'S-a' }],
+    ['terminal', 'create', { agentId: 'S-a', request: { id: 'term-1', cols: 80, rows: 24 } }],
+    ['terminal', 'write', { agentId: 'S-a', id: 'term-1', attachmentId: 'att-1', data: 'ls\n' }],
+    ['terminal', 'resize', { agentId: 'S-a', id: 'term-1', attachmentId: 'att-1', cols: 100, rows: 30 }],
+    ['terminal', 'rename', { agentId: 'S-a', id: 'term-1', title: '构建' }],
+    ['terminal', 'close', { agentId: 'S-a', id: 'term-1' }],
+  ]
+  for (const [namespace, method, args] of cases) {
+    assert.deepEqual(decideInvoke(namespace, method, args, only(shared)), { allow: true }, `${namespace}/${method} with a shared id`)
+    assert.deepEqual(
+      decideInvoke(namespace, method, args, only([])),
+      { allow: false, reason: 'not-shared' },
+      `${namespace}/${method} with an unshared id`,
+    )
+  }
+  // The client-generated terminal/attachment ids are dead weight: a shared id
+  // shaped as either of them must not unlock an unshared agentId.
+  const decoy = { agentId: 'VICTIM', id: 'S-shared', attachmentId: 'S-shared' }
+  assert.deepEqual(decideInvoke('terminal', 'write', decoy, only(['S-shared'])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideInvoke('terminal', 'create', { agentId: '' }, yes), { allow: false, reason: 'no-session' })
+})
+
+test('decideInvoke: terminal/list reads the TOP-LEVEL sessionId (retain is stream-only)', () => {
+  const list = { sessionId: 'S-a' }
+  assert.deepEqual(decideInvoke('terminal', 'list', list, only(['S-a'])), { allow: true }, 'terminal/list with a shared id')
+  assert.deepEqual(decideInvoke('terminal', 'list', list, only([])), { allow: false, reason: 'not-shared' }, 'terminal/list with an unshared id')
+  // A shared terminal id cannot stand in for the session: only the registered
+  // top-level sessionId is read.
+  assert.deepEqual(decideInvoke('terminal', 'list', { sessionId: 'VICTIM', id: 'S-shared' }, only(['S-shared'])), {
+    allow: false,
+    reason: 'not-shared',
+  })
+  assert.deepEqual(decideInvoke('terminal', 'list', {}, yes), { allow: false, reason: 'no-session' })
+})
+
+// -- T41a: the three new streams ride the stream route with their claimed ids --------------
+
+test('decideStream: the T41a scoped streams claim their ids and refuse the invoke route', () => {
+  const shared = ['S-a']
+  // Allowed on the stream route; the claimed ids ride back so the relay kills
+  // the subscription (with the unshared end frame) when one stops being shared.
+  assert.deepEqual(
+    decideStream('workspaceFiles', 'changes', { workspaceFileScopeId: 'S-a', path: '.' }, only(shared)),
+    { allow: true, sessionIds: ['S-a'] },
+  )
+  assert.deepEqual(
+    decideStream('terminal', 'follow', { agentId: 'S-a', id: 'term-1', attachmentId: 'att-1' }, only(shared)),
+    { allow: true, sessionIds: ['S-a'] },
+  )
+  assert.deepEqual(decideStream('terminal', 'retain', { sessionId: 'S-a', id: 'term-1' }, only(shared)), {
+    allow: true,
+    sessionIds: ['S-a'],
+  })
+  assert.deepEqual(
+    decideStream('workspaceFiles', 'changes', { workspaceFileScopeId: 'VICTIM', path: '.' }, only(shared)),
+    { allow: false, reason: 'not-shared' },
+  )
+  assert.deepEqual(decideStream('terminal', 'follow', { agentId: 'VICTIM', id: 't', attachmentId: 'a' }, only(shared)), {
+    allow: false,
+    reason: 'not-shared',
+  })
+  assert.deepEqual(decideStream('terminal', 'retain', { sessionId: '' }, yes), { allow: false, reason: 'no-session' })
+  // ...and the invoke route refuses every one of them, like every stream method.
+  for (const [namespace, method, args] of [
+    ['workspaceFiles', 'changes', { workspaceFileScopeId: 'S-a', path: '.' }],
+    ['terminal', 'follow', { agentId: 'S-a', id: 't', attachmentId: 'a' }],
+    ['terminal', 'retain', { sessionId: 'S-a', id: 't' }],
+  ]) {
+    assert.deepEqual(
+      decideInvoke(namespace, method, args, yes),
+      { allow: false, reason: 'forbidden-method' },
+      `${namespace}/${method} is stream-only`,
     )
   }
 })
