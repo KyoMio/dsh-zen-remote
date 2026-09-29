@@ -476,6 +476,14 @@ test('T34: the parts render only for virtual-id sessions (textual pins — .tsx 
   assert.ok(!css.includes('width: 100%'), 'no width+margins overflow')
 })
 
+test('CP5: RemoteHeaderIcon subscribes through subscribeIfNotPhoneShell (textual pin — .tsx cannot load under Node)', () => {
+  const source = readFileSync(join(ROOT, 'src', 'client', 'RemoteHeaderIcon.tsx'), 'utf8')
+  assert.ok(
+    source.includes('subscribeIfNotPhoneShell(shares, phoneShell'),
+    'the header icon must gate its store subscription on the phone shell — a direct shares.subscribe would keep the 30s admin/shares poll running inside the phone viewport where the icon is stylesheet-hidden',
+  )
+})
+
 test('T34: describeRemoteStatus — the three icon states, revoked/unpaired read offline, a mismatch only while online', async () => {
   const { describeRemoteStatus } = await import('../src/client-data/remote-status.ts')
   const t = (key) => `#${key}`
