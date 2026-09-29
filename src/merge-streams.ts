@@ -86,7 +86,12 @@
  * into the local one (the catalog is the model-selection dropdown's data), and
  * {@link virtualizeModelSelectionValue} rewrites a `modelSelection` projection
  * value's provider ids to virtual group ids so the UI can find the current
- * model's display name in the merged catalog.
+ * model's display name in the merged catalog — CONDITIONALLY since T52-fix2:
+ * a provider the server's own catalog does not list (its groups have no such
+ * id — the observed `codex` case against a DeepSeek-only server) must stay
+ * ORIGINAL, because the merged catalog carries no virtual group for it and the
+ * UI's fallback would otherwise show the raw `zr~<serverId>~codex` string.
+ * {@link catalogGroupIds} is the membership set one catalog value names.
  */
 
 import { toVirtual } from './virtual-id.js'
@@ -553,6 +558,13 @@ export interface ControlMergerOptions {
   serverId: string
   serverName?: string
   onDiagnostic?: (message: string) => void
+  /** The ORIGINAL group ids of the current server's last fetched model
+   * catalog (T52-fix2), read LIVE per frame — the cache fills as soon as the
+   * relay serves, which can be long after this stream opened. `undefined`
+   * (no catalog yet) and an id the set lacks both leave a modelSelection
+   * provider ORIGINAL: the merged catalog has no virtual group for it, so
+   * virtualizing would only teach the UI the raw `zr~…` fallback string. */
+  serverProviders?: (serverId: string) => ReadonlySet<string> | undefined
 }
 
 export interface ControlMerger {
@@ -592,6 +604,7 @@ export interface ControlMerger {
  */
 export function createControlMerger(options: ControlMergerOptions): ControlMerger {
   const onDiagnostic = options.onDiagnostic
+  const serverProviders = options.serverProviders
   let identity: MergerIdentity = { serverId: options.serverId, serverName: options.serverName ?? '' }
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
   // Remote output converted but not yet shown: the UI's snapshot stream
@@ -600,6 +613,12 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
   // before the local baseline has passed.
   let localSeen = false
   let buffered: unknown[] = []
+
+  // The T52 provider rewrite, gated on the live catalog cache (T52-fix2) —
+  // read PER FRAME: the cache fills when the relay's online fetch lands, which
+  // can be long after this stream opened.
+  const virtualizeSelection = (value: unknown): unknown =>
+    virtualizeModelSelectionValue(value, identity.serverId, serverProviders?.(identity.serverId))
 
   /** Convert one remote control frame into the projection frames the UI
    * understands (empty for anything malformed). */
@@ -627,12 +646,13 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
           // The baseline gives one sequence number per projection record
           // (`asOfSeq`) — every key of that record rides it. A modelSelection
           // value additionally gets its provider ids virtualized (T52) so the
-          // UI matches it against the merged catalog's virtual groups.
+          // UI matches it against the merged catalog's virtual groups — but
+          // only a provider the server's own catalog lists (T52-fix2).
           out.push({
             type: 'projection',
             sessionId: virtualize(sessionId),
             key,
-            value: key === 'modelSelection' ? virtualizeModelSelectionValue(values[key], identity.serverId) : values[key],
+            value: key === 'modelSelection' ? virtualizeSelection(values[key]) : values[key],
             seq: asOfSeq,
           })
         }
@@ -655,10 +675,9 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
           ...frame,
           sessionId: virtualize(frame.sessionId),
           // The modelSelection update's providers go virtual with the session
-          // id (T52) — same rewrite as the exploded baseline above.
-          ...(frame.key === 'modelSelection'
-            ? { value: virtualizeModelSelectionValue(frame.value, identity.serverId) }
-            : {}),
+          // id (T52) — same rewrite as the exploded baseline above, catalog-
+          // gated the same way (T52-fix2).
+          ...(frame.key === 'modelSelection' ? { value: virtualizeSelection(frame.value) } : {}),
         },
       ]
     }
@@ -750,10 +769,18 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
  * REWRITTEN frame rides that projection's OWN seq, so an original-provider
  * value left in a row would poison the store forever: the remote session's
  * dropdown would show the raw `provider/model` fallback with no check mark.
- * A missing or malformed remote result means "remote said nothing" — the
+ * The rewrite is catalog-gated like every route's (T52-fix2): only a provider
+ * the server's own catalog lists becomes the virtual group id, and a missing
+ * `serverGroups` (cache not ready) rewrites nothing. A missing or malformed
+ * remote result means "remote said nothing" — the
  * local result passes back untouched.
  */
-export function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string): unknown {
+export function mergeSessionList(
+  localResult: unknown,
+  remoteResult: unknown,
+  serverId: string,
+  serverGroups?: ReadonlySet<string>,
+): unknown {
   if (!isPlainObject(localResult)) return localResult
   if (!isPlainObject(remoteResult) || !Array.isArray(remoteResult.items)) return localResult
   const localItems = Array.isArray(localResult.items) ? localResult.items : []
@@ -768,7 +795,7 @@ export function mergeSessionList(localResult: unknown, remoteResult: unknown, se
       Object.hasOwn(item.projections.values, 'modelSelection')
     ) {
       const values: Record<string, unknown> = { ...item.projections.values }
-      values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId)
+      values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId, serverGroups)
       out.projections = { ...item.projections, values }
     }
     return out
@@ -841,6 +868,26 @@ export function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, id
 }
 
 /**
+ * The ORIGINAL group ids one `session/modelCatalog` value names (T52-fix2) —
+ * the membership set the provider rewrites judge against. Group ids are the
+ * provider identity on both wire sides (a `session/selectModel` request
+ * carries a group id as its `provider`, and the projections echo it back), so
+ * "the catalog has this provider" means exactly "some group's id equals it".
+ * Groups without a usable id are skipped, as {@link mergeModelCatalogs} does;
+ * a malformed value yields an empty set — not `undefined`: an EMPTY set is a
+ * fetched-but-groupless catalog (rewrites nothing, truthfully), while the
+ * caller passes `undefined` only when no catalog was ever fetched.
+ */
+export function catalogGroupIds(value: unknown): ReadonlySet<string> {
+  const ids = new Set<string>()
+  if (!isPlainObject(value) || !Array.isArray(value.groups)) return ids
+  for (const group of value.groups) {
+    if (isPlainObject(group) && typeof group.id === 'string' && group.id !== '') ids.add(group.id)
+  }
+  return ids
+}
+
+/**
  * Virtualize the provider ids inside one `modelSelection` projection value —
  * `{lastUsed: {provider, model, reasoningEffort?} | null, next: …}` (RT
  * dsh-api-session-controller lib/types/model-selection-projection.js:12-15,
@@ -851,15 +898,29 @@ export function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, id
  * virtual group id to be found in the merged catalog — and while the relay
  * serves, the merged catalog always carries it, so the composer trigger
  * shows the model NAME instead of the raw `provider/model` fallback string
- * (lib/client.js:700). Nulls and malformed entries pass through untouched;
+ * (lib/client.js:700).
+ *
+ * CONDITIONAL since T52-fix2: a provider the server's own catalog does not
+ * list — `serverGroups` given and the id absent — stays ORIGINAL. The merged
+ * catalog has no virtual group for it, so a rewritten value would send the UI
+ * to its raw-string fallback WITH the `zr~…` prefix visible (`zr~<serverId>~
+ * codex/gpt-5.6-sol`, the isolated-repro finding); the original id at least
+ * renders as the plain `provider/model` string, the pre-T52 display. The same
+ * for `serverGroups === undefined`: no catalog was fetched yet (the relay's
+ * online fetch has not landed, or it failed), so there is nothing to judge
+ * against. Nulls and malformed entries pass through untouched in every case;
  * `model` and `reasoningEffort` are group-agnostic ids and stay as they are.
  */
-export function virtualizeModelSelectionValue(value: unknown, serverId: string): unknown {
+export function virtualizeModelSelectionValue(value: unknown, serverId: string, serverGroups?: ReadonlySet<string>): unknown {
   if (!isPlainObject(value)) return value
   const out: Record<string, unknown> = { ...value }
   for (const key of ['lastUsed', 'next'] as const) {
     const selection = value[key]
-    if (isPlainObject(selection) && typeof selection.provider === 'string') {
+    if (
+      isPlainObject(selection) &&
+      typeof selection.provider === 'string' &&
+      serverGroups?.has(selection.provider) === true
+    ) {
       out[key] = { ...selection, provider: toVirtual(serverId, selection.provider) }
     }
   }
