@@ -150,14 +150,20 @@ export type StreamFilter = 'workspace' | 'control'
  * (relay-filter.ts), `session-reference-candidates` drops the @-mention
  * candidate rows whose session is not accessible (relay-server.ts — the host
  * lists EVERY server session with title, cwd and a ready-made mention, so
- * unshared rows must never leave the box). */
-export type InvokeFilter = 'session-list' | 'session-reference-candidates'
+ * unshared rows must never leave the box), and `model-catalog` empties the
+ * `session/modelCatalog` `failures` array (T52-fix — relay-filter.ts: the
+ * host's per-group error texts may carry endpoint or credential details, and
+ * the client discards `failures` anyway). */
+export type InvokeFilter = 'session-list' | 'session-reference-candidates' | 'model-catalog'
 
 interface RelayMethod {
   /** Every field that carries session ownership for this method. ALL of
    * them must exist, be strings, and pass the share-table check. Global
-   * entries (`workspace/follow`, `session/control`, `session/list`) own no
-   * field — reachability is enforced by filtering their output instead. */
+   * entries (`workspace/follow`, `session/control`, `session/list`,
+   * `session/modelCatalog`) own no field — reachability is enforced by
+   * filtering their output instead (for modelCatalog that filter only
+   * scrubs the `failures` array; the groups themselves carry no session
+   * data). */
   fields: SessionField[]
   /** Stream-delivered methods (`mode: 'stream'` in the wire inventory):
    * callable ONLY through the streaming route — an invoke carrying one is
@@ -277,6 +283,16 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   // session/* — the global control stream and the unscoped list
   'session/control': { fields: [], stream: true, streamFilter: 'control' },
   'session/list': { fields: [], resultFilter: 'session-list' },
+  // T52: the global model catalog — NO parameters at all (RT
+  // dsh-api-session-controller lib/typert.remote-client.js:1014-1027,
+  // `parameters: []`), and its result is the server's provider directory
+  // `{default, routableProviders, groups, failures}` — group/model ids and
+  // display names only, nothing session-scoped (the schema is at
+  // lib/typert.remote-client.js:489-518). Field-less like session/list; the
+  // result filter (T52-fix) only EMPTIES `failures` — the host's per-group
+  // error texts may carry endpoint or credential details the client never
+  // shows (it keeps its own local failures instead).
+  'session/modelCatalog': { fields: [], resultFilter: 'model-catalog' },
   // job/*
   'job/list': { fields: ['request.sessionId'], stream: true },
   'job/follow': { fields: ['request.sessionId'], stream: true },

@@ -488,7 +488,12 @@ const remoteSessionCss = readFileSync(
   join(ROOT, 'src', 'client', 'styles', 'remote-session.css.ts'),
   'utf8',
 )
-const t53Sliced = remoteSessionCss.slice(remoteSessionCss.indexOf('/* ---------- remote session: hide dsh-better-sidebar'))
+// The T53 section ends where the T52 model-menu section begins (the T52
+// rules — including the deliberately ungated vision-router option rule — are
+// pinned by test/remote-session-css.test.cjs, not by this gate check).
+const t53Start = remoteSessionCss.indexOf('/* ---------- remote session: hide dsh-better-sidebar')
+const t52Start = remoteSessionCss.indexOf("/* ---------- T52: model-menu groups follow the session's side")
+const t53Sliced = remoteSessionCss.slice(t53Start, t52Start > t53Start ? t52Start : undefined)
 assert.ok(t53Sliced.length > 0, 'the T53 better-sidebar section must exist in remote-session.css.ts')
 
 test('T53: every rule is gated on the remote-session attribute — a local session matches nothing', () => {

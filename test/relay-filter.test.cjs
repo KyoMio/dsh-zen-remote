@@ -13,6 +13,7 @@ const assert = require('node:assert/strict')
 const {
   filterWorkspaceFrame,
   filterControlFrame,
+  filterModelCatalogResult,
   filterSessionListResult,
   filterJobListFrame,
   createWorkspaceFollowState,
@@ -288,4 +289,31 @@ test('WorkspaceFollowState: unknown frames are ignored, garbage ids never synthe
   const state = createWorkspaceFollowState()
   for (const frame of [null, 1, { type: 'nope' }, { type: 'upsert' }, { type: 'baseline' }]) state.apply(frame)
   assert.deepEqual(state.onShareChange('anything', yes), [])
+})
+
+test('T52-fix filterModelCatalogResult: failures emptied, everything else rides along', () => {
+  // The host's per-group failure text is its own load error (adapter names,
+  // endpoint URLs, credential states); the sub-client keeps only its LOCAL
+  // failures, so the server's copies must not even travel.
+  const catalog = {
+    default: { provider: 'codex', model: 'sol' },
+    routableProviders: ['codex'],
+    groups: [{ id: 'codex', name: 'Codex', models: [{ id: 'sol', name: 'Sol' }] }],
+    failures: [
+      { id: 'broken', name: 'Broken', message: 'POST https://secret.example/v1 failed: 401 bad key sk-…' },
+    ],
+  }
+  const out = filterModelCatalogResult(catalog)
+  assert.deepEqual(out.groups, catalog.groups, 'the groups travel whole')
+  assert.deepEqual(out.default, catalog.default)
+  assert.deepEqual(out.routableProviders, catalog.routableProviders)
+  assert.deepEqual(out.failures, [], 'the failure texts never leave the box')
+  // input untouched
+  assert.equal(catalog.failures.length, 1)
+  // a result without a recognizable shape passes untouched (the far-side
+  // merge re-guards it); an already-clean failures array stays an array
+  assert.equal(filterModelCatalogResult('junk'), 'junk')
+  assert.equal(filterModelCatalogResult(undefined), undefined)
+  assert.deepEqual(filterModelCatalogResult({ groups: [] }), { groups: [] })
+  assert.deepEqual(filterModelCatalogResult({ failures: [] }), { failures: [] })
 })

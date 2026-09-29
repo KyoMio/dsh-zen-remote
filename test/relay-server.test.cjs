@@ -323,6 +323,37 @@ test('invoke: unregistered methods are 403 forbidden-method, registered ones wit
   } finally { await server.stop() }
 })
 
+test('invoke: session/modelCatalog leaves with its failures emptied (T52-fix)', async () => {
+  // The host's per-group failure text is its own load error (endpoint URLs,
+  // credential states); the sub-client discards `failures` anyway, so the
+  // route scrubs them (relay-filter.ts filterModelCatalogResult) while the
+  // groups travel whole.
+  const catalog = {
+    default: { provider: 'codex', model: 'sol' },
+    routableProviders: ['codex'],
+    groups: [{ id: 'codex', name: 'Codex', models: [{ id: 'sol', name: 'Sol' }] }],
+    failures: [{ id: 'broken', name: 'Broken', message: 'POST https://secret.example/v1 failed: 401 bad key' }],
+  }
+  const parts = makeParts('invoke-model-catalog', { value: catalog })
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'modelCatalog', args: {} }, AUTH))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.deepEqual(body.value.groups, catalog.groups, 'the groups travel whole')
+    assert.deepEqual(body.value.default, catalog.default)
+    assert.deepEqual(body.value.failures, [], 'the failure texts never leave the box')
+    assert.equal(parts.calls.length, 1)
+    const call = parts.calls[0]
+    assert.deepEqual({ namespace: call.namespace, method: call.method, args: call.args }, {
+      namespace: 'session',
+      method: 'modelCatalog',
+      args: {},
+    })
+  } finally { await server.stop() }
+})
+
 // ---- invoke: gateway failures ------------------------------------------------------
 
 test('invoke: a DSH error (string code) is passed through with a clipped message', async () => {
