@@ -113,8 +113,12 @@ export interface RelayClock {
   random(): number
 }
 
-/** The default clock: real time, `unref()`ed timers, `Math.random`. */
-const defaultClock: RelayClock = {
+/**
+ * The default clock: real time, `unref()`ed timers, `Math.random`. Exported
+ * so the interceptor's own waits (the merged-stream reopen delays) run on
+ * the SAME clock face — one injectable seam for tests instead of two.
+ */
+export const defaultClock: RelayClock = {
   now: () => Date.now(),
   setTimeout: (fn, ms) => {
     const handle = setTimeout(fn, ms)
@@ -568,6 +572,22 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     return new RelayError(`http-${status}`, `unexpected relay response with status ${status}`, status)
   }
 
+  /**
+   * The server-restart stream line (the server App exits cleanly or reloads
+   * its plugin row: relay-server.ts's closeAll ends every NDJSON stream with
+   * `error{code:'server-restart'}`) is a LINK fact, not an answer about one
+   * call — the whole server is going down. Mark the client offline exactly
+   * like a transport death would: the reconnect ladder arms, the merged
+   * streams' offline annotations apply, and the eventual reconnect runs a
+   * fresh handshake that picks up the (possibly changed) server name. The
+   * thrown RelayError keeps the specific code for the diagnostics ring.
+   */
+  function noteServerRestart(error: RelayError): void {
+    if (error.code !== 'server-restart') return
+    noteFailure('offline')
+    setState('offline')
+  }
+
   /** `aborted` — a caller's signal, not a transport fault. */
   function abortedError(): RelayError {
     return new RelayError('aborted', 'the caller aborted the request')
@@ -951,6 +971,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           } else if (verdict.kind === 'end') {
             return
           } else if (verdict.kind === 'error') {
+            noteServerRestart(verdict.error)
             throw verdict.error
           }
         }
@@ -965,6 +986,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         } else if (verdict.kind === 'end') {
           return
         } else if (verdict.kind === 'error') {
+          noteServerRestart(verdict.error)
           throw verdict.error
         }
       }

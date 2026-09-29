@@ -48,6 +48,14 @@
  *   revoked, interface mismatch) only ANNOTATES TITLES: setStatus +
  *   onStatusChanged re-upsert the shown groups under the annotated titles,
  *   and the reconnecting baseline (which always upserts) restores them.
+ * - a session the SERVER stopped serving (remote closed → the filtered
+ *   workspace upsert drops it from `sessionIds`, CP4) would otherwise stay
+ *   visible in the sidebar's 「未分组」 forever: the UI's session store keeps
+ *   the merged projection/list entry and nothing ever removes it. Every
+ *   session id any remote workspace ever carried is remembered, the ones
+ *   belonging to NO current workspace ride the merged `archived` frames —
+ *   the UI's archived filter hides them — and a re-share (back in some
+ *   workspace's `sessionIds`) drops them from the set again.
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
@@ -210,6 +218,19 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   let remote = new Map<string, Record<string, unknown>>()
   let remoteArchived: string[] = []
   let remotePinned: string[] = []
+  // Every session id ANY remote workspace has ever carried for this identity
+  // (original ids, cumulative — CP4): the superset of virtual ids the UI's
+  // session store may hold entries for (the merged session/control
+  // projections and the merged session/list rows both key on them). A
+  // session the server stopped serving (remote closed → the filtered
+  // workspace upsert drops it from `sessionIds`) keeps its UI entry — the
+  // sidebar would park it in 「未分组」 forever. The orphan set below is what
+  // hides it.
+  let shownSessions = new Set<string>()
+  // The orphan set (virtualized) as of the last archived frame emitted, for
+  // change detection — an archived frame is worth sending only when this
+  // moved.
+  let lastOrphans: string[] = []
   // The status annotation every virtualized title currently carries (T34).
   let annotation: MergerAnnotation = 'none'
 
@@ -218,18 +239,75 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   const remoteArchivedVirtual = (): string[] => remoteArchived.map(virtualize)
   const remotePinnedVirtual = (): string[] => remotePinned.map(virtualize)
 
+  /** Learn the session ids one remote workspace record carries (originals,
+   * cumulative). */
+  function learnSessions(record: Record<string, unknown>): void {
+    if (!Array.isArray(record.sessionIds)) return
+    for (const id of record.sessionIds) if (typeof id === 'string') shownSessions.add(id)
+  }
+
+  /** Sessions shown before but belonging to NO current remote workspace,
+   * virtualized — the ids the merged `archived` frame carries so the UI's
+   * archived filter keeps them out of 「未分组」 (RT dsh-client-ui-workspace
+   * `sessionVisible`: an archived session is invisible under the default
+   * filter, in the ungrouped strays just as in a group). Re-sharing returns
+   * the session to a workspace's `sessionIds`, the orphan leaves the set,
+   * and the next archived frame lets it back into the group. */
+  function orphanSessionIds(): string[] {
+    const current = new Set<string>()
+    for (const record of remote.values()) {
+      if (!Array.isArray(record.sessionIds)) continue
+      for (const id of record.sessionIds) if (typeof id === 'string') current.add(id)
+    }
+    const out: string[] = []
+    for (const id of shownSessions) if (!current.has(id)) out.push(virtualize(id))
+    return out
+  }
+
   const virtualWorkspaces = (): Record<string, unknown>[] =>
     [...remote.values()].map((record) => virtualizeWorkspace(record, identity, annotation))
   const upsertFrames = (): unknown[] => virtualWorkspaces().map((workspace) => ({ type: 'upsert', workspace }))
   const mergedOrderFrame = (): unknown => ({ type: 'order', workspaceIds: [...localOrder, ...remoteIds()] })
-  const mergedArchivedFrame = (): unknown => ({
-    type: 'archived',
-    archivedSessionIds: [...localArchived, ...remoteArchivedVirtual()],
-  })
+  /** The merged archived set: local, remote-archived, then the orphans —
+   * deduplicated in that priority order (a session can be server-archived
+   * AND orphaned at once: DSH keeps archived sessions in their workspace
+   * slots, so an unshared archived session lands in both lists). */
+  function mergedArchivedIds(): string[] {
+    const seen = new Set<string>()
+    const out: string[] = []
+    const add = (ids: string[]): void => {
+      for (const id of ids) {
+        if (seen.has(id)) continue
+        seen.add(id)
+        out.push(id)
+      }
+    }
+    add(localArchived)
+    add(remoteArchivedVirtual())
+    add(orphanSessionIds())
+    return out
+  }
+  const mergedArchivedFrame = (): unknown => {
+    const ids = mergedArchivedIds()
+    lastOrphans = orphanSessionIds()
+    return { type: 'archived', archivedSessionIds: ids }
+  }
   const mergedPinnedFrame = (): unknown => ({
     type: 'pinned',
     pinnedSessionIds: [...localPinned, ...remotePinnedVirtual()],
   })
+  /** Append an archived frame ONLY when the orphan set moved with this
+   * workspace-side change (an upsert that shrank `sessionIds`, a remove).
+   * The archived frame replaces the UI's whole set, so it must not be
+   * emitted casually — but it must be emitted every time a session dropped
+   * out of every group, or the stray would keep hanging around in
+   * 「未分组」. */
+  function archivedIfOrphansMoved(into: unknown[]): void {
+    const orphans = orphanSessionIds()
+    if (orphans.length === lastOrphans.length && orphans.every((id, index) => id === lastOrphans[index])) return
+    lastOrphans = orphans
+    into.push({ type: 'archived', archivedSessionIds: mergedArchivedIds() })
+  }
 
   /** Learn from a local frame without emitting anything. */
   function observeLocal(frame: Record<string, unknown>): void {
@@ -276,7 +354,9 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       // The local order carries the remote groups at its tail ONLY once
       // remote state exists — before that every local frame is verbatim.
       if (frame.type === 'baseline') {
-        if (remote.size === 0 && remoteArchived.length === 0 && remotePinned.length === 0) return [frame]
+        if (remote.size === 0 && remoteArchived.length === 0 && remotePinned.length === 0 && shownSessions.size === 0) {
+          return [frame]
+        }
         const value = isPlainObject(frame.value) ? frame.value : {}
         const items = Array.isArray(value.items) ? value.items : []
         // The baseline's own order already shows the remote groups; the
@@ -288,7 +368,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
             value: {
               ...value,
               items: [...items, ...virtualWorkspaces()],
-              archivedSessionIds: [...localArchived, ...remoteArchivedVirtual()],
+              archivedSessionIds: mergedArchivedIds(),
               pinnedSessionIds: [...localPinned, ...remotePinnedVirtual()],
             },
           },
@@ -331,6 +411,9 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           }
           const nextArchived = value === undefined ? [] : stringList(value.archivedSessionIds)
           const nextPinned = value === undefined ? [] : stringList(value.pinnedSessionIds)
+          // The session inventory is cumulative — a baseline only ever adds
+          // known session ids.
+          for (const record of next.values()) learnSessions(record)
           // Never a second baseline: the UI has either seen local data (which
           // it must keep) or nothing (cache only).
           if (!localSeen) {
@@ -359,10 +442,14 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           const id = workspace.workspaceId as string
           const isNew = !remote.has(id)
           remote.set(id, { ...workspace })
+          learnSessions(workspace)
           if (!localSeen) return []
           const out: unknown[] = [{ type: 'upsert', workspace: virtualizeWorkspace(workspace, identity, annotation) }]
           // A workspace the UI has not seen needs a position too.
           if (isNew) out.push(mergedOrderFrame())
+          // A shrunken sessionIds list orphans the dropped sessions — the
+          // archived frame that hides them from 「未分组」 rides here (CP4).
+          archivedIfOrphansMoved(out)
           return out
         }
         case 'remove': {
@@ -373,9 +460,15 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           }
           // A remove of a workspace this merger never knew is a no-op: the UI
           // was never shown it.
-          if (!remote.delete(id)) return []
+          const removed = remote.get(id)
+          if (removed === undefined) return []
+          remote.delete(id)
           if (!localSeen) return []
-          return [{ type: 'remove', workspaceId: virtualize(id) }, mergedOrderFrame()]
+          const out: unknown[] = [{ type: 'remove', workspaceId: virtualize(id) }, mergedOrderFrame()]
+          // The removed workspace's sessions may now belong to no group —
+          // archive-hide them the same way (CP4).
+          archivedIfOrphansMoved(out)
+          return out
         }
         case 'order': {
           if (!Array.isArray(frame.workspaceIds)) {
@@ -438,7 +531,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
     },
 
     onRemoteGone(): unknown[] {
-      const hadAny = remote.size > 0 || remoteArchived.length > 0 || remotePinned.length > 0
+      const hadAny = remote.size > 0 || shownSessions.size > 0 || remoteArchived.length > 0 || remotePinned.length > 0
       const out: unknown[] = []
       // The UI only ever SAW remote data when the local baseline had passed —
       // cached pre-baseline state is discarded silently instead.
@@ -451,6 +544,10 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       remote.clear()
       remoteArchived = []
       remotePinned = []
+      // The session inventory dies with the identity (a new server mints new
+      // ids); the archived frame above already dropped any orphan entries.
+      shownSessions = new Set()
+      lastOrphans = []
       return out
     },
   }
@@ -627,9 +724,11 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
 /**
  * Merge one `session/list` result pair (first page only — the caller skips
  * paged requests). Local items keep their order and their pagination fields;
- * the remote items are appended with virtualized session ids. A missing or
- * malformed remote result means "remote said nothing" — the local result
- * passes back untouched.
+ * the remote items are appended with virtualized session ids — `sessionId`
+ * AND `parentSessionId` (CP4): the fork link must point at the VIRTUAL parent
+ * id the UI knows, or the fork would sort beside a parent id that exists in
+ * no list the UI holds. A missing or malformed remote result means "remote
+ * said nothing" — the local result passes back untouched.
  */
 export function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string): unknown {
   if (!isPlainObject(localResult)) return localResult
@@ -638,7 +737,9 @@ export function mergeSessionList(localResult: unknown, remoteResult: unknown, se
   const virtualize = (id: string): string => toVirtual(serverId, id)
   const remoteItems = remoteResult.items.map((item) => {
     if (!isPlainObject(item) || typeof item.sessionId !== 'string') return item
-    return { ...item, sessionId: virtualize(item.sessionId) }
+    const out: Record<string, unknown> = { ...item, sessionId: virtualize(item.sessionId) }
+    if (typeof item.parentSessionId === 'string') out.parentSessionId = virtualize(item.parentSessionId)
+    return out
   })
   return { ...localResult, items: [...localItems, ...remoteItems] }
 }

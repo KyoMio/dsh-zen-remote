@@ -48,6 +48,14 @@
  *   revoked, interface mismatch) only ANNOTATES TITLES: setStatus +
  *   onStatusChanged re-upsert the shown groups under the annotated titles,
  *   and the reconnecting baseline (which always upserts) restores them.
+ * - a session the SERVER stopped serving (remote closed → the filtered
+ *   workspace upsert drops it from `sessionIds`, CP4) would otherwise stay
+ *   visible in the sidebar's 「未分组」 forever: the UI's session store keeps
+ *   the merged projection/list entry and nothing ever removes it. Every
+ *   session id any remote workspace ever carried is remembered, the ones
+ *   belonging to NO current workspace ride the merged `archived` frames —
+ *   the UI's archived filter hides them — and a re-share (back in some
+ *   workspace's `sessionIds`) drops them from the set again.
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
@@ -178,9 +186,11 @@ export declare function createControlMerger(options: ControlMergerOptions): Cont
 /**
  * Merge one `session/list` result pair (first page only — the caller skips
  * paged requests). Local items keep their order and their pagination fields;
- * the remote items are appended with virtualized session ids. A missing or
- * malformed remote result means "remote said nothing" — the local result
- * passes back untouched.
+ * the remote items are appended with virtualized session ids — `sessionId`
+ * AND `parentSessionId` (CP4): the fork link must point at the VIRTUAL parent
+ * id the UI knows, or the fork would sort beside a parent id that exists in
+ * no list the UI holds. A missing or malformed remote result means "remote
+ * said nothing" — the local result passes back untouched.
  */
 export declare function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string): unknown;
 //# sourceMappingURL=merge-streams.d.ts.map
