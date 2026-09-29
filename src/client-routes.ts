@@ -29,6 +29,7 @@ import type { AdminAdmission } from './admin-routes.js'
 import { classifyClaimResponse, classifyProbe, CLAIM_PATH, normalizeServerUrl, RELAY_PING_PATH } from './client-pairing.js'
 import type { ClaimOutcome, ProbeState } from './client-pairing.js'
 import { unwrapVolatile } from './config.js'
+import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { InterceptDiagnostics } from './intercept.js'
 import { responseJson, sameOriginPost } from './http.js'
 import { RELAY_HTTP_ROUTES } from './relay-access.js'
@@ -100,6 +101,11 @@ export interface ClientHandlerOptions {
    * Shapes, counters and failure codes only — never a token. Undefined when
    * this composition never even attempted an install (no typertGateway). */
   getIntercept?: () => InterceptDiagnostics | undefined
+  /** The exact-fetch-route interception's diagnostics (T51), read live per
+   * request: the local upload route's remote-forwarding install state and
+   * its refusal counters. Undefined when this composition never attempted
+   * one (no connection service, or no fileUploads service to inject). */
+  getFetchRouteIntercept?: () => FetchRouteInterceptDiagnostics | undefined
   /** Serve ONLY the remote-status route (T41a-fix2, the host role's mount):
    * every other route under the prefix answers the same 404 an unknown path
    * would. The claim / status / reconnect / unshare routes exist for a
@@ -411,6 +417,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // nothing to show, and the settings block presence-gates on exactly
         // that.
         const intercept = options.getIntercept?.()
+        const fetchRouteIntercept = options.getFetchRouteIntercept?.()
         const compatRelay = options.getRelayClient?.()
         const compat =
           compatRelay?.compat !== undefined || (intercept?.incompatibleCalls.length ?? 0) > 0
@@ -422,7 +429,8 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
               }
             : undefined
         const withDiagnostics = (body: Record<string, unknown>): Record<string, unknown> => {
-          const next = intercept === undefined ? body : { ...body, intercept }
+          let next = intercept === undefined ? body : { ...body, intercept }
+          if (fetchRouteIntercept !== undefined) next = { ...next, fetchRouteIntercept }
           return compat === undefined ? next : { ...next, compat }
         }
         // The ROW decides its own two shapes first, per request (both fields

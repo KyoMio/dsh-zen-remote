@@ -215,14 +215,15 @@ export declare function parseEventResultBody(body: unknown): EventResultBody | u
  * Deliberately ABSENT (the known limitations of the HTTP interception, kept
  * beside the registry that makes the contrast true):
  *
- * - `/api/session/uploadFileBinary` (attachment upload, RT
- *   dsh-client-ui-file-upload) — its Blob/stream branch runs inside a Web
- *   Worker over XHR / Worker-scoped fetch, which a `window.fetch` wrapper on
- *   the main page never sees. Attaching a NON-image file in a remote session
- *   therefore fails; inline images ride `session/prompt` content blocks and
- *   work.
  * - `/api/session.export` (session log download) — an anchor-click download,
- *   not a fetch call at all. Exporting from a remote session errors.
+ *   not a fetch call at all, and a full ZIP of the session's server-side log
+ *   is not a body worth re-streaming through the relay. Remote sessions have
+ *   export DISABLED instead (T51): the sub-client's own backend refuses
+ *   `/api/session.export` for a virtual id with 403 `remote-unsupported`
+ *   before the local route is ever reached (fetch-route-intercept.ts), and
+ *   the UI entry is hidden on the same html attribute
+ *   (remote-session.css.ts) — the host route's answer for a foreign id
+ *   never happens.
  * - `/api/present.host` — takes NO parameters and reports the machine the
  *   SERVER process runs on; forwarding it would read server-desktop facts
  *   into a panel whose actions stay hidden remotely, so it is not relayed.
@@ -230,6 +231,17 @@ export declare function parseEventResultBody(body: unknown): EventResultBody | u
  *   files ON THE SERVER MACHINE (Finder / applications); meaningless from a
  *   sub-client, so the UI entries are hidden remotely (remote-session.css)
  *   and the routes are not registered here.
+ *
+ * The one HTTP route that USED to be absent is no longer (T51):
+ * `/api/session/uploadFileBinary` (attachment upload, RT
+ * dsh-client-file-upload) — its Blob/stream branch runs inside a Web Worker
+ * over XHR / Worker-scoped fetch, which neither a `window.fetch` wrapper nor
+ * the GET passthrough this table serves can carry. The sub-client's own
+ * backend instead wraps that entry in the host's `fetchRoutes` map
+ * (fetch-route-intercept.ts) and forwards the raw byte stream through the
+ * DEDICATED binary channel `POST relay/v1/upload`, whose query is decided by
+ * {@link decideUploadQuery} below — the same parse-once normalization, share
+ * table and refusal codes as everything else here.
  */
 export interface RelayHttpRoute {
     /** The query parameter carrying the owning session id. */
@@ -267,4 +279,32 @@ export type HttpDecision = {
  * string alone, never from raw input. Unknown parameters are dropped.
  */
 export declare function decideHttpRoute(route: unknown, query: unknown, isAccessible: (sessionId: string) => boolean): HttpDecision;
+/**
+ * The binary upload channel's query (T51), decided with the SAME
+ * parse-once discipline as {@link decideHttpRoute}: the wire string is
+ * parsed exactly once here, only `sessionId` and `name` are kept, and the
+ * caller composes the synthetic Request URL from the RETURNED string alone.
+ * `URLSearchParams` keeps `\t` / `\r` / `\n` inside key names while the
+ * WHATWG URL parser strips control characters — the differential that was
+ * T41b-fix's authorization bypass on the GET routes — so the check and the
+ * dispatch must see one parse.
+ *
+ * `sessionId` exactly once, a non-empty string, and share-checked like any
+ * other session id; a repeat is `no-session` (400). `name` (the file's
+ * display name — the host route passes it to its own leaf-name sanitizer,
+ * RT dsh-client-file-upload lib/index.js `handleFileUploadHttp`) at most
+ * once; a repeat is `bad-query` (400) and an empty value is dropped, the
+ * same "absent" the host route reads when the browser sent none. Everything
+ * else is discarded before an id is read.
+ */
+export type UploadQueryDecision = {
+    allow: true;
+    sessionId: string;
+    name: string | undefined;
+    query: string;
+} | {
+    allow: false;
+    reason: 'no-session' | 'bad-query' | 'not-shared';
+};
+export declare function decideUploadQuery(query: unknown, isAccessible: (sessionId: string) => boolean): UploadQueryDecision;
 //# sourceMappingURL=relay-access.d.ts.map
