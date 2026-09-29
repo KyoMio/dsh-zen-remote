@@ -615,6 +615,26 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // Structurally typed instead of a Context augmentation: the providing
       // package is not a devDependency here (see RelayGateway's comment).
       const gatewayService = (relayCtx as Context & { typertGateway: RelayGateway }).typertGateway
+      // T41b: the `/api` shared-fetch dispatcher, probed PER REQUEST through
+      // the reflection layer (the same discipline as the admin routes'
+      // typertGateway: adding `connection` to the inject list would keep the
+      // whole relay prefix off compositions that lack the service). The
+      // connection service's `createSharedFetchHandler('/api').fetch` is the
+      // in-process entry to the same exact-fetch route table the browser
+      // `/api` transport dispatches through (RT dsh-client-connection
+      // lib/index.js ~608-637 — pathname + method lookup over `fetchRoutes`,
+      // the registry dsh-client-ui-deliverables' changes routes register
+      // into), so a synthetic Request reaches the serving functions directly:
+      // no loopback HTTP, no login state. A composition without the service
+      // answers the relay route 501 instead.
+      const getApiFetch = (): ((request: Request) => Promise<Response>) | undefined => {
+        const connection = relayCtx.reflect.get('connection') as
+          | { createSharedFetchHandler?: (channel: string) => { fetch?: (request: Request) => Promise<Response> } }
+          | undefined
+        const handler = connection?.createSharedFetchHandler?.('/api')
+        const fetch = handler?.fetch
+        return typeof fetch === 'function' ? (request) => fetch.call(handler, request) : undefined
+      }
       // The server's interface fingerprints (T42): recomputed at EVERY
       // handshake, deliberately uncached — the typert loader registers
       // package by package asynchronously, so a client that auto-reconnects
@@ -627,6 +647,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           secret: relaySecret,
           store,
           gateway: gatewayService,
+          getApiFetch,
           // Subagent reachability (T22c-fix): isAccessible walks the same
           // child→parent chain the activity tracker keeps fresh.
           parentOf: parentIndex.parentOf,

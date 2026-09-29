@@ -16,6 +16,12 @@
  * routes skip DSH's /api authentication), then for the POST also the
  * same-origin gate and a 16 KiB JSON-object body cap. Built by a factory so
  * the tests drive it over a real socket with a mock server gateway.
+ *
+ * T41b adds the plain-HTTP relay under `client/http/<route>`: the GETs the
+ * browser fetch wrapper intercepted (`/api/changes.summary` / `changes.diff`
+ * naming a virtual session id) are re-issued here through the relay client's
+ * `http()` with the original id restored, and the upstream status,
+ * content type and body travel back verbatim.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission } from './admin-routes.js';
@@ -41,6 +47,11 @@ export declare const CLIENT_REMOTE_STATUS_ROUTE = "/_dsh/zen-remote/client/remot
  * (T34) — the backend forwards the ORIGINAL id through the relay's
  * `POST relay/v1/unshare`, so the server closes it with reason `'client'`. */
 export declare const CLIENT_UNSHARE_ROUTE = "/_dsh/zen-remote/client/unshare";
+/** Prefix of the plain-HTTP relay routes (T41b):
+ * `GET ${CLIENT_HTTP_ROUTE_PREFIX}<route>?<query>` relays one intercepted
+ * `/api/<route>` call (the fetch wrapper's rewrites land here) to the
+ * server, with the virtual session id swapped back to the original. */
+export declare const CLIENT_HTTP_ROUTE_PREFIX = "/_dsh/zen-remote/client/http/";
 /** The fetch face this module needs; injectable for tests. */
 export type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>;
 export interface ClientHandlerOptions {

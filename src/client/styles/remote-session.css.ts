@@ -1,0 +1,25 @@
+// Remote-session entry hiding (T41b). Separate from MOBILE_CSS on purpose:
+// the phone stylesheet is injected behind apply's desktop gate, while these
+// rules must hold on every sub-client surface (phone browser, desktop-width
+// browser, desktop app) — they are keyed on the html-level remote-session
+// attribute, which only a virtual (relay) session ever sets, so a host-role
+// deployment never matches any of them.
+
+export const REMOTE_SESSION_CSS = `/* ---------- remote session: hide the open-on-the-server-machine entries ----------
+   A remote session's files live on the relay SERVER; every "open" control here
+   would act on the machine the DSH process runs on, not the one the browser is
+   on. Hidden while the current session is remote (html[data-zr-remote-session]):
+   - [data-open-target] is dsh-client-ui-open-in-app's own mount marker (RT
+     dsh-client-ui-open-in-app lib/client.js ~325: the split-button anchor
+     React renders with data-open-target={kind}) — one selector covers the
+     session-header "Open In..." button, the document-preview actions, AND the
+     "Open / Show in Finder / Choose an application" buttons of the changes
+     panel and the deliverable cards (RT dsh-client-ui-deliverables
+     lib/client.js ~1702, ~1963: those cards render the open-in-app package's
+     FileRouteAction through the deliverables.file.actions and
+     deliverables.review.file.actions slots, the same OpenTargetButton anchor).
+     The attribute is the component's own contract, not a generated class. */
+html[data-zr-remote-session="1"] [data-open-target] {
+  display: none !important;
+}
+`

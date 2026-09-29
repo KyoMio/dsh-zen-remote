@@ -481,3 +481,119 @@ export function parseEventResultBody(body: unknown): EventResultBody | undefined
   if (!isPlainObject(result)) return undefined
   return { eventId, result }
 }
+
+/**
+ * The plain-HTTP panel long tail (T41b): the session-page surfaces that do
+ * NOT ride the typert gateway but GET `/api/...` routes registered as exact
+ * Fetch routes on the host's connection service (RT
+ * dsh-client-ui-deliverables/lib/index.js — `ctx.connection.fetch.register`
+ * at ~49-58 and ~84-90; the shared handler they dispatch through is
+ * `createSharedFetchHandler('/api')`, dsh-client-connection/lib/index.js
+ * ~608-637). Each entry names the query parameter that locates the session —
+ * the same per-route registration discipline as RELAY_METHODS, and the same
+ * refusal defaults: a route not in this table answers `unknown-route`
+ * (404) before any id is read, and a registered route is judged ONLY along
+ * its declared field.
+ *
+ * Deliberately ABSENT (the known limitations of the HTTP interception, kept
+ * beside the registry that makes the contrast true):
+ *
+ * - `/api/session/uploadFileBinary` (attachment upload, RT
+ *   dsh-client-ui-file-upload) — its Blob/stream branch runs inside a Web
+ *   Worker over XHR / Worker-scoped fetch, which a `window.fetch` wrapper on
+ *   the main page never sees. Attaching a NON-image file in a remote session
+ *   therefore fails; inline images ride `session/prompt` content blocks and
+ *   work.
+ * - `/api/session.export` (session log download) — an anchor-click download,
+ *   not a fetch call at all. Exporting from a remote session errors.
+ * - `/api/present.host` — takes NO parameters and reports the machine the
+ *   SERVER process runs on; forwarding it would read server-desktop facts
+ *   into a panel whose actions stay hidden remotely, so it is not relayed.
+ * - `/api/changes.open` and `/api/present.open` — POST actions that open
+ *   files ON THE SERVER MACHINE (Finder / applications); meaningless from a
+ *   sub-client, so the UI entries are hidden remotely (remote-session.css)
+ *   and the routes are not registered here.
+ */
+export interface RelayHttpRoute {
+  /** The query parameter carrying the owning session id. */
+  sessionField: 'sessionId'
+}
+
+export const RELAY_HTTP_ROUTES: Readonly<Record<string, RelayHttpRoute>> = {
+  'changes.summary': { sessionField: 'sessionId' },
+  'changes.diff': { sessionField: 'sessionId' },
+}
+
+/** One plain-HTTP decision: allow — carrying the NORMALIZED query string
+ * that is the only thing the caller may put on the synthetic Request URL —
+ * or the reason for the answer: `unknown-route` (not in
+ * {@link RELAY_HTTP_ROUTES}) answers 404, `no-session` (the field is missing
+ * or duplicated) and `bad-query` (a whitelisted coordinate repeats or is not
+ * a decimal non-negative integer string) answer 400, and `not-shared`
+ * answers 403 like every other session-scoped refusal. */
+export type HttpDenyReason = 'unknown-route' | 'no-session' | 'bad-query' | 'not-shared'
+
+export type HttpDecision = { allow: true; query: string } | { allow: false; reason: HttpDenyReason }
+
+/** True only for OWN registry keys: a bare route string from the wire is
+ * indexed into a plain object, so `constructor` / `__proto__` must never
+ * resolve through the prototype chain the way a bare `table[route]` would. */
+function isRegisteredHttpRoute(route: string): boolean {
+  return Object.prototype.hasOwnProperty.call(RELAY_HTTP_ROUTES, route)
+}
+
+/** A decimal non-negative integer string, exactly what the serving routes'
+ * own coordinate parser accepts (RT dsh-client-ui-deliverables
+ * lib/index.js `NUMERIC`). */
+const DECIMAL = /^\d+$/
+
+/**
+ * The one value of a whitelisted query parameter, or `null` when it repeats
+ * or is not a decimal non-negative integer string (a 400, not a pass-through
+ * of whichever duplicate the URL parser happens to keep). `undefined` = the
+ * parameter is legitimately absent.
+ */
+function singleCoordinate(params: URLSearchParams, name: string): string | undefined | null {
+  const values = params.getAll(name)
+  if (values.length === 0) return undefined
+  const value = values.length === 1 ? values[0] : undefined
+  if (value === undefined || !DECIMAL.test(value)) return null
+  return value
+}
+
+/**
+ * Decide one relayed `/api` GET against the per-route allowlist, and
+ * NORMALIZE the query. The two halves of this route used to disagree about
+ * parsing: `URLSearchParams` keeps `\t` / `\r` / `\n` inside key names
+ * (`session\tId` is one parameter here) while the WHATWG URL parser strips
+ * control characters before the request URL is built — so a query whose
+ * checkable `sessionId` named a shared session could DISPATCH as two
+ * parameters, with the serving route's own `get('sessionId')` reading the
+ * first one, a secret (reviewer-confirmed 200). The fix is structural: this
+ * function parses ONCE, takes only the whitelisted parameters — `sessionId`
+ * exactly once (its id must pass the share table), `seq` / `index` at most
+ * once each and decimal non-negative integers — and returns the rebuilt,
+ * fixed-order query string; the caller composes the synthetic URL from THAT
+ * string alone, never from raw input. Unknown parameters are dropped.
+ */
+export function decideHttpRoute(
+  route: unknown,
+  query: unknown,
+  isAccessible: (sessionId: string) => boolean,
+): HttpDecision {
+  if (typeof route !== 'string' || !isRegisteredHttpRoute(route)) return { allow: false, reason: 'unknown-route' }
+  if (typeof query !== 'string') return { allow: false, reason: 'no-session' }
+  const raw = new URLSearchParams(query)
+  const values = raw.getAll('sessionId')
+  const id = values.length === 1 ? values[0] : undefined
+  if (id === undefined || id === '') return { allow: false, reason: 'no-session' }
+  const seq = singleCoordinate(raw, 'seq')
+  const index = singleCoordinate(raw, 'index')
+  if (seq === null || index === null) return { allow: false, reason: 'bad-query' }
+  if (!isAccessible(id)) return { allow: false, reason: 'not-shared' }
+  const normalized = new URLSearchParams()
+  normalized.set('sessionId', id)
+  if (seq !== undefined) normalized.set('seq', seq)
+  if (index !== undefined) normalized.set('index', index)
+  return { allow: true, query: normalized.toString() }
+}

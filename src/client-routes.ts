@@ -16,6 +16,12 @@
  * routes skip DSH's /api authentication), then for the POST also the
  * same-origin gate and a 16 KiB JSON-object body cap. Built by a factory so
  * the tests drive it over a real socket with a mock server gateway.
+ *
+ * T41b adds the plain-HTTP relay under `client/http/<route>`: the GETs the
+ * browser fetch wrapper intercepted (`/api/changes.summary` / `changes.diff`
+ * naming a virtual session id) are re-issued here through the relay client's
+ * `http()` with the original id restored, and the upstream status,
+ * content type and body travel back verbatim.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -25,8 +31,9 @@ import type { ClaimOutcome, ProbeState } from './client-pairing.js'
 import { unwrapVolatile } from './config.js'
 import type { InterceptDiagnostics } from './intercept.js'
 import { responseJson, sameOriginPost } from './http.js'
+import { RELAY_HTTP_ROUTES } from './relay-access.js'
 import { relayCredentialsDigest, RelayError } from './relay-client.js'
-import type { RelayClient } from './relay-client.js'
+import type { RelayClient, RelayHttpResult } from './relay-client.js'
 import { fromVirtual } from './virtual-id.js'
 
 /** Prefix all client routes live under (one webServer prefix registration). */
@@ -54,6 +61,12 @@ export const CLIENT_REMOTE_STATUS_ROUTE = `${CLIENT_ROUTE_PREFIX}/remote-status`
  * (T34) — the backend forwards the ORIGINAL id through the relay's
  * `POST relay/v1/unshare`, so the server closes it with reason `'client'`. */
 export const CLIENT_UNSHARE_ROUTE = `${CLIENT_ROUTE_PREFIX}/unshare`
+
+/** Prefix of the plain-HTTP relay routes (T41b):
+ * `GET ${CLIENT_HTTP_ROUTE_PREFIX}<route>?<query>` relays one intercepted
+ * `/api/<route>` call (the fetch wrapper's rewrites land here) to the
+ * server, with the virtual session id swapped back to the original. */
+export const CLIENT_HTTP_ROUTE_PREFIX = `${CLIENT_ROUTE_PREFIX}/http/`
 
 /** Longest wait for one pairing round-trip to the server's gateway. */
 const CLAIM_TIMEOUT_MS = 10_000
@@ -156,6 +169,48 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
 
 function stringOrEmpty(value: unknown): string {
   return typeof value === 'string' ? value : ''
+}
+
+/**
+ * Write one relayed upstream answer (T41b): the underlying `/api` route's
+ * status with its body as received, and a content type held to JSON — the
+ * two registered routes answer JSON, and a compromised server must not land
+ * a scriptable type (`text/html`) on this same-origin browser path (T41b-fix),
+ * so anything else downgrades to inert `text/plain`. `nosniff` backs the
+ * downgrade up, and the no-store discipline every route here answers with.
+ */
+function respondUpstream(res: ServerResponse, result: RelayHttpResult): void {
+  const bytes = Buffer.from(result.body, 'utf8')
+  const mediaType = result.contentType?.split(';', 1)[0]?.trim().toLowerCase()
+  const contentType =
+    mediaType === 'application/json' && result.contentType !== undefined ? result.contentType : 'text/plain; charset=utf-8'
+  res.setHeader('Content-Type', contentType)
+  res.setHeader('Content-Length', String(bytes.length))
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.writeHead(result.status)
+  res.end(bytes)
+}
+
+/**
+ * Map one relay failure onto the plain-HTTP answer (T41b): the four
+ * link-level codes mean "the server chain is not usable" (503
+ * `remote-offline`); a refusal the relay route itself answered keeps ITS
+ * status and code (an unshared session is the relay's 403 `not-shared`,
+ * verbatim); anything else is a bug and answers a bare 502.
+ */
+function respondRelayFailure(res: ServerResponse, error: unknown): void {
+  if (error instanceof RelayError) {
+    if (error.code === 'offline' || error.code === 'unpaired' || error.code === 'revoked' || error.code === 'incompatible') {
+      responseJson(res, 503, { ok: false, error: { code: 'remote-offline' } })
+      return
+    }
+    if (error.status !== undefined && error.status >= 400 && error.status <= 599) {
+      responseJson(res, error.status, { ok: false, error: { code: error.code } })
+      return
+    }
+  }
+  responseJson(res, 502, { ok: false, error: { code: 'internal' } })
 }
 
 /** One probe of the server's relay ping with the row's token. Only the
@@ -521,6 +576,63 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           // keys the short copy on it.
           const code = error instanceof RelayError ? error.code : 'internal'
           responseJson(res, 200, { ok: false, error: { code, message: error instanceof Error ? error.message : String(error) } })
+        }
+        return
+      }
+      if (route.startsWith(CLIENT_HTTP_ROUTE_PREFIX)) {
+        // The plain-HTTP relay (T41b): the browser fetch wrapper sends the
+        // `/api/changes.*` calls it intercepted here. Same first wall as
+        // every client route (admit, above), then the four checks the
+        // interceptor's own routes apply — registered route, exactly one
+        // virtual session id, the relay online, and THAT id belonging to the
+        // connected server — before the query travels with the original id
+        // restored.
+        if (method !== 'GET') {
+          res.setHeader('Allow', 'GET')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
+          return
+        }
+        const httpRoute = route.slice(CLIENT_HTTP_ROUTE_PREFIX.length)
+        // Registry lookup by hasOwnProperty, never a bare index: `route` is
+        // a wire string, and `constructor` must not resolve through the
+        // object prototype.
+        if (httpRoute === '' || !Object.prototype.hasOwnProperty.call(RELAY_HTTP_ROUTES, httpRoute)) {
+          responseJson(res, 404, { ok: false, error: { code: 'unknown-route' } })
+          return
+        }
+        const url = new URL(req.url ?? '/', 'http://dsh.internal')
+        const sessionIds = url.searchParams.getAll('sessionId')
+        const virtualId = sessionIds.length === 1 ? sessionIds[0] : undefined
+        if (virtualId === undefined || virtualId === '') {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'sessionId is required exactly once' } })
+          return
+        }
+        const parts = fromVirtual(virtualId)
+        if (parts === undefined) {
+          responseJson(res, 400, { ok: false, error: { code: 'not-virtual', message: 'sessionId is not a remote session id' } })
+          return
+        }
+        const relay = options.getRelayClient?.()
+        if (relay === undefined || relay.state !== 'online') {
+          responseJson(res, 503, { ok: false, error: { code: 'remote-offline' } })
+          return
+        }
+        if (relay.handshakeInfo?.serverId !== parts.serverId) {
+          responseJson(res, 400, { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端' } })
+          return
+        }
+        url.searchParams.set('sessionId', parts.id)
+        // A browser walk-off cancels the round-trip mid-flight; the write
+        // guard in the catch keeps a settled answer from racing the close.
+        const hangUp = new AbortController()
+        res.once('close', () => {
+          if (!res.writableEnded) hangUp.abort()
+        })
+        try {
+          const result = await relay.http(httpRoute, url.searchParams.toString(), hangUp.signal)
+          respondUpstream(res, result)
+        } catch (error) {
+          if (!res.writableEnded && !res.destroyed) respondRelayFailure(res, error)
         }
         return
       }
