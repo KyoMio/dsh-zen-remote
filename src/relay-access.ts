@@ -71,7 +71,9 @@ type SessionField =
   | 'agentId'
 
 /** Which standing filter the caller must apply to a global stream's frames
- * (`src/relay-filter.ts` owns both implementations). */
+ * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
+ * forwarding subscription is filtered by relay-server.ts itself — it needs
+ * the per-eventId registry, not a pure frame function). */
 export type StreamFilter = 'workspace' | 'control'
 
 /** Which standing filter the caller must apply to an invoke result before it
@@ -91,8 +93,14 @@ interface RelayMethod {
   /** Set on the two GLOBAL streams: every frame of such a subscription must
    * go through the named filter before it is written. */
   streamFilter?: StreamFilter
-  /** Set on invoke methods whose RESULT needs a standing filter. */
+  /** Set on the invoke methods whose RESULT needs a standing filter. */
   resultFilter?: InvokeFilter
+  /** The one EVENT-FORWARDING entry (T32, `$zr/events`): the stream route
+   * opens the gateway's `$events` wire stream (never `gw.stream`, spike §2.1
+   * 坑 1) and filters frames by the waterfall's `agentId`; the answer route
+   * matches `eventId`s against what was forwarded. Like the global reads it
+   * claims no session field — access is judged per frame / per answer. */
+  events?: true
 }
 
 /**
@@ -157,6 +165,9 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'workspace/unarchiveSession': { fields: ['request.sessionId'] },
   // workspace — the global follow stream
   'workspace/follow': { fields: [], stream: true, streamFilter: 'workspace' },
+  // the forwarded-event subscription (T32): special entry, no session fields —
+  // its frames are judged per `agentId`, its answers per forwarded `eventId`
+  '$zr/events': { fields: [], stream: true, events: true },
 }
 
 /** One invoke decision: allow (optionally through a standing result filter),
@@ -167,9 +178,10 @@ export type InvokeDecision = { allow: true; filter?: InvokeFilter } | { allow: f
 
 /** One stream decision: allow (global streams carry a `streamFilter`, scoped
  * streams list the session ids the subscription depends on — the relay kills
- * the stream and counts viewers with them), or the 403 reason. */
+ * the stream and counts viewers with them, and the event subscription sets
+ * `events`), or the 403 reason. */
 export type StreamDecision =
-  | { allow: true; filter?: StreamFilter; sessionIds: string[] }
+  | { allow: true; filter?: StreamFilter; sessionIds: string[]; events?: true }
   | { allow: false; reason: InvokeDenyReason }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -303,10 +315,35 @@ export function decideStream(
   const entry = RELAY_METHODS[`${namespace}/${method}`]
   if (entry === undefined || entry.stream !== true) return { allow: false, reason: 'forbidden-method' }
   if (entry.streamFilter !== undefined) return { allow: true, filter: entry.streamFilter, sessionIds: [] }
+  if (entry.events === true) return { allow: true, sessionIds: [], events: true }
   const claimed = claimedSessionIds(entry, args)
   if ('reason' in claimed) return { allow: false, reason: claimed.reason }
   for (const id of claimed.ids) {
     if (!isAccessible(id)) return { allow: false, reason: 'not-shared' }
   }
   return { allow: true, sessionIds: claimed.ids }
+}
+
+/**
+ * The `$events/result` answer body (T32), as the client sends it:
+ * `{ eventId, result }`. `result` is the Remote event OUTCOME and travels
+ * VERBATIM — dsh-api-gateway's `parseRemoteEventResult` is the validator
+ * (exactly `{clientId,eventId,outcome}` up there; kinds `next` / `result`
+ * with optional JSON `value` / `rejected` with `{name,message,code?,details?}`),
+ * and a malformed one comes back as the gateway's own 200 error envelope, so
+ * re-validating here would only invent a second dialect for the same refusal.
+ * `eventId` ownership (forwarded on a live subscription, session still
+ * reachable) is the ROUTE's check — it needs the handler's registry.
+ */
+export interface EventResultBody {
+  eventId: string
+  result: Record<string, unknown>
+}
+
+export function parseEventResultBody(body: unknown): EventResultBody | undefined {
+  if (!isPlainObject(body)) return undefined
+  const { eventId, result } = body
+  if (typeof eventId !== 'string' || eventId === '') return undefined
+  if (!isPlainObject(result)) return undefined
+  return { eventId, result }
 }

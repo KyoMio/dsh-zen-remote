@@ -45,8 +45,34 @@
  *   errors into `gateway/internal`, losing the code).
  * - the 0.2.0 `openWireStream` is an ASYNC method — the host's mux does
  *   `await this.open(...)` and then `for await` over the result. The merge
- *   route therefore awaits the local original too and hands the host back a
+ *   routes therefore await the local original too and hands the host back a
  *   promise of the merged iterable, the same shape the real method returns.
+ *
+ * T32 adds the forwarded-event pair, mirroring the server side:
+ *
+ * - `openWireStream('$events', …)` stays the stream the UI opened — local
+ *   frames pass through untouched — while a relay `$zr/events` leg, reopened
+ *   for as long as the relay is online, folds the SERVER's approval/question
+ *   waterfalls in. Remote frames are rewritten before the UI ever sees them:
+ *   `agentId` and `eventId` become `zr~<serverId>~…` virtual ids (those are
+ *   the ONLY session ids a forwarded waterfall carries — the request bodies
+ *   are tool/question data, verified against dsh-tools/dsh-user-questions),
+ *   and the remote `ready`/`emit` frames are DROPPED: the client face of the
+ *   gateway (dsh-api-gateway lib/client.js) accepts a ready frame only as
+ *   the FIRST frame of the stream and would fail the stream on a second one,
+ *   and emit events broadcast server-wide state the UI must not mistake for
+ *   local sessions. Prompts this leg showed are closed when the leg dies —
+ *   each gets a synthesized `cancel` — so a disconnect cannot leave an
+ *   approval on screen that no server can settle anymore (T32-fix).
+ * - `dispatchRpc('$events/result', …)` splits on the eventId: a virtual id
+ *   is swapped back to the original and answered through the relay's
+ *   `postEventResult` (the server composes the gateway payload with its own
+ *   clientId — the local payload's clientId is the local stream's and is
+ *   discarded); anything else reaches the local gateway verbatim. A relay
+ *   refusal that means "this event is already over" (`unknown-event`,
+ *   `not-shared`) is answered as silent success — exactly how DSH treats a
+ *   stale result — because a thrown answer fails the UI's whole `$events`
+ *   generation (client face: pumpEvents aborts on answer failures).
  */
 import type { RelayClient } from './relay-client.js';
 import type { GatewayShapeCheck } from './intercept-shape.js';
@@ -182,6 +208,36 @@ export interface InterceptHandle {
 export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown;
 /** Rewrite one invoke result's session ids to virtual form. */
 export declare function rewriteResult(endpoint: string, value: unknown, serverId: string): unknown;
+/**
+ * Rewrite one SERVER-side `$events` frame for the local UI (T32), or `null`
+ * to drop it. Wire shapes verified against dsh-api-gateway (frames:
+ * `openRemoteEvents`/`broadcastRemoteEvent`/`startRemoteEvent`/
+ * `finishRemoteEvent`; consumer validation: lib/client.js
+ * `parseRemoteEventFrame` — every variant demands EXACT keys, so rewriting
+ * must rename in place and never add or remove a field):
+ *
+ * - `waterfall`: `{type, event, eventId, agentId, request}` — `eventId` and
+ *   `agentId` become virtual; `request` passes verbatim (the projection the
+ *   gateway already stripped `agent`/`signal` from carries no session id:
+ *   approval requests are `{toolName, callId, reason?, displayReason?}`,
+ *   question requests `{questions:[…]}` — dsh-tools / dsh-user-questions).
+ *   The server already prefixed the eventId with its per-subscription token
+ *   (`<token>.<eventId>`); this layer treats that as opaque and wraps the
+ *   whole thing in `zr~<serverId>~`.
+ * - `cancel`: `{type, eventId}` — the correlation id goes virtual so the UI
+ *   can match it against the waterfall it showed and close the prompt.
+ * - `ready`: dropped. The local stream already opened the UI's stream with
+ *   ITS ready frame (client face: the first frame must be ready, any later
+ *   one fails `parseRemoteEventFrame`), and the remote one carries the
+ *   server's `clientId`/`home` — facts the UI must never need.
+ * - `emit`: dropped (T32-fix, second line of defense behind the server's
+ *   own drop). Emit events broadcast server-wide state — session lists and
+ *   titles, account expirations, cordis chatter — that is not share-scoped;
+ *   whatever survived a future server would feed the local UI ids it would
+ *   mistake for local sessions. Session state reaches the sub-client
+ *   through the share-filtered workspace/control streams instead.
+ */
+export declare function rewriteRemoteEventFrame(frame: unknown, serverId: string): unknown | null;
 /**
  * Install the two own-property wrappers on the raw gateway. Assumes
  * {@link checkGatewayShape} passed (the wiring gates on it) — this function
