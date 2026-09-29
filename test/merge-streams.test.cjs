@@ -520,3 +520,129 @@ test('RT UI model: a revocation clears every remote group', () => {
   m.onRemoteGone().forEach(ui.apply)
   assert.equal(ui.ids(), 'ws-local')
 })
+
+// -- 9. status annotations (T34) -----------------------------------------------------
+
+test('T34: setStatus offline + onStatusChanged re-upserts the shown groups with （离线）titles', () => {
+  const m = merger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  m.setStatus('offline')
+  const out = m.onStatusChanged()
+  assert.deepEqual(out, [
+    { type: 'upsert', workspace: { ...W1, workspaceId: V('w-1'), title: `${NAME} · 远端一（离线）`, sessionIds: [V('s1'), V('s2')] } },
+    { type: 'upsert', workspace: { ...W2, workspaceId: V('w-2'), title: `${NAME} · 远端二（离线）`, sessionIds: [V('s3')] } },
+  ])
+  // and the annotation rides every later frame until cleared (a local
+  // baseline carrying the remote tail, for instance)
+  const local = m.onLocal({ ...LOCAL_BASELINE })
+  assert.equal(local[0].value.items[1].title, `${NAME} · 远端一（离线）`)
+})
+
+test('T34: clearing the annotation and re-baselining restores the plain titles', () => {
+  const m = merger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  m.setStatus('offline')
+  m.onStatusChanged()
+  // back online: the intercept layer emits nothing on a CLEAR (the
+  // reconnecting baseline does the restore); the merger primitive's
+  // onStatusChanged re-upserts the shown groups, now with plain titles
+  m.setStatus('none')
+  assert.deepEqual(m.onStatusChanged(), [
+    { type: 'upsert', workspace: { ...W1, workspaceId: V('w-1'), title: `${NAME} · 远端一`, sessionIds: [V('s1'), V('s2')] } },
+    { type: 'upsert', workspace: { ...W2, workspaceId: V('w-2'), title: `${NAME} · 远端二`, sessionIds: [V('s3')] } },
+  ])
+  const again = m.onRemote(REMOTE_BASELINE)
+  assert.deepEqual(again[0], {
+    type: 'upsert',
+    workspace: { ...W1, workspaceId: V('w-1'), title: `${NAME} · 远端一`, sessionIds: [V('s1'), V('s2')] },
+  })
+  assert.ok(again.every((frame) => !String(frame.workspace?.title ?? '').includes('（离线）')))
+})
+
+test('T34: revoked / unpaired / mismatch annotations each render their suffix', () => {
+  const m = merger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  for (const [annotation, suffix] of [
+    ['revoked', '（令牌已吊销）'],
+    ['unpaired', '（已解除配对）'],
+    ['mismatch', '（版本有差异）'],
+  ]) {
+    m.setStatus(annotation)
+    const [frame] = m.onStatusChanged()
+    assert.equal(frame.workspace.title, `${NAME} · 远端一${suffix}`, annotation)
+    assert.equal(frame.workspace.workspaceId, V('w-1'))
+  }
+  // the suffix REPLACES, never stacks: setting revoked after offline renders
+  // only the revoked copy (the caller owns the priority)
+  m.setStatus('offline')
+  m.onStatusChanged()
+  m.setStatus('revoked')
+  const [frame] = m.onStatusChanged()
+  assert.equal(frame.workspace.title, `${NAME} · 远端一（令牌已吊销）`)
+  assert.ok(!frame.workspace.title.includes('（离线）'))
+})
+
+test('T34: onStatusChanged is silent before the local baseline and with no remote state', () => {
+  const m = merger()
+  m.setStatus('offline')
+  assert.deepEqual(m.onStatusChanged(), [], 'nothing shown yet — cached remote state stays cached')
+  m.onRemote(REMOTE_BASELINE)
+  assert.deepEqual(m.onStatusChanged(), [], 'still nothing shown')
+  m.onLocal(LOCAL_BASELINE)
+  // the baseline itself carried the annotation (set before it arrived)
+  assert.equal(m.onLocal({ ...LOCAL_BASELINE })[0].value.items[1].title, `${NAME} · 远端一（离线）`)
+  const fresh = merger()
+  fresh.onLocal(LOCAL_BASELINE)
+  fresh.setStatus('offline')
+  assert.deepEqual(fresh.onStatusChanged(), [], 'no remote groups — nothing to annotate')
+})
+
+test('T34: the control merger accepts setStatus and answers [] — projections carry no titles', () => {
+  const m = createControlMerger({ serverId: SID })
+  m.onLocal({ type: 'baseline', value: { projections: { s1: { asOfSeq: 1, values: { title: 'L' } } } } })
+  m.setStatus('offline')
+  assert.deepEqual(m.onStatusChanged(), [])
+  // the control stream keeps converting frames normally afterwards
+  assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', key: 'title', value: 'x', seq: 2 }), [
+    { type: 'projection', sessionId: V('s1'), key: 'title', value: 'x', seq: 2 },
+  ])
+})
+
+test('T34 RT UI model: offline keeps the groups under annotated titles; the reconnecting baseline restores them', () => {
+  const m = merger()
+  const ui = createUiModel()
+  m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
+  assert.equal(ui.ids(), `ws-local,${V('w-1')},${V('w-2')}`)
+
+  m.setStatus('offline')
+  m.onStatusChanged().forEach(ui.apply)
+  assert.equal(ui.ids(), `ws-local,${V('w-1')},${V('w-2')}`, 'the annotation removed nothing')
+  assert.equal(ui.model.items[1].title, `${NAME} · 远端一（离线）`)
+
+  // back online: clear, then the fresh baseline diff re-upserts — plain titles
+  m.setStatus('none')
+  m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
+  assert.equal(ui.model.items[1].title, `${NAME} · 远端一`)
+})
+
+test('T34 RT UI model: a revoked relay keeps the group under the 吊销 annotation, re-pair restores it', () => {
+  const m = merger()
+  const ui = createUiModel()
+  m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
+
+  m.setStatus('revoked')
+  m.onRemoteDown().forEach(ui.apply)
+  m.onStatusChanged().forEach(ui.apply)
+  assert.equal(ui.ids(), `ws-local,${V('w-1')},${V('w-2')}`, 'the revocation removed nothing (T23b2-fix3)')
+  assert.equal(ui.model.items[1].title, `${NAME} · 远端一（令牌已吊销）`)
+
+  // re-paired to the same server: annotation clears, the diffed baseline revives
+  m.setStatus('none')
+  m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
+  assert.equal(ui.model.items[1].title, `${NAME} · 远端一`)
+})

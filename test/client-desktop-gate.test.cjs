@@ -401,3 +401,209 @@ test('T33b-fix: client role hides, host role shows, a 404 round fails alone', as
   }
   off()
 })
+
+// --- T34: the sub-client remote-status parts -----------------------------------
+
+test('T34: desktop shell — the status icon and composer banner still register (both slots + styles)', async () => {
+  globalThis.dshDesktop = {}
+  try {
+    const { registerRemoteStatusUi } = await import('../src/client/remote-status-register.ts')
+    const iconComponent = () => null
+    const bannerComponent = () => null
+    const { ctx, calls } = fakeCtx()
+    registerRemoteStatusUi(ctx, iconComponent, bannerComponent)
+    assert.notEqual(
+      calls.effects.find((candidate) => candidate.label === 'dsh-zen-remote: remote-status styles'),
+      undefined,
+      'the remote-status stylesheet effect is registered',
+    )
+    const byName = new Map(calls.slotsRegistered.map((entry) => [entry.options.name, entry]))
+    const icon = byName.get('conversation.session.header.actions')
+    const banner = byName.get('conversation.input.dock')
+    assert.notEqual(icon, undefined, 'the status icon registers on the desktop shell')
+    assert.equal(icon.options.id, 'remote-status-icon')
+    // Order 26: past the T33b share icon (25), so the two never tie.
+    assert.equal(icon.options.order, 26)
+    assert.equal(icon.options.locale, 'mobileNav')
+    assert.equal(icon.component, iconComponent)
+    assert.notEqual(banner, undefined, 'the composer banner registers on the desktop shell')
+    assert.equal(banner.options.id, 'remote-status-banner')
+    assert.equal(banner.options.order, 15)
+    // The inject face hands both parts the page-wide store singleton, and
+    // the banner a per-session composer-block binding (T34-fix: the disable
+    // rides the host's ctx.conversation.blocks contract).
+    const share = icon.options.inject()
+    assert.equal(typeof share.status.subscribe, 'function')
+    assert.equal(typeof share.status.getSnapshot, 'function')
+    const bannerShare = banner.options.inject('zr~abcd1234~session-a')
+    assert.equal(typeof bannerShare.setComposerBlock, 'function')
+    // A composition whose conversation service is absent degrades to a no-op
+    // binding (the fake ctx has no `get`), not a crash.
+    bannerShare.setComposerBlock('reason')
+    bannerShare.setComposerBlock(undefined)
+  } finally {
+    delete globalThis.dshDesktop
+  }
+})
+
+test('T34: apply order guard — the remote-status registration runs before the desktop gate', () => {
+  const source = readFileSync(join(ROOT, 'src', 'client', 'index.tsx'), 'utf8')
+  const registerAt = source.indexOf('registerRemoteStatusUi(ctx, RemoteStatusIcon, RemoteComposerBanner)')
+  const gateAt = source.indexOf('if (isDesktopShell()) return')
+  assert.ok(registerAt !== -1, 'apply registers the remote-status parts')
+  assert.ok(registerAt < gateAt, 'the remote-status parts register BEFORE the desktop gate')
+})
+
+test('T34: the parts render only for virtual-id sessions (textual pins — .tsx cannot load under Node)', () => {
+  for (const [file, marker] of [
+    ['RemoteStatusIcon.tsx', 'isVirtual(sessionId)'],
+    ['RemoteComposerBanner.tsx', 'isVirtual(sessionId)'],
+  ]) {
+    const source = readFileSync(join(ROOT, 'src', 'client', file), 'utf8')
+    assert.ok(source.includes(marker), `${file} gates its render on the virtual id`)
+    assert.ok(source.includes('return null'), `${file} renders nothing off the gate`)
+  }
+  // T34-fix: the disable rides the host's composer-block contract, not a CSS
+  // override — the banner raises the block while it stands and the cleanup
+  // clears it.
+  const banner = readFileSync(join(ROOT, 'src', 'client', 'RemoteComposerBanner.tsx'), 'utf8')
+  assert.ok(banner.includes('setComposerBlock(text)'), 'the banner raises the block')
+  assert.ok(banner.includes('setComposerBlock(undefined)'), 'the cleanup clears it')
+  const css = readFileSync(join(ROOT, 'src', 'client', 'remote-status-css.ts'), 'utf8')
+  assert.ok(!css.includes('data-zr-remote-readonly'), 'the CSS override is gone')
+  // and the banner no longer stacks an explicit width onto its side margins
+  assert.ok(!css.includes('width: 100%'), 'no width+margins overflow')
+})
+
+test('T34: describeRemoteStatus — the three icon states, revoked/unpaired read offline, a mismatch only while online', async () => {
+  const { describeRemoteStatus } = await import('../src/client-data/remote-status.ts')
+  const t = (key) => `#${key}`
+  const view = (over = {}) => ({ state: 'online', versionMismatch: false, serverName: 's', closed: {}, asOf: 1, ...over })
+  assert.deepEqual(describeRemoteStatus(view(), t), { state: 'online', hoverText: '#remoteStatusOnline' })
+  assert.deepEqual(describeRemoteStatus(view({ versionMismatch: true }), t), { state: 'mismatch', hoverText: '#remoteStatusMismatch' })
+  assert.deepEqual(describeRemoteStatus(view({ state: 'offline' }), t), { state: 'offline', hoverText: '#remoteStatusOffline' })
+  // T34-fix: revoked / unpaired are states of their own — the word is theirs,
+  // never "reconnecting"
+  assert.deepEqual(describeRemoteStatus(view({ state: 'revoked' }), t), { state: 'revoked', hoverText: '#remoteStatusRevoked' })
+  assert.deepEqual(describeRemoteStatus(view({ state: 'unpaired' }), t), { state: 'unpaired', hoverText: '#remoteStatusUnpaired' })
+  assert.deepEqual(describeRemoteStatus(undefined, t), { state: 'offline', hoverText: '#remoteStatusOffline' })
+  // offline outranks the mismatch (the verdict may predate the outage)
+  assert.equal(describeRemoteStatus(view({ state: 'offline', versionMismatch: true }), t).state, 'offline')
+  // the default formatter is the Chinese dictionary
+  assert.equal(describeRemoteStatus(view()).hoverText, '远程会话 · 已连接')
+})
+
+test('T34: bannerText — the closed reason outranks the offline line; online and clean means no banner', async () => {
+  const { bannerText } = await import('../src/client-data/remote-status.ts')
+  const t = (key) => `#${key}`
+  const view = (over = {}) => ({ state: 'online', versionMismatch: false, serverName: 's', closed: {}, asOf: 1, ...over })
+  const session = 'zr~abcd1234~session-a'
+  assert.equal(bannerText(view({ state: 'offline' }), session, t), '#remoteBannerOffline')
+  assert.equal(bannerText(view({ closed: { [session]: 'idle' } }), session, t), '#remoteBannerClosedIdle')
+  assert.equal(bannerText(view({ closed: { [session]: 'manual' } }), session, t), '#remoteBannerClosedManual')
+  assert.equal(bannerText(view({ closed: { [session]: 'client' } }), session, t), '#remoteBannerClosedClient')
+  // a closed session stays closed even while the server is down: the reason wins
+  assert.equal(bannerText(view({ state: 'offline', closed: { [session]: 'idle' } }), session, t), '#remoteBannerClosedIdle')
+  // other sessions' closures say nothing about this one
+  assert.equal(bannerText(view({ closed: { 'zr~abcd1234~other': 'idle' } }), session, t), undefined)
+  assert.equal(bannerText(view(), session, t), undefined)
+  assert.equal(bannerText(undefined, session, t), undefined)
+  // an unknown reason in the closed map degrades to the manual close
+  assert.equal(bannerText(view({ closed: { [session]: 'mystery' } }), session, t), '#remoteBannerClosedManual')
+})
+
+test('T34: the store polls only with subscribers and only while visible; failures fail one round', async () => {
+  const { createRemoteStatusStore } = await import('../src/client-data/remote-status.ts')
+  const bodies = [
+    { ok: false, status: 404, json: async () => ({}) },
+    { ok: true, status: 200, json: async () => ({ state: 'online', versionMismatch: true, serverName: '书房', closed: { 'zr~abcd1234~s': 'idle' } }) },
+    { ok: true, status: 200, json: async () => ({ state: 'offline', versionMismatch: false, serverName: '书房', closed: {} }) },
+  ]
+  let calls = 0
+  let visible = true
+  // A visibility source the test DRIVES: the notify callback is what the
+  // store's onVisibility reacts to (the real one is document's
+  // visibilitychange).
+  let notifyVisibility = () => {}
+  const store = createRemoteStatusStore(
+    async () => { calls += 1; return bodies[Math.min(calls - 1, bodies.length - 1)] },
+    { visible: () => visible, subscribe: (listener) => { notifyVisibility = listener; return () => { notifyVisibility = () => {} } } },
+    5,
+  )
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 40))
+  const waitFor = async (predicate, ms = 2000) => {
+    const start = Date.now()
+    while (!predicate()) {
+      if (Date.now() - start > ms) throw new Error('waitFor timeout')
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+  }
+
+  // No subscribers: nothing polls.
+  await settle()
+  assert.equal(calls, 0)
+
+  const off = store.subscribe(() => {})
+  try {
+    // The immediate pull served the 404 (ready stays false); the cadence
+    // burns through the rest until the newest answer shows.
+    await waitFor(() => {
+      const snap = store.getSnapshot()
+      return snap.ready === true && snap.view?.state === 'offline'
+    })
+    assert.equal(store.getSnapshot().view.versionMismatch, false, 'the newest answer won')
+    assert.deepEqual(store.getSnapshot().view.closed, {})
+    const readyCalls = calls
+    await settle()
+    assert.ok(calls > readyCalls, 'the cadence kept polling while visible')
+
+    // Hidden page: the visibility listener stops the timer — no more fetches
+    // until visibility returns.
+    visible = false
+    notifyVisibility()
+    await settle()
+    const hiddenCalls = calls
+    await settle()
+    assert.equal(calls, hiddenCalls, 'nothing polls while the page is hidden')
+
+    // Becoming visible pulls once immediately and resumes the cadence.
+    visible = true
+    notifyVisibility()
+    await settle()
+    assert.ok(calls > hiddenCalls, 'becoming visible pulled right away')
+  } finally {
+    off()
+  }
+  await settle()
+  const afterOff = calls
+  await settle()
+  assert.equal(calls, afterOff, 'the last subscriber leaving stops the poll')
+})
+
+test('T34: the store unshare posts the virtual id to the client route, then refreshes', async () => {
+  const { createRemoteStatusStore } = await import('../src/client-data/remote-status.ts')
+  const seen = []
+  let pollCalls = 0
+  let posts = 0
+  const store = createRemoteStatusStore(async (url, init) => {
+    seen.push({ url, method: init?.method, body: init?.body })
+    if (init?.method === 'POST') {
+      posts += 1
+      const ok = posts === 1
+      return { ok, status: 200, json: async () => (ok ? { ok: true } : { ok: false, error: { code: 'not-shared' } }) }
+    }
+    pollCalls += 1
+    return { ok: true, status: 200, json: async () => ({ state: 'online', versionMismatch: false, serverName: 's', closed: {} }) }
+  }, { visible: () => true, subscribe: () => () => {} }, 60_000)
+  const outcome = await store.unshare('zr~abcd1234~session-a')
+  assert.deepEqual(outcome, { ok: true })
+  const post = seen.find((call) => call.method === 'POST')
+  assert.equal(post.url, '/_dsh/zen-remote/client/unshare')
+  assert.deepEqual(JSON.parse(post.body), { sessionId: 'zr~abcd1234~session-a' })
+  assert.ok(pollCalls >= 1, 'the action was followed by a refresh')
+
+  const refused = await store.unshare('zr~abcd1234~session-b')
+  const failBody = seen.filter((call) => call.method === 'POST')[1]
+  assert.deepEqual(JSON.parse(failBody.body), { sessionId: 'zr~abcd1234~session-b' })
+  assert.deepEqual(refused, { ok: false, code: 'not-shared' })
+})

@@ -43,7 +43,11 @@
  *   persists its serverId (relay-server.ts loadServerId), so a re-pair to
  *   the same server reuses the prefix and is handled as a remote death
  *   ({@link WorkspaceMerger.onRemoteDown}) — the reconnect diff revives
- *   the group.
+ *   the group;
+ * - a relay status that is not serving normally (T34: offline, unpaired,
+ *   revoked, interface mismatch) only ANNOTATES TITLES: setStatus +
+ *   onStatusChanged re-upsert the shown groups under the annotated titles,
+ *   and the reconnecting baseline (which always upserts) restores them.
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
@@ -68,6 +72,16 @@ export interface MergerIdentity {
     serverId: string;
     serverName: string;
 }
+/**
+ * The status annotation (T34) appended to every shown remote group's title
+ * while the relay is not serving normally. The CALLER (intercept.ts) maps the
+ * relay state onto one annotation — `revoked` / `unpaired` outrank `offline`,
+ * which outranks `mismatch` — and the merger only renders the suffix it is
+ * told to. The suffixes are the CHINESE copy, deliberately hardcoded here:
+ * this module is background code with no access to the UI language (the
+ * English forms live in src/client/locales.ts, `remoteGroup*` keys).
+ */
+export type MergerAnnotation = 'none' | 'offline' | 'revoked' | 'unpaired' | 'mismatch';
 export interface WorkspaceMergerOptions extends MergerIdentity {
     /** Diagnostics for frames this merger dropped (unknown type or malformed).
      * Optional: without it the drop is silent. */
@@ -99,6 +113,16 @@ export interface WorkspaceMerger {
     /** The server was renamed (same serverId — call after {@link retarget}):
      * re-upserts every shown workspace under the new title, nothing else. */
     onServerRenamed(): unknown[];
+    /** Record the status annotation (T34) future virtualized titles carry. No
+     * frames on its own — pair it with {@link onStatusChanged} to re-upsert the
+     * shown groups under the new annotation, or let the next natural upserts
+     * (a reconnecting baseline) carry it. */
+    setStatus(annotation: MergerAnnotation): void;
+    /** Re-upsert every SHOWN workspace under the CURRENT annotation: the whole
+     * update when the relay's serving status changed without any remote frame
+     * (offline, revoked, unpaired, version mismatch). [] while nothing is
+     * shown (no local baseline yet, or no remote state). */
+    onStatusChanged(): unknown[];
     /** Point the merger at a (possibly different) server. Local state survives;
      * for a serverId change the remote state must be gone first (onRemoteGone
      * first); for a rename it may stay. */
@@ -136,6 +160,11 @@ export interface ControlMerger {
     onRemoteGone(): unknown[];
     /** Always [] — projection frames carry no display name. */
     onServerRenamed(): unknown[];
+    /** Accepted and ignored: a status annotation is a TITLE concern, and
+     * control projections carry no titles. */
+    setStatus(annotation: MergerAnnotation): void;
+    /** Always [] — nothing shown here could carry an annotation. */
+    onStatusChanged(): unknown[];
     retarget(identity: MergerIdentity): void;
 }
 /**

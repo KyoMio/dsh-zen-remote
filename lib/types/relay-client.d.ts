@@ -74,14 +74,19 @@ export interface RelayHandshake {
  * One relay failure. `code` is the mapped reason (the contract's state
  * vocabulary, a server refusal like `not-shared`, or a DSH error code from
  * a 200 `{ok:false}` envelope); `status` carries the HTTP status when a
- * response existed. Fields are assigned in the constructor body rather than
- * declared as parameter properties: Node's strip-only type mode rejects
- * that syntax (the same rule as UploadError in index.ts).
+ * response existed. `reason` is the OPTIONAL structured detail some error
+ * frames carry beside the message — today only the server's `unshared`
+ * stream-closure frame, whose `reason` ('manual' | 'client' | 'idle', T34)
+ * the interceptor's closed-session display keys on. Fields are assigned in
+ * the constructor body rather than declared as parameter properties: Node's
+ * strip-only type mode rejects that syntax (the same rule as UploadError in
+ * index.ts).
  */
 export declare class RelayError extends Error {
     code: string;
     status?: number;
-    constructor(code: string, message?: string, httpStatus?: number);
+    reason?: string;
+    constructor(code: string, message?: string, httpStatus?: number, reason?: string);
 }
 export interface CreateRelayClientOptions {
     /** The normalized server address (no trailing slash), read live per
@@ -152,6 +157,13 @@ export interface RelayClient {
     /** One invoke round-trip; resolves with the unwrapped `value`, throws
      * RelayError otherwise. A caller abort surfaces as `RelayError('aborted')`. */
     invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown>;
+    /** Close one session's remote access on the SERVER (T34): the original
+     * (non-virtual) session id rides `POST relay/v1/unshare`, the server
+     * unshares it with reason `'client'`. Resolves on the success envelope;
+     * every refusal (`not-shared`, a wall, transport death) throws RelayError.
+     * A success proves the link and lifts a stale `offline` back to `online`,
+     * exactly like invoke. */
+    unshare(sessionId: string, signal?: AbortSignal): Promise<void>;
     /** Answer one forwarded Remote event (T32): `eventId` is the ORIGINAL id
      * (the interceptor swapped the virtual one back), `result` the Remote
      * event OUTCOME, forwarded verbatim — the gateway validates it. The error

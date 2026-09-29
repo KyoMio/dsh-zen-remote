@@ -236,6 +236,22 @@ export declare const zh: {
     readonly 'settings.client.diagRecentFailures': "最近的远程调用失败";
     readonly 'settings.client.diagCompatGroups': "指纹有差异的组：{groups}";
     readonly 'settings.client.diagCompatCalls': "最近的不兼容调用";
+    readonly remoteStatusOnline: "远程会话 · 已连接";
+    readonly remoteStatusOffline: "服务端离线，正在重连";
+    readonly remoteStatusMismatch: "与服务端版本不一致，部分功能可能不可用";
+    readonly remoteStatusRevoked: "令牌已吊销，请在设置页重新配对";
+    readonly remoteStatusUnpaired: "已解除配对";
+    readonly remoteBannerOffline: "服务端离线，远程会话暂时只读，恢复连接后自动可用";
+    readonly remoteBannerClosedIdle: "远程已关闭：闲置超过设定时间，已自动休眠";
+    readonly remoteBannerClosedManual: "远程已关闭：服务端已关闭此会话的远程";
+    readonly remoteBannerClosedClient: "远程已关闭：已在本机关闭远程";
+    readonly remoteStatusUnshareConfirm: "关闭远程后，此会话将从本机的远程分组中移除，服务端上的会话不受影响。确定关闭？";
+    readonly remoteStatusOfflineClick: "服务端离线，无法操作";
+    readonly remoteStatusUnshareFail: "关闭远程失败，请稍后再试";
+    readonly remoteGroupOffline: "（离线）";
+    readonly remoteGroupRevoked: "（令牌已吊销）";
+    readonly remoteGroupUnpaired: "（已解除配对）";
+    readonly remoteGroupMismatch: "（版本有差异）";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

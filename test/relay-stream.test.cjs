@@ -1052,6 +1052,90 @@ test('T43-fix: resuming before the watchdog still finishes the response cleanly 
   } finally { await server.stop() }
 })
 
+// ---- T34: the structured close reason ---------------------------------------------------
+
+test('T34: the unshared error line carries reason idle (the automatic idle shutdown)', async () => {
+  const parts = makeParts('t34-reason-idle', { shared: ['session-a'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+    await waitFor(() => parts.streams.length === 1)
+    parts.store.unshare('session-a', 'idle')
+    await open.done
+    const errorLine = open.lines[open.lines.length - 1]
+    assert.equal(errorLine.type, 'error')
+    assert.equal(errorLine.error.code, 'unshared')
+    assert.equal(errorLine.error.reason, 'idle', 'the structured reason rides beside the message')
+    assert.match(errorLine.error.message, /session-a/, 'the message stays')
+  } finally { await server.stop() }
+})
+
+test('T34: the unshared error line carries reason client (closed from the desktop-client route)', async () => {
+  const parts = makeParts('t34-reason-client', { shared: ['session-a'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+    await waitFor(() => parts.streams.length === 1)
+    const close = await server.fetch('/_dsh/zen-remote/relay/v1/unshare', post('/u', { sessionId: 'session-a' }, AUTH))
+    assert.equal(close.status, 200)
+    await open.done
+    const errorLine = open.lines[open.lines.length - 1]
+    assert.equal(errorLine.type, 'error')
+    assert.equal(errorLine.error.code, 'unshared')
+    assert.equal(errorLine.error.reason, 'client')
+  } finally { await server.stop() }
+})
+
+test('T34: the unshared error line carries reason manual (server-side close)', async () => {
+  const parts = makeParts('t34-reason-manual', { shared: ['session-a'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+    await waitFor(() => parts.streams.length === 1)
+    parts.store.unshare('session-a', 'manual')
+    await open.done
+    const errorLine = open.lines[open.lines.length - 1]
+    assert.equal(errorLine.type, 'error')
+    assert.equal(errorLine.error.code, 'unshared')
+    assert.equal(errorLine.error.reason, 'manual')
+  } finally { await server.stop() }
+})
+
+test('T34: the pre-open gate (no event observed) degrades to reason manual', async () => {
+  // The probe-race shape: the session leaves the table while the request is
+  // still inside its ownership probe — no share-table listener existed yet,
+  // so the pre-open re-check closes the stream. No event means no certain
+  // reason: it reads as the manual close.
+  let releaseProbe = () => {}
+  const parts = makeParts('t34-reason-gate', {
+    shared: ['S'],
+    heartbeatMs: 60_000,
+    overrides: {
+      stream: (call, gate) => {
+        if (call.namespace === 'job' && call.method === 'list') {
+          releaseProbe = () => {
+            gate.push({ type: 'rows', jobs: [{ id: 'j1', owner: 'S', kind: 'process', label: 'j1', status: 'running', startedAt: 1, output: { total: 0, earliest: 0 } }] })
+            gate.finish()
+          }
+        }
+      },
+    },
+  })
+  const server = await startServer(parts.handler)
+  try {
+    const openPromise = openStream(server, { namespace: 'job', method: 'follow', args: { request: { sessionId: 'S', jobId: 'j1' } } })
+    await waitFor(() => parts.streams.length === 1)
+    parts.store.unshare('S', 'idle')
+    releaseProbe()
+    const open = await openPromise
+    await open.done
+    assert.equal(open.lines.length, 1)
+    assert.equal(open.lines[0].type, 'error')
+    assert.equal(open.lines[0].error.code, 'unshared')
+    assert.equal(open.lines[0].error.reason, 'manual', 'an eventless closure reads manual')
+  } finally { await server.stop() }
+})
+
 // ---- T32 (+T32-fix): the $zr/events forwarding subscription + event-result -------------
 
 const EVENTS_BODY = { namespace: '$zr', method: 'events', args: {} }
