@@ -157,6 +157,31 @@ test('filterSessionListResult: a result without an items array is returned as-is
   assert.equal(filterSessionListResult(null, no), null)
 })
 
+test('filterSessionListResult: a parentSessionId naming an inaccessible session is stripped from the row (CP4)', () => {
+  const result = {
+    items: [
+      { sessionId: 'S-shared', parentSessionId: 'S-secret', title: 'child of a hidden session' },
+      { sessionId: 'S-also', parentSessionId: 'S-shared', title: 'parent is visible' },
+      { sessionId: 'S-plain', title: 'no parent at all' },
+    ],
+    total: 3,
+  }
+  const input = snapshot(result)
+  const out = filterSessionListResult(result, only(['S-shared', 'S-also', 'S-plain']))
+  assert.deepEqual(out, {
+    items: [
+      { sessionId: 'S-shared', title: 'child of a hidden session' },
+      { sessionId: 'S-also', parentSessionId: 'S-shared', title: 'parent is visible' },
+      { sessionId: 'S-plain', title: 'no parent at all' },
+    ],
+    total: 3,
+  })
+  assert.deepEqual(result, input, 'the input result is untouched')
+  // An id the client may reach rides along as before — only the dangling,
+  // unreachable parent link is removed.
+  assert.equal(out.items[1].parentSessionId, 'S-shared')
+})
+
 // -- job/list (4b: ownerless jobs are server-side only) -----------------------------
 
 test('filterJobListFrame: rows keep only jobs owned by the claimed session', () => {
