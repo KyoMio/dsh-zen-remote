@@ -259,7 +259,13 @@ export type DispatchEnvelope =
  * `messageFeedback/put|delete`, the workspace session-list mutations, and
  * the T41a mutations (`goals/edit|pause|resume|clear`, `commands/execute`,
  * `agentPresets/select`, `sessionFeedback/record`,
- * `terminal/create|write|resize|rename|close`) — is a write.
+ * `terminal/create|write|resize|rename|close|follow`) — is a write.
+ * `terminal/follow` joined the write side (T41a-fix2): its attachment is
+ * NOT a pure read — RT dsh-api-terminal-controller follow: "Attach with
+ * exclusive input control; an older attachment becomes read-only" — so a
+ * follow flips which follower owns the terminal's input, and offline it
+ * must refuse like every other mutation instead of silently stealing
+ * control from a connection that is not there.
  */
 export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   'session/follow',
@@ -279,7 +285,11 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   // T41a reads: the goal bar read, the slash-command catalog, the @-session
   // candidates, workspace file listing / reads / stats and their change
   // stream, the terminal environment/shell catalog, the session's terminal
-  // list and its keep-alive/output streams.
+  // list and its keep-alive stream. `terminal/follow` is NOT here
+  // (T41a-fix2): its attachment takes over the terminal's input control
+  // ("an older attachment becomes read-only", RT dsh-api-terminal-controller
+  // follow), which is a state change — it sits on the write side and is
+  // refused remote-offline like every other mutation.
   'goals/get',
   'commands/list',
   'sessionReferenceResolver/candidates',
@@ -291,7 +301,6 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   'terminal/environment',
   'terminal/shells',
   'terminal/list',
-  'terminal/follow',
   'terminal/retain',
 ])
 
@@ -693,33 +702,16 @@ function mapStrings(value: unknown, map: (id: string) => string): unknown {
   return value.map((item) => (typeof item === 'string' ? map(item) : item))
 }
 
-/**
- * The canonical `dsh-session:` reference addresses, per RT
- * dsh-session-reference (lib/index.js): payload is
- * base64url(JSON.stringify(sessionId)) and the decode is CANONICAL —
- * re-encoding must reproduce the URI byte for byte, exactly what the host
- * parser demands before it treats an address as a reference. The relay
- * server carries the SAME two helpers (relay-server.ts) for its prompt-text
- * scan; the pair is pinned together by test.
- */
-const SESSION_REFERENCE_URI = /@\[(?:\\.|[^\\\]])*\]\((dsh-session:[^\s)]*)\)|(dsh-session:[A-Za-z0-9_-]+)/gu
-
-function encodeSessionReferenceUri(sessionId: string): string {
-  return `dsh-session:${Buffer.from(JSON.stringify(sessionId), 'utf8').toString('base64url')}`
-}
-
-function decodeSessionReferenceUri(uri: string): string | undefined {
-  const payload = uri.slice('dsh-session:'.length)
-  if (!/^[A-Za-z0-9_-]+$/.test(payload)) return undefined
-  try {
-    const parsed: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
-    if (typeof parsed !== 'string') return undefined
-    if (encodeSessionReferenceUri(parsed).slice('dsh-session:'.length) !== payload) return undefined
-    return parsed
-  } catch {
-    return undefined
-  }
-}
+// The `dsh-session:` codec and the shared scan rule (T41a-fix2): ONE module
+// serves both ends — the relay server scans these same positions
+// (relay-server.ts), so where a reference can hide is decided in exactly
+// one place.
+import {
+  SESSION_REFERENCE_URI,
+  decodeSessionReferenceUri,
+  encodeSessionReferenceUri,
+  mapReferenceTexts,
+} from './session-reference.js'
 
 /**
  * Swap the canonical URI inside one `@[label](dsh-session:…)` mention for
@@ -737,31 +729,36 @@ function rewriteMentionUri(mention: string, target: string): string | undefined 
 }
 
 /**
- * The prompt-text half of the reference discipline (T41a-fix): DSH injects
- * whatever a canonical `dsh-session:` address in the prompt names
- * (prepareDirectMessages → readSurface, no access check of its own), and
- * the relay server refuses addresses naming a session off its share table.
- * So before a prompt travels, every address carrying a virtual id of THIS
- * server is restored to the original id — and an address naming anything
- * else (a LOCAL session of this sub-client, another server's virtual id) is
- * a refusal: the server does not have that session. Non-canonical tokens
- * are left alone — the host parser throws its own business error on those.
- * Mutates the text blocks of the (already cloned) args in place; returns
- * `false` when the call must be refused.
+ * The prompt-text half of the reference discipline (T41a-fix, widened by
+ * T41a-fix2): DSH injects whatever a canonical `dsh-session:` address in an
+ * injectable text names (prepareDirectMessages → readSurface, no access
+ * check of its own), and the relay server refuses addresses naming a session
+ * off its share table. WHERE those texts live is the shared rule
+ * (session-reference.ts — prompt content, a queue EDIT's replacement
+ * content, every string of a commands/execute call): the same rule the
+ * server scans by, so the ends cannot drift. Before a call travels, every
+ * address carrying a virtual id of THIS server is restored to the original
+ * id — and an address naming anything else (a LOCAL session of this
+ * sub-client, another server's virtual id) is a refusal: the server does
+ * not have that session. Non-canonical tokens are left alone — the host
+ * parser throws its own business error on those. Returns the args to
+ * forward (clone-on-write) and whether the call may travel at all.
  */
-function restoreSessionReferences(value: unknown, serverId: string): boolean {
-  const request = isPlainObject(value) ? value.request : undefined
-  const content = isPlainObject(request) ? request.content : undefined
-  if (!Array.isArray(content)) return true
+function restoreSessionReferences(
+  args: unknown,
+  namespace: string,
+  method: string,
+  serverId: string,
+): { args: unknown; ok: boolean } {
   let ok = true
-  for (const block of content) {
-    if (!isPlainObject(block) || block.type !== 'text' || typeof block.text !== 'string') continue
+  const mapped = mapReferenceTexts(namespace, method, args, (text) => {
     const pieces: string[] = []
     let last = 0
-    for (const match of block.text.matchAll(SESSION_REFERENCE_URI)) {
+    let changed = false
+    for (const match of text.matchAll(SESSION_REFERENCE_URI)) {
       const uri = match[1] ?? match[2]
       const start = match.index ?? 0
-      pieces.push(block.text.slice(last, start))
+      pieces.push(text.slice(last, start))
       const id = uri === undefined ? undefined : decodeSessionReferenceUri(uri)
       if (uri === undefined || id === undefined) {
         // Not a reference the host would accept either — pass through.
@@ -772,17 +769,18 @@ function restoreSessionReferences(value: unknown, serverId: string): boolean {
           ok = false
           pieces.push(match[0])
         } else {
+          changed = true
           const restored = uri === match[0] ? encodeSessionReferenceUri(parts.id) : `${match[0].slice(0, match[0].length - uri.length - 1)}${encodeSessionReferenceUri(parts.id)})`
           pieces.push(restored)
         }
       }
       last = start + match[0].length
     }
-    pieces.push(block.text.slice(last))
-    const next = pieces.join('')
-    if (next !== block.text) block.text = next
-  }
-  return ok
+    if (!changed) return text
+    pieces.push(text.slice(last))
+    return pieces.join('')
+  })
+  return { args: mapped, ok }
 }
 
 /** Rewrite one stream frame's session ids to virtual form. */
@@ -1053,13 +1051,18 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
    * even be evaluated honestly (the verdict may predate the outage), so
    * `offline` wins; `connecting` / `incompatible` count as offline (both are
    * "not serving, recovery pending"). Back `online` the annotation is
-   * recomputed from the live state (T34-fix): the real relay client re-evaluates
-   * compat BEFORE the online transition lands, so a mismatch that survives the
-   * outage keeps its annotation, and a cleared one loses it — whichever way it
-   * goes, the change emits its title upserts right away, because the remote
-   * leg may NOT reopen at all (a 502/503/504 on some other call flips the
-   * state offline while the workspace/follow stream stays open; back online
-   * nothing reopens and no baseline would ever restore the titles).
+   * recomputed from the live state (T34-fix), with one caveat (T41a-fix2):
+   * the compat verdict itself is re-evaluated only on the RE-HANDSHAKE path
+   * (relay-client.ts connect() compares fingerprints just before its online
+   * transition) — an online flip that did not run a handshake (a stream or
+   * ping answering 200) keeps the stored verdict as-is. So a mismatch that
+   * survives the outage keeps its annotation either way, but a stale
+   * `none`/`mismatch` is corrected only when the recovery went through a
+   * real handshake — whichever way the annotation moves, the change emits
+   * its title upserts right away, because the remote leg may NOT reopen at
+   * all (a 502/503/504 on some other call flips the state offline while the
+   * workspace/follow stream stays open; back online nothing reopens and no
+   * baseline would ever restore the titles).
    */
   const annotationOf = (state: RelayState): MergerAnnotation => {
     if (state === 'revoked') return 'revoked'
@@ -1100,8 +1103,10 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
    * non-online state annotates 离线; back `online` the annotation is
    * recomputed (T34-fix) and any change emits its title upserts at once —
    * the stream may have survived the flap, so the reopened baseline cannot
-   * be relied on. A serverId change cuts the in-flight stream so the pump
-   * re-opens; a rename re-upserts the shown groups under the new title.
+   * be relied on. (The verdict behind a `mismatch` is re-evaluated only on
+   * the re-handshake path — T41a-fix2.) A serverId change cuts the
+   * in-flight stream so the pump re-opens; a rename re-upserts the shown
+   * groups under the new title.
    * Anything thrown here must never escape into the relay's listener loop. */
   const onState = (state: RelayState): void => {
     try {
@@ -1140,13 +1145,15 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
         return
       }
       // Same server back online (T34-fix): the annotation is RECOMPUTED from
-      // the live state — the real relay client re-evaluates compat before
-      // this transition lands, so a surviving mismatch keeps its annotation —
-      // and whatever changed emits its title upserts NOW: the remote leg may
-      // not reopen at all (the stream can survive a state flap), so the
-      // reopened baseline cannot be relied on to restore anything. When the
-      // leg DOES reopen, its baseline's upserts are a harmless refresh. A
-      // rename still rides its own path below.
+      // the live state — when the recovery went through a re-handshake, the
+      // relay client re-evaluated compat before this transition landed, so a
+      // surviving mismatch keeps its annotation and a cleared one loses it;
+      // an online flip WITHOUT a handshake (a stream/ping 200) keeps the
+      // stored verdict (T41a-fix2). Whatever changed emits its title upserts
+      // NOW: the remote leg may not reopen at all (the stream can survive a
+      // state flap), so the reopened baseline cannot be relied on to restore
+      // anything. When the leg DOES reopen, its baseline's upserts are a
+      // harmless refresh. A rename still rides its own path below.
       applyAnnotation(annotationOf(state))
       if (next.serverName !== merger.serverName) {
         // Rename: same server, new display name — no reopen, no removals;
@@ -1692,7 +1699,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     const namespace = slash === -1 ? endpoint : endpoint.slice(0, slash)
     const method = slash === -1 ? '' : endpoint.slice(slash + 1)
     try {
-      const clone = structuredClone(args)
+      let clone: unknown = structuredClone(args)
       restoreRegisteredFields(CLIENT_METHOD_FIELDS[endpoint], clone)
       // A remote create never names its own session id: DSH mints one, and
       // adopting a caller-chosen id (create's idempotent-adopt path) could
@@ -1702,12 +1709,17 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         const request = isPlainObject(clone) ? clone.request : undefined
         if (isPlainObject(request)) delete request.sessionId
       }
-      // T41a-fix: a prompt's text may carry canonical `dsh-session:`
-      // addresses — DSH injects whatever they name, and the relay refuses
-      // any address off its share table. Restore virtual ids inside the
-      // addresses; a reference to a LOCAL session (or any other server's)
-      // refuses the whole call — the server does not have that session.
-      if ((endpoint === 'session/prompt' || endpoint === 'subagents/prompt') && !restoreSessionReferences(clone, serverId)) {
+      // T41a-fix2: wherever an injectable text can carry canonical
+      // `dsh-session:` addresses — prompt content, a queue EDIT's
+      // replacement content, any string of a commands/execute call (the
+      // shared rule, session-reference.ts) — DSH injects what they name and
+      // the relay refuses any address off its share table. Restore virtual
+      // ids inside those addresses; a reference to a LOCAL session (or any
+      // other server's) refuses the whole call — the server does not have
+      // that session.
+      const references = restoreSessionReferences(clone, namespace, method, serverId)
+      clone = references.args
+      if (!references.ok) {
         return failEnvelope(endpoint, 'remote-unsupported', '引用的会话不在服务端上，无法转发')
       }
       const value = await relay.invoke(namespace, method, clone, signal)

@@ -242,6 +242,8 @@ export declare const zh: {
     readonly remoteStatusRevoked: "令牌已吊销，请在设置页重新配对";
     readonly remoteStatusUnpaired: "已解除配对";
     readonly remoteBannerOffline: "服务端离线，远程会话暂时只读，恢复连接后自动可用";
+    readonly remoteBannerRevoked: "令牌已吊销，请在设置页重新配对";
+    readonly remoteBannerUnpaired: "已解除配对";
     readonly remoteBannerClosedIdle: "远程已关闭：闲置超过设定时间，已自动休眠";
     readonly remoteBannerClosedManual: "远程已关闭：服务端已关闭此会话的远程";
     readonly remoteBannerClosedClient: "远程已关闭：已在本机关闭远程";

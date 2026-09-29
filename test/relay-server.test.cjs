@@ -964,3 +964,68 @@ test('T41a-fix subagents/prompt references get the same share check', async () =
     assert.equal(parts.calls.length, 1)
   } finally { await server.stop() }
 })
+
+// ---- T41a-fix2: the two prompt-scan bypasses ---------------------------------------
+
+test('T41a-fix2 updateQueue: an edit content referencing an unshared session refuses before the gateway', async () => {
+  // The PoC: updateQueue's edit REPLACES a queued USER message's content
+  // verbatim (RT dsh-api-session-controller updateQueue), and
+  // prepareDirectMessages parses that content at the next turn start — so
+  // the edit content is a prompt-text sibling, not opaque data.
+  const parts = makeParts('t41a-fix2-queue')
+  parts.store.share('session-a')
+  parts.store.share('session-b')
+  const server = await startServer(parts.handler)
+  const update = (action) => ({
+    namespace: 'session',
+    method: 'updateQueue',
+    args: { request: { sessionId: 'session-a', itemId: 'q1', action } },
+  })
+  try {
+    const poc = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', update({ kind: 'edit', content: [{ type: 'text', text: `重新组织 ${encodeSessionReferenceUri('session-secret')}` }] }), AUTH))
+    assert.equal(poc.status, 403, 'the poisoned edit refuses')
+    assert.deepEqual(await poc.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 0, 'it never reached the gateway')
+
+    // An edit naming an accessible session travels verbatim — the relay
+    // only checks, never rewrites.
+    const okAction = update({ kind: 'edit', content: [{ type: 'text', text: `对照 ${encodeSessionReferenceUri('session-b')}` }] })
+    const ok = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', okAction, AUTH))
+    assert.equal(ok.status, 200)
+    assert.deepEqual(parts.calls[0].args, okAction.args)
+
+    // steer/remove carry no content the host would inject (RT updateQueue
+    // reads action.content only under 'edit' — steer re-sends the STORED
+    // message), so junk references there are not the relay's business.
+    const steer = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', update({ kind: 'steer', content: [{ type: 'text', text: encodeSessionReferenceUri('session-secret') }] }), AUTH))
+    assert.equal(steer.status, 200, 'the host ignores this content for steer')
+    assert.equal(parts.calls.length, 2)
+  } finally { await server.stop() }
+})
+
+test('T41a-fix2 commands/execute: an unshared reference anywhere in the arguments refuses', async () => {
+  // The PoC: /plan steers its raw input in as a fresh USER message (RT
+  // dsh-plan-mode, agent.steer(createUserMessage(…))) — parsed exactly like
+  // prompt text at the next turn start. The scan is RECURSIVE over every
+  // string in the arguments, keyed on no field name.
+  const parts = makeParts('t41a-fix2-commands')
+  parts.store.share('session-a')
+  const server = await startServer(parts.handler)
+  const execute = (args) => ({ namespace: 'commands', method: 'execute', args })
+  try {
+    const poc = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', execute({ agentId: 'session-a', line: `/plan ${encodeSessionReferenceUri('session-secret')}` }), AUTH))
+    assert.equal(poc.status, 403, 'the poisoned /plan refuses')
+    assert.deepEqual(await poc.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 0, 'it never reached the gateway')
+
+    // A reference hidden in a nested NON-line string refuses too.
+    const hidden = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', execute({ agentId: 'session-a', line: '/plan ok', extra: { deep: [`看看 ${encodeSessionReferenceUri('session-secret')}`] } }), AUTH))
+    assert.equal(hidden.status, 403)
+    assert.equal(parts.calls.length, 0)
+
+    // An accessible reference (and a plain command line) travels.
+    const ok = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', execute({ agentId: 'session-a', line: `/plan ${encodeSessionReferenceUri('session-a')}` }), AUTH))
+    assert.equal(ok.status, 200)
+    assert.equal(parts.calls.length, 1)
+  } finally { await server.stop() }
+})

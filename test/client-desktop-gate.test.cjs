@@ -510,6 +510,15 @@ test('T34: bannerText — the closed reason outranks the offline line; online an
   assert.equal(bannerText(undefined, session, t), undefined)
   // an unknown reason in the closed map degrades to the manual close
   assert.equal(bannerText(view({ closed: { [session]: 'mystery' } }), session, t), '#remoteBannerClosedManual')
+  // T41a-fix2: revoked / unpaired stand a banner of their own (and disable
+  // the input through it) — neither recovers without the settings page
+  assert.equal(bannerText(view({ state: 'revoked' }), session, t), '#remoteBannerRevoked')
+  assert.equal(bannerText(view({ state: 'unpaired' }), session, t), '#remoteBannerUnpaired')
+  // a session-level closure still outranks the link-level states
+  assert.equal(bannerText(view({ state: 'revoked', closed: { [session]: 'idle' } }), session, t), '#remoteBannerClosedIdle')
+  // the default formatter is the Chinese dictionary
+  assert.equal(bannerText(view({ state: 'revoked' }), session), '令牌已吊销，请在设置页重新配对')
+  assert.equal(bannerText(view({ state: 'unpaired' }), session), '已解除配对')
 })
 
 test('T34: the store polls only with subscribers and only while visible; failures fail one round', async () => {

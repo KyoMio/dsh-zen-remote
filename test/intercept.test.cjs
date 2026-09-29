@@ -2523,10 +2523,95 @@ test('subagents/prompt references restore the same way (T41a-fix)', async () => 
   handle.uninstall()
 })
 
-test('the relay server and the interceptor implement the SAME dsh-session codec (T41a-fix)', () => {
-  // Both ends must decode byte-identically or a restored address would fail
-  // the server's canonical check. The server's exports are the reference;
-  // the interceptor's own copy is exercised through the forward tests above.
+test('updateQueue edit content restores references like prompt text (T41a-fix2)', async () => {
+  // The edit REPLACES a queued user message's content (RT updateQueue), so
+  // its text is parsed at the next turn start exactly like prompt text —
+  // the restore must cover it, not just the prompt routes.
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const enc = encodeSessionReferenceUri
+  const envelope = await gateway.rpcBridge('session/updateQueue', {
+    args: { request: { sessionId: VIRTUAL_ID, itemId: 'q1', action: { kind: 'edit', content: [{ type: 'text', text: `改后 ${enc(toVirtual(SERVER_ID, 'session-b'))}` }] } } },
+  }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(relay.invokes[0].args.request.action.content[0].text, `改后 ${enc('session-b')}`, 'the edit content carries the ORIGINAL id')
+  assert.equal(relay.invokes[0].args.request.sessionId, LOCAL_ID, 'the registered-field restore still ran')
+
+  // A reference to a LOCAL session refuses the whole call, same rule.
+  const local = await gateway.rpcBridge('session/updateQueue', {
+    args: { request: { sessionId: VIRTUAL_ID, itemId: 'q2', action: { kind: 'edit', content: [{ type: 'text', text: `本地结论 ${enc('session-local-uuid')}` }] } } },
+  }, undefined, undefined)
+  assert.equal(local.ok, false)
+  assert.equal(local.error.code, 'remote-unsupported')
+  assert.equal(relay.invokes.length, 1, 'the refused edit never traveled')
+  handle.uninstall()
+})
+
+test('commands/execute strings restore /plan references; a local one refuses (T41a-fix2)', async () => {
+  // /plan steers its raw input in as a fresh USER message (RT
+  // dsh-plan-mode), so EVERY string of a commands/execute call is scanned —
+  // not just the line field.
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const enc = encodeSessionReferenceUri
+  const envelope = await gateway.rpcBridge('commands/execute', {
+    args: { agentId: VIRTUAL_ID, line: `/plan ${enc(toVirtual(SERVER_ID, 'session-c'))}` },
+  }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(relay.invokes[0].args.line, `/plan ${enc('session-c')}`, 'the line carries the ORIGINAL id')
+  assert.equal(relay.invokes[0].args.agentId, LOCAL_ID, 'the registered-field restore still ran')
+
+  // The scan is recursive: a reference in a nested non-line string is
+  // restored the same way.
+  await gateway.rpcBridge('commands/execute', {
+    args: { agentId: VIRTUAL_ID, line: '/plan ok', extra: { deep: [`看看 ${enc(toVirtual(SERVER_ID, 'session-d'))}`] } },
+  }, undefined, undefined)
+  assert.deepEqual(relay.invokes[1].args.extra.deep[0], `看看 ${enc('session-d')}`)
+
+  // A reference to a LOCAL session refuses the whole call.
+  const local = await gateway.rpcBridge('commands/execute', {
+    args: { agentId: VIRTUAL_ID, line: `/plan ${enc('session-local-uuid')}` },
+  }, undefined, undefined)
+  assert.equal(local.ok, false)
+  assert.equal(local.error.code, 'remote-unsupported')
+  assert.equal(relay.invokes.length, 2, 'the refused command never traveled')
+  handle.uninstall()
+})
+
+test('both ends share ONE codec and ONE scan rule module (T41a-fix2)', () => {
+  // T41a-fix kept two private copies pinned by this test; T41a-fix2 moved
+  // the codec and the scan rule into src/session-reference.ts, imported by
+  // BOTH ends — the pin is now the import itself, plus the re-export
+  // identity on the server surface.
+  const shared = require('../lib/session-reference.js')
+  const server = require('../lib/relay-server.js')
+  assert.equal(server.encodeSessionReferenceUri, shared.encodeSessionReferenceUri, 'the server surface IS the shared codec')
+  assert.equal(server.decodeSessionReferenceUri, shared.decodeSessionReferenceUri)
+  // The rule itself answers for exactly the three injection surfaces.
+  const enc = shared.encodeSessionReferenceUri
+  const prompt = { request: { sessionId: 's', content: [{ type: 'text', text: `a ${enc('p1')}` }] } }
+  assert.deepEqual(shared.collectReferenceTexts('session', 'prompt', prompt), [`a ${enc('p1')}`])
+  assert.deepEqual(shared.collectReferenceTexts('subagents', 'prompt', prompt), [`a ${enc('p1')}`])
+  const queue = { request: { sessionId: 's', action: { kind: 'edit', content: [{ type: 'text', text: `b ${enc('q1')}` }] } } }
+  assert.deepEqual(shared.collectReferenceTexts('session', 'updateQueue', queue), [`b ${enc('q1')}`])
+  const steer = { request: { sessionId: 's', action: { kind: 'steer', content: [{ type: 'text', text: `c ${enc('q2')}` }] } } }
+  assert.deepEqual(shared.collectReferenceTexts('session', 'updateQueue', steer), [], 'steer carries no injectable content')
+  const command = { agentId: 's', line: `/plan ${enc('c1')}`, extra: { deep: [`d ${enc('c2')}`] } }
+  assert.deepEqual(shared.collectReferenceTexts('commands', 'execute', command), ['s', `/plan ${enc('c1')}`, `d ${enc('c2')}`], 'every string, recursively — field names play no role')
+  assert.deepEqual(shared.collectReferenceTexts('session', 'rename', { request: { sessionId: 's', title: `${enc('x')}` } }), [], 'other methods contribute nothing')
+  // And neither end keeps a private copy: both import the shared module.
+  for (const file of ['src/intercept.ts', 'src/relay-server.ts']) {
+    const source = fs.readFileSync(path.join(__dirname, '..', file), 'utf8')
+    assert.ok(source.includes("from './session-reference.js'"), `${file} must import the shared codec/rule`)
+    assert.ok(!/const SESSION_REFERENCE_URI|function decodeSessionReferenceUri/.test(source), `${file} must not re-define the codec`)
+  }
+})
+
+test('the shared codec round-trips the host shapes (T41a-fix)', () => {
+  // Both ends decode byte-identically by construction now (one module); what
+  // still needs pinning is the WIRE shape against the host encoder.
   for (const id of ['session-a', toVirtual(SERVER_ID, 'session-b'), '含中文与~/字符', '"quoted"']) {
     const uri = encodeSessionReferenceUri(id)
     assert.ok(uri.startsWith('dsh-session:'))
@@ -2639,6 +2724,10 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
     'terminal/resize',
     'terminal/rename',
     'terminal/close',
+    // T41a-fix2: follow ATTACHES with exclusive input control ("an older
+    // attachment becomes read-only", RT dsh-api-terminal-controller) — a
+    // state change, refused offline like every other mutation.
+    'terminal/follow',
   ])
   for (const endpoint of Object.keys(CLIENT_METHOD_FIELDS)) {
     assert.ok(

@@ -84,6 +84,7 @@ function startClientServer(row, overrides = {}) {
     ...(overrides.fetchImpl !== undefined ? { fetchImpl: overrides.fetchImpl } : {}),
     ...(overrides.getRelayClient !== undefined ? { getRelayClient: overrides.getRelayClient } : {}),
     ...(overrides.getIntercept !== undefined ? { getIntercept: overrides.getIntercept } : {}),
+    ...(overrides.remoteStatusOnly !== undefined ? { remoteStatusOnly: overrides.remoteStatusOnly } : {}),
   })
   const server = http.createServer((req, res) => { void handler(req, res) })
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })))
@@ -1224,4 +1225,38 @@ test('T34 client/unshare: a relay failure travels with its code', async () => {
     assert.equal(body.ok, false)
     assert.equal(body.error.code, 'not-shared')
   } finally { await closeServer(server) }
+})
+
+test('T41a-fix2 remoteStatusOnly: the host mount serves remote-status alone — the pairing routes answer 404', async () => {
+  const row = makeRow()
+  // The remote-status route stays (the T34 parts poll it on either role),
+  // admission still runs first, and its empty no-relay conclusion is intact.
+  const { server, port } = await startClientServer(row, { remoteStatusOnly: true })
+  try {
+    const status = await request(port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })
+    assert.equal(status.status, 200)
+    assert.deepEqual(JSON.parse(status.body), { state: 'unpaired', versionMismatch: false, serverName: '', closed: {} })
+  } finally { await closeServer(server) }
+
+  const unadmitted = await startClientServer(row, { remoteStatusOnly: true, admit: () => ({ rejection: 401 }) })
+  try {
+    const refused = await request(unadmitted.port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })
+    assert.equal(refused.status, 401, 'admit still runs before the route gate')
+  } finally { await closeServer(unadmitted.server) }
+
+  // Every other route under the prefix answers the unknown-path 404 — the
+  // claim surface in particular must not exist on a host.
+  const second = await startClientServer(row, { remoteStatusOnly: true })
+  try {
+    for (const [method, route, body] of [
+      ['POST', routes.CLIENT_CLAIM_ROUTE, { serverUrl: gwUrl, code: '123456', name: 'x' }],
+      ['GET', routes.CLIENT_STATUS_ROUTE],
+      ['POST', routes.CLIENT_RECONNECT_ROUTE, {}],
+      ['POST', routes.CLIENT_UNSHARE_ROUTE, { sessionId: T34_VIRTUAL }],
+    ]) {
+      const res = await request(second.port, { method, path: route, headers: sameOrigin(second.port), ...(body !== undefined ? { body } : {}) })
+      assert.equal(res.status, 404, `${method} ${route}`)
+      assert.equal(JSON.parse(res.body).error.code, 'not-found')
+    }
+  } finally { await closeServer(second.server) }
 })
