@@ -156,8 +156,10 @@ export type InvokeFilter = 'session-list' | 'session-reference-candidates'
 interface RelayMethod {
   /** Every field that carries session ownership for this method. ALL of
    * them must exist, be strings, and pass the share-table check. Global
-   * entries (`workspace/follow`, `session/control`, `session/list`) own no
-   * field — reachability is enforced by filtering their output instead. */
+   * entries (`workspace/follow`, `session/control`, `session/list`,
+   * `session/modelCatalog`) own no field — reachability is enforced by
+   * filtering their output instead (modelCatalog is the one whose result
+   * needs no filter: it carries no session data at all). */
   fields: SessionField[]
   /** Stream-delivered methods (`mode: 'stream'` in the wire inventory):
    * callable ONLY through the streaming route — an invoke carrying one is
@@ -277,6 +279,14 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   // session/* — the global control stream and the unscoped list
   'session/control': { fields: [], stream: true, streamFilter: 'control' },
   'session/list': { fields: [], resultFilter: 'session-list' },
+  // T52: the global model catalog — NO parameters at all (RT
+  // dsh-api-session-controller lib/typert.remote-client.js:1014-1027,
+  // `parameters: []`), and its result is the server's provider directory
+  // `{default, routableProviders, groups, failures}` — group/model ids and
+  // display names only, nothing session-scoped (the schema is at
+  // lib/typert.remote-client.js:489-518). Field-less like session/list, but
+  // no result filter: there is nothing in it to narrow.
+  'session/modelCatalog': { fields: [] },
   // job/*
   'job/list': { fields: ['request.sessionId'], stream: true },
   'job/follow': { fields: ['request.sessionId'], stream: true },

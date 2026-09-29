@@ -2039,10 +2039,15 @@ test('merged $events: a remote death keeps the local stream alive, the next onli
   assert.deepEqual(next, { type: 'emit', event: 'settings/document-updated', args: [] })
 
   // The reconnect lands online: the leg reopens and pending events arrive again.
+  // This 'online' lands without the state ever leaving online (a test-double
+  // artifact — the real client notifies on state changes only), and being the
+  // stream's FIRST online notification it fires the T52 catalog-refresh emit
+  // ahead of the reopened leg's frames.
   relay.transition('online')
   await waitForStream(relay, 2)
   relay.streams[1].gate.push(SERVER_WATERFALL)
-  const [waterfall] = await readSome(iterator, 1)
+  const [refresh, waterfall] = await readSome(iterator, 2)
+  assert.deepEqual(refresh, { type: 'emit', event: 'llm/adapters-updated', args: [] })
   assert.equal(waterfall.eventId, V_REMOTE_EVENT)
   await iterator.return?.(undefined)
 })
@@ -2067,7 +2072,10 @@ test('merged $events: unpaired ends the remote leg until a re-pair; local keeps 
   relay.transition('online')
   await waitForStream(relay, 2)
   relay.streams[1].gate.push(SERVER_WATERFALL)
-  const [again] = await readSome(iterator, 1)
+  // The re-pair is a REAL serving transition (revoked → online): the T52
+  // catalog-refresh emit precedes the reopened leg's frames.
+  const [refresh, again] = await readSome(iterator, 2)
+  assert.deepEqual(refresh, { type: 'emit', event: 'llm/adapters-updated', args: [] })
   assert.equal(again.eventId, V_REMOTE_EVENT)
   await iterator.return?.(undefined)
 
@@ -2099,8 +2107,11 @@ test('merged $events: a handshake that names another server reopens under the ne
   await waitForStream(relay, 2)
   assert.equal(relay.streams[1].aborted, false)
   relay.streams[1].gate.push(SERVER_WATERFALL)
-  // The cut leg closes the prompt it showed BEFORE the new leg speaks.
-  const [orphanCancel, frame] = await readSome(iterator, 2)
+  // The cut leg closes the prompt it showed BEFORE the new leg speaks; the
+  // identity change also emitted the T52 catalog-refresh emit first (the
+  // state listener runs synchronously, the pump's orphan cancels after).
+  const [renamed, orphanCancel, frame] = await readSome(iterator, 3)
+  assert.deepEqual(renamed, { type: 'emit', event: 'llm/adapters-updated', args: [] })
   assert.deepEqual(orphanCancel, { type: 'cancel', eventId: V_REMOTE_EVENT })
   assert.equal(frame.agentId, toVirtual('ffffffff', LOCAL_ID))
   assert.equal(frame.eventId, toVirtual('ffffffff', 'a1b2c3d4e5f60718.evt-remote-1'))
@@ -2267,11 +2278,15 @@ test('merged $events T32-fix: a dying leg closes every prompt it showed, a remot
   assert.deepEqual(orphan, { type: 'cancel', eventId: V_REMOTE_EVENT })
 
   // The reopen re-delivers the still-pending event (fresh leg, fresh
-  // record): the prompt legitimately comes back.
+  // record): the prompt legitimately comes back. The first 'online' this
+  // stream sees also fires the T52 catalog-refresh emit (the fake notifies
+  // without a real state change — in production the recovery transition
+  // offline→online is exactly when the refresh belongs).
   relay.transition('online')
   await waitForStream(relay, 2)
   relay.streams[1].gate.push(SERVER_WATERFALL)
-  const [again] = await readSome(iterator, 1)
+  const [refresh, again] = await readSome(iterator, 2)
+  assert.deepEqual(refresh, { type: 'emit', event: 'llm/adapters-updated', args: [] })
   assert.equal(again.eventId, V_REMOTE_EVENT)
   await iterator.return?.(undefined)
 })
@@ -2296,9 +2311,11 @@ test('merged $events T32-fix: a real cancel clears the record — a leg end does
   gate.throwNow(new RelayError('offline', 'gone'))
   relay.transition('online')
   await new Promise((resolve) => setTimeout(resolve, 50))
-  // Prove liveness and the absence of a second cancel with a local frame.
+  // Prove liveness and the absence of a second cancel with a local frame —
+  // behind the T52 refresh emit this stream's first 'online' produced.
   localGate.push(LOCAL_WATERFALL)
-  const [local] = await readSome(iterator, 1)
+  const [refresh, local] = await readSome(iterator, 2)
+  assert.deepEqual(refresh, { type: 'emit', event: 'llm/adapters-updated', args: [] })
   assert.deepEqual(local, LOCAL_WATERFALL, 'no synthesized cancel arrived after the real one')
   await iterator.return?.(undefined)
 })
@@ -2318,6 +2335,251 @@ test('merged $events T32-fix: a repeat waterfall within one leg is not re-shown'
   const [local] = await readSome(iterator, 1)
   assert.deepEqual(local, LOCAL_WATERFALL, 'the duplicate never arrived between the frames')
   await iterator.return?.(undefined)
+})
+
+// -- T52: the model catalog, the model selection, and the provider-bearing results ----
+
+const LOCAL_CATALOG = {
+  default: { provider: 'deepseek-account', model: 'deepseek-v4-pro' },
+  routableProviders: ['deepseek-account', 'openai-custom'],
+  groups: [
+    { id: 'deepseek-account', name: 'DeepSeek 账号', models: [{ id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' }] },
+    { id: 'openai-custom', name: 'OpenAI 中转', models: [{ id: 'gpt-5.6', name: 'GPT-5.6' }] },
+  ],
+  failures: [{ id: 'broken', name: '坏的分组', message: 'boom' }],
+}
+const SERVER_CATALOG = {
+  default: { provider: 'codex', model: 'gpt-5.6-sol' },
+  routableProviders: ['codex'],
+  groups: [{ id: 'codex', name: 'Codex', models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }] }],
+  failures: [{ id: 'server-broken', name: '服务端坏的', message: '远端坏了' }],
+}
+
+test('T52: session/modelCatalog merges the relay groups behind the local ones; offline and remote failures answer the local result', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  gateway.spec.rpc = { 'session/modelCatalog': { ok: true, value: LOCAL_CATALOG } }
+  relay.invokeValue = SERVER_CATALOG
+  const { handle } = install(gateway, relay)
+
+  const envelope = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  const merged = envelope.value
+  // Local groups first, verbatim; the server group appended after with the
+  // virtual group id and the server-prefixed name, its models untouched.
+  assert.deepEqual(merged.groups[0], LOCAL_CATALOG.groups[0])
+  assert.deepEqual(merged.groups[1], LOCAL_CATALOG.groups[1])
+  assert.deepEqual(merged.groups[2], {
+    id: toVirtual(SERVER_ID, 'codex'),
+    name: '测试服务器 · Codex',
+    models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }],
+  })
+  // default and failures stay LOCAL (server failures never alarm the
+  // dropdown); routableProviders mirrors the merged group ids.
+  assert.deepEqual(merged.default, LOCAL_CATALOG.default)
+  assert.deepEqual(merged.failures, LOCAL_CATALOG.failures)
+  assert.deepEqual(merged.routableProviders, ['deepseek-account', 'openai-custom', toVirtual(SERVER_ID, 'codex')])
+  // One relay invoke, parameterless.
+  assert.deepEqual(relay.invokes, [{ namespace: 'session', method: 'modelCatalog', args: {}, signal: undefined }])
+
+  // A failed remote call degrades to the local catalog and records a ring
+  // entry — a dead link must never take the model picker down.
+  relay.invokeThrow = new RelayError('offline', '链路断了')
+  const fallback = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.deepEqual(fallback.value, LOCAL_CATALOG)
+  assert.equal(handle.diagnostics().recentFailures.at(-1).code, 'offline')
+
+  // Offline (or never handshook) answers the local result without asking.
+  relay.invokeThrow = undefined
+  relay.transition('offline')
+  const offlineAnswer = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.deepEqual(offlineAnswer.value, LOCAL_CATALOG)
+  assert.equal(relay.invokes.length, 2)
+  handle.uninstall()
+})
+
+test('T52: session/selectModel routes the provider by session context', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { selected: { provider: 'codex', model: 'gpt-5.6-sol' } }
+  const { handle } = install(gateway, relay)
+
+  // Remote session + the server's own group → the provider travels restored
+  // to the original id, and the echoed selection comes back virtual.
+  const remote = await gateway.rpcBridge(
+    'session/selectModel',
+    { args: { request: { sessionId: VIRTUAL_ID, provider: toVirtual(SERVER_ID, 'codex'), model: 'gpt-5.6-sol' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(remote.ok, true)
+  assert.deepEqual(relay.invokes[0].args, { request: { sessionId: LOCAL_ID, provider: 'codex', model: 'gpt-5.6-sol' } })
+  assert.deepEqual(remote.value, { selected: { provider: toVirtual(SERVER_ID, 'codex'), model: 'gpt-5.6-sol' } })
+
+  // Remote session + a LOCAL group → refused with the server's name in the
+  // message; the relay is never asked.
+  const refused = await gateway.rpcBridge(
+    'session/selectModel',
+    { args: { request: { sessionId: VIRTUAL_ID, provider: 'deepseek-account', model: 'deepseek-v4-pro' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(refused.ok, false)
+  assert.equal(refused.error.code, 'remote-unsupported')
+  assert.match(refused.error.message, /测试服务器/)
+  assert.deepEqual(refused.error.details, {})
+  assert.equal(relay.invokes.length, 1)
+
+  // Local session + a virtual group → refused before the local gateway sees it.
+  const localRefused = await gateway.rpcBridge(
+    'session/selectModel',
+    { args: { request: { sessionId: LOCAL_ID, provider: toVirtual(SERVER_ID, 'codex'), model: 'gpt-5.6-sol' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(localRefused.ok, false)
+  assert.equal(localRefused.error.code, 'remote-unsupported')
+  assert.ok(gateway.rpcCalls.every((call) => call.endpoint !== 'session/selectModel' || call !== undefined), 'no local dispatch of a refused call')
+
+  // Local session + local group → the plain local call, byte-for-byte.
+  const localArgs = { args: { request: { sessionId: LOCAL_ID, provider: 'deepseek-account', model: 'deepseek-v4-pro' } } }
+  await gateway.rpcBridge('session/selectModel', localArgs, undefined, undefined)
+  assert.deepEqual(gateway.rpcCalls.at(-1).payload, localArgs)
+
+  // Another server's group for this server's session → remote-mismatch.
+  const mismatch = await gateway.rpcBridge(
+    'session/selectModel',
+    { args: { request: { sessionId: VIRTUAL_ID, provider: toVirtual('ffffffff', 'codex'), model: 'x' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(mismatch.ok, false)
+  assert.equal(mismatch.error.code, 'remote-mismatch')
+
+  // A session of ANOTHER server → the generic path's mismatch verdict (this
+  // route steps aside — the sessionId is the registered field there).
+  const wrongServer = await gateway.rpcBridge(
+    'session/selectModel',
+    { args: { request: { sessionId: toVirtual('ffffffff', 's'), provider: 'deepseek-account', model: 'm' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(wrongServer.ok, false)
+  assert.equal(wrongServer.error.code, 'remote-mismatch')
+  handle.uninstall()
+})
+
+test('T52: remote projections, pages and follow snapshots carry the virtual group id; local results stay verbatim', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const selection = {
+    lastUsed: { provider: 'codex', model: 'gpt-5.6-sol' },
+    next: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+  }
+  relay.invokeValue = { asOfSeq: 7, values: { modelSelection: selection, title: '远端' } }
+  const { handle } = install(gateway, relay)
+
+  // session/projections: the modelSelection value's providers go virtual,
+  // its models and the other projection values stay verbatim.
+  const projections = await gateway.rpcBridge('session/projections', { args: { request: { sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  assert.deepEqual(projections.value.values.modelSelection, {
+    lastUsed: { provider: toVirtual(SERVER_ID, 'codex'), model: 'gpt-5.6-sol' },
+    next: { provider: toVirtual(SERVER_ID, 'codex'), model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+  })
+  assert.equal(projections.value.values.title, '远端')
+
+  // session/page: the same rewrite inside the page's projections block; the
+  // raw journal records (model/selection events included) are untouched.
+  relay.invokeValue = { records: [{ type: 'event', event: { type: 'model/selection', seq: 2, time: 1, data: selection } }], hasMore: false, projections: { asOfSeq: 3, values: { modelSelection: selection } } }
+  const page = await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
+  assert.equal(page.value.projections.values.modelSelection.next.provider, toVirtual(SERVER_ID, 'codex'))
+  assert.deepEqual(page.value.records, relay.invokeValue.records)
+
+  // session/follow: the snapshot seeds the projection store — its
+  // projections block rewrites; the header and the raw event frames do not.
+  relay.streamFrames = [
+    { type: 'snapshot', header: { version: 4, id: LOCAL_ID }, cursor: 5, hasMore: false, projections: { asOfSeq: 5, values: { modelSelection: selection } } },
+    { type: 'event', event: { type: 'model/selection', seq: 6, time: 2, data: { provider: 'codex', model: 'gpt-5.6-sol' } } },
+  ]
+  const frames = await drained(gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined }))
+  assert.equal(frames[0].header.id, VIRTUAL_ID)
+  assert.equal(frames[0].projections.values.modelSelection.lastUsed.provider, toVirtual(SERVER_ID, 'codex'))
+  assert.equal(frames[0].projections.values.modelSelection.next.provider, toVirtual(SERVER_ID, 'codex'))
+  assert.deepEqual(frames[1].event.data, { provider: 'codex', model: 'gpt-5.6-sol' }, 'event bodies keep their own ids')
+
+  // The LOCAL half of the same routes never passes through these rewrites:
+  // a local session's page result reaches the gateway verbatim (the wrapper
+  // only answers calls it forwards) — proven by the relay not being asked
+  // and the local call carrying the original payload.
+  const localArgs = { args: { request: { address: { kind: 'session', sessionId: LOCAL_ID } } } }
+  await gateway.rpcBridge('session/page', localArgs, undefined, undefined)
+  assert.deepEqual(gateway.rpcCalls.at(-1).payload, localArgs)
+  assert.equal(relay.invokes.length, 2)
+  handle.uninstall()
+})
+
+test('T52: the merged $events leg emits the catalog-refresh frame on serving transitions, deduped per identity, deferred past the local ready', async () => {
+  const REFRESH = { type: 'emit', event: 'llm/adapters-updated', args: [] }
+  // Deferred: the relay is ALREADY online when the stream opens, but the
+  // state listener never ran — the refresh comes from the first transition,
+  // after the local ready frame.
+  const relay = createControllableRelay()
+  const { localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  const [ready] = await readSome(iterator, 1)
+  assert.equal(ready.type, 'ready')
+  await waitForStream(relay, 1)
+  relay.transition('offline')
+  relay.transition('online')
+  const [refresh] = await readSome(iterator, 1)
+  assert.deepEqual(refresh, REFRESH, 'the offline→online transition refreshed the catalog')
+
+  // Continuous serving period: a redundant online notification refreshes
+  // nothing (the real client notifies on state changes only), and the next
+  // real offline→online pair refreshes exactly once more. A mere offline
+  // does NOT cut the remote leg (only unpaired/revoked do), so the frames
+  // still ride the original gate.
+  relay.transition('online')
+  relay.transition('offline')
+  relay.transition('online')
+  console.error('[dbg] before second-outage readSome')
+  relay.streams[0].gate.push(SERVER_WATERFALL)
+  const [second, waterfall] = await readSome(iterator, 2)
+  console.error('[dbg] after second-outage readSome')
+  assert.deepEqual(second, REFRESH, 'the second outage refreshed once')
+  assert.equal(waterfall.eventId, V_REMOTE_EVENT)
+
+  // A rename while serving refreshes under the new identity.
+  relay.handshakeInfo = { ...relay.handshakeInfo, serverName: '改名服务器' }
+  relay.transition('offline')
+  relay.transition('online')
+  const [renamedRefresh] = await readSome(iterator, 1)
+  assert.deepEqual(renamedRefresh, REFRESH)
+  await iterator.return?.(undefined)
+
+  // A transition landing BEFORE the local ready is deferred: the emit may
+  // only leave after the `ready` the UI's pump validates first. The first
+  // next() call starts the generator body on the microtask queue (async
+  // generators resume asynchronously — the transitions must wait out one
+  // macrotask so the state listener is actually registered).
+  const cold = createControllableRelay()
+  const coldOpen = await openMergedEvents(cold)
+  // The FIRST next() starts the generator body (async generators resume on
+  // the microtask queue — the transitions below must wait out one macrotask
+  // so the state listener is registered). That same request is kept as the
+  // reader of the first frame: async-generator requests are served FIFO, so
+  // leaving it pending beside readSome's would steal the ready frame.
+  const first = coldOpen.iterator.next()
+  await new Promise((resolve) => setImmediate(resolve))
+  cold.transition('offline')
+  cold.transition('online')
+  coldOpen.localGate.push(READY)
+  const coldReady = await first
+  assert.equal(coldReady.done, false)
+  assert.equal(coldReady.value.type, 'ready')
+  const deferred = await coldOpen.iterator.next()
+  assert.deepEqual(deferred.value, REFRESH, 'the pre-ready refresh left after the ready frame')
+  await coldOpen.iterator.return?.(undefined)
 })
 
 // -- T41a: the panel long tail — goals, commands, presets, @ candidates, feedback,
@@ -3194,12 +3456,15 @@ test('CP5: a waterfall the aborted $events generation already decoded never reac
   relay.handshakeInfo = { ...relay.handshakeInfo, serverId: 'ffffffff', serverName: '别服' }
   relay.transition('online')
   await waitForStream(relay, 2)
-  // The ONLY outputs are the orphan cancel for the SHOWN event and the new
-  // leg's waterfall — a leaked frame would surface ahead of them.
+  // The ONLY outputs are the T52 refresh emit (the identity change fired it
+  // synchronously in the state listener), the orphan cancel for the SHOWN
+  // event, and the new leg's waterfall — a leaked frame would surface among
+  // them.
   relay.streams[1].gate.push(SERVER_WATERFALL)
-  const frames = await readSome(iterator, 2)
-  assert.deepEqual(frames[0], { type: 'cancel', eventId: V_REMOTE_EVENT }, 'the shown prompt was closed by the leg death')
-  assert.equal(frames[1].eventId, toVirtual('ffffffff', 'a1b2c3d4e5f60718.evt-remote-1'), 'the reopened leg delivers under the new ids')
+  const frames = await readSome(iterator, 3)
+  assert.deepEqual(frames[0], { type: 'emit', event: 'llm/adapters-updated', args: [] })
+  assert.deepEqual(frames[1], { type: 'cancel', eventId: V_REMOTE_EVENT }, 'the shown prompt was closed by the leg death')
+  assert.equal(frames[2].eventId, toVirtual('ffffffff', 'a1b2c3d4e5f60718.evt-remote-1'), 'the reopened leg delivers under the new ids')
   const leakedOld = toVirtual(SERVER_ID, 'a1b2c3d4e5f60718.evt-remote-2')
   const leakedNew = toVirtual('ffffffff', 'a1b2c3d4e5f60718.evt-remote-2')
   assert.ok(
