@@ -348,3 +348,43 @@ test('decideInvoke: fileUploads/upload and fileReferences/list are gated on the 
     )
   }
 })
+
+// -- T32: the forwarded-event entries ------------------------------------------------
+
+test('decideStream: $zr/events is the special events entry — no fields, no session check', () => {
+  assert.deepEqual(decideStream('$zr', 'events', {}, no), { allow: true, sessionIds: [], events: true })
+  // It never rides the invoke route, and the event-result endpoint is not a
+  // namespace/method at all — both refuse like anything unlisted.
+  assert.deepEqual(decideInvoke('$zr', 'events', {}, yes), { allow: false, reason: 'forbidden-method' })
+  assert.deepEqual(decideStream('events', 'result', {}, yes), { allow: false, reason: 'forbidden-method' })
+})
+
+test('parseEventResultBody: eventId + object result, everything else undefined', () => {
+  const { parseEventResultBody } = require('../lib/relay-access.js')
+  assert.deepEqual(parseEventResultBody({ eventId: 'evt-1', result: { kind: 'next' } }), { eventId: 'evt-1', result: { kind: 'next' } })
+  assert.deepEqual(parseEventResultBody({ eventId: 'evt-1', result: { kind: 'result', value: { approve: true } } }), {
+    eventId: 'evt-1',
+    result: { kind: 'result', value: { approve: true } },
+  })
+  // The outcome travels verbatim: its RT validation (kinds next/result/
+  // rejected, exact keys) is the GATEWAY's job, and a malformed one comes
+  // back as the gateway's 200 error envelope.
+  assert.deepEqual(parseEventResultBody({ eventId: 'evt-1', result: { kind: 'nonsense' } }), {
+    eventId: 'evt-1',
+    result: { kind: 'nonsense' },
+  })
+  for (const body of [
+    undefined,
+    null,
+    'x',
+    [],
+    {},
+    { eventId: '' , result: { kind: 'next' } },
+    { eventId: 3, result: { kind: 'next' } },
+    { eventId: 'evt-1' },
+    { eventId: 'evt-1', result: 'next' },
+    { eventId: 'evt-1', result: null },
+  ]) {
+    assert.equal(parseEventResultBody(body), undefined, JSON.stringify(body))
+  }
+})

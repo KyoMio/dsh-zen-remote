@@ -54,7 +54,9 @@
  * Pure functions: no I/O, no clock, the share-table lookup is injected.
  */
 /** Which standing filter the caller must apply to a global stream's frames
- * (`src/relay-filter.ts` owns both implementations). */
+ * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
+ * forwarding subscription is filtered by relay-server.ts itself — it needs
+ * the per-eventId registry, not a pure frame function). */
 export type StreamFilter = 'workspace' | 'control';
 /** Which standing filter the caller must apply to an invoke result before it
  * travels (currently only the unscoped `session/list`). */
@@ -71,11 +73,13 @@ export type InvokeDecision = {
 };
 /** One stream decision: allow (global streams carry a `streamFilter`, scoped
  * streams list the session ids the subscription depends on — the relay kills
- * the stream and counts viewers with them), or the 403 reason. */
+ * the stream and counts viewers with them, and the event subscription sets
+ * `events`), or the 403 reason. */
 export type StreamDecision = {
     allow: true;
     filter?: StreamFilter;
     sessionIds: string[];
+    events?: true;
 } | {
     allow: false;
     reason: InvokeDenyReason;
@@ -110,4 +114,20 @@ export declare function decideInvoke(namespace: string, method: string, args: un
  *    subscription when one of them stops being shared.
  */
 export declare function decideStream(namespace: string, method: string, args: unknown, isAccessible: (sessionId: string) => boolean): StreamDecision;
+/**
+ * The `$events/result` answer body (T32), as the client sends it:
+ * `{ eventId, result }`. `result` is the Remote event OUTCOME and travels
+ * VERBATIM — dsh-api-gateway's `parseRemoteEventResult` is the validator
+ * (exactly `{clientId,eventId,outcome}` up there; kinds `next` / `result`
+ * with optional JSON `value` / `rejected` with `{name,message,code?,details?}`),
+ * and a malformed one comes back as the gateway's own 200 error envelope, so
+ * re-validating here would only invent a second dialect for the same refusal.
+ * `eventId` ownership (forwarded on a live subscription, session still
+ * reachable) is the ROUTE's check — it needs the handler's registry.
+ */
+export interface EventResultBody {
+    eventId: string;
+    result: Record<string, unknown>;
+}
+export declare function parseEventResultBody(body: unknown): EventResultBody | undefined;
 //# sourceMappingURL=relay-access.d.ts.map
