@@ -33,7 +33,7 @@ test('http is accepted for every allowed private IPv4 range and rejected outside
   // 10.0.0.0/8, 192.168.0.0/16, 127.0.0.0/8.
   assert.equal(pairing.normalizeServerUrl('http://10.1.2.3:3088').ok, true)
   assert.equal(pairing.normalizeServerUrl('http://11.0.0.1:3088').ok, false)
-  assert.equal(pairing.normalizeServerUrl('http://192.168.3.129:3088').ok, true)
+  assert.equal(pairing.normalizeServerUrl('http://192.168.1.10:3088').ok, true)
   assert.equal(pairing.normalizeServerUrl('http://192.169.0.1:3088').ok, false)
   assert.equal(pairing.normalizeServerUrl('http://127.0.0.1:3088').ok, true)
   assert.equal(pairing.normalizeServerUrl('http://128.0.0.1:3088').ok, false)
@@ -48,7 +48,7 @@ test('http is rejected for public IPs and ordinary domain names, https always ac
   // https: any host, any port, always fine.
   assert.equal(pairing.normalizeServerUrl('https://dsh.example.com').ok, true)
   assert.equal(pairing.normalizeServerUrl('https://8.8.8.8:3088').ok, true)
-  assert.equal(pairing.normalizeServerUrl('https://192.168.3.129:3088').ok, true)
+  assert.equal(pairing.normalizeServerUrl('https://192.168.1.10:3088').ok, true)
 })
 
 test('http is accepted for localhost, .local names and allowed IPv6 loopback/link-local/ULA', () => {
@@ -69,31 +69,31 @@ test('http is accepted for localhost, .local names and allowed IPv6 loopback/lin
 
 test('the normalizer strips whitespace and trailing slashes and returns a clean origin', () => {
   assert.deepEqual(
-    pairing.normalizeServerUrl('  http://192.168.3.129:3088/  '),
-    { ok: true, url: 'http://192.168.3.129:3088' },
+    pairing.normalizeServerUrl('  http://192.168.1.10:3088/  '),
+    { ok: true, url: 'http://192.168.1.10:3088' },
   )
   assert.deepEqual(
-    pairing.normalizeServerUrl('http://192.168.3.129:3088///'),
-    { ok: true, url: 'http://192.168.3.129:3088' },
+    pairing.normalizeServerUrl('http://192.168.1.10:3088///'),
+    { ok: true, url: 'http://192.168.1.10:3088' },
   )
 })
 
 test('paths, query strings, fragments, credentials and exotic schemes are invalid', () => {
-  assert.deepEqual(pairing.normalizeServerUrl('http://192.168.3.129:3088/lan-gate'), { ok: false, reason: 'invalid' })
+  assert.deepEqual(pairing.normalizeServerUrl('http://192.168.1.10:3088/lan-gate'), { ok: false, reason: 'invalid' })
   assert.deepEqual(pairing.normalizeServerUrl('https://dsh.example.com/app/'), { ok: false, reason: 'invalid' })
-  assert.deepEqual(pairing.normalizeServerUrl('http://192.168.3.129:3088/?x=1'), { ok: false, reason: 'invalid' })
+  assert.deepEqual(pairing.normalizeServerUrl('http://192.168.1.10:3088/?x=1'), { ok: false, reason: 'invalid' })
   assert.deepEqual(pairing.normalizeServerUrl('https://dsh.example.com#frag'), { ok: false, reason: 'invalid' })
-  assert.deepEqual(pairing.normalizeServerUrl('http://user:pass@192.168.3.129:3088'), { ok: false, reason: 'invalid' })
+  assert.deepEqual(pairing.normalizeServerUrl('http://user:pass@192.168.1.10:3088'), { ok: false, reason: 'invalid' })
   assert.deepEqual(pairing.normalizeServerUrl('https://alice@dsh.example.com'), { ok: false, reason: 'invalid' })
-  assert.deepEqual(pairing.normalizeServerUrl('ftp://192.168.3.129:3088'), { ok: false, reason: 'invalid' })
-  assert.deepEqual(pairing.normalizeServerUrl('192.168.3.129:3088'), { ok: false, reason: 'invalid' }, 'no scheme at all')
+  assert.deepEqual(pairing.normalizeServerUrl('ftp://192.168.1.10:3088'), { ok: false, reason: 'invalid' })
+  assert.deepEqual(pairing.normalizeServerUrl('192.168.1.10:3088'), { ok: false, reason: 'invalid' }, 'no scheme at all')
   assert.deepEqual(pairing.normalizeServerUrl(''), { ok: false, reason: 'invalid' })
   assert.deepEqual(pairing.normalizeServerUrl('not a url'), { ok: false, reason: 'invalid' })
 })
 
 test('acceptance sample: public http refused, LAN http and public https accepted', () => {
   assert.equal(pairing.normalizeServerUrl('http://8.8.8.8:3088').ok, false)
-  assert.equal(pairing.normalizeServerUrl('http://192.168.3.129:3088/').ok, true)
+  assert.equal(pairing.normalizeServerUrl('http://192.168.1.10:3088/').ok, true)
   assert.equal(pairing.normalizeServerUrl('https://dsh.example.com').ok, true)
 })
 

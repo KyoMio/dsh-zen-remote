@@ -184,7 +184,7 @@ export declare const zh: {
     readonly 'settings.resetPreview': "保存后恢复为下一层的值";
     readonly 'settings.client.connectTitle': "连接服务端";
     readonly 'settings.client.serverUrl': "服务端地址";
-    readonly 'settings.client.serverUrlHint': "服务端网关地址，例如 http://192.168.3.129:3088 或 https://dsh.example.com。";
+    readonly 'settings.client.serverUrlHint': "服务端网关地址，例如 http://192.168.1.10:3088 或 https://dsh.example.com。";
     readonly 'settings.client.deviceName': "设备名称";
     readonly 'settings.client.deviceNameDefault': "桌面应用端";
     readonly 'settings.client.pairingCode': "配对码";
