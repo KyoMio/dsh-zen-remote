@@ -32,7 +32,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ShareStore } from './share-store.js'
-import { decideHttpRoute, decideInvoke, decideStream, parseEventResultBody } from './relay-access.js'
+import { decideHttpRoute, decideInvoke, decideStream, decideUploadQuery, parseEventResultBody } from './relay-access.js'
 import {
   createWorkspaceFollowState,
   filterControlFrame,
@@ -55,6 +55,26 @@ const RELAY_PROTOCOL = 1
 
 /** Request body ceiling for the POST routes other than invoke. */
 const MAX_BODY_BYTES = 1024 * 1024
+
+/**
+ * Body ceiling for the binary upload channel alone (T51): a shared session's
+ * non-image file attachments. DSH's own upload route has NO byte cap — the
+ * host stores the stream verbatim (`saveFileStreamVerbatim` →
+ * `publishImmutableObjectStream`, RT dsh-attachment-local lib/index.js
+ * ~699-716; the 20 MiB `maxImageBytes` there covers INLINE images only), so
+ * there is no host number to mirror and this relay picks its own: 100 MiB
+ * per upload, checked first against `Content-Length` (refused before a byte
+ * moves) and then counted while the stream is pumped (a chunked body has no
+ * length header — the sub-client's undici forbids hand-set length headers,
+ * so the streaming count is the path its uploads normally take). Past the
+ * cap the forward is aborted, the rest of the request is drained and the
+ * answer is 413 `payload-too-large`.
+ */
+export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+
+/** The `/api` route the upload channel dispatches into, verbatim from the
+ * host's own registration (RT dsh-client-file-upload lib/index.js:73). */
+export const UPLOAD_HTTP_PATH = '/api/session/uploadFileBinary'
 
 /**
  * Body ceiling for the invoke route alone: the prompt routes carry inline
@@ -110,6 +130,9 @@ const DEFAULT_HEARTBEAT_MS = 15_000
 /** How long a stream's finish may wait for a backed-up socket buffer to
  * drain before the response is destroyed (T43-A). */
 const DEFAULT_END_DRAIN_TIMEOUT_MS = 5_000
+
+/** The upload cap used unless the wiring injects one (tests shrink it). */
+const DEFAULT_UPLOAD_CAP_BYTES = MAX_UPLOAD_BYTES
 
 /** `{"type":"ping"}` as one ready-made NDJSON line. */
 const PING_LINE = Buffer.from('{"type":"ping"}\n', 'utf8')
@@ -205,6 +228,10 @@ export interface RelayHandlerOptions {
    * reading must not pin the viewer count and the device budget forever);
    * defaults to 5000. Tests inject a small value. */
   endDrainTimeoutMs?: number
+  /** The binary upload channel's byte cap (T51); defaults to
+   * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
+   * Content-Length and streaming-count refusals stay cheap to drive. */
+  uploadCapBytes?: number
 }
 
 /**
@@ -466,6 +493,46 @@ async function readJsonObject(req: IncomingMessage, cap = MAX_BODY_BYTES): Promi
 }
 
 /**
+ * How much of an upload request's body a refusal is willing to swallow
+ * before giving up on the socket: a client that is still mid-send must read
+ * the status code, not a connection reset, so every refusal path drains
+ * first — but an unbounded hostile stream must not hold the answer (or the
+ * process) hostage either. A legitimate client never has more than the
+ * upload cap in flight; the slack covers the tail past a cap refusal.
+ */
+const DRAIN_SLACK_BYTES = 8 * 1024 * 1024
+
+/**
+ * Consume and discard the rest of one upload request, bounded. Resolves on
+ * end, error, close, or the moment the body outgrows the bound (the socket
+ * is destroyed then — the caller answers to whatever is still listening).
+ * The upload route's counterpart of `readJsonObject`'s always-drain
+ * discipline.
+ */
+function drainUpload(req: IncomingMessage, bound: number): Promise<void> {
+  return new Promise((resolve) => {
+    let size = 0
+    let settled = false
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.byteLength
+      if (size > bound) {
+        req.destroy()
+        finish()
+      }
+    })
+    req.once('end', finish)
+    req.once('error', finish)
+    req.once('close', finish)
+    req.resume()
+  })
+}
+
+/**
  * What may travel to the client about a failed gateway call. DSH's own errors
  * always carry a `namespace/name`-shaped string `code` — those pass through
  * with a clipped message. EVERYTHING else — a plugin bug, or a Node system
@@ -538,6 +605,8 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   const { secret, store, gateway, serverInfo } = options
   const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
   const endDrainTimeoutMs = options.endDrainTimeoutMs ?? DEFAULT_END_DRAIN_TIMEOUT_MS
+  const uploadCapBytes = options.uploadCapBytes ?? DEFAULT_UPLOAD_CAP_BYTES
+  const uploadDrainBound = uploadCapBytes + DRAIN_SLACK_BYTES
   const parentOf = options.parentOf ?? (() => undefined)
   const isAccessible = (sessionId: string): boolean => store.isAccessible(sessionId, parentOf)
 
@@ -1136,6 +1205,180 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // A dispatch failure is this server's fault, not a business answer —
         // and errorOf keeps any message off the wire.
         responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/upload`) {
+      // The binary upload channel (T51): the sub-client's wrapped
+      // `/api/session/uploadFileBinary` forwards a remote session's raw
+      // attachment bytes here, and this route dispatches them through the
+      // host's shared `/api` handler IN PROCESS — the same exact-fetch route
+      // entry the local upload would have reached, so the staged receipt
+      // lands under the same session the later `session/prompt` resolves it
+      // against. The body is a STREAM, not JSON: nothing here buffers it
+      // beyond the cap verdict, and the host's own upload route has no cap
+      // to inherit (see MAX_UPLOAD_BYTES), so this relay brings its own —
+      // Content-Length first, a counting pump as the chunked-body fallback.
+      // A `Content-Length` past the cap is refused before the query is even
+      // read (the body-fact order the invoke route answers in: 413 wins over
+      // the access walls there too); every other refusal drains the body
+      // first so a client still mid-send reads the status code, not a reset.
+      if (Number(req.headers['content-length']) > uploadCapBytes) {
+        await drainUpload(req, uploadDrainBound)
+        responseJson(res, 413, PAYLOAD_TOO_LARGE)
+        return
+      }
+      // The query is parsed ONCE (decideUploadQuery, the T41b-fix
+      // discipline): what was share-checked is exactly the normalized query
+      // the synthetic URL below is composed from — a duplicate sessionId, a
+      // tab-carrying key name, or a smuggled second coordinate can never
+      // re-enter between the check and the dispatch.
+      const decision = decideUploadQuery(new URL(req.url ?? '/', 'http://dsh.internal').search, isAccessible)
+      if (!decision.allow) {
+        await drainUpload(req, uploadDrainBound)
+        responseJson(res, decision.reason === 'not-shared' ? 403 : 400, { ok: false, error: { code: decision.reason } })
+        return
+      }
+      const dispatch = options.getApiFetch?.()
+      if (dispatch === undefined) {
+        await drainUpload(req, uploadDrainBound)
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      // A hang-up cancels the forward mid-stream, like invoke's — and the
+      // cap pump below aborts the SAME controller when it trips, so an
+      // oversized upload dies at the host side the moment it is judged.
+      const hangUp = new AbortController()
+      const onClientGone = (): void => {
+        if (!res.writableEnded) hangUp.abort()
+      }
+      res.on('close', onClientGone)
+      // The counting pump: the client's chunks are re-emitted into the
+      // synthetic body verbatim, counted on the way through, with real
+      // backpressure (the socket pauses whenever the host handler is not
+      // pulling). Past the cap the pump errors — the host's reader throws
+      // out of `requestBodyChunks` and its upload dies mid-write — and the
+      // answer below is the relay's own 413, never the host's internal
+      // failure envelope. `tooLarge` also detaches the pump from the socket:
+      // the tail belongs to drainUpload's bound.
+      let received = 0
+      let tooLarge = false
+      const body = new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          req.pause()
+          req.on('data', (chunk: Buffer) => {
+            if (tooLarge) return
+            received += chunk.byteLength
+            if (received > uploadCapBytes) {
+              tooLarge = true
+              req.pause()
+              hangUp.abort()
+              try {
+                controller.error(new Error('payload-too-large'))
+              } catch {
+                // The host consumer may have cancelled first.
+              }
+              return
+            }
+            try {
+              controller.enqueue(new Uint8Array(chunk))
+            } catch {
+              req.destroy()
+              return
+            }
+            if (controller.desiredSize !== null && controller.desiredSize <= 0) req.pause()
+          })
+          req.on('end', () => {
+            if (tooLarge) return
+            try {
+              controller.close()
+            } catch {
+              // Already errored by the consumer's cancel.
+            }
+          })
+          req.on('error', () => {
+            if (tooLarge) return
+            try {
+              controller.error(new Error('upload stream failed'))
+            } catch {
+              // Already errored.
+            }
+          })
+          req.on('close', () => {
+            if (tooLarge) return
+            try {
+              controller.close()
+            } catch {
+              // A hang-up destroy after a clean end — nothing to close.
+            }
+          })
+        },
+        pull: () => {
+          req.resume()
+        },
+        cancel: () => {
+          // The host consumer stopped reading (its own error path): stop
+          // pulling from the client too — the drain below finishes the wire.
+          req.pause()
+        },
+      })
+      let request: Request
+      try {
+        // The URL is composed from the DECISION's normalized query alone,
+        // and the content type is the one fact the host route mandates
+        // (RT dsh-client-file-upload lib/index.js:18) — set here, never
+        // copied from the wire.
+        const init: RequestInit = {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body,
+          signal: hangUp.signal,
+        }
+        // `duplex: 'half'` is mandatory for a streaming request body; the
+        // resolved RequestInit type hides the field (the DOM-vs-undici
+        // conditional in @types/node), so the assignment carries its own
+        // cast.
+        ;(init as { duplex?: string }).duplex = 'half'
+        request = new Request(`http://relay.local${UPLOAD_HTTP_PATH}?${decision.query}`, init)
+      } catch {
+        responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+        return
+      }
+      try {
+        const upstream = await dispatch(request)
+        // The host's upload route answers buffered JSON in every branch (RT
+        // dsh-client-file-upload lib/index.js:49-55), so the receipt reads
+        // out in full. The status + content type + body ride back VERBATIM
+        // inside the success envelope — the same wrapper the
+        // `relay/v1/http` route uses — so a 200-with-failure-envelope
+        // business answer keeps its code AND its structured details on this
+        // wire, and the sub-client reconstructs the exact Response its UI
+        // would have seen locally.
+        const bodyText = await upstream.text()
+        if (tooLarge) {
+          await drainUpload(req, uploadDrainBound)
+          responseJson(res, 413, PAYLOAD_TOO_LARGE)
+          return
+        }
+        const contentType = upstream.headers.get('content-type') ?? undefined
+        responseJson(res, 200, {
+          ok: true,
+          value: { status: upstream.status, ...(contentType !== undefined ? { contentType } : {}), body: bodyText },
+        })
+      } catch {
+        // A dispatch failure is this server's fault (or the hang-up's), not
+        // a business answer — errorOf keeps any message off the wire. The
+        // cap verdict outranks it: the abort the pump sent INTO the dispatch
+        // surfaces here as a throw, and the client still gets its 413.
+        if (tooLarge) {
+          await drainUpload(req, uploadDrainBound)
+          responseJson(res, 413, PAYLOAD_TOO_LARGE)
+          return
+        }
+        responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+      } finally {
+        res.off('close', onClientGone)
       }
       return
     }
