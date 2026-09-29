@@ -40,9 +40,9 @@
                        + Bearer 共享密钥，其余路径 403    (含共享密钥与设备标记头)       /pwa/push/send
 ```
 
-- 网关是独立子进程，与 DSH 主进程隔离：挂掉不影响主服务，插件停止时自动终止。
+- 网关是独立子进程，与 DSH 主进程隔离：挂掉不影响主服务，插件停止时自动终止；主进程若死于非正常退出（崩溃、`kill -9`），子进程每 5 秒自检一次父进程存活，发现不在就自己退出，不占着端口。
 - DSH 主服务本身仍然只监听 `127.0.0.1`，网关不改它的任何配置，也不碰它 `/api` 的信任栅栏。转发目标端口自动发现（桌面端构建的 Web UI 端口可配置，网关读宿主的实际值）。
-- 唯一保留的「按 IP 信任」：回环 socket 且不带任何 `X-Forwarded-*` 头的请求，判定为坐在这台机器前面的本机用户——这是管理面的唯一入口。经反代进来的请求一定带转发头，天然进不去。**注意这也是已知限制的根源**：同机联调时子客户端必须用局域网 IP 连网关，回环地址会被当成「本机直连」而不校验令牌。
+- 唯一保留的「按 IP 信任」：回环 socket 且不带任何 `X-Forwarded-*` 头、且 **Host 去掉端口后是 `127.0.0.1` / `localhost` / `[::1]` 之一**的请求，判定为坐在这台机器前面的本机用户——这是管理面的唯一入口。经反代进来的请求一定带转发头，天然进不去。Host 检查挡的是 DNS 重绑定：攻击者自己的域名解析到 127.0.0.1 时，请求虽然从回环进来，Host 却不是回环名，进不了管理面。**注意这也是已知限制的根源**：同机联调时子客户端必须用局域网 IP 连网关，回环地址会被当成「本机直连」而不校验令牌。
 
 ---
 
@@ -281,7 +281,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 
 ## 🔌 管理 API
 
-以下接口全部**仅限本机直连**：请求的 socket 必须是回环地址、且不带任何 `X-Forwarded-*` 头。只要请求经过反代（一定带转发头），一律返回 403——公网碰不到这些接口。2.0 起这些接口的调用方从浏览器管理页换成了插件后台：设置页发起的请求走 DSH 同源路由 `/_dsh/zen-remote/admin/*`，由主服务端进程以「本机直连」的身份代调下面这些网关接口（带 `x-zen-remote-via` 标记的转发请求只许查看、一律拒绝变更）。
+以下接口全部**仅限本机直连**：请求的 socket 必须是回环地址、且不带任何 `X-Forwarded-*` 头、且 Host 是回环名（见上）。在这道判定之外还有两道针对浏览器的门（网页发出的跨站 POST 不需要预检，光靠 socket/Host 判定挡不住）：请求带 `Origin` 头一律 403，带请求体但 `Content-Type` 不是 `application/json` 一律 415——插件后台的代调用和脚本 `curl`（带 JSON 头、无 Origin）都不受影响。只要请求经过反代（一定带转发头），一律返回 403——公网碰不到这些接口。2.0 起这些接口的调用方从浏览器管理页换成了插件后台：设置页发起的请求走 DSH 同源路由 `/_dsh/zen-remote/admin/*`，由主服务端进程以「本机直连」的身份代调下面这些网关接口（带 `x-zen-remote-via` 标记的转发请求只许查看、一律拒绝变更）。
 
 | 接口 | 方法 | 作用 | 参数 |
 | --- | --- | --- | --- |
@@ -321,7 +321,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `/v1/http` | POST | 改动摘要 / diff 面板的 plain-HTTP 长尾（T41b）：请求体 `{route, query}` 只登记 `changes.summary` / `changes.diff` 两条、只转发 GET（查询串是这次调用的坐标，不是要转发的请求体）；查询串按允许清单**规范化重建**——只保留 `sessionId`（恰好一次，过共享表）与 `seq` / `index`（至多一次、十进制非负整数），未知参数丢弃，合成 URL 只由规范化结果拼成（两次解析对控制字符的处理差异曾是越权读取口子，T41b-fix）——随后**进程内**交给宿主 `/api` 共享 fetch handler，不走回环 HTTP |
 | `/v1/unshare` | POST | 子客户端主动关闭某会话的远程（只认共享表内的会话） |
 
-**允许清单里的方法**（其余一律 `forbidden-method`）：会话读写（`session/follow`、`session/page`、`session/prompt`、`session/cancel`、`session/rename`、`session/selectModel`、`session/updateQueue`、`session/attachment`、`session/projections`）、新建与分叉（`session/create`、`session/fork`，结果自动共享）、子智能体（`subagents/prompt`、`subagents/interruptByParent`，按父会话判定）、附件与 @ 引用（`fileUploads/upload`、`fileReferences/list`、`sessionReferenceResolver/candidates`）、面板长尾（`goals/*` 五个、`commands/list|execute`、`agentPresets/select`、`sessionFeedback/record`）、文件树与预览（`workspaceFiles/list|changes|read|readBytes|stat`）、终端（`terminal/*`）、任务（`job/list|follow|kill`）、`skills/list`、消息反馈（`messageFeedback/*`）、`schedule/list`、工作区会话操作（`workspace/pinSession` 等）、以及三个全局读：`session/control` 流、`session/list`、`workspace/follow` 流——它们不带会话参数，安全靠**输出过滤**：每一帧/每一行结果先按共享表过滤，未共享会话的行到不了客户端。`sessionReferenceResolver/candidates`（@ 引用候选）的答案带**每一个**服务端会话的标题、目录与现成 mention，同样走行级输出过滤，只放行已共享会话的行。审批/提问事件经 `$zr/events` 订阅转发，逐事件按 `agentId` 判定可达性。
+**允许清单里的方法**（其余一律 `forbidden-method`）：会话读写（`session/follow`、`session/page`、`session/prompt`、`session/cancel`、`session/rename`、`session/selectModel`、`session/updateQueue`、`session/attachment`、`session/projections`）、新建与分叉（`session/create`、`session/fork`，结果自动共享）、子智能体（`subagents/prompt`、`subagents/interruptByParent`，按父会话判定）、附件与 @ 引用（`fileUploads/upload`、`fileReferences/list`、`sessionReferenceResolver/candidates`）、面板长尾（`goals/*` 五个、`commands/list|execute`、`agentPresets/select`、`sessionFeedback/record`）、文件树与预览（`workspaceFiles/list|changes|read|readBytes|stat`）、终端（`terminal/*`）、任务（`job/list|follow|kill`）、`skills/list`、消息反馈（`messageFeedback/*`）、`schedule/list`、工作区会话操作（`workspace/pinSession` 等）、以及三个全局读：`session/control` 流、`session/list`、`workspace/follow` 流——它们不带会话参数，安全靠**输出过滤**：每一帧/每一行结果先按共享表过滤，未共享会话的行到不了客户端；`session/list` 结果行里指向不可访问会话的 `parentSessionId` 字段也会被删掉（行的其余部分照常透传）。`sessionReferenceResolver/candidates`（@ 引用候选）的答案带**每一个**服务端会话的标题、目录与现成 mention，同样走行级输出过滤，只放行已共享会话的行。审批/提问事件经 `$zr/events` 订阅转发，逐事件按 `agentId` 判定可达性。
 
 `/v1/http` 那条路由是另一张按**路由名**登记的允许清单（不是方法表的一部分），纪律相同：表外路由一律 404，登记的路由只按声明的会话参数判定；子客户端一侧的对应入口是 `GET /_dsh/zen-remote/client/http/<route>`——浏览器 fetch 包装拦下的 `/api/changes.*` 虚拟 id 请求改道到这里，还原原始 id 后经中继转发，上游 Content-Type 只认 JSON，其余一律降级为 `text/plain` + `nosniff`。
 
@@ -332,7 +332,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 - `dsh-session:` 会话引用也会被扫描（T41a-fix 扫 prompt 文本，T41a-fix2 补齐两条绕过）：DSH 会在**发消息**（`session/prompt` / `subagents/prompt` 的 content 文本块）、**改写排队消息**（`session/updateQueue` 的 edit 内容）与**斜杠命令**（`commands/execute` 参数里的全部字符串——命令处理器会把原始输入拼进下一条用户消息）这三条路径上注入被引用会话的内容，且注入时不再做权限检查，所以引用指向未共享会话的调用在服务端直接 403；@ 引用候选（`sessionReferenceResolver/candidates`）的答案也只放行已共享会话的行；
 - 终端是有意开放的（桌面应用端是可信设备）：开的是**服务端**的 PTY，以服务端用户身份运行、不受智能体沙箱与审批限制；关闭会话的远程时终端流一并终止；
 - `workspaceFiles/read` 等文件预览接口不限制在会话目录内（DSH 自身就不限制），服务端进程可读的文件都能读——信任前提与终端相同；
-- 每台设备并发流数有上限（32），事件应答按「转发时的订阅 + 设备」核对归属。审批/提问的转发是**先到先得**：服务端自己的界面和子客户端谁先应答谁生效，后答的一方被网关拒绝、同步成「已处理」。中继**不代答**（T32-fix2 撤掉了代答放行）：未共享会话的审批/提问事件不会被转发，服务端界面也不在线时这个审批就一直等待——网关会把仍未应答的事件转交给下一个连上来的订阅，等，而不是替你拒绝（代答会把整批待审批一次性判死，砸掉「推送 → 唤醒 → 审批」链路）。未共享会话的**通知类**事件（EMIT 帧：会话列表摘要、账号到期之类的服务端全局状态）一律不转发。
+- 每台设备并发流数有上限（32）、同时在途的 invoke 数也有上限（8，超出 429 `too-many-invokes`）；`*/internal` 形状的错误码（`gateway/internal` 等）只回码不带消息——那类消息引用的是服务端内部细节。事件应答按「转发时的订阅 + 设备」核对归属。审批/提问的转发是**先到先得**：服务端自己的界面和子客户端谁先应答谁生效，后答的一方被网关拒绝、同步成「已处理」。中继**不代答**（T32-fix2 撤掉了代答放行）：未共享会话的审批/提问事件不会被转发，服务端界面也不在线时这个审批就一直等待——网关会把仍未应答的事件转交给下一个连上来的订阅，等，而不是替你拒绝（代答会把整批待审批一次性判死，砸掉「推送 → 唤醒 → 审批」链路）。未共享会话的**通知类**事件（EMIT 帧：会话列表摘要、账号到期之类的服务端全局状态）一律不转发。
 
 ---
 
@@ -353,11 +353,11 @@ sudo cloudflared service install      # 通了再装成常驻服务
 **防住了什么：**
 - 配对码暴力破解——码本身 10 分钟一次性，连续 5 次错码会把那个来源 IP 锁 15 分钟。
 - 码与角色绑定——Web 应用端的码进不了桌面通道，反之亦然；拿错的码不消耗、不计锁定。
-- 令牌可以随时吊销——设备丢了、借给别人用完了，设置页点一下就失效，立即生效（连接与推送订阅一并销毁）。
+- 令牌可以随时吊销——设备丢了、借给别人用完了，设置页点一下就失效，立即生效（连接、HTTP 长流与推送订阅一并销毁）。
 - 桌面应用端被关进中继前缀——它访问其余任何路径（包括 DSH 页面和 `/api`）一律 403。
 - 中继三道门——设备令牌、网关标记头 + 每次加载现生成的共享密钥（`LAN_GATE_RELAY_SECRET`，不可外部指定）、按方法登记的允许清单 + 输出过滤；未共享会话的数据一步都出不来。
 - 请求量——按解析出的真实客户端 IP 限流，默认每分钟 120 次，超了就 429。
-- 管理面只有本机能碰——生成配对码、管理设备、触发推送，这些接口只认本机直连，经反代来的请求（一定带转发头）一律 403；带网关标记头的请求即使本机直连也拒绝一切变更动作。
+- 管理面只有本机能碰——生成配对码、管理设备、触发推送，这些接口只认本机直连（回环 socket、无转发头、回环 Host），经反代来的请求（一定带转发头）一律 403；带 `Origin` 的请求与带非 JSON 请求体的请求也一样 403/415，DNS 重绑定与跨站简单请求进不来；带网关标记头的请求即使本机直连也拒绝一切变更动作。
 
 **没防住什么，需要你自己注意：**
 - 反代配置错了——比如不小心把 `127.0.0.1:3088/lan-gate/admin` 也挂到公网域名下，或者 `X-Forwarded-Proto` 设错导致网关判断错客户端协议，这些是配置问题，网关本身防不住。

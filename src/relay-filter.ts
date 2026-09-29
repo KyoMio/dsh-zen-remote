@@ -124,9 +124,12 @@ export function filterControlFrame(frame: unknown, isAccessible: Accessibility):
  * Filter one `session/list` result (the invoke route forwards it as the
  * enveloped value): `items` keeps only entries whose `sessionId` is
  * accessible, every other field of the result (and of each kept item) passes
- * through as-is. The result arrives from the same JSON boundary as the frames
- * but it is a RESULT, not a frame — there is no unknown-shape refusal here; a
- * result without an `items` array simply has nothing to filter.
+ * through as-is — except a `parentSessionId` naming a session the share table
+ * cannot reach (CP4): that field is dropped while the row stays, so the id of
+ * a hidden session never travels, not even as a dangling parent link. The
+ * result arrives from the same JSON boundary as the frames but it is a
+ * RESULT, not a frame — there is no unknown-shape refusal here; a result
+ * without an `items` array simply has nothing to filter.
  */
 export function filterSessionListResult(result: unknown, isAccessible: Accessibility): unknown {
   if (!isPlainObject(result)) return result
@@ -134,9 +137,15 @@ export function filterSessionListResult(result: unknown, isAccessible: Accessibi
   if (!Array.isArray(items)) return { ...result }
   return {
     ...result,
-    items: items.filter(
-      (item) => isPlainObject(item) && typeof item.sessionId === 'string' && isAccessible(item.sessionId),
-    ),
+    items: items.flatMap((item) => {
+      if (!isPlainObject(item) || typeof item.sessionId !== 'string' || !isAccessible(item.sessionId)) return []
+      if (typeof item.parentSessionId === 'string' && !isAccessible(item.parentSessionId)) {
+        const row = { ...item }
+        delete row.parentSessionId
+        return [row]
+      }
+      return [item]
+    }),
   }
 }
 
