@@ -792,6 +792,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               error: {
                 code: 'unshared',
                 message: `shared session ${event.sessionId} was unshared (${event.reason})`,
+                // T34: the structured close reason beside the message string —
+                // the sub-client's closed-session display keys on this field.
+                reason: event.reason,
               },
             })
             hangUp.abort()
@@ -842,7 +845,11 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             hangUp.abort()
             closeWith({
               type: 'error',
-              error: { code: 'unshared', message: `shared session ${firstInaccessible} is no longer shared` },
+              // No share-table event was observed on this stream (the session
+              // was already unshared while the request was deciding — e.g.
+              // inside the job ownership probe): the close reason degrades to
+              // the manual close, the only fact that is certain here.
+              error: { code: 'unshared', reason: 'manual', message: `shared session ${firstInaccessible} is no longer shared` },
             })
           } else {
             const iterable = await gateway.stream({ namespace, method, args, signal: hangUp.signal })

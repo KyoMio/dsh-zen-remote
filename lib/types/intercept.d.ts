@@ -84,6 +84,34 @@ export type DispatchEnvelope = {
         details: Record<string, unknown>;
     };
 };
+/**
+ * The WRITE methods of the client registry (T34): every registered method
+ * that MUTATES server-side session state, refused locally with
+ * `remote-offline` while the relay is not `online` — a write can only fail
+ * out there, and the honest local answer beats a dead round-trip. The
+ * classification, method by method, against the T31-less reality (tasks/T31
+ * does not exist; the source of truth is `RELAY_METHODS` in relay-access.ts
+ * minus the reads):
+ *
+ * - `session/prompt` sends a message; `session/cancel` cancels a turn;
+ *   `session/rename` renames; `session/selectModel` switches the session's
+ *   model; `session/updateQueue` mutates the pending inbox queue (RT:
+ *   "Mutate one pending Inbox occurrence") — all session-state mutations;
+ * - `job/kill` kills a server-side background job;
+ * - `messageFeedback/put` / `messageFeedback/delete` write and remove
+ *   message feedback records;
+ * - `workspace/pinSession` / `unpinSession` / `archiveSession` /
+ *   `unarchiveSession` mutate the workspace's session lists.
+ *
+ * Deliberately READS (forwarded as today, whatever the state):
+ * `session/follow|page|projections|attachment|control|list`, `job/list`,
+ * `job/follow`, `skills/list`, `messageFeedback/list`, `schedule/list`,
+ * `workspace/follow` — observation only, and `session/attachment` is
+ * verified against RT: it READS one durable image back (base64), it does
+ * not attach anything. Every `stream: true` entry is a read by
+ * construction.
+ */
+export declare const REMOTE_WRITE_METHODS: ReadonlySet<string>;
 /** One remote-call failure in the diagnostics ring. */
 export interface InterceptFailureRecord {
     /** ISO timestamp of the moment the failure was recorded. */
@@ -128,6 +156,20 @@ export type SelfCheckResult = {
     ok: false;
     reason: string;
 };
+/**
+ * One remote session whose stream the server closed with an `unshared` frame
+ * (T34): the virtual id plus the server's structured close reason
+ * ('manual' | 'client' | 'idle'; a frame without a usable reason reads
+ * 'manual'). Drives the session page's 远程已关闭 banner and the
+ * `remote-status` route's `closed` map. Cleared per session the next time a
+ * call for it SUCCEEDS (re-shared and served again), and wholesale when the
+ * relay returns to `online` (a reopened stream re-registers the closure if
+ * the server still holds it).
+ */
+export interface ClosedSessionRecord {
+    sessionId: string;
+    reason: 'manual' | 'client' | 'idle';
+}
 /** What the client status route surfaces about the interception. Contains
  * only shapes, counters and codes — never a token. */
 export interface InterceptDiagnostics {
@@ -142,6 +184,9 @@ export interface InterceptDiagnostics {
      * capped at 50 — the runtime-degradation half of the version-tolerance
      * diagnostics. */
     incompatibleCalls: IncompatibleCallRecord[];
+    /** Remote sessions closed server-side while a page had them open (T34),
+     * oldest first, capped at 200. */
+    closedSessions: ClosedSessionRecord[];
 }
 export interface InstallInterceptOptions {
     /** The RAW gateway instance (`ctx.typertGateway[symbols.original]`), not

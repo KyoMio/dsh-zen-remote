@@ -31,6 +31,9 @@ import { registerSettingsPage } from './settings/register-settings.ts'
 import { RemoteHeaderIcon } from './RemoteHeaderIcon.tsx'
 import { RemoteShareMenuItem } from './RemoteShareMenu.tsx'
 import { registerRemoteShareUi } from './remote-share-register.ts'
+import { RemoteStatusIcon } from './RemoteStatusIcon.tsx'
+import { RemoteComposerBanner } from './RemoteComposerBanner.tsx'
+import { registerRemoteStatusUi } from './remote-status-register.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -109,6 +112,13 @@ export function apply(ctx: ClientContext): void {
   // （styles/header.css.ts 的 header.actions 全量隐藏）。设置页的共享
   // 列表在 SettingsSection 内部，随设置页已在门之前。
   registerRemoteShareUi(ctx, RemoteHeaderIcon, RemoteShareMenuItem)
+
+  // T34 子客户端的远程状态两件套（标题行连接图标、composer 横幅）：同样在
+  // 桌面门之前注册——桌面端 App 也能以 client 角色接入服务端。部件自身按
+  // 数据降级：只在虚拟 id 会话渲染、首次 GET 应答前不渲染，所以主服务端
+  // 的页面上两者都是空，桌面保持逐像素 no-op；store 也只在有虚拟会话的
+  // 订阅者时才轮询，主服务端不白发请求。
+  registerRemoteStatusUi(ctx, RemoteStatusIcon, RemoteComposerBanner)
 
   // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
   // down to ~520px wide, where every width-based gate would flip the phone

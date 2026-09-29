@@ -26,6 +26,7 @@ const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
 const { createRelayClient, RelayError } = require('../lib/relay-client.js')
 const { installIntercept } = require('../lib/intercept.js')
+const { createClientHandler } = require('../lib/client-routes.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
@@ -680,4 +681,96 @@ test('e2e: injected fingerprints ride the real handshake and compare group by gr
     assert.deepEqual(same.compat, { identical: ['session', 'workspace'], different: [], unavailable: [] })
     await same.stop()
   } finally { await env.stop() }
+})
+
+// ---- T34: the closed-session registry over the real chain --------------------------
+
+test('e2e T34: the server idle-closes a session and the sub-client remote-status.closed carries the virtual id + reason; the unshare route closes through the chain', async () => {
+  const env = await boot({ shared: ['session-a'] })
+  let statusServer
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const virtual = toVirtual(info.serverId, 'session-a')
+
+    const controller = new AbortController()
+    const localGateway = new LocalMergeGateway(makeLocalGate(controller.signal))
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    // The session page is OPEN (its follow stream runs through the real
+    // gateway child + NDJSON relay) when the server closes the remote.
+    const stream = localGateway.wireTap(
+      'session/follow',
+      { args: { request: { address: { kind: 'session', sessionId: virtual } } } },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    )
+    const collected = collect(stream)
+    await waitFor(() => env.streams.some((gate) => gate.call.namespace === 'session' && gate.call.method === 'follow'))
+
+    // The idle sweeper closes the session on the server.
+    env.store.unshare('session-a', 'idle')
+    const { error } = await collected
+    assert.ok(error instanceof Error, 'the open page saw the closure')
+    assert.equal(error.code, 'unshared')
+    // The structured reason landed in the interceptor's registry.
+    assert.deepEqual(handle.diagnostics().closedSessions, [{ sessionId: virtual, reason: 'idle' }])
+
+    // The client route serves it: closed carries the VIRTUAL id + reason, and
+    // the body carries no token and no server address.
+    const handler = createClientHandler({
+      admit: () => ({}),
+      getRowConfig: () => ({}),
+      getRelayClient: () => env.client,
+      getIntercept: () => handle.diagnostics(),
+    })
+    statusServer = http.createServer((req, res) => { void handler(req, res) })
+    await new Promise((resolve) => statusServer.listen(0, '127.0.0.1', resolve))
+    const statusPort = statusServer.address().port
+    const status = await fetch(`http://127.0.0.1:${statusPort}/_dsh/zen-remote/client/remote-status`)
+    const body = await status.json()
+    assert.equal(body.state, 'online')
+    assert.equal(body.serverName, SERVER_NAME)
+    assert.deepEqual(body.closed, { [virtual]: 'idle' })
+    assert.ok(!JSON.stringify(body).includes(env.client.lastHandshakeDigest ?? ''), 'no credential material')
+
+    // The unshare route closes through the WHOLE chain: local route → relay
+    // client → proxy → gateway child → relay route → share table.
+    env.store.share('session-a')
+    assert.equal(env.store.isShared('session-a'), true)
+    const close = await fetch(`http://127.0.0.1:${statusPort}/_dsh/zen-remote/client/unshare`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${statusPort}` },
+      body: JSON.stringify({ sessionId: virtual }),
+    })
+    assert.equal(close.status, 200)
+    assert.deepEqual(await close.json(), { ok: true })
+    await waitFor(() => !env.store.isShared('session-a'))
+
+    // A non-virtual id is refused before anything travels.
+    env.store.share('session-a')
+    const bad = await fetch(`http://127.0.0.1:${statusPort}/_dsh/zen-remote/client/unshare`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${statusPort}` },
+      body: JSON.stringify({ sessionId: 'session-a' }),
+    })
+    assert.equal(bad.status, 400)
+    assert.equal(env.store.isShared('session-a'), true, 'the local id never reached the relay')
+
+    controller.abort()
+    handle.uninstall()
+  } finally {
+    if (statusServer !== undefined) {
+      statusServer.closeAllConnections()
+      await new Promise((resolve) => statusServer.close(resolve))
+    }
+    await env.stop()
+  }
 })

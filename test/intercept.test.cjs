@@ -679,15 +679,19 @@ test('workspace/follow merges the two legs: local first, remote upserts + merged
     { type: 'pinned', pinnedSessionIds: [] },
   ])
 
-  // the remote leg dies → NO frames at all (T23b2-fix): a remove here would
-  // blacklist the virtual ids in the UI's ClientWorkspaceModel forever
+  // the remote leg dies → the death itself emits NOTHING, but the OFFLINE
+  // transition (T34) annotates the shown titles: two upserts ride ahead of
+  // the next local frame. NO remove anywhere — a remove would blacklist the
+  // virtual ids in the UI's ClientWorkspaceModel forever
   relay.transition('offline')
   relay.streams[0].gate.throwNow(new RelayError('offline', '链路断了'))
   localGate.push({ type: 'order', workspaceIds: ['ws-local'] })
-  const afterDeath = await readSome(iterator, 1)
-  assert.deepEqual(afterDeath, [
-    { type: 'order', workspaceIds: ['ws-local', toVirtual(SERVER_ID, 'w-1'), toVirtual(SERVER_ID, 'w-2')] },
-  ], 'the shown remote state survives the death — the local order still merges it')
+  const afterDeath = await readSome(iterator, 3)
+  assert.deepEqual(afterDeath.map((frame) => frame.type), ['upsert', 'upsert', 'order'])
+  assert.equal(afterDeath[0].workspace.title, '主服务器 · 远端一（离线）')
+  assert.equal(afterDeath[1].workspace.title, '主服务器 · 远端二（离线）')
+  assert.deepEqual(afterDeath[2], { type: 'order', workspaceIds: ['ws-local', toVirtual(SERVER_ID, 'w-1'), toVirtual(SERVER_ID, 'w-2')] },
+    'the shown remote state survives the death — the local order still merges it')
 
   // relay back online → the remote leg reopens and the new baseline DIFFS
   // against the shown set: same content → upserts only, no removes
@@ -752,19 +756,23 @@ test('unpair / revocation keeps the shown group (serverId persists server-side);
   // the pairing dies (T23b2-fix3): NOT a remove any more. The server keeps
   // its serverId, so a re-pair reuses the prefix — and ClientWorkspaceModel's
   // removedIds blacklist never clears, so a remove here would make the whole
-  // group un-revivable. Nothing may leave; only the status annotation (T34)
-  // changes.
+  // group un-revivable. Nothing leaves; the T34 annotation rides out as the
+  // two title upserts ahead of the next local frame.
   relay.transition('revoked')
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(relay.streams.length, 1, 'no reopen while revoked')
   assert.ok(relay.streams[0].aborted, 'the in-flight remote leg was cut')
   assert.equal(ui.ids(), `ws-local,${v1},${v2}`, 'the revocation removed nothing from the UI model')
 
-  // local frames keep flowing while revoked, still merged with the kept tail
+  // local frames keep flowing while revoked, still merged with the kept tail,
+  // and the annotation upserts precede them (T34)
   localGate.push({ type: 'order', workspaceIds: ['ws-local'] })
-  const kept = await readSome(iterator, 1)
+  const kept = await readSome(iterator, 3)
   kept.forEach(ui.apply)
-  assert.deepEqual(kept, [{ type: 'order', workspaceIds: ['ws-local', v1, v2] }])
+  assert.deepEqual(kept.map((frame) => frame.type), ['upsert', 'upsert', 'order'])
+  assert.equal(kept[0].workspace.title, '主服务器 · 远端一（令牌已吊销）')
+  assert.deepEqual(kept[2], { type: 'order', workspaceIds: ['ws-local', v1, v2] })
+  assert.equal(ui.model.items[1].title, '主服务器 · 远端一（令牌已吊销）')
 
   // re-paired to the SAME server id: the leg reopens and the new baseline
   // diffs against the kept state — content refresh (upserts only, no
@@ -807,13 +815,14 @@ test('a revocation that never re-pairs emits NO remove: the merged stream stays 
 
   relay.transition('revoked')
   // Give the aborted remote leg every chance to surface a wrongly emitted
-  // frame: a remove would be queued in the channel AHEAD of the local frame
-  // read below.
+  // frame: a remove would be queued in the channel AHEAD of the frames read
+  // below. The T34 annotation's two title upserts ARE emitted (they are not
+  // removes) and precede the local order.
   await new Promise((resolve) => setTimeout(resolve, 50))
   localGate.push({ type: 'order', workspaceIds: ['ws-local'] })
-  const only = await readSome(iterator, 1)
+  const only = await readSome(iterator, 3)
   only.forEach(ui.apply)
-  assert.deepEqual(only, [{ type: 'order', workspaceIds: ['ws-local', v1, v2] }], 'the first frame after the revocation is the local order — no remove preceded it')
+  assert.deepEqual(only.map((frame) => frame.type), ['upsert', 'upsert', 'order'], 'only title upserts (no remove) preceded the local order')
   assert.equal(ui.ids(), `ws-local,${v1},${v2}`, 'the REAL model still holds the remote groups — the blacklist was never triggered')
   assert.equal(relay.streams.length, 1, 'nothing reopens while revoked')
   controller.abort()
@@ -1516,4 +1525,217 @@ test('the wiring uninstalls when the self-check fails (unreachable wrap)', async
   assert.equal(status.intercept.installed, false)
   assert.equal(status.intercept.selfCheck.ok, false)
   for (const disposer of effects) disposer()
+})
+
+// -- T34: offline writes, status annotations, closed sessions ------------------------
+
+test('T34: every write method is refused remote-offline while the relay is not online, and never reaches the relay', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  relay.transition('offline')
+  const writes = [
+    ['session/prompt', { request: { sessionId: VIRTUAL_ID, content: [{ type: 'text', text: 'hi' }] } }],
+    ['session/cancel', { request: { sessionId: VIRTUAL_ID } }],
+    ['session/rename', { request: { sessionId: VIRTUAL_ID, title: 'x' } }],
+    ['session/selectModel', { request: { sessionId: VIRTUAL_ID, selection: { provider: 'p', model: 'm' } } }],
+    ['session/updateQueue', { request: { sessionId: VIRTUAL_ID, itemId: 'q', action: { kind: 'remove' } } }],
+    ['job/kill', { request: { sessionId: VIRTUAL_ID, jobId: 'j' } }],
+    ['messageFeedback/put', { request: { sessionId: VIRTUAL_ID, messageId: 'm', rating: 'up' } }],
+    ['messageFeedback/delete', { request: { sessionId: VIRTUAL_ID, messageId: 'm' } }],
+    ['workspace/pinSession', { request: { sessionId: VIRTUAL_ID } }],
+    ['workspace/unpinSession', { request: { sessionId: VIRTUAL_ID } }],
+    ['workspace/archiveSession', { request: { sessionId: VIRTUAL_ID } }],
+    ['workspace/unarchiveSession', { request: { sessionId: VIRTUAL_ID } }],
+  ]
+  for (const [endpoint, request] of writes) {
+    const envelope = await gateway.rpcBridge(endpoint, { args: request }, undefined, gateway.operatorPeer())
+    assert.deepEqual(envelope, { ok: false, error: { code: 'remote-offline', message: '服务端离线，远程会话暂时只读', details: {} } }, endpoint)
+  }
+  assert.deepEqual(relay.invokes, [], 'not one write traveled')
+  assert.equal(gateway.rpcCalls.length, 0, 'the local gateway never saw them either')
+  handle.uninstall()
+})
+
+test('T34: a read method still forwards while offline (its own transport error answers it)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  relay.transition('offline')
+  const envelope = await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, gateway.operatorPeer())
+  assert.equal(relay.invokes.length, 1, 'the read was forwarded as today')
+  assert.equal(envelope.ok, true, 'the fake relay answers; the REAL client would fail the call offline — the point is it was SENT')
+  // the same session answering again once online: the refusal must be gone
+  relay.transition('online')
+  const write = await gateway.rpcBridge('session/rename', { args: { request: { sessionId: VIRTUAL_ID, title: 'x' } } }, undefined, gateway.operatorPeer())
+  assert.equal(write.ok, true)
+  handle.uninstall()
+})
+
+test('T34: the relay going offline annotates the shown group titles （离线）; the reopened baseline restores them', async () => {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  await readSome(iterator, 1)
+  relay.streams[0].gate.push(REMOTE_BASELINE)
+  await readSome(iterator, 5)
+
+  relay.transition('offline')
+  // the transport death takes the in-flight leg with it, like the real
+  // client's stream does on an outage (the pump then parks on waitOnline)
+  relay.streams[0].gate.throwNow(new RelayError('offline', '链路断了'))
+  const annotated = await readSome(iterator, 2)
+  assert.deepEqual(annotated.map((frame) => frame.type), ['upsert', 'upsert'])
+  assert.equal(annotated[0].workspace.title, '主服务器 · 远端一（离线）')
+  assert.equal(annotated[1].workspace.title, '主服务器 · 远端二（离线）')
+
+  // local frames keep merging under the annotation while offline
+  localGate.push({ type: 'order', workspaceIds: ['ws-local'] })
+  assert.deepEqual(await readSome(iterator, 1), [
+    { type: 'order', workspaceIds: ['ws-local', toVirtual(SERVER_ID, 'w-1'), toVirtual(SERVER_ID, 'w-2')] },
+  ])
+
+  // back online: the annotation clears SILENTLY (no premature all-clear);
+  // the reopened leg's baseline is what restores the plain titles
+  relay.transition('online')
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push(REMOTE_BASELINE)
+  const restored = await readSome(iterator, 5)
+  assert.equal(restored[0].workspace.title, '主服务器 · 远端一')
+  assert.ok(restored.every((frame) => !(frame.workspace?.title ?? '').includes('（离线）')))
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('T34: revoked keeps the group and annotates 令牌已吊销; re-pair restores', async () => {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  await readSome(iterator, 1)
+  relay.streams[0].gate.push(REMOTE_BASELINE)
+  await readSome(iterator, 5)
+
+  relay.transition('revoked')
+  const annotated = await readSome(iterator, 2)
+  assert.deepEqual(annotated.map((frame) => frame.type), ['upsert', 'upsert'])
+  assert.equal(annotated[0].workspace.title, '主服务器 · 远端一（令牌已吊销）')
+  assert.ok(relay.streams[0].aborted, 'the in-flight leg was cut')
+
+  relay.transition('online')
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push(REMOTE_BASELINE)
+  const restored = await readSome(iterator, 5)
+  assert.equal(restored[0].workspace.title, '主服务器 · 远端一')
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('T34: a version mismatch (compat.different) annotates 版本有差异 while online; offline outranks it', async () => {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay({
+    compat: { identical: ['session'], different: ['workspace'], unavailable: [] },
+  })
+  const { handle } = install(gateway, relay)
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  await readSome(iterator, 1)
+  // the FIRST baseline already carries the annotation (set at stream start)
+  relay.streams[0].gate.push(REMOTE_BASELINE)
+  const mismatched = await readSome(iterator, 5)
+  assert.equal(mismatched[0].workspace.title, '主服务器 · 远端一（版本有差异）')
+
+  // offline outranks the mismatch: the titles re-annotate 离线
+  relay.transition('offline')
+  const annotated = await readSome(iterator, 2)
+  assert.equal(annotated[0].workspace.title, '主服务器 · 远端一（离线）')
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('T34: an unshared error line registers the closed session with its structured reason', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  relay.streamFrames = [{ type: 'snapshot', header: { id: LOCAL_ID } }]
+  relay.streamThrow = new RelayError('unshared', 'shared session session-x was unshared (idle)', undefined, 'idle')
+  await assert.rejects(
+    drained(gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined })),
+    (error) => error.code === 'unshared',
+  )
+  assert.deepEqual(handle.diagnostics().closedSessions, [{ sessionId: VIRTUAL_ID, reason: 'idle' }])
+
+  // an unknown (or absent) reason degrades to manual — an older server's
+  // frame has no reason field at all
+  relay.streamFrames = [{ type: 'snapshot', header: { id: LOCAL_ID } }]
+  relay.streamThrow = new RelayError('unshared', 'shared session session-x was unshared')
+  await assert.rejects(
+    drained(gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined })),
+    (error) => error.code === 'unshared',
+  )
+  assert.deepEqual(handle.diagnostics().closedSessions, [{ sessionId: VIRTUAL_ID, reason: 'manual' }])
+  handle.uninstall()
+})
+
+test('T34: a successful call for the session clears its closed entry; a reconnect clears them all', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  relay.streamFrames = []
+  relay.streamThrow = new RelayError('unshared', 'closed', undefined, 'client')
+  await assert.rejects(
+    drained(gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined })),
+    (error) => error.code === 'unshared',
+  )
+  assert.equal(handle.diagnostics().closedSessions.length, 1)
+
+  // a succeeding invoke for the SAME session proves it is served again
+  relay.streamThrow = undefined
+  relay.invokeValue = { ok: 1 }
+  const page = await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, gateway.operatorPeer())
+  assert.equal(page.ok, true)
+  assert.deepEqual(handle.diagnostics().closedSessions, [], 'the per-session clear ran')
+
+  // register two, then a relay return to online clears wholesale
+  for (const reason of ['manual', 'idle']) {
+    relay.streamFrames = []
+    relay.streamThrow = new RelayError('unshared', 'closed', undefined, reason)
+    await assert.rejects(
+      drained(gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined })),
+      (error) => error.code === 'unshared',
+    )
+  }
+  assert.equal(handle.diagnostics().closedSessions.length, 1, 'the same session replaced its entry, not appended')
+  relay.transition('online')
+  assert.deepEqual(handle.diagnostics().closedSessions, [], 'the reconnect cleared the registry')
+  handle.uninstall()
+})
+
+test('T34: the closed registry caps at 200 entries', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  for (let i = 0; i < 205; i += 1) {
+    const id = toVirtual(SERVER_ID, `session-${i}`)
+    relay.streamFrames = []
+    relay.streamThrow = new RelayError('unshared', 'closed', undefined, 'idle')
+    await assert.rejects(
+      drained(gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: id } } } }, undefined, undefined, undefined, { signal: undefined })),
+      (error) => error.code === 'unshared',
+    )
+  }
+  const closed = handle.diagnostics().closedSessions
+  assert.equal(closed.length, 200)
+  assert.equal(closed[0].sessionId, toVirtual(SERVER_ID, 'session-5'), 'the oldest entries were evicted')
+  assert.equal(closed[199].sessionId, toVirtual(SERVER_ID, 'session-204'))
+  handle.uninstall()
 })

@@ -601,6 +601,24 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     margin-bottom: -2px;
   }
 
+  /* --- 7b2. the T34 remote-status banner opts OUT of the cage ---
+     Same class of entry as the to-do card (7a): a full-width status strip,
+     not a pill. dsh-zen-remote's remote banner registers into this dock at
+     order 15 when a remote session is offline or closed (T34) — the 26px
+     cage would clip the copy to one unreadable sliver. A whole line of its
+     own, natural height. */
+  [data-slot="conversation.input.dock"] > [data-zen-remote="remote-banner"] {
+    flex: 1 0 100% !important;
+    order: 2 !important;
+    max-width: none !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    border-radius: 12px !important;
+    font-size: 12px !important;
+    line-height: 18px !important;
+  }
+
   /* --- 7c. the queue strip opts OUT of the cage, on a line of its own ---
      Third entry that is not a pill. conversation.input.dock is a \`list\` slot
      and DSH's own QueueDock registers into it at order 20 (id \`queue\`,
