@@ -57,12 +57,33 @@ const HANDSHAKE_PATH = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE_PATH = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM_PATH = '/_dsh/zen-remote/relay/v1/stream'
 const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
+const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 
 /** How long a stream may stay line-silent before it is judged dead. */
 const DEFAULT_IDLE_TIMEOUT_MS = 45_000
 
 /** How long one request/response round-trip may take in full. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+
+/**
+ * The invoke round-trip budget (T31-fix): the configured request timeout
+ * plus 2 s per MiB of request body, capped at five minutes. The large
+ * bodies are the prompt routes' INLINE images — `session/prompt` /
+ * `subagents/prompt` content blocks carry base64 `image` data, one image up
+ * to 20 MiB by default (`maxImageBytes`, dsh-attachment-local) or ~27 MiB
+ * encoded — so a full-size picture over a slow link gets minutes, not the
+ * base seconds. The cap never lands below the configured base timeout.
+ */
+const INVOKE_TIMEOUT_PER_MIB_MS = 2_000
+const INVOKE_TIMEOUT_CAP_MS = 300_000
+
+/** The budget one invoke exchange gets, from its serialized body size. Whole
+ * MiB only (floored): a small call keeps the plain base budget — the extra
+ * time exists for the big inline-image bodies, not for every round-trip. */
+function invokeTimeoutMs(requestTimeoutMs: number, bodyJson: string): number {
+  const mib = Math.floor(Buffer.byteLength(bodyJson, 'utf8') / (1024 * 1024))
+  return Math.min(requestTimeoutMs + INVOKE_TIMEOUT_PER_MIB_MS * mib, Math.max(requestTimeoutMs, INVOKE_TIMEOUT_CAP_MS))
+}
 
 /**
  * The automatic reconnect ladder (T43): after the client lands `offline` it
@@ -219,6 +240,12 @@ export interface RelayClient {
    * A success proves the link and lifts a stale `offline` back to `online`,
    * exactly like invoke. */
   unshare(sessionId: string, signal?: AbortSignal): Promise<void>
+  /** Answer one forwarded Remote event (T32): `eventId` is the ORIGINAL id
+   * (the interceptor swapped the virtual one back), `result` the Remote
+   * event OUTCOME, forwarded verbatim — the gateway validates it. The error
+   * mapping is invoke's: a success envelope resolves (with the value, in
+   * practice undefined), everything else throws RelayError. */
+  postEventResult(eventId: string, result: unknown, signal?: AbortSignal): Promise<unknown>
   /** Open the NDJSON stream route. `frame` lines are yielded, `ping` lines
    * only refresh the idle clock, `end` finishes the iteration, an `error`
    * line throws its RelayError. A caller abort ENDS the iteration normally;
@@ -451,7 +478,16 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * dispatcher's business and must never be set by hand: DSH's process
    * swaps the global fetch dispatcher for its own undici, which rejects a
    * manual content-length outright (fetch failed / UND_ERR_INVALID_ARG). */
-  function requestInit(token: string, body: unknown): RequestInit {
+  /**
+   * The shared request face of every route. ONLY endpoint headers live
+   * here — content-length, host, connection and transfer-encoding are the
+   * dispatcher's business and must never be set by hand: DSH's process
+   * swaps the global fetch dispatcher for its own undici, which rejects a
+   * manual content-length outright (fetch failed / UND_ERR_INVALID_ARG).
+   * The body arrives PRE-SERIALIZED: the invoke caller needs the JSON once
+   * for its size-based timeout, so every route stringifies exactly one.
+   */
+  function requestInit(token: string, bodyJson: string): RequestInit {
     return {
       method: 'POST',
       headers: {
@@ -461,7 +497,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         // wall arrives as HTML and a revocation cannot be classified.
         accept: 'application/json',
       },
-      body: JSON.stringify(body),
+      body: bodyJson,
       // A wrong server must not walk the pairing token through a redirect.
       redirect: 'manual',
     }
@@ -526,15 +562,23 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * 2xx plus `ok:true` — and then lifts a stale `offline` back to `online`,
    * because a success proves the link. EVERY other outcome throws the
    * mapped RelayError; transport failures (fetch rejection, mid-body cut,
-   * timeout) set `offline` first.
+   * timeout) set `offline` first — EXCEPT a timeout on a route that opted
+   * out (`timeoutSetsOffline: false`, the invoke route): a slow call — a
+   * 28 MiB inline-image prompt crawling up a slow link — is not a dead
+   * LINK, so it fails the call and leaves the connection state exactly
+   * where it was. Only the handshake / stream-header legs and real
+   * network-layer failures judge the link.
    */
   async function exchange(
     pathName: string,
-    body: unknown,
+    bodyJson: string,
     signal: AbortSignal | undefined,
     applySuccessState: boolean,
     creds: { url: string; token: string },
+    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean } = {},
   ): Promise<Record<string, unknown>> {
+    const timeoutMs = opts.timeoutMs ?? requestTimeoutMs
+    const timeoutSetsOffline = opts.timeoutSetsOffline ?? true
     const controller = new AbortController()
     const onExternalAbort = (): void => {
       controller.abort()
@@ -547,19 +591,23 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     const timer = setTimeout(() => {
       timedOut = true
       controller.abort()
-    }, requestTimeoutMs)
+    }, timeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
     try {
       const url = creds.url
       const token = creds.token
       let response: Response
       try {
-        response = await fetchImpl(`${url}${pathName}`, { ...requestInit(token, body), signal: controller.signal })
+        response = await fetchImpl(`${url}${pathName}`, { ...requestInit(token, bodyJson), signal: controller.signal })
       } catch (error) {
         if (signal?.aborted) throw abortedError()
+        if (timedOut && !timeoutSetsOffline) {
+          noteFailure('request-timeout')
+          throw new RelayError('request-timeout', `no response within ${timeoutMs} ms`)
+        }
         noteFailure('offline')
         setState('offline')
-        throw new RelayError('offline', timedOut ? `no response within ${requestTimeoutMs} ms` : messageOf(error))
+        throw new RelayError('offline', timedOut ? `no response within ${timeoutMs} ms` : messageOf(error))
       }
       let payload: unknown
       try {
@@ -598,7 +646,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       setState('connecting')
       let payload: Record<string, unknown>
       try {
-        payload = await exchange(HANDSHAKE_PATH, {}, undefined, false, creds)
+        payload = await exchange(HANDSHAKE_PATH, '{}', undefined, false, creds)
       } catch (error) {
         // The two walls keep the state the mapping gave them (revoked /
         // incompatible). Every OTHER failure is an answer the contract says
@@ -721,13 +769,26 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
 
   async function invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
     const creds = requireCredentials()
-    const payload = await exchange(INVOKE_PATH, { namespace, method, args }, signal, true, creds)
+    // One serialization, two uses: the body on the wire and the size the
+    // round-trip budget scales with. The timeout deliberately does NOT move
+    // the connection state — a slow prompt is a slow call, not a dead link.
+    const bodyJson = JSON.stringify({ namespace, method, args })
+    const payload = await exchange(INVOKE_PATH, bodyJson, signal, true, creds, {
+      timeoutMs: invokeTimeoutMs(requestTimeoutMs, bodyJson),
+      timeoutSetsOffline: false,
+    })
+    return payload.value
+  }
+
+  async function postEventResult(eventId: string, result: unknown, signal?: AbortSignal): Promise<unknown> {
+    const creds = requireCredentials()
+    const payload = await exchange(EVENT_RESULT_PATH, JSON.stringify({ eventId, result }), signal, true, creds)
     return payload.value
   }
 
   async function unshare(sessionId: string, signal?: AbortSignal): Promise<void> {
     const creds = requireCredentials()
-    await exchange(UNSHARE_PATH, { sessionId }, signal, true, creds)
+    await exchange(UNSHARE_PATH, JSON.stringify({ sessionId }), signal, true, creds)
   }
 
   function openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown> {
@@ -797,7 +858,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       let response: Response
       try {
         response = await fetchImpl(`${url}${STREAM_PATH}`, {
-          ...requestInit(token, { namespace, method, args }),
+          ...requestInit(token, JSON.stringify({ namespace, method, args })),
           signal: controller.signal,
         })
       } catch (error) {
@@ -918,6 +979,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     stop,
     invoke,
     unshare,
+    postEventResult,
     openStream,
   }
 }

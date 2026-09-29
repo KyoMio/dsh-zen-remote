@@ -76,11 +76,55 @@ function makeGate(call) {
   }
 }
 
+/** The gateway's `$events` leg (T32): the ready frame IS the first yielded
+ * frame — exactly what openRemoteEvents produces (REMOTE_EVENT_STREAM_READY +
+ * clientId + host) — then the test drives the pending-event frames. */
+function makeEventsGate(signal) {
+  const pending = []
+  let wake = () => {}
+  let settled = 'open' // 'open' | 'done' | { error }
+  signal?.addEventListener('abort', () => {
+    if (settled === 'open') {
+      settled = { error: Object.assign(new Error('Remote invocation "$events" was aborted'), { code: 'gateway/cancelled' }) }
+      wake()
+    }
+  })
+  const iterable = (async function* () {
+    yield { type: 'ready', clientId: 'srv-events-client', host: { home: '/srv/home' } }
+    while (true) {
+      if (pending.length > 0) {
+        const next = pending.shift()
+        if (next.kind === 'frame') yield next.frame
+        else if (next.kind === 'throw') throw next.error
+        else return
+      } else if (settled !== 'open') {
+        if (settled === 'done') return
+        throw settled.error
+      } else {
+        await new Promise((resolve) => { wake = resolve })
+      }
+    }
+  })()
+  return {
+    iterable,
+    push: (frame) => { pending.push({ kind: 'frame', frame }); wake() },
+    throwNow: (error) => { pending.push({ kind: 'throw', error }); wake() },
+    finish: () => { pending.push({ kind: 'return' }); wake() },
+    get aborted() { return signal?.aborted === true },
+  }
+}
+
 /** A recording fake gateway: `invoke` answers from overrides.invoke (default:
- * a DSH-shaped not-implemented error), `stream` opens a gate per call. */
+ * a DSH-shaped not-implemented error), `stream` opens a gate per call. T32
+ * adds the two event surfaces: `wireStream.open` (the only door to `$events`)
+ * hands out one events gate, `dispatchRpc` records every `$events/result`
+ * answer and returns the ok envelope unless overridden. */
 function makeFakeGateway(overrides = {}) {
   const invokeCalls = []
   const streams = []
+  const wireOpens = []
+  const eventResults = []
+  let eventsGate
   const gateway = {
     invoke: async (call) => {
       invokeCalls.push(call)
@@ -93,8 +137,23 @@ function makeFakeGateway(overrides = {}) {
       if (overrides.stream !== undefined) await overrides.stream(call, gate)
       return gate.iterable
     },
+    wireStream: {
+      open: async (endpoint, payload, uplink, peer, signal) => {
+        wireOpens.push({ endpoint, payload, uplink, peer, signal })
+        if (endpoint !== '$events') {
+          throw Object.assign(new Error(`no wireStream fake for ${endpoint}`), { code: 'test/not-implemented' })
+        }
+        eventsGate = makeEventsGate(signal)
+        return eventsGate.iterable
+      },
+    },
+    dispatchRpc: async (endpoint, payload, signal, peer) => {
+      eventResults.push({ endpoint, payload, signal, peer })
+      if (overrides.dispatchRpc !== undefined) return overrides.dispatchRpc(endpoint, payload, signal, peer)
+      return { ok: true, value: undefined }
+    },
   }
-  return { gateway, invokeCalls, streams }
+  return { gateway, invokeCalls, streams, wireOpens, eventResults, eventsGate: () => eventsGate }
 }
 
 function makeParts(name, { shared = [], overrides = {}, heartbeatMs, endDrainTimeoutMs, parentOf } = {}) {
@@ -1075,4 +1134,294 @@ test('T34: the pre-open gate (no event observed) degrades to reason manual', asy
     assert.equal(open.lines[0].error.code, 'unshared')
     assert.equal(open.lines[0].error.reason, 'manual', 'an eventless closure reads manual')
   } finally { await server.stop() }
+})
+
+// ---- T32 (+T32-fix): the $zr/events forwarding subscription + event-result -------------
+
+const EVENTS_BODY = { namespace: '$zr', method: 'events', args: {} }
+const postEvent = (body, device) => post('/e', body, device === undefined ? AUTH : { ...AUTH, 'x-zen-remote-device': device })
+
+/** The token-bearing eventId a forwarded line carries: `<hex token>.<original>`. */
+const forwardedIds = (open) => open.lines
+  .filter((line) => line.type === 'frame' && line.frame?.type === 'waterfall')
+  .map((line) => line.frame.eventId)
+const cancelIds = (open) => open.lines
+  .filter((line) => line.type === 'frame' && line.frame?.type === 'cancel')
+  .map((line) => line.frame.eventId)
+const isTokenForm = (id, original) => typeof id === 'string' && /^[0-9a-f]{16}\./.test(id) && id.endsWith(`.${original}`)
+
+test('T32-fix: $zr/events forwards token-marked waterfalls, answers next for dropped ones, drops emits and foreign cancels', async () => {
+  const parts = makeParts('t32-events', { shared: ['S-shared'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, EVENTS_BODY)
+    assert.equal(open.status, 200)
+    await waitFor(() => parts.wireOpens.length === 1)
+    // The ONLY door: the wire adapter with the empty args object (RT
+    // openRemoteEvents refuses anything else), no uplink.
+    assert.equal(parts.wireOpens[0].endpoint, '$events')
+    assert.deepEqual(parts.wireOpens[0].payload, { args: {} })
+    assert.equal(parts.wireOpens[0].uplink, undefined)
+
+    // The ready frame forwards SCRUBBED: the clientId stays server-side for
+    // the answer route, the host facts never leave the process.
+    await waitFor(() => open.lines.length >= 1)
+    assert.deepEqual(open.lines[0], { type: 'frame', frame: { type: 'ready' } })
+
+    const gate = parts.eventsGate()
+    gate.push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: { toolName: 'Bash', callId: 'c1' } })
+    gate.push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-secret', agentId: 'S-secret', request: { toolName: 'Bash', callId: 'c2' } })
+    gate.push({ type: 'emit', event: 'api-session/added', args: [{ sessionId: 'S-secret', title: '机密会话' }] })
+    gate.push({ type: 'cancel', eventId: 'evt-never-forwarded' })
+    await waitFor(() => forwardedIds(open).length >= 1)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    // Exactly ONE waterfall traveled, under its token; the unshared
+    // session's waterfall, the server-wide emit and the foreign cancel all
+    // stayed server-side.
+    assert.equal(forwardedIds(open).length, 1)
+    const tokenEventId = forwardedIds(open)[0]
+    assert.ok(isTokenForm(tokenEventId, 'evt-1'), `the forwarded eventId is <token>.<original>, got ${tokenEventId}`)
+    assert.deepEqual(open.lines[1], {
+      type: 'frame',
+      frame: { type: 'waterfall', event: 'approval/request', eventId: tokenEventId, agentId: 'S-shared', request: { toolName: 'Bash', callId: 'c1' } },
+    })
+    assert.equal(open.lines.length, 2, 'emit frames and unforwarded cancels never travel')
+    assert.equal(cancelIds(open).length, 0)
+
+    // The DROPPED unshared waterfall was answered `next` on behalf — with
+    // the subscription's OWN clientId and the ORIGINAL eventId — so the
+    // gateway does not wait for a delivery that will never come.
+    await waitFor(() => parts.eventResults.length >= 1)
+    assert.deepEqual(parts.eventResults[0], {
+      endpoint: '$events/result',
+      payload: { args: { clientId: 'srv-events-client', eventId: 'evt-secret', outcome: { kind: 'next' } } },
+      signal: undefined,
+      peer: undefined,
+    })
+
+    // A cancel for a REGISTERED event forwards (with the token) and closes
+    // the entry; a second cancel for the same id no longer travels.
+    gate.push({ type: 'cancel', eventId: 'evt-1' })
+    await waitFor(() => cancelIds(open).length >= 1)
+    assert.deepEqual(cancelIds(open), [tokenEventId])
+    gate.push({ type: 'cancel', eventId: 'evt-1' })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(cancelIds(open).length, 1, 'the registry entry went with the forward')
+
+    // A forwarded waterfall of a shared session carries its token too.
+    gate.push({ type: 'waterfall', event: 'user-questions/request', eventId: 'evt-q', agentId: 'S-shared', request: { questions: [{ id: 'q1' }] } })
+    await waitFor(() => forwardedIds(open).length >= 2)
+    assert.ok(isTokenForm(forwardedIds(open)[1], 'evt-q'))
+
+    gate.finish()
+    await open.done
+    assert.equal(open.lines[open.lines.length - 1].type, 'end')
+  } finally { await server.stop() }
+})
+
+test('T32-fix: event-result resolves the subscription by token, the entry by registry', async () => {
+  const parts = makeParts('t32-answer', { shared: ['S-shared'] })
+  const server = await startServer(parts.handler)
+  try {
+    // Before anything was forwarded, an answer is unknown — even one in the
+    // old global-id shape (no token at all).
+    const early = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: 'evt-1', result: { kind: 'next' } }))
+    assert.equal(early.status, 403)
+    assert.deepEqual(await early.json(), { ok: false, error: { code: 'unknown-event' } })
+    // A malformed body is a 400 before any ownership question.
+    const bad = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: 'evt-1' }))
+    assert.equal(bad.status, 400)
+    assert.deepEqual(await bad.json(), { ok: false, error: { code: 'bad-request' } })
+
+    const open = await openStream(server, EVENTS_BODY)
+    await waitFor(() => open.lines.length >= 1)
+    parts.eventsGate().push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    await waitFor(() => forwardedIds(open).length >= 1)
+    const tokenEventId = forwardedIds(open)[0]
+
+    const answer = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'result', value: 'allowed-once' } }))
+    assert.equal(answer.status, 200)
+    assert.deepEqual(await answer.json(), { ok: true })
+    assert.equal(parts.eventResults.length, 1)
+    const dispatch = parts.eventResults[0]
+    assert.equal(dispatch.endpoint, '$events/result')
+    // The exact payload contract (parseRemoteEventResult): one args field
+    // holding the subscription's clientId, the ORIGINAL eventId (token
+    // stripped), the outcome as-is.
+    assert.deepEqual(dispatch.payload, {
+      args: { clientId: 'srv-events-client', eventId: 'evt-1', outcome: { kind: 'result', value: 'allowed-once' } },
+    })
+
+    // The gateway's own envelope — including failures — rides back untouched.
+    parts.gateway.dispatchRpc = async () => ({ ok: false, error: { code: 'gateway/internal', message: 'api gateway: invalid Remote event result', details: {} } })
+    const refused = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'nonsense' } }))
+    assert.equal(refused.status, 200)
+    assert.deepEqual(await refused.json(), { ok: false, error: { code: 'gateway/internal', message: 'api gateway: invalid Remote event result', details: {} } })
+    delete parts.gateway.dispatchRpc
+
+    // An answered-and-cancelled event is over: its registry entry went with
+    // the forwarded cancel, so the LATE answer refuses — the client turns
+    // that into the same silent ok DSH gives a stale result.
+    parts.eventsGate().push({ type: 'cancel', eventId: 'evt-1' })
+    await waitFor(() => cancelIds(open).length >= 1)
+    const late = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'result' } }))
+    assert.equal(late.status, 403)
+    assert.deepEqual(await late.json(), { ok: false, error: { code: 'unknown-event' } })
+
+    parts.eventsGate().finish()
+    await open.done
+    const after = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'next' } }))
+    assert.equal(after.status, 403)
+    assert.deepEqual(await after.json(), { ok: false, error: { code: 'unknown-event' } })
+  } finally { await server.stop() }
+})
+
+test('T32-fix: a foreign device cannot answer another device\'s subscription', async () => {
+  const parts = makeParts('t32-device', { shared: ['S-shared'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, EVENTS_BODY) // AUTH rides device-1
+    await waitFor(() => open.lines.length >= 1)
+    parts.eventsGate().push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    await waitFor(() => forwardedIds(open).length >= 1)
+    const tokenEventId = forwardedIds(open)[0]
+
+    // Device B knows a token (say it guessed or sniffed one) — refused
+    // before the registry is even read, indistinguishable from unknown.
+    const foreign = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'result', value: 'allowed-once' } }, 'device-2'))
+    assert.equal(foreign.status, 403)
+    assert.deepEqual(await foreign.json(), { ok: false, error: { code: 'unknown-event' } })
+    assert.equal(parts.eventResults.length, 0, 'the foreign answer never reached the gateway')
+
+    // The owning device answers fine.
+    const own = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'result', value: 'allowed-once' } }, 'device-1'))
+    assert.equal(own.status, 200)
+    assert.deepEqual(await own.json(), { ok: true })
+    assert.deepEqual(parts.eventResults[0].payload.args.eventId, 'evt-1')
+
+    parts.eventsGate().finish()
+    await open.done
+  } finally { await server.stop() }
+})
+
+test('T32-fix: unsharing mid-event synthesizes the cancel, abstains next, and closes the answer', async () => {
+  const parts = makeParts('t32-unshare', { shared: ['S-shared'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, EVENTS_BODY)
+    await waitFor(() => open.lines.length >= 1)
+    parts.eventsGate().push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    await waitFor(() => forwardedIds(open).length >= 1)
+    const tokenEventId = forwardedIds(open)[0]
+
+    parts.store.unshare('S-shared', 'manual')
+    // The sub-client sees the same close frame the gateway would have sent.
+    await waitFor(() => cancelIds(open).length >= 1)
+    assert.deepEqual(cancelIds(open), [tokenEventId])
+    // The server abstained on the sub-client's behalf at the gateway.
+    await waitFor(() => parts.eventResults.length >= 1)
+    assert.deepEqual(parts.eventResults[0].payload, {
+      args: { clientId: 'srv-events-client', eventId: 'evt-1', outcome: { kind: 'next' } },
+    })
+    // And the answer is closed — the entry went with the synthesized cancel.
+    const refused = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'next' } }))
+    assert.equal(refused.status, 403)
+    assert.deepEqual(await refused.json(), { ok: false, error: { code: 'unknown-event' } })
+
+    // Re-sharing does not resurrect it (the known limitation: only the next
+    // reconnect re-delivers), and the gateway's own late cancel for the
+    // already-deleted entry does not travel.
+    parts.store.share('S-shared')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(cancelIds(open).length, 1)
+    const stillRefused = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'next' } }))
+    assert.equal(stillRefused.status, 403)
+
+    parts.eventsGate().finish()
+    await open.done
+  } finally { await server.stop() }
+})
+
+test('T32-fix: the per-subscription registry caps at 500 and drops the oldest', async () => {
+  const parts = makeParts('t32-cap', { shared: ['S-shared'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, EVENTS_BODY)
+    await waitFor(() => open.lines.length >= 1)
+    const gate = parts.eventsGate()
+    for (let i = 0; i <= 500; i += 1) {
+      gate.push({ type: 'waterfall', event: 'approval/request', eventId: `evt-${i}`, agentId: 'S-shared', request: {} })
+    }
+    await waitFor(() => forwardedIds(open).length >= 501)
+    // evt-0 is the 501st-oldest: forgotten. Its cancel is not forwarded and
+    // its answer refuses.
+    gate.push({ type: 'cancel', eventId: 'evt-0' })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(cancelIds(open).length, 0)
+    const ghost = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: `${forwardedIds(open)[0].split('.')[0]}.evt-0`, result: { kind: 'next' } }))
+    assert.equal(ghost.status, 403)
+
+    // The newest event is still owned: its cancel travels.
+    gate.push({ type: 'cancel', eventId: 'evt-500' })
+    await waitFor(() => cancelIds(open).length >= 1)
+    assert.ok(isTokenForm(cancelIds(open)[0], 'evt-500'))
+
+    gate.finish()
+    await open.done
+  } finally { await server.stop() }
+})
+
+test('T32-fix: closeAll empties the event registries at once', async () => {
+  const parts = makeParts('t32-closeall', { shared: ['S-shared'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, EVENTS_BODY)
+    await waitFor(() => open.lines.length >= 1)
+    parts.eventsGate().push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    await waitFor(() => forwardedIds(open).length >= 1)
+    const tokenEventId = forwardedIds(open)[0]
+
+    parts.handler.closeAll('plugin row reloaded')
+    // The refusal must be immediate — not gated on the stream's own
+    // teardown unwinding.
+    const refused = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'next' } }))
+    assert.equal(refused.status, 403)
+    assert.deepEqual(await refused.json(), { ok: false, error: { code: 'unknown-event' } })
+    await open.done
+  } finally { await server.stop() }
+})
+
+test('T32-fix: a composition without the event surfaces degrades honestly', async () => {
+  // No wire adapter: the subscription itself answers with an error line.
+  const parts = makeParts('t32-no-wire', { shared: ['S-shared'] })
+  delete parts.gateway.wireStream
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, EVENTS_BODY)
+    await open.done
+    assert.deepEqual(open.lines, [
+      { type: 'error', error: { code: 'gateway/service-unavailable', message: 'forwarded Remote event source is unavailable' } },
+    ])
+  } finally { await server.stop() }
+
+  // Wire adapter but no dispatch surface: a forwarded event's answer is a
+  // 200 business envelope, not a transport error.
+  const parts2 = makeParts('t32-no-dispatch', { shared: ['S-shared'] })
+  delete parts2.gateway.dispatchRpc
+  const server2 = await startServer(parts2.handler)
+  try {
+    const open = await openStream(server2, EVENTS_BODY)
+    await waitFor(() => open.lines.length >= 1)
+    parts2.eventsGate().push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    await waitFor(() => forwardedIds(open).length >= 1)
+    const res = await server2.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: forwardedIds(open)[0], result: { kind: 'next' } }))
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), {
+      ok: false,
+      error: { code: 'gateway/service-unavailable', message: 'forwarded Remote event source is unavailable' },
+    })
+    parts2.eventsGate().finish()
+    await open.done
+  } finally { await server2.stop() }
 })

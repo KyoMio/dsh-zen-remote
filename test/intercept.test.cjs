@@ -30,7 +30,7 @@ for (const key of Object.keys(process.env)) {
 }
 
 const { checkGatewayShape } = require('../lib/intercept-shape.js')
-const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS } = require('../lib/intercept.js')
+const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS, rewriteRemoteEventFrame } = require('../lib/intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { RelayError } = require('../lib/relay-client.js')
 const { symbols } = require('@deepseek-ai/cordis')
@@ -197,12 +197,20 @@ function createControllableRelay(overrides = {}) {
     handshakeInfo: { relayProtocol: 1, serverId: SERVER_ID, serverName: '主服务器', dshVersion: '0.0.0', fingerprints: {} },
     invokes: [],
     streams: [],
+    results: [],
     invokeValue: undefined,
     invokeThrow: undefined,
+    resultValue: undefined,
+    resultThrow: undefined,
     invoke(namespace, method, args, signal) {
       relay.invokes.push({ namespace, method, args, signal })
       if (relay.invokeThrow) return Promise.reject(relay.invokeThrow)
       return Promise.resolve(relay.invokeValue)
+    },
+    postEventResult(eventId, result, signal) {
+      relay.results.push({ eventId, result, signal })
+      if (relay.resultThrow) return Promise.reject(relay.resultThrow)
+      return Promise.resolve(relay.resultValue)
     },
     openStream(namespace, method, args, signal) {
       const gate = createGate(signal)
@@ -1738,4 +1746,511 @@ test('T34: the closed registry caps at 200 entries', async () => {
   assert.equal(closed[0].sessionId, toVirtual(SERVER_ID, 'session-5'), 'the oldest entries were evicted')
   assert.equal(closed[199].sessionId, toVirtual(SERVER_ID, 'session-204'))
   handle.uninstall()
+})
+
+// -- T31: create / fork / subagents / agentId calls ----------------------------------
+
+test('session/create rewrites the virtual workspaceId, drops sessionId, virtualizes the result id', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { sessionId: 'session-fresh', agentPreset: 'default' }
+  const { handle } = install(gateway, relay)
+  const workspaceVirtual = toVirtual(SERVER_ID, 'workspace-9f0')
+  const args = { request: { workspaceId: workspaceVirtual, cwd: '/client/side', sessionId: 'session-chosen-locally' } }
+  const envelope = await gateway.rpcBridge('session/create', { args }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(envelope.value, { sessionId: toVirtual(SERVER_ID, 'session-fresh'), agentPreset: 'default' }, 'the minted id travels virtualized')
+  assert.deepEqual(relay.invokes, [{
+    namespace: 'session',
+    method: 'create',
+    args: { request: { workspaceId: 'workspace-9f0', cwd: '/client/side' } },
+    signal: undefined,
+  }], 'the original workspace id travels, cwd rides as-is (the server discards it), and the caller-chosen session id is gone')
+  assert.equal(args.request.workspaceId, workspaceVirtual, 'the caller arguments are never mutated')
+  handle.uninstall()
+})
+
+test('session/create in a LOCAL workspace passes through untouched', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const args = { request: { workspaceId: 'local-workspace-uuid', cwd: '/tmp' } }
+  await gateway.rpcBridge('session/create', { args }, undefined, undefined)
+  assert.equal(relay.invokes.length, 0, 'nothing was forwarded')
+  assert.equal(gateway.rpcCalls.length, 1, 'the local gateway answered')
+  assert.deepEqual(gateway.rpcCalls[0].payload.args, args, 'a local create is not stripped of anything')
+  handle.uninstall()
+})
+
+test('session/fork forwards the restored source id and virtualizes the child id', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { sessionId: 'session-forked' }
+  const { handle } = install(gateway, relay)
+  const envelope = await gateway.rpcBridge('session/fork', { args: { request: { sessionId: VIRTUAL_ID, atSeq: 12 } } }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(envelope.value, { sessionId: toVirtual(SERVER_ID, 'session-forked') })
+  assert.deepEqual(relay.invokes[0].args, { request: { sessionId: LOCAL_ID, atSeq: 12 } })
+  handle.uninstall()
+})
+
+test('subagents calls rewrite only the parent slot (request envelope and top level alike)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const childId = 'session-child-original'
+
+  await gateway.rpcBridge('subagents/prompt', {
+    args: { request: { requestId: 'r1', parentSessionId: toVirtual(SERVER_ID, 'session-parent'), childSessionId: childId, mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: 'hi' }] } },
+  }, undefined, undefined)
+  assert.deepEqual(relay.invokes[0].args.request, {
+    requestId: 'r1',
+    parentSessionId: 'session-parent',
+    childSessionId: childId,
+    mode: 'continuable',
+    delivery: 'queue',
+    content: [{ type: 'text', text: 'hi' }],
+  }, 'the parent id is restored; the child id is already the server-side original')
+
+  await gateway.rpcBridge('subagents/interruptByParent', {
+    args: { childSessionId: childId, parentSessionId: toVirtual(SERVER_ID, 'session-parent'), mode: 'continuable' },
+  }, undefined, undefined)
+  assert.deepEqual(relay.invokes[1].args, { childSessionId: childId, parentSessionId: 'session-parent', mode: 'continuable' }, 'the TOP-LEVEL parent slot is restored')
+  handle.uninstall()
+})
+
+test('the agentId calls restore the top-level agentId and pass everything else through', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { receiptId: 'r-1', file: { attachmentId: 'a-1', name: 'x.png', bytes: 3 } }
+  const { handle } = install(gateway, relay)
+
+  const uploadArgs = { agentId: VIRTUAL_ID, request: { data: 'Zm9v', name: 'x.png' } }
+  const uploaded = await gateway.rpcBridge('fileUploads/upload', { args: uploadArgs }, undefined, undefined)
+  assert.equal(uploaded.ok, true)
+  assert.equal(uploaded.value, relay.invokeValue, 'receipt and attachment ids are not session ids — untouched')
+  assert.deepEqual(relay.invokes[0].args, { agentId: LOCAL_ID, request: { data: 'Zm9v', name: 'x.png' } })
+
+  const refsArgs = { agentId: VIRTUAL_ID, query: 'src/' }
+  await gateway.rpcBridge('fileReferences/list', { args: refsArgs }, undefined, undefined)
+  assert.deepEqual(relay.invokes[1].args, { agentId: LOCAL_ID, query: 'src/' })
+  handle.uninstall()
+})
+
+test('an unregistered agentId-located method with a virtual agentId is still refused', async () => {
+  // The registry grew, but the deep-scan backstop has not loosened: a virtual
+  // id anywhere outside the table never reaches the local gateway.
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const envelope = await gateway.rpcBridge('goals/create', { args: { agentId: VIRTUAL_ID, request: { objective: 'x', maxGoalRounds: 1 } } }, undefined, undefined)
+  assert.deepEqual(envelope, { ok: false, error: { code: 'remote-unsupported', message: '此功能暂不支持远程会话', details: {} } })
+  assert.equal(relay.invokes.length, 0)
+  assert.equal(gateway.rpcCalls.length, 0)
+  handle.uninstall()
+})
+
+// -- T32: the forwarded-event frames -------------------------------------------------
+
+const EVT = (id) => `evt-${id}`
+
+test('rewriteRemoteEventFrame: waterfall ids go virtual in place, cancel matches, ready and emit drop', () => {
+  const waterfall = {
+    type: 'waterfall',
+    event: 'approval/request',
+    eventId: EVT('1'),
+    agentId: LOCAL_ID,
+    request: { toolName: 'Bash', callId: 'c1', reason: 'needs approval' },
+  }
+  // Exact-keys discipline (the client face validates every variant with
+  // hasExactRemoteEventKeys): the rewrite renames IN PLACE, adds nothing.
+  assert.deepEqual(rewriteRemoteEventFrame(waterfall, SERVER_ID), {
+    type: 'waterfall',
+    event: 'approval/request',
+    eventId: toVirtual(SERVER_ID, EVT('1')),
+    agentId: VIRTUAL_ID,
+    request: { toolName: 'Bash', callId: 'c1', reason: 'needs approval' },
+  })
+  assert.deepEqual(
+    rewriteRemoteEventFrame({ type: 'cancel', eventId: EVT('2') }, SERVER_ID),
+    { type: 'cancel', eventId: toVirtual(SERVER_ID, EVT('2')) },
+  )
+  // The remote ready frame: dropped — the UI's stream opened with the LOCAL
+  // ready, and a second one fails the client face's frame parser (plus it
+  // carries the server's clientId/host, which the UI must never need).
+  assert.equal(rewriteRemoteEventFrame({ type: 'ready', clientId: 'srv', host: { home: '/srv' } }, SERVER_ID), null)
+  // Emit frames are dropped outright (T32-fix): server-wide state the UI
+  // must never mistake for local sessions.
+  const emit = { type: 'emit', event: 'api-session/added', args: [{ sessionId: 's', title: '服务端会话' }] }
+  assert.equal(rewriteRemoteEventFrame(emit, SERVER_ID), null)
+  // A frame missing its ids stays a valid frame of the same shape.
+  assert.deepEqual(rewriteRemoteEventFrame({ type: 'waterfall', event: 'e', eventId: 3, agentId: 4, request: {} }, SERVER_ID), {
+    type: 'waterfall',
+    event: 'e',
+    eventId: 3,
+    agentId: 4,
+    request: {},
+  })
+  assert.deepEqual(rewriteRemoteEventFrame('junk', SERVER_ID), 'junk')
+})
+
+// -- T32: the merged $events stream ---------------------------------------------------
+
+const READY = { type: 'ready', clientId: 'local-stream-client', host: { home: '/local/home' } }
+const LOCAL_WATERFALL = {
+  type: 'waterfall',
+  event: 'user-questions/request',
+  eventId: 'evt-local-1',
+  agentId: 'session-local',
+  request: { questions: [{ id: 'q1' }] },
+}
+const SERVER_WATERFALL = {
+  type: 'waterfall',
+  event: 'approval/request',
+  // The server tokenizes eventIds (`<token>.<original>`); the client treats
+  // that as opaque and wraps the whole string.
+  eventId: 'a1b2c3d4e5f60718.evt-remote-1',
+  agentId: LOCAL_ID,
+  request: { toolName: 'Bash', callId: 'c2' },
+}
+const V_REMOTE_EVENT = toVirtual(SERVER_ID, 'a1b2c3d4e5f60718.evt-remote-1')
+
+async function openMergedEvents(relay, overrides = {}) {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const { handle, log } = install(gateway, relay, overrides)
+  const merged = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  return { controller, gateway, localGate, handle, log, merged, iterator: merged[Symbol.asyncIterator]() }
+}
+
+test('merged $events: the local ready opens, local frames pass untouched, remote frames arrive virtualized', async () => {
+  const relay = createControllableRelay()
+  const { controller, localGate, iterator } = await openMergedEvents(relay)
+  // The local ready is queued before the first pull, so the FIRST frame of
+  // the merged stream is the local one — what the client face demands.
+  localGate.push(READY)
+  const [first] = await readSome(iterator, 1)
+  assert.deepEqual(first, READY)
+
+  // The relay leg opened on its own ($zr/events, no args).
+  await waitForStream(relay, 1)
+  assert.equal(relay.streams.length, 1)
+  assert.equal(relay.streams[0].namespace, '$zr')
+  assert.equal(relay.streams[0].method, 'events')
+  assert.deepEqual(relay.streams[0].args, {})
+
+  const gate = relay.streams[0].gate
+  // The server's ready is dropped; the waterfall arrives with virtual ids.
+  gate.push({ type: 'ready', clientId: 'srv-client', host: { home: '/srv/home' } })
+  gate.push(SERVER_WATERFALL)
+  const [second] = await readSome(iterator, 1)
+  assert.deepEqual(second, {
+    type: 'waterfall',
+    event: 'approval/request',
+    eventId: V_REMOTE_EVENT,
+    agentId: VIRTUAL_ID,
+    request: { toolName: 'Bash', callId: 'c2' },
+  })
+
+  // Local frames flow beside the remote ones, untouched.
+  localGate.push(LOCAL_WATERFALL)
+  const [third] = await readSome(iterator, 1)
+  assert.deepEqual(third, LOCAL_WATERFALL)
+
+  // Cancel closes the prompt: the correlation id goes virtual too.
+  gate.push({ type: 'cancel', eventId: 'evt-remote-1' })
+  const [fourth] = await readSome(iterator, 1)
+  assert.deepEqual(fourth, { type: 'cancel', eventId: toVirtual(SERVER_ID, 'evt-remote-1') })
+
+  // Tearing the UI's stream down ends the merged stream and both legs.
+  controller.abort()
+  const done = await iterator.next()
+  assert.equal(done.done, true)
+  assert.equal(localGate.aborted, true, 'the local stream observed the teardown')
+})
+
+/** Poll until the predicate holds; times out loud (the merged pumps are
+ * promise-driven, a lost wake would otherwise hang the test). Named apart
+ * from waitForStream, which waits for a COUNT of relay streams. */
+async function waitUntil(predicate, ms = 2000) {
+  const start = Date.now()
+  while (!predicate()) {
+    if (Date.now() - start > ms) throw new Error('waitUntil timeout')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
+test('merged $events: a remote death keeps the local stream alive, the next online reopens', async () => {
+  const relay = createControllableRelay()
+  const { localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+
+  const first = relay.streams[0].gate
+  first.throwNow(new RelayError('offline', 'the relay chain answered 502'))
+  // The local UI stream keeps flowing — a remote death emits nothing.
+  localGate.push({ type: 'emit', event: 'settings/document-updated', args: [] })
+  const [next] = await readSome(iterator, 1)
+  assert.deepEqual(next, { type: 'emit', event: 'settings/document-updated', args: [] })
+
+  // The reconnect lands online: the leg reopens and pending events arrive again.
+  relay.transition('online')
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push(SERVER_WATERFALL)
+  const [waterfall] = await readSome(iterator, 1)
+  assert.equal(waterfall.eventId, V_REMOTE_EVENT)
+  await iterator.return?.(undefined)
+})
+
+test('merged $events: unpaired ends the remote leg until a re-pair; local keeps running', async () => {
+  const relay = createControllableRelay()
+  const { localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  assert.equal(relay.streams[0].aborted, false)
+
+  relay.transition('revoked')
+  await waitUntil(() => relay.streams[0].aborted)
+  localGate.push({ type: 'emit', event: 'commands/change', args: [] })
+  const [next] = await readSome(iterator, 1)
+  assert.deepEqual(next, { type: 'emit', event: 'commands/change', args: [] })
+
+  // A re-pair DOES reopen: the online transition carries a handshake
+  // identity again (the leg reopens and pending events re-deliver). But an
+  // online event with NO handshake — the unpaired row — reopens nothing.
+  relay.transition('online')
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push(SERVER_WATERFALL)
+  const [again] = await readSome(iterator, 1)
+  assert.equal(again.eventId, V_REMOTE_EVENT)
+  await iterator.return?.(undefined)
+
+  const cold = createControllableRelay()
+  const coldOpen = await openMergedEvents(cold)
+  coldOpen.localGate.push(READY)
+  await readSome(coldOpen.iterator, 1)
+  await waitForStream(cold, 1)
+  cold.handshakeInfo = undefined
+  cold.transition('revoked')
+  await waitUntil(() => cold.streams[0].aborted)
+  cold.transition('online')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(cold.streams.length, 1, 'no reopen without a handshake identity')
+  await coldOpen.iterator.return?.(undefined)
+})
+
+test('merged $events: a handshake that names another server reopens under the new ids', async () => {
+  const relay = createControllableRelay()
+  const { localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push(SERVER_WATERFALL)
+  await readSome(iterator, 1)
+
+  relay.handshakeInfo = { ...relay.handshakeInfo, serverId: 'ffffffff' }
+  relay.transition('online')
+  await waitForStream(relay, 2)
+  assert.equal(relay.streams[1].aborted, false)
+  relay.streams[1].gate.push(SERVER_WATERFALL)
+  // The cut leg closes the prompt it showed BEFORE the new leg speaks.
+  const [orphanCancel, frame] = await readSome(iterator, 2)
+  assert.deepEqual(orphanCancel, { type: 'cancel', eventId: V_REMOTE_EVENT })
+  assert.equal(frame.agentId, toVirtual('ffffffff', LOCAL_ID))
+  assert.equal(frame.eventId, toVirtual('ffffffff', 'a1b2c3d4e5f60718.evt-remote-1'))
+  await iterator.return?.(undefined)
+})
+
+test('merged $events: the consumer abort ends everything and both legs unwind', async () => {
+  const relay = createControllableRelay()
+  const { controller, localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  controller.abort()
+  const done = await iterator.next()
+  assert.equal(done.done, true)
+  await waitUntil(() => relay.streams[0].aborted)
+  assert.equal(localGate.aborted, true)
+})
+
+// -- T32: the $events/result answer split ---------------------------------------------
+
+test('$events/result: a virtual eventId rides postEventResult with the ORIGINAL id and never the local gateway', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const outcome = { kind: 'result', value: 'allowed-once' }
+  const envelope = await gateway.rpcBridge(
+    '$events/result',
+    { args: { clientId: 'local-stream-client', eventId: V_REMOTE_EVENT, outcome } },
+    undefined,
+    undefined,
+  )
+  assert.deepEqual(envelope, { ok: true, value: undefined })
+  assert.deepEqual(relay.results, [{ eventId: 'a1b2c3d4e5f60718.evt-remote-1', result: outcome, signal: undefined }])
+  assert.equal(gateway.rpcCalls.filter((call) => call.endpoint === '$events/result').length, 0, 'the local DSH never saw it')
+  handle.uninstall()
+})
+
+test('$events/result: a local eventId reaches the local gateway verbatim, the relay untouched', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const payload = { args: { clientId: 'local-stream-client', eventId: 'evt-local-1', outcome: { kind: 'result', value: 'ok' } } }
+  const envelope = await gateway.rpcBridge('$events/result', payload, undefined, undefined)
+  assert.deepEqual(envelope, { ok: true, value: { endpoint: '$events/result' } })
+  assert.equal(gateway.rpcCalls.filter((call) => call.endpoint === '$events/result').length, 1)
+  assert.deepEqual(gateway.rpcCalls[0].payload, payload)
+  assert.equal(relay.results.length, 0)
+  handle.uninstall()
+})
+
+test('$events/result: a foreign server id or a missing handshake refuses locally with details intact', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const mismatch = await gateway.rpcBridge(
+    '$events/result',
+    { args: { clientId: 'c', eventId: toVirtual('ffffffff', 'evt-x'), outcome: { kind: 'next' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(mismatch.ok, false)
+  assert.equal(mismatch.error.code, 'remote-mismatch')
+  assert.deepEqual(mismatch.error.details, {})
+  assert.equal(relay.results.length, 0)
+  handle.uninstall()
+
+  const offline = new FakeTypertGateway()
+  const offlineRelay = createControllableRelay()
+  const offlineInstall = install(offline, offlineRelay, { getServerId: () => undefined })
+  const refused = await offline.rpcBridge(
+    '$events/result',
+    { args: { clientId: 'c', eventId: toVirtual(SERVER_ID, 'evt-x'), outcome: { kind: 'next' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(refused.ok, false)
+  assert.equal(refused.error.code, 'remote-offline')
+  assert.deepEqual(refused.error.details, {})
+  offlineInstall.handle.uninstall()
+})
+
+test('$events/result: an already-over event answers silent ok — the UI stream must not fail', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  for (const code of ['unknown-event', 'not-shared']) {
+    relay.resultThrow = new RelayError(code, 'no subscription forwarded it', 403)
+    const envelope = await gateway.rpcBridge(
+      '$events/result',
+      { args: { clientId: 'c', eventId: toVirtual(SERVER_ID, 'evt-gone'), outcome: { kind: 'next' } } },
+      undefined,
+      undefined,
+    )
+    // Same answer DSH gives a stale result (receiveRemoteEventResult no-ops):
+    // a thrown answer would fail the UI's whole $events generation.
+    assert.deepEqual(envelope, { ok: true, value: undefined }, code)
+  }
+  assert.equal(handle.diagnostics().recentFailures.length, 0, 'not a call failure — the ring stays out of it')
+  handle.uninstall()
+})
+
+test('$events/result: a real relay failure maps onto the failure envelope with details', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createControllableRelay()
+  relay.resultThrow = new RelayError('offline', 'the relay chain answered 502', 502)
+  const { handle } = install(gateway, relay)
+  const envelope = await gateway.rpcBridge(
+    '$events/result',
+    { args: { clientId: 'c', eventId: toVirtual(SERVER_ID, 'evt-gone'), outcome: { kind: 'next' } } },
+    undefined,
+    undefined,
+  )
+  assert.deepEqual(envelope, {
+    ok: false,
+    error: { code: 'offline', message: 'the relay chain answered 502', details: {} },
+  })
+  const failures = handle.diagnostics().recentFailures
+  assert.deepEqual(failures[failures.length - 1], { endpoint: '$events/result', code: 'offline', time: failures[failures.length - 1].time })
+  handle.uninstall()
+})
+
+// -- T32-fix: orphan prompts and leg-end closes --------------------------------------
+
+test('merged $events T32-fix: a dying leg closes every prompt it showed, a remote emit never travels', async () => {
+  const relay = createControllableRelay()
+  const { localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  const gate = relay.streams[0].gate
+
+  // Remote emits are dropped outright (second line of defense).
+  gate.push({ type: 'emit', event: 'api-session/added', args: [{ sessionId: 's', title: 'x' }] })
+  gate.push(SERVER_WATERFALL)
+  const [waterfall] = await readSome(iterator, 1)
+  assert.equal(waterfall.eventId, V_REMOTE_EVENT, 'the emit never reached the UI, the waterfall did')
+
+  // The leg dies with the prompt still open: the UI gets the exact cancel
+  // shape its client face closes a waterfall on (type + eventId only).
+  gate.throwNow(new RelayError('offline', 'the relay chain answered 502'))
+  const [orphan] = await readSome(iterator, 1)
+  assert.deepEqual(orphan, { type: 'cancel', eventId: V_REMOTE_EVENT })
+
+  // The reopen re-delivers the still-pending event (fresh leg, fresh
+  // record): the prompt legitimately comes back.
+  relay.transition('online')
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push(SERVER_WATERFALL)
+  const [again] = await readSome(iterator, 1)
+  assert.equal(again.eventId, V_REMOTE_EVENT)
+  await iterator.return?.(undefined)
+})
+
+test('merged $events T32-fix: a real cancel clears the record — a leg end does not double-close', async () => {
+  const relay = createControllableRelay()
+  const { localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  const gate = relay.streams[0].gate
+
+  gate.push(SERVER_WATERFALL)
+  const [waterfall] = await readSome(iterator, 1)
+  assert.equal(waterfall.eventId, V_REMOTE_EVENT)
+  // The server settled it: the real cancel closes the prompt AND the record.
+  gate.push({ type: 'cancel', eventId: 'a1b2c3d4e5f60718.evt-remote-1' })
+  const [cancel] = await readSome(iterator, 1)
+  assert.deepEqual(cancel, { type: 'cancel', eventId: V_REMOTE_EVENT })
+
+  // Now the leg dies: nothing is shown anymore, so nothing is synthesized.
+  gate.throwNow(new RelayError('offline', 'gone'))
+  relay.transition('online')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  // Prove liveness and the absence of a second cancel with a local frame.
+  localGate.push(LOCAL_WATERFALL)
+  const [local] = await readSome(iterator, 1)
+  assert.deepEqual(local, LOCAL_WATERFALL, 'no synthesized cancel arrived after the real one')
+  await iterator.return?.(undefined)
+})
+
+test('merged $events T32-fix: a repeat waterfall within one leg is not re-shown', async () => {
+  const relay = createControllableRelay()
+  const { localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  const gate = relay.streams[0].gate
+  gate.push(SERVER_WATERFALL)
+  gate.push(SERVER_WATERFALL)
+  const [waterfall] = await readSome(iterator, 1)
+  assert.equal(waterfall.eventId, V_REMOTE_EVENT)
+  localGate.push(LOCAL_WATERFALL)
+  const [local] = await readSome(iterator, 1)
+  assert.deepEqual(local, LOCAL_WATERFALL, 'the duplicate never arrived between the frames')
+  await iterator.return?.(undefined)
 })

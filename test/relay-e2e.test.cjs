@@ -30,12 +30,26 @@ const { createClientHandler } = require('../lib/client-routes.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
-// Far from every other file's fixture ports (the 392xx band).
-const GW_PORT = 39301
-const TARGET_PORT = 39302
-const PROXY_PORT = 39303
+// T31-fix: every port is system-assigned so parallel test-run copies cannot
+// collide. The proxy and the relay-handler server listen(0) and read their
+// bound port back; the gateway child needs a fixed port parameter, so boot()
+// pre-grabs a free port (bind → read → release) and hands it over — the
+// gateway's own same-port retry band absorbs the small rebind race, and a
+// RESTART reuses the same number (freed by the previous child's SIGTERM).
+// The proxy reads `gwPort` at request time, so it always routes to the
+// current boot's child.
+let gwPort = 0
 const SECRET = '7e6a5b4c3d2e1f00'.repeat(4)
 const SERVER_NAME = '端到端服务器'
+
+/** One free loopback port: bound, read, released. */
+async function freePort() {
+  const server = http.createServer()
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  await new Promise((resolve) => server.close(resolve))
+  return port
+}
 
 /**
  * The reverse proxy every real deployment puts in front of the gateway. In
@@ -61,7 +75,7 @@ function startProxy() {
     let upstream
     // A client hang-up mid-stream must reach the gateway as a disconnect.
     res.on('close', () => { try { if (upstream !== undefined) upstream.destroy() } catch { /* gone */ } })
-    upstream = http.request({ host: '127.0.0.1', port: GW_PORT, method: req.method, path: req.url, headers }, (upRes) => {
+    upstream = http.request({ host: '127.0.0.1', port: gwPort, method: req.method, path: req.url, headers }, (upRes) => {
       const out = { ...upRes.headers }
       delete out['transfer-encoding']
       delete out.connection
@@ -82,11 +96,15 @@ function startProxy() {
     server.closeAllConnections()
     server.close(resolve)
   })
-  return new Promise((resolve) => server.listen(PROXY_PORT, '127.0.0.1', () => resolve({ server, stop })))
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, stop })))
 }
 
 let proxy
-test.before(async () => { proxy = await startProxy() })
+let proxyPort = 0
+test.before(async () => {
+  proxy = await startProxy()
+  proxyPort = proxy.port
+})
 test.after(async () => { if (proxy) await proxy.stop() })
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-relay-e2e-'))
@@ -128,6 +146,42 @@ function makeGate(call) {
   }
 }
 
+/** The gateway's `$events` leg (T32): ready first, exactly like
+ * openRemoteEvents yields it; abort becomes the documented cancelled throw. */
+function makeEventsGate(signal) {
+  const pending = []
+  let wake = () => {}
+  let settled = 'open'
+  signal?.addEventListener('abort', () => {
+    if (settled === 'open') {
+      settled = { error: Object.assign(new Error('Remote invocation "$events" was aborted'), { code: 'gateway/cancelled' }) }
+      wake()
+    }
+  })
+  const iterable = (async function* () {
+    yield { type: 'ready', clientId: 'srv-events-client', host: { home: '/srv/home' } }
+    while (true) {
+      if (pending.length > 0) {
+        const next = pending.shift()
+        if (next.kind === 'frame') yield next.frame
+        else if (next.kind === 'throw') throw next.error
+        else return
+      } else if (settled !== 'open') {
+        if (settled === 'done') return
+        throw settled.error
+      } else {
+        await new Promise((resolve) => { wake = resolve })
+      }
+    }
+  })()
+  return {
+    iterable,
+    push: (frame) => { pending.push({ kind: 'frame', frame }); wake() },
+    finish: () => { pending.push({ kind: 'return' }); wake() },
+    get aborted() { return signal?.aborted === true },
+  }
+}
+
 const FOLLOW_ARGS = { request: { address: { kind: 'session', sessionId: 'session-a' } } }
 
 /**
@@ -145,6 +199,8 @@ async function boot(opts = {}) {
   for (const id of shared) store.share(id)
   const invokeCalls = []
   const streams = []
+  const eventsGates = []
+  const eventResults = []
   const gateway = {
     invoke: async (call) => {
       invokeCalls.push(call)
@@ -155,6 +211,22 @@ async function boot(opts = {}) {
       const gate = makeGate(call)
       streams.push(gate)
       return gate.iterable
+    },
+    // T32: the two event surfaces — `$events` through the wire adapter, the
+    // answers through the /api dispatch.
+    wireStream: {
+      open: async (endpoint, payload, uplink, peer, signal) => {
+        if (endpoint !== '$events') {
+          throw Object.assign(new Error(`no wireStream fake for ${endpoint}`), { code: 'test/not-implemented' })
+        }
+        const gate = makeEventsGate(signal)
+        eventsGates.push(gate)
+        return gate.iterable
+      },
+    },
+    dispatchRpc: async (endpoint, payload, signal, peer) => {
+      eventResults.push({ endpoint, payload, signal, peer })
+      return { ok: true, value: undefined }
     },
   }
   const handler = createRelayHandler({
@@ -170,28 +242,32 @@ async function boot(opts = {}) {
     ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
   })
   const server = http.createServer((req, res) => { handler(req, res).catch(() => { try { res.destroy() } catch { /* gone */ } }) })
-  await new Promise((resolve) => server.listen(TARGET_PORT, '127.0.0.1', resolve))
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const targetPort = server.address().port
 
-  const env = { store, invokeCalls, streams, handler }
+  const env = { store, invokeCalls, streams, eventsGates, eventResults, handler }
   // T43: every client this boot created is remembered so the teardown can
   // stop its reconnect ladder — an offline zombie client from test N would
   // otherwise keep firing retries into test N+1's gateway.
   const allClients = []
   const registerClient = (client) => { allClients.push(client); return client }
-  let gw = startGatewayAt(home, GW_PORT, TARGET_PORT, { LAN_GATE_RELAY_SECRET: SECRET })
+  // Pre-grab a free port for the child (bind → read → release), then start
+  // it on that number.
+  gwPort = await freePort()
+  let gw = startGatewayAt(home, gwPort, targetPort, { LAN_GATE_RELAY_SECRET: SECRET })
   await gw.ready
-  const paired = await pairDesktop(GW_PORT, '端到端台式机')
+  const paired = await pairDesktop(gwPort, '端到端台式机')
   const token = paired.token
   env.deviceId = paired.id
   // The client reaches the gateway THROUGH the proxy hop, like any desktop
   // client behind its server's reverse proxy.
   env.client = registerClient(createRelayClient({
-    getServerUrl: () => `http://127.0.0.1:${PROXY_PORT}`,
+    getServerUrl: () => `http://127.0.0.1:${proxyPort}`,
     getToken: () => token,
   }))
   // A second client with custom tuning against the SAME paired device.
   env.tunedClient = (overrides = {}) => registerClient(createRelayClient({
-    getServerUrl: () => `http://127.0.0.1:${PROXY_PORT}`,
+    getServerUrl: () => `http://127.0.0.1:${proxyPort}`,
     getToken: () => token,
     ...overrides,
   }))
@@ -203,7 +279,9 @@ async function boot(opts = {}) {
     child.kill('SIGTERM')
   })
   env.restartGateway = async () => {
-    gw = startGatewayAt(home, GW_PORT, TARGET_PORT, { LAN_GATE_RELAY_SECRET: SECRET })
+    // The SAME port the first child drew: it was freed by the SIGTERM and
+    // the gateway's same-port retry band absorbs the teardown tail race.
+    gw = startGatewayAt(home, gwPort, targetPort, { LAN_GATE_RELAY_SECRET: SECRET })
     await gw.ready
   }
   env.stop = async () => {
@@ -406,7 +484,7 @@ test('e2e: revoking the device on the gateway turns the next invoke into revoked
   try {
     await env.client.connect()
     assert.equal(env.client.state, 'online')
-    const action = await request(GW_PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
+    const action = await request(gwPort, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
     assert.equal(action.status, 200)
     await assert.rejects(
       () => env.client.invoke('session', 'page', FOLLOW_ARGS),
@@ -485,7 +563,7 @@ test('e2e T43: a device revoked while the client is in the retry loop lands revo
     await env.client.connect()
     // Revoke behind the client's back, then take the chain down: the client
     // walks its ladder against a dead proxy.
-    const action = await request(GW_PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
+    const action = await request(gwPort, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
     assert.equal(action.status, 200)
     await env.killGateway()
     await assert.rejects(() => env.client.invoke('session', 'page', FOLLOW_ARGS), (error) => error.code === 'offline')
@@ -656,6 +734,159 @@ test('e2e T23b-2: the interceptor merges the global workspace stream — local g
     assert.equal(done.done, true)
     await waitFor(() => wsGate.aborted)
     handle.uninstall()
+  } finally { await env.stop() }
+})
+
+// ---- T32: the forwarded approval/question events, end to end --------------------
+
+/**
+ * The sub-client's own DSH, faked at the seam the intercept wraps: async
+ * openWireStream handing out ONE controllable local `$events` stream, and a
+ * dispatchRpc that answers every call (and records it, so the test can prove
+ * a remote answer never reached the local gateway).
+ */
+class LocalEventsGateway {
+  constructor(localGate) {
+    this.localGate = localGate
+    this.rpcCalls = []
+    this.wireStream = {
+      open: (endpoint, payload, uplink, peer, signal) => this.openWireStream(endpoint, payload, uplink, peer, signal, { signal }),
+    }
+    this.rpcBridge = (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer)
+    this.wireTap = (endpoint, payload, uplink, peer, signal, control) => this.openWireStream(endpoint, payload, uplink, peer, control.signal, control)
+  }
+  operatorPeer() { return { id: 'operator-peer' } }
+  async dispatchRpc(endpoint, payload, signal, peer) {
+    this.rpcCalls.push({ endpoint, payload })
+    return { ok: true, value: undefined }
+  }
+  async openWireStream(endpoint, payload, uplink, peer, signal, control) {
+    if (endpoint === '$events') return this.localGate.iterable
+    return (async function* () { yield { type: 'baseline', value: { items: [] } } })()
+  }
+}
+
+test('e2e T32: a server approval crosses into the local $events virtualized, the answer crosses back, and first-answer-wins closes the loser', async () => {
+  const env = await boot({ shared: ['session-a'] })
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const serverId = info.serverId
+    const V = (id) => toVirtual(serverId, id)
+
+    const controller = new AbortController()
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalEventsGateway(localGate)
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    const merged = await localGateway.wireTap('$events', { args: {} }, undefined, localGateway.operatorPeer(), controller.signal, { signal: controller.signal })
+    const iterator = merged[Symbol.asyncIterator]()
+
+    // The LOCAL ready is the merged stream's first frame — what the client
+    // face demands — and the server's own ready never crosses the relay.
+    // The first pull is what starts the pumps: it hands the queued local
+    // ready over AND opens the server's $zr/events subscription.
+    localGate.push({ type: 'ready', clientId: 'local-ui-client', host: { home: '/local/home' } })
+    const [ready] = await collectFrames(iterator, 1)
+    assert.deepEqual(ready, { type: 'ready', clientId: 'local-ui-client', host: { home: '/local/home' } })
+    await waitFor(() => env.eventsGates.length === 1)
+
+    // The shared session's approval arrives virtualized — the eventId is
+    // the server's opaque `<token>.<original>` wrapped in the virtual
+    // prefix; the unshared session's never leaves the server.
+    env.eventsGates[0].push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-srv-1', agentId: 'session-a', request: { toolName: 'Bash', callId: 'c1', reason: 'run a command' } })
+    env.eventsGates[0].push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-srv-secret', agentId: 'session-secret', request: { toolName: 'Bash', callId: 'c2' } })
+    const [waterfall] = await collectFrames(iterator, 1)
+    const { eventId: seenEventId, ...waterfallRest } = waterfall
+    assert.equal(seenEventId.startsWith(V('')), true)
+    assert.equal(seenEventId.endsWith('.evt-srv-1'), true)
+    assert.deepEqual(waterfallRest, {
+      type: 'waterfall',
+      event: 'approval/request',
+      agentId: V('session-a'),
+      request: { toolName: 'Bash', callId: 'c1', reason: 'run a command' },
+    })
+
+    // The UI answers through its own /api dispatch with the id it SAW. The
+    // answer rides the REAL chain back: the server resolves the token to
+    // THIS subscription, strips it off the eventId, and composes the
+    // gateway payload with ITS clientId; the local DSH never sees it.
+    const envelope = await localGateway.rpcBridge(
+      '$events/result',
+      { args: { clientId: 'local-ui-client', eventId: seenEventId, outcome: { kind: 'result', value: 'allowed-once' } } },
+      undefined,
+      undefined,
+    )
+    assert.deepEqual(envelope, { ok: true, value: undefined })
+    // Two answers reached the gateway: the server's own `next` abstention
+    // for the dropped unshared waterfall, and the real one.
+    await waitFor(() => env.eventResults.length >= 2)
+    assert.deepEqual(env.eventResults[0].payload, {
+      args: { clientId: 'srv-events-client', eventId: 'evt-srv-secret', outcome: { kind: 'next' } },
+    })
+    assert.deepEqual(env.eventResults[1].payload, {
+      args: { clientId: 'srv-events-client', eventId: 'evt-srv-1', outcome: { kind: 'result', value: 'allowed-once' } },
+    })
+    assert.equal(localGateway.rpcCalls.filter((call) => call.endpoint === '$events/result').length, 0)
+
+    // An event that was never forwarded refuses server-side (403
+    // unknown-event), and the interceptor answers the UI with the same
+    // silent ok DSH gives a stale result — a thrown answer would fail the
+    // UI's whole $events generation.
+    const ghost = await localGateway.rpcBridge(
+      '$events/result',
+      { args: { clientId: 'local-ui-client', eventId: V('token-guess.evt-ghost'), outcome: { kind: 'next' } } },
+      undefined,
+      undefined,
+    )
+    assert.deepEqual(ghost, { ok: true, value: undefined })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(env.eventResults.length, 2, 'the ghost answer never reached the server gateway')
+
+    // First answer wins: the server's own UI answers a second waterfall
+    // first, the gateway settles and pushes the cancel frame, the
+    // sub-client's prompt closes — and its LATE answer is refused
+    // server-side (the registry entry went with the forwarded cancel) but
+    // still reads as silent ok at the UI.
+    env.eventsGates[0].push({ type: 'waterfall', event: 'user-questions/request', eventId: 'evt-srv-2', agentId: 'session-a', request: { questions: [{ id: 'q1', prompt: '继续吗？' }] } })
+    const question = (await collectFrames(iterator, 1))[0]
+    assert.equal(question.eventId.endsWith('.evt-srv-2'), true)
+    env.eventsGates[0].push({ type: 'cancel', eventId: 'evt-srv-2' })
+    const [cancel] = await collectFrames(iterator, 1)
+    assert.equal(cancel.eventId.endsWith('.evt-srv-2'), true)
+    const late = await localGateway.rpcBridge(
+      '$events/result',
+      { args: { clientId: 'local-ui-client', eventId: question.eventId, outcome: { kind: 'result', value: { answers: { q1: '好的' } } } } },
+      undefined,
+      undefined,
+    )
+    assert.deepEqual(late, { ok: true, value: undefined })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(env.eventResults.length, 2, 'the late answer was refused before the gateway')
+
+    // A dying remote leg closes every prompt still on screen: evt-srv-1
+    // was answered but its real cancel never came (the fake gateway does
+    // not settle), evt-orphan is still pending — both get the synthesized
+    // cancel when the server's $events ends. evt-srv-2 does NOT: its real
+    // cancel already cleared it from the record.
+    env.eventsGates[0].push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-orphan', agentId: 'session-a', request: { toolName: 'Bash', callId: 'c9' } })
+    const orphan = (await collectFrames(iterator, 1))[0]
+    assert.equal(orphan.eventId.endsWith('.evt-orphan'), true)
+    env.eventsGates[0].finish()
+    const closes = await collectFrames(iterator, 2)
+    assert.deepEqual(
+      closes.map((frame) => frame.eventId),
+      [seenEventId, orphan.eventId],
+    )
+    for (const frame of closes) assert.deepEqual(Object.keys(frame).sort(), ['eventId', 'type'])
+
+    handle.uninstall()
+    controller.abort()
   } finally { await env.stop() }
 })
 

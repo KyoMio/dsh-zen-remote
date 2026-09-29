@@ -164,6 +164,12 @@ export interface RelayClient {
      * A success proves the link and lifts a stale `offline` back to `online`,
      * exactly like invoke. */
     unshare(sessionId: string, signal?: AbortSignal): Promise<void>;
+    /** Answer one forwarded Remote event (T32): `eventId` is the ORIGINAL id
+     * (the interceptor swapped the virtual one back), `result` the Remote
+     * event OUTCOME, forwarded verbatim — the gateway validates it. The error
+     * mapping is invoke's: a success envelope resolves (with the value, in
+     * practice undefined), everything else throws RelayError. */
+    postEventResult(eventId: string, result: unknown, signal?: AbortSignal): Promise<unknown>;
     /** Open the NDJSON stream route. `frame` lines are yielded, `ping` lines
      * only refresh the idle clock, `end` finishes the iteration, an `error`
      * line throws its RelayError. A caller abort ENDS the iteration normally;
