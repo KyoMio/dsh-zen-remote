@@ -77,6 +77,7 @@ cd ~/.dsh/profiles/desktop && pnpm install
 一次性的事实，按踩到的概率排序：
 
 - **三行合并为一行。** profile 补丁里残留的 `dsh-zen-remote-gateway` / `dsh-zen-remote-push` 旧行会被 loader 警告后跳过。原来写在**那两行上**的 `config:` 不再生效——搬到 `dsh-zen-remote` 行，或者直接在插件设置页里改。
+- **1.0 时代在 profile 补丁里手工 insert 过 `dsh-zen-remote/dsh-push.mjs` 那一行的，需要删掉**——主入口现在按角色自动加载推送子插件，残留的那一行会让推送加载两次。
 - **`~/.dsh/lan-gate.config.json` 继续生效。** 无需迁移，它的值会显示在设置页里。每个字段的优先级：环境变量 > 插件行设置 > `lan-gate.config.json` > 内置默认值。插件从不改写、也从不删除这个文件。
 - **已配对设备自动归为 Web 应用端**，继续照常用，不需要重新配对。
 - **管理页搬家了。** `/lan-gate/admin` 现在只剩一段指向插件设置页的说明（对非本机直连的请求仍然 403）。配对码、设备管理、测试推送、会话共享全部在 DSH「插件」页的 dsh-zen-remote 设置区块里。
