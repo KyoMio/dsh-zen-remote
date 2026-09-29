@@ -425,7 +425,7 @@ export const en: Record<MobileNavKey, string> = {
   'settings.shareTitle': 'Remote sharing',
   'settings.shareListTitle': 'Sessions shared remotely',
   'settings.shareListEmpty': 'No sessions are currently shared',
-  'settings.shareViewers': '{count} devices viewing',
+  'settings.shareViewers': 'Viewers: {count}',
   'settings.shareClose': 'Stop sharing',
   'settings.shareCloseAll': 'Close all',
   'settings.shareCloseAllConfirm': 'This disables remote access for every shared session. Continue?',
