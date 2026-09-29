@@ -130,6 +130,10 @@ Remote access is per session, with three toggle entries on the host:
 
 **What "remote off" means**: an unshared session's list row, history, live progress and approval/question events are all refused or filtered at the relay — not merely hidden in the UI. @-mention candidates list **only shared sessions**, and a `dsh-session:` reference embedded in a message, a queue edit or a slash command is refused for the whole call when it names an unshared session.
 
+**What a closed remote looks like on the client**: when the server closes a session's remote access (or the session idle-sleeps), a client page that has it open is not thrown out — the page stays where it is, a "remote closed" banner with the reason (server closed / idle sleep / turned off on this machine) appears above the composer, and input is disabled; in the sidebar the session stays in its original remote group (a tombstone) instead of being moved into the archive, until a page reload drops it with the next refresh. When the server turns remote access back on (or re-shares), the session returns to its normal position and any open page recovers by itself — the banner clears and input comes back.
+
+**Disconnects and recovery**: while the server (or the link) is down, an open remote session page holds its ground — the banner says offline and input is disabled; once the connection is back the page resumes by itself: the session stream and task-list-type panels pull a fresh snapshot automatically, no manual refresh needed. The exceptions are the file-tree changes and terminal panels, which must be reopened after a disconnect.
+
 ---
 
 ## Configuration
@@ -247,7 +251,6 @@ What a paired device is trusted with, stated plainly:
 - Attaching a **non-image file** in a remote session fails (DSH's file upload rides a request from inside a Web Worker, which the plugin cannot intercept). **Image** attachments work.
 - "Export session" errors in a remote session; the changes panel's **summary and diff do work** (relayed), while the entries that would pop a dialog on the server machine — "open", "reveal in Finder", "open in app", on the changes panel and deliverable cards alike — are hidden there.
 - The host truncates @-mention candidates to the **first 50 rows before** share-filtering: on a server with many sessions, a shared one may be missing from the candidate list (the reference check itself is unaffected — references you type out are still verified one by one).
-- After the server restarts, a remote session's title / running state can lag behind until the next event or a page refresh.
 - The model picker lists the **client's own** local model catalog.
 - Third-party plugins' own non-standard endpoints are not forwarded — their panels degrade or hide in remote sessions.
 - Same-machine testing must reach the gateway over a **LAN IP**, not `127.0.0.1`: a loopback connection without forwarded headers is treated as the local user and skips token checks entirely.
