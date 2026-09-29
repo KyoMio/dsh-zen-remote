@@ -150,6 +150,24 @@ export function filterSessionListResult(result: unknown, isAccessible: Accessibi
 }
 
 /**
+ * Scrub one `session/modelCatalog` result (T52-fix): the `failures` array is
+ * emptied in place-shaped fashion — the whole result otherwise passes through
+ * — because a provider group's failure text is the HOST's own error for that
+ * group (adapter names, endpoint URLs, credential states; RT
+ * dsh-api-session-controller `lib/index.js` builds `failures` from each
+ * adapter's load error). The sub-client discards `failures` anyway
+ * (intercept.ts mergeModelCatalogs keeps the LOCAL failures only), so
+ * forwarding the server's texts would spend real detail for nothing a client
+ * can show. The result arrives from the same JSON boundary as the frames; a
+ * result without a recognizable shape passes untouched (the merge on the far
+ * side re-guards it).
+ */
+export function filterModelCatalogResult(value: unknown): unknown {
+  if (!isPlainObject(value) || !Array.isArray(value.failures)) return value
+  return { ...value, failures: [] }
+}
+
+/**
  * Filter one `job/list` frame (`{type:'rows', jobs:[…]}` — the only frame type
  * the stream emits). DSH opens every OWNERLESS job to all sessions, so the
  * unfiltered stream would leak server-wide jobs through any shared session;

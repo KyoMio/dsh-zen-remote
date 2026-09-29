@@ -125,8 +125,11 @@ export type StreamFilter = 'workspace' | 'control';
  * (relay-filter.ts), `session-reference-candidates` drops the @-mention
  * candidate rows whose session is not accessible (relay-server.ts — the host
  * lists EVERY server session with title, cwd and a ready-made mention, so
- * unshared rows must never leave the box). */
-export type InvokeFilter = 'session-list' | 'session-reference-candidates';
+ * unshared rows must never leave the box), and `model-catalog` empties the
+ * `session/modelCatalog` `failures` array (T52-fix — relay-filter.ts: the
+ * host's per-group error texts may carry endpoint or credential details, and
+ * the client discards `failures` anyway). */
+export type InvokeFilter = 'session-list' | 'session-reference-candidates' | 'model-catalog';
 /** One invoke decision: allow (optionally through a standing result filter),
  * or the reason that goes into the 403 body. */
 export type InvokeDenyReason = 'no-session' | 'not-shared' | 'forbidden-method';

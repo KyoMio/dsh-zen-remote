@@ -1007,7 +1007,23 @@ test('session/list merges the relay first page into the local one; cursor, offli
     rpc: { 'session/list': { ok: true, value: { items: [{ sessionId: 'session-local', updatedAt: 1 }], nextCursor: 'tok' } } },
   })
   const relay = createControllableRelay()
-  relay.invokeValue = { items: [{ sessionId: 'session-a', updatedAt: 2 }, { sessionId: 'session-b', updatedAt: 3 }] }
+  // T52-fix: a remote row's projections block rides along (sequenced kind —
+  // the shape that poisons the projection store if left unwritten); the
+  // merged route must rewrite its modelSelection like every other route.
+  relay.invokeValue = {
+    items: [
+      {
+        sessionId: 'session-a',
+        updatedAt: 2,
+        projections: {
+          kind: 'sequenced',
+          asOfSeq: 6,
+          values: { modelSelection: { lastUsed: { provider: 'codex', model: 'sol' }, next: null } },
+        },
+      },
+      { sessionId: 'session-b', updatedAt: 3 },
+    ],
+  }
   const { handle } = install(gateway, relay)
 
   // first page, online: local items first, remote items virtualized after,
@@ -1018,7 +1034,15 @@ test('session/list merges the relay first page into the local one; cursor, offli
     value: {
       items: [
         { sessionId: 'session-local', updatedAt: 1 },
-        { sessionId: toVirtual(SERVER_ID, 'session-a'), updatedAt: 2 },
+        {
+          sessionId: toVirtual(SERVER_ID, 'session-a'),
+          updatedAt: 2,
+          projections: {
+            kind: 'sequenced',
+            asOfSeq: 6,
+            values: { modelSelection: { lastUsed: { provider: toVirtual(SERVER_ID, 'codex'), model: 'sol' }, next: null } },
+          },
+        },
         { sessionId: toVirtual(SERVER_ID, 'session-b'), updatedAt: 3 },
       ],
       nextCursor: 'tok',
@@ -2389,12 +2413,35 @@ test('T52: session/modelCatalog merges the relay groups behind the local ones; o
   assert.deepEqual(fallback.value, LOCAL_CATALOG)
   assert.equal(handle.diagnostics().recentFailures.at(-1).code, 'offline')
 
-  // Offline (or never handshook) answers the local result without asking.
+  // Offline (T52-fix): the last fetched server groups still merge in — a
+  // refreshed dropdown must not go blank and an open remote session's
+  // trigger must not fall back to the raw `zr~…` string — while the relay
+  // itself is never asked.
   relay.invokeThrow = undefined
   relay.transition('offline')
   const offlineAnswer = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
-  assert.deepEqual(offlineAnswer.value, LOCAL_CATALOG)
+  assert.equal(offlineAnswer.ok, true)
+  assert.deepEqual(offlineAnswer.value.groups[2], {
+    id: toVirtual(SERVER_ID, 'codex'),
+    name: '测试服务器 · Codex',
+    models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }],
+  })
+  assert.deepEqual(offlineAnswer.value.failures, LOCAL_CATALOG.failures, 'only the local failures travel')
   assert.equal(relay.invokes.length, 2)
+
+  // A DIFFERENT server's handshake never serves the old cache: offline with
+  // a mismatched identity the answer is local-only (a re-pair elsewhere must
+  // not keep showing the previous server's groups).
+  relay.handshakeInfo = { ...relay.handshakeInfo, serverId: 'ffffffff', serverName: '别服' }
+  relay.transition('offline')
+  const otherServerOffline = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.deepEqual(otherServerOffline.value, LOCAL_CATALOG, 'the old server\'s cache does not survive a server change')
+
+  // The pairing wall clears the cache outright: while the wall stands the
+  // answer is local-only, and re-serving the same server refetches.
+  relay.transition('unpaired')
+  const afterUnpair = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.deepEqual(afterUnpair.value, LOCAL_CATALOG)
   handle.uninstall()
 })
 
@@ -2431,6 +2478,7 @@ test('T52: session/selectModel routes the provider by session context', async ()
   assert.equal(relay.invokes.length, 1)
 
   // Local session + a virtual group → refused before the local gateway sees it.
+  const localCallsBefore = gateway.rpcCalls.length
   const localRefused = await gateway.rpcBridge(
     'session/selectModel',
     { args: { request: { sessionId: LOCAL_ID, provider: toVirtual(SERVER_ID, 'codex'), model: 'gpt-5.6-sol' } } },
@@ -2439,7 +2487,7 @@ test('T52: session/selectModel routes the provider by session context', async ()
   )
   assert.equal(localRefused.ok, false)
   assert.equal(localRefused.error.code, 'remote-unsupported')
-  assert.ok(gateway.rpcCalls.every((call) => call.endpoint !== 'session/selectModel' || call !== undefined), 'no local dispatch of a refused call')
+  assert.equal(gateway.rpcCalls.length, localCallsBefore, 'the refusal never reached the local gateway')
 
   // Local session + local group → the plain local call, byte-for-byte.
   const localArgs = { args: { request: { sessionId: LOCAL_ID, provider: 'deepseek-account', model: 'deepseek-v4-pro' } } }
@@ -2469,7 +2517,7 @@ test('T52: session/selectModel routes the provider by session context', async ()
   handle.uninstall()
 })
 
-test('T52: remote projections, pages and follow snapshots carry the virtual group id; local results stay verbatim', async () => {
+test('T52: remote projections and follow snapshots carry the virtual group id; local results stay verbatim', async () => {
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()
   const selection = {
@@ -2488,12 +2536,12 @@ test('T52: remote projections, pages and follow snapshots carry the virtual grou
   })
   assert.equal(projections.value.values.title, '远端')
 
-  // session/page: the same rewrite inside the page's projections block; the
-  // raw journal records (model/selection events included) are untouched.
+  // session/page: NO projections rewrite (T52-fix) — the result is
+  // `{records, hasMore}` only (RT lib/typert.remote-client.js:549-566), and
+  // whatever a caller pads onto it passes through verbatim.
   relay.invokeValue = { records: [{ type: 'event', event: { type: 'model/selection', seq: 2, time: 1, data: selection } }], hasMore: false, projections: { asOfSeq: 3, values: { modelSelection: selection } } }
   const page = await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
-  assert.equal(page.value.projections.values.modelSelection.next.provider, toVirtual(SERVER_ID, 'codex'))
-  assert.deepEqual(page.value.records, relay.invokeValue.records)
+  assert.deepEqual(page.value, relay.invokeValue, 'the page result travels untouched')
 
   // session/follow: the snapshot seeds the projection store — its
   // projections block rewrites; the header and the raw event frames do not.
