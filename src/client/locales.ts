@@ -203,7 +203,7 @@ export const zh = {
   'settings.client.statusTitle': '连接状态',
   'settings.client.statusUnpaired': '未配对',
   'settings.client.statusConnected': '已连接到 {serverUrl}',
-  'settings.client.statusRevoked': '令牌已失效，请在服务端重新生成桌面应用端配对码后重新配对',
+  'settings.client.statusRevoked': '令牌已被吊销，请重新配对',
   'settings.client.statusUnreachable': '服务端当前不可达',
   'settings.client.statusUnexpected': '服务端版本不支持远程会话（需要 dsh-zen-remote 2.0.0）',
   'settings.client.statusInvalidUrl': '服务端地址无效或不安全，请重新配对',
@@ -226,6 +226,21 @@ export const zh = {
   'shareRemoteFailSubagent': '开启远程失败：子智能体会话不能单独开启',
   'shareRemoteFailEmpty': '开启远程失败：会话还没有内容',
   'shareRemoteFailGeneric': '操作失败，请稍后再试',
+  // --- T43 诊断区 ---
+  'settings.client.reconnect': '立即重连',
+  'settings.client.reconnectBusy': '重连中…',
+  'settings.client.statusConnectedName': '已连接到「{serverName}」',
+  'settings.client.statusOfflineRetry': '离线，将于 {seconds} 秒后重试',
+  'settings.client.statusOfflineRetrySoon': '离线，即将重试…',
+  'settings.client.statusIncompatible': '与服务端中继协议不兼容，请升级两端的 dsh-zen-remote',
+  'settings.client.diagTitle': '诊断',
+  'settings.client.diagLastError': '最近错误码：{code}',
+  'settings.client.diagInterceptInstalled': '请求拦截器已安装',
+  'settings.client.diagInterceptMissing': '请求拦截器未安装',
+  'settings.client.diagInterceptDisabled': '远程功能已停用：DSH 内部结构与预期不符',
+  'settings.client.diagRecentFailures': '最近的远程调用失败',
+  'settings.client.diagCompatGroups': '指纹有差异的组：{groups}',
+  'settings.client.diagCompatCalls': '最近的不兼容调用',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -428,7 +443,7 @@ export const en: Record<MobileNavKey, string> = {
   'settings.client.statusTitle': 'Connection',
   'settings.client.statusUnpaired': 'Not paired',
   'settings.client.statusConnected': 'Connected to {serverUrl}',
-  'settings.client.statusRevoked': 'The token is no longer valid — generate a new desktop-client pairing code on the server and pair again',
+  'settings.client.statusRevoked': 'The pairing token was revoked. Pair this device again.',
   'settings.client.statusUnreachable': 'The server is currently unreachable',
   'settings.client.statusUnexpected': 'The server does not support remote sessions (needs dsh-zen-remote 2.0.0)',
   'settings.client.statusInvalidUrl': 'The server address is invalid or insecure — pair again',
@@ -450,6 +465,21 @@ export const en: Record<MobileNavKey, string> = {
   'shareRemoteFailSubagent': 'Enable remote failed: subagent sessions cannot be shared alone',
   'shareRemoteFailEmpty': 'Enable remote failed: the session has no content yet',
   'shareRemoteFailGeneric': 'The action failed — try again later',
+  // --- T43 diagnostics ---
+  'settings.client.reconnect': 'Reconnect now',
+  'settings.client.reconnectBusy': 'Reconnecting…',
+  'settings.client.statusConnectedName': 'Connected to \u201c{serverName}\u201d',
+  'settings.client.statusOfflineRetry': 'Offline — retrying in {seconds} s',
+  'settings.client.statusOfflineRetrySoon': 'Offline — retrying now…',
+  'settings.client.statusIncompatible': 'Relay protocol mismatch with the server — update dsh-zen-remote on both ends',
+  'settings.client.diagTitle': 'Diagnostics',
+  'settings.client.diagLastError': 'Last error code: {code}',
+  'settings.client.diagInterceptInstalled': 'Request interceptor installed',
+  'settings.client.diagInterceptMissing': 'Request interceptor not installed',
+  'settings.client.diagInterceptDisabled': 'Remote features disabled: DSH internals differ from the expected shape',
+  'settings.client.diagRecentFailures': 'Recent remote call failures',
+  'settings.client.diagCompatGroups': 'Groups with fingerprint differences: {groups}',
+  'settings.client.diagCompatCalls': 'Recent incompatible calls',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

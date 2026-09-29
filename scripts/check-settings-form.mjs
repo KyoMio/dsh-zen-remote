@@ -17,7 +17,9 @@
 // Run: node scripts/check-settings-form.mjs   (needs Node >= 23.6 type stripping)
 import assert from 'node:assert/strict'
 import {
+  CLIENT_RECONNECT_ROUTE,
   createLatestGate,
+  clientStatusLineOf,
   deriveClientStatusView,
   deriveSettingsView,
   normalizePairingCode,
@@ -444,26 +446,139 @@ test('the latest-wins gate drops tickets that are no longer newest (T15-fix 4)',
 // ---- T16: the client group ----------------------------------------------------
 
 test('deriveClientStatusView maps every probe state and tolerates garbage', () => {
-  assert.deepEqual(deriveClientStatusView({ state: 'unpaired' }), { state: 'unpaired', serverUrl: '' })
+  const bare = { state: 'unpaired', serverUrl: '', serverName: '', nextRetryAt: undefined, lastError: '', intercept: undefined, compat: undefined }
+  assert.deepEqual(deriveClientStatusView({ state: 'unpaired' }), bare)
   assert.deepEqual(deriveClientStatusView({ state: 'connected', serverUrl: 'http://192.168.3.129:3088' }), {
+    ...bare,
     state: 'connected',
     serverUrl: 'http://192.168.3.129:3088',
   })
   assert.deepEqual(deriveClientStatusView({ state: 'revoked', serverUrl: 'https://dsh.example.com' }), {
+    ...bare,
     state: 'revoked',
     serverUrl: 'https://dsh.example.com',
   })
   assert.deepEqual(deriveClientStatusView({ state: 'unreachable', serverUrl: 'http://x.local:1' }), {
+    ...bare,
     state: 'unreachable',
     serverUrl: 'http://x.local:1',
   })
-  assert.deepEqual(deriveClientStatusView({ state: 'unexpected', serverUrl: 'http://x.local:1' }).state, 'unexpected')
+  assert.equal(deriveClientStatusView({ state: 'unexpected', serverUrl: 'http://x.local:1' }).state, 'unexpected')
+  assert.equal(deriveClientStatusView({ state: 'incompatible' }).state, 'incompatible', 'T43: the protocol mismatch renders its own word')
   // T16-fix 1: the stored address failed re-validation; nothing was probed.
-  assert.deepEqual(deriveClientStatusView({ state: 'invalid-url' }), { state: 'invalid-url', serverUrl: '' })
+  assert.deepEqual(deriveClientStatusView({ state: 'invalid-url' }), { ...bare, state: 'invalid-url' })
   // Degraded shapes: unknown state words and non-objects fall back to unpaired.
   assert.equal(deriveClientStatusView({ state: 'gibberish', serverUrl: 'http://x' }).state, 'unpaired')
-  assert.deepEqual(deriveClientStatusView({}), { state: 'unpaired', serverUrl: '' })
-  assert.deepEqual(deriveClientStatusView(undefined), { state: 'unpaired', serverUrl: '' })
+  assert.deepEqual(deriveClientStatusView({}), bare)
+  assert.deepEqual(deriveClientStatusView(undefined), bare)
+})
+
+test('T43: the status view carries the reconnect readout only for well-shaped values', () => {
+  const view = deriveClientStatusView({
+    state: 'unreachable',
+    serverUrl: 'http://x.local:1',
+    serverName: '书房服务器',
+    nextRetryAt: 1_700_000_005_000,
+    lastError: 'offline',
+  })
+  assert.equal(view.serverName, '书房服务器')
+  assert.equal(view.nextRetryAt, 1_700_000_005_000)
+  assert.equal(view.lastError, 'offline')
+
+  // Garbage degrades: non-numeric nextRetryAt is absent, a non-string
+  // lastError is '', a non-string serverName is ''.
+  const junk = deriveClientStatusView({ state: 'unreachable', nextRetryAt: 'soon', lastError: 42, serverName: 7 })
+  assert.equal(junk.nextRetryAt, undefined)
+  assert.equal(junk.lastError, '')
+  assert.equal(junk.serverName, '')
+})
+
+test('T43: intercept/compat render only when the body carried the field', () => {
+  // Absent on an older server — nothing to render.
+  assert.equal(deriveClientStatusView({ state: 'unreachable' }).intercept, undefined)
+  assert.equal(deriveClientStatusView({ state: 'unreachable' }).compat, undefined)
+
+  const view = deriveClientStatusView({
+    state: 'unreachable',
+    intercept: {
+      installed: true,
+      reasons: ['AssistantMarkdown root missing'],
+      recentFailures: [
+        { time: 1_700_000_000_000, method: 'session/page', code: 'gateway/invocation-unavailable' },
+        { time: 'x', code: 42 },
+      ],
+    },
+    compat: { mismatchedGroups: ['session', 'workspace'], recentCalls: [{ time: 1, method: 'm', code: 'c' }] },
+  })
+  assert.deepEqual(view.intercept, {
+    installed: true,
+    reasons: ['AssistantMarkdown root missing'],
+    recentFailures: [
+      { time: 1_700_000_000_000, method: 'session/page', code: 'gateway/invocation-unavailable' },
+      { time: 0, method: '', code: '' },
+    ],
+  })
+  assert.deepEqual(view.compat, { mismatchedGroups: ['session', 'workspace'], recentCalls: [{ time: 1, method: 'm', code: 'c' }] })
+
+  // Present but empty/garbage still renders the group (installed defaults
+  // false, lists empty) — the field's presence is the gate, not its shape.
+  const empty = deriveClientStatusView({ state: 'unreachable', intercept: {}, compat: null })
+  assert.deepEqual(empty.intercept, { installed: false, reasons: [], recentFailures: [] })
+  assert.equal(empty.compat, undefined, 'null counts as absent')
+})
+
+// ---- T43: the connection-line copy selector ---------------------------------
+
+const viewOf = (extra = {}) => deriveClientStatusView({ state: 'unreachable', serverUrl: 'http://x.local:1', ...extra })
+
+test('clientStatusLineOf picks the diagnostics wording per state', () => {
+  // Connected prefers the handshake's server name, falls back to the URL.
+  assert.deepEqual(
+    clientStatusLineOf(viewOf({ state: 'connected', serverName: '书房服务器' }), NOW),
+    { kind: 'connectedName', serverName: '书房服务器' },
+  )
+  assert.deepEqual(
+    clientStatusLineOf(viewOf({ state: 'connected' }), NOW),
+    { kind: 'connected', serverUrl: 'http://x.local:1' },
+  )
+
+  // Offline with a pending retry counts down; overdue collapses to "soon".
+  assert.deepEqual(
+    clientStatusLineOf(viewOf({ nextRetryAt: NOW + 9_400 }), NOW),
+    { kind: 'offlineRetry', seconds: 10 },
+    'the countdown rounds up to whole seconds',
+  )
+  assert.deepEqual(
+    clientStatusLineOf(viewOf({ nextRetryAt: NOW + 1_000 }), NOW + 1_500),
+    { kind: 'offlineRetrySoon' },
+    'an overdue wait reads as imminent',
+  )
+  assert.deepEqual(
+    clientStatusLineOf(viewOf({ nextRetryAt: NOW + 500 }), NOW),
+    { kind: 'offlineRetry', seconds: 1 },
+  )
+  // The probe fallback (no relay client) has no nextRetryAt.
+  assert.deepEqual(clientStatusLineOf(viewOf({}), NOW), { kind: 'unreachable' })
+
+  // T43-fix: the countdown follows the nextRetryAt, whatever the probe
+  // word underneath — an `unexpected` verdict backed by a pending retry is
+  // still OFFLINE with a ladder running.
+  assert.deepEqual(
+    clientStatusLineOf(viewOf({ state: 'unexpected', nextRetryAt: NOW + 4_000 }), NOW),
+    { kind: 'offlineRetry', seconds: 4 },
+  )
+  // Without a nextRetryAt the two verdicts keep their own plain copy.
+  assert.deepEqual(clientStatusLineOf(viewOf({ state: 'unexpected' }), NOW), { kind: 'unexpected' })
+
+  assert.deepEqual(clientStatusLineOf(viewOf({ state: 'revoked' }), NOW), { kind: 'revoked' })
+  assert.deepEqual(clientStatusLineOf(viewOf({ state: 'incompatible' }), NOW), { kind: 'incompatible' })
+  assert.deepEqual(clientStatusLineOf(viewOf({ state: 'unexpected' }), NOW), { kind: 'unexpected' })
+  assert.deepEqual(clientStatusLineOf(viewOf({ state: 'invalid-url' }), NOW), { kind: 'invalidUrl' })
+  assert.deepEqual(clientStatusLineOf(viewOf({ state: 'unpaired' }), NOW), { kind: 'unpaired' })
+})
+
+test('CLIENT_RECONNECT_ROUTE is the one reconnect endpoint', () => {
+  assert.equal(CLIENT_RECONNECT_ROUTE, '/_dsh/zen-remote/client/reconnect')
 })
 
 test('normalizePairingCode uppercases and strips spaces and hyphens', () => {

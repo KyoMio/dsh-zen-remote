@@ -26,7 +26,29 @@
  * (`not-shared` / `no-session` / `forbidden-method`), a 200 `{ok:false}`
  * envelope, the gateway's own `relay-unauthorized` — is an ANSWER about the
  * call, not about the link, and leaves the state alone.
+ *
+ * Since T43 the client also reconnects on its own: an `offline` client walks
+ * a 1s → 2s → 5s → 10s → 30s ladder (0–20% jitter per wait) until a success
+ * lifts it back to `online`; `unpaired`, `revoked` and `incompatible` never
+ * reconnect on their own — they need a user action, which arrives as
+ * `credentialsChanged()` (or a fresh `connect()`). The wait is observable as
+ * `nextRetryAt`, the last failure code as `lastError`; both carry no
+ * credential material.
  */
+/**
+ * The clock face the reconnect machinery runs on: wall time, timers and the
+ * jitter source. Injectable so tests drive the whole backoff sequence
+ * deterministically. The default timers are `unref()`ed — a pending retry
+ * must never keep the host process alive on its own.
+ */
+export interface RelayClock {
+    /** Epoch milliseconds. */
+    now(): number;
+    setTimeout(fn: () => void, ms: number): unknown;
+    clearTimeout(handle: unknown): void;
+    /** One random sample in [0, 1] — the jitter source. */
+    random(): number;
+}
 /** The connection states the settings surface renders (and `subscribe`
  * listeners react to). */
 export type RelayState = 'unpaired' | 'connecting' | 'online' | 'offline' | 'revoked' | 'incompatible';
@@ -66,6 +88,9 @@ export interface CreateRelayClientOptions {
     /** How long one request/response round-trip (handshake, invoke — and the
      * headers of a stream open) may take; default 15000. */
     requestTimeoutMs?: number;
+    /** Clock/timers/jitter for the reconnect backoff; defaults to the real
+     * ones (timers `unref()`ed). Tests inject a manual clock. */
+    clock?: RelayClock;
 }
 export interface RelayClient {
     readonly state: RelayState;
@@ -77,10 +102,30 @@ export interface RelayClient {
      * cached "online" verdict from outliving the credentials it was earned
      * with. */
     readonly lastHandshakeDigest: string | undefined;
+    /** Epoch ms of the next automatic reconnect, or null while none is
+     * scheduled (connected, attempting, or in a state that never reconnects).
+     * Rendered by the settings page as "离线，将于 N 秒后重试". */
+    readonly nextRetryAt: number | null;
+    /** The error CODE of the most recent failure ('offline',
+     * 'relay-unauthorized', a DSH code, …) — never a message, never a token or
+     * URL. Cleared when a request succeeds again. */
+    readonly lastError: string | undefined;
     /** Observe state changes; a throwing listener never blocks the others. */
     subscribe(listener: (state: RelayState) => void): () => void;
     /** Run the handshake; success resolves with it and leaves `online`. */
     connect(): Promise<RelayHandshake>;
+    /** One immediate connection attempt from `offline`, resetting the backoff
+     * ladder (the settings page's 立即重连). Answers whether an attempt was
+     * started — the reconnect route turns a false into a 409. */
+    reconnect(): boolean;
+    /** Notify that the credentials source may have changed (the loader's
+     * volatile-update for the row): a pending reconnect wait is cancelled and,
+     * with credentials present, one immediate attempt runs with the new
+     * values; without them the client lands `unpaired`. */
+    credentialsChanged(): void;
+    /** Stop the automatic reconnect machinery (plugin row teardown). Explicit
+     * connect() calls still work, but no timer is armed again. */
+    stop(): void;
     /** One invoke round-trip; resolves with the unwrapped `value`, throws
      * RelayError otherwise. A caller abort surfaces as `RelayError('aborted')`. */
     invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown>;

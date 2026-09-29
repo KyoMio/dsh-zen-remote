@@ -97,7 +97,7 @@ function makeFakeGateway(overrides = {}) {
   return { gateway, invokeCalls, streams }
 }
 
-function makeParts(name, { shared = [], overrides = {}, heartbeatMs, parentOf } = {}) {
+function makeParts(name, { shared = [], overrides = {}, heartbeatMs, endDrainTimeoutMs, parentOf } = {}) {
   const home = path.join(ROOT, name)
   fs.mkdirSync(home, { recursive: true })
   const fake = makeFakeGateway(overrides)
@@ -109,6 +109,7 @@ function makeParts(name, { shared = [], overrides = {}, heartbeatMs, parentOf } 
     gateway: fake.gateway,
     serverInfo: { serverId: loadServerId(home), serverName: () => 'stream-test', dshVersion: '0.0.0-test' },
     ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
+    ...(endDrainTimeoutMs !== undefined ? { endDrainTimeoutMs } : {}),
     ...(parentOf !== undefined ? { parentOf } : {}),
   })
   return { handler, store, ...fake }
@@ -848,5 +849,146 @@ test('parentOf: a child streams through its shared parent and dies when the pare
     assert.match(errorLine.error.message, /S-parent/)
     assert.equal(gate.aborted, true)
     assert.equal(parts.handler.viewerCount('S-child'), 0)
+  } finally { await server.stop() }
+})
+
+// ---- T43-A: the finish drain watchdog --------------------------------------------
+
+test('T43-A: a finish with a full buffer and a stopped reader destroys the response and releases the viewer', async () => {
+  // The injected watchdog is 80ms: a viewer that never reads must lose its
+  // stream (and its count) within milliseconds of the close, not pin the
+  // count and the device budget forever.
+  const parts = makeParts('t43-end-drain', { shared: ['session-a'], heartbeatMs: 60_000, endDrainTimeoutMs: 80 })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+    const gate = parts.streams[0]
+    // The client stops reading; a 2MB frame overflows every buffer on the
+    // path and parks the pump mid-write (the same shape the backpressure
+    // test drives).
+    open.res.pause()
+    const big = 'x'.repeat(2 * 1024 * 1024)
+    const frame = (seq) => ({ type: 'event', event: { type: 'big', seq, time: seq, data: { pad: big } } })
+    gate.push(frame(1))
+    gate.push(frame(2))
+    gate.push(frame(3))
+    await waitFor(() => gate.queued >= 2)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+
+    parts.handler.closeAll('t43 watchdog test')
+    const started = Date.now()
+    await waitFor(() => parts.handler.viewerCount('session-a') === 0, 2000)
+    assert.ok(Date.now() - started < 1500, `the watchdog released the viewer promptly (took ${Date.now() - started} ms)`)
+    assert.equal(gate.aborted, true, 'the upstream subscription was aborted')
+    // NOTE: open.done is NOT awaited here — a paused client whose server
+    // destroyed the socket sits half-open forever (its own buffered bytes
+    // stay unread, so the client-side res never ends). The assertion target
+    // is the SERVER side, and it released within the watchdog budget.
+  } finally {
+    // Nothing to drain: the client was never reading. The connections go
+    // first, like every teardown here.
+    await server.stop()
+  }
+})
+
+test('T43-A: a finish with a READING client still ends normally with its tail line', async () => {
+  // The watchdog arms only on a backed-up buffer; the ordinary close paths
+  // must be untouched (the tail line arrives, the response ends cleanly).
+  const parts = makeParts('t43-end-normal', { shared: ['session-a'], heartbeatMs: 60_000, endDrainTimeoutMs: 80 })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+    const gate = parts.streams[0]
+    gate.push({ type: 'event', event: { type: 'turn/start', seq: 1, time: 1, data: {} } })
+    await waitFor(() => open.lines.length >= 1)
+    gate.finish()
+    await open.done
+    assert.deepEqual(open.lines[open.lines.length - 1], { type: 'end' })
+    assert.equal(parts.handler.viewerCount('session-a'), 0)
+  } finally { await server.stop() }
+})
+
+// ---- T43-B: closeAll detaches the handler from the share table --------------------
+
+test('T43-B: closeAll unsubscribes every share-table listener — table changes never reach the dead handler', async () => {
+  const home = path.join(ROOT, 't43-table-detach')
+  fs.mkdirSync(home, { recursive: true })
+  const real = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+  real.share('S')
+  // A counting wrapper around the REAL store: the handler subscribes through
+  // it, so `active` is exactly how many of this handler's listeners the table
+  // still holds.
+  const counts = { subscribed: 0, active: 0 }
+  const store = {
+    isAccessible: (id, parentOf) => real.isAccessible(id, parentOf),
+    isShared: (id) => real.isShared(id),
+    unshare: (id, reason) => real.unshare(id, reason),
+    subscribe: (listener) => {
+      counts.subscribed += 1
+      counts.active += 1
+      const off = real.subscribe(listener)
+      return () => {
+        counts.active -= 1
+        off()
+      }
+    },
+  }
+  const fake = makeFakeGateway()
+  const handler = createRelayHandler({
+    secret: SECRET,
+    store,
+    gateway: fake.gateway,
+    serverInfo: { serverId: loadServerId(home), serverName: () => 't43-b', dshVersion: '0.0.0-test' },
+  })
+  assert.equal(counts.active, 1, 'the handler holds one listener of its own (the ownership-cache sweeper)')
+
+  // An open stream adds its own listener; ending it releases it again.
+  const server = await startServer(handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'S' } } } })
+    await waitFor(() => counts.subscribed === 2)
+    fake.streams[0].finish()
+    await open.done
+    await waitFor(() => counts.active === 1)
+
+    handler.closeAll('t43-b test')
+    assert.equal(counts.active, 0, 'closeAll detached the handler from the table')
+
+    // Share changes after the close are invisible to the dead handler —
+    // and must not throw into it.
+    real.share('S2')
+    real.unshare('S2', 'manual')
+    assert.equal(counts.active, 0)
+    assert.equal(counts.subscribed, 2, 'no listener was re-registered')
+  } finally { await server.stop() }
+})
+
+test('T43-fix: resuming before the watchdog still finishes the response cleanly (tail line + end)', async () => {
+  // The closeWith watchdog now arms unconditionally and only `finish` or
+  // `close` disarms it. A client that resumes reading INSIDE the budget
+  // must get the tail line and a clean end — the queued error line
+  // included — and the viewer count releases through the normal teardown.
+  const parts = makeParts('t43-end-resume', { shared: ['session-a'], heartbeatMs: 60_000, endDrainTimeoutMs: 400 })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+    const gate = parts.streams[0]
+    open.res.pause()
+    const big = 'x'.repeat(2 * 1024 * 1024)
+    const frame = (seq) => ({ type: 'event', event: { type: 'big', seq, time: seq, data: { pad: big } } })
+    gate.push(frame(1))
+    gate.push(frame(2))
+    gate.push(frame(3))
+    await waitFor(() => gate.queued >= 2)
+    parts.handler.closeAll('t43 resume test')
+
+    // Back inside the 400ms budget, the client starts reading again.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    open.res.resume()
+    await open.done
+    const last = open.lines[open.lines.length - 1]
+    assert.equal(last.type, 'error', 'the queued server-restart tail line arrived')
+    assert.equal(last.error.code, 'server-restart')
+    assert.equal(parts.handler.viewerCount('session-a'), 0)
   } finally { await server.stop() }
 })

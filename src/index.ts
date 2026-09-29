@@ -659,16 +659,36 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     })
     clientRelayClient = relayClient
     // A stopped or reloaded row must not leave a stale instance where the
-    // module getter can hand it out (T23a-fix). The identity guard keeps a
-    // slow dispose from clearing a NEWER row's instance that a reload
-    // already installed.
+    // module getter can hand it out (T23a-fix), and its reconnect machinery
+    // (T43) must not outlive the row either: stop() cancels the armed retry
+    // timer and blocks further scheduling. The identity guard keeps a slow
+    // dispose from clearing a NEWER row's instance that a reload already
+    // installed.
     ctx.effect(() => () => {
+      relayClient.stop()
       if (clientRelayClient === relayClient) clientRelayClient = undefined
     }, 'dsh-zen-remote: relay client disposal')
+    // Credentials watch (T43): serverUrl / deviceToken are volatile row
+    // fields, and a pairing write (or unpair) commits them WITHOUT a row
+    // restart. The loader announces the commit on the row context; the
+    // client drops its pending reconnect wait and dials the new credentials
+    // immediately. Failure to subscribe degrades to a warning — the ladder
+    // and the per-request getters keep working without it.
+    ctx.effect(() => {
+      try {
+        const off = ctx.on('loader/volatile-update', () => relayClient.credentialsChanged())
+        return () => {
+          off()
+        }
+      } catch (error) {
+        ctx.logger.warn('dsh-zen-remote: cannot listen on "loader/volatile-update" for relay credentials: %s', message(error))
+        return () => {}
+      }
+    }, 'dsh-zen-remote: relay credentials watcher')
     // One connection attempt at startup (T23a). Failures only log — the
-    // status route surfaces the resulting state, and reconnection is T23b's
-    // job alongside the request interception. An unpaired row is the normal
-    // not-configured shape and stays silent.
+    // status route surfaces the resulting state, and the client's own
+    // backoff ladder (T43) takes over from the first failure. An unpaired
+    // row is the normal not-configured shape and stays silent.
     void relayClient.connect().catch((error) => {
       if (error instanceof RelayError && error.code === 'unpaired') return
       const code = error instanceof RelayError ? error.code : 'error'

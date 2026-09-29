@@ -36,6 +36,10 @@ export const CLIENT_CLAIM_ROUTE = `${CLIENT_ROUTE_PREFIX}/claim`
 /** GET: the current connection state (never carries the token). */
 export const CLIENT_STATUS_ROUTE = `${CLIENT_ROUTE_PREFIX}/status`
 
+/** POST: one immediate reconnect attempt (T43, the settings page's 立即重连);
+ * answered 409 unless the relay client is currently `offline`. */
+export const CLIENT_RECONNECT_ROUTE = `${CLIENT_ROUTE_PREFIX}/reconnect`
+
 /** Longest wait for one pairing round-trip to the server's gateway. */
 const CLAIM_TIMEOUT_MS = 10_000
 
@@ -166,18 +170,21 @@ function respondClaim(res: ServerResponse, outcome: ClaimOutcome, serverUrl: str
 }
 
 /**
- * Map one relay failure onto the status vocabulary (T23a-fix): ONLY the
- * gateway's unpaired wall is `revoked`. The relay route's own 401
- * `relay-unauthorized` is a server-side secret fault, and so is every other
- * shape of "this is not a working 2.0.0 relay" (`incompatible`, odd
- * statuses) — both land in `unexpected`, never in a verdict that would
- * unpair a validly-paired device. Transport death is `unreachable`.
+ * Map one relay failure onto the status vocabulary (T23a-fix, extended by
+ * T43): ONLY the gateway's unpaired wall is `revoked`. A server that refuses
+ * the relay prefix or speaks another protocol version answers
+ * `incompatible` — the settings page renders it with its own "upgrade both
+ * ends" copy. The relay route's own 401 `relay-unauthorized` is a
+ * server-side secret fault, and every other odd shape lands in `unexpected`
+ * — never in a verdict that would unpair a validly-paired device. Transport
+ * death is `unreachable`.
  */
-function probeStateOfRelayError(error: unknown): ProbeState | 'unpaired' {
+function probeStateOfRelayError(error: unknown): ProbeState | 'unpaired' | 'incompatible' {
   if (error instanceof RelayError) {
     if (error.code === 'revoked') return 'revoked'
     if (error.code === 'offline') return 'unreachable'
     if (error.code === 'unpaired') return 'unpaired'
+    if (error.code === 'incompatible') return 'incompatible'
   }
   return 'unexpected'
 }
@@ -328,13 +335,52 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // Everything else — never connected, offline, connecting, revoked,
         // stale credentials — gets ONE live connect bounded by the probe
         // timeout; its FRESH result is the answer, never the possibly stale
-        // cached state.
+        // cached state. A failed attempt additionally carries the relay
+        // client's reconnect machinery readout (T43): when the next
+        // automatic retry fires and which code failed last — both free of
+        // credential material by contract.
         try {
           const info = await withProbeTimeout(relay.connect())
           responseJson(res, 200, { state: 'online', serverName: info.serverName, serverUrl: normalized.url })
         } catch (error) {
-          responseJson(res, 200, { state: probeStateOfRelayError(error), serverUrl: normalized.url })
+          const body: Record<string, unknown> = { state: probeStateOfRelayError(error), serverUrl: normalized.url }
+          if (relay.nextRetryAt !== null && relay.nextRetryAt !== undefined) body.nextRetryAt = relay.nextRetryAt
+          if (relay.lastError !== undefined) body.lastError = relay.lastError
+          responseJson(res, 200, body)
         }
+        return
+      }
+      if (route === CLIENT_RECONNECT_ROUTE) {
+        if (method !== 'POST') {
+          res.setHeader('Allow', 'POST')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use POST' } })
+          return
+        }
+        if (!sameOriginPost(req)) {
+          responseJson(res, 403, {
+            ok: false,
+            error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+          })
+          return
+        }
+        const relay = options.getRelayClient?.()
+        // No relay client (a composition that never built one): there is
+        // nothing to reconnect, and the probe-shaped status route is the
+        // only connection surface this deployment has.
+        if (relay === undefined) {
+          responseJson(res, 503, { ok: false, error: { code: 'unavailable', message: 'No relay client is running' } })
+          return
+        }
+        // The button is only clickable while offline; anything else is a
+        // conflict with the state the page just rendered.
+        if (relay.state !== 'offline' || !relay.reconnect()) {
+          responseJson(res, 409, { ok: false, error: { code: 'not-offline', message: 'The client is not offline' } })
+          return
+        }
+        // Fired, not awaited: the attempt runs on the relay client (bounded
+        // by its own request timeout), the state lands there either way, and
+        // the page's status refresh reports the outcome.
+        responseJson(res, 200, { ok: true })
         return
       }
       responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown client route' } })

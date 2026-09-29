@@ -68,6 +68,10 @@ const MAX_STREAMS_PER_DEVICE = 32
 /** Stream heartbeat when the caller does not inject one. */
 const DEFAULT_HEARTBEAT_MS = 15_000
 
+/** How long a stream's finish may wait for a backed-up socket buffer to
+ * drain before the response is destroyed (T43-A). */
+const DEFAULT_END_DRAIN_TIMEOUT_MS = 5_000
+
 /** `{"type":"ping"}` as one ready-made NDJSON line. */
 const PING_LINE = Buffer.from('{"type":"ping"}\n', 'utf8')
 
@@ -118,6 +122,11 @@ export interface RelayHandlerOptions {
    * reverse proxies from timing the idle stream away); defaults to 15000.
    * Tests inject a small value. */
   heartbeatMs?: number
+  /** How long a stream's finish may wait for a backed-up write buffer to
+   * drain before the response is destroyed (T43-A: a client that stopped
+   * reading must not pin the viewer count and the device budget forever);
+   * defaults to 5000. Tests inject a small value. */
+  endDrainTimeoutMs?: number
 }
 
 /**
@@ -133,8 +142,11 @@ export interface RelayHandler {
    * (across all devices). */
   viewerCount(sessionId: string): number
   /** End every currently open stream: each client gets one
-   * `error{code:'server-restart'}` line, then the response ends, the upstream
-   * subscription aborts and every counter/listener cleans up. A plugin row
+   * `error{code:'server-restart'}` line, then the response ends (a client
+   * that stopped reading is destroyed after {@link RelayHandlerOptions.endDrainTimeoutMs}),
+   * the upstream subscription aborts and every counter/listener cleans up —
+   * including the handler's own share-table subscriptions, so a table change
+   * after the close never reaches this handler again (T43-B). A plugin row
    * reload builds a new handler and share table; without this the streams of
    * the OLD handler would keep pushing, unreachable by any unshare. */
   closeAll(reason: string): void
@@ -312,6 +324,7 @@ function errorOf(error: unknown): { code: string; message?: string } {
 export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   const { secret, store, gateway, serverInfo } = options
   const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
+  const endDrainTimeoutMs = options.endDrainTimeoutMs ?? DEFAULT_END_DRAIN_TIMEOUT_MS
   const parentOf = options.parentOf ?? (() => undefined)
   const isAccessible = (sessionId: string): boolean => store.isAccessible(sessionId, parentOf)
 
@@ -326,9 +339,19 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
    * An unshared session's rows are forgotten (T22b-fix): its jobs are none of
    * this client's business anymore. */
   const recentJobs = new Map<string, Map<string, string | undefined>>()
-  store.subscribe((event) => {
-    if (event.type === 'unshared') recentJobs.delete(event.sessionId)
-  })
+  /**
+   * Every share-table listener this handler registered — the ownership
+   * cache's unshare sweeper below, plus one per open stream. closeAll
+   * detaches them ALL (T43-B): after the handler closed, a share/unshare on
+   * the table must never re-enter the dead handler, not even through a
+   * stream whose pump is still parked on a full socket buffer.
+   */
+  const tableUnsubscribers = new Set<() => void>()
+  tableUnsubscribers.add(
+    store.subscribe((event) => {
+      if (event.type === 'unshared') recentJobs.delete(event.sessionId)
+    }),
+  )
 
   /** Kill switches of the streams currently open on THIS handler, and the
    * reason recorded by closeAll — a request that was mid-ownership-probe
@@ -640,12 +663,55 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           return run
         }
 
-        /** The one transition into "response over": idempotent, clears the
-         * heartbeat, writes the optional tail line, then ends the response. */
+        /**
+         * The one transition into "response over": idempotent, clears the
+         * heartbeat, writes the optional tail line, then ends the response.
+         *
+         * T43-A/fix: a client that stopped reading must not pin the stream —
+         * with it the viewer count and the device budget — forever. The
+         * watchdog starts UNCONDITIONALLY and owns the whole finish: the
+         * response either FINISHES (tail line and end-of-body handed to the
+         * socket — the `finish` event disarms the timer) or is gone
+         * (`close`), or it is destroyed after `endDrainTimeoutMs`. No
+         * branching on `writableNeedDrain`: a write that returned true can
+         * still be sitting in front of a full kernel buffer, and `finish`
+         * is the only honest "it drained" signal.
+         */
         const closeWith = (line: Record<string, unknown> | null): void => {
           if (finished) return
           finished = true
           clearInterval(heartbeat)
+          let watchdog: ReturnType<typeof setTimeout> | undefined
+          const stopWatchdog = (): void => {
+            res.off('finish', onSettled)
+            res.off('close', onSettled)
+            if (watchdog !== undefined) {
+              clearTimeout(watchdog)
+              watchdog = undefined
+            }
+          }
+          const onSettled = (): void => {
+            stopWatchdog()
+          }
+          if (!clientGone && !res.destroyed && !res.writableEnded) {
+            res.once('finish', onSettled)
+            res.once('close', onSettled)
+            watchdog = setTimeout(() => {
+              watchdog = undefined
+              res.off('finish', onSettled)
+              res.off('close', onSettled)
+              // The tail is somewhere in the buffers but the client never
+              // reads: destroying is the only way this response (and its
+              // counters) ever finishes.
+              try {
+                res.destroy()
+              } catch {
+                // Already gone.
+              }
+            }, endDrainTimeoutMs)
+            // The host process must never be kept alive by a finish alone.
+            if (typeof watchdog.unref === 'function') watchdog.unref()
+          }
           const tailLine = line === null ? Promise.resolve() : writeLine(line, true)
           void tailLine.then(() => {
             if (!clientGone && !res.destroyed && !res.writableEnded) res.end()
@@ -740,6 +806,10 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           )
         }
         openStreamKills.add(killThisStream)
+        // Registered beside the kill switch: closeAll detaches the stream's
+        // share-table listener synchronously, before the pump's own teardown
+        // gets a turn (T43-B).
+        tableUnsubscribers.add(unsubscribe)
 
         // Last gate before anything is opened (T22b-fix): both checks cover
         // the window the ownership probe (or any earlier await) opened — an
@@ -785,6 +855,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           openStreamKills.delete(killThisStream)
           clearInterval(heartbeat)
           unsubscribe()
+          tableUnsubscribers.delete(unsubscribe)
           res.off('close', onClientGone)
           res.off('error', onClientGone)
           if (decision.filter === undefined) {
@@ -808,6 +879,13 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
 
   handle.viewerCount = (sessionId: string): number => viewers.get(sessionId) ?? 0
   handle.closeAll = (reason: string): void => {
+    // Detach EVERY share-table listener first (T43-B): after this point the
+    // dead handler must not be reached by any share/unshare — not even by a
+    // stream whose pump is parked on a full socket buffer and whose own
+    // teardown still awaits the 'close' the kills below cause. Calling an
+    // unsubscribe twice is a no-op, so the pumps' finallys stay honest.
+    for (const detach of [...tableUnsubscribers]) detach()
+    tableUnsubscribers.clear()
     // Remember the reason for requests still inside their ownership probe —
     // they read it at the pre-open gate. Killing the open streams runs their
     // normal teardown (error line, res.end, abort), whose finally releases
