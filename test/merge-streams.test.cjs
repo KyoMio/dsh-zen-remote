@@ -11,7 +11,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createWorkspaceMerger, createControlMerger, mergeSessionList } = require('../lib/merge-streams.js')
+const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, virtualizeModelSelectionValue } = require('../lib/merge-streams.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
@@ -804,4 +804,91 @@ test('T34 RT UI model: a revoked relay keeps the group under the 吊销 annotati
   m.setStatus('none')
   m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
   assert.equal(ui.model.items[1].title, `${NAME} · 远端一`)
+})
+
+// -- 7. the model catalog and the modelSelection projection values (T52) -----------
+
+test('T52 mergeModelCatalogs: server groups append after the local ones with virtual ids and prefixed names; default and failures stay local', () => {
+  const local = {
+    default: { provider: 'deepseek-account', model: 'deepseek-v4-pro' },
+    routableProviders: ['deepseek-account', 'openai'],
+    groups: [
+      { id: 'deepseek-account', name: 'DeepSeek 账号', models: [{ id: 'deepseek-v4-pro', name: 'V4 Pro' }] },
+      { id: 'openai', name: 'OpenAI', models: [{ id: 'gpt', name: 'GPT' }] },
+    ],
+    failures: [{ id: 'bad', name: '坏', message: 'x' }],
+  }
+  const remote = {
+    default: { provider: 'codex', model: 'sol' },
+    routableProviders: ['codex', 'claude'],
+    groups: [
+      { id: 'codex', name: 'Codex', models: [{ id: 'sol', name: 'Sol' }] },
+      { id: 'claude', name: 'Claude', models: [{ id: 'sonnet', name: 'Sonnet' }] },
+      { notAGroup: true },
+    ],
+    failures: [{ id: 'server-bad', name: '服务端坏', message: 'y' }],
+  }
+  const merged = mergeModelCatalogs(local, remote, { serverId: SID, serverName: NAME })
+  assert.deepEqual(merged.groups, [
+    local.groups[0],
+    local.groups[1],
+    { id: V('codex'), name: `${NAME} · Codex`, models: [{ id: 'sol', name: 'Sol' }] },
+    { id: V('claude'), name: `${NAME} · Claude`, models: [{ id: 'sonnet', name: 'Sonnet' }] },
+  ])
+  // The default drives blank LOCAL sessions; server failures never alarm the
+  // dropdown (each failure row's Retry reloads the whole local catalog).
+  assert.equal(merged.default, local.default)
+  assert.deepEqual(merged.failures, local.failures)
+  // routableProviders mirrors the merged group ids (the host derives it as
+  // groups.map(g => g.id); no RT client UI reads it — consistency move).
+  assert.deepEqual(merged.routableProviders, ['deepseek-account', 'openai', V('codex'), V('claude')])
+  // The inputs are never mutated.
+  assert.deepEqual(remote.groups[0], { id: 'codex', name: 'Codex', models: [{ id: 'sol', name: 'Sol' }] })
+
+  // A group without a usable id is skipped; a remote side that says nothing
+  // (malformed, no groups array) leaves the local answer untouched.
+  const partial = mergeModelCatalogs(local, { groups: [{ notAGroup: true }] }, { serverId: SID, serverName: NAME })
+  assert.equal(partial, local)
+  assert.equal(mergeModelCatalogs(local, undefined, { serverId: SID, serverName: NAME }), local)
+  assert.equal(mergeModelCatalogs(undefined, remote, { serverId: SID, serverName: NAME }), undefined)
+})
+
+test('T52 virtualizeModelSelectionValue: providers go virtual, nulls and foreign keys pass', () => {
+  const value = {
+    lastUsed: { provider: 'codex', model: 'sol' },
+    next: { provider: 'codex', model: 'sol', reasoningEffort: 'high' },
+  }
+  assert.deepEqual(virtualizeModelSelectionValue(value, SID), {
+    lastUsed: { provider: V('codex'), model: 'sol' },
+    next: { provider: V('codex'), model: 'sol', reasoningEffort: 'high' },
+  })
+  assert.deepEqual(
+    virtualizeModelSelectionValue({ lastUsed: null, next: null }, SID),
+    { lastUsed: null, next: null },
+  )
+  // A selection without a provider string (or a non-object value) is untouchable.
+  assert.deepEqual(virtualizeModelSelectionValue({ lastUsed: { model: 'x' } }, SID), { lastUsed: { model: 'x' } })
+  assert.equal(virtualizeModelSelectionValue('nope', SID), 'nope')
+})
+
+test('T52 control merger: modelSelection projection frames get their providers virtualized beside the session id', () => {
+  const m = createControlMerger({ serverId: SID })
+  m.onLocal({ type: 'baseline', value: { projections: {} } })
+  // The exploded baseline path.
+  const exploded = m.onRemote({
+    type: 'baseline',
+    value: { projections: { s1: { asOfSeq: 9, values: { modelSelection: { lastUsed: { provider: 'codex', model: 'sol' }, next: null } } } } },
+  })
+  assert.deepEqual(exploded, [
+    { type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: { provider: V('codex'), model: 'sol' }, next: null }, seq: 9 },
+  ])
+  // The live single-key path.
+  assert.deepEqual(
+    m.onRemote({ type: 'projection', sessionId: 's1', key: 'modelSelection', value: { lastUsed: null, next: { provider: 'codex', model: 'sol' } }, seq: 10 }),
+    [{ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: null, next: { provider: V('codex'), model: 'sol' } }, seq: 10 }],
+  )
+  // Any other key stays verbatim.
+  assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', key: 'title', value: 't', seq: 11 }), [
+    { type: 'projection', sessionId: V('s1'), key: 'title', value: 't', seq: 11 },
+  ])
 })

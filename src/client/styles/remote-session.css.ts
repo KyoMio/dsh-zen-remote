@@ -22,4 +22,32 @@ export const REMOTE_SESSION_CSS = `/* ---------- remote session: hide the open-o
 html[data-zr-remote-session="1"] [data-open-target] {
   display: none !important;
 }
+
+/* ---------- T52: model-menu groups follow the session's side ----------
+   The model catalog is GLOBAL (one shared load per page), so the merged
+   catalog shows the server's groups everywhere; but a selection is only
+   runnable on the side the open session lives on — the interceptor refuses
+   the other side with a clear message. Hide what cannot run, by the one
+   stable mark the menu carries:
+   - the model menu renders one section[role="group"] per provider group
+     with aria-labelledby="<useId>-<group.id>" (RT dsh-client-ui-model-
+     selection lib/client.js:830-835), so a VIRTUAL group's section carries
+     the "zr~" prefix in that attribute — an attribute the component itself
+     writes, like data-open-target above;
+   - the menu is a portal under <body>, but <html> is still its ancestor,
+     so the html-level session attribute scopes it with no host-depth
+     assumption and no :has();
+   - the [role="menu"] scope keeps the rule inside dropdown menus (where the
+     model picker lives); if DSH ever drops the aria mark the rule simply
+     stops matching — the interceptor's refusals remain the backstop.
+     In a remote session only the server's groups stay; otherwise only the
+     local ones (the home page and dialogs read as local, which is right:
+     the model picker only mounts inside a session, and a blank local
+     session cannot run server models either). */
+html[data-zr-remote-session="1"] [role="menu"] section[role="group"]:not([aria-labelledby*="zr~"]) {
+  display: none !important;
+}
+html:not([data-zr-remote-session]) [role="menu"] section[role="group"][aria-labelledby*="zr~"] {
+  display: none !important;
+}
 `

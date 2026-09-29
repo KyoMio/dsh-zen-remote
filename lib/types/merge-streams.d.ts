@@ -80,6 +80,13 @@
  * clocks — the virtual-id arithmetic is the one dependency (virtual-id.ts).
  * Shapes are read defensively like relay-filter.ts does: a malformed frame is
  * dropped (diagnosed through the optional hook), never forwarded.
+ *
+ * T52 adds two RESULT-side pure helpers on the same principles:
+ * {@link mergeModelCatalogs} folds the relay's `session/modelCatalog` answer
+ * into the local one (the catalog is the model-selection dropdown's data), and
+ * {@link virtualizeModelSelectionValue} rewrites a `modelSelection` projection
+ * value's provider ids to virtual group ids so the UI can find the current
+ * model's display name in the merged catalog.
  */
 /** The (serverId, serverName) pair a merger virtualizes with. A re-handshake
  * with a different server retargets the SAME merger ({@link retarget}) so the
@@ -201,4 +208,54 @@ export declare function createControlMerger(options: ControlMergerOptions): Cont
  * said nothing" — the local result passes back untouched.
  */
 export declare function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string): unknown;
+/**
+ * Fold the relay's `session/modelCatalog` answer into the local one (T52).
+ * The result shape is RT dsh-api-session-controller
+ * `session_modelCatalog_result$schema` (lib/typert.remote-client.js:489-518):
+ * `{default, routableProviders, groups, failures}` — provider group ids and
+ * display names only, no session data anywhere, so no output filter guards it
+ * server-side and nothing here needs narrowing.
+ *
+ * - server groups are APPENDED after the local ones (the dropdown sorts
+ *   `deepseek-account` / `deepseek-official` first and keeps the rest in
+ *   order, RT dsh-client-ui-model-selection lib/client.js:510 — appended
+ *   groups render last); each group id becomes the virtual group id
+ *   `zr~<serverId>~<original>` and its name is prefixed
+ *   `${serverName} · ${name}` — the same workspace title discipline the
+ *   merger uses;
+ * - `default` and `failures` stay LOCAL untouched: the default drives what a
+ *   blank LOCAL session would run (a remote session's current model comes
+ *   from its projection instead), and the UI renders every failure as a
+ *   prominent warning row whose Retry reloads the WHOLE catalog
+ *   (lib/client.js:816-827) — a server-side group failure is not retryable
+ *   from here and would put a permanent alarm on every dropdown, so it does
+ *   not travel (dsh-vision-router's settings read the same result and shows
+ *   an error state exactly when groups are empty AND failures exist,
+ *   lib/client.js:635-647 — dropping remote failures keeps that honest);
+ * - `routableProviders` mirrors the group ids by construction host-side
+ *   (RT dsh-api-session-controller lib/index.js:544 — literally
+ *   `groups.map(g => g.id)`); no client UI reads it (the dropdown's
+ *   routable verdict comes from the groups themselves, lib/client.js:334),
+ *   so appending the virtual ids is a consistency move: the merged catalog
+ *   keeps the invariant the Host maintains, whatever reads it next.
+ *
+ * A malformed local or remote value means "one side said nothing" — the
+ * local result passes back untouched, like {@link mergeSessionList}.
+ */
+export declare function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, identity: MergerIdentity): unknown;
+/**
+ * Virtualize the provider ids inside one `modelSelection` projection value —
+ * `{lastUsed: {provider, model, reasoningEffort?} | null, next: …}` (RT
+ * dsh-api-session-controller lib/types/model-selection-projection.js:12-15,
+ * wire shapes at lib/typert.remote-client.js:83-94). The UI resolves the
+ * current model's display name by matching `(provider, model)` against the
+ * catalog groups (dsh-client-ui-model-selection lib/client.js:334, 520); for
+ * a remote session the provider is a SERVER group id, so it must become the
+ * virtual group id to be found in the merged catalog — and while the relay
+ * serves, the merged catalog always carries it, so the composer trigger
+ * shows the model NAME instead of the raw `provider/model` fallback string
+ * (lib/client.js:700). Nulls and malformed entries pass through untouched;
+ * `model` and `reasoningEffort` are group-agnostic ids and stay as they are.
+ */
+export declare function virtualizeModelSelectionValue(value: unknown, serverId: string): unknown;
 //# sourceMappingURL=merge-streams.d.ts.map
