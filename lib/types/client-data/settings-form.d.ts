@@ -396,6 +396,14 @@ export declare const SERVER_NAME_MAX = 40;
 export declare const IDLE_HOURS_MAX = 8760;
 /** The row fields the settings page edits, in render order. */
 export declare const SETTINGS_FIELDS: readonly SettingsFieldSpec[];
+/**
+ * Whether the settings page's server-local operations (pairing, device
+ * management, the push probe) are usable: only once a status load answered
+ * AND it answered as the local machine (`viaGateway: false`). Everything
+ * else — no answer yet, or the page opened through the gateway — keeps them
+ * disabled. Pure so the check script pins all three cases.
+ */
+export declare function localOpsAllowed(view: SettingsView | undefined): boolean;
 /** Per-field presentation facts the block renders next to each control. */
 export interface SettingsFieldView {
     /** Effective value (the resolved `config.values[field]`). */

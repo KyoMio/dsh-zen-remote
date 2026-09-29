@@ -14,7 +14,10 @@
  *
  * Renders NOTHING on a local session (the id is not a virtual id), so the
  * two roles' icons never appear at once, and nothing before the store's
- * first answered GET.
+ * first answered GET. A local session also never SUBSCRIBES
+ * (subscribeIfVirtual): the subscription is what keeps the store polling,
+ * so a page showing only local sessions never sends a remote-status
+ * request.
  *
  * On the phone shell no rule of its own is needed: the mobile stylesheet
  * blanket-hides every `conversation.session.header.actions` entry that is

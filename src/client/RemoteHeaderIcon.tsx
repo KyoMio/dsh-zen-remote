@@ -16,17 +16,23 @@
  * fallback), and on a subagent session, which the server refuses to share
  * alone (T33b-fix: same rule as the menu item).
  *
- * On the phone shell no rule of its own is needed: the mobile stylesheet
- * blanket-hides every `conversation.session.header.actions` entry that is
- * not the phone header's own (styles/header.css.ts), so this icon is a
- * desktop(-browser) surface, exactly like the official jobs pill.
+ * On the phone shell (a non-desktop-shell viewport at or under 767px) the
+ * mobile stylesheet blanket-hides every `conversation.session.header.actions`
+ * entry that is not the phone header's own (styles/header.css.ts), so this
+ * icon would never be seen — it does not SUBSCRIBE there either
+ * (subscribeIfNotPhoneShell): the subscription is what keeps the shares
+ * store polling, so the phone shell never sends the 30 s admin/shares GET
+ * through the gateway. On a desktop shell the phone CSS never applies
+ * (apply's gate returns before installing it), so the icon stays a live
+ * surface at any window width there.
  */
 
-import { useCallback, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { IconGlobeOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { describeShare, shareFailText } from '../client-data/shares.ts'
+import { describeShare, shareFailText, subscribeIfNotPhoneShell } from '../client-data/shares.ts'
 import type { SharesStore } from '../client-data/shares.ts'
+import { isDesktopShell } from './compat/desktop.ts'
 import { NS } from './locales.ts'
 
 export interface RemoteHeaderIconProps extends PropsRuntime<'conversation.session.header.actions'>, PropsLocale<typeof NS> {
@@ -34,9 +40,32 @@ export interface RemoteHeaderIconProps extends PropsRuntime<'conversation.sessio
   shares: SharesStore
 }
 
+/** The same breakpoint the phone stylesheet scopes itself to (styles/header.css.ts). */
+const PHONE_QUERY = '(max-width: 767px)'
+
+/** Live phone-shell flag. The desktop shell never carries the phone CSS, so
+ * its answer is a constant false; a plain browser tracks the breakpoint so
+ * a window dragged across 767px flips the subscription with it. */
+function usePhoneShell(): boolean {
+  const [phone, setPhone] = useState(() => !isDesktopShell() && window.matchMedia(PHONE_QUERY).matches)
+  useEffect(() => {
+    if (isDesktopShell()) return
+    const query = window.matchMedia(PHONE_QUERY)
+    const sync = (): void => { setPhone(query.matches) }
+    sync()
+    query.addEventListener('change', sync)
+    return () => { query.removeEventListener('change', sync) }
+  }, [])
+  return phone
+}
+
 export function RemoteHeaderIcon({ sessionId, shares, useSessions, t }: RemoteHeaderIconProps) {
+  const phoneShell = usePhoneShell()
   const snap = useSyncExternalStore(
-    useCallback((onStoreChange: () => void) => shares.subscribe(onStoreChange), [shares]),
+    useCallback(
+      (onStoreChange: () => void) => subscribeIfNotPhoneShell(shares, phoneShell, onStoreChange),
+      [shares, phoneShell],
+    ),
     () => shares.getSnapshot(),
   )
   const row = useSessions((sessions) => sessions.byId[sessionId])

@@ -20,12 +20,15 @@
  *
  * Renders NOTHING on a local session, before the store's first answered GET,
  * and whenever neither the offline nor a closed reason applies (then the
- * block is cleared too).
+ * block is cleared too). A local session also never SUBSCRIBES
+ * (subscribeIfVirtual): the subscription is what keeps the store polling,
+ * so a page showing only local sessions never sends a remote-status
+ * request.
  */
 
 import { useCallback, useLayoutEffect, useSyncExternalStore } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { bannerText } from '../client-data/remote-status.ts'
+import { bannerText, subscribeIfVirtual } from '../client-data/remote-status.ts'
 import type { RemoteStatusStore } from '../client-data/remote-status.ts'
 import { isVirtual } from '../virtual-id.js'
 import { NS } from './locales.ts'
@@ -42,8 +45,13 @@ export interface RemoteComposerBannerProps extends PropsRuntime<'conversation.in
 }
 
 export function RemoteComposerBanner({ sessionId, status, t, setComposerBlock }: RemoteComposerBannerProps) {
+  // The subscription is virtual-id gated (subscribeIfVirtual) — hooks stay
+  // above the render gate.
   const snap = useSyncExternalStore(
-    useCallback((onStoreChange: () => void) => status.subscribe(onStoreChange), [status]),
+    useCallback(
+      (onStoreChange: () => void) => subscribeIfVirtual(status, sessionId, onStoreChange),
+      [status, sessionId],
+    ),
     () => status.getSnapshot(),
   )
   const virtual = isVirtual(sessionId)

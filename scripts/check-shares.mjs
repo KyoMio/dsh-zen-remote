@@ -383,7 +383,7 @@ test('actions: a refused POST carries the server error code, no refresh', async 
 
 test('shareFailText maps the server codes to the alert copy', () => {
   assert.equal(shareFailText({ ok: false, code: 'subagent-session' }, 'share', t), '开启远程失败：子智能体会话不能单独开启')
-  assert.equal(shareFailText({ ok: false, code: 'no-session' }, 'share', t), '开启远程失败：会话还没有内容')
+  assert.equal(shareFailText({ ok: false, code: 'no-session' }, 'share', t), '开启远程失败：会话暂无内容')
   assert.equal(shareFailText({ ok: false }, 'share', t), '操作失败，请稍后再试')
   // Even a mappable code reads generic on unshare.
   assert.equal(shareFailText({ ok: false, code: 'subagent-session' }, 'unshare', t), '操作失败，请稍后再试')
