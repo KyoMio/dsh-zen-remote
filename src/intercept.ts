@@ -191,7 +191,8 @@ export interface InstallInterceptOptions {
   /** The client relay client (T23a) the calls travel through. */
   relay: RelayClient
   /** The CURRENT handshake's server id, read live per call; `undefined`
-   * (never handshook) makes every remote call a `remote-mismatch`. */
+   * (never handshook) makes every remote call a `remote-offline` — a
+   * different fact from pointing at the wrong server (`remote-mismatch`). */
   getServerId: () => string | undefined
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
@@ -205,7 +206,9 @@ export interface InterceptHandle {
    * install time, the self-check verdict, the failure ring. */
   diagnostics(): InterceptDiagnostics
   /** How many calls entered each wrapper (local passthroughs included) —
-   * the behavior self-check's "the wrap was reached" proof. */
+   * diagnostic traffic counters for the status surface; the behavior
+   * self-check proves "the wrap was reached" by probe-payload identity
+   * instead. */
   wrappedCalls(): { openWireStream: number; dispatchRpc: number }
   /** Record the wiring's self-check verdict (and uninstall + log on
    * failure — the wiring owns that decision, this only records). */
@@ -847,6 +850,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       )
     }
     counters.openWireStream += 1
+    // The behavior self-check's probe payload — recognized by identity, so
+    // only a wrap that actually served THIS call vouches for it.
+    const probe = isPlainObject(payload) ? probePayloads.get(payload) : undefined
+    if (probe !== undefined) probe.entered = true
     const args = argsOf(payload)
     const fields = CLIENT_METHOD_FIELDS[endpoint]
     const virtuals = collectVirtuals(fields, args)
@@ -961,12 +968,28 @@ export interface SelfCheckOptions {
 }
 
 /**
+ * The behavior self-check registers its probe payload here before the call,
+ * and {@link installIntercept}'s wrapper flags the exact object when it sees
+ * it — identity, not a counter. `wrappedCalls()` counts EVERY entry, so a
+ * stream the UI opens while the probe waits would vouch for a wire adapter
+ * that actually routes around the wrapper; the marked payload lets each
+ * self-check attempt be judged on its own.
+ */
+const probePayloads = new WeakMap<object, { entered: boolean }>()
+
+/**
  * The startup behavior self-check (spike §4.1 check 4): open the one stream
  * the shape check cannot prove — that the wrap is actually REACHED — through
  * `wireStream.open('workspace/follow', …)` and demand a `baseline` first
  * frame whose `value.items` is an array (the real workspace baseline's
- * shape). The caller decides what "the wrap was reached" means by comparing
- * `wrappedCalls()` before/after — {@link runSelfCheck} owns that policy.
+ * shape). The probe payload is marked in {@link probePayloads} before the
+ * call and the wrapper flags that exact object, so the verdict covers both
+ * faults at once: frames that are not a workspace feed, and a wire adapter
+ * that routes around the wrapper. The real gateway's `openWireStream` is
+ * `async` (RT dsh-api-gateway), so the adapter's `open()` returns a PROMISE
+ * of the stream — the await sits inside the same timeout race as the
+ * first-frame wait, so an upstream that never settles fails the check
+ * instead of hanging startup.
  */
 export async function behaviorSelfCheck(raw: object, options?: SelfCheckOptions): Promise<SelfCheckResult> {
   const gateway = raw as Record<string, unknown>
@@ -980,30 +1003,37 @@ export async function behaviorSelfCheck(raw: object, options?: SelfCheckOptions)
   // the only pending work — exactly the hang it exists to prevent. Five
   // seconds of keepalive during startup is harmless.
   const timer = setTimeout(() => controller.abort(), options?.timeoutMs ?? 5_000)
-    let iterator: AsyncIterator<unknown> | undefined
-    try {
-      // The 0.2.0 openWireStream is an async method: the host's mux awaits
-      // `open(...)` before for-awaiting, and so does this probe (`await` on a
-      // non-promise iterable passes it through unchanged).
-      const iterable = await (open as (...openArgs: unknown[]) => unknown).call(
-        wireStream,
-        'workspace/follow',
-        { args: {} },
-        undefined,
-        typeof operatorPeer === 'function' ? operatorPeer.call(raw) : undefined,
-        controller.signal,
-      )
-      iterator = (iterable as AsyncIterable<unknown>)[Symbol.asyncIterator]()
+  let iterator: AsyncIterator<unknown> | undefined
+  const payload: Record<string, unknown> = { args: {} }
+  const entered = { entered: false }
+  probePayloads.set(payload, entered)
+  try {
+    // One abort-gated rejector shared by both waits: settling the open and
+    // settling the first frame are bounded by the SAME deadline.
+    const timeout = new Promise<never>((_, reject) => {
+      const onAbort = (): void => reject(new RelayError('aborted', 'the self-check exceeded its timeout'))
+      if (controller.signal.aborted) onAbort()
+      else controller.signal.addEventListener('abort', onAbort, { once: true })
+    })
+    // A sync wrapper hands back the stream, an async one a Promise of it —
+    // normalize through Promise.resolve and await INSIDE the race.
+    const opened = await Promise.race([
+      Promise.resolve(
+        (open as (...openArgs: unknown[]) => unknown).call(
+          wireStream,
+          'workspace/follow',
+          payload,
+          undefined,
+          typeof operatorPeer === 'function' ? operatorPeer.call(raw) : undefined,
+          controller.signal,
+        ),
+      ),
+      timeout,
+    ])
+    iterator = (opened as AsyncIterable<unknown>)[Symbol.asyncIterator]()
     // The abort must also bound the WAIT, not only the signal: an upstream
     // that ignores its signal must not hang startup forever.
-    const first = await Promise.race([
-      iterator.next(),
-      new Promise<never>((_, reject) => {
-        const onAbort = (): void => reject(new RelayError('aborted', 'the self-check exceeded its timeout'))
-        if (controller.signal.aborted) onAbort()
-        else controller.signal.addEventListener('abort', onAbort, { once: true })
-      }),
-    ])
+    const first = await Promise.race([iterator.next(), timeout])
     await iterator.return?.(undefined)
     if (first.done === true) return { ok: false, reason: 'the self-check stream ended without a frame' }
     const frame = first.value
@@ -1017,6 +1047,7 @@ export async function behaviorSelfCheck(raw: object, options?: SelfCheckOptions)
     if (!isPlainObject(value) || !Array.isArray(value.items)) {
       return { ok: false, reason: 'the self-check baseline frame carries no value.items array' }
     }
+    if (!entered.entered) return { ok: false, reason: 'the self-check stream bypassed the wrapper' }
     return { ok: true }
   } catch (error) {
     // Best-effort close of an upstream the timeout may have interrupted —
@@ -1030,9 +1061,9 @@ export async function behaviorSelfCheck(raw: object, options?: SelfCheckOptions)
 }
 
 export interface RunSelfCheckOptions {
-  /** The handle whose self-check verdict, uninstall and call counters are
+  /** The handle whose self-check verdict, uninstall and installed state are
    * driven. */
-  handle: Pick<InterceptHandle, 'noteSelfCheck' | 'uninstall' | 'wrappedCalls'>
+  handle: Pick<InterceptHandle, 'noteSelfCheck' | 'uninstall' | 'diagnostics'>
   /** How long to wait before the single retry; default 3000 ms. */
   retryDelayMs?: number
   /** Failure logging, wired to the context logger by index.ts. */
@@ -1042,26 +1073,31 @@ export interface RunSelfCheckOptions {
 /**
  * Run the behavior self-check with the wiring's failure policy: ONE retry
  * after a pause (a transiently unready upstream must not cost the whole
- * interception), and only a second failure uninstalls and records. "The
- * wrap was reached" is a COUNTER DELTA, not an absolute count: the UI or
- * another plugin may open streams of its own while the probe waits for its
- * first frame, so the check demands at least one wrapper entry above the
- * pre-probe baseline, never exactly one.
+ * interception), and only a second failure uninstalls and records. Each
+ * attempt is judged on its own — the probe payload is recognized inside the
+ * wrapper by identity, so streams the UI opens during the check change
+ * nothing. The plugin may be disposed while a check is in flight (a row
+ * reload during startup), so the handle's installed state is re-read before
+ * the retry and after every attempt: an uninstalled check exits silently —
+ * no further probe, no verdict, no "interception removed" warning (that
+ * removal was not ours to announce, and a post-uninstall probe would run
+ * against the unwrapped gateway and fail spuriously).
  */
 export async function runSelfCheck(raw: object, options: RunSelfCheckOptions): Promise<SelfCheckResult> {
   const { handle, log } = options
   const retryDelayMs = options.retryDelayMs ?? 3_000
-  const before = handle.wrappedCalls().openWireStream
-  const attempt = async (): Promise<SelfCheckResult> => {
-    const outcome = await behaviorSelfCheck(raw)
-    if (outcome.ok && handle.wrappedCalls().openWireStream > before) return { ok: true }
-    return { ok: false, reason: outcome.ok ? 'the self-check stream bypassed the wrapper' : outcome.reason }
+  const stillInstalled = (): boolean => handle.diagnostics().installed
+  let result = await behaviorSelfCheck(raw)
+  if (!result.ok && stillInstalled()) {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, retryDelayMs)
+      // A disposed plugin must not hold the process (or a test runner's
+      // loop-empty judgement) open for the retry delay.
+      if (typeof timer.unref === 'function') timer.unref()
+    })
+    if (stillInstalled()) result = await behaviorSelfCheck(raw)
   }
-  let result = await attempt()
-  if (!result.ok) {
-    await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
-    result = await attempt()
-  }
+  if (!stillInstalled()) return result
   handle.noteSelfCheck(result)
   if (result.ok) return result
   handle.uninstall()
