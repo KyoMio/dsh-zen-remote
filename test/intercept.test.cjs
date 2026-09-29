@@ -613,7 +613,7 @@ const REMOTE_BASELINE = {
   },
 }
 
-test('workspace/follow merges the two legs: local first, remote upserts + merged order, remote death keeps local alive, recovery reopens, abort stops both', async () => {
+test('workspace/follow merges the two legs: local first, remote upserts + merged order, a remote death emits NOTHING (state kept), recovery diffs, abort stops both', async () => {
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
   const relay = createControllableRelay()
@@ -648,32 +648,24 @@ test('workspace/follow merges the two legs: local first, remote upserts + merged
     { type: 'pinned', pinnedSessionIds: [] },
   ])
 
-  // the remote leg dies → removal frames, local keeps flowing
+  // the remote leg dies → NO frames at all (T23b2-fix): a remove here would
+  // blacklist the virtual ids in the UI's ClientWorkspaceModel forever
   relay.transition('offline')
   relay.streams[0].gate.throwNow(new RelayError('offline', '链路断了'))
-  const gone = await readSome(iterator, 5)
-  assert.deepEqual(gone, [
-    { type: 'remove', workspaceId: toVirtual(SERVER_ID, 'w-1') },
-    { type: 'remove', workspaceId: toVirtual(SERVER_ID, 'w-2') },
-    { type: 'order', workspaceIds: ['ws-local'] },
-    { type: 'archived', archivedSessionIds: [] },
-    { type: 'pinned', pinnedSessionIds: [] },
-  ])
-  const ring = handle.diagnostics().recentFailures
-  assert.equal(ring[ring.length - 1].endpoint, 'workspace/follow')
-  assert.equal(ring[ring.length - 1].code, 'offline')
-
   localGate.push({ type: 'order', workspaceIds: ['ws-local'] })
-  const afterGone = await readSome(iterator, 1)
-  assert.deepEqual(afterGone, [{ type: 'order', workspaceIds: ['ws-local'] }], 'local frames flow while the relay is down')
+  const afterDeath = await readSome(iterator, 1)
+  assert.deepEqual(afterDeath, [
+    { type: 'order', workspaceIds: ['ws-local', toVirtual(SERVER_ID, 'w-1'), toVirtual(SERVER_ID, 'w-2')] },
+  ], 'the shown remote state survives the death — the local order still merges it')
 
-  // relay back online → the remote leg reopens (no local reopen needed)
+  // relay back online → the remote leg reopens and the new baseline DIFFS
+  // against the shown set: same content → upserts only, no removes
   relay.transition('online')
   await waitForStream(relay, 2)
   relay.streams[1].gate.push(REMOTE_BASELINE)
   const remerged = await readSome(iterator, 5)
-  assert.equal(remerged[0].type, 'upsert', 'the reopened stream re-shows the remote groups')
-  assert.equal(remerged[0].workspace.workspaceId, toVirtual(SERVER_ID, 'w-1'))
+  assert.deepEqual(remerged.map((frame) => frame.type), ['upsert', 'upsert', 'order', 'archived', 'pinned'])
+  assert.equal(remerged[0].workspace.workspaceId, toVirtual(SERVER_ID, 'w-1'), 'the reopened stream re-shows the remote groups')
 
   // external abort: both legs stop, the merged iteration ends normally
   controller.abort()
@@ -682,6 +674,143 @@ test('workspace/follow merges the two legs: local first, remote upserts + merged
   assert.ok(relay.streams[1].aborted, 'the remote leg was aborted')
   assert.ok(gateway.streamCalls[0].signal.aborted, 'the local leg rides the same external signal')
   localGate.finish()
+  handle.uninstall()
+})
+
+test('a server RENAME (same serverId) re-upserts under the new title without reopening the stream or removing anything', async () => {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  await readSome(iterator, 1)
+  relay.streams[0].gate.push(REMOTE_BASELINE)
+  await readSome(iterator, 5)
+
+  relay.handshakeInfo = { ...relay.handshakeInfo, serverName: '改名的服务器' }
+  relay.transition('online')
+  const renamed = await readSome(iterator, 2)
+  assert.deepEqual(renamed, [
+    { type: 'upsert', workspace: { ...REMOTE_BASELINE.value.items[0], workspaceId: toVirtual(SERVER_ID, 'w-1'), title: '改名的服务器 · 远端一', sessionIds: [toVirtual(SERVER_ID, 'session-a'), toVirtual(SERVER_ID, 'session-b')] } },
+    { type: 'upsert', workspace: { ...REMOTE_BASELINE.value.items[1], workspaceId: toVirtual(SERVER_ID, 'w-2'), title: '改名的服务器 · 远端二', sessionIds: [toVirtual(SERVER_ID, 'session-c')] } },
+  ])
+  assert.equal(relay.streams.length, 1, 'no reopen for a rename')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(relay.streams[0].aborted, false, 'the stream was never cut')
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('unpair / revocation removes the whole group; a re-pair to the same serverId reopens and re-shows everything', async () => {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  await readSome(iterator, 1)
+  relay.streams[0].gate.push(REMOTE_BASELINE)
+  await readSome(iterator, 5)
+
+  // the pairing dies: the whole virtual group leaves (those prefixes never
+  // come back, so the UI's remove-blacklist cannot be hit by a revival)
+  relay.transition('revoked')
+  const gone = await readSome(iterator, 5)
+  assert.deepEqual(gone, [
+    { type: 'remove', workspaceId: toVirtual(SERVER_ID, 'w-1') },
+    { type: 'remove', workspaceId: toVirtual(SERVER_ID, 'w-2') },
+    { type: 'order', workspaceIds: ['ws-local'] },
+    { type: 'archived', archivedSessionIds: [] },
+    { type: 'pinned', pinnedSessionIds: [] },
+  ])
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(relay.streams.length, 1, 'no reopen while revoked')
+
+  // re-paired (same server id): the leg reopens and the baseline re-shows
+  relay.transition('online')
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push(REMOTE_BASELINE)
+  const remerged = await readSome(iterator, 5)
+  assert.deepEqual(remerged.map((frame) => frame.type), ['upsert', 'upsert', 'order', 'archived', 'pinned'])
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('a relay.subscribe that throws degrades the merged stream to pure local passthrough', async () => {
+  const controller = new AbortController()
+  const gateway = new FakeTypertGateway({ stream: { 'workspace/follow': [LOCAL_BASELINE] } })
+  const relay = createControllableRelay({
+    subscribe() { throw new Error('no listeners for you') },
+  })
+  const { handle } = install(gateway, relay)
+  const frames = await drained(gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))
+  assert.deepEqual(frames, [LOCAL_BASELINE], 'the local stream flowed untouched')
+  assert.equal(relay.streams.length, 0, 'the remote leg never started')
+  handle.uninstall()
+})
+
+test('a hostile relay (identity getter throws) stops only the remote leg — no unhandled rejection, local keeps flowing', async () => {
+  const unhandled = []
+  const onUnhandled = (reason) => unhandled.push(reason)
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    const controller = new AbortController()
+    const { gateway, localGate } = createMergeGateway(controller.signal)
+    let reads = 0
+    const relay = createControllableRelay()
+    Object.defineProperty(relay, 'handshakeInfo', {
+      get() {
+        reads += 1
+        if (reads > 2) throw new Error('hostile handshake read')
+        return { relayProtocol: 1, serverId: SERVER_ID, serverName: '主服务器', dshVersion: '0.0.0', fingerprints: {} }
+      },
+    })
+    const { handle } = install(gateway, relay)
+    const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+    localGate.push(LOCAL_BASELINE)
+    const first = await readSome(iterator, 1)
+    assert.deepEqual(first, [LOCAL_BASELINE])
+    // let the remote pump hit the hostile getter and give the microtask
+    // queue time to surface any unhandled rejection
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    localGate.push({ type: 'order', workspaceIds: ['ws-local'] })
+    const second = await readSome(iterator, 1)
+    assert.deepEqual(second, [{ type: 'order', workspaceIds: ['ws-local'] }], 'the local leg never noticed')
+    assert.deepEqual(unhandled, [], 'no unhandled promise rejection from the remote pump')
+    controller.abort()
+    await iterator.next()
+    localGate.finish()
+    handle.uninstall()
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+})
+
+test('an external signal already aborted before the merged stream starts ends it immediately', async () => {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  controller.abort()
+  const merged = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const done = await merged[Symbol.asyncIterator]().next()
+  assert.equal(done.done, true, 'both legs skipped')
+  assert.equal(relay.streams.length, 0, 'no remote stream was opened')
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('the behavior self-check probe goes through the wrapper but skips the remote leg entirely', async () => {
+  const gateway = new FakeTypertGateway({ stream: { 'workspace/follow': [{ type: 'baseline', value: { items: [] } }] } })
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const outcome = await behaviorSelfCheck(gateway)
+  assert.deepEqual(outcome, { ok: true })
+  assert.equal(relay.streams.length, 0, 'the probe never opened a relay stream')
+  assert.equal(gateway.streamCalls.length, 1, 'the wrap served the probe stream')
   handle.uninstall()
 })
 

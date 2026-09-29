@@ -13,7 +13,7 @@
  * server filters by (relay-filter.ts); remote frames arriving here have
  * ALREADY been narrowed to the shared sessions and carry ORIGINAL ids.
  *
- * The rules, mirroring tasks/T23b2.md:
+ * The rules, mirroring tasks/T23b2.md as corrected by tasks/T23b2-fix.md:
  * - local frames pass through, except that `baseline` / `order` get the
  *   remote workspaces APPENDED to their order (remote groups sort after
  *   local) and the `archived` / `pinned` lists merge local + remote;
@@ -23,9 +23,23 @@
  * - remote frames that arrive before the local baseline are CACHED as state
  *   only — the UI has seen nothing yet, so emitting them would order
  *   workspaces the local baseline would immediately erase;
- * - `onRemoteGone` (relay down, unpaired, server changed) removes exactly
- *   what the UI was shown: one `remove` per known remote workspace plus the
- *   remote-free `order` / `archived` / `pinned`.
+ * - a remote stream that died (or a merely offline relay) emits NOTHING and
+ *   keeps the shown state ({@link WorkspaceMerger.onRemoteDown}): the UI's
+ *   `ClientWorkspaceModel.remove()` records ids in a never-cleared blacklist
+ *   and both `upsert` and baseline replacement drop blacklisted ids, so one
+ *   `remove` for a virtual id would make that group un-revivable on
+ *   reconnect — while the UI itself keeps the last complete projection
+ *   visible across carrier loss (its `handleCarrierFailure`);
+ * - a NEW remote baseline on the same server is DIFFED against the shown
+ *   set: still present → fresh `upsert` (content from the new baseline),
+ *   absent (deleted server-side / no longer shared) → `remove`, then the
+ *   merged `order` / `archived` / `pinned`;
+ * - a server RENAME (same serverId) re-upserts the shown groups under the
+ *   new title — no removals ({@link WorkspaceMerger.onServerRenamed});
+ * - only a serverId CHANGE or an unpair/revocation (relay entering
+ *   `unpaired` / `revoked`) removes the whole group
+ *   ({@link WorkspaceMerger.onRemoteGone}): those prefixes never return, so
+ *   they can never collide with the UI's blacklist.
  *
  * Everything here is a pure state machine: no DSH imports, no network, no
  * clocks — the virtual-id arithmetic is the one dependency (virtual-id.ts).
@@ -93,14 +107,24 @@ export interface WorkspaceMerger {
   onLocal(frame: unknown): unknown[]
   /** Feed one server-filtered frame of the REMOTE stream; returns the frames
    * the UI should see (possibly none — state-only while the local baseline
-   * has not passed). */
+   * has not passed). A later baseline is DIFFED against what was shown. */
   onRemote(frame: unknown): unknown[]
-  /** The remote leg died or the server changed: remove everything the UI was
-   * shown from the remote side and reset the remote state. Idempotent — a
-   * second call with no remote state returns []. */
+  /** The remote stream died or the relay went offline (the same server is
+   * expected back): emits NOTHING and keeps the shown state — the UI keeps
+   * the last projection visible across carrier loss, and a `remove` here
+   * would blacklist the virtual ids against revival. */
+  onRemoteDown(): unknown[]
+  /** The remote side is gone FOR GOOD: serverId changed, or the relay
+   * entered `unpaired` / `revoked`. Removes everything shown from the remote
+   * side, resets the remote state. Idempotent — a second call with no remote
+   * state returns []. */
   onRemoteGone(): unknown[]
+  /** The server was renamed (same serverId — call after {@link retarget}):
+   * re-upserts every shown workspace under the new title, nothing else. */
+  onServerRenamed(): unknown[]
   /** Point the merger at a (possibly different) server. Local state survives;
-   * remote state must be gone before this runs (onRemoteGone first). */
+   * for a serverId change the remote state must be gone first (onRemoteGone
+   * first); for a rename it may stay. */
   retarget(identity: MergerIdentity): void
 }
 
@@ -122,8 +146,11 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   let localArchived: string[] = []
   let localPinned: string[] = []
 
-  // The remote truth in ORIGINAL ids; insertion order = remote order.
-  const remote = new Map<string, Record<string, unknown>>()
+  // The remote truth in ORIGINAL ids; insertion order = remote order. Once
+  // the local baseline has passed this doubles as "what the UI has been
+  // shown" — the diff baseline for a reconnecting remote baseline, and the
+  // removal set for a permanent remote end.
+  let remote = new Map<string, Record<string, unknown>>()
   let remoteArchived: string[] = []
   let remotePinned: string[] = []
 
@@ -233,18 +260,36 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       switch (frame.type) {
         case 'baseline': {
           const value = isPlainObject(frame.value) ? frame.value : undefined
-          remote.clear()
+          // Build the new remote truth beside the shown one, then DIFF
+          // (T23b2-fix): a reconnecting baseline must not blindly re-add —
+          // the upserts refresh content, and the only removes it synthesizes
+          // are workspaces the server dropped (deleted / no longer shared).
+          const next = new Map<string, Record<string, unknown>>()
           if (value !== undefined && Array.isArray(value.items)) {
             for (const item of value.items) {
-              if (isPlainObject(item) && typeof item.workspaceId === 'string') remote.set(item.workspaceId, { ...item })
+              if (isPlainObject(item) && typeof item.workspaceId === 'string') next.set(item.workspaceId, { ...item })
             }
           }
-          remoteArchived = value === undefined ? [] : stringList(value.archivedSessionIds)
-          remotePinned = value === undefined ? [] : stringList(value.pinnedSessionIds)
+          const nextArchived = value === undefined ? [] : stringList(value.archivedSessionIds)
+          const nextPinned = value === undefined ? [] : stringList(value.pinnedSessionIds)
           // Never a second baseline: the UI has either seen local data (which
           // it must keep) or nothing (cache only).
-          if (!localSeen) return []
-          return [...upsertFrames(), mergedOrderFrame(), mergedArchivedFrame(), mergedPinnedFrame()]
+          if (!localSeen) {
+            remote = next
+            remoteArchived = nextArchived
+            remotePinned = nextPinned
+            return []
+          }
+          const out: unknown[] = []
+          for (const [id, record] of next) out.push({ type: 'upsert', workspace: virtualizeWorkspace(record, identity) })
+          for (const id of remote.keys()) {
+            if (!next.has(id)) out.push({ type: 'remove', workspaceId: virtualize(id) })
+          }
+          remote = next
+          remoteArchived = nextArchived
+          remotePinned = nextPinned
+          out.push(mergedOrderFrame(), mergedArchivedFrame(), mergedPinnedFrame())
+          return out
         }
         case 'upsert': {
           if (!isPlainObject(frame.workspace) || typeof frame.workspace.workspaceId !== 'string') {
@@ -309,6 +354,21 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       }
     },
 
+    onRemoteDown(): unknown[] {
+      // Deliberately nothing: the shown state STAYS (the UI keeps the last
+      // projection visible while the carrier is gone), so the reconnecting
+      // baseline can diff against it instead of re-adding through the UI's
+      // remove-blacklist. Pre-baseline cached state stays cached.
+      return []
+    },
+
+    onServerRenamed(): unknown[] {
+      // The caller has already retarget()ed to the new name; re-upserting the
+      // shown workspaces under the CURRENT identity is the whole update.
+      if (!localSeen || remote.size === 0) return []
+      return upsertFrames()
+    },
+
     onRemoteGone(): unknown[] {
       const hadAny = remote.size > 0 || remoteArchived.length > 0 || remotePinned.length > 0
       const out: unknown[] = []
@@ -337,21 +397,30 @@ export interface ControlMergerOptions {
 export interface ControlMerger {
   readonly serverId: string
   readonly serverName: string
-  /** Local control frames pass through untouched. */
+  /** Local control frames pass through untouched; the local BASELINE also
+   * flushes anything the remote side buffered before it arrived. */
   onLocal(frame: unknown): unknown[]
   /** Remote baseline → per-session per-key `projection` frames; remote
-   * projection updates → virtualized. Unknown types are dropped. */
+   * projection updates → virtualized. Unknown types are dropped. Frames
+   * arriving before the local baseline are buffered (the host's snapshot
+   * stream treats an update before the opening snapshot as a protocol
+   * violation and kills the stream). */
   onRemote(frame: unknown): unknown[]
-  /** Always [] — the workspace merger removes the group; leftover projection
-   * state for vanished virtual sessions is harmless. */
+  /** Always [] — a control stream has nothing to remove on a temporary
+   * remote end (the workspace merger owns the group). */
+  onRemoteDown(): unknown[]
+  /** Always [] — leftover projection state for vanished virtual sessions is
+   * harmless; the workspace merger removes the group. */
   onRemoteGone(): unknown[]
+  /** Always [] — projection frames carry no display name. */
+  onServerRenamed(): unknown[]
   retarget(identity: MergerIdentity): void
 }
 
 /**
  * The session/control merger. The control stream is key-value projection
  * traffic with no ordering constraints between sessions, so it needs no
- * caching and no baseline bookkeeping: local frames pass through, remote
+ * state beyond the pre-baseline buffer: local frames pass through, remote
  * frames get their session id virtualized, and a remote baseline is EXPLODED
  * into one `projection` frame per key (never a second baseline).
  */
@@ -359,6 +428,59 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
   const onDiagnostic = options.onDiagnostic
   let identity: MergerIdentity = { serverId: options.serverId, serverName: options.serverName ?? '' }
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
+  // Remote output converted but not yet shown: the UI's snapshot stream
+  // throws `emitted an update before its opening snapshot` — a protocol
+  // violation that permanently fails the stream — so nothing may leave
+  // before the local baseline has passed.
+  let localSeen = false
+  let buffered: unknown[] = []
+
+  /** Convert one remote control frame into the projection frames the UI
+   * understands (empty for anything malformed). */
+  function convert(frame: Record<string, unknown>): unknown[] {
+    if (frame.type === 'baseline') {
+      const value = isPlainObject(frame.value) ? frame.value : undefined
+      const projections = value !== undefined && isPlainObject(value.projections) ? value.projections : {}
+      const out: unknown[] = []
+      for (const [sessionId, projection] of Object.entries(projections)) {
+        if (!isPlainObject(projection)) continue
+        const values = isPlainObject(projection.values) ? projection.values : {}
+        const asOfSeq = projection.asOfSeq
+        // A zero-event session's asOfSeq is -1, and the UI's SessionSeq
+        // THROWS on a negative seq — one such frame would permanently stop
+        // the whole control stream. Skip the record (one diagnostic) instead
+        // of clamping: the UI compares `seq <= held → drop`, so a clamped 0
+        // would swallow the real seq-0 entry when it arrives.
+        if (typeof asOfSeq !== 'number' || !Number.isSafeInteger(asOfSeq) || asOfSeq < 0) {
+          onDiagnostic?.(
+            `skipped control projections for ${sessionId}: asOfSeq ${String(asOfSeq)} is not a usable sequence number`,
+          )
+          continue
+        }
+        for (const key of Object.keys(values)) {
+          // The baseline gives one sequence number per projection record
+          // (`asOfSeq`) — every key of that record rides it.
+          out.push({ type: 'projection', sessionId: virtualize(sessionId), key, value: values[key], seq: asOfSeq })
+        }
+      }
+      return out
+    }
+    if (frame.type === 'projection') {
+      if (typeof frame.sessionId !== 'string') {
+        onDiagnostic?.('dropped a session/control projection frame without a sessionId')
+        return []
+      }
+      if (typeof frame.seq !== 'number' || !Number.isSafeInteger(frame.seq) || frame.seq < 0) {
+        // Same SessionSeq hazard on live updates (a server reboot resets the
+        // counters — a -1 or fractional seq must not kill the stream).
+        onDiagnostic?.(`dropped a session/control projection frame with unusable seq ${String(frame.seq)}`)
+        return []
+      }
+      return [{ ...frame, sessionId: virtualize(frame.sessionId) }]
+    }
+    onDiagnostic?.(`dropped a session/control frame of unknown type ${String(frame.type)}`)
+    return []
+  }
 
   return {
     get serverId(): string {
@@ -368,11 +490,28 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
       return identity.serverName
     },
 
+    // TODO(seq-epoch): the server owns `seq` and restarts it from 0 on
+    // reboot, while the UI drops any projection whose seq is ≤ the value it
+    // already holds — so after a server restart every remote session's
+    // projections stay frozen at their pre-restart values until the live seq
+    // climbs past them. A fix would offset each remote stream generation's
+    // seq (e.g. by a per-generation epoch base) and shift the forwarded
+    // `session/projections` results by the same offset so both routes agree.
+    // Deliberately out of scope for T23b2-fix; recorded here where the seq
+    // conversion happens.
+
     retarget(next: MergerIdentity): void {
       identity = { serverId: next.serverId, serverName: next.serverName }
     },
 
     onLocal(frame: unknown): unknown[] {
+      if (isPlainObject(frame) && frame.type === 'baseline' && !localSeen) {
+        localSeen = true
+        // The baseline opens the stream; the buffered remote output follows.
+        const out = [frame, ...buffered]
+        buffered = []
+        return out
+      }
       return [frame]
     },
 
@@ -381,34 +520,26 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
         onDiagnostic?.('dropped a non-object session/control frame from the relay')
         return []
       }
-      if (frame.type === 'baseline') {
-        const value = isPlainObject(frame.value) ? frame.value : undefined
-        const projections = value !== undefined && isPlainObject(value.projections) ? value.projections : {}
-        const out: unknown[] = []
-        for (const [sessionId, projection] of Object.entries(projections)) {
-          if (!isPlainObject(projection)) continue
-          const values = isPlainObject(projection.values) ? projection.values : {}
-          // The baseline gives one sequence number per projection record
-          // (`asOfSeq`) — every key of that record rides it.
-          const seq = typeof projection.asOfSeq === 'number' ? projection.asOfSeq : 0
-          for (const key of Object.keys(values)) {
-            out.push({ type: 'projection', sessionId: virtualize(sessionId), key, value: values[key], seq })
-          }
-        }
-        return out
+      const converted = convert(frame)
+      if (!localSeen) {
+        buffered.push(...converted)
+        return []
       }
-      if (frame.type === 'projection') {
-        if (typeof frame.sessionId !== 'string') {
-          onDiagnostic?.('dropped a session/control projection frame without a sessionId')
-          return []
-        }
-        return [{ ...frame, sessionId: virtualize(frame.sessionId) }]
-      }
-      onDiagnostic?.(`dropped a session/control frame of unknown type ${String(frame.type)}`)
+      return converted
+    },
+
+    onRemoteDown(): unknown[] {
       return []
     },
 
     onRemoteGone(): unknown[] {
+      // Buffered pre-baseline remote output dies with the remote leg; the UI
+      // never saw it.
+      buffered = []
+      return []
+    },
+
+    onServerRenamed(): unknown[] {
       return []
     },
   }

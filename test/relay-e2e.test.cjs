@@ -453,6 +453,10 @@ test('e2e T43: the gateway dies, the client retries on its own, and a restarted 
     // Nobody calls the client: the RETRY must be what hits the dead chain.
     const hitsBefore = proxyHits
     await waitFor(() => proxyHits > hitsBefore, 5000)
+    // The proxy counter rises the instant the retry ARRIVES; the offline
+    // verdict lands one round trip later — wait it out instead of racing it
+    // (a loaded runner polls into that window and reads 'connecting').
+    await waitFor(() => env.client.state === 'offline', 5000)
     assert.equal(env.client.state, 'offline', 'the gateway is still down — the retry failed into offline again')
     assert.equal(env.client.lastError, 'offline')
 
