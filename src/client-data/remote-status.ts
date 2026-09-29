@@ -130,6 +130,8 @@ export function describeRemoteStatus(
 /** The locale keys `bannerText` needs. */
 export type RemoteBannerTextKey =
   | 'remoteBannerOffline'
+  | 'remoteBannerRevoked'
+  | 'remoteBannerUnpaired'
   | 'remoteBannerClosedIdle'
   | 'remoteBannerClosedManual'
   | 'remoteBannerClosedClient'
@@ -138,9 +140,14 @@ export type RemoteBannerFormatter = (key: RemoteBannerTextKey) => string
 
 /**
  * The composer banner copy for one virtual session (T34): the session's
- * closed reason — if the server closed this session — outranks the offline
- * line; a merely offline link reads the temporarily-readonly copy. `undefined`
- * when neither applies (online and not closed): no banner.
+ * closed reason — if the server closed this session — outranks the
+ * link-level lines (offline, T41a-fix2's revoked / unpaired); a merely
+ * offline link reads the temporarily-readonly copy, and a revoked token or
+ * an unpaired client reads the "not coming back on its own" copy — both
+ * stand a banner AND disable the input (the component raises its composer
+ * block from whatever this returns), since neither recovers without the
+ * settings page. `undefined` when nothing applies (online and not closed):
+ * no banner.
  */
 export function bannerText(
   view: RemoteStatusView | undefined | null,
@@ -153,7 +160,13 @@ export function bannerText(
   // 'manual' — and any word this build does not know (a newer server's
   // vocabulary): a closure with no certain reason reads as the manual close.
   if (reason !== undefined) return t('remoteBannerClosedManual')
-  if (view !== undefined && view !== null && view.state === 'offline') return t('remoteBannerOffline')
+  if (view !== undefined && view !== null) {
+    if (view.state === 'offline') return t('remoteBannerOffline')
+    // T41a-fix2: a revoked token / an unpaired client is not "reconnecting"
+    // — the composer must not sit disabled on a promise no reconnect keeps.
+    if (view.state === 'revoked') return t('remoteBannerRevoked')
+    if (view.state === 'unpaired') return t('remoteBannerUnpaired')
+  }
   return undefined
 }
 

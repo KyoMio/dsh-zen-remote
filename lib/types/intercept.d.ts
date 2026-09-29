@@ -149,7 +149,13 @@ export type DispatchEnvelope = {
  * `messageFeedback/put|delete`, the workspace session-list mutations, and
  * the T41a mutations (`goals/edit|pause|resume|clear`, `commands/execute`,
  * `agentPresets/select`, `sessionFeedback/record`,
- * `terminal/create|write|resize|rename|close`) — is a write.
+ * `terminal/create|write|resize|rename|close|follow`) — is a write.
+ * `terminal/follow` joined the write side (T41a-fix2): its attachment is
+ * NOT a pure read — RT dsh-api-terminal-controller follow: "Attach with
+ * exclusive input control; an older attachment becomes read-only" — so a
+ * follow flips which follower owns the terminal's input, and offline it
+ * must refuse like every other mutation instead of silently stealing
+ * control from a connection that is not there.
  */
 export declare const REMOTE_READ_METHODS: ReadonlySet<string>;
 /** Whether `endpoint` (a client-table method) is a remote WRITE: anything

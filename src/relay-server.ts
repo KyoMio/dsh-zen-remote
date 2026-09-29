@@ -38,6 +38,7 @@ import {
   filterSessionListResult,
   filterWorkspaceFrame,
 } from './relay-filter.js'
+import { SESSION_REFERENCE_URI, collectReferenceTexts, decodeSessionReferenceUri } from './session-reference.js'
 
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
@@ -976,19 +977,23 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               : {}),
           }
         }
-        // T41a-fix: a canonical `dsh-session:` address in the prompt text
+        // T41a-fix: a canonical `dsh-session:` address in an injectable text
         // makes DSH inject the referenced session's content with no access
         // check of its own (dsh-session-reference prepareDirectMessages →
         // readSurface). Every referenced session must pass the share table
         // before the call is forwarded — the prompt-text sibling of the
-        // job/kill ownership probe above. `commands/execute` is deliberately
-        // not scanned: its line goes through the command parser, not the
-        // session-reference preparation (verified against the 0.2.0 sources).
-        if ((namespace === 'session' || namespace === 'subagents') && method === 'prompt') {
-          if (referencedSessionIds(args).some((id) => !isAccessible(id))) {
-            responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
-            return
-          }
+        // job/kill ownership probe above. T41a-fix2 closed the two bypasses
+        // the prompt-only scan left: a queue EDIT replaces a queued USER
+        // message's content verbatim (RT dsh-api-session-controller
+        // updateQueue), and a slash command's raw input is steered in as a
+        // USER message by its handler (`/plan <text>` does exactly that, RT
+        // dsh-plan-mode) — both are parsed at the next turn start, exactly
+        // like prompt text. WHERE the injectable texts live is the shared
+        // rule (session-reference.ts), the same one the sub-client rewrites
+        // by; everything else in the arguments is not parsed by the host.
+        if (referencedSessionIds(namespace, method, args).some((id) => !isAccessible(id))) {
+          responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+          return
         }
         const value = await gateway.invoke({ namespace, method, args, signal: hangUp.signal })
         // T31: a session created or forked THROUGH the relay is shared
@@ -1449,56 +1454,29 @@ function ownerSessionIdOf(args: unknown): string {
   return isPlainObject(request) && typeof request.sessionId === 'string' ? request.sessionId : ''
 }
 
-/**
- * The canonical `dsh-session:` reference addresses DSH's own parser accepts
- * (dsh-session-reference lib/index.js: a Markdown mention `@[label](URI)` or
- * a bare URI; the payload is base64url(JSON.stringify(sessionId)) and the
- * decode is CANONICAL — re-encoding must reproduce the URI byte for byte).
- * The same shape drives the relay's prompt scan and the sub-client's rewrite
- * (src/intercept.ts): the two ends must agree on what a reference is.
- */
-const SESSION_REFERENCE_URI = /@\[(?:\\.|[^\\\]])*\]\((dsh-session:[^\s)]*)\)|(dsh-session:[A-Za-z0-9_-]+)/gu
-
-/** Encode one session id into the canonical reference URI (the mirror of
- * {@link decodeSessionReferenceUri}, matching the host's encoder). */
-export function encodeSessionReferenceUri(sessionId: string): string {
-  return `dsh-session:${Buffer.from(JSON.stringify(sessionId), 'utf8').toString('base64url')}`
-}
+// The `dsh-session:` codec and the shared scan rule live in ONE module the
+// sub-client's interceptor imports too (session-reference.ts, T41a-fix2) —
+// re-exported here so the server's public surface keeps carrying them.
+export {
+  SESSION_REFERENCE_URI,
+  collectReferenceTexts,
+  decodeSessionReferenceUri,
+  encodeSessionReferenceUri,
+  mapReferenceTexts,
+} from './session-reference.js'
 
 /**
- * Decode one `dsh-session:` URI the way the host does, or `undefined` when
- * it is not canonical. The host parser THROWS on non-canonical addresses —
- * those become gateway business errors — so an address this decoder rejects
- * can never inject anything and needs no guarding.
+ * Every session id one call's injectable texts reference through canonical
+ * `dsh-session:` addresses. WHERE those texts live is the shared scan rule
+ * (session-reference.ts: prompt content, a queue EDIT's replacement content,
+ * every string of a commands/execute call). Non-canonical candidates are
+ * skipped: DSH answers them with its own business error, and the relay must
+ * not crash on them.
  */
-export function decodeSessionReferenceUri(uri: string): string | undefined {
-  const payload = uri.slice('dsh-session:'.length)
-  if (!/^[A-Za-z0-9_-]+$/.test(payload)) return undefined
-  try {
-    const parsed: unknown = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
-    if (typeof parsed !== 'string') return undefined
-    if (encodeSessionReferenceUri(parsed).slice('dsh-session:'.length) !== payload) return undefined
-    return parsed
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * Every session id one prompt's TEXT blocks reference through canonical
- * `dsh-session:` addresses. Only `type:'text'` blocks are read — exactly
- * what the host's prepareDirectMessages parses (image and other blocks pass
- * it untouched). Non-canonical candidates are skipped: DSH answers them
- * with its own business error, and the relay must not crash on them.
- */
-function referencedSessionIds(args: unknown): string[] {
-  const request = isPlainObject(args) ? args.request : undefined
-  const content = isPlainObject(request) ? request.content : undefined
-  if (!Array.isArray(content)) return []
+function referencedSessionIds(namespace: string, method: string, args: unknown): string[] {
   const ids: string[] = []
-  for (const block of content) {
-    if (!isPlainObject(block) || block.type !== 'text' || typeof block.text !== 'string') continue
-    for (const match of block.text.matchAll(SESSION_REFERENCE_URI)) {
+  for (const text of collectReferenceTexts(namespace, method, args)) {
+    for (const match of text.matchAll(SESSION_REFERENCE_URI)) {
       const id = decodeSessionReferenceUri(match[1] ?? match[2])
       if (id !== undefined) ids.push(id)
     }
@@ -1507,15 +1485,24 @@ function referencedSessionIds(args: unknown): string[] {
 }
 
 /**
- * Filter one `sessionReferenceResolver/candidates` result (an array of
- * rows): keep only rows whose `sessionId` passes the share table. The host
- * lists EVERY server session with title, cwd and a ready-made mention, so
- * an unfiltered row leaks metadata and hands the client a one-keystroke
- * path into an unshared session's content. Rows that cannot locate a
- * session (malformed) are dropped — nothing untrusted travels.
+ * Filter one `sessionReferenceResolver/candidates` result: keep only rows
+ * whose `sessionId` passes the share table. The host lists EVERY server
+ * session with title, cwd and a ready-made mention, so an unfiltered row
+ * leaks metadata and hands the client a one-keystroke path into an unshared
+ * session's content. Rows that cannot locate a session (malformed) are
+ * dropped — nothing untrusted travels. A non-array result (a shape this
+ * build does not know — a newer host's evolution) yields `[]`: 宁可不给,
+ * never an unfiltered answer.
+ *
+ * Known limitation: the host caps a candidates page at `candidateLimit`
+ * rows (default 50, RT dsh-session-reference config) BEFORE this filter
+ * runs — on a server with many sessions the accessible rows past the cap
+ * are cut off with the inaccessible ones, and the client just sees fewer
+ * @ candidates. The @ resolver stays a convenience surface; the prompt-text
+ * scan below is the access boundary, and it is not affected.
  */
 function filterAccessibleCandidateRows(value: unknown, isAccessible: (sessionId: string) => boolean): unknown {
-  if (!Array.isArray(value)) return value
+  if (!Array.isArray(value)) return []
   return value.filter((row) => isPlainObject(row) && typeof row.sessionId === 'string' && isAccessible(row.sessionId))
 }
 

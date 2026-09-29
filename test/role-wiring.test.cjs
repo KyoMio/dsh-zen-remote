@@ -227,7 +227,9 @@ test("role 'client' mounts all three routes through a real inject and never call
   index.apply(hostCtx, {})
   assert.equal(pluginCalls.length, 2, 'the host role loads gateway and push on top of the routes')
   // T34-fix: the client prefix joined the host too (the remote-status route
-  // must answer on both roles), so the host mounts 5 routes.
+  // must answer on both roles), so the host mounts 5 routes — and since
+  // T41a-fix2 that prefix serves remote-status ONLY (the dedicated T16 test
+  // below drives the handler).
   assert.equal(hostRoutes.length, 5)
 })
 
@@ -268,7 +270,7 @@ test('admin routes register on the host role only', async () => {
   assert.equal(adminRoutes[0].kind, 'prefix')
 })
 
-test('T16: client routes register on the client role (and, since T34-fix, the client prefix on the host too)', async () => {
+test('T16: client routes register on the client role (the host mounts the prefix for remote-status ONLY)', async () => {
   const index = await import(INDEX_URL)
   const CLIENT_PREFIX = '/_dsh/zen-remote/client'
   const ADMIN_PREFIX = '/_dsh/zen-remote/admin'
@@ -305,14 +307,32 @@ test('T16: client routes register on the client role (and, since T34-fix, the cl
 
   const hostRoutes = []
   index.apply(ctxRecording(hostRoutes), {})
-  // T34-fix: the CLIENT prefix mounts on the host as well — with no relay
-  // client wired, every route answers its empty conclusion (remote-status
-  // reads `{state:'unpaired', …}`); that empty answer is the point, so the
-  // T34 parts find their route whatever the role.
+  // T34-fix: the CLIENT prefix mounts on the host as well — but since
+  // T41a-fix2 it serves ONLY the remote-status route there (least
+  // exposure): the T34 parts find their poll route whatever the role, while
+  // the pairing surfaces (claim / status / reconnect / unshare) answer 404.
   const hostClientPrefix = hostRoutes.filter((r) => String(r.path).startsWith(CLIENT_PREFIX))
   assert.equal(hostClientPrefix.length, 1, 'the host registers the client prefix too (T34-fix)')
   assert.equal(hostClientPrefix[0].kind, 'prefix')
   assert.equal(hostRoutes.filter((r) => String(r.path).startsWith(ADMIN_PREFIX)).length, 1, 'the host keeps its admin prefix route')
+
+  // Drive the HOST-mounted handler over a real socket: remote-status answers
+  // its empty conclusion, the pairing routes do not exist.
+  const mounted = hostClientPrefix[0]
+  const server = http.createServer((req, res) => { void mounted.handler(req, res) })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  try {
+    const status = await request(port, { method: 'GET', path: `${CLIENT_PREFIX}/remote-status` })
+    assert.equal(status.status, 200)
+    assert.deepEqual(JSON.parse(status.body), { state: 'unpaired', versionMismatch: false, serverName: '', closed: {} })
+    const claim = await request(port, { method: 'POST', path: `${CLIENT_PREFIX}/claim`, headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: { serverUrl: 'http://127.0.0.1:9', code: '123456', name: 'x' } })
+    assert.equal(claim.status, 404, 'the pairing claim must not answer on a host')
+    const unshare = await request(port, { method: 'POST', path: `${CLIENT_PREFIX}/unshare`, headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: { sessionId: 'zr~abcd1234~s' } })
+    assert.equal(unshare.status, 404, 'unshare must not answer on a host either')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
 })
 
 test('the admin handler resolves config per request, volatile fields included', async () => {
