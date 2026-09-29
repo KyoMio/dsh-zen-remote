@@ -19,6 +19,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission } from './admin-routes.js';
+import type { InterceptDiagnostics } from './intercept.js';
 import type { RelayClient } from './relay-client.js';
 /** Prefix all client routes live under (one webServer prefix registration). */
 export declare const CLIENT_ROUTE_PREFIX = "/_dsh/zen-remote/client";
@@ -47,6 +48,10 @@ export interface ClientHandlerOptions {
      * never connected, so the settings page still gets a fresh answer while
      * the startup `connect()` is still unpaired. */
     getRelayClient?: () => RelayClient | undefined;
+    /** The typert interception's diagnostics (T23b-1), read live per request.
+     * Shapes, counters and failure codes only — never a token. Undefined when
+     * this composition never even attempted an install (no typertGateway). */
+    getIntercept?: () => InterceptDiagnostics | undefined;
 }
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 /**
