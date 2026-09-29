@@ -94,6 +94,10 @@ function createFakeRelay() {
     invokes: [],
     streams: [],
     invokeValue: { whatever: true },
+    // Per-method answers staged over `invokeValue` (T52-fix2): the catalog
+    // fetch and the forwarded calls share one relay, and a test that needs
+    // the cache filled must not clobber the value the forwarded call plays.
+    invokeValues: {},
     invokeThrow: undefined,
     streamFrames: [],
     streamThrow: undefined,
@@ -109,6 +113,8 @@ function createFakeRelay() {
     },
     invoke(namespace, method, args, signal) {
       relay.invokes.push({ namespace, method, args, signal })
+      const staged = relay.invokeValues[`${namespace}/${method}`]
+      if (staged !== undefined) return Promise.resolve(staged)
       if (relay.invokeThrow) return Promise.reject(relay.invokeThrow)
       return Promise.resolve(relay.invokeValue)
     },
@@ -200,11 +206,16 @@ function createControllableRelay(overrides = {}) {
     streams: [],
     results: [],
     invokeValue: undefined,
+    // Per-method answers staged over `invokeValue` (T52-fix2) — same shape
+    // as createFakeRelay's.
+    invokeValues: {},
     invokeThrow: undefined,
     resultValue: undefined,
     resultThrow: undefined,
     invoke(namespace, method, args, signal) {
       relay.invokes.push({ namespace, method, args, signal })
+      const staged = relay.invokeValues[`${namespace}/${method}`]
+      if (staged !== undefined) return Promise.resolve(staged)
       if (relay.invokeThrow) return Promise.reject(relay.invokeThrow)
       return Promise.resolve(relay.invokeValue)
     },
@@ -1007,6 +1018,9 @@ test('session/list merges the relay first page into the local one; cursor, offli
     rpc: { 'session/list': { ok: true, value: { items: [{ sessionId: 'session-local', updatedAt: 1 }], nextCursor: 'tok' } } },
   })
   const relay = createControllableRelay()
+  // T52-fix2: the provider rewrite is catalog-gated — stage the server's
+  // answer and fill the cache the way the online fetch (or the route) would.
+  relay.invokeValues = { 'session/modelCatalog': SERVER_CATALOG }
   // T52-fix: a remote row's projections block rides along (sequenced kind —
   // the shape that poisons the projection store if left unwritten); the
   // merged route must rewrite its modelSelection like every other route.
@@ -1025,6 +1039,7 @@ test('session/list merges the relay first page into the local one; cursor, offli
     ],
   }
   const { handle } = install(gateway, relay)
+  await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
 
   // first page, online: local items first, remote items virtualized after,
   // the pagination field comes from the LOCAL result
@@ -1048,12 +1063,15 @@ test('session/list merges the relay first page into the local one; cursor, offli
       nextCursor: 'tok',
     },
   })
-  assert.deepEqual(relay.invokes, [{ namespace: 'session', method: 'list', args: { _request: {} }, signal: undefined }])
+  assert.deepEqual(relay.invokes, [
+    { namespace: 'session', method: 'modelCatalog', args: {}, signal: undefined },
+    { namespace: 'session', method: 'list', args: { _request: {} }, signal: undefined },
+  ])
 
   // a paged request never touches the relay
   const paged = await gateway.rpcBridge('session/list', { args: { _request: { cursor: 'tok' } } }, undefined, undefined)
   assert.deepEqual(paged.value.items, [{ sessionId: 'session-local', updatedAt: 1 }])
-  assert.equal(relay.invokes.length, 1)
+  assert.equal(relay.invokes.length, 2)
 
   // a remote failure degrades to the local answer and is recorded
   relay.invokeThrow = new RelayError('offline', 'down')
@@ -1061,13 +1079,13 @@ test('session/list merges the relay first page into the local one; cursor, offli
   assert.deepEqual(degraded.value.items, [{ sessionId: 'session-local', updatedAt: 1 }])
   const ring = handle.diagnostics().recentFailures
   assert.deepEqual([ring[ring.length - 1].endpoint, ring[ring.length - 1].code], ['session/list', 'offline'])
-  assert.equal(relay.invokes.length, 2)
+  assert.equal(relay.invokes.length, 3)
 
   // offline: no relay round-trip at all
   relay.transition('offline')
   const offline = await gateway.rpcBridge('session/list', { args: { _request: {} } }, undefined, undefined)
   assert.deepEqual(offline.value.items, [{ sessionId: 'session-local', updatedAt: 1 }])
-  assert.equal(relay.invokes.length, 2)
+  assert.equal(relay.invokes.length, 3)
 
   // a non-ok LOCAL envelope is the answer; nothing merges into it
   gateway.spec.rpc['session/list'] = { ok: false, error: { code: 'internal', message: 'boom', details: {} } }
@@ -2590,11 +2608,70 @@ test('T52: session/modelCatalog merges the relay groups behind the local ones; o
   handle.uninstall()
 })
 
+test('T52-fix2: the online transition fetches the server catalog proactively; failures only diagnose', async () => {
+  const gateway = new FakeTypertGateway()
+  gateway.spec.rpc = { 'session/modelCatalog': { ok: true, value: LOCAL_CATALOG } }
+  const relay = createFakeRelay()
+  relay.invokeValues = { 'session/modelCatalog': SERVER_CATALOG }
+  relay.state = 'offline'
+  const { handle } = install(gateway, relay)
+  assert.deepEqual(relay.invokes, [], 'nothing is fetched before the relay serves')
+
+  // The online transition fetches once, parameterless, and fills the cache —
+  // the provider gate must not depend on the UI opening a dropdown first.
+  relay.transition('online')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(relay.invokes, [{ namespace: 'session', method: 'modelCatalog', args: {}, signal: undefined }])
+
+  // The proactive answer feeds the OFFLINE merge: a dropdown refreshed while
+  // the link is down still shows the server groups.
+  relay.transition('offline')
+  const offlineAnswer = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.equal(offlineAnswer.value.groups.at(-1).id, toVirtual(SERVER_ID, 'codex'), 'the proactive fetch filled the cache the offline merge reads')
+  assert.equal(relay.invokes.length, 1, 'the offline answer never re-asks the relay')
+
+  // A failed proactive fetch is a diagnostics-ring entry, nothing else — and
+  // the NEXT transition retries.
+  relay.invokeValues = {}
+  relay.invokeThrow = new RelayError('offline', '链路断了')
+  relay.transition('online')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(relay.invokes.length, 2)
+  assert.equal(handle.diagnostics().recentFailures.at(-1).code, 'offline')
+
+  // A re-pair wall drops the cache EAGERLY — the same rule the route applies
+  // lazily on its own offline branch: offline right after the wall, the
+  // answer is local-only even though a successful fetch had filled the cache
+  // just before (and a failed refetch had not emptied it).
+  relay.transition('unpaired')
+  relay.transition('offline')
+  const cleared = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.deepEqual(cleared.value, LOCAL_CATALOG, 'the wall cleared the cache the offline merge would otherwise have served')
+
+  // Re-serving refetches, and uninstall stops the watcher: a late online
+  // transition after it fetches nothing.
+  relay.invokeThrow = undefined
+  relay.invokeValues = { 'session/modelCatalog': SERVER_CATALOG }
+  relay.transition('online')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(relay.invokes.length, 3, 're-serving refetches')
+  handle.uninstall()
+  relay.transition('online')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(relay.invokes.length, 3, 'no fetch after uninstall')
+})
+
 test('T52: session/selectModel routes the provider by session context', async () => {
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()
+  relay.invokeValues = {
+    // T52-fix2: fill the catalog cache — the echo rewrite below is gated on
+    // it, exactly like the projection rewrites.
+    'session/modelCatalog': SERVER_CATALOG,
+  }
   relay.invokeValue = { selected: { provider: 'codex', model: 'gpt-5.6-sol' } }
   const { handle } = install(gateway, relay)
+  await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
 
   // Remote session + the server's own group → the provider travels restored
   // to the original id, and the echoed selection comes back virtual.
@@ -2605,7 +2682,7 @@ test('T52: session/selectModel routes the provider by session context', async ()
     undefined,
   )
   assert.equal(remote.ok, true)
-  assert.deepEqual(relay.invokes[0].args, { request: { sessionId: LOCAL_ID, provider: 'codex', model: 'gpt-5.6-sol' } })
+  assert.deepEqual(relay.invokes[1].args, { request: { sessionId: LOCAL_ID, provider: 'codex', model: 'gpt-5.6-sol' } })
   assert.deepEqual(remote.value, { selected: { provider: toVirtual(SERVER_ID, 'codex'), model: 'gpt-5.6-sol' } })
 
   // Remote session + a LOCAL group → refused with the server's name in the
@@ -2620,7 +2697,7 @@ test('T52: session/selectModel routes the provider by session context', async ()
   assert.equal(refused.error.code, 'remote-unsupported')
   assert.match(refused.error.message, /测试服务器/)
   assert.deepEqual(refused.error.details, {})
-  assert.equal(relay.invokes.length, 1)
+  assert.equal(relay.invokes.length, 2)
 
   // Local session + a virtual group → refused before the local gateway sees it.
   const localCallsBefore = gateway.rpcCalls.length
@@ -2659,6 +2736,19 @@ test('T52: session/selectModel routes the provider by session context', async ()
   )
   assert.equal(wrongServer.ok, false)
   assert.equal(wrongServer.error.code, 'remote-mismatch')
+
+  // T52-fix2: an echoed provider the catalog does not list stays ORIGINAL —
+  // same gate as the projection rewrites. The cache now holds a catalog
+  // without `codex`, and the echo still names codex.
+  relay.invokeValues = { 'session/modelCatalog': { groups: [{ id: 'deepseek-official', name: 'DeepSeek' }] } }
+  await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  const foreignEcho = await gateway.rpcBridge(
+    'session/selectModel',
+    { args: { request: { sessionId: VIRTUAL_ID, provider: toVirtual(SERVER_ID, 'deepseek-official'), model: 'deepseek-v4-pro' } } },
+    undefined,
+    undefined,
+  )
+  assert.deepEqual(foreignEcho.value, { selected: { provider: 'codex', model: 'gpt-5.6-sol' } }, 'the echo of an unlisted provider stays original')
   handle.uninstall()
 })
 
@@ -2669,8 +2759,19 @@ test('T52: remote projections and follow snapshots carry the virtual group id; l
     lastUsed: { provider: 'codex', model: 'gpt-5.6-sol' },
     next: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' },
   }
+  relay.invokeValues = { 'session/modelCatalog': SERVER_CATALOG }
   relay.invokeValue = { asOfSeq: 7, values: { modelSelection: selection, title: '远端' } }
   const { handle } = install(gateway, relay)
+
+  // T52-fix2, cache NOT ready: without a fetched server catalog there is
+  // nothing to judge the provider against, so it travels ORIGINAL — the
+  // pre-T52 display (`provider/model`), never a `zr~…` string.
+  const early = await gateway.rpcBridge('session/projections', { args: { request: { sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  assert.deepEqual(early.value.values.modelSelection, selection, 'no catalog yet rewrites nothing')
+
+  // Fill the cache (SERVER_CATALOG lists codex) the way the online fetch
+  // would; then the same read virtualizes.
+  await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
 
   // session/projections: the modelSelection value's providers go virtual,
   // its models and the other projection values stay verbatim.
@@ -2700,6 +2801,15 @@ test('T52: remote projections and follow snapshots carry the virtual group id; l
   assert.equal(frames[0].projections.values.modelSelection.next.provider, toVirtual(SERVER_ID, 'codex'))
   assert.deepEqual(frames[1].event.data, { provider: 'codex', model: 'gpt-5.6-sol' }, 'event bodies keep their own ids')
 
+  // T52-fix2: swap the cache to a catalog WITHOUT codex (the isolated-repro
+  // shape — a DeepSeek-only server against a codex session) and the provider
+  // travels ORIGINAL again instead of a `zr~…` string.
+  relay.invokeValue = { asOfSeq: 7, values: { modelSelection: selection, title: '远端' } }
+  relay.invokeValues = { 'session/modelCatalog': { groups: [{ id: 'deepseek-official', name: 'DeepSeek' }] } }
+  await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  const foreign = await gateway.rpcBridge('session/projections', { args: { request: { sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  assert.deepEqual(foreign.value.values.modelSelection, selection, 'a provider off the catalog stays original')
+
   // The LOCAL half of the same routes never passes through these rewrites:
   // a local session's page result reaches the gateway verbatim (the wrapper
   // only answers calls it forwards) — proven by the relay not being asked
@@ -2707,7 +2817,7 @@ test('T52: remote projections and follow snapshots carry the virtual group id; l
   const localArgs = { args: { request: { address: { kind: 'session', sessionId: LOCAL_ID } } } }
   await gateway.rpcBridge('session/page', localArgs, undefined, undefined)
   assert.deepEqual(gateway.rpcCalls.at(-1).payload, localArgs)
-  assert.equal(relay.invokes.length, 2)
+  assert.equal(relay.invokes.length, 6)
   handle.uninstall()
 })
 

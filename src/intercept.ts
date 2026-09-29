@@ -81,7 +81,7 @@ import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
-import { createControlMerger, createWorkspaceMerger, mergeModelCatalogs, mergeSessionList, virtualizeModelSelectionValue } from './merge-streams.js'
+import { catalogGroupIds, createControlMerger, createWorkspaceMerger, mergeModelCatalogs, mergeSessionList, virtualizeModelSelectionValue } from './merge-streams.js'
 import type { ControlMerger, MergerAnnotation, MergerIdentity, WorkspaceMerger } from './merge-streams.js'
 
 /** The session-locating argument fields, as registered per method. Identical
@@ -809,6 +809,13 @@ function restoreRegisteredFields(fields: readonly SessionField[], args: unknown)
  *   blocks are rewritten by mergeSessionList instead, merge-streams.ts —
  *   T52-fix: their `sequenced` blocks poison the projection store against
  *   the rewritten control frames if left with original providers.)
+ *   CONDITIONAL since T52-fix2: the caller passes the server catalog's
+ *   original group ids (`serverGroups`, read live from the T52-fix cache per
+ *   result) and only a provider that set LISTS is virtualized — one the
+ *   catalog lacks (or no catalog fetched yet, `undefined`) travels ORIGINAL,
+ *   because the merged catalog has no virtual group for it and the UI's
+ *   fallback would otherwise show the raw `zr~…` string (the isolated repro:
+ *   `codex/gpt-5.6-sol` against a DeepSeek-only server).
  */
 function mapStrings(value: unknown, map: (id: string) => string): unknown {
   if (!Array.isArray(value)) return value
@@ -896,8 +903,10 @@ function restoreSessionReferences(
   return { args: mapped, ok }
 }
 
-/** Rewrite one stream frame's session ids to virtual form. */
-export function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown {
+/** Rewrite one stream frame's session ids to virtual form. `serverGroups` is
+ * the server catalog's original group ids (T52-fix2) — the modelSelection
+ * rewrite below only virtualizes a provider it lists. */
+export function rewriteFrame(endpoint: string, frame: unknown, serverId: string, serverGroups?: ReadonlySet<string>): unknown {
   const virtualize = (id: string): string => toVirtual(serverId, id)
   if (endpoint === 'session/follow') {
     if (!isPlainObject(frame) || frame.type !== 'snapshot' || !isPlainObject(frame.header)) return frame
@@ -910,15 +919,17 @@ export function rewriteFrame(endpoint: string, frame: unknown, serverId: string)
     // installWindow → ProjectionValueStore.seed) — a modelSelection entry in
     // it names the SERVER's current provider, so it goes virtual with the
     // session ids or the composer trigger falls back to the raw
-    // `provider/model` string. The snapshot's `records` are raw journal
-    // events (`model/selection` bodies included) — event bodies keep their
-    // own ids, per the standing convention; the projection faces are fed
-    // from this block and the control stream, never from folding events
-    // client-side (dsh-api-session-controller lib/client.js:1616-1628).
+    // `provider/model` string — but only when the catalog lists the provider
+    // (T52-fix2), or the fallback gains a visible `zr~…` prefix instead. The
+    // snapshot's `records` are raw journal events (`model/selection` bodies
+    // included) — event bodies keep their own ids, per the standing
+    // convention; the projection faces are fed from this block and the
+    // control stream, never from folding events client-side
+    // (dsh-api-session-controller lib/client.js:1616-1628).
     if (isPlainObject(frame.projections) && isPlainObject(frame.projections.values)) {
       const values: Record<string, unknown> = { ...frame.projections.values }
       if (Object.hasOwn(values, 'modelSelection')) {
-        values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId)
+        values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId, serverGroups)
         out.projections = { ...frame.projections, values }
       }
     }
@@ -942,8 +953,10 @@ export function rewriteFrame(endpoint: string, frame: unknown, serverId: string)
   return frame
 }
 
-/** Rewrite one invoke result's session ids to virtual form. */
-export function rewriteResult(endpoint: string, value: unknown, serverId: string): unknown {
+/** Rewrite one invoke result's session ids to virtual form. `serverGroups` is
+ * the server catalog's original group ids (T52-fix2) — the modelSelection and
+ * selectModel-echo rewrites below only virtualize a provider it lists. */
+export function rewriteResult(endpoint: string, value: unknown, serverId: string, serverGroups?: ReadonlySet<string>): unknown {
   const virtualize = (id: string): string => toVirtual(serverId, id)
   if (endpoint === 'session/create' || endpoint === 'session/fork') {
     // The one session id the result carries is the NEW session's, minted
@@ -995,16 +1008,17 @@ export function rewriteResult(endpoint: string, value: unknown, serverId: string
   if (endpoint === 'session/projections') {
     // T52: the control-key read answers `{asOfSeq, values}` (or null) —
     // RT lib/typert.remote-client.js:569-594; the modelSelection value's
-    // providers go virtual like every other projection route. (`session/page`
-    // needs NO such rewrite, T52-fix: its result is `{records, hasMore}` only
-    // — RT lib/typert.remote-client.js:549-566; the earlier read that blamed
+    // providers go virtual like every other projection route, catalog-gated
+    // like them since T52-fix2. (`session/page` needs NO such rewrite,
+    // T52-fix: its result is `{records, hasMore}` only —
+    // RT lib/typert.remote-client.js:549-566; the earlier read that blamed
     // a projections block on it had misread the session/LIST row schema at
     // :381-428, and list rows travel the merged route's
     // mergeSessionList rewrite instead, merge-streams.ts.)
     if (!isPlainObject(value) || !isPlainObject(value.values)) return value
     const values: Record<string, unknown> = { ...value.values }
     if (!Object.hasOwn(values, 'modelSelection')) return value
-    values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId)
+    values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId, serverGroups)
     return { ...value, values }
   }
   if (endpoint === 'session/selectModel') {
@@ -1014,10 +1028,13 @@ export function rewriteResult(endpoint: string, value: unknown, serverId: string
     // virtual group before forwarding), so the echo goes back virtual for
     // the same consistency the projection rewrite gives. The UI's directory
     // ignores the value today (ModelDirectory.select reads only ok), so this
-    // is consistency for any future reader, not a display fix.
+    // is consistency for any future reader, not a display fix. Catalog-gated
+    // like every route since T52-fix2: a provider the catalog does not list
+    // echoes original.
     if (!isPlainObject(value) || !isPlainObject(value.selected) || typeof value.selected.provider !== 'string') {
       return value
     }
+    if (serverGroups?.has(value.selected.provider) !== true) return value
     return { ...value, selected: { ...value.selected, provider: virtualize(value.selected.provider) } }
   }
   return value
@@ -1194,6 +1211,9 @@ interface MergedGlobalStreamDeps {
   log: ((format: string, ...args: unknown[]) => void) | undefined
   /** The clock the reopen backoff runs on (the install options' clock). */
   clock: RelayClock
+  /** The server catalog's original group ids per server id (T52-fix2), read
+   * live per frame — feeds the control merger's modelSelection gate. */
+  serverProviders: (serverId: string) => ReadonlySet<string> | undefined
 }
 
 /**
@@ -1212,7 +1232,7 @@ interface MergedGlobalStreamDeps {
  * rename re-upserts the shown groups under the new title without a reopen.
  */
 async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator<unknown, void, undefined> {
-  const { endpoint, namespace, method, local, relay, signal, recordFailure, log, clock } = deps
+  const { endpoint, namespace, method, local, relay, signal, recordFailure, log, clock, serverProviders } = deps
   // An already-aborted caller has nothing to merge — end both legs (neither
   // has started) immediately instead of letting the local stream open into
   // a dead iteration.
@@ -1226,7 +1246,7 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   // any remote frame is ever fed (it only runs under a real handshake).
   let merger: WorkspaceMerger | ControlMerger =
     endpoint === 'session/control'
-      ? createControlMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
+      ? createControlMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic, serverProviders })
       : createWorkspaceMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
 
   /**
@@ -1828,8 +1848,60 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // the offline merges of the `session/modelCatalog` route below — cleared
   // on a pairing wall and never served for another server's id (see the
   // route's doc). Only an in-memory value: the groups are display data and
-  // a reload refetches them anyway.
-  let serverCatalogCache: { identity: MergerIdentity; value: unknown } | undefined
+  // a reload refetches them anyway. `groups` (T52-fix2) is the value's
+  // ORIGINAL group ids — the membership set every provider rewrite judges
+  // against (serverProvidersOf below); computed once at fetch time and read
+  // live per result, so the rewrites only ever virtualize a provider the
+  // merged catalog really carries a virtual group for.
+  let serverCatalogCache: { identity: MergerIdentity; value: unknown; groups: ReadonlySet<string> } | undefined
+  /** The provider gate for one server's rewrites (T52-fix2): the cached
+   * catalog's original group ids, `undefined` when nothing was fetched for
+   * THAT server — the no-judgment-possible case that leaves providers
+   * original. */
+  const serverProvidersOf = (serverId: string): ReadonlySet<string> | undefined => {
+    const cached = serverCatalogCache
+    if (cached === undefined || cached.identity.serverId !== serverId) return undefined
+    return cached.groups
+  }
+  /** One server-catalog fetch whose answer only feeds the cache (T52-fix2):
+   * the proactive pull that runs as soon as the relay serves, so the
+   * provider gate is decidable for the projections that follow — the UI
+   * opening a dropdown must not be the only thing that fills it. Failures
+   * are diagnostics-ring entries, nothing else (the route's own fetch is
+   * the user-visible path and answers local-only there). */
+  const fetchServerCatalog = (identity: MergerIdentity): void => {
+    void relay.invoke('session', 'modelCatalog', {}, undefined).then(
+      (value) => {
+        serverCatalogCache = { identity, value, groups: catalogGroupIds(value) }
+      },
+      (error: unknown) => {
+        recordFailure('session/modelCatalog', error instanceof RelayError ? error.code : 'internal')
+      },
+    )
+  }
+  // The catalog watcher (T52-fix2). The relay client notifies on state
+  // CHANGES only, so this fires on the real online transitions (first
+  // handshake, every recovery); `unpaired` / `revoked` drop the cache the
+  // same way the catalog route does lazily — the wall's groups must not
+  // outlive it, and a still-filled cache would keep virtualizing providers
+  // no dropdown can show anymore. Faults stay contained: the sync body
+  // cannot throw, and the fetch settles through .then/.catch above.
+  let offCatalogWatch: (() => void) | undefined
+  try {
+    offCatalogWatch = relay.subscribe((state) => {
+      if (state === 'unpaired' || state === 'revoked') {
+        serverCatalogCache = undefined
+        return
+      }
+      if (state !== 'online') return
+      const identity = relayIdentityOf(relay)
+      if (identity !== undefined) fetchServerCatalog(identity)
+    })
+  } catch (error) {
+    // Subscription failed: the cache still fills whenever the UI opens a
+    // dropdown (the route's own fetch), only later.
+    log?.('client catalog watcher unavailable: %s', messageOf(error))
+  }
   const registerClosed = (sessionId: string, reason: ClosedSessionRecord['reason']): void => {
     closedSessions.delete(sessionId)
     if (closedSessions.size >= MAX_CLOSED_SESSIONS) {
@@ -2041,7 +2113,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // The session answered: any closed-session entry for it is stale
       // (re-shared and served again) — the banner may go.
       clearClosed(virtuals)
-      return { ok: true, value: rewriteResult(endpoint, value, serverId) }
+      // The provider gate reads the cache LIVE per result (T52-fix2): a
+      // catalog that landed between the request and this answer counts.
+      return { ok: true, value: rewriteResult(endpoint, value, serverId, serverProvidersOf(serverId)) }
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
       recordFailure(endpoint, code)
@@ -2212,7 +2286,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             // closed-session entry for it is stale (T34).
             clearClosed(claimed)
           }
-          yield rewriteFrame(endpoint, frame, serverId)
+          yield rewriteFrame(endpoint, frame, serverId, serverProvidersOf(serverId))
         }
         return
       } catch (error) {
@@ -2295,7 +2369,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     if (identity === undefined || relay.state !== 'online') return localEnvelope
     try {
       const remote = await relay.invoke('session', 'list', isPlainObject(args) ? args : {}, signal)
-      return { ok: true, value: mergeSessionList(localEnvelope.value, remote, identity.serverId) }
+      return {
+        ok: true,
+        value: mergeSessionList(localEnvelope.value, remote, identity.serverId, serverProvidersOf(identity.serverId)),
+      }
     } catch (error) {
       recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
       return localEnvelope
@@ -2344,7 +2421,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         // endpoint or credential details the client discards anyway), and the
         // result carries no session data.
         const remote = await relay.invoke('session', 'modelCatalog', {}, signal)
-        serverCatalogCache = { identity, value: remote }
+        serverCatalogCache = { identity, value: remote, groups: catalogGroupIds(remote) }
         return { ok: true, value: mergeModelCatalogs(localEnvelope.value, remote, identity) }
       } catch (error) {
         recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
@@ -2553,6 +2630,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             recordFailure,
             log,
             clock,
+            serverProviders: serverProvidersOf,
           })
         })()
       }
@@ -2626,6 +2704,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     uninstall() {
       if (!installed) return
       installed = false
+      // The catalog watcher dies with the wrap (T52-fix2): a late online
+      // transition after this point belongs to another generation.
+      offCatalogWatch?.()
+      offCatalogWatch = undefined
       for (const name of ['openWireStream', 'dispatchRpc']) {
         // Only replace/delete while the property still holds OUR wrapper.
         // A later plugin may have wrapped OVER us: its wrapper captured this
