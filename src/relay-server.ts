@@ -284,6 +284,58 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/** Non-empty string — the client face's `isRemoteEventId` /
+ * `isRemoteEventAgentId` / `validRemoteEventName` (dsh-api-gateway
+ * lib/client.js). */
+function isEventId(value: unknown): value is string {
+  return typeof value === 'string' && value !== ''
+}
+
+/**
+ * The two `$events` frame shapes a sub-client may be shown, proven
+ * well-formed BEFORE forwarding (T32-fix2). The client face's
+ * `parseRemoteEventFrame` validates every variant with exact keys — one
+ * extra or missing field throws and fails the sub-client's whole `$events`
+ * generation — so the relay only forwards frames that would survive that
+ * parse. A waterfall's `request` must additionally be a plain object
+ * without `agent`/`signal`: the host projection strips those, and the
+ * client face refuses them back.
+ */
+interface ForwardableWaterfallFrame extends Record<string, unknown> {
+  type: 'waterfall'
+  event: string
+  eventId: string
+  agentId: string
+  request: Record<string, unknown>
+}
+
+interface ForwardableCancelFrame extends Record<string, unknown> {
+  type: 'cancel'
+  eventId: string
+}
+
+function isForwardableWaterfall(frame: Record<string, unknown>): frame is ForwardableWaterfallFrame {
+  return (
+    Reflect.ownKeys(frame).length === 5 &&
+    ['type', 'event', 'eventId', 'agentId', 'request'].every((key) => Object.hasOwn(frame, key)) &&
+    isEventId(frame.event) &&
+    isEventId(frame.eventId) &&
+    isEventId(frame.agentId) &&
+    isPlainObject(frame.request) &&
+    !Object.hasOwn(frame.request, 'agent') &&
+    !Object.hasOwn(frame.request, 'signal')
+  )
+}
+
+function isForwardableCancel(frame: Record<string, unknown>): frame is ForwardableCancelFrame {
+  return (
+    Reflect.ownKeys(frame).length === 2 &&
+    Object.hasOwn(frame, 'type') &&
+    Object.hasOwn(frame, 'eventId') &&
+    isEventId(frame.eventId)
+  )
+}
+
 /**
  * Constant-time secret comparison. Different lengths are trivially unequal
  * (timingSafeEqual itself throws on that); an empty configured secret refuses
@@ -605,35 +657,6 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     return opened as AsyncIterable<unknown>
   }
 
-  /**
-   * Abstain on behalf of a delivery the sub-client must never answer (T32-fix):
-   * a waterfall dropped at forward time, or one whose session just left the
-   * share table. Without this the gateway keeps waiting for THIS delivery
-   * (RT dsh-api-gateway: `receiveRemoteEventResult` removes a delivery only
-   * on a result; `removeRemoteEventClient` on a disconnect does NOT settle
-   * the event) and the server-side tool call can hang. `next` is the honest
-   * answer for a gone answerer — it settles this delivery and, if the other
-   * clients (the server's own UI) are gone too, lets the waterfall fall
-   * through. A failure is swallowed: the handler has no logger, and the
-   * worst case is exactly the pre-fix behavior (the delivery stays pending,
-   * still answerable by the server UI).
-   */
-  const answerNextOnBehalf = (sub: EventsSubscription, eventId: string): void => {
-    const dispatch = gateway.dispatchRpc
-    if (sub.clientId === undefined || typeof dispatch !== 'function') return
-    void Promise.resolve(
-      dispatch.call(
-        gateway,
-        '$events/result',
-        { args: { clientId: sub.clientId, eventId, outcome: { kind: 'next' } } },
-        undefined,
-        undefined,
-      ),
-    ).catch(() => {
-      // Non-actionable: see the comment above.
-    })
-  }
-
   /** Record one forwarded waterfall in the subscription's registry (oldest
    * dropped past the cap), under its ORIGINAL id. */
   const rememberEvent = (sub: EventsSubscription, eventId: string, agentId: string): void => {
@@ -645,7 +668,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   }
 
   /**
-   * The `$zr/events` frame discipline (T32, reworked in T32-fix), one
+   * The `$zr/events` frame discipline (T32, reworked in T32-fix2), one
    * function for the pump:
    *
    * - READY is recorded (the subscription's clientId, for the answer route)
@@ -653,12 +676,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
    *   facts (`clientId`, `home`) that would let it speak to the gateway
    *   around this relay.
    * - WATERFALL frames whose `agentId` is not reachable right now are
-   *   dropped — and answered `next` on behalf, so the gateway does not wait
-   *   for a delivery that will never come. Forwarded ones are registered
-   *   and rewritten to `<token>.<eventId>`: the answer route resolves the
-   *   subscription (and its device) from the token, so ids never cross
-   *   subscriptions. Rewriting to virtual ids for the UI stays the
-   *   CLIENT's job — it prefixes the whole thing with `zr~<serverId>~`.
+   *   dropped — NOT answered on the sub-client's behalf (see DROPPED
+   *   DELIVERIES below). Forwarded ones are registered and rewritten to
+   *   `<token>.<eventId>`: the answer route resolves the subscription (and
+   *   its device) from the token, so ids never cross subscriptions.
+   *   Rewriting to virtual ids for the UI stays the CLIENT's job — it
+   *   prefixes the whole thing with `zr~<serverId>~`.
    * - CANCEL frames are forwarded only for events this subscription
    *   forwarded (an unshared session's activity timeline must not leak
    *   through cancels), and the entry goes with the forward.
@@ -668,34 +691,49 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
    *   unshared sessions and feed the sub-client ids it would treat as
    *   local. Everything a sub-client needs about a session's state travels
    *   the workspace/control streams, which ARE share-filtered.
+   * - Anything not shaped exactly like a forwardable waterfall or cancel
+   *   (T32-fix2, mirroring the client face's `parseRemoteEventFrame`
+   *   exact-keys validation) is dropped too: a frame that slipped through
+   *   would fail the sub-client's whole `$events` generation and leave it
+   *   failing and reconnecting in a loop.
+   *
+   * DROPPED DELIVERIES STAY PENDING (T32-fix2): a dropped waterfall used to
+   * be abstained `next` on behalf. That is gone on purpose. DSH's `next`
+   * only retracts the answering client's OWN delivery, and the event
+   * settles `next` — falling through to the host's fallback, where
+   * `approval/request` resolves `unavailable` (which dsh-user-approval
+   * treats as a rejection) and `user-questions/request` throws NO_PROVIDER
+   * — only when NO delivery remains (RT dsh-api-gateway
+   * `receiveRemoteEventResult`). With the desktop window closed and the
+   * phone asleep, the relay IS the only delivery: one abstention would fail
+   * every pending approval of the dropped session at once and break the
+   * push → wake → approve flow. The price: a waterfall dropped here keeps
+   * the relay's delivery pending, so an event the server UI answered `next`
+   * waits until the next `$events` client connects — the gateway
+   * re-delivers still-pending events to a fresh subscription
+   * (`openRemoteEvents`). A wait, never a rejection.
    *
    * KNOWN LIMITATION: an event that arrives while its session is still
-   * unshared is dropped (and answered `next`); sharing the session later
-   * does NOT resurrect it for the sub-client — it only sees such events
-   * from the next reconnect onward, when the gateway re-delivers still-
-   * pending events to the fresh subscription.
+   * unshared is dropped; sharing the session later does NOT resurrect it
+   * for the sub-client — it only sees such events from the next reconnect
+   * onward, when the gateway re-delivers still-pending events to the fresh
+   * subscription.
    */
   const filterEventsFrame = (sub: EventsSubscription, frame: unknown): unknown => {
-    if (!isPlainObject(frame)) return frame
+    if (!isPlainObject(frame)) return null
     if (frame.type === 'ready') {
       if (typeof frame.clientId === 'string' && frame.clientId !== '') sub.clientId = frame.clientId
       return { type: 'ready' }
     }
     if (frame.type === 'waterfall') {
-      const eventId = typeof frame.eventId === 'string' ? frame.eventId : ''
-      const agentId = typeof frame.agentId === 'string' ? frame.agentId : ''
-      if (eventId === '' || agentId === '' || !isAccessible(agentId)) {
-        answerNextOnBehalf(sub, eventId)
-        return null
-      }
-      rememberEvent(sub, eventId, agentId)
-      return { ...frame, eventId: `${sub.token}.${eventId}` }
+      if (!isForwardableWaterfall(frame) || !isAccessible(frame.agentId)) return null
+      rememberEvent(sub, frame.eventId, frame.agentId)
+      return { ...frame, eventId: `${sub.token}.${frame.eventId}` }
     }
     if (frame.type === 'cancel') {
-      const eventId = typeof frame.eventId === 'string' ? frame.eventId : ''
-      if (eventId === '' || !sub.events.has(eventId)) return null
-      sub.events.delete(eventId)
-      return { ...frame, eventId: `${sub.token}.${eventId}` }
+      if (!isForwardableCancel(frame) || !sub.events.has(frame.eventId)) return null
+      sub.events.delete(frame.eventId)
+      return { ...frame, eventId: `${sub.token}.${frame.eventId}` }
     }
     return null
   }
@@ -1221,12 +1259,16 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         } else if (eventsSub !== undefined) {
           // `$zr/events` (T32-fix): the share table closing a session must
           // also close the prompts this subscription is showing for it —
-          // synthesize the same cancel frame the gateway would have sent,
-          // drop the registry entry, and abstain `next` on the sub-client's
-          // behalf so the gateway stops waiting for an answer that can no
-          // longer arrive. Events of still-reachable sessions are untouched;
-          // nothing is synthesized on a share (the known limitation in
-          // filterEventsFrame's comment).
+          // synthesize the same cancel frame the gateway would have sent
+          // and drop the registry entry, so the sub-client closes the
+          // prompt and a late answer refuses unknown-event (which the
+          // client turns into the same silent ok DSH gives a stale
+          // result). The relay's OWN delivery is deliberately NOT abstained
+          // away (T32-fix2, see filterEventsFrame's DROPPED DELIVERIES): it
+          // stays pending at the gateway, still answerable by the server
+          // UI or a future subscriber. Events of still-reachable sessions
+          // are untouched; nothing is synthesized on a share (the known
+          // limitation in filterEventsFrame's comment).
           unsubscribe = store.subscribe((event) => {
             if (event.type !== 'unshared' || finished || clientGone) return
             for (const [eventId, agentId] of [...eventsSub.events]) {
@@ -1236,7 +1278,6 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                 type: 'frame',
                 frame: { type: 'cancel', eventId: `${eventsSub.token}.${eventId}` },
               })
-              answerNextOnBehalf(eventsSub, eventId)
             }
           })
         } else {

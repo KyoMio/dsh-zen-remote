@@ -70,8 +70,9 @@
  *   clientId — the local payload's clientId is the local stream's and is
  *   discarded); anything else reaches the local gateway verbatim. A relay
  *   refusal that means "this event is already over" (`unknown-event`,
- *   `not-shared`) is answered as silent success — exactly how DSH treats a
- *   stale result — because a thrown answer fails the UI's whole `$events`
+ *   `not-shared` — the route's 403 refusals) is answered as silent
+ *   success — exactly how DSH treats a stale result — because a thrown
+ *   answer fails the UI's whole `$events`
  *   generation (client face: pumpEvents aborts on answer failures).
  */
 
@@ -465,6 +466,56 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/** Non-empty string — the client face's `isRemoteEventId` /
+ * `isRemoteEventAgentId` / `validRemoteEventName` (dsh-api-gateway
+ * lib/client.js). */
+function isEventId(value: unknown): value is string {
+  return typeof value === 'string' && value !== ''
+}
+
+/**
+ * The two `$events` frame shapes this client will show the local UI,
+ * mirroring the client face's `parseRemoteEventFrame` exact-keys validation
+ * AND the relay server's own forwardable-shape gate (T32-fix2 — the two
+ * ends disagree on nothing): one extra or missing field would throw inside
+ * the client face and fail the UI's whole `$events` generation, so a frame
+ * that does not prove out here is dropped before the UI ever sees it.
+ */
+interface ForwardableWaterfallFrame extends Record<string, unknown> {
+  type: 'waterfall'
+  event: string
+  eventId: string
+  agentId: string
+  request: Record<string, unknown>
+}
+
+interface ForwardableCancelFrame extends Record<string, unknown> {
+  type: 'cancel'
+  eventId: string
+}
+
+function isForwardableWaterfall(frame: Record<string, unknown>): frame is ForwardableWaterfallFrame {
+  return (
+    Reflect.ownKeys(frame).length === 5 &&
+    ['type', 'event', 'eventId', 'agentId', 'request'].every((key) => Object.hasOwn(frame, key)) &&
+    isEventId(frame.event) &&
+    isEventId(frame.eventId) &&
+    isEventId(frame.agentId) &&
+    isPlainObject(frame.request) &&
+    !Object.hasOwn(frame.request, 'agent') &&
+    !Object.hasOwn(frame.request, 'signal')
+  )
+}
+
+function isForwardableCancel(frame: Record<string, unknown>): frame is ForwardableCancelFrame {
+  return (
+    Reflect.ownKeys(frame).length === 2 &&
+    Object.hasOwn(frame, 'type') &&
+    Object.hasOwn(frame, 'eventId') &&
+    isEventId(frame.eventId)
+  )
+}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -833,33 +884,30 @@ export function rewriteResult(endpoint: string, value: unknown, serverId: string
  *   whole thing in `zr~<serverId>~`.
  * - `cancel`: `{type, eventId}` — the correlation id goes virtual so the UI
  *   can match it against the waterfall it showed and close the prompt.
- * - `ready`: dropped. The local stream already opened the UI's stream with
- *   ITS ready frame (client face: the first frame must be ready, any later
- *   one fails `parseRemoteEventFrame`), and the remote one carries the
- *   server's `clientId`/`home` — facts the UI must never need.
- * - `emit`: dropped (T32-fix, second line of defense behind the server's
- *   own drop). Emit events broadcast server-wide state — session lists and
- *   titles, account expirations, cordis chatter — that is not share-scoped;
- *   whatever survived a future server would feed the local UI ids it would
- *   mistake for local sessions. Session state reaches the sub-client
- *   through the share-filtered workspace/control streams instead.
+ * - everything else — `ready`, `emit`, non-objects, unknown types, and any
+ *   waterfall/cancel failing the client face's exact-keys shape — is
+ *   DROPPED (T32-fix2 mirrors the server side). `ready` and `emit` carry
+ *   facts the UI must never see (the local stream opened with ITS ready
+ *   frame; emit broadcasts server-wide state); a malformed frame that
+ *   slipped through would fail `parseRemoteEventFrame` and take the UI's
+ *   whole `$events` generation down with it, failing and reconnecting in a
+ *   loop. Mirrors the server's own forwardable-shape gate, so the two ends
+ *   disagree on nothing.
  */
 export function rewriteRemoteEventFrame(frame: unknown, serverId: string): unknown | null {
   const virtualize = (id: string): string => toVirtual(serverId, id)
-  if (!isPlainObject(frame)) return frame
+  if (!isPlainObject(frame)) return null
   if (frame.type === 'ready') return null
   if (frame.type === 'emit') return null
   if (frame.type === 'waterfall') {
-    const next: Record<string, unknown> = { ...frame }
-    if (typeof frame.eventId === 'string') next.eventId = virtualize(frame.eventId)
-    if (typeof frame.agentId === 'string') next.agentId = virtualize(frame.agentId)
-    return next
+    if (!isForwardableWaterfall(frame)) return null
+    return { ...frame, eventId: virtualize(frame.eventId), agentId: virtualize(frame.agentId) }
   }
   if (frame.type === 'cancel') {
-    if (typeof frame.eventId !== 'string') return frame
+    if (!isForwardableCancel(frame)) return null
     return { ...frame, eventId: virtualize(frame.eventId) }
   }
-  return frame
+  return null
 }
 
 /** Longest failure ring kept for the status surface. */
@@ -1605,10 +1653,19 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         // silent ok (receiveRemoteEventResult no-ops), so the UI gets
         // exactly that instead of a thrown answer — a thrown one would
         // fail the UI's whole `$events` generation and restart the stream
-        // (client face: pumpEvents aborts on answer failures). Not a call
-        // failure, so the diagnostics ring stays out of it. Every OTHER
-        // code is a real fault and keeps the refusal envelope.
-        if (code === 'unknown-event' || code === 'not-shared') return { ok: true, value: undefined }
+        // (client face: pumpEvents aborts on answer failures). The route's
+        // documented refusal is a 403 (relay-server.ts event-result), so
+        // the mapping additionally demands `status === 403`: the same code
+        // string arriving on any other status is a different fault. Not a
+        // call failure, so the diagnostics ring stays out of it. Every
+        // OTHER code is a real fault and keeps the refusal envelope.
+        if (
+          error instanceof RelayError &&
+          error.status === 403 &&
+          (code === 'unknown-event' || code === 'not-shared')
+        ) {
+          return { ok: true, value: undefined }
+        }
         recordFailure(endpoint, code)
         return { ok: false, error: { code, message: messageOf(error), details: {} } }
       }
