@@ -492,21 +492,29 @@ const t53Sliced = remoteSessionCss.slice(remoteSessionCss.indexOf('/* ----------
 assert.ok(t53Sliced.length > 0, 'the T53 better-sidebar section must exist in remote-session.css.ts')
 
 test('T53: every rule is gated on the remote-session attribute — a local session matches nothing', () => {
-  // Strip block comments, then every remaining line must be a gated selector
-  // line (selector lists repeat the gate per line, so continuation lines
-  // ending in "," are checked too), a declaration, or a closing brace. An
-  // ungated selector would fire on local sessions, where these plugin
-  // surfaces are exactly right.
+  // T53-fix classification. After stripping block comments, a line is
+  // exactly one of: a closing brace, a DECLARATION, or a SELECTOR line.
+  //   declaration: `prop: value;` — and never brace-bearing (the tightened
+  //     [^{}]; the looser /^[a-z-]+:/ once let `body:has(...) { ... }`
+  //     selector lines through as "declarations"),
+  //   selector: must end with "{" or "," AND carry the remote-session gate
+  //     in full (selector lists repeat the gate per line, so continuation
+  //     lines ending in "," are checked too). An ungated selector would fire
+  //     on local sessions, where these plugin surfaces are exactly right.
+  const GATE = 'html[data-zr-remote-session="1"]'
   const stripped = t53Sliced.replace(/\/\*[\s\S]*?\*\//g, '')
   const offenders = stripped
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line !== '' && !line.startsWith('`'))
-    .filter((line) => !line.startsWith('html[data-zr-remote-session="1"]'))
-    .filter((line) => !/^[a-z-]+:/.test(line) && !line.startsWith('--') && !line.startsWith('}'))
+    .filter((line) => line !== '' && line !== '`')
+    .filter((line) => {
+      if (line === '}') return false
+      if (/^[a-z-]+:\s[^{}]*;$/.test(line)) return false
+      return !(line.startsWith(GATE) && /[,{]$/.test(line))
+    })
   assert.deepEqual(offenders, [], 'every selector line must sit under html[data-zr-remote-session="1"]')
-  // And the gate is really there, once per rule: 8 hide rules (the 3-kind
-  // guide rule repeats it per selector line) + 1 variable override.
+  // And the gate is really there, once per rule (the 3-kind guide rule
+  // repeats it per selector line) + 1 variable override.
   const gatedLines = (stripped.match(/html\[data-zr-remote-session="1"\]/g) || []).length
   assert.ok(gatedLines >= 10, `expected every rule gated, found ${gatedLines} gate occurrences`)
 })
@@ -529,13 +537,17 @@ test('T53: every selector anchors on better-sidebar\'s own (or its host slot\'s)
   // nArs4W is the plugin's build-hashed CSS-module prefix (client.js ~3536):
   // it changes per build and must never appear in a selector.
   assert.ok(!t53Sliced.includes('nArs4W'), 'no hashed class names')
-  // The files-capsule rule is the one selector that needs a presence gate:
-  // the host's own files page registers the same kind and is remote-aware,
-  // so hiding it must require the plugin's takeover to be mounted.
+  // The files-capsule rule is the one ambiguous kind: the host's own files
+  // page registers the same kind and is remote-aware. T53-fix discriminates
+  // on the capsule's rendered contract instead of plugin presence — the host
+  // EntryBox renders aria-keyshortcuts from its commandId's shortcut
+  // (workspace.files), better-sidebar's guide rows carry no commandId and
+  // never render it — so :not([aria-keyshortcuts]) hides the takeover
+  // capsule and spares the host's wherever the host has a default binding.
   assert.match(
     t53Sliced,
-    /html\[data-zr-remote-session="1"\] body:has\(\[data-dsh-better-sidebar\]\) \[data-sidebar-right-guide-entry="files"\]/,
-    'the files guide capsule is gated on the plugin being mounted',
+    /html\[data-zr-remote-session="1"\] \[data-sidebar-right-guide-entry="files"\]:not\(\[aria-keyshortcuts\]\)/,
+    'the files guide capsule is discriminated by aria-keyshortcuts, not plugin presence',
   )
 })
 

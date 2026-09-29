@@ -47,8 +47,22 @@ html[data-zr-remote-session="1"] [data-open-target] {
    Anchors, all the plugin's or the host's own rendered contracts (no hashed
    class names; the one suffix selector, _chipIcon, is unique among the
    profile's packages — checked dsh-vision-router / dsh-auto-approve /
-   dsh-mem0 / dsh-llm-verifier / dsh-plugin-subscriptions and every
-   @deepseek-ai sidebar package for it):
+   dsh-mem0 / dsh-llm-verifier / dsh-plugin-subscriptions /
+   @liustack/modsearch / @wxg-prc-cpg/browser-skill-dsh-plugin (modsearch /
+   browser-skill) / dshmarket and every @deepseek-ai sidebar package for it):
+
+   HONEST LIMITS (T53-fix): everything here is display:none ONLY. The plugin's
+   components stay mounted and keep silently POSTing READ-ONLY /sidebar/api
+   requests to the local machine (session.cwd, changes.ops, the tree reads a
+   mounted tab refreshes with) — the data never leaves that machine, and no
+   write can happen because every write control is inside the hidden surfaces.
+   Known boundary: a dsh-resource://file/** address opened through
+   sidebarRight.openResource in a remote session (file links in chat,
+   deliverables, @-references, skills) is CLAIMED by the plugin's editor
+   registration (client.js ~21377: patterns ["dsh-resource://file/**"]) before
+   the host preview sees it — the right sidebar expands, the rules below hide
+   the tab's body and chip, and an EMPTY panel remains. Root fix needs
+   zen-remote's own remote file tree; separate discussion.
 
    - [data-dsh-bottom-toggle] — the header-utilities button that expands the
      bottom workbench (client.js BottomDockToggle ~20863; slot registration
@@ -102,18 +116,26 @@ html[data-zr-remote-session="1"] [data-open-target] {
      the plugin's registrations ([data-sidebar-right-guide-entry="<kind>"], RT
      dsh-client-ui-sidebar-right lib/client.js:466): kinds git / subagent /
      sidechat exist only while this plugin registers them, so those selectors
-     are inert without it. The "files" capsule needs a real presence gate:
-     dsh-client-ui-sidebar-files registers the SAME kind (its
-     filesDefinition, lib/client.js:14-31) and that page is REMOTE-AWARE
-     (it injects the host's remote.workspaceFiles service) — hiding it would
-     amputate a working remote surface, so the rule only fires while the
-     plugin's own mount marker [data-dsh-better-sidebar] (client.js ~23213)
-     is on the page, i.e. while its takeover (priority extension, client.js
-     registerFilesKind ~21415) is the "files" implementation. Boundary, stated
-     honestly: a user who disables the plugin's editor tab in its settings
-     keeps the marker mounted but hands "files" back to the host, and the
-     capsule stays hidden — cosmetic, and the host page itself stays reachable
-     through the "+" guide once the marker is gone. */
+     are inert without it. The "files" capsule is the one ambiguous kind:
+     dsh-client-ui-sidebar-files registers the SAME kind (its filesDefinition,
+     lib/client.js:14-31) and that page is REMOTE-AWARE (it injects the host's
+     remote.workspaceFiles service). T53-fix discriminates on the capsule's
+     own rendered contract instead of plugin presence: the host's EntryBox
+     renders aria-keyshortcuts from the shortcut matching entry.commandId (RT
+     sidebar-right lib/client.js:461-467) — the host files guide row carries
+     commandId "workspace.files" (dsh-client-ui-sidebar-files
+     lib/client.js:30), while better-sidebar's guide rows carry NO commandId
+     (client.js registerNativeSurface ~21385-21400), so its capsule never
+     renders the attribute. :not([aria-keyshortcuts]) therefore hides the
+     plugin's takeover capsule and spares the host's wherever the host has a
+     default binding. Boundary: that "wherever" is not everywhere — the host
+     registers workspace.files defaults for desktop:macos/windows/linux and
+     web:macos/windows only (dsh-client-ui-sidebar-files lib/client.js:949-977),
+     so on any other platform the OFFICIAL capsule also renders without the
+     attribute and this rule hides it too (cosmetic; the page stays reachable
+     through its shortcut command path and the plugin's takeover is the
+     "files" implementation on every deployment this plugin pairs with
+     better-sidebar anyway). */
 html[data-zr-remote-session="1"] [data-dsh-bottom-toggle] {
   display: none !important;
 }
@@ -137,7 +159,7 @@ html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="subagent"],
 html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="sidechat"] {
   display: none !important;
 }
-html[data-zr-remote-session="1"] body:has([data-dsh-better-sidebar]) [data-sidebar-right-guide-entry="files"] {
+html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="files"]:not([aria-keyshortcuts]) {
   display: none !important;
 }
 `
