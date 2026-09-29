@@ -28,9 +28,10 @@ export declare function responseJson(res: ServerResponse, status: number, body: 
  * browser-direct cross-site POST. What stands in front of an accepted
  * headerless request depends on the route module: the admin routes (T14) and
  * the client routes (T16) run `connection.admit` FIRST, so such a request has
- * still cleared DSH's login wall before this check runs; the upload and
- * share-export routes carry no admit today — that gap is scheduled for T17 —
- * so there this acceptance rests on the same-origin rule alone. Everything
+ * still cleared DSH's login wall before this check runs; since T17 the
+ * upload and share-export routes run the same `connection.admit` first, so
+ * every state-changing route this gate fronts is admission-covered and this
+ * acceptance never stands alone. Everything
  * identifiable as cross-site (`Sec-Fetch-Site: cross-site`, or an `Origin`
  * that disagrees with `Host`) is still refused.
  * @param req - the inbound request.

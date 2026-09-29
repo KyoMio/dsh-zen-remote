@@ -16,15 +16,16 @@
 | `src/config.ts` | 配置模型：四层回退（env > 插件行 > `lan-gate.config.json` > 默认值）、loader 的 `Config` schema（全 volatile）、`resolveRole` |
 | `src/http.ts` | host 路由共用的 JSON 响应封装与同源 POST 门 |
 | `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
-| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status、配对代理、设置页诊断 |
+| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（两角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff） |
 | `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
 | `src/share-store.ts` | 共享会话表（`~/.dsh/zen-remote-shares.json`，持久化，重启恢复），中继访问控制的事实来源 |
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
 | `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
 | `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
-| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / unshare |
-| `src/relay-access.ts` | 中继的按方法登记访问控制表（服务端那一张） |
-| `src/relay-filter.ts` | 全局流与全局列表的输出过滤（`workspace/follow` / `session/control` / `session/list`） |
+| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（改动摘要 / diff 的 plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ unshare |
+| `src/relay-access.ts` | 中继的按方法登记访问控制表（服务端那一张；`v1/http` 的按路由登记表也在这里） |
+| `src/relay-filter.ts` | 全局流与全局列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
+| `src/session-reference.ts` | 两端共用的 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队消息 edit、`commands/execute` 全部字符串）：服务端照它校验、子客户端照它改写，同一份规则防两端漂移 |
 | `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
 | `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`，远程会话调用改走中继、虚拟 id 改写、面板判定（客户端那张字段表也在这里） |
 | `src/intercept-shape.ts` | 被包装方法的形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
