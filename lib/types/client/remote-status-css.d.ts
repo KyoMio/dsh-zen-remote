@@ -1,0 +1,15 @@
+/**
+ * Styles for the T34 sub-client status parts — the title-row connection
+ * icon's states and the composer's readonly banner. Injected as one
+ * `<style data-plugin="dsh-zen-remote-remote-status">` tag BEFORE apply's
+ * desktop gate (a desktop app in the client role has remote sessions too; on
+ * a host the parts render nothing for local sessions, so the desktop stays
+ * pixel-identical).
+ *
+ * T34-fix: the input itself is disabled through the HOST's component
+ * capability — `ctx.conversation.blocks.set(sessionId, { reason })`, the
+ * composer-block contract — not through any CSS override; what remains here
+ * is scoped under the parts' own attributes and can reach nothing but them.
+ */
+export declare const REMOTE_STATUS_CSS = "\nbutton.zr-remote-status[data-zen-remote=\"remote-status\"] {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 28px;\n  height: 28px;\n  flex-shrink: 0;\n  padding: 0;\n  border: none;\n  border-radius: 6px;\n  background: transparent;\n  color: var(--dsw-alias-label-tertiary);\n  cursor: pointer;\n}\nbutton.zr-remote-status[data-zen-remote=\"remote-status\"]:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\nbutton.zr-remote-status[data-zen-remote=\"remote-status\"][data-state=\"online\"] {\n  color: var(--dsw-alias-state-business-primary, #4f6ef7);\n}\n/* offline / revoked / unpaired: the default grey is the state, dimmed a\n   little so a dead or unpaired link reads instantly */\nbutton.zr-remote-status[data-zen-remote=\"remote-status\"][data-state=\"offline\"],\nbutton.zr-remote-status[data-zen-remote=\"remote-status\"][data-state=\"revoked\"],\nbutton.zr-remote-status[data-zen-remote=\"remote-status\"][data-state=\"unpaired\"] {\n  color: var(--dsw-alias-label-tertiary);\n  opacity: 0.75;\n}\nbutton.zr-remote-status[data-zen-remote=\"remote-status\"][data-state=\"mismatch\"] {\n  color: var(--dsw-alias-state-warning-primary, #d97706);\n}\n\n/* The composer banner: a dock entry, so on desktop it is one full-width row\n   of the composer column (the slot anchor is display:contents and the\n   composer column is a flex column \u2014 the item stretches to the column\n   width WITHOUT an explicit width, which would stack with the side margins\n   and overflow the input column, T34-fix). Styled after the host's own\n   composer notice, standalone. */\n.zr-remote-banner[data-zen-remote=\"remote-banner\"] {\n  box-sizing: border-box;\n  margin: 0 max(16px, var(--dsh-composer-side-clearance, 16px));\n  border-radius: var(--dsw-radius-md, 8px);\n  background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.04));\n  color: var(--dsw-alias-label-secondary, inherit);\n  padding: 6px 10px;\n  font-size: 12px;\n  line-height: 18px;\n}\n";
+//# sourceMappingURL=remote-status-css.d.ts.map

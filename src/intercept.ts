@@ -81,7 +81,7 @@ import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
 import { createControlMerger, createWorkspaceMerger, mergeSessionList } from './merge-streams.js'
-import type { ControlMerger, MergerIdentity, WorkspaceMerger } from './merge-streams.js'
+import type { ControlMerger, MergerAnnotation, MergerIdentity, WorkspaceMerger } from './merge-streams.js'
 
 /** The session-locating argument fields, as registered per method. Identical
  * in name and meaning to relay-access.ts's `SessionField`; a field named
@@ -226,6 +226,84 @@ export type DispatchEnvelope =
   | { ok: false; error: { code: string; message?: string; details: Record<string, unknown> } }
 
 /**
+ * The READ methods of the client registry (T34, whitelist form per T34-fix):
+ * the methods allowed through while the relay is not `online`. Everything in
+ * {@link CLIENT_METHOD_FIELDS} NOT listed here is a WRITE and is refused
+ * locally with `remote-offline` while offline — a write can only fail out
+ * there, and the honest local answer beats a dead round-trip. Maintaining
+ * the READ side keeps the failure mode safe: a future table entry nobody
+ * classified lands on the write side (refused offline), never silently
+ * forwarded into a dead link.
+ *
+ * The read list, method by method:
+ *
+ * - every `stream: true` entry of the server table — a subscription
+ *   observes, it never mutates: `session/follow`, `session/control`,
+ *   `job/list`, `job/follow`, `workspace/follow`, and the T32
+ *   `$zr/events` pair entry (never client-dialed, listed for the table
+ *   guard);
+ * - `session/list` — the unscoped first-page read the merge route folds in;
+ * - `session/page` (history read), `session/projections` (control-key
+ *   read), `session/attachment` — verified against RT: it READS one durable
+ *   image back (base64), it does not attach anything;
+ * - `skills/list`, `messageFeedback/list`, `schedule/list` — list reads;
+ * - `fileReferences/list` (T31) — the @-reference listing; its put/delete
+ *   siblings would be writes, but only this listing is in the table.
+ *
+ * Everything else — `session/prompt|cancel|rename|selectModel|updateQueue`
+ * (send, cancel, rename, model switch, inbox mutation), `session/create` /
+ * `session/fork` (T31: new sessions on the server), `subagents/prompt` /
+ * `subagents/interruptByParent` (T31: prompt/interrupt a remote subagent),
+ * `fileUploads/upload` (T31: attachments into a remote session), `job/kill`,
+ * `messageFeedback/put|delete`, the workspace session-list mutations, and
+ * the T41a mutations (`goals/edit|pause|resume|clear`, `commands/execute`,
+ * `agentPresets/select`, `sessionFeedback/record`,
+ * `terminal/create|write|resize|rename|close`) — is a write.
+ */
+export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
+  'session/follow',
+  'session/control',
+  'job/list',
+  'job/follow',
+  'workspace/follow',
+  '$zr/events',
+  'session/list',
+  'session/page',
+  'session/projections',
+  'session/attachment',
+  'skills/list',
+  'messageFeedback/list',
+  'schedule/list',
+  'fileReferences/list',
+  // T41a reads: the goal bar read, the slash-command catalog, the @-session
+  // candidates, workspace file listing / reads / stats and their change
+  // stream, the terminal environment/shell catalog, the session's terminal
+  // list and its keep-alive/output streams.
+  'goals/get',
+  'commands/list',
+  'sessionReferenceResolver/candidates',
+  'workspaceFiles/list',
+  'workspaceFiles/changes',
+  'workspaceFiles/read',
+  'workspaceFiles/readBytes',
+  'workspaceFiles/stat',
+  'terminal/environment',
+  'terminal/shells',
+  'terminal/list',
+  'terminal/follow',
+  'terminal/retain',
+])
+
+/** Whether `endpoint` (a client-table method) is a remote WRITE: anything
+ * the read whitelist does not name (T34-fix). */
+export function isRemoteWrite(endpoint: string): boolean {
+  return !REMOTE_READ_METHODS.has(endpoint)
+}
+
+/** The refusal a write gets while the relay is not serving (T34). */
+const WRITE_OFFLINE_MESSAGE = '服务端离线，远程会话暂时只读'
+
+/**
  * The error shape the host's stream channel forwards intact: only errors
  * with `isDSHRemoteError === true` and a string `code` keep their identity
  * across the wire (dsh-typert-protocol's remoteErrorOf) — anything else is
@@ -315,6 +393,24 @@ const MAX_INCOMPATIBLE_CALLS = 50
 /** The behavior self-check's verdict (spike §4.1 check 4). */
 export type SelfCheckResult = { ok: true } | { ok: false; reason: string }
 
+/**
+ * One remote session the SERVER is no longer serving to this device (T34,
+ * refined by T34-fix): the virtual id plus the close reason ('manual' |
+ * 'client' | 'idle'; anything uncertain reads 'manual'). Two sources: an
+ * `unshared` error frame on a session stream that was OPEN, and a
+ * session-scoped stream refused `not-shared` at open (the closure happened
+ * before this page arrived — no event was ever observed, so the reason
+ * degrades to manual). Drives the session page's 远程已关闭 banner and the
+ * `remote-status` route's `closed` map. Cleared PER SESSION only, when a
+ * call for it succeeds again (re-shared and served) — never wholesale on a
+ * reconnect: a link that flapped while the server still holds the closure
+ * would otherwise flash the banner away and back (T34-fix).
+ */
+export interface ClosedSessionRecord {
+  sessionId: string
+  reason: 'manual' | 'client' | 'idle'
+}
+
 /** What the client status route surfaces about the interception. Contains
  * only shapes, counters and codes — never a token. */
 export interface InterceptDiagnostics {
@@ -329,6 +425,9 @@ export interface InterceptDiagnostics {
    * capped at 50 — the runtime-degradation half of the version-tolerance
    * diagnostics. */
   incompatibleCalls: IncompatibleCallRecord[]
+  /** Remote sessions closed server-side while a page had them open (T34),
+   * oldest first, capped at 200. */
+  closedSessions: ClosedSessionRecord[]
 }
 
 export interface InstallInterceptOptions {
@@ -766,6 +865,15 @@ export function rewriteRemoteEventFrame(frame: unknown, serverId: string): unkno
 /** Longest failure ring kept for the status surface. */
 const MAX_FAILURES = 20
 
+/** Longest closed-session registry kept for the status surface (T34). */
+const MAX_CLOSED_SESSIONS = 200
+
+/** The close reasons the server's structured field may name; anything else
+ * (an older server without the field) degrades to the manual close. */
+function closedReasonOf(error: RelayError): ClosedSessionRecord['reason'] {
+  return error.reason === 'client' || error.reason === 'idle' ? error.reason : 'manual'
+}
+
 // ---- the global reads (T23b-2): merge-stream routes -----------------------
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -889,6 +997,42 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
       ? createControlMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
       : createWorkspaceMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
 
+  /**
+   * The status annotation (T34) the CURRENT relay state maps onto, applied
+   * only while the server identity is unchanged (a changed serverId is the
+   * removal path, titles do not matter). Priority: revoked / unpaired >
+   * offline > version mismatch — while the link is down the mismatch cannot
+   * even be evaluated honestly (the verdict may predate the outage), so
+   * `offline` wins; `connecting` / `incompatible` count as offline (both are
+   * "not serving, recovery pending"). Back `online` the annotation is
+   * recomputed from the live state (T34-fix): the real relay client re-evaluates
+   * compat BEFORE the online transition lands, so a mismatch that survives the
+   * outage keeps its annotation, and a cleared one loses it — whichever way it
+   * goes, the change emits its title upserts right away, because the remote
+   * leg may NOT reopen at all (a 502/503/504 on some other call flips the
+   * state offline while the workspace/follow stream stays open; back online
+   * nothing reopens and no baseline would ever restore the titles).
+   */
+  const annotationOf = (state: RelayState): MergerAnnotation => {
+    if (state === 'revoked') return 'revoked'
+    if (state === 'unpaired') return 'unpaired'
+    if (state !== 'online') return 'offline'
+    const different = relay.compat?.different
+    return different !== undefined && different.length > 0 ? 'mismatch' : 'none'
+  }
+  let currentAnnotation: MergerAnnotation = annotationOf(relay.state)
+  merger.setStatus(currentAnnotation)
+  /** Apply a new annotation and emit its title upserts (workspace merger
+   * only — the control merger ignores annotations). CLEARING emits too
+   * (T34-fix): the upserts are the only restore path when the stream never
+   * died, and a harmless content refresh when it did reopen. */
+  const applyAnnotation = (next: MergerAnnotation): void => {
+    if (next === currentAnnotation) return
+    currentAnnotation = next
+    merger.setStatus(next)
+    for (const frame of merger.onStatusChanged()) channel.push(frame)
+  }
+
   const channel = createFrameChannel()
   let alive = true
   let currentController: AbortController | undefined
@@ -901,14 +1045,16 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
     for (const wake of onlineWaiters.splice(0)) wake()
   }
 
-  /** The relay's state moves. `online` re-evaluates the server identity (a
-   * serverId change cuts the in-flight stream so the pump re-opens; a rename
-   * re-upserts the shown groups under the new title); `unpaired` /
-   * `revoked` follow the remote-death rule (keep the shown state — the
-   * server persists its serverId, so a re-pair to the same server revives
-   * the group through the reconnect diff; the 已解除配对/已吊销 status
-   * annotation is T34's). Anything thrown here must never escape into the
-   * relay's listener loop. */
+  /** The relay's state moves. `unpaired` / `revoked` follow the remote-death
+   * rule (keep the shown state — the server persists its serverId, so a
+   * re-pair to the same server revives the group through the reconnect diff)
+   * and annotate the group titles (T34: 令牌已吊销 / 已解除配对); every other
+   * non-online state annotates 离线; back `online` the annotation is
+   * recomputed (T34-fix) and any change emits its title upserts at once —
+   * the stream may have survived the flap, so the reopened baseline cannot
+   * be relied on. A serverId change cuts the in-flight stream so the pump
+   * re-opens; a rename re-upserts the shown groups under the new title.
+   * Anything thrown here must never escape into the relay's listener loop. */
   const onState = (state: RelayState): void => {
     try {
       if (state === 'unpaired' || state === 'revoked') {
@@ -916,25 +1062,44 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
         // persisted server-side, so a re-pair to the SAME server keeps the
         // virtual prefix — and the UI's removedIds blacklist never clears
         // during a page's life, so a remove here would make the group
-        // un-revivable. Handle it exactly like a remote death: emit nothing,
-        // keep the shown state, cut the in-flight leg; the re-pair lands as
-        // `online` and the pump's wait resumes under the SAME identity.
+        // un-revivable. Handle it exactly like a remote death: keep the
+        // shown state, cut the in-flight leg; the re-pair lands as `online`
+        // and the pump's wait resumes under the SAME identity.
+        applyAnnotation(annotationOf(state))
         merger.onRemoteDown()
         currentController?.abort()
         return
       }
-      if (state !== 'online') return
+      if (state !== 'online') {
+        // Offline / connecting / incompatible (T34): the group stays, its
+        // title says 离线. No leg to cut — the pump only runs under
+        // `online` and is already parked on waitOnline().
+        applyAnnotation(annotationOf(state))
+        return
+      }
       const next = relayIdentityOf(relay)
       if (next === undefined) return
       if (next.serverId !== merger.serverId) {
         // A different server: cut the in-flight stream so the pump's loop
         // re-evaluates (it emits the old group's removals and retargets).
+        // The annotation dies with the old identity — the pump resets it
+        // from the fresh identity's state (below, and at the reopen).
+        currentAnnotation = 'none'
         if (currentController !== undefined) {
           reopenNow = true
           currentController.abort()
         }
         return
       }
+      // Same server back online (T34-fix): the annotation is RECOMPUTED from
+      // the live state — the real relay client re-evaluates compat before
+      // this transition lands, so a surviving mismatch keeps its annotation —
+      // and whatever changed emits its title upserts NOW: the remote leg may
+      // not reopen at all (the stream can survive a state flap), so the
+      // reopened baseline cannot be relied on to restore anything. When the
+      // leg DOES reopen, its baseline's upserts are a harmless refresh. A
+      // rename still rides its own path below.
+      applyAnnotation(annotationOf(state))
       if (next.serverName !== merger.serverName) {
         // Rename: same server, new display name — no reopen, no removals;
         // every shown workspace is re-upserted under the new title and the
@@ -1013,9 +1178,12 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
           // The server changed (a rename is handled in the state listener —
           // reaching here means serverId differs): remove the old server's
           // groups, then point the SAME merger at the new server; the
-          // observed local state survives the swap.
+          // observed local state survives the swap. The annotation resets
+          // with the identity (a stale suffix must not outlive its server).
           for (const frame of merger.onRemoteGone()) channel.push(frame)
           merger.retarget(identity)
+          currentAnnotation = annotationOf(relay.state)
+          merger.setStatus(currentAnnotation)
         }
         const controller = new AbortController()
         currentController = controller
@@ -1303,6 +1471,23 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   const counters = { openWireStream: 0, dispatchRpc: 0 }
   const failures: InterceptFailureRecord[] = []
   const incompatible: IncompatibleCallRecord[] = []
+  // The closed-session registry (T34): insertion-ordered, capped, virtual-id
+  // keyed. Entries live until THEIR session proves reachable again (a
+  // succeeding call for it) — a reconnect clears nothing (T34-fix): a link
+  // that flapped under a still-standing closure would make the banner flicker
+  // away and back.
+  const closedSessions = new Map<string, ClosedSessionRecord['reason']>()
+  const registerClosed = (sessionId: string, reason: ClosedSessionRecord['reason']): void => {
+    closedSessions.delete(sessionId)
+    if (closedSessions.size >= MAX_CLOSED_SESSIONS) {
+      const oldest = closedSessions.keys().next()
+      if (oldest.done !== true) closedSessions.delete(oldest.value)
+    }
+    closedSessions.set(sessionId, reason)
+  }
+  const clearClosed = (virtuals: VirtualParts[]): void => {
+    for (const parts of virtuals) closedSessions.delete(toVirtual(parts.serverId, parts.id))
+  }
   let installed = true
   let selfCheck: SelfCheckResult | undefined
 
@@ -1394,7 +1579,19 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     }
     const endpoint = '$events/result'
     const current = getServerId()
-    if (current === undefined) return failEnvelope(endpoint, 'remote-offline', '尚未连接到服务端')
+    // Offline (T34-fix): a refusal envelope would RESTART the UI's whole
+    // `$events` generation — the client face's answer() throws on a
+    // `!response.ok` body and the pump treats that as a delivery failure
+    // (RT dsh-api-gateway lib/client.js: `if (!response.ok) throw new
+    // Error(response.error.message)` feeding `failed.abort(error)`), and the
+    // synthesized cancels the dying leg already sent have closed these
+    // prompts anyway. Answer the silent ok DSH itself gives a stale result,
+    // and record the refusal in the diagnostics ring instead — the
+    // non-online write-refusal message, so the banner's word matches.
+    if (current === undefined || relay.state !== 'online') {
+      failEnvelope(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
+      return { ok: true, value: undefined }
+    }
     if (virtual.serverId !== current) return failEnvelope(endpoint, 'remote-mismatch', '此远程会话属于其他主服务端')
     return (async (): Promise<DispatchEnvelope> => {
       try {
@@ -1426,6 +1623,13 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   ): Promise<DispatchEnvelope> {
     const verdict = validate(endpoint, virtuals)
     if (!verdict.ok) return failEnvelope(endpoint, verdict.code, verdict.message)
+    // A WRITE while the relay is not serving (T34, whitelist rule per
+    // T34-fix): refused here, never sent — the call could only fail out
+    // there, and the read paths answer for themselves (forwarded as today,
+    // failing with their own transport error).
+    if (isRemoteWrite(endpoint) && relay.state !== 'online') {
+      return failEnvelope(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
+    }
     const serverId = verdict.serverId
     const slash = endpoint.indexOf('/')
     const namespace = slash === -1 ? endpoint : endpoint.slice(0, slash)
@@ -1450,6 +1654,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         return failEnvelope(endpoint, 'remote-unsupported', '引用的会话不在服务端上，无法转发')
       }
       const value = await relay.invoke(namespace, method, clone, signal)
+      // The session answered: any closed-session entry for it is stale
+      // (re-shared and served again) — the banner may go.
+      clearClosed(virtuals)
       return { ok: true, value: rewriteResult(endpoint, value, serverId) }
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
@@ -1469,9 +1676,21 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     throw new CodedStreamError(code, text)
   }
 
-  async function* rewriteUpstream(endpoint: string, upstream: AsyncIterable<unknown>, serverId: string): AsyncGenerator<unknown> {
+  async function* rewriteUpstream(
+    endpoint: string,
+    upstream: AsyncIterable<unknown>,
+    serverId: string,
+    claimed: VirtualParts[],
+  ): AsyncGenerator<unknown> {
+    let first = true
     try {
       for await (const frame of upstream) {
+        if (first) {
+          first = false
+          // Frames are flowing: the session is being served again — a
+          // closed-session entry for it is stale (T34).
+          clearClosed(claimed)
+        }
         yield rewriteFrame(endpoint, frame, serverId)
       }
     } catch (error) {
@@ -1480,6 +1699,14 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // else travels as `internal`. Both are remote-call failures and land
       // in the diagnostics ring.
       const code = error instanceof RelayError ? error.code : 'internal'
+      // The server is no longer serving this session (T34): an `unshared`
+      // frame is the mid-stream closure with its structured reason; a
+      // `not-shared` refusal is the closure that happened before this page
+      // even opened — no event was observed, so the reason degrades to
+      // manual (T34-fix).
+      if (error instanceof RelayError && (code === 'unshared' || code === 'not-shared')) {
+        for (const parts of claimed) registerClosed(toVirtual(parts.serverId, parts.id), closedReasonOf(error))
+      }
       recordFailure(endpoint, code)
       throw new CodedStreamError(code, messageOf(error))
     }
@@ -1667,7 +1894,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // RelayError raised DURING iteration (unshared, offline, …) flows out of
     // the generator with its code attached, which is how the host's stream
     // channel hands the failure to the UI.
-    return rewriteUpstream(endpoint, upstream, serverId)
+    return rewriteUpstream(endpoint, upstream, serverId, virtuals)
   }
 
 
@@ -1699,6 +1926,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         ...(selfCheck !== undefined ? { selfCheck } : {}),
         recentFailures: [...failures],
         incompatibleCalls: [...incompatible],
+        closedSessions: [...closedSessions].map(([sessionId, reason]) => ({ sessionId, reason })),
       }
     },
     wrappedCalls() {

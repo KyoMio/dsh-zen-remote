@@ -115,6 +115,45 @@ export type DispatchEnvelope = {
         details: Record<string, unknown>;
     };
 };
+/**
+ * The READ methods of the client registry (T34, whitelist form per T34-fix):
+ * the methods allowed through while the relay is not `online`. Everything in
+ * {@link CLIENT_METHOD_FIELDS} NOT listed here is a WRITE and is refused
+ * locally with `remote-offline` while offline — a write can only fail out
+ * there, and the honest local answer beats a dead round-trip. Maintaining
+ * the READ side keeps the failure mode safe: a future table entry nobody
+ * classified lands on the write side (refused offline), never silently
+ * forwarded into a dead link.
+ *
+ * The read list, method by method:
+ *
+ * - every `stream: true` entry of the server table — a subscription
+ *   observes, it never mutates: `session/follow`, `session/control`,
+ *   `job/list`, `job/follow`, `workspace/follow`, and the T32
+ *   `$zr/events` pair entry (never client-dialed, listed for the table
+ *   guard);
+ * - `session/list` — the unscoped first-page read the merge route folds in;
+ * - `session/page` (history read), `session/projections` (control-key
+ *   read), `session/attachment` — verified against RT: it READS one durable
+ *   image back (base64), it does not attach anything;
+ * - `skills/list`, `messageFeedback/list`, `schedule/list` — list reads;
+ * - `fileReferences/list` (T31) — the @-reference listing; its put/delete
+ *   siblings would be writes, but only this listing is in the table.
+ *
+ * Everything else — `session/prompt|cancel|rename|selectModel|updateQueue`
+ * (send, cancel, rename, model switch, inbox mutation), `session/create` /
+ * `session/fork` (T31: new sessions on the server), `subagents/prompt` /
+ * `subagents/interruptByParent` (T31: prompt/interrupt a remote subagent),
+ * `fileUploads/upload` (T31: attachments into a remote session), `job/kill`,
+ * `messageFeedback/put|delete`, the workspace session-list mutations, and
+ * the T41a mutations (`goals/edit|pause|resume|clear`, `commands/execute`,
+ * `agentPresets/select`, `sessionFeedback/record`,
+ * `terminal/create|write|resize|rename|close`) — is a write.
+ */
+export declare const REMOTE_READ_METHODS: ReadonlySet<string>;
+/** Whether `endpoint` (a client-table method) is a remote WRITE: anything
+ * the read whitelist does not name (T34-fix). */
+export declare function isRemoteWrite(endpoint: string): boolean;
 /** One remote-call failure in the diagnostics ring. */
 export interface InterceptFailureRecord {
     /** ISO timestamp of the moment the failure was recorded. */
@@ -159,6 +198,23 @@ export type SelfCheckResult = {
     ok: false;
     reason: string;
 };
+/**
+ * One remote session the SERVER is no longer serving to this device (T34,
+ * refined by T34-fix): the virtual id plus the close reason ('manual' |
+ * 'client' | 'idle'; anything uncertain reads 'manual'). Two sources: an
+ * `unshared` error frame on a session stream that was OPEN, and a
+ * session-scoped stream refused `not-shared` at open (the closure happened
+ * before this page arrived — no event was ever observed, so the reason
+ * degrades to manual). Drives the session page's 远程已关闭 banner and the
+ * `remote-status` route's `closed` map. Cleared PER SESSION only, when a
+ * call for it succeeds again (re-shared and served) — never wholesale on a
+ * reconnect: a link that flapped while the server still holds the closure
+ * would otherwise flash the banner away and back (T34-fix).
+ */
+export interface ClosedSessionRecord {
+    sessionId: string;
+    reason: 'manual' | 'client' | 'idle';
+}
 /** What the client status route surfaces about the interception. Contains
  * only shapes, counters and codes — never a token. */
 export interface InterceptDiagnostics {
@@ -173,6 +229,9 @@ export interface InterceptDiagnostics {
      * capped at 50 — the runtime-degradation half of the version-tolerance
      * diagnostics. */
     incompatibleCalls: IncompatibleCallRecord[];
+    /** Remote sessions closed server-side while a page had them open (T34),
+     * oldest first, capped at 200. */
+    closedSessions: ClosedSessionRecord[];
 }
 export interface InstallInterceptOptions {
     /** The RAW gateway instance (`ctx.typertGateway[symbols.original]`), not
