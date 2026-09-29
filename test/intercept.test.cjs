@@ -2661,6 +2661,34 @@ test('T52-fix2: the online transition fetches the server catalog proactively; fa
   assert.equal(relay.invokes.length, 3, 'no fetch after uninstall')
 })
 
+test('T5x: after a pairing wall the same server going offline never serves the pre-unpair cache', async () => {
+  // The drop must not depend on a catalog call happening to run while the
+  // wall stands: unpair → (no call) → re-pair to the SAME server that cannot
+  // be reached lands offline, and a refreshed dropdown must not resurrect
+  // the pre-unpair groups. The install subscribes to the relay's states, so
+  // the transition itself is the drop.
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  gateway.spec.rpc = { 'session/modelCatalog': { ok: true, value: LOCAL_CATALOG } }
+  relay.invokeValue = SERVER_CATALOG
+  const { handle } = install(gateway, relay)
+
+  // Online: the fetch fills the cache and the merge carries the server group.
+  const merged = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.equal(merged.ok, true)
+  assert.equal(merged.value.groups.length, 3, 'the server group merged in while online')
+
+  // The wall rises — and NO catalog call observes it (nothing is asked while
+  // unpaired; the next call only comes after the offline re-pair attempt).
+  relay.transition('unpaired')
+  relay.transition('offline')
+  const offline = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+  assert.equal(offline.ok, true)
+  assert.deepEqual(offline.value, LOCAL_CATALOG, 'the pre-unpair groups never served again for the same server id')
+  assert.equal(relay.invokes.length, 1, 'offline serves no relay ask either')
+  handle.uninstall()
+})
+
 test('T52: session/selectModel routes the provider by session context', async () => {
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()
