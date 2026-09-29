@@ -1435,3 +1435,105 @@ test('the wiring uninstalls when the self-check fails (unreachable wrap)', async
   assert.equal(status.intercept.selfCheck.ok, false)
   for (const disposer of effects) disposer()
 })
+
+// -- T31: create / fork / subagents / agentId calls ----------------------------------
+
+test('session/create rewrites the virtual workspaceId, drops sessionId, virtualizes the result id', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { sessionId: 'session-fresh', agentPreset: 'default' }
+  const { handle } = install(gateway, relay)
+  const workspaceVirtual = toVirtual(SERVER_ID, 'workspace-9f0')
+  const args = { request: { workspaceId: workspaceVirtual, cwd: '/client/side', sessionId: 'session-chosen-locally' } }
+  const envelope = await gateway.rpcBridge('session/create', { args }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(envelope.value, { sessionId: toVirtual(SERVER_ID, 'session-fresh'), agentPreset: 'default' }, 'the minted id travels virtualized')
+  assert.deepEqual(relay.invokes, [{
+    namespace: 'session',
+    method: 'create',
+    args: { request: { workspaceId: 'workspace-9f0', cwd: '/client/side' } },
+    signal: undefined,
+  }], 'the original workspace id travels, cwd rides as-is (the server discards it), and the caller-chosen session id is gone')
+  assert.equal(args.request.workspaceId, workspaceVirtual, 'the caller arguments are never mutated')
+  handle.uninstall()
+})
+
+test('session/create in a LOCAL workspace passes through untouched', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const args = { request: { workspaceId: 'local-workspace-uuid', cwd: '/tmp' } }
+  await gateway.rpcBridge('session/create', { args }, undefined, undefined)
+  assert.equal(relay.invokes.length, 0, 'nothing was forwarded')
+  assert.equal(gateway.rpcCalls.length, 1, 'the local gateway answered')
+  assert.deepEqual(gateway.rpcCalls[0].payload.args, args, 'a local create is not stripped of anything')
+  handle.uninstall()
+})
+
+test('session/fork forwards the restored source id and virtualizes the child id', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { sessionId: 'session-forked' }
+  const { handle } = install(gateway, relay)
+  const envelope = await gateway.rpcBridge('session/fork', { args: { request: { sessionId: VIRTUAL_ID, atSeq: 12 } } }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.deepEqual(envelope.value, { sessionId: toVirtual(SERVER_ID, 'session-forked') })
+  assert.deepEqual(relay.invokes[0].args, { request: { sessionId: LOCAL_ID, atSeq: 12 } })
+  handle.uninstall()
+})
+
+test('subagents calls rewrite only the parent slot (request envelope and top level alike)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const childId = 'session-child-original'
+
+  await gateway.rpcBridge('subagents/prompt', {
+    args: { request: { requestId: 'r1', parentSessionId: toVirtual(SERVER_ID, 'session-parent'), childSessionId: childId, mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: 'hi' }] } },
+  }, undefined, undefined)
+  assert.deepEqual(relay.invokes[0].args.request, {
+    requestId: 'r1',
+    parentSessionId: 'session-parent',
+    childSessionId: childId,
+    mode: 'continuable',
+    delivery: 'queue',
+    content: [{ type: 'text', text: 'hi' }],
+  }, 'the parent id is restored; the child id is already the server-side original')
+
+  await gateway.rpcBridge('subagents/interruptByParent', {
+    args: { childSessionId: childId, parentSessionId: toVirtual(SERVER_ID, 'session-parent'), mode: 'continuable' },
+  }, undefined, undefined)
+  assert.deepEqual(relay.invokes[1].args, { childSessionId: childId, parentSessionId: 'session-parent', mode: 'continuable' }, 'the TOP-LEVEL parent slot is restored')
+  handle.uninstall()
+})
+
+test('the agentId calls restore the top-level agentId and pass everything else through', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValue = { receiptId: 'r-1', file: { attachmentId: 'a-1', name: 'x.png', bytes: 3 } }
+  const { handle } = install(gateway, relay)
+
+  const uploadArgs = { agentId: VIRTUAL_ID, request: { data: 'Zm9v', name: 'x.png' } }
+  const uploaded = await gateway.rpcBridge('fileUploads/upload', { args: uploadArgs }, undefined, undefined)
+  assert.equal(uploaded.ok, true)
+  assert.equal(uploaded.value, relay.invokeValue, 'receipt and attachment ids are not session ids — untouched')
+  assert.deepEqual(relay.invokes[0].args, { agentId: LOCAL_ID, request: { data: 'Zm9v', name: 'x.png' } })
+
+  const refsArgs = { agentId: VIRTUAL_ID, query: 'src/' }
+  await gateway.rpcBridge('fileReferences/list', { args: refsArgs }, undefined, undefined)
+  assert.deepEqual(relay.invokes[1].args, { agentId: LOCAL_ID, query: 'src/' })
+  handle.uninstall()
+})
+
+test('an unregistered agentId-located method with a virtual agentId is still refused', async () => {
+  // The registry grew, but the deep-scan backstop has not loosened: a virtual
+  // id anywhere outside the table never reaches the local gateway.
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const envelope = await gateway.rpcBridge('goals/create', { args: { agentId: VIRTUAL_ID, request: { objective: 'x', maxGoalRounds: 1 } } }, undefined, undefined)
+  assert.deepEqual(envelope, { ok: false, error: { code: 'remote-unsupported', message: '此功能暂不支持远程会话', details: {} } })
+  assert.equal(relay.invokes.length, 0)
+  assert.equal(gateway.rpcCalls.length, 0)
+  handle.uninstall()
+})

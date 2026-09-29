@@ -29,12 +29,26 @@ const { installIntercept } = require('../lib/intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
-// Far from every other file's fixture ports (the 392xx band).
-const GW_PORT = 39301
-const TARGET_PORT = 39302
-const PROXY_PORT = 39303
+// T31-fix: every port is system-assigned so parallel test-run copies cannot
+// collide. The proxy and the relay-handler server listen(0) and read their
+// bound port back; the gateway child needs a fixed port parameter, so boot()
+// pre-grabs a free port (bind → read → release) and hands it over — the
+// gateway's own same-port retry band absorbs the small rebind race, and a
+// RESTART reuses the same number (freed by the previous child's SIGTERM).
+// The proxy reads `gwPort` at request time, so it always routes to the
+// current boot's child.
+let gwPort = 0
 const SECRET = '7e6a5b4c3d2e1f00'.repeat(4)
 const SERVER_NAME = '端到端服务器'
+
+/** One free loopback port: bound, read, released. */
+async function freePort() {
+  const server = http.createServer()
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  await new Promise((resolve) => server.close(resolve))
+  return port
+}
 
 /**
  * The reverse proxy every real deployment puts in front of the gateway. In
@@ -60,7 +74,7 @@ function startProxy() {
     let upstream
     // A client hang-up mid-stream must reach the gateway as a disconnect.
     res.on('close', () => { try { if (upstream !== undefined) upstream.destroy() } catch { /* gone */ } })
-    upstream = http.request({ host: '127.0.0.1', port: GW_PORT, method: req.method, path: req.url, headers }, (upRes) => {
+    upstream = http.request({ host: '127.0.0.1', port: gwPort, method: req.method, path: req.url, headers }, (upRes) => {
       const out = { ...upRes.headers }
       delete out['transfer-encoding']
       delete out.connection
@@ -81,11 +95,15 @@ function startProxy() {
     server.closeAllConnections()
     server.close(resolve)
   })
-  return new Promise((resolve) => server.listen(PROXY_PORT, '127.0.0.1', () => resolve({ server, stop })))
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, stop })))
 }
 
 let proxy
-test.before(async () => { proxy = await startProxy() })
+let proxyPort = 0
+test.before(async () => {
+  proxy = await startProxy()
+  proxyPort = proxy.port
+})
 test.after(async () => { if (proxy) await proxy.stop() })
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-relay-e2e-'))
@@ -169,7 +187,8 @@ async function boot(opts = {}) {
     ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
   })
   const server = http.createServer((req, res) => { handler(req, res).catch(() => { try { res.destroy() } catch { /* gone */ } }) })
-  await new Promise((resolve) => server.listen(TARGET_PORT, '127.0.0.1', resolve))
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const targetPort = server.address().port
 
   const env = { store, invokeCalls, streams, handler }
   // T43: every client this boot created is remembered so the teardown can
@@ -177,20 +196,23 @@ async function boot(opts = {}) {
   // otherwise keep firing retries into test N+1's gateway.
   const allClients = []
   const registerClient = (client) => { allClients.push(client); return client }
-  let gw = startGatewayAt(home, GW_PORT, TARGET_PORT, { LAN_GATE_RELAY_SECRET: SECRET })
+  // Pre-grab a free port for the child (bind → read → release), then start
+  // it on that number.
+  gwPort = await freePort()
+  let gw = startGatewayAt(home, gwPort, targetPort, { LAN_GATE_RELAY_SECRET: SECRET })
   await gw.ready
-  const paired = await pairDesktop(GW_PORT, '端到端台式机')
+  const paired = await pairDesktop(gwPort, '端到端台式机')
   const token = paired.token
   env.deviceId = paired.id
   // The client reaches the gateway THROUGH the proxy hop, like any desktop
   // client behind its server's reverse proxy.
   env.client = registerClient(createRelayClient({
-    getServerUrl: () => `http://127.0.0.1:${PROXY_PORT}`,
+    getServerUrl: () => `http://127.0.0.1:${proxyPort}`,
     getToken: () => token,
   }))
   // A second client with custom tuning against the SAME paired device.
   env.tunedClient = (overrides = {}) => registerClient(createRelayClient({
-    getServerUrl: () => `http://127.0.0.1:${PROXY_PORT}`,
+    getServerUrl: () => `http://127.0.0.1:${proxyPort}`,
     getToken: () => token,
     ...overrides,
   }))
@@ -202,7 +224,9 @@ async function boot(opts = {}) {
     child.kill('SIGTERM')
   })
   env.restartGateway = async () => {
-    gw = startGatewayAt(home, GW_PORT, TARGET_PORT, { LAN_GATE_RELAY_SECRET: SECRET })
+    // The SAME port the first child drew: it was freed by the SIGTERM and
+    // the gateway's same-port retry band absorbs the teardown tail race.
+    gw = startGatewayAt(home, gwPort, targetPort, { LAN_GATE_RELAY_SECRET: SECRET })
     await gw.ready
   }
   env.stop = async () => {
@@ -405,7 +429,7 @@ test('e2e: revoking the device on the gateway turns the next invoke into revoked
   try {
     await env.client.connect()
     assert.equal(env.client.state, 'online')
-    const action = await request(GW_PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
+    const action = await request(gwPort, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
     assert.equal(action.status, 200)
     await assert.rejects(
       () => env.client.invoke('session', 'page', FOLLOW_ARGS),
@@ -484,7 +508,7 @@ test('e2e T43: a device revoked while the client is in the retry loop lands revo
     await env.client.connect()
     // Revoke behind the client's back, then take the chain down: the client
     // walks its ladder against a dead proxy.
-    const action = await request(GW_PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
+    const action = await request(gwPort, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
     assert.equal(action.status, 200)
     await env.killGateway()
     await assert.rejects(() => env.client.invoke('session', 'page', FOLLOW_ARGS), (error) => error.code === 'offline')
