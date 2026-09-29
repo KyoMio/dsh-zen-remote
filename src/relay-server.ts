@@ -37,6 +37,7 @@ import {
   createWorkspaceFollowState,
   filterControlFrame,
   filterJobListFrame,
+  filterModelCatalogResult,
   filterSessionListResult,
   filterWorkspaceFrame,
 } from './relay-filter.js'
@@ -1044,13 +1045,18 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         }
         // T41a-fix: the @ resolver names EVERY server session in its answer —
         // a row the share table cannot reach never travels (the session/list
-        // discipline).
+        // discipline). T52-fix: the model catalog's answer leaves with its
+        // `failures` emptied — the host's per-group error texts may carry
+        // endpoint or credential details (relay-filter.ts
+        // filterModelCatalogResult).
         const travels =
           decision.filter === 'session-list'
             ? filterSessionListResult(value, isAccessible)
             : decision.filter === 'session-reference-candidates'
               ? filterAccessibleCandidateRows(value, isAccessible)
-              : value
+              : decision.filter === 'model-catalog'
+                ? filterModelCatalogResult(value)
+                : value
         responseJson(res, 200, { ok: true, value: travels })
       } catch (error) {
         // The gateway's own failures (unknown namespace, absent service) are

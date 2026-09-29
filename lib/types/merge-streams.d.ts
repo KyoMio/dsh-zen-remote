@@ -204,8 +204,17 @@ export declare function createControlMerger(options: ControlMergerOptions): Cont
  * the remote items are appended with virtualized session ids — `sessionId`
  * AND `parentSessionId` (CP4): the fork link must point at the VIRTUAL parent
  * id the UI knows, or the fork would sort beside a parent id that exists in
- * no list the UI holds. A missing or malformed remote result means "remote
- * said nothing" — the local result passes back untouched.
+ * no list the UI holds — and a T52-fix rewrite of the row's own projections
+ * block: a list row carries `{kind:'cached'|'sequenced', asOfSeq, values}`
+ * (RT dsh-api-session-controller lib/typert.remote-client.js:381-428) and the
+ * client face applies it PER SESSION (lib/client.js:2633 → applyListBlock
+ * :2842-2855) — a `sequenced` modelSelection lands under higher-seq-wins
+ * (lib/client.js:986-995, `seq <= row.seq` rejects), and the control stream's
+ * REWRITTEN frame rides that projection's OWN seq, so an original-provider
+ * value left in a row would poison the store forever: the remote session's
+ * dropdown would show the raw `provider/model` fallback with no check mark.
+ * A missing or malformed remote result means "remote said nothing" — the
+ * local result passes back untouched.
  */
 export declare function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string): unknown;
 /**
@@ -231,7 +240,13 @@ export declare function mergeSessionList(localResult: unknown, remoteResult: unk
  *   from here and would put a permanent alarm on every dropdown, so it does
  *   not travel (dsh-vision-router's settings read the same result and shows
  *   an error state exactly when groups are empty AND failures exist,
- *   lib/client.js:635-647 — dropping remote failures keeps that honest);
+ *   lib/client.js:635-647 — dropping remote failures keeps that honest).
+ *   KNOWN BOUNDARY (pre-T52 behavior, unchanged): a NEW server session's
+ *   projection `next` is null until its first selection or turn, so the UI
+ *   shows `catalog.value.default` — the LOCAL default — as that session's
+ *   current model (RT dsh-client-ui-model-selection lib/client.js:316,
+ *   `projected?.next ?? catalog.value?.default`), which may differ from what
+ *   the server would actually run until its first selection lands.
  * - `routableProviders` mirrors the group ids by construction host-side
  *   (RT dsh-api-session-controller lib/index.js:544 — literally
  *   `groups.map(g => g.id)`); no client UI reads it (the dropdown's

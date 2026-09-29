@@ -481,6 +481,49 @@ test('mergeSessionList: a missing or malformed remote result returns the local r
   assert.deepEqual(mergeSessionList({ ok: 1 }, { items: [] }, SID), { ok: 1, items: [] })
 })
 
+test('T52-fix mergeSessionList: a row\'s projections.modelSelection is virtualized — a sequenced block must not poison the projection store', () => {
+  // RT dsh-api-session-controller lib/typert.remote-client.js:381-428: a
+  // list row carries {kind:'cached'|'sequenced', asOfSeq, values}; the client
+  // face applies it per session (lib/client.js:2633 → applyListBlock
+  // :2842-2855) and a sequenced modelSelection lands under higher-seq-wins
+  // (lib/client.js:986-995) — the control stream's rewritten frame rides the
+  // SAME seq, so an original-provider value here would permanently win.
+  const selection = { lastUsed: { provider: 'codex', model: 'sol' }, next: { provider: 'codex', model: 'sol' } }
+  const local = { items: [{ sessionId: 'session-local', updatedAt: 9 }] }
+  const remote = {
+    items: [
+      {
+        sessionId: 's1',
+        updatedAt: 2,
+        projections: { kind: 'sequenced', asOfSeq: 7, values: { modelSelection: selection, title: '远端' } },
+      },
+      // cached kind gets the same rewrite — the store applies it wherever no
+      // sequenced row holds (lib/client.js:1004-1013).
+      { sessionId: 's2', updatedAt: 3, projections: { kind: 'cached', asOfSeq: 1, values: { modelSelection: selection } } },
+      // a row without a projections block (or without a modelSelection key)
+      // passes untouched.
+      { sessionId: 's3', updatedAt: 4 },
+      { sessionId: 's4', updatedAt: 5, projections: { kind: 'sequenced', asOfSeq: 2, values: { title: '无模型' } } },
+    ],
+  }
+  const merged = mergeSessionList(local, remote, SID)
+  const [r1, r2, r3, r4] = merged.items.slice(1)
+  assert.deepEqual(r1.projections.values.modelSelection, {
+    lastUsed: { provider: V('codex'), model: 'sol' },
+    next: { provider: V('codex'), model: 'sol' },
+  })
+  assert.equal(r1.projections.kind, 'sequenced', 'kind and seq ride unchanged')
+  assert.equal(r1.projections.asOfSeq, 7)
+  assert.equal(r1.projections.values.title, '远端', 'the other projection values stay verbatim')
+  assert.equal(r2.projections.values.modelSelection.next.provider, V('codex'))
+  assert.equal(r3.projections, undefined)
+  assert.deepEqual(r4.projections.values, { title: '无模型' })
+  // the LOCAL rows never enter the rewrite (their ids and blocks are local)
+  assert.deepEqual(merged.items[0], { sessionId: 'session-local', updatedAt: 9 })
+  // inputs untouched
+  assert.equal(remote.items[0].projections.values.modelSelection.lastUsed.provider, 'codex')
+})
+
 test('mergeSessionList: parentSessionId is virtualized with the row (CP4) — the fork link must point at the id the UI knows', () => {
   const local = { items: [] }
   const remote = {

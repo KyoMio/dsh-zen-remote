@@ -107,14 +107,15 @@ test('decideInvoke: session/list is allowed without any session field, result ma
 
 // -- T52: session/modelCatalog — the field-less global read with a clean result ----
 
-test('decideInvoke: session/modelCatalog is allowed without any session field and carries no filter', () => {
+test('decideInvoke: session/modelCatalog is allowed without any session field, result marked model-catalog', () => {
   // The method has NO parameters (RT dsh-api-session-controller
   // lib/typert.remote-client.js:1019) and its result is the provider
-  // directory — group/model ids and names only, nothing session-scoped — so
-  // unlike session/list it needs no result filter: the access decision is
-  // unconditional and the whole result travels.
-  assert.deepEqual(decideInvoke('session', 'modelCatalog', {}, no), { allow: true })
-  assert.deepEqual(decideInvoke('session', 'modelCatalog', undefined, no), { allow: true })
+  // directory — group/model ids and names only, nothing session-scoped. The
+  // result filter (T52-fix) only EMPTIES `failures`: the host's per-group
+  // error texts may carry endpoint or credential details the client never
+  // shows (it keeps its own local failures instead).
+  assert.deepEqual(decideInvoke('session', 'modelCatalog', {}, no), { allow: true, filter: 'model-catalog' })
+  assert.deepEqual(decideInvoke('session', 'modelCatalog', undefined, no), { allow: true, filter: 'model-catalog' })
   // Invoke-delivered only: riding the stream route is forbidden-method like
   // any other invoke entry.
   assert.deepEqual(decideStream('session', 'modelCatalog', {}, yes), { allow: false, reason: 'forbidden-method' })

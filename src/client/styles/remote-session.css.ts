@@ -50,4 +50,27 @@ html[data-zr-remote-session="1"] [role="menu"] section[role="group"]:not([aria-l
 html:not([data-zr-remote-session]) [role="menu"] section[role="group"][aria-labelledby*="zr~"] {
   display: none !important;
 }
+
+/* ---------- T52-fix: hide the virtual groups in NATIVE <option> pickers ----
+   The model menu above is React DOM, but dsh-vision-router's settings render
+   its vision-backend picker as a native <select> of <option value={group.id}>
+   rows, and its filter (dsh-vision-router lib/client.js:661-670
+   filterVisionBackendGroups) drops only vision-http / vision-chain / *-vision
+   — a merged virtual group ("zr~<id>~…") survives into that picker even
+   though a server model can never be a LOCAL vision backend (the router calls
+   providers from the machine it runs on). Native <option> rows honor
+   display:none in the dropdown list, so this hides them wherever they appear:
+   - no scoping attribute on purpose: a virtual group is not a runnable
+     backend in ANY local context, and the option element itself carries the
+     value — no host-depth assumption, no :has();
+   - when the vision router (or any other <option>-rendering surface) is not
+     installed, nothing matches — dead rule, zero cost;
+   - zen-remote's own surfaces are checked: our settings forms render fixed
+     enum options ("web" / "desktop-client" / role kinds /
+     configForm enum strings, src/client/settings/SettingsSection.tsx:641,690-701)
+     and none can start with "zr~" (virtual group ids only ever exist inside
+     model-catalog payloads and model-selection arguments). */
+option[value^="zr~"] {
+  display: none !important;
+}
 `
