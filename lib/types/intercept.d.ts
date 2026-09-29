@@ -276,14 +276,10 @@ export interface InterceptHandle {
      * failure — the wiring owns that decision, this only records). */
     noteSelfCheck(result: SelfCheckResult): void;
 }
-/** Rewrite one stream frame's session ids to virtual form. `serverGroups` is
- * the server catalog's original group ids (T52-fix2) — the modelSelection
- * rewrite below only virtualizes a provider it lists. */
-export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string, serverGroups?: ReadonlySet<string>): unknown;
-/** Rewrite one invoke result's session ids to virtual form. `serverGroups` is
- * the server catalog's original group ids (T52-fix2) — the modelSelection and
- * selectModel-echo rewrites below only virtualize a provider it lists. */
-export declare function rewriteResult(endpoint: string, value: unknown, serverId: string, serverGroups?: ReadonlySet<string>): unknown;
+/** Rewrite one stream frame's session ids to virtual form. */
+export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown;
+/** Rewrite one invoke result's session ids to virtual form. */
+export declare function rewriteResult(endpoint: string, value: unknown, serverId: string): unknown;
 /**
  * Rewrite one SERVER-side `$events` frame for the local UI (T32), or `null`
  * to drop it. Wire shapes verified against dsh-api-gateway (frames:

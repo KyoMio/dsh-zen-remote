@@ -86,12 +86,22 @@
  * into the local one (the catalog is the model-selection dropdown's data), and
  * {@link virtualizeModelSelectionValue} rewrites a `modelSelection` projection
  * value's provider ids to virtual group ids so the UI can find the current
- * model's display name in the merged catalog — CONDITIONALLY since T52-fix2:
- * a provider the server's own catalog does not list (its groups have no such
- * id — the observed `codex` case against a DeepSeek-only server) must stay
- * ORIGINAL, because the merged catalog carries no virtual group for it and the
- * UI's fallback would otherwise show the raw `zr~<serverId>~codex` string.
- * {@link catalogGroupIds} is the membership set one catalog value names.
+ * model's display name in the merged catalog.
+ *
+ * T52-fix2 made that rewrite CONDITIONAL on the server catalog listing the
+ * provider; T52-fix3 reverts it to UNCONDITIONAL, and the revert is final:
+ * the host's projection store is FIRST-WRITE-WINS per sequence number
+ * (dsh-api-session-controller lib/client.js:986-994 —
+ * `if (row?.kind === "sequenced" && seq <= row.seq) return`, and the
+ * seed / list blocks take the same road). A projection rewritten ORIGINAL
+ * while the catalog had not landed yet occupies its seq; when the catalog
+ * arrives, the same seq's VIRTUAL value is dropped as stale — the server
+ * group never gets its check mark, and resubmitting a reasoning effort
+ * echoes the ORIGINAL provider back, which `session/selectModel`'s routing
+ * refuses ("请选择「服务端 · …」分组里的模型"). The rewrite of ONE provider
+ * must therefore not depend on when the catalog happened to arrive. The
+ * accepted cost: a provider absent from the server's OWN catalog renders the
+ * `zr~<serverId>~provider/model` fallback string (the pre-fix2 display).
  */
 /** The (serverId, serverName) pair a merger virtualizes with. A re-handshake
  * with a different server retargets the SAME merger ({@link retarget}) so the
@@ -167,13 +177,6 @@ export interface ControlMergerOptions {
     serverId: string;
     serverName?: string;
     onDiagnostic?: (message: string) => void;
-    /** The ORIGINAL group ids of the current server's last fetched model
-     * catalog (T52-fix2), read LIVE per frame — the cache fills as soon as the
-     * relay serves, which can be long after this stream opened. `undefined`
-     * (no catalog yet) and an id the set lacks both leave a modelSelection
-     * provider ORIGINAL: the merged catalog has no virtual group for it, so
-     * virtualizing would only teach the UI the raw `zr~…` fallback string. */
-    serverProviders?: (serverId: string) => ReadonlySet<string> | undefined;
 }
 export interface ControlMerger {
     readonly serverId: string;
@@ -225,13 +228,12 @@ export declare function createControlMerger(options: ControlMergerOptions): Cont
  * REWRITTEN frame rides that projection's OWN seq, so an original-provider
  * value left in a row would poison the store forever: the remote session's
  * dropdown would show the raw `provider/model` fallback with no check mark.
- * The rewrite is catalog-gated like every route's (T52-fix2): only a provider
- * the server's own catalog lists becomes the virtual group id, and a missing
- * `serverGroups` (cache not ready) rewrites nothing. A missing or malformed
- * remote result means "remote said nothing" — the
- * local result passes back untouched.
+ * The rewrite is UNCONDITIONAL (T52-fix3): first-write-wins per seq forbids
+ * a catalog gate — a row rewritten while the catalog was missing would
+ * occupy the seq forever. A missing or malformed remote result means "remote
+ * said nothing" — the local result passes back untouched.
  */
-export declare function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string, serverGroups?: ReadonlySet<string>): unknown;
+export declare function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string): unknown;
 /**
  * Fold the relay's `session/modelCatalog` answer into the local one (T52).
  * The result shape is RT dsh-api-session-controller
@@ -274,18 +276,6 @@ export declare function mergeSessionList(localResult: unknown, remoteResult: unk
  */
 export declare function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, identity: MergerIdentity): unknown;
 /**
- * The ORIGINAL group ids one `session/modelCatalog` value names (T52-fix2) —
- * the membership set the provider rewrites judge against. Group ids are the
- * provider identity on both wire sides (a `session/selectModel` request
- * carries a group id as its `provider`, and the projections echo it back), so
- * "the catalog has this provider" means exactly "some group's id equals it".
- * Groups without a usable id are skipped, as {@link mergeModelCatalogs} does;
- * a malformed value yields an empty set — not `undefined`: an EMPTY set is a
- * fetched-but-groupless catalog (rewrites nothing, truthfully), while the
- * caller passes `undefined` only when no catalog was ever fetched.
- */
-export declare function catalogGroupIds(value: unknown): ReadonlySet<string>;
-/**
  * Virtualize the provider ids inside one `modelSelection` projection value —
  * `{lastUsed: {provider, model, reasoningEffort?} | null, next: …}` (RT
  * dsh-api-session-controller lib/types/model-selection-projection.js:12-15,
@@ -298,16 +288,16 @@ export declare function catalogGroupIds(value: unknown): ReadonlySet<string>;
  * shows the model NAME instead of the raw `provider/model` fallback string
  * (lib/client.js:700).
  *
- * CONDITIONAL since T52-fix2: a provider the server's own catalog does not
- * list — `serverGroups` given and the id absent — stays ORIGINAL. The merged
- * catalog has no virtual group for it, so a rewritten value would send the UI
- * to its raw-string fallback WITH the `zr~…` prefix visible (`zr~<serverId>~
- * codex/gpt-5.6-sol`, the isolated-repro finding); the original id at least
- * renders as the plain `provider/model` string, the pre-T52 display. The same
- * for `serverGroups === undefined`: no catalog was fetched yet (the relay's
- * online fetch has not landed, or it failed), so there is nothing to judge
- * against. Nulls and malformed entries pass through untouched in every case;
- * `model` and `reasoningEffort` are group-agnostic ids and stay as they are.
+ * UNCONDITIONAL by decision (T52-fix3, reverting T52-fix2's catalog gate):
+ * the host's projection store is first-write-wins per sequence number
+ * (lib/client.js:986-994), so whether a value is rewritten may not depend on
+ * WHEN the catalog happened to arrive — an original written pre-catalog
+ * occupies the seq and the later virtual value is dropped, leaving the
+ * server group unchecked and the next reasoning-effort submit refused.
+ * Accepted cost: a provider the server's own catalog does not list renders
+ * the `zr~<serverId>~provider/model` fallback string. Nulls and malformed
+ * entries pass through untouched; `model` and `reasoningEffort` are
+ * group-agnostic ids and stay as they are.
  */
-export declare function virtualizeModelSelectionValue(value: unknown, serverId: string, serverGroups?: ReadonlySet<string>): unknown;
+export declare function virtualizeModelSelectionValue(value: unknown, serverId: string): unknown;
 //# sourceMappingURL=merge-streams.d.ts.map

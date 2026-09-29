@@ -205,6 +205,13 @@ async function boot(opts = {}) {
   const gateway = {
     invoke: async (call) => {
       invokeCalls.push(call)
+      // T52-fix3: the client fetches the model catalog proactively as soon as
+      // it serves (install into an online relay, every online transition) —
+      // the real server has answered this global read since T52, so the fake
+      // does too: an empty catalog, no session data anywhere.
+      if (call.namespace === 'session' && call.method === 'modelCatalog') {
+        return { default: null, routableProviders: [], groups: [], failures: [] }
+      }
       if (invoke !== undefined) return invoke(call)
       throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
     },
@@ -991,8 +998,11 @@ test('e2e T41a: terminal/create + terminal/follow work through the sub-client, a
     const created = await localGateway.rpcBridge('terminal/create', { args: { agentId: V('session-a'), request: { id: 'term-e2e', cols: 80, rows: 24 } } }, undefined, undefined)
     assert.equal(created.ok, true)
     assert.deepEqual(created.value, { id: 'term-e2e', title: 'zsh', shell: { path: '/bin/zsh', args: [], name: 'zsh' }, cwd: '/srv', cols: 80, rows: 24, state: 'running', exitCode: null })
-    assert.equal(env.invokeCalls.length, 1)
-    assert.deepEqual(env.invokeCalls[0].args, { agentId: 'session-a', request: { id: 'term-e2e', cols: 80, rows: 24 } }, 'the ORIGINAL session id reached the server')
+    // Two invokes reached the fake gateway: the T52-fix3 install-time
+    // modelCatalog fetch (the relay was already online when the intercept
+    // installed) and the terminal create itself.
+    assert.equal(env.invokeCalls.length, 2)
+    assert.deepEqual(env.invokeCalls[1].args, { agentId: 'session-a', request: { id: 'term-e2e', cols: 80, rows: 24 } }, 'the ORIGINAL session id reached the server')
 
     // follow rides the stream route; the fake gateway echoes an output frame.
     const stream = await localGateway.wireTap('terminal/follow', { args: { agentId: V('session-a'), id: 'term-e2e', attachmentId: 'att-e2e' } }, undefined, undefined, undefined, { signal: undefined })
