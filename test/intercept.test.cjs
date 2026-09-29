@@ -1926,15 +1926,16 @@ test('rewriteRemoteEventFrame: waterfall ids go virtual in place, cancel matches
   // must never mistake for local sessions.
   const emit = { type: 'emit', event: 'api-session/added', args: [{ sessionId: 's', title: '服务端会话' }] }
   assert.equal(rewriteRemoteEventFrame(emit, SERVER_ID), null)
-  // A frame missing its ids stays a valid frame of the same shape.
-  assert.deepEqual(rewriteRemoteEventFrame({ type: 'waterfall', event: 'e', eventId: 3, agentId: 4, request: {} }, SERVER_ID), {
-    type: 'waterfall',
-    event: 'e',
-    eventId: 3,
-    agentId: 4,
-    request: {},
-  })
-  assert.deepEqual(rewriteRemoteEventFrame('junk', SERVER_ID), 'junk')
+  // Everything the client face's parseRemoteEventFrame would refuse is
+  // dropped BEFORE the UI sees it (T32-fix2, mirroring the server's own
+  // forwardable-shape gate): a malformed frame would fail the UI's whole
+  // $events generation and leave it failing and reconnecting in a loop.
+  assert.equal(rewriteRemoteEventFrame({ type: 'waterfall', event: 'e', eventId: 3, agentId: 4, request: {} }, SERVER_ID), null, 'non-string ids')
+  assert.equal(rewriteRemoteEventFrame({ type: 'waterfall', event: 'e', eventId: 'e1' }, SERVER_ID), null, 'missing fields')
+  assert.equal(rewriteRemoteEventFrame({ ...waterfall, extra: 1 }, SERVER_ID), null, 'an extra field breaks exact keys')
+  assert.equal(rewriteRemoteEventFrame({ ...waterfall, request: { toolName: 'a', agent: 'x' } }, SERVER_ID), null, 'request carrying agent')
+  assert.equal(rewriteRemoteEventFrame({ type: 'nonsense', eventId: 'e1' }, SERVER_ID), null, 'unknown type')
+  assert.equal(rewriteRemoteEventFrame('junk', SERVER_ID), null, 'not even an object')
 })
 
 // -- T32: the merged $events stream ---------------------------------------------------
@@ -2204,6 +2205,22 @@ test('$events/result: an already-over event answers silent ok — the UI stream 
     assert.deepEqual(envelope, { ok: true, value: undefined }, code)
   }
   assert.equal(handle.diagnostics().recentFailures.length, 0, 'not a call failure — the ring stays out of it')
+
+  // T32-fix2: the silent-ok mapping is pinned to the route's 403 — the same
+  // code string arriving on any other status is a different fault and keeps
+  // the refusal envelope (recorded in the diagnostics ring).
+  relay.resultThrow = new RelayError('unknown-event', 'not the answer route', 200)
+  const notSilent = await gateway.rpcBridge(
+    '$events/result',
+    { args: { clientId: 'c', eventId: toVirtual(SERVER_ID, 'evt-gone'), outcome: { kind: 'next' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(notSilent.ok, false)
+  assert.equal(notSilent.error.code, 'unknown-event')
+  assert.deepEqual(notSilent.error.details, {})
+  const failures = handle.diagnostics().recentFailures
+  assert.equal(failures[failures.length - 1].code, 'unknown-event')
   handle.uninstall()
 })
 

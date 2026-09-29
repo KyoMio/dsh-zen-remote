@@ -78,8 +78,10 @@ function makeGate(call) {
 
 /** The gateway's `$events` leg (T32): the ready frame IS the first yielded
  * frame — exactly what openRemoteEvents produces (REMOTE_EVENT_STREAM_READY +
- * clientId + host) — then the test drives the pending-event frames. */
-function makeEventsGate(signal) {
+ * clientId + host) — then the test drives the pending-event frames. Each
+ * open mints a DISTINCT clientId (`srv-events-client-<n>`), so a test with
+ * several live subscriptions can tell which one an answer was composed for. */
+function makeEventsGate(signal, clientId) {
   const pending = []
   let wake = () => {}
   let settled = 'open' // 'open' | 'done' | { error }
@@ -90,7 +92,7 @@ function makeEventsGate(signal) {
     }
   })
   const iterable = (async function* () {
-    yield { type: 'ready', clientId: 'srv-events-client', host: { home: '/srv/home' } }
+    yield { type: 'ready', clientId, host: { home: '/srv/home' } }
     while (true) {
       if (pending.length > 0) {
         const next = pending.shift()
@@ -124,7 +126,9 @@ function makeFakeGateway(overrides = {}) {
   const streams = []
   const wireOpens = []
   const eventResults = []
+  const eventsGates = []
   let eventsGate
+  let eventsSeq = 0
   const gateway = {
     invoke: async (call) => {
       invokeCalls.push(call)
@@ -143,7 +147,9 @@ function makeFakeGateway(overrides = {}) {
         if (endpoint !== '$events') {
           throw Object.assign(new Error(`no wireStream fake for ${endpoint}`), { code: 'test/not-implemented' })
         }
-        eventsGate = makeEventsGate(signal)
+        eventsSeq += 1
+        eventsGate = makeEventsGate(signal, `srv-events-client-${eventsSeq}`)
+        eventsGates.push(eventsGate)
         return eventsGate.iterable
       },
     },
@@ -153,7 +159,7 @@ function makeFakeGateway(overrides = {}) {
       return { ok: true, value: undefined }
     },
   }
-  return { gateway, invokeCalls, streams, wireOpens, eventResults, eventsGate: () => eventsGate }
+  return { gateway, invokeCalls, streams, wireOpens, eventResults, eventsGate: () => eventsGate, eventsGates }
 }
 
 function makeParts(name, { shared = [], overrides = {}, heartbeatMs, endDrainTimeoutMs, parentOf } = {}) {
@@ -1150,7 +1156,7 @@ const cancelIds = (open) => open.lines
   .map((line) => line.frame.eventId)
 const isTokenForm = (id, original) => typeof id === 'string' && /^[0-9a-f]{16}\./.test(id) && id.endsWith(`.${original}`)
 
-test('T32-fix: $zr/events forwards token-marked waterfalls, answers next for dropped ones, drops emits and foreign cancels', async () => {
+test('T32-fix: $zr/events forwards token-marked waterfalls, leaves dropped ones pending, drops emits and foreign cancels', async () => {
   const parts = makeParts('t32-events', { shared: ['S-shared'] })
   const server = await startServer(parts.handler)
   try {
@@ -1189,16 +1195,13 @@ test('T32-fix: $zr/events forwards token-marked waterfalls, answers next for dro
     assert.equal(open.lines.length, 2, 'emit frames and unforwarded cancels never travel')
     assert.equal(cancelIds(open).length, 0)
 
-    // The DROPPED unshared waterfall was answered `next` on behalf — with
-    // the subscription's OWN clientId and the ORIGINAL eventId — so the
-    // gateway does not wait for a delivery that will never come.
-    await waitFor(() => parts.eventResults.length >= 1)
-    assert.deepEqual(parts.eventResults[0], {
-      endpoint: '$events/result',
-      payload: { args: { clientId: 'srv-events-client', eventId: 'evt-secret', outcome: { kind: 'next' } } },
-      signal: undefined,
-      peer: undefined,
-    })
+    // The DROPPED unshared waterfall stays pending at the gateway — the
+    // relay does NOT answer `next` on the sub-client's behalf (T32-fix2:
+    // with the server UI offline the relay may be the only delivery, and
+    // an abstention would settle the event `next` into the host's
+    // fallback — a rejection). The dropped answerer is silence.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(parts.eventResults.length, 0, 'a dropped waterfall is never answered on behalf')
 
     // A cancel for a REGISTERED event forwards (with the token) and closes
     // the entry; a second cancel for the same id no longer travels.
@@ -1250,7 +1253,7 @@ test('T32-fix: event-result resolves the subscription by token, the entry by reg
     // holding the subscription's clientId, the ORIGINAL eventId (token
     // stripped), the outcome as-is.
     assert.deepEqual(dispatch.payload, {
-      args: { clientId: 'srv-events-client', eventId: 'evt-1', outcome: { kind: 'result', value: 'allowed-once' } },
+      args: { clientId: 'srv-events-client-1', eventId: 'evt-1', outcome: { kind: 'result', value: 'allowed-once' } },
     })
 
     // The gateway's own envelope — including failures — rides back untouched.
@@ -1305,7 +1308,72 @@ test('T32-fix: a foreign device cannot answer another device\'s subscription', a
   } finally { await server.stop() }
 })
 
-test('T32-fix: unsharing mid-event synthesizes the cancel, abstains next, and closes the answer', async () => {
+test('T32-fix2: two subscriptions on one device answer only through their own token', async () => {
+  const parts = makeParts('t32-token-isolation', { shared: ['S-shared'] })
+  const server = await startServer(parts.handler)
+  try {
+    // Both subscriptions ride device-1 (the default AUTH). The gateway
+    // delivers the same pending waterfall (eventId evt-1) to EACH client.
+    const openA = await openStream(server, EVENTS_BODY)
+    const openB = await openStream(server, EVENTS_BODY)
+    await waitFor(() => parts.wireOpens.length === 2)
+    await waitFor(() => openA.lines.length >= 1 && openB.lines.length >= 1)
+    parts.eventsGates[0].push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    parts.eventsGates[1].push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    await waitFor(() => forwardedIds(openA).length >= 1 && forwardedIds(openB).length >= 1)
+    const tokenAId = forwardedIds(openA)[0]
+    const tokenBId = forwardedIds(openB)[0]
+    assert.notEqual(tokenAId.split('.')[0], tokenBId.split('.')[0], 'the two subscriptions minted different tokens')
+    assert.ok(isTokenForm(tokenAId, 'evt-1') && isTokenForm(tokenBId, 'evt-1'))
+
+    // The answer naming subscription B's token composes the gateway
+    // payload with B's clientId — never A's, though both forwarded the
+    // same original id on the same device.
+    const answerB = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenBId, result: { kind: 'result', value: 'allowed-once' } }))
+    assert.equal(answerB.status, 200)
+    assert.deepEqual(await answerB.json(), { ok: true })
+    assert.equal(parts.eventResults.length, 1)
+    assert.deepEqual(parts.eventResults[0].payload, {
+      args: { clientId: 'srv-events-client-2', eventId: 'evt-1', outcome: { kind: 'result', value: 'allowed-once' } },
+    })
+
+    // A token nobody minted refuses even with a correct original id.
+    const ghost = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: 'deadbeefdeadbeef.evt-1', result: { kind: 'next' } }))
+    assert.equal(ghost.status, 403)
+    assert.deepEqual(await ghost.json(), { ok: false, error: { code: 'unknown-event' } })
+    assert.equal(parts.eventResults.length, 1, 'the ghost answer never reached the gateway')
+
+    parts.eventsGates[0].finish()
+    parts.eventsGates[1].finish()
+    await openA.done
+    await openB.done
+  } finally { await server.stop() }
+})
+
+test('T32-fix2: a closed subscription leaves no answerable registry behind', async () => {
+  const parts = makeParts('t32-sub-cleanup', { shared: ['S-shared'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, EVENTS_BODY)
+    await waitFor(() => open.lines.length >= 1)
+    parts.eventsGate().push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    await waitFor(() => forwardedIds(open).length >= 1)
+    const tokenEventId = forwardedIds(open)[0]
+
+    // The client hangs up: the pump unwinds through its finally, which
+    // removes the subscription from the live set and clears its registry.
+    open.req.destroy()
+    await open.done
+    // A tick for the pump's teardown to run after the socket close.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const late = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'result', value: 'allowed-once' } }))
+    assert.equal(late.status, 403)
+    assert.deepEqual(await late.json(), { ok: false, error: { code: 'unknown-event' } })
+    assert.equal(parts.eventResults.length, 0, 'nothing was composed for a dead subscription')
+  } finally { await server.stop() }
+})
+
+test('T32-fix: unsharing mid-event synthesizes the cancel and closes the answer, delivery left pending', async () => {
   const parts = makeParts('t32-unshare', { shared: ['S-shared'] })
   const server = await startServer(parts.handler)
   try {
@@ -1319,11 +1387,11 @@ test('T32-fix: unsharing mid-event synthesizes the cancel, abstains next, and cl
     // The sub-client sees the same close frame the gateway would have sent.
     await waitFor(() => cancelIds(open).length >= 1)
     assert.deepEqual(cancelIds(open), [tokenEventId])
-    // The server abstained on the sub-client's behalf at the gateway.
-    await waitFor(() => parts.eventResults.length >= 1)
-    assert.deepEqual(parts.eventResults[0].payload, {
-      args: { clientId: 'srv-events-client', eventId: 'evt-1', outcome: { kind: 'next' } },
-    })
+    // The relay's own delivery stays pending at the gateway — no `next` is
+    // abstained on the sub-client's behalf (T32-fix2): the server UI or a
+    // future subscriber must stay able to answer it.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(parts.eventResults.length, 0, 'the synthesized cancel does not abstain on behalf')
     // And the answer is closed — the entry went with the synthesized cancel.
     const refused = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'next' } }))
     assert.equal(refused.status, 403)
@@ -1372,23 +1440,34 @@ test('T32-fix: the per-subscription registry caps at 500 and drops the oldest', 
   } finally { await server.stop() }
 })
 
-test('T32-fix: closeAll empties the event registries at once', async () => {
+test('T32-fix: closeAll empties the event registries at once, even when the pump never unwinds', async () => {
   const parts = makeParts('t32-closeall', { shared: ['S-shared'] })
   const server = await startServer(parts.handler)
   try {
+    // An upstream that IGNORES abort: after the two frames below it parks
+    // forever, so the pump stays inside its for-await and its finally —
+    // the stream's own registry cleaner — never runs. Only closeAll's own
+    // synchronous clearing can refuse answers now; a test with the normal
+    // gate would race the pump's teardown and could pass for the wrong
+    // reason.
+    const stubborn = (async function* () {
+      yield { type: 'ready', clientId: 'stubborn-events-client', host: { home: '/srv/home' } }
+      yield { type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} }
+      await new Promise(() => {})
+    })()
+    parts.gateway.wireStream.open = async () => stubborn
     const open = await openStream(server, EVENTS_BODY)
-    await waitFor(() => open.lines.length >= 1)
-    parts.eventsGate().push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
     await waitFor(() => forwardedIds(open).length >= 1)
     const tokenEventId = forwardedIds(open)[0]
 
     parts.handler.closeAll('plugin row reloaded')
+    await open.done
     // The refusal must be immediate — not gated on the stream's own
-    // teardown unwinding.
+    // teardown unwinding (here it never will).
     const refused = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: tokenEventId, result: { kind: 'next' } }))
     assert.equal(refused.status, 403)
     assert.deepEqual(await refused.json(), { ok: false, error: { code: 'unknown-event' } })
-    await open.done
+    assert.equal(parts.eventResults.length, 0, 'nothing was composed for a dead handler')
   } finally { await server.stop() }
 })
 
