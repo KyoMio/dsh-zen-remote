@@ -23,6 +23,7 @@ import type { AdminAdmission } from './admin-routes.js'
 import { classifyClaimResponse, classifyProbe, CLAIM_PATH, normalizeServerUrl, RELAY_PING_PATH } from './client-pairing.js'
 import type { ClaimOutcome, ProbeState } from './client-pairing.js'
 import { unwrapVolatile } from './config.js'
+import type { InterceptDiagnostics } from './intercept.js'
 import { responseJson, sameOriginPost } from './http.js'
 import { relayCredentialsDigest, RelayError } from './relay-client.js'
 import type { RelayClient } from './relay-client.js'
@@ -68,6 +69,10 @@ export interface ClientHandlerOptions {
    * never connected, so the settings page still gets a fresh answer while
    * the startup `connect()` is still unpaired. */
   getRelayClient?: () => RelayClient | undefined
+  /** The typert interception's diagnostics (T23b-1), read live per request.
+   * Shapes, counters and failure codes only — never a token. Undefined when
+   * this composition never even attempted an install (no typertGateway). */
+  getIntercept?: () => InterceptDiagnostics | undefined
 }
 
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -292,6 +297,12 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
           return
         }
+        // The typert interception's view (T23b-1) rides on EVERY status
+        // answer, whatever the connection state — the settings surface needs
+        // it to explain a refused install even while unpaired.
+        const intercept = options.getIntercept?.()
+        const withIntercept = (body: Record<string, unknown>): Record<string, unknown> =>
+          intercept === undefined ? body : { ...body, intercept }
         // The ROW decides its own two shapes first, per request (both fields
         // are volatile { get() } wrappers — only the row object apply()
         // received is a live source): without both credentials nothing is
@@ -302,19 +313,19 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         const serverUrl = stringOrEmpty(unwrapVolatile(record.serverUrl)).trim()
         const token = stringOrEmpty(unwrapVolatile(record.deviceToken))
         if (token === '' || serverUrl === '') {
-          responseJson(res, 200, { state: 'unpaired' })
+          responseJson(res, 200, withIntercept({ state: 'unpaired' }))
           return
         }
         const normalized = normalizeServerUrl(serverUrl)
         if (!normalized.ok) {
-          responseJson(res, 200, { state: 'invalid-url' })
+          responseJson(res, 200, withIntercept({ state: 'invalid-url' }))
           return
         }
         const relay = options.getRelayClient?.()
         if (relay === undefined) {
           // T16 shape: no relay client wired — the ping probe is the answer.
           const state = await probe(fetchImpl, normalized.url, token)
-          responseJson(res, 200, { state, serverUrl: normalized.url })
+          responseJson(res, 200, withIntercept({ state, serverUrl: normalized.url }))
           return
         }
         // The cached verdict is trusted only over the EXACT credentials the
@@ -329,7 +340,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           relay.lastHandshakeDigest !== undefined &&
           relay.lastHandshakeDigest === relayCredentialsDigest(normalized.url, token)
         ) {
-          responseJson(res, 200, { state: relay.state, serverName: relay.handshakeInfo.serverName, serverUrl: normalized.url })
+          responseJson(res, 200, withIntercept({ state: relay.state, serverName: relay.handshakeInfo.serverName, serverUrl: normalized.url }))
           return
         }
         // Everything else — never connected, offline, connecting, revoked,
@@ -341,12 +352,12 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // credential material by contract.
         try {
           const info = await withProbeTimeout(relay.connect())
-          responseJson(res, 200, { state: 'online', serverName: info.serverName, serverUrl: normalized.url })
+          responseJson(res, 200, withIntercept({ state: 'online', serverName: info.serverName, serverUrl: normalized.url }))
         } catch (error) {
           const body: Record<string, unknown> = { state: probeStateOfRelayError(error), serverUrl: normalized.url }
           if (relay.nextRetryAt !== null && relay.nextRetryAt !== undefined) body.nextRetryAt = relay.nextRetryAt
           if (relay.lastError !== undefined) body.lastError = relay.lastError
-          responseJson(res, 200, body)
+          responseJson(res, 200, withIntercept(body))
         }
         return
       }
