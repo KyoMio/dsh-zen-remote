@@ -137,7 +137,7 @@ const FOLLOW_ARGS = { request: { address: { kind: 'session', sessionId: 'session
  */
 let bootCounter = 0
 async function boot(opts = {}) {
-  const { shared = [], heartbeatMs, invoke } = opts
+  const { shared = [], heartbeatMs, invoke, fingerprints } = opts
   const home = path.join(ROOT, `run-${bootCounter++}`)
   fs.mkdirSync(home, { recursive: true })
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
@@ -160,7 +160,12 @@ async function boot(opts = {}) {
     secret: SECRET,
     store,
     gateway,
-    serverInfo: { serverId: loadServerId(home), serverName: () => SERVER_NAME, dshVersion: '0.0.0-e2e' },
+    serverInfo: {
+      serverId: loadServerId(home),
+      serverName: () => SERVER_NAME,
+      dshVersion: '0.0.0-e2e',
+      ...(fingerprints !== undefined ? { fingerprints: () => fingerprints } : {}),
+    },
     ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
   })
   const server = http.createServer((req, res) => { handler(req, res).catch(() => { try { res.destroy() } catch { /* gone */ } }) })
@@ -451,12 +456,13 @@ test('e2e T43: the gateway dies, the client retries on its own, and a restarted 
     assert.ok(env.client.nextRetryAt - Date.now() <= 1200, 'the first wait is the 1s step (+ jitter)')
 
     // Nobody calls the client: the RETRY must be what hits the dead chain.
+    // The proxy counts a hit the moment the REQUEST arrives, but the 502 it
+    // answers comes back asynchronously — a poll between the two would catch
+    // `connecting`. Waiting for the hit AND the settled `offline` means the
+    // observed attempt is complete (connect() switched to `connecting`
+    // before sending, so offline after a new hit is this retry's end).
     const hitsBefore = proxyHits
-    await waitFor(() => proxyHits > hitsBefore, 5000)
-    // The proxy counter rises the instant the retry ARRIVES; the offline
-    // verdict lands one round trip later — wait it out instead of racing it
-    // (a loaded runner polls into that window and reads 'connecting').
-    await waitFor(() => env.client.state === 'offline', 5000)
+    await waitFor(() => proxyHits > hitsBefore && env.client.state === 'offline', 5000)
     assert.equal(env.client.state, 'offline', 'the gateway is still down — the retry failed into offline again')
     assert.equal(env.client.lastError, 'offline')
 
@@ -649,5 +655,29 @@ test('e2e T23b-2: the interceptor merges the global workspace stream — local g
     assert.equal(done.done, true)
     await waitFor(() => wsGate.aborted)
     handle.uninstall()
+  } finally { await env.stop() }
+})
+
+// ---- T42: interface fingerprints over the real chain ---------------------------
+
+test('e2e: injected fingerprints ride the real handshake and compare group by group', async () => {
+  const SERVER_FP = { session: 'aaa111', workspace: 'bbb222' }
+  const env = await boot({ shared: [], fingerprints: SERVER_FP })
+  try {
+    // Different workspace hash: the differing group is named; `events` only
+    // the CLIENT computed, so it lands unavailable — never a difference.
+    const different = env.tunedClient({
+      computeOwnFingerprints: () => ({ session: 'aaa111', workspace: 'zzz999', events: 'ccc333' }),
+    })
+    const info = await different.connect()
+    assert.deepEqual(info.fingerprints, SERVER_FP, 'the server\'s map survived the real gateway chain')
+    assert.deepEqual(different.compat, { identical: ['session'], different: ['workspace'], unavailable: ['events'] })
+    await different.stop()
+
+    // The identical map: nothing differs.
+    const same = env.tunedClient({ computeOwnFingerprints: () => ({ ...SERVER_FP }) })
+    await same.connect()
+    assert.deepEqual(same.compat, { identical: ['session', 'workspace'], different: [], unavailable: [] })
+    await same.stop()
   } finally { await env.stop() }
 })

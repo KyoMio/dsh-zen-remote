@@ -101,6 +101,7 @@ function makeClient(port, overrides = {}) {
     ...(overrides.idleTimeoutMs !== undefined ? { idleTimeoutMs: overrides.idleTimeoutMs } : {}),
     ...(overrides.requestTimeoutMs !== undefined ? { requestTimeoutMs: overrides.requestTimeoutMs } : {}),
     ...(overrides.clock !== undefined ? { clock: overrides.clock } : {}),
+    ...(overrides.computeOwnFingerprints !== undefined ? { computeOwnFingerprints: overrides.computeOwnFingerprints } : {}),
   })
   return { client, setUrl: (v) => { url = v }, setToken: (v) => { token = v } }
 }
@@ -1031,5 +1032,92 @@ test('T43-fix: concurrent connects while a retry is armed join into ONE handshak
     await sleep(30)
     assert.equal(handshakeHits(relay), 2)
     assert.equal(clock.pending, 0, 'the success cleared the machinery')
+  } finally { await relay.stop() }
+})
+
+// ---- interface compatibility (T42) --------------------------------------------
+
+test('compat: matching fingerprints compare identical; differing groups are named', async () => {
+  const relay = await startFakeRelay()
+  try {
+    relay.scenario.handshake = () => [200, {
+      ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test',
+      fingerprints: { session: 'aaa111', workspace: 'bbb222', events: 'ccc333' },
+    }]
+    const { client } = makeClient(relay.port, {
+      computeOwnFingerprints: () => ({ session: 'aaa111', workspace: 'zzz999', events: 'ccc333' }),
+    })
+    assert.equal(client.compat, undefined, 'no verdict before the first handshake')
+    await client.connect()
+    assert.deepEqual(client.compat, { identical: ['events', 'session'], different: ['workspace'], unavailable: [] })
+  } finally { await relay.stop() }
+})
+
+test('compat: an own-compute failure degrades every group to unavailable, never different', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port, {
+      computeOwnFingerprints: () => { throw new Error('registry exploded') },
+    })
+    await client.connect()
+    assert.deepEqual(client.compat, { identical: [], different: [], unavailable: ['algo'] })
+  } finally { await relay.stop() }
+})
+
+test('compat: absent computeOwnFingerprints keeps compat undefined', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    assert.equal(client.compat, undefined)
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('compat: a verdict change rides the next handshake\u2019s state notification', async () => {
+  const relay = await startFakeRelay()
+  try {
+    let serverFingerprints = { session: 'aaa111' }
+    relay.scenario.handshake = () => [200, {
+      ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test',
+      fingerprints: serverFingerprints,
+    }]
+    const { client } = makeClient(relay.port, { computeOwnFingerprints: () => ({ session: 'aaa111' }) })
+    const events = []
+    client.subscribe((s) => events.push(s))
+    await client.connect()
+    assert.deepEqual(client.compat, { identical: ['session'], different: [], unavailable: [] })
+    assert.deepEqual(events, ['connecting', 'online'])
+    // The server upgraded its interface: the next handshake flips the
+    // verdict, stored BEFORE the online transition so the woken subscribers
+    // read the fresh verdict off the getter.
+    serverFingerprints = { session: 'fff999' }
+    await client.connect()
+    assert.deepEqual(client.compat, { identical: [], different: ['session'], unavailable: [] })
+    assert.equal(client.state, 'online')
+    assert.deepEqual(events, ['connecting', 'online', 'connecting', 'online'])
+  } finally { await relay.stop() }
+})
+
+test('compat: unpairing and revocation clear the verdict (T42-fix)', async () => {
+  const relay = await startFakeRelay()
+  try {
+    // Unpair path: a stored verdict, then the credentials vanish.
+    const holder = makeClient(relay.port, { computeOwnFingerprints: () => ({ algo: 'sha256' }) })
+    await holder.client.connect()
+    assert.deepEqual(holder.client.compat?.identical, ['algo'])
+    holder.setToken('')
+    holder.client.credentialsChanged()
+    assert.equal(holder.client.state, 'unpaired')
+    assert.equal(holder.client.compat, undefined, 'the verdict described the OLD server — it goes with the link')
+
+    // Revocation path: the same server later walls the token.
+    const revoker = makeClient(relay.port, { computeOwnFingerprints: () => ({ algo: 'sha256' }) })
+    await revoker.client.connect()
+    assert.deepEqual(revoker.client.compat?.identical, ['algo'])
+    relay.scenario.handshake = () => [401, { ok: false, reason: 'unpaired' }]
+    await assert.rejects(() => revoker.client.connect(), (error) => error instanceof RelayError && error.code === 'revoked')
+    assert.equal(revoker.client.state, 'revoked')
+    assert.equal(revoker.client.compat, undefined, 'revocation is the same "this server is gone" wall')
   } finally { await relay.stop() }
 })
