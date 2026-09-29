@@ -88,11 +88,13 @@ const MAX_STREAMS_PER_DEVICE = 32
 /**
  * Concurrent invokes one device may keep in flight (CP4): a runaway or
  * hostile client must not pin unbounded host work behind this route the way
- * it must not hold unbounded streams. Modeled on the stream budget below —
- * past the cap the request answers 429 `too-many-invokes` and the counter is
- * untouched.
+ * it must not hold unbounded streams. CP5 raises the cap to 32, the same
+ * budget as the stream cap above: opening one remote session in the UI fires
+ * a burst of concurrent invokes, and under high latency they stay in flight
+ * long enough for the old 8 to refuse real traffic. Past the cap the request
+ * answers 429 `too-many-invokes` and the counter is untouched.
  */
-const MAX_INVOKES_PER_DEVICE = 8
+const MAX_INVOKES_PER_DEVICE = 32
 
 /** Most recent forwarded waterfall events remembered per `$zr/events`
  * subscription (T32-fix): the registry is only an ownership record, so this

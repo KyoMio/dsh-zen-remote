@@ -5,11 +5,15 @@ const { test } = require('node:test')
 const assert = require('node:assert')
 const http = require('node:http')
 const crypto = require('node:crypto')
-const { REMOTE_HEADERS, startMockTarget, startGateway, request, pairDevice, stopAll } = require('./util.cjs')
+const { REMOTE_HEADERS, startMockTarget, startGateway, request, pairDevice, stopAll, freePort } = require('./util.cjs')
 
-const PORT = 39222
-const TARGET_PORT = 39221
-const PUSH_PORT = 39223
+// T31-fix (relay-e2e): every port is system-assigned so parallel test-run
+// copies cannot collide. The mock targets listen on 0 and report the kernel's
+// pick; the gateway child needs a number handed to it, so boot() pre-grabs one
+// with freePort(). Tests in one file run sequentially, so these carry the trio.
+let PORT = 0
+let TARGET_PORT = 0
+let PUSH_PORT = 0
 
 function fakeSubscription() {
   const ecdh = crypto.createECDH('prime256v1')
@@ -31,11 +35,16 @@ function startMockPushService(statusCode) {
       res.end()
     })
   })
-  return new Promise((resolve) => server.listen(PUSH_PORT, '127.0.0.1', () => resolve({ server, captured })))
+  return new Promise((resolve, reject) => {
+    server.on('error', reject) // refuse, never hang
+    server.listen(0, '127.0.0.1', () => { PUSH_PORT = server.address().port; resolve({ server, captured }) })
+  })
 }
 
 async function boot() {
-  const target = await startMockTarget(TARGET_PORT)
+  const target = await startMockTarget(0)
+  TARGET_PORT = target.address().port
+  PORT = await freePort()
   const gw = startGateway(PORT, TARGET_PORT, { LAN_GATE_ALLOW_HTTP_PUSH: '1' })
   await gw.ready
   return { target, gw, stop: () => stopAll(target, gw.child) }

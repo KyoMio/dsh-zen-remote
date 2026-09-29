@@ -10,13 +10,20 @@ const net = require('node:net')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { REMOTE_HEADERS, startGateway, startGatewayAt, request, cookieFrom, pairDevice, pairDesktop, startRecordingTarget, rawUpgrade, stopAll } = require('./util.cjs')
+const { REMOTE_HEADERS, startGateway, startGatewayAt, request, cookieFrom, pairDevice, pairDesktop, startRecordingTarget, rawUpgrade, stopAll, freePort } = require('./util.cjs')
 
-const PORT = 39241
-const TARGET_PORT = 39242
+// T31-fix (relay-e2e): every port is system-assigned so parallel test-run
+// copies cannot collide. The recording target listens on 0 and reports the
+// kernel's pick; the gateway child needs a number handed to it, so boot()
+// pre-grabs one with freePort(). Tests in one file run sequentially, so these
+// carry the current pair.
+let PORT = 0
+let TARGET_PORT = 0
 
 async function boot(extraEnv, targetOpts) {
-  const target = await startRecordingTarget(TARGET_PORT, targetOpts)
+  const target = await startRecordingTarget(0, targetOpts)
+  TARGET_PORT = target.server.address().port
+  PORT = await freePort()
   const gw = startGateway(PORT, TARGET_PORT, extraEnv)
   await gw.ready
   return { target, gw, stop: () => stopAll({ close: (done) => target.close().then(done, done) }, gw.child) }
@@ -59,7 +66,9 @@ test('T13-1: a v2 state file without roles backfills role=web and is written bac
       legacy2: { id: 'legacy2', token: 'tok-legacy-2', name: '坏角色', kind: 'phone', role: 'desktop', createdAt: 3, lastSeen: 4, ua: 'ua' }
     }
   }))
-  const target = await startRecordingTarget(TARGET_PORT)
+  const target = await startRecordingTarget(0)
+  TARGET_PORT = target.server.address().port
+  PORT = await freePort()
   const gw = startGatewayAt(home, PORT, TARGET_PORT)
   await gw.ready
   try {
