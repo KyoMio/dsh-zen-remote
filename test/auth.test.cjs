@@ -8,13 +8,19 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const net = require('node:net')
-const { REMOTE_HEADERS, startMockTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, stopAll } = require('./util.cjs')
+const { REMOTE_HEADERS, startMockTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, stopAll, freePort } = require('./util.cjs')
 
-const PORT = 39212
-const TARGET_PORT = 39211
+// T31-fix (relay-e2e): every port is system-assigned so parallel test-run
+// copies cannot collide. Targets listen on 0 and report the kernel's pick;
+// the gateway child needs a number handed to it, so boots pre-grab one with
+// freePort(). Tests in one file run sequentially, so these carry the pair.
+let PORT = 0
+let TARGET_PORT = 0
 
 async function boot(extraEnv) {
-  const target = await startMockTarget(TARGET_PORT)
+  const target = await startMockTarget(0)
+  TARGET_PORT = target.address().port
+  PORT = await freePort()
   const gw = startGateway(PORT, TARGET_PORT, extraEnv)
   await gw.ready
   return { target, gw, stop: () => stopAll(target, gw.child) }
@@ -147,10 +153,13 @@ test('five wrong codes lock the client out', async () => {
 test('origin and referer are rewritten to the upstream origin', async () => {
   const http = require('node:http')
   const captured = []
-  const target = await new Promise((resolve) => {
+  const target = await new Promise((resolve, reject) => {
     const srv = http.createServer((req, res) => { captured.push(req.headers); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}') })
-    srv.listen(TARGET_PORT, '127.0.0.1', () => resolve(srv))
+    srv.on('error', reject)
+    srv.listen(0, '127.0.0.1', () => resolve(srv))
   })
+  TARGET_PORT = target.address().port
+  PORT = await freePort()
   const gw = startGateway(PORT, TARGET_PORT)
   await gw.ready
   try {
@@ -183,7 +192,9 @@ test('rate limit hits unpaired clients only', async () => {
 test('lan-gate.config.json configures the gateway (env absent)', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-pwa-test-'))
   fs.writeFileSync(path.join(home, 'lan-gate.config.json'), JSON.stringify({ rateLimit: 5 }))
-  const target = await startMockTarget(TARGET_PORT)
+  const target = await startMockTarget(0)
+  TARGET_PORT = target.address().port
+  PORT = await freePort()
   const gw = startGatewayAt(home, PORT, TARGET_PORT)
   await gw.ready
   try {
@@ -199,7 +210,9 @@ test('lan-gate.config.json configures the gateway (env absent)', async () => {
 test('v1 state file is archived, not loaded', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-pwa-test-'))
   fs.writeFileSync(path.join(home, 'lan-gate-state.json'), JSON.stringify({ decisions: { '192.168.1.5': { allow: true, token: 'x' } } }))
-  const target = await startMockTarget(TARGET_PORT)
+  const target = await startMockTarget(0)
+  TARGET_PORT = target.address().port
+  PORT = await freePort()
   const gw = startGatewayAt(home, PORT, TARGET_PORT)
   await gw.ready
   try {
@@ -210,7 +223,9 @@ test('v1 state file is archived, not loaded', async () => {
 })
 
 test('paired devices survive a gateway restart', async () => {
-  const target = await startMockTarget(TARGET_PORT)
+  const target = await startMockTarget(0)
+  TARGET_PORT = target.address().port
+  PORT = await freePort()
   const gw1 = startGateway(PORT, TARGET_PORT)
   await gw1.ready
   let cookie
@@ -239,12 +254,14 @@ test('paired devices survive a gateway restart', async () => {
 //      and hands the admin surface to the internet. That is the actual footgun,
 //      and it is a property of the deployment, not something a gateway setting
 //      can fix — so it is asserted here rather than silently assumed.
-const TUNNEL_PORT = 39232
-const TUNNEL_TARGET_PORT = 39231
+let TUNNEL_PORT = 0
+let TUNNEL_TARGET_PORT = 0
 
 for (const trustedProxies of ['', '127.0.0.1']) {
   test(`same-host tunnel: forwarded headers decide, LAN_GATE_TRUSTED_PROXIES="${trustedProxies}" is not what holds the wall`, async () => {
-    const target = await startMockTarget(TUNNEL_TARGET_PORT)
+    const target = await startMockTarget(0)
+    TUNNEL_TARGET_PORT = target.address().port
+    TUNNEL_PORT = await freePort()
     const gw = startGateway(TUNNEL_PORT, TUNNEL_TARGET_PORT, trustedProxies ? { LAN_GATE_TRUSTED_PROXIES: trustedProxies } : undefined)
     await gw.ready
     try {

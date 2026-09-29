@@ -23,10 +23,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert')
 const net = require('node:net')
-const { startGateway, request, stopAll } = require('./util.cjs')
-
-const PORT = 39281
-const TARGET_PORT = 39282
+const { startGateway, request, stopAll, freePort } = require('./util.cjs')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -40,10 +37,15 @@ async function waitFor(fn, timeoutMs, message) {
 }
 
 test('T17b: a port freed inside the retry window is rebound on the ORIGINAL port', async () => {
+  // T31-fix: system-assigned so parallel test-run copies cannot collide. The
+  // blocker grabs a genuinely free port (the one the gateway must end up on);
+  // the upstream port is never dialled by this test, it just needs a number.
+  const PORT = await freePort()
+  const TARGET_PORT = await freePort()
   // Hold the configured port, start the gateway behind it: the first listen
   // attempt must hit EADDRINUSE and enter the same-port retry loop.
   const blocker = net.createServer(() => {})
-  await new Promise((resolve) => blocker.listen(PORT, '127.0.0.1', resolve))
+  await new Promise((resolve, reject) => { blocker.on('error', reject); blocker.listen(PORT, '127.0.0.1', resolve) })
   const gw = startGateway(PORT, TARGET_PORT)
   try {
     // Free the port only after the retry is OBSERVED: this line is the

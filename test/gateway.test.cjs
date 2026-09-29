@@ -8,17 +8,24 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert')
-const { startMockTarget, startMockAuthTarget, startGateway, request, stopAll, pairDevice, REMOTE_HEADERS } = require('./util.cjs')
+const { startMockTarget, startMockAuthTarget, startGateway, request, stopAll, pairDevice, REMOTE_HEADERS, freePort } = require('./util.cjs')
 
 const VIEWPORT_RE = /<meta[^>]*name=["']?viewport["']?[^>]*>/gi
 // Exactly what DSH itself serves today — the tag the gateway has to rewrite.
 const DSH_VIEWPORT = '<meta name="viewport" content="width=device-width, initial-scale=1" />'
 
-const PORT = 39202
-const TARGET_PORT = 39201
+// T31-fix (relay-e2e): every port is system-assigned so parallel test-run
+// copies cannot collide. Targets listen on 0 and report the kernel's pick;
+// the gateway child needs a number handed to it, so boot() pre-grabs one with
+// freePort() — the gateway's same-port retry band absorbs the rebind race.
+// Tests in one file run sequentially, so these carry the current pair.
+let PORT = 0
+let TARGET_PORT = 0
 
-async function boot() {
-  const target = await startMockTarget(TARGET_PORT)
+async function boot(html) {
+  const target = await startMockTarget(0, html)
+  TARGET_PORT = target.address().port
+  PORT = await freePort()
   const gw = startGateway(PORT, TARGET_PORT)
   await gw.ready
   return { gw, stop: () => stopAll(target, gw.child) }
@@ -91,16 +98,14 @@ test('gateway: injected bootstrap registers the service worker with scope "/"', 
 // manifest.json (proper icons, branding, the background_color the iOS
 // dead-strip fix depends on) was silently shadowed and never took effect.
 test('gateway: strips an upstream-supplied manifest link so the gateway\'s own /pwa/manifest.json is the only one and actually governs', async () => {
-  const target = await startMockTarget(TARGET_PORT, '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><link rel="manifest" href="/manifest.webmanifest" /></head><body>ok</body></html>')
-  const gw = startGateway(PORT, TARGET_PORT)
-  await gw.ready
+  const { stop } = await boot('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><link rel="manifest" href="/manifest.webmanifest" /></head><body>ok</body></html>')
   try {
     const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
     const links = page.body.match(/<link[^>]*rel=["']?manifest["']?[^>]*>/gi) || []
     assert.strictEqual(links.length, 1, 'exactly one manifest link survives')
     assert.ok(links[0].includes('/pwa/manifest.json'), 'the surviving link is the gateway\'s own')
     assert.ok(!page.body.includes('/manifest.webmanifest'), 'the shadowed upstream manifest link is gone')
-  } finally { await stopAll(target, gw.child) }
+  } finally { await stop() }
 })
 
 test('gateway: injects manifest link, PWA bootstrap & app.css into HTML (local)', async () => {
@@ -181,22 +186,18 @@ test('gateway: adds a viewport meta with viewport-fit=cover when upstream has no
 })
 
 test('gateway: rewrites an existing viewport meta instead of duplicating it', async () => {
-  const target = await startMockTarget(TARGET_PORT, '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' + DSH_VIEWPORT + '</head><body>ok</body></html>')
-  const gw = startGateway(PORT, TARGET_PORT)
-  await gw.ready
+  const { stop } = await boot('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' + DSH_VIEWPORT + '</head><body>ok</body></html>')
   try {
     const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
     const metas = page.body.match(VIEWPORT_RE) || []
     assert.strictEqual(metas.length, 1, 'exactly one viewport meta')
     assert.match(metas[0], /viewport-fit=cover/)
-  } finally { await stopAll(target, gw.child) }
+  } finally { await stop() }
 })
 
 // Devices pinned to "desktop" keep the upstream viewport untouched.
 test('gateway: leaves the viewport alone for kind=desktop devices', async () => {
-  const target = await startMockTarget(TARGET_PORT, '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' + DSH_VIEWPORT + '</head><body>ok</body></html>')
-  const gw = startGateway(PORT, TARGET_PORT)
-  await gw.ready
+  const { stop } = await boot('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">' + DSH_VIEWPORT + '</head><body>ok</body></html>')
   try {
     const { cookie, id } = await pairDevice(PORT, 'desk')
     await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'set-kind', id, kind: 'desktop' } })
@@ -205,7 +206,7 @@ test('gateway: leaves the viewport alone for kind=desktop devices', async () => 
     const metas = page.body.match(VIEWPORT_RE) || []
     assert.strictEqual(metas.length, 1)
     assert.doesNotMatch(metas[0], /viewport-fit/)
-  } finally { await stopAll(target, gw.child) }
+  } finally { await stop() }
 })
 
 test('gateway: injected inline scripts have balanced braces (quoting bug guard)', async () => {
@@ -316,11 +317,12 @@ test('manifest + icons are readable without the device cookie (credential-less b
 
 // ---- 0.1.2 browser-auth exchange (M3): the gateway swaps the upstream
 // token for a cookie on the phone's behalf --------------------------------
-const UPSTREAM_TOKEN_URL = () => 'http://127.0.0.1:' + TARGET_PORT + '/?token=TESTTOKEN'
 
 async function bootAuth(opts) {
-  const target = await startMockAuthTarget(TARGET_PORT, opts)
-  const gw = startGateway(PORT, TARGET_PORT, { LAN_GATE_UPSTREAM_TOKEN_URL: UPSTREAM_TOKEN_URL() })
+  const target = await startMockAuthTarget(0, opts)
+  TARGET_PORT = target.server.address().port
+  PORT = await freePort()
+  const gw = startGateway(PORT, TARGET_PORT, { LAN_GATE_UPSTREAM_TOKEN_URL: 'http://127.0.0.1:' + TARGET_PORT + '/?token=TESTTOKEN' })
   await gw.ready
   return { target, gw, stop: () => stopAll(target.server, gw.child) }
 }
@@ -345,7 +347,9 @@ test('auth exchange: a cookie-less HTML GET is swapped for the upstream token, t
 test('auth exchange: 0.1.1 mode (no token env) passes the upstream 401 through untouched', async () => {
   // Gateway WITHOUT LAN_GATE_UPSTREAM_TOKEN_URL against an auth-acting target:
   // the 401 must reach the client verbatim — no set-cookie, no redirect.
-  const target = await startMockAuthTarget(TARGET_PORT)
+  const target = await startMockAuthTarget(0)
+  TARGET_PORT = target.server.address().port
+  PORT = await freePort()
   const gw = startGateway(PORT, TARGET_PORT)
   await gw.ready
   try {
