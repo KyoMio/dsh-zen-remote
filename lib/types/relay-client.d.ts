@@ -59,6 +59,12 @@ export interface RelayClock {
     /** One random sample in [0, 1] — the jitter source. */
     random(): number;
 }
+/**
+ * The default clock: real time, `unref()`ed timers, `Math.random`. Exported
+ * so the interceptor's own waits (the merged-stream reopen delays) run on
+ * the SAME clock face — one injectable seam for tests instead of two.
+ */
+export declare const defaultClock: RelayClock;
 /** The connection states the settings surface renders (and `subscribe`
  * listeners react to). */
 export type RelayState = 'unpaired' | 'connecting' | 'online' | 'offline' | 'revoked' | 'incompatible';

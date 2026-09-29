@@ -75,7 +75,7 @@
  *   answer fails the UI's whole `$events`
  *   generation (client face: pumpEvents aborts on answer failures).
  */
-import type { RelayClient } from './relay-client.js';
+import type { RelayClient, RelayClock } from './relay-client.js';
 import type { GatewayShapeCheck } from './intercept-shape.js';
 /** The session-locating argument fields, as registered per method. Identical
  * in name and meaning to relay-access.ts's `SessionField`; a field named
@@ -252,6 +252,10 @@ export interface InstallInterceptOptions {
     getServerId: () => string | undefined;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
+    /** Clock/timers for the merged streams' reopen backoff (CP4); defaults to
+     * the same real clock the relay client's ladder uses. Tests inject a
+     * manual clock to drive the reopen delays without real waiting. */
+    clock?: RelayClock;
 }
 export interface InterceptHandle {
     /** Remove both own properties, restoring exactly what was installed over
