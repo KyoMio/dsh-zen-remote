@@ -17,6 +17,7 @@ const http = require('node:http')
 
 const { installIntercept } = require('../lib/intercept.js')
 const { createRelayClient } = require('../lib/relay-client.js')
+const { toVirtual } = require('../lib/virtual-id.js')
 
 const SERVER_ID = '5e5a5a5a'
 const RW = { workspaceId: 'w-1', path: '/srv/w1', title: '远端一', sessionIds: ['s1'], createdAt: '2026', updatedAt: '2026' }
@@ -265,5 +266,118 @@ test('CP4: a 429 too-many-streams refusal keeps the state online and the stream 
   await waitFor(() => relay.state.streams.length === 2, 4000)
   relay.state.streams[1].write({ type: 'frame', frame: { type: 'upsert', workspace: { ...RW, title: '重开' } } })
   await waitFor(() => frames.some((frame) => frame.workspace?.title === '主服务端 · 重开'), 4000)
+  assert.equal(frames.some((frame) => frame.terminal), false, 'the 429 never reached the UI as an error')
+})
+
+// -- CP5: the same trio for the merged $events leg --------------------------------
+
+/** The remote approval waterfall the reopened $events leg re-delivers. The
+ * eventId/agentId rewrite virtualizes both with the server id. */
+const EVENTS_WATERFALL = {
+  type: 'waterfall',
+  event: 'approval/request',
+  eventId: 'evt-remote-1',
+  agentId: 'session-local',
+  request: { toolName: 'Bash', callId: 'c1' },
+}
+
+/** The $events variant of boot: real relay client + intercept + manual clock,
+ * the merged events consumer collecting frames, the local ready already
+ * flowed and the remote `$zr/events` leg already open. */
+async function bootEvents(t) {
+  const relay = await createRelayServer()
+  const clock = fakeClock()
+  const client = createRelayClient({ getServerUrl: () => relay.url, getToken: () => 'token-1', clock })
+  await client.connect()
+  assert.equal(client.state, 'online')
+
+  const localGate = createLocalGate(undefined)
+  const gateway = {
+    operatorPeer: () => ({ id: 'p' }),
+    openWireStream: async function () { return localGate.iterable },
+    wireTap: (endpoint, payload, uplink, peer, signal, control) => gateway.openWireStream(endpoint, payload, uplink, peer, control.signal, control),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    relay: client,
+    getServerId: () => client.handshakeInfo?.serverId,
+    clock,
+  })
+  t.after(() => { handle.uninstall(); client.stop(); return relay.stop() })
+
+  const merged = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), undefined, { signal: undefined })
+  const frames = []
+  const done = (async () => {
+    try { for await (const frame of merged) frames.push(frame) } catch { frames.push({ terminal: true }) }
+  })()
+  // The local ready opens the merged stream (the UI's own subscription is the
+  // base); the pump then dials the relay's $zr/events leg on its own.
+  localGate.push({ type: 'ready', clientId: 'local-events-client', host: { home: '/local/home' } })
+  await waitFor(() => frames.length >= 1)
+  await waitFor(() => relay.state.streams.length === 1)
+  return { relay, clock, client, handle, frames, gateway, localGate, done }
+}
+
+test('CP5: the $events leg reopens after a server-restart line — offline at once, back within the ladder\'s first step', async (t) => {
+  const { relay, clock, client, frames } = await bootEvents(t)
+
+  // The server app exits cleanly: the leg draws the restart line, the client
+  // marks itself offline at once, and the pump parks on the state wait.
+  relay.state.streams[0].write({ type: 'error', error: { code: 'server-restart' } })
+  relay.state.streams[0].end()
+  await waitFor(() => client.state === 'offline')
+  assert.equal(client.nextRetryAt, clock.now() + 1000, 'the reconnect ladder armed its first step')
+
+  // The server is back: the ladder's first due attempt reconnects and the
+  // pump reopens the leg — a remote approval can arrive and be answered again.
+  clock.advance(1000)
+  await waitFor(() => client.state === 'online')
+  await waitFor(() => relay.state.streams.length === 2, 4000)
+  relay.state.streams[1].write({ type: 'frame', frame: EVENTS_WATERFALL })
+  await waitFor(() => frames.some((frame) => frame.eventId === toVirtual(SERVER_ID, 'evt-remote-1')), 4000)
+  assert.equal(frames.some((frame) => frame.terminal), false, 'the consumer never saw an error')
+})
+
+test('CP5: a clean end of the $events leg while still online reopens after the 1s backoff — not before', async (t) => {
+  const { relay, clock, client, frames } = await bootEvents(t)
+  assert.equal(client.state, 'online')
+
+  // A plain {type:'end'} — the state never moves, so nothing but the backoff
+  // can wake the pump. The pump walks real socket I/O before it arms the
+  // backoff timer, so the wait below lets the arming land BEFORE advancing.
+  relay.state.streams[0].write({ type: 'end' })
+  relay.state.streams[0].end()
+  await waitFor(() => clock.pending === 1)
+  clock.advance(500)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(relay.state.streams.length, 1, 'no reopen before the delay')
+  clock.advance(500)
+  await waitFor(() => relay.state.streams.length === 2, 4000)
+  relay.state.streams[1].write({ type: 'frame', frame: EVENTS_WATERFALL })
+  await waitFor(() => frames.some((frame) => frame.eventId === toVirtual(SERVER_ID, 'evt-remote-1')), 4000)
+  assert.equal(frames.some((frame) => frame.terminal), false)
+})
+
+test('CP5: a 429 on the reopened $events leg is a $zr/events ring record and the leg waits out the doubled delay', async (t) => {
+  const { relay, clock, client, handle, frames } = await bootEvents(t)
+
+  // Kill the current leg cleanly; the reopen attempt draws the 429.
+  relay.state.firstStreamRefusal = { status: 429, body: { ok: false, error: { code: 'too-many-streams' } } }
+  relay.state.streams[0].write({ type: 'end' })
+  relay.state.streams[0].end()
+  await waitFor(() => clock.pending === 1)
+  clock.advance(1000)
+  await waitFor(() => handle.diagnostics().recentFailures.at(-1)?.code === 'too-many-streams')
+  assert.equal(handle.diagnostics().recentFailures.at(-1).endpoint, '$zr/events', 'the refusal landed on the events leg')
+  assert.equal(client.state, 'online')
+  // The empty spin doubles the delay: 1s of advance must not reopen.
+  await waitFor(() => clock.pending === 1)
+  clock.advance(1000)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(relay.state.streams.length, 1, 'the doubled 2s delay is still running')
+  clock.advance(1000)
+  await waitFor(() => relay.state.streams.length === 2, 4000)
+  relay.state.streams[1].write({ type: 'frame', frame: EVENTS_WATERFALL })
+  await waitFor(() => frames.some((frame) => frame.eventId === toVirtual(SERVER_ID, 'evt-remote-1')), 4000)
   assert.equal(frames.some((frame) => frame.terminal), false, 'the 429 never reached the UI as an error')
 })

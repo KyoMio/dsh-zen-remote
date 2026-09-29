@@ -324,6 +324,52 @@ const WRITE_OFFLINE_MESSAGE = '服务端离线，远程会话暂时只读'
 const LINK_DOWN_CODES: ReadonlySet<string> = new Set(['offline', 'server-restart'])
 
 /**
+ * The session-level streams the CP4 hold-through-the-outage behavior is FOR
+ * (CP5 scope): only these endpoints' UI consumers turn a CLEAN stream end
+ * (≥1 frame accepted) into a `RemoteStreamCarrierError` and reopen at once,
+ * so ending the held stream cleanly on recovery is the one signal they
+ * retry. Endpoint by endpoint, verified against the RT bundle:
+ *
+ * - `session/follow` — dsh-api-gateway lib/client.js:1165, the
+ *   RemoteJournalStream `ended` callback: accepted →
+ *   `RemoteStreamCarrierError("… ended without a terminal result")`, which
+ *   feeds `waitForRemoteStreamRetry`;
+ * - `job/list` / `job/follow` — dsh-api-job-controller lib/client.js:269/303,
+ *   the same shape ("ended before release" / "ended before settlement");
+ * - `session/control` — dsh-api-session-controller lib/client.js:387
+ *   ("session control stream ended without a terminal result");
+ * - `workspace/follow` — dsh-api-workspace-controller lib/client.js:477
+ *   ("Workspace state stream ended without a terminal result").
+ *
+ * Every endpoint OUTSIDE the list has a consumer that renders a clean end as
+ * a TERMINAL error, so a hold would leave it frozen on recovery with no
+ * retry — those end with the ORIGINAL error code the moment the link dies
+ * (the pre-CP4 behavior). Verified: `workspaceFiles/changes`
+ * (dsh-api-workspace-files lib/client.js:112 — plain
+ * `Error("workspace file changes of … ended")`; dsh-client-ui-sidebar-files
+ * lib/client.js:229 — `Error("Directory watch ended: …")`),
+ * `terminal/retain` (dsh-api-terminal-controller lib/client.js:549 —
+ * `RemoteError("terminal/unavailable", "Terminal hold ended")`),
+ * `terminal/follow` (same file, lib/client.js:240 —
+ * `TerminalViewError("attachmentEnded")`).
+ *
+ * `session/control` and `workspace/follow` travel the MERGED route today
+ * (empty field tables → `mergedGlobalStream`, which holds by its own T23b-2
+ * design), so on this route the list's live members are `session/follow`,
+ * `job/list` and `job/follow`; they stay listed to keep the RT fact in one
+ * place. A future stream endpoint nobody classifies lands OUTSIDE the list —
+ * the honest terminal error, never a silent hold — the same safe default as
+ * the READ whitelist below it.
+ */
+const SESSION_STREAM_HOLD_ENDPOINTS: ReadonlySet<string> = new Set([
+  'session/follow',
+  'job/list',
+  'job/follow',
+  'session/control',
+  'workspace/follow',
+])
+
+/**
  * The reopen-backoff for a merged stream whose remote leg ended while the
  * relay STILL reads `online` (a clean `{type:'end'}`, a 429
  * `too-many-streams`, any error line that is not a link fact — none of them
@@ -1865,33 +1911,51 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   }
 
   /**
-   * Resolve when the relay next serves (`online`), or the caller aborts —
-   * false on the abort. True immediately when the relay already reads
-   * online. The listener removes itself on either exit; a throwing relay
-   * listener loop can never reach us (subscribe's contract keeps listener
-   * faults contained on the client side).
+   * How a serve-wait ended: the relay serves again (`online`), the caller
+   * aborted (`aborted`), or the pairing wall came down while waiting —
+   * `revoked`/`unpaired`, carried as their own verdict so the held stream can
+   * die a terminal death instead of waiting out a pairing that will not
+   * return on its own (CP5).
    */
-  function waitForOnline(signal: AbortSignal | undefined): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
+  type ServeWait = 'online' | 'aborted' | 'revoked' | 'unpaired'
+
+  /**
+   * Resolve when the relay next serves (`online`), or the wait is cut — the
+   * caller's abort, or the relay entering `revoked`/`unpaired` (CP5: a wall
+   * no ladder can climb — only the settings page can — so parking a held
+   * stream on it would hang the panel forever and leak the state listener).
+   * The listener removes itself on every exit; a throwing relay listener loop
+   * can never reach us (subscribe's contract keeps listener faults contained
+   * on the client side).
+   */
+  function waitForOnline(signal: AbortSignal | undefined): Promise<ServeWait> {
+    return new Promise<ServeWait>((resolve) => {
       if (signal?.aborted === true) {
-        resolve(false)
+        resolve('aborted')
         return
       }
       if (relay.state === 'online') {
-        resolve(true)
+        resolve('online')
+        return
+      }
+      // The wall may already be down when the wait starts (the leg died and
+      // the state flipped before this call) — same verdict as below.
+      if (relay.state === 'revoked' || relay.state === 'unpaired') {
+        resolve(relay.state)
         return
       }
       let off: (() => void) | undefined
-      const settle = (ok: boolean): void => {
+      const settle = (verdict: ServeWait): void => {
         if (off === undefined) return
         off()
         off = undefined
         signal?.removeEventListener('abort', onAbort)
-        resolve(ok)
+        resolve(verdict)
       }
-      const onAbort = (): void => settle(false)
+      const onAbort = (): void => settle('aborted')
       off = relay.subscribe((state) => {
-        if (state === 'online') settle(true)
+        if (state === 'online') settle('online')
+        else if (state === 'revoked' || state === 'unpaired') settle(state)
       })
       signal?.addEventListener('abort', onAbort, { once: true })
     })
@@ -1919,26 +1983,29 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * was a state fact) first waits out the reopen backoff: an error that
    * keeps contradicting an `online` state would otherwise spin the in-place
    * reopen in a hot microtask loop, so every retry costs at least the
-   * current backoff step. False only on caller abort.
+   * current backoff step. `aborted` only on caller abort; `revoked` /
+   * `unpaired` when the pairing wall came down (CP5).
    */
-  async function waitServeAgain(signal: AbortSignal | undefined, backoffMs: number): Promise<boolean> {
+  async function waitServeAgain(signal: AbortSignal | undefined, backoffMs: number): Promise<ServeWait> {
     if (relay.state === 'online') {
       await delayWait(signal, backoffMs)
-      if (signal?.aborted === true) return false
+      if (signal?.aborted === true) return 'aborted'
       if (relay.state !== 'online') return waitForOnline(signal)
-      return true
+      return 'online'
     }
     return waitForOnline(signal)
   }
 
   /**
    * Pump one session-level remote stream into the UI (CP4, SPEC story 54
-   * 「恢复后自动变回可用」): a mid-flight LINK death (`offline`, the
-   * server-restart line) must not end this UI stream with a terminal error —
-   * the UI rebuilds every failure into a `RemoteError` it treats as final
-   * (RT dsh-api-gateway lib/client.js: only `RemoteStreamCarrierError`
-   * feeds `waitForRemoteStreamRetry`; a wire `error` frame is terminal), and
-   * a frozen page was the observed fallout. Instead:
+   * 「恢复后自动变回可用」; CP5 scopes the hold to
+   * {@link SESSION_STREAM_HOLD_ENDPOINTS}): for those endpoints a mid-flight
+   * LINK death (`offline`, the server-restart line) must not end this UI
+   * stream with a terminal error — their UI turns an accepted clean end into
+   * a `RemoteStreamCarrierError` and retries (RT dsh-api-gateway
+   * lib/client.js: only `RemoteStreamCarrierError` feeds
+   * `waitForRemoteStreamRetry`; a wire `error` frame is terminal), and a
+   * frozen page was the observed fallout. For those endpoints, instead:
    *
    * - while the relay is down the stream stays OPEN and silent (the T34
    *   offline banner and the disabled composer explain the pause);
@@ -1952,9 +2019,20 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * - a generation still waiting for its first frame reopens the remote leg
    *   IN PLACE instead: ending it clean with nothing accepted would be the
    *   "ended before its opening snapshot" protocol violation, a terminal.
-   * - `unshared` / `not-shared` (the server closed the remote session) and
-   *   every other code stay terminal, exactly as before — the 远程已关闭
-   *   banner and the error states are real verdicts, not retryable blips.
+   * - the pairing wall (`revoked`/`unpaired`) ends the hold with a terminal
+   *   error in the wall's own code (CP5): no ladder climbs back from it, so
+   *   holding would park the stream — and its state listener — forever.
+   *
+   * Every OTHER endpoint's consumer treats a clean end as a TERMINAL error
+   * (the RT evidence is listed on {@link SESSION_STREAM_HOLD_ENDPOINTS}), so
+   * the hold would deliver, on recovery, the one shape their UI renders as a
+   * dead panel: those end with the ORIGINAL error code the moment the link
+   * dies — the pre-CP4 behavior.
+   *
+   * `unshared` / `not-shared` (the server closed the remote session) and
+   * every other code stay terminal for everyone, exactly as before — the
+   * 远程已关闭 banner and the error states are real verdicts, not retryable
+   * blips.
    */
   async function* rewriteUpstream(
     endpoint: string,
@@ -2005,11 +2083,30 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           throw new CodedStreamError(code, messageOf(error))
         }
         recordFailure(endpoint, code)
-        // A link-down fact (CP4): hold the UI stream open through the outage.
+        // A link-down fact (CP4), scoped by CP5: only the carrier-retry
+        // endpoints hold through the outage — everyone else ends with the
+        // original code right here (the pre-CP4 behavior; the RT evidence
+        // rides the list).
         if (!(error instanceof RelayError) || !LINK_DOWN_CODES.has(code)) {
           throw new CodedStreamError(code, messageOf(error))
         }
-        if (!(await waitServeAgain(signal, reopenDelayMs))) return
+        if (!SESSION_STREAM_HOLD_ENDPOINTS.has(endpoint)) {
+          throw new CodedStreamError(code, messageOf(error))
+        }
+        const serve = await waitServeAgain(signal, reopenDelayMs)
+        if (serve === 'aborted') return
+        // The pairing wall came down while held (CP5): no ladder climbs back
+        // from `revoked`/`unpaired` — only the settings page can — so the
+        // hold ends here as a terminal error in the wall's own code, and the
+        // serve-wait's state listener is released with it. A silent hold
+        // would freeze the panel with no verdict and no wake-up.
+        if (serve !== 'online') {
+          recordFailure(endpoint, serve)
+          throw new CodedStreamError(
+            serve,
+            serve === 'revoked' ? '配对令牌已被吊销，请在设置页重新配对' : '尚未与服务端配对，请在设置页完成配对',
+          )
+        }
         if (callerAborted()) return
         if (!first) return // the accepted-generation clean end the UI retries
         current = reopen()
@@ -2202,9 +2299,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       restoreRegisteredFields(CLIENT_METHOD_FIELDS[endpoint], clone)
       // Eager on purpose: an unpaired relay fails at CALL time, exactly like
       // the real openWireStream fails on a bad endpoint. An OFFLINE relay
-      // does not fail here (openStream only validates credentials) — the
-      // rewriteUpstream pump holds the UI stream open through the outage and
-      // reopens the leg when the relay serves again (CP4).
+      // does not fail here (openStream only validates credentials) — for the
+      // hold-list endpoints the rewriteUpstream pump holds the UI stream open
+      // through the outage and reopens the leg when the relay serves again
+      // (CP4); every other endpoint's first read fails out with the original
+      // code (CP5 scope, the pre-CP4 behavior).
       upstream = relay.openStream(namespace, method, clone, signal)
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
@@ -2212,9 +2311,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     }
     // RelayError raised DURING iteration flows through the pump below: an
     // `unshared` (or any non-link code) reaches the UI as a coded terminal
-    // error, a link-down fact holds the stream open and ends it cleanly
-    // once the relay serves again — the end the UI treats as a carrier
-    // failure and immediately retries (CP4).
+    // error; a link-down fact holds the stream open and ends it cleanly once
+    // the relay serves again — the end the hold-list endpoints' UI treats as
+    // a carrier failure and immediately retries (CP4) — while the endpoints
+    // OUTSIDE the list end with the original code at once, their consumers
+    // rendering a clean end as a terminal (CP5, SESSION_STREAM_HOLD_ENDPOINTS).
     return rewriteUpstream(endpoint, upstream, serverId, virtuals, signal, () =>
       relay.openStream(namespace, method, clone, signal),
     )
