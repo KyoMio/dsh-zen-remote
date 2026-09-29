@@ -41,6 +41,10 @@ import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 import { createShareStore } from './share-store.js'
 import { createRelayClient, RelayError } from './relay-client.js'
 import type { RelayClient } from './relay-client.js'
+import { runSelfCheck, installIntercept } from './intercept.js'
+import type { InterceptDiagnostics, InterceptHandle } from './intercept.js'
+import { checkGatewayShape } from './intercept-shape.js'
+import type { GatewayShapeCheck } from './intercept-shape.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 
@@ -61,6 +65,21 @@ import * as push from '../dsh-push.mjs'
 
 /** Exact route the phone composer POSTs one file body to. */
 export const UPLOAD_ROUTE = '/_dsh/mobile-nav/upload'
+
+/**
+ * The one piece of cordis the typert interception needs at RUNTIME: the
+ * registered symbol under which every cordis proxy answers with its raw
+ * instance (`symbols.original` in @deepseek-ai/cordis is
+ * `Symbol.for('cordis.original')`). Bound LOCALLY instead of imported —
+ * a runtime import would make the built lib depend on @deepseek-ai/cordis,
+ * whose dev copy in this package's node_modules would shadow the host's
+ * (the check-host-shadow gate fails the build for exactly that). Registered
+ * symbols are shared across module copies by design, so the lookup is
+ * identity-exact; if cordis ever renames the key the lookup yields
+ * undefined and the interception reports a refused install instead of
+ * misbehaving.
+ */
+const symbols = { original: Symbol.for('cordis.original') } as const
 
 /** Exact route the browser GETs the plugin row's client-facing knobs from.
  * The client bundle ships statically and never sees the row config, so the
@@ -650,6 +669,64 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       const code = error instanceof RelayError ? error.code : 'error'
       ctx.logger.warn('dsh-zen-remote relay client initial connect failed (%s): %s', code, message(error))
     })
+    // The typertGateway interception (T23b-1): remote-session calls ride the
+    // relay, everything else reaches the local gateway untouched. The live
+    // diagnostics flow to the client status route through whichever of the
+    // two slots is filled — an installed handle, or the shape verdict that
+    // REFUSED an install (both belong on the settings surface). A
+    // composition without typertGateway (0.1.7 client) leaves both empty and
+    // the status answer simply carries no intercept field.
+    let interceptHandle: InterceptHandle | undefined
+    let interceptRefused: GatewayShapeCheck | undefined
+    const interceptDiagnostics = (): InterceptDiagnostics | undefined => {
+      if (interceptHandle !== undefined) return interceptHandle.diagnostics()
+      if (interceptRefused !== undefined) {
+        return { installed: false, shape: interceptRefused, recentFailures: [] }
+      }
+      return undefined
+    }
+    ctx.inject(['typertGateway'], (gatewayCtx) => {
+      // Degraded logging: the real cordis context always carries a logger,
+      // but a row fake without one must not crash apply.
+      const logWarn = (...args: Parameters<Context['logger']['warn']>): void => { ctx.logger?.warn(...args) }
+      const proxy = (gatewayCtx as Context & { typertGateway?: unknown }).typertGateway
+      const raw = proxy !== null && typeof proxy === 'object'
+        ? (proxy as Record<PropertyKey, unknown>)[symbols.original]
+        : undefined
+      if (raw === null || typeof raw !== 'object') {
+        interceptRefused = { ok: false, reasons: ['original: typertGateway[symbols.original] is not an object'] }
+        logWarn('dsh-zen-remote client intercept not installed: %s', interceptRefused.reasons[0])
+        return
+      }
+      // Shape first (spike §4.1): a failed check leaves the gateway exactly
+      // as it was — remote features stay off, local behavior is untouched.
+      const shape = checkGatewayShape(raw)
+      if (!shape.ok) {
+        interceptRefused = shape
+        logWarn('dsh-zen-remote client intercept not installed: %s', shape.reasons.join('; '))
+        return
+      }
+      const handle = installIntercept({
+        raw,
+        relay: relayClient,
+        getServerId: () => relayClient.handshakeInfo?.serverId,
+        log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
+      })
+      interceptHandle = handle
+      gatewayCtx.effect(() => () => {
+        handle.uninstall()
+        if (interceptHandle === handle) interceptHandle = undefined
+      }, 'dsh-zen-remote: typert intercept')
+      // Behavior self-check (spike §4.1 check 4) — the shape check proves
+      // the constructor still resolves dynamically, this proves the wrap is
+      // actually REACHED: one local `workspace/follow` through
+      // wireStream.open must enter the wrapper at least once and answer a
+      // `baseline` first frame with a value.items array. One retry after a
+      // pause; only a second failure uninstalls (a half-trusted
+      // interception is worse than none). Failure handling lives in
+      // runSelfCheck, which records the verdict via noteSelfCheck.
+      void runSelfCheck(raw, { handle, log: logWarn })
+    })
     ctx.inject(['webServer', 'connection'], (clientCtx) => {
       clientCtx.effect(() => clientCtx.webServer.register({
         kind: 'prefix',
@@ -658,6 +735,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           admit: (req) => clientCtx.connection.admit(req),
           getRowConfig: () => config,
           getRelayClient: () => relayClient,
+          getIntercept: interceptDiagnostics,
         }),
       }), 'dsh-zen-remote: client routes')
     })
