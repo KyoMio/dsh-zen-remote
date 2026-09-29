@@ -56,6 +56,7 @@ const RELAY_PROTOCOL = 1
 const HANDSHAKE_PATH = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE_PATH = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM_PATH = '/_dsh/zen-remote/relay/v1/stream'
+const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
 
 /** How long a stream may stay line-silent before it is judged dead. */
 const DEFAULT_IDLE_TIMEOUT_MS = 45_000
@@ -119,19 +120,25 @@ export interface RelayHandshake {
  * One relay failure. `code` is the mapped reason (the contract's state
  * vocabulary, a server refusal like `not-shared`, or a DSH error code from
  * a 200 `{ok:false}` envelope); `status` carries the HTTP status when a
- * response existed. Fields are assigned in the constructor body rather than
- * declared as parameter properties: Node's strip-only type mode rejects
- * that syntax (the same rule as UploadError in index.ts).
+ * response existed. `reason` is the OPTIONAL structured detail some error
+ * frames carry beside the message — today only the server's `unshared`
+ * stream-closure frame, whose `reason` ('manual' | 'client' | 'idle', T34)
+ * the interceptor's closed-session display keys on. Fields are assigned in
+ * the constructor body rather than declared as parameter properties: Node's
+ * strip-only type mode rejects that syntax (the same rule as UploadError in
+ * index.ts).
  */
 export class RelayError extends Error {
   code: string
   status?: number
+  reason?: string
 
-  constructor(code: string, message?: string, httpStatus?: number) {
+  constructor(code: string, message?: string, httpStatus?: number, reason?: string) {
     super(message === undefined ? code : message)
     this.name = 'RelayError'
     this.code = code
     if (httpStatus !== undefined) this.status = httpStatus
+    if (reason !== undefined) this.reason = reason
   }
 }
 
@@ -205,6 +212,13 @@ export interface RelayClient {
   /** One invoke round-trip; resolves with the unwrapped `value`, throws
    * RelayError otherwise. A caller abort surfaces as `RelayError('aborted')`. */
   invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown>
+  /** Close one session's remote access on the SERVER (T34): the original
+   * (non-virtual) session id rides `POST relay/v1/unshare`, the server
+   * unshares it with reason `'client'`. Resolves on the success envelope;
+   * every refusal (`not-shared`, a wall, transport death) throws RelayError.
+   * A success proves the link and lifts a stale `offline` back to `online`,
+   * exactly like invoke. */
+  unshare(sessionId: string, signal?: AbortSignal): Promise<void>
   /** Open the NDJSON stream route. `frame` lines are yielded, `ping` lines
    * only refresh the idle clock, `end` finishes the iteration, an `error`
    * line throws its RelayError. A caller abort ENDS the iteration normally;
@@ -268,7 +282,11 @@ function classifyLine(line: string): LineVerdict {
     const detail = isRecord(parsed.error) ? parsed.error : {}
     const code = typeof detail.code === 'string' && detail.code !== '' ? detail.code : 'internal'
     const message = typeof detail.message === 'string' ? detail.message : undefined
-    return { kind: 'error', error: new RelayError(code, message) }
+    // The structured detail beside the message (T34): today only the
+    // `unshared` frame carries one. An absent or non-string reason stays
+    // undefined — the consumer degrades to its own default.
+    const reason = typeof detail.reason === 'string' ? detail.reason : undefined
+    return { kind: 'error', error: new RelayError(code, message, undefined, reason) }
   }
   // `ping` and any shape the protocol does not define — ignored.
   return { kind: 'none' }
@@ -707,6 +725,11 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     return payload.value
   }
 
+  async function unshare(sessionId: string, signal?: AbortSignal): Promise<void> {
+    const creds = requireCredentials()
+    await exchange(UNSHARE_PATH, { sessionId }, signal, true, creds)
+  }
+
   function openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown> {
     // Eager, not generator-lazy: an unconfigured client fails at CALL time,
     // exactly like connect/invoke, instead of hiding the error inside the
@@ -894,6 +917,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     credentialsChanged,
     stop,
     invoke,
+    unshare,
     openStream,
   }
 }

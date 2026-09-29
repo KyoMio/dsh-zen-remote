@@ -43,7 +43,11 @@
  *   persists its serverId (relay-server.ts loadServerId), so a re-pair to
  *   the same server reuses the prefix and is handled as a remote death
  *   ({@link WorkspaceMerger.onRemoteDown}) — the reconnect diff revives
- *   the group.
+ *   the group;
+ * - a relay status that is not serving normally (T34: offline, unpaired,
+ *   revoked, interface mismatch) only ANNOTATES TITLES: setStatus +
+ *   onStatusChanged re-upsert the shown groups under the annotated titles,
+ *   and the reconnecting baseline (which always upserts) restores them.
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
@@ -72,6 +76,24 @@ export interface MergerIdentity {
   serverName: string
 }
 
+/**
+ * The status annotation (T34) appended to every shown remote group's title
+ * while the relay is not serving normally. The CALLER (intercept.ts) maps the
+ * relay state onto one annotation — `revoked` / `unpaired` outrank `offline`,
+ * which outranks `mismatch` — and the merger only renders the suffix it is
+ * told to. The suffixes are the CHINESE copy, deliberately hardcoded here:
+ * this module is background code with no access to the UI language (the
+ * English forms live in src/client/locales.ts, `remoteGroup*` keys).
+ */
+export type MergerAnnotation = 'none' | 'offline' | 'revoked' | 'unpaired' | 'mismatch'
+
+const ANNOTATION_SUFFIX: Record<Exclude<MergerAnnotation, 'none'>, string> = {
+  offline: '（离线）',
+  revoked: '（令牌已吊销）',
+  unpaired: '（已解除配对）',
+  mismatch: '（版本有差异）',
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -94,13 +116,21 @@ function idList(value: unknown): string[] {
 }
 
 /** One workspace record rewritten for the UI: ids virtualized, the title
- * prefixed with the server name, `path` untouched (a server-side display
- * path). Values are copied — the caller's frame is never mutated. */
-function virtualizeWorkspace(record: Record<string, unknown>, identity: MergerIdentity): Record<string, unknown> {
+ * prefixed with the server name and — while an annotation is set — suffixed
+ * with its status copy. Values are copied — the caller's frame is never
+ * mutated. */
+function virtualizeWorkspace(
+  record: Record<string, unknown>,
+  identity: MergerIdentity,
+  annotation: MergerAnnotation,
+): Record<string, unknown> {
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
   const out: Record<string, unknown> = { ...record }
   if (typeof record.workspaceId === 'string') out.workspaceId = virtualize(record.workspaceId)
-  if (typeof record.title === 'string') out.title = `${identity.serverName} · ${record.title}`
+  if (typeof record.title === 'string') {
+    const suffix = annotation === 'none' ? '' : ANNOTATION_SUFFIX[annotation]
+    out.title = `${identity.serverName} · ${record.title}${suffix}`
+  }
   if (Array.isArray(record.sessionIds)) {
     out.sessionIds = record.sessionIds.map((id) => (typeof id === 'string' ? virtualize(id) : id))
   }
@@ -139,6 +169,16 @@ export interface WorkspaceMerger {
   /** The server was renamed (same serverId — call after {@link retarget}):
    * re-upserts every shown workspace under the new title, nothing else. */
   onServerRenamed(): unknown[]
+  /** Record the status annotation (T34) future virtualized titles carry. No
+   * frames on its own — pair it with {@link onStatusChanged} to re-upsert the
+   * shown groups under the new annotation, or let the next natural upserts
+   * (a reconnecting baseline) carry it. */
+  setStatus(annotation: MergerAnnotation): void
+  /** Re-upsert every SHOWN workspace under the CURRENT annotation: the whole
+   * update when the relay's serving status changed without any remote frame
+   * (offline, revoked, unpaired, version mismatch). [] while nothing is
+   * shown (no local baseline yet, or no remote state). */
+  onStatusChanged(): unknown[]
   /** Point the merger at a (possibly different) server. Local state survives;
    * for a serverId change the remote state must be gone first (onRemoteGone
    * first); for a rename it may stay. */
@@ -170,6 +210,8 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   let remote = new Map<string, Record<string, unknown>>()
   let remoteArchived: string[] = []
   let remotePinned: string[] = []
+  // The status annotation every virtualized title currently carries (T34).
+  let annotation: MergerAnnotation = 'none'
 
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
   const remoteIds = (): string[] => [...remote.keys()].map(virtualize)
@@ -177,7 +219,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   const remotePinnedVirtual = (): string[] => remotePinned.map(virtualize)
 
   const virtualWorkspaces = (): Record<string, unknown>[] =>
-    [...remote.values()].map((record) => virtualizeWorkspace(record, identity))
+    [...remote.values()].map((record) => virtualizeWorkspace(record, identity, annotation))
   const upsertFrames = (): unknown[] => virtualWorkspaces().map((workspace) => ({ type: 'upsert', workspace }))
   const mergedOrderFrame = (): unknown => ({ type: 'order', workspaceIds: [...localOrder, ...remoteIds()] })
   const mergedArchivedFrame = (): unknown => ({
@@ -298,7 +340,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
             return []
           }
           const out: unknown[] = []
-          for (const [id, record] of next) out.push({ type: 'upsert', workspace: virtualizeWorkspace(record, identity) })
+          for (const [id, record] of next) out.push({ type: 'upsert', workspace: virtualizeWorkspace(record, identity, annotation) })
           for (const id of remote.keys()) {
             if (!next.has(id)) out.push({ type: 'remove', workspaceId: virtualize(id) })
           }
@@ -318,7 +360,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           const isNew = !remote.has(id)
           remote.set(id, { ...workspace })
           if (!localSeen) return []
-          const out: unknown[] = [{ type: 'upsert', workspace: virtualizeWorkspace(workspace, identity) }]
+          const out: unknown[] = [{ type: 'upsert', workspace: virtualizeWorkspace(workspace, identity, annotation) }]
           // A workspace the UI has not seen needs a position too.
           if (isNew) out.push(mergedOrderFrame())
           return out
@@ -386,6 +428,15 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       return upsertFrames()
     },
 
+    setStatus(next: MergerAnnotation): void {
+      annotation = next
+    },
+
+    onStatusChanged(): unknown[] {
+      if (!localSeen || remote.size === 0) return []
+      return upsertFrames()
+    },
+
     onRemoteGone(): unknown[] {
       const hadAny = remote.size > 0 || remoteArchived.length > 0 || remotePinned.length > 0
       const out: unknown[] = []
@@ -431,6 +482,11 @@ export interface ControlMerger {
   onRemoteGone(): unknown[]
   /** Always [] — projection frames carry no display name. */
   onServerRenamed(): unknown[]
+  /** Accepted and ignored: a status annotation is a TITLE concern, and
+   * control projections carry no titles. */
+  setStatus(annotation: MergerAnnotation): void
+  /** Always [] — nothing shown here could carry an annotation. */
+  onStatusChanged(): unknown[]
   retarget(identity: MergerIdentity): void
 }
 
@@ -557,6 +613,12 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
     },
 
     onServerRenamed(): unknown[] {
+      return []
+    },
+
+    setStatus(_annotation: MergerAnnotation): void {},
+
+    onStatusChanged(): unknown[] {
       return []
     },
   }

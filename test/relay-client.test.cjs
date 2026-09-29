@@ -20,6 +20,7 @@ const { createRelayClient, relayCredentialsDigest, RelayError } = require('../li
 const HANDSHAKE = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM = '/_dsh/zen-remote/relay/v1/stream'
+const UNSHARE = '/_dsh/zen-remote/relay/v1/unshare'
 
 const HANDSHAKE_OK = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: { algo: 'sha256' } }]
 
@@ -41,6 +42,7 @@ function startFakeRelay() {
     handshake: HANDSHAKE_OK,
     invoke: () => [200, { ok: true, value: { answer: 42 } }],
     stream: undefined,
+    unshare: () => [200, { ok: true }],
   }
   const server = http.createServer((req, res) => {
     const chunks = []
@@ -70,6 +72,11 @@ function startFakeRelay() {
       if (route === STREAM) {
         if (scenario.stream) { scenario.stream(req, res, body); return }
         sendJson(res, 403, { ok: false, error: { code: 'forbidden-method' } })
+        return
+      }
+      if (route === UNSHARE) {
+        const answered = scenario.unshare(req, res)
+        if (answered !== undefined) sendJson(res, answered[0], answered[1])
         return
       }
       sendJson(res, 404, { ok: false, error: { code: 'not-found' } })
@@ -1142,5 +1149,68 @@ test('compat: a credential change clears the verdict even while online (T23b2-fi
     assert.equal(client.compat, undefined, 'the verdict goes with the credentials it was earned with')
     await waitFor(() => client.state === 'online', 3000)
     assert.deepEqual(client.compat?.identical, ['algo'], 'the new handshake earned a fresh verdict')
+  } finally { await relay.stop() }
+})
+
+// ---- T34: unshare + the structured error reason ------------------------------------
+
+test('T34 unshare: the original sessionId rides POST relay/v1/unshare with the bearer token; success resolves', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    await client.unshare('session-a')
+    const seen = relay.seen.filter((call) => call.url === UNSHARE)
+    assert.equal(seen.length, 1)
+    assert.deepEqual(seen[0].body, { sessionId: 'session-a' })
+    assert.equal(seen[0].headers.authorization, 'Bearer tok-1')
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('T34 unshare: a refusal throws its code and never moves the state; unconfigured throws unpaired offline', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.unshare = () => [403, { ok: false, error: { code: 'not-shared' } }]
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    await assert.rejects(client.unshare('session-gone'), (error) => error instanceof RelayError && error.code === 'not-shared')
+    assert.equal(client.state, 'online', 'a per-call refusal is not a link fact')
+
+    const { client: bare } = makeClient(relay.port, { token: '' })
+    await assert.rejects(bare.unshare('session-a'), (error) => error instanceof RelayError && error.code === 'unpaired')
+    assert.equal(bare.state, 'unpaired')
+  } finally { await relay.stop() }
+})
+
+test('T34 stream: the error line carries the structured reason on RelayError (and stays absent without one)', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.stream = (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+    res.write('{"type":"error","error":{"code":"unshared","message":"closed","reason":"idle"}}\n')
+  }
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    const { error } = await collect(client.openStream('session', 'follow', {}))
+    assert.ok(error instanceof RelayError)
+    assert.equal(error.code, 'unshared')
+    assert.equal(error.reason, 'idle', 'the structured close reason survived the line parser')
+
+    relay.scenario.stream = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.end('{"type":"error","error":{"code":"unshared","message":"closed"}}\n')
+    }
+    const again = await collect(client.openStream('session', 'follow', {}))
+    assert.equal(again.error.code, 'unshared')
+    assert.equal(again.error.reason, undefined, 'an older server frame without a reason stays undefined')
+
+    relay.scenario.stream = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.end('{"type":"error","error":{"code":"internal","message":"x","reason":42}}\n')
+    }
+    const junk = await collect(client.openStream('session', 'follow', {}))
+    assert.equal(junk.error.code, 'internal')
+    assert.equal(junk.error.reason, undefined, 'a non-string reason is dropped')
   } finally { await relay.stop() }
 })

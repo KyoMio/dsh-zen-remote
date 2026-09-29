@@ -241,6 +241,23 @@ export const zh = {
   'settings.client.diagRecentFailures': '最近的远程调用失败',
   'settings.client.diagCompatGroups': '指纹有差异的组：{groups}',
   'settings.client.diagCompatCalls': '最近的不兼容调用',
+  // --- T34 子客户端远程状态：标题行图标、横幅、关闭远程 ---
+  'remoteStatusOnline': '远程会话 · 已连接',
+  'remoteStatusOffline': '服务端离线，正在重连',
+  'remoteStatusMismatch': '与服务端版本不一致，部分功能可能不可用',
+  'remoteBannerOffline': '服务端离线，远程会话暂时只读，恢复连接后自动可用',
+  'remoteBannerClosedIdle': '远程已关闭：闲置超过设定时间，已自动休眠',
+  'remoteBannerClosedManual': '远程已关闭：服务端已关闭此会话的远程',
+  'remoteBannerClosedClient': '远程已关闭：已在本机关闭远程',
+  'remoteStatusUnshareConfirm': '关闭远程后，此会话将从本机的远程分组中移除，服务端上的会话不受影响。确定关闭？',
+  'remoteStatusOfflineClick': '服务端离线，无法操作',
+  'remoteStatusUnshareFail': '关闭远程失败，请稍后再试',
+  // 远程分组标题的后缀（后台 merge-streams 拿不到界面语言，固定用中文）；
+  // 这里登记英文对照，供界面侧需要复述同样状态时使用。
+  'remoteGroupOffline': '（离线）',
+  'remoteGroupRevoked': '（令牌已吊销）',
+  'remoteGroupUnpaired': '（已解除配对）',
+  'remoteGroupMismatch': '（版本有差异）',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -480,6 +497,24 @@ export const en: Record<MobileNavKey, string> = {
   'settings.client.diagRecentFailures': 'Recent remote call failures',
   'settings.client.diagCompatGroups': 'Groups with fingerprint differences: {groups}',
   'settings.client.diagCompatCalls': 'Recent incompatible calls',
+  // --- T34 remote-status icon, composer banner, unshare ---
+  'remoteStatusOnline': 'Remote session · connected',
+  'remoteStatusOffline': 'Server offline — reconnecting',
+  'remoteStatusMismatch': 'Version differs from the server — some features may not work',
+  'remoteBannerOffline': 'Server offline — this remote session is read-only until the connection recovers',
+  'remoteBannerClosedIdle': 'Remote closed: idle past the configured time, the session went to sleep',
+  'remoteBannerClosedManual': 'Remote closed: the server withdrew this session\u2019s remote access',
+  'remoteBannerClosedClient': 'Remote closed: remote access was turned off on this machine',
+  'remoteStatusUnshareConfirm': 'Closing the remote removes this session from this machine\u2019s remote group; the session on the server is untouched. Close it?',
+  'remoteStatusOfflineClick': 'The server is offline — nothing to do',
+  'remoteStatusUnshareFail': 'Closing the remote failed — try again later',
+  // Remote group title suffixes (the background merger cannot know the UI
+  // language and always uses the Chinese forms); the English equivalents
+  // live here for UI surfaces that restate the same status.
+  'remoteGroupOffline': ' (offline)',
+  'remoteGroupRevoked': ' (token revoked)',
+  'remoteGroupUnpaired': ' (unpaired)',
+  'remoteGroupMismatch': ' (version mismatch)',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

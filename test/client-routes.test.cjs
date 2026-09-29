@@ -1080,3 +1080,148 @@ test('T42 status: the interceptor\u2019s incompatible calls flow into compat', a
     assert.deepEqual(body.compat.different, [], 'no relay client verdict — no differences claimed')
   } finally { await closeServer(server) }
 })
+
+// ---- T34: remote-status + client/unshare -----------------------------------------
+
+const { toVirtual } = require('../lib/virtual-id.js')
+const T34_SERVER_ID = 'abcd1234'
+const T34_VIRTUAL = toVirtual(T34_SERVER_ID, 'session-a')
+
+test('T34 remote-status: unadmitted is 401, wrong method is 405', async () => {
+  const row = makeRow()
+  const unadmitted = await startClientServer(row, {
+    admit: () => ({ rejection: 401 }),
+    getRelayClient: () => fakeRelay({ state: 'online', handshakeInfo: INFO('x'), lastHandshakeDigest: 'd' }),
+  })
+  try {
+    const res = await request(unadmitted.port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })
+    assert.equal(res.status, 401)
+  } finally { await closeServer(unadmitted.server) }
+
+  const { server, port } = await startClientServer(row, {
+    getRelayClient: () => fakeRelay({ state: 'online', handshakeInfo: INFO('x'), lastHandshakeDigest: 'd' }),
+  })
+  try {
+    const methods = await request(port, { method: 'POST', path: routes.CLIENT_REMOTE_STATUS_ROUTE, headers: sameOrigin(port) })
+    assert.equal(methods.status, 405)
+    assert.equal(methods.headers.allow, 'GET')
+  } finally { await closeServer(server) }
+})
+
+test('T34 remote-status: the body carries state/compat/name/closed — and never a token or a server address', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('书房服务器'),
+    lastHandshakeDigest: relayCredentialsDigest(gwUrl, 'tok-row'),
+    compat: { identical: ['session'], different: ['workspace'], unavailable: [] },
+  })
+  const intercept = {
+    installed: true,
+    shape: { ok: true, notes: [] },
+    recentFailures: [],
+    incompatibleCalls: [],
+    closedSessions: [{ sessionId: T34_VIRTUAL, reason: 'idle' }, { sessionId: toVirtual(T34_SERVER_ID, 'b'), reason: 'client' }],
+  }
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay, getIntercept: () => intercept })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })
+    const body = JSON.parse(res.body)
+    assert.deepEqual(body, {
+      state: 'online',
+      versionMismatch: true,
+      serverName: '书房服务器',
+      closed: { [T34_VIRTUAL]: 'idle', [toVirtual(T34_SERVER_ID, 'b')]: 'client' },
+    })
+    assert.ok(!res.body.includes('tok-row'), 'no token anywhere in the body')
+    assert.ok(!res.body.includes(gwUrl), 'no server address in the body')
+  } finally { await closeServer(server) }
+})
+
+test('T34 remote-status: no relay client reads unpaired; an offline relay reads offline', async () => {
+  const row = makeRow()
+  const { server, port } = await startClientServer(row)
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })).body)
+    assert.deepEqual(body, { state: 'unpaired', versionMismatch: false, serverName: '', closed: {} })
+  } finally { await closeServer(server) }
+
+  const relay = fakeRelay({ state: 'offline', handshakeInfo: INFO('断线服务器'), lastHandshakeDigest: 'd' })
+  const second = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const body = JSON.parse((await request(second.port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'offline')
+    assert.equal(body.versionMismatch, false, 'no compat verdict — no mismatch claim')
+  } finally { await closeServer(second.server) }
+})
+
+test('T34 client/unshare: the wall order holds (401 unadmitted, 405 wrong method, 403 cross-site)', async () => {
+  const row = makeRow()
+  const unadmitted = await startClientServer(row, { admit: () => ({ rejection: 401 }) })
+  try {
+    const res = await request(unadmitted.port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers: sameOrigin(unadmitted.port), body: { sessionId: T34_VIRTUAL } })
+    assert.equal(res.status, 401)
+  } finally { await closeServer(unadmitted.server) }
+
+  const { server, port } = await startClientServer(row)
+  try {
+    const methods = await request(port, { method: 'GET', path: routes.CLIENT_UNSHARE_ROUTE })
+    assert.equal(methods.status, 405)
+    assert.equal(methods.headers.allow, 'POST')
+    const cross = await request(port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers: { origin: 'http://evil.example' }, body: { sessionId: T34_VIRTUAL } })
+    assert.equal(cross.status, 403)
+  } finally { await closeServer(server) }
+})
+
+test('T34 client/unshare: a non-virtual id is 400 and nothing is forwarded', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('x'), lastHandshakeDigest: 'd' })
+  const unshared = []
+  relay.unshare = async (id) => { unshared.push(id) }
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    for (const bad of ['session-712828e2', 'zr~short', 'zr~zzzzzzzz~not-hex-server', '']) {
+      const res = await request(port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers: sameOrigin(port), body: { sessionId: bad } })
+      assert.equal(res.status, 400, bad)
+      assert.equal(JSON.parse(res.body).error.code, 'not-virtual')
+    }
+    assert.deepEqual(unshared, [])
+  } finally { await closeServer(server) }
+})
+
+test('T34 client/unshare: the ORIGINAL id rides to relay.unshare; a foreign server answers remote-mismatch without forwarding', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('x'), lastHandshakeDigest: 'd' })
+  const unshared = []
+  relay.unshare = async (id) => { unshared.push(id) }
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const ok = await request(port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers: sameOrigin(port), body: { sessionId: T34_VIRTUAL } })
+    assert.equal(ok.status, 200)
+    assert.deepEqual(JSON.parse(ok.body), { ok: true })
+    assert.deepEqual(unshared, ['session-a'], 'the virtual prefix was stripped before the relay call')
+  } finally { await closeServer(server) }
+
+  const foreign = toVirtual('ffffffff', 'session-elsewhere')
+  relay.unshare = async () => { throw new Error('must not be reached') }
+  const second = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const res = await request(second.port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers: sameOrigin(second.port), body: { sessionId: foreign } })
+    assert.equal(res.status, 200)
+    assert.equal(JSON.parse(res.body).error.code, 'remote-mismatch')
+  } finally { await closeServer(second.server) }
+})
+
+test('T34 client/unshare: a relay failure travels with its code', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('x'), lastHandshakeDigest: 'd' })
+  relay.unshare = async () => { throw new RelayError('not-shared', 'the session is not shared', 403) }
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers: sameOrigin(port), body: { sessionId: T34_VIRTUAL } })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.ok, false)
+    assert.equal(body.error.code, 'not-shared')
+  } finally { await closeServer(server) }
+})

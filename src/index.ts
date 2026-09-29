@@ -740,7 +740,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     const interceptDiagnostics = (): InterceptDiagnostics | undefined => {
       if (interceptHandle !== undefined) return interceptHandle.diagnostics()
       if (interceptRefused !== undefined) {
-        return { installed: false, shape: interceptRefused, recentFailures: [], incompatibleCalls: [] }
+        return { installed: false, shape: interceptRefused, recentFailures: [], incompatibleCalls: [], closedSessions: [] }
       }
       return undefined
     }
