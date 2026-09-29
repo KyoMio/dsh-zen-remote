@@ -116,7 +116,8 @@ export interface InstallInterceptOptions {
     /** The client relay client (T23a) the calls travel through. */
     relay: RelayClient;
     /** The CURRENT handshake's server id, read live per call; `undefined`
-     * (never handshook) makes every remote call a `remote-mismatch`. */
+     * (never handshook) makes every remote call a `remote-offline` — a
+     * different fact from pointing at the wrong server (`remote-mismatch`). */
     getServerId: () => string | undefined;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
@@ -129,7 +130,9 @@ export interface InterceptHandle {
      * install time, the self-check verdict, the failure ring. */
     diagnostics(): InterceptDiagnostics;
     /** How many calls entered each wrapper (local passthroughs included) —
-     * the behavior self-check's "the wrap was reached" proof. */
+     * diagnostic traffic counters for the status surface; the behavior
+     * self-check proves "the wrap was reached" by probe-payload identity
+     * instead. */
     wrappedCalls(): {
         openWireStream: number;
         dispatchRpc: number;
@@ -158,14 +161,20 @@ export interface SelfCheckOptions {
  * the shape check cannot prove — that the wrap is actually REACHED — through
  * `wireStream.open('workspace/follow', …)` and demand a `baseline` first
  * frame whose `value.items` is an array (the real workspace baseline's
- * shape). The caller decides what "the wrap was reached" means by comparing
- * `wrappedCalls()` before/after — {@link runSelfCheck} owns that policy.
+ * shape). The probe payload is marked in {@link probePayloads} before the
+ * call and the wrapper flags that exact object, so the verdict covers both
+ * faults at once: frames that are not a workspace feed, and a wire adapter
+ * that routes around the wrapper. The real gateway's `openWireStream` is
+ * `async` (RT dsh-api-gateway), so the adapter's `open()` returns a PROMISE
+ * of the stream — the await sits inside the same timeout race as the
+ * first-frame wait, so an upstream that never settles fails the check
+ * instead of hanging startup.
  */
 export declare function behaviorSelfCheck(raw: object, options?: SelfCheckOptions): Promise<SelfCheckResult>;
 export interface RunSelfCheckOptions {
-    /** The handle whose self-check verdict, uninstall and call counters are
+    /** The handle whose self-check verdict, uninstall and installed state are
      * driven. */
-    handle: Pick<InterceptHandle, 'noteSelfCheck' | 'uninstall' | 'wrappedCalls'>;
+    handle: Pick<InterceptHandle, 'noteSelfCheck' | 'uninstall' | 'diagnostics'>;
     /** How long to wait before the single retry; default 3000 ms. */
     retryDelayMs?: number;
     /** Failure logging, wired to the context logger by index.ts. */
@@ -174,11 +183,15 @@ export interface RunSelfCheckOptions {
 /**
  * Run the behavior self-check with the wiring's failure policy: ONE retry
  * after a pause (a transiently unready upstream must not cost the whole
- * interception), and only a second failure uninstalls and records. "The
- * wrap was reached" is a COUNTER DELTA, not an absolute count: the UI or
- * another plugin may open streams of its own while the probe waits for its
- * first frame, so the check demands at least one wrapper entry above the
- * pre-probe baseline, never exactly one.
+ * interception), and only a second failure uninstalls and records. Each
+ * attempt is judged on its own — the probe payload is recognized inside the
+ * wrapper by identity, so streams the UI opens during the check change
+ * nothing. The plugin may be disposed while a check is in flight (a row
+ * reload during startup), so the handle's installed state is re-read before
+ * the retry and after every attempt: an uninstalled check exits silently —
+ * no further probe, no verdict, no "interception removed" warning (that
+ * removal was not ours to announce, and a post-uninstall probe would run
+ * against the unwrapped gateway and fail spuriously).
  */
 export declare function runSelfCheck(raw: object, options: RunSelfCheckOptions): Promise<SelfCheckResult>;
 //# sourceMappingURL=intercept.d.ts.map

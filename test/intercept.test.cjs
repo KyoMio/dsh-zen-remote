@@ -68,9 +68,10 @@ class FakeTypertGateway {
     if (scripted !== undefined) return Promise.resolve(scripted)
     return Promise.resolve({ ok: true, value: { endpoint } })
   }
-  // The 0.2.0 TypertGatewayService's openWireStream is an ASYNC method — the
-  // host's mux does `await this.open(...)` and then for-awaits the result —
-  // so the fake is async too and every caller must await it.
+  // `async` like the host's real method (RT dsh-api-gateway: `async
+  // openWireStream(...)`), so everything below it — the wire adapter's
+  // open(), our wrap's passthrough return value — hands its caller a
+  // Promise of the stream, exactly as production does.
   async openWireStream(endpoint, payload, uplink, peer, signal, control) {
     this.streamCalls.push({ endpoint, payload, uplink, peer, signal, control })
     const scripted = this.spec.stream ? this.spec.stream[endpoint] : undefined
@@ -927,9 +928,13 @@ test('diagnostics reports the shape verdict, the self-check and the failure ring
   }
   assert.equal(handle.diagnostics().recentFailures.length, 20)
   // An envelope failure ALSO lands in the ring (a relay refusal is a remote
-  // call failure like any other).
+  // call failure like any other) — and its envelope carries the host-mandated
+  // `details` object: dsh-client-connection refuses a failure without one, so
+  // the forwardInvoke catch branch must not skip it.
   relay.invokeThrow = new RelayError('not-shared')
-  await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
+  const thrown = await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
+  assert.equal(thrown.ok, false)
+  assert.deepEqual(thrown.error.details, {}, 'the catch-branch envelope carries details: {}')
   const ring = handle.diagnostics().recentFailures
   assert.equal(ring[ring.length - 1].code, 'not-shared')
   handle.uninstall()
@@ -987,11 +992,29 @@ function makeSelfCheckTarget(streamSpec) {
   return { gateway, handle }
 }
 
-test('runSelfCheck passes when OTHER streams run concurrently (counter delta, not absolute)', async () => {
+/**
+ * The runSelfCheck retry timer is unref()ed (a disposed plugin must not hold
+ * a live process open for the delay), so a test awaiting nothing but that
+ * timer lets the event loop drain — node:test then cancels the case with
+ * "Promise resolution is still pending". A short ref'd keepalive stands in
+ * for the production process's own live handles: an unref'd timer still
+ * FIRES on schedule as long as any other handle exists.
+ */
+async function withLoopKeepalive(ms, run) {
+  const keepalive = setTimeout(() => {}, ms)
+  try {
+    return await run()
+  } finally {
+    clearTimeout(keepalive)
+  }
+}
+
+test('runSelfCheck passes when OTHER streams run concurrently (the probe is judged by identity, not by count)', async () => {
   const { gateway, handle } = makeSelfCheckTarget(undefined)
-  // The UI opens its own local stream while the probe waits for its first
-  // frame: the wrap counter rises by TWO, and an absolute === 1 check would
-  // have uninstalled a perfectly healthy interception.
+  // The UI opens its own local stream while the probe runs: both enter the
+  // wrap, and the verdict must come from the probe payload ALONE — neither
+  // an absolute count nor a delta, either of which could mistake the UI's
+  // traffic for (or against) the probe.
   const pending = runSelfCheck(gateway, { handle, retryDelayMs: 1 })
   void drained(gateway.wireTap('workspace/follow', { args: {} }, undefined, undefined, undefined, { signal: undefined }))
   const result = await pending
@@ -1017,7 +1040,7 @@ test('runSelfCheck retries ONCE and recovers from a transient first failure', as
   }
   const relay = createFakeRelay()
   const { handle } = install(gateway, relay)
-  const result = await runSelfCheck(gateway, { handle, retryDelayMs: 5 })
+  const result = await withLoopKeepalive(200, () => runSelfCheck(gateway, { handle, retryDelayMs: 5 }))
   assert.deepEqual(result, { ok: true })
   assert.equal(opens, 2, 'exactly one retry')
   assert.equal(handle.diagnostics().installed, true, 'a recovered self-check keeps the interception')
@@ -1035,18 +1058,70 @@ test('runSelfCheck fault A: the wrap is bypassed (closure-bound wire adapter)', 
   }
   const relay = createFakeRelay()
   const { handle } = install(gateway, relay)
-  const result = await runSelfCheck(gateway, { handle, retryDelayMs: 1 })
+  const result = await withLoopKeepalive(200, () => runSelfCheck(gateway, { handle, retryDelayMs: 1 }))
   assert.equal(result.ok, false)
   assert.match(result.reason, /bypassed the wrapper/)
   assert.equal(handle.diagnostics().installed, false, 'two failed runs uninstall')
   assert.equal(handle.diagnostics().selfCheck.ok, false)
 })
 
+test('runSelfCheck fault A: a concurrent UI stream does not mask a bypassed probe', async () => {
+  // The old counter-delta check read ANY wrapper entry above the baseline,
+  // so a stream the UI opened while the probe ran would vouch for a wire
+  // adapter that routes around the wrapper. Here the probe rides the
+  // prototype (bypassed) while a healthy local stream DOES enter the wrap —
+  // the probe payload is judged by identity, so this must still fail.
+  const gateway = new FakeTypertGateway({ stream: { 'workspace/follow': [{ type: 'baseline', value: { items: [] } }] } })
+  gateway.wireStream = {
+    open: (endpoint, payload, uplink, peer, signal) =>
+      FakeTypertGateway.prototype.openWireStream.call(gateway, endpoint, payload, uplink, peer, signal, { signal: undefined }),
+  }
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const pending = runSelfCheck(gateway, { handle, retryDelayMs: 1 })
+  void drained(gateway.wireTap('workspace/follow', { args: {} }, undefined, undefined, undefined, { signal: undefined }))
+  const result = await withLoopKeepalive(200, () => pending)
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /bypassed the wrapper/)
+  assert.equal(handle.diagnostics().installed, false, 'two failed runs uninstall')
+})
+
+test('runSelfCheck does not retry after the interception was uninstalled mid-check', async () => {
+  // The first attempt fails on the frame shape; the plugin is disposed during
+  // the retry delay. The retry must never run (no second probe against the
+  // now-unwrapped gateway), the verdict must stay unrecorded, and the removal
+  // must not be announced — it was not ours.
+  let opens = 0
+  const gateway = new FakeTypertGateway({ stream: { 'workspace/follow': [{ type: 'ready' }] } })
+  gateway.wireStream = {
+    open(endpoint, payload, uplink, peer, signal) {
+      opens += 1
+      return gateway.openWireStream(endpoint, payload, uplink, peer, signal, { signal })
+    },
+  }
+  const relay = createFakeRelay()
+  const logging = makeLog()
+  const handle = installIntercept({ raw: gateway, relay, getServerId: () => SERVER_ID, log: logging.log })
+  const result = await withLoopKeepalive(200, async () => {
+    const pending = runSelfCheck(gateway, { handle, retryDelayMs: 30, log: logging.log })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    handle.uninstall()
+    return pending
+  })
+  assert.equal(result.ok, false)
+  assert.equal(opens, 1, 'the probe ran once — the retry never opened a stream')
+  assert.equal(handle.diagnostics().selfCheck, undefined, 'an uninstalled check records no verdict')
+  assert.ok(
+    !logging.lines.some(([format]) => String(format).includes('interception removed')),
+    logging.lines.map(String).join('|'),
+  )
+})
+
 test('runSelfCheck fault B: the first frame is not a baseline', async () => {
   // ONE fault only: the wrap IS reached (counter moves), but the first
   // frame answers `ready` on every attempt.
   const { gateway, handle } = makeSelfCheckTarget({ 'workspace/follow': [{ type: 'ready' }] })
-  const result = await runSelfCheck(gateway, { handle, retryDelayMs: 1 })
+  const result = await withLoopKeepalive(200, () => runSelfCheck(gateway, { handle, retryDelayMs: 1 }))
   assert.equal(result.ok, false)
   assert.match(result.reason, /baseline/)
   assert.equal(handle.diagnostics().installed, false, 'two failed runs uninstall')
