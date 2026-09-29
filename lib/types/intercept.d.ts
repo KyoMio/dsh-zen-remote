@@ -17,10 +17,13 @@
  *   table get one defensive deep scan instead — a virtual id found anywhere
  *   must never reach the local DSH, so the call is refused
  *   (`remote-unsupported`); for registered methods only the registered
- *   fields are read, the same decoy discipline the server applies. The
- *   three field-less GLOBAL reads therefore never refuse on their arguments:
- *   a stray id in them is unowned data, they pass through untouched, and
- *   merging their state is T23b-2.
+ *   fields are read, the same decoy discipline the server applies. The three
+ *   field-less GLOBAL reads (`workspace/follow`, `session/control`,
+ *   `session/list`) never refuse on their arguments either — since T23b-2
+ *   they are MERGED instead: the local answer passes through and the relay's
+ *   filtered answer is folded in by src/merge-streams.ts (remote workspaces
+ *   appear as `zr~`-prefixed groups after the local ones; a remote baseline
+ *   never reaches the UI as a second baseline).
  * - before forwarding, the call's virtual ids must all belong to ONE server
  *   AND to the server this relay client is handshook with (`remote-mismatch`);
  *   with no handshake at all the answer is `remote-offline`.
@@ -40,6 +43,10 @@
  *   every error THROWN on the stream route is marked `isDSHRemoteError` with
  *   a string `code` (dsh-typert-protocol's remoteErrorOf folds unmarked
  *   errors into `gateway/internal`, losing the code).
+ * - the 0.2.0 `openWireStream` is an ASYNC method — the host's mux does
+ *   `await this.open(...)` and then `for await` over the result. The merge
+ *   route therefore awaits the local original too and hands the host back a
+ *   promise of the merged iterable, the same shape the real method returns.
  */
 import type { RelayClient } from './relay-client.js';
 import type { GatewayShapeCheck } from './intercept-shape.js';
@@ -55,9 +62,9 @@ export type SessionField = 'request.sessionId' | 'request.address';
  * server does not check would strand a virtual id un-rewritten.
  *
  * The three global reads carry no field: nothing in their arguments is
- * session-scoped, so this module never forwards them (merging their state
- * is T23b-2) — a virtual id smuggled into their arguments deep-scans to a
- * refusal, same as any unregistered method.
+ * session-scoped, so they are never REFUSED on their arguments — a stray
+ * virtual id there is unowned data. Instead the T23b-2 routes merge their
+ * answers with the relay's filtered ones (merge-streams.ts).
  */
 export declare const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField[]>>;
 /** `dispatchRpc`'s failure shape as the UI mandates it: dsh-client-connection's
