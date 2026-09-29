@@ -14,7 +14,7 @@ const http = require('node:http')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
+const { createRelayHandler, loadServerId, encodeSessionReferenceUri, decodeSessionReferenceUri } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-relay-'))
@@ -833,15 +833,20 @@ test('T31 agentId calls: the agentId decides and a shared request.sessionId deco
   } finally { await server.stop() }
 })
 
-test('T31 subagents: both calls forward by the shared parent, child id untouched', async () => {
-  const parts = makeParts('t31-subagents')
+test('T31/T41a subagents: both calls forward with parent shared and child inherited, a foreign child refuses', async () => {
+  // T41a claims BOTH ids: the child session never enters the table but
+  // borrows the parent's share through the injected parentOf — exactly the
+  // store.isAccessible(id, parentOf) inheritance.
+  const parts = makeParts('t31-subagents', {
+    parentOf: (id) => (id === 'session-child' ? 'session-parent' : undefined),
+  })
   parts.store.share('session-parent')
   const server = await startServer(parts.handler)
   try {
     const prompt = { request: { requestId: 'r1', parentSessionId: 'session-parent', childSessionId: 'session-child', mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: '你好' }] } }
     const okPrompt = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'prompt', args: prompt }, AUTH))
     assert.equal(okPrompt.status, 200)
-    assert.deepEqual(parts.calls[0].args, prompt, 'the child id rides in original form; DSH validates the pair')
+    assert.deepEqual(parts.calls[0].args, prompt, 'both ids travel in original form; DSH still validates the pair')
 
     const interrupt = { childSessionId: 'session-child', parentSessionId: 'session-parent', mode: 'continuable' }
     const okInterrupt = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'interruptByParent', args: interrupt }, AUTH))
@@ -851,5 +856,111 @@ test('T31 subagents: both calls forward by the shared parent, child id untouched
     const denied = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'prompt', args: { request: { requestId: 'r2', parentSessionId: 'session-secret', childSessionId: 'session-parent', mode: 'continuable', delivery: 'queue', content: [] } } }, AUTH))
     assert.equal(denied.status, 403, 'an unshared parent refuses even with a shared child id')
     assert.deepEqual(await denied.json(), { ok: false, error: { code: 'not-shared' } })
+
+    // The T41a decoy: a shared parent with a child that belongs to nobody
+    // (parentOf leads nowhere shared) refuses before DSH is ever asked.
+    const foreign = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'prompt', args: { request: { requestId: 'r3', parentSessionId: 'session-parent', childSessionId: 'session-foreign', mode: 'continuable', delivery: 'queue', content: [] } } }, AUTH))
+    assert.equal(foreign.status, 403, 'a foreign child refuses under a shared parent')
+    assert.deepEqual(await foreign.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 2, 'the refusals never reached the gateway')
+  } finally { await server.stop() }
+})
+
+// ---- T41a-fix: @ candidates and prompt-text session references ---------------------
+
+test('T41a-fix reference codec: canonical base64url(JSON) round-trip, non-canonical rejected', () => {
+  // The shape RT dsh-session-reference implements: base64url of the
+  // JSON-QUOTED id, decode demanding byte-exact re-encoding.
+  for (const id of ['session-a', 'zr~721b94fb~session-b', '含中文', 'a"b\\c', 'x'.repeat(300)]) {
+    const uri = encodeSessionReferenceUri(id)
+    assert.ok(uri.startsWith('dsh-session:'))
+    assert.equal(decodeSessionReferenceUri(uri), id, JSON.stringify(id))
+  }
+  // Non-canonical payloads are not references: wrong JSON quoting, a padded
+  // or mutated payload, non-base64url characters, a non-string decode.
+  assert.equal(decodeSessionReferenceUri('dsh-session:'), undefined)
+  assert.equal(decodeSessionReferenceUri('dsh-session:!!!'), undefined)
+  assert.equal(decodeSessionReferenceUri('dsh-session:session-a'), undefined, 'bare id without JSON quoting')
+  assert.equal(
+    decodeSessionReferenceUri(`dsh-session:${Buffer.from('"session-a"', 'utf8').toString('base64url')}x`),
+    undefined,
+    'mutated payload fails the canonical round-trip',
+  )
+  assert.equal(decodeSessionReferenceUri(`dsh-session:${Buffer.from('42', 'utf8').toString('base64url')}`), undefined, 'a number is not a session id')
+})
+
+test('T41a-fix candidates: only accessible sessions travel, malformed rows are dropped', async () => {
+  const rows = [
+    { sessionId: 'session-shared', label: '共享', displayTitle: '共享的会话', mention: `@[共享的会话](${encodeSessionReferenceUri('session-shared')})`, sameWorkspace: true, createdAt: 1 },
+    { sessionId: 'session-secret', label: '机密', displayTitle: '机密的会话', mention: `@[机密的会话](${encodeSessionReferenceUri('session-secret')})`, sameWorkspace: false, createdAt: 2 },
+    { label: 'row without an id' },
+  ]
+  const parts = makeParts('t41a-fix-candidates', { value: rows })
+  parts.store.share('session-shared')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'sessionReferenceResolver', method: 'candidates', args: { agentId: 'session-shared', query: '' } }, AUTH))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.deepEqual(body.value, [rows[0]], 'the unshared row and the id-less row never travel')
+    assert.equal(parts.calls.length, 1, 'the call itself ran — the filter is output-side')
+  } finally { await server.stop() }
+})
+
+test('T41a-fix prompt references: shared travels verbatim, unshared refuses before the gateway', async () => {
+  const parts = makeParts('t41a-fix-refs')
+  parts.store.share('session-a')
+  parts.store.share('session-b')
+  const server = await startServer(parts.handler)
+  const prompt = (text) => ({
+    namespace: 'session',
+    method: 'prompt',
+    args: { request: { requestId: 'r1', sessionId: 'session-a', mode: 'queue', content: [{ type: 'text', text }, { type: 'image', mediaType: 'image/png', data: 'Zm9v' }] } },
+  })
+  try {
+    // Markdown mention + bare URI, both naming accessible sessions.
+    const okText = `对照 @[调试](dsh-session:${Buffer.from(JSON.stringify('session-b'), 'utf8').toString('base64url')}) 与裸地址 ${encodeSessionReferenceUri('session-a')}`
+    const ok = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', prompt(okText), AUTH))
+    assert.equal(ok.status, 200)
+    assert.deepEqual(parts.calls[0].args, prompt(okText).args, 'the text travels verbatim — the relay only checks')
+
+    // One unshared reference in the text refuses the WHOLE prompt.
+    const leak = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', prompt(`顺便看看 ${encodeSessionReferenceUri('session-secret')}`), AUTH))
+    assert.equal(leak.status, 403)
+    assert.deepEqual(await leak.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 1, 'the refused prompt never reached the gateway')
+
+    // A mixed text (shared + unshared) refuses too; non-text blocks alone travel.
+    const mixed = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', prompt(`@[a](dsh-session:${Buffer.from(JSON.stringify('session-b'), 'utf8').toString('base64url')}) 和 ${encodeSessionReferenceUri('session-secret')}`), AUTH))
+    assert.equal(mixed.status, 403)
+
+    // Malformed addresses are DSH's business error, not ours: they travel.
+    const junk = `解析这个 dsh-session:!!! 和伪地址 dsh-session:${Buffer.from('session-b', 'utf8').toString('base64url')}`
+    const junkRes = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', prompt(junk), AUTH))
+    assert.equal(junkRes.status, 200, 'non-canonical tokens do not crash the relay')
+    assert.deepEqual(parts.calls[1].args, prompt(junk).args)
+  } finally { await server.stop() }
+})
+
+test('T41a-fix subagents/prompt references get the same share check', async () => {
+  // parentOf wires the child's inheritance so the CALL itself passes the
+  // T41a both-ids check — this test is about the TEXT reference.
+  const parts = makeParts('t41a-fix-subagent-refs', {
+    parentOf: (id) => (id === 'session-child' ? 'session-parent' : undefined),
+  })
+  parts.store.share('session-parent')
+  const server = await startServer(parts.handler)
+  const prompt = (text) => ({
+    namespace: 'subagents',
+    method: 'prompt',
+    args: { request: { requestId: 'r1', parentSessionId: 'session-parent', childSessionId: 'session-child', mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text }] } },
+  })
+  try {
+    const ok = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', prompt(`父会话 ${encodeSessionReferenceUri('session-parent')} 的结论`), AUTH))
+    assert.equal(ok.status, 200)
+    const leak = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', prompt(`别的会话 ${encodeSessionReferenceUri('session-secret')}`), AUTH))
+    assert.equal(leak.status, 403)
+    assert.deepEqual(await leak.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 1)
   } finally { await server.stop() }
 })
