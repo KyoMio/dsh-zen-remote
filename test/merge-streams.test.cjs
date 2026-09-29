@@ -11,7 +11,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createWorkspaceMerger, createControlMerger, mergeSessionList } = require('../lib/merge-streams.js')
+const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, virtualizeModelSelectionValue } = require('../lib/merge-streams.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
@@ -481,6 +481,49 @@ test('mergeSessionList: a missing or malformed remote result returns the local r
   assert.deepEqual(mergeSessionList({ ok: 1 }, { items: [] }, SID), { ok: 1, items: [] })
 })
 
+test('T52-fix mergeSessionList: a row\'s projections.modelSelection is virtualized — a sequenced block must not poison the projection store', () => {
+  // RT dsh-api-session-controller lib/typert.remote-client.js:381-428: a
+  // list row carries {kind:'cached'|'sequenced', asOfSeq, values}; the client
+  // face applies it per session (lib/client.js:2633 → applyListBlock
+  // :2842-2855) and a sequenced modelSelection lands under higher-seq-wins
+  // (lib/client.js:986-995) — the control stream's rewritten frame rides the
+  // SAME seq, so an original-provider value here would permanently win.
+  const selection = { lastUsed: { provider: 'codex', model: 'sol' }, next: { provider: 'codex', model: 'sol' } }
+  const local = { items: [{ sessionId: 'session-local', updatedAt: 9 }] }
+  const remote = {
+    items: [
+      {
+        sessionId: 's1',
+        updatedAt: 2,
+        projections: { kind: 'sequenced', asOfSeq: 7, values: { modelSelection: selection, title: '远端' } },
+      },
+      // cached kind gets the same rewrite — the store applies it wherever no
+      // sequenced row holds (lib/client.js:1004-1013).
+      { sessionId: 's2', updatedAt: 3, projections: { kind: 'cached', asOfSeq: 1, values: { modelSelection: selection } } },
+      // a row without a projections block (or without a modelSelection key)
+      // passes untouched.
+      { sessionId: 's3', updatedAt: 4 },
+      { sessionId: 's4', updatedAt: 5, projections: { kind: 'sequenced', asOfSeq: 2, values: { title: '无模型' } } },
+    ],
+  }
+  const merged = mergeSessionList(local, remote, SID)
+  const [r1, r2, r3, r4] = merged.items.slice(1)
+  assert.deepEqual(r1.projections.values.modelSelection, {
+    lastUsed: { provider: V('codex'), model: 'sol' },
+    next: { provider: V('codex'), model: 'sol' },
+  })
+  assert.equal(r1.projections.kind, 'sequenced', 'kind and seq ride unchanged')
+  assert.equal(r1.projections.asOfSeq, 7)
+  assert.equal(r1.projections.values.title, '远端', 'the other projection values stay verbatim')
+  assert.equal(r2.projections.values.modelSelection.next.provider, V('codex'))
+  assert.equal(r3.projections, undefined)
+  assert.deepEqual(r4.projections.values, { title: '无模型' })
+  // the LOCAL rows never enter the rewrite (their ids and blocks are local)
+  assert.deepEqual(merged.items[0], { sessionId: 'session-local', updatedAt: 9 })
+  // inputs untouched
+  assert.equal(remote.items[0].projections.values.modelSelection.lastUsed.provider, 'codex')
+})
+
 test('mergeSessionList: parentSessionId is virtualized with the row (CP4) — the fork link must point at the id the UI knows', () => {
   const local = { items: [] }
   const remote = {
@@ -804,4 +847,91 @@ test('T34 RT UI model: a revoked relay keeps the group under the 吊销 annotati
   m.setStatus('none')
   m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
   assert.equal(ui.model.items[1].title, `${NAME} · 远端一`)
+})
+
+// -- 7. the model catalog and the modelSelection projection values (T52) -----------
+
+test('T52 mergeModelCatalogs: server groups append after the local ones with virtual ids and prefixed names; default and failures stay local', () => {
+  const local = {
+    default: { provider: 'deepseek-account', model: 'deepseek-v4-pro' },
+    routableProviders: ['deepseek-account', 'openai'],
+    groups: [
+      { id: 'deepseek-account', name: 'DeepSeek 账号', models: [{ id: 'deepseek-v4-pro', name: 'V4 Pro' }] },
+      { id: 'openai', name: 'OpenAI', models: [{ id: 'gpt', name: 'GPT' }] },
+    ],
+    failures: [{ id: 'bad', name: '坏', message: 'x' }],
+  }
+  const remote = {
+    default: { provider: 'codex', model: 'sol' },
+    routableProviders: ['codex', 'claude'],
+    groups: [
+      { id: 'codex', name: 'Codex', models: [{ id: 'sol', name: 'Sol' }] },
+      { id: 'claude', name: 'Claude', models: [{ id: 'sonnet', name: 'Sonnet' }] },
+      { notAGroup: true },
+    ],
+    failures: [{ id: 'server-bad', name: '服务端坏', message: 'y' }],
+  }
+  const merged = mergeModelCatalogs(local, remote, { serverId: SID, serverName: NAME })
+  assert.deepEqual(merged.groups, [
+    local.groups[0],
+    local.groups[1],
+    { id: V('codex'), name: `${NAME} · Codex`, models: [{ id: 'sol', name: 'Sol' }] },
+    { id: V('claude'), name: `${NAME} · Claude`, models: [{ id: 'sonnet', name: 'Sonnet' }] },
+  ])
+  // The default drives blank LOCAL sessions; server failures never alarm the
+  // dropdown (each failure row's Retry reloads the whole local catalog).
+  assert.equal(merged.default, local.default)
+  assert.deepEqual(merged.failures, local.failures)
+  // routableProviders mirrors the merged group ids (the host derives it as
+  // groups.map(g => g.id); no RT client UI reads it — consistency move).
+  assert.deepEqual(merged.routableProviders, ['deepseek-account', 'openai', V('codex'), V('claude')])
+  // The inputs are never mutated.
+  assert.deepEqual(remote.groups[0], { id: 'codex', name: 'Codex', models: [{ id: 'sol', name: 'Sol' }] })
+
+  // A group without a usable id is skipped; a remote side that says nothing
+  // (malformed, no groups array) leaves the local answer untouched.
+  const partial = mergeModelCatalogs(local, { groups: [{ notAGroup: true }] }, { serverId: SID, serverName: NAME })
+  assert.equal(partial, local)
+  assert.equal(mergeModelCatalogs(local, undefined, { serverId: SID, serverName: NAME }), local)
+  assert.equal(mergeModelCatalogs(undefined, remote, { serverId: SID, serverName: NAME }), undefined)
+})
+
+test('T52 virtualizeModelSelectionValue: providers go virtual, nulls and foreign keys pass', () => {
+  const value = {
+    lastUsed: { provider: 'codex', model: 'sol' },
+    next: { provider: 'codex', model: 'sol', reasoningEffort: 'high' },
+  }
+  assert.deepEqual(virtualizeModelSelectionValue(value, SID), {
+    lastUsed: { provider: V('codex'), model: 'sol' },
+    next: { provider: V('codex'), model: 'sol', reasoningEffort: 'high' },
+  })
+  assert.deepEqual(
+    virtualizeModelSelectionValue({ lastUsed: null, next: null }, SID),
+    { lastUsed: null, next: null },
+  )
+  // A selection without a provider string (or a non-object value) is untouchable.
+  assert.deepEqual(virtualizeModelSelectionValue({ lastUsed: { model: 'x' } }, SID), { lastUsed: { model: 'x' } })
+  assert.equal(virtualizeModelSelectionValue('nope', SID), 'nope')
+})
+
+test('T52 control merger: modelSelection projection frames get their providers virtualized beside the session id', () => {
+  const m = createControlMerger({ serverId: SID })
+  m.onLocal({ type: 'baseline', value: { projections: {} } })
+  // The exploded baseline path.
+  const exploded = m.onRemote({
+    type: 'baseline',
+    value: { projections: { s1: { asOfSeq: 9, values: { modelSelection: { lastUsed: { provider: 'codex', model: 'sol' }, next: null } } } } },
+  })
+  assert.deepEqual(exploded, [
+    { type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: { provider: V('codex'), model: 'sol' }, next: null }, seq: 9 },
+  ])
+  // The live single-key path.
+  assert.deepEqual(
+    m.onRemote({ type: 'projection', sessionId: 's1', key: 'modelSelection', value: { lastUsed: null, next: { provider: 'codex', model: 'sol' } }, seq: 10 }),
+    [{ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: null, next: { provider: V('codex'), model: 'sol' } }, seq: 10 }],
+  )
+  // Any other key stays verbatim.
+  assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', key: 'title', value: 't', seq: 11 }), [
+    { type: 'projection', sessionId: V('s1'), key: 'title', value: 't', seq: 11 },
+  ])
 })
