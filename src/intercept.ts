@@ -158,6 +158,45 @@ export interface InterceptFailureRecord {
   code: string
 }
 
+/**
+ * One INCOMPATIBLE remote call (T42): a forwarded call the SERVER refused
+ * because the two DSH versions disagree about the interface — the runtime
+ * symptom layer three of the version-tolerance design watches for (see
+ * {@link INCOMPATIBLE_CALL_CODES} for exactly which codes qualify). Only
+ * that one panel errors; the record feeds the settings page's diagnostics
+ * so the mismatch is explainable. `time` is epoch milliseconds — the number
+ * form the settings view's failure rows render directly.
+ */
+export interface IncompatibleCallRecord {
+  time: number
+  endpoint: string
+  code: string
+}
+
+/**
+ * The gateway error codes that count as version-mismatch symptoms, verified
+ * against dsh-api-gateway 0.2.0-rc.1 (`lib/index.js`):
+ * `gateway/arguments-invalid` — the args fields do not match the endpoint's
+ * descriptor; `gateway/input-invalid` — a wire field failed the codec's
+ * boundary parse; `gateway/invocation-unavailable` — no active Remote method
+ * exports the endpoint at all (the client called an interface an older
+ * server does not have). Other gateway codes answer different questions
+ * (a cancelled call, a missing service binding) and are NOT version
+ * symptoms. Deliberately ABSENT: `gateway/result-invalid` — despite the
+ * name it only means "a stream Remote method did not return an iterable"
+ * (a server implementation bug class); the gateway does NOT schema-validate
+ * results, so a result-shape disagreement between versions is invisible
+ * here and stays the fingerprint layer's job.
+ */
+export const INCOMPATIBLE_CALL_CODES: ReadonlySet<string> = new Set([
+  'gateway/arguments-invalid',
+  'gateway/input-invalid',
+  'gateway/invocation-unavailable',
+])
+
+/** Longest incompatible-call ring kept for the status surface (T42). */
+const MAX_INCOMPATIBLE_CALLS = 50
+
 /** The behavior self-check's verdict (spike §4.1 check 4). */
 export type SelfCheckResult = { ok: true } | { ok: false; reason: string }
 
@@ -171,6 +210,10 @@ export interface InterceptDiagnostics {
   selfCheck?: SelfCheckResult
   /** The most recent remote-call failures, oldest first, capped at 20. */
   recentFailures: InterceptFailureRecord[]
+  /** The most recent VALIDATION-refused remote calls (T42), oldest first,
+   * capped at 50 — the runtime-degradation half of the version-tolerance
+   * diagnostics. */
+  incompatibleCalls: IncompatibleCallRecord[]
 }
 
 export interface InstallInterceptOptions {
@@ -395,6 +438,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   const shape = checkGatewayShape(raw)
   const counters = { openWireStream: 0, dispatchRpc: 0 }
   const failures: InterceptFailureRecord[] = []
+  const incompatible: IncompatibleCallRecord[] = []
   let installed = true
   let selfCheck: SelfCheckResult | undefined
 
@@ -417,6 +461,12 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   const recordFailure = (endpoint: string, code: string): void => {
     if (failures.length >= MAX_FAILURES) failures.shift()
     failures.push({ time: new Date().toISOString(), endpoint, code })
+    // T42: validation-shaped refusals additionally land in the incompatible
+    // ring — every remote failure funnels through this one function, so the
+    // classification cannot drift between the invoke and stream routes.
+    if (!INCOMPATIBLE_CALL_CODES.has(code)) return
+    if (incompatible.length >= MAX_INCOMPATIBLE_CALLS) incompatible.shift()
+    incompatible.push({ time: Date.now(), endpoint, code })
   }
 
   const failEnvelope = (
@@ -619,6 +669,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         shape,
         ...(selfCheck !== undefined ? { selfCheck } : {}),
         recentFailures: [...failures],
+        incompatibleCalls: [...incompatible],
       }
     },
     wrappedCalls() {

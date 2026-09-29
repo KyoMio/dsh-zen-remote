@@ -78,6 +78,14 @@ const require = createRequire(import.meta.url)
 //   devDep then.
 // - npm-published tarballs contain no node_modules, so this shadow only
 //   exists on dev machines where the plugin is link-installed.
+// NOTE (T42-fix): src/fingerprint.ts resolves @deepseek-ai packages at
+// runtime — deliberately through the HOST process entry FIRST
+// (process.argv[1], the running App's closure), with the plugin location as
+// a fallback — so a link-installed plugin no longer fingerprints its own
+// devDependency copies. Those resolutions are createRequire(...).resolve()
+// calls whose specifier this file's scan regex cannot see, and the runtime
+// priority makes a plugin-copy shadow the fallback, not the read — so no
+// SHADOW_ALLOWED entry is registered for them.
 const SHADOW_ALLOWED = ['@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-session']
 
 // Packages that must never exist in this plugin's node_modules at all: DSH
@@ -86,8 +94,12 @@ const SHADOW_ALLOWED = ['@deepseek-ai/dsh-tools', '@deepseek-ai/dsh-session']
 const BANNED_PACKAGES = ['@deepseek-ai/dsh-client-runtime', '@deepseek-ai/dsh-host-apiproxy']
 
 // The files the host half actually loads. lib/share-export.js is statically
-// imported by lib/index.js, so it is part of the same runtime graph.
-const HOST_ENTRY_FILES = ['dsh-push.mjs', 'lan-gate.mjs', 'lib/index.js', 'lib/share-export.js']
+// imported by lib/index.js; lib/fingerprint.js rides the same runtime graph
+// (T42). It is listed here because the scan's whole purpose is watching
+// THIS graph for @deepseek-ai imports: its own package resolutions are
+// createRequire(...).resolve() calls the regex cannot see, but any literal
+// import someone adds there later WILL be caught.
+const HOST_ENTRY_FILES = ['dsh-push.mjs', 'lan-gate.mjs', 'lib/index.js', 'lib/share-export.js', 'lib/fingerprint.js']
 
 // Matches the specifier of real module statements only — `... from 'pkg'`,
 // `import 'pkg'`, `import('pkg')`, `require('pkg')` — so @deepseek-ai names

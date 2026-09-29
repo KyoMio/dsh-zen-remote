@@ -137,11 +137,15 @@ export interface ClientStatusBody {
   lastError?: unknown
   /** T23b request-interceptor diagnostics (provisional shape; presence-gated). */
   intercept?: unknown
-  /** T42 relay compat diagnostics (provisional shape; presence-gated). */
+  /** T42 relay compat diagnostics: `{ identical: string[], different:
+   * string[], unavailable: string[], incompatibleCalls: { time: number,
+   * endpoint: string, code: string }[] }` (presence-gated). */
   compat?: unknown
 }
 
-/** One remote-call failure line in the diagnostics lists. */
+/** One remote-call failure line in the diagnostics lists. `time` is epoch
+ * milliseconds — ISO-stamped rings are parsed at derive time; `method`
+ * carries the wire's method-or-endpoint name. */
 export interface ClientDiagFailureView {
   time: number
   method: string
@@ -191,15 +195,28 @@ function stringListOf(value: unknown, cap: number): string[] {
   return value.filter((entry): entry is string => typeof entry === 'string').slice(0, cap)
 }
 
-/** At most 10 diagnostics failure rows out of an array-shaped value. */
+/**
+ * The MOST RECENT 10 diagnostics failure rows out of an array-shaped value
+ * (the rings are oldest-first, so the tail is the fresh end). Both wire
+ * dialects render: the T42 compat ring stamps epoch-millisecond numbers
+ * under `endpoint`, the T23b interceptor ring ISO strings under the same
+ * key — times parse leniently either way, and an unparseable value renders
+ * as 0 rather than dropping the row.
+ */
 function failureListOf(value: unknown): ClientDiagFailureView[] {
   if (!Array.isArray(value)) return []
   const rows: ClientDiagFailureView[] = []
-  for (const entry of value.slice(0, 10)) {
+  for (const entry of value.slice(-10)) {
     const record = asRecord(entry)
+    let time = 0
+    if (typeof record.time === 'number' && Number.isFinite(record.time)) time = record.time
+    else if (typeof record.time === 'string') {
+      const parsed = Date.parse(record.time)
+      if (Number.isFinite(parsed)) time = parsed
+    }
     rows.push({
-      time: typeof record.time === 'number' && Number.isFinite(record.time) ? record.time : 0,
-      method: asStringSet(record.method),
+      time,
+      method: asStringSet(record.method ?? record.endpoint),
       code: asStringSet(record.code),
     })
   }
@@ -217,13 +234,15 @@ function deriveInterceptView(value: unknown): ClientInterceptView | undefined {
   }
 }
 
-/** T42 compat block, only when the body carried the field at all. */
+/** T42 compat block, only when the body carried the field at all. The wire
+ * names are the status route's (`different` / `incompatibleCalls`); the view
+ * keeps the render-side names the block was written against. */
 function deriveCompatView(value: unknown): ClientCompatView | undefined {
   if (value === undefined || value === null) return undefined
   const record = asRecord(value)
   return {
-    mismatchedGroups: stringListOf(record.mismatchedGroups, 20),
-    recentCalls: failureListOf(record.recentCalls),
+    mismatchedGroups: stringListOf(record.different, 20),
+    recentCalls: failureListOf(record.incompatibleCalls),
   }
 }
 

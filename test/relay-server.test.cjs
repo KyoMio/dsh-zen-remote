@@ -62,6 +62,7 @@ function makeParts(name, overrides = {}) {
       serverId: loadServerId(home),
       serverName: () => (overrides.serverName !== undefined ? overrides.serverName : 'test-server'),
       dshVersion: '0.0.0-test',
+      ...(overrides.fingerprints !== undefined ? { fingerprints: overrides.fingerprints } : {}),
     },
     ...(overrides.parentOf ? { parentOf: overrides.parentOf } : {}),
   })
@@ -598,5 +599,35 @@ test('routing: unknown paths, wrong methods, and %2F-shaped paths are all 404', 
       assert.deepEqual(await res.json(), { ok: false, error: { code: 'not-found' } }, `${method} ${p}`)
     }
     assert.equal(parts.calls.length, 0, 'no unknown route reached the gateway')
+  } finally { await server.stop() }
+})
+
+// ---- T42 + T42-fix: the handshake's fingerprint map -----------------------------
+
+test('T42-fix handshake: fingerprints are computed per handshake and a thrown compute degrades to {}', async () => {
+  let computes = 0
+  let fail = false
+  const parts = makeParts('handshake-fingerprints', {
+    fingerprints: () => {
+      computes += 1
+      if (fail) throw new Error('registry exploded')
+      return { session: 'r:aaa111' }
+    },
+  })
+  const server = await startServer(parts.handler)
+  try {
+    const first = await server.fetch('/_dsh/zen-remote/relay/v1/handshake', post('/h', {}, AUTH))
+    const body1 = await first.json()
+    assert.deepEqual(body1.fingerprints, { session: 'r:aaa111' })
+    const second = await server.fetch('/_dsh/zen-remote/relay/v1/handshake', post('/h', {}, AUTH))
+    await second.json()
+    assert.equal(computes, 2, 'recomputed per handshake — never cached across requests')
+    // A broken compute must not fail the handshake itself.
+    fail = true
+    const third = await server.fetch('/_dsh/zen-remote/relay/v1/handshake', post('/h', {}, AUTH))
+    assert.equal(third.status, 200)
+    const body3 = await third.json()
+    assert.equal(body3.ok, true)
+    assert.deepEqual(body3.fingerprints, {}, 'a thrown compute degrades to the empty map')
   } finally { await server.stop() }
 })

@@ -53,11 +53,16 @@ export interface RelayGateway {
 /** What the handshake reports about this server. `serverName` is a CALLBACK
  * on purpose: the row value is a volatile (`{ get() }` wrapped) setting that
  * can change without restarting the plugin row, so it must be recomputed at
- * handshake time, not snapshotted at registration. */
+ * handshake time, not snapshotted at registration. `fingerprints` is a
+ * callback too (T42), awaited per handshake so a just-restarted server never
+ * serves a stale map; a THROWN compute degrades to the empty map here so a
+ * broken fingerprint source can never fail the handshake itself — the
+ * client's comparison judges every group `unavailable`, never `different`. */
 export interface RelayServerInfo {
     serverId: string;
     serverName: () => string;
     dshVersion: string;
+    fingerprints?: () => Record<string, string> | Promise<Record<string, string>>;
 }
 export interface RelayHandlerOptions {
     /** The per-apply shared secret; an empty one refuses every request. */

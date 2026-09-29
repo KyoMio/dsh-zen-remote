@@ -578,6 +578,66 @@ test('diagnostics reports the shape verdict, the self-check and the failure ring
   handle.uninstall()
 })
 
+// -- the incompatible-call ring (T42) ---------------------------------------------
+
+test('validation-refused remote calls land in incompatibleCalls (T42)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  // A server-side parameter validation refusal travels as the gateway's DSH
+  // code through a 200 {ok:false} envelope.
+  relay.invokeThrow = new RelayError('gateway/arguments-invalid', 'args fields do not match the descriptor')
+  await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
+  // The stream route records through the same funnel.
+  relay.streamThrow = new RelayError('gateway/input-invalid', 'wire field "request" failed boundary validation')
+  await (async () => { try { for await (const f of gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined })) void f } catch { /* the coded throw is expected */ } })()
+  const diagnostics = handle.diagnostics()
+  assert.deepEqual(diagnostics.incompatibleCalls.map((c) => [c.endpoint, c.code]), [
+    ['session/page', 'gateway/arguments-invalid'],
+    ['session/follow', 'gateway/input-invalid'],
+  ])
+  for (const call of diagnostics.incompatibleCalls) {
+    assert.equal(typeof call.time, 'number', 'the settings view renders epoch milliseconds directly')
+    assert.ok(Number.isFinite(call.time))
+  }
+  handle.uninstall()
+})
+
+test('non-validation refusals never enter the incompatible ring (T42, T42-fix)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  for (const code of ['not-shared', 'remote-mismatch', 'offline', 'gateway/cancelled', 'internal', 'gateway/result-invalid']) {
+    relay.invokeThrow = new RelayError(code)
+    await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
+  }
+  // `gateway/invocation-unavailable` DOES count (T42-fix): the client called
+  // an endpoint an older server does not export — a version symptom. But
+  // `gateway/result-invalid` does NOT: it only flags a stream method that
+  // returned no iterable (a server implementation bug), and the gateway
+  // schema-validates no results, so result-shape drift is invisible there.
+  relay.invokeThrow = new RelayError('gateway/invocation-unavailable')
+  await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
+  const diagnostics = handle.diagnostics()
+  assert.equal(diagnostics.recentFailures.length, 7, 'the general ring holds every failure')
+  assert.deepEqual(diagnostics.incompatibleCalls.map((c) => c.code), ['gateway/invocation-unavailable'])
+  handle.uninstall()
+})
+
+test('the incompatible ring caps at 50 (T42)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  relay.invokeThrow = new RelayError('gateway/arguments-invalid')
+  for (let i = 0; i < 55; i += 1) {
+    await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
+  }
+  const calls = handle.diagnostics().incompatibleCalls
+  assert.equal(calls.length, 50)
+  assert.equal(calls[calls.length - 1].endpoint, 'session/page')
+  handle.uninstall()
+})
+
 // -- the behavior self-check -----------------------------------------------------------
 
 test('behaviorSelfCheck demands a baseline first frame and counts on the wrap', async () => {

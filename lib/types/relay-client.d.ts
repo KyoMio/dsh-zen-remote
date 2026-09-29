@@ -34,7 +34,17 @@
  * `credentialsChanged()` (or a fresh `connect()`). The wait is observable as
  * `nextRetryAt`, the last failure code as `lastError`; both carry no
  * credential material.
+ *
+ * Since T42 the client also judges INTERFACE compatibility: when the wiring
+ * injects `computeOwnFingerprints`, every completed handshake is followed by
+ * a group-by-group comparison of the server's `fingerprints` map against the
+ * locally computed one, stored as `compat` ({@link RelayCompatVerdict}).
+ * Groups either side could not compute land in `unavailable` — never in
+ * `different` — so a partial view stays silent. The verdict is read live by
+ * the status route; listeners additionally hear about it through the same
+ * notification channel the state changes use.
  */
+import type { RelayCompatVerdict } from './fingerprint.js';
 /**
  * The clock face the reconnect machinery runs on: wall time, timers and the
  * jitter source. Injectable so tests drive the whole backoff sequence
@@ -91,6 +101,12 @@ export interface CreateRelayClientOptions {
     /** Clock/timers/jitter for the reconnect backoff; defaults to the real
      * ones (timers `unref()`ed). Tests inject a manual clock. */
     clock?: RelayClock;
+    /** This side's own interface fingerprints (T42), computed after each
+     * completed handshake and compared group by group against the handshake's
+     * map. May be sync or async; a throw counts as "nothing computed" (an
+     * empty map — every group lands `unavailable`). Absent: `compat` stays
+     * undefined and no comparison ever runs (the host role's client, tests). */
+    computeOwnFingerprints?: () => Promise<Record<string, string>> | Record<string, string>;
 }
 export interface RelayClient {
     readonly state: RelayState;
@@ -110,6 +126,10 @@ export interface RelayClient {
      * 'relay-unauthorized', a DSH code, …) — never a message, never a token or
      * URL. Cleared when a request succeeds again. */
     readonly lastError: string | undefined;
+    /** The interface-compatibility verdict of the most recent handshake (T42):
+     * group names that matched, differed, or could not be compared. Undefined
+     * until a first handshake ran WITH `computeOwnFingerprints` wired. */
+    readonly compat: RelayCompatVerdict | undefined;
     /** Observe state changes; a throwing listener never blocks the others. */
     subscribe(listener: (state: RelayState) => void): () => void;
     /** Run the handshake; success resolves with it and leaves `online`. */
