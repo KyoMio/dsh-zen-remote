@@ -34,6 +34,8 @@ import { registerRemoteShareUi } from './remote-share-register.ts'
 import { RemoteStatusIcon } from './RemoteStatusIcon.tsx'
 import { RemoteComposerBanner } from './RemoteComposerBanner.tsx'
 import { registerRemoteStatusUi } from './remote-status-register.ts'
+import { installRemoteApiFetch } from './remote-fetch.ts'
+import { installRemoteSessionGuard } from './effects/remote-session.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -119,6 +121,14 @@ export function apply(ctx: ClientContext): void {
   // 的页面上两者都是空，桌面保持逐像素 no-op；store 也只在有虚拟会话的
   // 订阅者时才轮询，主服务端不白发请求。
   registerRemoteStatusUi(ctx, RemoteStatusIcon, RemoteComposerBanner)
+  // T41b 的两个远程会话部件：fetch 改写（改动 / diff 面板的两条 /api GET）与
+  // 远程会话标记（data-zr-remote-session + 隐藏「在服务端机器上打开」类入口
+  // 的样式）。同样必须在桌面门之前注册——桌面窗口也可以是配对好的子客户端，
+  // 改写与隐藏在它里面一样必要。改写只碰「同源 + 精确两条路径 + zr~ 虚拟
+  // 会话 id」的 GET（remote-fetch.ts），宿主角色的桌面端（会话 id 永非虚拟）
+  // 逐字节原样放行；标记属性只在虚拟会话打开时出现，卸载时还原。
+  ctx.effect(() => installRemoteApiFetch(window), 'dsh-zen-remote: remote api fetch')
+  installRemoteSessionGuard(ctx)
 
   // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
   // down to ~520px wide, where every width-based gate would flip the phone

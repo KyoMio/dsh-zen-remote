@@ -1260,3 +1260,148 @@ test('T41a-fix2 remoteStatusOnly: the host mount serves remote-status alone — 
     }
   } finally { await closeServer(second.server) }
 })
+
+// ---- T41b: the plain-HTTP relay route (client/http/<route>) --------------------
+
+/** A virtual id shaped for the fake relay's server id (INFO's abcd1234). */
+const VIRTUAL = 'zr~abcd1234~session-1'
+
+test('T41b http: an unadmitted request is refused before anything else', async () => {
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('书房'), http: async () => ({ status: 200, contentType: 'application/json', body: '{}' }) })
+  const { server, port } = await startClientServer(makeRow(), {
+    admit: () => ({ rejection: 401 }),
+    getRelayClient: () => relay,
+  })
+  try {
+    const res = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.diff?sessionId=${VIRTUAL}&seq=1&index=0` })
+    assert.equal(res.status, 401)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'unauthorized' } })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T41b http: an unregistered route is 404, a non-virtual or missing sessionId is 400', async () => {
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('书房'), http: async () => ({ status: 200, contentType: 'application/json', body: '{}' }) })
+  const { server, port } = await startClientServer(makeRow(), { getRelayClient: () => relay })
+  try {
+    const unknown = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}session.export?sessionId=${VIRTUAL}&v=1` })
+    assert.equal(unknown.status, 404)
+    assert.deepEqual(JSON.parse(unknown.body), { ok: false, error: { code: 'unknown-route' } })
+    const proto = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}constructor?sessionId=${VIRTUAL}` })
+    assert.equal(proto.status, 404, 'a prototype key name is not a route')
+    const local = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=session-local&seq=1` })
+    assert.equal(local.status, 400)
+    assert.deepEqual(JSON.parse(local.body), { ok: false, error: { code: 'not-virtual', message: 'sessionId is not a remote session id' } })
+    const missing = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?seq=1` })
+    assert.equal(missing.status, 400)
+    assert.deepEqual(JSON.parse(missing.body), { ok: false, error: { code: 'bad-request', message: 'sessionId is required exactly once' } })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T41b http: a relay that is not online answers 503 remote-offline, a foreign server id 400', async () => {
+  const offline = fakeRelay({ state: 'offline', handshakeInfo: INFO('书房') })
+  const { server, port } = await startClientServer(makeRow(), { getRelayClient: () => offline })
+  try {
+    const res = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${VIRTUAL}&seq=1` })
+    assert.equal(res.status, 503)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'remote-offline' } })
+  } finally {
+    await closeServer(server)
+  }
+  const other = fakeRelay({ state: 'online', handshakeInfo: { relayProtocol: 1, serverId: 'ffffffff', serverName: '别台', dshVersion: '2.0.0', fingerprints: {} } })
+  const second = await startClientServer(makeRow(), { getRelayClient: () => other })
+  try {
+    const res = await request(second.port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${VIRTUAL}&seq=1` })
+    assert.equal(res.status, 400)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端' } })
+  } finally {
+    await closeServer(second.server)
+  }
+})
+
+test('T41b http: success relays with the ORIGINAL id restored and passes status/content-type/body through', async () => {
+  const calls = []
+  const relay = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('书房'),
+    http: async (route, query, signal) => {
+      calls.push({ route, query, signal })
+      return { status: 200, contentType: 'application/json; charset=utf-8', body: '{"turn":3,"files":[],"total":0,"added":0,"deleted":0}' }
+    },
+  })
+  const { server, port } = await startClientServer(makeRow(), { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${encodeURIComponent(VIRTUAL)}&seq=3` })
+    assert.equal(res.status, 200)
+    assert.equal(res.headers['content-type'], 'application/json; charset=utf-8')
+    assert.deepEqual(JSON.parse(res.body), { turn: 3, files: [], total: 0, added: 0, deleted: 0 })
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].route, 'changes.summary')
+    assert.equal(calls[0].query, 'sessionId=session-1&seq=3', 'the virtual id was swapped back, the rest verbatim')
+    assert.ok(calls[0].signal instanceof AbortSignal || calls[0].signal === undefined, 'the abort signal rides along')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T41b http: relay refusals keep their status (an unshared session is the relay 403), a link failure is 503', async () => {
+  const refused = new RelayError('not-shared', undefined, 403)
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('书房'), http: async () => { throw refused } })
+  const { server, port } = await startClientServer(makeRow(), { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.diff?sessionId=${VIRTUAL}&seq=1&index=0` })
+    assert.equal(res.status, 403)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'not-shared' } })
+  } finally {
+    await closeServer(server)
+  }
+  const dead = fakeRelay({ state: 'online', handshakeInfo: INFO('书房'), http: async () => { throw new RelayError('offline', 'chain down') } })
+  const second = await startClientServer(makeRow(), { getRelayClient: () => dead })
+  try {
+    const res = await request(second.port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.diff?sessionId=${VIRTUAL}&seq=1&index=0` })
+    assert.equal(res.status, 503)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'remote-offline' } })
+  } finally {
+    await closeServer(second.server)
+  }
+})
+
+test('T41b-fix http: only application/json keeps its content type; anything else downgrades to inert text/plain', async () => {
+  const relay = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('书房'),
+    http: async () => ({ status: 200, contentType: 'text/html; charset=utf-8', body: '<script>alert(1)</script>' }),
+  })
+  const { server, port } = await startClientServer(makeRow(), { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${VIRTUAL}&seq=1` })
+    assert.equal(res.status, 200)
+    assert.equal(res.headers['content-type'], 'text/plain; charset=utf-8', 'a scriptable type never lands on this same-origin path')
+    assert.equal(res.headers['x-content-type-options'], 'nosniff')
+  } finally {
+    await closeServer(server)
+  }
+  // JSON keeps its own type, whatever the parameter spelling or case.
+  for (const contentType of ['application/json', 'APPLICATION/JSON', 'application/json;charset=utf-8', 'application/json; charset=UTF-8']) {
+    const jsonRelay = fakeRelay({ state: 'online', handshakeInfo: INFO('书房'), http: async () => ({ status: 200, contentType, body: '{}' }) })
+    const second = await startClientServer(makeRow(), { getRelayClient: () => jsonRelay })
+    try {
+      const res = await request(second.port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${VIRTUAL}&seq=1` })
+      assert.equal(res.headers['content-type'], contentType, contentType)
+    } finally {
+      await closeServer(second.server)
+    }
+  }
+  // A missing content type downgrades too.
+  const bare = fakeRelay({ state: 'online', handshakeInfo: INFO('书房'), http: async () => ({ status: 200, contentType: undefined, body: '{}' }) })
+  const third = await startClientServer(makeRow(), { getRelayClient: () => bare })
+  try {
+    const res = await request(third.port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${VIRTUAL}&seq=1` })
+    assert.equal(res.headers['content-type'], 'text/plain; charset=utf-8')
+  } finally {
+    await closeServer(third.server)
+  }
+})

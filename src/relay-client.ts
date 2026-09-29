@@ -58,6 +58,7 @@ const INVOKE_PATH = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM_PATH = '/_dsh/zen-remote/relay/v1/stream'
 const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
 const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
+const HTTP_PATH = '/_dsh/zen-remote/relay/v1/http'
 
 /** How long a stream may stay line-silent before it is judged dead. */
 const DEFAULT_IDLE_TIMEOUT_MS = 45_000
@@ -251,6 +252,24 @@ export interface RelayClient {
    * line throws its RelayError. A caller abort ENDS the iteration normally;
    * `break` aborts the underlying request. */
   openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown>
+  /** One plain-HTTP round-trip (T41b): `route` / `query` name a registered
+   * `/api` GET (relay-access's RELAY_HTTP_ROUTES; `query` is the URL-encoded
+   * query string with the session id already restored). Resolves with the
+   * UPSTREAM answer — its status, content type and body text ride inside the
+   * success envelope, so a 404 from the underlying route is a RESOLVED
+   * result here, never a RelayError. */
+  http(route: string, query: string, signal?: AbortSignal): Promise<RelayHttpResult>
+}
+
+/** The upstream answer one {@link RelayClient.http} round-trip carries. */
+export interface RelayHttpResult {
+  /** The underlying `/api` route's HTTP status. */
+  status: number
+  /** The underlying response's content type, when it sent one. */
+  contentType: string | undefined
+  /** The underlying response body, decoded as text (both registered routes
+   * answer buffered JSON). */
+  body: string
 }
 
 /**
@@ -791,6 +810,25 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     await exchange(UNSHARE_PATH, JSON.stringify({ sessionId }), signal, true, creds)
   }
 
+  async function http(route: string, query: string, signal?: AbortSignal): Promise<RelayHttpResult> {
+    const creds = requireCredentials()
+    const payload = await exchange(HTTP_PATH, JSON.stringify({ route, query }), signal, true, creds)
+    const value = payload.value
+    if (
+      !isRecord(value) ||
+      typeof value.status !== 'number' ||
+      !Number.isSafeInteger(value.status) ||
+      typeof value.body !== 'string'
+    ) {
+      throw new RelayError('internal', 'the relay http answer carries no upstream response')
+    }
+    return {
+      status: value.status,
+      contentType: typeof value.contentType === 'string' ? value.contentType : undefined,
+      body: value.body,
+    }
+  }
+
   function openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown> {
     // Eager, not generator-lazy: an unconfigured client fails at CALL time,
     // exactly like connect/invoke, instead of hiding the error inside the
@@ -981,5 +1019,6 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     unshare,
     postEventResult,
     openStream,
+    http,
   }
 }
