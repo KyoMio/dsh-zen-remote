@@ -65,7 +65,9 @@ function makeCtx() {
   const warns = []
   const ctx = {
     plugin(module, config) { calls.push({ module, config }) },
-    on(event, listener) { listeners.push({ event, listener }) },
+    // Cordis's on() returns an unsubscribe; the effects capture and return
+    // it (the T43 credentials watcher's disposer calls it on teardown).
+    on(event, listener) { listeners.push({ event, listener }); return () => {} },
     inject() {},
     effect(fn) { effects.push(fn()) },
     logger: { warn: (...args) => warns.push(args) },
@@ -500,13 +502,17 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
   index.apply(client.ctx, { role: 'client' })
   assert.deepEqual(
     client.listeners.map((l) => l.event),
-    ['loader/volatile-update'],
-    'the client role never subscribes the session feeds but still watches for volatile updates',
+    // T43 adds a second volatile-update listener: the relay credentials
+    // watcher (registered in the client half, before the restart watcher's).
+    ['loader/volatile-update', 'loader/volatile-update'],
+    'the client role never subscribes the session feeds but watches volatile updates twice (restart watcher + relay credentials)',
   )
-  // The client role has two effects: the restart watcher (T17) and the relay
-  // client's disposal (T23a-fix), which clears the module slot — never the
-  // sweeper, which stays host-only.
-  assert.equal(client.effects.length, 2, 'the client role starts the restart watcher and the relay client disposal')
+  assert.equal(typeof client.listeners[0].listener, 'function')
+  // The client role has three effects: the relay client's disposal (T23a-fix,
+  // which stops the reconnect machinery and clears the module slot), the T43
+  // credentials watcher's unsubscribe, and the restart watcher (T17) — never
+  // the sweeper, which stays host-only.
+  assert.equal(client.effects.length, 3, 'the client role starts the relay disposal, the credentials watcher and the restart watcher')
   for (const stop of client.effects) assert.equal(typeof stop, 'function', 'each effect returned a stop function')
   assert.notEqual(index.getRelayClient(), undefined, 'the client role installs its relay client in the module slot')
   for (const stop of client.effects) stop()

@@ -45,8 +45,13 @@ const SERVER_NAME = '端到端服务器'
  * Bearer token, NDJSON streams, mid-stream aborts — is piped to the gateway
  * as a public visitor's request.
  */
+/** Total requests the proxy has piped to the gateway — the observable for
+ * "the client is retrying on its own" and "the client stopped asking". */
+let proxyHits = 0
+
 function startProxy() {
   const server = http.createServer((req, res) => {
+    proxyHits += 1
     const headers = { ...req.headers, 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' }
     delete headers.connection
     delete headers['keep-alive']
@@ -160,6 +165,11 @@ async function boot(opts = {}) {
   await new Promise((resolve) => server.listen(TARGET_PORT, '127.0.0.1', resolve))
 
   const env = { store, invokeCalls, streams, handler }
+  // T43: every client this boot created is remembered so the teardown can
+  // stop its reconnect ladder — an offline zombie client from test N would
+  // otherwise keep firing retries into test N+1's gateway.
+  const allClients = []
+  const registerClient = (client) => { allClients.push(client); return client }
   let gw = startGatewayAt(home, GW_PORT, TARGET_PORT, { LAN_GATE_RELAY_SECRET: SECRET })
   await gw.ready
   const paired = await pairDesktop(GW_PORT, '端到端台式机')
@@ -167,16 +177,17 @@ async function boot(opts = {}) {
   env.deviceId = paired.id
   // The client reaches the gateway THROUGH the proxy hop, like any desktop
   // client behind its server's reverse proxy.
-  env.client = createRelayClient({
+  env.client = registerClient(createRelayClient({
     getServerUrl: () => `http://127.0.0.1:${PROXY_PORT}`,
     getToken: () => token,
-  })
+  }))
   // A second client with custom tuning against the SAME paired device.
-  env.tunedClient = (overrides = {}) => createRelayClient({
+  env.tunedClient = (overrides = {}) => registerClient(createRelayClient({
     getServerUrl: () => `http://127.0.0.1:${PROXY_PORT}`,
     getToken: () => token,
     ...overrides,
-  })
+  }))
+  env.allClients = allClients
   env.killGateway = () => new Promise((resolve) => {
     const child = gw.child
     if (child.exitCode !== null) { resolve(); return }
@@ -188,6 +199,7 @@ async function boot(opts = {}) {
     await gw.ready
   }
   env.stop = async () => {
+    for (const client of allClients) client.stop()
     handler.closeAll('e2e teardown')
     await stopAll({ close: (done) => { server.closeAllConnections(); server.close(done) } }, gw.child)
   }
@@ -417,5 +429,64 @@ test('e2e: a dead gateway reads offline, and the next success after restart read
     const again = await env.client.invoke('session', 'page', FOLLOW_ARGS)
     assert.deepEqual(again, { page: 'ok', n: 1 })
     assert.equal(env.client.state, 'online', 'a successful call lifts offline back to online')
+  } finally { await env.stop() }
+})
+
+// ---- 8. T43: the automatic reconnect ladder, end to end --------------------
+
+test('e2e T43: the gateway dies, the client retries on its own, and a restarted gateway brings it back online within the backoff', async () => {
+  const env = await boot({ shared: ['session-a'], invoke: () => ({ page: 'ok' }) })
+  try {
+    await env.client.connect()
+    assert.equal(env.client.state, 'online')
+
+    await env.killGateway()
+    // The observed failure lands offline and arms the first wait (1s + up
+    // to 20% jitter).
+    await assert.rejects(() => env.client.invoke('session', 'page', FOLLOW_ARGS), (error) => error.code === 'offline')
+    assert.equal(env.client.state, 'offline')
+    assert.ok(env.client.nextRetryAt !== null, 'a retry is armed')
+    assert.ok(env.client.nextRetryAt - Date.now() <= 1200, 'the first wait is the 1s step (+ jitter)')
+
+    // Nobody calls the client: the RETRY must be what hits the dead chain.
+    const hitsBefore = proxyHits
+    await waitFor(() => proxyHits > hitsBefore, 5000)
+    assert.equal(env.client.state, 'offline', 'the gateway is still down — the retry failed into offline again')
+    assert.equal(env.client.lastError, 'offline')
+
+    // The gateway returns on the SAME port with the SAME home (the device
+    // token lives in its state file): the next automatic attempt succeeds.
+    await env.restartGateway()
+    await waitFor(() => env.client.state === 'online', 10000)
+    assert.equal(env.client.nextRetryAt, null)
+    assert.equal(env.client.lastError, undefined)
+    // The link really works again — not just the state word.
+    const value = await env.client.invoke('session', 'page', FOLLOW_ARGS)
+    assert.deepEqual(value, { page: 'ok' })
+  } finally { await env.stop() }
+})
+
+test('e2e T43: a device revoked while the client is in the retry loop lands revoked and the client goes silent', async () => {
+  const env = await boot({ shared: ['session-a'], invoke: () => ({ page: 'ok' }) })
+  try {
+    await env.client.connect()
+    // Revoke behind the client's back, then take the chain down: the client
+    // walks its ladder against a dead proxy.
+    const action = await request(GW_PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: env.deviceId } })
+    assert.equal(action.status, 200)
+    await env.killGateway()
+    await assert.rejects(() => env.client.invoke('session', 'page', FOLLOW_ARGS), (error) => error.code === 'offline')
+    assert.equal(env.client.state, 'offline')
+
+    // The gateway returns; the retry reaches its pairing wall this time.
+    await env.restartGateway()
+    await waitFor(() => env.client.state === 'revoked', 10000)
+    assert.equal(env.client.nextRetryAt, null, 'revoked cancels the ladder')
+
+    // And the client NEVER asks again: no request leaves it, however long
+    // the ladder would have waited.
+    const quiet = proxyHits
+    await sleep(2500)
+    assert.equal(proxyHits, quiet, 'not one request after the revocation wall')
   } finally { await env.stop() }
 })
