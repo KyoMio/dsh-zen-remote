@@ -149,6 +149,12 @@ export interface RelayClient {
     /** One invoke round-trip; resolves with the unwrapped `value`, throws
      * RelayError otherwise. A caller abort surfaces as `RelayError('aborted')`. */
     invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown>;
+    /** Answer one forwarded Remote event (T32): `eventId` is the ORIGINAL id
+     * (the interceptor swapped the virtual one back), `result` the Remote
+     * event OUTCOME, forwarded verbatim — the gateway validates it. The error
+     * mapping is invoke's: a success envelope resolves (with the value, in
+     * practice undefined), everything else throws RelayError. */
+    postEventResult(eventId: string, result: unknown, signal?: AbortSignal): Promise<unknown>;
     /** Open the NDJSON stream route. `frame` lines are yielded, `ping` lines
      * only refresh the idle clock, `end` finishes the iteration, an `error`
      * line throws its RelayError. A caller abort ENDS the iteration normally;

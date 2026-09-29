@@ -1,8 +1,11 @@
 /**
  * Server-side relay routes for the desktop client (T22a routes, T22b
- * streaming): authentication, ping, handshake, the single invoke passthrough,
- * and the NDJSON stream subscription route with share-change synchronization.
- * Event forwarding (`$events`) and activity stats are later tasks.
+ * streaming, T32 event forwarding): authentication, ping, handshake, the
+ * single invoke passthrough, the NDJSON stream subscription route with
+ * share-change synchronization, and the forwarded-event half — the
+ * `$zr/events` subscription over the gateway's `$events` wire stream plus
+ * the `relay/v1/event-result` answer route. Activity stats remain a later
+ * task.
  *
  * Why the secret: the desktop client is a Node process on another machine —
  * it has no DSH login cookie, so the gateway authenticates it with a Bearer
@@ -35,7 +38,21 @@ export declare const RELAY_PREFIX = "/_dsh/zen-remote/relay";
  * method and resolves to an async iterable of its frames). Declared
  * structurally instead of augmenting `Context`: the providing package is not
  * a devDependency here, and a local augmentation could collide with its own
- * once that changes. */
+ * once that changes.
+ *
+ * T32 adds the two event surfaces, both OPTIONAL: only `$zr/events` and
+ * `relay/v1/event-result` touch them, so a composition (or test fake) without
+ * them keeps every other route working and the event routes answer
+ * `gateway/service-unavailable`.
+ *
+ * - `wireStream.open('$events', …)` is the ONLY way to the forwarded-event
+ *   stream — `gw.stream({namespace:'$events'})` refuses with
+ *   `gateway/invocation-unavailable` (docs/spike-relay.md §2.1 坑 1). It
+ *   resolves to an async iterable whose first frame is the `ready` frame.
+ * - `dispatchRpc('$events/result', payload, signal, peer)` is the only way to
+ *   answer a forwarded waterfall — the gateway special-cases the endpoint
+ *   before its typert dispatch — and returns the `{ok,…}` envelope itself.
+ */
 export interface RelayGateway {
     invoke(call: {
         namespace: string;
@@ -49,6 +66,13 @@ export interface RelayGateway {
         args: unknown;
         signal?: AbortSignal;
     }): Promise<AsyncIterable<unknown>>;
+    /** The host's wire adapter, shared by the WebSocket mux and the local
+     * transports. `open` is the async 0.2.0 method. */
+    wireStream?: {
+        open(endpoint: string, payload: unknown, uplink: unknown, peer: unknown, signal: AbortSignal | undefined): unknown;
+    };
+    /** The host's `/api` dispatch, owning the `$events/result` special case. */
+    dispatchRpc?(endpoint: string, payload: unknown, signal: AbortSignal | undefined, peer: unknown): Promise<unknown>;
 }
 /** What the handshake reports about this server. `serverName` is a CALLBACK
  * on purpose: the row value is a volatile (`{ get() }` wrapped) setting that

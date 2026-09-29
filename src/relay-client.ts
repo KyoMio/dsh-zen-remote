@@ -56,6 +56,7 @@ const RELAY_PROTOCOL = 1
 const HANDSHAKE_PATH = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE_PATH = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM_PATH = '/_dsh/zen-remote/relay/v1/stream'
+const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 
 /** How long a stream may stay line-silent before it is judged dead. */
 const DEFAULT_IDLE_TIMEOUT_MS = 45_000
@@ -202,6 +203,12 @@ export interface RelayClient {
   /** One invoke round-trip; resolves with the unwrapped `value`, throws
    * RelayError otherwise. A caller abort surfaces as `RelayError('aborted')`. */
   invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown>
+  /** Answer one forwarded Remote event (T32): `eventId` is the ORIGINAL id
+   * (the interceptor swapped the virtual one back), `result` the Remote
+   * event OUTCOME, forwarded verbatim — the gateway validates it. The error
+   * mapping is invoke's: a success envelope resolves (with the value, in
+   * practice undefined), everything else throws RelayError. */
+  postEventResult(eventId: string, result: unknown, signal?: AbortSignal): Promise<unknown>
   /** Open the NDJSON stream route. `frame` lines are yielded, `ping` lines
    * only refresh the idle clock, `end` finishes the iteration, an `error`
    * line throws its RelayError. A caller abort ENDS the iteration normally;
@@ -697,6 +704,12 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     return payload.value
   }
 
+  async function postEventResult(eventId: string, result: unknown, signal?: AbortSignal): Promise<unknown> {
+    const creds = requireCredentials()
+    const payload = await exchange(EVENT_RESULT_PATH, { eventId, result }, signal, true, creds)
+    return payload.value
+  }
+
   function openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown> {
     // Eager, not generator-lazy: an unconfigured client fails at CALL time,
     // exactly like connect/invoke, instead of hiding the error inside the
@@ -884,6 +897,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     credentialsChanged,
     stop,
     invoke,
+    postEventResult,
     openStream,
   }
 }
