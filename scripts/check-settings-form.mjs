@@ -505,26 +505,51 @@ test('T43: intercept/compat render only when the body carried the field', () => 
       reasons: ['AssistantMarkdown root missing'],
       recentFailures: [
         { time: 1_700_000_000_000, method: 'session/page', code: 'gateway/invocation-unavailable' },
+        // The interceptor's actual wire dialect (T42-fix): ISO time under
+        // `endpoint` — both must render, not 1970 and "—".
+        { time: '2026-09-29T01:02:03.000Z', endpoint: 'session/follow', code: 'offline' },
         { time: 'x', code: 42 },
       ],
     },
-    compat: { mismatchedGroups: ['session', 'workspace'], recentCalls: [{ time: 1, method: 'm', code: 'c' }] },
+    compat: {
+      identical: ['session'],
+      different: ['workspace', 'goal'],
+      unavailable: ['events'],
+      incompatibleCalls: [{ time: 1_700_000_000_000, endpoint: 'session/page', code: 'gateway/arguments-invalid' }],
+    },
   })
   assert.deepEqual(view.intercept, {
     installed: true,
     reasons: ['AssistantMarkdown root missing'],
     recentFailures: [
       { time: 1_700_000_000_000, method: 'session/page', code: 'gateway/invocation-unavailable' },
+      { time: Date.parse('2026-09-29T01:02:03.000Z'), method: 'session/follow', code: 'offline' },
       { time: 0, method: '', code: '' },
     ],
   })
-  assert.deepEqual(view.compat, { mismatchedGroups: ['session', 'workspace'], recentCalls: [{ time: 1, method: 'm', code: 'c' }] })
+  // T42: the view keeps its render names (mismatchedGroups / recentCalls,
+  // endpoint rows mapped onto method) while the WIRE names are the status
+  // route's different / incompatibleCalls.
+  assert.deepEqual(view.compat, {
+    mismatchedGroups: ['workspace', 'goal'],
+    recentCalls: [{ time: 1_700_000_000_000, method: 'session/page', code: 'gateway/arguments-invalid' }],
+  })
 
   // Present but empty/garbage still renders the group (installed defaults
   // false, lists empty) — the field's presence is the gate, not its shape.
   const empty = deriveClientStatusView({ state: 'unreachable', intercept: {}, compat: null })
   assert.deepEqual(empty.intercept, { installed: false, reasons: [], recentFailures: [] })
   assert.equal(empty.compat, undefined, 'null counts as absent')
+
+  // T42-fix: the MOST RECENT 10 rows survive a longer ring (the rings are
+  // oldest-first, so the tail is the fresh end), not the oldest ten.
+  const flooded = deriveClientStatusView({
+    state: 'unreachable',
+    intercept: { recentFailures: Array.from({ length: 14 }, (_, i) => ({ time: 1_000 + i, method: `m${i}`, code: 'x' })) },
+  })
+  assert.equal(flooded.intercept.recentFailures.length, 10)
+  assert.deepEqual(flooded.intercept.recentFailures[0], { time: 1_004, method: 'm4', code: 'x' })
+  assert.deepEqual(flooded.intercept.recentFailures[9], { time: 1_013, method: 'm13', code: 'x' })
 })
 
 // ---- T43: the connection-line copy selector ---------------------------------

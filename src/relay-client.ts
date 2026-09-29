@@ -34,9 +34,21 @@
  * `credentialsChanged()` (or a fresh `connect()`). The wait is observable as
  * `nextRetryAt`, the last failure code as `lastError`; both carry no
  * credential material.
+ *
+ * Since T42 the client also judges INTERFACE compatibility: when the wiring
+ * injects `computeOwnFingerprints`, every completed handshake is followed by
+ * a group-by-group comparison of the server's `fingerprints` map against the
+ * locally computed one, stored as `compat` ({@link RelayCompatVerdict}).
+ * Groups either side could not compute land in `unavailable` — never in
+ * `different` — so a partial view stays silent. The verdict is read live by
+ * the status route; listeners additionally hear about it through the same
+ * notification channel the state changes use.
  */
 
 import { createHash } from 'node:crypto'
+
+import { compareFingerprints } from './fingerprint.js'
+import type { RelayCompatVerdict } from './fingerprint.js'
 
 /** The one protocol version this client speaks; the handshake verifies it. */
 const RELAY_PROTOCOL = 1
@@ -141,6 +153,12 @@ export interface CreateRelayClientOptions {
   /** Clock/timers/jitter for the reconnect backoff; defaults to the real
    * ones (timers `unref()`ed). Tests inject a manual clock. */
   clock?: RelayClock
+  /** This side's own interface fingerprints (T42), computed after each
+   * completed handshake and compared group by group against the handshake's
+   * map. May be sync or async; a throw counts as "nothing computed" (an
+   * empty map — every group lands `unavailable`). Absent: `compat` stays
+   * undefined and no comparison ever runs (the host role's client, tests). */
+  computeOwnFingerprints?: () => Promise<Record<string, string>> | Record<string, string>
 }
 
 export interface RelayClient {
@@ -161,6 +179,10 @@ export interface RelayClient {
    * 'relay-unauthorized', a DSH code, …) — never a message, never a token or
    * URL. Cleared when a request succeeds again. */
   readonly lastError: string | undefined
+  /** The interface-compatibility verdict of the most recent handshake (T42):
+   * group names that matched, differed, or could not be compared. Undefined
+   * until a first handshake ran WITH `computeOwnFingerprints` wired. */
+  readonly compat: RelayCompatVerdict | undefined
   /** Observe state changes; a throwing listener never blocks the others. */
   subscribe(listener: (state: RelayState) => void): () => void
   /** Run the handshake; success resolves with it and leaves `online`. */
@@ -261,6 +283,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
 
   let state: RelayState = 'unpaired'
   let handshakeInfo: RelayHandshake | undefined
+  let compat: RelayCompatVerdict | undefined
   let lastHandshakeDigest: string | undefined
   let connectInFlight: Promise<RelayHandshake> | undefined
   // T43 reconnect machinery: the armed timer handle, how many consecutive
@@ -279,6 +302,21 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     initialCredentials === undefined ? undefined : relayCredentialsDigest(initialCredentials.url, initialCredentials.token)
   const listeners = new Set<(state: RelayState) => void>()
 
+  /** One broadcast of the CURRENT state to every subscriber; a throwing
+   * listener never blocks the rest. State transitions are the only trigger —
+   * including the handshake's connecting→online pair, which is how the T42
+   * compat verdict (stored just before `online`) reaches the settings
+   * surface: woken listeners read the getter fresh. */
+  function notify(): void {
+    for (const listener of [...listeners]) {
+      try {
+        listener(state)
+      } catch {
+        // One broken listener never blocks the rest.
+      }
+    }
+  }
+
   function setState(next: RelayState): void {
     if (state === next) return
     state = next
@@ -289,13 +327,11 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     if (next === 'offline') scheduleRetry()
     else if (next === 'online') resetRetry()
     else if (next === 'unpaired' || next === 'revoked' || next === 'incompatible') cancelRetry()
-    for (const listener of [...listeners]) {
-      try {
-        listener(next)
-      } catch {
-        // One broken listener never blocks the rest.
-      }
-    }
+    // A compat verdict describes the server the CURRENT credentials pointed
+    // at. Unpairing (or a revocation — the same "this server is gone" wall)
+    // invalidates that answer, so the verdict goes with the link (T42-fix).
+    if (next === 'unpaired' || next === 'revoked') compat = undefined
+    notify()
   }
 
   /**
@@ -576,6 +612,21 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         dshVersion: typeof payload.dshVersion === 'string' ? payload.dshVersion : '',
         fingerprints: isRecord(payload.fingerprints) ? (payload.fingerprints as Record<string, string>) : {},
       }
+      // Interface compatibility (T42): compare the handshake's group map
+      // against this side's own, right here where both are fresh. A compute
+      // failure degrades to "nothing computed" — every group lands in
+      // `unavailable`, which the comparison contract keeps away from
+      // `different`. The verdict is stored BEFORE the online transition, so
+      // every subscriber woken by it reads the getter fresh.
+      if (options.computeOwnFingerprints !== undefined) {
+        let own: Record<string, string> = {}
+        try {
+          own = (await options.computeOwnFingerprints()) ?? {}
+        } catch {
+          // Own fingerprints unavailable — the verdict says so, honestly.
+        }
+        compat = compareFingerprints(handshakeInfo.fingerprints, own)
+      }
       // Digest of exactly the credentials this handshake used — never the
       // plaintext values (T23a-fix).
       lastHandshakeDigest = relayCredentialsDigest(creds.url, creds.token)
@@ -823,6 +874,9 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     },
     get lastError(): string | undefined {
       return lastError
+    },
+    get compat(): RelayCompatVerdict | undefined {
+      return compat
     },
     subscribe,
     connect,

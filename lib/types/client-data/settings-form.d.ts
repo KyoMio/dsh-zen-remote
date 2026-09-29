@@ -120,10 +120,14 @@ export interface ClientStatusBody {
     lastError?: unknown;
     /** T23b request-interceptor diagnostics (provisional shape; presence-gated). */
     intercept?: unknown;
-    /** T42 relay compat diagnostics (provisional shape; presence-gated). */
+    /** T42 relay compat diagnostics: `{ identical: string[], different:
+     * string[], unavailable: string[], incompatibleCalls: { time: number,
+     * endpoint: string, code: string }[] }` (presence-gated). */
     compat?: unknown;
 }
-/** One remote-call failure line in the diagnostics lists. */
+/** One remote-call failure line in the diagnostics lists. `time` is epoch
+ * milliseconds — ISO-stamped rings are parsed at derive time; `method`
+ * carries the wire's method-or-endpoint name. */
 export interface ClientDiagFailureView {
     time: number;
     method: string;

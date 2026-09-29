@@ -52,6 +52,7 @@ import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 import { createShareStore } from './share-store.js'
 import { createRelayClient, RelayError } from './relay-client.js'
 import type { RelayClient } from './relay-client.js'
+import { computeFingerprints } from './fingerprint.js'
 import { runSelfCheck, installIntercept } from './intercept.js'
 import type { InterceptDiagnostics, InterceptHandle } from './intercept.js'
 import { checkGatewayShape } from './intercept-shape.js'
@@ -614,6 +615,13 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // Structurally typed instead of a Context augmentation: the providing
       // package is not a devDependency here (see RelayGateway's comment).
       const gatewayService = (relayCtx as Context & { typertGateway: RelayGateway }).typertGateway
+      // The server's interface fingerprints (T42): recomputed at EVERY
+      // handshake, deliberately uncached — the typert loader registers
+      // package by package asynchronously, so a client that auto-reconnects
+      // right after a server restart would otherwise handshake a half-empty
+      // registry and pin those throwaway values for the row's lifetime.
+      // ~7 ms per computation against a full registry; a failed compute
+      // lands as the empty map inside the relay handler's own guard.
       relayCtx.effect(() => {
         const handler = createRelayHandler({
           secret: relaySecret,
@@ -630,6 +638,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             // snapshotted from the resolveConfig call above.
             serverName: () => resolveConfig(config, readFileConfig(), process.env).values.serverName,
             dshVersion: resolveDshVersion(),
+            fingerprints: () => computeFingerprints(relayCtx),
           },
         })
         const unregister = relayCtx.webServer.register({
@@ -675,6 +684,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         const value = unwrapVolatile(row.deviceToken)
         return typeof value === 'string' && value !== '' ? value : undefined
       },
+      // Interface compatibility (T42): after each completed handshake this
+      // side computes its OWN fingerprints against THIS process's typert
+      // registry (read per call — at creation time the row context may still
+      // be assembling), and the relay client stores the group-by-group
+      // verdict the status route reports.
+      computeOwnFingerprints: () => computeFingerprints(ctx),
     })
     clientRelayClient = relayClient
     // A stopped or reloaded row must not leave a stale instance where the
@@ -725,7 +740,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     const interceptDiagnostics = (): InterceptDiagnostics | undefined => {
       if (interceptHandle !== undefined) return interceptHandle.diagnostics()
       if (interceptRefused !== undefined) {
-        return { installed: false, shape: interceptRefused, recentFailures: [] }
+        return { installed: false, shape: interceptRefused, recentFailures: [], incompatibleCalls: [] }
       }
       return undefined
     }
