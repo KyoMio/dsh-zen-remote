@@ -17,10 +17,13 @@
  *   table get one defensive deep scan instead — a virtual id found anywhere
  *   must never reach the local DSH, so the call is refused
  *   (`remote-unsupported`); for registered methods only the registered
- *   fields are read, the same decoy discipline the server applies. The
- *   three field-less GLOBAL reads therefore never refuse on their arguments:
- *   a stray id in them is unowned data, they pass through untouched, and
- *   merging their state is T23b-2.
+ *   fields are read, the same decoy discipline the server applies. The three
+ *   field-less GLOBAL reads (`workspace/follow`, `session/control`,
+ *   `session/list`) never refuse on their arguments either — since T23b-2
+ *   they are MERGED instead: the local answer passes through and the relay's
+ *   filtered answer is folded in by src/merge-streams.ts (remote workspaces
+ *   appear as `zr~`-prefixed groups after the local ones; a remote baseline
+ *   never reaches the UI as a second baseline).
  * - before forwarding, the call's virtual ids must all belong to ONE server
  *   AND to the server this relay client is handshook with (`remote-mismatch`);
  *   with no handshake at all the answer is `remote-offline`.
@@ -40,13 +43,19 @@
  *   every error THROWN on the stream route is marked `isDSHRemoteError` with
  *   a string `code` (dsh-typert-protocol's remoteErrorOf folds unmarked
  *   errors into `gateway/internal`, losing the code).
+ * - the 0.2.0 `openWireStream` is an ASYNC method — the host's mux does
+ *   `await this.open(...)` and then `for await` over the result. The merge
+ *   route therefore awaits the local original too and hands the host back a
+ *   promise of the merged iterable, the same shape the real method returns.
  */
 
 import { RelayError } from './relay-client.js'
-import type { RelayClient } from './relay-client.js'
+import type { RelayClient, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
+import { createControlMerger, createWorkspaceMerger, mergeSessionList } from './merge-streams.js'
+import type { ControlMerger, MergerIdentity, WorkspaceMerger } from './merge-streams.js'
 
 /** The session-locating argument fields, as registered per method. Identical
  * in name and meaning to relay-access.ts's `SessionField`. */
@@ -61,9 +70,9 @@ export type SessionField = 'request.sessionId' | 'request.address'
  * server does not check would strand a virtual id un-rewritten.
  *
  * The three global reads carry no field: nothing in their arguments is
- * session-scoped, so this module never forwards them (merging their state
- * is T23b-2) — a virtual id smuggled into their arguments deep-scans to a
- * refusal, same as any unregistered method.
+ * session-scoped, so they are never REFUSED on their arguments — a stray
+ * virtual id there is unowned data. Instead the T23b-2 routes merge their
+ * answers with the relay's filtered ones (merge-streams.ts).
  */
 export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField[]>> = {
   // session/* — ownership via the address envelope
@@ -77,7 +86,9 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'session/selectModel': ['request.sessionId'],
   'session/updateQueue': ['request.sessionId'],
   'session/attachment': ['request.sessionId'],
-  // session/* — the global control stream and the unscoped list (T23b-2)
+  // session/* — the global control stream and the unscoped list: merged with
+  // the relay's filtered answer by the T23b-2 routes below (never refused on
+  // arguments — a stray id in them is unowned data).
   'session/control': [],
   'session/list': [],
   // job/*
@@ -96,7 +107,7 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'workspace/unpinSession': ['request.sessionId'],
   'workspace/archiveSession': ['request.sessionId'],
   'workspace/unarchiveSession': ['request.sessionId'],
-  // workspace — the global follow stream (T23b-2)
+  // workspace — the global follow stream, merged like the two session/* reads
   'workspace/follow': [],
 }
 
@@ -386,6 +397,312 @@ export function rewriteResult(endpoint: string, value: unknown, serverId: string
 /** Longest failure ring kept for the status surface. */
 const MAX_FAILURES = 20
 
+// ---- the global reads (T23b-2): merge-stream routes -----------------------
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  if (value === null || typeof value !== 'object') return false
+  return typeof (value as Record<PropertyKey, unknown>)[Symbol.asyncIterator] === 'function'
+}
+
+/** The (serverId, serverName) the current handshake names — the identity a
+ * merge route virtualizes with and watches for changes. */
+function relayIdentityOf(client: RelayClient): MergerIdentity | undefined {
+  const info = client.handshakeInfo
+  if (info === undefined || info.serverId === '') return undefined
+  return { serverId: info.serverId, serverName: info.serverName }
+}
+
+/**
+ * One delivery queue between the two pump tasks and the consumer: frames
+ * leave in arrival order, the first failure wins, `end`/`fail` after `end`
+ * are no-ops. Single consumer, single-reader — exactly the merged stream's
+ * shape.
+ */
+function createFrameChannel(): {
+  push: (frame: unknown) => void
+  end: () => void
+  fail: (error: unknown) => void
+  next: () => Promise<IteratorResult<unknown>>
+} {
+  const items: unknown[] = []
+  let waiter: { resolve: (result: IteratorResult<unknown>) => void; reject: (error: unknown) => void } | undefined
+  let ended = false
+  let failure: { error: unknown } | undefined
+  return {
+    push(frame: unknown): void {
+      if (ended) return
+      if (waiter !== undefined) {
+        const pending = waiter
+        waiter = undefined
+        pending.resolve({ value: frame, done: false })
+        return
+      }
+      items.push(frame)
+    },
+    end(): void {
+      if (ended) return
+      ended = true
+      if (waiter !== undefined) {
+        const pending = waiter
+        waiter = undefined
+        pending.resolve({ value: undefined, done: true })
+      }
+    },
+    fail(error: unknown): void {
+      if (ended) return
+      ended = true
+      if (waiter !== undefined) {
+        const pending = waiter
+        waiter = undefined
+        pending.reject(error)
+        return
+      }
+      failure = { error }
+    },
+    next(): Promise<IteratorResult<unknown>> {
+      if (items.length > 0) return Promise.resolve({ value: items.shift() as unknown, done: false })
+      if (failure !== undefined) {
+        const stored = failure
+        failure = undefined
+        return Promise.reject(stored.error)
+      }
+      if (ended) return Promise.resolve({ value: undefined, done: true })
+      return new Promise((resolve, reject) => {
+        waiter = { resolve, reject }
+      })
+    },
+  }
+}
+
+interface MergedGlobalStreamDeps {
+  endpoint: 'workspace/follow' | 'session/control'
+  namespace: string
+  method: string
+  /** The LOCAL stream the original openWireStream returned (already
+   * awaited — the 0.2.0 method is async). */
+  local: AsyncIterable<unknown>
+  relay: RelayClient
+  signal: AbortSignal | undefined
+  recordFailure: (endpoint: string, code: string) => void
+  log: ((format: string, ...args: unknown[]) => void) | undefined
+}
+
+/**
+ * The merged global stream: the local frames and the relay's filtered
+ * frames interleave in arrival order, each side fed through its merger
+ * (merge-streams.ts). The local stream is the stream the UI actually
+ * opened — its end ends everything (remote leg aborted first), its error
+ * is the consumer's error. A remote death (error or clean end) and a
+ * merely offline relay emit NOTHING and keep the shown state (T23b2-fix):
+ * the UI blacklists removed virtual ids forever, so a disconnect remove
+ * would make the group un-revivable — the reconnecting baseline is diffed
+ * against what was shown instead. Only a serverId change or the relay
+ * entering `unpaired` / `revoked` removes the whole group, and a rename
+ * re-upserts the shown groups under the new title without a reopen.
+ */
+async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator<unknown, void, undefined> {
+  const { endpoint, namespace, method, local, relay, signal, recordFailure, log } = deps
+  // An already-aborted caller has nothing to merge — end both legs (neither
+  // has started) immediately instead of letting the local stream open into
+  // a dead iteration.
+  if (signal?.aborted === true) return
+  const onDiagnostic = (message: string): void => {
+    log?.('client merge dropped a frame on %s: %s', endpoint, message)
+  }
+  const initial = relayIdentityOf(relay)
+  // Created eagerly so the local leg is observed from its first frame on.
+  // The empty identity is a placeholder: the remote pump retargets before
+  // any remote frame is ever fed (it only runs under a real handshake).
+  let merger: WorkspaceMerger | ControlMerger =
+    endpoint === 'session/control'
+      ? createControlMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
+      : createWorkspaceMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
+
+  const channel = createFrameChannel()
+  let alive = true
+  let currentController: AbortController | undefined
+  // Set by the state listener when a re-handshake aborted the in-flight
+  // remote stream: the pump must reopen WITHOUT waiting for another online
+  // event (the transition that fired the abort already happened).
+  let reopenNow = false
+  const onlineWaiters: (() => void)[] = []
+  const flushWaiters = (): void => {
+    for (const wake of onlineWaiters.splice(0)) wake()
+  }
+
+  /** The relay's state moves. `online` re-evaluates the server identity (a
+   * serverId change cuts the in-flight stream so the pump re-opens; a rename
+   * re-upserts the shown groups under the new title); `unpaired` /
+   * `revoked` end the remote group for good. Anything thrown here must
+   * never escape into the relay's listener loop. */
+  const onState = (state: RelayState): void => {
+    try {
+      if (state === 'unpaired' || state === 'revoked') {
+        // Permanent remote end: the whole virtual group leaves (those
+        // prefixes never come back, so the UI's remove-blacklist cannot be
+        // hit by a revival under them). No reopen until a re-pair lands.
+        for (const frame of merger.onRemoteGone()) channel.push(frame)
+        currentController?.abort()
+        return
+      }
+      if (state !== 'online') return
+      const next = relayIdentityOf(relay)
+      if (next === undefined) return
+      if (next.serverId !== merger.serverId) {
+        // A different server: cut the in-flight stream so the pump's loop
+        // re-evaluates (it emits the old group's removals and retargets).
+        if (currentController !== undefined) {
+          reopenNow = true
+          currentController.abort()
+        }
+        return
+      }
+      if (next.serverName !== merger.serverName) {
+        // Rename: same server, new display name — no reopen, no removals;
+        // every shown workspace is re-upserted under the new title and the
+        // stream keeps running.
+        merger.retarget(next)
+        for (const frame of merger.onServerRenamed()) channel.push(frame)
+      }
+    } catch (error) {
+      log?.('client merge state handler failed on %s: %s', endpoint, messageOf(error))
+    } finally {
+      flushWaiters()
+    }
+  }
+  let offState: () => void
+  try {
+    offState = relay.subscribe(onState)
+  } catch (error) {
+    // Remote-side setup failed: degrade to a pure local passthrough so the
+    // UI's own stream is untouched and the remote leg never starts.
+    log?.('client merge on %s degraded to local-only: %s', endpoint, messageOf(error))
+    yield* localOnly(local)
+    return
+  }
+
+  const onExternalAbort = (): void => {
+    alive = false
+    currentController?.abort()
+    flushWaiters()
+    channel.end()
+  }
+  if (signal !== undefined) signal.addEventListener('abort', onExternalAbort)
+
+  /** Wait for the next relay state event. Registered in the same
+   * synchronous step as the caller's state check — an event either ran
+   * before the check (the state read saw it) or resolves this waiter. */
+  const waitOnline = async (): Promise<void> => {
+    await new Promise<void>((resolve) => {
+      onlineWaiters.push(resolve)
+    })
+  }
+
+  const localIterator = local[Symbol.asyncIterator]()
+  const pumpLocal = async (): Promise<void> => {
+    try {
+      while (alive) {
+        const result = await localIterator.next()
+        if (result.done === true) break
+        for (const frame of merger.onLocal(result.value)) channel.push(frame)
+      }
+    } catch (error) {
+      // The local stream is the one the UI opened: its failure is the
+      // merged stream's failure (a remote death never is).
+      if (alive) channel.fail(error)
+      return
+    }
+    if (!alive) return
+    // Local stream over → the whole merged stream is over; the remote leg
+    // goes first (its pump unwinds), then the consumer sees `done`.
+    alive = false
+    currentController?.abort()
+    flushWaiters()
+    channel.end()
+  }
+
+  const pumpRemote = async (): Promise<void> => {
+    // The whole pump body is guarded: ANY escape stops the REMOTE leg only —
+    // the local stream the UI opened must never notice.
+    try {
+      while (alive) {
+        const identity = relayIdentityOf(relay)
+        if (identity === undefined || relay.state !== 'online') {
+          await waitOnline()
+          continue
+        }
+        if (identity.serverId !== merger.serverId) {
+          // The server changed (a rename is handled in the state listener —
+          // reaching here means serverId differs): remove the old server's
+          // groups, then point the SAME merger at the new server; the
+          // observed local state survives the swap.
+          for (const frame of merger.onRemoteGone()) channel.push(frame)
+          merger.retarget(identity)
+        }
+        const controller = new AbortController()
+        currentController = controller
+        try {
+          const stream = relay.openStream(namespace, method, {}, controller.signal)
+          for await (const frame of stream) {
+            if (!alive) break
+            for (const out of merger.onRemote(frame)) channel.push(out)
+          }
+        } catch (error) {
+          // A transport fault is a diagnostics-ring failure — but an abort
+          // of OUR OWN controller (server change, unpair, teardown) is not:
+          // the generation signal tells them apart.
+          if (alive && !controller.signal.aborted && signal?.aborted !== true) {
+            recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
+          }
+        } finally {
+          if (currentController === controller) currentController = undefined
+        }
+        if (!alive) return
+        // Remote over — error or clean end: NOTHING is emitted and the shown
+        // state stays (T23b2-fix): the UI keeps the last projection visible
+        // while the carrier reconnects, and a remove here would blacklist
+        // the virtual ids against revival. The reconnecting baseline diffs.
+        merger.onRemoteDown()
+        if (reopenNow) {
+          reopenNow = false
+          continue
+        }
+        await waitOnline()
+      }
+    } catch (error) {
+      if (alive) onDiagnostic(`remote leg stopped: ${messageOf(error)}`)
+    }
+  }
+
+  void pumpLocal()
+  // The body above is fully guarded; the .catch is for the guard itself (a
+  // throwing logger must not become an unhandled rejection).
+  void pumpRemote().catch(() => {})
+  try {
+    while (true) {
+      const result = await channel.next()
+      if (result.done === true) break
+      yield result.value
+    }
+  } finally {
+    alive = false
+    offState()
+    if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
+    currentController?.abort()
+    flushWaiters()
+    // Best-effort half-close of the local stream the consumer walked away
+    // from — never awaited: an upstream that ignores return() must not
+    // hang the teardown.
+    void Promise.resolve(localIterator.return?.(undefined)).catch(() => {})
+  }
+}
+
+/** Pure local passthrough for the degraded (setup-failed) path: local errors
+ * propagate to the consumer, a consumer return() unwinds the upstream. */
+async function* localOnly(local: AsyncIterable<unknown>): AsyncGenerator<unknown, void, undefined> {
+  for await (const frame of local) yield frame
+}
+
 /**
  * Install the two own-property wrappers on the raw gateway. Assumes
  * {@link checkGatewayShape} passed (the wiring gates on it) — this function
@@ -508,6 +825,43 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     }
   }
 
+  /**
+   * The T23b-2 `session/list` route: the local answer stays the base (its
+   * pagination fields rule), the relay's filtered FIRST page is appended with
+   * virtualized session ids. Paged requests, an offline relay, a non-ok local
+   * envelope and a failed remote call all answer the local result untouched —
+   * only a remote failure is recorded.
+   */
+  async function mergedSessionListCall(
+    endpoint: string,
+    payload: unknown,
+    args: unknown,
+    signal: AbortSignal | undefined,
+    peer: unknown,
+  ): Promise<unknown> {
+    const localEnvelope = (await (chainTarget.dispatchRpc as (this: unknown, ...callArgs: unknown[]) => unknown).call(
+      raw,
+      endpoint,
+      payload,
+      signal,
+      peer,
+    )) as unknown
+    // A local failure is the answer — there is nothing to merge into.
+    if (!isPlainObject(localEnvelope) || localEnvelope.ok !== true) return localEnvelope
+    // Only the first page merges: a cursor pages the local list alone.
+    const request = isPlainObject(args) ? args._request : undefined
+    if (isPlainObject(request) && request.cursor !== undefined) return localEnvelope
+    const identity = relayIdentityOf(relay)
+    if (identity === undefined || relay.state !== 'online') return localEnvelope
+    try {
+      const remote = await relay.invoke('session', 'list', isPlainObject(args) ? args : {}, signal)
+      return { ok: true, value: mergeSessionList(localEnvelope.value, remote, identity.serverId) }
+    } catch (error) {
+      recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
+      return localEnvelope
+    }
+  }
+
   const wrappedDispatch = function wrappedDispatch(
     this: unknown,
     endpoint: string,
@@ -526,6 +880,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     const fields = CLIENT_METHOD_FIELDS[endpoint]
     const virtuals = collectVirtuals(fields, args)
     if (virtuals.length === 0) {
+      if (endpoint === 'session/list') {
+        return mergedSessionListCall(endpoint, payload, args, signal, peer)
+      }
       return (chainTarget.dispatchRpc as (...callArgs: unknown[]) => unknown).call(raw, endpoint, payload, signal, peer)
     }
     return forwardInvoke(endpoint, args, virtuals, signal)
@@ -560,6 +917,45 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     const fields = CLIENT_METHOD_FIELDS[endpoint]
     const virtuals = collectVirtuals(fields, args)
     if (virtuals.length === 0) {
+      if (endpoint === 'workspace/follow' || endpoint === 'session/control') {
+        // The startup self-check probe wants the LOCAL baseline only — no
+        // remote leg, no merge (its payload is registered in probePayloads).
+        if (probe !== undefined) {
+          return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
+            raw,
+            endpoint,
+            payload,
+            uplink,
+            peer,
+            signal,
+            control,
+          )
+        }
+        // The T23b-2 global merge. The 0.2.0 openWireStream is an ASYNC
+        // method — the host's mux awaits the result and then for-awaits it —
+        // so this route awaits the local original too and hands back a
+        // promise of the merged iterable, the shape the real method returns.
+        const slash = endpoint.indexOf('/')
+        const namespace = slash === -1 ? endpoint : endpoint.slice(0, slash)
+        const method = slash === -1 ? '' : endpoint.slice(slash + 1)
+        const open = chainTarget.openWireStream as (this: unknown, ...callArgs: unknown[]) => unknown
+        return (async (): Promise<unknown> => {
+          // The uplink rides to the LOCAL method verbatim (it may consume
+          // it); the remote leg carries no uplink.
+          const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control)
+          if (!isAsyncIterable(local)) return local
+          return mergedGlobalStream({
+            endpoint,
+            namespace,
+            method,
+            local,
+            relay,
+            signal,
+            recordFailure,
+            log,
+          })
+        })()
+      }
       return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
         raw,
         endpoint,
@@ -598,6 +994,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // channel hands the failure to the UI.
     return rewriteUpstream(endpoint, upstream, serverId)
   }
+
 
   gateway.openWireStream = wrappedOpen as unknown
   gateway.dispatchRpc = wrappedDispatch as unknown
