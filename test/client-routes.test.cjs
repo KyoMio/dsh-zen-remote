@@ -83,6 +83,7 @@ function startClientServer(row, overrides = {}) {
     getRowConfig: overrides.getRowConfig || (() => row),
     ...(overrides.fetchImpl !== undefined ? { fetchImpl: overrides.fetchImpl } : {}),
     ...(overrides.getRelayClient !== undefined ? { getRelayClient: overrides.getRelayClient } : {}),
+    ...(overrides.getIntercept !== undefined ? { getIntercept: overrides.getIntercept } : {}),
   })
   const server = http.createServer((req, res) => { void handler(req, res) })
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })))
@@ -977,4 +978,105 @@ test('an injected fetch sees the exact probe request: bearer header, ping path, 
   } finally {
     await closeServer(server)
   }
+})
+
+// ---- T42: the compat diagnostics ----------------------------------------------
+
+const { createRelayClient } = require('../lib/relay-client.js')
+
+/**
+ * A dedicated relay-handshake server answering ONLY the handshake route with
+ * the injected fingerprints — the "server side" of the injected-fingerprint
+ * e2e below, with no other machinery in the way.
+ */
+async function startHandshakeServer(fingerprints) {
+  const seen = []
+  const state = { fingerprints }
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      seen.push({ url: String(req.url).split('?')[0] })
+      if (String(req.url).split('?')[0] === '/_dsh/zen-remote/relay/v1/handshake') {
+        sendJson(res, 200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '指纹服务器', dshVersion: '0.0.0-t42', fingerprints: state.fingerprints })
+        return
+      }
+      sendJson(res, 404, { ok: false, error: { code: 'not-found' } })
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  return { server, port: server.address().port, seen, state, stop: () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve) }) }
+}
+
+test('T42 e2e: server and client with DIFFERENT fingerprints — status lists the groups', async () => {
+  const relayServer = await startHandshakeServer({ session: 'aaa111', workspace: 'bbb222', events: 'ccc333' })
+  const client = createRelayClient({
+    getServerUrl: () => `http://127.0.0.1:${relayServer.port}`,
+    getToken: () => 'tok-t42',
+    computeOwnFingerprints: () => ({ session: 'aaa111', workspace: 'zzz999', events: 'ccc333' }),
+  })
+  try {
+    await client.connect()
+    const row = makeRow({ serverUrl: `http://127.0.0.1:${relayServer.port}`, deviceToken: 'tok-t42' })
+    const { server, port } = await startClientServer(row, { getRelayClient: () => client })
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'online')
+    assert.deepEqual(body.compat, {
+      identical: ['events', 'session'],
+      different: ['workspace'],
+      unavailable: [],
+      incompatibleCalls: [],
+    })
+    await closeServer(server)
+  } finally { await client.stop(); await relayServer.stop() }
+})
+
+test('T42 e2e: identical fingerprints — status compat.different is empty', async () => {
+  const same = { session: 'aaa111', workspace: 'bbb222', events: 'ccc333' }
+  const relayServer = await startHandshakeServer(same)
+  const client = createRelayClient({
+    getServerUrl: () => `http://127.0.0.1:${relayServer.port}`,
+    getToken: () => 'tok-t42',
+    computeOwnFingerprints: () => ({ ...same }),
+  })
+  try {
+    await client.connect()
+    const row = makeRow({ serverUrl: `http://127.0.0.1:${relayServer.port}`, deviceToken: 'tok-t42' })
+    const { server, port } = await startClientServer(row, { getRelayClient: () => client })
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'online')
+    assert.deepEqual(body.compat.different, [], 'nothing differs — no yellow hint material')
+    assert.deepEqual(body.compat.identical, ['events', 'session', 'workspace'])
+    await closeServer(server)
+  } finally { await client.stop(); await relayServer.stop() }
+})
+
+test('T42 status: nothing to report — the compat field stays absent', async () => {
+  const client = createRelayClient({ getServerUrl: () => undefined, getToken: () => undefined })
+  const row = makeRow({ serverUrl: '', deviceToken: '' })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => client })
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'unpaired')
+    assert.equal(body.compat, undefined, 'no verdict and no incompatible calls — no compat field')
+  } finally { await client.stop(); await closeServer(server) }
+})
+
+test('T42 status: the interceptor\u2019s incompatible calls flow into compat', async () => {
+  const row = makeRow({ serverUrl: '', deviceToken: '' })
+  const { server, port } = await startClientServer(row, {
+    getIntercept: () => ({
+      installed: true,
+      shape: { ok: true, notes: [] },
+      recentFailures: [{ time: '2026-09-29T00:00:00.000Z', endpoint: 'session/page', code: 'remote-offline' }],
+      incompatibleCalls: [{ time: 1_700_000_000_000, endpoint: 'session/follow', code: 'gateway/arguments-invalid' }],
+    }),
+  })
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.deepEqual(body.compat.incompatibleCalls, [
+      { time: 1_700_000_000_000, endpoint: 'session/follow', code: 'gateway/arguments-invalid' },
+    ])
+    assert.deepEqual(body.compat.different, [], 'no relay client verdict — no differences claimed')
+  } finally { await closeServer(server) }
 })
