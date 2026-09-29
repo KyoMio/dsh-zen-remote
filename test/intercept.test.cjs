@@ -613,6 +613,37 @@ const REMOTE_BASELINE = {
   },
 }
 
+/**
+ * The real `ClientWorkspaceModel` (same loader as test/merge-streams.test.cjs:
+ * the devDep's browser-style bundle executed through a shimmed
+ * `window.__ModuleLoader__`), used to prove the revocation/re-pair lifecycle
+ * against the model whose never-cleared `removedIds` blacklist is the whole
+ * reason a revoke may not emit removes (T23b2-fix3). Loaded lazily so the
+ * global `window` shim only exists while these tests actually run.
+ */
+let workspaceClient
+function createUiModel() {
+  if (workspaceClient === undefined) {
+    let mod
+    global.window = { __ModuleLoader__: { load: ({ factory }) => { mod = factory(() => ({ isRemoteFailure: () => true, Service: class {}, RemoteSnapshotStream: class {} })) } } }
+    require(require.resolve('@deepseek-ai/dsh-api-workspace-controller/client'))
+    if (typeof mod?.ClientWorkspaceModel !== 'function') {
+      throw new Error('dsh-api-workspace-controller/client did not export ClientWorkspaceModel')
+    }
+    workspaceClient = mod
+  }
+  const model = new workspaceClient.ClientWorkspaceModel({})
+  const apply = (frame) => {
+    if (frame.type === 'baseline') model.replaceBaseline(frame.value)
+    else if (frame.type === 'upsert') model.upsertView(frame.workspace)
+    else if (frame.type === 'remove') model.removeView(frame.workspaceId)
+    else if (frame.type === 'order') model.replaceOrder(frame.workspaceIds)
+    else if (frame.type === 'archived') model.replaceArchived(frame.archivedSessionIds)
+    else model.replacePinned(frame.pinnedSessionIds)
+  }
+  return { model, apply, ids: () => model.items.map((item) => item.workspaceId).join(',') }
+}
+
 test('workspace/follow merges the two legs: local first, remote upserts + merged order, a remote death emits NOTHING (state kept), recovery diffs, abort stops both', async () => {
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
@@ -703,37 +734,88 @@ test('a server RENAME (same serverId) re-upserts under the new title without reo
   handle.uninstall()
 })
 
-test('unpair / revocation removes the whole group; a re-pair to the same serverId reopens and re-shows everything', async () => {
+test('unpair / revocation keeps the shown group (serverId persists server-side); a re-pair to the same serverId reopens and re-shows everything in the REAL UI model', async () => {
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
   const relay = createControllableRelay()
   const { handle } = install(gateway, relay)
+  const ui = createUiModel()
+  const v1 = toVirtual(SERVER_ID, 'w-1')
+  const v2 = toVirtual(SERVER_ID, 'w-2')
   const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
   localGate.push(LOCAL_BASELINE)
-  await readSome(iterator, 1)
+  ;(await readSome(iterator, 1)).forEach(ui.apply)
   relay.streams[0].gate.push(REMOTE_BASELINE)
-  await readSome(iterator, 5)
+  ;(await readSome(iterator, 5)).forEach(ui.apply)
+  assert.equal(ui.ids(), `ws-local,${v1},${v2}`)
 
-  // the pairing dies: the whole virtual group leaves (those prefixes never
-  // come back, so the UI's remove-blacklist cannot be hit by a revival)
+  // the pairing dies (T23b2-fix3): NOT a remove any more. The server keeps
+  // its serverId, so a re-pair reuses the prefix — and ClientWorkspaceModel's
+  // removedIds blacklist never clears, so a remove here would make the whole
+  // group un-revivable. Nothing may leave; only the status annotation (T34)
+  // changes.
   relay.transition('revoked')
-  const gone = await readSome(iterator, 5)
-  assert.deepEqual(gone, [
-    { type: 'remove', workspaceId: toVirtual(SERVER_ID, 'w-1') },
-    { type: 'remove', workspaceId: toVirtual(SERVER_ID, 'w-2') },
-    { type: 'order', workspaceIds: ['ws-local'] },
-    { type: 'archived', archivedSessionIds: [] },
-    { type: 'pinned', pinnedSessionIds: [] },
-  ])
   await new Promise((resolve) => setTimeout(resolve, 20))
   assert.equal(relay.streams.length, 1, 'no reopen while revoked')
+  assert.ok(relay.streams[0].aborted, 'the in-flight remote leg was cut')
+  assert.equal(ui.ids(), `ws-local,${v1},${v2}`, 'the revocation removed nothing from the UI model')
 
-  // re-paired (same server id): the leg reopens and the baseline re-shows
+  // local frames keep flowing while revoked, still merged with the kept tail
+  localGate.push({ type: 'order', workspaceIds: ['ws-local'] })
+  const kept = await readSome(iterator, 1)
+  kept.forEach(ui.apply)
+  assert.deepEqual(kept, [{ type: 'order', workspaceIds: ['ws-local', v1, v2] }])
+
+  // re-paired to the SAME server id: the leg reopens and the new baseline
+  // diffs against the kept state — content refresh (upserts only, no
+  // removes) — and the REAL model ends up holding the remote groups with the
+  // NEW baseline's content.
   relay.transition('online')
   await waitForStream(relay, 2)
-  relay.streams[1].gate.push(REMOTE_BASELINE)
+  const repairedBaseline = {
+    type: 'baseline',
+    value: {
+      items: [remoteWorkspace('w-1', '重配后', ['session-a']), remoteWorkspace('w-2', '远端二', ['session-c'])],
+      archivedSessionIds: [],
+      pinnedSessionIds: [],
+    },
+  }
+  relay.streams[1].gate.push(repairedBaseline)
   const remerged = await readSome(iterator, 5)
+  remerged.forEach(ui.apply)
   assert.deepEqual(remerged.map((frame) => frame.type), ['upsert', 'upsert', 'order', 'archived', 'pinned'])
+  assert.equal(ui.ids(), `ws-local,${v1},${v2}`, 'the remote groups survived the revoke → re-pair round trip')
+  assert.equal(ui.model.items[1].title, '主服务器 · 重配后', 'the content came from the NEW baseline')
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('a revocation that never re-pairs emits NO remove: the merged stream stays quiet and the REAL UI model keeps the groups', async () => {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const ui = createUiModel()
+  const v1 = toVirtual(SERVER_ID, 'w-1')
+  const v2 = toVirtual(SERVER_ID, 'w-2')
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  ;(await readSome(iterator, 1)).forEach(ui.apply)
+  relay.streams[0].gate.push(REMOTE_BASELINE)
+  ;(await readSome(iterator, 5)).forEach(ui.apply)
+
+  relay.transition('revoked')
+  // Give the aborted remote leg every chance to surface a wrongly emitted
+  // frame: a remove would be queued in the channel AHEAD of the local frame
+  // read below.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  localGate.push({ type: 'order', workspaceIds: ['ws-local'] })
+  const only = await readSome(iterator, 1)
+  only.forEach(ui.apply)
+  assert.deepEqual(only, [{ type: 'order', workspaceIds: ['ws-local', v1, v2] }], 'the first frame after the revocation is the local order — no remove preceded it')
+  assert.equal(ui.ids(), `ws-local,${v1},${v2}`, 'the REAL model still holds the remote groups — the blacklist was never triggered')
+  assert.equal(relay.streams.length, 1, 'nothing reopens while revoked')
   controller.abort()
   localGate.finish()
   handle.uninstall()

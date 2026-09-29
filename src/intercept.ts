@@ -535,13 +535,15 @@ interface MergedGlobalStreamDeps {
  * frames interleave in arrival order, each side fed through its merger
  * (merge-streams.ts). The local stream is the stream the UI actually
  * opened — its end ends everything (remote leg aborted first), its error
- * is the consumer's error. A remote death (error or clean end) and a
- * merely offline relay emit NOTHING and keep the shown state (T23b2-fix):
- * the UI blacklists removed virtual ids forever, so a disconnect remove
- * would make the group un-revivable — the reconnecting baseline is diffed
- * against what was shown instead. Only a serverId change or the relay
- * entering `unpaired` / `revoked` removes the whole group, and a rename
- * re-upserts the shown groups under the new title without a reopen.
+ * is the consumer's error. A remote death (error or clean end), a merely
+ * offline relay, AND the relay entering `unpaired` / `revoked` emit NOTHING
+ * and keep the shown state (T23b2-fix + T23b2-fix3): the UI blacklists
+ * removed virtual ids forever, so any remove of a still-valid prefix would
+ * make the group un-revivable — and the server PERSISTS its serverId
+ * (relay-server.ts loadServerId), so a re-pair to the same server reuses the
+ * prefix and revives the group through the reconnecting baseline's diff.
+ * Only a serverId CHANGE removes the whole group (a new prefix), and a
+ * rename re-upserts the shown groups under the new title without a reopen.
  */
 async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator<unknown, void, undefined> {
   const { endpoint, namespace, method, local, relay, signal, recordFailure, log } = deps
@@ -576,15 +578,22 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   /** The relay's state moves. `online` re-evaluates the server identity (a
    * serverId change cuts the in-flight stream so the pump re-opens; a rename
    * re-upserts the shown groups under the new title); `unpaired` /
-   * `revoked` end the remote group for good. Anything thrown here must
-   * never escape into the relay's listener loop. */
+   * `revoked` follow the remote-death rule (keep the shown state — the
+   * server persists its serverId, so a re-pair to the same server revives
+   * the group through the reconnect diff; the 已解除配对/已吊销 status
+   * annotation is T34's). Anything thrown here must never escape into the
+   * relay's listener loop. */
   const onState = (state: RelayState): void => {
     try {
       if (state === 'unpaired' || state === 'revoked') {
-        // Permanent remote end: the whole virtual group leaves (those
-        // prefixes never come back, so the UI's remove-blacklist cannot be
-        // hit by a revival under them). No reopen until a re-pair lands.
-        for (const frame of merger.onRemoteGone()) channel.push(frame)
+        // T23b2-fix3: NOT a permanent remote end any more. The serverId is
+        // persisted server-side, so a re-pair to the SAME server keeps the
+        // virtual prefix — and the UI's removedIds blacklist never clears
+        // during a page's life, so a remove here would make the group
+        // un-revivable. Handle it exactly like a remote death: emit nothing,
+        // keep the shown state, cut the in-flight leg; the re-pair lands as
+        // `online` and the pump's wait resumes under the SAME identity.
+        merger.onRemoteDown()
         currentController?.abort()
         return
       }
@@ -687,7 +696,12 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
         try {
           const stream = relay.openStream(namespace, method, {}, controller.signal)
           for await (const frame of stream) {
-            if (!alive) break
+            // `signal.aborted` too (T23b2-fix3): after an abort (server
+            // change, unpair/revocation, teardown) the transport may still
+            // hand over lines it had already decoded — they must not reach
+            // the merger, which the abort just declared dead for this
+            // generation.
+            if (!alive || controller.signal.aborted) break
             for (const out of merger.onRemote(frame)) channel.push(out)
           }
         } catch (error) {

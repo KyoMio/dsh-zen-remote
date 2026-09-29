@@ -61,7 +61,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -112,10 +112,11 @@ export interface FingerprintOptions {
   /**
    * Package-resolution anchors, HIGHEST priority first. Each anchor seeds a
    * `createRequire` that walks node_modules upward from it. The default puts
-   * the host process entry first (`process.argv[1]` — inside the running
-   * App's closure) and this plugin second: a link-installed plugin carries
-   * devDependency copies of the DSH packages, and reading those would
-   * fingerprint a version the host is not actually running.
+   * the host process entry first (`process.argv[1]`, realpath'd — under the
+   * npm CLI it is a symlink into the real install) and this plugin second:
+   * a link-installed plugin carries devDependency copies of the DSH
+   * packages, and reading those would fingerprint a version the host is not
+   * actually running.
    */
   anchors?: readonly string[]
 }
@@ -156,9 +157,13 @@ function isSchemaLike(value: unknown): value is { toJSONSchema: (params: { unrep
  * Recursive canonicalization of one projected JSON Schema document: object
  * keys are sorted at every depth, and `required` arrays — whose order zod
  * inherits from field declaration order and carries no meaning — are sorted
- * alphabetically. Every other array keeps its order (tuple/item order IS
- * meaning). This is what makes a fingerprint immune to field order, not just
- * to `sourceLocation` drift.
+ * alphabetically. EVERY array named `required` is sorted, wherever it
+ * appears — including one nested inside a `default` / `examples` value;
+ * deliberate, because no DSH interface definition carries a semantically
+ * ordered array under that name, and a hash that moves on declaration order
+ * would defeat the whole fingerprint. Every other array keeps its order
+ * (tuple/item order IS meaning). This is what makes a fingerprint immune to
+ * field order, not just to `sourceLocation` drift.
  */
 function canonicalizeJsonSchema(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalizeJsonSchema)
@@ -218,16 +223,22 @@ export function fingerprintDescriptors(descriptors: readonly unknown[]): string 
 
 /**
  * The package-resolution anchors, highest priority first: the HOST process
- * entry (`process.argv[1]` — the running App's closure) beats this plugin's
- * own location, whose node_modules may hold link-installed devDependency
- * copies of packages the host ships at different versions.
+ * entry (`process.argv[1]`) beats this plugin's own location, whose
+ * node_modules may hold link-installed devDependency copies of packages the
+ * host ships at different versions. The entry is realpath'd before it
+ * becomes an anchor (T23b2-fix3): under the npm CLI argv[1] is a SYMLINK
+ * (`…/bin/dsh` → the real install), and walking node_modules upward from
+ * the bin directory finds nothing — the host anchor would silently fail and
+ * the plugin's copies would answer instead. Resolved, the anchor sits next
+ * to the host's real node_modules. Under the desktop App argv[1] lives
+ * inside app.asar instead (not exercised in practice).
  */
 function defaultAnchors(): string[] {
   const anchors: string[] = []
   const entry = process.argv[1]
   if (typeof entry === 'string' && entry !== '') {
     try {
-      anchors.push(pathToFileURL(resolve(entry)).href)
+      anchors.push(pathToFileURL(realpathSync(resolve(entry))).href)
     } catch {
       // A strange argv[1] is not an anchor; the plugin anchor stands alone.
     }

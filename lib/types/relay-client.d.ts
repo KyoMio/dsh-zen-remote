@@ -128,7 +128,10 @@ export interface RelayClient {
     readonly lastError: string | undefined;
     /** The interface-compatibility verdict of the most recent handshake (T42):
      * group names that matched, differed, or could not be compared. Undefined
-     * until a first handshake ran WITH `computeOwnFingerprints` wired. */
+     * until a first handshake ran WITH `computeOwnFingerprints` wired, and
+     * cleared again whenever the link or the credentials move (unpaired,
+     * revoked, credentialsChanged) — it describes the credentials it was
+     * earned with, never the current ones. */
     readonly compat: RelayCompatVerdict | undefined;
     /** Observe state changes; a throwing listener never blocks the others. */
     subscribe(listener: (state: RelayState) => void): () => void;

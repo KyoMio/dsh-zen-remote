@@ -80,9 +80,14 @@ const require = createRequire(import.meta.url)
 //   exists on dev machines where the plugin is link-installed.
 // NOTE (T42-fix): src/fingerprint.ts resolves @deepseek-ai packages at
 // runtime — deliberately through the HOST process entry FIRST
-// (process.argv[1], the running App's closure), with the plugin location as
-// a fallback — so a link-installed plugin no longer fingerprints its own
-// devDependency copies. Those resolutions are createRequire(...).resolve()
+// (process.argv[1]), with the plugin location as a fallback — so a
+// link-installed plugin no longer fingerprints its own devDependency copies.
+// What argv[1] actually is, per launch shape (T23b2-fix3): under the npm
+// CLI it is a SYMLINK (…/bin/dsh into the real install), and fingerprint.ts
+// realpaths it before anchoring — walking node_modules upward from the bin
+// directory would find nothing and silently fall through to this plugin's
+// copies. Under the desktop App it lives inside app.asar (not exercised in
+// practice). Those resolutions are createRequire(...).resolve()
 // calls whose specifier this file's scan regex cannot see, and the runtime
 // priority makes a plugin-copy shadow the fallback, not the read — so no
 // SHADOW_ALLOWED entry is registered for them.
