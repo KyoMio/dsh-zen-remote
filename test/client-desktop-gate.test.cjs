@@ -476,6 +476,115 @@ test('T34: the parts render only for virtual-id sessions (textual pins — .tsx 
   assert.ok(!css.includes('width: 100%'), 'no width+margins overflow')
 })
 
+// --- T53: dsh-better-sidebar's file surfaces hidden in remote sessions --------
+
+// The T53 rules live in remote-session.css.ts (injected BEFORE the desktop
+// gate, together with the attribute effect), NOT in compat.css.ts: the compat
+// section rides MOBILE_CSS, which apply injects only after `isDesktopShell()`
+// returns, and a desktop app acting as a paired sub-client must hide the
+// plugin's file surfaces too. The ordering test below pins that; these tests
+// pin the rules' shape (the plugin's markup itself is not visible from here).
+const remoteSessionCss = readFileSync(
+  join(ROOT, 'src', 'client', 'styles', 'remote-session.css.ts'),
+  'utf8',
+)
+const t53Sliced = remoteSessionCss.slice(remoteSessionCss.indexOf('/* ---------- remote session: hide dsh-better-sidebar'))
+assert.ok(t53Sliced.length > 0, 'the T53 better-sidebar section must exist in remote-session.css.ts')
+
+test('T53: every rule is gated on the remote-session attribute — a local session matches nothing', () => {
+  // Strip block comments, then every remaining line must be a gated selector
+  // line (selector lists repeat the gate per line, so continuation lines
+  // ending in "," are checked too), a declaration, or a closing brace. An
+  // ungated selector would fire on local sessions, where these plugin
+  // surfaces are exactly right.
+  const stripped = t53Sliced.replace(/\/\*[\s\S]*?\*\//g, '')
+  const offenders = stripped
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('`'))
+    .filter((line) => !line.startsWith('html[data-zr-remote-session="1"]'))
+    .filter((line) => !/^[a-z-]+:/.test(line) && !line.startsWith('--') && !line.startsWith('}'))
+  assert.deepEqual(offenders, [], 'every selector line must sit under html[data-zr-remote-session="1"]')
+  // And the gate is really there, once per rule: 8 hide rules (the 3-kind
+  // guide rule repeats it per selector line) + 1 variable override.
+  const gatedLines = (stripped.match(/html\[data-zr-remote-session="1"\]/g) || []).length
+  assert.ok(gatedLines >= 10, `expected every rule gated, found ${gatedLines} gate occurrences`)
+})
+
+test('T53: every selector anchors on better-sidebar\'s own (or its host slot\'s) markers, never generated class names', () => {
+  const anchors = [
+    '[data-dsh-bottom-toggle]',
+    '[data-dsh-panel-host]',
+    '[data-dsh-native-tab-host]',
+    '[data-dockkit-tab]:has([class$="_chipIcon"])',
+    '[data-floating-window]:has([data-window-body])',
+    '[data-sidebar-right-guide-entry="git"]',
+    '[data-sidebar-right-guide-entry="subagent"]',
+    '[data-sidebar-right-guide-entry="sidechat"]',
+    '[data-sidebar-right-guide-entry="files"]',
+  ]
+  for (const anchor of anchors) {
+    assert.ok(t53Sliced.includes(anchor), `missing anchor ${anchor}`)
+  }
+  // nArs4W is the plugin's build-hashed CSS-module prefix (client.js ~3536):
+  // it changes per build and must never appear in a selector.
+  assert.ok(!t53Sliced.includes('nArs4W'), 'no hashed class names')
+  // The files-capsule rule is the one selector that needs a presence gate:
+  // the host's own files page registers the same kind and is remote-aware,
+  // so hiding it must require the plugin's takeover to be mounted.
+  assert.match(
+    t53Sliced,
+    /html\[data-zr-remote-session="1"\] body:has\(\[data-dsh-better-sidebar\]\) \[data-sidebar-right-guide-entry="files"\]/,
+    'the files guide capsule is gated on the plugin being mounted',
+  )
+})
+
+test('T53: the layout push is neutralized, not just the panel hidden', () => {
+  // better-sidebar reserves conversation height for the open workbench by
+  // writing --dsh-sidebar-height INLINE on <html> (client.js writeGeometry
+  // ~20482-20488); its layout.css spends it as the center column's
+  // margin-bottom. Hiding [data-dsh-panel-host] alone would leave that band
+  // as a blank strip, so the remote html must zero the variable with
+  // !important (stylesheet !important beats a non-important inline style)
+  // while never touching the plugin's own state.
+  assert.match(t53Sliced, /--dsh-sidebar-height: 0px !important;/)
+})
+
+test('T53: each hidden surface hides with display:none !important', () => {
+  // One assertion per surface so a later edit that drops one rule fails the
+  // exact line it broke. The variable override is covered by the test above.
+  const rules = {
+    'bottom workbench toggle': /html\[data-zr-remote-session="1"\] \[data-dsh-bottom-toggle\] \{\s*display: none !important;/,
+    'bottom workbench panel host': /html\[data-zr-remote-session="1"\] \[data-dsh-panel-host\] \{\s*display: none !important;/,
+    'native sidebar tab bodies': /html\[data-zr-remote-session="1"\] \[data-dsh-native-tab-host\] \{\s*display: none !important;/,
+    'native sidebar chips': /html\[data-zr-remote-session="1"\] \[data-dockkit-tab\]:has\(\[class\$="_chipIcon"\]\) \{\s*display: none !important;/,
+    'portaled floating windows': /html\[data-zr-remote-session="1"\] \[data-floating-window\]:has\(\[data-window-body\]\) \{\s*display: none !important;/,
+    'guide capsules (plugin-only kinds)': /html\[data-zr-remote-session="1"\] \[data-sidebar-right-guide-entry="git"\],\s*html\[data-zr-remote-session="1"\] \[data-sidebar-right-guide-entry="subagent"\],\s*html\[data-zr-remote-session="1"\] \[data-sidebar-right-guide-entry="sidechat"\] \{\s*display: none !important;/,
+  }
+  for (const [what, pattern] of Object.entries(rules)) {
+    assert.match(t53Sliced, pattern, `the ${what} rule is missing or changed shape`)
+  }
+})
+
+test('T53: the better-sidebar rules ride the PRE-gate stylesheet, not the compat section', () => {
+  // installRemoteSessionGuard injects REMOTE_SESSION_CSS and stamps the
+  // attribute; apply runs it before the desktop gate (the .tsx source order
+  // is pinned textually — Node cannot drive the real apply).
+  const source = readFileSync(join(ROOT, 'src', 'client', 'index.tsx'), 'utf8')
+  const guardAt = source.indexOf('installRemoteSessionGuard(ctx)')
+  const gateAt = source.indexOf('if (isDesktopShell()) return')
+  assert.ok(guardAt !== -1, 'apply installs the remote-session guard')
+  assert.ok(gateAt !== -1, 'the desktop gate is still present')
+  assert.ok(guardAt < gateAt, 'the remote-session stylesheet injects BEFORE the desktop gate')
+  // And the T53 markers must NOT appear in the compat section: that file is
+  // part of MOBILE_CSS, injected after the gate — rules there would never
+  // reach the desktop sub-client this task is about.
+  const compatCss = readFileSync(join(ROOT, 'src', 'client', 'styles', 'compat.css.ts'), 'utf8')
+  for (const marker of ['data-dsh-native-tab-host', 'data-dsh-bottom-toggle', 'data-dockkit-tab', 'data-floating-window']) {
+    assert.ok(!compatCss.includes(marker), `compat.css.ts must not carry ${marker} (it sits behind the desktop gate)`)
+  }
+})
+
 test('CP5: RemoteHeaderIcon subscribes through subscribeIfNotPhoneShell (textual pin — .tsx cannot load under Node)', () => {
   const source = readFileSync(join(ROOT, 'src', 'client', 'RemoteHeaderIcon.tsx'), 'utf8')
   assert.ok(
