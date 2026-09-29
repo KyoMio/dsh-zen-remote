@@ -25,6 +25,7 @@ const path = require('node:path')
 const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
 const { createRelayClient, RelayError } = require('../lib/relay-client.js')
+const { createClientHandler } = require('../lib/client-routes.js')
 const { installIntercept } = require('../lib/intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
@@ -191,7 +192,7 @@ const FOLLOW_ARGS = { request: { address: { kind: 'session', sessionId: 'session
  */
 let bootCounter = 0
 async function boot(opts = {}) {
-  const { shared = [], heartbeatMs, invoke, fingerprints } = opts
+  const { shared = [], heartbeatMs, invoke, fingerprints, apiFetch } = opts
   const home = path.join(ROOT, `run-${bootCounter++}`)
   fs.mkdirSync(home, { recursive: true })
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
@@ -228,10 +229,22 @@ async function boot(opts = {}) {
       return { ok: true, value: undefined }
     },
   }
+  const apiFetchCalls = []
   const handler = createRelayHandler({
     secret: SECRET,
     store,
     gateway,
+    // T41b: the host's shared `/api` dispatcher, faked with a recording
+    // double that answers a canned diff — the synthetic Request's URL is
+    // asserted to the byte in the http e2e test below.
+    ...(apiFetch !== undefined
+      ? {
+          getApiFetch: () => async (request) => {
+            apiFetchCalls.push(request)
+            return apiFetch(request)
+          },
+        }
+      : {}),
     serverInfo: {
       serverId: loadServerId(home),
       serverName: () => SERVER_NAME,
@@ -244,7 +257,7 @@ async function boot(opts = {}) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const targetPort = server.address().port
 
-  const env = { store, invokeCalls, streams, eventsGates, eventResults, handler }
+  const env = { store, invokeCalls, streams, eventsGates, eventResults, apiFetchCalls, handler }
   // T43: every client this boot created is remembered so the teardown can
   // stop its reconnect ladder — an offline zombie client from test N would
   // otherwise keep firing retries into test N+1's gateway.
@@ -1002,5 +1015,51 @@ test('e2e T41a: terminal/create + terminal/follow work through the sub-client, a
     assert.equal(thrown.isDSHRemoteError, true, 'the code survives the host wire because the error is marked')
     await waitFor(() => gate.aborted)
     handle.uninstall()
+  } finally { await env.stop() }
+})
+
+test('e2e T41b: the changes diff crosses the sub-client http route with the original id, and an unshare answers 403', async () => {
+  const DIFF = { kind: 'text', path: 'src/a.ts', display: 'a.ts', before: false, after: false, coarse: false, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['+hello'] }] }
+  const env = await boot({
+    shared: ['session-a'],
+    apiFetch: () => new Response(JSON.stringify(DIFF), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } }),
+  })
+  try {
+    const info = await env.client.connect()
+    // The sub-client backend route over the SAME relay client the browser
+    // half rides: the fetch wrapper's rewrite target, driven with a plain
+    // socket like the real webServer registration does.
+    const clientHandler = createClientHandler({
+      admit: () => ({ peer: {} }),
+      getRowConfig: () => ({ serverUrl: `http://127.0.0.1:${proxyPort}/`, deviceToken: 'e2e-token', role: 'client' }),
+      getRelayClient: () => env.client,
+    })
+    const clientServer = http.createServer((req, res) => { void clientHandler(req, res) })
+    await new Promise((resolve) => clientServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const virtual = toVirtual(info.serverId, 'session-a')
+      const url = `/_dsh/zen-remote/client/http/changes.diff?sessionId=${encodeURIComponent(virtual)}&seq=3&index=0`
+      const res = await fetch(`http://127.0.0.1:${clientServer.address().port}${url}`)
+      assert.equal(res.status, 200)
+      assert.deepEqual(await res.json(), DIFF)
+      await waitFor(() => env.apiFetchCalls.length === 1)
+      // The synthetic Request carries the ORIGINAL session id and the rest
+      // of the query verbatim — the whole point of the rewrite.
+      assert.equal(
+        env.apiFetchCalls[0].url,
+        'http://relay.local/api/changes.diff?sessionId=session-a&seq=3&index=0',
+      )
+      assert.equal(env.apiFetchCalls[0].method, 'GET')
+
+      // Closing the session's remote access closes its plain-HTTP reads too:
+      // the relay answers 403 not-shared and the sub-client route relays it.
+      env.store.unshare('session-a', 'manual')
+      const denied = await fetch(`http://127.0.0.1:${clientServer.address().port}${url}`)
+      assert.equal(denied.status, 403)
+      assert.deepEqual(await denied.json(), { ok: false, error: { code: 'not-shared' } })
+      assert.equal(env.apiFetchCalls.length, 1, 'the unshared read was never dispatched')
+    } finally {
+      await new Promise((resolve) => { clientServer.closeAllConnections(); clientServer.close(resolve) })
+    }
   } finally { await env.stop() }
 })

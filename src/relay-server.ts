@@ -1,8 +1,10 @@
 /**
  * Server-side relay routes for the desktop client (T22a routes, T22b
- * streaming, T32 event forwarding): authentication, ping, handshake, the
- * single invoke passthrough, the NDJSON stream subscription route with
- * share-change synchronization, and the forwarded-event half — the
+ * streaming, T32 event forwarding, T41b plain-HTTP passthrough):
+ * authentication, ping, handshake, the single invoke passthrough, the
+ * `relay/v1/http` GET dispatch through the host's shared `/api` fetch
+ * handler, the NDJSON stream subscription route with share-change
+ * synchronization, and the forwarded-event half — the
  * `$zr/events` subscription over the gateway's `$events` wire stream plus
  * the `relay/v1/event-result` answer route. Activity stats remain a later
  * task.
@@ -30,7 +32,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ShareStore } from './share-store.js'
-import { decideInvoke, decideStream, parseEventResultBody } from './relay-access.js'
+import { decideHttpRoute, decideInvoke, decideStream, parseEventResultBody } from './relay-access.js'
 import {
   createWorkspaceFollowState,
   filterControlFrame,
@@ -174,6 +176,14 @@ export interface RelayHandlerOptions {
   serverInfo: RelayServerInfo
   /** Ancestor lookup for subagent reachability; defaults to "no parent". */
   parentOf?: (id: string) => string | undefined
+  /** The host's `/api` shared-fetch dispatcher (T41b), probed lazily per
+   * request: `undefined` — no connection service, or no shared handler —
+   * answers 501 `unsupported` instead of touching the network. The wiring
+   * builds it from `connection.createSharedFetchHandler('/api').fetch`
+   * (dsh-client-connection), the in-process entry that dispatches a
+   * synthetic Request to the same exact-fetch route table the browser's
+   * `/api` transport uses — no loopback HTTP, no login state. */
+  getApiFetch?: () => ((request: Request) => Promise<Response>) | undefined
   /** Stream heartbeat interval in ms (a `{"type":"ping"}` line that keeps
    * reverse proxies from timing the idle stream away); defaults to 15000.
    * Tests inject a small value. */
@@ -979,6 +989,77 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         responseJson(res, 200, message === undefined ? { ok: false, error: { code } } : { ok: false, error: { code, message } })
       } finally {
         res.off('close', onClientGone)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/http`) {
+      // The plain-HTTP panel long tail (T41b): `{route, query}` names one
+      // GET the sub-client's `/api/...` fetch wrapper intercepted. GET
+      // semantics ONLY — the body carries the coordinates of the request to
+      // dispatch, never a request body to forward, so a `body` field is a
+      // protocol violation rather than data.
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      if (body.body !== undefined) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      const route = body.route
+      const query = body.query
+      if (typeof route !== 'string' || typeof query !== 'string') {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      const decision = decideHttpRoute(route, query, isAccessible)
+      if (!decision.allow) {
+        const status =
+          decision.reason === 'unknown-route'
+            ? 404
+            : decision.reason === 'not-shared'
+              ? 403
+              : 400 // no-session / bad-query — malformed coordinates
+        responseJson(res, status, { ok: false, error: { code: decision.reason } })
+        return
+      }
+      const dispatch = options.getApiFetch?.()
+      if (dispatch === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      let request: Request
+      try {
+        // The URL is composed from the DECISION's normalized query alone —
+        // never the raw wire string. The two parsers disagree about control
+        // characters (URLSearchParams keeps them in key names, the URL
+        // constructor strips them), and that differential was an
+        // authorization bypass (T41b-fix): decideHttpRoute now rebuilds the
+        // whitelisted parameters itself, so what was checked is exactly what
+        // is dispatched.
+        request = new Request(`http://relay.local/api/${route}?${decision.query}`, {
+          method: 'GET',
+          signal: hangUpOf(res),
+        })
+      } catch {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      try {
+        // In-process dispatch through the shared `/api` handler — the same
+        // exact-fetch route table the browser's transport uses, no loopback
+        // HTTP, no login state. Both registered routes answer buffered JSON,
+        // so the whole response is read and re-wrapped as the envelope value.
+        const upstream = await dispatch(request)
+        const bodyText = await upstream.text()
+        const contentType = upstream.headers.get('content-type') ?? undefined
+        responseJson(res, 200, {
+          ok: true,
+          value: { status: upstream.status, ...(contentType !== undefined ? { contentType } : {}), body: bodyText },
+        })
+      } catch {
+        // A dispatch failure is this server's fault, not a business answer —
+        // and errorOf keeps any message off the wire.
+        responseJson(res, 502, { ok: false, error: { code: 'internal' } })
       }
       return
     }

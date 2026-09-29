@@ -1,8 +1,10 @@
 /**
  * Server-side relay routes for the desktop client (T22a routes, T22b
- * streaming, T32 event forwarding): authentication, ping, handshake, the
- * single invoke passthrough, the NDJSON stream subscription route with
- * share-change synchronization, and the forwarded-event half — the
+ * streaming, T32 event forwarding, T41b plain-HTTP passthrough):
+ * authentication, ping, handshake, the single invoke passthrough, the
+ * `relay/v1/http` GET dispatch through the host's shared `/api` fetch
+ * handler, the NDJSON stream subscription route with share-change
+ * synchronization, and the forwarded-event half — the
  * `$zr/events` subscription over the gateway's `$events` wire stream plus
  * the `relay/v1/event-result` answer route. Activity stats remain a later
  * task.
@@ -99,6 +101,14 @@ export interface RelayHandlerOptions {
     serverInfo: RelayServerInfo;
     /** Ancestor lookup for subagent reachability; defaults to "no parent". */
     parentOf?: (id: string) => string | undefined;
+    /** The host's `/api` shared-fetch dispatcher (T41b), probed lazily per
+     * request: `undefined` — no connection service, or no shared handler —
+     * answers 501 `unsupported` instead of touching the network. The wiring
+     * builds it from `connection.createSharedFetchHandler('/api').fetch`
+     * (dsh-client-connection), the in-process entry that dispatches a
+     * synthetic Request to the same exact-fetch route table the browser's
+     * `/api` transport uses — no loopback HTTP, no login state. */
+    getApiFetch?: () => ((request: Request) => Promise<Response>) | undefined;
     /** Stream heartbeat interval in ms (a `{"type":"ping"}` line that keeps
      * reverse proxies from timing the idle stream away); defaults to 15000.
      * Tests inject a small value. */
