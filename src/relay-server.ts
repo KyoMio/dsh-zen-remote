@@ -250,6 +250,10 @@ export interface RelayHandlerOptions {
    * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
    * Content-Length and streaming-count refusals stay cheap to drive. */
   uploadCapBytes?: number
+  /** How long an upload refusal's tail drain may run before the socket is
+   * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
+   * Tests inject a small value so the deadline path stays cheap to drive. */
+  drainDeadlineMs?: number
 }
 
 /**
@@ -525,21 +529,21 @@ const DRAIN_DEADLINE_MS = 10_000
 
 /**
  * Consume and discard the tail of one upload request, bounded by
- * {@link DRAIN_SLACK_BYTES} past `fromBytes` and by {@link DRAIN_DEADLINE_MS}.
- * Resolves on end, error, close, or either bound (the socket is destroyed on
- * a bound — by then the caller's answer is already on the wire). Every
- * upload refusal path runs this; the ones whose answer is NOT yet written
- * (400/403/429/501) await it before answering, so a client still mid-send
- * reads the status code rather than a reset.
+ * {@link DRAIN_SLACK_BYTES} past `fromBytes` and by `deadlineMs`. Resolves on
+ * end, error, close, or either bound (the socket is destroyed on a bound — by
+ * then the caller's answer is already on the wire). Every upload refusal path
+ * runs this; the ones whose answer is NOT yet written (400/403/429/501) await
+ * it before answering, so a client still mid-send reads the status code
+ * rather than a reset.
  */
-function drainUpload(req: IncomingMessage, fromBytes: number): Promise<void> {
+function drainUpload(req: IncomingMessage, fromBytes: number, deadlineMs: number): Promise<void> {
   return new Promise((resolve) => {
     let size = fromBytes
     let settled = false
     const timer = setTimeout(() => {
       req.destroy()
       finish()
-    }, DRAIN_DEADLINE_MS)
+    }, deadlineMs)
     if (typeof timer.unref === 'function') timer.unref()
     const onData = (chunk: Buffer): void => {
       size += chunk.byteLength
@@ -640,6 +644,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
   const endDrainTimeoutMs = options.endDrainTimeoutMs ?? DEFAULT_END_DRAIN_TIMEOUT_MS
   const uploadCapBytes = options.uploadCapBytes ?? DEFAULT_UPLOAD_CAP_BYTES
+  const drainDeadlineMs = options.drainDeadlineMs ?? DRAIN_DEADLINE_MS
   const parentOf = options.parentOf ?? (() => undefined)
   const isAccessible = (sessionId: string): boolean => store.isAccessible(sessionId, parentOf)
 
@@ -1272,7 +1277,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       if (Number(req.headers['content-length']) > uploadCapBytes) {
         res.setHeader('Connection', 'close')
         responseJson(res, 413, PAYLOAD_TOO_LARGE)
-        await drainUpload(req, 0)
+        await drainUpload(req, 0, drainDeadlineMs)
         return
       }
       // The query is parsed ONCE (decideUploadQuery, the T41b-fix
@@ -1282,27 +1287,30 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       // re-enter between the check and the dispatch.
       const decision = decideUploadQuery(new URL(req.url ?? '/', 'http://dsh.internal').search, isAccessible)
       if (!decision.allow) {
-        await drainUpload(req, 0)
+        await drainUpload(req, 0, drainDeadlineMs)
         responseJson(res, decision.reason === 'not-shared' ? 403 : 400, { ok: false, error: { code: decision.reason } })
         return
       }
       const dispatch = options.getApiFetch?.()
       if (dispatch === undefined) {
-        await drainUpload(req, 0)
+        await drainUpload(req, 0, drainDeadlineMs)
         responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
         return
       }
-      // The per-device upload budget (T51-fix), counted after every wall
+      // The per-device upload budget (T51-fix), checked after every wall
       // above and released in the route's finally — one stalled client must
       // not pin unbounded host uploads behind this route. An over-budget
-      // request is drained and refused without touching the counter.
+      // request is drained and refused without touching the counter. The
+      // slot itself is TAKEN only after the synthetic request below built
+      // (T5x): that construction is the one step between the check and the
+      // dispatch that can fail and return outside the finally, and a taken-
+      // then-abandoned slot would quietly shrink this device's budget.
       const device = headerValue(req, 'x-zen-remote-device') ?? ''
       if ((uploadsByDevice.get(device) ?? 0) >= MAX_UPLOADS_PER_DEVICE) {
-        await drainUpload(req, 0)
+        await drainUpload(req, 0, drainDeadlineMs)
         responseJson(res, 429, { ok: false, error: { code: 'too-many-uploads' } })
         return
       }
-      uploadsByDevice.set(device, (uploadsByDevice.get(device) ?? 0) + 1)
       // A hang-up cancels the forward mid-stream, like invoke's — and the
       // cap pump below aborts the SAME controller when it trips, so an
       // oversized upload dies at the host side the moment it is judged.
@@ -1403,6 +1411,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         responseJson(res, 502, { ok: false, error: { code: 'internal' } })
         return
       }
+      // Construction succeeded — from here every exit runs the finally, so
+      // the slot is safe to take (T5x).
+      uploadsByDevice.set(device, (uploadsByDevice.get(device) ?? 0) + 1)
       try {
         const upstream = await dispatch(request)
         // The host's upload route answers buffered JSON in every branch (RT
@@ -1417,7 +1428,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         if (tooLarge) {
           res.setHeader('Connection', 'close')
           responseJson(res, 413, PAYLOAD_TOO_LARGE)
-          await drainUpload(req, received)
+          await drainUpload(req, received, drainDeadlineMs)
           return
         }
         const contentType = upstream.headers.get('content-type') ?? undefined
@@ -1434,7 +1445,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         if (tooLarge) {
           res.setHeader('Connection', 'close')
           responseJson(res, 413, PAYLOAD_TOO_LARGE)
-          await drainUpload(req, received)
+          await drainUpload(req, received, drainDeadlineMs)
           return
         }
         responseJson(res, 502, { ok: false, error: { code: 'internal' } })

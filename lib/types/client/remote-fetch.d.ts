@@ -15,12 +15,15 @@
  * fetch unchanged, so a host-role deployment (whose session ids are never
  * virtual) is bit-for-bit unintercepted.
  *
- * Deliberately NOT covered (the interception's known limitations, recorded
- * beside the server registry in src/relay-access.ts): the attachment
- * upload's HTTP branch runs inside a Web Worker over XHR / Worker-scoped
- * fetch, the session export is an anchor-click download, and
- * `present.host` / `changes.open` / `present.open` belong to entries hidden
- * on remote sessions rather than relayed.
+ * Not covered by THIS wrapper (each surface has its own channel since T51):
+ * the attachment upload's HTTP branch runs inside a Web Worker over XHR /
+ * Worker-scoped fetch — unreachable from `window.fetch`, so it is intercepted
+ * one layer down, at the host's exact-fetch-route table, by
+ * `src/fetch-route-intercept.ts` (which relays the bytes and likewise blocks
+ * the session export); `present.host` / `changes.open` / `present.open`
+ * belong to entries hidden on remote sessions rather than relayed. The
+ * complete not-relayed registry still lives beside the server's in
+ * src/relay-access.ts.
  */
 /** Prefix of the sub-client backend route the rewritten calls land on. */
 export declare const CLIENT_HTTP_ROUTE_PREFIX = "/_dsh/zen-remote/client/http/";

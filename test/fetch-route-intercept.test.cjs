@@ -262,12 +262,35 @@ test('wrap: a relay refusal keeps the host 200-envelope contract; a link death i
     body = await response.json()
     assert.equal(body.error.code, 'payload-too-large')
 
-    relay.setPlay(new RelayError('offline', 'the gateway is unreachable', 502))
+    relay.setPlay(new RelayError('offline', 'the relay chain answered 502 — the gateway is unreachable', 502))
     response = await connection.fetchRoutes.get(FILE_UPLOAD_PATH).fetch(uploadRequest(toVirtual(SERVER_ID, LOCAL_ID)))
     assert.equal(response.status, 200, 'a link death is ALSO the 200 envelope (T51-fix)')
     body = await response.json()
     assert.equal(body.error.code, 'remote-offline')
-    assert.equal(body.error.message, '服务端离线，远程会话暂时无法上传文件')
+    assert.equal(body.error.message, '服务端离线，远程会话暂时无法上传文件', 'a STATUS-carrying offline is the chain answering 5xx — the gateway really is down')
+  } finally { handle.uninstall() }
+})
+
+test('wrap (T5x): a MID-UPLOAD transport death answers the interrupted envelope, not 服务端离线', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay()
+  const handle = install(connection, relay)
+  try {
+    // The shape the real client throws when the socket dies UNDER the body
+    // (EPIPE / connection reset while an undeclared oversize upload is being
+    // cut, or a network fault): code offline, NO HTTP status — the upload
+    // route deliberately never judges the link (T51-fix), so this must not
+    // claim the server is down.
+    relay.setPlay(new RelayError('offline', 'socket hang up'))
+    const response = await connection.fetchRoutes.get(FILE_UPLOAD_PATH).fetch(uploadRequest(toVirtual(SERVER_ID, LOCAL_ID)))
+    assert.equal(response.status, 200, 'still the UI-parseable 200 envelope')
+    const body = await response.json()
+    assert.deepEqual(body, {
+      ok: false,
+      error: { code: 'upload-interrupted', message: '上传中断，文件可能超过远程上传上限（100 MiB）或网络不稳定', details: {} },
+    })
+    // The diagnostics ring keeps the relay's own code.
+    assert.deepEqual(handle.diagnostics().recentFailures.map((r) => r.code), ['offline'])
   } finally { handle.uninstall() }
 })
 
@@ -371,6 +394,44 @@ test('attach: a misshaped entry is refused for ITS route only; the other route s
     const virtual = await connection.fetchRoutes.get(FILE_UPLOAD_PATH).fetch(uploadRequest(toVirtual(SERVER_ID, LOCAL_ID)))
     assert.equal((JSON.parse(await virtual.text())).value.receiptId, 'local')
     assert.equal(relay.calls.length, 0)
+  } finally { handle.uninstall() }
+})
+
+test('attach (T5x): a refused route does not keep the retry spinning — the probe stops for good', async () => {
+  // The probe's only observable is the table read itself, so the fake's Map
+  // is a counting subclass: install probes each route once; a running retry
+  // would keep adding reads every tick. Upload is MISshaped (refused at
+  // first attach), export is healthy and wrapped — nothing is pending, so
+  // the interval must never start.
+  class CountingMap extends Map {
+    constructor() {
+      super()
+      this.gets = {}
+    }
+    get(key) {
+      this.gets[key] = (this.gets[key] ?? 0) + 1
+      return super.get(key)
+    }
+  }
+  const connection = fakeConnection({ upload: { requestBody: 'buffered' } })
+  const counting = new CountingMap()
+  for (const [key, value] of connection.fetchRoutes) counting.set(key, value)
+  connection.fetchRoutes = counting
+  const relay = fakeRelay()
+  const handle = install(connection, relay, { attachRetryMs: 10, attachAttempts: 10 })
+  try {
+    const diagnostics = handle.diagnostics()
+    assert.equal(diagnostics.uploadAttachRefused !== undefined, true, 'the refusal stands')
+    assert.equal(diagnostics.exportWrapped, true)
+    assert.equal(diagnostics.uploadPending, false)
+    assert.equal(diagnostics.exportPending, false)
+    // Far past the 10-tick budget (10 ms × 10): the counts must be frozen at
+    // the install-time reads — the shape check and the first attach probe
+    // each route once (2 per route); a still-running retry would keep adding
+    // reads every tick.
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(counting.gets[FILE_UPLOAD_PATH], 2, `the refused upload route was probed at install only, not retried (${counting.gets[FILE_UPLOAD_PATH]})`)
+    assert.equal(counting.gets[SESSION_EXPORT_PATH], 2, `the attached export route was probed at install only, not retried (${counting.gets[SESSION_EXPORT_PATH]})`)
   } finally { handle.uninstall() }
 })
 
