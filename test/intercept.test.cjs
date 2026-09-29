@@ -3008,3 +3008,203 @@ test('CP4-client-fix2: a session the server stopped serving keeps its group slot
   localGate.finish()
   handle.uninstall()
 })
+
+// -- CP5: the hold list, the pairing-wall verdict, the session-stream backoff ----
+
+/** Consume one session-level UI stream, classifying how it ended. */
+function consumeStream(gateway, endpoint, args) {
+  const seen = []
+  const outcome = (async () => {
+    try {
+      for await (const frame of await gateway.wireTap(endpoint, { args }, undefined, undefined, undefined, { signal: undefined })) {
+        seen.push(frame)
+      }
+      return 'ended-clean'
+    } catch (error) {
+      return `threw:${error.code}`
+    }
+  })()
+  return { seen, outcome }
+}
+
+test('CP5 hold list: job/follow (a carrier-retry endpoint) still holds through a link-down and ends cleanly on recovery', async () => {
+  const relay = createControllableRelay()
+  const gateway = new FakeTypertGateway()
+  const { handle } = install(gateway, relay)
+  const { seen, outcome } = consumeStream(gateway, 'job/follow', { request: { sessionId: VIRTUAL_ID } })
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push({ type: 'opened', job: { id: 'j-1', owner: LOCAL_ID } })
+  await waitUntil(() => seen.length === 1)
+  assert.equal(seen[0].job.owner, VIRTUAL_ID, 'sanity: the frame flowed and was rewritten')
+
+  // The link dies: NO terminal error reaches the UI stream — the RT
+  // job-controller (lib/client.js:269/303) turns an accepted clean end into
+  // the RemoteStreamCarrierError it retries, so the hold is what serves it.
+  relay.transition('offline')
+  relay.streams[0].gate.throwNow(new RelayError('offline', '链路断了'))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(seen.length, 1, 'nothing further arrived while offline')
+
+  relay.transition('online')
+  assert.equal(await outcome, 'ended-clean', 'the accepted generation ended cleanly — the carrier signal the job UI retries')
+  handle.uninstall()
+})
+
+test('CP5 hold list: workspaceFiles/changes (outside the list) ends with the ORIGINAL code the moment the link dies — no hold', async () => {
+  const relay = createControllableRelay()
+  const gateway = new FakeTypertGateway()
+  const { handle } = install(gateway, relay)
+  const { outcome } = consumeStream(gateway, 'workspaceFiles/changes', { workspaceFileScopeId: VIRTUAL_ID })
+  await waitForStream(relay, 1)
+
+  // The RT consumers of this stream (dsh-api-workspace-files lib/client.js:112,
+  // dsh-client-ui-sidebar-files lib/client.js:229) turn ANY clean end into a
+  // plain terminal Error with no retry — a hold would freeze the tree on
+  // recovery. The old behavior stands: the outage fails the stream at once,
+  // with the link error's own code.
+  relay.transition('offline')
+  relay.streams[0].gate.throwNow(new RelayError('offline', '链路断了'))
+  assert.equal(await outcome, 'threw:offline', 'the terminal error carries the original code')
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(relay.streams.length, 1, 'no reopen behind the terminal — the stream is over')
+  handle.uninstall()
+})
+
+test('CP5: the pairing wall ends a held session stream with a terminal error in the wall\'s own code — no silent park, the state listener released', async () => {
+  const relay = createControllableRelay()
+  // Count LIVE state listeners: the hold parks on one, and the verdict must
+  // release it (a leaked listener would tick forever behind a dead stream).
+  let liveListeners = 0
+  const baseSubscribe = relay.subscribe.bind(relay)
+  relay.subscribe = (listener) => {
+    liveListeners += 1
+    const off = baseSubscribe(listener)
+    return () => { liveListeners -= 1; off() }
+  }
+  const gateway = new FakeTypertGateway()
+  const { handle } = install(gateway, relay)
+
+  // revoked: the token died server-side. No ladder climbs back from the
+  // wall — the held stream must say so and stop.
+  const first = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } })
+  await waitForStream(relay, 1)
+  relay.transition('offline')
+  relay.streams[0].gate.throwNow(new RelayError('offline', '链路断了'))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const parked = liveListeners
+  assert.ok(parked >= 1, 'the hold is parked on a relay state listener')
+  relay.transition('revoked')
+  assert.equal(await first.outcome, 'threw:revoked', 'the wall ends the hold with its own code')
+  assert.equal(first.seen.length, 0, 'no frame ever reached the UI through the outage')
+  assert.equal(liveListeners, parked - 1, 'the serve-wait released its state listener')
+
+  // unpaired: the row lost its pairing — same verdict shape, own code.
+  const second = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } })
+  await waitForStream(relay, 2)
+  relay.transition('offline')
+  relay.streams[1].gate.throwNow(new RelayError('offline', '链路断了'))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  relay.transition('unpaired')
+  assert.equal(await second.outcome, 'threw:unpaired', 'unpaired ends the hold the same way')
+  handle.uninstall()
+})
+
+/** A manual clock for the session-stream backoff: `advance` moves time and
+ * fires due timers synchronously (same shape as the recovery file's). */
+function fakeClock() {
+  let now = 1_700_000_000_000
+  const timers = []
+  return {
+    now: () => now,
+    setTimeout(fn, ms) {
+      const timer = { fn, at: now + ms }
+      timers.push(timer)
+      return timer
+    },
+    clearTimeout(timer) {
+      const index = timers.indexOf(timer)
+      if (index >= 0) timers.splice(index, 1)
+    },
+    advance(ms) {
+      now += ms
+      const due = timers.filter((t) => t.at <= now).sort((a, b) => a.at - b.at)
+      for (const timer of due) {
+        const index = timers.indexOf(timer)
+        if (index >= 0) {
+          timers.splice(index, 1)
+          timer.fn()
+        }
+      }
+    },
+    get pending() { return timers.length },
+  }
+}
+
+test('CP5: waitServeAgain backs off the in-place reopen — state stays online, every retry costs the current step and the step doubles', async () => {
+  const relay = createControllableRelay()
+  const gateway = new FakeTypertGateway()
+  const clock = fakeClock()
+  const handle = installIntercept({ raw: gateway, relay, getServerId: () => SERVER_ID, clock })
+  const { seen, outcome } = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } })
+  await waitForStream(relay, 1)
+
+  // The leg dies with `offline` while the relay STILL reads online (an error
+  // line that never was a state fact — the exact contradiction that would
+  // spin a hot reopen loop without the delayWait). No frame was accepted, so
+  // every retry reopens IN PLACE: first after 1s, then 2s, then 4s.
+  let settled = false
+  outcome.then(() => { settled = true }, () => { settled = true })
+  const intervals = []
+  let lastOpenAt = null
+  for (const [delay, reopenStreams] of [[1_000, 2], [2_000, 3], [4_000, 4]]) {
+    relay.streams[reopenStreams - 2].gate.throwNow(new RelayError('offline', '链路断了'))
+    await waitUntil(() => clock.pending === 1, 2000)
+    if (lastOpenAt === null) lastOpenAt = clock.now()
+    clock.advance(delay - 100)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assert.equal(relay.streams.length, reopenStreams - 1, `no reopen inside the ${delay}ms step`)
+    clock.advance(100)
+    await waitForStream(relay, reopenStreams)
+    intervals.push(clock.now() - lastOpenAt)
+    lastOpenAt = clock.now()
+  }
+  assert.deepEqual(intervals, [1_000, 2_000, 4_000], 'each reopen waited the current step, and the step doubled')
+  assert.equal(relay.state, 'online', 'the state never moved through any of it')
+  assert.equal(settled, false, 'the UI stream stayed open and silent the whole time')
+  assert.equal(seen.length, 0)
+  handle.uninstall()
+})
+
+test('CP5: a waterfall the aborted $events generation already decoded never reaches the UI (the guard, symmetric with the merged global streams)', async () => {
+  const relay = createControllableRelay()
+  const { localGate, iterator } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push(SERVER_WATERFALL)
+  await readSome(iterator, 1)
+
+  // Park the pump inside the remote leg, then queue one waterfall that the
+  // abort below must drop: the transport may hand over lines it had already
+  // decoded, and they belong to a generation the server switch just killed.
+  const leaked = { ...SERVER_WATERFALL, eventId: 'a1b2c3d4e5f60718.evt-remote-2' }
+  relay.streams[0].gate.push(leaked)
+  // Switch servers — no await in between, so the pump is still parked when
+  // the onState handler aborts the in-flight controller.
+  relay.handshakeInfo = { ...relay.handshakeInfo, serverId: 'ffffffff', serverName: '别服' }
+  relay.transition('online')
+  await waitForStream(relay, 2)
+  // The ONLY outputs are the orphan cancel for the SHOWN event and the new
+  // leg's waterfall — a leaked frame would surface ahead of them.
+  relay.streams[1].gate.push(SERVER_WATERFALL)
+  const frames = await readSome(iterator, 2)
+  assert.deepEqual(frames[0], { type: 'cancel', eventId: V_REMOTE_EVENT }, 'the shown prompt was closed by the leg death')
+  assert.equal(frames[1].eventId, toVirtual('ffffffff', 'a1b2c3d4e5f60718.evt-remote-1'), 'the reopened leg delivers under the new ids')
+  const leakedOld = toVirtual(SERVER_ID, 'a1b2c3d4e5f60718.evt-remote-2')
+  const leakedNew = toVirtual('ffffffff', 'a1b2c3d4e5f60718.evt-remote-2')
+  assert.ok(
+    frames.every((frame) => frame.eventId !== leakedOld && frame.eventId !== leakedNew),
+    'the decoded-but-dead waterfall never reached the UI — under either server id',
+  )
+  await iterator.return?.(undefined)
+})
