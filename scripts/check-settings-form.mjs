@@ -455,10 +455,10 @@ test('the latest-wins gate drops tickets that are no longer newest (T15-fix 4)',
 test('deriveClientStatusView maps every probe state and tolerates garbage', () => {
   const bare = { state: 'unpaired', serverUrl: '', serverName: '', nextRetryAt: undefined, lastError: '', intercept: undefined, compat: undefined }
   assert.deepEqual(deriveClientStatusView({ state: 'unpaired' }), bare)
-  assert.deepEqual(deriveClientStatusView({ state: 'connected', serverUrl: 'http://192.168.3.129:3088' }), {
+  assert.deepEqual(deriveClientStatusView({ state: 'connected', serverUrl: 'http://192.168.1.10:3088' }), {
     ...bare,
     state: 'connected',
-    serverUrl: 'http://192.168.3.129:3088',
+    serverUrl: 'http://192.168.1.10:3088',
   })
   assert.deepEqual(deriveClientStatusView({ state: 'revoked', serverUrl: 'https://dsh.example.com' }), {
     ...bare,
@@ -623,10 +623,10 @@ test('normalizePairingCode uppercases and strips spaces and hyphens', () => {
 test('writeClientPairing lands one mutate with both ops and clears the draft fence', async () => {
   const { scope, state } = fakeScope()
   const form = new ZenRemoteSettingsForm(scope)
-  assert.equal(await form.writeClientPairing('http://192.168.3.129:3088', 'tok-xyz'), true)
+  assert.equal(await form.writeClientPairing('http://192.168.1.10:3088', 'tok-xyz'), true)
   assert.equal(state.mutateCalls.length, 1)
   assert.deepEqual(state.mutateCalls[0].ops, [
-    { op: 'set', path: ['serverUrl'], value: 'http://192.168.3.129:3088' },
+    { op: 'set', path: ['serverUrl'], value: 'http://192.168.1.10:3088' },
     { op: 'set', path: ['deviceToken'], value: 'tok-xyz' },
   ])
   assert.equal(state.mutateCalls[0].expectedRevision, 7, 'fenced with the current revision')
@@ -668,11 +668,11 @@ test('the direct writes refuse when the form is unavailable, read-only or alread
 
 test('the device token rides the snapshot as presence only, and rowValue reads the saved document', () => {
   let configured = false
-  const { scope } = fakeScope({ value: { role: 'client', serverUrl: 'http://192.168.3.129:3088' } })
+  const { scope } = fakeScope({ value: { role: 'client', serverUrl: 'http://192.168.1.10:3088' } })
   const form = new ZenRemoteSettingsForm(scope, () => configured)
   assert.equal(form.getSnapshot().deviceToken.configured, false)
   assert.equal(form.rowValue('role'), 'client')
-  assert.equal(form.rowValue('serverUrl'), 'http://192.168.3.129:3088')
+  assert.equal(form.rowValue('serverUrl'), 'http://192.168.1.10:3088')
   assert.equal(form.rowValue('deviceToken'), undefined, 'secrets never ride the form document')
 
   configured = true
