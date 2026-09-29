@@ -127,7 +127,7 @@ Remote access is per session, with three toggle entries on the host:
 
 **New sessions**: with `autoShareNewSessions` on, every session the host creates is shared automatically; sessions created **through** the relay (from a client's remote group) are always auto-shared, which is what makes the entry safe. Subagent and fork sessions follow their parent — no per-session toggling.
 
-**What "remote off" means**: an unshared session's list row, history, live progress, approval/question events, @-mention candidates and prompt-embedded session references are all refused or filtered at the relay — not merely hidden in the UI.
+**What "remote off" means**: an unshared session's list row, history, live progress and approval/question events are all refused or filtered at the relay — not merely hidden in the UI. @-mention candidates list **only shared sessions**, and a `dsh-session:` reference embedded in a message, a queue edit or a slash command is refused for the whole call when it names an unshared session.
 
 ---
 
@@ -211,7 +211,7 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 
 **Desktop client (2.0 additions)**
 
-- Remote groups in the sidebar ("server name · workspace name"), remote sessions open like local ones: full history, live progress, messages, cancels, queue edits, approvals and question answers, model selection, file tree, changes, goals, slash commands, agent presets, subagent prompts/interrupts, attachments and @ references, terminals running server-side
+- Remote groups in the sidebar ("server name · workspace name"), remote sessions open like local ones: full history, live progress, messages, cancels, queue edits, approvals and question answers, model selection, file tree, changes list plus changes summary/diff, goals, slash commands, agent presets, subagent prompts/interrupts, attachments and @ references, terminals running server-side
 - New sessions created inside a remote group run on the server's workspace and are shared automatically; remote sessions can be renamed, archived, pinned, forked, and their remote access closed (with confirmation) from the client
 - Title-row connection icon per remote session (online / offline / version differs); a "remote closed" banner with the reason when a session is slept or closed server-side; offline groups go grey with input disabled and reconnect automatically with backoff
 - First-come-first-served approvals/questions: if the server's own UI answers first, the client syncs to "already handled"
@@ -235,7 +235,7 @@ Three layers, strictest first:
 What a paired device is trusted with, stated plainly:
 
 - **A paired desktop client is a trusted device.** The remote session's terminal is a shell running as the **server's user**, without the agent sandbox or approval restrictions. The file-preview interfaces (`workspaceFiles/read` and friends) are **not** contained to the session directory — anything the server process can read is readable. A paired client can create sessions in **any** of the server's workspaces (not limited to remote-enabled ones; the created session is auto-shared).
-- **"Only remote-enabled sessions are visible" constrains session data**: list, history, live progress, approval/question events, @-mention candidates and prompt-embedded references of an unshared session are refused or filtered by the relay. It is not a sandbox around the machine.
+- **"Only remote-enabled sessions are visible" constrains session data**: an unshared session's list, history, live progress and approval/question events are refused or filtered by the relay; @-mention candidates list **only shared sessions**; and a `dsh-session:` reference embedded in a message, a queue edit or a slash command refuses the whole call when it names a session without remote access. It is not a sandbox around the machine.
 - **Admin actions stay local**: generating pairing codes, changing roles and revoking devices only work from the settings page on the server machine itself — requests that arrived through the gateway can view status but are refused for every mutation, and desktop clients cannot reach the admin routes at all.
 
 ---
@@ -244,7 +244,8 @@ What a paired device is trusted with, stated plainly:
 
 - Switching to a different server and back to the original one — or a server deleting a workspace and recreating one under the same id — leaves the affected remote groups invisible until the client page is **reloaded** (DSH's sidebar never re-accepts a removed workspace id within one page lifetime).
 - Attaching a **non-image file** in a remote session fails (DSH's file upload rides a request from inside a Web Worker, which the plugin cannot intercept). **Image** attachments work.
-- "Export session" errors in a remote session; "open in app", and the changes/deliverables "open / reveal in Finder" actions are hidden there (they would pop a dialog on the server machine).
+- "Export session" errors in a remote session; the changes panel's **summary and diff do work** (relayed), while the entries that would pop a dialog on the server machine — "open", "reveal in Finder", "open in app", on the changes panel and deliverable cards alike — are hidden there.
+- The host truncates @-mention candidates to the **first 50 rows before** share-filtering: on a server with many sessions, a shared one may be missing from the candidate list (the reference check itself is unaffected — references you type out are still verified one by one).
 - After the server restarts, a remote session's title / running state can lag behind until the next event or a page refresh.
 - The model picker lists the **client's own** local model catalog.
 - Third-party plugins' own non-standard endpoints are not forwarded — their panels degrade or hide in remote sessions.
