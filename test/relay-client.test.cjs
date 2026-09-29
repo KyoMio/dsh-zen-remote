@@ -328,7 +328,7 @@ test('invoke: the value rides out, the request carries bearer + json + the verba
   } finally { await relay.stop() }
 })
 
-test('invoke: transport failure and timeout both land offline', async () => {
+test('invoke: a transport failure lands offline and the next success lifts it back', async () => {
   const relay = await startFakeRelay()
   try {
     const { client, setUrl } = makeClient(relay.port)
@@ -344,15 +344,54 @@ test('invoke: transport failure and timeout both land offline', async () => {
   } finally { await relay.stop() }
 })
 
-test('invoke: a silent server trips the request timeout into offline', async () => {
+test('invoke: a timeout fails the CALL but leaves the connection state alone (T31-fix)', async () => {
+  // A slow call is not a dead link: a big inline-image prompt may need
+  // minutes on the wire. The timeout error says so, the state stays online,
+  // and the reconnect ladder stays disarmed (no retry was scheduled).
   const relay = await startFakeRelay()
   relay.scenario.invoke = (req, res) => {
     setTimeout(() => { if (!res.destroyed) sendJson(res, 200, { ok: true, value: 'late' }) }, 500)
   }
   try {
     const { client } = makeClient(relay.port, { requestTimeoutMs: 80 })
-    await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
-    assert.equal(client.state, 'offline')
+    await client.connect()
+    assert.equal(client.state, 'online')
+    await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'request-timeout')
+    assert.equal(client.state, 'online', 'an invoke timeout never judges the link')
+    assert.equal(client.nextRetryAt, null, 'no reconnect was armed for a slow call')
+    assert.equal(client.lastError, 'request-timeout')
+  } finally { await relay.stop() }
+})
+
+test('invoke: the round-trip budget scales with the body size (T31-fix)', async () => {
+  // Base budget 30 ms; the body carries 2 MiB, buying +4 s. A server that
+  // answers in 120 ms — four times the base budget, far inside the scaled
+  // one — must succeed. It would have timed out under a flat budget.
+  const relay = await startFakeRelay()
+  relay.scenario.invoke = (req, res) => {
+    setTimeout(() => { if (!res.destroyed) sendJson(res, 200, { ok: true, value: 'slow but in budget' }) }, 120)
+  }
+  try {
+    const { client } = makeClient(relay.port, { requestTimeoutMs: 30 })
+    await client.connect()
+    const bigArgs = { request: { sessionId: 'session-a', content: [{ type: 'image', mediaType: 'image/png', data: 'A'.repeat(2 * 1024 * 1024) }] } }
+    const value = await client.invoke('session', 'prompt', bigArgs)
+    assert.equal(value, 'slow but in budget')
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('invoke: a 413 payload-too-large answers its body code without a state change', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.invoke = () => [413, { ok: false, error: { code: 'payload-too-large', details: {} } }]
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    await assert.rejects(
+      () => client.invoke('session', 'prompt', { request: { sessionId: 's', content: [] } }),
+      (error) => error instanceof RelayError && error.code === 'payload-too-large' && error.status === 413,
+    )
+    assert.equal(client.state, 'online', 'an oversize refusal is an answer about the call, not the link')
   } finally { await relay.stop() }
 })
 
