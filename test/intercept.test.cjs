@@ -2837,7 +2837,7 @@ test('T34-fix: a session-scoped stream refused not-shared registers the closure 
 })
 
 // -- CP4: stream-route offline writes, carrier-style recovery, switch guards,
-//    orphan hiding -----------------------------------------------------------------
+//    closed-session tombstones -----------------------------------------------------
 
 test('CP4: a WRITE stream opened while the relay is offline refuses remote-offline like the invoke route', async () => {
   const gateway = new FakeTypertGateway()
@@ -2938,11 +2938,12 @@ test('CP4: a frame the aborted generation already decoded never reaches the merg
   // Park the pump inside the remote leg, then queue one frame that the abort
   // below must drop: the transport may hand over lines it already decoded,
   // and they belong to a generation the serverId switch just killed. The
-  // shrunken sessionIds legitimately orphan session-b first — an archived
-  // frame rides the upsert and is read off here.
+  // shrunken sessionIds tombstones session-b into the group — the padded
+  // upsert is read off here, alone (no archived frame rides along since
+  // CP4-client-fix2).
   relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '更新', ['session-a']) })
-  const orphaned = await readSome(iterator, 2)
-  assert.deepEqual(orphaned.map((frame) => frame.type), ['upsert', 'archived'])
+  const parked = await readSome(iterator, 1)
+  assert.deepEqual(parked.map((frame) => frame.type), ['upsert'])
   relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '泄漏', ['session-a']) })
   // Switch servers — no await in between, so the pump is still parked when
   // the onState handler aborts the in-flight controller (reopenNow).
@@ -2964,7 +2965,7 @@ test('CP4: a frame the aborted generation already decoded never reaches the merg
   handle.uninstall()
 })
 
-test('CP4: a session the server stopped serving is archived-hidden in the REAL UI model and returns on re-share', async () => {
+test('CP4-client-fix2: a session the server stopped serving keeps its group slot in the REAL UI model — no archive kick, no strays, re-share restores it', async () => {
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
   const relay = createControllableRelay()
@@ -2977,27 +2978,31 @@ test('CP4: a session the server stopped serving is archived-hidden in the REAL U
   ;(await readSome(iterator, 5)).forEach(ui.apply)
   const vA = toVirtual(SERVER_ID, 'session-a')
   const vB = toVirtual(SERVER_ID, 'session-b')
-  assert.equal(ui.model.archivedSessionIds.includes(vA), false, 'sanity: shared and unarchived before the close')
+  const w1 = () => ui.model.items.find((item) => item.workspaceId === toVirtual(SERVER_ID, 'w-1'))
+  assert.equal(w1().sessionIds.includes(vA), true, 'sanity: session-a is in w-1 before the close')
 
   // The server closes the remote: the filtered upsert drops the session from
-  // the group's sessionIds. The UI keeps the merged session entry, so
-  // without help it would hang around in 「未分组」 — the merged archived
-  // frame picks it up (RT dsh-client-ui-workspace sessionVisible: archived
-  // ids are invisible under the default filter, strays included).
+  // the group's sessionIds. The merger tombstones it into w-1 instead of
+  // archiving it — the RT navigation guard (dsh-client-ui-workspace
+  // watchNavigation → clearArchivedCurrent, lib/client.js:897/957-962: an
+  // archived CURRENT session is cleared to the home page) never fires, so
+  // the open page stays put for its 「远程已关闭」 banner, and the row can
+  // never stray into 「未分组」 (the UI's session store keeps the entry).
   relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-b']) })
-  const closed = await readSome(iterator, 2)
-  assert.deepEqual(closed.map((frame) => frame.type), ['upsert', 'archived'])
+  const closed = await readSome(iterator, 1)
+  assert.deepEqual(closed.map((frame) => frame.type), ['upsert'])
   closed.forEach(ui.apply)
-  assert.equal(ui.model.archivedSessionIds.includes(vA), true, 'the closed session is archived-hidden instead of straying into 未分组')
-  assert.equal(ui.model.archivedSessionIds.includes(vB), true, 'session-b is both server-archived and orphaned — deduped to one entry')
+  assert.equal(w1().sessionIds.includes(vA), true, 'the closed session keeps its group slot')
+  assert.equal(ui.model.archivedSessionIds.includes(vA), false, 'and is NOT archived-hidden — the open page is not navigated away')
 
-  // Re-sharing returns the session to a group's sessionIds: the orphan
-  // leaves the set, the archived frame drops it, the row is visible again.
+  // Re-sharing returns the session to the live list: exactly once, no
+  // tombstone duplicate.
   relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-a', 'session-b']) })
-  const reshow = await readSome(iterator, 2)
-  assert.deepEqual(reshow.map((frame) => frame.type), ['upsert', 'archived'])
+  const reshow = await readSome(iterator, 1)
+  assert.deepEqual(reshow.map((frame) => frame.type), ['upsert'])
   reshow.forEach(ui.apply)
-  assert.equal(ui.model.archivedSessionIds.includes(vA), false, 'the re-shared session left the archive set')
+  assert.equal(w1().sessionIds.filter((id) => id === vA).length, 1, 'restored exactly once — no tombstone duplicate')
+  assert.equal(ui.model.archivedSessionIds.includes(vA), false)
   assert.equal(ui.model.archivedSessionIds.includes(vB), true, 'the server-archived session stays archived')
   controller.abort()
   localGate.finish()
