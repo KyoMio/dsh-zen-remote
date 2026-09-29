@@ -43,6 +43,20 @@ function fakeCtx() {
         return () => {}
       },
     },
+    // The T33b remote-share registration records through the same calls
+    // object; register-settings never touches slots at the top level, so
+    // the existing deepEqual([]) assertions below stay valid.
+    slots: {
+      inject(name, factory) {
+        calls.slotsInjected.push({ name })
+        factory()
+        return () => {}
+      },
+      register(options, component) {
+        calls.slotsRegistered.push({ options, component })
+        return () => {}
+      },
+    },
   }
   return { ctx, calls }
 }
@@ -192,4 +206,198 @@ test('T16-fix2: an admin/status 200 whose body is not ok:true is a failed load',
   assert.notEqual(thenAt, -1, 'loadStatus has a body handler')
   const handler = source.slice(thenAt, source.indexOf('.catch', thenAt))
   assert.ok(handler.includes('body?.ok !== true'), 'a 200 body without ok:true must throw into the catch (stale data kept)')
+})
+
+// --- T33b: session-sharing parts on the desktop shell -------------------------
+
+test('T33b: desktop shell — the remote icon and menu item still register (both slots + styles)', async () => {
+  globalThis.dshDesktop = {}
+  try {
+    const { registerRemoteShareUi } = await import('../src/client/remote-share-register.ts')
+    const { ctx, calls } = fakeCtx()
+    registerRemoteShareUi(ctx, () => null, () => null)
+    // The styles effect touches `document`, so like every effect here it is
+    // asserted present, not invoked.
+    assert.notEqual(
+      calls.effects.find((candidate) => candidate.label === 'dsh-zen-remote: remote-share styles'),
+      undefined,
+      'the remote-share stylesheet effect is registered',
+    )
+    const names = calls.slotsInjected.map((call) => call.name)
+    assert.ok(names.includes('conversation.session.header.actions'), 'the title-row icon slot is injected')
+    assert.ok(names.includes('sidebar.workspaces.session.menu.item'), 'the session-menu slot is injected')
+    const byName = new Map(calls.slotsRegistered.map((entry) => [entry.options.name, entry]))
+    const header = byName.get('conversation.session.header.actions')
+    const menu = byName.get('sidebar.workspaces.session.menu.item')
+    assert.notEqual(header, undefined, 'the title-row icon registers on the desktop shell')
+    assert.equal(header.options.id, 'remote-share-icon')
+    // Order 25: past the official jobs entry (20), so the two never tie.
+    assert.equal(header.options.order, 25)
+    assert.equal(header.options.locale, 'mobileNav')
+    assert.notEqual(menu, undefined, 'the menu item registers on the desktop shell')
+    assert.equal(menu.options.id, 'remote-share')
+    assert.equal(menu.options.order, 500)
+    assert.equal(menu.options.locale, 'mobileNav')
+    assert.equal(typeof menu.component, 'function')
+    // The role wiring rides a lazy configForms inject (T33b-fix), and the
+    // no-configForms fallback probe runs on its own. Under Node the probe's
+    // relative fetch fails fast, and T33b-fix2 semantics apply: a FAILED
+    // probe wires NOTHING — the role stays unknown (the parts stay dark)
+    // instead of guessing host.
+    const injects = calls.injects.map((call) => call.services)
+    assert.ok(injects.some((services) => services.includes('configForms')), 'the role wiring waits for configForms')
+    const { getSharesStore } = await import('../src/client-data/shares.ts')
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(getSharesStore().getSnapshot().role, 'unknown', 'a failed fallback probe wires nothing, never a guessed host')
+  } finally {
+    delete globalThis.dshDesktop
+  }
+})
+
+test('T33b: apply order guard — the remote-share registration runs before the desktop gate', () => {
+  // Same textual pin as the settings-page guard above: registerRemoteShareUi
+  // is gate-independent by design, so desktop coverage rests on the call
+  // sitting before `if (isDesktopShell()) return` in apply.
+  const source = readFileSync(join(ROOT, 'src', 'client', 'index.tsx'), 'utf8')
+  const registerAt = source.indexOf('registerRemoteShareUi(ctx, RemoteHeaderIcon, RemoteShareMenuItem)')
+  const gateAt = source.indexOf('if (isDesktopShell()) return')
+  assert.ok(registerAt !== -1, 'apply registers the remote-share parts')
+  assert.ok(registerAt < gateAt, 'the remote-share parts register BEFORE the desktop gate')
+})
+
+test('T33b-fix2: role wiring — the row role wins, the probe fills the gap, updates re-decide', async () => {
+  // wireSharesRole is Node-drivable by design: a fresh store, a fake scope
+  // with a mutable snapshot, and an INJECTED probe double — no dependence
+  // on the module-level client-config cache any earlier test might have
+  // filled (T33b-fix2).
+  const { wireSharesRole } = await import('../src/client/remote-share-register.ts')
+  const { createSharesStore } = await import('../src/client-data/shares.ts')
+  const store = createSharesStore(async () => { throw new Error('the wiring test never polls') })
+
+  // The probe double: records every call's refetch flag. A queued answer
+  // resolves immediately; without one the probe stays PENDING until
+  // answerProbe() feeds it — 'host' / 'client' are definite, undefined is
+  // a FAILED probe.
+  const probeCalls = []
+  const probeWaiters = []
+  const probeReplies = []
+  const probe = (refetch = false) => {
+    probeCalls.push(refetch)
+    if (probeReplies.length > 0) return Promise.resolve(probeReplies.shift())
+    return new Promise((resolve) => { probeWaiters.push(resolve) })
+  }
+  const answerProbe = (value) => {
+    const waiter = probeWaiters.shift()
+    if (waiter !== undefined) waiter(value)
+    else probeReplies.push(value)
+  }
+
+  const snap = { status: 'loading', value: {}, user: {} }
+  const listeners = new Set()
+  const scope = {
+    getSnapshot: () => snap,
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+  }
+  const notify = () => { for (const listener of [...listeners]) listener() }
+  const settle = async () => { await new Promise((resolve) => setImmediate(resolve)); await new Promise((resolve) => setImmediate(resolve)) }
+  const off = wireSharesRole(scope, store, { probe })
+
+  // Loading: nothing is knowable — the store stays untouched (nothing
+  // polls, the parts render nothing), the settings page's wait-out rule.
+  assert.equal(store.getSnapshot().role, 'unknown')
+  assert.deepEqual(probeCalls, [], 'loading never probes')
+
+  // A row-carried role decides the moment the mirror settles — and beats
+  // any probe (none even runs while the row answers).
+  snap.status = 'ready'
+  snap.value = { role: 'client' }
+  notify()
+  assert.equal(store.getSnapshot().role, 'client')
+  assert.deepEqual(probeCalls, [])
+
+  // The row going silent hands the decision to the probe: one call, and
+  // while it is PENDING the last definite verdict stands (still client —
+  // the parts keep rendering, no flicker to unknown).
+  snap.value = {}
+  notify()
+  assert.deepEqual(probeCalls, [false], 'the row-silent snapshot probes once, unforced')
+  assert.equal(store.getSnapshot().role, 'client', 'still client while the probe is pending')
+
+  // The probe answers host: the role recovers — and the completion path
+  // must NOT have probed again (no re-entry loop).
+  answerProbe('host')
+  await settle()
+  assert.equal(store.getSnapshot().role, 'host', 'the probe answer recovered the role')
+  assert.deepEqual(probeCalls, [false], 'the probe completion re-evaluated without probing again')
+
+  // A row role arriving later still wins over the cached probe answer.
+  snap.value = { role: 'client' }
+  notify()
+  assert.equal(store.getSnapshot().role, 'client')
+  assert.deepEqual(probeCalls, [false], 'a row-silent -> row-carried flip needs no probe')
+
+  // Scope STATUS changed (mirror resync): the old probe answer is dropped
+  // and the probe runs FORCED. It answers client this time.
+  snap.status = 'unavailable'
+  snap.value = {}
+  notify()
+  assert.deepEqual(probeCalls, [false, true], 'the status change re-probes, forced')
+  answerProbe('client')
+  await settle()
+  assert.equal(store.getSnapshot().role, 'client', 'the forced re-probe re-decided')
+
+  // A FAILED probe (undefined) is not remembered: the verdict stays put —
+  // the role keeps its last definite value, never a guessed host — and the
+  // NEXT snapshot update probes again.
+  notify()
+  assert.deepEqual(probeCalls, [false, true, false], 'the next update probes again')
+  answerProbe(undefined)
+  await settle()
+  assert.equal(store.getSnapshot().role, 'client', 'a failed probe left the role alone')
+  notify()
+  assert.deepEqual(probeCalls, [false, true, false, false], 'failures are not cached — every update re-probes')
+  answerProbe(undefined)
+  off()
+})
+
+test('T33b-fix: client role hides, host role shows, a 404 round fails alone', async () => {
+  const { createSharesStore, describeShare } = await import('../src/client-data/shares.ts')
+  const replies = [
+    { ok: true, status: 404, json: async () => ({ ok: false }) },
+    { ok: true, status: 200, json: async () => ({ ok: true, shares: [{ sessionId: 's1', busy: false, remainingMs: null, viewers: 0, title: 'One' }] }) },
+  ]
+  let calls = 0
+  const store = createSharesStore(async () => { calls += 1; return replies[Math.min(calls - 1, replies.length - 1)] })
+
+  // Client role: hidden, and NOTHING polls — a client deployment must never
+  // see a wasted admin/* request.
+  store.setRole('client')
+  const seen = []
+  const off = store.subscribe(() => { seen.push('x') })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(store.getSnapshot().role, 'client')
+  assert.equal(calls, 0, 'a client deployment never asks for admin/shares')
+  assert.equal(describeShare(undefined, Date.now()).state, 'off', 'no entry reads off')
+
+  // Host role: the poll starts with an immediate pull — but the reload
+  // window answers 404, which fails exactly that one round.
+  store.setRole('host')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(calls, 1)
+  assert.equal(store.getSnapshot().ready, false, 'the 404 round cached nothing')
+
+  // The next round lands: the parts show. Nothing stayed latched anywhere.
+  await store.refresh()
+  assert.equal(store.getSnapshot().ready, true)
+  assert.deepEqual(store.getSnapshot().entries.map((entry) => entry.sessionId), ['s1'])
+
+  // Render-level: the .tsx parts cannot load under Node, so their
+  // render-empty rule is pinned textually — each gates its JSX behind the
+  // wired role (and the menu item additionally behind the first unanswered
+  // GET and subagent rows).
+  for (const file of ['RemoteHeaderIcon.tsx', 'RemoteShareMenu.tsx']) {
+    const source = readFileSync(join(ROOT, 'src', 'client', file), 'utf8')
+    assert.ok(source.includes("snap.role !== 'host'"), `${file} renders empty off the wired role`)
+  }
+  off()
 })

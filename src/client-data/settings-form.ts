@@ -221,25 +221,38 @@ export function savedRowRole(snapshot: { value?: unknown, user?: unknown }): 'ho
 }
 
 /**
- * Which status source the page polls for one scope snapshot. While the
- * namespace mirror is still loading the role is not knowable and NOTHING is
- * polled — a client deployment must never see a wasted `admin/status` 404.
- * A snapshot whose row carries a role decides from it; one that does not
- * waits (`'none'`) for the client-config probe ({@link savedRowRole}'s
- * undefined case), and only the probe's answer picks the source. `probed` is
- * the effective role the page fetched from `/_dsh/mobile-nav/client-config`,
- * or undefined while that probe has not answered.
+ * The EFFECTIVE role for one scope snapshot — the shared two-level decision
+ * every role-aware surface uses (the settings page via {@link settingsPollOf},
+ * the T33b session-sharing parts through the remote-share registration):
+ * while the namespace mirror is still loading the role is not knowable
+ * (`'unknown'` — a client deployment must never see a wasted `admin/*` 404);
+ * a snapshot whose row carries a role decides from it; a row-silent snapshot
+ * falls back to `probed`, the effective role fetched from
+ * `/_dsh/mobile-nav/client-config` (T17: the route carries the merged role),
+ * and stays `'unknown'` until that probe answers.
+ */
+export function settingsRoleOf(
+  status: 'loading' | 'ready' | 'unavailable',
+  snapshot: { value?: unknown, user?: unknown },
+  probed?: 'host' | 'client',
+): 'unknown' | 'host' | 'client' {
+  if (status === 'loading') return 'unknown'
+  return savedRowRole(snapshot) ?? probed ?? 'unknown'
+}
+
+/**
+ * Which status source the page polls for one scope snapshot —
+ * {@link settingsRoleOf} mapped onto poll sources (`'unknown'` polls
+ * nothing). See there for the decision.
  */
 export function settingsPollOf(
   status: 'loading' | 'ready' | 'unavailable',
   snapshot: { value?: unknown, user?: unknown },
   probed?: 'host' | 'client',
 ): 'none' | 'admin' | 'client' {
-  if (status === 'loading') return 'none'
-  const rowRole = savedRowRole(snapshot)
-  if (rowRole !== undefined) return rowRole === 'client' ? 'client' : 'admin'
-  if (probed === undefined) return 'none'
-  return probed === 'client' ? 'client' : 'admin'
+  const role = settingsRoleOf(status, snapshot, probed)
+  if (role === 'unknown') return 'none'
+  return role === 'client' ? 'client' : 'admin'
 }
 
 // --- T17: the plugin-reload note ------------------------------------------------
