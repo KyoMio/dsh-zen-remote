@@ -26,6 +26,14 @@
  * (`not-shared` / `no-session` / `forbidden-method`), a 200 `{ok:false}`
  * envelope, the gateway's own `relay-unauthorized` — is an ANSWER about the
  * call, not about the link, and leaves the state alone.
+ *
+ * Since T43 the client also reconnects on its own: an `offline` client walks
+ * a 1s → 2s → 5s → 10s → 30s ladder (0–20% jitter per wait) until a success
+ * lifts it back to `online`; `unpaired`, `revoked` and `incompatible` never
+ * reconnect on their own — they need a user action, which arrives as
+ * `credentialsChanged()` (or a fresh `connect()`). The wait is observable as
+ * `nextRetryAt`, the last failure code as `lastError`; both carry no
+ * credential material.
  */
 
 import { createHash } from 'node:crypto'
@@ -42,6 +50,45 @@ const DEFAULT_IDLE_TIMEOUT_MS = 45_000
 
 /** How long one request/response round-trip may take in full. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+
+/**
+ * The automatic reconnect ladder (T43): after the client lands `offline` it
+ * retries after 1s, 2s, 5s, 10s, 30s — and then every 30s until the link
+ * comes back. Each wait gains 0–20% of random jitter so a fleet of clients
+ * that lost the same server does not retry in lockstep. A success back to
+ * `online` resets the ladder to the first step.
+ */
+const RETRY_STEPS_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const
+
+/** Upper bound of the jitter fraction added to one retry delay (0–20%). */
+const RETRY_JITTER = 0.2
+
+/**
+ * The clock face the reconnect machinery runs on: wall time, timers and the
+ * jitter source. Injectable so tests drive the whole backoff sequence
+ * deterministically. The default timers are `unref()`ed — a pending retry
+ * must never keep the host process alive on its own.
+ */
+export interface RelayClock {
+  /** Epoch milliseconds. */
+  now(): number
+  setTimeout(fn: () => void, ms: number): unknown
+  clearTimeout(handle: unknown): void
+  /** One random sample in [0, 1] — the jitter source. */
+  random(): number
+}
+
+/** The default clock: real time, `unref()`ed timers, `Math.random`. */
+const defaultClock: RelayClock = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => {
+    const handle = setTimeout(fn, ms)
+    if (typeof handle.unref === 'function') handle.unref()
+    return handle
+  },
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  random: () => Math.random(),
+}
 
 /** The connection states the settings surface renders (and `subscribe`
  * listeners react to). */
@@ -91,6 +138,9 @@ export interface CreateRelayClientOptions {
   /** How long one request/response round-trip (handshake, invoke — and the
    * headers of a stream open) may take; default 15000. */
   requestTimeoutMs?: number
+  /** Clock/timers/jitter for the reconnect backoff; defaults to the real
+   * ones (timers `unref()`ed). Tests inject a manual clock. */
+  clock?: RelayClock
 }
 
 export interface RelayClient {
@@ -103,10 +153,30 @@ export interface RelayClient {
    * cached "online" verdict from outliving the credentials it was earned
    * with. */
   readonly lastHandshakeDigest: string | undefined
+  /** Epoch ms of the next automatic reconnect, or null while none is
+   * scheduled (connected, attempting, or in a state that never reconnects).
+   * Rendered by the settings page as "离线，将于 N 秒后重试". */
+  readonly nextRetryAt: number | null
+  /** The error CODE of the most recent failure ('offline',
+   * 'relay-unauthorized', a DSH code, …) — never a message, never a token or
+   * URL. Cleared when a request succeeds again. */
+  readonly lastError: string | undefined
   /** Observe state changes; a throwing listener never blocks the others. */
   subscribe(listener: (state: RelayState) => void): () => void
   /** Run the handshake; success resolves with it and leaves `online`. */
   connect(): Promise<RelayHandshake>
+  /** One immediate connection attempt from `offline`, resetting the backoff
+   * ladder (the settings page's 立即重连). Answers whether an attempt was
+   * started — the reconnect route turns a false into a 409. */
+  reconnect(): boolean
+  /** Notify that the credentials source may have changed (the loader's
+   * volatile-update for the row): a pending reconnect wait is cancelled and,
+   * with credentials present, one immediate attempt runs with the new
+   * values; without them the client lands `unpaired`. */
+  credentialsChanged(): void
+  /** Stop the automatic reconnect machinery (plugin row teardown). Explicit
+   * connect() calls still work, but no timer is armed again. */
+  stop(): void
   /** One invoke round-trip; resolves with the unwrapped `value`, throws
    * RelayError otherwise. A caller abort surfaces as `RelayError('aborted')`. */
   invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown>
@@ -187,16 +257,38 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
   const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   const fetchImpl: typeof fetch = options.fetchImpl ?? ((url, init) => fetch(url, init))
+  const clock: RelayClock = options.clock ?? defaultClock
 
   let state: RelayState = 'unpaired'
   let handshakeInfo: RelayHandshake | undefined
   let lastHandshakeDigest: string | undefined
   let connectInFlight: Promise<RelayHandshake> | undefined
+  // T43 reconnect machinery: the armed timer handle, how many consecutive
+  // attempts have failed (the ladder index), when the armed timer fires, the
+  // code of the most recent failure, and whether the row teardown stopped
+  // the machinery.
+  let retryTimer: unknown | undefined
+  let retryAttempt = 0
+  let nextRetryAt: number | null = null
+  let lastError: string | undefined
+  let stopped = false
+  // Digest of the credentials the machinery last SAW — the change detector
+  // behind credentialsChanged().
+  const initialCredentials = currentCredentials()
+  let credentialsDigest =
+    initialCredentials === undefined ? undefined : relayCredentialsDigest(initialCredentials.url, initialCredentials.token)
   const listeners = new Set<(state: RelayState) => void>()
 
   function setState(next: RelayState): void {
     if (state === next) return
     state = next
+    // The reconnect hooks ride the transitions (T43): landing offline arms
+    // the next wait; online resets the ladder; the three user-action states
+    // never reconnect and drop any pending wait; an attempt start leaves the
+    // ladder alone but the wait display is fireRetry's business.
+    if (next === 'offline') scheduleRetry()
+    else if (next === 'online') resetRetry()
+    else if (next === 'unpaired' || next === 'revoked' || next === 'incompatible') cancelRetry()
     for (const listener of [...listeners]) {
       try {
         listener(next)
@@ -206,11 +298,19 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     }
   }
 
-  function subscribe(listener: (state: RelayState) => void): () => void {
-    listeners.add(listener)
-    return () => {
-      listeners.delete(listener)
-    }
+  /**
+   * The live credentials, or undefined — the requireCredentials logic
+   * without the announcement, shared with credentialsChanged's change
+   * detection.
+   */
+  function currentCredentials(): { url: string; token: string } | undefined {
+    const url = options.getServerUrl()
+    const token = options.getToken()
+    if (url === undefined || url.trim() === '' || token === undefined || token === '') return undefined
+    // The getter contract delivers a normalized address; stripping stray
+    // trailing slashes anyway keeps a hand-edited row from silently producing
+    // `…/relay//v1/…`, which no route would ever match.
+    return { url: url.trim().replace(/\/+$/u, ''), token }
   }
 
   /**
@@ -219,16 +319,74 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * address or token was cleared later shows up as unpaired too.
    */
   function requireCredentials(): { url: string; token: string } {
-    const url = options.getServerUrl()
-    const token = options.getToken()
-    if (url === undefined || url.trim() === '' || token === undefined || token === '') {
+    const creds = currentCredentials()
+    if (creds === undefined) {
       setState('unpaired')
       throw new RelayError('unpaired', 'no server address or pairing token is configured')
     }
-    // The getter contract delivers a normalized address; stripping stray
-    // trailing slashes anyway keeps a hand-edited row from silently producing
-    // `…/relay//v1/…`, which no route would ever match.
-    return { url: url.trim().replace(/\/+$/u, ''), token }
+    credentialsDigest = relayCredentialsDigest(creds.url, creds.token)
+    return creds
+  }
+
+  // ---- the reconnect ladder (T43) ------------------------------------------
+
+  function cancelRetry(): void {
+    if (retryTimer !== undefined) {
+      clock.clearTimeout(retryTimer)
+      retryTimer = undefined
+    }
+    retryAttempt = 0
+    nextRetryAt = null
+  }
+
+  function resetRetry(): void {
+    cancelRetry()
+    lastError = undefined
+  }
+
+  function scheduleRetry(): void {
+    // One wait at a time — a second offline entry while a timer is armed
+    // (e.g. a status-route connect failing between two ticks) leaves the
+    // armed timer in charge.
+    if (stopped || retryTimer !== undefined) return
+    const base = RETRY_STEPS_MS[Math.min(retryAttempt, RETRY_STEPS_MS.length - 1)]
+    const delay = Math.round(base * (1 + clock.random() * RETRY_JITTER))
+    retryAttempt += 1
+    nextRetryAt = clock.now() + delay
+    retryTimer = clock.setTimeout(fireRetry, delay)
+  }
+
+  function fireRetry(): void {
+    retryTimer = undefined
+    nextRetryAt = null
+    if (stopped || state !== 'offline') return
+    // The attempt's own outcome drives the machine: success → online (ladder
+    // reset), a still-offline failure → scheduleRetry armed the next step,
+    // a wall (revoked/incompatible/unpaired) → cancelRetry ran.
+    void connect().catch(() => {})
+  }
+
+  /**
+   * The error-code vocabulary the diagnostics readout accepts (T43-fix):
+   * short, alphanumeric with / _ - separators. A server that answers a
+   * "code" quoting URLs or anything stranger does not get to write it into
+   * the client's state — it degrades to `unexpected`.
+   */
+  function sanitizeCode(code: string): string {
+    return /^[a-z0-9/_-]{1,64}$/i.test(code) ? code : 'unexpected'
+  }
+
+  /** Record the failing call's code for the diagnostics surface (the CODE
+   * only — messages quote URLs, and codes never carry credentials). */
+  function noteFailure(code: string): void {
+    lastError = sanitizeCode(code)
+  }
+
+  function subscribe(listener: (state: RelayState) => void): () => void {
+    listeners.add(listener)
+    return () => {
+      listeners.delete(listener)
+    }
   }
 
   /** The shared request face of every route. ONLY endpoint headers live
@@ -291,6 +449,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // reverse proxy answers when the gateway behind it is down (nginx: an
     // HTML 502). That IS the offline case, and the e2e contract expects it.
     if (status === 502 || status === 503 || status === 504) {
+      noteFailure('offline')
       setState('offline')
       return new RelayError('offline', `the relay chain answered ${status} — the gateway is unreachable`, status)
     }
@@ -341,6 +500,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         response = await fetchImpl(`${url}${pathName}`, { ...requestInit(token, body), signal: controller.signal })
       } catch (error) {
         if (signal?.aborted) throw abortedError()
+        noteFailure('offline')
         setState('offline')
         throw new RelayError('offline', timedOut ? `no response within ${requestTimeoutMs} ms` : messageOf(error))
       }
@@ -349,10 +509,13 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         payload = await readPayload(response)
       } catch (error) {
         if (signal?.aborted) throw abortedError()
+        noteFailure('offline')
         setState('offline')
         throw new RelayError('offline', messageOf(error))
       }
       if (response.status >= 200 && response.status < 300 && isRecord(payload) && payload.ok === true) {
+        // A success answers the link question: the last failure is superseded.
+        lastError = undefined
         if (applySuccessState) setState('online')
         return payload
       }
@@ -389,12 +552,18 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         // configured" — this attempt HAD them, so a restored first attempt
         // lands on `offline`, the honest "configured but not reached".
         if (state === 'connecting') setState(previous === 'unpaired' ? 'offline' : previous)
+        // Whatever the failure was, its code is the diagnostics answer — even
+        // when the restore left the state untouched (e.g. an online verdict
+        // surviving an unmapped handshake failure). Server-supplied codes go
+        // through the sanitizer first (T43-fix).
+        if (error instanceof RelayError) lastError = sanitizeCode(error.code)
         throw error
       }
       // The protocol gate runs BEFORE the online transition: an incompatible
       // server must end `incompatible`, never flicker through online.
       if (payload.relayProtocol !== RELAY_PROTOCOL) {
         setState('incompatible')
+        lastError = 'incompatible'
         throw new RelayError(
           'incompatible',
           `the server speaks relay protocol ${String(payload.relayProtocol)}, this client speaks ${RELAY_PROTOCOL}`,
@@ -419,6 +588,56 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     }
     attempt.then(clear, clear)
     return attempt
+  }
+
+  /** One immediate attempt, ladder reset to the first step (T43). Only an
+   * `offline` client has anything to reconnect. */
+  function reconnect(): boolean {
+    if (stopped || state !== 'offline') return false
+    cancelRetry()
+    void connect().catch(() => {})
+    return true
+  }
+
+  /**
+   * The credentials source moved (a pairing write, an unpair, a hand edit
+   * committed by the loader): drop any pending wait — the ladder belongs to
+   * the OLD credentials — and dial the new values at once. Nothing configured
+   * lands `unpaired`, exactly like a request would. A connect already
+   * running joined in with the old values (its getters were read at its
+   * start); when it settles, ONE follow-up goes out with the new values —
+   * skipped if a still-newer change superseded this one.
+   */
+  function credentialsChanged(): void {
+    const creds = currentCredentials()
+    const digest = creds === undefined ? undefined : relayCredentialsDigest(creds.url, creds.token)
+    if (digest === credentialsDigest) return
+    credentialsDigest = digest
+    cancelRetry()
+    if (stopped) return
+    if (creds === undefined) {
+      setState('unpaired')
+      return
+    }
+    const inFlight = connectInFlight
+    if (inFlight === undefined) {
+      void connect().catch(() => {})
+      return
+    }
+    // The running attempt is the old credentials' dial. Joining it would be
+    // a no-op (T23a-fix2 dedupe) AND answer nothing about the new values —
+    // the follow-up below is the new dial (T43-fix).
+    void inFlight.catch(() => {}).then(() => {
+      if (stopped) return
+      const latest = currentCredentials()
+      if (latest === undefined || relayCredentialsDigest(latest.url, latest.token) !== digest) return
+      void connect().catch(() => {})
+    })
+  }
+
+  function stop(): void {
+    stopped = true
+    cancelRetry()
   }
 
   async function invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -499,6 +718,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         })
       } catch (error) {
         if (signal?.aborted) return
+        noteFailure('offline')
         setState('offline')
         throw new RelayError('offline', headersTimedOut ? `no response within ${requestTimeoutMs} ms` : messageOf(error))
       }
@@ -513,6 +733,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           payload = await readPayload(response)
         } catch (error) {
           if (signal?.aborted) return
+          noteFailure('offline')
           setState('offline')
           throw new RelayError('offline', messageOf(error))
         }
@@ -568,6 +789,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       if (signal?.aborted) return
       if (error instanceof RelayError) throw error
       // Anything else escaping the body read is the transport dying.
+      noteFailure('offline')
       setState('offline')
       throw new RelayError('offline', idleFired ? `no line received for ${idleTimeoutMs} ms` : messageOf(error))
     } finally {
@@ -596,8 +818,17 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     get lastHandshakeDigest(): string | undefined {
       return lastHandshakeDigest
     },
+    get nextRetryAt(): number | null {
+      return nextRetryAt
+    },
+    get lastError(): string | undefined {
+      return lastError
+    },
     subscribe,
     connect,
+    reconnect,
+    credentialsChanged,
+    stop,
     invoke,
     openStream,
   }

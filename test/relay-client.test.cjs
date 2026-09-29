@@ -100,6 +100,7 @@ function makeClient(port, overrides = {}) {
     getToken: () => token,
     ...(overrides.idleTimeoutMs !== undefined ? { idleTimeoutMs: overrides.idleTimeoutMs } : {}),
     ...(overrides.requestTimeoutMs !== undefined ? { requestTimeoutMs: overrides.requestTimeoutMs } : {}),
+    ...(overrides.clock !== undefined ? { clock: overrides.clock } : {}),
   })
   return { client, setUrl: (v) => { url = v }, setToken: (v) => { token = v } }
 }
@@ -679,4 +680,356 @@ test('request headers stay dispatcher-safe: no content-length or connection-mana
     '/_dsh/zen-remote/relay/v1/invoke',
     '/_dsh/zen-remote/relay/v1/stream',
   ])
+})
+
+// ---- T43: the automatic reconnect ladder ---------------------------------------
+//
+// The whole ladder runs on an INJECTED clock: no real waiting, every wait is
+// asserted as the exact nextRetryAt timestamp the machinery arms. The
+// handshake scenario answers 502 (the reverse-proxy-down shape) to keep the
+// client offline; HANDSHAKE_OK flips it back.
+
+/** A manual clock for the ladder: `advance` moves time and fires due timers
+ * synchronously; `random` is pinned so the jitter math is exact. */
+function fakeClock() {
+  let now = 1_700_000_000_000
+  let rng = 0
+  const timers = []
+  return {
+    now: () => now,
+    random: () => rng,
+    setRandom: (v) => { rng = v },
+    setTimeout(fn, ms) {
+      const timer = { fn, at: now + ms }
+      timers.push(timer)
+      return timer
+    },
+    clearTimeout(timer) {
+      const index = timers.indexOf(timer)
+      if (index >= 0) timers.splice(index, 1)
+    },
+    advance(ms) {
+      now += ms
+      const due = timers.filter((t) => t.at <= now).sort((a, b) => a.at - b.at)
+      for (const timer of due) {
+        const index = timers.indexOf(timer)
+        if (index >= 0) {
+          timers.splice(index, 1)
+          timer.fn()
+        }
+      }
+    },
+    get pending() { return timers.length },
+  }
+}
+
+const OFFLINE_502 = () => [502, { ok: false }]
+const handshakeHits = (relay) => relay.seen.filter((r) => r.url === HANDSHAKE).length
+
+test('T43: the ladder walks 1/2/5/10/30/30s and resets to 1s after a success', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = OFFLINE_502
+  const { client } = makeClient(relay.port, { clock })
+  try {
+    // The FIRST failure arms the first step.
+    await assert.rejects(() => client.connect(), (error) => error.code === 'offline')
+    assert.equal(client.state, 'offline')
+    assert.equal(client.nextRetryAt, clock.now() + 1000)
+    assert.equal(clock.pending, 1)
+
+    const steps = [1000, 2000, 5000, 10000, 30000, 30000]
+    for (const [index, step] of steps.entries()) {
+      clock.advance(step)
+      // The fired attempt runs a real round-trip; wait for its failure to
+      // have armed the next wait.
+      await waitFor(() => clock.pending === 1 && client.state === 'offline', 3000)
+      const next = steps[index + 1]
+      if (next !== undefined) {
+        assert.equal(client.nextRetryAt, clock.now() + next, `step ${index + 1} waits ${next} ms`)
+      } else {
+        assert.equal(client.nextRetryAt, clock.now() + 30000, 'the ladder stays at 30s forever')
+      }
+    }
+    assert.equal(handshakeHits(relay), steps.length + 1, 'one initial connect plus one attempt per step')
+
+    // The server comes back: the NEXT due attempt succeeds and clears the
+    // machinery.
+    relay.scenario.handshake = HANDSHAKE_OK
+    clock.advance(client.nextRetryAt - clock.now())
+    await waitFor(() => client.state === 'online', 3000)
+    assert.equal(client.nextRetryAt, null)
+    assert.equal(client.lastError, undefined)
+    assert.equal(clock.pending, 0)
+
+    // A failure after a success starts over at the FIRST step.
+    relay.scenario.handshake = OFFLINE_502
+    await assert.rejects(() => client.connect(), (error) => error.code === 'offline')
+    assert.equal(client.nextRetryAt, clock.now() + 1000, 'the ladder reset — the first wait is 1s again')
+  } finally { await relay.stop() }
+})
+
+test('T43: the jitter adds 0–20% to each wait', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = OFFLINE_502
+  const { client } = makeClient(relay.port, { clock })
+  try {
+    clock.setRandom(1) // the boundary: exactly +20%
+    await assert.rejects(() => client.connect())
+    assert.equal(client.nextRetryAt, clock.now() + 1200, '1000 ms + 20%')
+
+    clock.setRandom(0.5) // +10%
+    clock.advance(1200)
+    await waitFor(() => clock.pending === 1 && client.state === 'offline', 3000)
+    assert.equal(client.nextRetryAt, clock.now() + 2200, '2000 ms + 10%')
+  } finally { await relay.stop() }
+})
+
+test('T43-fix: revoked cancels an ARMED ladder — the wall lands mid-retry, the timer dies', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  // First the client is merely offline WITH a retry armed...
+  relay.scenario.handshake = OFFLINE_502
+  const { client } = makeClient(relay.port, { clock })
+  try {
+    await assert.rejects(() => client.connect(), (error) => error.code === 'offline')
+    assert.equal(client.state, 'offline')
+    assert.equal(clock.pending, 1)
+    assert.equal(client.nextRetryAt, clock.now() + 1000)
+
+    // ...then the token dies: the NEXT (explicit) connect hits the gateway's
+    // unpaired wall, and the armed wait must die with the ladder.
+    relay.scenario.handshake = () => [401, { ok: false, reason: 'unpaired' }]
+    await assert.rejects(() => client.connect(), (error) => error.code === 'revoked')
+    assert.equal(client.state, 'revoked')
+    assert.equal(client.nextRetryAt, null)
+    assert.equal(clock.pending, 0)
+    assert.equal(client.lastError, 'revoked')
+    const hits = handshakeHits(relay)
+    clock.advance(10 * 60_000)
+    await sleep(30)
+    assert.equal(handshakeHits(relay), hits, 'not one request left the client after the wall')
+    assert.equal(client.state, 'revoked')
+  } finally { await relay.stop() }
+})
+
+test('T43-fix: incompatible cancels an ARMED ladder the same way', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = OFFLINE_502
+  const { client } = makeClient(relay.port, { clock })
+  try {
+    await assert.rejects(() => client.connect(), (error) => error.code === 'offline')
+    assert.equal(client.state, 'offline')
+    assert.equal(clock.pending, 1)
+    assert.notEqual(client.nextRetryAt, null)
+
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 2, serverId: 'x', serverName: 'n', dshVersion: 'v', fingerprints: {} }]
+    await assert.rejects(() => client.connect(), (error) => error.code === 'incompatible')
+    assert.equal(client.state, 'incompatible')
+    assert.equal(client.nextRetryAt, null)
+    assert.equal(clock.pending, 0)
+    const hits = handshakeHits(relay)
+    clock.advance(10 * 60_000)
+    await sleep(30)
+    assert.equal(handshakeHits(relay), hits)
+  } finally { await relay.stop() }
+})
+
+test('T43: unpaired never reconnects, and clearing the credentials cancels a pending wait', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = OFFLINE_502
+  const { client, setToken } = makeClient(relay.port, { clock })
+  try {
+    await assert.rejects(() => client.connect(), (error) => error.code === 'offline')
+    assert.equal(clock.pending, 1)
+    setToken('')
+    client.credentialsChanged()
+    assert.equal(client.state, 'unpaired')
+    assert.equal(client.nextRetryAt, null)
+    assert.equal(clock.pending, 0)
+    const hits = handshakeHits(relay)
+    clock.advance(120_000)
+    await sleep(30)
+    assert.equal(handshakeHits(relay), hits, 'an unpaired client stays silent')
+  } finally { await relay.stop() }
+})
+
+test('T43: changed credentials cancel the wait and dial the new values at once', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = OFFLINE_502
+  const { client, setToken } = makeClient(relay.port, { clock })
+  try {
+    await assert.rejects(() => client.connect())
+    assert.equal(clock.pending, 1)
+
+    // The same credentials are a no-op: the wait stays armed, nothing dials.
+    client.credentialsChanged()
+    assert.equal(clock.pending, 1)
+    assert.equal(handshakeHits(relay), 1)
+
+    // A REAL change cancels the wait and connects immediately.
+    relay.scenario.handshake = HANDSHAKE_OK
+    setToken('tok-2')
+    client.credentialsChanged()
+    await waitFor(() => client.state === 'online', 3000)
+    assert.equal(clock.pending, 0)
+    assert.equal(client.nextRetryAt, null)
+    assert.equal(relay.seen[relay.seen.length - 1].headers.authorization, 'Bearer tok-2', 'the new token rode the wire')
+
+    // The ladder was reset with the cancel: a fresh failure waits 1s again.
+    relay.scenario.handshake = OFFLINE_502
+    await assert.rejects(() => client.connect())
+    assert.equal(client.nextRetryAt, clock.now() + 1000)
+  } finally { await relay.stop() }
+})
+
+test('T43: stop() cancels the armed retry — the row teardown leaves nothing behind', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = OFFLINE_502
+  const { client } = makeClient(relay.port, { clock })
+  try {
+    await assert.rejects(() => client.connect())
+    assert.equal(clock.pending, 1)
+    client.stop()
+    assert.equal(clock.pending, 0)
+    assert.equal(client.nextRetryAt, null)
+    const hits = handshakeHits(relay)
+    clock.advance(120_000)
+    await sleep(30)
+    assert.equal(handshakeHits(relay), hits)
+  } finally { await relay.stop() }
+})
+
+test('T43: relay-unauthorized keeps the ladder running and records its code', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = () => [401, { ok: false, error: { code: 'relay-unauthorized' } }]
+  const { client } = makeClient(relay.port, { clock })
+  try {
+    await assert.rejects(() => client.connect(), (error) => error.code === 'relay-unauthorized')
+    assert.equal(client.state, 'offline', 'a server-side secret fault is NOT a dead token — the client stays offline')
+    assert.equal(client.lastError, 'relay-unauthorized')
+    assert.equal(client.nextRetryAt, clock.now() + 1000)
+    clock.advance(1000)
+    await waitFor(() => handshakeHits(relay) === 2, 3000)
+    await waitFor(() => clock.pending === 1 && client.state === 'offline', 3000)
+    assert.equal(client.lastError, 'relay-unauthorized', 'the code survives the retry')
+  } finally { await relay.stop() }
+})
+
+test('T43: the retry readout never carries credential material', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = OFFLINE_502
+  const { client, setUrl } = makeClient(relay.port, { clock })
+  try {
+    await assert.rejects(() => client.connect())
+    const readout = JSON.stringify({ state: client.state, nextRetryAt: client.nextRetryAt, lastError: client.lastError })
+    assert.equal(readout.includes('tok-1'), false, 'no token in the readout')
+    assert.equal(readout.includes('127.0.0.1'), false, 'no URL in the readout')
+    // Same after the timer walked and the transport error was recorded.
+    setUrl(`http://127.0.0.1:${await deadPort()}`)
+    client.credentialsChanged()
+    await waitFor(() => clock.pending === 1, 3000)
+    const after = JSON.stringify({ state: client.state, nextRetryAt: client.nextRetryAt, lastError: client.lastError })
+    assert.equal(after.includes('tok-1'), false)
+    assert.equal(after.includes('127.0.0.1'), false)
+  } finally { await relay.stop() }
+})
+
+// ---- T43-fix: sanitization, in-flight credentials, concurrent joins ------------
+
+test('T43-fix: a server "code" outside the diagnostics vocabulary reads unexpected', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  try {
+    // A long code quoting a URL is exactly what must never reach lastError.
+    relay.scenario.handshake = () => [200, { ok: false, error: { code: `see http://evil.example/trace/${'x'.repeat(80)}` } }]
+    const { client } = makeClient(relay.port, { clock })
+    await assert.rejects(() => client.connect())
+    assert.equal(client.lastError, 'unexpected')
+    assert.equal(JSON.stringify({ lastError: client.lastError }).includes('evil.example'), false)
+
+    // A code just past the cap is refused too; a legal server-shaped code
+    // rides through verbatim.
+    relay.scenario.handshake = () => [200, { ok: false, error: { code: 'a'.repeat(65) } }]
+    const capped = makeClient(relay.port, { clock }).client
+    await assert.rejects(() => capped.connect())
+    assert.equal(capped.lastError, 'unexpected')
+
+    relay.scenario.handshake = () => [200, { ok: false, error: { code: 'gateway/invocation-unavailable' } }]
+    const legal = makeClient(relay.port, { clock }).client
+    await assert.rejects(() => legal.connect())
+    assert.equal(legal.lastError, 'gateway/invocation-unavailable')
+  } finally { await relay.stop() }
+})
+
+test('T43-fix: credentialsChanged during an in-flight connect follows up ONCE with the new token', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  const { client, setToken } = makeClient(relay.port, { clock })
+  try {
+    // The FIRST handshake (old credentials) stalls on the wire.
+    let release = () => {}
+    relay.scenario.handshake = (req, res) => {
+      release = () => sendJson(res, 200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '补连', dshVersion: 'v', fingerprints: {} })
+      return undefined // answered by release()
+    }
+    const first = client.connect()
+    await waitFor(() => relay.seen.length === 1)
+
+    // The credentials change while that attempt is still on the wire: no
+    // second request may start — the running dial belongs to the OLD token.
+    setToken('tok-2')
+    client.credentialsChanged()
+    await sleep(40)
+    assert.equal(relay.seen.length, 1, 'nothing dials while the old attempt is in flight')
+
+    // The stalled handshake answers; when it settles, exactly ONE follow-up
+    // goes out with the NEW token.
+    release()
+    relay.scenario.handshake = HANDSHAKE_OK
+    await first
+    assert.equal(client.state, 'online')
+    await waitFor(() => relay.seen.length === 2, 3000)
+    assert.equal(relay.seen[1].headers.authorization, 'Bearer tok-2', 'the follow-up dialed the NEW credentials')
+    await sleep(50)
+    assert.equal(relay.seen.length, 2, 'exactly one follow-up, no loop')
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('T43-fix: concurrent connects while a retry is armed join into ONE handshake', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  relay.scenario.handshake = OFFLINE_502
+  const { client } = makeClient(relay.port, { clock })
+  try {
+    await assert.rejects(() => client.connect())
+    assert.equal(clock.pending, 1, 'a retry is armed')
+
+    relay.scenario.handshake = HANDSHAKE_OK
+    const a = client.connect()
+    const b = client.connect()
+    assert.equal(a, b, 'the two callers joined one attempt')
+
+    // Advancing past the armed wait must NOT stack another handshake on
+    // top of the in-flight one (fireRetry no-ops on a non-offline state),
+    // and at most one timer is ever outstanding.
+    clock.advance(client.nextRetryAt - clock.now())
+    await Promise.all([a, b])
+    assert.equal(client.state, 'online')
+    // One handshake for the initial failure, one for the JOINED attempt —
+    // the fired timer added nothing.
+    assert.equal(handshakeHits(relay), 2, 'the fired retry stacked no extra handshake')
+    assert.ok(clock.pending <= 1)
+    await sleep(30)
+    assert.equal(handshakeHits(relay), 2)
+    assert.equal(clock.pending, 0, 'the success cleared the machinery')
+  } finally { await relay.stop() }
 })

@@ -710,13 +710,15 @@ test('T23a-fix status: a relay that never connected gets a live connect on the s
   }
 })
 
-test('T23a-fix status: live-connect failures map — relay-unauthorized is unexpected, only unpaired is revoked', async () => {
+test('T23a-fix status: live-connect failures map — relay-unauthorized is unexpected, only unpaired is revoked (T43: incompatible is its own word)', async () => {
   const row = makeRow()
   const cases = [
     [new RelayError('relay-unauthorized', 'server secret mismatch', 401), 'unexpected'],
     [new RelayError('revoked', 'unpaired wall', 401), 'revoked'],
     [new RelayError('offline', 'connection refused'), 'unreachable'],
-    [new RelayError('incompatible', 'not a 2.0.0 relay'), 'unexpected'],
+    // T43: the protocol mismatch is rendered with its own "upgrade both
+    // ends" copy, so the route answers the dedicated word now.
+    [new RelayError('incompatible', 'not a 2.0.0 relay'), 'incompatible'],
   ]
   for (const [error, expected] of cases) {
     const relay = fakeRelay({
@@ -730,6 +732,116 @@ test('T23a-fix status: live-connect failures map — relay-unauthorized is unexp
     } finally {
       await closeServer(server)
     }
+  }
+})
+
+// ---- T43: the diagnostics readout + the reconnect route ----------------------
+
+test('T43 status: a failed live connect carries nextRetryAt + lastError, never the token', async () => {
+  const TOKEN = 'super-secret-token-value'
+  const row = makeRow({ deviceToken: TOKEN })
+  const failing = fakeRelay({
+    state: 'offline',
+    connectError: new RelayError('offline', 'connection refused'),
+    nextRetryAt: 1234567890123,
+    lastError: 'offline',
+  })
+  const failServer = await startClientServer(row, { getRelayClient: () => failing })
+  try {
+    const body = JSON.parse((await request(failServer.port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'unreachable')
+    assert.equal(body.nextRetryAt, 1234567890123)
+    assert.equal(body.lastError, 'offline')
+    assert.equal(JSON.stringify(body).includes(TOKEN), false, 'the token must not appear')
+  } finally {
+    await closeServer(failServer.server)
+  }
+
+  // An online verdict carries neither field.
+  const online = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('在线'),
+    lastHandshakeDigest: relayCredentialsDigest(gwUrl, TOKEN),
+  })
+  const okServer = await startClientServer(row, { getRelayClient: () => online })
+  try {
+    const body = JSON.parse((await request(okServer.port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'online')
+    assert.equal(body.nextRetryAt, undefined)
+    assert.equal(body.lastError, undefined)
+    assert.equal(JSON.stringify(body).includes(TOKEN), false)
+  } finally {
+    await closeServer(okServer.server)
+  }
+})
+
+test('T43 reconnect: wrong method 405, cross-site 403, unadmitted 401, missing relay client 503', async () => {
+  const { server, port } = await startClientServer(makeRow())
+  try {
+    const method = await request(port, { method: 'GET', path: routes.CLIENT_RECONNECT_ROUTE })
+    assert.equal(method.status, 405)
+    assert.equal(method.headers.allow, 'POST')
+
+    const cross = await request(port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers: { 'sec-fetch-site': 'cross-site' }, body: {} })
+    assert.equal(cross.status, 403)
+    assert.equal(JSON.parse(cross.body).error.code, 'origin-rejected')
+
+    const unadmitted = await startClientServer(makeRow(), { admit: () => ({ rejection: 401 }) })
+    try {
+      const rejected = await request(unadmitted.port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers: sameOrigin(unadmitted.port), body: {} })
+      assert.equal(rejected.status, 401)
+      assert.equal(JSON.parse(rejected.body).error.code, 'unauthorized')
+    } finally {
+      await closeServer(unadmitted.server)
+    }
+
+    const bare = await startClientServer(makeRow(), { getRelayClient: undefined })
+    try {
+      const missing = await request(bare.port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers: sameOrigin(bare.port), body: {} })
+      assert.equal(missing.status, 503)
+      assert.equal(JSON.parse(missing.body).error.code, 'unavailable')
+    } finally {
+      await closeServer(bare.server)
+    }
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T43 reconnect: 409 while not offline, and one fired attempt while offline', async () => {
+  const online = fakeRelay({ state: 'online', handshakeInfo: INFO('在线'), lastHandshakeDigest: 'd' })
+  const onlineServer = await startClientServer(makeRow(), { getRelayClient: () => online })
+  try {
+    const conflict = await request(onlineServer.port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers: sameOrigin(onlineServer.port), body: {} })
+    assert.equal(conflict.status, 409)
+    assert.equal(JSON.parse(conflict.body).error.code, 'not-offline')
+  } finally {
+    await closeServer(onlineServer.server)
+  }
+
+  // offline: the route fires ONE immediate attempt (never awaits it) and
+  // answers ok.
+  const attempts = []
+  const offline = fakeRelay({
+    state: 'offline',
+    reconnect: () => {
+      attempts.push(1)
+      offline.state = 'online'
+      return true
+    },
+  })
+  const offlineServer = await startClientServer(makeRow(), { getRelayClient: () => offline })
+  try {
+    const fired = await request(offlineServer.port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers: sameOrigin(offlineServer.port), body: {} })
+    assert.equal(fired.status, 200)
+    assert.deepEqual(JSON.parse(fired.body), { ok: true })
+    assert.equal(attempts.length, 1, 'exactly one attempt was fired')
+    // Now online again — a second press is a 409.
+    const again = await request(offlineServer.port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers: sameOrigin(offlineServer.port), body: {} })
+    assert.equal(again.status, 409)
+    assert.equal(attempts.length, 1)
+  } finally {
+    await closeServer(offlineServer.server)
   }
 })
 

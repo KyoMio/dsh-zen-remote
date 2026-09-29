@@ -92,6 +92,8 @@ export const ADMIN_PUSH_TEST_ROUTE = '/_dsh/zen-remote/admin/push-test'
 /** Same-origin client routes the sub-client block talks to (host half: T16). */
 export const CLIENT_CLAIM_ROUTE = '/_dsh/zen-remote/client/claim'
 export const CLIENT_STATUS_ROUTE = '/_dsh/zen-remote/client/status'
+/** T43: one immediate reconnect — answered 409 unless the client is offline. */
+export const CLIENT_RECONNECT_ROUTE = '/_dsh/zen-remote/client/reconnect'
 
 /** The lightweight client-facing config route (host half, both roles): the
  * settings page's FALLBACK role probe (T17) — it registers wherever a
@@ -116,22 +118,114 @@ export const DEVICE_TOKEN_FIELD = 'deviceToken'
 
 // --- client-half wire shapes -------------------------------------------------
 
-/** The `GET /_dsh/zen-remote/client/status` body, exactly as
+/**
+ * The `GET /_dsh/zen-remote/client/status` body, exactly as
  * src/client-routes.ts answers it: `serverUrl` is present only once a token
  * exists (the unpaired answer is `{ state: 'unpaired' }` alone). The token
- * itself never rides any status response. */
+ * itself never rides any status response. The T43 diagnostics fields ride
+ * only on a failed live connect of a wired relay client; `intercept` (T23b)
+ * and `compat` (T42) are rendered only when the body carries them — earlier
+ * servers answer neither.
+ */
 export interface ClientStatusBody {
   state?: string
   serverUrl?: string
+  serverName?: unknown
+  /** Epoch ms of the relay client's next automatic reconnect (offline only). */
+  nextRetryAt?: unknown
+  /** The error code of the last failure — a code, never a message or URL. */
+  lastError?: unknown
+  /** T23b request-interceptor diagnostics (provisional shape; presence-gated). */
+  intercept?: unknown
+  /** T42 relay compat diagnostics (provisional shape; presence-gated). */
+  compat?: unknown
+}
+
+/** One remote-call failure line in the diagnostics lists. */
+export interface ClientDiagFailureView {
+  time: number
+  method: string
+  code: string
+}
+
+/**
+ * T23b interceptor diagnostics as the block renders them. The wire field is
+ * presence-gated: `undefined` here means the body carried none (an older
+ * server), and the whole interceptor group stays hidden.
+ */
+export interface ClientInterceptView {
+  installed: boolean
+  /** Shape-detection failure reasons — non-empty means remote features are off. */
+  reasons: string[]
+  /** The most recent remote call failures (at most 10). */
+  recentFailures: ClientDiagFailureView[]
+}
+
+/** T42 compat diagnostics as the block renders them (presence-gated like {@link ClientInterceptView}). */
+export interface ClientCompatView {
+  /** Names of the groups whose fingerprints differ. */
+  mismatchedGroups: string[]
+  /** The most recent incompatible calls (at most 10). */
+  recentCalls: ClientDiagFailureView[]
 }
 
 /** One client connection as the block renders it. */
 export interface ClientConnectionView {
-  state: 'unpaired' | 'connected' | 'revoked' | 'unreachable' | 'unexpected' | 'invalid-url'
+  state: 'unpaired' | 'connected' | 'revoked' | 'unreachable' | 'unexpected' | 'invalid-url' | 'incompatible'
   serverUrl: string
+  serverName: string
+  /** Verbatim from the body when it carried a finite number; the countdown
+   * math happens at render time against the live clock. */
+  nextRetryAt: number | undefined
+  /** The last failure's code, '' when none is reported. */
+  lastError: string
+  intercept: ClientInterceptView | undefined
+  compat: ClientCompatView | undefined
 }
 
-const CLIENT_STATES: readonly ClientConnectionView['state'][] = ['unpaired', 'connected', 'revoked', 'unreachable', 'unexpected', 'invalid-url']
+const CLIENT_STATES: readonly ClientConnectionView['state'][] = ['unpaired', 'connected', 'revoked', 'unreachable', 'unexpected', 'invalid-url', 'incompatible']
+
+/** At most `cap` strings out of an array-shaped value; anything else is none. */
+function stringListOf(value: unknown, cap: number): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((entry): entry is string => typeof entry === 'string').slice(0, cap)
+}
+
+/** At most 10 diagnostics failure rows out of an array-shaped value. */
+function failureListOf(value: unknown): ClientDiagFailureView[] {
+  if (!Array.isArray(value)) return []
+  const rows: ClientDiagFailureView[] = []
+  for (const entry of value.slice(0, 10)) {
+    const record = asRecord(entry)
+    rows.push({
+      time: typeof record.time === 'number' && Number.isFinite(record.time) ? record.time : 0,
+      method: asStringSet(record.method),
+      code: asStringSet(record.code),
+    })
+  }
+  return rows
+}
+
+/** T23b interceptor block, only when the body carried the field at all. */
+function deriveInterceptView(value: unknown): ClientInterceptView | undefined {
+  if (value === undefined || value === null) return undefined
+  const record = asRecord(value)
+  return {
+    installed: record.installed === true,
+    reasons: stringListOf(record.reasons, 20),
+    recentFailures: failureListOf(record.recentFailures),
+  }
+}
+
+/** T42 compat block, only when the body carried the field at all. */
+function deriveCompatView(value: unknown): ClientCompatView | undefined {
+  if (value === undefined || value === null) return undefined
+  const record = asRecord(value)
+  return {
+    mismatchedGroups: stringListOf(record.mismatchedGroups, 20),
+    recentCalls: failureListOf(record.recentCalls),
+  }
+}
 
 /**
  * Map one `client/status` body into the view the client group renders.
@@ -143,9 +237,59 @@ export function deriveClientStatusView(body: ClientStatusBody): ClientConnection
   const state = CLIENT_STATES.includes(safe.state as ClientConnectionView['state'])
     ? safe.state as ClientConnectionView['state']
     : 'unpaired'
+  const nextRetryAt = typeof safe.nextRetryAt === 'number' && Number.isFinite(safe.nextRetryAt)
+    ? safe.nextRetryAt
+    : undefined
   return {
     state,
     serverUrl: typeof safe.serverUrl === 'string' ? safe.serverUrl : '',
+    serverName: typeof safe.serverName === 'string' ? safe.serverName : '',
+    nextRetryAt,
+    lastError: typeof safe.lastError === 'string' ? safe.lastError : '',
+    intercept: deriveInterceptView(safe.intercept),
+    compat: deriveCompatView(safe.compat),
+  }
+}
+
+/**
+ * Which connection line the block renders (T43 diagnostics wording, chosen
+ * as a pure descriptor so the copy table and the countdown math stay
+ * testable without a browser): connected prefers the handshake's server
+ * name; any verdict the body backs with a `nextRetryAt` is OFFLINE first —
+ * the relay client is mid-retry and the line counts down to it, whether the
+ * probe classified the failure `unreachable` or `unexpected` (T43-fix);
+ * without a `nextRetryAt` the two map one plain copy each. The rest map one
+ * state each.
+ */
+export type ClientStatusLine =
+  | { kind: 'connectedName', serverName: string }
+  | { kind: 'connected', serverUrl: string }
+  | { kind: 'offlineRetry', seconds: number }
+  | { kind: 'offlineRetrySoon' }
+  | { kind: 'unreachable' }
+  | { kind: 'revoked' }
+  | { kind: 'incompatible' }
+  | { kind: 'unexpected' }
+  | { kind: 'invalidUrl' }
+  | { kind: 'unpaired' }
+
+export function clientStatusLineOf(view: ClientConnectionView, now: number): ClientStatusLine {
+  switch (view.state) {
+    case 'connected':
+      return view.serverName !== ''
+        ? { kind: 'connectedName', serverName: view.serverName }
+        : { kind: 'connected', serverUrl: view.serverUrl }
+    case 'unreachable':
+    case 'unexpected':
+      if (view.nextRetryAt !== undefined) {
+        const seconds = Math.max(0, Math.ceil((view.nextRetryAt - now) / 1000))
+        return seconds > 0 ? { kind: 'offlineRetry', seconds } : { kind: 'offlineRetrySoon' }
+      }
+      return view.state === 'unexpected' ? { kind: 'unexpected' } : { kind: 'unreachable' }
+    case 'revoked': return { kind: 'revoked' }
+    case 'incompatible': return { kind: 'incompatible' }
+    case 'invalid-url': return { kind: 'invalidUrl' }
+    default: return { kind: 'unpaired' }
   }
 }
 
