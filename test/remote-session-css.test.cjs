@@ -45,3 +45,29 @@ test('T52-fix: native <option> rows with a virtual group value are hidden uncond
   // CONTAINS "zr~" must not be caught.
   assert.ok(!/option\[value\*="zr~"\]/.test(sheet), 'no contains-match on the option value')
 })
+
+test('T51: the export menu-item rule is gated on the session attribute and locked to the FIRST item', () => {
+  // The exact selector, character for character: the html-level remote-
+  // session gate, the utilities-slot anchor, the anchor's sibling menu
+  // surface, its items viewport, and `> :first-child`. The first item is
+  // the export by construction (the feedback entry is appended AFTER it),
+  // so anything wider — `*`, or a rule without the session gate — would
+  // hide entries a remote session must keep, or fire on local sessions.
+  assert.match(
+    sheet,
+    /html\[data-zr-remote-session="1"\] \[data-slot="conversation\.session\.header\.utilities"\] \[class\$="_moreButton"\] ~ \[role="menu"\] > \[role="presentation"\] > :first-child \{\s*display: none !important;/,
+  )
+  // No weaker shape may exist alongside: the child must not be the
+  // universal selector, and the anchor chain must never appear WITHOUT the
+  // html-level gate in front.
+  assert.ok(
+    !sheet.includes('[role="presentation"] > *'),
+    'the export item is pinned to :first-child, not matched by `>` + universal',
+  )
+  assert.ok(
+    !/\[data-slot="conversation\.session\.header\.utilities"\] \[class\$="_moreButton"\]/.test(
+      sheet.replace(/html\[data-zr-remote-session="1"\] \[data-slot="conversation\.session\.header\.utilities"\] \[class\$="_moreButton"\]/g, ''),
+    ),
+    'every use of the utilities-slot anchor chain sits behind the session gate',
+  )
+})

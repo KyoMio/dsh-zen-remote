@@ -67,6 +67,7 @@ function makeParts(name, overrides = {}) {
     ...(overrides.parentOf ? { parentOf: overrides.parentOf } : {}),
     ...(overrides.getApiFetch ? { getApiFetch: overrides.getApiFetch } : {}),
     ...(overrides.uploadCapBytes !== undefined ? { uploadCapBytes: overrides.uploadCapBytes } : {}),
+    ...(overrides.drainDeadlineMs !== undefined ? { drainDeadlineMs: overrides.drainDeadlineMs } : {}),
   })
   return { handler, calls, streamCalls, gateway, store, home }
 }
@@ -1546,6 +1547,167 @@ test('T51-fix upload: the 9th concurrent upload of one device answers 429, a rel
     pending[pending.length - 1](new Response(JSON.stringify({ ok: true, value: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))
     const done = await tenth
     assert.equal(done.status, 200, 'the released slot admits the next upload')
+    assert.equal(inFlight, 7)
+  } finally {
+    for (const req of stalled) { try { req.destroy() } catch { /* gone */ } }
+    await server.stop()
+  }
+})
+
+// ---- T5x: the drain bounds and the upload slot --------------------------------
+
+/**
+ * One endless upload against an UNSHARED session, sent raw (chunked, no
+ * Content-Length — the counting pump's path, like the sub-client's undici).
+ * The not-shared refusal answers only AFTER its drain, so while the drain
+ * runs the client just keeps pushing; the observable is when the connection
+ * DIES. Writes respect backpressure (one chunk per write-callback) so the
+ * acked count tracks what the server actually had a chance to read, plus
+ * whatever sat in kernel buffers. Resolves on the transport death or when
+ * `waitMs` passes with no death.
+ */
+function endlessUpload(server, { waitMs, chunkEveryMs = 0, chunkBytes = 64 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now()
+    const req = http.request({
+      host: '127.0.0.1',
+      port: server.port,
+      method: 'POST',
+      path: '/_dsh/zen-remote/relay/v1/upload?sessionId=session-secret&name=big.bin',
+      headers: { ...AUTH, 'content-type': 'application/octet-stream', 'transfer-encoding': 'chunked' },
+      agent: false,
+    })
+    let acked = 0
+    let settled = false
+    let timer = undefined
+    const finish = (cut) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ cut, acked, elapsed: Date.now() - started })
+    }
+    req.on('error', () => finish(true))
+    req.on('close', () => finish(true))
+    timer = setTimeout(() => finish(false), waitMs)
+    const chunk = Buffer.alloc(chunkBytes, 0x78)
+    const write = () => {
+      if (settled) return
+      req.write(chunk, (error) => {
+        if (settled) return
+        if (error) { finish(true); return }
+        acked += chunkBytes
+        if (chunkEveryMs > 0) setTimeout(write, chunkEveryMs)
+        else write()
+      })
+    }
+    write()
+  })
+}
+
+test('T5x drain: an unshared session\'s endless body is cut within read + 8 MiB, not fed forever', async () => {
+  const api = fakeUploadApiFetch(new Response('{}', { status: 200 }))
+  const parts = makeUploadParts('t5x-drain-bytes', { getApiFetch: () => api.dispatch })
+  // Nothing shared: the not-shared refusal's drain is the bound under test
+  // (fromBytes 0, so the cut lands at read + DRAIN_SLACK_BYTES).
+  const server = await startServer(parts.handler)
+  try {
+    const outcome = await endlessUpload(server, { waitMs: 20_000 })
+    assert.equal(outcome.cut, true, 'the connection was cut while the body kept coming')
+    // The cut must be the BYTE bound: acked ≈ 8 MiB plus whatever sat in
+    // kernel buffers — never an unbounded feed. (A lower floor guards the
+    // flip side: a cut that came too early would make this vacuous.)
+    assert.ok(outcome.acked >= 2 * 1024 * 1024, `data really flowed before the cut (${outcome.acked} bytes)`)
+    assert.ok(
+      outcome.acked <= 12 * 1024 * 1024,
+      `cut within read + 8 MiB (acked ${outcome.acked} bytes)`,
+    )
+    assert.equal(api.seen.length, 0, 'an unshared endless upload never reached the host handler')
+  } finally { await server.stop() }
+})
+
+test('T5x drain: the injected deadline cuts a SLOW endless body before the byte bound could', async () => {
+  const api = fakeUploadApiFetch(new Response('{}', { status: 200 }))
+  const parts = makeUploadParts('t5x-drain-deadline', { getApiFetch: () => api.dispatch, drainDeadlineMs: 400 })
+  const server = await startServer(parts.handler)
+  try {
+    // 64 KiB every 50 ms ≈ 1.3 MiB/s: the 8 MiB byte bound needs ~6 s, the
+    // deadline 400 ms. The cut must be the deadline's.
+    const outcome = await endlessUpload(server, { waitMs: 10_000, chunkEveryMs: 50 })
+    assert.equal(outcome.cut, true, 'the slow endless body was still cut')
+    assert.ok(outcome.elapsed < 3_000, `cut near the injected 400 ms deadline (took ${outcome.elapsed} ms)`)
+    assert.ok(outcome.acked < 1024 * 1024, `cut before the byte bound mattered (acked ${outcome.acked} bytes)`)
+    assert.equal(api.seen.length, 0)
+  } finally { await server.stop() }
+})
+
+test('T5x upload slot: a synthetic-request build failure leaves the device budget untouched', async () => {
+  // The dispatch fake holds every forward open, so slots are countable as
+  // `inFlight` (the budget test's trick). The build failure itself is forced
+  // by replacing the global Request constructor for exactly one request —
+  // the one step between the budget check and the dispatch that can fail
+  // outside the route's finally.
+  const pending = []
+  let inFlight = 0
+  const api = {
+    seen: [],
+    dispatch: (request) => {
+      inFlight += 1
+      return new Promise((resolve, reject) => {
+        const onAbort = () => { inFlight -= 1; reject(new Error('aborted')) }
+        if (request.signal.aborted) return onAbort()
+        request.signal.addEventListener('abort', onAbort, { once: true })
+        pending.push((response) => { inFlight -= 1; resolve(response) })
+      })
+    },
+  }
+  const parts = makeUploadParts('t5x-slot-build-fail', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  const waitFor = async (predicate, ms = 3000) => {
+    const start = Date.now()
+    while (!predicate()) {
+      if (Date.now() - start > ms) throw new Error('waitFor timeout')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  const stalled = []
+  const stallOnce = () => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: server.port, method: 'POST', path: '/_dsh/zen-remote/relay/v1/upload?sessionId=session-1', headers: { ...AUTH, 'content-type': 'application/octet-stream' }, agent: false }, (res) => { res.resume(); resolve(res.statusCode) })
+    req.on('error', () => resolve(0))
+    req.write('x')
+    stalled.push(req)
+  })
+  const emptyUpload = () => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: server.port, method: 'POST', path: '/_dsh/zen-remote/relay/v1/upload?sessionId=session-1', headers: { ...AUTH, 'content-type': 'application/octet-stream', 'content-length': '0' }, agent: false }, (res) => {
+      const chunks = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+    })
+    req.on('error', reject)
+    req.end()
+  })
+  try {
+    for (let i = 0; i < 7; i += 1) void stallOnce()
+    await waitFor(() => inFlight === 7)
+    // The 8th upload fails to BUILD its synthetic request: 502 on the wire.
+    const RealRequest = globalThis.Request
+    globalThis.Request = class { constructor() { throw new TypeError('boom') } }
+    let eighth
+    try {
+      eighth = await emptyUpload()
+    } finally {
+      globalThis.Request = RealRequest
+    }
+    assert.equal(eighth.status, 502)
+    assert.deepEqual(JSON.parse(eighth.body), { ok: false, error: { code: 'internal' } })
+    assert.equal(inFlight, 7, 'the failed build never held a slot')
+    // The slot was not leaked: the NEXT upload is the 8th IN FLIGHT, not a
+    // 429 — with the pre-T5x leak this exact request answers too-many-uploads.
+    const ninth = emptyUpload()
+    await waitFor(() => inFlight === 8)
+    pending[pending.length - 1](new Response(JSON.stringify({ ok: true, value: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const done = await ninth
+    assert.equal(done.status, 200, 'the budget still had room after the failed build')
     assert.equal(inFlight, 7)
   } finally {
     for (const req of stalled) { try { req.destroy() } catch { /* gone */ } }
