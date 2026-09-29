@@ -87,6 +87,14 @@ export interface ClientHandlerOptions {
    * Shapes, counters and failure codes only — never a token. Undefined when
    * this composition never even attempted an install (no typertGateway). */
   getIntercept?: () => InterceptDiagnostics | undefined
+  /** Serve ONLY the remote-status route (T41a-fix2, the host role's mount):
+   * every other route under the prefix answers the same 404 an unknown path
+   * would. The claim / status / reconnect / unshare routes exist for a
+   * CLIENT — a host carries no relay client and no pairing surface, so
+   * answering them (even with their empty conclusions) is exposure without
+   * a user. The remote-status route stays: the T34 client parts poll it on
+   * whatever role this process runs. */
+  remoteStatusOnly?: boolean
 }
 
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -270,6 +278,13 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
     const route = new URL(req.url ?? '/', 'http://dsh.internal').pathname
     const method = req.method ?? 'GET'
     try {
+      // The host mount's least-exposure wall (T41a-fix2): only remote-status
+      // exists here, and it sits BEHIND the admission wall like every other
+      // route. The shape of the refusal matches the unknown-path fallthrough.
+      if (options.remoteStatusOnly === true && route !== CLIENT_REMOTE_STATUS_ROUTE) {
+        responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown client route' } })
+        return
+      }
       if (route === CLIENT_CLAIM_ROUTE) {
         if (method !== 'POST') {
           res.setHeader('Allow', 'POST')

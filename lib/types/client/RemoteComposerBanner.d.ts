@@ -3,8 +3,9 @@
  * `conversation.input.dock` entry, the official full-width row ABOVE the
  * input card (the slot anchor is display:contents, so this renders as one
  * row of the composer column, ahead of the card). When the open session is a
- * remote one and the server is offline, or the server closed this session's
- * remote access, the banner names why.
+ * remote one and the server is offline, the token is revoked, the pairing
+ * is gone, or the server closed this session's remote access (T41a-fix2
+ * added the revoked / unpaired lines), the banner names why.
  *
  * The INPUT itself is disabled through the host's own component capability
  * (T34-fix): `ctx.conversation.blocks.set(sessionId, { reason })` — the
