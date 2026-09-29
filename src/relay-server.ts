@@ -47,8 +47,22 @@ export const RELAY_PREFIX = '/_dsh/zen-remote/relay'
 /** The one protocol version this file speaks; the handshake reports it. */
 const RELAY_PROTOCOL = 1
 
-/** Request body ceiling for the POST routes. */
+/** Request body ceiling for the POST routes other than invoke. */
 const MAX_BODY_BYTES = 1024 * 1024
+
+/**
+ * Body ceiling for the invoke route alone: the prompt routes carry inline
+ * images in their content blocks (`session/prompt` / `subagents/prompt` take
+ * base64 `image` parts; DSH admits one image up to 20 MiB by default —
+ * `maxImageBytes`, dsh-attachment-local — which base64 inflates to ~27 MiB),
+ * so one full-size inline image plus its envelope needs 32 MiB. It is NOT
+ * sized for `fileUploads/upload`: the UI's real file uploads ride the HTTP
+ * route `api/session/uploadFileBinary` (T41b), not this JSON relay. The
+ * buffer only ever grows to the REAL body size; the cap decides
+ * accept/refuse, and a body that outgrows it is drained and answered 413
+ * like any other oversized read.
+ */
+const MAX_INVOKE_BODY_BYTES = 32 * 1024 * 1024
 
 /** Error messages forwarded to the client are clipped to this many chars. */
 const MAX_MESSAGE_CHARS = 500
@@ -247,50 +261,96 @@ function secretsMatch(provided: string | undefined, secret: string): boolean {
 }
 
 /**
- * Read one JSON object body under the byte cap. An EMPTY body parses as the
+ * Read one JSON object body under the byte cap. The EMPTY body parses as the
  * empty object (the handshake takes no arguments; invoke then fails its own
- * field checks). Anything else — unparsable, a JSON array or scalar — comes
- * back undefined and becomes a 400. An oversized body is DRAINED, not
- * aborted mid-read: destroying the socket before the response goes out would
- * leave the desktop client with a connection error instead of the status
- * code explaining the refusal.
+ * field checks). Three outcomes, kept apart: a parsed object (`ok`),
+ * unparsable or non-object JSON (`invalid` → the routes answer 400), and a
+ * body past the cap (`too-large` → the routes answer 413). An oversized body
+ * is DRAINED, not aborted mid-read: destroying the socket before the
+ * response goes out would leave the desktop client with a connection error
+ * instead of the status code explaining the refusal. A `Content-Length`
+ * that already names more than the cap skips the buffering entirely — the
+ * drain still runs to the body's end before the verdict resolves.
  */
-async function readJsonObject(req: IncomingMessage): Promise<Record<string, unknown> | undefined> {
+type JsonBody =
+  | { kind: 'ok'; body: Record<string, unknown> }
+  | { kind: 'invalid' }
+  | { kind: 'too-large' }
+
+const PAYLOAD_TOO_LARGE = Object.freeze({ ok: false, error: { code: 'payload-too-large', details: {} } })
+
+/**
+ * One readJsonObject plus the two failure answers every POST route shares:
+ * an oversized body is 413 `payload-too-large`, unparsable JSON is 400
+ * `bad-request` — the two are distinct answers, not one "bad body" pile.
+ * `undefined` means the response is already written and the caller returns.
+ */
+async function readBodyOrRespond(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cap = MAX_BODY_BYTES,
+): Promise<Record<string, unknown> | undefined> {
+  const read = await readJsonObject(req, cap)
+  if (read.kind === 'too-large') {
+    responseJson(res, 413, PAYLOAD_TOO_LARGE)
+    return undefined
+  }
+  if (read.kind === 'invalid') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+    return undefined
+  }
+  return read.body
+}
+
+async function readJsonObject(req: IncomingMessage, cap = MAX_BODY_BYTES): Promise<JsonBody> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = []
+    // `Number(undefined)` is NaN, and `NaN > cap` is false: a chunked body
+    // (no length header) simply falls through to the byte counting below.
+    let tooLarge = Number(req.headers['content-length']) > cap
     let size = 0
     let done = false
-    const finish = (value: Record<string, unknown> | undefined): void => {
+    const finish = (value: JsonBody): void => {
       if (!done) {
         done = true
         resolve(value)
       }
     }
     req.on('data', (chunk: Buffer) => {
-      if (done) return
+      if (done || tooLarge) return
       size += chunk.length
-      if (size <= MAX_BODY_BYTES) chunks.push(chunk)
+      if (size > cap) {
+        tooLarge = true
+        chunks.length = 0
+        return
+      }
+      chunks.push(chunk)
       // Past the cap: keep consuming without buffering.
     })
     req.on('end', () => {
-      if (done || size > MAX_BODY_BYTES) {
-        finish(undefined)
+      if (done) return
+      if (tooLarge) {
+        finish({ kind: 'too-large' })
         return
       }
       if (size === 0) {
-        finish({})
+        finish({ kind: 'ok', body: {} })
         return
       }
       let parsed: unknown
       try {
         parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
       } catch {
-        finish(undefined)
+        finish({ kind: 'invalid' })
         return
       }
-      finish(parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined)
+      finish(
+        parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? { kind: 'ok', body: parsed as Record<string, unknown> }
+          : { kind: 'invalid' },
+      )
     })
-    req.on('error', () => finish(undefined))
+    req.on('error', () => finish({ kind: 'invalid' }))
   })
 }
 
@@ -410,6 +470,31 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     }
   }
 
+  /**
+   * Whether `workspaceId` names a workspace the server currently has, answered
+   * from a one-shot `workspace/follow` baseline (T31 — the only workspace read
+   * the gateway exposes; the stream is abandoned after its first frame). Any
+   * failure — transport, unexpected first frame, missing entry — is `false`:
+   * no answer is not permission. The create route pins the call to the
+   * workspace rather than to a path on purpose: with `workspaceId` attached,
+   * DSH takes `workspace.path` as the session cwd itself and attaches the new
+   * session to the workspace (the group the client created it from).
+   */
+  const workspaceExists = async (workspaceId: string, signal: AbortSignal): Promise<boolean> => {
+    try {
+      const iterable = await gateway.stream({ namespace: 'workspace', method: 'follow', args: {}, signal })
+      for await (const frame of iterable) {
+        if (!isPlainObject(frame) || frame.type !== 'baseline') return false
+        const value = isPlainObject(frame.value) ? frame.value : undefined
+        const items = value !== undefined && Array.isArray(value.items) ? value.items : []
+        return items.some((item) => isPlainObject(item) && item.workspaceId === workspaceId)
+      }
+      return false
+    } catch {
+      return false
+    }
+  }
+
   const handle: RelayHandler = async function handleRelay(req, res) {
     if (
       !secretsMatch(headerValue(req, 'x-zen-remote-secret'), secret) ||
@@ -439,11 +524,8 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     }
 
     if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/handshake`) {
-      const body = await readJsonObject(req)
-      if (body === undefined) {
-        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
-        return
-      }
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
       // The compute rides its own guard (T42-fix): a throwing fingerprint
       // source answers an empty map and the handshake still succeeds.
       let fingerprints: Record<string, string> = {}
@@ -466,8 +548,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     }
 
     if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/unshare`) {
-      const body = await readJsonObject(req)
-      const sessionId = body?.sessionId
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const sessionId = body.sessionId
       if (typeof sessionId !== 'string' || sessionId === '') {
         responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
         return
@@ -485,10 +568,13 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     }
 
     if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/invoke`) {
-      const body = await readJsonObject(req)
-      const namespace = body?.namespace
-      const method = body?.method
-      const args = body?.args
+      // The prompt-sized cap: a registered invoke may carry inline images in
+      // its content blocks (see MAX_INVOKE_BODY_BYTES).
+      const body = await readBodyOrRespond(req, res, MAX_INVOKE_BODY_BYTES)
+      if (body === undefined) return
+      const namespace = body.namespace
+      const method = body.method
+      const args = body.args
       if (
         typeof namespace !== 'string' ||
         namespace === '' ||
@@ -541,7 +627,40 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             return
           }
         }
+        // T31-fix: the forwarded create is REBUILT as a whitelist, not
+        // trimmed by deletion — exactly `{workspaceId, agentPreset?}` and
+        // nothing else, so a hostile or buggy client cannot smuggle extra
+        // fields (env, permissionMode, a caller-chosen sessionId, a decoy
+        // cwd) through to DSH. The workspace was probed above; the new
+        // session's id and cwd are DSH's own business (it mints the id and
+        // takes `workspace.path`; a create naming BOTH workspaceId and cwd
+        // would be a `gateway/bad-request`).
+        if (namespace === 'session' && method === 'create') {
+          const request = isPlainObject(args) ? args.request : undefined
+          const workspaceId =
+            isPlainObject(request) && typeof request.workspaceId === 'string' && request.workspaceId !== ''
+              ? request.workspaceId
+              : undefined
+          if (workspaceId === undefined || !(await workspaceExists(workspaceId, hangUp.signal))) {
+            responseJson(res, 403, { ok: false, error: { code: 'workspace/not-found' } })
+            return
+          }
+          ;(args as Record<string, unknown>).request = {
+            workspaceId,
+            ...(isPlainObject(request) && typeof request.agentPreset === 'string'
+              ? { agentPreset: request.agentPreset }
+              : {}),
+          }
+        }
         const value = await gateway.invoke({ namespace, method, args, signal: hangUp.signal })
+        // T31: a session created or forked THROUGH the relay is shared
+        // automatically — the client only ever sees shared sessions, so an
+        // unshared result would be born unreachable. Re-sharing (a fork the
+        // new-session listener already caught) is a table no-op.
+        if (namespace === 'session' && (method === 'create' || method === 'fork')) {
+          const created = isPlainObject(value) && typeof value.sessionId === 'string' ? value.sessionId : undefined
+          if (created !== undefined) store.share(created)
+        }
         const travels = decision.filter === 'session-list' ? filterSessionListResult(value, isAccessible) : value
         responseJson(res, 200, { ok: true, value: travels })
       } catch (error) {
@@ -559,10 +678,11 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/stream`) {
       // Body validation identical to invoke: one JSON object naming the
       // method and carrying object args.
-      const body = await readJsonObject(req)
-      const namespace = body?.namespace
-      const method = body?.method
-      const args = body?.args
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const namespace = body.namespace
+      const method = body.method
+      const args = body.args
       if (
         typeof namespace !== 'string' ||
         namespace === '' ||

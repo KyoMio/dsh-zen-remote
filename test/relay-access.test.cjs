@@ -31,12 +31,7 @@ test('decideInvoke: the three reviewer bypass requests are forbidden-method, dec
   assert.deepEqual(
     decideInvoke('goals', 'create', { agentId: 'VICTIM', request: { objective: 'x', maxGoalRounds: 3, sessionId: 'S-shared' } }, only(['S-shared'])),
     { allow: false, reason: 'forbidden-method' },
-    'goals/create is located by a top-level agentId — not registered until P4 verifies ownership',
-  )
-  assert.deepEqual(
-    decideInvoke('subagents', 'prompt', { request: { parentSessionId: 'VICTIM', childSessionId: 'C', sessionId: 'S-shared' } }, only(['S-shared'])),
-    { allow: false, reason: 'forbidden-method' },
-    'subagents/* waits for T31 to verify the parent-child ownership check',
+    'goals/create is located by a top-level agentId — still unregistered (no ownership story)',
   )
 })
 
@@ -46,8 +41,11 @@ test('decideInvoke: any unregistered method refuses, with or without a request o
     ['terminal', 'create', { agentId: 'a', request: { shellPath: '/bin/zsh' } }],
     ['account', 'getProfile', { client: {} }],
     ['pluginManager', 'listPlugins', {}],
-    ['session', 'fork', { request: { sessionId: 'S-shared', atSeq: 1 } }],
     ['schedule', 'delete', { request: { id: 's1', sessionId: 'S-shared' } }],
+    // T31 registered the six calls with a verified ownership story — the
+    // other agentId-located calls (goals, workspaceFiles) stay closed.
+    ['goals', 'create', { agentId: 'VICTIM', request: {} }],
+    ['workspaceFiles', 'list', { agentId: 'VICTIM', request: { path: '.' } }],
     ['anything', 'atAll', 'garbage'],
     ['nope', 'x', undefined],
   ]) {
@@ -146,6 +144,14 @@ test('decideStream: non-stream and unregistered methods are forbidden-method', (
     ['session', 'page', { request: { address: { kind: 'session', sessionId: 'S-a' } } }],
     ['job', 'kill', { request: { sessionId: 'S-a', jobId: 'j1' } }],
     ['session', 'projections', { request: { sessionId: 'S-a' } }],
+    // The T31 entries are all invoke-delivered (their results travel as one
+    // envelope; none of them streams).
+    ['session', 'create', { request: { workspaceId: 'w' } }],
+    ['session', 'fork', { request: { sessionId: 'S-a' } }],
+    ['subagents', 'prompt', { request: { parentSessionId: 'S-a', childSessionId: 'C' } }],
+    ['subagents', 'interruptByParent', { parentSessionId: 'S-a', childSessionId: 'C', mode: 'continuable' }],
+    ['fileUploads', 'upload', { agentId: 'S-a', request: { data: 'x' } }],
+    ['fileReferences', 'list', { agentId: 'S-a', query: 'q' }],
     ['settings', 'update', {}],
     ['anything', 'atAll', 'garbage'],
   ]) {
@@ -261,4 +267,84 @@ test('decideInvoke: unknown address kinds and missing address ids are no-session
     )
   }
   assert.deepEqual(decideInvoke('session', 'page', { request: {} }, yes), { allow: false, reason: 'no-session' })
+})
+
+// -- T31: session/create, session/fork ------------------------------------------------
+
+test('decideInvoke: session/create is gated on a PRESENT workspaceId, never share-checked', () => {
+  // The workspace id is not a share-table id: presence is the table's whole
+  // demand — the route validates existence and auto-shares the result.
+  assert.deepEqual(decideInvoke('session', 'create', { request: { workspaceId: 'W-not-shared' } }, no), { allow: true })
+  assert.deepEqual(
+    decideInvoke('session', 'create', { request: { workspaceId: 'W', cwd: '/x', sessionId: 'S' } }, no),
+    { allow: true },
+    'cwd/sessionId ride along; the route deletes them',
+  )
+  for (const args of [{ request: {} }, { request: { workspaceId: '' } }, { request: { workspaceId: 7 } }, {}]) {
+    assert.deepEqual(
+      decideInvoke('session', 'create', args, yes),
+      { allow: false, reason: 'no-session' },
+      JSON.stringify(args) + ' names no workspace',
+    )
+  }
+})
+
+test('decideInvoke: session/fork judges by the SOURCE session id', () => {
+  const args = { request: { sessionId: 'S-src', atSeq: 4 } }
+  assert.deepEqual(decideInvoke('session', 'fork', args, only(['S-src'])), { allow: true })
+  assert.deepEqual(decideInvoke('session', 'fork', args, only([])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideInvoke('session', 'fork', { request: { atSeq: 1 } }, yes), { allow: false, reason: 'no-session' })
+})
+
+// -- T31: subagents — judged by the parent --------------------------------------------
+
+test('decideInvoke: subagents/prompt judges by request.parentSessionId, child id is dead weight', () => {
+  const args = { request: { requestId: 'r', parentSessionId: 'S-parent', childSessionId: 'S-child', mode: 'continuable', delivery: 'queue', content: [] } }
+  assert.deepEqual(decideInvoke('subagents', 'prompt', args, only(['S-parent'])), { allow: true })
+  assert.deepEqual(decideInvoke('subagents', 'prompt', args, only([])), { allow: false, reason: 'not-shared' })
+  // A shared CHILD cannot smuggle an unshared parent through: only the
+  // registered field is read.
+  assert.deepEqual(
+    decideInvoke('subagents', 'prompt', { request: { parentSessionId: 'VICTIM', childSessionId: 'S-shared' } }, only(['S-shared'])),
+    { allow: false, reason: 'not-shared' },
+  )
+  assert.deepEqual(decideInvoke('subagents', 'prompt', { request: { childSessionId: 'C' } }, yes), { allow: false, reason: 'no-session' })
+})
+
+test('decideInvoke: subagents/interruptByParent reads the TOP-LEVEL parentSessionId', () => {
+  // Top-level arguments — no request envelope at all.
+  const args = { childSessionId: 'S-child', parentSessionId: 'S-parent', mode: 'continuable' }
+  assert.deepEqual(decideInvoke('subagents', 'interruptByParent', args, only(['S-parent'])), { allow: true })
+  assert.deepEqual(decideInvoke('subagents', 'interruptByParent', args, only([])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(
+    decideInvoke('subagents', 'interruptByParent', { childSessionId: 'C', mode: 'continuable' }, yes),
+    { allow: false, reason: 'no-session' },
+  )
+})
+
+// -- T31: agentId-located calls — attachments and @ references -------------------------
+
+test('decideInvoke: fileUploads/upload and fileReferences/list are gated on the top-level agentId', () => {
+  const upload = { agentId: 'S-a', request: { data: 'Zm9v', name: 'x.png' } }
+  const refs = { agentId: 'S-a', query: 'src' }
+  assert.deepEqual(decideInvoke('fileUploads', 'upload', upload, only(['S-a'])), { allow: true })
+  assert.deepEqual(decideInvoke('fileReferences', 'list', refs, only(['S-a'])), { allow: true })
+  assert.deepEqual(decideInvoke('fileUploads', 'upload', upload, only([])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideInvoke('fileReferences', 'list', refs, only([])), { allow: false, reason: 'not-shared' })
+  // The reviewer's decoy, replayed on the registered method: a SHARED id
+  // padded into request.sessionId buys nothing while the registered field
+  // points at an unshared session.
+  const decoy = { agentId: 'VICTIM', request: { data: 'Zm9v', sessionId: 'S-shared' } }
+  assert.deepEqual(decideInvoke('fileUploads', 'upload', decoy, only(['S-shared'])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideInvoke('fileReferences', 'list', { agentId: 'VICTIM', query: 'q', request: { sessionId: 'S-shared' } }, only(['S-shared'])), {
+    allow: false,
+    reason: 'not-shared',
+  })
+  for (const args of [{ request: { data: 'x' } }, { agentId: '' }, { agentId: 9 }]) {
+    assert.deepEqual(
+      decideInvoke('fileUploads', 'upload', args, yes),
+      { allow: false, reason: 'no-session' },
+      JSON.stringify(args) + ' claims no agent',
+    )
+  }
 })

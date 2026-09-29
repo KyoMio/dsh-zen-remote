@@ -58,8 +58,17 @@ import { createControlMerger, createWorkspaceMerger, mergeSessionList } from './
 import type { ControlMerger, MergerIdentity, WorkspaceMerger } from './merge-streams.js'
 
 /** The session-locating argument fields, as registered per method. Identical
- * in name and meaning to relay-access.ts's `SessionField`. */
-export type SessionField = 'request.sessionId' | 'request.address'
+ * in name and meaning to relay-access.ts's `SessionField`; a field named
+ * without a dot is TOP-LEVEL. `request.workspaceId` locates a remote create
+ * by its target workspace (never a share-table id on the server — the route
+ * probes the workspace and auto-shares the result). */
+export type SessionField =
+  | 'request.sessionId'
+  | 'request.address'
+  | 'request.parentSessionId'
+  | 'request.workspaceId'
+  | 'parentSessionId'
+  | 'agentId'
 
 /**
  * The client-side half of the server's `RELAY_METHODS` registry: which
@@ -86,6 +95,22 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'session/selectModel': ['request.sessionId'],
   'session/updateQueue': ['request.sessionId'],
   'session/attachment': ['request.sessionId'],
+  // session/* — creation and forking (T31): a create is spotted by its VIRTUAL
+  // workspace id and forwarded with that id restored; the client never lets a
+  // remote create name its own session id (deleted before forwarding), and
+  // create/fork results get the new session id virtualized (rewriteResult).
+  'session/create': ['request.workspaceId'],
+  'session/fork': ['request.sessionId'],
+  // subagents (T31) — the parent locates the call; the child id arrives from
+  // server frames in ORIGINAL form and passes through untouched (DSH itself
+  // validates that the child belongs to the parent).
+  'subagents/prompt': ['request.parentSessionId'],
+  'subagents/interruptByParent': ['parentSessionId'],
+  // attachments and @ references (T31) — the top-level agentId IS the session
+  // id (the gateway's agent lookup resolves it through the session-keyed
+  // agent registry).
+  'fileUploads/upload': ['agentId'],
+  'fileReferences/list': ['agentId'],
   // session/* — the global control stream and the unscoped list: merged with
   // the relay's filtered answer by the T23b-2 routes below (never refused on
   // arguments — a stray id in them is unowned data).
@@ -280,7 +305,10 @@ function argsOf(payload: unknown): unknown {
  *
  * `request.address` contributes one slot by kind: `session` → `sessionId`,
  * `subagent` → `parentSessionId` (the child id is already the server's
- * original and passes through untouched). Unknown kinds own no slot.
+ * original and passes through untouched). Unknown kinds own no slot. The
+ * top-level fields (`agentId`, `parentSessionId`) live on the argument
+ * object itself; `request.workspaceId` / `request.parentSessionId` on the
+ * request object.
  */
 function forEachRegisteredSlot(
   fields: readonly SessionField[],
@@ -288,11 +316,23 @@ function forEachRegisteredSlot(
   visit: (container: Record<string, unknown>, key: string) => void,
 ): void {
   if (!isPlainObject(args)) return
-  const request = args.request
-  if (!isPlainObject(request)) return
   for (const field of fields) {
+    if (field === 'agentId' || field === 'parentSessionId') {
+      visit(args, field)
+      continue
+    }
+    const request = args.request
+    if (!isPlainObject(request)) continue
     if (field === 'request.sessionId') {
       visit(request, 'sessionId')
+      continue
+    }
+    if (field === 'request.parentSessionId') {
+      visit(request, 'parentSessionId')
+      continue
+    }
+    if (field === 'request.workspaceId') {
+      visit(request, 'workspaceId')
       continue
     }
     const address = request.address
@@ -379,9 +419,16 @@ function restoreRegisteredFields(fields: readonly SessionField[], args: unknown)
  * - `messageFeedback/list|put|delete` succeed with no ids at all; only
  *   their `{ok:false, error:{code:'session-not-found', sessionId}}` variant
  *   carries one.
+ * - `session/create` (T31) answers `{sessionId, agentPreset?}` and
+ *   `session/fork` answers `{sessionId}` — both carry the NEW session's id,
+ *   minted server-side, and both get it virtualized (the sessions were
+ *   auto-shared by the relay, so the id is immediately usable).
  * - everything else in the table (`session/page`, `session/projections`,
  *   `session/prompt|cancel|rename|selectModel|updateQueue|attachment`,
- *   `job/kill`, `skills/list`, `schedule/list`) has NO
+ *   `job/kill`, `skills/list`, `schedule/list`, `subagents/prompt`
+ *   (`{messageId}`), `subagents/interruptByParent` (`{accepted}`),
+ *   `fileUploads/upload` (receipt + attachment ids, not session ids),
+ *   `fileReferences/list` (`{path,kind}` rows)) has NO
  *   session id in its result — verified, and passed through untouched.
  */
 function mapStrings(value: unknown, map: (id: string) => string): unknown {
@@ -420,6 +467,12 @@ export function rewriteFrame(endpoint: string, frame: unknown, serverId: string)
 /** Rewrite one invoke result's session ids to virtual form. */
 export function rewriteResult(endpoint: string, value: unknown, serverId: string): unknown {
   const virtualize = (id: string): string => toVirtual(serverId, id)
+  if (endpoint === 'session/create' || endpoint === 'session/fork') {
+    // The one session id the result carries is the NEW session's, minted
+    // server-side (create: `{sessionId, agentPreset?}`, fork: `{sessionId}`).
+    if (!isPlainObject(value) || typeof value.sessionId !== 'string') return value
+    return { ...value, sessionId: virtualize(value.sessionId) }
+  }
   if (endpoint === 'messageFeedback/list' || endpoint === 'messageFeedback/put' || endpoint === 'messageFeedback/delete') {
     if (!isPlainObject(value) || value.ok !== false || !isPlainObject(value.error)) return value
     const error = value.error
@@ -839,6 +892,14 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     try {
       const clone = structuredClone(args)
       restoreRegisteredFields(CLIENT_METHOD_FIELDS[endpoint], clone)
+      // A remote create never names its own session id: DSH mints one, and
+      // adopting a caller-chosen id (create's idempotent-adopt path) could
+      // resurrect or hijack a server-side session. The relay deletes the
+      // field too — this is the client-side half of the same rule.
+      if (endpoint === 'session/create') {
+        const request = isPlainObject(clone) ? clone.request : undefined
+        if (isPlainObject(request)) delete request.sessionId
+      }
       const value = await relay.invoke(namespace, method, clone, signal)
       return { ok: true, value: rewriteResult(endpoint, value, serverId) }
     } catch (error) {
