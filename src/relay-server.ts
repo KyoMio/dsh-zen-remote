@@ -85,6 +85,15 @@ const DSH_ERROR_CODE = /^[a-z][a-zA-Z-]*\/[a-zA-Z-]+$/
 /** Concurrent streams one device may hold open (per `x-zen-remote-device`). */
 const MAX_STREAMS_PER_DEVICE = 32
 
+/**
+ * Concurrent invokes one device may keep in flight (CP4): a runaway or
+ * hostile client must not pin unbounded host work behind this route the way
+ * it must not hold unbounded streams. Modeled on the stream budget below —
+ * past the cap the request answers 429 `too-many-invokes` and the counter is
+ * untouched.
+ */
+const MAX_INVOKES_PER_DEVICE = 8
+
 /** Most recent forwarded waterfall events remembered per `$zr/events`
  * subscription (T32-fix): the registry is only an ownership record, so this
  * bounds a pathological burst the same way the job cache does — past the
@@ -467,6 +476,10 @@ function errorOf(error: unknown): { code: string; message?: string } {
       ? (error as { code: string }).code
       : ''
   if (!DSH_ERROR_CODE.test(code)) return { code: 'internal' }
+  // CP4: a DSH `*/internal` code (`gateway/internal`, …) is the server saying
+  // "my own failure" — its message quotes server-side facts just like a Node
+  // error would, so only the code travels.
+  if (code.endsWith('/internal')) return { code }
   const text = error instanceof Error ? error.message : String(error)
   return { code, message: text.slice(0, MAX_MESSAGE_CHARS) }
 }
@@ -531,6 +544,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
 
   /** Open streams per device id, for the per-device budget. */
   const streamsByDevice = new Map<string, number>()
+
+  /** Invokes currently in flight per device id, for the invoke budget. */
+  const invokesByDevice = new Map<string, number>()
 
   /** The `$zr/events` subscriptions currently open — the event-result
    * route searches these for every incoming eventId. A closed
@@ -927,6 +943,16 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         responseJson(res, 403, { ok: false, error: { code: decision.reason } })
         return
       }
+      // CP4: per-device in-flight budget — the invoke twin of the stream
+      // budget below. Counted only from here (every earlier refusal is
+      // answered before this line) and released in the route's finally,
+      // which every path through the try reaches.
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      if ((invokesByDevice.get(device) ?? 0) >= MAX_INVOKES_PER_DEVICE) {
+        responseJson(res, 429, { ok: false, error: { code: 'too-many-invokes' } })
+        return
+      }
+      invokesByDevice.set(device, (invokesByDevice.get(device) ?? 0) + 1)
       // A client hanging up must not leave the host running the call to
       // completion behind a dead socket: the connection's close (arriving
       // before the response ends) cancels the AbortController whose signal
@@ -1032,6 +1058,11 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         responseJson(res, 200, message === undefined ? { ok: false, error: { code } } : { ok: false, error: { code, message } })
       } finally {
         res.off('close', onClientGone)
+        // The invoke is over — answered, refused mid-flight, or its client
+        // gone: the budget slot goes back.
+        const remaining = (invokesByDevice.get(device) ?? 1) - 1
+        if (remaining <= 0) invokesByDevice.delete(device)
+        else invokesByDevice.set(device, remaining)
       }
       return
     }

@@ -382,6 +382,61 @@ test('invoke: a Node system error (ENOENT) reports internal with NO path-leaking
   } finally { await server.stop() }
 })
 
+test('invoke: a */internal DSH code keeps its code but drops the message (CP4)', async () => {
+  // `gateway/internal` is the server calling its own failure by name — the
+  // message that rides it quotes server-side facts, so only the code travels.
+  const err = Object.assign(new Error('host internals: /Users/x/.dsh broke'), { code: 'gateway/internal' })
+  const parts = makeParts('invoke-gw-internal', { throw: err })
+  parts.store.share('session-a')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'page', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } }, AUTH))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.deepEqual(body, { ok: false, error: { code: 'gateway/internal' } }, 'the code stays, the message goes')
+    assert.equal(JSON.stringify(body).includes('/Users/x'), false)
+  } finally { await server.stop() }
+})
+
+// ---- invoke: the per-device budget (CP4) ------------------------------------------
+
+test('invoke: more than 8 in-flight invokes on one device get 429 too-many-invokes, and the budget frees up after', async () => {
+  let release = () => {}
+  const drained = new Promise((resolve) => { release = resolve })
+  const parts = makeParts('invoke-budget')
+  parts.store.share('session-a')
+  // Park every forwarded call at the gateway until the test says go.
+  parts.gateway.invoke = async (call) => {
+    parts.calls.push(call)
+    await drained
+    return { echo: call.method }
+  }
+  const server = await startServer(parts.handler)
+  try {
+    const args = { request: { address: { kind: 'session', sessionId: 'session-a' } } }
+    const inFlight = []
+    for (let i = 0; i < 8; i++) {
+      inFlight.push(server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'page', args }, AUTH)))
+    }
+    await new Promise((r) => setTimeout(r, 80))
+    assert.equal(parts.calls.length, 8, 'the first eight sit at the gateway')
+
+    const ninth = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'page', args }, AUTH))
+    assert.equal(ninth.status, 429, 'the ninth concurrent invoke is over the device budget')
+    assert.deepEqual(await ninth.json(), { ok: false, error: { code: 'too-many-invokes' } })
+    assert.equal(parts.calls.length, 8, 'the refused one never reached the gateway')
+
+    release()
+    for (const res of await Promise.all(inFlight)) assert.equal(res.status, 200)
+    await new Promise((r) => setTimeout(r, 30))
+    const again = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'page', args }, AUTH))
+    assert.equal(again.status, 200, 'after the drain the budget is free again')
+  } finally {
+    release()
+    await server.stop()
+  }
+})
+
 // ---- job ownership (4b) -----------------------------------------------------------
 
 test('invoke: job/kill forwards when the job belongs to the claimed session', async () => {
