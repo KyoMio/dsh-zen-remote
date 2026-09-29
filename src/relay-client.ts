@@ -662,23 +662,31 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * envelope — 2xx plus `ok:true` — and then lifts a stale `offline` back
    * to `online`, because a success proves the link. EVERY other outcome
    * throws the mapped RelayError; transport failures (fetch rejection,
-   * mid-body cut, timeout) set `offline` first — EXCEPT a timeout on a
-   * route that opted out (`timeoutSetsOffline: false`, the invoke and
-   * upload routes): a slow call — a 28 MiB inline-image prompt or a
-   * 100 MiB attachment crawling up a slow link — is not a dead LINK, so it
-   * fails the call and leaves the connection state exactly where it was.
-   * Only the handshake / stream-header legs and real network-layer
-   * failures judge the link.
+   * mid-body cut, timeout) set `offline` first — EXCEPT on a route that
+   * opted out (`timeoutSetsOffline: false`, the invoke and upload routes):
+   * a slow call — a 28 MiB inline-image prompt or a 100 MiB attachment
+   * crawling up a slow link — and, since T51-fix, an upload CUT MID-STREAM
+   * (a reset under a huge body is the size gate and the drain doing their
+   * job, not a dead link) both fail THIS call and leave the connection
+   * state exactly where it was; the diagnostics still record the failure
+   * code. Only the handshake / stream-header legs and real network-layer
+   * failures on the opted-in routes judge the link.
    */
   async function exchangeRequest(
     url: string,
     init: RequestInit,
     signal: AbortSignal | undefined,
     applySuccessState: boolean,
-    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean } = {},
+    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean; transportSetsOffline?: boolean } = {},
   ): Promise<Record<string, unknown>> {
     const timeoutMs = opts.timeoutMs ?? requestTimeoutMs
     const timeoutSetsOffline = opts.timeoutSetsOffline ?? true
+    // The transport-failure opt-out (T51-fix) is SEPARATE from the timeout
+    // one: the invoke route opts out of the timeout judging the link but
+    // keeps real transport deaths offline (the T43 reconnect ladder hangs
+    // off them); the upload route opts out of BOTH — a reset under a huge
+    // body is the size gate doing its job, not a dead link.
+    const transportSetsOffline = opts.transportSetsOffline ?? true
     const controller = new AbortController()
     const onExternalAbort = (): void => {
       controller.abort()
@@ -704,7 +712,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           throw new RelayError('request-timeout', `no response within ${timeoutMs} ms`)
         }
         noteFailure('offline')
-        setState('offline')
+        if (transportSetsOffline) setState('offline')
         throw new RelayError('offline', timedOut ? `no response within ${timeoutMs} ms` : messageOf(error))
       }
       let payload: unknown
@@ -713,7 +721,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       } catch (error) {
         if (signal?.aborted) throw abortedError()
         noteFailure('offline')
-        setState('offline')
+        if (transportSetsOffline) setState('offline')
         throw new RelayError('offline', messageOf(error))
       }
       if (response.status >= 200 && response.status < 300 && isRecord(payload) && payload.ok === true) {
@@ -944,7 +952,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       uploadInit(creds.token, body),
       signal,
       true,
-      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, options.bytes), timeoutSetsOffline: false },
+      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, options.bytes), timeoutSetsOffline: false, transportSetsOffline: false },
     )
     const value = payload.value
     if (

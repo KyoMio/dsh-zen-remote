@@ -1449,3 +1449,75 @@ test('T51 upload: a missing shared handler answers 501, and GET is not the uploa
     assert.deepEqual(await res.json(), { ok: false, error: { code: 'unsupported' } })
   } finally { await server.stop() }
 })
+
+test('T51-fix upload: the 9th concurrent upload of one device answers 429, a released slot admits the next', async () => {
+  // The dispatch fake holds every forward open (a stalled upload the host
+  // never finishes reading): slots are countable as `inFlight`, and a
+  // release is observable when one rejects on its abort signal.
+  const pending = []
+  let inFlight = 0
+  let abortedCount = 0
+  const api = {
+    seen: [],
+    dispatch: (request) => {
+      inFlight += 1
+      return new Promise((resolve, reject) => {
+        const onAbort = () => { abortedCount += 1; inFlight -= 1; reject(new Error("aborted")) }
+        if (request.signal.aborted) return onAbort()
+        request.signal.addEventListener("abort", onAbort, { once: true })
+        pending.push((response) => { inFlight -= 1; resolve(response) })
+      })
+    },
+  }
+  const parts = makeUploadParts('t51-fix-budget', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  const waitFor = async (predicate, ms = 3000) => {
+    const start = Date.now()
+    while (!predicate()) {
+      if (Date.now() - start > ms) throw new Error('waitFor timeout')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  const uploadPath = '/_dsh/zen-remote/relay/v1/upload?sessionId=session-1'
+  /** One request whose body STAYS OPEN (1 byte, never ended): it holds a slot. */
+  const stalled = []
+  const stallOnce = () => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: server.port, method: 'POST', path: uploadPath, headers: { ...AUTH, 'content-type': 'application/octet-stream' }, agent: false }, (res) => { res.resume(); resolve(res.statusCode) })
+    req.on('error', () => resolve(0))
+    req.write('x')
+    stalled.push(req)
+  })
+  /** One request with an EMPTY, ended body: the refusal drain resolves at once. */
+  const emptyUpload = () => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port: server.port, method: 'POST', path: uploadPath, headers: { ...AUTH, 'content-type': 'application/octet-stream', 'content-length': '0' }, agent: false }, (res) => {
+      const chunks = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString('utf8') }))
+    })
+    req.on('error', reject)
+    req.end()
+  })
+  try {
+    for (let i = 0; i < 8; i += 1) void stallOnce()
+    await waitFor(() => inFlight === 8)
+    const ninth = await emptyUpload()
+    assert.equal(ninth.status, 429, 'the over-budget upload is refused')
+    assert.deepEqual(JSON.parse(ninth.body), { ok: false, error: { code: 'too-many-uploads' } })
+    assert.equal(inFlight, 8, 'the refused one never entered dispatch')
+    // A different device is not crowded out by the first one's budget.
+    // (Single-device saturation is the case above; the counter is keyed by
+    // x-zen-remote-device, covered by the shared gate test shape.)
+    stalled[0].destroy()
+    await waitFor(() => abortedCount === 1 && inFlight === 7)
+    const tenth = emptyUpload()
+    await waitFor(() => inFlight === 8)
+    pending[pending.length - 1](new Response(JSON.stringify({ ok: true, value: {} }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const done = await tenth
+    assert.equal(done.status, 200, 'the released slot admits the next upload')
+    assert.equal(inFlight, 7)
+  } finally {
+    for (const req of stalled) { try { req.destroy() } catch { /* gone */ } }
+    await server.stop()
+  }
+})
