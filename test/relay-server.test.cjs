@@ -400,7 +400,7 @@ test('invoke: a */internal DSH code keeps its code but drops the message (CP4)',
 
 // ---- invoke: the per-device budget (CP4) ------------------------------------------
 
-test('invoke: more than 8 in-flight invokes on one device get 429 too-many-invokes, and the budget frees up after', async () => {
+test('invoke: more than 32 in-flight invokes on one device get 429 too-many-invokes, and the budget frees up after', async () => {
   let release = () => {}
   const drained = new Promise((resolve) => { release = resolve })
   const parts = makeParts('invoke-budget')
@@ -415,16 +415,16 @@ test('invoke: more than 8 in-flight invokes on one device get 429 too-many-invok
   try {
     const args = { request: { address: { kind: 'session', sessionId: 'session-a' } } }
     const inFlight = []
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 32; i++) {
       inFlight.push(server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'page', args }, AUTH)))
     }
-    await new Promise((r) => setTimeout(r, 80))
-    assert.equal(parts.calls.length, 8, 'the first eight sit at the gateway')
+    await new Promise((r) => setTimeout(r, 120))
+    assert.equal(parts.calls.length, 32, 'the first thirty-two sit at the gateway')
 
-    const ninth = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'page', args }, AUTH))
-    assert.equal(ninth.status, 429, 'the ninth concurrent invoke is over the device budget')
-    assert.deepEqual(await ninth.json(), { ok: false, error: { code: 'too-many-invokes' } })
-    assert.equal(parts.calls.length, 8, 'the refused one never reached the gateway')
+    const over = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'page', args }, AUTH))
+    assert.equal(over.status, 429, 'the thirty-third concurrent invoke is over the device budget')
+    assert.deepEqual(await over.json(), { ok: false, error: { code: 'too-many-invokes' } })
+    assert.equal(parts.calls.length, 32, 'the refused one never reached the gateway')
 
     release()
     for (const res of await Promise.all(inFlight)) assert.equal(res.status, 200)

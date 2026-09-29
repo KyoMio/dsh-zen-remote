@@ -44,7 +44,13 @@ function startMockTarget(port, html) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(page)
   })
-  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve(server)))
+  // A listen error (EADDRINUSE) must reject, not hang: an unresolved listen
+  // promise stalls the whole suite with zero output.
+  const p = new Promise((resolve, reject) => {
+    server.on('error', reject)
+    server.listen(port, '127.0.0.1', () => resolve(server))
+  })
+  return p
 }
 
 // Mock DSH upstream that acts like 0.1.2's browser auth: no signed cookie →
@@ -74,7 +80,29 @@ function startMockAuthTarget(port, opts) {
     res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' })
     res.end('401 Unauthorized')
   })
-  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve({ server, seen })))
+  const p = new Promise((resolve, reject) => {
+    server.on('error', reject) // refuse, never hang
+    server.listen(port, '127.0.0.1', () => resolve({ server, seen }))
+  })
+  return p
+}
+
+// T31-fix (relay-e2e) pattern: one free loopback port — bound, read, CLOSED,
+// released. For children that need a port HANDED to them (the gateway child);
+// the gateway's own same-port retry band absorbs the small rebind race. The
+// close is the whole point: a server left bound (unref'd or not) holds the
+// port for the test process's lifetime, and the gateway burns its 15
+// same-port retries and falls back to a port nothing else targets.
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.unref()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port
+      server.close(() => resolve(port))
+    })
+  })
 }
 
 function startGateway(port, targetPort, extraEnv) {
@@ -172,7 +200,11 @@ function startRecordingTarget(port, opts) {
     tunnels.forEach((s) => { try { s.destroy() } catch (e) {} })
     server.close(resolve)
   })
-  return new Promise((resolve) => server.listen(port, '127.0.0.1', () => resolve({ server, seen, upgrades, close })))
+  const p = new Promise((resolve, reject) => {
+    server.on('error', reject) // refuse, never hang
+    server.listen(port, '127.0.0.1', () => resolve({ server, seen, upgrades, close }))
+  })
+  return p
 }
 
 // Raw-socket WebSocket upgrade against the gateway: resolves as soon as the
@@ -208,4 +240,4 @@ function stopAll(target, child) {
   })
 }
 
-module.exports = { GATEWAY, REMOTE_HEADERS, startMockTarget, startMockAuthTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, pairDesktop, startRecordingTarget, rawUpgrade, stopAll }
+module.exports = { GATEWAY, REMOTE_HEADERS, startMockTarget, startMockAuthTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, pairDesktop, startRecordingTarget, rawUpgrade, stopAll, freePort }
