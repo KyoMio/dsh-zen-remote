@@ -217,6 +217,8 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 **Desktop client (2.0 additions)**
 
 - Remote groups in the sidebar ("server name · workspace name"), remote sessions open like local ones: full history, live progress, messages, cancels, queue edits, approvals and question answers, model selection, file tree, changes list plus changes summary/diff, goals, slash commands, agent presets, subagent prompts/interrupts, attachments and @ references, terminals running server-side
+- Remote sessions can attach **non-image files**: the upload request is caught by the sub-client's own backend and streamed through the relay to the server session; the 100 MiB cap is the relay's own (local uploads have no such limit), an over-limit pick is refused locally on the client with a readable message, and slow links are bounded by the 300-second timeout
+- The model picker in a remote session lists the **server's** model catalog (groups named "server name · group name"), local sessions list only local models; the last-fetched server groups survive while the relay is offline; server groups never appear in local settings such as the vision router. Known boundary: a session created on the server that has never sent a message shows the local default model in the picker
 - New sessions created inside a remote group run on the server's workspace and are shared automatically; remote sessions can be renamed, archived, pinned, forked, and their remote access closed (with confirmation) from the client
 - Title-row connection icon per remote session (online / offline / version differs); a "remote closed" banner with the reason when a session is slept or closed server-side; offline groups go grey with input disabled and reconnect automatically with backoff
 - First-come-first-served approvals/questions: if the server's own UI answers first, the client syncs to "already handled"
@@ -248,12 +250,10 @@ What a paired device is trusted with, stated plainly:
 ## Known limitations
 
 - Switching to a different server and back to the original one — or a server deleting a workspace and recreating one under the same id — leaves the affected remote groups invisible until the client page is **reloaded** (DSH's sidebar never re-accepts a removed workspace id within one page lifetime).
-- Attaching a **non-image file** in a remote session fails (DSH's file upload rides a request from inside a Web Worker, which the plugin cannot intercept). **Image** attachments work.
-- "Export session" errors in a remote session; the changes panel's **summary and diff do work** (relayed), while the entries that would pop a dialog on the server machine — "open", "reveal in Finder", "open in app", on the changes panel and deliverable cards alike — are hidden there.
+- "Export session" is disabled in a remote session (the menu item is hidden, and the backend refuses virtual session ids); the changes panel's **summary and diff do work** (relayed), while the entries that would pop a dialog on the server machine — "open", "reveal in Finder", "open in app", on the changes panel and deliverable cards alike — are hidden there.
 - The host truncates @-mention candidates to the **first 50 rows before** share-filtering: on a server with many sessions, a shared one may be missing from the candidate list (the reference check itself is unaffected — references you type out are still verified one by one).
-- The model picker lists the **client's own** local model catalog.
-- Third-party plugins' own non-standard endpoints are not forwarded — their panels degrade or hide in remote sessions.
-- Same-machine testing must reach the gateway over a **LAN IP**, not `127.0.0.1`: a loopback connection without forwarded headers is treated as the local user and skips token checks entirely.
+- Third-party plugins' own non-standard endpoints are not forwarded — their panels degrade or hide in remote sessions. A plugin's **tools** run on the server and are unaffected; what breaks is the part of its UI that calls the plugin's own backend with a session id (dsh-better-sidebar is the prime example, handled by the next bullet).
+- With [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) installed, its file browser, editor, git, tasks, bottom workbench and similar surfaces are hidden in remote sessions — they read and write the **client machine's own** files; and because it takes over the host's "Files" tab, a remote session has no sidebar file browser for now; file links in chat or deliverables open an empty right column in a remote session.
 - Both ends need zen-remote **2.0.x** (identical relay protocol version). DSH versions may differ; interface differences are annotated "（版本有差异）".
 
 ---
