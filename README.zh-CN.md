@@ -1,10 +1,10 @@
 <h1 align="center">dsh-zen-remote</h1>
-<p align="center">把 DeepSeek Harness 变成一个能从公网安全访问的手机 App：移动端界面重排 + 配对认证网关 + 装到主屏 + 锁屏推送。</p>
+<p align="center">一个 DeepSeek Harness 插件、两种角色。<b>主服务端</b>把 DSH 变成手机能安全访问的 PWA（手机界面、配对网关、锁屏推送），并把选定的会话共享给已配对的桌面端；<b>子客户端</b>跑在另一台 DSH 桌面端里，把服务端共享的会话直接摆进自己的侧边栏——完整历史、实时进度、发消息、审批、终端，全部在服务端执行。</p>
 
 <p align="center">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-0B7285?style=flat-square" alt="MIT"></a>
-<img src="https://img.shields.io/badge/release-v1.1.16-5B4CF0?style=flat-square" alt="v1.1.16">
-<img src="https://img.shields.io/badge/DSH-Web%20Profile-5B4CF0?style=flat-square" alt="DSH Web Profile">
+<img src="https://img.shields.io/badge/release-v2.0.0-5B4CF0?style=flat-square" alt="v2.0.0">
+<img src="https://img.shields.io/badge/DSH-0.1.7%20%7C%200.2.0-5B4CF0?style=flat-square" alt="DSH">
 </p>
 
 <p align="center"><a href="README.md">English</a></p>
@@ -21,211 +21,149 @@
 
 ---
 
+## 一个插件、两种角色
+
+同一个包、同一行插件。跑哪一半由 DSH「插件」页设置区块里的 `role` 决定：
+
+| | **主服务端**（`role: host`，默认） | **子客户端**（`role: client`） |
+| --- | --- | --- |
+| 机器 | 跑会话的那台 | 另一台装了 DSH 桌面端的电脑 |
+| 加载什么 | 手机界面、网关（子进程）、Web 推送、会话共享、中继服务端 | 中继客户端 + 侧边栏与会话页的远程部件 |
+| 不加载什么 | — | 不起网关、不注册推送、手机界面不生效——不和主服务端抢端口 |
+
+已配对的**桌面应用端**只看得到服务端开启了远程的会话，在本地工作区后面按「服务端名 · 工作区名」分组；子客户端本地的会话完全不受影响。
+
+---
+
 ## 安装
 
 ```sh
 dsh plugin add dsh-zen-remote
 ```
 
-装完重启 `dsh web`，手机界面与网关一起生效，不需要再手写任何配置行。
-
-> **兼容性——同一份产物，两个运行时。** 在 DSH `0.1.1-rc.2` 与 `0.1.2-rc.1`（web profile）上均实机验证，2026-09-04。
->
-> 0.1.2 删掉了 `@deepseek-ai/dsh-client-runtime`，并把网页界面挪到签名 cookie 之后——照原样会让手机界面加载失败、手机经网关也进不来。本插件改为自带 store 实现而不 import 那个包；对 0.1.2 搬了家的服务（`uiWorkspace`、`uiSession`）按存在探测、取不到就走 0.1.1 的老路；回合事件 `session.events` 和 `session.snapshotEvents()` 两种读法都认；浏览器 token 交换由网关代手机完成——这些在 0.1.1 上全部惰性，因为那边根本没有 token 端点。
->
-> 0.1.2 上有一点要知道：网页界面现在会拒绝 `Host` 不受信的请求。经本插件网关访问不受影响（网关把每个请求都以 `127.0.0.1` 的身份递上去），但拿浏览器直接开 `http://<局域网IP>:3080` 会得到 403，除非启动时加 `dsh web --trusted-host <host>`。
-
-卸载：`dsh plugin remove dsh-zen-remote`（或从 profile 的 `dependencies` 与 `bundles` 里删掉那两行），重启 `dsh web` 即恢复原状；要清掉配对数据再删 `~/.dsh/lan-gate-state.json` 与 `~/.dsh/lan-gate.config.json`。
-
-<details>
-<summary>手动写法 / 本地开发</summary>
-
-手动改 `~/.dsh/profiles/web/package.json`——`dependencies` 一行、`bundles` 一行：
+**桌面端 profile**（2.0 主服务端的实际形态）：把依赖写进 `~/.dsh/profiles/desktop/package.json`，装完重启桌面端 App：
 
 ```jsonc
+// ~/.dsh/profiles/desktop/package.json
 {
   "dependencies": {
-    "dsh-zen-remote": "^1.1.16"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
-  },
-  "dsh": { "profile": { "bundles": [
-    "@deepseek-ai/dsh-base",
-    "@deepseek-ai/dsh-web-app",
-    "dsh-zen-remote"
-  ] } }
+    "dsh-zen-remote": "^2.0.0"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
+  }
 }
 ```
 
 ```sh
-cd ~/.dsh/profiles/web && pnpm install
-# 重启 dsh web
+cd ~/.dsh/profiles/desktop && pnpm install
+# 然后重启 DSH 桌面端 App
 ```
 
-不想走 profile 安装流程的静态挂载写法见 [`cordis.patch.yml.example`](cordis.patch.yml.example)。
+**Web profile**（无头机器上跑 `dsh web` 的主服务端，手机访问也指向这里）：同样两步，目录换成 `~/.dsh/profiles/web`，装完重启 `dsh web`。
+
+无论哪种装法，组合层都只有**一行**。2.0.0 起挂载层只剩 `dsh-zen-remote` 一行，主入口按角色自己加载网关与推送子插件。不要再把旧的 `dsh-zen-remote-gateway` / `dsh-zen-remote-push` 两行加回来：loader 会警告后跳过；真挂两行网关就是两个网关进程抢 3088 端口。
+
+<details>
+<summary>静态挂载 / 本地开发</summary>
+
+把 [`cordis.patch.yml.example`](cordis.patch.yml.example) 抄进 profile 的 `cordis.patch.yml`、换成绝对路径即可——同样只有一行，附带的 `config:` 示例列了可写的行配置。走 `dsh plugin add` 的不需要它。
 
 </details>
+
+卸载：`dsh plugin remove dsh-zen-remote`（或从 profile 的 `dependencies` / `bundles` 里删掉那一行）后重启；要清掉配对与共享状态再删 `~/.dsh/lan-gate-state.json`、`~/.dsh/lan-gate.config.json` 与 `~/.dsh/zen-remote-shares.json`。
 
 ---
 
-## 配置公网访问
+## 从 1.x 升级
 
-装完在本机 `127.0.0.1:3080` 就能用手机界面。要从外面访问，按下面三步走。
+一次性的事实，按踩到的概率排序：
 
-### 1. 配一个反代中继 HTTPS
-
-网关默认只监听 `127.0.0.1:3088`，必须由你自己的反代对外。**家宽没有公网 IP、或者不想开路由器端口**，就跳过 nginx/Caddy 直接看第三个块（Cloudflare Tunnel）。
-
-<details open>
-<summary><b>nginx</b></summary>
-
-```nginx
-# http {} 块里加一次
-map $http_upgrade $connection_upgrade { default upgrade; '' close; }
-
-server {
-    listen 443 ssl http2;
-    server_name dsh.example.com;
-
-    ssl_certificate     /etc/letsencrypt/live/dsh.example.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/dsh.example.com/privkey.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:3088;
-        proxy_http_version 1.1;
-
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        proxy_buffering off;
-        proxy_read_timeout 3600s;
-    }
-}
-```
-
-</details>
-
-<details open>
-<summary><b>Caddy</b></summary>
-
-```
-dsh.example.com {
-    reverse_proxy 127.0.0.1:3088
-}
-```
-
-</details>
-
-<details open>
-<summary><b>没有公网 IP？用 Cloudflare Tunnel</b></summary>
-
-家宽拿不到公网 IP、或者不想在路由器上开端口时用这个：`cloudflared` 从你这台机器主动连出去，Cloudflare 那边负责域名、证书和入口，路由器一个端口都不用开。免费版够用。
-
-前置：域名托管在 Cloudflare（NS 指过去）。
-
-1. 打开 [Zero Trust 控制台](https://one.dash.cloudflare.com/) → **Networks → Tunnels → Create a tunnel** → 选 **Cloudflared**，起个名字，创建后页面会给你一条带 token 的安装命令；
-2. 在跑 DSH 的这台机器上执行那条命令（就是下面这个形状，token 用页面给的）：
-
-   ```sh
-   # macOS / Linux：装成常驻服务，开机自启
-   cloudflared service install eyJhIjoi...你的token
-   ```
-
-3. 回到隧道详情页 → **Public Hostname** → **Add a public hostname**：
-
-   | 字段 | 填什么 |
-   | --- | --- |
-   | Subdomain / Domain | `dsh` / `example.com`（即 `dsh.example.com`） |
-   | Service Type | `HTTP` |
-   | URL | `127.0.0.1:3088` |
-
-   保存后 `https://dsh.example.com` 就通了，证书 Cloudflare 自动签。网关的 `LAN_GATE_HOST` 保持默认 `127.0.0.1` 即可——`cloudflared` 就在本机。
-
-**装完必须做第 2 步的 403 自检**，这一步对隧道尤其要紧：`cloudflared` 和网关走的是本机回环连接，网关区分「公网访客」和「坐在这台电脑前的你」，全靠隧道有没有带上 `X-Forwarded-For`。`cloudflared` 默认是带的，所以配对墙正常生效；但万一你的版本或配置把它去掉了，公网请求就会被当成本机管理员，配对墙形同虚设——**用手机流量访问 `/lan-gate/admin`，看到 403 才算安全**。
-
-> 提示：不用设 `LAN_GATE_TRUSTED_PROXIES`——网关本来就把回环来的连接当作可信反代，填 `127.0.0.1` 是空操作，也**不能**替代上面那个自检。
->
-> Cloudflare 免费版支持 WebSocket（DSH 对话流需要），单个请求体上限 100MB，高于本插件默认的 20MB 上传上限，不影响使用。
-
-命令行流程（`cloudflared tunnel login` / `create` / `route dns` + `config.yml` 里写 ingress）见 [docs/remote-access.md](docs/remote-access.md#cloudflare-tunnel没有公网-ip-时的接入方式)。
-</details>
-
-Lucky（路由器/NAS）的配法见 [docs/remote-access.md](docs/remote-access.md#lucky)。反代与网关不在同一台机器时，要把反代出口 IP 填进 `LAN_GATE_TRUSTED_PROXIES`。
-
-### 2. 自检
-
-用**手机流量**（别连家里 Wi-Fi）访问 `https://你的域名/lan-gate/admin`，正确结果是 **403**。
-
-能看到管理页说明反代没带 `X-Forwarded-*` 头，公网请求被当成了本机用户——回去检查转发头再往下走。
-
-### 3. 配对设备
-
-```sh
-# 在跑 DSH 的这台机器上，用本机浏览器打开
-open http://127.0.0.1:3088/lan-gate/admin
-```
-
-1. 点「生成配对码」，得到 8 位码（10 分钟有效、只能用一次）；
-2. 手机打开你的 HTTPS 域名，在配对页输入这个码；
-3. 配对成功即进入 DSH，身份存在长期 Cookie 里，换网络不掉线；
-4. 浏览器菜单「添加到主屏幕」装成 App；
-5. 同意通知权限，agent 干完活推到锁屏。
-
-管理页还能改设备名、设备类型，或单独/全部吊销设备。
+- **三行合并为一行。** profile 补丁里残留的 `dsh-zen-remote-gateway` / `dsh-zen-remote-push` 旧行会被 loader 警告后跳过。原来写在**那两行上**的 `config:` 不再生效——搬到 `dsh-zen-remote` 行，或者直接在插件设置页里改。
+- **`~/.dsh/lan-gate.config.json` 继续生效。** 无需迁移，它的值会显示在设置页里。每个字段的优先级：环境变量 > 插件行设置 > `lan-gate.config.json` > 内置默认值。插件从不改写、也从不删除这个文件。
+- **已配对设备自动归为 Web 应用端**，继续照常用，不需要重新配对。
+- **管理页搬家了。** `/lan-gate/admin` 现在只剩一段指向插件设置页的说明（对非本机直连的请求仍然 403）。配对码、设备管理、测试推送、会话共享全部在 DSH「插件」页的 dsh-zen-remote 设置区块里。
+- 什么配置都不动的话，插件按主服务端起来，网关、推送、手机界面的行为与 1.1.x 完全一致。
 
 ---
 
-## 可选配置
+## 配置公网访问（主服务端）
 
-环境变量，或 `~/.dsh/lan-gate.config.json`（键名是变量去前缀转小驼峰，如 `port` / `trustedProxies`；显式环境变量优先）。改完重启 `dsh web`。
+装完在本机 `127.0.0.1:3080` 就能用手机界面。要从外面访问：给自己的网关配一个终结 TLS 的反代，用 403 自检确认，再配对设备。nginx / Caddy / Cloudflare Tunnel / Lucky 的完整配置见 [docs/remote-access.md](docs/remote-access.md)，简版：
 
-| 变量 | 默认 | 说明 |
+1. 网关只监听 `127.0.0.1:3088`，由反代（nginx、Caddy、Cloudflare Tunnel、Lucky）终结 HTTPS 并转发。**自检**：用**手机流量**（别连家里 Wi-Fi）访问 `https://你的域名/lan-gate/admin`，正确结果是 **403**。能看到说明页就代表反代没带 `X-Forwarded-*` 头、公网请求被当成了本机用户——先修转发头再往下走。
+2. 在**服务端这台机器**打开 DSH「插件」页，展开 dsh-zen-remote 设置区块，先选要配的设备角色，再点生成 8 位配对码（10 分钟有效、只能用一次）。
+3. 手机打开你的 HTTPS 域名，在配对页输入配对码。配对成功即进入 DSH，身份存在长期 Cookie 里。浏览器菜单「添加到主屏幕」装成 App，同意通知权限，agent 干完活推到锁屏。
+
+---
+
+## 配对设备
+
+配对码生成时**绑定设备角色**，兑换时校验角色——拿错通道用码会被明确拒绝，码不被消耗，也不计入错码锁定。
+
+| | **Web 应用端** | **桌面应用端** |
 | --- | --- | --- |
-| `LAN_GATE_PORT` | `3088` | 网关端口；被占用自动往上试（最多 +20） |
-| `LAN_GATE_HOST` | `127.0.0.1` | 监听地址；反代不在本机时才需要放开 |
-| `LAN_GATE_TARGET_PORT` | `3080` | 本机 DSH Web UI 端口 |
-| `LAN_GATE_RATE_LIMIT` | `120` | 未配对请求的每分钟上限（按真实客户端 IP） |
-| `LAN_GATE_TRUSTED_PROXIES` | 空 | 逗号分隔 IP；反代不在本机时必填 |
-| `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | 推送联系人。**iOS 必须改成真实邮箱或 https 网址**，否则 Apple 拒发 |
-| `LAN_GATE_LANG` | `auto` | 配对页、管理页、推送开关卡片的语言。`auto` 跟随浏览器的 `Accept-Language`（认不出就用中文），`zh`/`en` 写死 |
-| `DSH_PUSH_TURN_END` | **关** | 设 `1` 让「回合结束」也推一条。默认不推——回合结束不代表需要你（1.0.3 之前是默认推的，这是行为变更）。等授权、等回答这两类通知不受它影响，永远推 |
-| `DSH_PUSH_EVENTS` | `agent/turn-stopping` | 「回合结束」算哪些事件，逗号分隔；只在 `DSH_PUSH_TURN_END=1` 时有意义 |
-| `DSH_PUSH_DEBOUNCE_MS` | `15000` | 两条自动推送的最小间隔；等授权/等回答的通知不受压制 |
-| `DSH_PUSH_SUMMARY` | 关 | 设 `1` 让通知带上本回合的最终回复（只取正文，不含思考过程；截 120 字）和提问原文 |
-| `DSH_PUSH_TOOL` | 开 | 设 `0` 关掉模型可调用的 `push_notify` 工具 |
-| `DSH_PUSH_LANG` | `zh` | 推送通知文案的语言。通知没有「读者是谁」的信号，宿主进程也拿不到可靠的系统语言（launchd 不带 `LANG`），所以这里不自动探测：设 `en` 才是英文 |
-| `DSH_PUSH_APPROVAL_GRACE_MS` | `5000` | 「等授权」推送前的等待窗口。装了会自动答复审批的插件时（如 dsh-auto-approve），要等它答完再决定推不推——答完了就不推。判定器比这个慢就还是会推，那时把它调大 |
+| 形态 | 手机、平板及各类浏览器，经网关访问 | 装了 DSH 桌面端、zen-remote 设为子客户端角色的计算机 |
+| 可见范围 | 服务端**全部**会话 | **仅**服务端已开启远程的会话（服务端强制） |
+| 配对方式 | 浏览器打开网关地址，在配对页输入配对码 | 在子客户端的插件设置页填服务端地址和配对码 |
 
-上传大小上限（默认 20MB）在插件行的 `config.maxUploadBytes` 里改。
+**桌面应用端配对**，逐步：
 
-想在电脑端也启用回合过程折叠（默认只在手机宽度生效），在插件行的 `config.turnFoldDesktop` 里设 `true`——即在 profile 的 `cordis.patch.yml` 加一条：
+1. 在服务端的插件设置区块选「桌面应用端」，生成配对码。
+2. 在另一台电脑的 DSH 桌面端里打开插件设置区块，角色切到**子客户端**，填入服务端地址和配对码。
+3. 地址必须 `https://`，内网地址才允许 http——局域网段（`192.168.x`、`10.x`、`172.16–31.x`）、Tailscale/CGNAT（`100.64.x`）、回环、`localhost` / `*.local`、IPv6 `::1` / `fc00::/7` / `fe80::/10`。公网地址走明文 http 会被拒绝，设备令牌不会明文过公网。
+4. 配对成功后令牌存在插件行里（密钥字段），客户端自动连接。设置区块显示连接状态——已连接 / 离线 / 版本有差异 / 令牌已吊销——并可以解配。
 
-```yaml
-- id: dsh-zen-remote
-  config:
-    turnFoldDesktop: true
-```
+服务端的设置区块可以改设备名、改设备角色（`set-role`）、单独或全部吊销。吊销立即生效：连接与推送订阅一并失效。桌面应用端够不到任何管理路由——网关只把它的请求转进中继前缀。
 
-改完重启 `dsh web`。不改服务端配置的话，单个浏览器也可以访问一次 `?mobile-nav-turn-fold=1` 自己开启（`=0` 关闭，按浏览器记忆）。
+---
 
-**软键盘抬升的三个校准值**。少数手机上，键盘弹出时系统压根不告诉浏览器键盘有多高（实测过：某些第三方输入法 + Chrome；小米浏览器装的 PWA 壳）。这时插件没有任何可测的信号，只能按估算把输入框抬起来。估算值是照一台报告过的机器定的，别的机器可能偏高或偏低，所以三个数都能在插件行里改：
+## 会话共享
 
-| 配置项 | 默认 | 含义 | 允许范围 |
-| --- | --- | --- | --- |
-| `keyboardLiftRatio` | `0.42` | 抬升高度按屏幕高度的这个比例估算 | 0 ~ 1 |
-| `keyboardLiftMaxPx` | `400` | 估算值的上限（像素），防止在长屏手机上把输入框顶到屏幕中间 | 0 ~ 2000 |
-| `keyboardSafetyPadPx` | `15` | 键盘顶部再留出的一点余量，**仅安卓**。第三方输入法常常少报自己的高度（把键盘上方那条工具栏漏掉），这一点余量就是补它的 | 0 ~ 200 |
+远程按会话逐个开启，服务端有三个入口：
 
-```yaml
-- id: dsh-zen-remote
-  config:
-    keyboardLiftRatio: 0.45
-    keyboardSafetyPadPx: 30
-```
+1. 侧边栏会话的右键菜单项；
+2. 会话页标题行的远程图标（点击开关、带二次确认；悬停显示剩余闲置时间；图标带小圆点表示此刻有桌面应用端在看）；
+3. 插件设置区块的共享列表，含一键全部关闭。
 
-怎么调：输入框抬得**不够**（还被键盘挡住一截）就调大 `keyboardLiftRatio`，一次加 0.03 试；抬得**过头**（输入框和键盘之间空出一条）就调小。只差一点点（几十像素以内、且是安卓）优先加 `keyboardSafetyPadPx`。三个值一个都不写就是现在的行为，不受影响；写超出范围的值会被自动收进上表的区间，不会把输入框顶出屏幕。正常手机走的是实测路径，这几个值对它们完全没有影响。
+**闲置休眠**：开启远程的会话在 **48 小时**（可配，`idleHours`）内没有任何会话动静——回合开始或结束、发消息、审批或提问得到回答，不分服务端还是子客户端——就自动关闭远程。运行中的回合、等待审批/回答的会话永远不会被扫掉；只开窗口「看着」不算活跃。剩余时间悬停标题行图标可见，设置区块里逐条列出。
+
+**新建会话**：`autoShareNewSessions` 打开时，服务端新建的会话自动开启远程；**经中继**新建的会话（子客户端远程分组里点的）一律自动开启，这条入口的安全性正建立在此之上。子智能体会话与分叉会话自动跟随父会话，不用逐个开启。
+
+**「关闭远程」意味着什么**：未开启远程的会话，其列表、历史、实时进度、审批/提问事件、@ 引用候选、prompt 里内嵌的会话引用，全部在中继处拒绝或过滤——不只是界面上藏起来。
+
+---
+
+## 配置
+
+全部在 DSH「插件」页 → dsh-zen-remote 设置区块里改。每个字段按此顺序取第一个合法值：**环境变量 > 插件行设置 > `~/.dsh/lan-gate.config.json` > 默认值**；某层的值类型/范围/枚举不合法时该层视为未设置。改完需要重启网关/推送的字段（`role`、`port`、`host`、`targetPort`、`rateLimit`、`trustedProxies`、`vapidSubject`、`lang` 与推送各字段），插件会自己重载插件行——不用手动重启 App；其余字段立即生效。
+
+插件行字段（与 `src/config.ts` 一致）：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `role` | `host` | `host` 跑网关 + 推送 + 共享；`client` 连接服务端。不是精确的 `client` 就按 `host` 处理 |
+| `port` | `3088` | 网关端口；被占用自动往上试（最多 +20） |
+| `host` | `127.0.0.1` | 网关监听地址；反代不在本机时才需要放开 |
+| `targetPort` | （自动） | 本机 DSH Web UI 端口。留空即可：网关自动发现宿主实际监听端口（桌面端构建的端口可配置） |
+| `rateLimit` | `120` | 未配对请求的每分钟上限（按真实客户端 IP） |
+| `trustedProxies` | 空 | 逗号分隔 IP；反代不在本机时必填 |
+| `vapidSubject` | `mailto:admin@localhost` | 推送联系人。**iOS 必须改成真实邮箱或 https 网址**，否则 Apple 拒发 |
+| `lang` | `auto` | 网关页面、推送开关卡片与通知文案的语言。`auto` 跟随浏览器的 `Accept-Language`（认不出就用中文），`zh`/`en` 写死 |
+| `pushTurnEnd` | 关 | 「回合结束」也推一条。默认不推——回合结束不代表需要你。等授权/等回答的通知不受影响，永远推 |
+| `pushEvents` | `agent/turn-stopping` | 「回合结束」算哪些事件，逗号分隔；只在 `pushTurnEnd` 开时有意义 |
+| `pushDebounceMs` | `15000` | 两条自动推送的最小间隔；等授权/等回答的通知不受压制 |
+| `pushSummary` | 关 | 通知带上本回合的最终回复（只取正文，不含思考过程；截 120 字）和提问原文 |
+| `pushTool` | 开 | 设 `false` 关掉模型可调用的 `push_notify` 工具 |
+| `serverName` | 电脑名 | 服务端显示名（≤ 40 字），出现在子客户端的分组标题里 |
+| `idleHours` | `48` | 远程会话的闲置休眠时长（小时），范围 (0, 8760] |
+| `autoShareNewSessions` | 关 | 服务端新建的会话自动开启远程 |
+| `serverUrl`（子客户端） | 空 | 服务端网关地址，按上文规则校验 |
+| `deviceToken`（子客户端） | 空 | 配对拿到的设备令牌；密钥字段，处处打码 |
+| `turnFoldDesktop` | 关 | 回合过程折叠在任意宽度生效（默认仅手机宽度） |
+| `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` | `0.42` / `400` / `15` | 软键盘抬升校准，给浏览器拿不到键盘高度的环境用（见已知问题一节） |
+| `maxUploadBytes` | 20 MB | 附件上传上限 |
+
+旧的环境变量继续可用且优先级最高：`LAN_GATE_PORT`、`LAN_GATE_HOST`、`LAN_GATE_TARGET_PORT`、`LAN_GATE_RATE_LIMIT`、`LAN_GATE_TRUSTED_PROXIES`、`LAN_GATE_VAPID_SUBJECT`、`LAN_GATE_LANG`、`DSH_PUSH_TURN_END`、`DSH_PUSH_EVENTS`、`DSH_PUSH_DEBOUNCE_MS`、`DSH_PUSH_SUMMARY`、`DSH_PUSH_TOOL`、`DSH_PUSH_LANG`（通知文案覆盖；不设时由 `lang` 决定）、`DSH_PUSH_APPROVAL_GRACE_MS`（「等授权」推送前的等待窗口，给更快的自动审批插件让路；默认 5000；它与仅文件层的 `pushApprovalGraceMs` 键不在设置面板里）。`LAN_GATE_RELAY_SECRET` **不可**外部指定：插件每次加载现生成、自己交给网关。
+
+上传上限、键盘校准、回合折叠这几个旋钮与 1.x 行为一致——只是从「插件行 YAML」搬到了「设置页」（手写插件行 YAML 也照样有效）。
 
 ---
 
@@ -240,56 +178,98 @@ open http://127.0.0.1:3088/lan-gate/admin
 | 某个工具在等你授权 | 「DSH 等你授权」，带工具名 |
 | 模型调用 `ask_user_question` 在等你回答 | 「DSH 等你回答」 |
 
-这两类不看会话层级——子代理自己卡在授权上，照样喊你，因为等的还是你。也**不受
-`DSH_PUSH_DEBOUNCE_MS` 压制**：「有操作等你点头」是最不能被吞掉的一条。
+这两类不看会话层级——子代理自己卡在授权上，照样喊你，因为等的还是你。也**不受最小间隔压制**：「有操作等你点头」是最不能被吞掉的一条。2.0 起桌面端 App 里跑的会话同样覆盖：钩子挂在服务端侧，会话在哪跑都一样。
 
-**有机器答复者时的时机**：审批事件的顺序是「先记 asked → 问答复者 → 记 decided」，
-所以推送并不是一见到 asked 就发，而是等 `DSH_PUSH_APPROVAL_GRACE_MS`（默认 5 秒）
-——这段时间内被答复掉的就不推。这个窗口原来是 1.5 秒，按「答复者都在同一个 tick
-内结算」设计的；那对同步答复者成立，但对模型答复者不成立（实测平均 2.4 秒），
-结果是自动通过的请求照样推了一条「等你授权」，通知到了、框却从来没出现。
-换了更慢的判定模型就把这个值调大。
-
-策略自动放行的授权不会打扰你：请求发起后先等 1.5 秒，配对的「已决定」到了就取消，
-只有真正悬着没人管的才推。
+**有机器答复者时的时机**：审批事件的顺序是「先记 asked → 问答复者 → 记 decided」，所以推送并不是一见到 asked 就发，而是等 `DSH_PUSH_APPROVAL_GRACE_MS`（默认 5 秒）——这段时间内被答复掉的就不推。换了更慢的模型答复者就把这个值调大（实测平均 2.4 秒）。策略自动放行的授权不会打扰你。
 
 **二、模型自己决定的**
 
-`push_notify` 工具，模型在这些时候该调：你明确要求做完通知、需要你介入才能继续、
-出现你大概率想立刻知道的意外。不该调的场景（常规回合结束、进度汇报、它自己能推进
-的事）同样写在工具描述里——只写前者会让它每回合都调。会话开始还会注入一段同源的
-上下文强化，和工具描述共用一个常量，不会各改各的。
+`push_notify` 工具，模型在这些时候该调：你明确要求做完通知、需要你介入才能继续、出现你大概率想立刻知道的意外。不该调的场景同样写在工具描述里，同一段文字还作为会话上下文注入，两处共用同一个常量、不会各改各的。
 
-**默认不会响的**
+**默认不会响的**：普通跑完一轮不推（想要旧行为设 `pushTurnEnd` 或 `DSH_PUSH_TURN_END=1`）；子代理跑完永远不推，无论上面那个开关。
 
-- **普通跑完一轮不推**（1.0.3 起的行为变更，此前每回合都推）。干完活本身不等于
-  需要你。想要旧行为设 `DSH_PUSH_TURN_END=1`。
-- **子代理跑完永远不推**，无论上面那个开关。
-
-**通知里写什么**：默认只有标题，不带对话内容。开 `DSH_PUSH_SUMMARY=1` 才带这一轮
-的最终回复——只取正文，不含思考过程；这一轮没说话就退回「最后执行了 xx 工具」，不拿思考内容凑数。
-推送 payload 是 aes128gcm 端到端加密的。
+**通知里写什么**：默认只有标题。开 `pushSummary` 才带这一轮的最终回复——只取正文，不含思考过程；这一轮没说话就退回「最后执行了 xx 工具」。推送 payload 是 aes128gcm 端到端加密的。
 
 ---
 
 ## 功能
 
+**主服务端（手机访问，1.x 的延续）**
+
 - 会话列表主屏 + 独立会话页两级页面栈，横向推入推出
 - 主屏插件入口 chips，按已装插件自动出现，显隐可自定义
 - composer 重排：控件图标化，权限/模型菜单变成底部 sheet
-- 会话信息卡：六格统计 + 导出日志 / 重命名 / Fork / 归档
-- 同一回合的推理与工具调用默认折叠成一条「过程 · N 步」
-- 手势：左边缘右滑返回、底部 sheet 下滑关闭；安卓系统返回手势接管为「先关弹层 → 退回列表 → 退出应用」，不再一按就退出 PWA
-- 手机本地附件上传：落到会话工作目录 `.dsh-uploads/`，输入框追加 `@` 引用，发不发你说了算
-- 分享图：信息卡一键把会话导出成一张 PNG 长图（全部对话或最近 3/5/10 轮，按真提问计轮），超长内容保尾去头并在首部标注、长代码行/宽表格不横向裁剪、助手正文按 markdown 渲染，走系统分享面板，老浏览器退化为多张下载
+- 会话信息卡：六格统计 + 导出日志 / 重命名 / Fork / 归档；分享图一键导出 PNG 长图
+- 回合过程折叠、左缘右滑返回、安卓返回手势接管、手机本地附件上传
 - 配对码换长期设备令牌，认令牌不认 IP，可随时吊销
-- 管理面（生成配对码 / 管理设备 / 触发推送）只认本机直连，经反代一律 403
-- 真 PWA：manifest + service worker，可装到主屏、可离线打开
-- 真 Web Push：VAPID + aes128gcm，通知默认不带对话正文；默认只在等授权/等回答时响，回合结束不再打扰（见上）
-- `push_notify` 工具：模型可在关键节点自己推一条，带限流
-- 「内测声明」弹窗注入「不再弹出」可选项：远程访问每次刷新都会重弹声明，点一次后本设备记住选择、以后自动关闭
+- 真 PWA + 真 Web Push（VAPID + aes128gcm），默认只在等授权/等回答时响
 
-深度说明：[界面](docs/interface.md) · [公网接入](docs/remote-access.md)
+**主服务端（2.0 新增）**
+
+- 会话共享：三个开关入口、闲置休眠、新建自动共享、子会话跟随
+- 以上全部在 DSH 跑**桌面端 App** 时同样成立：网关自动转发到桌面端后台的实际端口，桌面端会话的等授权/等回答照推手机
+
+**桌面应用端（2.0 新增）**
+
+- 侧边栏远程分组（「服务端名 · 工作区名」），远程会话与本地会话同等使用：完整历史、实时进度、发消息、取消、排队调整、审批与提问应答、模型选择、文件树、改动列表、目标、斜杠命令、预设切换、子智能体提问/中断、附件与 @ 引用、开在服务端的终端
+- 远程分组里新建的会话跑在服务端对应工作区、自动开启远程；远程会话可改名、归档、置顶、分叉，也可从子客户端关闭其远程（带确认）
+- 远程会话标题行连接图标（在线 / 离线 / 版本有差异）；会话被休眠或服务端关闭时显示「远程已关闭」及原因；服务端离线时分组变灰、输入禁用，后台自动退避重连
+- 审批/提问先到先得：服务端自己的界面先答了，子客户端自动同步成「已处理」
+
+深度说明：[界面](docs/interface.md) · [公网接入 + 中继协议](docs/remote-access.md)
+
+---
+
+## 版本容错
+
+三层，从严到宽：
+
+1. **中继协议版本**必须一致——实际操作上，**两端 zen-remote 需同为 2.0.x**。服务端若还是 1.x，它的网关不认子客户端的 Bearer 令牌，请求会撞上通用配对墙，子客户端报「令牌已失效（或服务端 zen-remote 低于 2.0.0）」。DSH 版本可以不同。
+2. **DSH 接口指纹**决定其余：两端各自对中继会用到的几组远程接口生成规范化指纹，握手时比对。全部一致即完全兼容，版本号不同也无关；有差异照常连接，远程分组标注「（版本有差异）」，设置页诊断区列出差异组，只有受影响的面板降级。
+3. **运行时降级**：某次转发调用因参数或结果校验失败，只有那个面板显示「与服务端版本不兼容」并记入诊断区，其余功能继续可用。
+
+---
+
+## 安全模型
+
+一台已配对设备被信任到什么程度，明说：
+
+- **已配对的桌面应用端被视为可信设备。** 远程会话里的终端是以**服务端用户**身份运行的 shell，不受智能体沙箱与审批限制。文件预览接口（`workspaceFiles/read` 等）**不**限制在会话目录内——服务端进程读得到的文件都读得到。已配对设备可以在服务端**任意**工作区新建会话（不受「开启远程」限制；新建的会话自动开启远程）。
+- **「只有开启远程的会话可见」约束的是会话数据**：未开启远程的会话，其列表、历史、实时进度、审批/提问事件、@ 引用候选、prompt 内嵌引用都被中继拒绝或过滤。它不是围住整台机器的沙箱。
+- **管理操作只在服务端本机**：生成配对码、改角色、吊销只能在跑服务端那台机器的设置页做——经网关进来的请求可以查看状态，但一切变更动作被拒；桌面应用端根本够不到管理路由。
+
+---
+
+## 已知限制
+
+- 换到另一台服务端后再换回原来那台，或服务端删除某工作区后又以同一 id 重建：相关远程分组要**重载页面**才会再出现（DSH 侧边栏对移除过的工作区 id，在页面生命周期内不再接受）。
+- 远程会话里附加**非图片文件**会失败（DSH 的文件上传走 Web Worker 内的请求，插件拦截不到）；**图片**附件正常。
+- 远程会话里「导出会话」会报错；「在应用中打开」、改动/交付物里的「打开 / 在访达中显示」在远程会话里隐藏（它们会在服务端机器上弹窗）。
+- 服务端重启后，远程会话的标题 / 运行状态可能停在旧值，直到有新事件或刷新页面。
+- 模型选择器显示的是**子客户端本机**的模型目录。
+- 第三方插件自己的非标准接口不转发——它们的面板在远程会话里降级或隐藏。
+- 同机联调必须用**局域网 IP** 连网关（`127.0.0.1` 被网关视为本机直连，不校验令牌）。
+- 两端 zen-remote 需同为 **2.0.x**（中继协议版本一致）；DSH 版本可以不同，接口指纹有差异时远程分组标注「（版本有差异）」。
+
+---
+
+## 已知问题
+
+**iOS 26.x 独立 PWA 视口缩水**：加到主屏后视口底部会少掉一条状态栏高度，普通 Safari 标签页正常。这是 iOS 系统缺陷，缺掉的区域在文档之外，CSS 够不着；本插件做了三层缓解（浅色 manifest 背景 + 安全区补偿 + 强制重排），能减轻但不保证复原。彻底恢复只能整个 App 退出重开。
+
+**个别环境软键盘对浏览器完全不可见，输入框抬升靠估算兜底**：部分组合里系统不把键盘高度告知页面（visualViewport、VirtualKeyboard API 一并失效，均已实测排除）。插件聚焦后探测约 1.2 秒，判定「键盘不可见」就按估计高度抬升输入框。抬升高度差得明显的话，在设置页里调 `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx`。正常环境完全不走这条路径。
+
+**经反代访问时设置页打不开**（插件配置列表空白、模型卡片报「settings are unavailable in this browser」）：DSH 官方设计是设置类 RPC 只对回环连接开放，远程浏览器的设置镜像初始即 `unavailable`。绕法：回跑 DSH 的那台机器用本机浏览器改。经网关打开的插件设置页同样受此限制。与本插件无关。
+
+---
+
+## 权限与数据
+
+- **网络**：网关只监听本机（默认 `127.0.0.1:3088`），对外暴露完全由你的反代/隧道决定；推送经浏览器推送服务商中转（aes128gcm 端到端加密）；桌面应用端与主服务端之间的中继也走这条网关，授权在服务端逐请求复核。插件自身不向任何第三方上报数据。
+- **文件**：附件上传只写入当前会话工作目录下的 `.dsh-uploads/`；配对状态在 `~/.dsh/lan-gate-state.json`，配置在 `~/.dsh/lan-gate.config.json`，共享表在 `~/.dsh/zen-remote-shares.json`，服务端 id 在 `~/.dsh/zen-remote-server.json`。
+- **凭据**：不收集、不存储任何账号密码；设备身份是本插件自己签发的随机令牌（Web 应用端为 HttpOnly Cookie，桌面应用端为密钥字段），外加一枚每次加载现生成的中继共享密钥，不出这台机器对。
+
+排障：运行日志在 `~/.dsh/logs/web.log`（网关与推送的行带 `[dsh-zen-remote-*]` 前缀；桌面端构建打到 App 控制台）。安全问题请走 GitHub Security Advisories 私下报告，不要公开提 issue。
 
 ---
 
@@ -312,28 +292,6 @@ open http://127.0.0.1:3088/lan-gate/admin
 各项适配的技术细节（锚点选择器、断点、取舍记录）见[界面文档](docs/interface.md)的「兼容插件」一节。
 
 ---
-
-## 已知问题
-
-**iOS 26.x 独立 PWA 视口缩水**：加到主屏后视口底部会少掉一条状态栏高度，普通 Safari 标签页正常。这是 iOS 系统缺陷，缺掉的区域在文档之外，CSS 够不着；本插件做了三层缓解（浅色 manifest 背景 + 安全区补偿 + 强制重排），能减轻但不保证复原。彻底恢复只能整个 App 退出重开。
-
-**个别环境软键盘对浏览器完全不可见，输入框抬升靠估算兜底**：部分组合（实测过：某些第三方输入法 + Chrome；小米浏览器安装的 PWA 壳）里，键盘弹出/收起时系统不把键盘高度告知页面——视口不变、无任何事件（visualViewport、VirtualKeyboard API 一并失效，均已实测排除）。插件的兜底是：聚焦后探测约 1.2 秒，判定「键盘不可见」就按估计高度抬升输入框（判定按浏览器记忆，之后聚焦即时抬升）。代价有两条：抬升高度是估算的，可能与实际键盘有几十像素出入；键盘收起同样无信号，输入框要等你点击或滑动输入框以外的区域才回落。正常环境完全不走这条路径，不受影响。抬升高度差得明显的话不用改代码，插件行的 `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` 三个值可以照着自己的机器调，见上面「配置」一节。
-
-**经反代访问时设置页打不开（插件配置列表空白、模型卡片报「settings are unavailable in this browser」）**：直连 `127.0.0.1:3080/3088` 正常。
-
-根因是 DSH 官方的设计，不在网关：设置类 RPC **只对回环连接开放**。客户端按 `location.hostname` 判定（`dsh-client-connection` 的 `isLoopback`），非回环时 `dsh-client-ui-settings` 把持久化降级为 `memory`，设置镜像初始状态就是 `unavailable`——官方源码注释原话是「remote browsers remain process-local because settings RPCs are loopback-only」。所有依赖这个镜像的卡片（模型、插件配置）因此一起空白，与本插件、与 service worker 缓存都无关（2026-08-20 真机 USB 调试 + 本机对照实测）。
-
-绕法：要改配置就回跑 DSH 的那台机器上用本机浏览器改，配置存在后端，改完手机侧其它功能不受影响。想让远程也能改设置，得由上游放开这条限制。
-
----
-
-## 权限与数据
-
-- **网络**：网关只监听本机（默认 `127.0.0.1:3088`），对外暴露完全由你的反代/隧道决定；推送经浏览器推送服务商中转（内容 aes128gcm 端到端加密，服务商读不到）；插件自身不向任何第三方上报数据。
-- **文件**：附件上传只写入当前会话工作目录下的 `.dsh-uploads/`；配对状态与配置存在 `~/.dsh/lan-gate-state.json` / `lan-gate.config.json`。
-- **凭据**：不收集、不存储任何账号密码；设备身份是本插件自己签发的随机令牌（HttpOnly Cookie）。
-
-排障：运行日志在 `~/.dsh/logs/web.log`（网关与推送的行带 `[dsh-zen-remote-*]` 前缀）；手机端界面自检可用调试徽章（首页顶栏连点 5 下开关）。安全问题请走 GitHub Security Advisories 私下报告，不要公开提 issue。
 
 ## 上游致谢
 

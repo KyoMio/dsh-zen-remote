@@ -3,14 +3,28 @@
 # 不想走 `dsh plugin add` 的话，把下面这段抄进你 DSH profile 的
 # cordis.patch.yml，并把 <ABSOLUTE_PATH> 换成本仓库的 clone 目录。
 # 走 `dsh plugin add` 的正常安装不需要这个文件——包自带的
-# cordis.patch.yml 已经把三行都挂好了。
+# cordis.patch.yml 挂的就是这一行。
+#
+# 2.0.0 起整包只有这一行 insert：主入口（lib/index.js）读行配置里的
+# role，host（默认）就绪地加载网关与推送子插件，client 只挂远程部件。
+# 不要照 1.x 的老例子把网关行、推送行再各挂一行（行 id 以 -gateway /
+# -push 结尾的那两行）——网关行拿不到主行的配置，两行会各拉起一个网关
+# 抢 3088 端口。升级上来还残留着旧行的话，loader 会打一条警告并跳过，
+# 把旧行删掉即可。
+#
+# 行配置（全部可省，走默认值；settings 页保存的值优先于这里手写的）：
 - insert:
     - id: dsh-zen-remote
       name: dsh-zen-remote
       path: file:///ABSOLUTE_PATH/dsh-zen-remote/lib/index.js
-    - id: dsh-zen-remote-gateway
-      name: dsh-zen-remote-gateway
-      path: file:///ABSOLUTE_PATH/dsh-zen-remote/lan-gate.mjs
-    - id: dsh-zen-remote-push
-      name: dsh-zen-remote-push
-      path: file:///ABSOLUTE_PATH/dsh-zen-remote/dsh-push.mjs
+      config:
+        role: host                # host（主服务端，默认）| client（子客户端）
+        serverName: My-Mac        # 服务端显示名，出现在子客户端分组标题里（≤40 字）
+        port: 3088                # 网关端口
+        host: 127.0.0.1           # 网关监听地址
+        trustedProxies: ""        # 反代不在本机时填它的出口 IP，逗号分隔
+        idleHours: 48             # 远程会话闲置休眠时长（小时）
+        autoShareNewSessions: false  # 新建会话自动开启远程
+        # 子客户端角色要填的两项：
+        # serverUrl: https://dsh.example.com
+        # deviceToken: <配对拿到的设备令牌>

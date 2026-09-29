@@ -11,14 +11,33 @@
 | 路径 | 作用 |
 | --- | --- |
 | `package.json` | 单包声明：`dsh.bundle.patch` → `cordis.patch.yml`，`dsh.client` → `exports["./client"]` |
-| `cordis.patch.yml` | 组合层，三行 insert（界面 / 网关 / 推送），随包自带 |
-| `src/index.ts` → `lib/index.js` | host 半边入口（插件行 `dsh-zen-remote`）：唯一一条路由 `POST /_dsh/mobile-nav/upload` |
-| `src/client/**` → `lib/client.js` | 浏览器半边（同一插件行，经 `dsh.client` 发现）：app 外壳、slot、样式 |
-| `lan-gate.mjs` | 网关 Cordis entry（插件行 `dsh-zen-remote-gateway`）：spawn 子进程 |
-| `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，Node stdlib + `web-push`） |
-| `dsh-push.mjs` | 推送 entry（插件行 `dsh-zen-remote-push`）：回合结束推送 + `push_notify` 工具 |
+| `cordis.patch.yml` | 组合层，**一行** insert（`dsh-zen-remote`），随包自带；网关与推送由主入口按角色加载，不再各占一行 |
+| `src/index.ts` → `lib/index.js` | 主入口（插件行 `dsh-zen-remote`）：读 `role`，host 就 `ctx.plugin()` 加载网关与推送子插件，并挂 host 路由（附件上传 / 客户端配置 / 分享导出 / 管理 / 子客户端 / 中继） |
+| `src/config.ts` | 配置模型：四层回退（env > 插件行 > `lan-gate.config.json` > 默认值）、loader 的 `Config` schema（全 volatile）、`resolveRole` |
+| `src/http.ts` | host 路由共用的 JSON 响应封装与同源 POST 门 |
+| `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
+| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status、配对代理、设置页诊断 |
+| `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
+| `src/share-store.ts` | 共享会话表（`~/.dsh/zen-remote-shares.json`，持久化，重启恢复），中继访问控制的事实来源 |
+| `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
+| `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
+| `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
+| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / unshare |
+| `src/relay-access.ts` | 中继的按方法登记访问控制表（服务端那一张） |
+| `src/relay-filter.ts` | 全局流与全局列表的输出过滤（`workspace/follow` / `session/control` / `session/list`） |
+| `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
+| `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`，远程会话调用改走中继、虚拟 id 改写、面板判定（客户端那张字段表也在这里） |
+| `src/intercept-shape.ts` | 被包装方法的形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
+| `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数，无状态） |
+| `src/merge-streams.ts` | 三条全局流/列表的本地 + 远程合并状态机（侧边栏远程分组） |
+| `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
+| `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
+| `src/client/**` → `lib/client.js` | 浏览器半边（同一插件行，经 `dsh.client` 发现）：app 外壳、slot、样式、设置区块（`settings/`）、共享与远程部件（`remote-*` / `Remote*`） |
+| `lan-gate.mjs` | 网关子插件入口，由主入口按 host 角色加载（不再自己占插件行）：spawn 子进程，共享密钥只经它进子进程 |
+| `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，Node stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀 |
+| `dsh-push.mjs` | 推送子插件（与网关一起由主入口加载）：回合结束推送 + `push_notify` 工具 |
 | `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标 |
-| `test/*.test.cjs` | 网关侧测试（真子进程 + mock 上游） |
+| `test/*.test.cjs` | 网关侧测试（真子进程 + mock 上游）+ 中继端到端（`relay-e2e.test.cjs`）+ 纯逻辑导入测试 |
 | `scripts/check-*.mjs` | 界面侧自检（纯 `node:assert`，靠 Node ≥23.6 类型剥离直接 import `.ts`） |
 | `scripts/build-client.mjs` | client 打包器（内联相对模块 → `__ModuleLoader__.load({id:"dsh-zen-remote"})`） |
 | `docs/**` | 深度文档，见下 |
@@ -68,14 +87,35 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
 
 | 文件 | 内容 |
 | --- | --- |
-| [`docs/remote-access.md`](docs/remote-access.md) | 通道半边：反代配置（nginx/Caddy/Lucky）、配对流程、环境变量表、管理 API、推送、安全边界 |
-| [`docs/interface.md`](docs/interface.md) | 界面半边：断点策略、调试徽章、安全区体系、兼容插件清单 |
+| [`docs/remote-access.md`](docs/remote-access.md) | 通道半边：反代配置（nginx/Caddy/Lucky）、设备角色与配对、环境变量表、管理 API、远程中继协议、推送、安全边界 |
+| [`docs/interface.md`](docs/interface.md) | 界面半边：断点策略、设置区块与远程部件、调试徽章、安全区体系、兼容插件清单 |
 
 
 ## 合仓后仍然成立的硬约束
 
 - **网关是子进程**：`lan-gate.mjs` 只负责 spawn + 生命周期，永远不要把
   `lib/lan-gate-server.cjs` import 进 DSH 进程。
+- **中继共享密钥不落地**：主入口每次 apply 现生成 `LAN_GATE_RELAY_SECRET`，
+  只经环境变量交给网关子进程（无条件覆盖、缺失即删除），中继路由逐请求
+  `timingSafeEqual` 校验。不允许由外部环境指定，也不要把它写进日志或状态文件。
+- **中继访问控制按方法登记，两张表同步**：新增远程方法必须同时登记
+  `src/relay-access.ts` 的 `RELAY_METHODS`（服务端，授权看登记的归属字段）
+  和 `src/intercept.ts` 的 `CLIENT_METHOD_FIELDS`（客户端，改写判定），
+  一致性由 `test/intercept.test.cjs` 的逐方法比对测试钉住。禁止「从参数里
+  通用扫描会话 id」的写法——DSH 会悄悄丢掉不认识的参数名，扫描会被诱饵
+  字段骗过；全局读（`session/list` 等）安全靠输出过滤，不靠输入判定。
+- **桌面端请求没有 `Origin`/`Sec-Fetch-Site`**：DSH 桌面端主进程把窗口请求
+  转发给本机后台前，自己校验过 `Origin: dsh-app://app`，然后删掉
+  `host` / `origin` / `cookie` / `sec-fetch-site`。所以 `src/http.ts` 的
+  `sameOriginPost` 对「两个头都缺」的请求是**放行**的（`admit` 顶在前面）；
+  别把它改成「缺 Origin 即拒绝」，那会把桌面端窗口里的所有变更请求挡掉。
+  真正要拒的是可辨认的跨站（`Sec-Fetch-Site: cross-site`、Origin 与 Host 不符）。
+- **volatile 字段在使用时现场读取**：`Config` 的每个字段都是 volatile——
+  loader 交给 `apply()` 的是 `{ get() }` 包装而不是值。任何读行配置的地方
+  都要走 `unwrapVolatile`（单字段）或 `resolveConfig`（整组），禁止在
+  apply 时拍快照存着用；`RESTART_FIELDS` 之外的字段（`serverName`、
+  `idleHours`、`serverUrl`、`deviceToken`、界面旋钮）改了不重载行，
+  不现场读就是永久拿到旧值。
 - **CSS 分工没变**：排版类规则在 `src/client/styles/`；`pwa/app.css` 只留壳级
   规则（iOS 输入框防缩放、安全区滚动补偿、代码块横向滚动）。两边抢同一个元素
   是历史事故的根源，加规则前先确认归属。

@@ -21,13 +21,10 @@ export const inject = ['subprocess', 'connection', 'webServer']
 const here = dirname(fileURLToPath(import.meta.url))
 const serverFile = join(here, 'lib', 'lan-gate-server.cjs')
 
-// Optional cordis config (set on the insert row in your profile patch, or
-// through the DSH settings form — T12 resolves the row against
-// lan-gate.config.json and env before handing it here):
-//   { port, host, targetPort, rateLimit, trustedProxies, vapidSubject, lang }
-// Each RESOLVED value is translated to its LAN_GATE_* env var, unconditionally
-// overriding any host value; an undefined value DELETES the variable instead of
-// letting a leftover host value leak into the child.
+// 2.0.0 起本入口不再自己占一行：它由主入口（lib/index.js）按 role 加载——
+// host 角色才 ctx.plugin(gateway, …)，并把 resolveConfig 合并后的生效配置
+// （env > 插件行 > lan-gate.config.json > 默认值，src/config.ts）作为 config
+// 传进来；relaySecret 是主入口每次 apply 现生成的共享密钥，只经这里进子进程。
 const CONFIG_ENV = {
   port: 'LAN_GATE_PORT',
   host: 'LAN_GATE_HOST',

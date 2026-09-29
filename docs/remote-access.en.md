@@ -1,14 +1,10 @@
 <h1 align="center">Remote access (gateway half)</h1>
-<p align="center">Turn DeepSeek Harness into a mobile PWA you can safely reach from the public internet: pairing-code auth + token identity + real Web Push, with your own reverse proxy terminating TLS.</p>
+<p align="center">Turn DeepSeek Harness into a mobile PWA you can safely reach from the public internet: pairing-code auth + token identity + real Web Push, with your own reverse proxy terminating TLS — plus device roles and the remote relay that serves paired desktop clients.</p>
 
-> Full documentation for the gateway half of `dsh-zen-remote`: reverse proxy, pairing, environment variables, admin API, push, security boundary.
+> Full documentation for the gateway half of `dsh-zen-remote`: reverse proxy, device roles and pairing, environment variables, admin API, the remote relay, push, security boundary.
 > Installation and quick start live in the [root README](../README.md); interface-side detail in [interface.md](interface.md) (Chinese).
 
 Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate) secure-gateway base, with PWA differentiation.
-
-[![npm version](https://img.shields.io/npm/v/the gateway half)](https://www.npmjs.com/package/the gateway half)
-[![license](https://img.shields.io/github/license/KyoMio/the gateway half)](https://github.com/KyoMio/the gateway half/blob/main/LICENSE)
-[![dsh-plugin](https://img.shields.io/badge/dsh--plugin-ready-4c8dff)](https://github.com/topics/dsh-plugin)
 
 ---
 
@@ -16,15 +12,17 @@ Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-ga
 
 | Module | What |
 | --- | --- |
-| 🔑 **Public-internet identity** | The gateway listens on `127.0.0.1` only, sitting behind your own reverse proxy. New devices trade a pairing code for a long-lived device token (cookie `lg_device`) — identity follows the token, not the source IP |
+| 🔑 **Public-internet identity** | The gateway listens on `127.0.0.1` only, sitting behind your own reverse proxy. New devices trade a pairing code for a long-lived device token (cookie `lg_device` for web devices, a JSON token for desktop clients) — identity follows the token, not the source IP |
+| 👥 **Device roles** | A pairing code is minted for one role: **web app device** (phones/tablets/browsers through the gateway, see all sessions) or **desktop app device** (another DSH desktop running this plugin as the client role — relay prefix only, shared sessions only). A code offered to the wrong channel is refused with a clear message, not consumed |
+| 📡 **Remote relay** | Desktop clients talk to the host over zen-remote's own relay protocol (HTTP invokes + NDJSON stream subscriptions); the server re-verifies session ownership per request against a per-method allowlist — data of an unshared session never leaves the box |
 | 📱 **Real PWA** | `manifest.json` + service worker: once the proxy provides HTTPS, "Add to Home Screen" actually works — standalone full-screen app with icon, splash, theme-color, maskable assets |
 | 🌐 **Offline** | SW v3: only the true static shell (manifest/icons/offline page) is cache-first, everything else (DSH client bundle JS/CSS, API, page HTML) is network-first — a new deploy is picked up immediately instead of lingering behind stale cached CSS |
 | 👆 **Touch gestures** | Pinch-to-resize font (resettable); edge-swipe-back has been handed off to the interface half (see "Division of labor" below), pull-to-refresh has been removed entirely (an accidental overscroll used to fire a full reload mid-conversation) |
 | 🔔 **Push when you're actually needed** | Real Web Push (VAPID-signed, aes128gcm-encrypted). By default it fires only when something is genuinely waiting on you: a tool needs authorization, or the model asked you a question. Plain turn-end is opt-in (`DSH_PUSH_TURN_END=1`). The notification carries no conversation content unless you ask for it |
-| 🛎️ **`push_notify` tool** | A model-callable push tool (registered by `dsh-push.mjs`): the model can decide mid-task that the user needs a decision, that a key milestone was reached, or that an error needs a human — and push straight to the lock screen instead of waiting for the turn to end. Usage discipline (don't call this often) is spelled out in the tool description; the host also enforces it with rate limits (max 1 per 60s per session, 20/hour globally) — over the limit, the call is silently dropped, never an error. Same aes128gcm end-to-end encryption, same lock-screen-only exposure. Turn it off entirely with `pushTool: false` in `lan-gate.config.json` (or `DSH_PUSH_TOOL=0`); it's also skipped automatically on hosts without a tool registry (`ctx.tools`), with no effect on the rest of the plugin |
+| 🛎️ **`push_notify` tool** | A model-callable push tool (registered by the push half): the model can decide mid-task that the user needs a decision, that a key milestone was reached, or that an error needs a human — and push straight to the lock screen instead of waiting for the turn to end. Usage discipline (don't call this often) is spelled out in the tool description; the host also enforces it with rate limits (max 1 per 60s per session, 20/hour globally) — over the limit, the call is silently dropped, never an error. Same aes128gcm end-to-end encryption, same lock-screen-only exposure. Turn it off entirely with `pushTool: false` (or `DSH_PUSH_TOOL=0`); it's also skipped automatically on hosts without a tool registry (`ctx.tools`), with no effect on the rest of the plugin |
 | 📐 **Touch layout** | This repo now only keeps shell-level rules (iOS input-zoom fix, safe-area scroll padding, horizontal-scrolling code) — layout rules (44px targets, dialogs, composer chrome) moved to the interface half, see "Division of labor" below — desktop never affected |
 | 🔒 **Desktop unaffected** | Every rule is rooted at `html:not([data-lan-device="desktop"])` (or an `@media(max-width:820px)` with the same exclusion) — an explicit "desktop" kind opts out, everything else (including a real phone's default "auto" kind) opts in |
-| 🛡️ **Admin surface is local-only** | Generating pairing codes, managing devices, triggering pushes — these endpoints only accept direct local connections; anything arriving through the proxy gets 403 |
+| 🛡️ **Admin surface is local-only** | Generating pairing codes, managing devices, triggering pushes — these endpoints only accept direct local connections; anything arriving through the proxy gets 403. Since 2.0.0 they are driven from the dsh-zen-remote settings block in the DSH Plugins page (the plugin backend calls them as the local machine); the `/lan-gate/admin` page is now just a notice pointing there |
 
 ---
 
@@ -36,18 +34,19 @@ Public device (phone/laptop) --HTTPS--> your own reverse proxy (nginx/Caddy, ter
                                                 ▼
                             gateway (isolated Node child · listens on 127.0.0.1:3088 by default)
                                                 │
-              ┌──────────────────────────────────┼───────────────────────────────────┐
-              │                                  │                                    │
-       unpaired device                   paired device (has lg_device token cookie)    direct-local request (no X-Forwarded-*)
-       → any path redirects to               → reverse-proxied to DSH Web UI               → admin page / admin API / push trigger
-         the pairing page,                     (127.0.0.1:3080); HTML injected:                /lan-gate/admin /status
-         POST code -> token                    manifest + PWA bootstrap +                      /action /pair /pwa/push/send
-                                                touch CSS + randomUUID polyfill
+              ┌───────────────────┬─────────────┴────────────┬──────────────────────────────┐
+              │                   │                           │                              │
+       unpaired device      web app device (paired)     desktop app device (paired)     direct-local request
+       → any path redirects   → forwarded to DSH (auto-    → relay prefix only            (no X-Forwarded-*)
+         to the pairing page    discovered real port)      /_dsh/zen-remote/relay/*      → admin API / push trigger
+         POST code -> token     with device marker headers  with marker headers +        /lan-gate/status /action /pair
+                              + bearer shared secret;       the shared secret             /pwa/push/send
+                                any other path 403s
 ```
 
 - The gateway is an isolated child process: if it crashes, DSH's main service is unaffected; it's torn down automatically when the plugin stops.
-- DSH's own web server still binds `127.0.0.1` only. The gateway never touches DSH's config or its `/api` trust fence.
-- The one IP-based trust left: a loopback socket carrying **no** `X-Forwarded-*` headers is treated as the local user sitting at this machine — the only path into the admin surface. Requests that came through the proxy always carry forwarded headers, so they can never look local.
+- DSH's own web server still binds `127.0.0.1` only. The gateway never touches DSH's config or its `/api` trust fence; the forward target port is discovered from the host's real listening port (desktop builds use a configurable one).
+- The one IP-based trust left: a loopback socket carrying **no** `X-Forwarded-*` headers is treated as the local user sitting at this machine — the only path into the admin surface. Requests that came through the proxy always carry forwarded headers, so they can never look local. **Mind the flip side**: in same-machine testing the client must reach the gateway over a LAN IP — a loopback address is treated as local-direct and skips token checks entirely.
 
 ---
 
@@ -64,20 +63,10 @@ Inside this single plugin, the boundary between the two halves is: **this repo o
 ### 1. Install the plugin
 
 ```bash
-dsh plugin --profile web add github:KyoMio/the gateway half
+dsh plugin add dsh-zen-remote
 ```
 
-The package declares a `dsh.bundle` manifest; restart `dsh web` after installing.
-
-Local-directory install (for hacking on the code yourself):
-
-```bash
-git clone https://github.com/KyoMio/the gateway half.git
-cd the gateway half
-dsh plugin --profile web add ./the gateway half
-```
-
-Static mount is also available (see [`cordis.patch.yml.example`](../cordis.patch.yml.example) — swap in the absolute checkout path) or dynamic-plugin mount (see the header comment in `lan-gate.mjs`), for setups that skip `dsh plugin add`.
+The package declares a `dsh.bundle` manifest with a single row; restart DSH (the desktop app, or `dsh web`) after installing. Desktop-profile and manual install steps live in the [root README](../README.md#install).
 
 ### 2. Put your own reverse proxy in front
 
@@ -232,14 +221,17 @@ From **cellular data** (not your home Wi-Fi), open `https://your-domain/lan-gate
 
 ### 3. Generate a pairing code and pair devices
 
-1. With the proxy in place, open `http://127.0.0.1:3088/lan-gate/admin` in a browser **on the host itself**.
-2. Click "generate pairing code" to get an 8-character code, valid for 10 minutes, single-use.
-3. On the phone or another computer, open your proxy's HTTPS domain in a browser — you'll land on the pairing page. Enter the code (device name is optional).
-4. On success you're dropped straight into the DSH Web UI (PWA-injected); identity is stored in a long-lived cookie, so switching Wi-Fi/IP never logs you out.
-5. On the phone, use the browser menu's "Add to Home Screen" to get a standalone app.
-6. The page will prompt you to enable "agent-done push" — grant notification permission and you'll get a system notification when the agent finishes, even from another app.
+Since 2.0.0 pairing codes are minted from the dsh-zen-remote settings block in the DSH Plugins page (the old `/lan-gate/admin` page is just a notice pointing there, still local-direct-only):
 
-The admin page also lets you set a device's kind (phone / desktop / auto layout), rename it, and revoke a single device or all of them at once.
+1. With the proxy in place, open the DSH Plugins page **on the host machine** and expand the dsh-zen-remote settings block.
+2. Pick the device role (web app device / desktop app device) and click generate — an 8-character code, valid for 10 minutes, single-use. **The code is bound to the role**: a web-device code offered to the desktop channel is refused and vice versa; a wrong-channel code is neither consumed nor counted toward the lockout.
+3. Web app device: on the phone or another computer, open your proxy's HTTPS domain in a browser — you'll land on the pairing page. Enter the code (device name is optional).
+4. Desktop app device: in the other computer's DSH desktop app, open the plugin settings block, switch the role to **client**, and enter the server URL plus the code. The URL must be `https://` unless it is a private-network host — LAN ranges (`192.168.x`, `10.x`, `172.16–31.x`), Tailscale/CGNAT (`100.64.x`), loopback, `localhost` / `*.local`, or IPv6 `::1` / `fc00::/7` / `fe80::/10`.
+5. On success a web device is dropped straight into the DSH Web UI (PWA-injected); identity is stored in a long-lived cookie, so switching Wi-Fi/IP never logs you out.
+6. On the phone, use the browser menu's "Add to Home Screen" to get a standalone app.
+7. The page will prompt you to enable "agent-done push" — grant notification permission and you'll get a system notification when the agent finishes, even from another app.
+
+The settings block can also rename devices, change a device's role (`set-role`), and revoke one or all. Revocation is immediate: the device's open connections and push subscription die with it. Desktop-client devices can never reach any admin endpoint — the gateway only ever forwards them into the relay prefix; every other path (including DSH pages and `/api`) gets 403 (`reason: 'relay-only'`).
 
 ---
 
@@ -254,9 +246,10 @@ The admin page also lets you set a device's kind (phone / desktop / auto layout)
 | `LAN_GATE_TRUSTED_PROXIES` | empty | Comma-separated IP list. When the proxy and gateway aren't on the same host (i.e. not a loopback socket), list the proxy's egress IP here so the gateway trusts the `X-Forwarded-For`/`X-Forwarded-Proto` it sends |
 | `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | VAPID contact for Web Push. **Set this to a real mailto: address or https:// URL**: Apple rejects placeholder subjects with `403 BadJwtToken`, silently killing push to every iOS device (Google/Mozilla do not check). The gateway warns at startup if it looks invalid |
 | `LAN_GATE_LANG` | `auto` | Language of the pages the gateway serves itself (pairing, rate-limit, admin) and of the push opt-in card it injects into the app. `auto` follows the request's `Accept-Language` — the only language signal a pairing visitor ever volunteers; with no such header it falls back to Chinese. `zh`/`en` pin it and ignore the browser |
-| `DSH_PUSH_LANG` | `zh` | Language of the notification copy itself (approval pending / question pending / turn finished). Deliberately **not** autodetected: a notification is produced host-side, where there is no request header and launchd hands the process no `LANG` (`Intl` reports `en-US` even on a Chinese user's machine). Set `en` explicitly for English |
+| `LAN_GATE_RELAY_SECRET` | *(auto-generated)* | The relay shared secret: since 2.0.0 it is how a desktop client's forwarded request proves to the host's relay routes that the marker headers were written by this gateway. **Minted fresh by the plugin on every load** of the main entry (32 random bytes handed to the gateway child through the environment, unconditionally overwriting) and **not externally settable** — a value hand-placed in the host environment is overwritten or deleted at child startup; when the plugin doesn't supply one (client role, standalone load) the header feature is off and the gateway stamps nothing |
+| `DSH_PUSH_LANG` | `zh` | Language of the notification copy itself (approval pending / question pending / turn finished). Since 2.0.0 it is an env override over the settings `lang`; with neither set the copy is Chinese. Deliberately **not** autodetected: a notification is produced host-side, where there is no request header and launchd hands the process no `LANG` (`Intl` reports `en-US` even on a Chinese user's machine). Set `en` explicitly for English |
 
-Besides env vars, the **recommended way is the config file** `~/.dsh/lan-gate.config.json` (shared by the gateway and the push plugin; restart `dsh web` after editing; explicit env vars win over the file):
+Besides env vars, **the recommended surface is the dsh-zen-remote settings block in the DSH Plugins page** (the full field table lives in the root README); the legacy `~/.dsh/lan-gate.config.json` keeps working. Per field the first legal value wins in this order: **environment variable > plugin row settings > `lan-gate.config.json` > default** — a value that fails its field's check makes that layer transparent (a hand-edited `port: "abc"` surfaces the file's port, not an error). File keys = env var names minus the prefix, camelCased:
 
 ```json
 {
@@ -267,30 +260,65 @@ Besides env vars, the **recommended way is the config file** `~/.dsh/lan-gate.co
 }
 ```
 
-Field names = env var names minus the prefix, camelCased: `port` / `host` / `targetPort` / `rateLimit` / `trustedProxies` / `vapidSubject`, plus the push half `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool` (the `push_notify` tool switch, defaults to `true`). Language is a single shared key, `lang`: the gateway understands `auto` (follow the browser) / `zh` / `en`, the push half understands only `en` and treats everything else as Chinese — so `"lang": "auto"` means "pages follow the browser, notifications stay Chinese". On DSH versions whose insert rows support Cordis config, the same camelCase fields under the row's `config:` work too.
+The push half adds `pushTurnEnd` / `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool`. Language is a single shared key, `lang`: the gateway understands `auto` (follow the browser) / `zh` / `en`, the push half understands only `en` and treats everything else as Chinese — so `"lang": "auto"` means "pages follow the browser, notifications stay Chinese". Two more keys live outside the settings surface: `pushApprovalGraceMs` (env `DSH_PUSH_APPROVAL_GRACE_MS`). The 2.0 fields `role` (`host`/`client` — the one 2.0 field the file layer also reads), `serverName`, `idleHours`, `autoShareNewSessions`, `serverUrl` and `deviceToken` come from the settings page or the plugin row, not this file.
 
-The optional push host plugin mounts via the profile patch (`~/.dsh/profiles/web/cordis.patch.yml`):
+Saving a field that needs a gateway/push restart (`role`, `port`, `host`, `targetPort`, `rateLimit`, `trustedProxies`, `vapidSubject`, `lang`, and the push fields) makes the plugin detect the change and reload its own row — the gateway child restarts with it, no app restart needed.
 
-```yaml
-- insert:
-    - id: the gateway half-push
-      name: the gateway half/dsh-push.mjs
-```
+Since 2.0.0 the gateway and the push half **no longer take one row each**: the package's own `cordis.patch.yml` mounts a single `dsh-zen-remote` row, and the main entry loads the two sub-plugins itself with `ctx.plugin()`, per `role`, handing them the merged effective config. Stale `dsh-zen-remote-gateway` / `dsh-zen-remote-push` rows left in a profile patch are warned about and skipped by the loader — delete them; re-adding a gateway row by hand would spawn a second gateway process fighting over the port.
 
 ---
 
 ## Admin API
 
-All of the following endpoints are **local-direct-connection only**: the request's socket must be a loopback address and carry no `X-Forwarded-*` headers at all. Anything that came through the proxy (which always carries forwarded headers) gets 403 — the public internet can never reach these.
+All of the following endpoints are **local-direct-connection only**: the request's socket must be a loopback address and carry no `X-Forwarded-*` headers at all. Anything that came through the proxy (which always carries forwarded headers) gets 403 — the public internet can never reach these. Since 2.0.0 the caller is the plugin backend, not a browser admin page: requests from the settings page arrive on the same-origin routes `/_dsh/zen-remote/admin/*` and the host process calls the gateway below **as** the local machine (forwarded requests wearing the `x-zen-remote-via` marker may read status but are refused for every mutation).
 
 | Endpoint | Method | What | Params |
 | --- | --- | --- | --- |
-| `/lan-gate/pair` | POST | Generate a new one-time pairing code (valid 10 minutes) | none |
-| `/lan-gate/status` | GET | Read running state, the current pairing code, the list of paired devices | none |
-| `/lan-gate/action` | POST | Manage a device | `action`: `set-kind` / `rename` / `revoke` / `revoke-all`; `id`: device id (not needed for `revoke-all`); `set-kind` also needs `kind` (`phone`/`desktop`/`auto`); `rename` also needs `name` |
+| `/lan-gate/pair` | POST | Generate a new one-time pairing code (valid 10 minutes). **The code is role-bound** | `role` (optional): `desktop-client` mints a desktop-app-device code; absent/unparsable means a web-device code. The response carries `role` |
+| `/lan-gate/status` | GET | Read running state, the current pairing code, the list of paired devices (each with its `role`) | none |
+| `/lan-gate/action` | POST | Manage a device | `action`: `set-role` / `set-kind` / `rename` / `revoke` / `revoke-all`; `id`: device id (not needed for `revoke-all`); `set-role` also needs `role` (`web`/`desktop-client` — switching to `desktop-client` deletes the device's push subscription); `set-kind` also needs `kind` (`phone`/`desktop`/`auto`); `rename` also needs `name` |
 | `/pwa/push/send` | POST | Send one push to every subscribed device | `title`, `body` (plain text, no conversation content) |
 
-The exception is `/lan-gate/pair/claim` (POST) — the one endpoint reachable from anywhere, since it's how a device redeems the pairing code for a token in the first place. It's protected by the code itself (single-use, 10-minute TTL) and a failure lockout (5 wrong codes locks that IP for 15 minutes), not by local identity.
+The redemption endpoints are the exception reachable from anywhere, protected by the code itself (single-use, 10-minute TTL) and a failure lockout (5 wrong codes locks that IP for 15 minutes) — each channel accepting only its own role:
+
+- `/lan-gate/pair/claim` (POST) — the browser pairing page, **web-device** codes only, issues a cookie on success;
+- `/lan-gate/pair/claim-desktop` (POST) — desktop-client pairing, **desktop-device** codes only, the token travels in the JSON body (`{ok, id, name, token}`), never as a cookie.
+
+A role mismatch answers 403 `role-mismatch` with a localized message; the wrong-channel code is not consumed and does not count toward the lockout.
+
+---
+
+## The remote relay (desktop clients' data channel)
+
+A desktop client has no DSH login cookie, and the relay deliberately does not forward DSH's native `/api` or WebSocket connections. Instead the client and the host speak zen-remote's own relay protocol: **every single call is a plain HTTP POST, every streaming subscription is an HTTP streaming response**, all under the host plugin's dedicated prefix `/_dsh/zen-remote/relay/`, entering and leaving through the gateway. No hand-rolled WebSocket; the client aborts the request to cancel a subscription.
+
+**Three gates, re-checked per request:**
+
+1. **Gateway device auth** — the request must carry a valid desktop-client device token (Bearer), and the gateway forwards desktop-client traffic into the relay prefix only;
+2. **Marker headers + shared secret** — the gateway stamps every admitted forward with `x-zen-remote-via: gateway`, `x-zen-remote-role`, `x-zen-remote-device` and `x-zen-remote-secret` (the shared secret); client-forged copies of that namespace are stripped at the gateway's entrance. The relay routes re-verify the secret and the marker headers on every request — any mismatch is 401. Without the secret, any local process could hit `127.0.0.1` directly and forge the markers;
+3. **A per-method allowlist** — every allowed method is registered with EXACTLY the argument fields that locate its session; authorization looks at those fields and nothing else, and any method not in the table is refused. This is deliberately **not** "scan the arguments for session ids": DSH's parameter validation silently drops unknown names, so a hostile client could pad a decoy shared id into a call whose real ownership field goes unchecked.
+
+**Routes** (prefix `/_dsh/zen-remote/relay`):
+
+| Route | Method | What |
+| --- | --- | --- |
+| `/ping` | GET | Liveness probe, `{ok:true}` |
+| `/v1/handshake` | POST | Handshake: exchanges the relay protocol version, server id / display name, DSH version, and the interface fingerprint tables. A relay-protocol-version mismatch refuses the connection |
+| `/v1/invoke` | POST | One DSH remote call on a shared session (single-shot, JSON in and out) |
+| `/v1/stream` | POST | Opens one DSH stream subscription. **NDJSON format**: one JSON value per line; `{"type":"ping"}` heartbeat lines (every 15s by default) keep reverse proxies from timing idle streams away; when a share closes or a subscription loses its session the server writes `{"type":"error","error":{"code":"unshared"}}` and ends the response |
+| `/v1/event-result` | POST | The answer half for approval/question events (`{eventId, result}`); the server matches it against what it forwarded, per device, before handing it over |
+| `/v1/unshare` | POST | The client closes a session's remote access itself (table members only) |
+
+**The allowlist** (everything else is `forbidden-method`): session reads and writes (`session/follow`, `session/page`, `session/prompt`, `session/cancel`, `session/rename`, `session/selectModel`, `session/updateQueue`, `session/attachment`, `session/projections`), creation and forking (`session/create`, `session/fork` — results auto-share), subagents (`subagents/prompt`, `subagents/interruptByParent`, judged by the parent), attachments and @ references (`fileUploads/upload`, `fileReferences/list`, `sessionReferenceResolver/candidates`), the panel long tail (`goals/*` five verbs, `commands/list|execute`, `agentPresets/select`, `sessionFeedback/record`), file tree and previews (`workspaceFiles/list|changes|read|readBytes|stat`), terminals (`terminal/*`), jobs (`job/list|follow|kill`), `skills/list`, message feedback (`messageFeedback/*`), `schedule/list`, workspace session ops (`workspace/pinSession` and friends), plus three global reads: the `session/control` stream, `session/list` and the `workspace/follow` stream. The globals carry no session argument — their safety is **output filtering**: every frame / every result row is narrowed by the share table before it is written, so an unshared session's row never reaches the client. Approval/question events ride a `$zr/events` subscription, each forwarded event judged by its `agentId`.
+
+**Security boundary of the relay:**
+
+- The server executes everything through the DSH gateway service's public invoke/stream methods, under the operator identity — **it never replaces DSH internals**;
+- Subagent and fork sessions never enter the table; reachability walks the ancestor chain (a shared ancestor shares the family);
+- Prompt text is scanned too: a `dsh-session:` reference embedded in a prompt naming an unshared session is refused server-side;
+- Terminals are deliberate (a desktop client is a trusted device): what opens is a **server-side** PTY running as the server user, without the agent sandbox or approval restrictions; closing the session's remote access kills its terminal streams with it;
+- `workspaceFiles/read` and friends are not contained to the session directory (DSH itself does not contain them) — anything the server process can read is readable, under the same trusted-device premise as terminals;
+- Concurrent streams are budgeted per device (32), event answers are matched against the subscription and device they were forwarded to, and deliveries no client can answer are abstained on the client's behalf so a server-side tool call never hangs.
 
 ---
 
@@ -310,14 +338,18 @@ The exception is `/lan-gate/pair/claim` (POST) — the one endpoint reachable fr
 
 **What's covered:**
 - Pairing-code brute force — the code is single-use with a 10-minute TTL, and 5 wrong attempts locks that source IP for 15 minutes.
-- Revocable tokens — lost phone, lent-out device, one click on the admin page and it stops working immediately.
+- Role-bound codes — a web-device code cannot redeem through the desktop channel and vice versa; wrong-channel attempts neither consume the code nor count toward the lockout.
+- Revocable tokens — lost device, lent-out machine, one click in the settings block and it stops working immediately (open connections and push subscriptions die with it).
+- Desktop clients are fenced into the relay prefix — every other path (DSH pages, `/api` included) gets 403.
+- The relay's three gates — device token, gateway marker headers + the per-load shared secret (`LAN_GATE_RELAY_SECRET`, not externally settable), and the per-method allowlist with output filtering; an unshared session's data never leaves the box.
 - Request volume — rate-limited per resolved real client IP, 120/min by default, 429 past that.
-- The admin surface is local-only — generating pairing codes, managing devices, triggering pushes: all local-direct-connection only, and anything through the proxy (always carries forwarded headers) gets 403.
+- The admin surface is local-only — generating pairing codes, managing devices, triggering pushes: all local-direct-connection only, and anything through the proxy (always carries forwarded headers) gets 403; a forwarded request wearing the gateway marker may read but never mutate.
 
 **What's not covered — your responsibility:**
 - A misconfigured reverse proxy — e.g. accidentally exposing `127.0.0.1:3088/lan-gate/admin` on the public domain too, or a wrong `X-Forwarded-Proto` making the gateway misjudge the client's protocol. These are configuration mistakes the gateway can't defend against.
-- A stolen or shared token — this is a single-user tool; the token is equivalent to full access, with no finer-grained permission tiers. Whoever has the token can use it — if you suspect a leak, revoke it and re-pair from the admin page.
-- DSH's own capability boundary — the gateway only forwards HTTPS traffic to DSH safely; it can't and doesn't add security measures DSH itself doesn't have (DSH's own `/api` trust fence is DSH's concern).
+- A stolen or shared token — this is a single-user tool; the token is equivalent to full access, with no finer-grained permission tiers. Whoever has the token can use it — if you suspect a leak, revoke it and re-pair from the settings page.
+- **A desktop client is a trusted device** — its terminal runs as the server user without the agent sandbox or approval restrictions, file previews are not contained to the session directory, and it can create sessions in any server workspace. "Only shared sessions are visible" constrains session data, not the machine; giving a pairing code to a computer you don't trust is handing it the machine.
+- DSH's own capability boundary — the gateway only forwards traffic to DSH safely; it can't and doesn't add security measures DSH itself doesn't have (DSH's own `/api` trust fence is DSH's concern).
 - The state file `~/.dsh/lan-gate-state.json` stores the VAPID private key and every device's token in plaintext — this file *is* full access to your gateway. Mind its file permissions on the host, and don't sync `~/.dsh` into a shared drive or an untrusted backup location.
 
 ---
@@ -359,8 +391,8 @@ npm test   # boots a mock upstream, runs the gateway/auth/push suites: proxy+inj
 
 | Path | Role |
 | --- | --- |
-| `lan-gate.mjs` | Cordis entry: spawns the gateway child process and manages its lifecycle |
-| `dsh-push.mjs` | Optional agent-done push host plugin, calls the gateway's local `/pwa/push/send`; also registers the `push_notify` model tool |
+| `lan-gate.mjs` | Gateway sub-plugin entry, loaded by the main entry on the host role: spawns the gateway child process and manages its lifecycle |
+| `dsh-push.mjs` | Push sub-plugin (loaded alongside the gateway on the host role): listens on the DSH event bus, calls the gateway's local `/pwa/push/send`, and registers the `push_notify` model tool |
 | `lib/lan-gate-server.cjs` | The gateway itself: single-file CommonJS (Node stdlib + one runtime dependency, `web-push`) — HTTP/WebSocket reverse proxy, pairing/tokens, rate limiting, PWA injection, Web Push |
 | `pwa/manifest.json` | PWA install manifest |
 | `pwa/sw.js` | Service worker (offline caching + push notifications) |
