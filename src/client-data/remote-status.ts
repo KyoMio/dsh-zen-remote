@@ -80,10 +80,15 @@ export function parseRemoteStatusBody(body: unknown, now: number): RemoteStatusV
   }
 }
 
-// --- the icon's three states -------------------------------------------------
+// --- the icon's states -------------------------------------------------------
 
 /** The locale keys `describeRemoteStatus` needs. */
-export type RemoteStatusTextKey = 'remoteStatusOnline' | 'remoteStatusOffline' | 'remoteStatusMismatch'
+export type RemoteStatusTextKey =
+  | 'remoteStatusOnline'
+  | 'remoteStatusOffline'
+  | 'remoteStatusMismatch'
+  | 'remoteStatusRevoked'
+  | 'remoteStatusUnpaired'
 
 /** Minimal shape of the framework `t` seat over the plugin's namespace. */
 export type RemoteStatusFormatter = (key: RemoteStatusTextKey) => string
@@ -95,12 +100,13 @@ export function createZhRemoteStatusFormatter(): RemoteStatusFormatter {
   return (key) => zh[key]
 }
 
-/** The icon's three states and its hover line (T34). `revoked` / `unpaired`
- * render as the grey offline state — the link is not serving either way, and
- * the group title carries the precise word. A version mismatch only ever
- * shows while online (an offline link outranks it). */
+/** The icon's states and its hover line (T34, refined by T34-fix): online
+ * (lit), offline (grey, reconnecting), mismatch (yellow, only ever while
+ * online — an offline link outranks it), and `revoked` / `unpaired` as
+ * states of their OWN (T34-fix) — the hover and the click say the precise
+ * word, never "reconnecting", because neither recovers on its own. */
 export interface RemoteStatusDescription {
-  state: 'online' | 'offline' | 'mismatch'
+  state: 'online' | 'offline' | 'mismatch' | 'revoked' | 'unpaired'
   hoverText: string
 }
 
@@ -109,6 +115,8 @@ export function describeRemoteStatus(
   t: RemoteStatusFormatter = createZhRemoteStatusFormatter(),
 ): RemoteStatusDescription {
   if (view === undefined || view === null) return { state: 'offline', hoverText: t('remoteStatusOffline') }
+  if (view.state === 'revoked') return { state: 'revoked', hoverText: t('remoteStatusRevoked') }
+  if (view.state === 'unpaired') return { state: 'unpaired', hoverText: t('remoteStatusUnpaired') }
   if (view.state === 'online') {
     return view.versionMismatch
       ? { state: 'mismatch', hoverText: t('remoteStatusMismatch') }

@@ -44,8 +44,10 @@ export const CLIENT_RECONNECT_ROUTE = `${CLIENT_ROUTE_PREFIX}/reconnect`
 
 /** GET: the remote-session status the T34 client parts render from (T34) —
  * the relay's serving state, the interface-compatibility verdict, the
- * handshake's server name, and the closed-session map. Both roles register
- * it; it carries no token and no server address. */
+ * handshake's server name, and the closed-session map. The prefix is
+ * registered on BOTH roles (T34-fix): a host — no relay client wired —
+ * answers the empty `{state:'unpaired', versionMismatch:false, serverName:'',
+ * closed:{}}` conclusion. It carries no token and no server address. */
 export const CLIENT_REMOTE_STATUS_ROUTE = `${CLIENT_ROUTE_PREFIX}/remote-status`
 
 /** POST `{sessionId: <虚拟 id>}`: close one remote session from THIS machine

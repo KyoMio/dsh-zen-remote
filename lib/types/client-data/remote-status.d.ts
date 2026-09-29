@@ -53,19 +53,20 @@ export interface RemoteStatusSnapshot {
  * loop. */
 export declare function parseRemoteStatusBody(body: unknown, now: number): RemoteStatusView;
 /** The locale keys `describeRemoteStatus` needs. */
-export type RemoteStatusTextKey = 'remoteStatusOnline' | 'remoteStatusOffline' | 'remoteStatusMismatch';
+export type RemoteStatusTextKey = 'remoteStatusOnline' | 'remoteStatusOffline' | 'remoteStatusMismatch' | 'remoteStatusRevoked' | 'remoteStatusUnpaired';
 /** Minimal shape of the framework `t` seat over the plugin's namespace. */
 export type RemoteStatusFormatter = (key: RemoteStatusTextKey) => string;
 /** Default formatter: the plugin's Chinese dictionary. Components pass their
  * real framework `t`; this serves the pure-function callers (tests, check
  * scripts). */
 export declare function createZhRemoteStatusFormatter(): RemoteStatusFormatter;
-/** The icon's three states and its hover line (T34). `revoked` / `unpaired`
- * render as the grey offline state — the link is not serving either way, and
- * the group title carries the precise word. A version mismatch only ever
- * shows while online (an offline link outranks it). */
+/** The icon's states and its hover line (T34, refined by T34-fix): online
+ * (lit), offline (grey, reconnecting), mismatch (yellow, only ever while
+ * online — an offline link outranks it), and `revoked` / `unpaired` as
+ * states of their OWN (T34-fix) — the hover and the click say the precise
+ * word, never "reconnecting", because neither recovers on its own. */
 export interface RemoteStatusDescription {
-    state: 'online' | 'offline' | 'mismatch';
+    state: 'online' | 'offline' | 'mismatch' | 'revoked' | 'unpaired';
     hoverText: string;
 }
 export declare function describeRemoteStatus(view: RemoteStatusView | undefined | null, t?: RemoteStatusFormatter): RemoteStatusDescription;
