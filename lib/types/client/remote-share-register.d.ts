@@ -8,14 +8,23 @@
  * trick register-settings.ts uses).
  *
  * Registers the title-row remote icon on
- * `conversation.session.header.actions` (order 20, beside the official
- * jobs entry) and the remote toggle on
+ * `conversation.session.header.actions` (order 25, past the official jobs
+ * entry at 20 so the two never tie) and the remote toggle on
  * `sidebar.workspaces.session.menu.item` (order 500, under the official
  * archive row, behind a group hairline), plus the one stylesheet both
- * surfaces need. No new service is required — the parts read the shared
- * shares store singleton (src/client-data/shares.ts) over plain fetch, so
- * there is nothing to inject and nothing that can keep the plugin from
- * loading.
+ * surfaces need.
+ *
+ * The parts render and poll only on the HOST role (T33b-fix): this module
+ * wires the shares store's role from the SAME two-level decision the
+ * settings page makes (settings-form.ts's shared `settingsRoleOf`) — the
+ * configForms row document first, and while the row is silent the effective
+ * role probed from `/_dsh/mobile-nav/client-config` (T17: the route carries
+ * the merged role). The decision re-runs on every scope snapshot update, so
+ * a snapshot that resolves late — or a row whose role appears after the
+ * probe already answered — re-decides, and a deployment switched back to
+ * host recovers. The wiring hangs off a lazy `ctx.inject(['configForms'], …)`;
+ * where the settings service never arrives, one fallback probe wires the
+ * role on its own (guarded: a snapshot answer always wins over it).
  *
  * The `sidebar.workspaces.session.menu.item` SlotMap entry is declared here
  * as a structural mirror: this package does not depend on
@@ -30,6 +39,7 @@
 import type { ReactNode } from 'react';
 import type { SessionId } from './compat/types.ts';
 import type { ClientContext } from './compat/types.ts';
+import type { SharesStore } from '../client-data/shares.ts';
 import type { RemoteHeaderIconProps } from './RemoteHeaderIcon.tsx';
 import type { RemoteShareMenuProps } from './RemoteShareMenu.tsx';
 /** The `[open, setOpen]` pair the workspace Menu hands every row entry. */
@@ -56,6 +66,41 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 export type RemoteHeaderIconComponent = (props: RemoteHeaderIconProps) => ReactNode;
 /** The menu-item component (a .tsx factory result; parameter for Node). */
 export type RemoteShareMenuComponent = (props: RemoteShareMenuProps) => ReactNode;
+/** How one probe is issued — the real route reader, or the check/test
+ * double. `refetch` mirrors {@link probeClientConfigRole}: true drops any
+ * cached answer and asks again. */
+export type ClientConfigProbe = (refetch?: boolean) => Promise<'host' | 'client' | undefined>;
+export interface WireSharesRoleOptions {
+    /** Called once a definite verdict was applied (the no-configForms
+     * fallback checks this before trusting its own probe). */
+    onVerdict?: () => void;
+    /** The probe to consult while the row document is silent. Defaults to
+     * the real client-config reader; tests inject a controllable double so
+     * they never depend on module-level probe state. */
+    probe?: ClientConfigProbe;
+}
+/**
+ * Wire a shares store's role off one configForms scope: the saved row role
+ * wins (settingsRoleOf), while the row is silent the client-config probe
+ * fills the gap, and every scope update re-decides. Verdicts of
+ * `'unknown'` — snapshot still loading, probe pending or FAILED — leave
+ * the store untouched: nothing polls and nothing renders (never a guessed
+ * host). A scope STATUS change (loading→ready, a mirror resync) drops the
+ * probe answer and probes again, the same two signals the settings page's
+ * probe effect re-runs on.
+ * @param scope - the plugin row's shared configuration form scope.
+ * @param store - the shares store whose role this wiring drives.
+ * @param options - verdict callback and probe injection.
+ * @returns disposer releasing the scope subscription.
+ */
+export declare function wireSharesRole(scope: {
+    getSnapshot(): {
+        status: 'loading' | 'ready' | 'unavailable';
+        value?: unknown;
+        user?: unknown;
+    };
+    subscribe(listener: () => void): () => void;
+}, store: Pick<SharesStore, 'setRole'>, options?: WireSharesRoleOptions): () => void;
 /**
  * Register the stylesheet and the two sharing parts. Gate-independent by
  * design — the caller (apply) places this before its desktop gate.

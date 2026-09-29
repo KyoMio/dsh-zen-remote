@@ -1,8 +1,9 @@
 /**
- * Session-sharing data for the browser half (T33b): the shared-session table
- * behind the three entry points (session "…" menu item, title-row remote
- * icon, settings-page shared list). Browser-import-free so
- * scripts/check-shares.mjs drives it directly with a fake fetch:
+ * Session-sharing data for the browser half (T33b + T33b-fix): the
+ * shared-session table behind the three entry points (session "…" menu
+ * item, title-row remote icon, settings-page shared list).
+ * Browser-import-free so scripts/check-shares.mjs drives it directly with a
+ * fake fetch:
  *
  * - `parseSharesBody(body, now)` maps the `GET /_dsh/zen-remote/admin/shares`
  *   body (T33a: `{ ok, shares:[{ sessionId, sharedAt, lastActivityAt, busy,
@@ -12,13 +13,16 @@
  * - `describeShare(entry, now, t?)` maps one entry (or the absence of one)
  *   to the icon's three states — off / on / watched (a desktop client is
  *   viewing) — plus the hover line (idle time left, or the busy copy);
- * - `createSharesStore(fetchImpl)` is the subscription store every part
- *   shares: latest-wins GETs, visibility-aware polling (fetch once on
- *   becoming visible, then every 30 s; paused while hidden; started by the
- *   first subscriber, stopped by the last), and the three POST actions that
- *   refresh immediately after landing. A 404 latches `available: false` and
- *   stops the polling for good — the shares route exists only on the host
- *   role, so that latch is the client-role gate for the T33b parts;
+ * - `shareFailText(outcome, action, t)` maps a refused share/unshare to the
+ *   one-line `window.alert` copy, keyed by the server's error code;
+ * - `createSharesStore(fetchImpl, visibility?, pollMs?)` is the subscription
+ *   store every part shares. The ROLE gates everything (T33b-fix): until
+ *   the registration wires a role nothing polls and nothing renders; only
+ *   a host polls. A failed GET — 404 during a plugin reload, a dropped
+ *   connection, anything — fails exactly its own round: the last table
+ *   stays on screen and the next tick asks again; no latch, no permanent
+ *   shutdown. The poll cadence is visibility-shaped: the timer only runs
+ *   while the page is visible, becoming visible pulls once immediately;
  * - `getSharesStore()` is the page-wide singleton the registered components
  *   read, so exactly one poll loop exists no matter how many parts mount.
  */
@@ -46,10 +50,16 @@ export interface ShareEntryView {
 
 /** Everything the parts read off the store, one frozen object per change. */
 export interface SharesSnapshot {
+  /**
+   * The deployment role, wired by the registration from the SAME decision
+   * the settings page makes (row document first, client-config probe as the
+   * fallback — settings-form.ts's settingsRoleOf). `'unknown'` until that
+   * wiring answers: nothing polls, the parts render nothing. `'client'`
+   * hides the parts and stops the polling; switching back to host resumes.
+   */
+  role: 'unknown' | 'host' | 'client'
   /** One GET has answered ok — parts render nothing before this. */
   ready: boolean
-  /** The shares route exists here (host role). A 404 latches this false. */
-  available: boolean
   entries: readonly ShareEntryView[]
 }
 
@@ -110,6 +120,8 @@ export function describeShare(
   return { state: entry.viewers > 0 ? 'watched' : 'on', remainingText }
 }
 
+// --- share/unshare outcomes ---------------------------------------------------
+
 /** Parse one GET body tolerantly: a garbage shape is an empty table, a
  * garbage row is dropped — never a throw into the polling loop. */
 export function parseSharesBody(body: unknown, now: number): ShareEntryView[] {
@@ -140,41 +152,101 @@ export function parseSharesBody(body: unknown, now: number): ShareEntryView[] {
   return entries
 }
 
+/** How one share/unshare/unshare-all POST ended. A refused action carries
+ * the server's error `code` when it sent one (`subagent-session`,
+ * `no-session`, …) for the alert copy to key on. */
+export type ShareActionOutcome =
+  | { ok: true }
+  | { ok: false, code?: string, message?: string }
+
+/** The action verbs the POST route takes (mirror of the server's set). */
+export type ShareAction = 'share' | 'unshare' | 'unshare-all'
+
+/** The locale keys `shareFailText` needs. */
+export type ShareFailTextKey = 'shareRemoteFailSubagent' | 'shareRemoteFailEmpty' | 'shareRemoteFailGeneric'
+export type ShareFailTextFormatter = (key: ShareFailTextKey) => string
+
+/**
+ * The one-line `window.alert` copy for a refused action (T33b-fix): the
+ * share-specific server codes map to their reasons, everything else —
+ * including every unshare failure — reads as the generic retry line.
+ */
+export function shareFailText(outcome: { ok: boolean, code?: string }, action: ShareAction, t: ShareFailTextFormatter): string {
+  if (action === 'share') {
+    if (outcome.code === 'subagent-session') return t('shareRemoteFailSubagent')
+    if (outcome.code === 'no-session') return t('shareRemoteFailEmpty')
+  }
+  return t('shareRemoteFailGeneric')
+}
+
+// --- the store ---------------------------------------------------------------
+
+/** Whether the page is currently visible, plus change notifications — the
+ * seam that keeps the poll cadence visibility-shaped while staying
+ * testable (the check script injects a controllable source). */
+export interface VisibilitySource {
+  visible(): boolean
+  subscribe(listener: () => void): () => void
+}
+
+/** The real source: `visibilitychange` off `document` (Node: always visible,
+ * never notifying). */
+export const documentVisibility: VisibilitySource = {
+  visible: () => typeof document === 'undefined' || document.visibilityState !== 'hidden',
+  subscribe: (listener) => {
+    if (typeof document === 'undefined') return () => {}
+    document.addEventListener('visibilitychange', listener)
+    return () => { document.removeEventListener('visibilitychange', listener) }
+  },
+}
+
 /** The store face the three T33b parts share. */
 export interface SharesStore {
   /** The current snapshot — a stable frozen reference until the next change. */
   getSnapshot(): SharesSnapshot
-  /** Observe snapshot replacements; the FIRST subscriber starts the poll
-   * loop, the LAST unsubscriber stops it. */
+  /** Observe snapshot replacements; polling runs while at least one
+   * listener is attached AND the wired role is host AND the page is
+   * visible. */
   subscribe(listener: () => void): () => void
+  /** Wire the deployment role (settings-form.ts's settingsRoleOf verdict,
+   * re-applied on every configForms snapshot update). Flipping back to host
+   * resumes polling with an immediate pull; flipping to client stops it. */
+  setRole(role: 'host' | 'client'): void
   /** GET now (latest-wins). @returns whether an ok body landed. */
   refresh(): Promise<boolean>
-  /** POST share, then refresh immediately. @returns whether the POST landed. */
-  share(sessionId: string): Promise<boolean>
-  /** POST unshare for one session, then refresh. @returns POST outcome. */
-  unshare(sessionId: string): Promise<boolean>
-  /** POST unshare-all, then refresh. @returns POST outcome. */
-  unshareAll(): Promise<boolean>
+  /** POST share, then refresh immediately. @returns the action's outcome. */
+  share(sessionId: string): Promise<ShareActionOutcome>
+  /** POST unshare for one session, then refresh. @returns the outcome. */
+  unshare(sessionId: string): Promise<ShareActionOutcome>
+  /** POST unshare-all, then refresh. @returns the outcome. */
+  unshareAll(): Promise<ShareActionOutcome>
 }
 
-/** Poll cadence while the page is visible and at least one part is mounted. */
+/** Poll cadence while the page is visible, the role is host, and at least
+ * one part is mounted. */
 export const SHARES_POLL_MS = 30_000
 
 /**
- * Build one store over an injectable fetch. The GET is latest-wins (T16's
- * gate): an earlier request answering late never overwrites a newer table.
- * A 404 — the shares route does not exist here, i.e. this deployment is not
- * the host — latches `available: false` and retires the poll loop; every
- * other failure keeps the last ready table on screen.
+ * Build one store over an injectable fetch and visibility source. The GET is
+ * latest-wins (T16's gate): an earlier request answering late never
+ * overwrites a newer table. Every GET failure fails its own round only —
+ * the last ready table stays up and the next tick retries (a plugin reload
+ * serving a few 404s must not blind the page until reload). The timer is
+ * real while visible and gone while hidden; becoming visible pulls once
+ * immediately. `pollMs` exists for the check script: the shipped cadence is
+ * far too slow for a test to observe, so tests run a few cycles at 5 ms.
  */
-export function createSharesStore(fetchImpl: typeof fetch): SharesStore {
+export function createSharesStore(
+  fetchImpl: typeof fetch,
+  visibility: VisibilitySource = documentVisibility,
+  pollMs: number = SHARES_POLL_MS,
+): SharesStore {
   const gate = createLatestGate()
   const listeners = new Set<() => void>()
-  let snapshot: SharesSnapshot = Object.freeze({ ready: false, available: true, entries: Object.freeze([]) })
-  // The 404 latch: once the route is known absent, polling never starts again.
-  let available = true
-  let interval: ReturnType<typeof setInterval> | undefined
-  let visibilityHooked = false
+  let role: SharesSnapshot['role'] = 'unknown'
+  let snapshot: SharesSnapshot = Object.freeze({ role, ready: false, entries: Object.freeze([]) })
+  let timer: ReturnType<typeof setInterval> | undefined
+  let offVisibility: (() => void) | undefined
 
   const publish = (): void => {
     for (const listener of [...listeners]) listener()
@@ -182,25 +254,23 @@ export function createSharesStore(fetchImpl: typeof fetch): SharesStore {
 
   const applyBody = (body: unknown): void => {
     snapshot = Object.freeze({
+      role,
       ready: true,
-      available: true,
       entries: Object.freeze(parseSharesBody(body, Date.now())),
     })
     publish()
   }
 
   const refresh = async (): Promise<boolean> => {
-    if (!available) return false
+    // A client (or not-yet-wired) deployment never asks: the route does not
+    // exist there, and the settings-page rule holds — no wasted admin/* 404s.
+    if (role !== 'host') return false
     const ticket = gate.next()
     try {
       const res = await fetchImpl(ADMIN_SHARES_ROUTE, { cache: 'no-store' })
-      if (res.status === 404) {
-        available = false
-        stopPolling()
-        snapshot = Object.freeze({ ready: false, available: false, entries: Object.freeze([]) })
-        publish()
-        return false
-      }
+      if (!gate.isLatest(ticket)) return false
+      // 404 during a plugin reload, a 5xx, a broken body — all fail exactly
+      // this round: keep the last table, answer false, retry next tick.
       if (!res.ok) return false
       const body = await res.json().catch(() => undefined) as unknown
       if (body === undefined || (body as { ok?: unknown }).ok !== true) return false
@@ -212,55 +282,74 @@ export function createSharesStore(fetchImpl: typeof fetch): SharesStore {
     }
   }
 
-  const post = async (payload: Record<string, unknown>): Promise<boolean> => {
+  const post = async (payload: Record<string, unknown>): Promise<ShareActionOutcome> => {
+    let outcome: ShareActionOutcome = { ok: false }
     try {
       const res = await fetchImpl(ADMIN_SHARES_ROUTE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       })
-      const body = await res.json().catch(() => ({})) as { ok?: unknown }
-      if (!(res.ok && body.ok === true)) return false
+      const body = await res.json().catch(() => ({})) as { ok?: unknown, error?: { code?: unknown, message?: unknown } }
+      if (res.ok && body.ok === true) outcome = { ok: true }
+      else {
+        outcome = { ok: false }
+        const error = body.error !== null && typeof body.error === 'object' ? body.error : {}
+        if (typeof error.code === 'string') outcome.code = error.code
+        if (typeof error.message === 'string') outcome.message = error.message
+      }
     } catch {
-      return false
+      outcome = { ok: false }
     }
     // The action landed — the table must say so before the next poll tick.
-    await refresh()
-    return true
+    if (outcome.ok) await refresh()
+    return outcome
   }
 
-  const tick = (): void => {
-    // setInterval keeps firing while hidden; the fetch inside is what the
-    // visibility gate stops, so a hidden page stays request-free.
-    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
-    void refresh()
+  const startTimer = (): void => {
+    if (timer === undefined) timer = setInterval(() => { void refresh() }, pollMs)
+  }
+
+  const stopTimer = (): void => {
+    if (timer !== undefined) {
+      clearInterval(timer)
+      timer = undefined
+    }
   }
 
   const onVisibility = (): void => {
-    if (interval === undefined) return
-    // Becoming visible pulls once immediately; hiding just stops the timer
-    // (the tick's own gate covers the race in between).
-    if (typeof document === 'undefined' || document.visibilityState !== 'hidden') void refresh()
-  }
-
-  const startPolling = (): void => {
-    if (!available || interval !== undefined) return
-    void refresh()
-    interval = setInterval(tick, SHARES_POLL_MS)
-    if (!visibilityHooked && typeof document !== 'undefined') {
-      visibilityHooked = true
-      document.addEventListener('visibilitychange', onVisibility)
+    if (role !== 'host' || listeners.size === 0) return
+    if (visibility.visible()) {
+      // Becoming visible pulls once immediately, then resumes the cadence.
+      void refresh()
+      startTimer()
+    } else {
+      // Hidden: the timer is really gone, not just gated inside the tick.
+      stopTimer()
     }
   }
 
-  const stopPolling = (): void => {
-    if (interval !== undefined) {
-      clearInterval(interval)
-      interval = undefined
+  /** Reconcile the poll machinery with (role, listeners, visibility). */
+  const syncPolling = (): void => {
+    const shouldRun = role === 'host' && listeners.size > 0
+    if (!shouldRun) {
+      stopTimer()
+      if (offVisibility !== undefined) {
+        offVisibility()
+        offVisibility = undefined
+      }
+      return
     }
-    if (visibilityHooked && typeof document !== 'undefined') {
-      visibilityHooked = false
-      document.removeEventListener('visibilitychange', onVisibility)
+    if (offVisibility === undefined) offVisibility = visibility.subscribe(onVisibility)
+    if (!visibility.visible()) {
+      stopTimer()
+      return
+    }
+    if (timer === undefined) {
+      // Fresh run — first subscriber, or a client→host flip: pull once right
+      // away instead of leaving the first table up to one cadence away.
+      void refresh()
+      startTimer()
     }
   }
 
@@ -268,11 +357,18 @@ export function createSharesStore(fetchImpl: typeof fetch): SharesStore {
     getSnapshot: () => snapshot,
     subscribe(listener: () => void): () => void {
       listeners.add(listener)
-      if (listeners.size === 1) startPolling()
+      syncPolling()
       return () => {
         listeners.delete(listener)
-        if (listeners.size === 0) stopPolling()
+        syncPolling()
       }
+    },
+    setRole(next: 'host' | 'client'): void {
+      if (role === next) return
+      role = next
+      syncPolling()
+      snapshot = Object.freeze({ ...snapshot, role })
+      publish()
     },
     refresh,
     share: (sessionId: string) => post({ action: 'share', sessionId }),
