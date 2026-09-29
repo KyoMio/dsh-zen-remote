@@ -27,12 +27,36 @@
  *   childSessionId, mode}` — and DSH's `validateAddress` re-checks that the
  *   child belongs to the parent, so judging a subagent call by the parent id
  *   is authoritative. Any other kind, or a missing id, is a refusal.
- * - every other registered method carries `request.sessionId`.
+ * - every other method registered before T31 carries `request.sessionId`.
+ *
+ * T31 additions, each verified against the 0.2.0 sources before registering:
+ *
+ * - `session/create` carries `request.workspaceId` — a WORKSPACE id, never
+ *   share-checked (workspaces do not live in the share table): it must be
+ *   present, and the relay route validates it against the server's live
+ *   workspace list before forwarding (relay-server.ts). The new session is
+ *   auto-shared there, which is what makes the entry safe at all.
+ * - `session/fork` carries `request.sessionId` (the SOURCE session); the
+ *   forked child is auto-shared after the call succeeds.
+ * - `subagents/prompt` (`request.parentSessionId`) and
+ *   `subagents/interruptByParent` (TOP-LEVEL `parentSessionId`) are judged
+ *   by the parent: DSH re-validates the parent-child link itself
+ *   (`authorizeLineage` on both delivery paths of prompt; the user-authority
+ *   check inside `interrupt`), so an unshared child can no more be reached
+ *   than an unshared parent — it is refused server-side by DSH.
+ * - `fileUploads/upload` and `fileReferences/list` carry a TOP-LEVEL
+ *   `agentId`: the gateway's `agent` lookup resolves it through the agent
+ *   registry keyed by SESSION id (dsh-agent registers wire `agentId`,
+ *   wireTypeSymbol `SessionId`), so it IS the session id and shares its
+ *   check. A shared `request.sessionId` padded next to it buys nothing —
+ *   only the registered field is read.
  *
  * Pure functions: no I/O, no clock, the share-table lookup is injected.
  */
 /** Which standing filter the caller must apply to a global stream's frames
- * (`src/relay-filter.ts` owns both implementations). */
+ * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
+ * forwarding subscription is filtered by relay-server.ts itself — it needs
+ * the per-eventId registry, not a pure frame function). */
 export type StreamFilter = 'workspace' | 'control';
 /** Which standing filter the caller must apply to an invoke result before it
  * travels (currently only the unscoped `session/list`). */
@@ -49,11 +73,13 @@ export type InvokeDecision = {
 };
 /** One stream decision: allow (global streams carry a `streamFilter`, scoped
  * streams list the session ids the subscription depends on — the relay kills
- * the stream and counts viewers with them), or the 403 reason. */
+ * the stream and counts viewers with them, and the event subscription sets
+ * `events`), or the 403 reason. */
 export type StreamDecision = {
     allow: true;
     filter?: StreamFilter;
     sessionIds: string[];
+    events?: true;
 } | {
     allow: false;
     reason: InvokeDenyReason;
@@ -88,4 +114,20 @@ export declare function decideInvoke(namespace: string, method: string, args: un
  *    subscription when one of them stops being shared.
  */
 export declare function decideStream(namespace: string, method: string, args: unknown, isAccessible: (sessionId: string) => boolean): StreamDecision;
+/**
+ * The `$events/result` answer body (T32), as the client sends it:
+ * `{ eventId, result }`. `result` is the Remote event OUTCOME and travels
+ * VERBATIM — dsh-api-gateway's `parseRemoteEventResult` is the validator
+ * (exactly `{clientId,eventId,outcome}` up there; kinds `next` / `result`
+ * with optional JSON `value` / `rejected` with `{name,message,code?,details?}`),
+ * and a malformed one comes back as the gateway's own 200 error envelope, so
+ * re-validating here would only invent a second dialect for the same refusal.
+ * `eventId` ownership (forwarded on a live subscription, session still
+ * reachable) is the ROUTE's check — it needs the handler's registry.
+ */
+export interface EventResultBody {
+    eventId: string;
+    result: Record<string, unknown>;
+}
+export declare function parseEventResultBody(body: unknown): EventResultBody | undefined;
 //# sourceMappingURL=relay-access.d.ts.map

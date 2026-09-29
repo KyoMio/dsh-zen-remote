@@ -27,16 +27,53 @@
  *   childSessionId, mode}` — and DSH's `validateAddress` re-checks that the
  *   child belongs to the parent, so judging a subagent call by the parent id
  *   is authoritative. Any other kind, or a missing id, is a refusal.
- * - every other registered method carries `request.sessionId`.
+ * - every other method registered before T31 carries `request.sessionId`.
+ *
+ * T31 additions, each verified against the 0.2.0 sources before registering:
+ *
+ * - `session/create` carries `request.workspaceId` — a WORKSPACE id, never
+ *   share-checked (workspaces do not live in the share table): it must be
+ *   present, and the relay route validates it against the server's live
+ *   workspace list before forwarding (relay-server.ts). The new session is
+ *   auto-shared there, which is what makes the entry safe at all.
+ * - `session/fork` carries `request.sessionId` (the SOURCE session); the
+ *   forked child is auto-shared after the call succeeds.
+ * - `subagents/prompt` (`request.parentSessionId`) and
+ *   `subagents/interruptByParent` (TOP-LEVEL `parentSessionId`) are judged
+ *   by the parent: DSH re-validates the parent-child link itself
+ *   (`authorizeLineage` on both delivery paths of prompt; the user-authority
+ *   check inside `interrupt`), so an unshared child can no more be reached
+ *   than an unshared parent — it is refused server-side by DSH.
+ * - `fileUploads/upload` and `fileReferences/list` carry a TOP-LEVEL
+ *   `agentId`: the gateway's `agent` lookup resolves it through the agent
+ *   registry keyed by SESSION id (dsh-agent registers wire `agentId`,
+ *   wireTypeSymbol `SessionId`), so it IS the session id and shares its
+ *   check. A shared `request.sessionId` padded next to it buys nothing —
+ *   only the registered field is read.
  *
  * Pure functions: no I/O, no clock, the share-table lookup is injected.
  */
 
-/** The argument fields that can locate a session, as registered per method. */
-type SessionField = 'request.sessionId' | 'request.address'
+/**
+ * The argument fields that can locate a session, as registered per method.
+ * A field named without a dot is TOP-LEVEL (`agentId`, `parentSessionId`);
+ * the `request.*` forms live inside the `request` object. Every field except
+ * `request.workspaceId` must yield an id that passes the share-table check;
+ * `request.workspaceId` must merely be present (its validation is the relay
+ * route's workspace probe, not this table).
+ */
+type SessionField =
+  | 'request.sessionId'
+  | 'request.address'
+  | 'request.parentSessionId'
+  | 'request.workspaceId'
+  | 'parentSessionId'
+  | 'agentId'
 
 /** Which standing filter the caller must apply to a global stream's frames
- * (`src/relay-filter.ts` owns both implementations). */
+ * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
+ * forwarding subscription is filtered by relay-server.ts itself — it needs
+ * the per-eventId registry, not a pure frame function). */
 export type StreamFilter = 'workspace' | 'control'
 
 /** Which standing filter the caller must apply to an invoke result before it
@@ -56,18 +93,27 @@ interface RelayMethod {
   /** Set on the two GLOBAL streams: every frame of such a subscription must
    * go through the named filter before it is written. */
   streamFilter?: StreamFilter
-  /** Set on invoke methods whose RESULT needs a standing filter. */
+  /** Set on the invoke methods whose RESULT needs a standing filter. */
   resultFilter?: InvokeFilter
+  /** The one EVENT-FORWARDING entry (T32, `$zr/events`): the stream route
+   * opens the gateway's `$events` wire stream (never `gw.stream`, spike §2.1
+   * 坑 1) and filters frames by the waterfall's `agentId`; the answer route
+   * matches `eventId`s against what was forwarded. Like the global reads it
+   * claims no session field — access is judged per frame / per answer. */
+  events?: true
 }
 
 /**
  * The registry. Deliberately small: everything not listed here — plugin and
- * account management, settings, credentials, terminal, `session/create` /
- * `session/fork` (new sessions must auto-share, T31), `subagents/*` (T31
- * re-verifies ownership first), the methods located by other ids
- * (`schedule/update|delete|history`, `goals/*`, `fileReferences/*`,
- * `fileUploads/*`, `workspaceFiles/*` — P4 verifies DSH's ownership checks) —
- * is refused by default.
+ * account management, settings, credentials, terminal, the methods located
+ * by other ids (`schedule/update|delete|history`, `goals/*`,
+ * `fileUploads/list|resolve`, `workspaceFiles/*`) — is refused by default.
+ *
+ * T31 registered the five session-creating / agent-scoped calls after
+ * verifying their ownership story (see the field notes above): creations
+ * auto-share their result (relay-server.ts), the subagents calls are judged
+ * by the parent DSH itself re-validates, and the two `agentId` methods are
+ * located by the session id that name resolves to.
  *
  * The unscoped reads are registered as FILTERED controlled paths (T22b):
  * `workspace/follow` and `session/control` stream globally but every frame
@@ -86,6 +132,18 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'session/selectModel': { fields: ['request.sessionId'] },
   'session/updateQueue': { fields: ['request.sessionId'] },
   'session/attachment': { fields: ['request.sessionId'] },
+  // session/* — creation and forking (T31): the route validates the workspace
+  // / source session and auto-shares the NEW session from the result
+  'session/create': { fields: ['request.workspaceId'] },
+  'session/fork': { fields: ['request.sessionId'] },
+  // subagents (T31) — judged by the PARENT session; DSH re-validates that the
+  // addressed child belongs to it on every path
+  'subagents/prompt': { fields: ['request.parentSessionId'] },
+  'subagents/interruptByParent': { fields: ['parentSessionId'] },
+  // attachments and @ references (T31) — the top-level agentId resolves
+  // through the agent registry keyed by session id, so it IS the session id
+  'fileUploads/upload': { fields: ['agentId'] },
+  'fileReferences/list': { fields: ['agentId'] },
   // session/* — the global control stream and the unscoped list
   'session/control': { fields: [], stream: true, streamFilter: 'control' },
   'session/list': { fields: [], resultFilter: 'session-list' },
@@ -107,6 +165,9 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'workspace/unarchiveSession': { fields: ['request.sessionId'] },
   // workspace — the global follow stream
   'workspace/follow': { fields: [], stream: true, streamFilter: 'workspace' },
+  // the forwarded-event subscription (T32): special entry, no session fields —
+  // its frames are judged per `agentId`, its answers per forwarded `eventId`
+  '$zr/events': { fields: [], stream: true, events: true },
 }
 
 /** One invoke decision: allow (optionally through a standing result filter),
@@ -117,9 +178,10 @@ export type InvokeDecision = { allow: true; filter?: InvokeFilter } | { allow: f
 
 /** One stream decision: allow (global streams carry a `streamFilter`, scoped
  * streams list the session ids the subscription depends on — the relay kills
- * the stream and counts viewers with them), or the 403 reason. */
+ * the stream and counts viewers with them, and the event subscription sets
+ * `events`), or the 403 reason. */
 export type StreamDecision =
-  | { allow: true; filter?: StreamFilter; sessionIds: string[] }
+  | { allow: true; filter?: StreamFilter; sessionIds: string[]; events?: true }
   | { allow: false; reason: InvokeDenyReason }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -139,8 +201,12 @@ function ownedId(value: unknown): string | undefined {
  *
  * `request.address` contributes its session id by kind: `session` →
  * `sessionId`, `subagent` → `parentSessionId` (the child never enters the
- * share table; DSH validates the parent-child link server-side). Any other
- * kind, or a missing id, makes the method unauthorizable.
+ * share table; DSH validates the parent-child link server-side). The
+ * top-level fields (`agentId`, `parentSessionId`) read the argument object
+ * itself. `request.workspaceId` contributes NO id — it must be present, but
+ * its authorization is the route's workspace probe plus the auto-share of
+ * the created session, not this table. Any other kind, or a missing id,
+ * makes the method unauthorizable.
  */
 function claimedSessionIds(entry: RelayMethod, args: unknown): { ids: string[] } | { reason: InvokeDenyReason } {
   // Field-less entries (the global reads) claim nothing by construction —
@@ -148,14 +214,33 @@ function claimedSessionIds(entry: RelayMethod, args: unknown): { ids: string[] }
   // own (`session/list` takes `_request`, not `request`).
   if (entry.fields.length === 0) return { ids: [] }
   if (!isPlainObject(args)) return { reason: 'no-session' }
-  const request = args.request
-  if (!isPlainObject(request)) return { reason: 'no-session' }
   const ids: string[] = []
   for (const field of entry.fields) {
+    // Top-level fields read the argument object itself.
+    if (field === 'agentId' || field === 'parentSessionId') {
+      const id = ownedId(args[field])
+      if (id === undefined) return { reason: 'no-session' }
+      ids.push(id)
+      continue
+    }
+    const request = args.request
+    if (!isPlainObject(request)) return { reason: 'no-session' }
     if (field === 'request.sessionId') {
       const id = ownedId(request.sessionId)
       if (id === undefined) return { reason: 'no-session' }
       ids.push(id)
+      continue
+    }
+    if (field === 'request.parentSessionId') {
+      const id = ownedId(request.parentSessionId)
+      if (id === undefined) return { reason: 'no-session' }
+      ids.push(id)
+      continue
+    }
+    if (field === 'request.workspaceId') {
+      // Present and a non-empty string, but never share-checked — see the
+      // SessionField note.
+      if (ownedId(request.workspaceId) === undefined) return { reason: 'no-session' }
       continue
     }
     // 'request.address'
@@ -230,10 +315,35 @@ export function decideStream(
   const entry = RELAY_METHODS[`${namespace}/${method}`]
   if (entry === undefined || entry.stream !== true) return { allow: false, reason: 'forbidden-method' }
   if (entry.streamFilter !== undefined) return { allow: true, filter: entry.streamFilter, sessionIds: [] }
+  if (entry.events === true) return { allow: true, sessionIds: [], events: true }
   const claimed = claimedSessionIds(entry, args)
   if ('reason' in claimed) return { allow: false, reason: claimed.reason }
   for (const id of claimed.ids) {
     if (!isAccessible(id)) return { allow: false, reason: 'not-shared' }
   }
   return { allow: true, sessionIds: claimed.ids }
+}
+
+/**
+ * The `$events/result` answer body (T32), as the client sends it:
+ * `{ eventId, result }`. `result` is the Remote event OUTCOME and travels
+ * VERBATIM — dsh-api-gateway's `parseRemoteEventResult` is the validator
+ * (exactly `{clientId,eventId,outcome}` up there; kinds `next` / `result`
+ * with optional JSON `value` / `rejected` with `{name,message,code?,details?}`),
+ * and a malformed one comes back as the gateway's own 200 error envelope, so
+ * re-validating here would only invent a second dialect for the same refusal.
+ * `eventId` ownership (forwarded on a live subscription, session still
+ * reachable) is the ROUTE's check — it needs the handler's registry.
+ */
+export interface EventResultBody {
+  eventId: string
+  result: Record<string, unknown>
+}
+
+export function parseEventResultBody(body: unknown): EventResultBody | undefined {
+  if (!isPlainObject(body)) return undefined
+  const { eventId, result } = body
+  if (typeof eventId !== 'string' || eventId === '') return undefined
+  if (!isPlainObject(result)) return undefined
+  return { eventId, result }
 }
