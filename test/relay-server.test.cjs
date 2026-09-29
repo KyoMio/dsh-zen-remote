@@ -252,20 +252,23 @@ test('invoke: parentOf wiring — a child of a shared ancestor passes through th
 
 // ---- invoke: refusals -------------------------------------------------------------
 
-test('invoke: the three reviewer bypasses are 403 forbidden-method and never reach the gateway', async () => {
+test('invoke: the three reviewer bypasses are 403 and never reach the gateway', async () => {
   const parts = makeParts('invoke-bypass')
   parts.store.share('S-shared')
   const server = await startServer(parts.handler)
   try {
     const bypasses = [
-      ['session/search + decoy', { namespace: 'session', method: 'search', args: { request: { query: 'password', sessionId: 'S-shared' } } }],
-      ['goals/create + agentId + decoy', { namespace: 'goals', method: 'create', args: { agentId: 'VICTIM', request: { objective: 'x', maxGoalRounds: 3, sessionId: 'S-shared' } } }],
-      ['subagents/prompt + parentSessionId + decoy', { namespace: 'subagents', method: 'prompt', args: { request: { requestId: 'r', parentSessionId: 'VICTIM', childSessionId: 'C', mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: 'hi' }], sessionId: 'S-shared' } } }],
+      ['session/search + decoy', { namespace: 'session', method: 'search', args: { request: { query: 'password', sessionId: 'S-shared' } } }, 'forbidden-method'],
+      ['goals/create + agentId + decoy', { namespace: 'goals', method: 'create', args: { agentId: 'VICTIM', request: { objective: 'x', maxGoalRounds: 3, sessionId: 'S-shared' } } }, 'forbidden-method'],
+      // T31 registered subagents/prompt (judged by the parent): the decoy no
+      // longer buys a forbidden-method — the unshared PARENT refuses, and the
+      // padded shared sessionId changes nothing.
+      ['subagents/prompt + parentSessionId + decoy', { namespace: 'subagents', method: 'prompt', args: { request: { requestId: 'r', parentSessionId: 'VICTIM', childSessionId: 'C', mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: 'hi' }], sessionId: 'S-shared' } } }, 'not-shared'],
     ]
-    for (const [label, body] of bypasses) {
+    for (const [label, body, code] of bypasses) {
       const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', body, AUTH))
       assert.equal(res.status, 403, label)
-      assert.deepEqual(await res.json(), { ok: false, error: { code: 'forbidden-method' } }, label)
+      assert.deepEqual(await res.json(), { ok: false, error: { code } }, label)
     }
     assert.equal(parts.calls.length, 0, 'none of the bypass attempts reached the gateway')
   } finally { await server.stop() }
@@ -498,14 +501,60 @@ test('invoke: malformed bodies and fields are 400 bad-request', async () => {
   } finally { await server.stop() }
 })
 
-test('invoke: a body past the 1 MiB cap drains and answers 400', async () => {
-  const parts = makeParts('invoke-big')
+test('stream: a body past the 1 MiB cap drains and answers 413 payload-too-large', async () => {
+  // The generic ceiling lives on (invoke now carries the prompt-sized one):
+  // the stream route still refuses a body over 1 MiB — as 413, distinct
+  // from a 400 malformed-JSON answer.
+  const parts = makeParts('stream-big')
   const server = await startServer(parts.handler)
   try {
-    const body = JSON.stringify({ namespace: 'session', method: 'page', args: { request: { address: { kind: 'session', sessionId: 'session-a' }, pad: 'x'.repeat(1024 * 1024) } } })
+    const body = JSON.stringify({ namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } }, pad: 'x'.repeat(1024 * 1024) } })
+    assert.ok(body.length > 1024 * 1024)
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/stream', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body })
+    assert.equal(res.status, 413)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'payload-too-large', details: {} } })
+    assert.equal(parts.streamCalls.length, 0)
+  } finally { await server.stop() }
+})
+
+test('invoke: a body over the generic 1 MiB cap now parses (T31 prompt headroom)', async () => {
+  // The prompt routes carry inline images far past 1 MiB, so the invoke
+  // route widened its ceiling — a ~2 MiB body reaches the access table
+  // instead of dying in the body reader.
+  const parts = makeParts('invoke-upload-size')
+  parts.store.share('session-a')
+  const server = await startServer(parts.handler)
+  try {
+    const body = JSON.stringify({ namespace: 'fileUploads', method: 'upload', args: { agentId: 'session-a', request: { data: 'A'.repeat(2 * 1024 * 1024), name: 'big.png' } } })
     assert.ok(body.length > 1024 * 1024)
     const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body })
+    assert.equal(res.status, 200)
+    assert.equal((await res.json()).ok, true)
+    assert.equal(parts.calls.length, 1)
+    assert.equal(parts.calls[0].namespace, 'fileUploads')
+  } finally { await server.stop() }
+})
+
+test('invoke: a body past the invoke cap (32 MiB) drains and answers 413 payload-too-large', async () => {
+  const parts = makeParts('invoke-huge')
+  const server = await startServer(parts.handler)
+  try {
+    const body = JSON.stringify({ namespace: 'fileUploads', method: 'upload', args: { agentId: 'session-a', request: { data: 'A'.repeat(33 * 1024 * 1024) } } })
+    assert.ok(body.length > 32 * 1024 * 1024)
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body })
+    assert.equal(res.status, 413, 'oversize is 413 — a 400 would read as malformed JSON')
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'payload-too-large', details: {} } })
+    assert.equal(parts.calls.length, 0)
+  } finally { await server.stop() }
+})
+
+test('invoke: malformed JSON stays a 400, distinct from the 413 oversize answer', async () => {
+  const parts = makeParts('invoke-bad-json')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: '{"namespace": "session", ' })
     assert.equal(res.status, 400)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'bad-request' } })
     assert.equal(parts.calls.length, 0)
   } finally { await server.stop() }
 })
@@ -629,5 +678,178 @@ test('T42-fix handshake: fingerprints are computed per handshake and a thrown co
     const body3 = await third.json()
     assert.equal(body3.ok, true)
     assert.deepEqual(body3.fingerprints, {}, 'a thrown compute degrades to the empty map')
+  } finally { await server.stop() }
+})
+
+// ---- T31: session/create, session/fork, subagents, agentId-located calls -------------
+
+/** One `workspace/follow` baseline shaped like the workspace-controller codec. */
+const WORKSPACE = (workspaceId, path) => ({ workspaceId, path, title: workspaceId, sessionIds: [], createdAt: '2026-01-01', updatedAt: '2026-01-01' })
+/** A stream override answering the workspace probe (other namespaces: an empty job feed). */
+const workspaceStream = (workspaces) => async (call) => {
+  if (call.namespace === 'workspace' && call.method === 'follow') {
+    return (async function* () { yield { type: 'baseline', value: { items: workspaces, archivedSessionIds: [], pinnedSessionIds: [] } } })()
+  }
+  return (async function* () { yield { type: 'rows', jobs: [] } })()
+}
+
+test('T31 create: an existing workspace is forwarded pinned to it, and the new session is shared', async () => {
+  const parts = makeParts('t31-create-ok', { stream: workspaceStream([WORKSPACE('W-1', '/srv/proj')]), value: { sessionId: 'session-new' } })
+  const server = await startServer(parts.handler)
+  try {
+    const args = { request: { workspaceId: 'W-1', cwd: '/client/side/path', sessionId: 'session-attacker' } }
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'create', args }, AUTH))
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { ok: true, value: { sessionId: 'session-new' } })
+    // The probe was one throwaway workspace/follow stream.
+    assert.equal(parts.streamCalls.length, 1)
+    assert.equal(parts.streamCalls[0].namespace, 'workspace')
+    assert.equal(parts.streamCalls[0].method, 'follow')
+    // The forwarded call kept the workspace and lost the client's cwd and
+    // session id (DSH takes workspace.path as the cwd and mints the id).
+    assert.equal(parts.calls.length, 1)
+    assert.deepEqual(parts.calls[0].args, { request: { workspaceId: 'W-1' } })
+    // Born shared: the client only ever sees shared sessions.
+    assert.equal(parts.store.isShared('session-new'), true)
+  } finally { await server.stop() }
+})
+
+test('T31-fix create: the forwarded request is a WHITELIST — unknown fields never reach the gateway', async () => {
+  const parts = makeParts('t31-create-whitelist', { stream: workspaceStream([WORKSPACE('W-1', '/srv/proj')]), value: { sessionId: 'session-new' } })
+  const server = await startServer(parts.handler)
+  try {
+    // Unknown/forbidden fields (env, permissionMode, cwd, a caller-chosen
+    // sessionId) ride in like any hostile padding — the rebuild leaves only
+    // the two fields DSH's create understands, agentPreset among them when
+    // it is a string.
+    const args = {
+      request: {
+        workspaceId: 'W-1',
+        agentPreset: 'coder',
+        cwd: '/client/side/path',
+        sessionId: 'session-attacker',
+        env: { SECRET: 'leak' },
+        permissionMode: 'yolo',
+      },
+    }
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'create', args }, AUTH))
+    assert.equal(res.status, 200)
+    assert.equal(parts.calls.length, 1)
+    assert.deepEqual(parts.calls[0].args, { request: { workspaceId: 'W-1', agentPreset: 'coder' } })
+    // A non-string agentPreset is dropped too (the wire field is a string).
+    const odd = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'create', args: { request: { workspaceId: 'W-1', agentPreset: 42, env: 'x' } } }, AUTH))
+    assert.equal(odd.status, 200)
+    assert.deepEqual(parts.calls[1].args, { request: { workspaceId: 'W-1' } })
+  } finally { await server.stop() }
+})
+
+test('T31-fix: a gateway failure shares NOTHING for create or fork', async () => {
+  const parts = makeParts('t31-no-share-on-error', {
+    stream: workspaceStream([WORKSPACE('W-1', '/srv/proj')]),
+    throw: Object.assign(new Error('attach failed'), { code: 'session/workspace-attach-failed' }),
+  })
+  parts.store.share('S-src')
+  const server = await startServer(parts.handler)
+  try {
+    const created = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'create', args: { request: { workspaceId: 'W-1' } } }, AUTH))
+    assert.equal(created.status, 200)
+    assert.deepEqual(await created.json(), { ok: false, error: { code: 'session/workspace-attach-failed', message: 'attach failed' } })
+    const forked = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'fork', args: { request: { sessionId: 'S-src', atSeq: 1 } } }, AUTH))
+    assert.equal(forked.status, 200)
+    assert.deepEqual(await forked.json(), { ok: false, error: { code: 'session/workspace-attach-failed', message: 'attach failed' } })
+    // No result, no share — a session the table never saw is not the
+    // client's to reach, and nothing was created to leak. (The fork SOURCE
+    // 'S-src' is legitimately in the table — it had to be for the call to
+    // reach the gateway at all.)
+    for (const id of ['session-new', 'session-forked']) assert.equal(parts.store.isShared(id), false, id)
+  } finally { await server.stop() }
+})
+
+test('T31 create: an unknown workspace is a 403 workspace/not-found and never reaches the gateway', async () => {
+  const parts = makeParts('t31-create-miss', { stream: workspaceStream([WORKSPACE('W-other', '/srv/other')]) })
+  const server = await startServer(parts.handler)
+  try {
+    for (const workspaceId of ['W-missing', 'zr~abcd1234~W-1']) {
+      const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'create', args: { request: { workspaceId } } }, AUTH))
+      assert.equal(res.status, 403, workspaceId)
+      assert.deepEqual(await res.json(), { ok: false, error: { code: 'workspace/not-found' } }, workspaceId)
+    }
+    assert.equal(parts.calls.length, 0, 'nothing was created')
+    // A `zr~` id must not have leaked into a workspace either way.
+  } finally { await server.stop() }
+})
+
+test('T31 create: a failed workspace probe refuses exactly like a miss', async () => {
+  const parts = makeParts('t31-create-probe-fail', {
+    stream: async () => { throw new Error('probe down') },
+  })
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'create', args: { request: { workspaceId: 'W-1' } } }, AUTH))
+    assert.equal(res.status, 403)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'workspace/not-found' } })
+    assert.equal(parts.calls.length, 0)
+  } finally { await server.stop() }
+})
+
+test('T31 fork: a shared source forks and the child is auto-shared; an unshared source refuses', async () => {
+  const parts = makeParts('t31-fork', { value: { sessionId: 'session-forked' } })
+  parts.store.share('session-src')
+  const server = await startServer(parts.handler)
+  try {
+    const args = { request: { sessionId: 'session-src', atSeq: 4 } }
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'fork', args }, AUTH))
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { ok: true, value: { sessionId: 'session-forked' } })
+    assert.deepEqual(parts.calls[0].args, args, 'the fork arguments travel verbatim')
+    assert.equal(parts.store.isShared('session-forked'), true, 'the fork follows the share')
+
+    const denied = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'fork', args: { request: { sessionId: 'session-secret' } } }, AUTH))
+    assert.equal(denied.status, 403)
+    assert.deepEqual(await denied.json(), { ok: false, error: { code: 'not-shared' } })
+  } finally { await server.stop() }
+})
+
+test('T31 agentId calls: the agentId decides and a shared request.sessionId decoy buys nothing', async () => {
+  const parts = makeParts('t31-agentid')
+  parts.store.share('session-shared')
+  const server = await startServer(parts.handler)
+  try {
+    const decoy = { agentId: 'session-secret', request: { data: 'Zm9v', sessionId: 'session-shared' } }
+    const refused = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'fileUploads', method: 'upload', args: decoy }, AUTH))
+    assert.equal(refused.status, 403, 'the unshared agentId refuses despite the shared decoy')
+    assert.deepEqual(await refused.json(), { ok: false, error: { code: 'not-shared' } })
+
+    const refsDecoy = { agentId: 'session-secret', query: 'src', request: { sessionId: 'session-shared' } }
+    const refusedRefs = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'fileReferences', method: 'list', args: refsDecoy }, AUTH))
+    assert.equal(refusedRefs.status, 403)
+    assert.deepEqual(await refusedRefs.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 0)
+
+    const upload = { agentId: 'session-shared', request: { data: 'Zm9v', name: 'x.png' } }
+    const ok = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'fileUploads', method: 'upload', args: upload }, AUTH))
+    assert.equal(ok.status, 200)
+    assert.deepEqual(parts.calls[0].args, upload, 'the upload travels verbatim')
+  } finally { await server.stop() }
+})
+
+test('T31 subagents: both calls forward by the shared parent, child id untouched', async () => {
+  const parts = makeParts('t31-subagents')
+  parts.store.share('session-parent')
+  const server = await startServer(parts.handler)
+  try {
+    const prompt = { request: { requestId: 'r1', parentSessionId: 'session-parent', childSessionId: 'session-child', mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: '你好' }] } }
+    const okPrompt = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'prompt', args: prompt }, AUTH))
+    assert.equal(okPrompt.status, 200)
+    assert.deepEqual(parts.calls[0].args, prompt, 'the child id rides in original form; DSH validates the pair')
+
+    const interrupt = { childSessionId: 'session-child', parentSessionId: 'session-parent', mode: 'continuable' }
+    const okInterrupt = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'interruptByParent', args: interrupt }, AUTH))
+    assert.equal(okInterrupt.status, 200)
+    assert.deepEqual(parts.calls[1].args, interrupt, 'top-level arguments travel verbatim')
+
+    const denied = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'prompt', args: { request: { requestId: 'r2', parentSessionId: 'session-secret', childSessionId: 'session-parent', mode: 'continuable', delivery: 'queue', content: [] } } }, AUTH))
+    assert.equal(denied.status, 403, 'an unshared parent refuses even with a shared child id')
+    assert.deepEqual(await denied.json(), { ok: false, error: { code: 'not-shared' } })
   } finally { await server.stop() }
 })
