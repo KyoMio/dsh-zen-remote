@@ -81,6 +81,8 @@ export declare const ADMIN_PUSH_TEST_ROUTE = "/_dsh/zen-remote/admin/push-test";
 /** Same-origin client routes the sub-client block talks to (host half: T16). */
 export declare const CLIENT_CLAIM_ROUTE = "/_dsh/zen-remote/client/claim";
 export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
+/** T43: one immediate reconnect — answered 409 unless the client is offline. */
+export declare const CLIENT_RECONNECT_ROUTE = "/_dsh/zen-remote/client/reconnect";
 /** The lightweight client-facing config route (host half, both roles): the
  * settings page's FALLBACK role probe (T17) — it registers wherever a
  * webServer exists, and since T17 its body carries the effective `role`
@@ -99,18 +101,65 @@ export interface ClientConfigBody {
 /** Field name of the row secret the pairing flow writes (never echoed back
  * anywhere; the describe view's secrets sidecar is the only "is it set"). */
 export declare const DEVICE_TOKEN_FIELD = "deviceToken";
-/** The `GET /_dsh/zen-remote/client/status` body, exactly as
+/**
+ * The `GET /_dsh/zen-remote/client/status` body, exactly as
  * src/client-routes.ts answers it: `serverUrl` is present only once a token
  * exists (the unpaired answer is `{ state: 'unpaired' }` alone). The token
- * itself never rides any status response. */
+ * itself never rides any status response. The T43 diagnostics fields ride
+ * only on a failed live connect of a wired relay client; `intercept` (T23b)
+ * and `compat` (T42) are rendered only when the body carries them — earlier
+ * servers answer neither.
+ */
 export interface ClientStatusBody {
     state?: string;
     serverUrl?: string;
+    serverName?: unknown;
+    /** Epoch ms of the relay client's next automatic reconnect (offline only). */
+    nextRetryAt?: unknown;
+    /** The error code of the last failure — a code, never a message or URL. */
+    lastError?: unknown;
+    /** T23b request-interceptor diagnostics (provisional shape; presence-gated). */
+    intercept?: unknown;
+    /** T42 relay compat diagnostics (provisional shape; presence-gated). */
+    compat?: unknown;
+}
+/** One remote-call failure line in the diagnostics lists. */
+export interface ClientDiagFailureView {
+    time: number;
+    method: string;
+    code: string;
+}
+/**
+ * T23b interceptor diagnostics as the block renders them. The wire field is
+ * presence-gated: `undefined` here means the body carried none (an older
+ * server), and the whole interceptor group stays hidden.
+ */
+export interface ClientInterceptView {
+    installed: boolean;
+    /** Shape-detection failure reasons — non-empty means remote features are off. */
+    reasons: string[];
+    /** The most recent remote call failures (at most 10). */
+    recentFailures: ClientDiagFailureView[];
+}
+/** T42 compat diagnostics as the block renders them (presence-gated like {@link ClientInterceptView}). */
+export interface ClientCompatView {
+    /** Names of the groups whose fingerprints differ. */
+    mismatchedGroups: string[];
+    /** The most recent incompatible calls (at most 10). */
+    recentCalls: ClientDiagFailureView[];
 }
 /** One client connection as the block renders it. */
 export interface ClientConnectionView {
-    state: 'unpaired' | 'connected' | 'revoked' | 'unreachable' | 'unexpected' | 'invalid-url';
+    state: 'unpaired' | 'connected' | 'revoked' | 'unreachable' | 'unexpected' | 'invalid-url' | 'incompatible';
     serverUrl: string;
+    serverName: string;
+    /** Verbatim from the body when it carried a finite number; the countdown
+     * math happens at render time against the live clock. */
+    nextRetryAt: number | undefined;
+    /** The last failure's code, '' when none is reported. */
+    lastError: string;
+    intercept: ClientInterceptView | undefined;
+    compat: ClientCompatView | undefined;
 }
 /**
  * Map one `client/status` body into the view the client group renders.
@@ -118,6 +167,41 @@ export interface ClientConnectionView {
  * "unpaired" instead of throwing into the plugin page.
  */
 export declare function deriveClientStatusView(body: ClientStatusBody): ClientConnectionView;
+/**
+ * Which connection line the block renders (T43 diagnostics wording, chosen
+ * as a pure descriptor so the copy table and the countdown math stay
+ * testable without a browser): connected prefers the handshake's server
+ * name; any verdict the body backs with a `nextRetryAt` is OFFLINE first —
+ * the relay client is mid-retry and the line counts down to it, whether the
+ * probe classified the failure `unreachable` or `unexpected` (T43-fix);
+ * without a `nextRetryAt` the two map one plain copy each. The rest map one
+ * state each.
+ */
+export type ClientStatusLine = {
+    kind: 'connectedName';
+    serverName: string;
+} | {
+    kind: 'connected';
+    serverUrl: string;
+} | {
+    kind: 'offlineRetry';
+    seconds: number;
+} | {
+    kind: 'offlineRetrySoon';
+} | {
+    kind: 'unreachable';
+} | {
+    kind: 'revoked';
+} | {
+    kind: 'incompatible';
+} | {
+    kind: 'unexpected';
+} | {
+    kind: 'invalidUrl';
+} | {
+    kind: 'unpaired';
+};
+export declare function clientStatusLineOf(view: ClientConnectionView, now: number): ClientStatusLine;
 /** The `POST /_dsh/zen-remote/client/claim` body (T16's pairing round-trip;
  * on success `token` is the gateway-minted device token — it appears exactly
  * once, on its way into the row's secret field). */

@@ -74,6 +74,11 @@ export interface RelayHandlerOptions {
      * reverse proxies from timing the idle stream away); defaults to 15000.
      * Tests inject a small value. */
     heartbeatMs?: number;
+    /** How long a stream's finish may wait for a backed-up write buffer to
+     * drain before the response is destroyed (T43-A: a client that stopped
+     * reading must not pin the viewer count and the device budget forever);
+     * defaults to 5000. Tests inject a small value. */
+    endDrainTimeoutMs?: number;
 }
 /**
  * The relay route handler plus its introspection surface. A function WITH
@@ -88,8 +93,11 @@ export interface RelayHandler {
      * (across all devices). */
     viewerCount(sessionId: string): number;
     /** End every currently open stream: each client gets one
-     * `error{code:'server-restart'}` line, then the response ends, the upstream
-     * subscription aborts and every counter/listener cleans up. A plugin row
+     * `error{code:'server-restart'}` line, then the response ends (a client
+     * that stopped reading is destroyed after {@link RelayHandlerOptions.endDrainTimeoutMs}),
+     * the upstream subscription aborts and every counter/listener cleans up —
+     * including the handler's own share-table subscriptions, so a table change
+     * after the close never reaches this handler again (T43-B). A plugin row
      * reload builds a new handler and share table; without this the streams of
      * the OLD handler would keep pushing, unreachable by any unshare. */
     closeAll(reason: string): void;

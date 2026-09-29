@@ -44,8 +44,10 @@ import {
   ADMIN_STATUS_ROUTE,
   CLIENT_CLAIM_ROUTE,
   CLIENT_CONFIG_ROUTE,
+  CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
   createLatestGate,
+  clientStatusLineOf,
   deriveClientStatusView,
   deriveSettingsView,
   normalizePairingCode,
@@ -152,14 +154,20 @@ class StatusError extends Error {
 
 type SectionT = SettingsSectionProps['t']
 
-/** Copy of the client group's connection line, one case per probe state. */
-function clientStatusText(view: ClientConnectionView, t: SectionT): string {
-  switch (view.state) {
-    case 'connected': return t('settings.client.statusConnected', { serverUrl: view.serverUrl })
-    case 'revoked': return t('settings.client.statusRevoked')
+/** Copy of the client group's connection line (T43): the pure
+ * {@link clientStatusLineOf} picks the case; this table only binds copy. */
+function clientStatusText(view: ClientConnectionView, now: number, t: SectionT): string {
+  const line = clientStatusLineOf(view, now)
+  switch (line.kind) {
+    case 'connectedName': return t('settings.client.statusConnectedName', { serverName: line.serverName })
+    case 'connected': return t('settings.client.statusConnected', { serverUrl: line.serverUrl })
+    case 'offlineRetry': return t('settings.client.statusOfflineRetry', { seconds: line.seconds })
+    case 'offlineRetrySoon': return t('settings.client.statusOfflineRetrySoon')
     case 'unreachable': return t('settings.client.statusUnreachable')
+    case 'revoked': return t('settings.client.statusRevoked')
+    case 'incompatible': return t('settings.client.statusIncompatible')
     case 'unexpected': return t('settings.client.statusUnexpected')
-    case 'invalid-url': return t('settings.client.statusInvalidUrl')
+    case 'invalidUrl': return t('settings.client.statusInvalidUrl')
     default: return t('settings.client.statusUnpaired')
   }
 }
@@ -222,6 +230,8 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
   const [claimWriteFailed, setClaimWriteFailed] = useState(false)
   const [unpairBusy, setUnpairBusy] = useState(false)
   const [unpairDone, setUnpairDone] = useState(false)
+  // T43: the 立即重连 button's in-flight marker.
+  const [reconnectBusy, setReconnectBusy] = useState(false)
 
   const loadStatus = useCallback(() => {
     const ticket = statusGate.next()
@@ -272,6 +282,42 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
       })
   }, [clientGate])
 
+  // The client group's rendered view, hoisted for the countdown ticker and
+  // the retry-follow refresh below (T43).
+  const clientView = clientLoad.state === 'ready' || clientLoad.state === 'stale' ? clientLoad.view : undefined
+  const clientRetryAt = clientView?.nextRetryAt
+  const clientCountingDown = clientRetryAt !== undefined
+
+  // Offline with a pending retry: refresh the status shortly after the
+  // retry comes due, so a server that came back flips the line to connected
+  // without a manual refresh. A still-offline answer carries the NEXT
+  // nextRetryAt and re-arms this effect.
+  useEffect(() => {
+    if (!clientCountingDown) return
+    const timer = window.setTimeout(() => { loadClientStatus() }, Math.max(0, (clientRetryAt ?? 0) + 1500 - Date.now()))
+    return () => { window.clearTimeout(timer) }
+  }, [clientCountingDown, clientRetryAt, loadClientStatus])
+
+  // T43 立即重连: one POST, then refresh now (the state is at least
+  // "connecting") and once more after the attempt can have settled.
+  const runReconnect = async (): Promise<void> => {
+    setReconnectBusy(true)
+    try {
+      const res = await fetch(CLIENT_RECONNECT_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      if (res.ok) {
+        loadClientStatus()
+        refreshTimers.current.push(window.setTimeout(() => { loadClientStatus() }, 1500))
+      }
+    } catch {
+      // The refreshes tell the story; nothing to add here.
+    }
+    setReconnectBusy(false)
+  }
+
   // The page's role is the SAVED row role from the configForms snapshot —
   // nothing else (T16-fix 3): a client deployment has no admin route at all,
   // so a role judged from admin/status either 404s into host, or — with a
@@ -319,14 +365,15 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
   }, [load, config])
 
   // Re-render every second while a pairing code is on screen so the countdown
-  // follows; both display paths drop the code once `expiresAt` passes.
+  // follows; both display paths drop the code once `expiresAt` passes. T43:
+  // the same ticker drives the offline "将于 N 秒后重试" countdown.
   const pairingShown = data?.pairing !== null && data?.pairing !== undefined
     || (freshPairing !== null && freshPairing.expiresAt > now)
   useEffect(() => {
-    if (!pairingShown) return
+    if (!pairingShown && !clientCountingDown) return
     const timer = window.setInterval(() => { setNow(Date.now()) }, 1000)
     return () => { window.clearInterval(timer) }
-  }, [pairingShown])
+  }, [pairingShown, clientCountingDown])
 
   // Environment-locked fields cannot be staged: a written value would be
   // shadowed by the variable anyway. The controller refuses them; this effect
@@ -662,7 +709,6 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
     </div>
   )
 
-  const clientView = clientLoad.state === 'ready' || clientLoad.state === 'stale' ? clientLoad.view : undefined
   // Whether a landed save moved a restart-required field — read BEFORE save()
   // clears the staged drafts (T17b): the projected snapshot's restartPending
   // is exactly "the plan writes a restart-field op" (value actually differs,
@@ -898,9 +944,21 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
 
           <h3 className="zr-settings-card-title">{t('settings.client.statusTitle')}</h3>
           <div className="zr-settings-row" style={{ paddingBottom: 4 }}>
-            <p className="zr-settings-status-line" style={{ flex: 1 }} data-down={clientView !== undefined && (clientView.state === 'unreachable' || clientView.state === 'unexpected' || clientView.state === 'revoked' || clientView.state === 'invalid-url') ? 'true' : undefined}>
-              {clientView === undefined ? '' : clientStatusText(clientView, t)}
+            <p className="zr-settings-status-line" style={{ flex: 1 }} data-down={clientView !== undefined && (clientView.state === 'unreachable' || clientView.state === 'unexpected' || clientView.state === 'revoked' || clientView.state === 'invalid-url' || clientView.state === 'incompatible') ? 'true' : undefined}>
+              {clientView === undefined ? '' : clientStatusText(clientView, now, t)}
             </p>
+            {/* T43 立即重连: the response carrying a nextRetryAt is the one
+                honest "the relay is offline with a retry armed" signal — the
+                probe word underneath may be unreachable or unexpected; the
+                route 409s anything else anyway (T43-fix). */}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={clientView === undefined || clientView.nextRetryAt === undefined || reconnectBusy}
+              onClick={() => { void runReconnect() }}
+            >
+              {reconnectBusy ? t('settings.client.reconnectBusy') : t('settings.client.reconnect')}
+            </Button>
             <Button variant="outline" size="sm" disabled={clientLoad.state === 'loading'} onClick={loadClientStatus}>
               {clientLoad.state === 'loading' ? t('settings.client.statusRefreshing') : t('settings.client.statusRefresh')}
             </Button>
@@ -914,6 +972,72 @@ function SettingsSectionPage({ config, t }: SettingsSectionProps) {
             </div>
           )}
           {unpairDone && <p className="zr-settings-hint" style={{ paddingBottom: 12 }}>{t('settings.client.unpairDone')}</p>}
+
+          {/* 诊断 (T43): everything on this section comes from the same
+              client/status body. The interceptor (T23b) and compat (T42)
+              groups render only when the response carried their fields —
+              earlier servers answer neither, and the section itself only
+              exists when there is at least one line to show. */}
+          {clientView !== undefined && (clientView.lastError !== '' || clientView.intercept !== undefined || clientView.compat !== undefined) && (
+            <>
+              <h3 className="zr-settings-card-title">{t('settings.client.diagTitle')}</h3>
+              {clientView.lastError !== '' && (
+                <p className="zr-settings-hint" data-invalid={clientView.state === 'unreachable' ? 'true' : undefined}>
+                  {t('settings.client.diagLastError', { code: clientView.lastError })}
+                </p>
+              )}
+              {clientView.intercept !== undefined && (
+                <>
+                  <p className="zr-settings-hint">
+                    {clientView.intercept.installed
+                      ? t('settings.client.diagInterceptInstalled')
+                      : t('settings.client.diagInterceptMissing')}
+                  </p>
+                  {clientView.intercept.reasons.length > 0 && (
+                    <p className="zr-settings-hint" data-invalid="true">
+                      {t('settings.client.diagInterceptDisabled')}
+                      {clientView.intercept.reasons.map((reason, index) => (
+                        <span key={index} className="zr-settings-hint">{reason}</span>
+                      ))}
+                    </p>
+                  )}
+                  {clientView.intercept.recentFailures.length > 0 && (
+                    <div className="zr-settings-field">
+                      <div className="zr-settings-head">
+                        <label>{t('settings.client.diagRecentFailures')}</label>
+                      </div>
+                      {clientView.intercept.recentFailures.map((failure, index) => (
+                        <p key={index} className="zr-settings-hint">
+                          {new Date(failure.time).toLocaleString()} · {failure.method !== '' ? failure.method : '—'} · {failure.code}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+              {clientView.compat !== undefined && (
+                <>
+                  {clientView.compat.mismatchedGroups.length > 0 && (
+                    <p className="zr-settings-hint" data-invalid="true">
+                      {t('settings.client.diagCompatGroups', { groups: clientView.compat.mismatchedGroups.join(', ') })}
+                    </p>
+                  )}
+                  {clientView.compat.recentCalls.length > 0 && (
+                    <div className="zr-settings-field">
+                      <div className="zr-settings-head">
+                        <label>{t('settings.client.diagCompatCalls')}</label>
+                      </div>
+                      {clientView.compat.recentCalls.map((failure, index) => (
+                        <p key={index} className="zr-settings-hint">
+                          {new Date(failure.time).toLocaleString()} · {failure.method !== '' ? failure.method : '—'} · {failure.code}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
         </div>
       )}
     </div>

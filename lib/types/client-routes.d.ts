@@ -26,6 +26,9 @@ export declare const CLIENT_ROUTE_PREFIX = "/_dsh/zen-remote/client";
 export declare const CLIENT_CLAIM_ROUTE = "/_dsh/zen-remote/client/claim";
 /** GET: the current connection state (never carries the token). */
 export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
+/** POST: one immediate reconnect attempt (T43, the settings page's 立即重连);
+ * answered 409 unless the relay client is currently `offline`. */
+export declare const CLIENT_RECONNECT_ROUTE = "/_dsh/zen-remote/client/reconnect";
 /** The fetch face this module needs; injectable for tests. */
 export type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>;
 export interface ClientHandlerOptions {

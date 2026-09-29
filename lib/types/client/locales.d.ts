@@ -194,7 +194,7 @@ export declare const zh: {
     readonly 'settings.client.statusTitle': "连接状态";
     readonly 'settings.client.statusUnpaired': "未配对";
     readonly 'settings.client.statusConnected': "已连接到 {serverUrl}";
-    readonly 'settings.client.statusRevoked': "令牌已失效，请在服务端重新生成桌面应用端配对码后重新配对";
+    readonly 'settings.client.statusRevoked': "令牌已被吊销，请重新配对";
     readonly 'settings.client.statusUnreachable': "服务端当前不可达";
     readonly 'settings.client.statusUnexpected': "服务端版本不支持远程会话（需要 dsh-zen-remote 2.0.0）";
     readonly 'settings.client.statusInvalidUrl': "服务端地址无效或不安全，请重新配对";
@@ -205,6 +205,20 @@ export declare const zh: {
     readonly 'settings.client.unpairBusy': "解除中…";
     readonly 'settings.client.unpairConfirm': "本机将忘记已保存的服务端令牌（服务端的设备记录不受影响）。确定继续？";
     readonly 'settings.client.unpairDone': "本机已忘记令牌；如需彻底失效，请在服务端设备列表中吊销该设备";
+    readonly 'settings.client.reconnect': "立即重连";
+    readonly 'settings.client.reconnectBusy': "重连中…";
+    readonly 'settings.client.statusConnectedName': "已连接到「{serverName}」";
+    readonly 'settings.client.statusOfflineRetry': "离线，将于 {seconds} 秒后重试";
+    readonly 'settings.client.statusOfflineRetrySoon': "离线，即将重试…";
+    readonly 'settings.client.statusIncompatible': "与服务端中继协议不兼容，请升级两端的 dsh-zen-remote";
+    readonly 'settings.client.diagTitle': "诊断";
+    readonly 'settings.client.diagLastError': "最近错误码：{code}";
+    readonly 'settings.client.diagInterceptInstalled': "请求拦截器已安装";
+    readonly 'settings.client.diagInterceptMissing': "请求拦截器未安装";
+    readonly 'settings.client.diagInterceptDisabled': "远程功能已停用：DSH 内部结构与预期不符";
+    readonly 'settings.client.diagRecentFailures': "最近的远程调用失败";
+    readonly 'settings.client.diagCompatGroups': "指纹有差异的组：{groups}";
+    readonly 'settings.client.diagCompatCalls': "最近的不兼容调用";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;
