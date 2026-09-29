@@ -22,6 +22,9 @@
  *   only) never opens a subscription, so nothing polls. A failed GET fails
  *   exactly its own round; the poll cadence is visibility-shaped like the
  *   shares store's;
+ * - `subscribeIfVirtual(store, sessionId, listener)` is the subscribe face
+ *   the parts hand `useSyncExternalStore`: the virtual-id gate lives HERE,
+ *   so a local session mounts without ever opening a subscription;
  * - `getRemoteStatusStore()` is the page-wide singleton.
  */
 /** Same-origin client route feeding this store (host half: T34,
@@ -129,6 +132,15 @@ export declare const REMOTE_STATUS_POLL_MS = 15000;
  * cadence is far too slow to observe.
  */
 export declare function createRemoteStatusStore(fetchImpl: typeof fetch, visibility?: VisibilitySource, pollMs?: number): RemoteStatusStore;
+/**
+ * The subscribe face both T34 parts hand `useSyncExternalStore`: a VIRTUAL-id
+ * session subscribes to the store — the subscription is what keeps it
+ * polling — while a local session gets a no-op, so a page showing only local
+ * sessions (a host's own view of itself) never opens a subscription and never
+ * sends a remote-status request. Pure over (store, sessionId) so the
+ * desktop-gate test drives it with a counting fake fetch.
+ */
+export declare function subscribeIfVirtual(store: RemoteStatusStore, sessionId: string, listener: () => void): () => void;
 /** The page-wide store every registered part reads — one poll loop no
  * matter how many of the icon and banner parts are mounted at once. Created
  * lazily over the real fetch, so check scripts never construct it. */

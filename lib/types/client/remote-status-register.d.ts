@@ -22,9 +22,10 @@
  * to a no-op binding: the banner still renders, the disable is simply absent.
  *
  * No role wiring here, unlike the T33b parts: the store only polls while a
- * part is SUBSCRIBED, and both parts subscribe only for a virtual-id session
- * (the icon and banner render nothing on local sessions) — so a host page
- * never polls, without needing the settings role to tell it apart.
+ * part is SUBSCRIBED, and both parts gate the subscription itself on the
+ * virtual id (remote-status.ts's subscribeIfVirtual — a local session never
+ * opens one) — so a host page never polls, without needing the settings
+ * role to tell it apart.
  */
 import type { ReactNode } from 'react';
 import type { ClientContext } from './compat/types.ts';

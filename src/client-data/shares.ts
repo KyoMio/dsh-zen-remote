@@ -387,3 +387,16 @@ export function getSharesStore(): SharesStore {
   singleton ??= createSharesStore((input, init) => fetch(input, init))
   return singleton
 }
+
+/**
+ * The subscribe face the title-row icon hands `useSyncExternalStore`: on
+ * the phone shell (a non-desktop-shell viewport at or under 767px) the
+ * mobile stylesheet blanket-hides every `conversation.session.header.actions`
+ * entry (styles/header.css.ts), so the icon would never be seen — it does
+ * not subscribe either, and a subscription that never opens never polls.
+ * Pure over (store, phoneShell) so the desktop-gate test drives it with a
+ * counting fake fetch.
+ */
+export function subscribeIfNotPhoneShell(store: SharesStore, phoneShell: boolean, listener: () => void): () => void {
+  return phoneShell ? () => {} : store.subscribe(listener)
+}

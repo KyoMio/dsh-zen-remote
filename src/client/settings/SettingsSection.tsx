@@ -50,6 +50,7 @@ import {
   clientStatusLineOf,
   deriveClientStatusView,
   deriveSettingsView,
+  localOpsAllowed,
   normalizePairingCode,
 } from '../../client-data/settings-form.ts'
 import type {
@@ -111,7 +112,6 @@ type ClientLoad =
 /** One pairing attempt's classified failure, rendered by code. */
 interface PairFail {
   code: string
-  message?: string
   retryAfterMs?: number
 }
 
@@ -177,7 +177,10 @@ function clientStatusText(view: ClientConnectionView, now: number, t: SectionT):
   }
 }
 
-/** Copy of the pairing failure line, one case per claim failure code. */
+/** Copy of the pairing failure line, one case per claim failure code. The
+ * wording is always LOCAL (this build's dictionary), never the server's
+ * message — a remote message arrives in the server's language and can leak
+ * its internals. */
 function pairFailText(fail: PairFail, t: SectionT): string {
   switch (fail.code) {
     case 'invalid': return t('settings.client.failInvalid')
@@ -188,10 +191,7 @@ function pairFailText(fail: PairFail, t: SectionT): string {
       return t('settings.client.failLocked', { minutes })
     }
     case 'unreachable': return t('settings.client.failUnreachable')
-    case 'role-mismatch':
-      return fail.message !== undefined && fail.message !== ''
-        ? fail.message
-        : t('settings.client.failRoleMismatch')
+    case 'role-mismatch': return t('settings.client.failRoleMismatch')
     default: return t('settings.client.failUnexpected')
   }
 }
@@ -296,11 +296,29 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   // Offline with a pending retry: refresh the status shortly after the
   // retry comes due, so a server that came back flips the line to connected
   // without a manual refresh. A still-offline answer carries the NEXT
-  // nextRetryAt and re-arms this effect.
+  // nextRetryAt and re-arms this effect. A HIDDEN page does not fire the
+  // refresh: the timer marks the round missed, and becoming visible catches
+  // up once (the same visibility-shaped cadence the stores keep).
   useEffect(() => {
     if (!clientCountingDown) return
-    const timer = window.setTimeout(() => { loadClientStatus() }, Math.max(0, (clientRetryAt ?? 0) + 1500 - Date.now()))
-    return () => { window.clearTimeout(timer) }
+    let missed = false
+    const timer = window.setTimeout(() => {
+      if (document.visibilityState === 'hidden') {
+        missed = true
+        return
+      }
+      loadClientStatus()
+    }, Math.max(0, (clientRetryAt ?? 0) + 1500 - Date.now()))
+    const onVisibility = (): void => {
+      if (!missed || document.visibilityState !== 'visible') return
+      missed = false
+      loadClientStatus()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   }, [clientCountingDown, clientRetryAt, loadClientStatus])
 
   // T43 立即重连: one POST, then refresh now (the state is at least
@@ -413,8 +431,8 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
 
   // Pairing, device management and the push probe are server-local acts: they
   // stay disabled until a status load answers AND it answered as the local
-  // machine (a remote device gets viaGateway: true).
-  const localOps = data?.viaGateway === false
+  // machine (a remote device gets viaGateway: true) — localOpsAllowed.
+  const localOps = localOpsAllowed(data)
   const localBusy = pairBusy || deviceBusy
 
   const runPair = async (): Promise<void> => {
@@ -507,9 +525,9 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       } else {
         // Every other shape is a failure (T16-fix): a non-OK status, a body
         // whose `ok` is not true, a missing token — shown with the classified
-        // code when the route sent one.
+        // code when the route sent one. The body's `message` is ignored: the
+        // wording is this build's dictionary (pairFailText).
         const fail: PairFail = { code: typeof body.code === 'string' && body.code !== '' ? body.code : 'unexpected' }
-        if (typeof body.message === 'string') fail.message = body.message
         if (typeof body.retryAfterMs === 'number') fail.retryAfterMs = body.retryAfterMs
         setClaimFail(fail)
       }
@@ -664,7 +682,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       <div className="zr-settings-device-actions">
         <select
           className="zr-settings-input"
-          aria-label={`${device.name} · role`}
+          aria-label={t('settings.deviceRoleSelect', { name: device.name })}
           disabled={!localOps || localBusy}
           value={device.role}
           onChange={(e) => { void runDeviceAction({ action: 'set-role', id: device.id, role: e.currentTarget.value }) }}
@@ -674,7 +692,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         </select>
         <select
           className="zr-settings-input"
-          aria-label={`${device.name} · layout`}
+          aria-label={t('settings.deviceKindSelect', { name: device.name })}
           disabled={!localOps || localBusy}
           value={device.kind}
           onChange={(e) => { void runDeviceAction({ action: 'set-kind', id: device.id, kind: e.currentTarget.value }) }}
@@ -850,7 +868,8 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
           {shownPairing !== null && (
             <div className="zr-settings-field">
               <div className="zr-settings-head">
-                <label>{t('settings.pairingCodeLabel')}</label>
+                {/* Not a form control anywhere near: a span, not a control-less label. */}
+                <span className="zr-settings-head-title">{t('settings.pairingCodeLabel')}</span>
                 <span className="zr-settings-badge">{shownPairing.role === 'web' ? t('settings.deviceRoleWeb') : t('settings.deviceRoleDesktop')}</span>
                 <span className="zr-settings-badge" data-warn="true">{t('settings.pairingRemaining', { count: shownPairing.remainingSeconds })}</span>
               </div>
@@ -872,7 +891,8 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
 
           <div className="zr-settings-field">
             <div className="zr-settings-head">
-              <label>{t('settings.pushTestLabel')}</label>
+              {/* The row's control is a Button (not labelable): a span, not a control-less label. */}
+              <span className="zr-settings-head-title">{t('settings.pushTestLabel')}</span>
               <span style={{ flex: 1 }} />
               <Button variant="outline" size="sm" disabled={!localOps || pushTest.state === 'busy'} onClick={() => { void runPushTest() }}>
                 {pushTest.state === 'busy' ? t('settings.pushTestRunning') : t('settings.pushTestRun')}

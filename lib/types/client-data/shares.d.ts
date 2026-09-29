@@ -156,4 +156,14 @@ export declare function createSharesStore(fetchImpl: typeof fetch, visibility?: 
  * list are mounted at once. Created lazily over the real fetch, so the
  * check script never constructs it. */
 export declare function getSharesStore(): SharesStore;
+/**
+ * The subscribe face the title-row icon hands `useSyncExternalStore`: on
+ * the phone shell (a non-desktop-shell viewport at or under 767px) the
+ * mobile stylesheet blanket-hides every `conversation.session.header.actions`
+ * entry (styles/header.css.ts), so the icon would never be seen — it does
+ * not subscribe either, and a subscription that never opens never polls.
+ * Pure over (store, phoneShell) so the desktop-gate test drives it with a
+ * counting fake fetch.
+ */
+export declare function subscribeIfNotPhoneShell(store: SharesStore, phoneShell: boolean, listener: () => void): () => void;
 //# sourceMappingURL=shares.d.ts.map

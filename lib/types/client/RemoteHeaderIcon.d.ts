@@ -16,10 +16,15 @@
  * fallback), and on a subagent session, which the server refuses to share
  * alone (T33b-fix: same rule as the menu item).
  *
- * On the phone shell no rule of its own is needed: the mobile stylesheet
- * blanket-hides every `conversation.session.header.actions` entry that is
- * not the phone header's own (styles/header.css.ts), so this icon is a
- * desktop(-browser) surface, exactly like the official jobs pill.
+ * On the phone shell (a non-desktop-shell viewport at or under 767px) the
+ * mobile stylesheet blanket-hides every `conversation.session.header.actions`
+ * entry that is not the phone header's own (styles/header.css.ts), so this
+ * icon would never be seen — it does not SUBSCRIBE there either
+ * (subscribeIfNotPhoneShell): the subscription is what keeps the shares
+ * store polling, so the phone shell never sends the 30 s admin/shares GET
+ * through the gateway. On a desktop shell the phone CSS never applies
+ * (apply's gate returns before installing it), so the icon stays a live
+ * surface at any window width there.
  */
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
 import type { SharesStore } from '../client-data/shares.ts';
