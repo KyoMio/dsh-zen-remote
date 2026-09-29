@@ -48,14 +48,22 @@
  *   revoked, interface mismatch) only ANNOTATES TITLES: setStatus +
  *   onStatusChanged re-upsert the shown groups under the annotated titles,
  *   and the reconnecting baseline (which always upserts) restores them.
- * - a session the SERVER stopped serving (remote closed → the filtered
- *   workspace upsert drops it from `sessionIds`, CP4) would otherwise stay
- *   visible in the sidebar's 「未分组」 forever: the UI's session store keeps
- *   the merged projection/list entry and nothing ever removes it. Every
- *   session id any remote workspace ever carried is remembered, the ones
- *   belonging to NO current workspace ride the merged `archived` frames —
- *   the UI's archived filter hides them — and a re-share (back in some
- *   workspace's `sessionIds`) drops them from the set again.
+ * - a session the SERVER stopped serving (remote closed / idle-slept / its
+ *   fork parent closed → the filtered workspace upsert drops it from
+ *   `sessionIds`) keeps a TOMBSTONE in the group it was last seen in (CP4,
+ *   reworked by CP4-client-fix2): the merger remembers the workspace each
+ *   session id was last carried by, and the forwarded record for THAT
+ *   workspace still lists the id (appended at the end of `sessionIds`). The
+ *   UI's session store keeps the merged projection/list entry and nothing
+ *   ever removes it, so without this the sidebar would park the session in
+ *   「未分组」 forever — and hiding it in the merged `archived` frame instead
+ *   (what CP4-client first did) makes the RT navigation guard
+ *   `clearArchivedCurrent` (dsh-client-ui-workspace `watchNavigation`) kick
+ *   the OPEN session page back to the home page before its 「远程已关闭」
+ *   banner can show. A re-share (the id back in some workspace's
+ *   `sessionIds`) renders it live again and clears the tombstone; the
+ *   tombstone dies with its workspace (a remove) and with the identity
+ *   (onRemoteGone).
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
