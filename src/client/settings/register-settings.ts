@@ -24,6 +24,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: the renderer declares `ctx.slots` on the cordis Context.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { DEVICE_TOKEN_FIELD, ZenRemoteSettingsForm } from '../../client-data/settings-form.ts'
+import { getSharesStore } from '../../client-data/shares.ts'
 import { NS, en, zh } from '../locales.ts'
 import { SETTINGS_CSS } from './settings-css.ts'
 import type { SettingsSection } from './SettingsSection.tsx'
@@ -106,7 +107,9 @@ export function registerSettingsPage(ctx: ClientContext, section: typeof Setting
         name: 'plugins.row.config',
         key: SETTINGS_ROW_KEY,
         locale: NS,
-        inject: () => ({ config }),
+        // The T33b shared-session list rides the same shares store singleton
+        // as the title-row icon and the session menu — one poll loop total.
+        inject: () => ({ config, shares: getSharesStore() }),
       }, section)),
     ), 'dsh-zen-remote: row config page')
   })
