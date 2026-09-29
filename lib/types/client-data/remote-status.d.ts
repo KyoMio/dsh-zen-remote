@@ -71,13 +71,18 @@ export interface RemoteStatusDescription {
 }
 export declare function describeRemoteStatus(view: RemoteStatusView | undefined | null, t?: RemoteStatusFormatter): RemoteStatusDescription;
 /** The locale keys `bannerText` needs. */
-export type RemoteBannerTextKey = 'remoteBannerOffline' | 'remoteBannerClosedIdle' | 'remoteBannerClosedManual' | 'remoteBannerClosedClient';
+export type RemoteBannerTextKey = 'remoteBannerOffline' | 'remoteBannerRevoked' | 'remoteBannerUnpaired' | 'remoteBannerClosedIdle' | 'remoteBannerClosedManual' | 'remoteBannerClosedClient';
 export type RemoteBannerFormatter = (key: RemoteBannerTextKey) => string;
 /**
  * The composer banner copy for one virtual session (T34): the session's
- * closed reason — if the server closed this session — outranks the offline
- * line; a merely offline link reads the temporarily-readonly copy. `undefined`
- * when neither applies (online and not closed): no banner.
+ * closed reason — if the server closed this session — outranks the
+ * link-level lines (offline, T41a-fix2's revoked / unpaired); a merely
+ * offline link reads the temporarily-readonly copy, and a revoked token or
+ * an unpaired client reads the "not coming back on its own" copy — both
+ * stand a banner AND disable the input (the component raises its composer
+ * block from whatever this returns), since neither recovers without the
+ * settings page. `undefined` when nothing applies (online and not closed):
+ * no banner.
  */
 export declare function bannerText(view: RemoteStatusView | undefined | null, sessionId: string, t?: RemoteBannerFormatter): string | undefined;
 /** Whether the page is currently visible — the same seam shares.ts uses to

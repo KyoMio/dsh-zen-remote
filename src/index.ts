@@ -663,13 +663,15 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         }
       }, 'dsh-zen-remote: relay route')
     })
-    // The client routes live on BOTH roles (T34-fix): the T34 remote-status
-    // route especially is what the client-half parts poll, and a desktop app
-    // can switch roles without a code path change. On a host the row carries
-    // no server credentials, so every route answers its empty conclusion —
-    // remote-status reads `{state:'unpaired', versionMismatch:false, …}`,
-    // the settings probe reads unpaired, unshare finds no relay client.
-    // Same admission wall as the client role's mount.
+    // The remote-status route lives on BOTH roles (T34-fix): it is what the
+    // client-half parts poll, and a desktop app can switch roles without a
+    // code path change — on a host it reads the empty
+    // `{state:'unpaired', versionMismatch:false, …}` conclusion. The rest of
+    // the client prefix does NOT (T41a-fix2): claim / status / reconnect /
+    // unshare exist for a client role's pairing surface, and a host answers
+    // them 404 (least exposure — the prefix registration stays one route,
+    // the handler just refuses everything but remote-status). Same admission
+    // wall as the client role's mount.
     ctx.inject(['webServer', 'connection'], (clientCtx) => {
       clientCtx.effect(() => clientCtx.webServer.register({
         kind: 'prefix',
@@ -677,6 +679,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         handler: createClientHandler({
           admit: (req) => clientCtx.connection.admit(req),
           getRowConfig: () => config,
+          remoteStatusOnly: true,
         }),
       }), 'dsh-zen-remote: client routes (host)')
     })
