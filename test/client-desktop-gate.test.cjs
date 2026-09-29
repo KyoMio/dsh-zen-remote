@@ -461,6 +461,7 @@ test('T34: the parts render only for virtual-id sessions (textual pins — .tsx 
   ]) {
     const source = readFileSync(join(ROOT, 'src', 'client', file), 'utf8')
     assert.ok(source.includes(marker), `${file} gates its render on the virtual id`)
+    assert.ok(source.includes('subscribeIfVirtual(status, sessionId'), `${file} gates the SUBSCRIPTION on the virtual id too (CP4: a local session never subscribes)`)
     assert.ok(source.includes('return null'), `${file} renders nothing off the gate`)
   }
   // T34-fix: the disable rides the host's composer-block contract, not a CSS
@@ -615,4 +616,61 @@ test('T34: the store unshare posts the virtual id to the client route, then refr
   const failBody = seen.filter((call) => call.method === 'POST')[1]
   assert.deepEqual(JSON.parse(failBody.body), { sessionId: 'zr~abcd1234~session-b' })
   assert.deepEqual(refused, { ok: false, code: 'not-shared' })
+})
+
+test('T34/CP4: subscribeIfVirtual — a local session never subscribes, a virtual session polls', async () => {
+  const { createRemoteStatusStore, subscribeIfVirtual } = await import('../src/client-data/remote-status.ts')
+  let calls = 0
+  const store = createRemoteStatusStore(
+    async () => { calls += 1; return { ok: true, status: 200, json: async () => ({ state: 'online', versionMismatch: false, serverName: 's', closed: {} }) } },
+    { visible: () => true, subscribe: () => () => {} },
+    5,
+  )
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 40))
+
+  // A local id: the no-op subscription opens no listener, nothing polls —
+  // a page showing only local sessions sends no remote-status request.
+  const offLocal = subscribeIfVirtual(store, 'session-0aa70fd6-0c91-4a6e-a1f2-16f645b76d67', () => {})
+  await settle()
+  assert.equal(calls, 0, 'a local session sends no remote-status request')
+  offLocal()
+
+  // A virtual id: the real subscription starts the poll loop.
+  const offRemote = subscribeIfVirtual(store, 'zr~abcd1234~session-a', () => {})
+  await settle()
+  assert.ok(calls >= 1, 'a virtual session subscribes and polls')
+  offRemote()
+  await settle()
+  const afterOff = calls
+  await settle()
+  assert.equal(calls, afterOff, 'unsubscribing stops the poll')
+})
+
+test('CP4: subscribeIfNotPhoneShell — the phone shell never polls shares, a desktop viewport does', async () => {
+  const { createSharesStore, subscribeIfNotPhoneShell } = await import('../src/client-data/shares.ts')
+  let calls = 0
+  const store = createSharesStore(
+    async () => { calls += 1; return { ok: true, status: 200, json: async () => ({ ok: true, shares: [] }) } },
+    { visible: () => true, subscribe: () => () => {} },
+    5,
+  )
+  store.setRole('host') // the shares store polls only on a host deployment
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 40))
+
+  // Phone shell: the icon is stylesheet-hidden there, so it must not
+  // subscribe — no listener, no admin/shares GET through the gateway.
+  const offPhone = subscribeIfNotPhoneShell(store, true, () => {})
+  await settle()
+  assert.equal(calls, 0, 'the phone shell sends no admin/shares request')
+  offPhone()
+
+  // Desktop viewport: the icon subscribes and the poll loop runs.
+  const offDesktop = subscribeIfNotPhoneShell(store, false, () => {})
+  await settle()
+  assert.ok(calls >= 1, 'a desktop viewport subscribes and polls')
+  offDesktop()
+  await settle()
+  const afterOff = calls
+  await settle()
+  assert.equal(calls, afterOff, 'unsubscribing stops the poll')
 })

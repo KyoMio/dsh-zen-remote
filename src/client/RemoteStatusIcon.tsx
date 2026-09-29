@@ -14,7 +14,10 @@
  *
  * Renders NOTHING on a local session (the id is not a virtual id), so the
  * two roles' icons never appear at once, and nothing before the store's
- * first answered GET.
+ * first answered GET. A local session also never SUBSCRIBES
+ * (subscribeIfVirtual): the subscription is what keeps the store polling,
+ * so a page showing only local sessions never sends a remote-status
+ * request.
  *
  * On the phone shell no rule of its own is needed: the mobile stylesheet
  * blanket-hides every `conversation.session.header.actions` entry that is
@@ -25,8 +28,8 @@
 import { useCallback, useSyncExternalStore } from 'react'
 import { IconGlobeOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { describeRemoteStatus } from '../client-data/remote-status.ts'
-import type { RemoteStatusStore, RemoteUnshareOutcome } from '../client-data/remote-status.ts'
+import { describeRemoteStatus, subscribeIfVirtual } from '../client-data/remote-status.ts'
+import type { RemoteStatusStore } from '../client-data/remote-status.ts'
 import { isVirtual } from '../virtual-id.js'
 import { NS } from './locales.ts'
 
@@ -36,21 +39,19 @@ export interface RemoteStatusIconProps extends PropsRuntime<'conversation.sessio
   status: RemoteStatusStore
 }
 
-/** The one-line alert for a refused close (T34): the generic copy plus the
- * backend's error code when it named one — short, and diagnosable. */
-function unshareFailText(outcome: RemoteUnshareOutcome, text: string): string {
-  return outcome.ok || outcome.code === undefined ? text : `${text}（${outcome.code}）`
-}
-
 export function RemoteStatusIcon({ sessionId, status, t }: RemoteStatusIconProps) {
+  // The subscription is virtual-id gated (subscribeIfVirtual) — hooks stay
+  // above the render gate; the button additionally waits for a remote
+  // session and the store's first answered GET.
   const snap = useSyncExternalStore(
-    useCallback((onStoreChange: () => void) => status.subscribe(onStoreChange), [status]),
+    useCallback(
+      (onStoreChange: () => void) => subscribeIfVirtual(status, sessionId, onStoreChange),
+      [status, sessionId],
+    ),
     () => status.getSnapshot(),
   )
-  // Hooks stay above the gate: the subscription exists on every render path,
-  // the button only for a virtual-id session with an answered GET. (The
-  // subscription is also what keeps the store polling — a page showing only
-  // local sessions never subscribes, so a host never polls.)
+  // The explicit virtual-id gate stays: the page-wide store's snapshot can
+  // still be ready from a PREVIOUS remote session when a local one opens.
   if (!isVirtual(sessionId) || !snap.ready) return null
   const description = describeRemoteStatus(snap.view, t)
   const close = (): void => {
@@ -66,7 +67,12 @@ export function RemoteStatusIcon({ sessionId, status, t }: RemoteStatusIconProps
     }
     if (!window.confirm(t('remoteStatusUnshareConfirm'))) return
     void status.unshare(sessionId).then((outcome) => {
-      if (!outcome.ok) window.alert(unshareFailText(outcome, t('remoteStatusUnshareFail')))
+      if (outcome.ok) return
+      // A refused close names the backend's error code when it sent one —
+      // the locale line carries the placeholder (each language its own
+      // brackets), never a hardcoded concatenation.
+      if (outcome.code === undefined) window.alert(t('remoteStatusUnshareFail'))
+      else window.alert(t('remoteStatusUnshareFailCode', { code: outcome.code }))
     })
   }
   return (

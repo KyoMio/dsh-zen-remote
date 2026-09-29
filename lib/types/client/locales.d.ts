@@ -12,7 +12,7 @@ export declare const zh: {
     readonly allWorkspaces: "全部";
     readonly switchWorkspace: "切换工作区";
     readonly newSession: "新建会话";
-    readonly noSessions: "还没有会话，点右下角加号开始";
+    readonly noSessions: "暂无会话，点击右下角加号新建";
     readonly homeStatusOngoing: "运行中";
     readonly homeStatusWarning: "待处理";
     readonly homeStatusDone: "已完成";
@@ -67,7 +67,7 @@ export declare const zh: {
     readonly shareErrProbe: "当前浏览器无法生成分享图";
     readonly shareErrRender: "生成分享图失败，请重试";
     readonly shareErrSliceBudget: "分享图单段内容超出画布上限，请缩小分享范围后重试";
-    readonly shareErrEmpty: "会话还没有可分享的内容";
+    readonly shareErrEmpty: "会话暂无可分享的内容";
     readonly shareStitchUnsupported: "当前浏览器暂不支持合成单张长图，已导出为多张图片";
     readonly shareStitchFailed: "合成单张长图失败，已改为多张图片导出";
     readonly settings: "设置";
@@ -85,7 +85,7 @@ export declare const zh: {
     readonly 'settings.reset': "重置";
     readonly 'settings.roleTitle': "角色";
     readonly 'settings.role': "运行角色";
-    readonly 'settings.roleHint': "本 DSH 进程在远程访问体系里的角色。";
+    readonly 'settings.roleHint': "本 DSH 进程在远程访问体系中的角色。";
     readonly 'settings.roleHost': "主服务端（host）";
     readonly 'settings.roleClient': "子客户端（client）";
     readonly 'settings.reloadNote': "保存后插件会自动重载，网关短暂中断";
@@ -108,11 +108,11 @@ export declare const zh: {
     readonly 'settings.invalidPositiveInt': "需要正整数";
     readonly 'settings.pushTitle': "推送";
     readonly 'settings.fieldPushSummary': "推送内容摘要";
-    readonly 'settings.fieldPushSummaryHint': "在推送正文里带上回合的最终文本或待回答的问题。";
+    readonly 'settings.fieldPushSummaryHint': "在推送正文中包含回合的最终文本或待回答的问题。";
     readonly 'settings.fieldPushTurnEnd': "回合结束推送";
-    readonly 'settings.fieldPushTurnEndHint': "每个顶层回合结束时都推送；默认只在需要你处理时推送。";
+    readonly 'settings.fieldPushTurnEndHint': "每个顶层回合结束时都推送；默认仅在需要处理时推送。";
     readonly 'settings.fieldPushTool': "注册 push_notify 工具";
-    readonly 'settings.fieldPushToolHint': "让模型可以主动给你发通知。";
+    readonly 'settings.fieldPushToolHint': "允许模型主动发送通知。";
     readonly 'settings.fieldPushDebounceMs': "防抖间隔（毫秒）";
     readonly 'settings.fieldPushDebounceMsHint': "两次推送之间的最小间隔，不小于 0 的整数。";
     readonly 'settings.fieldLang': "通知语言";
@@ -135,7 +135,7 @@ export declare const zh: {
     readonly 'settings.pairingRemaining': "剩余 {count} 秒";
     readonly 'settings.pairingFail': "配对码生成失败";
     readonly 'settings.devicesTitle': "设备";
-    readonly 'settings.devicesEmpty': "还没有已配对的设备";
+    readonly 'settings.devicesEmpty': "暂无已配对的设备";
     readonly 'settings.deviceRoleWeb': "Web 应用端";
     readonly 'settings.deviceRoleDesktop': "桌面应用端";
     readonly 'settings.kindAuto': "自动";
@@ -144,11 +144,13 @@ export declare const zh: {
     readonly 'settings.deviceLastSeen': "最近在线 {time}";
     readonly 'settings.devicePushOn': "已订阅推送";
     readonly 'settings.devicePushOff': "未订阅推送";
-    readonly 'settings.deviceRename': "改名";
+    readonly 'settings.deviceRename': "重命名";
     readonly 'settings.renamePrompt': "设备新名称";
     readonly 'settings.renameSave': "确定";
     readonly 'settings.renameCancel': "取消";
     readonly 'settings.deviceRevoke': "吊销";
+    readonly 'settings.deviceRoleSelect': "{name} 的角色";
+    readonly 'settings.deviceKindSelect': "{name} 的界面布局";
     readonly 'settings.revokeConfirm': "吊销后该设备需要重新配对，确定继续？";
     readonly 'settings.revokeAll': "全部吊销";
     readonly 'settings.revokeAllConfirm': "将吊销全部已配对设备，确定继续？";
@@ -156,7 +158,7 @@ export declare const zh: {
     readonly 'settings.shareTitle': "远程共享";
     readonly 'settings.shareListTitle': "已开启远程的会话";
     readonly 'settings.shareListEmpty': "当前没有已开启远程的会话";
-    readonly 'settings.shareViewers': "{count} 人在看";
+    readonly 'settings.shareViewers': "{count} 台设备正在查看";
     readonly 'settings.shareClose': "关闭远程";
     readonly 'settings.shareCloseAll': "全部关闭";
     readonly 'settings.shareCloseAllConfirm': "将关闭全部已开启远程的会话，确定继续？";
@@ -164,7 +166,7 @@ export declare const zh: {
     readonly 'settings.fieldServerName': "服务端名称";
     readonly 'settings.fieldServerNameHint': "远程界面上显示的服务端名称，1–40 个字符。留空恢复默认。";
     readonly 'settings.fieldIdleHours': "闲置休眠（小时）";
-    readonly 'settings.fieldIdleHoursHint': "已开启远程的会话超过这个时长没有新动静，就自动关闭远程连接。运行中或等待中的会话不计时。默认 48，范围 0–8760（不含 0）。";
+    readonly 'settings.fieldIdleHoursHint': "超过该时长无新活动时，自动关闭远程连接。运行中或等待中的会话不计时。默认 48，取值大于 0 且不超过 8760。";
     readonly 'settings.fieldAutoShare': "自动共享新会话";
     readonly 'settings.fieldAutoShareHint': "新建的会话自动共享给已配对的设备。";
     readonly 'settings.invalidName': "名称需要 1–40 个字符";
@@ -193,7 +195,7 @@ export declare const zh: {
     readonly 'settings.client.failInsecureHttp': "公网地址必须使用 https；http 只允许局域网或 Tailscale 地址";
     readonly 'settings.client.failBadCode': "配对码错误或已过期";
     readonly 'settings.client.failLocked': "尝试次数过多，请 {minutes} 分钟后再试";
-    readonly 'settings.client.failUnreachable': "连接不到服务端，请检查地址和网络";
+    readonly 'settings.client.failUnreachable': "无法连接服务端";
     readonly 'settings.client.failRoleMismatch': "该配对码不适用于桌面应用端";
     readonly 'settings.client.failUnexpected': "服务端回应无法识别，请确认服务端已安装 dsh-zen-remote 2.0.0";
     readonly 'settings.client.failWrite': "配对成功，但本机保存令牌失败：设置存储不可用或只读";
@@ -220,7 +222,7 @@ export declare const zh: {
     readonly shareRemoteConfirmOn: "开启远程后，已配对的桌面应用端将可以查看并操作此会话。确定开启？";
     readonly shareRemoteConfirmOff: "关闭后，桌面应用端将无法再访问此会话。确定关闭？";
     readonly shareRemoteFailSubagent: "开启远程失败：子智能体会话不能单独开启";
-    readonly shareRemoteFailEmpty: "开启远程失败：会话还没有内容";
+    readonly shareRemoteFailEmpty: "开启远程失败：会话暂无内容";
     readonly shareRemoteFailGeneric: "操作失败，请稍后再试";
     readonly 'settings.client.reconnect': "立即重连";
     readonly 'settings.client.reconnectBusy': "重连中…";
@@ -250,6 +252,7 @@ export declare const zh: {
     readonly remoteStatusUnshareConfirm: "关闭远程后，此会话将从本机的远程分组中移除，服务端上的会话不受影响。确定关闭？";
     readonly remoteStatusOfflineClick: "服务端离线，无法操作";
     readonly remoteStatusUnshareFail: "关闭远程失败，请稍后再试";
+    readonly remoteStatusUnshareFailCode: "关闭远程失败（{code}），请稍后再试";
     readonly remoteGroupOffline: "（离线）";
     readonly remoteGroupRevoked: "（令牌已吊销）";
     readonly remoteGroupUnpaired: "（已解除配对）";

@@ -20,7 +20,10 @@
  *
  * Renders NOTHING on a local session, before the store's first answered GET,
  * and whenever neither the offline nor a closed reason applies (then the
- * block is cleared too).
+ * block is cleared too). A local session also never SUBSCRIBES
+ * (subscribeIfVirtual): the subscription is what keeps the store polling,
+ * so a page showing only local sessions never sends a remote-status
+ * request.
  */
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
 import type { RemoteStatusStore } from '../client-data/remote-status.ts';

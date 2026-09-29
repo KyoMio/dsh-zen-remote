@@ -57,7 +57,11 @@ export const SETTINGS_CSS = `
   align-items: center;
   gap: 8px;
 }
-[data-zen-remote="settings"] .zr-settings-head label {
+/* The head's title text: real labels (they name the select/checkbox below)
+   and the two .zr-settings-head-title spans whose text names no form control
+   (the pairing code readout, the push-test button) share the look. */
+[data-zen-remote="settings"] .zr-settings-head label,
+[data-zen-remote="settings"] .zr-settings-head .zr-settings-head-title {
   flex: 1;
   font-size: 13px;
   font-weight: 500;

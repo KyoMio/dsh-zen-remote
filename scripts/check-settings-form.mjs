@@ -22,6 +22,7 @@ import {
   clientStatusLineOf,
   deriveClientStatusView,
   deriveSettingsView,
+  localOpsAllowed,
   normalizePairingCode,
   savedRowRole,
   settingsPollOf,
@@ -164,6 +165,12 @@ assert.equal(clientView.role, 'client')
 
 // viaGateway is the disable flag for every server-local button.
 assert.equal(deriveSettingsView({ ...STATUS, viaGateway: true }, { now: NOW }).viaGateway, true)
+
+// localOpsAllowed: the server-local buttons enable only for a viaGateway:false
+// answer — undefined (no answer yet) and viaGateway:true both stay disabled.
+assert.equal(localOpsAllowed(undefined), false, 'no status answer yet counts as remote')
+assert.equal(localOpsAllowed(deriveSettingsView({ ...STATUS, viaGateway: true }, { now: NOW })), false, 'viaGateway:true disables the server-local buttons')
+assert.equal(localOpsAllowed(deriveSettingsView({ ...STATUS, viaGateway: false }, { now: NOW })), true, 'viaGateway:false enables the server-local buttons')
 
 // An unshaped body degrades instead of throwing.
 const empty = deriveSettingsView({}, { now: NOW })

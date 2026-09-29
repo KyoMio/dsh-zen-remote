@@ -77,6 +77,7 @@ To uninstall: `dsh plugin remove dsh-zen-remote` (or delete the line from the pr
 One-time facts, in order of likelihood to bite:
 
 - **The three bundle rows collapse into one.** Old `dsh-zen-remote-gateway` / `dsh-zen-remote-push` rows left in a profile patch are warned about and skipped by the loader. Any `config:` you had written **on those old rows** no longer applies — move it onto the `dsh-zen-remote` row or, better, set it in the plugin settings page.
+- **If you hand-inserted a `dsh-zen-remote/dsh-push.mjs` line into a profile patch back in 1.0, remove it** — the main entry loads the push half by role now, and a leftover line loads push twice.
 - **`~/.dsh/lan-gate.config.json` still works.** Nothing to migrate; its values show up in the settings page. Priority per field: environment variable > plugin row settings > `lan-gate.config.json` > built-in default. The file is never written or deleted by the plugin.
 - **Paired devices become Web 应用端 automatically** and keep working; no re-pairing.
 - **The admin page moved.** `/lan-gate/admin` is now just a notice pointing at the plugin settings page (it still 403s anything that is not a direct local connection). Pairing codes, device management, push test and sharing all live in the DSH Plugins page → dsh-zen-remote settings block.

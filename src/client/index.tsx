@@ -110,16 +110,19 @@ export function apply(ctx: ClientContext): void {
   // T33b 会话共享的三个入口里前两个（标题行远程图标、会话右键菜单项）：
   // 同样必须在桌面门之前注册——桌面端 App 就是主服务端，图标和菜单恰好
   // 住在它的标题行与会话菜单里。部件自身按数据降级：shares 路由 404
-  // （子客户端部署没有这条路由）时渲染为空，手机外壳则由样式表兜底隐藏
-  // （styles/header.css.ts 的 header.actions 全量隐藏）。设置页的共享
-  // 列表在 SettingsSection 内部，随设置页已在门之前。
+  // （子客户端部署没有这条路由）时渲染为空；手机外壳下样式表把
+  // header.actions 全量隐藏（styles/header.css.ts），图标也就不订阅
+  // （subscribeIfNotPhoneShell）——订阅是轮询的燃料，不订阅就不发
+  // admin/shares 请求。设置页的共享列表在 SettingsSection 内部，随设置
+  // 页已在门之前。
   registerRemoteShareUi(ctx, RemoteHeaderIcon, RemoteShareMenuItem)
 
   // T34 子客户端的远程状态两件套（标题行连接图标、composer 横幅）：同样在
   // 桌面门之前注册——桌面端 App 也能以 client 角色接入服务端。部件自身按
   // 数据降级：只在虚拟 id 会话渲染、首次 GET 应答前不渲染，所以主服务端
-  // 的页面上两者都是空，桌面保持逐像素 no-op；store 也只在有虚拟会话的
-  // 订阅者时才轮询，主服务端不白发请求。
+  // 的页面上两者都是空，桌面保持逐像素 no-op；订阅本身也按虚拟 id 门控
+  // （remote-status.ts 的 subscribeIfVirtual）——本地会话不建立订阅，
+  // store 只在有订阅者时才轮询，主服务端的页面不白发 remote-status 请求。
   registerRemoteStatusUi(ctx, RemoteStatusIcon, RemoteComposerBanner)
   // T41b 的两个远程会话部件：fetch 改写（改动 / diff 面板的两条 /api GET）与
   // 远程会话标记（data-zr-remote-session + 隐藏「在服务端机器上打开」类入口
