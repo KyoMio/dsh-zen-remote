@@ -822,13 +822,12 @@ test('e2e T32: a server approval crosses into the local $events virtualized, the
       undefined,
     )
     assert.deepEqual(envelope, { ok: true, value: undefined })
-    // Two answers reached the gateway: the server's own `next` abstention
-    // for the dropped unshared waterfall, and the real one.
-    await waitFor(() => env.eventResults.length >= 2)
+    // Exactly ONE answer reached the gateway: the real one. The dropped
+    // unshared waterfall is NOT abstained on behalf anymore (T32-fix2) —
+    // the relay's silence keeps that delivery pending at the gateway,
+    // answerable by the server UI or a future subscriber.
+    await waitFor(() => env.eventResults.length >= 1)
     assert.deepEqual(env.eventResults[0].payload, {
-      args: { clientId: 'srv-events-client', eventId: 'evt-srv-secret', outcome: { kind: 'next' } },
-    })
-    assert.deepEqual(env.eventResults[1].payload, {
       args: { clientId: 'srv-events-client', eventId: 'evt-srv-1', outcome: { kind: 'result', value: 'allowed-once' } },
     })
     assert.equal(localGateway.rpcCalls.filter((call) => call.endpoint === '$events/result').length, 0)
@@ -845,7 +844,7 @@ test('e2e T32: a server approval crosses into the local $events virtualized, the
     )
     assert.deepEqual(ghost, { ok: true, value: undefined })
     await new Promise((resolve) => setTimeout(resolve, 100))
-    assert.equal(env.eventResults.length, 2, 'the ghost answer never reached the server gateway')
+    assert.equal(env.eventResults.length, 1, 'the ghost answer never reached the server gateway')
 
     // First answer wins: the server's own UI answers a second waterfall
     // first, the gateway settles and pushes the cancel frame, the
@@ -866,7 +865,7 @@ test('e2e T32: a server approval crosses into the local $events virtualized, the
     )
     assert.deepEqual(late, { ok: true, value: undefined })
     await new Promise((resolve) => setTimeout(resolve, 100))
-    assert.equal(env.eventResults.length, 2, 'the late answer was refused before the gateway')
+    assert.equal(env.eventResults.length, 1, 'the late answer was refused before the gateway')
 
     // A dying remote leg closes every prompt still on screen: evt-srv-1
     // was answered but its real cancel never came (the fake gateway does
