@@ -147,6 +147,10 @@ export interface RelayHandlerOptions {
      * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
      * Content-Length and streaming-count refusals stay cheap to drive. */
     uploadCapBytes?: number;
+    /** How long an upload refusal's tail drain may run before the socket is
+     * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
+     * Tests inject a small value so the deadline path stays cheap to drive. */
+    drainDeadlineMs?: number;
 }
 /**
  * The relay route handler plus its introspection surface. A function WITH
