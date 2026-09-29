@@ -1634,11 +1634,12 @@ test('T51: the fetch-route wiring installs beside the typert wrap and the status
   assert.equal(status.fetchRouteIntercept.exportWrapped, true)
   assert.equal(status.fetchRouteIntercept.shape.ok, true)
 
-  // A virtual upload is refused locally (the row is unpaired → 503
-  // remote-offline); a local id reaches the original route untouched.
+  // A virtual upload is refused locally with the UI-parseable envelope (the
+  // row is unpaired → remote-offline, T51-fix's 200 contract); a local id
+  // reaches the original route untouched.
   const virtual = toVirtual(SERVER_ID, LOCAL_ID)
   const refused = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(virtual))
-  assert.equal(refused.status, 503)
+  assert.equal(refused.status, 200)
   assert.equal((await refused.json()).error.code, 'remote-offline')
   assert.equal(uploadSeen.length, 0)
   const local = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(LOCAL_ID))
@@ -1660,11 +1661,15 @@ test('T51: the fetch-route wiring installs beside the typert wrap and the status
   assert.equal(afterStatus.fetchRouteIntercept, undefined)
 })
 
-test('T51: a shape refusal leaves the routes untouched and the status route says why', async () => {
+test('T51-fix: a misshaped upload entry is refused for ITS route only; the rest installs and local behavior is identical', async () => {
   const { apply } = await import(INDEX_URL)
   const gateway = new FakeTypertGateway()
-  // The upload entry is missing entirely (a composition without the upload
-  // service, or a reshaped future DSH): the wiring refuses and records.
+  // The upload entry is present but wrong (requestBody not "streaming" — a
+  // reshaped future DSH): the structural shape still passes, the install
+  // runs, the upload attach refuses (present-but-wrong never fixes itself,
+  // no retry), and the healthy export route wraps anyway. The upload route
+  // answers exactly as it did before the plugin existed — local and virtual
+  // ids alike.
   const uploadSeen = []
   const connection = makeFakeConnectionService(undefined)
   connection.routes.set(FILE_UPLOAD_PATH, {
@@ -1682,13 +1687,25 @@ test('T51: a shape refusal leaves the routes untouched and the status route says
   })
   apply(ctx, { role: 'client' })
   const status = await serveOnce(registered, '/_dsh/zen-remote/client/status')
-  assert.equal(status.fetchRouteIntercept.installed, false)
-  assert.equal(status.fetchRouteIntercept.shape.ok, false)
-  assert.ok(status.fetchRouteIntercept.shape.reasons.some((reason) => reason.includes('streaming')))
-  // The route answers exactly as it did before the plugin existed.
+  assert.equal(status.fetchRouteIntercept.installed, true, 'the structural gate passed')
+  assert.equal(status.fetchRouteIntercept.uploadWrapped, false, 'the misshaped entry was never wrapped')
+  assert.equal(status.fetchRouteIntercept.uploadPending, false, 'present-but-wrong does not retry')
+  assert.ok(status.fetchRouteIntercept.uploadAttachRefused.includes('streaming'))
+  assert.equal(status.fetchRouteIntercept.exportWrapped, true, 'the healthy route installed anyway')
+  // The untouched upload route serves BOTH ids locally.
+  const virtual = toVirtual(SERVER_ID, LOCAL_ID)
+  const remote = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(virtual))
+  assert.equal(await remote.text(), 'local-upload')
+  assert.equal(uploadSeen.length, 1)
   const local = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(LOCAL_ID))
   assert.equal(await local.text(), 'local-upload')
-  assert.equal(uploadSeen.length, 1)
+  assert.equal(uploadSeen.length, 2)
+  // The export refusal still works.
+  const blocked = await connection.routes.get(SESSION_EXPORT_PATH).fetch(
+    new Request(`http://dsh.internal/api/session.export?sessionId=${encodeURIComponent(virtual)}`, { method: 'HEAD' }),
+  )
+  assert.equal(blocked.status, 403)
+  assert.equal(connection.seen.length, 0)
   for (const disposer of effects) disposer()
 })
 

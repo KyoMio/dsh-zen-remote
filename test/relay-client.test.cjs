@@ -47,6 +47,11 @@ function startFakeRelay() {
     upload: () => [200, { ok: true, value: { status: 200, contentType: 'application/json; charset=utf-8', body: JSON.stringify({ ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'att-1', name: 'note.txt', bytes: 5 } } }) } }],
   }
   const server = http.createServer((req, res) => {
+    // T51-fix: the uploadStart hook fires when the HEADERS arrive — the only
+    // place a mid-SEND connection reset can be staged (the end-gated
+    // dispatch below runs after the body, where a destroy never rejects the
+    // pending fetch; only the round-trip budget would, minutes later).
+    if (String(req.url).split('?')[0] === UPLOAD && scenario.uploadStart !== undefined) scenario.uploadStart(req)
     const chunks = []
     req.on('data', (c) => chunks.push(c))
     req.on('end', () => {
@@ -621,6 +626,67 @@ test('upload: a null body rides as an empty stream', async () => {
     const hit = relay.seen.find((r) => r.url === UPLOAD)
     assert.equal(hit.rawBody.length, 0)
   } finally { await relay.stop() }
+})
+
+test('upload (T51-fix): a mid-flight transport death fails the CALL and leaves the connection state online', async () => {
+  // A connection reset WHILE THE BODY IS STILL PUMPING is the server's size
+  // gate and drain doing their job, not a dead link: the call rejects with
+  // the transport code within moments, the diagnostics record it, the state
+  // stays online and no reconnect is armed (the next invoke judges the
+  // link). The body drips slowly so the reset lands mid-send — a reset
+  // after the body finished would only be caught by the round-trip budget.
+  const relay = await startFakeRelay()
+  relay.scenario.uploadStart = (req) => {
+    let first = true
+    req.on('data', () => {
+      if (first) {
+        first = false
+        setTimeout(() => { req.destroy() }, 20)
+      }
+    })
+  }
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    assert.equal(client.state, 'online')
+    // A bounded drip: the reset should land mid-send (~20-30 ms); if it
+    // somehow missed, the stream CLOSES after 40 chunks (the server then
+    // answers its receipt and the reject assertion fails loudly) instead of
+    // holding the runner's event loop open forever.
+    let sent = 0
+    const drip = new ReadableStream({
+      async pull(controller) {
+        if (sent >= 40) {
+          controller.close()
+          return
+        }
+        sent += 1
+        controller.enqueue(new Uint8Array(8192).fill(1))
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      },
+    })
+    await assert.rejects(
+      () => client.upload({ sessionId: 'session-a', body: drip, bytes: 256 * 1024 }),
+      (error) => error instanceof RelayError && error.code === 'offline',
+    )
+    assert.equal(client.state, 'online', 'an upload reset never judges the link')
+    assert.equal(client.nextRetryAt, null, 'no reconnect was armed for a cut upload')
+    assert.equal(client.lastError, 'offline', 'the failure code is still recorded for the diagnostics')
+  } finally { await relay.stop() }
+})
+
+test('invoke: a transport failure still judges the link offline (the T51-fix upload opt-out does not leak)', async () => {
+  // The guard against my own refactor: only the UPLOAD route opts out of
+  // transport failures setting the state — invoke keeps the T43 contract
+  // (a dead link arms the reconnect ladder).
+  const port = await deadPort()
+  const { client } = makeClient(port)
+  await assert.rejects(() => client.connect(), (error) => error.code === 'offline')
+  assert.equal(client.state, 'offline')
+  await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
+  assert.equal(client.state, 'offline', 'invoke keeps judging the link')
+  assert.ok(client.nextRetryAt !== null, 'the ladder armed')
+  client.stop()
 })
 
 // ---- subscribe ----------------------------------------------------------------

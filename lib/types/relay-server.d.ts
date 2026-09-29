@@ -47,6 +47,13 @@ export declare const RELAY_PREFIX = "/_dsh/zen-remote/relay";
  * so the streaming count is the path its uploads normally take). Past the
  * cap the forward is aborted, the rest of the request is drained and the
  * answer is 413 `payload-too-large`.
+ *
+ * SLOW-LINK BOUND (T51-fix, for the docs): a single legitimate upload is
+ * also bounded in TIME — the host's HTTP server keeps its default 300 s
+ * request deadline, and the sub-client's own round-trip budget caps at the
+ * same 300 s (relay-client.ts, the T31-fix rule) — so a 100 MiB body needs
+ * roughly 2.8 Mbps sustained end to end; slower links fail the call (the
+ * client-side refusal keeps the connection state) rather than hanging.
  */
 export declare const MAX_UPLOAD_BYTES: number;
 /** The `/api` route the upload channel dispatches into, verbatim from the
