@@ -25,6 +25,8 @@ const path = require('node:path')
 const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
 const { createRelayClient, RelayError } = require('../lib/relay-client.js')
+const { installIntercept } = require('../lib/intercept.js')
+const { toVirtual } = require('../lib/virtual-id.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
 // Far from every other file's fixture ports (the 392xx band).
@@ -451,6 +453,10 @@ test('e2e T43: the gateway dies, the client retries on its own, and a restarted 
     // Nobody calls the client: the RETRY must be what hits the dead chain.
     const hitsBefore = proxyHits
     await waitFor(() => proxyHits > hitsBefore, 5000)
+    // The proxy counter rises the instant the retry ARRIVES; the offline
+    // verdict lands one round trip later — wait it out instead of racing it
+    // (a loaded runner polls into that window and reads 'connecting').
+    await waitFor(() => env.client.state === 'offline', 5000)
     assert.equal(env.client.state, 'offline', 'the gateway is still down — the retry failed into offline again')
     assert.equal(env.client.lastError, 'offline')
 
@@ -488,5 +494,160 @@ test('e2e T43: a device revoked while the client is in the retry loop lands revo
     const quiet = proxyHits
     await sleep(2500)
     assert.equal(proxyHits, quiet, 'not one request after the revocation wall')
+  } finally { await env.stop() }
+})
+
+// ---- 9. T23b-2: the sub-client interceptor merges the GLOBAL workspace stream ----
+
+/**
+ * The sub-client's own DSH process, faked at the same seam the intercept
+ * wraps: async openWireStream (the 0.2.0 shape the mux awaits), the exact
+ * dynamic call sites in the constructor, and a controllable local
+ * workspace/follow stream so the merged stream stays open across the share.
+ */
+class LocalMergeGateway {
+  constructor(localGate) {
+    this.localGate = localGate
+    this.streamCalls = []
+    this.rpcCalls = []
+    this.wireStream = {
+      open: (endpoint, payload, uplink, peer, signal) => this.openWireStream(endpoint, payload, uplink, peer, signal, { signal }),
+    }
+    this.rpcBridge = (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer)
+    this.wireTap = (endpoint, payload, uplink, peer, signal, control) => this.openWireStream(endpoint, payload, uplink, peer, control.signal, control)
+  }
+  operatorPeer() { return { id: 'operator-peer' } }
+  async dispatchRpc(endpoint, payload, signal, peer) {
+    this.rpcCalls.push({ endpoint, payload })
+    return { ok: true, value: { items: [{ sessionId: 'session-local', updatedAt: 1 }] } }
+  }
+  async openWireStream(endpoint, payload, uplink, peer, signal, control) {
+    this.streamCalls.push({ endpoint, payload, uplink, peer, signal, control })
+    if (endpoint === 'workspace/follow') return this.localGate.iterable
+    return (async function* () { yield { type: 'baseline', value: { items: [] } } })()
+  }
+}
+
+/** Controllable local stream leg honoring its signal like the relay client. */
+function makeLocalGate(signal) {
+  const pending = []
+  let wake = () => {}
+  let finished = false
+  const iterable = (async function* () {
+    const onAbort = () => { finished = true; wake() }
+    if (signal?.aborted) return
+    signal?.addEventListener('abort', onAbort)
+    try {
+      while (true) {
+        if (pending.length > 0) {
+          const next = pending.shift()
+          if (next.kind === 'frame') yield next.frame
+          else return
+        } else if (finished) return
+        else await new Promise((resolve) => { wake = resolve })
+      }
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
+  })()
+  return {
+    iterable,
+    push: (frame) => { pending.push({ kind: 'frame', frame }); wake() },
+    get aborted() { return signal?.aborted === true },
+  }
+}
+
+/** Read exactly `count` merged frames, failing loudly on a stall. */
+async function collectFrames(iterator, count, ms = 5000) {
+  const frames = []
+  for (let i = 0; i < count; i += 1) {
+    let timer
+    const result = await Promise.race([
+      iterator.next(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out waiting for merged frame ${frames.length + 1}/${count}`)), ms)
+      }),
+    ]).finally(() => clearTimeout(timer))
+    if (result.done) throw new Error(`merged stream ended after ${frames.length} of ${count} frames`)
+    frames.push(result.value)
+  }
+  return frames
+}
+
+test('e2e T23b-2: the interceptor merges the global workspace stream — local group, filtered remote groups, and a live share travels the whole chain', async () => {
+  const env = await boot({ shared: ['session-a'] })
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const serverId = info.serverId
+    const V = (id) => toVirtual(serverId, id)
+
+    const LOCAL_WS = {
+      workspaceId: 'ws-local',
+      path: '/home/me/local',
+      title: '本地',
+      sessionIds: ['session-l1'],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }
+    const SERVER_W1 = {
+      workspaceId: 'w-1',
+      path: '/srv/one',
+      title: '服务端一',
+      sessionIds: ['session-a', 'session-b'],
+      createdAt: '2026-02-02T00:00:00.000Z',
+      updatedAt: '2026-02-02T00:00:00.000Z',
+    }
+    const SERVER_W2 = { ...SERVER_W1, workspaceId: 'w-2', path: '/srv/two', title: '服务端二', sessionIds: ['session-c'] }
+
+    const controller = new AbortController()
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalMergeGateway(localGate)
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    // The merged stream through the sub-client's own wire adapter.
+    const merged = await localGateway.wireTap('workspace/follow', { args: {} }, undefined, localGateway.operatorPeer(), controller.signal, { signal: controller.signal })
+    const iterator = merged[Symbol.asyncIterator]()
+
+    // Local baseline first — untouched, no remote state known yet.
+    localGate.push({ type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: [], pinnedSessionIds: [] } })
+    const first = await collectFrames(iterator, 1)
+    assert.deepEqual(first[0].value.items.map((workspace) => workspace.workspaceId), ['ws-local'])
+
+    // The relay's filtered workspace/follow is the second server-side stream.
+    await waitFor(() => env.streams.some((gate) => gate.call.namespace === 'workspace' && gate.call.method === 'follow'))
+    const wsGate = env.streams.find((gate) => gate.call.namespace === 'workspace')
+    wsGate.push({ type: 'baseline', value: { items: [SERVER_W1, SERVER_W2], archivedSessionIds: [], pinnedSessionIds: [] } })
+    const remote = await collectFrames(iterator, 5)
+    // The server only shares session-a, so the remote groups show only what
+    // is shared: w-1 carries ONE virtual session despite two server-side,
+    // w-2's unshared session-c is filtered to an empty list; titles carry the
+    // server name; and the UI never sees a second baseline.
+    assert.deepEqual(remote[0].workspace, { ...SERVER_W1, workspaceId: V('w-1'), title: `${SERVER_NAME} · 服务端一`, sessionIds: [V('session-a')] })
+    assert.deepEqual(remote[1].workspace, { ...SERVER_W2, workspaceId: V('w-2'), title: `${SERVER_NAME} · 服务端二`, sessionIds: [] })
+    assert.deepEqual(remote[2], { type: 'order', workspaceIds: ['ws-local', V('w-1'), V('w-2')] })
+    assert.ok(remote.every((frame) => frame.type !== 'baseline'))
+
+    // Sharing a second session on the server synthesizes an upsert there; it
+    // must cross the real gateway child + NDJSON relay + interceptor merger
+    // and land as ONE virtualized upsert with BOTH sessions.
+    env.store.share('session-b')
+    const shared = await collectFrames(iterator, 1)
+    assert.deepEqual(shared, [
+      { type: 'upsert', workspace: { ...SERVER_W1, workspaceId: V('w-1'), title: `${SERVER_NAME} · 服务端一`, sessionIds: [V('session-a'), V('session-b')] } },
+    ])
+
+    // External abort: the merged iteration ends and the server-side stream
+    // observes the hang-up chain (mux abort → relay → gateway).
+    controller.abort()
+    const done = await iterator.next()
+    assert.equal(done.done, true)
+    await waitFor(() => wsGate.aborted)
+    handle.uninstall()
   } finally { await env.stop() }
 })
