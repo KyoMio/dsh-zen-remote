@@ -70,8 +70,9 @@
  *   clientId — the local payload's clientId is the local stream's and is
  *   discarded); anything else reaches the local gateway verbatim. A relay
  *   refusal that means "this event is already over" (`unknown-event`,
- *   `not-shared`) is answered as silent success — exactly how DSH treats a
- *   stale result — because a thrown answer fails the UI's whole `$events`
+ *   `not-shared` — the route's 403 refusals) is answered as silent
+ *   success — exactly how DSH treats a stale result — because a thrown
+ *   answer fails the UI's whole `$events`
  *   generation (client face: pumpEvents aborts on answer failures).
  */
 import type { RelayClient } from './relay-client.js';
@@ -226,16 +227,15 @@ export declare function rewriteResult(endpoint: string, value: unknown, serverId
  *   whole thing in `zr~<serverId>~`.
  * - `cancel`: `{type, eventId}` — the correlation id goes virtual so the UI
  *   can match it against the waterfall it showed and close the prompt.
- * - `ready`: dropped. The local stream already opened the UI's stream with
- *   ITS ready frame (client face: the first frame must be ready, any later
- *   one fails `parseRemoteEventFrame`), and the remote one carries the
- *   server's `clientId`/`home` — facts the UI must never need.
- * - `emit`: dropped (T32-fix, second line of defense behind the server's
- *   own drop). Emit events broadcast server-wide state — session lists and
- *   titles, account expirations, cordis chatter — that is not share-scoped;
- *   whatever survived a future server would feed the local UI ids it would
- *   mistake for local sessions. Session state reaches the sub-client
- *   through the share-filtered workspace/control streams instead.
+ * - everything else — `ready`, `emit`, non-objects, unknown types, and any
+ *   waterfall/cancel failing the client face's exact-keys shape — is
+ *   DROPPED (T32-fix2 mirrors the server side). `ready` and `emit` carry
+ *   facts the UI must never see (the local stream opened with ITS ready
+ *   frame; emit broadcasts server-wide state); a malformed frame that
+ *   slipped through would fail `parseRemoteEventFrame` and take the UI's
+ *   whole `$events` generation down with it, failing and reconnecting in a
+ *   loop. Mirrors the server's own forwardable-shape gate, so the two ends
+ *   disagree on nothing.
  */
 export declare function rewriteRemoteEventFrame(frame: unknown, serverId: string): unknown | null;
 /**
