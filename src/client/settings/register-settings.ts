@@ -102,15 +102,15 @@ export function registerSettingsPage(ctx: ClientContext, section: typeof Setting
     // describe follow) when the fiber that built it is disposed.
     const offDescribe = describe.subscribe(() => { config.refresh() })
     formsCtx.effect(() => () => { offDescribe(); config.dispose() }, 'dsh-zen-remote: settings form')
-      formsCtx.effect(() => formsCtx.configForms.whileServed([SETTINGS_ENTRY_ID], () =>
-        formsCtx.slots.inject('plugins.row.config', () => formsCtx.slots.register({
-          name: 'plugins.row.config',
-          key: SETTINGS_ROW_KEY,
-          locale: NS,
-          // The T33b shared-session list rides the same shares store singleton
-          // as the title-row icon and the session menu — one poll loop total.
-          inject: () => ({ config, shares: getSharesStore() }),
-        }, section)),
-      ), 'dsh-zen-remote: row config page')
+    formsCtx.effect(() => formsCtx.configForms.whileServed([SETTINGS_ENTRY_ID], () =>
+      formsCtx.slots.inject('plugins.row.config', () => formsCtx.slots.register({
+        name: 'plugins.row.config',
+        key: SETTINGS_ROW_KEY,
+        locale: NS,
+        // The T33b shared-session list rides the same shares store singleton
+        // as the title-row icon and the session menu — one poll loop total.
+        inject: () => ({ config, shares: getSharesStore() }),
+      }, section)),
+    ), 'dsh-zen-remote: row config page')
   })
 }

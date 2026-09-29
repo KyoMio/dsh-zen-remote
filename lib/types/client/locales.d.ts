@@ -154,6 +154,7 @@ export declare const zh: {
     readonly 'settings.revokeAllConfirm': "将吊销全部已配对设备，确定继续？";
     readonly 'settings.actionFail': "操作失败";
     readonly 'settings.shareTitle': "远程共享";
+    readonly 'settings.shareListTitle': "已开启远程的会话";
     readonly 'settings.shareListEmpty': "当前没有已开启远程的会话";
     readonly 'settings.shareViewers': "{count} 人在看";
     readonly 'settings.shareClose': "关闭远程";
@@ -218,6 +219,9 @@ export declare const zh: {
     readonly shareRemoteRemainingMinutes: "剩余闲置时间 {count} 分钟";
     readonly shareRemoteConfirmOn: "开启远程后，已配对的桌面应用端将可以查看并操作此会话。确定开启？";
     readonly shareRemoteConfirmOff: "关闭后，桌面应用端将无法再访问此会话。确定关闭？";
+    readonly shareRemoteFailSubagent: "开启远程失败：子智能体会话不能单独开启";
+    readonly shareRemoteFailEmpty: "开启远程失败：会话还没有内容";
+    readonly shareRemoteFailGeneric: "操作失败，请稍后再试";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

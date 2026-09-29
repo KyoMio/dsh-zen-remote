@@ -7,11 +7,14 @@
  * copy); clicking toggles the share behind a `window.confirm` — the desktop
  * app is the main server, and Electron answers confirm (its missing dialog
  * method is prompt, not confirm — the settings page's confirms run there).
+ * A refused action (subagent child, contentless session, anything else)
+ * alerts the mapped reason (shareFailText).
  *
- * Renders NOTHING while the table has never answered (no wrong-state flash)
- * and on a `404`-latched deployment: the shares route exists only on the
- * host role, so "no route" is the client-role gate for this part — the
- * sub-client's own remote affordances are T34's.
+ * Renders NOTHING while the table has never answered, on a non-host role
+ * (the registration wires the store's role from the same two-level decision
+ * the settings page makes — row document first, client-config probe as the
+ * fallback), and on a subagent session, which the server refuses to share
+ * alone (T33b-fix: same rule as the menu item).
  *
  * On the phone shell no rule of its own is needed: the mobile stylesheet
  * blanket-hides every `conversation.session.header.actions` entry that is
@@ -25,5 +28,5 @@ export interface RemoteHeaderIconProps extends PropsRuntime<'conversation.sessio
     /** The shared shares store, bound through the registration's inject face. */
     shares: SharesStore;
 }
-export declare function RemoteHeaderIcon({ sessionId, shares, t }: RemoteHeaderIconProps): import("react").JSX.Element | null;
+export declare function RemoteHeaderIcon({ sessionId, shares, useSessions, t }: RemoteHeaderIconProps): import("react").JSX.Element | null;
 //# sourceMappingURL=RemoteHeaderIcon.d.ts.map

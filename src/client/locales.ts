@@ -156,6 +156,7 @@ export const zh = {
   'settings.revokeAllConfirm': '将吊销全部已配对设备，确定继续？',
   'settings.actionFail': '操作失败',
   'settings.shareTitle': '远程共享',
+  'settings.shareListTitle': '已开启远程的会话',
   'settings.shareListEmpty': '当前没有已开启远程的会话',
   'settings.shareViewers': '{count} 人在看',
   'settings.shareClose': '关闭远程',
@@ -222,6 +223,9 @@ export const zh = {
   'shareRemoteRemainingMinutes': '剩余闲置时间 {count} 分钟',
   'shareRemoteConfirmOn': '开启远程后，已配对的桌面应用端将可以查看并操作此会话。确定开启？',
   'shareRemoteConfirmOff': '关闭后，桌面应用端将无法再访问此会话。确定关闭？',
+  'shareRemoteFailSubagent': '开启远程失败：子智能体会话不能单独开启',
+  'shareRemoteFailEmpty': '开启远程失败：会话还没有内容',
+  'shareRemoteFailGeneric': '操作失败，请稍后再试',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -378,6 +382,7 @@ export const en: Record<MobileNavKey, string> = {
   'settings.revokeAllConfirm': 'This revokes every paired device. Continue?',
   'settings.actionFail': 'The action failed',
   'settings.shareTitle': 'Remote sharing',
+  'settings.shareListTitle': 'Sessions shared remotely',
   'settings.shareListEmpty': 'No sessions are currently shared',
   'settings.shareViewers': '{count} viewing',
   'settings.shareClose': 'Stop sharing',
@@ -442,6 +447,9 @@ export const en: Record<MobileNavKey, string> = {
   'shareRemoteRemainingMinutes': 'Idle time remaining: {count} min',
   'shareRemoteConfirmOn': 'Once enabled, paired desktop apps will be able to view and operate this session. Enable?',
   'shareRemoteConfirmOff': 'Desktop apps will no longer be able to access this session. Disable?',
+  'shareRemoteFailSubagent': 'Enable remote failed: subagent sessions cannot be shared alone',
+  'shareRemoteFailEmpty': 'Enable remote failed: the session has no content yet',
+  'shareRemoteFailGeneric': 'The action failed — try again later',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

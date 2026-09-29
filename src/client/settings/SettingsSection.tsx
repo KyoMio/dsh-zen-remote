@@ -920,9 +920,10 @@ function sourceName(source: SettingsFieldView['source'], t: SectionT): string {
  * read-only. It reads the SAME shares store singleton as the title-row icon
  * and the session menu (one poll loop for all three, started by this page's
  * subscription while mounted). Renders nothing until the first GET answers
- * and nothing at all on a 404-latched deployment (the shares route exists
- * only on the host role — this component additionally sits inside the
- * page's `!clientRole` branch, judged the T16 way off the saved row role).
+ * and nothing while the store's wired role is not host (T33b-fix: the role
+ * comes from the settings page's own two-level decision — this component
+ * additionally sits inside the page's `!clientRole` branch, judged the T16
+ * way off the saved row role). A failed GET keeps the last table on screen.
  *
  * Unlike pairing and device management these actions are NOT gated by
  * `viaGateway`: toggling shares through the gateway is the T33a-sanctioned
@@ -936,7 +937,7 @@ function SharesList({ shares, t }: { shares: SharesStore, t: SectionT }) {
   const [shareBusy, setShareBusy] = useState(false)
   const [shareFailed, setShareFailed] = useState(false)
 
-  if (!snap.ready || !snap.available) return null
+  if (!snap.ready || snap.role !== 'host') return null
   const entries = snap.entries
   // Fresh clock per render — the 30 s poll replaces the snapshot, which is
   // the re-render that keeps every countdown text within one poll of truth.
@@ -945,7 +946,8 @@ function SharesList({ shares, t }: { shares: SharesStore, t: SectionT }) {
   const runUnshare = async (sessionId: string): Promise<void> => {
     setShareBusy(true)
     setShareFailed(false)
-    if (!await shares.unshare(sessionId)) setShareFailed(true)
+    const outcome = await shares.unshare(sessionId)
+    if (!outcome.ok) setShareFailed(true)
     setShareBusy(false)
   }
 
@@ -953,7 +955,8 @@ function SharesList({ shares, t }: { shares: SharesStore, t: SectionT }) {
     if (!window.confirm(t('settings.shareCloseAllConfirm'))) return
     setShareBusy(true)
     setShareFailed(false)
-    if (!await shares.unshareAll()) setShareFailed(true)
+    const outcome = await shares.unshareAll()
+    if (!outcome.ok) setShareFailed(true)
     setShareBusy(false)
   }
 
@@ -976,7 +979,7 @@ function SharesList({ shares, t }: { shares: SharesStore, t: SectionT }) {
 
   return (
     <>
-      <h3 className="zr-settings-card-title">{t('settings.shareTitle')}</h3>
+      <h3 className="zr-settings-card-title">{t('settings.shareListTitle')}</h3>
       {entries.length === 0 && <p className="zr-settings-hint">{t('settings.shareListEmpty')}</p>}
       {entries.map(shareRow)}
       {shareFailed && <p className="zr-settings-hint" data-invalid="true">{t('settings.shareActionFail')}</p>}
