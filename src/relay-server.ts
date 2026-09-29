@@ -1,8 +1,11 @@
 /**
  * Server-side relay routes for the desktop client (T22a routes, T22b
- * streaming): authentication, ping, handshake, the single invoke passthrough,
- * and the NDJSON stream subscription route with share-change synchronization.
- * Event forwarding (`$events`) and activity stats are later tasks.
+ * streaming, T32 event forwarding): authentication, ping, handshake, the
+ * single invoke passthrough, the NDJSON stream subscription route with
+ * share-change synchronization, and the forwarded-event half — the
+ * `$zr/events` subscription over the gateway's `$events` wire stream plus
+ * the `relay/v1/event-result` answer route. Activity stats remain a later
+ * task.
  *
  * Why the secret: the desktop client is a Node process on another machine —
  * it has no DSH login cookie, so the gateway authenticates it with a Bearer
@@ -27,7 +30,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ShareStore } from './share-store.js'
-import { decideInvoke, decideStream } from './relay-access.js'
+import { decideInvoke, decideStream, parseEventResultBody } from './relay-access.js'
 import {
   createWorkspaceFollowState,
   filterControlFrame,
@@ -65,6 +68,14 @@ const DSH_ERROR_CODE = /^[a-z][a-zA-Z-]*\/[a-zA-Z-]+$/
 /** Concurrent streams one device may hold open (per `x-zen-remote-device`). */
 const MAX_STREAMS_PER_DEVICE = 32
 
+/** Most recent forwarded waterfall events remembered per `$zr/events`
+ * subscription (T32-fix): the registry is only an ownership record, so this
+ * bounds a pathological burst the same way the job cache does — past the
+ * cap the OLDEST entry is dropped (a forwarded-but-forgotten event answers
+ * `unknown-event`, which the client surfaces as the same silent ok DSH
+ * gives a stale result). */
+const EVENT_REGISTRY_LIMIT = 500
+
 /** Stream heartbeat when the caller does not inject one. */
 const DEFAULT_HEARTBEAT_MS = 15_000
 
@@ -86,7 +97,21 @@ const JOB_CACHE_LIMIT = 1024
  * method and resolves to an async iterable of its frames). Declared
  * structurally instead of augmenting `Context`: the providing package is not
  * a devDependency here, and a local augmentation could collide with its own
- * once that changes. */
+ * once that changes.
+ *
+ * T32 adds the two event surfaces, both OPTIONAL: only `$zr/events` and
+ * `relay/v1/event-result` touch them, so a composition (or test fake) without
+ * them keeps every other route working and the event routes answer
+ * `gateway/service-unavailable`.
+ *
+ * - `wireStream.open('$events', …)` is the ONLY way to the forwarded-event
+ *   stream — `gw.stream({namespace:'$events'})` refuses with
+ *   `gateway/invocation-unavailable` (docs/spike-relay.md §2.1 坑 1). It
+ *   resolves to an async iterable whose first frame is the `ready` frame.
+ * - `dispatchRpc('$events/result', payload, signal, peer)` is the only way to
+ *   answer a forwarded waterfall — the gateway special-cases the endpoint
+ *   before its typert dispatch — and returns the `{ok,…}` envelope itself.
+ */
 export interface RelayGateway {
   invoke(call: { namespace: string; method: string; args: unknown; signal?: AbortSignal }): Promise<unknown>
   stream(call: {
@@ -95,6 +120,18 @@ export interface RelayGateway {
     args: unknown
     signal?: AbortSignal
   }): Promise<AsyncIterable<unknown>>
+  /** The host's wire adapter, shared by the WebSocket mux and the local
+   * transports. `open` is the async 0.2.0 method. */
+  wireStream?: {
+    open(endpoint: string, payload: unknown, uplink: unknown, peer: unknown, signal: AbortSignal | undefined): unknown
+  }
+  /** The host's `/api` dispatch, owning the `$events/result` special case. */
+  dispatchRpc?(
+    endpoint: string,
+    payload: unknown,
+    signal: AbortSignal | undefined,
+    peer: unknown,
+  ): Promise<unknown>
 }
 
 /** What the handshake reports about this server. `serverName` is a CALLBACK
@@ -312,6 +349,39 @@ function errorOf(error: unknown): { code: string; message?: string } {
 }
 
 /**
+ * One live `$zr/events` subscription's forwarding bookkeeping (T32). The
+ * answer route (`relay/v1/event-result`) proves an `eventId` was forwarded
+ * through HERE before it composes the gateway payload, so the registry is
+ * the whole ownership story: event → the agent (session) it belongs to,
+ * judged accessible AT ANSWER TIME, and the subscription's own `clientId`
+ * — the server is ONE client of the host's `$events` stream, and DSH
+ * matches every result against THAT id (`parseRemoteEventResult`), never
+ * the sub-client's local one.
+ *
+ * T32-fix: the events handed to the sub-client are rewritten to
+ * `<token>.<eventId>` so an answer names the subscription it belongs to —
+ * answers are matched against THAT sub only, on THAT sub's device, never
+ * across devices. The registry survives the event's own `cancel` frame
+ * NO LONGER: cancel closes the entry (the client already closed its
+ * prompt; a later answer refuses `unknown-event`, which the client turns
+ * into the same silent ok DSH gives a stale result).
+ */
+interface EventsSubscription {
+  /** The `x-zen-remote-device` the subscription rides on; answers from any
+   * other device are refused before the registry is read. */
+  device: string
+  /** The random token baked into every forwarded eventId. */
+  token: string
+  /** The server's `$events` clientId, taken from the subscription's ready
+   * frame; undefined until it arrived. */
+  clientId: string | undefined
+  /** Forwarded waterfall eventIds (ORIGINAL ids — the token stays in the
+   * wire form) → the `agentId` each belongs to. Capped at
+   * {@link EVENT_REGISTRY_LIMIT}, oldest dropped. */
+  events: Map<string, string>
+}
+
+/**
  * Build the relay route handler mounted under {@link RELAY_PREFIX}. Exported
  * as a factory so the route tests can drive it against a plain node:http
  * server with a fake gateway and a real share store — no harness required.
@@ -338,6 +408,11 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
 
   /** Open streams per device id, for the per-device budget. */
   const streamsByDevice = new Map<string, number>()
+
+  /** The `$zr/events` subscriptions currently open — the event-result
+   * route searches these for every incoming eventId. A closed
+   * subscription removes itself; closeAll empties the set. */
+  const liveEventSubscriptions = new Set<EventsSubscription>()
 
   /** Latest `job/list` rows seen per session — the recent-state half of the
    * job ownership check (the other half is a one-shot list on a cache miss).
@@ -408,6 +483,136 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     } catch {
       return false
     }
+  }
+
+  /**
+   * Open THIS server's own `$events` subscription (T32) — through the
+   * host's wire adapter, the only door (docs/spike-relay.md §2.1 坑 1:
+   * `gw.stream({namespace:'$events'})` refuses with
+   * `gateway/invocation-unavailable`). The payload must be exactly
+   * `{args:{}}` (gateway `openRemoteEvents`); the uplink is undefined —
+   * the endpoint takes none and the host half-closes whatever arrives.
+   */
+  const openEventsStream = async (signal: AbortSignal): Promise<AsyncIterable<unknown>> => {
+    const open = gateway.wireStream?.open
+    if (typeof open !== 'function') {
+      throw Object.assign(new Error('forwarded Remote event source is unavailable'), {
+        code: 'gateway/service-unavailable',
+      })
+    }
+    const opened = (await (open as (this: unknown, ...openArgs: unknown[]) => unknown).call(
+      gateway.wireStream,
+      '$events',
+      { args: {} },
+      undefined,
+      undefined,
+      signal,
+    )) as unknown
+    if (
+      opened === null ||
+      typeof opened !== 'object' ||
+      typeof (opened as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function'
+    ) {
+      throw Object.assign(new Error('forwarded Remote event stream did not open'), {
+        code: 'gateway/service-unavailable',
+      })
+    }
+    return opened as AsyncIterable<unknown>
+  }
+
+  /**
+   * Abstain on behalf of a delivery the sub-client must never answer (T32-fix):
+   * a waterfall dropped at forward time, or one whose session just left the
+   * share table. Without this the gateway keeps waiting for THIS delivery
+   * (RT dsh-api-gateway: `receiveRemoteEventResult` removes a delivery only
+   * on a result; `removeRemoteEventClient` on a disconnect does NOT settle
+   * the event) and the server-side tool call can hang. `next` is the honest
+   * answer for a gone answerer — it settles this delivery and, if the other
+   * clients (the server's own UI) are gone too, lets the waterfall fall
+   * through. A failure is swallowed: the handler has no logger, and the
+   * worst case is exactly the pre-fix behavior (the delivery stays pending,
+   * still answerable by the server UI).
+   */
+  const answerNextOnBehalf = (sub: EventsSubscription, eventId: string): void => {
+    const dispatch = gateway.dispatchRpc
+    if (sub.clientId === undefined || typeof dispatch !== 'function') return
+    void Promise.resolve(
+      dispatch.call(
+        gateway,
+        '$events/result',
+        { args: { clientId: sub.clientId, eventId, outcome: { kind: 'next' } } },
+        undefined,
+        undefined,
+      ),
+    ).catch(() => {
+      // Non-actionable: see the comment above.
+    })
+  }
+
+  /** Record one forwarded waterfall in the subscription's registry (oldest
+   * dropped past the cap), under its ORIGINAL id. */
+  const rememberEvent = (sub: EventsSubscription, eventId: string, agentId: string): void => {
+    if (sub.events.size >= EVENT_REGISTRY_LIMIT) {
+      const oldest = sub.events.keys().next().value
+      if (oldest !== undefined) sub.events.delete(oldest)
+    }
+    sub.events.set(eventId, agentId)
+  }
+
+  /**
+   * The `$zr/events` frame discipline (T32, reworked in T32-fix), one
+   * function for the pump:
+   *
+   * - READY is recorded (the subscription's clientId, for the answer route)
+   *   and forwarded SCRUBBED — the client learns "ready", never the host
+   *   facts (`clientId`, `home`) that would let it speak to the gateway
+   *   around this relay.
+   * - WATERFALL frames whose `agentId` is not reachable right now are
+   *   dropped — and answered `next` on behalf, so the gateway does not wait
+   *   for a delivery that will never come. Forwarded ones are registered
+   *   and rewritten to `<token>.<eventId>`: the answer route resolves the
+   *   subscription (and its device) from the token, so ids never cross
+   *   subscriptions. Rewriting to virtual ids for the UI stays the
+   *   CLIENT's job — it prefixes the whole thing with `zr~<serverId>~`.
+   * - CANCEL frames are forwarded only for events this subscription
+   *   forwarded (an unshared session's activity timeline must not leak
+   *   through cancels), and the entry goes with the forward.
+   * - EMIT frames are dropped entirely (T32-fix): they carry server-wide
+   *   state (`api-session/added` summaries and titles, account expirations,
+   *   cordis chatter) that is not share-scoped — forwarding them would leak
+   *   unshared sessions and feed the sub-client ids it would treat as
+   *   local. Everything a sub-client needs about a session's state travels
+   *   the workspace/control streams, which ARE share-filtered.
+   *
+   * KNOWN LIMITATION: an event that arrives while its session is still
+   * unshared is dropped (and answered `next`); sharing the session later
+   * does NOT resurrect it for the sub-client — it only sees such events
+   * from the next reconnect onward, when the gateway re-delivers still-
+   * pending events to the fresh subscription.
+   */
+  const filterEventsFrame = (sub: EventsSubscription, frame: unknown): unknown => {
+    if (!isPlainObject(frame)) return frame
+    if (frame.type === 'ready') {
+      if (typeof frame.clientId === 'string' && frame.clientId !== '') sub.clientId = frame.clientId
+      return { type: 'ready' }
+    }
+    if (frame.type === 'waterfall') {
+      const eventId = typeof frame.eventId === 'string' ? frame.eventId : ''
+      const agentId = typeof frame.agentId === 'string' ? frame.agentId : ''
+      if (eventId === '' || agentId === '' || !isAccessible(agentId)) {
+        answerNextOnBehalf(sub, eventId)
+        return null
+      }
+      rememberEvent(sub, eventId, agentId)
+      return { ...frame, eventId: `${sub.token}.${eventId}` }
+    }
+    if (frame.type === 'cancel') {
+      const eventId = typeof frame.eventId === 'string' ? frame.eventId : ''
+      if (eventId === '' || !sub.events.has(eventId)) return null
+      sub.events.delete(eventId)
+      return { ...frame, eventId: `${sub.token}.${eventId}` }
+    }
+    return null
   }
 
   const handle: RelayHandler = async function handleRelay(req, res) {
@@ -481,6 +686,86 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       }
       store.unshare(sessionId, 'client')
       responseJson(res, 200, { ok: true })
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/event-result`) {
+      // The answer half of `$zr/events` (T32): `{eventId, result}`, where
+      // `eventId` is the OPAQUE `<token>.<eventId>` string this relay handed
+      // the sub-client (wrapped in `zr~<serverId>~` by the client), and
+      // `result` is the Remote event OUTCOME, forwarded verbatim.
+      const body = await readJsonObject(req)
+      const parsed = parseEventResultBody(body)
+      if (parsed === undefined) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      // Ownership (T32-fix): the token locates the ONE subscription the
+      // event was forwarded on — the answer is matched against that sub
+      // only, and only from the device that holds it. An unknown token, a
+      // foreign device, or an eventId that subscription did not forward is
+      // the same refusal (no oracle about which half missed).
+      const separator = parsed.eventId.indexOf('.')
+      const token = separator === -1 ? '' : parsed.eventId.slice(0, separator)
+      const originalEventId = separator === -1 ? '' : parsed.eventId.slice(separator + 1)
+      let owner: { clientId: string; agentId: string } | undefined
+      if (token !== '' && originalEventId !== '') {
+        const device = headerValue(req, 'x-zen-remote-device') ?? ''
+        for (const sub of liveEventSubscriptions) {
+          if (sub.token !== token) continue
+          if (sub.device !== device) break
+          const agentId = sub.events.get(originalEventId)
+          if (agentId !== undefined && sub.clientId !== undefined) {
+            owner = { clientId: sub.clientId, agentId }
+          }
+          break
+        }
+      }
+      if (owner === undefined) {
+        responseJson(res, 403, { ok: false, error: { code: 'unknown-event' } })
+        return
+      }
+      if (!isAccessible(owner.agentId)) {
+        responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+        return
+      }
+      const dispatch = gateway.dispatchRpc
+      if (typeof dispatch !== 'function') {
+        responseJson(res, 200, {
+          ok: false,
+          error: { code: 'gateway/service-unavailable', message: 'forwarded Remote event source is unavailable' },
+        })
+        return
+      }
+      // A hang-up cancels the answer mid-flight, like invoke's.
+      const hangUp = new AbortController()
+      const onClientGone = (): void => {
+        if (!res.writableEnded) hangUp.abort()
+      }
+      res.on('close', onClientGone)
+      try {
+        // Exactly the gateway's payload contract (parseRemoteEventResult):
+        // one `args` field holding `{clientId, eventId, outcome}` — the
+        // subscription's OWN clientId (the gateway matches results against
+        // the client the event was delivered to) and the ORIGINAL eventId
+        // with the token stripped back off; the outcome untouched. The
+        // envelope — including the gateway's own
+        // `{ok:false, error:{code:'gateway/internal',…}}` for a malformed
+        // outcome — rides back as the 200 body.
+        const envelope = (await dispatch.call(
+          gateway,
+          '$events/result',
+          { args: { clientId: owner.clientId, eventId: originalEventId, outcome: parsed.result } },
+          hangUp.signal,
+          undefined,
+        )) as unknown
+        responseJson(res, 200, isPlainObject(envelope) ? envelope : { ok: false, error: { code: 'internal' } })
+      } catch (error) {
+        const { code, message } = errorOf(error)
+        responseJson(res, 200, message === undefined ? { ok: false, error: { code } } : { ok: false, error: { code, message } })
+      } finally {
+        res.off('close', onClientGone)
+      }
       return
     }
 
@@ -735,6 +1020,17 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
 
         // ---- share-change synchronization (T22b §4) --------------------
 
+        // The `$zr/events` forwarding bookkeeping (T32): registered for the
+        // answer route the moment this stream starts being served, removed
+        // in the pump's finally. The token is baked into every forwarded
+        // eventId and binds the answers to THIS subscription; the device
+        // binds them to THIS connection's pairing.
+        const eventsSub: EventsSubscription | undefined =
+          decision.events === true
+            ? { device, token: randomBytes(8).toString('hex'), clientId: undefined, events: new Map() }
+            : undefined
+        if (eventsSub !== undefined) liveEventSubscriptions.add(eventsSub)
+
         let unsubscribe = (): void => {}
         let applyToState: ((frame: unknown) => void) | undefined
 
@@ -779,6 +1075,27 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             if (event.type !== 'shared' || finished || clientGone) return
             void syncProjections(event.sessionId)
           })
+        } else if (eventsSub !== undefined) {
+          // `$zr/events` (T32-fix): the share table closing a session must
+          // also close the prompts this subscription is showing for it —
+          // synthesize the same cancel frame the gateway would have sent,
+          // drop the registry entry, and abstain `next` on the sub-client's
+          // behalf so the gateway stops waiting for an answer that can no
+          // longer arrive. Events of still-reachable sessions are untouched;
+          // nothing is synthesized on a share (the known limitation in
+          // filterEventsFrame's comment).
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'unshared' || finished || clientGone) return
+            for (const [eventId, agentId] of [...eventsSub.events]) {
+              if (isAccessible(agentId)) continue
+              eventsSub.events.delete(eventId)
+              void writeLine({
+                type: 'frame',
+                frame: { type: 'cancel', eventId: `${eventsSub.token}.${eventId}` },
+              })
+              answerNextOnBehalf(eventsSub, eventId)
+            }
+          })
         } else {
           // Session-scoped stream: count its viewers, and die loudly when
           // a dependency stops being shared — silence would leave the
@@ -799,14 +1116,16 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         }
 
         const filterFrame: (frame: unknown) => unknown =
-          decision.filter === 'workspace'
-            ? (frame) => filterWorkspaceFrame(frame, isAccessible)
-            : decision.filter === 'control'
-              ? (frame) => filterControlFrame(frame, isAccessible)
-              : namespace === 'job' && method === 'list'
-                ? // 4b: ownerless and foreign jobs stay server-side.
-                  (frame) => filterJobListFrame(frame, ownerSessionIdOf(args))
-                : (frame) => frame
+          eventsSub !== undefined
+            ? (frame) => filterEventsFrame(eventsSub, frame)
+            : decision.filter === 'workspace'
+              ? (frame) => filterWorkspaceFrame(frame, isAccessible)
+              : decision.filter === 'control'
+                ? (frame) => filterControlFrame(frame, isAccessible)
+                : namespace === 'job' && method === 'list'
+                  // 4b: ownerless and foreign jobs stay server-side.
+                  ? (frame) => filterJobListFrame(frame, ownerSessionIdOf(args))
+                  : (frame) => frame
 
         // closeAll's kill switch for THIS stream: idempotent, safe to call on
         // an already-finished stream. Registered only while the response is
@@ -845,7 +1164,13 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               error: { code: 'unshared', message: `shared session ${firstInaccessible} is no longer shared` },
             })
           } else {
-            const iterable = await gateway.stream({ namespace, method, args, signal: hangUp.signal })
+            // `$zr/events` opens through the wire adapter (the ONLY door to
+            // the forwarded-event stream); every other route is a typert
+            // stream method.
+            const iterable =
+              eventsSub !== undefined
+                ? await openEventsStream(hangUp.signal)
+                : await gateway.stream({ namespace, method, args, signal: hangUp.signal })
             for await (const frame of iterable) {
               if (finished || clientGone) break
               if (namespace === 'job' && method === 'list') rememberJobs(ownerSessionIdOf(args), frame)
@@ -871,6 +1196,10 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           clearInterval(heartbeat)
           unsubscribe()
           tableUnsubscribers.delete(unsubscribe)
+          if (eventsSub !== undefined) {
+            liveEventSubscriptions.delete(eventsSub)
+            eventsSub.events.clear()
+          }
           res.off('close', onClientGone)
           res.off('error', onClientGone)
           if (decision.filter === undefined) {
@@ -901,6 +1230,15 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     // unsubscribe twice is a no-op, so the pumps' finallys stay honest.
     for (const detach of [...tableUnsubscribers]) detach()
     tableUnsubscribers.clear()
+    // The event-forwarding registries go with them (T32): after closeAll no
+    // answer may still compose a payload for a dead handler's clientId —
+    // the streams' own finallys would clear theirs, but only after their
+    // teardown unwinds, and an answer could slip into that window.
+    for (const sub of liveEventSubscriptions) {
+      sub.clientId = undefined
+      sub.events.clear()
+    }
+    liveEventSubscriptions.clear()
     // Remember the reason for requests still inside their ownership probe —
     // they read it at the pre-open gate. Killing the open streams runs their
     // normal teardown (error line, res.end, abort), whose finally releases
