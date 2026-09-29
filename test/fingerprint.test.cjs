@@ -202,6 +202,35 @@ test('computeFingerprints: anchors fall through when a root lacks the package', 
   )
 })
 
+test('defaultAnchors: a symlinked process entry resolves through to the real closure behind it (T23b2-fix3)', async () => {
+  // The npm global CLI shape: `…/bin/dsh` is a SYMLINK into the real install
+  // (whose node_modules sits beside the target). Without the realpath the
+  // host anchor would be the bin directory — its upward node_modules walk
+  // finds nothing, the anchor silently fails, and this plugin's own copies
+  // (the second anchor) would answer instead of the host's.
+  const real = makeFakeRoot('real-behind-link')
+  // The realpath needs a REAL target: create the entry file the symlink
+  // points at (the npm CLI's entry exists too — it is what Node runs).
+  fs.writeFileSync(path.join(real.root, 'entry.js'), '// anchor target\n')
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-fp-bin-'))
+  process.on('exit', () => { try { fs.rmSync(bin, { recursive: true, force: true }) } catch { /* best effort */ } })
+  const link = path.join(bin, 'dsh')
+  fs.symlinkSync(path.join(real.root, 'entry.js'), link)
+  const originalEntry = process.argv[1]
+  process.argv[1] = link
+  try {
+    // DEFAULT anchors — the host entry first (realpath'd), the plugin second.
+    const fingerprints = await computeFingerprints({})
+    assert.equal(
+      fingerprints[EVENTS_GROUP],
+      fingerprintForwardedEvents([{ event: 'real-behind-link/event', mode: 'emit' }]),
+      'the symlinked entry anchored the real closure beside it, not the plugin copy',
+    )
+  } finally {
+    process.argv[1] = originalEntry
+  }
+})
+
 // -- computeFingerprints over injected typert fakes ------------------------------
 
 function fakeCtx(typert) {

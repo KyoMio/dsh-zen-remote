@@ -87,10 +87,11 @@ export interface FingerprintOptions {
     /**
      * Package-resolution anchors, HIGHEST priority first. Each anchor seeds a
      * `createRequire` that walks node_modules upward from it. The default puts
-     * the host process entry first (`process.argv[1]` — inside the running
-     * App's closure) and this plugin second: a link-installed plugin carries
-     * devDependency copies of the DSH packages, and reading those would
-     * fingerprint a version the host is not actually running.
+     * the host process entry first (`process.argv[1]`, realpath'd — under the
+     * npm CLI it is a symlink into the real install) and this plugin second:
+     * a link-installed plugin carries devDependency copies of the DSH
+     * packages, and reading those would fingerprint a version the host is not
+     * actually running.
      */
     anchors?: readonly string[];
 }

@@ -1121,3 +1121,26 @@ test('compat: unpairing and revocation clear the verdict (T42-fix)', async () =>
     assert.equal(revoker.client.compat, undefined, 'revocation is the same "this server is gone" wall')
   } finally { await relay.stop() }
 })
+
+test('compat: a credential change clears the verdict even while online (T23b2-fix3)', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client, setToken } = makeClient(relay.port, { computeOwnFingerprints: () => ({ algo: 'sha256' }) })
+    await client.connect()
+    assert.deepEqual(client.compat?.identical, ['algo'])
+    assert.equal(client.state, 'online')
+    // Unchanged credentials are a no-op — the verdict was earned by exactly
+    // these values and stays.
+    client.credentialsChanged()
+    assert.deepEqual(client.compat?.identical, ['algo'])
+    // A re-pair with a NEW token: the verdict described the OLD credentials.
+    // It must vanish the moment the change is committed — there is a window
+    // before the follow-up handshake repopulates it — and the fresh verdict
+    // comes from that handshake.
+    setToken('tok-2')
+    client.credentialsChanged()
+    assert.equal(client.compat, undefined, 'the verdict goes with the credentials it was earned with')
+    await waitFor(() => client.state === 'online', 3000)
+    assert.deepEqual(client.compat?.identical, ['algo'], 'the new handshake earned a fresh verdict')
+  } finally { await relay.stop() }
+})

@@ -181,7 +181,10 @@ export interface RelayClient {
   readonly lastError: string | undefined
   /** The interface-compatibility verdict of the most recent handshake (T42):
    * group names that matched, differed, or could not be compared. Undefined
-   * until a first handshake ran WITH `computeOwnFingerprints` wired. */
+   * until a first handshake ran WITH `computeOwnFingerprints` wired, and
+   * cleared again whenever the link or the credentials move (unpaired,
+   * revoked, credentialsChanged) — it describes the credentials it was
+   * earned with, never the current ones. */
   readonly compat: RelayCompatVerdict | undefined
   /** Observe state changes; a throwing listener never blocks the others. */
   subscribe(listener: (state: RelayState) => void): () => void
@@ -653,17 +656,24 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
   /**
    * The credentials source moved (a pairing write, an unpair, a hand edit
    * committed by the loader): drop any pending wait — the ladder belongs to
-   * the OLD credentials — and dial the new values at once. Nothing configured
-   * lands `unpaired`, exactly like a request would. A connect already
-   * running joined in with the old values (its getters were read at its
-   * start); when it settles, ONE follow-up goes out with the new values —
-   * skipped if a still-newer change superseded this one.
+   * the OLD credentials — clear the stored compat verdict (it describes the
+   * server the OLD credentials pointed at, T23b2-fix3) and dial the new
+   * values at once. Nothing configured lands `unpaired`, exactly like a
+   * request would. A connect already running joined in with the old values
+   * (its getters were read at its start); when it settles, ONE follow-up
+   * goes out with the new values — skipped if a still-newer change
+   * superseded this one.
    */
   function credentialsChanged(): void {
     const creds = currentCredentials()
     const digest = creds === undefined ? undefined : relayCredentialsDigest(creds.url, creds.token)
     if (digest === credentialsDigest) return
     credentialsDigest = digest
+    // Same invalidation rule as setState's unpaired/revoked branch: a
+    // verdict the current credentials never earned must not stay visible —
+    // even when the very next handshake lands online, there is a window
+    // between the change and that handshake.
+    compat = undefined
     cancelRetry()
     if (stopped) return
     if (creds === undefined) {
