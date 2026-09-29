@@ -76,8 +76,8 @@
  *   generation (client face: pumpEvents aborts on answer failures).
  */
 
-import { RelayError } from './relay-client.js'
-import type { RelayClient, RelayState } from './relay-client.js'
+import { RelayError, defaultClock } from './relay-client.js'
+import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
@@ -314,6 +314,52 @@ export function isRemoteWrite(endpoint: string): boolean {
 const WRITE_OFFLINE_MESSAGE = '服务端离线，远程会话暂时只读'
 
 /**
+ * The RelayError codes that mean "the LINK went down under a live stream"
+ * (CP4): `offline` is the transport death, `server-restart` the server's
+ * clean-exit line (relay-client marks the client offline for it). Both are
+ * recoverable by waiting for the relay to serve again; every other code is
+ * either an answer about the call (`unshared`, `not-shared`, `too-many-streams`)
+ * or a user-action wall (`revoked`, …) and stays a terminal stream error.
+ */
+const LINK_DOWN_CODES: ReadonlySet<string> = new Set(['offline', 'server-restart'])
+
+/**
+ * The reopen-backoff for a merged stream whose remote leg ended while the
+ * relay STILL reads `online` (a clean `{type:'end'}`, a 429
+ * `too-many-streams`, any error line that is not a link fact — none of them
+ * move the state, so `waitOnline` alone would park the pump forever). The
+ * first wait is 1s, each consecutive empty spin doubles it (capped at 30s),
+ * and a delivered frame resets it — a stream that actually served content
+ * proved the route works and the next end is worth retrying promptly.
+ */
+const REMOTE_REOPEN_FIRST_MS = 1_000
+const REMOTE_REOPEN_MAX_MS = 30_000
+
+/**
+ * One delayed reopen wait: whichever comes first — the next relay state
+ * event (a transition to `offline` cancels the wait, the pump re-evaluates)
+ * or the backoff delay elapsing. The `waitOnline` waiter left behind when
+ * the timer wins is flushed by the next state event, as every waiter is.
+ */
+function waitReopen(clock: RelayClock, waitOnline: () => Promise<void>, delayMs: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false
+    const settle = (): void => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    const timer = clock.setTimeout(settle, delayMs)
+    void waitOnline().then(() => {
+      if (settled) return
+      settled = true
+      clock.clearTimeout(timer)
+      resolve()
+    })
+  })
+}
+
+/**
  * The error shape the host's stream channel forwards intact: only errors
  * with `isDSHRemoteError === true` and a string `code` keep their identity
  * across the wire (dsh-typert-protocol's remoteErrorOf) — anything else is
@@ -452,6 +498,10 @@ export interface InstallInterceptOptions {
   getServerId: () => string | undefined
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
+  /** Clock/timers for the merged streams' reopen backoff (CP4); defaults to
+   * the same real clock the relay client's ladder uses. Tests inject a
+   * manual clock to drive the reopen delays without real waiting. */
+  clock?: RelayClock
 }
 
 export interface InterceptHandle {
@@ -1008,6 +1058,8 @@ interface MergedGlobalStreamDeps {
   signal: AbortSignal | undefined
   recordFailure: (endpoint: string, code: string) => void
   log: ((format: string, ...args: unknown[]) => void) | undefined
+  /** The clock the reopen backoff runs on (the install options' clock). */
+  clock: RelayClock
 }
 
 /**
@@ -1026,7 +1078,7 @@ interface MergedGlobalStreamDeps {
  * rename re-upserts the shown groups under the new title without a reopen.
  */
 async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator<unknown, void, undefined> {
-  const { endpoint, namespace, method, local, relay, signal, recordFailure, log } = deps
+  const { endpoint, namespace, method, local, relay, signal, recordFailure, log, clock } = deps
   // An already-aborted caller has nothing to merge — end both legs (neither
   // has started) immediately instead of letting the local stream open into
   // a dead iteration.
@@ -1222,6 +1274,10 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   const pumpRemote = async (): Promise<void> => {
     // The whole pump body is guarded: ANY escape stops the REMOTE leg only —
     // the local stream the UI opened must never notice.
+    // The reopen backoff (CP4): how long the next end-while-online spin waits
+    // before reopening. Doubles per consecutive empty spin, reset by a
+    // delivered frame.
+    let reopenDelayMs = REMOTE_REOPEN_FIRST_MS
     try {
       while (alive) {
         const identity = relayIdentityOf(relay)
@@ -1244,6 +1300,7 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
         currentController = controller
         try {
           const stream = relay.openStream(namespace, method, {}, controller.signal)
+          let served = false
           for await (const frame of stream) {
             // `signal.aborted` too (T23b2-fix3): after an abort (server
             // change, unpair/revocation, teardown) the transport may still
@@ -1251,6 +1308,10 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
             // the merger, which the abort just declared dead for this
             // generation.
             if (!alive || controller.signal.aborted) break
+            if (!served) {
+              served = true
+              reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+            }
             for (const out of merger.onRemote(frame)) channel.push(out)
           }
         } catch (error) {
@@ -1271,6 +1332,19 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
         merger.onRemoteDown()
         if (reopenNow) {
           reopenNow = false
+          continue
+        }
+        // The leg ended while the relay still reads `online` and the identity
+        // is unchanged (a clean `{type:'end'}`, a 429 `too-many-streams`, an
+        // error line that is not a link fact — none move the state), so
+        // waitOnline alone would park here FOREVER: the group would never
+        // mark itself offline and the content would freeze even after the
+        // server recovered (CP4). Race the state wait against the backoff
+        // delay and reopen. A genuinely offline relay skips the race — the
+        // reconnect ladder's `online` transition is the wake-up.
+        if (relay.state === 'online') {
+          await waitReopen(clock, waitOnline, reopenDelayMs)
+          reopenDelayMs = Math.min(reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
           continue
         }
         await waitOnline()
@@ -1317,6 +1391,8 @@ interface MergedEventsStreamDeps {
   signal: AbortSignal | undefined
   recordFailure: (endpoint: string, code: string) => void
   log: ((format: string, ...args: unknown[]) => void) | undefined
+  /** The clock the reopen backoff runs on (the install options' clock). */
+  clock: RelayClock
 }
 
 /**
@@ -1343,7 +1419,7 @@ interface MergedEventsStreamDeps {
  * first, which removes it from the record.
  */
 async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator<unknown, void, undefined> {
-  const { local, relay, signal, recordFailure, log } = deps
+  const { local, relay, signal, recordFailure, log, clock } = deps
   if (signal?.aborted === true) return
   const channel = createFrameChannel()
   let alive = true
@@ -1428,6 +1504,10 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
   const pumpRemote = async (): Promise<void> => {
     // The whole pump body is guarded: ANY escape stops the REMOTE leg only —
     // the local stream the UI opened must never notice.
+    // The reopen backoff (CP4), same discipline as the merged global streams:
+    // doubles per consecutive end-while-online spin, reset by a delivered
+    // frame.
+    let reopenDelayMs = REMOTE_REOPEN_FIRST_MS
     try {
       while (alive) {
         const identity = relayIdentityOf(relay)
@@ -1440,8 +1520,18 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
         currentController = controller
         try {
           const stream = relay.openStream('$zr', 'events', {}, controller.signal)
+          let served = false
           for await (const frame of stream) {
-            if (!alive) break
+            // `controller.signal.aborted` too (CP4, matching the merged
+            // global streams): after an abort (server change, unpair,
+            // teardown) the transport may still hand over lines it had
+            // already decoded — they must not reach the UI, whose generation
+            // the abort just declared dead.
+            if (!alive || controller.signal.aborted) break
+            if (!served) {
+              served = true
+              reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+            }
             const rewritten = rewriteRemoteEventFrame(frame, identity.serverId)
             if (rewritten === null) continue
             // The orphan-close bookkeeping rides the two id-carrying frame
@@ -1483,6 +1573,17 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
         // change skips the wait — the cut above already aimed us elsewhere.
         const next = relayIdentityOf(relay)
         if (next !== undefined && next.serverId !== legServerId) continue
+        // The leg ended while the relay still reads `online` (a clean end or
+        // a non-link error line — none move the state), so waitOnline alone
+        // would park the leg forever and a remote approval could never
+        // arrive or be answered again after a server-side restart that is
+        // not a link death (CP4). Race the state wait against the backoff
+        // delay, exactly like the merged global streams.
+        if (relay.state === 'online') {
+          await waitReopen(clock, waitOnline, reopenDelayMs)
+          reopenDelayMs = Math.min(reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
+          continue
+        }
         await waitOnline()
       }
     } catch (error) {
@@ -1521,6 +1622,7 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
  */
 export function installIntercept(options: InstallInterceptOptions): InterceptHandle {
   const { raw, relay, getServerId, log } = options
+  const clock = options.clock ?? defaultClock
   const gateway = raw as Record<string | symbol, unknown>
   const shape = checkGatewayShape(raw)
   const counters = { openWireStream: 0, dispatchRpc: 0 }
@@ -1546,10 +1648,27 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   let installed = true
   let selfCheck: SelfCheckResult | undefined
 
-  // Save the CURRENT value per property (possibly another plugin's wrapper —
-  // shape note "own-property"), falling back to the prototype method only
-  // when the current value is not callable. Uninstall restores the saved
-  // own state verbatim: value if there was one, absence if not.
+  /**
+   * Reload overlay, for the record (CP4): the theoretical hazard is installing
+   * a NEW wrapper while an OLD one is still installed, so each captures the
+   * other and the older survives as a live layer. Cordis `fiber.restart()`
+   * disposes the old fiber FIRST (its effect calls {@link InterceptHandle.uninstall},
+   * restoring the saved property) and only then applies the new row — the
+   * overlay ordering never happens today, so there is nothing to absorb at
+   * install time. Detection is also not cheaply implementable: a reloaded row
+   * loads a FRESH module instance, so a stale wrapper shares no mark with the
+   * new one — telling "ours, from a dead generation" apart from another
+   * plugin's wrapper would take a process-wide registry, which the comment
+   * above argues is not worth it while the ordering cannot occur. The
+   * `installed === false → inert passthrough` rule below is the safety net
+   * for the ordering that CAN happen: a later plugin wrapping OVER us and
+   * keeping a reference past our uninstall.
+   *
+   * Save the CURRENT value per property (possibly another plugin's wrapper —
+   * shape note "own-property"), falling back to the prototype method only
+   * when the current value is not callable. Uninstall restores the saved
+   * own state verbatim: value if there was one, absence if not.
+   */
   const saved: Record<string, { existed: boolean; value: unknown }> = {}
   const chainTarget: Record<string, unknown> = {}
   for (const name of ['openWireStream', 'dispatchRpc']) {
@@ -1745,39 +1864,157 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     throw new CodedStreamError(code, text)
   }
 
+  /**
+   * Resolve when the relay next serves (`online`), or the caller aborts —
+   * false on the abort. True immediately when the relay already reads
+   * online. The listener removes itself on either exit; a throwing relay
+   * listener loop can never reach us (subscribe's contract keeps listener
+   * faults contained on the client side).
+   */
+  function waitForOnline(signal: AbortSignal | undefined): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      if (signal?.aborted === true) {
+        resolve(false)
+        return
+      }
+      if (relay.state === 'online') {
+        resolve(true)
+        return
+      }
+      let off: (() => void) | undefined
+      const settle = (ok: boolean): void => {
+        if (off === undefined) return
+        off()
+        off = undefined
+        signal?.removeEventListener('abort', onAbort)
+        resolve(ok)
+      }
+      const onAbort = (): void => settle(false)
+      off = relay.subscribe((state) => {
+        if (state === 'online') settle(true)
+      })
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  /** One abort-aware backoff wait on the install clock. */
+  function delayWait(signal: AbortSignal | undefined, ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const done = (): void => {
+        clock.clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }
+      const onAbort = (): void => done()
+      const timer = clock.setTimeout(done, ms)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  /**
+   * Wait out a link-down death (CP4). The relay reading `offline` parks on
+   * the state change — the reconnect ladder's `online` transition is the
+   * wake-up. The state still reading `online` (a concurrent call
+   * re-established it before the error was caught, or the error line never
+   * was a state fact) first waits out the reopen backoff: an error that
+   * keeps contradicting an `online` state would otherwise spin the in-place
+   * reopen in a hot microtask loop, so every retry costs at least the
+   * current backoff step. False only on caller abort.
+   */
+  async function waitServeAgain(signal: AbortSignal | undefined, backoffMs: number): Promise<boolean> {
+    if (relay.state === 'online') {
+      await delayWait(signal, backoffMs)
+      if (signal?.aborted === true) return false
+      if (relay.state !== 'online') return waitForOnline(signal)
+      return true
+    }
+    return waitForOnline(signal)
+  }
+
+  /**
+   * Pump one session-level remote stream into the UI (CP4, SPEC story 54
+   * 「恢复后自动变回可用」): a mid-flight LINK death (`offline`, the
+   * server-restart line) must not end this UI stream with a terminal error —
+   * the UI rebuilds every failure into a `RemoteError` it treats as final
+   * (RT dsh-api-gateway lib/client.js: only `RemoteStreamCarrierError`
+   * feeds `waitForRemoteStreamRetry`; a wire `error` frame is terminal), and
+   * a frozen page was the observed fallout. Instead:
+   *
+   * - while the relay is down the stream stays OPEN and silent (the T34
+   *   offline banner and the disabled composer explain the pause);
+   * - a generation the UI has already consumed (≥1 frame out) is ended
+   *   CLEANLY once the relay serves again: the domain streams' `ended`
+   *   callbacks turn an accepted clean end into `RemoteStreamCarrierError`
+   *   ("… ended without a terminal result") — the ONE carrier shape the UI
+   *   recognizes on this carrier — and the UI immediately reopens the
+   *   stream, which now reaches the recovered server and delivers a fresh
+   *   snapshot;
+   * - a generation still waiting for its first frame reopens the remote leg
+   *   IN PLACE instead: ending it clean with nothing accepted would be the
+   *   "ended before its opening snapshot" protocol violation, a terminal.
+   * - `unshared` / `not-shared` (the server closed the remote session) and
+   *   every other code stay terminal, exactly as before — the 远程已关闭
+   *   banner and the error states are real verdicts, not retryable blips.
+   */
   async function* rewriteUpstream(
     endpoint: string,
     upstream: AsyncIterable<unknown>,
     serverId: string,
     claimed: VirtualParts[],
+    signal: AbortSignal | undefined,
+    reopen: () => AsyncIterable<unknown>,
   ): AsyncGenerator<unknown> {
     let first = true
-    try {
-      for await (const frame of upstream) {
-        if (first) {
-          first = false
-          // Frames are flowing: the session is being served again — a
-          // closed-session entry for it is stale (T34).
-          clearClosed(claimed)
+    let current = upstream
+    // The in-place reopen backoff (CP4, the merged pumps' discipline): starts
+    // at 1s, doubles per consecutive empty retry (cap 30s), resets the moment
+    // a frame is delivered.
+    let reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+    // Read through a function on purpose: the caller's signal MUTATES, and a
+    // direct `signal?.aborted === true` check after the entry check would be
+    // a type error (TS keeps the negative narrowing across the awaits below).
+    const callerAborted = (): boolean => signal?.aborted === true
+    while (true) {
+      try {
+        for await (const frame of current) {
+          if (first) {
+            first = false
+            reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+            // Frames are flowing: the session is being served again — a
+            // closed-session entry for it is stale (T34).
+            clearClosed(claimed)
+          }
+          yield rewriteFrame(endpoint, frame, serverId)
         }
-        yield rewriteFrame(endpoint, frame, serverId)
+        return
+      } catch (error) {
+        if (callerAborted()) return
+        // Same marker discipline as the refusals: a RelayError rising out of
+        // the relay's pump (unshared, offline, …) keeps its code; anything
+        // else travels as `internal`. Both are remote-call failures and land
+        // in the diagnostics ring.
+        const code = error instanceof RelayError ? error.code : 'internal'
+        // The server is no longer serving this session (T34): an `unshared`
+        // frame is the mid-stream closure with its structured reason; a
+        // `not-shared` refusal is the closure that happened before this page
+        // even opened — no event was observed, so the reason degrades to
+        // manual (T34-fix).
+        if (error instanceof RelayError && (code === 'unshared' || code === 'not-shared')) {
+          for (const parts of claimed) registerClosed(toVirtual(parts.serverId, parts.id), closedReasonOf(error))
+          recordFailure(endpoint, code)
+          throw new CodedStreamError(code, messageOf(error))
+        }
+        recordFailure(endpoint, code)
+        // A link-down fact (CP4): hold the UI stream open through the outage.
+        if (!(error instanceof RelayError) || !LINK_DOWN_CODES.has(code)) {
+          throw new CodedStreamError(code, messageOf(error))
+        }
+        if (!(await waitServeAgain(signal, reopenDelayMs))) return
+        if (callerAborted()) return
+        if (!first) return // the accepted-generation clean end the UI retries
+        current = reopen()
+        reopenDelayMs = Math.min(reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
       }
-    } catch (error) {
-      // Same marker discipline as the refusals: a RelayError rising out of
-      // the relay's pump (unshared, offline, …) keeps its code; anything
-      // else travels as `internal`. Both are remote-call failures and land
-      // in the diagnostics ring.
-      const code = error instanceof RelayError ? error.code : 'internal'
-      // The server is no longer serving this session (T34): an `unshared`
-      // frame is the mid-stream closure with its structured reason; a
-      // `not-shared` refusal is the closure that happened before this page
-      // even opened — no event was observed, so the reason degrades to
-      // manual (T34-fix).
-      if (error instanceof RelayError && (code === 'unshared' || code === 'not-shared')) {
-        for (const parts of claimed) registerClosed(toVirtual(parts.serverId, parts.id), closedReasonOf(error))
-      }
-      recordFailure(endpoint, code)
-      throw new CodedStreamError(code, messageOf(error))
     }
   }
 
@@ -1881,7 +2118,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       return (async (): Promise<unknown> => {
         const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control)
         if (!isAsyncIterable(local)) return local
-        return mergedEventsStream({ local, relay, signal, recordFailure, log })
+        return mergedEventsStream({ local, relay, signal, recordFailure, log, clock })
       })()
     }
     const args = argsOf(payload)
@@ -1924,6 +2161,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             signal,
             recordFailure,
             log,
+            clock,
           })
         })()
       }
@@ -1939,6 +2177,14 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     }
     const verdict = validate(endpoint, virtuals)
     if (!verdict.ok) throwRecorded(endpoint, verdict.code, verdict.message)
+    // A WRITE stream while the relay is not serving (CP4, the invoke route's
+    // T34 rule applied to the stream route): `terminal/follow` is the one
+    // write-shaped STREAM in the table — its attachment takes over the
+    // terminal's input control — so opening it into a dead link must refuse
+    // here, exactly like every other mutation.
+    if (isRemoteWrite(endpoint) && relay.state !== 'online') {
+      throwRecorded(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
+    }
     // The multiplexed wire channel ALWAYS hands us an UplinkInbox here —
     // never undefined. Remote streams consume no uplink items, so the uplink
     // is half-closed and the stream forwarded (the host's own move for its
@@ -1950,20 +2196,28 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     const namespace = slash === -1 ? endpoint : endpoint.slice(0, slash)
     const method = slash === -1 ? '' : endpoint.slice(slash + 1)
     let upstream: AsyncIterable<unknown>
+    let clone: unknown
     try {
-      const clone = structuredClone(args)
+      clone = structuredClone(args)
       restoreRegisteredFields(CLIENT_METHOD_FIELDS[endpoint], clone)
-      // Eager on purpose: an unpaired or offline relay fails at CALL time,
-      // exactly like the real openWireStream fails on a bad endpoint.
+      // Eager on purpose: an unpaired relay fails at CALL time, exactly like
+      // the real openWireStream fails on a bad endpoint. An OFFLINE relay
+      // does not fail here (openStream only validates credentials) — the
+      // rewriteUpstream pump holds the UI stream open through the outage and
+      // reopens the leg when the relay serves again (CP4).
       upstream = relay.openStream(namespace, method, clone, signal)
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
       throwRecorded(endpoint, code, messageOf(error))
     }
-    // RelayError raised DURING iteration (unshared, offline, …) flows out of
-    // the generator with its code attached, which is how the host's stream
-    // channel hands the failure to the UI.
-    return rewriteUpstream(endpoint, upstream, serverId, virtuals)
+    // RelayError raised DURING iteration flows through the pump below: an
+    // `unshared` (or any non-link code) reaches the UI as a coded terminal
+    // error, a link-down fact holds the stream open and ends it cleanly
+    // once the relay serves again — the end the UI treats as a carrier
+    // failure and immediately retries (CP4).
+    return rewriteUpstream(endpoint, upstream, serverId, virtuals, signal, () =>
+      relay.openStream(namespace, method, clone, signal),
+    )
   }
 
 

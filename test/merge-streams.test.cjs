@@ -136,14 +136,18 @@ test('remote upsert of a NEW workspace: upsert + merged order', () => {
   assert.deepEqual(out[1], { type: 'order', workspaceIds: ['ws-local', V('w-1'), V('w-2'), V('w-3')] })
 })
 
-test('remote remove: virtual remove + merged order; an unknown remove is a silent no-op', () => {
+test('remote remove: virtual remove + merged order + orphan archived (CP4); an unknown remove is a silent no-op', () => {
   const m = merger()
   m.onLocal(LOCAL_BASELINE)
   m.onRemote(REMOTE_BASELINE)
   const out = m.onRemote({ type: 'remove', workspaceId: 'w-1' })
+  // CP4: w-1's sessions belong to no group any more — the merged archived
+  // frame picks them up (deduped against the remote-archived s2) so the UI's
+  // archived filter keeps them out of 「未分组」.
   assert.deepEqual(out, [
     { type: 'remove', workspaceId: V('w-1') },
     { type: 'order', workspaceIds: ['ws-local', V('w-2')] },
+    { type: 'archived', archivedSessionIds: [V('s2'), V('s1')] },
   ])
   assert.deepEqual(m.onRemote({ type: 'remove', workspaceId: 'w-ghost' }), [])
 })
@@ -218,13 +222,14 @@ test('a reconnecting baseline removes only workspaces the server dropped', () =>
   m.onRemote(REMOTE_BASELINE)
   assert.deepEqual(m.onRemoteDown(), [])
 
-  // The server deleted w-1 (and w-2 got a new title): the diff shows it.
+  // The server deleted w-1 (and w-2 got a new title): the diff shows it, and
+  // w-1's sessions become orphans the archived frame hides (CP4).
   const out = m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-2', '改名了', ['s3'])], archivedSessionIds: [], pinnedSessionIds: [] } })
   assert.deepEqual(out, [
     { type: 'upsert', workspace: { ...remoteWorkspace('w-2', '改名了', ['s3']), workspaceId: V('w-2'), title: `${NAME} · 改名了`, sessionIds: [V('s3')] } },
     { type: 'remove', workspaceId: V('w-1') },
     { type: 'order', workspaceIds: ['ws-local', V('w-2')] },
-    { type: 'archived', archivedSessionIds: [] },
+    { type: 'archived', archivedSessionIds: [V('s1'), V('s2')] },
     { type: 'pinned', pinnedSessionIds: [] },
   ])
   // a second identical baseline: still-present → upserts only
@@ -416,6 +421,23 @@ test('mergeSessionList: a missing or malformed remote result returns the local r
   assert.equal(mergeSessionList(local, { items: 'junk' }, SID), local)
   // a local result without items still merges around an empty local list
   assert.deepEqual(mergeSessionList({ ok: 1 }, { items: [] }, SID), { ok: 1, items: [] })
+})
+
+test('mergeSessionList: parentSessionId is virtualized with the row (CP4) — the fork link must point at the id the UI knows', () => {
+  const local = { items: [] }
+  const remote = {
+    items: [
+      { sessionId: 's1', parentSessionId: 's0', updatedAt: 2 },
+      { sessionId: 's2', updatedAt: 3 },
+      { junk: true },
+    ],
+  }
+  const merged = mergeSessionList(local, remote, SID)
+  assert.deepEqual(merged.items, [
+    { sessionId: V('s1'), parentSessionId: V('s0'), updatedAt: 2 },
+    { sessionId: V('s2'), updatedAt: 3 },
+    { junk: true },
+  ])
 })
 
 // -- 8. driven through the REAL DSH UI model ------------------------------------------
