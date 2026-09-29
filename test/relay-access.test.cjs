@@ -11,7 +11,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { decideInvoke, decideStream } = require('../lib/relay-access.js')
+const { decideHttpRoute, decideInvoke, decideStream } = require('../lib/relay-access.js')
 
 const yes = () => true
 const no = () => false
@@ -586,4 +586,65 @@ test('decideStream: the T41a scoped streams claim their ids and refuse the invok
       `${namespace}/${method} is stream-only`,
     )
   }
+})
+
+// -- T41b: the plain-HTTP route registry (relay/v1/http) --------------------------
+
+test('decideHttpRoute: only the two registered routes allow, everything else is unknown-route', () => {
+  assert.deepEqual(decideHttpRoute('changes.summary', 'sessionId=S1&seq=1', yes), { allow: true, query: 'sessionId=S1&seq=1' })
+  assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S1&seq=1&index=0', yes), { allow: true, query: 'sessionId=S1&seq=1&index=0' })
+  assert.deepEqual(decideHttpRoute('session.export', 'sessionId=S1', yes), { allow: false, reason: 'unknown-route' })
+  assert.deepEqual(decideHttpRoute('changes.open', 'sessionId=S1&seq=1&index=0', yes), { allow: false, reason: 'unknown-route' })
+  assert.deepEqual(decideHttpRoute('present.host', '', yes), { allow: false, reason: 'unknown-route' })
+  // A prototype key name from the wire must not resolve through the object
+  // prototype the way a bare table index would.
+  assert.deepEqual(decideHttpRoute('constructor', 'sessionId=S1', yes), { allow: false, reason: 'unknown-route' })
+  assert.deepEqual(decideHttpRoute('__proto__', 'sessionId=S1', yes), { allow: false, reason: 'unknown-route' })
+  assert.deepEqual(decideHttpRoute(undefined, 'sessionId=S1', yes), { allow: false, reason: 'unknown-route' })
+})
+
+test('decideHttpRoute: the session field must be present, single, and shared', () => {
+  assert.deepEqual(decideHttpRoute('changes.summary', 'seq=1', yes), { allow: false, reason: 'no-session' })
+  assert.deepEqual(decideHttpRoute('changes.summary', 'sessionId=&seq=1', yes), { allow: false, reason: 'no-session' })
+  // Duplicates are the same "which session did you mean" garbage as a miss.
+  assert.deepEqual(decideHttpRoute('changes.summary', 'sessionId=S1&sessionId=S2', yes), { allow: false, reason: 'no-session' })
+  assert.deepEqual(decideHttpRoute('changes.summary', undefined, yes), { allow: false, reason: 'no-session' })
+  // The share-table discipline, verbatim from decideInvoke: an unshared id
+  // refuses even when everything else is well-formed.
+  assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S-secret&seq=1&index=0', no), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S-shared&seq=1&index=0', only(['S-shared'])), { allow: true, query: 'sessionId=S-shared&seq=1&index=0' })
+})
+
+// -- T41b-fix: parser differential regression (tab/CR/LF in key names) -------------
+
+test('decideHttpRoute: control characters in key names cannot split a parameter past the check', () => {
+  // The reviewed bypass: URLSearchParams kept the tab inside `session\tId`,
+  // the WHATWG URL parser strips it when the synthetic Request URL is built,
+  // and the serving route's get('sessionId') then read the FIRST parameter —
+  // the secret. The decision now rebuilds the query, so what was checked is
+  // what dispatches: only the APPROVED id travels.
+  for (const query of [
+    'session\tId=S-secret&sessionId=S-shared&seq=1&index=0',
+    'session\rId=S-secret&sessionId=S-shared&seq=1&index=0',
+    'session\nId=S-secret&sessionId=S-shared&seq=1&index=0',
+    'session\t\r\nId=S-secret&sessionId=S-shared&seq=1&index=0',
+  ]) {
+    const decision = decideHttpRoute('changes.diff', query, only(['S-shared']))
+    assert.deepEqual(decision, { allow: true, query: 'sessionId=S-shared&seq=1&index=0' }, query)
+    assert.equal(new URLSearchParams(decision.allow ? decision.query : '').getAll('sessionId').join(), 'S-shared')
+    assert.ok(!decision.allow || !decision.query.includes('S-secret'), query)
+  }
+})
+
+test('decideHttpRoute: whitelisted parameters only, fixed order, garbage coordinates refuse', () => {
+  // Unknown parameters are dropped; a stray leading ? is not a key.
+  assert.deepEqual(decideHttpRoute('changes.summary', '?sessionId=S1&foo=bar&seq=5', yes), { allow: true, query: 'sessionId=S1&seq=5' })
+  // Coordinates must be single decimal non-negative integers when present.
+  assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S1&seq=1%2F..%2F', yes), { allow: false, reason: 'bad-query' })
+  assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S1&seq=1#/../../session.export', yes), { allow: false, reason: 'bad-query' })
+  assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S1&seq=1&seq=2', yes), { allow: false, reason: 'bad-query' })
+  assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S1&index=-1', yes), { allow: false, reason: 'bad-query' })
+  // Percent-encoded key names decode like any other query text: two reads
+  // of the same key are duplicates, not a decoy and a pass.
+  assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S-shared&%73essionId=S-secret&seq=1', yes), { allow: false, reason: 'no-session' })
 })

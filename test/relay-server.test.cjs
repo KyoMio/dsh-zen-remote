@@ -65,6 +65,7 @@ function makeParts(name, overrides = {}) {
       ...(overrides.fingerprints !== undefined ? { fingerprints: overrides.fingerprints } : {}),
     },
     ...(overrides.parentOf ? { parentOf: overrides.parentOf } : {}),
+    ...(overrides.getApiFetch ? { getApiFetch: overrides.getApiFetch } : {}),
   })
   return { handler, calls, streamCalls, gateway, store, home }
 }
@@ -962,5 +963,168 @@ test('T41a-fix subagents/prompt references get the same share check', async () =
     assert.equal(leak.status, 403)
     assert.deepEqual(await leak.json(), { ok: false, error: { code: 'not-shared' } })
     assert.equal(parts.calls.length, 1)
+  } finally { await server.stop() }
+})
+
+// ---- T41b: relay/v1/http (the plain-HTTP panel passthrough) --------------------
+
+/** A shared-handler double that records the synthetic Request and answers a
+ * canned Response. The URL is asserted to the byte in the tests below. */
+function fakeApiFetch(answer) {
+  const seen = []
+  const dispatch = async (request) => {
+    seen.push(request)
+    if (typeof answer === 'function') return answer(request)
+    return answer
+  }
+  return { seen, dispatch }
+}
+
+test('T41b http: an unregistered route answers 404 before any id is read', async () => {
+  const api = fakeApiFetch(new Response('{}', { status: 200 }))
+  const parts = makeParts('t41b-http-unknown', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'session.export', query: 'sessionId=session-1' }, AUTH))
+    assert.equal(res.status, 404)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'unknown-route' } })
+    const proto = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'constructor', query: 'sessionId=session-1' }, AUTH))
+    assert.equal(proto.status, 404, 'a prototype key name is not a route')
+    assert.equal(api.seen.length, 0, 'nothing was dispatched')
+  } finally { await server.stop() }
+})
+
+test('T41b http: an unshared session answers 403 not-shared, a malformed one 400', async () => {
+  const api = fakeApiFetch(new Response('{}', { status: 200 }))
+  const parts = makeParts('t41b-http-shared', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const unshared = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.diff', query: 'sessionId=session-secret&seq=1&index=0' }, AUTH))
+    assert.equal(unshared.status, 403)
+    assert.deepEqual(await unshared.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(api.seen.length, 0, 'the unshared read was never dispatched')
+    const noId = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.summary', query: 'seq=1' }, AUTH))
+    assert.equal(noId.status, 400)
+    assert.deepEqual(await noId.json(), { ok: false, error: { code: 'no-session' } })
+  } finally { await server.stop() }
+})
+
+test('T41b http: a shared session dispatches a synthetic GET with the original id and passes the answer through', async () => {
+  const api = fakeApiFetch(new Response(JSON.stringify({ kind: 'text', path: 'a.ts', hunks: [] }), { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } }))
+  const parts = makeParts('t41b-http-dispatch', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.diff', query: 'sessionId=session-1&seq=3&index=0' }, AUTH))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.ok, true)
+    assert.equal(api.seen.length, 1)
+    // The synthetic Request is the contract: GET, exact /api path, the
+    // ORIGINAL session id (the client swapped its virtual id back before
+    // the relay), the rest of the query verbatim.
+    assert.equal(api.seen[0].method, 'GET')
+    assert.equal(api.seen[0].url, 'http://relay.local/api/changes.diff?sessionId=session-1&seq=3&index=0')
+    assert.equal(body.value.status, 200)
+    assert.equal(body.value.contentType, 'application/json; charset=utf-8')
+    assert.equal(body.value.body, JSON.stringify({ kind: 'text', path: 'a.ts', hunks: [] }))
+  } finally { await server.stop() }
+})
+
+test('T41b http: the underlying route status rides INSIDE the success envelope (a 404 is an answer, not a relay failure)', async () => {
+  const api = fakeApiFetch(new Response('Change summary unavailable.', { status: 404 }))
+  const parts = makeParts('t41b-http-404', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.summary', query: 'sessionId=session-1&seq=9' }, AUTH))
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    // Node answers a plain-text Response with its own default content type;
+    // whatever it is, it travels verbatim beside the status.
+    assert.equal(body.ok, true)
+    assert.equal(body.value.status, 404)
+    assert.equal(body.value.body, 'Change summary unavailable.')
+    assert.ok(typeof body.value.contentType === 'string')
+  } finally { await server.stop() }
+})
+
+test('T41b http: a missing shared handler answers 501 unsupported and never throws', async () => {
+  const parts = makeParts('t41b-http-nohandler')
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.summary', query: 'sessionId=session-1&seq=1' }, AUTH))
+    assert.equal(res.status, 501)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'unsupported' } })
+  } finally { await server.stop() }
+})
+
+test('T41b http: a body field is refused (GET semantics only), and so is a non-object or wrong-typed payload', async () => {
+  const api = fakeApiFetch(new Response('{}', { status: 200 }))
+  const parts = makeParts('t41b-http-body', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const withBody = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.summary', query: 'sessionId=session-1&seq=1', body: 'raw-bytes-attempt' }, AUTH))
+    assert.equal(withBody.status, 400, 'a forwarded body is a protocol violation')
+    assert.deepEqual(await withBody.json(), { ok: false, error: { code: 'bad-request' } })
+    const wrongTypes = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 5, query: ['x'] }, AUTH))
+    assert.equal(wrongTypes.status, 400)
+    assert.equal(api.seen.length, 0, 'nothing was dispatched')
+  } finally { await server.stop() }
+})
+
+test('T41b-fix parser differential: what the share check approves is EXACTLY what dispatches', async () => {
+  // The reviewed bypass: URLSearchParams kept `\t` inside `session\tId` while
+  // the WHATWG URL parser stripped it from the synthetic URL — one checked
+  // parameter went in, two arrived, and the serving route read the FIRST
+  // `sessionId` (the secret). The route now dispatches the decision's
+  // normalized query alone.
+  // A fresh Response per dispatch: a shared instance's body is consumed by
+  // the first read and every later .text() would throw.
+  const api = fakeApiFetch(() => new Response('{}', { status: 200 }))
+  const parts = makeParts('t41b-fix-differential', { getApiFetch: () => api.dispatch })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  const approvedId = (url) => new URL(url).searchParams.get('sessionId')
+  try {
+    for (const query of [
+      'session\tId=session-secret&sessionId=session-1&seq=1&index=0',
+      'session\rId=session-secret&sessionId=session-1&seq=1&index=0',
+      'session\nId=session-secret&sessionId=session-1&seq=1&index=0',
+      '?sessionId=session-1&seq=1',
+      'sessionId=session-1&foo=bar&seq=1',
+    ]) {
+      const res = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.diff', query }, AUTH))
+      assert.equal(res.status, 200, query)
+      const body = await res.json()
+      assert.equal(body.ok, true, query)
+      assert.equal(api.seen.length, 1, query)
+      const dispatched = new URL(api.seen[0].url)
+      assert.equal(approvedId(api.seen[0].url), 'session-1', `host saw ${JSON.stringify(dispatched.search)} for ${JSON.stringify(query)}`)
+      assert.equal(dispatched.searchParams.get('foo'), null, `unknown parameters must not travel: ${query}`)
+      assert.equal(dispatched.searchParams.getAll('sessionId').length, 1, query)
+      assert.ok(!api.seen[0].url.includes('session-secret'), query)
+      assert.ok(!api.seen[0].url.includes('\t') && !api.seen[0].url.includes('\r') && !api.seen[0].url.includes('\n'), query)
+      assert.equal(api.seen[0].url.startsWith('http://relay.local/api/changes.diff?'), true, query)
+      api.seen.length = 0
+    }
+    // Garbage coordinates refuse with 400 and dispatch nothing.
+    // A fragment in the query is garbage the serving route's own coordinate
+    // parser would refuse too; refusing at the relay is the same answer, and
+    // nothing of it travels.
+    for (const query of ['sessionId=session-1&seq=1%2F..%2F', 'sessionId=session-1&seq=1#/../../session.export', 'sessionId=session-1&seq=1&seq=2', 'sessionId=session-1&%73essionId=session-secret&seq=1']) {
+      const res = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.diff', query }, AUTH))
+      assert.equal(res.status, 400, query)
+      assert.equal(api.seen.length, 0, query)
+    }
+    // The byte-exact contract now reads the NORMALIZED query: fixed order,
+    // whitelisted parameters only.
+    const clean = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.diff', query: 'index=0&sessionId=session-1&extra=x&seq=3' }, AUTH))
+    assert.equal(clean.status, 200)
+    assert.equal(api.seen[0].url, 'http://relay.local/api/changes.diff?sessionId=session-1&seq=3&index=0')
   } finally { await server.stop() }
 })

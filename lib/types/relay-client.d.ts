@@ -163,6 +163,23 @@ export interface RelayClient {
      * line throws its RelayError. A caller abort ENDS the iteration normally;
      * `break` aborts the underlying request. */
     openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown>;
+    /** One plain-HTTP round-trip (T41b): `route` / `query` name a registered
+     * `/api` GET (relay-access's RELAY_HTTP_ROUTES; `query` is the URL-encoded
+     * query string with the session id already restored). Resolves with the
+     * UPSTREAM answer — its status, content type and body text ride inside the
+     * success envelope, so a 404 from the underlying route is a RESOLVED
+     * result here, never a RelayError. */
+    http(route: string, query: string, signal?: AbortSignal): Promise<RelayHttpResult>;
+}
+/** The upstream answer one {@link RelayClient.http} round-trip carries. */
+export interface RelayHttpResult {
+    /** The underlying `/api` route's HTTP status. */
+    status: number;
+    /** The underlying response's content type, when it sent one. */
+    contentType: string | undefined;
+    /** The underlying response body, decoded as text (both registered routes
+     * answer buffered JSON). */
+    body: string;
 }
 /**
  * The credential digest recorded beside a completed handshake (T23a-fix):
