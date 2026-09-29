@@ -80,8 +80,10 @@ import type { GatewayShapeCheck } from './intercept-shape.js';
  * in name and meaning to relay-access.ts's `SessionField`; a field named
  * without a dot is TOP-LEVEL. `request.workspaceId` locates a remote create
  * by its target workspace (never a share-table id on the server — the route
- * probes the workspace and auto-shares the result). */
-export type SessionField = 'request.sessionId' | 'request.address' | 'request.parentSessionId' | 'request.workspaceId' | 'parentSessionId' | 'agentId';
+ * probes the workspace and auto-shares the result); top-level
+ * `sessionId` / `workspaceFileScopeId` ARE session ids (terminal's retain/list
+ * half and the workspace-files group). */
+export type SessionField = 'request.sessionId' | 'request.address' | 'request.parentSessionId' | 'request.childSessionId' | 'request.workspaceId' | 'parentSessionId' | 'childSessionId' | 'sessionId' | 'workspaceFileScopeId' | 'agentId';
 /**
  * The client-side half of the server's `RELAY_METHODS` registry: which
  * argument field locates the session for each method. METHODS AND FIELDS

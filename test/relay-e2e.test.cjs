@@ -912,3 +912,95 @@ test('e2e: injected fingerprints ride the real handshake and compare group by gr
     await same.stop()
   } finally { await env.stop() }
 })
+
+// ---- T41a: the terminal panel end to end through the sub-client interceptor ----
+
+/**
+ * The sub-client's own DSH process, faked at the same seam as
+ * LocalMergeGateway above: async openWireStream, the exact dynamic call sites
+ * in the constructor. Local answers are irrelevant here — every call in the
+ * test carries a virtual id and must travel.
+ */
+class LocalTerminalGateway {
+  constructor() {
+    this.streamCalls = []
+    this.rpcCalls = []
+    this.wireStream = {
+      open: (endpoint, payload, uplink, peer, signal) => this.openWireStream(endpoint, payload, uplink, peer, signal, { signal }),
+    }
+    this.rpcBridge = (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer)
+    this.wireTap = (endpoint, payload, uplink, peer, signal, control) => this.openWireStream(endpoint, payload, uplink, peer, control.signal, control)
+  }
+  operatorPeer() { return { id: 'operator-peer' } }
+  async dispatchRpc(endpoint, payload, signal, peer) {
+    this.rpcCalls.push({ endpoint, payload })
+    return { ok: true, value: { endpoint } }
+  }
+  async openWireStream(endpoint, payload, uplink, peer, signal, control) {
+    this.streamCalls.push({ endpoint, payload })
+    return (async function* () { yield { type: 'baseline', value: { items: [] } } })()
+  }
+}
+
+test('e2e T41a: terminal/create + terminal/follow work through the sub-client, and closing remote ends follow with unshared', async () => {
+  const env = await boot({
+    shared: ['session-a'],
+    invoke: (call) => {
+      if (call.namespace === 'terminal' && call.method === 'create') {
+        return {
+          id: call.args.request.id,
+          title: 'zsh',
+          shell: { path: '/bin/zsh', args: [], name: 'zsh' },
+          cwd: '/srv',
+          cols: call.args.request.cols,
+          rows: call.args.request.rows,
+          state: 'running',
+          exitCode: null,
+        }
+      }
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+  })
+  try {
+    const info = await env.client.connect()
+    const V = (id) => toVirtual(info.serverId, id)
+    const localGateway = new LocalTerminalGateway()
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    // The PTY is created SERVER-side: the virtual agentId is restored on the
+    // way out, and the server-minted terminal info (terminal id, no session
+    // id) rides back untouched.
+    const created = await localGateway.rpcBridge('terminal/create', { args: { agentId: V('session-a'), request: { id: 'term-e2e', cols: 80, rows: 24 } } }, undefined, undefined)
+    assert.equal(created.ok, true)
+    assert.deepEqual(created.value, { id: 'term-e2e', title: 'zsh', shell: { path: '/bin/zsh', args: [], name: 'zsh' }, cwd: '/srv', cols: 80, rows: 24, state: 'running', exitCode: null })
+    assert.equal(env.invokeCalls.length, 1)
+    assert.deepEqual(env.invokeCalls[0].args, { agentId: 'session-a', request: { id: 'term-e2e', cols: 80, rows: 24 } }, 'the ORIGINAL session id reached the server')
+
+    // follow rides the stream route; the fake gateway echoes an output frame.
+    const stream = await localGateway.wireTap('terminal/follow', { args: { agentId: V('session-a'), id: 'term-e2e', attachmentId: 'att-e2e' } }, undefined, undefined, undefined, { signal: undefined })
+    const iterator = stream[Symbol.asyncIterator]()
+    const pending = iterator.next()
+    await waitFor(() => env.streams.some((gate) => gate.call.namespace === 'terminal' && gate.call.method === 'follow'))
+    const gate = env.streams.find((item) => item.call.namespace === 'terminal')
+    assert.deepEqual(gate.call.args, { agentId: 'session-a', id: 'term-e2e', attachmentId: 'att-e2e' })
+    gate.push({ type: 'snapshot', sequence: 0, screen: '$ ', info: { id: 'term-e2e', title: 'zsh', cols: 80, rows: 24, state: 'running', exitCode: null } })
+    const first = await pending
+    assert.equal(first.value.type, 'snapshot')
+
+    // Closing the session's remote access kills the follow with the SAME
+    // unshared end frame every session-scoped stream gets — through the real
+    // gateway child, NDJSON wire and interceptor.
+    env.store.unshare('session-a', 'manual')
+    let thrown
+    try { await iterator.next() } catch (error) { thrown = error }
+    assert.ok(thrown instanceof Error && thrown.code === 'unshared', `expected unshared, got: ${thrown}`)
+    assert.equal(thrown.isDSHRemoteError, true, 'the code survives the host wire because the error is marked')
+    await waitFor(() => gate.aborted)
+    handle.uninstall()
+  } finally { await env.stop() }
+})
