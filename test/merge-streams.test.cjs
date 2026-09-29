@@ -136,19 +136,64 @@ test('remote upsert of a NEW workspace: upsert + merged order', () => {
   assert.deepEqual(out[1], { type: 'order', workspaceIds: ['ws-local', V('w-1'), V('w-2'), V('w-3')] })
 })
 
-test('remote remove: virtual remove + merged order + orphan archived (CP4); an unknown remove is a silent no-op', () => {
+test('CP4-client-fix2: a session the server stopped serving keeps a TOMBSTONE in its last group — no archived frame', () => {
   const m = merger()
   m.onLocal(LOCAL_BASELINE)
   m.onRemote(REMOTE_BASELINE)
+  // The server closed s1's remote: the filtered upsert carries only s2, and
+  // the forwarded record still lists s1 — appended at the end. No archived
+  // frame: the RT navigation guard (clearArchivedCurrent) keys on that list,
+  // and an archived CURRENT session would be kicked off its page.
+  const out = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) })
+  assert.deepEqual(out, [
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-1', '远端一', ['s2']), workspaceId: V('w-1'), title: `${NAME} · 远端一`, sessionIds: [V('s2'), V('s1')] } },
+  ])
+  // A later refresher upsert (a rename) keeps carrying the tombstone.
+  const again = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '改名', ['s2']) })
+  assert.deepEqual(again, [
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-1', '改名', ['s2']), workspaceId: V('w-1'), title: `${NAME} · 改名`, sessionIds: [V('s2'), V('s1')] } },
+  ])
+})
+
+test('CP4-client-fix2: a re-shared session returns to its live position — once, tombstone cleared', () => {
+  const m = merger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 tombstoned
+  // Back in the SAME group: the live list rules, no tombstone duplicate.
+  const back = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2', 's1']) })
+  assert.deepEqual(back, [
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-1', '远端一', ['s2', 's1']), workspaceId: V('w-1'), title: `${NAME} · 远端一`, sessionIds: [V('s2'), V('s1')] } },
+  ])
+  // Shared into a DIFFERENT group instead: the home moves, the old group
+  // drops the tombstone.
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 tombstoned again
+  const moved = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-2', '远端二', ['s3', 's1']) })
+  assert.deepEqual(moved, [
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-2', '远端二', ['s3', 's1']), workspaceId: V('w-2'), title: `${NAME} · 远端二`, sessionIds: [V('s3'), V('s1')] } },
+  ])
+  // w-1 no longer carries it: refresh w-1 (a rename) and look.
+  const refresh = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '改名', ['s2']) })
+  assert.deepEqual(refresh, [
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-1', '改名', ['s2']), workspaceId: V('w-1'), title: `${NAME} · 改名`, sessionIds: [V('s2')] } },
+  ])
+})
+
+test('remote remove: virtual remove + merged order; the group\'s tombstones die with it; an unknown remove is a silent no-op', () => {
+  const m = merger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 tombstoned in w-1
   const out = m.onRemote({ type: 'remove', workspaceId: 'w-1' })
-  // CP4: w-1's sessions belong to no group any more — the merged archived
-  // frame picks them up (deduped against the remote-archived s2) so the UI's
-  // archived filter keeps them out of 「未分组」.
+  // No archived frame: CP4-client-fix2 removed the orphan hiding — a remove
+  // takes the whole group AND its tombstones away.
   assert.deepEqual(out, [
     { type: 'remove', workspaceId: V('w-1') },
     { type: 'order', workspaceIds: ['ws-local', V('w-2')] },
-    { type: 'archived', archivedSessionIds: [V('s2'), V('s1')] },
   ])
+  // A same-id group re-shared by the server carries no old tombstone.
+  const recreated = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '新组', ['s9']) })
+  assert.deepEqual(recreated[0].workspace.sessionIds, [V('s9')])
   assert.deepEqual(m.onRemote({ type: 'remove', workspaceId: 'w-ghost' }), [])
 })
 
@@ -223,13 +268,14 @@ test('a reconnecting baseline removes only workspaces the server dropped', () =>
   assert.deepEqual(m.onRemoteDown(), [])
 
   // The server deleted w-1 (and w-2 got a new title): the diff shows it, and
-  // w-1's sessions become orphans the archived frame hides (CP4).
+  // w-1's sessions leave WITH the group — their tombstones die with it, the
+  // archived set holds only the server's own archived sessions.
   const out = m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-2', '改名了', ['s3'])], archivedSessionIds: [], pinnedSessionIds: [] } })
   assert.deepEqual(out, [
     { type: 'upsert', workspace: { ...remoteWorkspace('w-2', '改名了', ['s3']), workspaceId: V('w-2'), title: `${NAME} · 改名了`, sessionIds: [V('s3')] } },
     { type: 'remove', workspaceId: V('w-1') },
     { type: 'order', workspaceIds: ['ws-local', V('w-2')] },
-    { type: 'archived', archivedSessionIds: [V('s1'), V('s2')] },
+    { type: 'archived', archivedSessionIds: [] },
     { type: 'pinned', pinnedSessionIds: [] },
   ])
   // a second identical baseline: still-present → upserts only
@@ -299,6 +345,18 @@ test('workspace merger retarget keeps the observed local state and switches the 
   assert.deepEqual(out[0].workspace.workspaceId, toVirtual('ffffffff', 'w-1'))
   assert.equal(out[0].workspace.title, '新服务器 · 远端一')
   assert.deepEqual(out[1], { type: 'order', workspaceIds: ['ws-local', toVirtual('ffffffff', 'w-1')] })
+})
+
+test('CP4-client-fix2: onRemoteGone clears the tombstones with the identity — the new server never sees them', () => {
+  const m = merger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 tombstoned
+  m.onRemoteGone()
+  m.retarget({ serverId: 'ffffffff', serverName: '新服务器' })
+  // A same-named workspace on the NEW server lists only what the server sent.
+  const out = m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', ['s2'])], archivedSessionIds: [], pinnedSessionIds: [] } })
+  assert.deepEqual(out[0].workspace.sessionIds, [toVirtual('ffffffff', 's2')])
 })
 
 // -- 6. the control merger -----------------------------------------------------------
@@ -541,6 +599,85 @@ test('RT UI model: a revocation clears every remote group', () => {
 
   m.onRemoteGone().forEach(ui.apply)
   assert.equal(ui.ids(), 'ws-local')
+})
+
+// -- 8b. tombstones through the REAL DSH UI model (CP4-client-fix2) -------------------
+
+const heldSessions = () => new Set([V('s1'), V('s2'), V('s3'), 'session-l1'])
+/** The sidebar's 「未分组」 invariant: every session the UI's store holds must
+ * sit in some workspace's sessionIds (or be archived-hidden — which the
+ * tombstone design never does for closed remotes). */
+function assertNoStrays(ui) {
+  const grouped = new Set(ui.model.items.flatMap((item) => item.sessionIds))
+  for (const id of heldSessions()) {
+    assert.ok(grouped.has(id), `${id} belongs to a group — no 「未分组」 stray`)
+  }
+}
+
+test('CP4-client-fix2 RT UI model: a closed remote session keeps its group slot — not archived (no page kick), no strays', () => {
+  const m = merger()
+  const ui = createUiModel()
+  m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
+
+  // The server closed s1's remote: the filtered upsert drops it from w-1's
+  // sessionIds. RT dsh-client-ui-workspace watchNavigation → clearArchivedCurrent
+  // (lib/client.js:897, 957-962) clears the CURRENT session to the home page
+  // the moment its id enters archivedSessionIds — the tombstone keeps it OUT
+  // of that list, so the open page stays put for its 「远程已关闭」 banner.
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }).forEach(ui.apply)
+  const group = ui.model.items.find((item) => item.workspaceId === V('w-1'))
+  assert.deepEqual(group.sessionIds, [V('s2'), V('s1')], 'the closed session still rides its group, appended at the end')
+  assert.equal(ui.model.archivedSessionIds.includes(V('s1')), false, 'NOT archived-hidden — the open page is not navigated away')
+  assertNoStrays(ui)
+})
+
+test('CP4-client-fix2 RT UI model: a re-shared session returns to its live position exactly once', () => {
+  const m = merger()
+  const ui = createUiModel()
+  m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }).forEach(ui.apply) // tombstone
+
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2', 's1']) }).forEach(ui.apply)
+  const group = ui.model.items.find((item) => item.workspaceId === V('w-1'))
+  assert.equal(group.sessionIds.filter((id) => id === V('s1')).length, 1, 'restored once — no tombstone duplicate')
+  assert.equal(group.sessionIds.join(','), [V('s2'), V('s1')].join(','), 'the live order rules again')
+  assert.equal(ui.model.archivedSessionIds.includes(V('s1')), false)
+  assertNoStrays(ui)
+})
+
+test('CP4-client-fix2 RT UI model: deleting the workspace takes its tombstones with it', () => {
+  const m = merger()
+  const ui = createUiModel()
+  m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }).forEach(ui.apply) // s1 tombstoned
+
+  m.onRemote({ type: 'remove', workspaceId: 'w-1' }).forEach(ui.apply)
+  assert.equal(ui.ids(), `ws-local,${V('w-2')}`, 'the group left, tombstones with it')
+  // A same-id group re-shared later carries no old tombstone (frame level —
+  // the UI model itself would still blacklist the removed id, the documented
+  // ClientWorkspaceModel limitation).
+  const [recreated] = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '新组', ['s9']) })
+  assert.deepEqual(recreated.workspace.sessionIds, [V('s9')])
+})
+
+test('CP4-client-fix2 RT UI model: a serverId change takes the tombstones away with the old prefix', () => {
+  const m = merger()
+  const ui = createUiModel()
+  m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(REMOTE_BASELINE).forEach(ui.apply)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }).forEach(ui.apply) // s1 tombstoned
+
+  m.onRemoteGone().forEach(ui.apply)
+  assert.equal(ui.ids(), 'ws-local', 'the old groups left with the identity')
+  assert.equal(ui.model.archivedSessionIds.includes(V('s1')), false, 'no archived leftovers either')
+
+  m.retarget({ serverId: 'ffffffff', serverName: '新服务器' })
+  const frames = m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', ['s2'])], archivedSessionIds: [], pinnedSessionIds: [] } })
+  assert.deepEqual(frames[0].workspace.sessionIds, [toVirtual('ffffffff', 's2')], 'the new server carries no old tombstone')
+  frames.forEach(ui.apply)
 })
 
 // -- 9. status annotations (T34) -----------------------------------------------------
