@@ -11,7 +11,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, virtualizeModelSelectionValue, catalogGroupIds } = require('../lib/merge-streams.js')
+const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, virtualizeModelSelectionValue } = require('../lib/merge-streams.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
@@ -481,7 +481,7 @@ test('mergeSessionList: a missing or malformed remote result returns the local r
   assert.deepEqual(mergeSessionList({ ok: 1 }, { items: [] }, SID), { ok: 1, items: [] })
 })
 
-test('T52-fix2 mergeSessionList: a row\'s projections.modelSelection is virtualized — a sequenced block must not poison the projection store', () => {
+test('T52-fix3 mergeSessionList: a row\'s projections.modelSelection is virtualized unconditionally — a sequenced block must not poison the projection store', () => {
   // RT dsh-api-session-controller lib/typert.remote-client.js:381-428: a
   // list row carries {kind:'cached'|'sequenced', asOfSeq, values}; the client
   // face applies it per session (lib/client.js:2633 → applyListBlock
@@ -506,7 +506,7 @@ test('T52-fix2 mergeSessionList: a row\'s projections.modelSelection is virtuali
       { sessionId: 's4', updatedAt: 5, projections: { kind: 'sequenced', asOfSeq: 2, values: { title: '无模型' } } },
     ],
   }
-  const merged = mergeSessionList(local, remote, SID, new Set(['codex']))
+  const merged = mergeSessionList(local, remote, SID)
   const [r1, r2, r3, r4] = merged.items.slice(1)
   assert.deepEqual(r1.projections.values.modelSelection, {
     lastUsed: { provider: V('codex'), model: 'sol' },
@@ -523,13 +523,54 @@ test('T52-fix2 mergeSessionList: a row\'s projections.modelSelection is virtuali
   // inputs untouched
   assert.equal(remote.items[0].projections.values.modelSelection.lastUsed.provider, 'codex')
 
-  // T52-fix2: a provider the server catalog does not list (or no catalog
-  // fetched yet) keeps its ORIGINAL id — the merged catalog has no virtual
-  // group for it and the UI's fallback would otherwise show `zr~…`.
-  const foreign = mergeSessionList(local, remote, SID, new Set(['deepseek-official']))
-  assert.deepEqual(foreign.items[1].projections.values.modelSelection, selection, 'a provider off the catalog stays original')
-  const noCache = mergeSessionList(local, remote, SID)
-  assert.deepEqual(noCache.items[1].projections.values.modelSelection, selection, 'no catalog yet rewrites nothing')
+  // T52-fix3: the rewrite does not depend on any catalog knowledge at all —
+  // first-write-wins per seq forbids a gate (a pre-catalog original would
+  // occupy the seq forever), so even a provider NO catalog lists goes
+  // virtual. Accepted cost: the UI renders the `zr~…` fallback for it.
+  const again = mergeSessionList(local, remote, SID)
+  assert.deepEqual(again.items[1].projections.values.modelSelection, {
+    lastUsed: { provider: V('codex'), model: 'sol' },
+    next: { provider: V('codex'), model: 'sol' },
+  }, 'the rewrite is the same with or without a fetched catalog')
+})
+
+test('T52-fix3 mergeSessionList: first-write-wins store — control baseline before the catalog, list row after, the store still ends virtual', () => {
+  // The poison-ref repro (scratchpad/poison-ref.mjs), as a regression pin:
+  // the host's projection store applies first-write-wins per seq
+  // (dsh-api-session-controller lib/client.js:986-994 —
+  // `if (row?.kind === 'sequenced' && seq <= row.seq) return`, the seed /
+  // list blocks take the same road). T52-fix2's catalog gate projected an
+  // ORIGINAL provider from the control baseline while the catalog had not
+  // landed; the same seq's VIRTUAL list row was then dropped as stale and
+  // the store kept the original forever. The rewrite must therefore be
+  // identical whenever it runs.
+  const store = new Map()
+  const apply = (key, value, seq) => {
+    const row = store.get(key)
+    if (row !== undefined && seq <= row.seq) return 'ignored'
+    store.set(key, { value, seq })
+    return 'applied'
+  }
+  const selection = { lastUsed: null, next: { provider: 'codex', model: 'sol' } }
+  // The control baseline arrives FIRST — no catalog anywhere in sight.
+  const m = createControlMerger({ serverId: SID })
+  m.onLocal({ type: 'baseline', value: { projections: {} } })
+  const [frame] = m.onRemote({ type: 'baseline', value: { projections: { s1: { asOfSeq: 7, values: { modelSelection: selection } } } } })
+  assert.equal(apply('s1/modelSelection', frame.value, frame.seq), 'applied')
+  assert.equal(store.get('s1/modelSelection').value.next.provider, V('codex'), 'the pre-catalog baseline already lands virtual')
+
+  // The catalog lands later and the list row re-states the SAME seq — the
+  // store rejects it as stale, which is harmless ONLY because the rewrite
+  // was identical.
+  const list = mergeSessionList(
+    { items: [] },
+    { items: [{ sessionId: 's1', projections: { kind: 'sequenced', asOfSeq: 7, values: { modelSelection: selection } } }] },
+    SID,
+  )
+  const block = list.items[0].projections
+  assert.equal(block.values.modelSelection.next.provider, V('codex'), 'the list row rewrites to the very same virtual value')
+  assert.equal(apply('s1/modelSelection', block.values.modelSelection, block.asOfSeq), 'ignored', 'same seq is first-write-wins')
+  assert.equal(store.get('s1/modelSelection').value.next.provider, V('codex'), 'the store ends with the virtual provider — no poison')
 })
 
 test('mergeSessionList: parentSessionId is virtualized with the row (CP4) — the fork link must point at the id the UI knows', () => {
@@ -904,59 +945,37 @@ test('T52 mergeModelCatalogs: server groups append after the local ones with vir
   assert.equal(mergeModelCatalogs(undefined, remote, { serverId: SID, serverName: NAME }), undefined)
 })
 
-test('T52-fix2 virtualizeModelSelectionValue: only a provider the server catalog lists goes virtual', () => {
+test('T52-fix3 virtualizeModelSelectionValue: providers always go virtual, nulls and foreign keys pass', () => {
   const value = {
     lastUsed: { provider: 'codex', model: 'sol' },
     next: { provider: 'codex', model: 'sol', reasoningEffort: 'high' },
   }
-  const groups = new Set(['codex', 'deepseek-official'])
-  assert.deepEqual(virtualizeModelSelectionValue(value, SID, groups), {
+  assert.deepEqual(virtualizeModelSelectionValue(value, SID), {
     lastUsed: { provider: V('codex'), model: 'sol' },
     next: { provider: V('codex'), model: 'sol', reasoningEffort: 'high' },
   })
-  // A provider the catalog does not list stays ORIGINAL — the isolated-repro
-  // case (`codex` against a server without that group): the merged catalog
-  // has no virtual group for it, so the rewrite would only teach the UI's
-  // fallback the raw `zr~…` string.
+  // UNCONDITIONAL (T52-fix3, reverting the fix2 catalog gate): the rewrite
+  // may not depend on WHEN the catalog arrived — first-write-wins per seq
+  // means a pre-catalog original would occupy the seq forever. A provider
+  // NO server catalog lists goes virtual all the same; the accepted cost is
+  // the `zr~…` fallback string the UI renders for it.
   const foreign = { lastUsed: { provider: 'claude', model: 'sonnet' }, next: null }
   assert.deepEqual(
-    virtualizeModelSelectionValue(foreign, SID, groups),
-    { lastUsed: { provider: 'claude', model: 'sonnet' }, next: null },
-    'a provider off the catalog stays original',
+    virtualizeModelSelectionValue(foreign, SID),
+    { lastUsed: { provider: V('claude'), model: 'sonnet' }, next: null },
+    'an unlisted provider goes virtual too — the rewrite is catalog-independent',
   )
-  // No catalog fetched yet (undefined) rewrites nothing at all.
-  assert.deepEqual(virtualizeModelSelectionValue(value, SID), value)
-  assert.deepEqual(virtualizeModelSelectionValue(value, SID, undefined), value)
-  // An EMPTY catalog (fetched, no groups) is a set like any other: nothing matches.
-  assert.deepEqual(virtualizeModelSelectionValue(value, SID, new Set()), value)
   assert.deepEqual(
-    virtualizeModelSelectionValue({ lastUsed: null, next: null }, SID, groups),
+    virtualizeModelSelectionValue({ lastUsed: null, next: null }, SID),
     { lastUsed: null, next: null },
   )
   // A selection without a provider string (or a non-object value) is untouchable.
-  assert.deepEqual(virtualizeModelSelectionValue({ lastUsed: { model: 'x' } }, SID, groups), { lastUsed: { model: 'x' } })
-  assert.equal(virtualizeModelSelectionValue('nope', SID, groups), 'nope')
+  assert.deepEqual(virtualizeModelSelectionValue({ lastUsed: { model: 'x' } }, SID), { lastUsed: { model: 'x' } })
+  assert.equal(virtualizeModelSelectionValue('nope', SID), 'nope')
 })
 
-test('T52-fix2 catalogGroupIds: the original group ids of one catalog value, junk skipped', () => {
-  assert.deepEqual(
-    catalogGroupIds({
-      groups: [
-        { id: 'codex', name: 'Codex' },
-        { notAGroup: true },
-        { id: '', name: '空 id 不算' },
-        { id: 'deepseek-official', name: 'DeepSeek' },
-      ],
-    }),
-    new Set(['codex', 'deepseek-official']),
-  )
-  assert.deepEqual(catalogGroupIds(undefined), new Set())
-  assert.deepEqual(catalogGroupIds({ noGroups: true }), new Set())
-  assert.deepEqual(catalogGroupIds({ groups: 'junk' }), new Set())
-})
-
-test('T52 control merger: modelSelection projection frames get their providers virtualized beside the session id — catalog-gated (T52-fix2)', () => {
-  const m = createControlMerger({ serverId: SID, serverProviders: (serverId) => (serverId === SID ? new Set(['codex']) : undefined) })
+test('T52-fix3 control merger: modelSelection projection frames get their providers virtualized beside the session id — unconditionally', () => {
+  const m = createControlMerger({ serverId: SID })
   m.onLocal({ type: 'baseline', value: { projections: {} } })
   // The exploded baseline path.
   const exploded = m.onRemote({
@@ -976,20 +995,11 @@ test('T52 control merger: modelSelection projection frames get their providers v
     { type: 'projection', sessionId: V('s1'), key: 'title', value: 't', seq: 11 },
   ])
 
-  // T52-fix2: read LIVE per frame — a provider the catalog does not list (or
-  // no catalog yet, or a foreign server id) keeps its original id.
-  const before = createControlMerger({ serverId: SID })
-  before.onLocal({ type: 'baseline', value: { projections: {} } })
+  // T52-fix3: no catalog gate anywhere — a provider no catalog lists goes
+  // virtual exactly the same (first-write-wins per seq forbids the gate).
   assert.deepEqual(
-    before.onRemote({ type: 'projection', sessionId: 's1', key: 'modelSelection', value: { lastUsed: null, next: { provider: 'codex', model: 'sol' } }, seq: 1 }),
-    [{ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: null, next: { provider: 'codex', model: 'sol' } }, seq: 1 }],
-    'no catalog yet rewrites nothing',
-  )
-  const foreign = createControlMerger({ serverId: SID, serverProviders: () => new Set(['deepseek-official']) })
-  foreign.onLocal({ type: 'baseline', value: { projections: {} } })
-  assert.deepEqual(
-    foreign.onRemote({ type: 'projection', sessionId: 's1', key: 'modelSelection', value: { next: { provider: 'codex', model: 'sol' } }, seq: 2 }),
-    [{ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { next: { provider: 'codex', model: 'sol' } }, seq: 2 }],
-    'a provider off the catalog stays original',
+    m.onRemote({ type: 'projection', sessionId: 's1', key: 'modelSelection', value: { next: { provider: 'claude', model: 'sonnet' } }, seq: 12 }),
+    [{ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { next: { provider: V('claude'), model: 'sonnet' } }, seq: 12 }],
+    'an unlisted provider is virtualized identically',
   )
 })
