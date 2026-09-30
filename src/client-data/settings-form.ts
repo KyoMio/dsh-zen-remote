@@ -607,17 +607,19 @@ export function nameField(field: string, max: number): SettingsFieldSpec {
 }
 
 /**
- * The name one pairing claim registers under (T57): the shared 设备名称
- * field's CURRENT displayed value — a staged draft when one exists — used
- * only when it is a value a save would WRITE ({@link nameField} rules: an
- * empty draft means nothing stored, a blank or over-cap draft is invalid),
- * otherwise the default device-name copy. The fallback is load-bearing since
- * T55: a client page reads no admin baseline, so an unstored name displays
- * EMPTY and the claim must still carry a usable name.
+ * The name one pairing claim registers under (T57, trimmed since T60): the
+ * shared 设备名称 field's CURRENT displayed value — a staged draft when one
+ * exists — trimmed FIRST and judged on the trimmed text (a 40-character name
+ * with padded spaces is legal; whitespace alone is not a name), returned
+ * trimmed so what the claim SENDS is exactly what a later save would store.
+ * Falls back to the default device-name copy otherwise. The fallback is
+ * load-bearing since T55: a client page reads no admin baseline, so an
+ * unstored name displays EMPTY and the claim must still carry a usable name.
  */
 export function claimDeviceNameOf(displayText: string, fallback: string): string {
-  return nameField('serverName', SERVER_NAME_MAX).parse(displayText)?.kind === 'set'
-    ? displayText
+  const trimmed = displayText.trim()
+  return nameField('serverName', SERVER_NAME_MAX).parse(trimmed)?.kind === 'set'
+    ? trimmed
     : fallback
 }
 
@@ -1053,14 +1055,21 @@ export class ZenRemoteSettingsForm {
 
   /**
    * One direct write for the pairing flow (T16): the normalized server
-   * address and the token just redeemed from the server ride ONE
-   * revision-fenced mutate. Not a staged edit — both fields are volatile row
-   * settings and apply immediately. @returns whether the write landed.
+   * address, the token just redeemed from the server, and (T60) the name
+   * actually registered with — the SERVER's confirmed echo when the claim
+   * carried one, else the name the claim sent — ride ONE revision-fenced
+   * mutate. The name lands in the row's `serverName` (the role card's 设备
+   * 名称 field), so a pairing that used an UNSAVED draft can never leave the
+   * local row empty while the server records the name. Not a staged edit —
+   * all three fields are volatile row settings and apply immediately. The
+   * caller drops the field's stale draft afterwards (see
+   * {@link discardField}). @returns whether the write landed.
    */
-  async writeClientPairing(serverUrl: string, token: string): Promise<boolean> {
+  async writeClientPairing(serverUrl: string, token: string, deviceName: string): Promise<boolean> {
     return this.directWrite([
       { op: 'set', path: ['serverUrl'], value: serverUrl },
       { op: 'set', path: [DEVICE_TOKEN_FIELD], value: token },
+      { op: 'set', path: ['serverName'], value: deviceName },
     ])
   }
 
@@ -1070,6 +1079,20 @@ export class ZenRemoteSettingsForm {
    */
   async clearDeviceToken(): Promise<boolean> {
     return this.directWrite([{ op: 'unset', path: [DEVICE_TOKEN_FIELD] }])
+  }
+
+  /**
+   * Drop ONE field's staged draft (T60): after the pairing write landed the
+   * name in the row, the draft that produced it is stale — it now equals the
+   * displayed value, and keeping it would show a phantom "overridden" badge.
+   * The revision fence goes with the last draft (there is nothing staged
+   * left to fence); an in-flight save-failure flag is not touched — that is
+   * the staged-save surface's own story.
+   */
+  discardField(field: string): void {
+    if (!this.staged.delete(field)) return
+    if (this.staged.size === 0) this.stagedRevision = undefined
+    this.publish()
   }
 
   /**

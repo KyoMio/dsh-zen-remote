@@ -193,6 +193,8 @@ export const zh = {
   // is only the fallback name a pairing registers under when that field is
   // empty.
   'settings.client.deviceNameDefault': '桌面应用端',
+  // T60: the pairing button's disabled reason while the device-name draft is invalid.
+  'settings.client.fixDeviceName': '请先修正设备名称',
   'settings.client.pairingCode': '配对码',
   'settings.client.pairingCodeHint': '在服务端设置页生成「桌面应用端」配对码后填入（8 位，自动转大写）。',
   'settings.client.pair': '配对',
@@ -460,6 +462,8 @@ export const en: Record<MobileNavKey, string> = {
   // is only the fallback name a pairing registers under when that field is
   // empty.
   'settings.client.deviceNameDefault': 'Desktop client',
+  // T60: the pairing button's disabled reason while the device-name draft is invalid.
+  'settings.client.fixDeviceName': 'Fix the device name first',
   'settings.client.pairingCode': 'Pairing code',
   'settings.client.pairingCodeHint': 'Generate a desktop-client pairing code on the server\u2019s settings page and enter it here (8 characters, uppercased automatically).',
   'settings.client.pair': 'Pair',
