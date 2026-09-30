@@ -281,10 +281,11 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   ${PERM} [role="menu"],
   /* T70: the SAME permission menu, portaled to body on DSH 0.2.0 — the
      descendant selector above cannot reach it there. The marker is written
-     by effects/permission-sheet.ts (the trigger's click arms a window; the
-     first body-level menu inside it is the permission menu — the host's
-     only other portal Menu, the copy button's confirm, opens through a
-     different button and is never marked). */
+     by effects/permission-sheet.ts: the trigger's click arms a short window
+     and the first body-level menu to land inside it is ours — the host has
+     many other portal Menus (preset pickers, preference rows, the sidebar's
+     …, open-in-app, deliverables, …), and none opens through this trigger
+     while no marked menu is up. */
   body > div[role="menu"][data-zen-sheet="perm"],
   ${MODEL_MENU} {
     position: fixed !important;
