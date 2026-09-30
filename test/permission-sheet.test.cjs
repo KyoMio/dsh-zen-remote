@@ -29,6 +29,8 @@ const { join } = require('node:path')
 
 const loadEffect = () => import('../src/client/effects/permission-sheet.ts?' + Math.random())
 
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
 const ROOT = join(__dirname, '..')
 const css = readFileSync(join(ROOT, 'src', 'client', 'styles', 'composer.css.ts'), 'utf8')
 // The template literal is the shipped stylesheet; slice past the module
@@ -128,4 +130,114 @@ test('T70 effect: the install watches body childList, exits early when unarmed, 
   // Teardown stops both listeners.
   assert.ok(source.includes("removeEventListener('click', onCaptureClick, true)"), 'the capture click listener is removed')
   assert.ok(source.includes('observer.disconnect()'), 'the observer disconnects')
+})
+
+// -- the install, behaviorally (fake Element/window/document/MutationObserver) --
+
+/**
+ * A minimal DOM simulation good enough to run the REAL installPermissionSheet
+ * (the same shape the review's t70review-sim.mjs used): Element with
+ * matches/get/setAttribute/closest, a click-listener trap on document, a
+ * manual MutationObserver callback, and a querySelector that answers the
+ * guard's one question — is a MARKED menu still on the page?
+ */
+async function bootSim() {
+  const state = { clickListener: undefined, moCallback: undefined, menus: [] }
+  class FakeElement {
+    constructor(kind) {
+      this.kind = kind
+      this.attrs = {}
+    }
+    matches(selectors) { return selectors === 'body > div[role="menu"]' && this.kind === 'menu' }
+    getAttribute(name) { return this.attrs[name] ?? null }
+    setAttribute(name, value) { this.attrs[name] = value }
+    closest(selectors) { return this.kind === 'permTrigger' && selectors.includes('permission') ? this : null }
+  }
+  globalThis.Element = FakeElement
+  globalThis.window = { matchMedia: () => ({ matches: true }) }
+  globalThis.document = {
+    body: {},
+    addEventListener: (type, fn) => { if (type === 'click') state.clickListener = fn },
+    removeEventListener: (type, fn) => { if (state.clickListener === fn) state.clickListener = undefined },
+    querySelector: () => state.menus.find((menu) => menu.attrs['data-zen-sheet'] === 'perm') ?? null,
+  }
+  globalThis.MutationObserver = class {
+    constructor(cb) { state.moCallback = cb }
+    observe() { /* the test drives the callback by hand */ }
+    disconnect() { state.moCallback = undefined }
+  }
+  const mod = await loadEffect()
+  let stop
+  mod.installPermissionSheet({ effect: (fn) => { stop = fn() } })
+  const trigger = new FakeElement('permTrigger')
+  return {
+    trigger,
+    tapTrigger() {
+      // After an uninstall the listener is gone: the click lands nowhere.
+      state.clickListener?.({ target: trigger })
+    },
+    addMenu() {
+      const menu = new FakeElement('menu')
+      state.menus.push(menu)
+      // After an uninstall the observer is disconnected: the DOM changes
+      // but nothing is told about it.
+      state.moCallback?.([{ addedNodes: [menu] }])
+      return menu
+    },
+    unmount() { stop() },
+    cleanup() {
+      delete globalThis.Element
+      delete globalThis.window
+      delete globalThis.document
+      delete globalThis.MutationObserver
+    },
+  }
+}
+
+test('T70-fix behavior: an OPEN click marks the menu that lands with it', async () => {
+  const sim = await bootSim()
+  try {
+    sim.tapTrigger()
+    const menu = sim.addMenu()
+    assert.equal(menu.getAttribute('data-zen-sheet'), 'perm', 'the opening menu is marked')
+  } finally { sim.cleanup() }
+})
+
+test('T70-fix behavior: the CLOSE click opens no window — a later unrelated menu is never marked', async () => {
+  const sim = await bootSim()
+  try {
+    // Open: the menu lands marked; it is still on the page.
+    sim.tapTrigger()
+    const perm = sim.addMenu()
+    assert.equal(perm.getAttribute('data-zen-sheet'), 'perm')
+
+    // Close: the click lands BEFORE the host unmounts the menu (capture
+    // first) — the marked menu on the page must keep the window shut.
+    sim.tapTrigger()
+    const unrelated = sim.addMenu()
+    assert.equal(unrelated.getAttribute('data-zen-sheet'), undefined ?? null, 'an unrelated menu inside a close-click window is NOT marked')
+    assert.equal(unrelated.getAttribute('data-zen-sheet'), null)
+  } finally { sim.cleanup() }
+})
+
+test('T70-fix behavior: a window whose menu never came expires and marks nothing', async () => {
+  const sim = await bootSim()
+  try {
+    // Open click, but the menu never lands (React stalled): the window must
+    // retire on its own instead of marking whatever shows up later.
+    sim.tapTrigger()
+    await wait(1_700)
+    const unrelated = sim.addMenu()
+    assert.equal(unrelated.getAttribute('data-zen-sheet'), null, 'the expired window marks nothing')
+  } finally { sim.cleanup() }
+})
+
+test('T70-fix behavior: after uninstall nothing is marked', async () => {
+  const sim = await bootSim()
+  try {
+    sim.unmount()
+    sim.tapTrigger()
+    const menu = sim.addMenu()
+    assert.equal(menu.getAttribute('data-zen-sheet'), null, 'an uninstalled effect never marks')
+  } finally { sim.cleanup() }
 })
