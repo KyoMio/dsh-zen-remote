@@ -744,6 +744,54 @@ test('workspace/follow merges the two legs: local first, remote upserts + merged
   handle.uninstall()
 })
 
+test('T58 wiring: the current session is read from the persisted selection store, and the ≥1s poll hides a closed session once the user navigates away', async () => {
+  // The host's selection store persists to this exact key (RT
+  // dsh-client-ui-workspace: createSnapshotStore({}, { persist: { name:
+  // 'dsh.sessions.current' } })); stub the browser storage for this test.
+  const backing = new Map([
+    ['dsh.sessions.current', JSON.stringify({ sessionId: toVirtual(SERVER_ID, 'session-b') })],
+  ])
+  global.localStorage = {
+    getItem: (key) => (backing.has(key) ? backing.get(key) : null),
+    setItem: (key, value) => backing.set(key, value),
+    removeItem: (key) => backing.delete(key),
+  }
+  try {
+    const controller = new AbortController()
+    const { gateway, localGate } = createMergeGateway(controller.signal)
+    const relay = createControllableRelay()
+    const { handle } = install(gateway, relay)
+    const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+    localGate.push(LOCAL_BASELINE)
+    await readSome(iterator, 1)
+    relay.streams[0].gate.push({
+      type: 'baseline',
+      value: { items: [remoteWorkspace('w-1', '远端一', ['session-a', 'session-b'])], archivedSessionIds: [], pinnedSessionIds: [] },
+    })
+    await readSome(iterator, 4)
+
+    // session-b's remote closes WHILE the user has it open: the tombstone
+    // stays (the page keeps its 「远程已关闭」 banner), nothing is archived.
+    relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-a']) })
+    const [kept] = await readSome(iterator, 1)
+    assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a'), toVirtual(SERVER_ID, 'session-b')])
+
+    // the user navigates to a local session: within a poll tick the merger
+    // is informed and hides the closed session (archived first, then the
+    // group drops it)
+    backing.set('dsh.sessions.current', JSON.stringify({ sessionId: 'session-l2' }))
+    const [archived, dropped] = await readSome(iterator, 2, 4000)
+    assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [toVirtual(SERVER_ID, 'session-b')] })
+    assert.deepEqual(dropped.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a')])
+
+    controller.abort()
+    localGate.finish()
+    handle.uninstall()
+  } finally {
+    delete global.localStorage
+  }
+})
+
 test('a server RENAME (same serverId) re-upserts under the new title without reopening the stream or removing anything', async () => {
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
