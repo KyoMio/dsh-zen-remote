@@ -792,6 +792,48 @@ test('T58 wiring: the current session is read from the persisted selection store
   }
 })
 
+test('T58-fix wiring: a close frame is judged against the CURRENT selection — a session opened after the stream started keeps its tombstone', async () => {
+  // The stream starts while a LOCAL session is open; the user opens remote
+  // session-b afterwards — only localStorage changes, no frame announces it.
+  const backing = new Map([['dsh.sessions.current', JSON.stringify({ sessionId: 'session-l1' })]])
+  global.localStorage = {
+    getItem: (key) => (backing.has(key) ? backing.get(key) : null),
+    setItem: (key, value) => backing.set(key, value),
+    removeItem: (key) => backing.delete(key),
+  }
+  try {
+    const controller = new AbortController()
+    const { gateway, localGate } = createMergeGateway(controller.signal)
+    const relay = createControllableRelay()
+    const { handle } = install(gateway, relay)
+    const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+    localGate.push(LOCAL_BASELINE)
+    await readSome(iterator, 1)
+    relay.streams[0].gate.push({
+      type: 'baseline',
+      value: { items: [remoteWorkspace('w-1', '远端一', ['session-a', 'session-b'])], archivedSessionIds: [], pinnedSessionIds: [] },
+    })
+    await readSome(iterator, 4)
+
+    backing.set('dsh.sessions.current', JSON.stringify({ sessionId: toVirtual(SERVER_ID, 'session-b') }))
+
+    // the server closes session-b: judged against the FRESH per-frame read,
+    // it IS the open session — tombstone kept, and no archived frame may
+    // precede the upsert (one would kick the open page home via
+    // clearArchivedCurrent)
+    relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-a']) })
+    const [kept] = await readSome(iterator, 1)
+    assert.equal(kept.type, 'upsert', 'no archived frame went first')
+    assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a'), toVirtual(SERVER_ID, 'session-b')], 'the open page keeps its slot')
+
+    controller.abort()
+    localGate.finish()
+    handle.uninstall()
+  } finally {
+    delete global.localStorage
+  }
+})
+
 test('a server RENAME (same serverId) re-upserts under the new title without reopening the stream or removing anything', async () => {
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
