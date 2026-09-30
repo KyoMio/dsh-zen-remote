@@ -33,6 +33,16 @@ const CURRENT_SESSION_ROUTE = '/_dsh/zen-remote/client/current-session'
 /** The re-check cadence — the same 1s the backend's fallback poll uses. */
 const CHECK_INTERVAL_MS = 1_000
 
+/**
+ * How often the current value is re-sent even when unchanged (T66): the
+ * reporter otherwise posts only CHANGES, but the backend can be reset
+ * underneath the page — a plugin row reload re-runs apply() and drops its
+ * stored value — leaving the page convinced it already reported. One
+ * unconditional re-post per window keeps the two ends converging without
+ * waiting for the user to navigate.
+ */
+const RESEND_INTERVAL_MS = 30_000
+
 /** The storage face used, narrowed to the one method (structurally typed:
  * this module compiles under the client tsconfig with DOM lib, but tests
  * inject stubs). */
@@ -52,6 +62,8 @@ export interface CurrentSessionReporterOptions {
   route?: string
   /** The re-check interval; default 1000ms. */
   intervalMs?: number
+  /** The unconditional re-send window (T66); default 30000ms. */
+  resendIntervalMs?: number
 }
 
 /** One reportable value — `unavailable` never travels. */
@@ -85,7 +97,11 @@ export function startCurrentSessionReporter(options: CurrentSessionReporterOptio
   // The last value the backend ACCEPTED (undefined = nothing posted yet).
   // A failed POST must not advance it — that is the whole retry rule: the
   // value still differs, so the next change or the next check re-sends.
+  // T66: the timestamp of the last accepted post drives the slow unconditional
+  // re-send (0 = due immediately, which is the page-load post).
   let lastReported: CurrentSessionReport | undefined
+  let lastSentAt = 0
+  const resendEveryMs = options.resendIntervalMs ?? RESEND_INTERVAL_MS
   let role: 'host' | 'client' | undefined
   let inFlight = false
 
@@ -99,10 +115,16 @@ export function startCurrentSessionReporter(options: CurrentSessionReporterOptio
     if (role !== 'client') return
     const report = parseCurrentSessionStorage(readRaw())
     if (report.kind === 'unavailable') return
-    if (lastReported !== undefined && currentSessionReportEquals(report, lastReported)) return
+    const now = Date.now()
+    // T66: inside the re-send window an unchanged value says nothing; once
+    // the window passes, the CURRENT value re-posts even unchanged — the
+    // backend may have been reset underneath the page.
+    const resendDue = now - lastSentAt >= resendEveryMs
+    if (!resendDue && lastReported !== undefined && currentSessionReportEquals(report, lastReported)) return
     try {
       await post(report)
       lastReported = report
+      lastSentAt = now
     } catch {
       // Silent: the next tick sees the unchanged lastReported and retries.
     }

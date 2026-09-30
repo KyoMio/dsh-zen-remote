@@ -106,9 +106,29 @@ export function startRemoteGroupExpansionKeeper(options: RemoteGroupExpansionKee
   })
 
   let role: 'host' | 'client' | undefined
-  // One auto-click per group per page load, ever — not per tick.
+  // One auto-click per group per page load, ever — not per tick. (T66: a
+  // group whose ROW disappears has its marker dropped — see the tick.)
   const clickedOnce = new Set<string>()
   let inFlight = false
+
+  // T66: a storage write/read can throw (a private-mode quota, a poisoned
+  // extension wrapper) — one bad key must not reject the tick's promise or
+  // kill the loop. A failed read degrades to "absent" (the pure layer's
+  // empty-record rule), a failed write is skipped until the next tick.
+  const readKey = (storage: StorageLike, key: string): string | null => {
+    try {
+      return storage.getItem(key)
+    } catch {
+      return null
+    }
+  }
+  const writeKey = (storage: StorageLike, key: string, value: string): void => {
+    try {
+      storage.setItem(key, value)
+    } catch {
+      // Silent: the next tick recomputes and tries again.
+    }
+  }
 
   const tick = async (): Promise<void> => {
     if (role === undefined) {
@@ -123,9 +143,16 @@ export function startRemoteGroupExpansionKeeper(options: RemoteGroupExpansionKee
     // A malformed value on either side degrades to an empty record (the
     // pure layer's rule) — a wiped plugin record then re-applies the
     // default-expanded state, which is the honest reading of "no memory".
-    const hostRecord = parseHostGroupExpansion(storage.getItem(HOST_WORKSPACE_VIEW_KEY))
-    const pluginRecord = parseExpansionRecord(storage.getItem(REMOTE_GROUP_EXPANSION_KEY))
+    const hostRecord = parseHostGroupExpansion(readKey(storage, HOST_WORKSPACE_VIEW_KEY))
+    const pluginRecord = parseExpansionRecord(readKey(storage, REMOTE_GROUP_EXPANSION_KEY))
     const rowHandles = queryRows()
+    // T66: a group whose row left the DOM (a server switch, a workspace
+    // list refresh) loses its once-per-load marker — when the row comes
+    // back it may be restored once more, exactly like on a fresh load.
+    const presentKeys = new Set(rowHandles.map((handle) => handle.key))
+    for (const key of [...clickedOnce]) {
+      if (!presentKeys.has(key)) clickedOnce.delete(key)
+    }
     const plan = planRemoteGroupExpansion({
       hostRecord,
       pluginRecord,
@@ -133,7 +160,7 @@ export function startRemoteGroupExpansionKeeper(options: RemoteGroupExpansionKee
     })
     const nextRecordJson = JSON.stringify(plan.record)
     if (nextRecordJson !== JSON.stringify(pluginRecord)) {
-      storage.setItem(REMOTE_GROUP_EXPANSION_KEY, nextRecordJson)
+      writeKey(storage, REMOTE_GROUP_EXPANSION_KEY, nextRecordJson)
     }
     for (const key of plan.clicks) {
       if (clickedOnce.has(key)) continue

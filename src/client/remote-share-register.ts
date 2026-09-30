@@ -85,7 +85,8 @@ export type RemoteShareMenuComponent = (props: RemoteShareMenuProps) => ReactNod
 let probeAnswer: 'host' | 'client' | undefined
 let probeInFlight: Promise<'host' | 'client' | undefined> | undefined
 export function probeClientConfigRole(refetch = false): Promise<'host' | 'client' | undefined> {
-  if (!refetch) {    if (probeAnswer !== undefined) return Promise.resolve(probeAnswer)
+  if (!refetch) {
+    if (probeAnswer !== undefined) return Promise.resolve(probeAnswer)
     if (probeInFlight !== undefined) return probeInFlight
   }
   // Always tracked so a settled probe — failed ones especially — never
