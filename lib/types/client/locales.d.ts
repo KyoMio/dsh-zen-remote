@@ -217,6 +217,8 @@ export declare const zh: {
     readonly shareRemoteOn: "开启远程";
     readonly shareRemoteOff: "关闭远程";
     readonly shareRemoteStateOff: "未开启远程";
+    readonly shareRemoteStateOn: "已开启远程";
+    readonly infoRemoteAccess: "远程访问";
     readonly shareRemoteBusy: "运行中，不计时";
     readonly shareRemoteRemainingHours: "剩余闲置时间 {count} 小时";
     readonly shareRemoteRemainingMinutes: "剩余闲置时间 {count} 分钟";

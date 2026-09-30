@@ -211,6 +211,70 @@ export const INFO_CSS = `/* ---------- session-info sheet (< 768px) ---------- *
     line-height: 1.2;
   }
 
+  /* --- T67: the remote-access row (label + live description + switch) --- */
+  [data-mobile-nav="info-remote"] {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .12));
+    border-radius: 12px;
+  }
+  [data-mobile-nav="info-remote-text"] {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  [data-mobile-nav="info-remote-label"] {
+    color: var(--dsw-alias-label-primary, inherit);
+    font-size: 13px;
+    line-height: 1.3;
+  }
+  [data-mobile-nav="info-remote-desc"] {
+    color: var(--dsw-alias-label-tertiary, rgba(0, 0, 0, .4));
+    font-size: 11px;
+    line-height: 1.3;
+  }
+  /* The switch: a 48px-tall touch target, thumb slides on the data-on flag. */
+  [data-mobile-nav="info-remote-switch"] {
+    position: relative;
+    flex: none;
+    width: 44px;
+    height: 26px;
+    padding: 0;
+    border: none;
+    border-radius: 13px;
+    background: var(--dsw-alias-label-tertiary, rgba(0, 0, 0, .4));
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    transition: background .15s ease;
+  }
+  [data-mobile-nav="info-remote-switch"]::after {
+    content: '';
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: var(--dsw-alias-label-primary, #fff);
+    transition: transform .15s ease;
+  }
+  [data-mobile-nav="info-remote-switch"][data-on] {
+    background: var(--dsw-alias-state-success-primary, #16a34a);
+  }
+  [data-mobile-nav="info-remote-switch"][data-on]::after {
+    transform: translateX(18px);
+  }
+  [data-mobile-nav="info-remote-switch"]:disabled {
+    opacity: .5;
+    cursor: default;
+  }
+
   [data-mobile-nav="info-error"] {
     margin-bottom: 8px;
     padding: 8px 10px;

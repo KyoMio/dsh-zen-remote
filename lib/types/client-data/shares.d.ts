@@ -106,6 +106,42 @@ export declare function shareFailText(outcome: {
     ok: boolean;
     code?: string;
 }, action: ShareAction, t: ShareFailTextFormatter): string;
+/** The formatter the info-card row needs: the icon's words plus the two
+ * keys that live outside the icon's vocabulary — the row label and the
+ * settings list's viewers line (REUSED verbatim, T67: no duplicate copy).
+ * Loose key typing on purpose: the component's real `t` seat carries the
+ * whole dictionary, and the check/test doubles just answer these keys. */
+/** The keys the info-card row reads: the icon's words, the one new state
+ * word (the icon only ever colored the on state, it never had copy for it),
+ * the row label, and the settings list's viewers line (reused verbatim). */
+export type ShareCardFormatterKey = ShareTextKey | 'shareRemoteStateOn' | 'infoRemoteAccess' | 'settings.shareViewers';
+export type ShareCardFormatter = (key: ShareCardFormatterKey, params?: Record<string, unknown>) => string;
+/** What the info-card「远程访问」row renders (T67). */
+export interface ShareCardRemoteView {
+    /** Host role + an answered table + not a subagent session — the exact
+     * gate the title-row icon and the menu item use. */
+    visible: boolean;
+    /** Whether the switch reads on (the session is in the table). */
+    shared: boolean;
+    /** The description line under the label: state word, then (when on) the
+     * watchers count if any, then the idle countdown / busy copy verbatim
+     * from {@link describeShare}. */
+    line: string;
+}
+/**
+ * Derive the info-card「远程访问」row from the shares snapshot (T67). The
+ * visibility gate is the shared one; the description reuses the icon's
+ * words (`shareRemoteStateOn` is the one new state word — the icon only
+ * ever colored that state, it never had copy for it).
+ */
+export declare function shareCardRemoteView(args: {
+    ready: boolean;
+    role: SharesSnapshot['role'];
+    subagent: boolean;
+    entry: ShareEntryView | undefined;
+    now: number;
+    t: ShareCardFormatter;
+}): ShareCardRemoteView;
 /** Whether the page is currently visible, plus change notifications — the
  * seam that keeps the poll cadence visibility-shaped while staying
  * testable (the check script injects a controllable source). */
