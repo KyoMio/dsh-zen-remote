@@ -15,7 +15,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
-const { createRelayClient, relayCredentialsDigest, RelayError } = require('../lib/relay-client.js')
+const { createRelayClient, relayCredentialsDigest, volatileUpdateTouchesServerName, RelayError } = require('../lib/relay-client.js')
 
 const HANDSHAKE = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
@@ -1637,5 +1637,127 @@ test('T59: the periodic info refresh re-handshakes while online and folds the fr
     clock.advance(30_000)
     await waitFor(() => handshakeBodies() === 3)
     await waitFor(() => client.handshakeInfo.serverName === '再改')
+  } finally { await relay.stop() }
+})
+
+// ---- T59-fix: the follow-race hardening ---------------------------------------
+
+test('T59-fix: volatileUpdateTouchesServerName picks the device field out of the announcement', () => {
+  assert.equal(volatileUpdateTouchesServerName([['idleHours'], ['lang']]), false, 'an unrelated knob never queues a push')
+  assert.equal(volatileUpdateTouchesServerName([['serverName']]), true)
+  assert.equal(volatileUpdateTouchesServerName([['idleHours'], ['serverName']]), true, 'a batch containing the field counts')
+  assert.equal(volatileUpdateTouchesServerName([['serverName', 'nested']]), true, 'the first path segment decides')
+  assert.equal(volatileUpdateTouchesServerName([['servername']]), false, 'the exact field only')
+  assert.equal(volatileUpdateTouchesServerName([]), false)
+  assert.equal(volatileUpdateTouchesServerName(undefined), false, 'a shapeless announcement pushes nothing')
+})
+
+test('T59-fix: deviceNameSyncing covers the queued AND the in-flight push', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    // Offline: the name queues → syncing.
+    client.queueDeviceName('排队名')
+    assert.equal(client.deviceNameSyncing, true, 'a queued rename counts')
+    await client.connect()
+    // The online flush pushes it (default scenario answers OK at once).
+    await waitFor(() => client.deviceNameSyncing === false)
+    assert.equal(client.handshakeInfo.deviceName, '排队名')
+
+    // In flight: the endpoint holds the request open.
+    let pushRes
+    relay.scenario.deviceName = (req, res) => { pushRes = res; return undefined }
+    client.queueDeviceName('在途名')
+    await waitFor(() => pushRes !== undefined)
+    assert.equal(client.deviceNameSyncing, true, 'an in-flight push counts')
+    sendJson(pushRes, 200, { ok: true, name: '在途名' })
+    await waitFor(() => client.deviceNameSyncing === false)
+    assert.equal(client.handshakeInfo.deviceName, '在途名')
+  } finally { await relay.stop() }
+})
+
+test('T59-fix: an info refresh overlapping a push drops the answer\'s deviceName and keeps the authority', async () => {
+  const clock = fakeClock()
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port, { clock, infoRefreshMs: 30_000 })
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: 'A' }]
+    await client.connect()
+    assert.equal(client.handshakeInfo.deviceName, 'A')
+
+    // The push hangs in flight; the periodic refresh fires UNDER it.
+    let pushRes
+    relay.scenario.deviceName = (req, res) => { pushRes = res; return undefined }
+    client.queueDeviceName('B')
+    await waitFor(() => pushRes !== undefined)
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '改名的服务端', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: 'OLD' }]
+    clock.advance(30_000)
+    await waitFor(() => client.handshakeInfo.serverName === '改名的服务端', 2000)
+    // The refresh's deviceName PREDATES the push — dropped.
+    assert.equal(client.handshakeInfo.deviceName, 'A', 'the overlapping answer did not land')
+
+    // The push settles: the fresh name wins.
+    sendJson(pushRes, 200, { ok: true, name: 'B' })
+    await waitFor(() => client.handshakeInfo.deviceName === 'B')
+
+    // The authority survives stale pings until a CLEAN refresh confirms.
+    relay.scenario.stream = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.write('{"type":"ping","serverName":"改名的服务端","deviceName":"A"}\n')
+      res.end()
+    }
+    const iterator = client.openStream('session', 'follow', {})
+    await iterator.next()
+    await sleep(30)
+    assert.equal(client.handshakeInfo.deviceName, 'B', 'the stale heartbeat did not pull the name back')
+    // A clean refresh (no push overlap) retires the authority.
+    const handshakes = () => relay.seen.filter((hit) => hit.url === HANDSHAKE).length
+    // The gateway's table now records the pushed name: the next CLEAN
+    // refresh confirms it and retires the local authority.
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '改名的服务端', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: 'B' }]
+    relay.scenario.stream = undefined
+    clock.advance(30_000)
+    // connect + the overlap refresh + this tick = three handshakes, the
+    // re-armed ladder alive behind them.
+    await waitFor(() => handshakes() === 3, 2000)
+    assert.equal(client.handshakeInfo.deviceName, 'B', 'the clean refresh confirms the pushed name')
+  } finally { await relay.stop() }
+})
+
+test('T59-fix: a re-pair during an in-flight push voids the answer', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client, setToken } = makeClient(relay.port)
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: 'A' }]
+    await client.connect()
+    let pushRes
+    relay.scenario.deviceName = (req, res) => { pushRes = res; return undefined }
+    client.queueDeviceName('新名')
+    await waitFor(() => pushRes !== undefined)
+    // Re-pair to (nominally) another server while the push hangs: the
+    // credential digest moves.
+    setToken('tok-2')
+    client.credentialsChanged()
+    await waitFor(() => relay.seen.filter((hit) => hit.url === HANDSHAKE).length >= 2, 2000)
+    sendJson(pushRes, 200, { ok: true, name: '新名' })
+    await sleep(30)
+    assert.equal(client.handshakeInfo.deviceName, 'A', 'the answer about the OLD server never landed')
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('T59-fix: refreshInfo moves ONLY the two names — serverId, version and fingerprints stand', async () => {
+  const clock = fakeClock()
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port, { clock, infoRefreshMs: 30_000 })
+    await client.connect()
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'ffffffff', serverName: '新服务端名', dshVersion: '0.0.0-other', fingerprints: { different: 'map' }, deviceName: 'B' }]
+    clock.advance(30_000)
+    await waitFor(() => client.handshakeInfo.serverName === '新服务端名', 2000)
+    assert.equal(client.handshakeInfo.deviceName, 'B')
+    assert.equal(client.handshakeInfo.serverId, 'abcd1234', 'the quiet refresh never touches the server identity')
+    assert.equal(client.handshakeInfo.dshVersion, '9.9.9-test')
+    assert.deepEqual(client.handshakeInfo.fingerprints, { algo: 'sha256' }, 'compat inputs belong to the real handshake')
   } finally { await relay.stop() }
 })
