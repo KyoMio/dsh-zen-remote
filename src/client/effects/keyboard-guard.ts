@@ -6,6 +6,23 @@ const PHONE_QUERY = '(max-width: 767px)'
 /** The official composer slot wrapper (same marker composer.css.ts styles). */
 const COMPOSER = '[data-slot="conversation.composer.bar"]'
 
+/**
+ * T72: the model sheet's search input on DSH 0.2.0-rc.2 — a `role=searchbox`
+ * `<input>` inside the portaled model menu (composer.css.ts's MODEL_MENU
+ * body form; on rc.2 the model pane portals as `role=group` with the search
+ * row inside). The host focuses it the moment the user drills into the
+ * model pane, which pops the phone keyboard over the sheet.
+ */
+const MODEL_MENU_ROOT = 'body > [id$="-menu"]'
+const MODEL_SEARCH = `${MODEL_MENU_ROOT} [role="searchbox"]`
+/** The focus target when the search's autofocus must be retracted: the
+ * currently selected model row, the exact element the host's own arrow-key
+ * navigation focuses first (model-selection-client.js moveFocus). */
+const SELECTED_OPTION = '[role="menuitemradio"][aria-checked="true"]:not([disabled])'
+/** The host's fallback when no row is checked (filtered/empty list): the
+ * first selectable option row. */
+const ANY_OPTION = '[role="menuitemradio"]:not([disabled])'
+
 /** A tap/keystroke older than this no longer explains a focus. */
 const INTENT_WINDOW_MS = 1000
 
@@ -43,6 +60,10 @@ export function installKeyboardGuard(ctx: ClientContext): void {
     const narrow = window.matchMedia(PHONE_QUERY)
     let lastIntent = 0
     let granted = false
+    // T72: the search field's own grant — separate from the composer's,
+    // cleared when the field blurs, so a later programmatic focus (drilling
+    // back into the pane) is retracted again.
+    let searchGranted = false
     let observer: MutationObserver | null = null
     let frame = 0
 
@@ -60,6 +81,31 @@ export function installKeyboardGuard(ctx: ClientContext): void {
       return node.tagName === 'TEXTAREA' ? node : null
     }
 
+    /**
+     * T72: the model sheet's search input. Unlike the composer field this
+     * one is NOT blurred to the body — the model menu's root has an onBlur
+     * that CLOSES the menu when the focus leaves root and menu (rc.2 model-
+     * selection-client.js: `relatedTarget` outside both → `close()`), so
+     * blurring would slam the sheet shut. The focus moves INSIDE the menu
+     * instead: to the selected model row, the element the host's own
+     * keyboard navigation focuses first. Phone keyboards have no arrow keys,
+     * so the host's search-focus-follows-highlight logic losing focus costs
+     * nothing there.
+     */
+    const modelSearchField = (node: unknown): HTMLElement | null => {
+      if (!(node instanceof HTMLElement)) return null
+      if (node.getAttribute('role') !== 'searchbox') return null
+      return node.closest(MODEL_SEARCH)
+    }
+
+    /** Retract the search autofocus WITHOUT closing the menu (see above). */
+    const retractSearchFocus = (field: HTMLElement): void => {
+      const menu = field.closest(MODEL_MENU_ROOT)
+      const selected = menu?.querySelector<HTMLElement>(SELECTED_OPTION) ?? menu?.querySelector<HTMLElement>(ANY_OPTION)
+      if (selected !== null && selected !== undefined) selected.focus()
+      else field.blur()
+    }
+
     const onPointerDown = (event: PointerEvent): void => {
       // Only the textarea itself grants the keyboard. A tap on any other
       // composer control (slash-command toggle, attach, model menu, send)
@@ -69,12 +115,23 @@ export function installKeyboardGuard(ctx: ClientContext): void {
         lastIntent = Date.now()
         granted = true
       }
+      // T72: a tap ON the search field is the user asking for the keyboard
+      // — typing to filter models must work.
+      if (modelSearchField(event.target) !== null) searchGranted = true
     }
     const onKeyDown = (): void => {
       lastIntent = Date.now()
       if (composerField(document.activeElement) !== null) granted = true
     }
     const sweep = (): void => {
+      // The search field is judged on its own grant, and a retracted focus
+      // never leaves the menu (see modelSearchField — blur would close it).
+      const search = modelSearchField(document.activeElement)
+      if (search !== null) {
+        if (searchGranted) return
+        retractSearchFocus(search)
+        return
+      }
       const el = composerField(document.activeElement)
       if (el === null) return
       if (granted || Date.now() - lastIntent < INTENT_WINDOW_MS) {
@@ -84,10 +141,16 @@ export function installKeyboardGuard(ctx: ClientContext): void {
       el.blur()
     }
     const onFocusIn = (event: FocusEvent): void => {
-      if (composerField(event.target) === null) return
+      if (composerField(event.target) === null && modelSearchField(event.target) === null) return
       sweep()
     }
     const onFocusOut = (event: FocusEvent): void => {
+      // T72: the search field's grant dies with its focus — the next
+      // programmatic focus is retracted again.
+      if (modelSearchField(event.target) !== null) {
+        searchGranted = false
+        return
+      }
       if (composerField(event.target) === null) return
       granted = false
     }
@@ -122,6 +185,7 @@ export function installKeyboardGuard(ctx: ClientContext): void {
       if (frame !== 0) window.clearTimeout(frame)
       frame = 0
       granted = false
+      searchGranted = false
     }
 
     if (narrow.matches) attach()
