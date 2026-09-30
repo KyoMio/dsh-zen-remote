@@ -314,13 +314,13 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | 路由 | 方法 | 作用 |
 | --- | --- | --- |
 | `/ping` | GET | 存活探测，`{ok:true}` |
-| `/v1/handshake` | POST | 握手：交换中继协议版本、服务端 id / 显示名、DSH 版本号、接口指纹表。中继协议版本不一致即拒绝连接；回包带 `serverName`（服务端显示名）与 `deviceName`（本设备在服务端记录里的名字，T59） |
-| `/v1/device/name` | POST | 设备改名（T59）：**网关自己处理、不转发给 DSH**——只对已配对的桌面应用端开放，只改调用者自己的设备记录；请求体 `{"name":"…"}`（1–40 字），改名经流心跳（约 15 秒）与握手刷新（约 30 秒）同步到对端 |
+| `/v1/handshake` | POST | 握手：交换中继协议版本、服务端 id / 显示名、DSH 版本号、接口指纹表。中继协议版本不一致即拒绝连接；回包带 `serverName`（服务端显示名）与 `deviceName`（本设备在服务端记录里的名字） |
+| `/v1/device/name` | POST | 设备改名：**网关自己处理、不转发给 DSH**——只对已配对的桌面应用端开放，只改调用者自己的设备记录；请求体 `{"name":"…"}`（1–40 字），改名经流心跳（约 15 秒）与握手刷新（约 30 秒）同步到对端 |
 | `/v1/invoke` | POST | 在已共享会话上执行一次 DSH 远程调用（单次，JSON 进出） |
-| `/v1/stream` | POST | 打开一条 DSH 流式订阅。**NDJSON 格式**：响应体每行一条 JSON；`{"type":"ping"}` 心跳行（默认 15 秒一条）防止反代把闲置流掐掉，每条都带当下的 `serverName` / `deviceName`（T59，服务端改名约 15 秒内到达所有客户端）；共享关闭/订阅失效时补一行 `{"type":"error","error":{"code":"unshared"}}` 再结束 |
+| `/v1/stream` | POST | 打开一条 DSH 流式订阅。**NDJSON 格式**：响应体每行一条 JSON；`{"type":"ping"}` 心跳行（默认 15 秒一条）防止反代把闲置流掐掉，每条都带当下的 `serverName` / `deviceName`（服务端改名约 15 秒内到达所有客户端）；共享关闭/订阅失效时补一行 `{"type":"error","error":{"code":"unshared"}}` 再结束 |
 | `/v1/event-result` | POST | 审批/提问这类「需要应答事件」的应答回传（`{eventId, result}`），服务端按转发记录核对归属后转交 |
-| `/v1/http` | POST | 改动摘要 / diff 面板的 plain-HTTP 长尾（T41b）：请求体 `{route, query}` 只登记 `changes.summary` / `changes.diff` 两条、只转发 GET（查询串是这次调用的坐标，不是要转发的请求体）；查询串按允许清单**规范化重建**——只保留 `sessionId`（恰好一次，过共享表）与 `seq` / `index`（至多一次、十进制非负整数），未知参数丢弃，合成 URL 只由规范化结果拼成（两次解析对控制字符的处理差异曾是越权读取口子，T41b-fix）——随后**进程内**交给宿主 `/api` 共享 fetch handler，不走回环 HTTP |
-| `/v1/upload` | POST | 远程会话的**非图片附件**上传（T51）：请求体是原始字节流（不是 JSON）；查询串按允许清单规范化重建——只保留 `sessionId`（恰好一次、过共享表，未共享 403）与 `name`（至多一次）；上限 100 MiB，`Content-Length` 预检加流式计数双保险，超限 413（先回拒绝再排空尾部字节）；每设备并发 8（超出 429）；随后与 `/v1/http` 一样**进程内**交给宿主 `/api` 共享 handler——上传回执落进的会话与之后 `session/prompt` 解析附件引用的会话是同一个 |
+| `/v1/http` | POST | 改动摘要 / diff 面板的 plain-HTTP 长尾：请求体 `{route, query}` 只登记 `changes.summary` / `changes.diff` 两条、只转发 GET（查询串是这次调用的坐标，不是要转发的请求体）；查询串按允许清单**规范化重建**——只保留 `sessionId`（恰好一次，过共享表）与 `seq` / `index`（至多一次、十进制非负整数），未知参数丢弃，合成 URL 只由规范化结果拼成（两次解析对控制字符的处理差异曾是越权读取口子）——随后**进程内**交给宿主 `/api` 共享 fetch handler，不走回环 HTTP |
+| `/v1/upload` | POST | 远程会话的**非图片附件**上传：请求体是原始字节流（不是 JSON）；查询串按允许清单规范化重建——只保留 `sessionId`（恰好一次、过共享表，未共享 403）与 `name`（至多一次）；上限 100 MiB，`Content-Length` 预检加流式计数双保险，超限 413（先回拒绝再排空尾部字节）；每设备并发 8（超出 429）；随后与 `/v1/http` 一样**进程内**交给宿主 `/api` 共享 handler——上传回执落进的会话与之后 `session/prompt` 解析附件引用的会话是同一个 |
 | `/v1/unshare` | POST | 子客户端主动关闭某会话的远程（只认共享表内的会话） |
 
 **允许清单里的方法**（其余一律 `forbidden-method`）：会话读写（`session/follow`、`session/page`、`session/prompt`、`session/cancel`、`session/rename`、`session/selectModel`、`session/updateQueue`、`session/attachment`、`session/projections`）、新建与分叉（`session/create`、`session/fork`，结果自动共享）、子智能体（`subagents/prompt`、`subagents/interruptByParent`，按父会话判定）、附件与 @ 引用（`fileUploads/upload`、`fileReferences/list`、`sessionReferenceResolver/candidates`）、面板长尾（`goals/*` 五个、`commands/list|execute`、`agentPresets/select`、`sessionFeedback/record`）、文件树与预览（`workspaceFiles/list|changes|read|readBytes|stat`）、终端（`terminal/*`）、任务（`job/list|follow|kill`）、`skills/list`、消息反馈（`messageFeedback/*`）、`schedule/list`、工作区会话操作（`workspace/pinSession` 等）、以及四个全局读：`session/control` 流、`session/list`、`workspace/follow` 流与 `session/modelCatalog`。前三个不带会话参数，安全靠**输出过滤**：每一帧/每一行结果先按共享表过滤，未共享会话的行到不了客户端；`session/list` 结果行里指向不可访问会话的 `parentSessionId` 字段也会被删掉（行的其余部分照常透传）。`session/modelCatalog` 同样无参数、全局只读——它就是服务端的模型提供方目录，只有分组与模型 id、显示名，不带会话数据；服务端会把结果里的 `failures` 数组清空（宿主的逐组错误文本可能带端点或凭据细节，客户端本来也不展示它）。`sessionReferenceResolver/candidates`（@ 引用候选）的答案带**每一个**服务端会话的标题、目录与现成 mention，同样走行级输出过滤，只放行已共享会话的行。审批/提问事件经 `$zr/events` 订阅转发，逐事件按 `agentId` 判定可达性。
@@ -333,10 +333,10 @@ sudo cloudflared service install      # 通了再装成常驻服务
 
 - 中继执行时用的是 DSH 网关服务的公开调用方法，身份是操作者身份，**不在服务端替换任何 DSH 内部方法**；
 - 子智能体/分叉会话不单独落表，可达性按「祖先链上有已共享会话」判定；
-- `dsh-session:` 会话引用也会被扫描（T41a-fix 扫 prompt 文本，T41a-fix2 补齐两条绕过）：DSH 会在**发消息**（`session/prompt` / `subagents/prompt` 的 content 文本块）、**改写排队消息**（`session/updateQueue` 的 edit 内容）与**斜杠命令**（`commands/execute` 参数里的全部字符串——命令处理器会把原始输入拼进下一条用户消息）这三条路径上注入被引用会话的内容，且注入时不再做权限检查，所以引用指向未共享会话的调用在服务端直接 403；@ 引用候选（`sessionReferenceResolver/candidates`）的答案也只放行已共享会话的行；
+- `dsh-session:` 会话引用也会被扫描：DSH 会在**发消息**（`session/prompt` / `subagents/prompt` 的 content 文本块）、**改写排队消息**（`session/updateQueue` 的 edit 内容）与**斜杠命令**（`commands/execute` 参数里的全部字符串——命令处理器会把原始输入拼进下一条用户消息）这三条路径上注入被引用会话的内容，且注入时不再做权限检查，所以引用指向未共享会话的调用在服务端直接 403；@ 引用候选（`sessionReferenceResolver/candidates`）的答案也只放行已共享会话的行；
 - 终端是有意开放的（桌面应用端是可信设备）：开的是**服务端**的 PTY，以服务端用户身份运行、不受智能体沙箱与审批限制；关闭会话的远程时终端流一并终止；
 - `workspaceFiles/read` 等文件预览接口不限制在会话目录内（DSH 自身就不限制），服务端进程可读的文件都能读——信任前提与终端相同；
-- 每台设备并发流数有上限（32）、同时在途的 invoke 数也有上限（32，超出 429 `too-many-invokes`）；`*/internal` 形状的错误码（`gateway/internal` 等）只回码不带消息——那类消息引用的是服务端内部细节。事件应答按「转发时的订阅 + 设备」核对归属。审批/提问的转发是**先到先得**：服务端自己的界面和子客户端谁先应答谁生效，后答的一方被网关拒绝、同步成「已处理」。中继**不代答**（T32-fix2 撤掉了代答放行）：未共享会话的审批/提问事件不会被转发，服务端界面也不在线时这个审批就一直等待——网关会把仍未应答的事件转交给下一个连上来的订阅，等，而不是替你拒绝（代答会把整批待审批一次性判死，砸掉「推送 → 唤醒 → 审批」链路）。未共享会话的**通知类**事件（EMIT 帧：会话列表摘要、账号到期之类的服务端全局状态）一律不转发。
+- 每台设备并发流数有上限（32）、同时在途的 invoke 数也有上限（32，超出 429 `too-many-invokes`）；`*/internal` 形状的错误码（`gateway/internal` 等）只回码不带消息——那类消息引用的是服务端内部细节。事件应答按「转发时的订阅 + 设备」核对归属。审批/提问的转发是**先到先得**：服务端自己的界面和子客户端谁先应答谁生效，后答的一方被网关拒绝、同步成「已处理」。中继**不代答**：未共享会话的审批/提问事件不会被转发，服务端界面也不在线时这个审批就一直等待——网关会把仍未应答的事件转交给下一个连上来的订阅，等，而不是替你拒绝（代答会把整批待审批一次性判死，砸掉「推送 → 唤醒 → 审批」链路）。未共享会话的**通知类**事件（EMIT 帧：会话列表摘要、账号到期之类的服务端全局状态）一律不转发。
 
 ---
 
