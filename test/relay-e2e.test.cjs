@@ -1161,11 +1161,128 @@ test('e2e T73: an idle sweep closing the open page and another session leaves th
     await waitFor(() => env.streams[0].aborted)
     await waitFor(() => handle.diagnostics().closedSessions.length === 1)
     assert.deepEqual(handle.diagnostics().closedSessions, [{ sessionId: virtual, reason: 'idle' }], 'the banner learns the closure and its reason')
+    // A TIME-WINDOW judgment, not a barrier: a failure would surface on the
+    // very next iterator tick, so 300ms of silence is the evidence the hold
+    // is quiet — no fixed bound can prove a negative.
     const verdict = await Promise.race([next, sleep(300).then(() => 'silent')])
     assert.equal(verdict, 'silent', `the page stream must neither fail nor end, got: ${verdict.error?.message ?? JSON.stringify(verdict)}`)
 
     controller.abort()
     assert.deepEqual(await next, { result: { value: undefined, done: true } }, 'the page closing the stream ends it cleanly')
+    handle.uninstall()
+  } finally { await env.stop() }
+})
+
+test('e2e T73-fix: a re-enabled remote ends the quiet history hold so the host reopens it with fresh history', async () => {
+  const env = await boot({
+    shared: ['session-page', 'session-other'],
+    invoke: (call) => {
+      if (call.namespace === 'session' && call.method === 'page') {
+        return { events: [{ type: 'turn/start', seq: 9, time: 9, data: {} }], seq: 9 }
+      }
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+  })
+  try {
+    const info = await env.client.connect()
+    const virtual = toVirtual(info.serverId, 'session-page')
+    const controller = new AbortController()
+    const localGateway = new LocalMergeGateway(makeLocalGate(controller.signal))
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+    const page = (await localGateway.wireTap(
+      'session/follow',
+      { args: { request: { address: { kind: 'session', sessionId: virtual } } } },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    ))[Symbol.asyncIterator]()
+    const first = page.next()
+    await waitFor(() => env.streams.length === 1)
+    env.streams[0].push({ type: 'event', event: { type: 'turn/start', seq: 1, time: 1, data: {} } })
+    assert.equal((await first).value.event.type, 'turn/start')
+
+    // the sweep closes the page's remote: the stream goes quiet under its banner
+    env.store.setIdleHours(1e-9)
+    await sleep(5)
+    assert.deepEqual(env.store.sweep(), ['session-other', 'session-page'])
+    const next = page.next().then((result) => ({ result }), (error) => ({ error }))
+    await waitFor(() => handle.diagnostics().closedSessions.length === 1)
+    const quiet = await Promise.race([next, sleep(300).then(() => 'silent')])
+    assert.equal(quiet, 'silent', 'the hold is quiet while the closure stands')
+
+    // The host RE-ENABLES the remote (the sweep had closed it): the session
+    // is shared again. The user keeps working through the still-enabled
+    // composer — the forwarded single call now succeeds on the server,
+    // which clears the closed-session record. The quiet hold ENDS cleanly:
+    // this is exactly the accepted-generation clean end the host answers by
+    // reopening the stream with a fresh history, so the re-enabled remote
+    // comes back.
+    env.store.share('session-page')
+    const payload = { args: { request: { address: { kind: 'session', sessionId: virtual }, seq: 0 } } }
+    const call = await localGateway.rpcBridge('session/page', payload, controller.signal, undefined)
+    assert.equal(call.ok, true)
+    const settled = await next
+    assert.deepEqual(settled, { result: { value: undefined, done: true } }, 'the cleared record ends the hold; the host reopens the stream')
+
+    // no waiter leaks: a further successful call (nothing held anymore) is a
+    // plain success, and the page abort is uneventful.
+    const again = await localGateway.rpcBridge('session/page', payload, controller.signal, undefined)
+    assert.equal(again.ok, true)
+    controller.abort()
+    handle.uninstall()
+  } finally { await env.stop() }
+})
+
+test('e2e T73-fix: the quiet close is a session/follow rule — a panel stream with a real signal still ends with 远程已关闭', async () => {
+  const env = await boot({
+    shared: ['session-a'],
+    invoke: (call) => {
+      if (call.namespace === 'terminal' && call.method === 'create') {
+        return { id: call.args.request.id, title: 'zsh', shell: { path: '/bin/zsh', args: [], name: 'zsh' }, cwd: '/srv', cols: call.args.request.cols, rows: call.args.request.rows, state: 'running', exitCode: null }
+      }
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+  })
+  try {
+    const info = await env.client.connect()
+    const localGateway = new LocalTerminalGateway()
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+    await localGateway.rpcBridge('terminal/create', { args: { agentId: toVirtual(info.serverId, 'session-a'), request: { id: 'term-e2e', cols: 80, rows: 24 } } }, undefined, undefined)
+
+    // A REAL signal this time — the earlier panel tests all passed
+    // `signal: undefined`, which short-circuits the endpoint check and would
+    // have hidden a regression that made panel streams hold too.
+    const controller = new AbortController()
+    const stream = await localGateway.wireTap('terminal/follow', { args: { agentId: toVirtual(info.serverId, 'session-a'), id: 'term-e2e', attachmentId: 'att-e2e' } }, undefined, undefined, controller.signal, { signal: controller.signal })
+    const iterator = stream[Symbol.asyncIterator]()
+    const pending = iterator.next()
+    await waitFor(() => env.streams.some((gate) => gate.call.namespace === 'terminal' && gate.call.method === 'follow'))
+    const gate = env.streams.find((item) => item.call.namespace === 'terminal')
+    gate.push({ type: 'snapshot', sequence: 0, screen: '$ ', info: { id: 'term-e2e', title: 'zsh', cols: 80, rows: 24, state: 'running', exitCode: null } })
+    const first = await pending
+    assert.equal(first.value.type, 'snapshot')
+
+    // the remote closes after the first frame: the panel stream ends with
+    // the banner's verdict — never a silent hold (that is session/follow only)
+    env.store.unshare('session-a', 'manual')
+    let thrown
+    try { await iterator.next() } catch (error) { thrown = error }
+    assert.ok(thrown instanceof Error && thrown.code === 'unshared', `expected unshared, got: ${thrown}`)
+    assert.equal(thrown.message, '远程已关闭')
+    assert.equal(thrown.isDSHRemoteError, true, 'the code survives the host wire')
+    await waitFor(() => gate.aborted)
+    controller.abort()
     handle.uninstall()
   } finally { await env.stop() }
 })
