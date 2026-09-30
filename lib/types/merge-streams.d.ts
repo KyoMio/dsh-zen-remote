@@ -64,6 +64,20 @@
  *   `sessionIds`) renders it live again and clears the tombstone; the
  *   tombstone dies with its workspace (a remove) and with the identity
  *   (onRemoteGone).
+ * - a workspace with NOTHING to show is not shown at all (T56): the server
+ *   keeps every workspace and only narrows `sessionIds` (relay-filter.ts),
+ *   so a workspace where nothing is shared would arrive as an empty group
+ *   and render as a bare 「服务端名 · 工作区名」 heading. A workspace the UI
+ *   has never seen is therefore held back — no baseline item, no upsert, no
+ *   order entry — until its forwarded `sessionIds` (live sessions or
+ *   tombstones it must carry) first gains content. From that first forward
+ *   on it counts as SHOWN and stays shown even when the sessions leave
+ *   again: a `remove` would blacklist the id in the UI's ClientWorkspaceModel
+ *   and make the group un-revivable, so an emptied group keeps its (empty)
+ *   display until the page reload rebuilds the model and this rule hides it
+ *   again. Every removal path — the reconnecting baseline diff, an explicit
+ *   server remove, {@link WorkspaceMerger.onRemoteGone} — emits a `remove`
+ *   only for shown workspaces; never-shown ones leave the state silently.
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
