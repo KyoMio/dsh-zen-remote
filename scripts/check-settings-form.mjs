@@ -623,15 +623,16 @@ test('normalizePairingCode uppercases and strips spaces and hyphens', () => {
   assert.equal(normalizePairingCode(''), '')
 })
 
-test('writeClientPairing lands one mutate with both ops and clears the draft fence', async () => {
+test('writeClientPairing lands one mutate — address, token AND the registered name (T60) — and clears the draft fence', async () => {
   const { scope, state } = fakeScope()
   const form = new ZenRemoteSettingsForm(scope)
-  assert.equal(await form.writeClientPairing('http://192.168.1.10:3088', 'tok-xyz'), true)
+  assert.equal(await form.writeClientPairing('http://192.168.1.10:3088', 'tok-xyz', '书房的台式机'), true)
   assert.equal(state.mutateCalls.length, 1)
   assert.deepEqual(state.mutateCalls[0].ops, [
     { op: 'set', path: ['serverUrl'], value: 'http://192.168.1.10:3088' },
     { op: 'set', path: ['deviceToken'], value: 'tok-xyz' },
-  ])
+    { op: 'set', path: ['serverName'], value: '书房的台式机' },
+  ], 'the registered name lands in the row with the credentials (T60)')
   assert.equal(state.mutateCalls[0].expectedRevision, 7, 'fenced with the current revision')
 
   // Staged drafts survive the direct write, and their fence refreshes: a
@@ -640,10 +641,30 @@ test('writeClientPairing lands one mutate with both ops and clears the draft fen
   const staged = fakeScope()
   const stForm = new ZenRemoteSettingsForm(staged.scope)
   stForm.stage('host', '0.0.0.0')
-  assert.equal(await stForm.writeClientPairing('http://x.local', 'tok'), true)
+  assert.equal(await stForm.writeClientPairing('http://x.local', 'tok', '台式机'), true)
   await stForm.save()
   assert.equal(staged.state.mutateCalls[1].expectedRevision, 8, 'the fence moved with the row, not with the stale stage time')
   assert.deepEqual(staged.state.mutateCalls[1].ops, [{ op: 'set', path: ['host'], value: '0.0.0.0' }])
+})
+
+test('T60: the name draft did its job — discardField retires it once the pairing write landed', async () => {
+  const { scope } = fakeScope({ value: { role: 'client' } })
+  const form = new ZenRemoteSettingsForm(scope)
+  // The user typed a (legal) name and paired WITHOUT saving: the draft
+  // stages, the claim uses it, and the write lands it in the row.
+  form.stage('serverName', '书房的台式机')
+  assert.equal(form.hasDraft('serverName'), true)
+  assert.equal(await form.writeClientPairing('http://x.local', 'tok', '书房的台式机'), true)
+  form.discardField('serverName')
+  assert.equal(form.hasDraft('serverName'), false, 'the draft now equals the displayed value — no phantom edit')
+  // The row document reads the landed name for the prefill.
+  assert.equal(form.rowValue('serverName'), undefined, 'the fake scope keeps the ops; the real row would answer the name')
+
+  // A field with no draft is a no-op; another field's draft survives.
+  form.stage('role', 'client')
+  form.discardField('serverName')
+  form.discardField('host')
+  assert.equal(form.hasDraft('role'), true, 'unrelated drafts untouched')
 })
 
 test('clearDeviceToken unsets only the token and keeps the address', async () => {
@@ -655,11 +676,11 @@ test('clearDeviceToken unsets only the token and keeps the address', async () =>
 
 test('the direct writes refuse when the form is unavailable, read-only or already saving', async () => {
   const unavailable = new ZenRemoteSettingsForm(fakeScope({ ready: false }).scope)
-  assert.equal(await unavailable.writeClientPairing('http://x.local', 'tok'), false)
+  assert.equal(await unavailable.writeClientPairing('http://x.local', 'tok', '名'), false)
   assert.equal(await unavailable.clearDeviceToken(), false)
 
   const readOnly = new ZenRemoteSettingsForm(fakeScope({ writable: false }).scope)
-  assert.equal(await readOnly.writeClientPairing('http://x.local', 'tok'), false)
+  assert.equal(await readOnly.writeClientPairing('http://x.local', 'tok', '名'), false)
 
   // A refused mutate reports failure through the return value; the frame's
   // staged-save `failed` flag stays untouched (pairing has its own copy).
@@ -859,6 +880,18 @@ test('T57: the pairing claim name follows the displayed value, else the default 
   assert.equal(claimDeviceNameOf('   ', '桌面应用端'), '桌面应用端')
   assert.equal(claimDeviceNameOf('x'.repeat(41), '桌面应用端'), '桌面应用端')
   assert.equal(claimDeviceNameOf('x'.repeat(40), '桌面应用端'), 'x'.repeat(40), 'the cap itself is legal')
+})
+
+test('T60: the claim name is TRIMMED first — the registered name carries no padding', () => {
+  assert.equal(claimDeviceNameOf('  书房  ', '桌面应用端'), '书房', 'trim, then judge, then return the trimmed text')
+  assert.equal(claimDeviceNameOf('\t书房\n', '桌面应用端'), '书房', 'all whitespace kinds count')
+  // 40 characters PLUS padding: judged on the trimmed text, so still legal.
+  assert.equal(claimDeviceNameOf('  ' + 'x'.repeat(40) + '  ', '桌面应用端'), 'x'.repeat(40))
+  // 40 characters of which padding is a PART is over the cap once trimmed
+  // the other way — the judge is always the trimmed text.
+  assert.equal(claimDeviceNameOf('x'.repeat(39) + '  ', '桌面应用端'), 'x'.repeat(39))
+  // Whitespace-only is not a name even though the raw text was non-empty.
+  assert.equal(claimDeviceNameOf(' \t ', '桌面应用端'), '桌面应用端')
 })
 
 // ---- T59: the device-name two-way sync ----------------------------------------
