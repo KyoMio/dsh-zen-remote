@@ -23,6 +23,10 @@ const { request } = require('./util.cjs')
 
 const ROUTES_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'client-routes.js')).href
 const { RelayError, relayCredentialsDigest } = require('../lib/relay-client.js')
+// Loaded synchronously before test.before's import(ROUTES_URL) pulls it in as an
+// ESM dependency: a later require() of a half-loaded module throws
+// ERR_REQUIRE_ESM_RACE_CONDITION on Node 24.
+const { toVirtual } = require('../lib/virtual-id.js')
 
 function sendJson(res, status, body) {
   const bytes = Buffer.from(JSON.stringify(body))
@@ -1095,7 +1099,6 @@ test('T42 status: the interceptor\u2019s incompatible calls flow into compat', a
 
 // ---- T34: remote-status + client/unshare -----------------------------------------
 
-const { toVirtual } = require('../lib/virtual-id.js')
 const T34_SERVER_ID = 'abcd1234'
 const T34_VIRTUAL = toVirtual(T34_SERVER_ID, 'session-a')
 

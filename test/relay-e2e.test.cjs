@@ -1002,8 +1002,12 @@ test('e2e T41a: terminal/create + terminal/follow work through the sub-client, a
     // Two invokes reached the fake gateway: the T52-fix3 install-time
     // modelCatalog fetch (the relay was already online when the intercept
     // installed) and the terminal create itself.
+    // The catalog fetch is fire-and-forget, so it can land either side of
+    // the create: wait for both and pick the create by method, not position.
+    await waitFor(() => env.invokeCalls.length >= 2)
     assert.equal(env.invokeCalls.length, 2)
-    assert.deepEqual(env.invokeCalls[1].args, { agentId: 'session-a', request: { id: 'term-e2e', cols: 80, rows: 24 } }, 'the ORIGINAL session id reached the server')
+    const createCall = env.invokeCalls.find((call) => call.namespace === 'terminal' && call.method === 'create')
+    assert.deepEqual(createCall.args, { agentId: 'session-a', request: { id: 'term-e2e', cols: 80, rows: 24 } }, 'the ORIGINAL session id reached the server')
 
     // follow rides the stream route; the fake gateway echoes an output frame.
     const stream = await localGateway.wireTap('terminal/follow', { args: { agentId: V('session-a'), id: 'term-e2e', attachmentId: 'att-e2e' } }, undefined, undefined, undefined, { signal: undefined })
