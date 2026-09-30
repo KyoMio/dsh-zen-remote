@@ -187,6 +187,7 @@ export declare const zh: {
     readonly 'settings.client.serverUrl': "服务端地址";
     readonly 'settings.client.serverUrlHint': "服务端网关地址，例如 http://192.168.1.10:3088 或 https://dsh.example.com。";
     readonly 'settings.client.deviceNameDefault': "桌面应用端";
+    readonly 'settings.client.fixDeviceName': "请先修正设备名称";
     readonly 'settings.client.pairingCode': "配对码";
     readonly 'settings.client.pairingCodeHint': "在服务端设置页生成「桌面应用端」配对码后填入（8 位，自动转大写）。";
     readonly 'settings.client.pair': "配对";

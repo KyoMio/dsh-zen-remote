@@ -532,12 +532,20 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   }, [pairUrlTouched, pairUrl, rowServerUrl])
 
   const codeNormalized = normalizePairingCode(pairCode)
-  const claimAllowed = form.available && form.writable && !claimBusy && codeNormalized.length === 8
+  // T60: an INVALID device-name draft (red box — blank-but-nonempty or over
+  // the cap) blocks the pairing: the claim would silently substitute the
+  // default copy and the server would register a name the user never asked
+  // for. A VALID draft pairs fine — it lands in the row with the write.
+  const claimAllowed = form.available && form.writable && !claimBusy && codeNormalized.length === 8 && !form.serverName.invalid
 
   const runClaim = async (): Promise<void> => {
     setClaimBusy(true)
     setClaimFail(null)
     setClaimWriteFailed(false)
+    // T60: one name for both halves of the round-trip — trimmed and legal
+    // ({@link claimDeviceNameOf}), sent to the server AND written into the
+    // row when the claim lands.
+    const claimName = claimDeviceNameOf(form.serverName.text, t('settings.client.deviceNameDefault'))
     try {
       const res = await fetch(CLIENT_CLAIM_ROUTE, {
         method: 'POST',
@@ -549,16 +557,24 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         body: JSON.stringify({
           serverUrl: pairUrl.trim(),
           code: codeNormalized,
-          name: claimDeviceNameOf(form.serverName.text, t('settings.client.deviceNameDefault')),
+          name: claimName,
         }),
       })
       const body = await res.json().catch(() => ({})) as ClaimRouteBody
       if (res.ok && body.ok === true && typeof body.token === 'string' && body.token !== '') {
-        // The backend echoes the address it validated; write both through ONE
-        // mutate, then clear the code and re-read the connection state.
+        // The backend echoes the address it validated; write the credentials
+        // AND the registered name through ONE mutate, then clear the code
+        // and re-read the connection state. The name is the SERVER's
+        // confirmed echo when the claim carried one (the gateway may have
+        // trimmed or uniquified it at registration), else the name we
+        // actually sent (T60) — either way the row now matches the server.
         const urlToWrite = typeof body.serverUrl === 'string' && body.serverUrl !== '' ? body.serverUrl : pairUrl.trim()
-        const landed = await config.writeClientPairing(urlToWrite, body.token)
+        const echoed = typeof body.deviceName === 'string' && body.deviceName.trim() !== '' ? body.deviceName.trim() : claimName
+        const landed = await config.writeClientPairing(urlToWrite, body.token, echoed)
         if (landed) {
+          // The draft did its job — it now equals the displayed value, and
+          // keeping it would be a phantom edit (T60).
+          config.discardField('serverName')
           setPairCode('')
           setPairUrl(urlToWrite)
           setUnpairDone(false)
@@ -1005,6 +1021,9 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
             <Button variant="outline" size="sm" disabled={!claimAllowed} onClick={() => { void runClaim() }}>
               {claimBusy ? t('settings.client.pairing') : t('settings.client.pair')}
             </Button>
+            {/* T60: the pairing button is disabled while the device-name
+                draft is invalid — this line says why. */}
+            {form.serverName.invalid && <span className="zr-settings-hint" data-invalid="true">{t('settings.client.fixDeviceName')}</span>}
             {claimFail !== null && <span className="zr-settings-hint" data-invalid="true">{pairFailText(claimFail, t)}</span>}
             {claimWriteFailed && <span className="zr-settings-hint" data-invalid="true">{t('settings.client.failWrite')}</span>}
           </div>
