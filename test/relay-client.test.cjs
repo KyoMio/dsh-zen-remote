@@ -1761,3 +1761,72 @@ test('T59-fix: refreshInfo moves ONLY the two names — serverId, version and fi
     assert.deepEqual(client.handshakeInfo.fingerprints, { algo: 'sha256' }, 'compat inputs belong to the real handshake')
   } finally { await relay.stop() }
 })
+
+// ---- T59-fix2: the two missed endings of a rename push ------------------------
+
+test('T59-fix2: a FAILED push with the link still up retries on the refresh cadence', async () => {
+  const clock = fakeClock()
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port, { clock, infoRefreshMs: 30_000 })
+    await client.connect()
+    // The push draws a 500: the name queues, the link stays up, and with no
+    // state transition coming the refresh cadence is the only way out.
+    relay.scenario.deviceName = () => [500, { ok: false }]
+    client.queueDeviceName('B')
+    const pushes = () => relay.seen.filter((hit) => hit.url === DEVICE_NAME).length
+    await waitFor(() => pushes() === 1)
+    assert.equal(client.state, 'online')
+    assert.equal(client.deviceNameSyncing, true, 'queued after the failure')
+
+    // One refresh tick: the queued name retries (still 500).
+    clock.advance(30_000)
+    await waitFor(() => pushes() === 2)
+    assert.equal(client.deviceNameSyncing, true, 'still queued after the second refusal')
+
+    // The gateway recovers (the admin's problem went away): the next tick
+    // lands the name and clears the syncing window.
+    relay.scenario.deviceName = (req, res, body) => [200, { ok: true, name: body && typeof body.name === 'string' ? body.name : '' }]
+    clock.advance(30_000)
+    await waitFor(() => pushes() === 3)
+    await waitFor(() => client.deviceNameSyncing === false)
+    assert.equal(client.handshakeInfo.deviceName, 'B')
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('T59-fix2: a push whose connection dies MID-FLIGHT re-queues instead of dropping the name', async () => {
+  const clock = fakeClock()
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port, { clock, infoRefreshMs: 30_000 })
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: 'A' }]
+    await client.connect()
+    // The push hangs in flight; the connection dies UNDER it.
+    let pushRes
+    relay.scenario.deviceName = (req, res) => { pushRes = res; return undefined }
+    client.queueDeviceName('B')
+    await waitFor(() => pushRes !== undefined)
+    relay.scenario.invoke = () => [502, { ok: false }]
+    await assert.rejects(() => client.invoke('session', 'page', {}))
+    await waitFor(() => client.state === 'offline')
+
+    // The answer arrives after the drop — and even though it says OK, the
+    // world moved: the name re-queues (syncing stays true) instead of being
+    // silently dropped with the dead connection.
+    sendJson(pushRes, 200, { ok: true, name: 'B' })
+    await sleep(30)
+    assert.equal(client.deviceNameSyncing, true, 'the name waited in the queue')
+    assert.notEqual(client.handshakeInfo.deviceName, 'B', 'never confirmed while offline')
+
+    // Back online: the queued name pushes exactly once and confirms.
+    relay.scenario.invoke = undefined
+    relay.scenario.deviceName = (req, res, body) => [200, { ok: true, name: body && typeof body.name === 'string' ? body.name : '' }]
+    const pushes = () => relay.seen.filter((hit) => hit.url === DEVICE_NAME).length
+    await client.connect()
+    await waitFor(() => pushes() === 2)
+    await waitFor(() => client.deviceNameSyncing === false)
+    assert.equal(client.handshakeInfo.deviceName, 'B')
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
