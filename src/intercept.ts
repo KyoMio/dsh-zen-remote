@@ -330,13 +330,19 @@ export function isRemoteWrite(endpoint: string): boolean {
 /** The refusal a write gets while the relay is not serving (T34). */
 const WRITE_OFFLINE_MESSAGE = '服务端离线，远程会话暂时只读'
 
+/** What a call or stream on a closed remote session answers in place of the
+ * relay's own text (T73) — the banner already says why. */
+const CLOSED_MESSAGE = '远程已关闭'
+
 /**
  * The RelayError codes that mean "the LINK went down under a live stream"
  * (CP4): `offline` is the transport death, `server-restart` the server's
  * clean-exit line (relay-client marks the client offline for it). Both are
  * recoverable by waiting for the relay to serve again; every other code is
  * either an answer about the call (`unshared`, `not-shared`, `too-many-streams`)
- * or a user-action wall (`revoked`, …) and stays a terminal stream error.
+ * or a user-action wall (`revoked`, …) and stays a terminal stream error —
+ * save the closed session's open page, which goes silent instead (T73, see
+ * rewriteUpstream).
  */
 const LINK_DOWN_CODES: ReadonlySet<string> = new Set(['offline', 'server-restart'])
 
@@ -419,6 +425,14 @@ function waitReopen(clock: RelayClock, waitOnline: () => Promise<void>, delayMs:
       clock.clearTimeout(timer)
       resolve()
     })
+  })
+}
+
+/** Resolve once `signal` aborts — the closed page's silent hold (T73). */
+function untilAborted(signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) resolve()
+    else signal.addEventListener('abort', () => resolve(), { once: true })
   })
 }
 
@@ -2522,7 +2536,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
       recordFailure(endpoint, code)
-      return { ok: false, error: { code, message: messageOf(error), details: {} } }
+      // A call on a closed session reads like the banner, not like the
+      // relay's bare code (T73).
+      const message = code === 'not-shared' ? CLOSED_MESSAGE : messageOf(error)
+      return { ok: false, error: { code, message, details: {} } }
     }
   }
 
@@ -2657,9 +2674,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * dies — the pre-CP4 behavior.
    *
    * `unshared` / `not-shared` (the server closed the remote session) and
-   * every other code stay terminal for everyone, exactly as before — the
-   * 远程已关闭 banner and the error states are real verdicts, not retryable
-   * blips.
+   * every other code are never retried — the 远程已关闭 banner and the error
+   * states are real verdicts, not retryable blips. A closure ends the stream
+   * with the banner's word, never the server's message; on the page's
+   * history stream after its first frame it ends nothing at all — the
+   * stream goes silent until the page closes it (T73, at the catch below).
    */
   async function* rewriteUpstream(
     endpoint: string,
@@ -2707,7 +2726,23 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         if (error instanceof RelayError && (code === 'unshared' || code === 'not-shared')) {
           for (const parts of claimed) registerClosed(toVirtual(parts.serverId, parts.id), closedReasonOf(error))
           recordFailure(endpoint, code)
-          throw new CodedStreamError(code, messageOf(error))
+          // 远程已关闭 is the banner's verdict, not a page error (SPEC story
+          // 53, T73): the host renders ANY terminal error of the history
+          // stream as a line over the conversation — 「历史加载失败：
+          // {message}（{code}）」 (dsh-api-session-controller
+          // failEventStream). So a history stream that already delivered
+          // goes silent: the page keeps what it shows, and the page's own
+          // abort (navigating away disposes the session) ends the stream.
+          // Everything else still ends, with the banner's word instead of
+          // the server's internal message: a zero-frame stream is what the
+          // host's first open awaits (sessions.using waits on it — a hold
+          // would hang it), a panel stream would freeze silently, and
+          // without a signal nothing could ever release a hold.
+          if (endpoint === 'session/follow' && !first && signal !== undefined) {
+            await untilAborted(signal)
+            return
+          }
+          throw new CodedStreamError(code, CLOSED_MESSAGE)
         }
         recordFailure(endpoint, code)
         // A link-down fact (CP4), scoped by CP5: only the carrier-retry
@@ -3091,11 +3126,13 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     }
     // RelayError raised DURING iteration flows through the pump below: an
     // `unshared` (or any non-link code) reaches the UI as a coded terminal
-    // error; a link-down fact holds the stream open and ends it cleanly once
-    // the relay serves again — the end the hold-list endpoints' UI treats as
-    // a carrier failure and immediately retries (CP4) — while the endpoints
-    // OUTSIDE the list end with the original code at once, their consumers
-    // rendering a clean end as a terminal (CP5, SESSION_STREAM_HOLD_ENDPOINTS).
+    // error (a closure silences an already-delivering history stream
+    // instead, T73); a link-down fact holds the stream open and ends it
+    // cleanly once the relay serves again — the end the hold-list endpoints'
+    // UI treats as a carrier failure and immediately retries (CP4) — while
+    // the endpoints OUTSIDE the list end with the original code at once,
+    // their consumers rendering a clean end as a terminal (CP5,
+    // SESSION_STREAM_HOLD_ENDPOINTS).
     return rewriteUpstream(endpoint, upstream, serverId, virtuals, signal, () =>
       relay.openStream(namespace, method, clone, signal),
     )
