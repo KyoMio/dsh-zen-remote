@@ -46,6 +46,7 @@ import {
   CLIENT_CONFIG_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
+  claimDeviceNameOf,
   createLatestGate,
   clientStatusLineOf,
   deriveClientStatusView,
@@ -225,10 +226,10 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
 
   // The client group's pairing form (T16). The address prefills from the row
   // (once the shared form's document is served) until the user types into it;
-  // the name defaults to the display copy; the code normalizes as typed.
+  // the code normalizes as typed. The registered name is the shared 设备名称
+  // field in the role card above (T57) — no separate name box here.
   const [pairUrl, setPairUrl] = useState('')
   const [pairUrlTouched, setPairUrlTouched] = useState(false)
-  const [pairName, setPairName] = useState(() => t('settings.client.deviceNameDefault'))
   const [pairCode, setPairCode] = useState('')
   const [claimBusy, setClaimBusy] = useState(false)
   const [claimFail, setClaimFail] = useState<PairFail | null>(null)
@@ -516,7 +517,15 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       const res = await fetch(CLIENT_CLAIM_ROUTE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ serverUrl: pairUrl.trim(), code: codeNormalized, name: pairName.trim() }),
+        // T57: the name registers under the shared 设备名称 field's current
+        // displayed value (a staged draft counts), falling back to the
+        // default copy when the field is empty — the client page reads no
+        // admin baseline (T55), so an unstored name displays empty here.
+        body: JSON.stringify({
+          serverUrl: pairUrl.trim(),
+          code: codeNormalized,
+          name: claimDeviceNameOf(form.serverName.text, t('settings.client.deviceNameDefault')),
+        }),
       })
       const body = await res.json().catch(() => ({})) as ClaimRouteBody
       if (res.ok && body.ok === true && typeof body.token === 'string' && body.token !== '') {
@@ -806,6 +815,18 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
           {select(form.role, 'role', t('settings.role'), t('settings.roleHint'), ['host', 'client'], (option) => (
             option === 'host' ? t('settings.roleHost') : t('settings.roleClient')
           ))}
+          {/* T57: the device name — the row's serverName field — lives in the
+              role card on BOTH roles: on a host it is the server display name
+              other devices' sidebars show; on a client it is the name a
+              pairing registers with. The hint is the one role fact that
+              differs. */}
+          {text(
+            form.serverName,
+            'serverName',
+            t('settings.fieldServerName'),
+            t(clientRole ? 'settings.fieldServerNameHintClient' : 'settings.fieldServerNameHint'),
+            t('settings.invalidName'),
+          )}
           {reloadPending && <p className="zr-settings-status-line">{t('settings.reloadNote')}</p>}
 
           {!clientRole && (
@@ -827,7 +848,6 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               ))}
 
               <h3 className="zr-settings-card-title">{t('settings.shareTitle')}</h3>
-              {text(form.serverName, 'serverName', t('settings.fieldServerName'), t('settings.fieldServerNameHint'), t('settings.invalidName'))}
               {text(form.idleHours, 'idleHours', t('settings.fieldIdleHours'), t('settings.fieldIdleHoursHint'), t('settings.invalidHours'), true)}
               {bool(form.autoShareNewSessions, 'autoShareNewSessions', t('settings.fieldAutoShare'), t('settings.fieldAutoShareHint'))}
             </>
@@ -936,19 +956,6 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               onChange={(e) => { setPairUrl(e.currentTarget.value); setPairUrlTouched(true) }}
             />
             <p className="zr-settings-hint">{t('settings.client.serverUrlHint')}</p>
-          </div>
-          <div className="zr-settings-field">
-            <div className="zr-settings-head">
-              <label htmlFor="zr-settings-client-name">{t('settings.client.deviceName')}</label>
-            </div>
-            <input
-              id="zr-settings-client-name"
-              className="zr-settings-input"
-              type="text"
-              maxLength={DEVICE_NAME_MAX}
-              value={pairName}
-              onChange={(e) => { setPairName(e.currentTarget.value) }}
-            />
           </div>
           <div className="zr-settings-field">
             <div className="zr-settings-head">

@@ -165,8 +165,9 @@ export const zh = {
   'settings.shareCloseAll': '全部关闭',
   'settings.shareCloseAllConfirm': '将关闭全部已开启远程的会话，确定继续？',
   'settings.shareActionFail': '操作失败',
-  'settings.fieldServerName': '服务端名称',
-  'settings.fieldServerNameHint': '远程界面上显示的服务端名称，1–40 个字符。留空恢复默认。',
+  'settings.fieldServerName': '设备名称',
+  'settings.fieldServerNameHint': '其他设备远程访问时显示的名称，1–40 个字符，留空恢复默认。',
+  'settings.fieldServerNameHintClient': '配对时注册到服务端的名称，1–40 个字符。',
   'settings.fieldIdleHours': '闲置休眠（小时）',
   'settings.fieldIdleHoursHint': '超过该时长无新活动时，自动关闭远程连接。运行中或等待中的会话不计时。默认 48，取值大于 0 且不超过 8760。',
   'settings.fieldAutoShare': '自动共享新会话',
@@ -188,7 +189,9 @@ export const zh = {
   'settings.client.connectTitle': '连接服务端',
   'settings.client.serverUrl': '服务端地址',
   'settings.client.serverUrlHint': '服务端网关地址，例如 http://192.168.1.10:3088 或 https://dsh.example.com。',
-  'settings.client.deviceName': '设备名称',
+  // The label above is the shared 设备名称 field in the role card (T57); this
+  // is only the fallback name a pairing registers under when that field is
+  // empty.
   'settings.client.deviceNameDefault': '桌面应用端',
   'settings.client.pairingCode': '配对码',
   'settings.client.pairingCodeHint': '在服务端设置页生成「桌面应用端」配对码后填入（8 位，自动转大写）。',
@@ -430,8 +433,9 @@ export const en: Record<MobileNavKey, string> = {
   'settings.shareCloseAll': 'Close all',
   'settings.shareCloseAllConfirm': 'This disables remote access for every shared session. Continue?',
   'settings.shareActionFail': 'The action failed',
-  'settings.fieldServerName': 'Server name',
-  'settings.fieldServerNameHint': 'Server name shown in the remote UI, 1–40 characters. Empty restores the default.',
+  'settings.fieldServerName': 'Device name',
+  'settings.fieldServerNameHint': 'The name other devices see when they access this machine remotely, 1–40 characters. Empty restores the default.',
+  'settings.fieldServerNameHintClient': 'The name registered with the server when pairing, 1–40 characters.',
   'settings.fieldIdleHours': 'Idle sleep (hours)',
   'settings.fieldIdleHoursHint': 'Automatically closes the remote connection once a session has no new activity for this long. Running or waiting sessions never count. Default 48; the value must be greater than 0 and at most 8760.',
   'settings.fieldAutoShare': 'Auto-share new sessions',
@@ -452,7 +456,9 @@ export const en: Record<MobileNavKey, string> = {
   'settings.client.connectTitle': 'Connect to the server',
   'settings.client.serverUrl': 'Server address',
   'settings.client.serverUrlHint': 'The server\u2019s gateway address, e.g. http://192.168.1.10:3088 or https://dsh.example.com.',
-  'settings.client.deviceName': 'Device name',
+  // The label above is the shared 设备名称 field in the role card (T57); this
+  // is only the fallback name a pairing registers under when that field is
+  // empty.
   'settings.client.deviceNameDefault': 'Desktop client',
   'settings.client.pairingCode': 'Pairing code',
   'settings.client.pairingCodeHint': 'Generate a desktop-client pairing code on the server\u2019s settings page and enter it here (8 characters, uppercased automatically).',
