@@ -483,7 +483,7 @@ test('session/follow rewrites snapshot header ids to virtual and relays errors w
     // the wire (dsh-typert-protocol's remoteErrorOf).
     assert.equal(error.isDSHRemoteError, true, 'the marker remoteErrorOf checks')
     assert.equal(error.code, 'unshared')
-    assert.equal(error.message, 'the session is not shared any more')
+    assert.equal(error.message, '远程已关闭', "the banner's word, never the server's internal message (T73)")
     assert.ok(error.details !== null && typeof error.details === 'object', 'details is an object')
     assert.equal(error instanceof RelayError, false, 'a locally built coded error, not the relay client class')
     return true
@@ -1422,6 +1422,7 @@ test('diagnostics reports the shape verdict, the self-check and the failure ring
   const thrown = await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
   assert.equal(thrown.ok, false)
   assert.deepEqual(thrown.error.details, {}, 'the catch-branch envelope carries details: {}')
+  assert.equal(thrown.error.message, '远程已关闭', 'a closed session reads like the banner, not the bare code (T73)')
   const ring = handle.diagnostics().recentFailures
   assert.equal(ring[ring.length - 1].code, 'not-shared')
   handle.uninstall()

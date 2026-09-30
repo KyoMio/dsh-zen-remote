@@ -1099,6 +1099,28 @@ test('T34: the unshared error line carries reason client (closed from the deskto
   } finally { await server.stop() }
 })
 
+test('T73: an idle sweep closing two sessions ends each stream naming its OWN session', async () => {
+  // Both expire in one sweep, announced in id order — 'session-other'
+  // first. The page's stream must end on its own closure, not on the other
+  // one's (2026-09-30: page A quoted session B's id, because the sweep
+  // dropped every expired row before announcing any).
+  const parts = makeParts('t73-sweep-own-id', { shared: ['session-page', 'session-other'] })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-page' } } } })
+    await waitFor(() => parts.streams.length === 1)
+    parts.store.setIdleHours(1e-9)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.deepEqual(parts.store.sweep(), ['session-other', 'session-page'])
+    await open.done
+    const errorLine = open.lines[open.lines.length - 1]
+    assert.equal(errorLine.type, 'error')
+    assert.equal(errorLine.error.code, 'unshared')
+    assert.equal(errorLine.error.reason, 'idle')
+    assert.equal(errorLine.error.message, 'shared session session-page was unshared (idle)')
+  } finally { await server.stop() }
+})
+
 test('T34: the unshared error line carries reason manual (server-side close)', async () => {
   const parts = makeParts('t34-reason-manual', { shared: ['session-a'] })
   const server = await startServer(parts.handler)

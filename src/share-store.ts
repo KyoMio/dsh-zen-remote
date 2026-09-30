@@ -321,14 +321,11 @@ export function createShareStore(options: ShareStoreOptions): ShareStore {
       for (const [id, row] of sessions) {
         if (!row.busy && t - row.lastActivityAt >= idleMs) expired.push(id)
       }
-      if (expired.length === 0) return expired
       expired.sort()
-      for (const id of expired) {
-        sessions.delete(id)
-        activityFlushedAt.delete(id)
-      }
-      persist()
-      for (const id of expired) emit({ type: 'unshared', sessionId: id, reason: 'idle' })
+      // One unshare per session, never delete-all-then-announce (T73): a
+      // listener judging "what did this event close" must not find sessions
+      // the event did not name already gone — page A quoted session B's id.
+      for (const id of expired) store.unshare(id, 'idle')
       return expired
     },
 

@@ -1121,6 +1121,55 @@ test('e2e T34: the server idle-closes a session and the sub-client remote-status
   }
 })
 
+test('e2e T73: an idle sweep closing the open page and another session leaves the page silent under its banner', async () => {
+  // The 2026-09-30 repro: A (the open page) and B shared, one idle sweep
+  // closes both, and page A showed 「历史加载失败：shared session <B> was
+  // unshared (idle)（unshared）」 over its history. 'session-other' sorts
+  // first, so B's closure is announced first. The page keeps what it
+  // shows — no stream error, no end — while its own closure reaches the
+  // banner's registry; only the page closing the stream ends it.
+  const env = await boot({ shared: ['session-page', 'session-other'] })
+  try {
+    const info = await env.client.connect()
+    const virtual = toVirtual(info.serverId, 'session-page')
+    const controller = new AbortController()
+    const localGateway = new LocalMergeGateway(makeLocalGate(controller.signal))
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+    const page = (await localGateway.wireTap(
+      'session/follow',
+      { args: { request: { address: { kind: 'session', sessionId: virtual } } } },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    ))[Symbol.asyncIterator]()
+    // The history arrives first: the page shows content when the sweep hits.
+    const first = page.next()
+    await waitFor(() => env.streams.length === 1)
+    env.streams[0].push({ type: 'event', event: { type: 'turn/start', seq: 1, time: 1, data: {} } })
+    assert.equal((await first).value.event.type, 'turn/start')
+
+    env.store.setIdleHours(1e-9)
+    await sleep(5)
+    assert.deepEqual(env.store.sweep(), ['session-other', 'session-page'])
+    const next = page.next().then((result) => ({ result }), (error) => ({ error }))
+    await waitFor(() => env.streams[0].aborted)
+    await waitFor(() => handle.diagnostics().closedSessions.length === 1)
+    assert.deepEqual(handle.diagnostics().closedSessions, [{ sessionId: virtual, reason: 'idle' }], 'the banner learns the closure and its reason')
+    const verdict = await Promise.race([next, sleep(300).then(() => 'silent')])
+    assert.equal(verdict, 'silent', `the page stream must neither fail nor end, got: ${verdict.error?.message ?? JSON.stringify(verdict)}`)
+
+    controller.abort()
+    assert.deepEqual(await next, { result: { value: undefined, done: true } }, 'the page closing the stream ends it cleanly')
+    handle.uninstall()
+  } finally { await env.stop() }
+})
+
 test('e2e T41b: the changes diff crosses the sub-client http route with the original id, and an unshare answers 403', async () => {
   const DIFF = { kind: 'text', path: 'src/a.ts', display: 'a.ts', before: false, after: false, coarse: false, hunks: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['+hello'] }] }
   const env = await boot({
