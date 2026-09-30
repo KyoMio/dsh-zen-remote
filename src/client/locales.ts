@@ -225,6 +225,11 @@ export const zh = {
   'shareRemoteOn': '开启远程',
   'shareRemoteOff': '关闭远程',
   'shareRemoteStateOff': '未开启远程',
+  // T67: the info-card row's on-state word — the icon only colored this
+  // state and never had copy for it.
+  'shareRemoteStateOn': '已开启远程',
+  // T67: the info-card row's label.
+  'infoRemoteAccess': '远程访问',
   'shareRemoteBusy': '运行中，不计时',
   'shareRemoteRemainingHours': '剩余闲置时间 {count} 小时',
   'shareRemoteRemainingMinutes': '剩余闲置时间 {count} 分钟',
@@ -493,6 +498,9 @@ export const en: Record<MobileNavKey, string> = {
   'shareRemoteOn': 'Enable remote',
   'shareRemoteOff': 'Disable remote',
   'shareRemoteStateOff': 'Remote access off',
+  // T67: the info-card row's on-state word and label.
+  'shareRemoteStateOn': 'Remote access on',
+  'infoRemoteAccess': 'Remote access',
   'shareRemoteBusy': 'Running — not counting down',
   'shareRemoteRemainingHours': 'Idle time remaining: {count} h',
   'shareRemoteRemainingMinutes': 'Idle time remaining: {count} min',

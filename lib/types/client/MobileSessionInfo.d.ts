@@ -1,4 +1,5 @@
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots';
+import type { SharesStore } from '../client-data/shares.ts';
 import type { RenameResult, SessionId, UseJobs } from './compat/types.ts';
 import { NS } from './locales.ts';
 /** Full props for the session-info sheet (header.utilities, second entry). */
@@ -21,6 +22,14 @@ export type MobileSessionInfoProps = PropsRuntime<'conversation.session.header.u
     useJobs: UseJobs;
     /** Keeps the session's job roster stream open while the sheet's session is mounted. */
     watchRows: (sessionId: SessionId) => () => void;
+    /**
+     * The page-wide shares store (T67) — the SAME singleton the title-row
+     * icon and the menu item read, so this row adds no second poll loop.
+     * Subscribed ONLY while the sheet is open (the phone shell must not
+     * keep a 30 s admin/shares GET alive behind the gateway — the same
+     * rule that keeps the icon unsubscribed there).
+     */
+    shares: SharesStore;
 };
 /**
  * Session-info sheet: the bottom sheet that gathers everything S3 pulled off
@@ -45,5 +54,5 @@ export type MobileSessionInfoProps = PropsRuntime<'conversation.session.header.u
  * menu. Mounting inside the header's own DOM (outside that capped layer)
  * lets this sheet's z-index clear every other phone-shell float.
  */
-export declare function MobileSessionInfo({ sessionId, useSessions, useProjection, forkSession, openSession, renameSession, archiveSession, downloadSessionLog, useJobs, watchRows, t, }: MobileSessionInfoProps): import("react").JSX.Element | null;
+export declare function MobileSessionInfo({ sessionId, useSessions, useProjection, forkSession, openSession, renameSession, archiveSession, downloadSessionLog, useJobs, watchRows, shares, t, }: MobileSessionInfoProps): import("react").JSX.Element | null;
 //# sourceMappingURL=MobileSessionInfo.d.ts.map
