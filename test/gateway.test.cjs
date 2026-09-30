@@ -8,7 +8,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert')
-const { startMockTarget, startMockAuthTarget, startGateway, request, stopAll, pairDevice, REMOTE_HEADERS, freePort } = require('./util.cjs')
+const { startMockTarget, startMockAuthTarget, startGateway, startRecordingTarget, request, stopAll, pairDevice, REMOTE_HEADERS, freePort } = require('./util.cjs')
 
 const VIEWPORT_RE = /<meta[^>]*name=["']?viewport["']?[^>]*>/gi
 // Exactly what DSH itself serves today — the tag the gateway has to rewrite.
@@ -30,6 +30,91 @@ async function boot(html) {
   await gw.ready
   return { gw, stop: () => stopAll(target, gw.child) }
 }
+
+/** An upstream that 404s exactly the two favicon files the logo proxy asks
+ * for — the "upstream has no logo" case. */
+async function bootWithFaviconlessUpstream() {
+  const target = await startRecordingTarget(0, {
+    statusFor: (url) => (url === '/favicon.svg' || url === '/favicon-dark.svg' ? 404 : 0),
+  })
+  TARGET_PORT = target.server.address().port
+  PORT = await freePort()
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  return { target, gw, stop: () => stopAll(target.server, gw.child) }
+}
+
+test('gateway logo proxy: an unpaired visitor gets the upstream favicon verbatim on both fixed paths', async () => {
+  // A known body: the mock serves THIS for every path, so "verbatim" is
+  // provable by exact comparison.
+  const upstreamBody = '<svg xmlns="http://www.w3.org/2000/svg"><text>logo</text></svg>'
+  const { stop } = await boot(upstreamBody)
+  try {
+    for (const path of ['/lan-gate/logo.svg', '/lan-gate/logo-dark.svg']) {
+      const res = await request(PORT, { path, headers: REMOTE_HEADERS })
+      assert.strictEqual(res.status, 200, path)
+      assert.strictEqual(res.headers['content-type'], 'image/svg+xml', path)
+      assert.strictEqual(res.headers['x-content-type-options'], 'nosniff')
+      // "verbatim": the body is exactly what the upstream served.
+      assert.strictEqual(res.body, upstreamBody, path)
+    }
+  } finally { await stop() }
+})
+
+test('gateway logo proxy: an upstream miss answers 404 on the logo route', async () => {
+  const { stop } = await bootWithFaviconlessUpstream()
+  try {
+    for (const path of ['/lan-gate/logo.svg', '/lan-gate/logo-dark.svg']) {
+      const res = await request(PORT, { path, headers: REMOTE_HEADERS })
+      assert.strictEqual(res.status, 404, path)
+    }
+  } finally { await stop() }
+})
+
+test('gateway logo proxy: the allowlist is exact — lookalike paths hit the pairing wall, and a query never reaches upstream', async () => {
+  const target = await startRecordingTarget(0)
+  TARGET_PORT = target.server.address().port
+  PORT = await freePort()
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  try {
+    // Dot-segment and sibling paths stay literal (the dispatch matches the
+    // raw, un-normalized path) and fall through to the pairing wall.
+    for (const path of ['/lan-gate/logo.svg/../x', '/lan-gate/logo.svg%2f..', '/favicon.svg', '/lan-gate/logo.svgx']) {
+      const res = await request(PORT, { path, headers: REMOTE_HEADERS })
+      assert.strictEqual(res.status, 401, path)
+      assert.ok(res.body.includes('id="code"'), path + ' gets the pairing page, not upstream content')
+    }
+    // A query suffix resolves the fixed path but the query is dropped: the
+    // upstream sees the bare /favicon.svg and nothing else.
+    const res = await request(PORT, { path: '/lan-gate/logo.svg?x=/api/secret', headers: REMOTE_HEADERS })
+    assert.strictEqual(res.status, 200)
+    const faviconCalls = target.seen.filter((call) => call.path.indexOf('/favicon') === 0)
+    assert.deepEqual(faviconCalls.map((call) => call.path), ['/favicon.svg'])
+    assert.ok(target.seen.every((call) => call.path.indexOf('/api/') !== 0), 'no other upstream path was touched')
+  } finally { await stopAll(target.server, gw.child) }
+})
+
+test('gateway pairing page: DSH-styled shell with the proxied logo and the original form contract', async () => {
+  const { stop } = await boot()
+  try {
+    const page = await request(PORT, { path: '/', headers: REMOTE_HEADERS })
+    assert.strictEqual(page.status, 401)
+    // The shell follows the system appearance (light + dark theme colors,
+    // a dark-mode media query), and the logo is the <picture> switching the
+    // two proxied favicon files.
+    assert.ok(page.body.includes('<picture class="logo">'), 'the logo is a picture element')
+    assert.ok(page.body.includes('/lan-gate/logo.svg') && page.body.includes('/lan-gate/logo-dark.svg'))
+    assert.ok(page.body.includes('media="(prefers-color-scheme: dark)"'), 'dark-mode sources/theme-color are present')
+    assert.ok(page.body.includes('#f7f8fa') && page.body.includes('#151517'), 'the DSH light/dark page backgrounds')
+    // The pairing script's contract is unchanged.
+    for (const id of ['id="code"', 'id="name"', 'id="go"', 'id="err"']) {
+      assert.ok(page.body.includes(id), id + ' survives the restyle')
+    }
+    // The rate-limit and tap-through pages are built by the same gatePage
+    // shell (one function), so they restyle together with this one.
+  } finally { await stop() }
+})
 
 test('gateway: starts and reports pwa:true', async () => {
   const { stop } = await boot()

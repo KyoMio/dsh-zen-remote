@@ -17,7 +17,7 @@
 | --- | --- |
 | ![Composer permission sheet](assets/sheet.png) | ![Pairing page](assets/pairing.png) |
 
-> Screenshots are a 390×844 phone viewport in the light theme; both themes are supported. The pairing page is drawn by the gateway itself and is always dark.
+> Screenshots are a 390×844 phone viewport in the light theme; both themes are supported. The pairing page is drawn by the gateway in DSH's official style, following the system light / dark appearance.
 
 ---
 
