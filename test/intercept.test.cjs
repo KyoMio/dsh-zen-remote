@@ -2481,6 +2481,27 @@ test('merged $events: the consumer abort ends everything and both legs unwind', 
 const T63_SHARED_ROW = { sessionId: 'session-shared', updatedAt: 5 }
 const T63_WORKSPACE = { workspaceId: 'w-1', title: '远端一', sessionIds: ['session-shared'], createdAt: '2026-02-02T00:00:00.000Z', updatedAt: '2026-02-02T00:00:00.000Z' }
 
+/** The host's WIRE shape for `session/list` (RT dsh-api-session-controller
+ * lib/typert.remote-client.js:993-1003 — ONE strict parameter named
+ * `_request`, SessionListRequest = {cursor?}); anything else answers
+ * `gateway/arguments-invalid` on the real server. The mock relay accepts any
+ * args, which is exactly how T63 shipped a bare `{}` and the sync silently
+ * never served — this wraps the mock to refuse every other shape the way the
+ * real gateway would. */
+function enforceSessionListWireShape(relay) {
+  const baseInvoke = relay.invoke
+  relay.invoke = function (namespace, method, args, signal) {
+    if (namespace === 'session' && method === 'list') {
+      const keys = args !== null && typeof args === 'object' && !Array.isArray(args) ? Object.keys(args) : []
+      const request = keys.length === 1 && keys[0] === '_request' ? args._request : undefined
+      if (request === null || typeof request !== 'object' || Array.isArray(request)) {
+        return Promise.reject(new RelayError('gateway/arguments-invalid', 'session/list expects { _request: {...} }'))
+      }
+    }
+    return baseInvoke(namespace, method, args, signal)
+  }
+}
+
 /** A gateway whose LOCAL streams are one gate PER ENDPOINT (the T63 tests
  * drive `$events` and `workspace/follow` side by side through one install). */
 function createPerEndpointGateway() {
@@ -2494,7 +2515,7 @@ function createPerEndpointGateway() {
   return { gateway, gates }
 }
 
-test('T63: session/list answered offline at page load, then the relay serves — the merged $events leg announces the missing row and a re-pull merges it', async () => {
+test('T63-fix: session/list answered offline at page load, then the relay serves — the sync re-pulls with the WIRE shape ({ _request }) and announces the missing row', async () => {
   const relay = createControllableRelay()
   // The page-load state: the handshake is not up (no state event — the UI's
   // one list pull runs against a relay that cannot serve).
@@ -2503,6 +2524,15 @@ test('T63: session/list answered offline at page load, then the relay serves —
     'session/modelCatalog': SERVER_CATALOG,
     'session/list': { items: [T63_SHARED_ROW] },
   }
+  // The real server rejects a bare {} with gateway/arguments-invalid (T63's
+  // shipped bug) — arm the same refusal here so the sync's request shape is
+  // load-bearing in the test.
+  enforceSessionListWireShape(relay)
+  // The gate is armed: the shape T63 originally sent is refused exactly like
+  // the real gateway refuses it. (The probe's invoke record is wiped below,
+  // like install() wipes the install-time catalog probe.)
+  await assert.rejects(relay.invoke('session', 'list', {}, undefined), (error) => error.code === 'gateway/arguments-invalid')
+  relay.invokes.length = 0
   const { gateway, iterator, localGate } = await openMergedEvents(relay)
   gateway.spec.rpc = {
     'session/list': { ok: true, value: { items: [{ sessionId: 'session-local', updatedAt: 1 }] } },
@@ -2532,7 +2562,7 @@ test('T63: session/list answered offline at page load, then the relay serves —
   })
   const listInvokes = relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list')
   assert.equal(listInvokes.length, 1)
-  assert.deepEqual(listInvokes[0].args, {})
+  assert.deepEqual(listInvokes[0].args, { _request: {} })
 
   // The pull the announce stands in for: with the relay serving, the merged
   // list route folds the remote session in.
@@ -2544,13 +2574,16 @@ test('T63: session/list answered offline at page load, then the relay serves —
   await iterator.return?.(undefined)
 })
 
-test('T63: the workspace route nudges about an unannounced session id once — an already-announced id stays quiet', async () => {
+test('T63-fix: the workspace route nudges about an unannounced session id once — an already-announced id stays quiet', async () => {
   const { gateway, gates } = createPerEndpointGateway()
   const relay = createControllableRelay()
   relay.invokeValues = {
     'session/modelCatalog': SERVER_CATALOG,
     'session/list': { items: [T63_SHARED_ROW] },
   }
+  // The sync's fetch must carry the host's wire shape (T63-fix), so the
+  // mock refuses anything else exactly like the real server.
+  enforceSessionListWireShape(relay)
   install(gateway, relay)
   const controller = new AbortController()
   const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
@@ -2599,6 +2632,9 @@ test('T63 regression: a hidden closed-remote session stays hidden — the server
     'session/modelCatalog': SERVER_CATALOG,
     'session/list': { items: [T63_SHARED_ROW] },
   }
+  // Same wire-shape gate as above: the announce only proves anything if the
+  // fetch would actually serve on the real server.
+  enforceSessionListWireShape(relay)
   // A readable current session (a LOCAL one) arms the T58 hiding.
   const { handle } = install(gateway, relay, { getCurrentSession: () => ({ kind: 'open', sessionId: 'local-current' }) })
   const controller = new AbortController()
