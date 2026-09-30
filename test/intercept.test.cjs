@@ -22,6 +22,10 @@ const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
+const { request } = require('./util.cjs')
+
+// The REAL client-route handler, for the T62 route+intercept end-to-end.
+const routes = require('../lib/client-routes.js')
 
 process.env.DSH_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-intercept-'))
 process.on('exit', () => { try { fs.rmSync(process.env.DSH_HOME, { recursive: true, force: true }) } catch { /* best effort */ } })
@@ -140,6 +144,7 @@ function install(raw, relay, overrides = {}) {
     raw,
     relay,
     getServerId: overrides.getServerId ?? (() => SERVER_ID),
+    ...(overrides.getCurrentSession !== undefined ? { getCurrentSession: overrides.getCurrentSession } : {}),
     log: logging.log,
   })
   // T52-fix3: installing into an already-online relay fires one proactive
@@ -744,93 +749,143 @@ test('workspace/follow merges the two legs: local first, remote upserts + merged
   handle.uninstall()
 })
 
-test('T58 wiring: the current session is read from the persisted selection store, and the ≥1s poll hides a closed session once the user navigates away', async () => {
-  // The host's selection store persists to this exact key (RT
-  // dsh-client-ui-workspace: createSnapshotStore({}, { persist: { name:
-  // 'dsh.sessions.current' } })); stub the browser storage for this test.
-  const backing = new Map([
-    ['dsh.sessions.current', JSON.stringify({ sessionId: toVirtual(SERVER_ID, 'session-b') })],
-  ])
-  global.localStorage = {
-    getItem: (key) => (backing.has(key) ? backing.get(key) : null),
-    setItem: (key, value) => backing.set(key, value),
-    removeItem: (key) => backing.delete(key),
-  }
-  try {
-    const controller = new AbortController()
-    const { gateway, localGate } = createMergeGateway(controller.signal)
-    const relay = createControllableRelay()
-    const { handle } = install(gateway, relay)
-    const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
-    localGate.push(LOCAL_BASELINE)
-    await readSome(iterator, 1)
-    relay.streams[0].gate.push({
-      type: 'baseline',
-      value: { items: [remoteWorkspace('w-1', '远端一', ['session-a', 'session-b'])], archivedSessionIds: [], pinnedSessionIds: [] },
-    })
-    await readSome(iterator, 4)
+test('T62 wiring: the current session comes from the injected browser report — a close is judged per report, and currentSessionChanged hides without waiting for the poll', async () => {
+  // The intercept runs in the backend Node process; the current-session
+  // value arrives from the browser half through the client route and is
+  // held by the wiring — here, one mutable holder behind the injected
+  // getter (index.ts does exactly this with `reportedCurrentSession`).
+  let current = { kind: 'unavailable' }
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay, { getCurrentSession: () => current })
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  await readSome(iterator, 1)
+  relay.streams[0].gate.push({
+    type: 'baseline',
+    value: { items: [remoteWorkspace('w-1', '远端一', ['session-a', 'session-b'])], archivedSessionIds: [], pinnedSessionIds: [] },
+  })
+  await readSome(iterator, 4)
 
-    // session-b's remote closes WHILE the user has it open: the tombstone
-    // stays (the page keeps its 「远程已关闭」 banner), nothing is archived.
-    relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-a']) })
-    const [kept] = await readSome(iterator, 1)
-    assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a'), toVirtual(SERVER_ID, 'session-b')])
+  // The browser reports session-b open (the route's sink stores the value
+  // and calls handle.currentSessionChanged()).
+  current = { kind: 'open', sessionId: toVirtual(SERVER_ID, 'session-b') }
+  handle.currentSessionChanged()
 
-    // the user navigates to a local session: within a poll tick the merger
-    // is informed and hides the closed session (archived first, then the
-    // group drops it)
-    backing.set('dsh.sessions.current', JSON.stringify({ sessionId: 'session-l2' }))
-    const [archived, dropped] = await readSome(iterator, 2, 4000)
-    assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [toVirtual(SERVER_ID, 'session-b')] })
-    assert.deepEqual(dropped.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a')])
+  // session-b's remote closes WHILE the user has it open: the tombstone
+  // stays (the page keeps its 「远程已关闭」 banner), nothing is archived.
+  relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-a']) })
+  const [kept] = await readSome(iterator, 1)
+  assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a'), toVirtual(SERVER_ID, 'session-b')])
 
-    controller.abort()
-    localGate.finish()
-    handle.uninstall()
-  } finally {
-    delete global.localStorage
-  }
+  // The browser reports the user navigated away (a readable "nothing
+  // open"): the change notification re-judges AT ONCE — archived first,
+  // then the group drops the tombstone. No poll tick, no real waiting.
+  current = { kind: 'none' }
+  handle.currentSessionChanged()
+  const [archived, dropped] = await readSome(iterator, 2)
+  assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [toVirtual(SERVER_ID, 'session-b')] })
+  assert.deepEqual(dropped.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a')])
+
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
 })
 
-test('T58-fix wiring: a close frame is judged against the CURRENT selection — a session opened after the stream started keeps its tombstone', async () => {
-  // The stream starts while a LOCAL session is open; the user opens remote
-  // session-b afterwards — only localStorage changes, no frame announces it.
-  const backing = new Map([['dsh.sessions.current', JSON.stringify({ sessionId: 'session-l1' })]])
-  global.localStorage = {
-    getItem: (key) => (backing.has(key) ? backing.get(key) : null),
-    setItem: (key, value) => backing.set(key, value),
-    removeItem: (key) => backing.delete(key),
-  }
+test('T62 wiring: no report yet (getter unavailable) keeps the conservative tombstone — a close hides nothing', async () => {
+  // Default install: no getCurrentSession injected, permanently
+  // `unavailable` — the pre-report conservative behavior (T58's fallback).
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay)
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  await readSome(iterator, 1)
+  relay.streams[0].gate.push({
+    type: 'baseline',
+    value: { items: [remoteWorkspace('w-1', '远端一', ['session-a', 'session-b'])], archivedSessionIds: [], pinnedSessionIds: [] },
+  })
+  await readSome(iterator, 4)
+
+  relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-a']) })
+  const [kept] = await readSome(iterator, 1)
+  assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a'), toVirtual(SERVER_ID, 'session-b')], 'the tombstone stays while no signal has arrived')
+
+  // A spurious change notification WITHOUT a signal must not start hiding
+  // either: prove it by pushing a marker frame after the notification and
+  // asserting the very next frame is the marker itself.
+  handle.currentSessionChanged()
+  localGate.push({ type: 'pinned', pinnedSessionIds: [] })
+  const [marker] = await readSome(iterator, 1)
+  assert.equal(marker.type, 'pinned', 'the notification produced no frames of its own')
+
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('T62 e2e: the REAL client route feeds the intercept — report A, close A, report B, A enters archived', async () => {
+  // The route and the intercept exactly as index.ts wires them: the route's
+  // sink stores the report and calls handle.currentSessionChanged(); the
+  // intercept reads the holder per use.
+  let reported = { kind: 'unavailable' }
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const { handle } = install(gateway, relay, { getCurrentSession: () => reported })
+  const handler = routes.createClientHandler({
+    admit: () => ({ peer: {} }),
+    getRowConfig: () => ({ role: 'client' }),
+    onCurrentSession: (read) => {
+      reported = read
+      handle.currentSessionChanged()
+    },
+  })
+  const server = http.createServer((req, res) => { void handler(req, res) })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
   try {
-    const controller = new AbortController()
-    const { gateway, localGate } = createMergeGateway(controller.signal)
-    const relay = createControllableRelay()
-    const { handle } = install(gateway, relay)
     const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
     localGate.push(LOCAL_BASELINE)
     await readSome(iterator, 1)
     relay.streams[0].gate.push({
       type: 'baseline',
-      value: { items: [remoteWorkspace('w-1', '远端一', ['session-a', 'session-b'])], archivedSessionIds: [], pinnedSessionIds: [] },
+      value: { items: [remoteWorkspace('w-1', '远端一', ['session-a'])], archivedSessionIds: [], pinnedSessionIds: [] },
     })
     await readSome(iterator, 4)
 
-    backing.set('dsh.sessions.current', JSON.stringify({ sessionId: toVirtual(SERVER_ID, 'session-b') }))
-
-    // the server closes session-b: judged against the FRESH per-frame read,
-    // it IS the open session — tombstone kept, and no archived frame may
-    // precede the upsert (one would kick the open page home via
-    // clearArchivedCurrent)
-    relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-a']) })
+    // The browser reports session-a open; the server then closes its remote.
+    const posted = await request(port, {
+      method: 'POST',
+      path: '/_dsh/zen-remote/client/current-session',
+      headers: { origin: `http://127.0.0.1:${port}` },
+      body: { sessionId: toVirtual(SERVER_ID, 'session-a') },
+    })
+    assert.equal(posted.status, 200)
+    relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', []) })
     const [kept] = await readSome(iterator, 1)
-    assert.equal(kept.type, 'upsert', 'no archived frame went first')
-    assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a'), toVirtual(SERVER_ID, 'session-b')], 'the open page keeps its slot')
+    assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a')], 'the open closed session keeps its tombstone')
+
+    // The user navigates away: the report of B (a local id) arrives through
+    // the REAL route — A moves into archived and out of the group.
+    const away = await request(port, {
+      method: 'POST',
+      path: '/_dsh/zen-remote/client/current-session',
+      headers: { origin: `http://127.0.0.1:${port}` },
+      body: { sessionId: 'session-l2' },
+    })
+    assert.equal(away.status, 200)
+    const [archived, dropped] = await readSome(iterator, 2)
+    assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [toVirtual(SERVER_ID, 'session-a')] })
+    assert.deepEqual(dropped.workspace.sessionIds, [], 'the tombstone left the group')
 
     controller.abort()
     localGate.finish()
     handle.uninstall()
   } finally {
-    delete global.localStorage
+    await new Promise((resolve) => server.close(resolve))
   }
 })
 

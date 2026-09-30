@@ -85,6 +85,7 @@ function startClientServer(row, overrides = {}) {
     ...(overrides.getRelayClient !== undefined ? { getRelayClient: overrides.getRelayClient } : {}),
     ...(overrides.getIntercept !== undefined ? { getIntercept: overrides.getIntercept } : {}),
     ...(overrides.remoteStatusOnly !== undefined ? { remoteStatusOnly: overrides.remoteStatusOnly } : {}),
+    ...(overrides.onCurrentSession !== undefined ? { onCurrentSession: overrides.onCurrentSession } : {}),
   })
   const server = http.createServer((req, res) => { void handler(req, res) })
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })))
@@ -1472,5 +1473,109 @@ test('T59-fix status: an in-flight or queued rename answers an EMPTY deviceName 
     assert.equal(after.deviceName, 'B', 'after the push the fresh record travels')
   } finally {
     await closeServer(server)
+  }
+})
+
+// -- T62: the current-session report route ------------------------------------------
+
+test('T62 current-session: a same-origin POST stores the report — an id opens, null clears', async () => {
+  const row = makeRow()
+  const seen = []
+  const { server, port } = await startClientServer(row, { onCurrentSession: (read) => seen.push(read) })
+  try {
+    const open = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CURRENT_SESSION_ROUTE,
+      headers: sameOrigin(port),
+      body: { sessionId: 'zr~721b94fb~session-a' },
+    })
+    assert.equal(open.status, 200)
+    assert.deepEqual(JSON.parse(open.body), { ok: true })
+    const none = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CURRENT_SESSION_ROUTE,
+      headers: sameOrigin(port),
+      body: { sessionId: null },
+    })
+    assert.equal(none.status, 200)
+    assert.deepEqual(seen, [
+      { kind: 'open', sessionId: 'zr~721b94fb~session-a' },
+      { kind: 'none' },
+    ])
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T62 current-session: GET, cross-origin, missing, wrong-type, blank and over-long reports are refused', async () => {
+  const row = makeRow()
+  const seen = []
+  const { server, port } = await startClientServer(row, { onCurrentSession: (read) => seen.push(read) })
+  try {
+    const get = await request(port, { method: 'GET', path: routes.CLIENT_CURRENT_SESSION_ROUTE })
+    assert.equal(get.status, 405)
+
+    const cross = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CURRENT_SESSION_ROUTE,
+      headers: { origin: 'http://evil.example' },
+      body: { sessionId: 'zr~721b94fb~session-a' },
+    })
+    assert.equal(cross.status, 403)
+    assert.equal(JSON.parse(cross.body).error.code, 'origin-rejected')
+
+    for (const body of [{}, { sessionId: 42 }, { sessionId: '' }, { sessionId: 'x'.repeat(513) }]) {
+      const bad = await request(port, {
+        method: 'POST',
+        path: routes.CLIENT_CURRENT_SESSION_ROUTE,
+        headers: sameOrigin(port),
+        body,
+      })
+      assert.equal(bad.status, 400, `sessionId ${JSON.stringify(body.sessionId)} must be refused`)
+      assert.equal(JSON.parse(bad.body).error.code, 'bad-request')
+    }
+    assert.deepEqual(seen, [], 'nothing reached the sink')
+    // The 512-char cap is a bound, not a squeeze: a 512-char id passes.
+    const edge = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CURRENT_SESSION_ROUTE,
+      headers: sameOrigin(port),
+      body: { sessionId: 's'.repeat(512) },
+    })
+    assert.equal(edge.status, 200)
+    assert.deepEqual(seen, [{ kind: 'open', sessionId: 's'.repeat(512) }])
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T62 current-session: no sink (host role / remoteStatusOnly, or a sinkless client mount) answers 404', async () => {
+  const row = makeRow()
+  // Host mount: the remoteStatusOnly wall 404s the route before anything else.
+  const host = await startClientServer(row, { remoteStatusOnly: true, onCurrentSession: () => {} })
+  try {
+    const hostRes = await request(host.port, {
+      method: 'POST',
+      path: routes.CLIENT_CURRENT_SESSION_ROUTE,
+      headers: sameOrigin(host.port),
+      body: { sessionId: 'x' },
+    })
+    assert.equal(hostRes.status, 404)
+  } finally {
+    await closeServer(host.server)
+  }
+  // A client mount without the sink answers the unknown-path 404 too.
+  const sinkless = await startClientServer(row)
+  try {
+    const res = await request(sinkless.port, {
+      method: 'POST',
+      path: routes.CLIENT_CURRENT_SESSION_ROUTE,
+      headers: sameOrigin(sinkless.port),
+      body: { sessionId: 'x' },
+    })
+    assert.equal(res.status, 404)
+    assert.equal(JSON.parse(res.body).error.code, 'not-found')
+  } finally {
+    await closeServer(sinkless.server)
   }
 })

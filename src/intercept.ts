@@ -415,63 +415,29 @@ function waitReopen(clock: RelayClock, waitOnline: () => Promise<void>, delayMs:
 }
 
 /**
- * T58: where the CURRENT session id comes from. The host's
- * `dsh-client-ui-workspace` keeps its selection (the `mainReference.sessionId`
- * its `watchNavigation` / `clearArchivedCurrent` act on) in a snapshot store
- * persisted to THIS localStorage key on every navigation (`replaceMain`
- * writes `{sessionId}`, `clearMain` writes `{}`) — reading it is reading the
- * same source the navigation guard uses, no host internals needed. A stale
- * value cannot mislead either: on load the store rehydrates from this exact
- * key before `restoreSelection` reopens it.
+ * T58/T62: the vocabulary of the current-session signal. The value travels
+ * from the BROWSER — the only place the host's persisted selection
+ * (localStorage `dsh.sessions.current`) is readable — through the client
+ * route `current-session` into this process, because the intercept layer
+ * runs in the backend Node process (it wraps the typert gateway there) and
+ * cannot read the browser's storage itself (the T58 localStorage read was
+ * exactly that mistake: Node's global localStorage without a
+ * `--localstorage-file` never answers, so every read degraded to
+ * `unavailable` and tombstones never hid).
+ *
+ * - `unavailable`: no usable signal has arrived yet — the conservative
+ *   fallback keeps every tombstone;
+ * - `none`: a readable signal says no session is open;
+ * - `open`: this session's page is open (the raw id as the UI knows it — a
+ *   virtual id for a remote session, a local id otherwise).
  */
-const CURRENT_SESSION_STORAGE_KEY = 'dsh.sessions.current'
+export type CurrentSessionRead = { kind: 'unavailable' } | { kind: 'none' } | { kind: 'open'; sessionId: string }
 
-/** The poll interval for re-reading the current session (T58: never faster
- * than 1s, and the loop runs only while the merger keeps tombstones waiting). */
+/** The fallback re-check interval (T58): the browser reports on change and
+ * the route notifies the mergers at once, so the poll only exists for the
+ * "closed session that IS the open one, waiting for the user to navigate
+ * away" case — a navigation writes no relay frames to piggyback on. */
 const CURRENT_SESSION_POLL_MS = 1_000
-
-/** localStorage reduced to the one method used — intercept.ts is compiled
- * with the HOST tsconfig (node types, no DOM lib) even though it runs in the
- * browser page. */
-interface BrowserStorageLike {
-  getItem(key: string): string | null
-}
-
-/** The page's localStorage when one exists and answers, else undefined. */
-function browserStorage(): BrowserStorageLike | undefined {
-  try {
-    const storage = (globalThis as { localStorage?: BrowserStorageLike | null }).localStorage
-    return storage !== null && storage !== undefined && typeof storage.getItem === 'function' ? storage : undefined
-  } catch {
-    return undefined
-  }
-}
-
-/** One read of the current-session signal (T58). `unavailable` = no usable
- * storage or an unreadable value — the caller must NOT inform the merger
- * (the conservative tombstone fallback applies); `none` / `open` are real
- * answers (the store was read: either no session is open, or this one is). */
-type CurrentSessionRead = { kind: 'unavailable' } | { kind: 'none' } | { kind: 'open'; sessionId: string }
-
-function readCurrentSession(): CurrentSessionRead {
-  const storage = browserStorage()
-  if (storage === undefined) return { kind: 'unavailable' }
-  try {
-    const raw = storage.getItem(CURRENT_SESSION_STORAGE_KEY)
-    // An absent key is treated as unavailable, on purpose: the store only
-    // starts persisting once the host writes a selection, so absence means
-    // "no signal ever" — the conservative reading — rather than a positive
-    // "no session is open".
-    if (raw === null) return { kind: 'unavailable' }
-    const parsed: unknown = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { kind: 'unavailable' }
-    const sessionId = (parsed as { sessionId?: unknown }).sessionId
-    if (typeof sessionId !== 'string' || sessionId === '') return { kind: 'none' }
-    return { kind: 'open', sessionId }
-  } catch {
-    return { kind: 'unavailable' }
-  }
-}
 
 /**
  * The error shape the host's stream channel forwards intact: only errors
@@ -616,6 +582,14 @@ export interface InstallInterceptOptions {
    * the same real clock the relay client's ladder uses. Tests inject a
    * manual clock to drive the reopen delays without real waiting. */
   clock?: RelayClock
+  /** The current-session signal, read live per use (T62): the browser half
+   * reports the host UI's open session through the client route
+   * (`current-session`) and the wiring holds the latest value here. The
+   * intercept runs in the BACKEND Node process — the browser's localStorage
+   * is not reachable from it, which is exactly what the T58 localStorage
+   * read got wrong — so the value must be carried in. Default: permanently
+   * `unavailable` (the conservative fallback — tombstones stay). */
+  getCurrentSession?: () => CurrentSessionRead
 }
 
 export interface InterceptHandle {
@@ -633,6 +607,11 @@ export interface InterceptHandle {
   /** Record the wiring's self-check verdict (and uninstall + log on
    * failure — the wiring owns that decision, this only records). */
   noteSelfCheck(result: SelfCheckResult): void
+  /** T62: the browser just reported a new current-session value (the
+   * client route's sink calls this). Every live merged global stream
+   * re-judges NOW — the mergers dedupe no-change calls — instead of
+   * waiting for the next frame or the 1s fallback poll. */
+  currentSessionChanged(): void
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -1268,6 +1247,13 @@ interface MergedGlobalStreamDeps {
   log: ((format: string, ...args: unknown[]) => void) | undefined
   /** The clock the reopen backoff runs on (the install options' clock). */
   clock: RelayClock
+  /** The current-session signal, read live per use (T62): the browser's
+   * last report, held by the wiring. */
+  getCurrentSession: () => CurrentSessionRead
+  /** Subscribe one callback to "the browser reported a new current
+   * session" (T62); the merged stream re-judges immediately instead of
+   * waiting for a frame or the fallback poll. Returns the disposer. */
+  watchCurrentSession(fn: () => void): () => void
 }
 
 /**
@@ -1347,21 +1333,22 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   const channel = createFrameChannel()
   let alive = true
   let currentController: AbortController | undefined
-  // T58 + T58-fix: the current-session knowledge. Seeded once up front, then
-  // refreshed BEFORE EVERY merged frame (`informCurrentSession` in the two
-  // pumps) — the host rewrites localStorage synchronously on every
-  // navigation, so a read inside the same window as the incoming frame is
-  // accurate; a close frame arriving right after the user switched sessions
-  // must not be judged by a stale session. The ≥1s poll remains ONLY for the
-  // case no frame will announce: a closed session that IS the open one waits
-  // for the user to navigate away (hasPendingHide). An unavailable read is
+  // T58/T62: the current-session knowledge. Seeded once, then refreshed
+  // BEFORE EVERY merged frame, and re-judged the moment the browser reports
+  // a new value (the deps' watchCurrentSession listener — the route's sink
+  // calls handle.currentSessionChanged()). The value itself comes from the
+  // injected getter (the browser's report, stored by the wiring); the ≥1s
+  // poll remains ONLY for the case no frame and no report will announce: a
+  // closed session that IS the open one waits for the user to navigate
+  // away, and a navigation writes no relay frames. An `unavailable` read is
   // skipped entirely: the merger falls back to the conservative tombstone
   // behavior then.
   const informCurrentSession = (): void => {
-    const read = readCurrentSession()
+    const read = deps.getCurrentSession()
     if (read.kind === 'unavailable') return
     for (const frame of merger.setCurrentSession(read.kind === 'open' ? read.sessionId : undefined)) channel.push(frame)
   }
+  const offCurrentSession = deps.watchCurrentSession(informCurrentSession)
   let sessionPoll: unknown = undefined
   const pollCurrentSession = (): void => {
     sessionPoll = undefined
@@ -1617,6 +1604,7 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   } finally {
     alive = false
     if (sessionPoll !== undefined) clock.clearTimeout(sessionPoll)
+    offCurrentSession()
     offState()
     if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
     currentController?.abort()
@@ -1933,6 +1921,14 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
 export function installIntercept(options: InstallInterceptOptions): InterceptHandle {
   const { raw, relay, getServerId, log } = options
   const clock = options.clock ?? defaultClock
+  // T62: the current-session getter and the live-merged-stream listener
+  // registry behind handle.currentSessionChanged().
+  const getCurrentSession = options.getCurrentSession ?? (() => ({ kind: 'unavailable' }) as const)
+  const currentSessionListeners = new Set<() => void>()
+  const watchCurrentSession = (fn: () => void): (() => void) => {
+    currentSessionListeners.add(fn)
+    return () => { currentSessionListeners.delete(fn) }
+  }
   const gateway = raw as Record<string | symbol, unknown>
   const shape = checkGatewayShape(raw)
   const counters = { openWireStream: 0, dispatchRpc: 0 }
@@ -2752,6 +2748,8 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             recordFailure,
             log,
             clock,
+            getCurrentSession,
+            watchCurrentSession,
           })
         })()
       }
@@ -2855,6 +2853,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     },
     noteSelfCheck(result: SelfCheckResult) {
       selfCheck = result
+    },
+    currentSessionChanged() {
+      for (const listener of [...currentSessionListeners]) listener()
     },
   }
 }

@@ -54,7 +54,7 @@ import { createRelayClient, RelayError, volatileUpdateTouchesServerName } from '
 import type { RelayClient } from './relay-client.js'
 import { computeFingerprints } from './fingerprint.js'
 import { runSelfCheck, installIntercept } from './intercept.js'
-import type { InterceptDiagnostics, InterceptHandle } from './intercept.js'
+import type { CurrentSessionRead, InterceptDiagnostics, InterceptHandle } from './intercept.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { checkFetchRouteShape, installFetchRouteIntercept } from './fetch-route-intercept.js'
@@ -799,6 +799,18 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // the status answer simply carries no intercept field.
     let interceptHandle: InterceptHandle | undefined
     let interceptRefused: GatewayShapeCheck | undefined
+    // T62: the browser's current-session report, held here and read live by
+    // the intercept (which cannot reach the browser's localStorage — it
+    // wraps the backend gateway). Last write wins across windows; until the
+    // first report arrives the value is `unavailable` and the intercept
+    // keeps its conservative tombstone behavior.
+    let reportedCurrentSession: CurrentSessionRead = { kind: 'unavailable' }
+    const onCurrentSession = (read: CurrentSessionRead): void => {
+      reportedCurrentSession = read
+      // Re-judge NOW — the merger dedupes no-change calls, so a report that
+      // carries nothing new costs one compare.
+      interceptHandle?.currentSessionChanged()
+    }
     const interceptDiagnostics = (): InterceptDiagnostics | undefined => {
       if (interceptHandle !== undefined) return interceptHandle.diagnostics()
       if (interceptRefused !== undefined) {
@@ -831,6 +843,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         raw,
         relay: relayClient,
         getServerId: () => relayClient.handshakeInfo?.serverId,
+        getCurrentSession: () => reportedCurrentSession,
         log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
       })
       interceptHandle = handle
@@ -928,6 +941,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           getRelayClient: () => relayClient,
           getIntercept: interceptDiagnostics,
           getFetchRouteIntercept: fetchRouteDiagnostics,
+          onCurrentSession,
         }),
       }), 'dsh-zen-remote: client routes')
     })
