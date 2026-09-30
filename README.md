@@ -31,7 +31,7 @@ Same package, same plugin row. What runs is decided by the `role` setting in the
 | What it loads | Mobile UI, gateway (child process), Web Push, session sharing, the relay server | The relay client and the sidebar/session-page remote parts |
 | What it does NOT load | — | No gateway, no push, no phone UI — it never fights the host for the gateway port |
 
-A paired **desktop client** sees exactly the sessions the host has turned remote access on for, grouped under "server name · workspace name" after the local workspaces. Local sessions on the client machine are untouched.
+A paired **desktop client** sees exactly the sessions the host has turned remote access on for, grouped under "server name · workspace name" after the local workspaces. A server workspace only appears once at least one of its sessions has remote access on, so a workspace you never touched never shows up as an empty group; a group that was already showing and later loses all its sessions stays as an empty group until the page is reloaded. Local sessions on the client machine are untouched.
 
 ---
 
@@ -114,6 +114,8 @@ A pairing code is minted **for one device role**, and the role is checked at red
 
 The server-side settings page can rename devices, change a device's role (`set-role`), and revoke one or all. Revocation is immediate: open connections and push subscriptions die with it. Desktop-client devices can never reach any admin route — the gateway only ever forwards them into the relay prefix.
 
+**Device name**: the 设备名称 (device name) field in the settings page's role card — the `serverName` config — is shared by both roles. On a host it is the name that titles the group in other devices' sidebars (default: the computer's name); on a client it is the name registered with the server when pairing. The name syncs both ways by itself: the server renaming itself reaches the clients' group titles in about 15 seconds; a client saving a new name updates the server's device list; the server renaming a client in its device list reaches that client in about 30 seconds. A client pushes its name only when you explicitly save the settings — everything else defers to the server's record, and a rename made while offline is dropped if the process exits before it can be pushed. Names are 1–40 characters.
+
 ---
 
 ## Session sharing
@@ -130,7 +132,7 @@ Remote access is per session, with three toggle entries on the host:
 
 **What "remote off" means**: an unshared session's list row, history, live progress and approval/question events are all refused or filtered at the relay — not merely hidden in the UI. @-mention candidates list **only shared sessions**, and a `dsh-session:` reference embedded in a message, a queue edit or a slash command is refused for the whole call when it names an unshared session.
 
-**What a closed remote looks like on the client**: when the server closes a session's remote access (or the session idle-sleeps), a client page that has it open is not thrown out — the page stays where it is, a "remote closed" banner with the reason (server closed / idle sleep / turned off on this machine) appears above the composer, and input is disabled; in the sidebar the session stays in its original remote group (a tombstone) instead of being moved into the archive, until a page reload drops it with the next refresh. When the server turns remote access back on (or re-shares), the session returns to its normal position and any open page recovers by itself — the banner clears and input comes back.
+**What a closed remote looks like on the client**: when the server closes a session's remote access (or the session idle-sleeps), the session is hidden from the client's sidebar list — it counts as archived, so DSH's "show archived" filter brings it back into view. The one exception is the session page you have open right now: it stays where it is, a "remote closed" banner with the reason (server closed / idle sleep / turned off on this machine) appears above the composer, and input is disabled; once you switch to another session, it hides too. When the server turns remote access back on (or re-shares), the session returns to its original workspace and an open page recovers by itself — the banner clears and input comes back.
 
 **Disconnects and recovery**: while the server (or the link) is down, an open remote session page holds its ground — the banner says offline and input is disabled; once the connection is back the page resumes by itself: the session stream and task-list-type panels pull a fresh snapshot automatically, no manual refresh needed. The exceptions are the file-tree changes and terminal panels, which must be reopened after a disconnect.
 
@@ -157,7 +159,7 @@ Row fields (matching `src/config.ts`):
 | `pushDebounceMs` | `15000` | Minimum gap between two automatic pushes; approval/question notifications are never suppressed by it |
 | `pushSummary` | off | Include the turn's final reply (prose only, never the reasoning; clipped to 120 chars) and the question text in the body |
 | `pushTool` | on | Set `false` to remove the model-callable `push_notify` tool |
-| `serverName` | computer name | Server display name (≤ 40 chars), shown in the client's group titles |
+| `serverName` | computer name | **Device name** (≤ 40 chars), shared by both roles: on a host it is the display name in clients' group titles; on a client it is the name registered when pairing. Syncs both ways with the server automatically |
 | `idleHours` | `48` | Idle-sleep window in hours for remote-enabled sessions; range (0, 8760] |
 | `autoShareNewSessions` | off | Auto-enable remote on every session the host creates |
 | `serverUrl` *(client)* | empty | The server's gateway address, normalized per the rules above |
@@ -249,6 +251,7 @@ What a paired device is trusted with, stated plainly:
 
 ## Known limitations
 
+- With several DSH windows open at the same time (including the desktop app's backend page opened in a browser), "which session is currently open" can be judged wrongly on a client: a closed-remote session may hide at the wrong moment, and in the worst case a session you have open is taken for a background one and dismissed to the home page.
 - Switching to a different server and back to the original one — or a server deleting a workspace and recreating one under the same id — leaves the affected remote groups invisible until the client page is **reloaded** (DSH's sidebar never re-accepts a removed workspace id within one page lifetime).
 - "Export session" is disabled in a remote session (the menu item is hidden, and the backend refuses virtual session ids); the changes panel's **summary and diff do work** (relayed), while the entries that would pop a dialog on the server machine — "open", "reveal in Finder", "open in app", on the changes panel and deliverable cards alike — are hidden there.
 - The host truncates @-mention candidates to the **first 50 rows before** share-filtering: on a server with many sessions, a shared one may be missing from the candidate list (the reference check itself is unaffected — references you type out are still verified one by one).
