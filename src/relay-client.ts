@@ -276,6 +276,11 @@ export interface RelayClient {
    * settings page's server-driven write echoing back, and pushing it would
    * set the two ends overwriting each other. */
   queueDeviceName(name: string): void
+  /** Whether a locally-pushed rename is queued or in flight (T59-fix). The
+   * status route answers an EMPTY `deviceName` while this is true — an
+   * in-flight answer could still carry the pre-push record, and the page
+   * following it would bounce the fresh save back to the old name. */
+  readonly deviceNameSyncing: boolean
   /** Run the handshake; success resolves with it and leaves `online`. */
   connect(): Promise<RelayHandshake>
   /** One immediate connection attempt from `offline`, resetting the backoff
@@ -368,6 +373,17 @@ export function relayCredentialsDigest(serverUrl: string, token: string): string
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Whether the loader's `loader/volatile-update` announcement names the
+ * device's own field (T59-fix): the announcement rides EVERY volatile
+ * commit — an unrelated knob, or the settings page's own follow write — and
+ * only a commit that actually moved `serverName` may queue a push. The
+ * paths are the loader's changed-field lists (`[['serverName'], …]`).
+ */
+export function volatileUpdateTouchesServerName(paths: unknown): boolean {
+  return Array.isArray(paths) && paths.some((entry) => Array.isArray(entry) && entry[0] === 'serverName')
 }
 
 function messageOf(error: unknown): string {
@@ -617,6 +633,24 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * first handshake), flushed once `online` lands. */
   let pendingDeviceName: string | undefined
 
+  // T59-fix: a push that is IN FLIGHT right now, plus a sequence counter
+  // bumped at every push start AND settle. An info-refresh answer that
+  // overlapped a push (seq moved, or a push is still queued) carries the
+  // PRE-push record and must not win — see {@link refreshInfo}.
+  let deviceNamePushBusy = false
+  let deviceNamePushSeq = 0
+
+  /**
+   * Whether a locally-pushed rename is queued or in flight (T59-fix). The
+   * status route answers an EMPTY `deviceName` while this is true: an
+   * in-flight status answer could still carry the pre-push record, and a
+   * page that followed it would bounce the user's fresh save straight back
+   * to the old name.
+   */
+  function deviceNameSyncing(): boolean {
+    return deviceNamePushBusy || pendingDeviceName !== undefined
+  }
+
   /** The periodic info-refresh's armed timer (see {@link INFO_REFRESH_MS}). */
   let infoTimer: unknown | undefined
 
@@ -630,8 +664,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       changed = true
     }
     // A locally-pushed rename outranks the stream heartbeat until the server
-    // confirms it — see {@link deviceNameAuthoritative}.
-    if (deviceName !== undefined && deviceName !== next.deviceName && !deviceNameAuthoritative) {
+    // confirms it — see {@link deviceNameAuthoritative}; a push IN FLIGHT is
+    // equally authoritative for the same reason (T59-fix): the heartbeat's
+    // name was stamped before our rename reached the table.
+    if (deviceName !== undefined && deviceName !== next.deviceName && !deviceNameAuthoritative && !deviceNamePushBusy) {
       next.deviceName = deviceName
       changed = true
     }
@@ -658,6 +694,12 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       pendingDeviceName = name
       return false
     }
+    // T59-fix: the busy window covers the whole round-trip (the status route
+    // answers an empty deviceName while it lasts), and the sequence counter
+    // lets an overlapping info refresh know its answer is stale.
+    const digestAtStart = credentialsDigest
+    deviceNamePushBusy = true
+    deviceNamePushSeq += 1
     let payload: unknown
     try {
       const controller = new AbortController()
@@ -675,6 +717,12 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     } catch {
       payload = undefined
     }
+    deviceNamePushBusy = false
+    deviceNamePushSeq += 1
+    // T59-fix: judge the answer only if the world stood still — a re-pair to
+    // another server (the credential digest moved) or a dropped link makes
+    // this answer a fact about a table we may no longer be talking to.
+    if (stopped || state !== 'online' || credentialsDigest !== digestAtStart) return false
     const confirmed = isRecord(payload) && payload.ok === true && infoString(payload.name) === name
     if (!confirmed) {
       pendingDeviceName = name
@@ -738,6 +786,12 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     if (stopped || state !== 'online' || connectInFlight !== undefined) return
     const creds = currentCredentials()
     if (creds === undefined) return
+    // T59-fix: remember the world at request time — the answer only counts
+    // if we are still the same online client (the credential digest catches
+    // a re-pair to another server), and a name push that overlapped the
+    // round-trip makes the answer's deviceName a PRE-push record.
+    const digestAtStart = credentialsDigest
+    const pushSeqAtStart = deviceNamePushSeq
     let payload: unknown
     try {
       const controller = new AbortController()
@@ -756,29 +810,27 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     } catch {
       return
     }
+    if (stopped || state !== 'online' || credentialsDigest !== digestAtStart) return
     if (!isRecord(payload) || payload.ok !== true || payload.relayProtocol !== RELAY_PROTOCOL) return
-    const next: RelayHandshake = {
-      relayProtocol: RELAY_PROTOCOL,
-      serverId: typeof payload.serverId === 'string' ? payload.serverId : '',
-      serverName: typeof payload.serverName === 'string' ? payload.serverName : '',
-      dshVersion: typeof payload.dshVersion === 'string' ? payload.dshVersion : '',
-      fingerprints: isRecord(payload.fingerprints) ? (payload.fingerprints as Record<string, string>) : {},
-      ...(infoString(payload.deviceName) !== undefined ? { deviceName: infoString(payload.deviceName) } : {}),
-    }
-    // The answer IS the table's current record: the local push authority
-    // retires here, whatever it said.
-    deviceNameAuthoritative = false
+    // T59-fix: NAMES ONLY. serverId / dshVersion / fingerprints belong to the
+    // real handshake (the compat verdict is computed there, on both maps
+    // fresh); a quiet refresh never disturbs them.
     const previous = handshakeInfo
-    if (
-      previous === undefined ||
-      previous.serverId !== next.serverId ||
-      previous.serverName !== next.serverName ||
-      previous.dshVersion !== next.dshVersion ||
-      previous.deviceName !== next.deviceName
-    ) {
-      handshakeInfo = next
-      notify()
-    }
+    if (previous === undefined) return
+    const serverName = typeof payload.serverName === 'string' ? payload.serverName : previous.serverName
+    const serverDeviceName = infoString(payload.deviceName)
+    // A push that overlapped this round-trip — STARTED before it (the seq
+    // moved by the settle), still IN FLIGHT, or still QUEUED — makes the
+    // answer's deviceName a pre-push record: dropped, and the local
+    // authority stays; the next clean refresh confirms instead.
+    const pushedDuringRefresh = deviceNamePushSeq !== pushSeqAtStart || deviceNamePushBusy || pendingDeviceName !== undefined
+    const deviceName = pushedDuringRefresh ? undefined : serverDeviceName
+    if (deviceName !== undefined) deviceNameAuthoritative = false
+    let changed = previous.serverName !== serverName
+    if (deviceName !== undefined && deviceName !== previous.deviceName) changed = true
+    if (!changed) return
+    handshakeInfo = { ...previous, serverName, ...(deviceName !== undefined ? { deviceName } : {}) }
+    notify()
   }
 
   /** Arm one refresh tick; re-arms itself while the client stays online. */
@@ -1426,6 +1478,9 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     },
     get compat(): RelayCompatVerdict | undefined {
       return compat
+    },
+    get deviceNameSyncing(): boolean {
+      return deviceNameSyncing()
     },
     subscribe,
     queueDeviceName,

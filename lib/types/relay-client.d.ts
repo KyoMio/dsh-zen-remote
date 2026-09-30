@@ -169,6 +169,11 @@ export interface RelayClient {
      * settings page's server-driven write echoing back, and pushing it would
      * set the two ends overwriting each other. */
     queueDeviceName(name: string): void;
+    /** Whether a locally-pushed rename is queued or in flight (T59-fix). The
+     * status route answers an EMPTY `deviceName` while this is true — an
+     * in-flight answer could still carry the pre-push record, and the page
+     * following it would bounce the fresh save back to the old name. */
+    readonly deviceNameSyncing: boolean;
     /** Run the handshake; success resolves with it and leaves `online`. */
     connect(): Promise<RelayHandshake>;
     /** One immediate connection attempt from `offline`, resetting the backoff
@@ -253,6 +258,14 @@ export interface RelayHttpResult {
  * plaintext copy of either value.
  */
 export declare function relayCredentialsDigest(serverUrl: string, token: string): string;
+/**
+ * Whether the loader's `loader/volatile-update` announcement names the
+ * device's own field (T59-fix): the announcement rides EVERY volatile
+ * commit — an unrelated knob, or the settings page's own follow write — and
+ * only a commit that actually moved `serverName` may queue a push. The
+ * paths are the loader's changed-field lists (`[['serverName'], …]`).
+ */
+export declare function volatileUpdateTouchesServerName(paths: unknown): boolean;
 /**
  * Build one relay client. Pure state machine + fetch plumbing; the row is
  * only ever seen through the two getters.
