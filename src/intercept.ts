@@ -1770,8 +1770,13 @@ interface MergedEventsStreamDeps {
  * the host's own add-a-row event, applied idempotently by the client
  * face's mergeSummary). The frames obey the same discipline as the
  * catalog frame: never before the local leg's `ready`, failures confined
- * to the diagnostics ring, and deduped to the serving period plus the
- * hub's announced set.
+ * to the diagnostics ring, and deduped per stream. T65 moved the
+ * announced/asked sets INTO each stream (a new page's first sync is never
+ * skipped by the previous page's knowledge); T65-fix adds the ask
+ * bookkeeping — mid-flight batches run as their own follow-up round, an
+ * id the server did not return is retried on a 2s/10s backoff at most
+ * twice before it counts as asked for good (a tombstone triggers at most
+ * three syncs), and a fresh serving period clears the bookkeeping.
  */
 async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator<unknown, void, undefined> {
   const { local, relay, signal, recordFailure, log, clock } = deps
@@ -1831,10 +1836,46 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
   let deferredSummarySync = false
   let summarySyncInFlight = false
   const announced = new Set<string>()
-  const asked = new Set<string>()
-  /** The ids the in-flight sync will mark asked on success — the triggering
-   * batches; a nudge landing mid-flight joins the same round. */
+  // T65-fix: the ask bookkeeping. `askAttempts` counts how many rounds have
+  // ASKED about an id; an id the server keeps NOT returning is retried on a
+  // growing backoff (2s, then 10s) up to `MAX_ASK_ATTEMPTS`, after which it
+  // lands in `askedForGood` and nudges stay quiet — a tombstone the server
+  // will never return therefore triggers at most three syncs, never an
+  // infinite re-pull (the T65 bug this bounds). A fresh serving period
+  // clears the bookkeeping, giving every id another chance.
+  const askAttempts = new Map<string, number>()
+  const askedForGood = new Set<string>()
+  const retryAt = new Map<string, number>()
+  const MAX_ASK_ATTEMPTS = 3
+  const ASK_RETRY_FIRST_MS = 2_000
+  const ASK_RETRY_SECOND_MS = 10_000
+  let retryTimer: unknown = undefined
+  /** T65-fix: batches that landed while a sync was in flight do NOT join
+   * that round — the round's list snapshot predates them, and marking their
+   * ids asked would silence exactly the rows it could not have served. They
+   * queue here and run as the NEXT round (whose snapshot is fresh), counted
+   * as that round's asked ids. */
+  let midFlightBatches: string[] = []
+  /** The ids the in-flight round asked (its triggering batches) — marked at
+   * completion, joined by nothing (mid-flight batches queue instead). */
   let askingNow: string[] = []
+  const scheduleRetry = (): void => {
+    if (retryTimer !== undefined || retryAt.size === 0) return
+    const earliest = Math.min(...retryAt.values())
+    retryTimer = clock.setTimeout(() => {
+      retryTimer = undefined
+      if (!alive) return
+      const nowMs = clock.now()
+      const due: string[] = []
+      for (const [id, at] of retryAt) {
+        if (at <= nowMs) {
+          retryAt.delete(id)
+          due.push(id)
+        }
+      }
+      if (due.length > 0) runSummarySync(due)
+    }, Math.max(0, earliest - clock.now()))
+  }
   const runSummarySync = (triggerIds: readonly string[] = []): void => {
     if (!alive) return
     if (!localOpened) {
@@ -1842,14 +1883,17 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
       return
     }
     if (summarySyncInFlight) {
-      // Same round: the in-flight success marks these asked too.
-      askingNow.push(...triggerIds)
+      // T65-fix: NOT the same round — the in-flight answer predates these
+      // ids, so marking them asked here would bury rows it could not serve.
+      // They queue and run as the next round once this one lands.
+      midFlightBatches.push(...triggerIds)
       return
     }
     const identity = relayIdentityOf(relay)
     if (identity === undefined || relay.state !== 'online') return
     summarySyncInFlight = true
     askingNow = [...triggerIds]
+    for (const id of askingNow) askAttempts.set(id, (askAttempts.get(id) ?? 0) + 1)
     // The wire shape is the host descriptor's, not the method's semantics:
     // `session/list` carries ONE strict parameter named `_request` (RT
     // dsh-api-session-controller lib/typert.remote-client.js:993-1003,
@@ -1860,32 +1904,55 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
       (value) => {
         summarySyncInFlight = false
         if (!alive) return
-        // Mark the round's asked ids BEFORE the row work: a tombstone-only
-        // trigger has no rows to push but must still stop nudging.
-        for (const id of askingNow) asked.add(id)
+        const round = askingNow
         askingNow = []
         const frames = sessionSummaryAddedFrames(value, identity.serverId)
+        const returned = new Set<string>()
         for (const frame of frames) {
           const row = (frame as { args: unknown[] }).args[0]
           const rowId = isPlainObject(row) && typeof row.sessionId === 'string' ? row.sessionId : undefined
           // Already announced: a second sync (a new nudge, a new serving
           // period) must not re-push the row — see the T65 note above.
-          if (rowId === undefined || announced.has(rowId)) continue
+          if (rowId === undefined) continue
+          returned.add(rowId)
+          if (announced.has(rowId)) continue
           announced.add(rowId)
           channel.push(frame)
         }
+        // T65-fix ask bookkeeping: a returned id is announced and done; an
+        // id the server did NOT return either exhausts its attempts or
+        // schedules one conservative retry (2s, then 10s).
+        for (const id of round) {
+          if (returned.has(id)) {
+            retryAt.delete(id)
+            continue
+          }
+          const attempts = askAttempts.get(id) ?? 0
+          if (attempts >= MAX_ASK_ATTEMPTS) askedForGood.add(id)
+          else retryAt.set(id, clock.now() + (attempts <= 1 ? ASK_RETRY_FIRST_MS : ASK_RETRY_SECOND_MS))
+        }
+        scheduleRetry()
+        // The mid-flight batches run as their own round against a fresh
+        // snapshot, counted as THAT round's asked ids (T65-fix).
+        const queued = midFlightBatches
+        midFlightBatches = []
+        if (queued.length > 0) runSummarySync(queued)
       },
       (error: unknown) => {
         summarySyncInFlight = false
+        // The queued batches are dropped with the failed round: their ids
+        // were never marked, so the next nudge (or serving period) retries.
+        midFlightBatches = []
+        askingNow = []
         recordFailure('session/list', error instanceof RelayError ? error.code : 'internal')
       },
     )
   }
-  /** T65: one forwarded batch lands on THIS stream. A batch whose ids are
-   * all announced-or-asked requests nothing; otherwise one sync covers the
-   * whole batch. */
+  /** T65-fix: one forwarded batch lands on THIS stream. A batch whose ids
+   * are all announced, exhausted, or already waiting on a scheduled retry
+   * requests nothing; otherwise one sync covers the whole batch. */
   const handleForwardedBatch = (ids: readonly string[]): void => {
-    if (!ids.some((id) => !announced.has(id) && !asked.has(id))) return
+    if (!ids.some((id) => !announced.has(id) && !askedForGood.has(id) && !retryAt.has(id))) return
     runSummarySync(ids)
   }
   const noteOnlineIdentity = (identity: MergerIdentity, firstOnline: boolean): void => {
@@ -1893,6 +1960,19 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
     if (!firstOnline && key === refreshKey) return
     refreshKey = key
     pushRefresh()
+    // T65-fix: a FRESH serving period resets the ask bookkeeping — the
+    // server was restarted (or the link re-established), its list may carry
+    // sessions the exhausted attempts had given up on, so every id gets
+    // another chance. The announce below covers the returned rows anyway.
+    if (firstOnline) {
+      askedForGood.clear()
+      askAttempts.clear()
+      retryAt.clear()
+      if (retryTimer !== undefined) {
+        clock.clearTimeout(retryTimer)
+        retryTimer = undefined
+      }
+    }
     // T63: a NEW serving period is the page-load hole closing — the UI's
     // one list pull already ran (relay offline), so announce the rows now.
     runSummarySync()
@@ -2102,6 +2182,7 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
     }
   } finally {
     alive = false
+    if (retryTimer !== undefined) clock.clearTimeout(retryTimer)
     offState()
     offSyncRequest()
     if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
