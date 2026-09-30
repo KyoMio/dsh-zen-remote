@@ -1,8 +1,9 @@
 # dsh-zen-remote — 静态挂载示例
 #
-# 不想走 `dsh plugin add` 的话，把下面这段抄进你 DSH profile 的
+# 不想走插件管理（「插件」页或 `dsh plugin --profile <name> add`）的话，
+# 把下面这段抄进你 DSH profile 的
 # cordis.patch.yml，并把 <ABSOLUTE_PATH> 换成本仓库的 clone 目录。
-# 走 `dsh plugin add` 的正常安装不需要这个文件——包自带的
+# 走插件管理的正常安装不需要这个文件——包自带的
 # cordis.patch.yml 挂的就是这一行。
 #
 # 2.0.0 起整包只有这一行 insert：主入口（lib/index.js）读行配置里的

@@ -73,11 +73,18 @@ What it can and cannot do: see [Features](#features) and [Known limitations](#kn
 
 ## Install
 
+**From the UI** (desktop app and web UI alike; the desktop app is how a 2.0 host actually runs): open the **Plugins** page in the sidebar → **Add plugin** → type `dsh-zen-remote` → click **Enable now** when the install finishes, then restart the desktop app (or `dsh web`).
+
+**Web service from the command line** (host on a headless `dsh web` box, also where phone access still points):
+
 ```sh
-dsh plugin add dsh-zen-remote
+dsh plugin --profile web add dsh-zen-remote
+# then restart dsh web
 ```
 
-**Desktop profile** (how a 2.0 host actually runs): add the dependency to `~/.dsh/profiles/desktop/package.json`, install, restart the desktop app:
+`dsh plugin` requires `--profile` to name the profile to install into and errors out without it. The desktop app's `desktop` profile is managed exclusively by the app — the CLI refuses `--profile desktop` — so on the desktop app use the UI above.
+
+**Editing the profile by hand** (local development, `link:` installs): add the dependency to the profile's `package.json` (`~/.dsh/profiles/desktop` for the desktop app, `~/.dsh/profiles/web` for the web service), install, restart:
 
 ```jsonc
 // ~/.dsh/profiles/desktop/package.json
@@ -90,21 +97,21 @@ dsh plugin add dsh-zen-remote
 
 ```sh
 cd ~/.dsh/profiles/desktop && pnpm install
-# then restart the DSH desktop app
+# then restart the DSH desktop app (or dsh web)
 ```
 
-**Web profile** (host on a headless `dsh web` box, also where phone access still points): same two steps against `~/.dsh/profiles/web/package.json`, then restart `dsh web`.
+`pnpm install` only installs the package; it does not switch it on. Turn it on in the **Plugins** page, or append `"dsh-zen-remote"` to the end of the `dsh.profile.bundles` array in the same file (leave the existing entries alone). The UI and `dsh plugin` write that entry for you; a hand edit has to add it itself.
 
 Either way there is exactly **one** bundle row to mount. Since 2.0.0 the composition layer is a single line — `dsh-zen-remote` — and the main entry loads the gateway and push sub-plugins itself, according to the role. Do **not** re-add the old `dsh-zen-remote-gateway` / `dsh-zen-remote-push` rows: the loader warns and skips them, and two gateway rows would mean two gateway processes fighting over port 3088.
 
 <details>
 <summary>Static mount / local development</summary>
 
-Copy [`cordis.patch.yml.example`](cordis.patch.yml.example) into your profile's `cordis.patch.yml` with an absolute path — it is the same single row, with an optional `config:` block showing the row fields. `dsh plugin add` users never need it.
+Copy [`cordis.patch.yml.example`](cordis.patch.yml.example) into your profile's `cordis.patch.yml` with an absolute path — it is the same single row, with an optional `config:` block showing the row fields. A normal install from the UI or with `dsh plugin` never needs it.
 
 </details>
 
-To uninstall: `dsh plugin remove dsh-zen-remote` (or delete the line from the profile's `dependencies` / `bundles`) and restart. To also wipe pairing and share state, delete `~/.dsh/lan-gate-state.json`, `~/.dsh/lan-gate.config.json`, `~/.dsh/zen-remote-shares.json` and `~/.dsh/zen-remote-server.json` (the server id — once it is gone, paired clients see a brand-new server).
+To uninstall: open dsh-zen-remote in the **Plugins** page and click **Uninstall**, then confirm; on the web service you can also run `dsh plugin --profile web remove dsh-zen-remote`; for a hand-edited install, delete it from the profile's `dependencies` and `dsh.profile.bundles`. Then restart. To also wipe pairing and share state, delete `~/.dsh/lan-gate-state.json`, `~/.dsh/lan-gate.config.json`, `~/.dsh/zen-remote-shares.json` and `~/.dsh/zen-remote-server.json` (the server id — once it is gone, paired clients see a brand-new server).
 
 ---
 

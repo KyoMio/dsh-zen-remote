@@ -4,7 +4,7 @@
 //   - secure remote access (first-visit approval, one-token-per-browser, rate limit)
 //   - PWA serving (/pwa/*) + mobile layout + touch gesture + offline + notifications
 //
-// Mount via cordis.patch.yml (see cordis.patch.yml.example) or `dsh plugin add`.
+// Not mounted as its own row: the main entry (src/index.ts) loads it for the host role.
 import { readFileConfig, resolveConfig } from './lib/config.js'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
