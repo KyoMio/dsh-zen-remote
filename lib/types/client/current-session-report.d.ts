@@ -16,6 +16,8 @@ export interface CurrentSessionReporterOptions {
     route?: string;
     /** The re-check interval; default 1000ms. */
     intervalMs?: number;
+    /** The unconditional re-send window (T66); default 30000ms. */
+    resendIntervalMs?: number;
 }
 /**
  * Start the reporter loop. Returns the disposer (listeners + interval) the

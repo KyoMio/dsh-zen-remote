@@ -51,7 +51,7 @@ test('T62 equals: content, not identity', async () => {
 // `roleAnswer` has NO destructuring default on purpose: `undefined` is a
 // real answer here (a failed probe), and a default would turn it into a
 // definite verdict.
-function makeEnv({ initial = '{}', roleAnswer, failFirst = false } = {}) {
+function makeEnv({ initial = '{}', roleAnswer, failFirst = false, resendIntervalMs } = {}) {
   const posted = []
   let storageValue = initial
   let fail = failFirst
@@ -72,6 +72,7 @@ function makeEnv({ initial = '{}', roleAnswer, failFirst = false } = {}) {
       },
       probeRole: async () => roleAnswer,
       intervalMs: 5,
+      ...(resendIntervalMs !== undefined ? { resendIntervalMs } : {}),
     })
   }
   env.load = load
@@ -149,5 +150,38 @@ test('T62 reporter: a non-client role never reports', async () => {
     assert.deepEqual(unknown.posted, [])
   } finally {
     unknown.stop()
+  }
+})
+
+test('T66 reporter: an unchanged value re-posts once per resend window; a change posts immediately', async () => {
+  const env = makeEnv({
+    initial: JSON.stringify({ sessionId: 'zr~721b94fb~s1' }),
+    roleAnswer: 'client',
+    resendIntervalMs: 50,
+  })
+  await env.load()
+  try {
+    // The page-load post lands at once; inside the window the unchanged
+    // value stays quiet.
+    await wait(20)
+    assert.equal(env.posted.length, 1, 'initial value, window still open')
+
+    // The window passes: the SAME value re-posts — the backend may have
+    // been reset underneath the page (a plugin row reload re-ran apply).
+    await wait(40)
+    assert.equal(env.posted.length, 2)
+    assert.deepEqual(env.posted[1].body, env.posted[0].body, 'the identical value, re-sent unconditionally')
+
+    // A CHANGE posts immediately, without waiting for a window.
+    env.setStorage(JSON.stringify({ sessionId: 'session-l2' }))
+    await wait(20)
+    assert.equal(env.posted.length, 3)
+    assert.deepEqual(env.posted[2].body, { sessionId: 'session-l2' })
+    // The window restarted with that post: the new value does not re-post
+    // inside it.
+    await wait(15)
+    assert.equal(env.posted.length, 3)
+  } finally {
+    env.stop()
   }
 })
