@@ -30,14 +30,23 @@ const PERM = `${ROW} > [class$="_tools"] > [class$="_modes"]`
 /**
  * ModelSelect's popup, wherever the host renders it: inline under the pill
  * (≤ 0.1.2) or portaled to document.body (0.1.5+: `createPortal(..., body)`,
- * id `${useId()}-menu`, role=menu — measured on 0.1.5-rc.2, the only body-
- * level menu that carries such an id; the Menu primitive's menus have none).
- * `:is()` takes the specificity of its heaviest argument, so the body form
- * inherits the long inline path's weight instead of needing its own.
- * The one place this cannot be used is the body:has() gate below — a
- * relative selector inside :has() cannot start at body — which spells both.
+ * id `${useId()}-menu` — the only body-level menu that carries such an id;
+ * the Menu primitive's menus have none). `:is()` takes the specificity of
+ * its heaviest argument, so the body form inherits the long inline path's
+ * weight instead of needing its own.
+ *
+ * T72: the portaled body form accepts BOTH roles. 0.1.5–rc.1 rendered the
+ * whole popup as one `role=menu`; rc.2 re-roles the portaled div by pane —
+ * `role=menu` on the root/effort pane, `role=group` on the model pane (the
+ * one with the search row and the `menuitemradio` options) — and only the
+ * `role=menu` spelling stopped matching there, dropping the bottom sheet on
+ * the second layer. The `[class$="_menu"]` narrowing (rc.1 `xevZdG_menu`,
+ * rc.2 `cl2Rlq_menu` — both end in `_menu`) keeps a hypothetical unrelated
+ * body-level `-menu` id from ever matching. The one place this cannot be
+ * used is the body:has() gate below — a relative selector inside :has()
+ * cannot start at body — which spells the body form out.
  */
-const MODEL_MENU = `:is(${MODEL} > [class$="_menu"], body > [id$="-menu"][role="menu"])`
+const MODEL_MENU = `:is(${MODEL} > [class$="_menu"], body > [id$="-menu"][class$="_menu"]:is([role="menu"], [role="group"]))`
 
 export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- */
 
@@ -457,7 +466,7 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      slot), so the adjacent-sibling combinator pins it precisely. */
   body:has(${PERM} [role="menu"]) [data-chat-flow] + div,
   body:has(${MODEL} > [class$="_menu"]) [data-chat-flow] + div,
-  body:has(> [id$="-menu"][role="menu"]) [data-chat-flow] + div,
+  body:has(> [id$="-menu"][class$="_menu"]:is([role="menu"], [role="group"])) [data-chat-flow] + div,
   /* T70: the portaled permission menu (marked by effects/permission-sheet.ts). */
   body:has(> div[role="menu"][data-zen-sheet="perm"]) [data-chat-flow] + div {
     display: none !important;
