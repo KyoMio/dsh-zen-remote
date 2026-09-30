@@ -26,7 +26,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission } from './admin-routes.js';
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js';
-import type { InterceptDiagnostics } from './intercept.js';
+import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js';
 import type { RelayClient } from './relay-client.js';
 /** Prefix all client routes live under (one webServer prefix registration). */
 export declare const CLIENT_ROUTE_PREFIX = "/_dsh/zen-remote/client";
@@ -48,6 +48,12 @@ export declare const CLIENT_REMOTE_STATUS_ROUTE = "/_dsh/zen-remote/client/remot
  * (T34) — the backend forwards the ORIGINAL id through the relay's
  * `POST relay/v1/unshare`, so the server closes it with reason `'client'`. */
 export declare const CLIENT_UNSHARE_ROUTE = "/_dsh/zen-remote/client/unshare";
+/** POST `{sessionId: string | null}`: the browser's report of which session
+ * the host UI currently has open (T62) — the intercept layer runs in this
+ * backend process and cannot read the browser's localStorage itself. `null`
+ * means a readable signal says nothing is open; the sink stores the value
+ * and re-judges the mergers immediately. */
+export declare const CLIENT_CURRENT_SESSION_ROUTE = "/_dsh/zen-remote/client/current-session";
 /** Prefix of the plain-HTTP relay routes (T41b):
  * `GET ${CLIENT_HTTP_ROUTE_PREFIX}<route>?<query>` relays one intercepted
  * `/api/<route>` call (the fetch wrapper's rewrites land here) to the
@@ -88,6 +94,13 @@ export interface ClientHandlerOptions {
      * a user. The remote-status route stays: the T34 client parts poll it on
      * whatever role this process runs. */
     remoteStatusOnly?: boolean;
+    /** T62: the sink for the browser's current-session reports — stores the
+     * latest value (memory, last write wins across windows) and makes the
+     * intercept re-judge at once. Wired only on the CLIENT mount; the HOST
+     * mount's remoteStatusOnly wall 404s the route before this matters, and
+     * a client handler WITHOUT the sink answers the same 404 (no sink, no
+     * route). */
+    onCurrentSession?: (read: CurrentSessionRead) => void;
 }
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 /**

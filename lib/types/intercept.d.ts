@@ -161,6 +161,31 @@ export declare const REMOTE_READ_METHODS: ReadonlySet<string>;
 /** Whether `endpoint` (a client-table method) is a remote WRITE: anything
  * the read whitelist does not name (T34-fix). */
 export declare function isRemoteWrite(endpoint: string): boolean;
+/**
+ * T58/T62: the vocabulary of the current-session signal. The value travels
+ * from the BROWSER — the only place the host's persisted selection
+ * (localStorage `dsh.sessions.current`) is readable — through the client
+ * route `current-session` into this process, because the intercept layer
+ * runs in the backend Node process (it wraps the typert gateway there) and
+ * cannot read the browser's storage itself (the T58 localStorage read was
+ * exactly that mistake: Node's global localStorage without a
+ * `--localstorage-file` never answers, so every read degraded to
+ * `unavailable` and tombstones never hid).
+ *
+ * - `unavailable`: no usable signal has arrived yet — the conservative
+ *   fallback keeps every tombstone;
+ * - `none`: a readable signal says no session is open;
+ * - `open`: this session's page is open (the raw id as the UI knows it — a
+ *   virtual id for a remote session, a local id otherwise).
+ */
+export type CurrentSessionRead = {
+    kind: 'unavailable';
+} | {
+    kind: 'none';
+} | {
+    kind: 'open';
+    sessionId: string;
+};
 /** One remote-call failure in the diagnostics ring. */
 export interface InterceptFailureRecord {
     /** ISO timestamp of the moment the failure was recorded. */
@@ -256,6 +281,14 @@ export interface InstallInterceptOptions {
      * the same real clock the relay client's ladder uses. Tests inject a
      * manual clock to drive the reopen delays without real waiting. */
     clock?: RelayClock;
+    /** The current-session signal, read live per use (T62): the browser half
+     * reports the host UI's open session through the client route
+     * (`current-session`) and the wiring holds the latest value here. The
+     * intercept runs in the BACKEND Node process — the browser's localStorage
+     * is not reachable from it, which is exactly what the T58 localStorage
+     * read got wrong — so the value must be carried in. Default: permanently
+     * `unavailable` (the conservative fallback — tombstones stay). */
+    getCurrentSession?: () => CurrentSessionRead;
 }
 export interface InterceptHandle {
     /** Remove both own properties, restoring exactly what was installed over
@@ -275,6 +308,11 @@ export interface InterceptHandle {
     /** Record the wiring's self-check verdict (and uninstall + log on
      * failure — the wiring owns that decision, this only records). */
     noteSelfCheck(result: SelfCheckResult): void;
+    /** T62: the browser just reported a new current-session value (the
+     * client route's sink calls this). Every live merged global stream
+     * re-judges NOW — the mergers dedupe no-change calls — instead of
+     * waiting for the next frame or the 1s fallback poll. */
+    currentSessionChanged(): void;
 }
 /** Rewrite one stream frame's session ids to virtual form. */
 export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown;
