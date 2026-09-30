@@ -30,6 +30,7 @@ import { SettingsSection } from './settings/SettingsSection.tsx'
 import { registerSettingsPage } from './settings/register-settings.ts'
 import { RemoteHeaderIcon } from './RemoteHeaderIcon.tsx'
 import { RemoteShareMenuItem } from './RemoteShareMenu.tsx'
+import { getSharesStore } from '../client-data/shares.ts'
 import { registerRemoteShareUi } from './remote-share-register.ts'
 import { RemoteStatusIcon } from './RemoteStatusIcon.tsx'
 import { RemoteComposerBanner } from './RemoteComposerBanner.tsx'
@@ -281,6 +282,10 @@ export function apply(ctx: ClientContext): void {
     // the info-sheet badges), see activityInject.
     inject: (_sessionId: SessionId) => ({
       ...activityInject(ctx),
+      // T67: the SAME page-wide shares store the header icon and the menu
+      // item read — the row subscribes only while the sheet is open, so no
+      // second poll loop and no phone-shell polling either.
+      shares: getSharesStore(),
       forkSession: (id: SessionId) => ctx.sessions.fork({ sessionId: id }),
       // 0.1.7: ctx.sessions.open is gone; uiWorkspace.openSession is the one
       // navigation entry (also what the official subagent catalog uses).
