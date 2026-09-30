@@ -793,6 +793,12 @@ test('T58 wiring: the current session is read from the persisted selection store
 })
 
 test('a server RENAME (same serverId) re-upserts under the new title without reopening the stream or removing anything', async () => {
+  // T59: this is also the shape the stream heartbeat's names arrive through —
+  // the relay client folds a ping's `serverName` into `handshakeInfo` and
+  // broadcasts the CURRENT state (`notify`, state unmoved), which is exactly
+  // what the `transition('online')` below simulates: an identity change with
+  // no state transition, re-titleing the groups via the existing
+  // retarget/onServerRenamed path, never a reopen.
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
   const relay = createControllableRelay()

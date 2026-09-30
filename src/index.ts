@@ -751,9 +751,18 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // client drops its pending reconnect wait and dials the new credentials
     // immediately. Failure to subscribe degrades to a warning — the ladder
     // and the per-request getters keep working without it.
+    // T59 rides the same announcement: the row's `serverName` is this
+    // device's name, and a user-committed change is FORWARDED to the
+    // gateway's device table — but only when it differs from the server's
+    // record (queueDeviceName's contract), which is what keeps the settings
+    // page's server-driven write from bouncing back and forth.
     ctx.effect(() => {
       try {
-        const off = ctx.on('loader/volatile-update', () => relayClient.credentialsChanged())
+        const off = ctx.on('loader/volatile-update', () => {
+          relayClient.credentialsChanged()
+          const name = unwrapVolatile(row.serverName)
+          if (typeof name === 'string' && name.trim() !== '') relayClient.queueDeviceName(name)
+        })
         return () => {
           off()
         }
@@ -762,6 +771,13 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         return () => {}
       }
     }, 'dsh-zen-remote: relay credentials watcher')
+    // T59: the name the row was LOADED with gets the same treatment once —
+    // a rename committed while offline (queued, then the process died)
+    // reaches the gateway on the first connect this way too.
+    {
+      const name = unwrapVolatile(row.serverName)
+      if (typeof name === 'string' && name.trim() !== '') relayClient.queueDeviceName(name)
+    }
     // One connection attempt at startup (T23a). Failures only log — the
     // status route surfaces the resulting state, and the client's own
     // backoff ladder (T43) takes over from the first failure. An unpaired

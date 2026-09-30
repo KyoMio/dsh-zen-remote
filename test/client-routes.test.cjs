@@ -568,7 +568,14 @@ test('status reads the volatile row PER REQUEST: a re-pair without re-apply is v
 
 // ---- T23a-fix: the status route over a relay client ----------------------------
 
-const INFO = (name) => ({ relayProtocol: 1, serverId: 'abcd1234', serverName: name, dshVersion: '2.0.0', fingerprints: {} })
+// T59: the handshake info may carry the device's own name (undefined from
+  // an older server — the status answer degrades it to '').
+  // eslint-disable-next-line no-unused-vars
+const INFO = (name, deviceName) => {
+  const info = { relayProtocol: 1, serverId: 'abcd1234', serverName: name, dshVersion: '2.0.0', fingerprints: {} }
+  if (deviceName !== undefined) info.deviceName = deviceName
+  return info
+}
 
 /** A relay-client stand-in with exactly the surface the status route reads
  * (state / handshakeInfo / lastHandshakeDigest / connect); every test wires
@@ -626,7 +633,7 @@ test('T23a-fix status: an online relay over UNCHANGED credentials answers state 
     const before = gwSeen.length
     const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
     assert.equal(res.status, 200)
-    assert.deepEqual(JSON.parse(res.body), { state: 'online', serverName: '书房服务器', serverUrl: gwUrl })
+    assert.deepEqual(JSON.parse(res.body), { state: 'online', serverName: '书房服务器', serverUrl: gwUrl, deviceName: '' }, 'no deviceName on the handshake → empty, nothing to follow')
     assert.equal(gwSeen.length, before, 'the cached verdict short-circuits — nothing left the box')
     assert.equal(relay.connectCount, 0, 'no live connect either')
   } finally {
@@ -705,7 +712,7 @@ test('T23a-fix status: a relay that never connected gets a live connect on the s
   const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
   try {
     const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(body, { state: 'online', serverName: '现场握手', serverUrl: gwUrl })
+    assert.deepEqual(body, { state: 'online', serverName: '现场握手', serverUrl: gwUrl, deviceName: '' })
     assert.equal(relay.connectCount, 1)
   } finally {
     await closeServer(server)
@@ -916,8 +923,8 @@ test('T23a-fix2 status: a second status during an unsettled connect joins it —
       request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE }),
       request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE }),
     ])
-    assert.deepEqual(JSON.parse(first.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl })
-    assert.deepEqual(JSON.parse(second.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl })
+    assert.deepEqual(JSON.parse(first.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl, deviceName: '' })
+    assert.deepEqual(JSON.parse(second.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl, deviceName: '' })
     assert.equal(relay.connectCount, 1, 'the second status joined the in-flight connect')
   } finally {
     await closeServer(server)
@@ -945,7 +952,7 @@ test('T23a-fix2 status: a changed ADDRESS (token unchanged) never serves the cac
   const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
   try {
     const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(body, { state: 'online', serverName: '新地址的名字', serverUrl: newUrl }, 'the fresh connect answers, never the stale cache')
+    assert.deepEqual(body, { state: 'online', serverName: '新地址的名字', serverUrl: newUrl, deviceName: '' }, 'the fresh connect answers, never the stale cache')
     assert.equal(relay.connectCount, 1, 'the digest mismatch forced a live connect')
   } finally {
     await closeServer(server)
@@ -1403,5 +1410,38 @@ test('T41b-fix http: only application/json keeps its content type; anything else
     assert.equal(res.headers['content-type'], 'text/plain; charset=utf-8')
   } finally {
     await closeServer(third.server)
+  }
+})
+
+test('T59 status: the device\'s own name rides the online answer from the handshake record', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('书房服务器', '书房的台式机'),
+    lastHandshakeDigest: relayCredentialsDigest(gwUrl, 'tok-row'),
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'online')
+    assert.equal(body.deviceName, '书房的台式机', 'the SERVER\'s record of this device — what the settings page follows')
+
+    // The fresh-connect path answers it too.
+    const relay2 = fakeRelay({
+      state: 'offline',
+      lastHandshakeDigest: 'stale',
+      digest: relayCredentialsDigest(gwUrl, 'tok-row'),
+      connectResult: INFO('书房服务器', '重连后的名字'),
+    })
+    const { server: server2, port: port2 } = await startClientServer(row, { getRelayClient: () => relay2 })
+    try {
+      const again = JSON.parse((await request(port2, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+      assert.equal(again.state, 'online')
+      assert.equal(again.deviceName, '重连后的名字')
+    } finally {
+      await closeServer(server2)
+    }
+  } finally {
+    await closeServer(server)
   }
 })

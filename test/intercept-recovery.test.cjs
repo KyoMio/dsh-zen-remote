@@ -147,7 +147,9 @@ async function waitFor(predicate, ms = 4000) {
 async function boot(t) {
   const relay = await createRelayServer()
   const clock = fakeClock()
-  const client = createRelayClient({ getServerUrl: () => relay.url, getToken: () => 'token-1', clock })
+  // T59: the periodic info refresh would arm a second fake-clock timer on
+  // `online`, and these tests count timers (`clock.pending`) — off here.
+  const client = createRelayClient({ getServerUrl: () => relay.url, getToken: () => 'token-1', clock, infoRefreshMs: 0 })
   await client.connect()
   assert.equal(client.state, 'online')
 
@@ -287,7 +289,8 @@ const EVENTS_WATERFALL = {
 async function bootEvents(t) {
   const relay = await createRelayServer()
   const clock = fakeClock()
-  const client = createRelayClient({ getServerUrl: () => relay.url, getToken: () => 'token-1', clock })
+  // T59: no periodic info refresh — these tests count fake-clock timers.
+  const client = createRelayClient({ getServerUrl: () => relay.url, getToken: () => 'token-1', clock, infoRefreshMs: 0 })
   await client.connect()
   assert.equal(client.state, 'online')
 
