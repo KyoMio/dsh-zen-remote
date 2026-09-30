@@ -34,6 +34,7 @@ import { registerRemoteShareUi } from './remote-share-register.ts'
 import { RemoteStatusIcon } from './RemoteStatusIcon.tsx'
 import { RemoteComposerBanner } from './RemoteComposerBanner.tsx'
 import { registerRemoteStatusUi } from './remote-status-register.ts'
+import { mountCurrentSessionReporter } from './current-session-report.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
 
@@ -124,6 +125,12 @@ export function apply(ctx: ClientContext): void {
   // （remote-status.ts 的 subscribeIfVirtual）——本地会话不建立订阅，
   // store 只在有订阅者时才轮询，主服务端的页面不白发 remote-status 请求。
   registerRemoteStatusUi(ctx, RemoteStatusIcon, RemoteComposerBanner)
+  // T62 当前会话信号的上报：拦截层跑在后台 Node 进程里，读不到浏览器的
+  // localStorage——由这里（唯一读得到宿主选择存储的地方）把「当前打开的
+  // 会话」在值变化时 POST 给后台路由。同样在桌面门之前挂载：client 角色
+  // 的桌面端 App 正是远程会话所在；只在探测出的子客户端角色下运行，主
+  // 服务端的页面探测一次后就静默。
+  mountCurrentSessionReporter(ctx)
   // T41b 的两个远程会话部件：fetch 改写（改动 / diff 面板的两条 /api GET）与
   // 远程会话标记（data-zr-remote-session + 隐藏「在服务端机器上打开」类入口
   // 的样式）。同样必须在桌面门之前注册——桌面窗口也可以是配对好的子客户端，
