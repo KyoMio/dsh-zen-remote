@@ -1836,7 +1836,13 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
     const identity = relayIdentityOf(relay)
     if (identity === undefined || relay.state !== 'online') return
     summarySyncInFlight = true
-    void relay.invoke('session', 'list', {}, undefined).then(
+    // The wire shape is the host descriptor's, not the method's semantics:
+    // `session/list` carries ONE strict parameter named `_request` (RT
+    // dsh-api-session-controller lib/typert.remote-client.js:993-1003,
+    // SessionListRequest = {cursor?}) — a bare {} answers
+    // `gateway/arguments-invalid` (T63-fix; the fake relay in the tests
+    // accepts anything, which is how this shipped).
+    void relay.invoke('session', 'list', { _request: {} }, undefined).then(
       (value) => {
         summarySyncInFlight = false
         if (!alive) return
