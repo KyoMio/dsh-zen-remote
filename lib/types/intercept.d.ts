@@ -359,22 +359,26 @@ export declare function rewriteRemoteEventFrame(frame: unknown, serverId: string
  * `api-session/added` emit per row); the workspace route produces the
  * mid-page nudges (a forwarded frame carrying a session id no sync has
  * announced yet).
+ *
+ * T65: the hub is pure broadcast. The announced/asked bookkeeping lives in
+ * EACH merged `$events` stream (a new page's stream starts with empty sets,
+ * so its first online sync is never skipped by the previous page's
+ * knowledge), and a forwarded batch reaches EVERY live stream — a page
+ * refresh's old and new generations each judge for themselves.
  */
 export interface SessionSummarySync {
     /** The workspace route reports the virtual session ids one forwarded frame
-     * batch carried. Ids already announced by a successful sync are ignored; a
-     * batch with any unannounced id requests one sync. */
+     * batch carried. Broadcast to every live $events stream; each judges its
+     * own announced/asked sets (T65). */
     noteForwardedSessionIds(ids: readonly string[]): void;
-    /** A successful sync marks every served row announced, so a static remote
-     * stops nudging. */
-    noteAnnouncedSessionIds(ids: readonly string[]): void;
-    /** Subscribe the "a sync is requested" callback; the latest subscriber
-     * wins (an older $events generation's disposer must not detach the newer
-     * one). Returns the disposer. */
-    onSyncRequested(fn: () => void): () => void;
-    /** Whether a sync was requested while no listener was subscribed (a nudge
-     * before the $events stream opened) — consumed on read. */
-    consumePendingRequest(): boolean;
+    /** Subscribe to every forwarded batch. All live subscribers get the
+     * broadcast (T65 — the old latest-subscriber-wins shape starved the older
+     * stream of mid-page nudges); a disposer removes only its own listener. */
+    onForwardedSessionIds(fn: (ids: readonly string[]) => void): () => void;
+    /** The most recent forwarded batch's ids, when one arrived since the last
+     * consume — the catch-up for a nudge that landed before the $events
+     * stream opened. Consumed on read. */
+    consumePendingRequest(): readonly string[];
 }
 /**
  * Install the two own-property wrappers on the raw gateway. Assumes
