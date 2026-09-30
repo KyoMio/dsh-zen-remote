@@ -50,7 +50,7 @@ import type { AdminAdmission } from './admin-routes.js'
 import { startRestartWatcher } from './restart-watcher.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 import { createShareStore } from './share-store.js'
-import { createRelayClient, RelayError } from './relay-client.js'
+import { createRelayClient, RelayError, volatileUpdateTouchesServerName } from './relay-client.js'
 import type { RelayClient } from './relay-client.js'
 import { computeFingerprints } from './fingerprint.js'
 import { runSelfCheck, installIntercept } from './intercept.js'
@@ -751,15 +751,25 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // client drops its pending reconnect wait and dials the new credentials
     // immediately. Failure to subscribe degrades to a warning — the ladder
     // and the per-request getters keep working without it.
-    // T59 rides the same announcement: the row's `serverName` is this
-    // device's name, and a user-committed change is FORWARDED to the
-    // gateway's device table — but only when it differs from the server's
-    // record (queueDeviceName's contract), which is what keeps the settings
-    // page's server-driven write from bouncing back and forth.
+    // T59 rides the same announcement, and ONLY that announcement (T59-fix):
+    // the row's `serverName` is this device's name, and a USER-committed
+    // change is forwarded to the gateway's device table — but the event
+    // fires for EVERY volatile commit (an unrelated knob, or the settings
+    // page's own server-driven follow write arriving at startup), so the
+    // listener filters on the changed paths. A push fires only when
+    // `serverName` itself moved and differs from the server's record
+    // (queueDeviceName's contract) — which is what keeps the follow write
+    // from bouncing back and forth. NOT pushed at startup either: the row's
+    // loaded name is stale by definition (the server's table may have been
+    // edited while we were gone) and an unconditional boot-time push would
+    // overwrite an administrator's rename. A rename committed offline and
+    // lost to a process exit therefore stays local until the user edits it
+    // again — accepted; the server's record wins by default.
     ctx.effect(() => {
       try {
-        const off = ctx.on('loader/volatile-update', () => {
+        const off = ctx.on('loader/volatile-update', (paths) => {
           relayClient.credentialsChanged()
+          if (!volatileUpdateTouchesServerName(paths)) return
           const name = unwrapVolatile(row.serverName)
           if (typeof name === 'string' && name.trim() !== '') relayClient.queueDeviceName(name)
         })
@@ -771,13 +781,6 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         return () => {}
       }
     }, 'dsh-zen-remote: relay credentials watcher')
-    // T59: the name the row was LOADED with gets the same treatment once —
-    // a rename committed while offline (queued, then the process died)
-    // reaches the gateway on the first connect this way too.
-    {
-      const name = unwrapVolatile(row.serverName)
-      if (typeof name === 'string' && name.trim() !== '') relayClient.queueDeviceName(name)
-    }
     // One connection attempt at startup (T23a). Failures only log — the
     // status route surfaces the resulting state, and the client's own
     // backoff ladder (T43) takes over from the first failure. An unpaired

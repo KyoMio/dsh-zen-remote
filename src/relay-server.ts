@@ -662,6 +662,25 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   const parentOf = options.parentOf ?? (() => undefined)
   const isAccessible = (sessionId: string): boolean => store.isAccessible(sessionId, parentOf)
 
+  /**
+   * The server display name as of the last second (T59-fix): every stream's
+   * heartbeat reads it per ping, and a deployment whose `serverName()`
+   * callback re-reads the row's configuration would otherwise do so per
+   * STREAM per tick — all streams share this one value instead, refreshed
+   * at most once a second (a 15s heartbeat still reads a fresh name every
+   * round; the handshake route keeps reading the callback directly).
+   */
+  let cachedServerName: string | undefined
+  let cachedServerNameAt = 0
+  const currentServerName = (): string => {
+    const now = Date.now()
+    if (cachedServerName === undefined || now - cachedServerNameAt >= 1_000) {
+      cachedServerName = serverInfo.serverName()
+      cachedServerNameAt = now
+    }
+    return cachedServerName
+  }
+
   /** Session-scoped streams currently open, per session (cross-device). */
   const viewers = new Map<string, number>()
 
@@ -1584,7 +1603,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             const deviceName = deviceNames.get(device)
             const line = JSON.stringify({
               type: 'ping',
-              serverName: serverInfo.serverName(),
+              serverName: currentServerName(),
               ...(deviceName !== undefined ? { deviceName } : {}),
             })
             res.write(Buffer.from(`${line}\n`, 'utf8'))
