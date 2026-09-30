@@ -128,6 +128,12 @@ export const DEVICE_TOKEN_FIELD = 'deviceToken'
  * servers answer neither.
  */
 export interface ClientStatusBody {
+  /** The probe vocabulary (`connected` / `unreachable` / `revoked` /
+   * `unexpected`), the row's two own answers (`unpaired` / `invalid-url`),
+   * the relay verdicts (`revoked` / `incompatible`) — and, since the
+   * relay-wired route reports the relay client's own state verbatim, the
+   * `online` / `offline` words too ({@link deriveClientStatusView} maps
+   * them; T55). */
   state?: string
   serverUrl?: string
   serverName?: unknown
@@ -188,6 +194,15 @@ export interface ClientConnectionView {
 }
 
 const CLIENT_STATES: readonly ClientConnectionView['state'][] = ['unpaired', 'connected', 'revoked', 'unreachable', 'unexpected', 'invalid-url', 'incompatible']
+
+/** Wire `state` words the status route can answer that are NOT the view
+ * vocabulary (T55): the relay client's `online` is the page's `connected`,
+ * and its `offline` is the probe vocabulary's `unreachable` — the offline
+ * line, whose countdown the body's `nextRetryAt` backs when present. */
+const WIRE_STATE_ALIASES: Readonly<Record<string, ClientConnectionView['state']>> = {
+  online: 'connected',
+  offline: 'unreachable',
+}
 
 /** At most `cap` strings out of an array-shaped value; anything else is none. */
 function stringListOf(value: unknown, cap: number): string[] {
@@ -253,9 +268,19 @@ function deriveCompatView(value: unknown): ClientCompatView | undefined {
  */
 export function deriveClientStatusView(body: ClientStatusBody): ClientConnectionView {
   const safe = body !== null && typeof body === 'object' ? body : {}
-  const state = CLIENT_STATES.includes(safe.state as ClientConnectionView['state'])
-    ? safe.state as ClientConnectionView['state']
-    : 'unpaired'
+  // T55: the route answers TWO vocabularies. The probe fallback speaks the
+  // view's own words (connected / unreachable / …, ProbeState), but the
+  // relay-wired route reports the RELAY client's state — `online` verbatim
+  // (client-routes.ts sends `state: relay.state` on the cached-verdict and
+  // fresh-connect paths) — which the view never listed, so a PAIRED, CONNECTED
+  // client fell through the unknown-state bucket into "未配对" while the
+  // diagnostics below it showed live relay calls. `offline` rides the same
+  // mapping to the probe word for it; anything else unknown still degrades
+  // to `unpaired`.
+  const rawState = typeof safe.state === 'string' ? safe.state : ''
+  const state = CLIENT_STATES.includes(rawState as ClientConnectionView['state'])
+    ? rawState as ClientConnectionView['state']
+    : WIRE_STATE_ALIASES[rawState] ?? 'unpaired'
   const nextRetryAt = typeof safe.nextRetryAt === 'number' && Number.isFinite(safe.nextRetryAt)
     ? safe.nextRetryAt
     : undefined
@@ -864,7 +889,8 @@ export class ZenRemoteSettingsForm {
   private readonly secretConfigured: () => boolean
   /** Effective values from `admin/status`'s `config.values` — what a field
    * displays while the row layer does not carry it. Empty until the page's
-   * first status load feeds it via {@link setBaseline}. */
+   * first status load feeds it via {@link setBaseline}. Consulted only while
+   * the page is NOT a client page (T55): see {@link displayValue}. */
   private baseline: Record<string, unknown> = {}
   /** The effective role the page probed from the client-config route (T17):
    * the fallback for {@link savedRoleIsClient} / {@link statusPoll} when the
@@ -1038,7 +1064,9 @@ export class ZenRemoteSettingsForm {
   /**
    * Feed the effective values (`admin/status`'s `config.values`) the fields
    * display while the row layer does not carry them; also the baseline the
-   * "did the user change anything" comparison reads.
+   * "did the user change anything" comparison reads. The page clears it
+   * (`undefined`) whenever the poll source is not the admin one (T55): a
+   * stale host baseline must not survive a role switch on a client page.
    */
   setBaseline(values: unknown): void {
     this.baseline = asRecord(values)
@@ -1147,13 +1175,26 @@ export class ZenRemoteSettingsForm {
    * the first status load the stored raw value stands in, and otherwise the
    * shared form's own effective layer does, so drafts behave sensibly even
    * with no admin/status yet.
+   *
+   * T55: the admin/status baseline counts only while the page is not a CLIENT
+   * page. A role switch leaves the host page's kept status load (and with it
+   * the last-fed baseline) in place forever — a client page never refreshes
+   * admin/status again — so reading the baseline there would pin every field,
+   * the role dropdown included, to the old role. Under a client poll the
+   * fields fall back to the row's stored values (the page stops feeding the
+   * baseline too, {@link setBaseline}).
    */
   private displayValue(field: string): unknown {
-    if (this.lockedFields.has(field)) return this.baseline[field]
+    const staleAdmin = this.statusPoll() === 'client'
+    if (this.lockedFields.has(field)) {
+      // Lock sets only ever arrive from an admin/status load; while a stale
+      // set lingers after a switch, the row document stands in.
+      return staleAdmin ? this.scope.getSnapshot().value?.[field] : this.baseline[field]
+    }
     const user = asRecord(this.scope.getSnapshot().user)
     const rowStored = Object.hasOwn(user, field)
     if (rowStored && this.rowInvalidFields.has(field)) return user[field]
-    if (Object.hasOwn(this.baseline, field)) return this.baseline[field]
+    if (!staleAdmin && Object.hasOwn(this.baseline, field)) return this.baseline[field]
     if (rowStored) return user[field]
     return this.scope.getSnapshot().value?.[field]
   }
