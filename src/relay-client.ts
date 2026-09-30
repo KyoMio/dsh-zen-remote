@@ -60,6 +60,8 @@ const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
 const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 const HTTP_PATH = '/_dsh/zen-remote/relay/v1/http'
 const UPLOAD_PATH = '/_dsh/zen-remote/relay/v1/upload'
+/** T59: a desktop-client device renaming ITSELF in the gateway's table. */
+const DEVICE_NAME_PATH = '/_dsh/zen-remote/relay/v1/device/name'
 
 /** How long a stream may stay line-silent before it is judged dead. */
 const DEFAULT_IDLE_TIMEOUT_MS = 45_000
@@ -80,6 +82,18 @@ const INVOKE_TIMEOUT_PER_MIB_MS = 2_000
 const INVOKE_TIMEOUT_CAP_MS = 300_000
 
 /**
+ * How often an ONLINE client re-runs the handshake purely to refresh the two
+ * names (T59): the server's display name and this device's name in its
+ * table. The stream heartbeat covers the server name mid-stream, but a
+ * device-side rename (an admin edit in the gateway's list) only reaches the
+ * server→client direction when THIS side sends a request — the handshake's
+ * marking header is always the gateway's freshest record. Deliberately quiet:
+ * a failed refresh changes nothing (the heartbeat/idle clocks judge the
+ * link), and the state never leaves `online`.
+ */
+const INFO_REFRESH_MS = 30_000
+
+/**
  * The budget one size-backed exchange gets (invoke since T31-fix, upload
  * since T51): whole MiB only (floored), so a small call keeps the plain
  * base budget. The upload's size is the DECLARED `Content-Length` of the
@@ -96,6 +110,12 @@ function sizeBackedTimeoutMs(requestTimeoutMs: number, bytes: number | undefined
 /** The budget one invoke exchange gets, from its serialized body size. */
 function invokeTimeoutMs(requestTimeoutMs: number, bodyJson: string): number {
   return sizeBackedTimeoutMs(requestTimeoutMs, Buffer.byteLength(bodyJson, 'utf8'))
+}
+
+/** 0 or less disables the periodic refresh entirely (tests that count
+ * handshakes inject 0; the T59 refresh test injects the real cadence). */
+function infoRefreshDelay(options: CreateRelayClientOptions): number {
+  return options.infoRefreshMs ?? INFO_REFRESH_MS
 }
 
 /**
@@ -152,6 +172,13 @@ export interface RelayHandshake {
   serverName: string
   dshVersion: string
   fingerprints: Record<string, string>
+  /**
+   * The SERVER's record of THIS device's name (T59) — what the pairing
+   * registered and renames have since made of it. `undefined` from an older
+   * server that does not send the field; the client then keeps whatever it
+   * has and pushes nothing.
+   */
+  deviceName?: string
 }
 
 /**
@@ -198,6 +225,13 @@ export interface CreateRelayClientOptions {
   /** Clock/timers/jitter for the reconnect backoff; defaults to the real
    * ones (timers `unref()`ed). Tests inject a manual clock. */
   clock?: RelayClock
+  /**
+   * How often an ONLINE client re-runs the handshake to refresh the two
+   * names (T59, {@link INFO_REFRESH_MS}); `0` disables the periodic refresh
+   * — handshake-counting tests inject 0, the refresh test injects a cadence
+   * its fake clock can drive.
+   */
+  infoRefreshMs?: number
   /** This side's own interface fingerprints (T42), computed after each
    * completed handshake and compared group by group against the handshake's
    * map. May be sync or async; a throw counts as "nothing computed" (an
@@ -231,8 +265,17 @@ export interface RelayClient {
    * revoked, credentialsChanged) — it describes the credentials it was
    * earned with, never the current ones. */
   readonly compat: RelayCompatVerdict | undefined
-  /** Observe state changes; a throwing listener never blocks the others. */
+  /** Observe state changes; a throwing listener never blocks the others.
+   * The CURRENT state is also broadcast when only the handshake identity
+   * moved (the T59 heartbeat names) — listeners re-read the getters. */
   subscribe(listener: (state: RelayState) => void): () => void
+  /** The row's `serverName` was just committed (T59): forward it to the
+   * gateway's device table when it differs from the server's record —
+   * immediately while online, queued for the next `online` otherwise. A
+   * name equal to the server's record is a no-op BY CONTRACT: that is the
+   * settings page's server-driven write echoing back, and pushing it would
+   * set the two ends overwriting each other. */
+  queueDeviceName(name: string): void
   /** Run the handshake; success resolves with it and leaves `online`. */
   connect(): Promise<RelayHandshake>
   /** One immediate connection attempt from `offline`, resetting the backoff
@@ -354,6 +397,12 @@ type LineVerdict =
   | { kind: 'frame'; frame: unknown }
   | { kind: 'end' }
   | { kind: 'error'; error: RelayError }
+  | { kind: 'info'; serverName?: string; deviceName?: string }
+
+/** A string field of an info line, or undefined — absent, blank or not a string. */
+function infoString(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
 
 function classifyLine(line: string): LineVerdict {
   let parsed: unknown
@@ -375,7 +424,15 @@ function classifyLine(line: string): LineVerdict {
     const reason = typeof detail.reason === 'string' ? detail.reason : undefined
     return { kind: 'error', error: new RelayError(code, message, undefined, reason) }
   }
-  // `ping` and any shape the protocol does not define — ignored.
+  // T59: a ping may carry the names as of NOW (`serverName` — the server's
+  // display name; `deviceName` — this device's name in its table). An old
+  // server's bare `{"type":"ping"}` carries neither and stays `none`.
+  if (parsed.type === 'ping') {
+    const serverName = infoString(parsed.serverName)
+    const deviceName = infoString(parsed.deviceName)
+    if (serverName !== undefined || deviceName !== undefined) return { kind: 'info', serverName, deviceName }
+  }
+  // Any shape the protocol does not define — ignored.
   return { kind: 'none' }
 }
 
@@ -433,7 +490,16 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // never reconnect and drop any pending wait; an attempt start leaves the
     // ladder alone but the wait display is fireRetry's business.
     if (next === 'offline') scheduleRetry()
-    else if (next === 'online') resetRetry()
+    else if (next === 'online') {
+      resetRetry()
+      // T59: a server confirmation retires the local push authority (the
+      // handshake/stream/invoke that just landed saw the table as it is),
+      // the periodic name refresh arms, and a rename queued while offline
+      // goes out now.
+      deviceNameAuthoritative = false
+      armInfoRefresh()
+      flushPendingDeviceName()
+    }
     else if (next === 'unpaired' || next === 'revoked' || next === 'incompatible') cancelRetry()
     // A compat verdict describes the server the CURRENT credentials pointed
     // at. Unpairing (or a revocation — the same "this server is gone" wall)
@@ -531,6 +597,200 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     return () => {
       listeners.delete(listener)
     }
+  }
+
+  // ---- the T59 device-name sync ----------------------------------------------
+
+  /**
+   * True while THIS side's `deviceName` is the authority: a rename this
+   * client pushed that the gateway just answered OK to. In-flight stream
+   * heartbeats still carry the OLD name (their marking header was written
+   * when the stream opened), and without this flag those pings would pull
+   * `handshakeInfo` back to the stale name — and the settings page would
+   * then "follow" it straight over the user's fresh save. The next server
+   * confirmation (handshake or refresh) retires the flag: the answer there
+   * IS the table's current record.
+   */
+  let deviceNameAuthoritative = false
+
+  /** A rename waiting for the link: queued while offline (or before the
+   * first handshake), flushed once `online` lands. */
+  let pendingDeviceName: string | undefined
+
+  /** The periodic info-refresh's armed timer (see {@link INFO_REFRESH_MS}). */
+  let infoTimer: unknown | undefined
+
+  /** Fold one heartbeat's names into the stored handshake (T59). */
+  function applyInfoDelta(serverName: string | undefined, deviceName: string | undefined): void {
+    if (handshakeInfo === undefined) return
+    const next = { ...handshakeInfo }
+    let changed = false
+    if (serverName !== undefined && serverName !== next.serverName) {
+      next.serverName = serverName
+      changed = true
+    }
+    // A locally-pushed rename outranks the stream heartbeat until the server
+    // confirms it — see {@link deviceNameAuthoritative}.
+    if (deviceName !== undefined && deviceName !== next.deviceName && !deviceNameAuthoritative) {
+      next.deviceName = deviceName
+      changed = true
+    }
+    if (!changed) return
+    handshakeInfo = next
+    // The state itself did not move, but the identity did: subscribers (the
+    // interceptor's rename path above all) must see the new names. The
+    // current-state broadcast is exactly that — no reconnect can come from
+    // it, because only setState moves the machine.
+    notify()
+  }
+
+  /**
+   * Push one name to the gateway's `device/name` endpoint (T59): the gateway
+   * renames the CALLING device's own record. Resolves `true` when the table
+   * now carries `name` (the push answered OK) or when no push was needed;
+   * a failed push queues the name for the next `online` and resolves false.
+   * Never touches the connection state — a refused rename is not a dead
+   * link.
+   */
+  async function pushDeviceName(name: string): Promise<boolean> {
+    const creds = currentCredentials()
+    if (creds === undefined) {
+      pendingDeviceName = name
+      return false
+    }
+    let payload: unknown
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
+      if (typeof timer.unref === 'function') timer.unref()
+      try {
+        const response = await fetchImpl(`${creds.url}${DEVICE_NAME_PATH}`, {
+          ...requestInit(creds.token, JSON.stringify({ name })),
+          signal: controller.signal,
+        })
+        if (response.ok) payload = await readPayload(response)
+      } finally {
+        clearTimeout(timer)
+      }
+    } catch {
+      payload = undefined
+    }
+    const confirmed = isRecord(payload) && payload.ok === true && infoString(payload.name) === name
+    if (!confirmed) {
+      pendingDeviceName = name
+      return false
+    }
+    // The table took the new name: remember it locally (without a state
+    // announcement — nothing but the name moved) and mark it authoritative
+    // until the server's own answer says the same.
+    if (handshakeInfo !== undefined && handshakeInfo.deviceName !== name) {
+      handshakeInfo = { ...handshakeInfo, deviceName: name }
+    }
+    deviceNameAuthoritative = true
+    pendingDeviceName = undefined
+    return true
+  }
+
+  /** Flush a queued rename against the fresh online state (T59). */
+  function flushPendingDeviceName(): void {
+    if (pendingDeviceName === undefined) return
+    const name = pendingDeviceName
+    pendingDeviceName = undefined
+    if (handshakeInfo === undefined) {
+      pendingDeviceName = name
+      return
+    }
+    if (name === (handshakeInfo.deviceName ?? '')) return
+    void pushDeviceName(name)
+  }
+
+  /**
+   * The backend's one entry point (T59): the row's `serverName` was just
+   * committed. Online with a handshake, the name travels to the gateway only
+   * when it DIFFERS from the server's record — the settings page's
+   * server-driven write lands here with both sides equal, which is exactly
+   * what keeps the two ends from overwriting each other. Offline (or not yet
+   * handshaken), the name queues for the next `online`.
+   */
+  function queueDeviceName(name: string): void {
+    const trimmed = name.trim()
+    if (trimmed === '') return
+    if (state !== 'online' || handshakeInfo === undefined) {
+      pendingDeviceName = trimmed
+      return
+    }
+    if (trimmed === (handshakeInfo.deviceName ?? '')) {
+      pendingDeviceName = undefined
+      return
+    }
+    void pushDeviceName(trimmed)
+  }
+
+  /**
+   * One QUIET handshake re-run (T59): refreshes the two names while online —
+   * no state announcement, no ladder movement, failures silent (the next
+   * tick retries; the idle and heartbeat clocks own the link's verdict).
+   * The reply carries the gateway's freshest record of BOTH names (its
+   * marking headers are written per forward), so this is also how a rename
+   * an admin made on the server reaches an otherwise-idle client.
+   */
+  async function refreshInfo(): Promise<void> {
+    if (stopped || state !== 'online' || connectInFlight !== undefined) return
+    const creds = currentCredentials()
+    if (creds === undefined) return
+    let payload: unknown
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
+      if (typeof timer.unref === 'function') timer.unref()
+      try {
+        const response = await fetchImpl(`${creds.url}${HANDSHAKE_PATH}`, {
+          ...requestInit(creds.token, '{}'),
+          signal: controller.signal,
+        })
+        if (!response.ok) return
+        payload = await readPayload(response)
+      } finally {
+        clearTimeout(timer)
+      }
+    } catch {
+      return
+    }
+    if (!isRecord(payload) || payload.ok !== true || payload.relayProtocol !== RELAY_PROTOCOL) return
+    const next: RelayHandshake = {
+      relayProtocol: RELAY_PROTOCOL,
+      serverId: typeof payload.serverId === 'string' ? payload.serverId : '',
+      serverName: typeof payload.serverName === 'string' ? payload.serverName : '',
+      dshVersion: typeof payload.dshVersion === 'string' ? payload.dshVersion : '',
+      fingerprints: isRecord(payload.fingerprints) ? (payload.fingerprints as Record<string, string>) : {},
+      ...(infoString(payload.deviceName) !== undefined ? { deviceName: infoString(payload.deviceName) } : {}),
+    }
+    // The answer IS the table's current record: the local push authority
+    // retires here, whatever it said.
+    deviceNameAuthoritative = false
+    const previous = handshakeInfo
+    if (
+      previous === undefined ||
+      previous.serverId !== next.serverId ||
+      previous.serverName !== next.serverName ||
+      previous.dshVersion !== next.dshVersion ||
+      previous.deviceName !== next.deviceName
+    ) {
+      handshakeInfo = next
+      notify()
+    }
+  }
+
+  /** Arm one refresh tick; re-arms itself while the client stays online. */
+  function armInfoRefresh(): void {
+    const delay = infoRefreshDelay(options)
+    if (delay <= 0 || infoTimer !== undefined || stopped) return
+    infoTimer = clock.setTimeout(() => {
+      infoTimer = undefined
+      void refreshInfo().then(() => {
+        if (state === 'online' && !stopped) armInfoRefresh()
+      })
+    }, delay)
   }
 
   /** The shared request face of every route. ONLY endpoint headers live
@@ -799,6 +1059,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         serverName: typeof payload.serverName === 'string' ? payload.serverName : '',
         dshVersion: typeof payload.dshVersion === 'string' ? payload.dshVersion : '',
         fingerprints: isRecord(payload.fingerprints) ? (payload.fingerprints as Record<string, string>) : {},
+        // T59: the gateway's record of THIS device's name, when the server
+        // speaks the field at all (an older server omits it and the client
+        // keeps whatever it had).
+        ...(infoString(payload.deviceName) !== undefined ? { deviceName: infoString(payload.deviceName) } : {}),
       }
       // Interface compatibility (T42): compare the handshake's group map
       // against this side's own, right here where both are fresh. A compute
@@ -884,6 +1148,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
   function stop(): void {
     stopped = true
     cancelRetry()
+    if (infoTimer !== undefined) {
+      clock.clearTimeout(infoTimer)
+      infoTimer = undefined
+    }
   }
 
   async function invoke(namespace: string, method: string, args: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -1094,6 +1362,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           } else if (verdict.kind === 'error') {
             noteServerRestart(verdict.error)
             throw verdict.error
+          } else if (verdict.kind === 'info') {
+            // T59: the heartbeat's names, folded in quietly — a state-sparing
+            // notify wakes the interceptor's rename path without any reconnect.
+            applyInfoDelta(verdict.serverName, verdict.deviceName)
           }
         }
       }
@@ -1109,6 +1381,8 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         } else if (verdict.kind === 'error') {
           noteServerRestart(verdict.error)
           throw verdict.error
+        } else if (verdict.kind === 'info') {
+          applyInfoDelta(verdict.serverName, verdict.deviceName)
         }
       }
     } catch (error) {
@@ -1154,6 +1428,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       return compat
     },
     subscribe,
+    queueDeviceName,
     connect,
     reconnect,
     credentialsChanged,

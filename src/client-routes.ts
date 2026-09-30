@@ -278,6 +278,22 @@ function probeStateOfRelayError(error: unknown): ProbeState | 'unpaired' | 'inco
 }
 
 /**
+ * The online status body (T59): the handshake facts plus the device's own
+ * name — the SERVER's record of this device (T59), which the settings page
+ * follows into the row while the user is not mid-edit. Absent from an older
+ * relay client (no handshake field) and then the body carries it as '' —
+ * the settings page treats empty as "nothing to follow".
+ */
+function deviceStatusBody(state: string, info: { serverName: string, deviceName?: string }, serverUrl: string): Record<string, unknown> {
+  return {
+    state,
+    serverName: info.serverName,
+    serverUrl,
+    deviceName: typeof info.deviceName === 'string' ? info.deviceName : '',
+  }
+}
+
+/**
  * One live handshake bounded by the probe timeout. An abandoned connect
  * keeps running in the background — its result lands in the relay client's
  * state and digest either way — but the status answer never waits longer
@@ -470,7 +486,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           relay.lastHandshakeDigest !== undefined &&
           relay.lastHandshakeDigest === relayCredentialsDigest(normalized.url, token)
         ) {
-          responseJson(res, 200, withDiagnostics({ state: relay.state, serverName: relay.handshakeInfo.serverName, serverUrl: normalized.url }))
+          responseJson(res, 200, withDiagnostics(deviceStatusBody(relay.state, relay.handshakeInfo, normalized.url)))
           return
         }
         // Everything else — never connected, offline, connecting, revoked,
@@ -482,7 +498,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // credential material by contract.
         try {
           const info = await withProbeTimeout(relay.connect())
-          responseJson(res, 200, withDiagnostics({ state: 'online', serverName: info.serverName, serverUrl: normalized.url }))
+          responseJson(res, 200, withDiagnostics(deviceStatusBody('online', info, normalized.url)))
         } catch (error) {
           const body: Record<string, unknown> = { state: probeStateOfRelayError(error), serverUrl: normalized.url }
           if (relay.nextRetryAt !== null && relay.nextRetryAt !== undefined) body.nextRetryAt = relay.nextRetryAt

@@ -83,3 +83,21 @@ test('T57: the locales keep only keys someone uses', () => {
   const en = locales.indexOf("'settings.fieldServerName': 'Device name'")
   assert.notEqual(en, -1, 'en label is Device name')
 })
+
+// ---- T59: the two-way sync's wiring -------------------------------------------
+
+test('T59: the backend forwards a committed row name through the volatile-update listener', () => {
+  // The push logic itself (queueDeviceName's contract: differing name →
+  // endpoint, equal name → no-op, offline → queued for the next online) is
+  // pinned in relay-client.test.cjs. This pins the WIRING: the row's
+  // serverName feeds queueDeviceName on the loader's volatile-update
+  // announcement, beside the credentials watcher that already lived there.
+  const index = readFileSync(join(ROOT, 'src', 'index.ts'), 'utf8')
+  const watcherAt = index.indexOf("'dsh-zen-remote: relay credentials watcher'")
+  assert.notEqual(watcherAt, -1, 'the credentials watcher is the anchor')
+  const watcherBlock = index.slice(index.indexOf('loader/volatile-update', watcherAt - 3000), watcherAt)
+  assert.ok(watcherBlock.includes('relayClient.credentialsChanged()'), 'the credentials watch is intact')
+  const effectSource = index.slice(index.indexOf("ctx.on('loader/volatile-update'"), watcherAt)
+  assert.ok(effectSource.includes('queueDeviceName'), 'the committed row name is queued for the gateway push')
+  assert.ok(effectSource.includes('unwrapVolatile(row.serverName)'), 'the name is read LIVE off the volatile row')
+})
