@@ -1311,3 +1311,85 @@ test('T58 RT UI model: the open closed session keeps its group slot for the bann
   assert.deepEqual(group.sessionIds, [V('s2')])
   assert.equal(ui.model.archivedSessionIds.includes(V('s1')), true)
 })
+
+// -- 12. T58-fix: review findings -----------------------------------------------------
+
+test('T58-fix: a local archived frame and a local baseline merge instead of passing verbatim while hidden sessions exist', () => {
+  const m = merger()
+  const ui = createUiModel()
+  m.onLocal(T58_LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(T58_BASELINE).forEach(ui.apply)
+  m.setCurrentSession('session-l2')
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }).forEach(ui.apply) // s1 closed → hidden
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-2', '远端二', []) }).forEach(ui.apply) // s3 closed → hidden
+  // the emptied groups are deleted server-side: the hidden sessions go sticky
+  m.onRemote({ type: 'remove', workspaceId: 'w-1' }).forEach(ui.apply)
+  m.onRemote({ type: 'remove', workspaceId: 'w-2' }).forEach(ui.apply)
+  assert.equal(ui.ids(), 'ws-local')
+
+  // the user archives a local session: the local-only list must arrive
+  // MERGED — verbatim it would wipe the hidden ids out of the UI's archived
+  // set and flush them back as 「未分组」 strays
+  const out = m.onLocal({ type: 'archived', archivedSessionIds: ['session-l1', 'session-l3'] })
+  assert.deepEqual(out, [{ type: 'archived', archivedSessionIds: ['session-l1', 'session-l3', V('s1'), V('s3')] }])
+  out.forEach(ui.apply)
+
+  // the same gate on the local baseline's verbatim path
+  const rebased = m.onLocal({ type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: ['session-l1', 'session-l3'], pinnedSessionIds: [] } })
+  assert.deepEqual(rebased[0].value.archivedSessionIds, ['session-l1', 'session-l3', V('s1'), V('s3')])
+  // through the REAL UI model: the hidden sessions stay archived-hidden —
+  // sessionVisible drops them under the default filter, never 「未分组」
+  rebased.forEach(ui.apply)
+  assert.ok(ui.model.archivedSessionIds.includes(V('s1')))
+  assert.ok(ui.model.archivedSessionIds.includes(V('s3')))
+})
+
+test('T58-fix: setCurrentSession first-shows a never-seen group WITH its order frame, upsert before the archived frame', () => {
+  const m = merger()
+  // everything remote lands BEFORE the local baseline: w-1 arrives, closes,
+  // and hides while still cached — the UI never sees it
+  m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', ['s1'])], archivedSessionIds: [], pinnedSessionIds: [] } })
+  m.setCurrentSession('session-l2') // readable while still pre-baseline
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', []) }) // s1 closed while cached
+  // the flush hides s1 and never shows w-1 (its only content was the hidden tombstone)
+  const flushed = m.onLocal(LOCAL_BASELINE)
+  assert.deepEqual(flushed, [
+    { type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: [V('s1')], pinnedSessionIds: [] } },
+  ])
+  assert.equal(m.hasPendingHide, false)
+
+  // the user opens s1: it must leave archived at once — and since its group
+  // was never shown, the reveal carries its order position. Frame order is
+  // load-bearing: the group's upsert FIRST (the session is back in a group
+  // while still archived-hidden), the archived frame that clears it AFTER —
+  // reversed, the session would sit in 「未分组」 for one frame.
+  const out = m.setCurrentSession(V('s1'))
+  assert.deepEqual(out, [
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-1', '远端一', []), workspaceId: V('w-1'), title: `${NAME} · 远端一`, sessionIds: [V('s1')] } },
+    { type: 'order', workspaceIds: ['ws-local', V('w-1')] },
+    { type: 'archived', archivedSessionIds: [] },
+  ])
+})
+
+test('T58-fix: onRemoteGone with ONLY hidden sessions left still restores the archived list', () => {
+  const m = merger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(T58_BASELINE)
+  m.setCurrentSession('session-l2')
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 hidden
+  m.onRemote({ type: 'remove', workspaceId: 'w-1' }) // group deleted — s1 sticky-hidden
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-2', '远端二', []) }) // s3 hidden
+  m.onRemote({ type: 'remove', workspaceId: 'w-2' })
+  // nothing shown and both server lists empty — but the hidden ids sit in
+  // the UI's archived set and must leave it with the identity
+  const out = m.onRemoteGone()
+  assert.deepEqual(out, [
+    { type: 'order', workspaceIds: ['ws-local'] },
+    { type: 'archived', archivedSessionIds: [] },
+    { type: 'pinned', pinnedSessionIds: [] },
+  ])
+  // and they are really gone: the next merged archived list is local-only
+  assert.deepEqual(m.onRemote({ type: 'archived', archivedSessionIds: [] }), [
+    { type: 'archived', archivedSessionIds: [] },
+  ])
+})

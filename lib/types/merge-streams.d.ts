@@ -80,11 +80,16 @@
  *   as hidden). Frame order follows the flash rule: an archived frame that
  *   ADDS ids precedes the workspace frames (hide before the group drops the
  *   row), one that REMOVES ids follows them (the group regains the row
- *   while it is still archived-hidden — never a stray in 「未分组」, never a
- *   current session inside `archived`). The hidden ids are sticky: they
- *   survive even the death of their home workspace (a hidden session whose
- *   group is deleted must not resurface as a stray) until a re-share or the
- *   identity ends.
+ *   while it is still archived-hidden). Single-direction changes therefore
+ *   never flash a stray; when ONE update both hides and reveals, the
+ *   leading archived frame already excludes the revealed ids, so a revealed
+ *   id can flash in 「未分组」 for the one frame before its group's upsert
+ *   lands — an accepted, vanishingly small window. A revealed id that is
+ *   CURRENT at that moment is an exception in the other direction: it must
+ *   leave `archived` at once, or the navigation guard kicks its page. The
+ *   hidden ids are sticky: they survive even the death of their home
+ *   workspace (a hidden session whose group is deleted must not resurface
+ *   as a stray) until a re-share or the identity ends.
  * - a workspace with NOTHING to show is not shown at all (T56): the server
  *   keeps every workspace and only narrows `sessionIds` (relay-filter.ts),
  *   so a workspace where nothing is shared would arrive as an empty group
