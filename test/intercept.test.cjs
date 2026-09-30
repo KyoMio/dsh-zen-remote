@@ -2888,6 +2888,247 @@ test('T65 sync: a later sync pushes only the rows not announced yet — announce
   await workspacesIterator.return?.(undefined)
 })
 
+/** A clock whose timers the test FIRES by advancing — the T65-fix retry
+ * backoff (2s/10s) is driven deterministically, with no real waiting. */
+function manualClock() {
+  let nowMs = 1_700_000_000_000
+  const timers = new Map()
+  let seq = 0
+  const clock = {
+    now: () => nowMs,
+    setTimeout: (fn, ms) => {
+      seq += 1
+      timers.set(seq, { fn, at: nowMs + ms })
+      return seq
+    },
+    clearTimeout: (id) => timers.delete(id),
+    random: () => 0.5,
+  }
+  const advance = async (ms) => {
+    nowMs += ms
+    for (const [id, timer] of [...timers.entries()].sort((a, b) => a[1].at - b[1].at)) {
+      if (timer.at <= nowMs) {
+        timers.delete(id)
+        timer.fn()
+        await Promise.resolve()
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  return { clock, advance }
+}
+
+const T65_NEW_ROW = { sessionId: 'session-new', updatedAt: 8 }
+
+test('T65-fix sync: an id that appears while a sync is in flight runs its own follow-up round and is announced', async () => {
+  const { gateway, gates } = createPerEndpointGateway()
+  const relay = createControllableRelay()
+  relay.invokeValues = { 'session/modelCatalog': SERVER_CATALOG }
+  // A controllable session/list: each call parks its resolver (the
+  // reviewer's harness). Each parked round resolves with the list snapshot
+  // of its own moment.
+  const pendingLists = []
+  const baseInvoke = relay.invoke.bind(relay)
+  relay.invoke = function (ns, m, args, signal) {
+    if (ns === 'session' && m === 'list') {
+      relay.invokes.push({ namespace: ns, method: m, args, signal })
+      return new Promise((resolve) => pendingLists.push((value) => resolve(value)))
+    }
+    return baseInvoke(ns, m, args, signal)
+  }
+  install(gateway, relay)
+  const controller = new AbortController()
+  const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const eventsIterator = events[Symbol.asyncIterator]()
+  gates['$events'].push(READY)
+  await readSome(eventsIterator, 1)
+  await waitForStream(relay, 1)
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 2)
+
+  // Round 1 parks with session-shared as its trigger.
+  relay.streams[1].gate.push({ type: 'baseline', value: { items: [T63_WORKSPACE], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(pendingLists.length, 1, 'round 1 in flight')
+
+  // MID-FLIGHT: a workspace frame carries the just-shared session-new. Its
+  // id must NOT join round 1 — that round's list snapshot predates the
+  // share, and marking session-new asked there would bury the row forever.
+  relay.streams[1].gate.push({ type: 'upsert', workspace: { ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-new'] } })
+  await readSome(workspacesIterator, 1)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(pendingLists.length, 1, 'the mid-flight batch did not start a second sync yet')
+
+  // Round 1 lands serving only what its snapshot knew: session-shared.
+  pendingLists[0]({ items: [T63_SHARED_ROW] })
+  const [added1] = await readSome(eventsIterator, 1)
+  assert.deepEqual(added1.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }])
+
+  // The queued mid-flight batch runs as its OWN round against a fresh
+  // snapshot, and session-new is announced by it.
+  assert.equal(pendingLists.length, 2, 'exactly one follow-up round was queued beside round 1')
+  pendingLists[1]({ items: [T63_SHARED_ROW, T65_NEW_ROW] })
+  const [added2] = await readSome(eventsIterator, 1)
+  assert.deepEqual(added2.args, [{ sessionId: toVirtual(SERVER_ID, 'session-new'), updatedAt: 8 }], 'session-new is announced by the follow-up round')
+
+  // Both ids settled (announced or returned): a refresher frame pulls nothing.
+  relay.streams[1].gate.push({ type: 'upsert', workspace: { ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-new'] } })
+  await readSome(workspacesIterator, 1)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length, 2)
+  await eventsIterator.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
+})
+
+test('T65-fix sync: a session the server admits late is announced by the scheduled retry', async () => {
+  const { clock, advance } = manualClock()
+  const { gateway, gates } = createPerEndpointGateway()
+  const relay = createControllableRelay()
+  // The variant without any mid-flight timing: the server's list lags the
+  // workspace frames in admitting a just-forked session.
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW] },
+  }
+  enforceSessionListWireShape(relay)
+  install(gateway, relay, { clock })
+  const controller = new AbortController()
+  const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const eventsIterator = events[Symbol.asyncIterator]()
+  gates['$events'].push(READY)
+  await readSome(eventsIterator, 1)
+  await waitForStream(relay, 1)
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push({ type: 'baseline', value: { items: [{ ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-late'] }], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+  // Round 1 announced shared; session-late was asked and not returned — the
+  // first retry is scheduled at +2s.
+  const [added1] = await readSome(eventsIterator, 1)
+  assert.deepEqual(added1.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }])
+  const listCount = () => relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length
+  assert.equal(listCount(), 1)
+
+  // The server catches up, the retry fires, and session-late is announced.
+  relay.invokeValues['session/list'] = { items: [T63_SHARED_ROW, { sessionId: 'session-late', updatedAt: 9 }] }
+  await advance(2_000)
+  const [added2] = await readSome(eventsIterator, 1)
+  assert.deepEqual(added2.args, [{ sessionId: toVirtual(SERVER_ID, 'session-late'), updatedAt: 9 }])
+  assert.equal(listCount(), 2)
+  await eventsIterator.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
+})
+
+test('T65-fix sync: a tombstone id triggers at most three session/list pulls — further frames never add more', async () => {
+  const { clock, advance } = manualClock()
+  const { gateway, gates } = createPerEndpointGateway()
+  const relay = createControllableRelay()
+  // The list NEVER carries session-tomb (its remote access was closed): no
+  // round can ever return it.
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW] },
+  }
+  enforceSessionListWireShape(relay)
+  install(gateway, relay, { clock })
+  const controller = new AbortController()
+  const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const eventsIterator = events[Symbol.asyncIterator]()
+  gates['$events'].push(READY)
+  await readSome(eventsIterator, 1)
+  await waitForStream(relay, 1)
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push({ type: 'baseline', value: { items: [{ ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-tomb'] }], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+  const listCount = () => relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCount(), 1, 'round 1: the initial ask')
+
+  // The tombstone cannot be returned, so the conservative retries run: +2s,
+  // then +10s — and after the third attempt the id is asked for good.
+  await advance(2_000)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCount(), 2, 'round 2: the first retry')
+  await advance(10_000)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCount(), 3, 'round 3: the second and final retry')
+  await advance(10_000)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCount(), 3, 'no scheduled anything after the cap')
+
+  // Further workspace frames carrying the exhausted id never pull again —
+  // the T65 guarantee (no infinite re-pull) still holds.
+  for (let i = 0; i < 3; i += 1) {
+    relay.streams[1].gate.push({ type: 'upsert', workspace: { ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-tomb'] } })
+    await readSome(workspacesIterator, 1)
+  }
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(listCount(), 3)
+  // The only announce ever pushed was the live row.
+  await eventsIterator.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
+})
+
+test('T65-fix sync: a fresh serving period clears the ask bookkeeping — an exhausted id can be asked again', async () => {
+  const { clock, advance } = manualClock()
+  const { gateway, gates } = createPerEndpointGateway()
+  const relay = createControllableRelay()
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW] },
+  }
+  enforceSessionListWireShape(relay)
+  install(gateway, relay, { clock })
+  const controller = new AbortController()
+  const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const eventsIterator = events[Symbol.asyncIterator]()
+  gates['$events'].push(READY)
+  await readSome(eventsIterator, 1)
+  await waitForStream(relay, 1)
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push({ type: 'baseline', value: { items: [{ ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-tomb'] }], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+  const listCount = () => relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length
+  // Drive the tombstone to exhaustion: three asks, none ever returned.
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  await advance(2_000)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  await advance(10_000)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCount(), 3)
+
+  // The relay re-establishes its serving period: the bookkeeping clears and
+  // the fresh-serving announce runs.
+  relay.transition('offline')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  relay.transition('online')
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCount(), 4, 'the fresh serving period announces again')
+  // and the exhausted id has its chances back: one frame with it nudges a
+  // fresh round (which still cannot return it — it re-enters the schedule).
+  relay.streams[1].gate.push({ type: 'upsert', workspace: { ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-tomb'] } })
+  await readSome(workspacesIterator, 1)
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCount(), 5, 'the cleared bookkeeping lets the id be asked again')
+  await eventsIterator.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
+})
+
 // -- T32: the $events/result answer split ---------------------------------------------
 
 test('$events/result: a virtual eventId rides postEventResult with the ORIGINAL id and never the local gateway', async () => {
