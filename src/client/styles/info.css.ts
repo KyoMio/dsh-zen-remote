@@ -238,7 +238,11 @@ export const INFO_CSS = `/* ---------- session-info sheet (< 768px) ---------- *
     font-size: 11px;
     line-height: 1.3;
   }
-  /* The switch: a 48px-tall touch target, thumb slides on the data-on flag. */
+  /* The switch: a 44x26 track whose TRANSPARENT ::before stretches the
+     tappable area to 52x44 (inset -9px vertical / -4px horizontal) — the
+     44x44 minimum touch target without moving the visible control; ::after
+     is the thumb, so ::before carries the hot-zone extension. The horizontal
+     reach leans toward the row edge, away from the description text. */
   [data-mobile-nav="info-remote-switch"] {
     position: relative;
     flex: none;
@@ -252,6 +256,11 @@ export const INFO_CSS = `/* ---------- session-info sheet (< 768px) ---------- *
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
     transition: background .15s ease;
+  }
+  [data-mobile-nav="info-remote-switch"]::before {
+    content: '';
+    position: absolute;
+    inset: -9px -4px;
   }
   [data-mobile-nav="info-remote-switch"]::after {
     content: '';
