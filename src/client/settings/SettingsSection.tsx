@@ -381,11 +381,21 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     return () => { cancelled = true }
   }, [scopeStatus, roleKnown, config])
 
-  // Feed the effective values the fields display (and compare drafts against).
+  // Feed the effective values the fields display (and compare drafts against)
+  // — but ONLY while the page actually polls the admin source (T55): a role
+  // switch leaves the host page's kept status load (and its fed baseline) in
+  // place forever, because a client page never refreshes admin/status again.
+  // The form also refuses the baseline under a client poll, but the stale
+  // values are dropped here as well, so the fields fall back to the row's
+  // stored values the moment the row moves.
   useEffect(() => {
+    if (statusPoll !== 'admin') {
+      config.setBaseline(undefined)
+      return
+    }
     if (load.state !== 'ready') return
     config.setBaseline(load.body.config?.values)
-  }, [load, config])
+  }, [load, config, statusPoll])
 
   // Re-render every second while a pairing code is on screen so the countdown
   // follows; both display paths drop the code once `expiresAt` passes. T43:
