@@ -13,6 +13,10 @@
  *
  * Also usable standalone: `node scripts/sync-doc-version.mjs [--check]`.
  * `--check` reports drift without writing, for CI.
+ *
+ * The README's top badge row went all-dynamic (npm version / downloads /
+ * workflow status — no hardcoded version left to drift), so the only
+ * version-bearing marker left is the profile dependency example.
  */
 
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -25,23 +29,12 @@ const checkOnly = process.argv.includes('--check')
 
 /**
  * Each target names the file, what it looks for, and what it becomes. Both
- * READMEs carry the same three markers, and both are required: a missing one
- * means the docs moved and this script has to be updated, which is the whole
- * point of failing loudly.
+ * READMEs carry the same marker, and both are required: a missing one means
+ * the docs moved and this script has to be updated, which is the whole point
+ * of failing loudly. (Until the badge row went all-dynamic there were two
+ * more — a hardcoded release badge and its alt text; both are gone.)
  */
 const targets = ['README.md', 'README.zh-CN.md'].flatMap((file) => [
-  {
-    file,
-    label: 'release badge',
-    pattern: /badge\/release-v\d+\.\d+\.\d+-/,
-    replace: `badge/release-v${version}-`,
-  },
-  {
-    file,
-    label: 'release badge alt text',
-    pattern: /alt="v\d+\.\d+\.\d+"/,
-    replace: `alt="v${version}"`,
-  },
   {
     file,
     label: 'profile dependency example',
