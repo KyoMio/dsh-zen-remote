@@ -24,6 +24,8 @@ const { join } = require('node:path')
 const loadView = () => import('../src/client-data/shares.ts?' + Math.random())
 
 const ROOT = join(__dirname, '..')
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const NOW = 1_700_000_000_000
 
 /** A formatter that records WHICH keys were read — the copy-reuse rule is
@@ -83,14 +85,10 @@ test('T67 view: the gate — client role, unanswered table, subagent session all
 test('T67 wiring: subscribe only while open, pull once on open, accessible switch, row-local busy', () => {
   const source = readFileSync(join(ROOT, 'src', 'client', 'MobileSessionInfo.tsx'), 'utf8')
 
-  // The subscription lives inside the `open ?` — closed sheet = no listener
-  // = no 30 s admin/shares poll behind the gateway.
-  const subscribeAt = source.indexOf('open ? shares.subscribe(onStoreChange) : () => {}')
-  assert.notEqual(subscribeAt, -1, 'the shares subscription is gated on the sheet being open')
-
-  // Opening pulls once immediately (the row must show the CURRENT table).
-  const pullAt = source.indexOf('if (!open) return\n    void shares.refresh()')
-  assert.notEqual(pullAt, -1, 'opening the sheet reads the table once right away')
+  // T68: the gating itself is a tested pure function (subscribeWhileOpen —
+  // see the behavior test below); here only a LOOSE call-presence check.
+  assert.ok(source.includes('subscribeWhileOpen(shares, open, onStoreChange)'), 'the subscription goes through the tested gating function')
+  assert.ok(source.includes('void shares.refresh()'), 'opening the sheet reads the table once right away')
 
   // The switch is an accessible one (role/aria, not a bare div).
   const switchAt = source.indexOf('role="switch"')
@@ -116,4 +114,50 @@ test('T67 wiring: the store arrives as the SAME page-wide singleton via the regi
   assert.notEqual(injectAt, -1, 'the info sheet registration is the anchor')
   const injectBlock = index.slice(injectAt, index.indexOf('MobileSessionInfo)', injectAt))
   assert.ok(injectBlock.includes('shares: getSharesStore()'), 'the shared singleton is bound, never a second store')
+})
+
+// -- subscribeWhileOpen: the behavior behind the row's subscription ----------
+
+/** A shares store over a COUNTING fake fetch (the real createSharesStore,
+ * 5 ms poll cadence, always-visible Node), plus its request counter. */
+async function makeCountedStore() {
+  const { createSharesStore } = await loadView()
+  let requests = 0
+  const store = createSharesStore(async () => {
+    requests += 1
+    return {
+      ok: true,
+      json: async () => ({ ok: true, shares: [] }),
+    }
+  }, undefined, 5)
+  store.setRole('host')
+  return { store, requests: () => requests }
+}
+
+test('T68 subscribeWhileOpen: closed subscribes nothing, open polls, unsubscribe stops it', async () => {
+  const { store, requests } = await makeCountedStore()
+  const { subscribeWhileOpen } = await loadView()
+  try {
+    // Closed sheet: the no-op unsubscribe means the store never sees a
+    // listener — no poll, no request.
+    const closed = subscribeWhileOpen(store, false, () => {})
+    closed()
+    await wait(30)
+    assert.equal(requests(), 0, 'a closed sheet never polls')
+
+    // Open: the real subscription starts the 5 ms cadence.
+    const unsubscribe = subscribeWhileOpen(store, true, () => {})
+    await wait(30)
+    const seenWhileOpen = requests()
+    assert.ok(seenWhileOpen >= 2, `an open sheet polls (saw ${seenWhileOpen} requests)`)
+
+    // Unsubscribed: the cadence stops for good.
+    unsubscribe()
+    await wait(30)
+    const seenAtStop = requests()
+    await wait(30)
+    assert.equal(requests(), seenAtStop, 'the poll stopped after the sheet closed')
+  } finally {
+    store.setRole('client')
+  }
 })

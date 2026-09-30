@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import {
   IconArchiveOutlineRegular,
@@ -8,7 +8,7 @@ import {
   IconEditOutlineRegular,
   IconShareOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import { shareCardRemoteView, shareFailText } from '../client-data/shares.ts'
+import { shareCardRemoteView, shareFailText, subscribeWhileOpen } from '../client-data/shares.ts'
 import type { SharesStore } from '../client-data/shares.ts'
 import { workspaceTitleOf } from './compat/store.ts'
 import { agentPresetOf } from './compat/types.ts'
@@ -169,6 +169,10 @@ export function MobileSessionInfo({
   // T67: the remote-access row's own busy flag — distinct from the sheet's
   // global one, so a slow share/unshare POST greys only this switch.
   const [remoteBusy, setRemoteBusy] = useState(false)
+  // T68: the description line's id, so the switch can name it for screen
+  // readers (aria-describedby) — the line is the state explanation the
+  // switch itself carries no visible text for.
+  const remoteDescId = useId()
 
   // T67: the shares table is subscribed ONLY while the sheet is open — a
   // subscription is what keeps the store's 30 s admin/shares poll running,
@@ -178,7 +182,7 @@ export function MobileSessionInfo({
   // wait out the cadence.
   const shareSnap = useSyncExternalStore(
     useCallback(
-      (onStoreChange: () => void) => (open ? shares.subscribe(onStoreChange) : () => {}),
+      (onStoreChange: () => void) => subscribeWhileOpen(shares, open, onStoreChange),
       [shares, open],
     ),
     () => shares.getSnapshot(),
@@ -552,13 +556,14 @@ export function MobileSessionInfo({
           <div data-mobile-nav="info-remote">
             <div data-mobile-nav="info-remote-text">
               <span data-mobile-nav="info-remote-label">{t('infoRemoteAccess')}</span>
-              <span data-mobile-nav="info-remote-desc">{remoteRow.line}</span>
+              <span data-mobile-nav="info-remote-desc" id={remoteDescId}>{remoteRow.line}</span>
             </div>
             <button
               type="button"
               role="switch"
               aria-checked={remoteRow.shared}
               aria-label={t('infoRemoteAccess')}
+              aria-describedby={remoteDescId}
               data-mobile-nav="info-remote-switch"
               data-on={remoteRow.shared ? '' : undefined}
               disabled={remoteBusy}

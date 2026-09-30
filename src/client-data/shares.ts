@@ -181,18 +181,14 @@ export function shareFailText(outcome: { ok: boolean, code?: string }, action: S
 
 // --- the mobile info-card row (T67) --------------------------------------------
 
-/** The formatter the info-card row needs: the icon's words plus the two
- * keys that live outside the icon's vocabulary — the row label and the
- * settings list's viewers line (REUSED verbatim, T67: no duplicate copy).
- * Loose key typing on purpose: the component's real `t` seat carries the
- * whole dictionary, and the check/test doubles just answer these keys. */
 /** The keys the info-card row reads: the icon's words, the one new state
  * word (the icon only ever colored the on state, it never had copy for it),
- * the row label, and the settings list's viewers line (reused verbatim). */
+ * and the settings list's viewers line (reused verbatim). The component's
+ * real `t` seat carries the whole dictionary, so it assigns cleanly; the
+ * check/test doubles just answer these keys. */
 export type ShareCardFormatterKey =
   | ShareTextKey
   | 'shareRemoteStateOn'
-  | 'infoRemoteAccess'
   | 'settings.shareViewers'
 export type ShareCardFormatter = (key: ShareCardFormatterKey, params?: Record<string, unknown>) => string
 
@@ -456,4 +452,16 @@ export function getSharesStore(): SharesStore {
  */
 export function subscribeIfNotPhoneShell(store: SharesStore, phoneShell: boolean, listener: () => void): () => void {
   return phoneShell ? () => {} : store.subscribe(listener)
+}
+
+/**
+ * The subscribe face the info-card row (T67) hands `useSyncExternalStore`:
+ * the shares table is subscribed ONLY while the sheet is open — a
+ * subscription is what keeps the 30 s admin/shares poll alive, and the
+ * phone shell must not keep that polling through the gateway. Pure over
+ * (store, open) so behavior tests drive it with a counting fake fetch;
+ * closing the sheet returns the no-op unsubscribes and the poll stops.
+ */
+export function subscribeWhileOpen(store: SharesStore, open: boolean, listener: () => void): () => void {
+  return open ? store.subscribe(listener) : () => {}
 }
