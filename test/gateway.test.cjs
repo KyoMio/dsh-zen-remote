@@ -8,6 +8,8 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert')
+const net = require('node:net')
+const http = require('node:http')
 const { startMockTarget, startMockAuthTarget, startGateway, startRecordingTarget, request, stopAll, pairDevice, REMOTE_HEADERS, freePort } = require('./util.cjs')
 
 const VIEWPORT_RE = /<meta[^>]*name=["']?viewport["']?[^>]*>/gi
@@ -115,6 +117,86 @@ test('gateway pairing page: DSH-styled shell with the proxied logo and the origi
     // shell (one function), so they restyle together with this one.
   } finally { await stop() }
 })
+
+test('gateway logo proxy (T71-fix): response headers are whitelisted, 200 carries CSP + nosniff; POST 405, HEAD bodyless', async () => {
+  // The upstream answers with its own cookie, a custom header and a
+  // cache directive that must all stay upstream — plus a script inside the
+  // SVG that the CSP keeps dead when the file is opened directly.
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Set-Cookie': 'up=1', 'X-Up-Leak': 'yes', 'Cache-Control': 'no-store' })
+    res.end('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+  })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  TARGET_PORT = upstream.address().port
+  PORT = await freePort()
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  try {
+    const res = await request(PORT, { path: '/lan-gate/logo.svg', headers: REMOTE_HEADERS })
+    assert.strictEqual(res.status, 200)
+    assert.strictEqual(res.headers['content-type'], 'image/svg+xml')
+    assert.strictEqual(res.headers['content-security-policy'], "default-src 'none'")
+    assert.strictEqual(res.headers['x-content-type-options'], 'nosniff')
+    assert.strictEqual(res.headers['cache-control'], 'public, max-age=300', 'the whitelisted directive, not the upstream\'s')
+    assert.strictEqual(res.headers['set-cookie'], undefined, 'the upstream cookie stays upstream')
+    assert.strictEqual(res.headers['x-up-leak'], undefined, 'custom upstream headers stay upstream')
+
+    const post = await request(PORT, { method: 'POST', path: '/lan-gate/logo.svg', headers: REMOTE_HEADERS, body: {} })
+    assert.strictEqual(post.status, 405)
+
+    const head = await request(PORT, { method: 'HEAD', path: '/lan-gate/logo.svg', headers: REMOTE_HEADERS })
+    assert.strictEqual(head.status, 200)
+    assert.strictEqual(head.headers['content-type'], 'image/svg+xml')
+    assert.strictEqual(head.body, '', 'HEAD answers headers only')
+  } finally { await stopAll(upstream, gw.child) }
+})
+
+test('gateway logo proxy (T71-fix): path variants — doubled slashes, case, parameters, absolute-form — all hit the pairing wall', async () => {
+  const { stop } = await boot()
+  try {
+    for (const path of ['//lan-gate/logo.svg', '/LAN-GATE/logo.svg', '/lan-gate/logo.svg;x', 'http://evil.example/lan-gate/logo.svg']) {
+      const res = await request(PORT, { path, headers: REMOTE_HEADERS })
+      assert.strictEqual(res.status, 401, path)
+      assert.ok(res.body.includes('id="code"'), path + ' gets the pairing page, not the logo')
+    }
+  } finally { await stop() }
+})
+
+test('gateway logo proxy (T71-fix): a silent upstream is torn down when the visitor leaves, and times out to 404', async () => {
+  // An upstream that accepts requests and never answers — the reviewer's
+  // socket-leak scenario. It records connection closes.
+  const sockets = new Set()
+  let closes = 0
+  const upstream = http.createServer((req, res) => { req.resume() })
+  upstream.on('connection', (sock) => { sockets.add(sock); sock.on('close', () => { closes += 1; sockets.delete(sock) }) })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  TARGET_PORT = upstream.address().port
+  PORT = await freePort()
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  try {
+    // The visitor connects and then walks away mid-request: the gateway must
+    // tear the parked upstream request down with it — no socket left behind.
+    const visitor = net.connect(PORT, '127.0.0.1', () => {
+      visitor.write('GET /lan-gate/logo.svg HTTP/1.1\r\nHost: gw\r\nX-Forwarded-For: 203.0.113.9\r\nX-Forwarded-Proto: https\r\n\r\n')
+    })
+    visitor.on('error', () => {})
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    visitor.destroy()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(sockets.size, 0, 'no upstream socket left for the disconnected visitor')
+    assert.ok(closes >= 1, 'the upstream saw its connection close')
+
+    // A patient visitor: the 5s upstream timeout answers 404 — the gateway
+    // does not hang.
+    const t0 = Date.now()
+    const res = await request(PORT, { path: '/lan-gate/logo-dark.svg', headers: REMOTE_HEADERS })
+    const elapsed = Date.now() - t0
+    assert.strictEqual(res.status, 404)
+    assert.ok(elapsed >= 4500 && elapsed < 9000, 'the answer waits out the 5s timeout, then 404s (took ' + elapsed + 'ms)')
+  } finally { await stopAll(upstream, gw.child) }
+})
+
 
 test('gateway: starts and reports pwa:true', async () => {
   const { stop } = await boot()
