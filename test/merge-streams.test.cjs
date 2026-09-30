@@ -1177,24 +1177,37 @@ const w1As = (sessionIds, title = '远端一') => ({
   workspace: { ...remoteWorkspace('w-1', title, sessionIds), workspaceId: V('w-1'), title: `${NAME} · ${title}`, sessionIds: sessionIds.map(V) },
 })
 
-test('T58: a closed remote session the user is NOT viewing is hidden — archived gains it, the group drops the tombstone', () => {
-  const m = merger()
+// the grace clock the T65 tests drive
+function clockedMerger() {
+  let nowMs = 1_700_000_000_000
+  const m = createWorkspaceMerger({ serverId: SID, serverName: NAME, now: () => nowMs })
+  return { m, advance: (ms) => { nowMs += ms } }
+}
+
+test('T58/T65: a closed remote session the user is NOT viewing is hidden — archived gains it, the group KEEPS the tombstone', () => {
+  const { m, advance } = clockedMerger()
   m.onLocal(T58_LOCAL_BASELINE)
   m.onRemote(T58_BASELINE)
   m.setCurrentSession(V('s3'))
-  // the server closes s1's remote while the user reads s3: the merged
-  // archived frame lands BEFORE the group upsert (hide first, then the row
-  // leaves — never a 「未分组」 stray in between), and the local archived
-  // session rides the list untouched.
-  const out = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) })
-  assert.deepEqual(out, [
-    { type: 'archived', archivedSessionIds: ['session-l1', V('s1')] },
-    w1As(['s2']),
-  ])
+  // the close lands: the tombstone is inside the hide grace — the session
+  // stays in the group and nothing is archived yet
+  const close = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) })
+  assert.deepEqual(close, [w1As(['s2', 's1'])])
+  // past the grace, the poll's re-judge (the same setCurrentSession call the
+  // poll makes) hides: the merged archived frame is the whole update — the
+  // group copy keeps the tombstone, and the local archived session rides the
+  // list untouched.
+  advance(2_001)
+  const hidden = m.setCurrentSession(V('s3'))
+  assert.deepEqual(hidden, [{ type: 'archived', archivedSessionIds: ['session-l1', V('s1')] }])
+  // and a refresher upsert keeps carrying the hidden session in the group —
+  // 「显示已归档」 needs the membership to show it in place
+  const refresh = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) })
+  assert.deepEqual(refresh, [w1As(['s2', 's1'])])
 })
 
-test('T58: the CURRENT session keeps its tombstone when its remote closes; navigating away later hides it', () => {
-  const m = merger()
+test('T58/T65: the CURRENT session keeps its tombstone when its remote closes; navigating away later hides it', () => {
+  const { m, advance } = clockedMerger()
   m.onLocal(T58_LOCAL_BASELINE)
   m.onRemote(T58_BASELINE)
   m.setCurrentSession(V('s1'))
@@ -1205,25 +1218,26 @@ test('T58: the CURRENT session keeps its tombstone when its remote closes; navig
   assert.deepEqual(out, [w1As(['s2', 's1'])])
   assert.equal(m.hasPendingHide, true, 'waiting for the user to navigate away')
 
-  // the user leaves to a LOCAL session (the poll re-reads the selection
-  // store): the tombstone moves into archived, the group drops it
+  // the user leaves to a LOCAL session; past the grace the poll's re-judge
+  // hides — the archived frame is the whole update, the group copy keeps the
+  // tombstone (invisible under the default filter, in place under
+  // 「显示已归档」)
+  advance(2_001)
   const away = m.setCurrentSession('session-l2')
-  assert.deepEqual(away, [
-    { type: 'archived', archivedSessionIds: ['session-l1', V('s1')] },
-    w1As(['s2']),
-  ])
+  assert.deepEqual(away, [{ type: 'archived', archivedSessionIds: ['session-l1', V('s1')] }])
   assert.equal(m.hasPendingHide, false, 'nothing left waiting')
 })
 
-test('T58: re-sharing the session takes it back out of archived — the group regains it live', () => {
-  const m = merger()
+test('T58/T65: re-sharing the session takes it back out of archived — the group regains it live', () => {
+  const { m, advance } = clockedMerger()
   m.onLocal(T58_LOCAL_BASELINE)
   m.onRemote(T58_BASELINE)
   m.setCurrentSession(V('s3'))
-  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 closed → hidden
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 closed (in grace)
+  advance(2_001)
+  m.setCurrentSession(V('s3')) // the poll's re-judge hides
 
-  // shared again: live in the group (the upsert first — while archived still
-  // holds it the row would be invisible), then the archived frame clears it
+  // shared again: live in the group, then the archived frame clears it
   const out = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2', 's1']) })
   assert.deepEqual(out, [
     w1As(['s2', 's1']),
@@ -1231,8 +1245,8 @@ test('T58: re-sharing the session takes it back out of archived — the group re
   ])
 })
 
-test('T58: with no readable current session the tombstone behavior is exactly as before (conservative)', () => {
-  const m = merger()
+test('T58/T65: with no readable current session the tombstone behavior is exactly as before (conservative)', () => {
+  const { m, advance } = clockedMerger()
   m.onLocal(T58_LOCAL_BASELINE)
   m.onRemote(T58_BASELINE)
   // the merger was never told a current session: the close keeps the
@@ -1241,20 +1255,20 @@ test('T58: with no readable current session the tombstone behavior is exactly as
   assert.deepEqual(out, [w1As(['s2', 's1'])])
   assert.equal(m.hasPendingHide, true, 'kept tombstones keep the poll alive')
 
-  // an explicitly READABLE "no session is open" hides them
+  // past the grace, an explicitly READABLE "no session is open" hides them
+  advance(2_001)
   const none = m.setCurrentSession(undefined)
-  assert.deepEqual(none, [
-    { type: 'archived', archivedSessionIds: ['session-l1', V('s1')] },
-    w1As(['s2']),
-  ])
+  assert.deepEqual(none, [{ type: 'archived', archivedSessionIds: ['session-l1', V('s1')] }])
 })
 
-test('T58: a hidden session stays hidden when its workspace is deleted; onRemoteGone clears it with the identity', () => {
-  const m = merger()
+test('T58/T65: a hidden session stays hidden when its workspace is deleted; onRemoteGone clears it with the identity', () => {
+  const { m, advance } = clockedMerger()
   m.onLocal(T58_LOCAL_BASELINE)
   m.onRemote(T58_BASELINE)
   m.setCurrentSession('session-l2')
-  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 closed → hidden
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 closed (in grace)
+  advance(2_001)
+  m.setCurrentSession('session-l2') // the poll's re-judge hides
 
   // the server DELETES w-1: the shown group removes (T56 rule), but the
   // hidden session must NOT resurface as a 「未分组」 stray
@@ -1274,26 +1288,64 @@ test('T58: a hidden session stays hidden when its workspace is deleted; onRemote
   ])
 })
 
-test('T58 + T56: closing a shown group\'s last session empties it but never removes it; the hidden ids fill the archived list', () => {
-  const m = merger()
+test('T65 grace: a close frame inside the grace window hides nothing, even with a stale current session', () => {
+  const { m, advance } = clockedMerger()
   m.onLocal(T58_LOCAL_BASELINE)
   m.onRemote(T58_BASELINE)
-  m.setCurrentSession('session-l2')
-  // both of w-1's sessions close: both hide, the SHOWN group stays shown as
-  // an empty group (T56's no-remove rule) — only its content empties
-  const out = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', []) })
-  assert.deepEqual(out, [
-    { type: 'archived', archivedSessionIds: ['session-l1', V('s1'), V('s2')] },
-    w1As([]),
-  ])
-  // and the group still rides the merged order
-  assert.deepEqual(m.onLocal({ type: 'order', workspaceIds: ['ws-local'] }), [
-    { type: 'order', workspaceIds: ['ws-local', V('w-1'), V('w-2')] },
+  m.setCurrentSession(V('s3')) // the report still names the OLD session
+  // s1 closes while the report has not caught up: inside the grace the
+  // tombstone is NOT hidden — no archived frame can kick the open page home
+  const out = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) })
+  assert.deepEqual(out, [w1As(['s2', 's1'])], 'the tombstone rides the group, nothing archived')
+  assert.equal(m.hasPendingHide, true, 'the not-yet-hidden tombstone keeps the poll alive')
+  // still inside the grace: the tick's re-judge with the SAME stale value
+  // hides nothing
+  advance(1_000)
+  assert.deepEqual(m.setCurrentSession(V('s3')), [])
+  // past the grace with the stale value: NOW it hides
+  advance(1_001)
+  assert.deepEqual(m.setCurrentSession(V('s3')), [
+    { type: 'archived', archivedSessionIds: ['session-l1', V('s1')] },
   ])
 })
 
-test('T58 RT UI model: the open closed session keeps its group slot for the banner; leaving hides it via archived', () => {
-  const m = merger()
+test('T65 grace: after the grace the fresh report decides — the session the user switched TO keeps its tombstone', () => {
+  const { m, advance } = clockedMerger()
+  m.onLocal(T58_LOCAL_BASELINE)
+  m.onRemote(T58_BASELINE)
+  m.setCurrentSession(V('s3')) // stale: the user has JUST switched to s1
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 closed (in grace)
+  // the report caught up after the grace: the user IS on s1 → the tombstone
+  // stays, never hidden
+  advance(2_001)
+  assert.deepEqual(m.setCurrentSession(V('s1')), [], 'the open page keeps its tombstone')
+  assert.equal(m.hasPendingHide, true, 'kept because CURRENT — the poll keeps watching for the navigate-away')
+  // then the user moves on: NOW it hides
+  advance(1)
+  assert.deepEqual(m.setCurrentSession('session-l2'), [
+    { type: 'archived', archivedSessionIds: ['session-l1', V('s1')] },
+  ])
+})
+
+test('T65: a hidden session keeps its original workspace\'s sessionIds AND the archived set — 「显示已归档」 shows it in place', () => {
+  const { m, advance } = clockedMerger()
+  const ui = createUiModel()
+  m.onLocal(T58_LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(T58_BASELINE).forEach(ui.apply)
+  m.setCurrentSession('session-l2')
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }).forEach(ui.apply) // s1 closed (in grace)
+  advance(2_001)
+  m.setCurrentSession('session-l2').forEach(ui.apply) // the poll's re-judge hides
+  // through the REAL UI model: the group still lists the hidden session
+  // (in place under 「显示已归档」) and the archived set hides it under the
+  // default filter — membership in a group, so never a 「未分组」 stray
+  const group = ui.model.items.find((item) => item.workspaceId === V('w-1'))
+  assert.deepEqual(group.sessionIds, [V('s2'), V('s1')])
+  assert.equal(ui.model.archivedSessionIds.includes(V('s1')), true)
+})
+
+test('T58/T65 RT UI model: the open closed session keeps its group slot for the banner; leaving archives it in place', () => {
+  const { m, advance } = clockedMerger()
   const ui = createUiModel()
   m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
   m.onRemote(T58_BASELINE).forEach(ui.apply)
@@ -1303,26 +1355,29 @@ test('T58 RT UI model: the open closed session keeps its group slot for the bann
   assert.deepEqual(group.sessionIds, [V('s2'), V('s1')], 'the open page keeps its slot for the 「远程已关闭」 banner')
   assert.equal(ui.model.archivedSessionIds.includes(V('s1')), false, 'NOT archived — clearArchivedCurrent must not kick the open page')
 
-  // the user navigates away (the poll reports the new selection): the group
-  // drops the tombstone and the archived list takes over the hiding —
-  // exactly what sessionVisible checks under the default filter
+  // the user navigates away (the poll reports the new selection); past the
+  // grace the hide lands: the archived set takes over the hiding while the
+  // group membership survives
+  advance(2_001)
   m.setCurrentSession('session-l2').forEach(ui.apply)
   group = ui.model.items.find((item) => item.workspaceId === V('w-1'))
-  assert.deepEqual(group.sessionIds, [V('s2')])
-  assert.equal(ui.model.archivedSessionIds.includes(V('s1')), true)
+  assert.deepEqual(group.sessionIds, [V('s2'), V('s1')], 'the group membership survives the hide')
+  assert.equal(ui.model.archivedSessionIds.includes(V('s1')), true, 'archived — invisible under the default filter, in place under 「显示已归档」')
 })
 
 // -- 12. T58-fix: review findings -----------------------------------------------------
 
 test('T58-fix: a local archived frame and a local baseline merge instead of passing verbatim while hidden sessions exist', () => {
-  const m = merger()
+  const { m, advance } = clockedMerger()
   const ui = createUiModel()
   m.onLocal(T58_LOCAL_BASELINE).forEach(ui.apply)
   m.onRemote(T58_BASELINE).forEach(ui.apply)
   m.setCurrentSession('session-l2')
-  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }).forEach(ui.apply) // s1 closed → hidden
-  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-2', '远端二', []) }).forEach(ui.apply) // s3 closed → hidden
-  // the emptied groups are deleted server-side: the hidden sessions go sticky
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }).forEach(ui.apply) // s1 closed (in grace)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-2', '远端二', []) }).forEach(ui.apply) // s3 closed (in grace)
+  advance(2_001)
+  m.setCurrentSession('session-l2').forEach(ui.apply) // the poll's re-judge hides both
+  // the emptied-content groups are deleted server-side: the hidden sessions go sticky
   m.onRemote({ type: 'remove', workspaceId: 'w-1' }).forEach(ui.apply)
   m.onRemote({ type: 'remove', workspaceId: 'w-2' }).forEach(ui.apply)
   assert.equal(ui.ids(), 'ws-local')
@@ -1344,41 +1399,42 @@ test('T58-fix: a local archived frame and a local baseline merge instead of pass
   assert.ok(ui.model.archivedSessionIds.includes(V('s3')))
 })
 
-test('T58-fix: setCurrentSession first-shows a never-seen group WITH its order frame, upsert before the archived frame', () => {
-  const m = merger()
+test('T65: a group whose only session is hidden is not first-shown; revealing the session updates only the archived set', () => {
+  const { m, advance } = clockedMerger()
   // everything remote lands BEFORE the local baseline: w-1 arrives, closes,
-  // and hides while still cached — the UI never sees it
+  // and hides while still cached — the UI never sees the group
   m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', ['s1'])], archivedSessionIds: [], pinnedSessionIds: [] } })
   m.setCurrentSession('session-l2') // readable while still pre-baseline
   m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', []) }) // s1 closed while cached
-  // the flush hides s1 and never shows w-1 (its only content was the hidden tombstone)
+  advance(2_001) // the cached close's grace passes before the page's first frame
+  // the flush hides s1 and never shows w-1: its only member is hidden, and
+  // the host draws a bare group heading even when every member is
+  // archived-invisible — so the first-show gate counts visible content only
   const flushed = m.onLocal(LOCAL_BASELINE)
   assert.deepEqual(flushed, [
     { type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: [V('s1')], pinnedSessionIds: [] } },
   ])
   assert.equal(m.hasPendingHide, false)
 
-  // the user opens s1: it must leave archived at once — and since its group
-  // was never shown, the reveal carries its order position. Frame order is
-  // load-bearing: the group's upsert FIRST (the session is back in a group
-  // while still archived-hidden), the archived frame that clears it AFTER —
-  // reversed, the session would sit in 「未分组」 for one frame.
+  // the user opens s1 (restoreSelection): the reveal updates ONLY the
+  // archived set — no group upsert, no order frame. The group membership
+  // never changed (the tombstone rode the record all along); w-1 stays
+  // unshown until a real frame of its own.
   const out = m.setCurrentSession(V('s1'))
-  assert.deepEqual(out, [
-    { type: 'upsert', workspace: { ...remoteWorkspace('w-1', '远端一', []), workspaceId: V('w-1'), title: `${NAME} · 远端一`, sessionIds: [V('s1')] } },
-    { type: 'order', workspaceIds: ['ws-local', V('w-1')] },
-    { type: 'archived', archivedSessionIds: [] },
-  ])
+  assert.deepEqual(out, [{ type: 'archived', archivedSessionIds: [] }])
+  assert.equal(m.hasPendingHide, true, 'kept because CURRENT — the poll watches for the next navigate-away')
 })
 
 test('T58-fix: onRemoteGone with ONLY hidden sessions left still restores the archived list', () => {
-  const m = merger()
+  const { m, advance } = clockedMerger()
   m.onLocal(LOCAL_BASELINE)
   m.onRemote(T58_BASELINE)
   m.setCurrentSession('session-l2')
-  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 hidden
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 closed (in grace)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-2', '远端二', []) }) // s3 closed (in grace)
+  advance(2_001)
+  m.setCurrentSession('session-l2') // the poll's re-judge hides both
   m.onRemote({ type: 'remove', workspaceId: 'w-1' }) // group deleted — s1 sticky-hidden
-  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-2', '远端二', []) }) // s3 hidden
   m.onRemote({ type: 'remove', workspaceId: 'w-2' })
   // nothing shown and both server lists empty — but the hidden ids sit in
   // the UI's archived set and must leave it with the identity
@@ -1466,17 +1522,23 @@ test('T63 virtualSessionIdsInWorkspaceFrames: upserts and baselines, virtual ids
   assert.deepEqual(virtualSessionIdsInWorkspaceFrames([]), [])
 })
 
-test('T63 e2e at the merger level: a hidden closed-remote session never rides the forwarded frames, so it can never be announced', () => {
-  const m = merger()
+test('T63/T65 e2e at the merger level: a hidden closed-remote session rides the forwarded frames, and the sync\'s asked-once gate covers it', () => {
+  const { m, advance } = clockedMerger()
   m.onLocal(LOCAL_BASELINE)
   // readable current session = a LOCAL one: the T58 hiding arms
   m.setCurrentSession('session-l1')
   m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', ['s1', 's2'])], archivedSessionIds: [], pinnedSessionIds: [] } })
-  // the closure: the group retracts s2 — the tombstone hides
+  // the closure: the group retracts s2 — inside the grace the tombstone
+  // stays in the forwarded group and nothing is archived yet
   const out = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s1']) })
-  // leading archived frame carries the hidden id; the forwarded group does not
-  assert.deepEqual(out[0], { type: 'archived', archivedSessionIds: [V('s2')] })
-  assert.deepEqual(out[1].workspace.sessionIds, [V('s1')])
-  // the ids a sync would be nudged about: only the live one
-  assert.deepEqual(virtualSessionIdsInWorkspaceFrames(out), [V('s1')])
+  assert.deepEqual(out, [w1As(['s1', 's2'])])
+  assert.deepEqual(virtualSessionIdsInWorkspaceFrames(out), [V('s1'), V('s2')])
+  // past the grace the poll re-judge hides: the archived frame is the whole
+  // update, and the forwarded frames STILL carry the hidden id — the sync's
+  // asked-once gate (T65) is what stops it re-pulling the list every frame
+  advance(2_001)
+  const hidden = m.setCurrentSession('session-l1')
+  assert.deepEqual(hidden, [{ type: 'archived', archivedSessionIds: [V('s2')] }])
+  const refresh = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s1']) })
+  assert.deepEqual(virtualSessionIdsInWorkspaceFrames(refresh), [V('s1'), V('s2')])
 })

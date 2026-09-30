@@ -138,6 +138,22 @@ function makeLog() {
   return { lines, log: (format, ...args) => lines.push([format, ...args]) }
 }
 
+/** A RelayClock whose only fake part is `now()` — the tombstone hide grace
+ * (T65) is time-gated, and the tests need to cross it without real waiting.
+ * The timers stay real. */
+function clockWithFakeNow() {
+  let nowMs = 1_700_000_000_000
+  return {
+    clock: {
+      now: () => nowMs,
+      setTimeout: (fn, ms) => setTimeout(fn, ms),
+      clearTimeout: (handle) => clearTimeout(handle),
+      random: () => 0.5,
+    },
+    advance: (ms) => { nowMs += ms },
+  }
+}
+
 function install(raw, relay, overrides = {}) {
   const logging = makeLog()
   const handle = installIntercept({
@@ -145,6 +161,7 @@ function install(raw, relay, overrides = {}) {
     relay,
     getServerId: overrides.getServerId ?? (() => SERVER_ID),
     ...(overrides.getCurrentSession !== undefined ? { getCurrentSession: overrides.getCurrentSession } : {}),
+    ...(overrides.clock !== undefined ? { clock: overrides.clock } : {}),
     log: logging.log,
   })
   // T52-fix3: installing into an already-online relay fires one proactive
@@ -749,16 +766,18 @@ test('workspace/follow merges the two legs: local first, remote upserts + merged
   handle.uninstall()
 })
 
-test('T62 wiring: the current session comes from the injected browser report — a close is judged per report, and currentSessionChanged hides without waiting for the poll', async () => {
+test('T62/T65 wiring: the current session comes from the injected browser report — a close is judged per report, and past the grace the notification lands the hide at once', async () => {
   // The intercept runs in the backend Node process; the current-session
   // value arrives from the browser half through the client route and is
   // held by the wiring — here, one mutable holder behind the injected
-  // getter (index.ts does exactly this with `reportedCurrentSession`).
+  // getter (index.ts does exactly this with `reportedCurrentSession`). The
+  // fake `now` crosses the tombstone hide grace (T65) without real waiting.
+  const { clock, advance } = clockWithFakeNow()
   let current = { kind: 'unavailable' }
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
   const relay = createControllableRelay()
-  const { handle } = install(gateway, relay, { getCurrentSession: () => current })
+  const { handle } = install(gateway, relay, { getCurrentSession: () => current, clock })
   const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
   localGate.push(LOCAL_BASELINE)
   await readSome(iterator, 1)
@@ -774,19 +793,26 @@ test('T62 wiring: the current session comes from the injected browser report —
   handle.currentSessionChanged()
 
   // session-b's remote closes WHILE the user has it open: the tombstone
-  // stays (the page keeps its 「远程已关闭」 banner), nothing is archived.
+  // stays (the page keeps its 「远程已关闭」 banner), nothing is archived —
+  // and inside the grace it rides the group as before.
   relay.streams[0].gate.push({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['session-a']) })
   const [kept] = await readSome(iterator, 1)
   assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a'), toVirtual(SERVER_ID, 'session-b')])
 
   // The browser reports the user navigated away (a readable "nothing
-  // open"): the change notification re-judges AT ONCE — archived first,
-  // then the group drops the tombstone. No poll tick, no real waiting.
+  // open"); past the grace the change notification re-judges AT ONCE — one
+  // merged archived frame, no group upsert (T65: hiding moves only the
+  // archived set).
   current = { kind: 'none' }
+  advance(2_001)
   handle.currentSessionChanged()
-  const [archived, dropped] = await readSome(iterator, 2)
+  const [archived] = await readSome(iterator, 1)
   assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [toVirtual(SERVER_ID, 'session-b')] })
-  assert.deepEqual(dropped.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a')])
+  // and the group still carries the tombstone: a marker frame after the
+  // notification proves no group upsert followed
+  localGate.push({ type: 'pinned', pinnedSessionIds: [] })
+  const [marker] = await readSome(iterator, 1)
+  assert.equal(marker.type, 'pinned', 'no group upsert — hiding is the archived set alone')
 
   controller.abort()
   localGate.finish()
@@ -826,15 +852,17 @@ test('T62 wiring: no report yet (getter unavailable) keeps the conservative tomb
   handle.uninstall()
 })
 
-test('T62 e2e: the REAL client route feeds the intercept — report A, close A, report B, A enters archived', async () => {
+test('T62/T65 e2e: the REAL client route feeds the intercept — report A, close A, report B, A enters archived', async () => {
   // The route and the intercept exactly as index.ts wires them: the route's
   // sink stores the report and calls handle.currentSessionChanged(); the
-  // intercept reads the holder per use.
+  // intercept reads the holder per use. The fake `now` crosses the hide
+  // grace (T65) without real waiting.
+  const { clock, advance } = clockWithFakeNow()
   let reported = { kind: 'unavailable' }
   const controller = new AbortController()
   const { gateway, localGate } = createMergeGateway(controller.signal)
   const relay = createControllableRelay()
-  const { handle } = install(gateway, relay, { getCurrentSession: () => reported })
+  const { handle } = install(gateway, relay, { getCurrentSession: () => reported, clock })
   const handler = routes.createClientHandler({
     admit: () => ({ peer: {} }),
     getRowConfig: () => ({ role: 'client' }),
@@ -869,7 +897,8 @@ test('T62 e2e: the REAL client route feeds the intercept — report A, close A, 
     assert.deepEqual(kept.workspace.sessionIds, [toVirtual(SERVER_ID, 'session-a')], 'the open closed session keeps its tombstone')
 
     // The user navigates away: the report of B (a local id) arrives through
-    // the REAL route — A moves into archived and out of the group.
+    // the REAL route; past the grace the notification lands the hide — one
+    // merged archived frame (T65: the group copy keeps the tombstone).
     const away = await request(port, {
       method: 'POST',
       path: '/_dsh/zen-remote/client/current-session',
@@ -877,9 +906,10 @@ test('T62 e2e: the REAL client route feeds the intercept — report A, close A, 
       body: { sessionId: 'session-l2' },
     })
     assert.equal(away.status, 200)
-    const [archived, dropped] = await readSome(iterator, 2)
+    advance(2_001)
+    handle.currentSessionChanged()
+    const [archived] = await readSome(iterator, 1)
     assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [toVirtual(SERVER_ID, 'session-a')] })
-    assert.deepEqual(dropped.workspace.sessionIds, [], 'the tombstone left the group')
 
     controller.abort()
     localGate.finish()
@@ -2622,7 +2652,7 @@ test('T63-fix: the workspace route nudges about an unannounced session id once �
   await workspacesIterator.return?.(undefined)
 })
 
-test('T63 regression: a hidden closed-remote session stays hidden — the server list does not carry it and no announce resurrects it', async () => {
+test('T63/T65 regression: a hidden closed-remote session stays hidden, nudges once, and keeps riding its group', async () => {
   const { gateway, gates } = createPerEndpointGateway()
   const relay = createControllableRelay()
   // The server serves only the live session: the closed one left the share
@@ -2635,8 +2665,10 @@ test('T63 regression: a hidden closed-remote session stays hidden — the server
   // Same wire-shape gate as above: the announce only proves anything if the
   // fetch would actually serve on the real server.
   enforceSessionListWireShape(relay)
-  // A readable current session (a LOCAL one) arms the T58 hiding.
-  const { handle } = install(gateway, relay, { getCurrentSession: () => ({ kind: 'open', sessionId: 'local-current' }) })
+  // A readable current session (a LOCAL one) arms the T58 hiding; the fake
+  // `now` crosses the T65 hide grace without real waiting.
+  const { clock, advance } = clockWithFakeNow()
+  const { handle } = install(gateway, relay, { getCurrentSession: () => ({ kind: 'open', sessionId: 'local-current' }), clock })
   const controller = new AbortController()
   const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
   const eventsIterator = events[Symbol.asyncIterator]()
@@ -2657,21 +2689,203 @@ test('T63 regression: a hidden closed-remote session stays hidden — the server
   const [added] = await readSome(eventsIterator, 1)
   assert.deepEqual(added.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }])
 
-  // The closure lands (the group's copy retracts the closed session): the
-  // tombstone HIDES — the leading archived frame carries the closed id, the
-  // forwarded group drops it — and the nudge that retraction produces asks
-  // for nothing new (the id is gone from the forwarded frames; the announce
-  // already ran).
+  // The closure lands (the group's server-side copy retracts the closed
+  // session): inside the hide grace the tombstone rides the group and
+  // nothing is archived yet.
   const closedVirtual = toVirtual(SERVER_ID, 'session-closed')
   relay.streams[1].gate.push({ type: 'upsert', workspace: T63_WORKSPACE })
-  const [archived] = await readSome(workspacesIterator, 2)
-  assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [closedVirtual] })
+  const [duringGrace] = await readSome(workspacesIterator, 1)
+  assert.deepEqual(duringGrace.workspace.sessionIds, [
+    toVirtual(SERVER_ID, 'session-shared'),
+    closedVirtual,
+  ], 'the just-closed tombstone stays in the group inside the grace')
+  // The closure's nudge asked about [shared, closed] — both already
+  // announced-or-asked, so no second fetch: the tombstone nudges exactly
+  // once even though it keeps riding every forwarded frame (T65).
   await new Promise((resolve) => setTimeout(resolve, 50))
   assert.equal(relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length, 1)
+
+  // Past the grace, the current-session re-judge (the poll's call) hides:
+  // one archived frame on the workspace stream — and a refresher upsert
+  // still carries the hidden id in the group.
+  advance(2_001)
+  handle.currentSessionChanged()
+  const [archived] = await readSome(workspacesIterator, 1)
+  assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [closedVirtual] })
+  relay.streams[1].gate.push({ type: 'upsert', workspace: T63_WORKSPACE })
+  const [refresh] = await readSome(workspacesIterator, 1)
+  assert.deepEqual(refresh.workspace.sessionIds, [
+    toVirtual(SERVER_ID, 'session-shared'),
+    closedVirtual,
+  ], 'the hidden id keeps riding the forwarded group')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length, 1, 'still one fetch — asked-once holds')
   // No second added frame ever reached the events stream.
   await eventsIterator.return?.(undefined)
   await workspacesIterator.return?.(undefined)
   assert.equal(handle.diagnostics().recentFailures.length, 0)
+})
+
+/** A gateway whose `$events` taps each open a FRESH gate (the T65 multi-
+ * subscriber tests drive two live $events generations side by side). */
+function createMultiEventsGateway() {
+  const gateway = new FakeTypertGateway()
+  const gates = {}
+  gateway.openWireStream = async function (endpoint, payload, uplink, peer, legSignal, control) {
+    gateway.streamCalls.push({ endpoint, payload, uplink, peer, signal: legSignal, control })
+    if (endpoint === '$events') {
+      const gate = createGate(legSignal)
+      ;(gates.events ??= []).push(gate)
+      return gate.iterable
+    }
+    if (gates[endpoint] === undefined) gates[endpoint] = createGate(legSignal)
+    return gates[endpoint].iterable
+  }
+  return { gateway, gates }
+}
+
+const T65_SECOND_ROW = { sessionId: 'session-second', updatedAt: 6 }
+const T65_THIRD_ROW = { sessionId: 'session-third', updatedAt: 7 }
+
+test('T65 sync: every live $events stream receives the nudge and announces for itself — two streams, two syncs, both quiet afterwards', async () => {
+  const { gateway, gates } = createMultiEventsGateway()
+  const relay = createControllableRelay()
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW] },
+  }
+  enforceSessionListWireShape(relay)
+  install(gateway, relay)
+  const controller = new AbortController()
+  const openEvents = async () => {
+    const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+    const iterator = events[Symbol.asyncIterator]()
+    const index = gates.events.length - 1
+    gates.events[index].push(READY)
+    await readSome(iterator, 1)
+    return iterator
+  }
+  const events1 = await openEvents()
+  const events2 = await openEvents()
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 3)
+
+  // ONE workspace nudge: the broadcast reaches BOTH streams, and each —
+  // judging its own empty sets — runs its own sync and announces its own
+  // consumer (the old latest-subscriber-wins hub starved the first stream).
+  relay.streams[2].gate.push({ type: 'baseline', value: { items: [T63_WORKSPACE], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+  const [added1] = await readSome(events1, 1)
+  const [added2] = await readSome(events2, 1)
+  assert.deepEqual(added1.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }])
+  assert.deepEqual(added2.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }])
+  const listCount = () => relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length
+  assert.equal(listCount(), 2, 'each stream syncs for itself')
+
+  // a second workspace frame with the SAME id: both streams' sets have it —
+  // neither re-syncs, neither re-pushes
+  relay.streams[2].gate.push({ type: 'upsert', workspace: T63_WORKSPACE })
+  await readSome(workspacesIterator, 1)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(listCount(), 2)
+  await events1.return?.(undefined)
+  await events2.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
+})
+
+test('T65 sync: a new page\'s stream syncs again after the previous page announced — the sets are per stream', async () => {
+  // Fresh $events gates per tap: page 2's LOCAL leg must be a new stream, not
+  // the drained one page 1 left behind.
+  const { gateway, gates } = createMultiEventsGateway()
+  const relay = createControllableRelay()
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW] },
+  }
+  enforceSessionListWireShape(relay)
+  install(gateway, relay)
+  const controller = new AbortController()
+  // The events stream opens FIRST (relay stream 0), the workspace leg second
+  // (relay stream 1) — the same order the T63 tests pin.
+  const events1 = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const events1Iterator = events1[Symbol.asyncIterator]()
+  gates.events[0].push(READY)
+  await readSome(events1Iterator, 1)
+  await waitForStream(relay, 1)
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 2)
+  assert.equal(relay.streams[1].method, 'follow')
+
+  // Page 1: the nudge announces the shared row on THIS stream.
+  relay.streams[1].gate.push({ type: 'baseline', value: { items: [T63_WORKSPACE], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+  const [added1] = await readSome(events1Iterator, 1)
+  assert.deepEqual(added1.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }])
+  const listCount = () => relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length
+  assert.equal(listCount(), 1)
+  await events1Iterator.return?.(undefined)
+
+  // Page 2 (the refresh): a NEW $events generation whose sets start empty —
+  // the same id nudges again and the sync runs again for the new consumer.
+  const events2 = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const events2Iterator = events2[Symbol.asyncIterator]()
+  gates.events[1].push(READY)
+  await readSome(events2Iterator, 1)
+  relay.streams[1].gate.push({ type: 'upsert', workspace: T63_WORKSPACE })
+  const [added2] = await readSome(events2Iterator, 1)
+  assert.deepEqual(added2.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }], 'the new generation is not skipped by the old one\'s sets')
+  assert.equal(listCount(), 2)
+  await events2Iterator.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
+})
+
+test('T65 sync: a later sync pushes only the rows not announced yet — announced rows are never re-pushed', async () => {
+  const { gateway, gates } = createPerEndpointGateway()
+  const relay = createControllableRelay()
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW, T65_SECOND_ROW] },
+  }
+  enforceSessionListWireShape(relay)
+  install(gateway, relay)
+  const controller = new AbortController()
+  const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const eventsIterator = events[Symbol.asyncIterator]()
+  gates['$events'].push(READY)
+  await readSome(eventsIterator, 1)
+  await waitForStream(relay, 1)
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push({ type: 'baseline', value: { items: [T63_WORKSPACE], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+
+  // The first sync announces BOTH rows the list served.
+  const [first1, first2] = await readSome(eventsIterator, 2)
+  assert.deepEqual(first1.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }])
+  assert.deepEqual(first2.args, [{ sessionId: toVirtual(SERVER_ID, T65_SECOND_ROW.sessionId), updatedAt: 6 }])
+
+  // A THIRD session is shared mid-page: its id is unannounced, so one new
+  // sync runs — and the fresh answer re-serves all three rows, of which
+  // only the new one may reach the UI (a re-pushed row races the host's own
+  // applyMutation and can flip a just-idle session back to running).
+  relay.invokeValues['session/list'] = { items: [T63_SHARED_ROW, T65_SECOND_ROW, T65_THIRD_ROW] }
+  relay.streams[1].gate.push({ type: 'upsert', workspace: { ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-third'] } })
+  await readSome(workspacesIterator, 1)
+  const [third] = await readSome(eventsIterator, 1)
+  assert.deepEqual(third.args, [{ sessionId: toVirtual(SERVER_ID, 'session-third'), updatedAt: 7 }], 'only the unannounced row travels')
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length, 2)
+  await eventsIterator.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
 })
 
 // -- T32: the $events/result answer split ---------------------------------------------

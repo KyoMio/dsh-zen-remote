@@ -64,32 +64,30 @@
  *   `sessionIds`) renders it live again and clears the tombstone; the
  *   tombstone dies with its workspace (a remove) and with the identity
  *   (onRemoteGone).
- * - T58 reworks the tombstone's VISIBILITY: a closed-remote session is
- *   HIDDEN — moved into the merged `archived` set (the host's
- *   `sessionVisible` hides archived ids under the default filter) and
- *   dropped from its group's forwarded copy — instead of parking in the
- *   group forever. The one exception is the session the user currently has
- *   OPEN: its tombstone stays (the page must keep its 「远程已关闭」 banner),
- *   and once the caller reports a different current session
+ * - T58 reworks the tombstone's VISIBILITY, reshaped by T65: a closed-remote
+ *   session is HIDDEN — moved into the merged `archived` set (the host's
+ *   `sessionVisible` hides archived ids under the default filter) — while
+ *   STAYING in its group's forwarded `sessionIds`: under「显示已归档」it
+ *   renders in place, and it can never resurface as a 「未分组」 stray. The
+ *   one exception is the session the user currently has OPEN: it is not
+ *   hidden at all (the page must keep its 「远程已关闭」 banner), and once
+ *   the caller reports a different current session
  *   ({@link WorkspaceMerger.setCurrentSession}) it moves into `archived`
  *   too. `archived` is exactly what the host's navigation guard
  *   `clearArchivedCurrent` acts on, so the CURRENT session may never enter
  *   it — and an unreadable current-session signal falls back to the
- *   conservative tombstone behavior (nothing is hidden). Re-sharing the
- *   session takes it back out of `archived` (live-carried ids never count
- *   as hidden). Frame order follows the flash rule: an archived frame that
- *   ADDS ids precedes the workspace frames (hide before the group drops the
- *   row), one that REMOVES ids follows them (the group regains the row
- *   while it is still archived-hidden). Single-direction changes therefore
- *   never flash a stray; when ONE update both hides and reveals, the
- *   leading archived frame already excludes the revealed ids, so a revealed
- *   id can flash in 「未分组」 for the one frame before its group's upsert
- *   lands — an accepted, vanishingly small window. A revealed id that is
- *   CURRENT at that moment is an exception in the other direction: it must
- *   leave `archived` at once, or the navigation guard kicks its page. The
- *   hidden ids are sticky: they survive even the death of their home
- *   workspace (a hidden session whose group is deleted must not resurface
- *   as a stray) until a re-share or the identity ends.
+ *   conservative tombstone behavior (nothing is hidden). Because the
+ *   browser's report can lag the user's switch by up to a poll interval, a
+ *   JUST-created tombstone is not hidden for a short grace (T65, injectable
+ *   clock): the 1s poll re-judges with the fresh report afterwards — the
+ *   session the user really switched to keeps its tombstone, anything else
+ *   hides. Re-sharing the session takes it back out of `archived`
+ *   (live-carried ids never count as hidden). Since hiding moves only the
+ *   archived set, hide/reveal updates are exactly one merged archived frame
+ *   — no group content changes, no ordering dance; the current session
+ *   never enters the set by construction. The hidden ids are sticky: they
+ *   survive even the death of their home workspace until a re-share or the
+ *   identity ends.
  * - a workspace with NOTHING to show is not shown at all (T56): the server
  *   keeps every workspace and only narrows `sessionIds` (relay-filter.ts),
  *   so a workspace where nothing is shared would arrive as an empty group
@@ -219,6 +217,9 @@ export interface WorkspaceMergerOptions extends MergerIdentity {
   /** Diagnostics for frames this merger dropped (unknown type or malformed).
    * Optional: without it the drop is silent. */
   onDiagnostic?: (message: string) => void
+  /** T65: the clock the tombstone hide-grace runs on. Default Date.now;
+   * tests advance an injectable fake to cross the grace. */
+  now?: () => number
 }
 
 export interface WorkspaceMerger {
@@ -338,8 +339,14 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   // or the identity ends (onRemoteGone). Never contains the current
   // session — the host's clearArchivedCurrent would kick its open page.
   const hiddenSessions = new Set<string>()
+  // T65: when each tombstone was CREATED (the moment a close frame dropped a
+  // live id), for the hide grace below. Entries die with the tombstone: a
+  // re-carried id leaves, a forgotten workspace takes its ids, the identity
+  // end clears the rest.
+  const closedAt = new Map<string, number>()
   // The status annotation every virtualized title currently carries (T34).
   let annotation: MergerAnnotation = 'none'
+  const now = options.now ?? Date.now
 
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
   // Only SHOWN workspaces travel in order frames (T56): a hidden group has no
@@ -359,7 +366,27 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
    * their group (a server remove / a workspace diffed away; a session that
    * moved on lives under its NEW home and survives this). */
   function forgetWorkspace(workspaceId: string): void {
-    for (const [id, home] of sessionHome) if (home === workspaceId) sessionHome.delete(id)
+    for (const [id, home] of sessionHome) {
+      if (home === workspaceId) {
+        sessionHome.delete(id)
+        closedAt.delete(id)
+      }
+    }
+  }
+
+  /** T65: stamp the ids that JUST left a workspace's live list (their
+   * tombstones were created by this frame) and clear the ones that came
+   * back. The grace window is judged from these stamps. */
+  function noteClosedTransitions(prevRecord: Record<string, unknown> | undefined, nextRecord: Record<string, unknown>): void {
+    const prevLive = prevRecord === undefined ? [] : stringList(prevRecord.sessionIds)
+    const nextLive = stringList(nextRecord.sessionIds)
+    const stamp = now()
+    for (const id of prevLive) {
+      if (!nextLive.includes(id)) closedAt.set(id, stamp)
+    }
+    for (const id of nextLive) {
+      if (closedAt.has(id)) closedAt.delete(id)
+    }
   }
 
   /** The CURRENT session as an ORIGINAL id of THIS server — undefined when
@@ -371,23 +398,34 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
     return parts !== undefined && parts.serverId === identity.serverId ? parts.id : undefined
   }
 
+  /** The hide grace (T65): a freshly closed session is not hidden for this
+   * long, because the browser's current-session report can lag the user's
+   * switch by up to a poll interval — a close frame naming the session the
+   * user JUST opened would read the stale value and archive the open page
+   * (the host's clearArchivedCurrent kicks it home). The 1s poll re-judges
+   * with the fresh report once the grace passes. */
+  const TOMBSTONE_HIDE_GRACE_MS = 2_000
+
   /** T58: whether the tombstone of `id` is HIDDEN (moved into the merged
    * archived set) rather than kept visible in its group. Only an actually
    * readable current-session signal hides anything: before the first
    * {@link WorkspaceMerger.setCurrentSession} call, every tombstone stays
-   * (the conservative fallback). */
+   * (the conservative fallback) — and a JUST-created tombstone stays for
+   * the grace regardless (T65). */
   function hideTombstone(id: string): boolean {
     if (!currentReadable) return false
+    const closed = closedAt.get(id)
+    if (closed !== undefined && now() - closed < TOMBSTONE_HIDE_GRACE_MS) return false
     return currentOriginal() !== id
   }
 
   /** T58: re-derive {@link hiddenSessions} from the live tombstone set —
    * tombstones hide unless they ARE the current session (or no readable
-   * current is known); live-carried ids and ids that (re-)became the current
-   * session leave the set. Returns the transitions grouped by direction so
-   * the caller can order the frames: `hidden` ids must enter `archived`
-   * BEFORE their group drops them, `revealed` ids must leave `archived`
-   * AFTER their group regains them. */
+   * current is known, or the tombstone is inside the T65 hide grace);
+   * live-carried ids and ids that (re-)became the current session leave the
+   * set. Since T65 the hide/reveal transitions move ONLY the archived set —
+   * the session stays in its group's forwarded copy either way — so the
+   * caller emits just the merged archived frame when anything changed. */
   function syncHiddenSessions(): { hidden: string[]; revealed: string[] } {
     const hidden: string[] = []
     const revealed: string[] = []
@@ -415,31 +453,41 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
    * record no longer carries — appended at the end of `sessionIds`
    * (CP4-client-fix2). Liveness is judged against the record's ORIGINAL
    * sessionIds (the registry stores originals; the forwarded copy is
-   * virtualized). */
+   * virtualized). Since T65 a HIDDEN tombstone rides the group too: the
+   * session stays in its group so the host's「显示已归档」filter can show it
+   * in place — hiding is purely the archived set. */
   function forwardWorkspace(record: Record<string, unknown>): Record<string, unknown> {
     const out = virtualizeWorkspace(record, identity, annotation)
     const workspaceId = typeof record.workspaceId === 'string' ? record.workspaceId : undefined
     const live = stringList(record.sessionIds)
     if (workspaceId === undefined || !Array.isArray(out.sessionIds)) return out
     for (const [id, home] of sessionHome) {
-      // T58: a HIDDEN tombstone does not ride the group — its session is
-      // archived-hidden instead (it is not the current session).
-      if (home === workspaceId && !live.includes(id) && !hideTombstone(id)) out.sessionIds.push(virtualize(id))
+      if (home === workspaceId && !live.includes(id)) out.sessionIds.push(virtualize(id))
     }
     return out
   }
   /** T56: the forwarded record when the UI may see this workspace, else
    * undefined — a never-shown workspace is forwarded only once its forwarded
-   * sessionIds (live + tombstones) first carries content, and forwarding it
-   * marks it shown for good. Only call on paths that actually emit (after
-   * the local baseline has passed): a mark here is a claim that the UI now
-   * holds the group. */
+   * sessionIds first carries VISIBLE content, and forwarding it marks it
+   * shown for good. Only call on paths that actually emit (after the local
+   * baseline has passed): a mark here is a claim that the UI now holds the
+   * group. Visible means NOT hidden (T65): the host draws a group heading
+   * even when every member is archived-invisible under the default filter,
+   * so a group whose members are all hidden must not be first-shown —
+   * the forwarded copy itself still carries the hidden ids. */
   function forwardVisible(record: Record<string, unknown>): Record<string, unknown> | undefined {
     const id = typeof record.workspaceId === 'string' ? record.workspaceId : undefined
     if (id !== undefined && shown.has(id)) return forwardWorkspace(record)
     const out = forwardWorkspace(record)
     const ids = Array.isArray(out.sessionIds) ? out.sessionIds : []
-    if (ids.length === 0) return undefined
+    let visible = false
+    for (const virtualId of ids) {
+      const parts = fromVirtual(virtualId)
+      if (parts !== undefined && parts.serverId === identity.serverId && hiddenSessions.has(parts.id)) continue
+      visible = true
+      break
+    }
+    if (!visible) return undefined
     if (id !== undefined) shown.add(id)
     return out
   }
@@ -611,17 +659,17 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           }
           const out: unknown[] = []
           // The remote truth moves FIRST (the sync and every frame below are
-          // built against the NEW records), then the frames: a leading
-          // archived frame when the hide set grew (T58 — hide before the
-          // groups drop the rows), then the diffed upserts / removes, then
-          // the canonical order / archived / pinned (the trailing archived
-          // also covers any REVEALED ids — it must follow the upserts).
+          // built against the NEW records; close stamps start the grace per
+          // dropped id — T65), then the diffed upserts / removes and the
+          // canonical order / archived / pinned. The trailing archived frame
+          // covers any hide/reveal the new records caused: since T65 hiding
+          // moves only the archived set, nothing can flash in between.
           const prev = remote
           remote = next
           remoteArchived = nextArchived
           remotePinned = nextPinned
-          const changed = syncHiddenSessions()
-          if (changed.hidden.length > 0) out.push(mergedArchivedFrame())
+          for (const [id, record] of next) noteClosedTransitions(prev.get(id), record)
+          syncHiddenSessions()
           for (const [, record] of next) {
             const forwarded = forwardVisible(record)
             if (forwarded !== undefined) out.push({ type: 'upsert', workspace: forwarded })
@@ -644,12 +692,17 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           }
           const workspace: Record<string, unknown> = frame.workspace
           const id = workspace.workspaceId as string
+          // T65: stamp the close first — the ids the OLD record carried live
+          // and this one drops just became tombstones (the grace starts now).
+          const prevRecord = remote.get(id)
           remote.set(id, { ...workspace })
           learnSessions(workspace, id)
+          noteClosedTransitions(prevRecord, workspace)
           if (!localSeen) return []
-          // T58 first: this record change may have hidden or revealed
-          // tombstones — the archived frames must agree with the forwarded
-          // copy below (adds BEFORE it, removes AFTER it).
+          // T65: hide/reveal moves only the archived set (the session keeps
+          // its group slot), so the group's upsert and the archived frame no
+          // longer race — one trailing archived frame after the group's own
+          // update covers both directions.
           const changed = syncHiddenSessions()
           // The tombstone-padded upsert is the whole update; a workspace the
           // UI has not seen (new, or hidden until now — T56) additionally
@@ -657,12 +710,11 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           const wasShown = shown.has(id)
           const forwarded = forwardVisible(workspace)
           const out: unknown[] = []
-          if (changed.hidden.length > 0) out.push(mergedArchivedFrame())
           if (forwarded !== undefined) {
             out.push({ type: 'upsert', workspace: forwarded })
             if (!wasShown) out.push(mergedOrderFrame())
           }
-          if (changed.revealed.length > 0) out.push(mergedArchivedFrame())
+          if (changed.hidden.length > 0 || changed.revealed.length > 0) out.push(mergedArchivedFrame())
           return out
         }
         case 'remove': {
@@ -749,34 +801,13 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       currentRaw = sessionId
       currentReadable = true
       if (!localSeen) return []
+      // T65: hide/reveal moves ONLY the archived set — the session keeps its
+      // group slot either way, so the whole update is the merged archived
+      // frame (no group upserts, no ordering dance; the current session can
+      // never enter the set, and a re-share removes its id from it).
       const changed = syncHiddenSessions()
       if (changed.hidden.length === 0 && changed.revealed.length === 0) return []
-      // Every group whose forwarded tombstones just changed needs a fresh
-      // upsert; the archived frames ride the flash rule (adds before,
-      // removes after).
-      const homes = new Set<string>()
-      for (const id of [...changed.hidden, ...changed.revealed]) {
-        const home = sessionHome.get(id)
-        if (home !== undefined && remote.has(home)) homes.add(home)
-      }
-      const out: unknown[] = []
-      if (changed.hidden.length > 0) out.push(mergedArchivedFrame())
-      let firstShown = false
-      for (const home of homes) {
-        const record = remote.get(home)
-        if (record === undefined) continue
-        // A group the UI has never seen needs its position the moment this
-        // upsert first shows it (T58-fix — same rule as the upsert path).
-        const wasShown = shown.has(home)
-        const forwarded = forwardVisible(record)
-        if (forwarded !== undefined) {
-          out.push({ type: 'upsert', workspace: forwarded })
-          if (!wasShown) firstShown = true
-        }
-      }
-      if (firstShown) out.push(mergedOrderFrame())
-      if (changed.revealed.length > 0) out.push(mergedArchivedFrame())
-      return out
+      return [mergedArchivedFrame()]
     },
 
     get hasPendingHide(): boolean {
@@ -814,9 +845,11 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       // The tombstone registry dies with the identity (a new server mints new
       // ids); the archived frame above already restored the local-only set.
       sessionHome = new Map()
-      // So do the T58 hidden sessions and the current-session knowledge (a
-      // NEW server may reuse original workspace/session ids, and a stale
-      // entry would forward or mis-hide the new server's sessions).
+      // So do the T65 close stamps, the T58 hidden sessions and the
+      // current-session knowledge (a NEW server may reuse original
+      // workspace/session ids, and a stale entry would forward or mis-hide
+      // the new server's sessions).
+      closedAt.clear()
       hiddenSessions.clear()
       currentRaw = undefined
       currentReadable = false
