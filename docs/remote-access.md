@@ -314,9 +314,10 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | 路由 | 方法 | 作用 |
 | --- | --- | --- |
 | `/ping` | GET | 存活探测，`{ok:true}` |
-| `/v1/handshake` | POST | 握手：交换中继协议版本、服务端 id / 显示名、DSH 版本号、接口指纹表。中继协议版本不一致即拒绝连接 |
+| `/v1/handshake` | POST | 握手：交换中继协议版本、服务端 id / 显示名、DSH 版本号、接口指纹表。中继协议版本不一致即拒绝连接；回包带 `serverName`（服务端显示名）与 `deviceName`（本设备在服务端记录里的名字，T59） |
+| `/v1/device/name` | POST | 设备改名（T59）：**网关自己处理、不转发给 DSH**——只对已配对的桌面应用端开放，只改调用者自己的设备记录；请求体 `{"name":"…"}`（1–40 字），改名经流心跳（约 15 秒）与握手刷新（约 30 秒）同步到对端 |
 | `/v1/invoke` | POST | 在已共享会话上执行一次 DSH 远程调用（单次，JSON 进出） |
-| `/v1/stream` | POST | 打开一条 DSH 流式订阅。**NDJSON 格式**：响应体每行一条 JSON；`{"type":"ping"}` 心跳行（默认 15 秒一条）防止反代把闲置流掐掉；共享关闭/订阅失效时补一行 `{"type":"error","error":{"code":"unshared"}}` 再结束 |
+| `/v1/stream` | POST | 打开一条 DSH 流式订阅。**NDJSON 格式**：响应体每行一条 JSON；`{"type":"ping"}` 心跳行（默认 15 秒一条）防止反代把闲置流掐掉，每条都带当下的 `serverName` / `deviceName`（T59，服务端改名约 15 秒内到达所有客户端）；共享关闭/订阅失效时补一行 `{"type":"error","error":{"code":"unshared"}}` 再结束 |
 | `/v1/event-result` | POST | 审批/提问这类「需要应答事件」的应答回传（`{eventId, result}`），服务端按转发记录核对归属后转交 |
 | `/v1/http` | POST | 改动摘要 / diff 面板的 plain-HTTP 长尾（T41b）：请求体 `{route, query}` 只登记 `changes.summary` / `changes.diff` 两条、只转发 GET（查询串是这次调用的坐标，不是要转发的请求体）；查询串按允许清单**规范化重建**——只保留 `sessionId`（恰好一次，过共享表）与 `seq` / `index`（至多一次、十进制非负整数），未知参数丢弃，合成 URL 只由规范化结果拼成（两次解析对控制字符的处理差异曾是越权读取口子，T41b-fix）——随后**进程内**交给宿主 `/api` 共享 fetch handler，不走回环 HTTP |
 | `/v1/upload` | POST | 远程会话的**非图片附件**上传（T51）：请求体是原始字节流（不是 JSON）；查询串按允许清单规范化重建——只保留 `sessionId`（恰好一次、过共享表，未共享 403）与 `name`（至多一次）；上限 100 MiB，`Content-Length` 预检加流式计数双保险，超限 413（先回拒绝再排空尾部字节）；每设备并发 8（超出 429）；随后与 `/v1/http` 一样**进程内**交给宿主 `/api` 共享 handler——上传回执落进的会话与之后 `session/prompt` 解析附件引用的会话是同一个 |
