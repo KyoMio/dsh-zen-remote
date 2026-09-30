@@ -26,7 +26,7 @@ v1.0.0（fork 自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-
 ### 主服务端：共享部件
 
 - **标题行远程图标**（`conversation.session.header.actions`，order 25，排在官方任务入口之后）：灰色为未开启，亮色为已开启，亮色带小圆点表示此刻有桌面应用端正在查看；悬停显示剩余闲置时间；点击开关当前会话的远程，带二次确认。
-- **右键菜单项**（`sidebar.workspaces.session.menu.item`，order 500，官方归档行之下、分组细线之后）：侧边栏里直接开启 / 关闭该会话的远程。
+- **会话「…」菜单项**（`sidebar.workspaces.session.menu.item`，order 500，官方归档行之下、分组细线之后）：侧边栏会话行的「…」菜单里直接开启 / 关闭该会话的远程。
 - 这两组部件只在 host 角色渲染与轮询，角色判定与设置页同一套两级决策，角色切换回来时自动恢复。
 
 ### 子客户端：远程部件
@@ -46,7 +46,7 @@ v1.0.0（fork 自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-
 | 部件 | 槽位 | 出现在哪些角色 |
 | --- | --- | --- |
 | 插件设置区块 | `plugins.row.config` | 两角色（内容按角色不同） |
-| 标题行远程图标 + 右键菜单项 | `conversation.session.header.actions` / `sidebar.workspaces.session.menu.item` | host |
+| 标题行远程图标 + 会话「…」菜单项 | `conversation.session.header.actions` / `sidebar.workspaces.session.menu.item` | host |
 | 标题行连接图标 + composer 横幅 | 同上槽位 / `conversation.input.dock` | client（仅远程会话渲染） |
 | 远程分组（流合并进侧边栏） | `workspace/follow` 全局流的运行时包装 | client |
 
@@ -177,7 +177,7 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 - 一个插件、两种角色，界面半边多出两组部件（详见「2.0：远程会话与设置区块」一节）：
   - 插件设置区块：DSH「插件」页里的完整配置与管理界面，主服务端（网关 / 反代 / 配对 / 设备列表 / 推送 / 远程共享）与子客户端（服务端地址 / 连接状态 / 诊断）按角色不同；经网关打开时管理动作只读；
-  - 主服务端共享部件：会话页标题行远程图标（灰 / 亮 / 亮带圆点，悬停剩余闲置时间，点击开关带确认）与侧边栏右键菜单项；
+  - 主服务端共享部件：会话页标题行远程图标（灰 / 亮 / 亮带圆点，悬停剩余闲置时间，点击开关带确认）与侧边栏会话「…」菜单项；手机会话信息卡片里的「远程访问」开关（只在卡片打开期间拉共享表）；
   - 子客户端远程部件：侧边栏远程分组（离线 / 解配 / 吊销 / 版本差异标注、离线禁写）、标题行连接图标、「远程已关闭」composer 横幅；
 - 以上部件全部注册在桌面端门（`dshDesktop`）之外——桌面端 App 正是主服务端/子客户端的宿主，门的语义是「手机外壳不生效」，不是「远程部件不生效」。
 
