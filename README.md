@@ -35,6 +35,35 @@ A paired **desktop client** sees exactly the sessions the host has turned remote
 
 ---
 
+## Remote connection
+
+**What it is for**: one always-on computer runs the sessions (the host), and the DSH desktop app on another computer (the client) watches and carries on with them remotely — history, live progress, messages, approvals, the terminal all work, and everything executes on the host. Phones and tablets take a different road: a browser reaching the host through the gateway (a web app device), see [Setting up public access](#setting-up-public-access-host).
+
+**How it works**, in four steps:
+
+1. **Pair**: on the host's settings page, generate a 桌面应用端 (desktop app device) pairing code; on the client's settings page, enter the server address and the code. Step by step in the [settings page walkthrough](#settings-page-walkthrough) below.
+2. **Turn remote access on**: remote access is per session. On the host, pick 开启远程 (turn remote on) from the session's "…" menu (or use the globe icon in the title row, or the list in the settings page — see [Session sharing](#session-sharing)).
+
+   ![The host turning remote access on from a session's "…" menu](docs/images/host-share-menu.png)
+
+3. **Use it on the client**: after the local workspaces, the sidebar shows a "host device name · workspace name" group; sessions in it open like local ones, and the globe icon in the title row shows the connection state (online / offline / version differs). A host workspace with no remote-enabled session never shows up.
+
+   ![The client sidebar with the "书房 · Desktop" group and the remote status icon in the title row](docs/images/client-sidebar.png)
+
+4. **Closing and coming back**: when the host closes remote access, the session idle-sleeps (48 hours without activity by default), or you close it from the client, an open session page shows a "remote closed" banner with input disabled, and the session hides from the list once you switch away; turning remote access back on brings it back. During a disconnect the page holds still and resumes by itself once the link is back.
+
+   ![The "remote closed" banner above the composer after remote access was closed](docs/images/client-remote-closed.png)
+
+**Toggle it from your phone too**: when a phone (web app device) opens a session on the host, the session info card has a 远程访问 (remote access) row showing whether it is on and the idle time left; the switch turns it on or off.
+
+<p align="center"><img src="docs/images/mobile-info-remote.png" alt="The remote access switch in the phone's session info card" width="320"></p>
+
+What it can and cannot do: see [Features](#features) and [Known limitations](#known-limitations). A paired desktop client is treated as a trusted device — the trust boundary is in [Security model](#security-model).
+
+> In these screenshots the red frames mark what this plugin adds to the DSH interface; session titles are demo names and conversation content is blurred. The UI is shown in Chinese.
+
+---
+
 ## Install
 
 ```sh
@@ -68,7 +97,7 @@ Copy [`cordis.patch.yml.example`](cordis.patch.yml.example) into your profile's 
 
 </details>
 
-To uninstall: `dsh plugin remove dsh-zen-remote` (or delete the line from the profile's `dependencies` / `bundles`) and restart. To also wipe pairing and share state, delete `~/.dsh/lan-gate-state.json`, `~/.dsh/lan-gate.config.json` and `~/.dsh/zen-remote-shares.json`.
+To uninstall: `dsh plugin remove dsh-zen-remote` (or delete the line from the profile's `dependencies` / `bundles`) and restart. To also wipe pairing and share state, delete `~/.dsh/lan-gate-state.json`, `~/.dsh/lan-gate.config.json`, `~/.dsh/zen-remote-shares.json` and `~/.dsh/zen-remote-server.json` (the server id — once it is gone, paired clients see a brand-new server).
 
 ---
 
@@ -120,11 +149,12 @@ The server-side settings page can rename devices, change a device's role (`set-r
 
 ## Session sharing
 
-Remote access is per session, with three toggle entries on the host:
+Remote access is per session, with four toggle entries:
 
-1. the session's context-menu item in the sidebar;
+1. 开启远程 / 关闭远程 (remote on / off) in the sidebar session row's "…" menu;
 2. the remote icon in the session title row (click to toggle, with a confirmation; hover shows the remaining idle time; a dot on the icon means a desktop client is watching right now);
-3. the shared-sessions list in the plugin settings page, including a close-all.
+3. the shared-sessions list in the plugin settings page, including a close-all;
+4. the 远程访问 (remote access) switch in the phone's (web app device's) session info card.
 
 **Idle sleep**: a remote-enabled session closes its remote access by itself after **48 hours** (configurable, `idleHours`) with no session activity — turns starting or ending, messages, approvals or question answers, from either the server or a client. Sessions that are mid-turn or waiting on an approval/question are never swept, and merely having a viewer open does not keep one awake. The remaining time is hoverable on the title-row icon and listed in the settings page.
 
@@ -139,6 +169,42 @@ Remote access is per session, with three toggle entries on the host:
 ---
 
 ## Configuration
+
+### Settings page walkthrough
+
+**Where it is**: in DSH, click 插件 (Plugins) in the left bar → click dsh-zen-remote in the plugin list → click dsh-zen-remote once more under 包含的组件 (components); the settings block is below.
+
+**Common controls**: 已覆盖 (overridden) at a field's top right means the value is saved in the plugin settings (overriding the config file or the default); 重置 (reset) falls back to the next layer. Click 保存 (save) at the bottom of the card when done. Fields that need a reload say so, and the plugin reloads itself after saving — no app restart.
+
+**Host**
+
+1. Set 运行角色 (role) to 主服务端 (host) and give it a recognizable 设备名称 (device name), e.g. "书房" (study) — it titles the group in clients' sidebars and shows on the phone. Save.
+
+   ![Host settings: role and device name in the role card](docs/images/host-settings-role.png)
+
+2. 网关与反代 (gateway and reverse proxy): keep the defaults for local use and phone access through a proxy; for public access see [Setting up public access](#setting-up-public-access-host). For clients on the LAN to reach the gateway **directly**, set 监听地址 (listen address) to `0.0.0.0` (it must include loopback — the settings page manages the gateway over loopback).
+3. 配对 (pairing): choose Web 应用端 (phones, browsers) or 桌面应用端 (another DSH desktop app), click 生成配对码 (generate code) and enter it on the other device within 10 minutes. The 设备 (devices) list renames devices, changes their role and revokes them.
+
+   ![Generating a pairing code, and the device list](docs/images/host-pairing.png)
+
+4. 远程共享 (remote sharing): the idle-sleep window and whether new sessions are shared automatically. Below the card, 已开启远程的会话 (remote-enabled sessions) lists what is shared right now, the idle time left and whether a device is watching; close them one by one or all at once.
+
+   ![The remote-enabled sessions list](docs/images/host-settings-shares.png)
+
+5. 推送 (push): push summaries, turn-end pushes and so on, as you like — see [When notifications fire](#when-notifications-fire).
+
+**Client**
+
+1. Set 运行角色 (role) to 子客户端 (client) and save — the plugin reloads and the page switches to the client's settings.
+2. Give this computer a 设备名称 (device name), e.g. "客厅" (living room); it is registered in the host's device list when pairing. Save.
+3. 连接服务端 (connect to server): enter the host's gateway address (on a LAN e.g. `http://192.168.1.10:3088`; public addresses must be `https://`) and a 桌面应用端 pairing code from the host, then click 配对 (pair).
+4. Done when 连接状态 (connection state) reads 已连接到「host name」 (connected to "host name"); the host's groups appear in the sidebar right away. The 诊断 (diagnostics) area lists the request interceptor state and recent remote-call failures — the first place to look when something is off.
+
+   ![Client settings: role, device name, server connection and connection state](docs/images/client-settings.png)
+
+> Addresses and pairing codes in the screenshots are demo values.
+
+### Field reference
 
 Everything is edited in the DSH Plugins page → dsh-zen-remote settings block. Per field the first legal value wins in this order: **environment variable > plugin row settings > `~/.dsh/lan-gate.config.json` > default**. A value that fails its field's check (type, range, enum) makes that layer transparent. Saving a field that needs a gateway/push restart (`role`, `port`, `host`, `targetPort`, `rateLimit`, `trustedProxies`, `vapidSubject`, `lang`, and the push fields) reloads the plugin row automatically — no app restart required; everything else takes effect immediately.
 
@@ -206,14 +272,14 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 - Two-level page stack — session list home plus a standalone session page, pushed in and out horizontally
 - Plugin entry chips on the home screen, appearing automatically for what you have installed, individually hideable
 - Reworked composer: controls become icons, the permission and model menus become bottom sheets
-- Session info card: six stats plus export log / rename / fork / archive; share-image export as ONE long PNG
+- Session info card: six stats plus export log / rename / fork / archive; share-image export as ONE long PNG; since 2.0 a remote access switch row
 - Turn-process folding, left-edge swipe back, Android back-gesture takeover, phone-local attachment upload
 - A pairing code buys a long-lived device token; identity follows the token, not the IP, revocable at any time
 - Real PWA + real Web Push (VAPID + aes128gcm), firing only for approvals and questions by default
 
 **Host (2.0 additions)**
 
-- Session sharing with three toggle entries, idle sleep, auto-share and subagent/fork following
+- Session sharing with four toggle entries (including the phone info card), idle sleep, auto-share and subagent/fork following
 - Everything above works when DSH runs as the **desktop app**: the gateway forwards to the desktop backend's real port automatically, and approval/question pushes fire for desktop sessions
 
 **Desktop client (2.0 additions)**
@@ -245,7 +311,7 @@ What a paired device is trusted with, stated plainly:
 
 - **A paired desktop client is a trusted device.** The remote session's terminal is a shell running as the **server's user**, without the agent sandbox or approval restrictions. The file-preview interfaces (`workspaceFiles/read` and friends) are **not** contained to the session directory — anything the server process can read is readable. A paired client can create sessions in **any** of the server's workspaces (not limited to remote-enabled ones; the created session is auto-shared).
 - **"Only remote-enabled sessions are visible" constrains session data**: an unshared session's list, history, live progress and approval/question events are refused or filtered by the relay; @-mention candidates list **only shared sessions**; and a `dsh-session:` reference embedded in a message, a queue edit or a slash command refuses the whole call when it names a session without remote access. It is not a sandbox around the machine.
-- **Admin actions stay local**: generating pairing codes, changing roles and revoking devices only work from the settings page on the server machine itself — requests that arrived through the gateway can view status but are refused for every mutation, and desktop clients cannot reach the admin routes at all.
+- **Admin actions stay local**: generating pairing codes, changing roles and revoking devices only work from the settings page on the server machine itself — requests that arrived through the gateway can view status but mutations are refused — the one exception is toggling a session's remote access, which a web app device (a phone) may do, and that is what the phone info card's remote access switch uses; desktop clients cannot reach the admin routes at all.
 
 ---
 
