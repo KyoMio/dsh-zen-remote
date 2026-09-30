@@ -11,7 +11,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, virtualizeModelSelectionValue } = require('../lib/merge-streams.js')
+const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue } = require('../lib/merge-streams.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
@@ -1392,4 +1392,91 @@ test('T58-fix: onRemoteGone with ONLY hidden sessions left still restores the ar
   assert.deepEqual(m.onRemote({ type: 'archived', archivedSessionIds: [] }), [
     { type: 'archived', archivedSessionIds: [] },
   ])
+})
+
+// -- T63: the summary sync helpers ---------------------------------------------
+
+test('T63 sessionSummaryAddedFrames: one api-session/added emit per row, virtualized exactly like mergeSessionList (id, fork parent, modelSelection)', () => {
+  const frames = sessionSummaryAddedFrames(
+    {
+      items: [
+        {
+          sessionId: 's1',
+          parentSessionId: 's0',
+          updatedAt: 7,
+          running: true,
+          projections: {
+            kind: 'sequenced',
+            asOfSeq: 4,
+            values: { modelSelection: { lastUsed: { provider: 'codex', model: 'sol' }, next: null } },
+          },
+        },
+        { sessionId: 's2', updatedAt: 8 },
+      ],
+    },
+    SID,
+  )
+  assert.deepEqual(frames, [
+    {
+      type: 'emit',
+      event: 'api-session/added',
+      args: [
+        {
+          sessionId: V('s1'),
+          parentSessionId: V('s0'),
+          updatedAt: 7,
+          running: true,
+          projections: {
+            kind: 'sequenced',
+            asOfSeq: 4,
+            values: { modelSelection: { lastUsed: { provider: V('codex'), model: 'sol' }, next: null } },
+          },
+        },
+      ],
+    },
+    { type: 'emit', event: 'api-session/added', args: [{ sessionId: V('s2'), updatedAt: 8 }] },
+  ])
+  // exact-keys emit shape — the client face's parser demands it
+  for (const frame of frames) assert.deepEqual(Object.keys(frame).sort(), ['args', 'event', 'type'])
+})
+
+test('T63 sessionSummaryAddedFrames: a malformed row or result synthesizes nothing the UI would misfile', () => {
+  assert.deepEqual(sessionSummaryAddedFrames(undefined, SID), [])
+  assert.deepEqual(sessionSummaryAddedFrames({ items: 'nope' }, SID), [])
+  // mergeSessionList passes a malformed row through as-is; the frame builder
+  // must not (applyMutation would file it under byId[undefined])
+  assert.deepEqual(sessionSummaryAddedFrames({ items: [{}, { updatedAt: 1 }, 'row'] }, SID), [])
+})
+
+test('T63 virtualSessionIdsInWorkspaceFrames: upserts and baselines, virtual ids only', () => {
+  const forwarded = [
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-1', '远端一', ['s1']), workspaceId: V('w-1'), sessionIds: [V('s1'), V('s2')] } },
+    { type: 'order', workspaceIds: ['ws-local', V('w-1')] },
+    { type: 'archived', archivedSessionIds: [V('s3')] },
+    {
+      type: 'baseline',
+      value: { items: [{ ...LOCAL_WS, sessionIds: ['session-l1'] }], archivedSessionIds: [], pinnedSessionIds: [] },
+    },
+  ]
+  // archived frames carry hidden/closed ids on purpose — they are NOT group
+  // membership and must not be announced; the local baseline row is not
+  // virtual and its summary already exists.
+  assert.deepEqual(virtualSessionIdsInWorkspaceFrames(forwarded), [V('s1'), V('s2')])
+  assert.deepEqual(virtualSessionIdsInWorkspaceFrames([{ type: 'upsert', workspace: { workspaceId: V('w-9') } }]), [])
+  assert.deepEqual(virtualSessionIdsInWorkspaceFrames([]), [])
+})
+
+test('T63 e2e at the merger level: a hidden closed-remote session never rides the forwarded frames, so it can never be announced', () => {
+  const m = merger()
+  m.onLocal(LOCAL_BASELINE)
+  // readable current session = a LOCAL one: the T58 hiding arms
+  m.setCurrentSession('session-l1')
+  m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', ['s1', 's2'])], archivedSessionIds: [], pinnedSessionIds: [] } })
+  // the closure: the group retracts s2 — the tombstone hides
+  const out = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s1']) })
+  // leading archived frame carries the hidden id; the forwarded group does not
+  assert.deepEqual(out[0], { type: 'archived', archivedSessionIds: [V('s2')] })
+  assert.deepEqual(out[1].workspace.sessionIds, [V('s1')])
+  // the ids a sync would be nudged about: only the live one
+  assert.deepEqual(virtualSessionIdsInWorkspaceFrames(out), [V('s1')])
 })

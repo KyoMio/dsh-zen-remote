@@ -144,7 +144,7 @@
  * `zr~<serverId>~provider/model` fallback string (the pre-fix2 display).
  */
 
-import { fromVirtual, toVirtual } from './virtual-id.js'
+import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
 
 /** The (serverId, serverName) pair a merger virtualizes with. A re-handshake
  * with a different server retargets the SAME merger ({@link retarget}) so the
@@ -1171,4 +1171,69 @@ export function virtualizeModelSelectionValue(value: unknown, serverId: string):
     }
   }
   return out
+}
+
+/**
+ * T63: the virtual session ids a set of FORWARDED workspace frames carries —
+ * the `sessionIds` of `upsert` records and of baseline `value.items`. The
+ * workspace route feeds these to the summary sync, which announces list rows
+ * for ids the UI has no summary for yet (the sidebar drops a group member
+ * without one — RT dsh-client-ui-workspace orderByRecency / groupByWorkspace).
+ * Reading the FORWARDED output (not the merger's raw state) is the point:
+ * T56 already withheld empty groups and T58 already dropped hidden sessions,
+ * so a hidden closed-remote session never reaches here and is never
+ * announced. Only virtual ids count — local baseline content rides these
+ * frames verbatim and its rows already have summaries.
+ */
+export function virtualSessionIdsInWorkspaceFrames(frames: readonly unknown[]): string[] {
+  const out = new Set<string>()
+  const collect = (record: unknown): void => {
+    if (!isPlainObject(record) || !Array.isArray(record.sessionIds)) return
+    for (const id of record.sessionIds) {
+      if (typeof id === 'string' && isVirtual(id)) out.add(id)
+    }
+  }
+  for (const frame of frames) {
+    if (!isPlainObject(frame)) continue
+    if (frame.type === 'upsert') collect(frame.workspace)
+    if (frame.type === 'baseline') {
+      const value = isPlainObject(frame.value) ? frame.value : undefined
+      if (value !== undefined && Array.isArray(value.items)) for (const item of value.items) collect(item)
+    }
+  }
+  return [...out]
+}
+
+/**
+ * T63: the synthesized `api-session/added` emit frames for one relay
+ * `session/list` answer — one `{type:'emit', event:'api-session/added',
+ * args:[row]}` frame per row. This is the host's own mechanism for adding a
+ * list row without a re-pull (RT dsh-api-session-controller: the client face
+ * subscribes `api-session/added` → handleSessionAdded → mergeSummary →
+ * applyMutation's upsert, which ADDS an unknown row and fills an existing
+ * one — idempotent), and the emit frame shape is the client face's
+ * exact-keys `{type, event, args}` with args a JSON array
+ * (dsh-api-gateway lib/client.js parseRemoteEventFrame) — the same shape the
+ * T52 catalog-refresh frame uses. The rows are virtualized by
+ * {@link mergeSessionList} itself, so a synthesized row carries exactly what
+ * the merged `session/list` route would have answered: the session id AND
+ * the fork parent virtualized, and the projections' modelSelection providers
+ * rewritten (a row's `sequenced` block must not poison the projection store
+ * against the control stream's rewritten frames — T52-fix3). A malformed
+ * remote result means "the server said nothing" — no frames.
+ */
+export function sessionSummaryAddedFrames(remoteResult: unknown, serverId: string): unknown[] {
+  if (!isPlainObject(remoteResult) || !Array.isArray(remoteResult.items)) return []
+  const merged = mergeSessionList({ items: [] }, remoteResult, serverId)
+  if (!isPlainObject(merged) || !Array.isArray(merged.items)) return []
+  const frames: unknown[] = []
+  for (const row of merged.items) {
+    // mergeSessionList passes a malformed row through as-is; the UI's
+    // applyMutation would file it under `byId[undefined]`, so only a
+    // well-formed row (plain object, string sessionId — the shape
+    // handleSessionAdded's mergeSummary keys on) becomes a frame.
+    if (!isPlainObject(row) || typeof row.sessionId !== 'string' || row.sessionId === '') continue
+    frames.push({ type: 'emit', event: 'api-session/added', args: [row] })
+  }
+  return frames
 }

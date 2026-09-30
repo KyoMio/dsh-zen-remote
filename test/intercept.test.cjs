@@ -2476,6 +2476,168 @@ test('merged $events: the consumer abort ends everything and both legs unwind', 
   assert.equal(localGate.aborted, true)
 })
 
+// -- T63: the summary sync (synthesized api-session/added rows) ----------------
+
+const T63_SHARED_ROW = { sessionId: 'session-shared', updatedAt: 5 }
+const T63_WORKSPACE = { workspaceId: 'w-1', title: '远端一', sessionIds: ['session-shared'], createdAt: '2026-02-02T00:00:00.000Z', updatedAt: '2026-02-02T00:00:00.000Z' }
+
+/** A gateway whose LOCAL streams are one gate PER ENDPOINT (the T63 tests
+ * drive `$events` and `workspace/follow` side by side through one install). */
+function createPerEndpointGateway() {
+  const gateway = new FakeTypertGateway()
+  const gates = {}
+  gateway.openWireStream = async function (endpoint, payload, uplink, peer, legSignal, control) {
+    gateway.streamCalls.push({ endpoint, payload, uplink, peer, signal: legSignal, control })
+    if (gates[endpoint] === undefined) gates[endpoint] = createGate(legSignal)
+    return gates[endpoint].iterable
+  }
+  return { gateway, gates }
+}
+
+test('T63: session/list answered offline at page load, then the relay serves — the merged $events leg announces the missing row and a re-pull merges it', async () => {
+  const relay = createControllableRelay()
+  // The page-load state: the handshake is not up (no state event — the UI's
+  // one list pull runs against a relay that cannot serve).
+  relay.state = 'offline'
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW] },
+  }
+  const { gateway, iterator, localGate } = await openMergedEvents(relay)
+  gateway.spec.rpc = {
+    'session/list': { ok: true, value: { items: [{ sessionId: 'session-local', updatedAt: 1 }] } },
+  }
+  localGate.push(READY)
+  await readSome(iterator, 1)
+
+  // The offline pull: the merged route answers the local list alone, and no
+  // relay round-trip happens. This is the root cause — the UI now holds no
+  // summary for the shared session, and the host re-pulls only on a
+  // connection generation change, which a quiet page never gets.
+  const offline = await gateway.rpcBridge('session/list', { args: { _request: {} } }, undefined, undefined)
+  assert.deepEqual(offline.value.items, [{ sessionId: 'session-local', updatedAt: 1 }])
+  assert.equal(relay.invokes.length, 0)
+
+  // The relay comes up: the serving period opens, the sync fetches the list
+  // and announces the row the UI is missing (after the catalog refresh the
+  // same transition emits).
+  relay.transition('online')
+  await waitForStream(relay, 1)
+  const [refresh, added] = await readSome(iterator, 2)
+  assert.deepEqual(refresh, { type: 'emit', event: 'llm/adapters-updated', args: [] })
+  assert.deepEqual(added, {
+    type: 'emit',
+    event: 'api-session/added',
+    args: [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }],
+  })
+  const listInvokes = relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list')
+  assert.equal(listInvokes.length, 1)
+  assert.deepEqual(listInvokes[0].args, {})
+
+  // The pull the announce stands in for: with the relay serving, the merged
+  // list route folds the remote session in.
+  const repulled = await gateway.rpcBridge('session/list', { args: { _request: {} } }, undefined, undefined)
+  assert.deepEqual(repulled.value.items, [
+    { sessionId: 'session-local', updatedAt: 1 },
+    { sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 },
+  ])
+  await iterator.return?.(undefined)
+})
+
+test('T63: the workspace route nudges about an unannounced session id once — an already-announced id stays quiet', async () => {
+  const { gateway, gates } = createPerEndpointGateway()
+  const relay = createControllableRelay()
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW] },
+  }
+  install(gateway, relay)
+  const controller = new AbortController()
+  const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const eventsIterator = events[Symbol.asyncIterator]()
+  gates['$events'].push(READY)
+  await readSome(eventsIterator, 1)
+  await waitForStream(relay, 1)
+
+  // The workspace leg: a local baseline, then the server's baseline carrying
+  // the shared session. The forwarded upsert nudges the hub; the sync
+  // fetches once and announces on the EVENTS stream (stream 0 is the events
+  // leg, stream 1 the workspace leg).
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 2)
+  assert.equal(relay.streams[1].method, 'follow')
+  relay.streams[1].gate.push({ type: 'baseline', value: { items: [T63_WORKSPACE], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+  const [added] = await readSome(eventsIterator, 1)
+  assert.deepEqual(added, {
+    type: 'emit',
+    event: 'api-session/added',
+    args: [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }],
+  })
+  assert.equal(relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length, 1)
+
+  // A second workspace frame carrying the SAME (announced) id: no new fetch,
+  // no new announce — the hub's announced set gates the nudges.
+  relay.streams[1].gate.push({ type: 'upsert', workspace: T63_WORKSPACE })
+  await readSome(workspacesIterator, 1)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length, 1)
+  await eventsIterator.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
+})
+
+test('T63 regression: a hidden closed-remote session stays hidden — the server list does not carry it and no announce resurrects it', async () => {
+  const { gateway, gates } = createPerEndpointGateway()
+  const relay = createControllableRelay()
+  // The server serves only the live session: the closed one left the share
+  // table, so its list row is gone (the relay's output filter) — the announce
+  // can never resurrect what the server no longer serves.
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [T63_SHARED_ROW] },
+  }
+  // A readable current session (a LOCAL one) arms the T58 hiding.
+  const { handle } = install(gateway, relay, { getCurrentSession: () => ({ kind: 'open', sessionId: 'local-current' }) })
+  const controller = new AbortController()
+  const events = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const eventsIterator = events[Symbol.asyncIterator]()
+  gates['$events'].push(READY)
+  await readSome(eventsIterator, 1)
+  await waitForStream(relay, 1)
+
+  const workspaces = await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const workspacesIterator = workspaces[Symbol.asyncIterator]()
+  gates['workspace/follow'].push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 1)
+  await waitForStream(relay, 2)
+  // The server's baseline still lists BOTH sessions in the group…
+  const both = { ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-closed'] }
+  relay.streams[1].gate.push({ type: 'baseline', value: { items: [both], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(workspacesIterator, 4)
+  // …and the announce that follows names only the live one.
+  const [added] = await readSome(eventsIterator, 1)
+  assert.deepEqual(added.args, [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }])
+
+  // The closure lands (the group's copy retracts the closed session): the
+  // tombstone HIDES — the leading archived frame carries the closed id, the
+  // forwarded group drops it — and the nudge that retraction produces asks
+  // for nothing new (the id is gone from the forwarded frames; the announce
+  // already ran).
+  const closedVirtual = toVirtual(SERVER_ID, 'session-closed')
+  relay.streams[1].gate.push({ type: 'upsert', workspace: T63_WORKSPACE })
+  const [archived] = await readSome(workspacesIterator, 2)
+  assert.deepEqual(archived, { type: 'archived', archivedSessionIds: [closedVirtual] })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length, 1)
+  // No second added frame ever reached the events stream.
+  await eventsIterator.return?.(undefined)
+  await workspacesIterator.return?.(undefined)
+  assert.equal(handle.diagnostics().recentFailures.length, 0)
+})
+
 // -- T32: the $events/result answer split ---------------------------------------------
 
 test('$events/result: a virtual eventId rides postEventResult with the ORIGINAL id and never the local gateway', async () => {
