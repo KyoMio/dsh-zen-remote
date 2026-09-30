@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import {
   IconArchiveOutlineRegular,
@@ -8,6 +8,8 @@ import {
   IconEditOutlineRegular,
   IconShareOutlineRegular,
 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { shareCardRemoteView, shareFailText } from '../client-data/shares.ts'
+import type { SharesStore } from '../client-data/shares.ts'
 import { workspaceTitleOf } from './compat/store.ts'
 import { agentPresetOf } from './compat/types.ts'
 import type { RenameResult, SessionId, UseJobs } from './compat/types.ts'
@@ -66,6 +68,14 @@ export type MobileSessionInfoProps =
     useJobs: UseJobs
     /** Keeps the session's job roster stream open while the sheet's session is mounted. */
     watchRows: (sessionId: SessionId) => () => void
+    /**
+     * The page-wide shares store (T67) — the SAME singleton the title-row
+     * icon and the menu item read, so this row adds no second poll loop.
+     * Subscribed ONLY while the sheet is open (the phone shell must not
+     * keep a 30 s admin/shares GET alive behind the gateway — the same
+     * rule that keeps the icon unsubscribed there).
+     */
+    shares: SharesStore
   }
 
 /* ---- StatsLine-identical formatting -------------------------------------
@@ -142,6 +152,7 @@ export function MobileSessionInfo({
   downloadSessionLog,
   useJobs,
   watchRows,
+  shares,
   t,
 }: MobileSessionInfoProps) {
   const [open, setOpen] = useState(false)
@@ -155,6 +166,27 @@ export function MobileSessionInfo({
   const [shareOpen, setShareOpen] = useState(false)
   const [shareData, setShareData] = useState<ShareExportData | null>(null)
   const shareCardHostRef = useRef<HTMLDivElement>(null)
+  // T67: the remote-access row's own busy flag — distinct from the sheet's
+  // global one, so a slow share/unshare POST greys only this switch.
+  const [remoteBusy, setRemoteBusy] = useState(false)
+
+  // T67: the shares table is subscribed ONLY while the sheet is open — a
+  // subscription is what keeps the store's 30 s admin/shares poll running,
+  // and the phone shell must not keep that alive behind the gateway (the
+  // same rule that leaves the title-row icon unsubscribed here). Opening
+  // also pulls once right away: the row must show the CURRENT table, not
+  // wait out the cadence.
+  const shareSnap = useSyncExternalStore(
+    useCallback(
+      (onStoreChange: () => void) => (open ? shares.subscribe(onStoreChange) : () => {}),
+      [shares, open],
+    ),
+    () => shares.getSnapshot(),
+  )
+  useEffect(() => {
+    if (!open) return
+    void shares.refresh()
+  }, [open, shares])
 
   useEffect(() => {
     const onOpen = (): void => {
@@ -386,6 +418,31 @@ export function MobileSessionInfo({
     image: t('shareCardImage'),
   }
 
+  // T67: the row's derived view (visibility gate + description line), and
+  // the toggle — share / unshare with the row's own busy window, failures
+  // landing on the sheet's existing error row via the shared shareFailText
+  // copy. No confirm: the sheet's other destructive action (archive) has a
+  // window.confirm, but remote access is reversible with one more tap and
+  // the switch itself states the outcome.
+  const remoteRow = shareCardRemoteView({
+    ready: shareSnap.ready,
+    role: shareSnap.role,
+    subagent: row?.origin === 'subagent',
+    entry: shareSnap.entries.find((candidate) => candidate.sessionId === sessionId),
+    now: Date.now(),
+    t,
+  })
+  const onToggleRemote = (): void => {
+    if (remoteBusy) return
+    setRemoteBusy(true)
+    setError(null)
+    const action = remoteRow.shared ? shares.unshare(sessionId) : shares.share(sessionId)
+    void action.then((outcome) => {
+      setRemoteBusy(false)
+      if (!outcome.ok) setError(shareFailText(outcome, remoteRow.shared ? 'unshare' : 'share', t))
+    })
+  }
+
   const cells: Array<{ label: string; value: string; sub: string | undefined }> = [
     { label: t('infoStatTurns'), value: stats === undefined ? NA : String(stats.turns), sub: undefined },
     { label: t('infoStatSteps'), value: stats === undefined ? NA : String(stats.steps), sub: undefined },
@@ -487,6 +544,28 @@ export function MobileSessionInfo({
             </div>
           ))}
         </div>
+
+        {/* T67: the remote-access row — the same visibility gate as the
+            title-row icon and the menu item (host role, answered table,
+            never a subagent session), decided in shareCardRemoteView. */}
+        {remoteRow.visible && (
+          <div data-mobile-nav="info-remote">
+            <div data-mobile-nav="info-remote-text">
+              <span data-mobile-nav="info-remote-label">{t('infoRemoteAccess')}</span>
+              <span data-mobile-nav="info-remote-desc">{remoteRow.line}</span>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={remoteRow.shared}
+              aria-label={t('infoRemoteAccess')}
+              data-mobile-nav="info-remote-switch"
+              data-on={remoteRow.shared ? '' : undefined}
+              disabled={remoteBusy}
+              onClick={onToggleRemote}
+            />
+          </div>
+        )}
 
         {error !== null && <div data-mobile-nav="info-error">{t('infoActionError', { message: error })}</div>}
         {/* Degraded-outcome notice (review 07+08): same container metrics as
