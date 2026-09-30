@@ -16,11 +16,14 @@ const TRIGGER_SELECTOR = '[data-slot="conversation.input.permission"] button[cla
  * What the Menu primitive portals on 0.2.0: a `role=menu` div DIRECTLY under
  * body, carrying `data-menu-material` and a randomized `--dsh-menu-anchor`
  * (a per-instance useId) but NO id and no back-reference from the trigger —
- * there is no pure-CSS way to tell it apart from the OTHER portal Menu in
- * the product (the copy button's little confirm menu, also `portal: true`),
- * which must NOT become a bottom sheet. That is why this effect exists: the
- * trigger click arms a short window, and the first body-level menu that
- * lands inside it is OURS to mark.
+ * there is no pure-CSS way to pick OUR menu out of the portal crowd: the
+ * host has MANY `portal: true` Menus (agent-preset, chat preference rows,
+ * the Enter-behavior row, the workspace sidebar's 「…」, open-in-app,
+ * deliverables, the copy button's confirm, …), and none of them may become
+ * a bottom sheet. That is why this effect exists: a click on the permission
+ * trigger arms a short window and the next body-level menu to land is OURS
+ * to mark — while a marked menu still on the page (the close click) keeps
+ * the window shut.
  */
 const PORTAL_MENU_SELECTOR = 'body > div[role="menu"]'
 
@@ -59,11 +62,12 @@ export function clickArmsPermissionSheet(target: PermissionSheetCandidate | null
 }
 
 /**
- * How long a trigger click stays armed. The portal lands in the same React
+ * How long an OPEN click stays armed. The portal lands in the same React
  * commit as the state flip, so milliseconds of real latency; the window is
- * generous only against a stalled main thread, and it is CONSUMED by the
- * first menu that lands, so a longer ceiling cannot mis-mark a later,
- * unrelated menu.
+ * consumed by the menu that opens with it, or expires on its own — the
+ * close path never arms at all (the marked menu is still on the page, see
+ * the guard in onCaptureClick), so the ceiling's only job is retiring a
+ * window whose menu never came.
  */
 const ARM_MS = 1_500
 
@@ -99,6 +103,14 @@ export function installPermissionSheet(ctx: ClientContext): void {
     const onCaptureClick = (event: Event): void => {
       const target = event.target instanceof Element ? event.target : null
       if (!clickArmsPermissionSheet(target, phone.matches)) return
+      // T70-fix: the trigger TOGGLES. A click that CLOSES the menu lands
+      // while the marked menu is still in the DOM (capture runs before the
+      // host's own handler unmounts it) — arming there would leave a live
+      // 1.5 s window with no menu coming to consume it, and any unrelated
+      // body-level menu opening inside that window would be mis-marked as
+      // ours. A marked menu present at click time means this click can only
+      // be the close (or a no-op re-open), never an opening we must catch.
+      if (document.querySelector(`${PORTAL_MENU_SELECTOR}[${SHEET_MARKER}="${SHEET_VALUE}"]`) !== null) return
       armed = true
       if (armTimer !== undefined) clearTimeout(armTimer)
       armTimer = setTimeout(disarm, ARM_MS)
