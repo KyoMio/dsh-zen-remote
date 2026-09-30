@@ -357,4 +357,36 @@ export declare function mergeModelCatalogs(localValue: unknown, remoteValue: unk
  * group-agnostic ids and stay as they are.
  */
 export declare function virtualizeModelSelectionValue(value: unknown, serverId: string): unknown;
+/**
+ * T63: the virtual session ids a set of FORWARDED workspace frames carries —
+ * the `sessionIds` of `upsert` records and of baseline `value.items`. The
+ * workspace route feeds these to the summary sync, which announces list rows
+ * for ids the UI has no summary for yet (the sidebar drops a group member
+ * without one — RT dsh-client-ui-workspace orderByRecency / groupByWorkspace).
+ * Reading the FORWARDED output (not the merger's raw state) is the point:
+ * T56 already withheld empty groups and T58 already dropped hidden sessions,
+ * so a hidden closed-remote session never reaches here and is never
+ * announced. Only virtual ids count — local baseline content rides these
+ * frames verbatim and its rows already have summaries.
+ */
+export declare function virtualSessionIdsInWorkspaceFrames(frames: readonly unknown[]): string[];
+/**
+ * T63: the synthesized `api-session/added` emit frames for one relay
+ * `session/list` answer — one `{type:'emit', event:'api-session/added',
+ * args:[row]}` frame per row. This is the host's own mechanism for adding a
+ * list row without a re-pull (RT dsh-api-session-controller: the client face
+ * subscribes `api-session/added` → handleSessionAdded → mergeSummary →
+ * applyMutation's upsert, which ADDS an unknown row and fills an existing
+ * one — idempotent), and the emit frame shape is the client face's
+ * exact-keys `{type, event, args}` with args a JSON array
+ * (dsh-api-gateway lib/client.js parseRemoteEventFrame) — the same shape the
+ * T52 catalog-refresh frame uses. The rows are virtualized by
+ * {@link mergeSessionList} itself, so a synthesized row carries exactly what
+ * the merged `session/list` route would have answered: the session id AND
+ * the fork parent virtualized, and the projections' modelSelection providers
+ * rewritten (a row's `sequenced` block must not poison the projection store
+ * against the control stream's rewritten frames — T52-fix3). A malformed
+ * remote result means "the server said nothing" — no frames.
+ */
+export declare function sessionSummaryAddedFrames(remoteResult: unknown, serverId: string): unknown[];
 //# sourceMappingURL=merge-streams.d.ts.map

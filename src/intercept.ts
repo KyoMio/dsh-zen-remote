@@ -81,7 +81,15 @@ import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
-import { createControlMerger, createWorkspaceMerger, mergeModelCatalogs, mergeSessionList, virtualizeModelSelectionValue } from './merge-streams.js'
+import {
+  createControlMerger,
+  createWorkspaceMerger,
+  mergeModelCatalogs,
+  mergeSessionList,
+  sessionSummaryAddedFrames,
+  virtualSessionIdsInWorkspaceFrames,
+  virtualizeModelSelectionValue,
+} from './merge-streams.js'
 import type { ControlMerger, MergerAnnotation, MergerIdentity, WorkspaceMerger } from './merge-streams.js'
 
 /** The session-locating argument fields, as registered per method. Identical
@@ -1254,6 +1262,11 @@ interface MergedGlobalStreamDeps {
    * session" (T62); the merged stream re-judges immediately instead of
    * waiting for a frame or the fallback poll. Returns the disposer. */
   watchCurrentSession(fn: () => void): () => void
+  /** T63: the summary-sync hub. The WORKSPACE route reports the virtual
+   * session ids each forwarded frame batch carried, so the events leg's
+   * sync can announce list rows the UI has no summary for; the control
+   * route carries no session lists and never calls it. */
+  summarySync: SessionSummarySync
 }
 
 /**
@@ -1472,6 +1485,17 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   }
 
   const localIterator = local[Symbol.asyncIterator]()
+  // T63: forwarded workspace frames carry the group membership the sidebar
+  // renders; their virtual session ids go to the sync so rows the UI lacks
+  // summaries for get announced. Reading the FORWARDED output keeps the T56
+  // (empty groups) and T58 (hidden closed sessions) filters authoritative —
+  // a hidden id never reaches the hub, so it is never announced and never
+  // resurfaces as a row.
+  const noteForwardedSessions = (frames: readonly unknown[]): void => {
+    if (endpoint !== 'workspace/follow') return
+    const ids = virtualSessionIdsInWorkspaceFrames(frames)
+    if (ids.length > 0) deps.summarySync.noteForwardedSessionIds(ids)
+  }
   const pumpLocal = async (): Promise<void> => {
     try {
       while (alive) {
@@ -1480,7 +1504,9 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
         // T58-fix: judge this frame against the CURRENT selection, not a
         // stale one (see informCurrentSession above).
         informCurrentSession()
-        for (const frame of merger.onLocal(result.value)) channel.push(frame)
+        const out = merger.onLocal(result.value)
+        for (const frame of out) channel.push(frame)
+        noteForwardedSessions(out)
         // The flushed baseline may surface cached tombstones (T58) — the
         // poll starts the moment something waits on the current session.
         ensureSessionPoll()
@@ -1545,7 +1571,9 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
             // stale one (see informCurrentSession above) — the close of the
             // session the user JUST opened must keep its tombstone.
             informCurrentSession()
-            for (const out of merger.onRemote(frame)) channel.push(out)
+            const out = merger.onRemote(frame)
+            for (const outFrame of out) channel.push(outFrame)
+            noteForwardedSessions(out)
             // A close frame may have created a kept tombstone (T58) — start
             // watching the current session so the hide lands once the user
             // navigates away.
@@ -1622,6 +1650,70 @@ async function* localOnly(local: AsyncIterable<unknown>): AsyncGenerator<unknown
   for await (const frame of local) yield frame
 }
 
+/**
+ * T63: the shared summary-sync hub between the merged streams. The sidebar
+ * renders a session row only when the UI's `sessions.list` snapshot holds a
+ * summary for it (RT dsh-client-ui-workspace orderByRecency drops a member
+ * with `summaries[id] === void 0`, groupByWorkspace skips
+ * `list.byId[id] === undefined`), and that snapshot is written only by the
+ * `session/list` pull — which runs once per page load, when the relay may
+ * still be offline — and by the `api-session/added` event. The events leg
+ * consumes the sync (fetches the server list and synthesizes one
+ * `api-session/added` emit per row); the workspace route produces the
+ * mid-page nudges (a forwarded frame carrying a session id no sync has
+ * announced yet).
+ */
+export interface SessionSummarySync {
+  /** The workspace route reports the virtual session ids one forwarded frame
+   * batch carried. Ids already announced by a successful sync are ignored; a
+   * batch with any unannounced id requests one sync. */
+  noteForwardedSessionIds(ids: readonly string[]): void
+  /** A successful sync marks every served row announced, so a static remote
+   * stops nudging. */
+  noteAnnouncedSessionIds(ids: readonly string[]): void
+  /** Subscribe the "a sync is requested" callback; the latest subscriber
+   * wins (an older $events generation's disposer must not detach the newer
+   * one). Returns the disposer. */
+  onSyncRequested(fn: () => void): () => void
+  /** Whether a sync was requested while no listener was subscribed (a nudge
+   * before the $events stream opened) — consumed on read. */
+  consumePendingRequest(): boolean
+}
+
+function createSessionSummarySync(): SessionSummarySync {
+  const announced = new Set<string>()
+  let listener: (() => void) | undefined
+  let pending = false
+  return {
+    noteForwardedSessionIds(ids: readonly string[]): void {
+      let unknown = false
+      for (const id of ids) {
+        if (!announced.has(id)) {
+          unknown = true
+          break
+        }
+      }
+      if (!unknown) return
+      pending = true
+      listener?.()
+    },
+    noteAnnouncedSessionIds(ids: readonly string[]): void {
+      for (const id of ids) announced.add(id)
+    },
+    onSyncRequested(fn: () => void): () => void {
+      listener = fn
+      return () => {
+        if (listener === fn) listener = undefined
+      }
+    },
+    consumePendingRequest(): boolean {
+      const was = pending
+      pending = false
+      return was
+    },
+  }
+}
+
 interface MergedEventsStreamDeps {
   /** The LOCAL `$events` stream the UI opened (already awaited — the 0.2.0
    * method is async). */
@@ -1632,6 +1724,9 @@ interface MergedEventsStreamDeps {
   log: ((format: string, ...args: unknown[]) => void) | undefined
   /** The clock the reopen backoff runs on (the install options' clock). */
   clock: RelayClock
+  /** T63: the summary-sync hub — the workspace route's nudges arrive here
+   * and this leg runs the fetch-and-announce (see runSummarySync below). */
+  summarySync: SessionSummarySync
 }
 
 /**
@@ -1666,6 +1761,23 @@ interface MergedEventsStreamDeps {
  * synthesized on the way DOWN: an open remote session keeps its last
  * merged catalog and its last projection, so the composer trigger keeps
  * showing the server model's name while the link is down.
+ *
+ * T63 adds the summary sync (the sidebar-row fix): nothing re-pulls
+ * `session/list` while a page stays open — the pull runs once per
+ * connection generation (RT dsh-api-session-controller handleConnected),
+ * and at page load the relay may still be offline, so the merged answer
+ * carried no remote rows and the workspace group's members render without
+ * their rows (the summaries are missing). This leg therefore ANNOUNCES the
+ * rows itself: on serving-period establishment — the same gate as the
+ * catalog frame — and whenever the workspace route nudges about a
+ * forwarded frame carrying an unannounced session id, it fetches the
+ * server's `session/list` once and pushes one synthesized
+ * `api-session/added` emit per row ({@link sessionSummaryAddedFrames};
+ * the host's own add-a-row event, applied idempotently by the client
+ * face's mergeSummary). The frames obey the same discipline as the
+ * catalog frame: never before the local leg's `ready`, failures confined
+ * to the diagnostics ring, and deduped to the serving period plus the
+ * hub's announced set.
  */
 async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator<unknown, void, undefined> {
   const { local, relay, signal, recordFailure, log, clock } = deps
@@ -1702,11 +1814,56 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
     }
     channel.push(catalogRefreshFrame())
   }
+  /**
+   * T63: fetch the server's `session/list` once and announce every row as a
+   * synthesized `api-session/added` emit ({@link sessionSummaryAddedFrames}) —
+   * the list rows the UI never received because its one pull ran while the
+   * relay was offline. Deferred past the local `ready` like the catalog
+   * frame, single-flight (a nudge burst collapses into the running fetch),
+   * and a failure is diagnostics only — the next nudge or serving period
+   * retries. Rows land unconditionally (idempotent upserts client-side);
+   * their ids are marked announced so the workspace nudges quiet down.
+   */
+  let deferredSummarySync = false
+  let summarySyncInFlight = false
+  const runSummarySync = (): void => {
+    if (!alive) return
+    if (!localOpened) {
+      deferredSummarySync = true
+      return
+    }
+    if (summarySyncInFlight) return
+    const identity = relayIdentityOf(relay)
+    if (identity === undefined || relay.state !== 'online') return
+    summarySyncInFlight = true
+    void relay.invoke('session', 'list', {}, undefined).then(
+      (value) => {
+        summarySyncInFlight = false
+        if (!alive) return
+        const frames = sessionSummaryAddedFrames(value, identity.serverId)
+        if (frames.length === 0) return
+        const announced: string[] = []
+        for (const frame of frames) {
+          channel.push(frame)
+          const row = (frame as { args: unknown[] }).args[0]
+          if (isPlainObject(row) && typeof row.sessionId === 'string') announced.push(row.sessionId)
+        }
+        deps.summarySync.noteAnnouncedSessionIds(announced)
+      },
+      (error: unknown) => {
+        summarySyncInFlight = false
+        recordFailure('session/list', error instanceof RelayError ? error.code : 'internal')
+      },
+    )
+  }
   const noteOnlineIdentity = (identity: MergerIdentity, firstOnline: boolean): void => {
     const key = `${identity.serverId}\u0000${identity.serverName}`
     if (!firstOnline && key === refreshKey) return
     refreshKey = key
     pushRefresh()
+    // T63: a NEW serving period is the page-load hole closing — the UI's
+    // one list pull already ran (relay offline), so announce the rows now.
+    runSummarySync()
   }
   const onlineWaiters: (() => void)[] = []
   const flushWaiters = (): void => {
@@ -1761,6 +1918,10 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
     channel.end()
   }
   if (signal !== undefined) signal.addEventListener('abort', onExternalAbort)
+  // T63: workspace-route nudges arrive while this leg is open; requests that
+  // landed before the subscription (or before the local ready) ride the
+  // pending flag, consumed at the ready flip below.
+  const offSyncRequest = deps.summarySync.onSyncRequested(runSummarySync)
 
   const waitOnline = async (): Promise<void> => {
     await new Promise<void>((resolve) => {
@@ -1783,6 +1944,12 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
           if (deferredRefresh) {
             deferredRefresh = false
             channel.push(catalogRefreshFrame())
+          }
+          // T63: same rule for the summary sync — a request that arrived
+          // before the ready (or before this stream opened at all) runs now.
+          if (deferredSummarySync || deps.summarySync.consumePendingRequest()) {
+            deferredSummarySync = false
+            runSummarySync()
           }
         }
       }
@@ -1902,6 +2069,7 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
   } finally {
     alive = false
     offState()
+    offSyncRequest()
     if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
     currentController?.abort()
     flushWaiters()
@@ -1921,6 +2089,11 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
 export function installIntercept(options: InstallInterceptOptions): InterceptHandle {
   const { raw, relay, getServerId, log } = options
   const clock = options.clock ?? defaultClock
+  // T63: the summary-sync hub shared by the merged streams — the workspace
+  // route nudges, the events leg fetches-and-announces. One per install: it
+  // outlives individual stream generations so a nudge from a workspace leg
+  // reaches whichever $events generation is open.
+  const summarySync = createSessionSummarySync()
   // T62: the current-session getter and the live-merged-stream listener
   // registry behind handle.currentSessionChanged().
   const getCurrentSession = options.getCurrentSession ?? (() => ({ kind: 'unavailable' }) as const)
@@ -2704,7 +2877,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       return (async (): Promise<unknown> => {
         const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control)
         if (!isAsyncIterable(local)) return local
-        return mergedEventsStream({ local, relay, signal, recordFailure, log, clock })
+        return mergedEventsStream({ local, relay, signal, recordFailure, log, clock, summarySync })
       })()
     }
     const args = argsOf(payload)
@@ -2750,6 +2923,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             clock,
             getCurrentSession,
             watchCurrentSession,
+            summarySync,
           })
         })()
       }
