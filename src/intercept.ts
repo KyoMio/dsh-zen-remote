@@ -415,6 +415,65 @@ function waitReopen(clock: RelayClock, waitOnline: () => Promise<void>, delayMs:
 }
 
 /**
+ * T58: where the CURRENT session id comes from. The host's
+ * `dsh-client-ui-workspace` keeps its selection (the `mainReference.sessionId`
+ * its `watchNavigation` / `clearArchivedCurrent` act on) in a snapshot store
+ * persisted to THIS localStorage key on every navigation (`replaceMain`
+ * writes `{sessionId}`, `clearMain` writes `{}`) — reading it is reading the
+ * same source the navigation guard uses, no host internals needed. A stale
+ * value cannot mislead either: on load the store rehydrates from this exact
+ * key before `restoreSelection` reopens it.
+ */
+const CURRENT_SESSION_STORAGE_KEY = 'dsh.sessions.current'
+
+/** The poll interval for re-reading the current session (T58: never faster
+ * than 1s, and the loop runs only while the merger keeps tombstones waiting). */
+const CURRENT_SESSION_POLL_MS = 1_000
+
+/** localStorage reduced to the one method used — intercept.ts is compiled
+ * with the HOST tsconfig (node types, no DOM lib) even though it runs in the
+ * browser page. */
+interface BrowserStorageLike {
+  getItem(key: string): string | null
+}
+
+/** The page's localStorage when one exists and answers, else undefined. */
+function browserStorage(): BrowserStorageLike | undefined {
+  try {
+    const storage = (globalThis as { localStorage?: BrowserStorageLike | null }).localStorage
+    return storage !== null && storage !== undefined && typeof storage.getItem === 'function' ? storage : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** One read of the current-session signal (T58). `unavailable` = no usable
+ * storage or an unreadable value — the caller must NOT inform the merger
+ * (the conservative tombstone fallback applies); `none` / `open` are real
+ * answers (the store was read: either no session is open, or this one is). */
+type CurrentSessionRead = { kind: 'unavailable' } | { kind: 'none' } | { kind: 'open'; sessionId: string }
+
+function readCurrentSession(): CurrentSessionRead {
+  const storage = browserStorage()
+  if (storage === undefined) return { kind: 'unavailable' }
+  try {
+    const raw = storage.getItem(CURRENT_SESSION_STORAGE_KEY)
+    // An absent key is treated as unavailable, on purpose: the store only
+    // starts persisting once the host writes a selection, so absence means
+    // "no signal ever" — the conservative reading — rather than a positive
+    // "no session is open".
+    if (raw === null) return { kind: 'unavailable' }
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { kind: 'unavailable' }
+    const sessionId = (parsed as { sessionId?: unknown }).sessionId
+    if (typeof sessionId !== 'string' || sessionId === '') return { kind: 'none' }
+    return { kind: 'open', sessionId }
+  } catch {
+    return { kind: 'unavailable' }
+  }
+}
+
+/**
  * The error shape the host's stream channel forwards intact: only errors
  * with `isDSHRemoteError === true` and a string `code` keep their identity
  * across the wire (dsh-typert-protocol's remoteErrorOf) — anything else is
@@ -1288,6 +1347,31 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   const channel = createFrameChannel()
   let alive = true
   let currentController: AbortController | undefined
+  // T58: the current-session knowledge. Seeded once, before any frame, so
+  // the FIRST closed-remote decision already knows which session the user
+  // has open; then kept fresh by a ≥1s poll that runs ONLY while the merger
+  // keeps tombstones waiting (hasPendingHide — a closed session that is the
+  // open one, or tombstones still undecided for lack of a readable signal).
+  // An unavailable read is skipped entirely: the merger falls back to the
+  // conservative tombstone behavior then.
+  const informCurrentSession = (): void => {
+    const read = readCurrentSession()
+    if (read.kind === 'unavailable') return
+    for (const frame of merger.setCurrentSession(read.kind === 'open' ? read.sessionId : undefined)) channel.push(frame)
+  }
+  let sessionPoll: unknown = undefined
+  const pollCurrentSession = (): void => {
+    sessionPoll = undefined
+    if (!alive) return
+    if (merger.hasPendingHide) informCurrentSession()
+    if (alive && merger.hasPendingHide) sessionPoll = clock.setTimeout(pollCurrentSession, CURRENT_SESSION_POLL_MS)
+  }
+  const ensureSessionPoll = (): void => {
+    if (sessionPoll === undefined && alive && merger.hasPendingHide) {
+      sessionPoll = clock.setTimeout(pollCurrentSession, CURRENT_SESSION_POLL_MS)
+    }
+  }
+  informCurrentSession()
   // Set by the state listener when a re-handshake aborted the in-flight
   // remote stream: the pump must reopen WITHOUT waiting for another online
   // event (the transition that fired the abort already happened).
@@ -1404,6 +1488,9 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
         const result = await localIterator.next()
         if (result.done === true) break
         for (const frame of merger.onLocal(result.value)) channel.push(frame)
+        // The flushed baseline may surface cached tombstones (T58) — the
+        // poll starts the moment something waits on the current session.
+        ensureSessionPoll()
       }
     } catch (error) {
       // The local stream is the one the UI opened: its failure is the
@@ -1462,6 +1549,10 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
               reopenDelayMs = REMOTE_REOPEN_FIRST_MS
             }
             for (const out of merger.onRemote(frame)) channel.push(out)
+            // A close frame may have created a kept tombstone (T58) — start
+            // watching the current session so the hide lands once the user
+            // navigates away.
+            ensureSessionPoll()
           }
         } catch (error) {
           // A transport fault is a diagnostics-ring failure — but an abort
@@ -1515,6 +1606,7 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
     }
   } finally {
     alive = false
+    if (sessionPoll !== undefined) clock.clearTimeout(sessionPoll)
     offState()
     if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
     currentController?.abort()
