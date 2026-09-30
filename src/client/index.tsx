@@ -35,6 +35,7 @@ import { RemoteStatusIcon } from './RemoteStatusIcon.tsx'
 import { RemoteComposerBanner } from './RemoteComposerBanner.tsx'
 import { registerRemoteStatusUi } from './remote-status-register.ts'
 import { mountCurrentSessionReporter } from './current-session-report.ts'
+import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
 
@@ -131,6 +132,12 @@ export function apply(ctx: ClientContext): void {
   // 的桌面端 App 正是远程会话所在；只在探测出的子客户端角色下运行，主
   // 服务端的页面探测一次后就静默。
   mountCurrentSessionReporter(ctx)
+  // T64 服务端分组展开状态的记忆与恢复：宿主在工作区列表 ready 时会把不在
+  // 列表里的分组展开记录清掉（retainAccountKeys），而本地工作区先 ready、
+  // 服务端分组后并入，zr~ 键每次加载都被清掉、分组回到折叠。与上报器共用
+  // 挂载点与角色判断（同一个 client-config 探测）、同样的 1 秒节拍（自己的
+  // 定时器），逻辑在 remote-group-expansion.ts 自己的文件里。
+  mountRemoteGroupExpansionKeeper(ctx)
   // T41b 的两个远程会话部件：fetch 改写（改动 / diff 面板的两条 /api GET）与
   // 远程会话标记（data-zr-remote-session + 隐藏「在服务端机器上打开」类入口
   // 的样式）。同样必须在桌面门之前注册——桌面窗口也可以是配对好的子客户端，
