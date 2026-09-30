@@ -96,11 +96,35 @@ test('T59: the backend forwards a committed row name through the volatile-update
   const index = readFileSync(join(ROOT, 'src', 'index.ts'), 'utf8')
   const watcherAt = index.indexOf("'dsh-zen-remote: relay credentials watcher'")
   assert.notEqual(watcherAt, -1, 'the credentials watcher is the anchor')
-  const watcherBlock = index.slice(index.indexOf('loader/volatile-update', watcherAt - 3000), watcherAt)
-  assert.ok(watcherBlock.includes('relayClient.credentialsChanged()'), 'the credentials watch is intact')
   const effectSource = index.slice(index.indexOf("ctx.on('loader/volatile-update'"), watcherAt)
+  assert.ok(effectSource.includes('relayClient.credentialsChanged()'), 'the credentials watch is intact')
+  assert.ok(effectSource.includes('volatileUpdateTouchesServerName(paths)'), 'the push filters on the CHANGED paths (T59-fix: an unrelated knob never queues a push)')
   assert.ok(effectSource.includes('queueDeviceName'), 'the committed row name is queued for the gateway push')
   assert.ok(effectSource.includes('unwrapVolatile(row.serverName)'), 'the name is read LIVE off the volatile row')
+  // T59-fix: NO boot-time push — the row's loaded name is stale by
+  // definition (the server's table may have been edited meanwhile), and an
+  // unconditional boot push would overwrite an administrator's rename.
+  assert.equal(index.includes('queueDeviceName'), true)
+  const bootPushes = index.split('relayClient.queueDeviceName(').length - 1
+  assert.equal(bootPushes, 1, 'exactly one queue call site: the volatile-update listener, nothing at startup')
+})
+
+test('T59-fix: the settings page follows the name at the STATUS ANSWER, not off a row-keyed effect', () => {
+  const section = readFileSync(join(ROOT, 'src', 'client', 'settings', 'SettingsSection.tsx'), 'utf8')
+  // The race source is gone: no effect keyed on the row's serverName value
+  // (it re-ran on every save holding the PREVIOUS poll's name and wrote the
+  // old one back over the fresh save).
+  assert.ok(!section.includes('rowDeviceName'), 'the row-value follow effect is gone')
+  // The decision now runs where the FRESH answer lands, judging the row and
+  // the draft as they are at that moment.
+  const loadAt = section.indexOf('const loadClientStatus = useCallback(')
+  const followDefAt = section.indexOf('const followServerDeviceName = useCallback(')
+  const callAt = section.indexOf('followServerDeviceName(view)', loadAt)
+  for (const [label, at] of [['the follow decision', followDefAt], ['its call in the status load', callAt]]) {
+    assert.notEqual(at, -1, `${label} present`)
+  }
+  assert.ok(followDefAt < loadAt, 'the decision is declared before the loader uses it')
+  assert.ok(callAt > loadAt, 'the decision runs on every fresh status answer')
 })
 
 // ---- T60: the pairing round-trip lands the name in the row --------------------

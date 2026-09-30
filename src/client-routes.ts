@@ -282,14 +282,17 @@ function probeStateOfRelayError(error: unknown): ProbeState | 'unpaired' | 'inco
  * name — the SERVER's record of this device (T59), which the settings page
  * follows into the row while the user is not mid-edit. Absent from an older
  * relay client (no handshake field) and then the body carries it as '' —
- * the settings page treats empty as "nothing to follow".
+ * the settings page treats empty as "nothing to follow". While a
+ * locally-pushed rename is queued or in flight the name is FORCED empty
+ * (T59-fix): the answer could predate the push, and a page that followed it
+ * would bounce the user's fresh save back to the old name.
  */
-function deviceStatusBody(state: string, info: { serverName: string, deviceName?: string }, serverUrl: string): Record<string, unknown> {
+function deviceStatusBody(state: string, info: { serverName: string, deviceName?: string }, serverUrl: string, deviceNameSyncing: boolean): Record<string, unknown> {
   return {
     state,
     serverName: info.serverName,
     serverUrl,
-    deviceName: typeof info.deviceName === 'string' ? info.deviceName : '',
+    deviceName: !deviceNameSyncing && typeof info.deviceName === 'string' ? info.deviceName : '',
   }
 }
 
@@ -486,7 +489,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           relay.lastHandshakeDigest !== undefined &&
           relay.lastHandshakeDigest === relayCredentialsDigest(normalized.url, token)
         ) {
-          responseJson(res, 200, withDiagnostics(deviceStatusBody(relay.state, relay.handshakeInfo, normalized.url)))
+          responseJson(res, 200, withDiagnostics(deviceStatusBody(relay.state, relay.handshakeInfo, normalized.url, relay.deviceNameSyncing)))
           return
         }
         // Everything else — never connected, offline, connecting, revoked,
@@ -498,7 +501,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // credential material by contract.
         try {
           const info = await withProbeTimeout(relay.connect())
-          responseJson(res, 200, withDiagnostics(deviceStatusBody('online', info, normalized.url)))
+          responseJson(res, 200, withDiagnostics(deviceStatusBody('online', info, normalized.url, relay.deviceNameSyncing)))
         } catch (error) {
           const body: Record<string, unknown> = { state: probeStateOfRelayError(error), serverUrl: normalized.url }
           if (relay.nextRetryAt !== null && relay.nextRetryAt !== undefined) body.nextRetryAt = relay.nextRetryAt

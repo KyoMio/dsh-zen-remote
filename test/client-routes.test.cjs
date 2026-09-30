@@ -586,6 +586,9 @@ function fakeRelay(overrides = {}) {
     state: 'unpaired',
     handshakeInfo: undefined,
     lastHandshakeDigest: undefined,
+    // T59-fix: the status route answers an empty deviceName while a
+    // locally-pushed rename is queued or in flight; tests override this.
+    deviceNameSyncing: false,
     connectCount: 0,
     connectError: undefined,
     connectResult: undefined,
@@ -1441,6 +1444,32 @@ test('T59 status: the device\'s own name rides the online answer from the handsh
     } finally {
       await closeServer(server2)
     }
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('T59-fix status: an in-flight or queued rename answers an EMPTY deviceName — the page must not follow', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    state: 'online',
+    handshakeInfo: INFO('书房服务器', '书房的台式机'),
+    lastHandshakeDigest: relayCredentialsDigest(gwUrl, 'tok-row'),
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    // While the push is queued or in flight, the answer could predate it —
+    // the name is forced empty so the page has nothing to follow.
+    relay.deviceNameSyncing = true
+    const during = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(during.deviceName, '', 'syncing forces the follow field empty')
+
+    // Once the push settles (and the handshake record carries the pushed
+    // name), the answer carries it and the page follows THAT.
+    relay.deviceNameSyncing = false
+    relay.handshakeInfo = INFO('书房服务器', 'B')
+    const after = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(after.deviceName, 'B', 'after the push the fresh record travels')
   } finally {
     await closeServer(server)
   }
