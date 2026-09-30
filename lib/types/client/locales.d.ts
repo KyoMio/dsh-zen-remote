@@ -101,7 +101,7 @@ export declare const zh: {
     readonly 'settings.fieldTrustedProxies': "可信代理";
     readonly 'settings.fieldTrustedProxiesHint': "逗号分隔的反代 IP 列表，网关据此信任 X-Forwarded-* 头。留空清除。";
     readonly 'settings.fieldRateLimit': "限流（次/分钟）";
-    readonly 'settings.fieldRateLimitHint': "每个配对设备每分钟允许的远程请求数，正整数。";
+    readonly 'settings.fieldRateLimitHint': "尚未配对的请求每分钟允许的次数（按客户端 IP 计，已配对设备不受限），正整数。";
     readonly 'settings.fieldVapidSubject': "推送联系人";
     readonly 'settings.fieldVapidSubjectHint': "VAPID subject，mailto: 或 https: 地址。留空清除。";
     readonly 'settings.invalidPort': "需要 1–65535 的整数";
