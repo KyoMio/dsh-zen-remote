@@ -22,6 +22,7 @@ const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM = '/_dsh/zen-remote/relay/v1/stream'
 const UNSHARE = '/_dsh/zen-remote/relay/v1/unshare'
 const UPLOAD = '/_dsh/zen-remote/relay/v1/upload'
+const DEVICE_NAME = '/_dsh/zen-remote/relay/v1/device/name'
 
 const HANDSHAKE_OK = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: { algo: 'sha256' } }]
 
@@ -45,6 +46,7 @@ function startFakeRelay() {
     stream: undefined,
     unshare: () => [200, { ok: true }],
     upload: () => [200, { ok: true, value: { status: 200, contentType: 'application/json; charset=utf-8', body: JSON.stringify({ ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'att-1', name: 'note.txt', bytes: 5 } } }) } }],
+    deviceName: (req, res, body) => [200, { ok: true, name: body && typeof body.name === 'string' ? body.name : '' }],
   }
   const server = http.createServer((req, res) => {
     // T51-fix: the uploadStart hook fires when the HEADERS arrive — the only
@@ -89,6 +91,13 @@ function startFakeRelay() {
         sendJson(res, 403, { ok: false, error: { code: 'forbidden-method' } })
         return
       }
+      if (route === DEVICE_NAME) {
+        // T59: the gateway's device-name endpoint — a scenario contract like
+        // the JSON routes above.
+        const answered = scenario.deviceName(req, res, body)
+        if (answered !== undefined) sendJson(res, answered[0], answered[1])
+        return
+      }
       if (route === UNSHARE) {
         const answered = scenario.unshare(req, res)
         if (answered !== undefined) sendJson(res, answered[0], answered[1])
@@ -122,6 +131,9 @@ function makeClient(port, overrides = {}) {
     getToken: () => token,
     ...(overrides.idleTimeoutMs !== undefined ? { idleTimeoutMs: overrides.idleTimeoutMs } : {}),
     ...(overrides.requestTimeoutMs !== undefined ? { requestTimeoutMs: overrides.requestTimeoutMs } : {}),
+    // T59: handshake-counting tests would see the periodic info refresh as
+    // extra handshakes — off unless a test opts in.
+    infoRefreshMs: overrides.infoRefreshMs ?? 0,
     ...(overrides.clock !== undefined ? { clock: overrides.clock } : {}),
     ...(overrides.computeOwnFingerprints !== undefined ? { computeOwnFingerprints: overrides.computeOwnFingerprints } : {}),
   })
@@ -1443,5 +1455,187 @@ test('T34 stream: the error line carries the structured reason on RelayError (an
     const junk = await collect(client.openStream('session', 'follow', {}))
     assert.equal(junk.error.code, 'internal')
     assert.equal(junk.error.reason, undefined, 'a non-string reason is dropped')
+  } finally { await relay.stop() }
+})
+
+// ---- T59: the device-name sync -----------------------------------------------
+
+test('T59 handshake: the server\'s record of this device rides the reply when sent', async () => {
+  const relay = await startFakeRelay()
+  try {
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: '书房的台式机' }]
+    const { client } = makeClient(relay.port)
+    const info = await client.connect()
+    assert.equal(info.deviceName, '书房的台式机')
+    assert.equal(client.handshakeInfo.deviceName, '书房的台式机')
+
+    // An older server omits the field: the client keeps what it has — here,
+    // nothing at all.
+    const bare = await startFakeRelay()
+    try {
+      const { client: bareClient } = makeClient(bare.port)
+      const bareInfo = await bareClient.connect()
+      assert.equal('deviceName' in bareInfo, false, 'no field, no value')
+    } finally { await bare.stop() }
+  } finally { await relay.stop() }
+})
+
+test('T59 stream: a ping carrying names updates the handshake and notifies — state unmoved', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    const states = []
+    let notifications = 0
+    client.subscribe((s) => { notifications += 1; states.push(s) })
+    // The heartbeat names, as the real server composes them per tick.
+    relay.scenario.stream = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.write('{"type":"ping","serverName":"新服务端名","deviceName":"新设备名"}\n')
+      res.end()
+    }
+    const iterator = client.openStream('session', 'follow', {})
+    const first = await iterator.next()
+    assert.equal(first.done, true, 'the one-shot stream ends after its ping')
+    await waitFor(() => client.handshakeInfo.serverName === '新服务端名')
+    assert.equal(client.handshakeInfo.deviceName, '新设备名')
+    assert.ok(notifications >= 1, 'the identity change woke the subscribers')
+    assert.ok(states.every((s) => s === 'online'), `no state movement — got ${states.join(',')}`)
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('T59 stream: an old-format bare ping neither errors nor notifies', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    let notifications = 0
+    client.subscribe(() => { notifications += 1 })
+    relay.scenario.stream = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.write('{"type":"ping"}\n')
+      res.end()
+    }
+    const iterator = client.openStream('session', 'follow', {})
+    const next = await iterator.next()
+    assert.equal(next.done, true)
+    await sleep(30)
+    assert.equal(notifications, 0, 'a bare ping carries nothing worth announcing')
+    assert.equal(client.state, 'online')
+    assert.equal(client.handshakeInfo.serverName, '假服务器')
+  } finally { await relay.stop() }
+})
+
+test('T59 queueDeviceName: online push, same-name no-op, offline queued for the first connect', async () => {
+  // ONLINE, name differs: exactly one endpoint call carrying the name; the
+  // local handshake record follows the confirmed answer.
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    client.queueDeviceName('书房的新名字')
+    await waitFor(() => relay.seen.some((hit) => hit.url === DEVICE_NAME))
+    const push = relay.seen.find((hit) => hit.url === DEVICE_NAME)
+    assert.deepEqual(push.body, { name: '书房的新名字' })
+    assert.equal(push.headers.authorization, 'Bearer tok-1')
+    assert.equal(client.handshakeInfo.deviceName, '书房的新名字', 'the confirmed answer landed locally')
+    const pushes = () => relay.seen.filter((hit) => hit.url === DEVICE_NAME).length
+
+    // The same name again (the settings page's own write echoing back): a
+    // no-op BY CONTRACT — this is the anti-bounce rule.
+    client.queueDeviceName('书房的新名字')
+    await sleep(40)
+    assert.equal(pushes(), 1, 'an equal name never travels')
+
+    // OFFLINE: the name queues, and the first successful connect flushes it.
+    relay.scenario.deviceName = () => [200, { ok: true, name: '离线改名' }]
+    relay.scenario.invoke = () => [502, { ok: false }]
+    await assert.rejects(() => client.invoke('session', 'page', {}))
+    await waitFor(() => client.state === 'offline')
+    client.queueDeviceName('离线改名')
+    await sleep(20)
+    assert.equal(pushes(), 1, 'offline queues only')
+    relay.scenario.handshake = HANDSHAKE_OK
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: '书房的新名字' }]
+    await client.connect()
+    await waitFor(() => pushes() === 2, 2000)
+    assert.deepEqual(relay.seen.filter((hit) => hit.url === DEVICE_NAME).at(-1).body, { name: '离线改名' }, 'the queued rename went out after the handshake')
+
+    // A queued name EQUAL to the server's record is dropped, not pushed:
+    // the flush above left '离线改名' as the table's record, so queuing it
+    // again is the echo — while the OLD name would legitimately travel (the
+    // user actively saved it).
+    client.queueDeviceName('离线改名')
+    await sleep(40)
+    assert.equal(pushes(), 2, 'a name the server already records is the echo, not a push')
+    client.queueDeviceName('书房的新名字')
+    await waitFor(() => pushes() === 3)
+    assert.deepEqual(relay.seen.filter((hit) => hit.url === DEVICE_NAME).at(-1).body, { name: '书房的新名字' }, 'an actively saved rename travels, even back to an older value')
+  } finally { await relay.stop() }
+})
+
+test('T59: a pushed rename outranks the stale stream heartbeat until the server confirms', async () => {
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port)
+    relay.scenario.stream = (req, res) => {
+      // The stream opened BEFORE the rename: its heartbeats still carry the
+      // old marking header, and so the old name — indefinitely.
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.write('{"type":"ping","serverName":"假服务器","deviceName":"旧名"}\n')
+      res.end()
+    }
+    await client.connect()
+    const iterator = client.openStream('session', 'follow', {})
+    await iterator.next()
+    client.queueDeviceName('新名')
+    await waitFor(() => relay.seen.some((hit) => hit.url === DEVICE_NAME))
+    await waitFor(() => client.handshakeInfo.deviceName === '新名')
+    // Let the stale ping land now that the local record is authoritative.
+    await sleep(40)
+    assert.equal(client.handshakeInfo.deviceName, '新名', 'the old heartbeat did NOT pull the name back — no overwrite loop')
+    assert.equal(client.state, 'online')
+
+    // The next server confirmation retires the authority: a handshake that
+    // answers the new name keeps it (and a different one would win).
+    relay.scenario.stream = undefined
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: '新名' }]
+    await client.connect()
+    assert.equal(client.handshakeInfo.deviceName, '新名')
+    // Authority retired: a stale heartbeat WOULD win now — proving the flag
+    // really cleared by pushing nothing and bouncing a differing ping back.
+    relay.scenario.stream = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.write('{"type":"ping","serverName":"假服务器","deviceName":"服务端另一改"}\n')
+      res.end()
+    }
+    const it2 = client.openStream('session', 'follow', {})
+    await it2.next()
+    await waitFor(() => client.handshakeInfo.deviceName === '服务端另一改')
+  } finally { await relay.stop() }
+})
+
+test('T59: the periodic info refresh re-handshakes while online and folds the fresh names', async () => {
+  const clock = fakeClock()
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port, { clock, infoRefreshMs: 30_000 })
+    const handshakeBodies = () => relay.seen.filter((hit) => hit.url === HANDSHAKE).length
+    await client.connect()
+    assert.equal(handshakeBodies(), 1)
+    // Advance past INFO_REFRESH_MS: the armed tick fires, one quiet
+    // handshake goes out, and the fresh names land.
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '改名后的服务端', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: '服务端改的名' }]
+    clock.advance(30_000)
+    await waitFor(() => handshakeBodies() === 2)
+    await waitFor(() => client.handshakeInfo.serverName === '改名后的服务端' && client.handshakeInfo.deviceName === '服务端改的名')
+    assert.equal(client.state, 'online', 'the refresh never leaves online')
+
+    // And the ladder keeps re-arming while online.
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '再改', dshVersion: '9.9.9-test', fingerprints: {}, deviceName: '再改的设备名' }]
+    clock.advance(30_000)
+    await waitFor(() => handshakeBodies() === 3)
+    await waitFor(() => client.handshakeInfo.serverName === '再改')
   } finally { await relay.stop() }
 })

@@ -152,8 +152,22 @@ const DEFAULT_END_DRAIN_TIMEOUT_MS = 5_000
 /** The upload cap used unless the wiring injects one (tests shrink it). */
 const DEFAULT_UPLOAD_CAP_BYTES = MAX_UPLOAD_BYTES
 
-/** `{"type":"ping"}` as one ready-made NDJSON line. */
-const PING_LINE = Buffer.from('{"type":"ping"}\n', 'utf8')
+/**
+ * Decode the gateway's `x-zen-remote-device-name` marking header (T59): the
+ * gateway percent-encodes the device table's current name; `undefined` when
+ * the header is absent, blank, or not valid percent-encoding (an old gateway,
+ * a direct local call). Never throws.
+ */
+function deviceNameHeaderOf(req: IncomingMessage): string | undefined {
+  const raw = headerValue(req, 'x-zen-remote-device-name')
+  if (raw === undefined || raw === '') return undefined
+  try {
+    const decoded = decodeURIComponent(raw)
+    return decoded === '' ? undefined : decoded
+  } catch {
+    return undefined
+  }
+}
 
 /** Most recent jobs remembered per session for ownership checks (4b): the
  * latest `job/list` frame replaces the whole set, so this only bounds a
@@ -660,6 +674,16 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   /** Uploads currently in flight per device id, for the upload budget (T51-fix). */
   const uploadsByDevice = new Map<string, number>()
 
+  /**
+   * The device NAME this process last saw per device id (T59): every relay
+   * request rides the gateway's fresh `x-zen-remote-device-name` marking
+   * header, so the map learns a rename as soon as that device sends anything
+   * at all — and the NDJSON heartbeat reads the LATEST known name per ping,
+   * which is how a server-side rename reaches a connected client without a
+   * reconnect. Tiny by construction (paired device ids only).
+   */
+  const deviceNames = new Map<string, string>()
+
   /** The `$zr/events` subscriptions currently open — the event-result
    * route searches these for every incoming eventId. A closed
    * subscription removes itself; closeAll empties the set. */
@@ -888,6 +912,14 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     }
     // The stream route below budgets concurrent streams per device; other
     // routes do not need the id beyond the gate itself.
+    // T59: every authenticated request teaches the name cache — the gateway
+    // stamps the device table's CURRENT name on every forward, so this line
+    // is where a rename (admin edit, or the device's own push) lands.
+    const deviceNameHeader = deviceNameHeaderOf(req)
+    const gateDeviceId = headerValue(req, 'x-zen-remote-device')
+    if (gateDeviceId !== undefined && gateDeviceId !== '' && deviceNameHeader !== undefined) {
+      deviceNames.set(gateDeviceId, deviceNameHeader)
+    }
 
     // The pathname EXACTLY as the webserver saw it — never decoded before
     // matching (see the module comment): a decoded match would turn the
@@ -925,6 +957,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // T42: the server's own interface fingerprints (empty when the wiring
         // had nothing to compute — the client judges group by group).
         fingerprints,
+        // T59: the CALLING device's name, as the gateway's device table holds
+        // it at this moment (the header is written fresh per forward, so a
+        // just-renamed device reads its new name here). Undefined without the
+        // header — an old gateway or a direct call — and the field then rides
+        // no further: the client keeps what it has.
+        ...(deviceNameHeaderOf(req) !== undefined ? { deviceName: deviceNameHeaderOf(req) } : {}),
       })
       return
     }
@@ -1536,7 +1574,21 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         res.on('error', onClientGone)
 
         const heartbeat = setInterval(() => {
-          if (!finished && !clientGone) res.write(PING_LINE)
+          if (!finished && !clientGone) {
+            // T59: a PER-STREAM ping carrying the names as of NOW. The
+            // server's display name is re-read live per tick (a host rename
+            // reaches every connected client within one heartbeat), and the
+            // device name comes from the learned cache (updated by that
+            // device's every request) — the old shared PING_LINE constant
+            // could carry neither.
+            const deviceName = deviceNames.get(device)
+            const line = JSON.stringify({
+              type: 'ping',
+              serverName: serverInfo.serverName(),
+              ...(deviceName !== undefined ? { deviceName } : {}),
+            })
+            res.write(Buffer.from(`${line}\n`, 'utf8'))
+          }
         }, heartbeatMs)
         // The host process must never be kept alive by a heartbeat alone.
         if (typeof heartbeat.unref === 'function') heartbeat.unref()

@@ -75,6 +75,13 @@ export interface RelayHandshake {
     serverName: string;
     dshVersion: string;
     fingerprints: Record<string, string>;
+    /**
+     * The SERVER's record of THIS device's name (T59) — what the pairing
+     * registered and renames have since made of it. `undefined` from an older
+     * server that does not send the field; the client then keeps whatever it
+     * has and pushes nothing.
+     */
+    deviceName?: string;
 }
 /**
  * One relay failure. `code` is the mapped reason (the contract's state
@@ -112,6 +119,13 @@ export interface CreateRelayClientOptions {
     /** Clock/timers/jitter for the reconnect backoff; defaults to the real
      * ones (timers `unref()`ed). Tests inject a manual clock. */
     clock?: RelayClock;
+    /**
+     * How often an ONLINE client re-runs the handshake to refresh the two
+     * names (T59, {@link INFO_REFRESH_MS}); `0` disables the periodic refresh
+     * — handshake-counting tests inject 0, the refresh test injects a cadence
+     * its fake clock can drive.
+     */
+    infoRefreshMs?: number;
     /** This side's own interface fingerprints (T42), computed after each
      * completed handshake and compared group by group against the handshake's
      * map. May be sync or async; a throw counts as "nothing computed" (an
@@ -144,8 +158,17 @@ export interface RelayClient {
      * revoked, credentialsChanged) — it describes the credentials it was
      * earned with, never the current ones. */
     readonly compat: RelayCompatVerdict | undefined;
-    /** Observe state changes; a throwing listener never blocks the others. */
+    /** Observe state changes; a throwing listener never blocks the others.
+     * The CURRENT state is also broadcast when only the handshake identity
+     * moved (the T59 heartbeat names) — listeners re-read the getters. */
     subscribe(listener: (state: RelayState) => void): () => void;
+    /** The row's `serverName` was just committed (T59): forward it to the
+     * gateway's device table when it differs from the server's record —
+     * immediately while online, queued for the next `online` otherwise. A
+     * name equal to the server's record is a no-op BY CONTRACT: that is the
+     * settings page's server-driven write echoing back, and pushing it would
+     * set the two ends overwriting each other. */
+    queueDeviceName(name: string): void;
     /** Run the handshake; success resolves with it and leaves `online`. */
     connect(): Promise<RelayHandshake>;
     /** One immediate connection attempt from `offline`, resetting the backoff
