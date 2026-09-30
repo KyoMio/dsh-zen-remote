@@ -1300,7 +1300,7 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   let merger: WorkspaceMerger | ControlMerger =
     endpoint === 'session/control'
       ? createControlMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
-      : createWorkspaceMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
+      : createWorkspaceMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic, now: clock.now })
 
   /**
    * The status annotation (T34) the CURRENT relay state maps onto, applied
@@ -1488,9 +1488,11 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   // T63: forwarded workspace frames carry the group membership the sidebar
   // renders; their virtual session ids go to the sync so rows the UI lacks
   // summaries for get announced. Reading the FORWARDED output keeps the T56
-  // (empty groups) and T58 (hidden closed sessions) filters authoritative —
-  // a hidden id never reaches the hub, so it is never announced and never
-  // resurfaces as a row.
+  // (empty groups) filter authoritative. Hidden closed sessions (T58) RIDE
+  // these frames since T65 — they stay in their group's sessionIds — but a
+  // hidden id nudges exactly once: the sync marks asked ids on completion
+  // (T65), so the never-returned tombstone cannot re-pull the list on every
+  // frame.
   const noteForwardedSessions = (frames: readonly unknown[]): void => {
     if (endpoint !== 'workspace/follow') return
     const ids = virtualSessionIdsInWorkspaceFrames(frames)
@@ -1662,53 +1664,45 @@ async function* localOnly(local: AsyncIterable<unknown>): AsyncGenerator<unknown
  * `api-session/added` emit per row); the workspace route produces the
  * mid-page nudges (a forwarded frame carrying a session id no sync has
  * announced yet).
+ *
+ * T65: the hub is pure broadcast. The announced/asked bookkeeping lives in
+ * EACH merged `$events` stream (a new page's stream starts with empty sets,
+ * so its first online sync is never skipped by the previous page's
+ * knowledge), and a forwarded batch reaches EVERY live stream — a page
+ * refresh's old and new generations each judge for themselves.
  */
 export interface SessionSummarySync {
   /** The workspace route reports the virtual session ids one forwarded frame
-   * batch carried. Ids already announced by a successful sync are ignored; a
-   * batch with any unannounced id requests one sync. */
+   * batch carried. Broadcast to every live $events stream; each judges its
+   * own announced/asked sets (T65). */
   noteForwardedSessionIds(ids: readonly string[]): void
-  /** A successful sync marks every served row announced, so a static remote
-   * stops nudging. */
-  noteAnnouncedSessionIds(ids: readonly string[]): void
-  /** Subscribe the "a sync is requested" callback; the latest subscriber
-   * wins (an older $events generation's disposer must not detach the newer
-   * one). Returns the disposer. */
-  onSyncRequested(fn: () => void): () => void
-  /** Whether a sync was requested while no listener was subscribed (a nudge
-   * before the $events stream opened) — consumed on read. */
-  consumePendingRequest(): boolean
+  /** Subscribe to every forwarded batch. All live subscribers get the
+   * broadcast (T65 — the old latest-subscriber-wins shape starved the older
+   * stream of mid-page nudges); a disposer removes only its own listener. */
+  onForwardedSessionIds(fn: (ids: readonly string[]) => void): () => void
+  /** The most recent forwarded batch's ids, when one arrived since the last
+   * consume — the catch-up for a nudge that landed before the $events
+   * stream opened. Consumed on read. */
+  consumePendingRequest(): readonly string[]
 }
 
 function createSessionSummarySync(): SessionSummarySync {
-  const announced = new Set<string>()
-  let listener: (() => void) | undefined
-  let pending = false
+  const listeners = new Set<(ids: readonly string[]) => void>()
+  let pending: readonly string[] = []
   return {
     noteForwardedSessionIds(ids: readonly string[]): void {
-      let unknown = false
-      for (const id of ids) {
-        if (!announced.has(id)) {
-          unknown = true
-          break
-        }
-      }
-      if (!unknown) return
-      pending = true
-      listener?.()
+      pending = ids
+      for (const listener of [...listeners]) listener(ids)
     },
-    noteAnnouncedSessionIds(ids: readonly string[]): void {
-      for (const id of ids) announced.add(id)
-    },
-    onSyncRequested(fn: () => void): () => void {
-      listener = fn
+    onForwardedSessionIds(fn: (ids: readonly string[]) => void): () => void {
+      listeners.add(fn)
       return () => {
-        if (listener === fn) listener = undefined
+        listeners.delete(fn)
       }
     },
-    consumePendingRequest(): boolean {
+    consumePendingRequest(): readonly string[] {
       const was = pending
-      pending = false
+      pending = []
       return was
     },
   }
@@ -1821,21 +1815,41 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
    * relay was offline. Deferred past the local `ready` like the catalog
    * frame, single-flight (a nudge burst collapses into the running fetch),
    * and a failure is diagnostics only — the next nudge or serving period
-   * retries. Rows land unconditionally (idempotent upserts client-side);
-   * their ids are marked announced so the workspace nudges quiet down.
+   * retries.
+   *
+   * T65: only ids NOT announced yet are pushed (a re-pushed row races the
+   * host's own applyMutation — a late snapshot can flip a just-idle session
+   * back to running), and the ids this round ASKED ABOUT — the triggering
+   * batches, tombstones the server list will never return among them — are
+   * marked on success, so a kept tombstone nudges exactly once instead of
+   * re-pulling the whole list on every workspace frame.
    */
+  // Per-stream bookkeeping (T65): `announced` = the rows this stream has
+  // pushed; `asked` = the ids a completed sync of THIS stream covered. Both
+  // start empty — a new page's stream never inherits the previous page's
+  // knowledge.
   let deferredSummarySync = false
   let summarySyncInFlight = false
-  const runSummarySync = (): void => {
+  const announced = new Set<string>()
+  const asked = new Set<string>()
+  /** The ids the in-flight sync will mark asked on success — the triggering
+   * batches; a nudge landing mid-flight joins the same round. */
+  let askingNow: string[] = []
+  const runSummarySync = (triggerIds: readonly string[] = []): void => {
     if (!alive) return
     if (!localOpened) {
       deferredSummarySync = true
       return
     }
-    if (summarySyncInFlight) return
+    if (summarySyncInFlight) {
+      // Same round: the in-flight success marks these asked too.
+      askingNow.push(...triggerIds)
+      return
+    }
     const identity = relayIdentityOf(relay)
     if (identity === undefined || relay.state !== 'online') return
     summarySyncInFlight = true
+    askingNow = [...triggerIds]
     // The wire shape is the host descriptor's, not the method's semantics:
     // `session/list` carries ONE strict parameter named `_request` (RT
     // dsh-api-session-controller lib/typert.remote-client.js:993-1003,
@@ -1846,21 +1860,33 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
       (value) => {
         summarySyncInFlight = false
         if (!alive) return
+        // Mark the round's asked ids BEFORE the row work: a tombstone-only
+        // trigger has no rows to push but must still stop nudging.
+        for (const id of askingNow) asked.add(id)
+        askingNow = []
         const frames = sessionSummaryAddedFrames(value, identity.serverId)
-        if (frames.length === 0) return
-        const announced: string[] = []
         for (const frame of frames) {
-          channel.push(frame)
           const row = (frame as { args: unknown[] }).args[0]
-          if (isPlainObject(row) && typeof row.sessionId === 'string') announced.push(row.sessionId)
+          const rowId = isPlainObject(row) && typeof row.sessionId === 'string' ? row.sessionId : undefined
+          // Already announced: a second sync (a new nudge, a new serving
+          // period) must not re-push the row — see the T65 note above.
+          if (rowId === undefined || announced.has(rowId)) continue
+          announced.add(rowId)
+          channel.push(frame)
         }
-        deps.summarySync.noteAnnouncedSessionIds(announced)
       },
       (error: unknown) => {
         summarySyncInFlight = false
         recordFailure('session/list', error instanceof RelayError ? error.code : 'internal')
       },
     )
+  }
+  /** T65: one forwarded batch lands on THIS stream. A batch whose ids are
+   * all announced-or-asked requests nothing; otherwise one sync covers the
+   * whole batch. */
+  const handleForwardedBatch = (ids: readonly string[]): void => {
+    if (!ids.some((id) => !announced.has(id) && !asked.has(id))) return
+    runSummarySync(ids)
   }
   const noteOnlineIdentity = (identity: MergerIdentity, firstOnline: boolean): void => {
     const key = `${identity.serverId}\u0000${identity.serverName}`
@@ -1924,10 +1950,10 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
     channel.end()
   }
   if (signal !== undefined) signal.addEventListener('abort', onExternalAbort)
-  // T63: workspace-route nudges arrive while this leg is open; requests that
+  // T63: workspace-route nudges arrive while this leg is open; batches that
   // landed before the subscription (or before the local ready) ride the
-  // pending flag, consumed at the ready flip below.
-  const offSyncRequest = deps.summarySync.onSyncRequested(runSummarySync)
+  // pending slot, consumed at the ready flip below.
+  const offSyncRequest = deps.summarySync.onForwardedSessionIds(handleForwardedBatch)
 
   const waitOnline = async (): Promise<void> => {
     await new Promise<void>((resolve) => {
@@ -1951,11 +1977,13 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
             deferredRefresh = false
             channel.push(catalogRefreshFrame())
           }
-          // T63: same rule for the summary sync — a request that arrived
-          // before the ready (or before this stream opened at all) runs now.
-          if (deferredSummarySync || deps.summarySync.consumePendingRequest()) {
+          // T63: same rule for the summary sync — a batch that arrived
+          // before the ready (or before this stream opened at all) runs now,
+          // its ids marked asked with the round (T65).
+          const pendingBatch = deps.summarySync.consumePendingRequest()
+          if (deferredSummarySync || pendingBatch.length > 0) {
             deferredSummarySync = false
-            runSummarySync()
+            runSummarySync(pendingBatch)
           }
         }
       }
