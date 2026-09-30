@@ -64,6 +64,27 @@
  *   `sessionIds`) renders it live again and clears the tombstone; the
  *   tombstone dies with its workspace (a remove) and with the identity
  *   (onRemoteGone).
+ * - T58 reworks the tombstone's VISIBILITY: a closed-remote session is
+ *   HIDDEN — moved into the merged `archived` set (the host's
+ *   `sessionVisible` hides archived ids under the default filter) and
+ *   dropped from its group's forwarded copy — instead of parking in the
+ *   group forever. The one exception is the session the user currently has
+ *   OPEN: its tombstone stays (the page must keep its 「远程已关闭」 banner),
+ *   and once the caller reports a different current session
+ *   ({@link WorkspaceMerger.setCurrentSession}) it moves into `archived`
+ *   too. `archived` is exactly what the host's navigation guard
+ *   `clearArchivedCurrent` acts on, so the CURRENT session may never enter
+ *   it — and an unreadable current-session signal falls back to the
+ *   conservative tombstone behavior (nothing is hidden). Re-sharing the
+ *   session takes it back out of `archived` (live-carried ids never count
+ *   as hidden). Frame order follows the flash rule: an archived frame that
+ *   ADDS ids precedes the workspace frames (hide before the group drops the
+ *   row), one that REMOVES ids follows them (the group regains the row
+ *   while it is still archived-hidden — never a stray in 「未分组」, never a
+ *   current session inside `archived`). The hidden ids are sticky: they
+ *   survive even the death of their home workspace (a hidden session whose
+ *   group is deleted must not resurface as a stray) until a re-share or the
+ *   identity ends.
  * - a workspace with NOTHING to show is not shown at all (T56): the server
  *   keeps every workspace and only narrows `sessionIds` (relay-filter.ts),
  *   so a workspace where nothing is shared would arrive as an empty group
@@ -175,6 +196,19 @@ export interface WorkspaceMerger {
      * (offline, revoked, unpaired, version mismatch). [] while nothing is
      * shown (no local baseline yet, or no remote state). */
     onStatusChanged(): unknown[];
+    /** Record the session id the UI currently has OPEN (T58) — the raw id as
+     * the UI knows it (a virtual id for a remote session, a local id
+     * otherwise); `undefined` means a READABLE signal says no session is
+     * open. An UNREADABLE signal is expressed by not calling this at all —
+     * the merger then keeps every tombstone (the conservative fallback).
+     * Returns the frames that apply the resulting hide transitions ([] when
+     * nothing changed). */
+    setCurrentSession(sessionId: string | undefined): unknown[];
+    /** Whether some closed-remote session is being kept visible — it is the
+     * current session (waiting for the user to navigate away), or the current
+     * session was never readable (conservative fallback). While true the
+     * caller should keep polling {@link setCurrentSession} at ≥1s intervals. */
+    readonly hasPendingHide: boolean;
     /** Point the merger at a (possibly different) server. Local state survives;
      * for a serverId change the remote state must be gone first (onRemoteGone
      * first); for a rename it may stay. */
@@ -217,6 +251,10 @@ export interface ControlMerger {
     setStatus(annotation: MergerAnnotation): void;
     /** Always [] — nothing shown here could carry an annotation. */
     onStatusChanged(): unknown[];
+    /** Accepted and ignored; always answers []. */
+    setCurrentSession(sessionId: string | undefined): unknown[];
+    /** Always false — the control merger hides nothing. */
+    readonly hasPendingHide: boolean;
     retarget(identity: MergerIdentity): void;
 }
 /**
