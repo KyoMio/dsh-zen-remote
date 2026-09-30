@@ -375,11 +375,13 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 ## 安装
 
+桌面端 App 与 Web 端都可以在左侧「插件」页 →「添加插件」→ 输入 `dsh-zen-remote` → 点「立即启用」；无头机器上的 Web 服务也可以用命令行：
+
 ```sh
-dsh plugin add dsh-zen-remote
+dsh plugin --profile web add dsh-zen-remote
 ```
 
-装完重启 `dsh web`。手动写法与本地开发装法见[根 README](../README.zh-CN.md#安装)。
+装完重启桌面端 App 或 `dsh web`。命令行不接受 `--profile desktop`（桌面端 profile 由 App 独占管理）；手动写法与本地开发装法见[根 README](../README.zh-CN.md#安装)。
 
 ## 构建
 

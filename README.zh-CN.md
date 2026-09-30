@@ -73,11 +73,18 @@
 
 ## 安装
 
+**界面安装**（桌面端 App 与 Web 端都适用；桌面端是 2.0 主服务端的实际形态）：左侧「插件」页 →「添加插件」→ 输入 `dsh-zen-remote` → 装完点「立即启用」，然后重启桌面端 App（Web 端重启 `dsh web`）。
+
+**Web 服务命令行**（无头机器上跑 `dsh web` 的主服务端，手机访问也指向这里）：
+
 ```sh
-dsh plugin add dsh-zen-remote
+dsh plugin --profile web add dsh-zen-remote
+# 然后重启 dsh web
 ```
 
-**桌面端 profile**（2.0 主服务端的实际形态）：把依赖写进 `~/.dsh/profiles/desktop/package.json`，装完重启桌面端 App：
+`dsh plugin` 必须用 `--profile` 指明装进哪个 profile，不带会直接报错。桌面端的 `desktop` profile 由 App 独占管理，命令行会拒绝 `--profile desktop`，所以桌面端只能用上面的界面安装。
+
+**手工改 profile**（本地开发、`link:` 装法）：把依赖写进 profile 的 `package.json`（桌面端在 `~/.dsh/profiles/desktop`，Web 端在 `~/.dsh/profiles/web`），装完重启：
 
 ```jsonc
 // ~/.dsh/profiles/desktop/package.json
@@ -90,21 +97,21 @@ dsh plugin add dsh-zen-remote
 
 ```sh
 cd ~/.dsh/profiles/desktop && pnpm install
-# 然后重启 DSH 桌面端 App
+# 然后重启 DSH 桌面端 App（Web 端重启 dsh web）
 ```
 
-**Web profile**（无头机器上跑 `dsh web` 的主服务端，手机访问也指向这里）：同样两步，目录换成 `~/.dsh/profiles/web`，装完重启 `dsh web`。
+`pnpm install` 只装包、不启用。还要到「插件」页打开它的开关，或者自己把 `"dsh-zen-remote"` 追加到同一个文件 `dsh.profile.bundles` 数组的末尾（数组里原有的项别动）。界面安装和 `dsh plugin` 会自动写这一项，手工装法要自己补。
 
 无论哪种装法，组合层都只有**一行**。2.0.0 起挂载层只剩 `dsh-zen-remote` 一行，主入口按角色自己加载网关与推送子插件。不要再把旧的 `dsh-zen-remote-gateway` / `dsh-zen-remote-push` 两行加回来：loader 会警告后跳过；真挂两行网关就是两个网关进程抢 3088 端口。
 
 <details>
 <summary>静态挂载 / 本地开发</summary>
 
-把 [`cordis.patch.yml.example`](cordis.patch.yml.example) 抄进 profile 的 `cordis.patch.yml`、换成绝对路径即可——同样只有一行，附带的 `config:` 示例列了可写的行配置。走 `dsh plugin add` 的不需要它。
+把 [`cordis.patch.yml.example`](cordis.patch.yml.example) 抄进 profile 的 `cordis.patch.yml`、换成绝对路径即可——同样只有一行，附带的 `config:` 示例列了可写的行配置。用界面或 `dsh plugin` 正常安装的不需要它。
 
 </details>
 
-卸载：`dsh plugin remove dsh-zen-remote`（或从 profile 的 `dependencies` / `bundles` 里删掉那一行）后重启；要清掉配对与共享状态再删 `~/.dsh/lan-gate-state.json`、`~/.dsh/lan-gate.config.json`、`~/.dsh/zen-remote-shares.json` 与 `~/.dsh/zen-remote-server.json`（服务端 id；删了之后已配对的子客户端会把它当成一台新服务端）。
+卸载：在「插件」页打开 dsh-zen-remote，点「卸载」并确认；Web 服务也可以用命令行 `dsh plugin --profile web remove dsh-zen-remote`；手工装的从 profile 的 `dependencies` 和 `dsh.profile.bundles` 里删掉它。之后重启；要清掉配对与共享状态再删 `~/.dsh/lan-gate-state.json`、`~/.dsh/lan-gate.config.json`、`~/.dsh/zen-remote-shares.json` 与 `~/.dsh/zen-remote-server.json`（服务端 id；删了之后已配对的子客户端会把它当成一台新服务端）。
 
 ---
 
