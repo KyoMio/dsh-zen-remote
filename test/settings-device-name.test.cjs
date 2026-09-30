@@ -58,8 +58,9 @@ test('T57: the pairing area has no separate name box — the claim uses the shar
   assert.ok(!source.includes('zr-settings-client-name'), 'the client-name input id is gone')
   assert.ok(!source.includes('pairName'), 'the pairName state is gone')
   // The claim body names the device from the shared field, via the pure
-  // selector, falling back to the default copy.
-  const claimAt = source.indexOf('name: claimDeviceNameOf(')
+  // selector, falling back to the default copy (T60: computed once per
+  // attempt as `claimName`, sent and written).
+  const claimAt = source.indexOf('const claimName = claimDeviceNameOf(')
   assert.notEqual(claimAt, -1, 'runClaim reads the shared field through claimDeviceNameOf')
   const claimLine = source.slice(claimAt, source.indexOf(')', claimAt) + 1)
   assert.ok(claimLine.includes('form.serverName.text'), 'the claim name follows the displayed field value')
@@ -100,4 +101,38 @@ test('T59: the backend forwards a committed row name through the volatile-update
   const effectSource = index.slice(index.indexOf("ctx.on('loader/volatile-update'"), watcherAt)
   assert.ok(effectSource.includes('queueDeviceName'), 'the committed row name is queued for the gateway push')
   assert.ok(effectSource.includes('unwrapVolatile(row.serverName)'), 'the name is read LIVE off the volatile row')
+})
+
+// ---- T60: the pairing round-trip lands the name in the row --------------------
+
+test('T60: runClaim writes the registered name with the credentials and retires the draft', () => {
+  // The claim name is computed ONCE per attempt (sent AND written).
+  assert.ok(source.includes('const claimName = claimDeviceNameOf('), 'one claim name per attempt')
+  const claimAt = source.indexOf('const claimName = claimDeviceNameOf(')
+  const sendAt = source.indexOf('name: claimName,', claimAt)
+  assert.notEqual(sendAt, -1, 'the claim body sends exactly that name')
+  // The write: the server's echo wins, else the sent name; same mutate as
+  // the credentials.
+  const writeAt = source.indexOf('config.writeClientPairing(urlToWrite, body.token, echoed)')
+  assert.notEqual(writeAt, -1, 'the registered name rides the SAME direct write')
+  const echoBlock = source.slice(source.indexOf('const echoed =', claimAt), writeAt)
+  assert.ok(echoBlock.includes('body.deviceName'), 'the server-confirmed echo has priority')
+  assert.ok(echoBlock.includes(': claimName'), 'the sent name is the fallback')
+  // The draft did its job: retired after a LANDED write (not before).
+  const landedAt = source.indexOf('if (landed) {', claimAt)
+  const landedBlock = source.slice(landedAt, source.indexOf('}', landedAt))
+  assert.ok(landedBlock.includes("config.discardField('serverName')"), 'a landed write clears the stale draft')
+})
+
+test('T60: an invalid device-name draft disables pairing and says why', () => {
+  // The gate…
+  const allowedAt = source.indexOf('const claimAllowed =')
+  const allowedLine = source.slice(allowedAt, source.indexOf('\n', allowedAt))
+  assert.ok(allowedLine.includes('!form.serverName.invalid'), 'an invalid draft blocks the pairing button')
+  // …and the visible reason, in the pairing area (after the button row).
+  const buttonAt = source.indexOf("t('settings.client.pair')}")
+  const hintAt = source.indexOf("t('settings.client.fixDeviceName')")
+  for (const [label, at] of [['button', buttonAt], ['hint', hintAt]]) assert.notEqual(at, -1, `${label} present`)
+  assert.ok(hintAt > buttonAt, 'the fix-it hint renders in the pairing area')
+  assert.ok(source.includes("form.serverName.invalid && <span"), 'the hint is gated on the draft being invalid')
 })
