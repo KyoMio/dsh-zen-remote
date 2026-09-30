@@ -64,6 +64,20 @@
  *   `sessionIds`) renders it live again and clears the tombstone; the
  *   tombstone dies with its workspace (a remove) and with the identity
  *   (onRemoteGone).
+ * - a workspace with NOTHING to show is not shown at all (T56): the server
+ *   keeps every workspace and only narrows `sessionIds` (relay-filter.ts),
+ *   so a workspace where nothing is shared would arrive as an empty group
+ *   and render as a bare 「服务端名 · 工作区名」 heading. A workspace the UI
+ *   has never seen is therefore held back — no baseline item, no upsert, no
+ *   order entry — until its forwarded `sessionIds` (live sessions or
+ *   tombstones it must carry) first gains content. From that first forward
+ *   on it counts as SHOWN and stays shown even when the sessions leave
+ *   again: a `remove` would blacklist the id in the UI's ClientWorkspaceModel
+ *   and make the group un-revivable, so an emptied group keeps its (empty)
+ *   display until the page reload rebuilds the model and this rule hides it
+ *   again. Every removal path — the reconnecting baseline diff, an explicit
+ *   server remove, {@link WorkspaceMerger.onRemoteGone} — emits a `remove`
+ *   only for shown workspaces; never-shown ones leave the state silently.
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
@@ -241,10 +255,9 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   let localArchived: string[] = []
   let localPinned: string[] = []
 
-  // The remote truth in ORIGINAL ids; insertion order = remote order. Once
-  // the local baseline has passed this doubles as "what the UI has been
-  // shown" — the diff baseline for a reconnecting remote baseline, and the
-  // removal set for a permanent remote end.
+  // The remote truth in ORIGINAL ids; insertion order = remote order. A
+  // reconnecting baseline diffs its content against this; what the UI has
+  // ever been SHOWN is tracked beside it (the `shown` set, T56).
   let remote = new Map<string, Record<string, unknown>>()
   let remoteArchived: string[] = []
   let remotePinned: string[] = []
@@ -257,11 +270,23 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   // (re-shared, anywhere — the home moves with it), when its workspace is
   // removed, and with the identity (onRemoteGone).
   let sessionHome = new Map<string, string>()
+  // T56: the workspace ids (originals) the UI has EVER been shown. The UI's
+  // ClientWorkspaceModel blacklists removed ids for the page's whole life, so
+  // only a shown workspace may ever receive a `remove` — and a workspace the
+  // UI never saw stays invisible while its forwarded sessionIds (live
+  // sessions + tombstones) is empty, instead of rendering as an empty
+  // 「服务端名 · 工作区名」 group. Once shown, a workspace stays shown even
+  // when its last session leaves (no remove — the blacklist would make the
+  // id un-revivable); the page reload rebuilds the model and the emptied
+  // group then never comes back.
+  const shown = new Set<string>()
   // The status annotation every virtualized title currently carries (T34).
   let annotation: MergerAnnotation = 'none'
 
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
-  const remoteIds = (): string[] => [...remote.keys()].map(virtualize)
+  // Only SHOWN workspaces travel in order frames (T56): a hidden group has no
+  // position the UI knows about.
+  const remoteIds = (): string[] => [...remote.keys()].filter((id) => shown.has(id)).map(virtualize)
   const remoteArchivedVirtual = (): string[] => remoteArchived.map(virtualize)
   const remotePinnedVirtual = (): string[] => remotePinned.map(virtualize)
 
@@ -295,7 +320,29 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
     }
     return out
   }
-  const virtualWorkspaces = (): Record<string, unknown>[] => [...remote.values()].map(forwardWorkspace)
+  /** T56: the forwarded record when the UI may see this workspace, else
+   * undefined — a never-shown workspace is forwarded only once its forwarded
+   * sessionIds (live + tombstones) first carries content, and forwarding it
+   * marks it shown for good. Only call on paths that actually emit (after
+   * the local baseline has passed): a mark here is a claim that the UI now
+   * holds the group. */
+  function forwardVisible(record: Record<string, unknown>): Record<string, unknown> | undefined {
+    const id = typeof record.workspaceId === 'string' ? record.workspaceId : undefined
+    if (id !== undefined && shown.has(id)) return forwardWorkspace(record)
+    const out = forwardWorkspace(record)
+    const ids = Array.isArray(out.sessionIds) ? out.sessionIds : []
+    if (ids.length === 0) return undefined
+    if (id !== undefined) shown.add(id)
+    return out
+  }
+  const virtualWorkspaces = (): Record<string, unknown>[] => {
+    const out: Record<string, unknown>[] = []
+    for (const record of remote.values()) {
+      const forwarded = forwardVisible(record)
+      if (forwarded !== undefined) out.push(forwarded)
+    }
+    return out
+  }
   const upsertFrames = (): unknown[] => virtualWorkspaces().map((workspace) => ({ type: 'upsert', workspace }))
   const mergedOrderFrame = (): unknown => ({ type: 'order', workspaceIds: [...localOrder, ...remoteIds()] })
   /** The merged archived set: local, then remote-archived, deduplicated in
@@ -367,7 +414,10 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       // The local order carries the remote groups at its tail ONLY once
       // remote state exists — before that every local frame is verbatim.
       if (frame.type === 'baseline') {
-        if (remote.size === 0 && remoteArchived.length === 0 && remotePinned.length === 0 && sessionHome.size === 0) {
+        const shownWorkspaces = virtualWorkspaces()
+        // Nothing VISIBLE (T56 — a remote full of hidden empty groups counts
+        // as nothing) and no lists to merge: the frame passes verbatim.
+        if (shownWorkspaces.length === 0 && remoteArchived.length === 0 && remotePinned.length === 0 && sessionHome.size === 0) {
           return [frame]
         }
         const value = isPlainObject(frame.value) ? frame.value : {}
@@ -380,7 +430,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
             ...frame,
             value: {
               ...value,
-              items: [...items, ...virtualWorkspaces()],
+              items: [...items, ...shownWorkspaces],
               archivedSessionIds: mergedArchivedIds(),
               pinnedSessionIds: [...localPinned, ...remotePinnedVirtual()],
             },
@@ -436,12 +486,17 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
             return []
           }
           const out: unknown[] = []
-          for (const [id, record] of next) out.push({ type: 'upsert', workspace: forwardWorkspace(record) })
+          for (const [, record] of next) {
+            const forwarded = forwardVisible(record)
+            if (forwarded !== undefined) out.push({ type: 'upsert', workspace: forwarded })
+          }
           for (const id of remote.keys()) {
-            if (!next.has(id)) {
-              forgetWorkspace(id)
-              out.push({ type: 'remove', workspaceId: virtualize(id) })
-            }
+            if (next.has(id)) continue
+            forgetWorkspace(id)
+            // Only a workspace the UI was SHOWN may receive a remove (T56) —
+            // the model blacklists the id forever; a never-shown one is
+            // unknown to the UI and leaves silently.
+            if (shown.has(id)) out.push({ type: 'remove', workspaceId: virtualize(id) })
           }
           remote = next
           remoteArchived = nextArchived
@@ -456,14 +511,17 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           }
           const workspace: Record<string, unknown> = frame.workspace
           const id = workspace.workspaceId as string
-          const isNew = !remote.has(id)
           remote.set(id, { ...workspace })
           learnSessions(workspace, id)
           if (!localSeen) return []
           // The tombstone-padded upsert is the whole update; a workspace the
-          // UI has not seen additionally needs a position.
-          const out: unknown[] = [{ type: 'upsert', workspace: forwardWorkspace(workspace) }]
-          if (isNew) out.push(mergedOrderFrame())
+          // UI has not seen (new, or hidden until now — T56) additionally
+          // needs a position.
+          const wasShown = shown.has(id)
+          const forwarded = forwardVisible(workspace)
+          if (forwarded === undefined) return []
+          const out: unknown[] = [{ type: 'upsert', workspace: forwarded }]
+          if (!wasShown) out.push(mergedOrderFrame())
           return out
         }
         case 'remove': {
@@ -480,6 +538,10 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           // The group's tombstones die with it (CP4-client-fix2).
           forgetWorkspace(id)
           if (!localSeen) return []
+          // T56: a workspace the UI was never shown must not receive a
+          // remove — the model would blacklist the id against any future
+          // re-share of the same workspace id.
+          if (!shown.has(id)) return []
           return [{ type: 'remove', workspaceId: virtualize(id) }, mergedOrderFrame()]
         }
         case 'order': {
@@ -543,12 +605,16 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
     },
 
     onRemoteGone(): unknown[] {
-      const hadAny = remote.size > 0 || sessionHome.size > 0 || remoteArchived.length > 0 || remotePinned.length > 0
       const out: unknown[] = []
       // The UI only ever SAW remote data when the local baseline had passed —
-      // cached pre-baseline state is discarded silently instead.
-      if (localSeen && hadAny) {
-        for (const id of remote.keys()) out.push({ type: 'remove', workspaceId: virtualize(id) })
+      // cached pre-baseline state is discarded silently instead. And only
+      // SHOWN workspaces may leave via a remove (T56): a never-shown one is
+      // unknown to the UI and just leaves the state. The archived/pinned
+      // restore still rides along whenever remote sessions reached those
+      // lists (session lists merge independently of workspace visibility).
+      const removedIds = [...remote.keys()].filter((id) => shown.has(id))
+      if (localSeen && (removedIds.length > 0 || remoteArchived.length > 0 || remotePinned.length > 0)) {
+        for (const id of removedIds) out.push({ type: 'remove', workspaceId: virtualize(id) })
         out.push({ type: 'order', workspaceIds: [...localOrder] })
         out.push({ type: 'archived', archivedSessionIds: [...localArchived] })
         out.push({ type: 'pinned', pinnedSessionIds: [...localPinned] })
@@ -559,6 +625,9 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       // The tombstone registry dies with the identity (a new server mints new
       // ids); the archived frame above already restored the local-only set.
       sessionHome = new Map()
+      // So does the shown set: a NEW server may reuse original workspace ids,
+      // and a stale entry would forward the new server's empty groups.
+      shown.clear()
       return out
     },
   }
