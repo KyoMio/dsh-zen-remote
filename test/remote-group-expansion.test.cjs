@@ -244,3 +244,79 @@ test('T64 keeper: a non-client role never clicks and never writes', async () => 
     env.stop()
   }
 })
+
+test('T66 keeper: a throwing localStorage neither rejects the tick nor clicks — and recovery works', async () => {
+  // The storage wrapper (a private-mode quota, a poisoned extension) throws
+  // on BOTH methods; the tick must swallow it and keep the loop alive.
+  let broken = true
+  const backing = new Map()
+  const clicked = []
+  const mod = await loadKeeper()
+  const stop = mod.startRemoteGroupExpansionKeeper({
+    storage: {
+      getItem: (key) => {
+        if (broken) throw new Error('quota exceeded')
+        return backing.has(key) ? backing.get(key) : null
+      },
+      setItem: (key, value) => {
+        if (broken) throw new Error('quota exceeded')
+        backing.set(key, value)
+      },
+    },
+    probeRole: async () => 'client',
+    queryRows: () => [{
+      key: 'zr~sid~w1',
+      expanded: false,
+      // A real click makes the HOST record the state in its own storage —
+      // mirrored here so the sync half has something to read once healed.
+      click: () => {
+        clicked.push('zr~sid~w1')
+        backing.set('dsh.workspace.view.v5', JSON.stringify({ groupExpansion: { 'zr~sid~w1': true } }))
+      },
+    }],
+    intervalMs: 5,
+  })
+  try {
+    // Many ticks against the throwing storage: no rejection escapes (an
+    // escaping one would fail this run as an unhandled rejection), and the
+    // loop stays alive. The clicks keep following the plan computed from
+    // the degraded (empty) record — the failure is swallowed, not the tick.
+    await wait(40)
+    // The storage heals: the next tick works — reads land, and the record
+    // write survives too.
+    broken = false
+    await wait(40)
+    assert.deepEqual(clicked, ['zr~sid~w1'], 'recovery needs no reload')
+    assert.deepEqual(JSON.parse(backing.get('zr.remoteGroupExpansion.v1')), { 'zr~sid~w1': true },
+      'the host-recorded value (written by the landing click) synced into the memory')
+  } finally {
+    stop()
+  }
+})
+
+test('T66 keeper: a group whose row DISAPPEARS may be restored once more when it comes back', async () => {
+  const env = makeEnv({ rows: [{ key: 'zr~sid~w1', expanded: false }], roleAnswer: 'client' })
+  await env.load()
+  try {
+    await wait(40)
+    assert.deepEqual(env.clicked, ['zr~sid~w1'], 'restored once on first sight')
+
+    // The row leaves the DOM (a server switch, a workspace refresh): the
+    // once-per-load marker drops with it.
+    env.setRowStates([])
+    await wait(40)
+
+    // The row comes BACK (still collapsed — a fresh host record again): the
+    // group is restorable once more, like on a fresh load.
+    env.setRowStates([{ key: 'zr~sid~w1', expanded: false }])
+    await wait(40)
+    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w1'], 'the returned group was restored a second time')
+
+    // And the once-per-load rule still holds while the row STAYS: no third
+    // click for an unchanged DOM.
+    await wait(40)
+    assert.equal(env.clicked.length, 2)
+  } finally {
+    env.stop()
+  }
+})
