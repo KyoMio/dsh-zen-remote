@@ -348,6 +348,35 @@ export declare function rewriteResult(endpoint: string, value: unknown, serverId
  */
 export declare function rewriteRemoteEventFrame(frame: unknown, serverId: string): unknown | null;
 /**
+ * T63: the shared summary-sync hub between the merged streams. The sidebar
+ * renders a session row only when the UI's `sessions.list` snapshot holds a
+ * summary for it (RT dsh-client-ui-workspace orderByRecency drops a member
+ * with `summaries[id] === void 0`, groupByWorkspace skips
+ * `list.byId[id] === undefined`), and that snapshot is written only by the
+ * `session/list` pull — which runs once per page load, when the relay may
+ * still be offline — and by the `api-session/added` event. The events leg
+ * consumes the sync (fetches the server list and synthesizes one
+ * `api-session/added` emit per row); the workspace route produces the
+ * mid-page nudges (a forwarded frame carrying a session id no sync has
+ * announced yet).
+ */
+export interface SessionSummarySync {
+    /** The workspace route reports the virtual session ids one forwarded frame
+     * batch carried. Ids already announced by a successful sync are ignored; a
+     * batch with any unannounced id requests one sync. */
+    noteForwardedSessionIds(ids: readonly string[]): void;
+    /** A successful sync marks every served row announced, so a static remote
+     * stops nudging. */
+    noteAnnouncedSessionIds(ids: readonly string[]): void;
+    /** Subscribe the "a sync is requested" callback; the latest subscriber
+     * wins (an older $events generation's disposer must not detach the newer
+     * one). Returns the disposer. */
+    onSyncRequested(fn: () => void): () => void;
+    /** Whether a sync was requested while no listener was subscribed (a nudge
+     * before the $events stream opened) — consumed on read. */
+    consumePendingRequest(): boolean;
+}
+/**
  * Install the two own-property wrappers on the raw gateway. Assumes
  * {@link checkGatewayShape} passed (the wiring gates on it) — this function
  * records the verdict but does not re-gate, so it stays usable in tests
