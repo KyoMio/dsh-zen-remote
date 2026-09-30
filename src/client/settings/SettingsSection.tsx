@@ -53,6 +53,7 @@ import {
   deriveSettingsView,
   localOpsAllowed,
   normalizePairingCode,
+  shouldFollowServerDeviceName,
 } from '../../client-data/settings-form.ts'
 import type {
   AdminStatusBody,
@@ -359,6 +360,30 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     if (statusPoll === 'client') loadClientStatus()
     else if (statusPoll === 'admin') loadStatus()
   }, [statusPoll, loadClientStatus, loadStatus])
+
+  // T59: while CONNECTED the status refreshes on a steady 15s cadence (the
+  // heartbeat pace) — that is the channel a server-side rename of this
+  // device arrives through; offline the retry-follow effect above owns the
+  // timing, and unpaired pages simply never arm this.
+  const clientConnected = clientView?.state === 'connected'
+  useEffect(() => {
+    if (!clientConnected) return
+    const timer = window.setInterval(() => { loadClientStatus() }, 15_000)
+    return () => { window.clearInterval(timer) }
+  }, [clientConnected, loadClientStatus])
+
+  // T59: the SERVER's record of this device's name wins over the row —
+  // unless the user is mid-edit (a staged draft in the field). One direct
+  // write lands it in the row's serverName; that write's own volatile
+  // update reaches the backend with both sides now EQUAL, so the push path
+  // stays silent and the two ends cannot bounce the name back and forth.
+  const rowDeviceName = typeof config.rowValue('serverName') === 'string' ? config.rowValue('serverName') as string : ''
+  useEffect(() => {
+    if (!clientRole || !clientConnected) return
+    const deviceName = clientView?.deviceName ?? ''
+    if (!shouldFollowServerDeviceName(deviceName, rowDeviceName, config.hasDraft('serverName'))) return
+    void config.writeDeviceName(deviceName)
+  }, [clientRole, clientConnected, clientView, rowDeviceName, config])
 
   // T17: when the row document cannot answer the saved role (the value lives
   // only in lan-gate.config.json), probe the client-config route — registered

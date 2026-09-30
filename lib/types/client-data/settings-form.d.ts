@@ -124,6 +124,12 @@ export interface ClientStatusBody {
     nextRetryAt?: unknown;
     /** The error code of the last failure — a code, never a message or URL. */
     lastError?: unknown;
+    /**
+     * The SERVER's record of THIS device's name (T59, presence-gated like the
+     * diagnostics fields — older servers answer without it). The settings page
+     * follows it into the row while the user is not editing the field.
+     */
+    deviceName?: unknown;
     /** T23b request-interceptor diagnostics (provisional shape; presence-gated). */
     intercept?: unknown;
     /** T42 relay compat diagnostics: `{ identical: string[], different:
@@ -168,6 +174,9 @@ export interface ClientConnectionView {
     nextRetryAt: number | undefined;
     /** The last failure's code, '' when none is reported. */
     lastError: string;
+    /** The SERVER's record of this device's name (T59): '' when the body did
+     * not carry one — empty means "nothing to follow". */
+    deviceName: string;
     intercept: ClientInterceptView | undefined;
     compat: ClientCompatView | undefined;
 }
@@ -229,6 +238,15 @@ export interface ClaimRouteBody {
 /** What the pairing-code box keeps as its draft: uppercase, no spaces or
  * hyphens (the gateway strips every other character at claim time anyway). */
 export declare function normalizePairingCode(input: string): string;
+/**
+ * Whether the settings page may follow the SERVER's record of this device's
+ * name into the row (T59): the body carried a name, it differs from the row
+ * (nothing to do otherwise — and this equality is the anti-bounce half: the
+ * page's own write echoes back through client/status with both sides equal),
+ * and the user has no staged draft in the field (their edit wins until they
+ * save — a follow mid-typing would clobber it).
+ */
+export declare function shouldFollowServerDeviceName(deviceName: string, rowName: string, hasDraft: boolean): boolean;
 /**
  * Latest-wins sequencing for the status loads: every request takes a ticket,
  * and only the newest ticket may still apply its result. An earlier request
@@ -647,6 +665,22 @@ export declare class ZenRemoteSettingsForm {
      * the next pairing only needs a fresh code.
      */
     clearDeviceToken(): Promise<boolean>;
+    /**
+     * Whether one field currently has a STAGED edit (a typed draft or a staged
+     * clear) — the "the user is mid-edit" fact the T59 server-name follow
+     * reads before it may write. Reads the live draft map, so it answers per
+     * call; the page re-runs its effect on every republished snapshot.
+     */
+    hasDraft(field: string): boolean;
+    /**
+     * One direct write for the T59 name follow: the SERVER's record of this
+     * device's name landing in the row's `serverName` (the role card's 设备
+     * 名称 field). The page only calls it when the user is not mid-edit —
+     * see {@link shouldFollowServerDeviceName} — and the write's own volatile
+     * update echoes back to the backend with both sides now equal, so the
+     * push path stays silent (no overwrite loop).
+     */
+    writeDeviceName(name: string): Promise<boolean>;
     /**
      * The shared write path of the two pairing flows. Deliberately does NOT
      * touch the frame's `failed` flag — a refused pairing write surfaces in

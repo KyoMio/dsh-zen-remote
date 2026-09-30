@@ -162,22 +162,29 @@ function makeFakeGateway(overrides = {}) {
   return { gateway, invokeCalls, streams, wireOpens, eventResults, eventsGate: () => eventsGate, eventsGates }
 }
 
-function makeParts(name, { shared = [], overrides = {}, heartbeatMs, endDrainTimeoutMs, parentOf } = {}) {
+function makeParts(name, { shared = [], overrides = {}, heartbeatMs, endDrainTimeoutMs, parentOf, serverName } = {}) {
   const home = path.join(ROOT, name)
   fs.mkdirSync(home, { recursive: true })
   const fake = makeFakeGateway(overrides)
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
   for (const id of shared) store.share(id)
+  // T59: the name is read LIVE per handshake and per heartbeat ping, so a
+  // test can flip it mid-stream (setServerName) and watch the next ping.
+  let currentServerName = typeof serverName === 'string' ? serverName : 'stream-test'
   const handler = createRelayHandler({
     secret: SECRET,
     store,
     gateway: fake.gateway,
-    serverInfo: { serverId: loadServerId(home), serverName: () => 'stream-test', dshVersion: '0.0.0-test' },
+    serverInfo: {
+      serverId: loadServerId(home),
+      serverName: () => currentServerName,
+      dshVersion: '0.0.0-test',
+    },
     ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
     ...(endDrainTimeoutMs !== undefined ? { endDrainTimeoutMs } : {}),
     ...(parentOf !== undefined ? { parentOf } : {}),
   })
-  return { handler, store, ...fake }
+  return { handler, store, setServerName: (next) => { currentServerName = next }, ...fake }
 }
 
 async function startServer(handler) {
@@ -1503,4 +1510,59 @@ test('T32-fix: a composition without the event surfaces degrades honestly', asyn
     parts2.eventsGate().finish()
     await open.done
   } finally { await server2.stop() }
+})
+
+// ---- 8. T59: the heartbeat carries the two names -------------------------------------
+
+test('T59 stream: pings carry the server name and the device name, both as of NOW', async () => {
+  const parts = makeParts('t59-ping-names', { shared: ['session-a'], heartbeatMs: 25 })
+  const server = await startServer(parts.handler)
+  try {
+    // The gateway stamps the CURRENT table name on every forward; here the
+    // header stands in for it.
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } }, { ...AUTH, 'x-zen-remote-device-name': encodeURIComponent('书房的台式机') })
+    assert.equal(open.status, 200)
+    await waitFor(() => open.lines.some((line) => line.type === 'ping'))
+    let ping = open.lines.find((line) => line.type === 'ping')
+    assert.equal(ping.serverName, 'stream-test')
+    assert.equal(ping.deviceName, '书房的台式机', 'the decoded header name rides the heartbeat')
+
+    // A later request from the SAME device with a NEW name (the gateway
+    // stamps the fresh table name per forward) teaches the cache; the next
+    // ping of the STILL-OPEN stream carries it — no reconnect involved.
+    const renamed = await server.fetch('/_dsh/zen-remote/relay/v1/handshake', {
+      method: 'POST',
+      headers: { ...AUTH, 'x-zen-remote-device-name': encodeURIComponent('改名后的台式机'), 'content-type': 'application/json' },
+      body: '{}',
+    })
+    assert.equal(renamed.status, 200)
+    assert.equal(JSON.parse(await renamed.text()).deviceName, '改名后的台式机', 'the handshake answers the caller\'s device name too')
+    await waitFor(() => {
+      const latest = open.lines.filter((line) => line.type === 'ping').at(-1)
+      return latest !== undefined && latest.deviceName === '改名后的台式机'
+    })
+
+    // And a server-side rename of the SERVER itself rides the very next tick.
+    parts.setServerName('新服务端名')
+    await waitFor(() => {
+      const latest = open.lines.filter((line) => line.type === 'ping').at(-1)
+      return latest !== undefined && latest.serverName === '新服务端名'
+    })
+    open.req.destroy()
+    await open.done
+  } finally { await server.stop() }
+})
+
+test('T59 stream: a device with no name header keeps pinging without a deviceName field', async () => {
+  const parts = makeParts('t59-ping-noname', { shared: ['session-a'], heartbeatMs: 25 })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+    await waitFor(() => open.lines.some((line) => line.type === 'ping'))
+    const ping = open.lines.find((line) => line.type === 'ping')
+    assert.equal(ping.serverName, 'stream-test')
+    assert.equal('deviceName' in ping, false, 'an unknown device omits the field entirely')
+    open.req.destroy()
+    await open.done
+  } finally { await server.stop() }
 })

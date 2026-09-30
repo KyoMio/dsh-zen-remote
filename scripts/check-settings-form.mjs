@@ -19,6 +19,7 @@ import assert from 'node:assert/strict'
 import {
   CLIENT_RECONNECT_ROUTE,
   claimDeviceNameOf,
+  shouldFollowServerDeviceName,
   createLatestGate,
   clientStatusLineOf,
   deriveClientStatusView,
@@ -454,7 +455,8 @@ test('the latest-wins gate drops tickets that are no longer newest (T15-fix 4)',
 // ---- T16: the client group ----------------------------------------------------
 
 test('deriveClientStatusView maps every probe state and tolerates garbage', () => {
-  const bare = { state: 'unpaired', serverUrl: '', serverName: '', nextRetryAt: undefined, lastError: '', intercept: undefined, compat: undefined }
+  // T59: the view carries the device's own name ('' when the body had none).
+  const bare = { state: 'unpaired', serverUrl: '', serverName: '', deviceName: '', nextRetryAt: undefined, lastError: '', intercept: undefined, compat: undefined }
   assert.deepEqual(deriveClientStatusView({ state: 'unpaired' }), bare)
   assert.deepEqual(deriveClientStatusView({ state: 'connected', serverUrl: 'http://192.168.1.10:3088' }), {
     ...bare,
@@ -857,4 +859,42 @@ test('T57: the pairing claim name follows the displayed value, else the default 
   assert.equal(claimDeviceNameOf('   ', '桌面应用端'), '桌面应用端')
   assert.equal(claimDeviceNameOf('x'.repeat(41), '桌面应用端'), '桌面应用端')
   assert.equal(claimDeviceNameOf('x'.repeat(40), '桌面应用端'), 'x'.repeat(40), 'the cap itself is legal')
+})
+
+// ---- T59: the device-name two-way sync ----------------------------------------
+
+test('T59: the client/status deviceName parses; absent stays empty', () => {
+  const view = deriveClientStatusView({ state: 'online', serverName: '书房', serverUrl: 'http://x.local', deviceName: '书房的台式机' })
+  assert.equal(view.state, 'connected')
+  assert.equal(view.deviceName, '书房的台式机')
+  // An older server answers without the field: nothing to follow.
+  assert.equal(deriveClientStatusView({ state: 'online', serverUrl: 'http://x.local' }).deviceName, '')
+  // A non-string degrades to empty like every other wire field.
+  assert.equal(deriveClientStatusView({ state: 'online', deviceName: 42 }).deviceName, '')
+})
+
+test('T59: the follow decision — server name wins only when carried, differing, and unedited', () => {
+  assert.equal(shouldFollowServerDeviceName('服务端名', '本地旧名', false), true, 'differing and unedited: follow')
+  assert.equal(shouldFollowServerDeviceName('', '本地旧名', false), false, 'an absent record is nothing to follow')
+  assert.equal(shouldFollowServerDeviceName('服务端名', '服务端名', false), false, 'equal is the echo of our own write — the anti-bounce half')
+  assert.equal(shouldFollowServerDeviceName('服务端名', '本地旧名', true), false, 'a staged draft means the user is mid-edit; their text wins')
+})
+
+test('T59: hasDraft tracks the staged map; writeDeviceName lands one serverName set', async () => {
+  const { scope, state } = fakeScope({ value: { role: 'client' } })
+  const form = new ZenRemoteSettingsForm(scope)
+  assert.equal(form.hasDraft('serverName'), false, 'nothing staged yet')
+
+  form.stage('serverName', '用户正在打字')
+  assert.equal(form.hasDraft('serverName'), true, 'a draft blocks the follow')
+  assert.equal(await form.writeDeviceName('服务端名'), true, 'the write itself is still possible — the page just must not call it now')
+
+  form.discard()
+  assert.equal(form.hasDraft('serverName'), false)
+
+  // The follow write: ONE direct mutate, the row's serverName field, no
+  // token or address touched.
+  assert.equal(await form.writeDeviceName('服务端的名'), true)
+  assert.deepEqual(state.mutateCalls.at(-1).ops, [{ op: 'set', path: ['serverName'], value: '服务端的名' }])
+  assert.equal(state.mutateCalls.at(-1).expectedRevision, 8, 'fenced like every direct write')
 })
