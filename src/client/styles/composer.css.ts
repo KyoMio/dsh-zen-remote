@@ -279,6 +279,13 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      the items, the two-level model panes and every selection handler stay
      official. */
   ${PERM} [role="menu"],
+  /* T70: the SAME permission menu, portaled to body on DSH 0.2.0 — the
+     descendant selector above cannot reach it there. The marker is written
+     by effects/permission-sheet.ts (the trigger's click arms a window; the
+     first body-level menu inside it is the permission menu — the host's
+     only other portal Menu, the copy button's confirm, opens through a
+     different button and is never marked). */
+  body > div[role="menu"][data-zen-sheet="perm"],
   ${MODEL_MENU} {
     position: fixed !important;
     left: 0 !important;
@@ -304,6 +311,7 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   /* 44pt+ rows in both sheets (Menu items, model options, and the model
      sheet's two root cells that drill into the model / effort panes). */
   ${PERM} [role="menu"] [role="menuitem"],
+  body > div[role="menu"][data-zen-sheet="perm"] [role="menuitem"],
   ${MODEL_MENU} [class$="_option"],
   ${MODEL_MENU} [class$="_cell"] {
     min-height: 48px !important;
@@ -440,7 +448,9 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      slot), so the adjacent-sibling combinator pins it precisely. */
   body:has(${PERM} [role="menu"]) [data-chat-flow] + div,
   body:has(${MODEL} > [class$="_menu"]) [data-chat-flow] + div,
-  body:has(> [id$="-menu"][role="menu"]) [data-chat-flow] + div {
+  body:has(> [id$="-menu"][role="menu"]) [data-chat-flow] + div,
+  /* T70: the portaled permission menu (marked by effects/permission-sheet.ts). */
+  body:has(> div[role="menu"][data-zen-sheet="perm"]) [data-chat-flow] + div {
     display: none !important;
   }
   /* --- 5. input box: two lines minimum, five lines maximum ---
