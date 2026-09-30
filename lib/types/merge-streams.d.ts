@@ -64,32 +64,30 @@
  *   `sessionIds`) renders it live again and clears the tombstone; the
  *   tombstone dies with its workspace (a remove) and with the identity
  *   (onRemoteGone).
- * - T58 reworks the tombstone's VISIBILITY: a closed-remote session is
- *   HIDDEN — moved into the merged `archived` set (the host's
- *   `sessionVisible` hides archived ids under the default filter) and
- *   dropped from its group's forwarded copy — instead of parking in the
- *   group forever. The one exception is the session the user currently has
- *   OPEN: its tombstone stays (the page must keep its 「远程已关闭」 banner),
- *   and once the caller reports a different current session
+ * - T58 reworks the tombstone's VISIBILITY, reshaped by T65: a closed-remote
+ *   session is HIDDEN — moved into the merged `archived` set (the host's
+ *   `sessionVisible` hides archived ids under the default filter) — while
+ *   STAYING in its group's forwarded `sessionIds`: under「显示已归档」it
+ *   renders in place, and it can never resurface as a 「未分组」 stray. The
+ *   one exception is the session the user currently has OPEN: it is not
+ *   hidden at all (the page must keep its 「远程已关闭」 banner), and once
+ *   the caller reports a different current session
  *   ({@link WorkspaceMerger.setCurrentSession}) it moves into `archived`
  *   too. `archived` is exactly what the host's navigation guard
  *   `clearArchivedCurrent` acts on, so the CURRENT session may never enter
  *   it — and an unreadable current-session signal falls back to the
- *   conservative tombstone behavior (nothing is hidden). Re-sharing the
- *   session takes it back out of `archived` (live-carried ids never count
- *   as hidden). Frame order follows the flash rule: an archived frame that
- *   ADDS ids precedes the workspace frames (hide before the group drops the
- *   row), one that REMOVES ids follows them (the group regains the row
- *   while it is still archived-hidden). Single-direction changes therefore
- *   never flash a stray; when ONE update both hides and reveals, the
- *   leading archived frame already excludes the revealed ids, so a revealed
- *   id can flash in 「未分组」 for the one frame before its group's upsert
- *   lands — an accepted, vanishingly small window. A revealed id that is
- *   CURRENT at that moment is an exception in the other direction: it must
- *   leave `archived` at once, or the navigation guard kicks its page. The
- *   hidden ids are sticky: they survive even the death of their home
- *   workspace (a hidden session whose group is deleted must not resurface
- *   as a stray) until a re-share or the identity ends.
+ *   conservative tombstone behavior (nothing is hidden). Because the
+ *   browser's report can lag the user's switch by up to a poll interval, a
+ *   JUST-created tombstone is not hidden for a short grace (T65, injectable
+ *   clock): the 1s poll re-judges with the fresh report afterwards — the
+ *   session the user really switched to keeps its tombstone, anything else
+ *   hides. Re-sharing the session takes it back out of `archived`
+ *   (live-carried ids never count as hidden). Since hiding moves only the
+ *   archived set, hide/reveal updates are exactly one merged archived frame
+ *   — no group content changes, no ordering dance; the current session
+ *   never enters the set by construction. The hidden ids are sticky: they
+ *   survive even the death of their home workspace until a re-share or the
+ *   identity ends.
  * - a workspace with NOTHING to show is not shown at all (T56): the server
  *   keeps every workspace and only narrows `sessionIds` (relay-filter.ts),
  *   so a workspace where nothing is shared would arrive as an empty group
@@ -164,6 +162,9 @@ export interface WorkspaceMergerOptions extends MergerIdentity {
     /** Diagnostics for frames this merger dropped (unknown type or malformed).
      * Optional: without it the drop is silent. */
     onDiagnostic?: (message: string) => void;
+    /** T65: the clock the tombstone hide-grace runs on. Default Date.now;
+     * tests advance an injectable fake to cross the grace. */
+    now?: () => number;
 }
 export interface WorkspaceMerger {
     readonly serverId: string;
