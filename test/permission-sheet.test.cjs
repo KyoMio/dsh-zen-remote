@@ -241,3 +241,16 @@ test('T70-fix behavior: after uninstall nothing is marked', async () => {
     assert.equal(menu.getAttribute('data-zen-sheet'), null, 'an uninstalled effect never marks')
   } finally { sim.cleanup() }
 })
+
+// -- model sheet rows (DSH 0.2.0) -----------------------------------------------
+
+test('model sheet rows: options and root cells are matched by role, so the SELECTED option gets the row treatment', () => {
+  // On 0.2.0 the checked option's class list ends in `_selected`
+  // (`…_option …_selected`), which a `[class$="_option"]` selector misses —
+  // the checked row fell back to the host's 34px pill beside 48px siblings.
+  // The role selectors cover it; the class forms stay for older hosts.
+  const rowRule = sheet.slice(sheet.indexOf('/* 44pt+ rows in both sheets'), sheet.indexOf('min-height: 48px !important;'))
+  assert.ok(rowRule.includes('${MODEL_MENU} [role="menuitemradio"],'), 'model/effort options are matched by role')
+  assert.ok(rowRule.includes('${MODEL_MENU} [role="menuitem"],'), 'the two root cells are matched by role')
+  assert.ok(rowRule.includes('${MODEL_MENU} [class$="_option"],'), 'the class form survives for older hosts')
+})
