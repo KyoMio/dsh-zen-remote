@@ -78,13 +78,14 @@ export type RemoteShareMenuComponent = (props: RemoteShareMenuProps) => ReactNod
  * probes again, and until one answers the role reads unknown — never a
  * guessed host (T33b-fix2). `refetch` bypasses the cache and replaces it
  * with a fresh answer; the wiring uses it when the form scope's status
- * changed (the settings page re-probes on the same signal).
+ * changed (the settings page re-probes on the same signal). Exported since
+ * T62: the current-session reporter reuses the same cached probe (one
+ * route read per page, whatever part asks first).
  */
 let probeAnswer: 'host' | 'client' | undefined
 let probeInFlight: Promise<'host' | 'client' | undefined> | undefined
-function probeClientConfigRole(refetch = false): Promise<'host' | 'client' | undefined> {
-  if (!refetch) {
-    if (probeAnswer !== undefined) return Promise.resolve(probeAnswer)
+export function probeClientConfigRole(refetch = false): Promise<'host' | 'client' | undefined> {
+  if (!refetch) {    if (probeAnswer !== undefined) return Promise.resolve(probeAnswer)
     if (probeInFlight !== undefined) return probeInFlight
   }
   // Always tracked so a settled probe — failed ones especially — never

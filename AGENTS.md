@@ -35,6 +35,7 @@
 | `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
 | `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
 | `src/client/**` → `lib/client.js` | 浏览器半边（同一插件行，经 `dsh.client` 发现）：app 外壳、slot、样式、设置区块（`settings/`）、共享与远程部件（`remote-*` / `Remote*`） |
+| `src/client-data/current-session.ts` + `src/client/current-session-report.ts` | 当前会话信号的浏览器上报（T62）：拦截层在后台进程读不到浏览器 localStorage，由浏览器端解析宿主选择存储、值变化时 POST 到 `client/current-session` 路由；纯函数（解析 + 变化判定）与上报循环分居两文件 |
 | `lan-gate.mjs` | 网关子插件入口，由主入口按 host 角色加载（不再自己占插件行）：spawn 子进程，共享密钥只经它进子进程 |
 | `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，Node stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀 |
 | `dsh-push.mjs` | 推送子插件（与网关一起由主入口加载）：回合结束推送 + `push_notify` 工具 |

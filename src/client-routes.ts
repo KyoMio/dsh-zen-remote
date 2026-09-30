@@ -30,7 +30,7 @@ import { classifyClaimResponse, classifyProbe, CLAIM_PATH, normalizeServerUrl, R
 import type { ClaimOutcome, ProbeState } from './client-pairing.js'
 import { unwrapVolatile } from './config.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
-import type { InterceptDiagnostics } from './intercept.js'
+import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import { responseJson, sameOriginPost } from './http.js'
 import { RELAY_HTTP_ROUTES } from './relay-access.js'
 import { relayCredentialsDigest, RelayError } from './relay-client.js'
@@ -62,6 +62,18 @@ export const CLIENT_REMOTE_STATUS_ROUTE = `${CLIENT_ROUTE_PREFIX}/remote-status`
  * (T34) — the backend forwards the ORIGINAL id through the relay's
  * `POST relay/v1/unshare`, so the server closes it with reason `'client'`. */
 export const CLIENT_UNSHARE_ROUTE = `${CLIENT_ROUTE_PREFIX}/unshare`
+
+/** POST `{sessionId: string | null}`: the browser's report of which session
+ * the host UI currently has open (T62) — the intercept layer runs in this
+ * backend process and cannot read the browser's localStorage itself. `null`
+ * means a readable signal says nothing is open; the sink stores the value
+ * and re-judges the mergers immediately. */
+export const CLIENT_CURRENT_SESSION_ROUTE = `${CLIENT_ROUTE_PREFIX}/current-session`
+
+/** Longest `sessionId` the current-session route accepts (T62): real ids —
+ * a local `session-<uuid>` or a `zr~<serverId>~<id>` virtual id — are far
+ * shorter; the cap bounds garbage, not reality. */
+const MAX_CURRENT_SESSION_ID = 512
 
 /** Prefix of the plain-HTTP relay routes (T41b):
  * `GET ${CLIENT_HTTP_ROUTE_PREFIX}<route>?<query>` relays one intercepted
@@ -114,6 +126,13 @@ export interface ClientHandlerOptions {
    * a user. The remote-status route stays: the T34 client parts poll it on
    * whatever role this process runs. */
   remoteStatusOnly?: boolean
+  /** T62: the sink for the browser's current-session reports — stores the
+   * latest value (memory, last write wins across windows) and makes the
+   * intercept re-judge at once. Wired only on the CLIENT mount; the HOST
+   * mount's remoteStatusOnly wall 404s the route before this matters, and
+   * a client handler WITHOUT the sink answers the same 404 (no sink, no
+   * route). */
+  onCurrentSession?: (read: CurrentSessionRead) => void
 }
 
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -560,6 +579,41 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           serverName: relay?.handshakeInfo?.serverName ?? '',
           closed: Object.fromEntries((intercept?.closedSessions ?? []).map((record) => [record.sessionId, record.reason])),
         })
+        return
+      }
+      if (route === CLIENT_CURRENT_SESSION_ROUTE) {
+        // No sink wired: a client mount without the intercept half — same
+        // answer an unknown path gets (the host mount never reaches here,
+        // its remoteStatusOnly wall 404s first).
+        const sink = options.onCurrentSession
+        if (sink === undefined) {
+          responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown client route' } })
+          return
+        }
+        if (method !== 'POST') {
+          res.setHeader('Allow', 'POST')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use POST' } })
+          return
+        }
+        if (!sameOriginPost(req)) {
+          responseJson(res, 403, {
+            ok: false,
+            error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+          })
+          return
+        }
+        const body = await readJsonBody(req)
+        // Exactly `sessionId`: a non-empty string (length-capped) or null —
+        // null is a REAL "nothing is open" answer; anything else (absent,
+        // wrong type, blank, over-long) is a malformed report, refused.
+        const raw = body.sessionId
+        if (raw !== null && (typeof raw !== 'string' || raw === '' || raw.length > MAX_CURRENT_SESSION_ID)) {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'sessionId must be a non-empty string of at most 512 characters, or null' } })
+          return
+        }
+        const read: CurrentSessionRead = raw === null ? { kind: 'none' } : { kind: 'open', sessionId: raw }
+        sink(read)
+        responseJson(res, 200, { ok: true })
         return
       }
       if (route === CLIENT_UNSHARE_ROUTE) {
