@@ -584,6 +584,21 @@ export function nameField(field: string, max: number): SettingsFieldSpec {
   }
 }
 
+/**
+ * The name one pairing claim registers under (T57): the shared 设备名称
+ * field's CURRENT displayed value — a staged draft when one exists — used
+ * only when it is a value a save would WRITE ({@link nameField} rules: an
+ * empty draft means nothing stored, a blank or over-cap draft is invalid),
+ * otherwise the default device-name copy. The fallback is load-bearing since
+ * T55: a client page reads no admin baseline, so an unstored name displays
+ * EMPTY and the claim must still carry a usable name.
+ */
+export function claimDeviceNameOf(displayText: string, fallback: string): string {
+  return nameField('serverName', SERVER_NAME_MAX).parse(displayText)?.kind === 'set'
+    ? displayText
+    : fallback
+}
+
 /** One-of field over a fixed vocabulary (rendered as a select). */
 export function oneOfField(field: string, options: readonly string[]): SettingsFieldSpec {
   return {

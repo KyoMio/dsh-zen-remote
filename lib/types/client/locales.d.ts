@@ -163,8 +163,9 @@ export declare const zh: {
     readonly 'settings.shareCloseAll': "全部关闭";
     readonly 'settings.shareCloseAllConfirm': "将关闭全部已开启远程的会话，确定继续？";
     readonly 'settings.shareActionFail': "操作失败";
-    readonly 'settings.fieldServerName': "服务端名称";
-    readonly 'settings.fieldServerNameHint': "远程界面上显示的服务端名称，1–40 个字符。留空恢复默认。";
+    readonly 'settings.fieldServerName': "设备名称";
+    readonly 'settings.fieldServerNameHint': "其他设备远程访问时显示的名称，1–40 个字符，留空恢复默认。";
+    readonly 'settings.fieldServerNameHintClient': "配对时注册到服务端的名称，1–40 个字符。";
     readonly 'settings.fieldIdleHours': "闲置休眠（小时）";
     readonly 'settings.fieldIdleHoursHint': "超过该时长无新活动时，自动关闭远程连接。运行中或等待中的会话不计时。默认 48，取值大于 0 且不超过 8760。";
     readonly 'settings.fieldAutoShare': "自动共享新会话";
@@ -185,7 +186,6 @@ export declare const zh: {
     readonly 'settings.client.connectTitle': "连接服务端";
     readonly 'settings.client.serverUrl': "服务端地址";
     readonly 'settings.client.serverUrlHint': "服务端网关地址，例如 http://192.168.1.10:3088 或 https://dsh.example.com。";
-    readonly 'settings.client.deviceName': "设备名称";
     readonly 'settings.client.deviceNameDefault': "桌面应用端";
     readonly 'settings.client.pairingCode': "配对码";
     readonly 'settings.client.pairingCodeHint': "在服务端设置页生成「桌面应用端」配对码后填入（8 位，自动转大写）。";

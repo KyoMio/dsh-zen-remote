@@ -18,6 +18,7 @@
 import assert from 'node:assert/strict'
 import {
   CLIENT_RECONNECT_ROUTE,
+  claimDeviceNameOf,
   createLatestGate,
   clientStatusLineOf,
   deriveClientStatusView,
@@ -825,4 +826,35 @@ test('restartPending only promises a reload when a save would actually write a c
   // A real value change still promises the reload.
   clearForm.stage('port', '4001')
   assert.equal(clearForm.getSnapshot().restartPending, true, 'a real change keeps the note')
+})
+
+// ---- T57: the device name on the role card, both roles -----------------------
+
+test('T57: serverName stages and saves on a CLIENT page — the role card is its only home', async () => {
+  // The device name (the row's serverName field) renders in the ROLE card on
+  // both roles now; on a client page (no admin/status, no baseline since T55)
+  // an unstored name displays EMPTY and staging still plans the write.
+  const { scope, state } = fakeScope({ value: { role: 'client' } })
+  const form = new ZenRemoteSettingsForm(scope)
+  assert.equal(form.statusPoll(), 'client')
+  assert.equal(form.getSnapshot().serverName.text, '', 'an unstored name displays empty on a client page')
+
+  form.stage('serverName', '书房的台式机')
+  const staged = form.getSnapshot()
+  assert.equal(staged.serverName.overridden, true)
+  assert.equal(staged.serverName.invalid, false)
+  assert.equal(form.canSave(), true)
+  assert.equal(await form.save(), true)
+  assert.deepEqual(state.mutateCalls[0].ops, [{ op: 'set', path: ['serverName'], value: '书房的台式机' }])
+})
+
+test('T57: the pairing claim name follows the displayed value, else the default copy', () => {
+  // A legal displayed value — staged draft or stored value — IS the name.
+  assert.equal(claimDeviceNameOf('书房的台式机', '桌面应用端'), '书房的台式机')
+  // An EMPTY field (the client page's unstored display) falls back.
+  assert.equal(claimDeviceNameOf('', '桌面应用端'), '桌面应用端')
+  // nameField's other non-values are not names either: blank-only, over cap.
+  assert.equal(claimDeviceNameOf('   ', '桌面应用端'), '桌面应用端')
+  assert.equal(claimDeviceNameOf('x'.repeat(41), '桌面应用端'), '桌面应用端')
+  assert.equal(claimDeviceNameOf('x'.repeat(40), '桌面应用端'), 'x'.repeat(40), 'the cap itself is legal')
 })
