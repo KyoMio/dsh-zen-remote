@@ -8,8 +8,10 @@
  * definitions, the server puts its map into the handshake, the client
  * compares group by group, and the settings page lists the differing groups.
  * Identical maps mean fully compatible — the DSH version numbers themselves
- * are deliberately NOT compared (docs/spike-relay.md §2.3: 0.1.7 and 0.2.0
- * share byte-identical remote interfaces, so a version gate would misreject).
+ * are deliberately NOT compared (docs/spike-relay.md §2.3: 0.1.7-rc.2 and
+ * 0.2.0-rc.1 share byte-identical remote interfaces, so a version gate would
+ * misreject; 0.2.0-rc.2 then changed the session group within one minor —
+ * an additive optional field — which a version gate would have missed).
  *
  * What is hashed, per group, in priority order:
  *

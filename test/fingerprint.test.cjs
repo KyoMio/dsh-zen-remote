@@ -285,12 +285,23 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
   // under its key-sorting-only normalization, byte-identical across
   // App/npm/0.1.7/0.2.0. This canonicalization is strictly stronger
   // (recursive schema-key sorting), so the pin here is ITS value over the
-  // same 0.1.7-rc.2 dev closure — a drift means the interface definitions
-  // or the projection changed, which is exactly what this pin must catch.
+  // same dev closure — a drift means the interface definitions or the
+  // projection changed, which is exactly what this pin must catch. Keyed by
+  // the installed version so a dev-closure bump fails loudly instead of
+  // silently comparing against another version's value. 0.2.0-rc.2 added the
+  // optional `userQuestions` snapshot field (still 21 endpoints), so its hash
+  // differs; 0.2.0-rc.1 is byte-identical to 0.1.7-rc.2.
+  const PINS = {
+    '0.1.7-rc.2': 'r:211083a84f52',
+    '0.2.0-rc.1': 'r:211083a84f52',
+    '0.2.0-rc.2': 'r:60f0fceb0e36',
+  }
+  const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
+  assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
   const remote = await import('../node_modules/@deepseek-ai/dsh-api-session-controller/lib/typert.remote-client.js')
   assert.equal(remote.default.descriptors.length, 21)
   const fingerprints = await computeFingerprints(fakeCtx({ local: { list: () => remote.default.descriptors } }), { anchors: [] })
-  assert.equal(fingerprints.session, 'r:211083a84f52')
+  assert.equal(fingerprints.session, PINS[version])
 })
 
 // -- the comparison -------------------------------------------------------------
