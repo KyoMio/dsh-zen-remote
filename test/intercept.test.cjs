@@ -2273,7 +2273,7 @@ test('an unregistered agentId-located method with a virtual agentId is still ref
 
 const EVT = (id) => `evt-${id}`
 
-test('rewriteRemoteEventFrame: waterfall ids go virtual in place, cancel matches, ready and emit drop', () => {
+test('rewriteRemoteEventFrame: waterfall ids go virtual in place, status goes virtual, ready and other emits drop', () => {
   const waterfall = {
     type: 'waterfall',
     event: 'approval/request',
@@ -2298,7 +2298,21 @@ test('rewriteRemoteEventFrame: waterfall ids go virtual in place, cancel matches
   // ready, and a second one fails the client face's frame parser (plus it
   // carries the server's clientId/host, which the UI must never need).
   assert.equal(rewriteRemoteEventFrame({ type: 'ready', clientId: 'srv', host: { home: '/srv' } }, SERVER_ID), null)
-  // Emit frames are dropped outright (T32-fix): server-wide state the UI
+  // T75: the ONE emit that crosses — a session's running flip. The id goes
+  // virtual, the boolean passes through; a NEW frame leaves, never the
+  // host's object.
+  const status = { type: 'emit', event: 'api-session/status', args: [LOCAL_ID, true] }
+  assert.deepEqual(rewriteRemoteEventFrame(status, SERVER_ID), {
+    type: 'emit',
+    event: 'api-session/status',
+    args: [VIRTUAL_ID, true],
+  })
+  assert.deepEqual(rewriteRemoteEventFrame({ ...status, args: [LOCAL_ID, false] }, SERVER_ID), {
+    type: 'emit',
+    event: 'api-session/status',
+    args: [VIRTUAL_ID, false],
+  })
+  // Every other emit is dropped outright (T32-fix): server-wide state the UI
   // must never mistake for local sessions.
   const emit = { type: 'emit', event: 'api-session/added', args: [{ sessionId: 's', title: '服务端会话' }] }
   assert.equal(rewriteRemoteEventFrame(emit, SERVER_ID), null)
@@ -2312,6 +2326,15 @@ test('rewriteRemoteEventFrame: waterfall ids go virtual in place, cancel matches
   assert.equal(rewriteRemoteEventFrame({ ...waterfall, request: { toolName: 'a', agent: 'x' } }, SERVER_ID), null, 'request carrying agent')
   assert.equal(rewriteRemoteEventFrame({ type: 'nonsense', eventId: 'e1' }, SERVER_ID), null, 'unknown type')
   assert.equal(rewriteRemoteEventFrame('junk', SERVER_ID), null, 'not even an object')
+  // The status emit obeys the same exact-keys discipline (T75).
+  assert.equal(rewriteRemoteEventFrame({ ...status, extra: 1 }, SERVER_ID), null, 'status: an extra field breaks exact keys')
+  assert.equal(rewriteRemoteEventFrame({ ...status, args: [LOCAL_ID, 'yes'] }, SERVER_ID), null, 'status: args[1] not boolean')
+  assert.equal(rewriteRemoteEventFrame({ ...status, args: [LOCAL_ID, 1] }, SERVER_ID), null, 'status: args[1] a number')
+  assert.equal(rewriteRemoteEventFrame({ ...status, args: [LOCAL_ID, true, 'x'] }, SERVER_ID), null, 'status: args length 3')
+  assert.equal(rewriteRemoteEventFrame({ ...status, args: ['', true] }, SERVER_ID), null, 'status: empty session id')
+  assert.equal(rewriteRemoteEventFrame({ ...status, args: [LOCAL_ID] }, SERVER_ID), null, 'status: args length 1')
+  assert.equal(rewriteRemoteEventFrame({ ...status, args: LOCAL_ID }, SERVER_ID), null, 'status: args not an array')
+  assert.equal(rewriteRemoteEventFrame({ type: 'emit', event: 'api-session/status', args: [LOCAL_ID, true], clientId: 'c' }, SERVER_ID), null, 'status: four keys')
 })
 
 // -- T32: the merged $events stream ---------------------------------------------------
@@ -2381,6 +2404,11 @@ test('merged $events: the local ready opens, local frames pass untouched, remote
   gate.push({ type: 'cancel', eventId: 'evt-remote-1' })
   const [fourth] = await readSome(iterator, 1)
   assert.deepEqual(fourth, { type: 'cancel', eventId: toVirtual(SERVER_ID, 'evt-remote-1') })
+
+  // T75: the forwarded status emit crosses with its session id virtualized.
+  gate.push({ type: 'emit', event: 'api-session/status', args: [LOCAL_ID, true] })
+  const [fifth] = await readSome(iterator, 1)
+  assert.deepEqual(fifth, { type: 'emit', event: 'api-session/status', args: [VIRTUAL_ID, true] })
 
   // Tearing the UI's stream down ends the merged stream and both legs.
   controller.abort()
@@ -2581,19 +2609,28 @@ test('T63-fix: session/list answered offline at page load, then the relay serves
 
   // The relay comes up: the serving period opens, the sync fetches the list
   // and announces the row the UI is missing (after the catalog refresh the
-  // same transition emits).
+  // same transition emits). T75: the serving period runs a SECOND list pull
+  // — the status re-sync — ahead of the announce, so one status frame per
+  // row precedes the added frames (the row carries no `running`, so the
+  // snapshot reads false).
   relay.transition('online')
   await waitForStream(relay, 1)
-  const [refresh, added] = await readSome(iterator, 2)
+  const [refresh, status, added] = await readSome(iterator, 3)
   assert.deepEqual(refresh, { type: 'emit', event: 'llm/adapters-updated', args: [] })
+  assert.deepEqual(status, {
+    type: 'emit',
+    event: 'api-session/status',
+    args: [toVirtual(SERVER_ID, 'session-shared'), false],
+  })
   assert.deepEqual(added, {
     type: 'emit',
     event: 'api-session/added',
     args: [{ sessionId: toVirtual(SERVER_ID, 'session-shared'), updatedAt: 5 }],
   })
   const listInvokes = relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list')
-  assert.equal(listInvokes.length, 1)
+  assert.equal(listInvokes.length, 2, 'one pull for the announce, one for the T75 status re-sync')
   assert.deepEqual(listInvokes[0].args, { _request: {} })
+  assert.deepEqual(listInvokes[1].args, { _request: {} })
 
   // The pull the announce stands in for: with the relay serving, the merged
   // list route folds the remote session in.
@@ -3114,20 +3151,148 @@ test('T65-fix sync: a fresh serving period clears the ask bookkeeping — an exh
   assert.equal(listCount(), 3)
 
   // The relay re-establishes its serving period: the bookkeeping clears and
-  // the fresh-serving announce runs.
+  // the fresh-serving announce runs (plus, since T75, the status re-sync's
+  // own pull — 4 pulls total).
   relay.transition('offline')
   await new Promise((resolve) => setTimeout(resolve, 30))
   relay.transition('online')
   await new Promise((resolve) => setTimeout(resolve, 30))
-  assert.equal(listCount(), 4, 'the fresh serving period announces again')
+  assert.equal(listCount(), 5, 'the fresh serving period announces again — announce + status re-sync')
   // and the exhausted id has its chances back: one frame with it nudges a
   // fresh round (which still cannot return it — it re-enters the schedule).
   relay.streams[1].gate.push({ type: 'upsert', workspace: { ...T63_WORKSPACE, sessionIds: ['session-shared', 'session-tomb'] } })
   await readSome(workspacesIterator, 1)
   await new Promise((resolve) => setTimeout(resolve, 30))
-  assert.equal(listCount(), 5, 'the cleared bookkeeping lets the id be asked again')
+  assert.equal(listCount(), 6, 'the cleared bookkeeping lets the id be asked again')
   await eventsIterator.return?.(undefined)
   await workspacesIterator.return?.(undefined)
+})
+
+// -- T75: the serving-period status sync --------------------------------------
+
+const T75_ROWS = [
+  { sessionId: 'session-shared', updatedAt: 5, running: true },
+  { sessionId: 'session-idle', updatedAt: 4, running: false },
+]
+const T75_STATUS_FRAMES = [
+  { type: 'emit', event: 'api-session/status', args: [toVirtual(SERVER_ID, 'session-shared'), true] },
+  { type: 'emit', event: 'api-session/status', args: [toVirtual(SERVER_ID, 'session-idle'), false] },
+]
+
+function offlineRelayWithRows() {
+  const relay = createControllableRelay()
+  // The page-load state: the UI's one list pull runs while the relay cannot
+  // serve (the T63 hole — and the status flips inside the offline window are
+  // equally lost, which the serving-period re-sync repairs).
+  relay.state = 'offline'
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: T75_ROWS },
+  }
+  enforceSessionListWireShape(relay)
+  return relay
+}
+
+test('T75: a new serving period pushes one status frame per row, and every new period pushes again', async () => {
+  const relay = offlineRelayWithRows()
+  const { iterator, localGate } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+
+  // The relay starts serving: the T52 catalog refresh leads, then the two
+  // syncs' synthesized emits — one status frame per row, value from the
+  // snapshot.
+  relay.transition('online')
+  await waitForStream(relay, 1)
+  const frames = await readSome(iterator, 5)
+  assert.deepEqual(frames[0], { type: 'emit', event: 'llm/adapters-updated', args: [] })
+  assert.deepEqual(
+    frames.filter((frame) => frame.event === 'api-session/status'),
+    T75_STATUS_FRAMES,
+  )
+  assert.equal(frames.filter((frame) => frame.event === 'api-session/added').length, 2, 'the T63 announce still runs beside the status sync')
+
+  // A SECOND serving period: the status frames are pushed again — the
+  // `announced` dedup gates only the row announcements, never the running
+  // flags — while the announced rows stay quiet.
+  relay.transition('offline')
+  relay.transition('online')
+  const frames2 = await readSome(iterator, 3)
+  assert.deepEqual(frames2[0], { type: 'emit', event: 'llm/adapters-updated', args: [] })
+  assert.deepEqual(
+    frames2.filter((frame) => frame.event === 'api-session/status'),
+    T75_STATUS_FRAMES,
+  )
+  assert.equal(frames2.some((frame) => frame.event === 'api-session/added'), false, 'announced rows are not re-announced')
+  await iterator.return?.(undefined)
+})
+
+test('T75: a real-time status frame that lands mid-fetch outranks the list snapshot', async () => {
+  const relay = offlineRelayWithRows()
+  // The status sync's session/list fetch hangs until released — the window
+  // a real server's slow answer would open. The WIRE shape stays policed.
+  let releaseList = () => {}
+  const listGate = new Promise((resolve) => { releaseList = resolve })
+  const baseInvoke = relay.invoke
+  relay.invoke = function (namespace, method, args, signal) {
+    if (namespace === 'session' && method === 'list') {
+      const keys = args !== null && typeof args === 'object' && !Array.isArray(args) ? Object.keys(args) : []
+      if (!(keys.length === 1 && keys[0] === '_request')) {
+        return Promise.reject(new RelayError('gateway/arguments-invalid', 'session/list expects { _request: {...} }'))
+      }
+      return listGate.then(() => relay.invokeValues['session/list'])
+    }
+    return baseInvoke(namespace, method, args, signal)
+  }
+  const { iterator, localGate } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  relay.transition('online')
+  await waitForStream(relay, 1)
+  const [refresh] = await readSome(iterator, 1)
+  assert.deepEqual(refresh, { type: 'emit', event: 'llm/adapters-updated', args: [] })
+
+  // While the fetch hangs, the shared session flips to idle ON THE LEG — a
+  // real-time fact fresher than the snapshot (whose row still says running).
+  relay.streams[0].gate.push({ type: 'emit', event: 'api-session/status', args: ['session-shared', false] })
+  const [live] = await readSome(iterator, 1)
+  assert.deepEqual(live, { type: 'emit', event: 'api-session/status', args: [toVirtual(SERVER_ID, 'session-shared'), false] })
+
+  releaseList()
+  // The snapshot lands: the live frame's session is NOT overwritten (no
+  // second status frame for it); the untouched row passes. The summary
+  // sync's announce rode the same gate and follows.
+  const rest = await readSome(iterator, 1)
+  assert.deepEqual(rest, [{ type: 'emit', event: 'api-session/status', args: [toVirtual(SERVER_ID, 'session-idle'), false] }])
+  const added = await readSome(iterator, 2)
+  assert.deepEqual(added.map((frame) => frame.event), ['api-session/added', 'api-session/added'])
+  await iterator.return?.(undefined)
+})
+
+test('T75: the status sync obeys the local-ready gate — it defers until the UI stream has spoken', async () => {
+  const relay = offlineRelayWithRows()
+  const { iterator, localGate } = await openMergedEvents(relay)
+  // Start the pumps (async generators run on the first pull) while the
+  // relay is still offline, THEN open the serving period — the order a real
+  // page loaded during an outage lives through.
+  const firstPull = iterator.next()
+  relay.transition('online')
+  await waitForStream(relay, 1)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  // Both syncs deferred: nothing fetched, so nothing synthesized — a frame
+  // here would precede the ready and fail the client face's parser.
+  assert.equal(relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length, 0, 'the syncs deferred past the ready')
+
+  localGate.push(READY)
+  const ready = (await firstPull).value
+  assert.deepEqual(ready, READY)
+  const frames = await readSome(iterator, 5)
+  assert.deepEqual(frames[0], { type: 'emit', event: 'llm/adapters-updated', args: [] })
+  assert.deepEqual(
+    frames.filter((frame) => frame.event === 'api-session/status'),
+    T75_STATUS_FRAMES,
+  )
+  await iterator.return?.(undefined)
 })
 
 // -- T32: the $events/result answer split ---------------------------------------------

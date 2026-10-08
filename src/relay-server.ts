@@ -399,6 +399,21 @@ interface ForwardableCancelFrame extends Record<string, unknown> {
   eventId: string
 }
 
+/**
+ * T75: the ONE emit shape the relay forwards — a single session's
+ * running-state flip (`api-session/status`), exactly what the host emits on
+ * `agent/status` (RT dsh-api-session-controller lib/index.js:2884-2886:
+ * `ctx.emit("api-session/status", agent.id, status === "running")`), carried
+ * on the wire as the client face's exact-keys emit with a JSON-array `args`
+ * (RT dsh-api-gateway lib/index.js:846-853 builds `{type, event, args}`;
+ * lib/client.js `parseRemoteEventFrame` demands that shape back).
+ */
+interface ForwardableStatusEmitFrame extends Record<string, unknown> {
+  type: 'emit'
+  event: 'api-session/status'
+  args: [string, boolean]
+}
+
 function isForwardableWaterfall(frame: Record<string, unknown>): frame is ForwardableWaterfallFrame {
   return (
     Reflect.ownKeys(frame).length === 5 &&
@@ -418,6 +433,18 @@ function isForwardableCancel(frame: Record<string, unknown>): frame is Forwardab
     Object.hasOwn(frame, 'type') &&
     Object.hasOwn(frame, 'eventId') &&
     isEventId(frame.eventId)
+  )
+}
+
+function isForwardableStatusEmit(frame: Record<string, unknown>): frame is ForwardableStatusEmitFrame {
+  return (
+    Reflect.ownKeys(frame).length === 3 &&
+    ['type', 'event', 'args'].every((key) => Object.hasOwn(frame, key)) &&
+    frame.event === 'api-session/status' &&
+    Array.isArray(frame.args) &&
+    frame.args.length === 2 &&
+    isEventId(frame.args[0]) &&
+    typeof frame.args[1] === 'boolean'
   )
 }
 
@@ -867,17 +894,22 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
    * - CANCEL frames are forwarded only for events this subscription
    *   forwarded (an unshared session's activity timeline must not leak
    *   through cancels), and the entry goes with the forward.
-   * - EMIT frames are dropped entirely (T32-fix): they carry server-wide
-   *   state (`api-session/added` summaries and titles, account expirations,
-   *   cordis chatter) that is not share-scoped — forwarding them would leak
-   *   unshared sessions and feed the sub-client ids it would treat as
-   *   local. Everything a sub-client needs about a session's state travels
-   *   the workspace/control streams, which ARE share-filtered.
-   * - Anything not shaped exactly like a forwardable waterfall or cancel
-   *   (T32-fix2, mirroring the client face's `parseRemoteEventFrame`
-   *   exact-keys validation) is dropped too: a frame that slipped through
-   *   would fail the sub-client's whole `$events` generation and leave it
-   *   failing and reconnecting in a loop.
+   * - EMIT frames are dropped, with ONE exception (T75): a
+   *   `api-session/status` emit whose `args[0]` names an accessible session
+   *   crosses as a fresh `{type, event, args:[id, running]}` — it is the
+   *   only share-SCOPED emit the host produces (one session's running flip,
+   *   judged per frame by `isAccessible` like a waterfall's `agentId`).
+   *   Every other emit is server-wide state (`api-session/added` summaries
+   *   and titles, account expirations, cordis chatter) that is not
+   *   share-scoped: forwarding it would leak unshared sessions and feed the
+   *   sub-client ids it would treat as local. Everything else a sub-client
+   *   needs about a session's state travels the workspace/control streams,
+   *   which ARE share-filtered.
+   * - Anything not shaped exactly like a forwardable waterfall, cancel, or
+   *   status emit (T32-fix2, mirroring the client face's
+   *   `parseRemoteEventFrame` exact-keys validation) is dropped too: a frame
+   *   that slipped through would fail the sub-client's whole `$events`
+   *   generation and leave it failing and reconnecting in a loop.
    *
    * DROPPED DELIVERIES STAY PENDING (T32-fix2): a dropped waterfall used to
    * be abstained `next` on behalf. That is gone on purpose. DSH's `next`
@@ -916,6 +948,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       if (!isForwardableCancel(frame) || !sub.events.has(frame.eventId)) return null
       sub.events.delete(frame.eventId)
       return { ...frame, eventId: `${sub.token}.${frame.eventId}` }
+    }
+    if (frame.type === 'emit') {
+      // T75: the one share-scoped emit. A NEW frame with a fresh args array
+      // leaves — never the host's object itself.
+      if (!isForwardableStatusEmit(frame) || !isAccessible(frame.args[0])) return null
+      return { type: 'emit', event: frame.event, args: [frame.args[0], frame.args[1]] }
     }
     return null
   }
