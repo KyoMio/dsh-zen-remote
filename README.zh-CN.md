@@ -90,7 +90,7 @@ dsh plugin --profile web add dsh-zen-remote
 // ~/.dsh/profiles/desktop/package.json
 {
   "dependencies": {
-    "dsh-zen-remote": "^2.0.0"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^2.0.1"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
   }
 }
 ```

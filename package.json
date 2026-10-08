@@ -1,6 +1,6 @@
 {
   "name": "dsh-zen-remote",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "一个插件、两种角色：主服务端把 DeepSeek Harness 变成手机能安全访问的 PWA（移动端界面、配对码网关、Web Push），并把选定会话共享给已配对的桌面端；子客户端在另一台 DSH 桌面端的侧边栏里远程使用这些会话。One DSH plugin, two roles: the host turns DeepSeek Harness into a phone-reachable PWA (mobile UI, pairing-code gateway behind your own reverse proxy, Web Push) and shares chosen sessions to paired desktops; the client uses those sessions remotely from another DSH desktop app's sidebar.",
   "license": "MIT",
   "type": "module",
