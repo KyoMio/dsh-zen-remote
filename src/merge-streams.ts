@@ -142,7 +142,7 @@
  * `zr~<serverId>~provider/model` fallback string (the pre-fix2 display).
  */
 
-import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
+import { fromVirtual, isVirtual, toVirtual, VIRTUAL_GROUP_NAME_MARK } from './virtual-id.js'
 
 /** The (serverId, serverName) pair a merger virtualizes with. A re-handshake
  * with a different server retargets the SAME merger ({@link retarget}) so the
@@ -1119,8 +1119,13 @@ export function mergeSessionList(localResult: unknown, remoteResult: unknown, se
  *   order, RT dsh-client-ui-model-selection lib/client.js:510 — appended
  *   groups render last); each group id becomes the virtual group id
  *   `zr~<serverId>~<original>` and its name is prefixed
- *   `${serverName} · ${name}` — the same workspace title discipline the
- *   merger uses;
+ *   `${VIRTUAL_GROUP_NAME_MARK}${serverName} · ${name}` — the same workspace
+ *   title discipline the merger uses, PLUS the invisible WORD JOINER (T74):
+ *   the model menu's groups stopped carrying their id in the markup (0.2.0's
+ *   MenuGroup renders `aria-labelledby={useId()}` only), so the browser
+ *   classifies menu groups by this heading prefix instead
+ *   (client-data/model-group-side.ts). The sidebar's workspace TITLES stay
+ *   unmarked — those groups are keyed by their `zr~` row ids;
  * - `default` and `failures` stay LOCAL untouched: the default drives what a
  *   blank LOCAL session would run (a remote session's current model comes
  *   from its projection instead), and the UI renders every failure as a
@@ -1159,7 +1164,9 @@ export function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, id
     virtualGroups.push({
       ...group,
       id,
-      ...(typeof group.name === 'string' ? { name: `${identity.serverName} · ${group.name}` } : {}),
+      ...(typeof group.name === 'string'
+        ? { name: `${VIRTUAL_GROUP_NAME_MARK}${identity.serverName} · ${group.name}` }
+        : {}),
     })
   }
   if (virtualGroups.length === 0) return localValue

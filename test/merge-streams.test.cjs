@@ -12,11 +12,12 @@ const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
 const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue } = require('../lib/merge-streams.js')
-const { toVirtual } = require('../lib/virtual-id.js')
+const { toVirtual, VIRTUAL_GROUP_NAME_MARK } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
 const NAME = '主服务器'
 const V = (id) => toVirtual(SID, id)
+const MARK = VIRTUAL_GROUP_NAME_MARK
 
 const LOCAL_WS = {
   workspaceId: 'ws-local',
@@ -900,7 +901,7 @@ test('T34 RT UI model: a revoked relay keeps the group under the 吊销 annotati
 
 // -- 7. the model catalog and the modelSelection projection values (T52) -----------
 
-test('T52 mergeModelCatalogs: server groups append after the local ones with virtual ids and prefixed names; default and failures stay local', () => {
+test('T52/T74 mergeModelCatalogs: server groups append after the local ones with virtual ids and marked, prefixed names; default and failures stay local', () => {
   const local = {
     default: { provider: 'deepseek-account', model: 'deepseek-v4-pro' },
     routableProviders: ['deepseek-account', 'openai'],
@@ -921,11 +922,15 @@ test('T52 mergeModelCatalogs: server groups append after the local ones with vir
     failures: [{ id: 'server-bad', name: '服务端坏', message: 'y' }],
   }
   const merged = mergeModelCatalogs(local, remote, { serverId: SID, serverName: NAME })
+  // T74: every virtual group NAME starts with the invisible WORD JOINER —
+  // the model menu's only surviving per-group mark once 0.2.0's MenuGroup
+  // dropped the group id from the markup (client-data/model-group-side.ts
+  // classifies headings by it).
   assert.deepEqual(merged.groups, [
     local.groups[0],
     local.groups[1],
-    { id: V('codex'), name: `${NAME} · Codex`, models: [{ id: 'sol', name: 'Sol' }] },
-    { id: V('claude'), name: `${NAME} · Claude`, models: [{ id: 'sonnet', name: 'Sonnet' }] },
+    { id: V('codex'), name: `${MARK}${NAME} · Codex`, models: [{ id: 'sol', name: 'Sol' }] },
+    { id: V('claude'), name: `${MARK}${NAME} · Claude`, models: [{ id: 'sonnet', name: 'Sonnet' }] },
   ])
   // The default drives blank LOCAL sessions; server failures never alarm the
   // dropdown (each failure row's Retry reloads the whole local catalog).
@@ -943,6 +948,13 @@ test('T52 mergeModelCatalogs: server groups append after the local ones with vir
   assert.equal(partial, local)
   assert.equal(mergeModelCatalogs(local, undefined, { serverId: SID, serverName: NAME }), local)
   assert.equal(mergeModelCatalogs(undefined, remote, { serverId: SID, serverName: NAME }), undefined)
+
+  // T74: a group WITHOUT a name stays without one — no invented name, and
+  // above all no mark (an unmarkable heading must never decide a container).
+  const noName = mergeModelCatalogs(local, { groups: [{ id: 'noname', models: [] }] }, { serverId: SID, serverName: NAME })
+  assert.equal(noName.groups.length, 3)
+  assert.equal(noName.groups[2].id, V('noname'))
+  assert.equal(Object.hasOwn(noName.groups[2], 'name'), false, 'nameless in, nameless out — no mark either')
 })
 
 test('T52-fix3 virtualizeModelSelectionValue: providers always go virtual, nulls and foreign keys pass', () => {

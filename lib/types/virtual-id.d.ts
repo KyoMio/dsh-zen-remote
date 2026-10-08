@@ -18,6 +18,20 @@
  */
 /** The fixed prefix every virtual id starts with. */
 export declare const VIRTUAL_ID_PREFIX = "zr~";
+/**
+ * The invisible WORD JOINER (U+2060) every virtual GROUP NAME starts with
+ * (T74). DSH 0.2.0 renders the model menu's provider groups with the
+ * primitives' MenuGroup, whose `aria-labelledby` carries only a useId — the
+ * group id is gone from the markup — so the browser half can no longer tell
+ * a virtual group from a local one by attribute. The merged catalog's group
+ * NAME (merge-streams.ts mergeModelCatalogs) is the one mark that survives
+ * in both 0.1.7 and 0.2.0, and effects/model-group-side.ts classifies each
+ * group container by which headings start with it. Zero-width: headings
+ * read exactly as before. Sidebar workspace TITLES deliberately do NOT
+ * carry it — those groups are told apart by their `zr~` row ids, not by
+ * text.
+ */
+export declare const VIRTUAL_GROUP_NAME_MARK = "\u2060";
 /** The two halves {@link fromVirtual} recovers from a virtual id. */
 export interface VirtualIdParts {
     serverId: string;

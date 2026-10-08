@@ -21,17 +21,29 @@ assert.ok(sheet.length > 0, 'the template literal must exist')
  * much would hide selectable rows in menus we never meant to touch.
  */
 
-test('T52: the model-menu group rules key on the aria mark and the html-level session attribute', () => {
-  // A remote session keeps only the server's groups (sections whose
-  // aria-labelledby does NOT carry the virtual "zr~" prefix are hidden)…
+test('T74: the model-menu group rules key on the data-zr-group stamp and the html-level session attribute', () => {
+  // A remote session hides the groups the effect stamped LOCAL…
   assert.match(
     sheet,
-    /html\[data-zr-remote-session="1"\] \[role="menu"\] section\[role="group"\]:not\(\[aria-labelledby\*="zr~"\]\) \{\s*display: none !important;/,
+    /html\[data-zr-remote-session="1"\] section\[role="group"\]\[data-zr-group="local"\] \{\s*display: none !important;/,
   )
-  // …every other context keeps only the virtual ones.
+  // …every other context hides the stamped-REMOTE ones.
   assert.match(
     sheet,
-    /html:not\(\[data-zr-remote-session\]\) \[role="menu"\] section\[role="group"\]\[aria-labelledby\*="zr~"\] \{\s*display: none !important;/,
+    /html:not\(\[data-zr-remote-session\]\) section\[role="group"\]\[data-zr-group="remote"\] \{\s*display: none !important;/,
+  )
+  // The 0.1.7-era rules that keyed on the group id inside aria-labelledby
+  // must be GONE: 0.2.0's MenuGroup carries only a useId there (the group id
+  // is nowhere in the markup), and the same component renders other menus'
+  // groups — a surviving attribute-prefix rule would misfire in BOTH
+  // directions (hide everything in a remote session's model menu, miss the
+  // server's groups in local ones).
+  assert.ok(!sheet.includes('aria-labelledby*="zr~"'), 'the aria-prefix group rules must not survive')
+  // No [role="menu"] scoping on the stamp rules: the container rule of the
+  // classifier is what scopes them, not a structural guess about menus.
+  assert.ok(
+    !/\[role="menu"\] section\[role="group"\]\[data-zr-group/.test(sheet),
+    'the stamp rules carry no menu-structure scope',
   )
 })
 

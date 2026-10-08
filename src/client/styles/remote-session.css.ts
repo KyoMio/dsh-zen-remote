@@ -163,31 +163,54 @@ html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="files"]:not([a
   display: none !important;
 }
 
-/* ---------- T52: model-menu groups follow the session's side ----------
+/* ---------- T52/T74: model-menu groups follow the session's side ----------
    The model catalog is GLOBAL (one shared load per page), so the merged
    catalog shows the server's groups everywhere; but a selection is only
    runnable on the side the open session lives on — the interceptor refuses
-   the other side with a clear message. Hide what cannot run, by the one
-   stable mark the menu carries:
-   - the model menu renders one section[role="group"] per provider group
-     with aria-labelledby="<useId>-<group.id>" (RT dsh-client-ui-model-
-     selection lib/client.js:830-835), so a VIRTUAL group's section carries
-     the "zr~" prefix in that attribute — an attribute the component itself
-     writes, like data-open-target above;
-   - the menu is a portal under <body>, but <html> is still its ancestor,
-     so the html-level session attribute scopes it with no host-depth
-     assumption and no :has();
-   - the [role="menu"] scope keeps the rule inside dropdown menus (where the
-     model picker lives); if DSH ever drops the aria mark the rule simply
-     stops matching — the interceptor's refusals remain the backstop.
-     In a remote session only the server's groups stay; otherwise only the
-     local ones (the home page and dialogs read as local, which is right:
-     the model picker only mounts inside a session, and a blank local
-     session cannot run server models either). */
-html[data-zr-remote-session="1"] [role="menu"] section[role="group"]:not([aria-labelledby*="zr~"]) {
+   the other side with a clear message. Hide what cannot run.
+
+   What changed and why the mechanism is a STAMP now (T74): through 0.1.7
+   each menu group rendered aria-labelledby="<useId>-<group.id>" (RT017
+   dsh-client-ui-model-selection lib/client.js ~824-830) — the group id was
+   IN the attribute, and rules could key on a virtual group's "zr~" prefix
+   directly. 0.2.0 renders the groups with the primitives' MenuGroup
+   instead (RT dsh-client-ui-primitives lib/index.js ~4283-4304): the
+   section's aria-labelledby carries ONLY the useId, the heading is a child
+   div[data-menu-group-heading], and the menu container is a div whose id
+   ends in "-models" with role="menu" (RT dsh-client-ui-model-selection
+   lib/client.js ~974-980). Two consequences killed the old rules: a group
+   section no longer says anywhere in its markup which group it is, and the
+   same MenuGroup renders OTHER menus' groups too — the old
+   [role="menu"] section[role="group"] scope alone was too wide and would
+   have hidden every unmarked group of every menu in a remote session
+   (leaving just the search box), while missing the server's groups in
+   local ones.
+
+   The new keys on what EVERY version actually renders, the heading text:
+   each virtual group's name is prefixed with the invisible WORD JOINER
+   (VIRTUAL_GROUP_NAME_MARK, virtual-id.ts; written by mergeModelCatalogs).
+   The browser effect (effects/model-group-side.ts) reads each group's
+   heading and stamps data-zr-group="remote|local" on the section — but
+   only inside a CONTAINER (the sections' shared parent element) that holds
+   at least one marked heading. That container rule is what scopes these
+   rules to the model menu alone WITHOUT assuming menu structure: an
+   unpaired client's model menu, every other menu, and the whole rest of
+   the page hold no marked heading, receive no stamp, and match neither
+   rule. And since the merged catalog only ever APPENDS virtual groups to
+   the local list, within a decided container the unmarked groups are
+   exactly the local ones — mixed containers (the norm) decide each group
+   separately. The menu is a portal under <body>, but <html> is still its
+   ancestor, so the html-level session attribute scopes both rules. If the
+   effect is not running (uninstalled, or a host-role page that never had
+   it), no stamp exists and both rules go inert — nothing stays hidden.
+
+   KNOWN BOUNDARY (accepted, not fixed): in a remote session, searching the
+   model menu and pressing Enter can commit a HIDDEN local model — the
+   interceptor refuses it with its usual message. */
+html[data-zr-remote-session="1"] section[role="group"][data-zr-group="local"] {
   display: none !important;
 }
-html:not([data-zr-remote-session]) [role="menu"] section[role="group"][aria-labelledby*="zr~"] {
+html:not([data-zr-remote-session]) section[role="group"][data-zr-group="remote"] {
   display: none !important;
 }
 

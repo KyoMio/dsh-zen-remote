@@ -40,6 +40,7 @@ import { mountCurrentSessionReporter } from './current-session-report.ts'
 import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
+import { installModelGroupSide } from './effects/model-group-side.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -148,6 +149,12 @@ export function apply(ctx: ClientContext): void {
   // 逐字节原样放行；标记属性只在虚拟会话打开时出现，卸载时还原。
   ctx.effect(() => installRemoteApiFetch(window), 'dsh-zen-remote: remote api fetch')
   installRemoteSessionGuard(ctx)
+  // T74 模型选单分组按会话归属显示：0.2.0 的 MenuGroup 的 aria-labelledby 只剩
+  // useId（分组 id 不再出现在标记里），旧的 zr~ 前缀选择器失效——改为 effect 给
+  // 分组打 data-zr-group 标（分类依据是虚拟分组名开头的不可见标记，见
+  // client-data/model-group-side.ts），CSS 按标隐藏。同样必须在桌面门之前挂载：
+  // 桌面端子客户端的模型选单一样要分侧，桌面无手机外壳不影响它。
+  installModelGroupSide(ctx)
 
   // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
   // down to ~520px wide, where every width-based gate would flip the phone
