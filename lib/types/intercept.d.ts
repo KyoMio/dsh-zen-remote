@@ -57,11 +57,14 @@
  *   `agentId` and `eventId` become `zr~<serverId>~…` virtual ids (those are
  *   the ONLY session ids a forwarded waterfall carries — the request bodies
  *   are tool/question data, verified against dsh-tools/dsh-user-questions),
- *   and the remote `ready`/`emit` frames are DROPPED: the client face of the
+ *   and the remote `ready`/`emit` frames are DROPPED — except, since T75, a
+ *   shared session's `api-session/status` emit, which crosses with its
+ *   session id virtualized (the one share-scoped emit; every other emit
+ *   broadcasts server-wide state the UI must not mistake for local
+ *   sessions). The client face of the
  *   gateway (dsh-api-gateway lib/client.js) accepts a ready frame only as
- *   the FIRST frame of the stream and would fail the stream on a second one,
- *   and emit events broadcast server-wide state the UI must not mistake for
- *   local sessions. Prompts this leg showed are closed when the leg dies —
+ *   the FIRST frame of the stream and would fail the stream on a second one.
+ *   Prompts this leg showed are closed when the leg dies —
  *   each gets a synthesized `cancel` — so a disconnect cannot leave an
  *   approval on screen that no server can settle anymore (T32-fix).
  * - `dispatchRpc('$events/result', …)` splits on the eventId: a virtual id
@@ -336,11 +339,18 @@ export declare function rewriteResult(endpoint: string, value: unknown, serverId
  *   whole thing in `zr~<serverId>~`.
  * - `cancel`: `{type, eventId}` — the correlation id goes virtual so the UI
  *   can match it against the waterfall it showed and close the prompt.
- * - everything else — `ready`, `emit`, non-objects, unknown types, and any
- *   waterfall/cancel failing the client face's exact-keys shape — is
- *   DROPPED (T32-fix2 mirrors the server side). `ready` and `emit` carry
- *   facts the UI must never see (the local stream opened with ITS ready
- *   frame; emit broadcasts server-wide state); a malformed frame that
+ * - `emit`: dropped, with ONE exception (T75) — a well-formed
+ *   `api-session/status` frame (the only emit the server forwards, and only
+ *   for accessible sessions) has its `args[0]` session id virtualized and
+ *   its `args[1]` running flag passed through, so the UI's
+ *   `api-session/status` listener keeps the remote session's running state
+ *   in step with the host's (RT dsh-api-session-controller lib/client.js
+ *   `handleSessionStatus`).
+ * - everything else — `ready`, non-status emits, non-objects, unknown
+ *   types, and any frame failing the client face's exact-keys shape — is
+ *   DROPPED (T32-fix2 mirrors the server side). `ready` and the other emits
+ *   carry facts the UI must never see (the local stream opened with ITS
+ *   ready frame; emits broadcast server-wide state); a malformed frame that
  *   slipped through would fail `parseRemoteEventFrame` and take the UI's
  *   whole `$events` generation down with it, failing and reconnecting in a
  *   loop. Mirrors the server's own forwardable-shape gate, so the two ends

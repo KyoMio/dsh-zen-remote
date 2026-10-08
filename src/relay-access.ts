@@ -176,9 +176,12 @@ interface RelayMethod {
   resultFilter?: InvokeFilter
   /** The one EVENT-FORWARDING entry (T32, `$zr/events`): the stream route
    * opens the gateway's `$events` wire stream (never `gw.stream`, spike §2.1
-   * 坑 1) and filters frames by the waterfall's `agentId`; the answer route
-   * matches `eventId`s against what was forwarded. Like the global reads it
-   * claims no session field — access is judged per frame / per answer. */
+   * 坑 1) and filters frames per frame — waterfalls by the `agentId`, and
+   * since T75 the one forwardable emit (`api-session/status`) by the
+   * session id in `args[0]`; every other emit is server-wide state and is
+   * dropped. The answer route matches `eventId`s against what was
+   * forwarded. Like the global reads it claims no session field — access is
+   * judged per frame / per answer. */
   events?: true
 }
 

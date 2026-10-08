@@ -193,7 +193,7 @@ const FOLLOW_ARGS = { request: { address: { kind: 'session', sessionId: 'session
  */
 let bootCounter = 0
 async function boot(opts = {}) {
-  const { shared = [], heartbeatMs, invoke, fingerprints, apiFetch } = opts
+  const { shared = [], heartbeatMs, invoke, fingerprints, apiFetch, parentOf } = opts
   const home = path.join(ROOT, `run-${bootCounter++}`)
   fs.mkdirSync(home, { recursive: true })
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
@@ -242,6 +242,9 @@ async function boot(opts = {}) {
     secret: SECRET,
     store,
     gateway,
+    // T75: the subagent/fork reachability walk (share-store isAccessible
+    // needs it); tests that do not care leave it unset → no parents.
+    ...(parentOf !== undefined ? { parentOf } : {}),
     // T41b: the host's shared `/api` dispatcher, faked with a recording
     // double that answers a canned diff — the synthetic Request's URL is
     // asserted to the byte in the http e2e test below.
@@ -904,6 +907,66 @@ test('e2e T32: a server approval crosses into the local $events virtualized, the
       [seenEventId, orphan.eventId],
     )
     for (const frame of closes) assert.deepEqual(Object.keys(frame).sort(), ['eventId', 'type'])
+
+    handle.uninstall()
+    controller.abort()
+  } finally { await env.stop() }
+})
+
+// ---- T75: the running-status emit, end to end ------------------------------------
+
+test('e2e T75: a shared session (and its child) running-status emit crosses virtualized; unshared, malformed, and other emits never leave the server', async () => {
+  const env = await boot({
+    shared: ['session-parent'],
+    parentOf: (id) => (id === 'session-child' ? 'session-parent' : undefined),
+  })
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const serverId = info.serverId
+    const V = (id) => toVirtual(serverId, id)
+
+    const controller = new AbortController()
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalEventsGateway(localGate)
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    const merged = await localGateway.wireTap('$events', { args: {} }, undefined, localGateway.operatorPeer(), controller.signal, { signal: controller.signal })
+    const iterator = merged[Symbol.asyncIterator]()
+    localGate.push({ type: 'ready', clientId: 'local-ui-client', host: { home: '/local/home' } })
+    const [ready] = await collectFrames(iterator, 1)
+    assert.deepEqual(ready, { type: 'ready', clientId: 'local-ui-client', host: { home: '/local/home' } })
+    await waitFor(() => env.eventsGates.length === 1)
+
+    // The shared session's status emit crosses the real chain virtualized —
+    // and so does a CHILD session's: isAccessible walks the parent chain,
+    // the same rule the waterfalls are judged by.
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/status', args: ['session-parent', true] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/status', args: ['session-child', false] })
+    const crossing = await collectFrames(iterator, 2)
+    assert.deepEqual(crossing, [
+      { type: 'emit', event: 'api-session/status', args: [V('session-parent'), true] },
+      { type: 'emit', event: 'api-session/status', args: [V('session-child'), false] },
+    ])
+
+    // Everything else is dropped server-side — the proof is ORDERED: the
+    // next frame to cross the in-order stream is the known-good one pushed
+    // last, so nothing before it can have slipped through. Unshared status,
+    // the malformed shapes (extra key, args[1] not boolean, args length 3),
+    // and any other emit all die at the relay.
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/status', args: ['session-secret', true] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/status', args: ['session-parent', true, 'extra'] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/status', args: ['session-parent', 'yes'] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/status', args: ['session-parent', true], extra: 1 })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/added', args: [{ sessionId: 'session-parent', title: '服务端会话' }] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/status', args: ['session-parent', false] })
+    const afterJunk = await collectFrames(iterator, 1)
+    assert.deepEqual(afterJunk, [{ type: 'emit', event: 'api-session/status', args: [V('session-parent'), false] }])
 
     handle.uninstall()
     controller.abort()
