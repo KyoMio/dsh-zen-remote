@@ -440,14 +440,20 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
      cache) is long. It is the single entry the official StatsLine puts in
      conversation.composer.dock, so the structural anchor below reaches it
      without any DOM marking (S3 deleted the text-matching effect that used
-     to set [data-slot="conversation.composer.dock"] > [data-composer-stat]). Layout: ONE fixed-height (28px) flex
+     to set the dock-entry marker). Layout: ONE fixed-height (28px) flex
      strip that scrolls horizontally — the full metrics stream stays
      reachable by swiping, the row never grows vertically, no ellipsis or
      fade, 12px gaps between metric groups, a 2px scrollbar as the swipe
      affordance. The phone breakpoint hides the strip outright instead
      (styles/composer.css.ts — its data moves into the session info card). */
 
-  [data-slot="conversation.composer.dock"] > [data-composer-stat] {
+  /* Marker set is deliberately dual: 0.2.0-rc.2 renders the strip root with
+     data-composer-stats (plural, dsh-client-ui-chat rc.2 lib), 0.2.1-alpha.2
+     dropped the strip wrapper and registers activity/usage as separate dock
+     entries whose pill spans carry data-composer-stat (singular). Keeping
+     both lets this plugin style the strip on a host that has NOT upgraded to
+     alpha.2 — verified against both npm tarballs 2026-10-09. */
+  [data-slot="conversation.composer.dock"] > :is([data-composer-stat], [data-composer-stats]) {
     display: flex !important;
     flex-flow: row nowrap !important;
     align-items: center !important;
@@ -469,17 +475,17 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     line-height: 20px !important;
     font-size: 12px !important;
   }
-  [data-slot="conversation.composer.dock"] > [data-composer-stat]::-webkit-scrollbar {
+  [data-slot="conversation.composer.dock"] > :is([data-composer-stat], [data-composer-stats])::-webkit-scrollbar {
     height: 2px !important;
   }
-  [data-slot="conversation.composer.dock"] > [data-composer-stat]::-webkit-scrollbar-thumb {
+  [data-slot="conversation.composer.dock"] > :is([data-composer-stat], [data-composer-stats])::-webkit-scrollbar-thumb {
     background: var(--dsw-alias-label-tertiary, rgba(0, 0, 0, .3)) !important;
     border-radius: 2px !important;
   }
-  [data-slot="conversation.composer.dock"] > [data-composer-stat]::-webkit-scrollbar-track {
+  [data-slot="conversation.composer.dock"] > :is([data-composer-stat], [data-composer-stats])::-webkit-scrollbar-track {
     background: transparent !important;
   }
-  [data-slot="conversation.composer.dock"] > [data-composer-stat] > * {
+  [data-slot="conversation.composer.dock"] > :is([data-composer-stat], [data-composer-stats]) > * {
     display: flex !important;
     flex: 0 0 auto !important;
     flex-flow: row nowrap !important;
@@ -491,10 +497,10 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     margin-right: 12px !important;
     padding: 0 !important;
   }
-  [data-slot="conversation.composer.dock"] > [data-composer-stat] > *:last-child {
+  [data-slot="conversation.composer.dock"] > :is([data-composer-stat], [data-composer-stats]) > *:last-child {
     margin-right: 0 !important;
   }
-  [data-slot="conversation.composer.dock"] > [data-composer-stat] * {
+  [data-slot="conversation.composer.dock"] > :is([data-composer-stat], [data-composer-stats]) * {
     white-space: nowrap !important;
   }
 

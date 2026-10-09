@@ -95,6 +95,9 @@ export function apply(ctx, config) {
         ? ctx.webServer.host
         : '127.0.0.1'
       // URL host: wrap IPv6; wildcard/empty falls back to loopback for the token URL.
+      // Inline on purpose — dsh-host-webserver exports isWildcardHost() only from
+      // 0.2.x, and the peer range still admits 0.1.7 hosts where importing that
+      // named export would throw at load time.
       const hostForUrl = (!rawHost || rawHost === '0.0.0.0' || rawHost === '::' || rawHost === '[::]')
         ? '127.0.0.1'
         : (rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost)
