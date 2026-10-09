@@ -803,7 +803,8 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   /* --- 8. the official stats strip leaves the composer ---
      Its data moves into the session info card (S4). The row is the composer
      dock's own \`_root\` entry; the slot itself stays live for later entries. */
-  [data-slot="conversation.composer.dock"] > [class$="_root"] {
+  [data-slot="conversation.composer.dock"] > [class$="_root"],
+  [data-slot="conversation.composer.dock"] > [data-composer-stat] {
     display: none !important;
   }
 

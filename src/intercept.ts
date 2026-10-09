@@ -1100,9 +1100,16 @@ export function rewriteResult(endpoint: string, value: unknown, serverId: string
     // mergeSessionList rewrite instead, merge-streams.ts.)
     if (!isPlainObject(value) || !isPlainObject(value.values)) return value
     const values: Record<string, unknown> = { ...value.values }
-    if (!Object.hasOwn(values, 'modelSelection')) return value
+    // alpha.2 clients validate list/control projections with kind:'cached'|'sequenced'.
+    // Older hosts (rc.2) omit it on the session/projections control-key result — synthesize.
+    const withKind = typeof value.kind === 'string'
+      ? value
+      : (typeof value.asOfSeq === 'number' ? { ...value, kind: 'sequenced' as const } : value)
+    if (!Object.hasOwn(values, 'modelSelection')) {
+      return withKind === value ? value : { ...withKind, values }
+    }
     values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId)
-    return { ...value, values }
+    return { ...withKind, values }
   }
   if (endpoint === 'session/selectModel') {
     // T52: the result echoes the selection it accepted (`{selected:
