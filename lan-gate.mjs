@@ -87,8 +87,22 @@ export function apply(ctx, config) {
       // 不传。
       const env = childEnv()
       const targetPort = Number(env.LAN_GATE_TARGET_PORT || 3080)
+      // Prefer live webServer bind info (host may be a LAN IP; protocol may be https:).
+      const proto = (ctx.webServer && typeof ctx.webServer.protocol === 'string')
+        ? ctx.webServer.protocol
+        : 'http:'
+      const rawHost = (ctx.webServer && typeof ctx.webServer.host === 'string' && ctx.webServer.host)
+        ? ctx.webServer.host
+        : '127.0.0.1'
+      // URL host: wrap IPv6; wildcard/empty falls back to loopback for the token URL.
+      // Inline on purpose — dsh-host-webserver exports isWildcardHost() only from
+      // 0.2.x, and the peer range still admits 0.1.7 hosts where importing that
+      // named export would throw at load time.
+      const hostForUrl = (!rawHost || rawHost === '0.0.0.0' || rawHost === '::' || rawHost === '[::]')
+        ? '127.0.0.1'
+        : (rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost)
       const tokenUrl = ctx.connection && typeof ctx.connection.authenticatedUrl === 'function'
-        ? ctx.connection.authenticatedUrl('http://127.0.0.1:' + targetPort)
+        ? ctx.connection.authenticatedUrl(proto + '//' + hostForUrl + ':' + targetPort)
         : undefined
       const nodePath = await ctx.subprocess.resolveExecutable('node')
       if (disposed) return // 行在 await 期间被销毁：不再 spawn

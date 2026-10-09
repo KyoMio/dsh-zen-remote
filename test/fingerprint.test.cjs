@@ -295,6 +295,9 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     '0.1.7-rc.2': 'r:211083a84f52',
     '0.2.0-rc.1': 'r:211083a84f52',
     '0.2.0-rc.2': 'r:60f0fceb0e36',
+    // 0.2.1-alpha.2: workingDirectory, mode:'external', tokenUsage/contextPressure;
+    // session/projections result shape gained kind on list-row projections.
+    '0.2.1-alpha.2': 'r:3ff7ad92341c',
   }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
