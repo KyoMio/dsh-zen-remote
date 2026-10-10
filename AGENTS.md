@@ -110,7 +110,7 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
   `src/relay-access.ts` 的 `RELAY_METHODS`（服务端，授权看登记的归属字段）
   和 `src/intercept.ts` 的 `CLIENT_METHOD_FIELDS`（客户端，改写判定），
   一致性由 `test/intercept.test.cjs` 的逐方法比对测试钉住。插件桥的授权另走一条：声明注册表 + 路径完全相等 + 会话共享（`src/plugin-route-intercept.ts` / relay 的 `/v1/plugin`），同样不扫描参数；
-禁止「从参数里
+  禁止「从参数里
   通用扫描会话 id」的写法——DSH 会悄悄丢掉不认识的参数名，扫描会被诱饵
   字段骗过；全局读（`session/list` 等）安全靠输出过滤，不靠输入判定。
 - **桌面端请求没有 `Origin`/`Sec-Fetch-Site`**：DSH 桌面端主进程把窗口请求

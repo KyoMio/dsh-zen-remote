@@ -61,7 +61,13 @@ function startFakePluginServer() {
       res.end()
       return
     }
-    state.requests.push({ url: req.url ?? '/', host: String(req.headers.host ?? ''), cookie: String(req.headers.cookie ?? ''), accept: req.headers.accept, range: req.headers.range, headers: req.headers })
+    const entry = { url: req.url ?? '/', host: String(req.headers.host ?? ''), cookie: String(req.headers.cookie ?? ''), accept: req.headers.accept, range: req.headers.range, headers: req.headers, method: req.method, contentType: req.headers['content-type'], body: '', bodyDone: false, aborted: false }
+    state.requests.push(entry)
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => { entry.body = Buffer.concat(chunks).toString('utf8'); entry.bodyDone = true })
+    req.on('error', () => { entry.aborted = true })
+    req.on('close', () => { if (!entry.bodyDone) entry.aborted = true })
     if (String(req.headers.cookie ?? '') !== 'dsh-auth=ok') {
       res.writeHead(401, { 'content-type': 'text/plain' })
       res.end('unauthorized')
@@ -145,7 +151,7 @@ async function makeWiring(name, { consent = {}, registryOverride, getTokenUrl, g
       await pluginServer.stop()
     },
     /** One POST to the plugin route with the given coordinates. */
-    pluginFetch(pathName, { plugin = 'test-panel', version = '1.0.0', digest, zrPath = '/panel/data', query = 'sessionId=session-shared', headers: extra = {}, device } = {}) {
+    pluginFetch(pathName, { plugin = 'test-panel', version = '1.0.0', digest, zrPath = '/panel/data', query = 'sessionId=session-shared', headers: extra = {}, device, body } = {}) {
       const declared = normalizeDeclaration(DECLARATION_INPUT)
       return fetch(`http://127.0.0.1:${port}${pathName}`, {
         method: 'POST',
@@ -158,6 +164,9 @@ async function makeWiring(name, { consent = {}, registryOverride, getTokenUrl, g
           ...(device !== undefined ? { 'x-zen-remote-device': device } : {}),
           ...extra,
         }),
+        ...(body !== undefined
+          ? { body, ...(body instanceof ReadableStream ? { duplex: 'half' } : {}) }
+          : {}),
       })
     },
   }
@@ -253,6 +262,133 @@ test("PB-3: consent gates only scope:'server' routes, read LIVE per request", as
     assert.equal(granted.status, 200)
     await granted.text()
   } finally { await wiring.stop() }
+})
+
+// ---- PB-9: write requests -----------------------------------------------------
+
+test('PB-9 POST round-trip: the plugin receives the VERBATIM bytes and content type; undeclared method 405; bodyless GET with a body 400', async () => {
+  const wiring = await makeWiring('post-write', { registryOverride: createBridgeRegistry() })
+  try {
+    const WRITE_DECL = {
+      plugin: 'test-panel',
+      version: '1.0.0',
+      routes: [
+        { path: '/panel/write', scope: 'session', methods: ['POST', 'PUT'] },
+        { path: '/panel/data', scope: 'session' },
+      ],
+    }
+    const writeDigest = normalizeDeclaration(WRITE_DECL).digest
+    wiring.registry.register(WRITE_DECL)
+    wiring.consentBox.map = {}
+    const body = JSON.stringify({ title: '新任务', items: [1, 2, 3] })
+    const res = await wiring.pluginFetch(ROUTE, {
+      zrPath: '/panel/write',
+      query: 'sessionId=session-shared',
+      digest: writeDigest,
+      headers: { 'x-zr-method': 'POST', 'content-type': 'application/json; charset=utf-8' },
+      body,
+    })
+    assert.equal(res.status, 200, `the write round-trip: ${res.body?.slice?.(0, 200) ?? ''}`)
+    await res.text()
+    const seen = wiring.pluginServer.state.requests.at(-1)
+    assert.equal(seen.method, 'POST', 'the loopback method is the forwarded one')
+    assert.equal(seen.bodyDone, true)
+    assert.equal(seen.body, body, 'the exact bytes reached the plugin')
+    assert.equal(seen.contentType, 'application/json; charset=utf-8', 'the content type rode the passthrough')
+
+    // A method the route did NOT declare answers 405 method-undeclared, and
+    // the plugin never sees it.
+    const before = wiring.pluginServer.state.requests.length
+    const undeclared = await wiring.pluginFetch(ROUTE, {
+      zrPath: '/panel/write',
+      query: 'sessionId=session-shared',
+      digest: writeDigest,
+      headers: { 'x-zr-method': 'DELETE' },
+    })
+    assert.equal(undeclared.status, 405)
+    assert.equal(undeclared.headers.get('x-zen-remote-error'), 'method-undeclared')
+    assert.equal(wiring.pluginServer.state.requests.length, before, 'the plugin saw nothing')
+
+    // A route without `methods` forwards GET only: the default is still
+    // exactly 2.1's.
+    const getDefault = await wiring.pluginFetch(ROUTE, { zrPath: '/panel/data', digest: writeDigest })
+    assert.equal(getDefault.status, 200)
+    const postOnGet = await wiring.pluginFetch(ROUTE, {
+      zrPath: '/panel/data',
+      digest: writeDigest,
+      headers: { 'x-zr-method': 'POST' },
+      body: 'x',
+    })
+    assert.equal(postOnGet.status, 405)
+
+    // GET/HEAD stay bodyless: a body on them is a shape violation.
+    const getWithBody = await wiring.pluginFetch(ROUTE, {
+      zrPath: '/panel/data',
+      headers: { 'content-type': 'application/json' },
+      body: '{"sneaky":true}',
+    })
+    assert.equal(getWithBody.status, 400)
+    assert.equal(getWithBody.headers.get('x-zen-remote-error'), 'bad-request')
+  } finally {
+    wiring.pluginServer.releaseAll()
+    await wiring.stop()
+  }
+})
+
+test('PB-9 body gates: a declared over-max content-length refuses 413 before forwarding; a chunked over-max body trips the streaming count and the loopback dies', async () => {
+  const wiring = await makeWiring('body-gates', { registryOverride: createBridgeRegistry() })
+  try {
+    const GATE_DECL = {
+      plugin: 'test-panel',
+      version: '1.0.0',
+      routes: [{ path: '/panel/write', scope: 'session', methods: ['POST'], maxBody: 1024 }],
+    }
+    const gateDigest = normalizeDeclaration(GATE_DECL).digest
+    wiring.registry.register(GATE_DECL)
+    wiring.consentBox.map = {}
+
+    // Declared length over the cap: refused before a byte moves.
+    const before = wiring.pluginServer.state.requests.length
+    const pre = await wiring.pluginFetch(ROUTE, {
+      zrPath: '/panel/write',
+      query: 'sessionId=session-shared',
+      digest: gateDigest,
+      headers: { 'x-zr-method': 'POST' },
+      body: 'x'.repeat(1025),
+    })
+    assert.equal(pre.status, 413)
+    assert.equal(pre.headers.get('x-zen-remote-error'), 'body-too-large')
+    assert.equal(wiring.pluginServer.state.requests.length, before, 'nothing reached the plugin')
+
+    // Chunked body past the cap: NO content-length (a web-stream body rides
+    // chunked), so the pre-check cannot see it — the pump's counting gate
+    // trips mid-forward, the loopback request dies mid-write, and the 413
+    // answers with the relay's headers not yet out.
+    const chunkInit = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('x'.repeat(2000)))
+        controller.close()
+      },
+    })
+    const chunked = await wiring.pluginFetch(ROUTE, {
+      zrPath: '/panel/write',
+      query: 'sessionId=session-shared',
+      digest: gateDigest,
+      headers: { 'x-zr-method': 'POST', 'content-type': 'application/octet-stream' },
+      body: chunkInit,
+    })
+    assert.equal(chunked.status, 413)
+    assert.equal(chunked.headers.get('x-zen-remote-error'), 'body-too-large')
+    const writes = wiring.pluginServer.state.requests.filter((r) => r.url.startsWith('/panel/write'))
+    // The 2000-byte body arrives as ONE chunk past the 1024 cap: the gate
+    // trips before the loopback has written anything, so ZERO connection
+    // attempts is the honest "aborted at the gate" outcome — and any attempt
+    // that DID open was killed mid-body, never completed.
+    assert.ok(writes.every((w) => !w.bodyDone && w.aborted), 'no loopback attempt ever completed a body')
+  } finally {
+    wiring.pluginServer.releaseAll()
+    await wiring.stop()
+  }
 })
 
 test("PB-3-fix: a THROWN consent source reads as no consent — the server-scoped route stays home", async () => {

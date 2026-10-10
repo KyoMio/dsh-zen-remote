@@ -256,6 +256,8 @@ export const zh = {
   // --- PB-5 插件桥：主服务端同意小节 + 子客户端诊断小节 ---
   'settings.bridge.title': '插件桥',
   'settings.bridge.empty': '暂无插件登记插件桥',
+  'settings.bridge.loading': '正在读取插件桥登记…',
+  'settings.bridge.loadFailed': '插件桥列表读取失败（旧版服务端或经网关打开的页面）',
   'settings.bridge.sessionOnly': '随会话共享转发',
   'settings.bridge.consentToggle': '允许转发整机数据',
   'settings.bridge.consentHint': '打开后，已配对的桌面应用端可在远程会话里读取该插件的整机数据。',
@@ -541,6 +543,8 @@ export const en: Record<MobileNavKey, string> = {
   // --- PB-5 plugin bridge: host consent section + sub-client diagnostics ---
   'settings.bridge.title': 'Plugin bridge',
   'settings.bridge.empty': 'No plugin has registered a bridge yet',
+  'settings.bridge.loading': 'Loading the bridge registrations…',
+  'settings.bridge.loadFailed': 'The bridge listing failed to load (an older server, or the page opened through the gateway)',
   'settings.bridge.sessionOnly': 'Forwards with shared sessions',
   'settings.bridge.consentToggle': 'Allow forwarding whole-machine data',
   'settings.bridge.consentHint': 'When on, paired desktop apps can read this plugin\u2019s whole-machine data in remote sessions.',

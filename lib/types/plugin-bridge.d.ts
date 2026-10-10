@@ -22,15 +22,28 @@
  * `'server'` — whole-machine data (e.g. every zcode task), which the server
  * owner must consent to per plugin (the `pluginBridgeConsent` row knob). */
 export type BridgeScope = 'session' | 'server';
+/** The HTTP methods a bridged route may forward (PB-9). 2.1 accepted GET
+ * only; the write methods arrived with the `methods` field. */
+export declare const BRIDGE_METHODS: readonly ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
+/** The body cap a route may declare (`maxBody`), in bytes: 64 MiB. */
+export declare const MAX_ROUTE_BODY_BYTES: number;
+/** The body cap a route gets when it declares none: 1 MiB. */
+export declare const DEFAULT_ROUTE_BODY_BYTES: number;
 /** One forwardable route as a plugin declares it. `sessionParam` names the
  * URL query parameter carrying the session id (default `'sessionId'`);
  * `stream` marks routes answered as an event stream rather than one JSON
- * body. */
+ * body. `methods` (PB-9) lists the forwardable HTTP methods — uppercase
+ * members of {@link BRIDGE_METHODS}, deduplicated and sorted at
+ * normalization; omitted means `['GET']` (the 2.1 behavior). `maxBody`
+ * (PB-9) caps the forwarded request body in bytes; omitted means
+ * {@link DEFAULT_ROUTE_BODY_BYTES}. */
 export interface BridgeRoute {
     path: string;
     scope: BridgeScope;
     sessionParam?: string;
     stream?: boolean;
+    methods?: readonly string[];
+    maxBody?: number;
 }
 /** What a plugin hands `zenRemote.bridge(...)` — the raw, unvalidated shape. */
 export interface BridgeDeclaration {
@@ -38,12 +51,29 @@ export interface BridgeDeclaration {
     version: string;
     routes: BridgeRoute[];
 }
+/** A route after validation: every scalar field filled, `methods` and
+ * `maxBody` present ONLY when the plugin declared them explicitly — the
+ * distinction is load-bearing for the digest (see the canonical form in
+ * {@link normalizeDeclaration}), while consumers read the EFFECTIVE values
+ * through {@link routeMethodsOf} / {@link routeMaxBodyOf}. */
+export interface NormalizedBridgeRoute {
+    path: string;
+    scope: BridgeScope;
+    sessionParam: string;
+    stream: boolean;
+    methods: string[] | undefined;
+    maxBody: number | undefined;
+}
+/** The effective forwardable methods of one normalized route. */
+export declare function routeMethodsOf(route: NormalizedBridgeRoute): string[];
+/** The effective body cap of one normalized route, in bytes. */
+export declare function routeMaxBodyOf(route: NormalizedBridgeRoute): number;
 /** A declaration after validation: every route field filled, routes sorted
  * by path, and the 16-hex-char digest both ends will compare. */
 export interface NormalizedDeclaration {
     plugin: string;
     version: string;
-    routes: Required<BridgeRoute>[];
+    routes: NormalizedBridgeRoute[];
     digest: string;
 }
 /**

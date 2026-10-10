@@ -27,6 +27,7 @@ const DECLARED = {
     { path: '/panel/all', scope: 'server' },
     { path: '/panel/stream', scope: 'session', stream: true },
     { path: '/panel/hold', scope: 'session' },
+    { path: '/panel/write', scope: 'session', methods: ['POST'], maxBody: 1024 },
   ],
 }
 const DIGEST = normalizeDeclaration(DECLARED).digest
@@ -116,8 +117,13 @@ function startFakeHost() {
             },
           })
         },
-        get: (pathWithQuery, { headers = {}, signal, method } = {}) =>
-          fetch(`http://127.0.0.1:${port}${pathWithQuery}`, { method: method ?? 'GET', headers, signal }),
+        get: (pathWithQuery, { headers = {}, signal, method, body } = {}) =>
+          fetch(`http://127.0.0.1:${port}${pathWithQuery}`, {
+            method: method ?? 'GET',
+            headers,
+            ...(body !== undefined ? { body, ...(body instanceof ReadableStream ? { duplex: 'half' } : {}) } : {}),
+            signal,
+          }),
       })
     })
   })
@@ -134,6 +140,7 @@ function startFakeRelay({ refuse } = {}) {
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://relay.internal')
     state.hits.push({
+      method: req.method,
       path: url.pathname,
       plugin: req.headers['x-zr-plugin'],
       version: req.headers['x-zr-plugin-version'],
@@ -152,6 +159,17 @@ function startFakeRelay({ refuse } = {}) {
       res.writeHead(200, { 'content-type': 'application/x-ndjson' })
       res.write('frame-1\n')
       setTimeout(() => { res.write('frame-2\n'); res.end() }, 15)
+      return
+    }
+    if (url.pathname === '/_dsh/zen-remote/relay/v1/plugin' && req.headers['x-zr-path'] === '/panel/write') {
+      // PB-9: echo the forwarded body verbatim so the test can prove the
+      // exact bytes and content type crossed the sub-client boundary.
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ echoed: Buffer.concat(chunks).toString('utf8'), ct: req.headers['content-type'] }))
+      })
       return
     }
     if (url.pathname === '/_dsh/zen-remote/relay/v1/plugin' && req.headers['x-zr-path'] === '/panel/hold') {
@@ -176,24 +194,56 @@ function startFakeRelay({ refuse } = {}) {
   })
 }
 
-/** The relay client stub: only `pluginRequest` and the state the wrap reads. */
+/** The relay client stub: only `pluginRequest` and the state the wrap reads.
+ * PB-9: the method, body stream and content type forward too, and EVERY
+ * call is recorded (method, content type, declared length) so the test can
+ * assert what the wrap actually handed the relay client — the body BYTES
+ * themselves are proven by the fake relay's echo. PB-9-fix: the stub mirrors
+ * the fixed relay-client contract — a caller abort is a caller verdict, NOT
+ * a transport death — and every offline verdict it WOULD have made is
+ * recorded for the tests to refute. */
 function fakeRelayClient(relayPort) {
-  return {
-    pluginRequest: async (request, signal) =>
-      fetch(`http://127.0.0.1:${relayPort}/_dsh/zen-remote/relay/v1/plugin`, {
-        method: 'POST',
+  const forwarded = []
+  const offlineVerdicts = []
+  const client = {
+    forwarded,
+    offlineVerdicts,
+    pluginRequest: async (request, signal) => {
+      const hasBody = request.body !== undefined && request.body !== null
+      forwarded.push({
+        method: request.method ?? 'GET',
+        contentType: request.contentType,
+        contentLength: request.contentLength,
+        path: request.path,
+        query: request.query,
+      })
+      const init = {
+        method: request.method ?? 'POST',
         headers: {
           accept: request.accept ?? 'application/json',
           ...(request.range !== undefined ? { range: request.range } : {}),
+          ...(hasBody && request.contentType !== undefined ? { 'content-type': request.contentType } : {}),
           'x-zr-plugin': request.plugin,
           'x-zr-plugin-version': request.version,
           'x-zr-plugin-digest': request.digest,
           'x-zr-path': request.path,
           'x-zr-query': request.query,
         },
+        ...(hasBody ? { body: request.body, duplex: 'half' } : {}),
         signal,
-      }),
+      }
+      try {
+        return await fetch(`http://127.0.0.1:${relayPort}/_dsh/zen-remote/relay/v1/plugin`, init)
+      } catch (error) {
+        if (signal?.aborted) {
+          throw Object.assign(new Error('aborted'), { code: 'aborted' })
+        }
+        offlineVerdicts.push({ code: 'offline', message: String((error && error.message) ?? error) })
+        throw Object.assign(new Error('offline'), { code: 'offline' })
+      }
+    },
   }
+  return client
 }
 
 const VIRTUAL = 'zr~abcd1234~session-a'
@@ -412,6 +462,97 @@ test('PB-5-fix: a LOCAL session request logs NOTHING; only forwards and refusals
     // The relay side still speaks: one forward, one line.
     await host.get(`/panel/stream?sessionId=${encodeURIComponent(VIRTUAL)}`, { headers: { accept: 'text/event-stream' } })
     assert.equal(logLines.length, 1, 'the forward logged exactly once')
+  } finally {
+    handle.uninstall()
+    await relay.stop()
+    await host.stop()
+  }
+})
+
+test('PB-9: a POST on a declared route streams through; an undeclared method and an over-max body never reach the local plugin', async () => {
+  const host = await startFakeHost()
+  host.registerLocalPlugin()
+  const relay = await startFakeRelay()
+  const relayClient = fakeRelayClient(relay.__port)
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const handle = installPluginRouteIntercept({
+    webServer: host.raw,
+    registry,
+    relay: relayClient,
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  try {
+    // POST on the declared route: the body crosses to the relay and the
+    // echoed answer streams back; the local plugin handler never ran.
+    const posted = await host.get(`/panel/write?sessionId=${encodeURIComponent(VIRTUAL)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: '新任务' }),
+    })
+    assert.equal(posted.status, 200)
+    assert.deepEqual(JSON.parse(await posted.text()), {
+      echoed: JSON.stringify({ title: '新任务' }),
+      ct: 'application/json',
+    }, 'the exact bytes and content type crossed the boundary')
+    const forward = relayClient.forwarded.at(-1)
+    assert.equal(forward.method, 'POST', 'the forwarded method is the browser\'s')
+    assert.equal(forward.contentType, 'application/json', 'the content type is passed through')
+    // 21 = the JSON string's UTF-8 byte length (新任务 are 3 bytes each) —
+    // what the browser's Content-Length named and what the budget scales with.
+    assert.equal(forward.contentLength, Buffer.byteLength(JSON.stringify({ title: '新任务' })), 'the declared length rides along for the budget')
+    assert.equal(forward.path, '/panel/write')
+    assert.equal(host.hits.localPanel, 0)
+
+    // A PUT the route did not declare: uniform 503, local plugin untouched,
+    // relay untouched.
+    const put = await host.get(`/panel/write?sessionId=${encodeURIComponent(VIRTUAL)}`, { method: 'PUT', body: 'x' })
+    assert.equal(put.status, 503)
+    assert.equal((await put.json()).error.reason, 'method-not-bridged')
+    assert.equal(relay.state.hits.filter((hit) => hit.zrPath === '/panel/write').length, 1, 'nothing was forwarded')
+
+    // PRE-CHECK case: a DECLARED Content-Length past maxBody refuses
+    // locally before a byte moves.
+    const over = await host.get(`/panel/write?sessionId=${encodeURIComponent(VIRTUAL)}`, {
+      method: 'POST',
+      headers: { 'content-length': '1025' },
+      body: 'x'.repeat(1025),
+    })
+    assert.equal(over.status, 413)
+    assert.deepEqual(await over.json(), { ok: false, error: { code: 'zr-plugin-body-too-large' } })
+    assert.equal(host.hits.localPanel, 0)
+
+    // CHUNKED case (PB-9-fix): a TRUE no-Content-Length body — a web-stream
+    // body rides chunked — outgrows the gate mid-forward. The gate's LOCAL
+    // flag answers the 413 (the relay client correctly did NOT judge the
+    // link offline for the caller abort), the local plugin never runs.
+    const chunked = await host.get(`/panel/write?sessionId=${encodeURIComponent(VIRTUAL)}`, {
+      method: 'POST',
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('x'.repeat(2000)))
+          controller.close()
+        },
+      }),
+    })
+    const chunkedBody = await chunked.json()
+    assert.equal(chunked.status, 413, 'the chunked over-max body answers the local 413')
+    assert.deepEqual(chunkedBody, { ok: false, error: { code: 'zr-plugin-body-too-large' } })
+    assert.equal(host.hits.localPanel, 0, 'the local plugin handler still never runs')
+    // The relay client never saw the body gate's failure as a link verdict.
+    assert.equal(relayClient.offlineVerdicts.length, 0, 'the gate trip is a caller verdict, never offline')
+    // The over-limit request did not reach the fake relay either (the abort
+    // tore the forward down mid-flight).
+    assert.equal(relay.state.hits.filter((hit) => hit.zrPath === '/panel/write').length, 1, 'only the legal POST was ever forwarded')
+
+    const diag = handle.diagnostics()
+    // forwarded counts REQUESTS THAT ENTERED the forward — the legal POST
+    // plus the chunked one whose gate tripped MID-forward. The over-max
+    // pre-check refusal never entered, so it is not counted here.
+    assert.equal(diag.forwarded, 2, 'the legal POST entered the forward, and so did the chunked one before its gate tripped')
+    assert.equal(diag.refusalsByReason['body-too-large'], 2)
   } finally {
     handle.uninstall()
     await relay.stop()

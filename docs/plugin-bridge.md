@@ -53,8 +53,10 @@ export function apply(ctx: Context) {
 | `scope` | 必填，只能是 `'session'`（数据属于单个会话）或 `'server'`（整机数据，需主服务端主人逐插件同意） |
 | `sessionParam` | 可选，缺省 `'sessionId'`；须匹配 `/^[A-Za-z][A-Za-z0-9_]{0,63}$/`——你的接口用别的名字接会话 id 时在这里声明 |
 | `stream` | 可选，缺省 `false`；标记该路由以流式响应回答 |
+| `methods` | 可选，缺省 `['GET']`；大写 HTTP 方法数组，只接受 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`，去重并按字典序排序后进规范化与摘要（2.2 起，写请求） |
+| `maxBody` | 可选，缺省 `1048576`（1 MiB）；请求体上限（字节），正整数，最高 64 MiB（2.2 起） |
 
-声明里出现未知字段直接报错（防拼错）。2.1 只匹配 **exact 路径**：声明的 `path` 与请求 pathname 完全相等才算命中，把 `path` 写成前缀不会覆盖子路径。
+声明里出现未知字段直接报错（防拼错）。`methods` 与 `maxBody` 只在**显式给出**时进摘要——2.1 时代（没有这两个字段）的声明，摘要与当年完全一致，升级不破坏已桥接状态。2.1 只匹配 **exact 路径**：声明的 `path` 与请求 pathname 完全相等才算命中，把 `path` 写成前缀不会覆盖子路径。
 
 ## 你的插件要守的约定
 
@@ -86,13 +88,13 @@ content-type: application/json; charset=utf-8
 | `offline` | 中继离线（或传输失败） |
 | `server-too-old` | 服务端 zen-remote 过旧，握手没有插件表 |
 | `server-changed` | 会话 id 指向另一台服务端（切换服务端后页面未刷新） |
-| `bad-query` | 会话参数缺失、重复、为空，或虚拟 id 解析失败 |
-| `method-not-bridged` | 非 GET 请求（2.1 只转发 GET） |
+| `bad-query` | 会话参数重复，或虚拟会话 id 解析失败（浏览器侧缺失 / 为空的请求走本地放行，到不了 503） |
+| `method-not-bridged` | 请求方法不在该路由声明的 `methods` 内（未声明即只转发 GET） |
 | `not-shared` / `busy` / `plugin-unknown` / `plugin-mismatch` / `route-undeclared` / `loopback-auth` / `internal` | 服务端中继路由的对应拒绝原样透传（会话未共享 / 该设备并发超限 / 服务端无此登记 / 版本或摘要不符 / 路径未声明 / 服务端回环鉴权失败 / 服务端内部错误） |
 
 ## 2.1 的限制
 
-- 只转发 **GET**；写请求（POST/PUT/DELETE）在远程会话里回答 `method-not-bridged`。
+- 2.1 只转发 **GET**；2.2 起路由可声明 `methods` 开放写方法（POST 等），请求体经中继流式转发，受该路由 `maxBody` 约束（缺省 1 MiB）——超限在本地即回答 413，不落本机、不到服务端。
 - 只匹配 **exact 路径**；前缀声明不生效。
 - WebSocket 不在桥接范围内。已知的插件 WebSocket（如 better-sidebar 的两条）将按中继的既有约定「订阅走流式响应、指令走普通请求」在 2.2 以流式响应加普通请求模拟（见 `docs/adr/0002`），届时再扩展声明字段。
 

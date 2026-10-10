@@ -15,7 +15,7 @@
 //
 // Run: node scripts/check-plugin-bridge-ui.mjs
 import assert from 'node:assert/strict'
-import { derivePluginBridgeStatuses, togglePluginConsent } from '../src/client-data/plugin-bridge.ts'
+import { bridgeSectionState, derivePluginBridgeStatuses, togglePluginConsent } from '../src/client-data/plugin-bridge.ts'
 import { consentField, SETTINGS_FIELDS } from '../src/client-data/settings-form.ts'
 
 let testChain = Promise.resolve()
@@ -93,6 +93,15 @@ await test('an illegal current map reads as empty; the toggle writes from scratc
   for (const bad of [undefined, null, 'x', 42, [], { plugin: 'yes' }]) {
     assert.deepEqual(togglePluginConsent(bad, 'p', true), { p: true }, `current ${JSON.stringify(bad)} must read as empty`)
   }
+})
+
+// ---- bridgeSectionState: the three-state listing (PB-9-fix) -----------------
+
+await test('the listing distinguishes loading / failed from a confirmed empty registry', () => {
+  assert.equal(bridgeSectionState('loading', []), 'loading', 'no answer yet — never reads as empty')
+  assert.equal(bridgeSectionState('error', []), 'error', 'a failed or refused fetch is an error, not "nothing registered"')
+  assert.equal(bridgeSectionState('ready', []), 'empty', 'an ANSWER with zero rows is the honest empty')
+  assert.equal(bridgeSectionState('ready', [{ plugin: 'p' }]), 'plugins')
 })
 
 // ---- consentField: the staged-form spec the toggles ride ---------------------

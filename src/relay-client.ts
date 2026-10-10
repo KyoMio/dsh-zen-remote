@@ -386,6 +386,18 @@ export interface RelayPluginRequest {
   /** The re-serialized query string, session id already restored to its
    * ORIGINAL form. */
   query: string
+  /** The request method (PB-9); defaults to GET. Must be one the route
+   * declared — the server answers 405 `method-undeclared` otherwise. */
+  method?: string
+  /** The request BODY (PB-9), forwarded verbatim as a stream. `null` means
+   * no body. A streaming body rides chunked (undici forbids hand-set length
+   * headers), so the server's streaming byte count is the size gate. */
+  body?: ReadableStream<Uint8Array> | null
+  /** The body's content type, passed through to the plugin when set. */
+  contentType?: string
+  /** The declared body size, when the local request carried one — sizes the
+   * header-wait budget and nothing else (a streaming body goes chunked). */
+  contentLength?: number
   /** The one request header passed through to the plugin beside `range`. */
   accept?: string
   range?: string
@@ -1427,33 +1439,71 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       if (signal.aborted) controller.abort()
       else signal.addEventListener('abort', onExternalAbort, { once: true })
     }
-    const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
+    // The header wait gets the plain request timeout for a bodyless call;
+    // with a BODY (PB-9) the budget scales with its declared size like the
+    // upload's (a slow body is a slow call, never a dead link), and the
+    // timeout never moves the connection state.
+    const hasBody = request.body !== undefined && request.body !== null
+    const headerTimeoutMs = hasBody
+      ? sizeBackedTimeoutMs(requestTimeoutMs, request.contentLength)
+      : requestTimeoutMs
+    const timer = setTimeout(() => controller.abort(), headerTimeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
     try {
       let response: Response
+      const init: RequestInit = {
+        // The WIRE method is always POST — the relay route is a POST endpoint
+        // whatever the bridged call is; the bridged method travels in
+        // `x-zr-method` (the server never reads this request line's verb).
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${creds.token}`,
+          // No accept of our own unless the caller carries one: this
+          // header FORWARDS to the plugin (PB-3's protocol), and the
+          // default below exists only so a revoked-token wall still
+          // answers JSON instead of the pairing HTML page.
+          accept: request.accept ?? 'application/json',
+          ...(request.range !== undefined ? { range: request.range } : {}),
+          // PB-9: the body's content type is the OTHER passthrough header.
+          ...(hasBody && request.contentType !== undefined ? { 'content-type': request.contentType } : {}),
+          'x-zr-plugin': request.plugin,
+          'x-zr-plugin-version': request.version,
+          'x-zr-plugin-digest': request.digest,
+          'x-zr-path': request.path,
+          'x-zr-query': request.query,
+          // PB-9: the method travels in the HEADER (the wire protocol's
+          // coordinate), not just the request line — the server reads it
+          // from here, and an omitted header means GET there no matter what
+          // this request line says.
+          'x-zr-method': request.method ?? 'GET',
+        },
+        ...(hasBody ? { body: request.body } : {}),
+        // A wrong server must not walk the pairing token through a redirect.
+        redirect: 'manual',
+        signal: controller.signal,
+      }
+      if (hasBody) {
+        // `duplex: 'half'` is mandatory for a streaming request body; the
+        // resolved RequestInit type hides the field (the DOM-vs-undici
+        // conditional in @types/node), so the assignment carries its own cast.
+        ;(init as { duplex?: string }).duplex = 'half'
+      }
       try {
-        response = await fetchImpl(`${creds.url}${PLUGIN_PATH}`, {
-          method: 'POST',
-          headers: {
-            authorization: `Bearer ${creds.token}`,
-            // No accept of our own unless the caller carries one: this
-            // header FORWARDS to the plugin (PB-3's protocol), and the
-            // default below exists only so a revoked-token wall still
-            // answers JSON instead of the pairing HTML page.
-            accept: request.accept ?? 'application/json',
-            ...(request.range !== undefined ? { range: request.range } : {}),
-            'x-zr-plugin': request.plugin,
-            'x-zr-plugin-version': request.version,
-            'x-zr-plugin-digest': request.digest,
-            'x-zr-path': request.path,
-            'x-zr-query': request.query,
-          },
-          // A wrong server must not walk the pairing token through a redirect.
-          redirect: 'manual',
-          signal: controller.signal,
-        })
+        response = await fetchImpl(`${creds.url}${PLUGIN_PATH}`, init)
       } catch (error) {
+        // A caller abort is NOT a transport death (PB-9-fix): the caller
+        // aborts exactly when its own request-body gate tripped or the
+        // browser hung up — both are this call's verdicts to answer, never
+        // the link's. Same discipline as the invoke/upload timeouts
+        // (T31-fix/T51-fix): no offline, no failure recorded on the link.
         if (signal?.aborted) throw abortedError()
+        // A body-bearing call keeps the upload route's rule (T51-fix): the
+        // timeout judges THIS call, not the link — but a real transport
+        // death still reads offline (the reconnect ladder hangs off it).
+        if (hasBody && controller.signal.aborted && !signal?.aborted) {
+          noteFailure('request-timeout')
+          throw new RelayError('request-timeout', `no response within ${headerTimeoutMs} ms`)
+        }
         noteFailure('offline')
         setState('offline')
         throw new RelayError('offline', messageOf(error))

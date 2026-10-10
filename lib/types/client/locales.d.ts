@@ -243,6 +243,8 @@ export declare const zh: {
     readonly 'settings.client.diagCompatCalls': "最近的不兼容调用";
     readonly 'settings.bridge.title': "插件桥";
     readonly 'settings.bridge.empty': "暂无插件登记插件桥";
+    readonly 'settings.bridge.loading': "正在读取插件桥登记…";
+    readonly 'settings.bridge.loadFailed': "插件桥列表读取失败（旧版服务端或经网关打开的页面）";
     readonly 'settings.bridge.sessionOnly': "随会话共享转发";
     readonly 'settings.bridge.consentToggle': "允许转发整机数据";
     readonly 'settings.bridge.consentHint': "打开后，已配对的桌面应用端可在远程会话里读取该插件的整机数据。";
