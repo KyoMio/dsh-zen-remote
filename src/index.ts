@@ -63,6 +63,7 @@ import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } fro
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
+import { createPluginLoopback } from './plugin-loopback.js'
 
 // The plugin bridge's public types (PB-1), re-exported so another plugin's
 // author can `import type { … } from 'dsh-zen-remote'` without reaching into
@@ -699,6 +700,28 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // ~7 ms per computation against a full registry; a failed compute
       // lands as the empty map inside the relay handler's own guard.
       relayCtx.effect(() => {
+        // The plugin bridge's loopback facts (PB-3), both read PER REQUEST
+        // through the reflection layer: the web server may have restarted on
+        // another port or protocol, and the connection service's
+        // authenticatedUrl — the token-exchange entry the lan-gate wiring
+        // also reads (0.1.1 hosts lack the method entirely) — lives on a
+        // service deliberately NOT in this inject's declaration list (same
+        // reason as getApiFetch above: adding it would keep the whole relay
+        // prefix off compositions that lack it).
+        const getLoopbackTarget = () => {
+          const webServer = relayCtx.reflect.get('webServer') as { protocol?: unknown; port?: unknown } | undefined
+          const port = typeof webServer?.port === 'number' && webServer.port > 0 ? webServer.port : undefined
+          if (port === undefined) throw new Error('the web server exposes no loopback port')
+          return { protocol: webServer?.protocol === 'https:' ? ('https:' as const) : ('http:' as const), port }
+        }
+        const getTokenUrl = () => {
+          const connection = relayCtx.reflect.get('connection') as
+            | { authenticatedUrl?: (base: string) => string | undefined }
+            | undefined
+          if (typeof connection?.authenticatedUrl !== 'function') return undefined
+          const { protocol, port } = getLoopbackTarget()
+          return connection.authenticatedUrl(`${protocol}//127.0.0.1:${port}`)
+        }
         const handler = createRelayHandler({
           secret: relaySecret,
           store,
@@ -733,6 +756,15 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
               }
               return table
             },
+          },
+          // PB-3: the forwarding half of the plugin bridge — the registry
+          // this apply built (the zenRemote service's table), the consent
+          // map read LIVE per request (a volatile row field), and the
+          // loopback executor over the wiring's two reflection getters.
+          pluginBridge: {
+            registry,
+            getConsent: () => resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent,
+            loopback: createPluginLoopback({ getTarget: getLoopbackTarget, getTokenUrl }),
           },
         })
         const unregister = relayCtx.webServer.register({
