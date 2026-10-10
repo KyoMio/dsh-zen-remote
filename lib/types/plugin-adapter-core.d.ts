@@ -43,7 +43,15 @@ export type AdapterLocator = {
  * `pathname === path || pathname.startsWith(path + '/')` on the RAW
  * undecoded pathname; `exact` is the equality alone. `local: true` marks a
  * path that stays on the sub-client's own machine forever (static assets
- * and the like) — it never forwards, in either direction. */
+ * and the like) — it never forwards, in either direction.
+ *
+ * `deny` (optional) answers a reason string for requests that must refuse
+ * BEFORE any id locating happens — the better-sidebar adapter uses it to
+ * refuse `open.external` when the browser's CURRENT session is a remote
+ * one (the request itself carries no session field, so the classify step
+ * would otherwise read it as local) and the side-chat methods wholesale.
+ * A `deny` hit answers the bridge's uniform 503 with that reason; returning
+ * `undefined` falls through to the normal classify. */
 export interface AdapterRoute {
     path: string;
     match: 'exact' | 'prefix';
@@ -53,11 +61,18 @@ export interface AdapterRoute {
     upgrade?: boolean;
     locator: AdapterLocator;
     local?: boolean;
+    deny?: (info: {
+        pathname: string;
+        method: string;
+        currentSessionId: string | undefined;
+    }) => string | undefined;
 }
 /** One adapter route after validation: every scalar filled with its
  * EFFECTIVE value (the adapters have no legacy-digest constraint, so
  * unlike the cooperative {@link NormalizedBridgeRoute} the canonical form
- * always carries the defaults). */
+ * always carries the defaults). `deny` rides along by reference — a
+ * function cannot enter the digest, and it is client-half logic the
+ * server never needs. */
 export interface NormalizedAdapterRoute {
     path: string;
     match: 'exact' | 'prefix';
@@ -67,6 +82,7 @@ export interface NormalizedAdapterRoute {
     upgrade: boolean;
     locator: AdapterLocator;
     local: boolean;
+    deny?: AdapterRoute['deny'];
 }
 /** The two hook faces an adapter may implement (both optional — an adapter
  * that only relocates ids needs neither). `client.request` runs on the
@@ -78,6 +94,9 @@ export interface NormalizedAdapterRoute {
  * a `cwd`) the local machine must not receive. */
 export interface AdapterRequestContext {
     method: string;
+    /** The full request pathname (RAW, undecoded) — a prefix route's
+     * tail segment is where better-sidebar carries its API method name. */
+    pathname: string;
     /** The matched route, as declared. */
     route: AdapterRoute;
     /** The request's query, ids already in their REAL form. */
@@ -87,20 +106,26 @@ export interface AdapterRequestContext {
     body: unknown;
 }
 /** The verdict of a request hook: allow (optionally replacing the JSON
- * body), or refuse with a reason — the refusal travels the bridge's
+ * body and/or the query — the better-sidebar adapter strips the `cwd`
+ * query field of the file/upload routes so the backend resolves it from
+ * the session), or refuse with a reason — the refusal travels the bridge's
  * uniform 503 shape on the client half, a 403 on the server half. */
 export type AdapterVerdict = {
     allow: true;
     body?: unknown;
+    query?: URLSearchParams;
 } | {
     allow: false;
     reason: string;
 };
 /** The context of `client.response`: the parsed JSON answer plus the
  * virtualizer for this device — an adapter maps server-real session ids
- * back to THIS sub-client's virtual form with it. */
+ * back to THIS sub-client's virtual form with it. `pathname` names the
+ * request the answer belongs to (better-sidebar's response rewriting is
+ * per API method). */
 export interface AdapterResponseContext {
     status: number;
+    pathname: string;
     body: unknown;
     /** Wrap one server-real session id into this device's virtual form. */
     virtualize(id: string): string;
@@ -135,6 +160,13 @@ export interface NormalizedAdapter {
     declaration: NormalizedDeclaration;
     hooks: AdapterHooks;
 }
+/** The body cap an ADAPTER route may declare: 100 MiB — the relay's own
+ * upload budget (lib/relay-server.js `MAX_UPLOAD_BYTES`), which the
+ * better-sidebar upload route rides. Wider than the cooperative
+ * declaration's 64 MiB because raw media uploads are exactly what an
+ * adapter exists to carry; test/adapter-better-sidebar.test.cjs pins the
+ * two numbers together. */
+export declare const MAX_ADAPTER_BODY_BYTES: number;
 /** Validate one adapter's route table and fold it, together with the
  * INSTALLED plugin version, into the registry-ready form.
  *
@@ -167,6 +199,16 @@ export interface AdapterIdHit {
     /** The query parameter or JSON field name; undefined for a path segment. */
     key: string | undefined;
     value: string;
+}
+/** Thrown when a query parameter the locator reads appears with MORE than
+ * one value: the cooperative bridge refuses such requests as `bad-query`
+ * (a duplicated id is a shape violation, never a forward of whichever
+ * duplicate a parser happens to keep), and so does the adapter (PB-12
+ * review note — the old behavior silently collapsed to `set`, rewriting
+ * only one of the values). Callers catch this and answer 503/400
+ * `bad-query`. */
+export declare class AdapterMultiValueQueryError extends Error {
+    constructor(name: string);
 }
 /** Locate the session ids one request carries for one route. A query
  * parameter counts once per value it appears with; a JSON body field counts
@@ -211,4 +253,11 @@ export declare function adapterOwnsRegistryEntry(adapter: NormalizedAdapter, reg
 /** The largest JSON answer the client half will buffer for a response
  * rewrite: past this the body passes through untouched (8 MB). */
 export declare const MAX_ADAPTER_RESPONSE_BUFFER_BYTES: number;
+/** Response headers an ADAPTER answer may carry through VERBATIM, beyond
+ * the three every bridged forward passes (content-type, content-length,
+ * cache-control): the better-sidebar HTML preview ships a `content-
+ * security-policy` sandbox and downloads carry `content-disposition` —
+ * stripping those breaks the very panels the adapter exists to serve.
+ * Cooperative declaration routes keep the three-header behavior. */
+export declare const ADAPTER_RESPONSE_HEADER_ALLOWLIST: readonly ["content-security-policy", "content-disposition", "etag", "last-modified", "accept-ranges", "content-range"];
 //# sourceMappingURL=plugin-adapter-core.d.ts.map

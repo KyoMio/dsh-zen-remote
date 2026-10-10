@@ -1168,6 +1168,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         getServerId: () => relayClient.handshakeInfo?.serverId,
         getStatus: pluginBridgeStatus,
         adapters,
+        // PB-12: the browser's currently open session — a VIRTUAL id means
+        // a remote panel is the request's origin, the signal the adapter
+        // routes' deny hooks read (better-sidebar's open.external carries
+        // no session field of its own).
+        getCurrentSession: () => (reportedCurrentSession.kind === 'open' ? reportedCurrentSession.sessionId : undefined),
         log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
       })
       pluginRouteHandle = handle

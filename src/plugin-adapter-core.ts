@@ -25,7 +25,7 @@
 import { createHash } from 'node:crypto'
 import { isVirtual, fromVirtual } from './virtual-id.js'
 import type { NormalizedBridgeRoute, NormalizedDeclaration } from './plugin-bridge.js'
-import { BRIDGE_METHODS, MAX_ROUTE_BODY_BYTES, DEFAULT_ROUTE_BODY_BYTES } from './plugin-bridge.js'
+import { BRIDGE_METHODS, DEFAULT_ROUTE_BODY_BYTES } from './plugin-bridge.js'
 
 export { fromVirtual }
 
@@ -43,7 +43,15 @@ export type AdapterLocator =
  * `pathname === path || pathname.startsWith(path + '/')` on the RAW
  * undecoded pathname; `exact` is the equality alone. `local: true` marks a
  * path that stays on the sub-client's own machine forever (static assets
- * and the like) — it never forwards, in either direction. */
+ * and the like) — it never forwards, in either direction.
+ *
+ * `deny` (optional) answers a reason string for requests that must refuse
+ * BEFORE any id locating happens — the better-sidebar adapter uses it to
+ * refuse `open.external` when the browser's CURRENT session is a remote
+ * one (the request itself carries no session field, so the classify step
+ * would otherwise read it as local) and the side-chat methods wholesale.
+ * A `deny` hit answers the bridge's uniform 503 with that reason; returning
+ * `undefined` falls through to the normal classify. */
 export interface AdapterRoute {
   path: string
   match: 'exact' | 'prefix'
@@ -53,12 +61,15 @@ export interface AdapterRoute {
   upgrade?: boolean
   locator: AdapterLocator
   local?: boolean
+  deny?: (info: { pathname: string; method: string; currentSessionId: string | undefined }) => string | undefined
 }
 
 /** One adapter route after validation: every scalar filled with its
  * EFFECTIVE value (the adapters have no legacy-digest constraint, so
  * unlike the cooperative {@link NormalizedBridgeRoute} the canonical form
- * always carries the defaults). */
+ * always carries the defaults). `deny` rides along by reference — a
+ * function cannot enter the digest, and it is client-half logic the
+ * server never needs. */
 export interface NormalizedAdapterRoute {
   path: string
   match: 'exact' | 'prefix'
@@ -68,6 +79,7 @@ export interface NormalizedAdapterRoute {
   upgrade: boolean
   locator: AdapterLocator
   local: boolean
+  deny?: AdapterRoute['deny']
 }
 
 /** The two hook faces an adapter may implement (both optional — an adapter
@@ -80,6 +92,9 @@ export interface NormalizedAdapterRoute {
  * a `cwd`) the local machine must not receive. */
 export interface AdapterRequestContext {
   method: string
+  /** The full request pathname (RAW, undecoded) — a prefix route's
+   * tail segment is where better-sidebar carries its API method name. */
+  pathname: string
   /** The matched route, as declared. */
   route: AdapterRoute
   /** The request's query, ids already in their REAL form. */
@@ -90,17 +105,22 @@ export interface AdapterRequestContext {
 }
 
 /** The verdict of a request hook: allow (optionally replacing the JSON
- * body), or refuse with a reason — the refusal travels the bridge's
+ * body and/or the query — the better-sidebar adapter strips the `cwd`
+ * query field of the file/upload routes so the backend resolves it from
+ * the session), or refuse with a reason — the refusal travels the bridge's
  * uniform 503 shape on the client half, a 403 on the server half. */
 export type AdapterVerdict =
-  | { allow: true; body?: unknown }
+  | { allow: true; body?: unknown; query?: URLSearchParams }
   | { allow: false; reason: string }
 
 /** The context of `client.response`: the parsed JSON answer plus the
  * virtualizer for this device — an adapter maps server-real session ids
- * back to THIS sub-client's virtual form with it. */
+ * back to THIS sub-client's virtual form with it. `pathname` names the
+ * request the answer belongs to (better-sidebar's response rewriting is
+ * per API method). */
 export interface AdapterResponseContext {
   status: number
+  pathname: string
   body: unknown
   /** Wrap one server-real session id into this device's virtual form. */
   virtualize(id: string): string
@@ -138,8 +158,18 @@ export interface NormalizedAdapter {
   hooks: AdapterHooks
 }
 
+/** The npm package name of an adapter's target, same shape the cooperative
+ * declarations validate. */
 const PLUGIN_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u
 const MAX_ROUTES = 64
+
+/** The body cap an ADAPTER route may declare: 100 MiB — the relay's own
+ * upload budget (lib/relay-server.js `MAX_UPLOAD_BYTES`), which the
+ * better-sidebar upload route rides. Wider than the cooperative
+ * declaration's 64 MiB because raw media uploads are exactly what an
+ * adapter exists to carry; test/adapter-better-sidebar.test.cjs pins the
+ * two numbers together. */
+export const MAX_ADAPTER_BODY_BYTES = 100 * 1024 * 1024
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -183,11 +213,11 @@ export function normalizeAdapter(input: unknown, installedVersion: string): Norm
   const normalized: NormalizedAdapterRoute[] = routes.map((route, index): NormalizedAdapterRoute => {
     if (!isRecord(route)) fail(`routes[${index}]`, 'expected an object')
     for (const key of Object.keys(route)) {
-      if (key !== 'path' && key !== 'match' && key !== 'methods' && key !== 'maxBody' && key !== 'stream' && key !== 'upgrade' && key !== 'locator' && key !== 'local') {
+      if (key !== 'path' && key !== 'match' && key !== 'methods' && key !== 'maxBody' && key !== 'stream' && key !== 'upgrade' && key !== 'locator' && key !== 'local' && key !== 'deny') {
         fail(`routes[${index}].${key}`, 'unknown field (typo guard)')
       }
     }
-    const { path, match, methods, maxBody, stream, upgrade, locator, local } = route
+    const { path, match, methods, maxBody, stream, upgrade, locator, local, deny } = route
     if (typeof path !== 'string' || path === '' || !path.startsWith('/') || path.includes('?') || path.includes('#') || path.includes('..') || /\s/u.test(path)) {
       fail(`routes[${index}].path`, `"${String(path)}" must be a plain absolute path`)
     }
@@ -213,8 +243,8 @@ export function normalizeAdapter(input: unknown, installedVersion: string): Norm
       normalizedMethods = upper
     }
     const normalizedMaxBody = maxBody === undefined ? DEFAULT_ROUTE_BODY_BYTES : maxBody
-    if (typeof normalizedMaxBody !== 'number' || !Number.isInteger(normalizedMaxBody) || normalizedMaxBody <= 0 || normalizedMaxBody > MAX_ROUTE_BODY_BYTES) {
-      fail(`routes[${index}].maxBody`, `must be a positive integer up to ${MAX_ROUTE_BODY_BYTES}`)
+    if (typeof normalizedMaxBody !== 'number' || !Number.isInteger(normalizedMaxBody) || normalizedMaxBody <= 0 || normalizedMaxBody > MAX_ADAPTER_BODY_BYTES) {
+      fail(`routes[${index}].maxBody`, `must be a positive integer up to ${MAX_ADAPTER_BODY_BYTES}`)
     }
     const normalizedStream = stream === undefined ? false : stream
     if (typeof normalizedStream !== 'boolean') fail(`routes[${index}].stream`, 'must be a boolean')
@@ -243,6 +273,7 @@ export function normalizeAdapter(input: unknown, installedVersion: string): Norm
     }
     if (local !== undefined && local !== true && local !== false) fail(`routes[${index}].local`, 'must be a boolean')
     const normalizedLocal: boolean = local === true
+    if (deny !== undefined && typeof deny !== 'function') fail(`routes[${index}].deny`, 'must be a function or omitted')
     return {
       path,
       match,
@@ -252,6 +283,7 @@ export function normalizeAdapter(input: unknown, installedVersion: string): Norm
       upgrade: normalizedUpgrade,
       locator: locator as AdapterLocator,
       local: normalizedLocal,
+      ...(deny !== undefined && typeof deny === 'function' ? { deny: deny as AdapterRoute['deny'] } : {}),
     }
   })
   normalized.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
@@ -347,6 +379,20 @@ export interface AdapterIdHit {
   value: string
 }
 
+/** Thrown when a query parameter the locator reads appears with MORE than
+ * one value: the cooperative bridge refuses such requests as `bad-query`
+ * (a duplicated id is a shape violation, never a forward of whichever
+ * duplicate a parser happens to keep), and so does the adapter (PB-12
+ * review note — the old behavior silently collapsed to `set`, rewriting
+ * only one of the values). Callers catch this and answer 503/400
+ * `bad-query`. */
+export class AdapterMultiValueQueryError extends Error {
+  constructor(name: string) {
+    super(`query parameter "${name}" appears more than once`)
+    this.name = 'AdapterMultiValueQueryError'
+  }
+}
+
 /** Locate the session ids one request carries for one route. A query
  * parameter counts once per value it appears with; a JSON body field counts
  * when present with a non-empty string value; a path segment counts when
@@ -355,7 +401,9 @@ export function locateAdapterIds(route: NormalizedAdapterRoute, pathname: string
   const hits: AdapterIdHit[] = []
   const locator = route.locator
   if (locator.in === 'query') {
-    for (const value of search.getAll(locator.name)) {
+    const values = search.getAll(locator.name)
+    if (values.length > 1) throw new AdapterMultiValueQueryError(locator.name)
+    for (const value of values) {
       if (value !== '') hits.push({ kind: 'query', key: locator.name, value })
     }
   } else if (locator.in === 'path-segment') {
@@ -465,3 +513,18 @@ export function adapterOwnsRegistryEntry(adapter: NormalizedAdapter, registryEnt
 /** The largest JSON answer the client half will buffer for a response
  * rewrite: past this the body passes through untouched (8 MB). */
 export const MAX_ADAPTER_RESPONSE_BUFFER_BYTES = 8 * 1024 * 1024
+
+/** Response headers an ADAPTER answer may carry through VERBATIM, beyond
+ * the three every bridged forward passes (content-type, content-length,
+ * cache-control): the better-sidebar HTML preview ships a `content-
+ * security-policy` sandbox and downloads carry `content-disposition` —
+ * stripping those breaks the very panels the adapter exists to serve.
+ * Cooperative declaration routes keep the three-header behavior. */
+export const ADAPTER_RESPONSE_HEADER_ALLOWLIST = [
+  'content-security-policy',
+  'content-disposition',
+  'etag',
+  'last-modified',
+  'accept-ranges',
+  'content-range',
+] as const

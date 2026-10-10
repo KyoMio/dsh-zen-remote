@@ -1,1 +1,1 @@
-{"version":3,"file":"index.d.ts","sourceRoot":"","sources":["../../../src/adapters/index.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;GAYG;AAEH,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,YAAY,CAAA;AAE/C,6DAA6D;AAC7D,eAAO,MAAM,QAAQ,EAAE,SAAS,aAAa,EAAO,CAAA"}
+{"version":3,"file":"index.d.ts","sourceRoot":"","sources":["../../../src/adapters/index.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;GAYG;AAEH,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,YAAY,CAAA;AAG/C,6DAA6D;AAC7D,eAAO,MAAM,QAAQ,EAAE,SAAS,aAAa,EAA8B,CAAA"}

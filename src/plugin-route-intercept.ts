@@ -28,12 +28,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { BridgeRegistry, BridgeStatus } from './plugin-bridge.js'
 import { routeMethodsOf, routeMaxBodyOf, routeUpgradesOf } from './plugin-bridge.js'
-import { Readable, Transform } from 'node:stream'
+import { PassThrough, Readable, Transform } from 'node:stream'
 import type { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
-import type { NormalizedAdapter, NormalizedAdapterRoute, AdapterIdHit, AdapterVerdict } from './plugin-adapter-core.js'
-import { adapterPathMatches, classifyAdapterRequest, rewriteAdapterRequest, adapterOwnsRegistryEntry, MAX_ADAPTER_RESPONSE_BUFFER_BYTES } from './plugin-adapter-core.js'
+import type { NormalizedAdapter, NormalizedAdapterRoute, AdapterIdHit, AdapterVerdict, AdapterRemoteVerdict } from './plugin-adapter-core.js'
+import { adapterPathMatches, classifyAdapterRequest, rewriteAdapterRequest, adapterOwnsRegistryEntry, MAX_ADAPTER_RESPONSE_BUFFER_BYTES, ADAPTER_RESPONSE_HEADER_ALLOWLIST, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
 
 /** Structural verdict of {@link checkWebServerShape}: the facts the wrap
  * reads per request — the `match` function the host's handle calls, the two
@@ -114,6 +114,13 @@ export interface InstallPluginRouteInterceptOptions {
    * Absent/empty — the pluggable default — means no adapter routes exist
    * and this interception behaves exactly as before. */
   adapters?: readonly NormalizedAdapter[]
+  /** The session id the browser is CURRENTLY looking at (T62's report,
+   * read live per call). A VIRTUAL id means a remote session's panel is
+   * the request's origin — the signal an adapter route's `deny` hook uses
+   * to refuse requests (like better-sidebar's `open.external`) that carry
+   * no session field of their own. Absent → deny hooks see `undefined`
+   * and judge conservatively. */
+  getCurrentSession?: () => string | undefined
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
 }
@@ -174,6 +181,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   }
   const { webServer, registry, relay, getServerId, getStatus, log } = options
   const adapters = options.adapters ?? []
+  const getCurrentSession = options.getCurrentSession
   const target = webServer as { match: (this: unknown, pathname: string) => unknown }
   const savedMatch = target.match
 
@@ -530,7 +538,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           return
         }
         if (replayBody !== undefined) {
-          const replay = new Transform()
+          const replay = new PassThrough()
           replay.end(replayBody)
           Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
           await originalHandler(replay as unknown as IncomingMessage, res)
@@ -561,6 +569,19 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const searchParams = url.searchParams
         const method = req.method ?? 'GET'
         const hasBody = method !== 'GET' && method !== 'HEAD'
+
+        // The route's deny hook runs BEFORE any id locating: a request the
+        // adapter refuses on path grounds (better-sidebar's open.external
+        // from a remote panel, the side-chat methods) answers here — these
+        // requests often carry NO session field, so the classify below
+        // would otherwise read them as local and let them through.
+        if (route.deny !== undefined) {
+          const denial = route.deny({ pathname, method, currentSessionId: getCurrentSession?.() })
+          if (denial !== undefined) {
+            answerUnbridged(res, plugin, denial)
+            return
+          }
+        }
 
         // A body-locating route buffers the request body up front (bounded
         // by the route's own maxBody — the cooperative 413 shape, answered
@@ -603,8 +624,18 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           }
         }
 
-        // The remote/local verdict on the ids as they arrived.
-        const verdict = classifyAdapterRequest(route, pathname, searchParams, bodyGiven ? parsedBody : undefined)
+        // The remote/local verdict on the ids as they arrived. A duplicated
+        // query id refuses rather than silently collapsing (PB-12 review).
+        let verdict: AdapterRemoteVerdict
+        try {
+          verdict = classifyAdapterRequest(route, pathname, searchParams, bodyGiven ? parsedBody : undefined)
+        } catch (error) {
+          if (error instanceof AdapterMultiValueQueryError) {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+          throw error
+        }
         if (verdict.kind === 'local') {
           await passthrough(bufferedBody)
           return
@@ -650,7 +681,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           const hookedBody = bodyGiven && rewrite.bodyText !== undefined ? JSON.parse(rewrite.bodyText) : bodyGiven ? parsedBody : undefined
           let hookVerdict: AdapterVerdict
           try {
-            hookVerdict = hook({ method, route, query: rewrite.query, body: hookedBody })
+            hookVerdict = hook({ method, pathname, route, query: rewrite.query, body: hookedBody })
           } catch {
             answerUnbridged(res, plugin, 'internal')
             return
@@ -718,6 +749,14 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const contentType = response.headers.get('content-type')
         const responseLength = response.headers.get('content-length')
         const cacheControl = response.headers.get('cache-control')
+        // The adapter header allowlist (PB-12): beyond the three cooperative
+        // headers, the answers adapters carry may need their own — the HTML
+        // preview's CSP sandbox, download dispositions, range headers. The
+        // plugin wrote them; the browser needs them.
+        const allowlistedHeaders = ADAPTER_RESPONSE_HEADER_ALLOWLIST.flatMap((name) => {
+          const value = response.headers.get(name)
+          return value !== null ? [{ [name]: value }] : []
+        })
         const responseHook = adapter.hooks.client?.response
         const rewriteCandidate = responseHook !== undefined && !route.stream && contentType !== null && contentType.includes('application/json')
         if (!rewriteCandidate) {
@@ -727,6 +766,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             ...(contentType !== null ? { 'content-type': contentType } : {}),
             ...(responseLength !== null ? { 'content-length': responseLength } : {}),
             ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+            ...Object.assign({}, ...allowlistedHeaders),
           })
           const reader = response.body?.getReader()
           if (reader !== undefined) {
@@ -774,6 +814,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             ...(contentType !== null ? { 'content-type': contentType } : {}),
             ...(responseLength !== null ? { 'content-length': responseLength } : {}),
             ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+            ...Object.assign({}, ...allowlistedHeaders),
           })
           for (const chunk of chunks) {
             if (!res.write(chunk)) {
@@ -811,6 +852,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         try {
           rewrittenBody = responseHook({
             status: response.status,
+            pathname,
             body: JSON.parse(text),
             virtualize: (id: string) => toVirtual(serverId ?? '', id),
             isVirtual: (value: unknown) => isVirtual(value),
@@ -821,6 +863,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           res.writeHead(response.status, {
             ...(contentType !== null ? { 'content-type': contentType } : {}),
             ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+            ...Object.assign({}, ...allowlistedHeaders),
             'content-length': String(passthroughBody.length),
           })
           res.end(passthroughBody)
@@ -831,6 +874,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         res.writeHead(response.status, {
           ...(contentType !== null ? { 'content-type': contentType } : {}),
           ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+          ...Object.assign({}, ...allowlistedHeaders),
           'content-length': String(outBody.length),
         })
         res.end(outBody)

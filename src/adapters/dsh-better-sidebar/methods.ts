@@ -1,0 +1,205 @@
+/**
+ * better-sidebar 0.25.0 的 `/sidebar/api` 方法表（PB-12）——适配器唯一
+ * 认识的接口清单，逐条对着 `/tmp/bs-versions/0.25.0/lib/index.js` 复核
+ * （行号见各条注释，以 0.25.0 的构建产物为准）。表里没有的方法在远程
+ * 会话里一律拒绝（reason `adapter-method-unknown`）：宁可少转发，不可
+ * 误转发——`test/adapter-better-sidebar.test.cjs` 会把源码里的实际方法
+ * 名集合提取出来与这张表逐一比对，防止插件升级后漏记。
+ *
+ * 会话字段：绝大多数方法在 JSON 体顶层带 `sessionId`（client.js 的
+ * scopePayload，lib/client.js:3866）；子代理与工作流面板带
+ * `rootSessionId`；sidechat 的后续调用带 `childId`（本单一律拒绝）。
+ *
+ * 响应里带会话 id 的位置（核实于 0.25.0 源码，全部只有三处）：
+ *  - `session.cwd` 把请求的 `sessionId` 原样回显（lib/index.js:6327）；
+ *  - `subagents.live` 的响应以会话 id 为键（lib/index.js:4513
+ *    `live[sessionId] = view`，根会话与全部子会话）；
+ *  - `workflows.list` 的每行 `originSessionId`（lib/index.js:4666）与
+ *    `phases[].members[].childId`（lib/index.js:4686）。
+ * `teams.taskCreate`/`taskUpdate` 的响应是 `{ok, value:<任务记录>}`
+ * （lib/index.js:4607-4612、4650-4655），任务记录不带会话 id；
+ * `changes.ops` 返回 `{events, lastSeq}`，事件属于该会话自身的流
+ * （tool/call、tool/result），对象上没有会话 id 字段；
+ * `archive.build` 返回 `{id, entries}`（lib/index.js:3470-3473）、
+ * `archive.status` 返回 `{state, done, total, bytes, error?}`
+ * （lib/index.js:3479-3485）——都不带会话 id。这四类不改写。
+ */
+
+/** 响应改写器的上下文（框架的 AdapterResponseContext 的结构性子集）。 */
+export interface SidebarRewriteContext {
+  virtualize(id: string): string
+  isVirtual(value: unknown): boolean
+}
+
+/** 一个 `/sidebar/api` 方法的处置。 */
+export interface SidebarMethodSpec {
+  /** 该方法在 JSON 体顶层的会话字段名（settings.* 无会话字段，缺省）。 */
+  sessionField?: 'sessionId' | 'rootSessionId' | 'childId'
+  /** 读还是写（写方法在远程会话里执行的是主服务端的磁盘与 git）。 */
+  kind: 'read' | 'write'
+  /** 无会话数据的方法（settings.*）：定位结果为空，天然留本机。 */
+  local?: true
+  /** 响应改写器：把响应里的真实会话 id 换回虚拟 id。 */
+  rewrite?: (body: unknown, ctx: SidebarRewriteContext) => unknown
+}
+
+/** 无改写的普通转发方法的简写工厂。 */
+const forward = (kind: 'read' | 'write', sessionField: 'sessionId' | 'rootSessionId' | 'childId' = 'sessionId'): SidebarMethodSpec => ({ kind, sessionField })
+
+/** 0.25.0 的全部方法。 */
+export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
+  // ---- 会话（lib/index.js:6319-6333）----
+  'session.phase': forward('read'),
+  'session.cwd': {
+    kind: 'read',
+    sessionField: 'sessionId',
+    // 请求的 sessionId 原样回显（lib/index.js:6327）。
+    rewrite: (body, ctx) => rewriteTopLevel(body, 'sessionId', ctx),
+  },
+
+  // ---- 文件（lib/index.js:6334-6442）----
+  'fs.tree': forward('read'),
+  'fs.trees': forward('read'),
+  'fs.search': forward('read'),
+  'fs.read': forward('read'),
+  'fs.write': forward('write'),
+  'fs.rename': forward('write'),
+  'fs.mkdir': forward('write'),
+  'fs.createFile': forward('write'),
+  'fs.remove': forward('write'),
+
+  // ---- git（lib/index.js:6443-6613）----
+  'git.worktrees': forward('read'),
+  'git.status': forward('read'),
+  'git.diff': forward('read'),
+  'git.diff-head': forward('read'),
+  'git.branch': forward('read'),
+  'git.log': forward('read'),
+  'git.commit-diff': forward('read'),
+  'git.show': forward('read'),
+  'git.blame': forward('read'),
+  'git.stage': forward('write'),
+  'git.unstage': forward('write'),
+  'git.commit': forward('write'),
+  'git.push': forward('write'),
+  'git.pull': forward('write'),
+  'git.checkout': forward('write'),
+  'git.discard': forward('write'),
+  'git.revert': forward('write'),
+  'git.cherry-pick': forward('write'),
+  // 提交信息生成：消耗主服务端的模型额度（产品决定：跟随会话，接）。
+  'git.suggest-message': forward('write'),
+  // 模型目录：sessionId 可选（lib/index.js:6573-6602、6614-6626）。
+  'git.commit-model': forward('read'),
+  'git.models': forward('read'),
+
+  // ---- 变更流（lib/index.js:6627-6649）----
+  // 事件对象属于该会话自身的流，不带会话 id —— 不改写。
+  'changes.ops': forward('read'),
+
+  // ---- 子代理 / 工作流 / 团队（lib/index.js:4482-4662、4770-4789）----
+  'subagents.live': {
+    kind: 'read',
+    sessionField: 'rootSessionId',
+    // 响应的 live 映射以会话 id 为键（lib/index.js:4513）。
+    rewrite: (body, ctx) => {
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) return body
+      const live = (body as Record<string, unknown>).live
+      if (live === null || typeof live !== 'object' || Array.isArray(live)) return body
+      const rewritten: Record<string, unknown> = {}
+      for (const [id, view] of Object.entries(live as Record<string, unknown>)) {
+        rewritten[ctx.isVirtual(id) ? id : ctx.virtualize(id)] = view
+      }
+      return { ...(body as Record<string, unknown>), live: rewritten }
+    },
+  },
+  'workflows.list': {
+    kind: 'read',
+    sessionField: 'rootSessionId',
+    // 每行的 originSessionId（4666）与 members[].childId（4686）。
+    rewrite: (body, ctx) => {
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) return body
+      const runs = (body as Record<string, unknown>).runs
+      if (!Array.isArray(runs)) return body
+      return {
+        ...(body as Record<string, unknown>),
+        runs: runs.map((run) => rewriteWorkflowRun(run, ctx)),
+      }
+    },
+  },
+  // 响应是 {ok, value:<任务记录>}，不带会话 id —— 不改写。
+  'teams.taskCreate': forward('write', 'rootSessionId'),
+  'teams.taskUpdate': forward('write', 'rootSessionId'),
+
+  // ---- 归档（lib/index.js:6663-6686；响应不带会话 id）----
+  'archive.build': forward('write'),
+  'archive.status': forward('read'),
+
+  // ---- 设置（lib/index.js:6666-6682）----
+  // 无会话字段：定位结果为空，远程判定天然放行本机 —— 表里登记只为
+  // 文档完整与「未知方法」比对（真实存在，只是不转发）。
+  'settings.get': { kind: 'read', local: true },
+  'settings.update': { kind: 'write', local: true },
+
+  // ---- 外部打开（lib/index.js:6683-6687）----
+  // 在宿主机起进程：远程会话拒绝（适配器路由的 deny 钩子按「浏览器当前
+  // 会话是虚拟 id」拒绝；这里登记是让方法比对认识它）。请求体不带会话
+  // 字段（client.js:9383-9392 只发 action/path/url）。
+  'open.external': { kind: 'write', sessionField: 'sessionId' },
+
+  // ---- 侧聊（lib/index.js:4971-5140，buildSidechatApi）----
+  // PB-13 再定：本单一律拒绝（适配器路由的 deny 钩子）。
+  'sidechat.start': forward('write'),
+  'sidechat.prompt': forward('write', 'childId'),
+  'sidechat.cancel': forward('write', 'childId'),
+  'sidechat.dispose': forward('write', 'childId'),
+  'sidechat.info': forward('read', 'childId'),
+  'sidechat.events': forward('read', 'childId'),
+}
+
+/** `/sidebar/api` 的路径前缀（方法名跟在后面，lib/index.js:6888）。 */
+export const SIDEBAR_API_PREFIX = '/sidebar/api/'
+
+/** 从请求 pathname 取出 API 方法名（`/sidebar/api/fs.tree` → `fs.tree`）。 */
+export function sidebarMethodNameOf(pathname: string): string | undefined {
+  if (!pathname.startsWith(SIDEBAR_API_PREFIX)) return undefined
+  const name = pathname.slice(SIDEBAR_API_PREFIX.length)
+  if (name === '' || name.includes('/')) return undefined
+  return name
+}
+
+/** 顶层字段的虚拟化改写（session.cwd 的形状）。 */
+function rewriteTopLevel(body: unknown, field: string, ctx: SidebarRewriteContext): unknown {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return body
+  const record = body as Record<string, unknown>
+  const value = record[field]
+  if (typeof value !== 'string' || value === '' || ctx.isVirtual(value)) return body
+  return { ...record, [field]: ctx.virtualize(value) }
+}
+
+/** 一行工作流运行的改写（originSessionId + phases[].members[].childId）。 */
+function rewriteWorkflowRun(run: unknown, ctx: SidebarRewriteContext): unknown {
+  if (run === null || typeof run !== 'object' || Array.isArray(run)) return run
+  const record = run as Record<string, unknown>
+  const rewritten: Record<string, unknown> = { ...record }
+  const origin = record.originSessionId
+  if (typeof origin === 'string' && origin !== '' && !ctx.isVirtual(origin)) rewritten.originSessionId = ctx.virtualize(origin)
+  if (Array.isArray(record.phases)) {
+    rewritten.phases = record.phases.map((phase) => {
+      if (phase === null || typeof phase !== 'object' || Array.isArray(phase)) return phase
+      const phaseRecord = phase as Record<string, unknown>
+      if (!Array.isArray(phaseRecord.members)) return phase
+      return {
+        ...phaseRecord,
+        members: phaseRecord.members.map((member) => {
+          if (member === null || typeof member !== 'object' || Array.isArray(member)) return member
+          const memberRecord = member as Record<string, unknown>
+          const childId = memberRecord.childId
+          if (typeof childId !== 'string' || childId === '' || ctx.isVirtual(childId)) return member
+          return { ...memberRecord, childId: ctx.virtualize(childId) }
+        }),
+      }
+    })
+  }
+  return rewritten
+}

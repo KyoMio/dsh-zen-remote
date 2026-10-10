@@ -49,7 +49,7 @@ import { createPluginTunnel, validatePluginCall, type PluginTunnelRoutes } from 
 import type { PluginLoopback } from './plugin-loopback.js'
 import { isLoopbackAuthError } from './plugin-loopback.js'
 import type { NormalizedAdapter, AdapterVerdict } from './plugin-adapter-core.js'
-import { matchAdapterRoute, locateAdapterIds, adapterOwnsRegistryEntry } from './plugin-adapter-core.js'
+import { matchAdapterRoute, locateAdapterIds, adapterOwnsRegistryEntry, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
 
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
@@ -1546,6 +1546,8 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           }
           pluginsByDevice.set(adapterDevice, (pluginsByDevice.get(adapterDevice) ?? 0) + 1)
           let adapterGone = false
+          let multiValueRefusal = false
+          let adapterQueryOverride: string | undefined
           const adapterHangUp = new AbortController()
           const onAdapterGone = (): void => {
             adapterGone = true
@@ -1557,7 +1559,8 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             // Locate ONCE, over the same routing rule the sub-client used:
             // the query parses once, the path segments decode off the
             // rewritten pathname, and a body-locating route buffers its
-            // (bounded) JSON body.
+            // (bounded) JSON body. A duplicated query id throws — the
+            // cooperative shape violation (PB-12 review).
             const adapterSearch = new URLSearchParams(rawQuery)
             let parsedBody: unknown
             let bodyGiven = false
@@ -1590,7 +1593,21 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                 }
               }
             }
-            const hits = locateAdapterIds(adapterRoute, routePath, adapterSearch, bodyGiven ? parsedBody : undefined)
+            const hits = (() => {
+              try {
+                return locateAdapterIds(adapterRoute, routePath, adapterSearch, bodyGiven ? parsedBody : undefined)
+              } catch (error) {
+                if (error instanceof AdapterMultiValueQueryError) {
+                  multiValueRefusal = true
+                  return []
+                }
+                throw error
+              }
+            })()
+            if (multiValueRefusal) {
+              relayPluginError(res, 400, 'bad-query')
+              return
+            }
             // The sub-client only forwards a classified-remote request, so
             // an adapter request that locates NOTHING is malformed here.
             if (hits.length === 0) {
@@ -1613,7 +1630,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             if (serverHook !== undefined) {
               let verdict: AdapterVerdict
               try {
-                verdict = serverHook({ method: pluginMethod, route: adapterRoute, query: adapterSearch, body: bodyGiven ? parsedBody : undefined })
+                verdict = serverHook({ method: pluginMethod, pathname: routePath, route: adapterRoute, query: adapterSearch, body: bodyGiven ? parsedBody : undefined })
               } catch {
                 relayPluginError(res, 403, 'internal')
                 return
@@ -1625,6 +1642,10 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               if (bodyGiven && verdict.body !== undefined) {
                 loopbackBody = Buffer.from(JSON.stringify(verdict.body), 'utf8')
               }
+              // A hook may also rewrite the query (the file/upload routes'
+              // `cwd` strip rides this) — the loopback then sends the
+              // hook's serialization instead of the verbatim rawQuery.
+              adapterQueryOverride = verdict.query !== undefined ? verdict.query.toString() : undefined
             }
             // The loopback body: a body-locating route sends its (possibly
             // hook-rewritten) buffer; any other body rides the cooperative
@@ -1655,10 +1676,20 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               req.pipe(gate)
               adapterBodyStream = gate
             }
+            // The loopback: the coordinates travel VERBATIM, on purpose —
+            // the sub-client has already rewritten every located virtual id
+            // to its real half (query re-serialized, path segment
+            // re-encoded, JSON body re-serialized), so what the server
+            // validated (the share check below ran over the SAME locate)
+            // is byte-for-byte what the local plugin will see. Re-locating
+            // here would only risk divergence. The ONE exception is an
+            // explicit hook verdict (`query` above): the better-sidebar
+            // adapter strips the file/upload routes' `cwd` so the backend
+            // resolves it from the session.
             const outbound = await bridge.loopback.request(
               pluginMethod,
               routePath,
-              rawQuery,
+              adapterQueryOverride ?? rawQuery,
               {
                 ...(adapterAccept !== undefined ? { accept: adapterAccept } : {}),
                 ...(adapterRange !== undefined ? { range: adapterRange } : {}),
@@ -1672,10 +1703,14 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               void drainUpload(req, 0, drainDeadlineMs)
               return
             }
+            // The adapter header allowlist (PB-12): the HTML preview's CSP
+            // sandbox and download dispositions ride through to the phone.
+            // The loopback collected them into `extraHeaders`.
             res.writeHead(outbound.status, {
               ...(outbound.contentType !== undefined ? { 'Content-Type': outbound.contentType } : {}),
               ...(outbound.contentLength !== undefined ? { 'Content-Length': outbound.contentLength } : {}),
               ...(outbound.cacheControl !== undefined ? { 'Cache-Control': outbound.cacheControl } : {}),
+              ...outbound.extraHeaders,
             })
             await new Promise<void>((resolve, reject) => {
               const upstream = outbound.stream
