@@ -23,6 +23,8 @@
  * `archive.build` 返回 `{id, entries}`（lib/index.js:3470-3473）、
  * `archive.status` 返回 `{state, done, total, bytes, error?}`
  * （lib/index.js:3479-3485）——都不带会话 id。这四类不改写。
+ * `sidechat.start` 返回 `{childId}`（lib/index.js:5050）——PB-13 起
+ * 虚拟化（子客户端拿它发后续调用）。
  */
 
 /** 响应改写器的上下文（框架的 AdapterResponseContext 的结构性子集）。 */
@@ -148,8 +150,16 @@ export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
   'open.external': { kind: 'write', sessionField: 'sessionId' },
 
   // ---- 侧聊（lib/index.js:4971-5140，buildSidechatApi）----
-  // PB-13 再定：本单一律拒绝（适配器路由的 deny 钩子）。
-  'sidechat.start': forward('write'),
+  // PB-13 起转发：sidechat 的子会话带 `meta.parentSession = 调用会话 id`
+  // （lib/index.js:5012），zen-remote 的共享按祖先链判定，所以侧聊线程
+  // 自动继承父会话的共享——闭环是 start 的响应 childId 换成虚拟 id，
+  // 浏览器拿它发后续调用时经体定位回本适配器，服务端按继承校验放行。
+  'sidechat.start': {
+    kind: 'write',
+    sessionField: 'sessionId',
+    // 响应 `{ childId }`（lib/index.js:5050）——服务端真实 id 换虚拟。
+    rewrite: (body, ctx) => rewriteTopLevel(body, 'childId', ctx),
+  },
   'sidechat.prompt': forward('write', 'childId'),
   'sidechat.cancel': forward('write', 'childId'),
   'sidechat.dispose': forward('write', 'childId'),

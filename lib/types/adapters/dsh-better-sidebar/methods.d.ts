@@ -23,6 +23,8 @@
  * `archive.build` 返回 `{id, entries}`（lib/index.js:3470-3473）、
  * `archive.status` 返回 `{state, done, total, bytes, error?}`
  * （lib/index.js:3479-3485）——都不带会话 id。这四类不改写。
+ * `sidechat.start` 返回 `{childId}`（lib/index.js:5050）——PB-13 起
+ * 虚拟化（子客户端拿它发后续调用）。
  */
 /** 响应改写器的上下文（框架的 AdapterResponseContext 的结构性子集）。 */
 export interface SidebarRewriteContext {

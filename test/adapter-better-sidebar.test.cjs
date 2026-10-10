@@ -17,11 +17,18 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
+const os = require('node:os')
 const http = require('node:http')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 
 const PLUGIN_SOURCE = '/tmp/bs-versions/0.25.0/lib/index.js'
+
+/** Scratch space for the server-side share store — OUTSIDE the repository
+ * (a store file in the repo root once landed in the commit staging by
+ * accident; PB-13 fix). */
+const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-bs-'))
+process.on('exit', () => { try { fs.rmSync(TMP_ROOT, { recursive: true, force: true }) } catch { /* best effort */ } })
 
 const importLib = async (name) => import(pathToFileURL(path.join(__dirname, '..', 'lib', name)).href)
 
@@ -70,7 +77,7 @@ async function loadAdapter() {
 }
 
 function startFakeHost() {
-  const hits = { local: 0 }
+  const hits = { local: 0, localWs: 0 }
   let raw
   const server = http.createServer((req, res) => {
     Promise.resolve(raw.match(new URL(req.url ?? '/', 'http://x').pathname)).then(async (route) => {
@@ -81,6 +88,22 @@ function startFakeHost() {
       res.writeHead(404)
       res.end()
     }).catch(() => { try { res.destroy() } catch { /* gone */ } })
+  })
+  // Without an 'upgrade' listener node destroys every upgrading socket —
+  // the fake host dispatches them through the raw table (the interceptor
+  // shadows `upgrades.get`). Upgraded sockets also ESCAPE
+  // closeAllConnections (the PB-10 finding), so they are tracked and
+  // destroyed at teardown by hand.
+  const upgradeSockets = new Set()
+  server.on('upgrade', (req, socket, head) => {
+    upgradeSockets.add(socket)
+    socket.on('close', () => upgradeSockets.delete(socket))
+    const route = raw.upgrades.get(new URL(req.url ?? '/', 'http://x').pathname)
+    if (route !== undefined) {
+      route.handler(req, socket, head)
+      return
+    }
+    socket.destroy()
   })
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
@@ -116,10 +139,29 @@ function startFakeHost() {
           res.end('/* bundle */')
         },
       })
+      // The LOCAL WS endpoint the adapter's upgrade routes shadow: a LOCAL
+      // session's upgrade must land HERE, never in the tunnel (the PB-13
+      // fix's direct assertion). The accept is computed for real — undici
+      // validates it and fails the connection otherwise.
+      raw.upgrades.set('/sidebar/ws/fs-watch', {
+        path: '/sidebar/ws/fs-watch',
+        handler: (req, socket) => {
+          hits.localWs += 1
+          const key = req.headers['sec-websocket-key']
+          const accept = key === undefined
+            ? 'invalid'
+            : require('node:crypto').createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+          socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+        },
+      })
       resolve({
         raw, hits, port,
         get: (pathWithQuery, init = {}) => fetch(`http://127.0.0.1:${port}${pathWithQuery}`, init),
-        stop: () => new Promise((done) => { server.closeAllConnections(); server.close(done) }),
+        stop: () => new Promise((done) => {
+          for (const socket of upgradeSockets) socket.destroy()
+          server.closeAllConnections()
+          server.close(done)
+        }),
       })
     })
   })
@@ -165,7 +207,7 @@ async function installedIntercept(host, relay, adapter, { currentSession } = {})
 
 // ---- 2. the client half --------------------------------------------------------
 
-test('PB-12 client: a read and a write forward with real ids; settings stays local; sidechat and open.external refuse', async () => {
+test('PB-12 client: a read and a write forward with real ids; settings stays local; open.external refuses for a remote panel', async () => {
   const host = await startFakeHost()
   const relay = fakeRelayClient()
   const { adapter } = await loadAdapter()
@@ -208,14 +250,18 @@ test('PB-12 client: a read and a write forward with real ids; settings stays loc
     assert.equal(host.hits.local, 1)
     assert.equal(relay.forwarded.length, 3, 'settings never left the machine')
 
-    // sidechat refuses (deny hook — wholesale, remote or local).
-    const sidechat = await host.get('/sidebar/api/sidechat.start', {
+    // sidechat.start FORWARDS now (PB-13): the child session inherits the
+    // parent's share via meta.parentSession, so it crosses like everything
+    // else — and its answer's childId comes back virtual (asserted in the
+    // closed-loop test below).
+    await host.get('/sidebar/api/sidechat.start', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: virtual('session-a'), question: 'hi' }),
     })
-    assert.equal(sidechat.status, 503)
-    assert.equal((await sidechat.json()).error.reason, 'adapter-sidechat-pending')
-    assert.equal(host.hits.local, 1)
+    assert.equal(relay.forwarded.length, 4)
+    assert.equal(relay.forwarded[3].path, '/sidebar/api/sidechat.start')
+    assert.equal(JSON.parse(relay.forwarded[3].body).sessionId, 'session-a')
+    assert.equal(host.hits.local, 1, 'sidechat no longer falls to the local plugin')
 
     // open.external refuses when the CURRENT session is remote (deny hook).
     const openRemote = await host.get('/sidebar/api/open.external', {
@@ -235,6 +281,33 @@ test('PB-12 client: a read and a write forward with real ids; settings stays loc
     })
     assert.deepEqual(await openLocal.json(), { ok: true, value: { local: true } })
     assert.equal(host.hits.local, 2, 'the local open.external reached the local plugin')
+
+    // A LOCAL session's sidechat.start stays local too (PB-13 fix's direct
+    // assertion): the plain id locates to nothing remote, the local
+    // handler answers, the relay sees nothing.
+    const forwardedBeforeLocalSidechat = relay.forwarded.length
+    const localSidechat = await host.get('/sidebar/api/sidechat.start', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'session-local', question: 'hi' }),
+    })
+    assert.deepEqual(await localSidechat.json(), { ok: true, value: { local: true } })
+    assert.equal(host.hits.local, 3, 'the local sidechat reached the local plugin')
+    assert.equal(relay.forwarded.length, forwardedBeforeLocalSidechat, 'the local sidechat never left the machine')
+
+    // A LOCAL session's WebSocket lands on the LOCAL upgrade handler —
+    // the tunnel never opens (PB-13 fix's direct assertion).
+    const forwardedBefore = relay.forwarded.length
+    const localWs = new WebSocket(`ws://127.0.0.1:${host.port}/sidebar/ws/fs-watch?sessionId=session-local`)
+    const wsOutcome = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), 3000)
+      localWs.addEventListener('open', () => { clearTimeout(timer); resolve('open') })
+      localWs.addEventListener('error', () => { clearTimeout(timer); resolve('error') })
+    })
+    assert.equal(wsOutcome, 'open', 'the local upgrade answered 101 from the LOCAL handler')
+    assert.equal(host.hits.localWs, 1, 'the LOCAL upgrade handler ran')
+    localWs.close()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.equal(relay.forwarded.length, forwardedBefore, 'no tunnel ever opened for the local session')
     localHandle.uninstall()
   } finally {
     handle.uninstall()
@@ -349,10 +422,10 @@ test('PB-12 client: the three response rewrites — session.cwd, subagents.live 
 
 // ---- 3. the server half --------------------------------------------------------
 
-async function startServerSide({ consent = true, loopbackHits, loopbackHeaders }) {
+async function startServerSide({ consent = true, loopbackHits, loopbackHeaders, parentOf } = {}) {
   const relayServerMod = await importLib('relay-server.js')
   const shareStoreMod = await importLib('share-store.js')
-  const store = shareStoreMod.createShareStore({ file: path.join(__dirname, '..', '.tmp-bs-server.json'), idleHours: 48 })
+  const store = shareStoreMod.createShareStore({ file: path.join(TMP_ROOT, `srv-${Math.random().toString(36).slice(2)}.json`), idleHours: 48 })
   store.share('session-a')
   const loopback = {
     cookieHeader: async () => 'dsh-auth=t',
@@ -384,6 +457,9 @@ async function startServerSide({ consent = true, loopbackHits, loopbackHeaders }
   const handler = relayServerMod.createRelayHandler({
     secret: 's'.repeat(64),
     store,
+    // The ancestor walk (PB-13): a sidechat child inherits its parent's
+    // share through this chain.
+    ...(parentOf !== undefined ? { parentOf } : {}),
     gateway: { invoke: async () => { throw new Error('no') }, stream: async () => { throw new Error('no') } },
     pluginBridge: {
       registry,
@@ -449,7 +525,6 @@ test('PB-12 server: the cwd is stripped from the api body AND the file/upload qu
     assert.equal(loopbackHits[2].query.includes('cwd='), false)
   } finally {
     await server.stop()
-    try { fs.unlinkSync(path.join(__dirname, '..', '.tmp-bs-server.json')) } catch { /* gone */ }
   }
 })
 
@@ -460,4 +535,80 @@ test('PB-12: the adapter upload cap equals the relay upload budget', async () =>
   assert.equal(upload.maxBody, relayServerMod.MAX_UPLOAD_BYTES, 'the two numbers move together')
   const api = adapter.routes.find((route) => route.path === '/sidebar/api')
   assert.equal(api.maxBody, 1024 * 1024, 'the api body cap is the plugin\u2019s own 1 MiB')
+})
+
+// ---- PB-13: the two WebSockets and the sidechat loop ---------------------------
+
+test('PB-13: both WS routes are in the declaration table as upgrades; the tunnel opens through the adapter registration', async () => {
+  const { adapter } = await loadAdapter()
+  for (const path of ['/sidebar/ws/agent-opens', '/sidebar/ws/fs-watch']) {
+    const route = adapter.routes.find((entry) => entry.path === path)
+    assert.ok(route !== undefined, `${path} is declared`)
+    assert.equal(route.upgrade, true, `${path} is an upgrade route`)
+    assert.equal(route.match, 'exact')
+    assert.deepEqual(route.methods, ['GET'])
+    assert.equal(route.locator.in, 'query')
+    assert.equal(route.locator.name, 'sessionId')
+    // The registry entry carries it too — that is what the tunnel's
+    // validation chain (and the handshake table) reads.
+    const declared = adapter.declaration.routes.find((entry) => entry.path === path)
+    assert.ok(declared !== undefined, `${path} reached the registry`)
+    assert.equal(declared.upgrade, true)
+  }
+})
+
+test('PB-13 sidechat loop: start forwards and virtualizes the childId; prompt takes the virtual id back to the REAL one; the server admits it through the ancestor chain', async () => {
+  // ---- the CLIENT half: start's answer childId comes back VIRTUAL, and a
+  // prompt carrying that virtual id forwards as the REAL child id.
+  const host = await startFakeHost()
+  const relay = fakeRelayClient()
+  const { adapter } = await loadAdapter()
+  const handle = await installedIntercept(host, relay, adapter)
+  relay.answer('/sidebar/api/sidechat.start', {
+    status: 200, headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ childId: 'session-child-1' }),
+  })
+  try {
+    const start = await host.get('/sidebar/api/sidechat.start', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: virtual('session-a'), question: 'what changed?' }),
+    })
+    assert.deepEqual(await start.json(), { childId: virtual('session-child-1') }, 'the REAL child id came back VIRTUAL')
+
+    await host.get('/sidebar/api/sidechat.prompt', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ childId: virtual('session-child-1'), text: 'the diff please' }),
+    })
+    assert.equal(relay.forwarded.length, 2)
+    assert.equal(JSON.parse(relay.forwarded[1].body).childId, 'session-child-1', 'the prompt forwarded with the REAL child id')
+  } finally {
+    handle.uninstall()
+    await host.stop()
+  }
+
+  // ---- the SERVER half: the SAME virtual-id-shaped flow arrives with the
+  // real child id, and the ancestor chain admits it (session-child-1's
+  // parent is the shared session-a). An unshared orphan refuses.
+  const loopbackHits = []
+  const server = await startServerSide({
+    loopbackHits,
+    parentOf: (sessionId) => (sessionId === 'session-child-1' ? 'session-a' : undefined),
+  })
+  try {
+    const prompt = await server.pluginPost('/sidebar/api/sidechat.prompt', '', {
+      body: JSON.stringify({ childId: 'session-child-1', text: 'the diff please' }),
+    })
+    assert.equal(prompt.status, 200, 'the inherited child is admitted')
+    assert.equal(loopbackHits.length, 1)
+    assert.equal(JSON.parse(loopbackHits[0].body).childId, 'session-child-1')
+
+    const stranger = await server.pluginPost('/sidebar/api/sidechat.prompt', '', {
+      body: JSON.stringify({ childId: 'session-stranger', text: 'hello?' }),
+    })
+    assert.equal(stranger.status, 403)
+    assert.equal((await stranger.json()).error.code, 'not-shared')
+    assert.equal(loopbackHits.length, 1, 'the stranger never reached the loopback')
+  } finally {
+    await server.stop()
+  }
 })
