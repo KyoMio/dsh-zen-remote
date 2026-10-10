@@ -49,8 +49,15 @@ test('PB-11 core: the locator verdicts — remote, local, mixed, none', async ()
   assert.equal(core.classifyAdapterRequest(route, '/some-panel/data', q('other=1'), undefined).kind, 'local')
   // located but plain → local
   assert.equal(core.classifyAdapterRequest(route, '/some-panel/data', q('sid=session-local'), undefined).kind, 'local')
-  // a mix → malformed for the bridge
-  assert.equal(core.classifyAdapterRequest(route, '/some-panel/data', q(`sid=${virtual('a')}&sid=session-local`), undefined).kind, 'mixed')
+  // a DUPLICATED parameter refuses outright (PB-12 review: never collapse)
+  assert.throws(() => core.classifyAdapterRequest(route, '/some-panel/data', q(`sid=${virtual('a')}&sid=${virtual('b')}`), undefined), core.AdapterMultiValueQueryError)
+  assert.throws(() => core.classifyAdapterRequest(route, '/some-panel/data', q('sid=a&sid=b'), undefined), core.AdapterMultiValueQueryError)
+  // a MIX across distinct fields (json-body) → malformed for the bridge
+  const mixedBodyRoute = core.normalizeAdapter(
+    { plugin: 'some-panel', versions: ['1.2.3'], routes: [{ path: '/some-panel/mix', match: 'exact', locator: { in: 'json-body', fields: ['sessionId', 'sourceId'] } }] },
+    '1.2.3',
+  ).routes[0]
+  assert.equal(core.classifyAdapterRequest(mixedBodyRoute, '/some-panel/mix', new URLSearchParams(), { sessionId: virtual('a'), sourceId: 'plain' }).kind, 'mixed')
 
   const prefixRoute = core.normalizeAdapter(
     { plugin: 'some-panel', versions: ['1.2.3'], routes: [{ path: '/some-panel/api', match: 'prefix', locator: { in: 'path-segment', index: 1 } }] },

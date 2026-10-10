@@ -94,6 +94,13 @@ export interface InstallPluginRouteInterceptOptions {
      * Absent/empty — the pluggable default — means no adapter routes exist
      * and this interception behaves exactly as before. */
     adapters?: readonly NormalizedAdapter[];
+    /** The session id the browser is CURRENTLY looking at (T62's report,
+     * read live per call). A VIRTUAL id means a remote session's panel is
+     * the request's origin — the signal an adapter route's `deny` hook uses
+     * to refuse requests (like better-sidebar's `open.external`) that carry
+     * no session field of their own. Absent → deny hooks see `undefined`
+     * and judge conservatively. */
+    getCurrentSession?: () => string | undefined;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
 }

@@ -35,6 +35,17 @@
 import http from 'node:http'
 import https from 'node:https'
 import type { IncomingMessage } from 'node:http'
+import { ADAPTER_RESPONSE_HEADER_ALLOWLIST } from './plugin-adapter-core.js'
+
+/** The adapter allowlist's headers off one loopback answer, verbatim. */
+function extraAdapterHeadersOf(response: IncomingMessage): Record<string, string> {
+  const extra: Record<string, string> = {}
+  for (const name of ADAPTER_RESPONSE_HEADER_ALLOWLIST) {
+    const value = response.headers[name]
+    if (typeof value === 'string' && value !== '') extra[name] = value
+  }
+  return extra
+}
 
 /** The loopback bind info, re-read live per request by the wiring. */
 export interface PluginLoopbackTarget {
@@ -52,12 +63,17 @@ export interface PluginLoopbackHeaders {
 
 /** The plugin route's answer, headers whitelisted to what the relay may
  * forward. `stream` is the RAW IncomingMessage: the caller reads it (and
- * only it) — the module has already drained every other outcome. */
+ * only it) — the module has already drained every other outcome.
+ * `extraHeaders` (PB-12) carries the ADAPTER allowlist — the headers an
+ * adapter's answer may hand the browser verbatim (the HTML preview's CSP
+ * sandbox, download dispositions, range headers); the cooperative relay
+ * branch ignores it. */
 export interface PluginLoopbackResponse {
   status: number
   contentType: string | undefined
   contentLength: string | undefined
   cacheControl: string | undefined
+  extraHeaders: Record<string, string>
   stream: IncomingMessage
 }
 
@@ -269,6 +285,11 @@ export function createPluginLoopback(options: CreatePluginLoopbackOptions): Plug
         contentType: typeof response.headers['content-type'] === 'string' ? response.headers['content-type'] : undefined,
         contentLength: typeof response.headers['content-length'] === 'string' ? response.headers['content-length'] : undefined,
         cacheControl: typeof response.headers['cache-control'] === 'string' ? response.headers['cache-control'] : undefined,
+        // PB-12: the adapter allowlist — the HTML preview's CSP sandbox, a
+        // download's content-disposition, range headers. Collected here so
+        // the adapter forwards can hand them to the browser; the relay's
+        // cooperative branch ignores the field.
+        extraHeaders: extraAdapterHeadersOf(response),
         stream: response,
       }
     },

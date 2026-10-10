@@ -46,12 +46,17 @@ export interface PluginLoopbackHeaders {
 }
 /** The plugin route's answer, headers whitelisted to what the relay may
  * forward. `stream` is the RAW IncomingMessage: the caller reads it (and
- * only it) — the module has already drained every other outcome. */
+ * only it) — the module has already drained every other outcome.
+ * `extraHeaders` (PB-12) carries the ADAPTER allowlist — the headers an
+ * adapter's answer may hand the browser verbatim (the HTML preview's CSP
+ * sandbox, download dispositions, range headers); the cooperative relay
+ * branch ignores it. */
 export interface PluginLoopbackResponse {
     status: number;
     contentType: string | undefined;
     contentLength: string | undefined;
     cacheControl: string | undefined;
+    extraHeaders: Record<string, string>;
     stream: IncomingMessage;
 }
 /** The one failure the relay maps onto 502 `loopback-auth`: the cookie

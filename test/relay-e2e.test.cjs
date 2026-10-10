@@ -2476,3 +2476,187 @@ test('e2e PB-11: a fake adapter forwards a JSON-body request for a remote sessio
     await dshStop()
   }
 })
+
+// ---- PB-12: the better-sidebar adapter crosses the whole chain -----------------
+
+test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html preview across the full chain; a drifted version never bridges', async () => {
+  // The fake DSH: better-sidebar's real route shapes (the /sidebar/api
+  // dispatcher, the file media route, the html preview with its CSP).
+  const dshHits = []
+  const fakeDsh = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://x')
+    if (url.pathname === '/') {
+      res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+      res.end()
+      return
+    }
+    if (url.pathname === '/sidebar/api/git.status') {
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        dshHits.push({ path: url.pathname, body })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ branch: 'main', sessionId: body.sessionId ?? null }))
+      })
+      return
+    }
+    if (url.pathname === '/sidebar/api/git.commit') {
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        dshHits.push({ path: url.pathname, body })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, cwdSeen: body.cwd ?? null }))
+      })
+      return
+    }
+    if (url.pathname.startsWith('/sidebar/html/')) {
+      const segments = url.pathname.slice('/sidebar/html/'.length).split('/').map((s) => decodeURIComponent(s))
+      dshHits.push({ path: url.pathname, sessionId: segments[0] })
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-security-policy': 'sandbox allow-scripts allow-popups allow-downloads allow-modals; object-src \'none\'',
+      })
+      res.end('<html><body>preview</body></html>')
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+  await new Promise((resolve) => fakeDsh.listen(0, '127.0.0.1', resolve))
+  const dshPort = fakeDsh.address().port
+  const dshStop = () => new Promise((done) => { fakeDsh.closeAllConnections(); fakeDsh.close(done) })
+
+  const ADAPTER_INPUT = {
+    plugin: 'dsh-better-sidebar', versions: ['0.25.0'],
+    routes: [
+      { path: '/sidebar/api', match: 'prefix', methods: ['POST'], maxBody: 1024 * 1024, locator: { in: 'json-body', fields: ['sessionId', 'rootSessionId', 'childId'] } },
+      { path: '/sidebar/file', match: 'exact', methods: ['GET'], locator: { in: 'query', name: 'sessionId' } },
+      { path: '/sidebar/html', match: 'prefix', methods: ['GET'], locator: { in: 'path-segment', index: 0 } },
+      { path: '/sidebar/bundle', match: 'prefix', methods: ['GET'], locator: { in: 'query', name: 'sessionId' }, local: true },
+    ],
+    server: {
+      request: (ctx) => {
+        if (ctx.body !== null && typeof ctx.body === 'object' && 'cwd' in ctx.body) {
+          const stripped = { ...ctx.body }
+          delete stripped.cwd
+          return { allow: true, body: stripped }
+        }
+        return { allow: true }
+      },
+    },
+    client: {
+      response: (ctx) => {
+        if (ctx.pathname === '/sidebar/api/git.status' && ctx.body !== null && typeof ctx.body === 'object' && typeof ctx.body.sessionId === 'string') {
+          return { ...ctx.body, sessionId: ctx.virtualize(ctx.body.sessionId) }
+        }
+        return ctx.body
+      },
+    },
+  }
+  const adapter = normalizeAdapter(ADAPTER_INPUT, '0.25.0')
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => ({ 'dsh-better-sidebar': { version: '0.25.0', digest: adapter.digest, serverScopeConsent: true } }),
+    pluginBridge: {
+      registry: (() => { const r = createBridgeRegistry(); r.registerNormalized(adapter.declaration); return r })(),
+      getConsent: () => ({ 'dsh-better-sidebar': true }),
+      loopback: createPluginLoopback({
+        getTarget: () => ({ protocol: 'http:', port: dshPort }),
+        getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+      }),
+      adapters: [adapter],
+    },
+  })
+
+  const hostRaw = {
+    exact: new Map(), prefixes: new Map(), upgrades: new Map(),
+    match(pathname) {
+      const exact = this.exact.get(pathname)
+      if (exact !== undefined) return exact
+      for (const [, route] of this.prefixes) {
+        if (pathname === route.path || pathname.startsWith(`${route.path}/`)) return route
+      }
+      return undefined
+    },
+    register(route) { (route.kind === 'exact' ? this.exact : this.prefixes).set(route.path, route); return () => undefined },
+  }
+  const subServer = http.createServer((req, res) => {
+    Promise.resolve(hostRaw.match(new URL(req.url ?? '/', 'http://x').pathname)).then(async (route) => {
+      if (route !== undefined) {
+        await route.handler(req, res)
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    }).catch(() => { try { res.destroy() } catch { /* gone */ } })
+  })
+  await new Promise((resolve) => subServer.listen(0, '127.0.0.1', resolve))
+  const subPort = subServer.address().port
+  const subStop = () => new Promise((done) => { subServer.closeAllConnections(); subServer.close(done) })
+
+  const localRegistry = createBridgeRegistry()
+  localRegistry.registerNormalized(adapter.declaration)
+  const handle = installPluginRouteIntercept({
+    webServer: hostRaw,
+    registry: localRegistry,
+    relay: env.client,
+    getServerId: () => env.client.handshakeInfo?.serverId,
+    getStatus: () => compareBridges(localRegistry.list(), env.client.handshakeInfo?.plugins, env.client.state === 'online'),
+    adapters: [adapter],
+    log: () => {},
+  })
+
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const virtual = toVirtual(info.serverId, 'session-a')
+
+    // READ: git.status forwards and the answer's id comes back virtual.
+    const read = await fetch(`http://127.0.0.1:${subPort}/sidebar/api/git.status`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: virtual }),
+    })
+    assert.equal(read.status, 200, await read.clone().text())
+    const readBody = await read.json()
+    assert.equal(readBody.sessionId, virtual, 'the answer id came back VIRTUAL')
+    assert.equal(dshHits[0].body.sessionId, 'session-a', 'the fake plugin saw the REAL id')
+
+    // WRITE: git.commit forwards, and the client cwd is stripped server-side.
+    const write = await fetch(`http://127.0.0.1:${subPort}/sidebar/api/git.commit`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: virtual, message: 'ship it', cwd: '/home/me/leaked' }),
+    })
+    assert.equal(write.status, 200)
+    assert.equal(dshHits[1].body.cwd, undefined, 'the server hook stripped the cwd before the loopback')
+    assert.equal(dshHits[1].body.message, 'ship it')
+
+    // HTML: the segment id rewrites, and the CSP header survives the hop.
+    const html = await fetch(`http://127.0.0.1:${subPort}/sidebar/html/${encodeURIComponent(virtual)}/index.html`)
+    assert.equal(html.status, 200)
+    assert.match(html.headers.get('content-security-policy') ?? '', /sandbox allow-scripts/, 'the CSP sandbox travelled')
+    assert.equal((await html.text()).includes('preview'), true)
+    assert.equal(dshHits[2].sessionId, 'session-a', 'the html segment arrived as the REAL id')
+
+    // A drifted version (the plugin updated past the adapter's table)
+    // never bridges: the local registry carries 0.25.0, the server
+    // announces 0.26.0 — compareBridges reads version-mismatch, and the
+    // request refuses with the uniform 503 instead of forwarding.
+    const driftedRegistry = createBridgeRegistry()
+    driftedRegistry.registerNormalized(adapter.declaration)
+    const driftedStatus = compareBridges(
+      driftedRegistry.list(),
+      { 'dsh-better-sidebar': { version: '0.26.0', digest: adapter.digest, serverScopeConsent: true } },
+      true,
+    )
+    assert.equal(driftedStatus[0].bridged, false)
+    assert.equal(driftedStatus[0].reason, 'version-mismatch')
+  } finally {
+    handle.uninstall()
+    await env.stop()
+    await subStop()
+    await dshStop()
+  }
+})

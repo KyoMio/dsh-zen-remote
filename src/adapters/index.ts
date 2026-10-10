@@ -13,6 +13,7 @@
  */
 
 import type { BridgeAdapter } from './types.js'
+import { dshBetterSidebarAdapter } from './dsh-better-sidebar/index.js'
 
 /** Every adapter zen-remote ships, in registration order. */
-export const ADAPTERS: readonly BridgeAdapter[] = []
+export const ADAPTERS: readonly BridgeAdapter[] = [dshBetterSidebarAdapter]

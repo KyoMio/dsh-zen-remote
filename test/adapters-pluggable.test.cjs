@@ -37,8 +37,14 @@ function scanAdapterImports() {
   const subdirImporters = []
   for (const file of entries) {
     const text = fs.readFileSync(path.join(SRC, file), 'utf8')
-    for (const match of text.matchAll(/from\s+['"]([^'"]*adapters\/[^'"]*)['"]/g)) {
-      const spec = match[1]
+    // Both import shapes: the static `from '...'` and the dynamic
+    // `import('...')` — an adapter pulled in dynamically would dodge the
+    // delete-the-directory guarantee just as surely.
+    const specs = [
+      ...[...text.matchAll(/from\s+['"]([^'"]*adapters\/[^'"]*)['"]/g)].map((match) => match[1]),
+      ...[...text.matchAll(/import\(\s*['"]([^'"]*adapters\/[^'"]*)['"]\s*\)/g)].map((match) => match[1]),
+    ]
+    for (const spec of specs) {
       if (/adapters\/index/.test(spec)) indexImporters.push(file)
       else if (/adapters\/types/.test(spec)) {
         // The author-face types module — adapter code and types.ts itself
