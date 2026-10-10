@@ -222,6 +222,12 @@ test('PB-10 tunnel: the validation chain answers through the tunnel lens', async
     const crlf = await openTunnel(base, { headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13\r\nX-Injected: 1' } })
     assert.equal(crlf.status, 400)
     assert.equal(crlf.marker, 'bad-request')
+    // The optional headers get the same check even when key/version are
+    // clean — a CR/LF protocol must not reach the hand-built upgrade request
+    // as a literal `undefined` header.
+    const crlfProtocol = await openTunnel(base, { headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13', 'sec-websocket-protocol': 'chat\r\nX-Injected: 1' } })
+    assert.equal(crlfProtocol.status, 400)
+    assert.equal(crlfProtocol.marker, 'bad-request')
   } finally {
     await stop()
     await wiring.upstream.stop()
@@ -412,10 +418,18 @@ test('PB-10 tunnel: sub-chunk upstream bytes travel NOW — a live session never
     const openLine = JSON.parse(await lines.next())
     assert.equal(openLine.type, 'open')
 
-    const data = JSON.parse(await lines.next(1500))
-    assert.notEqual(data, null, 'the sub-chunk push arrived without the upstream closing')
-    assert.equal(data.type, 'data')
-    assert.equal(Buffer.from(data.b64, 'base64').toString('utf8'), 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nserver-push-small', 'the whole arrival travels as ONE verbatim line')
+    // Same collect-per-arrival discipline as above: one line per arrival,
+    // possibly split — what matters (and what the PB-10 e2e hang regression
+    // checks) is that the sub-chunk push arrives WITHOUT the upstream
+    // closing, in order, verbatim.
+    let bytes = ''
+    while (!bytes.includes('server-push-small')) {
+      const data = JSON.parse(await lines.next(1500))
+      assert.notEqual(data, null, 'the sub-chunk push arrived without the upstream closing')
+      assert.equal(data.type, 'data')
+      bytes += Buffer.from(data.b64, 'base64').toString('utf8')
+    }
+    assert.equal(bytes, 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nserver-push-small', 'the arrival travels verbatim, in order, without waiting for a close')
 
     // The tunnel is still alive: no end line raced in behind the data, and
     // the upstream socket is exactly where it was.

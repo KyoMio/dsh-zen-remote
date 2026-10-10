@@ -366,6 +366,25 @@ A bridged plugin's panel request, rerouted by the sub-client's local backend (th
 
 **Write requests (2.2+)**: the method arrives in the `x-zr-method` header (default GET); `GET`/`HEAD` with a body still answers 400, and any other method's body IS the plugin request body (raw byte stream). The size gate is the declared `Content-Length` first, a streaming count as the fallback — past the route's `maxBody` the answer is 413 `body-too-large`; a method the route did not declare answers 405 `method-undeclared`; the passthrough whitelist gains `content-type` accordingly.
 
+### The plugin bridge's WebSocket byte tunnel: `POST /v1/plugin-tunnel/{open,send,close}`
+
+Routes declared `upgrade: true` travel over these three (the declaration side is in `docs/plugin-bridge.md`). The relay **never parses WebSocket**: the server→browser direction is **one NDJSON streaming response**, the browser→server direction is **ordered chunked POSTs**, and both directions are opaque bytes — the real upgrade handshake (the 101 and every frame) is produced by the plugin route on the server machine and crosses the tunnel untouched (`docs/adr/0002`).
+
+| Route | Headers | Body | Success answer |
+| --- | --- | --- | --- |
+| `/v1/plugin-tunnel/open` | The same coordinate headers as `/v1/plugin` | A small JSON: `{"headers":{"sec-websocket-key":…,"sec-websocket-version":…,"sec-websocket-protocol"?,"sec-websocket-extensions"?},"head"?}` — the four ws headers travel verbatim into the upgrade request (each passes a CR/LF check); `head` is the already-arrived early bytes, base64, optional | 200 NDJSON stream (shape below) |
+| `/v1/plugin-tunnel/send` | `x-zr-tunnel` (the tunnel id from the open line), `x-zr-seq` (strictly increasing from 0) | Raw bytes, ≤ 64 KiB | `{"ok":true}` — sent only after the plugin's socket took the bytes (backpressure: a stalled plugin slows THIS send) |
+| `/v1/plugin-tunnel/close` | `x-zr-tunnel` | none | `{"ok":true}`, idempotent (an unknown id still answers ok) |
+
+The open route's validation chain is **entirely shared** with `/v1/plugin` (registry → version and digest → exact route → parse-once query → share table → consent wall; same order, same codes), plus one wall of its own: the route must ALSO be declared `upgrade: true` — behind an ordinary route there is no WebSocket endpoint to dial, so 404 `route-undeclared`. On success the relay dials the local web server ITSELF (net/tls, loopback only; self-signed https verification is relaxed only for the literal `127.0.0.1`), hand-writes the upgrade request from the four received headers plus the operator's cookie (no Origin), and pumps the socket's bytes into the NDJSON stream line by line:
+
+- The first line `{"type":"open","tunnel":"<32 hex chars>"}` is the client's signal to stop HTTP-ing and start reading; a dial failure does not drop the connection — it becomes an `end` line before the stream closes;
+- `{"type":"data","b64":"…"}` carries upstream bytes (base64), at most 48 KiB of **raw** bytes per line (base64 inflates by 4/3 — the cap is on the raw bytes);
+- `{"type":"ping"}` heartbeat lines (default one per 15 s) keep reverse proxies from cutting an idle stream; the slow-reader discipline matches the relay streams — a client that stops reading pauses the UPSTREAM socket, and this process never buffers for a slow reader;
+- The final line `{"type":"end","reason":"upstream-closed"|"upstream-error"|"client-closed"}` precedes the stream close; close bytes the plugin sent (if any) already travelled as data lines — no WebSocket close frame is synthesized.
+
+The open body caps at 1 MiB (413 past it); each device holds at most 8 concurrent tunnels, 429 `busy` past that. A tunnel belongs to the device that opened it (`x-zen-remote-device`): another device's send/close answers 404 `tunnel-unknown`; a send whose `x-zr-seq` is not the expected sequence answers 409 `tunnel-out-of-order` and **closes the tunnel immediately** — a broken ordering contract makes the stream untrustworthy. Beyond these tunnel-specific codes, every other refusal matches the `/v1/plugin` error table (the validation chain is shared).
+
 ---
 
 ## Push notes

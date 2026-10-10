@@ -383,6 +383,25 @@ sudo cloudflared service install      # 通了再装成常驻服务
 
 **写请求（2.2 起）**：方法由头 `x-zr-method` 给出（缺省 GET）；`GET`/`HEAD` 带体仍拒绝 400，其余方法的请求体 = 插件请求体（原样字节流），体大小按 `content-length` 先判、流式累计兜底，超过该路由声明的 `maxBody` 回 413 `body-too-large`；方法不在路由声明的 `methods` 内回 405 `method-undeclared`；透传头白名单相应加入 `content-type`。
 
+### 插件桥的 WebSocket 字节隧道：`POST /v1/plugin-tunnel/{open,send,close}`
+
+声明 `upgrade: true` 的插件路由走这三条路由（声明侧见 `docs/plugin-bridge.md`）。中继**不解析 WebSocket**：服务端→浏览器方向是**一条 NDJSON 流式响应**，浏览器→服务端方向是**按序分块的普通 POST**，双向都是不透明字节——真正的升级握手（101 与每个帧）由插件路由在服务端本机完成，字节原样穿过隧道（`docs/adr/0002`）。
+
+| 路由 | 请求头 | 请求体 | 成功回答 |
+| --- | --- | --- | --- |
+| `/v1/plugin-tunnel/open` | 与 `/v1/plugin` 相同的坐标头 | 小 JSON：`{"headers":{"sec-websocket-key":…,"sec-websocket-version":…,"sec-websocket-protocol"?,"sec-websocket-extensions"?},"head"?}`——四个 ws 头原样进升级请求（逐个做 CR/LF 检查），`head` 是 base64 的已到达早期字节，可省略 | 200 NDJSON 流（形状见下） |
+| `/v1/plugin-tunnel/send` | `x-zr-tunnel`（open 首行给的隧道 id）、`x-zr-seq`（从 0 起严格递增） | 原始字节，≤ 64 KiB | `{"ok":true}`——等插件那条 socket 收下字节才回（背压：插件收不动，这次的 send 就慢） |
+| `/v1/plugin-tunnel/close` | `x-zr-tunnel` | 无 | `{"ok":true}`，幂等（未知 id 也答 ok） |
+
+open 的校验链与 `/v1/plugin` **完全共享**（注册表 → 版本与摘要 → exact 路由 → parse-once query → 共享表 → 同意墙，次序与错误码一致），外加一条自己的墙：路由还必须声明 `upgrade: true`——普通路由背后没有可拨的 WebSocket 端点，404 `route-undeclared`。通过后中继**自己拨本机 web server**（net/tls、只限回环；自签 https 仅对字面 `127.0.0.1` 放宽证书校验），用收到的四个头与操作者 cookie 手写升级请求（Origin 不写），把 socket 字节逐行泵进 NDJSON 流：
+
+- 首行 `{"type":"open","tunnel":"<32 位十六进制>"}`——子客户端收到它就停止 HTTP、开始读流；拨号失败不丢连接，变成一行 `end` 再关闭；
+- `{"type":"data","b64":"…"}`——上游字节（base64），每行最多 48 KiB **原始**字节（base64 会膨胀 4/3，上限按裸字节算）；
+- `{"type":"ping"}` 心跳行（默认 15 秒一条）防反代掐闲置流；慢读纪律与中继流一致——客户端读不动就**暂停上游 socket**，服务端进程不为慢客户端攒字节；
+- 结束行 `{"type":"end","reason":"upstream-closed"|"upstream-error"|"client-closed"}` 后流关闭；插件发的关闭字节（若有）作为 data 行先行到达，不另造 WebSocket 关闭帧。
+
+open 的体上限 1 MiB（超出 413）；每设备并发隧道上限 8，超出 429 `busy`。隧道归属**开它的设备**（`x-zen-remote-device`）：另一台设备的 send/close 一律 404 `tunnel-unknown`；send 的 `x-zr-seq` 不等于期望序号回 409 `tunnel-out-of-order` 并**立即关闭隧道**——顺序契约破了，这条流不再可信。除这些隧道自有错误码外，其余拒绝与 `/v1/plugin` 的错误码表一致（校验链共享）。
+
 ---
 
 ## 🔔 推送说明

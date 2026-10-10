@@ -55,8 +55,9 @@ export function apply(ctx: Context) {
 | `stream` | 可选，缺省 `false`；标记该路由以流式响应回答 |
 | `methods` | 可选，缺省 `['GET']`；大写 HTTP 方法数组，只接受 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`，去重并按字典序排序后进规范化与摘要（2.2 起，写请求） |
 | `maxBody` | 可选，缺省 `1048576`（1 MiB）；请求体上限（字节），正整数，最高 64 MiB（2.2 起） |
+| `upgrade` | 可选；置 `true` 标记该路由是 WebSocket 升级端点，远程会话里经字节隧道转发（2.2 起，见下文「WebSocket 路由」）。只能为 `true` 或省略；不能与 `stream` 同用；升级路由只有 GET——显式 `methods` 里出现其他方法登记即报错 |
 
-声明里出现未知字段直接报错（防拼错）。`methods` 与 `maxBody` 只在**显式给出**时进摘要——2.1 时代（没有这两个字段）的声明，摘要与当年完全一致，升级不破坏已桥接状态。2.1 只匹配 **exact 路径**：声明的 `path` 与请求 pathname 完全相等才算命中，把 `path` 写成前缀不会覆盖子路径。
+声明里出现未知字段直接报错（防拼错）。`methods`、`maxBody` 与 `upgrade` 只在**显式给出**时进摘要——2.1 时代（没有这三个字段）的声明，摘要与当年完全一致，升级不破坏已桥接状态。2.1 只匹配 **exact 路径**：声明的 `path` 与请求 pathname 完全相等才算命中，把 `path` 写成前缀不会覆盖子路径。
 
 ## 你的插件要守的约定
 
@@ -92,11 +93,23 @@ content-type: application/json; charset=utf-8
 | `method-not-bridged` | 请求方法不在该路由声明的 `methods` 内（未声明即只转发 GET） |
 | `not-shared` / `busy` / `plugin-unknown` / `plugin-mismatch` / `route-undeclared` / `loopback-auth` / `internal` | 服务端中继路由的对应拒绝原样透传（会话未共享 / 该设备并发超限 / 服务端无此登记 / 版本或摘要不符 / 路径未声明 / 服务端回环鉴权失败 / 服务端内部错误） |
 
-## 2.1 的限制
+## 限制
 
 - 2.1 只转发 **GET**；2.2 起路由可声明 `methods` 开放写方法（POST 等），请求体经中继流式转发，受该路由 `maxBody` 约束（缺省 1 MiB）——超限在本地即回答 413，不落本机、不到服务端。
 - 只匹配 **exact 路径**；前缀声明不生效。
-- WebSocket 不在桥接范围内。已知的插件 WebSocket（如 better-sidebar 的两条）将按中继的既有约定「订阅走流式响应、指令走普通请求」在 2.2 以流式响应加普通请求模拟（见 `docs/adr/0002`），届时再扩展声明字段。
+
+## WebSocket 路由（2.2 起）
+
+路由声明 `upgrade: true` 后即成为 WebSocket 升级端点：远程会话里浏览器对该路径的 `new WebSocket(...)` 由子客户端本机接住，经中继的**字节隧道**接到服务端本机插件——升级请求头（`sec-websocket-key` / `sec-websocket-version`，及可选的 `sec-websocket-protocol` / `sec-websocket-extensions`）与双向字节各自**原样搬运，两端都不解析 WebSocket 帧**：101 响应、每个帧、关闭字节都是不透明字节，真正的握手由插件路由在服务端本机完成。三路由的协议形状见 `docs/remote-access.md` 的「插件桥」一节；决策记录见 `docs/adr/0002`。
+
+浏览器侧没有新接口：拿到的仍是原生 `WebSocket`，感知不到隧道。升级无法转发时（未桥接、会话不可达等原因）浏览器看到的就是一次握手失败——子客户端在 socket 上回答与 HTTP 改道相同的 503 `zr-plugin-unbridged` 形状（reason 取值见上表），表现为 `error` / `close` 事件。
+
+限制：
+
+- 声明侧：`upgrade` 只能为 `true` 或省略，不能与 `stream` 同用，升级路由只有 GET（见字段表）；
+- 上行字节按最大 64 KiB 分块、严格按序转发（服务端按序号把关，乱序即断）；下行字节每行最多 48 KiB，走一条 NDJSON 流；
+- 每设备并发隧道上限 8；
+- 隧道随浏览器 socket 断开即关闭；服务端一侧的字节流断掉时浏览器 socket 直接切断——字节隧道不代拟关闭帧，插件自己发的关闭字节（若有）已作为数据先行到达。
 
 相关阅读：主服务端一侧的路由协议见 `docs/remote-access.md` 的「插件桥」小节；设置页的同意开关与状态文案见 `docs/interface.md`。
 
