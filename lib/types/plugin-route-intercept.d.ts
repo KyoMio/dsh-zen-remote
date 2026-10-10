@@ -26,6 +26,7 @@
  */
 import type { BridgeRegistry, BridgeStatus } from './plugin-bridge.js';
 import type { RelayClient } from './relay-client.js';
+import type { NormalizedAdapter } from './plugin-adapter-core.js';
 /** Structural verdict of {@link checkWebServerShape}: the facts the wrap
  * reads per request — the `match` function the host's handle calls, the two
  * route tables, and (PB-10) the `upgrades` table the host's upgrade handler
@@ -67,6 +68,13 @@ export interface PluginRouteInterceptDiagnostics {
     /** PB-10: tunnels opened / torn down since the install. */
     tunnelsOpened: number;
     tunnelsClosed: number;
+    /** PB-11: adapter requests forwarded through the relay. */
+    adapterForwarded: number;
+    /** PB-11: adapter JSON answers rewritten by a `client.response` hook, and
+     * answers that passed through UNTOUCHED because the buffer cap (8 MB) or
+     * a parse failure made a rewrite impossible. */
+    adapterResponseRewrites: number;
+    adapterResponsePassthroughs: number;
 }
 export interface InstallPluginRouteInterceptOptions {
     /** The RAW webServer instance (`ctx.webServer[symbols.original]`). */
@@ -82,6 +90,10 @@ export interface InstallPluginRouteInterceptOptions {
     /** The PB-2 bridge verdicts, computed live per call; a plugin that is
      * not bridged right now refuses with the status's own reason. */
     getStatus: () => BridgeStatus[];
+    /** The validated adapters (PB-11), as the wiring registered them.
+     * Absent/empty — the pluggable default — means no adapter routes exist
+     * and this interception behaves exactly as before. */
+    adapters?: readonly NormalizedAdapter[];
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
 }

@@ -802,9 +802,11 @@ test('PB-5 GET plugin-bridge: shape, order, hasServerScope, and consent read LIV
     const body = JSON.parse(res.body)
     assert.equal(body.ok, true)
     // Sorted by plugin name; hasServerScope from the routes; consent verbatim.
+    // PB-11: the adapter mark defaults to false on a wiring that passes no
+    // `adaptedPlugins` (none of these entries is adapted).
     assert.deepEqual(body.value.plugins, [
-      { plugin: 'acme-tasks', version: '2.0.0', hasServerScope: true, consent: true },
-      { plugin: 'zeta-panel', version: '1.0.0', hasServerScope: false, consent: false },
+      { plugin: 'acme-tasks', version: '2.0.0', hasServerScope: true, consent: true, adapted: false },
+      { plugin: 'zeta-panel', version: '1.0.0', hasServerScope: false, consent: false, adapted: false },
     ])
 
     // The consent read is LIVE: flipping the row-side map (the volatile

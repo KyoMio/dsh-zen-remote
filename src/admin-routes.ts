@@ -173,6 +173,10 @@ export interface AdminHandlerOptions {
   pluginBridge?: {
     registry: BridgeRegistry
     getConsent: () => Record<string, boolean>
+    /** The plugins an ADAPTER currently stands in for (PB-11), read live
+     * per listing — a plugin that registered its own declaration stops
+     * being marked. Absent on a wiring that predates adapters. */
+    adaptedPlugins?: () => ReadonlySet<string>
   }
 }
 
@@ -619,11 +623,17 @@ export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
           consent = {}
         }
         // registry.list() arrives plugin-sorted; the map keeps that order.
+        // PB-11: `adapted` marks the entries an ADAPTER stands in for —
+        // zen-remote-internal forwarding for a plugin that never registered
+        // anything — so the settings page can say「由 zen-remote 适配」.
+        // Absent (a wiring that predates adapters) reads as none.
+        const adapted = options.pluginBridge.adaptedPlugins?.() ?? new Set<string>()
         const plugins = options.pluginBridge.registry.list().map((declaration) => ({
           plugin: declaration.plugin,
           version: declaration.version,
           hasServerScope: declaration.routes.some((route) => route.scope === 'server'),
           consent: consent[declaration.plugin] === true,
+          adapted: adapted.has(declaration.plugin),
         }))
         responseJson(res, 200, { ok: true, value: { plugins } })
         return

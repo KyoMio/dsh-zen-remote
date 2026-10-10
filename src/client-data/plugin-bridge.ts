@@ -114,3 +114,37 @@ export function togglePluginConsent(current: unknown, plugin: string, allow: boo
   next[plugin] = allow
   return next
 }
+
+/** One row of the host settings page's 插件桥 list, as the admin listing
+ * answers it (PB-5: plugin/version/hasServerScope/consent; PB-11 adds the
+ * adapter mark). */
+export interface AdminBridgeRowView {
+  plugin: string
+  version: string
+  hasServerScope: boolean
+  consent: boolean
+  /** True when zen-remote's own adapter stands in for this plugin (the
+   * row renders「由 zen-remote 适配」); a wiring that predates adapters
+   * never sets it. */
+  adapted: boolean
+}
+
+/**
+ * Tolerant read of one admin listing row into the render shape (PB-11).
+ * A malformed row is `undefined`, never a throw — the settings page skips
+ * it the same way {@link derivePluginBridgeStatuses} skips a bad verdict.
+ * `adapted` defaults to false: an older server's answer simply reads as
+ * "nothing is adapted".
+ */
+export function readAdminBridgeRow(row: unknown): AdminBridgeRowView | undefined {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) return undefined
+  const record = row as Record<string, unknown>
+  if (typeof record.plugin !== 'string' || record.plugin === '') return undefined
+  return {
+    plugin: record.plugin,
+    version: typeof record.version === 'string' ? record.version : '',
+    hasServerScope: record.hasServerScope === true,
+    consent: record.consent === true,
+    adapted: record.adapted === true,
+  }
+}

@@ -367,13 +367,24 @@ test('PB-10 tunnel: upstream bytes arrive as data lines; upstream close sends th
     const openLine = JSON.parse(await lines.next())
     assert.equal(openLine.type, 'open')
 
-    const data = JSON.parse(await lines.next())
-    assert.equal(data.type, 'data')
-    assert.equal(Buffer.from(data.b64, 'base64').toString('utf8'), 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nframe-bytes-from-upstream', 'the RAW bytes — the 101 answer and the frames — travel verbatim')
+    // Collect every data line until the end line: HOW the upstream's two
+    // writes split into data lines is TCP scheduling, not the contract —
+    // the contract is the byte-exact concatenation.
+    const endLine = { type: '', reason: '' }
+    const dataChunks = []
+    for (let raw = await lines.next(); raw !== null; raw = await lines.next()) {
+      const line = JSON.parse(raw)
+      if (line.type === 'data') dataChunks.push(Buffer.from(line.b64, 'base64').toString('utf8'))
+      if (line.type === 'end') {
+        endLine.type = line.type
+        endLine.reason = line.reason
+        break
+      }
+    }
+    assert.equal(Buffer.concat(dataChunks.map((c) => Buffer.from(c, 'utf8'))).toString('utf8'), 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nframe-bytes-from-upstream', 'the RAW bytes — the 101 answer and the frames — travel verbatim')
 
-    const end = JSON.parse(await lines.next())
-    assert.equal(end.type, 'end')
-    assert.equal(end.reason, 'upstream-closed')
+    assert.equal(endLine.type, 'end')
+    assert.equal(endLine.reason, 'upstream-closed')
   } finally {
     await stop()
     await wiring.upstream.stop()

@@ -27,7 +27,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { Transform } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
@@ -48,6 +48,8 @@ import { routeMethodsOf, routeMaxBodyOf } from './plugin-bridge.js'
 import { createPluginTunnel, validatePluginCall, type PluginTunnelRoutes } from './plugin-tunnel.js'
 import type { PluginLoopback } from './plugin-loopback.js'
 import { isLoopbackAuthError } from './plugin-loopback.js'
+import type { NormalizedAdapter, AdapterVerdict } from './plugin-adapter-core.js'
+import { matchAdapterRoute, locateAdapterIds, adapterOwnsRegistryEntry } from './plugin-adapter-core.js'
 
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
@@ -299,6 +301,10 @@ export interface RelayHandlerOptions {
      * that predates the tunnels — and the three `plugin-tunnel` routes
      * answer 501 `unsupported` like an unwired bridge. */
     tunnel?: PluginTunnelRoutes
+    /** The validated adapters (PB-11), as the wiring registered them.
+     * Absent/empty — the pluggable default — and `v1/plugin` serves
+     * cooperative declarations only, exactly as before. */
+    adapters?: readonly NormalizedAdapter[]
   }
 }
 
@@ -1494,6 +1500,248 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       ) {
         relayPluginError(res, 400, 'bad-request')
         return
+      }
+      // ---- PB-11: the adapter routes claim the request BEFORE the
+      // cooperative chain. An adapter route matches by equality or one
+      // segment deeper (not the cooperative exact equality), its ids live
+      // wherever ITS locator says (query, path segment, JSON body), and the
+      // loopback receives the coordinates VERBATIM — the sub-client has
+      // already rewritten every virtual id to its real half, so what gets
+      // validated here is exactly what the local plugin will see. A YIELDED
+      // adapter (the plugin registered its own declaration) falls through to
+      // the cooperative chain below, whose digest check refuses the stale
+      // adapter coordinates with `plugin-mismatch`.
+      const adapterHit = matchAdapterRoute(options.pluginBridge?.adapters, routePath)
+      if (adapterHit !== undefined) {
+        const { adapter, route: adapterRoute } = adapterHit
+        if (adapterOwnsRegistryEntry(adapter, bridge.registry.get(adapter.plugin))) {
+          // Coordinates first: the forwarded version/digest must be the
+          // adapter's registered pair.
+          if (pluginVersion !== adapter.declaration.version || pluginDigest !== adapter.digest) {
+            relayPluginError(res, 409, 'plugin-mismatch')
+            return
+          }
+          // Whole-machine data by definition: the live consent wall, the
+          // same knob the cooperative server-scope routes read.
+          let adapterConsent: Record<string, boolean> = {}
+          try {
+            adapterConsent = bridge.getConsent()
+          } catch {
+            adapterConsent = {}
+          }
+          if (adapterConsent[adapter.plugin] !== true) {
+            relayPluginError(res, 403, 'consent-off')
+            return
+          }
+          if (!adapterRoute.methods.includes(pluginMethod)) {
+            relayPluginError(res, 405, 'method-undeclared')
+            return
+          }
+          // The per-device budget — the SAME table the cooperative forwards
+          // share, held for the whole response stream.
+          const adapterDevice = headerValue(req, 'x-zen-remote-device') ?? ''
+          if ((pluginsByDevice.get(adapterDevice) ?? 0) >= MAX_PLUGIN_REQUESTS_PER_DEVICE) {
+            relayPluginError(res, 429, 'busy')
+            return
+          }
+          pluginsByDevice.set(adapterDevice, (pluginsByDevice.get(adapterDevice) ?? 0) + 1)
+          let adapterGone = false
+          const adapterHangUp = new AbortController()
+          const onAdapterGone = (): void => {
+            adapterGone = true
+            if (!res.writableEnded) adapterHangUp.abort()
+          }
+          res.on('close', onAdapterGone)
+          res.on('error', onAdapterGone)
+          try {
+            // Locate ONCE, over the same routing rule the sub-client used:
+            // the query parses once, the path segments decode off the
+            // rewritten pathname, and a body-locating route buffers its
+            // (bounded) JSON body.
+            const adapterSearch = new URLSearchParams(rawQuery)
+            let parsedBody: unknown
+            let bodyGiven = false
+            let bufferedBody: Buffer | undefined
+            if (!bodylessMethod && adapterRoute.locator.in === 'json-body') {
+              const chunks: Buffer[] = []
+              let size = 0
+              let over = false
+              for await (const chunk of req) {
+                size += (chunk as Buffer).length
+                if (size > adapterRoute.maxBody) {
+                  over = true
+                  break
+                }
+                chunks.push(Buffer.from(chunk as Uint8Array))
+              }
+              if (over) {
+                relayPluginError(res, 413, 'body-too-large')
+                void drainUpload(req, 0, drainDeadlineMs)
+                return
+              }
+              bufferedBody = Buffer.concat(chunks)
+              if (bufferedBody.length > 0) {
+                try {
+                  parsedBody = JSON.parse(bufferedBody.toString('utf8'))
+                  bodyGiven = true
+                } catch {
+                  relayPluginError(res, 400, 'bad-request')
+                  return
+                }
+              }
+            }
+            const hits = locateAdapterIds(adapterRoute, routePath, adapterSearch, bodyGiven ? parsedBody : undefined)
+            // The sub-client only forwards a classified-remote request, so
+            // an adapter request that locates NOTHING is malformed here.
+            if (hits.length === 0) {
+              relayPluginError(res, 400, 'bad-request')
+              return
+            }
+            // EVERY located id must be a shared session — one unshared id
+            // among several refuses the whole request.
+            for (const hit of hits) {
+              if (!isAccessible(hit.value)) {
+                relayPluginError(res, 403, 'not-shared')
+                return
+              }
+            }
+            // The server hook: refuse, or replace the parsed body (strip a
+            // `cwd`, pin a field…). The loopback coordinates stay verbatim.
+            let loopbackBody: Buffer | undefined
+            if (bodyGiven) loopbackBody = Buffer.from(JSON.stringify(parsedBody), 'utf8')
+            const serverHook = adapter.hooks.server?.request
+            if (serverHook !== undefined) {
+              let verdict: AdapterVerdict
+              try {
+                verdict = serverHook({ method: pluginMethod, route: adapterRoute, query: adapterSearch, body: bodyGiven ? parsedBody : undefined })
+              } catch {
+                relayPluginError(res, 403, 'internal')
+                return
+              }
+              if (!verdict.allow) {
+                relayPluginError(res, 403, verdict.reason)
+                return
+              }
+              if (bodyGiven && verdict.body !== undefined) {
+                loopbackBody = Buffer.from(JSON.stringify(verdict.body), 'utf8')
+              }
+            }
+            // The loopback body: a body-locating route sends its (possibly
+            // hook-rewritten) buffer; any other body rides the cooperative
+            // counting gate.
+            const adapterAccept = headerValue(req, 'accept')
+            const adapterRange = headerValue(req, 'range')
+            const adapterContentType = headerValue(req, 'content-type')
+            let adapterBodyStream: import('node:stream').Readable | null = null
+            let adapterBodyGateError: Error | undefined
+            if (!bodylessMethod && adapterRoute.locator.in === 'json-body') {
+              adapterBodyStream = Readable.from(loopbackBody ?? Buffer.alloc(0))
+            } else if (!bodylessMethod) {
+              let pumped = 0
+              const gate = new Transform({
+                transform(chunk: Buffer, _encoding, callback) {
+                  pumped += chunk.length
+                  if (pumped > adapterRoute.maxBody) {
+                    callback(new Error('body-too-large'))
+                    return
+                  }
+                  callback(null, chunk)
+                },
+              })
+              gate.on('error', (error) => {
+                adapterBodyGateError = error
+                adapterHangUp.abort()
+              })
+              req.pipe(gate)
+              adapterBodyStream = gate
+            }
+            const outbound = await bridge.loopback.request(
+              pluginMethod,
+              routePath,
+              rawQuery,
+              {
+                ...(adapterAccept !== undefined ? { accept: adapterAccept } : {}),
+                ...(adapterRange !== undefined ? { range: adapterRange } : {}),
+                ...(adapterContentType !== undefined ? { contentType: adapterContentType } : {}),
+              },
+              adapterBodyStream,
+              adapterHangUp.signal,
+            )
+            if (adapterBodyGateError !== undefined && !res.headersSent) {
+              relayPluginError(res, 413, 'body-too-large')
+              void drainUpload(req, 0, drainDeadlineMs)
+              return
+            }
+            res.writeHead(outbound.status, {
+              ...(outbound.contentType !== undefined ? { 'Content-Type': outbound.contentType } : {}),
+              ...(outbound.contentLength !== undefined ? { 'Content-Length': outbound.contentLength } : {}),
+              ...(outbound.cacheControl !== undefined ? { 'Cache-Control': outbound.cacheControl } : {}),
+            })
+            await new Promise<void>((resolve, reject) => {
+              const upstream = outbound.stream
+              upstream.on('data', (chunk: Buffer) => {
+                if (adapterGone || res.destroyed || res.writableEnded) {
+                  upstream.destroy()
+                  return
+                }
+                if (!res.write(chunk)) {
+                  upstream.pause()
+                  res.once('drain', () => upstream.resume())
+                }
+              })
+              upstream.on('end', () => resolve())
+              upstream.on('error', reject)
+            })
+            await new Promise<void>((resolve) => {
+              if (res.writableEnded || res.destroyed) {
+                resolve()
+                return
+              }
+              const watchdog = setTimeout(() => {
+                try {
+                  res.destroy()
+                } catch {
+                  // Already gone.
+                }
+              }, endDrainTimeoutMs)
+              if (typeof watchdog.unref === 'function') watchdog.unref()
+              const settled = (): void => {
+                clearTimeout(watchdog)
+                resolve()
+              }
+              res.once('finish', settled)
+              res.once('close', settled)
+              res.end()
+            })
+          } catch (error) {
+            if (adapterHangUp.signal.aborted) {
+              try {
+                res.destroy()
+              } catch {
+                // Already gone.
+              }
+            } else if (isLoopbackAuthError(error)) {
+              relayPluginError(res, 502, 'loopback-auth')
+            } else if (!res.headersSent) {
+              relayPluginError(res, 502, 'internal')
+            } else {
+              try {
+                res.destroy()
+              } catch {
+                // Already gone.
+              }
+            }
+          } finally {
+            res.off('close', onAdapterGone)
+            res.off('error', onAdapterGone)
+            const remaining = (pluginsByDevice.get(adapterDevice) ?? 1) - 1
+            if (remaining <= 0) pluginsByDevice.delete(adapterDevice)
+            else pluginsByDevice.set(adapterDevice, remaining)
+          }
+          return
+        }
+        // A yielded adapter falls through: the cooperative chain's digest
+        // check refuses these stale coordinates below.
       }
       // ---- the validation chain, in order, first failure answers --------
       // Steps 1/2/3 and 4-6 (registry, version+digest, exact route, the
