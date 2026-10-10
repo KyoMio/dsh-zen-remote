@@ -1640,6 +1640,85 @@ test('T59: the periodic info refresh re-handshakes while online and folds the fr
   } finally { await relay.stop() }
 })
 
+test('PB-2: the info refresh folds a changed plugins table — a consent flip needs no reconnect', async () => {
+  const clock = fakeClock()
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port, { clock, infoRefreshMs: 30_000 })
+    const handshakeBodies = () => relay.seen.filter((hit) => hit.url === HANDSHAKE).length
+    // The server grants NO consent at pairing time.
+    relay.scenario.handshake = () => [200, {
+      ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {},
+      plugins: { 'some-panel': { version: '1.0.0', digest: 'digest-a', serverScopeConsent: false } },
+    }]
+    await client.connect()
+    assert.deepEqual(client.handshakeInfo.plugins, { 'some-panel': { version: '1.0.0', digest: 'digest-a', serverScopeConsent: false } })
+
+    // The server owner flips the consent; the QUIET refresh (no reconnect)
+    // carries the new table in.
+    relay.scenario.handshake = () => [200, {
+      ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {},
+      plugins: { 'some-panel': { version: '1.0.0', digest: 'digest-a', serverScopeConsent: true } },
+    }]
+    clock.advance(30_000)
+    await waitFor(() => handshakeBodies() === 2)
+    await waitFor(() => client.handshakeInfo.plugins?.['some-panel']?.serverScopeConsent === true)
+    assert.equal(client.state, 'online', 'the refresh never leaves online')
+
+    // A refresh answer WITHOUT the field (a server that stopped speaking it)
+    // keeps the stored table — never silently downgraded to nothing.
+    relay.scenario.handshake = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {} }]
+    clock.advance(30_000)
+    await waitFor(() => handshakeBodies() === 3)
+    await sleep(40)
+    assert.deepEqual(client.handshakeInfo.plugins, { 'some-panel': { version: '1.0.0', digest: 'digest-a', serverScopeConsent: true } }, 'the stored table survives a field-less refresh')
+  } finally { await relay.stop() }
+})
+
+test('PB-2-fix: an UNCHANGED plugins table refreshes silently — no notify, same object; only real content wakes listeners', async () => {
+  const clock = fakeClock()
+  const relay = await startFakeRelay()
+  try {
+    const { client } = makeClient(relay.port, { clock, infoRefreshMs: 30_000 })
+    const handshakeBodies = () => relay.seen.filter((hit) => hit.url === HANDSHAKE).length
+    relay.scenario.handshake = () => [200, {
+      ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {},
+      plugins: { 'some-panel': { version: '1.0.0', digest: 'digest-a', serverScopeConsent: false } },
+    }]
+    await client.connect()
+    // Counted AFTER connect: only refresh-driven wakes interest this test.
+    let notifications = 0
+    client.subscribe(() => { notifications += 1 })
+    const tableBefore = client.handshakeInfo.plugins
+
+    // The SAME table comes back as a FRESH JSON literal (the wire parses a
+    // new object every time — reference equality would flag it) with its key
+    // in a different insertion order, names and deviceName untouched. The
+    // refresh must run, keep the OLD object, and wake NO listener: a
+    // woke-on-every-tick subscriber is the interceptor's catalog listener
+    // re-pulling `session/modelCatalog` every 30s for nothing (PB-2-fix).
+    relay.scenario.handshake = () => [200, {
+      ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {},
+      plugins: { 'some-panel': { serverScopeConsent: false, digest: 'digest-a', version: '1.0.0' } },
+    }]
+    clock.advance(30_000)
+    await waitFor(() => handshakeBodies() === 2, 3000, 'the unchanged-content refresh still ran')
+    await sleep(40)
+    assert.equal(notifications, 0, 'an unchanged table never wakes a subscriber')
+    assert.equal(client.handshakeInfo.plugins, tableBefore, 'the previous object is kept — identity is the nothing-moved proof')
+
+    // Real content change (the consent flips): the table swaps and exactly
+    // one notification goes out.
+    relay.scenario.handshake = () => [200, {
+      ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: {},
+      plugins: { 'some-panel': { version: '1.0.0', digest: 'digest-a', serverScopeConsent: true } },
+    }]
+    clock.advance(30_000)
+    await waitFor(() => notifications === 1, 3000, 'a real table change wakes the subscriber once')
+    assert.equal(client.handshakeInfo.plugins['some-panel'].serverScopeConsent, true)
+  } finally { await relay.stop() }
+})
+
 // ---- T59-fix: the follow-race hardening ---------------------------------------
 
 test('T59-fix: volatileUpdateTouchesServerName picks the device field out of the announcement', () => {

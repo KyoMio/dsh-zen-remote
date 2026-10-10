@@ -42,6 +42,7 @@ import {
   filterWorkspaceFrame,
 } from './relay-filter.js'
 import { SESSION_REFERENCE_URI, collectReferenceTexts, decodeSessionReferenceUri } from './session-reference.js'
+import type { ServerPluginEntry } from './plugin-bridge.js'
 
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
@@ -224,12 +225,17 @@ export interface RelayGateway {
  * callback too (T42), awaited per handshake so a just-restarted server never
  * serves a stale map; a THROWN compute degrades to the empty map here so a
  * broken fingerprint source can never fail the handshake itself — the
- * client's comparison judges every group `unavailable`, never `different`. */
+ * client's comparison judges every group `unavailable`, never `different`.
+ * `plugins` is the same discipline for the plugin bridge (PB-2): computed
+ * FRESH per handshake (the local registry and the row's consent map are both
+ * live), a THROWN compute degrades to the empty table — the handshake still
+ * succeeds and the client reads every local plugin `not-on-server`. */
 export interface RelayServerInfo {
   serverId: string
   serverName: () => string
   dshVersion: string
   fingerprints?: () => Record<string, string> | Promise<Record<string, string>>
+  plugins?: () => Record<string, ServerPluginEntry>
 }
 
 export interface RelayHandlerOptions {
@@ -1031,6 +1037,19 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       } catch {
         fingerprints = {}
       }
+      // PB-2: the plugin bridge table, computed FRESH per handshake (the
+      // registry and the row's consent map are both live state), with the
+      // SAME guard: a throwing source answers the empty table — the field
+      // still travels, so the client reads "no plugins on this server"
+      // (not-on-server), never a failed handshake. The field is ALWAYS
+      // present in the reply: only its ABSENCE (an older server) can ever
+      // mean server-too-old on the client.
+      let plugins: Record<string, ServerPluginEntry> = {}
+      try {
+        plugins = serverInfo.plugins?.() ?? {}
+      } catch {
+        plugins = {}
+      }
       responseJson(res, 200, {
         ok: true,
         relayProtocol: RELAY_PROTOCOL,
@@ -1040,6 +1059,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // T42: the server's own interface fingerprints (empty when the wiring
         // had nothing to compute — the client judges group by group).
         fingerprints,
+        // PB-2: the plugin bridge table (empty when the wiring had nothing to
+        // register — the client judges plugin by plugin).
+        plugins,
         // T59: the CALLING device's name, as the gateway's device table holds
         // it at this moment (the header is written fresh per forward, so a
         // just-renamed device reads its new name here). Undefined without the

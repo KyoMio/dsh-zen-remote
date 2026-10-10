@@ -61,8 +61,8 @@ import { checkFetchRouteShape, installFetchRouteIntercept } from './fetch-route-
 import type { FetchRouteInterceptDiagnostics, FetchRouteInterceptHandle, FetchRouteShapeCheck } from './fetch-route-intercept.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway, RelayHandler } from './relay-server.js'
-import { createBridgeRegistry } from './plugin-bridge.js'
-import type { BridgeDeclaration, BridgeRegistry, ZenRemoteService } from './plugin-bridge.js'
+import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
+import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 
 // The plugin bridge's public types (PB-1), re-exported so another plugin's
 // author can `import type { … } from 'dsh-zen-remote'` without reaching into
@@ -716,6 +716,23 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             serverName: () => resolveConfig(config, readFileConfig(), process.env).values.serverName,
             dshVersion: resolveDshVersion(),
             fingerprints: () => computeFingerprints(relayCtx),
+            // PB-2: the plugin bridge table, rebuilt FRESH at every handshake
+            // from the PB-1 registry and the row's consent map — both live:
+            // the registry through this apply's own closure, the consent
+            // through resolveConfig on the SAME row object (a volatile field,
+            // read at use time per the hard constraint, never snapshotted).
+            plugins: () => {
+              const consent = resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent
+              const table: Record<string, ServerPluginEntry> = {}
+              for (const declaration of registry.list()) {
+                table[declaration.plugin] = {
+                  version: declaration.version,
+                  digest: declaration.digest,
+                  serverScopeConsent: consent[declaration.plugin] === true,
+                }
+              }
+              return table
+            },
           },
         })
         const unregister = relayCtx.webServer.register({
@@ -789,6 +806,15 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       computeOwnFingerprints: () => computeFingerprints(ctx),
     })
     clientRelayClient = relayClient
+    // The plugin bridge's live verdict (PB-2), the CLIENT role's job — a host
+    // has no remote sessions of its own to bridge anything into. Computed PER
+    // CALL (never a stored conclusion): the local registry is this apply's
+    // own closure, the server's table is the LAST handshake's `plugins`
+    // (undefined until one succeeded — an old server reads server-too-old),
+    // and `online` is the client's CURRENT state — so a registry change, a
+    // fresh handshake or a link flip shows up at the very next read.
+    const pluginBridgeStatus = (): BridgeStatus[] =>
+      compareBridges(registry.list(), relayClient.handshakeInfo?.plugins, relayClient.state === 'online')
     // A stopped or reloaded row must not leave a stale instance where the
     // module getter can hand it out (T23a-fix), and its reconnect machinery
     // (T43) must not outlive the row either: stop() cancels the armed retry
@@ -995,6 +1021,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           getRelayClient: () => relayClient,
           getIntercept: interceptDiagnostics,
           getFetchRouteIntercept: fetchRouteDiagnostics,
+          getPluginBridgeStatus: pluginBridgeStatus,
           onCurrentSession,
         }),
       }), 'dsh-zen-remote: client routes')

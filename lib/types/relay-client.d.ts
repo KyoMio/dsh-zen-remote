@@ -45,6 +45,7 @@
  * notification channel the state changes use.
  */
 import type { RelayCompatVerdict } from './fingerprint.js';
+import type { ServerPluginEntry } from './plugin-bridge.js';
 /**
  * The clock face the reconnect machinery runs on: wall time, timers and the
  * jitter source. Injectable so tests drive the whole backoff sequence
@@ -82,6 +83,15 @@ export interface RelayHandshake {
      * has and pushes nothing.
      */
     deviceName?: string;
+    /**
+     * The server's per-plugin bridge table (PB-2), verbatim from the
+     * handshake. `undefined` from an OLDER server whose handshake carries no
+     * `plugins` field at all — and that distinction is load-bearing:
+     * {@link compareBridges} reads `undefined` as `server-too-old`, while an
+     * empty table means "this server speaks the field, nothing registered"
+     * (`not-on-server`). Never normalized into `{}` here.
+     */
+    plugins?: Record<string, ServerPluginEntry>;
 }
 /**
  * One relay failure. `code` is the mapped reason (the contract's state

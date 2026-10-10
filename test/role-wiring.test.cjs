@@ -329,7 +329,7 @@ test('T16: client routes register on the client role (the host mounts the prefix
   try {
     const status = await request(port, { method: 'GET', path: `${CLIENT_PREFIX}/remote-status` })
     assert.equal(status.status, 200)
-    assert.deepEqual(JSON.parse(status.body), { state: 'unpaired', versionMismatch: false, serverName: '', closed: {} })
+    assert.deepEqual(JSON.parse(status.body), { state: 'unpaired', versionMismatch: false, serverName: '', closed: {}, bridgedPlugins: [] })
     const claim = await request(port, { method: 'POST', path: `${CLIENT_PREFIX}/claim`, headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: { serverUrl: 'http://127.0.0.1:9', code: '123456', name: 'x' } })
     assert.equal(claim.status, 404, 'the pairing claim must not answer on a host')
     const unshare = await request(port, { method: 'POST', path: `${CLIENT_PREFIX}/unshare`, headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: { sessionId: 'zr~abcd1234~s' } })
