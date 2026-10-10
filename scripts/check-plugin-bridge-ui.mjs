@@ -15,7 +15,7 @@
 //
 // Run: node scripts/check-plugin-bridge-ui.mjs
 import assert from 'node:assert/strict'
-import { bridgeSectionState, derivePluginBridgeStatuses, togglePluginConsent } from '../src/client-data/plugin-bridge.ts'
+import { bridgeSectionState, derivePluginBridgeStatuses, readAdminBridgeRow, togglePluginConsent } from '../src/client-data/plugin-bridge.ts'
 import { consentField, SETTINGS_FIELDS } from '../src/client-data/settings-form.ts'
 
 let testChain = Promise.resolve()
@@ -142,6 +142,24 @@ await test('the toggle lands on the SHARED field table and a save would send exa
   const unchanged = spec.parse(spec.format(current))
   assert.deepEqual(unchanged, { kind: 'set', value: { old: true } })
   assert.equal(JSON.stringify(next) === spec.format(next), true, 'an unchanged map formats identical to its draft')
+})
+
+// ---- readAdminBridgeRow (PB-11) ----------------------------------------------
+
+await test('the adapter mark rides the admin listing row and reads tolerantly', () => {
+  // A full row: adapted true rides through; the tolerable defaults hold.
+  assert.deepEqual(
+    readAdminBridgeRow({ plugin: 'p', version: '1.0.0', hasServerScope: true, consent: false, adapted: true }),
+    { plugin: 'p', version: '1.0.0', hasServerScope: true, consent: false, adapted: true },
+  )
+  // An older server without the field reads as NOT adapted.
+  assert.equal(readAdminBridgeRow({ plugin: 'p', version: '1', hasServerScope: false, consent: true }).adapted, false)
+  // A junk field value is not "adapted" — only the exact true is.
+  assert.equal(readAdminBridgeRow({ plugin: 'p', version: '1', hasServerScope: false, consent: true, adapted: 'yes' }).adapted, false)
+  // A malformed row is undefined, never a throw.
+  for (const bad of [undefined, null, 42, 'x', [], {}, { version: '1' }]) {
+    assert.equal(readAdminBridgeRow(bad), undefined, `row ${JSON.stringify(bad)} must not parse`)
+  }
 })
 
 let failed = 0

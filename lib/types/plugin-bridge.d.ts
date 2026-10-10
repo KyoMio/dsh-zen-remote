@@ -125,6 +125,15 @@ export interface BridgeRegistry {
      * registration it came from — after an overwrite the STALE dispose is a
      * no-op and must not remove the replacement. */
     register(input: unknown): () => void;
+    /** Record an ALREADY-normalized declaration verbatim — no validation, no
+     * re-digest (PB-11). This is the adapter registration door: an adapter
+     * arrives with its own digest (over its route table, locator included)
+     * and its own normalized routes, shapes the cooperative validator cannot
+     * produce. The same-plugin replace/report/dispose semantics of
+     * {@link register} apply unchanged — which is exactly the yielding rule:
+     * a plugin's own later `zenRemote.bridge(...)` call replaces the adapter's
+     * entry and a warn notes the takeover. */
+    registerNormalized(normalized: NormalizedDeclaration): () => void;
     /** All live declarations, sorted by plugin name. */
     list(): NormalizedDeclaration[];
     get(plugin: string): NormalizedDeclaration | undefined;

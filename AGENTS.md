@@ -32,6 +32,8 @@
 | `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端比对 `compareBridges`；不 import DSH、不碰 I/O |
 | `src/plugin-loopback.ts` | 插件桥回环执行器（PB-3）：本机回环 GET 插件路由，token 换 cookie（401 重换一次），cookie 只存内存；https 仅对字面 127.0.0.1 放宽证书校验 |
 | `src/plugin-route-intercept.ts` | 子客户端改道（PB-4）：包装宿主 webServer 的 `match`，声明命中的虚拟 id 请求改走 `relay.pluginRequest`；未桥接一律统一 503（`x-zen-remote: unbridged`），绝不落本机插件 |
+| `src/plugin-adapter-core.ts` | 适配器框架核心（PB-11）：适配器路由/定位器的校验、三种定位（query/路径段/JSON 体）的「远程/本地/混合」判定与双向改写、适配器摘要与让位判定；纯逻辑，框架两半只 import 这里 |
+| `src/adapters/` | 适配器目录（PB-11）：`index.ts` 只导出 `ADAPTERS` 数组（本单为空，PB-12 加第一个），`types.ts` 放适配器作者接口，实现各占一个子目录；**除 `src/index.ts` 接线外任何文件不得 import 此目录**，适配器实现只可 import `types.ts` 与纯工具 |
 | `src/client-data/plugin-bridge.ts` | 设置页纯函数（PB-5）：桥接状态 → 文案键、整机数据同意表的切换（只动一键）；浏览器半边，不 import 主包 |
 | `src/fetch-route-intercept.ts` | 子客户端本机拦截的第二半：包装宿主连接服务 `fetchRoutes` 表的上传与导出两项——远程会话的非图片附件经 `relay/v1/upload` 流式转服务端（超限本地拒、失败回宿主自己的 200 失败信封）、虚拟 id 的导出后台 403（形态检测、懒装重试、卸载守卫） |
 | `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数，无状态） |
@@ -113,6 +115,13 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
   禁止「从参数里
   通用扫描会话 id」的写法——DSH 会悄悄丢掉不认识的参数名，扫描会被诱饵
   字段骗过；全局读（`session/list` 等）安全靠输出过滤，不靠输入判定。
+- **适配器必须可插拔**：`src/adapters/` 整个目录删掉后其余功能一字不改——
+  框架只消费 `src/plugin-adapter-core.ts`（在适配器目录之外），接线只有
+  `src/index.ts` 一处 import `./adapters/index`，`createRelayHandler` /
+  `installPluginRouteIntercept` / admin 列表的适配器参数全部缺省空；改
+  框架两半时不得新增对适配器目录的 import（`test/adapters-pluggable.test.cjs`
+  的静态扫描钉住）。适配器让位规则：插件自己登记的协作声明永远优先，
+  运行时逐请求核对注册表摘要。
 - **桌面端请求没有 `Origin`/`Sec-Fetch-Site`**：DSH 桌面端主进程把窗口请求
   转发给本机后台前，自己校验过 `Origin: dsh-app://app`，然后删掉
   `host` / `origin` / `cookie` / `sec-fetch-site`。所以 `src/http.ts` 的

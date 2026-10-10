@@ -30,6 +30,7 @@ import type { ShareStore } from './share-store.js';
 import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js';
 import { type PluginTunnelRoutes } from './plugin-tunnel.js';
 import type { PluginLoopback } from './plugin-loopback.js';
+import type { NormalizedAdapter } from './plugin-adapter-core.js';
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
  * trailing slash: the webserver matches a prefix route as `pathname === p ||
@@ -176,6 +177,10 @@ export interface RelayHandlerOptions {
          * that predates the tunnels — and the three `plugin-tunnel` routes
          * answer 501 `unsupported` like an unwired bridge. */
         tunnel?: PluginTunnelRoutes;
+        /** The validated adapters (PB-11), as the wiring registered them.
+         * Absent/empty — the pluggable default — and `v1/plugin` serves
+         * cooperative declarations only, exactly as before. */
+        adapters?: readonly NormalizedAdapter[];
     };
 }
 /**

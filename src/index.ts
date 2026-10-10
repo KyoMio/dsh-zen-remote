@@ -61,6 +61,9 @@ import { checkFetchRouteShape, installFetchRouteIntercept } from './fetch-route-
 import type { FetchRouteInterceptDiagnostics, FetchRouteInterceptHandle, FetchRouteShapeCheck } from './fetch-route-intercept.js'
 import { checkWebServerShape, installPluginRouteIntercept } from './plugin-route-intercept.js'
 import type { PluginRouteInterceptDiagnostics, PluginRouteInterceptHandle, WebServerShapeCheck } from './plugin-route-intercept.js'
+import { normalizeAdapter, adapterOwnsRegistryEntry } from './plugin-adapter-core.js'
+import type { NormalizedAdapter } from './plugin-adapter-core.js'
+import { ADAPTERS } from './adapters/index.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
@@ -519,6 +522,45 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   ctx.effect(() => () => {
     if (bridgeRegistry === registry) bridgeRegistry = undefined
   }, 'dsh-zen-remote: plugin bridge registry disposal')
+  // The adapters (PB-11): each one registers ONLY against its target's
+  // EXACT installed version, probed off the host's `pluginPackages` service
+  // (`packageOf(name, ctx.baseUrl)` — verified on 0.2.0-rc.2 to answer
+  // `{name, version, dir, …}` or undefined; any other shape, a missing
+  // service or a probe failure reads as "not installed" and the adapter
+  // stays out). A plugin that registers its OWN cooperative declaration
+  // always wins: the adapter yields at registration time (logged), and the
+  // runtime re-checks the registry digest on every request. Both roles run
+  // this loop — the registry entries drive the handshake table, the bridge
+  // verdicts and the settings listing on either side, while the returned
+  // array feeds the two request halves.
+  const adapters: NormalizedAdapter[] = []
+  {
+    const adapterWarn = (text: string): void => { ctx.logger?.warn('dsh-zen-remote adapter: %s', text) }
+    for (const adapter of ADAPTERS) {
+      try {
+        const holder = ctx as unknown as { get?: (name: string) => unknown; baseUrl?: string }
+        const packages = holder.get?.('pluginPackages') as { packageOf?: (specifier: string, parentURL: string) => unknown } | undefined
+        const found = packages?.packageOf?.(adapter.plugin, holder.baseUrl ?? '') as { version?: unknown } | undefined
+        const installedVersion = found !== null && typeof found === 'object' && typeof (found as { version?: unknown }).version === 'string'
+          ? (found as { version: string }).version
+          : undefined
+        if (installedVersion === undefined || installedVersion === '') {
+          adapterWarn(`${adapter.plugin}: target package (or its version) not found; not registered`)
+          continue
+        }
+        const normalized = normalizeAdapter(adapter, installedVersion)
+        if (registry.get(normalized.plugin) !== undefined) {
+          adapterWarn(`${normalized.plugin}: the plugin registers its own bridge declaration; the adapter yields`)
+          continue
+        }
+        registry.registerNormalized(normalized.declaration)
+        adapters.push(normalized)
+        ctx.logger?.info('dsh-zen-remote adapter: %s adapted at version %s', normalized.plugin, installedVersion)
+      } catch (error) {
+        adapterWarn(`${adapter.plugin} refused: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
   if (effective.values.role === 'host') {
     // A row that switched from client to host must not leave a stale relay
     // client where getRelayClient() can find it (T23a-fix).
@@ -657,10 +699,13 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           sessionQuery: () => webCtx.reflect.get('sessionQuery') as SessionQueryLike | undefined,
           // The plugin bridge listing (PB-5): the SAME registry this apply
           // built and the SAME live consent reader the relay's plugins table
-          // uses — one source of truth per question.
+          // uses — one source of truth per question. PB-11: the listing
+          // marks the plugins an adapter stands in for (live — a plugin
+          // that registered its own declaration stops being marked).
           pluginBridge: {
             registry,
             getConsent: () => resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent,
+            adaptedPlugins: () => new Set(adapters.filter((adapter) => adapterOwnsRegistryEntry(adapter, registry.get(adapter.plugin))).map((adapter) => adapter.plugin)),
           },
         }),
       }), 'dsh-zen-remote: admin routes')
@@ -783,6 +828,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             registry,
             getConsent: pluginConsent,
             loopback: pluginLoopback,
+            adapters,
             tunnel: createPluginTunnel({
               bridge: { registry, getConsent: pluginConsent, loopback: pluginLoopback },
               getTarget: getLoopbackTarget,
@@ -1086,6 +1132,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           refused: 0,
           refusalsByReason: {},
           recentFailures: [],
+          adapterForwarded: 0,
+          adapterResponseRewrites: 0,
+          adapterResponsePassthroughs: 0,
           tunnelsCurrent: 0,
           tunnelsOpened: 0,
           tunnelsClosed: 0,
@@ -1118,6 +1167,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         relay: relayClient,
         getServerId: () => relayClient.handshakeInfo?.serverId,
         getStatus: pluginBridgeStatus,
+        adapters,
         log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
       })
       pluginRouteHandle = handle

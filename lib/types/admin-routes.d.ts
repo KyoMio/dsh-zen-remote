@@ -115,6 +115,10 @@ export interface AdminHandlerOptions {
     pluginBridge?: {
         registry: BridgeRegistry;
         getConsent: () => Record<string, boolean>;
+        /** The plugins an ADAPTER currently stands in for (PB-11), read live
+         * per listing — a plugin that registered its own declaration stops
+         * being marked. Absent on a wiring that predates adapters. */
+        adaptedPlugins?: () => ReadonlySet<string>;
     };
 }
 /** The slice of the sessionQuery service the share action reads (RT

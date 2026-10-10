@@ -31,7 +31,9 @@ import { routeMethodsOf, routeMaxBodyOf, routeUpgradesOf } from './plugin-bridge
 import { Readable, Transform } from 'node:stream'
 import type { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
-import { fromVirtual } from './virtual-id.js'
+import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
+import type { NormalizedAdapter, NormalizedAdapterRoute, AdapterIdHit, AdapterVerdict } from './plugin-adapter-core.js'
+import { adapterPathMatches, classifyAdapterRequest, rewriteAdapterRequest, adapterOwnsRegistryEntry, MAX_ADAPTER_RESPONSE_BUFFER_BYTES } from './plugin-adapter-core.js'
 
 /** Structural verdict of {@link checkWebServerShape}: the facts the wrap
  * reads per request — the `match` function the host's handle calls, the two
@@ -85,6 +87,13 @@ export interface PluginRouteInterceptDiagnostics {
   /** PB-10: tunnels opened / torn down since the install. */
   tunnelsOpened: number
   tunnelsClosed: number
+  /** PB-11: adapter requests forwarded through the relay. */
+  adapterForwarded: number
+  /** PB-11: adapter JSON answers rewritten by a `client.response` hook, and
+   * answers that passed through UNTOUCHED because the buffer cap (8 MB) or
+   * a parse failure made a rewrite impossible. */
+  adapterResponseRewrites: number
+  adapterResponsePassthroughs: number
 }
 
 export interface InstallPluginRouteInterceptOptions {
@@ -101,6 +110,10 @@ export interface InstallPluginRouteInterceptOptions {
   /** The PB-2 bridge verdicts, computed live per call; a plugin that is
    * not bridged right now refuses with the status's own reason. */
   getStatus: () => BridgeStatus[]
+  /** The validated adapters (PB-11), as the wiring registered them.
+   * Absent/empty — the pluggable default — means no adapter routes exist
+   * and this interception behaves exactly as before. */
+  adapters?: readonly NormalizedAdapter[]
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
 }
@@ -149,6 +162,9 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           refused: 0,
           refusalsByReason: {},
           recentFailures: [],
+          adapterForwarded: 0,
+          adapterResponseRewrites: 0,
+          adapterResponsePassthroughs: 0,
           tunnelsCurrent: 0,
           tunnelsOpened: 0,
           tunnelsClosed: 0,
@@ -157,12 +173,16 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     }
   }
   const { webServer, registry, relay, getServerId, getStatus, log } = options
+  const adapters = options.adapters ?? []
   const target = webServer as { match: (this: unknown, pathname: string) => unknown }
   const savedMatch = target.match
 
   let installed = true
   let forwarded = 0
   let refused = 0
+  let adapterForwarded = 0
+  let adapterResponseRewrites = 0
+  let adapterResponsePassthroughs = 0
   let tunnelsCurrent = 0
   let tunnelsOpened = 0
   let tunnelsClosed = 0
@@ -464,20 +484,399 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       }
     }
 
-  /** The wrapped match: original verdict first, then the exact declaration
-   * lookup — an undeclared pathname returns whatever the original match
-   * answered, untouched. */
+  // ---- PB-11: the adapter interception ---------------------------------------
+  //
+  // An adapter (src/adapters/, validated into a NormalizedAdapter by the
+  // wiring) claims routes of a NON-cooperative plugin: the match lookup
+  // below hands one of those requests to a surrogate that locates the
+  // session ids (query / path segment / JSON body), classifies the request
+  // — every id virtual → forward, none → local passthrough, a mix → the
+  // uniform 503 (docs/adr/0001: a remote session never reaches a local
+  // plugin) — rewrites the ids to their real halves and forwards through
+  // the SAME relay door the cooperative surrogate uses. On the way back a
+  // `client.response` hook maps real ids to virtual form inside a buffered
+  // JSON answer (8 MB cap; past it the answer passes through untouched).
+
+  /** The adapter route this pathname hits, if any: only an adapter that
+   * STILL owns its plugin's registry entry qualifies — a plugin's own
+   * cooperative declaration always wins, and the adapter yields silently
+   * here (the registration-time yield logged a line already). */
+  const adapterRouteOf = (pathname: string): { adapter: NormalizedAdapter; route: NormalizedAdapterRoute } | undefined => {
+    if (!installed || adapters.length === 0) return undefined
+    for (const adapter of adapters) {
+      if (!adapterOwnsRegistryEntry(adapter, registry.get(adapter.plugin))) continue
+      for (const route of adapter.routes) {
+        if (route.local) continue
+        if (adapterPathMatches(route, pathname)) return { adapter, route }
+      }
+    }
+    return undefined
+  }
+
+  /** The adapter surrogate: locate → classify → walls → rewrite → hooks →
+   * the relay round-trip, then the buffered JSON rewrite on the way back. */
+  const adapterSurrogateHandler = (hit: { adapter: NormalizedAdapter; route: NormalizedAdapterRoute }, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      const { adapter, route } = hit
+      const plugin = adapter.plugin
+      // The local passthrough. A body-locating route has ALREADY consumed
+      // the request body by the time this runs, so the replay hands the
+      // buffered bytes back behind the original request's metadata — the
+      // shape a local handler actually reads (method/url/headers/pipe).
+      const passthrough = async (replayBody?: Buffer): Promise<void> => {
+        if (originalHandler === undefined) {
+          res.writeHead(404)
+          res.end()
+          return
+        }
+        if (replayBody !== undefined) {
+          const replay = new Transform()
+          replay.end(replayBody)
+          Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
+          await originalHandler(replay as unknown as IncomingMessage, res)
+          return
+        }
+        await originalHandler(req, res)
+      }
+      // Chained-over: inert passthrough, exactly the posture of the other
+      // intercepts.
+      if (!installed) {
+        await passthrough()
+        return
+      }
+      let controller: AbortController | undefined
+      const onClientGone = (): void => {
+        if (controller !== undefined && !res.writableEnded) controller.abort()
+      }
+      res.on('close', onClientGone)
+      try {
+        let url: URL
+        try {
+          url = new URL(req.url ?? '/', 'http://local')
+        } catch {
+          answerUnbridged(res, plugin, 'bad-query')
+          return
+        }
+        const pathname = url.pathname
+        const searchParams = url.searchParams
+        const method = req.method ?? 'GET'
+        const hasBody = method !== 'GET' && method !== 'HEAD'
+
+        // A body-locating route buffers the request body up front (bounded
+        // by the route's own maxBody — the cooperative 413 shape, answered
+        // locally, the plugin never reached). Any other locator's body
+        // streams through the cooperative counting gate below.
+        let bufferedBody: Buffer | undefined
+        if (hasBody && route.locator.in === 'json-body') {
+          const chunks: Buffer[] = []
+          let size = 0
+          let over = false
+          for await (const chunk of req) {
+            size += (chunk as Buffer).length
+            if (size > route.maxBody) {
+              over = true
+              break
+            }
+            chunks.push(Buffer.from(chunk as Uint8Array))
+          }
+          if (over) {
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.writeHead(413)
+            res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+            recordRefusal(plugin, 'body-too-large')
+            return
+          }
+          bufferedBody = Buffer.concat(chunks)
+        }
+        // A present body must be a JSON object when the route locates in
+        // the body: a remote request with a corrupted body refuses rather
+        // than falling through to the local plugin.
+        let parsedBody: unknown
+        let bodyGiven = false
+        if (hasBody && route.locator.in === 'json-body' && bufferedBody !== undefined && bufferedBody.length > 0) {
+          try {
+            parsedBody = JSON.parse(bufferedBody.toString('utf8'))
+            bodyGiven = true
+          } catch {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+        }
+
+        // The remote/local verdict on the ids as they arrived.
+        const verdict = classifyAdapterRequest(route, pathname, searchParams, bodyGiven ? parsedBody : undefined)
+        if (verdict.kind === 'local') {
+          await passthrough(bufferedBody)
+          return
+        }
+        if (verdict.kind === 'mixed') {
+          answerUnbridged(res, plugin, 'bad-query')
+          return
+        }
+        // Remote: the route's method wall, then per-id server walls.
+        if (!route.methods.includes(method)) {
+          answerUnbridged(res, plugin, 'method-not-bridged')
+          return
+        }
+        const serverId = getServerId()
+        for (const idHit of verdict.hits) {
+          const parts = fromVirtual(idHit.value)
+          if (parts === undefined || parts.id === '') {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+          if (parts.serverId !== serverId) {
+            answerUnbridged(res, plugin, 'server-changed')
+            return
+          }
+        }
+        // The bridge verdicts (version skew, consent, offline…) judged from
+        // the SAME live table the cooperative surrogate reads — the
+        // adapter's registry entry makes the plugin indistinguishable from
+        // a cooperative one here.
+        const status = getStatus().find((entry) => entry.plugin === plugin)
+        if (status === undefined || !status.bridged) {
+          answerUnbridged(res, plugin, status?.reason ?? 'not-on-server')
+          return
+        }
+
+        // Real ids in, coordinates rewritten.
+        const rewrite = rewriteAdapterRequest(route, pathname, searchParams, bodyGiven ? parsedBody : undefined, verdict.hits, (virtualId) => fromVirtual(virtualId)!.id)
+        // The client hook: refuse, or replace the parsed body wholesale.
+        // The hook sees the REWRITTEN body — the ids are already real (the
+        // design's order: locate → rewrite → hook → forward).
+        const hook = adapter.hooks.client?.request
+        if (hook !== undefined) {
+          const hookedBody = bodyGiven && rewrite.bodyText !== undefined ? JSON.parse(rewrite.bodyText) : bodyGiven ? parsedBody : undefined
+          let hookVerdict: AdapterVerdict
+          try {
+            hookVerdict = hook({ method, route, query: rewrite.query, body: hookedBody })
+          } catch {
+            answerUnbridged(res, plugin, 'internal')
+            return
+          }
+          if (!hookVerdict.allow) {
+            answerUnbridged(res, plugin, hookVerdict.reason)
+            return
+          }
+          if (hookedBody !== undefined && hookVerdict.body !== undefined) {
+            rewrite.bodyText = JSON.stringify(hookVerdict.body)
+          }
+        }
+
+        controller = new AbortController()
+        adapterForwarded += 1
+        // The forward. A body-locating route sends its (possibly rewritten)
+        // buffer; any other body rides the cooperative counting gate.
+        const accept = typeof req.headers.accept === 'string' ? req.headers.accept : undefined
+        const range = typeof req.headers.range === 'string' ? req.headers.range : undefined
+        const requestContentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined
+        let bodyStream: ReadableStream<Uint8Array> | null = null
+        let contentLength: number | undefined
+        if (hasBody && route.locator.in === 'json-body') {
+          const payload = rewrite.bodyText !== undefined ? Buffer.from(rewrite.bodyText, 'utf8') : bufferedBody ?? Buffer.alloc(0)
+          contentLength = payload.length
+          bodyStream = Readable.toWeb(Readable.from(payload)) as ReadableStream<Uint8Array>
+        } else if (hasBody) {
+          let pumped = 0
+          const gate = new Transform({
+            transform(chunk: Buffer, _encoding, callback) {
+              pumped += chunk.length
+              if (pumped > route.maxBody) {
+                callback(new Error('zr-plugin-body-too-large'))
+                return
+              }
+              callback(null, chunk)
+            },
+          })
+          gate.on('error', () => controller?.abort())
+          bodyStream = Readable.toWeb(gate) as ReadableStream<Uint8Array>
+          req.pipe(gate)
+        }
+        const response = await relay.pluginRequest(
+          {
+            plugin,
+            version: adapter.declaration.version,
+            digest: adapter.digest,
+            path: rewrite.pathname,
+            query: rewrite.query.toString(),
+            method,
+            ...(bodyStream !== null ? { body: bodyStream } : {}),
+            ...(bodyStream !== null && requestContentType !== undefined ? { contentType: requestContentType } : {}),
+            ...(bodyStream !== null && contentLength !== undefined ? { contentLength } : {}),
+            ...(accept !== undefined ? { accept } : {}),
+            ...(range !== undefined ? { range } : {}),
+          },
+          controller.signal,
+        )
+        const refusal = response.headers.get('x-zen-remote-error')
+        if (refusal !== null) {
+          await response.body?.cancel().catch(() => {})
+          answerUnbridged(res, plugin, refusal)
+          return
+        }
+        const contentType = response.headers.get('content-type')
+        const responseLength = response.headers.get('content-length')
+        const cacheControl = response.headers.get('cache-control')
+        const responseHook = adapter.hooks.client?.response
+        const rewriteCandidate = responseHook !== undefined && !route.stream && contentType !== null && contentType.includes('application/json')
+        if (!rewriteCandidate) {
+          // The verbatim pump: chunk-for-chunk with real backpressure, the
+          // cooperative surrogate's discipline.
+          res.writeHead(response.status, {
+            ...(contentType !== null ? { 'content-type': contentType } : {}),
+            ...(responseLength !== null ? { 'content-length': responseLength } : {}),
+            ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+          })
+          const reader = response.body?.getReader()
+          if (reader !== undefined) {
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
+              if (!res.write(value)) {
+                await new Promise<void>((resolve) => {
+                  const settled = (): void => {
+                    res.off('drain', settled)
+                    res.off('close', settled)
+                    resolve()
+                  }
+                  res.once('drain', settled)
+                  res.once('close', settled)
+                })
+              }
+            }
+          }
+          res.end()
+          return
+        }
+        // The buffered rewrite: the whole answer (≤ 8 MB), parsed, hooked,
+        // re-serialized with a corrected content-length. Past the cap — or
+        // on a parse/hook failure — the answer passes through untouched.
+        const reader = response.body!.getReader()
+        const chunks: Buffer[] = []
+        let size = 0
+        let overflow = false
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          size += value.length
+          // The over-cap chunk ITSELF is body content — it lands in the
+          // passthrough buffer too; only the REWRITE is cancelled.
+          chunks.push(Buffer.from(value))
+          if (size > MAX_ADAPTER_RESPONSE_BUFFER_BYTES) {
+            overflow = true
+            break
+          }
+        }
+        if (overflow) {
+          adapterResponsePassthroughs += 1
+          res.writeHead(response.status, {
+            ...(contentType !== null ? { 'content-type': contentType } : {}),
+            ...(responseLength !== null ? { 'content-length': responseLength } : {}),
+            ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+          })
+          for (const chunk of chunks) {
+            if (!res.write(chunk)) {
+              await new Promise<void>((resolve) => {
+                const settled = (): void => {
+                  res.off('drain', settled)
+                  res.off('close', settled)
+                  resolve()
+                }
+                res.once('drain', settled)
+                res.once('close', settled)
+              })
+            }
+          }
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            if (!res.write(value)) {
+              await new Promise<void>((resolve) => {
+                const settled = (): void => {
+                  res.off('drain', settled)
+                  res.off('close', settled)
+                  resolve()
+                }
+                res.once('drain', settled)
+                res.once('close', settled)
+              })
+            }
+          }
+          res.end()
+          return
+        }
+        const text = Buffer.concat(chunks).toString('utf8')
+        let rewrittenBody: unknown
+        try {
+          rewrittenBody = responseHook({
+            status: response.status,
+            body: JSON.parse(text),
+            virtualize: (id: string) => toVirtual(serverId ?? '', id),
+            isVirtual: (value: unknown) => isVirtual(value),
+          })
+        } catch {
+          adapterResponsePassthroughs += 1
+          const passthroughBody = Buffer.from(text, 'utf8')
+          res.writeHead(response.status, {
+            ...(contentType !== null ? { 'content-type': contentType } : {}),
+            ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+            'content-length': String(passthroughBody.length),
+          })
+          res.end(passthroughBody)
+          return
+        }
+        adapterResponseRewrites += 1
+        const outBody = Buffer.from(JSON.stringify(rewrittenBody), 'utf8')
+        res.writeHead(response.status, {
+          ...(contentType !== null ? { 'content-type': contentType } : {}),
+          ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+          'content-length': String(outBody.length),
+        })
+        res.end(outBody)
+      } catch (error) {
+        if (controller?.signal.aborted || res.destroyed || res.headersSent) {
+          try {
+            res.destroy()
+          } catch {
+            // Already gone.
+          }
+          return
+        }
+        const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : 'offline'
+        answerUnbridged(res, plugin, code === 'aborted' ? 'offline' : code)
+      } finally {
+        res.off('close', onClientGone)
+      }
+    }
+
+  /** The wrapped match: original verdict first, then the adapter routes
+   * (PB-11 — BEFORE the declaration lookup: the adapter's registry entry
+   * IS a declaration, and the cooperative surrogate's query-sessionParam
+   * logic is not how an adapter request is judged), then the exact
+   * declaration lookup — an undeclared pathname returns whatever the
+   * original match answered, untouched. */
   const wrappedMatch = function match(this: unknown, pathname: string): unknown {
     const route = savedMatch.call(this, pathname)
     if (!installed) return route
     if (typeof pathname !== 'string' || !pathname.startsWith('/')) return route
-    const declared = declaredRouteOf(pathname)
-    if (declared === undefined) return route
-    return {
-      kind: 'exact',
-      path: pathname,
-      handler: surrogateHandler(declared, handlerOf(route)),
+    const adapterHit = adapterRouteOf(pathname)
+    if (adapterHit !== undefined) {
+      return {
+        kind: 'exact',
+        path: pathname,
+        handler: adapterSurrogateHandler(adapterHit, handlerOf(route)),
+      }
     }
+    const declared = declaredRouteOf(pathname)
+    if (declared !== undefined) {
+      return {
+        kind: 'exact',
+        path: pathname,
+        handler: surrogateHandler(declared, handlerOf(route)),
+      }
+    }
+    return route
   }
 
   // ---- PB-10: the WebSocket upgrade interception -----------------------------
@@ -738,6 +1137,9 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         refused,
         refusalsByReason: { ...refusalsByReason },
         recentFailures: [...recentFailures],
+        adapterForwarded,
+        adapterResponseRewrites,
+        adapterResponsePassthroughs,
         tunnelsCurrent,
         tunnelsOpened,
         tunnelsClosed,

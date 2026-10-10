@@ -32,6 +32,7 @@ const { toVirtual } = require('../lib/virtual-id.js')
 const { normalizeDeclaration, createBridgeRegistry, compareBridges } = require('../lib/plugin-bridge.js')
 const { createPluginLoopback } = require('../lib/plugin-loopback.js')
 const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
+const { normalizeAdapter } = require('../lib/plugin-adapter-core.js')
 const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
@@ -2357,6 +2358,117 @@ test('e2e PB-10: a browser WebSocket on the sub-client speaks to the bridged plu
     assert.ok(localMessages.includes('local-answer'), 'the local answer came from the LOCAL handler')
     assert.equal(localWs.opened, 1, 'exactly the local session reached the local handler')
     local.close()
+  } finally {
+    handle.uninstall()
+    await env.stop()
+    await subStop()
+    await dshStop()
+  }
+})
+
+// ---- PB-11: an adapter crosses the whole chain end to end ----------------------
+
+test('e2e PB-11: a fake adapter forwards a JSON-body request for a remote session and maps the answer\u2019s id back to virtual form', async () => {
+  // The fake DSH: the third-party plugin's route. It records what arrived
+  // and answers with a body carrying the REAL session id.
+  const dshHits = []
+  const fakeDsh = http.createServer((req, res) => {
+    res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+    res.end()
+  })
+  fakeDsh.on('request', () => {})
+  const dshServer = http.createServer((req, res) => {
+    if (new URL(req.url ?? '/', 'http://x').pathname === '/') {
+      res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+      res.end()
+      return
+    }
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      dshHits.push({ path: new URL(req.url ?? '/', 'http://x').pathname, body: Buffer.concat(chunks).toString('utf8') })
+      const body = JSON.parse(dshHits[dshHits.length - 1].body || '{}')
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ served: true, sessionId: body.sessionId ?? 'unknown' }))
+    })
+  })
+  await new Promise((resolve) => dshServer.listen(0, '127.0.0.1', resolve))
+  const dshPort = dshServer.address().port
+  const dshStop = () => new Promise((done) => { dshServer.closeAllConnections(); dshServer.close(done) })
+
+  // The fake adapter (the tests' stand-in for a real one — the real array
+  // in src/adapters/ stays empty until PB-12): JSON-body locating plus a
+  // response rewrite.
+  const ADAPTER_INPUT = {
+    plugin: 'fake-panel', versions: ['1.0.0'],
+    client: { response: (ctx) => ({ ...ctx.body, sessionId: ctx.virtualize(ctx.body.sessionId) }) },
+    routes: [{ path: '/fake-panel/api', match: 'prefix', methods: ['POST'], locator: { in: 'json-body', fields: ['sessionId'] } }],
+  }
+  const adapter = normalizeAdapter(ADAPTER_INPUT, '1.0.0')
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => ({ 'fake-panel': { version: '1.0.0', digest: adapter.digest, serverScopeConsent: true } }),
+    pluginBridge: {
+      registry: (() => { const r = createBridgeRegistry(); r.registerNormalized(adapter.declaration); return r })(),
+      getConsent: () => ({ 'fake-panel': true }),
+      loopback: createPluginLoopback({
+        getTarget: () => ({ protocol: 'http:', port: dshPort }),
+        getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+      }),
+      adapters: [adapter],
+    },
+  })
+
+  const hostRaw = {
+    exact: new Map(), prefixes: new Map(), upgrades: new Map(),
+    match(pathname) { return this.exact.get(pathname) ?? [...this.prefixes.values()].find((r) => pathname.startsWith(`${r.path}/`)) },
+    register(route) { (route.kind === 'exact' ? this.exact : this.prefixes).set(route.path, route); return () => undefined },
+  }
+  const subServer = http.createServer((req, res) => {
+    Promise.resolve(hostRaw.match(new URL(req.url ?? '/', 'http://x').pathname)).then(async (route) => {
+      if (route !== undefined) {
+        await route.handler(req, res)
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    }).catch(() => { try { res.destroy() } catch { /* gone */ } })
+  })
+  await new Promise((resolve) => subServer.listen(0, '127.0.0.1', resolve))
+  const subPort = subServer.address().port
+  const subStop = () => new Promise((done) => { subServer.closeAllConnections(); subServer.close(done) })
+
+  const localRegistry = createBridgeRegistry()
+  localRegistry.registerNormalized(adapter.declaration)
+  const handle = installPluginRouteIntercept({
+    webServer: hostRaw,
+    registry: localRegistry,
+    relay: env.client,
+    getServerId: () => env.client.handshakeInfo?.serverId,
+    getStatus: () => compareBridges(localRegistry.list(), env.client.handshakeInfo?.plugins, env.client.state === 'online'),
+    adapters: [adapter],
+    log: () => {},
+  })
+
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const virtual = toVirtual(info.serverId, 'session-a')
+
+    const answer = await fetch(`http://127.0.0.1:${subPort}/fake-panel/api/open`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: virtual, note: 'hello' }),
+    })
+    assert.equal(answer.status, 200, `the adapter forward crossed every hop: ${await answer.clone().text()}`)
+    assert.deepEqual(await answer.json(), { served: true, sessionId: virtual }, 'the answer\u2019s real id came back VIRTUAL')
+    // The fake DSH saw the REAL id and the untouched extra field.
+    assert.equal(dshHits.length, 1)
+    assert.equal(dshHits[0].path, '/fake-panel/api/open')
+    const seen = JSON.parse(dshHits[0].body)
+    assert.equal(seen.sessionId, 'session-a', 'the plugin received the REAL id')
+    assert.equal(seen.note, 'hello')
+    assert.equal(answer.headers.get('content-length'), String(Buffer.byteLength(JSON.stringify({ served: true, sessionId: virtual }))), 'the content-length matches the rewritten body')
   } finally {
     handle.uninstall()
     await env.stop()
