@@ -2644,7 +2644,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           return { ok: true, value: undefined }
         }
         recordFailure(endpoint, code)
-        return { ok: false, error: { code, message: messageOf(error), details: {} } }
+        // The host's sanitized `details` rides along when present — its
+        // `reason` codes (MODEL_DOES_NOT_SUPPORT_IMAGES, …) are what the UI
+        // maps onto a user-facing line; without them it prints `undefined`.
+        return { ok: false, error: { code, message: messageOf(error), details: error instanceof RelayError && isPlainObject(error.details) ? error.details : {} } }
       }
     })()
   }
@@ -2703,7 +2706,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // A call on a closed session reads like the banner, not like the
       // relay's bare code (T73).
       const message = code === 'not-shared' ? CLOSED_MESSAGE : messageOf(error)
-      return { ok: false, error: { code, message, details: {} } }
+      return { ok: false, error: { code, message, details: error instanceof RelayError && isPlainObject(error.details) ? error.details : {} } }
     }
   }
 

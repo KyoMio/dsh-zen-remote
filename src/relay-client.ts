@@ -197,14 +197,31 @@ export class RelayError extends Error {
   code: string
   status?: number
   reason?: string
+  /** The host error's sanitized `details` (invoke path): the UI maps
+   *  `details.reason` codes like `MODEL_DOES_NOT_SUPPORT_IMAGES` onto a
+   *  user-facing line — absent details stay undefined. */
+  details?: Record<string, unknown>
 
-  constructor(code: string, message?: string, httpStatus?: number, reason?: string) {
+  constructor(code: string, message?: string, httpStatus?: number, reason?: string, details?: Record<string, unknown>) {
     super(message === undefined ? code : message)
     this.name = 'RelayError'
     this.code = code
     if (httpStatus !== undefined) this.status = httpStatus
     if (reason !== undefined) this.reason = reason
+    if (details !== undefined) this.details = details
   }
+}
+
+/** The error body's structured `details`, when it is a record of scalars —
+ *  the shape the server's own sanitizer emits. */
+function detailsOf(error: Record<string, unknown>): Record<string, unknown> | undefined {
+  const raw = error.details
+  if (!isRecord(raw)) return undefined
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || value === null) out[key] = value
+  }
+  return Object.keys(out).length > 0 ? out : undefined
 }
 
 export interface CreateRelayClientOptions {
@@ -948,7 +965,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // 200 {ok:false} envelopes, 400/404/429 answers and anything else
     // unheard-of: the body's error code is the answer, the state is not
     // touched.
-    if (code !== undefined) return new RelayError(code, message, status)
+    if (code !== undefined) return new RelayError(code, message, status, undefined, detailsOf(error))
     // The bad-gateway band carries no relay body of its own — it is what a
     // reverse proxy answers when the gateway behind it is down (nginx: an
     // HTML 502). That IS the offline case, and the e2e contract expects it.
