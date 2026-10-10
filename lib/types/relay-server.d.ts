@@ -27,6 +27,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ShareStore } from './share-store.js';
+import type { ServerPluginEntry } from './plugin-bridge.js';
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
  * trailing slash: the webserver matches a prefix route as `pathname === p ||
@@ -108,12 +109,17 @@ export interface RelayGateway {
  * callback too (T42), awaited per handshake so a just-restarted server never
  * serves a stale map; a THROWN compute degrades to the empty map here so a
  * broken fingerprint source can never fail the handshake itself — the
- * client's comparison judges every group `unavailable`, never `different`. */
+ * client's comparison judges every group `unavailable`, never `different`.
+ * `plugins` is the same discipline for the plugin bridge (PB-2): computed
+ * FRESH per handshake (the local registry and the row's consent map are both
+ * live), a THROWN compute degrades to the empty table — the handshake still
+ * succeeds and the client reads every local plugin `not-on-server`. */
 export interface RelayServerInfo {
     serverId: string;
     serverName: () => string;
     dshVersion: string;
     fingerprints?: () => Record<string, string> | Promise<Record<string, string>>;
+    plugins?: () => Record<string, ServerPluginEntry>;
 }
 export interface RelayHandlerOptions {
     /** The per-apply shared secret; an empty one refuses every request. */

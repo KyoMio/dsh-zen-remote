@@ -27,6 +27,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission } from './admin-routes.js';
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js';
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js';
+import type { BridgeStatus } from './plugin-bridge.js';
 import type { RelayClient } from './relay-client.js';
 /** Prefix all client routes live under (one webServer prefix registration). */
 export declare const CLIENT_ROUTE_PREFIX = "/_dsh/zen-remote/client";
@@ -86,6 +87,12 @@ export interface ClientHandlerOptions {
      * its refusal counters. Undefined when this composition never attempted
      * one (no connection service, or no fileUploads service to inject). */
     getFetchRouteIntercept?: () => FetchRouteInterceptDiagnostics | undefined;
+    /** The plugin bridge's live verdict (PB-2), computed PER CALL off the local
+     * registry, the last handshake's `plugins` table and the connection state —
+     * never a stored conclusion. Wired only by the CLIENT role's mount; absent
+     * (the host mount, old tests) both routes answer the empty shape: status's
+     * `pluginBridge: []` and remote-status's `bridgedPlugins: []`. */
+    getPluginBridgeStatus?: () => BridgeStatus[];
     /** Serve ONLY the remote-status route (T41a-fix2, the host role's mount):
      * every other route under the prefix answers the same 404 an unknown path
      * would. The claim / status / reconnect / unshare routes exist for a

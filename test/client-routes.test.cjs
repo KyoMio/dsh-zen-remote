@@ -88,6 +88,7 @@ function startClientServer(row, overrides = {}) {
     ...(overrides.fetchImpl !== undefined ? { fetchImpl: overrides.fetchImpl } : {}),
     ...(overrides.getRelayClient !== undefined ? { getRelayClient: overrides.getRelayClient } : {}),
     ...(overrides.getIntercept !== undefined ? { getIntercept: overrides.getIntercept } : {}),
+    ...(overrides.getPluginBridgeStatus !== undefined ? { getPluginBridgeStatus: overrides.getPluginBridgeStatus } : {}),
     ...(overrides.remoteStatusOnly !== undefined ? { remoteStatusOnly: overrides.remoteStatusOnly } : {}),
     ...(overrides.onCurrentSession !== undefined ? { onCurrentSession: overrides.onCurrentSession } : {}),
   })
@@ -376,7 +377,7 @@ test('status: no token in the row means unpaired and probes nothing', async () =
     const before = gwSeen.length
     const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
     assert.equal(res.status, 200)
-    assert.deepEqual(JSON.parse(res.body), { state: 'unpaired' })
+    assert.deepEqual(JSON.parse(res.body), { state: 'unpaired', pluginBridge: [] })
     assert.equal(gwSeen.length, before, 'nothing was probed')
   } finally {
     await closeServer(server)
@@ -392,7 +393,7 @@ test('status: the probe drives the state — connected (404), revoked (401), une
     const connected = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
     assert.equal(connected.status, 200)
     const connectedBody = JSON.parse(connected.body)
-    assert.deepEqual(connectedBody, { state: 'connected', serverUrl: gwUrl })
+    assert.deepEqual(connectedBody, { state: 'connected', serverUrl: gwUrl, pluginBridge: [] })
     // The probe presented the row's token as a Bearer header.
     const probe = gwSeen[gwSeen.length - 1]
     assert.equal(probe.url, '/_dsh/zen-remote/relay/ping')
@@ -400,11 +401,11 @@ test('status: the probe drives the state — connected (404), revoked (401), une
 
     gwState.pingReply = () => [401, { ok: false, reason: 'unpaired' }]
     const revoked = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(revoked, { state: 'revoked', serverUrl: gwUrl })
+    assert.deepEqual(revoked, { state: 'revoked', serverUrl: gwUrl, pluginBridge: [] })
 
     gwState.pingReply = () => [403, { ok: false, reason: 'relay-only' }]
     const unexpected = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(unexpected, { state: 'unexpected', serverUrl: gwUrl })
+    assert.deepEqual(unexpected, { state: 'unexpected', serverUrl: gwUrl, pluginBridge: [] })
 
     const dead = http.createServer()
     await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve))
@@ -414,7 +415,7 @@ test('status: the probe drives the state — connected (404), revoked (401), une
     const deadServer = await startClientServer(deadRow)
     try {
       const unreachable = JSON.parse((await request(deadServer.port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-      assert.deepEqual(unreachable, { state: 'unreachable', serverUrl: `http://127.0.0.1:${deadPort}` })
+      assert.deepEqual(unreachable, { state: 'unreachable', serverUrl: `http://127.0.0.1:${deadPort}`, pluginBridge: [] })
     } finally {
       await closeServer(deadServer.server)
     }
@@ -455,7 +456,7 @@ test('T16-fix: a stored plain-http PUBLIC address answers invalid-url and probes
     const before = gwSeen.length
     const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
     assert.equal(res.status, 200)
-    assert.deepEqual(JSON.parse(res.body), { state: 'invalid-url' })
+    assert.deepEqual(JSON.parse(res.body), { state: 'invalid-url', pluginBridge: [] })
     assert.equal(gwSeen.length, before, 'the mock gateway must not see a single request')
   } finally {
     await closeServer(server)
@@ -468,7 +469,7 @@ test('T16-fix: a stored address with a path also fails re-validation, a trailing
   try {
     const before = gwSeen.length
     const res = await request(a.port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
-    assert.deepEqual(JSON.parse(res.body), { state: 'invalid-url' })
+    assert.deepEqual(JSON.parse(res.body), { state: 'invalid-url', pluginBridge: [] })
     assert.equal(gwSeen.length, before)
   } finally {
     await closeServer(a.server)
@@ -641,7 +642,7 @@ test('T23a-fix status: an online relay over UNCHANGED credentials answers state 
     const before = gwSeen.length
     const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
     assert.equal(res.status, 200)
-    assert.deepEqual(JSON.parse(res.body), { state: 'online', serverName: '书房服务器', serverUrl: gwUrl, deviceName: '' }, 'no deviceName on the handshake → empty, nothing to follow')
+    assert.deepEqual(JSON.parse(res.body), { state: 'online', serverName: '书房服务器', serverUrl: gwUrl, deviceName: '', pluginBridge: [] }, 'no deviceName on the handshake → empty, nothing to follow')
     assert.equal(gwSeen.length, before, 'the cached verdict short-circuits — nothing left the box')
     assert.equal(relay.connectCount, 0, 'no live connect either')
   } finally {
@@ -687,7 +688,7 @@ test('T23a-fix status: a cleared token answers unpaired and connects nothing', a
   try {
     const before = gwSeen.length
     const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
-    assert.deepEqual(JSON.parse(res.body), { state: 'unpaired' })
+    assert.deepEqual(JSON.parse(res.body), { state: 'unpaired', pluginBridge: [] })
     assert.equal(gwSeen.length, before, 'nothing was probed')
     assert.equal(relay.connectCount, 0, 'nothing was connected')
   } finally {
@@ -701,7 +702,7 @@ test('T23a-fix status: an invalid stored address answers invalid-url and sends n
   const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
   try {
     const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
-    assert.deepEqual(JSON.parse(res.body), { state: 'invalid-url' })
+    assert.deepEqual(JSON.parse(res.body), { state: 'invalid-url', pluginBridge: [] })
     assert.equal(relay.connectCount, 0)
   } finally {
     await closeServer(server)
@@ -720,7 +721,7 @@ test('T23a-fix status: a relay that never connected gets a live connect on the s
   const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
   try {
     const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(body, { state: 'online', serverName: '现场握手', serverUrl: gwUrl, deviceName: '' })
+    assert.deepEqual(body, { state: 'online', serverName: '现场握手', serverUrl: gwUrl, deviceName: '', pluginBridge: [] })
     assert.equal(relay.connectCount, 1)
   } finally {
     await closeServer(server)
@@ -745,7 +746,7 @@ test('T23a-fix status: live-connect failures map — relay-unauthorized is unexp
     const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
     try {
       const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-      assert.deepEqual(body, { state: expected, serverUrl: gwUrl }, error.code)
+      assert.deepEqual(body, { state: expected, serverUrl: gwUrl, pluginBridge: [] }, error.code)
     } finally {
       await closeServer(server)
     }
@@ -871,7 +872,7 @@ test('T23a-fix status: a live connect that exceeds the probe timeout answers unr
   const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
   try {
     const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(body, { state: 'unreachable', serverUrl: gwUrl })
+    assert.deepEqual(body, { state: 'unreachable', serverUrl: gwUrl, pluginBridge: [] })
   } finally {
     await closeServer(server)
   }
@@ -905,11 +906,11 @@ test('T23a-fix probe: a 401 relay-unauthorized classifies as unexpected — only
   try {
     gwState.pingReply = () => [401, { ok: false, error: { code: 'relay-unauthorized' } }]
     const unexpected = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(unexpected, { state: 'unexpected', serverUrl: gwUrl })
+    assert.deepEqual(unexpected, { state: 'unexpected', serverUrl: gwUrl, pluginBridge: [] })
 
     gwState.pingReply = () => [401, { ok: false, reason: 'unpaired' }]
     const revoked = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(revoked, { state: 'revoked', serverUrl: gwUrl })
+    assert.deepEqual(revoked, { state: 'revoked', serverUrl: gwUrl, pluginBridge: [] })
   } finally {
     gwState.pingReply = () => [200, { ok: true }]
     await closeServer(server)
@@ -931,8 +932,8 @@ test('T23a-fix2 status: a second status during an unsettled connect joins it —
       request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE }),
       request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE }),
     ])
-    assert.deepEqual(JSON.parse(first.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl, deviceName: '' })
-    assert.deepEqual(JSON.parse(second.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl, deviceName: '' })
+    assert.deepEqual(JSON.parse(first.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl, deviceName: '', pluginBridge: [] })
+    assert.deepEqual(JSON.parse(second.body), { state: 'online', serverName: '并发握手', serverUrl: gwUrl, deviceName: '', pluginBridge: [] })
     assert.equal(relay.connectCount, 1, 'the second status joined the in-flight connect')
   } finally {
     await closeServer(server)
@@ -960,7 +961,7 @@ test('T23a-fix2 status: a changed ADDRESS (token unchanged) never serves the cac
   const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
   try {
     const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
-    assert.deepEqual(body, { state: 'online', serverName: '新地址的名字', serverUrl: newUrl, deviceName: '' }, 'the fresh connect answers, never the stale cache')
+    assert.deepEqual(body, { state: 'online', serverName: '新地址的名字', serverUrl: newUrl, deviceName: '', pluginBridge: [] }, 'the fresh connect answers, never the stale cache')
     assert.equal(relay.connectCount, 1, 'the digest mismatch forced a live connect')
   } finally {
     await closeServer(server)
@@ -1147,6 +1148,8 @@ test('T34 remote-status: the body carries state/compat/name/closed — and never
       versionMismatch: true,
       serverName: '书房服务器',
       closed: { [T34_VIRTUAL]: 'idle', [toVirtual(T34_SERVER_ID, 'b')]: 'client' },
+      // PB-2: no verdict source wired on this mount → the empty bridge list.
+      bridgedPlugins: [],
     })
     assert.ok(!res.body.includes('tok-row'), 'no token anywhere in the body')
     assert.ok(!res.body.includes(gwUrl), 'no server address in the body')
@@ -1158,7 +1161,7 @@ test('T34 remote-status: no relay client reads unpaired; an offline relay reads 
   const { server, port } = await startClientServer(row)
   try {
     const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })).body)
-    assert.deepEqual(body, { state: 'unpaired', versionMismatch: false, serverName: '', closed: {} })
+    assert.deepEqual(body, { state: 'unpaired', versionMismatch: false, serverName: '', closed: {}, bridgedPlugins: [] })
   } finally { await closeServer(server) }
 
   const relay = fakeRelay({ state: 'offline', handshakeInfo: INFO('断线服务器'), lastHandshakeDigest: 'd' })
@@ -1168,6 +1171,65 @@ test('T34 remote-status: no relay client reads unpaired; an offline relay reads 
     assert.equal(body.state, 'offline')
     assert.equal(body.versionMismatch, false, 'no compat verdict — no mismatch claim')
   } finally { await closeServer(second.server) }
+})
+
+// ---- PB-2: the plugin bridge fields on the two status routes ------------------
+
+test('PB-2 status: pluginBridge rides EVERY answer and is computed live per request', async () => {
+  const row = makeRow()
+  // A verdict source that ages between two reads — the route must re-ask it
+  // per request, never cache the first answer.
+  let verdicts = [{ plugin: 'stale-one', bridged: false, reason: 'offline', localVersion: '1.0.0' }]
+  const { server, port } = await startClientServer(row, { getPluginBridgeStatus: () => verdicts })
+  try {
+    const first = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(first.state, 'connected')
+    assert.deepEqual(first.pluginBridge, [{ plugin: 'stale-one', bridged: false, reason: 'offline', localVersion: '1.0.0' }])
+
+    verdicts = [
+      { plugin: 'a-bridged', bridged: true, localVersion: '2.0.0', serverVersion: '2.0.0' },
+      { plugin: 'b-consent', bridged: false, reason: 'consent-off', localVersion: '1.0.0', serverVersion: '1.0.0' },
+    ]
+    const second = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.deepEqual(second.pluginBridge, verdicts, 'the next request reads the fresh verdict, verbatim')
+  } finally { await closeServer(server) }
+
+  // No verdict source wired (old mounts, tests): the empty array, not a
+  // missing field — every status answer carries the field.
+  const bare = await startClientServer(row)
+  try {
+    const body = JSON.parse((await request(bare.port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.deepEqual(body.pluginBridge, [])
+  } finally { await closeServer(bare.server) }
+})
+
+test('PB-2 remote-status: bridgedPlugins lists ONLY the bridged names, sorted; the host mount reads []', async () => {
+  const row = makeRow()
+  const verdicts = [
+    { plugin: 'zeta-panel', bridged: false, reason: 'version-mismatch', localVersion: '1', serverVersion: '2' },
+    // The two BRIDGED names sit in reverse order on purpose: the field's
+    // sorted shape is pinned — dropping the implementation's .sort() fails
+    // this assertion with ['beta-notes', 'alpha-tasks'].
+    { plugin: 'beta-notes', bridged: true, localVersion: '1', serverVersion: '1' },
+    { plugin: 'mid-consent', bridged: false, reason: 'consent-off', localVersion: '1', serverVersion: '1' },
+    { plugin: 'alpha-tasks', bridged: true, localVersion: '1', serverVersion: '1' },
+  ]
+  const { server, port } = await startClientServer(row, {
+    getRelayClient: () => fakeRelay({ state: 'online', handshakeInfo: INFO('书房服务器'), lastHandshakeDigest: relayCredentialsDigest(gwUrl, 'tok-row') }),
+    getPluginBridgeStatus: () => verdicts,
+  })
+  try {
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })).body)
+    assert.deepEqual(body.bridgedPlugins, ['alpha-tasks', 'beta-notes'], 'only bridged plugins, name-sorted')
+  } finally { await closeServer(server) }
+
+  // The host mount (remoteStatusOnly): no verdict source is ever wired there,
+  // and the field still answers — the empty list.
+  const host = await startClientServer(row, { remoteStatusOnly: true })
+  try {
+    const body = JSON.parse((await request(host.port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })).body)
+    assert.deepEqual(body.bridgedPlugins, [], 'the host mount answers the empty bridge list')
+  } finally { await closeServer(host.server) }
 })
 
 test('T34 client/unshare: the wall order holds (401 unadmitted, 405 wrong method, 403 cross-site)', async () => {
@@ -1249,7 +1311,7 @@ test('T41a-fix2 remoteStatusOnly: the host mount serves remote-status alone — 
   try {
     const status = await request(port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })
     assert.equal(status.status, 200)
-    assert.deepEqual(JSON.parse(status.body), { state: 'unpaired', versionMismatch: false, serverName: '', closed: {} })
+    assert.deepEqual(JSON.parse(status.body), { state: 'unpaired', versionMismatch: false, serverName: '', closed: {}, bridgedPlugins: [] })
   } finally { await closeServer(server) }
 
   const unadmitted = await startClientServer(row, { remoteStatusOnly: true, admit: () => ({ rejection: 401 }) })

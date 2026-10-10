@@ -49,6 +49,7 @@ import { createHash } from 'node:crypto'
 
 import { compareFingerprints } from './fingerprint.js'
 import type { RelayCompatVerdict } from './fingerprint.js'
+import type { ServerPluginEntry } from './plugin-bridge.js'
 
 /** The one protocol version this client speaks; the handshake verifies it. */
 const RELAY_PROTOCOL = 1
@@ -179,6 +180,15 @@ export interface RelayHandshake {
    * has and pushes nothing.
    */
   deviceName?: string
+  /**
+   * The server's per-plugin bridge table (PB-2), verbatim from the
+   * handshake. `undefined` from an OLDER server whose handshake carries no
+   * `plugins` field at all — and that distinction is load-bearing:
+   * {@link compareBridges} reads `undefined` as `server-too-old`, while an
+   * empty table means "this server speaks the field, nothing registered"
+   * (`not-on-server`). Never normalized into `{}` here.
+   */
+  plugins?: Record<string, ServerPluginEntry>
 }
 
 /**
@@ -799,64 +809,105 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     void pushDeviceName(trimmed)
   }
 
-  /**
-   * One QUIET handshake re-run (T59): refreshes the two names while online —
-   * no state announcement, no ladder movement, failures silent (the next
-   * tick retries; the idle and heartbeat clocks own the link's verdict).
-   * The reply carries the gateway's freshest record of BOTH names (its
-   * marking headers are written per forward), so this is also how a rename
-   * an admin made on the server reaches an otherwise-idle client.
-   */
-  async function refreshInfo(): Promise<void> {
-    if (stopped || state !== 'online' || connectInFlight !== undefined) return
-    const creds = currentCredentials()
-    if (creds === undefined) return
-    // T59-fix: remember the world at request time — the answer only counts
-    // if we are still the same online client (the credential digest catches
-    // a re-pair to another server), and a name push that overlapped the
-    // round-trip makes the answer's deviceName a PRE-push record.
-    const digestAtStart = credentialsDigest
-    const pushSeqAtStart = deviceNamePushSeq
-    let payload: unknown
-    try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
-      if (typeof timer.unref === 'function') timer.unref()
-      try {
-        const response = await fetchImpl(`${creds.url}${HANDSHAKE_PATH}`, {
-          ...requestInit(creds.token, '{}'),
-          signal: controller.signal,
-        })
-        if (!response.ok) return
-        payload = await readPayload(response)
-      } finally {
-        clearTimeout(timer)
-      }
-    } catch {
-      return
-    }
-    if (stopped || state !== 'online' || credentialsDigest !== digestAtStart) return
-    if (!isRecord(payload) || payload.ok !== true || payload.relayProtocol !== RELAY_PROTOCOL) return
-    // T59-fix: NAMES ONLY. serverId / dshVersion / fingerprints belong to the
-    // real handshake (the compat verdict is computed there, on both maps
-    // fresh); a quiet refresh never disturbs them.
-    const previous = handshakeInfo
-    if (previous === undefined) return
-    const serverName = typeof payload.serverName === 'string' ? payload.serverName : previous.serverName
-    const serverDeviceName = infoString(payload.deviceName)
-    // A push that overlapped this round-trip — STARTED before it (the seq
-    // moved by the settle), still IN FLIGHT, or still QUEUED — makes the
-    // answer's deviceName a pre-push record: dropped, and the local
-    // authority stays; the next clean refresh confirms instead.
-    const pushedDuringRefresh = deviceNamePushSeq !== pushSeqAtStart || deviceNamePushBusy || pendingDeviceName !== undefined
-    const deviceName = pushedDuringRefresh ? undefined : serverDeviceName
-    if (deviceName !== undefined) deviceNameAuthoritative = false
-    let changed = previous.serverName !== serverName
-    if (deviceName !== undefined && deviceName !== previous.deviceName) changed = true
-    if (!changed) return
-    handshakeInfo = { ...previous, serverName, ...(deviceName !== undefined ? { deviceName } : {}) }
-    notify()
+/**
+ * Canonical JSON for CHANGE DETECTION (PB-2-fix): every object's keys are
+ * sorted, recursively, so two tables that differ only in key order — the
+ * server's map insertion order AND each entry's field order — compare
+ * equal. Anything else (values, entry sets) differs, and JSON.stringify
+ * answers scalars verbatim.
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+      .join(',')}}`
   }
+  return JSON.stringify(value)
+}
+
+/**
+ * One QUIET handshake re-run (T59): refreshes the two names while online —
+ * no state announcement, no ladder movement, failures silent (the next
+ * tick retries; the idle and heartbeat clocks own the link's verdict).
+ * The reply carries the gateway's freshest record of BOTH names (its
+ * marking headers are written per forward), so this is also how a rename
+ * an admin made on the server reaches an otherwise-idle client.
+ */
+async function refreshInfo(): Promise<void> {
+  if (stopped || state !== 'online' || connectInFlight !== undefined) return
+  const creds = currentCredentials()
+  if (creds === undefined) return
+  // T59-fix: remember the world at request time — the answer only counts
+  // if we are still the same online client (the credential digest catches
+  // a re-pair to another server), and a name push that overlapped the
+  // round-trip makes the answer's deviceName a PRE-push record.
+  const digestAtStart = credentialsDigest
+  const pushSeqAtStart = deviceNamePushSeq
+  let payload: unknown
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    try {
+      const response = await fetchImpl(`${creds.url}${HANDSHAKE_PATH}`, {
+        ...requestInit(creds.token, '{}'),
+        signal: controller.signal,
+      })
+      if (!response.ok) return
+      payload = await readPayload(response)
+    } finally {
+      clearTimeout(timer)
+    }
+  } catch {
+    return
+  }
+  if (stopped || state !== 'online' || credentialsDigest !== digestAtStart) return
+  if (!isRecord(payload) || payload.ok !== true || payload.relayProtocol !== RELAY_PROTOCOL) return
+  // T59-fix: NAMES ONLY. serverId / dshVersion / fingerprints belong to the
+  // real handshake (the compat verdict is computed there, on both maps
+  // fresh); a quiet refresh never disturbs them. PB-2 is the one addition:
+  // the plugin bridge table rides along, because a consent change on the
+  // server must reach an otherwise-idle client without a reconnect — and
+  // unlike the compat verdict it is never cached as a conclusion, the
+  // comparison runs live off this map. A refresh answer WITHOUT the field
+  // keeps whatever the real handshake stored.
+  const previous = handshakeInfo
+  if (previous === undefined) return
+  const serverName = typeof payload.serverName === 'string' ? payload.serverName : previous.serverName
+  const serverDeviceName = infoString(payload.deviceName)
+  // A push that overlapped this round-trip — STARTED before it (the seq
+  // moved by the settle), still IN FLIGHT, or still QUEUED — makes the
+  // answer's deviceName a pre-push record: dropped, and the local
+  // authority stays; the next clean refresh confirms instead.
+  const pushedDuringRefresh = deviceNamePushSeq !== pushSeqAtStart || deviceNamePushBusy || pendingDeviceName !== undefined
+  const deviceName = pushedDuringRefresh ? undefined : serverDeviceName
+  if (deviceName !== undefined) deviceNameAuthoritative = false
+  // PB-2-fix: compare the incoming table by CONTENT, not by reference — the
+  // payload was parsed fresh, so an unchanged table would otherwise read as
+  // changed on every tick and wake every subscriber (the interceptor's
+  // catalog listener re-pulls on each wake) for nothing. An unchanged table
+  // keeps the PREVIOUS object: identity is the "nothing moved" proof the
+  // changed flag reads.
+  let plugins = previous.plugins
+  if (isRecord(payload.plugins)) {
+    const incoming = payload.plugins as Record<string, ServerPluginEntry>
+    if (canonicalJson(incoming) !== canonicalJson(previous.plugins ?? {})) plugins = incoming
+  }
+  let changed = previous.serverName !== serverName
+  if (deviceName !== undefined && deviceName !== previous.deviceName) changed = true
+  if (plugins !== previous.plugins) changed = true
+  if (!changed) return
+  handshakeInfo = {
+    ...previous,
+    serverName,
+    ...(deviceName !== undefined ? { deviceName } : {}),
+    ...(plugins !== previous.plugins ? { plugins } : {}),
+  }
+  notify()
+}
 
   /** Arm one refresh tick; re-arms itself while the client stays online. */
   function armInfoRefresh(): void {
@@ -1148,6 +1199,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         // speaks the field at all (an older server omits it and the client
         // keeps whatever it had).
         ...(infoString(payload.deviceName) !== undefined ? { deviceName: infoString(payload.deviceName) } : {}),
+        // PB-2: the plugin bridge table, kept VERBATIM — an absent or
+        // malformed field stays `undefined` so the comparison reads
+        // server-too-old, never a silently empty table.
+        ...(isRecord(payload.plugins) ? { plugins: payload.plugins as Record<string, ServerPluginEntry> } : {}),
       }
       // Interface compatibility (T42): compare the handshake's group map
       // against this side's own, right here where both are fresh. A compute

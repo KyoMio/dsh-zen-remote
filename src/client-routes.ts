@@ -32,6 +32,7 @@ import { unwrapVolatile } from './config.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import { responseJson, sameOriginPost } from './http.js'
+import type { BridgeStatus } from './plugin-bridge.js'
 import { RELAY_HTTP_ROUTES } from './relay-access.js'
 import { relayCredentialsDigest, RelayError } from './relay-client.js'
 import type { RelayClient, RelayHttpResult } from './relay-client.js'
@@ -118,6 +119,12 @@ export interface ClientHandlerOptions {
    * its refusal counters. Undefined when this composition never attempted
    * one (no connection service, or no fileUploads service to inject). */
   getFetchRouteIntercept?: () => FetchRouteInterceptDiagnostics | undefined
+  /** The plugin bridge's live verdict (PB-2), computed PER CALL off the local
+   * registry, the last handshake's `plugins` table and the connection state —
+   * never a stored conclusion. Wired only by the CLIENT role's mount; absent
+   * (the host mount, old tests) both routes answer the empty shape: status's
+   * `pluginBridge: []` and remote-status's `bridgedPlugins: []`. */
+  getPluginBridgeStatus?: () => BridgeStatus[]
   /** Serve ONLY the remote-status route (T41a-fix2, the host role's mount):
    * every other route under the prefix answers the same 404 an unknown path
    * would. The claim / status / reconnect / unshare routes exist for a
@@ -467,7 +474,11 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
               }
             : undefined
         const withDiagnostics = (body: Record<string, unknown>): Record<string, unknown> => {
-          let next = intercept === undefined ? body : { ...body, intercept }
+          // PB-2: the per-plugin bridge verdict rides EVERY status answer —
+          // the settings surface explains a not-bridged plugin whatever the
+          // connection state (unpaired reads all-offline, the honest verdict).
+          let next: Record<string, unknown> = { ...body, pluginBridge: options.getPluginBridgeStatus?.() ?? [] }
+          if (intercept !== undefined) next = { ...next, intercept }
           if (fetchRouteIntercept !== undefined) next = { ...next, fetchRouteIntercept }
           return compat === undefined ? next : { ...next, compat }
         }
@@ -571,6 +582,11 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // T34: the T34 client parts' data source — no token, no server
         // address, nothing but the serving state, the compat verdict's
         // difference flag, the display name and the closed-session map.
+        // PB-2 adds `bridgedPlugins`: the names whose bridge verdict is
+        // bridged RIGHT NOW, sorted (the list arrives plugin-sorted, but the
+        // sort is pinned here so the field's shape never depends on the
+        // registry's internal order). The host mount — no verdict source —
+        // answers [].
         const relay = options.getRelayClient?.()
         const intercept = options.getIntercept?.()
         responseJson(res, 200, {
@@ -578,6 +594,10 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           versionMismatch: (relay?.compat?.different?.length ?? 0) > 0,
           serverName: relay?.handshakeInfo?.serverName ?? '',
           closed: Object.fromEntries((intercept?.closedSessions ?? []).map((record) => [record.sessionId, record.reason])),
+          bridgedPlugins: (options.getPluginBridgeStatus?.() ?? [])
+            .filter((status) => status.bridged)
+            .map((status) => status.plugin)
+            .sort(),
         })
         return
       }

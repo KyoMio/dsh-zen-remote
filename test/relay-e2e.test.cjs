@@ -29,6 +29,7 @@ const { createClientHandler } = require('../lib/client-routes.js')
 const { installIntercept } = require('../lib/intercept.js')
 const { installFetchRouteIntercept, FILE_UPLOAD_PATH, SESSION_EXPORT_PATH } = require('../lib/fetch-route-intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
+const { normalizeDeclaration, createBridgeRegistry, compareBridges } = require('../lib/plugin-bridge.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
 // T31-fix: every port is system-assigned so parallel test-run copies cannot
@@ -193,7 +194,7 @@ const FOLLOW_ARGS = { request: { address: { kind: 'session', sessionId: 'session
  */
 let bootCounter = 0
 async function boot(opts = {}) {
-  const { shared = [], heartbeatMs, invoke, fingerprints, apiFetch, parentOf } = opts
+  const { shared = [], heartbeatMs, invoke, fingerprints, plugins, apiFetch, parentOf } = opts
   const home = path.join(ROOT, `run-${bootCounter++}`)
   fs.mkdirSync(home, { recursive: true })
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
@@ -261,6 +262,11 @@ async function boot(opts = {}) {
       serverName: () => SERVER_NAME,
       dshVersion: '0.0.0-e2e',
       ...(fingerprints !== undefined ? { fingerprints: () => fingerprints } : {}),
+      // PB-2: the bridge table callback. ABSENT (the option unset) still
+      // answers `plugins: {}` — the built relay-server always speaks the
+      // field; a TRUE old server (no field at all) is simulated at the
+      // client's fetchImpl in the dedicated test below.
+      ...(plugins !== undefined ? { plugins } : {}),
     },
     ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
   })
@@ -1550,3 +1556,142 @@ class BareGateway {
   operatorPeer() { return { id: 'operator-peer' } }
   dispatchRpc(endpoint) { return Promise.resolve({ ok: true, value: { endpoint } }) }
 }
+
+// ---- PB-2: the plugin bridge rides the handshake -----------------------------
+
+/**
+ * The client-side packaging index.ts wires around the relay client (PB-2):
+ * the local registry's list against the LAST handshake's plugins table, with
+ * `online` read live off the client state. The e2e tests run THIS exact
+ * composition against the real chain, so the assertions below are about what
+ * the handshake really carried.
+ */
+function bridgeStatusOf(localRegistry, client) {
+  return compareBridges(localRegistry.list(), client.handshakeInfo?.plugins, client.state === 'online')
+}
+
+/** One declaration per scenario, same shape on both ends unless noted. */
+const BRIDGE_DECL = (plugin, version, routes) => ({ plugin, version, routes })
+
+test('e2e PB-2: the handshake plugins table drives every bridge verdict, and a consent flip lands on the NEXT connect', async () => {
+  const local = createBridgeRegistry()
+  local.register(BRIDGE_DECL('bridge-ok', '1.0.0', [{ path: '/ok', scope: 'session' }]))
+  local.register(BRIDGE_DECL('bridge-ver', '1.0.0', [{ path: '/ver', scope: 'session' }]))
+  local.register(BRIDGE_DECL('bridge-dec', '1.0.0', [{ path: '/dec', scope: 'session' }]))
+  local.register(BRIDGE_DECL('bridge-consent', '1.0.0', [{ path: '/consent', scope: 'server' }]))
+  local.register(BRIDGE_DECL('bridge-absent', '1.0.0', [{ path: '/absent', scope: 'session' }]))
+
+  const serverRegistry = createBridgeRegistry()
+  serverRegistry.register(BRIDGE_DECL('bridge-ok', '1.0.0', [{ path: '/ok', scope: 'session' }]))
+  // Same declaration, different version → version-mismatch.
+  serverRegistry.register(BRIDGE_DECL('bridge-ver', '2.0.0', [{ path: '/ver', scope: 'session' }]))
+  // Same version, one route's scope differs → the digests diverge →
+  // declaration-mismatch.
+  serverRegistry.register(BRIDGE_DECL('bridge-dec', '1.0.0', [{ path: '/dec', scope: 'server' }]))
+  // Identical to the local one; its consent is a LIVE variable the callback
+  // reads per handshake — the flip below is the acceptance case.
+  serverRegistry.register(BRIDGE_DECL('bridge-consent', '1.0.0', [{ path: '/consent', scope: 'server' }]))
+  let consentGranted = false
+  const env = await boot({
+    plugins: () => {
+      const table = {}
+      for (const declaration of serverRegistry.list()) {
+        table[declaration.plugin] = {
+          version: declaration.version,
+          digest: declaration.digest,
+          serverScopeConsent: declaration.plugin === 'bridge-consent' ? consentGranted : true,
+        }
+      }
+      return table
+    },
+  })
+  try {
+    await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const verdicts = new Map(bridgeStatusOf(local, env.client).map((s) => [s.plugin, s]))
+    assert.equal(verdicts.size, 5, 'one status per local declaration')
+
+    const ok = verdicts.get('bridge-ok')
+    assert.equal(ok.bridged, true, 'name + version + digest all equal → bridged')
+    assert.equal(ok.serverVersion, '1.0.0')
+
+    const ver = verdicts.get('bridge-ver')
+    assert.equal(ver.bridged, false)
+    assert.equal(ver.reason, 'version-mismatch')
+    assert.equal(ver.serverVersion, '2.0.0', 'the server version rides the status')
+
+    const dec = verdicts.get('bridge-dec')
+    assert.equal(dec.bridged, false)
+    assert.equal(dec.reason, 'declaration-mismatch')
+    assert.equal(dec.serverVersion, '1.0.0', 'the version agreed — only the digest differs')
+
+    const consent = verdicts.get('bridge-consent')
+    assert.equal(consent.bridged, false)
+    assert.equal(consent.reason, 'consent-off', 'a server-scope route without consent stays home')
+
+    const absent = verdicts.get('bridge-absent')
+    assert.equal(absent.bridged, false)
+    assert.equal(absent.reason, 'not-on-server')
+
+    // The server grants consent; the verdict flips on the NEXT handshake —
+    // the client dials again directly (the settings-page reconnect path).
+    consentGranted = true
+    await env.client.connect()
+    const after = new Map(bridgeStatusOf(local, env.client).map((s) => [s.plugin, s]))
+    assert.equal(after.get('bridge-consent').bridged, true, 'consent granted → bridged on the next connect')
+    assert.equal(after.get('bridge-consent').reason, undefined)
+  } finally {
+    await env.stop()
+  }
+})
+
+test('e2e PB-2: a throwing plugins table still handshakes, a stripped field reads server-too-old, and offline reads offline', async () => {
+  const local = createBridgeRegistry()
+  local.register(BRIDGE_DECL('bridge-any', '1.0.0', [{ path: '/any', scope: 'session' }]))
+  const env = await boot({
+    plugins: () => {
+      throw new Error('the bridge table source is broken')
+    },
+  })
+  try {
+    // A throwing compute degrades to the empty table; the handshake itself
+    // succeeds and the client reads not-on-server — never a dead link.
+    await env.client.connect()
+    assert.equal(env.client.state, 'online', 'the broken table did not fail the handshake')
+    const [status] = bridgeStatusOf(local, env.client)
+    assert.equal(status.reason, 'not-on-server', 'the degraded empty table means nothing is registered')
+
+    // A TRUE old server: the handshake reply carries NO plugins field at all
+    // (simulated at the fetch face, the only seam where the wire can lose
+    // the field). The client must keep `undefined` — NOT normalize it — so
+    // the verdict is server-too-old.
+    const stripped = env.tunedClient({
+      fetchImpl: async (url, init) => {
+        const response = await fetch(url, init)
+        if (typeof url === 'string' && url.endsWith('/relay/v1/handshake')) {
+          const body = await response.json()
+          delete body.plugins
+          return new Response(JSON.stringify(body), { status: response.status, headers: { 'content-type': 'application/json' } })
+        }
+        return response
+      },
+    })
+    await stripped.connect()
+    assert.equal(stripped.state, 'online')
+    assert.equal(stripped.handshakeInfo.plugins, undefined, 'an absent field stays undefined')
+    const [tooOld] = bridgeStatusOf(local, stripped)
+    assert.equal(tooOld.reason, 'server-too-old')
+
+    // The link dies: the non-online state reads every plugin offline.
+    await env.killGateway()
+    await env.client.connect().catch(() => {})
+    assert.equal(env.client.state, 'offline')
+    const offline = bridgeStatusOf(local, env.client)
+    assert.equal(offline.length, 1)
+    assert.equal(offline[0].reason, 'offline')
+    assert.equal(offline[0].bridged, false)
+    assert.equal(offline[0].serverVersion, undefined, 'an offline verdict carries no server facts')
+  } finally {
+    await env.stop()
+  }
+})
