@@ -327,7 +327,42 @@ The `/v1/http` route is a second allowlist, keyed by **route name** (not part of
 - `dsh-session:` references are scanned too: DSH injects the referenced session's content along **messages** (the content text blocks of `session/prompt` / `subagents/prompt`), **queue edits** (`session/updateQueue`'s edit content) and **slash commands** (EVERY string of a `commands/execute` call — a command handler steers its raw input in as the next user message), with no access check of its own at injection time, so a call whose reference names an unshared session is refused server-side with 403; the @-mention candidates (`sessionReferenceResolver/candidates`) likewise only ever list shared sessions' rows;
 - Terminals are deliberate (a desktop client is a trusted device): what opens is a **server-side** PTY running as the server user, without the agent sandbox or approval restrictions; closing the session's remote access kills its terminal streams with it;
 - `workspaceFiles/read` and friends are not contained to the session directory (DSH itself does not contain them) — anything the server process can read is readable, under the same trusted-device premise as terminals;
+- The plugin bridge's whole-machine data requires the server owner's per-plugin consent — the toggles in the settings page's Plugin bridge section, everything OFF by default; the loopback carries the operator's cookie, so a bridged plugin sees the same permissions the local browser sees. The bridge's boundary is therefore the DECLARED route set (exact equality) plus the share table — there is **no** parameter-level scanning;
 - Concurrent streams are budgeted per device (32), and so are invokes kept in flight at once — past the per-device cap the invoke answers 429 `too-many-invokes`. Error codes shaped `*/internal` (`gateway/internal` and friends) are returned as the bare code with no message — that kind of message quotes server-side internals. Event answers are matched against the subscription and device they were forwarded to. Approval/question forwarding is **first come, first served**: whichever of the server's own UI and the sub-client answers first wins; the later answer is refused by the gateway and the client syncs to "already handled". The relay **never answers on the client's behalf**: an unshared session's approval/question events are not forwarded at all, and with the server's own UI offline too, the approval simply keeps waiting — the gateway re-delivers still-pending events to the next `$events` subscriber. A wait, never a rejection (an abstention would fail every pending approval of the session at once and break the push → wake → approve flow). Notification-type events (EMIT frames: session-list summaries, account expirations and other server-wide state) of an unshared session are never forwarded.
+
+
+### Plugin bridge: `POST /v1/plugin`
+
+A bridged plugin's panel request, rerouted by the sub-client's local backend (the `match` wrap — see `docs/plugin-bridge.md`), arrives here: coordinates in headers, **no body** (a body answers 400).
+
+| Header | Meaning |
+| --- | --- |
+| `x-zr-plugin` / `x-zr-plugin-version` / `x-zr-plugin-digest` | Plugin name, the caller's plugin version, declaration digest |
+| `x-zr-path` | The plugin route path (no query), verbatim, never decoded |
+| `x-zr-query` | The query string (no `?`; the session parameter already carries the REAL id) |
+| `accept`, `range` | The only request headers passed through to the plugin |
+
+**Validation chain** (first failure answers, with the `x-zen-remote-error: <code>` header): gateway secret and markers → body must be empty → header shapes → the plugin is in THIS server's registry → version AND digest equal the local declaration → `x-zr-path` matches a declared route EXACTLY (exact-only in 2.1) → the query is parsed once and the route's declared `sessionParam` appears exactly once, non-empty → the session passes the share table (ancestor chain included) → a `scope:'server'` route requires `pluginBridgeConsent[plugin] === true` (read live off the row) → the per-device budget. On success the query is RE-SERIALIZED from the parsed result via `URLSearchParams` — what was checked is exactly what is sent.
+
+**Error codes and statuses**:
+
+| code | status | condition |
+| --- | --- | --- |
+| `unsupported` | 501 | the bridge is not wired on this server |
+| `bad-request` | 400 | a body was sent; missing or malformed coordinate headers |
+| `plugin-unknown` | 404 | the plugin is not in the local registry |
+| `plugin-mismatch` | 409 | version or digest differs from the local declaration |
+| `route-undeclared` | 404 | the path matches no declared route exactly |
+| `bad-query` | 400 | the session parameter is missing, repeated, or empty |
+| `not-shared` | 403 | the session is not reachable |
+| `consent-off` | 403 | a whole-machine-data route without the owner's consent |
+| `busy` | 429 | the device already holds 8 in-flight bridged requests |
+| `loopback-auth` | 502 | the loopback cookie exchange failed (no token URL, no cookie obtained) |
+| `internal` | 502 | any other loopback failure (headers not sent yet; a mid-stream failure cuts the response) |
+
+**Loopback execution**: the server requests its OWN plugin route over loopback HTTP (`127.0.0.1:<webServer.port>`), Host header pinned to the loopback address — the plugin's own authentication and handler run exactly as they would for a local browser. The loopback request carries the OPERATOR's cookie: with none cached, one `GET /?token=<server token>` exchanges for it (no redirects followed; the pair comes off the 3xx `set-cookie`), and a 401 from the plugin route triggers exactly one re-exchange before a retry — a still-401 answer travels verbatim. **The loopback carries the operator's cookie, so the plugin sees the same permissions the local browser sees** — by design: the bridge replaces "the browser opening the panel locally", it does not bypass the plugin's own auth. The cookie lives in memory only — never logged, never persisted. Since 0.2.1 the webServer may serve self-signed https: certificate verification is skipped ONLY when dialing the literal `127.0.0.1`.
+
+**Streaming and budget**: the plugin answer's status plus its `content-type`, `content-length` (when present) and `cache-control` travel verbatim; the body is pumped chunk by chunk with real backpressure (a slow client slows the loopback, nothing buffers); the finish follows the relay stream's drain watchdog (default 5 s — a connection that stops reading is destroyed). At most 8 in-flight bridged requests per device (one slot held for the whole stream), 429 `busy` past that; the sub-client hanging up aborts the loopback request.
 
 ---
 
