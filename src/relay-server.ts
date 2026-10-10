@@ -45,6 +45,7 @@ import {
 import { SESSION_REFERENCE_URI, collectReferenceTexts, decodeSessionReferenceUri } from './session-reference.js'
 import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js'
 import { routeMethodsOf, routeMaxBodyOf } from './plugin-bridge.js'
+import { createPluginTunnel, validatePluginCall, type PluginTunnelRoutes } from './plugin-tunnel.js'
 import type { PluginLoopback } from './plugin-loopback.js'
 import { isLoopbackAuthError } from './plugin-loopback.js'
 
@@ -294,6 +295,10 @@ export interface RelayHandlerOptions {
     getConsent: () => Record<string, boolean>
     /** The loopback executor performing the actual plugin GET. */
     loopback: PluginLoopback
+    /** The WebSocket byte tunnel's server half (PB-10). Absent — a wiring
+     * that predates the tunnels — and the three `plugin-tunnel` routes
+     * answer 501 `unsupported` like an unwired bridge. */
+    tunnel?: PluginTunnelRoutes
   }
 }
 
@@ -1491,29 +1496,20 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         return
       }
       // ---- the validation chain, in order, first failure answers --------
-      // 1. the plugin is registered HERE (both ends run the declaration
-      //    registry; an unregistered name has nothing to forward to).
-      const declaration = bridge.registry.get(pluginName)
-      if (declaration === undefined) {
-        relayPluginError(res, 404, 'plugin-unknown')
+      // Steps 1/2/3 and 4-6 (registry, version+digest, exact route, the
+      // parse-once query, the share table, the consent wall) are SHARED with
+      // the tunnel open route — see validatePluginCall. This route's own
+      // extras are the method check (3b) and the body gate (3c) below.
+      const validation = validatePluginCall(
+        bridge,
+        { pluginName, pluginVersion, pluginDigest, routePath, rawQuery },
+        isAccessible,
+      )
+      if (!validation.ok) {
+        relayPluginError(res, validation.status, validation.code)
         return
       }
-      // 2. the caller's copy of the plugin (version AND declaration digest)
-      //    equals this server's — "已桥接" is an exact-match property, so a
-      //    skewed upgrade on either end stops forwarding until they agree.
-      if (declaration.version !== pluginVersion || declaration.digest !== pluginDigest) {
-        relayPluginError(res, 409, 'plugin-mismatch')
-        return
-      }
-      // 3. the route is declared — EXACT semantics this task (a declared
-      //    prefix does NOT match longer paths; prefix semantics arrive with
-      //    PB-12). Matching against the NORMALIZED declaration means a route
-      //    the plugin itself never declared cannot be invented here.
-      const route = declaration.routes.find((candidate) => candidate.path === routePath)
-      if (route === undefined) {
-        relayPluginError(res, 404, 'route-undeclared')
-        return
-      }
+      const route = validation.route
       // 3b. (PB-9) the METHOD must be one the route declared — the write
       //     surface is exactly as explicit as the read one was in 2.1: a
       //     route that declared no `methods` forwards GET only, and an
@@ -1534,48 +1530,8 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         await drainUpload(req, 0, drainDeadlineMs)
         return
       }
-      // 4. the query, parsed ONCE (the T41b-fix discipline): the session
-      //    parameter this route declared must appear EXACTLY once and name a
-      //    non-empty id. The re-serialization of THIS parse is the only
-      //    string the loopback request will carry, so what was checked is
-      //    what is forwarded — a control-character key (`session%09Id=x`)
-      //    survives as its own parameter end to end and can never split into
-      //    a second `sessionId` between the check and the plugin.
-      let params: URLSearchParams
-      try {
-        params = new URLSearchParams(rawQuery)
-      } catch {
-        relayPluginError(res, 400, 'bad-query')
-        return
-      }
-      const ids = params.getAll(route.sessionParam)
-      const sessionId = ids.length === 1 ? ids[0] : undefined
-      if (sessionId === undefined || sessionId === '') {
-        relayPluginError(res, 400, 'bad-query')
-        return
-      }
-      // 5. share-table reachability, the same judgment (and ancestor walk)
-      //    every session-scoped route applies.
-      if (!isAccessible(sessionId)) {
-        relayPluginError(res, 403, 'not-shared')
-        return
-      }
-      // 6. whole-machine data (`scope:'server'`) needs the server owner's
-      //    per-plugin consent, read LIVE off the row; a consent source that
-      //    throws means UNKNOWN consent, and unknown consent stays home
-      //    (fail-closed — the map the answer reads is the empty one).
-      if (route.scope === 'server') {
-        let consent: Record<string, boolean> = {}
-        try {
-          consent = bridge.getConsent()
-        } catch {
-          consent = {}
-        }
-        if (consent[pluginName] !== true) {
-          relayPluginError(res, 403, 'consent-off')
-          return
-        }
-      }
+      const params = validation.params
+      const normalizedQuery = validation.normalizedQuery
       // 7. the per-device budget — taken only after every wall above, held
       //    for the whole response stream, released in the finally.
       const device = headerValue(req, 'x-zen-remote-device') ?? ''
@@ -1598,7 +1554,6 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       }
       res.on('close', onClientGone)
       res.on('error', onClientGone)
-      const normalizedQuery = params.toString()
       try {
         const accept = headerValue(req, 'accept')
         const range = headerValue(req, 'range')
@@ -1758,6 +1713,36 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         if (remaining <= 0) pluginsByDevice.delete(device)
         else pluginsByDevice.set(device, remaining)
       }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/plugin-tunnel/open`) {
+      const tunnel = options.pluginBridge?.tunnel
+      if (tunnel === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      await tunnel.open(req, res)
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/plugin-tunnel/send`) {
+      const tunnel = options.pluginBridge?.tunnel
+      if (tunnel === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      await tunnel.send(req, res)
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/plugin-tunnel/close`) {
+      const tunnel = options.pluginBridge?.tunnel
+      if (tunnel === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      await tunnel.close(req, res)
       return
     }
 

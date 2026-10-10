@@ -62,6 +62,9 @@ const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 const HTTP_PATH = '/_dsh/zen-remote/relay/v1/http'
 const UPLOAD_PATH = '/_dsh/zen-remote/relay/v1/upload'
 const PLUGIN_PATH = '/_dsh/zen-remote/relay/v1/plugin'
+const PLUGIN_TUNNEL_OPEN_PATH = '/_dsh/zen-remote/relay/v1/plugin-tunnel/open'
+const PLUGIN_TUNNEL_SEND_PATH = '/_dsh/zen-remote/relay/v1/plugin-tunnel/send'
+const PLUGIN_TUNNEL_CLOSE_PATH = '/_dsh/zen-remote/relay/v1/plugin-tunnel/close'
 /** T59: a desktop-client device renaming ITSELF in the gateway's table. */
 const DEVICE_NAME_PATH = '/_dsh/zen-remote/relay/v1/device/name'
 
@@ -372,6 +375,28 @@ export interface RelayClient {
    * link like every exchange (offline); `requireCredentials` throws the
    * usual RelayError when nothing is configured. */
   pluginRequest(request: RelayPluginRequest, signal?: AbortSignal): Promise<Response>
+  /** Open one WebSocket byte tunnel (PB-10): the coordinates travel like a
+   * pluginRequest's, plus the browser handshake's `sec-websocket-*` headers
+   * and any early head bytes (base64). Resolves once the NDJSON stream's
+   * FIRST line named the tunnel id; `frames` then yields the upstream's
+   * raw bytes (each `data` line decoded) and ENDS when the server writes
+   * the `end` line (upstream closed or errored). A refusal (any non-200 or
+   * a missing open line) throws RelayError with the wire's
+   * `x-zen-remote-error` code. */
+  pluginTunnelOpen(
+    request: RelayPluginRequest & {
+      wsHeaders: { 'sec-websocket-key': string; 'sec-websocket-version': string; 'sec-websocket-protocol'?: string; 'sec-websocket-extensions'?: string }
+      head?: string
+    },
+    signal?: AbortSignal,
+  ): Promise<{ tunnel: string; frames: AsyncIterable<Uint8Array> }>
+  /** One ordered upstream chunk (PB-10): `seq` must count from 0 without
+   * gaps — the server answers 409 `tunnel-out-of-order` and closes the
+   * tunnel otherwise. Resolves after the server took the bytes (drain
+   * included). */
+  pluginTunnelSend(tunnel: string, seq: number, bytes: Uint8Array, signal?: AbortSignal): Promise<void>
+  /** Idempotent teardown (PB-10). */
+  pluginTunnelClose(tunnel: string, signal?: AbortSignal): Promise<void>
 }
 
 /** The inputs of one {@link RelayClient.pluginRequest} round-trip (PB-4) —
@@ -1517,6 +1542,175 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     }
   }
 
+  /**
+   * The WebSocket byte tunnel's open half (PB-10). The wire: one POST whose
+   * answer is an NDJSON river — first line names the tunnel, `data` lines
+   * carry base64 chunks of the upstream socket's bytes, `ping` lines keep
+   * proxies warm, an `end` line closes the river. Everything after the
+   * headers is line-framed HERE: the caller gets an async iterable of
+   * decoded byte chunks and never sees the framing.
+   */
+  async function pluginTunnelOpen(
+    request: RelayPluginRequest & {
+      wsHeaders: { 'sec-websocket-key': string; 'sec-websocket-version': string; 'sec-websocket-protocol'?: string; 'sec-websocket-extensions'?: string }
+      head?: string
+    },
+    signal?: AbortSignal,
+  ): Promise<{ tunnel: string; frames: AsyncIterable<Uint8Array> }> {
+    const creds = requireCredentials()
+    const payload = {
+      headers: request.wsHeaders,
+      ...(request.head !== undefined && request.head !== '' ? { head: request.head } : {}),
+    }
+    const response = await fetch(`${creds.url}${PLUGIN_TUNNEL_OPEN_PATH}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${creds.token}`,
+        accept: 'application/x-ndjson',
+        'content-type': 'application/json',
+        'x-zr-plugin': request.plugin,
+        'x-zr-plugin-version': request.version,
+        'x-zr-plugin-digest': request.digest,
+        'x-zr-path': request.path,
+        'x-zr-query': request.query,
+      },
+      body: JSON.stringify(payload),
+      redirect: 'manual',
+      signal,
+    }).catch((error: unknown) => {
+      noteFailure('offline')
+      setState('offline')
+      throw new RelayError('offline', messageOf(error))
+    })
+    if (response.status < 200 || response.status >= 300 || response.body === null) {
+      // The refusal carries its code in the marker header (every
+      // plugin-bridge wall does) — surface it verbatim.
+      const code = response.headers.get('x-zen-remote-error') ?? `http-${response.status}`
+      const bodyText = await response.text().catch(() => '')
+      throw new RelayError(code, bodyText === '' ? code : bodyText, response.status)
+    }
+    let tunnelId: string | undefined
+    let upstreamClosed = false
+    let pendingError: RelayError | undefined
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let lineBuffer = ''
+    const nextLine = async (): Promise<string | null> => {
+      while (true) {
+        const idx = lineBuffer.indexOf('\n')
+        if (idx >= 0) {
+          const line = lineBuffer.slice(0, idx)
+          lineBuffer = lineBuffer.slice(idx + 1)
+          return line
+        }
+        const { done, value } = await reader.read()
+        if (done) {
+          const tail = lineBuffer
+          lineBuffer = ''
+          return tail === '' ? null : tail
+        }
+        lineBuffer += decoder.decode(value, { stream: true })
+      }
+    }
+    // The FIRST line must name the tunnel; anything else up front is a
+    // protocol violation the caller sees as a refused open.
+    const first = await nextLine()
+    if (first !== null) {
+      try {
+        const parsed: unknown = JSON.parse(first)
+        if (typeof parsed === 'object' && parsed !== null && (parsed as { type?: unknown }).type === 'open' &&
+            typeof (parsed as { tunnel?: unknown }).tunnel === 'string') {
+          tunnelId = (parsed as { tunnel: string }).tunnel
+        }
+      } catch {
+        // Falls through to the refusal below.
+      }
+    }
+    if (tunnelId === undefined) {
+      const code = response.headers.get('x-zen-remote-error') ?? 'internal'
+      throw new RelayError(code, `the tunnel open stream never named a tunnel`, response.status)
+    }
+    const frames: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next(): Promise<IteratorResult<Uint8Array>> {
+            if (upstreamClosed) return { done: true, value: undefined }
+            while (true) {
+              const line = await nextLine()
+              if (line === null) {
+                upstreamClosed = true
+                return { done: true, value: undefined }
+              }
+              let parsed: unknown
+              try {
+                parsed = JSON.parse(line)
+              } catch {
+                continue // a damaged line is skipped, like every NDJSON reader here
+              }
+              if (parsed === null || typeof parsed !== 'object') continue
+              const frame = parsed as { type?: unknown; b64?: unknown; reason?: unknown }
+              if (frame.type === 'data' && typeof frame.b64 === 'string' && frame.b64 !== '') {
+                return { done: false, value: new Uint8Array(Buffer.from(frame.b64, 'base64')) }
+              }
+              if (frame.type === 'end') {
+                upstreamClosed = true
+                if (typeof frame.reason === 'string' && frame.reason === 'upstream-error') {
+                  pendingError = new RelayError('internal', 'the upstream tunnel socket failed')
+                }
+                return { done: true, value: undefined }
+              }
+              // ping and anything unrecognized: skipped.
+            }
+          },
+        }
+      },
+    }
+    void pendingError
+    return { tunnel: tunnelId, frames }
+  }
+
+  async function pluginTunnelSend(tunnel: string, seq: number, bytes: Uint8Array, signal?: AbortSignal): Promise<void> {
+    const creds = requireCredentials()
+    // The body IS the payload — raw bytes, not JSON. The requestInit shape
+    // lives in exchangeRequest's url+init contract: headers hand-built here.
+    await exchangeRequest(
+      `${creds.url}${PLUGIN_TUNNEL_SEND_PATH}`,
+      {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${creds.token}`,
+          accept: 'application/json',
+          'content-type': 'application/octet-stream',
+          'x-zr-tunnel': tunnel,
+          'x-zr-seq': String(seq),
+        },
+        // undici's BodyInit types reject ArrayBufferView here (the DOM face
+        // wins in @types/node) — the cast carries the wire reality.
+        body: new Uint8Array(bytes) as unknown as BodyInit,
+        redirect: 'manual',
+      },
+      signal,
+      true,
+      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, bytes.byteLength), timeoutSetsOffline: false },
+    )
+  }
+
+  async function pluginTunnelClose(tunnel: string, signal?: AbortSignal): Promise<void> {
+    const creds = requireCredentials()
+    await fetch(`${creds.url}${PLUGIN_TUNNEL_CLOSE_PATH}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${creds.token}`,
+        accept: 'application/json',
+        'x-zr-tunnel': tunnel,
+      },
+      redirect: 'manual',
+      signal,
+    }).catch((error: unknown) => {
+      throw new RelayError('offline', messageOf(error))
+    })
+  }
+
   function openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown> {
     // Eager, not generator-lazy: an unconfigured client fails at CALL time,
     // exactly like connect/invoke, instead of hiding the error inside the
@@ -1722,5 +1916,8 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     http,
     upload,
     pluginRequest,
+    pluginTunnelOpen,
+    pluginTunnelSend,
+    pluginTunnelClose,
   }
 }

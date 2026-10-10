@@ -88,6 +88,12 @@ export interface CreatePluginLoopbackOptions {
 }
 
 export interface PluginLoopback {
+  /** The cookie the tunnel executor (PB-10) needs to write its OWN upgrade
+   * request — a raw socket dial, which cannot ride this module's `request`
+   * (it owns the cookie internally). Resolves the current pair, exchanging
+   * once when none is cached; empty string means the host has no token URL
+   * and the tunnel cannot authenticate. The cookie stays in memory. */
+  cookieHeader(): Promise<string>
   /** One validated request against the local plugin route. `path` arrives
    * undecoded and `query` is the RELAY-CHECKED serialization (the caller
    * never passes raw wire input — the parse-once discipline). `body` (PB-9)
@@ -213,6 +219,10 @@ export function createPluginLoopback(options: CreatePluginLoopbackOptions): Plug
   }
 
   return {
+    async cookieHeader() {
+      if (cookie === undefined) await exchangeCookie(new AbortController().signal)
+      return cookie ?? ''
+    },
     async request(method, path, query, headers, body, signal) {
       const target = options.getTarget()
       const pathWithQuery = query === '' ? path : `${path}?${query}`

@@ -251,6 +251,33 @@ export interface RelayClient {
      * link like every exchange (offline); `requireCredentials` throws the
      * usual RelayError when nothing is configured. */
     pluginRequest(request: RelayPluginRequest, signal?: AbortSignal): Promise<Response>;
+    /** Open one WebSocket byte tunnel (PB-10): the coordinates travel like a
+     * pluginRequest's, plus the browser handshake's `sec-websocket-*` headers
+     * and any early head bytes (base64). Resolves once the NDJSON stream's
+     * FIRST line named the tunnel id; `frames` then yields the upstream's
+     * raw bytes (each `data` line decoded) and ENDS when the server writes
+     * the `end` line (upstream closed or errored). A refusal (any non-200 or
+     * a missing open line) throws RelayError with the wire's
+     * `x-zen-remote-error` code. */
+    pluginTunnelOpen(request: RelayPluginRequest & {
+        wsHeaders: {
+            'sec-websocket-key': string;
+            'sec-websocket-version': string;
+            'sec-websocket-protocol'?: string;
+            'sec-websocket-extensions'?: string;
+        };
+        head?: string;
+    }, signal?: AbortSignal): Promise<{
+        tunnel: string;
+        frames: AsyncIterable<Uint8Array>;
+    }>;
+    /** One ordered upstream chunk (PB-10): `seq` must count from 0 without
+     * gaps — the server answers 409 `tunnel-out-of-order` and closes the
+     * tunnel otherwise. Resolves after the server took the bytes (drain
+     * included). */
+    pluginTunnelSend(tunnel: string, seq: number, bytes: Uint8Array, signal?: AbortSignal): Promise<void>;
+    /** Idempotent teardown (PB-10). */
+    pluginTunnelClose(tunnel: string, signal?: AbortSignal): Promise<void>;
 }
 /** The inputs of one {@link RelayClient.pluginRequest} round-trip (PB-4) —
  * the PB-3 wire protocol's coordinates, already validated and virtual-id-

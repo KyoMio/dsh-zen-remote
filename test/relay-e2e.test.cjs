@@ -32,6 +32,8 @@ const { toVirtual } = require('../lib/virtual-id.js')
 const { normalizeDeclaration, createBridgeRegistry, compareBridges } = require('../lib/plugin-bridge.js')
 const { createPluginLoopback } = require('../lib/plugin-loopback.js')
 const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
+const crypto = require('node:crypto')
+const { pathToFileURL } = require('node:url')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
 // T31-fix: every port is system-assigned so parallel test-run copies cannot
@@ -53,6 +55,36 @@ async function freePort() {
   const port = server.address().port
   await new Promise((resolve) => server.close(resolve))
   return port
+}
+
+/**
+ * A host-shaped fake webServer, the shape every plugin-bridge test here
+ * installs against: the RAW undecoded pathname goes through this.match,
+ * which reads the THREE tables the real host keeps — `exact`, `prefixes`
+ * and (PB-10) `upgrades` (RT dsh-host-webserver; the interceptor's shape
+ * check refuses anything less). register/unregister is the exact-table
+ * helper the tests build their declared routes with.
+ */
+function makeFakeHost() {
+  return {
+    exact: new Map(),
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) {
+      const exact = this.exact.get(pathname)
+      if (exact !== undefined) return exact
+      let best
+      for (const [prefix, route] of this.prefixes) {
+        if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue
+        if (best === undefined || prefix.length > best.path.length) best = route
+      }
+      return best
+    },
+    register(route) {
+      this.exact.set(route.path, route)
+      return () => this.exact.delete(route.path)
+    },
+  }
 }
 
 /**
@@ -1861,24 +1893,7 @@ test('e2e PB-4: the browser hits the local webServer, the wrap forwards over the
   // The SUB-CLIENT side: a host-shaped fake webServer (raw undecoded
   // pathname → this.match → handler), the SAME declaration registered
   // locally, the REAL relay client wired into the interception.
-  const hostRaw = {
-    exact: new Map(),
-    prefixes: new Map(),
-    match(pathname) {
-      const exact = this.exact.get(pathname)
-      if (exact !== undefined) return exact
-      let best
-      for (const [prefix, route] of this.prefixes) {
-        if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue
-        if (best === undefined || prefix.length > best.path.length) best = route
-      }
-      return best
-    },
-    register(route) {
-      this.exact.set(route.path, route)
-      return () => this.exact.delete(route.path)
-    },
-  }
+  const hostRaw = makeFakeHost()
   const subServer = http.createServer((req, res) => {
     const rawPath = new URL(req.url ?? '/', 'http://x').pathname
     Promise.resolve(hostRaw.match(rawPath)).then(async (route) => {
@@ -2009,17 +2024,7 @@ test('e2e PB-9: a 1 MiB POST crosses the whole chain byte for byte; one byte ove
   })
 
   // The sub-client side: a host-shaped fake webServer with the interception.
-  const hostRaw = {
-    exact: new Map(),
-    prefixes: new Map(),
-    match(pathname) {
-      return this.exact.get(pathname)
-    },
-    register(route) {
-      this.exact.set(route.path, route)
-      return () => this.exact.delete(route.path)
-    },
-  }
+  const hostRaw = makeFakeHost()
   const subServer = http.createServer((req, res) => {
     const rawPath = new URL(req.url ?? '/', 'http://x').pathname
     Promise.resolve(hostRaw.match(rawPath)).then(async (route) => {
@@ -2097,6 +2102,261 @@ test('e2e PB-9: a 1 MiB POST crosses the whole chain byte for byte; one byte ove
     assert.deepEqual(chunkedBody, { ok: false, error: { code: 'zr-plugin-body-too-large' } })
     assert.equal(seen.hits, 1, 'the chunked over-limit never reached the server either')
     assert.equal(env.client.state, 'online', 'the gate trip is a caller verdict — the relay client stayed online')
+  } finally {
+    handle.uninstall()
+    await env.stop()
+    await subStop()
+    await dshStop()
+  }
+})
+
+// ---- PB-10: the WebSocket byte tunnel end to end ------------------------------
+
+/** Minimal WebSocket server helpers (RFC 6455, text frames only — the
+ * handshake accept, a masked-client-frame decoder, and an unmasked
+ * server-frame encoder). No npm dependency, per the task boundary. */
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+function wsAccept(key) {
+  return crypto.createHash('sha1').update(key + WS_GUID).digest('base64')
+}
+function wsEncodeText(text) {
+  const payload = Buffer.from(text, 'utf8')
+  const length = payload.length
+  let head
+  if (length < 126) {
+    head = Buffer.from([0x81, length])
+  } else if (length < 65536) {
+    head = Buffer.alloc(4)
+    head[0] = 0x81
+    head[1] = 126
+    head.writeUInt16BE(length, 2)
+  } else {
+    head = Buffer.alloc(10)
+    head[0] = 0x81
+    head[1] = 127
+    head.writeBigUInt64BE(BigInt(length), 2)
+  }
+  return Buffer.concat([head, payload])
+}
+/** Decode ONE client frame (masked per RFC). Returns { opcode, text } or
+ * null when the chunk is not one complete frame (the tests keep frames
+ * small enough to arrive whole). */
+function wsDecodeClientFrame(chunk) {
+  if (chunk.length < 2) return null
+  const opcode = chunk[0] & 0x0f
+  const masked = (chunk[1] & 0x80) !== 0
+  let length = chunk[1] & 0x7f
+  let offset = 2
+  if (length === 126) {
+    if (chunk.length < 4) return null
+    length = chunk.readUInt16BE(2)
+    offset = 4
+  } else if (length === 127) {
+    if (chunk.length < 10) return null
+    length = Number(chunk.readBigUInt64BE(2))
+    offset = 10
+  }
+  const mask = masked ? chunk.subarray(offset, offset + 4) : null
+  if (masked) offset += 4
+  const payload = chunk.subarray(offset, offset + length)
+  if (masked) {
+    for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4]
+  }
+  return { opcode, text: payload.toString('utf8') }
+}
+
+test('e2e PB-10: a browser WebSocket on the sub-client speaks to the bridged plugin through the byte tunnel; unbridged refuses 503; local sessions stay local', async () => {
+  // ---- the SERVER's fake DSH: a real http server whose 'upgrade' handler
+  // is a hand-written WebSocket endpoint (handshake, echo, one server push,
+  // close awareness).
+  const dshWs = { opened: 0, echoed: [], closed: false, pushed: false }
+  const fakeDsh = http.createServer((req, res) => {
+    // The tunnel's cookie exchange lands here (GET /?token=...).
+    res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+    res.end()
+  })
+  fakeDsh.on('upgrade', (req, socket) => {
+    dshWs.opened += 1
+    const key = req.headers['sec-websocket-key']
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`)
+    socket.write(wsEncodeText('server-push-hello'))
+    socket.on('data', (chunk) => {
+      const frame = wsDecodeClientFrame(chunk)
+      if (frame === null) return
+      if (frame.opcode === 0x8) {
+        dshWs.closed = true
+        socket.end()
+        return
+      }
+      if (frame.opcode === 0x1) {
+        dshWs.echoed.push(frame.text)
+        socket.write(wsEncodeText(`echo:${frame.text}`))
+      }
+    })
+    socket.on('close', () => { dshWs.closed = true })
+  })
+  await new Promise((resolve) => fakeDsh.listen(0, '127.0.0.1', resolve))
+  const dshPort = fakeDsh.address().port
+  const dshStop = () => new Promise((done) => { fakeDsh.closeAllConnections(); fakeDsh.close(done) })
+
+  const DECLARED_INPUT = {
+    plugin: 'e2e-panel',
+    version: '1.0.0',
+    routes: [{ path: '/panel/ws', scope: 'session', upgrade: true }],
+  }
+  const serverRegistry = createBridgeRegistry()
+  serverRegistry.register(DECLARED_INPUT)
+  // The tunnel's server half, wired over the SAME pieces before boot.
+  const pluginTunnelMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-tunnel.js')).href)
+  const pluginLoopbackObj = createPluginLoopback({
+    getTarget: () => ({ protocol: 'http:', port: dshPort }),
+    getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+  })
+  const shareStoreMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'share-store.js')).href)
+  const tunnelStore = shareStoreMod.createShareStore({ file: path.join(ROOT, `tunnel-e2e-${Date.now()}.json`), idleHours: 48 })
+  tunnelStore.share('session-a')
+  const pluginTunnel = pluginTunnelMod.createPluginTunnel({
+    bridge: { registry: serverRegistry, getConsent: () => ({ 'e2e-panel': true }), loopback: pluginLoopbackObj },
+    getTarget: () => ({ protocol: 'http:', port: dshPort }),
+    isAccessible: (sessionId) => sessionId === 'session-a',
+    heartbeatMs: 15_000,
+  })
+  // The server's plugins table starts EMPTY (the first WebSocket below must
+  // hit the unbridged wall) and fills in for the re-handshake after it.
+  const pluginsBox = { table: {} }
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => pluginsBox.table,
+    pluginBridge: {
+      registry: serverRegistry,
+      getConsent: () => ({ 'e2e-panel': true }),
+      loopback: pluginLoopbackObj,
+      tunnel: pluginTunnel,
+    },
+  })
+
+  // ---- the SUB-CLIENT side: a host-shaped fake webServer with BOTH the
+  // match wrap and the upgrade interception, plus a real upgrade listener.
+  const hostRaw = makeFakeHost()
+  const subServer = http.createServer(() => {})
+  const localWs = { opened: 0 }
+  // The LOCAL plugin's own upgrade handler (the one remote sessions must
+  // NEVER reach). The fake host's upgrade dispatch mirrors the real host:
+  // the route table lookup, then the handler, async body detached.
+  subServer.on('upgrade', (req, socket, head) => {
+    try {
+      const rawPath = new URL(req.url ?? '/', 'http://x').pathname
+      const route = hostRaw.upgrades.get(rawPath)
+      if (route !== undefined) {
+        route.handler(req, socket, head)
+        return
+      }
+      socket.destroy()
+    } catch {
+      socket.destroy()
+    }
+  })
+  // The local route itself (registered on the same table the intercept
+  // shadows): a same-shaped WS endpoint marking its hits.
+  hostRaw.upgrades.set('/panel/ws', {
+    path: '/panel/ws',
+    handler: (req, socket) => {
+      localWs.opened += 1
+      const key = req.headers['sec-websocket-key']
+      socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`)
+      socket.write(wsEncodeText('local-answer'))
+    },
+  })
+  await new Promise((resolve) => subServer.listen(0, '127.0.0.1', resolve))
+  const subPort = subServer.address().port
+  // Node stops tracking an UPGRADED socket (closeAllConnections never sees
+  // it — verified on v22), so the teardown destroys every connection this
+  // server accepted by hand before closing.
+  const subSockets = new Set()
+  subServer.on('connection', (socket) => {
+    subSockets.add(socket)
+    socket.on('close', () => subSockets.delete(socket))
+  })
+  const subStop = () => new Promise((done) => {
+    for (const socket of subSockets) socket.destroy()
+    subServer.closeAllConnections()
+    subServer.close(done)
+  })
+
+  const localRegistry = createBridgeRegistry()
+  localRegistry.register(DECLARED_INPUT)
+  const handle = installPluginRouteIntercept({
+    webServer: hostRaw,
+    registry: localRegistry,
+    relay: env.client,
+    getServerId: () => env.client.handshakeInfo?.serverId,
+    getStatus: () => compareBridges(localRegistry.list(), env.client.handshakeInfo?.plugins, env.client.state === 'online'),
+    log: () => {},
+  })
+
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const virtual = toVirtual(info.serverId, 'session-a')
+
+    // ---- 1. UNBRIDGED first (the statuses start empty): the browser's
+    //    WebSocket gets the 503 with the marker; the LOCAL handler never ran.
+    const unbridged = new WebSocket(`ws://127.0.0.1:${subPort}/panel/ws?sessionId=${encodeURIComponent(virtual)}`)
+    const unbridgedResult = await new Promise((resolve) => {
+      // The verdict must ARRIVE — a socket that just sits there fails the
+      // test here instead of hanging the whole case.
+      const timer = setTimeout(() => resolve({ timeout: true }), 5000)
+      unbridged.addEventListener('open', () => { clearTimeout(timer); resolve({ opened: true }) })
+      unbridged.addEventListener('error', (event) => { clearTimeout(timer); resolve({ opened: false, error: event.error ?? event.message }) })
+      unbridged.addEventListener('close', (event) => { clearTimeout(timer); resolve({ opened: false, closedCode: event.code }) })
+    })
+    assert.equal(unbridgedResult.timeout, undefined, `the unbridged socket must answer at all: ${JSON.stringify(unbridgedResult)}`)
+    assert.equal(unbridgedResult.opened, false, `the unbridged socket must not open: ${JSON.stringify(unbridgedResult)}`)
+    assert.equal(localWs.opened, 0, 'the local upgrade handler never ran')
+    // The server now announces the plugin; the re-handshake picks the table
+    // up and every later virtual-id call takes the tunnel.
+    pluginsBox.table = Object.fromEntries(
+      serverRegistry.list().map((d) => [d.plugin, { version: d.version, digest: d.digest, serverScopeConsent: true }]),
+    )
+    await env.client.connect() // re-handshake to pick up the plugins table
+
+    // ---- 2. BRIDGED: handshake opens, echo round-trips, the server push
+    // arrives, close closes — everything through the byte tunnel.
+    const bridged = new WebSocket(`ws://127.0.0.1:${subPort}/panel/ws?sessionId=${encodeURIComponent(virtual)}`)
+    const messages = []
+    const bridgedOpened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5000)
+      bridged.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      bridged.addEventListener('error', (event) => { clearTimeout(timer); resolve(`error: ${event.error ?? event.message}`) })
+    })
+    assert.equal(bridgedOpened, true, `the bridged handshake: ${JSON.stringify(bridgedOpened)}`)
+    bridged.addEventListener('message', (event) => { messages.push(String(event.data)) })
+    bridged.send('hello-tunnel')
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.ok(messages.includes('echo:hello-tunnel'), `the echo arrived: ${JSON.stringify(messages)}`)
+    assert.ok(messages.includes('server-push-hello'), `the server push arrived: ${JSON.stringify(messages)}`)
+    assert.ok(dshWs.echoed.includes('hello-tunnel'), 'the server side decoded the browser frame')
+
+    // ---- 3. Close: the browser closes; the server side learns.
+    bridged.close()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(dshWs.closed, true, 'the server side saw the close')
+
+    // ---- 4. A LOCAL session on the same route: the intercept passthrough —
+    // the LOCAL handler answers (its own marker message proves it).
+    const local = new WebSocket(`ws://127.0.0.1:${subPort}/panel/ws?sessionId=session-local`)
+    const localMessages = []
+    const localOpened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 3000)
+      local.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      local.addEventListener('error', () => { clearTimeout(timer); resolve(false) })
+    })
+    assert.equal(localOpened, true, 'the local session opened against the LOCAL handler')
+    local.addEventListener('message', (event) => { localMessages.push(String(event.data)) })
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.ok(localMessages.includes('local-answer'), 'the local answer came from the LOCAL handler')
+    assert.equal(localWs.opened, 1, 'exactly the local session reached the local handler')
+    local.close()
   } finally {
     handle.uninstall()
     await env.stop()

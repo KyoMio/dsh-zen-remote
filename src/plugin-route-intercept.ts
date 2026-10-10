@@ -27,15 +27,18 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { BridgeRegistry, BridgeStatus } from './plugin-bridge.js'
-import { routeMethodsOf, routeMaxBodyOf } from './plugin-bridge.js'
+import { routeMethodsOf, routeMaxBodyOf, routeUpgradesOf } from './plugin-bridge.js'
 import { Readable, Transform } from 'node:stream'
+import type { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
 import { fromVirtual } from './virtual-id.js'
 
-/** Structural verdict of {@link checkWebServerShape}: the two facts the
- * wrap reads per request — the `match` function the host's handle calls,
- * and the two route tables (both Maps, RT lib/index.js:467-478 and 298-308;
- * the probe verified them on real 0.2.0-rc.2 / 0.2.1-alpha.2 instances). */
+/** Structural verdict of {@link checkWebServerShape}: the facts the wrap
+ * reads per request — the `match` function the host's handle calls, the two
+ * route tables, and (PB-10) the `upgrades` table the host's upgrade handler
+ * reads `this.upgrades.get(pathname)` from (both Maps, RT
+ * lib/index.js:467-478 and 298-308; the probe verified them on real
+ * 0.2.0-rc.2 / 0.2.1-alpha.2 instances). */
 export type WebServerShapeCheck = { ok: true } | { ok: false; reasons: string[] }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -50,6 +53,7 @@ export function checkWebServerShape(webServer: unknown): WebServerShapeCheck {
   if (typeof webServer.match !== 'function') reasons.push('match: not a function')
   if (!(webServer.exact instanceof Map)) reasons.push('exact: not a Map')
   if (!(webServer.prefixes instanceof Map)) reasons.push('prefixes: not a Map')
+  if (!(webServer.upgrades instanceof Map)) reasons.push('upgrades: not a Map')
   if (reasons.length > 0) return { ok: false, reasons }
   return { ok: true }
 }
@@ -76,6 +80,11 @@ export interface PluginRouteInterceptDiagnostics {
   /** The most recent refusals, oldest first, capped — time, plugin, reason
    * only, never a query, never a session id. */
   recentFailures: PluginRouteFailureRecord[]
+  /** PB-10: tunnels live RIGHT NOW. */
+  tunnelsCurrent: number
+  /** PB-10: tunnels opened / torn down since the install. */
+  tunnelsOpened: number
+  tunnelsClosed: number
 }
 
 export interface InstallPluginRouteInterceptOptions {
@@ -123,6 +132,30 @@ interface DeclaredHit {
 }
 
 export function installPluginRouteIntercept(options: InstallPluginRouteInterceptOptions): PluginRouteInterceptHandle {
+  // Shape FIRST, like every wrap: a caller that skipped checkWebServerShape
+  // (or a host whose shape changed between the check and this call) gets an
+  // INERT handle — nothing on the instance is touched — instead of a
+  // TypeError from a missing table midway through the install.
+  const shape = checkWebServerShape(options.webServer)
+  if (!shape.ok) {
+    options.log?.('plugin route intercept refused: %s', shape.reasons.join('; '))
+    return {
+      uninstall() {},
+      diagnostics(): PluginRouteInterceptDiagnostics {
+        return {
+          installed: false,
+          shape,
+          forwarded: 0,
+          refused: 0,
+          refusalsByReason: {},
+          recentFailures: [],
+          tunnelsCurrent: 0,
+          tunnelsOpened: 0,
+          tunnelsClosed: 0,
+        }
+      },
+    }
+  }
   const { webServer, registry, relay, getServerId, getStatus, log } = options
   const target = webServer as { match: (this: unknown, pathname: string) => unknown }
   const savedMatch = target.match
@@ -130,8 +163,34 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   let installed = true
   let forwarded = 0
   let refused = 0
+  let tunnelsCurrent = 0
+  let tunnelsOpened = 0
+  let tunnelsClosed = 0
   const refusalsByReason: Record<string, number> = {}
   const recentFailures: PluginRouteFailureRecord[] = []
+
+  /** The unbridged refusal written straight onto an upgrading socket
+   * (PB-10): the WebSocket handshake never happened, so the "response" is
+   * hand-written HTTP — same shape, same marker, then the socket dies
+   * without the local plugin ever seeing the connection. */
+  const answerUnbridgedSocket = (socket: Socket, plugin: string, reason: string): void => {
+    recordRefusal(plugin, reason)
+    log?.('plugin upgrade refused for %s: %s', plugin, reason)
+    const body = Buffer.from(JSON.stringify({ ok: false, error: { code: 'zr-plugin-unbridged', reason, plugin } }), 'utf8')
+    try {
+      socket.write(
+        `HTTP/1.1 503 Service Unavailable\r\n` +
+          `x-zen-remote: unbridged\r\n` +
+          `content-type: application/json; charset=utf-8\r\n` +
+          `content-length: ${body.length}\r\n` +
+          `connection: close\r\n` +
+          `\r\n`,
+      )
+      socket.end(body)
+    } catch {
+      // The socket was already gone.
+    }
+  }
 
   const recordRefusal = (plugin: string, reason: string): void => {
     refused += 1
@@ -421,7 +480,243 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     }
   }
 
+  // ---- PB-10: the WebSocket upgrade interception -----------------------------
+  //
+  // The host's upgrade handler reads `this.upgrades.get(pathname)` (RT
+  // dsh-host-webserver — the probe verified the shape on real instances).
+  // Shadowing that ONE method on the raw instance intercepts every upgrade
+  // lookup, including upgrades registered after us. Declared `upgrade`
+  // routes with a virtual session id become a byte tunnel to the server:
+  // the browser's WebSocket speaks to THIS process, the bytes travel the
+  // tunnel, and the REAL handshake (101, frames, close) is produced by the
+  // plugin route on the server machine — neither end parses WebSocket
+  // frames (docs/adr/0002).
+
+  const targetWithUpgrades = webServer as { upgrades: Map<string, unknown> }
+  const savedUpgradesGet = targetWithUpgrades.upgrades.get
+  const upgradeRoutesOf = (pathname: string): { plugin: string; version: string; digest: string; path: string; sessionParam: string } | undefined => {
+    if (!installed) return undefined
+    for (const declaration of registry.list()) {
+      for (const route of declaration.routes) {
+        if (route.path === pathname && routeUpgradesOf(route)) {
+          return {
+            plugin: declaration.plugin,
+            version: declaration.version,
+            digest: declaration.digest,
+            path: route.path,
+            sessionParam: route.sessionParam,
+          }
+        }
+      }
+    }
+    return undefined
+  }
+
+  /** The tunnel's surrogate upgrade handler. Every outcome — refusal,
+   * teardown, the byte pumping — owns the socket's whole remaining life. */
+  const surrogateUpgrade = (declared: { plugin: string; version: string; digest: string; path: string; sessionParam: string }, originalHandler: unknown) =>
+    (req: IncomingMessage, socket: Socket, head: Buffer): void => {
+      // The host never awaits an upgrade handler — the async body runs on
+      // its own and every failure path owns the socket's teardown.
+      void (async () => {
+        log?.('upgrade entered for %s', declared.path)
+      const socketGone = (): boolean => socket.destroyed || !socket.writable
+      const passthrough = (): void => {
+        if (typeof originalHandler === 'function') {
+          originalHandler(req, socket, head)
+          return
+        }
+        try {
+          socket.destroy()
+        } catch {
+          // Already gone.
+        }
+      }
+      try {
+        // ONE parse of the query — the session parameter's home.
+        let searchParams: URLSearchParams
+        try {
+          searchParams = new URL(req.url ?? '/', 'http://local').searchParams
+        } catch {
+          answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
+          return
+        }
+        const values = searchParams.getAll(declared.sessionParam)
+        if (values.length > 1) {
+          answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
+          return
+        }
+        const value = values.length === 1 ? values[0] : undefined
+        // A LOCAL session (or no parameter at all): the original upgrade
+        // handler's business, the head bytes untouched.
+        if (value === undefined || value === '' || !value.startsWith('zr~')) {
+          passthrough()
+          return
+        }
+        const parts = fromVirtual(value)
+        if (parts === undefined || parts.id === '') {
+          answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
+          return
+        }
+        if (parts.serverId !== getServerId()) {
+          answerUnbridgedSocket(socket, declared.plugin, 'server-changed')
+          return
+        }
+        // The PB-2 bridge verdict, the SAME wall the HTTP surrogate raises:
+        // the tunnel opens only for a plugin bridged RIGHT NOW — an absent
+        // or unbridged status refuses with its own reason, and the local
+        // plugin handler is never reached.
+        const bridgeStatus = getStatus().find((entry) => entry.plugin === declared.plugin)
+        if (bridgeStatus === undefined || !bridgeStatus.bridged) {
+          answerUnbridgedSocket(socket, declared.plugin, bridgeStatus?.reason ?? 'not-on-server')
+          return
+        }
+        // ---- bridged: open the byte tunnel (PB-10) ---------------------
+        const controller = new AbortController()
+        socket.on('close', () => controller.abort())
+        const wsKey = typeof req.headers['sec-websocket-key'] === 'string' ? req.headers['sec-websocket-key'] : undefined
+        const wsVersion = typeof req.headers['sec-websocket-version'] === 'string' ? req.headers['sec-websocket-version'] : undefined
+        if (wsKey === undefined || wsVersion === undefined) {
+          answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
+          return
+        }
+        const protocol = typeof req.headers['sec-websocket-protocol'] === 'string' ? req.headers['sec-websocket-protocol'] : undefined
+        const extensions = typeof req.headers['sec-websocket-extensions'] === 'string' ? req.headers['sec-websocket-extensions'] : undefined
+        const query = new URLSearchParams(searchParams)
+        query.set(declared.sessionParam, parts.id)
+        let tunnel: { tunnel: string; frames: AsyncIterable<Uint8Array> }
+        try {
+          log?.('opening tunnel for %s', declared.path)
+          tunnel = await relay.pluginTunnelOpen(
+            {
+              plugin: declared.plugin,
+              version: declared.version,
+              digest: declared.digest,
+              path: declared.path,
+              query: query.toString(),
+              wsHeaders: {
+                'sec-websocket-key': wsKey,
+                'sec-websocket-version': wsVersion,
+                ...(protocol !== undefined ? { 'sec-websocket-protocol': protocol } : {}),
+                ...(extensions !== undefined ? { 'sec-websocket-extensions': extensions } : {}),
+              },
+              ...(head.length > 0 ? { head: head.toString('base64') } : {}),
+            },
+            controller.signal,
+          )
+        } catch (error) {
+          // The relay refused the open (unbridged walls arrive with their
+          // code in the error). The browser's handshake never completes.
+          const rawCode = (error as { code?: unknown } | null)?.code
+          const code = typeof rawCode === 'string' && rawCode !== '' ? rawCode : 'offline'
+          answerUnbridgedSocket(socket, declared.plugin, code)
+          return
+        }
+        tunnelsCurrent += 1
+        tunnelsOpened += 1
+        log?.('tunnel open for %s: %s', declared.path, tunnel.tunnel)
+        // ---- downstream: tunnel frames → the browser socket -------------
+        void (async () => {
+          try {
+            for await (const chunk of tunnel.frames) {
+              if (socketGone()) break
+              if (!socket.write(chunk)) {
+                // Real backpressure: the NEXT frame is not pulled until the
+                // browser socket drained — the tunnel's server half pauses
+                // its upstream read in turn (the same discipline the NDJSON
+                // streams run).
+                await new Promise<void>((resolve) => {
+                  const settled = (): void => {
+                    socket.off('drain', settled)
+                    socket.off('close', settled)
+                    resolve()
+                  }
+                  socket.once('drain', settled)
+                  socket.once('close', settled)
+                })
+                if (socketGone()) break
+              }
+            }
+          } catch {
+            // The tunnel died (transport or server-side failure) — the
+            // browser socket follows, below.
+          }
+          // Upstream is over: the browser's WebSocket ends here. A WebSocket
+          // close frame cannot be synthesized (this is a byte tunnel — the
+          // upstream's own close bytes, when the plugin sent any, already
+          // travelled as data), so the socket is cut the honest way.
+          if (!socketGone()) socket.destroy()
+        })()
+        // ---- upstream: browser bytes → ordered sends --------------------
+        let sendSeq = 0
+        let upstreamBroken = false
+        let pending = Promise.resolve()
+        socket.on('data', (chunk: Buffer) => {
+          let offset = 0
+          while (offset < chunk.length) {
+            const part = chunk.subarray(offset, Math.min(offset + 65536, chunk.length))
+            offset += part.length
+            const bytes = new Uint8Array(part)
+            const seq = sendSeq
+            sendSeq += 1
+            // ONE in-flight send at a time: each chunk chains behind the
+            // previous answer, which is what keeps the server-side sequence
+            // gate satisfied and the byte order intact.
+            pending = pending.then(async () => {
+              if (upstreamBroken) return
+              try {
+                await relay.pluginTunnelSend(tunnel.tunnel, seq, bytes, controller.signal)
+              } catch {
+                upstreamBroken = true
+              }
+            })
+          }
+        })
+        const teardownTunnel = (): void => {
+          upstreamBroken = true
+          tunnelsCurrent -= 1
+          tunnelsClosed += 1
+          void relay.pluginTunnelClose(tunnel.tunnel).catch(() => {})
+        }
+        socket.on('close', teardownTunnel)
+        socket.on('error', teardownTunnel)
+        } catch {
+          // Any unexpected failure in the bridged path: the socket goes.
+          try {
+            socket.destroy()
+          } catch {
+            // Already gone.
+          }
+        }
+      })().catch(() => {
+        try {
+          socket.destroy()
+        } catch {
+          // Already gone.
+        }
+      })
+      void originalHandler
+    }
+
+  const wrappedUpgradesGet = function get(this: Map<string, unknown>, pathname: string): unknown {
+    const entry = savedUpgradesGet.call(this, pathname)
+    if (!installed) return entry
+    if (typeof pathname !== 'string' || !pathname.startsWith('/')) return entry
+    const declared = upgradeRoutesOf(pathname)
+    if (declared === undefined) return entry
+    const originalHandler = entry !== undefined && isRecord(entry) && typeof (entry as { handler?: unknown }).handler === 'function'
+      ? (entry as { handler: unknown }).handler
+      : undefined
+    return {
+      path: pathname,
+      handler: surrogateUpgrade(declared, originalHandler),
+    }
+  } as unknown as typeof targetWithUpgrades.upgrades.get
+
   target.match = wrappedMatch as typeof target.match
+  // Instance-owning property shadows Map.prototype.get — exactly the seam
+  // the probe verified (the host calls `this.upgrades.get(pathname)`).
+  targetWithUpgrades.upgrades.get = wrappedUpgradesGet
 
   return {
     uninstall() {
@@ -431,6 +726,9 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       // wrapper chained over us captured this function, and restoring the
       // original would silently drop ITS wrap. Ours goes inert instead.
       if (target.match === wrappedMatch) target.match = savedMatch
+      if (targetWithUpgrades.upgrades.get === wrappedUpgradesGet) {
+        targetWithUpgrades.upgrades.get = savedUpgradesGet
+      }
     },
     diagnostics(): PluginRouteInterceptDiagnostics {
       return {
@@ -440,6 +738,9 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         refused,
         refusalsByReason: { ...refusalsByReason },
         recentFailures: [...recentFailures],
+        tunnelsCurrent,
+        tunnelsOpened,
+        tunnelsClosed,
       }
     },
   }

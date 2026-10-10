@@ -26,10 +26,12 @@
  */
 import type { BridgeRegistry, BridgeStatus } from './plugin-bridge.js';
 import type { RelayClient } from './relay-client.js';
-/** Structural verdict of {@link checkWebServerShape}: the two facts the
- * wrap reads per request — the `match` function the host's handle calls,
- * and the two route tables (both Maps, RT lib/index.js:467-478 and 298-308;
- * the probe verified them on real 0.2.0-rc.2 / 0.2.1-alpha.2 instances). */
+/** Structural verdict of {@link checkWebServerShape}: the facts the wrap
+ * reads per request — the `match` function the host's handle calls, the two
+ * route tables, and (PB-10) the `upgrades` table the host's upgrade handler
+ * reads `this.upgrades.get(pathname)` from (both Maps, RT
+ * lib/index.js:467-478 and 298-308; the probe verified them on real
+ * 0.2.0-rc.2 / 0.2.1-alpha.2 instances). */
 export type WebServerShapeCheck = {
     ok: true;
 } | {
@@ -60,6 +62,11 @@ export interface PluginRouteInterceptDiagnostics {
     /** The most recent refusals, oldest first, capped — time, plugin, reason
      * only, never a query, never a session id. */
     recentFailures: PluginRouteFailureRecord[];
+    /** PB-10: tunnels live RIGHT NOW. */
+    tunnelsCurrent: number;
+    /** PB-10: tunnels opened / torn down since the install. */
+    tunnelsOpened: number;
+    tunnelsClosed: number;
 }
 export interface InstallPluginRouteInterceptOptions {
     /** The RAW webServer instance (`ctx.webServer[symbols.original]`). */

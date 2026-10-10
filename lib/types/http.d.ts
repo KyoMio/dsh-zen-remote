@@ -38,4 +38,11 @@ export declare function responseJson(res: ServerResponse, status: number, body: 
  * @returns true when the request may mutate the workspace.
  */
 export declare function sameOriginPost(req: IncomingMessage): boolean;
+/**
+ * One plugin-bridge refusal (PB-3): the standard JSON envelope plus the
+ * `x-zen-remote-error` marker header — the sub-client's passthrough layer
+ * classifies a refusal off the header alone, because the success path
+ * streams opaque plugin bytes and must never have to parse a body.
+ */
+export declare function pluginBridgeError(res: ServerResponse, status: number, code: string): void;
 //# sourceMappingURL=http.d.ts.map
