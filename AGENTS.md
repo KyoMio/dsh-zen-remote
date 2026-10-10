@@ -29,6 +29,10 @@
 | `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
 | `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`，远程会话调用改走中继、虚拟 id 改写、面板判定（客户端那张字段表也在这里） |
 | `src/intercept-shape.ts` | 被包装方法的形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
+| `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端比对 `compareBridges`；不 import DSH、不碰 I/O |
+| `src/plugin-loopback.ts` | 插件桥回环执行器（PB-3）：本机回环 GET 插件路由，token 换 cookie（401 重换一次），cookie 只存内存；https 仅对字面 127.0.0.1 放宽证书校验 |
+| `src/plugin-route-intercept.ts` | 子客户端改道（PB-4）：包装宿主 webServer 的 `match`，声明命中的虚拟 id 请求改走 `relay.pluginRequest`；未桥接一律统一 503（`x-zen-remote: unbridged`），绝不落本机插件 |
+| `src/client-data/plugin-bridge.ts` | 设置页纯函数（PB-5）：桥接状态 → 文案键、整机数据同意表的切换（只动一键）；浏览器半边，不 import 主包 |
 | `src/fetch-route-intercept.ts` | 子客户端本机拦截的第二半：包装宿主连接服务 `fetchRoutes` 表的上传与导出两项——远程会话的非图片附件经 `relay/v1/upload` 流式转服务端（超限本地拒、失败回宿主自己的 200 失败信封）、虚拟 id 的导出后台 403（形态检测、懒装重试、卸载守卫） |
 | `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数，无状态） |
 | `src/merge-streams.ts` | 三条全局流/列表的本地 + 远程合并状态机（侧边栏远程分组） |
@@ -105,7 +109,8 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
 - **中继访问控制按方法登记，两张表同步**：新增远程方法必须同时登记
   `src/relay-access.ts` 的 `RELAY_METHODS`（服务端，授权看登记的归属字段）
   和 `src/intercept.ts` 的 `CLIENT_METHOD_FIELDS`（客户端，改写判定），
-  一致性由 `test/intercept.test.cjs` 的逐方法比对测试钉住。禁止「从参数里
+  一致性由 `test/intercept.test.cjs` 的逐方法比对测试钉住。插件桥的授权另走一条：声明注册表 + 路径完全相等 + 会话共享（`src/plugin-route-intercept.ts` / relay 的 `/v1/plugin`），同样不扫描参数；
+禁止「从参数里
   通用扫描会话 id」的写法——DSH 会悄悄丢掉不认识的参数名，扫描会被诱饵
   字段骗过；全局读（`session/list` 等）安全靠输出过滤，不靠输入判定。
 - **桌面端请求没有 `Origin`/`Sec-Fetch-Site`**：DSH 桌面端主进程把窗口请求

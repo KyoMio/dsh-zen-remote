@@ -242,6 +242,8 @@ Row fields (matching `src/config.ts`):
 | `serverName` | computer name | **Device name** (≤ 40 chars), shared by both roles: on a host it is the display name in clients' group titles; on a client it is the name registered when pairing. Syncs both ways with the server automatically |
 | `idleHours` | `48` | Idle-sleep window in hours for remote-enabled sessions; range (0, 8760] |
 | `autoShareNewSessions` | off | Auto-enable remote on every session the host creates |
+| `pluginBridgeConsent` | `{}` | The plugin bridge's whole-machine-data consent map: plugin name → boolean. Managed by the settings page's Plugin bridge section, rarely hand-edited; leftover keys for unregistered plugins are never pruned |
+
 | `serverUrl` *(client)* | empty | The server's gateway address, normalized per the rules above |
 | `deviceToken` *(client)* | empty | The paired device token; stored as a secret field, redacted everywhere |
 | `turnFoldDesktop` | off | Turn-process folding at every width, not just phone widths |
@@ -305,6 +307,10 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 - Title-row connection icon per remote session (online / offline / version differs); a "remote closed" banner with the reason when a session is slept or closed server-side; offline groups go grey with input disabled and reconnect automatically with backoff
 - First-come-first-served approvals/questions: if the server's own UI answers first, the client syncs to "already handled"
 
+**Both ends (2.1 additions)**
+
+- The **plugin bridge**: another plugin registers one bridge declaration and its panel data in remote sessions is served by the HOST — the sub-client reroutes the declared GET requests to the server, which executes them over loopback and streams the answer back; local data never leaks into a remote session. Bridged requires the plugin name, exact version and declaration to agree on BOTH ends; whole-machine data additionally needs the server owner's per-plugin consent in the settings page. Author guide: [the plugin bridge](docs/plugin-bridge.md)
+
 In depth: [interface](docs/interface.md) · [public access + relay protocol](docs/remote-access.en.md)
 
 ---
@@ -363,10 +369,11 @@ Troubleshooting: runtime logs are in `~/.dsh/logs/web.log` (gateway and push lin
 
 ## Third-party plugins with mobile support
 
-The mobile UI has specific adaptations for the plugins below. Every adaptation is anchored on that plugin's own DOM markers: if you don't have it installed the rules simply don't match, and installing a plugin that isn't listed here can't be caught in the crossfire.
+The mobile UI has specific adaptations for the plugins below. Every adaptation is anchored on that plugin's own DOM markers; the plugin bridge is a separate lane — the plugin registers a declaration itself (see [the plugin bridge](docs/plugin-bridge.md)) and none of this table applies: if you don't have it installed the rules simply don't match, and installing a plugin that isn't listed here can't be caught in the crossfire.
 
 | Plugin | What the mobile adaptation does | Version tested |
 | --- | --- | --- |
+| [dsh-zcode-executor](https://github.com/KyoMio/dsh-zcode-executor) | 0.2.0+ registers a bridge declaration: its task / snapshot panel data in **remote sessions** is served by the host (snapshot and streaming task list are whole-machine data — grant consent in the host's settings page); no mobile-UI rules needed | 0.2.0 |
 | [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 0.19+: all its tabs live in DSH 0.1.5's native right sidebar, which the host takes full screen on a phone (padded clear of the notch / home indicator) — the session header keeps an entry button for it, the left-edge swipe-back closes it, and tapping an @-reference in the file tree closes it. ≤ 0.18 (own right panel, DSH < 0.1.5 only): full-width phone drawer with notch safe area and a centred close pill | 0.19.1 (legacy rules: 0.15.0) |
 | [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | The AgentTeams activity overlay moves below the session header (its original position covered the header buttons) and hides itself on the session list; a subagent session keeps a tappable parent-session title in its header for jumping back | 0.1.9 |
 | [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | Usage and balance entries fold into the home-screen chips row | 0.2.9 |
