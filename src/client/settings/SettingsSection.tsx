@@ -40,6 +40,7 @@ import type { SettingsFormLabels } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   ADMIN_ACTION_ROUTE,
   ADMIN_PAIR_ROUTE,
+  ADMIN_PLUGIN_BRIDGE_ROUTE,
   ADMIN_PUSH_TEST_ROUTE,
   ADMIN_STATUS_ROUTE,
   CLIENT_CLAIM_ROUTE,
@@ -55,6 +56,8 @@ import {
   normalizePairingCode,
   shouldFollowServerDeviceName,
 } from '../../client-data/settings-form.ts'
+import { togglePluginConsent } from '../../client-data/plugin-bridge.ts'
+import type { PluginBridgeStatusView } from '../../client-data/plugin-bridge.ts'
 import type {
   AdminStatusBody,
   ClaimRouteBody,
@@ -374,6 +377,30 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     ? deriveSettingsView(load.body, { now, rowUser: config.rowUser() })
     : undefined
   const clientRole = config.savedRoleIsClient()
+
+  // The plugin bridge's registered-plugin listing (PB-5), host page only:
+  // loaded once per page life and refreshed whenever a save lands (the
+  // consent staged by the toggles below rides that very save). Undefined
+  // until the first answer — the section renders the empty copy then, and a
+  // composition without the route stays there silently.
+  const [bridgeRows, setBridgeRows] = useState<{ plugin: string, version: string, hasServerScope: boolean, consent: boolean }[] | undefined>(undefined)
+  const loadBridge = useCallback(() => {
+    fetch(ADMIN_PLUGIN_BRIDGE_ROUTE)
+      .then((res) => {
+        if (!res.ok) return Promise.reject(new Error(String(res.status)))
+        return res.json() as Promise<{ value?: { plugins?: unknown } }>
+      })
+      .then((body) => {
+        const plugins = body?.value?.plugins
+        if (!Array.isArray(plugins)) return
+        setBridgeRows(plugins.filter((row): row is { plugin: string, version: string, hasServerScope: boolean, consent: boolean } =>
+          row !== null && typeof row === 'object' && typeof (row as { plugin?: unknown }).plugin === 'string'))
+      })
+      .catch(() => { /* no listing (older build, or refused): the section keeps its empty copy */ })
+  }, [])
+  useEffect(() => {
+    if (!clientRole) loadBridge()
+  }, [clientRole, loadBridge])
   const statusPoll = config.statusPoll()
 
   useEffect(() => {
@@ -817,6 +844,9 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     else setClientLoad({ state: 'loading' })
     const refresh = config.savedRoleIsClient() ? loadClientStatus : loadStatus
     refresh()
+    // The plugin bridge listing re-reads too (PB-5): the consent toggles
+    // stage through the very save that just landed.
+    if (!config.savedRoleIsClient()) loadBridge()
     // Immediate pull + 1.5s covers a hot-only save. A save that reloads the
     // plugin row (T17) restarts the row and the gateway child with it — the
     // reload and the gateway's rebinding of its port both take longer than
@@ -901,6 +931,47 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               <h3 className="zr-settings-card-title">{t('settings.shareTitle')}</h3>
               {text(form.idleHours, 'idleHours', t('settings.fieldIdleHours'), t('settings.fieldIdleHoursHint'), t('settings.invalidHours'), true)}
               {bool(form.autoShareNewSessions, 'autoShareNewSessions', t('settings.fieldAutoShare'), t('settings.fieldAutoShareHint'))}
+
+              {/* 插件桥 (PB-5): the consent toggles stage the NEXT consent map
+                  over the SAME form — one save button, one revision fence —
+                  reading the CURRENT map off the staged (or displayed) draft
+                  so consecutive toggles compose. */}
+              <h3 className="zr-settings-card-title">{t('settings.bridge.title')}</h3>
+              {(bridgeRows ?? []).length === 0 && <p className="zr-settings-hint">{t('settings.bridge.empty')}</p>}
+              {(bridgeRows ?? []).map((row) => {
+                let current: Record<string, boolean> = {}
+                try {
+                  const parsed: unknown = JSON.parse(form.pluginBridgeConsent.text)
+                  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    current = parsed as Record<string, boolean>
+                  }
+                } catch { /* a malformed draft reads as nothing consented */ }
+                return (
+                  <div className="zr-settings-field" key={row.plugin}>
+                    <div className="zr-settings-head">
+                      <span className="zr-settings-head-title">{row.plugin}</span>
+                      <span className="zr-settings-badge">{row.version}</span>
+                    </div>
+                    {row.hasServerScope ? (
+                      <>
+                        <label className="zr-settings-field">
+                          <input
+                            type="checkbox"
+                            checked={current[row.plugin] === true}
+                            onChange={(event) => {
+                              config.stage('pluginBridgeConsent', JSON.stringify(togglePluginConsent(current, row.plugin, event.target.checked)))
+                            }}
+                          />
+                          {' '}{t('settings.bridge.consentToggle')}
+                        </label>
+                        <p className="zr-settings-hint">{t('settings.bridge.consentHint')}</p>
+                      </>
+                    ) : (
+                      <p className="zr-settings-hint">{t('settings.bridge.sessionOnly')}</p>
+                    )}
+                  </div>
+                )
+              })}
             </>
           )}
         </SettingsForm>
@@ -1073,8 +1144,9 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               client/status body. The interceptor (T23b) and compat (T42)
               groups render only when the response carried their fields —
               earlier servers answer neither, and the section itself only
-              exists when there is at least one line to show. */}
-          {clientView !== undefined && (clientView.lastError !== '' || clientView.intercept !== undefined || clientView.compat !== undefined) && (
+              exists when there is at least one line to show. PB-5 adds the
+              bridge rows and the rerouting note on the same presence gate. */}
+          {clientView !== undefined && (clientView.lastError !== '' || clientView.intercept !== undefined || clientView.compat !== undefined || (clientView.pluginBridge?.length ?? 0) > 0 || clientView.pluginRouteIntercept !== undefined) && (
             <>
               <h3 className="zr-settings-card-title">{t('settings.client.diagTitle')}</h3>
               {clientView.lastError !== '' && (
@@ -1131,6 +1203,26 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                     </div>
                   )}
                 </>
+              )}
+              {(clientView.pluginBridge?.length ?? 0) > 0 && clientView.pluginBridge !== undefined && (
+                <div className="zr-settings-field">
+                  <div className="zr-settings-head">
+                    <label>{t('settings.bridge.title')}</label>
+                  </div>
+                  {clientView.pluginBridge.map((row: PluginBridgeStatusView) => (
+                    <p key={row.plugin} className="zr-settings-hint">
+                      {row.plugin} · {row.localVersion !== '' ? `v${row.localVersion}` : '—'} ·{' '}
+                      {row.stateKey === 'settings.bridge.stateVersionMismatch'
+                        ? t(row.stateKey, { version: row.serverVersion ?? '?' })
+                        : t(row.stateKey)}
+                    </p>
+                  ))}
+                </div>
+              )}
+              {clientView.pluginRouteIntercept !== undefined && !clientView.pluginRouteIntercept.installed && (
+                <p className="zr-settings-hint" data-invalid="true">
+                  {t('settings.bridge.interceptOff', { reason: clientView.pluginRouteIntercept.reasons.join('; ') || '—' })}
+                </p>
               )}
             </>
           )}

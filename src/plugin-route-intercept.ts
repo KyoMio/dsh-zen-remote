@@ -233,6 +233,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         return
       }
       forwarded += 1
+      // Logged HERE, after the virtual-id gate (PB-5-fix): a local panel
+      // polling its route every second must not log a line a second — the
+      // bridge only speaks when a request actually leaves for the relay (or
+      // is refused below, which answerUnbridged logs).
+      log?.('plugin route %s forwards for %s', declared.path, declared.plugin)
       // The session id rides the CHECKED parse, restored to its ORIGINAL
       // form, re-serialized once — what was judged is what is forwarded.
       searchParams.set(declared.sessionParam, parts.id)
@@ -322,7 +327,6 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     if (typeof pathname !== 'string' || !pathname.startsWith('/')) return route
     const declared = declaredRouteOf(pathname)
     if (declared === undefined) return route
-    log?.('plugin route %s enters the bridge for %s', pathname, declared.plugin)
     return {
       kind: 'exact',
       path: pathname,

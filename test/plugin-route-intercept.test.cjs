@@ -385,8 +385,75 @@ test('PB-4: every unbridged reason answers the uniform 503 and the local handler
   }
 })
 
-test('PB-4: the browser hang-up aborts the relay round-trip', async () => {
+test('PB-5-fix: a LOCAL session request logs NOTHING; only forwards and refusals speak', async () => {
   const host = await startFakeHost()
+  host.registerLocalPlugin()
+  const relay = await startFakeRelay()
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const logLines = []
+  const handle = installPluginRouteIntercept({
+    webServer: host.raw,
+    registry,
+    relay: fakeRelayClient(relay.__port),
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: (format, ...args) => logLines.push(`${format} ${args.join(' ')}`),
+  })
+  try {
+    // The local panel's own polling shape: declared route, local id, over
+    // and over.
+    for (let i = 0; i < 5; i += 1) {
+      const res = await host.get('/panel/data?sessionId=session-local')
+      assert.equal(res.status, 200)
+    }
+    assert.equal(logLines.length, 0, 'the local passthrough never logged')
+
+    // The relay side still speaks: one forward, one line.
+    await host.get(`/panel/stream?sessionId=${encodeURIComponent(VIRTUAL)}`, { headers: { accept: 'text/event-stream' } })
+    assert.equal(logLines.length, 1, 'the forward logged exactly once')
+  } finally {
+    handle.uninstall()
+    await relay.stop()
+    await host.stop()
+  }
+})
+
+test('PB-5-fix: a relay TRANSPORT failure answers the uniform 503 offline, and the local handler still never runs', async () => {
+  const host = await startFakeHost()
+  host.registerLocalPlugin()
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  // A relay client pointed at a port nothing listens on: the transport dies.
+  const dead = http.createServer()
+  await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve))
+  const deadPort = dead.address().port
+  await new Promise((resolve) => dead.close(resolve))
+  const handle = installPluginRouteIntercept({
+    webServer: host.raw,
+    registry,
+    relay: fakeRelayClient(deadPort),
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  try {
+    const res = await host.get(`/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`)
+    assert.equal(res.status, 503)
+    assert.equal(res.headers.get('x-zen-remote'), 'unbridged')
+    assert.deepEqual(await res.json(), {
+      ok: false, error: { code: 'zr-plugin-unbridged', reason: 'offline', plugin: 'test-panel' },
+    })
+    assert.equal(host.hits.localPanel, 0, 'the local handler still never ran')
+    const diag = handle.diagnostics()
+    assert.equal(diag.refusalsByReason.offline, 1)
+  } finally {
+    handle.uninstall()
+    await host.stop()
+  }
+})
+
+test('PB-4: the browser hang-up aborts the relay round-trip', async () => {  const host = await startFakeHost()
   host.registerLocalPlugin()
   const relay = await startFakeRelay()
   const registry = createBridgeRegistry()

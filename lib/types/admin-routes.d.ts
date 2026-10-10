@@ -38,6 +38,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ConfigSource, ZenRemoteConfig } from './config.js';
+import type { BridgeRegistry } from './plugin-bridge.js';
 import type { RelayGateway } from './relay-server.js';
 import type { AgentStatusLike } from './share-ops.js';
 import type { ShareStore } from './share-store.js';
@@ -55,6 +56,9 @@ export declare const ADMIN_PUSH_TEST_ROUTE = "/_dsh/zen-remote/admin/push-test";
 /** GET: every shared session with its clocks, viewers and titles.
  * POST `{action, sessionId?}`: share / unshare / unshare-all (T33a). */
 export declare const ADMIN_SHARES_ROUTE = "/_dsh/zen-remote/admin/shares";
+/** GET: the plugin bridge's registered plugins with their whole-machine-data
+ * consent, for the settings page's 插件桥 section (PB-5). */
+export declare const ADMIN_PLUGIN_BRIDGE_ROUTE = "/_dsh/zen-remote/admin/plugin-bridge";
 /** What `connection.admit` answers: the operator peer, or the refusal status. */
 export type AdminAdmission = {
     readonly peer: unknown;
@@ -104,6 +108,14 @@ export interface AdminHandlerOptions {
      * durable header through it to judge subagent sessions; absent (or a
      * failing read) falls back to the projection identity. */
     sessionQuery?: () => SessionQueryLike | undefined;
+    /** The plugin bridge's server half (PB-5): the declaration registry and
+     * the LIVE consent reader backing the plugin-bridge listing. Absent — a
+     * composition that never built the registry — and the route answers 404
+     * like any unknown admin path. */
+    pluginBridge?: {
+        registry: BridgeRegistry;
+        getConsent: () => Record<string, boolean>;
+    };
 }
 /** The slice of the sessionQuery service the share action reads (RT
  * dsh-session-query): `observeSession` answers a caller-owned lease over an

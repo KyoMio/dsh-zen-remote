@@ -777,3 +777,64 @@ test('without a store the shares routes answer 404 like any unknown admin path',
     assert.equal(post.status, 404)
   } finally { await closeServer(server) }
 })
+
+// ---- PB-5: the plugin bridge listing -------------------------------------------
+
+async function startBridgeAdmin(options) {
+  const bridgeAdmin = await import(ADMIN_URL)
+  const handler = bridgeAdmin.createAdminHandler(options)
+  const server = http.createServer((req, res) => { void handler(req, res) })
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })))
+}
+
+test('PB-5 GET plugin-bridge: shape, order, hasServerScope, and consent read LIVE', async () => {
+  const registry = (await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-bridge.js')).href)).createBridgeRegistry()
+  registry.register({ plugin: 'zeta-panel', version: '1.0.0', routes: [{ path: '/z/data', scope: 'session' }] })
+  registry.register({ plugin: 'acme-tasks', version: '2.0.0', routes: [{ path: '/a/all', scope: 'server' }, { path: '/a/x', scope: 'session' }] })
+  const consentBox = { map: { 'acme-tasks': true } }
+  const { server, port } = await startBridgeAdmin({
+    ...makeOptions(gwPort),
+    pluginBridge: { registry, getConsent: () => consentBox.map },
+  })
+  try {
+    const res = await request(port, { method: 'GET', path: '/_dsh/zen-remote/admin/plugin-bridge' })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.ok, true)
+    // Sorted by plugin name; hasServerScope from the routes; consent verbatim.
+    assert.deepEqual(body.value.plugins, [
+      { plugin: 'acme-tasks', version: '2.0.0', hasServerScope: true, consent: true },
+      { plugin: 'zeta-panel', version: '1.0.0', hasServerScope: false, consent: false },
+    ])
+
+    // The consent read is LIVE: flipping the row-side map (the volatile
+    // knob's stand-in) shows up on the very next request, no re-wiring.
+    consentBox.map = {}
+    const second = JSON.parse((await request(port, { method: 'GET', path: '/_dsh/zen-remote/admin/plugin-bridge' })).body)
+    assert.deepEqual(second.value.plugins.map((p) => [p.plugin, p.consent]), [['acme-tasks', false], ['zeta-panel', false]])
+  } finally { await closeServer(server) }
+})
+
+test('PB-5 GET plugin-bridge: the existing rules hold — via-gateway refused, non-GET 405, unwired 404', async () => {
+  const registry = (await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-bridge.js')).href)).createBridgeRegistry()
+  registry.register({ plugin: 'p', version: '1', routes: [{ path: '/p/x', scope: 'session' }] })
+  const { server, port } = await startBridgeAdmin({
+    ...makeOptions(gwPort),
+    pluginBridge: { registry, getConsent: () => ({}) },
+  })
+  try {
+    // The listing feeds a MANAGEMENT surface, so the pair/action rule
+    // applies: a forwarded remote request is refused outright.
+    const via = await request(port, { method: 'GET', path: '/_dsh/zen-remote/admin/plugin-bridge', headers: { 'x-zen-remote-via': 'gateway' } })
+    assert.equal(via.status, 403)
+    assert.equal(JSON.parse(via.body).error.code, 'via-gateway')
+    // Read-only: anything but GET answers 405.
+    const post = await request(port, { method: 'POST', path: '/_dsh/zen-remote/admin/plugin-bridge', headers: sameOrigin(port) })
+    assert.equal(post.status, 405)
+  } finally { await closeServer(server) }
+
+  // The wired handler's composition carries NO bridge: the route answers
+  // 404 like any unknown admin path.
+  const none = await request(adminPort, { method: 'GET', path: '/_dsh/zen-remote/admin/plugin-bridge' })
+  assert.equal(none.status, 404)
+})

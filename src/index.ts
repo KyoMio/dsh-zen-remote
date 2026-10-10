@@ -654,6 +654,13 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           // composition lacks the service.
           viewerCount: (id) => relayHandler?.viewerCount(id) ?? 0,
           sessionQuery: () => webCtx.reflect.get('sessionQuery') as SessionQueryLike | undefined,
+          // The plugin bridge listing (PB-5): the SAME registry this apply
+          // built and the SAME live consent reader the relay's plugins table
+          // uses — one source of truth per question.
+          pluginBridge: {
+            registry,
+            getConsent: () => resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent,
+          },
         }),
       }), 'dsh-zen-remote: admin routes')
     })
