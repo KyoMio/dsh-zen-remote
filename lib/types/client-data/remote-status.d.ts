@@ -42,6 +42,11 @@ export interface RemoteStatusView {
     versionMismatch: boolean;
     serverName: string;
     closed: Readonly<Record<string, RemoteClosedReason>>;
+    /** The plugins whose bridge verdict is bridged RIGHT NOW (PB-2; sorted
+     * server-side). A garbage or missing field degrades to the empty list —
+     * nothing is ever considered bridged on a shape the parse does not
+     * trust. */
+    bridgedPlugins: readonly string[];
     /** When this view was parsed off a GET body. */
     asOf: number;
 }
@@ -55,6 +60,21 @@ export interface RemoteStatusSnapshot {
  * garbage field degrades to its default — never a throw into the polling
  * loop. */
 export declare function parseRemoteStatusBody(body: unknown, now: number): RemoteStatusView;
+/**
+ * Whether ONE plugin's bridge verdict is bridged RIGHT NOW, judged off the
+ * `bridgedPlugins` list the remote-status body carries. Tolerant by the
+ * same discipline as the parse: a garbage list (an older server that never
+ * learned the field, a broken body) reads as "not bridged" — the hiding
+ * rules stay in force unless the server positively says otherwise, never
+ * the reverse. This is the pure core behind the
+ * `html[data-zr-bridge-<plugin>]` stamp the remote-session stylesheet
+ * spends.
+ */
+export declare function shouldStampBridgeAttribute(bridgedPlugins: unknown, plugin: string): boolean;
+/** The plugin the bridge stamp names. */
+export declare const BRIDGE_STAMP_PLUGIN = "dsh-better-sidebar";
+/** The html attribute the stamp writes (`data-zr-bridge-dsh-better-sidebar`). */
+export declare const BRIDGE_STAMP_ATTRIBUTE = "data-zr-bridge-dsh-better-sidebar";
 /** The locale keys `describeRemoteStatus` needs. */
 export type RemoteStatusTextKey = 'remoteStatusOnline' | 'remoteStatusOffline' | 'remoteStatusMismatch' | 'remoteStatusRevoked' | 'remoteStatusUnpaired';
 /** Minimal shape of the framework `t` seat over the plugin's namespace. */

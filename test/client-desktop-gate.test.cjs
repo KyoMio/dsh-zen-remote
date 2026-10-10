@@ -506,7 +506,7 @@ test('T53: every rule is gated on the remote-session attribute — a local sessi
   //     in full (selector lists repeat the gate per line, so continuation
   //     lines ending in "," are checked too). An ungated selector would fire
   //     on local sessions, where these plugin surfaces are exactly right.
-  const GATE = 'html[data-zr-remote-session="1"]'
+  const GATE = 'html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"])'
   const stripped = t53Sliced.replace(/\/\*[\s\S]*?\*\//g, '')
   const offenders = stripped
     .split('\n')
@@ -517,11 +517,16 @@ test('T53: every rule is gated on the remote-session attribute — a local sessi
       if (/^[a-z-]+:\s[^{}]*;$/.test(line)) return false
       return !(line.startsWith(GATE) && /[,{]$/.test(line))
     })
-  assert.deepEqual(offenders, [], 'every selector line must sit under html[data-zr-remote-session="1"]')
+  assert.deepEqual(offenders, [], 'every selector line must sit under the double gate (remote session AND not-bridged)')
   // And the gate is really there, once per rule (the 3-kind guide rule
   // repeats it per selector line) + 1 variable override.
-  const gatedLines = (stripped.match(/html\[data-zr-remote-session="1"\]/g) || []).length
+  const gatedLines = (stripped.match(/html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\)/g) || []).length
   assert.ok(gatedLines >= 10, `expected every rule gated, found ${gatedLines} gate occurrences`)
+  // And no rule may carry the remote-session attribute WITHOUT the bridge
+  // stamp gate — that bare shape would hide the panels even when bridged
+  // (PB-14).
+  const bareLines = (stripped.match(/html\[data-zr-remote-session="1"\](?!:not)/g) || []).length
+  assert.equal(bareLines, 0, 'no T53 selector may skip the bridge stamp gate')
 })
 
 test('T53: every selector anchors on better-sidebar\'s own (or its host slot\'s) markers, never generated class names', () => {
@@ -551,7 +556,7 @@ test('T53: every selector anchors on better-sidebar\'s own (or its host slot\'s)
   // capsule and spares the host's wherever the host has a default binding.
   assert.match(
     t53Sliced,
-    /html\[data-zr-remote-session="1"\] \[data-sidebar-right-guide-entry="files"\]:not\(\[aria-keyshortcuts\]\)/,
+    /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-sidebar-right-guide-entry="files"\]:not\(\[aria-keyshortcuts\]\)/,
     'the files guide capsule is discriminated by aria-keyshortcuts, not plugin presence',
   )
 })
@@ -571,12 +576,13 @@ test('T53: each hidden surface hides with display:none !important', () => {
   // One assertion per surface so a later edit that drops one rule fails the
   // exact line it broke. The variable override is covered by the test above.
   const rules = {
-    'bottom workbench toggle': /html\[data-zr-remote-session="1"\] \[data-dsh-bottom-toggle\] \{\s*display: none !important;/,
-    'bottom workbench panel host': /html\[data-zr-remote-session="1"\] \[data-dsh-panel-host\] \{\s*display: none !important;/,
-    'native sidebar tab bodies': /html\[data-zr-remote-session="1"\] \[data-dsh-native-tab-host\] \{\s*display: none !important;/,
-    'native sidebar chips': /html\[data-zr-remote-session="1"\] \[data-dockkit-tab\]:has\(\[class\$="_chipIcon"\]\) \{\s*display: none !important;/,
-    'portaled floating windows': /html\[data-zr-remote-session="1"\] \[data-floating-window\]:has\(\[data-window-body\]\) \{\s*display: none !important;/,
-    'guide capsules (plugin-only kinds)': /html\[data-zr-remote-session="1"\] \[data-sidebar-right-guide-entry="git"\],\s*html\[data-zr-remote-session="1"\] \[data-sidebar-right-guide-entry="subagent"\],\s*html\[data-zr-remote-session="1"\] \[data-sidebar-right-guide-entry="sidechat"\] \{\s*display: none !important;/,
+    'bottom workbench toggle': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-bottom-toggle\] \{\s*display: none !important;/,
+    'bottom workbench panel host': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-panel-host\] \{\s*display: none !important;/,
+    'native sidebar tab bodies (children hidden, note shown)': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-native-tab-host\] > \* \{\s*display: none !important;/,
+    'native sidebar tab bodies (the note)': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-native-tab-host\]::before \{\s*content: var\(--zr-bridge-note\);/,
+    'native sidebar chips': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dockkit-tab\]:has\(\[class\$="_chipIcon"\]\) \{\s*display: none !important;/,
+    'portaled floating windows': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-floating-window\]:has\(\[data-window-body\]\) \{\s*display: none !important;/,
+    'guide capsules (plugin-only kinds)': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-sidebar-right-guide-entry="git"\],\s*html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-sidebar-right-guide-entry="subagent"\],\s*html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-sidebar-right-guide-entry="sidechat"\] \{\s*display: none !important;/,
   }
   for (const [what, pattern] of Object.entries(rules)) {
     assert.match(t53Sliced, pattern, `the ${what} rule is missing or changed shape`)

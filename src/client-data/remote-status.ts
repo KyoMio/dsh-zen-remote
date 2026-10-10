@@ -51,6 +51,11 @@ export interface RemoteStatusView {
   versionMismatch: boolean
   serverName: string
   closed: Readonly<Record<string, RemoteClosedReason>>
+  /** The plugins whose bridge verdict is bridged RIGHT NOW (PB-2; sorted
+   * server-side). A garbage or missing field degrades to the empty list —
+   * nothing is ever considered bridged on a shape the parse does not
+   * trust. */
+  bridgedPlugins: readonly string[]
   /** When this view was parsed off a GET body. */
   asOf: number
 }
@@ -80,9 +85,34 @@ export function parseRemoteStatusBody(body: unknown, now: number): RemoteStatusV
     versionMismatch: record.versionMismatch === true,
     serverName: typeof record.serverName === 'string' ? record.serverName : '',
     closed,
+    bridgedPlugins: Array.isArray(record.bridgedPlugins)
+      ? record.bridgedPlugins.filter((name): name is string => typeof name === 'string' && name !== '')
+      : [],
     asOf: now,
   }
 }
+
+// --- the bridge stamp (PB-14) -----------------------------------------------
+
+/**
+ * Whether ONE plugin's bridge verdict is bridged RIGHT NOW, judged off the
+ * `bridgedPlugins` list the remote-status body carries. Tolerant by the
+ * same discipline as the parse: a garbage list (an older server that never
+ * learned the field, a broken body) reads as "not bridged" — the hiding
+ * rules stay in force unless the server positively says otherwise, never
+ * the reverse. This is the pure core behind the
+ * `html[data-zr-bridge-<plugin>]` stamp the remote-session stylesheet
+ * spends.
+ */
+export function shouldStampBridgeAttribute(bridgedPlugins: unknown, plugin: string): boolean {
+  return Array.isArray(bridgedPlugins) && bridgedPlugins.includes(plugin)
+}
+
+/** The plugin the bridge stamp names. */
+export const BRIDGE_STAMP_PLUGIN = 'dsh-better-sidebar'
+
+/** The html attribute the stamp writes (`data-zr-bridge-dsh-better-sidebar`). */
+export const BRIDGE_STAMP_ATTRIBUTE = `data-zr-bridge-${BRIDGE_STAMP_PLUGIN}`
 
 // --- the icon's states -------------------------------------------------------
 
