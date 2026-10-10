@@ -123,6 +123,12 @@ server {
         # 长连接/流式响应建议关掉缓冲，避免响应被攒着不发
         proxy_buffering off;
         proxy_read_timeout 3600s;
+
+        # 必须加：nginx 默认 client_max_body_size 只有 1m，而中继的 JSON
+        # invoke（远程会话带图消息，上限 32MiB）和附件二进制上传
+        # （relay/v1/upload，上限 100MiB）都远超——缺了这条，文字消息正常、
+        # 一发图片就被掐断，子客户端界面报一个没有内容的错误（实测 2026-10-10）。
+        client_max_body_size 128m;
     }
 }
 ```
