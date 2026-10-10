@@ -24,6 +24,7 @@
  * separate task; the shapes mirror `lib/lan-gate-server.cjs`'s status payload
  * (devices / pairing) plus the T14 envelope (ok / gateway / config / viaGateway).
  */
+import { type PluginBridgeStatusView } from './plugin-bridge.ts';
 /** Where a resolved field value came from (mirror of src/config.ts's union; the client half cannot import the host module). */
 export type ConfigSource = 'env' | 'row' | 'file' | 'default';
 /** One paired gateway device, as the gateway's status payload lists it. */
@@ -78,6 +79,8 @@ export declare const ADMIN_STATUS_ROUTE = "/_dsh/zen-remote/admin/status";
 export declare const ADMIN_PAIR_ROUTE = "/_dsh/zen-remote/admin/pair";
 export declare const ADMIN_ACTION_ROUTE = "/_dsh/zen-remote/admin/action";
 export declare const ADMIN_PUSH_TEST_ROUTE = "/_dsh/zen-remote/admin/push-test";
+/** PB-5: the plugin bridge's registered-plugin listing (GET, server-local only). */
+export declare const ADMIN_PLUGIN_BRIDGE_ROUTE = "/_dsh/zen-remote/admin/plugin-bridge";
 /** Same-origin client routes the sub-client block talks to (host half: T16). */
 export declare const CLIENT_CLAIM_ROUTE = "/_dsh/zen-remote/client/claim";
 export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
@@ -136,6 +139,13 @@ export interface ClientStatusBody {
      * string[], unavailable: string[], incompatibleCalls: { time: number,
      * endpoint: string, code: string }[] }` (presence-gated). */
     compat?: unknown;
+    /** PB-2: the per-plugin bridge verdicts (`BridgeStatus[]` verbatim,
+     * presence-gated — older servers answer without it). */
+    pluginBridge?: unknown;
+    /** PB-4: the plugin-route interception's diagnostics (presence-gated —
+     * a host role or a refused install may still answer it; a server without
+     * the field never does). */
+    pluginRouteIntercept?: unknown;
 }
 /** One remote-call failure line in the diagnostics lists. `time` is epoch
  * milliseconds — ISO-stamped rings are parsed at derive time; `method`
@@ -179,6 +189,16 @@ export interface ClientConnectionView {
     deviceName: string;
     intercept: ClientInterceptView | undefined;
     compat: ClientCompatView | undefined;
+    /** PB-5: the bridge verdicts as the 诊断区 renders them, input order kept
+     * (undefined when the body carried none — the group stays hidden). */
+    pluginBridge: PluginBridgeStatusView[] | undefined;
+    /** PB-5: the route interception's install state (`installed: false`
+     * renders the 本机改道未启用 line with the shape reasons; undefined when
+     * the body carried none). */
+    pluginRouteIntercept: {
+        installed: boolean;
+        reasons: string[];
+    } | undefined;
 }
 /**
  * Map one `client/status` body into the view the client group renders.
@@ -423,8 +443,20 @@ export declare function claimDeviceNameOf(displayText: string, fallback: string)
 export declare function oneOfField(field: string, options: readonly string[]): SettingsFieldSpec;
 /** Boolean field staged as 'true'/'false' draft text (rendered as a checkbox). */
 export declare function boolField(field: string): SettingsFieldSpec;
+/**
+ * `pluginBridgeConsent` (PB-5): a name → boolean map staged as its canonical
+ * JSON draft. Nothing renders it as text — the 插件桥 toggles stage the NEXT
+ * map wholesale (`togglePluginConsent` builds it, one key per click) — but
+ * riding the shared spec table is what puts the field on the SAME save path
+ * as `autoShareNewSessions`: one staged revision, one save button, one
+ * atomic mutation. `format` keeps the value's own key order so a staged
+ * draft equal to the displayed value reads as "no change"; an illegal stored
+ * map formats as `{}` (the toggle then writes from scratch, and the junk
+ * stays refused by the row validator, never laundered through).
+ */
+export declare function consentField(field: string): SettingsFieldSpec;
 /** Names of the row fields the settings page edits, in group order. */
-export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushDebounceMs' | 'lang' | 'serverName' | 'idleHours' | 'autoShareNewSessions';
+export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushDebounceMs' | 'lang' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'pluginBridgeConsent';
 /** Longest legal `serverName`, mirroring src/config.ts's cap. */
 export declare const SERVER_NAME_MAX = 40;
 /** Upper bound of `idleHours`, mirroring src/config.ts. */
@@ -546,6 +578,10 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
     serverName: SettingsFieldState;
     idleHours: SettingsFieldState;
     autoShareNewSessions: SettingsFieldState;
+    /** The consent map's staged state (PB-5). No text control renders it — the
+     * 插件桥 toggles stage the next map wholesale — but its `invalid` flag
+     * (a malformed draft) still gates the save like any field's. */
+    pluginBridgeConsent: SettingsFieldState;
     deviceToken: SettingsSecretFieldState;
     /** A restart-required field ({@link RESTART_FIELDS}) has a staged change a
      * save would actually write: the save will move the row and the host

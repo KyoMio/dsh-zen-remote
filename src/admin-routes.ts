@@ -41,6 +41,7 @@ import { request as httpRequest } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ConfigSource, ZenRemoteConfig } from './config.js'
 import { responseJson, sameOriginPost } from './http.js'
+import type { BridgeRegistry } from './plugin-bridge.js'
 import type { RelayGateway } from './relay-server.js'
 import { restoreBusy } from './share-ops.js'
 import type { AgentStatusLike } from './share-ops.js'
@@ -65,6 +66,10 @@ export const ADMIN_PUSH_TEST_ROUTE = `${ADMIN_ROUTE_PREFIX}/push-test`
 /** GET: every shared session with its clocks, viewers and titles.
  * POST `{action, sessionId?}`: share / unshare / unshare-all (T33a). */
 export const ADMIN_SHARES_ROUTE = `${ADMIN_ROUTE_PREFIX}/shares`
+
+/** GET: the plugin bridge's registered plugins with their whole-machine-data
+ * consent, for the settings page's 插件桥 section (PB-5). */
+export const ADMIN_PLUGIN_BRIDGE_ROUTE = `${ADMIN_ROUTE_PREFIX}/plugin-bridge`
 
 /** Longest wait for one gateway round-trip. */
 const GATEWAY_TIMEOUT_MS = 5000
@@ -161,6 +166,14 @@ export interface AdminHandlerOptions {
    * durable header through it to judge subagent sessions; absent (or a
    * failing read) falls back to the projection identity. */
   sessionQuery?: () => SessionQueryLike | undefined
+  /** The plugin bridge's server half (PB-5): the declaration registry and
+   * the LIVE consent reader backing the plugin-bridge listing. Absent — a
+   * composition that never built the registry — and the route answers 404
+   * like any unknown admin path. */
+  pluginBridge?: {
+    registry: BridgeRegistry
+    getConsent: () => Record<string, boolean>
+  }
 }
 
 /** The slice of the sessionQuery service the share action reads (RT
@@ -572,6 +585,47 @@ export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
         }
         res.setHeader('Allow', 'GET, POST')
         responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET or POST' } })
+        return
+      }
+      if (route === ADMIN_PLUGIN_BRIDGE_ROUTE) {
+        // No registry, no route: a composition that never built the plugin
+        // bridge answers like any unknown admin path.
+        if (options.pluginBridge === undefined) {
+          responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown admin route' } })
+          return
+        }
+        if (method !== 'GET') {
+          res.setHeader('Allow', 'GET')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
+          return
+        }
+        // Wall 2, the pair/action rule: this listing feeds a MANAGEMENT
+        // surface (the consent toggles below it), so a request that arrived
+        // through the gateway is refused — consent is granted on the server
+        // machine, by its owner, period.
+        if (req.headers['x-zen-remote-via'] !== undefined) {
+          responseJson(res, 403, {
+            ok: false,
+            error: { code: 'via-gateway', message: '插件桥设置只能在服务端本机操作' },
+          })
+          return
+        }
+        // The consent source is a live row read; a broken one reads as the
+        // empty map (nothing consented) instead of failing the listing.
+        let consent: Record<string, boolean> = {}
+        try {
+          consent = options.pluginBridge.getConsent()
+        } catch {
+          consent = {}
+        }
+        // registry.list() arrives plugin-sorted; the map keeps that order.
+        const plugins = options.pluginBridge.registry.list().map((declaration) => ({
+          plugin: declaration.plugin,
+          version: declaration.version,
+          hasServerScope: declaration.routes.some((route) => route.scope === 'server'),
+          consent: consent[declaration.plugin] === true,
+        }))
+        responseJson(res, 200, { ok: true, value: { plugins } })
         return
       }
       if (route === ADMIN_PAIR_ROUTE || route === ADMIN_ACTION_ROUTE || route === ADMIN_PUSH_TEST_ROUTE) {
