@@ -31,6 +31,7 @@ const { installFetchRouteIntercept, FILE_UPLOAD_PATH, SESSION_EXPORT_PATH } = re
 const { toVirtual } = require('../lib/virtual-id.js')
 const { normalizeDeclaration, createBridgeRegistry, compareBridges } = require('../lib/plugin-bridge.js')
 const { createPluginLoopback } = require('../lib/plugin-loopback.js')
+const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
 // T31-fix: every port is system-assigned so parallel test-run copies cannot
@@ -1785,5 +1786,170 @@ test('e2e PB-2: a throwing plugins table still handshakes, a stripped field read
     assert.equal(offline[0].serverVersion, undefined, 'an offline verdict carries no server facts')
   } finally {
     await env.stop()
+  }
+})
+
+// ---- PB-4: the sub-client route interception, full chain ----------------------
+
+test('e2e PB-4: the browser hits the local webServer, the wrap forwards over the relay, the server loopbacks its plugin — streamed back end to end', async () => {
+  // The SERVER's fake DSH: token exchange at `/`, the plugin routes behind
+  // the cookie, one NDJSON stream, one holdable response.
+  const dshState = { hits: 0, aborted: false }
+  let hold
+  const fakeDsh = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://dsh.internal')
+    if (url.pathname === '/') {
+      res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+      res.end()
+      return
+    }
+    dshState.hits += 1
+    if (String(req.headers.cookie ?? '') !== 'dsh-auth=e2e') {
+      res.writeHead(401, { 'content-type': 'text/plain' })
+      res.end('unauthorized')
+      return
+    }
+    if (url.pathname === '/panel/hold') {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.write('held')
+      hold = { release: () => res.end() }
+      req.on('close', () => { dshState.aborted = true })
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+    res.write('dsh-frame-1\n')
+    setTimeout(() => res.write('dsh-frame-2\n'), 8)
+    setTimeout(() => { res.write('dsh-frame-3\n'); res.end() }, 16)
+  })
+  await new Promise((resolve) => fakeDsh.listen(0, '127.0.0.1', resolve))
+  const dshPort = fakeDsh.address().port
+  const dshStop = () => new Promise((done) => { fakeDsh.closeAllConnections(); fakeDsh.close(done) })
+
+  const DECLARED_INPUT = {
+    plugin: 'e2e-panel',
+    version: '1.0.0',
+    routes: [
+      { path: '/panel/stream', scope: 'session', stream: true },
+      { path: '/panel/hold', scope: 'session' },
+      { path: '/panel/all', scope: 'server' },
+    ],
+  }
+  const declared = normalizeDeclaration(DECLARED_INPUT)
+  const serverRegistry = createBridgeRegistry()
+  serverRegistry.register(DECLARED_INPUT)
+  const consentBox = { map: { 'e2e-panel': true } }
+
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => {
+      const table = {}
+      for (const d of serverRegistry.list()) {
+        table[d.plugin] = { version: d.version, digest: d.digest, serverScopeConsent: consentBox.map[d.plugin] === true }
+      }
+      return table
+    },
+    pluginBridge: {
+      registry: serverRegistry,
+      getConsent: () => consentBox.map,
+      loopback: createPluginLoopback({
+        getTarget: () => ({ protocol: 'http:', port: dshPort }),
+        getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+      }),
+    },
+  })
+
+  // The SUB-CLIENT side: a host-shaped fake webServer (raw undecoded
+  // pathname → this.match → handler), the SAME declaration registered
+  // locally, the REAL relay client wired into the interception.
+  const hostRaw = {
+    exact: new Map(),
+    prefixes: new Map(),
+    match(pathname) {
+      const exact = this.exact.get(pathname)
+      if (exact !== undefined) return exact
+      let best
+      for (const [prefix, route] of this.prefixes) {
+        if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue
+        if (best === undefined || prefix.length > best.path.length) best = route
+      }
+      return best
+    },
+    register(route) {
+      this.exact.set(route.path, route)
+      return () => this.exact.delete(route.path)
+    },
+  }
+  const subServer = http.createServer((req, res) => {
+    const rawPath = new URL(req.url ?? '/', 'http://x').pathname
+    Promise.resolve(hostRaw.match(rawPath)).then(async (route) => {
+      if (route !== undefined) {
+        await route.handler(req, res)
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    }).catch(() => { try { res.destroy() } catch { /* gone */ } })
+  })
+  await new Promise((resolve) => subServer.listen(0, '127.0.0.1', resolve))
+  const subPort = subServer.address().port
+  const subStop = () => new Promise((done) => { subServer.closeAllConnections(); subServer.close(done) })
+
+  const localRegistry = createBridgeRegistry()
+  localRegistry.register(DECLARED_INPUT)
+  const bridgeStatusOf = () =>
+    compareBridges(localRegistry.list(), env.client.handshakeInfo?.plugins, env.client.state === 'online')
+  const handle = installPluginRouteIntercept({
+    webServer: hostRaw,
+    registry: localRegistry,
+    relay: env.client,
+    getServerId: () => env.client.handshakeInfo?.serverId,
+    getStatus: bridgeStatusOf,
+    log: () => {},
+  })
+
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const virtual = toVirtual(info.serverId, 'session-a')
+    const base = `http://127.0.0.1:${subPort}`
+
+    // 1. The streamed answer crosses every hop in order: browser → local
+    //    match wrap → relay client → gateway child → relay route →
+    //    loopback → fake DSH.
+    const stream = await fetch(`${base}/panel/stream?sessionId=${encodeURIComponent(virtual)}`)
+    assert.equal(stream.status, 200, `the bridged stream: ${await stream.clone().text().catch(() => '')}`.slice(0, 300))
+    assert.equal(stream.headers.get('content-type'), 'application/x-ndjson')
+    assert.equal(await stream.text(), 'dsh-frame-1\ndsh-frame-2\ndsh-frame-3\n', 'three hops, three frames, one order')
+    assert.equal(dshState.hits, 2, 'one 401 + one cookie-authenticated hit on the fake DSH')
+
+    // 2. The consent wall: server scope refused while the server owner has
+    //    NOT consented — flipped here WITHOUT touching either process, both
+    //    ends read it live.
+    consentBox.map = {}
+    const unconsented = await fetch(`${base}/panel/all?sessionId=${encodeURIComponent(virtual)}`)
+    assert.equal(unconsented.status, 503)
+    assert.equal(unconsented.headers.get('x-zen-remote'), 'unbridged')
+    assert.deepEqual(await unconsented.json(), {
+      ok: false, error: { code: 'zr-plugin-unbridged', reason: 'consent-off', plugin: 'e2e-panel' },
+    })
+
+    // 3. The mid-stream hang-up: the browser aborts a held response; the
+    //    abort crosses every hop and the fake DSH sees its connection close.
+    consentBox.map = { 'e2e-panel': true }
+    const controller = new AbortController()
+    const pending = fetch(`${base}/panel/hold?sessionId=${encodeURIComponent(virtual)}`, { signal: controller.signal })
+    const held = await pending
+    assert.equal(held.status, 200)
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    controller.abort()
+    await held.text().catch(() => 'aborted')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(dshState.aborted, true, 'the abort crossed the whole chain into the fake DSH')
+  } finally {
+    handle.uninstall()
+    if (hold !== undefined) hold.release()
+    await env.stop()
+    await subStop()
+    await dshStop()
   }
 })

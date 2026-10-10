@@ -59,6 +59,8 @@ import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { checkFetchRouteShape, installFetchRouteIntercept } from './fetch-route-intercept.js'
 import type { FetchRouteInterceptDiagnostics, FetchRouteInterceptHandle, FetchRouteShapeCheck } from './fetch-route-intercept.js'
+import { checkWebServerShape, installPluginRouteIntercept } from './plugin-route-intercept.js'
+import type { PluginRouteInterceptDiagnostics, PluginRouteInterceptHandle, WebServerShapeCheck } from './plugin-route-intercept.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
@@ -1043,6 +1045,62 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         if (fetchRouteHandle === handle) fetchRouteHandle = undefined
       }, 'dsh-zen-remote: fetch-route intercept')
     })
+    // The plugin bridge's route interception (PB-4): the local webServer's
+    // `match` wrap forwarding bridged-plugin requests for REMOTE sessions
+    // through the relay. Injected on `webServer` alone — the only service
+    // it reads — and the raw instance comes off the reflection layer's
+    // symbols lookup, the same face the typert and fetch-route wraps use.
+    // The diagnostics flow to the client status route like theirs, refused
+    // installs included.
+    let pluginRouteHandle: PluginRouteInterceptHandle | undefined
+    let pluginRouteRefused: WebServerShapeCheck | undefined
+    const pluginRouteDiagnostics = (): PluginRouteInterceptDiagnostics | undefined => {
+      if (pluginRouteHandle !== undefined) return pluginRouteHandle.diagnostics()
+      if (pluginRouteRefused !== undefined) {
+        return {
+          installed: false,
+          shape: pluginRouteRefused,
+          forwarded: 0,
+          refused: 0,
+          refusalsByReason: {},
+          recentFailures: [],
+        }
+      }
+      return undefined
+    }
+    ctx.inject(['webServer'], (wsCtx) => {
+      const logWarn = (...args: Parameters<Context['logger']['warn']>): void => { ctx.logger?.warn(...args) }
+      const proxy = (wsCtx as Context & { webServer?: unknown }).webServer
+      const raw = proxy !== null && typeof proxy === 'object'
+        ? (proxy as unknown as Record<PropertyKey, unknown>)[symbols.original]
+        : undefined
+      if (raw === null || typeof raw !== 'object') {
+        pluginRouteRefused = { ok: false, reasons: ['original: webServer[symbols.original] is not an object'] }
+        logWarn('dsh-zen-remote plugin-route intercept not installed: %s', pluginRouteRefused.reasons[0])
+        return
+      }
+      // Shape first, like every wrap: a failed check leaves the webServer
+      // exactly as it was — local routing untouched, remote bridging off.
+      const shape = checkWebServerShape(raw)
+      if (!shape.ok) {
+        pluginRouteRefused = shape
+        logWarn('dsh-zen-remote plugin-route intercept not installed: %s', shape.reasons.join('; '))
+        return
+      }
+      const handle = installPluginRouteIntercept({
+        webServer: raw,
+        registry,
+        relay: relayClient,
+        getServerId: () => relayClient.handshakeInfo?.serverId,
+        getStatus: pluginBridgeStatus,
+        log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
+      })
+      pluginRouteHandle = handle
+      wsCtx.effect(() => () => {
+        handle.uninstall()
+        if (pluginRouteHandle === handle) pluginRouteHandle = undefined
+      }, 'dsh-zen-remote: plugin route intercept')
+    })
     ctx.inject(['webServer', 'connection'], (clientCtx) => {
       clientCtx.effect(() => clientCtx.webServer.register({
         kind: 'prefix',
@@ -1053,6 +1111,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           getRelayClient: () => relayClient,
           getIntercept: interceptDiagnostics,
           getFetchRouteIntercept: fetchRouteDiagnostics,
+          getPluginRouteIntercept: pluginRouteDiagnostics,
           getPluginBridgeStatus: pluginBridgeStatus,
           onCurrentSession,
         }),

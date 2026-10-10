@@ -1532,10 +1532,19 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       }
       // 6. whole-machine data (`scope:'server'`) needs the server owner's
       //    per-plugin consent, read LIVE off the row; a consent source that
-      //    throws means UNKNOWN consent, and unknown consent stays home.
-      if (route.scope === 'server' && bridge.getConsent()[pluginName] !== true) {
-        relayPluginError(res, 403, 'consent-off')
-        return
+      //    throws means UNKNOWN consent, and unknown consent stays home
+      //    (fail-closed — the map the answer reads is the empty one).
+      if (route.scope === 'server') {
+        let consent: Record<string, boolean> = {}
+        try {
+          consent = bridge.getConsent()
+        } catch {
+          consent = {}
+        }
+        if (consent[pluginName] !== true) {
+          relayPluginError(res, 403, 'consent-off')
+          return
+        }
       }
       // 7. the per-device budget — taken only after every wall above, held
       //    for the whole response stream, released in the finally.
@@ -1546,12 +1555,16 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       }
       pluginsByDevice.set(device, (pluginsByDevice.get(device) ?? 0) + 1)
       // A sub-client hang-up cancels the loopback request mid-stream, like
-      // the invoke route's wiring.
+      // the invoke route's wiring; the pump below reads the same flag (and
+      // 'error' rides along, v1/stream's discipline).
+      let clientGone = false
       const hangUp = new AbortController()
       const onClientGone = (): void => {
+        clientGone = true
         if (!res.writableEnded) hangUp.abort()
       }
       res.on('close', onClientGone)
+      res.on('error', onClientGone)
       const normalizedQuery = params.toString()
       try {
         const accept = headerValue(req, 'accept')
@@ -1573,10 +1586,20 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // The pump: chunk-for-chunk with real backpressure — a full socket
         // pauses the plugin's response instead of buffering it here, so a
         // slow phone reads a big file without this process ever holding
-        // more than a socket buffer of it.
+        // more than a socket buffer of it. Every chunk re-checks the
+        // response's liveness first (the v1/stream write discipline): a
+        // client that died mid-stream stops the pump on its next chunk
+        // instead of racing one more write into a dead socket, and a
+        // response 'error' (a write racing a destroyed socket surfaces
+        // there) reacts exactly like the hang-up.
+        let clientGoneSeen = false
         await new Promise<void>((resolve, reject) => {
           const upstream = outbound.stream
           upstream.on('data', (chunk: Buffer) => {
+            if (clientGone || res.destroyed || res.writableEnded) {
+              upstream.destroy()
+              return
+            }
             if (!res.write(chunk)) {
               upstream.pause()
               res.once('drain', () => upstream.resume())
@@ -1640,6 +1663,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         }
       } finally {
         res.off('close', onClientGone)
+        res.off('error', onClientGone)
         const remaining = (pluginsByDevice.get(device) ?? 1) - 1
         if (remaining <= 0) pluginsByDevice.delete(device)
         else pluginsByDevice.set(device, remaining)

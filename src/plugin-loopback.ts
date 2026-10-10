@@ -96,7 +96,10 @@ export interface PluginLoopback {
 }
 
 /** One raw loopback request that never follows redirects and resolves with
- * the raw IncomingMessage (the caller drains or streams it). */
+ * the raw IncomingMessage (the caller drains or streams it). The loosened
+ * certificate verification (PB-3-fix) applies ONLY to a literal `127.0.0.1`
+ * hostname — the plugin hop the wiring pins — never to the token exchange
+ * when its URL names anything else. */
 function rawRequest(
   target: { protocol: string; hostname: string; port: number },
   pathWithQuery: string,
@@ -117,8 +120,10 @@ function rawRequest(
         headers,
         // 0.2.1 serves self-signed https; the dial is the literal loopback
         // address (see the module comment), so certificate identity carries
-        // no information to verify.
-        ...(target.protocol === 'https:' ? { rejectUnauthorized: false } : {}),
+        // no information to verify — and ONLY there: any other hostname
+        // (the token URL's, should the wiring ever point it elsewhere) keeps
+        // full verification.
+        ...(target.protocol === 'https:' && target.hostname === '127.0.0.1' ? { rejectUnauthorized: false } : {}),
         signal,
       },
       resolve,
