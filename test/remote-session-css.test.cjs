@@ -83,3 +83,77 @@ test('T51: the export menu-item rule is gated on the session attribute and locke
     'every use of the utilities-slot anchor chain sits behind the session gate',
   )
 })
+
+// ---- PB-14: the T53 rules key on the bridge stamp -----------------------------
+
+/** Every T53 target the hiding applies to while better-sidebar is NOT
+ * bridged. The four display regimes follow from the selector shape alone:
+ *  - LOCAL SESSION / NO ATTRIBUTE — no `data-zr-remote-session` on <html>,
+ *    so not one rule matches (every selector is pinned to it first);
+ *  - REMOTE + UNBRIDGED — the remote attribute matches, the bridge stamp
+ *    is absent, the `:not()` passes → the rule FIRES;
+ *  - REMOTE + BRIDGED — the stamp is present, the `:not()` fails → the
+ *    rule never fires and the panels stay visible (the adapter serves the
+ *    server's data). */
+const T53_TARGETS = [
+  '[data-dsh-bottom-toggle]',
+  '[data-dsh-panel-host]',
+  '[data-dsh-native-tab-host] > *',
+  '[data-dsh-native-tab-host]::before',
+  '[data-dockkit-tab]:has([class$="_chipIcon"])',
+  '[data-floating-window]:has([data-window-body])',
+  '[data-sidebar-right-guide-entry="git"]',
+  '[data-sidebar-right-guide-entry="subagent"]',
+  '[data-sidebar-right-guide-entry="sidechat"]',
+  '[data-sidebar-right-guide-entry="files"]:not([aria-keyshortcuts])',
+  '[data-dsh-dock-fallback]',
+]
+
+test('PB-14: every T53 rule sits behind the bridge stamp and fires only while unbridged', () => {
+  for (const target of T53_TARGETS) {
+    // The gate prefix must sit immediately before the target, in order.
+    assert.ok(
+      sheet.includes(`html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) ${target}`),
+      `the ${target} rule must sit behind the bridge stamp`,
+    )
+  }
+  // The --dsh-sidebar-height zeroing is an html-level rule with the same gate.
+  assert.match(
+    sheet,
+    /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \{\s*--dsh-sidebar-height: 0px !important;/,
+  )
+  // The UNBRIDGED-ONLY shape must be the only shape: a bare
+  // `html[data-zr-remote-session="1"] <T53 target>` rule would hide the
+  // panels even when bridged. Every legacy occurrence has to carry the
+  // :not gate.
+  const sheetWithoutGated = sheet.replaceAll(
+    'html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"])',
+    'GATED',
+  )
+  for (const target of T53_TARGETS) {
+    assert.ok(
+      !sheetWithoutGated.includes(`html[data-zr-remote-session="1"] ${target} {`),
+      `a bare (ungated) ${target} rule must not survive`,
+    )
+  }
+})
+
+test('PB-14: the unbridged tab body spends the note variable as its ::before', () => {
+  // The empty tab body hides the plugin's own content…
+  assert.match(
+    sheet,
+    /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-native-tab-host\] > \* \{\s*display: none !important;/,
+  )
+  // …and spends the note copy the stamp effect writes on <html> (a CSS
+  // variable, because ::before's attr() reads only the element itself).
+  assert.match(
+    sheet,
+    /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-native-tab-host\]::before \{\s*content: var\(--zr-bridge-note\);/,
+  )
+  // Unset variable (the effect not running) must render NOTHING: the
+  // content declaration is the only source of the ::before.
+  assert.ok(
+    !/content:\s*["'].*better-sidebar[^"']*["']/.test(sheet),
+    'the note copy must live in the effect (per-locale), never inline in the sheet',
+  )
+})

@@ -285,6 +285,9 @@ export const zh = {
   'remoteStatusOfflineClick': '服务端离线，无法操作',
   'remoteStatusUnshareFail': '关闭远程失败，请稍后再试',
   'remoteStatusUnshareFailCode': '关闭远程失败（{code}），请稍后再试',
+  // --- PB-14: the unbridged better-sidebar note (a CSS variable the
+  // remote-session stylesheet spends as the empty tab's ::before copy) ---
+  'remoteBridgeUnbridgedNote': 'better-sidebar 未在远程会话桥接（服务端未装同版本或未允许），文件与改动请以会话内消息为准',
   // 远程分组标题的后缀（后台 merge-streams 拿不到界面语言，固定用中文）；
   // 这里登记英文对照，供界面侧需要复述同样状态时使用。
   'remoteGroupOffline': '（离线）',
@@ -572,6 +575,7 @@ export const en: Record<MobileNavKey, string> = {
   'remoteStatusOfflineClick': 'The server is offline — nothing to do',
   'remoteStatusUnshareFail': 'Closing the remote failed — try again later',
   'remoteStatusUnshareFailCode': 'Closing the remote failed ({code}) — try again later',
+  'remoteBridgeUnbridgedNote': 'better-sidebar is not bridged for this remote session (the server lacks the same version or has not allowed it) — treat files and changes as session messages only',
   // Remote group title suffixes (the background merger cannot know the UI
   // language and always uses the Chinese forms); the English equivalents
   // live here for UI surfaces that restate the same status.

@@ -32,17 +32,23 @@ html[data-zr-remote-session="1"] [data-open-target] {
   display: none !important;
 }
 
-/* ---------- remote session: hide dsh-better-sidebar's file surfaces (T53) ----------
-   dsh-better-sidebar 0.24.x is the second big "open the machine's files" UI.
-   Every tab it registers (files/editor, git changes, subagent/tasks, side
-   chat, the markdown/html/code file viewers) builds its requests from a
-   {sessionId, cwd} scope and POSTs them to the plugin's own /sidebar/api/*
-   routes on whichever machine answers — in a remote session that is the
-   SUB-CLIENT's machine (client.js call() ~3111, fetchUpload ~3162,
-   encodeHtmlUrl /sidebar/html/ ~3069-3414), so the tree would show same-named
-   LOCAL files as if they were the session's and an edit would WRITE locally.
-   Per the T53 decision the interfaces are hidden, not proxied: the relay
-   carries no /sidebar routes and none are added.
+/* ---------- remote session: hide dsh-better-sidebar's file surfaces (T53, two regimes since PB-14) ----------
+   dsh-better-sidebar 0.25.0 is the second big "open the machine's files" UI
+   AND, since PB-12/13, the first ADAPTER-BRIDGED one: at exactly 0.25.0 its
+   /sidebar/api routes, its two WebSockets and its side chat cross the byte
+   tunnel and read/write the SERVER's data, gated on the whole-machine-data
+   consent. The hiding below therefore applies ONLY while the plugin is NOT
+   bridged — the :not([data-zr-bridge-dsh-better-sidebar="1"]) stamp the
+   remote-status poll writes; see the PB-14 note above): bridged, the panels
+   are remote-aware and stay visible; unbridged (a different version, the
+   server without the adapter's consent), every tab it registers (files/
+   editor, git changes, subagent/tasks, side chat, the markdown/html/code
+   file viewers) builds its requests from a {sessionId, cwd} scope and POSTs
+   them to the plugin's own /sidebar/api/* routes on whichever machine
+   answers — in a remote session that is the SUB-CLIENT's machine (client.js
+   call() ~3111, fetchUpload ~3162, encodeHtmlUrl /sidebar/html/ ~3069-3414),
+   so the tree would show same-named LOCAL files as if they were the
+   session's and an edit would WRITE locally.
 
    Anchors, all the plugin's or the host's own rendered contracts (no hashed
    class names; the one suffix selector, _chipIcon, is unique among the
@@ -51,18 +57,21 @@ html[data-zr-remote-session="1"] [data-open-target] {
    @liustack/modsearch / @wxg-prc-cpg/browser-skill-dsh-plugin (modsearch /
    browser-skill) / dshmarket and every @deepseek-ai sidebar package for it):
 
-   HONEST LIMITS (T53-fix): everything here is display:none ONLY. The plugin's
+   HONEST LIMITS (T53-fix, adjusted PB-14): unbridged, the plugin's
    components stay mounted and keep silently POSTing READ-ONLY /sidebar/api
    requests to the local machine (session.cwd, changes.ops, the tree reads a
    mounted tab refreshes with) — the data never leaves that machine, and no
-   write can happen because every write control is inside the hidden surfaces.
-   Known boundary: a dsh-resource://file/** address opened through
-   sidebarRight.openResource in a remote session (file links in chat,
-   deliverables, @-references, skills) is CLAIMED by the plugin's editor
-   registration (client.js ~21377: patterns ["dsh-resource://file/**"]) before
-   the host preview sees it — the right sidebar expands, the rules below hide
-   the tab's body and chip, and an EMPTY panel remains. Root fix needs
-   zen-remote's own remote file tree; separate discussion.
+   write can happen because every write control is inside the hidden
+   surfaces (the tab body hides its CHILDREN and spends the note copy as a
+   ::before, so an already-open tab reads WHY it is empty instead of
+   sitting blank). Known boundary: a dsh-resource://file/** address opened
+   through sidebarRight.openResource in a remote session (file links in
+   chat, deliverables, @-references, skills) is CLAIMED by the plugin's
+   editor registration (client.js ~21377: patterns ["dsh-resource://file/**"])
+   before the host preview sees it — the right sidebar expands, the rules
+   below hide the tab's body content and chip, and the note fills the panel.
+   Bridged (0.25.0 + consent), none of this applies: the tab reads the
+   server's data through the adapter and stays visible whole.
 
    - [data-dsh-bottom-toggle] — the header-utilities button that expands the
      bottom workbench (client.js BottomDockToggle ~20863; slot registration
@@ -135,31 +144,61 @@ html[data-zr-remote-session="1"] [data-open-target] {
      attribute and this rule hides it too (cosmetic; the page stays reachable
      through its shortcut command path and the plugin's takeover is the
      "files" implementation on every deployment this plugin pairs with
-     better-sidebar anyway). */
-html[data-zr-remote-session="1"] [data-dsh-bottom-toggle] {
+     better-sidebar anyway).
+
+   /* PB-14: every T53 rule below carries
+   :not([data-zr-bridge-dsh-better-sidebar="1"]) — when the adapter
+   (PB-12) bridges the plugin, the panels read the SERVER's data through
+   the byte tunnel and MUST stay visible; the hiding applies only to the
+   unbridged combination, and the empty tab body then carries a note
+   instead of blankness. The stamp is written by
+   effects/remote-session.ts off the remote-status poll's bridgedPlugins
+   list (client-data/remote-status.ts shouldStampBridgeAttribute). */
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-dsh-bottom-toggle] {
   display: none !important;
 }
-html[data-zr-remote-session="1"] [data-dsh-panel-host] {
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-dsh-panel-host] {
   display: none !important;
 }
-html[data-zr-remote-session="1"] {
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) {
   --dsh-sidebar-height: 0px !important;
 }
-html[data-zr-remote-session="1"] [data-dsh-native-tab-host] {
+/* The unbridged tab body: hide the plugin's own content and spend the
+   note copy as a ::before — an already-open tab reads WHY it is empty
+   (0.25.0 keeps tabs mounted, so a stale body would otherwise sit blank).
+   --zr-bridge-note is set on <html> by the stamp effect, in the
+   browser's language; unset (effect not running yet) the content falls
+   through and nothing renders. */
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-dsh-native-tab-host] > * {
   display: none !important;
 }
-html[data-zr-remote-session="1"] [data-dockkit-tab]:has([class$="_chipIcon"]) {
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-dsh-native-tab-host]::before {
+  content: var(--zr-bridge-note);
+  display: block;
+  padding: 24px 16px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--dsh-fg-muted, #6b7280);
+  word-break: break-word;
+}
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-dockkit-tab]:has([class$="_chipIcon"]) {
   display: none !important;
 }
-html[data-zr-remote-session="1"] [data-floating-window]:has([data-window-body]) {
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-floating-window]:has([data-window-body]) {
   display: none !important;
 }
-html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="git"],
-html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="subagent"],
-html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="sidechat"] {
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-sidebar-right-guide-entry="git"],
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-sidebar-right-guide-entry="subagent"],
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-sidebar-right-guide-entry="sidechat"] {
   display: none !important;
 }
-html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="files"]:not([aria-keyshortcuts]) {
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-sidebar-right-guide-entry="files"]:not([aria-keyshortcuts]) {
+  display: none !important;
+}
+/* 0.25.0's dock fallback — the floating quick-open button the plugin pins
+   for empty workspaces. Same treatment as every other open-the-machine's-
+   files control: hidden while unbridged, untouched when bridged. */
+html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [data-dsh-dock-fallback] {
   display: none !important;
 }
 

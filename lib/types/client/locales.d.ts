@@ -271,6 +271,7 @@ export declare const zh: {
     readonly remoteStatusOfflineClick: "服务端离线，无法操作";
     readonly remoteStatusUnshareFail: "关闭远程失败，请稍后再试";
     readonly remoteStatusUnshareFailCode: "关闭远程失败（{code}），请稍后再试";
+    readonly remoteBridgeUnbridgedNote: "better-sidebar 未在远程会话桥接（服务端未装同版本或未允许），文件与改动请以会话内消息为准";
     readonly remoteGroupOffline: "（离线）";
     readonly remoteGroupRevoked: "（令牌已吊销）";
     readonly remoteGroupUnpaired: "（已解除配对）";
