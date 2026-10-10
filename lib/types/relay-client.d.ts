@@ -99,7 +99,11 @@ export declare class RelayError extends Error {
     code: string;
     status?: number;
     reason?: string;
-    constructor(code: string, message?: string, httpStatus?: number, reason?: string);
+    /** The host error's sanitized `details` (invoke path): the UI maps
+     *  `details.reason` codes like `MODEL_DOES_NOT_SUPPORT_IMAGES` onto a
+     *  user-facing line — absent details stay undefined. */
+    details?: Record<string, unknown>;
+    constructor(code: string, message?: string, httpStatus?: number, reason?: string, details?: Record<string, unknown>);
 }
 export interface CreateRelayClientOptions {
     /** The normalized server address (no trailing slash), read live per

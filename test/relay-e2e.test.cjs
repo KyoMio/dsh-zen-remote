@@ -1507,3 +1507,46 @@ test('e2e T51: an upload through the wrapped local route crosses the whole chain
     await env.stop()
   }
 })
+
+// ---- details passthrough (2026-10-10) ----------------------------------------
+
+// The host rejects an image-bearing prompt with `session/attachment-invalid`
+// whose details.reason is what the client UI maps onto a user-facing line
+// ("The current model does not support images…"). Every hop must carry it:
+// server errorOf → wire envelope → client RelayError → the interceptor's
+// UI envelope. Dropped anywhere, the UI prints `undefined` (real report).
+test('e2e: a host error details.reason crosses the whole chain into the UI envelope', async () => {
+  const env = await boot({
+    shared: ['session-a'],
+    invoke: (call) => {
+      throw Object.assign(new Error('当前模型不支持图片'), {
+        code: 'session/attachment-invalid',
+        details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES', count: 1, nested: { x: 1 }, ok: true },
+      })
+    },
+  })
+  try {
+    const info = await env.client.connect()
+    const gateway = new BareGateway()
+    const handle = installIntercept({ raw: gateway, relay: env.client, getServerId: () => info.serverId, log: () => {} })
+    const envelope = await gateway.rpcBridge('session/prompt', {
+      args: { request: { sessionId: toVirtual(info.serverId, 'session-a'), content: [{ type: 'image', mediaType: 'image/png', data: 'AAAA' }] } },
+    }, undefined, gateway.operatorPeer())
+    assert.equal(envelope.ok, false)
+    assert.equal(envelope.error.code, 'session/attachment-invalid')
+    assert.equal(envelope.error.message, '当前模型不支持图片')
+    // Scalars ride, nested objects are stripped by the server sanitizer.
+    assert.deepEqual(envelope.error.details, { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES', count: 1, ok: true })
+    handle.uninstall()
+  } finally { await env.stop() }
+})
+
+/** The minimal interception surface installIntercept needs (see
+ *  intercept.test.cjs's FakeTypertGateway for the full mirror). */
+class BareGateway {
+  constructor() {
+    this.rpcBridge = (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer)
+  }
+  operatorPeer() { return { id: 'operator-peer' } }
+  dispatchRpc(endpoint) { return Promise.resolve({ ok: true, value: { endpoint } }) }
+}

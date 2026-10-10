@@ -611,6 +611,16 @@ function drainUpload(req: IncomingMessage, fromBytes: number, deadlineMs: number
   })
 }
 
+
+/** The 200 error envelope for a failed gateway call, `details` included when
+ *  the host error carried a sanitized one (see errorOf). */
+function errorEnvelopeOf(error: unknown): { ok: false; error: Record<string, unknown> } {
+  const { code, message, details } = errorOf(error)
+  const inner: Record<string, unknown> = message === undefined ? { code } : { code, message }
+  if (details !== undefined) inner.details = details
+  return { ok: false, error: inner }
+}
+
 /**
  * What may travel to the client about a failed gateway call. DSH's own errors
  * always carry a `namespace/name`-shaped string `code` — those pass through
@@ -618,7 +628,7 @@ function drainUpload(req: IncomingMessage, fromBytes: number, deadlineMs: number
  * error whose `code` (`ENOENT`, …) and message (`… '/Users/x/…'`) quote the
  * server's filesystem — reports `internal` and NO message at all (T22a-fix).
  */
-function errorOf(error: unknown): { code: string; message?: string } {
+function errorOf(error: unknown): { code: string; message?: string; details?: Record<string, unknown> } {
   const code =
     error !== null && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string'
       ? (error as { code: string }).code
@@ -629,7 +639,23 @@ function errorOf(error: unknown): { code: string; message?: string } {
   // error would, so only the code travels.
   if (code.endsWith('/internal')) return { code }
   const text = error instanceof Error ? error.message : String(error)
-  return { code, message: text.slice(0, MAX_MESSAGE_CHARS) }
+  // The structured `details` beside code/message (2026-10-10): the host
+  // rejects an image-bearing prompt with `session/attachment-invalid` whose
+  // `details.reason` (`MODEL_DOES_NOT_SUPPORT_IMAGES`, …) is what the client
+  // UI maps onto a user-facing line — dropped here, the UI prints
+  // `undefined`. Scalars and clipped strings only, bounded key count;
+  // nested objects/arrays stay out so server internals cannot ride this.
+  const raw = (error as { details?: unknown }).details
+  const details: Record<string, unknown> = {}
+  if (isPlainObject(raw)) {
+    for (const [key, value] of Object.entries(raw).slice(0, 16)) {
+      if (typeof value === 'string') details[key] = value.slice(0, MAX_MESSAGE_CHARS)
+      else if (typeof value === 'number' || typeof value === 'boolean' || value === null) details[key] = value
+    }
+  }
+  const out: { code: string; message?: string; details?: Record<string, unknown> } = { code, message: text.slice(0, MAX_MESSAGE_CHARS) }
+  if (Object.keys(details).length > 0) out.details = details
+  return out
 }
 
 /**
@@ -1117,8 +1143,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         )) as unknown
         responseJson(res, 200, isPlainObject(envelope) ? envelope : { ok: false, error: { code: 'internal' } })
       } catch (error) {
-        const { code, message } = errorOf(error)
-        responseJson(res, 200, message === undefined ? { ok: false, error: { code } } : { ok: false, error: { code, message } })
+        responseJson(res, 200, errorEnvelopeOf(error))
       } finally {
         res.off('close', onClientGone)
       }
@@ -1266,8 +1291,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // The gateway's own failures (unknown namespace, absent service) are
         // business answers, not transport errors: they ride a 200 envelope
         // like every other result, with the gateway's string code preserved.
-        const { code, message } = errorOf(error)
-        responseJson(res, 200, message === undefined ? { ok: false, error: { code } } : { ok: false, error: { code, message } })
+        responseJson(res, 200, errorEnvelopeOf(error))
       } finally {
         res.off('close', onClientGone)
         // The invoke is over — answered, refused mid-flight, or its client
@@ -1927,8 +1951,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             // DOCUMENTED normal end, swallowed whole.
             closeWith(null)
           } else {
-            const { code, message } = errorOf(error)
-            closeWith(message === undefined ? { type: 'error', error: { code } } : { type: 'error', error: { code, message } })
+            closeWith({ type: 'error', error: errorEnvelopeOf(error).error })
           }
         } finally {
           openStreamKills.delete(killThisStream)
