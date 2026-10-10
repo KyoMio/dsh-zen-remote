@@ -2660,3 +2660,224 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
     await dshStop()
   }
 })
+
+// ---- PB-13: the better-sidebar WebSockets cross the byte tunnel ---------------
+
+test('e2e PB-13: fs-watch speaks through the tunnel both ways and agent-opens pushes server-initiated frames; sidechat forwards end to end', async () => {
+  // The fake DSH: both WS endpoints (handshake, per-message behaviour) plus
+  // the cookie-exchange and one sidechat method.
+  const dshState = { fsWatchOpened: 0, watched: [], pushed: false, agentOpensOpened: 0, agentOpensSeenClose: false, sidechatStarts: [] }
+  // ONE request listener (a createServer callback would answer every
+  // request TWICE alongside the on('request') handler below).
+  const fakeDsh = http.createServer()
+  const fsWatchSockets = new Set()
+  const agentOpensSockets = new Set()
+  fakeDsh.on('upgrade', (req, socket) => {
+    agentOpensSockets.add(socket)
+    socket.on('close', () => agentOpensSockets.delete(socket))
+    const url = new URL(req.url ?? '/', 'http://dsh.internal')
+    const key = req.headers['sec-websocket-key']
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`)
+    if (url.pathname === '/sidebar/ws/fs-watch') {
+      dshState.fsWatchOpened += 1
+      if (url.searchParams.get('sessionId') !== 'session-a') {
+        socket.end()
+        return
+      }
+      fsWatchSockets.add(socket)
+      socket.on('data', (chunk) => {
+        const frame = wsDecodeClientFrame(chunk)
+        if (frame === null || frame.opcode !== 0x1) return
+        const message = JSON.parse(frame.text)
+        if (message.op === 'watch') {
+          dshState.watched.push(message.path)
+          if (socket.writable) socket.write(wsEncodeText(JSON.stringify({ dir: `/srv/proj/${message.path}` })))
+        }
+      })
+      socket.on('close', () => fsWatchSockets.delete(socket))
+      return
+    }
+    if (url.pathname === '/sidebar/ws/agent-opens') {
+      dshState.agentOpensOpened += 1
+      if (url.searchParams.get('sessionId') !== 'session-a') {
+        socket.end()
+        return
+      }
+      socket.on('close', () => { dshState.agentOpensSeenClose = true })
+      // The SERVER-initiated push (the whole point of agent-opens).
+      dshState.pushed = true
+      socket.write(wsEncodeText(JSON.stringify({ id: 'req-1', sessionId: 'session-a', kind: 'file', target: '/srv/proj/README.md', title: 'README' })))
+      return
+    }
+    socket.destroy()
+  })
+  fakeDsh.on('request', (req, res) => {
+    if (new URL(req.url ?? '/', 'http://x').pathname === '/sidebar/api/sidechat.start') {
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        dshState.sidechatStarts.push(body)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ childId: 'session-child-9' }))
+      })
+      return
+    }
+    res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+    res.end()
+  })
+  await new Promise((resolve) => fakeDsh.listen(0, '127.0.0.1', resolve))
+  const dshPort = fakeDsh.address().port
+  const dshStop = () => new Promise((done) => {
+    // Upgraded sockets escape closeAllConnections (the PB-10 finding).
+    for (const socket of [...fsWatchSockets, ...agentOpensSockets]) socket.destroy()
+    fakeDsh.closeAllConnections()
+    fakeDsh.close(done)
+  })
+
+  const ADAPTER_INPUT = {
+    plugin: 'dsh-better-sidebar', versions: ['0.25.0'],
+    client: { response: (ctx) => (ctx.pathname === '/sidebar/api/sidechat.start' && ctx.body !== null && typeof ctx.body === 'object' && typeof ctx.body.childId === 'string' && !ctx.isVirtual(ctx.body.childId) ? { ...ctx.body, childId: ctx.virtualize(ctx.body.childId) } : ctx.body) },
+    routes: [
+      { path: '/sidebar/api', match: 'prefix', methods: ['POST'], maxBody: 1024 * 1024, locator: { in: 'json-body', fields: ['sessionId', 'rootSessionId', 'childId'] } },
+      { path: '/sidebar/ws/agent-opens', match: 'exact', methods: ['GET'], upgrade: true, locator: { in: 'query', name: 'sessionId' } },
+      { path: '/sidebar/ws/fs-watch', match: 'exact', methods: ['GET'], upgrade: true, locator: { in: 'query', name: 'sessionId' } },
+    ],
+  }
+  const adapter = normalizeAdapter(ADAPTER_INPUT, '0.25.0')
+  // The tunnel's server half, wired over the SAME pieces before boot (the
+  // PB-10 shape — the WebSocket routes answer 501 unsupported without it).
+  const pluginTunnelMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-tunnel.js')).href)
+  const pluginLoopbackObj = createPluginLoopback({
+    getTarget: () => ({ protocol: 'http:', port: dshPort }),
+    getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+  })
+  const pluginTunnel = pluginTunnelMod.createPluginTunnel({
+    bridge: { registry: (() => { const r = createBridgeRegistry(); r.registerNormalized(adapter.declaration); return r })(), getConsent: () => ({ 'dsh-better-sidebar': true }), loopback: pluginLoopbackObj },
+    getTarget: () => ({ protocol: 'http:', port: dshPort }),
+    isAccessible: (sessionId) => sessionId === 'session-a',
+    heartbeatMs: 15_000,
+  })
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => ({ 'dsh-better-sidebar': { version: '0.25.0', digest: adapter.digest, serverScopeConsent: true } }),
+    pluginBridge: {
+      registry: (() => { const r = createBridgeRegistry(); r.registerNormalized(adapter.declaration); return r })(),
+      getConsent: () => ({ 'dsh-better-sidebar': true }),
+      loopback: pluginLoopbackObj,
+      adapters: [adapter],
+      tunnel: pluginTunnel,
+    },
+  })
+
+  const hostRaw = {
+    exact: new Map(), prefixes: new Map(), upgrades: new Map(),
+    match(pathname) { return this.exact.get(pathname) },
+    register(route) { this.exact.set(route.path, route); return () => undefined },
+  }
+  const subServer = http.createServer((req, res) => {
+    // The HTTP half (sidechat.start) dispatches through the SAME wrapped
+    // match; the WS half rides the upgrade listener below.
+    Promise.resolve(hostRaw.match(new URL(req.url ?? '/', 'http://x').pathname)).then(async (route) => {
+      if (route !== undefined) {
+        await route.handler(req, res)
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    }).catch(() => { try { res.destroy() } catch { /* gone */ } })
+  })
+  subServer.on('upgrade', (req, socket, head) => {
+    const route = hostRaw.upgrades.get(new URL(req.url ?? '/', 'http://x').pathname)
+    if (route !== undefined) {
+      route.handler(req, socket, head)
+      return
+    }
+    socket.destroy()
+  })
+  await new Promise((resolve) => subServer.listen(0, '127.0.0.1', resolve))
+  const subPort = subServer.address().port
+  // Node stops tracking an UPGRADED socket (closeAllConnections never sees
+  // it — the PB-10 finding), so the teardown destroys every connection this
+  // server accepted by hand before closing.
+  const subSockets = new Set()
+  subServer.on('connection', (socket) => {
+    subSockets.add(socket)
+    socket.on('close', () => subSockets.delete(socket))
+  })
+  const subStop = () => new Promise((done) => {
+    for (const socket of subSockets) socket.destroy()
+    subServer.closeAllConnections()
+    subServer.close(done)
+  })
+
+  const localRegistry = createBridgeRegistry()
+  localRegistry.registerNormalized(adapter.declaration)
+  const handle = installPluginRouteIntercept({
+    webServer: hostRaw,
+    registry: localRegistry,
+    relay: env.client,
+    getServerId: () => env.client.handshakeInfo?.serverId,
+    getStatus: () => compareBridges(localRegistry.list(), env.client.handshakeInfo?.plugins, env.client.state === 'online'),
+    adapters: [adapter],
+    log: () => {},
+  })
+
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const virtual = toVirtual(info.serverId, 'session-a')
+
+    // ---- fs-watch: handshake opens through the tunnel, the browser's
+    // watch frame crosses, the server's {dir} push comes back.
+    const fsWatch = new WebSocket(`ws://127.0.0.1:${subPort}/sidebar/ws/fs-watch?sessionId=${encodeURIComponent(virtual)}`)
+    const fsOpened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), 5000)
+      fsWatch.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      fsWatch.addEventListener('error', (event) => { clearTimeout(timer); resolve(`error: ${event.message ?? event.error ?? 'unknown'}`) })
+      fsWatch.addEventListener('close', (event) => { clearTimeout(timer); resolve(`close code=${event.code} reason=${event.reason}`) })
+    })
+    assert.equal(fsOpened, true, 'the fs-watch handshake opened through the tunnel')
+    const fsMessages = []
+    fsWatch.addEventListener('message', (event) => { fsMessages.push(String(event.data)) })
+    fsWatch.send(JSON.stringify({ op: 'watch', path: 'src' }))
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(dshState.fsWatchOpened, 1, 'the fake DSH accepted the upgrade')
+    assert.deepEqual(dshState.watched, ['src'], 'the watch op crossed to the server')
+    assert.ok(fsMessages.some((text) => JSON.parse(text).dir === '/srv/proj/src'), `the server push arrived: ${JSON.stringify(fsMessages)}`)
+    fsWatch.close()
+    await new Promise((resolve) => setTimeout(resolve, 300))
+
+    // ---- agent-opens: the SERVER-initiated push arrives at the browser.
+    const agentOpens = new WebSocket(`ws://127.0.0.1:${subPort}/sidebar/ws/agent-opens?sessionId=${encodeURIComponent(virtual)}`)
+    const agentOpened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5000)
+      agentOpens.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      agentOpens.addEventListener('error', () => { clearTimeout(timer); resolve(false) })
+    })
+    assert.equal(agentOpened, true, 'the agent-opens handshake opened through the tunnel')
+    const agentMessages = []
+    agentOpens.addEventListener('message', (event) => { agentMessages.push(String(event.data)) })
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    assert.equal(dshState.pushed, true)
+    assert.equal(agentMessages.length, 1, 'the server push crossed the tunnel')
+    const pushed = JSON.parse(agentMessages[0])
+    assert.equal(pushed.kind, 'file')
+    assert.equal(pushed.sessionId, 'session-a', 'the push bytes travel VERBATIM (the browser never reads this field)')
+
+    // ---- sidechat.start forwards and the answer's childId comes back
+    // virtual — the closed loop, end to end.
+    const start = await fetch(`http://127.0.0.1:${subPort}/sidebar/api/sidechat.start`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: virtual, question: 'what changed?' }),
+    })
+    assert.equal(start.status, 200)
+    assert.deepEqual(await start.json(), { childId: toVirtual(info.serverId, 'session-child-9') }, 'the child id came back VIRTUAL')
+    assert.deepEqual(dshState.sidechatStarts, [{ sessionId: 'session-a', question: 'what changed?' }], 'the plugin saw the REAL ids')
+  } finally {
+    handle.uninstall()
+    await env.stop()
+    await subStop()
+    await dshStop()
+  }
+})

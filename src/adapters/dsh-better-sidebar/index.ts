@@ -58,15 +58,15 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
       deny: ({ pathname, currentSessionId }) => {
         const name = apiMethodOf(pathname)
         if (name === '') return undefined
-        // Side chat: refused WHOLESALE for now (remote or local — the
-        // feature is not ready to cross the bridge); PB-13 decides.
-        if (name.startsWith('sidechat.')) return 'adapter-sidechat-pending'
         // Opening apps/URLs on the HOST is a remote-panel no: refused when
         // the browser is currently looking at a REMOTE session (the
         // request body carries no session field of its own — client.js
         // 9383-9392 — so the classify step could never tell). A LOCAL
         // session's open.external never reaches here as a refusal and
         // stays on the local machine, exactly as without zen-remote.
+        // (The sidechat methods left this hook in PB-13: their child
+        // sessions inherit the parent's share through `meta.parentSession`,
+        // so they forward like everything else.)
         if (name === 'open.external' && currentSessionId !== undefined && isVirtual(currentSessionId)) {
           return 'remote-open-unsupported'
         }
@@ -89,6 +89,16 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
     { path: '/sidebar/html', match: 'prefix', methods: ['GET'], locator: { in: 'path-segment', index: 0 } },
     // Lazy chunks: client code, session-independent, LOCAL forever.
     { path: '/sidebar/bundle', match: 'prefix', methods: ['GET'], locator: { in: 'query', name: 'sessionId' }, local: true },
+    // The two WebSockets (PB-13, both `registerUpgrade` EXACT registrations
+    // in lib/index.js:7066-7091): the agent-opens push feed and the
+    // file-tree watch. Both carry the session id in the query; both ride
+    // PB-10's byte tunnel untouched — neither side parses frames, and the
+    // messages need no rewriting (agent-opens pushes carry the server-real
+    // sessionId but the browser never reads it — client.js:23618-23640
+    // uses its own connect-time id for the scope; fs-watch frames carry
+    // file paths, not session ids).
+    { path: '/sidebar/ws/agent-opens', match: 'exact', methods: ['GET'], upgrade: true, locator: { in: 'query', name: 'sessionId' } },
+    { path: '/sidebar/ws/fs-watch', match: 'exact', methods: ['GET'], upgrade: true, locator: { in: 'query', name: 'sessionId' } },
   ],
   client: {
     request: (ctx) => {
@@ -97,7 +107,6 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
       // even if a future plugin version starts carrying session fields
       // on it (which would flip it into the remote branch).
       if (name === 'open.external') return { allow: false, reason: 'remote-open-unsupported' }
-      if (name.startsWith('sidechat.')) return { allow: false, reason: 'adapter-sidechat-pending' }
       // Unknown method: refuse — never guess what a drifted version means.
       if (name !== '' && SIDEBAR_METHODS[name] === undefined) return { allow: false, reason: 'adapter-method-unknown' }
       return { allow: true }
