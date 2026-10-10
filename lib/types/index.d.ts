@@ -23,6 +23,8 @@ declare module '@deepseek-ai/cordis' {
 }
 import type { AdminAdmission } from './admin-routes.js';
 import type { RelayClient } from './relay-client.js';
+import type { BridgeRegistry } from './plugin-bridge.js';
+export type { BridgeDeclaration, ZenRemoteService } from './plugin-bridge.js';
 export { Config, resolveRole } from './config.js';
 export { sameOriginPost } from './http.js';
 /** Exact route the phone composer POSTs one file body to. */
@@ -37,6 +39,8 @@ export declare const UPLOAD_DIR = ".dsh-uploads";
 export declare const DEFAULT_MAX_UPLOAD_BYTES: number;
 /** The live client-role relay client, if one was built. */
 export declare function getRelayClient(): RelayClient | undefined;
+/** The live bridge registry, if a plugin row is currently applied. */
+export declare function getBridgeRegistry(): BridgeRegistry | undefined;
 /** Host half config. Every field below arrives through the loader as a
  * volatile live reference — a `{ get() }` wrapper over the stored value, not
  * the value itself (src/config.ts explains why every field is volatile) — so

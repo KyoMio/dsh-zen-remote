@@ -61,6 +61,13 @@ import { checkFetchRouteShape, installFetchRouteIntercept } from './fetch-route-
 import type { FetchRouteInterceptDiagnostics, FetchRouteInterceptHandle, FetchRouteShapeCheck } from './fetch-route-intercept.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway, RelayHandler } from './relay-server.js'
+import { createBridgeRegistry } from './plugin-bridge.js'
+import type { BridgeDeclaration, BridgeRegistry, ZenRemoteService } from './plugin-bridge.js'
+
+// The plugin bridge's public types (PB-1), re-exported so another plugin's
+// author can `import type { … } from 'dsh-zen-remote'` without reaching into
+// lib/types. Type-only: no runtime code, no Context augmentation.
+export type { BridgeDeclaration, ZenRemoteService } from './plugin-bridge.js'
 
 // The loader's config schema (settings form) and the role normalizer live in
 // src/config.ts next to the resolution they describe; re-exported so the
@@ -124,6 +131,22 @@ let clientRelayClient: RelayClient | undefined
 /** The live client-role relay client, if one was built. */
 export function getRelayClient(): RelayClient | undefined {
   return clientRelayClient
+}
+
+/**
+ * The plugin bridge's declaration registry (PB-1), created inside apply() on
+ * BOTH roles and kept on the module so later tasks (the handshake's plugins
+ * table, the client-side rewrite) can reach it without reaching into a
+ * context. Undefined in compositions that never ran this module's apply, and
+ * — identity-guarded below — after the row that owned a registry was
+ * unloaded or reloaded, so a reloaded row never leaves a stale table where
+ * the getter can hand it out (the T23a-fix discipline).
+ */
+let bridgeRegistry: BridgeRegistry | undefined
+
+/** The live bridge registry, if a plugin row is currently applied. */
+export function getBridgeRegistry(): BridgeRegistry | undefined {
+  return bridgeRegistry
 }
 
 /** Host half config. Every field below arrives through the loader as a
@@ -461,6 +484,37 @@ export async function handleUpload(
  */
 export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   const effective = resolveConfig(config, readFileConfig(), process.env)
+  // The plugin bridge's zenRemote service (PB-1), provided on BOTH roles
+  // before any role branch: a plugin that wants its panel data forwarded in
+  // remote sessions declares that against THIS process whichever role it
+  // runs as, and the declaration registry is the one piece of PB-1 both the
+  // server half (handshake plugins table) and the client half (route
+  // rewrite) will read. ctx.provide (cordis 4) registers the service owned
+  // by THIS row's fiber: visible to `inject(['zenRemote'])` dependents once
+  // the row is active, withdrawn when the row unloads — so a composition
+  // without zen-remote never fires those injects and a row reload swaps the
+  // service wholesale. The registry goes into the module slot BEFORE the
+  // provide so this apply's consumers never see a window without it; the
+  // effect's identity guard then clears the slot exactly when THIS row
+  // unloads (a reload installs the new registry before the old disposer
+  // runs, same shape as clientRelayClient). provide() throwing is not worth
+  // failing the row over — the bridge stays off, everything else keeps
+  // working — so it degrades to a warning like the session feeds do.
+  const registry = createBridgeRegistry({
+    warn: (text) => { ctx.logger?.warn('dsh-zen-remote plugin bridge: %s', text) },
+  })
+  bridgeRegistry = registry
+  try {
+    const service: ZenRemoteService = {
+      bridge: (declaration: BridgeDeclaration) => registry.register(declaration),
+    }
+    ctx.provide('zenRemote', service)
+  } catch (error) {
+    ctx.logger?.warn('dsh-zen-remote: cannot provide the "zenRemote" service: %s', message(error))
+  }
+  ctx.effect(() => () => {
+    if (bridgeRegistry === registry) bridgeRegistry = undefined
+  }, 'dsh-zen-remote: plugin bridge registry disposal')
   if (effective.values.role === 'host') {
     // A row that switched from client to host must not leave a stale relay
     // client where getRelayClient() can find it (T23a-fix).
