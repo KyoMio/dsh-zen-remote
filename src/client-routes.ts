@@ -31,6 +31,7 @@ import type { ClaimOutcome, ProbeState } from './client-pairing.js'
 import { unwrapVolatile } from './config.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
+import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js'
 import { responseJson, sameOriginPost } from './http.js'
 import type { BridgeStatus } from './plugin-bridge.js'
 import { RELAY_HTTP_ROUTES } from './relay-access.js'
@@ -119,6 +120,11 @@ export interface ClientHandlerOptions {
    * its refusal counters. Undefined when this composition never attempted
    * one (no connection service, or no fileUploads service to inject). */
   getFetchRouteIntercept?: () => FetchRouteInterceptDiagnostics | undefined
+  /** The plugin-route interception's diagnostics (PB-4), read live per
+   * request: the local webServer `match` wrap that forwards bridged-plugin
+   * requests for remote sessions. Undefined when this composition never
+   * attempted one (a host role, or no webServer). */
+  getPluginRouteIntercept?: () => PluginRouteInterceptDiagnostics | undefined
   /** The plugin bridge's live verdict (PB-2), computed PER CALL off the local
    * registry, the last handshake's `plugins` table and the connection state —
    * never a stored conclusion. Wired only by the CLIENT role's mount; absent
@@ -463,6 +469,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // that.
         const intercept = options.getIntercept?.()
         const fetchRouteIntercept = options.getFetchRouteIntercept?.()
+        const pluginRouteIntercept = options.getPluginRouteIntercept?.()
         const compatRelay = options.getRelayClient?.()
         const compat =
           compatRelay?.compat !== undefined || (intercept?.incompatibleCalls.length ?? 0) > 0
@@ -480,6 +487,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           let next: Record<string, unknown> = { ...body, pluginBridge: options.getPluginBridgeStatus?.() ?? [] }
           if (intercept !== undefined) next = { ...next, intercept }
           if (fetchRouteIntercept !== undefined) next = { ...next, fetchRouteIntercept }
+          if (pluginRouteIntercept !== undefined) next = { ...next, pluginRouteIntercept }
           return compat === undefined ? next : { ...next, compat }
         }
         // The ROW decides its own two shapes first, per request (both fields

@@ -61,6 +61,7 @@ const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
 const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 const HTTP_PATH = '/_dsh/zen-remote/relay/v1/http'
 const UPLOAD_PATH = '/_dsh/zen-remote/relay/v1/upload'
+const PLUGIN_PATH = '/_dsh/zen-remote/relay/v1/plugin'
 /** T59: a desktop-client device renaming ITSELF in the gateway's table. */
 const DEVICE_NAME_PATH = '/_dsh/zen-remote/relay/v1/device/name'
 
@@ -360,6 +361,34 @@ export interface RelayClient {
    * `Content-Length`, when it had one) and a timeout there never moves the
    * connection state — the invoke route's rules (T31-fix). */
   upload(options: RelayUploadOptions, signal?: AbortSignal): Promise<RelayHttpResult>
+  /** One bridged-plugin round-trip (PB-4): the coordinates travel in the
+   * x-zr-* headers (PB-3's protocol), no body. Resolves with the UNREAD
+   * fetch Response the moment the headers arrive — the caller streams the
+   * body itself — and EVERY HTTP status is carried verbatim (a refusal's
+   * `x-zen-remote-error` header is the caller's classifier, never an
+   * exception here). The header wait gets the plain request timeout; the
+   * BODY carries no deadline of our own (a stream takes as long as it
+   * takes) — the caller's signal aborts it. Transport deaths judge the
+   * link like every exchange (offline); `requireCredentials` throws the
+   * usual RelayError when nothing is configured. */
+  pluginRequest(request: RelayPluginRequest, signal?: AbortSignal): Promise<Response>
+}
+
+/** The inputs of one {@link RelayClient.pluginRequest} round-trip (PB-4) —
+ * the PB-3 wire protocol's coordinates, already validated and virtual-id-
+ * restored by the caller. */
+export interface RelayPluginRequest {
+  plugin: string
+  version: string
+  digest: string
+  /** The declared route path, verbatim (never decoded). */
+  path: string
+  /** The re-serialized query string, session id already restored to its
+   * ORIGINAL form. */
+  query: string
+  /** The one request header passed through to the plugin beside `range`. */
+  accept?: string
+  range?: string
 }
 
 /** The inputs of one {@link RelayClient.upload} round-trip. */
@@ -1378,6 +1407,66 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     }
   }
 
+  /**
+   * The bridged-plugin forward (PB-4): headers in, an UNREAD Response out.
+   * Deliberately NOT the shared exchange (it buffers the body): the fetch
+   * resolves on headers, the plain request timeout guards exactly that
+   * wait, and the body streams under the CALLER's signal alone. The
+   * caller's abort listener survives past the header arrival (registered
+   * `once` on the caller's own request-scoped signal, so it dies with that
+   * request) — a browser hang-up mid-stream must tear the relay round-trip
+   * down, and the server's own route then aborts its loopback in turn.
+   */
+  async function pluginRequest(request: RelayPluginRequest, signal?: AbortSignal): Promise<Response> {
+    const creds = requireCredentials()
+    const controller = new AbortController()
+    const onExternalAbort = (): void => {
+      controller.abort()
+    }
+    if (signal !== undefined) {
+      if (signal.aborted) controller.abort()
+      else signal.addEventListener('abort', onExternalAbort, { once: true })
+    }
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    try {
+      let response: Response
+      try {
+        response = await fetchImpl(`${creds.url}${PLUGIN_PATH}`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${creds.token}`,
+            // No accept of our own unless the caller carries one: this
+            // header FORWARDS to the plugin (PB-3's protocol), and the
+            // default below exists only so a revoked-token wall still
+            // answers JSON instead of the pairing HTML page.
+            accept: request.accept ?? 'application/json',
+            ...(request.range !== undefined ? { range: request.range } : {}),
+            'x-zr-plugin': request.plugin,
+            'x-zr-plugin-version': request.version,
+            'x-zr-plugin-digest': request.digest,
+            'x-zr-path': request.path,
+            'x-zr-query': request.query,
+          },
+          // A wrong server must not walk the pairing token through a redirect.
+          redirect: 'manual',
+          signal: controller.signal,
+        })
+      } catch (error) {
+        if (signal?.aborted) throw abortedError()
+        noteFailure('offline')
+        setState('offline')
+        throw new RelayError('offline', messageOf(error))
+      }
+      // Headers are here: every status — bridged answer or x-zen-remote-error
+      // refusal — travels to the caller verbatim, body untouched.
+      return response
+    } finally {
+      // The header wait is over (or never started): no deadline on the body.
+      clearTimeout(timer)
+    }
+  }
+
   function openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown> {
     // Eager, not generator-lazy: an unconfigured client fails at CALL time,
     // exactly like connect/invoke, instead of hiding the error inside the
@@ -1582,5 +1671,6 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     openStream,
     http,
     upload,
+    pluginRequest,
   }
 }

@@ -27,6 +27,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission } from './admin-routes.js';
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js';
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js';
+import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js';
 import type { BridgeStatus } from './plugin-bridge.js';
 import type { RelayClient } from './relay-client.js';
 /** Prefix all client routes live under (one webServer prefix registration). */
@@ -87,6 +88,11 @@ export interface ClientHandlerOptions {
      * its refusal counters. Undefined when this composition never attempted
      * one (no connection service, or no fileUploads service to inject). */
     getFetchRouteIntercept?: () => FetchRouteInterceptDiagnostics | undefined;
+    /** The plugin-route interception's diagnostics (PB-4), read live per
+     * request: the local webServer `match` wrap that forwards bridged-plugin
+     * requests for remote sessions. Undefined when this composition never
+     * attempted one (a host role, or no webServer). */
+    getPluginRouteIntercept?: () => PluginRouteInterceptDiagnostics | undefined;
     /** The plugin bridge's live verdict (PB-2), computed PER CALL off the local
      * registry, the last handshake's `plugins` table and the connection state —
      * never a stored conclusion. Wired only by the CLIENT role's mount; absent

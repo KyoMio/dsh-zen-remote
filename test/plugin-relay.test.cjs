@@ -61,7 +61,7 @@ function startFakePluginServer() {
       res.end()
       return
     }
-    state.requests.push({ url: req.url ?? '/', host: String(req.headers.host ?? ''), cookie: String(req.headers.cookie ?? ''), accept: req.headers.accept, range: req.headers.range })
+    state.requests.push({ url: req.url ?? '/', host: String(req.headers.host ?? ''), cookie: String(req.headers.cookie ?? ''), accept: req.headers.accept, range: req.headers.range, headers: req.headers })
     if (String(req.headers.cookie ?? '') !== 'dsh-auth=ok') {
       res.writeHead(401, { 'content-type': 'text/plain' })
       res.end('unauthorized')
@@ -255,6 +255,49 @@ test("PB-3: consent gates only scope:'server' routes, read LIVE per request", as
   } finally { await wiring.stop() }
 })
 
+test("PB-3-fix: a THROWN consent source reads as no consent — the server-scoped route stays home", async () => {
+  const home = path.join(ROOT, 'consent-throws')
+  fs.mkdirSync(home, { recursive: true })
+  const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+  store.share('session-shared')
+  const pluginServer = await startFakePluginServer()
+  const registry = createBridgeRegistry()
+  registry.register(DECLARATION_INPUT)
+  const handler = createRelayHandler({
+    secret: SECRET,
+    store,
+    gateway: { invoke: async () => ({}), stream: async () => (async function* () {})() },
+    serverInfo: { serverId: loadServerId(home), serverName: () => 'test-server', dshVersion: '0.0.0-test' },
+    pluginBridge: {
+      registry,
+      getConsent: () => { throw new Error('the consent source exploded') },
+      loopback: createPluginLoopback({ getTarget: pluginServer.target, getTokenUrl: pluginServer.tokenUrl }),
+    },
+  })
+  const server = http.createServer((req, res) => { handler(req, res).catch(() => { try { res.destroy() } catch { /* gone */ } }) })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  try {
+    const declared = normalizeDeclaration(DECLARATION_INPUT)
+    const res = await fetch(`http://127.0.0.1:${port}${ROUTE}`, {
+      method: 'POST',
+      headers: { ...AUTH, 'x-zr-plugin': 'test-panel', 'x-zr-plugin-version': '1.0.0', 'x-zr-plugin-digest': declared.digest, 'x-zr-path': '/panel/all', 'x-zr-query': 'sessionId=session-shared' },
+    })
+    assert.equal(res.status, 403)
+    assert.equal(res.headers.get('x-zen-remote-error'), 'consent-off', 'unknown consent is NO consent')
+    // The session-scoped route is untouched by the broken source.
+    const sessionRoute = await fetch(`http://127.0.0.1:${port}${ROUTE}`, {
+      method: 'POST',
+      headers: { ...AUTH, 'x-zr-plugin': 'test-panel', 'x-zr-plugin-version': '1.0.0', 'x-zr-plugin-digest': declared.digest, 'x-zr-path': '/panel/data', 'x-zr-query': 'sessionId=session-shared' },
+    })
+    assert.equal(sessionRoute.status, 200, 'session-scoped routes never read the consent source')
+  } finally {
+    pluginServer.releaseAll()
+    await new Promise((resolve) => { server.closeAllConnections(); server.close(resolve) })
+    await pluginServer.stop()
+  }
+})
+
 test('PB-3: the per-device budget holds 8, refuses the 9th with busy, and recovers after one finishes', async () => {
   const wiring = await makeWiring('busy')
   try {
@@ -313,12 +356,26 @@ test('PB-3: a loopback-auth failure answers 502 loopback-auth; any other loopbac
 test('PB-3: a streamed plugin answer crosses in order with its headers; a mid-stream hang-up aborts the plugin', async () => {
   const wiring = await makeWiring('streaming')
   try {
-    const res = await wiring.pluginFetch(ROUTE, { zrPath: '/panel/stream' })
+    const res = await wiring.pluginFetch(ROUTE, {
+      zrPath: '/panel/stream',
+      headers: { accept: 'application/x-ndjson', range: 'bytes=0-' },
+    })
     assert.equal(res.status, 200)
     assert.equal(res.headers.get('content-type'), 'application/x-ndjson')
     assert.equal(res.headers.get('x-zen-remote-error'), null, 'a success never carries the refusal marker')
     const text = await res.text()
     assert.deepEqual(text.split('\n').filter(Boolean), ['{"n":1}', '{"n":2}', '{"n":3}'], 'the three frames arrive in wire order')
+
+    // Header discipline at the plugin hop (PB-3-fix): exactly the two
+    // passthrough headers arrive; the relay secret, the device's Bearer
+    // token and identity, and the x-zr-* coordinates NEVER do — the plugin
+    // must not learn how the request was authenticated or forwarded.
+    const seen = wiring.pluginServer.state.requests.at(-1)
+    assert.equal(seen.headers.accept, 'application/x-ndjson', 'accept passes through')
+    assert.equal(seen.headers.range, 'bytes=0-', 'range passes through')
+    for (const forbidden of ['x-zen-remote-secret', 'authorization', 'x-zen-remote-device', 'x-zen-remote-via', 'x-zen-remote-role', 'x-zr-plugin', 'x-zr-plugin-version', 'x-zr-plugin-digest', 'x-zr-path', 'x-zr-query']) {
+      assert.equal(seen.headers[forbidden], undefined, `${forbidden} must not reach the plugin`)
+    }
 
     // The hang-up: headers arrive, the body is held, the client walks —
     // the plugin must see its connection close.
