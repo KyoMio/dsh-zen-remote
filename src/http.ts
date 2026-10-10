@@ -66,3 +66,15 @@ export function sameOriginPost(req: IncomingMessage): boolean {
     return false
   }
 }
+
+
+/**
+ * One plugin-bridge refusal (PB-3): the standard JSON envelope plus the
+ * `x-zen-remote-error` marker header — the sub-client's passthrough layer
+ * classifies a refusal off the header alone, because the success path
+ * streams opaque plugin bytes and must never have to parse a body.
+ */
+export function pluginBridgeError(res: ServerResponse, status: number, code: string): void {
+  res.setHeader('x-zen-remote-error', code)
+  responseJson(res, status, { ok: false, error: { code } })
+}

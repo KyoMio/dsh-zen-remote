@@ -44,6 +44,7 @@ function startFakeHost() {
   const raw = {
     exact: new Map(),
     prefixes: new Map(),
+    upgrades: new Map(),
     match(pathname) {
       const exact = this.exact.get(pathname)
       if (exact !== undefined) return exact
@@ -250,13 +251,32 @@ const VIRTUAL = 'zr~abcd1234~session-a'
 const SERVER_ID = 'abcd1234'
 
 test('PB-4: shape check accepts the host shape and refuses lookalikes', () => {
-  const good = { match: () => undefined, exact: new Map(), prefixes: new Map() }
+  const good = { match: () => undefined, exact: new Map(), prefixes: new Map(), upgrades: new Map() }
   assert.deepEqual(checkWebServerShape(good), { ok: true })
   for (const bad of [null, 42, {}, { match: () => undefined }, { match: () => undefined, exact: new Map() }, { match: 'x', exact: new Map(), prefixes: new Map() }]) {
     const verdict = checkWebServerShape(bad)
     assert.equal(verdict.ok, false, `shape ${JSON.stringify(bad)} must refuse`)
     assert.ok(verdict.reasons.length > 0)
   }
+})
+
+test('PB-4/10: install itself refuses a bad shape INERTLY — no TypeError, nothing touched', () => {
+  // A caller that skips checkWebServerShape (the e2e fake hosts once lacked
+  // `upgrades` and install died mid-wrap with a TypeError — the PB-10
+  // rework) gets an inert handle, never a throw.
+  const bad = { match: () => undefined, exact: new Map(), prefixes: new Map() } // no upgrades
+  const handle = installPluginRouteIntercept({
+    webServer: bad,
+    registry: createBridgeRegistry(),
+    relay: {},
+    getServerId: () => undefined,
+    getStatus: () => [],
+    log: () => {},
+  })
+  assert.equal(handle.diagnostics().installed, false, 'the inert handle reports uninstalled')
+  assert.equal(handle.diagnostics().shape.ok, false, 'the diagnostics carry the refusal')
+  handle.uninstall() // a no-op, not a throw
+  assert.equal(typeof bad.upgrades, 'undefined', 'the bad host was never touched')
 })
 
 test('PB-4: a LOCAL session id reaches the local plugin; an UNDECLARED route flows untouched', async () => {

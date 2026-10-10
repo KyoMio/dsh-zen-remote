@@ -28,6 +28,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ShareStore } from './share-store.js';
 import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js';
+import { type PluginTunnelRoutes } from './plugin-tunnel.js';
 import type { PluginLoopback } from './plugin-loopback.js';
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
@@ -171,6 +172,10 @@ export interface RelayHandlerOptions {
         getConsent: () => Record<string, boolean>;
         /** The loopback executor performing the actual plugin GET. */
         loopback: PluginLoopback;
+        /** The WebSocket byte tunnel's server half (PB-10). Absent — a wiring
+         * that predates the tunnels — and the three `plugin-tunnel` routes
+         * answer 501 `unsupported` like an unwired bridge. */
+        tunnel?: PluginTunnelRoutes;
     };
 }
 /**

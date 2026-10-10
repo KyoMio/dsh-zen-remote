@@ -15,7 +15,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { normalizeDeclaration, createBridgeRegistry, compareBridges, routeMethodsOf, routeMaxBodyOf } = require('../lib/plugin-bridge.js')
+const { normalizeDeclaration, createBridgeRegistry, compareBridges, routeMethodsOf, routeMaxBodyOf, routeUpgradesOf } = require('../lib/plugin-bridge.js')
 
 /** One legal declaration everything else is patched from. */
 const DECL = {
@@ -155,8 +155,8 @@ test('normalizeDeclaration fills the defaults and normalizes the shape', () => {
     routes: [{ path: '/panel/zebra', scope: 'session', stream: true }, { path: '/panel/alpaca', scope: 'server', sessionParam: 'sid' }],
   })
   assert.deepEqual(normalized.routes, [
-    { path: '/panel/alpaca', scope: 'server', sessionParam: 'sid', stream: false, methods: undefined, maxBody: undefined },
-    { path: '/panel/zebra', scope: 'session', sessionParam: 'sessionId', stream: true, methods: undefined, maxBody: undefined },
+    { path: '/panel/alpaca', scope: 'server', sessionParam: 'sid', stream: false, methods: undefined, maxBody: undefined, upgrade: undefined },
+    { path: '/panel/zebra', scope: 'session', sessionParam: 'sessionId', stream: true, methods: undefined, maxBody: undefined, upgrade: undefined },
   ])
   assert.match(normalized.digest, DIGEST_PATTERN)
 })
@@ -193,6 +193,63 @@ test('the digest ignores route order and changes with any field value', () => {
     assert.notEqual(normalizeDeclaration(variant).digest, base, `changing ${what} must change the digest`)
   }
   assert.notEqual(normalizeDeclaration(variants.plugin).digest, normalizeDeclaration({ ...variants.plugin, version: '9' }).digest)
+})
+
+// --- PB-10: upgrade routes ------------------------------------------------------
+
+test('PB-10: upgrade must be true, cannot coexist with stream, and is GET-only', () => {
+  // Only `true` is a legal value — this is a declaration, not a toggle.
+  assert.throws(() => normalizeDeclaration({ ...DECL, routes: [{ path: '/ws', scope: 'session', upgrade: false }] }), /upgrade/)
+  assert.throws(() => normalizeDeclaration({ ...DECL, routes: [{ path: '/ws', scope: 'session', upgrade: 'yes' }] }), /upgrade/)
+
+  // One route is one thing: stream and upgrade cannot coexist.
+  assert.throws(
+    () => normalizeDeclaration({ ...DECL, routes: [{ path: '/ws', scope: 'session', stream: true, upgrade: true }] }),
+    /cannot be combined with stream/,
+  )
+
+  // Upgrade routes are GET-only: an explicit methods list naming anything
+  // else cannot declare an upgrade.
+  assert.throws(
+    () => normalizeDeclaration({ ...DECL, routes: [{ path: '/ws', scope: 'session', upgrade: true, methods: ['POST'] }] }),
+    /GET-only/,
+  )
+  assert.throws(
+    () => normalizeDeclaration({ ...DECL, routes: [{ path: '/ws', scope: 'session', upgrade: true, methods: ['GET', 'POST'] }] }),
+    /GET-only/,
+  )
+
+  // Legal: bare upgrade, or upgrade with methods exactly ['GET'].
+  const bare = normalizeDeclaration({ ...DECL, routes: [{ path: '/ws', scope: 'session', upgrade: true }] })
+  assert.equal(bare.routes[0].upgrade, true)
+  assert.equal(routeUpgradesOf(bare.routes[0]), true)
+  const explicit = normalizeDeclaration({ ...DECL, routes: [{ path: '/ws', scope: 'session', upgrade: true, methods: ['GET'] }] })
+  assert.equal(explicit.routes[0].upgrade, true)
+
+  // Omitted reads as NOT an upgrade route.
+  const omitted = normalizeDeclaration(DECL)
+  assert.equal(omitted.routes[0].upgrade, undefined)
+  assert.equal(routeUpgradesOf(omitted.routes[0]), false)
+})
+
+test('PB-10: an explicit upgrade enters the digest; a legacy declaration without it hashes unchanged', () => {
+  // The PB-1 baseline is still pinned by the earlier test; here the
+  // complement — an explicit upgrade: true MOVES the digest.
+  const legacy = normalizeDeclaration(DECL).digest
+  // `...DECL` carries the earlier assertions' `digest` key — strip it: the
+  // input is the DECLARATION, not the normalized form.
+  const { digest: _legacyDigest, ...declInput } = DECL
+  const upgraded = normalizeDeclaration({
+    ...declInput,
+    routes: [...declInput.routes, { path: '/panel/ws', scope: 'session', upgrade: true }],
+  })
+  assert.notEqual(upgraded.digest, legacy)
+  // And an upgrade declaration from another plugin differs by its plugin
+  // name as always (digest sanity). Same strip: `upgraded` is normalized.
+  assert.notEqual(
+    normalizeDeclaration({ ...declInput, plugin: 'other', routes: [...declInput.routes, { path: '/panel/ws', scope: 'session', upgrade: true }] }).digest,
+    upgraded.digest,
+  )
 })
 
 // --- PB-9: methods and maxBody ------------------------------------------------

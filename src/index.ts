@@ -66,6 +66,7 @@ import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
+import { createPluginTunnel } from './plugin-tunnel.js'
 
 // The plugin bridge's public types (PB-1), re-exported so another plugin's
 // author can `import type { … } from 'dsh-zen-remote'` without reaching into
@@ -731,6 +732,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           const { protocol, port } = getLoopbackTarget()
           return connection.authenticatedUrl(`${protocol}//127.0.0.1:${port}`)
         }
+        // One loopback executor for BOTH plugin halves (the HTTP forward and
+        // the PB-10 tunnel): a single cookie cache behind two consumers.
+        const pluginLoopback = createPluginLoopback({ getTarget: getLoopbackTarget, getTokenUrl })
+        const pluginConsent = () => resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent
         const handler = createRelayHandler({
           secret: relaySecret,
           store,
@@ -770,10 +775,20 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           // this apply built (the zenRemote service's table), the consent
           // map read LIVE per request (a volatile row field), and the
           // loopback executor over the wiring's two reflection getters.
+          // PB-10: the WebSocket byte tunnel's server half shares the SAME
+          // loopback (one cookie cache) and the same live consent; its
+          // reachability judgment rides the store directly (the handler's
+          // own isAccessible closure is not visible out here).
           pluginBridge: {
             registry,
-            getConsent: () => resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent,
-            loopback: createPluginLoopback({ getTarget: getLoopbackTarget, getTokenUrl }),
+            getConsent: pluginConsent,
+            loopback: pluginLoopback,
+            tunnel: createPluginTunnel({
+              bridge: { registry, getConsent: pluginConsent, loopback: pluginLoopback },
+              getTarget: getLoopbackTarget,
+              isAccessible: (sessionId) => store.isAccessible(sessionId, parentIndex.parentOf),
+              heartbeatMs: 15_000,
+            }),
           },
         })
         const unregister = relayCtx.webServer.register({
@@ -1071,6 +1086,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           refused: 0,
           refusalsByReason: {},
           recentFailures: [],
+          tunnelsCurrent: 0,
+          tunnelsOpened: 0,
+          tunnelsClosed: 0,
         }
       }
       return undefined

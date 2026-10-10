@@ -36,7 +36,9 @@ export declare const DEFAULT_ROUTE_BODY_BYTES: number;
  * members of {@link BRIDGE_METHODS}, deduplicated and sorted at
  * normalization; omitted means `['GET']` (the 2.1 behavior). `maxBody`
  * (PB-9) caps the forwarded request body in bytes; omitted means
- * {@link DEFAULT_ROUTE_BODY_BYTES}. */
+ * {@link DEFAULT_ROUTE_BODY_BYTES}. `upgrade` (PB-10) marks the route as a
+ * WebSocket endpoint carried over the byte tunnel — GET-only, mutually
+ * exclusive with `stream`. */
 export interface BridgeRoute {
     path: string;
     scope: BridgeScope;
@@ -44,6 +46,7 @@ export interface BridgeRoute {
     stream?: boolean;
     methods?: readonly string[];
     maxBody?: number;
+    upgrade?: boolean;
 }
 /** What a plugin hands `zenRemote.bridge(...)` — the raw, unvalidated shape. */
 export interface BridgeDeclaration {
@@ -51,11 +54,12 @@ export interface BridgeDeclaration {
     version: string;
     routes: BridgeRoute[];
 }
-/** A route after validation: every scalar field filled, `methods` and
- * `maxBody` present ONLY when the plugin declared them explicitly — the
- * distinction is load-bearing for the digest (see the canonical form in
- * {@link normalizeDeclaration}), while consumers read the EFFECTIVE values
- * through {@link routeMethodsOf} / {@link routeMaxBodyOf}. */
+/** A route after validation: every scalar field filled, `methods`,
+ * `maxBody` and `upgrade` present ONLY when the plugin declared them
+ * explicitly — the distinction is load-bearing for the digest (see the
+ * canonical form in {@link normalizeDeclaration}), while consumers read the
+ * EFFECTIVE values through {@link routeMethodsOf} / {@link routeMaxBodyOf}
+ * / {@link routeUpgradesOf}. */
 export interface NormalizedBridgeRoute {
     path: string;
     scope: BridgeScope;
@@ -63,7 +67,10 @@ export interface NormalizedBridgeRoute {
     stream: boolean;
     methods: string[] | undefined;
     maxBody: number | undefined;
+    upgrade: boolean | undefined;
 }
+/** The effective upgrade mark of one normalized route. */
+export declare function routeUpgradesOf(route: NormalizedBridgeRoute): boolean;
 /** The effective forwardable methods of one normalized route. */
 export declare function routeMethodsOf(route: NormalizedBridgeRoute): string[];
 /** The effective body cap of one normalized route, in bytes. */

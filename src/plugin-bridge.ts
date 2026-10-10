@@ -43,7 +43,9 @@ export const DEFAULT_ROUTE_BODY_BYTES = 1024 * 1024
  * members of {@link BRIDGE_METHODS}, deduplicated and sorted at
  * normalization; omitted means `['GET']` (the 2.1 behavior). `maxBody`
  * (PB-9) caps the forwarded request body in bytes; omitted means
- * {@link DEFAULT_ROUTE_BODY_BYTES}. */
+ * {@link DEFAULT_ROUTE_BODY_BYTES}. `upgrade` (PB-10) marks the route as a
+ * WebSocket endpoint carried over the byte tunnel — GET-only, mutually
+ * exclusive with `stream`. */
 export interface BridgeRoute {
   path: string
   scope: BridgeScope
@@ -51,6 +53,7 @@ export interface BridgeRoute {
   stream?: boolean
   methods?: readonly string[]
   maxBody?: number
+  upgrade?: boolean
 }
 
 /** What a plugin hands `zenRemote.bridge(...)` — the raw, unvalidated shape. */
@@ -60,11 +63,12 @@ export interface BridgeDeclaration {
   routes: BridgeRoute[]
 }
 
-/** A route after validation: every scalar field filled, `methods` and
- * `maxBody` present ONLY when the plugin declared them explicitly — the
- * distinction is load-bearing for the digest (see the canonical form in
- * {@link normalizeDeclaration}), while consumers read the EFFECTIVE values
- * through {@link routeMethodsOf} / {@link routeMaxBodyOf}. */
+/** A route after validation: every scalar field filled, `methods`,
+ * `maxBody` and `upgrade` present ONLY when the plugin declared them
+ * explicitly — the distinction is load-bearing for the digest (see the
+ * canonical form in {@link normalizeDeclaration}), while consumers read the
+ * EFFECTIVE values through {@link routeMethodsOf} / {@link routeMaxBodyOf}
+ * / {@link routeUpgradesOf}. */
 export interface NormalizedBridgeRoute {
   path: string
   scope: BridgeScope
@@ -72,6 +76,12 @@ export interface NormalizedBridgeRoute {
   stream: boolean
   methods: string[] | undefined
   maxBody: number | undefined
+  upgrade: boolean | undefined
+}
+
+/** The effective upgrade mark of one normalized route. */
+export function routeUpgradesOf(route: NormalizedBridgeRoute): boolean {
+  return route.upgrade === true
 }
 
 /** The effective forwardable methods of one normalized route. */
@@ -152,11 +162,11 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
   const normalizedRoutes = routes.map((route, index): NormalizedBridgeRoute => {
     if (!isPlainObject(route)) fail(`routes[${index}]`, 'expected an object')
     for (const key of Object.keys(route)) {
-      if (key !== 'path' && key !== 'scope' && key !== 'sessionParam' && key !== 'stream' && key !== 'methods' && key !== 'maxBody') {
+      if (key !== 'path' && key !== 'scope' && key !== 'sessionParam' && key !== 'stream' && key !== 'methods' && key !== 'maxBody' && key !== 'upgrade') {
         fail(`routes[${index}].${key}`, 'unknown field (typo guard)')
       }
     }
-    const { path, scope, sessionParam, stream, methods, maxBody } = route
+    const { path, scope, sessionParam, stream, methods, maxBody, upgrade } = route
     if (typeof path !== 'string' || path === '') fail(`routes[${index}].path`, 'must be a non-empty string')
     if (!path.startsWith('/')) fail(`routes[${index}].path`, `"${path}" must start with "/"`)
     if (path.includes('?')) fail(`routes[${index}].path`, `"${path}" must not contain "?"`)
@@ -210,7 +220,20 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
       }
       normalizedMaxBody = maxBody
     }
-    return { path, scope, sessionParam: param, stream: streamFlag, methods: normalizedMethods, maxBody: normalizedMaxBody }
+    // PB-10: the WebSocket tunnel mark. Only `true` is legal (this is a
+    // declaration, not a toggle), it cannot coexist with `stream` (a route
+    // is one thing), and it is GET-only — an explicit `methods` naming
+    // anything else cannot be an upgrade route.
+    let normalizedUpgrade: boolean | undefined
+    if (upgrade !== undefined) {
+      if (upgrade !== true) fail(`routes[${index}].upgrade`, 'must be true or omitted')
+      if (streamFlag) fail(`routes[${index}].upgrade`, 'cannot be combined with stream')
+      if (normalizedMethods !== undefined && normalizedMethods.some((entry) => entry !== 'GET')) {
+        fail(`routes[${index}].upgrade`, 'upgrade routes are GET-only')
+      }
+      normalizedUpgrade = true
+    }
+    return { path, scope, sessionParam: param, stream: streamFlag, methods: normalizedMethods, maxBody: normalizedMaxBody, upgrade: normalizedUpgrade }
   })
   normalizedRoutes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 
@@ -232,6 +255,7 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
       }
       if (route.methods !== undefined) entry.methods = route.methods
       if (route.maxBody !== undefined) entry.maxBody = route.maxBody
+      if (route.upgrade !== undefined) entry.upgrade = route.upgrade
       return entry
     }),
   })
