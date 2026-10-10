@@ -30,6 +30,7 @@ const { installIntercept } = require('../lib/intercept.js')
 const { installFetchRouteIntercept, FILE_UPLOAD_PATH, SESSION_EXPORT_PATH } = require('../lib/fetch-route-intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { normalizeDeclaration, createBridgeRegistry, compareBridges } = require('../lib/plugin-bridge.js')
+const { createPluginLoopback } = require('../lib/plugin-loopback.js')
 const { startGatewayAt, request, pairDesktop, stopAll } = require('./util.cjs')
 
 // T31-fix: every port is system-assigned so parallel test-run copies cannot
@@ -194,7 +195,7 @@ const FOLLOW_ARGS = { request: { address: { kind: 'session', sessionId: 'session
  */
 let bootCounter = 0
 async function boot(opts = {}) {
-  const { shared = [], heartbeatMs, invoke, fingerprints, plugins, apiFetch, parentOf } = opts
+  const { shared = [], heartbeatMs, invoke, fingerprints, plugins, pluginBridge, apiFetch, parentOf } = opts
   const home = path.join(ROOT, `run-${bootCounter++}`)
   fs.mkdirSync(home, { recursive: true })
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
@@ -268,6 +269,9 @@ async function boot(opts = {}) {
       // client's fetchImpl in the dedicated test below.
       ...(plugins !== undefined ? { plugins } : {}),
     },
+    // PB-3: the plugin forwarding half, wired by the test with its own
+    // registry + loopback (usually aimed at a local fake plugin server).
+    ...(pluginBridge !== undefined ? { pluginBridge } : {}),
     ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
   })
   const server = http.createServer((req, res) => { handler(req, res).catch(() => { try { res.destroy() } catch { /* gone */ } }) })
@@ -288,6 +292,7 @@ async function boot(opts = {}) {
   const paired = await pairDesktop(gwPort, '端到端台式机')
   const token = paired.token
   env.deviceId = paired.id
+  env.deviceToken = token
   // The client reaches the gateway THROUGH the proxy hop, like any desktop
   // client behind its server's reverse proxy.
   env.client = registerClient(createRelayClient({
@@ -1556,6 +1561,93 @@ class BareGateway {
   operatorPeer() { return { id: 'operator-peer' } }
   dispatchRpc(endpoint) { return Promise.resolve({ ok: true, value: { endpoint } }) }
 }
+
+// ---- PB-3: the plugin forwarding route over the REAL gateway ------------------
+
+test('e2e PB-3: a hand-written device POST to relay/v1/plugin crosses the gateway into the bridged plugin route', async () => {
+  // The plugin side: a local fake DSH — token exchange at `/`, one NDJSON
+  // plugin route demanding the cookie.
+  const pluginHits = []
+  const pluginServer = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://plugin.internal')
+    if (url.pathname === '/') {
+      res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+      res.end()
+      return
+    }
+    pluginHits.push({ url: req.url ?? '/', cookie: String(req.headers.cookie ?? '') })
+    if (String(req.headers.cookie ?? '') !== 'dsh-auth=e2e') {
+      res.writeHead(401, { 'content-type': 'text/plain' })
+      res.end('unauthorized')
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+    res.write('e2e-frame-1\n')
+    setTimeout(() => { res.write('e2e-frame-2\n'); res.end() }, 15)
+  })
+  await new Promise((resolve) => pluginServer.listen(0, '127.0.0.1', resolve))
+  const pluginPort = pluginServer.address().port
+  const pluginStop = () => new Promise((done) => { pluginServer.closeAllConnections(); pluginServer.close(done) })
+
+  const declared = normalizeDeclaration({
+    plugin: 'e2e-panel',
+    version: '1.0.0',
+    routes: [{ path: '/panel/stream', scope: 'session', stream: true }],
+  })
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'e2e-panel',
+    version: '1.0.0',
+    routes: [{ path: '/panel/stream', scope: 'session', stream: true }],
+  })
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => ({ 'e2e-panel': { version: '1.0.0', digest: declared.digest, serverScopeConsent: true } }),
+    pluginBridge: {
+      registry,
+      getConsent: () => ({}),
+      loopback: createPluginLoopback({
+        getTarget: () => ({ protocol: 'http:', port: pluginPort }),
+        getTokenUrl: () => `http://127.0.0.1:${pluginPort}/?token=t`,
+      }),
+    },
+  })
+  try {
+    // The sub-client's hand-written forward: device Bearer against the
+    // gateway (through the proxy hop, like every relay call), coordinates
+    // in the x-zr-* headers, no body.
+    const res = await request(proxyPort, {
+      method: 'POST',
+      path: '/_dsh/zen-remote/relay/v1/plugin',
+      headers: {
+        authorization: `Bearer ${env.deviceToken}`,
+        accept: 'application/x-ndjson',
+        'x-zr-plugin': 'e2e-panel',
+        'x-zr-plugin-version': '1.0.0',
+        'x-zr-plugin-digest': declared.digest,
+        'x-zr-path': '/panel/stream',
+        'x-zr-query': 'sessionId=session-a',
+      },
+    })
+    assert.equal(res.status, 200, `the forward crosses the whole chain: ${res.body.slice(0, 200)}`)
+    assert.equal(res.headers['content-type'], 'application/x-ndjson')
+    assert.equal(res.headers['x-zen-remote-error'], undefined, 'a success carries no refusal marker')
+    assert.deepEqual(
+      res.body.split('\n').filter(Boolean),
+      ['e2e-frame-1', 'e2e-frame-2'],
+      'the streamed plugin answer arrives in order through gateway + proxy + relay + loopback',
+    )
+    // The loopback really ran against the local plugin: cookie exchanged
+    // once, the session id forwarded as validated.
+    assert.equal(pluginHits.filter((hit) => hit.url.startsWith('/panel/')).length, 2, 'one 401 + one cookie-authenticated hit')
+    assert.ok(pluginHits.some((hit) => hit.cookie === 'dsh-auth=e2e'), 'the exchanged cookie authenticated the plugin request')
+    const pluginUrl = new URL(`http://plugin.internal${pluginHits.find((hit) => hit.url.startsWith('/panel/'))?.url ?? '/'}`)
+    assert.equal(pluginUrl.searchParams.get('sessionId'), 'session-a')
+  } finally {
+    await env.stop()
+    await pluginStop()
+  }
+})
 
 // ---- PB-2: the plugin bridge rides the handshake -----------------------------
 

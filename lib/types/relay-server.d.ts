@@ -27,7 +27,8 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ShareStore } from './share-store.js';
-import type { ServerPluginEntry } from './plugin-bridge.js';
+import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js';
+import type { PluginLoopback } from './plugin-loopback.js';
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
  * trailing slash: the webserver matches a prefix route as `pathname === p ||
@@ -157,6 +158,20 @@ export interface RelayHandlerOptions {
      * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
      * Tests inject a small value so the deadline path stays cheap to drive. */
     drainDeadlineMs?: number;
+    /** The plugin bridge's server half (PB-3). Absent — a wiring that never
+     * mounted it, old tests — and `POST relay/v1/plugin` answers 501
+     * `unsupported`, exactly like the `/api` passthrough without a dispatcher. */
+    pluginBridge?: {
+        /** THIS process's bridge declaration registry (the `zenRemote` service's
+         * backing table) — the source of truth for "which plugin, which version,
+         * which routes". */
+        registry: BridgeRegistry;
+        /** The row's per-plugin whole-machine-data consent, read LIVE per request
+         * (a volatile row field — never snapshotted). */
+        getConsent: () => Record<string, boolean>;
+        /** The loopback executor performing the actual plugin GET. */
+        loopback: PluginLoopback;
+    };
 }
 /**
  * The relay route handler plus its introspection surface. A function WITH
