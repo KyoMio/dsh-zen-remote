@@ -92,9 +92,9 @@ function startFakeDsh({ token = 'token-good', initialCookie = 'dsh-auth=good', r
   })
 }
 
-/** One buffered loopback GET (the streaming/abort tests drive `get` directly). */
+/** One buffered loopback GET (the streaming/abort tests drive `request` directly). */
 async function bufferedGet(loopback, path, query) {
-  const response = await loopback.get(path, query, {}, new AbortController().signal)
+  const response = await loopback.request('GET', path, query, {}, null, new AbortController().signal)
   const chunks = []
   for await (const chunk of response.stream) chunks.push(Buffer.from(chunk))
   return { ...response, body: Buffer.concat(chunks).toString('utf8') }
@@ -152,7 +152,7 @@ test('a 401 that survives the fresh cookie is returned verbatim, never an error'
   const dsh = await startFakeDsh({ initialCookie: 'dsh-auth=a', routeCookie: 'dsh-auth=b' })
   try {
     const loopback = createPluginLoopback({ getTarget: dsh.target, getTokenUrl: dsh.tokenUrl })
-    const response = await loopback.get('/panel/data', 'sessionId=s1', {}, new AbortController().signal)
+    const response = await loopback.request('GET', '/panel/data', 'sessionId=s1', {}, null, new AbortController().signal)
     assert.equal(response.status, 401, 'the verbatim 401 status — a plugin answer, not a relay wall')
     assert.equal(dsh.state.tokenHits, 1, 'exactly one re-exchange ran for the first 401')
     const body = await new Promise((resolve) => {
@@ -176,7 +176,7 @@ test('a failed exchange throws LoopbackAuthError: refused token, and no token UR
       getTokenUrl: () => `${dsh.tokenUrl().split('?')[0]}?token=forged`,
     })
     await assert.rejects(
-      () => loopback.get('/panel/data', 'sessionId=s1', {}, new AbortController().signal),
+      () => loopback.request('GET', '/panel/data', 'sessionId=s1', {}, null, new AbortController().signal),
       (error) => error instanceof LoopbackAuthError,
       'a homepage answer (no cookie) is an exchange failure',
     )
@@ -185,7 +185,7 @@ test('a failed exchange throws LoopbackAuthError: refused token, and no token UR
     // No token URL (a 0.1.1 host): the exchange cannot even start.
     const bare = createPluginLoopback({ getTarget: dsh.target, getTokenUrl: () => undefined })
     await assert.rejects(
-      () => bare.get('/panel/data', 'sessionId=s1', {}, new AbortController().signal),
+      () => bare.request('GET', '/panel/data', 'sessionId=s1', {}, null, new AbortController().signal),
       (error) => error instanceof LoopbackAuthError,
     )
   } finally {
@@ -200,7 +200,7 @@ test('a caller abort tears the loopback request down — the fake server sees th
     const controller = new AbortController()
     // get() resolves once the plugin's response HEADERS arrive; the abort
     // has to reach the still-open body stream below.
-    const response = await loopback.get('/panel/hold', 'sessionId=s1', {}, controller.signal)
+    const response = await loopback.request('GET', '/panel/hold', 'sessionId=s1', {}, null, controller.signal)
     assert.equal(response.status, 200)
     assert.equal(dsh.state.pluginHits, 2, 'the route is mid-response (cold call: one 401, one held 200)')
     const streamDone = new Promise((resolve, reject) => {
@@ -226,7 +226,7 @@ test('a chunked plugin answer streams in order with its whitelisted headers', as
   const dsh = await startFakeDsh()
   try {
     const loopback = createPluginLoopback({ getTarget: dsh.target, getTokenUrl: dsh.tokenUrl })
-    const response = await loopback.get('/panel/hold', 'sessionId=s1', {}, new AbortController().signal)
+    const response = await loopback.request('GET', '/panel/hold', 'sessionId=s1', {}, null, new AbortController().signal)
     assert.equal(response.status, 200)
     assert.equal(response.contentType, 'application/x-ndjson')
     const seen = []

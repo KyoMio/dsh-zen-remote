@@ -1953,3 +1953,154 @@ test('e2e PB-4: the browser hits the local webServer, the wrap forwards over the
     await dshStop()
   }
 })
+
+// ---- PB-9: write requests end to end, at the 1 MiB boundary -------------------
+
+test('e2e PB-9: a 1 MiB POST crosses the whole chain byte for byte; one byte over the declared cap refuses locally with 413', async () => {
+  const seen = { hits: 0, bytes: 0, ct: '' }
+  const fakeDsh = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://dsh.internal')
+    if (url.pathname === '/') {
+      res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+      res.end()
+      return
+    }
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      seen.hits += 1
+      seen.bytes = Buffer.concat(chunks).length
+      seen.ct = String(req.headers['content-type'] ?? '')
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ received: seen.bytes }))
+    })
+  })
+  await new Promise((resolve) => fakeDsh.listen(0, '127.0.0.1', resolve))
+  const dshPort = fakeDsh.address().port
+  const dshStop = () => new Promise((done) => { fakeDsh.closeAllConnections(); fakeDsh.close(done) })
+
+  // maxBody declared EXPLICITLY at exactly 1 MiB: the boundary is the
+  // contract, not the default.
+  const DECLARED_INPUT = {
+    plugin: 'e2e-panel',
+    version: '1.0.0',
+    routes: [{ path: '/panel/write', scope: 'session', methods: ['POST'], maxBody: 1024 * 1024 }],
+  }
+  const declared = normalizeDeclaration(DECLARED_INPUT)
+  const serverRegistry = createBridgeRegistry()
+  serverRegistry.register(DECLARED_INPUT)
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => {
+      const table = {}
+      for (const d of serverRegistry.list()) {
+        table[d.plugin] = { version: d.version, digest: d.digest, serverScopeConsent: true }
+      }
+      return table
+    },
+    pluginBridge: {
+      registry: serverRegistry,
+      getConsent: () => ({ 'e2e-panel': true }),
+      loopback: createPluginLoopback({
+        getTarget: () => ({ protocol: 'http:', port: dshPort }),
+        getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+      }),
+    },
+  })
+
+  // The sub-client side: a host-shaped fake webServer with the interception.
+  const hostRaw = {
+    exact: new Map(),
+    prefixes: new Map(),
+    match(pathname) {
+      return this.exact.get(pathname)
+    },
+    register(route) {
+      this.exact.set(route.path, route)
+      return () => this.exact.delete(route.path)
+    },
+  }
+  const subServer = http.createServer((req, res) => {
+    const rawPath = new URL(req.url ?? '/', 'http://x').pathname
+    Promise.resolve(hostRaw.match(rawPath)).then(async (route) => {
+      if (route !== undefined) {
+        await route.handler(req, res)
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    }).catch(() => { try { res.destroy() } catch { /* gone */ } })
+  })
+  await new Promise((resolve) => subServer.listen(0, '127.0.0.1', resolve))
+  const subPort = subServer.address().port
+  const subStop = () => new Promise((done) => { subServer.closeAllConnections(); subServer.close(done) })
+
+  const localRegistry = createBridgeRegistry()
+  localRegistry.register(DECLARED_INPUT)
+  const handle = installPluginRouteIntercept({
+    webServer: hostRaw,
+    registry: localRegistry,
+    relay: env.client,
+    getServerId: () => env.client.handshakeInfo?.serverId,
+    getStatus: () => compareBridges(localRegistry.list(), env.client.handshakeInfo?.plugins, env.client.state === 'online'),
+    log: () => {},
+  })
+
+  try {
+    await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const virtual = toVirtual(env.client.handshakeInfo?.serverId ?? '', 'session-a')
+    const base = `http://127.0.0.1:${subPort}`
+
+    // EXACTLY the declared cap: crosses every hop, byte for byte.
+    const exactly = Buffer.alloc(1024 * 1024, 0x61)
+    const ok = await fetch(`${base}/panel/write?sessionId=${encodeURIComponent(virtual)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: exactly,
+    })
+    const okBody = await ok.json().catch(() => ({ error: { code: 'unreadable' } }))
+    assert.equal(ok.status, 200, `the 1 MiB write crossed: ${JSON.stringify(okBody)}`)
+    assert.deepEqual(okBody, { received: 1024 * 1024 })
+    assert.equal(seen.bytes, 1024 * 1024, 'the fake DSH received the whole MiB')
+    assert.equal(seen.ct, 'application/octet-stream', 'the content type rode every hop')
+
+    // One byte over: refused at the SUB-CLIENT (before the relay sees a
+    // byte) with the local 413 shape.
+    const over = Buffer.alloc(1024 * 1024 + 1, 0x61)
+    const refused = await fetch(`${base}/panel/write?sessionId=${encodeURIComponent(virtual)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: over,
+    })
+    assert.equal(refused.status, 413)
+    assert.deepEqual(await refused.json(), { ok: false, error: { code: 'zr-plugin-body-too-large' } })
+    assert.equal(seen.hits, 1, 'the over-limit write never reached the server')
+
+    // CHUNKED over-limit (PB-9-fix): a TRUE no-Content-Length body trips
+    // the gate mid-forward. The local 413 answers — and, decisive, the REAL
+    // relay client never judged the link offline for its caller's abort:
+    // the connection stays online for everything after it.
+    const chunked = await fetch(`${base}/panel/write?sessionId=${encodeURIComponent(virtual)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('x'.repeat(1024 * 1024 + 1)))
+          controller.close()
+        },
+      }),
+      duplex: 'half',
+    })
+    const chunkedBody = await chunked.json()
+    assert.equal(chunked.status, 413, `the chunked over-limit answer: ${JSON.stringify(chunkedBody)}`)
+    assert.deepEqual(chunkedBody, { ok: false, error: { code: 'zr-plugin-body-too-large' } })
+    assert.equal(seen.hits, 1, 'the chunked over-limit never reached the server either')
+    assert.equal(env.client.state, 'online', 'the gate trip is a caller verdict — the relay client stayed online')
+  } finally {
+    handle.uninstall()
+    await env.stop()
+    await subStop()
+    await dshStop()
+  }
+})

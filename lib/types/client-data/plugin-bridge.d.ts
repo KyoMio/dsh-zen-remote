@@ -36,6 +36,16 @@ export type PluginBridgeStateKey = 'settings.bridge.stateBridged' | 'settings.br
  * entry is skipped, never thrown into the settings page. */
 export declare function derivePluginBridgeStatuses(value: unknown): PluginBridgeStatusView[];
 /**
+ * The three-state resolution for the host settings page's 插件桥 list
+ * (PB-9-fix): a fetch that has not answered is LOADING, a failed or
+ * refused fetch is an ERROR — and only a successful answer with zero rows
+ * means "no plugin has registered a bridge". Collapsing the first two into
+ * the empty copy would tell the user nothing is bridged while the answer is
+ * simply not in yet (or the page was opened through the gateway, where the
+ * listing is refused). Pure so the check pins all four outcomes.
+ */
+export declare function bridgeSectionState(load: 'loading' | 'error' | 'ready', rows: unknown): 'loading' | 'error' | 'empty' | 'plugins';
+/**
  * One consent-toggle click: the NEXT whole-machine-data consent map, staged
  * over the row's `pluginBridgeConsent` field. Only `plugin`'s key moves —
  * every other key (including entries for plugins no longer registered; the

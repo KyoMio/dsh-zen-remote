@@ -264,6 +264,18 @@ export interface RelayPluginRequest {
     /** The re-serialized query string, session id already restored to its
      * ORIGINAL form. */
     query: string;
+    /** The request method (PB-9); defaults to GET. Must be one the route
+     * declared — the server answers 405 `method-undeclared` otherwise. */
+    method?: string;
+    /** The request BODY (PB-9), forwarded verbatim as a stream. `null` means
+     * no body. A streaming body rides chunked (undici forbids hand-set length
+     * headers), so the server's streaming byte count is the size gate. */
+    body?: ReadableStream<Uint8Array> | null;
+    /** The body's content type, passed through to the plugin when set. */
+    contentType?: string;
+    /** The declared body size, when the local request carried one — sizes the
+     * header-wait budget and nothing else (a streaming body goes chunked). */
+    contentLength?: number;
     /** The one request header passed through to the plugin beside `range`. */
     accept?: string;
     range?: string;

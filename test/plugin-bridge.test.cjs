@@ -15,7 +15,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { normalizeDeclaration, createBridgeRegistry, compareBridges } = require('../lib/plugin-bridge.js')
+const { normalizeDeclaration, createBridgeRegistry, compareBridges, routeMethodsOf, routeMaxBodyOf } = require('../lib/plugin-bridge.js')
 
 /** One legal declaration everything else is patched from. */
 const DECL = {
@@ -155,8 +155,8 @@ test('normalizeDeclaration fills the defaults and normalizes the shape', () => {
     routes: [{ path: '/panel/zebra', scope: 'session', stream: true }, { path: '/panel/alpaca', scope: 'server', sessionParam: 'sid' }],
   })
   assert.deepEqual(normalized.routes, [
-    { path: '/panel/alpaca', scope: 'server', sessionParam: 'sid', stream: false },
-    { path: '/panel/zebra', scope: 'session', sessionParam: 'sessionId', stream: true },
+    { path: '/panel/alpaca', scope: 'server', sessionParam: 'sid', stream: false, methods: undefined, maxBody: undefined },
+    { path: '/panel/zebra', scope: 'session', sessionParam: 'sessionId', stream: true, methods: undefined, maxBody: undefined },
   ])
   assert.match(normalized.digest, DIGEST_PATTERN)
 })
@@ -193,6 +193,91 @@ test('the digest ignores route order and changes with any field value', () => {
     assert.notEqual(normalizeDeclaration(variant).digest, base, `changing ${what} must change the digest`)
   }
   assert.notEqual(normalizeDeclaration(variants.plugin).digest, normalizeDeclaration({ ...variants.plugin, version: '9' }).digest)
+})
+
+// --- PB-9: methods and maxBody ------------------------------------------------
+
+test('PB-9: methods validates, uppercases nothing (strict), dedupes and sorts; defaults read through the accessors', () => {
+  // The vocabulary is closed, and method names are case-sensitive on the
+  // wire — a lowercase or unknown entry is exactly the typo the strictness
+  // catches.
+  for (const bad of ['get', 'Get', 'POSTS', 'CONNECT', 42, null]) {
+    assert.throws(
+      () => normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', methods: [bad] }] }),
+      /methods/,
+      `methods ${JSON.stringify(bad)} must be refused`,
+    )
+  }
+  assert.throws(() => normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', methods: [] }] }), /methods/)
+  assert.throws(() => normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', methods: 'POST' }] }), /methods/)
+
+  // Deduplicated and dictionary-sorted; input order never reaches the digest.
+  const normalized = normalizeDeclaration({
+    ...DECL,
+    routes: [{ path: '/x', scope: 'session', methods: ['DELETE', 'POST', 'GET', 'POST'] }],
+  })
+  assert.deepEqual(normalized.routes[0].methods, ['DELETE', 'GET', 'POST'])
+  // Omitted reads as GET through the accessor, and stays undefined in the
+  // normalized route (the digest's explicit-only rule).
+  const omitted = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session' }] })
+  assert.equal(omitted.routes[0].methods, undefined)
+  assert.deepEqual(routeMethodsOf(omitted.routes[0]), ['GET'])
+  assert.deepEqual(routeMethodsOf(normalized.routes[0]), ['DELETE', 'GET', 'POST'])
+})
+
+test('PB-9: maxBody must be a positive integer up to 64 MiB; omitted reads as 1 MiB', () => {
+  for (const bad of [0, -1, 1.5, 'x', true, 64 * 1024 * 1024 + 1]) {
+    assert.throws(
+      () => normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', maxBody: bad }] }),
+      /maxBody/,
+      `maxBody ${JSON.stringify(bad)} must be refused`,
+    )
+  }
+  const big = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', maxBody: 64 * 1024 * 1024 }] })
+  assert.equal(big.routes[0].maxBody, 64 * 1024 * 1024)
+  const omitted = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session' }] })
+  assert.equal(omitted.routes[0].maxBody, undefined)
+  assert.equal(routeMaxBodyOf(omitted.routes[0]), 1024 * 1024)
+})
+
+test('PB-9: a 2.1-era declaration hashes EXACTLY as it did before methods/maxBody existed', () => {
+  // The PB-1 baseline, computed in October 2026 against the pre-methods
+  // implementation and pinned here: defaults never enter the canonical
+  // form, so an old declaration keeps its digest across the upgrade —
+  // otherwise every already-bridged pair would flip to declaration-mismatch
+  // the moment one end updated.
+  const legacy = {
+    plugin: 'task-panel',
+    version: '1.2.3',
+    routes: [
+      { path: '/panel/tasks', scope: 'session' },
+      { path: '/panel/teams', scope: 'server' },
+    ],
+  }
+  assert.equal(normalizeDeclaration(legacy).digest, 'dc490b9ea6eed005', 'the pinned PB-1 digest')
+
+  // The complement: an EXPLICIT methods/maxBody does enter the digest, even
+  // when it spells the default — explicitness is what the two ends compare.
+  const withDefaults = {
+    ...legacy,
+    routes: [...legacy.routes, { path: '/panel/extra', scope: 'session', methods: ['GET'], maxBody: 1024 * 1024 }],
+  }
+  assert.notEqual(normalizeDeclaration(withDefaults).digest, 'dc490b9ea6eed005')
+  const onlyMethods = {
+    ...legacy,
+    routes: [...legacy.routes, { path: '/panel/extra', scope: 'session', methods: ['GET'] }],
+  }
+  assert.notEqual(normalizeDeclaration(onlyMethods).digest, normalizeDeclaration(legacy).digest)
+  // Method ORDER does not move the digest (sorted at normalization).
+  const reordered = normalizeDeclaration({
+    ...legacy,
+    routes: [...legacy.routes, { path: '/panel/extra', scope: 'session', methods: ['POST', 'GET'] }],
+  })
+  const ordered = normalizeDeclaration({
+    ...legacy,
+    routes: [...legacy.routes, { path: '/panel/extra', scope: 'session', methods: ['GET', 'POST'] }],
+  })
+  assert.equal(reordered.digest, ordered.digest)
 })
 
 // --- createBridgeRegistry ------------------------------------------------------

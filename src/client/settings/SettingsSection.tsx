@@ -56,7 +56,7 @@ import {
   normalizePairingCode,
   shouldFollowServerDeviceName,
 } from '../../client-data/settings-form.ts'
-import { togglePluginConsent } from '../../client-data/plugin-bridge.ts'
+import { bridgeSectionState, togglePluginConsent } from '../../client-data/plugin-bridge.ts'
 import type { PluginBridgeStatusView } from '../../client-data/plugin-bridge.ts'
 import type {
   AdminStatusBody,
@@ -380,11 +380,17 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
 
   // The plugin bridge's registered-plugin listing (PB-5), host page only:
   // loaded once per page life and refreshed whenever a save lands (the
-  // consent staged by the toggles below rides that very save). Undefined
-  // until the first answer — the section renders the empty copy then, and a
-  // composition without the route stays there silently.
-  const [bridgeRows, setBridgeRows] = useState<{ plugin: string, version: string, hasServerScope: boolean, consent: boolean }[] | undefined>(undefined)
+  // consent staged by the toggles below rides that very save). Starts in
+  // the loading state — the section renders the loading copy until the
+  // first answer lands (or the load fails, which is its own state, never
+  // the empty one); a composition without the route stays loading.
+  // PB-9-fix: the listing is a THREE-state read — loading, failed (an old
+  // build, or the page opened through the gateway where the listing is
+  // refused), or an answer that carries zero rows. Only the third means
+  // "nothing registered"; the first two must not masquerade as it.
+  const [bridgeLoad, setBridgeLoad] = useState<{ state: 'loading' | 'error' | 'ready', rows: { plugin: string, version: string, hasServerScope: boolean, consent: boolean }[] }>({ state: 'loading', rows: [] })
   const loadBridge = useCallback(() => {
+    setBridgeLoad((prev) => ({ state: 'loading', rows: prev.rows }))
     fetch(ADMIN_PLUGIN_BRIDGE_ROUTE)
       .then((res) => {
         if (!res.ok) return Promise.reject(new Error(String(res.status)))
@@ -393,14 +399,18 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       .then((body) => {
         const plugins = body?.value?.plugins
         if (!Array.isArray(plugins)) return
-        setBridgeRows(plugins.filter((row): row is { plugin: string, version: string, hasServerScope: boolean, consent: boolean } =>
-          row !== null && typeof row === 'object' && typeof (row as { plugin?: unknown }).plugin === 'string'))
+        setBridgeLoad({
+          state: 'ready',
+          rows: plugins.filter((row): row is { plugin: string, version: string, hasServerScope: boolean, consent: boolean } =>
+            row !== null && typeof row === 'object' && typeof (row as { plugin?: unknown }).plugin === 'string'),
+        })
       })
-      .catch(() => { /* no listing (older build, or refused): the section keeps its empty copy */ })
+      .catch(() => { setBridgeLoad((prev) => ({ state: 'error', rows: prev.rows })) })
   }, [])
   useEffect(() => {
     if (!clientRole) loadBridge()
   }, [clientRole, loadBridge])
+  const bridgeState = bridgeSectionState(bridgeLoad.state, bridgeLoad.rows)
   const statusPoll = config.statusPoll()
 
   useEffect(() => {
@@ -937,8 +947,10 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   reading the CURRENT map off the staged (or displayed) draft
                   so consecutive toggles compose. */}
               <h3 className="zr-settings-card-title">{t('settings.bridge.title')}</h3>
-              {(bridgeRows ?? []).length === 0 && <p className="zr-settings-hint">{t('settings.bridge.empty')}</p>}
-              {(bridgeRows ?? []).map((row) => {
+              {bridgeState === 'loading' && <p className="zr-settings-hint">{t('settings.bridge.loading')}</p>}
+              {bridgeState === 'error' && <p className="zr-settings-hint" data-invalid="true">{t('settings.bridge.loadFailed')}</p>}
+              {bridgeState === 'empty' && <p className="zr-settings-hint">{t('settings.bridge.empty')}</p>}
+              {bridgeLoad.rows.map((row) => {
                 let current: Record<string, boolean> = {}
                 try {
                   const parsed: unknown = JSON.parse(form.pluginBridgeConsent.text)

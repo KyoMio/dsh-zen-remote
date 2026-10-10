@@ -37,10 +37,12 @@ export interface PluginLoopbackTarget {
     protocol: 'http:' | 'https:';
     port: number;
 }
-/** The two request headers this bridge passes through to the plugin. */
+/** The request headers this bridge passes through to the plugin. */
 export interface PluginLoopbackHeaders {
     accept?: string;
     range?: string;
+    /** PB-9: a forwarded request body's content type. */
+    contentType?: string;
 }
 /** The plugin route's answer, headers whitelisted to what the relay may
  * forward. `stream` is the RAW IncomingMessage: the caller reads it (and
@@ -71,13 +73,17 @@ export interface CreatePluginLoopbackOptions {
     getTokenUrl: () => string | undefined;
 }
 export interface PluginLoopback {
-    /** One validated GET against the local plugin route. `path` arrives
+    /** One validated request against the local plugin route. `path` arrives
      * undecoded and `query` is the RELAY-CHECKED serialization (the caller
-     * never passes raw wire input — the parse-once discipline). Throws
-     * {@link LoopbackAuthError} when the cookie cannot be obtained; every
-     * other failure (target unreachable, the signal aborted) rejects with the
-     * underlying error and is the caller's `internal`/hang-up case. */
-    get(path: string, query: string, headers: PluginLoopbackHeaders, signal: AbortSignal): Promise<PluginLoopbackResponse>;
+     * never passes raw wire input — the parse-once discipline). `body` (PB-9)
+     * is the relay request's body streamed verbatim (an IncomingMessage or a
+     * byte stream), `null` for bodyless methods; it is pumped into the
+     * loopback request as-is — sizing it is the ROUTE's job, transport is
+     * this module's. Throws {@link LoopbackAuthError} when the cookie cannot
+     * be obtained; every other failure (target unreachable, the signal
+     * aborted, the body dying mid-flight) rejects with the underlying error
+     * and is the caller's `internal`/hang-up case. */
+    request(method: string, path: string, query: string, headers: PluginLoopbackHeaders, body: import('node:http').IncomingMessage | import('node:stream').Readable | null, signal: AbortSignal): Promise<PluginLoopbackResponse>;
 }
 /**
  * Build the loopback executor. The cookie lives only in this closure.
