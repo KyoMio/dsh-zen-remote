@@ -77,6 +77,12 @@ export interface ZenRemoteConfig {
   idleHours: number
   /** Auto-share every newly created session to the paired phone (T16). */
   autoShareNewSessions: boolean
+  /** Per-plugin consent for bridging whole-machine data (plugin bridge,
+   * PB-1): plugin name → whether the server owner lets that plugin's
+   * `scope:'server'` routes be forwarded inside remote sessions. Absent or
+   * false means NO — default `{}` keeps every plugin unconsented. Volatile:
+   * read at compare time, deliberately NOT in RESTART_FIELDS. */
+  pluginBridgeConsent: Record<string, boolean>
 }
 
 function defaultServerName(): string {
@@ -101,6 +107,7 @@ export const DEFAULTS: ZenRemoteConfig = {
   serverName: defaultServerName(),
   idleHours: 48,
   autoShareNewSessions: false,
+  pluginBridgeConsent: {},
 }
 
 // --- per-field validators -------------------------------------------------
@@ -174,6 +181,22 @@ function commaList(value: unknown): string | undefined {
 function serverNameOf(value: unknown): string | undefined {
   const name = nonEmptyString(value)
   return name === undefined ? undefined : name.slice(0, SERVER_NAME_MAX)
+}
+
+/** `pluginBridgeConsent`: a plain object mapping plugin names to STRICT
+ * booleans. Anything else — null, an array, a non-boolean value (`"yes"`,
+ * `1`; unlike the scalar booleans there is no historic `1`/`"1"` convention
+ * to honor, this map only ever came from the settings surface or a
+ * hand-edited row/file) — makes the layer transparent, because a half-valid
+ * consent map must never read as "consented". Object keys are strings by
+ * construction in both JSON and YAML; the per-key string check stays as the
+ * cheap belt over the iteration. */
+function consentMap(value: unknown): Record<string, boolean> | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof key !== 'string' || typeof entry !== 'boolean') return undefined
+  }
+  return value as Record<string, boolean>
 }
 
 /** Env validator applied to `Number(env[name])`, so `LAN_GATE_PORT='abc'`
@@ -263,6 +286,10 @@ const FIELDS: { [K in keyof ZenRemoteConfig]: FieldResolver<ZenRemoteConfig[K]> 
   serverName: { row: serverNameOf, file: serverNameOf },
   idleHours: { row: inRange(0, 8760), file: inRange(0, 8760) },
   autoShareNewSessions: { row: boolLike, file: boolLike },
+  // No env layer on purpose (PB-1): a per-plugin consent map has no historic
+  // flat variable to stay compatible with, and a consent decision is a
+  // settings-page action, not something set through the environment.
+  pluginBridgeConsent: { row: consentMap, file: consentMap },
 }
 
 /**
@@ -346,6 +373,7 @@ export function resolveConfig(
     serverName: resolveField('serverName', safeRow, safeFile, env, sources),
     idleHours: resolveField('idleHours', safeRow, safeFile, env, sources),
     autoShareNewSessions: resolveField('autoShareNewSessions', safeRow, safeFile, env, sources),
+    pluginBridgeConsent: resolveField('pluginBridgeConsent', safeRow, safeFile, env, sources),
   }
   return { values, sources }
 }
@@ -432,6 +460,10 @@ export const Config = z.object({
   serverName: z.any().volatile(),
   idleHours: z.any().volatile(),
   autoShareNewSessions: z.any().volatile(),
+  // Plugin-bridge consent (PB-1): a name → boolean map, live-read at compare
+  // time — a consent flip must apply without a row restart, so it is
+  // deliberately NOT in RESTART_FIELDS.
+  pluginBridgeConsent: z.any().volatile(),
   // Client-half knobs (T16): where the phone finds the gateway, and the
   // pairing token it presents. `role('secret')` keeps the token out of every
   // settings wire surface, like the verifier plugin's API key.

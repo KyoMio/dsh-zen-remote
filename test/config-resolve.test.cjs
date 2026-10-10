@@ -161,6 +161,48 @@ test('boolean fields read true/false plus the historic 1/"1"/0/"0" from row and 
   assert.equal(resolveConfig({}, {}, {}).values.pushTool, true, 'pushTool defaults to on')
 })
 
+// --- pluginBridgeConsent (PB-1) ----------------------------------------------
+
+test('pluginBridgeConsent: default {}, a legal name→boolean map passes through row and file', async () => {
+  const { resolveConfig } = await load()
+  const fallback = resolveConfig({}, {}, {})
+  assert.deepEqual(fallback.values.pluginBridgeConsent, {}, 'the default consents to nothing')
+  assert.equal(fallback.sources.pluginBridgeConsent, 'default')
+
+  const legal = { '@acme/panel': true, 'other-thing': false }
+  const viaRow = resolveConfig({ pluginBridgeConsent: legal }, {}, {})
+  assert.deepEqual(viaRow.values.pluginBridgeConsent, legal)
+  assert.equal(viaRow.sources.pluginBridgeConsent, 'row')
+  const viaFile = resolveConfig({}, { pluginBridgeConsent: legal }, {})
+  assert.deepEqual(viaFile.values.pluginBridgeConsent, legal)
+  assert.equal(viaFile.sources.pluginBridgeConsent, 'file')
+  assert.equal(resolveConfig({ pluginBridgeConsent: legal }, { pluginBridgeConsent: { x: true } }, {}).values.pluginBridgeConsent['@acme/panel'], true, 'row beats file')
+})
+
+test('pluginBridgeConsent: an illegal value makes its layer transparent, unlike the scalar booleans there is no 1/"1" leniency', async () => {
+  const { resolveConfig } = await load()
+  const illegal = ['yes', 42, null, [], { '@acme/panel': 'yes' }, { '@acme/panel': 1 }, { '@acme/panel': null }]
+  for (const bad of illegal) {
+    const r = resolveConfig({ pluginBridgeConsent: bad }, {}, {})
+    assert.deepEqual(r.values.pluginBridgeConsent, {}, `row ${JSON.stringify(bad)} must fall to the default`)
+    assert.equal(r.sources.pluginBridgeConsent, 'default')
+    assert.equal(resolveConfig({}, { pluginBridgeConsent: bad }, {}).sources.pluginBridgeConsent, 'default', `file ${JSON.stringify(bad)} is just as illegal`)
+  }
+  // A legal file value still answers when the row wrote junk — the usual
+  // per-layer transparency, not a whole-config failure.
+  const rescued = resolveConfig({ pluginBridgeConsent: 'nope' }, { pluginBridgeConsent: { '@acme/panel': true } }, {})
+  assert.deepEqual(rescued.values.pluginBridgeConsent, { '@acme/panel': true })
+  assert.equal(rescued.sources.pluginBridgeConsent, 'file')
+})
+
+test('pluginBridgeConsent unwraps the volatile loader reference like every row field', async () => {
+  const { resolveConfig, Config } = await load()
+  const row = Config({ pluginBridgeConsent: { '@acme/panel': true } })
+  const resolved = resolveConfig(row, {}, {})
+  assert.deepEqual(resolved.values.pluginBridgeConsent, { '@acme/panel': true })
+  assert.equal(resolved.sources.pluginBridgeConsent, 'row')
+})
+
 test('env boolean semantics: DSH_PUSH_SUMMARY/TURN_END are 1-gated, DSH_PUSH_TOOL flips off only on 0', async () => {
   const { resolveConfig } = await load()
   await withEnvVar('DSH_PUSH_SUMMARY', '1', async () => {
@@ -318,6 +360,7 @@ test('Config parses a fully populated row and leaves an empty row free of defaul
     trustedProxies: ['10.0.0.1'], vapidSubject: 'mailto:x@y.z', lang: 'zh',
     pushEvents: 'a/b', pushDebounceMs: 1000, pushSummary: true, pushTurnEnd: true, pushTool: false,
     serverName: 'phone', idleHours: 24, autoShareNewSessions: true,
+    pluginBridgeConsent: { '@acme/panel': true },
     serverUrl: 'https://gw.example', deviceToken: 'tok',
     turnFoldDesktop: true, keyboardLiftRatio: 0.5, keyboardLiftMaxPx: 300, keyboardSafetyPadPx: 10, maxUploadBytes: 1024,
   }
@@ -372,6 +415,7 @@ test('a fully populated Config row resolves with EVERY source = row (T17)', asyn
     trustedProxies: ['10.0.0.1'], vapidSubject: 'mailto:x@y.z', lang: 'zh',
     pushEvents: 'a/b', pushDebounceMs: 1000, pushSummary: true, pushTurnEnd: true, pushTool: false,
     serverName: 'phone', idleHours: 24, autoShareNewSessions: true,
+    pluginBridgeConsent: { '@acme/panel': true },
     serverUrl: 'https://gw.example', deviceToken: 'tok',
     turnFoldDesktop: true, keyboardLiftRatio: 0.5, keyboardLiftMaxPx: 300, keyboardSafetyPadPx: 10, maxUploadBytes: 1024,
   }

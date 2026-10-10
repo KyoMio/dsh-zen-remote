@@ -68,6 +68,12 @@ export interface ZenRemoteConfig {
     idleHours: number;
     /** Auto-share every newly created session to the paired phone (T16). */
     autoShareNewSessions: boolean;
+    /** Per-plugin consent for bridging whole-machine data (plugin bridge,
+     * PB-1): plugin name → whether the server owner lets that plugin's
+     * `scope:'server'` routes be forwarded inside remote sessions. Absent or
+     * false means NO — default `{}` keeps every plugin unconsented. Volatile:
+     * read at compare time, deliberately NOT in RESTART_FIELDS. */
+    pluginBridgeConsent: Record<string, boolean>;
 }
 /** Defaults, one per field — exactly what layer 4 hands back. */
 export declare const DEFAULTS: ZenRemoteConfig;
@@ -165,6 +171,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     serverName: z<any, any, "volatile">;
     idleHours: z<any, any, "volatile">;
     autoShareNewSessions: z<any, any, "volatile">;
+    pluginBridgeConsent: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;
@@ -189,6 +196,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     serverName: z<any, any, "volatile">;
     idleHours: z<any, any, "volatile">;
     autoShareNewSessions: z<any, any, "volatile">;
+    pluginBridgeConsent: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;

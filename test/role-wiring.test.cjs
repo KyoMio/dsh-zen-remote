@@ -53,18 +53,22 @@ test.after(() => {
 })
 
 /** Fake Cordis context: records every plugin() call (module namespace +
- * config) and every ctx.on subscription + ctx.effect return, no-ops
- * inject/effect like the route tests do. Neither sub-plugin is executed —
- * the namespace objects are only inspected. The `on` record and the effect
- * returns are what the T22c wiring test asserts on; `warns` captures
- * logger.warn calls (the T33a-fix listener-swallow test reads them). */
+ * config), every provide() call (service name + value), every ctx.on
+ * subscription + ctx.effect return, no-ops inject/effect like the route
+ * tests do. Neither sub-plugin is executed — the namespace objects are only
+ * inspected. The `on` record and the effect returns are what the T22c
+ * wiring test asserts on; `warns` captures logger.warn calls (the T33a-fix
+ * listener-swallow test reads them); `provides` is what the PB-1 zenRemote
+ * test reads. */
 function makeCtx() {
   const calls = []
   const listeners = []
   const effects = []
   const warns = []
+  const provides = []
   const ctx = {
     plugin(module, config) { calls.push({ module, config }) },
+    provide(name, value) { provides.push({ name, value }); return () => {} },
     // Cordis's on() returns an unsubscribe; the effects capture and return
     // it (the T43 credentials watcher's disposer calls it on teardown).
     on(event, listener) { listeners.push({ event, listener }); return () => {} },
@@ -72,7 +76,7 @@ function makeCtx() {
     effect(fn) { effects.push(fn()) },
     logger: { warn: (...args) => warns.push(args) },
   }
-  return { ctx, calls, listeners, effects, warns }
+  return { ctx, calls, listeners, effects, warns, provides }
 }
 
 /** Cordis-faithful `inject` for fakes that EXECUTE their callbacks. The
@@ -517,14 +521,12 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
   assert.equal(typeof host.listeners[0].listener, 'function')
   // The sweeper is registered through ctx.effect, whose callback returns the
   // stop function Cordis calls on disposal — captured here as the effect's
-  // return value. makeCtx's no-op inject never fires, so the only effects on
-  // this ctx are the sweeper (T22c) and the T17 restart watcher, in
-  // registration order.
-  assert.equal(host.effects.length, 2, 'the host role starts the idle sweeper and the restart watcher')
-  assert.equal(typeof host.effects[0], 'function', 'the sweeper effect returned a stop function')
-  assert.equal(typeof host.effects[1], 'function', 'the restart watcher effect returned a stop function')
-  host.effects[0]() // calling it right away must be safe (and stops the real 60s timer)
-  host.effects[1]() // same for the 2s poll
+  // return value. makeCtx's no-op inject never fires, so the effects on this
+  // ctx are, in apply() order: the PB-1 bridge registry disposal (which runs
+  // BEFORE the role branch), the sweeper (T22c) and the T17 restart watcher.
+  assert.equal(host.effects.length, 3, 'the host role starts the bridge registry disposal, the idle sweeper and the restart watcher')
+  for (const stop of host.effects) assert.equal(typeof stop, 'function', 'each effect returned a stop function')
+  for (const stop of host.effects) stop() // calling each right away must be safe (stops the real timers)
 
   const client = makeCtx()
   index.apply(client.ctx, { role: 'client' })
@@ -536,11 +538,12 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
     'the client role never subscribes the session feeds but watches volatile updates twice (restart watcher + relay credentials)',
   )
   assert.equal(typeof client.listeners[0].listener, 'function')
-  // The client role has three effects: the relay client's disposal (T23a-fix,
-  // which stops the reconnect machinery and clears the module slot), the T43
+  // The client role has four effects: the PB-1 bridge registry disposal
+  // (before the role branch), the relay client's disposal (T23a-fix, which
+  // stops the reconnect machinery and clears the module slot), the T43
   // credentials watcher's unsubscribe, and the restart watcher (T17) — never
   // the sweeper, which stays host-only.
-  assert.equal(client.effects.length, 3, 'the client role starts the relay disposal, the credentials watcher and the restart watcher')
+  assert.equal(client.effects.length, 4, 'the client role starts the bridge disposal, the relay disposal, the credentials watcher and the restart watcher')
   for (const stop of client.effects) assert.equal(typeof stop, 'function', 'each effect returned a stop function')
   assert.notEqual(index.getRelayClient(), undefined, 'the client role installs its relay client in the module slot')
   for (const stop of client.effects) stop()
@@ -776,7 +779,73 @@ test('T33a-fix: a throwing agent/created listener is swallowed and warned, never
   )
 })
 
+// ---- PB-1: the zenRemote service ------------------------------------------------
+
+test('PB-1: BOTH roles provide a zenRemote service whose bridge() registers, validates and disposes', async () => {
+  const index = await import(INDEX_URL)
+  for (const role of ['host', 'client']) {
+    const config = role === 'host' ? {} : { role: 'client' }
+    const { ctx, provides, effects } = makeCtx()
+    index.apply(ctx, config)
+
+    const provided = provides.find((p) => p.name === 'zenRemote')
+    assert.ok(provided, `the ${role} role provides the zenRemote service`)
+    assert.equal(typeof provided.value.bridge, 'function', 'the service exposes bridge()')
+    assert.equal(provides.length, 1, 'exactly one service is provided')
+
+    // The module slot carries the SAME registry the service writes into, so
+    // later tasks read it without reaching into a context.
+    const registry = index.getBridgeRegistry()
+    assert.ok(registry, `the ${role} role installs the module-slot registry`)
+
+    // A legal declaration registers through the service and shows up in the
+    // registry; the dispose it returned removes exactly that declaration.
+    const dispose = provided.value.bridge({
+      plugin: '@acme/panel-bridge', version: '1.0.0', routes: [{ path: '/panel/tasks', scope: 'session' }],
+    })
+    assert.equal(typeof dispose, 'function', 'bridge() returns a dispose function')
+    assert.equal(registry.get('@acme/panel-bridge')?.version, '1.0.0', 'the declaration reached the registry')
+
+    // An illegal declaration throws through and registers nothing.
+    assert.throws(
+      () => provided.value.bridge({ plugin: 'BAD NAME', version: '1', routes: [{ path: '/x', scope: 'session' }] }),
+      /plugin/,
+      'an illegal declaration must throw',
+    )
+    assert.deepEqual(registry.list().map((d) => d.plugin), ['@acme/panel-bridge'], 'the rejection registered nothing')
+
+    dispose()
+    assert.equal(registry.get('@acme/panel-bridge'), undefined, 'the dispose removed its own declaration')
+
+    // The identity-guarded disposal effect clears the module slot for THIS
+    // row (and only this row — a reload replaces the slot before this runs).
+    assert.equal(effects.length, role === 'host' ? 3 : 4)
+    effects[0]()
+    assert.equal(index.getBridgeRegistry(), undefined, `the ${role} row disposal cleared the module slot`)
+  }
+})
+
+test('PB-1: a row reload swaps in a NEW registry; the old row disposal cannot clear it', async () => {
+  const index = await import(INDEX_URL)
+  const first = makeCtx()
+  index.apply(first.ctx, {})
+  const firstRegistry = index.getBridgeRegistry()
+
+  // The reload: a fresh apply installs its registry BEFORE the old row's
+  // disposal effect runs (cordis disposes the old fiber after applying the
+  // new one) — the identity guard then must NOT clear the new slot.
+  const second = makeCtx()
+  index.apply(second.ctx, {})
+  const secondRegistry = index.getBridgeRegistry()
+  assert.notEqual(firstRegistry, secondRegistry, 'a new apply built a new registry')
+  first.effects[0]()
+  assert.equal(index.getBridgeRegistry(), secondRegistry, 'the OLD disposal left the NEW slot alone')
+  second.effects[0]()
+  assert.equal(index.getBridgeRegistry(), undefined, 'and its own disposal still clears it')
+})
+
 // ---- T17: live volatile reads, restart watcher, admission walls ---------------
+
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
