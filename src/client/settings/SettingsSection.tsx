@@ -35,7 +35,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import { Button, SettingsForm, SettingsValueField } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, SettingsForm, SettingsValueField, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SettingsFormLabels } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   ADMIN_ACTION_ROUTE,
@@ -966,16 +966,16 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                     </div>
                     {row.hasServerScope ? (
                       <>
-                        <label className="zr-settings-field">
-                          <input
-                            type="checkbox"
+                        <div className="zr-settings-head">
+                          <label>{t('settings.bridge.consentToggle')}</label>
+                          <Switch
                             checked={current[row.plugin] === true}
-                            onChange={(event) => {
-                              config.stage('pluginBridgeConsent', JSON.stringify(togglePluginConsent(current, row.plugin, event.target.checked)))
+                            onChange={(checked) => {
+                              config.stage('pluginBridgeConsent', JSON.stringify(togglePluginConsent(current, row.plugin, checked)))
                             }}
+                            label={t('settings.bridge.consentToggle')}
                           />
-                          {' '}{t('settings.bridge.consentToggle')}
-                        </label>
+                        </div>
                         <p className="zr-settings-hint">{t('settings.bridge.consentHint')}</p>
                       </>
                     ) : (
