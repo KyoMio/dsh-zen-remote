@@ -363,46 +363,49 @@ test('PB-12 client: the three response rewrites — session.cwd, subagents.live 
   const handle = await installedIntercept(host, relay, adapter)
   try {
     // session.cwd echoes the request's sessionId (lib/index.js:6327).
+    // Every /sidebar/api success rides writeOk's {ok:true, value} envelope
+    // (lib/index.js:889-896) — the fakes below use the REAL wire shape
+    // (2026-10-13 fix: the adapter used to miss the id inside the envelope).
     relay.answer('/sidebar/api/session.cwd', {
       status: 200, headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'session-a', cwd: '/srv/proj', root: 'proj', parent: null }),
+      body: JSON.stringify({ ok: true, value: { sessionId: 'session-a', cwd: '/srv/proj', root: 'proj', parent: null } }),
     })
     const cwd = await host.get('/sidebar/api/session.cwd', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: virtual('session-a') }),
     })
-    assert.deepEqual(await cwd.json(), { sessionId: virtual('session-a'), cwd: '/srv/proj', root: 'proj', parent: null })
+    assert.deepEqual(await cwd.json(), { ok: true, value: { sessionId: virtual('session-a'), cwd: '/srv/proj', root: 'proj', parent: null } }, 'the envelope survives, the id inside is VIRTUAL')
 
     // subagents.live keys the map BY session id (lib/index.js:4513).
     relay.answer('/sidebar/api/subagents.live', {
       status: 200, headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ live: { 'session-a': { running: true }, 'session-child': { text: 'hi' } } }),
+      body: JSON.stringify({ ok: true, value: { live: { 'session-a': { running: true }, 'session-child': { text: 'hi' } } } }),
     })
     const live = await host.get('/sidebar/api/subagents.live', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ rootSessionId: virtual('session-a') }),
     })
     const liveBody = await live.json()
-    assert.deepEqual(Object.keys(liveBody.live).sort(), [virtual('session-child'), virtual('session-a')].sort(), 'every key came back VIRTUAL')
+    assert.deepEqual(Object.keys(liveBody.value.live).sort(), [virtual('session-child'), virtual('session-a')].sort(), 'every key came back VIRTUAL')
 
     // workflows.list rows carry originSessionId + members[].childId
     // (lib/index.js:4666, 4686).
     relay.answer('/sidebar/api/workflows.list', {
       status: 200, headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
+      body: JSON.stringify({ ok: true, value: {
         runs: [{
           runId: 'r1', originSessionId: 'session-child', status: 'running',
           phases: [{ title: 'p', members: [{ seq: 1, label: '#1', childId: 'session-grandchild' }] }],
         }],
-      }),
+      } }),
     })
     const workflows = await host.get('/sidebar/api/workflows.list', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ rootSessionId: virtual('session-a') }),
     })
     const workflowsBody = await workflows.json()
-    assert.equal(workflowsBody.runs[0].originSessionId, virtual('session-child'))
-    assert.equal(workflowsBody.runs[0].phases[0].members[0].childId, virtual('session-grandchild'))
+    assert.equal(workflowsBody.value.runs[0].originSessionId, virtual('session-child'))
+    assert.equal(workflowsBody.value.runs[0].phases[0].members[0].childId, virtual('session-grandchild'))
 
     // teams.taskCreate is NOT rewritten (its answer carries no session id).
     relay.answer('/sidebar/api/teams.taskCreate', {
@@ -564,16 +567,18 @@ test('PB-13 sidechat loop: start forwards and virtualizes the childId; prompt ta
   const relay = fakeRelayClient()
   const { adapter } = await loadAdapter()
   const handle = await installedIntercept(host, relay, adapter)
+  // The REAL wire shape: writeOk wraps every /sidebar/api success in
+  // {ok:true, value} — the 2026-10-13 regression this test pins.
   relay.answer('/sidebar/api/sidechat.start', {
     status: 200, headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ childId: 'session-child-1' }),
+    body: JSON.stringify({ ok: true, value: { childId: 'session-child-1' } }),
   })
   try {
     const start = await host.get('/sidebar/api/sidechat.start', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: virtual('session-a'), question: 'what changed?' }),
     })
-    assert.deepEqual(await start.json(), { childId: virtual('session-child-1') }, 'the REAL child id came back VIRTUAL')
+    assert.deepEqual(await start.json(), { ok: true, value: { childId: virtual('session-child-1') } }, 'the REAL child id came back VIRTUAL inside the envelope')
 
     await host.get('/sidebar/api/sidechat.prompt', {
       method: 'POST', headers: { 'content-type': 'application/json' },

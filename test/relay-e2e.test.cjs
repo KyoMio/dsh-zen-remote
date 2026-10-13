@@ -2719,7 +2719,8 @@ test('e2e PB-13: fs-watch speaks through the tunnel both ways and agent-opens pu
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
         dshState.sidechatStarts.push(body)
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ childId: 'session-child-9' }))
+        // The REAL wire shape: writeOk wraps the handler result.
+        res.end(JSON.stringify({ ok: true, value: { childId: 'session-child-9' } }))
       })
       return
     }
@@ -2737,7 +2738,7 @@ test('e2e PB-13: fs-watch speaks through the tunnel both ways and agent-opens pu
 
   const ADAPTER_INPUT = {
     plugin: 'dsh-better-sidebar', versions: ['0.25.0'],
-    client: { response: (ctx) => (ctx.pathname === '/sidebar/api/sidechat.start' && ctx.body !== null && typeof ctx.body === 'object' && typeof ctx.body.childId === 'string' && !ctx.isVirtual(ctx.body.childId) ? { ...ctx.body, childId: ctx.virtualize(ctx.body.childId) } : ctx.body) },
+    client: { response: (ctx) => (ctx.pathname === '/sidebar/api/sidechat.start' && ctx.body !== null && typeof ctx.body === 'object' && ctx.body.ok === true && ctx.body.value !== null && typeof ctx.body.value === 'object' && typeof ctx.body.value.childId === 'string' && !ctx.isVirtual(ctx.body.value.childId) ? { ...ctx.body, value: { ...ctx.body.value, childId: ctx.virtualize(ctx.body.value.childId) } } : ctx.body) },
     routes: [
       { path: '/sidebar/api', match: 'prefix', methods: ['POST'], maxBody: 1024 * 1024, locator: { in: 'json-body', fields: ['sessionId', 'rootSessionId', 'childId'] } },
       { path: '/sidebar/ws/agent-opens', match: 'exact', methods: ['GET'], upgrade: true, locator: { in: 'query', name: 'sessionId' } },
@@ -2872,7 +2873,7 @@ test('e2e PB-13: fs-watch speaks through the tunnel both ways and agent-opens pu
       body: JSON.stringify({ sessionId: virtual, question: 'what changed?' }),
     })
     assert.equal(start.status, 200)
-    assert.deepEqual(await start.json(), { childId: toVirtual(info.serverId, 'session-child-9') }, 'the child id came back VIRTUAL')
+    assert.deepEqual(await start.json(), { ok: true, value: { childId: toVirtual(info.serverId, 'session-child-9') } }, 'the child id came back VIRTUAL inside the envelope')
     assert.deepEqual(dshState.sidechatStarts, [{ sessionId: 'session-a', question: 'what changed?' }], 'the plugin saw the REAL ids')
   } finally {
     handle.uninstall()
