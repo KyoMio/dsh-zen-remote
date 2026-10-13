@@ -38,7 +38,7 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 import { readFileConfig, resolveConfig, unwrapVolatile } from './config.js'
-import { createActivityTracker, createParentIndex, startSweeper } from './activity.js'
+import { createActivityTracker, createParentIndex, seedParentIndexFromSnapshots, startSweeper, type PersistedSessionSnapshot } from './activity.js'
 import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
 import type { SessionQueryLike } from './admin-routes.js'
 import { normalizedRowServerUrl } from './client-pairing.js'
@@ -657,6 +657,32 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       const agents = (agentsCtx as Context & { agents: { list(): readonly AgentStatusLike[] } }).agents
       restoreBusy(store, () => agents.list())
     })
+    // Restart repair (2026-10-13): the parent index rebuilds only from LIVE
+    // session/event traffic, so after a host restart every already-stored
+    // sidechat / subagent child lost its parent link and the relay answered
+    // `not-shared` for a session whose share it used to inherit through the
+    // ancestor chain. Seed the index once from the persistence service's
+    // snapshot list — headers only, event logs are never read.
+    try {
+      ctx.inject(['sessionPersistence'], (persistenceCtx) => {
+        const persistence = (persistenceCtx as Context & {
+          sessionPersistence?: { list(): Promise<readonly PersistedSessionSnapshot[]> } | undefined
+        }).sessionPersistence
+        if (persistence === undefined) {
+          ctx.logger.warn('dsh-zen-remote: no sessionPersistence service — pre-restart subagent sessions stay not-shared until they emit an event')
+          return
+        }
+        void persistence
+          .list()
+          .then((snapshots) => {
+            const recorded = seedParentIndexFromSnapshots(parentIndex, snapshots)
+            if (recorded > 0) ctx.logger.info?.('dsh-zen-remote: restored %d persisted parent links', recorded)
+          })
+          .catch((error: unknown) => ctx.logger.warn('dsh-zen-remote cannot seed parent links from persisted sessions: %s', message(error)))
+      })
+    } catch (error) {
+      ctx.logger.warn('dsh-zen-remote cannot listen on "sessionPersistence": %s', message(error))
+    }
     // Settings-surface admin routes (T14). The browser cannot call the
     // gateway's loopback-only admin API from DSH's origin, so the host
     // process re-exposes it same-origin and the handler calls the gateway AS
