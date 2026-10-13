@@ -319,7 +319,7 @@ In depth: [interface](docs/interface.md) · [public access + relay protocol](doc
 
 Three layers, strictest first:
 
-1. **Relay protocol version** must match — in practice, **both ends need zen-remote 2.0.x**. A 1.x server's gateway doesn't know the client's bearer token and answers its requests with the generic pairing wall, which the client reports as "token invalid (or the server's zen-remote is older than 2.0.0)". DSH versions may differ.
+1. **Relay protocol version** must match — in practice, **both ends need the same zen-remote version**. A 1.x server's gateway doesn't know the client's bearer token and answers its requests with the generic pairing wall, which the client reports as "token invalid (or the server's zen-remote is older than 2.0.0)". DSH versions may differ.
 2. **DSH interface fingerprints** decide the rest: both ends compute normalized fingerprints of the remote-interface groups the relay uses and compare them at handshake. Identical is fully compatible even when version strings differ; a difference connects anyway, annotates the remote group "（版本有差异）" (version differs), lists the differing groups in the settings diagnostics, and degrades only the affected panels.
 3. **Runtime degradation**: a forwarded call that fails parameter/result validation shows "incompatible with the server version" in that one panel and is recorded in the diagnostics — everything else keeps working.
 
@@ -343,7 +343,7 @@ What a paired device is trusted with, stated plainly:
 - The host truncates @-mention candidates to the **first 50 rows before** share-filtering: on a server with many sessions, a shared one may be missing from the candidate list (the reference check itself is unaffected — references you type out are still verified one by one).
 - A third-party plugin's own endpoints work in remote sessions only through the [plugin bridge](docs/plugin-bridge.md): cooperative plugins register themselves, third-party plugins are covered by built-in adapters. A plugin with neither has its panels degraded or hidden in remote sessions (its **tools** still run on the server, unaffected).
 - With [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) installed, remote sessions have TWO treatments: exactly **0.25.0** is bridged by zen-remote's built-in adapter — its file / git / task panels read and write the SERVER's data in a remote session (consent required, see the security boundary doc). Any OTHER version keeps the hide-local-surfaces treatment: its surfaces are hidden in remote sessions because they would read and write the **client machine's own** files; and because 0.19+ takes over the host's "Files" tab, an unbridged remote session has no sidebar file browser for now; file links in chat or deliverables open an empty right column in a remote session.
-- Both ends need zen-remote **2.0.x** (identical relay protocol version). DSH versions may differ; interface differences are annotated "（版本有差异）".
+- Both ends need the **same zen-remote version** (identical relay protocol version). DSH versions may differ; interface differences are annotated "（版本有差异）".
 
 ---
 
