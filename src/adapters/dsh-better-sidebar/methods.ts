@@ -25,12 +25,34 @@
  * （lib/index.js:3479-3485）——都不带会话 id。这四类不改写。
  * `sidechat.start` 返回 `{childId}`（lib/index.js:5050）——PB-13 起
  * 虚拟化（子客户端拿它发后续调用）。
+ *
+ * 信封：`/sidebar/api` 的成功响应**全部**是 `{ok:true, value:<handler
+ * 返回值>}`（lib/index.js:889-896 的 `writeOk`），上面引用的行号都是
+ * handler 层、不是线上形状——响应改写器一律经 `rewriteEnveloped` 先剥
+ * 信封再改写再包回去（2026-10-13 修复：sidechat.start 的 childId 曾在
+ * 顶层找不到而漏虚拟化，浏览器拿真实 id 发后续调用被判本地、落到子
+ * 客户端本机报 session not found）。
  */
 
 /** 响应改写器的上下文（框架的 AdapterResponseContext 的结构性子集）。 */
 export interface SidebarRewriteContext {
   virtualize(id: string): string
   isVirtual(value: unknown): boolean
+}
+
+/** 改写信封内的 value（信封外层的 ok 等字段原样保留）。 */
+type SidebarInnerRewrite = (value: unknown, ctx: SidebarRewriteContext) => unknown
+
+/** 剥 `{ok:true, value}` 信封 → 改写 value → 包回去；无信封原样改写。
+ *  `writeOk`（lib/index.js:889）给每个 /sidebar/api 成功响应都包了这层。 */
+function rewriteEnveloped(body: unknown, inner: SidebarInnerRewrite, ctx: SidebarRewriteContext): unknown {
+  if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
+    const record = body as Record<string, unknown>
+    if (record.ok === true && record.value !== null && typeof record.value === 'object' && !Array.isArray(record.value)) {
+      return { ...record, value: inner(record.value, ctx) }
+    }
+  }
+  return inner(body, ctx)
 }
 
 /** 一个 `/sidebar/api` 方法的处置。 */
@@ -56,7 +78,7 @@ export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
     kind: 'read',
     sessionField: 'sessionId',
     // 请求的 sessionId 原样回显（lib/index.js:6327）。
-    rewrite: (body, ctx) => rewriteTopLevel(body, 'sessionId', ctx),
+    rewrite: (body, ctx) => rewriteEnveloped(body, (v) => rewriteTopLevel(v, 'sessionId', ctx), ctx),
   },
 
   // ---- 文件（lib/index.js:6334-6442）----
@@ -104,30 +126,13 @@ export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
     kind: 'read',
     sessionField: 'rootSessionId',
     // 响应的 live 映射以会话 id 为键（lib/index.js:4513）。
-    rewrite: (body, ctx) => {
-      if (body === null || typeof body !== 'object' || Array.isArray(body)) return body
-      const live = (body as Record<string, unknown>).live
-      if (live === null || typeof live !== 'object' || Array.isArray(live)) return body
-      const rewritten: Record<string, unknown> = {}
-      for (const [id, view] of Object.entries(live as Record<string, unknown>)) {
-        rewritten[ctx.isVirtual(id) ? id : ctx.virtualize(id)] = view
-      }
-      return { ...(body as Record<string, unknown>), live: rewritten }
-    },
+    rewrite: (body, ctx) => rewriteEnveloped(body, rewriteLiveKeys, ctx),
   },
   'workflows.list': {
     kind: 'read',
     sessionField: 'rootSessionId',
     // 每行的 originSessionId（4666）与 members[].childId（4686）。
-    rewrite: (body, ctx) => {
-      if (body === null || typeof body !== 'object' || Array.isArray(body)) return body
-      const runs = (body as Record<string, unknown>).runs
-      if (!Array.isArray(runs)) return body
-      return {
-        ...(body as Record<string, unknown>),
-        runs: runs.map((run) => rewriteWorkflowRun(run, ctx)),
-      }
-    },
+    rewrite: (body, ctx) => rewriteEnveloped(body, rewriteWorkflowsBody, ctx),
   },
   // 响应是 {ok, value:<任务记录>}，不带会话 id —— 不改写。
   'teams.taskCreate': forward('write', 'rootSessionId'),
@@ -157,8 +162,9 @@ export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
   'sidechat.start': {
     kind: 'write',
     sessionField: 'sessionId',
-    // 响应 `{ childId }`（lib/index.js:5050）——服务端真实 id 换虚拟。
-    rewrite: (body, ctx) => rewriteTopLevel(body, 'childId', ctx),
+    // 响应 `{ childId }`（lib/index.js:5050，外面还有 writeOk 信封）——
+    // 服务端真实 id 换虚拟。
+    rewrite: (body, ctx) => rewriteEnveloped(body, (v) => rewriteTopLevel(v, 'childId', ctx), ctx),
   },
   'sidechat.prompt': forward('write', 'childId'),
   'sidechat.cancel': forward('write', 'childId'),
@@ -185,6 +191,29 @@ function rewriteTopLevel(body: unknown, field: string, ctx: SidebarRewriteContex
   const value = record[field]
   if (typeof value !== 'string' || value === '' || ctx.isVirtual(value)) return body
   return { ...record, [field]: ctx.virtualize(value) }
+}
+
+/** subagents.live 的 value（信封内）：live 映射的键是会话 id。 */
+function rewriteLiveKeys(value: unknown, ctx: SidebarRewriteContext): unknown {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return value
+  const live = (value as Record<string, unknown>).live
+  if (live === null || typeof live !== 'object' || Array.isArray(live)) return value
+  const rewritten: Record<string, unknown> = {}
+  for (const [id, view] of Object.entries(live as Record<string, unknown>)) {
+    rewritten[ctx.isVirtual(id) ? id : ctx.virtualize(id)] = view
+  }
+  return { ...(value as Record<string, unknown>), live: rewritten }
+}
+
+/** workflows.list 的 value（信封内）：runs[].originSessionId 等。 */
+function rewriteWorkflowsBody(value: unknown, ctx: SidebarRewriteContext): unknown {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return value
+  const runs = (value as Record<string, unknown>).runs
+  if (!Array.isArray(runs)) return value
+  return {
+    ...(value as Record<string, unknown>),
+    runs: runs.map((run) => rewriteWorkflowRun(run, ctx)),
+  }
 }
 
 /** 一行工作流运行的改写（originSessionId + phases[].members[].childId）。 */

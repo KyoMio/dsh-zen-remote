@@ -25,6 +25,13 @@
  * （lib/index.js:3479-3485）——都不带会话 id。这四类不改写。
  * `sidechat.start` 返回 `{childId}`（lib/index.js:5050）——PB-13 起
  * 虚拟化（子客户端拿它发后续调用）。
+ *
+ * 信封：`/sidebar/api` 的成功响应**全部**是 `{ok:true, value:<handler
+ * 返回值>}`（lib/index.js:889-896 的 `writeOk`），上面引用的行号都是
+ * handler 层、不是线上形状——响应改写器一律经 `rewriteEnveloped` 先剥
+ * 信封再改写再包回去（2026-10-13 修复：sidechat.start 的 childId 曾在
+ * 顶层找不到而漏虚拟化，浏览器拿真实 id 发后续调用被判本地、落到子
+ * 客户端本机报 session not found）。
  */
 /** 响应改写器的上下文（框架的 AdapterResponseContext 的结构性子集）。 */
 export interface SidebarRewriteContext {
