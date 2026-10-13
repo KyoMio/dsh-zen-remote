@@ -62,6 +62,28 @@ export interface ParentIndex {
  * is nothing to persist and nothing to invalidate.
  */
 export declare function createParentIndex(): ParentIndex;
+/** One persisted-session snapshot as `SessionPersistence.list()` hands it
+ * back: the detached header is all the parent index needs (`id`,
+ * `origin: 'subagent'`, `parentSession` — dsh-session's SessionHeader).
+ * Structural on purpose: the service's full snapshot carries revision and
+ * sizes we do not care about. */
+export interface PersistedSessionSnapshot {
+    header?: {
+        id?: unknown;
+        origin?: unknown;
+        parentSession?: unknown;
+    } | undefined;
+}
+/**
+ * Seed a parent index from persisted-session snapshots (2026-10-13 fix):
+ * the index otherwise rebuilds only from LIVE `session/event` traffic, so
+ * after a host restart every already-stored sidechat / subagent child lost
+ * its parent link and the relay answered `not-shared` for sessions whose
+ * share it used to inherit. Feeding `SessionPersistence.list()`'s snapshots
+ * through `observe` restores the chain; it reads headers only, never event
+ * logs. Returns how many parent links the pass recorded.
+ */
+export declare function seedParentIndexFromSnapshots(index: ParentIndex, snapshots: readonly PersistedSessionSnapshot[]): number;
 /** Duck-typed timer halves: Node's setInterval/clearInterval at runtime,
  * fakes in tests. Loose on purpose — the real NodeJS.Timeout type would
  * fight the contravariant `clearInterval` parameter under strictFunctionTypes. */

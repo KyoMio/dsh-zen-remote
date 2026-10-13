@@ -23,11 +23,12 @@ const T0 = 1_750_000_000_000
 
 let createActivityTracker
 let createParentIndex
+let seedParentIndexFromSnapshots
 let startSweeper
 let createShareStore
 
 before(async () => {
-  ;({ createActivityTracker, createParentIndex, startSweeper } = await import(ACTIVITY_URL))
+  ;({ createActivityTracker, createParentIndex, seedParentIndexFromSnapshots, startSweeper } = await import(ACTIVITY_URL))
   ;({ createShareStore } = await import(STORE_URL))
 })
 
@@ -145,6 +146,30 @@ test('parentIndex records subagent links and answers parentOf; everything else s
   assert.equal(index.parentOf('bad'), undefined)
   assert.equal(index.parentOf('self'), undefined)
   assert.equal(index.parentOf('nobody'), undefined, 'unobserved sessions have no parent')
+})
+
+test('seedParentIndexFromSnapshots restores persisted links after a restart (2026-10-13 fix)', () => {
+  const index = createParentIndex()
+  // SessionPersistence.list() snapshots: header only, no top-level id —
+  // the shape the restart seeding in index.ts feeds through this pass.
+  const snapshots = [
+    { header: { id: 'kid-sidechat', origin: 'subagent', parentSession: 'top' } },
+    { header: { id: 'plain', cwd: '/x' } }, // top-level: no link
+    { header: { origin: 'subagent', parentSession: 'top' } }, // id-less
+    { header: { id: 'bad', origin: 'subagent', parentSession: 7 } }, // garbage parent
+    'not-even-an-object',
+  ]
+  const fresh = createParentIndex()
+  const recorded = seedParentIndexFromSnapshots(fresh, snapshots)
+  assert.equal(recorded, 1, 'exactly the one honest link was recorded')
+  assert.equal(fresh.parentOf('kid-sidechat'), 'top')
+  assert.equal(fresh.parentOf('plain'), undefined)
+  assert.equal(fresh.parentOf('bad'), undefined)
+
+  // An already-known id does not double-count (a re-seed over a live index).
+  const again = seedParentIndexFromSnapshots(fresh, snapshots)
+  assert.equal(again, 0, 'the second pass over the same snapshots records nothing new')
+  assert.equal(fresh.parentOf('kid-sidechat'), 'top')
 })
 
 test('a subagent event refreshes the parent clock but never its busy flag', (t) => {
