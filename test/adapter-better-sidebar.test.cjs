@@ -1,10 +1,11 @@
-/* dsh-zen-remote · the better-sidebar adapter (PB-12)
+/* dsh-zen-remote · the better-sidebar adapter (PB-12, widened to 0.26.0 by PB-15)
  *
  * Drives the BUILT lib/adapters/* + the framework halves over real
  * sockets. Layers:
  *  1. the METHOD TABLE vs the plugin's OWN source: every method name the
- *     0.25.0 build dispatches must appear in the table (skip with a note
- *     when /tmp/bs-versions/0.25.0 is not on this machine);
+ *     0.25.0 AND 0.26.0 builds dispatch must appear in the table — the
+ *     table must cover exactly the union (skip with a note when
+ *     /tmp/bs-versions/ is not on this machine);
  *  2. the client half over a fake host + fake relay: one read, one write,
  *     a rootSessionId call, settings staying local, open.external and
  *     sidechat refusing, an unknown method refusing, cwd stripped from the
@@ -22,7 +23,10 @@ const http = require('node:http')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 
-const PLUGIN_SOURCE = '/tmp/bs-versions/0.25.0/lib/index.js'
+const PLUGIN_SOURCES = [
+  '/tmp/bs-versions/0.25.0/lib/index.js',
+  '/tmp/bs-versions/0.26.0/lib/index.js',
+]
 
 /** Scratch space for the server-side share store — OUTSIDE the repository
  * (a store file in the repo root once landed in the commit staging by
@@ -37,33 +41,76 @@ const virtual = (id) => `zr~${SERVER_ID}~${id}`
 
 // ---- 1. the method table vs the plugin's own source ---------------------------
 
-test('PB-12 table: every method the 0.25.0 source dispatches is in the table', async () => {
+test('PB-12/PB-15 table: every method the 0.25.0+0.26.0 sources dispatch is in the table (exactly the union)', async () => {
   const adapterMod = await importLib('adapters/dsh-better-sidebar/methods.js')
-  let source
-  try {
-    source = fs.readFileSync(PLUGIN_SOURCE, 'utf8')
-  } catch {
-    test.skip(`the plugin source is not on this machine (${PLUGIN_SOURCE}); the table-vs-source comparison is skipped`)
+  const absent = PLUGIN_SOURCES.filter((sourcePath) => !fs.existsSync(sourcePath))
+  if (absent.length > 0) {
+    test.skip(`plugin sources are not on this machine (${absent.join(', ')}); the table-vs-source comparison is skipped`)
     return
   }
-  // The dispatcher's own method names: every `"x.y": async (payload) =>`
-  // entry of buildApi's table (lib/index.js:6319-6688), the sidechat
-  // builder's keys (lib/index.js:4971-5140), and the spread of
-  // buildSidechatApi into the table (lib/index.js:6687).
+  // The dispatcher's own method names, extracted from BOTH builds and
+  // unioned: every `"x.y": async (payload) =>` entry of buildApi's table
+  // (0.25.0 lib/index.js:6319-6688; 0.26.0 grows fs.readPage and the
+  // sidechat trio, and drops fs.write to the /sidebar/write route), the
+  // sidechat builder's keys, and the spread of buildSidechatApi into the
+  // table.
   const names = new Set()
-  for (const match of source.matchAll(/"([a-zA-Z]+\.[a-zA-Z-]+)":\s*(?:async\s*)?\(/g)) {
-    names.add(match[1])
+  for (const sourcePath of PLUGIN_SOURCES) {
+    const source = fs.readFileSync(sourcePath, 'utf8')
+    for (const match of source.matchAll(/"([a-zA-Z]+\.[a-zA-Z-]+)":\s*(?:async\s*)?\(/g)) {
+      names.add(match[1])
+    }
   }
   // Restrict to the sidebar namespaces (the same regex catches unrelated
   // object tables elsewhere in the bundle).
   const sidebarNames = [...names].filter((name) => /^(session|fs|git|changes|subagents|workflows|teams|settings|open|archive|sidechat)\./.test(name))
-  assert.ok(sidebarNames.length >= 40, `the extraction found the table (${sidebarNames.length} names)`)
+  assert.ok(sidebarNames.length >= 45, `the extraction found the union table (${sidebarNames.length} names)`)
   const missing = sidebarNames.filter((name) => adapterMod.SIDEBAR_METHODS[name] === undefined)
   assert.deepEqual(missing, [], `methods the plugin dispatches but the table lacks: ${missing.join(', ')}`)
-  // And the reverse direction: a table entry the plugin no longer has is a
-  // dead row (harmless but worth noticing).
+  // And the reverse direction: a table entry NEITHER build dispatches any
+  // more is a dead row (harmless but worth noticing). fs.write stays: it
+  // rode the 0.25.0 JSON api and the table must keep serving 0.25.0 hosts.
   const extra = Object.keys(adapterMod.SIDEBAR_METHODS).filter((name) => !names.has(name))
-  assert.deepEqual(extra, [], `table entries the 0.25.0 source does not dispatch: ${extra.join(', ')}`)
+  assert.deepEqual(extra, [], `table entries neither source dispatches: ${extra.join(', ')}`)
+})
+
+test('PB-15: the 0.26.0 additions carry the right dispositions; both versions normalize; /sidebar/write is declared', async () => {
+  const adapterMod = await importLib('adapters/dsh-better-sidebar/methods.js')
+  const specOf = (name) => adapterMod.SIDEBAR_METHODS[name]
+  // fs.readPage: a paged read, session-scoped like the fs.read family
+  // (0.26.0 lib/index.js:7332-7338) — no rewrite (the answer is file text).
+  assert.deepEqual({ ...specOf('fs.readPage') }, { kind: 'read', sessionField: 'sessionId' })
+  // sidechat.dequeue / sidechat.model: child-scoped writes
+  // (0.26.0 lib/index.js:6206, 6229).
+  assert.deepEqual({ ...specOf('sidechat.dequeue') }, { kind: 'write', sessionField: 'childId' })
+  assert.deepEqual({ ...specOf('sidechat.model') }, { kind: 'write', sessionField: 'childId' })
+  // sidechat.models: the model catalog, NO session field → local, the
+  // settings.* precedent (0.26.0 lib/index.js:6228).
+  assert.deepEqual({ ...specOf('sidechat.models') }, { kind: 'read', local: true })
+
+  // Both versions register: normalizeAdapter refuses an installed version
+  // outside `versions`, so each list entry must normalize clean.
+  const { adapter } = await loadAdapter()
+  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0'])
+  for (const version of ['0.25.0', '0.26.0']) {
+    const core = await importLib('plugin-adapter-core.js')
+    const adaptersMod = await importLib('adapters/index.js')
+    const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
+    const normalized = core.normalizeAdapter(raw, version)
+    assert.equal(normalized.plugin, 'dsh-better-sidebar', `${version} normalizes`)
+  }
+
+  // The raw text-write route (0.26.0 lib/index.js:7875-7919): exact, POST,
+  // the session id rides the query, 10 MiB — headroom over the plugin's
+  // own 8 MiB WRITE_BODY_GUARD_BYTES, under the relay's 100 MiB.
+  const write = adapter.routes.find((route) => route.path === '/sidebar/write')
+  assert.ok(write !== undefined, '/sidebar/write is declared')
+  assert.equal(write.match, 'exact')
+  assert.deepEqual(write.methods, ['POST'])
+  assert.deepEqual(write.locator, { in: 'query', name: 'sessionId' })
+  assert.equal(write.maxBody, 10 * 1024 * 1024)
+  assert.equal(write.local, false, 'it forwards — that is its whole point')
+  assert.equal(write.upgrade, false)
 })
 
 // ---- shared fixtures -----------------------------------------------------------
@@ -526,6 +573,16 @@ test('PB-12 server: the cwd is stripped from the api body AND the file/upload qu
     assert.equal(upload.status, 200)
     assert.equal(loopbackHits.length, 3)
     assert.equal(loopbackHits[2].query.includes('cwd='), false)
+
+    // The raw text-write route (0.26.0's /sidebar/write): same strip, the
+    // text body crossing verbatim (PB-15).
+    const write = await server.pluginPost('/sidebar/write', `sessionId=session-a&path=notes.md&cwd=${encodeURIComponent('/leaked')}`, { body: 'the document text' })
+    assert.equal(write.status, 200)
+    assert.equal(loopbackHits.length, 4)
+    assert.equal(loopbackHits[3].query.includes('cwd='), false, 'the write route\u2019s query cwd was stripped')
+    assert.ok(loopbackHits[3].query.includes('sessionId=session-a'))
+    assert.ok(loopbackHits[3].query.includes('path=notes.md'))
+    assert.equal(loopbackHits[3].body, 'the document text', 'the text body arrived verbatim')
   } finally {
     await server.stop()
   }

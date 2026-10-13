@@ -1,10 +1,19 @@
 /**
- * better-sidebar 0.25.0 的 `/sidebar/api` 方法表（PB-12）——适配器唯一
- * 认识的接口清单，逐条对着 `/tmp/bs-versions/0.25.0/lib/index.js` 复核
- * （行号见各条注释，以 0.25.0 的构建产物为准）。表里没有的方法在远程
- * 会话里一律拒绝（reason `adapter-method-unknown`）：宁可少转发，不可
- * 误转发——`test/adapter-better-sidebar.test.cjs` 会把源码里的实际方法
- * 名集合提取出来与这张表逐一比对，防止插件升级后漏记。
+ * better-sidebar 0.25.0 + 0.26.0 的 `/sidebar/api` 方法表（PB-12/PB-15）
+ * ——适配器唯一认识的接口清单，逐条对着 `/tmp/bs-versions/{0.25.0,
+ * 0.26.0}/lib/index.js` 复核（行号见各条注释，未标版本的一律以 0.25.0
+ * 的构建产物为准；0.26.0 是 0.25.0 的 JSON-api 超集，除下述三处外形状
+ * 不变）。表里没有的方法在远程会话里一律拒绝（reason
+ * `adapter-method-unknown`）：宁可少转发，不可误转发——
+ * `test/adapter-better-sidebar.test.cjs` 会把两版源码里的实际方法名集合
+ * 提取出来求并集，与这张表逐一比对，防止插件升级后漏记。
+ *
+ * 0.26.0 相对 0.25.0 的差异（本表如何覆盖两版）：
+ *  - 新增 `fs.readPage` 与 sidechat 的 `dequeue`/`model`/`models` 三个；
+ *  - `fs.write` 从 JSON api 移除，改走新的 `/sidebar/write` HTTP 路由
+ *    （内容作纯文本 POST 体，见 index.ts 的路由条目）。表里保留
+ *    `fs.write`：0.25.0 的宿主仍从 JSON api 派发它；0.26.0 的客户端
+ *    不再调它，登记无害。
  *
  * 会话字段：绝大多数方法在 JSON 体顶层带 `sessionId`（client.js 的
  * scopePayload，lib/client.js:3866）；子代理与工作流面板带
@@ -49,7 +58,7 @@ export interface SidebarMethodSpec {
     /** 响应改写器：把响应里的真实会话 id 换回虚拟 id。 */
     rewrite?: (body: unknown, ctx: SidebarRewriteContext) => unknown;
 }
-/** 0.25.0 的全部方法。 */
+/** 两版（0.25.0 + 0.26.0）方法名的并集，各条目的处置见上。 */
 export declare const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>>;
 /** `/sidebar/api` 的路径前缀（方法名跟在后面，lib/index.js:6888）。 */
 export declare const SIDEBAR_API_PREFIX = "/sidebar/api/";
