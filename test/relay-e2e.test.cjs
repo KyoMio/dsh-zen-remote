@@ -2522,6 +2522,21 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
       res.end('<html><body>preview</body></html>')
       return
     }
+    // The raw text-write route (PB-15, 0.26.0 lib/index.js:7875-7919):
+    // POST, the session id + path + cwd ride the QUERY, the body is the
+    // plain document text, and the answer rides writeOk's {ok:true, value}
+    // envelope — the fake uses the REAL wire shape (the 2026-10-13 lesson:
+    // never copy the handler's bare return value).
+    if (url.pathname === '/sidebar/write') {
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        dshHits.push({ path: url.pathname, query: url.searchParams, body: Buffer.concat(chunks).toString('utf8') })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, value: { ok: true, path: url.searchParams.get('path') } }))
+      })
+      return
+    }
     res.writeHead(404)
     res.end()
   })
@@ -2530,15 +2545,26 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
   const dshStop = () => new Promise((done) => { fakeDsh.closeAllConnections(); fakeDsh.close(done) })
 
   const ADAPTER_INPUT = {
-    plugin: 'dsh-better-sidebar', versions: ['0.25.0'],
+    plugin: 'dsh-better-sidebar', versions: ['0.25.0', '0.26.0'],
     routes: [
       { path: '/sidebar/api', match: 'prefix', methods: ['POST'], maxBody: 1024 * 1024, locator: { in: 'json-body', fields: ['sessionId', 'rootSessionId', 'childId'] } },
       { path: '/sidebar/file', match: 'exact', methods: ['GET'], locator: { in: 'query', name: 'sessionId' } },
+      { path: '/sidebar/write', match: 'exact', methods: ['POST'], maxBody: 10 * 1024 * 1024, locator: { in: 'query', name: 'sessionId' } },
       { path: '/sidebar/html', match: 'prefix', methods: ['GET'], locator: { in: 'path-segment', index: 0 } },
       { path: '/sidebar/bundle', match: 'prefix', methods: ['GET'], locator: { in: 'query', name: 'sessionId' }, local: true },
     ],
     server: {
       request: (ctx) => {
+        // The media/write routes: the client-supplied query cwd goes — a
+        // remote panel never steers the server by path (PB-15 adds write).
+        if (ctx.pathname === '/sidebar/file' || ctx.pathname === '/sidebar/write') {
+          if (ctx.query.get('cwd') !== null) {
+            const stripped = new URLSearchParams(ctx.query)
+            stripped.delete('cwd')
+            return { allow: true, query: stripped }
+          }
+          return { allow: true }
+        }
         if (ctx.body !== null && typeof ctx.body === 'object' && 'cwd' in ctx.body) {
           const stripped = { ...ctx.body }
           delete stripped.cwd
@@ -2640,15 +2666,30 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
     assert.equal((await html.text()).includes('preview'), true)
     assert.equal(dshHits[2].sessionId, 'session-a', 'the html segment arrived as the REAL id')
 
+    // RAW WRITE (PB-15, 0.26.0's /sidebar/write): the query id rewrites to
+    // REAL, the query cwd is stripped server-side, the text body crosses
+    // verbatim, and writeOk's envelope comes back untouched.
+    const raw = await fetch(`http://127.0.0.1:${subPort}/sidebar/write?sessionId=${encodeURIComponent(virtual)}&path=notes.md&cwd=${encodeURIComponent('/home/me/leaked')}`, {
+      method: 'POST', headers: { 'content-type': 'text/plain; charset=utf-8' },
+      body: 'the document text',
+    })
+    assert.equal(raw.status, 200, await raw.clone().text())
+    assert.deepEqual(await raw.json(), { ok: true, value: { ok: true, path: 'notes.md' } }, 'the envelope came back')
+    assert.equal(dshHits[3].path, '/sidebar/write')
+    assert.equal(dshHits[3].query.get('sessionId'), 'session-a', 'the query id arrived REAL')
+    assert.equal(dshHits[3].query.get('cwd'), null, 'the server hook stripped the query cwd')
+    assert.equal(dshHits[3].query.get('path'), 'notes.md')
+    assert.equal(dshHits[3].body, 'the document text', 'the text body crossed verbatim')
+
     // A drifted version (the plugin updated past the adapter's table)
-    // never bridges: the local registry carries 0.25.0, the server
-    // announces 0.26.0 — compareBridges reads version-mismatch, and the
+    // never bridges: the local registry carries 0.25.0/0.26.0, the server
+    // announces 0.27.0 — compareBridges reads version-mismatch, and the
     // request refuses with the uniform 503 instead of forwarding.
     const driftedRegistry = createBridgeRegistry()
     driftedRegistry.registerNormalized(adapter.declaration)
     const driftedStatus = compareBridges(
       driftedRegistry.list(),
-      { 'dsh-better-sidebar': { version: '0.26.0', digest: adapter.digest, serverScopeConsent: true } },
+      { 'dsh-better-sidebar': { version: '0.27.0', digest: adapter.digest, serverScopeConsent: true } },
       true,
     )
     assert.equal(driftedStatus[0].bridged, false)

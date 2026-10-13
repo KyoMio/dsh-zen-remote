@@ -1,10 +1,19 @@
 /**
- * better-sidebar 0.25.0 的 `/sidebar/api` 方法表（PB-12）——适配器唯一
- * 认识的接口清单，逐条对着 `/tmp/bs-versions/0.25.0/lib/index.js` 复核
- * （行号见各条注释，以 0.25.0 的构建产物为准）。表里没有的方法在远程
- * 会话里一律拒绝（reason `adapter-method-unknown`）：宁可少转发，不可
- * 误转发——`test/adapter-better-sidebar.test.cjs` 会把源码里的实际方法
- * 名集合提取出来与这张表逐一比对，防止插件升级后漏记。
+ * better-sidebar 0.25.0 + 0.26.0 的 `/sidebar/api` 方法表（PB-12/PB-15）
+ * ——适配器唯一认识的接口清单，逐条对着 `/tmp/bs-versions/{0.25.0,
+ * 0.26.0}/lib/index.js` 复核（行号见各条注释，未标版本的一律以 0.25.0
+ * 的构建产物为准；0.26.0 是 0.25.0 的 JSON-api 超集，除下述三处外形状
+ * 不变）。表里没有的方法在远程会话里一律拒绝（reason
+ * `adapter-method-unknown`）：宁可少转发，不可误转发——
+ * `test/adapter-better-sidebar.test.cjs` 会把两版源码里的实际方法名集合
+ * 提取出来求并集，与这张表逐一比对，防止插件升级后漏记。
+ *
+ * 0.26.0 相对 0.25.0 的差异（本表如何覆盖两版）：
+ *  - 新增 `fs.readPage` 与 sidechat 的 `dequeue`/`model`/`models` 三个；
+ *  - `fs.write` 从 JSON api 移除，改走新的 `/sidebar/write` HTTP 路由
+ *    （内容作纯文本 POST 体，见 index.ts 的路由条目）。表里保留
+ *    `fs.write`：0.25.0 的宿主仍从 JSON api 派发它；0.26.0 的客户端
+ *    不再调它，登记无害。
  *
  * 会话字段：绝大多数方法在 JSON 体顶层带 `sessionId`（client.js 的
  * scopePayload，lib/client.js:3866）；子代理与工作流面板带
@@ -70,7 +79,7 @@ export interface SidebarMethodSpec {
 /** 无改写的普通转发方法的简写工厂。 */
 const forward = (kind: 'read' | 'write', sessionField: 'sessionId' | 'rootSessionId' | 'childId' = 'sessionId'): SidebarMethodSpec => ({ kind, sessionField })
 
-/** 0.25.0 的全部方法。 */
+/** 两版（0.25.0 + 0.26.0）方法名的并集，各条目的处置见上。 */
 export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
   // ---- 会话（lib/index.js:6319-6333）----
   'session.phase': forward('read'),
@@ -86,6 +95,11 @@ export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
   'fs.trees': forward('read'),
   'fs.search': forward('read'),
   'fs.read': forward('read'),
+  // 分页读（0.26.0 lib/index.js:7332-7338）：payload 形状同 fs.read 加
+  // 顶层 `offset` 数字；响应是文件文本，不带会话 id —— 不改写。
+  'fs.readPage': forward('read'),
+  // 0.26.0 起从 JSON api 移除（写内容改走 /sidebar/write 路由，见
+  // index.ts）；保留给 0.25.0 的宿主——0.26.0 的客户端不再派发它。
   'fs.write': forward('write'),
   'fs.rename': forward('write'),
   'fs.mkdir': forward('write'),
@@ -171,6 +185,15 @@ export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
   'sidechat.dispose': forward('write', 'childId'),
   'sidechat.info': forward('read', 'childId'),
   'sidechat.events': forward('read', 'childId'),
+  // 撤回排队消息（0.26.0 lib/index.js:6206-6226）：childId 定位，可选
+  // `messageId`；响应 {accepted, removed} 不带会话 id —— 不改写。
+  'sidechat.dequeue': forward('write', 'childId'),
+  // 模型目录（0.26.0 lib/index.js:6228）：handler 不收 payload、无会话
+  // 字段 → local（settings.* 先例），登记只为「未知方法」比对。
+  'sidechat.models': { kind: 'read', local: true },
+  // 给线程切模型（0.26.0 lib/index.js:6229-6245）：childId 定位；响应
+  // {accepted, selection} 不带会话 id —— 不改写。
+  'sidechat.model': forward('write', 'childId'),
 }
 
 /** `/sidebar/api` 的路径前缀（方法名跟在后面，lib/index.js:6888）。 */
