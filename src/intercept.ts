@@ -80,6 +80,7 @@
  */
 
 import { RelayError, defaultClock } from './relay-client.js'
+import { appendFileSync } from 'node:fs'
 import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
@@ -2705,6 +2706,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // array, so the server marked it and the caller's own zod validation
       // needs the real Uint8Array back.
       const restored = INVOKE_BINARY_RESULT_METHODS.has(endpoint) ? restoreInvokeBinary(value) : value
+      // TEMP-DEBUG 2026-10-14: pinpoint the readBytes image bug on the live wire (remove after diagnosis)
+      if (endpoint === 'workspaceFiles/readBytes') {
+        try { appendFileSync('/tmp/zr-client-restore.log', `${new Date().toISOString()} listed=${INVOKE_BINARY_RESULT_METHODS.has(endpoint)} rawDataType=${String((value as { data?: unknown } | null)?.data?.constructor?.name)} restoredDataType=${String((restored as { data?: unknown } | null)?.data?.constructor?.name)}\n`) } catch { /* best-effort */ }
+      }
       return { ok: true, value: rewriteResult(endpoint, restored, serverId) }
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
