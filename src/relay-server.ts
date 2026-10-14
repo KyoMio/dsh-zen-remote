@@ -28,7 +28,7 @@
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { Readable, Transform } from 'node:stream'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -1371,6 +1371,10 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // (invoke-binary.ts) is restored on the client half (intercept.ts).
         const wire =
           INVOKE_BINARY_RESULT_METHODS.has(`${namespace}/${method}`) ? markInvokeBinary(travels) : travels
+        // TEMP-DEBUG 2026-10-14: pinpoint the readBytes image bug on the live wire (remove after diagnosis)
+        if (`${namespace}/${method}` === 'workspaceFiles/readBytes') {
+          try { appendFileSync('/tmp/zr-server-mark.log', `${new Date().toISOString()} marked=${wire !== travels} dataType=${String((travels as { data?: unknown } | null)?.data?.constructor?.name)}\n`) } catch { /* best-effort */ }
+        }
         responseJson(res, 200, { ok: true, value: wire })
       } catch (error) {
         // The gateway's own failures (unknown namespace, absent service) are
