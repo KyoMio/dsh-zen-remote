@@ -4065,6 +4065,24 @@ test('workspaceFiles calls restore the top-level workspaceFileScopeId; local sco
   handle.uninstall()
 })
 
+test('workspaceFiles/readBytes restores the binary marker into a real Uint8Array (2026-10-14 fix)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  // What the RELAY answers after the server half marked it: the JSON wire
+  // shape (invoke-binary.ts) — a plain object no zod would accept as data.
+  const bytes = new Uint8Array([0, 1, 250, 255, 128])
+  relay.invokeValue = { data: { '$zr-u8': Buffer.from(bytes).toString('base64') }, path: 'pic.png' }
+  const { handle } = install(gateway, relay)
+  const scopeVirtual = toVirtual(SERVER_ID, 'session-scope')
+  const envelope = await gateway.rpcBridge('workspaceFiles/readBytes', { args: { workspaceFileScopeId: scopeVirtual, path: 'pic.png' } }, undefined, undefined)
+  assert.equal(envelope.ok, true)
+  assert.ok(envelope.value.data instanceof Uint8Array, 'data is a REAL Uint8Array again — the caller-side zod validation passes')
+  assert.deepEqual(Array.from(envelope.value.data), Array.from(bytes))
+  assert.equal(envelope.value.path, 'pic.png')
+  assert.deepEqual(relay.invokes[0].args, { workspaceFileScopeId: 'session-scope', path: 'pic.png' }, 'the scope id was restored for the relay as usual')
+  handle.uninstall()
+})
+
 test('terminal calls restore BOTH field halves: agentId for the PTY half, sessionId for retain/list', async () => {
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()

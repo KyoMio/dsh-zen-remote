@@ -84,6 +84,7 @@ import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
+import { INVOKE_BINARY_RESULT_METHODS, restoreInvokeBinary } from './invoke-binary.js'
 import {
   createControlMerger,
   createWorkspaceMerger,
@@ -2699,7 +2700,12 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // The session answered: any closed-session entry for it is stale
       // (re-shared and served again) — the banner may go.
       clearClosed(virtuals)
-      return { ok: true, value: rewriteResult(endpoint, value, serverId) }
+      // 2026-10-14: a binary-result method's answer arrives marker-encoded
+      // (invoke-binary.ts) — the relay's JSON channel cannot carry a typed
+      // array, so the server marked it and the caller's own zod validation
+      // needs the real Uint8Array back.
+      const restored = INVOKE_BINARY_RESULT_METHODS.has(endpoint) ? restoreInvokeBinary(value) : value
+      return { ok: true, value: rewriteResult(endpoint, restored, serverId) }
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
       recordFailure(endpoint, code)
