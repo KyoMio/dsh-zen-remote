@@ -84,7 +84,7 @@ import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
-import { INVOKE_BINARY_RESULT_METHODS, extractResultAttachments, restoreInvokeBinary } from './invoke-binary.js'
+import { INVOKE_BINARY_RESULT_METHODS, extractResultAttachments, restoreInvokeBinary, type ResultAttachment } from './invoke-binary.js'
 import {
   createControlMerger,
   createWorkspaceMerger,
@@ -241,7 +241,7 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
  * envelope WE construct carries `details: {}` (the host rpcFailure's
  * fallback). */
 export type DispatchEnvelope =
-  | { ok: true; value: unknown }
+  | { ok: true; value: unknown; attachments?: ResultAttachment[] }
   | { ok: false; error: { code: string; message?: string; details: Record<string, unknown> } }
 
 /**
