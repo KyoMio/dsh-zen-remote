@@ -422,6 +422,28 @@ test('e2e: a shared session invoke returns the fake gateway value, an unshared o
   } finally { await env.stop() }
 })
 
+test('e2e: workspaceFiles/readBytes rides the JSON relay as a base64 marker (2026-10-14 fix)', async () => {
+  const bytes = new Uint8Array([0, 1, 2, 250, 255, 128, 200])
+  const env = await boot({
+    shared: ['session-a'],
+    invoke: (call) => {
+      if (call.namespace === 'workspaceFiles' && call.method === 'readBytes') return { data: bytes, path: 'pic.png' }
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+  })
+  try {
+    await env.client.connect()
+    // The relay CLIENT sees the wire shape: the server half marked the typed
+    // array (invoke-binary.ts) because JSON.stringify would have collapsed it
+    // into a plain object the caller-side zod rejects. The intercept half
+    // (tested in intercept.test.cjs) restores it above this layer.
+    const value = await env.client.invoke('workspaceFiles', 'readBytes', { workspaceFileScopeId: 'session-a', path: 'pic.png' })
+    assert.equal(value.path, 'pic.png')
+    assert.equal(typeof value.data['$zr-u8'], 'string', 'the typed array traveled as the base64 marker')
+    assert.deepEqual(Array.from(Buffer.from(value.data['$zr-u8'], 'base64')), Array.from(bytes), 'the bytes round-tripped exactly')
+  } finally { await env.stop() }
+})
+
 // ---- 3. stream: frames flow, an unshare kills the stream loudly ---------------
 
 test('e2e: openStream delivers the pushed frames in order and ends cleanly', async () => {

@@ -48,6 +48,7 @@ import { routeMethodsOf, routeMaxBodyOf } from './plugin-bridge.js'
 import { createPluginTunnel, validatePluginCall, type PluginTunnelRoutes } from './plugin-tunnel.js'
 import type { PluginLoopback } from './plugin-loopback.js'
 import { isLoopbackAuthError } from './plugin-loopback.js'
+import { INVOKE_BINARY_RESULT_METHODS, markInvokeBinary } from './invoke-binary.js'
 import type { NormalizedAdapter, AdapterVerdict } from './plugin-adapter-core.js'
 import { matchAdapterRoute, locateAdapterIds, adapterOwnsRegistryEntry, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
 
@@ -1363,7 +1364,14 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               : decision.filter === 'model-catalog'
                 ? filterModelCatalogResult(value)
                 : value
-        responseJson(res, 200, { ok: true, value: travels })
+        // 2026-10-14: a binary-result method (workspaceFiles/readBytes) cannot
+        // ride JSON.stringify — typed arrays collapse into plain objects and
+        // the sub-client's own zod validation rejects the answer (remote image
+        // preview: "expected Uint8Array"). The marker round-trip
+        // (invoke-binary.ts) is restored on the client half (intercept.ts).
+        const wire =
+          INVOKE_BINARY_RESULT_METHODS.has(`${namespace}/${method}`) ? markInvokeBinary(travels) : travels
+        responseJson(res, 200, { ok: true, value: wire })
       } catch (error) {
         // The gateway's own failures (unknown namespace, absent service) are
         // business answers, not transport errors: they ride a 200 envelope
