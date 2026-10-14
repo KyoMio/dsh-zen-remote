@@ -4076,9 +4076,16 @@ test('workspaceFiles/readBytes restores the binary marker into a real Uint8Array
   const scopeVirtual = toVirtual(SERVER_ID, 'session-scope')
   const envelope = await gateway.rpcBridge('workspaceFiles/readBytes', { args: { workspaceFileScopeId: scopeVirtual, path: 'pic.png' } }, undefined, undefined)
   assert.equal(envelope.ok, true)
-  assert.ok(envelope.value.data instanceof Uint8Array, 'data is a REAL Uint8Array again — the caller-side zod validation passes')
-  assert.deepEqual(Array.from(envelope.value.data), Array.from(bytes))
+  // The dispatchRpc envelope contract (dsh-api-gateway encodeRpcResult): the
+  // typed array rides the ATTACHMENTS side channel, its value position is
+  // null — that is what survives the background→browser bridge (2026-10-14
+  // live-probed root cause of the remote image preview failure).
+  assert.equal(envelope.value.data, null, 'the value position is null — bytes ride the attachment channel')
   assert.equal(envelope.value.path, 'pic.png')
+  assert.ok(Array.isArray(envelope.attachments) && envelope.attachments.length === 1, 'exactly one attachment')
+  assert.deepEqual(envelope.attachments[0].path, ['data'])
+  assert.ok(envelope.attachments[0].bytes instanceof Uint8Array)
+  assert.deepEqual(Array.from(envelope.attachments[0].bytes), Array.from(bytes))
   assert.deepEqual(relay.invokes[0].args, { workspaceFileScopeId: 'session-scope', path: 'pic.png' }, 'the scope id was restored for the relay as usual')
   handle.uninstall()
 })
