@@ -24,4 +24,18 @@ export declare function markInvokeBinary(value: unknown, depth?: number): unknow
  *  恒有效；万一混入同键的怪值，`Buffer.from(..., 'base64')` 的宽容解码
  *  也不会抛。非标记对象原样返回（同一引用，不惊动浅比较的调用方）。 */
 export declare function restoreInvokeBinary(value: unknown, depth?: number): unknown;
+/** dispatchRpc 信封的附件旁路形状（dsh-api-gateway 的 encodeRpcResult）：
+ *  Uint8Array 不进 JSON 值，抽到 `attachments: [{path, bytes}]`，原位置
+ *  置 null，渲染层按 path 回填。远程路径必须产出同样的契约，否则
+ *  typed array 在后台→浏览器的桥上被 JSON 压扁（2026-10-14 实机定位）。 */
+export interface ResultAttachment {
+    path: (string | number)[];
+    bytes: Uint8Array;
+}
+/** 把（已还原的）结果值里的 Uint8Array 抽成附件；值内原位置置 null。
+ *  没有 typed array 时 value 原引用返回、attachments 为空数组。 */
+export declare function extractResultAttachments(value: unknown): {
+    value: unknown;
+    attachments: ResultAttachment[];
+};
 //# sourceMappingURL=invoke-binary.d.ts.map

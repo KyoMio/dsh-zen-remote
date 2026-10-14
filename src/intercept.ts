@@ -80,12 +80,11 @@
  */
 
 import { RelayError, defaultClock } from './relay-client.js'
-import { appendFileSync } from 'node:fs'
 import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
-import { INVOKE_BINARY_RESULT_METHODS, restoreInvokeBinary } from './invoke-binary.js'
+import { INVOKE_BINARY_RESULT_METHODS, extractResultAttachments, restoreInvokeBinary } from './invoke-binary.js'
 import {
   createControlMerger,
   createWorkspaceMerger,
@@ -2706,9 +2705,19 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // array, so the server marked it and the caller's own zod validation
       // needs the real Uint8Array back.
       const restored = INVOKE_BINARY_RESULT_METHODS.has(endpoint) ? restoreInvokeBinary(value) : value
-      // TEMP-DEBUG 2026-10-14: pinpoint the readBytes image bug on the live wire (remove after diagnosis)
-      if (endpoint === 'workspaceFiles/readBytes') {
-        try { appendFileSync('/tmp/zr-client-restore.log', `${new Date().toISOString()} listed=${INVOKE_BINARY_RESULT_METHODS.has(endpoint)} rawDataType=${String((value as { data?: unknown } | null)?.data?.constructor?.name)} restoredDataType=${String((restored as { data?: unknown } | null)?.data?.constructor?.name)}\n`) } catch { /* best-effort */ }
+      // 2026-10-14 (root cause, live-probed): dispatchRpc's envelope contract
+      // carries Uint8Arrays in the ATTACHMENTS side channel (dsh-api-gateway
+      // encodeRpcResult) — value positions become null and the renderer
+      // re-attaches by path. A raw typed array in the value dies on the
+      // background→browser bridge (JSON), which is exactly the remote image
+      // preview's "expected Uint8Array" zod failure. Restore, then re-extract.
+      if (INVOKE_BINARY_RESULT_METHODS.has(endpoint)) {
+        const extracted = extractResultAttachments(restored)
+        return {
+          ok: true,
+          value: rewriteResult(endpoint, extracted.value, serverId),
+          ...(extracted.attachments.length > 0 ? { attachments: extracted.attachments } : {}),
+        }
       }
       return { ok: true, value: rewriteResult(endpoint, restored, serverId) }
     } catch (error) {

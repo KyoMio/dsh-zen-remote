@@ -89,3 +89,46 @@ export function restoreInvokeBinary(value: unknown, depth = 0): unknown {
   }
   return value
 }
+
+/** dispatchRpc 信封的附件旁路形状（dsh-api-gateway 的 encodeRpcResult）：
+ *  Uint8Array 不进 JSON 值，抽到 `attachments: [{path, bytes}]`，原位置
+ *  置 null，渲染层按 path 回填。远程路径必须产出同样的契约，否则
+ *  typed array 在后台→浏览器的桥上被 JSON 压扁（2026-10-14 实机定位）。 */
+export interface ResultAttachment {
+  path: (string | number)[]
+  bytes: Uint8Array
+}
+
+/** 把（已还原的）结果值里的 Uint8Array 抽成附件；值内原位置置 null。
+ *  没有 typed array 时 value 原引用返回、attachments 为空数组。 */
+export function extractResultAttachments(value: unknown): { value: unknown; attachments: ResultAttachment[] } {
+  const attachments: ResultAttachment[] = []
+  const walk = (input: unknown, path: (string | number)[], depth: number): unknown => {
+    if (depth >= MAX_DEPTH) return input
+    if (isTypedArray(input)) {
+      attachments.push({ path, bytes: input as Uint8Array })
+      return null
+    }
+    if (Array.isArray(input)) {
+      let changed = false
+      const out: unknown[] = input.map((item, index) => {
+        const extracted = walk(item, [...path, index], depth + 1)
+        if (extracted !== item) changed = true
+        return extracted
+      })
+      return changed ? out : input
+    }
+    if (isPlainObject(input)) {
+      let changed = false
+      const out: Record<string, unknown> = {}
+      for (const [key, item] of Object.entries(input)) {
+        const extracted = walk(item, [...path, key], depth + 1)
+        if (extracted !== item) changed = true
+        out[key] = extracted
+      }
+      return changed ? out : input
+    }
+    return input
+  }
+  return { value: walk(value, [], 0), attachments }
+}

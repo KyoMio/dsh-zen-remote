@@ -13,11 +13,12 @@ const path = require('node:path')
 
 let markInvokeBinary
 let restoreInvokeBinary
+let extractResultAttachments
 let BINARY_MARKER
 let INVOKE_BINARY_RESULT_METHODS
 
 before(async () => {
-  ;({ markInvokeBinary, restoreInvokeBinary, BINARY_MARKER, INVOKE_BINARY_RESULT_METHODS } = await import(
+  ;({ markInvokeBinary, restoreInvokeBinary, extractResultAttachments, BINARY_MARKER, INVOKE_BINARY_RESULT_METHODS } = await import(
     pathToFileURL(path.join(__dirname, '..', 'lib', 'invoke-binary.js')).href
   ))
 })
@@ -81,4 +82,33 @@ test('every binary-result method is also a REGISTERED relay method (a name outsi
     const decision = relayAccess.decideInvoke(namespace, method, { workspaceFileScopeId: 'session-x' }, () => true)
     assert.equal(decision.allow, true, `${name} must stay a registered relay method or the marker path is dead code (${decision.reason})`)
   }
+})
+
+test('extractResultAttachments produces the dispatchRpc attachment contract', () => {
+  const bytes = new Uint8Array([7, 8, 9])
+  const nested = new Uint8Array([1])
+  const value = { data: bytes, meta: { list: [nested, 'x'] }, path: 'a.png' }
+  const out = extractResultAttachments(value)
+  assert.equal(out.value.data, null, 'value position becomes null')
+  assert.equal(out.value.meta.list[0], null, 'nested positions too')
+  assert.equal(out.value.meta.list[1], 'x')
+  assert.deepEqual(out.attachments.map((a) => a.path), [['data'], ['meta', 'list', 0]], 'paths address the exact positions')
+  assert.deepEqual(Array.from(out.attachments[0].bytes), Array.from(bytes))
+  assert.deepEqual(Array.from(out.attachments[1].bytes), [1])
+})
+
+test('extractResultAttachments keeps the reference when nothing is a typed array', () => {
+  const plain = { a: 1, list: [{ b: 2 }] }
+  const out = extractResultAttachments(plain)
+  assert.equal(out.value, plain)
+  assert.deepEqual(out.attachments, [])
+})
+
+test('full round trip: mark → JSON wire → restore → extract matches the envelope contract', () => {
+  const bytes = new Uint8Array([0, 255, 128])
+  const onWire = JSON.parse(JSON.stringify(markInvokeBinary({ data: bytes, path: 'p' })))
+  const restored = restoreInvokeBinary(onWire)
+  const out = extractResultAttachments(restored)
+  assert.equal(out.value.data, null)
+  assert.deepEqual(Array.from(out.attachments[0].bytes), Array.from(bytes))
 })
