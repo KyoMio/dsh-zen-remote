@@ -67,3 +67,18 @@ test('deep nesting past the depth bound passes through untouched (no hang, no th
 test('the method list covers exactly the known binary-result methods', () => {
   assert.deepEqual([...INVOKE_BINARY_RESULT_METHODS], ['workspaceFiles/readBytes'])
 })
+
+test('an EMPTY Uint8Array round-trips too (review 2026-10-14: the empty base64 string is a legal marker)', () => {
+  const restored = restoreInvokeBinary(JSON.parse(JSON.stringify(markInvokeBinary({ data: new Uint8Array(0) }))))
+  assert.ok(restored.data instanceof Uint8Array)
+  assert.equal(restored.data.byteLength, 0)
+})
+
+test('every binary-result method is also a REGISTERED relay method (a name outside both forwarding tables would silently never mark)', async () => {
+  const relayAccess = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'relay-access.js')).href)
+  for (const name of INVOKE_BINARY_RESULT_METHODS) {
+    const [namespace, method] = name.split('/')
+    const decision = relayAccess.decideInvoke(namespace, method, { workspaceFileScopeId: 'session-x' }, () => true)
+    assert.equal(decision.allow, true, `${name} must stay a registered relay method or the marker path is dead code (${decision.reason})`)
+  }
+})
