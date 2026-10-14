@@ -80,6 +80,7 @@
  */
 import type { RelayClient, RelayClock } from './relay-client.js';
 import type { GatewayShapeCheck } from './intercept-shape.js';
+import { type ResultAttachment } from './invoke-binary.js';
 /** The session-locating argument fields, as registered per method. Identical
  * in name and meaning to relay-access.ts's `SessionField`; a field named
  * without a dot is TOP-LEVEL. `request.workspaceId` locates a remote create
@@ -111,6 +112,7 @@ export declare const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly Sess
 export type DispatchEnvelope = {
     ok: true;
     value: unknown;
+    attachments?: ResultAttachment[];
 } | {
     ok: false;
     error: {
