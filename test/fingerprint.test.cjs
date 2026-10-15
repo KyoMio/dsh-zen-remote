@@ -301,6 +301,8 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     // 0.2.1-alpha.3: generator now emits .describe() docs, z.json() and plain z.string()
     // ids (was string&unknown); 21 endpoints unchanged. Mixed alpha.2/alpha.3 pairs differ.
     '0.2.1-alpha.3': 'r:8e0209aa5eb8',
+    // 0.2.1-alpha.4: typert.remote-client.js byte-identical to alpha.3.
+    '0.2.1-alpha.4': 'r:8e0209aa5eb8',
   }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
