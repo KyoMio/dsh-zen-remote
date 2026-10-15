@@ -92,6 +92,8 @@ export interface AdminHandlerOptions {
      * share trusts the table alone. The lookup itself must never be allowed to
      * throw into the route, so callers wrap it. */
     typert?: () => RelayGateway | undefined;
+    /** The owner Peer gateway calls are made as (DSH 0.2.1-alpha.3+); see owner-peer.ts. */
+    getPeer?: () => unknown;
     /** Live agent roster for the busy restore a successful `share` performs.
      * Absent or throwing means "no information": nothing is marked busy. */
     listAgents?: () => readonly AgentStatusLike[];

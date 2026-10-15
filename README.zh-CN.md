@@ -82,6 +82,10 @@ dsh plugin --profile web add dsh-zen-remote
 # 然后重启 dsh web
 ```
 
+> **开着 HMR 升级插件：** 先 remove 再 install（`dsh plugin --profile <name> remove dsh-zen-remote` 后再 `add dsh-zen-remote`，或在「插件」页先卸载再添加）；直接在运行中的旧版上覆盖安装不会被干净地接管。
+
+> **DSH 0.2.1-alpha.3 起：** `dsh --profile <name> --from-default-profile <模板>` 会用模板新副本**覆盖**已有的自定义 profile，删掉其中的 `dependencies`（包括 dsh-zen-remote）和用户 `cordis.patch.yml`。执行前先备份 `~/.dsh/profiles/<name>`（如 `cp -a ~/.dsh/profiles/<name> ~/.dsh/profiles/<name>.bak-$(date +%Y%m%d%H%M%S)`），之后重新装插件。`~/.dsh/*.json` 里的配对/共享状态在 profile 之外，不受影响。
+
 `dsh plugin` 必须用 `--profile` 指明装进哪个 profile，不带会直接报错。桌面端的 `desktop` profile 由 App 独占管理，命令行会拒绝 `--profile desktop`，所以桌面端只能用上面的界面安装。
 
 **手工改 profile**（本地开发、`link:` 装法）：把依赖写进 profile 的 `package.json`（桌面端在 `~/.dsh/profiles/desktop`，Web 端在 `~/.dsh/profiles/web`），装完重启：

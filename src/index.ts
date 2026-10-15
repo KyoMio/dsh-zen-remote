@@ -15,6 +15,7 @@
  * the package.json dsh.client declaration.
  */
 
+import { createOwnerPeerSource } from './owner-peer.js'
 import { lstat, mkdir, open, realpath, rm } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -715,6 +716,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           // which would turn every shares request into a 500.
           store,
           typert: () => webCtx.reflect.get('typertGateway') as RelayGateway | undefined,
+          getPeer: createOwnerPeerSource(() => webCtx.connection),
           listAgents: () => (webCtx.reflect.get('agents') as { list(): readonly AgentStatusLike[] } | undefined)?.list() ?? [],
           // The "who is looking" badge (T33a2): read through whichever relay
           // handler is live right now. sessionQuery likewise — the share
@@ -780,6 +782,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // registry and pin those throwaway values for the row's lifetime.
       // ~7 ms per computation against a full registry; a failed compute
       // lands as the empty map inside the relay handler's own guard.
+      const relayPeer = createOwnerPeerSource(() => relayCtx.reflect.get('connection'))
       relayCtx.effect(() => {
         // The plugin bridge's loopback facts (PB-3), both read PER REQUEST
         // through the reflection layer: the web server may have restarted on
@@ -812,6 +815,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           store,
           gateway: gatewayService,
           getApiFetch,
+          // DSH 0.2.1-alpha.3: one cached owner/answer Peer for every relay
+          // gateway call — `$events/result` must come from the Peer that
+          // opened `$events`.
+          getPeer: relayPeer,
           // Subagent reachability (T22c-fix): isAccessible walks the same
           // child→parent chain the activity tracker keeps fresh.
           parentOf: parentIndex.parentOf,
@@ -1068,7 +1075,15 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // second failure uninstalls (a half-trusted interception is worse than
       // none). Failure handling lives in runSelfCheck, which records the
       // verdict via noteSelfCheck.
-      void runSelfCheck(raw, { handle, log: logWarn })
+      // DSH 0.2.1-alpha.3: the probe needs an owner Peer of its own (the
+      // gateway's operatorPeer fallback is gone) — read `connection` through
+      // the reflection layer so a composition without it still installs.
+      void runSelfCheck(raw, {
+        handle,
+        log: logWarn,
+        info: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
+        getPeer: createOwnerPeerSource(() => gatewayCtx.reflect.get('connection')),
+      })
     })
     // The exact-fetch-route interception (T51): the local backend's
     // `/api/session/uploadFileBinary` entry forwards REMOTE sessions'

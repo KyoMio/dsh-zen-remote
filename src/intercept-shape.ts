@@ -23,6 +23,11 @@ export type GatewayShapeCheck = { ok: true; notes: string[] } | { ok: false; rea
  * §2.2/§4.1). If these strings vanish from the constructor source, own
  * properties would silently stop intercepting. */
 const DYNAMIC_OPEN_CALL = 'this.openWireStream(endpoint, payload, uplink, peer, control.signal, control)'
+/** DSH 0.2.1-alpha.3 threads the mux's per-stream uplink window through as a
+ * seventh argument (`uplinkWindow`); the call site is otherwise unchanged. */
+const DYNAMIC_OPEN_CALL_WINDOW = 'this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window)'
+/** Accepted `openWireStream` arities: 6 through 0.2.1-alpha.2, 7 from alpha.3. */
+const OPEN_ARITIES = [6, 7]
 const DYNAMIC_RPC_CALL = 'this.dispatchRpc(endpoint, payload, signal, peer)'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -48,7 +53,9 @@ export function checkGatewayShape(raw: unknown): GatewayShapeCheck {
   // already installed.
   const open = proto === null ? undefined : proto.openWireStream
   if (typeof open !== 'function') reasons.push('prototype: openWireStream is not a function')
-  else if (open.length !== 6) reasons.push(`prototype: openWireStream has ${open.length} parameters, expected 6`)
+  else if (!OPEN_ARITIES.includes(open.length)) {
+    reasons.push(`prototype: openWireStream has ${open.length} parameters, expected ${OPEN_ARITIES.join(' or ')}`)
+  }
   const dispatch = proto === null ? undefined : proto.dispatchRpc
   if (typeof dispatch !== 'function') reasons.push('prototype: dispatchRpc is not a function')
   else if (dispatch.length !== 4) reasons.push(`prototype: dispatchRpc has ${dispatch.length} parameters, expected 4`)
@@ -65,8 +72,8 @@ export function checkGatewayShape(raw: unknown): GatewayShapeCheck {
   if (constructorSource === '') {
     reasons.push('constructor: the prototype has no constructor to inspect')
   } else {
-    if (!constructorSource.includes(DYNAMIC_OPEN_CALL)) {
-      reasons.push(`constructor: source does not contain "${DYNAMIC_OPEN_CALL}"`)
+    if (!constructorSource.includes(DYNAMIC_OPEN_CALL) && !constructorSource.includes(DYNAMIC_OPEN_CALL_WINDOW)) {
+      reasons.push(`constructor: source does not contain "${DYNAMIC_OPEN_CALL}" or "${DYNAMIC_OPEN_CALL_WINDOW}"`)
     }
     if (!constructorSource.includes(DYNAMIC_RPC_CALL)) {
       reasons.push(`constructor: source does not contain "${DYNAMIC_RPC_CALL}"`)
