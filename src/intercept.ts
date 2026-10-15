@@ -3212,6 +3212,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     peer: unknown,
     signal: AbortSignal | undefined,
     control: unknown,
+    // DSH 0.2.1-alpha.3: the mux's uplink window, passed through verbatim
+    // (undefined on older hosts and on the 5-argument wireStream.open path).
+    uplinkWindow?: unknown,
   ): unknown {
     if (!installed) {
       return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
@@ -3222,6 +3225,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         peer,
         signal,
         control,
+        uplinkWindow,
       )
     }
     counters.openWireStream += 1
@@ -3235,7 +3239,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     if (endpoint === '$events') {
       const open = chainTarget.openWireStream as (this: unknown, ...callArgs: unknown[]) => unknown
       return (async (): Promise<unknown> => {
-        const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control)
+        const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control, uplinkWindow)
         if (!isAsyncIterable(local)) return local
         return mergedEventsStream({ local, relay, signal, recordFailure, log, clock, summarySync })
       })()
@@ -3256,6 +3260,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             peer,
             signal,
             control,
+            uplinkWindow,
           )
         }
         // The T23b-2 global merge. The 0.2.0 openWireStream is an ASYNC
@@ -3269,7 +3274,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         return (async (): Promise<unknown> => {
           // The uplink rides to the LOCAL method verbatim (it may consume
           // it); the remote leg carries no uplink.
-          const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control)
+          const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control, uplinkWindow)
           if (!isAsyncIterable(local)) return local
           return mergedGlobalStream({
             endpoint,
@@ -3295,6 +3300,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         peer,
         signal,
         control,
+        uplinkWindow,
       )
     }
     const verdict = validate(endpoint, virtuals)
@@ -3399,6 +3405,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
 export interface SelfCheckOptions {
   /** How long the probe may wait for its first frame; default 5000 ms. */
   timeoutMs?: number
+  /** The owner Peer the probe opens as. DSH 0.2.1-alpha.3 removed
+   * `gateway.operatorPeer()` and requires a live Peer on every stream; see
+   * owner-peer.ts. Undefined falls back to `operatorPeer()` where it still
+   * exists (≤ alpha.2), else to no Peer. */
+  getPeer?: () => unknown
 }
 
 /**
@@ -3430,7 +3441,15 @@ export async function behaviorSelfCheck(raw: object, options?: SelfCheckOptions)
   const wireStream = gateway.wireStream
   const open = isPlainObject(wireStream) ? wireStream.open : undefined
   if (typeof open !== 'function') return { ok: false, reason: 'wireStream.open disappeared before the self-check' }
-  const operatorPeer = typeof gateway.operatorPeer === 'function' ? gateway.operatorPeer : undefined
+  // ≤ 0.2.1-alpha.2 only: alpha.3 deleted operatorPeer (and connection.operator).
+  const legacyOperatorPeer = typeof gateway.operatorPeer === 'function' ? gateway.operatorPeer : undefined
+  let peer: unknown
+  try {
+    peer = options?.getPeer?.()
+  } catch (error) {
+    return { ok: false, reason: `the self-check could not obtain an owner Peer: ${messageOf(error)}` }
+  }
+  if (peer === undefined && legacyOperatorPeer !== undefined) peer = legacyOperatorPeer.call(raw)
   const controller = new AbortController()
   // NOT unref'd: an unref'd timer lets the process exit (or a test runner
   // judge the loop empty) before the timeout ever fires when this probe is
@@ -3458,7 +3477,7 @@ export async function behaviorSelfCheck(raw: object, options?: SelfCheckOptions)
           'workspace/follow',
           payload,
           undefined,
-          typeof operatorPeer === 'function' ? operatorPeer.call(raw) : undefined,
+          peer,
           controller.signal,
         ),
       ),
@@ -3502,6 +3521,10 @@ export interface RunSelfCheckOptions {
   retryDelayMs?: number
   /** Failure logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
+  /** Success logging (one line once the probe passes). */
+  info?: (format: string, ...args: unknown[]) => void
+  /** Forwarded to {@link behaviorSelfCheck}. */
+  getPeer?: () => unknown
 }
 
 /**
@@ -3521,7 +3544,7 @@ export async function runSelfCheck(raw: object, options: RunSelfCheckOptions): P
   const { handle, log } = options
   const retryDelayMs = options.retryDelayMs ?? 3_000
   const stillInstalled = (): boolean => handle.diagnostics().installed
-  let result = await behaviorSelfCheck(raw)
+  let result = await behaviorSelfCheck(raw, { getPeer: options.getPeer })
   if (!result.ok && stillInstalled()) {
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, retryDelayMs)
@@ -3529,11 +3552,14 @@ export async function runSelfCheck(raw: object, options: RunSelfCheckOptions): P
       // loop-empty judgement) open for the retry delay.
       if (typeof timer.unref === 'function') timer.unref()
     })
-    if (stillInstalled()) result = await behaviorSelfCheck(raw)
+    if (stillInstalled()) result = await behaviorSelfCheck(raw, { getPeer: options.getPeer })
   }
   if (!stillInstalled()) return result
   handle.noteSelfCheck(result)
-  if (result.ok) return result
+  if (result.ok) {
+    options.info?.('client intercept self-check passed; interception active')
+    return result
+  }
   handle.uninstall()
   log?.('client intercept self-check failed (%s), interception removed', result.reason)
   return result
