@@ -90,12 +90,14 @@ export interface RelayGateway {
         method: string;
         args: unknown;
         signal?: AbortSignal;
+        peer?: unknown;
     }): Promise<unknown>;
     stream(call: {
         namespace: string;
         method: string;
         args: unknown;
         signal?: AbortSignal;
+        peer?: unknown;
     }): Promise<AsyncIterable<unknown>>;
     /** The host's wire adapter, shared by the WebSocket mux and the local
      * transports. `open` is the async 0.2.0 method. */
@@ -143,6 +145,12 @@ export interface RelayHandlerOptions {
      * synthetic Request to the same exact-fetch route table the browser's
      * `/api` transport uses — no loopback HTTP, no login state. */
     getApiFetch?: () => ((request: Request) => Promise<Response>) | undefined;
+    /** The owner Peer every gateway call is made as (DSH 0.2.1-alpha.3+
+     * requires one; `$events` and `$events/result` need an owner Peer with
+     * `interactions: 'answer'`, the SAME one for both). Built by
+     * {@link createOwnerPeerSource}; absent or answering undefined keeps the
+     * pre-alpha.3 behavior (the host defaults the Peer). */
+    getPeer?: () => unknown;
     /** Stream heartbeat interval in ms (a `{"type":"ping"}` line that keeps
      * reverse proxies from timing the idle stream away); defaults to 15000.
      * Tests inject a small value. */

@@ -402,6 +402,11 @@ export declare function installIntercept(options: InstallInterceptOptions): Inte
 export interface SelfCheckOptions {
     /** How long the probe may wait for its first frame; default 5000 ms. */
     timeoutMs?: number;
+    /** The owner Peer the probe opens as. DSH 0.2.1-alpha.3 removed
+     * `gateway.operatorPeer()` and requires a live Peer on every stream; see
+     * owner-peer.ts. Undefined falls back to `operatorPeer()` where it still
+     * exists (≤ alpha.2), else to no Peer. */
+    getPeer?: () => unknown;
 }
 /**
  * The startup behavior self-check (spike §4.1 check 4): open the one stream
@@ -426,6 +431,10 @@ export interface RunSelfCheckOptions {
     retryDelayMs?: number;
     /** Failure logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
+    /** Success logging (one line once the probe passes). */
+    info?: (format: string, ...args: unknown[]) => void;
+    /** Forwarded to {@link behaviorSelfCheck}. */
+    getPeer?: () => unknown;
 }
 /**
  * Run the behavior self-check with the wiring's failure policy: ONE retry
