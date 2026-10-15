@@ -26,6 +26,7 @@
  * a 404.
  */
 
+import { withPeer } from './owner-peer.js'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { Readable, Transform } from 'node:stream'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -208,12 +209,13 @@ const JOB_CACHE_LIMIT = 1024
  *   before its typert dispatch — and returns the `{ok,…}` envelope itself.
  */
 export interface RelayGateway {
-  invoke(call: { namespace: string; method: string; args: unknown; signal?: AbortSignal }): Promise<unknown>
+  invoke(call: { namespace: string; method: string; args: unknown; signal?: AbortSignal; peer?: unknown }): Promise<unknown>
   stream(call: {
     namespace: string
     method: string
     args: unknown
     signal?: AbortSignal
+    peer?: unknown
   }): Promise<AsyncIterable<unknown>>
   /** The host's wire adapter, shared by the WebSocket mux and the local
    * transports. `open` is the async 0.2.0 method. */
@@ -268,6 +270,12 @@ export interface RelayHandlerOptions {
    * synthetic Request to the same exact-fetch route table the browser's
    * `/api` transport uses — no loopback HTTP, no login state. */
   getApiFetch?: () => ((request: Request) => Promise<Response>) | undefined
+  /** The owner Peer every gateway call is made as (DSH 0.2.1-alpha.3+
+   * requires one; `$events` and `$events/result` need an owner Peer with
+   * `interactions: 'answer'`, the SAME one for both). Built by
+   * {@link createOwnerPeerSource}; absent or answering undefined keeps the
+   * pre-alpha.3 behavior (the host defaults the Peer). */
+  getPeer?: () => unknown
   /** Stream heartbeat interval in ms (a `{"type":"ping"}` line that keeps
    * reverse proxies from timing the idle stream away); defaults to 15000.
    * Tests inject a small value. */
@@ -875,12 +883,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
     const cached = recentJobs.get(sessionId)
     if (cached !== undefined && cached.has(jobId)) return cached.get(jobId) === sessionId
     try {
-      const iterable = await gateway.stream({
+      const iterable = await gateway.stream(withPeer({
         namespace: 'job',
         method: 'list',
         args: { request: { sessionId } },
         signal,
-      })
+      }, options.getPeer))
       for await (const frame of iterable) {
         rememberJobs(sessionId, frame)
         const jobs = recentJobs.get(sessionId)
@@ -906,7 +914,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
    */
   const workspaceExists = async (workspaceId: string, signal: AbortSignal): Promise<boolean> => {
     try {
-      const iterable = await gateway.stream({ namespace: 'workspace', method: 'follow', args: {}, signal })
+      const iterable = await gateway.stream(withPeer({ namespace: 'workspace', method: 'follow', args: {}, signal }, options.getPeer))
       for await (const frame of iterable) {
         if (!isPlainObject(frame) || frame.type !== 'baseline') return false
         const value = isPlainObject(frame.value) ? frame.value : undefined
@@ -939,7 +947,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       '$events',
       { args: {} },
       undefined,
-      undefined,
+      options.getPeer?.(),
       signal,
     )) as unknown
     if (
@@ -1217,7 +1225,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           '$events/result',
           { args: { clientId: owner.clientId, eventId: originalEventId, outcome: parsed.result } },
           hangUp.signal,
-          undefined,
+          options.getPeer?.(),
         )) as unknown
         responseJson(res, 200, isPlainObject(envelope) ? envelope : { ok: false, error: { code: 'internal' } })
       } catch (error) {
@@ -1341,7 +1349,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
           return
         }
-        const value = await gateway.invoke({ namespace, method, args, signal: hangUp.signal })
+        const value = await gateway.invoke(withPeer({ namespace, method, args, signal: hangUp.signal }, options.getPeer))
         // T31: a session created or forked THROUGH the relay is shared
         // automatically — the client only ever sees shared sessions, so an
         // unshared result would be born unreachable. Re-sharing (a fork the
@@ -2471,12 +2479,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           const syncProjections = async (sessionId: string): Promise<void> => {
             let result: unknown
             try {
-              result = await gateway.invoke({
+              result = await gateway.invoke(withPeer({
                 namespace: 'session',
                 method: 'projections',
                 args: { request: { sessionId } },
                 signal: hangUp.signal,
-              })
+              }, options.getPeer))
             } catch {
               return // projections unavailable — the next live projection frame will flow anyway
             }
@@ -2596,7 +2604,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             const iterable =
               eventsSub !== undefined
                 ? await openEventsStream(hangUp.signal)
-                : await gateway.stream({ namespace, method, args, signal: hangUp.signal })
+                : await gateway.stream(withPeer({ namespace, method, args, signal: hangUp.signal }, options.getPeer))
             for await (const frame of iterable) {
               if (finished || clientGone) break
               if (namespace === 'job' && method === 'list') rememberJobs(ownerSessionIdOf(args), frame)

@@ -372,6 +372,63 @@ test('checkGatewayShape: an existing own property is a note, not a failure', () 
   assert.match(verdict.notes[0], /dispatchRpc.*own property/)
 })
 
+/** The DSH 0.2.1-alpha.3 gateway shape: openWireStream takes a seventh
+ * `uplinkWindow`, the mux call site passes `window`, operatorPeer is gone
+ * and every stream asserts a live Peer (RT dsh-api-gateway 0.2.1-alpha.3). */
+class Alpha3TypertGateway {
+  constructor() {
+    this.streamCalls = []
+    this.wireStream = {
+      open: (endpoint, payload, uplink, peer, signal) => this.openWireStream(endpoint, payload, uplink, peer, signal, new AbortController()),
+    }
+    this.rpcBridge = (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer)
+    this.muxTap = (endpoint, payload, uplink, peer, control, window) => this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window)
+  }
+  async dispatchRpc(endpoint, payload, signal, peer) {
+    if (peer === undefined) throw new TypeError("Cannot read properties of undefined (reading 'signal')")
+    return { ok: true, value: { endpoint } }
+  }
+  async openWireStream(endpoint, payload, uplink, peer, signal, control, uplinkWindow) {
+    if (peer === undefined) throw new TypeError("Cannot read properties of undefined (reading 'signal')")
+    this.streamCalls.push({ endpoint, payload, uplink, peer, signal, control, uplinkWindow })
+    return (async function* () { yield { type: 'baseline', value: { items: [] } } })()
+  }
+}
+
+test('checkGatewayShape: the alpha.3 7-parameter openWireStream and window call site pass', () => {
+  assert.equal(Alpha3TypertGateway.prototype.openWireStream.length, 7)
+  const verdict = checkGatewayShape(new Alpha3TypertGateway())
+  assert.equal(verdict.ok, true, verdict.ok ? '' : verdict.reasons.join('; '))
+})
+
+test('checkGatewayShape: an 8-parameter openWireStream is still refused', () => {
+  class TooMany extends Alpha3TypertGateway {}
+  TooMany.prototype.openWireStream = function (a, b, c, d, e, f, g, h) { return Alpha3TypertGateway.prototype.openWireStream.call(this, a, b, c, d, e, f, g) }
+  const verdict = checkGatewayShape(new TooMany())
+  assert.equal(verdict.ok, false)
+  assert.ok(verdict.reasons.some((r) => r.includes('has 8 parameters, expected 6 or 7')), verdict.reasons.join('; '))
+})
+
+test('alpha.3: the wrap passes uplinkWindow through and the self-check opens as the owner Peer', async () => {
+  const gateway = new Alpha3TypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const window = { credit: 4 }
+  const control = new AbortController()
+  const ownerPeer = { principal: { kind: 'owner' }, interactions: 'answer', signal: new AbortController().signal }
+  const stream = await gateway.muxTap('job/list', { args: { request: { sessionId: 's1' } } }, undefined, ownerPeer, control, window)
+  for await (const _ of stream) break
+  assert.equal(gateway.streamCalls.at(-1).uplinkWindow, window, 'the 7th argument reached the original')
+  assert.equal(gateway.streamCalls.at(-1).peer, ownerPeer)
+
+  const noPeer = await behaviorSelfCheck(gateway, { timeoutMs: 500 })
+  assert.equal(noPeer.ok, false, 'alpha.3 refuses a Peer-less probe (no operatorPeer fallback)')
+  const outcome = await behaviorSelfCheck(gateway, { getPeer: () => ownerPeer })
+  assert.deepEqual(outcome, { ok: true })
+  assert.equal(gateway.streamCalls.at(-1).peer, ownerPeer)
+  handle.uninstall()
+})
+
 test('a shape refusal installs nothing (wiring)', async () => {
   const { apply } = await import(INDEX_URL)
   class BrokenGateway extends FakeTypertGateway {}

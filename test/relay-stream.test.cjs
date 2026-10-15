@@ -162,7 +162,7 @@ function makeFakeGateway(overrides = {}) {
   return { gateway, invokeCalls, streams, wireOpens, eventResults, eventsGate: () => eventsGate, eventsGates }
 }
 
-function makeParts(name, { shared = [], overrides = {}, heartbeatMs, endDrainTimeoutMs, parentOf, serverName } = {}) {
+function makeParts(name, { shared = [], overrides = {}, heartbeatMs, endDrainTimeoutMs, parentOf, serverName, getPeer } = {}) {
   const home = path.join(ROOT, name)
   fs.mkdirSync(home, { recursive: true })
   const fake = makeFakeGateway(overrides)
@@ -183,6 +183,7 @@ function makeParts(name, { shared = [], overrides = {}, heartbeatMs, endDrainTim
     ...(heartbeatMs !== undefined ? { heartbeatMs } : {}),
     ...(endDrainTimeoutMs !== undefined ? { endDrainTimeoutMs } : {}),
     ...(parentOf !== undefined ? { parentOf } : {}),
+    ...(getPeer !== undefined ? { getPeer } : {}),
   })
   return { handler, store, setServerName: (next) => { currentServerName = next }, ...fake }
 }
@@ -1585,6 +1586,29 @@ test('T59 stream: a device with no name header keeps pinging without a deviceNam
     assert.equal(ping.serverName, 'stream-test')
     assert.equal('deviceName' in ping, false, 'an unknown device omits the field entirely')
     open.req.destroy()
+    await open.done
+  } finally { await server.stop() }
+})
+
+test('alpha.3: $events opens and $events/result answers as the SAME owner/answer Peer', async () => {
+  const peer = { principal: { kind: 'owner' }, interactions: 'answer', signal: new AbortController().signal }
+  const parts = makeParts('a3-peer', {
+    shared: ['S-shared'],
+    getPeer: () => peer,
+    overrides: { invoke: async () => ({ values: {} }) },
+  })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, EVENTS_BODY)
+    await waitFor(() => open.lines.length >= 1)
+    assert.equal(parts.wireOpens[0].peer, peer, '$events opened as the owner Peer')
+    parts.eventsGate().push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-1', agentId: 'S-shared', request: {} })
+    await waitFor(() => forwardedIds(open).length >= 1)
+    const answer = await server.fetch('/_dsh/zen-remote/relay/v1/event-result', postEvent({ eventId: forwardedIds(open)[0], result: { kind: 'result', value: 'allowed-once' } }))
+    assert.equal(answer.status, 200)
+    assert.equal(parts.eventResults[0].endpoint, '$events/result')
+    assert.equal(parts.eventResults[0].peer, peer, '$events/result answered by the Peer that opened the stream')
+    parts.eventsGate().finish()
     await open.done
   } finally { await server.stop() }
 })

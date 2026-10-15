@@ -37,6 +37,7 @@
  * drive it over a real socket with a mock gateway and a mock admit.
  */
 
+import { withPeer } from './owner-peer.js'
 import { request as httpRequest } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ConfigSource, ZenRemoteConfig } from './config.js'
@@ -150,6 +151,8 @@ export interface AdminHandlerOptions {
    * share trusts the table alone. The lookup itself must never be allowed to
    * throw into the route, so callers wrap it. */
   typert?: () => RelayGateway | undefined
+  /** The owner Peer gateway calls are made as (DSH 0.2.1-alpha.3+); see owner-peer.ts. */
+  getPeer?: () => unknown
   /** Live agent roster for the busy restore a successful `share` performs.
    * Absent or throwing means "no information": nothing is marked busy. */
   listAgents?: () => readonly AgentStatusLike[]
@@ -358,12 +361,12 @@ async function projectionOf(options: AdminHandlerOptions, sessionId: string): Pr
     return { kind: 'no-gateway' }
   }
   if (gateway === undefined) return { kind: 'no-gateway' }
-  const value = await gateway.invoke({
+  const value = await gateway.invoke(withPeer({
     namespace: 'session',
     method: 'projections',
     args: { request: { sessionId } },
     signal: AbortSignal.timeout(options.projectionTimeoutMs ?? PROJECTION_TIMEOUT_MS),
-  })
+  }, options.getPeer))
   if (value === null || value === undefined) return { kind: 'no-session' }
   const values = (value as { values?: unknown }).values
   return {
