@@ -82,6 +82,8 @@ dsh plugin --profile web add dsh-zen-remote
 # then restart dsh web
 ```
 
+> **DSH 0.2.1-alpha.3+:** `dsh --profile <name> --from-default-profile <template>` now *replaces* an existing custom profile with a fresh template copy, deleting its `dependencies` (including dsh-zen-remote) and user `cordis.patch.yml`. Back up `~/.dsh/profiles/<name>` first (e.g. `cp -a ~/.dsh/profiles/<name> ~/.dsh/profiles/<name>.bak-$(date +%Y%m%d%H%M%S)`), then re-add the plugin afterwards. Pairing/share state under `~/.dsh/*.json` is outside the profile and is not touched.
+
 `dsh plugin` requires `--profile` to name the profile to install into and errors out without it. The desktop app's `desktop` profile is managed exclusively by the app — the CLI refuses `--profile desktop` — so on the desktop app use the UI above.
 
 **Editing the profile by hand** (local development, `link:` installs): add the dependency to the profile's `package.json` (`~/.dsh/profiles/desktop` for the desktop app, `~/.dsh/profiles/web` for the web service), install, restart:
