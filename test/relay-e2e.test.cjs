@@ -2567,7 +2567,7 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
   const dshStop = () => new Promise((done) => { fakeDsh.closeAllConnections(); fakeDsh.close(done) })
 
   const ADAPTER_INPUT = {
-    plugin: 'dsh-better-sidebar', versions: ['0.25.0', '0.26.0'],
+    plugin: 'dsh-better-sidebar', versions: ['0.25.0', '0.26.0', '0.26.1'],
     routes: [
       { path: '/sidebar/api', match: 'prefix', methods: ['POST'], maxBody: 1024 * 1024, locator: { in: 'json-body', fields: ['sessionId', 'rootSessionId', 'childId'] } },
       { path: '/sidebar/file', match: 'exact', methods: ['GET'], locator: { in: 'query', name: 'sessionId' } },
@@ -2704,7 +2704,7 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
     assert.equal(dshHits[3].body, 'the document text', 'the text body crossed verbatim')
 
     // A drifted version (the plugin updated past the adapter's table)
-    // never bridges: the local registry carries 0.25.0/0.26.0, the server
+    // never bridges: the local registry carries 0.25.0/0.26.0/0.26.1, the server
     // announces 0.27.0 — compareBridges reads version-mismatch, and the
     // request refuses with the uniform 503 instead of forwarding.
     const driftedRegistry = createBridgeRegistry()
