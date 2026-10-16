@@ -1,6 +1,7 @@
 /**
  * The dsh-better-sidebar adapter (PB-12), written against EXACTLY
- * versions 0.25.0 and 0.26.0 (PB-15 widened the list; 0.26.0 is a JSON-api
+ * versions 0.25.0, 0.26.0 and 0.26.1 (PB-15 widened the list; 0.26.1 is a
+ * perf-only patch with the same wire surface as 0.26.0; 0.26.0 is a JSON-api
  * superset of 0.25.0 — it grows fs.readPage and the sidechat dequeue/model/
  * models methods, and moves fs.write's content onto the new raw-text
  * /sidebar/write route). Everything the adapter knows about the plugin came
