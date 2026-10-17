@@ -1,6 +1,6 @@
 /**
  * The dsh-better-sidebar adapter (PB-12), written against EXACTLY
- * versions 0.25.0, 0.26.0, 0.26.1 and 0.28.0-alpha.0 (PB-15 widened the list; 0.26.1 is a
+ * versions 0.25.0, 0.26.0, 0.26.1, 0.28.0-alpha.0 and 0.28.0 (PB-15 widened the list; 0.26.1 is a
  * perf-only patch with the same wire surface as 0.26.0; 0.26.0 is a JSON-api
  * superset of 0.25.0 — it grows fs.readPage and the sidechat dequeue/model/
  * models methods, and moves fs.write's content onto the new raw-text
@@ -59,7 +59,10 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
   // the server hook below strips — see there. Routes now admit through the
   // host's `ctx.connection.requestRejection` (Host fence + signed cookie),
   // which the loopback courier already satisfies (127.0.0.1 + cookie).
-  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0'],
+  // 0.28.0 (stable, DSH 0.2.1-rc.1+): lib/index.js byte-identical to
+  // 0.28.0-alpha.0; the client bundles differ only in CSS-module map order
+  // and the service version string. alpha.0 stays for DSH 0.2.1-alpha.5.
+  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0'],
   routes: [
     {
       // The JSON API: the method name rides the path tail, the session
