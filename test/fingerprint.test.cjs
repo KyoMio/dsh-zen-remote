@@ -305,6 +305,8 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     '0.2.1-alpha.4': 'r:8e0209aa5eb8',
     // 0.2.1-alpha.5: typert.remote-client.js byte-identical to alpha.4.
     '0.2.1-alpha.5': 'r:8e0209aa5eb8',
+    // 0.2.1-rc.1: typert.remote-client.js byte-identical to alpha.5.
+    '0.2.1-rc.1': 'r:8e0209aa5eb8',
   }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
