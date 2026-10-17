@@ -127,7 +127,7 @@ content-type: application/json; charset=utf-8
 
 ## 开发一个适配器
 
-先确认目标插件真的需要适配器：能让作者加几行 `zenRemote.bridge(...)` 就优先走协作声明——适配器只在第三方插件不配合时使用。当前唯一在册的适配器是 **`dsh-better-sidebar`（0.25.0、0.26.0 与 0.26.1 三版）**（`src/adapters/dsh-better-sidebar/`），新适配器照它写。
+先确认目标插件真的需要适配器：能让作者加几行 `zenRemote.bridge(...)` 就优先走协作声明——适配器只在第三方插件不配合时使用。当前唯一在册的适配器是 **`dsh-better-sidebar`（0.25.0、0.26.0、0.26.1、0.28.0-alpha.0 与 0.28.0 五版）**（`src/adapters/dsh-better-sidebar/`），新适配器照它写。
 
 步骤：
 

@@ -113,6 +113,8 @@ export const SIDEBAR_METHODS: Readonly<Record<string, SidebarMethodSpec>> = {
   'git.diff-head': forward('read'),
   'git.branch': forward('read'),
   'git.log': forward('read'),
+  // 0.28.0-alpha.0：只读拓扑提交图（lib/index.js:8626），sessionId 定位，响应无会话 id。
+  'git.graph': forward('read'),
   'git.commit-diff': forward('read'),
   'git.show': forward('read'),
   'git.blame': forward('read'),
