@@ -28,6 +28,7 @@ const PLUGIN_SOURCES = [
   '/tmp/bs-versions/0.26.0/lib/index.js',
   '/tmp/bs-versions/0.26.1/lib/index.js',
   '/tmp/bs-versions/0.28.0-alpha.0/lib/index.js',
+  '/tmp/bs-versions/0.28.0/lib/index.js',
 ]
 
 /** Scratch space for the server-side share store — OUTSIDE the repository
@@ -93,8 +94,8 @@ test('PB-15: the 0.26.0 additions carry the right dispositions; both versions no
   // Both versions register: normalizeAdapter refuses an installed version
   // outside `versions`, so each list entry must normalize clean.
   const { adapter } = await loadAdapter()
-  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0'])
-  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0']) {
+  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0'])
+  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0']) {
     const core = await importLib('plugin-adapter-core.js')
     const adaptersMod = await importLib('adapters/index.js')
     const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
@@ -590,7 +591,7 @@ test('PB-12 server: the cwd is stripped from the api body AND the file/upload qu
   }
 })
 
-test('0.28.0-alpha.0: git.graph is a session-scoped read; changes.ops drops `wait` (and cwd) before the loopback', async () => {
+test('0.28.0-alpha.0 / 0.28.0: git.graph is a session-scoped read; changes.ops drops `wait` (and cwd) before the loopback', async () => {
   const adapterMod = await importLib('adapters/dsh-better-sidebar/methods.js')
   assert.deepEqual({ ...adapterMod.SIDEBAR_METHODS['git.graph'] }, { kind: 'read', sessionField: 'sessionId' })
   const loopbackHits = []
