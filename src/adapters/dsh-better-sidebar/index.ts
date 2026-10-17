@@ -1,6 +1,6 @@
 /**
  * The dsh-better-sidebar adapter (PB-12), written against EXACTLY
- * versions 0.25.0, 0.26.0 and 0.26.1 (PB-15 widened the list; 0.26.1 is a
+ * versions 0.25.0, 0.26.0, 0.26.1 and 0.28.0-alpha.0 (PB-15 widened the list; 0.26.1 is a
  * perf-only patch with the same wire surface as 0.26.0; 0.26.0 is a JSON-api
  * superset of 0.25.0 — it grows fs.readPage and the sidechat dequeue/model/
  * models methods, and moves fs.write's content onto the new raw-text
@@ -53,7 +53,13 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
   // 0.26.1 (perf patch): JSON-api method set, routes and WebSocket paths
   // identical to 0.26.0's wire surface (verified against the npm build;
   // lib/index.js itself differs — a perf refactor, not byte-identical).
-  versions: ['0.25.0', '0.26.0', '0.26.1'],
+  // 0.28.0-alpha.0 (DSH 0.2.1-alpha.5+): same routes and WebSockets; the
+  // JSON api grows `git.graph` (session-scoped read, no ids in the answer);
+  // `changes.ops` gains a `wait: true` long-poll (parks up to 25 s), which
+  // the server hook below strips — see there. Routes now admit through the
+  // host's `ctx.connection.requestRejection` (Host fence + signed cookie),
+  // which the loopback courier already satisfies (127.0.0.1 + cookie).
+  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0'],
   routes: [
     {
       // The JSON API: the method name rides the path tail, the session
@@ -149,10 +155,21 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
         }
         return { allow: true }
       }
-      if (ctx.route.path === '/sidebar/api' && ctx.body !== null && typeof ctx.body === 'object' && !Array.isArray(ctx.body) && 'cwd' in (ctx.body as Record<string, unknown>)) {
-        const stripped = { ...(ctx.body as Record<string, unknown>) }
-        delete stripped.cwd
-        return { allow: true, body: stripped }
+      if (ctx.route.path === '/sidebar/api' && ctx.body !== null && typeof ctx.body === 'object' && !Array.isArray(ctx.body)) {
+        const record = ctx.body as Record<string, unknown>
+        // 0.28.0-alpha.0: a primed `changes.ops` asks with `wait: true` and the
+        // backend parks it up to 25 s — longer than the relay's 15 s header
+        // wait, so every bridged long-poll would die as request-timeout. The
+        // client polls on a fixed 2.5 s interval with an in-flight guard
+        // either way, so dropping `wait` degrades a remote session to the
+        // 0.26 cadence (same precedent as the unbridged ws/sidechat push).
+        const stripWait = apiMethodOf(ctx.pathname) === 'changes.ops' && 'wait' in record
+        if ('cwd' in record || stripWait) {
+          const stripped = { ...record }
+          delete stripped.cwd
+          if (stripWait) delete stripped.wait
+          return { allow: true, body: stripped }
+        }
       }
       return { allow: true }
     },
