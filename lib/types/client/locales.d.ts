@@ -241,6 +241,9 @@ export declare const zh: {
     readonly 'settings.client.diagRecentFailures': "最近的远程调用失败";
     readonly 'settings.client.diagCompatGroups': "指纹有差异的组：{groups}";
     readonly 'settings.client.diagCompatCalls': "最近的不兼容调用";
+    readonly 'settings.client.diagRemoteDrop': "远程拖拽守卫";
+    readonly 'settings.client.diagRemoteDropOk': "已安装 · 拦截 {intercepted} · 重派发 {redispatched} · 文件夹 {blocked} · 放行 {passthrough} · 重包失败 {failed}";
+    readonly 'settings.client.diagRemoteDropOff': "未安装（{reason}）";
     readonly 'settings.bridge.title': "插件桥";
     readonly 'settings.bridge.empty': "暂无插件登记插件桥";
     readonly 'settings.bridge.loading': "正在读取插件桥登记…";
@@ -276,6 +279,7 @@ export declare const zh: {
     readonly remoteGroupRevoked: "（令牌已吊销）";
     readonly remoteGroupUnpaired: "（已解除配对）";
     readonly remoteGroupMismatch: "（版本有差异）";
+    readonly remoteDropFolderBlocked: "远程会话暂不支持拖入文件夹";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

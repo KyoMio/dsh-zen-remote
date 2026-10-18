@@ -315,6 +315,10 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 
 - The **plugin bridge**: another plugin registers one bridge declaration and its panel data in remote sessions is served by the HOST — the sub-client reroutes the declared GET requests to the server, which executes them over loopback and streams the answer back; local data never leaks into a remote session. Bridged requires the plugin name, exact version and declaration to agree on BOTH ends; whole-machine data additionally needs the server owner's per-plugin consent in the settings page. Author guide: [the plugin bridge](docs/plugin-bridge.md)
 
+**Desktop client (2.2 additions)**
+
+- Dragging files into a remote session attaches them by **upload**: the desktop app's same-machine shortcut (a dragged file keeps its disk path and would become an `@absolute path` mention naming a file on YOUR machine, unreadable on the server) is intercepted in the browser and the drop is re-shaped into an ordinary upload — the same relay path as the attach button, so the server session gets the bytes. Dragging a **folder** into a remote session is not supported: the drop is stopped with a short on-screen notice. Local sessions are untouched — the shortcut keeps working there — and the guard's status is visible in the settings page diagnostics.
+
 In depth: [interface](docs/interface.md) · [public access + relay protocol](docs/remote-access.en.md)
 
 ---

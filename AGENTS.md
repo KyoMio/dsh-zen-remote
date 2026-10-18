@@ -36,7 +36,7 @@
 | `src/adapters/` | 适配器目录（PB-11）：`index.ts` 只导出 `ADAPTERS` 数组（本单为空，PB-12 加第一个），`types.ts` 放适配器作者接口，实现各占一个子目录；**除 `src/index.ts` 接线外任何文件不得 import 此目录**，适配器实现只可 import `types.ts` 与纯工具 |
 | `src/client-data/plugin-bridge.ts` | 设置页纯函数（PB-5）：桥接状态 → 文案键、整机数据同意表的切换（只动一键）；浏览器半边，不 import 主包 |
 | `src/fetch-route-intercept.ts` | 子客户端本机拦截的第二半：包装宿主连接服务 `fetchRoutes` 表的上传与导出两项——远程会话的非图片附件经 `relay/v1/upload` 流式转服务端（超限本地拒、失败回宿主自己的 200 失败信封）、虚拟 id 的导出后台 403（形态检测、懒装重试、卸载守卫） |
-| `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数，无状态） |
+| `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数、零依赖；client-data 半边许可 import 它做 zr~ 判定，先例 remote-drop.ts / remote-status.ts） |
 | `src/merge-streams.ts` | 三条全局流/列表的本地 + 远程合并状态机（侧边栏远程分组） |
 | `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
 | `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
