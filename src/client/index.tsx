@@ -41,7 +41,10 @@ import { mountRemoteDropGuard } from './effects/remote-drop.ts'
 import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
+import { installHostPathBridgeGuard } from './effects/host-path-bridge.ts'
 import { installModelGroupSide } from './effects/model-group-side.ts'
+import { DeliverableDownload, DocumentDownload } from './RemoteFileDownload.tsx'
+import { createSaveRemoteFile } from './remote-file-save.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -159,12 +162,53 @@ export function apply(ctx: ClientContext): void {
   // 逐字节原样放行；标记属性只在虚拟会话打开时出现，卸载时还原。
   ctx.effect(() => installRemoteApiFetch(window), 'dsh-zen-remote: remote api fetch')
   installRemoteSessionGuard(ctx)
+  // 2.2.6 补：远程会话里「拖文件进输入框」此前会插成 `@C:\...` 本机路径——桌面壳的
+  // host-path bridge 让 composer 优先插路径而不是上传，客户端路径在服务端不存在，
+  // 于是文件永远读不到。这里把 bridge 的 pathFor 在远程会话下改成 undefined，
+  // composer 自己的下一步就会把文件当普通上传处理，走 T51 已就绪的中继上传。
+  // 包一层 Proxy、其它成员原样透传；本地会话与主服务端完全不变。
+  ctx.effect(() => installHostPathBridgeGuard(), 'dsh-zen-remote: host path bridge guard')
   // T74 模型选单分组按会话归属显示：0.2.0 的 MenuGroup 的 aria-labelledby 只剩
   // useId（分组 id 不再出现在标记里），旧的 zr~ 前缀选择器失效——改为 effect 给
   // 分组打 data-zr-group 标（分类依据是虚拟分组名开头的不可见标记，见
   // client-data/model-group-side.ts），CSS 按标隐藏。同样必须在桌面门之前挂载：
   // 桌面端子客户端的模型选单一样要分侧，桌面无手机外壳不影响它。
   installModelGroupSide(ctx)
+
+  // 2.2.6 远程会话产物下载：子客户端最常见的诉求是「把服务端工作区里刚产出的
+  // 文件拿到本机」。DSH 官方的产物卡片只有预览，打开类动作（present.open /
+  // open-in-app）作用于跑 DSH 的那台机器，远程会话里被样式表整组隐藏——
+  // 也就是说此前客户端根本没有把文件落到本机磁盘的入口。两个入口共用同一个
+  // 「读中继 + 浏览器下载」实现（RemoteFileDownload.tsx + remote-file-save.ts）：
+  // deliverable 卡片上的按钮从卡片自己的预览按钮 title 取绝对路径，
+  // 文档预览头的按钮直接拿 owner 给的 absolutePath；两者都只在虚拟会话渲染，
+  // 主服务端与本地会话逐像素 no-op。同样在桌面门之前注册——client 角色的
+  // 桌面端 App 正是远程会话所在。
+  const saveRemoteFileToLocal = createSaveRemoteFile(ctx)
+  ctx.slots.inject('deliverables.file.actions', () =>
+    ctx.slots.register(
+      {
+        name: 'deliverables.file.actions',
+        id: 'zr-download',
+        order: 40,
+        locale: NS,
+        inject: () => ({ saveFile: saveRemoteFileToLocal }),
+      },
+      DeliverableDownload,
+    ),
+  )
+  ctx.slots.inject('sidebar.right.tab.document.actions', () =>
+    ctx.slots.register(
+      {
+        name: 'sidebar.right.tab.document.actions',
+        id: 'zr-download',
+        order: 40,
+        locale: NS,
+        inject: () => ({ saveFile: saveRemoteFileToLocal }),
+      },
+      DocumentDownload,
+    ),
+  )
 
   // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
   // down to ~520px wide, where every width-based gate would flip the phone

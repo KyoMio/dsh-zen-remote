@@ -71,6 +71,7 @@ import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
+import { cleanupStalePromptAttachments, savePromptAttachment } from './prompt-attachments.js'
 
 // The plugin bridge's public types (PB-1), re-exported so another plugin's
 // author can `import type { … } from 'dsh-zen-remote'` without reaching into
@@ -810,6 +811,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // the PB-10 tunnel): a single cookie cache behind two consumers.
         const pluginLoopback = createPluginLoopback({ getTarget: getLoopbackTarget, getTokenUrl })
         const pluginConsent = () => resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent
+        // 2.3.0: sweep yesterday's materialized prompt attachments once per
+        // host apply (ZCode's janitor window). Best-effort — a busy or
+        // read-only home must not keep the relay from starting.
+        void cleanupStalePromptAttachments().catch(() => {})
         const handler = createRelayHandler({
           secret: relaySecret,
           store,
@@ -822,6 +827,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           // Subagent reachability (T22c-fix): isAccessible walks the same
           // child→parent chain the activity tracker keeps fresh.
           parentOf: parentIndex.parentOf,
+          // 2.3.0: the visible-path upload (ZCode's model) — a remote
+          // prompt's client-local file is materialized under
+          // ~/.dsh/tmp/prompt-attachments/<session>/ and its absolute path
+          // answers back for the client to rewrite the mention with.
+          promptAttachments: { save: savePromptAttachment },
           serverInfo: {
             serverId: loadServerId(home),
             // serverName is a volatile row setting ({ get() } wrapped) that

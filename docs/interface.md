@@ -35,6 +35,7 @@ v1.0.0（fork 自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-
 
 - **远程分组**：侧边栏在本地工作区后面按「服务端名 · 工作区名」多出几组，默认收起，里面是服务端已开启远程的会话；服务端的工作区只有其中至少一个会话开启了远程才会成组——没动过的工作区不显示成空分组，已显示过的分组里会话全部关闭后空分组留到刷新页面（DSH 界面对移除过的工作区 id 不再接受，见根 README 已知限制）；服务端离线时分组标注「（离线）」、输入禁用、后台退避重连；解配 / 吊销保留分组只换标注，这两种状态同样禁用输入、也不等自动重连（只能从设置页重新配对才恢复）；仅当换到另一台服务端才整组移除；
 - **标题行连接图标**（同一槽位，order 26）：每个远程会话的连接状态——在线 / 离线 / 版本有差异；点击可关闭该会话的远程（二次确认，文案写明「关闭后需要在服务端重新开启」）；
+- **产物下载**：产出台的卡片（`deliverables.file.actions`，order 40）与文档预览头（`sidebar.right.tab.document.actions`，order 40）各多一个「下载到本机」。远程会话里官方只有「预览」和「在服务端机器上打开」，产物此前无法落到子客户端磁盘——这个按钮用中继已放行的 `workspaceFiles/readBytes` 按窗口（默认 2 MiB，宿主的 `maxBytes` 更小时按 `details.limit` 自动缩小）读回字节，再由浏览器落盘；卡片上的入口从卡片自己的预览按钮 `title`（宿主 `resolveWorkspacePath` 的绝对路径）取路径，预览头直接用 owner 给的 `absolutePath`。两个入口都只在虚拟 id 会话渲染，主服务端与本地会话逐像素 no-op。同一版起 Word/Excel/PPT 预览改由**服务端** LibreOffice 出 PDF（`officeToPdf/render` 登记进中继白名单，PDF 字节走 `INVOKE_BINARY_RESULT_METHODS` 标记），不再报「此功能暂不支持远程会话」。
 - **composer 横幅**（`conversation.input.dock`，order 15）：四种状态——会话被休眠或服务端关闭时显示「远程已关闭」及原因；服务端离线显示「暂时只读，恢复连接后自动可用」；令牌被吊销、解除配对也显示横幅（这两者不会自己恢复，文案指向设置页重新配对）。横幅出现的同时**输入一律禁用**，禁用走宿主自己的 composer-block 契约（`ctx.conversation.blocks.set(sessionId, { reason })`，输入框、发送钮与模型控件一起禁掉，`reason` 成为占位文案），链接恢复或组件卸载时清除，不碰宿主 DOM；
 - 面板长尾：远程会话里带会话 id 的调用自动走中继；改动摘要 / diff 是例外路径——它们不走 typert 网关而是 plain-HTTP GET，浏览器侧的 fetch 包装把带虚拟 id 的 `/api/changes.*` 请求改写到子客户端路由 `/_dsh/zen-remote/client/http/<route>` 再经中继；离线时写一律本地拒绝，`terminal/follow` 也按写处理（它的附带会接管终端的输入控制权，离线放行等于悄悄抢走一条不在线连接的控制权，所以离线即拒绝）；认不准数据来源的面板直接隐藏，而不是显示本机错误数据（清单见根 README「已知限制」）。
 - **关闭的会话与断线恢复**（CP4 / CP4-client-fix2）：服务端关闭某会话的远程（或它被闲置休眠扫掉）时，该会话**从侧边栏列表隐藏**——按「已归档」处理（宿主 `sessionVisible` 在默认筛选下不显示 archived 里的会话），打开「显示已归档」筛选仍能找到。唯一的例外是此刻正打开的会话页：页面停在原处——关闭不重试，已出过帧的会话流也不再报错，静默保持到页面自己关掉它（宿主把会话流的任何终止错误都渲染成对话区顶部的「历史加载失败：…」，而关闭原因只该由横幅表达）；若之后服务端重新共享、又有对它的调用成功，关闭记录随之清掉，这条流改为**正常结束**——宿主把它当作载具恢复、带着新历史自动重开。零帧的会话流、其他面板的流以及对它的 typert 单次请求仍以错误结束，但文字统一为「远程已关闭」，不透出服务端的内部报错（改动摘要 / diff 走的 plain-HTTP 转发例外：那里仍是只带错误码的 403）。composer 横幅显示「远程已关闭」及原因，输入经 composer-block 禁用；当前会话绝不进 archived（否则宿主守卫 `clearArchivedCurrent` 会把正打开的页踢回首页，横幅就无从显示），用户切到别的会话后（当前会话信号来自宿主持久化的选择存储，逐帧读取、另有 1 秒轮询兜底）它才转为隐藏。服务端重新共享（id 回到某工作区的 `sessionIds`）即从 archived 移出、回到正常位置。服务端断线期间已打开的远程会话页保持原状：会话流与任务列表类面板在中继恢复后自动续上——已出过帧的流以干净 end 结束，宿主界面把它当作载具错误立即重开、拿到恢复后的新快照；零帧的原位重开，重开同样走退避（1 秒起翻倍、上限 30 秒）。「远程已关闭」与「暂时只读」是真判决，不在续上之列；文件树变更与终端面板断线后需重新打开。
@@ -50,6 +51,7 @@ v1.0.0（fork 自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-
 | 插件设置区块 | `plugins.row.config` | 两角色（内容按角色不同） |
 | 标题行远程图标 + 会话「…」菜单项 | `conversation.session.header.actions` / `sidebar.workspaces.session.menu.item` | host |
 | 标题行连接图标 + composer 横幅 | 同上槽位 / `conversation.input.dock` | client（仅远程会话渲染） |
+| 产物下载按钮 | `deliverables.file.actions` / `sidebar.right.tab.document.actions` | client（仅远程会话渲染） |
 | 远程分组（流合并进侧边栏） | `workspace/follow` 全局流的运行时包装 | client |
 
 门外留下的只有这些；手机外壳本体（两级页面栈、composer 重排、手势、调试徽章）仍受门与 `<768px` 断点的双重约束，桌面 ≥1024px 逐像素 no-op 的硬约束不变。
@@ -201,7 +203,30 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
   下载）；超 24 片保尾去头并在首片标注省略数；长代码行/宽表格永不横向裁剪；助手正文
   按 markdown 子集渲染。手机上滚动截图拼长图太麻烦，这是第一等诉求（见「分享图」一节）。
 
+**新增**
+
+- 远程会话产物下载：产出台卡片与文档预览头各一个「下载到本机」，经中继
+  `workspaceFiles/readBytes` 分段读回后由浏览器落盘；Word/Excel/PPT 预览改由服务端
+  LibreOffice 出 PDF（`officeToPdf/*` 进入中继白名单，PDF 字节走二进制标记）。此前
+  子客户端只能预览，产物拿不到本机。
+
 **修复**
+
+- 远程会话里手打/粘贴/拖拽插入的 `@<客户端绝对路径>` 在发送前自动**物化到服务端可见
+  路径**（参照 ZCode 的 `remotePromptAttachments`）：客户端拦截层在转发
+  `session/prompt` 前扫描文本里的 `@` 引用，只有「本机存在的绝对路径 + 服务端没有这个
+  路径」才经中继的新路由 `relay/v1/prompt-attachment` 上传；服务端把它写进
+  `~/.dsh/tmp/prompt-attachments/<会话>/<时间戳>-<随机>-<安全文件名>`（目录 0700、
+  文件 0600，24 小时清理），返回绝对路径，客户端把消息里的 `@` 路径**原地改写**为该
+  服务端路径，模型用普通读文件工具打开。旧服务端没有这条路由（501）时退回附件回执
+  （`{type:'file', receiptId}`），任何失败都不改消息。见 `src/prompt-file-mentions.ts`
+  与 `src/prompt-attachments.ts`。
+
+- 远程会话里**拖文件进输入框**曾变成 `@C:\...` 本机路径文本：桌面壳的
+  `__DSH_HOST_PATHS__` 让官方 composer 优先插路径引用而不是上传，客户端路径在服务端
+  不存在，模型永远读不到。现在远程会话下把 bridge 的 `pathFor` 收敛为 `undefined`
+  （`src/client/effects/host-path-bridge.ts`，Proxy 包一层、其余成员透传），composer
+  自己的下一步就回到上传分支，文件经 T51 中继落到服务端。本地会话与主服务端不变。
 
 - 适配 DSH `0.1.5`（0.1.2 → 0.1.5-rc.2 的一批回归，2026-09-11 真机报告、逐项实测）：
   - 官方工具行新增了原生附件回形针，手机端一度出现两枚——现在运行时探测宿主

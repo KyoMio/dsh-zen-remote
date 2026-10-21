@@ -15,7 +15,10 @@
 /** 标记键。线上只会出现服务端写入的标记；客户端只认这个键。 */
 export declare const BINARY_MARKER = "$zr-u8";
 /** 结果里带二进制的方法（`namespace/method`）。请求侧参数不带二进制
- * （readBytes 的参数是 scope/paths），故只有结果方向需要标记。 */
+ * （readBytes 的参数是 scope/paths），故只有结果方向需要标记。
+ * `officeToPdf/render`（2.2.6）返回的 `data` 是整份 PDF 字节：同一个
+ * JSON 通道会把 typed array 压扁，客户端严格编解码当场拒绝——登记进来
+ * 后服务端按同一标记写出、客户端按同一标记还原。 */
 export declare const INVOKE_BINARY_RESULT_METHODS: ReadonlySet<string>;
 /** 深度遍历，把 typed array（含 Buffer）换成 `{ $zr-u8: base64 }` 标记。 */
 export declare function markInvokeBinary(value: unknown, depth?: number): unknown;

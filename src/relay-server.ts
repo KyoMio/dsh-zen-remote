@@ -73,7 +73,7 @@ const MAX_BODY_BYTES = 1024 * 1024
  * host stores the stream verbatim (`saveFileStreamVerbatim` →
  * `publishImmutableObjectStream`, RT dsh-attachment-local lib/index.js
  * ~699-716; the 20 MiB `maxImageBytes` there covers INLINE images only), so
- * there is no host number to mirror and this relay picks its own: 100 MiB
+ * there is no host number to mirror and this relay picks its own: 500 MiB
  * per upload, checked first against `Content-Length` (refused before a byte
  * moves) and then counted while the stream is pumped (a chunked body has no
  * length header — the sub-client's undici forbids hand-set length headers,
@@ -82,13 +82,16 @@ const MAX_BODY_BYTES = 1024 * 1024
  * answer is 413 `payload-too-large`.
  *
  * SLOW-LINK BOUND (T51-fix, for the docs): a single legitimate upload is
- * also bounded in TIME — the host's HTTP server keeps its default 300 s
- * request deadline, and the sub-client's own round-trip budget caps at the
- * same 300 s (relay-client.ts, the T31-fix rule) — so a 100 MiB body needs
- * roughly 2.8 Mbps sustained end to end; slower links fail the call (the
- * client-side refusal keeps the connection state) rather than hanging.
+ * also bounded in TIME. The sub-client's own round-trip budget now caps at
+ * 15 minutes (relay-client.ts, the T31-fix rule), but the HOST's HTTP server
+ * keeps Node's default 300 s request deadline — that is the binding limit:
+ * a 500 MiB body needs roughly 14 Mbps sustained end to end, and a slower
+ * link fails the call (the client-side refusal keeps the connection state)
+ * rather than hanging. Raising the cap past what that deadline can carry
+ * would only move the failure, so 500 MiB is the honest ceiling for the
+ * current transport.
  */
-export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+export const MAX_UPLOAD_BYTES = 500 * 1024 * 1024
 
 /** The `/api` route the upload channel dispatches into, verbatim from the
  * host's own registration (RT dsh-client-file-upload lib/index.js:73). */
@@ -289,6 +292,20 @@ export interface RelayHandlerOptions {
    * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
    * Content-Length and streaming-count refusals stay cheap to drive. */
   uploadCapBytes?: number
+  /** Prompt-attachment materialization (2.3.0): stores one binary body at a
+   * private, VISIBLE path on this host and returns it, so a remote prompt's
+   * `@<client path>` mention can be rewritten to a path the agent reads with
+   * its ordinary file tools. Absent — an older wiring — and
+   * `v1/prompt-attachment` answers 501 `unsupported`, which the client treats
+   * as "fall back to the attachment receipt". */
+  promptAttachments?: {
+    save(input: {
+      sessionId: string
+      name?: string | undefined
+      body: ReadableStream<Uint8Array> | null
+      signal?: AbortSignal | undefined
+    }): Promise<{ path: string }>
+  }
   /** How long an upload refusal's tail drain may run before the socket is
    * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
    * Tests inject a small value so the deadline path stays cheap to drive. */
@@ -422,6 +439,100 @@ function headerValue(req: IncomingMessage, name: string): string | undefined {
   const raw = req.headers[name]
   const value = Array.isArray(raw) ? raw[0] : raw
   return typeof value === 'string' ? value : undefined
+}
+
+/** The streaming upload pump shared by `v1/upload` and
+ * `v1/prompt-attachment`: the client's chunks are re-emitted into a
+ * synthetic body verbatim, counted on the way through, with real
+ * backpressure (the socket pauses whenever the consumer is not pulling).
+ * Past the cap the pump errors — the consumer's reader throws mid-write —
+ * and the route answers its own 413 before draining the tail. Returned as
+ * accessors so the route can judge the cap AFTER the consumer settles. */
+interface PumpedUploadBody {
+  body: ReadableStream<Uint8Array>
+  received: () => number
+  tooLarge: () => boolean
+  /** Detach the socket listeners once the route is done with the body. */
+  detach: () => void
+}
+
+function pumpUploadBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cap: number,
+  hangUp: AbortController,
+): PumpedUploadBody {
+  let received = 0
+  let tooLarge = false
+  const onClientGone = (): void => {
+    if (!res.writableEnded) hangUp.abort()
+  }
+  res.on('close', onClientGone)
+  const body = new ReadableStream<Uint8Array>({
+    start: (controller) => {
+      req.pause()
+      req.on('data', (chunk: Buffer) => {
+        if (tooLarge) return
+        received += chunk.byteLength
+        if (received > cap) {
+          tooLarge = true
+          req.pause()
+          hangUp.abort()
+          try {
+            controller.error(new Error('payload-too-large'))
+          } catch {
+            // The consumer may have cancelled first.
+          }
+          return
+        }
+        try {
+          controller.enqueue(new Uint8Array(chunk))
+        } catch {
+          req.destroy()
+          return
+        }
+        if (controller.desiredSize !== null && controller.desiredSize <= 0) req.pause()
+      })
+      req.on('end', () => {
+        if (tooLarge) return
+        try {
+          controller.close()
+        } catch {
+          // Already errored by the consumer's cancel.
+        }
+      })
+      req.on('error', () => {
+        if (tooLarge) return
+        try {
+          controller.error(new Error('upload stream failed'))
+        } catch {
+          // Already errored.
+        }
+      })
+      req.on('close', () => {
+        if (tooLarge) return
+        try {
+          controller.close()
+        } catch {
+          // A hang-up destroy after a clean end — nothing to close.
+        }
+      })
+    },
+    pull: () => {
+      req.resume()
+    },
+    cancel: () => {
+      req.pause()
+    },
+  })
+  return {
+    body,
+    received: () => received,
+    tooLarge: () => tooLarge,
+    detach: () => {
+      res.off('close', onClientGone)
+    },
+  }
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -2102,83 +2213,10 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         return
       }
       // A hang-up cancels the forward mid-stream, like invoke's — and the
-      // cap pump below aborts the SAME controller when it trips, so an
-      // oversized upload dies at the host side the moment it is judged.
+      // cap pump (pumpUploadBody) aborts the SAME controller when it trips,
+      // so an oversized upload dies at the host side the moment it is judged.
       const hangUp = new AbortController()
-      const onClientGone = (): void => {
-        if (!res.writableEnded) hangUp.abort()
-      }
-      res.on('close', onClientGone)
-      // The counting pump: the client's chunks are re-emitted into the
-      // synthetic body verbatim, counted on the way through, with real
-      // backpressure (the socket pauses whenever the host handler is not
-      // pulling). Past the cap the pump errors — the host's reader throws
-      // out of `requestBodyChunks` and its upload dies mid-write — and the
-      // answer below is the relay's own 413 (written before the tail drain),
-      // never the host's internal failure envelope. `tooLarge` also detaches
-      // the pump from the socket: the tail belongs to drainUpload's bound,
-      // which continues from the pump's own count.
-      let received = 0
-      let tooLarge = false
-      const body = new ReadableStream<Uint8Array>({
-        start: (controller) => {
-          req.pause()
-          req.on('data', (chunk: Buffer) => {
-            if (tooLarge) return
-            received += chunk.byteLength
-            if (received > uploadCapBytes) {
-              tooLarge = true
-              req.pause()
-              hangUp.abort()
-              try {
-                controller.error(new Error('payload-too-large'))
-              } catch {
-                // The host consumer may have cancelled first.
-              }
-              return
-            }
-            try {
-              controller.enqueue(new Uint8Array(chunk))
-            } catch {
-              req.destroy()
-              return
-            }
-            if (controller.desiredSize !== null && controller.desiredSize <= 0) req.pause()
-          })
-          req.on('end', () => {
-            if (tooLarge) return
-            try {
-              controller.close()
-            } catch {
-              // Already errored by the consumer's cancel.
-            }
-          })
-          req.on('error', () => {
-            if (tooLarge) return
-            try {
-              controller.error(new Error('upload stream failed'))
-            } catch {
-              // Already errored.
-            }
-          })
-          req.on('close', () => {
-            if (tooLarge) return
-            try {
-              controller.close()
-            } catch {
-              // A hang-up destroy after a clean end — nothing to close.
-            }
-          })
-        },
-        pull: () => {
-          req.resume()
-        },
-        cancel: () => {
-          // The host consumer stopped reading (its own error path): stop
-          // pulling from the client too — the drain below finishes the wire.
-          req.pause()
-        },
-      })
+      const pump = pumpUploadBody(req, res, uploadCapBytes, hangUp)
       let request: Request
       try {
         // The URL is composed from the DECISION's normalized query alone,
@@ -2188,7 +2226,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         const init: RequestInit = {
           method: 'POST',
           headers: { 'content-type': 'application/octet-stream' },
-          body,
+          body: pump.body,
           signal: hangUp.signal,
         }
         // `duplex: 'half'` is mandatory for a streaming request body; the
@@ -2215,10 +2253,10 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // wire, and the sub-client reconstructs the exact Response its UI
         // would have seen locally.
         const bodyText = await upstream.text()
-        if (tooLarge) {
+        if (pump.tooLarge()) {
           res.setHeader('Connection', 'close')
           responseJson(res, 413, PAYLOAD_TOO_LARGE)
-          await drainUpload(req, received, drainDeadlineMs)
+          await drainUpload(req, pump.received(), drainDeadlineMs)
           return
         }
         const contentType = upstream.headers.get('content-type') ?? undefined
@@ -2232,17 +2270,87 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // cap verdict outranks it: the abort the pump sent INTO the dispatch
         // surfaces here as a throw, and the client still gets its 413
         // (before the tail drain, like every oversize answer).
-        if (tooLarge) {
+        if (pump.tooLarge()) {
           res.setHeader('Connection', 'close')
           responseJson(res, 413, PAYLOAD_TOO_LARGE)
-          await drainUpload(req, received, drainDeadlineMs)
+          await drainUpload(req, pump.received(), drainDeadlineMs)
           return
         }
         responseJson(res, 502, { ok: false, error: { code: 'internal' } })
       } finally {
-        res.off('close', onClientGone)
+        pump.detach()
         // The upload is over — answered, refused mid-flight, or its client
         // gone: the budget slot goes back (T51-fix).
+        const remaining = (uploadsByDevice.get(device) ?? 1) - 1
+        if (remaining <= 0) uploadsByDevice.delete(device)
+        else uploadsByDevice.set(device, remaining)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/prompt-attachment`) {
+      // The VISIBLE-PATH upload (2.3.0), the twin of `v1/upload`: same walls,
+      // same per-device budget, same streaming pump — only the destination
+      // differs. The client sends the bytes of a client-local file its prompt
+      // mentions; this route materializes them under the host's private
+      // prompt-attachment tree and answers the absolute path, which the client
+      // rewrites into the prompt text. A wiring without a store answers 501 so
+      // an older host keeps the attachment-receipt fallback.
+      if (Number(req.headers['content-length']) > uploadCapBytes) {
+        res.setHeader('Connection', 'close')
+        responseJson(res, 413, PAYLOAD_TOO_LARGE)
+        await drainUpload(req, 0, drainDeadlineMs)
+        return
+      }
+      const decision = decideUploadQuery(new URL(req.url ?? '/', 'http://dsh.internal').search, isAccessible)
+      if (!decision.allow) {
+        await drainUpload(req, 0, drainDeadlineMs)
+        responseJson(res, decision.reason === 'not-shared' ? 403 : 400, { ok: false, error: { code: decision.reason } })
+        return
+      }
+      const save = options.promptAttachments?.save
+      if (save === undefined) {
+        await drainUpload(req, 0, drainDeadlineMs)
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      if ((uploadsByDevice.get(device) ?? 0) >= MAX_UPLOADS_PER_DEVICE) {
+        await drainUpload(req, 0, drainDeadlineMs)
+        responseJson(res, 429, { ok: false, error: { code: 'too-many-uploads' } })
+        return
+      }
+      const hangUp = new AbortController()
+      const pump = pumpUploadBody(req, res, uploadCapBytes, hangUp)
+      uploadsByDevice.set(device, (uploadsByDevice.get(device) ?? 0) + 1)
+      try {
+        const saved = await save({
+          sessionId: decision.sessionId,
+          ...(decision.name === undefined ? {} : { name: decision.name }),
+          body: pump.body,
+          signal: hangUp.signal,
+        })
+        if (pump.tooLarge()) {
+          res.setHeader('Connection', 'close')
+          responseJson(res, 413, PAYLOAD_TOO_LARGE)
+          await drainUpload(req, pump.received(), drainDeadlineMs)
+          return
+        }
+        if (typeof saved.path !== 'string' || saved.path === '') {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+          return
+        }
+        responseJson(res, 200, { ok: true, value: { path: saved.path } })
+      } catch {
+        if (pump.tooLarge()) {
+          res.setHeader('Connection', 'close')
+          responseJson(res, 413, PAYLOAD_TOO_LARGE)
+          await drainUpload(req, pump.received(), drainDeadlineMs)
+          return
+        }
+        responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+      } finally {
+        pump.detach()
         const remaining = (uploadsByDevice.get(device) ?? 1) - 1
         if (remaining <= 0) uploadsByDevice.delete(device)
         else uploadsByDevice.set(device, remaining)

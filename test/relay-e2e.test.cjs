@@ -444,8 +444,40 @@ test('e2e: workspaceFiles/readBytes rides the JSON relay as a base64 marker (202
   } finally { await env.stop() }
 })
 
-// ---- 3. stream: frames flow, an unshare kills the stream loudly ---------------
+test('e2e: officeToPdf/render is a shared-session read whose PDF bytes ride the binary marker (2.2.6)', async () => {
+  const pdf = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0, 1, 254, 255])
+  const env = await boot({
+    shared: ['session-a'],
+    invoke: (call) => {
+      if (call.namespace === 'officeToPdf' && call.method === 'render') {
+        return { data: pdf, eof: true, absolutePath: '/srv/a/report.docx', version: 'v1', missingFonts: [] }
+      }
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+  })
+  try {
+    await env.client.connect()
+    const value = await env.client.invoke('officeToPdf', 'render', {
+      workspaceFileScopeId: 'session-a',
+      path: 'report.docx',
+      priority: 'foreground',
+    })
+    assert.equal(value.absolutePath, '/srv/a/report.docx')
+    assert.equal(typeof value.data['$zr-u8'], 'string', 'the PDF typed array traveled as the base64 marker')
+    assert.deepEqual(Array.from(Buffer.from(value.data['$zr-u8'], 'base64')), Array.from(pdf), 'the bytes round-tripped exactly')
 
+    // The registry discipline: the session field is the ONLY authorization,
+    // so an unshared scope is refused before the fake gateway sees the call.
+    const before = env.invokeCalls.length
+    await assert.rejects(
+      () => env.client.invoke('officeToPdf', 'render', { workspaceFileScopeId: 'session-secret', path: 'x.docx' }),
+      (error) => error instanceof RelayError && error.code === 'not-shared',
+    )
+    assert.equal(env.invokeCalls.length, before, 'the unshared conversion never ran on the host')
+  } finally { await env.stop() }
+})
+
+// ---- 3. stream: frames flow, an unshare kills the stream loudly ---------------
 test('e2e: openStream delivers the pushed frames in order and ends cleanly', async () => {
   const env = await boot({ shared: ['session-a'] })
   try {
