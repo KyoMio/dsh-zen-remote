@@ -376,19 +376,52 @@ export function MobileHome({
   }
 
   // Opens the OFFICIAL settings modal (dsh-client-ui-settings-general's
-  // SettingsRoot) by clicking its real trigger button — its "open" state is
+  // SettingsRoot) by clicking its real trigger — its "open" state is
   // component-local React state with no public setter, same reasoning as
-  // MobileSessionHeader's Chat/Trajectory tab click. The trigger mounts
-  // inside the sidebar's `sidebar.settings` footer slot
-  // (`[class$="_settingsArea"]`, the sidebar shell's stable class suffix —
-  // see dsh-client-ui-sidebar's SidebarRoot), which is display:none on the
-  // phone breakpoint (home.css.ts): `.click()` still dispatches (bypasses
-  // hit-testing, S2.1 precedent) and flips `open`, but the resulting
-  // `aria-modal="true"` dialog would still paint nothing without the portal
-  // fix in styles/chips.css.ts (`:has([aria-modal="true"])` un-hides exactly
-  // the ancestor chain down to it, not the whole sidebar).
+  // MobileSessionHeader's Chat/Trajectory tab click. The trigger lives in the
+  // sidebar's `sidebar.settings` footer slot (`[class$="_settingsArea"]`, the
+  // sidebar shell's stable class suffix — see dsh-client-ui-sidebar's
+  // SidebarRoot), which is display:none on the phone breakpoint
+  // (home.css.ts): `.click()` still dispatches (bypasses hit-testing, S2.1
+  // precedent) and flips `open`.
+  //
+  // DSH 0.2.1-rc.2 moved the entry: that slot now holds only the ACCOUNT
+  // launcher (aria-haspopup="menu"), and Settings is an item inside its menu
+  // — the `button[aria-haspopup="dialog"]` this used to forward to is gone
+  // (and the resulting dialog is a body portal now, so the chips.css.ts
+  // ancestor un-hide below no longer has anything to reveal). Hence the
+  // menu fallback; both paths keep the label-free, structure-free
+  // "dispatch a click on the official control" approach.
   const openSettings = (): void => {
-    document.querySelector<HTMLButtonElement>('[class$="_settingsArea"] button[aria-haspopup="dialog"]')?.click()
+    const area = document.querySelector<HTMLElement>('[class$="_settingsArea"]')
+    // Older DSH: the settings modal's own trigger sits in the settings area.
+    const direct = area?.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')
+    if (direct) {
+      direct.click()
+      return
+    }
+    // DSH 0.2.1-rc.2: the sidebar footer's settings area now holds only the
+    // ACCOUNT launcher (aria-haspopup="menu", data-signed-out), and 设置 /
+    // Settings is the first item inside that menu — the dialog trigger this
+    // used to forward to no longer exists there, so the bare
+    // querySelector()?.click() silently no-oped (real-phone report
+    // 2026-10-21: "手机端右上角设置点了没反应"). Open the menu, then click the
+    // settings item; React mounts the menu synchronously on a click, but poll
+    // briefly anyway so a sibling launcher that defers cannot break it.
+    const launcher = area?.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"], button')
+    if (!launcher) return
+    launcher.click()
+    let tries = 0
+    const look = (): void => {
+      const item = [...document.querySelectorAll<HTMLElement>('[role="menu"] [role="menuitem"], [role="menu"] button, [role="menu"] a, [role="menu"] li')]
+        .find((el) => /设置|Settings/i.test(el.textContent || ''))
+      if (item) {
+        item.click()
+        return
+      }
+      if (++tries < 20) setTimeout(look, 25)
+    }
+    setTimeout(look, 0)
   }
 
   if (!phone) return null
