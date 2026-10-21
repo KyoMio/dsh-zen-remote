@@ -457,14 +457,24 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
      (config file + close) is reparented INTO this nav row by a client
      effect (MobileNavOverlay), so the tab list must be anchored by its
      class, NOT by :last-child (the reparented toolbar becomes the nav's
-     new last child). */
+     new last child).
+
+     2026-10-21 (DSH 0.2.1-rc.2): this rule used to declare
+     "flex-wrap: wrap; overflow: visible" on top of the flex/min-width/gap
+     above. Because it is one class-anchored compound selector with a much
+     higher specificity than compat.css.ts's portal-scoped navList rule, it
+     silently won the tie and the tab list wrapped into two rows — with the
+     reparented ✕ vertically centred across both of them. Measured on a
+     phone shell: the list was 86px tall (two rows) instead of one 40px row,
+     and it scrolled nowhere. The wrap was a 2026-08-16 trade-off (show every
+     tab, no hidden scroll cut-off); with the thin scrollbar affordance now
+     in compat.css.ts the single scrolling row is the better trade, so the
+     two declarations live there and this rule no longer contradicts them. */
   [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])):not(:has([class*="ZuhsRW"])) > :first-child [class$="_navList"] {
     flex: 1 1 auto !important;
     min-width: 0 !important;
     flex-direction: row !important;
-    flex-wrap: wrap !important;
     gap: 6px !important;
-    overflow: visible !important;
   }
   /* Content toolbar (Open configuration file + close): grouped flush to
      the right edge, and reparented INTO the nav row on mobile so it shares
