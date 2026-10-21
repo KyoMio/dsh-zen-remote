@@ -294,6 +294,10 @@ export const zh = {
   'remoteGroupRevoked': '（令牌已吊销）',
   'remoteGroupUnpaired': '（已解除配对）',
   'remoteGroupMismatch': '（版本有差异）',
+  // --- 2.2.6: 远程会话产物下载（deliverable 卡片 / 文档预览头） ---
+  'downloadToLocal': '下载到本机',
+  'downloadBusy': '下载中…',
+  'downloadFailed': '下载失败',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -583,6 +587,11 @@ export const en: Record<MobileNavKey, string> = {
   'remoteGroupRevoked': ' (token revoked)',
   'remoteGroupUnpaired': ' (unpaired)',
   'remoteGroupMismatch': ' (version mismatch)',
+  // 2.2.6: remote-session artifact download (deliverable cards / document
+  // preview header).
+  'downloadToLocal': 'Download to this computer',
+  'downloadBusy': 'Downloading…',
+  'downloadFailed': 'Download failed',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

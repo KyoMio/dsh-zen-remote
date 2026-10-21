@@ -276,6 +276,9 @@ export declare const zh: {
     readonly remoteGroupRevoked: "（令牌已吊销）";
     readonly remoteGroupUnpaired: "（已解除配对）";
     readonly remoteGroupMismatch: "（版本有差异）";
+    readonly downloadToLocal: "下载到本机";
+    readonly downloadBusy: "下载中…";
+    readonly downloadFailed: "下载失败";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

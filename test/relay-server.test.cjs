@@ -67,6 +67,7 @@ function makeParts(name, overrides = {}) {
     ...(overrides.parentOf ? { parentOf: overrides.parentOf } : {}),
     ...(overrides.getApiFetch ? { getApiFetch: overrides.getApiFetch } : {}),
     ...(overrides.uploadCapBytes !== undefined ? { uploadCapBytes: overrides.uploadCapBytes } : {}),
+    ...(overrides.promptAttachments !== undefined ? { promptAttachments: overrides.promptAttachments } : {}),
     ...(overrides.drainDeadlineMs !== undefined ? { drainDeadlineMs: overrides.drainDeadlineMs } : {}),
   })
   return { handler, calls, streamCalls, gateway, store, home }
@@ -1279,6 +1280,81 @@ test('T41b-fix parser differential: what the share check approves is EXACTLY wha
     const clean = await server.fetch('/_dsh/zen-remote/relay/v1/http', post('/h', { route: 'changes.diff', query: 'index=0&sessionId=session-1&extra=x&seq=3' }, AUTH))
     assert.equal(clean.status, 200)
     assert.equal(api.seen[0].url, 'http://relay.local/api/changes.diff?sessionId=session-1&seq=3&index=0')
+  } finally { await server.stop() }
+})
+
+// ---- 2.3.0: relay/v1/prompt-attachment (visible-path materialization) --------
+
+/** Read a web ReadableStream fully. */
+async function drainWebStream(stream) {
+  const chunks = []
+  if (stream === null) return Buffer.alloc(0)
+  const reader = stream.getReader()
+  for (;;) {
+    const next = await reader.read()
+    if (next.done) break
+    chunks.push(Buffer.from(next.value))
+  }
+  return Buffer.concat(chunks)
+}
+
+test('2.3.0 prompt-attachment: a shared session materializes the bytes and answers the path', async () => {
+  const saved = []
+  const parts = makeParts('prompt-attachment-ok', {
+    promptAttachments: {
+      save: async (input) => {
+        saved.push({ sessionId: input.sessionId, name: input.name, bytes: await drainWebStream(input.body) })
+        return { path: '/home/u/.dsh/tmp/prompt-attachments/session-1/20261021-1100-ab-日志.txt' }
+      },
+    },
+  })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/prompt-attachment?sessionId=session-1&name=note.txt', {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/octet-stream' },
+      body: Buffer.from('raw-bytes'),
+    })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.deepEqual(body, { ok: true, value: { path: '/home/u/.dsh/tmp/prompt-attachments/session-1/20261021-1100-ab-日志.txt' } })
+    assert.equal(saved.length, 1)
+    assert.equal(saved[0].sessionId, 'session-1')
+    assert.equal(saved[0].name, 'note.txt')
+    assert.equal(saved[0].bytes.toString(), 'raw-bytes')
+  } finally { await server.stop() }
+})
+
+test('2.3.0 prompt-attachment: an unshared session is refused before the store runs', async () => {
+  let called = 0
+  const parts = makeParts('prompt-attachment-unshared', {
+    promptAttachments: { save: async () => { called += 1; return { path: '/x' } } },
+  })
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/prompt-attachment?sessionId=session-secret', {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/octet-stream' },
+      body: Buffer.from('x'),
+    })
+    assert.equal(res.status, 403)
+    assert.equal(called, 0)
+  } finally { await server.stop() }
+})
+
+test('2.3.0 prompt-attachment: a host without the store answers 501 unsupported (client falls back)', async () => {
+  const parts = makeParts('prompt-attachment-absent')
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/prompt-attachment?sessionId=session-1', {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/octet-stream' },
+      body: Buffer.from('x'),
+    })
+    assert.equal(res.status, 501)
+    assert.deepEqual(await res.json(), { ok: false, error: { code: 'unsupported' } })
   } finally { await server.stop() }
 })
 
