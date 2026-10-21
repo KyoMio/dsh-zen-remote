@@ -47,7 +47,6 @@ test('decideInvoke: any unregistered method refuses, with or without a request o
     ['agentPresets', 'list', {}],
     ['agentPresets', 'read', { agentPreset: 'p' }],
     ['permissionPresets', 'catalog', {}],
-    ['officeToPdf', 'render', { request: { path: 'x' } }],
     ['dynamicCordisRunner', 'invoke', { agentId: 'VICTIM', request: {} }],
     ['schedule', 'delete', { request: { id: 's1', sessionId: 'S-shared' } }],
     ['anything', 'atAll', 'garbage'],
@@ -59,6 +58,38 @@ test('decideInvoke: any unregistered method refuses, with or without a request o
       `${namespace}/${method} is not registered`,
     )
   }
+})
+
+// -- 2.2.6: the Office preview pair -----------------------------------------------
+
+test('decideInvoke: officeToPdf/render is owned by the workspaceFileScopeId (session id)', () => {
+  // The SAME lookup the workspace-files group uses: the first argument is the
+  // session's file scope, so a shared SESSION (not a path) authorizes it.
+  assert.deepEqual(
+    decideInvoke('officeToPdf', 'render', { workspaceFileScopeId: 'S-shared' }, only(['S-shared'])),
+    { allow: true },
+  )
+  assert.deepEqual(
+    decideInvoke('officeToPdf', 'render', { workspaceFileScopeId: 'S-other' }, only(['S-shared'])),
+    { allow: false, reason: 'not-shared' },
+  )
+  // A path or a decoy-only argument buys nothing: the registered field is the
+  // ONLY one read, and a missing one is a 400, never a forward.
+  assert.deepEqual(
+    decideInvoke('officeToPdf', 'render', { request: { path: '/etc/passwd' } }, yes),
+    { allow: false, reason: 'no-session' },
+  )
+  assert.deepEqual(
+    decideInvoke('officeToPdf', 'render', { workspaceFileScopeId: 'S-shared', path: '/etc/passwd' }, only(['S-shared'])),
+    { allow: true },
+    'extra fields are never read (the registry discipline)',
+  )
+})
+
+test('decideInvoke: officeToPdf/generation stays unregistered (answers locally, never relayed)', () => {
+  // Field-less, so the client's interception never sees a virtual id and
+  // never forwards it; a direct relay call must still be refused.
+  assert.deepEqual(decideInvoke('officeToPdf', 'generation', {}, yes), { allow: false, reason: 'forbidden-method' })
 })
 
 // -- streaming entries refuse the invoke route ------------------------------------

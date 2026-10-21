@@ -61,6 +61,9 @@ const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
 const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 const HTTP_PATH = '/_dsh/zen-remote/relay/v1/http'
 const UPLOAD_PATH = '/_dsh/zen-remote/relay/v1/upload'
+/** The visible-path upload (2.3.0): materializes a prompt's client-local file
+ * on the host and returns its absolute path. */
+const PROMPT_ATTACHMENT_PATH = '/_dsh/zen-remote/relay/v1/prompt-attachment'
 const PLUGIN_PATH = '/_dsh/zen-remote/relay/v1/plugin'
 const PLUGIN_TUNNEL_OPEN_PATH = '/_dsh/zen-remote/relay/v1/plugin-tunnel/open'
 const PLUGIN_TUNNEL_SEND_PATH = '/_dsh/zen-remote/relay/v1/plugin-tunnel/send'
@@ -76,7 +79,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 
 /**
  * The invoke round-trip budget (T31-fix): the configured request timeout
- * plus 2 s per MiB of request body, capped at five minutes. The large
+ * plus 2 s per MiB of request body, capped at fifteen minutes. The large
  * bodies are the prompt routes' INLINE images — `session/prompt` /
  * `subagents/prompt` content blocks carry base64 `image` data, one image up
  * to 20 MiB by default (`maxImageBytes`, dsh-attachment-local) or ~27 MiB
@@ -84,7 +87,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
  * base seconds. The cap never lands below the configured base timeout.
  */
 const INVOKE_TIMEOUT_PER_MIB_MS = 2_000
-const INVOKE_TIMEOUT_CAP_MS = 300_000
+const INVOKE_TIMEOUT_CAP_MS = 900_000
 
 /**
  * How often an ONLINE client re-runs the handshake purely to refresh the two
@@ -364,6 +367,11 @@ export interface RelayClient {
    * `Content-Length`, when it had one) and a timeout there never moves the
    * connection state — the invoke route's rules (T31-fix). */
   upload(options: RelayUploadOptions, signal?: AbortSignal): Promise<RelayHttpResult>
+  /** One visible-path materialization (2.3.0): uploads one client-local file
+   * and resolves with the SERVER's absolute path. Refusals (unshared, offline,
+   * an older host answering 501 `unsupported`) throw RelayError; the caller
+   * treats any throw as "keep the attachment-receipt fallback". */
+  promptAttachment(options: RelayPromptAttachmentOptions, signal?: AbortSignal): Promise<RelayPromptAttachmentResult>
   /** One bridged-plugin round-trip (PB-4): the coordinates travel in the
    * x-zr-* headers (PB-3's protocol), no body. Resolves with the UNREAD
    * fetch Response the moment the headers arrive — the caller streams the
@@ -441,6 +449,24 @@ export interface RelayUploadOptions {
   /** The local request's declared byte count, when its `Content-Length` was
    * readable — sizes the round-trip budget and nothing else. */
   bytes?: number
+}
+
+/** The inputs of one {@link RelayClient.promptAttachment} round-trip. */
+export interface RelayPromptAttachmentOptions {
+  /** The ORIGINAL (non-virtual) session id. */
+  sessionId: string
+  /** The file's display name. */
+  name?: string
+  /** The raw byte stream (a local file the prompt mentions). */
+  body: ReadableStream<Uint8Array> | null
+  /** Declared size, for the round-trip budget. */
+  bytes?: number
+}
+
+/** One materialized prompt attachment. */
+export interface RelayPromptAttachmentResult {
+  /** Absolute path on the SERVER, suitable for the agent's own read tools. */
+  path: string
 }
 
 /** The upstream answer one {@link RelayClient.http} round-trip carries. */
@@ -1444,6 +1470,35 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     }
   }
 
+  async function promptAttachment(
+    options: RelayPromptAttachmentOptions,
+    signal?: AbortSignal,
+  ): Promise<RelayPromptAttachmentResult> {
+    const creds = requireCredentials()
+    const params = new URLSearchParams()
+    params.set('sessionId', options.sessionId)
+    if (options.name !== undefined) params.set('name', options.name)
+    const body =
+      options.body ??
+      new ReadableStream<Uint8Array>({
+        start: (controller) => {
+          controller.close()
+        },
+      })
+    const payload = await exchangeRequest(
+      `${creds.url}${PROMPT_ATTACHMENT_PATH}?${params.toString()}`,
+      uploadInit(creds.token, body),
+      signal,
+      true,
+      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, options.bytes), timeoutSetsOffline: false, transportSetsOffline: false },
+    )
+    const value = payload.value
+    if (!isRecord(value) || typeof value.path !== 'string' || value.path === '') {
+      throw new RelayError('internal', 'the relay prompt-attachment answer carries no path')
+    }
+    return { path: value.path }
+  }
+
   /**
    * The bridged-plugin forward (PB-4): headers in, an UNREAD Response out.
    * Deliberately NOT the shared exchange (it buffers the body): the fetch
@@ -1915,6 +1970,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     openStream,
     http,
     upload,
+    promptAttachment,
     pluginRequest,
     pluginTunnelOpen,
     pluginTunnelSend,
