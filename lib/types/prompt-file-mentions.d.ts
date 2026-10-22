@@ -7,6 +7,21 @@ export interface FileMention {
     /** The mention's path, quotes stripped. */
     path: string;
 }
+/**
+ * True when a path must NEVER be read and shipped by the mention materializer.
+ *
+ * The client uploads any absolute path a prompt mentions, so a pasted log line
+ * that happens to contain `~/.dsh/lan-gate-state.json` (the pairing table and
+ * the VAPID keys) or `~/.ssh/id_ed25519` would silently exfiltrate a secret to
+ * the host. The reviewer of the upstream PR called this out; the denylist is
+ * deliberately broad and fail-closed: DSH's own home (keys, shares, attachment
+ * store), the usual credential directories, and credential-looking file names.
+ *
+ * @param path - one resolved absolute path.
+ * @param dshHome - DSH home (tests inject one); defaults to DSH_HOME or ~/.dsh.
+ * @returns whether the path is refused.
+ */
+export declare function isSensitivePath(path: string, dshHome?: string): boolean;
 /** Absolute in either spelling the Host accepts: POSIX, Windows drive, UNC. */
 export declare function isAbsolutePathMention(path: string): boolean;
 /**

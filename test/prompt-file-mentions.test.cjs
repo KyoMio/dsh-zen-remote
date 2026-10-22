@@ -9,7 +9,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const { mkdtemp, writeFile, rm } = require('node:fs/promises')
-const { tmpdir } = require('node:os')
+const { homedir, tmpdir } = require('node:os')
 const { join } = require('node:path')
 
 /** Read a web stream fully (utf8). */
@@ -220,6 +220,79 @@ test('materialize (2.3.0): a host without the path route falls back to the attac
       { type: 'file', receiptId: 'receipt-1' },
       { type: 'text', text: ' 看下' },
     ])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('isSensitivePath: DSH home, key directories and credential names are refused', async () => {
+  const { isSensitivePath } = await import('../src/prompt-file-mentions.ts')
+  const home = await mkdtemp(join(tmpdir(), 'zr-home-'))
+  try {
+    assert.equal(isSensitivePath(join(home, 'lan-gate-state.json'), home), true)
+    assert.equal(isSensitivePath(join(home, 'nested', 'x.txt'), home), true)
+    assert.equal(isSensitivePath(join(homedir(), '.ssh', 'id_ed25519'), home), true)
+    assert.equal(isSensitivePath(join(homedir(), '.aws', 'credentials'), home), true)
+    assert.equal(isSensitivePath('/tmp/server.pem', home), true)
+    assert.equal(isSensitivePath('/tmp/service.key', home), true)
+    assert.equal(isSensitivePath('/tmp/.env', home), true)
+    assert.equal(isSensitivePath('/tmp/zen-remote-shares.json', home), true)
+    assert.equal(isSensitivePath('/tmp/regular.log', home), false)
+    assert.equal(isSensitivePath('/tmp/notes.txt', home), false)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('materialize: a sensitive path (DSH home) is never read or uploaded', async () => {
+  const { materializeLocalFileMentions } = await import('../src/prompt-file-mentions.ts')
+  const dshHome = await mkdtemp(join(tmpdir(), 'zr-dshhome-'))
+  const secret = join(dshHome, 'lan-gate-state.json')
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = dshHome
+  try {
+    await writeFile(secret, '{"token":"do-not-leak"}')
+    const relay = fakeRelay({ pathMode: 'ok' })
+    const args = { request: { sessionId: 's', content: [{ type: 'text', text: `@${secret} 看下` }] } }
+    const before = JSON.stringify(args)
+    await materializeLocalFileMentions(args, relay)
+    assert.equal(JSON.stringify(args), before, 'the prompt is untouched')
+    assert.equal(relay.calls.promptAttachments.length, 0)
+    assert.equal(relay.calls.uploads.length, 0)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    await rm(dshHome, { recursive: true, force: true })
+  }
+})
+
+test('materialize: the suffix trim never crosses a path character into a different file', async () => {
+  const { materializeLocalFileMentions } = await import('../src/prompt-file-mentions.ts')
+  const dir = await mkdtemp(join(tmpdir(), 'zr-trim-'))
+  const real = join(dir, 'report.txt')
+  await writeFile(real, 'x')
+  try {
+    const relay = fakeRelay()
+    const args = { request: { sessionId: 's', content: [{ type: 'text', text: `@${real}.bak` }] } }
+    await materializeLocalFileMentions(args, relay)
+    assert.equal(relay.calls.promptAttachments.length + relay.calls.uploads.length, 0, 'report.txt.bak must not resolve to report.txt')
+    assert.match(args.request.content[0].text, /report\.txt\.bak/u)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('materialize: CJK prose glued after a real path still resolves to that file', async () => {
+  const { materializeLocalFileMentions } = await import('../src/prompt-file-mentions.ts')
+  const dir = await mkdtemp(join(tmpdir(), 'zr-glue-'))
+  const file = join(dir, '日志.txt')
+  await writeFile(file, 'log')
+  try {
+    const relay = fakeRelay({ pathMode: 'ok' })
+    const args = { request: { sessionId: 's', content: [{ type: 'text', text: `@${file}）里看下` }] } }
+    await materializeLocalFileMentions(args, relay)
+    assert.equal(relay.calls.promptAttachments.length, 1)
+    assert.equal(args.request.content[0].text, '@/host/.dsh/tmp/prompt-attachments/session-a/20261021-1100-ab-日志.txt）里看下')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
