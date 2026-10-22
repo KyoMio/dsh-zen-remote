@@ -136,6 +136,32 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
       opacity .3s var(--ds-ease-in-out, ease-in-out),
       visibility 0s .3s;
   }
+  /* The host's SESSION header must not sit on top of this list page.
+     Real-device report (2026-10-22, DSH 0.2.0-rc.2, dsh-web-mobile 3.2.1,
+     360x792 phone): on the list page the top strip showed the LAST SESSION's
+     header — its title plus the session's tab row — and the workspace switcher
+     underneath was neither visible nor tappable, so "switch workspace" did
+     nothing at all. Measured with elementFromPoint(150,30) on the phone
+     viewport: span.wSkVaW_crumbCurrent, i.e. the host header's crumb, while
+     our own workspace button sat at [46,8,208,44] underneath it.
+
+     Why z-index is not the fix: this page is position:absolute; z-index:5
+     inside the shell overlay layer, and the host header carries its own
+     stacking context, so raising us above its z-index:30 changed nothing
+     (measured: the crumb still won the hit test). The session header has to
+     leave the hit tree while the list page is up — the list page draws its
+     own top bar (home-top, with the workspace switcher).
+
+     The gate is this page's own marker: data-view="session" means a session
+     is open, so the rule lapses exactly when the host header is wanted again
+     (verified: entering a session restores display:grid, the back button in
+     that header stays tappable, and going back hides it once more). Two
+     selectors on purpose — the class suffix survives CSS-module hash renames,
+     the structural one survives a rename of the class itself. */
+  body:has([data-mobile-nav="home"]:not([data-view="session"])) [data-mobile-nav="frame"] header[class*="_header"],
+  body:has([data-mobile-nav="home"]:not([data-view="session"])) [data-mobile-nav="frame"] header:has([class*="_titleRow"]) {
+    display: none !important;
+  }
   @media (prefers-reduced-motion: reduce) {
     [data-mobile-nav="home"],
     [data-mobile-nav="home"][data-view="session"] {
