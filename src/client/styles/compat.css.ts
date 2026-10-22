@@ -306,9 +306,9 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
      renders inside the app frame — it is a PORTAL on body
      (body > [class$="_overlay"] > [class$="_panel"]), so a
      [data-mobile-nav="frame"] [aria-modal="true"] … prefix can never match
-     it, and the old :has(> :first-child > :last-child > button) shape
-     qualifier guessed a child depth the panel no longer has (now
-     panel > nav > (navTitle, navList, header)). Symptom: four nav cells
+     it, and the panel depth the old :has(> :first-child > :last-child >
+     button) gate was written against is no longer the shape the sheet has
+     (now panel > nav > (navTitle, navList, header)). Symptom: four nav cells
      fell back to the host's wrapping grid (measured 209x132 for the list
      instead of one 40px row) and the "open config file" action came back
      into the header. Keep the same phone gate from the ancestor side
@@ -319,8 +319,15 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
      This rule is the only place that declares the row's wrap/overflow now:
      layout.css.ts's navList rule has a higher specificity and used to force
      "flex-wrap: wrap; overflow: visible", so the one-row intent below never
-     actually rendered (see the note in layout.css.ts). */
-  html:has([data-mobile-nav="frame"]) [aria-modal="true"] [class$="_navList"] {
+     actually rendered (see the note in layout.css.ts).
+
+     Every selector below is gated on :has([class$="_navList"]) — the one
+     stable feature of the settings sheet. The ancestor marker alone is not
+     enough: once the dialog is a body portal, [aria-modal="true"] matches
+     EVERY dialog on the phone (session export, directory picker, plugin
+     sheets), which is how the first cut of this block ended up hiding the
+     top-right action button of all of them (review, 2026-10-22). */
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navList"] {
     display: flex !important;
     flex-wrap: nowrap !important;
     /* The nav row is [navList][header(close)]: min-width:0 + flex-basis auto
@@ -337,17 +344,17 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
   }
   /* Hairline scrollbar for the tab row: the default WebKit scrollbar reads
      fat on a phone; 2px keeps the scroll affordance without the bulk. */
-  html:has([data-mobile-nav="frame"]) [aria-modal="true"] [class$="_navList"]::-webkit-scrollbar {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navList"]::-webkit-scrollbar {
     height: 2px !important;
   }
-  html:has([data-mobile-nav="frame"]) [aria-modal="true"] [class$="_navList"]::-webkit-scrollbar-thumb {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navList"]::-webkit-scrollbar-thumb {
     background: var(--dsw-alias-border-l2, rgba(0, 0, 0, .22)) !important;
     border-radius: 1px !important;
   }
-  html:has([data-mobile-nav="frame"]) [aria-modal="true"] [class$="_navList"]::-webkit-scrollbar-track {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navList"]::-webkit-scrollbar-track {
     background: transparent !important;
   }
-  html:has([data-mobile-nav="frame"]) [aria-modal="true"] [class$="_navCell"] {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navCell"] {
     flex: 0 0 auto !important;
     white-space: nowrap !important;
     padding: 6px 8px !important;
@@ -355,7 +362,7 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     font-size: 13px !important;
     justify-content: flex-start !important;
   }
-  html:has([data-mobile-nav="frame"]) [aria-modal="true"] [class$="_navCell"] svg {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navCell"] svg {
     width: 14px !important;
     height: 14px !important;
     flex: none !important;
@@ -364,10 +371,10 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
      mobile — it is rarely needed on a phone and steals ~180px from the
      tab row's scroll area (user feedback 2026-08-16). Only the close ✕
      stays, flush right in the nav row. Desktop untouched (phone gate). */
-  html:has([data-mobile-nav="frame"]) [aria-modal="true"] [class$="_header"] [class$="_actions"] {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_header"] [class$="_actions"] {
     display: none !important;
   }
-  html:has([data-mobile-nav="frame"]) [aria-modal="true"] [class$="_header"] [class$="_actions"] [class$="_action"] {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_header"] [class$="_actions"] [class$="_action"] {
     font-size: 13px !important;
     padding: 6px 12px !important;
     min-height: 0 !important;
