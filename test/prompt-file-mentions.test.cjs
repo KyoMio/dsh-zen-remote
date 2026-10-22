@@ -127,13 +127,16 @@ test('materialize: a path the host already has stays a text mention (no upload)'
   }
 })
 
-test('materialize: a missing local file or a failed upload leaves the prompt untouched', async () => {
+test('materialize: a missing local file keeps the text and appends a visible failure note', async () => {
   const { materializeLocalFileMentions } = await import('../src/prompt-file-mentions.ts')
   const missing = { request: { sessionId: 's', content: [{ type: 'text', text: '@C:\\does\\not\\exist.txt 看下' }] } }
   const relay = fakeRelay()
   await materializeLocalFileMentions(missing, relay)
   assert.equal(relay.calls.uploads.length, 0)
-  assert.deepEqual(missing.request.content, [{ type: 'text', text: '@C:\\does\\not\\exist.txt 看下' }])
+  assert.equal(missing.request.content.length, 2)
+  assert.equal(missing.request.content[0].text, '@C:\\does\\not\\exist.txt 看下', 'the original text stays intact')
+  assert.match(missing.request.content[1].text, /远程附件未送达/u)
+  assert.match(missing.request.content[1].text, /exist\.txt/u)
 
   const dir = await mkdtemp(join(tmpdir(), 'zr-mention-'))
   const file = join(dir, 'b.txt')
@@ -143,7 +146,8 @@ test('materialize: a missing local file or a failed upload leaves the prompt unt
     const args = { request: { sessionId: 's', content: [{ type: 'text', text: `@${file} 看下` }] } }
     await materializeLocalFileMentions(args, failing)
     assert.equal(failing.calls.uploads.length, 1)
-    assert.deepEqual(args.request.content, [{ type: 'text', text: `@${file} 看下` }], 'nothing removed when the receipt fails')
+    assert.equal(args.request.content[0].text, `@${file} 看下`, 'nothing removed when the receipt fails')
+    assert.match(args.request.content[1].text, /远程附件未送达/u)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
