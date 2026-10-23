@@ -39,6 +39,25 @@ export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
 /** POST: one immediate reconnect attempt (T43, the settings page's 立即重连);
  * answered 409 unless the relay client is currently `offline`. */
 export declare const CLIENT_RECONNECT_ROUTE = "/_dsh/zen-remote/client/reconnect";
+/** POST: the browser's NETWORK-RESTORED hint.
+ *
+ * Why this route exists: the host half runs in a plain Node process with no
+ * OS network events, and the browser half cannot touch the relay client's
+ * memory across the HTTP boundary. So the browser — the only place that can
+ * observe `online`/`visibilitychange` — reports the hint here, and the host
+ * turns it into ONE controlled probe + reconnect.
+ *
+ * Deliberately narrower than `reconnect`:
+ *  - it first runs `probeHealth()` (authenticated GET /ping); a hint NEVER
+ *    alone proves the link is back (`navigator.onLine === true` is not
+ *    evidence);
+ *  - only a successful probe advances to `networkRestored()`, which itself
+ *    refuses outside `offline` and inside its 3s anti-storm gap;
+ *  - it answers the probe outcome so the page can log/annotate it.
+ *
+ * It NEVER changes state by itself: `probeHealth` is read-only, and
+ * `networkRestored` is the same controlled path the settings button uses. */
+export declare const CLIENT_NETWORK_HINT_ROUTE = "/_dsh/zen-remote/client/network-hint";
 /** GET: the remote-session status the T34 client parts render from (T34) —
  * the relay's serving state, the interface-compatibility verdict, the
  * handshake's server name, and the closed-session map. The prefix is

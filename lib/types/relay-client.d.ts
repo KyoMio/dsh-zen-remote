@@ -194,6 +194,16 @@ export interface RelayClient {
      * ladder (the settings page's 立即重连). Answers whether an attempt was
      * started — the reconnect route turns a false into a 409. */
     reconnect(): boolean;
+    /** ONE lightweight authenticated health probe
+     * (`GET /ping`). Never changes `state`; de-duplicated while in flight;
+     * resolves false on any refusal. NOT a poller — call it on a real signal. */
+    probeHealth(): Promise<boolean>;
+    /** a CONTROLLED fast-path for a reliable
+     * "network is back" signal. Fires only from `offline`, refuses within
+     * NETWORK_HINT_MIN_GAP_MS of the previous hint (no storm), and otherwise
+     * behaves exactly like reconnect(). connect() de-duplicates concurrent
+     * attempts via connectInFlight. Answers whether an attempt started. */
+    networkRestored(): boolean;
     /** Notify that the credentials source may have changed (the loader's
      * volatile-update for the row): a pending reconnect wait is cancelled and,
      * with credentials present, one immediate attempt runs with the new
