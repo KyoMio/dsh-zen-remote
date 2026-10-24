@@ -81,15 +81,26 @@
       alert(T.unsupported)
       return Promise.reject(new Error('push unsupported'))
     }
-    return new Promise(function (resolve, reject) {
-      if (!window.__DSH_PWA__.reg) {
-        navigator.serviceWorker.ready.then(function (reg) {
-          window.__DSH_PWA__.reg = reg
-          doSubscribe(reg).then(resolve).catch(reject)
-        }).catch(reject)
-      } else {
-        doSubscribe(window.__DSH_PWA__.reg).then(resolve).catch(reject)
-      }
+    // Ask for permission inside the click gesture: Safari only honours
+    // requestPermission() while user activation is still live, and this
+    // function is called straight from the button's click handler.
+    var perm = window.Notification.permission === 'granted'
+      ? Promise.resolve('granted')
+      : (typeof window.Notification.requestPermission === 'function'
+        ? window.Notification.requestPermission()
+        : Promise.resolve('denied'))
+    // Then wait for an ACTIVE worker. register() resolves before install
+    // finishes, so `__DSH_PWA__.reg` set from its .then() may still have a
+    // null `active` — WebKit rejects pushManager.subscribe() on it with
+    // "Subscribing for push requires an active service worker" (seen on a
+    // real iPhone PWA 2026-10-21; it worked after a restart, i.e. a race).
+    // navigator.serviceWorker.ready is the only reliable gate.
+    return perm.then(function (state) {
+      if (state !== 'granted') throw new Error(T.denied)
+      return navigator.serviceWorker.ready
+    }).then(function (reg) {
+      window.__DSH_PWA__.reg = reg
+      return doSubscribe(reg)
     })
   }
 
