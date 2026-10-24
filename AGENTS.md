@@ -140,6 +140,18 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
 - **`lib/` 是产物，不手改**：改 `src/` → `pnpm build` → 提交 `lib/`。
 - **桌面必须 no-op**：≥1024px 逐像素与未安装时一致。
   是从真机事故里攒出来的，改相关代码前先读。
+- **首帧壳只能内联注入**：冷启动占位壳由网关 `injectBootShell` 写进第一帧
+  HTML（`BOOT_SHELL_*`），DSH 一往 `#root` 渲染就同步摘掉。壳的 CSS/标记/脚本
+  都是网关里的内联常量（不放进 `pwa/app.css` 或客户端样式），带 30s CSS 渐隐
+  兜底；移除脚本有真实 vm 用例（DCL / 晚渲染 / `#root` 缺失 / 保险丝）。不能
+  挪进客户端插件——那个 bundle 正是首帧要等的东西；不能引入额外请求；显式
+  `desktop` 设备不注入、≥1024px 由 CSS 隐藏。`test/gateway.test.cjs` 钉住。
+- **长缓存只给内容寻址 URL**：网关只给 `/assets/` 下**哈希形状**（8+ 位且含
+  数字或大小写混合，排除 `vendor-bootstrap.css` 这类普通词）、且响应不是 HTML
+  的文件补 `immutable`（上游已有缓存头时让上游说话）；service worker 只对同一
+  判定与 `?rev=<hex 构建修订>`（DSH 按 mtime/ctime/size 生成，且 DSH 自己已
+  按 immutable 提供）的插件批次缓存优先；响应类型必须与 URL 声明一致，
+  HTML/错误页不得存进资源缓存。给无哈希 URL 做长缓存就是重演 v2 的「新 DOM + 旧 CSS」事故。
 - **要藏宿主刚渲染出来的东西，别用 `requestAnimationFrame`**：React 在该帧的
   rAF 阶段之后才提交 DOM，所以从 mutation 里排的 rAF 落在**下一帧**——中间那
   一帧已经画到屏幕上，用户就看见闪。两个月内三次「晚一帧」的 bug（2026-08-18

@@ -1,14 +1,21 @@
 /* dsh-mobile-pwa · service worker
  * Offline-capable caching + agent-done push notifications for the DSH Web UI.
  *
- * Strategy (v3 — see the "new DOM + old CSS" postmortem below):
+ * Strategy (v4 — see the "new DOM + old CSS" postmortem below):
  *  - True static shell (manifest, icons, offline fallback) -> cache-first.
  *    These are the only assets whose bytes cannot change without an entry in
  *    SHELL_PATHS changing too, so caching them aggressively is safe.
- *  - Everything else same-origin (DSH's own JS/CSS bundle, plugin client
- *    bundles incl. this plugin's own app.css/inject.js/touch-gestures.js,
- *    API calls, fonts, images) -> network-first, falling back to cache only
- *    when the network fetch actually fails (offline).
+ *  - Content-addressed build output (a Vite hash in the filename, or DSH's
+ *    plugin graph served with ?rev=<build revision>) -> cache-first. The URL is
+ *    a function of the bytes, so a hit can never be stale: a new deploy is a
+ *    NEW URL. This is what makes the second and later cold starts cheap — the
+ *    app shell JS/CSS and the ~12 MB plugin graph come from CacheStorage
+ *    instead of crossing the reverse proxy again. Stored payloads must match
+ *    the type their URL claims, and endless streams are never cached.
+ *  - Everything else same-origin (unhashed JS/CSS incl. this plugin's own
+ *    app.css/inject.js/touch-gestures.js, API calls, fonts, images) ->
+ *    network-first, falling back to cache only when the network fetch
+ *    actually fails (offline).
  *  - SPA navigations (HTML doc) -> network-first, falling back to the last
  *    successfully loaded page when offline.
  *
@@ -20,14 +27,15 @@
  * navigation (already network-first) served today's markup — a "new DOM +
  * old CSS" mismatch (e.g. cards rendered full-bleed) that a fresh local
  * profile never reproduces because it has nothing stale to serve. Only the
- * handful of files in SHELL_PATHS are safe to keep cache-first.
+ * handful of files in SHELL_PATHS are safe to keep cache-first — plus, from
+ * v4 on, content-addressed URLs, whose freshness proof is the URL itself.
  *
  * Served by the gateway at /pwa/sw.js. Registered from the injected PWA script.
  */
 'use strict'
 
-const SHELL_CACHE = 'dsh-mobile-pwa-shell-v3'
-const RUNTIME_CACHE = 'dsh-mobile-pwa-runtime-v3'
+const SHELL_CACHE = 'dsh-mobile-pwa-shell-v4'
+const RUNTIME_CACHE = 'dsh-mobile-pwa-runtime-v4'
 
 const SHELL_PATHS = new Set([
   '/pwa/manifest.json',
@@ -36,6 +44,48 @@ const SHELL_PATHS = new Set([
   '/pwa/icons/icon-maskable-512.png',
   '/pwa/offline.html'
 ])
+
+// A Vite content hash in the filename (/assets/index-CN7NIWNw.js, hashed
+// fonts, lazy language chunks): 8+ base64url characters after the last dash.
+// A plain-word filename that happens to match the shape (vendor-bootstrap.css,
+// app-BOOTSTRAP.js) has no digit and only one letter case and is rejected; a
+// genuine all-lowercase hash would merely fall back to network-first.
+const IMMUTABLE_ASSET_RE = /^\/assets\/(?:[^/]+\/)*[^/]+-([A-Za-z0-9_-]{8,})\.(?:js|mjs|css|woff2?|ttf|otf|eot|svg|png|jpe?g|gif|webp|avif|ico)$/
+// DSH serves a whole plugin batch through /plugins/??<id>/client.js&rev=<hash>.
+// DSH derives that revision as a 12-char sha1 hex slice over the plugin
+// artifact's mtime/ctime/size (a build revision, not a content hash) and
+// serves those URLs immutable itself; requiring hex rejects words like
+// rev=default/latest.
+const IMMUTABLE_PLUGIN_RE = /^\/plugins\//
+const IMMUTABLE_REV_RE = /[?&]rev=([0-9a-f]{8,})(?:&|$)/i
+function isContentAddressedAsset(pathname) {
+  const m = IMMUTABLE_ASSET_RE.exec(pathname)
+  if (m === null) return false
+  const hash = m[1]
+  return /[0-9]/.test(hash) || (/[a-z]/.test(hash) && /[A-Z]/.test(hash))
+}
+function isImmutableUrl(url) {
+  return isContentAddressedAsset(url.pathname) ||
+    (IMMUTABLE_PLUGIN_RE.test(url.pathname) && IMMUTABLE_REV_RE.test(url.search))
+}
+// cacheFirst only stores what the URL claims to be. A 200 HTML/SPA-fallback or
+// error page served at an asset URL (deploy race, login wall, revoked device)
+// must never become a permanent "asset" in CacheStorage.
+function responseContentType(res) {
+  try { return res && res.headers && typeof res.headers.get === 'function' ? String(res.headers.get('content-type') || '') : '' } catch (e) { return '' }
+}
+function immutablePayloadOk(url, res) {
+  const ct = responseContentType(res).toLowerCase()
+  if (ct === '') return false
+  if (url.pathname.indexOf('/plugins/') === 0) return ct.indexOf('javascript') !== -1 || ct.indexOf('ecmascript') !== -1
+  if (/\.css$/.test(url.pathname)) return ct.indexOf('text/css') === 0
+  if (/\.(?:m?js)$/.test(url.pathname)) return ct.indexOf('javascript') !== -1 || ct.indexOf('ecmascript') !== -1
+  // DSH's static server treats fonts (and some images) as octet-stream — the
+  // extension is still the payload's identity, and an HTML page never carries
+  // that type.
+  if (/\.(?:woff2?|ttf|otf|eot)$/.test(url.pathname)) return ct.indexOf('font/') === 0 || ct.indexOf('application/octet-stream') === 0
+  return ct.indexOf('image/') === 0 || ct.indexOf('application/octet-stream') === 0
+}
 
 // ---- Copy -------------------------------------------------------------
 // A worker has no window and no gateway injection, so the language comes from
@@ -64,11 +114,12 @@ self.addEventListener('install', (event) => {
     ]))
   )
   // Safe to activate immediately: this worker only decides how *future*
-  // fetches are served (cache-first for the shell, network-first for
-  // everything else). A tab that's already loaded keeps running the JS it
-  // already has in memory regardless of which SW version is "active" — it
-  // only starts talking to the new worker on its next fetch/navigation — so
-  // skipping the wait doesn't yank code out from under a running page. What
+  // fetches are served (cache-first for the static shell and content-addressed
+  // build output, network-first for everything else). A tab that's already
+  // loaded keeps running the JS it already has in memory regardless of which
+  // SW version is "active" — it only starts talking to the new worker on its
+  // next fetch/navigation — so skipping the wait doesn't yank code out from
+  // under a running page. What
   // it *does* fix: without it, an old SW can sit "waiting" indefinitely on a
   // phone that never fully closes the PWA, which is the same staleness bug
   // this rewrite targets, just at the SW-registration layer instead of the
@@ -107,29 +158,52 @@ self.addEventListener('fetch', (event) => {
     return
   }
 
-  // 2. HTML navigations -> network-first with offline fallback to the last
+  // 2. Content-addressed build output -> cache-first. The URL names its own
+  //    bytes (Vite filename hash, or DSH's ?rev=<content hash> plugin graph),
+  //    so a deploy reaches the phone as a new URL rather than new bytes under
+  //    a cached one — no "new DOM + old CSS" risk.
+  if (req.method === 'GET' && isImmutableUrl(url)) {
+    event.respondWith(cacheFirst(req, RUNTIME_CACHE, (res) => immutablePayloadOk(url, res)))
+    return
+  }
+
+  // 3. HTML navigations -> network-first with offline fallback to the last
   //    successfully loaded page.
   if (req.mode === 'navigate') {
     event.respondWith(networkFirstNavigation(req))
     return
   }
 
-  // 3. Everything else same-origin GET -> network-first. This is the DSH
-  //    client bundle (JS/CSS, incl. plugin client bundles), API calls,
-  //    fonts and images: all of it can change on any deploy, so the server's
-  //    current copy always wins; the cache only serves it when offline.
+  // 4. Everything else same-origin GET -> network-first. Unhashed JS/CSS,
+  //    API calls, fonts and images can change on any deploy without their
+  //    URL changing, so the server's current copy always wins; the cache
+  //    only serves them when offline.
   if (req.method === 'GET') {
     event.respondWith(networkFirst(req, RUNTIME_CACHE))
     return
   }
 })
 
-async function cacheFirst(req, cacheName) {
+// A response cannot be cloned/consumed to completion without blocking the
+// caller, so NEVER await cache.put() on the response path: /plugins/events is
+// an endless text/event-stream, and awaiting its clone would keep
+// respondWith() pending forever (the stream would never open). Fire and
+// forget; a rejected write (quota, Vary:*) must not break the fetch either.
+function isEndlessResponse(res) {
+  const ct = responseContentType(res).toLowerCase()
+  return ct.indexOf('text/event-stream') !== -1 ||
+    ct.indexOf('application/x-ndjson') !== -1 ||
+    ct.indexOf('multipart/') === 0
+}
+
+async function cacheFirst(req, cacheName, accept) {
   const cache = await caches.open(cacheName)
   const cached = await cache.match(req)
   if (cached) return cached
   const res = await fetch(req)
-  if (res && res.ok) cache.put(req, res.clone())
+  if (res && res.ok && !isEndlessResponse(res) && (!accept || accept(res))) {
+    cache.put(req, res.clone()).catch(() => {})
+  }
   return res
 }
 
@@ -137,7 +211,9 @@ async function networkFirst(req, cacheName) {
   const cache = await caches.open(cacheName)
   try {
     const res = await fetch(req)
-    if (res && res.ok && req.method === 'GET') cache.put(req, res.clone())
+    if (res && res.ok && req.method === 'GET' && !isEndlessResponse(res)) {
+      cache.put(req, res.clone()).catch(() => {})
+    }
     return res
   } catch (err) {
     const cached = await cache.match(req)

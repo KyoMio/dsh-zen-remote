@@ -296,6 +296,7 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 - Turn-process folding, left-edge swipe back, Android back-gesture takeover, phone-local attachment upload
 - A pairing code buys a long-lived device token; identity follows the token, not the IP, revocable at any time
 - Real PWA + real Web Push (VAPID + aes128gcm), firing only for approvals and questions by default
+- Cold start paints an app-shaped skeleton from the first HTML byte; content-hashed build assets are cached for a year, so a repeat open reuses the shell instead of re-downloading it
 
 **Host (2.0 additions)**
 

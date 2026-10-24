@@ -15,7 +15,9 @@ const GATEWAY = path.join(__dirname, '..', 'lib', 'lan-gate-server.cjs')
 const REMOTE_HEADERS = { 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' }
 
 // Mock DSH homepage in the 0.1.2 shape (mirrors the real index.html's
-// structure, rev hashes made deterministic): head carries preload links for
+// structure, rev hashes made deterministic): the body carries the SPA
+// <div id="root"> and ends with the __DSH_BOOT_READY__ settlement script;
+// head carries preload links for
 // the client-modules combo script, the blocking bootstrap <script>, the
 // manifest link and a viewport meta; the body ends with the
 // __DSH_BOOT_READY__ settlement script. The gateway's injection lands before
@@ -33,6 +35,7 @@ function defaultPage() {
     '<link rel="manifest" href="./manifest.webmanifest" />',
     '</head><body>',
     '<main data-slot="conversation">upstream-ok</main>',
+    '<div id="root"></div>',
     '<script>window.__DSH_BOOT_READY__ = true</script>',
     '</body></html>'
   ].join('\n')
