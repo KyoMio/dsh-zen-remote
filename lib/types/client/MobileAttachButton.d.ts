@@ -19,8 +19,11 @@ export type MobileAttachButtonProps = PropsRuntime<'conversation.input.left'> & 
  * host without one (DSH ≤ 0.1.2) everything below loads exactly as before.
  *
  * Every picked file takes the SAME path: upload to the node half, then append
- * `@.dsh-uploads/name` to the draft through `inputActions.setDraft` (the
- * official write path — no DOM value poking). S7.1 removed the split that used
+ * `@.dsh-uploads/name` to the draft through the official write path — no DOM
+ * value poking: `inputActions.appendDraft` where the running DSH exposes it
+ * (0.2.1-rc.3+ editor runtime; keeps the user's text and inline references),
+ * else `inputActions.setDraft` with the whole next draft (attach-upload.ts
+ * `writeMention`). S7.1 removed the split that used
  * to send inlineable images straight into the session with `session.prompt`:
  * one behaviour for every attachment, and the user always presses send.
  * MobileAttachChips renders the preview row off those same draft tokens.
