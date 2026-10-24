@@ -457,8 +457,9 @@ test('the latest-wins gate drops tickets that are no longer newest (T15-fix 4)',
 test('deriveClientStatusView maps every probe state and tolerates garbage', () => {
   // T59: the view carries the device's own name ('' when the body had none).
   // PB-5: the bridge rows ([] — the body carried none) and the rerouting
-  // note (undefined) ride the same tolerant derivation.
-  const bare = { state: 'unpaired', serverUrl: '', serverName: '', deviceName: '', nextRetryAt: undefined, lastError: '', intercept: undefined, compat: undefined, pluginBridge: [], pluginRouteIntercept: undefined }
+  // note (undefined) ride the same tolerant derivation. RD-6: the
+  // upload-redirect probe (undefined — the body carried no serviceProbe).
+  const bare = { state: 'unpaired', serverUrl: '', serverName: '', deviceName: '', nextRetryAt: undefined, lastError: '', intercept: undefined, compat: undefined, pluginBridge: [], pluginRouteIntercept: undefined, uploadProbe: undefined }
   assert.deepEqual(deriveClientStatusView({ state: 'unpaired' }), bare)
   assert.deepEqual(deriveClientStatusView({ state: 'connected', serverUrl: 'http://192.168.1.10:3088' }), {
     ...bare,
