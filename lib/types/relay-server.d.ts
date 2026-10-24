@@ -164,7 +164,7 @@ export interface RelayHandlerOptions {
      * defaults to 5000. Tests inject a small value. */
     endDrainTimeoutMs?: number;
     /** The binary upload channel's byte cap (T51); defaults to
-     * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
+     * {@link MAX_UPLOAD_BYTES} (500 MiB). Tests inject a small value so the
      * Content-Length and streaming-count refusals stay cheap to drive. */
     uploadCapBytes?: number;
     /** How long an upload refusal's tail drain may run before the socket is
