@@ -133,13 +133,17 @@ composer 最左的回形针打开的是**手机本地**的文件选择器（iOS 
 
 安全上的几句话：这个功能给插件的 host 半区新增了一条 HTTP 路由（`POST /_dsh/mobile-nav/upload`），只接受同源请求，文件名清洗后只取叶子名，写入路径校验不允许越出工作目录，单文件默认上限 20MB（可在 profile 里的插件行用 `maxUploadBytes` 调整）。远程访问时，这条路由和其它请求一样在 网关半边的配对墙之后。
 
-### 远程会话拖拽附件（2.2.6）
+### 远程会话拖拽附件（2.2.6，2.2.6 起改为中继工作区上传）
 
-桌面端把文件从访达拖进会话输入区时，宿主有一条「同机零拷贝」捷径：Electron 的 `__DSH_HOST_PATHS__` 能读出拖入文件的磁盘路径，`addFiles` 于是不传字节、直接插一条 `@本机绝对路径` 的引用。远程会话里这个路径是**子客户端机器**的路径，服务端的会话永远读不到，引用落地就是坏的。2.2.6 起浏览器半边在 document 上装了一个 **capture 阶段**的 drop 拦截（`src/client/effects/remote-drop.ts`，判定纯函数在 `src/client-data/remote-drop.ts`）：当前会话是 `zr~` 虚拟 id 时，把拖入的文件重包装成不带磁盘路径的 `File`（`new File([f], …)`，Electron 对 JS 构造的 File 返回空路径），塞进新的 `DataTransfer` 后在 document 上重派发一个合成 drop 事件——宿主自己的 drop 管道（mask 清理、busy 拒绝、目录判定、addFiles 分支）原样接手，把它当普通浏览器拖拽走字节上传，下游由既有的 fetch-route 拦截经中继转服务端暂存。合成事件 `isTrusted === false`，拦截器自己不会再处理它，天然防自重入。
+桌面端把文件从访达拖进会话输入区时，宿主有一条「同机零拷贝」捷径：Electron 的 `__DSH_HOST_PATHS__` 能读出拖入文件的磁盘路径，`addFiles` 于是不传字节、直接插一条 `@本机绝对路径` 的引用。远程会话里这个路径是**子客户端机器**的路径，服务端的会话永远读不到，引用落地就是坏的。浏览器半边在 document 上装了一个 **capture 阶段**的 drop 拦截（`src/client/effects/remote-drop.ts`，判定纯函数在 `src/client-data/remote-drop.ts`）：当前会话是 `zr~` 虚拟 id 时，守卫把拖入的文件**自己经中继上传到服务端**——逐文件 POST 到本插件的 `client/workspace-upload` 路由（同源、带配对 cookie），子客户端后台经中继客户端的 `workspaceUpload` 把字节送到服务端的 `relay/v1/workspace-upload`，最终写进**服务端会话工作区**的 `.dsh-uploads/`（复用 S7 附件上传的写盘核心）；每个文件成功后派发一个 `zr:drop-mention` CustomEvent，挂在 composer `conversation.input.left` slot 上的隐形组件（`DropMentionListener.tsx`，渲染 null）收到后用官方写路径（`writeMention`）把 `@.dsh-uploads/<文件名>` 插进输入框。发不发消息仍由你按官方发送键决定。
 
-三重触发门，任一不满足就零干预（`passthrough`）：`__DSH_HOST_PATHS__` 存在（手机 / 纯浏览器宿主本来就走上传，不装拦截）、当前会话是远程虚拟 id（当前会话读 `localStorage['dsh.sessions.current']`，事件发生时现场读；读不到按本机会话处理——误判方向安全：最坏把本机拖拽当成远程多传了字节，不会丢数据）、事件是受信的。拖入**文件夹**时整批拦下（文件夹没法用单文件上传修），出一条 3 秒自动消失的提示（locale key `remoteDropFolderBlocked`）。`webkitGetAsEntry` 不可用时视为无文件夹（与宿主同一默认）。重包装或 `DataTransfer.items.add` 抛错时放行原事件回归现状——宁坏勿丢。
+为什么不走宿主自己的上传管道：官方 composer 的文件上传走 **Worker 内原生 XHR**（rc.3 源码 `xhr.open("POST", request.url)` 直发），**从不经过 `connection.fetchRoutes` 表**——T51 的表拦截在桌面端 Electron 上物理接不住 Worker 流量，早期「改写 DragEvent 重派发给宿主管道」的方案因此在桌面端必然失败（2026-10-24 排障实证），重派发代码已整体删除。
 
-降级：`DragEvent` 不可用或 `DataTransfer` 不可构造时**整体不装**，行为与未安装本功能完全一致。诊断：设置页（子客户端角色）诊断区新增「远程拖拽守卫」一行，显示安装状态与拦截 / 重派发 / 拦下文件夹 / 放行 / 重包失败五个计数（`remoteDropDiagnostics()`，浏览器端计数，渲染时现读）。
+三重触发门，任一不满足就零干预（`passthrough`）：`__DSH_HOST_PATHS__` 存在（手机 / 纯浏览器宿主本来就走上传，不装拦截）、当前会话是远程虚拟 id（当前会话读 `localStorage['dsh.sessions.current']`，事件发生时现场读；读不到按本机会话处理——误判方向安全：最坏把本机拖拽当成远程多传了字节，不会丢数据）、事件是受信的。拖入**文件夹**时整批拦下（文件夹没法用单文件上传修），出一条 3 秒自动消失的提示（locale key `remoteDropFolderBlocked`）。`webkitGetAsEntry` 不可用时视为无文件夹（与宿主同一默认）。事件只有在全部上传参数构建完成后才被掐掉（构建不会失败）；掐掉后没有可回退的宿主管道，上传失败用 toast 表达（locale keys `remoteDropUploading` / `remoteDropInserted` / `remoteDropFailed`），不会把事件放回去。
+
+服务端那半条链路的墙与 `relay/v1/upload` 一致（content-length 预检 413、共享判定 403/400、per-device 并发预算 429、流式泵超限中途 413、drain 纪律），写盘上限沿用插件行的 `maxUploadBytes`。服务端未挂 `workspaceUploads`（老组合、测试假注入）时该路由答 501。
+
+降级：`__DSH_HOST_PATHS__` 不存在时**整体不装**，行为与未安装本功能完全一致。诊断：设置页（子客户端角色）诊断区新增「远程拖拽守卫」一行，显示安装状态与拦截 / 已上传 / 失败 / 拦下文件夹 / 放行五个计数（`remoteDropDiagnostics()`，浏览器端计数，渲染时现读；上传与失败按**文件**计）。
 
 ### 分享图
 

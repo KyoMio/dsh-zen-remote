@@ -1644,3 +1644,89 @@ test('T62 current-session: no sink (host role / remoteStatusOnly, or a sinkless 
     await closeServer(sinkless.server)
   }
 })
+
+// ---- RD-7: the workspace-upload route (client/workspace-upload) ------------------
+
+/** The virtual id shaped for the fake relay's server id (INFO's abcd1234). */
+const WS_VIRTUAL = 'zr~abcd1234~session-1'
+
+test('RD-7 client/workspace-upload: the wall order holds (405 wrong method, 401 unadmitted, 403 cross-site)', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('书房') })
+  relay.workspaceUpload = async () => ({ relPath: '.dsh-uploads/a.txt', absolutePath: '/srv/.dsh-uploads/a.txt', filename: 'a.txt', bytes: 1 })
+  const unadmitted = await startClientServer(row, { admit: () => ({ rejection: 401 }), getRelayClient: () => relay })
+  try {
+    const res = await request(unadmitted.port, { method: 'POST', path: `${routes.CLIENT_WORKSPACE_UPLOAD_ROUTE}?sessionId=${encodeURIComponent(WS_VIRTUAL)}&name=a.txt`, headers: sameOrigin(unadmitted.port), body: 'x' })
+    assert.equal(res.status, 401)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'unauthorized' } })
+  } finally { await closeServer(unadmitted.server) }
+
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const methods = await request(port, { method: 'GET', path: `${routes.CLIENT_WORKSPACE_UPLOAD_ROUTE}?sessionId=${encodeURIComponent(WS_VIRTUAL)}&name=a.txt` })
+    assert.equal(methods.status, 405)
+    assert.equal(methods.headers.allow, 'POST')
+    const cross = await request(port, { method: 'POST', path: `${routes.CLIENT_WORKSPACE_UPLOAD_ROUTE}?sessionId=${encodeURIComponent(WS_VIRTUAL)}&name=a.txt`, headers: { origin: 'http://evil.example' }, body: 'x' })
+    assert.equal(cross.status, 403)
+    assert.equal(JSON.parse(cross.body).error.code, 'origin-rejected')
+  } finally { await closeServer(server) }
+})
+
+test('RD-7 client/workspace-upload: a non-virtual sessionId is 400 and nothing is forwarded', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('书房') })
+  const uploads = []
+  relay.workspaceUpload = async (input) => { uploads.push(input); return { relPath: '.dsh-uploads/a.txt', absolutePath: '/srv/.dsh-uploads/a.txt', filename: 'a.txt', bytes: 1 } }
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    for (const bad of ['session-712828e2', 'zr~short', 'zr~zzzzzzzz~not-hex-server', '']) {
+      const res = await request(port, { method: 'POST', path: `${routes.CLIENT_WORKSPACE_UPLOAD_ROUTE}?sessionId=${encodeURIComponent(bad)}&name=a.txt`, headers: sameOrigin(port), body: 'x' })
+      assert.equal(res.status, 400, bad)
+      assert.equal(JSON.parse(res.body).error.code, 'not-virtual', bad)
+    }
+    assert.deepEqual(uploads, [], 'a local id never reaches the relay')
+  } finally { await closeServer(server) }
+})
+
+test('RD-7 client/workspace-upload: success forwards the RESTORED id + name + raw bytes and relays the receipt', async () => {
+  const row = makeRow()
+  const calls = []
+  const relay = fakeRelay({ state: 'online', handshakeInfo: INFO('书房') })
+  relay.workspaceUpload = async (input) => {
+    calls.push(input)
+    return { relPath: '.dsh-uploads/note.txt', absolutePath: '/srv/ws/.dsh-uploads/note.txt', filename: 'note.txt', bytes: 9 }
+  }
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'POST', path: `${routes.CLIENT_WORKSPACE_UPLOAD_ROUTE}?sessionId=${encodeURIComponent(WS_VIRTUAL)}&name=${encodeURIComponent('note.txt')}`, headers: { ...sameOrigin(port), 'content-type': 'application/octet-stream', 'content-length': '9' }, body: 'raw-bytes' })
+    assert.equal(res.status, 200)
+    // N1: the envelope carries exactly what the browser half consumes —
+    // the SERVER's absolute path never crosses to the page.
+    assert.deepEqual(JSON.parse(res.body), { ok: true, relPath: '.dsh-uploads/note.txt', filename: 'note.txt', bytes: 9 })
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].sessionId, 'session-1', 'the virtual prefix was stripped before the relay call')
+    assert.equal(calls[0].name, 'note.txt')
+    assert.equal(calls[0].bytes, 9, 'the declared size rides along for the round-trip budget')
+  } finally { await closeServer(server) }
+})
+
+test('RD-7 client/workspace-upload: a relay refusal keeps its code, a dead link is 503 remote-offline', async () => {
+  const row = makeRow()
+  const refused = fakeRelay({ state: 'online', handshakeInfo: INFO('书房') })
+  refused.workspaceUpload = async () => { throw new RelayError('not-shared', 'the session is not shared', 403) }
+  const { server, port } = await startClientServer(row, { getRelayClient: () => refused })
+  try {
+    const res = await request(port, { method: 'POST', path: `${routes.CLIENT_WORKSPACE_UPLOAD_ROUTE}?sessionId=${encodeURIComponent(WS_VIRTUAL)}&name=a.txt`, headers: sameOrigin(port), body: 'x' })
+    assert.equal(res.status, 403)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'not-shared' } })
+  } finally { await closeServer(server) }
+
+  const dead = fakeRelay({ state: 'online', handshakeInfo: INFO('书房') })
+  dead.workspaceUpload = async () => { throw new RelayError('offline', 'chain down') }
+  const second = await startClientServer(row, { getRelayClient: () => dead })
+  try {
+    const res = await request(second.port, { method: 'POST', path: `${routes.CLIENT_WORKSPACE_UPLOAD_ROUTE}?sessionId=${encodeURIComponent(WS_VIRTUAL)}&name=a.txt`, headers: sameOrigin(second.port), body: 'x' })
+    assert.equal(res.status, 503)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'remote-offline' } })
+  } finally { await closeServer(second.server) }
+})
