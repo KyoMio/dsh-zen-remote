@@ -16,17 +16,18 @@
 | `src/config.ts` | 配置模型：四层回退（env > 插件行 > `lan-gate.config.json` > 默认值）、loader 的 `Config` schema（全 volatile）、`resolveRole` |
 | `src/http.ts` | host 路由共用的 JSON 响应封装与同源 POST 门 |
 | `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
-| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（两角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff） |
+| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（两角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff）、工作区上传代理 `client/workspace-upload`（RD-7 拖拽文件经中继转服务端） |
 | `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
 | `src/share-store.ts` | 共享会话表（`~/.dsh/zen-remote-shares.json`，持久化，重启恢复），中继访问控制的事实来源 |
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
 | `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
 | `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
-| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（改动摘要 / diff 的 plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ unshare |
+| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（改动摘要 / diff 的 plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（附件字节转宿主暂存）/ `v1/workspace-upload`（RD-7：拖拽文件写进服务端会话工作区，写盘核心由 index.ts 以 `workspaceUploads.save` 注入）/ unshare |
 | `src/relay-access.ts` | 中继的按方法登记访问控制表（服务端那一张；`v1/http` 的按路由登记表也在这里） |
 | `src/relay-filter.ts` | 全局流与全局列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
 | `src/session-reference.ts` | 两端共用的 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队消息 edit、`commands/execute` 全部字符串）：服务端照它校验、子客户端照它改写，同一份规则防两端漂移 |
-| `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
+| `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别；`upload`（附件转宿主暂存）与 `workspaceUpload`（RD-7 拖拽写工作区）两条二进制通道 |
+| `src/remote-drop-contract.ts` + `src/client-data/remote-drop.ts` + `src/client/effects/remote-drop.ts` + `src/client/DropMentionListener.tsx` | 远程会话拖拽附件（RD-1/2/7）：共享常量叶子（上传路由 + 事件名，两半 import 同一处拼法，零依赖，virtual-id.ts 先例）、判定纯函数（三门真值表 + 文件夹规则，`scripts/check-remote-drop.mjs` 钉住真值表与常量唯一声明）、document 级 capture 拦截守卫（命中即逐文件 POST `client/workspace-upload` 上传到服务端工作区，成功派发 `zr:drop-mention`）、挂在 composer `conversation.input.left` slot 的隐形 seat（渲染 null，收事件后经 `writeMention` 插 `@.dsh-uploads/<名>`）——一条链，桌面门之前注册 |
 | `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`，远程会话调用改走中继、虚拟 id 改写、面板判定（客户端那张字段表也在这里） |
 | `src/intercept-shape.ts` | 被包装方法的形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
 | `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端比对 `compareBridges`；不 import DSH、不碰 I/O |
@@ -115,6 +116,10 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
   禁止「从参数里
   通用扫描会话 id」的写法——DSH 会悄悄丢掉不认识的参数名，扫描会被诱饵
   字段骗过；全局读（`session/list` 等）安全靠输出过滤，不靠输入判定。
+- **官方 composer 的文件上传走 Worker 原生 XHR，绕过 `connection.fetchRoutes`
+  表**——任何基于该表的改道对上传无效（2026-10-24 桌面端实证，rc.3 源码
+  `xhr.open("POST", request.url)` 直发；RD-7 因此把远程拖拽改为守卫经中继
+  `relay/v1/workspace-upload` 直接写服务端工作区，不再重派发给宿主管道）。
 - **适配器必须可插拔**：`src/adapters/` 整个目录删掉后其余功能一字不改——
   框架只消费 `src/plugin-adapter-core.ts`（在适配器目录之外），接线只有
   `src/index.ts` 一处 import `./adapters/index`，`createRelayHandler` /

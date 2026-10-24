@@ -319,7 +319,7 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 
 **Desktop client (2.2 additions)**
 
-- Dragging files into a remote session attaches them by **upload**: the desktop app's same-machine shortcut (a dragged file keeps its disk path and would become an `@absolute path` mention naming a file on YOUR machine, unreadable on the server) is intercepted in the browser and the drop is re-shaped into an ordinary upload — the same relay path as the attach button, so the server session gets the bytes. Dragging a **folder** into a remote session is not supported: the drop is stopped with a short on-screen notice. Local sessions are untouched — the shortcut keeps working there — and the guard's status is visible in the settings page diagnostics.
+- Dragging files into a remote session attaches them by **upload**: the desktop app's same-machine shortcut (a dragged file keeps its disk path and would become an `@absolute path` mention naming a file on YOUR machine, unreadable on the server) is intercepted in the browser, and the guard uploads each file ITSELF through the relay — the bytes land in the SERVER session's workspace (`.dsh-uploads/`, the same directory the attach button uses) and the `@.dsh-uploads/<name>` mention is inserted into the composer for you. Dragging a **folder** into a remote session is not supported: the drop is stopped with a short on-screen notice. Local sessions are untouched — the shortcut keeps working there — and the guard's status is visible in the settings page diagnostics.
 
 In depth: [interface](docs/interface.md) · [public access + relay protocol](docs/remote-access.en.md)
 
