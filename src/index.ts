@@ -492,6 +492,39 @@ export async function handleUpload(
  */
 export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   const effective = resolveConfig(config, readFileConfig(), process.env)
+  // RD-6 probe fact: whether the fetch-route inject callback (below, in the
+  // client-half wiring) ever fired. On a composition where `connection` or
+  // `fileUploads` never becomes available the callback stays silently
+  // PENDING (cordis waits forever, printing nothing) and every fetch-route
+  // diagnostic stays undefined — this flag is the one honest signal of that
+  // state. Declared this early because probes on BOTH role branches read it.
+  let fetchRouteInjectSeen = false
+  /** The client branch's fetch-route diagnostics getter, assigned once that
+   * branch declares it; the probe reads it lazily through this slot so both
+   * role mounts can share one probe factory. */
+  let fetchRouteDiagnosticsRef: (() => unknown) | undefined
+  /** RD-6: build the lazy service probe against a context whose own inject
+   * already resolved (the client-routes mounts qualify on both roles). One
+   * reflection per process: `connection` / `fileUploads` presence plus the
+   * fetchRoutes table's shape — enough to name the missing service. */
+  const uploadServiceProbe = (probeCtx: Context): (() => Record<string, unknown>) => {
+    let cached: Record<string, unknown> | undefined
+    return () => {
+      if (cached !== undefined) return cached
+      const reflect = (probeCtx as Context & { reflect?: { get(name: string): unknown } }).reflect
+      const connection = reflect?.get('connection')
+      const fileUploads = reflect?.get('fileUploads')
+      const fetchRoute = fetchRouteDiagnosticsRef?.()
+      cached = {
+        uploadInjectSeen: fetchRouteInjectSeen,
+        connectionService: connection === undefined ? 'absent' : 'present',
+        fileUploadsService: fileUploads === undefined ? 'absent' : 'present',
+        ...(connection === undefined ? {} : { connectionShape: checkFetchRouteShape(connection) }),
+        ...(fetchRoute === undefined ? {} : { fetchRoute }),
+      }
+      return cached
+    }
+  }
   // The plugin bridge's zenRemote service (PB-1), provided on BOTH roles
   // before any role branch: a plugin that wants its panel data forwarded in
   // remote sessions declares that against THIS process whichever role it
@@ -909,6 +942,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           admit: (req) => clientCtx.connection.admit(req),
           getRowConfig: () => config,
           remoteStatusOnly: true,
+          getServiceProbe: uploadServiceProbe(clientCtx),
         }),
       }), 'dsh-zen-remote: client routes (host)')
     })
@@ -1121,7 +1155,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       }
       return undefined
     }
+    fetchRouteDiagnosticsRef = fetchRouteDiagnostics
     ctx.inject(['connection', 'fileUploads'], (connectionCtx) => {
+      fetchRouteInjectSeen = true
       const logWarn = (...args: Parameters<Context['logger']['warn']>): void => { ctx.logger?.warn(...args) }
       const logInfo = (...args: Parameters<Context['logger']['info']>): void => { ctx.logger?.info(...args) }
       const proxy = (connectionCtx as Context & { connection?: unknown }).connection
@@ -1232,6 +1268,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           getRelayClient: () => relayClient,
           getIntercept: interceptDiagnostics,
           getFetchRouteIntercept: fetchRouteDiagnostics,
+          getServiceProbe: uploadServiceProbe(clientCtx),
           getPluginRouteIntercept: pluginRouteDiagnostics,
           getPluginBridgeStatus: pluginBridgeStatus,
           onCurrentSession,
