@@ -257,6 +257,11 @@ export const zh = {
   'settings.client.diagRemoteDrop': '远程拖拽守卫',
   'settings.client.diagRemoteDropOk': '已安装 · 拦截 {intercepted} · 重派发 {redispatched} · 文件夹 {blocked} · 放行 {passthrough} · 重包失败 {failed}',
   'settings.client.diagRemoteDropOff': '未安装（{reason}）',
+  // --- RD-6 上传改道（fetch-route 拦截）的诊断行：读 remote-status 的 serviceProbe ---
+  'settings.client.diagUploadRedirect': '上传改道',
+  'settings.client.diagUploadRedirectOk': '已安装 · 上传已接管',
+  'settings.client.diagUploadRedirectRefused': '拒装：{reason}',
+  'settings.client.diagUploadRedirectPending': '服务注入未触发 · connection {connection} · fileUploads {fileUploads}',
   // --- PB-5 插件桥：主服务端同意小节 + 子客户端诊断小节 ---
   'settings.bridge.title': '插件桥',
   'settings.bridge.empty': '暂无插件登记插件桥',
@@ -558,6 +563,11 @@ export const en: Record<MobileNavKey, string> = {
   'settings.client.diagRemoteDrop': 'Remote drop guard',
   'settings.client.diagRemoteDropOk': 'Installed · intercepted {intercepted} · redispatched {redispatched} · folders {blocked} · passthrough {passthrough} · rewrap failed {failed}',
   'settings.client.diagRemoteDropOff': 'Not installed ({reason})',
+  // --- RD-6: the upload-redirect (fetch-route intercept) diagnostics row ---
+  'settings.client.diagUploadRedirect': 'Upload redirect',
+  'settings.client.diagUploadRedirectOk': 'Installed · upload wrapped',
+  'settings.client.diagUploadRedirectRefused': 'Refused: {reason}',
+  'settings.client.diagUploadRedirectPending': 'Service inject never fired · connection {connection} · fileUploads {fileUploads}',
   // --- PB-5 plugin bridge: host consent section + sub-client diagnostics ---
   'settings.bridge.title': 'Plugin bridge',
   'settings.bridge.empty': 'No plugin has registered a bridge yet',

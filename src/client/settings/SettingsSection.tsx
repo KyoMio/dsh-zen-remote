@@ -1222,6 +1222,39 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   </p>
                 </div>
               )}
+              {/* RD-6: the upload-redirect (fetch-route intercept) line — rides
+                  the client/status body's serviceProbe. One row answers the
+                  question this diagnosis was built for: whether the redirect
+                  is installed, refused (with the shape reason), or its service
+                  inject never fired — and which of the two services is
+                  missing when so. */}
+              {clientView?.uploadProbe !== undefined && (() => {
+                const probe = clientView.uploadProbe as {
+                  uploadInjectSeen?: unknown
+                  connectionService?: unknown
+                  fileUploadsService?: unknown
+                  fetchRoute?: { installed?: unknown; uploadWrapped?: unknown; shape?: { reasons?: unknown } }
+                }
+                const seen = probe.uploadInjectSeen === true
+                const refused = seen && probe.fetchRoute?.shape?.reasons instanceof Array && (probe.fetchRoute.shape.reasons as string[]).length > 0
+                const wrapped = probe.fetchRoute?.uploadWrapped === true
+                const text = wrapped
+                  ? t('settings.client.diagUploadRedirectOk')
+                  : refused
+                    ? t('settings.client.diagUploadRedirectRefused', { reason: (probe.fetchRoute?.shape?.reasons as string[]).join('; ') })
+                    : t('settings.client.diagUploadRedirectPending', {
+                      connection: typeof probe.connectionService === 'string' ? probe.connectionService : '—',
+                      fileUploads: typeof probe.fileUploadsService === 'string' ? probe.fileUploadsService : '—',
+                    })
+                return (
+                  <div className="zr-settings-field">
+                    <div className="zr-settings-head">
+                      <label>{t('settings.client.diagUploadRedirect')}</label>
+                    </div>
+                    <p className="zr-settings-hint">{text}</p>
+                  </div>
+                )
+              })()}
               {clientView.compat !== undefined && (
                 <>
                   {clientView.compat.mismatchedGroups.length > 0 && (

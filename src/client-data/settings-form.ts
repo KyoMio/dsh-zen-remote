@@ -163,6 +163,9 @@ export interface ClientStatusBody {
    * a host role or a refused install may still answer it; a server without
    * the field never does). */
   pluginRouteIntercept?: unknown
+  /** RD-6: the upload-redirect service probe (presence-gated — an older
+   * plugin answers without it). */
+  serviceProbe?: unknown
 }
 
 /** One remote-call failure line in the diagnostics lists. `time` is epoch
@@ -217,6 +220,10 @@ export interface ClientConnectionView {
    * renders the 本机改道未启用 line with the shape reasons; undefined when
    * the body carried none). */
   pluginRouteIntercept: { installed: boolean; reasons: string[] } | undefined
+  /** RD-6: the upload-redirect service probe from the same body, passed
+   * through tolerantly (undefined when the body carried none — an older
+   * plugin — and the diagnostics row stays hidden). */
+  uploadProbe: Readonly<Record<string, unknown>> | undefined
 }
 
 const CLIENT_STATES: readonly ClientConnectionView['state'][] = ['unpaired', 'connected', 'revoked', 'unreachable', 'unexpected', 'invalid-url', 'incompatible']
@@ -333,6 +340,9 @@ export function deriveClientStatusView(body: ClientStatusBody): ClientConnection
     compat: deriveCompatView(safe.compat),
     pluginBridge: derivePluginBridgeStatuses(safe.pluginBridge),
     pluginRouteIntercept: derivePluginRouteInterceptView(safe.pluginRouteIntercept),
+    uploadProbe: safe.serviceProbe !== null && typeof safe.serviceProbe === 'object'
+      ? Object.freeze({ ...(safe.serviceProbe as Record<string, unknown>) })
+      : undefined,
   }
 }
 
