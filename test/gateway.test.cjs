@@ -10,6 +10,8 @@ const { test } = require('node:test')
 const assert = require('node:assert')
 const net = require('node:net')
 const http = require('node:http')
+const zlib = require('node:zlib')
+const vm = require('node:vm')
 const { startMockTarget, startMockAuthTarget, startGateway, startRecordingTarget, request, stopAll, pairDevice, REMOTE_HEADERS, freePort } = require('./util.cjs')
 
 const VIEWPORT_RE = /<meta[^>]*name=["']?viewport["']?[^>]*>/gi
@@ -324,6 +326,188 @@ test('injects after DSH bootstrap, before </head>', async () => {
   } finally { await stop() }
 })
 
+// Cold start is a blank page until DSH's ~2.7 MB of app/plugin JavaScript has
+// run. The gateway now paints an app-shaped placeholder inside the first HTML
+// byte (no extra request), and an inline script removes it as soon as DSH
+// renders into #root. It must never reach an explicit desktop device.
+test('gateway: first-paint shell is inlined for phones, presentation-only, and absent for explicit desktop devices', async () => {
+  const { stop } = await boot()
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.strictEqual(page.status, 200)
+    const html = page.body
+    assert.ok(html.includes('<style data-dsh-zen-boot>'), 'shell CSS is inlined with the markup')
+    assert.ok(html.includes('id="dsh-zen-boot"'), 'shell markup is inlined in the body')
+    assert.ok(html.includes('@media (min-width:1024px){#dsh-zen-boot{display:none!important}}'),
+      'desktop width hides the placeholder in CSS')
+    assert.ok(html.includes('animation:dsh-zen-boot-expire 30s'), 'CSS-only auto-hide fallback exists')
+    assert.ok(html.includes('html[data-ds-theme-source="dark"] #dsh-zen-boot'), 'shell fills follow the host\'s resolved theme')
+    assert.ok(html.includes('html[data-ds-theme-source="light"] #dsh-zen-boot'), 'including an explicitly pinned light theme')
+    assert.ok(html.includes('new MutationObserver'), 'an inline observer removes it when DSH renders')
+    assert.ok(html.includes('DOMContentLoaded'), 'and removes it synchronously when the host is already there')
+    assert.ok(html.includes('clearTimeout'), 'the safety valve is cancelled on normal removal')
+    assert.ok(html.includes('aria-hidden="true"'), 'placeholder is hidden from assistive tech')
+    assert.ok(html.includes('pointer-events:none'), 'placeholder cannot eat clicks')
+    const bodyOpen = html.search(/<body[^>]*>/i)
+    const shellAt = html.indexOf('id="dsh-zen-boot"')
+    const bootReady = html.indexOf('__DSH_BOOT_READY__')
+    assert.ok(bodyOpen >= 0 && shellAt > bodyOpen, 'shell lives in <body>')
+    assert.ok(bootReady < 0 || shellAt < bootReady, 'shell is parsed before DSH settles')
+    const shell = html.slice(html.indexOf('<style data-dsh-zen-boot>'), html.indexOf('</script>', shellAt))
+    assert.ok(!/https?:\/\//.test(shell), 'placeholder references no external URL')
+    assert.ok(!/url\(/.test(html.slice(html.indexOf('<style data-dsh-zen-boot>'), shellAt)),
+      'placeholder CSS loads no images or fonts')
+
+    // An explicit desktop device is not a phone: no placeholder at all.
+    const { cookie, id } = await pairDevice(PORT, 'desk')
+    await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'set-kind', id, kind: 'desktop' } })
+    const desktop = await request(PORT, { path: '/', headers: Object.assign({ accept: 'text/html', cookie }, REMOTE_HEADERS) })
+    assert.ok(!desktop.body.includes('dsh-zen-boot'), 'explicit desktop gets no mobile placeholder')
+  } finally { await stop() }
+})
+
+// DSH's static server sends no cache headers for its Vite output. Only real
+// content-addressed names may get a year of immutable caching; HTML (even
+// compressed), upstream directives and hash-shaped plain words must not.
+test('gateway: only content-addressed /assets/ gets immutable caching', async () => {
+  const upstream = http.createServer((req, res) => {
+    const u = String(req.url || '')
+    // A hash-shaped URL whose response is actually (gzipped) HTML: the header
+    // must not be added even though injection skips compressed HTML.
+    if (u === '/assets/index-ZZZZ1111.js') {
+      const body = zlib.gzipSync('<!doctype html><html><head></head><body>login</body></html>')
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'content-encoding': 'gzip' })
+      res.end(body)
+      return
+    }
+    const isStatic = /\.(?:js|css|woff2)$/.test(u)
+    const headers = { 'content-type': isStatic ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8' }
+    // Explicit upstream directives must win on hashed and unhashed paths.
+    if (u === '/assets/vendor-DcuzkuQH.js') headers['cache-control'] = 'no-cache'
+    if (u === '/assets/app.css') headers['cache-control'] = 'no-cache'
+    res.writeHead(200, headers)
+    res.end(isStatic ? 'console.log(1)' : '<!doctype html><html><head></head><body>ok</body></html>')
+  })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  TARGET_PORT = upstream.address().port
+  PORT = await freePort()
+  const gw = startGateway(PORT, TARGET_PORT)
+  await gw.ready
+  try {
+    for (const path of ['/assets/index-CN7NIWNw.js', '/assets/langs/cpp-DddhVWhK.js', '/assets/fonts/montserrat-light-Cvd2VjE_.woff2']) {
+      const res = await request(PORT, { path })
+      assert.strictEqual(res.status, 200, path)
+      assert.strictEqual(res.headers['cache-control'], 'public, max-age=31536000, immutable', path + ' is content-addressed')
+    }
+    const upstreamOwn = await request(PORT, { path: '/assets/vendor-DcuzkuQH.js' })
+    assert.strictEqual(upstreamOwn.headers['cache-control'], 'no-cache', 'an upstream directive on a hashed path wins')
+    for (const path of ['/assets/vendor-bootstrap.css', '/assets/app-BOOTSTRAP.js']) {
+      const res = await request(PORT, { path })
+      assert.strictEqual(res.status, 200, path)
+      assert.strictEqual(res.headers['cache-control'], undefined, path + ' only looks hash-shaped, not content-addressed')
+    }
+    const compressed = await request(PORT, { path: '/assets/index-ZZZZ1111.js' })
+    assert.strictEqual(compressed.headers['content-encoding'], 'gzip')
+    assert.strictEqual(compressed.headers['cache-control'], undefined, 'HTML is never marked immutable, whatever its encoding')
+    const plain = await request(PORT, { path: '/assets/app.css' })
+    assert.strictEqual(plain.headers['cache-control'], 'no-cache', 'an upstream directive is not overridden')
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    assert.strictEqual(page.headers['cache-control'], 'no-store', 'HTML stays uncached')
+  } finally { await stopAll(upstream, gw.child) }
+})
+
+// Execute the real inline remover against a fake DOM so the "DSH renders ->
+// shell goes away" hard constraint is pinned, not grepped.
+function extractBootShellScript(html) {
+  const start = html.indexOf('(function(){var el=document.getElementById("dsh-zen-boot")')
+  if (start < 0) throw new Error('boot shell remover not found')
+  const endMark = '})()</script>'
+  const end = html.indexOf(endMark, start)
+  if (end < 0) throw new Error('boot shell remover is not closed')
+  return html.slice(start, end + endMark.length - '</script>'.length)
+}
+function runBootShellScript(script, opts) {
+  const removed = []
+  const shell = { parentNode: { removeChild: (node) => removed.push(node) } }
+  const root = { childElementCount: opts.rootChildren || 0 }
+  let rootAvailable = opts.rootAvailable !== false
+  let dcl = null
+  const observers = []
+  function MutationObserver(cb) { this.cb = cb; this.observe = () => {}; this.disconnect = () => { this.disconnected = true }; observers.push(this) }
+  const document = {
+    readyState: 'loading',
+    documentElement: {},
+    getElementById: (id) => id === 'dsh-zen-boot' ? shell : (id === 'root' && rootAvailable ? root : null),
+    addEventListener: (type, fn) => { if (type === 'DOMContentLoaded') dcl = fn }
+  }
+  const timers = []
+  const sandbox = {
+    document,
+    MutationObserver,
+    setTimeout: (fn) => { timers.push(fn); return timers.length },
+    clearTimeout: (id) => { if (id > 0) timers[id - 1] = null }
+  }
+  vm.runInContext(script, vm.createContext(sandbox), { filename: 'boot-shell.js' })
+  return {
+    removed,
+    root,
+    observers,
+    timers,
+    fireDcl: () => { assert.strictEqual(typeof dcl, 'function'); dcl() },
+    makeRootAvailable: () => { rootAvailable = true }
+  }
+}
+
+test('gateway: the inline remover handles DCL, late renders, missing #root and the safety valve', async () => {
+  const { stop } = await boot()
+  try {
+    const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+    const script = extractBootShellScript(page.body)
+
+    // (a) Host already rendered when DOMContentLoaded fires (module scripts
+    //     execute before it) -> removed synchronously.
+    const immediate = runBootShellScript(script, { rootChildren: 1 })
+    assert.strictEqual(immediate.removed.length, 0)
+    immediate.fireDcl()
+    assert.strictEqual(immediate.removed.length, 1, 'removed at DOMContentLoaded')
+
+    // (b) #root exists but is still empty -> observer waits for the first child.
+    const late = runBootShellScript(script, { rootChildren: 0 })
+    late.fireDcl()
+    assert.strictEqual(late.removed.length, 0, 'shell stays while the host is empty')
+    assert.ok(late.observers.length >= 1, 'observer installed on #root')
+    late.root.childElementCount = 1
+    late.observers[0].cb()
+    assert.strictEqual(late.removed.length, 1, 'removed when the host renders')
+
+    // (c) No #root at all -> this is not the SPA (plugin preview/fragment):
+    //     remove immediately instead of covering it for 30 seconds.
+    const missing = runBootShellScript(script, { rootAvailable: false })
+    missing.fireDcl()
+    assert.strictEqual(missing.removed.length, 1, 'a document without #root is not the SPA')
+
+    // (d) Host never renders -> the 30s safety valve removes the overlay.
+    const stalled = runBootShellScript(script, { rootChildren: 0 })
+    stalled.fireDcl()
+    assert.strictEqual(stalled.removed.length, 0)
+    stalled.timers[0]()
+    assert.strictEqual(stalled.removed.length, 1, 'safety valve removes the shell')
+  } finally { await stop() }
+})
+
+test('gateway: non-SPA HTML (no <head> or no #root) gets no boot shell', async () => {
+  // Plugin HTML previews and iframes are proxied as text/html too; they must
+  // stay untouched instead of being covered by a fake home screen.
+  for (const html of ['<body><main>no head</main></body>',
+                      '<!doctype html><html><head><meta charset="utf-8"></head><body><main>plugin preview</main></body></html>']) {
+    const { stop } = await boot(html)
+    try {
+      const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
+      assert.ok(!page.body.includes('dsh-zen-boot'), 'no overlay for ' + html.slice(0, 40))
+    } finally { await stop() }
+  }
+})
+
 function extractInlineScripts(html) {
   const out = []
   const re = /<script([^>]*)>([\s\S]*?)<\/script>/gi
@@ -382,7 +566,10 @@ test('gateway: injected inline scripts have balanced braces (quoting bug guard)'
     const page = await request(PORT, { path: '/', headers: { accept: 'text/html' } })
     const scripts = extractInlineScripts(page.body)
     assert.ok(scripts.length > 0, 'expected inline scripts')
-    for (const s of scripts) assert.ok(balanced(s), 'inline script braces balanced: ' + s.slice(0, 40))
+    for (const s of scripts) {
+      assert.ok(balanced(s), 'inline script braces balanced: ' + s.slice(0, 40))
+      assert.doesNotThrow(() => new vm.Script(s), 'inline script compiles: ' + s.slice(0, 40))
+    }
     assert.ok(page.body.includes('randomUUID'), 'uuid polyfill present')
   } finally { await stop() }
 })
