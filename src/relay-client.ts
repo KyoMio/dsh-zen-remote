@@ -61,6 +61,7 @@ const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
 const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 const HTTP_PATH = '/_dsh/zen-remote/relay/v1/http'
 const UPLOAD_PATH = '/_dsh/zen-remote/relay/v1/upload'
+const WORKSPACE_UPLOAD_PATH = '/_dsh/zen-remote/relay/v1/workspace-upload'
 const PLUGIN_PATH = '/_dsh/zen-remote/relay/v1/plugin'
 const PLUGIN_TUNNEL_OPEN_PATH = '/_dsh/zen-remote/relay/v1/plugin-tunnel/open'
 const PLUGIN_TUNNEL_SEND_PATH = '/_dsh/zen-remote/relay/v1/plugin-tunnel/send'
@@ -364,6 +365,19 @@ export interface RelayClient {
    * `Content-Length`, when it had one) and a timeout there never moves the
    * connection state — the invoke route's rules (T31-fix). */
   upload(options: RelayUploadOptions, signal?: AbortSignal): Promise<RelayHttpResult>
+  /** One workspace-upload round-trip (RD-7): `sessionId` is the ORIGINAL
+   * session id, `name` the optional display filename, `body` the raw byte
+   * stream forwarded verbatim; the SERVER writes the bytes into that
+   * session's workspace `.dsh-uploads/` and answers a receipt. Resolves with
+   * the parsed receipt; every refusal (a 501 from an unwired server, a
+   * not-shared session, an oversize body) or link death throws RelayError.
+   * The round-trip budget scales with `bytes` and a timeout there never
+   * moves the connection state — the invoke route's rules (T31-fix), same
+   * as {@link upload}. */
+  workspaceUpload(
+    options: { sessionId: string; name?: string; body: ReadableStream<Uint8Array> | null; bytes?: number },
+    signal?: AbortSignal,
+  ): Promise<RelayWorkspaceUploadResult>
   /** One bridged-plugin round-trip (PB-4): the coordinates travel in the
    * x-zr-* headers (PB-3's protocol), no body. Resolves with the UNREAD
    * fetch Response the moment the headers arrive — the caller streams the
@@ -452,6 +466,16 @@ export interface RelayHttpResult {
   /** The underlying response body, decoded as text (both registered routes
    * answer buffered JSON). */
   body: string
+}
+
+/** The receipt one {@link RelayClient.workspaceUpload} round-trip carries
+ * (RD-7): where the file landed in the server session's workspace — relPath
+ * is what the drop flow mentions in the composer draft. */
+export interface RelayWorkspaceUploadResult {
+  relPath: string
+  absolutePath: string
+  filename: string
+  bytes: number
 }
 
 /**
@@ -1411,13 +1435,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // The empty-body upload still rides a (closed) stream: the wire route
     // always speaks a request body, and a missing one would be a transport
     // error, not the host's own empty-upload business failure.
-    const body =
-      options.body ??
-      new ReadableStream<Uint8Array>({
-        start: (controller) => {
-          controller.close()
-        },
-      })
+    const body = options.body ?? emptyByteStream()
     // The budget scales with the DECLARED size (T31-fix's rule); a timeout
     // deliberately does not move the connection state — a slow upload is a
     // slow call, not a dead link.
@@ -1442,6 +1460,53 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       contentType: typeof value.contentType === 'string' ? value.contentType : undefined,
       body: value.body,
     }
+  }
+
+  /** The empty byte stream a bodyless upload rides as (see {@link upload}). */
+  function emptyByteStream(): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        controller.close()
+      },
+    })
+  }
+
+  /**
+   * The workspace-upload round-trip (RD-7), modeled on {@link upload}: same
+   * wire shape (octet-stream body, original id + name in the query), same
+   * timeout rules — only the route differs (the server writes the bytes
+   * itself) and so does the answer: a receipt envelope, parsed strictly.
+   */
+  async function workspaceUpload(
+    options: { sessionId: string; name?: string; body: ReadableStream<Uint8Array> | null; bytes?: number },
+    signal?: AbortSignal,
+  ): Promise<RelayWorkspaceUploadResult> {
+    const creds = requireCredentials()
+    const params = new URLSearchParams()
+    params.set('sessionId', options.sessionId)
+    if (options.name !== undefined) params.set('name', options.name)
+    const body = options.body ?? emptyByteStream()
+    const payload = await exchangeRequest(
+      `${creds.url}${WORKSPACE_UPLOAD_PATH}?${params.toString()}`,
+      uploadInit(creds.token, body),
+      signal,
+      true,
+      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, options.bytes), timeoutSetsOffline: false, transportSetsOffline: false },
+    )
+    const value = payload.value
+    if (
+      !isRecord(value) ||
+      typeof value.relPath !== 'string' ||
+      value.relPath === '' ||
+      typeof value.absolutePath !== 'string' ||
+      typeof value.filename !== 'string' ||
+      typeof value.bytes !== 'number' ||
+      !Number.isSafeInteger(value.bytes) ||
+      value.bytes < 0
+    ) {
+      throw new RelayError('internal', 'the relay workspace-upload answer carries no receipt')
+    }
+    return { relPath: value.relPath, absolutePath: value.absolutePath, filename: value.filename, bytes: value.bytes }
   }
 
   /**
@@ -1915,6 +1980,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     openStream,
     http,
     upload,
+    workspaceUpload,
     pluginRequest,
     pluginTunnelOpen,
     pluginTunnelSend,

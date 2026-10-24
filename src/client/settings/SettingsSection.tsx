@@ -1202,8 +1202,9 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                 </>
               )}
               {/* RD-3: the remote drop guard's own line — installed state
-                  plus the five counters. Browser-side values, so unlike the
-                  rows above it never rides the client/status body. */}
+                  plus the five counters (RD-7 semantics: uploaded/failed
+                  count FILES). Browser-side values, so unlike the rows
+                  above it never rides the client/status body. */}
               {(dropDiag.installed || dropDiag.notInstalledReason !== undefined) && (
                 <div className="zr-settings-field">
                   <div className="zr-settings-head">
@@ -1213,10 +1214,10 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                     {dropDiag.installed
                       ? t('settings.client.diagRemoteDropOk', {
                         intercepted: dropDiag.intercepted,
-                        redispatched: dropDiag.redispatched,
+                        uploaded: dropDiag.uploaded,
+                        failed: dropDiag.failed,
                         blocked: dropDiag.blockedDirectories,
                         passthrough: dropDiag.passthrough,
-                        failed: dropDiag.rewrapFailed,
                       })
                       : t('settings.client.diagRemoteDropOff', { reason: dropDiag.notInstalledReason ?? '—' })}
                   </p>

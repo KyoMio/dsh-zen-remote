@@ -167,6 +167,26 @@ export interface RelayHandlerOptions {
      * {@link MAX_UPLOAD_BYTES} (500 MiB). Tests inject a small value so the
      * Content-Length and streaming-count refusals stay cheap to drive. */
     uploadCapBytes?: number;
+    /** The workspace-upload channel's server half (RD-7): writes a pumped
+     * upload body into a shared session's workspace `.dsh-uploads/` directory
+     * on THIS machine. Injected by the wiring out of the S7 upload internals
+     * (sessionUploadRoot + writeUpload + safeUploadName live in index.ts;
+     * importing index.ts here would be a cycle). Absent — a wiring that never
+     * mounted it, old tests — and `POST relay/v1/workspace-upload` answers 501
+     * `unsupported`, exactly like the `/api` passthrough without a dispatcher. */
+    workspaceUploads?: {
+        save(input: {
+            sessionId: string;
+            name?: string;
+            body: ReadableStream<Uint8Array> | null;
+            signal?: AbortSignal;
+        }): Promise<{
+            relPath: string;
+            absolutePath: string;
+            filename: string;
+            bytes: number;
+        }>;
+    };
     /** How long an upload refusal's tail drain may run before the socket is
      * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
      * Tests inject a small value so the deadline path stays cheap to drive. */
