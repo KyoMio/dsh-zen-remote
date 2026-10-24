@@ -42,6 +42,8 @@ import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
 import { installModelGroupSide } from './effects/model-group-side.ts'
+import { DeliverableDownload, DocumentDownload } from './RemoteFileDownload.tsx'
+import { createSaveRemoteFile } from './remote-file-save.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -165,6 +167,41 @@ export function apply(ctx: ClientContext): void {
   // client-data/model-group-side.ts），CSS 按标隐藏。同样必须在桌面门之前挂载：
   // 桌面端子客户端的模型选单一样要分侧，桌面无手机外壳不影响它。
   installModelGroupSide(ctx)
+
+  // 2.2.6 远程会话产物下载：子客户端最常见的诉求是「把服务端工作区里刚产出的
+  // 文件拿到本机」。DSH 官方的产物卡片只有预览，打开类动作（present.open /
+  // open-in-app）作用于跑 DSH 的那台机器，远程会话里被样式表整组隐藏——
+  // 也就是说此前客户端根本没有把文件落到本机磁盘的入口。两个入口共用同一个
+  // 「读中继 + 浏览器下载」实现（RemoteFileDownload.tsx + remote-file-save.ts）：
+  // deliverable 卡片上的按钮从卡片自己的预览按钮 title 取绝对路径，
+  // 文档预览头的按钮直接拿 owner 给的 absolutePath；两者都只在虚拟会话渲染，
+  // 主服务端与本地会话逐像素 no-op。同样在桌面门之前注册——client 角色的
+  // 桌面端 App 正是远程会话所在。
+  const saveRemoteFileToLocal = createSaveRemoteFile(ctx)
+  ctx.slots.inject('deliverables.file.actions', () =>
+    ctx.slots.register(
+      {
+        name: 'deliverables.file.actions',
+        id: 'zr-download',
+        order: 40,
+        locale: NS,
+        inject: () => ({ saveFile: saveRemoteFileToLocal }),
+      },
+      DeliverableDownload,
+    ),
+  )
+  ctx.slots.inject('sidebar.right.tab.document.actions', () =>
+    ctx.slots.register(
+      {
+        name: 'sidebar.right.tab.document.actions',
+        id: 'zr-download',
+        order: 40,
+        locale: NS,
+        inject: () => ({ saveFile: saveRemoteFileToLocal }),
+      },
+      DocumentDownload,
+    ),
+  )
 
   // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
   // down to ~520px wide, where every width-based gate would flip the phone

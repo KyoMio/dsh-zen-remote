@@ -310,4 +310,42 @@ option[value^="zr~"] {
 html[data-zr-remote-session="1"] [data-slot="conversation.session.header.utilities"] [class$="_moreButton"] ~ [role="menu"] > [role="presentation"] > :first-child {
   display: none !important;
 }
+
+/* ---------- remote session: the "save to this machine" action (2.2.6) ----------
+   One class, owned by this plugin (no host module class, no hash): the
+   deliverable-card entry renders it in the card's own actions cell, the
+   document-preview entry in the preview header where open-in-app's control
+   sits (that one is hidden remotely by the [data-open-target] rule above,
+   so this is the only action left there). Both entries only MOUNT for a
+   virtual session, so the html attribute gate is belt-and-braces, not the
+   decision.
+   The palette variables are the host's own (label-secondary / border-l1 /
+   interactive-bg-hover / state-error), which keeps light/dark identical to
+   the cards around it without copying a theme. */
+html[data-zr-remote-session="1"] .zr-download-action {
+  box-sizing: border-box;
+  flex: none;
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary, #6b7280);
+  background: transparent;
+  border: 0.5px solid var(--dsw-alias-border-l1, #d9dde3);
+  border-radius: var(--dsw-radius-sm, 4px);
+  padding: 1px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+html[data-zr-remote-session="1"] .zr-download-action:hover {
+  color: var(--dsw-alias-label-primary, #111827);
+  background: var(--dsw-alias-interactive-bg-hover, rgba(0, 0, 0, 0.05));
+}
+html[data-zr-remote-session="1"] .zr-download-action[data-phase="busy"] {
+  cursor: progress;
+  opacity: 0.7;
+}
+html[data-zr-remote-session="1"] .zr-download-action[data-phase="error"] {
+  color: var(--dsw-alias-state-error-primary, #dc2626);
+  border-color: var(--dsw-alias-state-error-primary, #dc2626);
+}
 `
