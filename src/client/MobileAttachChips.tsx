@@ -80,6 +80,10 @@ export function MobileAttachChips({ t, useInput, inputActions }: MobileAttachChi
               type="button"
               data-mobile-nav="attach-chip-remove"
               aria-label={t('attachRemove', { name })}
+              // Removal stays on setDraft even where the host has appendDraft
+              // (DSH 0.2.1-rc.3+): append can only add text, and the public
+              // inputActions face has no span-replace verb, so lifting one
+              // token out still means writing the whole next draft.
               onClick={() => inputActions.setDraft(draftWithoutMention(draft, relPath))}
             >
               <IconCloseFillRegular size={14} />

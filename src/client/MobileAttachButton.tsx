@@ -4,7 +4,7 @@ import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots
 import { IconPaperclipOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SessionId } from './compat/types.ts'
 import { NS } from './locales.ts'
-import { draftWithMention, rememberThumbnail, uploadUrl } from './attach-upload.ts'
+import { appendDraftOf, rememberThumbnail, uploadUrl, writeMention } from './attach-upload.ts'
 import { useOwnAttachUi } from './host-attach.ts'
 
 /** Full props for the composer attachment seat. */
@@ -49,8 +49,11 @@ async function uploadFile(sessionId: SessionId, file: File): Promise<string> {
  * host without one (DSH ≤ 0.1.2) everything below loads exactly as before.
  *
  * Every picked file takes the SAME path: upload to the node half, then append
- * `@.dsh-uploads/name` to the draft through `inputActions.setDraft` (the
- * official write path — no DOM value poking). S7.1 removed the split that used
+ * `@.dsh-uploads/name` to the draft through the official write path — no DOM
+ * value poking: `inputActions.appendDraft` where the running DSH exposes it
+ * (0.2.1-rc.3+ editor runtime; keeps the user's text and inline references),
+ * else `inputActions.setDraft` with the whole next draft (attach-upload.ts
+ * `writeMention`). S7.1 removed the split that used
  * to send inlineable images straight into the session with `session.prompt`:
  * one behaviour for every attachment, and the user always presses send.
  * MobileAttachChips renders the preview row off those same draft tokens.
@@ -84,19 +87,21 @@ export function MobileAttachButton({ t, sessionId, useInput, inputActions }: Mob
 
     setBusy(true)
     setError(null)
-    // setDraft takes the WHOLE next draft, so each mention is appended to the
-    // value we last wrote — unless the ref shows the user has typed since, in
-    // which case theirs wins and we append to that instead. (Rebasing on the
-    // ref unconditionally would lose a mention whenever React had not yet
+    // appendDraft (DSH 0.2.1-rc.3+) appends after whatever the composer holds
+    // right now, so no rebasing is needed. The setDraft fallback takes the
+    // WHOLE next draft, so each mention is appended to the value we last
+    // wrote — unless the ref shows the user has typed since, in which case
+    // theirs wins and we append to that instead. (Rebasing on the ref
+    // unconditionally would lose a mention whenever React had not yet
     // re-rendered us between two files of the same pick.)
+    const appends = appendDraftOf(inputActions) !== undefined
     let written = liveDraft.current
     try {
       for (const file of files) {
         const relPath = await uploadFile(sessionId, file)
         // Local preview for the chip row; a no-op for non-images.
         rememberThumbnail(relPath, file)
-        written = draftWithMention(liveDraft.current === written ? written : liveDraft.current, relPath)
-        inputActions.setDraft(written)
+        written = writeMention(inputActions, (appends || liveDraft.current === written) ? written : liveDraft.current, relPath)
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
