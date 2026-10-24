@@ -41,7 +41,6 @@ import { mountRemoteDropGuard } from './effects/remote-drop.ts'
 import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
-import { installHostPathBridgeGuard } from './effects/host-path-bridge.ts'
 import { installModelGroupSide } from './effects/model-group-side.ts'
 import { DeliverableDownload, DocumentDownload } from './RemoteFileDownload.tsx'
 import { createSaveRemoteFile } from './remote-file-save.ts'
@@ -162,12 +161,6 @@ export function apply(ctx: ClientContext): void {
   // 逐字节原样放行；标记属性只在虚拟会话打开时出现，卸载时还原。
   ctx.effect(() => installRemoteApiFetch(window), 'dsh-zen-remote: remote api fetch')
   installRemoteSessionGuard(ctx)
-  // 2.2.6 补：远程会话里「拖文件进输入框」此前会插成 `@C:\...` 本机路径——桌面壳的
-  // host-path bridge 让 composer 优先插路径而不是上传，客户端路径在服务端不存在，
-  // 于是文件永远读不到。这里把 bridge 的 pathFor 在远程会话下改成 undefined，
-  // composer 自己的下一步就会把文件当普通上传处理，走 T51 已就绪的中继上传。
-  // 包一层 Proxy、其它成员原样透传；本地会话与主服务端完全不变。
-  ctx.effect(() => installHostPathBridgeGuard(), 'dsh-zen-remote: host path bridge guard')
   // T74 模型选单分组按会话归属显示：0.2.0 的 MenuGroup 的 aria-labelledby 只剩
   // useId（分组 id 不再出现在标记里），旧的 zr~ 前缀选择器失效——改为 effect 给
   // 分组打 data-zr-group 标（分类依据是虚拟分组名开头的不可见标记，见

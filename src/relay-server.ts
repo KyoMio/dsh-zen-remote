@@ -292,20 +292,6 @@ export interface RelayHandlerOptions {
    * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
    * Content-Length and streaming-count refusals stay cheap to drive. */
   uploadCapBytes?: number
-  /** Prompt-attachment materialization (2.3.0): stores one binary body at a
-   * private, VISIBLE path on this host and returns it, so a remote prompt's
-   * `@<client path>` mention can be rewritten to a path the agent reads with
-   * its ordinary file tools. Absent — an older wiring — and
-   * `v1/prompt-attachment` answers 501 `unsupported`, which the client treats
-   * as "fall back to the attachment receipt". */
-  promptAttachments?: {
-    save(input: {
-      sessionId: string
-      name?: string | undefined
-      body: ReadableStream<Uint8Array> | null
-      signal?: AbortSignal | undefined
-    }): Promise<{ path: string }>
-  }
   /** How long an upload refusal's tail drain may run before the socket is
    * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
    * Tests inject a small value so the deadline path stays cheap to drive. */
@@ -441,8 +427,8 @@ function headerValue(req: IncomingMessage, name: string): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
-/** The streaming upload pump shared by `v1/upload` and
- * `v1/prompt-attachment`: the client's chunks are re-emitted into a
+/** The streaming upload pump behind `v1/upload`: the client's chunks are
+ * re-emitted into a
  * synthetic body verbatim, counted on the way through, with real
  * backpressure (the socket pauses whenever the consumer is not pulling).
  * Past the cap the pump errors — the consumer's reader throws mid-write —
@@ -2281,76 +2267,6 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         pump.detach()
         // The upload is over — answered, refused mid-flight, or its client
         // gone: the budget slot goes back (T51-fix).
-        const remaining = (uploadsByDevice.get(device) ?? 1) - 1
-        if (remaining <= 0) uploadsByDevice.delete(device)
-        else uploadsByDevice.set(device, remaining)
-      }
-      return
-    }
-
-    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/prompt-attachment`) {
-      // The VISIBLE-PATH upload (2.3.0), the twin of `v1/upload`: same walls,
-      // same per-device budget, same streaming pump — only the destination
-      // differs. The client sends the bytes of a client-local file its prompt
-      // mentions; this route materializes them under the host's private
-      // prompt-attachment tree and answers the absolute path, which the client
-      // rewrites into the prompt text. A wiring without a store answers 501 so
-      // an older host keeps the attachment-receipt fallback.
-      if (Number(req.headers['content-length']) > uploadCapBytes) {
-        res.setHeader('Connection', 'close')
-        responseJson(res, 413, PAYLOAD_TOO_LARGE)
-        await drainUpload(req, 0, drainDeadlineMs)
-        return
-      }
-      const decision = decideUploadQuery(new URL(req.url ?? '/', 'http://dsh.internal').search, isAccessible)
-      if (!decision.allow) {
-        await drainUpload(req, 0, drainDeadlineMs)
-        responseJson(res, decision.reason === 'not-shared' ? 403 : 400, { ok: false, error: { code: decision.reason } })
-        return
-      }
-      const save = options.promptAttachments?.save
-      if (save === undefined) {
-        await drainUpload(req, 0, drainDeadlineMs)
-        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
-        return
-      }
-      const device = headerValue(req, 'x-zen-remote-device') ?? ''
-      if ((uploadsByDevice.get(device) ?? 0) >= MAX_UPLOADS_PER_DEVICE) {
-        await drainUpload(req, 0, drainDeadlineMs)
-        responseJson(res, 429, { ok: false, error: { code: 'too-many-uploads' } })
-        return
-      }
-      const hangUp = new AbortController()
-      const pump = pumpUploadBody(req, res, uploadCapBytes, hangUp)
-      uploadsByDevice.set(device, (uploadsByDevice.get(device) ?? 0) + 1)
-      try {
-        const saved = await save({
-          sessionId: decision.sessionId,
-          ...(decision.name === undefined ? {} : { name: decision.name }),
-          body: pump.body,
-          signal: hangUp.signal,
-        })
-        if (pump.tooLarge()) {
-          res.setHeader('Connection', 'close')
-          responseJson(res, 413, PAYLOAD_TOO_LARGE)
-          await drainUpload(req, pump.received(), drainDeadlineMs)
-          return
-        }
-        if (typeof saved.path !== 'string' || saved.path === '') {
-          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
-          return
-        }
-        responseJson(res, 200, { ok: true, value: { path: saved.path } })
-      } catch {
-        if (pump.tooLarge()) {
-          res.setHeader('Connection', 'close')
-          responseJson(res, 413, PAYLOAD_TOO_LARGE)
-          await drainUpload(req, pump.received(), drainDeadlineMs)
-          return
-        }
-        responseJson(res, 502, { ok: false, error: { code: 'internal' } })
-      } finally {
-        pump.detach()
         const remaining = (uploadsByDevice.get(device) ?? 1) - 1
         if (remaining <= 0) uploadsByDevice.delete(device)
         else uploadsByDevice.set(device, remaining)
