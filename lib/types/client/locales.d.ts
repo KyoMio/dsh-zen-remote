@@ -244,6 +244,10 @@ export declare const zh: {
     readonly 'settings.client.diagRemoteDrop': "远程拖拽守卫";
     readonly 'settings.client.diagRemoteDropOk': "已安装 · 拦截 {intercepted} · 重派发 {redispatched} · 文件夹 {blocked} · 放行 {passthrough} · 重包失败 {failed}";
     readonly 'settings.client.diagRemoteDropOff': "未安装（{reason}）";
+    readonly 'settings.client.diagUploadRedirect': "上传改道";
+    readonly 'settings.client.diagUploadRedirectOk': "已安装 · 上传已接管";
+    readonly 'settings.client.diagUploadRedirectRefused': "拒装：{reason}";
+    readonly 'settings.client.diagUploadRedirectPending': "服务注入未触发 · connection {connection} · fileUploads {fileUploads}";
     readonly 'settings.bridge.title': "插件桥";
     readonly 'settings.bridge.empty': "暂无插件登记插件桥";
     readonly 'settings.bridge.loading': "正在读取插件桥登记…";

@@ -146,6 +146,9 @@ export interface ClientStatusBody {
      * a host role or a refused install may still answer it; a server without
      * the field never does). */
     pluginRouteIntercept?: unknown;
+    /** RD-6: the upload-redirect service probe (presence-gated — an older
+     * plugin answers without it). */
+    serviceProbe?: unknown;
 }
 /** One remote-call failure line in the diagnostics lists. `time` is epoch
  * milliseconds — ISO-stamped rings are parsed at derive time; `method`
@@ -199,6 +202,10 @@ export interface ClientConnectionView {
         installed: boolean;
         reasons: string[];
     } | undefined;
+    /** RD-6: the upload-redirect service probe from the same body, passed
+     * through tolerantly (undefined when the body carried none — an older
+     * plugin — and the diagnostics row stays hidden). */
+    uploadProbe: Readonly<Record<string, unknown>> | undefined;
 }
 /**
  * Map one `client/status` body into the view the client group renders.
