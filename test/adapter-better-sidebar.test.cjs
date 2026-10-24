@@ -105,7 +105,7 @@ test('PB-15: the 0.26.0 additions carry the right dispositions; both versions no
 
   // The raw text-write route (0.26.0 lib/index.js:7875-7919): exact, POST,
   // the session id rides the query, 10 MiB — headroom over the plugin's
-  // own 8 MiB WRITE_BODY_GUARD_BYTES, under the relay's 100 MiB.
+  // own 8 MiB WRITE_BODY_GUARD_BYTES, under the relay's 500 MiB.
   const write = adapter.routes.find((route) => route.path === '/sidebar/write')
   assert.ok(write !== undefined, '/sidebar/write is declared')
   assert.equal(write.match, 'exact')

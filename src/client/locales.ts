@@ -300,6 +300,10 @@ export const zh = {
   'remoteGroupMismatch': '（版本有差异）',
   // --- 远程会话拖拽附件（RD-2）：文件夹被拦截时的短暂提示 ---
   'remoteDropFolderBlocked': '远程会话暂不支持拖入文件夹',
+  // --- 2.2.6: 远程会话产物下载（deliverable 卡片 / 文档预览头） ---
+  'downloadToLocal': '下载到本机',
+  'downloadBusy': '下载中…',
+  'downloadFailed': '下载失败',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -596,6 +600,11 @@ export const en: Record<MobileNavKey, string> = {
   'remoteGroupMismatch': ' (version mismatch)',
   // --- RD-2: the short toast when a folder drop into a remote session is blocked ---
   'remoteDropFolderBlocked': 'Folders cannot be dropped into a remote session yet',
+  // 2.2.6: remote-session artifact download (deliverable cards / document
+  // preview header).
+  'downloadToLocal': 'Download to this computer',
+  'downloadBusy': 'Downloading…',
+  'downloadFailed': 'Download failed',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

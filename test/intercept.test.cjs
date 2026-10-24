@@ -4147,6 +4147,40 @@ test('workspaceFiles/readBytes restores the binary marker into a real Uint8Array
   handle.uninstall()
 })
 
+test('officeToPdf/render forwards with the restored workspaceFileScopeId and its PDF bytes as an attachment (2.2.6)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  // What the relay answers after the server half marked the PDF bytes.
+  const pdf = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0, 1, 254, 255])
+  relay.invokeValue = {
+    data: { '$zr-u8': Buffer.from(pdf).toString('base64') },
+    absolutePath: '/srv/a/report.docx',
+    version: 'v1',
+    missingFonts: [],
+    eof: true,
+  }
+  const { handle } = install(gateway, relay)
+  const scopeVirtual = toVirtual(SERVER_ID, 'session-scope')
+  const envelope = await gateway.rpcBridge(
+    'officeToPdf/render',
+    { args: { workspaceFileScopeId: scopeVirtual, path: 'report.docx', priority: 'foreground' } },
+    undefined,
+    undefined,
+  )
+  assert.equal(envelope.ok, true)
+  assert.equal(envelope.value.data, null, 'the PDF bytes ride the attachment channel')
+  assert.equal(envelope.value.absolutePath, '/srv/a/report.docx')
+  assert.ok(Array.isArray(envelope.attachments) && envelope.attachments.length === 1)
+  assert.deepEqual(envelope.attachments[0].path, ['data'])
+  assert.deepEqual(Array.from(envelope.attachments[0].bytes), Array.from(pdf))
+  assert.deepEqual(relay.invokes[0].args, {
+    workspaceFileScopeId: 'session-scope',
+    path: 'report.docx',
+    priority: 'foreground',
+  }, 'the virtual scope is restored to the server session id, path/priority pass verbatim')
+  handle.uninstall()
+})
+
 test('terminal calls restore BOTH field halves: agentId for the PTY half, sessionId for retain/list', async () => {
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()

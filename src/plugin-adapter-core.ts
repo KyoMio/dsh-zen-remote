@@ -163,13 +163,13 @@ export interface NormalizedAdapter {
 const PLUGIN_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u
 const MAX_ROUTES = 64
 
-/** The body cap an ADAPTER route may declare: 100 MiB — the relay's own
+/** The body cap an ADAPTER route may declare: 500 MiB — the relay's own
  * upload budget (lib/relay-server.js `MAX_UPLOAD_BYTES`), which the
  * better-sidebar upload route rides. Wider than the cooperative
  * declaration's 64 MiB because raw media uploads are exactly what an
  * adapter exists to carry; test/adapter-better-sidebar.test.cjs pins the
  * two numbers together. */
-export const MAX_ADAPTER_BODY_BYTES = 100 * 1024 * 1024
+export const MAX_ADAPTER_BODY_BYTES = 500 * 1024 * 1024
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
