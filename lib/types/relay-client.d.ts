@@ -240,11 +240,6 @@ export interface RelayClient {
      * `Content-Length`, when it had one) and a timeout there never moves the
      * connection state — the invoke route's rules (T31-fix). */
     upload(options: RelayUploadOptions, signal?: AbortSignal): Promise<RelayHttpResult>;
-    /** One visible-path materialization (2.3.0): uploads one client-local file
-     * and resolves with the SERVER's absolute path. Refusals (unshared, offline,
-     * an older host answering 501 `unsupported`) throw RelayError; the caller
-     * treats any throw as "keep the attachment-receipt fallback". */
-    promptAttachment(options: RelayPromptAttachmentOptions, signal?: AbortSignal): Promise<RelayPromptAttachmentResult>;
     /** One bridged-plugin round-trip (PB-4): the coordinates travel in the
      * x-zr-* headers (PB-3's protocol), no body. Resolves with the UNREAD
      * fetch Response the moment the headers arrive — the caller streams the
@@ -325,22 +320,6 @@ export interface RelayUploadOptions {
     /** The local request's declared byte count, when its `Content-Length` was
      * readable — sizes the round-trip budget and nothing else. */
     bytes?: number;
-}
-/** The inputs of one {@link RelayClient.promptAttachment} round-trip. */
-export interface RelayPromptAttachmentOptions {
-    /** The ORIGINAL (non-virtual) session id. */
-    sessionId: string;
-    /** The file's display name. */
-    name?: string;
-    /** The raw byte stream (a local file the prompt mentions). */
-    body: ReadableStream<Uint8Array> | null;
-    /** Declared size, for the round-trip budget. */
-    bytes?: number;
-}
-/** One materialized prompt attachment. */
-export interface RelayPromptAttachmentResult {
-    /** Absolute path on the SERVER, suitable for the agent's own read tools. */
-    path: string;
 }
 /** The upstream answer one {@link RelayClient.http} round-trip carries. */
 export interface RelayHttpResult {

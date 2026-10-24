@@ -167,22 +167,6 @@ export interface RelayHandlerOptions {
      * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
      * Content-Length and streaming-count refusals stay cheap to drive. */
     uploadCapBytes?: number;
-    /** Prompt-attachment materialization (2.3.0): stores one binary body at a
-     * private, VISIBLE path on this host and returns it, so a remote prompt's
-     * `@<client path>` mention can be rewritten to a path the agent reads with
-     * its ordinary file tools. Absent — an older wiring — and
-     * `v1/prompt-attachment` answers 501 `unsupported`, which the client treats
-     * as "fall back to the attachment receipt". */
-    promptAttachments?: {
-        save(input: {
-            sessionId: string;
-            name?: string | undefined;
-            body: ReadableStream<Uint8Array> | null;
-            signal?: AbortSignal | undefined;
-        }): Promise<{
-            path: string;
-        }>;
-    };
     /** How long an upload refusal's tail drain may run before the socket is
      * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
      * Tests inject a small value so the deadline path stays cheap to drive. */

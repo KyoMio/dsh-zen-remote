@@ -82,7 +82,6 @@
 import { RelayError, defaultClock } from './relay-client.js'
 import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import { checkGatewayShape } from './intercept-shape.js'
-import { materializeLocalFileMentions } from './prompt-file-mentions.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
 import { INVOKE_BINARY_RESULT_METHODS, extractResultAttachments, restoreInvokeBinary, type ResultAttachment } from './invoke-binary.js'
@@ -2709,15 +2708,6 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       clone = references.args
       if (!references.ok) {
         return failEnvelope(endpoint, 'remote-unsupported', '引用的会话不在服务端上，无法转发')
-      }
-      // 2.2.8: a prompt whose text carries a CLIENT-local absolute `@path`
-      // (the desktop composer prefers a path reference over an upload when
-      // the shell can name one, and a pasted path looks the same) would reach
-      // the server as unreadable text. Stage those files on the host through
-      // the relay's binary channel and turn the mentions into file receipts;
-      // every failure leaves the prompt untouched.
-      if (endpoint === 'session/prompt') {
-        clone = await materializeLocalFileMentions(clone, relay, signal)
       }
       const value = await relay.invoke(namespace, method, clone, signal)
       // The session answered: any closed-session entry for it is stale

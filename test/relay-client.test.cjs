@@ -22,7 +22,6 @@ const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM = '/_dsh/zen-remote/relay/v1/stream'
 const UNSHARE = '/_dsh/zen-remote/relay/v1/unshare'
 const UPLOAD = '/_dsh/zen-remote/relay/v1/upload'
-const PROMPT_ATTACHMENT = '/_dsh/zen-remote/relay/v1/prompt-attachment'
 const DEVICE_NAME = '/_dsh/zen-remote/relay/v1/device/name'
 
 const HANDSHAKE_OK = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: { algo: 'sha256' } }]
@@ -47,7 +46,6 @@ function startFakeRelay() {
     stream: undefined,
     unshare: () => [200, { ok: true }],
     upload: () => [200, { ok: true, value: { status: 200, contentType: 'application/json; charset=utf-8', body: JSON.stringify({ ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'att-1', name: 'note.txt', bytes: 5 } } }) } }],
-    promptAttachment: () => [200, { ok: true, value: { path: '/root/.dsh/tmp/prompt-attachments/session-a/20261021-1100-ab-日志.txt' } }],
     deviceName: (req, res, body) => [200, { ok: true, name: body && typeof body.name === 'string' ? body.name : '' }],
   }
   const server = http.createServer((req, res) => {
@@ -78,12 +76,6 @@ function startFakeRelay() {
         // T51: the binary channel — the body is raw bytes, never JSON. Same
         // scenario contract as the JSON routes.
         const answered = scenario.upload(req, res)
-        if (answered !== undefined) sendJson(res, answered[0], answered[1])
-        return
-      }
-      if (route === PROMPT_ATTACHMENT) {
-        // 2.3.0: the visible-path channel — raw bytes in, `{path}` out.
-        const answered = scenario.promptAttachment(req, res)
         if (answered !== undefined) sendJson(res, answered[0], answered[1])
         return
       }
@@ -1915,32 +1907,5 @@ test('T59-fix2: a push whose connection dies MID-FLIGHT re-queues instead of dro
     await waitFor(() => client.deviceNameSyncing === false)
     assert.equal(client.handshakeInfo.deviceName, 'B')
     assert.equal(client.state, 'online')
-  } finally { await relay.stop() }
-})
-
-test('promptAttachment (2.3.0): raw bytes ride the route and the host path resolves', async () => {
-  const relay = await startFakeRelay()
-  try {
-    const { client } = makeClient(relay.port)
-    await client.connect()
-    const result = await client.promptAttachment({ sessionId: 'session-a', name: '日志.txt', body: byteStreamOf(Buffer.from('hello')) })
-    assert.equal(result.path, '/root/.dsh/tmp/prompt-attachments/session-a/20261021-1100-ab-日志.txt')
-    const hit = relay.seen.find((r) => r.url === PROMPT_ATTACHMENT)
-    assert.equal(hit.query, '?sessionId=session-a&name=%E6%97%A5%E5%BF%97.txt')
-    assert.equal(hit.rawBody.toString(), 'hello')
-    assert.equal(client.state, 'online')
-  } finally { await relay.stop() }
-})
-
-test('promptAttachment (2.3.0): a 501 unsupported rejects so the caller keeps the receipt fallback', async () => {
-  const relay = await startFakeRelay()
-  relay.scenario.promptAttachment = () => [501, { ok: false, error: { code: 'unsupported' } }]
-  try {
-    const { client } = makeClient(relay.port)
-    await client.connect()
-    await assert.rejects(
-      () => client.promptAttachment({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')) }),
-      (error) => error instanceof RelayError && error.code === 'unsupported',
-    )
   } finally { await relay.stop() }
 })
