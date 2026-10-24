@@ -137,7 +137,7 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
 - **CSS 分工没变**：排版类规则在 `src/client/styles/`；`pwa/app.css` 只留壳级
   规则（iOS 输入框防缩放、安全区滚动补偿、代码块横向滚动）。两边抢同一个元素
   是历史事故的根源，加规则前先确认归属。
-- **`lib/` 是产物，不手改**：改 `src/` → `pnpm build` → 提交 `lib/`。
+- **`lib/` 是产物，不手改**：改 `src/` → `pnpm build` → 提交 `lib/`。**删 src 时必须手动 `git rm` 对应 lib 产物**：tsc 只增量写、从不清理已删源文件的旧产物，CI 的 `git diff --exit-code -- lib` 关卡对死产物全盲（2026-10-24 PR #34 吸收剥离踩过，靠对抗审查拦下）。
 - **桌面必须 no-op**：≥1024px 逐像素与未安装时一致。
   是从真机事故里攒出来的，改相关代码前先读。
 - **首帧壳只能内联注入**：冷启动占位壳由网关 `injectBootShell` 写进第一帧
