@@ -19,6 +19,13 @@
 //                               hidden below, our workbench button routes to
 //                               its controls instead)
 //     div.tabs[role="tablist"]  Chat/Trajectory, only when there is >1 view
+//                               (DSH <= 0.2.1-rc.2)
+//     div.tabs                  DSH 0.2.1-rc.3: the row lost its role and
+//       div.viewTabs[role="tablist"][data-conversation-tabs]
+//       div.viewsMoreAnchor     "More conversation views" (…) menu launcher,
+//                               present while conversation.session.header.
+//                               views.actions has registrations (the web app
+//                               ships dsh-client-ui-entry-customization)
 
 export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768px) ---------- */
 
@@ -439,6 +446,35 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      never relies on it (MobileSessionHeader always calls .click()). */
   [data-phase] header [class$="_tabs"][role="tablist"] {
     display: none;
+  }
+  /* DSH 0.2.1-rc.3 split the row: div._tabs (no role) now wraps the
+     tablist (div._viewTabs[role=tablist][data-conversation-tabs]) and the
+     new "More conversation views" launcher, so the rule above matches
+     nothing there and the official row — plus a stray (…) More button —
+     came back under our view-switch band. It cannot simply be display:none
+     either: while the More menu has registrations the header folds every
+     View past floor((row.clientWidth - 48) / 120) into More, and a
+     display:none row measures 0, which would leave only Chat as a
+     [role=tab] for readViewTabs() (MobileSessionHeader.tsx) to mirror.
+     So the row keeps a wide layout box that paints nothing: absolute (out
+     of the header's flow, no band), 2048px wide (room for 16 tabs before
+     anything folds), scale(0) so it adds no scrollable overflow (clientWidth
+     ignores transforms), visibility:hidden + pointer-events:none so it is
+     never seen or hit. Its tabs still take the synthetic .click() the view
+     switcher sends — the same reasoning as the display:none rule above. */
+  [data-phase] header [class$="_tabs"]:has(> [data-conversation-tabs]) {
+    position: absolute !important;
+    top: 0;
+    left: 0;
+    width: 2048px !important;
+    max-width: none !important;
+    height: 0 !important;
+    margin: 0 !important;
+    overflow: hidden !important;
+    transform: scale(0);
+    transform-origin: 0 0;
+    visibility: hidden !important;
+    pointer-events: none !important;
   }
 
   /* View-switch row: "current view name + dots", replacing the (still

@@ -14,12 +14,14 @@ import assert from 'node:assert/strict'
 import {
   UPLOAD_DIR,
   UPLOAD_ROUTE,
+  appendDraftOf,
   draftWithMention,
   draftWithoutMention,
   leafOf,
   mentionsIn,
   middleEllipsis,
   uploadUrl,
+  writeMention,
 } from '../src/client/attach-upload.ts'
 
 // ---- the upload URL --------------------------------------------------------
@@ -83,6 +85,41 @@ assert.deepEqual(mentionsIn(draft), [])
 // typing into this draft, and silently trimming under the caret is worse than
 // one trailing space.
 assert.equal(draft, 'photos: ')
+
+// ---- writing mentions: appendDraft when the host has it, else setDraft ------
+// DSH <= 0.2.1-rc.2 (and the rc.3 public inputActions face): setDraft only.
+{
+  const calls = []
+  const legacy = { setDraft: (text) => calls.push(['set', text]) }
+  assert.equal(appendDraftOf(legacy), undefined)
+  const first = writeMention(legacy, 'read', a)
+  assert.equal(first, 'read @.dsh-uploads/a.pdf ')
+  const second = writeMention(legacy, first, b)
+  assert.equal(second, 'read @.dsh-uploads/a.pdf @.dsh-uploads/b.zip ')
+  assert.deepEqual(calls, [['set', first], ['set', second]])
+}
+// A host whose action face carries appendDraft: only the token is appended,
+// setDraft is never touched, and `this` stays bound to the action face.
+{
+  const calls = []
+  const modern = {
+    draft: 'keep my @src/index.ts reference',
+    setDraft(text) { calls.push(['set', text]) },
+    appendDraft(text) { calls.push(['append', text, this === modern]) },
+  }
+  assert.equal(typeof appendDraftOf(modern), 'function')
+  assert.equal(writeMention(modern, modern.draft, a), modern.draft)
+  writeMention(modern, modern.draft, b)
+  assert.deepEqual(calls, [['append', '@.dsh-uploads/a.pdf ', true], ['append', '@.dsh-uploads/b.zip ', true]])
+}
+// A non-function appendDraft is not an interface: fall back.
+{
+  const calls = []
+  const odd = { appendDraft: true, setDraft: (text) => calls.push(text) }
+  assert.equal(appendDraftOf(odd), undefined)
+  writeMention(odd, '', a)
+  assert.deepEqual(calls, ['@.dsh-uploads/a.pdf '])
+}
 
 // ---- chip labels -----------------------------------------------------------
 assert.equal(leafOf(`${UPLOAD_DIR}/report.pdf`), 'report.pdf')

@@ -41,6 +41,38 @@ export declare function mentionsIn(draft: string): string[];
  */
 export declare function draftWithMention(draft: string, relPath: string): string;
 /**
+ * The two draft writers the attachment flow can use. `setDraft` replaces the
+ * WHOLE draft with plain text (and, on DSH 0.2.1+, drops any inline reference
+ * chips the user had in it); `appendDraft` adds text after the current draft
+ * as new paragraphs and keeps its text and references. DSH 0.2.1-rc.3 grew
+ * `appendDraft` on the composer editor runtime; it is optional here because
+ * older hosts — and, as of rc.3, the public slot `inputActions` face itself —
+ * do not carry it, so it is feature-detected at runtime, never assumed.
+ */
+export interface DraftWriter {
+    setDraft(text: string): void;
+    appendDraft?: (text: string) => void;
+}
+/**
+ * The host's non-destructive append, when the running DSH exposes one.
+ * @param actions - the slot's `inputActions` (or any object carrying them).
+ * @returns a bound `appendDraft`, or undefined when the host has none.
+ */
+export declare function appendDraftOf(actions: object): ((text: string) => void) | undefined;
+/**
+ * Write one `@path` mention into the composer.
+ *
+ * Prefers `appendDraft` (no whole-draft rewrite, so nothing the user typed or
+ * referenced meanwhile can be lost); falls back to `setDraft` with
+ * {@link draftWithMention} over `base` on a host without it.
+ * @param actions - the draft writers.
+ * @param base - the draft to rebase onto for the `setDraft` fallback.
+ * @param relPath - workspace-relative path returned by the upload route.
+ * @returns the draft text the fallback wrote, or `base` unchanged when the
+ *   host appended for us (the next render's `useInput` carries the result).
+ */
+export declare function writeMention(actions: DraftWriter, base: string, relPath: string): string;
+/**
  * Remove one `@path` mention from the draft — what a chip's × does.
  *
  * The file itself stays on disk: it is a few KB in a directory the user can
