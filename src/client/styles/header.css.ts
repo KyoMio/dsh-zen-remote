@@ -100,7 +100,15 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      2026-08-23). color-mix instead of the transparent keyword: the host
      writes its own seat gradient that way, and plain \`transparent\` is
      rgba(0,0,0,0) — WebKit interpolates it through grey. */
-  [data-phase] header::after {
+   /* rc.3 fix (2026-10-25 real-device report "渐隐条跑到顶部"): the host
+     now also renders a BLANK header in the hero phase (no session open,
+     kiGsTW_headerBlank, min-height:0 — a window-drag strip pinned at the
+     frame top), and the bare [data-phase] attribute selector matched that
+     too, painting the fade strip full-width at the very top of the app
+     window on the session LIST page. Scope the fade to a real, active
+     conversation only — the hero/blank header keeps its own (hidden)
+     bottom line. */
+  [data-phase="active"] header::after {
     height: 20px !important;
     top: 100% !important;
     bottom: auto !important;
