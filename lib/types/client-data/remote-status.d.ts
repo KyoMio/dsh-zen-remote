@@ -178,12 +178,17 @@ export declare const REMOTE_STATUS_POLL_MS = 15000;
  * never overwrites a newer table), every GET failure fails its own round,
  * the timer is real while visible and gone while hidden, and becoming
  * visible pulls once immediately. `pollMs` exists for tests: the shipped
- * cadence is far too slow to observe.
+ * cadence is far too slow to observe. `hintGapMs` exists for the same
+ * reason: the shipped hint gap (default 3000) is far too slow to observe.
  */
 export declare function createRemoteStatusStore(fetchImpl: typeof fetch, visibility?: VisibilitySource, pollMs?: number, 
 /** the network-restored hint source. Omitted → no
  * hint wiring (a host mount, or a test). */
-networkHint?: NetworkHintSource): RemoteStatusStore;
+networkHint?: NetworkHintSource, 
+/** the minimum gap between two client-side hints, ms; default 3000 (the
+ * same anti-storm gap the host enforces). Exists for tests, like
+ * `pollMs`: the shipped gap is far too slow to observe. */
+hintGapMs?: number): RemoteStatusStore;
 /**
  * The subscribe face both T34 parts hand `useSyncExternalStore`: a VIRTUAL-id
  * session subscribes to the store — the subscription is what keeps it

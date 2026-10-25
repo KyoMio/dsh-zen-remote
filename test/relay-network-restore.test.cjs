@@ -82,76 +82,88 @@ function makeClient(url, options = {}) {
   })
 }
 
+/** Awaited close: a test that throws mid-assertion must still release the
+ * fake relay's port, or the runner hangs on the open handle. */
+function closeRelay(relay) {
+  return new Promise((resolve) => relay.server.close(resolve))
+}
+
 test('probeHealth: one authenticated GET /ping, state untouched', async () => {
   const relay = await startFakeRelay()
-  const client = makeClient(relay.url)
-  await client.connect()
-  assert.equal(client.state, 'online')
+  try {
+    const client = makeClient(relay.url)
+    await client.connect()
+    assert.equal(client.state, 'online')
 
-  const before = client.state
-  const ok = await client.probeHealth()
-  assert.equal(ok, true, 'a 200 ping resolves true')
-  assert.equal(relay.state.pingCalls, 1, 'exactly one ping round')
-  assert.equal(client.state, before, 'a probe is a question — it must not move state')
-  relay.server.close()
+    const before = client.state
+    const ok = await client.probeHealth()
+    assert.equal(ok, true, 'a 200 ping resolves true')
+    assert.equal(relay.state.pingCalls, 1, 'exactly one ping round')
+    assert.equal(client.state, before, 'a probe is a question — it must not move state')
+  } finally { await closeRelay(relay) }
 })
 
 test('probeHealth: a refused ping resolves false and leaves state alone', async () => {
   const relay = await startFakeRelay({ pingStatus: 401 })
-  const client = makeClient(relay.url)
-  await client.connect()
-  const before = client.state
-  const ok = await client.probeHealth()
-  assert.equal(ok, false, 'a 401 ping resolves false')
-  assert.equal(client.state, before, 'a refusal is about the call, not the link')
-  relay.server.close()
+  try {
+    const client = makeClient(relay.url)
+    await client.connect()
+    const before = client.state
+    const ok = await client.probeHealth()
+    assert.equal(ok, false, 'a 401 ping resolves false')
+    assert.equal(client.state, before, 'a refusal is about the call, not the link')
+  } finally { await closeRelay(relay) }
 })
 
 test('probeHealth: concurrent calls share ONE round trip', async () => {
   const relay = await startFakeRelay({ pingDelayMs: 40 })
-  const client = makeClient(relay.url)
-  await client.connect()
-  const results = await Promise.all([client.probeHealth(), client.probeHealth(), client.probeHealth()])
-  assert.deepEqual(results, [true, true, true], 'all callers get the same answer')
-  assert.equal(relay.state.pingCalls, 1, 'the in-flight slot collapses the three calls')
-  relay.server.close()
+  try {
+    const client = makeClient(relay.url)
+    await client.connect()
+    const results = await Promise.all([client.probeHealth(), client.probeHealth(), client.probeHealth()])
+    assert.deepEqual(results, [true, true, true], 'all callers get the same answer')
+    assert.equal(relay.state.pingCalls, 1, 'the in-flight slot collapses the three calls')
+  } finally { await closeRelay(relay) }
 })
 
 test('networkRestored: refused while online', async () => {
   const relay = await startFakeRelay()
-  const client = makeClient(relay.url)
-  await client.connect()
-  assert.equal(client.state, 'online')
-  assert.equal(client.networkRestored(), false, 'only an offline client has anything to restore')
-  relay.server.close()
+  try {
+    const client = makeClient(relay.url)
+    await client.connect()
+    assert.equal(client.state, 'online')
+    assert.equal(client.networkRestored(), false, 'only an offline client has anything to restore')
+  } finally { await closeRelay(relay) }
 })
 
 test('networkRestored: fires from offline and lands online', async () => {
   const relay = await startFakeRelay({ rejectHandshake: true })
-  const client = makeClient(relay.url)
-  await assert.rejects(() => client.connect())
-  assert.equal(client.state, 'offline')
-  const armed = client.nextRetryAt
-  assert.notEqual(armed, null, 'offline arms the ladder')
+  try {
+    const client = makeClient(relay.url)
+    await assert.rejects(() => client.connect())
+    assert.equal(client.state, 'offline')
+    const armed = client.nextRetryAt
+    assert.notEqual(armed, null, 'offline arms the ladder')
 
-  relay.state.rejectHandshake = false
-  assert.equal(client.networkRestored(), true, 'the hint starts one attempt')
-  await new Promise((r) => setTimeout(r, 50))
-  assert.equal(client.state, 'online', 'the attempt lands online without waiting out the ladder')
-  assert.equal(client.nextRetryAt, null, 'a success retires the armed retry')
-  relay.server.close()
+    relay.state.rejectHandshake = false
+    assert.equal(client.networkRestored(), true, 'the hint starts one attempt')
+    await new Promise((r) => setTimeout(r, 50))
+    assert.equal(client.state, 'online', 'the attempt lands online without waiting out the ladder')
+    assert.equal(client.nextRetryAt, null, 'a success retires the armed retry')
+  } finally { await closeRelay(relay) }
 })
 
 test('networkRestored: the anti-storm gap refuses an immediate second hint', async () => {
   const relay = await startFakeRelay({ rejectHandshake: true })
-  const client = makeClient(relay.url)
-  await assert.rejects(() => client.connect())
-  assert.equal(client.state, 'offline')
+  try {
+    const client = makeClient(relay.url)
+    await assert.rejects(() => client.connect())
+    assert.equal(client.state, 'offline')
 
-  assert.equal(client.networkRestored(), true, 'the first hint is honoured')
-  await new Promise((r) => setTimeout(r, 20))
-  // Still offline (the server keeps refusing), and the gap has not elapsed.
-  assert.equal(client.state, 'offline')
-  assert.equal(client.networkRestored(), false, 'a second hint inside the gap is refused')
-  relay.server.close()
+    assert.equal(client.networkRestored(), true, 'the first hint is honoured')
+    await new Promise((r) => setTimeout(r, 20))
+    // Still offline (the server keeps refusing), and the gap has not elapsed.
+    assert.equal(client.state, 'offline')
+    assert.equal(client.networkRestored(), false, 'a second hint inside the gap is refused')
+  } finally { await closeRelay(relay) }
 })
