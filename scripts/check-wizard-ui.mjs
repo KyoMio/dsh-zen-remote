@@ -22,6 +22,7 @@ import {
   configureReadiness,
   caddySnippetText,
   deriveWizardLights,
+  formSeedOf,
   initialStep,
   isValidHostname,
   isValidPort,
@@ -29,6 +30,7 @@ import {
   nginxSnippetText,
   pairingSecondsLeft,
   publicUrlFrom,
+  upstreamPortOf,
 } from '../src/client-data/wizard.ts'
 import { luckySteps, nginxSnippet, caddySnippet } from '../lib/wizard/proxy-snippets.js'
 import { qrMatrix } from '../src/client-data/qr.ts'
@@ -88,6 +90,34 @@ await test('configureReadiness: each path demands its own fields', () => {
   assert.equal(configureReadiness('external', { domain: '', httpsPort: '', cfToken: '', serverUrl: 'http://dsh.example.com' }).error, 'bad-server-url')
   assert.equal(configureReadiness('external', { domain: '', httpsPort: '', cfToken: '', serverUrl: 'https://x/app' }).error, 'bad-server-url')
   assert.equal(configureReadiness('external', { domain: '', httpsPort: '', cfToken: '', serverUrl: 'not a url' }).error, 'bad-server-url')
+})
+
+await test('formSeedOf: the configure forms seed from the wizard projection, not admin/status (GW-fix-3/M1)', () => {
+  // The projection carries the ingress fields; admin/status does not (GW-1
+  // strips them) — seeding from there would silently never backfill.
+  const configured = {
+    ok: true, mode: 'caddy', domain: 'dsh.example.com', httpsPort: 8443,
+    publicUrl: 'https://dsh.example.com:8443', cfTokenConfigured: true, tunnelTokenConfigured: false,
+    caddyRunning: false, cloudflaredRunning: false, gatewayActualPort: 4088,
+    lastHostProbe: null, lastExternalVerification: null, lastForwardedSource: null,
+  }
+  assert.deepEqual(formSeedOf(configured), {
+    domain: 'dsh.example.com', httpsPort: '8443', serverUrl: 'https://dsh.example.com:8443', path: 'caddy',
+  })
+  // An unconfigured projection seeds nothing (the forms keep the user's
+  // input) and names no path.
+  assert.deepEqual(formSeedOf({ ...configured, mode: 'off', domain: '', httpsPort: 443, publicUrl: '' }), {
+    domain: '', httpsPort: '', serverUrl: '', path: undefined,
+  })
+  assert.deepEqual(formSeedOf(undefined).path, undefined)
+})
+
+await test('upstreamPortOf: the gateway ACTUAL port wins, 3088 is the fallback (GW-fix-3/M2)', () => {
+  assert.equal(upstreamPortOf(undefined), 3088)
+  assert.equal(upstreamPortOf({ ok: true, mode: 'caddy', domain: '', httpsPort: 443, publicUrl: '', cfTokenConfigured: false, tunnelTokenConfigured: false, caddyRunning: false, cloudflaredRunning: false, gatewayActualPort: null, lastHostProbe: null, lastExternalVerification: null, lastForwardedSource: null }), 3088)
+  assert.equal(upstreamPortOf({ ok: true, mode: 'caddy', domain: '', httpsPort: 443, publicUrl: '', cfTokenConfigured: false, tunnelTokenConfigured: false, caddyRunning: false, cloudflaredRunning: false, gatewayActualPort: 4088, lastHostProbe: null, lastExternalVerification: null, lastForwardedSource: null }), 4088)
+  // A junk actual port falls back too.
+  assert.equal(upstreamPortOf({ ok: true, mode: 'caddy', domain: '', httpsPort: 443, publicUrl: '', cfTokenConfigured: false, tunnelTokenConfigured: false, caddyRunning: false, cloudflaredRunning: false, gatewayActualPort: 0, lastHostProbe: null, lastExternalVerification: null, lastForwardedSource: null }), 3088)
 })
 
 await test('deriveWizardLights: amber before trying, red on wrong shapes, pass only on pass', () => {

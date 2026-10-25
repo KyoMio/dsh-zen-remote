@@ -62,6 +62,42 @@ export function initialStep(status: WizardStatusBody | undefined): WizardStep {
   return status !== undefined && status.mode !== 'off' ? 'verify' : 'pick'
 }
 
+export interface WizardFormSeed {
+  domain: string
+  httpsPort: string
+  serverUrl: string
+  path: WizardPath | undefined
+}
+
+/**
+ * The configure-form seed from one wizard status projection (GW-fix-3/M1):
+ * the projection (wizard/status) is the ONLY surface that carries the
+ * ingress fields — admin/status strips them by design, so the form must
+ * seed from here. Empty values leave the form untouched.
+ */
+export function formSeedOf(status: WizardStatusBody | undefined): WizardFormSeed {
+  if (status === undefined || status.mode === 'off') {
+    return { domain: '', httpsPort: '', serverUrl: '', path: undefined }
+  }
+  return {
+    domain: status.domain,
+    httpsPort: String(status.httpsPort),
+    serverUrl: status.publicUrl,
+    path: status.mode,
+  }
+}
+
+/**
+ * The reverse-proxy snippet's upstream port: the gateway's ACTUAL port as
+ * the wizard runtime reports it, falling back to the configured default
+ * 3088 when no status has landed yet (GW-fix-3/M2).
+ */
+export function upstreamPortOf(status: WizardStatusBody | undefined): number {
+  return typeof status?.gatewayActualPort === 'number' && status.gatewayActualPort >= 1 && status.gatewayActualPort <= 65535
+    ? status.gatewayActualPort
+    : 3088
+}
+
 /** The step AFTER pick, given the user's path choice. */
 export function stepAfterPick(): WizardStep {
   return 'configure'

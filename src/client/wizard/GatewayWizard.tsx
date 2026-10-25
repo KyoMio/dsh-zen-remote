@@ -33,10 +33,12 @@ import {
   configureReadiness,
   caddySnippetText,
   deriveWizardLights,
+  formSeedOf,
   initialStep,
   luckyStepTexts,
   nginxSnippetText,
   pairingSecondsLeft,
+  upstreamPortOf,
   type LightState,
   type SnippetKind,
   type WizardPath,
@@ -162,15 +164,12 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           if (body?.ok === true) setWizardStatus(body)
         }
         if (adminResponse.ok && mine === ticket) {
-          const body = (await adminResponse.json()) as { gatewayReachable?: unknown; viaGateway?: unknown; config?: { values?: { ingressDomain?: unknown; ingressHttpsPort?: unknown; ingressPublicUrl?: unknown; ingressMode?: unknown } } }
+          const body = (await adminResponse.json()) as { gatewayReachable?: unknown; viaGateway?: unknown }
           setGatewayReachable(body?.gatewayReachable === true)
           setViaGateway(body?.viaGateway !== false)
-          const values = body?.config?.values
-          if (values !== undefined) {
-            if (typeof values.ingressDomain === 'string' && values.ingressDomain !== '') setDomain(values.ingressDomain)
-            if (typeof values.ingressHttpsPort === 'number') setHttpsPort(String(values.ingressHttpsPort))
-            if (typeof values.ingressPublicUrl === 'string' && values.ingressPublicUrl !== '') setServerUrl(values.ingressPublicUrl)
-          }
+          // The ingress fields live ONLY on the wizard projection —
+          // admin/status strips them (GW-1), so backfill happens in the
+          // wizardStatus seed below.
         }
         if (mine === ticket) setStatusLoaded(true)
       } catch {
@@ -182,15 +181,20 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     return () => clearInterval(handle)
   }, [])
 
-  // Seed the entry step from the FIRST ready wizard status (initialStep:
-  // a configured ingress opens straight on verify). Later refreshes do not
-  // yank the user around.
+  // Seed the entry step AND the configure forms from the FIRST ready
+  // wizard status (initialStep + formSeedOf — the projection is the only
+  // surface carrying the ingress fields). Later refreshes do not yank the
+  // user around.
   const seededRef = useRef(false)
   useEffect(() => {
     if (seededRef.current || wizardStatus === undefined) return
     seededRef.current = true
     setStep(initialStep(wizardStatus))
-    if (wizardStatus.mode === 'caddy' || wizardStatus.mode === 'external' || wizardStatus.mode === 'cloudflared') setPath(wizardStatus.mode)
+    const seed = formSeedOf(wizardStatus)
+    if (seed.path !== undefined) setPath(seed.path)
+    if (seed.domain !== '') setDomain(seed.domain)
+    if (seed.httpsPort !== '') setHttpsPort(seed.httpsPort)
+    if (seed.serverUrl !== '') setServerUrl(seed.serverUrl)
   }, [wizardStatus])
 
   // Verification polling: only while a session could still move — a
@@ -278,7 +282,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const lights = deriveWizardLights({ gatewayReachable, poll })
   const verified = poll?.result === 'pass'
   const qr = startResult?.ok === true ? qrMatrix(startResult.publicUrl) : null
-  const snippetInput = { domain: domain.trim() || 'dsh.example.com', upstreamHost: '127.0.0.1', upstreamPort: 3088 }
+  // The snippet targets the gateway's ACTUAL port (it may have retried
+  // past the configured one), falling back to 3088 before any status lands.
+  const snippetInput = { domain: domain.trim() || 'dsh.example.com', upstreamHost: '127.0.0.1', upstreamPort: upstreamPortOf(wizardStatus) }
   const snippetText = snippetTab === 'nginx'
     ? nginxSnippetText(snippetInput)
     : snippetTab === 'caddy' ? caddySnippetText(snippetInput) : (luckyStepTexts(snippetInput) ?? []).join('\n')
