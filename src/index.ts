@@ -16,7 +16,7 @@
  */
 
 import { createOwnerPeerSource } from './owner-peer.js'
-import { lstat, mkdir, open, realpath, rm } from 'node:fs/promises'
+import { lstat, mkdir, open, realpath, rm, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { randomBytes } from 'node:crypto'
@@ -307,7 +307,25 @@ async function ensureManagedDirectory(workspace: string, path: string): Promise<
   if (!entry.isDirectory()) throw new UploadError(400, 'path-escape', `upload path is not a directory: ${path}`)
   const canonical = await realpath(path)
   ensurePathInside(workspace, canonical)
+  await ensureSelfIgnoring(canonical)
   return canonical
+}
+
+/**
+ * Drop a self-ignoring `.gitignore` (`*` + `!.gitignore`) next to the
+ * upload directory's creation, so dropped files never surface as untracked
+ * entries in the session workspace — an agent's `git add -A` would
+ * otherwise commit the user's uploads. `wx` keeps a pre-existing
+ * (user-customized) file untouched; in a non-git workspace the file is an
+ * inert no-op. Best-effort only: a read-only directory still receives the
+ * upload route's own error, never a new one from here.
+ */
+async function ensureSelfIgnoring(directory: string): Promise<void> {
+  try {
+    await writeFile(join(directory, '.gitignore'), '*\n!.gitignore\n', { flag: 'wx', mode: 0o644 })
+  } catch (error) {
+    if (!isErrnoCode(error, 'EEXIST') && !isErrnoCode(error, 'EROFS') && !isErrnoCode(error, 'EACCES')) throw error
+  }
 }
 
 interface UploadRoot {
