@@ -42,6 +42,7 @@ function statusBody() {
     devices: [{ id: 'dev-1', name: 'Test Phone', role: 'web', kind: 'auto', createdAt: 1, lastSeen: 2, ua: 'ua', hasPush: false }],
     pushSubscriptions: 0,
     lastForwardedSource: { ip: '198.51.100.7', at: 1698249600000 },
+    lastWebClaim: { id: 'dev-1', secure: true, at: 1698249660000 },
   }
 }
 
@@ -148,6 +149,7 @@ test('GET status relays the gateway payload and adds the live config', async () 
   assert.equal(body.gateway.pairing.code, 'TESTCODE', 'the operator sees the live pairing code')
   assert.equal(body.gateway.devices[0].id, 'dev-1')
   assert.deepEqual(body.gateway.lastForwardedSource, { ip: '198.51.100.7', at: 1698249600000 }, 'the local operator sees the untrusted-proxy detection (GW-fix-2/L1)')
+  assert.deepEqual(body.gateway.lastWebClaim, { id: 'dev-1', secure: true, at: 1698249660000 }, 'the local operator sees the web-claim record (GW-9)')
   assert.ok(body.config.values, 'config.values present')
   assert.ok(body.config.sources, 'config.sources present')
   assert.equal(body.config.values.lang, 'zh')
@@ -161,6 +163,7 @@ test('a via-gateway caller may read status (pairing stripped) but never POST', a
   assert.equal(body.viaGateway, true)
   assert.equal(body.gateway.pairing, null, 'the live pairing code must not reach a remote device')
   assert.equal(body.gateway.lastForwardedSource, null, 'the untrusted-proxy detection must not reach a remote device either (GW-fix-2/L1)')
+  assert.equal(body.gateway.lastWebClaim, null, 'the web-claim record must not reach a remote device either (GW-9)')
   assert.equal(body.gateway.devices.length, 1, 'the rest of the status payload is untouched')
 
   const before = seen.length

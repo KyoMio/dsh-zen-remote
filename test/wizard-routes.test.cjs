@@ -58,6 +58,7 @@ function wizardOptions(overrides = {}) {
     ...(overrides.getRuntime !== undefined
       ? { getRuntime: overrides.getRuntime }
       : { getRuntime: () => { runtimeReads += 1; return { cfTokenConfigured: true, cloudflaredRunning: true, gatewayActualPort: 4088 } } }),
+    ...(overrides.verify !== undefined ? { verify: overrides.verify } : {}),
   }
 }
 
@@ -198,6 +199,81 @@ test('POST placeholders answer 501 only after same-origin passes; cross-site is 
   })
   assert.equal(cross.status, 403)
   assert.equal(JSON.parse(cross.body).error.code, 'origin-rejected')
+})
+
+// --- GW-9: the verify routes -------------------------------------------------------
+
+test('verify routes: POST starts, GET polls, the walls hold, unwired is 501', async () => {
+  const calls = []
+  const { server, port } = await serve(wizard.createWizardHandler(wizardOptions({
+    verify: {
+      start: async (input) => { calls.push(['start', input]); return { ok: true, pairingCode: 'PAIRCODE', publicUrl: 'https://dsh.example.com', expiresAt: 1 } },
+      check: async () => { calls.push(['check']); return { result: 'pending' } },
+    },
+  })))
+  try {
+    // POST starts the verification with the body's URL.
+    const post = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_VERIFY_ROUTE,
+      headers: sameOrigin(port),
+      body: { publicUrl: 'https://dsh.example.com' },
+    })
+    assert.equal(post.status, 200)
+    assert.deepEqual(JSON.parse(post.body), { ok: true, pairingCode: 'PAIRCODE', publicUrl: 'https://dsh.example.com', expiresAt: 1 })
+
+    // GET polls (read-only — no same-origin requirement, like any GET).
+    const get = await request(port, { method: 'GET', path: wizard.WIZARD_VERIFY_ROUTE })
+    assert.equal(get.status, 200)
+    assert.deepEqual(JSON.parse(get.body), { result: 'pending' })
+    assert.deepEqual(calls, [['start', { publicUrl: 'https://dsh.example.com' }], ['check']])
+
+    // The walls hold on the new route too: cross-site POST first 403s.
+    const cross = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_VERIFY_ROUTE,
+      headers: { origin: 'http://evil.example' },
+      body: { publicUrl: 'https://dsh.example.com' },
+    })
+    assert.equal(cross.status, 403)
+    assert.equal(JSON.parse(cross.body).error.code, 'origin-rejected')
+    const via = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_VERIFY_ROUTE,
+      headers: { 'x-zen-remote-via': 'gateway', ...sameOrigin(port) },
+      body: { publicUrl: 'https://dsh.example.com' },
+    })
+    assert.equal(via.status, 403)
+    assert.equal(JSON.parse(via.body).error.code, 'via-gateway')
+
+    // Malformed body is a typed 400 before the orchestrator runs.
+    const bad = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_VERIFY_ROUTE,
+      headers: sameOrigin(port),
+      body: '{"publicUrl": ',
+    })
+    assert.equal(bad.status, 400)
+    assert.equal(JSON.parse(bad.body).error.code, 'bad-request')
+    assert.equal(calls.filter((entry) => entry[0] === 'start').length, 1, 'no start ran for the malformed body')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+
+  // Unwired: the placeholder answer, walls still first.
+  const bare = await serve(wizard.createWizardHandler(wizardOptions()))
+  try {
+    const notWired = await request(bare.port, {
+      method: 'POST',
+      path: wizard.WIZARD_VERIFY_ROUTE,
+      headers: sameOrigin(bare.port),
+      body: { publicUrl: 'https://dsh.example.com' },
+    })
+    assert.equal(notWired.status, 501)
+    assert.equal(JSON.parse(notWired.body).error.code, 'not-implemented')
+  } finally {
+    await new Promise((resolve) => bare.server.close(resolve))
+  }
 })
 
 test('unknown GET under the prefix is 404; non-GET/POST is 405; GET reads only', async () => {

@@ -27,7 +27,9 @@
     "src/wizard/cloudflare.ts",
     "src/wizard/cloudflared.ts",
     "src/wizard/source-detect.ts",
-    "src/wizard/proxy-snippets.ts"
+    "src/wizard/proxy-snippets.ts",
+    "src/wizard/probe.ts",
+    "src/wizard/verify.ts"
   ],
   "exclude": [
     "src/client",
