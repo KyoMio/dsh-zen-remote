@@ -6,11 +6,16 @@
 //
 // Official structure this file reshapes (verified live at 390px, see the S3
 // report): InputBar renders
-//   _card > _row > [_tools > (_add, _modes > PermissionSelect, input.left)]
+//   _card > _row > [_tools > (_add, input[type=file] hidden, _modes >
+//                             PermissionSelect, input.left)]
 //                  [_trailing > (_standardControls > (input.right, input.model), _activity, _primary)]
 // with `_tools` / `_trailing` / `_standardControls` as inner flex groups
 // (0.1.7 added `_standardControls` and moved the ContextMeter out of the row
-// into the dock under the card). Flattening all three to
+// into the dock under the card). That hidden file input is the stand-down
+// probe host-attach.ts USED to key on — since #31 the phone's own attach
+// button is a permanent resident instead, and DSH 0.1.5's second `_add`
+// button (the standalone paperclip 0.2.x removed) is hidden by section 2.
+// Flattening all three to
 // `display: contents` turns every control into a direct flex item of `_row`,
 // which is what makes a pure `order` reflow possible without touching a
 // single official component.
@@ -23,8 +28,21 @@ const ROOT = '[data-slot="conversation.composer.bar"] > [class$="_root"]'
 const RING_W = '30px'
 /** DSH 0.1.7's wrapper around input.right + input.model inside `_trailing`. */
 const STD = `${ROW} > [class$="_trailing"] > [class$="_standardControls"]`
-/** The model seat's own root inside the trailing group (long form so it beats the <=1023px pill rules in layout.css.ts). */
-const MODEL = `${STD} > [data-slot="conversation.input.model"] > [class$="_root"]`
+/**
+ * The model seat's content, whichever plugin owns it: officially ModelSelect's
+ * `_root`, but a third party can replace the whole `conversation.input.model`
+ * slot (…codex-ui mounts its own selector there), and a subagent session has
+ * nothing matching `_root` at all. Spelled `*:not(…)` rather than bare `> *`
+ * on purpose: `:not([data-mobile-nav])` carries the same (0,1,0) the old
+ * `[class$="_root"]` did, keeping every rule below a full attribute CLASS
+ * ahead of the ≤1023px pill rules in layout.css.ts — their `[data-phase] …
+ * :has(…)` forms measure (0,6,1) on the trigger and (0,7,1) on the label
+ * with `!important`, so a bare `> *` would leave the phone winning by
+ * exactly one class on every MODEL-derived rule, one upstream attr away
+ * from losing. The :not() also keeps this plugin's own nodes from ever
+ * reading as the model seat, should one ever be mounted there.
+ */
+const MODEL = `${STD} > [data-slot="conversation.input.model"] > *:not([data-mobile-nav])`
 /** The permission select's trigger button (structure only — the PermissionSelect hashed classes are never named). */
 const PERM = `${ROW} > [class$="_tools"] > [class$="_modes"]`
 /**
@@ -60,6 +78,12 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
 [data-mobile-nav="attach-picker"] {
   display: none !important;
 }
+/* The composer-chips strip (effects/model-sheet-extras.ts) — same
+   every-width default as the picker above: the phone block re-shows it
+   inside the dock rail; the desktop shell keeps none. */
+[data-mobile-nav="composer-chips"] {
+  display: none !important;
+}
 
 @media (max-width: 767px) {
   /* --- 1. flatten the two official groups ---
@@ -83,14 +107,26 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   }
 
   /* --- 2. the running order ---
-     The attachment button (S3 placeholder, S7 wires it up) sits leftmost;
-     the official "+" command menu keeps its seat right next to it, where
+     The attachment button (S3 placeholder, S7 wires it up) sits leftmost and
+     is a PERMANENT resident now (#31): on DSH 0.2.x the standalone paperclip
+     moved into the "+" command menu while its hidden <input type="file">
+     stayed in _tools, so the old host-attach stand-down probe matched on
+     every host and the phone composer was left with no attach affordance at
+     all. The official "+" command menu keeps its seat right next to it, where
      the two "insert something" affordances read as one cluster. */
   ${ROW} [data-mobile-nav="attach"] {
     order: 1 !important;
   }
   ${ROW} > [class$="_tools"] > [class$="_add"] {
     order: 2 !important;
+  }
+  /* DSH ≤ 0.1.5 still renders that second _add button (the standalone
+     paperclip) as a direct _tools child; hide it below 768px so the row
+     keeps exactly one attach control — ours, which uploads into the session
+     workspace the phone can actually reach. On 0.2.x the only button in
+     _tools is the first of its type, so this never matches. */
+  ${ROW} > [class$="_tools"] > button[class$="_add"]:nth-of-type(2) {
+    display: none !important;
   }
   ${ROW} > [class$="_tools"] > [class$="_modes"] {
     order: 3 !important;
@@ -243,7 +279,8 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      caps the pill so the row's elastic gap survives extreme model ids;
      the label rules below override the <=1023px grow rules in
      layout.css.ts (flex 1 1 auto) that would otherwise pad the pill. */
-  ${MODEL} > [class$="_trigger"] {
+  ${MODEL} > [class$="_trigger"],
+  ${MODEL} > button {
     background: var(--dsw-specific-selector, rgba(127, 127, 127, .12)) !important;
     height: 30px !important;
     width: auto !important;
@@ -267,6 +304,18 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   ${MODEL} > [class$="_trigger"] > [class$="_triggerEffort"] {
     display: block !important;
     flex: none !important;
+    white-space: nowrap !important;
+  }
+  /* Third-party model selectors (…codex-ui) render a bare <button> with no
+     _trigger classes and text straight inside it; give that button the same
+     shrink+truncate contract the official label gets, so a long model id
+     ellipsizes instead of stretching the row. The official trigger also
+     matches this (harmless: it already ellipsizes its own label). */
+  ${MODEL} > button {
+    max-width: 100% !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
     white-space: nowrap !important;
   }
   /* PermissionSelect wraps its trigger in the Menu primitive's root span,
@@ -336,90 +385,97 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 12px !important;
     font-size: 15px !important;
   }
-  /* --- 4a. third-party composer entries live in the model sheet ---
-     effects/model-sheet-extras.ts parks the \`conversation.input.right\`
-     container inside the model menu while that menu is open and puts it back
-     when it closes; these rules are the two halves of that trip.
+  /* --- 4a. third-party composer entries live in the dock's chip strip ---
+     effects/model-sheet-extras.ts collects the composer's secondary controls
+     (input.right, input.left, and anything a third party parks directly into
+     _tools / _standardControls / _trailing / _row) and moves the REAL nodes
+     into [data-mobile-nav="composer-chips"] — a 26px horizontally
+     scrollable strip the effect mounts at the head of the dock rail above
+     the card. Always visible, one tap, no sheet in between.
 
-     In the row: hidden, but ONLY once the effect has marked the container as
-     one it manages. Keying the hide off the marker rather than off "not
-     currently parked" is what makes the failure direction safe — if the
-     effect declines to act (nothing in the slot but the vision toggle, so
-     nothing worth moving) or never runs at all, the marker is absent, this
-     rule does not match, and the controls stay exactly where the host put
-     them. The inverse spelling hid them in the row whenever they were not in
-     the sheet, which in those same cases left them reachable from neither
-     place (caught in review, 2026-09-06).
-     Hiding by ancestor rather than by a display rule on the container itself
-     is what lets the parked copy style itself freely — same element, two
-     homes, two rule sets. \`!important\` because the slot container carries an
-     inline \`display: contents\`. */
-  ${STD} > [data-slot="conversation.input.right"][data-zen-sheet-extras] {
+     In the row: hidden, but ONLY once the effect has marked them. Two opt-in
+     markers, both written by the effect: the input.right CONTAINER gets
+     data-zen-sheet-extras (so an emptied wrapper leaves no flex gap), and
+     every collected node gets data-zen-composer-extra. Visibility comes back
+     the moment a node is parked (="open") or the effect releases it (marker
+     removed) — a version of the effect that declines to act, or never runs
+     at all, leaves every control exactly where the host put it; nothing can
+     end up hidden from both places at once (the 2026-09-06 review's rule). */
+  [data-slot="conversation.input.right"][data-zen-sheet-extras],
+  [data-zen-composer-extra]:not([data-zen-composer-extra="open"]) {
     display: none !important;
   }
-  /* Parked in the sheet: a column of full-width rows in the sheet's own
-     language, so a relocated control reads as a sibling of 模型 and 推理等级
-     rather than a chip that wandered in. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] {
+  /* The strip itself: one 26px line at the rail's head (order 0, document
+     order first via the effect's prepend), scrolling sideways when the
+     collected controls overflow. Scoped to the dock CHILD — the generic
+     marker also sits on the emptied input.right container in the row, where
+     nothing but the opt-in hide above may touch it. This specificity (0,2,0)
+     is what beats the section 7 \`> *\` cage wherever they overlap (overflow,
+     max-width, radius are all !important there too). */
+  [data-slot="conversation.input.dock"] > [data-mobile-nav="composer-chips"] {
     display: flex !important;
-    flex-direction: column !important;
-    gap: 2px !important;
-    width: 100% !important;
-  }
-  /* Undo the row's compaction on every parked control: back to full width and
-     the 48px the sheet's own cells use. \`> * > *\` reaches both shapes without
-     naming either plugin — subscriptions wraps its trigger in a positioning
-     div, vision-router puts its button straight in the slot. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] > *,
-  ${MODEL_MENU} > [data-zen-sheet-extras] > * > button {
-    width: 100% !important;
-    max-width: none !important;
-    min-width: 0 !important;
-    justify-content: flex-start !important;
-  }
-  ${MODEL_MENU} > [data-zen-sheet-extras] button {
-    box-sizing: border-box !important;
-    min-height: 48px !important;
-    height: auto !important;
-    padding: 0 12px !important;
-    gap: 10px !important;
-    border-radius: 12px !important;
-    border: none !important;
-    background: transparent !important;
-    font-size: 15px !important;
-    /* Both plugins center their chip label, which is right for a pill in the
-       row and wrong for a full-width row: the sheet's own cells start their
-       label at the left edge. justify-content covers the flex triggers,
-       text-align the ones that are not flex containers. */
-    text-align: left !important;
-    justify-content: flex-start !important;
-  }
-  /* Order comes from the row (compat.css.ts puts the vision toggle at 5 so it
-     parks beside the context ring), and that rule still matches in here on
-     ≤ 0.1.2 — the inline sheet is a DOM descendant of the composer bar even
-     though it paints as a fixed layer (the 0.1.5 body portal is not, where
-     this is a harmless no-op). Reset it so the sheet follows DOM order
-     instead of inheriting a decision that was about a different layout. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] > * {
+    flex-flow: row nowrap !important;
+    align-items: center !important;
+    gap: 6px !important;
     order: 0 !important;
+    flex: 0 1 auto !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    min-height: 26px !important;
+    max-height: 26px !important;
+    border-radius: 0 !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    scrollbar-width: none !important;
   }
-  /* The vision toggle is squeezed to a 28px icon in the row (compat.css.ts);
-     in the sheet it is a row, so its label comes back and the icon leads. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > span {
+  [data-slot="conversation.input.dock"] > [data-mobile-nav="composer-chips"]::-webkit-scrollbar {
+    display: none !important;
+  }
+  /* Parked controls shrink from whatever the row allowed them to the rail's
+     26px pill scale: auto width again (no full-width rows here), tight
+     height, and the chip font the rest of the rail uses. */
+  [data-mobile-nav="composer-chips"] > * {
+    flex: 0 0 auto !important;
+    order: 0 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    min-height: 26px !important;
+    max-height: 26px !important;
+    width: auto !important;
+    max-width: none !important;
+  }
+  [data-mobile-nav="composer-chips"] button {
+    box-sizing: border-box !important;
+    height: 26px !important;
+    min-height: 26px !important;
+    max-height: 26px !important;
+    width: auto !important;
+    padding: 0 10px !important;
+    gap: 5px !important;
+    border-radius: 999px !important;
+    font-size: 11.5px !important;
+    line-height: 18px !important;
+    white-space: nowrap !important;
+  }
+  /* The vision toggle is squeezed to a 28px icon-only button in the row
+     (compat.css.ts); in the strip it is a 14px icon + text pill, so its
+     label comes back. */
+  [data-mobile-nav="composer-chips"] [data-vision-router-mode-toggle] > span {
     display: inline !important;
   }
-  ${MODEL_MENU} > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > svg:first-of-type {
-    width: 18px !important;
-    height: 18px !important;
+  [data-mobile-nav="composer-chips"] [data-vision-router-mode-toggle] > svg:first-of-type {
+    width: 14px !important;
+    height: 14px !important;
   }
   /* The speed chip opens a menu of its own, anchored \`bottom: 100%\` to its
-     trigger. Inside the sheet — which is \`overflow: hidden\` so its rounded
-     top clips its content — that menu would be cut off. Same escape section 4
-     uses for the host's two menus: position: fixed leaves the clip behind
-     (the sheet sets \`transform: none\`, so nothing between here and the
-     viewport captures fixed positioning) and it lands as its own sheet on top
-     of this one. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] [role="menu"] {
+     trigger. Inside the strip — which is \`overflow-x: auto\`, so its content
+     clips at the strip's box — that menu would be cut off. Same escape
+     section 4 uses for the host's two menus: position: fixed leaves the clip
+     behind and it lands as its own bottom sheet over the composer. */
+  [class$="_composerSeat"]:has([data-zen-sheet-extras] [role="menu"]) {
+    z-index: 60 !important;
+  }
+  [data-zen-sheet-extras] [role="menu"] {
     position: fixed !important;
     left: 0 !important;
     right: 0 !important;
@@ -434,13 +490,13 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 16px 16px 0 0 !important;
     border-bottom: none !important;
     padding: 8px 8px calc(8px + var(--mnav-sab)) !important;
-    /* Above the model sheet it sits on (60, section 4), below the session-info
-       sheet's 70 (info.css.ts) — it is a child of the model sheet, not a peer
-       of the page's own layers. */
+    /* Above the page content behind the seat (the seat is raised to 60 by
+       the rule above while a parked menu is open), below the session-info
+       sheet's 70 (info.css.ts). */
     z-index: 61 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, .18) !important;
   }
-  ${MODEL_MENU} > [data-zen-sheet-extras] [role="menu"] [role="menuitemradio"] {
+  [data-zen-sheet-extras] [role="menu"] [role="menuitemradio"] {
     min-height: 48px !important;
     border-radius: 12px !important;
     font-size: 15px !important;
@@ -468,7 +524,10 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   body:has(${MODEL} > [class$="_menu"]) [data-chat-flow] + div,
   body:has(> [id$="-menu"][class$="_menu"]:is([role="menu"], [role="group"])) [data-chat-flow] + div,
   /* T70: the portaled permission menu (marked by effects/permission-sheet.ts). */
-  body:has(> div[role="menu"][data-zen-sheet="perm"]) [data-chat-flow] + div {
+  body:has(> div[role="menu"][data-zen-sheet="perm"]) [data-chat-flow] + div,
+  /* T-issue30: an inline menu a parked chip opened (escaped to a fixed
+     sheet by 4a). */
+  body:has([data-zen-sheet-extras] [role="menu"]) [data-chat-flow] + div {
     display: none !important;
   }
   /* --- 5. input box: two lines minimum, five lines maximum ---

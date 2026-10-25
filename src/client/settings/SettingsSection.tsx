@@ -71,6 +71,7 @@ import type {
   ZenRemoteSettingsForm,
 } from '../../client-data/settings-form.ts'
 import { NS } from '../locales.ts'
+import { remoteDropDiagnostics } from '../effects/remote-drop.ts'
 import { describeShare } from '../../client-data/shares.ts'
 import type { ShareEntryView, SharesStore } from '../../client-data/shares.ts'
 
@@ -315,6 +316,11 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   // The client group's rendered view, hoisted for the countdown ticker and
   // the retry-follow refresh below (T43).
   const clientView = clientLoad.state === 'ready' || clientLoad.state === 'stale' ? clientLoad.view : undefined
+  // RD-3: the remote drop guard's browser-side counters, read at render
+  // time — no snapshot state of its own: the initial mount, the 15s
+  // connected-status poll and the countdown ticker all re-render this page,
+  // and each render takes the values as they are right then.
+  const dropDiag = remoteDropDiagnostics()
   const clientRetryAt = clientView?.nextRetryAt
   const clientCountingDown = clientRetryAt !== undefined
 
@@ -1158,7 +1164,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               earlier servers answer neither, and the section itself only
               exists when there is at least one line to show. PB-5 adds the
               bridge rows and the rerouting note on the same presence gate. */}
-          {clientView !== undefined && (clientView.lastError !== '' || clientView.intercept !== undefined || clientView.compat !== undefined || (clientView.pluginBridge?.length ?? 0) > 0 || clientView.pluginRouteIntercept !== undefined) && (
+          {clientView !== undefined && (clientView.lastError !== '' || clientView.intercept !== undefined || clientView.compat !== undefined || (clientView.pluginBridge?.length ?? 0) > 0 || clientView.pluginRouteIntercept !== undefined || dropDiag.installed || dropDiag.notInstalledReason !== undefined) && (
             <>
               <h3 className="zr-settings-card-title">{t('settings.client.diagTitle')}</h3>
               {clientView.lastError !== '' && (
@@ -1195,6 +1201,60 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   )}
                 </>
               )}
+              {/* RD-3: the remote drop guard's own line — installed state
+                  plus the five counters. Browser-side values, so unlike the
+                  rows above it never rides the client/status body. */}
+              {(dropDiag.installed || dropDiag.notInstalledReason !== undefined) && (
+                <div className="zr-settings-field">
+                  <div className="zr-settings-head">
+                    <label>{t('settings.client.diagRemoteDrop')}</label>
+                  </div>
+                  <p className="zr-settings-hint">
+                    {dropDiag.installed
+                      ? t('settings.client.diagRemoteDropOk', {
+                        intercepted: dropDiag.intercepted,
+                        redispatched: dropDiag.redispatched,
+                        blocked: dropDiag.blockedDirectories,
+                        passthrough: dropDiag.passthrough,
+                        failed: dropDiag.rewrapFailed,
+                      })
+                      : t('settings.client.diagRemoteDropOff', { reason: dropDiag.notInstalledReason ?? '—' })}
+                  </p>
+                </div>
+              )}
+              {/* RD-6: the upload-redirect (fetch-route intercept) line — rides
+                  the client/status body's serviceProbe. One row answers the
+                  question this diagnosis was built for: whether the redirect
+                  is installed, refused (with the shape reason), or its service
+                  inject never fired — and which of the two services is
+                  missing when so. */}
+              {clientView?.uploadProbe !== undefined && (() => {
+                const probe = clientView.uploadProbe as {
+                  uploadInjectSeen?: unknown
+                  connectionService?: unknown
+                  fileUploadsService?: unknown
+                  fetchRoute?: { installed?: unknown; uploadWrapped?: unknown; shape?: { reasons?: unknown } }
+                }
+                const seen = probe.uploadInjectSeen === true
+                const refused = seen && probe.fetchRoute?.shape?.reasons instanceof Array && (probe.fetchRoute.shape.reasons as string[]).length > 0
+                const wrapped = probe.fetchRoute?.uploadWrapped === true
+                const text = wrapped
+                  ? t('settings.client.diagUploadRedirectOk')
+                  : refused
+                    ? t('settings.client.diagUploadRedirectRefused', { reason: (probe.fetchRoute?.shape?.reasons as string[]).join('; ') })
+                    : t('settings.client.diagUploadRedirectPending', {
+                      connection: typeof probe.connectionService === 'string' ? probe.connectionService : '—',
+                      fileUploads: typeof probe.fileUploadsService === 'string' ? probe.fileUploadsService : '—',
+                    })
+                return (
+                  <div className="zr-settings-field">
+                    <div className="zr-settings-head">
+                      <label>{t('settings.client.diagUploadRedirect')}</label>
+                    </div>
+                    <p className="zr-settings-hint">{text}</p>
+                  </div>
+                )
+              })()}
               {clientView.compat !== undefined && (
                 <>
                   {clientView.compat.mismatchedGroups.length > 0 && (

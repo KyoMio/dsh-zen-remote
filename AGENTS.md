@@ -22,7 +22,7 @@
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
 | `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
 | `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
-| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（改动摘要 / diff 的 plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ unshare |
+| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（改动摘要 / diff 的 plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（远程会话附件字节转宿主暂存，返回回执）/ unshare |
 | `src/relay-access.ts` | 中继的按方法登记访问控制表（服务端那一张；`v1/http` 的按路由登记表也在这里） |
 | `src/relay-filter.ts` | 全局流与全局列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
 | `src/session-reference.ts` | 两端共用的 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队消息 edit、`commands/execute` 全部字符串）：服务端照它校验、子客户端照它改写，同一份规则防两端漂移 |
@@ -36,7 +36,7 @@
 | `src/adapters/` | 适配器目录（PB-11）：`index.ts` 只导出 `ADAPTERS` 数组（本单为空，PB-12 加第一个），`types.ts` 放适配器作者接口，实现各占一个子目录；**除 `src/index.ts` 接线外任何文件不得 import 此目录**，适配器实现只可 import `types.ts` 与纯工具 |
 | `src/client-data/plugin-bridge.ts` | 设置页纯函数（PB-5）：桥接状态 → 文案键、整机数据同意表的切换（只动一键）；浏览器半边，不 import 主包 |
 | `src/fetch-route-intercept.ts` | 子客户端本机拦截的第二半：包装宿主连接服务 `fetchRoutes` 表的上传与导出两项——远程会话的非图片附件经 `relay/v1/upload` 流式转服务端（超限本地拒、失败回宿主自己的 200 失败信封）、虚拟 id 的导出后台 403（形态检测、懒装重试、卸载守卫） |
-| `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数，无状态） |
+| `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数、零依赖；client-data 半边许可 import 它做 zr~ 判定，先例 remote-drop.ts / remote-status.ts） |
 | `src/merge-streams.ts` | 三条全局流/列表的本地 + 远程合并状态机（侧边栏远程分组） |
 | `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
 | `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
@@ -137,9 +137,21 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
 - **CSS 分工没变**：排版类规则在 `src/client/styles/`；`pwa/app.css` 只留壳级
   规则（iOS 输入框防缩放、安全区滚动补偿、代码块横向滚动）。两边抢同一个元素
   是历史事故的根源，加规则前先确认归属。
-- **`lib/` 是产物，不手改**：改 `src/` → `pnpm build` → 提交 `lib/`。
+- **`lib/` 是产物，不手改**：改 `src/` → `pnpm build` → 提交 `lib/`。**删 src 时必须手动 `git rm` 对应 lib 产物**：tsc 只增量写、从不清理已删源文件的旧产物，CI 的 `git diff --exit-code -- lib` 关卡对死产物全盲（2026-10-24 PR #34 吸收剥离踩过，靠对抗审查拦下）。
 - **桌面必须 no-op**：≥1024px 逐像素与未安装时一致。
   是从真机事故里攒出来的，改相关代码前先读。
+- **首帧壳只能内联注入**：冷启动占位壳由网关 `injectBootShell` 写进第一帧
+  HTML（`BOOT_SHELL_*`），DSH 一往 `#root` 渲染就同步摘掉。壳的 CSS/标记/脚本
+  都是网关里的内联常量（不放进 `pwa/app.css` 或客户端样式），带 30s CSS 渐隐
+  兜底；移除脚本有真实 vm 用例（DCL / 晚渲染 / `#root` 缺失 / 保险丝）。不能
+  挪进客户端插件——那个 bundle 正是首帧要等的东西；不能引入额外请求；显式
+  `desktop` 设备不注入、≥1024px 由 CSS 隐藏。`test/gateway.test.cjs` 钉住。
+- **长缓存只给内容寻址 URL**：网关只给 `/assets/` 下**哈希形状**（8+ 位且含
+  数字或大小写混合，排除 `vendor-bootstrap.css` 这类普通词）、且响应不是 HTML
+  的文件补 `immutable`（上游已有缓存头时让上游说话）；service worker 只对同一
+  判定与 `?rev=<hex 构建修订>`（DSH 按 mtime/ctime/size 生成，且 DSH 自己已
+  按 immutable 提供）的插件批次缓存优先；响应类型必须与 URL 声明一致，
+  HTML/错误页不得存进资源缓存。给无哈希 URL 做长缓存就是重演 v2 的「新 DOM + 旧 CSS」事故。
 - **要藏宿主刚渲染出来的东西，别用 `requestAnimationFrame`**：React 在该帧的
   rAF 阶段之后才提交 DOM，所以从 mutation 里排的 rAF 落在**下一帧**——中间那
   一帧已经画到屏幕上，用户就看见闪。两个月内三次「晚一帧」的 bug（2026-08-18

@@ -124,6 +124,12 @@ export interface ClientHandlerOptions {
   getRowConfig: () => unknown
   /** Outbound fetch, defaulting to the global one. */
   fetchImpl?: FetchLike
+  /** Upload-redirect service probe (RD-6): lazily reflects `connection` /
+   * `fileUploads` from a context that already resolved, plus whether the
+   * fetch-route inject callback ever fired. Answers WHY the upload
+   * redirection is absent on compositions where one of the two services
+   * never becomes available (cordis keeps such injects silently PENDING). */
+  getServiceProbe?: () => Record<string, unknown>
   /** The live relay client (T23a), once apply() built one. When it has LEFT
    * its initial `unpaired` state — a connection attempt ran — the status
    * route reports ITS verdict (state + handshake server name) and skips the
@@ -489,6 +495,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // that.
         const intercept = options.getIntercept?.()
         const fetchRouteIntercept = options.getFetchRouteIntercept?.()
+        const serviceProbe = options.getServiceProbe?.()
         const pluginRouteIntercept = options.getPluginRouteIntercept?.()
         const compatRelay = options.getRelayClient?.()
         const compat =
@@ -507,6 +514,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           let next: Record<string, unknown> = { ...body, pluginBridge: options.getPluginBridgeStatus?.() ?? [] }
           if (intercept !== undefined) next = { ...next, intercept }
           if (fetchRouteIntercept !== undefined) next = { ...next, fetchRouteIntercept }
+          if (serviceProbe !== undefined) next = { ...next, serviceProbe }
           if (pluginRouteIntercept !== undefined) next = { ...next, pluginRouteIntercept }
           return compat === undefined ? next : { ...next, compat }
         }

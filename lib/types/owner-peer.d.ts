@@ -54,4 +54,13 @@ export declare function createOwnerPeerSource(getConnection: () => unknown): () 
 export declare function withPeer<T extends object>(request: T, getPeer: (() => unknown) | undefined): T & {
     peer?: unknown;
 };
+/**
+ * Build the `/api` shared-fetch dispatcher reader for the relay server.
+ * DSH 0.2.1-rc.3's `HostConnectionService.createSharedFetchHandler('/api').fetch(request, peer)`
+ * checks `peer.principal.kind !== 'owner'` directly (returning 403 or throwing
+ * TypeError when `peer` is undefined), so the dispatcher forwards the owner
+ * Peer from `getPeer()` as the second argument. Pre-rc.3 hosts ignore the
+ * extra argument.
+ */
+export declare function createSharedApiFetchGetter(getConnection: () => unknown, getPeer?: () => unknown): () => ((request: Request) => Promise<Response>) | undefined;
 //# sourceMappingURL=owner-peer.d.ts.map

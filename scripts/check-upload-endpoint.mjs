@@ -89,6 +89,17 @@ try {
   assert.equal(ok.body.bytes, Buffer.byteLength(payload))
   assert.equal(await readFile(join(workspace, UPLOAD_DIR, 'notes.txt'), 'utf8'), payload)
 
+  // ---- the upload dir self-ignores in git ---------------------------------
+  // Files dropped into a session workspace would otherwise surface as
+  // untracked entries — and an agent's `git add -A` would commit the user's
+  // uploads. The directory ships a self-ignoring .gitignore created with the
+  // directory itself; a pre-existing (user-customized) one is never touched.
+  assert.equal(
+    await readFile(join(workspace, UPLOAD_DIR, '.gitignore'), 'utf8'),
+    '*\n!.gitignore\n',
+    'upload dir gets a self-ignoring .gitignore',
+  )
+
   // ---- same name twice does not clobber -----------------------------------
   const again = await post('?session=session-live&name=notes.txt', 'second')
   assert.equal(again.status, 201)
@@ -165,7 +176,7 @@ try {
 
   // ---- the workspace holds exactly what was uploaded, nothing partial ------
   assert.deepEqual((await readdir(join(workspace, UPLOAD_DIR))).sort(), [
-    'blob.bin', 'evil.txt', 'notes-1.txt', 'notes.txt',
+    '.gitignore', 'blob.bin', 'evil.txt', 'notes-1.txt', 'notes.txt',
   ])
 
   // ---- T17: the admission wall the apply() wiring passes in ----------------
@@ -205,8 +216,8 @@ try {
       assert.equal(body.error.code, status === 401 ? 'unauthorized' : 'forbidden')
     }
     assert.deepEqual(await readdir(join(workspace, UPLOAD_DIR)), [
-      'blob.bin', 'evil.txt', 'notes-1.txt', 'notes.txt',
-    ], 'a refused admit writes nothing')
+      '.gitignore', 'blob.bin', 'evil.txt', 'notes-1.txt', 'notes.txt',
+    ], 'a refused admit writes nothing (the .gitignore predates it, created with the dir)')
     assert.equal(logged, 7, 'the admission wall short-circuits before the logger, like the 405/403')
 
     const allowed = await fetch(`${admitBases[2]}/_dsh/mobile-nav/upload?session=session-live&name=admitted.txt`, {

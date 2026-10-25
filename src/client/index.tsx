@@ -37,10 +37,13 @@ import { RemoteStatusIcon } from './RemoteStatusIcon.tsx'
 import { RemoteComposerBanner } from './RemoteComposerBanner.tsx'
 import { registerRemoteStatusUi } from './remote-status-register.ts'
 import { mountCurrentSessionReporter } from './current-session-report.ts'
+import { mountRemoteDropGuard } from './effects/remote-drop.ts'
 import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
 import { installModelGroupSide } from './effects/model-group-side.ts'
+import { DeliverableDownload, DocumentDownload } from './RemoteFileDownload.tsx'
+import { createSaveRemoteFile } from './remote-file-save.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
@@ -135,6 +138,15 @@ export function apply(ctx: ClientContext): void {
   // 的桌面端 App 正是远程会话所在；只在探测出的子客户端角色下运行，主
   // 服务端的页面探测一次后就静默。
   mountCurrentSessionReporter(ctx)
+  // 远程会话拖拽附件（RD-2）：document 级 capture 阶段的 drop 拦截。桌面端
+  // 的同机零拷贝会把拖入的文件变成 `@本机绝对路径` chip，远程会话里服务端
+  // 读不到这个路径——守卫把远程会话的文件拖拽改写成无路径 File 的合成
+  // drop（宿主原生管道按浏览器拖拽走字节上传，再由 T51 的 fetch-route
+  // 拦截经中继转服务端）。判定在 client-data/remote-drop.ts（纯函数），
+  // 这里只做监听与重派发。同样必须在桌面门之前挂载：远程会话恰在桌面端
+  // 全宽使用；三门全不中（本地会话 / 手机端无 bridge / 非受信事件）时
+  // 零干预，主服务端的页面不受影响。
+  mountRemoteDropGuard(ctx)
   // T64 服务端分组展开状态的记忆与恢复：宿主在工作区列表 ready 时会把不在
   // 列表里的分组展开记录清掉（retainAccountKeys），而本地工作区先 ready、
   // 服务端分组后并入，zr~ 键每次加载都被清掉、分组回到折叠。与上报器共用
@@ -155,6 +167,41 @@ export function apply(ctx: ClientContext): void {
   // client-data/model-group-side.ts），CSS 按标隐藏。同样必须在桌面门之前挂载：
   // 桌面端子客户端的模型选单一样要分侧，桌面无手机外壳不影响它。
   installModelGroupSide(ctx)
+
+  // 2.2.6 远程会话产物下载：子客户端最常见的诉求是「把服务端工作区里刚产出的
+  // 文件拿到本机」。DSH 官方的产物卡片只有预览，打开类动作（present.open /
+  // open-in-app）作用于跑 DSH 的那台机器，远程会话里被样式表整组隐藏——
+  // 也就是说此前客户端根本没有把文件落到本机磁盘的入口。两个入口共用同一个
+  // 「读中继 + 浏览器下载」实现（RemoteFileDownload.tsx + remote-file-save.ts）：
+  // deliverable 卡片上的按钮从卡片自己的预览按钮 title 取绝对路径，
+  // 文档预览头的按钮直接拿 owner 给的 absolutePath；两者都只在虚拟会话渲染，
+  // 主服务端与本地会话逐像素 no-op。同样在桌面门之前注册——client 角色的
+  // 桌面端 App 正是远程会话所在。
+  const saveRemoteFileToLocal = createSaveRemoteFile(ctx)
+  ctx.slots.inject('deliverables.file.actions', () =>
+    ctx.slots.register(
+      {
+        name: 'deliverables.file.actions',
+        id: 'zr-download',
+        order: 40,
+        locale: NS,
+        inject: () => ({ saveFile: saveRemoteFileToLocal }),
+      },
+      DeliverableDownload,
+    ),
+  )
+  ctx.slots.inject('sidebar.right.tab.document.actions', () =>
+    ctx.slots.register(
+      {
+        name: 'sidebar.right.tab.document.actions',
+        id: 'zr-download',
+        order: 40,
+        locale: NS,
+        inject: () => ({ saveFile: saveRemoteFileToLocal }),
+      },
+      DocumentDownload,
+    ),
+  )
 
   // Desktop gate (DSH 0.1.7): the official Electron shell can be dragged
   // down to ~520px wide, where every width-based gate would flip the phone

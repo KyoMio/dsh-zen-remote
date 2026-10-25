@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode, TouchEvent as ReactTouchEvent } from 'react'
 import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import {
@@ -368,6 +368,23 @@ export function MobileHome({
     return () => window.removeEventListener(GO_HOME_EVENT, onGoHome)
   }, [actions])
 
+  // Mirror the current phone view onto the AppFrame element itself so CSS inside
+  // the main column (session header hide + fade strip gate) can key off a direct
+  // ancestor attribute instead of relying solely on cross-subtree body:has(...)
+  // invalidation on iOS WebKit (especially across installViewportHeal's display
+  // toggle on standalone PWA launch).
+  useLayoutEffect(() => {
+    const frame = document.querySelector<HTMLElement>('[data-mobile-nav="frame"]')
+      ?? document.querySelector('[data-shell-overlay]')?.parentElement
+      ?? null
+    if (!phone || frame === null) {
+      frame?.removeAttribute('data-mobile-view')
+      return
+    }
+    frame.setAttribute('data-mobile-view', view)
+    return () => frame.removeAttribute('data-mobile-view')
+  }, [phone, view])
+
   const enter = (start: () => void): void => {
     start()
     setSheet(null)
@@ -376,19 +393,69 @@ export function MobileHome({
   }
 
   // Opens the OFFICIAL settings modal (dsh-client-ui-settings-general's
-  // SettingsRoot) by clicking its real trigger button — its "open" state is
+  // SettingsRoot) by clicking its real trigger — its "open" state is
   // component-local React state with no public setter, same reasoning as
-  // MobileSessionHeader's Chat/Trajectory tab click. The trigger mounts
-  // inside the sidebar's `sidebar.settings` footer slot
-  // (`[class$="_settingsArea"]`, the sidebar shell's stable class suffix —
-  // see dsh-client-ui-sidebar's SidebarRoot), which is display:none on the
-  // phone breakpoint (home.css.ts): `.click()` still dispatches (bypasses
-  // hit-testing, S2.1 precedent) and flips `open`, but the resulting
-  // `aria-modal="true"` dialog would still paint nothing without the portal
-  // fix in styles/chips.css.ts (`:has([aria-modal="true"])` un-hides exactly
-  // the ancestor chain down to it, not the whole sidebar).
+  // MobileSessionHeader's Chat/Trajectory tab click. The trigger lives in the
+  // sidebar's `sidebar.settings` footer slot (`[class$="_settingsArea"]`, the
+  // sidebar shell's stable class suffix — see dsh-client-ui-sidebar's
+  // SidebarRoot), which is display:none on the phone breakpoint
+  // (home.css.ts): `.click()` still dispatches (bypasses hit-testing, S2.1
+  // precedent) and flips `open`.
+  //
+  // DSH 0.2.1-rc.2 moved the entry: that slot now holds only the ACCOUNT
+  // launcher (aria-haspopup="menu"), and Settings is an item inside its menu
+  // — the `button[aria-haspopup="dialog"]` this used to forward to is gone
+  // (and the resulting dialog is a body portal now, so the chips.css.ts
+  // ancestor un-hide below no longer has anything to reveal). Hence the
+  // menu fallback; both paths keep the label-free, structure-free
+  // "dispatch a click on the official control" approach.
   const openSettings = (): void => {
-    document.querySelector<HTMLButtonElement>('[class$="_settingsArea"] button[aria-haspopup="dialog"]')?.click()
+    const area = document.querySelector<HTMLElement>('[class$="_settingsArea"]')
+    // Older DSH: the settings modal's own trigger sits in the settings area.
+    const direct = area?.querySelector<HTMLButtonElement>('button[aria-haspopup="dialog"]')
+    if (direct) {
+      direct.click()
+      return
+    }
+    // DSH 0.2.1-rc.2: the sidebar footer's settings area now holds only the
+    // ACCOUNT launcher (aria-haspopup="menu", data-signed-out), and 设置 /
+    // Settings is an item inside its menu — the dialog trigger this used to
+    // forward to no longer exists there, so the bare
+    // querySelector()?.click() silently no-oped (real-phone report
+    // 2026-10-21: "手机端右上角设置点了没反应"). Open the menu, then click the
+    // settings item.
+    //
+    // Two constraints from review: (1) menus are body portals and a sibling
+    // menu (session actions, model picker) may already be mounted, so the
+    // item must come from the menu THIS click opened — snapshot the existing
+    // ones and pick the newly mounted menu; (2) the item is located without
+    // depending on its label, because the account menu's copy is localized:
+    // 设置 / Settings is the FIRST menuitem in both the signed-in and the
+    // signed-out variant (AccountMenu items: settings, contact, signin/out),
+    // so the first item is the locale-independent anchor, with the label as
+    // a refinement if that order ever changes.
+    const launcher = area?.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"], button')
+    if (!launcher) return
+    const before = new Set<Element>(document.querySelectorAll('[role="menu"]'))
+    launcher.click()
+    const pick = (): boolean => {
+      const menu = [...document.querySelectorAll<HTMLElement>('[role="menu"]')].find((el) => !before.has(el))
+      if (!menu) return false
+      const items = [...menu.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]')]
+      const item = items.find((el) => /设置|Settings/i.test(el.textContent || '')) ?? items[0]
+      if (!item) return false
+      item.click()
+      return true
+    }
+    // React commits the menu in the click's own task; observe for the mount
+    // (a deferred sibling launcher cannot leave a stale poll behind) and give
+    // up instead of leaking the observer if it never appears.
+    if (pick()) return
+    const observer = new MutationObserver(() => {
+      if (pick()) observer.disconnect()
+    })
+    observer.observe(document.body, { childList: true, subtree: true })
+    setTimeout(() => observer.disconnect(), 1000)
   }
 
   if (!phone) return null

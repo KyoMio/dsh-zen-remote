@@ -66,7 +66,10 @@ test('deep nesting past the depth bound passes through untouched (no hang, no th
 })
 
 test('the method list covers exactly the known binary-result methods', () => {
-  assert.deepEqual([...INVOKE_BINARY_RESULT_METHODS], ['workspaceFiles/readBytes'])
+  // 2.2.6 added the Office preview converter: its result carries the complete
+  // PDF bytes as `data: Uint8Array`, so it needs the same marker as a file
+  // read.
+  assert.deepEqual([...INVOKE_BINARY_RESULT_METHODS], ['workspaceFiles/readBytes', 'officeToPdf/render'])
 })
 
 test('an EMPTY Uint8Array round-trips too (review 2026-10-14: the empty base64 string is a legal marker)', () => {
