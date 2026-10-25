@@ -108,6 +108,18 @@ export function binDir(dshHome: string): string {
   return join(ingressDir(dshHome), 'bin')
 }
 
+/** `<DSH_HOME>/zen-remote-ingress/Caddyfile` — generated, validated, then
+ * handed to `caddy run --config`. */
+export function caddyfilePath(dshHome: string): string {
+  return join(ingressDir(dshHome), 'Caddyfile')
+}
+
+/** `<DSH_HOME>/zen-remote-ingress/caddy-data` — certificates and the ACME
+ * account live here, kept out of the default Caddy home. */
+export function caddyDataDir(dshHome: string): string {
+  return join(ingressDir(dshHome), 'caddy-data')
+}
+
 /** The installed file name. Windows cannot spawn an extension-less image,
  * so the `.exe` suffix is part of the install name there. */
 export function binaryFileName(tool: IngressBinary, platform: BinaryPlatform = currentPlatform()): string {

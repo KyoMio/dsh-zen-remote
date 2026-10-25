@@ -79,6 +79,12 @@ export declare function dshHomeDefault(env?: NodeJS.ProcessEnv): string;
 export declare function ingressDir(dshHome: string): string;
 /** `<DSH_HOME>/zen-remote-ingress/bin` — both binaries install here. */
 export declare function binDir(dshHome: string): string;
+/** `<DSH_HOME>/zen-remote-ingress/Caddyfile` — generated, validated, then
+ * handed to `caddy run --config`. */
+export declare function caddyfilePath(dshHome: string): string;
+/** `<DSH_HOME>/zen-remote-ingress/caddy-data` — certificates and the ACME
+ * account live here, kept out of the default Caddy home. */
+export declare function caddyDataDir(dshHome: string): string;
 /** The installed file name. Windows cannot spawn an extension-less image,
  * so the `.exe` suffix is part of the install name there. */
 export declare function binaryFileName(tool: IngressBinary, platform?: BinaryPlatform): string;

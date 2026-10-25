@@ -12,7 +12,8 @@ const net = require('node:net')
 const http = require('node:http')
 const zlib = require('node:zlib')
 const vm = require('node:vm')
-const { startMockTarget, startMockAuthTarget, startGateway, startRecordingTarget, request, stopAll, pairDevice, REMOTE_HEADERS, freePort } = require('./util.cjs')
+const { startMockTarget, startMockAuthTarget, startGateway, startGatewayAt, startRecordingTarget, request, stopAll, pairDevice, REMOTE_HEADERS, freePort } = require('./util.cjs')
+const path = require('node:path')
 
 const VIEWPORT_RE = /<meta[^>]*name=["']?viewport["']?[^>]*>/gi
 // Exactly what DSH itself serves today — the tag the gateway has to rewrite.
@@ -764,4 +765,52 @@ test('auth exchange: the token request reaches upstream with the rewritten loopb
     assert.ok(exchange, 'the gateway performed one token exchange')
     assert.strictEqual(exchange.headers.host, '127.0.0.1:' + TARGET_PORT, 'exchange Host is the loopback target, not the public domain')
   } finally { await stop() }
+})
+
+// ---- GW-5: untrusted reverse-proxy detection -----------------------------------
+
+test('GW-5: a proxy signature from an untrusted socket is recorded as lastForwardedSource', async () => {
+  // The detection needs a NON-loopback socket peer (loopback is always
+  // trusted), so the gateway binds 0.0.0.0 and the test connects to this
+  // host's own LAN address — the closest faithful stand-in for the user's
+  // reverse proxy. No LAN interface: nothing to simulate.
+  const os = require('node:os')
+  const fs = require('node:fs')
+  let lan
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const entry of list || []) {
+      if (entry.family === 'IPv4' && !entry.internal) { lan = entry.address; break }
+    }
+    if (lan) break
+  }
+  if (!lan) return
+
+  const target = await startMockTarget(0)
+  const port = await freePort()
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-gw5-'))
+  const gw = startGatewayAt(home, port, target.address().port, { LAN_GATE_HOST: '0.0.0.0' })
+  try {
+    await gw.ready
+    // Before any proxied request: the field exists and answers null.
+    const before = JSON.parse((await request(port, { path: '/lan-gate/status' })).body)
+    assert.strictEqual(before.lastForwardedSource, null)
+
+    // A proxy signature (XFF) from the LAN socket: still refused as an
+    // untrusted client (the 403 the pre-wizard gateway always gave), AND
+    // recorded with the SOCKET ip for the wizard to offer.
+    const marked = await fetch(`http://${lan}:${port}/lan-gate/status`, { headers: { 'x-forwarded-for': '203.0.113.9' } })
+    assert.strictEqual(marked.status, 403)
+    const after = JSON.parse((await request(port, { path: '/lan-gate/status' })).body)
+    assert.strictEqual(after.lastForwardedSource.ip, lan, 'the recorded ip is the SOCKET peer, not the XFF claim')
+    assert.strictEqual(typeof after.lastForwardedSource.at, 'number')
+
+    // A plain (headerless) request from the same untrusted socket changes
+    // nothing — only a proxy signature is a detection.
+    await fetch(`http://${lan}:${port}/lan-gate/status`)
+    const final = JSON.parse((await request(port, { path: '/lan-gate/status' })).body)
+    assert.strictEqual(final.lastForwardedSource.ip, lan, 'the last detection survives headerless traffic')
+  } finally {
+    await stopAll(target, gw.child)
+    try { fs.rmSync(home, { recursive: true, force: true }) } catch { /* best effort */ }
+  }
 })

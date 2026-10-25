@@ -55,6 +55,18 @@ export interface WizardRecordInput {
 }
 
 /**
+ * The gateway's own detection of an untrusted reverse proxy (GW-5): the
+ * socket peer of the last request that carried proxy headers from an IP
+ * outside `trustedProxies` — almost certainly the user's own proxy, and
+ * the one IP the trust-proxy flow offers to add. Whitelist-projected like
+ * everything else.
+ */
+export interface WizardForwardedSourceInput {
+  ip?: unknown
+  at?: unknown
+}
+
+/**
  * Runtime facts the wizard back-end observes live. Everything is optional —
  * a composition that has not started any ingress process simply omits the
  * fields. Token presence is reported as booleans only; port as the gateway
@@ -68,6 +80,7 @@ export interface WizardRuntimeInput {
   gatewayActualPort?: unknown
   lastHostProbe?: WizardRecordInput | null
   lastExternalVerification?: WizardRecordInput | null
+  lastForwardedSource?: WizardForwardedSourceInput | null
 }
 
 /** One projected probe / verification memory, or null when there is none. */
@@ -75,6 +88,12 @@ export interface WizardStatusRecord {
   result: string
   deviceId: string | null
   at: number | null
+}
+
+/** One projected untrusted-proxy detection, or null when none is pending. */
+export interface WizardStatusForwardedSource {
+  ip: string
+  at: number
 }
 
 /** The full sanitized status the wizard status route answers with. */
@@ -91,6 +110,7 @@ export interface WizardStatus {
   gatewayActualPort: number | null
   lastHostProbe: WizardStatusRecord | null
   lastExternalVerification: WizardStatusRecord | null
+  lastForwardedSource: WizardStatusForwardedSource | null
 }
 
 function modeOf(value: unknown): WizardIngressMode {
@@ -123,6 +143,15 @@ function recordOf(input: WizardRecordInput | null | undefined): WizardStatusReco
   }
 }
 
+/** Project one untrusted-proxy detection down to its two wire fields. */
+function forwardedSourceOf(input: WizardForwardedSourceInput | null | undefined): WizardStatusForwardedSource | null {
+  if (input === null || input === undefined || typeof input !== 'object') return null
+  const { ip, at } = input
+  if (typeof ip !== 'string' || ip === '') return null
+  if (typeof at !== 'number' || !Number.isFinite(at)) return null
+  return { ip, at }
+}
+
 /**
  * Build the sanitized wizard status. Both arguments are optional so a
  * composition can answer before anything is configured; the all-empty
@@ -143,5 +172,6 @@ export function projectWizardStatus(declared: WizardDeclaredInput = {}, runtime:
     gatewayActualPort: portOf(runtime.gatewayActualPort),
     lastHostProbe: recordOf(runtime.lastHostProbe),
     lastExternalVerification: recordOf(runtime.lastExternalVerification),
+    lastForwardedSource: forwardedSourceOf(runtime.lastForwardedSource),
   }
 }

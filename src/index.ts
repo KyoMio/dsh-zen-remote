@@ -16,7 +16,7 @@
  */
 
 import { createOwnerPeerSource, createSharedApiFetchGetter } from './owner-peer.js'
-import { lstat, mkdir, open, realpath, rm, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { randomBytes } from 'node:crypto'
@@ -69,6 +69,7 @@ import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } fro
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
 import { createWizardHandler, WIZARD_ROUTE_PREFIX } from './wizard/routes.js'
+import { detectForwardedSource } from './wizard/source-detect.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
@@ -790,13 +791,20 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         }),
       }), 'dsh-zen-remote: admin routes')
     })
-    // Gateway-wizard routes (GW-4): a separate LONGEST-prefix registration
-    // under the admin prefix — the host web server matches the longest
-    // prefix first, so /admin/wizard/* lands here and everything else stays
-    // with the admin handler above. Same host-only gate and admit wall; the
-    // wizard handler applies its own via-marker and same-origin walls to
-    // every route. The runtime probe arrives with the ingress lifecycle
-    // (GW-3/GW-7); the skeleton answers "nothing configured" meanwhile.
+    // Gateway-wizard routes (GW-4, extended by GW-5): a separate LONGEST-
+    // prefix registration under the admin prefix — the host web server
+    // matches the longest prefix first, so /admin/wizard/* lands here and
+    // everything else stays with the admin handler above. Same host-only
+    // gate and admit wall; the wizard handler applies its own via-marker
+    // and same-origin walls to every route. The runtime probe reads the
+    // gateway's own /lan-gate/status for the untrusted-proxy detection
+    // (read-only, best-effort); the trust-proxy persister merges into the
+    // FILE layer of lan-gate.config.json — the only writable config surface
+    // the plugin owns — which the restart watcher's poll picks up and
+    // reloads the row from (trustedProxies is a restart field), restarting
+    // the gateway with the new trust list. When the resolved value comes
+    // from env or the row the route refuses instead: a file-layer write
+    // would be shadowed there.
     ctx.inject(['webServer', 'connection'], (wizardCtx) => {
       wizardCtx.effect(() => wizardCtx.webServer.register({
         kind: 'prefix',
@@ -804,6 +812,31 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         handler: createWizardHandler({
           admit: (req) => wizardCtx.connection.admit(req),
           getConfig: () => resolveConfig(config, readFileConfig(), process.env),
+          getRuntime: async () => {
+            try {
+              const response = await fetch(`http://127.0.0.1:${effective.values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
+              if (!response.ok) return {}
+              return { lastForwardedSource: detectForwardedSource(await response.json()) }
+            } catch {
+              // No answer is no detection — the status projection renders
+              // its null shape and the UI offers nothing.
+              return {}
+            }
+          },
+          trustProxy: {
+            resolved: () => {
+              const snapshot = resolveConfig(config, readFileConfig(), process.env)
+              return { value: snapshot.values.trustedProxies, source: snapshot.sources.trustedProxies }
+            },
+            write: async (list) => {
+              const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+              const file = join(home, 'lan-gate.config.json')
+              const next = { ...readFileConfig(), trustedProxies: list }
+              const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
+              await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
+              await rename(tmp, file)
+            },
+          },
         }),
       }), 'dsh-zen-remote: wizard routes')
     })
