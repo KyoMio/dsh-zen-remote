@@ -21,7 +21,13 @@
     "src/wizard/status.ts",
     "src/wizard/binary.ts",
     "src/wizard/binary-io.ts",
-    "src/wizard/routes.ts"
+    "src/wizard/routes.ts",
+    "src/wizard/caddy.ts",
+    "src/wizard/caddy-process.ts",
+    "src/wizard/cloudflare.ts",
+    "src/wizard/cloudflared.ts",
+    "src/wizard/source-detect.ts",
+    "src/wizard/proxy-snippets.ts"
   ],
   "exclude": [
     "src/client",

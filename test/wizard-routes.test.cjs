@@ -98,6 +98,7 @@ test('GET status answers the sanitized projection from live config + runtime', a
     gatewayActualPort: 4088,
     lastHostProbe: null,
     lastExternalVerification: null,
+    lastForwardedSource: null,
   })
   assert.ok(configReads > readsBefore, 'the config is resolved per request, not captured at build time')
 })

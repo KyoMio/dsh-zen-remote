@@ -183,6 +183,7 @@ test('the empty projection is the honest not-started state', async () => {
     gatewayActualPort: null,
     lastHostProbe: null,
     lastExternalVerification: null,
+    lastForwardedSource: null,
   })
 })
 
@@ -198,6 +199,7 @@ test('the projection whitelists declared + runtime facts into the sanitized shap
       gatewayActualPort: 3088,
       lastHostProbe: { result: 'pass', at: 1698249600000 },
       lastExternalVerification: { result: 'pass', deviceId: 'abc123', at: 1698249660000 },
+      lastForwardedSource: { ip: '198.51.100.7', at: 1698249700000 },
     },
   )
   assert.deepEqual(status, {
@@ -213,6 +215,7 @@ test('the projection whitelists declared + runtime facts into the sanitized shap
     gatewayActualPort: 3088,
     lastHostProbe: { result: 'pass', deviceId: null, at: 1698249600000 },
     lastExternalVerification: { result: 'pass', deviceId: 'abc123', at: 1698249660000 },
+    lastForwardedSource: { ip: '198.51.100.7', at: 1698249700000 },
   })
 })
 
@@ -241,7 +244,7 @@ test('the projection never echoes token material or file paths, whatever the run
   // The shape is exactly the whitelist: extra runtime keys contribute nothing.
   assert.deepEqual(Object.keys(status).sort(), [
     'caddyRunning', 'cfTokenConfigured', 'cloudflaredRunning', 'domain', 'gatewayActualPort',
-    'httpsPort', 'lastExternalVerification', 'lastHostProbe', 'mode', 'ok', 'publicUrl',
+    'httpsPort', 'lastExternalVerification', 'lastForwardedSource', 'lastHostProbe', 'mode', 'ok', 'publicUrl',
     'tunnelTokenConfigured',
   ])
   assert.deepEqual(status.lastHostProbe, { result: 'fail', deviceId: null, at: 1 })

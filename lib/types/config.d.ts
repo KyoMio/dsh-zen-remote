@@ -104,6 +104,7 @@ export declare const DEFAULTS: ZenRemoteConfig;
  * settings at operation time use this too.
  */
 export declare function unwrapVolatile(value: unknown): unknown;
+export declare function hostOf(value: unknown): string | undefined;
 /**
  * The effective configuration: every field resolved through the four layers.
  * @param row - the plugin row config as `apply()` received it (loosely typed

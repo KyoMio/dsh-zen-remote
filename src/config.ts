@@ -220,13 +220,14 @@ function acmeEmail(value: unknown): string | undefined {
  * (the value flows verbatim into generated Caddyfile / DNS material, where
  * any of those would either break the config or smuggle in an injection).
  * IP literals pass — a bare-IP LAN ingress is a legitimate shape. IDN names
- * must arrive punycoded.
+ * must arrive punycoded. Exported for the wizard half, which validates the
+ * same shape at its own edges (generated config, API payloads).
  */
 const HOSTNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/
 
 const HOSTNAME_MAX = 253
 
-function hostOf(value: unknown): string | undefined {
+export function hostOf(value: unknown): string | undefined {
   return typeof value === 'string' && value.length <= HOSTNAME_MAX && HOSTNAME_PATTERN.test(value) ? value : undefined
 }
 
