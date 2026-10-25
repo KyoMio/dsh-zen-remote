@@ -124,10 +124,13 @@ test('parse/merge of the proxy list: append, dedupe, tolerate junk', () => {
 const sameOrigin = (port) => ({ origin: `http://127.0.0.1:${port}` })
 
 /** The REAL wizard handler with a trustProxy persister backed by a real
- * file (the same read-merge-write shape the index.ts wiring uses). */
+ * file (the same read-check-write shape the index.ts wiring uses). */
 async function serveWithTrustProxy() {
   const file = path.join(home, `lan-gate-${Date.now()}-${Math.random().toString(16).slice(2)}.config.json`)
   let resolvedSource = 'file'
+  // GW-fix-2/L2: when set, the persister answers false — the persisted
+  // list moved between resolve and write (a parallel trust click).
+  let concurrentChange = false
   const handler = routes.createWizardHandler({
     admit: () => ({ peer: {} }),
     getConfig: () => ({ values: {}, sources: {} }),
@@ -139,8 +142,10 @@ async function serveWithTrustProxy() {
         } catch { /* no file yet */ }
         return { value, source: resolvedSource }
       },
-      write: async (list) => {
+      write: async (expected, list) => {
+        if (concurrentChange) return false
         fs.writeFileSync(file, JSON.stringify({ trustedProxies: list }, null, 2))
+        return true
       },
     },
   })
@@ -150,6 +155,7 @@ async function serveWithTrustProxy() {
     port: server.address().port,
     server,
     setSource: (source) => { resolvedSource = source },
+    setConcurrentChange: (value) => { concurrentChange = value },
     file,
     close: () => new Promise((resolve) => server.close(resolve)),
   }
@@ -260,6 +266,34 @@ test('trust-proxy: walls first, then a typed flow — merge, dedupe, refuse junk
     })
     assert.equal(shadowed.status, 409)
     assert.equal(JSON.parse(shadowed.body).error.code, 'proxy-list-shadowed')
+
+    // GW-fix-2/L2: a concurrent writer moved the list between resolve and
+    // write — the persister refuses, the route answers 409 and the file
+    // keeps whatever the other writer left.
+    svc.setSource('file')
+    svc.setConcurrentChange(true)
+    const raced = await request(port, {
+      method: 'POST',
+      path: routes.WIZARD_TRUST_PROXY_ROUTE,
+      headers: sameOrigin(port),
+      body: { ip: '198.51.100.8' },
+    })
+    assert.equal(raced.status, 409)
+    assert.equal(JSON.parse(raced.body).error.code, 'trust-list-changed')
+    assert.equal(
+      JSON.parse(fs.readFileSync(svc.file, 'utf8')).trustedProxies,
+      '203.0.113.9,198.51.100.7',
+      'a lost race must not clobber or append',
+    )
+    // After the other writer settles, the same click succeeds again.
+    svc.setConcurrentChange(false)
+    const retried = await request(port, {
+      method: 'POST',
+      path: routes.WIZARD_TRUST_PROXY_ROUTE,
+      headers: sameOrigin(port),
+      body: { ip: '198.51.100.8' },
+    })
+    assert.equal(JSON.parse(retried.body).added, true)
   } finally {
     await svc.close()
   }

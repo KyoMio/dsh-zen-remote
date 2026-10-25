@@ -69,7 +69,7 @@ import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } fro
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
 import { createWizardHandler, WIZARD_ROUTE_PREFIX } from './wizard/routes.js'
-import { detectForwardedSource } from './wizard/source-detect.js'
+import { detectForwardedSource, parseProxyList } from './wizard/source-detect.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
@@ -828,13 +828,22 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
               const snapshot = resolveConfig(config, readFileConfig(), process.env)
               return { value: snapshot.values.trustedProxies, source: snapshot.sources.trustedProxies }
             },
-            write: async (list) => {
+            write: async (expected, list) => {
               const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
               const file = join(home, 'lan-gate.config.json')
-              const next = { ...readFileConfig(), trustedProxies: list }
+              const current = readFileConfig()
+              // Concurrent-write guard (GW-fix-2/L2): the route resolved
+              // the list moments ago; if the file layer moved since (a
+              // parallel trust click, a hand edit), refuse instead of
+              // clobbering the other writer's entry. Both sides compare
+              // normalized so an illegal file value reads as "empty", the
+              // same thing resolveConfig saw.
+              const now = typeof current.trustedProxies === 'string' ? current.trustedProxies : ''
+              if (parseProxyList(now).join(',') !== parseProxyList(expected).join(',')) return false
               const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
-              await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 })
+              await writeFile(tmp, `${JSON.stringify({ ...current, trustedProxies: list }, null, 2)}\n`, { mode: 0o600 })
               await rename(tmp, file)
+              return true
             },
           },
         }),

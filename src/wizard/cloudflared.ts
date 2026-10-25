@@ -84,13 +84,24 @@ export function createCloudflaredManager(options: CloudflaredManagerOptions): Cl
   const maxLogBytes = options.maxLogBytes ?? 64 * 1024
   let handle: SubprocessHandleLike | null = null
 
+  // GW-fix-2/L3: whitelist env — the host process carries the relay secret
+  // and DSH's own credentials, and cloudflared needs none of them (its
+  // connector secret comes through the 0600 token file).
+  const childEnv = (): NodeJS.ProcessEnv => {
+    const env: NodeJS.ProcessEnv = {}
+    for (const key of ['PATH', 'HOME', 'TMPDIR', 'LANG', 'TZ']) {
+      if (process.env[key] !== undefined) env[key] = process.env[key]
+    }
+    return env
+  }
+
   const spawnChild = (argv: string[]): SubprocessHandleLike =>
     subprocess.spawn({
       argv,
       cwd: dshHome,
-      // The token rides the 0600 file, not the environment: the child env
-      // is a plain copy of the host's, nothing secret added.
-      env: { ...process.env },
+      // GW-fix-2/L3: whitelist env — the token rides the 0600 file, so the
+      // child needs nothing from the host's environment beyond the basics.
+      env: childEnv(),
       stdio: {
         stdin: 'ignore',
         stdout: { maxBytes: maxLogBytes },

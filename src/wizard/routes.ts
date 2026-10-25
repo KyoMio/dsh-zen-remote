@@ -65,13 +65,17 @@ export interface WizardHandlerOptions {
    * "nothing configured, nothing running"; a throw is degraded to the
    * same. Later tasks inject the real probe. */
   getRuntime?: () => WizardRuntimeInput | Promise<WizardRuntimeInput>
-  /** The trust-proxy persistence (GW-5), injected by apply(): the
-   * CURRENTLY resolved trustedProxies with its layer, and the atomic
-   * persister for a merged list. Absent — a wiring that predates GW-5 —
-   * and the route answers 501 like the other placeholders. */
+  /** The trust-proxy persistence (GW-5, GW-fix-2/L2), injected by apply():
+   * the CURRENTLY resolved trustedProxies with its layer, and the atomic
+   * persister for a merged list. `write` re-checks the persisted surface
+   * against `expected` (the value `resolved` answered moments earlier) —
+   * answering false when another writer moved it in between, which the
+   * route turns into a 409 instead of a silent clobber. Absent — a wiring
+   * that predates GW-5 — and the route answers 501 like the other
+   * placeholders. */
   trustProxy?: {
     resolved: () => { value: string; source: ConfigSource }
-    write: (list: string) => void | Promise<void>
+    write: (expected: string, list: string) => boolean | Promise<boolean>
   }
 }
 
@@ -199,7 +203,18 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
           responseJson(res, 200, { ok: true, added: false })
           return
         }
-        await trust.write(mergeProxyList(resolved.value, ip))
+        const merged = mergeProxyList(resolved.value, ip)
+        // GW-fix-2/L2: the persister re-reads the persisted surface and
+        // refuses when it moved since `resolved()` — two 信任 clicks in
+        // quick succession must not lose either IP.
+        const landed = await trust.write(resolved.value, merged)
+        if (landed === false) {
+          responseJson(res, 409, {
+            ok: false,
+            error: { code: 'trust-list-changed', message: '信任列表刚被其他操作修改，请刷新后重试' },
+          })
+          return
+        }
         responseJson(res, 200, { ok: true, added: true })
         return
       }

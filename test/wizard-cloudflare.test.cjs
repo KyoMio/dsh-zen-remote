@@ -31,15 +31,26 @@ before(async () => {
   cloudflare = await load('cloudflare.js')
   const routes = {
     // Keys carry the EXACT query string the client builds (match is by full
-    // URL after the base-path strip).
-    'GET /accounts?per_page=50': { success: true, result: [{ id: 'acc-1' }, { id: 'acc-2' }] },
-    // Exact zone only on the SECOND account — exercises the composed check.
-    'GET /zones?name=dsh.example.com&account.id=acc-1': { success: true, result: [] },
-    'GET /zones?name=dsh.example.com&account.id=acc-2': { success: true, result: [{ id: 'zone-2', name: 'dsh.example.com' }] },
-    'GET /zones?name=elsewhere.example&account.id=acc-1': { success: true, result: [] },
-    'GET /zones?name=elsewhere.example&account.id=acc-2': { success: true, result: [] },
+    // URL after the base-path strip), pagination parameters included.
+    'GET /accounts?per_page=50&page=1': { success: true, result: [{ id: 'acc-1' }, { id: 'acc-2' }], result_info: { total_pages: 1 } },
+    // GW-fix-2/H1: zones are APEX domains — `dsh.example.com` lives in the
+    // zone named `example.com`, and the composed check must find it by
+    // walking the ancestor chain. The full-domain lookups all MISS.
+    'GET /zones?name=dsh.example.com&account.id=acc-1': { success: true, result: [], result_info: { total_pages: 1 } },
+    'GET /zones?name=example.com&account.id=acc-1': { success: true, result: [], result_info: { total_pages: 1 } },
+    'GET /zones?name=com&account.id=acc-1': { success: true, result: [], result_info: { total_pages: 1 } },
+    'GET /zones?name=dsh.example.com&account.id=acc-2': { success: true, result: [], result_info: { total_pages: 1 } },
+    'GET /zones?name=example.com&account.id=acc-2': { success: true, result: [{ id: 'zone-2', name: 'example.com' }], result_info: { total_pages: 1 } },
+    'GET /zones?name=com&account.id=acc-2': { success: true, result: [], result_info: { total_pages: 1 } },
+    // `elsewhere.example` is on nobody's account (both ancestors miss).
+    'GET /zones?name=elsewhere.example&account.id=acc-1': { success: true, result: [], result_info: { total_pages: 1 } },
+    'GET /zones?name=elsewhere.example&account.id=acc-2': { success: true, result: [], result_info: { total_pages: 1 } },
+    'GET /zones?name=example&account.id=acc-1': { success: true, result: [], result_info: { total_pages: 1 } },
+    'GET /zones?name=example&account.id=acc-2': { success: true, result: [], result_info: { total_pages: 1 } },
+    // The exact-match rule itself: a zone whose name EQUALS the query.
+    'GET /zones?name=exact.example&account.id=acc-1': { success: true, result: [{ id: 'zone-exact', name: 'exact.example' }], result_info: { total_pages: 1 } },
     'POST /accounts/acc-1/cfd_tunnel': { success: true, result: { id: 'tun-1', token: 'connector-secret', name: 'dsh-zen-remote' } },
-    'GET /accounts/acc-1/cfd_tunnel?is_deleted=false&per_page=50': { success: true, result: [{ id: 'tun-1', name: 'dsh-zen-remote', status: 'down' }] },
+    'GET /accounts/acc-1/cfd_tunnel?is_deleted=false&per_page=50&page=1': { success: true, result: [{ id: 'tun-1', name: 'dsh-zen-remote', status: 'down' }], result_info: { total_pages: 1 } },
     'PUT /accounts/acc-1/cfd_tunnel/tun-1/configurations': { success: true, result: { id: 'tun-1' } },
     'POST /zones/zone-2/dns_records': { success: true, result: { id: 'rec-1' } },
   }
@@ -78,7 +89,7 @@ test('listAccounts returns the account ids with the Bearer header', async () => 
 })
 
 test('getZone matches the zone name EXACTLY and answers its id', async () => {
-  assert.equal(await api().getZone('acc-2', 'dsh.example.com'), 'zone-2')
+  assert.equal(await api().getZone('acc-1', 'exact.example'), 'zone-exact')
   await assert.rejects(
     api().getZone('acc-1', 'dsh.example.com'),
     (error) => error.code === 'cf-zone-not-found',
@@ -133,16 +144,62 @@ test('createDnsRecord posts a proxied CNAME to the tunnel target', async () => {
   assert.match(body.content, /\.cfargotunnel\.com$/)
 })
 
-test('checkDomainOnCloudflare composes accounts + zones and answers all three facts', async () => {
+test('checkDomainOnCloudflare walks the ancestor chain: the zone is the PARENT domain (GW-fix-2/H1)', async () => {
+  // The zone is named `example.com` while the wizard asks about
+  // `dsh.example.com` — the exact pre-fix behavior answered
+  // onCloudflare:false here, which would have pushed a user whose domain
+  // is already on Cloudflare into the migrate flow.
   assert.deepEqual(
     await api().checkDomainOnCloudflare('dsh.example.com'),
     { onCloudflare: true, zoneId: 'zone-2', accountId: 'acc-2' },
-    'the zone lives on the second account — the check walks all of them',
   )
   assert.deepEqual(
     await api().checkDomainOnCloudflare('elsewhere.example'),
     { onCloudflare: false, zoneId: null, accountId: null },
+    'both ancestors miss on both accounts',
   )
+})
+
+test('ancestorHosts builds the walked chain, itself first', async () => {
+  assert.deepEqual(cloudflare.ancestorHosts('dsh.example.com'), ['dsh.example.com', 'example.com', 'com'])
+  assert.deepEqual(cloudflare.ancestorHosts('example.com'), ['example.com', 'com'])
+  assert.deepEqual(cloudflare.ancestorHosts('mybox'), ['mybox'])
+})
+
+test('listAccounts/listTunnels page through result_info (GW-fix-2/L5)', async () => {
+  const pages = http.createServer((req, res) => {
+    const url = String(req.url)
+    if (url === '/v4/accounts?per_page=50&page=1') {
+      sendJson(res, 200, { success: true, result: [{ id: 'a1' }, { id: 'a2' }], result_info: { total_pages: 2 } })
+      return
+    }
+    if (url === '/v4/accounts?per_page=50&page=2') {
+      sendJson(res, 200, { success: true, result: [{ id: 'a3' }], result_info: { total_pages: 2 } })
+      return
+    }
+    sendJson(res, 404, { success: false, errors: [{ code: 7000, message: `unexpected page request ${url}` }] })
+  })
+  await new Promise((resolve) => pages.listen(0, '127.0.0.1', resolve))
+  try {
+    const base = `http://127.0.0.1:${pages.address().port}/v4`
+    assert.deepEqual(await cloudflare.createCloudflareApi({ token: 't', baseUrl: base }).listAccounts(), ['a1', 'a2', 'a3'])
+  } finally {
+    pages.close()
+  }
+})
+
+test('a missing result_info reads as one page (old envelopes keep working)', async () => {
+  const onePage = http.createServer((req, res) => {
+    assert.equal(String(req.url), '/v4/accounts?per_page=50&page=1', 'only page 1 is requested')
+    sendJson(res, 200, { success: true, result: [{ id: 'only' }] })
+  })
+  await new Promise((resolve) => onePage.listen(0, '127.0.0.1', resolve))
+  try {
+    const base = `http://127.0.0.1:${onePage.address().port}/v4`
+    assert.deepEqual(await cloudflare.createCloudflareApi({ token: 't', baseUrl: base }).listAccounts(), ['only'])
+  } finally {
+    onePage.close()
+  }
 })
 
 // --- error classification -------------------------------------------------------
@@ -222,5 +279,5 @@ test('transport failures and unparsable answers are cf-network; the token never 
 
 test('the module-level cf* wrappers work with an explicit baseUrl', async () => {
   assert.deepEqual(await cloudflare.cfListAccounts('sekret-cf-token', { baseUrl: `http://127.0.0.1:${port}/client/v4` }), ['acc-1', 'acc-2'])
-  assert.equal(await cloudflare.cfGetZone('sekret-cf-token', 'acc-2', 'dsh.example.com', { baseUrl: `http://127.0.0.1:${port}/client/v4` }), 'zone-2')
+  assert.equal(await cloudflare.cfGetZone('sekret-cf-token', 'acc-1', 'exact.example', { baseUrl: `http://127.0.0.1:${port}/client/v4` }), 'zone-exact')
 })

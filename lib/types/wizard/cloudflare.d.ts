@@ -71,9 +71,19 @@ export interface CloudflareApi {
     configureIngress(accountId: string, tunnelId: string, domain: string, serviceUrl: string): Promise<void>;
     /** One proxied CNAME `subdomain` → `target`; returns the record id. */
     createDnsRecord(zoneId: string, subdomain: string, target: string): Promise<string>;
-    /** Composed check: is `domain` a zone on any of the token's accounts? */
+    /** Composed check: does any ancestor of `domain` name a zone on the
+     * token's accounts (zones are apexes — `dsh.example.com` lives in the
+     * `example.com` zone)? */
     checkDomainOnCloudflare(domain: string): Promise<CloudflareDomainCheck>;
 }
+/**
+ * The ancestor chain of one hostname, itself first: `dsh.example.com` →
+ * `dsh.example.com`, `example.com`, `com`. Cloudflare zones are apex
+ * domains, so a wizard lookup for `dsh.example.com` must find the zone
+ * named `example.com` (GW-fix-2/H1) — exact-name matching walks this chain
+ * level by level.
+ */
+export declare function ancestorHosts(domain: string): string[];
 export declare function createCloudflareApi(options: CloudflareApiOptions): CloudflareApi;
 type CfCallOptions = Partial<Pick<CloudflareApiOptions, 'fetchImpl' | 'baseUrl'>>;
 export declare function cfListAccounts(token: string, opts?: CfCallOptions): Promise<string[]>;
