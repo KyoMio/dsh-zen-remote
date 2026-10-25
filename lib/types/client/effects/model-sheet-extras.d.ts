@@ -1,8 +1,8 @@
 import type { ClientContext } from '../compat/types.ts';
 /**
- * Phone: collect the composer row's secondary third-party controls behind a
- * `⋯` pill in the dock rail, and move the REAL nodes into a bottom sheet
- * while it is open.
+ * Phone: move the composer row's secondary third-party controls into a
+ * 26px horizontally-scrollable strip inside the dock rail above the card —
+ * always visible, one tap from anywhere, no sheet in between.
  *
  * Why move the real controls instead of drawing our own rows that drive
  * them: the same reason native-trigger-overlay.ts moves the real trigger. A
@@ -22,17 +22,16 @@ import type { ClientContext } from '../compat/types.ts';
  * composer re-renders the row and does not yank it back) and stays
  * hit-testable at its new position.
  *
- * Restoring on close is not cosmetic. The sheet unmounts when it closes and
- * anything still inside goes with it, so the controls would vanish from the
- * page while their React roots kept updating detached nodes. Every close
- * path — mask tap, ⋯ toggle, Android back gesture (via history-nav), phone
- * breakpoint change, teardown — funnels through `close`.
- *
- * Known narrow window, accepted by design: a control unmounting while the
- * sheet is OPEN (an async update removes it from the row). With the sheet
- * open the mask covers the row, so nothing user-driven can trigger that —
- * only background timers/polls could, and none of today's contributors do.
- * A detached parked node is pruned on the next sync and its anchor removed.
+ * Known hazard, inherent to relocating React-owned nodes: a control whose
+ * REGISTRATION unmounts while parked (plugin disabled, slot re-keyed) is
+ * removed by React through its ORIGINAL parent — `parent.removeChild(child)`
+ * throws when the child moved, and the exception lands in React's commit.
+ * Updates that keep the registration mounted (state-driven re-renders,
+ * text/attribute changes, a control's own inner nodes unmounting) are safe:
+ * those removals run inside the parked subtree, where every parent-child
+ * link React recorded still holds. Parking is also fully reversible — any
+ * decline path (desktop, nothing worth moving, teardown) hands every node
+ * back before anything is removed.
  */
 export declare function installModelSheetExtras(ctx: ClientContext): void;
 //# sourceMappingURL=model-sheet-extras.d.ts.map

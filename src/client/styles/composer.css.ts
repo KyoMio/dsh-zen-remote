@@ -78,12 +78,10 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
 [data-mobile-nav="attach-picker"] {
   display: none !important;
 }
-/* The ⋯ composer-more trigger and its sheet (effects/model-sheet-extras.ts)
-   — same every-width default as the picker above: the phone block below
-   re-shows each in its place (dock rail / fixed layer); the desktop shell
-   keeps neither. */
-[data-mobile-nav="composer-more"],
-[data-mobile-nav="composer-more-layer"] {
+/* The composer-chips strip (effects/model-sheet-extras.ts) — same
+   every-width default as the picker above: the phone block re-shows it
+   inside the dock rail; the desktop shell keeps none. */
+[data-mobile-nav="composer-chips"] {
   display: none !important;
 }
 
@@ -387,12 +385,13 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 12px !important;
     font-size: 15px !important;
   }
-  /* --- 4a. third-party composer entries live in the ⋯ sheet ---
+  /* --- 4a. third-party composer entries live in the dock's chip strip ---
      effects/model-sheet-extras.ts collects the composer's secondary controls
      (input.right, input.left, and anything a third party parks directly into
-     _tools / _standardControls / _trailing / _row) and, while the
-     [data-mobile-nav="composer-more-layer"] sheet is open, moves the REAL
-     nodes into its [data-zen-sheet-extras] list.
+     _tools / _standardControls / _trailing / _row) and moves the REAL nodes
+     into [data-mobile-nav="composer-chips"] — a 26px horizontally
+     scrollable strip the effect mounts at the head of the dock rail above
+     the card. Always visible, one tap, no sheet in between.
 
      In the row: hidden, but ONLY once the effect has marked them. Two opt-in
      markers, both written by the effect: the input.right CONTAINER gets
@@ -406,65 +405,76 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   [data-zen-composer-extra]:not([data-zen-composer-extra="open"]) {
     display: none !important;
   }
-  /* The ⋯ sheet's list: a column of full-width rows in the sheet's own
-     language, so a relocated control reads as a cell of the sheet rather
-     than a chip that wandered in. Written against the bare marker: inside
-     the layer the list is its only carrier, and the generic spelling keeps
-     the rules true for the row container too, where they are masked by the
-     opt-in hide above (0,2,0 beats this 0,1,0). */
-  [data-zen-sheet-extras] {
+  /* The strip itself: one 26px line at the rail's head (order 0, document
+     order first via the effect's prepend), scrolling sideways when the
+     collected controls overflow. Scoped to the dock CHILD — the generic
+     marker also sits on the emptied input.right container in the row, where
+     nothing but the opt-in hide above may touch it. This specificity (0,2,0)
+     is what beats the section 7 \`> *\` cage wherever they overlap (overflow,
+     max-width, radius are all !important there too). */
+  [data-slot="conversation.input.dock"] > [data-mobile-nav="composer-chips"] {
     display: flex !important;
-    flex-direction: column !important;
-    gap: 2px !important;
-    width: 100% !important;
-  }
-  /* Undo the row's compaction on every parked control: back to full width and
-     the 48px the sheet's own cells use. \`> * > *\` reaches both shapes without
-     naming either plugin — subscriptions wraps its trigger in a positioning
-     div, vision-router puts its button straight in the slot. */
-  [data-zen-sheet-extras] > *,
-  [data-zen-sheet-extras] > * > button {
-    width: 100% !important;
-    max-width: none !important;
-    min-width: 0 !important;
-    justify-content: flex-start !important;
-  }
-  [data-zen-sheet-extras] button {
-    box-sizing: border-box !important;
-    min-height: 48px !important;
-    height: auto !important;
-    padding: 0 12px !important;
-    gap: 10px !important;
-    border-radius: 12px !important;
-    border: none !important;
-    background: transparent !important;
-    font-size: 15px !important;
-    /* Both plugins center their chip label, which is right for a pill in the
-       row and wrong for a full-width row: the sheet's own cells start their
-       label at the left edge. justify-content covers the flex triggers,
-       text-align the ones that are not flex containers. */
-    text-align: left !important;
-    justify-content: flex-start !important;
-  }
-  /* Parked controls keep no row ordering — the sheet follows DOM order. */
-  [data-zen-sheet-extras] > * {
+    flex-flow: row nowrap !important;
+    align-items: center !important;
+    gap: 6px !important;
     order: 0 !important;
+    flex: 0 1 auto !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    min-height: 26px !important;
+    max-height: 26px !important;
+    border-radius: 0 !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    scrollbar-width: none !important;
   }
-  /* The vision toggle is squeezed to a 28px icon in the row (compat.css.ts);
-     in the sheet it is a row, so its label comes back and the icon leads. */
-  [data-zen-sheet-extras] [data-vision-router-mode-toggle] > span {
+  [data-slot="conversation.input.dock"] > [data-mobile-nav="composer-chips"]::-webkit-scrollbar {
+    display: none !important;
+  }
+  /* Parked controls shrink from whatever the row allowed them to the rail's
+     26px pill scale: auto width again (no full-width rows here), tight
+     height, and the chip font the rest of the rail uses. */
+  [data-mobile-nav="composer-chips"] > * {
+    flex: 0 0 auto !important;
+    order: 0 !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    min-height: 26px !important;
+    max-height: 26px !important;
+    width: auto !important;
+    max-width: none !important;
+  }
+  [data-mobile-nav="composer-chips"] button {
+    box-sizing: border-box !important;
+    height: 26px !important;
+    min-height: 26px !important;
+    max-height: 26px !important;
+    width: auto !important;
+    padding: 0 10px !important;
+    gap: 5px !important;
+    border-radius: 999px !important;
+    font-size: 11.5px !important;
+    line-height: 18px !important;
+    white-space: nowrap !important;
+  }
+  /* The vision toggle is squeezed to a 28px icon-only button in the row
+     (compat.css.ts); in the strip it is a 14px icon + text pill, so its
+     label comes back. */
+  [data-mobile-nav="composer-chips"] [data-vision-router-mode-toggle] > span {
     display: inline !important;
   }
-  [data-zen-sheet-extras] [data-vision-router-mode-toggle] > svg:first-of-type {
-    width: 18px !important;
-    height: 18px !important;
+  [data-mobile-nav="composer-chips"] [data-vision-router-mode-toggle] > svg:first-of-type {
+    width: 14px !important;
+    height: 14px !important;
   }
   /* The speed chip opens a menu of its own, anchored \`bottom: 100%\` to its
-     trigger. Inside the sheet — which is \`overflow: hidden\` so its rounded
-     top clips its content — that menu would be cut off. Same escape section 4
-     uses for the host's two menus: position: fixed leaves the clip behind
-     (the sheet sets \`transform: none\` on entrance) and it lands as its own
-     sheet on top of this one. */
+     trigger. Inside the strip — which is \`overflow-x: auto\`, so its content
+     clips at the strip's box — that menu would be cut off. Same escape
+     section 4 uses for the host's two menus: position: fixed leaves the clip
+     behind and it lands as its own bottom sheet over the composer. */
+  [class$="_composerSeat"]:has([data-zen-sheet-extras] [role="menu"]) {
+    z-index: 60 !important;
+  }
   [data-zen-sheet-extras] [role="menu"] {
     position: fixed !important;
     left: 0 !important;
@@ -480,9 +490,9 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 16px 16px 0 0 !important;
     border-bottom: none !important;
     padding: 8px 8px calc(8px + var(--mnav-sab)) !important;
-    /* Above the ⋯ sheet it sits on (60, below), below the session-info
-       sheet's 70 (info.css.ts) — it is a child of the ⋯ sheet, not a peer
-       of the page's own layers. */
+    /* Above the page content behind the seat (the seat is raised to 60 by
+       the rule above while a parked menu is open), below the session-info
+       sheet's 70 (info.css.ts). */
     z-index: 61 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, .18) !important;
   }
@@ -490,45 +500,6 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     min-height: 48px !important;
     border-radius: 12px !important;
     font-size: 15px !important;
-  }
-  /* The ⋯ sheet itself: fixed, full-width, rising from the bottom edge — the
-     same geometry section 4 gives the host's two menus. It hangs under the
-     composer BAR (inside #root, outside the official column), so it cannot
-     outlive the composer it was opened from. The every-width default-hidden
-     rule at the top of this file is beaten here by the later display: block.
-     z 60 = the perm/model sheets' level; a menu a parked control portals to
-     the body (z 100+) naturally outranks it, and an inline one takes the
-     fixed z-61 escape above. */
-  [class$="_composerSeat"]:has([data-mobile-nav="composer-more-layer"]) {
-    z-index: 60 !important;
-  }
-  [data-mobile-nav="composer-more-layer"] {
-    display: block !important;
-    position: fixed;
-    inset: 0;
-    z-index: 60;
-  }
-  [data-mobile-nav="composer-more-mask"] {
-    position: absolute;
-    inset: 0;
-    border: none;
-    background: var(--dsw-alias-bg-mask-3, rgba(0, 0, 0, .45));
-    animation: dsh-mobile-nav-fade .18s var(--ds-ease-out, ease-in-out);
-  }
-  [data-mobile-nav="composer-more-sheet"] {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    max-height: min(70dvh, 520px);
-    overflow-y: auto;
-    overscroll-behavior: contain;
-    box-sizing: border-box;
-    padding: 8px 8px calc(8px + var(--mnav-sab));
-    border-radius: 16px 16px 0 0;
-    background: var(--dsw-alias-bg-layer-2, #ffffff);
-    box-shadow: 0 -8px 32px rgba(0, 0, 0, .18);
-    animation: dsh-mobile-nav-sheet-up .22s var(--ds-ease-out, ease-in-out);
   }
 
   /* --- 4b. the official scroll-to-bottom button must not poke through the
@@ -554,8 +525,9 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   body:has(> [id$="-menu"][class$="_menu"]:is([role="menu"], [role="group"])) [data-chat-flow] + div,
   /* T70: the portaled permission menu (marked by effects/permission-sheet.ts). */
   body:has(> div[role="menu"][data-zen-sheet="perm"]) [data-chat-flow] + div,
-  /* T-issue30: the ⋯ composer-more sheet (effects/model-sheet-extras.ts). */
-  body:has([data-mobile-nav="composer-more-layer"]) [data-chat-flow] + div {
+  /* T-issue30: an inline menu a parked chip opened (escaped to a fixed
+     sheet by 4a). */
+  body:has([data-zen-sheet-extras] [role="menu"]) [data-chat-flow] + div {
     display: none !important;
   }
   /* --- 5. input box: two lines minimum, five lines maximum ---
@@ -732,36 +704,6 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 12px !important;
     font-size: 12px !important;
     line-height: 18px !important;
-  }
-
-  /* --- 7b3. the ⋯ composer-more chip (T-issue30) ---
-     effects/model-sheet-extras.ts mounts it at order 0 while the row holds
-     secondary controls worth collecting; with none the trigger does not
-     render at all, so an empty rail costs zero. It is an inline pill sharing
-     the scrolling rail with the branch chip — deliberately NOT in 7c's wrap
-     gate, it must never take a line of its own. The 26px cage above still
-     wins where it is !important (height, font size); the declarations here
-     give the pill its border, tint and tap behaviour. */
-  [data-slot="conversation.input.dock"] > [data-mobile-nav="composer-more"] {
-    display: inline-flex !important;
-    align-items: center;
-    justify-content: center;
-    order: 0 !important;
-    flex: 0 0 auto !important;
-    height: 26px;
-    min-width: 32px;
-    padding: 0 10px;
-    border-radius: 999px;
-    border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .08));
-    background: var(--dsw-alias-bg-layer-2, rgba(0, 0, 0, .04));
-    color: var(--dsw-alias-label-secondary, inherit);
-    font-family: inherit;
-    font-size: 14px;
-    font-weight: 600;
-    line-height: 1;
-    cursor: pointer;
-    touch-action: manipulation;
-    -webkit-tap-highlight-color: transparent;
   }
 
   /* --- 7c. the queue strip opts OUT of the cage, on a line of its own ---
