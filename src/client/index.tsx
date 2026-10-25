@@ -38,7 +38,6 @@ import { RemoteComposerBanner } from './RemoteComposerBanner.tsx'
 import { registerRemoteStatusUi } from './remote-status-register.ts'
 import { mountCurrentSessionReporter } from './current-session-report.ts'
 import { mountRemoteDropGuard } from './effects/remote-drop.ts'
-import { DropMentionListener } from './DropMentionListener.tsx'
 import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
@@ -139,26 +138,15 @@ export function apply(ctx: ClientContext): void {
   // 的桌面端 App 正是远程会话所在；只在探测出的子客户端角色下运行，主
   // 服务端的页面探测一次后就静默。
   mountCurrentSessionReporter(ctx)
-  // 远程会话拖拽附件（RD-2 拦截 + RD-7 上传，一条链）：桌面端的同机零拷贝
-  // 会把拖入文件变成 `@本机绝对路径` chip，远程会话里服务端读不到这个路径。
-  // 守卫在 document 上挂 capture 阶段的 drop 拦截，命中远程会话时逐文件
-  // POST client/workspace-upload，经中继写进服务端会话工作区的
-  // .dsh-uploads/（官方 composer 的上传走 Worker 原生 XHR、绕过
-  // fetchRoutes 表，改道宿主管道接不住，所以守卫自己上传），每个成功文件
-  // 派发 zr:drop-mention 事件。判定纯函数在 client-data/remote-drop.ts。
-  // 必须在桌面门之前挂载——远程会话恰在桌面端全宽使用；三门全不中（本地
-  // 会话 / 手机端无 bridge / 非受信事件）时零干预，主服务端的页面不受影响。
+  // 远程会话拖拽附件（RD-2）：document 级 capture 阶段的 drop 拦截。桌面端
+  // 的同机零拷贝会把拖入的文件变成 `@本机绝对路径` chip，远程会话里服务端
+  // 读不到这个路径——守卫把远程会话的文件拖拽改写成无路径 File 的合成
+  // drop（宿主原生管道按浏览器拖拽走字节上传，再由 T51 的 fetch-route
+  // 拦截经中继转服务端）。判定在 client-data/remote-drop.ts（纯函数），
+  // 这里只做监听与重派发。同样必须在桌面门之前挂载：远程会话恰在桌面端
+  // 全宽使用；三门全不中（本地会话 / 手机端无 bridge / 非受信事件）时
+  // 零干预，主服务端的页面不受影响。
   mountRemoteDropGuard(ctx)
-  // 拖拽链的接收半边：收 zr:drop-mention 事件的隐形 seat（渲染 null，无
-  // UI），校验事件里的会话 id 后用官方写路径把 `@.dsh-uploads/<名>` 插进
-  // draft。order 900 让它在 slot 里排最右，不挤占真实控件；主机角色的
-  // 桌面端 sessionId 永非虚拟，监听不挂载，同样是逐像素 no-op。
-  ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
-    name: 'conversation.input.left',
-    id: 'zr-drop-mention',
-    order: 900,
-    locale: NS,
-  }, DropMentionListener))
   // T64 服务端分组展开状态的记忆与恢复：宿主在工作区列表 ready 时会把不在
   // 列表里的分组展开记录清掉（retainAccountKeys），而本地工作区先 ready、
   // 服务端分组后并入，zr~ 键每次加载都被清掉、分组回到折叠。与上报器共用

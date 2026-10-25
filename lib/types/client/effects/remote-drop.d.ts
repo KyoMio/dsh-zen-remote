@@ -7,19 +7,18 @@ export interface RemoteDropDiagnostics {
      * installed (and after a dispose, which keeps the counters readable). */
     notInstalledReason: string | undefined;
     /** Drops this guard stopped from reaching the host (both the blocked and
-     * the uploaded kind). */
+     * the redispatched kind). */
     intercepted: number;
-    /** Files that reached the server workspace and had their mention
-     * dispatched. */
-    uploaded: number;
-    /** Files whose upload failed (the toast carries the code; the event stays
-     * stopped — there is no host pipeline to fall back to). */
-    failed: number;
+    /** Synthetic path-stripped drops actually dispatched. */
+    redispatched: number;
     /** Drops stopped because they carried a folder (toast shown, nothing
-     * uploaded). */
+     * dispatched). */
     blockedDirectories: number;
     /** Drops judged not-ours and released untouched. */
     passthrough: number;
+    /** Redispatches aborted because a re-wrap or a DataTransfer add threw —
+     * the original event was released instead (宁坏勿丢). */
+    rewrapFailed: number;
 }
 /** A snapshot for the diagnostics carriers (settings page). Copying keeps
  * callers from holding a live reference into a later mount's state. */
