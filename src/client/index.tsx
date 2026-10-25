@@ -29,6 +29,8 @@ import { NS } from './locales.ts'
 import type { MobileNavKey } from './locales.ts'
 import { SettingsSection } from './settings/SettingsSection.tsx'
 import { registerSettingsPage } from './settings/register-settings.ts'
+import { GatewayWizard } from './wizard/GatewayWizard.tsx'
+import { registerGatewayWizard } from './wizard/register-wizard.ts'
 import { RemoteHeaderIcon } from './RemoteHeaderIcon.tsx'
 import { RemoteShareMenuItem } from './RemoteShareMenu.tsx'
 import { getSharesStore } from '../client-data/shares.ts'
@@ -114,6 +116,13 @@ export function apply(ctx: ClientContext): void {
   // 的按需注入都在 registerSettingsPage 里（那个服务名绝不进顶层的 inject
   // 数组，否则没有该服务的环境整个界面半边都加载不了）。
   registerSettingsPage(ctx, SettingsSection)
+
+  // GW-10 网关配置引导「让手机连上来」：同样在桌面门之前注册——桌面端 App
+  // 正是主服务端，wizard 恰好是它最有用的入口。部件自身三重门控：subject
+  // 过滤（kind === 'row' && pkg.name === 'dsh-zen-remote'）、保存角色检查
+  // （client 角色不渲染）、viaGateway 时全部操作禁用。样式全部作用在组件
+  // 自身的 data 属性下，≥1024px 的其他页面逐像素不受影响。
+  registerGatewayWizard(ctx, GatewayWizard)
 
   // T33b 会话共享的三个入口里前两个（标题行远程图标、会话右键菜单项）：
   // 同样必须在桌面门之前注册——桌面端 App 就是主服务端，图标和菜单恰好

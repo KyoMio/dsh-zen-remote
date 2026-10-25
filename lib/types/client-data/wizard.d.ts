@@ -1,0 +1,137 @@
+/**
+ * Wizard UI pure logic (GW-10): route constants, wire types, the step
+ * state machine, form validation and the derived lights — everything the
+ * React components need that a test can drive without a DOM. Mirrors of
+ * the host half's shapes (src/wizard/routes.ts / verify.ts /
+ * proxy-snippets.ts) live HERE because the browser bundle cannot import
+ * those modules (they transitively import node builtins through
+ * config.ts); the check script cross-checks the snippet templates against
+ * the host's so the two cannot drift.
+ *
+ * Validation mirrors src/config.ts's `hostOf` for the same reason — the
+ * row layer applies the same rule when the fields land there, so a client
+ * that accepts something the resolver would silently drop would only set
+ * the user up for a mystery.
+ */
+/** Wizard route constants — mirror of src/wizard/routes.ts. */
+export declare const WIZARD_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/status";
+export declare const WIZARD_VERIFY_ROUTE = "/_dsh/zen-remote/admin/wizard/verify";
+/** Wire mirror of src/wizard/status.ts's WizardStatus. */
+export interface WizardStatusBody {
+    ok: true;
+    mode: 'off' | 'caddy' | 'external' | 'cloudflared';
+    domain: string;
+    httpsPort: number;
+    publicUrl: string;
+    cfTokenConfigured: boolean;
+    tunnelTokenConfigured: boolean;
+    caddyRunning: boolean;
+    cloudflaredRunning: boolean;
+    gatewayActualPort: number | null;
+    lastHostProbe: {
+        result: string;
+        deviceId: string | null;
+        at: number | null;
+    } | null;
+    lastExternalVerification: {
+        result: string;
+        deviceId: string | null;
+        at: number | null;
+    } | null;
+    lastForwardedSource: {
+        ip: string;
+        at: number;
+    } | null;
+}
+/** Wire mirror of src/wizard/verify.ts's poll result. */
+export type WizardVerifyPoll = {
+    result: 'not-started';
+} | {
+    result: 'stale';
+} | {
+    result: 'code-expired';
+} | {
+    result: 'pending';
+} | {
+    result: 'cookie-insecure';
+    deviceId: string;
+} | {
+    result: 'pass';
+    deviceId: string;
+    at: number;
+};
+/** Wire mirror of src/wizard/verify.ts's start result. */
+export type WizardVerifyStart = {
+    ok: true;
+    pairingCode: string;
+    publicUrl: string;
+    expiresAt: number;
+} | {
+    ok: false;
+    reason: 'no-public-url' | 'bad-public-url' | 'runtime-not-ready' | 'gateway-unreachable' | 'probe-failed' | 'pair-refused';
+    detail?: unknown;
+};
+/** The three wizard steps: pick a path, fill its form, verify end to end. */
+export type WizardStep = 'pick' | 'configure' | 'verify';
+/** The three public-ingress paths (the row's `ingressMode` minus `'off'`). */
+export type WizardPath = 'caddy' | 'external' | 'cloudflared';
+/** Where the wizard opens: a configured ingress jumps straight to verify. */
+export declare function initialStep(status: WizardStatusBody | undefined): WizardStep;
+/** The step AFTER pick, given the user's path choice. */
+export declare function stepAfterPick(): WizardStep;
+export declare function isValidHostname(value: string): boolean;
+/** Port strings: [1, 65535]. */
+export declare function isValidPort(value: string): boolean;
+/** The public origin a verified domain+port answers on (443 hides the port). */
+export declare function publicUrlFrom(domain: string, httpsPort: number): string;
+/** Which configure form is complete enough to advance. */
+export declare function configureReadiness(path: WizardPath, form: {
+    domain: string;
+    httpsPort: string;
+    cfToken: string;
+    serverUrl: string;
+}): {
+    ok: true;
+    publicUrl: string;
+    httpsPort: number;
+} | {
+    ok: false;
+    error: 'bad-domain' | 'bad-port' | 'missing-token' | 'bad-server-url';
+};
+export type LightState = 'pass' | 'pending' | 'fail';
+export interface WizardLights {
+    /** The gateway child answers on this machine. */
+    gateway: LightState;
+    /** The public URL walks back to this gateway. */
+    publicUrl: LightState;
+    /** A phone actually paired through it. */
+    pairing: LightState;
+}
+/**
+ * The three progress lights, derived from the admin/status reachability
+ * plus the verification poll result. Before a session is started the poll
+ * answers `not-started`, which is a pending state — the public and pairing
+ * lights stay amber (nothing has been tried, so red would just shout);
+ * once started, an amber poll keeps them amber, a wrong-shape answer
+ * (redirect, someone else's server) turns the public light red, and an
+ * insecure cookie turns the pairing light red without ever passing.
+ */
+export declare function deriveWizardLights(input: {
+    gatewayReachable: boolean;
+    poll: WizardVerifyPoll | undefined;
+}): WizardLights;
+/** Pairing-code countdown, whole seconds, never negative. */
+export declare function pairingSecondsLeft(expiresAt: number, now: number): number;
+export interface SnippetInput {
+    domain: string;
+    upstreamHost: string;
+    upstreamPort: number;
+}
+export declare function nginxSnippetText(input: SnippetInput): string | null;
+export declare function caddySnippetText(input: SnippetInput): string | null;
+/** The Lucky steps (mirror of proxy-snippets.ts luckySteps). */
+export declare function luckyStepTexts(input: SnippetInput): string[] | null;
+/** The snippet kinds the reverse-proxy card tabs over, in tab order. */
+export declare const SNIPPET_KINDS: readonly ["nginx", "caddy", "lucky"];
+export type SnippetKind = (typeof SNIPPET_KINDS)[number];
+//# sourceMappingURL=wizard.d.ts.map
