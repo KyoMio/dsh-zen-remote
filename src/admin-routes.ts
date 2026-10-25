@@ -129,6 +129,43 @@ export interface AdminConfigSnapshot {
   sources: Record<keyof ZenRemoteConfig, ConfigSource>
 }
 
+/** The gateway-wizard declared fields (GW-1). They reach the browser only
+ * through the sanitized wizard/status projection (src/wizard/status.ts) —
+ * the raw config dump on admin/status strips them, the same redaction
+ * discipline that keeps `deviceToken` off every wire surface. */
+const INGRESS_FIELDS = [
+  'ingressMode',
+  'ingressDomain',
+  'ingressHttpsPort',
+  'ingressAcmeEmail',
+  'ingressPublicUrl',
+] as const
+
+/** One {@link INGRESS_FIELDS} member. */
+type IngressField = (typeof INGRESS_FIELDS)[number]
+
+/** The admin/status config shape: the resolved snapshot minus the ingress fields. */
+export interface AdminPublicConfig {
+  values: Omit<ZenRemoteConfig, IngressField>
+  sources: Omit<Record<keyof ZenRemoteConfig, ConfigSource>, IngressField>
+}
+
+/** Copy the snapshot without the wizard-declared fields (a copy, never the
+ * live object — the resolver's values are per-request but still shared with
+ * other readers of the same getConfig() answer). */
+function publicConfigSnapshot(snapshot: AdminConfigSnapshot): AdminPublicConfig {
+  const values = { ...snapshot.values } as Record<string, unknown>
+  const sources = { ...snapshot.sources } as Record<string, unknown>
+  for (const field of INGRESS_FIELDS) {
+    delete values[field]
+    delete sources[field]
+  }
+  return {
+    values: values as Omit<ZenRemoteConfig, IngressField>,
+    sources: sources as AdminPublicConfig['sources'],
+  }
+}
+
 export interface AdminHandlerOptions {
   /** The connection service's admit, injected by apply(); tests fake it. */
   admit: (req: IncomingMessage) => AdminAdmission
@@ -310,7 +347,7 @@ function testPushPayload(lang: ZenRemoteConfig['lang']): { title: string; body: 
  * plugin restart, so an apply-time snapshot would go stale. */
 async function respondStatus(options: AdminHandlerOptions, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const viaGateway = req.headers['x-zen-remote-via'] !== undefined
-  const config = options.getConfig()
+  const config = publicConfigSnapshot(options.getConfig())
   let gateway: unknown = null
   let gatewayStatus: number | null = null
   let gatewayReachable = false

@@ -233,8 +233,9 @@ test("role 'client' mounts all three routes through a real inject and never call
   // T34-fix: the client prefix joined the host too (the remote-status route
   // must answer on both roles), so the host mounts 5 routes — and since
   // T41a-fix2 that prefix serves remote-status ONLY (the dedicated T16 test
-  // below drives the handler).
-  assert.equal(hostRoutes.length, 5)
+  // below drives the handler). GW-4 adds the wizard prefix under the admin
+  // one, for 6.
+  assert.equal(hostRoutes.length, 6)
 })
 
 test('admin routes register on the host role only', async () => {
@@ -269,9 +270,12 @@ test('admin routes register on the host role only', async () => {
 
   const hostRoutes = []
   index.apply(ctxRecording(hostRoutes), {})
+  // GW-4: the wizard prefix lives UNDER the admin prefix (its own longest-
+  // prefix registration), so the path filter catches two registrations.
   const adminRoutes = hostRoutes.filter((r) => String(r.path).startsWith(PREFIX))
-  assert.equal(adminRoutes.length, 1, 'the host role registers the admin prefix route')
+  assert.equal(adminRoutes.length, 2, 'the host role registers the admin prefix route and the wizard sub-prefix')
   assert.equal(adminRoutes[0].kind, 'prefix')
+  assert.ok(adminRoutes.some((r) => r.path === '/_dsh/zen-remote/admin/wizard'), 'the wizard sub-prefix is registered')
 })
 
 test('T16: client routes register on the client role (the host mounts the prefix for remote-status ONLY)', async () => {
@@ -318,7 +322,7 @@ test('T16: client routes register on the client role (the host mounts the prefix
   const hostClientPrefix = hostRoutes.filter((r) => String(r.path).startsWith(CLIENT_PREFIX))
   assert.equal(hostClientPrefix.length, 1, 'the host registers the client prefix too (T34-fix)')
   assert.equal(hostClientPrefix[0].kind, 'prefix')
-  assert.equal(hostRoutes.filter((r) => String(r.path).startsWith(ADMIN_PREFIX)).length, 1, 'the host keeps its admin prefix route')
+  assert.equal(hostRoutes.filter((r) => String(r.path).startsWith(ADMIN_PREFIX)).length, 2, 'the host keeps its admin prefix route (plus the GW-4 wizard sub-prefix)')
 
   // Drive the HOST-mounted handler over a real socket: remote-status answers
   // its empty conclusion, the pairing routes do not exist.

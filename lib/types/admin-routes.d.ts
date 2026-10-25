@@ -70,6 +70,18 @@ export interface AdminConfigSnapshot {
     values: ZenRemoteConfig;
     sources: Record<keyof ZenRemoteConfig, ConfigSource>;
 }
+/** The gateway-wizard declared fields (GW-1). They reach the browser only
+ * through the sanitized wizard/status projection (src/wizard/status.ts) —
+ * the raw config dump on admin/status strips them, the same redaction
+ * discipline that keeps `deviceToken` off every wire surface. */
+declare const INGRESS_FIELDS: readonly ["ingressMode", "ingressDomain", "ingressHttpsPort", "ingressAcmeEmail", "ingressPublicUrl"];
+/** One {@link INGRESS_FIELDS} member. */
+type IngressField = (typeof INGRESS_FIELDS)[number];
+/** The admin/status config shape: the resolved snapshot minus the ingress fields. */
+export interface AdminPublicConfig {
+    values: Omit<ZenRemoteConfig, IngressField>;
+    sources: Omit<Record<keyof ZenRemoteConfig, ConfigSource>, IngressField>;
+}
 export interface AdminHandlerOptions {
     /** The connection service's admit, injected by apply(); tests fake it. */
     admit: (req: IncomingMessage) => AdminAdmission;
@@ -144,4 +156,5 @@ export type AdminHandler = (req: IncomingMessage, res: ServerResponse) => Promis
  * {@link ADMIN_ROUTE_PREFIX} and never throws.
  */
 export declare function createAdminHandler(options: AdminHandlerOptions): AdminHandler;
+export {};
 //# sourceMappingURL=admin-routes.d.ts.map
