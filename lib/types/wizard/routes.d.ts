@@ -55,16 +55,20 @@ export interface WizardHandlerOptions {
      * "nothing configured, nothing running"; a throw is degraded to the
      * same. Later tasks inject the real probe. */
     getRuntime?: () => WizardRuntimeInput | Promise<WizardRuntimeInput>;
-    /** The trust-proxy persistence (GW-5), injected by apply(): the
-     * CURRENTLY resolved trustedProxies with its layer, and the atomic
-     * persister for a merged list. Absent — a wiring that predates GW-5 —
-     * and the route answers 501 like the other placeholders. */
+    /** The trust-proxy persistence (GW-5, GW-fix-2/L2), injected by apply():
+     * the CURRENTLY resolved trustedProxies with its layer, and the atomic
+     * persister for a merged list. `write` re-checks the persisted surface
+     * against `expected` (the value `resolved` answered moments earlier) —
+     * answering false when another writer moved it in between, which the
+     * route turns into a 409 instead of a silent clobber. Absent — a wiring
+     * that predates GW-5 — and the route answers 501 like the other
+     * placeholders. */
     trustProxy?: {
         resolved: () => {
             value: string;
             source: ConfigSource;
         };
-        write: (list: string) => void | Promise<void>;
+        write: (expected: string, list: string) => boolean | Promise<boolean>;
     };
 }
 export type WizardHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;

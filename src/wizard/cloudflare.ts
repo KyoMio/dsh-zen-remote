@@ -116,7 +116,9 @@ export interface CloudflareApi {
   configureIngress(accountId: string, tunnelId: string, domain: string, serviceUrl: string): Promise<void>
   /** One proxied CNAME `subdomain` → `target`; returns the record id. */
   createDnsRecord(zoneId: string, subdomain: string, target: string): Promise<string>
-  /** Composed check: is `domain` a zone on any of the token's accounts? */
+  /** Composed check: does any ancestor of `domain` name a zone on the
+   * token's accounts (zones are apexes — `dsh.example.com` lives in the
+   * `example.com` zone)? */
   checkDomainOnCloudflare(domain: string): Promise<CloudflareDomainCheck>
 }
 
@@ -130,6 +132,26 @@ const SERVICE_URL_PATTERN = /^https?:\/\/[A-Za-z0-9.[\]:-]+$/
  * encoded anyway, so a hostile value cannot change the request shape. */
 const seg = (value: string): string => encodeURIComponent(value)
 
+/** Page-size + page ceiling for the two list endpoints: 5 pages of 50 is
+ * 250 accounts/tunnels — far past anything a wizard user has, and the hard
+ * stop means a broken pagination answer can never loop forever. */
+const PAGE_SIZE = 50
+const PAGE_LIMIT = 5
+
+/**
+ * The ancestor chain of one hostname, itself first: `dsh.example.com` →
+ * `dsh.example.com`, `example.com`, `com`. Cloudflare zones are apex
+ * domains, so a wizard lookup for `dsh.example.com` must find the zone
+ * named `example.com` (GW-fix-2/H1) — exact-name matching walks this chain
+ * level by level.
+ */
+export function ancestorHosts(domain: string): string[] {
+  const labels = domain.split('.')
+  const chain: string[] = []
+  for (let index = 0; index < labels.length; index++) chain.push(labels.slice(index).join('.'))
+  return chain
+}
+
 export function createCloudflareApi(options: CloudflareApiOptions): CloudflareApi {
   const baseUrl = options.baseUrl ?? CLOUDFLARE_API_BASE
   const fetchImpl = options.fetchImpl ?? fetch
@@ -140,8 +162,9 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
   }
 
   /** One authenticated v4 call: Bearer header, envelope unwrapping, typed
-   * failures. The token never appears in any error path. */
-  const call = async (method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<unknown> => {
+   * failures. The token never appears in any error path. Returns the
+   * result PLUS the pagination envelope (the list endpoints page). */
+  const call = async (method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<{ result: unknown; totalPages: number }> => {
     let response: Response
     try {
       response = await fetchImpl(`${baseUrl}${path}`, {
@@ -156,7 +179,7 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
     } catch (cause) {
       throw new CloudflareError('cf-network', `the Cloudflare API call failed before an answer arrived (${path})`, null, [], { cause })
     }
-    let envelope: { success?: unknown; errors?: unknown; result?: unknown }
+    let envelope: { success?: unknown; errors?: unknown; result?: unknown; result_info?: { total_pages?: unknown } }
     try {
       envelope = await response.json()
     } catch {
@@ -173,7 +196,12 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
       else if (isDnsConflict(summary.codes, summary.text)) code = 'cf-dns-conflict'
       throw new CloudflareError(code, summary.text, response.status, summary.codes)
     }
-    return envelope.result
+    // A missing or junk total_pages reads as a single page — old mocks and
+    // tolerant callers keep working, pagination simply never continues.
+    const totalPages = typeof envelope.result_info?.total_pages === 'number' && envelope.result_info.total_pages >= 1
+      ? envelope.result_info.total_pages
+      : 1
+    return { result: envelope.result, totalPages }
   }
 
   const requireString = (value: unknown, what: string): string => {
@@ -188,16 +216,21 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
 
   return {
     async listAccounts() {
-      const result = await call('GET', '/accounts?per_page=50')
-      if (!Array.isArray(result)) throw new CloudflareError('cf-api', 'the accounts answer had no list')
-      return result.map((account) => requireString((account as { id?: unknown })?.id, 'an account id'))
+      const accounts: string[] = []
+      for (let page = 1; page <= PAGE_LIMIT; page++) {
+        const { result, totalPages } = await call('GET', `/accounts?per_page=${PAGE_SIZE}&page=${page}`)
+        if (!Array.isArray(result)) throw new CloudflareError('cf-api', 'the accounts answer had no list')
+        accounts.push(...result.map((account) => requireString((account as { id?: unknown })?.id, 'an account id')))
+        if (page >= totalPages || result.length === 0) break
+      }
+      return accounts
     },
 
     async getZone(accountId, domain) {
       const host = hostOf(domain)
       if (host === undefined) throw new CloudflareError('cf-api', 'the domain is not a bare hostname')
       const id = requireId(accountId, 'the account id')
-      const result = await call('GET', `/zones?name=${seg(host)}&account.id=${seg(id)}`)
+      const { result } = await call('GET', `/zones?name=${seg(host)}&account.id=${seg(id)}`)
       // Exact-match on the zone NAME client-side: the query filter is
       // advisory, the verdict is ours.
       const zones = Array.isArray(result) ? (result as readonly { name?: unknown; id?: unknown }[]) : []
@@ -213,22 +246,28 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
       }
       // config_src cloudflare makes the create response carry the connector
       // token directly — the second round-trip (GET .../token) is spared.
-      const result = await call('POST', `/accounts/${seg(id)}/cfd_tunnel`, { name, config_src: 'cloudflare' }) as { id?: unknown; token?: unknown }
-      return { id: requireString(result?.id, 'a tunnel id'), token: requireString(result?.token, 'a tunnel token') }
+      const { result } = await call('POST', `/accounts/${seg(id)}/cfd_tunnel`, { name, config_src: 'cloudflare' })
+      const record = result as { id?: unknown; token?: unknown }
+      return { id: requireString(record?.id, 'a tunnel id'), token: requireString(record?.token, 'a tunnel token') }
     },
 
     async listTunnels(accountId) {
       const id = requireId(accountId, 'the account id')
-      const result = await call('GET', `/accounts/${seg(id)}/cfd_tunnel?is_deleted=false&per_page=50`)
-      if (!Array.isArray(result)) throw new CloudflareError('cf-api', 'the tunnels answer had no list')
-      return result.map((tunnel) => {
-        const record = tunnel as { id?: unknown; name?: unknown; status?: unknown }
-        return {
-          id: requireString(record?.id, 'a tunnel id'),
-          name: typeof record?.name === 'string' ? record.name : '',
-          status: typeof record?.status === 'string' ? record.status : '',
-        }
-      })
+      const tunnels: CloudflareTunnelSummary[] = []
+      for (let page = 1; page <= PAGE_LIMIT; page++) {
+        const { result, totalPages } = await call('GET', `/accounts/${seg(id)}/cfd_tunnel?is_deleted=false&per_page=${PAGE_SIZE}&page=${page}`)
+        if (!Array.isArray(result)) throw new CloudflareError('cf-api', 'the tunnels answer had no list')
+        tunnels.push(...result.map((tunnel) => {
+          const record = tunnel as { id?: unknown; name?: unknown; status?: unknown }
+          return {
+            id: requireString(record?.id, 'a tunnel id'),
+            name: typeof record?.name === 'string' ? record.name : '',
+            status: typeof record?.status === 'string' ? record.status : '',
+          }
+        }))
+        if (page >= totalPages || result.length === 0) break
+      }
+      return tunnels
     },
 
     async configureIngress(accountId, tunnelId, domain, serviceUrl) {
@@ -256,26 +295,32 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
       if (typeof target !== 'string' || !/^[A-Za-z0-9-]{32}\.cfargotunnel\.com$/.test(target)) {
         throw new CloudflareError('cf-api', 'the CNAME target is not a tunnel hostname')
       }
-      const result = await call('POST', `/zones/${seg(zone)}/dns_records`, {
+      const { result } = await call('POST', `/zones/${seg(zone)}/dns_records`, {
         type: 'CNAME',
         name,
         content: target,
         proxied: true,
         ttl: 1,
-      }) as { id?: unknown }
-      return requireString(result?.id, 'a DNS record id')
+      })
+      return requireString((result as { id?: unknown })?.id, 'a DNS record id')
     },
 
     async checkDomainOnCloudflare(domain) {
       const host = hostOf(domain)
       if (host === undefined) throw new CloudflareError('cf-api', 'the domain is not a bare hostname')
+      // Zones are APEX domains: the user's `dsh.example.com` lives in the
+      // zone named `example.com`, so the exact-name lookup walks the
+      // ancestor chain (GW-fix-2/H1). First hit wins.
+      const chain = ancestorHosts(host)
       for (const accountId of await this.listAccounts()) {
-        try {
-          const zoneId = await this.getZone(accountId, host)
-          return { onCloudflare: true, zoneId, accountId }
-        } catch (error) {
-          if (error instanceof CloudflareError && error.code === 'cf-zone-not-found') continue
-          throw error
+        for (const candidate of chain) {
+          try {
+            const zoneId = await this.getZone(accountId, candidate)
+            return { onCloudflare: true, zoneId, accountId }
+          } catch (error) {
+            if (error instanceof CloudflareError && error.code === 'cf-zone-not-found') continue
+            throw error
+          }
         }
       }
       return { onCloudflare: false, zoneId: null, accountId: null }

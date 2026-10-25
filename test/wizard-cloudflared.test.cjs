@@ -105,6 +105,18 @@ test('start: token file 0600 via atomic rename, secret by --token-file only', as
   assert.ok(!JSON.stringify(spawn.argv).includes(secret), 'no secret in argv')
   assert.equal(spawn.env.TUNNEL_TOKEN, undefined)
   assert.ok(!JSON.stringify(spawn.env).includes(secret), 'no secret in the child env')
+  // GW-fix-2/L3: whitelist env — the canary (a relay-secret stand-in)
+  // planted in the host environment must not reach the child.
+  process.env.LAN_GATE_RELAY_SECRET = 'f'.repeat(64)
+  await manager.stop()
+  subprocess.spawns.length = 0
+  subprocess.handles.length = 0
+  assert.equal((await manager.start({ tunnelToken: secret })).ok, true)
+  const envKeys = Object.keys(subprocess.spawns[0].env)
+  const WHITELIST = new Set(['PATH', 'HOME', 'TMPDIR', 'LANG', 'TZ'])
+  for (const key of envKeys) assert.ok(WHITELIST.has(key), `env key ${key} must be whitelisted`)
+  assert.ok(!JSON.stringify(subprocess.spawns[0].env).includes('f'.repeat(64)), 'no host secret reached the child env')
+  delete process.env.LAN_GATE_RELAY_SECRET
 
   manager.stop()
 })
