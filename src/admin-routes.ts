@@ -365,12 +365,13 @@ async function respondStatus(options: AdminHandlerOptions, req: IncomingMessage,
     // stays null and the settings page renders from config alone.
   }
   // A remote device may see the device list but never the live pairing
-  // code — and never the untrusted-proxy detection (GW-fix-2/L1): the
-  // wizard's 信任卡片 is a server-owner surface, and the recorded address
-  // is a network topology fact a remote device has no business reading.
+  // code — and never the untrusted-proxy detection or the web-claim record
+  // (GW-fix-2/L1, GW-9): both are server-owner surfaces carrying network
+  // topology facts and device ids a remote device has no business reading.
   if (viaGateway && gateway !== null && typeof gateway === 'object') {
     ;(gateway as { pairing?: unknown }).pairing = null
     ;(gateway as { lastForwardedSource?: unknown }).lastForwardedSource = null
+    ;(gateway as { lastWebClaim?: unknown }).lastWebClaim = null
   }
   responseJson(res, 200, { ok: true, gateway, gatewayReachable, gatewayStatus, config, viaGateway })
 }

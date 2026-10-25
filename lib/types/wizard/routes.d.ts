@@ -32,6 +32,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission, AdminConfigSnapshot } from '../admin-routes.js';
 import type { ConfigSource } from '../config.js';
 import { type WizardRuntimeInput } from './status.js';
+import type { VerificationCheckResult, VerificationStartResult } from './verify.js';
 /** Prefix all wizard routes live under (one webServer prefix registration;
  * the host web server matches longest-prefix-first, so these win over the
  * plain admin prefix registration). */
@@ -41,6 +42,9 @@ export declare const WIZARD_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/status
 /** POST `{ip}`: merge one detected reverse-proxy IP into the persisted
  * trustedProxies (GW-5). */
 export declare const WIZARD_TRUST_PROXY_ROUTE = "/_dsh/zen-remote/admin/wizard/trust-proxy";
+/** POST `{publicUrl}`: start the final verification — mint the web pairing
+ * code (GW-9). GET: poll its status. */
+export declare const WIZARD_VERIFY_ROUTE = "/_dsh/zen-remote/admin/wizard/verify";
 export interface WizardHandlerOptions {
     /** The connection service's admit, injected by apply(); tests fake it. */
     admit: (req: IncomingMessage) => AdminAdmission;
@@ -69,6 +73,15 @@ export interface WizardHandlerOptions {
             source: ConfigSource;
         };
         write: (expected: string, list: string) => boolean | Promise<boolean>;
+    };
+    /** The final-verification orchestration (GW-9), injected by apply():
+     * POST mints the pairing code, GET polls the session. Absent — a wiring
+     * that predates GW-9 — and both answer 501 like the placeholders. */
+    verify?: {
+        start: (input: {
+            publicUrl: unknown;
+        }) => Promise<VerificationStartResult>;
+        check: () => Promise<VerificationCheckResult>;
     };
 }
 export type WizardHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;

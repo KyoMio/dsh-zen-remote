@@ -70,6 +70,7 @@ import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
 import { createWizardHandler, WIZARD_ROUTE_PREFIX } from './wizard/routes.js'
 import { detectForwardedSource, parseProxyList } from './wizard/source-detect.js'
+import { createVerificationManager } from './wizard/verify.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
@@ -806,12 +807,24 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // from env or the row the route refuses instead: a file-layer write
     // would be shadowed there.
     ctx.inject(['webServer', 'connection'], (wizardCtx) => {
+      // The verification session lives in THIS manager's closure (GW-9):
+      // memory-only by design, and a row reload rebuilds it — the same
+      // "stale" verdict the config fingerprint produces, arriving via the
+      // process generation instead.
+      const verification = createVerificationManager({
+        gatewayBase: `http://127.0.0.1:${effective.values.port}`,
+        getValues: () => resolveConfig(config, readFileConfig(), process.env).values,
+        // runtimeReady arrives when the Caddy / cloudflared process
+        // managers mount here (later wizard tasks); absent means the
+        // gateway check stands alone for now.
+      })
       wizardCtx.effect(() => wizardCtx.webServer.register({
         kind: 'prefix',
         path: WIZARD_ROUTE_PREFIX,
         handler: createWizardHandler({
           admit: (req) => wizardCtx.connection.admit(req),
           getConfig: () => resolveConfig(config, readFileConfig(), process.env),
+          verify: { start: (input) => verification.start(input), check: () => verification.check() },
           getRuntime: async () => {
             try {
               const response = await fetch(`http://127.0.0.1:${effective.values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })

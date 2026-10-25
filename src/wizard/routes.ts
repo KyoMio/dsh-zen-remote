@@ -35,6 +35,7 @@ import type { ConfigSource } from '../config.js'
 import { responseJson, sameOriginPost } from '../http.js'
 import { normalizeTrustedIp, mergeProxyList, parseProxyList } from './source-detect.js'
 import { projectWizardStatus, type WizardRuntimeInput } from './status.js'
+import type { VerificationCheckResult, VerificationStartResult } from './verify.js'
 
 /** Prefix all wizard routes live under (one webServer prefix registration;
  * the host web server matches longest-prefix-first, so these win over the
@@ -47,6 +48,10 @@ export const WIZARD_STATUS_ROUTE = `${WIZARD_ROUTE_PREFIX}/status`
 /** POST `{ip}`: merge one detected reverse-proxy IP into the persisted
  * trustedProxies (GW-5). */
 export const WIZARD_TRUST_PROXY_ROUTE = `${WIZARD_ROUTE_PREFIX}/trust-proxy`
+
+/** POST `{publicUrl}`: start the final verification — mint the web pairing
+ * code (GW-9). GET: poll its status. */
+export const WIZARD_VERIFY_ROUTE = `${WIZARD_ROUTE_PREFIX}/verify`
 
 /** Inbound body cap — the wizard forms send a few hundred bytes. */
 const MAX_BODY_BYTES = 16 * 1024
@@ -76,6 +81,13 @@ export interface WizardHandlerOptions {
   trustProxy?: {
     resolved: () => { value: string; source: ConfigSource }
     write: (expected: string, list: string) => boolean | Promise<boolean>
+  }
+  /** The final-verification orchestration (GW-9), injected by apply():
+   * POST mints the pairing code, GET polls the session. Absent — a wiring
+   * that predates GW-9 — and both answer 501 like the placeholders. */
+  verify?: {
+    start: (input: { publicUrl: unknown }) => Promise<VerificationStartResult>
+    check: () => Promise<VerificationCheckResult>
   }
 }
 
@@ -216,6 +228,34 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
           return
         }
         responseJson(res, 200, { ok: true, added: true })
+        return
+      }
+      if (route === WIZARD_VERIFY_ROUTE && (method === 'POST' || method === 'GET')) {
+        // Wall 3 applies to the POST; the GET is read-only polling. Both
+        // answers are 200 with the orchestration's own verdict in the
+        // body — the UI branches on `ok` / `result`, not on status codes.
+        if (method === 'POST' && !sameOriginPost(req)) {
+          responseJson(res, 403, {
+            ok: false,
+            error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+          })
+          return
+        }
+        const verify = options.verify
+        if (verify === undefined) {
+          responseJson(res, 501, { ok: false, error: { code: 'not-implemented', message: 'This wizard step is not wired up yet' } })
+          return
+        }
+        if (method === 'GET') {
+          responseJson(res, 200, await verify.check())
+          return
+        }
+        const body = await readJsonObject(req)
+        if (body === null) {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'request body must be a JSON object' } })
+          return
+        }
+        responseJson(res, 200, await verify.start({ publicUrl: body.publicUrl }))
         return
       }
       if (route.startsWith(`${WIZARD_ROUTE_PREFIX}/`)) {

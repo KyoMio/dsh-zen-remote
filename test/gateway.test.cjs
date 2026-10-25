@@ -814,3 +814,36 @@ test('GW-5: a proxy signature from an untrusted socket is recorded as lastForwar
     try { fs.rmSync(home, { recursive: true, force: true }) } catch { /* best effort */ }
   }
 })
+
+// ---- GW-9: web-claim cookie-safety record ----------------------------------------
+
+test('GW-9: a web claim records lastWebClaim; a proxy that drops X-Forwarded-Proto reads secure:false', async () => {
+  const { stop } = await boot()
+  try {
+    // First pairing rides the standard reverse-proxy headers (proto: https)
+    // — the issued cookie gets its Secure flag and the record says so.
+    const first = await pairDevice(PORT, 'phone-a')
+    assert.strictEqual(first.claim.status, 200)
+    let status = JSON.parse((await request(PORT, { path: '/lan-gate/status' })).body)
+    assert.ok(status.lastWebClaim, 'the claim was recorded')
+    assert.strictEqual(status.lastWebClaim.id, first.id)
+    assert.strictEqual(status.lastWebClaim.secure, true, 'proto: https → Secure cookie')
+    assert.strictEqual(typeof status.lastWebClaim.at, 'number')
+
+    // Second pairing WITHOUT x-forwarded-proto (the misbehaving proxy
+    // shape): the record flips to secure:false — the wizard's verdict
+    // source — and names the new device.
+    const gen = await request(PORT, { method: 'POST', path: '/lan-gate/pair', body: { role: 'web' } })
+    const code = JSON.parse(gen.body).code
+    const claim = await request(PORT, {
+      method: 'POST',
+      path: '/lan-gate/pair/claim',
+      headers: { 'x-forwarded-for': '203.0.113.9' },
+      body: { code, name: 'phone-b' },
+    })
+    assert.strictEqual(claim.status, 200)
+    status = JSON.parse((await request(PORT, { path: '/lan-gate/status' })).body)
+    assert.strictEqual(status.lastWebClaim.id, JSON.parse(claim.body).id)
+    assert.strictEqual(status.lastWebClaim.secure, false, 'no proto header → no Secure flag')
+  } finally { await stop() }
+})
