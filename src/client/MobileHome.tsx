@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode, TouchEvent as ReactTouchEvent } from 'react'
 import type { PropsLocale, PropsRuntime, PropsStore } from '@deepseek-ai/dsh-client-ui-slots'
 import {
@@ -367,6 +367,23 @@ export function MobileHome({
     window.addEventListener(GO_HOME_EVENT, onGoHome)
     return () => window.removeEventListener(GO_HOME_EVENT, onGoHome)
   }, [actions])
+
+  // Mirror the current phone view onto the AppFrame element itself so CSS inside
+  // the main column (session header hide + fade strip gate) can key off a direct
+  // ancestor attribute instead of relying solely on cross-subtree body:has(...)
+  // invalidation on iOS WebKit (especially across installViewportHeal's display
+  // toggle on standalone PWA launch).
+  useLayoutEffect(() => {
+    const frame = document.querySelector<HTMLElement>('[data-mobile-nav="frame"]')
+      ?? document.querySelector('[data-shell-overlay]')?.parentElement
+      ?? null
+    if (!phone || frame === null) {
+      frame?.removeAttribute('data-mobile-view')
+      return
+    }
+    frame.setAttribute('data-mobile-view', view)
+    return () => frame.removeAttribute('data-mobile-view')
+  }, [phone, view])
 
   const enter = (start: () => void): void => {
     start()
