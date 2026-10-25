@@ -1347,8 +1347,6 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           headers: {
             authorization: `Bearer ${creds.token}`,
             accept: 'application/json',
-            'x-zen-remote-via': 'gateway',
-            'x-zen-remote-role': 'desktop-client',
           },
           redirect: 'manual',
           signal: ac.signal,

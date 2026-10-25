@@ -297,13 +297,19 @@ export interface RemoteStatusStore {
  * (T34: 15 秒). */
 export const REMOTE_STATUS_POLL_MS = 15_000
 
+/** The minimum gap between two client-side network hints — the same 3s the
+ * host's `networkRestored()` enforces, so the two never fight. `hintGapMs`
+ * injects a smaller one (tests). */
+const NETWORK_HINT_CLIENT_GAP_MS = 3_000
+
 /**
  * Build one store over an injectable fetch and visibility source — the
  * shares-store discipline: latest-wins (an earlier request answering late
  * never overwrites a newer table), every GET failure fails its own round,
  * the timer is real while visible and gone while hidden, and becoming
  * visible pulls once immediately. `pollMs` exists for tests: the shipped
- * cadence is far too slow to observe.
+ * cadence is far too slow to observe. `hintGapMs` exists for the same
+ * reason: the shipped hint gap (default 3000) is far too slow to observe.
  */
 export function createRemoteStatusStore(
   fetchImpl: typeof fetch,
@@ -312,6 +318,10 @@ export function createRemoteStatusStore(
   /** the network-restored hint source. Omitted → no
    * hint wiring (a host mount, or a test). */
   networkHint?: NetworkHintSource,
+  /** the minimum gap between two client-side hints, ms; default 3000 (the
+   * same anti-storm gap the host enforces). Exists for tests, like
+   * `pollMs`: the shipped gap is far too slow to observe. */
+  hintGapMs: number = NETWORK_HINT_CLIENT_GAP_MS,
 ): RemoteStatusStore {
   const gate = createLatestGate()
   const listeners = new Set<() => void>()
@@ -425,17 +435,22 @@ export function createRemoteStatusStore(
   // status poll reflects the new state, and the intercept layer's $zr/events
   // leg reopens on its own once the relay reads online.
   //
-  // Two client-side guards keep a flapping machine from turning the hint
-  // into a poll: an in-flight slot (one hint at a time) and a minimum gap
-  // (the same 3s the host enforces, so the two never fight).
+  // THREE client-side guards keep a flapping machine from turning the hint
+  // into a poll: a healthy-link gate (the last status read said `online` —
+  // nothing to retire), an in-flight slot (one hint at a time), and a
+  // minimum gap (the same 3s the host enforces, so the two never fight).
   let hintInFlight = false
   let lastHintAt = 0
-  const NETWORK_HINT_CLIENT_GAP_MS = 3_000
 
   const sendNetworkHint = async (): Promise<void> => {
+    // The healthy-link gate: a hint exists to retire a stale `offline`. While
+    // the last status read says `online`, a tab switch or a browser `online`
+    // event must not spend the hint→ping→refresh triple. `view` undefined
+    // (no GET answered yet) passes — conservative before the first read.
+    if (snapshot.view?.state === 'online') return
     if (hintInFlight) return
     const now = Date.now()
-    if (now - lastHintAt < NETWORK_HINT_CLIENT_GAP_MS) return
+    if (now - lastHintAt < hintGapMs) return
     lastHintAt = now
     hintInFlight = true
     try {
