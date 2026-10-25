@@ -200,17 +200,32 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     flex: none;
     border-radius: 6px;
     object-fit: contain;
+    /* rc.3 fix (2026-10-25, Safari real-device report "logo 不显示"): the
+       host now ships TWO media-scoped favicons and the first in DOM order
+       is the DARK one — a WHITE whale (fill #fff). useSiteIconHref picks
+       the first link unconditionally, so on a light page the logo arrived
+       white-on-light and vanished. brightness(0) collapses ANY source (the
+       old single black favicon or the new white one) to a black silhouette,
+       making light mode correct for both hosts; the dark-theme rules below
+       re-invert it to white. */
+    filter: brightness(0);
   }
-  /* Dark theme (real-device report, 2026-08-17): the runtime favicon is a
-     dark-on-transparent whale mark, illegible on the dark page. Force a
-     white silhouette regardless of the source image's own colors —
-     brightness(0) collapses every opaque pixel to black first, invert(1)
-     then flips that to white; transparent pixels stay transparent either
-     way. Same body[data-ds-dark-theme] marker as the home-row hairline
-     above (AGENTS.md: prefers-color-scheme never fires, the app switches
-     themes via this attribute with color-scheme hardcoded to light). */
-  body[data-ds-dark-theme] [data-mobile-nav="home-logo"] {
+  /* Dark theme (real-device report, 2026-08-17): force a white silhouette
+     regardless of the source image's own colors — brightness(0) collapses
+     every opaque pixel to black first, invert(1) then flips that to white;
+     transparent pixels stay transparent either way. Three dark signals,
+     deliberately redundant: the pre-rc.3 body[data-ds-dark-theme] marker,
+     and rc.3's resolved <html data-ds-theme-source> ("dark" pinned, or
+     "system" under a dark OS — rc.3 stamps the resolved scheme on
+     html[style] with no body attribute until the first theme flip). */
+  body[data-ds-dark-theme] [data-mobile-nav="home-logo"],
+  html[data-ds-theme-source="dark"] [data-mobile-nav="home-logo"] {
     filter: brightness(0) invert(1);
+  }
+  @media (prefers-color-scheme: dark) {
+    html[data-ds-theme-source="system"] [data-mobile-nav="home-logo"] {
+      filter: brightness(0) invert(1);
+    }
   }
   [data-mobile-nav="ws-switch"] {
     display: inline-flex;
