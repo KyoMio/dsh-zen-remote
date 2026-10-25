@@ -30,6 +30,8 @@
 /** Same-origin client route feeding this store (host half: T34,
  * src/client-routes.ts). */
 export declare const REMOTE_STATUS_ROUTE = "/_dsh/zen-remote/client/remote-status";
+/** the browser's network-restored hint (POST). */
+export declare const NETWORK_HINT_ROUTE = "/_dsh/zen-remote/client/network-hint";
 /** Same-origin client route closing one remote session from this machine. */
 export declare const CLIENT_UNSHARE_ROUTE = "/_dsh/zen-remote/client/unshare";
 /** The relay's serving state, as the route words it. */
@@ -117,6 +119,29 @@ export interface VisibilitySource {
 /** The real source: `visibilitychange` off `document` (Node: always visible,
  * never notifying). */
 export declare const documentVisibility: VisibilitySource;
+/**
+ * the browser-side signal that a previously broken
+ * link MAY be back. Two triggers, both cheap and event-driven (never polled):
+ *
+ *  - `window`'s `online` event — the browser's own reachability flag going
+ *    true. Note this is a HINT, never proof: `navigator.onLine === true`
+ *    means "an interface is up", not "the host is reachable". The host
+ *    resolves the question with an authenticated `/ping` before anything
+ *    reconnects.
+ *  - `visibilitychange` → visible: a backgrounded tab (throttled timers, a
+ *    possibly-changed network) coming back is the other moment a stale
+ *    `offline` is most likely, and it costs one hint at most.
+ *
+ * Deliberately NOT wired: `window`'s `offline` event. Going offline needs no
+ * action (the poll and the streams already notice), and firing a hint there
+ * would only produce refused round-trips.
+ */
+export interface NetworkHintSource {
+    /** Attach; the returned function detaches. */
+    subscribe(listener: () => void): () => void;
+}
+/** The real source (Node / SSR: never notifying — a host has no navigator). */
+export declare const windowNetworkHint: NetworkHintSource;
 /** How one `client/unshare` POST ended. A refused action carries the
  * backend's error `code` when it sent one (`not-shared`, `remote-mismatch`,
  * …). */
@@ -139,6 +164,10 @@ export interface RemoteStatusStore {
     /** POST client/unshare for one VIRTUAL session id, then refresh.
      * @returns the action's outcome. */
     unshare(sessionId: string): Promise<RemoteUnshareOutcome>;
+    /** fire one network-restored hint now (the same
+     * controlled round the window `online` event drives). Exposed for tests
+     * and for a host-side manual probe; never bypasses the host's probe. */
+    notifyNetworkRestored(): void;
 }
 /** Poll cadence while the page is visible and at least one part is mounted
  * (T34: 15 秒). */
@@ -149,9 +178,17 @@ export declare const REMOTE_STATUS_POLL_MS = 15000;
  * never overwrites a newer table), every GET failure fails its own round,
  * the timer is real while visible and gone while hidden, and becoming
  * visible pulls once immediately. `pollMs` exists for tests: the shipped
- * cadence is far too slow to observe.
+ * cadence is far too slow to observe. `hintGapMs` exists for the same
+ * reason: the shipped hint gap (default 3000) is far too slow to observe.
  */
-export declare function createRemoteStatusStore(fetchImpl: typeof fetch, visibility?: VisibilitySource, pollMs?: number): RemoteStatusStore;
+export declare function createRemoteStatusStore(fetchImpl: typeof fetch, visibility?: VisibilitySource, pollMs?: number, 
+/** the network-restored hint source. Omitted → no
+ * hint wiring (a host mount, or a test). */
+networkHint?: NetworkHintSource, 
+/** the minimum gap between two client-side hints, ms; default 3000 (the
+ * same anti-storm gap the host enforces). Exists for tests, like
+ * `pollMs`: the shipped gap is far too slow to observe. */
+hintGapMs?: number): RemoteStatusStore;
 /**
  * The subscribe face both T34 parts hand `useSyncExternalStore`: a VIRTUAL-id
  * session subscribes to the store — the subscription is what keeps it

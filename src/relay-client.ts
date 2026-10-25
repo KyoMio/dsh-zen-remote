@@ -57,6 +57,9 @@ const RELAY_PROTOCOL = 1
 const HANDSHAKE_PATH = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE_PATH = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM_PATH = '/_dsh/zen-remote/relay/v1/stream'
+/** the relay's existing authenticated health route
+ * (`GET …/relay/ping`, answers `{ok:true}`). Used by probeHealth() only. */
+const PING_PATH = '/_dsh/zen-remote/relay/ping'
 const UNSHARE_PATH = '/_dsh/zen-remote/relay/v1/unshare'
 const EVENT_RESULT_PATH = '/_dsh/zen-remote/relay/v1/event-result'
 const HTTP_PATH = '/_dsh/zen-remote/relay/v1/http'
@@ -318,6 +321,18 @@ export interface RelayClient {
    * ladder (the settings page's 立即重连). Answers whether an attempt was
    * started — the reconnect route turns a false into a 409. */
   reconnect(): boolean
+
+  /** ONE lightweight authenticated health probe
+   * (`GET /ping`). Never changes `state`; de-duplicated while in flight;
+   * resolves false on any refusal. NOT a poller — call it on a real signal. */
+  probeHealth(): Promise<boolean>
+
+  /** a CONTROLLED fast-path for a reliable
+   * "network is back" signal. Fires only from `offline`, refuses within
+   * NETWORK_HINT_MIN_GAP_MS of the previous hint (no storm), and otherwise
+   * behaves exactly like reconnect(). connect() de-duplicates concurrent
+   * attempts via connectInFlight. Answers whether an attempt started. */
+  networkRestored(): boolean
   /** Notify that the credentials source may have changed (the loader's
    * volatile-update for the row): a pending reconnect wait is cancelled and,
    * with credentials present, one immediate attempt runs with the new
@@ -1309,6 +1324,62 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
   }
 
   /**
+   * one authenticated `GET /ping` — the independent
+   * health confirmation a restored link needs when no business traffic is
+   * flowing. Never throws, never moves `state`, de-duplicated in flight.
+   */
+  let healthProbeInFlight: Promise<boolean> | undefined
+  async function probeHealth(): Promise<boolean> {
+    if (healthProbeInFlight !== undefined) return healthProbeInFlight
+    const attempt = (async (): Promise<boolean> => {
+      let creds: { url: string, token: string }
+      try {
+        creds = requireCredentials()
+      } catch {
+        return false
+      }
+      const ac = new AbortController()
+      const timer = setTimeout(() => ac.abort(), Math.min(requestTimeoutMs, 8_000))
+      if (typeof timer.unref === 'function') timer.unref()
+      try {
+        const response = await fetchImpl(`${creds.url}${PING_PATH}`, {
+          method: 'GET',
+          headers: {
+            authorization: `Bearer ${creds.token}`,
+            accept: 'application/json',
+          },
+          redirect: 'manual',
+          signal: ac.signal,
+        })
+        return response.ok
+      } catch {
+        return false
+      } finally {
+        clearTimeout(timer)
+      }
+    })()
+    healthProbeInFlight = attempt
+    try {
+      return await attempt
+    } finally {
+      if (healthProbeInFlight === attempt) healthProbeInFlight = undefined
+    }
+  }
+
+  /** controlled fast-path; see the interface note. */
+  const NETWORK_HINT_MIN_GAP_MS = 3_000
+  let lastNetworkHintAt = 0
+  function networkRestored(): boolean {
+    if (stopped || state !== 'offline') return false
+    const now = clock.now()
+    if (now - lastNetworkHintAt < NETWORK_HINT_MIN_GAP_MS) return false
+    lastNetworkHintAt = now
+    cancelRetry()
+    void connect().catch(() => {})
+    return true
+  }
+
+  /**
    * The credentials source moved (a pairing write, an unpair, a hand edit
    * committed by the loader): drop any pending wait — the ladder belongs to
    * the OLD credentials — clear the stored compat verdict (it describes the
@@ -1907,6 +1978,11 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     queueDeviceName,
     connect,
     reconnect,
+    // the two new surfaces. `probeHealth` is the
+    // authenticated GET /ping health check (never moves `state`);
+    // `networkRestored` is the controlled fast-path (offline-only + 3s gap).
+    probeHealth,
+    networkRestored,
     credentialsChanged,
     stop,
     invoke,

@@ -35,6 +35,8 @@ import { zh } from '../client/locales.ts'
 /** Same-origin client route feeding this store (host half: T34,
  * src/client-routes.ts). */
 export const REMOTE_STATUS_ROUTE = '/_dsh/zen-remote/client/remote-status'
+/** the browser's network-restored hint (POST). */
+export const NETWORK_HINT_ROUTE = '/_dsh/zen-remote/client/network-hint'
 
 /** Same-origin client route closing one remote session from this machine. */
 export const CLIENT_UNSHARE_ROUTE = '/_dsh/zen-remote/client/unshare'
@@ -224,6 +226,47 @@ export const documentVisibility: VisibilitySource = {
   },
 }
 
+// --- the NETWORK-RESTORED hint source ---------------
+
+/**
+ * the browser-side signal that a previously broken
+ * link MAY be back. Two triggers, both cheap and event-driven (never polled):
+ *
+ *  - `window`'s `online` event — the browser's own reachability flag going
+ *    true. Note this is a HINT, never proof: `navigator.onLine === true`
+ *    means "an interface is up", not "the host is reachable". The host
+ *    resolves the question with an authenticated `/ping` before anything
+ *    reconnects.
+ *  - `visibilitychange` → visible: a backgrounded tab (throttled timers, a
+ *    possibly-changed network) coming back is the other moment a stale
+ *    `offline` is most likely, and it costs one hint at most.
+ *
+ * Deliberately NOT wired: `window`'s `offline` event. Going offline needs no
+ * action (the poll and the streams already notice), and firing a hint there
+ * would only produce refused round-trips.
+ */
+export interface NetworkHintSource {
+  /** Attach; the returned function detaches. */
+  subscribe(listener: () => void): () => void
+}
+
+/** The real source (Node / SSR: never notifying — a host has no navigator). */
+export const windowNetworkHint: NetworkHintSource = {
+  subscribe: (listener) => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return () => {}
+    const onOnline = (): void => { listener() }
+    const onVisibility = (): void => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') listener()
+    }
+    window.addEventListener('online', onOnline)
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.removeEventListener('online', onOnline)
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
+    }
+  },
+}
+
 /** How one `client/unshare` POST ended. A refused action carries the
  * backend's error `code` when it sent one (`not-shared`, `remote-mismatch`,
  * …). */
@@ -243,11 +286,21 @@ export interface RemoteStatusStore {
   /** POST client/unshare for one VIRTUAL session id, then refresh.
    * @returns the action's outcome. */
   unshare(sessionId: string): Promise<RemoteUnshareOutcome>
+
+  /** fire one network-restored hint now (the same
+   * controlled round the window `online` event drives). Exposed for tests
+   * and for a host-side manual probe; never bypasses the host's probe. */
+  notifyNetworkRestored(): void
 }
 
 /** Poll cadence while the page is visible and at least one part is mounted
  * (T34: 15 秒). */
 export const REMOTE_STATUS_POLL_MS = 15_000
+
+/** The minimum gap between two client-side network hints — the same 3s the
+ * host's `networkRestored()` enforces, so the two never fight. `hintGapMs`
+ * injects a smaller one (tests). */
+const NETWORK_HINT_CLIENT_GAP_MS = 3_000
 
 /**
  * Build one store over an injectable fetch and visibility source — the
@@ -255,12 +308,20 @@ export const REMOTE_STATUS_POLL_MS = 15_000
  * never overwrites a newer table), every GET failure fails its own round,
  * the timer is real while visible and gone while hidden, and becoming
  * visible pulls once immediately. `pollMs` exists for tests: the shipped
- * cadence is far too slow to observe.
+ * cadence is far too slow to observe. `hintGapMs` exists for the same
+ * reason: the shipped hint gap (default 3000) is far too slow to observe.
  */
 export function createRemoteStatusStore(
   fetchImpl: typeof fetch,
   visibility: VisibilitySource = documentVisibility,
   pollMs: number = REMOTE_STATUS_POLL_MS,
+  /** the network-restored hint source. Omitted → no
+   * hint wiring (a host mount, or a test). */
+  networkHint?: NetworkHintSource,
+  /** the minimum gap between two client-side hints, ms; default 3000 (the
+   * same anti-storm gap the host enforces). Exists for tests, like
+   * `pollMs`: the shipped gap is far too slow to observe. */
+  hintGapMs: number = NETWORK_HINT_CLIENT_GAP_MS,
 ): RemoteStatusStore {
   const gate = createLatestGate()
   const listeners = new Set<() => void>()
@@ -366,18 +427,71 @@ export function createRemoteStatusStore(
     }
   }
 
+  // ONE controlled round per hint.
+  //
+  // The chain is: hint → POST client/network-hint → host runs probeHealth()
+  // (authenticated GET /ping) → only a reachable host advances to
+  // networkRestored() (which is itself offline-only + 3s-gapped) → the next
+  // status poll reflects the new state, and the intercept layer's $zr/events
+  // leg reopens on its own once the relay reads online.
+  //
+  // THREE client-side guards keep a flapping machine from turning the hint
+  // into a poll: a healthy-link gate (the last status read said `online` —
+  // nothing to retire), an in-flight slot (one hint at a time), and a
+  // minimum gap (the same 3s the host enforces, so the two never fight).
+  let hintInFlight = false
+  let lastHintAt = 0
+
+  const sendNetworkHint = async (): Promise<void> => {
+    // The healthy-link gate: a hint exists to retire a stale `offline`. While
+    // the last status read says `online`, a tab switch or a browser `online`
+    // event must not spend the hint→ping→refresh triple. `view` undefined
+    // (no GET answered yet) passes — conservative before the first read.
+    if (snapshot.view?.state === 'online') return
+    if (hintInFlight) return
+    const now = Date.now()
+    if (now - lastHintAt < hintGapMs) return
+    lastHintAt = now
+    hintInFlight = true
+    try {
+      await fetchImpl(NETWORK_HINT_ROUTE, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    } catch {
+      // A hint that cannot be delivered is simply dropped — the poll and the
+      // streams are still the truth, and the next event tries again.
+    } finally {
+      hintInFlight = false
+      // Whatever the hint achieved, re-read the status so the UI stops
+      // showing a stale `offline` the moment the host is back.
+      void refresh()
+    }
+  }
+
+  let offNetworkHint: (() => void) | undefined
+  const startHintWiring = (): void => {
+    if (networkHint === undefined || offNetworkHint !== undefined) return
+    offNetworkHint = networkHint.subscribe(() => { void sendNetworkHint() })
+  }
+
   return {
     getSnapshot: () => snapshot,
     subscribe(listener: () => void): () => void {
       listeners.add(listener)
       syncPolling()
+      startHintWiring()
       return () => {
         listeners.delete(listener)
         syncPolling()
+        // The hint listener follows the subscribers: no page, no hints.
+        if (listeners.size === 0 && offNetworkHint !== undefined) {
+          offNetworkHint()
+          offNetworkHint = undefined
+        }
       }
     },
     refresh,
     unshare,
+    /** explicit hint trigger (tests / manual probe). */
+    notifyNetworkRestored: () => { void sendNetworkHint() },
   }
 }
 
@@ -399,6 +513,18 @@ export function subscribeIfVirtual(store: RemoteStatusStore, sessionId: string, 
  * matter how many of the icon and banner parts are mounted at once. Created
  * lazily over the real fetch, so check scripts never construct it. */
 export function getRemoteStatusStore(): RemoteStatusStore {
-  singleton ??= createRemoteStatusStore((input, init) => fetch(input, init))
+  // the REAL entry wiring. The network-hint source is
+  // passed here and nowhere else, so every mounted remote part (icon + banner)
+  // shares ONE store and therefore ONE hint subscription — no per-component
+  // listeners, no duplicate POSTs.
+  //
+  // Node / SSR: `windowNetworkHint.subscribe` returns a no-op detacher and
+  // never fires (there is no `window`), so a host mount is unaffected.
+  singleton ??= createRemoteStatusStore(
+    (input, init) => fetch(input, init),
+    documentVisibility,
+    REMOTE_STATUS_POLL_MS,
+    windowNetworkHint,
+  )
   return singleton
 }
