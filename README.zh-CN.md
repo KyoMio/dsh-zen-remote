@@ -361,6 +361,8 @@ cd ~/.dsh/profiles/desktop && pnpm install
 
 **iOS 26.x 独立 PWA 视口缩水**：加到主屏后视口底部会少掉一条状态栏高度，普通 Safari 标签页正常。这是 iOS 系统缺陷，缺掉的区域在文档之外，CSS 够不着；本插件做了三层缓解（浅色 manifest 背景 + 安全区补偿 + 强制重排），能减轻但不保证复原。彻底恢复只能整个 App 退出重开。
 
+**iOS 26+ 独立 PWA 窗口顶部系统渐进模糊**：加到主屏后从桌面打开时，iOS WebKit 会在窗口顶部约 95px 区域（状态栏至顶栏上半截）叠加一层系统级滚动边缘模糊遮罩（`WKScrollPocket` / `UIScrollEdgeEffect`）。该遮罩由系统合成层绘制在网页 DOM 之外，CSS 无法直接消除；点进任意会话再退回会话列表页即可在列表页恢复正常。Android 与普通 Safari 标签页不受影响。
+
 **个别环境软键盘对浏览器完全不可见，输入框抬升靠估算兜底**：部分组合里系统不把键盘高度告知页面（visualViewport、VirtualKeyboard API 一并失效，均已实测排除）。插件聚焦后探测约 1.2 秒，判定「键盘不可见」就按估计高度抬升输入框。抬升高度差得明显的话，在设置页里调 `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx`。正常环境完全不走这条路径。
 
 **经反代访问时设置页打不开**（插件配置列表空白、模型卡片报「settings are unavailable in this browser」）：DSH 官方设计是设置类 RPC 只对回环连接开放，远程浏览器的设置镜像初始即 `unavailable`。绕法：回跑 DSH 的那台机器用本机浏览器改。经网关打开的插件设置页同样受此限制。与本插件无关。

@@ -168,6 +168,8 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
      that header stays tappable, and going back hides it once more). Two
      selectors on purpose — the class suffix survives CSS-module hash renames,
      the structural one survives a rename of the class itself. */
+  [data-mobile-nav="frame"]:not([data-mobile-view="session"]) header[class*="_header"],
+  [data-mobile-nav="frame"]:not([data-mobile-view="session"]) header:has([class*="_titleRow"]),
   body:has([data-mobile-nav="home"]:not([data-view="session"])) [data-mobile-nav="frame"] header[class*="_header"],
   body:has([data-mobile-nav="home"]:not([data-view="session"])) [data-mobile-nav="frame"] header:has([class*="_titleRow"]) {
     display: none !important;
