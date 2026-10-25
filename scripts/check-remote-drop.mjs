@@ -126,4 +126,16 @@ const walkSources = (dir) => {
 }
 walkSources(SRC_ROOT.pathname)
 
+// ---- 6. the guard dismisses the host drop overlay after eating a drop ------
+// The overlay's only close paths are its own (stopped) drop handler and a
+// window `dragend` (drop-events.ts); an OS-file drag never delivers a native
+// one, so the guard must fire it itself in BOTH intercept branches. A text
+// nail against accidental removal — behavior is verified on real hardware.
+{
+  const effects = readFileSync(new URL('../src/client/effects/remote-drop.ts', import.meta.url), 'utf8')
+  assert.ok(effects.includes('function dismissHostDropOverlay'), 'the guard defines dismissHostDropOverlay')
+  const calls = effects.match(/^\s*dismissHostDropOverlay\(\)\s*$/gm)?.length ?? 0
+  assert.equal(calls, 2, `both intercept branches call dismissHostDropOverlay() as standalone statements (saw ${calls})`)
+}
+
 console.log('check-remote-drop: ok')

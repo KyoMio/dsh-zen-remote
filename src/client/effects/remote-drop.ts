@@ -124,6 +124,24 @@ function collectItems(transfer: DataTransfer): RemoteDropItemDescriptor[] | unde
   return out
 }
 
+/**
+ * Take the host's「拖拽文件到此处添加」drop overlay back down after the
+ * guard has stopped a drop. The overlay's own state machine
+ * (`dsh-client-ui-attachment` drop-events.ts) closes on the reset() inside
+ * its DOCUMENT-level bubble `drop` handler — which this guard's capture
+ * stopPropagation deliberately prevents from running — or on `dragend` at
+ * `window` level, a channel it does not read the event object for and does
+ * not isTrust-check. An OS-file drag never delivers a native dragend (the
+ * drag source is the OS, not a page element), so after eating the drop the
+ * guard fires that synthetic one itself: the overlay dismisses through the
+ * host's own reset, exactly as if the drag had ended. Both intercept
+ * branches (upload and folder-block) must call this the moment they stop
+ * the event, or the overlay stays up forever.
+ */
+function dismissHostDropOverlay(): void {
+  window.dispatchEvent(new Event('dragend'))
+}
+
 /** The toast copy in the page's language (the plugin's namespace carries
  * both dictionaries; the framework `t` seat is not reachable from a
  * non-React effect — same pick as the bridge note), with `{name}`-style
@@ -263,6 +281,7 @@ export function mountRemoteDropGuard(ctx: ClientContext): void {
         // drop, say so, nothing is uploaded.
         event.preventDefault()
         event.stopPropagation()
+        dismissHostDropOverlay()
         diagnostics.intercepted += 1
         diagnostics.blockedDirectories += 1
         showToast(toastText(navigator.language, 'remoteDropFolderBlocked'))
@@ -284,6 +303,7 @@ export function mountRemoteDropGuard(ctx: ClientContext): void {
       }
       event.preventDefault()
       event.stopPropagation()
+      dismissHostDropOverlay()
       diagnostics.intercepted += 1
       void uploadAll(sessionId, uploads)
     }
