@@ -68,6 +68,7 @@ import { ADAPTERS } from './adapters/index.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
+import { createWizardHandler, WIZARD_ROUTE_PREFIX } from './wizard/routes.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
@@ -788,6 +789,23 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           },
         }),
       }), 'dsh-zen-remote: admin routes')
+    })
+    // Gateway-wizard routes (GW-4): a separate LONGEST-prefix registration
+    // under the admin prefix — the host web server matches the longest
+    // prefix first, so /admin/wizard/* lands here and everything else stays
+    // with the admin handler above. Same host-only gate and admit wall; the
+    // wizard handler applies its own via-marker and same-origin walls to
+    // every route. The runtime probe arrives with the ingress lifecycle
+    // (GW-3/GW-7); the skeleton answers "nothing configured" meanwhile.
+    ctx.inject(['webServer', 'connection'], (wizardCtx) => {
+      wizardCtx.effect(() => wizardCtx.webServer.register({
+        kind: 'prefix',
+        path: WIZARD_ROUTE_PREFIX,
+        handler: createWizardHandler({
+          admit: (req) => wizardCtx.connection.admit(req),
+          getConfig: () => resolveConfig(config, readFileConfig(), process.env),
+        }),
+      }), 'dsh-zen-remote: wizard routes')
     })
     // The idle sweeper (T22c): every minute, hand the table the CURRENT
     // idleHours and let it close sessions quiet past that. idleHours is a

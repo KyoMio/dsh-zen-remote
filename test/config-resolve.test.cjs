@@ -361,6 +361,8 @@ test('Config parses a fully populated row and leaves an empty row free of defaul
     pushEvents: 'a/b', pushDebounceMs: 1000, pushSummary: true, pushTurnEnd: true, pushTool: false,
     serverName: 'phone', idleHours: 24, autoShareNewSessions: true,
     pluginBridgeConsent: { '@acme/panel': true },
+    ingressMode: 'caddy', ingressDomain: 'dsh.example.com', ingressHttpsPort: 8443,
+    ingressAcmeEmail: 'acme@example.com', ingressPublicUrl: 'https://dsh.example.com:8443',
     serverUrl: 'https://gw.example', deviceToken: 'tok',
     turnFoldDesktop: true, keyboardLiftRatio: 0.5, keyboardLiftMaxPx: 300, keyboardSafetyPadPx: 10, maxUploadBytes: 1024,
   }
@@ -416,6 +418,8 @@ test('a fully populated Config row resolves with EVERY source = row (T17)', asyn
     pushEvents: 'a/b', pushDebounceMs: 1000, pushSummary: true, pushTurnEnd: true, pushTool: false,
     serverName: 'phone', idleHours: 24, autoShareNewSessions: true,
     pluginBridgeConsent: { '@acme/panel': true },
+    ingressMode: 'caddy', ingressDomain: 'dsh.example.com', ingressHttpsPort: 8443,
+    ingressAcmeEmail: 'acme@example.com', ingressPublicUrl: 'https://dsh.example.com:8443',
     serverUrl: 'https://gw.example', deviceToken: 'tok',
     turnFoldDesktop: true, keyboardLiftRatio: 0.5, keyboardLiftMaxPx: 300, keyboardSafetyPadPx: 10, maxUploadBytes: 1024,
   }

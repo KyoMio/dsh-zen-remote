@@ -74,6 +74,22 @@ export interface ZenRemoteConfig {
      * false means NO — default `{}` keeps every plugin unconsented. Volatile:
      * read at compare time, deliberately NOT in RESTART_FIELDS. */
     pluginBridgeConsent: Record<string, boolean>;
+    /** Which public-ingress setup the gateway wizard (GW-1) manages.
+     * `'off'` no public entry; `'caddy'` the plugin-managed Caddy reverse
+     * proxy; `'external'` a user-operated reverse proxy; `'cloudflared'` a
+     * Cloudflare Tunnel. Read live per request by the wizard routes; a mode
+     * change must NOT reload the row (the ingress processes outlive it). */
+    ingressMode: 'off' | 'caddy' | 'external' | 'cloudflared';
+    /** Public ingress domain, bare host (e.g. `dsh.example.com`), no scheme,
+     * no path. Empty means none yet. */
+    ingressDomain: string;
+    /** Port the managed Caddy listens for HTTPS on. [1, 65535]. */
+    ingressHttpsPort: number;
+    /** ACME account contact for certificate notices; empty means none. */
+    ingressAcmeEmail: string;
+    /** The public origin the final verification reached (scheme + host +
+     * optional port, root path only). Empty until verified. */
+    ingressPublicUrl: string;
 }
 /** Defaults, one per field — exactly what layer 4 hands back. */
 export declare const DEFAULTS: ZenRemoteConfig;
@@ -172,6 +188,11 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     idleHours: z<any, any, "volatile">;
     autoShareNewSessions: z<any, any, "volatile">;
     pluginBridgeConsent: z<any, any, "volatile">;
+    ingressMode: z<any, any, "volatile">;
+    ingressDomain: z<any, any, "volatile">;
+    ingressHttpsPort: z<any, any, "volatile">;
+    ingressAcmeEmail: z<any, any, "volatile">;
+    ingressPublicUrl: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;
@@ -197,6 +218,11 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     idleHours: z<any, any, "volatile">;
     autoShareNewSessions: z<any, any, "volatile">;
     pluginBridgeConsent: z<any, any, "volatile">;
+    ingressMode: z<any, any, "volatile">;
+    ingressDomain: z<any, any, "volatile">;
+    ingressHttpsPort: z<any, any, "volatile">;
+    ingressAcmeEmail: z<any, any, "volatile">;
+    ingressPublicUrl: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;

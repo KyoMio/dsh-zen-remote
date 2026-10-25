@@ -83,6 +83,22 @@ export interface ZenRemoteConfig {
    * false means NO — default `{}` keeps every plugin unconsented. Volatile:
    * read at compare time, deliberately NOT in RESTART_FIELDS. */
   pluginBridgeConsent: Record<string, boolean>
+  /** Which public-ingress setup the gateway wizard (GW-1) manages.
+   * `'off'` no public entry; `'caddy'` the plugin-managed Caddy reverse
+   * proxy; `'external'` a user-operated reverse proxy; `'cloudflared'` a
+   * Cloudflare Tunnel. Read live per request by the wizard routes; a mode
+   * change must NOT reload the row (the ingress processes outlive it). */
+  ingressMode: 'off' | 'caddy' | 'external' | 'cloudflared'
+  /** Public ingress domain, bare host (e.g. `dsh.example.com`), no scheme,
+   * no path. Empty means none yet. */
+  ingressDomain: string
+  /** Port the managed Caddy listens for HTTPS on. [1, 65535]. */
+  ingressHttpsPort: number
+  /** ACME account contact for certificate notices; empty means none. */
+  ingressAcmeEmail: string
+  /** The public origin the final verification reached (scheme + host +
+   * optional port, root path only). Empty until verified. */
+  ingressPublicUrl: string
 }
 
 function defaultServerName(): string {
@@ -108,6 +124,11 @@ export const DEFAULTS: ZenRemoteConfig = {
   idleHours: 48,
   autoShareNewSessions: false,
   pluginBridgeConsent: {},
+  ingressMode: 'off',
+  ingressDomain: '',
+  ingressHttpsPort: 443,
+  ingressAcmeEmail: '',
+  ingressPublicUrl: '',
 }
 
 // --- per-field validators -------------------------------------------------
@@ -181,6 +202,32 @@ function commaList(value: unknown): string | undefined {
 function serverNameOf(value: unknown): string | undefined {
   const name = nonEmptyString(value)
   return name === undefined ? undefined : name.slice(0, SERVER_NAME_MAX)
+}
+
+/** `ingressAcmeEmail`: the pragmatic mail shape (local part, one `@`, dotted
+ * domain, no whitespace) — enough to keep a typo out of the ACME account,
+ * not a full RFC 5322 parser. */
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+function acmeEmail(value: unknown): string | undefined {
+  return typeof value === 'string' && EMAIL_PATTERN.test(value) ? value : undefined
+}
+
+/** `ingressPublicUrl`: an http(s) ORIGIN and nothing else — the design keeps
+ * path-based reverse proxying out of scope, so a URL with a path, query,
+ * fragment or userinfo never counts as verified. Returned verbatim. */
+function publicOrigin(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value === '') return undefined
+  let parsed: URL
+  try {
+    parsed = new URL(value)
+  } catch {
+    return undefined
+  }
+  if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:')) return undefined
+  if ((parsed.pathname !== '/' && parsed.pathname !== '') || parsed.search !== '' || parsed.hash !== '') return undefined
+  if (parsed.username !== '' || parsed.password !== '') return undefined
+  return value
 }
 
 /** `pluginBridgeConsent`: a plain object mapping plugin names to STRICT
@@ -290,6 +337,15 @@ const FIELDS: { [K in keyof ZenRemoteConfig]: FieldResolver<ZenRemoteConfig[K]> 
   // flat variable to stay compatible with, and a consent decision is a
   // settings-page action, not something set through the environment.
   pluginBridgeConsent: { row: consentMap, file: consentMap },
+  // Gateway-wizard declared fields (GW-1), same no-env reasoning: they are
+  // written by the wizard's own routes on this machine, never through the
+  // environment, and none has a historic LAN_GATE_* name. Not in
+  // RESTART_FIELDS — the ingress reads them live per request.
+  ingressMode: { row: oneOf('off', 'caddy', 'external', 'cloudflared'), file: oneOf('off', 'caddy', 'external', 'cloudflared') },
+  ingressDomain: { row: nonEmptyString, file: nonEmptyString },
+  ingressHttpsPort: { row: intIn(1, 65535), file: lenientFileNumber(intIn(1, 65535)) },
+  ingressAcmeEmail: { row: acmeEmail, file: acmeEmail },
+  ingressPublicUrl: { row: publicOrigin, file: publicOrigin },
 }
 
 /**
@@ -374,6 +430,11 @@ export function resolveConfig(
     idleHours: resolveField('idleHours', safeRow, safeFile, env, sources),
     autoShareNewSessions: resolveField('autoShareNewSessions', safeRow, safeFile, env, sources),
     pluginBridgeConsent: resolveField('pluginBridgeConsent', safeRow, safeFile, env, sources),
+    ingressMode: resolveField('ingressMode', safeRow, safeFile, env, sources),
+    ingressDomain: resolveField('ingressDomain', safeRow, safeFile, env, sources),
+    ingressHttpsPort: resolveField('ingressHttpsPort', safeRow, safeFile, env, sources),
+    ingressAcmeEmail: resolveField('ingressAcmeEmail', safeRow, safeFile, env, sources),
+    ingressPublicUrl: resolveField('ingressPublicUrl', safeRow, safeFile, env, sources),
   }
   return { values, sources }
 }
@@ -464,6 +525,14 @@ export const Config = z.object({
   // time — a consent flip must apply without a row restart, so it is
   // deliberately NOT in RESTART_FIELDS.
   pluginBridgeConsent: z.any().volatile(),
+  // Gateway-wizard declared fields (GW-1): the ingress mode/domain/port and
+  // the ACME contact and verified origin, all live-read by the wizard routes
+  // (never snapshotted) and deliberately NOT in RESTART_FIELDS.
+  ingressMode: z.any().volatile(),
+  ingressDomain: z.any().volatile(),
+  ingressHttpsPort: z.any().volatile(),
+  ingressAcmeEmail: z.any().volatile(),
+  ingressPublicUrl: z.any().volatile(),
   // Client-half knobs (T16): where the phone finds the gateway, and the
   // pairing token it presents. `role('secret')` keeps the token out of every
   // settings wire surface, like the verifier plugin's API key.
