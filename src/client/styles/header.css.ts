@@ -100,20 +100,30 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      2026-08-23). color-mix instead of the transparent keyword: the host
      writes its own seat gradient that way, and plain \`transparent\` is
      rgba(0,0,0,0) — WebKit interpolates it through grey. */
-   /* rc.3 fix (2026-10-25 real-device report "渐隐条跑到顶部"): the host
-     now also renders a BLANK header in the hero phase (no session open,
-     kiGsTW_headerBlank, min-height:0 — a window-drag strip pinned at the
-     frame top), and the bare [data-phase] attribute selector matched that
-     too, painting the fade strip full-width at the very top of the app
-     window on the session LIST page. Scope the fade to a real, active
-     conversation only — the hero/blank header keeps its own (hidden)
-     bottom line. */
-  [data-phase="active"] header::after {
-    height: 20px !important;
-    top: 100% !important;
-    bottom: auto !important;
-    background: linear-gradient(to bottom, var(--dsw-alias-bg-base), color-mix(in srgb, var(--dsw-alias-bg-base) 0%, transparent)) !important;
-  }
+   /* rc.3 fix round 2 (2026-10-25): the fade strip now hangs off OUR
+session view layer instead of the host header. Two reasons, both rc.3
+facts: (1) the bare [data-phase] selector matched the new hero-phase
+BLANK header (kiGsTW_headerBlank, min-height:0, pinned at the frame
+top), painting the strip full-width at the very top of the app window
+on the session LIST page; (2) with the shell layer raised to z:30
+(home.css.ts, above the host's z:20 overlayLayer) a host-header ::after
+now sits UNDER the shell's own header band and is invisible — the shell
+has to draw the fade itself. Position: below the shell's 76px session
+chrome (48px title row + 28px view-switch row, the same arithmetic this
+file uses for the agent-teams offset) + the safe-area inset. Same
+gradient and color-mix discipline as before (plain transparent
+interpolates through grey on WebKit). */
+[data-mobile-nav="home"][data-view="session"]::after {
+  content: '';
+  position: absolute;
+  top: calc(var(--mnav-sat, 0px) + 76px);
+  left: 0;
+  right: 0;
+  height: 20px;
+  pointer-events: none;
+  background: linear-gradient(to bottom, var(--dsw-alias-bg-base), color-mix(in srgb, var(--dsw-alias-bg-base) 0%, transparent));
+  z-index: 1;
+}
   /* grid-row: 1 on every item is load-bearing, not decoration (S2.1 fix for
      the "标题被挤下去" report). The three items are placed with explicit
      grid-column but arrive in DOM order crumbs(2) → headerActions(1) →

@@ -91,7 +91,17 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
   [data-mobile-nav="home"] {
     position: absolute;
     inset: 0;
-    z-index: 5;
+    /* rc.3 raise (real-device report 2026-10-25 "top strip leaking the
+       conversation through"): this shell layer mounts INSIDE the host's
+       PIRFFq_overlayLayer (z-index:20, new in rc.3 — the conversation
+       content itself moved under it too), so the old z:5 let host session
+       content (STRONG/CODE rows measured at viewport y=4) paint over the
+       shell's top bar on BOTH pages, reading as a faint fixed strip at the
+       window top. z:30 puts the whole shell above everything the host
+       stacks inside that layer; the shell's own transparent middle and
+       pointer-events passthrough keep the conversation visible and tappable
+       (verified live via console injection before landing). */
+    z-index: 30;
     display: flex;
     flex-direction: column;
     pointer-events: auto;
