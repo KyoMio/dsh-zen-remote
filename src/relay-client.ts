@@ -79,7 +79,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
 
 /**
  * The invoke round-trip budget (T31-fix): the configured request timeout
- * plus 2 s per MiB of request body, capped at five minutes. The large
+ * plus 2 s per MiB of request body, capped at fifteen minutes. The large
  * bodies are the prompt routes' INLINE images — `session/prompt` /
  * `subagents/prompt` content blocks carry base64 `image` data, one image up
  * to 20 MiB by default (`maxImageBytes`, dsh-attachment-local) or ~27 MiB
@@ -87,7 +87,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
  * base seconds. The cap never lands below the configured base timeout.
  */
 const INVOKE_TIMEOUT_PER_MIB_MS = 2_000
-const INVOKE_TIMEOUT_CAP_MS = 300_000
+const INVOKE_TIMEOUT_CAP_MS = 900_000
 
 /**
  * How often an ONLINE client re-runs the handshake purely to refresh the two

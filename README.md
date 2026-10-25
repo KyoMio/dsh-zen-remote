@@ -94,7 +94,7 @@ dsh plugin --profile web add dsh-zen-remote
 // ~/.dsh/profiles/desktop/package.json
 {
   "dependencies": {
-    "dsh-zen-remote": "^2.2.5"        // for local development: "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^2.2.8"        // for local development: "link:/path/to/dsh-zen-remote"
   }
 }
 ```
@@ -296,6 +296,7 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 - Turn-process folding, left-edge swipe back, Android back-gesture takeover, phone-local attachment upload
 - A pairing code buys a long-lived device token; identity follows the token, not the IP, revocable at any time
 - Real PWA + real Web Push (VAPID + aes128gcm), firing only for approvals and questions by default
+- Cold start paints an app-shaped skeleton from the first HTML byte; content-hashed build assets are cached for a year, so a repeat open reuses the shell instead of re-downloading it
 
 **Host (2.0 additions)**
 
@@ -305,7 +306,8 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 **Desktop client (2.0 additions)**
 
 - Remote groups in the sidebar ("server name · workspace name"), remote sessions open like local ones: full history, live progress, messages, cancels, queue edits, approvals and question answers, model selection, file tree, changes list plus changes summary/diff, goals, slash commands, agent presets, subagent prompts/interrupts, attachments and @ references, terminals running server-side
-- Remote sessions can attach **non-image files**: the upload request is caught by the sub-client's own backend and streamed through the relay to the server session; the 100 MiB cap is the relay's own (local uploads have no such limit), an over-limit pick is refused locally on the client with a readable message, and slow links are bounded by the 300-second timeout
+- Artifacts a remote session produces can be **downloaded to this computer**: the deliverable card and the document preview header each carry a "download to this computer" action that reads the host file through the relay in byte windows (any file size, never held whole in memory) and hands it to the browser; Word/Excel/PPT previews are now rendered to PDF by the host's LibreOffice (`officeToPdf/*` is on the relay allowlist) instead of failing with "not supported in remote sessions"
+- Remote sessions can attach **non-image files**: the upload request is caught by the sub-client's own backend and streamed through the relay to the server session; the 500 MiB cap is the relay's own (local uploads have no such limit), an over-limit pick is refused locally on the client with a readable message, and slow links are bounded by the client's 15-minute upload budget (the host HTTP server's 5-minute request deadline is the practical ceiling: 500 MiB needs ~14 Mbps sustained).
 - The model picker in a remote session lists the **server's** model catalog (groups named "server name · group name"), local sessions list only local models; the last-fetched server groups survive while the relay is offline; server groups never appear in local settings such as the vision router. Known boundary: a session created on the server that has never sent a message shows the local default model in the picker
 - New sessions created inside a remote group run on the server's workspace and are shared automatically; remote sessions can be renamed, archived, pinned, forked, and their remote access closed (with confirmation) from the client
 - Title-row connection icon per remote session (online / offline / version differs); a "remote closed" banner with the reason when a session is slept or closed server-side; offline groups go grey with input disabled and reconnect automatically with backoff
@@ -314,6 +316,10 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 **Both ends (2.1 additions)**
 
 - The **plugin bridge**: another plugin registers one bridge declaration and its panel data in remote sessions is served by the HOST — the sub-client reroutes the declared GET requests to the server, which executes them over loopback and streams the answer back; local data never leaks into a remote session. Bridged requires the plugin name, exact version and declaration to agree on BOTH ends; whole-machine data additionally needs the server owner's per-plugin consent in the settings page. Author guide: [the plugin bridge](docs/plugin-bridge.md)
+
+**Desktop client (2.2 additions)**
+
+- Dragging files into a remote session attaches them by **upload**: the desktop app's same-machine shortcut (a dragged file keeps its disk path and would become an `@absolute path` mention naming a file on YOUR machine, unreadable on the server) is intercepted in the browser and the drop is re-shaped into an ordinary upload — the same relay path as the attach button, so the server session gets the bytes. Dragging a **folder** into a remote session is not supported: the drop is stopped with a short on-screen notice. Local sessions are untouched — the shortcut keeps working there — and the guard's status is visible in the settings page diagnostics.
 
 In depth: [interface](docs/interface.md) · [public access + relay protocol](docs/remote-access.en.md)
 
@@ -354,6 +360,8 @@ What a paired device is trusted with, stated plainly:
 ## Known issues
 
 **iOS 26.x standalone PWA viewport shrinkage**: after adding to the home screen, the viewport loses a status-bar's height at the bottom; an ordinary Safari tab is fine. This is an iOS defect — the missing region is outside the document and CSS cannot reach it. The plugin ships three layers of mitigation (light manifest background, safe-area compensation, forced reflow) which reduce it without guaranteeing a fix. Only quitting and reopening the whole app restores it fully.
+
+**iOS 26+ standalone PWA system top progressive blur**: when opened from the home screen on iOS 26+, WebKit draws a system-level scroll-edge progressive blur (`WKScrollPocket` / `UIScrollEdgeEffect`) across the top ~95px of the window (status bar plus the upper half of the top bar). Because it is an OS compositor layer outside the DOM, page CSS cannot remove it directly; entering a session and returning to the session list clears it on the list page. Android and regular Safari tabs are unaffected.
 
 **In a few environments the soft keyboard is completely invisible to the browser, and the lift falls back to an estimate**: in some combinations the system never tells the page the keyboard's height (visualViewport and the VirtualKeyboard API both fail; both ruled out by measurement). The fallback probes for ~1.2s after focus and lifts the input box by an estimated height when the keyboard is judged invisible. If the lift is visibly off, tune `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` in the settings page. Normal environments never take this path.
 

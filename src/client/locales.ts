@@ -253,6 +253,15 @@ export const zh = {
   'settings.client.diagRecentFailures': '最近的远程调用失败',
   'settings.client.diagCompatGroups': '指纹有差异的组：{groups}',
   'settings.client.diagCompatCalls': '最近的不兼容调用',
+  // --- RD-3 远程会话拖拽守卫的诊断行（浏览器端计数，渲染时现读） ---
+  'settings.client.diagRemoteDrop': '远程拖拽守卫',
+  'settings.client.diagRemoteDropOk': '已安装 · 拦截 {intercepted} · 重派发 {redispatched} · 文件夹 {blocked} · 放行 {passthrough} · 重包失败 {failed}',
+  'settings.client.diagRemoteDropOff': '未安装（{reason}）',
+  // --- RD-6 上传改道（fetch-route 拦截）的诊断行：读 remote-status 的 serviceProbe ---
+  'settings.client.diagUploadRedirect': '上传改道',
+  'settings.client.diagUploadRedirectOk': '已安装 · 上传已接管',
+  'settings.client.diagUploadRedirectRefused': '拒装：{reason}',
+  'settings.client.diagUploadRedirectPending': '服务注入未触发 · connection {connection} · fileUploads {fileUploads}',
   // --- PB-5 插件桥：主服务端同意小节 + 子客户端诊断小节 ---
   'settings.bridge.title': '插件桥',
   'settings.bridge.empty': '暂无插件登记插件桥',
@@ -294,6 +303,12 @@ export const zh = {
   'remoteGroupRevoked': '（令牌已吊销）',
   'remoteGroupUnpaired': '（已解除配对）',
   'remoteGroupMismatch': '（版本有差异）',
+  // --- 远程会话拖拽附件（RD-2）：文件夹被拦截时的短暂提示 ---
+  'remoteDropFolderBlocked': '远程会话暂不支持拖入文件夹',
+  // --- 2.2.6: 远程会话产物下载（deliverable 卡片 / 文档预览头） ---
+  'downloadToLocal': '下载到本机',
+  'downloadBusy': '下载中…',
+  'downloadFailed': '下载失败',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -543,6 +558,16 @@ export const en: Record<MobileNavKey, string> = {
   'settings.client.diagRecentFailures': 'Recent remote call failures',
   'settings.client.diagCompatGroups': 'Groups with fingerprint differences: {groups}',
   'settings.client.diagCompatCalls': 'Recent incompatible calls',
+  // --- RD-3: the remote drop guard's diagnostics line (browser-side
+  // counters, read at render time) ---
+  'settings.client.diagRemoteDrop': 'Remote drop guard',
+  'settings.client.diagRemoteDropOk': 'Installed · intercepted {intercepted} · redispatched {redispatched} · folders {blocked} · passthrough {passthrough} · rewrap failed {failed}',
+  'settings.client.diagRemoteDropOff': 'Not installed ({reason})',
+  // --- RD-6: the upload-redirect (fetch-route intercept) diagnostics row ---
+  'settings.client.diagUploadRedirect': 'Upload redirect',
+  'settings.client.diagUploadRedirectOk': 'Installed · upload wrapped',
+  'settings.client.diagUploadRedirectRefused': 'Refused: {reason}',
+  'settings.client.diagUploadRedirectPending': 'Service inject never fired · connection {connection} · fileUploads {fileUploads}',
   // --- PB-5 plugin bridge: host consent section + sub-client diagnostics ---
   'settings.bridge.title': 'Plugin bridge',
   'settings.bridge.empty': 'No plugin has registered a bridge yet',
@@ -583,6 +608,13 @@ export const en: Record<MobileNavKey, string> = {
   'remoteGroupRevoked': ' (token revoked)',
   'remoteGroupUnpaired': ' (unpaired)',
   'remoteGroupMismatch': ' (version mismatch)',
+  // --- RD-2: the short toast when a folder drop into a remote session is blocked ---
+  'remoteDropFolderBlocked': 'Folders cannot be dropped into a remote session yet',
+  // 2.2.6: remote-session artifact download (deliverable cards / document
+  // preview header).
+  'downloadToLocal': 'Download to this computer',
+  'downloadBusy': 'Downloading…',
+  'downloadFailed': 'Download failed',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

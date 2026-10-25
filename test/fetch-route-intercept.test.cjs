@@ -225,7 +225,7 @@ test('wrap (T51-fix): a DECLARED body past the relay cap is refused locally — 
     const query = new URLSearchParams({ sessionId: toVirtual(SERVER_ID, LOCAL_ID), name: 'huge.bin' })
     const request = new Request(`http://dsh.internal/api/session/uploadFileBinary?${query.toString()}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/octet-stream', 'content-length': String(250 * 1024 * 1024) },
+      headers: { 'content-type': 'application/octet-stream', 'content-length': String(600 * 1024 * 1024) },
       body: Buffer.from('tiny'),
       duplex: 'half',
     })
@@ -234,9 +234,9 @@ test('wrap (T51-fix): a DECLARED body past the relay cap is refused locally — 
     const body = await response.json()
     assert.equal(body.ok, false)
     assert.equal(body.error.code, 'payload-too-large')
-    assert.equal(body.error.message, '文件超过远程上传上限（100 MiB）')
+    assert.equal(body.error.message, '文件超过远程上传上限（500 MiB）')
     assert.deepEqual(body.error.details, {})
-    assert.equal(relay.calls.length, 0, 'a 250 MiB declaration never starts a doomed round-trip')
+    assert.equal(relay.calls.length, 0, 'a 600 MiB declaration never starts a doomed round-trip')
     assert.equal(connection.seen.upload.length, 0)
     assert.equal(handle.diagnostics().uploadRefused, 1)
   } finally { handle.uninstall() }
@@ -287,7 +287,7 @@ test('wrap (T5x): a MID-UPLOAD transport death answers the interrupted envelope,
     const body = await response.json()
     assert.deepEqual(body, {
       ok: false,
-      error: { code: 'upload-interrupted', message: '上传中断，文件可能超过远程上传上限（100 MiB）或网络不稳定', details: {} },
+      error: { code: 'upload-interrupted', message: '上传中断，文件可能超过远程上传上限（500 MiB）或网络不稳定', details: {} },
     })
     // The diagnostics ring keeps the relay's own code.
     assert.deepEqual(handle.diagnostics().recentFailures.map((r) => r.code), ['offline'])
@@ -521,5 +521,5 @@ test('diagnostics: counters, flags, attach refusals and the failure ring — no 
 })
 
 test('the cap the local pre-refusal quotes is the relay module cap', () => {
-  assert.equal(MAX_UPLOAD_BYTES, 100 * 1024 * 1024, 'the message and the gate must move together')
+  assert.equal(MAX_UPLOAD_BYTES, 500 * 1024 * 1024, 'the message and the gate must move together')
 })

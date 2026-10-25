@@ -91,7 +91,17 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
   [data-mobile-nav="home"] {
     position: absolute;
     inset: 0;
-    z-index: 5;
+    /* rc.3 raise (real-device report 2026-10-25 "top strip leaking the
+       conversation through"): this shell layer mounts INSIDE the host's
+       PIRFFq_overlayLayer (z-index:20, new in rc.3 — the conversation
+       content itself moved under it too), so the old z:5 let host session
+       content (STRONG/CODE rows measured at viewport y=4) paint over the
+       shell's top bar on BOTH pages, reading as a faint fixed strip at the
+       window top. z:30 puts the whole shell above everything the host
+       stacks inside that layer; the shell's own transparent middle and
+       pointer-events passthrough keep the conversation visible and tappable
+       (verified live via console injection before landing). */
+    z-index: 30;
     display: flex;
     flex-direction: column;
     pointer-events: auto;
@@ -136,6 +146,34 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
       opacity .3s var(--ds-ease-in-out, ease-in-out),
       visibility 0s .3s;
   }
+  /* The host's SESSION header must not sit on top of this list page.
+     Real-device report (2026-10-22, DSH 0.2.0-rc.2, dsh-web-mobile 3.2.1,
+     360x792 phone): on the list page the top strip showed the LAST SESSION's
+     header — its title plus the session's tab row — and the workspace switcher
+     underneath was neither visible nor tappable, so "switch workspace" did
+     nothing at all. Measured with elementFromPoint(150,30) on the phone
+     viewport: span.wSkVaW_crumbCurrent, i.e. the host header's crumb, while
+     our own workspace button sat at [46,8,208,44] underneath it.
+
+     Why z-index is not the fix: this page is position:absolute; z-index:5
+     inside the shell overlay layer, and the host header carries its own
+     stacking context, so raising us above its z-index:30 changed nothing
+     (measured: the crumb still won the hit test). The session header has to
+     leave the hit tree while the list page is up — the list page draws its
+     own top bar (home-top, with the workspace switcher).
+
+     The gate is this page's own marker: data-view="session" means a session
+     is open, so the rule lapses exactly when the host header is wanted again
+     (verified: entering a session restores display:grid, the back button in
+     that header stays tappable, and going back hides it once more). Two
+     selectors on purpose — the class suffix survives CSS-module hash renames,
+     the structural one survives a rename of the class itself. */
+  [data-mobile-nav="frame"]:not([data-mobile-view="session"]) header[class*="_header"],
+  [data-mobile-nav="frame"]:not([data-mobile-view="session"]) header:has([class*="_titleRow"]),
+  body:has([data-mobile-nav="home"]:not([data-view="session"])) [data-mobile-nav="frame"] header[class*="_header"],
+  body:has([data-mobile-nav="home"]:not([data-view="session"])) [data-mobile-nav="frame"] header:has([class*="_titleRow"]) {
+    display: none !important;
+  }
   @media (prefers-reduced-motion: reduce) {
     [data-mobile-nav="home"],
     [data-mobile-nav="home"][data-view="session"] {
@@ -162,17 +200,32 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
     flex: none;
     border-radius: 6px;
     object-fit: contain;
+    /* rc.3 fix (2026-10-25, Safari real-device report "logo 不显示"): the
+       host now ships TWO media-scoped favicons and the first in DOM order
+       is the DARK one — a WHITE whale (fill #fff). useSiteIconHref picks
+       the first link unconditionally, so on a light page the logo arrived
+       white-on-light and vanished. brightness(0) collapses ANY source (the
+       old single black favicon or the new white one) to a black silhouette,
+       making light mode correct for both hosts; the dark-theme rules below
+       re-invert it to white. */
+    filter: brightness(0);
   }
-  /* Dark theme (real-device report, 2026-08-17): the runtime favicon is a
-     dark-on-transparent whale mark, illegible on the dark page. Force a
-     white silhouette regardless of the source image's own colors —
-     brightness(0) collapses every opaque pixel to black first, invert(1)
-     then flips that to white; transparent pixels stay transparent either
-     way. Same body[data-ds-dark-theme] marker as the home-row hairline
-     above (AGENTS.md: prefers-color-scheme never fires, the app switches
-     themes via this attribute with color-scheme hardcoded to light). */
-  body[data-ds-dark-theme] [data-mobile-nav="home-logo"] {
+  /* Dark theme (real-device report, 2026-08-17): force a white silhouette
+     regardless of the source image's own colors — brightness(0) collapses
+     every opaque pixel to black first, invert(1) then flips that to white;
+     transparent pixels stay transparent either way. Three dark signals,
+     deliberately redundant: the pre-rc.3 body[data-ds-dark-theme] marker,
+     and rc.3's resolved <html data-ds-theme-source> ("dark" pinned, or
+     "system" under a dark OS — rc.3 stamps the resolved scheme on
+     html[style] with no body attribute until the first theme flip). */
+  body[data-ds-dark-theme] [data-mobile-nav="home-logo"],
+  html[data-ds-theme-source="dark"] [data-mobile-nav="home-logo"] {
     filter: brightness(0) invert(1);
+  }
+  @media (prefers-color-scheme: dark) {
+    html[data-ds-theme-source="system"] [data-mobile-nav="home-logo"] {
+      filter: brightness(0) invert(1);
+    }
   }
   [data-mobile-nav="ws-switch"] {
     display: inline-flex;

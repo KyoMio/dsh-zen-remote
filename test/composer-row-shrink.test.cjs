@@ -50,6 +50,31 @@ test('the model seat stays the one shrinkable item', () => {
   assert.match(decls(modelRule[1]), /min-width: 0 !important;/)
 })
 
+test('the model seat matches any plugin root, not just the official one (#30)', () => {
+  // A third party can replace the whole conversation.input.model slot
+  // (…codex-ui), and a subagent session has no `_root` at all — the seat
+  // rules must land on whatever renders there. The relaxed child still has
+  // to carry a class' worth of specificity (:not(...) in the source), or
+  // the <=1023px grow rules in layout.css.ts would win the pill back.
+  assert.match(composer, /\[data-slot="conversation\.input\.model"\] > \*/)
+  assert.doesNotMatch(composer, /\[data-slot="conversation\.input\.model"\] > \[class\$="_root"\]/)
+})
+
+test('a third-party bare button trigger gets the ellipsis truncation too (#30)', () => {
+  // …codex-ui renders text straight inside a bare <button> with no
+  // _trigger classes; the standalone `${MODEL} > button` rule carries the
+  // same shrink+truncate contract the official label gets. (The geometry
+  // rule also lists `${MODEL} > button`, so anchor on the truncation
+  // declarations: the regex engine walks past the geometry rule — its body
+  // holds no text-overflow — and lands on the standalone one.)
+  assert.match(
+    composer,
+    /\$\{MODEL\} > button \{[^}]*text-overflow: ellipsis !important;/,
+    'the generic ${MODEL} > button rule must ellipsize',
+  )
+  assert.match(composer, /\$\{MODEL\} > \[class\$\="_trigger"\],\s*\$\{MODEL\} > button \{/)
+})
+
 test('the row is still one nowrap line', () => {
   assert.match(section, /flex-wrap: nowrap !important;/)
 })

@@ -19,6 +19,13 @@
 //                               hidden below, our workbench button routes to
 //                               its controls instead)
 //     div.tabs[role="tablist"]  Chat/Trajectory, only when there is >1 view
+//                               (DSH <= 0.2.1-rc.2)
+//     div.tabs                  DSH 0.2.1-rc.3: the row lost its role and
+//       div.viewTabs[role="tablist"][data-conversation-tabs]
+//       div.viewsMoreAnchor     "More conversation views" (…) menu launcher,
+//                               present while conversation.session.header.
+//                               views.actions has registrations (the web app
+//                               ships dsh-client-ui-entry-customization)
 
 export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768px) ---------- */
 
@@ -78,26 +85,38 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
        above. */
     z-index: 2;
     padding: 0 8px 28px !important;
+    border-bottom: none !important;
   }
   /* No header bottom line — fade instead (real-device round 2, 2026-08-17).
-     The official header draws its border as a \`::after\` 1px bar (the
-     \`border-bottom\` on the header itself is transparent, just a layout
-     reserve — dsh-client-ui-conversation lib/client.js ".wSkVaW_header{
-     border-bottom:1px solid #0000}.wSkVaW_header:after{...height:1px;
-     position:absolute;bottom:1px...}", verified live 2026-08-17), so the
-     bar is repurposed rather than hidden: restyled into a 20px strip
-     hanging just below the header that fades the messages in — the same
-     look the scroller's mask-image used to produce, without a mask on a
-     scroll container (iOS WebKit renders that as fog over the header, see
-     composer.css.ts "no divider above OR below the message list",
-     2026-08-23). color-mix instead of the transparent keyword: the host
-     writes its own seat gradient that way, and plain \`transparent\` is
-     rgba(0,0,0,0) — WebKit interpolates it through grey. */
-  [data-phase] header::after {
-    height: 20px !important;
+     The official header in rc.2 drew its border as a \`::after\` 1px bar; in
+     rc.3 (2026-10-25) the host replaced that pseudo-element with a plain 0.5px
+     border-bottom (cleared above) and added a blank 0px header in the hero
+     phase (\`_headerBlank\`). Declaring \`content: ''\` + \`position: absolute;
+     left: 0; right: 0\` explicitly on \`[data-phase="active"] header:not([class$="_headerBlank"])::after\`
+     keeps the 20px fade strip anchored right below the real session header on
+     both rc.2 and rc.3 without touching the scroll container:
+     - When the session header is display:none on the list page, ::after is
+       not generated at all (unlike _scrollBody::before, which stayed in flow
+       at y=0 whenever the header was hidden or blank and showed up at the top
+       of the window on iOS standalone PWA launch before data-view mutated).
+     - :not([class$="_headerBlank"]) excludes the 0-height blank header.
+     - color-mix instead of the transparent keyword: plain \`transparent\` is
+       rgba(0,0,0,0) — WebKit interpolates it through grey. */
+  [data-phase="active"] header:not([class$="_headerBlank"])::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
     top: 100% !important;
     bottom: auto !important;
+    height: 20px !important;
+    pointer-events: none;
     background: linear-gradient(to bottom, var(--dsw-alias-bg-base), color-mix(in srgb, var(--dsw-alias-bg-base) 0%, transparent)) !important;
+  }
+  [data-mobile-nav="frame"]:not([data-mobile-view="session"]) [data-phase] header::after,
+  body:has([data-mobile-nav="home"]:not([data-view="session"])) [data-phase] header::after {
+    content: none !important;
+    display: none !important;
   }
   /* grid-row: 1 on every item is load-bearing, not decoration (S2.1 fix for
      the "标题被挤下去" report). The three items are placed with explicit
@@ -439,6 +458,35 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      never relies on it (MobileSessionHeader always calls .click()). */
   [data-phase] header [class$="_tabs"][role="tablist"] {
     display: none;
+  }
+  /* DSH 0.2.1-rc.3 split the row: div._tabs (no role) now wraps the
+     tablist (div._viewTabs[role=tablist][data-conversation-tabs]) and the
+     new "More conversation views" launcher, so the rule above matches
+     nothing there and the official row — plus a stray (…) More button —
+     came back under our view-switch band. It cannot simply be display:none
+     either: while the More menu has registrations the header folds every
+     View past floor((row.clientWidth - 48) / 120) into More, and a
+     display:none row measures 0, which would leave only Chat as a
+     [role=tab] for readViewTabs() (MobileSessionHeader.tsx) to mirror.
+     So the row keeps a wide layout box that paints nothing: absolute (out
+     of the header's flow, no band), 2048px wide (room for 16 tabs before
+     anything folds), scale(0) so it adds no scrollable overflow (clientWidth
+     ignores transforms), visibility:hidden + pointer-events:none so it is
+     never seen or hit. Its tabs still take the synthetic .click() the view
+     switcher sends — the same reasoning as the display:none rule above. */
+  [data-phase] header [class$="_tabs"]:has(> [data-conversation-tabs]) {
+    position: absolute !important;
+    top: 0;
+    left: 0;
+    width: 2048px !important;
+    max-width: none !important;
+    height: 0 !important;
+    margin: 0 !important;
+    overflow: hidden !important;
+    transform: scale(0);
+    transform-origin: 0 0;
+    visibility: hidden !important;
+    pointer-events: none !important;
   }
 
   /* View-switch row: "current view name + dots", replacing the (still

@@ -299,31 +299,62 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
      one row with a thin scrollbar keeps every tab reachable and returns
      that space to the options area (user feedback 2026-08-16). An earlier
      one-row attempt had no scroll affordance and silently cut the last
-     tab off; the thin scrollbar IS the affordance. Scoped to the frame
-     marker: the desktop dialog keeps its official vertical nav column. */
-  [data-mobile-nav="frame"] [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])):not(:has([class*="ZuhsRW"])) > :first-child [class$="_navList"] {
+     tab off; the thin scrollbar IS the affordance.
+
+     2026-10-21 (DSH 0.2.1-rc.2, measured on a real phone shell): the whole
+     block below had silently stopped matching. The settings dialog no longer
+     renders inside the app frame — it is a PORTAL on body
+     (body > [class$="_overlay"] > [class$="_panel"]), so a
+     [data-mobile-nav="frame"] [aria-modal="true"] … prefix can never match
+     it, and the panel depth the old :has(> :first-child > :last-child >
+     button) gate was written against is no longer the shape the sheet has
+     (now panel > nav > (navTitle, navList, header)). Symptom: four nav cells
+     fell back to the host's wrapping grid (measured 209x132 for the list
+     instead of one 40px row) and the "open config file" action came back
+     into the header. Keep the same phone gate from the ancestor side
+     (html:has([data-mobile-nav="frame"]) — the marker only exists outside
+     the desktop gate) and identify the dialog by the nav list it owns, not
+     by a guessed depth. Desktop untouched.
+
+     This rule is the only place that declares the row's wrap/overflow now:
+     layout.css.ts's navList rule has a higher specificity and used to force
+     "flex-wrap: wrap; overflow: visible", so the one-row intent below never
+     actually rendered (see the note in layout.css.ts).
+
+     Every selector below is gated on :has([class$="_navList"]) — the one
+     stable feature of the settings sheet. The ancestor marker alone is not
+     enough: once the dialog is a body portal, [aria-modal="true"] matches
+     EVERY dialog on the phone (session export, directory picker, plugin
+     sheets), which is how the first cut of this block ended up hiding the
+     top-right action button of all of them (review, 2026-10-22). */
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navList"] {
     display: flex !important;
     flex-wrap: nowrap !important;
+    /* The nav row is [navList][header(close)]: min-width:0 + flex-basis auto
+       lets the list shrink to the width left over by the ✕ and scroll inside
+       itself — without it the nowrap content widens the row and pushes the
+       close button off-screen. */
+    flex: 1 1 auto !important;
+    min-width: 0 !important;
     overflow-x: auto !important;
     overflow-y: hidden !important;
     gap: 6px !important;
-    width: 100% !important;
     scrollbar-width: thin !important;
     -webkit-overflow-scrolling: touch !important;
   }
   /* Hairline scrollbar for the tab row: the default WebKit scrollbar reads
      fat on a phone; 2px keeps the scroll affordance without the bulk. */
-  [data-mobile-nav="frame"] [aria-modal="true"] [class$="_navList"]::-webkit-scrollbar {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navList"]::-webkit-scrollbar {
     height: 2px !important;
   }
-  [data-mobile-nav="frame"] [aria-modal="true"] [class$="_navList"]::-webkit-scrollbar-thumb {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navList"]::-webkit-scrollbar-thumb {
     background: var(--dsw-alias-border-l2, rgba(0, 0, 0, .22)) !important;
     border-radius: 1px !important;
   }
-  [data-mobile-nav="frame"] [aria-modal="true"] [class$="_navList"]::-webkit-scrollbar-track {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navList"]::-webkit-scrollbar-track {
     background: transparent !important;
   }
-  [data-mobile-nav="frame"] [aria-modal="true"] [class$="_navCell"] {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navCell"] {
     flex: 0 0 auto !important;
     white-space: nowrap !important;
     padding: 6px 8px !important;
@@ -331,7 +362,7 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
     font-size: 13px !important;
     justify-content: flex-start !important;
   }
-  [data-mobile-nav="frame"] [aria-modal="true"] [class$="_navCell"] svg {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_navCell"] svg {
     width: 14px !important;
     height: 14px !important;
     flex: none !important;
@@ -339,11 +370,11 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
   /* Content toolbar: the "Open configuration file" button is hidden on
      mobile — it is rarely needed on a phone and steals ~180px from the
      tab row's scroll area (user feedback 2026-08-16). Only the close ✕
-     stays, flush right in the nav row. Desktop untouched (frame scoped). */
-  [data-mobile-nav="frame"] [aria-modal="true"] [class$="_header"] [class$="_actions"] {
+     stays, flush right in the nav row. Desktop untouched (phone gate). */
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_header"] [class$="_actions"] {
     display: none !important;
   }
-  [data-mobile-nav="frame"] [aria-modal="true"] [class$="_header"] [class$="_actions"] [class$="_action"] {
+  html:has([data-mobile-nav="frame"]) [aria-modal="true"]:has([class$="_navList"]) [class$="_header"] [class$="_actions"] [class$="_action"] {
     font-size: 13px !important;
     padding: 6px 12px !important;
     min-height: 0 !important;

@@ -44,7 +44,7 @@ export declare const RELAY_PREFIX = "/_dsh/zen-remote/relay";
  * host stores the stream verbatim (`saveFileStreamVerbatim` →
  * `publishImmutableObjectStream`, RT dsh-attachment-local lib/index.js
  * ~699-716; the 20 MiB `maxImageBytes` there covers INLINE images only), so
- * there is no host number to mirror and this relay picks its own: 100 MiB
+ * there is no host number to mirror and this relay picks its own: 500 MiB
  * per upload, checked first against `Content-Length` (refused before a byte
  * moves) and then counted while the stream is pumped (a chunked body has no
  * length header — the sub-client's undici forbids hand-set length headers,
@@ -53,11 +53,14 @@ export declare const RELAY_PREFIX = "/_dsh/zen-remote/relay";
  * answer is 413 `payload-too-large`.
  *
  * SLOW-LINK BOUND (T51-fix, for the docs): a single legitimate upload is
- * also bounded in TIME — the host's HTTP server keeps its default 300 s
- * request deadline, and the sub-client's own round-trip budget caps at the
- * same 300 s (relay-client.ts, the T31-fix rule) — so a 100 MiB body needs
- * roughly 2.8 Mbps sustained end to end; slower links fail the call (the
- * client-side refusal keeps the connection state) rather than hanging.
+ * also bounded in TIME. The sub-client's own round-trip budget now caps at
+ * 15 minutes (relay-client.ts, the T31-fix rule), but the HOST's HTTP server
+ * keeps Node's default 300 s request deadline — that is the binding limit:
+ * a 500 MiB body needs roughly 14 Mbps sustained end to end, and a slower
+ * link fails the call (the client-side refusal keeps the connection state)
+ * rather than hanging. Raising the cap past what that deadline can carry
+ * would only move the failure, so 500 MiB is the honest ceiling for the
+ * current transport.
  */
 export declare const MAX_UPLOAD_BYTES: number;
 /** The `/api` route the upload channel dispatches into, verbatim from the
@@ -161,7 +164,7 @@ export interface RelayHandlerOptions {
      * defaults to 5000. Tests inject a small value. */
     endDrainTimeoutMs?: number;
     /** The binary upload channel's byte cap (T51); defaults to
-     * {@link MAX_UPLOAD_BYTES} (100 MiB). Tests inject a small value so the
+     * {@link MAX_UPLOAD_BYTES} (500 MiB). Tests inject a small value so the
      * Content-Length and streaming-count refusals stay cheap to drive. */
     uploadCapBytes?: number;
     /** How long an upload refusal's tail drain may run before the socket is

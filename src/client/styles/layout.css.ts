@@ -394,7 +394,14 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
      display:none rule below, and the user can no longer type a path
      (issue #12, 2026-08-16). The picker family keeps the official layout
      on mobile in every mode. */
-  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])):not(:has([class*="ZuhsRW"])) {
+  /* DSH 0.2.1-rc.2 renders this dialog as a body PORTAL
+     (body > overlay > panel), so the placement below must key off the nav
+     list the panel owns, not off a guessed child depth: that is both the
+     stable "this is the settings sheet" anchor and the reason the safe-area
+     offset below still applies inside the portal (the constants live on
+     :root, so they cross the portal boundary). The bottom inset is
+     subtracted too — a tall panel must not run under the home indicator. */
+  [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])):not(:has([class*="ZuhsRW"])):has([class$="_navList"]) {
     position: absolute !important;
     left: 8px !important;
     /* Fixed top (no translateY): a transform on the panel combined with the
@@ -405,11 +412,11 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
     width: calc(100vw - 16px) !important;
     max-width: calc(100vw - 16px) !important;
     /* Height follows the content (no dead space under a short page); it
-       caps at 100dvh-24 (less the safe-area top) and the options area
+       caps at 100dvh-24 (less both safe-area insets) and the options area
        scrolls only then. */
     height: auto !important;
-    max-height: min(800px, calc(100vh - 24px - var(--mnav-sat))) !important;
-    max-height: min(800px, calc(100dvh - 24px - var(--mnav-sat))) !important;
+    max-height: min(800px, calc(100vh - 24px - var(--mnav-sat) - var(--mnav-sab))) !important;
+    max-height: min(800px, calc(100dvh - 24px - var(--mnav-sat) - var(--mnav-sab))) !important;
     flex-direction: column !important;
     border-radius: 14px !important;
     animation: dsh-mobile-nav-sheet-in .22s var(--ds-ease-out, ease-in-out);
@@ -457,14 +464,24 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
      (config file + close) is reparented INTO this nav row by a client
      effect (MobileNavOverlay), so the tab list must be anchored by its
      class, NOT by :last-child (the reparented toolbar becomes the nav's
-     new last child). */
+     new last child).
+
+     2026-10-21 (DSH 0.2.1-rc.2): this rule used to declare
+     "flex-wrap: wrap; overflow: visible" on top of the flex/min-width/gap
+     above. Because it is one class-anchored compound selector with a much
+     higher specificity than compat.css.ts's portal-scoped navList rule, it
+     silently won the tie and the tab list wrapped into two rows — with the
+     reparented ✕ vertically centred across both of them. Measured on a
+     phone shell: the list was 86px tall (two rows) instead of one 40px row,
+     and it scrolled nowhere. The wrap was a 2026-08-16 trade-off (show every
+     tab, no hidden scroll cut-off); with the thin scrollbar affordance now
+     in compat.css.ts the single scrolling row is the better trade, so the
+     two declarations live there and this rule no longer contradicts them. */
   [aria-modal="true"]:has(> :first-child > :last-child > button):not(:has([role="navigation"])):not(:has([class*="ZuhsRW"])) > :first-child [class$="_navList"] {
     flex: 1 1 auto !important;
     min-width: 0 !important;
     flex-direction: row !important;
-    flex-wrap: wrap !important;
     gap: 6px !important;
-    overflow: visible !important;
   }
   /* Content toolbar (Open configuration file + close): grouped flush to
      the right edge, and reparented INTO the nav row on mobile so it shares

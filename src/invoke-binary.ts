@@ -17,8 +17,14 @@
 export const BINARY_MARKER = '$zr-u8'
 
 /** 结果里带二进制的方法（`namespace/method`）。请求侧参数不带二进制
- * （readBytes 的参数是 scope/paths），故只有结果方向需要标记。 */
-export const INVOKE_BINARY_RESULT_METHODS: ReadonlySet<string> = new Set(['workspaceFiles/readBytes'])
+ * （readBytes 的参数是 scope/paths），故只有结果方向需要标记。
+ * `officeToPdf/render`（2.2.6）返回的 `data` 是整份 PDF 字节：同一个
+ * JSON 通道会把 typed array 压扁，客户端严格编解码当场拒绝——登记进来
+ * 后服务端按同一标记写出、客户端按同一标记还原。 */
+export const INVOKE_BINARY_RESULT_METHODS: ReadonlySet<string> = new Set([
+  'workspaceFiles/readBytes',
+  'officeToPdf/render',
+])
 
 /** 深度上限：与其余 walker（share-store 祖先链、会话引用扫描）一致。 */
 const MAX_DEPTH = 16
