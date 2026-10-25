@@ -1644,3 +1644,111 @@ test('T62 current-session: no sink (host role / remoteStatusOnly, or a sinkless 
     await closeServer(sinkless.server)
   }
 })
+
+// ---- PR29: client/network-hint ---------------------------------------------------
+//
+// The network-restored fast path's glue: the browser POSTs a hint, the route
+// asks the relay client's probeHealth() (one authenticated GET /ping) and
+// only a reachable host earns networkRestored(). The fakes below give the
+// handler exactly that surface — the same wiring the T34 remote-status tests
+// use.
+
+test('PR29 network-hint: the wall order holds — GET is 405 + Allow: POST, a cross-site POST is 403', async () => {
+  const row = makeRow()
+  let probes = 0
+  const relay = fakeRelay({
+    state: 'offline',
+    probeHealth: async () => { probes += 1; return true },
+    networkRestored: () => true,
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const get = await request(port, { method: 'GET', path: routes.CLIENT_NETWORK_HINT_ROUTE })
+    assert.equal(get.status, 405)
+    assert.equal(get.headers.allow, 'POST')
+
+    const cross = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_NETWORK_HINT_ROUTE,
+      headers: { origin: 'http://evil.example' },
+      body: {},
+    })
+    assert.equal(cross.status, 403)
+    assert.equal(JSON.parse(cross.body).error.code, 'origin-rejected')
+    assert.equal(probes, 0, 'nothing got past the walls — the relay was never asked')
+  } finally { await closeServer(server) }
+})
+
+test('PR29 network-hint: no relay client reads 503 unavailable', async () => {
+  const row = makeRow()
+  const { server, port } = await startClientServer(row)
+  try {
+    const res = await request(port, { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, headers: sameOrigin(port), body: {} })
+    assert.equal(res.status, 503)
+    assert.equal(JSON.parse(res.body).error.code, 'unavailable')
+  } finally { await closeServer(server) }
+})
+
+test('PR29 network-hint: a failed probe answers reachable:false and NEVER reconnects', async () => {
+  const row = makeRow()
+  let restoredCalls = 0
+  const relay = fakeRelay({
+    state: 'offline',
+    probeHealth: async () => false,
+    networkRestored: () => { restoredCalls += 1; return true },
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, headers: sameOrigin(port), body: {} })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true, reachable: false, reconnected: false })
+    assert.equal(restoredCalls, 0, 'an unreachable host earns NO reconnect — the sentinel branch')
+  } finally { await closeServer(server) }
+})
+
+test('PR29 network-hint: a reachable host plus an accepted hint answers reconnected:true', async () => {
+  const row = makeRow()
+  let restoredCalls = 0
+  const relay = fakeRelay({
+    state: 'offline',
+    probeHealth: async () => true,
+    networkRestored: () => { restoredCalls += 1; return true },
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, headers: sameOrigin(port), body: {} })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true, reachable: true, reconnected: true })
+    assert.equal(restoredCalls, 1, 'exactly one networkRestored round')
+  } finally { await closeServer(server) }
+})
+
+test('PR29 network-hint: a reachable host but a refused hint (the 3s gap) answers reconnected:false', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    state: 'offline',
+    probeHealth: async () => true,
+    networkRestored: () => false,
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    const res = await request(port, { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, headers: sameOrigin(port), body: {} })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true, reachable: true, reconnected: false }, 'the refusal is honest — reachable, just gapped')
+  } finally { await closeServer(server) }
+})
+
+test('PR29 network-hint: the route reads the relay client LIVE — the getter is asked per request', async () => {
+  const row = makeRow()
+  let relay
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay })
+  try {
+    // Undefined now: the same mount answers 503...
+    const missing = await request(port, { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, headers: sameOrigin(port), body: {} })
+    assert.equal(missing.status, 503)
+    // ...and the NEXT request sees the client that appeared in between.
+    relay = { probeHealth: async () => true, networkRestored: () => true }
+    const appeared = await request(port, { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, headers: sameOrigin(port), body: {} })
+    assert.deepEqual(JSON.parse(appeared.body), { ok: true, reachable: true, reconnected: true })
+  } finally { await closeServer(server) }
+})
