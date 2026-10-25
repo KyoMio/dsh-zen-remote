@@ -28,8 +28,21 @@ const ROOT = '[data-slot="conversation.composer.bar"] > [class$="_root"]'
 const RING_W = '30px'
 /** DSH 0.1.7's wrapper around input.right + input.model inside `_trailing`. */
 const STD = `${ROW} > [class$="_trailing"] > [class$="_standardControls"]`
-/** The model seat's own root inside the trailing group (long form so it beats the <=1023px pill rules in layout.css.ts). */
-const MODEL = `${STD} > [data-slot="conversation.input.model"] > [class$="_root"]`
+/**
+ * The model seat's content, whichever plugin owns it: officially ModelSelect's
+ * `_root`, but a third party can replace the whole `conversation.input.model`
+ * slot (…codex-ui mounts its own selector there), and a subagent session has
+ * nothing matching `_root` at all. Spelled `*:not(…)` rather than bare `> *`
+ * on purpose: `:not([data-mobile-nav])` carries the same (0,1,0) the old
+ * `[class$="_root"]` did, keeping every rule below a full attribute CLASS
+ * ahead of the ≤1023px pill rules in layout.css.ts — their `[data-phase] …
+ * :has(…)` forms measure (0,6,1) on the trigger and (0,7,1) on the label
+ * with `!important`, so a bare `> *` would leave the phone winning by
+ * exactly one class on every MODEL-derived rule, one upstream attr away
+ * from losing. The :not() also keeps this plugin's own nodes from ever
+ * reading as the model seat, should one ever be mounted there.
+ */
+const MODEL = `${STD} > [data-slot="conversation.input.model"] > *:not([data-mobile-nav])`
 /** The permission select's trigger button (structure only — the PermissionSelect hashed classes are never named). */
 const PERM = `${ROW} > [class$="_tools"] > [class$="_modes"]`
 /**
@@ -63,6 +76,14 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
    composer (caught on a live deploy, 2026-08-17): the button that drives it is
    phone-only, but the input it drives is in the DOM at all widths. */
 [data-mobile-nav="attach-picker"] {
+  display: none !important;
+}
+/* The ⋯ composer-more trigger and its sheet (effects/model-sheet-extras.ts)
+   — same every-width default as the picker above: the phone block below
+   re-shows each in its place (dock rail / fixed layer); the desktop shell
+   keeps neither. */
+[data-mobile-nav="composer-more"],
+[data-mobile-nav="composer-more-layer"] {
   display: none !important;
 }
 
@@ -260,7 +281,8 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      caps the pill so the row's elastic gap survives extreme model ids;
      the label rules below override the <=1023px grow rules in
      layout.css.ts (flex 1 1 auto) that would otherwise pad the pill. */
-  ${MODEL} > [class$="_trigger"] {
+  ${MODEL} > [class$="_trigger"],
+  ${MODEL} > button {
     background: var(--dsw-specific-selector, rgba(127, 127, 127, .12)) !important;
     height: 30px !important;
     width: auto !important;
@@ -284,6 +306,18 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   ${MODEL} > [class$="_trigger"] > [class$="_triggerEffort"] {
     display: block !important;
     flex: none !important;
+    white-space: nowrap !important;
+  }
+  /* Third-party model selectors (…codex-ui) render a bare <button> with no
+     _trigger classes and text straight inside it; give that button the same
+     shrink+truncate contract the official label gets, so a long model id
+     ellipsizes instead of stretching the row. The official trigger also
+     matches this (harmless: it already ellipsizes its own label). */
+  ${MODEL} > button {
+    max-width: 100% !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
     white-space: nowrap !important;
   }
   /* PermissionSelect wraps its trigger in the Menu primitive's root span,
@@ -353,31 +387,32 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 12px !important;
     font-size: 15px !important;
   }
-  /* --- 4a. third-party composer entries live in the model sheet ---
-     effects/model-sheet-extras.ts parks the \`conversation.input.right\`
-     container inside the model menu while that menu is open and puts it back
-     when it closes; these rules are the two halves of that trip.
+  /* --- 4a. third-party composer entries live in the ⋯ sheet ---
+     effects/model-sheet-extras.ts collects the composer's secondary controls
+     (input.right, input.left, and anything a third party parks directly into
+     _tools / _standardControls / _trailing / _row) and, while the
+     [data-mobile-nav="composer-more-layer"] sheet is open, moves the REAL
+     nodes into its [data-zen-sheet-extras] list.
 
-     In the row: hidden, but ONLY once the effect has marked the container as
-     one it manages. Keying the hide off the marker rather than off "not
-     currently parked" is what makes the failure direction safe — if the
-     effect declines to act (nothing in the slot but the vision toggle, so
-     nothing worth moving) or never runs at all, the marker is absent, this
-     rule does not match, and the controls stay exactly where the host put
-     them. The inverse spelling hid them in the row whenever they were not in
-     the sheet, which in those same cases left them reachable from neither
-     place (caught in review, 2026-09-06).
-     Hiding by ancestor rather than by a display rule on the container itself
-     is what lets the parked copy style itself freely — same element, two
-     homes, two rule sets. \`!important\` because the slot container carries an
-     inline \`display: contents\`. */
-  ${STD} > [data-slot="conversation.input.right"][data-zen-sheet-extras] {
+     In the row: hidden, but ONLY once the effect has marked them. Two opt-in
+     markers, both written by the effect: the input.right CONTAINER gets
+     data-zen-sheet-extras (so an emptied wrapper leaves no flex gap), and
+     every collected node gets data-zen-composer-extra. Visibility comes back
+     the moment a node is parked (="open") or the effect releases it (marker
+     removed) — a version of the effect that declines to act, or never runs
+     at all, leaves every control exactly where the host put it; nothing can
+     end up hidden from both places at once (the 2026-09-06 review's rule). */
+  [data-slot="conversation.input.right"][data-zen-sheet-extras],
+  [data-zen-composer-extra]:not([data-zen-composer-extra="open"]) {
     display: none !important;
   }
-  /* Parked in the sheet: a column of full-width rows in the sheet's own
-     language, so a relocated control reads as a sibling of 模型 and 推理等级
-     rather than a chip that wandered in. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] {
+  /* The ⋯ sheet's list: a column of full-width rows in the sheet's own
+     language, so a relocated control reads as a cell of the sheet rather
+     than a chip that wandered in. Written against the bare marker: inside
+     the layer the list is its only carrier, and the generic spelling keeps
+     the rules true for the row container too, where they are masked by the
+     opt-in hide above (0,2,0 beats this 0,1,0). */
+  [data-zen-sheet-extras] {
     display: flex !important;
     flex-direction: column !important;
     gap: 2px !important;
@@ -387,14 +422,14 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      the 48px the sheet's own cells use. \`> * > *\` reaches both shapes without
      naming either plugin — subscriptions wraps its trigger in a positioning
      div, vision-router puts its button straight in the slot. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] > *,
-  ${MODEL_MENU} > [data-zen-sheet-extras] > * > button {
+  [data-zen-sheet-extras] > *,
+  [data-zen-sheet-extras] > * > button {
     width: 100% !important;
     max-width: none !important;
     min-width: 0 !important;
     justify-content: flex-start !important;
   }
-  ${MODEL_MENU} > [data-zen-sheet-extras] button {
+  [data-zen-sheet-extras] button {
     box-sizing: border-box !important;
     min-height: 48px !important;
     height: auto !important;
@@ -411,21 +446,16 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     text-align: left !important;
     justify-content: flex-start !important;
   }
-  /* Order comes from the row (compat.css.ts puts the vision toggle at 5 so it
-     parks beside the context ring), and that rule still matches in here on
-     ≤ 0.1.2 — the inline sheet is a DOM descendant of the composer bar even
-     though it paints as a fixed layer (the 0.1.5 body portal is not, where
-     this is a harmless no-op). Reset it so the sheet follows DOM order
-     instead of inheriting a decision that was about a different layout. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] > * {
+  /* Parked controls keep no row ordering — the sheet follows DOM order. */
+  [data-zen-sheet-extras] > * {
     order: 0 !important;
   }
   /* The vision toggle is squeezed to a 28px icon in the row (compat.css.ts);
      in the sheet it is a row, so its label comes back and the icon leads. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > span {
+  [data-zen-sheet-extras] [data-vision-router-mode-toggle] > span {
     display: inline !important;
   }
-  ${MODEL_MENU} > [data-zen-sheet-extras] [data-vision-router-mode-toggle] > svg:first-of-type {
+  [data-zen-sheet-extras] [data-vision-router-mode-toggle] > svg:first-of-type {
     width: 18px !important;
     height: 18px !important;
   }
@@ -433,10 +463,9 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      trigger. Inside the sheet — which is \`overflow: hidden\` so its rounded
      top clips its content — that menu would be cut off. Same escape section 4
      uses for the host's two menus: position: fixed leaves the clip behind
-     (the sheet sets \`transform: none\`, so nothing between here and the
-     viewport captures fixed positioning) and it lands as its own sheet on top
-     of this one. */
-  ${MODEL_MENU} > [data-zen-sheet-extras] [role="menu"] {
+     (the sheet sets \`transform: none\` on entrance) and it lands as its own
+     sheet on top of this one. */
+  [data-zen-sheet-extras] [role="menu"] {
     position: fixed !important;
     left: 0 !important;
     right: 0 !important;
@@ -451,16 +480,55 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 16px 16px 0 0 !important;
     border-bottom: none !important;
     padding: 8px 8px calc(8px + var(--mnav-sab)) !important;
-    /* Above the model sheet it sits on (60, section 4), below the session-info
-       sheet's 70 (info.css.ts) — it is a child of the model sheet, not a peer
+    /* Above the ⋯ sheet it sits on (60, below), below the session-info
+       sheet's 70 (info.css.ts) — it is a child of the ⋯ sheet, not a peer
        of the page's own layers. */
     z-index: 61 !important;
     box-shadow: 0 -8px 32px rgba(0, 0, 0, .18) !important;
   }
-  ${MODEL_MENU} > [data-zen-sheet-extras] [role="menu"] [role="menuitemradio"] {
+  [data-zen-sheet-extras] [role="menu"] [role="menuitemradio"] {
     min-height: 48px !important;
     border-radius: 12px !important;
     font-size: 15px !important;
+  }
+  /* The ⋯ sheet itself: fixed, full-width, rising from the bottom edge — the
+     same geometry section 4 gives the host's two menus. It hangs under the
+     composer BAR (inside #root, outside the official column), so it cannot
+     outlive the composer it was opened from. The every-width default-hidden
+     rule at the top of this file is beaten here by the later display: block.
+     z 60 = the perm/model sheets' level; a menu a parked control portals to
+     the body (z 100+) naturally outranks it, and an inline one takes the
+     fixed z-61 escape above. */
+  [class$="_composerSeat"]:has([data-mobile-nav="composer-more-layer"]) {
+    z-index: 60 !important;
+  }
+  [data-mobile-nav="composer-more-layer"] {
+    display: block !important;
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+  }
+  [data-mobile-nav="composer-more-mask"] {
+    position: absolute;
+    inset: 0;
+    border: none;
+    background: var(--dsw-alias-bg-mask-3, rgba(0, 0, 0, .45));
+    animation: dsh-mobile-nav-fade .18s var(--ds-ease-out, ease-in-out);
+  }
+  [data-mobile-nav="composer-more-sheet"] {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-height: min(70dvh, 520px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    box-sizing: border-box;
+    padding: 8px 8px calc(8px + var(--mnav-sab));
+    border-radius: 16px 16px 0 0;
+    background: var(--dsw-alias-bg-layer-2, #ffffff);
+    box-shadow: 0 -8px 32px rgba(0, 0, 0, .18);
+    animation: dsh-mobile-nav-sheet-up .22s var(--ds-ease-out, ease-in-out);
   }
 
   /* --- 4b. the official scroll-to-bottom button must not poke through the
@@ -485,7 +553,9 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   body:has(${MODEL} > [class$="_menu"]) [data-chat-flow] + div,
   body:has(> [id$="-menu"][class$="_menu"]:is([role="menu"], [role="group"])) [data-chat-flow] + div,
   /* T70: the portaled permission menu (marked by effects/permission-sheet.ts). */
-  body:has(> div[role="menu"][data-zen-sheet="perm"]) [data-chat-flow] + div {
+  body:has(> div[role="menu"][data-zen-sheet="perm"]) [data-chat-flow] + div,
+  /* T-issue30: the ⋯ composer-more sheet (effects/model-sheet-extras.ts). */
+  body:has([data-mobile-nav="composer-more-layer"]) [data-chat-flow] + div {
     display: none !important;
   }
   /* --- 5. input box: two lines minimum, five lines maximum ---
@@ -662,6 +732,36 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
     border-radius: 12px !important;
     font-size: 12px !important;
     line-height: 18px !important;
+  }
+
+  /* --- 7b3. the ⋯ composer-more chip (T-issue30) ---
+     effects/model-sheet-extras.ts mounts it at order 0 while the row holds
+     secondary controls worth collecting; with none the trigger does not
+     render at all, so an empty rail costs zero. It is an inline pill sharing
+     the scrolling rail with the branch chip — deliberately NOT in 7c's wrap
+     gate, it must never take a line of its own. The 26px cage above still
+     wins where it is !important (height, font size); the declarations here
+     give the pill its border, tint and tap behaviour. */
+  [data-slot="conversation.input.dock"] > [data-mobile-nav="composer-more"] {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    order: 0 !important;
+    flex: 0 0 auto !important;
+    height: 26px;
+    min-width: 32px;
+    padding: 0 10px;
+    border-radius: 999px;
+    border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, .08));
+    background: var(--dsw-alias-bg-layer-2, rgba(0, 0, 0, .04));
+    color: var(--dsw-alias-label-secondary, inherit);
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
 
   /* --- 7c. the queue strip opts OUT of the cage, on a line of its own ---
