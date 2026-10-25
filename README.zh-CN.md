@@ -134,7 +134,7 @@ cd ~/.dsh/profiles/desktop && pnpm install
 
 ## 配置公网访问（主服务端）
 
-装完在本机 `127.0.0.1:3080` 就能用手机界面。要从外面访问：给自己的网关配一个终结 TLS 的反代，用 403 自检确认，再配对设备。nginx / Caddy / Cloudflare Tunnel / Lucky 的完整配置见 [docs/remote-access.md](docs/remote-access.md)，简版：
+装完在本机 `127.0.0.1:3080` 就能用手机界面。要从外面访问：给自己的网关配一个终结 TLS 的反代，用 403 自检确认，再配对设备。nginx / Caddy / Cloudflare Tunnel / Lucky 的完整配置见 [docs/remote-access.md](docs/remote-access.md)。**不想手配？**服务端插件详情页有「让手机连上来」配置引导，三步走完下面的主流路线（托管 Caddy + DNS-01 证书、现有反代的片段生成与验证、全自动 Cloudflare Tunnel）。简版：
 
 1. 网关只监听 `127.0.0.1:3088`，由反代（nginx、Caddy、Cloudflare Tunnel、Lucky）终结 HTTPS 并转发。**自检**：用**手机流量**（别连家里 Wi-Fi）访问 `https://你的域名/lan-gate/admin`，正确结果是 **403**。能看到说明页就代表反代没带 `X-Forwarded-*` 头、公网请求被当成了本机用户——先修转发头再往下走。
 2. 在**服务端这台机器**打开 DSH「插件」页，展开 dsh-zen-remote 设置区块，先选要配的设备角色，再点生成 8 位配对码（10 分钟有效、只能用一次）。

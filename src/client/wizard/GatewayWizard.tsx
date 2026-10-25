@@ -27,20 +27,16 @@ import type { ZenRemoteSettingsForm } from '../../client-data/settings-form.ts'
 import { ADMIN_STATUS_ROUTE, CLIENT_CONFIG_ROUTE } from '../../client-data/settings-form.ts'
 import { qrMatrix } from '../../client-data/qr.ts'
 import {
-  SNIPPET_KINDS,
   WIZARD_STATUS_ROUTE,
   WIZARD_VERIFY_ROUTE,
   configureReadiness,
-  caddySnippetText,
   deriveWizardLights,
   formSeedOf,
   initialStep,
-  luckyStepTexts,
-  nginxSnippetText,
+  isValidPort,
   pairingSecondsLeft,
   upstreamPortOf,
   type LightState,
-  type SnippetKind,
   type WizardPath,
   type WizardStatusBody,
   type WizardStep,
@@ -48,7 +44,10 @@ import {
   type WizardVerifyStart,
 } from '../../client-data/wizard.ts'
 import { NS } from '../locales.ts'
-import { WizardCard } from './WizardCard.tsx'
+import { MigrateCard } from './cards/MigrateCard.tsx'
+import { PortForwardCard } from './cards/PortForwardCard.tsx'
+import { ProxyCard } from './cards/ProxyCard.tsx'
+import { TokenCard } from './cards/TokenCard.tsx'
 
 export interface GatewayWizardProps extends PropsRuntime<'plugins.detail.section'>, PropsLocale<typeof NS> {
   /** The row's staged-form controller — saved-role source of truth. */
@@ -122,8 +121,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [poll, setPoll] = useState<WizardVerifyPoll | undefined>()
   const [notWired, setNotWired] = useState(false)
   const [now, setNow] = useState(() => Date.now())
-  const [card, setCard] = useState<'proxy' | 'token' | undefined>()
-  const [snippetTab, setSnippetTab] = useState<SnippetKind>('nginx')
+  const [card, setCard] = useState<'proxy' | 'token' | 'migrate' | 'portforward' | undefined>()
   const [probedClient, setProbedClient] = useState<boolean | null>(null)
 
   // The saved role, live: a role flip re-renders this away (or back).
@@ -282,12 +280,6 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const lights = deriveWizardLights({ gatewayReachable, poll })
   const verified = poll?.result === 'pass'
   const qr = startResult?.ok === true ? qrMatrix(startResult.publicUrl) : null
-  // The snippet targets the gateway's ACTUAL port (it may have retried
-  // past the configured one), falling back to 3088 before any status lands.
-  const snippetInput = { domain: domain.trim() || 'dsh.example.com', upstreamHost: '127.0.0.1', upstreamPort: upstreamPortOf(wizardStatus) }
-  const snippetText = snippetTab === 'nginx'
-    ? nginxSnippetText(snippetInput)
-    : snippetTab === 'caddy' ? caddySnippetText(snippetInput) : (luckyStepTexts(snippetInput) ?? []).join('\n')
 
   const stepLabel = (name: WizardStep): string => t(name === 'pick' ? 'wizard.step.pick' : name === 'configure' ? 'wizard.step.configure' : 'wizard.step.verify')
 
@@ -383,12 +375,26 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                   onChange={(event) => setCfToken(event.target.value)}
                 />
                 <p className="zr-wizard-hint">{t('wizard.cfTokenHint')}</p>
-                <button type="button" className="zr-wizard-link" disabled={disabled} onClick={() => setCard('token')}>
-                  {t('wizard.cfTokenHowTo')}
-                </button>
+                <div className="zr-wizard-row">
+                  <button type="button" className="zr-wizard-link" disabled={disabled} onClick={() => setCard('token')}>
+                    {t('wizard.cfTokenHowTo')}
+                  </button>
+                  {path === 'cloudflared' ? (
+                    <button type="button" className="zr-wizard-link" disabled={disabled} onClick={() => setCard('migrate')}>
+                      {t('wizard.migrateEntry')}
+                    </button>
+                  ) : null}
+                </div>
               </div>
             </>
           )}
+          {path === 'caddy' && isValidPort(httpsPort.trim()) && httpsPort.trim() !== '443' ? (
+            <p className="zr-wizard-hint">
+              <button type="button" className="zr-wizard-link" disabled={disabled} onClick={() => setCard('portforward')}>
+                {t('wizard.portForwardEntry')}
+              </button>
+            </p>
+          ) : null}
           {formError !== null ? <p className="zr-wizard-notice" data-tone="error">{t(formError === 'bad-domain' ? 'wizard.badDomain' : formError === 'bad-port' ? 'wizard.badPort' : formError === 'missing-token' ? 'wizard.missingToken' : 'wizard.badServerUrl')}</p> : null}
           <div className="zr-wizard-row">
             <button type="button" disabled={disabled} onClick={() => setStep('pick')}>{t('wizard.back')}</button>
@@ -440,46 +446,35 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       ) : null}
 
       {card === 'proxy' ? (
-        <WizardCard
-          title={t('wizard.card.proxyTitle')}
-          copyText={snippetText}
-          copyLabel={t('wizard.card.copy')}
-          copiedLabel={t('wizard.card.copied')}
-          closeLabel={t('wizard.card.close')}
+        <ProxyCard
+          t={t}
+          domain={domain.trim() || 'dsh.example.com'}
+          upstreamPort={upstreamPortOf(wizardStatus)}
+          onCheck={() => {
+            setStep('verify')
+            void startVerification()
+          }}
           onClose={() => setCard(undefined)}
-        >
-          <div className="zr-wizard-cardTabs" data-zen-remote="wizard-card-tabs">
-            {SNIPPET_KINDS.map((kind) => (
-              <button
-                key={kind}
-                type="button"
-                className="zr-wizard-cardTab"
-                data-selected={snippetTab === kind}
-                onClick={() => setSnippetTab(kind)}
-              >
-                {kind}
-              </button>
-            ))}
-          </div>
-          {snippetText === null
-            ? <p className="zr-wizard-cardStep">{t('wizard.badDomain')}</p>
-            : <pre className="zr-wizard-cardCode">{snippetText}</pre>}
-        </WizardCard>
+        />
       ) : null}
 
       {card === 'token' ? (
-        <WizardCard
-          title={t('wizard.card.tokenTitle')}
-          copyText={null}
-          copyLabel={t('wizard.card.copy')}
-          copiedLabel={t('wizard.card.copied')}
-          closeLabel={t('wizard.card.close')}
+        <TokenCard
+          t={t}
+          onUse={(token) => {
+            setCfToken(token)
+            setCard(undefined)
+          }}
           onClose={() => setCard(undefined)}
-        >
-          {(['tokenStep1', 'tokenStep2', 'tokenStep3', 'tokenStep4', 'tokenStep5', 'tokenStep6', 'tokenStep7'] as const).map((key, index) => (
-            <p key={key} className="zr-wizard-cardStep">{`${index + 1}. ${t(`wizard.card.${key}` as Parameters<typeof t>[0])}`}</p>
-          ))}
-        </WizardCard>
+        />
+      ) : null}
+
+      {card === 'migrate' ? (
+        <MigrateCard t={t} onRecheck={() => setCard(undefined)} onClose={() => setCard(undefined)} />
+      ) : null}
+
+      {card === 'portforward' ? (
+        <PortForwardCard t={t} port={Number(httpsPort.trim()) || 8443} onClose={() => setCard(undefined)} />
       ) : null}
     </div>
   )

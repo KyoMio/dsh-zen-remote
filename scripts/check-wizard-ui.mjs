@@ -171,11 +171,38 @@ const WIZARD_KEYS = [
   'wizard.startFailed', 'wizard.startFailedProbe', 'wizard.startFailedRuntime', 'wizard.startFailedGateway',
   'wizard.startFailedPair', 'wizard.startFailedUrl',
   'wizard.remoteOnly', 'wizard.notWired',
-  'wizard.card.proxyTitle', 'wizard.card.tokenTitle', 'wizard.card.copy', 'wizard.card.copied',
-  'wizard.card.close',
+  'wizard.card.proxyTitle', 'wizard.card.proxyCheck', 'wizard.card.tokenTitle', 'wizard.card.copy',
+  'wizard.card.copied', 'wizard.card.close',
   'wizard.card.tokenStep1', 'wizard.card.tokenStep2', 'wizard.card.tokenStep3', 'wizard.card.tokenStep4',
-  'wizard.card.tokenStep5', 'wizard.card.tokenStep6', 'wizard.card.tokenStep7',
+  'wizard.card.tokenStep5', 'wizard.card.tokenStep6', 'wizard.card.tokenStep7', 'wizard.card.tokenStep8',
+  'wizard.card.tokenPerms', 'wizard.card.tokenPermDns', 'wizard.card.tokenPermDnsWhy',
+  'wizard.card.tokenPermTunnel', 'wizard.card.tokenPermTunnelWhy', 'wizard.card.tokenPaste',
+  'wizard.card.tokenUse',
+  'wizard.card.migrateTitle', 'wizard.card.migrateRecheck',
+  'wizard.card.migrateStep1', 'wizard.card.migrateStep2', 'wizard.card.migrateStep3',
+  'wizard.card.migrateStep4', 'wizard.card.migrateStep5', 'wizard.card.migrateStep6',
+  'wizard.card.portForwardTitle',
+  'wizard.card.portForwardStep1', 'wizard.card.portForwardStep2', 'wizard.card.portForwardStep3',
+  'wizard.card.portForwardStep4',
+  'wizard.portForwardEntry', 'wizard.migrateEntry',
 ]
+
+// The cards' step counts are part of the walkthrough contract (GW-11).
+const CARD_STEP_COUNTS = {
+  tokenStep: 8,
+  migrateStep: 6,
+  portForwardStep: 4,
+}
+for (const [prefix, expected] of Object.entries(CARD_STEP_COUNTS)) {
+  const keys = Object.keys(zh).filter((key) => key.startsWith(`wizard.card.${prefix}`))
+  assert.equal(keys.length, expected, `${prefix} has exactly ${expected} steps, got ${keys.join(', ')}`)
+  for (let i = 1; i <= expected; i++) {
+    assert.ok(keys.includes(`wizard.card.${prefix}${i}`), `missing step ${prefix}${i}`)
+  }
+}
+// The placeholder interpolation the port-forward steps promise.
+assert.ok(zh['wizard.card.portForwardStep3'].includes('{port}'), 'step 3 interpolates the port')
+assert.ok(en['wizard.card.portForwardStep3'].includes('{port}'), 'step 3 interpolates the port (en)')
 
 await test('zh/en carry identical key sets, and every wizard key exists in both', () => {
   assert.deepEqual(Object.keys(zh).sort(), Object.keys(en).sort(), 'zh is the key-set source of truth')
