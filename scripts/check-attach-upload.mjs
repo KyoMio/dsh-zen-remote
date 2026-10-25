@@ -11,6 +11,7 @@
 //
 // Run: node scripts/check-attach-upload.mjs   (needs Node >= 23.6 type stripping)
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import {
   UPLOAD_DIR,
   UPLOAD_ROUTE,
@@ -132,5 +133,46 @@ assert.equal(long.length, 18)
 assert.ok(long.startsWith('quarterly'), long)
 assert.ok(long.endsWith('.pdf'), long)
 assert.ok(long.includes('…'))
+
+// ---- static regression: the #31 attach restore ------------------------------
+// The host-attach stand-down is gone for good (#31: DSH 0.2.x kept the hidden
+// <input type="file"> after moving the paperclip into the "+" menu, so the
+// probe matched everywhere and the phone lost its only attach affordance).
+// The probe file must stay deleted, the two components must not reference it,
+// and composer.css.ts must keep hiding the second official _add paperclip
+// that DSH ≤ 0.1.5 still renders below 768px.
+assert.equal(
+  fs.existsSync(new URL('../src/client/host-attach.ts', import.meta.url)),
+  false,
+  'src/client/host-attach.ts must stay deleted (the removed stand-down probe)',
+)
+for (const rel of ['../src/client/MobileAttachButton.tsx', '../src/client/MobileAttachChips.tsx']) {
+  const source = fs.readFileSync(new URL(rel, import.meta.url), 'utf8')
+  assert.ok(
+    !source.includes('useOwnAttachUi') && !source.includes('host-attach'),
+    `${rel} must not reference the removed host-attach stand-down`,
+  )
+}
+// The hide rule must live in the PHONE media block only — desktop (>= 768px)
+// keeps the official paperclip untouched, so match inside the 767px block.
+const composer = fs.readFileSync(new URL('../src/client/styles/composer.css.ts', import.meta.url), 'utf8')
+const phoneStart = composer.indexOf('@media (max-width: 767px)')
+const phoneEnd = composer.indexOf('@media (min-width: 768px)')
+assert.ok(
+  phoneStart !== -1 && phoneEnd !== -1 && phoneStart < phoneEnd,
+  'composer.css.ts phone/desktop media blocks not found in expected order',
+)
+assert.match(
+  composer.slice(phoneStart, phoneEnd),
+  /\$\{ROW\} > \[class\$\="_tools"\] > button\[class\$\="_add"\]:nth-of-type\(2\)\s*\{[^}]*display: none !important/,
+  'composer.css.ts must hide the second official _add paperclip below 768px (#31)',
+)
+// The subagent gate must stay: the host disables its own file input while a
+// subagent session is open, so ours stands down with it (#31 review).
+assert.ok(
+  fs.readFileSync(new URL('../src/client/MobileAttachButton.tsx', import.meta.url), 'utf8')
+    .includes("row?.origin === 'subagent'"),
+  'MobileAttachButton must gate the paperclip off on subagent sessions',
+)
 
 console.log('ATTACH UPLOAD CHECK OK')
