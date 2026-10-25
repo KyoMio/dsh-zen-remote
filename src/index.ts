@@ -15,7 +15,7 @@
  * the package.json dsh.client declaration.
  */
 
-import { createOwnerPeerSource } from './owner-peer.js'
+import { createOwnerPeerSource, createSharedApiFetchGetter } from './owner-peer.js'
 import { lstat, mkdir, open, realpath, rm, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -377,50 +377,15 @@ async function openUnique(directory: string, filename: string): Promise<{ handle
 }
 
 /**
- * What {@link writeUpload} reads an upload body from: the declared
- * Content-Length (when the request carried one) and the byte stream itself.
- * An `IncomingMessage` satisfies it directly; the relay's workspace-upload
- * save (RD-7) synthesizes one over a web `ReadableStream`.
- */
-type UploadBodySource = { headers: { 'content-length'?: string | undefined } } & AsyncIterable<unknown>
-
-/**
- * Adapt a web `ReadableStream` (the relay workspace-upload pump's body) to
- * the source shape {@link writeUpload} reads: no declared length (a chunked
- * upstream has none — the pump's own count is the size gate), and the
- * caller's abort surfaces as a thrown upload so the partial file is
- * unlinked, never left half-written.
- */
-function uploadBodyFromStream(body: ReadableStream<Uint8Array> | null, signal?: AbortSignal): UploadBodySource {
-  return {
-    headers: {},
-    [Symbol.asyncIterator]: async function* () {
-      if (body === null) return
-      const reader = body.getReader()
-      try {
-        for (;;) {
-          const next = await reader.read()
-          if (signal?.aborted) throw new UploadError(400, 'aborted', 'upload aborted by the requester')
-          if (next.done) return
-          yield next.value
-        }
-      } finally {
-        reader.releaseLock()
-      }
-    },
-  }
-}
-
-/**
- * Stream the upload body onto disk under a running byte cap.
- * @param req - the body source (an IncomingMessage, or an adapted stream).
+ * Stream the request body onto disk under a running byte cap.
+ * @param req - the request whose body is the file.
  * @param directory - canonical upload directory.
  * @param filename - sanitized leaf name.
  * @param maxBytes - hard cap; exceeding it aborts and unlinks.
  * @returns the absolute path written and its byte count.
  */
 async function writeUpload(
-  req: UploadBodySource,
+  req: IncomingMessage,
   directory: string,
   filename: string,
   maxBytes: number,
@@ -852,23 +817,13 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // the registry dsh-client-ui-deliverables' changes routes register
       // into), so a synthetic Request reaches the serving functions directly:
       // no loopback HTTP, no login state. A composition without the service
-      // answers the relay route 501 instead.
-      const getApiFetch = (): ((request: Request) => Promise<Response>) | undefined => {
-        const connection = relayCtx.reflect.get('connection') as
-          | { createSharedFetchHandler?: (channel: string) => { fetch?: (request: Request) => Promise<Response> } }
-          | undefined
-        const handler = connection?.createSharedFetchHandler?.('/api')
-        const fetch = handler?.fetch
-        return typeof fetch === 'function' ? (request) => fetch.call(handler, request) : undefined
-      }
-      // The server's interface fingerprints (T42): recomputed at EVERY
-      // handshake, deliberately uncached — the typert loader registers
-      // package by package asynchronously, so a client that auto-reconnects
-      // right after a server restart would otherwise handshake a half-empty
-      // registry and pin those throwaway values for the row's lifetime.
-      // ~7 ms per computation against a full registry; a failed compute
-      // lands as the empty map inside the relay handler's own guard.
+      // answers the relay route 501 instead. DSH 0.2.1-rc.3: the handler's
+      // fetch takes the requesting Peer as a second argument and refuses
+      // everything but the owner (a missing peer there throws TypeError,
+      // surfacing as a 502 on every relayed /api call) — the dispatcher
+      // forwards the cached owner Peer below; pre-rc.3 hosts ignore it.
       const relayPeer = createOwnerPeerSource(() => relayCtx.reflect.get('connection'))
+      const getApiFetch = createSharedApiFetchGetter(() => relayCtx.reflect.get('connection'), relayPeer)
       relayCtx.effect(() => {
         // The plugin bridge's loopback facts (PB-3), both read PER REQUEST
         // through the reflection layer: the web server may have restarted on
@@ -896,48 +851,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // the PB-10 tunnel): a single cookie cache behind two consumers.
         const pluginLoopback = createPluginLoopback({ getTarget: getLoopbackTarget, getTokenUrl })
         const pluginConsent = () => resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent
-        // RD-7: the workspace-upload channel's save — the S7 upload internals
-        // (sessionUploadRoot + writeUpload + safeUploadName) pointed at the
-        // session the relay's share check just judged. sessions is read PER
-        // REQUEST through the reflection layer (the same discipline as
-        // getApiFetch above: adding it to the inject list would keep the
-        // whole relay prefix off compositions that lack the service), and
-        // maxUploadBytes is a volatile row field re-read per save — an edit
-        // applies without waiting for a row reload.
-        const workspaceUploads = {
-          save: async (input: {
-            sessionId: string
-            name?: string
-            body: ReadableStream<Uint8Array> | null
-            signal?: AbortSignal
-          }): Promise<{ relPath: string; absolutePath: string; filename: string; bytes: number }> => {
-            const rawMax: unknown = unwrapVolatile(config.maxUploadBytes)
-            const maxBytes = typeof rawMax === 'number' && Number.isFinite(rawMax) && rawMax > 0
-              ? rawMax
-              : DEFAULT_MAX_UPLOAD_BYTES
-            const sessions = relayCtx.reflect.get('sessions') as Context['sessions'] | undefined
-            if (sessions === undefined) {
-              throw new UploadError(404, 'session-not-found', 'no sessions service in this composition')
-            }
-            const root = await sessionUploadRoot({ sessions } as Context, input.sessionId)
-            const filename = safeUploadName(input.name ?? '')
-            const written = await writeUpload(uploadBodyFromStream(input.body, input.signal), root.writeRoot, filename, maxBytes)
-            const leaf = basename(written.path)
-            return {
-              relPath: `${UPLOAD_DIR}/${leaf}`,
-              absolutePath: join(root.visibleRoot, leaf),
-              filename: leaf,
-              bytes: written.bytes,
-            }
-          },
-        }
         const handler = createRelayHandler({
           secret: relaySecret,
           store,
           gateway: gatewayService,
           getApiFetch,
-          // RD-7: the workspace-upload channel's server half (see above).
-          workspaceUploads,
           // DSH 0.2.1-alpha.3: one cached owner/answer Peer for every relay
           // gateway call — `$events/result` must come from the Peer that
           // opened `$events`.
@@ -953,6 +871,14 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             // snapshotted from the resolveConfig call above.
             serverName: () => resolveConfig(config, readFileConfig(), process.env).values.serverName,
             dshVersion: resolveDshVersion(),
+            // The server's interface fingerprints (T42): recomputed at EVERY
+            // handshake, deliberately uncached — the typert loader registers
+            // package by package asynchronously, so a client that
+            // auto-reconnects right after a server restart would otherwise
+            // handshake a half-empty registry and pin those throwaway values
+            // for the row's lifetime. ~7 ms per computation against a full
+            // registry; a failed compute lands as the empty map inside the
+            // relay handler's own guard.
             fingerprints: () => computeFingerprints(relayCtx),
             // PB-2: the plugin bridge table, rebuilt FRESH at every handshake
             // from the PB-1 registry and the row's consent map — both live:

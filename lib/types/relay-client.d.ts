@@ -240,21 +240,6 @@ export interface RelayClient {
      * `Content-Length`, when it had one) and a timeout there never moves the
      * connection state — the invoke route's rules (T31-fix). */
     upload(options: RelayUploadOptions, signal?: AbortSignal): Promise<RelayHttpResult>;
-    /** One workspace-upload round-trip (RD-7): `sessionId` is the ORIGINAL
-     * session id, `name` the optional display filename, `body` the raw byte
-     * stream forwarded verbatim; the SERVER writes the bytes into that
-     * session's workspace `.dsh-uploads/` and answers a receipt. Resolves with
-     * the parsed receipt; every refusal (a 501 from an unwired server, a
-     * not-shared session, an oversize body) or link death throws RelayError.
-     * The round-trip budget scales with `bytes` and a timeout there never
-     * moves the connection state — the invoke route's rules (T31-fix), same
-     * as {@link upload}. */
-    workspaceUpload(options: {
-        sessionId: string;
-        name?: string;
-        body: ReadableStream<Uint8Array> | null;
-        bytes?: number;
-    }, signal?: AbortSignal): Promise<RelayWorkspaceUploadResult>;
     /** One bridged-plugin round-trip (PB-4): the coordinates travel in the
      * x-zr-* headers (PB-3's protocol), no body. Resolves with the UNREAD
      * fetch Response the moment the headers arrive — the caller streams the
@@ -345,15 +330,6 @@ export interface RelayHttpResult {
     /** The underlying response body, decoded as text (both registered routes
      * answer buffered JSON). */
     body: string;
-}
-/** The receipt one {@link RelayClient.workspaceUpload} round-trip carries
- * (RD-7): where the file landed in the server session's workspace — relPath
- * is what the drop flow mentions in the composer draft. */
-export interface RelayWorkspaceUploadResult {
-    relPath: string;
-    absolutePath: string;
-    filename: string;
-    bytes: number;
 }
 /**
  * The credential digest recorded beside a completed handshake (T23a-fix):

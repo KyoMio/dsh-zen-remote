@@ -242,7 +242,7 @@ export declare const zh: {
     readonly 'settings.client.diagCompatGroups': "指纹有差异的组：{groups}";
     readonly 'settings.client.diagCompatCalls': "最近的不兼容调用";
     readonly 'settings.client.diagRemoteDrop': "远程拖拽守卫";
-    readonly 'settings.client.diagRemoteDropOk': "已安装 · 拦截 {intercepted} · 已上传 {uploaded} · 失败 {failed} · 文件夹 {blocked} · 放行 {passthrough}";
+    readonly 'settings.client.diagRemoteDropOk': "已安装 · 拦截 {intercepted} · 重派发 {redispatched} · 文件夹 {blocked} · 放行 {passthrough} · 重包失败 {failed}";
     readonly 'settings.client.diagRemoteDropOff': "未安装（{reason}）";
     readonly 'settings.client.diagUploadRedirect': "上传改道";
     readonly 'settings.client.diagUploadRedirectOk': "已安装 · 上传已接管";
@@ -284,9 +284,6 @@ export declare const zh: {
     readonly remoteGroupUnpaired: "（已解除配对）";
     readonly remoteGroupMismatch: "（版本有差异）";
     readonly remoteDropFolderBlocked: "远程会话暂不支持拖入文件夹";
-    readonly remoteDropUploading: "正在上传到服务端…";
-    readonly remoteDropInserted: "已插入 {name}";
-    readonly remoteDropFailed: "上传失败：{code}";
     readonly downloadToLocal: "下载到本机";
     readonly downloadBusy: "下载中…";
     readonly downloadFailed: "下载失败";

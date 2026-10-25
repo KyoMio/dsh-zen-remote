@@ -22,7 +22,6 @@ const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM = '/_dsh/zen-remote/relay/v1/stream'
 const UNSHARE = '/_dsh/zen-remote/relay/v1/unshare'
 const UPLOAD = '/_dsh/zen-remote/relay/v1/upload'
-const WORKSPACE_UPLOAD = '/_dsh/zen-remote/relay/v1/workspace-upload'
 const DEVICE_NAME = '/_dsh/zen-remote/relay/v1/device/name'
 
 const HANDSHAKE_OK = () => [200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: '假服务器', dshVersion: '9.9.9-test', fingerprints: { algo: 'sha256' } }]
@@ -47,7 +46,6 @@ function startFakeRelay() {
     stream: undefined,
     unshare: () => [200, { ok: true }],
     upload: () => [200, { ok: true, value: { status: 200, contentType: 'application/json; charset=utf-8', body: JSON.stringify({ ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'att-1', name: 'note.txt', bytes: 5 } } }) } }],
-    workspaceUpload: () => [200, { ok: true, value: { relPath: '.dsh-uploads/note.txt', absolutePath: '/srv/ws/.dsh-uploads/note.txt', filename: 'note.txt', bytes: 5 } }],
     deviceName: (req, res, body) => [200, { ok: true, name: body && typeof body.name === 'string' ? body.name : '' }],
   }
   const server = http.createServer((req, res) => {
@@ -78,13 +76,6 @@ function startFakeRelay() {
         // T51: the binary channel — the body is raw bytes, never JSON. Same
         // scenario contract as the JSON routes.
         const answered = scenario.upload(req, res)
-        if (answered !== undefined) sendJson(res, answered[0], answered[1])
-        return
-      }
-      if (route === WORKSPACE_UPLOAD) {
-        // RD-7: the workspace-upload channel — the body is raw bytes, never
-        // JSON. Same scenario contract as the JSON routes.
-        const answered = scenario.workspaceUpload(req, res)
         if (answered !== undefined) sendJson(res, answered[0], answered[1])
         return
       }
@@ -693,58 +684,6 @@ test('upload (T51-fix): a mid-flight transport death fails the CALL and leaves t
     assert.equal(client.state, 'online', 'an upload reset never judges the link')
     assert.equal(client.nextRetryAt, null, 'no reconnect was armed for a cut upload')
     assert.equal(client.lastError, 'offline', 'the failure code is still recorded for the diagnostics')
-  } finally { await relay.stop() }
-})
-
-// ---- RD-7: the workspace-upload channel -------------------------------------------
-
-const WORKSPACE_RECEIPT = { relPath: '.dsh-uploads/note.txt', absolutePath: '/srv/ws/.dsh-uploads/note.txt', filename: 'note.txt', bytes: 5 }
-
-test('workspaceUpload: the byte stream rides out, the query carries the original id + name, and the receipt comes back parsed', async () => {
-  const relay = await startFakeRelay()
-  try {
-    const { client } = makeClient(relay.port)
-    await client.connect()
-    const bytes = Buffer.from('hello')
-    const result = await client.workspaceUpload({ sessionId: 'session-a', name: 'note.txt', body: byteStreamOf(bytes), bytes: 5 })
-    assert.deepEqual(result, WORKSPACE_RECEIPT)
-    const hits = relay.seen.filter((r) => r.url === WORKSPACE_UPLOAD)
-    assert.equal(hits.length, 1)
-    const hit = hits[0]
-    assert.equal(hit.method, 'POST')
-    assert.equal(hit.query, '?sessionId=session-a&name=note.txt', 'the ORIGINAL session id and name travel in the query')
-    assert.equal(hit.headers['content-type'], 'application/octet-stream')
-    assert.equal(hit.headers['content-length'], undefined, 'the body goes chunked — a hand-set length breaks DSH undici')
-    assert.ok(hit.rawBody.equals(bytes), 'the exact bytes arrived, in order')
-    assert.equal(hit.headers.authorization, 'Bearer tok-1')
-  } finally { await relay.stop() }
-})
-
-test('workspaceUpload: a 501 unwired-server refusal keeps its code without a state change', async () => {
-  const relay = await startFakeRelay()
-  relay.scenario.workspaceUpload = () => [501, { ok: false, error: { code: 'unsupported' } }]
-  try {
-    const { client } = makeClient(relay.port)
-    await client.connect()
-    await assert.rejects(
-      () => client.workspaceUpload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')) }),
-      (error) => error instanceof RelayError && error.code === 'unsupported' && error.status === 501,
-    )
-    assert.equal(client.state, 'online', 'a refusal about the call is not a dead link')
-  } finally { await relay.stop() }
-})
-
-test('workspaceUpload: a malformed receipt envelope answers internal, not a shape leak', async () => {
-  const relay = await startFakeRelay()
-  relay.scenario.workspaceUpload = () => [200, { ok: true, value: { status: 200, body: '{}' } }]
-  try {
-    const { client } = makeClient(relay.port)
-    await client.connect()
-    await assert.rejects(
-      () => client.workspaceUpload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')) }),
-      (error) => error instanceof RelayError && error.code === 'internal',
-    )
-    assert.equal(client.state, 'online')
   } finally { await relay.stop() }
 })
 

@@ -79,3 +79,35 @@ export function withPeer<T extends object>(request: T, getPeer: (() => unknown) 
   const peer = getPeer?.()
   return peer === undefined ? request : { ...request, peer }
 }
+
+/**
+ * Build the `/api` shared-fetch dispatcher reader for the relay server.
+ * DSH 0.2.1-rc.3's `HostConnectionService.createSharedFetchHandler('/api').fetch(request, peer)`
+ * checks `peer.principal.kind !== 'owner'` directly (returning 403 or throwing
+ * TypeError when `peer` is undefined), so the dispatcher forwards the owner
+ * Peer from `getPeer()` as the second argument. Pre-rc.3 hosts ignore the
+ * extra argument.
+ */
+export function createSharedApiFetchGetter(
+  getConnection: () => unknown,
+  getPeer: () => unknown = createOwnerPeerSource(getConnection),
+): () => ((request: Request) => Promise<Response>) | undefined {
+  return () => {
+    let connection:
+      | {
+          createSharedFetchHandler?: (channel: string) => {
+            fetch?: (request: Request, peer?: unknown) => Promise<Response>
+          }
+        }
+      | undefined
+    try {
+      const value = getConnection()
+      connection = value !== null && typeof value === 'object' ? (value as typeof connection) : undefined
+    } catch {
+      connection = undefined
+    }
+    const handler = connection?.createSharedFetchHandler?.('/api')
+    const fetch = handler?.fetch
+    return typeof fetch === 'function' ? (request) => fetch.call(handler, request, getPeer()) : undefined
+  }
+}

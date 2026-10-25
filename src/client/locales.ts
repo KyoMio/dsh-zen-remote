@@ -253,10 +253,9 @@ export const zh = {
   'settings.client.diagRecentFailures': '最近的远程调用失败',
   'settings.client.diagCompatGroups': '指纹有差异的组：{groups}',
   'settings.client.diagCompatCalls': '最近的不兼容调用',
-  // --- RD-3 远程会话拖拽守卫的诊断行（浏览器端计数，渲染时现读；RD-7 起
-  // 计数语义为上传：uploaded / failed 按文件计） ---
+  // --- RD-3 远程会话拖拽守卫的诊断行（浏览器端计数，渲染时现读） ---
   'settings.client.diagRemoteDrop': '远程拖拽守卫',
-  'settings.client.diagRemoteDropOk': '已安装 · 拦截 {intercepted} · 已上传 {uploaded} · 失败 {failed} · 文件夹 {blocked} · 放行 {passthrough}',
+  'settings.client.diagRemoteDropOk': '已安装 · 拦截 {intercepted} · 重派发 {redispatched} · 文件夹 {blocked} · 放行 {passthrough} · 重包失败 {failed}',
   'settings.client.diagRemoteDropOff': '未安装（{reason}）',
   // --- RD-6 上传改道（fetch-route 拦截）的诊断行：读 remote-status 的 serviceProbe ---
   'settings.client.diagUploadRedirect': '上传改道',
@@ -304,11 +303,8 @@ export const zh = {
   'remoteGroupRevoked': '（令牌已吊销）',
   'remoteGroupUnpaired': '（已解除配对）',
   'remoteGroupMismatch': '（版本有差异）',
-  // --- 远程会话拖拽附件（RD-2 文件夹拦截；RD-7 起守卫自己经中继上传到服务端工作区） ---
+  // --- 远程会话拖拽附件（RD-2）：文件夹被拦截时的短暂提示 ---
   'remoteDropFolderBlocked': '远程会话暂不支持拖入文件夹',
-  'remoteDropUploading': '正在上传到服务端…',
-  'remoteDropInserted': '已插入 {name}',
-  'remoteDropFailed': '上传失败：{code}',
   // --- 2.2.6: 远程会话产物下载（deliverable 卡片 / 文档预览头） ---
   'downloadToLocal': '下载到本机',
   'downloadBusy': '下载中…',
@@ -565,7 +561,7 @@ export const en: Record<MobileNavKey, string> = {
   // --- RD-3: the remote drop guard's diagnostics line (browser-side
   // counters, read at render time) ---
   'settings.client.diagRemoteDrop': 'Remote drop guard',
-  'settings.client.diagRemoteDropOk': 'Installed · intercepted {intercepted} · uploaded {uploaded} · failed {failed} · folders {blocked} · passthrough {passthrough}',
+  'settings.client.diagRemoteDropOk': 'Installed · intercepted {intercepted} · redispatched {redispatched} · folders {blocked} · passthrough {passthrough} · rewrap failed {failed}',
   'settings.client.diagRemoteDropOff': 'Not installed ({reason})',
   // --- RD-6: the upload-redirect (fetch-route intercept) diagnostics row ---
   'settings.client.diagUploadRedirect': 'Upload redirect',
@@ -614,9 +610,6 @@ export const en: Record<MobileNavKey, string> = {
   'remoteGroupMismatch': ' (version mismatch)',
   // --- RD-2: the short toast when a folder drop into a remote session is blocked ---
   'remoteDropFolderBlocked': 'Folders cannot be dropped into a remote session yet',
-  'remoteDropUploading': 'Uploading to the server…',
-  'remoteDropInserted': 'Inserted {name}',
-  'remoteDropFailed': 'Upload failed: {code}',
   // 2.2.6: remote-session artifact download (deliverable cards / document
   // preview header).
   'downloadToLocal': 'Download to this computer',

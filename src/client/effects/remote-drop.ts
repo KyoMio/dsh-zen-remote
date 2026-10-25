@@ -1,49 +1,40 @@
 import type { ClientContext } from '../compat/types.ts'
-import { decideRemoteDrop } from '../../client-data/remote-drop.ts'
+import { decideRemoteDrop, rewrapFiles } from '../../client-data/remote-drop.ts'
 import type { RemoteDropItemDescriptor } from '../../client-data/remote-drop.ts'
-import { DROP_MENTION_EVENT, WORKSPACE_UPLOAD_ROUTE } from '../../remote-drop-contract.ts'
 import { CURRENT_SESSION_STORAGE_KEY, parseCurrentSessionStorage } from '../../client-data/current-session.ts'
 import { en, zh } from '../locales.ts'
 
 /**
- * The remote-session drop guard (RD-2, reworked in RD-7): a document-level
- * CAPTURE-phase drop listener that intercepts file drops landing in a remote
- * session before the host's own (bubble-phase, F4) handler sees them.
+ * The remote-session drop guard (RD-2): a document-level CAPTURE-phase drop
+ * listener that re-shapes file drops landing in a remote session before the
+ * host's own (bubble-phase, F4) handler sees them.
  *
  * The desktop app's zero-copy fast path is the problem: a File dragged from
  * the OS keeps its disk path, the host turns it into an `@/absolute/path`
  * mention chip without uploading bytes, and in a remote session that path
  * names a file on THIS machine — the server-side session can never read it.
- *
- * Why the guard cannot hand the drop back to the host's own upload pipeline
- * (the RD-2..4 synthetic-DragEvent redispatch, REMOVED): the official
- * composer's file upload runs a native XHR inside a Web Worker — straight
- * to the host route, never through `connection.fetchRoutes`, the table the
- * T51 interception wraps (2026-10-24 empirical, rc.3 source). No re-shaping
- * of a DragEvent can route those bytes through this plugin on the desktop
- * app. The guard therefore uploads the files ITSELF: one POST per file to
- * this plugin's `client/workspace-upload` route (same-origin, so the
- * pairing cookie rides along), which relays the bytes to the SERVER
- * session's workspace `.dsh-uploads/` and answers the receipt; each
- * receipt's relPath travels a `zr:drop-mention` CustomEvent to the
- * invisible composer-slot listener (DropMentionListener.tsx), which inserts
- * the `@.dsh-uploads/<name>` mention through the official write path.
+ * The bridge global (`__DSH_HOST_PATHS__`) is contextBridge-exposed and
+ * deep-frozen, so it cannot be wrapped; instead the drop event itself is
+ * re-shaped: each File is re-wrapped (path-stripped, RD-1) into a fresh
+ * DataTransfer and redispatched as a synthetic DragEvent. The host's own
+ * pipeline then classifies it as a browser drag — the byte-upload branch —
+ * which the T51 fetch-route interception relays to the server. Mask
+ * cleanup, busy rejection, directory detection and the addFiles branch all
+ * stay the host's own code; nothing downstream is reimplemented here.
  *
  * Gates (all three must pass, decided by RD-1's pure function): the event
- * is trusted, the Electron bridge exists (phone / plain-browser hosts are
+ * is trusted (our redispatch is untrusted — that alone makes the guard
+ * loop-free), the Electron bridge exists (phone / plain-browser hosts are
  * already on the upload branch), and the current session (`dsh.sessions.
  * current`, read fresh at event time) is a `zr~` virtual id. A missing
  * signal counts as a local session — the conservative direction: the only
  * misfire a stale signal can cause is uploading bytes for a local drop,
  * never losing one.
  *
- * The original event is stopped only after the upload parameters are fully
- * built — building cannot fail (Files and strings), and once stopped there
- * is no host pipeline to fall back to. Upload failures are expressed with a
- * toast, never by releasing the event. Dragging a FOLDER is still blocked
- * whole (a folder cannot be fixed by single-file upload). Diagnostic
- * counters for the settings-page diagnostics block are exported via
- * {@link remoteDropDiagnostics}.
+ * Degrades to not-installed when DragEvent / DataTransfer construction is
+ * unavailable — back to exactly today's behavior (RD-4's interface.md
+ * documents this). Diagnostic counters for the settings-page diagnostics
+ * block are exported via {@link remoteDropDiagnostics}.
  */
 
 interface StorageLike {
@@ -58,19 +49,18 @@ export interface RemoteDropDiagnostics {
    * installed (and after a dispose, which keeps the counters readable). */
   notInstalledReason: string | undefined
   /** Drops this guard stopped from reaching the host (both the blocked and
-   * the uploaded kind). */
+   * the redispatched kind). */
   intercepted: number
-  /** Files that reached the server workspace and had their mention
-   * dispatched. */
-  uploaded: number
-  /** Files whose upload failed (the toast carries the code; the event stays
-   * stopped — there is no host pipeline to fall back to). */
-  failed: number
+  /** Synthetic path-stripped drops actually dispatched. */
+  redispatched: number
   /** Drops stopped because they carried a folder (toast shown, nothing
-   * uploaded). */
+   * dispatched). */
   blockedDirectories: number
   /** Drops judged not-ours and released untouched. */
   passthrough: number
+  /** Redispatches aborted because a re-wrap or a DataTransfer add threw —
+   * the original event was released instead (宁坏勿丢). */
+  rewrapFailed: number
 }
 
 /** Module-level singleton: the bundle has one document, so one guard state.
@@ -78,7 +68,7 @@ export interface RemoteDropDiagnostics {
 let diagnostics: RemoteDropDiagnostics = freshDiagnostics()
 
 function freshDiagnostics(): RemoteDropDiagnostics {
-  return { installed: false, notInstalledReason: undefined, intercepted: 0, uploaded: 0, failed: 0, blockedDirectories: 0, passthrough: 0 }
+  return { installed: false, notInstalledReason: undefined, intercepted: 0, redispatched: 0, blockedDirectories: 0, passthrough: 0, rewrapFailed: 0 }
 }
 
 /** A snapshot for the diagnostics carriers (settings page). Copying keeps
@@ -124,40 +114,31 @@ function collectItems(transfer: DataTransfer): RemoteDropItemDescriptor[] | unde
   return out
 }
 
-/**
- * Take the host's「拖拽文件到此处添加」drop overlay back down after the
- * guard has stopped a drop. The overlay's own state machine
+/** The toast copy in the page's language (the plugin's namespace carries
+ * both dictionaries; the framework `t` seat is not reachable from a
+ * non-React effect — same pick as the bridge note). */
+function toastText(language: string | undefined): string {
+  const key = 'remoteDropFolderBlocked' as const
+  return typeof language === 'string' && language.startsWith('zh') ? zh[key] : en[key]
+}
+
+/** Take the host's「拖拽文件到此处添加」drop overlay back down after this
+ * guard has stopped a drop outright. The overlay's own state machine
  * (`dsh-client-ui-attachment` drop-events.ts) closes on the reset() inside
  * its DOCUMENT-level bubble `drop` handler — which this guard's capture
  * stopPropagation deliberately prevents from running — or on `dragend` at
- * `window` level, a channel it does not read the event object for and does
- * not isTrust-check. An OS-file drag never delivers a native dragend (the
- * drag source is the OS, not a page element), so after eating the drop the
- * guard fires that synthetic one itself: the overlay dismisses through the
- * host's own reset, exactly as if the drag had ended. Both intercept
- * branches (upload and folder-block) must call this the moment they stop
- * the event, or the overlay stays up forever.
- */
+ * `window` level, a channel it reads without isTrust-checking. An OS-file
+ * drag never delivers a native dragend (the drag source is the OS, not a
+ * page element), so a branch that eats the drop must fire a synthetic one
+ * itself or the overlay stays up forever. Only the folder-block branch
+ * calls this: the redispatch branch's synthetic drop reaches the host's
+ * bubble handler, whose own reset brings the overlay down. */
 function dismissHostDropOverlay(): void {
-  window.dispatchEvent(new Event('dragend'))
-}
-
-/** The toast copy in the page's language (the plugin's namespace carries
- * both dictionaries; the framework `t` seat is not reachable from a
- * non-React effect — same pick as the bridge note), with `{name}`-style
- * placeholders filled from `params`. */
-type DropToastKey = 'remoteDropFolderBlocked' | 'remoteDropUploading' | 'remoteDropInserted' | 'remoteDropFailed'
-
-function toastText(language: string | undefined, key: DropToastKey, params?: Record<string, string>): string {
-  const template = typeof language === 'string' && language.startsWith('zh') ? zh[key] : en[key]
-  if (params === undefined) return template
-  return template.replace(/\{(\w+)\}/gu, (whole, name: string) => params[name] ?? whole)
-}
-
-/** One uploaded file's dispatch record. */
-interface PendingUpload {
-  file: File
-  url: string
+  try {
+    window.dispatchEvent(new Event('dragend'))
+  } catch {
+    // No window / Event in this host: the overlay is the only casualty.
+  }
 }
 
 export function mountRemoteDropGuard(ctx: ClientContext): void {
@@ -168,16 +149,26 @@ export function mountRemoteDropGuard(ctx: ClientContext): void {
 
     // Capability self-check — anything missing means "not installed",
     // back to today's behavior. Counted, not thrown: the diagnostics
-    // block explains why the guard is absent. (The desktop bridge is the
-    // one gate: without it the host is already on the byte-upload branch
-    // and a guard would only double-upload.)
+    // block explains why the guard is absent.
+    if (typeof DragEvent !== 'function') {
+      diagnostics.notInstalledReason = 'drag-event-unavailable'
+      return () => {}
+    }
+    try {
+      new DataTransfer()
+    } catch {
+      diagnostics.notInstalledReason = 'datatransfer-unavailable'
+      return () => {}
+    }
     if (hostPathsOf() === undefined) {
+      // Phone / plain-browser hosts: the bridge is absent and the host is
+      // already on the byte-upload branch — nothing to fix here.
       diagnostics.notInstalledReason = 'host-paths-unavailable'
       return () => {}
     }
     diagnostics.installed = true
 
-    // --- toast, inline styles per the CSS split ---
+    // --- toast (folder-blocked notice), inline styles per the CSS split ---
     let toast: HTMLDivElement | undefined
     let toastTimer: ReturnType<typeof setTimeout> | undefined
     const removeToast = (): void => {
@@ -186,12 +177,12 @@ export function mountRemoteDropGuard(ctx: ClientContext): void {
       toast?.remove()
       toast = undefined
     }
-    const showToast = (text: string): void => {
+    const showToast = (): void => {
       // Restart the window on rapid re-drops rather than stacking toasts.
       removeToast()
       const el = document.createElement('div')
       el.dataset.zenRemote = 'remote-drop-toast'
-      el.textContent = text
+      el.textContent = toastText(navigator.language)
       el.style.cssText = [
         'position:fixed', 'left:50%', 'transform:translateX(-50%)',
         // Safe-area habit shared with the overlay effects: keep clear of the
@@ -209,66 +200,17 @@ export function mountRemoteDropGuard(ctx: ClientContext): void {
       toastTimer = setTimeout(removeToast, 3000)
     }
 
-    /** Upload the intercepted files one by one and speak the outcome in
-     * toasts. Each success dispatches its `zr:drop-mention` immediately, so
-     * a mid-batch failure still mentions the files that made it; the first
-     * failure stops the loop and names its code. */
-    const uploadAll = async (sessionId: string, uploads: PendingUpload[]): Promise<void> => {
-      const lang = navigator.language
-      showToast(toastText(lang, 'remoteDropUploading'))
-      const inserted: string[] = []
-      let failure: string | undefined
-      for (const { file, url } of uploads) {
-        try {
-          const response = await fetch(url, {
-            method: 'POST',
-            // Same-origin so the pairing cookie rides along (the attach
-            // button's habit; also the fetch default, made explicit).
-            credentials: 'same-origin',
-            headers: { 'content-type': 'application/octet-stream' },
-            body: file,
-          })
-          const body: unknown = await response.json().catch(() => undefined)
-          const record = body !== null && typeof body === 'object' && !Array.isArray(body)
-            ? (body as Record<string, unknown>)
-            : {}
-          const relPath = typeof record.relPath === 'string' ? record.relPath : undefined
-          if (!response.ok || record.ok !== true || relPath === undefined) {
-            const error = record.error !== null && typeof record.error === 'object' && !Array.isArray(record.error)
-              ? (record.error as Record<string, unknown>)
-              : {}
-            failure = typeof error.code === 'string' && error.code !== '' ? error.code : `http-${response.status}`
-            diagnostics.failed += 1
-            break
-          }
-          diagnostics.uploaded += 1
-          inserted.push(file.name)
-          document.dispatchEvent(new CustomEvent(DROP_MENTION_EVENT, { detail: { sessionId, relPath } }))
-        } catch {
-          // Transport death (the sub-client backend unreachable): a code the
-          // toast can name, like the status route's own vocabulary.
-          failure = 'offline'
-          diagnostics.failed += 1
-          break
-        }
-      }
-      if (failure !== undefined) showToast(toastText(lang, 'remoteDropFailed', { code: failure }))
-      else if (inserted.length > 0) {
-        showToast(toastText(lang, 'remoteDropInserted', { name: inserted.join(lang.startsWith('zh') ? '、' : ', ') }))
-      }
-    }
-
     const onDrop = (event: DragEvent): void => {
-      // Self-reentry guard: only events the OS originated are ours to judge.
+      // Self-reentry guard first: the redispatched event is untrusted, and
+      // this capture listener would otherwise see it again.
       if (!event.isTrusted) return
       const transfer = event.dataTransfer
       if (transfer === null || !transfer.types.includes('Files')) return
       // Not a file drag: the host's own Files-in-types gate ignores the
       // drop anyway — not a candidate, not counted.
-      const currentSessionId = readCurrentSessionId()
       const decision = decideRemoteDrop({
         hasHostPaths: hostPathsOf() !== undefined,
-        currentSessionId,
+        currentSessionId: readCurrentSessionId(),
         trusted: event.isTrusted,
         items: collectItems(transfer),
       })
@@ -278,34 +220,41 @@ export function mountRemoteDropGuard(ctx: ClientContext): void {
       }
       if (decision.action === 'block-directories') {
         // A folder cannot be fixed by single-file upload: stop the whole
-        // drop, say so, nothing is uploaded.
+        // drop, say so, nothing is dispatched.
         event.preventDefault()
         event.stopPropagation()
         dismissHostDropOverlay()
         diagnostics.intercepted += 1
         diagnostics.blockedDirectories += 1
-        showToast(toastText(navigator.language, 'remoteDropFolderBlocked'))
+        showToast()
         return
       }
-      // workspace-upload: build EVERYTHING before stopping the original
-      // event. Building cannot fail (a File list and strings), so from here
-      // the event stays stopped — 宁坏勿丢 no longer means releasing it,
-      // because there is no host pipeline these bytes could fall back to;
-      // an upload failure is a toast, not an un-eaten event.
-      const sessionId = currentSessionId ?? ''
-      const uploads: PendingUpload[] = Array.from(transfer.files).map((file) => ({
-        file,
-        url: `${WORKSPACE_UPLOAD_ROUTE}?sessionId=${encodeURIComponent(sessionId)}&name=${encodeURIComponent(file.name)}`,
-      }))
-      if (uploads.length === 0) {
-        diagnostics.passthrough += 1
-        return
+      // redispatch: build the ENTIRE payload before stopping the original
+      // event — any failure below releases the original untouched, so the
+      // host still receives today's (path-chip) behavior instead of
+      // nothing at all.
+      try {
+        const rewrapped = rewrapFiles(Array.from(transfer.files))
+        if (rewrapped.length === 0) {
+          diagnostics.passthrough += 1
+          return
+        }
+        const payload = new DataTransfer()
+        for (const file of rewrapped) payload.items.add(file)
+        event.preventDefault()
+        event.stopPropagation()
+        diagnostics.intercepted += 1
+        // The host's drop handler sits on document, bubble phase (F4): a
+        // bubbling synthetic drop on document reaches it. Its own handler
+        // does the preventDefault / mask reset / addFiles work; our capture
+        // listener skips this event via the isTrusted gate above.
+        document.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: payload }))
+        diagnostics.redispatched += 1
+      } catch {
+        // A re-wrap or a single items.add threw (0-byte / exotic File):
+        // count it and let the original event flow — 宁坏勿丢.
+        diagnostics.rewrapFailed += 1
       }
-      event.preventDefault()
-      event.stopPropagation()
-      dismissHostDropOverlay()
-      diagnostics.intercepted += 1
-      void uploadAll(sessionId, uploads)
     }
     document.addEventListener('drop', onDrop, true)
 

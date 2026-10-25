@@ -61,17 +61,6 @@ export declare const CLIENT_CURRENT_SESSION_ROUTE = "/_dsh/zen-remote/client/cur
  * `/api/<route>` call (the fetch wrapper's rewrites land here) to the
  * server, with the virtual session id swapped back to the original. */
 export declare const CLIENT_HTTP_ROUTE_PREFIX = "/_dsh/zen-remote/client/http/";
-/** POST `${CLIENT_WORKSPACE_UPLOAD_ROUTE}?sessionId=<虚拟 id>&name=<file>`
- * (RD-7): the drop guard's binary channel — the raw body is ONE dragged
- * file, forwarded through the relay client's `workspaceUpload` into the
- * SERVER session's workspace `.dsh-uploads/`; the receipt's relPath is what
- * the drop flow mentions in the composer draft. The host role's
- * remoteStatusOnly wall 404s it (a host has no relay client to forward
- * through), like every non-remote-status route. The path VALUE is spelled
- * once in remote-drop-contract.ts (the browser half imports the same
- * constant — a typo'd duplicate was mutation-proven silent); the CLIENT_
- * alias here only keeps this module's route-name convention. */
-export declare const CLIENT_WORKSPACE_UPLOAD_ROUTE = "/_dsh/zen-remote/client/workspace-upload";
 /** The fetch face this module needs; injectable for tests. */
 export type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>;
 export interface ClientHandlerOptions {
