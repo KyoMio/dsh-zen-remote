@@ -22,7 +22,7 @@
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
 | `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
 | `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
-| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（改动摘要 / diff 的 plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ unshare |
+| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（改动摘要 / diff 的 plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（远程会话附件字节转宿主暂存，返回回执）/ unshare |
 | `src/relay-access.ts` | 中继的按方法登记访问控制表（服务端那一张；`v1/http` 的按路由登记表也在这里） |
 | `src/relay-filter.ts` | 全局流与全局列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
 | `src/session-reference.ts` | 两端共用的 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队消息 edit、`commands/execute` 全部字符串）：服务端照它校验、子客户端照它改写，同一份规则防两端漂移 |
