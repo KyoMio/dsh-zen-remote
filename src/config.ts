@@ -213,6 +213,23 @@ function acmeEmail(value: unknown): string | undefined {
   return typeof value === 'string' && EMAIL_PATTERN.test(value) ? value : undefined
 }
 
+/**
+ * `ingressDomain`: a BARE hostname and nothing else (GW-fix-1/M1) — letters,
+ * digits, dots and inner hyphens, labels of at most 63 characters, 253 in
+ * total, no scheme, no path, no port, no whitespace, no braces or newlines
+ * (the value flows verbatim into generated Caddyfile / DNS material, where
+ * any of those would either break the config or smuggle in an injection).
+ * IP literals pass — a bare-IP LAN ingress is a legitimate shape. IDN names
+ * must arrive punycoded.
+ */
+const HOSTNAME_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/
+
+const HOSTNAME_MAX = 253
+
+function hostOf(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length <= HOSTNAME_MAX && HOSTNAME_PATTERN.test(value) ? value : undefined
+}
+
 /** `ingressPublicUrl`: an http(s) ORIGIN and nothing else — the design keeps
  * path-based reverse proxying out of scope, so a URL with a path, query,
  * fragment or userinfo never counts as verified. Returned verbatim. */
@@ -342,7 +359,7 @@ const FIELDS: { [K in keyof ZenRemoteConfig]: FieldResolver<ZenRemoteConfig[K]> 
   // environment, and none has a historic LAN_GATE_* name. Not in
   // RESTART_FIELDS — the ingress reads them live per request.
   ingressMode: { row: oneOf('off', 'caddy', 'external', 'cloudflared'), file: oneOf('off', 'caddy', 'external', 'cloudflared') },
-  ingressDomain: { row: nonEmptyString, file: nonEmptyString },
+  ingressDomain: { row: hostOf, file: hostOf },
   ingressHttpsPort: { row: intIn(1, 65535), file: lenientFileNumber(intIn(1, 65535)) },
   ingressAcmeEmail: { row: acmeEmail, file: acmeEmail },
   ingressPublicUrl: { row: publicOrigin, file: publicOrigin },

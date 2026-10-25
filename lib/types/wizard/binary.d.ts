@@ -16,31 +16,58 @@
  */
 /** The two binaries the wizard downloads and runs. */
 export type IngressBinary = 'caddy' | 'cloudflared';
-/** The platform shapes both distribution points understand. */
-export interface BinaryPlatform {
-    os: 'darwin' | 'linux' | 'windows';
+/**
+ * The platform shapes both distribution points understand. Windows is
+ * deliberately amd64-only: that is all Caddy's build API and cloudflared's
+ * Releases publish a gateway-wizard-usable image for (a windows-arm64 host
+ * has no supported download either way, so pretending otherwise would only
+ * move the failure somewhere less explicable).
+ */
+export type BinaryPlatform = {
+    os: 'darwin';
     arch: 'amd64' | 'arm64';
-}
-/** The archive wrapper a cloudflared asset arrives in; `none` is a bare
- * executable, `exe` Windows' own format. */
-export type CloudflaredArchive = 'tgz' | 'exe' | 'none';
+} | {
+    os: 'linux';
+    arch: 'amd64' | 'arm64';
+} | {
+    os: 'windows';
+    arch: 'amd64';
+};
+/**
+ * The wrapper an asset arrives in: `tgz` gzipped tar (needs unpacking),
+ * `zip` (no reader in this codebase yet — refused before download), `exe`
+ * Windows' own format, `none` a bare executable.
+ */
+export type BinaryArchive = 'tgz' | 'zip' | 'exe' | 'none';
 /** This process's platform, mapped into the download points' naming. */
 export declare function currentPlatform(): BinaryPlatform;
 /** Caddy's custom-build API, pinned to the Cloudflare DNS module the
  * DNS-01 challenge needs (plain Caddy cannot write the TXT record). */
 export declare function caddyDownloadUrl(platform: BinaryPlatform): string;
+/**
+ * The Caddy asset the build API answers with, PLUS its archive shape — the
+ * URL is a query string, so its ending says nothing about the payload:
+ * unix answers a gzipped tar, Windows a zip (not unpackable here yet).
+ */
+export declare function caddyDownload(platform: BinaryPlatform): {
+    url: string;
+    archive: BinaryArchive;
+};
 /** cloudflared's GitHub Releases asset for one platform, plus the archive
  * shape the I/O half must unwrap (darwin assets are `.tgz`, windows ships
  * a bare `.exe`, linux a bare binary). */
 export declare function cloudflaredDownload(platform: BinaryPlatform): {
     url: string;
-    archive: CloudflaredArchive;
+    archive: BinaryArchive;
 };
-/** Both download URLs for one platform, defaults to the running process's. */
+/** Both download URLs for one platform WITH their archive shapes, defaults
+ * to the running process's. The archive metadata — not a URL suffix — is
+ * what tells the I/O half how to unpack. */
 export declare function binaryUrls(platform?: BinaryPlatform): {
     caddy: string;
+    caddyArchive: BinaryArchive;
     cloudflared: string;
-    cloudflaredArchive: CloudflaredArchive;
+    cloudflaredArchive: BinaryArchive;
 };
 /** Official manual-install pages, surfaced by the UI when a download fails. */
 export declare const MANUAL_INSTALL_LINKS: Readonly<Record<IngressBinary, string>>;
