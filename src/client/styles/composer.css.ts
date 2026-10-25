@@ -6,11 +6,16 @@
 //
 // Official structure this file reshapes (verified live at 390px, see the S3
 // report): InputBar renders
-//   _card > _row > [_tools > (_add, _modes > PermissionSelect, input.left)]
+//   _card > _row > [_tools > (_add, input[type=file] hidden, _modes >
+//                             PermissionSelect, input.left)]
 //                  [_trailing > (_standardControls > (input.right, input.model), _activity, _primary)]
 // with `_tools` / `_trailing` / `_standardControls` as inner flex groups
 // (0.1.7 added `_standardControls` and moved the ContextMeter out of the row
-// into the dock under the card). Flattening all three to
+// into the dock under the card). That hidden file input is the stand-down
+// probe host-attach.ts USED to key on — since #31 the phone's own attach
+// button is a permanent resident instead, and DSH 0.1.5's second `_add`
+// button (the standalone paperclip 0.2.x removed) is hidden by section 2.
+// Flattening all three to
 // `display: contents` turns every control into a direct flex item of `_row`,
 // which is what makes a pure `order` reflow possible without touching a
 // single official component.
@@ -83,14 +88,26 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   }
 
   /* --- 2. the running order ---
-     The attachment button (S3 placeholder, S7 wires it up) sits leftmost;
-     the official "+" command menu keeps its seat right next to it, where
+     The attachment button (S3 placeholder, S7 wires it up) sits leftmost and
+     is a PERMANENT resident now (#31): on DSH 0.2.x the standalone paperclip
+     moved into the "+" command menu while its hidden <input type="file">
+     stayed in _tools, so the old host-attach stand-down probe matched on
+     every host and the phone composer was left with no attach affordance at
+     all. The official "+" command menu keeps its seat right next to it, where
      the two "insert something" affordances read as one cluster. */
   ${ROW} [data-mobile-nav="attach"] {
     order: 1 !important;
   }
   ${ROW} > [class$="_tools"] > [class$="_add"] {
     order: 2 !important;
+  }
+  /* DSH ≤ 0.1.5 still renders that second _add button (the standalone
+     paperclip) as a direct _tools child; hide it below 768px so the row
+     keeps exactly one attach control — ours, which uploads into the session
+     workspace the phone can actually reach. On 0.2.x the only button in
+     _tools is the first of its type, so this never matches. */
+  ${ROW} > [class$="_tools"] > button[class$="_add"]:nth-of-type(2) {
+    display: none !important;
   }
   ${ROW} > [class$="_tools"] > [class$="_modes"] {
     order: 3 !important;

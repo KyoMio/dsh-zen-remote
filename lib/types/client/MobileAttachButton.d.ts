@@ -11,12 +11,20 @@ export type MobileAttachButtonProps = PropsRuntime<'conversation.input.left'> & 
  * the CLIENT's picker — no `accept` attribute on purpose, so iOS offers the
  * full 相册 / 拍照 / 选取文件 sheet rather than one of them.
  *
- * DSH 0.1.5 gave the official tool row its own paperclip (the host attachment
- * flow), which made TWO identical controls on a phone. This button now stands
- * down entirely while the host ships its own picker (`host-attach.ts` probes
- * for it) — the official flow uploads into `~/.dsh/attachments` and renders
- * its own rail, so the composer keeps exactly one attach affordance. On a
- * host without one (DSH ≤ 0.1.2) everything below loads exactly as before.
+ * DSH 0.1.5 gave the official tool row its own paperclip, and this button
+ * used to stand down whenever that flow's hidden `<input type="file">` was
+ * probed in the composer (that probe file is deleted with #31), keeping one
+ * attach control per composer. DSH 0.2.x then removed the standalone
+ * paperclip (the file action moved into the `+` command menu) while KEEPING
+ * the hidden input, so the probe matched on every host and the phone composer
+ * was left with no attach affordance at all. The phone shell now always
+ * renders this button — its picker is the CLIENT's (相册 / 拍照 / 选取文件),
+ * and every attachment takes the same `@.dsh-uploads/` draft-token path on
+ * every DSH version. On DSH ≤ 0.1.5, which still ships the second official
+ * paperclip, composer.css.ts hides it below 768px so the row keeps exactly
+ * one attach control. Subagent sessions stay buttonless, mirroring the host:
+ * the official InputBar disables its own file input while
+ * `subagent !== null`.
  *
  * Every picked file takes the SAME path: upload to the node half, then append
  * `@.dsh-uploads/name` to the draft through the official write path — no DOM
@@ -31,5 +39,5 @@ export type MobileAttachButtonProps = PropsRuntime<'conversation.input.left'> & 
  * Files upload one at a time: a phone uplink gains nothing from parallelism
  * and a serial loop keeps the mentions in pick order.
  */
-export declare function MobileAttachButton({ t, sessionId, useInput, inputActions }: MobileAttachButtonProps): import("react").JSX.Element | null;
+export declare function MobileAttachButton({ t, sessionId, useInput, inputActions, useSessions }: MobileAttachButtonProps): import("react").JSX.Element | null;
 //# sourceMappingURL=MobileAttachButton.d.ts.map

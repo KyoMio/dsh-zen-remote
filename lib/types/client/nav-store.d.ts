@@ -47,7 +47,7 @@ export declare const SESSION_INFO_EVENT = "dsh-mobile-nav:session-info";
  * @returns a fresh store handle, shared by every SAME-SCOPE registration of
  * one apply().
  */
-export declare function createNavStore(): import("@deepseek-ai/dsh-client-store").StoreHandle<{
+export declare function createNavStore(): import("@deepseek-ai/dsh-client-ui-slots").StoreHandle<{
     view: MobileView;
     workspace: WorkspaceFilter;
 }, {
