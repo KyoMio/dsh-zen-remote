@@ -63,19 +63,23 @@ export type WizardHandler = (req: IncomingMessage, res: ServerResponse) => Promi
  */
 export function createWizardHandler(options: WizardHandlerOptions): WizardHandler {
   return async (req, res) => {
-    // Wall 1 first: DSH's own admission.
-    const admission = options.admit(req)
-    if ('rejection' in admission) {
-      responseJson(res, admission.rejection, {
-        ok: false,
-        error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
-      })
-      return
-    }
-    const url = new URL(req.url ?? '/', 'http://dsh.internal')
-    const route = url.pathname
-    const method = req.method ?? 'GET'
+    // EVERYTHING rides inside the one guard (GW-fix-1/L1): a malformed
+    // req.url explodes in `new URL`, and a broken connection service can
+    // throw out of admit — neither may escape as an unhandled rejection,
+    // the handler owns the full response lifecycle, always.
     try {
+      // Wall 1 first: DSH's own admission.
+      const admission = options.admit(req)
+      if ('rejection' in admission) {
+        responseJson(res, admission.rejection, {
+          ok: false,
+          error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
+        })
+        return
+      }
+      const url = new URL(req.url ?? '/', 'http://dsh.internal')
+      const route = url.pathname
+      const method = req.method ?? 'GET'
       // Wall 2, on EVERY wizard route before anything else: unlike
       // admin/status there is no remote-readable exception — the wizard is
       // a server-owner surface, GET included. This runs BEFORE same-origin

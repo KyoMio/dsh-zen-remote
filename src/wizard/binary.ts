@@ -21,22 +21,31 @@ import { homedir } from 'node:os'
 /** The two binaries the wizard downloads and runs. */
 export type IngressBinary = 'caddy' | 'cloudflared'
 
-/** The platform shapes both distribution points understand. */
-export interface BinaryPlatform {
-  os: 'darwin' | 'linux' | 'windows'
-  arch: 'amd64' | 'arm64'
-}
+/**
+ * The platform shapes both distribution points understand. Windows is
+ * deliberately amd64-only: that is all Caddy's build API and cloudflared's
+ * Releases publish a gateway-wizard-usable image for (a windows-arm64 host
+ * has no supported download either way, so pretending otherwise would only
+ * move the failure somewhere less explicable).
+ */
+export type BinaryPlatform =
+  | { os: 'darwin'; arch: 'amd64' | 'arm64' }
+  | { os: 'linux'; arch: 'amd64' | 'arm64' }
+  | { os: 'windows'; arch: 'amd64' }
 
-/** The archive wrapper a cloudflared asset arrives in; `none` is a bare
- * executable, `exe` Windows' own format. */
-export type CloudflaredArchive = 'tgz' | 'exe' | 'none'
+/**
+ * The wrapper an asset arrives in: `tgz` gzipped tar (needs unpacking),
+ * `zip` (no reader in this codebase yet — refused before download), `exe`
+ * Windows' own format, `none` a bare executable.
+ */
+export type BinaryArchive = 'tgz' | 'zip' | 'exe' | 'none'
 
 /** This process's platform, mapped into the download points' naming. */
 export function currentPlatform(): BinaryPlatform {
-  return {
-    os: process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux',
-    arch: process.arch === 'arm64' ? 'arm64' : 'amd64',
-  }
+  if (process.platform === 'win32') return { os: 'windows', arch: 'amd64' }
+  const arch = process.arch === 'arm64' ? 'arm64' : 'amd64'
+  if (process.platform === 'darwin') return { os: 'darwin', arch }
+  return { os: 'linux', arch }
 }
 
 /** Caddy's custom-build API, pinned to the Cloudflare DNS module the
@@ -45,22 +54,34 @@ export function caddyDownloadUrl(platform: BinaryPlatform): string {
   return `https://caddyserver.com/api/download?os=${platform.os}&arch=${platform.arch}&p=github.com/caddy-dns/cloudflare`
 }
 
+/**
+ * The Caddy asset the build API answers with, PLUS its archive shape — the
+ * URL is a query string, so its ending says nothing about the payload:
+ * unix answers a gzipped tar, Windows a zip (not unpackable here yet).
+ */
+export function caddyDownload(platform: BinaryPlatform): { url: string; archive: BinaryArchive } {
+  return { url: caddyDownloadUrl(platform), archive: platform.os === 'windows' ? 'zip' : 'tgz' }
+}
+
 /** cloudflared's GitHub Releases asset for one platform, plus the archive
  * shape the I/O half must unwrap (darwin assets are `.tgz`, windows ships
  * a bare `.exe`, linux a bare binary). */
-export function cloudflaredDownload(platform: BinaryPlatform): { url: string; archive: CloudflaredArchive } {
+export function cloudflaredDownload(platform: BinaryPlatform): { url: string; archive: BinaryArchive } {
   const base = 'https://github.com/cloudflare/cloudflared/releases/latest/download/'
   if (platform.os === 'darwin') return { url: `${base}cloudflared-darwin-${platform.arch}.tgz`, archive: 'tgz' }
   if (platform.os === 'windows') return { url: `${base}cloudflared-windows-amd64.exe`, archive: 'exe' }
   return { url: `${base}cloudflared-linux-${platform.arch}`, archive: 'none' }
 }
 
-/** Both download URLs for one platform, defaults to the running process's. */
+/** Both download URLs for one platform WITH their archive shapes, defaults
+ * to the running process's. The archive metadata — not a URL suffix — is
+ * what tells the I/O half how to unpack. */
 export function binaryUrls(
   platform: BinaryPlatform = currentPlatform(),
-): { caddy: string; cloudflared: string; cloudflaredArchive: CloudflaredArchive } {
+): { caddy: string; caddyArchive: BinaryArchive; cloudflared: string; cloudflaredArchive: BinaryArchive } {
+  const caddy = caddyDownload(platform)
   const cloudflared = cloudflaredDownload(platform)
-  return { caddy: caddyDownloadUrl(platform), cloudflared: cloudflared.url, cloudflaredArchive: cloudflared.archive }
+  return { caddy: caddy.url, caddyArchive: caddy.archive, cloudflared: cloudflared.url, cloudflaredArchive: cloudflared.archive }
 }
 
 /** Official manual-install pages, surfaced by the UI when a download fails. */

@@ -1,23 +1,32 @@
 /**
- * Ingress binary I/O (GW-2): download, unpack, install and cache-probe for
- * the two wizard-managed binaries. The arithmetic lives in binary.ts; this
- * file is the only one allowed to touch the filesystem or the network for
- * it.
+ * Ingress binary I/O (GW-2, revised by GW-fix-1/H1): download, unpack,
+ * install and cache-probe for the two wizard-managed binaries. The
+ * arithmetic lives in binary.ts; this file is the only one allowed to touch
+ * the filesystem or the network for it.
  *
- * House rules the task pins down:
+ * House rules the tasks pin down:
  *
  *   - No shell, no `child_process` at all. Downloads ride `fetch`, the
  *     body streams straight to a `.part` file, and the install is a POSIX
  *     rename — a crash mid-download can never leave a half binary at the
  *     install path.
- *   - The darwin arm64 cloudflared asset is a `.tgz`; it is unpacked with
+ *   - The archive wrapper comes from binary.ts's METADATA (`options.archive`,
+ *     what binaryUrls() models per platform), never from sniffing the URL:
+ *     the Caddy build API's URL is a query string whose ending says nothing
+ *     about the tar.gz / zip payload it answers with (GW-fix-1/H1).
+ *   - Windows' Caddy asset is a zip and there is no zip reader here yet:
+ *     refused up front with the typed `windows-zip-unsupported` code, the
+ *     manual-install link stays the fallback (GW-fix-1/H1 item 3).
+ *   - After unpacking (or for a bare download), a unix image must carry an
+ *     ELF or Mach-O magic; anything else is refused as `bad-binary-image`
+ *     and leaves nothing on disk (GW-fix-1/H1 item 4). Windows keeps no
+ *     magic check — PE inspection is not this module's job.
+ *   - The darwin cloudflared asset is a `.tgz`; it is unpacked with
  *     `zlib.gunzipSync` plus a minimal ustar reader (the archive carries a
- *     single `cloudflared` entry — no PAX/GNU long-name handling needed,
- *     but those header types are skipped correctly if an upstream rebuild
- *     adds one).
- *   - Installed images get 0755.
- *   - `ensureBinary` is idempotent: an existing executable short-circuits
- *     before any network traffic.
+ *     single entry — no PAX/GNU long-name handling needed, but those
+ *     header types are skipped correctly if an upstream rebuild adds one).
+ *   - Installed images get 0755; `ensureBinary` is idempotent (an existing
+ *     executable short-circuits before any network traffic).
  *
  * `fetch` is injectable so the tests drive real downloads against a local
  * mock server without touching the network.
@@ -26,10 +35,13 @@
 import {
   accessSync,
   chmodSync,
+  closeSync,
   constants as fsConstants,
   createWriteStream,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   renameSync,
   rmSync,
   statSync,
@@ -44,6 +56,8 @@ import {
   binaryInstallPath,
   binDir,
   binaryUrls,
+  currentPlatform,
+  type BinaryArchive,
   type BinaryPlatform,
   type IngressBinary,
 } from './binary.js'
@@ -52,36 +66,58 @@ import {
  * to fill the disk. Both real binaries sit far below 200 MB. */
 const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
+/** ELF: `\x7fELF`. */
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46])
+/** Mach-O 32 big-endian, Mach-O 64 big-endian, Mach-O 64 little-endian —
+ * the three shapes Apple toolchains emit for this codebase's targets. */
+const MACH_O_MAGICS = [
+  Buffer.from([0xfe, 0xed, 0xfa, 0xce]),
+  Buffer.from([0xfe, 0xed, 0xfa, 0xcf]),
+  Buffer.from([0xcf, 0xfa, 0xed, 0xfe]),
+]
+
+/** Whether the first bytes of an image look like an executable this module
+ * is willing to install on a unix host (GW-fix-1/H1 item 4). */
+function looksLikeUnixImage(head: Buffer): boolean {
+  return ELF_MAGIC.equals(head) || MACH_O_MAGICS.some((magic) => magic.equals(head))
+}
+
+/** The first four bytes of a file (fewer when the file is shorter). */
+function headBytes(path: string): Buffer {
+  const head = Buffer.alloc(4)
+  const fd = openSync(path, 'r')
+  try {
+    return head.subarray(0, readSync(fd, head, 0, 4, 0))
+  } finally {
+    closeSync(fd)
+  }
+}
+
 /**
- * One failed download. `code` is the wire-stable `'download-failed'` the UI
- * classifies on; `installUrl` is the official manual-install page the
+ * One failed or refused download/install. `code` is the wire-stable marker
+ * the UI classifies on — `'download-failed'` for transport/shaping
+ * failures, `'windows-zip-unsupported'` for the zip refusal, and
+ * `'bad-binary-image'` when the payload did not carry an executable
+ * image's magic. `installUrl` is the official manual-install page the
  * failure card links to. Fields are assigned in the constructor body rather
  * than declared as parameter properties (the check scripts import modules
  * through Node's strip-only type stripping, which rejects that syntax).
  */
 export class BinaryDownloadError extends Error {
-  readonly code = 'download-failed'
+  readonly code: string
   readonly tool: IngressBinary
   readonly url: string
   readonly status: number | null
   readonly installUrl: string
 
-  constructor(tool: IngressBinary, url: string, status: number | null, message: string, options?: { cause?: unknown }) {
+  constructor(tool: IngressBinary, url: string, status: number | null, message: string, options?: { cause?: unknown; code?: string }) {
     super(message, options)
     this.name = 'BinaryDownloadError'
+    this.code = options?.code ?? 'download-failed'
     this.tool = tool
     this.url = url
     this.status = status
     this.installUrl = MANUAL_INSTALL_LINKS[tool]
-  }
-}
-
-/** This process's platform, mapped into the download points' naming (the
- * pure half's mapping, restated to keep this half import-light). */
-function currentPlatformIO(): BinaryPlatform {
-  return {
-    os: process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux',
-    arch: process.arch === 'arm64' ? 'arm64' : 'amd64',
   }
 }
 
@@ -98,11 +134,10 @@ function isExecutableFile(path: string): boolean {
 
 /**
  * The installed binary's absolute path, or undefined when it is not (yet)
- * on disk in executable shape — the acceptance "binaryPath() 返回绝对路径
- * 或 undefined（未下载）". The read-only probe; see binary.ts's
+ * on disk in executable shape — the read-only probe; see binary.ts's
  * `binaryInstallPath` for the pure arithmetic.
  */
-export function binaryPath(dshHome: string, tool: IngressBinary, platform: BinaryPlatform = currentPlatformIO()): string | undefined {
+export function binaryPath(dshHome: string, tool: IngressBinary, platform: BinaryPlatform = currentPlatform()): string | undefined {
   const path = binaryInstallPath(dshHome, tool, platform)
   return isExecutableFile(path) ? path : undefined
 }
@@ -115,6 +150,10 @@ export interface DownloadBinaryOptions {
   fetchImpl?: typeof fetch
   platform?: BinaryPlatform
   onProgress?: DownloadProgress
+  /** The archive wrapper the URL delivers — metadata from binary.ts
+   * (`binaryUrls` / `caddyDownload` / `cloudflaredDownload`), NOT guessed
+   * from the URL shape. Default `'none'`: a bare executable. */
+  archive?: BinaryArchive
 }
 
 /** Write one fetched response body to `partPath` under the size cap. */
@@ -196,11 +235,25 @@ function installBytes(bytes: Uint8Array, installPath: string): void {
   }
 }
 
+/** The unix image-magic gate (GW-fix-1/H1 item 4): a payload that does not
+ * open with an ELF or Mach-O magic is refused, nothing lands on disk. */
+function assertUnixImageMagic(tool: IngressBinary, url: string, status: number | null, head: Buffer): void {
+  if (looksLikeUnixImage(head)) return
+  throw new BinaryDownloadError(
+    tool,
+    url,
+    status,
+    `the downloaded ${tool} does not carry an ELF or Mach-O image magic`,
+    { code: 'bad-binary-image' },
+  )
+}
+
 /**
  * Download one binary from an explicit URL and install it. The archive
- * wrapper is inferred from the URL's `.tgz` suffix (the only archived shape
- * the distribution points use). `platform` only matters for tests that want
- * a specific install name; it defaults to this process's.
+ * wrapper is the CALLER'S metadata (`options.archive`) — `ensureBinary`
+ * feeds it from binaryUrls(); tests pin it per fixture. `platform` only
+ * matters for the install name and the magic-check gate; it defaults to
+ * this process's.
  * @returns the absolute install path.
  */
 export async function downloadBinary(
@@ -209,8 +262,21 @@ export async function downloadBinary(
   url: string,
   options: DownloadBinaryOptions = {},
 ): Promise<string> {
-  const platform = options.platform ?? currentPlatformIO()
+  const platform = options.platform ?? currentPlatform()
+  const archive: BinaryArchive = options.archive ?? 'none'
   const installPath = binaryInstallPath(dshHome, tool, platform)
+  if (archive === 'zip') {
+    // Refused BEFORE any network traffic: there is no zip reader in this
+    // codebase yet (GW-fix-1/H1 item 3), and half-supporting the format
+    // would only install a zip's bytes as an image.
+    throw new BinaryDownloadError(
+      tool,
+      url,
+      null,
+      `the ${tool} asset for Windows ships as a zip, which cannot be unpacked here yet`,
+      { code: 'windows-zip-unsupported' },
+    )
+  }
   const fetchImpl = options.fetchImpl ?? fetch
   let response: Response
   try {
@@ -227,7 +293,7 @@ export async function downloadBinary(
   const onProgress: DownloadProgress | undefined = options.onProgress
     ? (received) => options.onProgress?.(received, total)
     : undefined
-  if (url.endsWith('.tgz')) {
+  if (archive === 'tgz') {
     // Archive: land the compressed bytes in a sibling, then unpack.
     const tgzPath = `${installPath}.download.tgz`
     try {
@@ -236,6 +302,7 @@ export async function downloadBinary(
       if (entry === undefined) {
         throw new BinaryDownloadError(tool, url, response.status, `the ${tool} archive carried no binary entry`)
       }
+      if (platform.os !== 'windows') assertUnixImageMagic(tool, url, response.status, entry.subarray(0, 4))
       installBytes(entry, installPath)
     } catch (error) {
       if (error instanceof BinaryDownloadError) throw error
@@ -245,11 +312,15 @@ export async function downloadBinary(
     }
     return installPath
   }
+  // Bare executable: stream to the .part, gate the magic, then rename.
+  const partPath = `${installPath}.part`
   try {
-    await streamToFile(tool, url, response.body as unknown as NodeWebReadableStream<Uint8Array>, `${installPath}.part`, onProgress)
-    chmodExec(`${installPath}.part`)
-    renameSync(`${installPath}.part`, installPath)
+    await streamToFile(tool, url, response.body as unknown as NodeWebReadableStream<Uint8Array>, partPath, onProgress)
+    if (platform.os !== 'windows') assertUnixImageMagic(tool, url, response.status, headBytes(partPath))
+    chmodExec(partPath)
+    renameSync(partPath, installPath)
   } catch (error) {
+    rmSync(partPath, { force: true })
     if (error instanceof BinaryDownloadError) throw error
     throw new BinaryDownloadError(tool, url, response.status, `the download of ${tool} could not be written to disk`, { cause: error })
   }
@@ -264,8 +335,8 @@ export interface EnsureBinaryOptions extends DownloadBinaryOptions {
 /**
  * The idempotent front door: an already-installed executable short-circuits
  * (no network), anything else downloads from the official distribution
- * point for the tool. `fetchImpl` injects the transport (tests point it at
- * a local mock server).
+ * point for the tool, archive shape included. `fetchImpl` injects the
+ * transport (tests point it at a local mock server).
  * @returns the absolute install path and whether THIS call downloaded.
  */
 export async function ensureBinary(
@@ -273,10 +344,11 @@ export async function ensureBinary(
   tool: IngressBinary,
   options: EnsureBinaryOptions = {},
 ): Promise<{ path: string; downloaded: boolean }> {
-  const platform = options.platform ?? currentPlatformIO()
+  const platform = options.platform ?? currentPlatform()
   const existing = binaryPath(dshHome, tool, platform)
   if (existing !== undefined) return { path: existing, downloaded: false }
-  const url = tool === 'caddy' ? binaryUrls(platform).caddy : binaryUrls(platform).cloudflared
-  const path = await downloadBinary(dshHome, tool, url, options)
+  const urls = binaryUrls(platform)
+  const [url, archive] = tool === 'caddy' ? [urls.caddy, urls.caddyArchive] : [urls.cloudflared, urls.cloudflaredArchive]
+  const path = await downloadBinary(dshHome, tool, url, { ...options, archive })
   return { path, downloaded: true }
 }

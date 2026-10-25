@@ -133,18 +133,49 @@ test('the via-gateway marker refuses EVERY wizard route, GET included', async ()
   assert.equal(JSON.parse(post.body).error.code, 'via-gateway')
 })
 
-test('admit rejections relay verbatim and the walls run admit FIRST', async () => {
+test('admit rejections relay verbatim BEFORE the via wall; via loses to admit (GW-fix-1/L2)', async () => {
   for (const status of [401, 403]) {
     const { server, port } = await serve(wizard.createWizardHandler(wizardOptions({ admit: () => ({ rejection: status }) })))
     try {
-      const get = await request(port, { method: 'GET', path: wizard.WIZARD_STATUS_ROUTE })
+      // The via header is deliberately PRESENT: admit is wall 1, so its
+      // rejection must win with the plain unauthorized/forbidden envelope —
+      // answering `via-gateway` here would mean the walls swapped places.
+      const headers = { 'x-zen-remote-via': 'gateway' }
+      const get = await request(port, { method: 'GET', path: wizard.WIZARD_STATUS_ROUTE, headers })
       assert.equal(get.status, status)
       assert.equal(JSON.parse(get.body).error.code, status === 401 ? 'unauthorized' : 'forbidden')
-      const post = await request(port, { method: 'POST', path: `${wizard.WIZARD_ROUTE_PREFIX}/x`, headers: sameOrigin(port), body: {} })
+      const post = await request(port, { method: 'POST', path: `${wizard.WIZARD_ROUTE_PREFIX}/x`, headers: { ...headers, ...sameOrigin(port) }, body: {} })
       assert.equal(post.status, status)
+      assert.equal(JSON.parse(post.body).error.code, status === 401 ? 'unauthorized' : 'forbidden')
     } finally {
       await new Promise((resolve) => server.close(resolve))
     }
+  }
+})
+
+test('a throwing admit degrades to the JSON 500 envelope, not an unhandled rejection (GW-fix-1/L1)', async () => {
+  const { server, port } = await serve(wizard.createWizardHandler(wizardOptions({
+    admit: () => { throw new Error('connection service exploded') },
+  })))
+  try {
+    const res = await request(port, { method: 'GET', path: wizard.WIZARD_STATUS_ROUTE })
+    assert.equal(res.status, 500)
+    assert.equal(JSON.parse(res.body).error.code, 'internal')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+test('a malformed request URL (new URL throws) degrades to the JSON 500 envelope too (GW-fix-1/L1)', async () => {
+  const { server, port } = await serve(wizard.createWizardHandler(wizardOptions()))
+  try {
+    // The one malformed shape WHATWG new URL actually rejects: an invalid
+    // IPv6 authority (//bad//url etc. parse fine, they just look odd).
+    const res = await request(port, { method: 'GET', path: '//[::z]/' })
+    assert.equal(res.status, 500)
+    assert.equal(JSON.parse(res.body).error.code, 'internal')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
   }
 })
 

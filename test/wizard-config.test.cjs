@@ -79,16 +79,48 @@ test('ingressHttpsPort accepts only [1, 65535]; the file layer keeps its digit-s
   assert.equal(viaFile.sources.ingressHttpsPort, 'file')
 })
 
-test('ingressAcmeEmail must look like an email; ingressDomain must be non-blank', async () => {
+test('ingressAcmeEmail must look like an email', async () => {
   const { resolveConfig } = await load('config.js')
   assert.equal(resolveConfig({ ingressAcmeEmail: 'a@b.c' }, {}, {}).values.ingressAcmeEmail, 'a@b.c', 'the minimal dotted shape is legal')
   assert.equal(resolveConfig({ ingressAcmeEmail: 'admin@mail.example.com' }, {}, {}).values.ingressAcmeEmail, 'admin@mail.example.com')
   for (const bad of ['not-an-email', 'a@b', 'a b@c.d', 'a@b.c d', 42, '']) {
     assert.equal(resolveConfig({ ingressAcmeEmail: bad }, {}, {}).values.ingressAcmeEmail, '', `acmeEmail ${JSON.stringify(bad)} must fall to the default`)
   }
+})
+
+test('ingressDomain must be a bare hostname: no scheme, path, whitespace, braces, newline or port (GW-fix-1/M1)', async () => {
+  const { resolveConfig } = await load('config.js')
+  for (const ok of ['dsh.example.com', 'mybox', 'a-b.cd', '192.168.1.10', 'a.b.c.d.e']) {
+    const r = resolveConfig({ ingressDomain: ok }, {}, {})
+    assert.equal(r.values.ingressDomain, ok, `${ok} is a legal bare hostname`)
+    assert.equal(r.sources.ingressDomain, 'row')
+  }
+  // The ticket's five illegal shapes, plus the adjacent ones the grammar
+  // rules out: any of these flowing into generated Caddyfile/DNS material
+  // would break the config or smuggle an injection.
+  for (const bad of [
+    'https://foo', // scheme
+    'foo/path', // path
+    'foo bar', // space
+    'foo\nbar', // newline
+    'foo{}', // braces
+    'foo:443', // port
+    'HTTP://foo', // scheme, any case
+    'foo..bar', // empty label
+    '-foo', 'foo-', // hyphen at a label edge
+    `${'a'.repeat(64)}.com`, // label over 63
+    `${`${'a'.repeat(63)}.`.repeat(4)}com`, // total over 253
+    'pünct.example', // non-ASCII (must arrive punycoded)
+    '   ', 42, '', null,
+  ]) {
+    const r = resolveConfig({ ingressDomain: bad }, {}, {})
+    assert.equal(r.values.ingressDomain, '', `ingressDomain ${JSON.stringify(String(bad).slice(0, 20))} must fall to the default`)
+    assert.equal(r.sources.ingressDomain, 'default')
+  }
+  // A legal file value still answers when the row wrote junk.
+  const rescued = resolveConfig({ ingressDomain: 'foo{}' }, { ingressDomain: 'file.example.com' }, {})
+  assert.equal(rescued.values.ingressDomain, 'file.example.com')
   assert.equal(resolveConfig({ ingressDomain: 'dsh.example.com' }, {}, {}).values.ingressDomain, 'dsh.example.com')
-  assert.equal(resolveConfig({ ingressDomain: '   ' }, {}, {}).values.ingressDomain, '', 'blank is unset')
-  assert.equal(resolveConfig({ ingressDomain: 123 }, {}, {}).values.ingressDomain, '')
 })
 
 test('ingressPublicUrl accepts only an http(s) origin: any path, query, fragment or userinfo is illegal', async () => {
