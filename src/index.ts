@@ -829,7 +829,14 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             try {
               const response = await fetch(`http://127.0.0.1:${effective.values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
               if (!response.ok) return {}
-              return { lastForwardedSource: detectForwardedSource(await response.json()) }
+              const body = (await response.json()) as { port?: unknown; lastForwardedSource?: unknown }
+              return {
+                lastForwardedSource: detectForwardedSource(body),
+                // GW-fix-3/M2: the wizard's snippets and QR target the
+                // gateway's ACTUAL port (it may have retried past the
+                // configured one).
+                gatewayActualPort: typeof body?.port === 'number' ? body.port : undefined,
+              }
             } catch {
               // No answer is no detection — the status projection renders
               // its null shape and the UI offers nothing.

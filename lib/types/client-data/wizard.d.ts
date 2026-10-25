@@ -77,6 +77,25 @@ export type WizardStep = 'pick' | 'configure' | 'verify';
 export type WizardPath = 'caddy' | 'external' | 'cloudflared';
 /** Where the wizard opens: a configured ingress jumps straight to verify. */
 export declare function initialStep(status: WizardStatusBody | undefined): WizardStep;
+export interface WizardFormSeed {
+    domain: string;
+    httpsPort: string;
+    serverUrl: string;
+    path: WizardPath | undefined;
+}
+/**
+ * The configure-form seed from one wizard status projection (GW-fix-3/M1):
+ * the projection (wizard/status) is the ONLY surface that carries the
+ * ingress fields — admin/status strips them by design, so the form must
+ * seed from here. Empty values leave the form untouched.
+ */
+export declare function formSeedOf(status: WizardStatusBody | undefined): WizardFormSeed;
+/**
+ * The reverse-proxy snippet's upstream port: the gateway's ACTUAL port as
+ * the wizard runtime reports it, falling back to the configured default
+ * 3088 when no status has landed yet (GW-fix-3/M2).
+ */
+export declare function upstreamPortOf(status: WizardStatusBody | undefined): number;
 /** The step AFTER pick, given the user's path choice. */
 export declare function stepAfterPick(): WizardStep;
 export declare function isValidHostname(value: string): boolean;

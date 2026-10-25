@@ -224,9 +224,10 @@ function placeData(grid: Grid, codewords: Uint8Array): void {
     // Fill the pair top-to-bottom or bottom-to-top until the edge.
     while (true) {
       const cells = grid[row]
-      if (cells === undefined) continue
+      // `row` is always in range here (the while loop flips before that can
+      // change); the guard only keeps a future invariant break non-fatal.
+      if (cells === undefined) break
       for (let col = right; col >= right - 1; col--) {
-        // An out-of-bounds read (leftmost odd column) reads as "reserved".
         const current = cells[col]
         if (current !== true && current !== false) {
           let dark = false
