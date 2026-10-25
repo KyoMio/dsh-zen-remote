@@ -519,6 +519,7 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 - **稳定选择器**：用 `[data-slot=...]` / ARIA 而非 hash 类名，避免前端构建后失效。
 - **注入页的单引号坑**：`lib/lan-gate-server.cjs` 里的注入脚本字符串，历史上有「双引号套双引号」bug，注意字面量转义。
 - **本机直连判定**：新增/修改路由前先看 `isLocalDirect`——它是管理面 403 防护的唯一依据，别绕过它。
+- **改 `pwa/inject.js` 要重启网关**：`lib/lan-gate-server.cjs` 在网关子进程启动时把 `pwa/inject.js` 一次性读进内存常量 `INJECT_JS`（`readPwaText('inject.js')`，用于拼装首帧 HTML 的注入脚本），之后不再读盘——本地改完 `pwa/inject.js` 必须重启网关子进程（或重启 DSH）才会出现在响应里。
 
 ---
 

@@ -5,13 +5,14 @@ import { closeOpenSidebar } from '../sidebar-panels.ts'
 /** Phone breakpoint — same query every phone-only effect in this plugin uses. */
 const PHONE_QUERY = '(max-width: 767px)'
 
-/** This plugin's two dismissible sheets (session-info, home workspace/chips
+/** This plugin's dismissible sheets (session-info, home workspace/chips
  * picker — MobileHome.tsx's home-sheet hosts both the workspace switcher and
- * the S5 chip-customize list under the same marker). Official popupSelect
- * menus (permission/model) are deliberately excluded — the design spec
+ * the S5 chip-customize list under the same marker, and the ⋯ composer-more
+ * sheet from model-sheet-extras.ts). Official popupSelect menus
+ * (permission/model) are deliberately excluded — the design spec
  * leaves those mask-tap-only, and they are the suite's own DOM, not ours to
  * add gesture handling to. */
-const SHEET_SELECTOR = '[data-mobile-nav="info-sheet"], [data-mobile-nav="home-sheet"]'
+const SHEET_SELECTOR = '[data-mobile-nav="info-sheet"], [data-mobile-nav="home-sheet"], [data-mobile-nav="composer-more-sheet"]'
 
 const CLOSE_DISTANCE = 80
 /** px/ms — a fast flick closes the sheet even short of CLOSE_DISTANCE. */
