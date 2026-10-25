@@ -94,7 +94,7 @@ dsh plugin --profile web add dsh-zen-remote
 // ~/.dsh/profiles/desktop/package.json
 {
   "dependencies": {
-    "dsh-zen-remote": "^2.2.6"        // for local development: "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^2.2.7"        // for local development: "link:/path/to/dsh-zen-remote"
   }
 }
 ```
