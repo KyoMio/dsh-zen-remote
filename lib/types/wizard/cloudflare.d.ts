@@ -67,6 +67,8 @@ export interface CloudflareApi {
     }>;
     /** The account's live tunnels (deleted ones filtered server-side). */
     listTunnels(accountId: string): Promise<CloudflareTunnelSummary[]>;
+    /** The connector token of an EXISTING tunnel (the re-use path of setup). */
+    getTunnelToken(accountId: string, tunnelId: string): Promise<string>;
     /** Map `domain` → `serviceUrl` in the tunnel's ingress, 404 fallback last. */
     configureIngress(accountId: string, tunnelId: string, domain: string, serviceUrl: string): Promise<void>;
     /** One proxied CNAME `subdomain` → `target`; returns the record id. */
@@ -93,6 +95,7 @@ export declare function cfCreateTunnel(token: string, accountId: string, name: s
     token: string;
 }>;
 export declare function cfListTunnels(token: string, accountId: string, opts?: CfCallOptions): Promise<CloudflareTunnelSummary[]>;
+export declare function cfGetTunnelToken(token: string, accountId: string, tunnelId: string, opts?: CfCallOptions): Promise<string>;
 export declare function cfConfigureIngress(token: string, accountId: string, tunnelId: string, domain: string, serviceUrl: string, opts?: CfCallOptions): Promise<void>;
 export declare function cfCreateDnsRecord(token: string, zoneId: string, subdomain: string, target: string, opts?: CfCallOptions): Promise<string>;
 export declare function cfCheckDomainOnCloudflare(token: string, domain: string, opts?: CfCallOptions): Promise<CloudflareDomainCheck>;

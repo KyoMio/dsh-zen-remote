@@ -77,12 +77,15 @@ export interface CloudflaredManager {
   stop(): void
   /** Whether a child is currently held. */
   isRunning(): boolean
+  /** Whether any start has succeeded in this manager's lifetime. */
+  hasStarted(): boolean
 }
 
 export function createCloudflaredManager(options: CloudflaredManagerOptions): CloudflaredManager {
   const { subprocess, dshHome } = options
   const maxLogBytes = options.maxLogBytes ?? 64 * 1024
   let handle: SubprocessHandleLike | null = null
+  let startedOnce = false
 
   // GW-fix-2/L3: whitelist env — the host process carries the relay secret
   // and DSH's own credentials, and cloudflared needs none of them (its
@@ -144,6 +147,7 @@ export function createCloudflaredManager(options: CloudflaredManagerOptions): Cl
       try {
         const child = spawnChild([binaryPath, 'tunnel', 'run', '--token-file', tokenFile])
         handle = child
+        startedOnce = true
         void child.done.then(() => clearSlot(child)).catch(() => clearSlot(child))
         return { ok: true, binaryPath, tokenFile, alreadyRunning: false }
       } catch (error) {
@@ -164,5 +168,7 @@ export function createCloudflaredManager(options: CloudflaredManagerOptions): Cl
     },
 
     isRunning: () => handle !== null,
+    /** Whether any start has succeeded in this manager's lifetime. */
+    hasStarted: () => startedOnce,
   }
 }

@@ -24,8 +24,44 @@ export declare const WIZARD_CADDY_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/
 export declare const WIZARD_TUNNEL_CHECK_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/check-domain";
 export declare const WIZARD_TUNNEL_SETUP_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/setup";
 export declare const WIZARD_TUNNEL_STOP_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/stop";
+export declare const WIZARD_TUNNEL_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/status";
 /** Wire mirror of src/wizard/routes.ts's CaddyProcessState. */
 export type CaddyState = 'running' | 'stopped' | 'never-started';
+/** Wire mirror of src/wizard/tunnel-orchestrator.ts's results. */
+export interface TunnelExisting {
+    id: string;
+    name: string;
+    status: string;
+}
+export type TunnelSetupWire = {
+    ok: true;
+    tunnelId: string;
+    publicUrl: string;
+} | {
+    ok: false;
+    reason: string;
+    detail?: string;
+    existing?: TunnelExisting[];
+};
+export type TunnelCheckWire = {
+    ok: true;
+    onCloudflare: boolean;
+    zoneId: string | null;
+} | {
+    ok: false;
+    reason: string;
+    detail?: string;
+};
+/** The tunnel setup failure's locale key (plus params). Pure. */
+export declare function tunnelFailureCopy(reason: string, detail?: string): {
+    key: string;
+    params: Record<string, string>;
+};
+/** The domain check's copy (the migration card's re-check). Pure. */
+export declare function tunnelCheckCopy(result: TunnelCheckWire): {
+    key: string;
+    tone: 'ok' | 'error';
+};
 /** Wire mirror of src/wizard/status.ts's WizardStatus. */
 export interface WizardStatusBody {
     ok: true;

@@ -112,6 +112,8 @@ export interface CloudflareApi {
   createTunnel(accountId: string, name: string): Promise<{ id: string; token: string }>
   /** The account's live tunnels (deleted ones filtered server-side). */
   listTunnels(accountId: string): Promise<CloudflareTunnelSummary[]>
+  /** The connector token of an EXISTING tunnel (the re-use path of setup). */
+  getTunnelToken(accountId: string, tunnelId: string): Promise<string>
   /** Map `domain` → `serviceUrl` in the tunnel's ingress, 404 fallback last. */
   configureIngress(accountId: string, tunnelId: string, domain: string, serviceUrl: string): Promise<void>
   /** One proxied CNAME `subdomain` → `target`; returns the record id. */
@@ -251,6 +253,13 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
       return { id: requireString(record?.id, 'a tunnel id'), token: requireString(record?.token, 'a tunnel token') }
     },
 
+    async getTunnelToken(accountId, tunnelId) {
+      const id = requireId(accountId, 'the account id')
+      const tunnel = requireId(tunnelId, 'the tunnel id')
+      const { result } = await call('GET', `/accounts/${seg(id)}/cfd_tunnel/${seg(tunnel)}/token`)
+      return requireString((result as { token?: unknown })?.token, 'a tunnel token')
+    },
+
     async listTunnels(accountId) {
       const id = requireId(accountId, 'the account id')
       const tunnels: CloudflareTunnelSummary[] = []
@@ -346,6 +355,10 @@ export function cfCreateTunnel(token: string, accountId: string, name: string, o
 
 export function cfListTunnels(token: string, accountId: string, opts?: CfCallOptions): Promise<CloudflareTunnelSummary[]> {
   return createCloudflareApi({ token, ...opts }).listTunnels(accountId)
+}
+
+export function cfGetTunnelToken(token: string, accountId: string, tunnelId: string, opts?: CfCallOptions): Promise<string> {
+  return createCloudflareApi({ token, ...opts }).getTunnelToken(accountId, tunnelId)
 }
 
 export function cfConfigureIngress(

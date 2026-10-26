@@ -63,6 +63,7 @@ function wizardOptions(overrides = {}) {
     ...(overrides.verify !== undefined ? { verify: overrides.verify } : {}),
     ...(overrides.tokenStore !== undefined ? { tokenStore: overrides.tokenStore } : {}),
     ...(overrides.caddy !== undefined ? { caddy: overrides.caddy } : {}),
+    ...(overrides.tunnel !== undefined ? { tunnel: overrides.tunnel } : {}),
   }
 }
 
@@ -569,5 +570,96 @@ test('caddy routes unwired answer 501 (GW-13a compatibility)', async () => {
     }
   } finally {
     await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+// ---- GW-13b: tunnel routes -------------------------------------------------------
+
+test('tunnel routes: walls, then wiring; setup carries no connector token (GW-13b)', async () => {
+  const calls = []
+  const { server, port } = await serve(wizard.createWizardHandler(wizardOptions({
+    tunnel: {
+      checkDomain: async (domain) => { calls.push(['check', domain]); return { ok: true, onCloudflare: true, zoneId: 'z1', accountId: 'a1' } },
+      setup: async (input) => { calls.push(['setup', input]); return { ok: true, tunnelId: 't1', publicUrl: 'https://x', tokenFile: '/secret/path' } },
+      stop: () => { calls.push(['stop']) },
+      status: () => 'running',
+    },
+  })))
+  try {
+    // Status (GET, no same-origin needed) and a happy setup.
+    const status = await request(port, { method: 'GET', path: wizard.WIZARD_TUNNEL_STATUS_ROUTE })
+    assert.equal(status.status, 200)
+    assert.deepEqual(JSON.parse(status.body), { ok: true, state: 'running' })
+
+    const setup = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_TUNNEL_SETUP_ROUTE,
+      headers: sameOrigin(port),
+      body: { domain: 'dsh.example.com' },
+    })
+    assert.equal(setup.status, 200)
+    assert.deepEqual(JSON.parse(setup.body), { ok: true, tunnelId: 't1', publicUrl: 'https://x' })
+    assert.ok(!setup.body.includes('/secret/path'), 'the token FILE PATH must not reach the browser either')
+    assert.deepEqual(calls[0], ['setup', { domain: 'dsh.example.com', tunnelId: undefined }], 'the orchestrator receives the domain (and the absent adoption)')
+
+    const check = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_TUNNEL_CHECK_ROUTE,
+      headers: sameOrigin(port),
+      body: { domain: 'dsh.example.com' },
+    })
+    assert.deepEqual(JSON.parse(check.body), { ok: true, onCloudflare: true, zoneId: 'z1' })
+
+    const stop = await request(port, { method: 'POST', path: wizard.WIZARD_TUNNEL_STOP_ROUTE, headers: sameOrigin(port) })
+    assert.equal(JSON.parse(stop.body).state, 'running')
+
+    // A conflict setup relays the same-name list.
+    const conflict = await serve(wizard.createWizardHandler(wizardOptions({
+      tunnel: {
+        checkDomain: async () => ({ ok: true, onCloudflare: true, zoneId: 'z', accountId: 'a' }),
+        setup: async () => ({ ok: false, reason: 'tunnel-conflict', existing: [{ id: 'tun-old', name: 'dsh-zen-remote', status: 'down' }] }),
+        stop: () => {},
+        status: () => 'never-started',
+      },
+    })))
+    try {
+      const listed = await request(conflict.port, {
+        method: 'POST',
+        path: wizard.WIZARD_TUNNEL_SETUP_ROUTE,
+        headers: sameOrigin(conflict.port),
+        body: { domain: 'dsh.example.com' },
+      })
+      assert.equal(listed.status, 200)
+      assert.equal(JSON.parse(listed.body).reason, 'tunnel-conflict')
+      assert.deepEqual(JSON.parse(listed.body).existing, [{ id: 'tun-old', name: 'dsh-zen-remote', status: 'down' }])
+    } finally {
+      await new Promise((resolve) => conflict.server.close(resolve))
+    }
+
+    // The walls hold on the whole tunnel subtree.
+    const cross = await request(port, { method: 'POST', path: wizard.WIZARD_TUNNEL_SETUP_ROUTE, headers: { origin: 'http://evil.example' }, body: { domain: 'x' } })
+    assert.equal(cross.status, 403)
+    const via = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_TUNNEL_SETUP_ROUTE,
+      headers: { 'x-zen-remote-via': 'gateway', ...sameOrigin(port) },
+      body: { domain: 'x' },
+    })
+    assert.equal(via.status, 403)
+    const put = await request(port, { method: 'PUT', path: wizard.WIZARD_TUNNEL_SETUP_ROUTE, headers: sameOrigin(port) })
+    assert.equal(put.status, 405)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+
+  // Unwired: 501 everywhere under the tunnel subtree.
+  const bare = await serve(wizard.createWizardHandler(wizardOptions()))
+  try {
+    for (const [method, path] of [['POST', wizard.WIZARD_TUNNEL_SETUP_ROUTE], ['GET', wizard.WIZARD_TUNNEL_STATUS_ROUTE], ['POST', wizard.WIZARD_TUNNEL_CHECK_ROUTE]]) {
+      const res = await request(bare.port, { method, path, headers: sameOrigin(bare.port) })
+      assert.equal(res.status, 501, path)
+    }
+  } finally {
+    await new Promise((resolve) => bare.server.close(resolve))
   }
 })

@@ -21,6 +21,8 @@ import assert from 'node:assert/strict'
 import {
   caddyFailureCopy,
   configureReadiness,
+  tunnelCheckCopy,
+  tunnelFailureCopy,
   caddySnippetText,
   deriveWizardLights,
   formSeedOf,
@@ -28,6 +30,10 @@ import {
   WIZARD_CADDY_START_ROUTE,
   WIZARD_CADDY_STATUS_ROUTE,
   WIZARD_CADDY_STOP_ROUTE,
+  WIZARD_TUNNEL_CHECK_ROUTE,
+  WIZARD_TUNNEL_SETUP_ROUTE,
+  WIZARD_TUNNEL_STATUS_ROUTE,
+  WIZARD_TUNNEL_STOP_ROUTE,
   WIZARD_TUNNEL_TOKEN_ROUTE,
   initialStep,
   isValidHostname,
@@ -46,6 +52,10 @@ import {
   WIZARD_CADDY_STOP_ROUTE as HOST_CADDY_STOP_ROUTE,
   WIZARD_CADDY_STATUS_ROUTE as HOST_CADDY_STATUS_ROUTE,
   WIZARD_TUNNEL_TOKEN_ROUTE as HOST_TUNNEL_TOKEN_ROUTE,
+  WIZARD_TUNNEL_CHECK_ROUTE as HOST_TUNNEL_CHECK_ROUTE,
+  WIZARD_TUNNEL_SETUP_ROUTE as HOST_TUNNEL_SETUP_ROUTE,
+  WIZARD_TUNNEL_STATUS_ROUTE as HOST_TUNNEL_STATUS_ROUTE,
+  WIZARD_TUNNEL_STOP_ROUTE as HOST_TUNNEL_STOP_ROUTE,
 } from '../lib/wizard/routes.js'
 
 import { en, zh } from '../src/client/locales.ts'
@@ -179,6 +189,34 @@ await test('the route constants mirror the host routes (GW-13a)', () => {
   assert.equal(WIZARD_TUNNEL_TOKEN_ROUTE, HOST_TUNNEL_TOKEN_ROUTE)
 })
 
+await test('tunnelFailureCopy / tunnelCheckCopy: every reason maps to its locale key (GW-13b)', () => {
+  for (const [reason, key] of [
+    ['tunnel-conflict', 'wizard.tunnel.conflict'],
+    ['zone-not-found', 'wizard.tunnel.zoneNotFound'],
+    ['auth', 'wizard.tunnel.auth'],
+    ['network', 'wizard.tunnel.network'],
+    ['no-token', 'wizard.tunnel.noToken'],
+    ['bad-domain', 'wizard.tunnel.badDomain'],
+    ['spawn-failed', 'wizard.tunnel.spawnFailed'],
+  ]) {
+    const copy = tunnelFailureCopy(reason, 'd')
+    assert.equal(copy.key, key, reason)
+    if (reason === 'spawn-failed') assert.deepEqual(copy.params, { detail: 'd' })
+  }
+  // Unknown reasons degrade to the generic API failure carrying the reason.
+  assert.deepEqual(tunnelFailureCopy('anything-new'), { key: 'wizard.tunnel.api', params: { detail: 'anything-new' } })
+  assert.deepEqual(tunnelCheckCopy({ ok: true, onCloudflare: true, zoneId: 'z' }), { key: 'wizard.check.okOnCf', tone: 'ok' })
+  assert.equal(tunnelCheckCopy({ ok: true, onCloudflare: false, zoneId: null }).tone, 'error')
+  assert.equal(tunnelCheckCopy({ ok: false, reason: 'network' }).key, 'wizard.check.failed')
+})
+
+await test('the tunnel route constants mirror the host routes (GW-13b)', () => {
+  assert.equal(WIZARD_TUNNEL_CHECK_ROUTE, HOST_TUNNEL_CHECK_ROUTE)
+  assert.equal(WIZARD_TUNNEL_SETUP_ROUTE, HOST_TUNNEL_SETUP_ROUTE)
+  assert.equal(WIZARD_TUNNEL_STATUS_ROUTE, HOST_TUNNEL_STATUS_ROUTE)
+  assert.equal(WIZARD_TUNNEL_STOP_ROUTE, HOST_TUNNEL_STOP_ROUTE)
+})
+
 await test('the pairing countdown counts whole seconds, never negative', () => {
   const now = 1_000_000
   assert.equal(pairingSecondsLeft(now + 59_500, now), 60)
@@ -221,6 +259,11 @@ const WIZARD_KEYS = [
   'wizard.caddy.failMissingToken', 'wizard.caddy.failNoDomain', 'wizard.caddy.failBadConfig',
   'wizard.caddy.failSpawn',
   'wizard.token.saved', 'wizard.token.saveFailed',
+  'wizard.tunnel.setup', 'wizard.tunnel.stop', 'wizard.tunnel.running', 'wizard.tunnel.stopped',
+  'wizard.tunnel.neverStarted', 'wizard.tunnel.ok', 'wizard.tunnel.conflict', 'wizard.tunnel.useExisting',
+  'wizard.tunnel.zoneNotFound', 'wizard.tunnel.auth', 'wizard.tunnel.network', 'wizard.tunnel.api',
+  'wizard.tunnel.spawnFailed', 'wizard.tunnel.noToken', 'wizard.tunnel.badDomain', 'wizard.tunnel.checking',
+  'wizard.check.okOnCf', 'wizard.check.okNotOnCf', 'wizard.check.failed',
   'wizard.card.migrateTitle', 'wizard.card.migrateRecheck',
   'wizard.card.migrateStep1', 'wizard.card.migrateStep2', 'wizard.card.migrateStep3',
   'wizard.card.migrateStep4', 'wizard.card.migrateStep5', 'wizard.card.migrateStep6',

@@ -60,6 +60,8 @@ export interface CloudflaredManager {
     stop(): void;
     /** Whether a child is currently held. */
     isRunning(): boolean;
+    /** Whether any start has succeeded in this manager's lifetime. */
+    hasStarted(): boolean;
 }
 export declare function createCloudflaredManager(options: CloudflaredManagerOptions): CloudflaredManager;
 //# sourceMappingURL=cloudflared.d.ts.map
