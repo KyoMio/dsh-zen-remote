@@ -52,6 +52,8 @@ export function tunnelFailureCopy(reason: string, detail?: string): { key: strin
       return { key: 'wizard.tunnel.conflict', params: {} }
     case 'zone-not-found':
       return { key: 'wizard.tunnel.zoneNotFound', params: {} }
+    case 'dns-conflict':
+      return { key: 'wizard.tunnel.dnsConflict', params: { detail: detail ?? '' } }
     case 'auth':
       return { key: 'wizard.tunnel.auth', params: {} }
     case 'network':

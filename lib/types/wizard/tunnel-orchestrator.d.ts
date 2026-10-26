@@ -27,8 +27,9 @@ export interface TunnelOrchestratorOptions {
     dshHome: string;
     /** The stored Cloudflare token (token-store); absent → `no-token`. */
     readToken: () => string | undefined;
-    /** The gateway's ACTUAL port (the ingress service target). */
-    gatewayPort: () => number;
+    /** The gateway's ACTUAL port (the ingress service target); may probe
+     * asynchronously (the wiring re-reads /lan-gate/status per setup). */
+    gatewayPort: () => number | Promise<number>;
     /** The client factory; injectable so the tests drive the orchestration
      * against a scripted CloudflareApi without any HTTP. Defaults to
      * createCloudflareApi over the injected fetch. */
@@ -60,7 +61,7 @@ export type TunnelSetupResult = {
     tokenFile: string;
 } | {
     ok: false;
-    reason: 'no-token' | 'bad-domain' | 'zone-not-found' | 'tunnel-conflict' | 'auth' | 'network' | 'api' | 'spawn-failed';
+    reason: 'no-token' | 'bad-domain' | 'zone-not-found' | 'tunnel-conflict' | 'dns-conflict' | 'auth' | 'network' | 'api' | 'spawn-failed';
     detail?: string;
     /** The same-name tunnels, for `tunnel-conflict`. */
     existing?: CloudflareTunnelSummary[];

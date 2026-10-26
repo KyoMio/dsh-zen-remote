@@ -193,6 +193,7 @@ await test('tunnelFailureCopy / tunnelCheckCopy: every reason maps to its locale
   for (const [reason, key] of [
     ['tunnel-conflict', 'wizard.tunnel.conflict'],
     ['zone-not-found', 'wizard.tunnel.zoneNotFound'],
+    ['dns-conflict', 'wizard.tunnel.dnsConflict'],
     ['auth', 'wizard.tunnel.auth'],
     ['network', 'wizard.tunnel.network'],
     ['no-token', 'wizard.tunnel.noToken'],
@@ -202,6 +203,7 @@ await test('tunnelFailureCopy / tunnelCheckCopy: every reason maps to its locale
     const copy = tunnelFailureCopy(reason, 'd')
     assert.equal(copy.key, key, reason)
     if (reason === 'spawn-failed') assert.deepEqual(copy.params, { detail: 'd' })
+    if (reason === 'dns-conflict') assert.deepEqual(copy.params, { detail: 'd' })
   }
   // Unknown reasons degrade to the generic API failure carrying the reason.
   assert.deepEqual(tunnelFailureCopy('anything-new'), { key: 'wizard.tunnel.api', params: { detail: 'anything-new' } })
@@ -261,7 +263,7 @@ const WIZARD_KEYS = [
   'wizard.token.saved', 'wizard.token.saveFailed',
   'wizard.tunnel.setup', 'wizard.tunnel.stop', 'wizard.tunnel.running', 'wizard.tunnel.stopped',
   'wizard.tunnel.neverStarted', 'wizard.tunnel.ok', 'wizard.tunnel.conflict', 'wizard.tunnel.useExisting',
-  'wizard.tunnel.zoneNotFound', 'wizard.tunnel.auth', 'wizard.tunnel.network', 'wizard.tunnel.api',
+  'wizard.tunnel.zoneNotFound', 'wizard.tunnel.dnsConflict', 'wizard.tunnel.auth', 'wizard.tunnel.network', 'wizard.tunnel.api',
   'wizard.tunnel.spawnFailed', 'wizard.tunnel.noToken', 'wizard.tunnel.badDomain', 'wizard.tunnel.checking',
   'wizard.check.okOnCf', 'wizard.check.okNotOnCf', 'wizard.check.failed',
   'wizard.card.migrateTitle', 'wizard.card.migrateRecheck',

@@ -712,7 +712,10 @@ test('T33a: the host role restores busy on startup, auto-shares fresh top-level 
   // back to zero viewers instead of reading a dead handler. The disposer is
   // the effect callback's return, captured by the fake's effectReturns —
   // the only captured return that is not a fake webServer unregister.
-  const relayTeardown = effectReturns.find((d) => typeof d === 'function' && !d.isFakeUnregister)
+  // GW-fix-4: the wizard effect now returns a REAL disposer (it stops the
+  // managed children), so "first non-fake" no longer identifies the relay
+  // teardown — the relay registers LAST, so take the LAST non-fake one.
+  const relayTeardown = effectReturns.findLast((d) => typeof d === 'function' && !d.isFakeUnregister)
   assert.equal(typeof relayTeardown, 'function', 'the relay registration carries a teardown')
   relayTeardown()
   assert.equal((await fetchShares()).shares.find((s) => s.sessionId === 'live-1').viewers, 0, 'a disposed relay handler reads as zero viewers, not a crash')
