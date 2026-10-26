@@ -101,7 +101,11 @@ export interface ProbeOptions {
   now?: () => number
 }
 
-/** One manual-redirect GET, classified. */
+/** One manual-redirect GET, classified. Sends a browser-shaped `Accept:
+ * text/html` (never `application/json`, which tells `lan-gate-server.cjs`
+ * the caller is an XHR/API client and makes `GET /` answer 401 JSON
+ * `{"ok":false,"reason":"unpaired"}` instead of the HTML pairing page;
+ * `/lan-gate/admin` answers 403 JSON regardless of `Accept`). */
 async function probeOnce(
   fetchImpl: typeof fetch,
   url: string,
@@ -110,7 +114,7 @@ async function probeOnce(
   const response = await fetchImpl(url, {
     redirect: 'manual',
     signal: AbortSignal.timeout(timeoutMs),
-    headers: { Accept: 'text/html, application/json' },
+    headers: { Accept: 'text/html' },
   })
   const body = await response.text()
   return { status: response.status, contentType: String(response.headers.get('content-type') ?? ''), body }
@@ -130,7 +134,7 @@ export async function probeHostPath(publicUrl: unknown, options: ProbeOptions = 
   // only into the explicit private-network allowances.
   const normalized = normalizeServerUrl(typeof publicUrl === 'string' ? publicUrl : '')
   if (!normalized.ok) {
-    return { kind: 'unreachable', reason: normalized.reason === 'insecure-http' ? 'insecure-http' : 'invalid-url', ms: elapsed() }
+    return { kind: 'unreachable', reason: normalized.reason === 'insecure-http' ? 'insecure-http' : 'invalid-url', ms: 0 }
   }
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? 10_000

@@ -22,7 +22,9 @@ export interface WizardCardProps {
     copyLabel: string;
     copiedLabel: string;
     closeLabel: string;
+    /** Optional primary action button rendered alongside the close button. */
+    primaryAction?: ReactNode;
     onClose: () => void;
 }
-export declare function WizardCard({ title, children, copyText, copyLabel, copiedLabel, closeLabel, onClose }: WizardCardProps): ReactNode;
+export declare function WizardCard({ title, children, copyText, copyLabel, copiedLabel, closeLabel, primaryAction, onClose }: WizardCardProps): ReactNode;
 //# sourceMappingURL=WizardCard.d.ts.map

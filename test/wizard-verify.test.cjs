@@ -222,6 +222,21 @@ test('check: a config-fingerprint drift answers stale and discards the session',
   }
 })
 
+test('start with probeOnly: verifies gateway and public URL without minting a pairing code', async () => {
+  const gw = await startMockGateway({ devices: [{ id: 'dev-old' }] })
+  try {
+    const { manager, probeCalls } = makeManager(gw.port)
+    const result = await manager.start({ publicUrl: 'https://dsh.example.com', probeOnly: true })
+    assert.deepEqual(result, { ok: true, pairingCode: '', publicUrl: 'https://dsh.example.com', expiresAt: 0 })
+    assert.equal(probeCalls.length, 1)
+    assert.equal(probeCalls[0], 'https://dsh.example.com')
+    assert.equal(manager.hasSession(), false)
+    assert.deepEqual(gw.state.calls.map((c) => `${c.method} ${c.url}`), ['GET /lan-gate/status'])
+  } finally {
+    await new Promise((resolve) => gw.server.close(resolve))
+  }
+})
+
 test('minting the code restarts nothing: after start, only status reads fly', async () => {
   const gw = await startMockGateway()
   try {

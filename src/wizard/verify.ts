@@ -105,7 +105,7 @@ interface VerificationSession {
 }
 
 export interface VerificationManager {
-  start(input: { publicUrl: unknown }): Promise<VerificationStartResult>
+  start(input: { publicUrl: unknown; probeOnly?: boolean }): Promise<VerificationStartResult>
   check(): Promise<VerificationCheckResult>
   /** Whether a verification session is open (the route surfaces it for the
    * UI's 「待外部验证」 state). */
@@ -157,7 +157,7 @@ export function createVerificationManager(options: VerificationManagerOptions): 
   }
 
   return {
-    async start({ publicUrl }) {
+    async start({ publicUrl, probeOnly }) {
       if (typeof publicUrl !== 'string' || publicUrl.trim() === '') return { ok: false, reason: 'no-public-url' }
       // Same admission as the probe: https anywhere, plain http only into
       // the private-network allowances. The URL the phone will open must
@@ -173,6 +173,10 @@ export function createVerificationManager(options: VerificationManagerOptions): 
       const outcome = await (options.probe ?? probeHostPath)(normalized.url)
       if (outcome.kind !== 'reached' || outcome.root !== 'gateway-pairing-page' || outcome.admin !== 'gateway-admin-403') {
         return { ok: false, reason: 'probe-failed', detail: outcome }
+      }
+
+      if (probeOnly === true) {
+        return { ok: true, pairingCode: '', publicUrl: normalized.url, expiresAt: 0 }
       }
 
       const pair = await callGateway('POST', '/lan-gate/pair', { role: 'web' })

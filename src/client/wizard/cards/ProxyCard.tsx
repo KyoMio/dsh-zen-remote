@@ -34,6 +34,11 @@ export function ProxyCard({ t, domain, upstreamPort, onCheck, onClose }: ProxyCa
       copyLabel={t('wizard.card.copy')}
       copiedLabel={t('wizard.card.copied')}
       closeLabel={t('wizard.card.close')}
+      primaryAction={(
+        <button type="button" className="zr-wizard-btn zr-wizard-btnPrimary" onClick={() => { onCheck(); onClose() }}>
+          {t('wizard.card.proxyCheck')}
+        </button>
+      )}
       onClose={onClose}
     >
       <div className="zr-wizard-cardTabs">
@@ -46,10 +51,6 @@ export function ProxyCard({ t, domain, upstreamPort, onCheck, onClose }: ProxyCa
       {text === null
         ? <p className="zr-wizard-cardStep">{t('wizard.badDomain')}</p>
         : <pre className="zr-wizard-cardCode">{text}</pre>}
-      <div className="zr-wizard-cardActions">
-        <button type="button" onClick={() => { onCheck(); onClose() }}>{t('wizard.card.proxyCheck')}</button>
-        <button type="button" onClick={onClose}>{t('wizard.card.close')}</button>
-      </div>
     </WizardCard>
   )
 }

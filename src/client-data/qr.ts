@@ -195,17 +195,21 @@ function formatBits(mask: number): number {
 function placeFormat(grid: Grid, mask: number): void {
   const n = grid.length
   const bits = formatBits(mask)
+  // ISO/IEC 18004 Figure 25: bit 14 (MSB) sits at (8, 0) / (n - 1, 8) and
+  // bit 0 (LSB) sits at (0, 8) / (8, n - 1). Placing LSB-first reverses the
+  // 15-bit BCH codeword and makes every real scanner reject the symbol.
+  const bit = (index: number): boolean => ((bits >>> index) & 1) === 1
   const put = (row: number, col: number, value: boolean): void => {
     const target = grid[row]
     if (target !== undefined) target[col] = value
   }
-  for (let i = 0; i <= 5; i++) put(8, i, ((bits >>> i) & 1) === 1)
-  put(8, 7, ((bits >>> 6) & 1) === 1)
-  put(8, 8, ((bits >>> 7) & 1) === 1)
-  put(7, 8, ((bits >>> 8) & 1) === 1)
-  for (let i = 9; i <= 14; i++) put(14 - i, 8, ((bits >>> i) & 1) === 1)
-  for (let i = 0; i <= 6; i++) put(n - 1 - i, 8, ((bits >>> i) & 1) === 1)
-  for (let i = 7; i <= 14; i++) put(8, n - 15 + i, ((bits >>> i) & 1) === 1)
+  for (let i = 0; i <= 5; i++) put(8, i, bit(14 - i))
+  put(8, 7, bit(8))
+  put(8, 8, bit(7))
+  put(7, 8, bit(6))
+  for (let i = 9; i <= 14; i++) put(14 - i, 8, bit(14 - i))
+  for (let i = 0; i <= 6; i++) put(n - 1 - i, 8, bit(14 - i))
+  for (let i = 7; i <= 14; i++) put(8, n - 15 + i, bit(14 - i))
 }
 
 function placeData(grid: Grid, codewords: Uint8Array): void {

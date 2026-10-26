@@ -27,11 +27,10 @@ export function PortForwardCard({ t, port, onClose }: PortForwardCardProps): Rea
       closeLabel={t('wizard.card.close')}
       onClose={onClose}
     >
-      {STEPS.map((key, index) => (
-        <p key={key} className="zr-wizard-cardStep">{`${index + 1}. ${t(`wizard.card.${key}`, { port: String(port) })}`}</p>
-      ))}
-      <div className="zr-wizard-cardActions">
-        <button type="button" onClick={onClose}>{t('wizard.card.close')}</button>
+      <div className="zr-wizard-cardSteps">
+        {STEPS.map((key, index) => (
+          <p key={key} className="zr-wizard-cardStep">{`${index + 1}. ${t(`wizard.card.${key}`, { port: String(port) })}`}</p>
+        ))}
       </div>
     </WizardCard>
   )

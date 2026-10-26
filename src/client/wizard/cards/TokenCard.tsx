@@ -33,12 +33,19 @@ export function TokenCard({ t, onUse, onClose }: TokenCardProps): ReactNode {
       copyLabel={t('wizard.card.copy')}
       copiedLabel={t('wizard.card.copied')}
       closeLabel={t('wizard.card.close')}
+      primaryAction={(
+        <button type="button" className="zr-wizard-btn zr-wizard-btnPrimary" disabled={pasted.trim() === ''} onClick={() => onUse(pasted.trim())}>
+          {t('wizard.card.tokenUse')}
+        </button>
+      )}
       onClose={onClose}
     >
-      {STEPS.map((key, index) => (
-        <p key={key} className="zr-wizard-cardStep">{`${index + 1}. ${t(`wizard.card.${key}`)}`}</p>
-      ))}
-      <p className="zr-wizard-cardStep">{t('wizard.card.tokenPerms')}</p>
+      <div className="zr-wizard-cardSteps">
+        {STEPS.map((key, index) => (
+          <p key={key} className="zr-wizard-cardStep">{`${index + 1}. ${t(`wizard.card.${key}`)}`}</p>
+        ))}
+      </div>
+      <p className="zr-wizard-cardSubhead">{t('wizard.card.tokenPerms')}</p>
       <table className="zr-wizard-cardTable">
         <tbody>
           <tr>
@@ -59,19 +66,15 @@ export function TokenCard({ t, onUse, onClose }: TokenCardProps): ReactNode {
           </tr>
         </tbody>
       </table>
-      <label className="zr-wizard-label" htmlFor="zr-wizard-token-paste">{t('wizard.card.tokenPaste')}</label>
-      <input
-        id="zr-wizard-token-paste"
-        className="zr-wizard-input"
-        type="password"
-        value={pasted}
-        onChange={(event) => setPasted(event.target.value)}
-      />
-      <div className="zr-wizard-cardActions">
-        <button type="button" disabled={pasted.trim() === ''} onClick={() => onUse(pasted.trim())}>
-          {t('wizard.card.tokenUse')}
-        </button>
-        <button type="button" onClick={onClose}>{t('wizard.card.close')}</button>
+      <div className="zr-wizard-field">
+        <label className="zr-wizard-label" htmlFor="zr-wizard-token-paste">{t('wizard.card.tokenPaste')}</label>
+        <input
+          id="zr-wizard-token-paste"
+          className="zr-wizard-input"
+          type="password"
+          value={pasted}
+          onChange={(event) => setPasted(event.target.value)}
+        />
       </div>
     </WizardCard>
   )

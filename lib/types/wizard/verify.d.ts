@@ -86,6 +86,7 @@ export declare function verificationFingerprint(values: ZenRemoteConfig, gateway
 export interface VerificationManager {
     start(input: {
         publicUrl: unknown;
+        probeOnly?: boolean;
     }): Promise<VerificationStartResult>;
     check(): Promise<VerificationCheckResult>;
     /** Whether a verification session is open (the route surfaces it for the
