@@ -418,7 +418,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     else if (wizardStatus.publicUrl !== '') setPath('lan')
     if (seed.domain !== '') setDomain(seed.domain)
     if (seed.httpsPort !== '') setHttpsPort(seed.httpsPort)
-    if (seed.serverUrl !== '') setServerUrl(seed.serverUrl)
+    if (seed.serverUrl !== '') {
+      setServerUrl(seed.serverUrl)
+    } else if (wizardStatus.mode === 'off' && wizardStatus.lanAddress !== undefined && wizardStatus.lanAddress !== '') {
+      setServerUrl(`http://${wizardStatus.lanAddress}:${upstreamPortOf(wizardStatus)}`)
+    }
   }, [wizardStatus, effectiveClient])
 
   // Verification polling: only while a web pairing session is active and could still move.
@@ -473,7 +477,12 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
     if (readiness.ok && readiness.publicUrl !== '') return readiness.publicUrl
     if (wizardStatus?.publicUrl !== undefined && wizardStatus.publicUrl !== '') return wizardStatus.publicUrl
-    if (path === 'lan') return `http://127.0.0.1:${upstreamPortOf(wizardStatus)}`
+    if (path === 'lan') {
+      const lanHost = wizardStatus?.lanAddress !== undefined && wizardStatus.lanAddress !== ''
+        ? wizardStatus.lanAddress
+        : '127.0.0.1'
+      return `http://${lanHost}:${upstreamPortOf(wizardStatus)}`
+    }
     return ''
   }, [path, serverUrl, readiness, wizardStatus])
 
@@ -580,6 +589,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
     setSavingConfig(true)
     const wasClient = effectiveClient
+    const currentHostSetting = typeof config.rowValue('host') === 'string' ? (config.rowValue('host') as string).trim() : ''
+    const needsLanHostBind = path === 'lan' && currentHostSetting !== '0.0.0.0' && currentHostSetting !== '::'
     try {
       try {
         const baseFields: Record<string, unknown> = {
@@ -588,9 +599,13 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           ...(hostName.trim() !== '' ? { serverName: hostName.trim() } : {}),
         }
         if (path === 'lan') {
+          // LAN / Tailscale direct connections arrive on the machine's LAN or
+          // Tailscale interface, so the gateway child must bind to `0.0.0.0`
+          // rather than loopback-only `127.0.0.1`.
           await props.saveRowFields(
             {
               ...baseFields,
+              host: '0.0.0.0',
               ingressMode: 'off',
               ...(readiness.publicUrl !== '' ? { ingressPublicUrl: readiness.publicUrl } : {}),
             },
@@ -610,11 +625,17 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
             ingressHttpsPort: readiness.httpsPort,
           })
         }
-        // If this machine was previously in client mode, wait for the
-        // restart-watcher to reload the plugin row into host mode and spawn
-        // the local gateway child process before saving the token or probing.
-        if (wasClient) {
+        // If this machine was previously in client mode or just rebound
+        // `host` to `0.0.0.0` for LAN access, wait for the restart-watcher to
+        // reload the plugin row and respawn the local gateway child process
+        // before saving the token or probing.
+        if (wasClient || needsLanHostBind) {
           setProbedClient(false)
+          if (needsLanHostBind && !wasClient) {
+            // Give the restart-watcher time to observe the `host` change and
+            // restart the gateway child on 0.0.0.0.
+            await new Promise((resolve) => setTimeout(resolve, 900))
+          }
           for (let i = 0; i < 6; i++) {
             await new Promise((resolve) => setTimeout(resolve, 650))
             try {
@@ -716,6 +737,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     if (readiness.ok && readiness.publicUrl !== '') return readiness.publicUrl
     if (wizardStatus?.publicUrl !== undefined && wizardStatus.publicUrl !== '') return wizardStatus.publicUrl
     const port = upstreamPortOf(wizardStatus)
+    if (wizardStatus?.lanAddress !== undefined && wizardStatus.lanAddress !== '') {
+      return `http://${wizardStatus.lanAddress}:${port}`
+    }
     return `http://<服务端局域网IP>:${port}`
   }, [path, serverUrl, readiness, wizardStatus])
 

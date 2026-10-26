@@ -374,7 +374,7 @@ export declare const zh: {
     readonly 'wizard.client.lightSync': "会话与插件同步";
     readonly 'wizard.client.reconfigure': "更换服务端 / 重新配对";
     readonly 'wizard.startFailed': "验证未通过：{reason}";
-    readonly 'wizard.startFailedProbe': "无法从公网访问该地址（{detail}）";
+    readonly 'wizard.startFailedProbe': "无法访问该连接地址（{detail}）";
     readonly 'wizard.startFailedRuntime': "入口服务尚未运行，请先在上方启动";
     readonly 'wizard.startFailedGateway': "本地网关未响应，请检查网关运行状态";
     readonly 'wizard.startFailedPair': "无法生成配对码（{detail}）";

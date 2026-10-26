@@ -213,8 +213,11 @@ export function createVerificationManager(options: VerificationManagerOptions): 
         const deviceId = newcomers[newcomers.length - 1]
         const claim = status.lastWebClaim
         if (claim !== null && claim.id === deviceId) {
+          const isHttps = session.publicUrl.startsWith('https://')
           session = null
-          if (!claim.secure) return { result: 'cookie-insecure', deviceId }
+          // Plain http:// LAN/Tailscale pairing does not sit behind a TLS
+          // reverse proxy and intentionally issues a non-Secure cookie.
+          if (isHttps && !claim.secure) return { result: 'cookie-insecure', deviceId }
           return { result: 'pass', deviceId, at: claim.at }
         }
         // A claim record that has not surfaced (or names a different,
