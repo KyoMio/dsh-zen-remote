@@ -84,18 +84,18 @@ const machoPayload = (body) => Buffer.concat([MACH_O_LE64, Buffer.from(body)])
 test('binaryUrls maps every supported platform to both official endpoints WITH archive shapes', async () => {
   const darwinArm = binary.binaryUrls({ os: 'darwin', arch: 'arm64' })
   assert.equal(darwinArm.caddy, 'https://caddyserver.com/api/download?os=darwin&arch=arm64&p=github.com/caddy-dns/cloudflare')
-  assert.equal(darwinArm.caddyArchive, 'tgz', 'the Caddy build API answers unix with a tar.gz (GW-fix-1/H1)')
+  assert.equal(darwinArm.caddyArchive, 'none', 'caddyserver.com/api/download returns a bare binary on unix')
   assert.equal(darwinArm.cloudflared, 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz')
   assert.equal(darwinArm.cloudflaredArchive, 'tgz')
 
   const linuxAmd = binary.binaryUrls({ os: 'linux', arch: 'amd64' })
   assert.equal(linuxAmd.caddy, 'https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/caddy-dns/cloudflare')
-  assert.equal(linuxAmd.caddyArchive, 'tgz')
+  assert.equal(linuxAmd.caddyArchive, 'none')
   assert.equal(linuxAmd.cloudflared, 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64')
   assert.equal(linuxAmd.cloudflaredArchive, 'none')
 
   const winAmd = binary.binaryUrls({ os: 'windows', arch: 'amd64' })
-  assert.equal(winAmd.caddyArchive, 'zip', 'the Caddy build API answers Windows with a zip')
+  assert.equal(winAmd.caddyArchive, 'exe', 'caddyserver.com/api/download returns a bare .exe on Windows')
   assert.equal(winAmd.cloudflared, 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe')
   assert.equal(winAmd.cloudflaredArchive, 'exe')
 
@@ -112,9 +112,9 @@ test('currentPlatform maps this process into the supported set (windows is amd64
   assert.equal(p.os, process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux')
   assert.equal(p.arch, process.arch === 'arm64' ? 'arm64' : 'amd64')
   // caddyDownload models the archive per OS family, mirroring binaryUrls.
-  assert.equal(binary.caddyDownload({ os: 'darwin', arch: 'arm64' }).archive, 'tgz')
-  assert.equal(binary.caddyDownload({ os: 'linux', arch: 'amd64' }).archive, 'tgz')
-  assert.equal(binary.caddyDownload({ os: 'windows', arch: 'amd64' }).archive, 'zip')
+  assert.equal(binary.caddyDownload({ os: 'darwin', arch: 'arm64' }).archive, 'none')
+  assert.equal(binary.caddyDownload({ os: 'linux', arch: 'amd64' }).archive, 'none')
+  assert.equal(binary.caddyDownload({ os: 'windows', arch: 'amd64' }).archive, 'exe')
 })
 
 test('install paths sit under <DSH_HOME>/zen-remote-ingress/bin; windows gains .exe', async () => {
@@ -200,12 +200,11 @@ test('downloadBinary unpacks a .tgz archive (the darwin cloudflared shape) and s
   fs.rmSync(installPath)
 })
 
-test('GW-fix-1/H1: the Caddy tar.gz chain — download, unpack, install, self-check, cache hit', async () => {
-  // The exact shape the build API answers with: a gzipped tar whose URL is
-  // a query string (no .tgz suffix to sniff — the archive comes as
-  // metadata), carrying one `caddy` ELF image.
+test('GW-fix-1/H1: the Caddy bare-binary chain — download, self-check, install, cache hit', async () => {
+  // The exact shape caddyserver.com/api/download answers with: a bare ELF or
+  // Mach-O binary (`Content-Type: application/octet-stream`).
   const payload = elfPayload('fake-caddy-elf-body')
-  server.bodies['/api/download'] = zlib.gzipSync(tarOf('caddy', payload))
+  server.bodies['/api/download'] = payload
   const ensured = await binaryIo.ensureBinary(home, 'caddy', {
     platform: { os: 'linux', arch: 'amd64' },
     fetchImpl: async (url) => {
@@ -219,7 +218,7 @@ test('GW-fix-1/H1: the Caddy tar.gz chain — download, unpack, install, self-ch
   const installPath = ensured.path
   assert.equal(installPath, binary.binaryInstallPath(home, 'caddy', { os: 'linux', arch: 'amd64' }))
   assert.equal(installPath, path.join(home, 'zen-remote-ingress', 'bin', 'caddy'))
-  assert.deepEqual(fs.readFileSync(installPath), payload, 'the unpacked caddy image landed byte-for-byte')
+  assert.deepEqual(fs.readFileSync(installPath), payload, 'the caddy image landed byte-for-byte')
   assert.equal(fs.statSync(installPath).mode & 0o777, 0o755)
   assert.ok(!fs.existsSync(`${installPath}.download.tgz`), 'no archive leftover')
   assert.ok(!fs.existsSync(`${installPath}.part`), 'no .part leftover')
@@ -232,10 +231,11 @@ test('GW-fix-1/H1: the Caddy tar.gz chain — download, unpack, install, self-ch
   fs.rmSync(installPath)
 })
 
-test('GW-fix-1/H1: the Windows Caddy zip is refused before any network traffic', async () => {
+test('GW-fix-1/H1: a zip archive is refused before any network traffic', async () => {
   let fetched = false
-  const failure = await binaryIo.ensureBinary(home, 'caddy', {
+  const failure = await binaryIo.downloadBinary(home, 'caddy', mockUrl('whatever'), {
     platform: { os: 'windows', arch: 'amd64' },
+    archive: 'zip',
     fetchImpl: async () => { fetched = true; throw new Error('must not fetch') },
   }).then(() => { throw new Error('must have failed') }, (error) => error)
   assert.equal(failure.code, 'windows-zip-unsupported')
@@ -243,11 +243,6 @@ test('GW-fix-1/H1: the Windows Caddy zip is refused before any network traffic',
   assert.equal(failure.installUrl, binary.MANUAL_INSTALL_LINKS.caddy)
   assert.equal(fetched, false, 'the refusal happens before the transport runs')
   assert.ok(!fs.existsSync(path.join(home, 'zen-remote-ingress', 'bin', 'caddy.exe')), 'nothing landed on disk')
-  // Same refusal through the explicit-url entry when the archive metadata says zip.
-  await assert.rejects(
-    binaryIo.downloadBinary(home, 'caddy', mockUrl('whatever'), { platform: { os: 'windows', arch: 'amd64' }, archive: 'zip' }),
-    (error) => error.code === 'windows-zip-unsupported',
-  )
 })
 
 test('GW-fix-1/H1: a payload without an executable magic is refused, leaving nothing on disk', async () => {

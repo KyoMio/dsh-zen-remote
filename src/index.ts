@@ -930,6 +930,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
                   },
                   cloudflared: {
                     start: async (startInput: { tunnelToken: string }) => {
+                      if (cloudflaredManager.isRunning()) cloudflaredManager.stop()
                       const started = await cloudflaredManager.start({ tunnelToken: startInput.tunnelToken })
                       return started.ok ? ({ ok: true } as const) : ({ ok: false, error: started.error ?? 'spawn-failed' } as const)
                     },

@@ -45,9 +45,10 @@ export declare function currentPlatform(): BinaryPlatform;
  * DNS-01 challenge needs (plain Caddy cannot write the TXT record). */
 export declare function caddyDownloadUrl(platform: BinaryPlatform): string;
 /**
- * The Caddy asset the build API answers with, PLUS its archive shape — the
- * URL is a query string, so its ending says nothing about the payload:
- * unix answers a gzipped tar, Windows a zip (not unpackable here yet).
+ * The Caddy asset the build API answers with, PLUS its archive shape —
+ * `caddyserver.com/api/download` returns a bare Mach-O/ELF binary on unix
+ * (`Content-Disposition: attachment; filename="caddy_<os>_<arch>_custom"`,
+ * `Content-Type: application/octet-stream`) and a bare `.exe` on Windows.
  */
 export declare function caddyDownload(platform: BinaryPlatform): {
     url: string;

@@ -294,11 +294,18 @@ export async function downloadBinary(
     ? (received) => options.onProgress?.(received, total)
     : undefined
   if (archive === 'tgz') {
-    // Archive: land the compressed bytes in a sibling, then unpack.
+    // Archive (or auto-detected bare binary if an upstream endpoint serves a
+    // raw ELF/Mach-O image despite tgz metadata): land the bytes in a sibling,
+    // then either install directly when the payload already starts with a
+    // unix image magic or gunzip + extract the tar entry.
     const tgzPath = `${installPath}.download.tgz`
     try {
       await streamToFile(tool, url, response.body as unknown as NodeWebReadableStream<Uint8Array>, tgzPath, onProgress)
-      const entry = firstTarFileEntry(gunzipSync(readFileSync(tgzPath)))
+      const rawBytes = readFileSync(tgzPath)
+      const gzipMagic = rawBytes.length >= 2 && rawBytes[0] === 0x1f && rawBytes[1] === 0x8b
+      const entry = (!gzipMagic && platform.os !== 'windows' && looksLikeUnixImage(rawBytes.subarray(0, 4)))
+        ? rawBytes
+        : firstTarFileEntry(gunzipSync(rawBytes))
       if (entry === undefined) {
         throw new BinaryDownloadError(tool, url, response.status, `the ${tool} archive carried no binary entry`)
       }

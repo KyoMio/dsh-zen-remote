@@ -50,6 +50,7 @@ before(async () => {
     // The exact-match rule itself: a zone whose name EQUALS the query.
     'GET /zones?name=exact.example&account.id=acc-1': { success: true, result: [{ id: 'zone-exact', name: 'exact.example' }], result_info: { total_pages: 1 } },
     'POST /accounts/acc-1/cfd_tunnel': { success: true, result: { id: 'tun-1', token: 'connector-secret', name: 'dsh-zen-remote' } },
+    'GET /accounts/acc-1/cfd_tunnel/tun-1/token': { success: true, result: 'raw-string-connector-token' },
     'GET /accounts/acc-1/cfd_tunnel?is_deleted=false&per_page=50&page=1': { success: true, result: [{ id: 'tun-1', name: 'dsh-zen-remote', status: 'down' }], result_info: { total_pages: 1 } },
     'PUT /accounts/acc-1/cfd_tunnel/tun-1/configurations': { success: true, result: { id: 'tun-1' } },
     'POST /zones/zone-2/dns_records': { success: true, result: { id: 'rec-1' } },
@@ -133,15 +134,18 @@ test('configureIngress writes hostname→service plus the 404 fallback', async (
   ])
 })
 
-test('createDnsRecord posts a proxied CNAME to the tunnel target', async () => {
-  const recordId = await api().createDnsRecord('zone-2', 'dsh.example.com', 'tun-1'.padEnd(32, 'x') + '.cfargotunnel.com')
+test('createDnsRecord posts a proxied CNAME to the tunnel target (including 36-char hyphenated UUID tunnel IDs)', async () => {
+  const uuidTunnelTarget = 'ef824ff9-4004-4b23-8538-b501202821c8.cfargotunnel.com'
+  const recordId = await api().createDnsRecord('zone-2', 'dsh.example.com', uuidTunnelTarget)
   assert.equal(recordId, 'rec-1')
   const call = seen.at(-1)
   assert.equal(call.url, '/zones/zone-2/dns_records')
   const body = JSON.parse(call.body)
   assert.equal(body.type, 'CNAME')
   assert.equal(body.proxied, true)
-  assert.match(body.content, /\.cfargotunnel\.com$/)
+  assert.equal(body.content, uuidTunnelTarget)
+  // Also verify getTunnelToken accepts Cloudflare's raw-string result envelope.
+  assert.equal(await api().getTunnelToken('acc-1', 'tun-1'), 'raw-string-connector-token')
 })
 
 test('checkDomainOnCloudflare walks the ancestor chain: the zone is the PARENT domain (GW-fix-2/H1)', async () => {
