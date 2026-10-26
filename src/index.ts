@@ -20,7 +20,7 @@ import { lstat, mkdir, open, realpath, rename, rm, writeFile } from 'node:fs/pro
 import type { FileHandle } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { randomBytes } from 'node:crypto'
-import { homedir } from 'node:os'
+import { homedir, networkInterfaces } from 'node:os'
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
@@ -828,13 +828,40 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // "stale" verdict the config fingerprint produces, arriving via the
       // process generation instead.
       const currentMode = (): string => resolveConfig(config, readFileConfig(), process.env).values.ingressMode
+      const detectLanAddress = (): string | undefined => {
+        try {
+          const nets = networkInterfaces()
+          let tailscaleIp: string | undefined
+          let lanIp: string | undefined
+          for (const entries of Object.values(nets)) {
+            if (!Array.isArray(entries)) continue
+            for (const entry of entries) {
+              if (!entry || entry.internal || entry.family !== 'IPv4') continue
+              const addr = entry.address
+              if (
+                /^192\.168\./.test(addr)
+                || /^10\./.test(addr)
+                || /^172\.(?:1[6-9]|2\d|3[01])\./.test(addr)
+              ) {
+                lanIp ??= addr
+              } else if (/^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(addr)) {
+                tailscaleIp ??= addr
+              }
+            }
+          }
+          return lanIp ?? tailscaleIp
+        } catch {
+          return undefined
+        }
+      }
       // One runtime probe per request: the gateway's own status (source-IP
       // detection + the ACTUAL port for snippets/QR), plus our processes'
       // liveness for the projection.
       const buildRuntime = async () => {
+        const lanAddress = detectLanAddress()
         try {
           const response = await fetch(`http://127.0.0.1:${effective.values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
-          if (!response.ok) return { caddyRunning: caddyManager?.isRunning() === true }
+          if (!response.ok) return { caddyRunning: caddyManager?.isRunning() === true, lanAddress }
           const body = (await response.json()) as { port?: unknown; lastForwardedSource?: unknown }
           return {
             lastForwardedSource: detectForwardedSource(body),
@@ -842,6 +869,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             // gateway's ACTUAL port (it may have retried past the
             // configured one).
             gatewayActualPort: typeof body?.port === 'number' ? body.port : undefined,
+            lanAddress,
             caddyRunning: caddyManager?.isRunning() === true,
             cloudflaredRunning: cloudflaredManager?.isRunning() === true,
             tunnelTokenConfigured: cloudflaredManager !== undefined,
@@ -851,6 +879,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           // No answer is no detection — the status projection renders
           // its null shape and the UI offers nothing.
           return {
+            lanAddress,
             caddyRunning: caddyManager?.isRunning() === true,
             cloudflaredRunning: cloudflaredManager?.isRunning() === true,
             tunnelTokenConfigured: tunnelTokenConfigured(dshHome),

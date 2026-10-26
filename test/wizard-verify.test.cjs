@@ -222,6 +222,24 @@ test('check: a config-fingerprint drift answers stale and discards the session',
   }
 })
 
+test('check: plain http:// LAN/Tailscale pairing passes without requiring a Secure cookie', async () => {
+  const gw = await startMockGateway({
+    devices: [{ id: 'dev-old' }],
+    lastWebClaim: null,
+  })
+  try {
+    const { manager } = makeManager(gw.port)
+    const started = await manager.start({ publicUrl: 'http://192.168.1.10:3088' })
+    assert.equal(started.ok, true)
+    assert.equal(started.publicUrl, 'http://192.168.1.10:3088')
+    gw.state.devices.push({ id: 'dev-lan' })
+    gw.state.lastWebClaim = { id: 'dev-lan', secure: false, at: 1700000005000 }
+    assert.deepEqual(await manager.check(), { result: 'pass', deviceId: 'dev-lan', at: 1700000005000 })
+  } finally {
+    await new Promise((resolve) => gw.server.close(resolve))
+  }
+})
+
 test('start with probeOnly: verifies gateway and public URL without minting a pairing code', async () => {
   const gw = await startMockGateway({ devices: [{ id: 'dev-old' }] })
   try {

@@ -91,6 +91,7 @@ export interface WizardStatusBody {
   caddyRunning: boolean
   cloudflaredRunning: boolean
   gatewayActualPort: number | null
+  lanAddress?: string
   lastHostProbe: { result: string; deviceId: string | null; at: number | null } | null
   lastExternalVerification: { result: string; deviceId: string | null; at: number | null } | null
   lastForwardedSource: { ip: string; at: number } | null

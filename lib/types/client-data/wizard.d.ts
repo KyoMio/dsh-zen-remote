@@ -74,6 +74,7 @@ export interface WizardStatusBody {
     caddyRunning: boolean;
     cloudflaredRunning: boolean;
     gatewayActualPort: number | null;
+    lanAddress?: string;
     lastHostProbe: {
         result: string;
         deviceId: string | null;

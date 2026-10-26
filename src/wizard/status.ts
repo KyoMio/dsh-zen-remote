@@ -78,6 +78,7 @@ export interface WizardRuntimeInput {
   caddyRunning?: unknown
   cloudflaredRunning?: unknown
   gatewayActualPort?: unknown
+  lanAddress?: unknown
   lastHostProbe?: WizardRecordInput | null
   lastExternalVerification?: WizardRecordInput | null
   lastForwardedSource?: WizardForwardedSourceInput | null
@@ -108,6 +109,7 @@ export interface WizardStatus {
   caddyRunning: boolean
   cloudflaredRunning: boolean
   gatewayActualPort: number | null
+  lanAddress?: string
   lastHostProbe: WizardStatusRecord | null
   lastExternalVerification: WizardStatusRecord | null
   lastForwardedSource: WizardStatusForwardedSource | null
@@ -170,6 +172,7 @@ export function projectWizardStatus(declared: WizardDeclaredInput = {}, runtime:
     caddyRunning: runtime.caddyRunning === true,
     cloudflaredRunning: runtime.cloudflaredRunning === true,
     gatewayActualPort: portOf(runtime.gatewayActualPort),
+    ...(typeof runtime.lanAddress === 'string' && runtime.lanAddress !== '' ? { lanAddress: runtime.lanAddress } : {}),
     lastHostProbe: recordOf(runtime.lastHostProbe),
     lastExternalVerification: recordOf(runtime.lastExternalVerification),
     lastForwardedSource: forwardedSourceOf(runtime.lastForwardedSource),
