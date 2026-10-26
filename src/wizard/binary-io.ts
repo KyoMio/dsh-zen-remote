@@ -66,6 +66,10 @@ import {
 /** Generous ceiling on one download; a mirror gone wrong must not be able
  * to fill the disk. Both real binaries sit far below 200 MB. */
 const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
+/** Connection / response-headers timeout before a mirror is skipped. */
+const CONNECT_TIMEOUT_MS = 10_000
+/** Maximum idle gap between body chunks before a stalled mirror is aborted. */
+const STALL_TIMEOUT_MS = 15_000
 
 /** ELF: `\x7fELF`. */
 const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46])
@@ -157,7 +161,8 @@ export interface DownloadBinaryOptions {
   archive?: BinaryArchive
 }
 
-/** Write one fetched response body to `partPath` under the size cap. */
+/** Write one fetched response body to `partPath` under the size cap and
+ * per-chunk stall timeout so a throttled or hung mirror fails over quickly. */
 async function streamToFile(
   tool: IngressBinary,
   url: string,
@@ -166,6 +171,7 @@ async function streamToFile(
   onProgress: DownloadProgress | undefined,
 ): Promise<void> {
   let received = 0
+  let stallTimer: ReturnType<typeof setTimeout> | undefined
   const counter = new Transform({
     transform(chunk: Buffer, _encoding, done) {
       received += chunk.length
@@ -173,15 +179,26 @@ async function streamToFile(
         done(new BinaryDownloadError(tool, url, null, `the download of ${tool} exceeds the ${MAX_DOWNLOAD_BYTES}-byte cap`))
         return
       }
+      if (stallTimer !== undefined) clearTimeout(stallTimer)
+      stallTimer = setTimeout(() => {
+        counter.destroy(new BinaryDownloadError(tool, url, null, `the download of ${tool} stalled after ${received} bytes`))
+      }, STALL_TIMEOUT_MS)
+      if (typeof stallTimer.unref === 'function') stallTimer.unref()
       onProgress?.(received, null)
       done(null, chunk)
     },
   })
+  stallTimer = setTimeout(() => {
+    counter.destroy(new BinaryDownloadError(tool, url, null, `the download of ${tool} stalled before first byte`))
+  }, STALL_TIMEOUT_MS)
+  if (typeof stallTimer.unref === 'function') stallTimer.unref()
   try {
     await pipeline(Readable.fromWeb(body), counter, createWriteStream(partPath, { mode: 0o644 }))
   } catch (error) {
     rmSync(partPath, { force: true })
     throw error
+  } finally {
+    if (stallTimer !== undefined) clearTimeout(stallTimer)
   }
 }
 
@@ -281,7 +298,10 @@ export async function downloadBinary(
   const fetchImpl = options.fetchImpl ?? fetch
   let response: Response
   try {
-    response = await fetchImpl(url, { redirect: 'follow' })
+    response = await fetchImpl(url, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
+    })
   } catch (cause) {
     throw new BinaryDownloadError(tool, url, null, `the download of ${tool} failed before an answer arrived`, { cause })
   }
