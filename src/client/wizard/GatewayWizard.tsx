@@ -600,8 +600,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         }
         if (path === 'lan') {
           // LAN / Tailscale direct connections arrive on the machine's LAN or
-          // Tailscale interface, so the gateway child must bind to `0.0.0.0`
-          // rather than loopback-only `127.0.0.1`.
+          // Tailscale interface, so the gateway child binds to `0.0.0.0` (with
+          // lan-gate's private-IP wall blocking any unproxied public IP).
           await props.saveRowFields(
             {
               ...baseFields,
@@ -618,8 +618,12 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
             ingressPublicUrl: readiness.publicUrl,
           })
         } else {
+          // Managed Caddy and Cloudflare Tunnel both run on the same host and
+          // connect to the gateway over loopback, so reset `host` back to
+          // `127.0.0.1` in case the user previously enabled LAN mode.
           await props.saveRowFields({
             ...baseFields,
+            host: '127.0.0.1',
             ingressMode: path,
             ingressDomain: domain.trim(),
             ingressHttpsPort: readiness.httpsPort,
