@@ -129,7 +129,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [formError, setFormError] = useState<string | null>(null)
   const [wizardStatus, setWizardStatus] = useState<WizardStatusBody | undefined>()
   const [gatewayReachable, setGatewayReachable] = useState(false)
-  const [viaGateway, setViaGateway] = useState(true) // count as remote until one load answers locally
+  const [viaGateway, setViaGateway] = useState(false) // default local; server wall is the real gate
   const [statusLoaded, setStatusLoaded] = useState(false)
   const [startResult, setStartResult] = useState<WizardVerifyStart | undefined>()
   const [poll, setPoll] = useState<WizardVerifyPoll | undefined>()
@@ -390,12 +390,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }
 
-  // The subject + role gates. All hooks above; nothing below renders for a
-  // foreign subject or a sub-client row. The plugin-manager passes the subject
-  // as `props.subject` — a structural mirror that flattens it into kind/pkg
-  // would compile but miss at runtime.
+  // The subject + role gates. Show on BOTH the bundle detail page (kind:
+  // 'bundle') and the row detail page (kind: 'row') — the bundle page is
+  // one click shallower and where users actually look first.
   const subject = (props as { subject?: { kind?: string; pkg?: { name?: string } } }).subject
-  if (subject?.kind !== 'row' || subject?.pkg?.name !== 'dsh-zen-remote') return null
+  if ((subject?.kind !== 'row' && subject?.kind !== 'bundle') || subject?.pkg?.name !== 'dsh-zen-remote') return null
   const effectiveClient = savedClient || (probedClient === true && !config.rowRoleKnown())
   if (effectiveClient) return null
 
