@@ -36,6 +36,7 @@ import { responseJson, sameOriginPost } from '../http.js'
 import { hostOf } from '../config.js'
 import { normalizeTrustedIp, mergeProxyList, parseProxyList } from './source-detect.js'
 import type { CaddyStartResult } from './caddy-process.js'
+import type { TunnelCheckResult, TunnelSetupResult } from './tunnel-orchestrator.js'
 import { projectWizardStatus, type WizardRuntimeInput } from './status.js'
 import type { VerificationCheckResult, VerificationStartResult } from './verify.js'
 
@@ -67,6 +68,14 @@ export const WIZARD_TUNNEL_TOKEN_ROUTE = `${WIZARD_ROUTE_PREFIX}/tunnel-token`
 export const WIZARD_CADDY_START_ROUTE = `${WIZARD_ROUTE_PREFIX}/caddy/start`
 export const WIZARD_CADDY_STOP_ROUTE = `${WIZARD_ROUTE_PREFIX}/caddy/stop`
 export const WIZARD_CADDY_STATUS_ROUTE = `${WIZARD_ROUTE_PREFIX}/caddy/status`
+
+/** POST `{domain}`: the zone/account probe the migration card re-checks;
+ * POST `{domain, tunnelId?}`: the full tunnel setup; POST (stop) and GET
+ * (three-state) mirror the Caddy pair (GW-13b). */
+export const WIZARD_TUNNEL_CHECK_ROUTE = `${WIZARD_ROUTE_PREFIX}/tunnel/check-domain`
+export const WIZARD_TUNNEL_SETUP_ROUTE = `${WIZARD_ROUTE_PREFIX}/tunnel/setup`
+export const WIZARD_TUNNEL_STOP_ROUTE = `${WIZARD_ROUTE_PREFIX}/tunnel/stop`
+export const WIZARD_TUNNEL_STATUS_ROUTE = `${WIZARD_ROUTE_PREFIX}/tunnel/status`
 
 /** The managed Caddy's three-state. `stopped` means a start happened and
  * the process has since exited (degraded); `never-started` precedes that. */
@@ -116,6 +125,16 @@ export interface WizardHandlerOptions {
    * comes from the token store inside the wiring (never through routes). */
   caddy?: {
     start: (input: { domain: string; httpsPort: number; gatewayPort: number }) => Promise<CaddyStartResult>
+    stop: () => void
+    status: () => CaddyProcessState
+  }
+  /** The Cloudflare Tunnel orchestration (GW-13b), injected by apply().
+   * `setup` receives the SAVED domain and (when the user adopted an
+   * existing tunnel) its id; the Cloudflare token comes from the token
+   * store inside the wiring. Absent — unwired — and the routes 501. */
+  tunnel?: {
+    checkDomain: (domain: string) => Promise<TunnelCheckResult>
+    setup: (input: { domain: string; tunnelId?: string }) => Promise<TunnelSetupResult>
     stop: () => void
     status: () => CaddyProcessState
   }
@@ -367,6 +386,68 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
         const result = await caddy.start({ domain, httpsPort: values.ingressHttpsPort, gatewayPort })
         // The start result may carry a failure detail — never the token.
         responseJson(res, 200, { ok: result.ok, ...(result.ok ? { caddyfile: result.caddyfile } : { error: result.error, detail: result.detail, installUrl: result.installUrl }) })
+        return
+      }
+      if (route.startsWith(`${WIZARD_ROUTE_PREFIX}/tunnel/`)) {
+        // Same discipline as the caddy block: walls, then method shape,
+        // then the wiring check.
+        if (method === 'POST' && !sameOriginPost(req)) {
+          responseJson(res, 403, {
+            ok: false,
+            error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+          })
+          return
+        }
+        if (method !== 'GET' && method !== 'POST') {
+          res.setHeader('Allow', 'GET, POST')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET or POST' } })
+          return
+        }
+        const tunnel = options.tunnel
+        if (tunnel === undefined) {
+          responseJson(res, 501, { ok: false, error: { code: 'not-implemented', message: 'This wizard step is not wired up yet' } })
+          return
+        }
+        if (route === WIZARD_TUNNEL_STATUS_ROUTE && method === 'GET') {
+          responseJson(res, 200, { ok: true, state: tunnel.status() })
+          return
+        }
+        if (method !== 'POST') {
+          res.setHeader('Allow', 'GET, POST')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET or POST' } })
+          return
+        }
+        const body = await readJsonObject(req)
+        const domain = typeof body?.domain === 'string' ? body.domain : ''
+        if (route === WIZARD_TUNNEL_CHECK_ROUTE) {
+          const result = await tunnel.checkDomain(domain)
+          responseJson(res, 200, { ok: result.ok, ...(result.ok ? { onCloudflare: result.onCloudflare, zoneId: result.zoneId } : { reason: result.reason, detail: result.detail }) })
+          return
+        }
+        if (route === WIZARD_TUNNEL_STOP_ROUTE) {
+          tunnel.stop()
+          responseJson(res, 200, { ok: true, state: tunnel.status() })
+          return
+        }
+        if (route === WIZARD_TUNNEL_SETUP_ROUTE) {
+          const tunnelId = typeof body?.tunnelId === 'string' && body.tunnelId !== '' ? body.tunnelId : undefined
+          const result = await tunnel.setup({ domain, tunnelId })
+          // The setup answer never carries the connector token — only its
+          // file path (a server-local fact) and the conflict list.
+          if (result.ok) {
+            responseJson(res, 200, { ok: true, tunnelId: result.tunnelId, publicUrl: result.publicUrl })
+          } else {
+            responseJson(res, 200, {
+              ok: false,
+              reason: result.reason,
+              ...(result.detail !== undefined ? { detail: result.detail } : {}),
+              ...(result.existing !== undefined ? { existing: result.existing } : {}),
+              ...(result.installUrl !== undefined ? { installUrl: result.installUrl } : {}),
+            })
+          }
+          return
+        }
+        responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown wizard route' } })
         return
       }
       if (route === WIZARD_VERIFY_ROUTE && (method === 'POST' || method === 'GET')) {

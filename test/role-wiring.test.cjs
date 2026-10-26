@@ -301,6 +301,7 @@ test('T16: client routes register on the client role (the host mounts the prefix
       on() { return () => {} },
       logger: { warn() {} },
       effect(fn) { fn() },
+      reflect: { get: () => undefined },
       inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
     }
     return ctx
@@ -872,6 +873,7 @@ function ctxExecuting(services) {
     plugin() {},
     on() {},
     effect(fn) { fn() },
+    reflect: { get: () => undefined },
     webServer: { register: (route) => { routes.push(route); return () => {} } },
     ...services,
   }

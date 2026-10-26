@@ -72,6 +72,8 @@ import { createWizardHandler, WIZARD_ROUTE_PREFIX } from './wizard/routes.js'
 import { createCaddyManager } from './wizard/caddy-process.js'
 import type { SubprocessServiceLike } from './wizard/caddy-process.js'
 import { cfTokenConfigured, deleteCfTokenFile, readCfTokenFile, writeCfTokenFile } from './wizard/token-store.js'
+import { createCloudflaredManager } from './wizard/cloudflared.js'
+import { checkDomainOnCloudflare as runTunnelCheck, setupTunnel } from './wizard/tunnel-orchestrator.js'
 import { writeTunnelTokenFile } from './wizard/cloudflared.js'
 import { detectForwardedSource, parseProxyList } from './wizard/source-detect.js'
 import { createVerificationManager } from './wizard/verify.js'
@@ -820,6 +822,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
       const subprocessService = wizardCtx.reflect.get('subprocess') as SubprocessServiceLike | undefined
       const caddyManager = subprocessService === undefined ? undefined : createCaddyManager({ subprocess: subprocessService, dshHome })
+      const cloudflaredManager = subprocessService === undefined ? undefined : createCloudflaredManager({ subprocess: subprocessService, dshHome })
       // The verification session lives in THIS manager's closure (GW-9):
       // memory-only by design, and a row reload rebuilds it — the same
       // "stale" verdict the config fingerprint produces, arriving via the
@@ -840,12 +843,18 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             // configured one).
             gatewayActualPort: typeof body?.port === 'number' ? body.port : undefined,
             caddyRunning: caddyManager?.isRunning() === true,
+            cloudflaredRunning: cloudflaredManager?.isRunning() === true,
+            tunnelTokenConfigured: cloudflaredManager !== undefined,
             cfTokenConfigured: cfTokenConfigured(dshHome),
           }
         } catch {
           // No answer is no detection — the status projection renders
           // its null shape and the UI offers nothing.
-          return { caddyRunning: caddyManager?.isRunning() === true, cfTokenConfigured: cfTokenConfigured(dshHome) }
+          return {
+            caddyRunning: caddyManager?.isRunning() === true,
+            cloudflaredRunning: cloudflaredManager?.isRunning() === true,
+            cfTokenConfigured: cfTokenConfigured(dshHome),
+          }
         }
       }
       const verification = createVerificationManager({
@@ -857,6 +866,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         runtimeReady: () => {
           const mode = currentMode()
           if (mode === 'caddy') return caddyManager?.isRunning() === true
+          if (mode === 'cloudflared') return cloudflaredManager?.isRunning() === true
           return true
         },
       })
@@ -872,8 +882,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             deleteCfToken: () => {
               // Stop the consumers first (the mode-switch rule): whichever
               // process might hold the token in its environment dies before
-              // the file disappears. cloudflared joins in GW-13b.
+              // the file disappears.
               caddyManager?.stop()
+              cloudflaredManager?.stop()
               deleteCfTokenFile(dshHome)
             },
             cfTokenConfigured: () => cfTokenConfigured(dshHome),
@@ -890,6 +901,38 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
               },
               stop: () => caddyManager.stop(),
               status: () => (caddyManager.isRunning() ? 'running' as const : caddyManager.hasStarted() ? 'stopped' as const : 'never-started' as const),
+            },
+          }),
+          ...(cloudflaredManager === undefined ? {} : {
+            tunnel: {
+              checkDomain: (domain: string) => runTunnelCheck(
+                { readToken: () => readCfTokenFile(dshHome) },
+                domain,
+              ),
+              setup: (input: { domain: string; tunnelId?: string }) => setupTunnel(
+                {
+                  dshHome,
+                  readToken: () => readCfTokenFile(dshHome),
+                  gatewayPort: () => {
+                    // The ingress service target is the gateway's ACTUAL
+                    // port; re-resolve per call (cheap, and it may have
+                    // moved since the route read it).
+                    const values = resolveConfig(config, readFileConfig(), process.env).values
+                    return values.port
+                  },
+                  cloudflared: {
+                    start: async (startInput: { tunnelToken: string }) => {
+                      const started = await cloudflaredManager.start({ tunnelToken: startInput.tunnelToken })
+                      return started.ok ? ({ ok: true } as const) : ({ ok: false, error: started.error ?? 'spawn-failed' } as const)
+                    },
+                    // 模式切换：starting the tunnel stops the managed Caddy.
+                    stopCaddy: () => caddyManager?.stop(),
+                  },
+                },
+                input,
+              ),
+              stop: () => cloudflaredManager.stop(),
+              status: () => (cloudflaredManager.isRunning() ? 'running' as const : cloudflaredManager.hasStarted() ? 'stopped' as const : 'never-started' as const),
             },
           }),
           verify: { start: (input) => verification.start(input), check: () => verification.check() },

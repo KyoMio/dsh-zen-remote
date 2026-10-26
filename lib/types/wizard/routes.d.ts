@@ -32,6 +32,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission, AdminConfigSnapshot } from '../admin-routes.js';
 import type { ConfigSource } from '../config.js';
 import type { CaddyStartResult } from './caddy-process.js';
+import type { TunnelCheckResult, TunnelSetupResult } from './tunnel-orchestrator.js';
 import { type WizardRuntimeInput } from './status.js';
 import type { VerificationCheckResult, VerificationStartResult } from './verify.js';
 /** Prefix all wizard routes live under (one webServer prefix registration;
@@ -56,6 +57,13 @@ export declare const WIZARD_TUNNEL_TOKEN_ROUTE = "/_dsh/zen-remote/admin/wizard/
 export declare const WIZARD_CADDY_START_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/start";
 export declare const WIZARD_CADDY_STOP_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/stop";
 export declare const WIZARD_CADDY_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/status";
+/** POST `{domain}`: the zone/account probe the migration card re-checks;
+ * POST `{domain, tunnelId?}`: the full tunnel setup; POST (stop) and GET
+ * (three-state) mirror the Caddy pair (GW-13b). */
+export declare const WIZARD_TUNNEL_CHECK_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/check-domain";
+export declare const WIZARD_TUNNEL_SETUP_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/setup";
+export declare const WIZARD_TUNNEL_STOP_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/stop";
+export declare const WIZARD_TUNNEL_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/status";
 /** The managed Caddy's three-state. `stopped` means a start happened and
  * the process has since exited (degraded); `never-started` precedes that. */
 export type CaddyProcessState = 'running' | 'stopped' | 'never-started';
@@ -107,6 +115,19 @@ export interface WizardHandlerOptions {
             httpsPort: number;
             gatewayPort: number;
         }) => Promise<CaddyStartResult>;
+        stop: () => void;
+        status: () => CaddyProcessState;
+    };
+    /** The Cloudflare Tunnel orchestration (GW-13b), injected by apply().
+     * `setup` receives the SAVED domain and (when the user adopted an
+     * existing tunnel) its id; the Cloudflare token comes from the token
+     * store inside the wiring. Absent — unwired — and the routes 501. */
+    tunnel?: {
+        checkDomain: (domain: string) => Promise<TunnelCheckResult>;
+        setup: (input: {
+            domain: string;
+            tunnelId?: string;
+        }) => Promise<TunnelSetupResult>;
         stop: () => void;
         status: () => CaddyProcessState;
     };

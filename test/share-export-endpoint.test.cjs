@@ -587,6 +587,11 @@ function makeApplyCtx({ webServer = true, ...services } = {}) {
     // executed here, so a no-op sink is all the fake context needs.
     plugin: () => {},
     connection: { admit: () => ({ peer: {} }) },
+    // GW-13a: the wizard registration reads `subprocess` through the
+    // reflection layer (production cordis always carries it; this fake
+    // answers undefined = a composition without it, so the wizard routes
+    // simply do not wire).
+    reflect: { get: () => undefined },
     ...(webServer ? { webServer: { register: (route) => { routes.push(route); return () => {} } } } : {}),
     ...services,
   }

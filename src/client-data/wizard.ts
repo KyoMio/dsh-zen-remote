@@ -25,9 +25,57 @@ export const WIZARD_CADDY_STATUS_ROUTE = '/_dsh/zen-remote/admin/wizard/caddy/st
 export const WIZARD_TUNNEL_CHECK_ROUTE = '/_dsh/zen-remote/admin/wizard/tunnel/check-domain'
 export const WIZARD_TUNNEL_SETUP_ROUTE = '/_dsh/zen-remote/admin/wizard/tunnel/setup'
 export const WIZARD_TUNNEL_STOP_ROUTE = '/_dsh/zen-remote/admin/wizard/tunnel/stop'
+export const WIZARD_TUNNEL_STATUS_ROUTE = '/_dsh/zen-remote/admin/wizard/tunnel/status'
 
 /** Wire mirror of src/wizard/routes.ts's CaddyProcessState. */
 export type CaddyState = 'running' | 'stopped' | 'never-started'
+
+/** Wire mirror of src/wizard/tunnel-orchestrator.ts's results. */
+export interface TunnelExisting {
+  id: string
+  name: string
+  status: string
+}
+
+export type TunnelSetupWire =
+  | { ok: true; tunnelId: string; publicUrl: string }
+  | { ok: false; reason: string; detail?: string; existing?: TunnelExisting[] }
+
+export type TunnelCheckWire =
+  | { ok: true; onCloudflare: boolean; zoneId: string | null }
+  | { ok: false; reason: string; detail?: string }
+
+/** The tunnel setup failure's locale key (plus params). Pure. */
+export function tunnelFailureCopy(reason: string, detail?: string): { key: string; params: Record<string, string> } {
+  switch (reason) {
+    case 'tunnel-conflict':
+      return { key: 'wizard.tunnel.conflict', params: {} }
+    case 'zone-not-found':
+      return { key: 'wizard.tunnel.zoneNotFound', params: {} }
+    case 'auth':
+      return { key: 'wizard.tunnel.auth', params: {} }
+    case 'network':
+      return { key: 'wizard.tunnel.network', params: {} }
+    case 'no-token':
+      return { key: 'wizard.tunnel.noToken', params: {} }
+    case 'bad-domain':
+      return { key: 'wizard.tunnel.badDomain', params: {} }
+    case 'spawn-failed':
+      return { key: 'wizard.tunnel.spawnFailed', params: { detail: detail ?? '' } }
+    default:
+      return { key: 'wizard.tunnel.api', params: { detail: detail ?? reason } }
+  }
+}
+
+/** The domain check's copy (the migration card's re-check). Pure. */
+export function tunnelCheckCopy(result: TunnelCheckWire): { key: string; tone: 'ok' | 'error' } {
+  if (result.ok) {
+    return result.onCloudflare
+      ? { key: 'wizard.check.okOnCf', tone: 'ok' }
+      : { key: 'wizard.check.okNotOnCf', tone: 'error' }
+  }
+  return { key: 'wizard.check.failed', tone: 'error' }
+}
 
 /** Wire mirror of src/wizard/status.ts's WizardStatus. */
 export interface WizardStatusBody {

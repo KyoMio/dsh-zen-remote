@@ -32,6 +32,10 @@ import {
   WIZARD_CADDY_STOP_ROUTE,
   WIZARD_CF_TOKEN_ROUTE,
   WIZARD_STATUS_ROUTE,
+  WIZARD_TUNNEL_CHECK_ROUTE,
+  WIZARD_TUNNEL_SETUP_ROUTE,
+  WIZARD_TUNNEL_STATUS_ROUTE,
+  WIZARD_TUNNEL_STOP_ROUTE,
   WIZARD_VERIFY_ROUTE,
   caddyFailureCopy,
   configureReadiness,
@@ -40,8 +44,12 @@ import {
   initialStep,
   isValidPort,
   pairingSecondsLeft,
+  tunnelCheckCopy,
+  tunnelFailureCopy,
   upstreamPortOf,
   type CaddyState,
+  type TunnelCheckWire,
+  type TunnelSetupWire,
   type LightState,
   type WizardPath,
   type WizardStatusBody,
@@ -131,6 +139,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [tokenNotice, setTokenNotice] = useState<'saved' | 'failed' | undefined>()
   const [caddyState, setCaddyState] = useState<CaddyState | undefined>()
   const [caddyStartError, setCaddyStartError] = useState<ReturnType<typeof caddyFailureCopy> | undefined>()
+  const [tunnelState, setTunnelState] = useState<CaddyState | undefined>()
+  const [tunnelBusy, setTunnelBusy] = useState(false)
+  const [tunnelResult, setTunnelResult] = useState<TunnelSetupWire | undefined>()
+  const [tunnelCheck, setTunnelCheck] = useState<TunnelCheckWire | undefined>()
+  const [adoptTunnelId, setAdoptTunnelId] = useState<string | undefined>()
   const [probedClient, setProbedClient] = useState<boolean | null>(null)
 
   // The saved role, live: a role flip re-renders this away (or back).
@@ -284,28 +297,31 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   // step shows the caddy path, start/stop through the routes. A start
   // failure maps to locale copy (download failures carry the install URL).
   const caddyPath = wizardStatus?.mode === 'caddy' || path === 'caddy'
+  const tunnelPath = wizardStatus?.mode === 'cloudflared' || path === 'cloudflared'
+  const pollIngressState = async (route: string, apply: (state: CaddyState) => void): Promise<void> => {
+    try {
+      const response = await fetch(route)
+      if (!response.ok) return
+      const body = (await response.json()) as { state?: unknown }
+      if (body?.state === 'running' || body?.state === 'stopped' || body?.state === 'never-started') apply(body.state)
+    } catch {
+      // keep the last state
+    }
+  }
   useEffect(() => {
     if (step !== 'verify' || !caddyPath) return
-    let cancelled = false
-    const beat = async (): Promise<void> => {
-      try {
-        const response = await fetch(WIZARD_CADDY_STATUS_ROUTE)
-        if (!response.ok || cancelled) return
-        const body = (await response.json()) as { state?: unknown }
-        if (body?.state === 'running' || body?.state === 'stopped' || body?.state === 'never-started') {
-          if (!cancelled) setCaddyState(body.state)
-        }
-      } catch {
-        // keep the last state
-      }
-    }
+    const beat = (): Promise<void> => pollIngressState(WIZARD_CADDY_STATUS_ROUTE, setCaddyState)
     void beat()
     const handle = setInterval(() => { void beat() }, 3000)
-    return () => {
-      cancelled = true
-      clearInterval(handle)
-    }
+    return () => clearInterval(handle)
   }, [step, caddyPath])
+  useEffect(() => {
+    if (step !== 'verify' || !tunnelPath) return
+    const beat = (): Promise<void> => pollIngressState(WIZARD_TUNNEL_STATUS_ROUTE, setTunnelState)
+    void beat()
+    const handle = setInterval(() => { void beat() }, 3000)
+    return () => clearInterval(handle)
+  }, [step, tunnelPath])
 
   const startCaddy = async (): Promise<void> => {
     setCaddyStartError(undefined)
@@ -332,6 +348,45 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       setCaddyState('stopped')
     } catch {
       // the 3 s poll will correct the label
+    }
+  }
+
+  // Tunnel path (GW-13b): the check-domain probe (the migration card's
+  // re-check) and the full setup. A conflict carries the same-name list —
+  // each entry offers adoption, which re-runs setup with its tunnelId.
+  const checkDomain = async (): Promise<void> => {
+    const domain = path === 'external' ? serverUrl.trim() : domain2()
+    setTunnelCheck(undefined)
+    try {
+      const response = await fetch(WIZARD_TUNNEL_CHECK_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain }),
+      })
+      const body = (await response.json()) as TunnelCheckWire
+      setTunnelCheck(body)
+    } catch {
+      setTunnelCheck({ ok: false, reason: 'network' })
+    }
+  }
+
+  const domain2 = (): string => domain.trim()
+
+  const setupTunnelNow = async (tunnelId?: string): Promise<void> => {
+    setTunnelBusy(true)
+    try {
+      const response = await fetch(WIZARD_TUNNEL_SETUP_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain: domain.trim(), ...(tunnelId !== undefined ? { tunnelId } : {}) }),
+      })
+      const body = (await response.json()) as TunnelSetupWire
+      setTunnelResult(body)
+      if (body.ok) setTunnelState('running')
+    } catch {
+      setTunnelResult({ ok: false, reason: 'network' })
+    } finally {
+      setTunnelBusy(false)
     }
   }
 
@@ -484,6 +539,47 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
               <button type="button" disabled={disabled || caddyState !== 'running'} onClick={() => { void stopCaddy() }}>{t('wizard.caddy.stop')}</button>
             </div>
           ) : null}
+          {tunnelPath ? (
+            <div className="zr-wizard-row" data-zen-remote="wizard-tunnel-controls">
+              <span className="zr-wizard-label">{t('wizard.ingress')}</span>
+              <span className="zr-wizard-hint">
+                {t(tunnelState === 'running' ? 'wizard.tunnel.running' : tunnelState === 'stopped' ? 'wizard.tunnel.stopped' : 'wizard.tunnel.neverStarted')}
+              </span>
+              <button type="button" disabled={disabled || tunnelBusy} onClick={() => { void setupTunnelNow(adoptTunnelId) }}>
+                {tunnelState === 'running' ? t('wizard.reverify') : t('wizard.tunnel.setup')}
+              </button>
+              <button type="button" disabled={disabled || tunnelState !== 'running'} onClick={() => { void (async () => {
+                try {
+                  await fetch(WIZARD_TUNNEL_STOP_ROUTE, { method: 'POST' })
+                  setTunnelState('stopped')
+                } catch { /* the poll corrects */ }
+              })() }}>{t('wizard.tunnel.stop')}</button>
+            </div>
+          ) : null}
+          {tunnelPath && tunnelCheck !== undefined ? (() => {
+            const copy = tunnelCheckCopy(tunnelCheck)
+            return <p className="zr-wizard-notice" data-tone={copy.tone === 'error' ? 'error' : undefined}>
+              {copy.key === 'wizard.check.failed'
+                ? t('wizard.check.failed', { reason: tunnelCheck.ok ? '' : String(tunnelCheck.reason) })
+                : t(copy.key as Parameters<typeof t>[0])}
+            </p>
+          })() : null}
+          {tunnelPath && tunnelResult !== undefined && !tunnelResult.ok && tunnelResult.reason === 'tunnel-conflict' && tunnelResult.existing !== undefined ? (
+            <div className="zr-wizard-field">
+              <p className="zr-wizard-label">{t('wizard.tunnel.conflict')}</p>
+              {tunnelResult.existing.map((tunnel) => (
+                <button key={tunnel.id} type="button" className="zr-wizard-link" disabled={disabled || tunnelBusy}
+                  onClick={() => { setAdoptTunnelId(tunnel.id); void setupTunnelNow(tunnel.id) }}>
+                  {t('wizard.tunnel.useExisting')}：{tunnel.name}（{tunnel.status}）
+                </button>
+              ))}
+            </div>
+          ) : null}
+          {tunnelPath && tunnelResult !== undefined && tunnelResult.ok ? <p className="zr-wizard-notice">{t('wizard.tunnel.ok')}</p> : null}
+          {tunnelPath && tunnelResult !== undefined && !tunnelResult.ok && tunnelResult.reason !== 'tunnel-conflict' ? (() => {
+            const copy = tunnelFailureCopy(tunnelResult.reason, tunnelResult.detail)
+            return <p className="zr-wizard-notice" data-tone="error">{t(copy.key as Parameters<typeof t>[0], copy.params)}</p>
+          })() : null}
           {caddyStartError !== undefined ? (
             <p className="zr-wizard-notice" data-tone="error">
               {t('wizard.caddy.startFailed', { reason: t(caddyStartError.key as Parameters<typeof t>[0], caddyStartError.params) })}
@@ -570,7 +666,14 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       ) : null}
 
       {card === 'migrate' ? (
-        <MigrateCard t={t} onRecheck={() => setCard(undefined)} onClose={() => setCard(undefined)} />
+        <MigrateCard
+          t={t}
+          onRecheck={() => {
+            setCard(undefined)
+            void checkDomain()
+          }}
+          onClose={() => setCard(undefined)}
+        />
       ) : null}
 
       {card === 'portforward' ? (

@@ -396,6 +396,25 @@ export declare const zh: {
     readonly 'wizard.caddy.failSpawn': "进程启动失败";
     readonly 'wizard.token.saved': "Token 已保存到服务端本机";
     readonly 'wizard.token.saveFailed': "Token 保存失败，请重试";
+    readonly 'wizard.tunnel.setup': "自动创建 Cloudflare 隧道";
+    readonly 'wizard.tunnel.stop': "停止 cloudflared";
+    readonly 'wizard.tunnel.running': "cloudflared 运行中";
+    readonly 'wizard.tunnel.stopped': "cloudflared 已退出（可重新创建/启动）";
+    readonly 'wizard.tunnel.neverStarted': "cloudflared 尚未启动";
+    readonly 'wizard.tunnel.ok': "隧道已建立，cloudflared 运行中";
+    readonly 'wizard.tunnel.conflict': "已存在同名隧道，选择一条使用：";
+    readonly 'wizard.tunnel.useExisting': "使用此隧道";
+    readonly 'wizard.tunnel.zoneNotFound': "域名（或其父域）不在这个 Token 能访问的 Cloudflare 区域里——可用迁移卡片把域名迁过来";
+    readonly 'wizard.tunnel.auth': "Cloudflare 认证失败：请检查 Token 权限";
+    readonly 'wizard.tunnel.network': "Cloudflare API 网络错误";
+    readonly 'wizard.tunnel.api': "Cloudflare API 错误：{detail}";
+    readonly 'wizard.tunnel.spawnFailed': "cloudflared 启动失败：{detail}";
+    readonly 'wizard.tunnel.noToken': "请先在配置页保存 Cloudflare API Token";
+    readonly 'wizard.tunnel.badDomain': "域名格式不对";
+    readonly 'wizard.tunnel.checking': "检查中…";
+    readonly 'wizard.check.okOnCf': "域名已在 Cloudflare 上（Zone 已找到）";
+    readonly 'wizard.check.okNotOnCf': "域名尚未托管到 Cloudflare——可按迁移卡片操作";
+    readonly 'wizard.check.failed': "检查失败：{reason}";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;
