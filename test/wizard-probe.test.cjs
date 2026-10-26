@@ -66,6 +66,14 @@ test('the happy shape: pairing page + admin 403 answer reached with both classif
       res.end(body)
       return
     }
+    // Mirror lan-gate-server.cjs line 1274: if Accept includes
+    // application/json, the gateway returns 401 JSON instead of the HTML
+    // pairing page. The probe must send a browser-like Accept header.
+    if (String(req.headers.accept || '').includes('application/json')) {
+      res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end('{"ok":false,"reason":"unpaired"}')
+      return
+    }
     res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(PAIRING_PAGE)
   })

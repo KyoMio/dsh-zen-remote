@@ -25,10 +25,12 @@ export interface WizardCardProps {
   copyLabel: string
   copiedLabel: string
   closeLabel: string
+  /** Optional primary action button rendered alongside the close button. */
+  primaryAction?: ReactNode
   onClose: () => void
 }
 
-export function WizardCard({ title, children, copyText, copyLabel, copiedLabel, closeLabel, onClose }: WizardCardProps): ReactNode {
+export function WizardCard({ title, children, copyText, copyLabel, copiedLabel, closeLabel, primaryAction, onClose }: WizardCardProps): ReactNode {
   const [copied, setCopied] = useState(false)
   const copiedTimer = useRef<ReturnType<typeof setTimeout>>()
 
@@ -59,13 +61,19 @@ export function WizardCard({ title, children, copyText, copyLabel, copiedLabel, 
   return (
     <div data-zen-remote="wizard-card" onClick={onClose}>
       <div className="zr-wizard-cardPanel" onClick={(event) => event.stopPropagation()}>
-        <p className="zr-wizard-cardTitle">{title}</p>
-        {children}
+        <div className="zr-wizard-cardHeader">
+          <p className="zr-wizard-cardTitle">{title}</p>
+          <button type="button" className="zr-wizard-cardCloseIcon" aria-label={closeLabel} onClick={onClose}>×</button>
+        </div>
+        <div className="zr-wizard-cardBody">
+          {children}
+        </div>
         <div className="zr-wizard-cardActions">
+          <button type="button" className="zr-wizard-btn" onClick={onClose}>{closeLabel}</button>
           {copyText !== undefined && copyText !== null && copyText !== '' ? (
-            <button type="button" onClick={() => { void copy() }}>{copied ? copiedLabel : copyLabel}</button>
+            <button type="button" className="zr-wizard-btn" onClick={() => { void copy() }}>{copied ? copiedLabel : copyLabel}</button>
           ) : null}
-          <button type="button" onClick={onClose}>{closeLabel}</button>
+          {primaryAction}
         </div>
       </div>
     </div>

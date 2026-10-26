@@ -112,15 +112,41 @@ export type WizardVerifyStart =
 
 // --- the step state machine ----------------------------------------------------
 
+/** The deployment role the unified wizard configures: server (`host`) or
+ * desktop sub-client (`client`). */
+export type WizardRole = 'host' | 'client'
+
 /** The three wizard steps: pick a path, fill its form, verify end to end. */
 export type WizardStep = 'pick' | 'configure' | 'verify'
 
-/** The three public-ingress paths (the row's `ingressMode` minus `'off'`). */
-export type WizardPath = 'caddy' | 'external' | 'cloudflared'
+/** The four server-ingress paths (the three public ones plus LAN-only `'lan'`). */
+export type WizardPath = 'caddy' | 'external' | 'cloudflared' | 'lan'
 
 /** Where the wizard opens: a configured ingress jumps straight to verify. */
 export function initialStep(status: WizardStatusBody | undefined): WizardStep {
   return status !== undefined && status.mode !== 'off' ? 'verify' : 'pick'
+}
+
+/**
+ * Whether the inline overview card should render the configured status
+ * dashboard instead of the first-time setup prompt.
+ */
+export function isWizardConfigured(input: {
+  effectiveClient: boolean
+  wizardStatus: WizardStatusBody | undefined
+  pairedDeviceCount: number
+  hasSavedHostConfig: boolean
+  tokenConfigured: boolean
+  clientServerUrl: string
+  clientState: string | undefined
+}): boolean {
+  if (input.effectiveClient) {
+    return input.tokenConfigured || input.clientServerUrl.trim() !== '' || input.clientState === 'connected'
+  }
+  if (input.wizardStatus !== undefined && (input.wizardStatus.mode !== 'off' || input.wizardStatus.publicUrl !== '')) {
+    return true
+  }
+  return input.pairedDeviceCount > 0 || input.hasSavedHostConfig
 }
 
 export interface WizardFormSeed {
@@ -190,6 +216,20 @@ export function configureReadiness(
   path: WizardPath,
   form: { domain: string; httpsPort: string; cfToken: string; serverUrl: string },
 ): { ok: true; publicUrl: string; httpsPort: number } | { ok: false; error: 'bad-domain' | 'bad-port' | 'missing-token' | 'bad-server-url' } {
+  if (path === 'lan') {
+    const trimmed = form.serverUrl.trim().replace(/\/+$/u, '')
+    if (trimmed === '') return { ok: true, publicUrl: '', httpsPort: 443 }
+    let parsed: URL
+    try {
+      parsed = new URL(trimmed)
+    } catch {
+      return { ok: false, error: 'bad-server-url' }
+    }
+    if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || (parsed.pathname !== '/' && parsed.pathname !== '') || parsed.search !== '' || parsed.hash !== '') {
+      return { ok: false, error: 'bad-server-url' }
+    }
+    return { ok: true, publicUrl: parsed.origin, httpsPort: 443 }
+  }
   if (path === 'external') {
     // The user's own reverse proxy: the public origin is the one thing to
     // get right (same admission the probe applies — https, root path).
@@ -240,13 +280,52 @@ const VERIFY_PENDING_RESULTS: ReadonlySet<string> = new Set(['not-started', 'pen
 export function deriveWizardLights(input: {
   gatewayReachable: boolean
   poll: WizardVerifyPoll | undefined
+  startResult?: WizardVerifyStart | undefined
 }): WizardLights {
-  const poll = input.poll
-  const publicFail = poll !== undefined && poll.result !== 'pass' && !VERIFY_PENDING_RESULTS.has(poll.result)
+  const { poll, startResult } = input
+  const startProbeFailed = startResult !== undefined && !startResult.ok
+    && (startResult.reason === 'probe-failed' || startResult.reason === 'bad-public-url' || startResult.reason === 'no-public-url')
+  const startProbePassed = startResult?.ok === true && poll?.result !== 'stale' && poll?.result !== 'cookie-insecure'
+  const publicFail = startProbeFailed || (poll !== undefined && poll.result !== 'pass' && !VERIFY_PENDING_RESULTS.has(poll.result))
   return {
     gateway: input.gatewayReachable ? 'pass' : 'fail',
-    publicUrl: poll?.result === 'pass' ? 'pass' : publicFail ? 'fail' : 'pending',
+    publicUrl: (poll?.result === 'pass' || startProbePassed) ? 'pass' : publicFail ? 'fail' : 'pending',
     pairing: poll?.result === 'pass' ? 'pass' : poll?.result === 'cookie-insecure' ? 'fail' : 'pending',
+  }
+}
+
+export interface ClientWizardLights {
+  /** Whether a desktop-client token is saved on this machine. */
+  credential: LightState
+  /** Whether the client can reach and authenticate with the server. */
+  connection: LightState
+  /** Whether the session-sync and plugin-bridge interceptors are active. */
+  sync: LightState
+}
+
+const CLIENT_FAIL_STATES: ReadonlySet<string> = new Set([
+  'unreachable',
+  'revoked',
+  'incompatible',
+  'invalid-url',
+  'unexpected',
+])
+
+/**
+ * Derive the three status lights for the desktop sub-client verification
+ * step (`role === 'client'`).
+ */
+export function deriveClientWizardLights(input: {
+  tokenConfigured: boolean
+  clientState: string | undefined
+  interceptInstalled?: boolean | undefined
+}): ClientWizardLights {
+  const connected = input.clientState === 'connected'
+  const failed = input.clientState !== undefined && CLIENT_FAIL_STATES.has(input.clientState)
+  return {
+    credential: (input.tokenConfigured || connected) ? 'pass' : input.clientState === 'revoked' ? 'fail' : 'pending',
+    connection: connected ? 'pass' : failed ? 'fail' : 'pending',
+    sync: connected ? (input.interceptInstalled === false ? 'fail' : 'pass') : 'pending',
   }
 }
 

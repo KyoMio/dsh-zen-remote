@@ -137,6 +137,7 @@ export interface WizardHandlerOptions {
     verify?: {
         start: (input: {
             publicUrl: unknown;
+            probeOnly?: boolean;
         }) => Promise<VerificationStartResult>;
         check: () => Promise<VerificationCheckResult>;
     };

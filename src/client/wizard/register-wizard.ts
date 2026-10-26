@@ -4,13 +4,10 @@
  * register-settings.ts, and for the same reason: the desktop app IS the
  * main server, and the wizard is exactly where it is most useful).
  *
- * The `plugins.detail.section` SlotMap entry is a structural mirror: this
- * package does not depend on dsh-client-ui-plugin-manager, whose type-only
- * merges normally declare the slot (same trick as `plugins.row.config` in
- * register-settings.ts). The component itself filters its subject
- * (`kind === 'row'` + `pkg.name === 'dsh-zen-remote'`) and the saved row
- * role, so a foreign section, a sub-client deployment and the phone shell
- * all render nothing.
+ * Registered on `plugins.bundle.config` (keyed by `'dsh-zen-remote'`), which
+ * `PackageDetail` renders as the FIRST section at the top of the bundle
+ * detail page (above `RowsSection`「插件组件」and `SourceSection`「来源」),
+ * and which `RowDetail` (the component detail page) never renders.
  *
  * `configForms` never joins the top-level inject: a composition without
  * the settings service keeps the whole browser half loadable, and the lazy
@@ -22,7 +19,7 @@ import type { ClientContext } from '../compat/types.ts'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 // Type-only: the renderer declares `ctx.slots` on the cordis Context.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
-import { ZenRemoteSettingsForm } from '../../client-data/settings-form.ts'
+import { DEVICE_TOKEN_FIELD, ZenRemoteSettingsForm } from '../../client-data/settings-form.ts'
 import { NS } from '../locales.ts'
 import { SETTINGS_ENTRY_ID } from '../settings/register-settings.ts'
 import { WIZARD_CSS } from './wizard-css.ts'
@@ -31,24 +28,25 @@ import type { GatewayWizard } from './GatewayWizard.tsx'
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface SlotMap {
     /**
-     * One plugin's section on the plugin DETAIL page — a list seat whose
-     * entries receive the page's subject (structural mirror of the
-     * plugin-manager's declaration).
+     * One bundle's top configuration block on the plugin DETAIL page — a
+     * keyed seat (`key = pkg.name`) rendered at the top of `PackageDetail`
+     * above the component rows and source sections, and absent from
+     * `RowDetail` (structural mirror of the plugin-manager's declaration).
      */
-    'plugins.detail.section': {
-      kind: 'list'
+    'plugins.bundle.config': {
+      kind: 'keyed'
       scope: 'root'
-      owner: { readonly kind: string; readonly pkg?: { readonly name: string } | null }
+      owner: { readonly view: 'page' }
     }
   }
 }
 
-/** List order on the detail page: below the manager's own header blocks. */
-const WIZARD_SECTION_ORDER = 50
+/** `plugins.bundle.config` key: the bundle's package name. */
+export const WIZARD_BUNDLE_KEY = 'dsh-zen-remote'
 
 /**
  * Register the wizard stylesheet and (lazily, only where the settings
- * service exists) the detail-page section.
+ * service exists) the bundle detail-page top block.
  * @param ctx - client root context.
  * @param section - the block component; a parameter so this module stays
  *   JSX-free and importable under Node's type stripping.
@@ -64,11 +62,20 @@ export function registerGatewayWizard(ctx: ClientContext, section: typeof Gatewa
 
   ctx.inject(['configForms'], (formsCtx) => {
     const scope = formsCtx.configForms.get(SETTINGS_ENTRY_ID)
-    // The wizard's OWN form controller (its saved-role read and its row
-    // writes live here) — separate from the settings block's instance so
-    // neither's staged state can bleed into the other.
-    const config = new ZenRemoteSettingsForm(scope, () => false)
-    formsCtx.effect(() => () => { config.dispose() }, 'dsh-zen-remote: wizard form')
+    // Follow the describe sidecar when available so client-mode pairing can
+    // see whether `deviceToken` is configured (degrades to false in minimal
+    // test harnesses that omit `describe`).
+    const describe = typeof formsCtx.configForms.describe === 'function' ? formsCtx.configForms.describe() : undefined
+    const secretConfigured = (): boolean => {
+      const namespaces = describe?.getSnapshot().view?.namespaces ?? []
+      const row = namespaces.find((candidate) => candidate.ns === SETTINGS_ENTRY_ID)
+      return (row?.secrets ?? []).some(
+        (secret) => secret.path.length === 1 && secret.path[0] === DEVICE_TOKEN_FIELD && secret.set,
+      )
+    }
+    const config = new ZenRemoteSettingsForm(scope, secretConfigured)
+    const offDescribe = describe !== undefined ? describe.subscribe(() => { config.refresh() }) : () => {}
+    formsCtx.effect(() => () => { offDescribe(); config.dispose() }, 'dsh-zen-remote: wizard form')
     // One atomic row write per save: the wizard fields are volatile
     // live-read fields (not in RESTART_FIELDS), so saving reloads nothing.
     const saveRowFields = async (fields: Record<string, unknown>): Promise<void> => {
@@ -78,10 +85,9 @@ export function registerGatewayWizard(ctx: ClientContext, section: typeof Gatewa
         snapshot.revision,
       )
     }
-    formsCtx.effect(() => formsCtx.slots.inject('plugins.detail.section', () => formsCtx.slots.register({
-      name: 'plugins.detail.section',
-      id: 'zr-wizard',
-      order: WIZARD_SECTION_ORDER,
+    formsCtx.effect(() => formsCtx.slots.inject('plugins.bundle.config', () => formsCtx.slots.register({
+      name: 'plugins.bundle.config',
+      key: WIZARD_BUNDLE_KEY,
       locale: NS,
       inject: () => ({ config, saveRowFields }),
     }, section)), 'dsh-zen-remote: wizard section')

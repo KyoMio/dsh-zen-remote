@@ -24,6 +24,7 @@ import {
   tunnelCheckCopy,
   tunnelFailureCopy,
   caddySnippetText,
+  deriveClientWizardLights,
   deriveWizardLights,
   formSeedOf,
   WIZARD_CF_TOKEN_ROUTE,
@@ -36,6 +37,7 @@ import {
   WIZARD_TUNNEL_STOP_ROUTE,
   WIZARD_TUNNEL_TOKEN_ROUTE,
   initialStep,
+  isWizardConfigured,
   isValidHostname,
   isValidPort,
   luckyStepTexts,
@@ -59,6 +61,7 @@ import {
 } from '../lib/wizard/routes.js'
 
 import { en, zh } from '../src/client/locales.ts'
+import { registerGatewayWizard, WIZARD_BUNDLE_KEY } from '../src/client/wizard/register-wizard.ts'
 
 let testChain = Promise.resolve()
 function test(name, fn) {
@@ -80,6 +83,87 @@ await test('initialStep: a configured ingress opens on verify, off opens on pick
   for (const mode of ['caddy', 'external', 'cloudflared']) {
     assert.equal(initialStep({ ok: true, mode }), 'verify')
   }
+})
+
+await test('isWizardConfigured: distinguishes fresh install from configured host or client', () => {
+  const baseWizardStatus = {
+    ok: true, mode: 'off', domain: '', httpsPort: 443, publicUrl: '',
+    cfTokenConfigured: false, tunnelTokenConfigured: false, caddyRunning: false,
+    cloudflaredRunning: false, gatewayActualPort: 3088,
+    lastHostProbe: null, lastExternalVerification: null, lastForwardedSource: null,
+  }
+  assert.equal(
+    isWizardConfigured({
+      effectiveClient: false,
+      wizardStatus: baseWizardStatus,
+      pairedDeviceCount: 0,
+      hasSavedHostConfig: false,
+      tokenConfigured: false,
+      clientServerUrl: '',
+      clientState: undefined,
+    }),
+    false,
+  )
+  assert.equal(
+    isWizardConfigured({
+      effectiveClient: false,
+      wizardStatus: { ...baseWizardStatus, mode: 'external', publicUrl: 'https://dsh.example.com' },
+      pairedDeviceCount: 0,
+      hasSavedHostConfig: false,
+      tokenConfigured: false,
+      clientServerUrl: '',
+      clientState: undefined,
+    }),
+    true,
+  )
+  assert.equal(
+    isWizardConfigured({
+      effectiveClient: false,
+      wizardStatus: baseWizardStatus,
+      pairedDeviceCount: 1,
+      hasSavedHostConfig: false,
+      tokenConfigured: false,
+      clientServerUrl: '',
+      clientState: undefined,
+    }),
+    true,
+  )
+  assert.equal(
+    isWizardConfigured({
+      effectiveClient: false,
+      wizardStatus: baseWizardStatus,
+      pairedDeviceCount: 0,
+      hasSavedHostConfig: true,
+      tokenConfigured: false,
+      clientServerUrl: '',
+      clientState: undefined,
+    }),
+    true,
+  )
+  assert.equal(
+    isWizardConfigured({
+      effectiveClient: true,
+      wizardStatus: undefined,
+      pairedDeviceCount: 0,
+      hasSavedHostConfig: false,
+      tokenConfigured: false,
+      clientServerUrl: '',
+      clientState: undefined,
+    }),
+    false,
+  )
+  assert.equal(
+    isWizardConfigured({
+      effectiveClient: true,
+      wizardStatus: undefined,
+      pairedDeviceCount: 0,
+      hasSavedHostConfig: false,
+      tokenConfigured: true,
+      clientServerUrl: 'https://dsh.example.com',
+      clientState: 'connected',
+    }),
+    true,
+  )
 })
 
 await test('hostname/port validation mirrors the row layer', () => {
@@ -114,6 +198,35 @@ await test('configureReadiness: each path demands its own fields', () => {
   assert.equal(configureReadiness('external', { domain: '', httpsPort: '', cfToken: '', serverUrl: 'http://dsh.example.com' }).error, 'bad-server-url')
   assert.equal(configureReadiness('external', { domain: '', httpsPort: '', cfToken: '', serverUrl: 'https://x/app' }).error, 'bad-server-url')
   assert.equal(configureReadiness('external', { domain: '', httpsPort: '', cfToken: '', serverUrl: 'not a url' }).error, 'bad-server-url')
+  // lan: empty serverUrl is valid (LAN/Tailscale direct without public URL), or http/https origin.
+  assert.deepEqual(
+    configureReadiness('lan', { domain: '', httpsPort: '', cfToken: '', serverUrl: '' }),
+    { ok: true, publicUrl: '', httpsPort: 443 },
+  )
+  assert.deepEqual(
+    configureReadiness('lan', { domain: '', httpsPort: '', cfToken: '', serverUrl: 'http://192.168.1.10:3088/' }),
+    { ok: true, publicUrl: 'http://192.168.1.10:3088', httpsPort: 443 },
+  )
+  assert.equal(configureReadiness('lan', { domain: '', httpsPort: '', cfToken: '', serverUrl: 'ftp://192.168.1.10' }).error, 'bad-server-url')
+})
+
+await test('deriveClientWizardLights: reflects token and client connection state', () => {
+  assert.deepEqual(
+    deriveClientWizardLights({ tokenConfigured: false, clientState: undefined }),
+    { credential: 'pending', connection: 'pending', sync: 'pending' },
+  )
+  assert.deepEqual(
+    deriveClientWizardLights({ tokenConfigured: true, clientState: 'connected' }),
+    { credential: 'pass', connection: 'pass', sync: 'pass' },
+  )
+  assert.deepEqual(
+    deriveClientWizardLights({ tokenConfigured: false, clientState: 'revoked' }),
+    { credential: 'fail', connection: 'fail', sync: 'pending' },
+  )
+  assert.deepEqual(
+    deriveClientWizardLights({ tokenConfigured: true, clientState: 'unreachable' }),
+    { credential: 'pass', connection: 'fail', sync: 'pending' },
+  )
 })
 
 await test('formSeedOf: the configure forms seed from the wizard projection, not admin/status (GW-fix-3/M1)', () => {
@@ -167,6 +280,24 @@ await test('deriveWizardLights: amber before trying, red on wrong shapes, pass o
   // A wrong-shape probe answer fails the public light but never pairing.
   const lights = deriveWizardLights({ gatewayReachable: true, poll: { result: 'cookie-insecure', deviceId: 'd1' } })
   assert.deepEqual(lights, { gateway: 'pass', publicUrl: 'fail', pairing: 'fail' })
+  // When startResult is supplied, a successful start probe turns publicUrl green immediately,
+  // while a failed probe turns publicUrl red immediately.
+  assert.deepEqual(
+    deriveWizardLights({
+      gatewayReachable: true,
+      poll: { result: 'pending' },
+      startResult: { ok: true, pairingCode: 'ABCD1234', publicUrl: 'https://dsh.example.com', expiresAt: 1000 },
+    }),
+    { gateway: 'pass', publicUrl: 'pass', pairing: 'pending' },
+  )
+  assert.deepEqual(
+    deriveWizardLights({
+      gatewayReachable: true,
+      poll: undefined,
+      startResult: { ok: false, reason: 'probe-failed', detail: { kind: 'reached', root: 'unexpected-401', admin: 'gateway-admin-403' } },
+    }),
+    { gateway: 'pass', publicUrl: 'fail', pairing: 'pending' },
+  )
 })
 
 await test('caddyFailureCopy: every wire error maps to its locale key (GW-13a)', () => {
@@ -273,6 +404,17 @@ const WIZARD_KEYS = [
   'wizard.card.portForwardStep1', 'wizard.card.portForwardStep2', 'wizard.card.portForwardStep3',
   'wizard.card.portForwardStep4',
   'wizard.portForwardEntry', 'wizard.migrateEntry',
+  'wizard.overview.roleLabel', 'wizard.overview.gatewayLabel', 'wizard.overview.gatewayReady',
+  'wizard.overview.gatewayDown', 'wizard.overview.ingressLabel', 'wizard.overview.devicesLabel',
+  'wizard.overview.devicesSummary', 'wizard.overview.devicesNone', 'wizard.overview.clientCredLabel',
+  'wizard.overview.clientConnLabel', 'wizard.overview.clientServerLabel', 'wizard.overview.startSetup',
+  'wizard.overview.reconfigure', 'wizard.overview.pairPhone', 'wizard.overview.pairDesktop',
+  'wizard.overview.clientDetail', 'wizard.overview.emptyIntro',
+  'wizard.modal.title', 'wizard.modal.stepTag', 'wizard.modal.step1Desc', 'wizard.modal.step2Desc',
+  'wizard.modal.step3Desc', 'wizard.modal.selectedPlan', 'wizard.modal.cancel',
+  'wizard.modal.saveAndNext', 'wizard.modal.finish',
+  'wizard.light.probing', 'wizard.overview.manageDevices',
+  'wizard.devicesModal.title', 'wizard.devicesModal.subtitle', 'wizard.devicesModal.retest',
 ]
 
 // The cards' step counts are part of the walkthrough contract (GW-11).
@@ -380,9 +522,12 @@ await test('QR: every version encodes a decodable symbol (RS + format + data rec
     assert.equal(matrix[n - 8][8], true, 'the fixed dark module')
 
     // Format info: both copies agree and decode to (L, mask 0).
+    // ISO/IEC 18004 Figure 25: bit 14 (MSB) is at (8, 0) / (n - 1, 8) and
+    // bit 0 (LSB) is at (0, 8) / (8, n - 1).
     const decodeFormat = (bits) => {
       let value = 0
       for (let i = 0; i < 15; i++) value |= (bits[i] ? 1 : 0) << i
+      assert.equal(value, 0x77c4, 'ISO/IEC 18004 Table C.1 format word for L + mask 0')
       const unmasked = value ^ 0x5412
       // BCH check: re-encode the 5 data bits and compare.
       const data = unmasked >> 10
@@ -393,15 +538,15 @@ await test('QR: every version encodes a decodable symbol (RS + format + data rec
       assert.equal(data & 0b111, 0, 'mask 0')
     }
     const formatBits = []
-    for (let i = 0; i <= 5; i++) formatBits[i] = matrix[8][i]
-    formatBits[6] = matrix[8][7]
+    for (let i = 0; i <= 5; i++) formatBits[14 - i] = matrix[8][i]
+    formatBits[8] = matrix[8][7]
     formatBits[7] = matrix[8][8]
-    formatBits[8] = matrix[7][8]
-    for (let i = 9; i <= 14; i++) formatBits[i] = matrix[14 - i][8]
+    formatBits[6] = matrix[7][8]
+    for (let i = 9; i <= 14; i++) formatBits[14 - i] = matrix[14 - i][8]
     decodeFormat(formatBits)
     const formatBits2 = []
-    for (let i = 0; i <= 6; i++) formatBits2[i] = matrix[n - 1 - i][8]
-    for (let i = 7; i <= 14; i++) formatBits2[i] = matrix[8][n - 15 + i]
+    for (let i = 0; i <= 6; i++) formatBits2[14 - i] = matrix[n - 1 - i][8]
+    for (let i = 7; i <= 14; i++) formatBits2[14 - i] = matrix[8][n - 15 + i]
     assert.deepEqual(formatBits2, formatBits, 'both format copies agree')
 
     // Collect the DATA positions (the zigzag minus every reserved cell),
@@ -490,6 +635,56 @@ await test('QR: every version encodes a decodable symbol (RS + format + data rec
 
   // Overlong text refuses instead of mis-encoding.
   assert.equal(qrMatrix('x'.repeat(107)), null)
+})
+
+await test('registerGatewayWizard: mounts on plugins.bundle.config (top of bundle detail page, absent on row detail page)', () => {
+  const slotsInjected = []
+  const slotsRegistered = []
+  let formsCallback
+  const ctx = {
+    effect: () => () => {},
+    inject(services, cb) {
+      if (services.includes('configForms')) formsCallback = cb
+    },
+  }
+  const stubWizard = () => null
+  registerGatewayWizard(ctx, stubWizard)
+  assert.equal(typeof formsCallback, 'function', 'registers through lazy configForms inject')
+
+  const formsEffects = []
+  formsCallback({
+    effect(producer, label) {
+      formsEffects.push({ label, producer })
+      return () => {}
+    },
+    configForms: {
+      get: () => ({
+        getSnapshot: () => ({ status: 'ready', value: {}, base: {}, user: {}, revision: 1, writable: true }),
+        subscribe: () => () => {},
+        mutate: async () => true,
+      }),
+    },
+    slots: {
+      inject(name, factory) {
+        slotsInjected.push(name)
+        factory()
+        return () => {}
+      },
+      register(options, component) {
+        slotsRegistered.push({ options, component })
+        return () => {}
+      },
+    },
+  })
+  const sectionEffect = formsEffects.find((entry) => entry.label === 'dsh-zen-remote: wizard section')
+  assert.ok(sectionEffect !== undefined, 'wizard section effect registered')
+  sectionEffect.producer()
+  assert.deepEqual(slotsInjected, ['plugins.bundle.config'])
+  assert.equal(slotsRegistered.length, 1)
+  assert.equal(slotsRegistered[0].options.name, 'plugins.bundle.config')
+  assert.equal(slotsRegistered[0].options.key, WIZARD_BUNDLE_KEY)
+  assert.equal(slotsRegistered[0].options.key, 'dsh-zen-remote')
+  assert.equal(slotsRegistered[0].component, stubWizard)
 })
 
 console.log('check-wizard-ui: ok')

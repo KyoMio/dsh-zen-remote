@@ -25,14 +25,17 @@ export function MigrateCard({ t, onRecheck, onClose }: MigrateCardProps): ReactN
       copyLabel={t('wizard.card.copy')}
       copiedLabel={t('wizard.card.copied')}
       closeLabel={t('wizard.card.close')}
+      primaryAction={(
+        <button type="button" className="zr-wizard-btn zr-wizard-btnPrimary" onClick={onRecheck}>
+          {t('wizard.card.migrateRecheck')}
+        </button>
+      )}
       onClose={onClose}
     >
-      {STEPS.map((key, index) => (
-        <p key={key} className="zr-wizard-cardStep">{`${index + 1}. ${t(`wizard.card.${key}`)}`}</p>
-      ))}
-      <div className="zr-wizard-cardActions">
-        <button type="button" onClick={onRecheck}>{t('wizard.card.migrateRecheck')}</button>
-        <button type="button" onClick={onClose}>{t('wizard.card.close')}</button>
+      <div className="zr-wizard-cardSteps">
+        {STEPS.map((key, index) => (
+          <p key={key} className="zr-wizard-cardStep">{`${index + 1}. ${t(`wizard.card.${key}`)}`}</p>
+        ))}
       </div>
     </WizardCard>
   )

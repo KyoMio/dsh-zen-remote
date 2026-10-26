@@ -117,12 +117,28 @@ export type WizardVerifyStart = {
     reason: 'no-public-url' | 'bad-public-url' | 'runtime-not-ready' | 'gateway-unreachable' | 'probe-failed' | 'pair-refused';
     detail?: unknown;
 };
+/** The deployment role the unified wizard configures: server (`host`) or
+ * desktop sub-client (`client`). */
+export type WizardRole = 'host' | 'client';
 /** The three wizard steps: pick a path, fill its form, verify end to end. */
 export type WizardStep = 'pick' | 'configure' | 'verify';
-/** The three public-ingress paths (the row's `ingressMode` minus `'off'`). */
-export type WizardPath = 'caddy' | 'external' | 'cloudflared';
+/** The four server-ingress paths (the three public ones plus LAN-only `'lan'`). */
+export type WizardPath = 'caddy' | 'external' | 'cloudflared' | 'lan';
 /** Where the wizard opens: a configured ingress jumps straight to verify. */
 export declare function initialStep(status: WizardStatusBody | undefined): WizardStep;
+/**
+ * Whether the inline overview card should render the configured status
+ * dashboard instead of the first-time setup prompt.
+ */
+export declare function isWizardConfigured(input: {
+    effectiveClient: boolean;
+    wizardStatus: WizardStatusBody | undefined;
+    pairedDeviceCount: number;
+    hasSavedHostConfig: boolean;
+    tokenConfigured: boolean;
+    clientServerUrl: string;
+    clientState: string | undefined;
+}): boolean;
 export interface WizardFormSeed {
     domain: string;
     httpsPort: string;
@@ -184,7 +200,25 @@ export interface WizardLights {
 export declare function deriveWizardLights(input: {
     gatewayReachable: boolean;
     poll: WizardVerifyPoll | undefined;
+    startResult?: WizardVerifyStart | undefined;
 }): WizardLights;
+export interface ClientWizardLights {
+    /** Whether a desktop-client token is saved on this machine. */
+    credential: LightState;
+    /** Whether the client can reach and authenticate with the server. */
+    connection: LightState;
+    /** Whether the session-sync and plugin-bridge interceptors are active. */
+    sync: LightState;
+}
+/**
+ * Derive the three status lights for the desktop sub-client verification
+ * step (`role === 'client'`).
+ */
+export declare function deriveClientWizardLights(input: {
+    tokenConfigured: boolean;
+    clientState: string | undefined;
+    interceptInstalled?: boolean | undefined;
+}): ClientWizardLights;
 /** Pairing-code countdown, whole seconds, never negative. */
 export declare function pairingSecondsLeft(expiresAt: number, now: number): number;
 /**
