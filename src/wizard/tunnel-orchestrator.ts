@@ -32,8 +32,9 @@ export interface TunnelOrchestratorOptions {
   dshHome: string
   /** The stored Cloudflare token (token-store); absent → `no-token`. */
   readToken: () => string | undefined
-  /** The gateway's ACTUAL port (the ingress service target). */
-  gatewayPort: () => number
+  /** The gateway's ACTUAL port (the ingress service target); may probe
+   * asynchronously (the wiring re-reads /lan-gate/status per setup). */
+  gatewayPort: () => number | Promise<number>
   /** The client factory; injectable so the tests drive the orchestration
    * against a scripted CloudflareApi without any HTTP. Defaults to
    * createCloudflareApi over the injected fetch. */
@@ -57,7 +58,7 @@ export type TunnelSetupResult =
   | { ok: true; tunnelId: string; publicUrl: string; tokenFile: string }
   | {
     ok: false
-    reason: 'no-token' | 'bad-domain' | 'zone-not-found' | 'tunnel-conflict' | 'auth' | 'network' | 'api' | 'spawn-failed'
+    reason: 'no-token' | 'bad-domain' | 'zone-not-found' | 'tunnel-conflict' | 'dns-conflict' | 'auth' | 'network' | 'api' | 'spawn-failed'
     detail?: string
     /** The same-name tunnels, for `tunnel-conflict`. */
     existing?: CloudflareTunnelSummary[]
@@ -125,16 +126,36 @@ export async function setupTunnel(options: TunnelOrchestratorOptions, input: Tun
     return mapCloudflareError(error)
   }
 
-  // 模式切换：the tunnel takes over — the managed Caddy stops first.
-  options.cloudflared.stopCaddy()
+  const gatewayPort = await options.gatewayPort()
 
-  // Ingress + DNS, both idempotent-shaped API calls.
+  // The ingress mapping: the public hostname serves the local gateway.
   try {
-    await api.configureIngress(accountId, tunnelId, host, `http://127.0.0.1:${options.gatewayPort()}`)
-    await api.createDnsRecord(zoneId, host, `${tunnelId}.cfargotunnel.com`)
+    await api.configureIngress(accountId, tunnelId, host, `http://127.0.0.1:${gatewayPort}`)
   } catch (error) {
     return mapCloudflareError(error)
   }
+
+  // DNS idempotence next (GW-fix-4/M3): an existing CNAME for this name
+  // pointing at the SAME tunnel is a no-op; pointing elsewhere is a real
+  // conflict we refuse instead of silently overwriting.
+  try {
+    const existing = await api.listDnsRecords(zoneId, host)
+    const prior = existing.find((record) => record.name === host)
+    if (prior !== undefined) {
+      const expected = `${tunnelId}.cfargotunnel.com`
+      if (prior.content !== expected) {
+        return { ok: false, reason: 'dns-conflict', detail: prior.content }
+      }
+    } else {
+      await api.createDnsRecord(zoneId, host, `${tunnelId}.cfargotunnel.com`)
+    }
+  } catch (error) {
+    return mapCloudflareError(error)
+  }
+
+  // L1: the Cloudflare half is DONE — only now stop the managed Caddy and
+  // start the tunnel, so a failed API call leaves the old path untouched.
+  options.cloudflared.stopCaddy()
 
   // Connector secret → 0600 file → child.
   let tokenFile: string

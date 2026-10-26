@@ -17,7 +17,7 @@
  * ctx.effect so the row's disposal kills cloudflared too.
  */
 
-import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ensureBinary, BinaryDownloadError, type DownloadProgress } from './binary-io.js'
 import { ingressDir, type BinaryPlatform } from './binary.js'
@@ -26,6 +26,17 @@ import type { SubprocessServiceLike, SubprocessHandleLike } from './caddy-proces
 /** Where the connector secret lives (design.md: 不进 Config 的字段). */
 export function tunnelTokenPath(dshHome: string): string {
   return join(ingressDir(dshHome), 'tunnel-token')
+}
+
+/** Whether a non-empty tunnel-token file exists (the projection's boolean
+ * only — GW-fix-4/M1: the manager's EXISTENCE says nothing about whether a
+ * token has been stored). */
+export function tunnelTokenConfigured(dshHome: string): boolean {
+  try {
+    return statSync(tunnelTokenPath(dshHome)).isFile() && readFileSync(tunnelTokenPath(dshHome), 'utf8').trim() !== ''
+  } catch {
+    return false
+  }
 }
 
 /**

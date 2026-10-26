@@ -72,7 +72,7 @@ import { createWizardHandler, WIZARD_ROUTE_PREFIX } from './wizard/routes.js'
 import { createCaddyManager } from './wizard/caddy-process.js'
 import type { SubprocessServiceLike } from './wizard/caddy-process.js'
 import { cfTokenConfigured, deleteCfTokenFile, readCfTokenFile, writeCfTokenFile } from './wizard/token-store.js'
-import { createCloudflaredManager } from './wizard/cloudflared.js'
+import { createCloudflaredManager, tunnelTokenConfigured } from './wizard/cloudflared.js'
 import { checkDomainOnCloudflare as runTunnelCheck, setupTunnel } from './wizard/tunnel-orchestrator.js'
 import { writeTunnelTokenFile } from './wizard/cloudflared.js'
 import { detectForwardedSource, parseProxyList } from './wizard/source-detect.js'
@@ -853,6 +853,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           return {
             caddyRunning: caddyManager?.isRunning() === true,
             cloudflaredRunning: cloudflaredManager?.isRunning() === true,
+            tunnelTokenConfigured: tunnelTokenConfigured(dshHome),
             cfTokenConfigured: cfTokenConfigured(dshHome),
           }
         }
@@ -913,12 +914,19 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
                 {
                   dshHome,
                   readToken: () => readCfTokenFile(dshHome),
-                  gatewayPort: () => {
+                  gatewayPort: async () => {
                     // The ingress service target is the gateway's ACTUAL
-                    // port; re-resolve per call (cheap, and it may have
-                    // moved since the route read it).
-                    const values = resolveConfig(config, readFileConfig(), process.env).values
-                    return values.port
+                    // port — same fallback as the caddy start route: probe
+                    // /lan-gate/status first, fall back to the configured
+                    // port when it does not answer (GW-fix-4/M2).
+                    try {
+                      const response = await fetch(`http://127.0.0.1:${resolveConfig(config, readFileConfig(), process.env).values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
+                      if (response.ok) {
+                        const body = (await response.json()) as { port?: unknown }
+                        if (typeof body?.port === 'number') return body.port
+                      }
+                    } catch { /* fall through to the configured port */ }
+                    return resolveConfig(config, readFileConfig(), process.env).values.port
                   },
                   cloudflared: {
                     start: async (startInput: { tunnelToken: string }) => {
@@ -962,7 +970,14 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           },
         }),
       })
-      return unregister
+      // H1: the row's disposal must not orphan the managed children — the
+      // Caddy/cloudflared processes die WITH the row that spawned them,
+      // before the route registration unregisters.
+      return () => {
+        caddyManager?.stop()
+        cloudflaredManager?.stop()
+        unregister()
+      }
       }, 'dsh-zen-remote: wizard routes')
     })
     // The idle sweeper (T22c): every minute, hand the table the CURRENT

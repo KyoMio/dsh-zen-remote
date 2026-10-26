@@ -97,6 +97,13 @@ export interface CloudflareTunnelSummary {
   status: string
 }
 
+/** One DNS record summary (the id/content the tunnel setup compares). */
+export interface CloudflareDnsRecord {
+  id: string
+  name: string
+  content: string
+}
+
 export interface CloudflareDomainCheck {
   onCloudflare: boolean
   zoneId: string | null
@@ -118,6 +125,8 @@ export interface CloudflareApi {
   configureIngress(accountId: string, tunnelId: string, domain: string, serviceUrl: string): Promise<void>
   /** One proxied CNAME `subdomain` → `target`; returns the record id. */
   createDnsRecord(zoneId: string, subdomain: string, target: string): Promise<string>
+  /** The CNAME records named `name` in one zone (id/name/content only). */
+  listDnsRecords(zoneId: string, name: string): Promise<CloudflareDnsRecord[]>
   /** Composed check: does any ancestor of `domain` name a zone on the
    * token's accounts (zones are apexes — `dsh.example.com` lives in the
    * `example.com` zone)? */
@@ -297,6 +306,22 @@ export function createCloudflareApi(options: CloudflareApiOptions): CloudflareAp
       })
     },
 
+    async listDnsRecords(zoneId, name) {
+      const zone = requireId(zoneId, 'the zone id')
+      const recordName = hostOf(name)
+      if (recordName === undefined) throw new CloudflareError('cf-api', 'the record name is not a bare hostname')
+      const { result } = await call('GET', `/zones/${seg(zone)}/dns_records?type=CNAME&name=${seg(recordName)}&per_page=${50}&page=${1}`)
+      if (!Array.isArray(result)) throw new CloudflareError('cf-api', 'the DNS records answer had no list')
+      return result.map((record) => {
+        const entry = record as { id?: unknown; name?: unknown; content?: unknown }
+        return {
+          id: requireString(entry?.id, 'a DNS record id'),
+          name: typeof entry?.name === 'string' ? entry.name : '',
+          content: typeof entry?.content === 'string' ? entry.content : '',
+        }
+      })
+    },
+
     async createDnsRecord(zoneId, subdomain, target) {
       const zone = requireId(zoneId, 'the zone id')
       const name = hostOf(subdomain)
@@ -374,6 +399,10 @@ export function cfConfigureIngress(
 
 export function cfCreateDnsRecord(token: string, zoneId: string, subdomain: string, target: string, opts?: CfCallOptions): Promise<string> {
   return createCloudflareApi({ token, ...opts }).createDnsRecord(zoneId, subdomain, target)
+}
+
+export function cfListDnsRecords(token: string, zoneId: string, name: string, opts?: CfCallOptions): Promise<CloudflareDnsRecord[]> {
+  return createCloudflareApi({ token, ...opts }).listDnsRecords(zoneId, name)
 }
 
 export function cfCheckDomainOnCloudflare(token: string, domain: string, opts?: CfCallOptions): Promise<CloudflareDomainCheck> {

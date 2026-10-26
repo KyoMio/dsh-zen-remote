@@ -560,6 +560,24 @@ test('caddy routes: start reads the SAVED config, stop and the three-state statu
   }
 })
 
+test('a GET on the stop routes answers 405 — never stops a process (GW-fix-4/H2)', async () => {
+  const calls = []
+  const { server, port } = await serve(wizard.createWizardHandler(wizardOptions({
+    caddy: { start: async () => ({ ok: true, binaryPath: '/b', caddyfile: '/cf', alreadyRunning: false }), stop: () => { calls.push(['caddy-stop']) }, status: () => 'running' },
+    tunnel: { checkDomain: async () => ({ ok: true, onCloudflare: true, zoneId: null }), setup: async () => ({ ok: true, tunnelId: 't', publicUrl: 'https://x' }), stop: () => { calls.push(['tunnel-stop']) }, status: () => 'running' },
+  })))
+  try {
+    const caddyGet = await request(port, { method: 'GET', path: wizard.WIZARD_CADDY_STOP_ROUTE })
+    assert.equal(caddyGet.status, 405)
+    assert.equal(JSON.parse(caddyGet.body).error.code, 'method-not-allowed')
+    const tunnelGet = await request(port, { method: 'GET', path: wizard.WIZARD_TUNNEL_STOP_ROUTE })
+    assert.equal(tunnelGet.status, 405)
+    assert.equal(calls.length, 0, 'no stop ran')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
 test('caddy routes unwired answer 501 (GW-13a compatibility)', async () => {
   const { server, port } = await serve(wizard.createWizardHandler(wizardOptions()))
   try {
@@ -661,5 +679,106 @@ test('tunnel routes: walls, then wiring; setup carries no connector token (GW-13
     }
   } finally {
     await new Promise((resolve) => bare.server.close(resolve))
+  }
+})
+
+// ---- GW-fix-4/H1: the row disposal stops the managed children -------------------
+
+test('the wizard effect disposal stops the managed Caddy before unregistering', async () => {
+  const index = await import(INDEX_URL)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-dispose-'))
+  try {
+    // Pre-install a fake executable + token so start() runs fully offline.
+    const binDir = path.join(home, 'zen-remote-ingress', 'bin')
+    fs.mkdirSync(binDir, { recursive: true })
+    const binaryPath = path.join(binDir, 'caddy')
+    fs.writeFileSync(binaryPath, 'not-really-caddy')
+    fs.chmodSync(binaryPath, 0o755)
+    fs.writeFileSync(path.join(home, 'zen-remote-ingress', 'cf-api-token'), 'tok', { mode: 0o600 })
+
+    const handles = []
+    const subprocess = {
+      spawn(definition) {
+        let resolveDone
+        const done = new Promise((resolve) => { resolveDone = resolve })
+        const handle = {
+          argv: definition.argv,
+          terminated: false,
+          done,
+          terminate() { this.terminated = true; resolveDone({ exitCode: null, signal: 'SIGTERM' }); return Promise.resolve() },
+        }
+        handles.push(handle)
+        // The validate child exits immediately; the run child stays alive.
+        if (definition.argv.includes('validate')) queueMicrotask(() => resolveDone({ exitCode: 0, signal: null }))
+        return handle
+      },
+    }
+    const routes = []
+    const disposers = []
+    const services = {
+      webServer: { register: (route) => { routes.push(route); return () => {} } },
+      connection: { admit: () => ({ peer: {} }) },
+      sessions: { get: () => undefined },
+      sessionQuery: {},
+      subprocess,
+    }
+    const ctx = {
+      plugin() {},
+      on() { return () => {} },
+      effect(fn, name) { disposers.push({ name, disposer: fn() }) },
+      logger: { warn() {} },
+      inject(deps, cb) {
+        if (!deps.every((d) => services[d] !== undefined)) return
+        const target = {
+          get: (name) => services[name],
+          reflect: { get: (name) => services[name] },
+          effect: (fn2, name2) => disposers.push({ name: name2, disposer: fn2() }),
+        }
+        void services
+        cb(new Proxy(target, {
+          get(t, prop) {
+            if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
+            if (deps.includes(prop)) return services[prop]
+            throw new Error(`cannot get property "${String(prop)}" without inject`)
+          },
+        }))
+      },
+    }
+    // The wiring resolves DSH_HOME from the PROCESS environment at apply
+    // time — point it at the fixture home for the whole test.
+    const savedHome = process.env.DSH_HOME
+    process.env.DSH_HOME = home
+    try {
+      index.apply(ctx, { port: 47000, ingressMode: 'caddy', ingressDomain: 'dsh.example.com', ingressHttpsPort: 443 })
+    } catch (error) {
+      process.env.DSH_HOME = savedHome
+      throw error
+    }
+
+    const wizardRoute = routes.find((r) => r.path === '/_dsh/zen-remote/admin/wizard')
+    assert.ok(wizardRoute, 'the wizard prefix registered')
+    const server = http.createServer((req, res) => { void wizardRoute.handler(req, res) })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const port = server.address().port
+      const start = await request(port, { method: 'POST', path: '/_dsh/zen-remote/admin/wizard/caddy/start', headers: { origin: `http://127.0.0.1:${port}` } })
+      assert.equal(start.status, 200)
+      assert.equal(JSON.parse(start.body).ok, true)
+      const runChild = handles[handles.length - 1]
+      assert.equal(runChild.terminated, false, 'sanity: the child is alive before the disposal')
+
+      // The row's disposal: children FIRST, then the unregister. The wizard
+      // effect is picked BY NAME — apply registers several effects after it.
+      const wizardEntry = disposers.find((entry) => entry.name === 'dsh-zen-remote: wizard routes')
+      assert.ok(wizardEntry, 'the wizard effect was registered')
+      wizardEntry.disposer()
+      assert.equal(runChild.terminated, true, 'the managed Caddy was terminated by the row disposal')
+      assert.equal(JSON.parse((await request(port, { method: 'GET', path: '/_dsh/zen-remote/admin/wizard/caddy/status', headers: { origin: `http://127.0.0.1:${port}` } })).body).state, 'stopped', 'degraded, not never-started')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      process.env.DSH_HOME = savedHome
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
   }
 })

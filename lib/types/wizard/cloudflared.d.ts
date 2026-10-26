@@ -21,6 +21,10 @@ import { type BinaryPlatform } from './binary.js';
 import type { SubprocessServiceLike } from './caddy-process.js';
 /** Where the connector secret lives (design.md: 不进 Config 的字段). */
 export declare function tunnelTokenPath(dshHome: string): string;
+/** Whether a non-empty tunnel-token file exists (the projection's boolean
+ * only — GW-fix-4/M1: the manager's EXISTENCE says nothing about whether a
+ * token has been stored). */
+export declare function tunnelTokenConfigured(dshHome: string): boolean;
 /**
  * Persist the tunnel connector secret: 0600, atomic (write the `.part`
  * sibling, then rename over the real path).

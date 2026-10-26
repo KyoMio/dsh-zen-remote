@@ -67,6 +67,10 @@ function fakeApi(overrides = {}) {
       calls.push(['createDnsRecord', zoneId, subdomain, target])
       return 'rec-1'
     },
+    async listDnsRecords(zoneId, name) {
+      calls.push(['listDnsRecords', name])
+      return overrides.dnsRecords ?? []
+    },
   }
   return api
 }
@@ -110,6 +114,7 @@ test('the full chain: zone → create → ingress(actual port) → CNAME → tok
     ['listTunnels', 'acc-1'],
     ['createTunnel', 'acc-1', 'dsh-zen-remote'],
     ['configureIngress', 'acc-1', 'tun-new', 'dsh.example.com', 'http://127.0.0.1:4088'],
+    ['listDnsRecords', 'dsh.example.com'],
     ['createDnsRecord', 'zone-1', 'dsh.example.com', 'tun-new.cfargotunnel.com'],
   ])
   // 模式切换 BEFORE the child starts; the connector secret rides the file.
@@ -140,6 +145,7 @@ test('a same-name tunnel refuses with the list; adopting one switches to the tok
   })
   assert.ok(api.calls.some((entry) => entry[0] === 'getTunnelToken' && entry[2] === 'tun-old'), 'the token endpoint answered')
   assert.deepEqual(api.calls.filter((entry) => entry[0] === 'configureIngress'), [['configureIngress', 'acc-1', 'tun-old', 'dsh.example.com', 'http://127.0.0.1:4088']])
+  assert.deepEqual(api.calls.filter((entry) => entry[0] === 'listDnsRecords'), [['listDnsRecords', 'dsh.example.com']])
   assert.deepEqual(api.calls.filter((entry) => entry[0] === 'createDnsRecord'), [['createDnsRecord', 'zone-1', 'dsh.example.com', 'tun-old.cfargotunnel.com']])
   assert.deepEqual(calls.filter((entry) => entry[0] === 'cf-start'), [['cf-start', 'adopted-connector-secret']])
 })
@@ -188,4 +194,89 @@ test('checkDomainOnCloudflare: the parent zone matches; no-token and bad-domain 
   )
   assert.equal((await orchestrator.checkDomainOnCloudflare({ readToken: () => undefined }, 'dsh.example.com')).reason, 'no-token')
   assert.equal((await orchestrator.checkDomainOnCloudflare({ readToken: () => 't' }, 'not a domain')).reason, 'bad-domain')
+})
+
+// ---- GW-fix-4: DNS idempotence + the L1 ordering ---------------------------------
+
+test('a repeated setup on the SAME domain is idempotent: the existing CNAME skips the POST', async () => {
+  const calls = []
+  const api = {
+    calls,
+    async checkDomainOnCloudflare() { calls.push(['checkDomain']); return { onCloudflare: true, zoneId: 'zone-1', accountId: 'acc-1' } },
+    async listTunnels() { calls.push(['listTunnels']); return [{ id: 'tun-existing', name: 'dsh-zen-remote', status: 'down' }] },
+    async createTunnel() { calls.push(['createTunnel']); throw new Error('must not create on conflict') },
+    async getTunnelToken(accountId, tunnelId) { calls.push(['getTunnelToken', tunnelId]); return 'adopted-secret' },
+    async configureIngress(accountId, tunnelId, domain, serviceUrl) { calls.push(['configureIngress', tunnelId, serviceUrl]) },
+    async listDnsRecords(zoneId, name) {
+      calls.push(['listDnsRecords', name])
+      // Already pointing at the tunnel the user adopted: a re-run is a no-op.
+      return [{ id: 'rec-1', name, content: 'tun-existing.cfargotunnel.com' }]
+    },
+    async createDnsRecord() { calls.push(['createDnsRecord']); throw new Error('must not re-POST an existing record') },
+  }
+  const managerCalls = []
+  const result = await orchestrator.setupTunnel({
+    dshHome: home,
+    readToken: () => 't',
+    gatewayPort: () => 4088,
+    apiFactory: () => api,
+    cloudflared: {
+      start: async (input) => { managerCalls.push(['cf-start', input.tunnelToken]); return { ok: true } },
+      stopCaddy: () => { managerCalls.push(['stop-caddy']) },
+    },
+  }, { domain: 'dsh.example.com', tunnelId: 'tun-existing' })
+  assert.equal(result.ok, true)
+  assert.ok(!calls.some((entry) => entry[0] === 'createDnsRecord'), 'the CNAME POST was skipped')
+  assert.deepEqual(managerCalls, [['stop-caddy'], ['cf-start', 'adopted-secret']], 'the child still restarts with the adopted token')
+})
+
+test('a CNAME pointing ELSEWHERE is a typed dns-conflict; the old path is untouched (L1)', async () => {
+  const calls = []
+  const managerCalls = []
+  const result = await orchestrator.setupTunnel({
+    dshHome: home,
+    readToken: () => 't',
+    gatewayPort: () => 4088,
+    apiFactory: () => ({
+      async checkDomainOnCloudflare() { return { onCloudflare: true, zoneId: 'zone-1', accountId: 'acc-1' } },
+      async listTunnels() { return [] },
+      async createTunnel() { return { id: 'tun-new', token: 'fresh' } },
+      async configureIngress() { calls.push(['configureIngress']) },
+      async listDnsRecords(zoneId, name) { calls.push(['listDnsRecords']); return [{ id: 'rec-other', name, content: 'old-target.example.com' }] },
+      async createDnsRecord() { calls.push(['createDnsRecord']); throw new Error('must not overwrite') },
+    }),
+    cloudflared: {
+      start: async () => { managerCalls.push(['cf-start']); return { ok: true } },
+      stopCaddy: () => { managerCalls.push(['stop-caddy']) },
+    },
+  }, { domain: 'dsh.example.com' })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'dns-conflict')
+  assert.equal(result.detail, 'old-target.example.com', 'the existing target surfaces for the UI')
+  assert.ok(!calls.some((entry) => entry[0] === 'createDnsRecord'), 'never overwrites')
+  assert.deepEqual(managerCalls, [], 'L1: a failed API half leaves the RUNNING old path completely untouched')
+})
+
+test('L1: the caddy stop lands AFTER the Cloudflare calls succeed', async () => {
+  const order = []
+  const result = await orchestrator.setupTunnel({
+    dshHome: home,
+    readToken: () => 't',
+    gatewayPort: () => 4088,
+    apiFactory: () => ({
+      async checkDomainOnCloudflare() { order.push('check'); return { onCloudflare: true, zoneId: 'z', accountId: 'a' } },
+      async listTunnels() { order.push('list'); return [] },
+      async createTunnel() { order.push('create'); return { id: 't1', token: 'tok' } },
+      async configureIngress() { order.push('ingress') },
+      async listDnsRecords() { order.push('listDns'); return [] },
+      async createDnsRecord() { order.push('dns'); return 'rec' },
+    }),
+    cloudflared: {
+      start: async () => { order.push('cf-start'); return { ok: true } },
+      stopCaddy: () => { order.push('stop-caddy') },
+    },
+  }, { domain: 'dsh.example.com' })
+  assert.equal(result.ok, true)
+  assert.equal(order.indexOf('stop-caddy'), order.length - 2, 'stop-caddy is second-to-last, right before cf-start')
+  assert.ok(order.indexOf('dns') < order.indexOf('stop-caddy'), 'every Cloudflare call precedes the stop')
 })

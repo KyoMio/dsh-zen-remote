@@ -405,6 +405,7 @@ export declare const zh: {
     readonly 'wizard.tunnel.conflict': "已存在同名隧道，选择一条使用：";
     readonly 'wizard.tunnel.useExisting': "使用此隧道";
     readonly 'wizard.tunnel.zoneNotFound': "域名（或其父域）不在这个 Token 能访问的 Cloudflare 区域里——可用迁移卡片把域名迁过来";
+    readonly 'wizard.tunnel.dnsConflict': "该域名已有一条指向别处的 CNAME 记录（指向 {detail}），请先在 Cloudflare 删除或改回再试";
     readonly 'wizard.tunnel.auth': "Cloudflare 认证失败：请检查 Token 权限";
     readonly 'wizard.tunnel.network': "Cloudflare API 网络错误";
     readonly 'wizard.tunnel.api': "Cloudflare API 错误：{detail}";

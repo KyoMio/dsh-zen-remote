@@ -50,6 +50,12 @@ export interface CloudflareTunnelSummary {
     name: string;
     status: string;
 }
+/** One DNS record summary (the id/content the tunnel setup compares). */
+export interface CloudflareDnsRecord {
+    id: string;
+    name: string;
+    content: string;
+}
 export interface CloudflareDomainCheck {
     onCloudflare: boolean;
     zoneId: string | null;
@@ -73,6 +79,8 @@ export interface CloudflareApi {
     configureIngress(accountId: string, tunnelId: string, domain: string, serviceUrl: string): Promise<void>;
     /** One proxied CNAME `subdomain` → `target`; returns the record id. */
     createDnsRecord(zoneId: string, subdomain: string, target: string): Promise<string>;
+    /** The CNAME records named `name` in one zone (id/name/content only). */
+    listDnsRecords(zoneId: string, name: string): Promise<CloudflareDnsRecord[]>;
     /** Composed check: does any ancestor of `domain` name a zone on the
      * token's accounts (zones are apexes — `dsh.example.com` lives in the
      * `example.com` zone)? */
@@ -98,6 +106,7 @@ export declare function cfListTunnels(token: string, accountId: string, opts?: C
 export declare function cfGetTunnelToken(token: string, accountId: string, tunnelId: string, opts?: CfCallOptions): Promise<string>;
 export declare function cfConfigureIngress(token: string, accountId: string, tunnelId: string, domain: string, serviceUrl: string, opts?: CfCallOptions): Promise<void>;
 export declare function cfCreateDnsRecord(token: string, zoneId: string, subdomain: string, target: string, opts?: CfCallOptions): Promise<string>;
+export declare function cfListDnsRecords(token: string, zoneId: string, name: string, opts?: CfCallOptions): Promise<CloudflareDnsRecord[]>;
 export declare function cfCheckDomainOnCloudflare(token: string, domain: string, opts?: CfCallOptions): Promise<CloudflareDomainCheck>;
 export {};
 //# sourceMappingURL=cloudflare.d.ts.map
