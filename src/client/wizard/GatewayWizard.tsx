@@ -391,8 +391,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   }
 
   // The subject + role gates. All hooks above; nothing below renders for a
-  // foreign subject or a sub-client row.
-  if (props.kind !== 'row' || props.pkg?.name !== 'dsh-zen-remote') return null
+  // foreign subject or a sub-client row. The plugin-manager passes the subject
+  // as `props.subject` — a structural mirror that flattens it into kind/pkg
+  // would compile but miss at runtime.
+  const subject = (props as { subject?: { kind?: string; pkg?: { name?: string } } }).subject
+  if (subject?.kind !== 'row' || subject?.pkg?.name !== 'dsh-zen-remote') return null
   const effectiveClient = savedClient || (probedClient === true && !config.rowRoleKnown())
   if (effectiveClient) return null
 
