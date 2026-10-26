@@ -115,6 +115,18 @@ test('binaryUrls maps every supported platform to both official endpoints WITH a
   assert.equal(globalCaddy[0].url, 'https://github.com/KyoMio/dsh-zen-remote/releases/download/caddy-cloudflare/caddy-darwin-arm64.tgz')
   assert.equal(globalCaddy[0].archive, 'tgz')
   assert.ok(globalCaddy[1].url.startsWith('https://gh-proxy.com/'))
+
+  const globalCloudflared = binary.binaryDownloadCandidates('cloudflared', { os: 'windows', arch: 'amd64' }, false)
+  assert.equal(globalCloudflared[0].url, 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe')
+  assert.equal(globalCloudflared[0].archive, 'exe')
+  assert.ok(globalCloudflared[1].url.startsWith('https://gh-proxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe'))
+  assert.ok(globalCloudflared[2].url.startsWith('https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe'))
+
+  const cnCloudflared = binary.binaryDownloadCandidates('cloudflared', { os: 'darwin', arch: 'arm64' }, true)
+  assert.ok(cnCloudflared[0].url.startsWith('https://gh-proxy.com/https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz'))
+  assert.equal(cnCloudflared[0].archive, 'tgz')
+  assert.ok(cnCloudflared[1].url.startsWith('https://ghfast.top/'))
+  assert.equal(cnCloudflared[2].url, 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz')
 })
 
 test('currentPlatform maps this process into the supported set (windows is amd64-only, GW-fix-1/L4)', async () => {

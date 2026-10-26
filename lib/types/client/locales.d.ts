@@ -455,7 +455,7 @@ export declare const zh: {
     readonly 'wizard.tunnel.spawnFailed': "cloudflared 启动失败：{detail}";
     readonly 'wizard.tunnel.noToken': "请先在上一步保存 Cloudflare API 令牌";
     readonly 'wizard.tunnel.badDomain': "域名格式无效";
-    readonly 'wizard.tunnel.checking': "处理中…";
+    readonly 'wizard.tunnel.checking': "正在配置隧道并启动（首次自动下载 cloudflared）…";
     readonly 'wizard.check.okOnCf': "已确认域名托管在 Cloudflare";
     readonly 'wizard.check.okNotOnCf': "未在 Cloudflare 中找到该域名，请先完成域名接入";
     readonly 'wizard.check.failed': "域名检测失败：{reason}";

@@ -177,7 +177,12 @@ test('start: binary cache hit → validate → publish → run, token in env onl
   assert.equal(run.env.CF_API_TOKEN, token)
 
   // The child env is the whitelist PLUS the token — nothing else inherits.
-  const WHITELIST = new Set(['PATH', 'HOME', 'TMPDIR', 'LANG', 'TZ', 'CF_API_TOKEN'])
+  const WHITELIST = new Set([
+    'PATH', 'HOME', 'TMPDIR', 'LANG', 'TZ',
+    'SystemRoot', 'SYSTEMROOT', 'windir', 'WINDIR',
+    'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA', 'TEMP', 'TMP',
+    'CF_API_TOKEN',
+  ])
   for (const spawn of subprocess.spawns) {
     for (const key of Object.keys(spawn.env)) {
       assert.ok(WHITELIST.has(key), `env key ${key} must be whitelisted`)
