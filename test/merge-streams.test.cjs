@@ -1534,6 +1534,33 @@ test('T63 virtualSessionIdsInWorkspaceFrames: upserts and baselines, virtual ids
   assert.deepEqual(virtualSessionIdsInWorkspaceFrames([]), [])
 })
 
+test('unpair / revocation with a readable current session archives and hides remote sessions (except the currently open session); re-pair reveals them', () => {
+  const m = merger()
+  const ui = createUiModel()
+  m.onLocal(T58_LOCAL_BASELINE).forEach(ui.apply)
+  m.onRemote(T58_BASELINE).forEach(ui.apply)
+  // User is viewing a local session (or settings page): all remote sessions
+  // move into archivedSessionIds on unpair, hiding them from the default
+  // sidebar view while keeping them in their workspace group so they never
+  // become 「未分组」 strays.
+  m.setCurrentSession('session-l1')
+  m.setStatus('unpaired')
+  const unpairedFrames = m.onStatusChanged()
+  unpairedFrames.forEach(ui.apply)
+  assert.deepEqual(
+    ui.model.archivedSessionIds,
+    ['session-l1', V('s1'), V('s2'), V('s3')],
+    'all remote sessions are archived/hidden when unpaired',
+  )
+  assertNoStrays(ui)
+
+  // Re-pairing to the same server (`none`) reveals the live sessions again.
+  m.setStatus('none')
+  const restoredFrames = m.onStatusChanged()
+  restoredFrames.forEach(ui.apply)
+  assert.deepEqual(ui.model.archivedSessionIds, ['session-l1'], 're-pair removes the remote sessions from archived')
+})
+
 test('T63/T65 e2e at the merger level: a hidden closed-remote session rides the forwarded frames, and the sync\'s asked-once gate covers it', () => {
   const { m, advance } = clockedMerger()
   m.onLocal(LOCAL_BASELINE)

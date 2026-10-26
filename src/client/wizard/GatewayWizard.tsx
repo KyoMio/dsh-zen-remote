@@ -85,7 +85,7 @@ export interface GatewayWizardProps extends PropsRuntime<'plugins.bundle.config'
   /** The row's staged-form controller — saved-role source of truth. */
   config: ZenRemoteSettingsForm
   /** One atomic row write (the wiring stages through configForms.mutate). */
-  saveRowFields: (fields: Record<string, unknown>) => Promise<void>
+  saveRowFields: (fields: Record<string, unknown>, options?: { unset?: readonly string[] }) => Promise<void>
 }
 
 type StartFailureKey = 'wizard.startFailedProbe' | 'wizard.startFailedRuntime' | 'wizard.startFailedGateway' | 'wizard.startFailedPair' | 'wizard.startFailedUrl'
@@ -465,16 +465,35 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     setNotWired(false)
     setProbingUrl(true)
     try {
-      const response = await fetch(WIZARD_VERIFY_ROUTE, {
+      const sendProbe = () => fetch(WIZARD_VERIFY_ROUTE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ publicUrl: urlToProbe, probeOnly: true }),
       })
+      let response = await sendProbe()
+      // When switching from client to host role, the plugin row reloads and the
+      // gateway child process takes a brief moment to bind its port. Retry once
+      // or twice before surfacing a transient 404 or gateway-unreachable.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (response.status === 404) {
+          await new Promise((resolve) => setTimeout(resolve, 900))
+          response = await sendProbe()
+          continue
+        }
+        const clone = (await response.clone().json().catch(() => undefined)) as WizardVerifyStart | undefined
+        if (clone !== undefined && !clone.ok && clone.reason === 'gateway-unreachable') {
+          await new Promise((resolve) => setTimeout(resolve, 900))
+          response = await sendProbe()
+          continue
+        }
+        break
+      }
       if (response.status === 501) {
         setNotWired(true)
         return
       }
       const body = (await response.json()) as WizardVerifyStart
+      if (body.ok) setGatewayReachable(true)
       setStartResult((prev) => {
         // Keep an active web pairing code on screen if one was already requested and probe passed.
         if (body.ok && prev?.ok === true && prev.pairingCode !== '' && body.pairingCode === '') {
@@ -521,6 +540,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       return
     }
     setSavingConfig(true)
+    const wasClient = effectiveClient
     try {
       if ((path === 'caddy' || path === 'cloudflared') && cfToken.trim() !== '') {
         const saved = await saveTokenValue(cfToken.trim())
@@ -533,11 +553,14 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           ...(hostName.trim() !== '' ? { serverName: hostName.trim() } : {}),
         }
         if (path === 'lan') {
-          await props.saveRowFields({
-            ...baseFields,
-            ingressMode: 'off',
-            ...(readiness.publicUrl !== '' ? { ingressPublicUrl: readiness.publicUrl } : {}),
-          })
+          await props.saveRowFields(
+            {
+              ...baseFields,
+              ingressMode: 'off',
+              ...(readiness.publicUrl !== '' ? { ingressPublicUrl: readiness.publicUrl } : {}),
+            },
+            readiness.publicUrl === '' ? { unset: ['ingressPublicUrl'] } : undefined,
+          )
         } else if (path === 'external') {
           await props.saveRowFields({
             ...baseFields,
@@ -551,6 +574,25 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
             ingressDomain: domain.trim(),
             ingressHttpsPort: readiness.httpsPort,
           })
+        }
+        // If this machine was previously in client mode, wait for the
+        // restart-watcher to reload the plugin row into host mode and spawn
+        // the local gateway child process before entering the verify step.
+        if (wasClient) {
+          setProbedClient(false)
+          for (let i = 0; i < 6; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 650))
+            try {
+              const res = await fetch(ADMIN_STATUS_ROUTE)
+              if (res.ok) {
+                const body = (await res.json()) as AdminStatusBody
+                if (body?.ok === true && body.gatewayReachable === true) break
+              }
+            } catch {
+              // keep waiting for gateway startup
+            }
+          }
+          await loadHostStatus()
         }
       } catch {
         // Even if the row mutation is pending mirror sync, advance to verify.
@@ -578,6 +620,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         return
       }
       const body = (await response.json()) as WizardVerifyStart
+      if (body.ok) setGatewayReachable(true)
       setStartResult(body)
       setPoll(body.ok ? { result: 'not-started' } : undefined)
     } catch {
@@ -1446,10 +1489,12 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                             id="zr-wizard-client-code"
                             className="zr-wizard-input"
                             type="text"
+                            autoComplete="off"
+                            spellCheck={false}
                             placeholder={t('wizard.client.pairingCodePlaceholder')}
                             value={clientPairCode}
                             disabled={clientClaimBusy}
-                            onChange={(event) => setClientPairCode(event.target.value)}
+                            onChange={(event) => setClientPairCode(normalizePairingCode(event.target.value))}
                           />
                           <p className="zr-wizard-hint">{t('wizard.client.pairingCodeHint')}</p>
                         </div>

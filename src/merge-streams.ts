@@ -419,19 +419,43 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
     return currentOriginal() !== id
   }
 
-  /** T58: re-derive {@link hiddenSessions} from the live tombstone set —
-   * tombstones hide unless they ARE the current session (or no readable
-   * current is known, or the tombstone is inside the T65 hide grace);
-   * live-carried ids and ids that (re-)became the current session leave the
-   * set. Since T65 the hide/reveal transitions move ONLY the archived set —
-   * the session stays in its group's forwarded copy either way — so the
-   * caller emits just the merged archived frame when anything changed. */
+  /** Whether the relay status is an unpair or token revocation — while in
+   * either state, every known remote session is archived/hidden (except the
+   * currently open session when current session is readable, so its open page
+   * is not kicked home by `clearArchivedCurrent`). Reconnecting (`none`) or
+   * re-sharing automatically reveals them again. */
+  function isPairingDisconnected(): boolean {
+    return annotation === 'unpaired' || annotation === 'revoked'
+  }
+
+  /** T58: re-derive {@link hiddenSessions} from the live tombstone set (and
+   * when unpaired/revoked with a readable current session, every known remote
+   * session) — tombstones hide unless they ARE the current session (or no
+   * readable current is known, or the tombstone is inside the T65 hide
+   * grace); live-carried ids and ids that (re-)became the current session
+   * leave the set when paired. Since T65 the hide/reveal transitions move
+   * ONLY the archived set — the session stays in its group's forwarded copy
+   * either way — so the caller emits just the merged archived frame when
+   * anything changed. */
   function syncHiddenSessions(): { hidden: string[]; revealed: string[] } {
     const hidden: string[] = []
     const revealed: string[] = []
+    const disconnected = isPairingDisconnected()
+    const current = currentOriginal()
     for (const [id, home] of sessionHome) {
       const record = remote.get(home)
       if (record === undefined) continue
+      if (disconnected) {
+        if (currentReadable && current !== id) {
+          if (!hiddenSessions.has(id)) {
+            hiddenSessions.add(id)
+            hidden.push(id)
+          }
+        } else if (hiddenSessions.delete(id)) {
+          revealed.push(id)
+        }
+        continue
+      }
       if (stringList(record.sessionIds).includes(id)) {
         if (hiddenSessions.delete(id)) revealed.push(id)
         continue
@@ -794,7 +818,10 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
 
     onStatusChanged(): unknown[] {
       if (!localSeen || remote.size === 0) return []
-      return upsertFrames()
+      const changed = syncHiddenSessions()
+      const out = upsertFrames()
+      if (changed.hidden.length > 0 || changed.revealed.length > 0) out.push(mergedArchivedFrame())
+      return out
     },
 
     setCurrentSession(sessionId: string | undefined): unknown[] {
@@ -811,13 +838,15 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
     },
 
     get hasPendingHide(): boolean {
-      // Some tombstone is being kept visible: it is not in the hidden set
-      // (either it IS the current session, or no readable current made any
-      // decision yet) — the caller keeps polling until it hides.
+      // Some tombstone (or unpaired/revoked session) is being kept visible:
+      // it is not in the hidden set (either it IS the current session, or no
+      // readable current made any decision yet) — the caller keeps polling
+      // until it hides.
+      const disconnected = isPairingDisconnected()
       for (const [id, home] of sessionHome) {
         if (hiddenSessions.has(id)) continue
         const record = remote.get(home)
-        if (record !== undefined && !stringList(record.sessionIds).includes(id)) return true
+        if (record !== undefined && (disconnected || !stringList(record.sessionIds).includes(id))) return true
       }
       return false
     },

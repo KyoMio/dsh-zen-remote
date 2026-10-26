@@ -36,6 +36,10 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 }
 /** `plugins.bundle.config` key: the bundle's package name. */
 export declare const WIZARD_BUNDLE_KEY = "dsh-zen-remote";
+export interface SaveRowFieldsOptions {
+    /** Field names to remove (`op: 'unset'`) in the same atomic mutation. */
+    unset?: readonly string[];
+}
 /**
  * Register the wizard stylesheet and (lazily, only where the settings
  * service exists) the bundle detail-page top block.
