@@ -20,14 +20,21 @@ export function cfTokenPath(dshHome: string): string {
   return join(ingressDir(dshHome), 'cf-api-token')
 }
 
-/** Atomic 0600 write (temp sibling + rename), mirroring writeTunnelTokenFile. */
+/** Atomic 0600 write (temp sibling + rename), with a direct-write fallback
+ * on Windows if an existing file or antivirus scan refuses `renameSync` with
+ * EPERM/EACCES. */
 export function writeCfTokenFile(dshHome: string, token: string): string {
   const finalPath = cfTokenPath(dshHome)
   const partPath = `${finalPath}.part`
   try {
     mkdirSync(ingressDir(dshHome), { recursive: true })
     writeFileSync(partPath, token, { mode: 0o600 })
-    renameSync(partPath, finalPath)
+    try {
+      renameSync(partPath, finalPath)
+    } catch {
+      writeFileSync(finalPath, token, { mode: 0o600 })
+      rmSync(partPath, { force: true })
+    }
   } catch (error) {
     rmSync(partPath, { force: true })
     throw error
