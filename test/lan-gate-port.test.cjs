@@ -154,3 +154,27 @@ test('lan-gate: config variables reach the child env copy', async () => {
   const { opts } = await spawnWith({ config: { host: '0.0.0.0' }, webServerPort: 3999 })
   assert.equal(opts.env.LAN_GATE_HOST, '0.0.0.0')
 })
+
+test('lan-gate: Windows .cmd/.bat wrapper from resolveExecutable falls back to real binary with ELECTRON_RUN_AS_NODE=1', async () => {
+  const spawned = []
+  const ctx = {
+    webServer: { port: 3999 },
+    get() { return undefined },
+    connection: { authenticatedUrl: (url) => `${url}?token=t` },
+    effect(fn) { fn(); return () => {} },
+    subprocess: {
+      resolveExecutable: async () => 'C:\\Program Files\\DeepSeek Harness\\resources\\runtime\\bin\\node.cmd',
+      spawn(opts) {
+        spawned.push(opts)
+        return { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {} }
+      },
+    },
+  }
+  const entry = await import('../lan-gate.mjs')
+  entry.apply(ctx, {})
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(spawned.length, 1)
+  assert.ok(!spawned[0].argv[0].endsWith('.cmd'), 'must not pass .cmd batch file to CreateProcessW')
+  assert.equal(spawned[0].argv[0], process.env.DSH_DESKTOP_NODE_EXECUTABLE || process.execPath)
+  assert.equal(spawned[0].env.ELECTRON_RUN_AS_NODE, '1')
+})

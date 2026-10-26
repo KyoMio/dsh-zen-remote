@@ -104,8 +104,18 @@ export function apply(ctx, config) {
       const tokenUrl = ctx.connection && typeof ctx.connection.authenticatedUrl === 'function'
         ? ctx.connection.authenticatedUrl(proto + '//' + hostForUrl + ':' + targetPort)
         : undefined
-      const nodePath = await ctx.subprocess.resolveExecutable('node')
+      const resolvedNode = await ctx.subprocess.resolveExecutable('node').catch(() => process.execPath)
       if (disposed) return // 行在 await 期间被销毁：不再 spawn
+      // Windows 桌面端下 PATH 最前面是 runtime/bin/node.cmd 批处理脚本；而
+      // DSH Windows Job Runner 底层走 Win32 CreateProcessW 直接启动目标程序，
+      // 传 .cmd/.bat 会立即报 Win32 error 193 (EFTYPE / %1 不是有效的 Win32 应用程序)
+      // 导致网关子进程启动失败。此时改用宿主自带的二进制（DSH_DESKTOP_NODE_EXECUTABLE
+      // 或 process.execPath）并显式置 ELECTRON_RUN_AS_NODE=1，与宿主自身子进程一致。
+      const isBatchWrapper = /\.(cmd|bat)$/i.test(String(resolvedNode || ''))
+      const nodePath = isBatchWrapper
+        ? (process.env.DSH_DESKTOP_NODE_EXECUTABLE || process.execPath)
+        : resolvedNode
+      if (isBatchWrapper || nodePath === process.execPath) env['ELECTRON_RUN_AS_NODE'] = '1'
       if (tokenUrl !== undefined) env['LAN_GATE_UPSTREAM_TOKEN_URL'] = tokenUrl
       else delete env['LAN_GATE_UPSTREAM_TOKEN_URL'] // 0.1.1 模式：变量不能残留
       handle = ctx.subprocess.spawn({
