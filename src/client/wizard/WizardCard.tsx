@@ -3,12 +3,17 @@
  * ELSEWHERE — creating the Cloudflare token, configuring their own
  * reverse proxy. Numbered steps in the page locale, copy-to-clipboard for
  * the value or snippet at hand, Esc / backdrop / button to close. Scoped
- * under `[data-zen-remote="wizard-card"]`; rendered through a DOM portal
- * so the Plugins page's stacking contexts cannot clip it.
+ * under `[data-zen-remote="wizard-card"]`.
+ *
+ * Deliberately NO react-dom portal: `react-dom` is not a seed word of the
+ * host browser module table (GW-fix-4 — `check-client-externals` gates the
+ * allowlist), so the overlay renders IN PLACE as a `position: fixed`
+ * layer. That keeps the plugin version-agnostic; the z-index floor of
+ * 1000 clears the Plugins page chrome, and no ancestor of the detail page
+ * establishes a containing block that could clip it.
  */
 
 import { useEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
 import type { ReactNode } from 'react'
 
 export interface WizardCardProps {
@@ -51,7 +56,7 @@ export function WizardCard({ title, children, copyText, copyLabel, copiedLabel, 
     }
   }
 
-  return createPortal(
+  return (
     <div data-zen-remote="wizard-card" onClick={onClose}>
       <div className="zr-wizard-cardPanel" onClick={(event) => event.stopPropagation()}>
         <p className="zr-wizard-cardTitle">{title}</p>
@@ -63,7 +68,6 @@ export function WizardCard({ title, children, copyText, copyLabel, copiedLabel, 
           <button type="button" onClick={onClose}>{closeLabel}</button>
         </div>
       </div>
-    </div>,
-    document.body,
+    </div>
   )
 }
