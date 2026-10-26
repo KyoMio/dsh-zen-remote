@@ -523,6 +523,28 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: rawToken }),
       })
+      if (response.status === 404 && effectiveClient) {
+        await props.saveRowFields({
+          role: 'host',
+          autoShareNewSessions: autoShare,
+          ...(hostName.trim() !== '' ? { serverName: hostName.trim() } : {}),
+        })
+        setProbedClient(false)
+        for (let i = 0; i < 6; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 650))
+          const retry = await fetch(WIZARD_CF_TOKEN_ROUTE, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: rawToken }),
+          })
+          if (retry.status !== 404) {
+            const ok = retry.ok
+            setTokenNotice(ok ? 'saved' : 'failed')
+            if (ok) setCfToken('')
+            return ok
+          }
+        }
+      }
       const ok = response.ok
       setTokenNotice(ok ? 'saved' : 'failed')
       if (ok) setCfToken('')
@@ -542,10 +564,6 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     setSavingConfig(true)
     const wasClient = effectiveClient
     try {
-      if ((path === 'caddy' || path === 'cloudflared') && cfToken.trim() !== '') {
-        const saved = await saveTokenValue(cfToken.trim())
-        if (!saved) return
-      }
       try {
         const baseFields: Record<string, unknown> = {
           role: 'host',
@@ -577,7 +595,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         }
         // If this machine was previously in client mode, wait for the
         // restart-watcher to reload the plugin row into host mode and spawn
-        // the local gateway child process before entering the verify step.
+        // the local gateway child process before saving the token or probing.
         if (wasClient) {
           setProbedClient(false)
           for (let i = 0; i < 6; i++) {
@@ -595,7 +613,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           await loadHostStatus()
         }
       } catch {
-        // Even if the row mutation is pending mirror sync, advance to verify.
+        // Even if the row mutation is pending mirror sync, proceed to token save / verify.
+      }
+      if ((path === 'caddy' || path === 'cloudflared') && cfToken.trim() !== '') {
+        const saved = await saveTokenValue(cfToken.trim())
+        if (!saved) return
       }
       setHostSavedInSession(true)
       setStep('verify')

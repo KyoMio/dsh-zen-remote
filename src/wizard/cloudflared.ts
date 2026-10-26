@@ -49,7 +49,12 @@ export function writeTunnelTokenFile(dshHome: string, token: string): string {
   try {
     mkdirSync(ingressDir(dshHome), { recursive: true })
     writeFileSync(partPath, token, { mode: 0o600 })
-    renameSync(partPath, finalPath)
+    try {
+      renameSync(partPath, finalPath)
+    } catch {
+      writeFileSync(finalPath, token, { mode: 0o600 })
+      rmSync(partPath, { force: true })
+    }
   } catch (error) {
     rmSync(partPath, { force: true })
     throw error

@@ -12,7 +12,9 @@
  */
 /** `<DSH_HOME>/zen-remote-ingress/cf-api-token`. */
 export declare function cfTokenPath(dshHome: string): string;
-/** Atomic 0600 write (temp sibling + rename), mirroring writeTunnelTokenFile. */
+/** Atomic 0600 write (temp sibling + rename), with a direct-write fallback
+ * on Windows if an existing file or antivirus scan refuses `renameSync` with
+ * EPERM/EACCES. */
 export declare function writeCfTokenFile(dshHome: string, token: string): string;
 /** The stored token, or undefined when absent/empty. Callers feed it to the
  * Caddy manager's environment; it must never reach a response or a log. */
