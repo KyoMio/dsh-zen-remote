@@ -80,15 +80,18 @@ export interface CaddyManager {
   /**
    * Idempotent front door: a live Caddy refuses a second start (stop
    * first to switch configuration). Throws nothing — every failure is a
-   * value.
+   * value. The storage directory is this manager's own (under dshHome) —
+   * callers supply only the user-facing fields.
    */
-  start(input: CaddyfileInput & { cfToken: unknown }): Promise<CaddyStartResult>
+  start(input: Omit<CaddyfileInput, 'storageDir'> & { cfToken: unknown }): Promise<CaddyStartResult>
   /** Idempotent terminate; safe before any start. */
   stop(): void
   /** Whether a child is currently held (true between spawn and exit). */
   isRunning(): boolean
   /** The live child's Caddyfile path, or undefined. */
   runningCaddyfile(): string | undefined
+  /** Whether any start has succeeded in this manager's lifetime. */
+  hasStarted(): boolean
 }
 
 export function createCaddyManager(options: CaddyManagerOptions): CaddyManager {
@@ -96,6 +99,7 @@ export function createCaddyManager(options: CaddyManagerOptions): CaddyManager {
   const maxLogBytes = options.maxLogBytes ?? 64 * 1024
   let handle: SubprocessHandleLike | null = null
   let caddyfileArg: string | undefined
+  let startedOnce = false
 
   // GW-fix-2/L3: a WHITELIST, not the host's full environment — the host
   // process carries the relay secret and DSH's own credentials in env, and
@@ -131,7 +135,7 @@ export function createCaddyManager(options: CaddyManagerOptions): CaddyManager {
       if (handle !== null) return { ok: false, error: 'already-running' }
       const cfToken = typeof input.cfToken === 'string' && input.cfToken.trim() !== '' ? input.cfToken : undefined
       if (cfToken === undefined) return { ok: false, error: 'missing-token' }
-      const generated = generateCaddyfile(input)
+      const generated = generateCaddyfile({ ...input, storageDir: caddyDataDir(dshHome) })
       if (!generated.ok) return { ok: false, error: 'bad-config', detail: generated.error }
 
       let binaryPath: string
@@ -173,6 +177,7 @@ export function createCaddyManager(options: CaddyManagerOptions): CaddyManager {
         const child = spawnChild([binaryPath, 'run', '--config', finalPath], env)
         handle = child
         caddyfileArg = finalPath
+        startedOnce = true
         // An exited child clears its own slot: isRunning() goes honest and
         // a later start() works without a manual stop.
         void child.done.then(() => {
@@ -208,6 +213,9 @@ export function createCaddyManager(options: CaddyManagerOptions): CaddyManager {
 
     isRunning: () => handle !== null,
     runningCaddyfile: () => caddyfileArg,
+    /** Whether a start has EVER succeeded in this row's lifetime — the
+     * three-state status needs it to tell 已退出 (degraded) from 未启动. */
+    hasStarted: () => startedOnce,
   }
 }
 

@@ -49,6 +49,14 @@ export function TokenCard({ t, onUse, onClose }: TokenCardProps): ReactNode {
             <td className="zr-wizard-cardPerm">{t('wizard.card.tokenPermTunnel')}</td>
             <td className="zr-wizard-cardWhy">{t('wizard.card.tokenPermTunnelWhy')}</td>
           </tr>
+          <tr>
+            <td className="zr-wizard-cardPerm">{t('wizard.card.tokenPermAccount')}</td>
+            <td className="zr-wizard-cardWhy">{t('wizard.card.tokenPermAccountWhy')}</td>
+          </tr>
+          <tr>
+            <td className="zr-wizard-cardPerm">{t('wizard.card.tokenPermZoneRead')}</td>
+            <td className="zr-wizard-cardWhy">{t('wizard.card.tokenPermZoneReadWhy')}</td>
+          </tr>
         </tbody>
       </table>
       <label className="zr-wizard-label" htmlFor="zr-wizard-token-paste">{t('wizard.card.tokenPaste')}</label>

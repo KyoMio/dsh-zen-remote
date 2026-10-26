@@ -19,10 +19,16 @@
 // Run: node scripts/check-wizard-ui.mjs
 import assert from 'node:assert/strict'
 import {
+  caddyFailureCopy,
   configureReadiness,
   caddySnippetText,
   deriveWizardLights,
   formSeedOf,
+  WIZARD_CF_TOKEN_ROUTE,
+  WIZARD_CADDY_START_ROUTE,
+  WIZARD_CADDY_STATUS_ROUTE,
+  WIZARD_CADDY_STOP_ROUTE,
+  WIZARD_TUNNEL_TOKEN_ROUTE,
   initialStep,
   isValidHostname,
   isValidPort,
@@ -34,6 +40,14 @@ import {
 } from '../src/client-data/wizard.ts'
 import { luckySteps, nginxSnippet, caddySnippet } from '../lib/wizard/proxy-snippets.js'
 import { qrMatrix } from '../src/client-data/qr.ts'
+import {
+  WIZARD_CF_TOKEN_ROUTE as HOST_CF_TOKEN_ROUTE,
+  WIZARD_CADDY_START_ROUTE as HOST_CADDY_START_ROUTE,
+  WIZARD_CADDY_STOP_ROUTE as HOST_CADDY_STOP_ROUTE,
+  WIZARD_CADDY_STATUS_ROUTE as HOST_CADDY_STATUS_ROUTE,
+  WIZARD_TUNNEL_TOKEN_ROUTE as HOST_TUNNEL_TOKEN_ROUTE,
+} from '../lib/wizard/routes.js'
+
 import { en, zh } from '../src/client/locales.ts'
 
 let testChain = Promise.resolve()
@@ -145,6 +159,26 @@ await test('deriveWizardLights: amber before trying, red on wrong shapes, pass o
   assert.deepEqual(lights, { gateway: 'pass', publicUrl: 'fail', pairing: 'fail' })
 })
 
+await test('caddyFailureCopy: every wire error maps to its locale key (GW-13a)', () => {
+  assert.equal(caddyFailureCopy('missing-token').key, 'wizard.caddy.failMissingToken')
+  assert.equal(caddyFailureCopy('already-running').key, 'wizard.caddy.failAlreadyRunning')
+  assert.deepEqual(caddyFailureCopy('bad-config', 'bad-domain'), { key: 'wizard.caddy.failBadConfig', params: { detail: 'bad-domain' } })
+  const download = caddyFailureCopy('download-failed', undefined, 'https://caddyserver.com/download')
+  assert.equal(download.key, 'wizard.caddy.failDownload')
+  assert.equal(download.installUrl, 'https://caddyserver.com/download')
+  assert.equal(caddyFailureCopy('validate-failed').key, 'wizard.caddy.failValidate')
+  assert.equal(caddyFailureCopy('spawn-failed').key, 'wizard.caddy.failSpawn')
+  assert.equal(caddyFailureCopy('something-new').key, 'wizard.caddy.failSpawn', 'unknown codes degrade to the generic failure')
+})
+
+await test('the route constants mirror the host routes (GW-13a)', () => {
+  assert.equal(WIZARD_CF_TOKEN_ROUTE, HOST_CF_TOKEN_ROUTE)
+  assert.equal(WIZARD_CADDY_START_ROUTE, HOST_CADDY_START_ROUTE)
+  assert.equal(WIZARD_CADDY_STOP_ROUTE, HOST_CADDY_STOP_ROUTE)
+  assert.equal(WIZARD_CADDY_STATUS_ROUTE, HOST_CADDY_STATUS_ROUTE)
+  assert.equal(WIZARD_TUNNEL_TOKEN_ROUTE, HOST_TUNNEL_TOKEN_ROUTE)
+})
+
 await test('the pairing countdown counts whole seconds, never negative', () => {
   const now = 1_000_000
   assert.equal(pairingSecondsLeft(now + 59_500, now), 60)
@@ -176,8 +210,17 @@ const WIZARD_KEYS = [
   'wizard.card.tokenStep1', 'wizard.card.tokenStep2', 'wizard.card.tokenStep3', 'wizard.card.tokenStep4',
   'wizard.card.tokenStep5', 'wizard.card.tokenStep6', 'wizard.card.tokenStep7', 'wizard.card.tokenStep8',
   'wizard.card.tokenPerms', 'wizard.card.tokenPermDns', 'wizard.card.tokenPermDnsWhy',
-  'wizard.card.tokenPermTunnel', 'wizard.card.tokenPermTunnelWhy', 'wizard.card.tokenPaste',
-  'wizard.card.tokenUse',
+  'wizard.card.tokenPermTunnel', 'wizard.card.tokenPermTunnelWhy',
+  'wizard.card.tokenPermAccount', 'wizard.card.tokenPermAccountWhy',
+  'wizard.card.tokenPermZoneRead', 'wizard.card.tokenPermZoneReadWhy',
+  'wizard.card.tokenPaste', 'wizard.card.tokenUse',
+  'wizard.ingress',
+  'wizard.caddy.start', 'wizard.caddy.stop', 'wizard.caddy.running', 'wizard.caddy.stopped',
+  'wizard.caddy.neverStarted', 'wizard.caddy.startOk', 'wizard.caddy.startFailed',
+  'wizard.caddy.failDownload', 'wizard.caddy.failValidate', 'wizard.caddy.failAlreadyRunning',
+  'wizard.caddy.failMissingToken', 'wizard.caddy.failNoDomain', 'wizard.caddy.failBadConfig',
+  'wizard.caddy.failSpawn',
+  'wizard.token.saved', 'wizard.token.saveFailed',
   'wizard.card.migrateTitle', 'wizard.card.migrateRecheck',
   'wizard.card.migrateStep1', 'wizard.card.migrateStep2', 'wizard.card.migrateStep3',
   'wizard.card.migrateStep4', 'wizard.card.migrateStep5', 'wizard.card.migrateStep6',

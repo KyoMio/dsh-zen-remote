@@ -17,6 +17,17 @@
 /** Wizard route constants — mirror of src/wizard/routes.ts. */
 export const WIZARD_STATUS_ROUTE = '/_dsh/zen-remote/admin/wizard/status'
 export const WIZARD_VERIFY_ROUTE = '/_dsh/zen-remote/admin/wizard/verify'
+export const WIZARD_CF_TOKEN_ROUTE = '/_dsh/zen-remote/admin/wizard/cf-token'
+export const WIZARD_TUNNEL_TOKEN_ROUTE = '/_dsh/zen-remote/admin/wizard/tunnel-token'
+export const WIZARD_CADDY_START_ROUTE = '/_dsh/zen-remote/admin/wizard/caddy/start'
+export const WIZARD_CADDY_STOP_ROUTE = '/_dsh/zen-remote/admin/wizard/caddy/stop'
+export const WIZARD_CADDY_STATUS_ROUTE = '/_dsh/zen-remote/admin/wizard/caddy/status'
+export const WIZARD_TUNNEL_CHECK_ROUTE = '/_dsh/zen-remote/admin/wizard/tunnel/check-domain'
+export const WIZARD_TUNNEL_SETUP_ROUTE = '/_dsh/zen-remote/admin/wizard/tunnel/setup'
+export const WIZARD_TUNNEL_STOP_ROUTE = '/_dsh/zen-remote/admin/wizard/tunnel/stop'
+
+/** Wire mirror of src/wizard/routes.ts's CaddyProcessState. */
+export type CaddyState = 'running' | 'stopped' | 'never-started'
 
 /** Wire mirror of src/wizard/status.ts's WizardStatus. */
 export interface WizardStatusBody {
@@ -192,6 +203,32 @@ export function deriveWizardLights(input: {
 /** Pairing-code countdown, whole seconds, never negative. */
 export function pairingSecondsLeft(expiresAt: number, now: number): number {
   return Math.max(0, Math.ceil((expiresAt - now) / 1000))
+}
+
+/**
+ * The managed-Caddy start-failure copy: maps the wire error code to a
+ * locale key (+params / manual-install link). Pure — the check script pins
+ * every mapping.
+ */
+export function caddyFailureCopy(
+  error: string,
+  detail?: string,
+  installUrl?: string,
+): { key: string; params: Record<string, string>; installUrl?: string } {
+  switch (error) {
+    case 'missing-token':
+      return { key: 'wizard.caddy.failMissingToken', params: {} }
+    case 'already-running':
+      return { key: 'wizard.caddy.failAlreadyRunning', params: {} }
+    case 'bad-config':
+      return { key: 'wizard.caddy.failBadConfig', params: { detail: detail ?? '' } }
+    case 'download-failed':
+      return { key: 'wizard.caddy.failDownload', params: {}, ...(installUrl !== undefined ? { installUrl } : {}) }
+    case 'validate-failed':
+      return { key: 'wizard.caddy.failValidate', params: {} }
+    default:
+      return { key: 'wizard.caddy.failSpawn', params: {} }
+  }
 }
 
 // --- the reverse-proxy snippet templates (mirror of proxy-snippets.ts) -----------

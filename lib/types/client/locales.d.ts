@@ -357,6 +357,10 @@ export declare const zh: {
     readonly 'wizard.card.tokenPermDnsWhy': "签发证书（DNS-01 挑战）必需";
     readonly 'wizard.card.tokenPermTunnel': "账户 · Cloudflare Tunnel · 编辑";
     readonly 'wizard.card.tokenPermTunnelWhy': "仅 Cloudflare Tunnel 路需要";
+    readonly 'wizard.card.tokenPermAccount': "账户 · 账户设置 · 读取";
+    readonly 'wizard.card.tokenPermAccountWhy': "仅隧道路需要（查询账户）";
+    readonly 'wizard.card.tokenPermZoneRead': "区域 · 区域 · 读取";
+    readonly 'wizard.card.tokenPermZoneReadWhy': "仅隧道路需要（查询域名所在 Zone）";
     readonly 'wizard.card.tokenPaste': "粘贴 Token";
     readonly 'wizard.card.tokenUse': "使用此 Token";
     readonly 'wizard.card.migrateTitle': "把域名迁移到 Cloudflare";
@@ -375,6 +379,23 @@ export declare const zh: {
     readonly 'wizard.card.portForwardStep4': "保存后用手机流量（不连家里 Wi-Fi）测试公网地址是否可达";
     readonly 'wizard.portForwardEntry': "用了非 443 端口？看看路由器端口映射怎么做";
     readonly 'wizard.migrateEntry': "域名还没托管到 Cloudflare？";
+    readonly 'wizard.ingress': "入口进程";
+    readonly 'wizard.caddy.start': "启动 Caddy";
+    readonly 'wizard.caddy.stop': "停止 Caddy";
+    readonly 'wizard.caddy.running': "Caddy 运行中";
+    readonly 'wizard.caddy.stopped': "Caddy 已退出（可重新启动）";
+    readonly 'wizard.caddy.neverStarted': "Caddy 尚未启动";
+    readonly 'wizard.caddy.startOk': "Caddy 已启动";
+    readonly 'wizard.caddy.startFailed': "Caddy 启动失败：{reason}";
+    readonly 'wizard.caddy.failDownload': "下载失败，可手动安装后重试";
+    readonly 'wizard.caddy.failValidate': "配置校验未通过";
+    readonly 'wizard.caddy.failAlreadyRunning': "已在运行中";
+    readonly 'wizard.caddy.failMissingToken': "请先在配置页保存 Cloudflare API Token";
+    readonly 'wizard.caddy.failNoDomain': "请先保存公开域名";
+    readonly 'wizard.caddy.failBadConfig': "配置项有误：{detail}";
+    readonly 'wizard.caddy.failSpawn': "进程启动失败";
+    readonly 'wizard.token.saved': "Token 已保存到服务端本机";
+    readonly 'wizard.token.saveFailed': "Token 保存失败，请重试";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

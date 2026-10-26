@@ -16,6 +16,16 @@
 /** Wizard route constants — mirror of src/wizard/routes.ts. */
 export declare const WIZARD_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/status";
 export declare const WIZARD_VERIFY_ROUTE = "/_dsh/zen-remote/admin/wizard/verify";
+export declare const WIZARD_CF_TOKEN_ROUTE = "/_dsh/zen-remote/admin/wizard/cf-token";
+export declare const WIZARD_TUNNEL_TOKEN_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel-token";
+export declare const WIZARD_CADDY_START_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/start";
+export declare const WIZARD_CADDY_STOP_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/stop";
+export declare const WIZARD_CADDY_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/status";
+export declare const WIZARD_TUNNEL_CHECK_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/check-domain";
+export declare const WIZARD_TUNNEL_SETUP_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/setup";
+export declare const WIZARD_TUNNEL_STOP_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel/stop";
+/** Wire mirror of src/wizard/routes.ts's CaddyProcessState. */
+export type CaddyState = 'running' | 'stopped' | 'never-started';
 /** Wire mirror of src/wizard/status.ts's WizardStatus. */
 export interface WizardStatusBody {
     ok: true;
@@ -141,6 +151,16 @@ export declare function deriveWizardLights(input: {
 }): WizardLights;
 /** Pairing-code countdown, whole seconds, never negative. */
 export declare function pairingSecondsLeft(expiresAt: number, now: number): number;
+/**
+ * The managed-Caddy start-failure copy: maps the wire error code to a
+ * locale key (+params / manual-install link). Pure — the check script pins
+ * every mapping.
+ */
+export declare function caddyFailureCopy(error: string, detail?: string, installUrl?: string): {
+    key: string;
+    params: Record<string, string>;
+    installUrl?: string;
+};
 export interface SnippetInput {
     domain: string;
     upstreamHost: string;

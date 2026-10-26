@@ -31,6 +31,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission, AdminConfigSnapshot } from '../admin-routes.js';
 import type { ConfigSource } from '../config.js';
+import type { CaddyStartResult } from './caddy-process.js';
 import { type WizardRuntimeInput } from './status.js';
 import type { VerificationCheckResult, VerificationStartResult } from './verify.js';
 /** Prefix all wizard routes live under (one webServer prefix registration;
@@ -45,6 +46,19 @@ export declare const WIZARD_TRUST_PROXY_ROUTE = "/_dsh/zen-remote/admin/wizard/t
 /** POST `{publicUrl}`: start the final verification — mint the web pairing
  * code (GW-9). GET: poll its status. */
 export declare const WIZARD_VERIFY_ROUTE = "/_dsh/zen-remote/admin/wizard/verify";
+/** POST `{token}`: store the Cloudflare API token 0600 on this machine;
+ * DELETE: stop the consumers and remove it (GW-13a). */
+export declare const WIZARD_CF_TOKEN_ROUTE = "/_dsh/zen-remote/admin/wizard/cf-token";
+/** POST `{token}`: store the cloudflared connector token (GW-13a). */
+export declare const WIZARD_TUNNEL_TOKEN_ROUTE = "/_dsh/zen-remote/admin/wizard/tunnel-token";
+/** POST: start the managed Caddy from the saved row config; POST (stop)
+ * terminates it; GET answers its three-state (GW-13a). */
+export declare const WIZARD_CADDY_START_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/start";
+export declare const WIZARD_CADDY_STOP_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/stop";
+export declare const WIZARD_CADDY_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/caddy/status";
+/** The managed Caddy's three-state. `stopped` means a start happened and
+ * the process has since exited (degraded); `never-started` precedes that. */
+export type CaddyProcessState = 'running' | 'stopped' | 'never-started';
 export interface WizardHandlerOptions {
     /** The connection service's admit, injected by apply(); tests fake it. */
     admit: (req: IncomingMessage) => AdminAdmission;
@@ -73,6 +87,28 @@ export interface WizardHandlerOptions {
             source: ConfigSource;
         };
         write: (expected: string, list: string) => boolean | Promise<boolean>;
+    };
+    /** The Cloudflare token store (GW-13a), injected by apply(): 0600 files
+     * under the ingress directory. `deleteCfToken` is called AFTER the
+     * callers have stopped the consuming processes. Absent — a wiring that
+     * predates GW-13 — and the routes answer 501. */
+    tokenStore?: {
+        writeCfToken: (token: string) => void;
+        deleteCfToken: () => void;
+        cfTokenConfigured: () => boolean;
+        writeTunnelToken: (token: string) => void;
+    };
+    /** The managed Caddy (GW-13a), injected by apply(). `start` receives the
+     * SAVED row values and the gateway's actual port; the Cloudflare token
+     * comes from the token store inside the wiring (never through routes). */
+    caddy?: {
+        start: (input: {
+            domain: string;
+            httpsPort: number;
+            gatewayPort: number;
+        }) => Promise<CaddyStartResult>;
+        stop: () => void;
+        status: () => CaddyProcessState;
     };
     /** The final-verification orchestration (GW-9), injected by apply():
      * POST mints the pairing code, GET polls the session. Absent — a wiring

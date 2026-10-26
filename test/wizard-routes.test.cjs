@@ -19,6 +19,8 @@ const http = require('node:http')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { request } = require('./util.cjs')
+const fs = require('node:fs')
+const os = require('node:os')
 
 const WIZARD_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'wizard', 'routes.js')).href
 const ADMIN_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'admin-routes.js')).href
@@ -59,6 +61,8 @@ function wizardOptions(overrides = {}) {
       ? { getRuntime: overrides.getRuntime }
       : { getRuntime: () => { runtimeReads += 1; return { cfTokenConfigured: true, cloudflaredRunning: true, gatewayActualPort: 4088 } } }),
     ...(overrides.verify !== undefined ? { verify: overrides.verify } : {}),
+    ...(overrides.tokenStore !== undefined ? { tokenStore: overrides.tokenStore } : {}),
+    ...(overrides.caddy !== undefined ? { caddy: overrides.caddy } : {}),
   }
 }
 
@@ -184,7 +188,7 @@ test('a malformed request URL (new URL throws) degrades to the JSON 500 envelope
 test('POST placeholders answer 501 only after same-origin passes; cross-site is 403 first', async () => {
   const ok = await request(wizardPort, {
     method: 'POST',
-    path: `${wizard.WIZARD_ROUTE_PREFIX}/caddy/start`,
+    path: `${wizard.WIZARD_ROUTE_PREFIX}/elsewhere`,
     headers: sameOrigin(wizardPort),
     body: {},
   })
@@ -193,7 +197,7 @@ test('POST placeholders answer 501 only after same-origin passes; cross-site is 
 
   const cross = await request(wizardPort, {
     method: 'POST',
-    path: `${wizard.WIZARD_ROUTE_PREFIX}/caddy/start`,
+    path: `${wizard.WIZARD_ROUTE_PREFIX}/elsewhere`,
     headers: { origin: 'http://evil.example' },
     body: {},
   })
@@ -390,4 +394,180 @@ test('the wizard prefix registers on the host role only', async () => {
     0,
     'no connection service, no wizard prefix',
   )
+})
+
+// ---- GW-13a: token store + managed Caddy routes ---------------------------------
+
+/** A token store backed by a REAL file in a temp dir (the 0600 atomic write
+ * is the wiring's shape: write through the store, never through payloads). */
+function tokenStoreFixture() {
+  const fs = require('node:fs')
+  const os = require('node:os')
+  const path = require('node:path')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-tokstore-'))
+  const file = path.join(dir, 'cf-api-token')
+  let tunnelWritten
+  return {
+    file,
+    dir,
+    tunnelWritten: () => tunnelWritten,
+    store: {
+      writeCfToken: (token) => { fs.writeFileSync(file, token, { mode: 0o600 }) },
+      deleteCfToken: () => { fs.rmSync(file, { force: true }) },
+      cfTokenConfigured: () => { try { return fs.readFileSync(file, 'utf8').trim() !== '' } catch { return false } },
+      writeTunnelToken: (token) => { tunnelWritten = token },
+    },
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+  }
+}
+
+test('cf-token: POST stores 0600, DELETE removes, the token never echoes (GW-13a)', async () => {
+  const fixture = tokenStoreFixture()
+  try {
+    const { server, port } = await serve(wizard.createWizardHandler(wizardOptions({ tokenStore: fixture.store })))
+    try {
+      const post = await request(port, {
+        method: 'POST',
+        path: wizard.WIZARD_CF_TOKEN_ROUTE,
+        headers: sameOrigin(port),
+        body: { token: 'sekret-cf-token-value' },
+      })
+      assert.equal(post.status, 200)
+      assert.deepEqual(JSON.parse(post.body), { ok: true, configured: true })
+      const stored = fs.readFileSync(fixture.file, 'utf8')
+      assert.equal(stored, 'sekret-cf-token-value')
+      assert.equal(fs.statSync(fixture.file).mode & 0o777, 0o600, '0600 on disk')
+      assert.ok(!post.body.includes('sekret-cf-token-value'), 'the token never echoes')
+
+      // Bad bodies are typed 400s before any write.
+      for (const body of [{}, { token: '' }, { token: 42 }]) {
+        const bad = await request(port, { method: 'POST', path: wizard.WIZARD_CF_TOKEN_ROUTE, headers: sameOrigin(port), body })
+        assert.equal(bad.status, 400)
+        assert.equal(JSON.parse(bad.body).error.code, 'bad-token')
+      }
+
+      // DELETE removes the file.
+      const del = await request(port, { method: 'DELETE', path: wizard.WIZARD_CF_TOKEN_ROUTE, headers: sameOrigin(port) })
+      assert.equal(del.status, 200)
+      assert.deepEqual(JSON.parse(del.body), { ok: true, configured: false })
+      assert.ok(!fs.existsSync(fixture.file))
+
+      // Cross-site DELETE is refused like any write.
+      fixture.store.writeCfToken('again')
+      const cross = await request(port, { method: 'DELETE', path: wizard.WIZARD_CF_TOKEN_ROUTE, headers: { origin: 'http://evil.example' } })
+      assert.equal(cross.status, 403)
+      assert.equal(JSON.parse(cross.body).error.code, 'origin-rejected')
+
+      // The tunnel-token route writes through the store.
+      const tunnel = await request(port, {
+        method: 'POST',
+        path: wizard.WIZARD_TUNNEL_TOKEN_ROUTE,
+        headers: sameOrigin(port),
+        body: { token: 'connector-secret' },
+      })
+      assert.equal(tunnel.status, 200)
+      assert.equal(fixture.tunnelWritten(), 'connector-secret')
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+    }
+  } finally {
+    fixture.cleanup()
+  }
+})
+
+test('cf-token unwired is 501; the via wall holds (GW-13a)', async () => {
+  const { server, port } = await serve(wizard.createWizardHandler(wizardOptions()))
+  try {
+    const notWired = await request(port, { method: 'POST', path: wizard.WIZARD_CF_TOKEN_ROUTE, headers: sameOrigin(port), body: { token: 'x' } })
+    assert.equal(notWired.status, 501)
+    const via = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_CF_TOKEN_ROUTE,
+      headers: { 'x-zen-remote-via': 'gateway', ...sameOrigin(port) },
+      body: { token: 'x' },
+    })
+    assert.equal(via.status, 403)
+    assert.equal(JSON.parse(via.body).error.code, 'via-gateway')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+test('caddy routes: start reads the SAVED config, stop and the three-state status (GW-13a)', async () => {
+  const calls = []
+  const manager = {
+    start: async (input) => { calls.push(['start', input]); return { ok: true, binaryPath: '/bin/caddy', caddyfile: '/cf', alreadyRunning: false } },
+    stop: () => { calls.push(['stop']) },
+    status: () => (calls.some((c) => c[0] === 'start') && !calls.some((c) => c[0] === 'stop') ? 'running' : calls.some((c) => c[0] === 'start') ? 'stopped' : 'never-started'),
+  }
+  const { server, port } = await serve(wizard.createWizardHandler(wizardOptions({
+    caddy: manager,
+    getConfig: () => ({
+      values: { ingressDomain: 'dsh.example.com', ingressHttpsPort: 8443, port: 3000 },
+      sources: {},
+    }),
+    getRuntime: () => ({ gatewayActualPort: 4088 }),
+  })))
+  try {
+    // Status before anything: never-started.
+    const before = await request(port, { method: 'GET', path: wizard.WIZARD_CADDY_STATUS_ROUTE })
+    assert.equal(before.status, 200)
+    assert.deepEqual(JSON.parse(before.body), { ok: true, state: 'never-started' })
+
+    // Start: the SAVED domain/port + the ACTUAL gateway port; no token anywhere.
+    const start = await request(port, { method: 'POST', path: wizard.WIZARD_CADDY_START_ROUTE, headers: sameOrigin(port) })
+    assert.equal(start.status, 200)
+    assert.equal(JSON.parse(start.body).ok, true)
+    assert.deepEqual(calls[0], ['start', { domain: 'dsh.example.com', httpsPort: 8443, gatewayPort: 4088 }])
+    assert.ok(!start.body.includes('token'), 'no token material in the answer')
+
+    // Running status.
+    const running = await request(port, { method: 'GET', path: wizard.WIZARD_CADDY_STATUS_ROUTE })
+    assert.equal(JSON.parse(running.body).state, 'running')
+
+    // Stop.
+    const stop = await request(port, { method: 'POST', path: wizard.WIZARD_CADDY_STOP_ROUTE, headers: sameOrigin(port) })
+    assert.equal(stop.status, 200)
+    assert.deepEqual(JSON.parse(stop.body), { ok: true, state: 'stopped' }, 'started-then-exited reads as degraded/stopped, never as never-started')
+
+    // Start without a saved domain is a typed 400.
+    const noDomain = await request(port, {
+      method: 'POST',
+      path: wizard.WIZARD_CADDY_START_ROUTE,
+      headers: sameOrigin(port),
+    })
+    // getConfig still answers the domain here; force the refusal through a fresh handler.
+    const bare = await serve(wizard.createWizardHandler(wizardOptions({
+      caddy: manager,
+      getConfig: () => ({ values: { ingressDomain: '', ingressHttpsPort: 443, port: 3000 }, sources: {} }),
+    })))
+    try {
+      const refused = await request(bare.port, { method: 'POST', path: wizard.WIZARD_CADDY_START_ROUTE, headers: sameOrigin(bare.port) })
+      assert.equal(refused.status, 400)
+      assert.equal(JSON.parse(refused.body).error.code, 'no-domain')
+    } finally {
+      await new Promise((resolve) => bare.server.close(resolve))
+    }
+
+    // Cross-site start is refused before the manager runs.
+    const before2 = calls.length
+    const cross = await request(port, { method: 'POST', path: wizard.WIZARD_CADDY_START_ROUTE, headers: { origin: 'http://evil.example' } })
+    assert.equal(cross.status, 403)
+    assert.equal(calls.length, before2, 'no start ran')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
+})
+
+test('caddy routes unwired answer 501 (GW-13a compatibility)', async () => {
+  const { server, port } = await serve(wizard.createWizardHandler(wizardOptions()))
+  try {
+    for (const [method, path] of [['POST', wizard.WIZARD_CADDY_START_ROUTE], ['POST', wizard.WIZARD_CADDY_STOP_ROUTE], ['GET', wizard.WIZARD_CADDY_STATUS_ROUTE]]) {
+      const res = await request(port, { method, path, headers: sameOrigin(port) })
+      assert.equal(res.status, 501, path)
+      assert.equal(JSON.parse(res.body).error.code, 'not-implemented')
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+  }
 })
