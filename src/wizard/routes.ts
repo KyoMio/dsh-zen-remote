@@ -373,25 +373,33 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
           responseJson(res, 200, { ok: true, state: caddy.status() })
           return
         }
-        // start: the SAVED row config is the source of truth (the configure
-        // step stored it); the gateway's ACTUAL port wins over the
-        // configured one.
-        const values = options.getConfig().values
-        const domain = hostOf(values.ingressDomain)
-        if (domain === undefined) {
-          responseJson(res, 400, { ok: false, error: { code: 'no-domain', message: '保存一个有效的公开域名后再启动' } })
+        if (route === WIZARD_CADDY_START_ROUTE && method === 'POST') {
+          const body = await readJsonObject(req)
+          const values = options.getConfig().values
+          const rawDomain = typeof body?.domain === 'string' && body.domain.trim() !== ''
+            ? body.domain.trim()
+            : values.ingressDomain
+          const domain = hostOf(rawDomain)
+          if (domain === undefined) {
+            responseJson(res, 400, { ok: false, error: { code: 'no-domain', message: '保存一个有效的公开域名后再启动' } })
+            return
+          }
+          const rawPort = typeof body?.httpsPort === 'number' && Number.isSafeInteger(body.httpsPort) && body.httpsPort >= 1 && body.httpsPort <= 65535
+            ? body.httpsPort
+            : values.ingressHttpsPort
+          let runtime: WizardRuntimeInput = {}
+          try {
+            runtime = (await options.getRuntime?.()) ?? {}
+          } catch {
+            runtime = {}
+          }
+          const gatewayPort = typeof runtime.gatewayActualPort === 'number' ? runtime.gatewayActualPort : values.port
+          const result = await caddy.start({ domain, httpsPort: rawPort, gatewayPort })
+          // The start result may carry a failure detail — never the token.
+          responseJson(res, 200, { ok: result.ok, ...(result.ok ? { caddyfile: result.caddyfile } : { error: result.error, detail: result.detail, installUrl: result.installUrl }) })
           return
         }
-        let runtime: WizardRuntimeInput = {}
-        try {
-          runtime = (await options.getRuntime?.()) ?? {}
-        } catch {
-          runtime = {}
-        }
-        const gatewayPort = typeof runtime.gatewayActualPort === 'number' ? runtime.gatewayActualPort : values.port
-        const result = await caddy.start({ domain, httpsPort: values.ingressHttpsPort, gatewayPort })
-        // The start result may carry a failure detail — never the token.
-        responseJson(res, 200, { ok: result.ok, ...(result.ok ? { caddyfile: result.caddyfile } : { error: result.error, detail: result.detail, installUrl: result.installUrl }) })
+        responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown wizard route' } })
         return
       }
       if (route.startsWith(`${WIZARD_ROUTE_PREFIX}/tunnel/`)) {

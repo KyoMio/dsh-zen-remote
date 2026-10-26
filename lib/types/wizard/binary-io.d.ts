@@ -85,10 +85,23 @@ export interface EnsureBinaryOptions extends DownloadBinaryOptions {
     platform?: BinaryPlatform;
 }
 /**
+ * Detect whether the current host is in mainland China:
+ * 1. Fast local check: system timezone is `Asia/Shanghai`, `Asia/Chongqing`,
+ *    `Asia/Harbin`, or `Asia/Urumqi`, or `LANG`/`LC_ALL` carries `zh_CN`.
+ * 2. Quick 1.5s probe to Cloudflare's `/cdn-cgi/trace` (`loc=CN`), or if
+ *    direct `github.com` HEAD fails/times out within 2s.
+ */
+export declare function detectCnNetwork(fetchImpl?: typeof fetch): Promise<boolean>;
+/**
  * The idempotent front door: an already-installed executable short-circuits
  * (no network), anything else downloads from the official distribution
- * point for the tool, archive shape included. `fetchImpl` injects the
- * transport (tests point it at a local mock server).
+ * point for the tool, archive shape included.
+ *
+ * When using the default `fetch` transport, automatically detects mainland
+ * China network environments and tries prebuilt GitHub Release mirrors
+ * (`gh-proxy.com` / `ghfast.top`) + direct GitHub Release before falling back
+ * to `caddyserver.com/api/download`. When a custom `fetchImpl` is injected
+ * (unit tests), calls the canonical `binaryUrls(platform)` endpoint directly.
  * @returns the absolute install path and whether THIS call downloaded.
  */
 export declare function ensureBinary(dshHome: string, tool: IngressBinary, options?: EnsureBinaryOptions): Promise<{

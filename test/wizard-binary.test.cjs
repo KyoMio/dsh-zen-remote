@@ -102,6 +102,19 @@ test('binaryUrls maps every supported platform to both official endpoints WITH a
   const linuxArm = binary.binaryUrls({ os: 'linux', arch: 'arm64' })
   assert.equal(linuxArm.cloudflared, 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64')
   assert.equal(linuxArm.cloudflaredArchive, 'none')
+
+  // Prebuilt Caddy release + mainland China mirror ordering
+  const cnCaddy = binary.binaryDownloadCandidates('caddy', { os: 'windows', arch: 'amd64' }, true)
+  assert.ok(cnCaddy[0].url.startsWith('https://gh-proxy.com/https://github.com/KyoMio/dsh-zen-remote/releases/download/caddy-cloudflare/caddy-windows-amd64.exe'))
+  assert.equal(cnCaddy[0].archive, 'exe')
+  assert.ok(cnCaddy[1].url.startsWith('https://ghfast.top/'))
+  assert.equal(cnCaddy[2].url, 'https://github.com/KyoMio/dsh-zen-remote/releases/download/caddy-cloudflare/caddy-windows-amd64.exe')
+  assert.equal(cnCaddy[3].url, 'https://caddyserver.com/api/download?os=windows&arch=amd64&p=github.com/caddy-dns/cloudflare')
+
+  const globalCaddy = binary.binaryDownloadCandidates('caddy', { os: 'darwin', arch: 'arm64' }, false)
+  assert.equal(globalCaddy[0].url, 'https://github.com/KyoMio/dsh-zen-remote/releases/download/caddy-cloudflare/caddy-darwin-arm64.tgz')
+  assert.equal(globalCaddy[0].archive, 'tgz')
+  assert.ok(globalCaddy[1].url.startsWith('https://gh-proxy.com/'))
 })
 
 test('currentPlatform maps this process into the supported set (windows is amd64-only, GW-fix-1/L4)', async () => {

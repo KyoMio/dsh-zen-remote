@@ -423,6 +423,7 @@ export declare const zh: {
     readonly 'wizard.migrateEntry': "域名尚未接入 Cloudflare？";
     readonly 'wizard.ingress': "入口服务";
     readonly 'wizard.caddy.start': "启动 Caddy";
+    readonly 'wizard.caddy.starting': "正在下载并启动…";
     readonly 'wizard.caddy.stop': "停止";
     readonly 'wizard.caddy.running': "Caddy 运行中";
     readonly 'wizard.caddy.stopped': "Caddy 已停止";

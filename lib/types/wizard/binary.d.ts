@@ -91,4 +91,28 @@ export declare function caddyDataDir(dshHome: string): string;
 export declare function binaryFileName(tool: IngressBinary, platform?: BinaryPlatform): string;
 /** The absolute install path for one binary (where downloadBinary puts it). */
 export declare function binaryInstallPath(dshHome: string, tool: IngressBinary, platform?: BinaryPlatform): string;
+/** Prebuilt Caddy + `github.com/caddy-dns/cloudflare` release assets hosted
+ * on this repository's `caddy-cloudflare` GitHub Release (built by
+ * `.github/workflows/caddy-assets.yml`). Unlike `caddyserver.com/api/download`
+ * — which compiles on the fly and throttles downloads to ~13 KB/s — these
+ * static GitHub Release assets download in seconds and work with mainland
+ * China GitHub acceleration mirrors (`gh-proxy.com` / `ghfast.top`). */
+export declare function caddyPrebuiltDownload(platform: BinaryPlatform): {
+    url: string;
+    archive: BinaryArchive;
+};
+/** Mainland China GitHub release acceleration mirrors, tried first when the
+ * host environment is detected as mainland China (or tried as fallbacks if
+ * direct GitHub times out). */
+export declare const GITHUB_MIRROR_PREFIXES: readonly ["https://gh-proxy.com/", "https://ghfast.top/"];
+/** Ordered candidate downloads for one binary and platform:
+ * - When `preferCnMirror` is true, GitHub Release URLs through mainland
+ *   mirrors come first, followed by direct GitHub Release URL, and finally
+ *   (for Caddy) the upstream `caddyserver.com/api/download` fallback.
+ * - When `preferCnMirror` is false, direct GitHub Release comes first, then
+ *   mainland mirrors, then the upstream build API fallback. */
+export declare function binaryDownloadCandidates(tool: IngressBinary, platform?: BinaryPlatform, preferCnMirror?: boolean): Array<{
+    url: string;
+    archive: BinaryArchive;
+}>;
 //# sourceMappingURL=binary.d.ts.map
