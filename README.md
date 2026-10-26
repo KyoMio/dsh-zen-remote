@@ -134,11 +134,30 @@ One-time facts, in order of likelihood to bite:
 
 ## Setting up public access (host)
 
-Once installed, the mobile UI already works at `127.0.0.1:3080` on the machine itself. To reach it from outside: put your own TLS-terminating reverse proxy in front of the gateway, verify it with a 403 self-check, then pair devices. The full walkthroughs — nginx / Caddy / Cloudflare Tunnel / Lucky — live in [docs/remote-access.en.md](docs/remote-access.en.md). **Prefer a guided setup?** The plugin detail page on the host has a three-step wizard (“Connect your phone”) that automates every path below — a managed Caddy with DNS-01 certificates, snippet generation + verification for your existing proxy, and a fully automatic Cloudflare Tunnel. The short form:
+Once installed, the mobile UI already works at `127.0.0.1:3080` on the machine itself. To reach the host from a phone or another computer, open the **`dsh-zen-remote` bundle detail page** in the DSH **Plugins** page and use the built-in **Remote Access & Device Pairing Wizard** at the top — three guided steps cover configuration, automatic reachability probing, and QR / desktop-code pairing (for full manual nginx / Caddy / Cloudflare Tunnel / Lucky configs, see [docs/remote-access.en.md](docs/remote-access.en.md)):
 
-1. The gateway listens on `127.0.0.1:3088` only; a reverse proxy (nginx, Caddy, Cloudflare Tunnel, Lucky) terminates HTTPS and forwards to it. **Self-check**: from **mobile data** (not home Wi-Fi), open `https://your-domain/lan-gate/admin` — the correct result is a **403**. If you can see the notice page, your proxy is not forwarding `X-Forwarded-*` headers and public requests are being treated as local ones — fix that before continuing.
-2. Open the DSH Plugins page **on the host machine**, open the dsh-zen-remote settings block, pick the device role for the code you are about to mint, and generate an 8-character pairing code (valid 10 minutes, single use).
-3. On the phone, open your HTTPS domain and enter the code on the pairing page. Once paired you land in DSH; identity lives in a long-lived cookie. Use "Add to Home Screen" to install it as an app, grant notification permission, and the agent reaches your lock screen when it needs you.
+![Remote Access & Device Pairing overview card on the plugin detail page](docs/images/wizard-overview.png)
+
+The wizard supports four host access methods (switching modes automatically stops any managed process from the previous mode and updates the gateway bind address):
+
+| Access method | Best for | Gateway binding & behavior |
+| --- | --- | --- |
+| **Managed Caddy (Recommended)** | Public IP + domain on Cloudflare | Automatically downloads a prebuilt Caddy binary (with `caddy-dns/cloudflare`, auto-accelerated via mainland China mirrors when applicable) and obtains a wildcard/domain TLS certificate via DNS-01; gateway listens only on `127.0.0.1:3088` |
+| **Existing Reverse Proxy** | Existing Nginx, Caddy, or Lucky setup | Generates ready-to-paste proxy snippets with WebSocket and `X-Forwarded-*` headers, plus one-click `trustedProxies` registration |
+| **Cloudflare Tunnel** | No public IP / no router port forwarding | Automatically downloads `cloudflared` (with automatic mainland China mirror failover), creates or reuses a tunnel via the Cloudflare API, and writes the DNS CNAME record; gateway listens only on `127.0.0.1:3088` |
+| **LAN / Tailscale Direct** | Same Wi-Fi / LAN or Tailscale virtual network | No domain or TLS certificate needed; auto-detects the machine's LAN / Tailscale IPv4 address and binds `0.0.0.0:3088`, while the gateway's built-in private-IP wall rejects any unproxied direct connection from a public internet IP (`403 public-direct-forbidden`) |
+
+![Wizard Step 1: Choose machine role and server access method](docs/images/wizard-step1-role-path.png)
+
+When entering Step 3 (**Verify & Pair**), the wizard automatically probes both the local gateway and the external access URL (verifying that `/` serves the `401` pairing page and `/lan-gate/admin` returns `403`), and lets you generate a phone QR code or an 8-character desktop client pairing code on the spot:
+
+![Wizard Step 3: Automatic connectivity check, phone QR pairing, and desktop client pairing](docs/images/wizard-step3-verify-pair.png)
+
+If you prefer configuring a reverse proxy by hand, the short form:
+
+1. The gateway listens on `127.0.0.1:3088` by default while a reverse proxy (nginx, Caddy, Cloudflare Tunnel, Lucky) terminates HTTPS and forwards to it. **Self-check**: from **mobile data** (not home Wi-Fi), open `https://your-domain/lan-gate/admin` — the correct result is a **403**. If you can see the notice page, your proxy is not forwarding `X-Forwarded-*` headers and public requests are being treated as local ones — fix that before continuing.
+2. Open the DSH Plugins page **on the host machine**, open `dsh-zen-remote`, and click **Pair Phone (QR)** or **Pair Desktop Client** to generate an 8-character pairing code (32-char unambiguous alphabet, valid 10 minutes, single use).
+3. On the phone, scan the QR code or open your HTTPS domain and enter the code on the pairing page. Once paired you land in DSH; identity lives in a long-lived cookie. Use "Add to Home Screen" to install it as an app, grant notification permission, and the agent reaches your lock screen when it needs you.
 
 ---
 
@@ -190,7 +209,12 @@ Remote access is per session, with four toggle entries:
 
 ### Settings page walkthrough
 
-**Where it is**: in DSH, click 插件 (Plugins) in the left bar → click dsh-zen-remote in the plugin list → click dsh-zen-remote once more under 包含的组件 (components); the settings block is below.
+**Recommended entry (Unified Setup & Pairing Wizard)**: in DSH, click 插件 (Plugins) in the left bar → click `dsh-zen-remote` in the plugin list. The **Remote Access & Device Pairing** card sits right at the top of the bundle detail page:
+- When unconfigured, click **Start Setup Wizard**; once configured, a 2×2 live status overview shows the current role, local gateway health, access method & URL, and paired device counts.
+- Use the footer actions to **Reconfigure Wizard**, **Manage Devices** (rename devices, switch device roles, revoke one or all devices, or send a test push in a dedicated modal), **Pair Desktop Client**, or **Pair Phone (QR)**.
+- When configuring this machine as a **Desktop Client**, Step 2 takes the device name, remote server URL, and 8-character pairing code to pair and connect in one step, and automatically archives/cleans up stale remote sessions in the sidebar if unpaired or revoked.
+
+**Advanced field settings**: to fine-tune individual fields (ports, rate limits, idle sleep hours, push policies), click `dsh-zen-remote` once more under 包含的组件 (components); the underlying settings block is below.
 
 **Common controls**: 已覆盖 (overridden) at a field's top right means the value is saved in the plugin settings (overriding the config file or the default); 重置 (reset) falls back to the next layer. Click 保存 (save) at the bottom of the card when done. Fields that need a reload say so, and the plugin reloads itself after saving — no app restart.
 
@@ -320,6 +344,13 @@ The `push_notify` tool. The model should call it when you explicitly asked to be
 **Desktop client (2.2 additions)**
 
 - Dragging files into a remote session attaches them by **upload**: the desktop app's same-machine shortcut (a dragged file keeps its disk path and would become an `@absolute path` mention naming a file on YOUR machine, unreadable on the server) is intercepted in the browser and the drop is re-shaped into an ordinary upload — the same relay path as the attach button, so the server session gets the bytes. Dragging a **folder** into a remote session is not supported: the drop is stopped with a short on-screen notice. Local sessions are untouched — the shortcut keeps working there — and the guard's status is visible in the settings page diagnostics.
+
+**Unified Setup & Pairing Wizard (2.3 additions)**
+
+- Built-in **Remote Access & Device Pairing** modal wizard and 2×2 live overview card at the top of the plugin bundle detail page, unifying both Host (Managed Caddy, Existing Reverse Proxy, Cloudflare Tunnel, LAN / Tailscale Direct) and Desktop Client setup flows
+- Prebuilt `Caddy + caddy-dns/cloudflare` and `cloudflared` binary management with automatic mainland China network detection, mirror acceleration (`gh-proxy.com` / `ghfast.top`), connect/stall failover watchdogs, and a daily GitHub Actions job that tracks upstream releases automatically
+- LAN / Tailscale Direct mode auto-detects the host's LAN / Tailscale IPv4 address for one-click local network probing, while the gateway's private-IP wall blocks any unproxied direct connection from a public internet IP
+- Standalone **Manage Devices** modal and automatic sidebar cleanup when a desktop client unpairs or its token is revoked
 
 In depth: [interface](docs/interface.md) · [public access + relay protocol](docs/remote-access.en.md)
 
