@@ -1,0 +1,66 @@
+# Prebuild Caddy with github.com/caddy-dns/cloudflare for all 5 gateway-wizard
+# target platforms and publish them to the `caddy-cloudflare` GitHub Release.
+# Why: caddyserver.com/api/download compiles on the fly and throttles downloads
+# (~13 KB/s, >45 min per binary), whereas GitHub Release assets download in
+# seconds and work seamlessly with mainland China GitHub acceleration mirrors.
+name: caddy-assets
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-caddy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      - name: Cross-compile Caddy with caddy-dns/cloudflare
+        run: |
+          mkdir -p dist
+          export CGO_ENABLED=0
+          for pair in \
+            "darwin arm64 caddy-darwin-arm64.tgz" \
+            "darwin amd64 caddy-darwin-amd64.tgz" \
+            "linux arm64 caddy-linux-arm64.tgz" \
+            "linux amd64 caddy-linux-amd64.tgz" \
+            "windows amd64 caddy-windows-amd64.exe"
+          do
+            set -- $pair
+            os=$1; arch=$2; asset=$3
+            echo "=== Building $asset ($os/$arch) ==="
+            if [ "$os" = "windows" ]; then
+              GOOS=$os GOARCH=$arch xcaddy build --with github.com/caddy-dns/cloudflare --output "dist/$asset"
+            else
+              rm -rf build-tmp && mkdir -p build-tmp
+              GOOS=$os GOARCH=$arch xcaddy build --with github.com/caddy-dns/cloudflare --output "build-tmp/caddy"
+              chmod 0755 build-tmp/caddy
+              tar --format=ustar -czf "dist/$asset" -C build-tmp caddy
+              rm -rf build-tmp
+            fi
+            ls -lh "dist/$asset"
+          done
+
+      - name: Publish to caddy-cloudflare release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="caddy-cloudflare"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            git tag -f "$TAG"
+            git push -f origin "$TAG"
+            gh release create "$TAG" \
+              --title "Prebuilt Caddy with caddy-dns/cloudflare" \
+              --notes "Prebuilt Caddy binaries with github.com/caddy-dns/cloudflare for dsh-zen-remote gateway wizard." \
+              dist/*
+          else
+            gh release upload "$TAG" dist/* --clobber
+          fi
