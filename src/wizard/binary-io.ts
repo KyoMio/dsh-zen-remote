@@ -53,6 +53,7 @@ import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web'
 import { gunzipSync } from 'node:zlib'
 import {
   MANUAL_INSTALL_LINKS,
+  binaryDownloadCandidates,
   binaryInstallPath,
   binDir,
   binaryUrls,
@@ -339,11 +340,61 @@ export interface EnsureBinaryOptions extends DownloadBinaryOptions {
   platform?: BinaryPlatform
 }
 
+/** Cached mainland-China network detection so repeated downloads do not
+ * re-probe within the same process. */
+let cachedCnNetwork: boolean | undefined
+
+/**
+ * Detect whether the current host is in mainland China:
+ * 1. Fast local check: system timezone is `Asia/Shanghai`, `Asia/Chongqing`,
+ *    `Asia/Harbin`, or `Asia/Urumqi`, or `LANG`/`LC_ALL` carries `zh_CN`.
+ * 2. Quick 1.5s probe to Cloudflare's `/cdn-cgi/trace` (`loc=CN`), or if
+ *    direct `github.com` HEAD fails/times out within 2s.
+ */
+export async function detectCnNetwork(fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  if (cachedCnNetwork !== undefined) return cachedCnNetwork
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone ?? ''
+    if (/^Asia\/(Shanghai|Chongqing|Harbin|Urumqi)$/i.test(tz)) {
+      cachedCnNetwork = true
+      return true
+    }
+  } catch { /* ignore */ }
+  const envLang = `${process.env.LANG ?? ''} ${process.env.LC_ALL ?? ''}`
+  if (/zh_CN/i.test(envLang)) {
+    cachedCnNetwork = true
+    return true
+  }
+  try {
+    const trace = await fetchImpl('https://www.cloudflare.com/cdn-cgi/trace', {
+      signal: AbortSignal.timeout(1500),
+    })
+    if (trace.ok) {
+      const text = await trace.text()
+      if (/\bloc=CN\b/i.test(text)) {
+        cachedCnNetwork = true
+        return true
+      }
+      cachedCnNetwork = false
+      return false
+    }
+  } catch {
+    // ignore trace timeout
+  }
+  cachedCnNetwork = false
+  return false
+}
+
 /**
  * The idempotent front door: an already-installed executable short-circuits
  * (no network), anything else downloads from the official distribution
- * point for the tool, archive shape included. `fetchImpl` injects the
- * transport (tests point it at a local mock server).
+ * point for the tool, archive shape included.
+ *
+ * When using the default `fetch` transport, automatically detects mainland
+ * China network environments and tries prebuilt GitHub Release mirrors
+ * (`gh-proxy.com` / `ghfast.top`) + direct GitHub Release before falling back
+ * to `caddyserver.com/api/download`. When a custom `fetchImpl` is injected
+ * (unit tests), calls the canonical `binaryUrls(platform)` endpoint directly.
  * @returns the absolute install path and whether THIS call downloaded.
  */
 export async function ensureBinary(
@@ -354,8 +405,25 @@ export async function ensureBinary(
   const platform = options.platform ?? currentPlatform()
   const existing = binaryPath(dshHome, tool, platform)
   if (existing !== undefined) return { path: existing, downloaded: false }
-  const urls = binaryUrls(platform)
-  const [url, archive] = tool === 'caddy' ? [urls.caddy, urls.caddyArchive] : [urls.cloudflared, urls.cloudflaredArchive]
-  const path = await downloadBinary(dshHome, tool, url, { ...options, archive })
-  return { path, downloaded: true }
+  if (options.fetchImpl !== undefined) {
+    const urls = binaryUrls(platform)
+    const [url, archive] = tool === 'caddy' ? [urls.caddy, urls.caddyArchive] : [urls.cloudflared, urls.cloudflaredArchive]
+    const path = await downloadBinary(dshHome, tool, url, { ...options, archive })
+    return { path, downloaded: true }
+  }
+  const preferCnMirror = await detectCnNetwork()
+  const candidates = binaryDownloadCandidates(tool, platform, preferCnMirror)
+  let lastError: unknown
+  for (const candidate of candidates) {
+    try {
+      const path = await downloadBinary(dshHome, tool, candidate.url, {
+        ...options,
+        archive: candidate.archive,
+      })
+      return { path, downloaded: true }
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError
 }

@@ -403,7 +403,7 @@ const WIZARD_KEYS = [
   'wizard.card.portForwardTitle',
   'wizard.card.portForwardStep1', 'wizard.card.portForwardStep2', 'wizard.card.portForwardStep3',
   'wizard.card.portForwardStep4',
-  'wizard.portForwardEntry', 'wizard.migrateEntry',
+  'wizard.portForwardEntry', 'wizard.migrateEntry', 'wizard.caddy.starting',
   'wizard.overview.roleLabel', 'wizard.overview.gatewayLabel', 'wizard.overview.gatewayReady',
   'wizard.overview.gatewayDown', 'wizard.overview.ingressLabel', 'wizard.overview.devicesLabel',
   'wizard.overview.devicesSummary', 'wizard.overview.devicesNone', 'wizard.overview.clientCredLabel',

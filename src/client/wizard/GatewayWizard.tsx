@@ -224,6 +224,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [card, setCard] = useState<'proxy' | 'token' | 'migrate' | 'portforward' | undefined>()
   const [tokenNotice, setTokenNotice] = useState<'saved' | 'failed' | undefined>()
   const [caddyState, setCaddyState] = useState<CaddyState | undefined>()
+  const [caddyBusy, setCaddyBusy] = useState(false)
   const [caddyStartError, setCaddyStartError] = useState<ReturnType<typeof caddyFailureCopy> | undefined>()
   const [tunnelState, setTunnelState] = useState<CaddyState | undefined>()
   const [tunnelBusy, setTunnelBusy] = useState(false)
@@ -231,6 +232,22 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [tunnelCheck, setTunnelCheck] = useState<TunnelCheckWire | undefined>()
   const [adoptTunnelId, setAdoptTunnelId] = useState<string | undefined>()
   const [probedClient, setProbedClient] = useState<boolean | null>(null)
+
+  const selectPath = useCallback((nextPath: WizardPath): void => {
+    setFormError(null)
+    setPath((prev) => {
+      if (prev !== nextPath) {
+        setCaddyStartError(undefined)
+        setTunnelResult(undefined)
+        setTunnelCheck(undefined)
+        setAdoptTunnelId(undefined)
+        setStartResult(undefined)
+        setPoll(undefined)
+        setWebPairRequested(false)
+      }
+      return nextPath
+    })
+  }, [])
 
   const webDeviceCount = useMemo(() => allDevices.filter((d) => d.role === 'web').length, [allDevices])
   const desktopDevices = useMemo(() => allDevices.filter((d) => d.role === 'desktop-client'), [allDevices])
@@ -619,6 +636,22 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         const saved = await saveTokenValue(cfToken.trim())
         if (!saved) return
       }
+      // Mode-switch process synchronization: stop any managed ingress process
+      // that does not belong to the newly saved path so an old tunnel or
+      // Caddy child never keeps running across a mode change.
+      if (path !== 'caddy') {
+        fetch(WIZARD_CADDY_STOP_ROUTE, { method: 'POST' }).catch(() => {})
+        setCaddyState('stopped')
+        setCaddyStartError(undefined)
+      }
+      if (path !== 'cloudflared') {
+        fetch(WIZARD_TUNNEL_STOP_ROUTE, { method: 'POST' }).catch(() => {})
+        setTunnelState('stopped')
+        setTunnelResult(undefined)
+        setTunnelCheck(undefined)
+        setAdoptTunnelId(undefined)
+      }
+      await loadHostStatus()
       setHostSavedInSession(true)
       setStep('verify')
     } finally {
@@ -781,11 +814,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }
 
-  // Managed-Caddy controls (GW-13a): a 3 s status poll while the verify
-  // step shows the caddy path, start/stop through the routes. A start
-  // failure maps to locale copy (download failures carry the install URL).
-  const caddyPath = wizardRole === 'host' && (path === 'caddy' || (wizardStatus?.mode === 'caddy' && step === 'verify'))
-  const tunnelPath = wizardRole === 'host' && (path === 'cloudflared' || (wizardStatus?.mode === 'cloudflared' && step === 'verify'))
+  // Managed-Caddy & Tunnel controls (GW-13a / GW-13b): keyed strictly off the
+  // currently selected `path` so switching away from Tunnel or Caddy never
+  // leaves the previous mode's status bar or notices on screen.
+  const caddyPath = wizardRole === 'host' && path === 'caddy'
+  const tunnelPath = wizardRole === 'host' && path === 'cloudflared'
   const pollIngressState = async (route: string, apply: (state: CaddyState) => void): Promise<void> => {
     try {
       const response = await fetch(route)
@@ -813,11 +846,21 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
 
   const startCaddy = async (): Promise<void> => {
     setCaddyStartError(undefined)
+    setCaddyBusy(true)
     try {
-      const response = await fetch(WIZARD_CADDY_START_ROUTE, { method: 'POST' })
+      const parsedPort = Number(httpsPort.trim())
+      const response = await fetch(WIZARD_CADDY_START_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          domain: domain.trim(),
+          ...(Number.isSafeInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535 ? { httpsPort: parsedPort } : {}),
+        }),
+      })
       const body = (await response.json()) as { ok?: unknown; error?: unknown; detail?: unknown; installUrl?: unknown }
       if (body?.ok === true) {
         setCaddyState('running')
+        setTunnelState('stopped')
         return
       }
       if (response.status === 501) {
@@ -827,6 +870,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       setCaddyStartError(caddyFailureCopy(String(body?.error ?? ''), typeof body?.detail === 'string' ? body.detail : undefined, typeof body?.installUrl === 'string' ? body.installUrl : undefined))
     } catch {
       setCaddyStartError({ key: 'wizard.caddy.failSpawn', params: {} })
+    } finally {
+      setCaddyBusy(false)
     }
   }
 
@@ -868,7 +913,10 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       })
       const body = (await response.json()) as TunnelSetupWire
       setTunnelResult(body)
-      if (body.ok) setTunnelState('running')
+      if (body.ok) {
+        setTunnelState('running')
+        setCaddyState('stopped')
+      }
     } catch {
       setTunnelResult({ ok: false, reason: 'network' })
     } finally {
@@ -1266,13 +1314,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                               data-selected={selected}
                               disabled={disabled}
                               onClick={() => {
-                                setFormError(null)
-                                setPath(value)
+                                selectPath(value)
                               }}
                               onDoubleClick={() => {
                                 if (disabled) return
-                                setFormError(null)
-                                setPath(value)
+                                selectPath(value)
                                 setStep(stepAfterPick())
                               }}
                             >
@@ -1589,14 +1635,16 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                             <span className="zr-wizard-dot" data-state={caddyState === 'running' ? 'pass' : 'pending'} />
                             <span className="zr-wizard-label">{t('wizard.ingress')}</span>
                             <span className="zr-wizard-hint">
-                              {t(caddyState === 'running' ? 'wizard.caddy.running' : caddyState === 'stopped' ? 'wizard.caddy.stopped' : 'wizard.caddy.neverStarted')}
+                              {caddyBusy
+                                ? t('wizard.caddy.starting')
+                                : t(caddyState === 'running' ? 'wizard.caddy.running' : caddyState === 'stopped' ? 'wizard.caddy.stopped' : 'wizard.caddy.neverStarted')}
                             </span>
                           </div>
                           <div className="zr-wizard-row">
-                            <button type="button" className="zr-wizard-btn zr-wizard-btnPrimary" disabled={disabled || caddyState === 'running'} onClick={() => { void startCaddy() }}>
-                              {t('wizard.caddy.start')}
+                            <button type="button" className="zr-wizard-btn zr-wizard-btnPrimary" disabled={disabled || caddyBusy || caddyState === 'running'} onClick={() => { void startCaddy() }}>
+                              {caddyBusy ? t('wizard.caddy.starting') : t('wizard.caddy.start')}
                             </button>
-                            <button type="button" className="zr-wizard-btn" disabled={disabled || caddyState !== 'running'} onClick={() => { void stopCaddy() }}>
+                            <button type="button" className="zr-wizard-btn" disabled={disabled || caddyBusy || caddyState !== 'running'} onClick={() => { void stopCaddy() }}>
                               {t('wizard.caddy.stop')}
                             </button>
                           </div>
@@ -1650,7 +1698,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                         const copy = tunnelFailureCopy(tunnelResult.reason, tunnelResult.detail)
                         return <p className="zr-wizard-notice" data-tone="error">{t(copy.key as Parameters<typeof t>[0], copy.params)}</p>
                       })() : null}
-                      {caddyStartError !== undefined ? (
+                      {caddyPath && caddyStartError !== undefined ? (
                         <p className="zr-wizard-notice" data-tone="error">
                           {t('wizard.caddy.startFailed', { reason: t(caddyStartError.key as Parameters<typeof t>[0], caddyStartError.params) })}
                           {caddyStartError.installUrl !== undefined ? (

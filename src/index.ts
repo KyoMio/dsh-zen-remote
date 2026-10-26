@@ -894,6 +894,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           ...(caddyManager === undefined ? {} : {
             caddy: {
               start: async (input: { domain: string; httpsPort: number; gatewayPort: number }) => {
+                // 模式切换：starting managed Caddy stops any running cloudflared tunnel first,
+                // and restarts Caddy if it was already running with an older config.
+                cloudflaredManager?.stop()
+                if (caddyManager.isRunning()) caddyManager.stop()
                 // The token rides the child env only — read from the store
                 // inside the wiring, never through a route payload.
                 const token = readCfTokenFile(dshHome)
