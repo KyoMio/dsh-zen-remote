@@ -79,9 +79,10 @@ export interface CaddyManager {
     /**
      * Idempotent front door: a live Caddy refuses a second start (stop
      * first to switch configuration). Throws nothing — every failure is a
-     * value.
+     * value. The storage directory is this manager's own (under dshHome) —
+     * callers supply only the user-facing fields.
      */
-    start(input: CaddyfileInput & {
+    start(input: Omit<CaddyfileInput, 'storageDir'> & {
         cfToken: unknown;
     }): Promise<CaddyStartResult>;
     /** Idempotent terminate; safe before any start. */
@@ -90,6 +91,8 @@ export interface CaddyManager {
     isRunning(): boolean;
     /** The live child's Caddyfile path, or undefined. */
     runningCaddyfile(): string | undefined;
+    /** Whether any start has succeeded in this manager's lifetime. */
+    hasStarted(): boolean;
 }
 export declare function createCaddyManager(options: CaddyManagerOptions): CaddyManager;
 /** Re-exported so the wiring (and later the routes) need one import for

@@ -33,7 +33,9 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { AdminAdmission, AdminConfigSnapshot } from '../admin-routes.js'
 import type { ConfigSource } from '../config.js'
 import { responseJson, sameOriginPost } from '../http.js'
+import { hostOf } from '../config.js'
 import { normalizeTrustedIp, mergeProxyList, parseProxyList } from './source-detect.js'
+import type { CaddyStartResult } from './caddy-process.js'
 import { projectWizardStatus, type WizardRuntimeInput } from './status.js'
 import type { VerificationCheckResult, VerificationStartResult } from './verify.js'
 
@@ -52,6 +54,23 @@ export const WIZARD_TRUST_PROXY_ROUTE = `${WIZARD_ROUTE_PREFIX}/trust-proxy`
 /** POST `{publicUrl}`: start the final verification — mint the web pairing
  * code (GW-9). GET: poll its status. */
 export const WIZARD_VERIFY_ROUTE = `${WIZARD_ROUTE_PREFIX}/verify`
+
+/** POST `{token}`: store the Cloudflare API token 0600 on this machine;
+ * DELETE: stop the consumers and remove it (GW-13a). */
+export const WIZARD_CF_TOKEN_ROUTE = `${WIZARD_ROUTE_PREFIX}/cf-token`
+
+/** POST `{token}`: store the cloudflared connector token (GW-13a). */
+export const WIZARD_TUNNEL_TOKEN_ROUTE = `${WIZARD_ROUTE_PREFIX}/tunnel-token`
+
+/** POST: start the managed Caddy from the saved row config; POST (stop)
+ * terminates it; GET answers its three-state (GW-13a). */
+export const WIZARD_CADDY_START_ROUTE = `${WIZARD_ROUTE_PREFIX}/caddy/start`
+export const WIZARD_CADDY_STOP_ROUTE = `${WIZARD_ROUTE_PREFIX}/caddy/stop`
+export const WIZARD_CADDY_STATUS_ROUTE = `${WIZARD_ROUTE_PREFIX}/caddy/status`
+
+/** The managed Caddy's three-state. `stopped` means a start happened and
+ * the process has since exited (degraded); `never-started` precedes that. */
+export type CaddyProcessState = 'running' | 'stopped' | 'never-started'
 
 /** Inbound body cap — the wizard forms send a few hundred bytes. */
 const MAX_BODY_BYTES = 16 * 1024
@@ -81,6 +100,24 @@ export interface WizardHandlerOptions {
   trustProxy?: {
     resolved: () => { value: string; source: ConfigSource }
     write: (expected: string, list: string) => boolean | Promise<boolean>
+  }
+  /** The Cloudflare token store (GW-13a), injected by apply(): 0600 files
+   * under the ingress directory. `deleteCfToken` is called AFTER the
+   * callers have stopped the consuming processes. Absent — a wiring that
+   * predates GW-13 — and the routes answer 501. */
+  tokenStore?: {
+    writeCfToken: (token: string) => void
+    deleteCfToken: () => void
+    cfTokenConfigured: () => boolean
+    writeTunnelToken: (token: string) => void
+  }
+  /** The managed Caddy (GW-13a), injected by apply(). `start` receives the
+   * SAVED row values and the gateway's actual port; the Cloudflare token
+   * comes from the token store inside the wiring (never through routes). */
+  caddy?: {
+    start: (input: { domain: string; httpsPort: number; gatewayPort: number }) => Promise<CaddyStartResult>
+    stop: () => void
+    status: () => CaddyProcessState
   }
   /** The final-verification orchestration (GW-9), injected by apply():
    * POST mints the pairing code, GET polls the session. Absent — a wiring
@@ -228,6 +265,108 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
           return
         }
         responseJson(res, 200, { ok: true, added: true })
+        return
+      }
+      if (route === WIZARD_CF_TOKEN_ROUTE && (method === 'POST' || method === 'DELETE')) {
+        if (!sameOriginPost(req)) {
+          responseJson(res, 403, {
+            ok: false,
+            error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+          })
+          return
+        }
+        const store = options.tokenStore
+        if (store === undefined) {
+          responseJson(res, 501, { ok: false, error: { code: 'not-implemented', message: 'This wizard step is not wired up yet' } })
+          return
+        }
+        if (method === 'DELETE') {
+          store.deleteCfToken()
+          responseJson(res, 200, { ok: true, configured: false })
+          return
+        }
+        const body = await readJsonObject(req)
+        const token = typeof body?.token === 'string' ? body.token.trim() : ''
+        if (token === '') {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-token', message: 'token must be a non-empty string' } })
+          return
+        }
+        store.writeCfToken(token)
+        responseJson(res, 200, { ok: true, configured: true })
+        return
+      }
+      if (route === WIZARD_TUNNEL_TOKEN_ROUTE && method === 'POST') {
+        if (!sameOriginPost(req)) {
+          responseJson(res, 403, {
+            ok: false,
+            error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+          })
+          return
+        }
+        const store = options.tokenStore
+        if (store === undefined) {
+          responseJson(res, 501, { ok: false, error: { code: 'not-implemented', message: 'This wizard step is not wired up yet' } })
+          return
+        }
+        const body = await readJsonObject(req)
+        const token = typeof body?.token === 'string' ? body.token.trim() : ''
+        if (token === '') {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-token', message: 'token must be a non-empty string' } })
+          return
+        }
+        store.writeTunnelToken(token)
+        responseJson(res, 200, { ok: true, configured: true })
+        return
+      }
+      if (route.startsWith(`${WIZARD_ROUTE_PREFIX}/caddy/`)) {
+        // Walls first, then the method shape, then (and only then) the
+        // wiring check — a 501 must never answer before the walls, and a
+        // wrong method on a wired route must still read 405.
+        if (method === 'POST' && !sameOriginPost(req)) {
+          responseJson(res, 403, {
+            ok: false,
+            error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+          })
+          return
+        }
+        if (method !== 'GET' && method !== 'POST') {
+          res.setHeader('Allow', 'GET, POST')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET or POST' } })
+          return
+        }
+        const caddy = options.caddy
+        if (caddy === undefined) {
+          responseJson(res, 501, { ok: false, error: { code: 'not-implemented', message: 'This wizard step is not wired up yet' } })
+          return
+        }
+        if (route === WIZARD_CADDY_STATUS_ROUTE && method === 'GET') {
+          responseJson(res, 200, { ok: true, state: caddy.status() })
+          return
+        }
+        if (route === WIZARD_CADDY_STOP_ROUTE) {
+          caddy.stop()
+          responseJson(res, 200, { ok: true, state: caddy.status() })
+          return
+        }
+        // start: the SAVED row config is the source of truth (the configure
+        // step stored it); the gateway's ACTUAL port wins over the
+        // configured one.
+        const values = options.getConfig().values
+        const domain = hostOf(values.ingressDomain)
+        if (domain === undefined) {
+          responseJson(res, 400, { ok: false, error: { code: 'no-domain', message: '保存一个有效的公开域名后再启动' } })
+          return
+        }
+        let runtime: WizardRuntimeInput = {}
+        try {
+          runtime = (await options.getRuntime?.()) ?? {}
+        } catch {
+          runtime = {}
+        }
+        const gatewayPort = typeof runtime.gatewayActualPort === 'number' ? runtime.gatewayActualPort : values.port
+        const result = await caddy.start({ domain, httpsPort: values.ingressHttpsPort, gatewayPort })
+        // The start result may carry a failure detail — never the token.
+        responseJson(res, 200, { ok: result.ok, ...(result.ok ? { caddyfile: result.caddyfile } : { error: result.error, detail: result.detail, installUrl: result.installUrl }) })
         return
       }
       if (route === WIZARD_VERIFY_ROUTE && (method === 'POST' || method === 'GET')) {

@@ -27,8 +27,13 @@ import type { ZenRemoteSettingsForm } from '../../client-data/settings-form.ts'
 import { ADMIN_STATUS_ROUTE, CLIENT_CONFIG_ROUTE } from '../../client-data/settings-form.ts'
 import { qrMatrix } from '../../client-data/qr.ts'
 import {
+  WIZARD_CADDY_START_ROUTE,
+  WIZARD_CADDY_STATUS_ROUTE,
+  WIZARD_CADDY_STOP_ROUTE,
+  WIZARD_CF_TOKEN_ROUTE,
   WIZARD_STATUS_ROUTE,
   WIZARD_VERIFY_ROUTE,
+  caddyFailureCopy,
   configureReadiness,
   deriveWizardLights,
   formSeedOf,
@@ -36,6 +41,7 @@ import {
   isValidPort,
   pairingSecondsLeft,
   upstreamPortOf,
+  type CaddyState,
   type LightState,
   type WizardPath,
   type WizardStatusBody,
@@ -122,6 +128,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [notWired, setNotWired] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   const [card, setCard] = useState<'proxy' | 'token' | 'migrate' | 'portforward' | undefined>()
+  const [tokenNotice, setTokenNotice] = useState<'saved' | 'failed' | undefined>()
+  const [caddyState, setCaddyState] = useState<CaddyState | undefined>()
+  const [caddyStartError, setCaddyStartError] = useState<ReturnType<typeof caddyFailureCopy> | undefined>()
   const [probedClient, setProbedClient] = useState<boolean | null>(null)
 
   // The saved role, live: a role flip re-renders this away (or back).
@@ -271,6 +280,61 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }
 
+  // Managed-Caddy controls (GW-13a): a 3 s status poll while the verify
+  // step shows the caddy path, start/stop through the routes. A start
+  // failure maps to locale copy (download failures carry the install URL).
+  const caddyPath = wizardStatus?.mode === 'caddy' || path === 'caddy'
+  useEffect(() => {
+    if (step !== 'verify' || !caddyPath) return
+    let cancelled = false
+    const beat = async (): Promise<void> => {
+      try {
+        const response = await fetch(WIZARD_CADDY_STATUS_ROUTE)
+        if (!response.ok || cancelled) return
+        const body = (await response.json()) as { state?: unknown }
+        if (body?.state === 'running' || body?.state === 'stopped' || body?.state === 'never-started') {
+          if (!cancelled) setCaddyState(body.state)
+        }
+      } catch {
+        // keep the last state
+      }
+    }
+    void beat()
+    const handle = setInterval(() => { void beat() }, 3000)
+    return () => {
+      cancelled = true
+      clearInterval(handle)
+    }
+  }, [step, caddyPath])
+
+  const startCaddy = async (): Promise<void> => {
+    setCaddyStartError(undefined)
+    try {
+      const response = await fetch(WIZARD_CADDY_START_ROUTE, { method: 'POST' })
+      const body = (await response.json()) as { ok?: unknown; error?: unknown; detail?: unknown; installUrl?: unknown }
+      if (body?.ok === true) {
+        setCaddyState('running')
+        return
+      }
+      if (response.status === 501) {
+        setNotWired(true)
+        return
+      }
+      setCaddyStartError(caddyFailureCopy(String(body?.error ?? ''), typeof body?.detail === 'string' ? body.detail : undefined, typeof body?.installUrl === 'string' ? body.installUrl : undefined))
+    } catch {
+      setCaddyStartError({ key: 'wizard.caddy.failSpawn', params: {} })
+    }
+  }
+
+  const stopCaddy = async (): Promise<void> => {
+    try {
+      await fetch(WIZARD_CADDY_STOP_ROUTE, { method: 'POST' })
+      setCaddyState('stopped')
+    } catch {
+      // the 3 s poll will correct the label
+    }
+  }
+
   // The subject + role gates. All hooks above; nothing below renders for a
   // foreign subject or a sub-client row.
   if (props.kind !== 'row' || props.pkg?.name !== 'dsh-zen-remote') return null
@@ -388,6 +452,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
               </div>
             </>
           )}
+          {tokenNotice !== undefined ? (
+            <p className="zr-wizard-notice" data-tone={tokenNotice === 'saved' ? undefined : 'error'}>
+              {t(tokenNotice === 'saved' ? 'wizard.token.saved' : 'wizard.token.saveFailed')}
+            </p>
+          ) : null}
           {path === 'caddy' && isValidPort(httpsPort.trim()) && httpsPort.trim() !== '443' ? (
             <p className="zr-wizard-hint">
               <button type="button" className="zr-wizard-link" disabled={disabled} onClick={() => setCard('portforward')}>
@@ -405,6 +474,24 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
 
       {step === 'verify' ? (
         <>
+          {(wizardStatus?.mode === 'caddy' || path === 'caddy') ? (
+            <div className="zr-wizard-row" data-zen-remote="wizard-caddy-controls">
+              <span className="zr-wizard-label">{t('wizard.ingress')}</span>
+              <span className="zr-wizard-hint">
+                {t(caddyState === 'running' ? 'wizard.caddy.running' : caddyState === 'stopped' ? 'wizard.caddy.stopped' : 'wizard.caddy.neverStarted')}
+              </span>
+              <button type="button" disabled={disabled} onClick={() => { void startCaddy() }}>{t('wizard.caddy.start')}</button>
+              <button type="button" disabled={disabled || caddyState !== 'running'} onClick={() => { void stopCaddy() }}>{t('wizard.caddy.stop')}</button>
+            </div>
+          ) : null}
+          {caddyStartError !== undefined ? (
+            <p className="zr-wizard-notice" data-tone="error">
+              {t('wizard.caddy.startFailed', { reason: t(caddyStartError.key as Parameters<typeof t>[0], caddyStartError.params) })}
+              {caddyStartError.installUrl !== undefined ? (
+                <> <a className="zr-wizard-link" href={caddyStartError.installUrl} target="_blank" rel="noreferrer">{caddyStartError.installUrl}</a></>
+              ) : null}
+            </p>
+          ) : null}
           <ul className="zr-wizard-lights">
             {LIGHT_ORDER.map(({ key, light }) => (
               <li key={key} className="zr-wizard-light">
@@ -462,8 +549,21 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         <TokenCard
           t={t}
           onUse={(token) => {
-            setCfToken(token)
-            setCard(undefined)
+            void (async () => {
+              try {
+                const response = await fetch(WIZARD_CF_TOKEN_ROUTE, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ token }),
+                })
+                setTokenNotice(response.ok ? 'saved' : 'failed')
+              } catch {
+                setTokenNotice('failed')
+              }
+              // Either way the paste box is done with the value.
+              setCfToken('')
+              setCard(undefined)
+            })()
           }}
           onClose={() => setCard(undefined)}
         />
