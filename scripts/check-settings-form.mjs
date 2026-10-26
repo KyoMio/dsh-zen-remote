@@ -619,10 +619,11 @@ test('CLIENT_RECONNECT_ROUTE is the one reconnect endpoint', () => {
   assert.equal(CLIENT_RECONNECT_ROUTE, '/_dsh/zen-remote/client/reconnect')
 })
 
-test('normalizePairingCode uppercases and strips spaces and hyphens', () => {
-  assert.equal(normalizePairingCode('ab cd-12'), 'ABCD12')
-  assert.equal(normalizePairingCode('  abcd12ef  '), 'ABCD12EF')
-  assert.equal(normalizePairingCode('abcd-12-ef'), 'ABCD12EF')
+test('normalizePairingCode uppercases, filters to the 32-char code alphabet (no 0/O/1/I/L or symbols), and caps at 8 chars', () => {
+  assert.equal(normalizePairingCode('ab cd-23'), 'ABCD23')
+  assert.equal(normalizePairingCode('  abcd23ef  '), 'ABCD23EF')
+  assert.equal(normalizePairingCode('abcd-23-ef-gh'), 'ABCD23EF')
+  assert.equal(normalizePairingCode('0O1IL!@#$%^&*()_+=abcd2345'), 'ABCD2345')
   assert.equal(normalizePairingCode(''), '')
 })
 

@@ -44,6 +44,11 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 /** `plugins.bundle.config` key: the bundle's package name. */
 export const WIZARD_BUNDLE_KEY = 'dsh-zen-remote'
 
+export interface SaveRowFieldsOptions {
+  /** Field names to remove (`op: 'unset'`) in the same atomic mutation. */
+  unset?: readonly string[]
+}
+
 /**
  * Register the wizard stylesheet and (lazily, only where the settings
  * service exists) the bundle detail-page top block.
@@ -76,14 +81,13 @@ export function registerGatewayWizard(ctx: ClientContext, section: typeof Gatewa
     const config = new ZenRemoteSettingsForm(scope, secretConfigured)
     const offDescribe = describe !== undefined ? describe.subscribe(() => { config.refresh() }) : () => {}
     formsCtx.effect(() => () => { offDescribe(); config.dispose() }, 'dsh-zen-remote: wizard form')
-    // One atomic row write per save: the wizard fields are volatile
-    // live-read fields (not in RESTART_FIELDS), so saving reloads nothing.
-    const saveRowFields = async (fields: Record<string, unknown>): Promise<void> => {
+    const saveRowFields = async (fields: Record<string, unknown>, options?: SaveRowFieldsOptions): Promise<void> => {
       const snapshot = scope.getSnapshot()
-      await scope.mutate(
-        Object.entries(fields).map(([key, value]) => ({ op: 'set' as const, path: [key], value })),
-        snapshot.revision,
-      )
+      const ops = [
+        ...Object.entries(fields).map(([key, value]) => ({ op: 'set' as const, path: [key], value })),
+        ...(options?.unset ?? []).map((key) => ({ op: 'unset' as const, path: [key] })),
+      ]
+      await scope.mutate(ops, snapshot.revision)
     }
     formsCtx.effect(() => formsCtx.slots.inject('plugins.bundle.config', () => formsCtx.slots.register({
       name: 'plugins.bundle.config',

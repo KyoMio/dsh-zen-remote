@@ -262,8 +262,13 @@ export interface ClaimRouteBody {
     message?: string;
     retryAfterMs?: number;
 }
-/** What the pairing-code box keeps as its draft: uppercase, no spaces or
- * hyphens (the gateway strips every other character at claim time anyway). */
+/** The gateway's 32-character unambiguous pairing-code alphabet (no 0/O/1/I/L)
+ * and fixed 8-character length (`lib/lan-gate-server.cjs:330-335`). */
+export declare const PAIRING_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+export declare const PAIRING_CODE_LENGTH = 8;
+/** What the pairing-code box keeps as its draft: uppercase, restricted to the
+ * 32-character pairing-code alphabet (excluding 0/O/1/I/L and symbols), and
+ * capped at 8 characters. */
 export declare function normalizePairingCode(input: string): string;
 /**
  * Whether the settings page may follow the SERVER's record of this device's

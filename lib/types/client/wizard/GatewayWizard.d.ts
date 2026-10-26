@@ -21,7 +21,9 @@ export interface GatewayWizardProps extends PropsRuntime<'plugins.bundle.config'
     /** The row's staged-form controller — saved-role source of truth. */
     config: ZenRemoteSettingsForm;
     /** One atomic row write (the wiring stages through configForms.mutate). */
-    saveRowFields: (fields: Record<string, unknown>) => Promise<void>;
+    saveRowFields: (fields: Record<string, unknown>, options?: {
+        unset?: readonly string[];
+    }) => Promise<void>;
 }
 export declare function GatewayWizard(props: GatewayWizardProps): ReactNode;
 //# sourceMappingURL=GatewayWizard.d.ts.map

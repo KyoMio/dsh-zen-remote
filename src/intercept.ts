@@ -1330,6 +1330,10 @@ interface MergedGlobalStreamDeps {
    * session" (T62); the merged stream re-judges immediately instead of
    * waiting for a frame or the fallback poll. Returns the disposer. */
   watchCurrentSession(fn: () => void): () => void
+  /** Subscribe one callback to {@link InterceptHandle.uninstall} so a live
+   * merged stream removes its remote groups and archives/hides its remote
+   * sessions when the plugin unloads or switches role from client to host. */
+  watchUninstall(fn: () => void): () => void
   /** T63: the summary-sync hub. The WORKSPACE route reports the virtual
    * session ids each forwarded frame batch carried, so the events leg's
    * sync can announce list rows the UI has no summary for; the control
@@ -1430,6 +1434,24 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
     for (const frame of merger.setCurrentSession(read.kind === 'open' ? read.sessionId : undefined)) channel.push(frame)
   }
   const offCurrentSession = deps.watchCurrentSession(informCurrentSession)
+  const offUninstall = deps.watchUninstall(() => {
+    try {
+      // When the client intercept is uninstalled (e.g. role switched from
+      // client to host), transition to `unpaired` (and ensure a readable
+      // current-session state so all remote sessions move into the archived
+      // set and are hidden from the default sidebar view while staying in
+      // their workspace group so they never become 「未分组」 strays).
+      const read = deps.getCurrentSession()
+      merger.setCurrentSession(read.kind === 'open' ? read.sessionId : undefined)
+      applyAnnotation('unpaired')
+      merger.onRemoteDown()
+      currentController?.abort()
+    } catch {
+      // ignore teardown errors
+    } finally {
+      flushWaiters()
+    }
+  })
   let sessionPoll: unknown = undefined
   const pollCurrentSession = (): void => {
     sessionPoll = undefined
@@ -1471,11 +1493,21 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
         // persisted server-side, so a re-pair to the SAME server keeps the
         // virtual prefix — and the UI's removedIds blacklist never clears
         // during a page's life, so a remove here would make the group
-        // un-revivable. Handle it exactly like a remote death: keep the
-        // shown state, cut the in-flight leg; the re-pair lands as `online`
-        // and the pump's wait resumes under the SAME identity.
+        // un-revivable. Handle it like a remote death: keep the shown
+        // workspace group, archive/hide the remote sessions via
+        // applyAnnotation → onStatusChanged (when `unpaired` or when
+        // current-session is readable), and cut the in-flight leg; the
+        // re-pair lands as `online` and restores the sessions under the SAME
+        // identity.
+        const read = deps.getCurrentSession()
+        if (state === 'unpaired' && read.kind === 'unavailable') {
+          merger.setCurrentSession(undefined)
+        } else {
+          informCurrentSession()
+        }
         applyAnnotation(annotationOf(state))
         merger.onRemoteDown()
+        ensureSessionPoll()
         currentController?.abort()
         return
       }
@@ -1703,6 +1735,7 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
     alive = false
     if (sessionPoll !== undefined) clock.clearTimeout(sessionPoll)
     offCurrentSession()
+    offUninstall()
     offState()
     if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
     currentController?.abort()
@@ -2399,6 +2432,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   const watchCurrentSession = (fn: () => void): (() => void) => {
     currentSessionListeners.add(fn)
     return () => { currentSessionListeners.delete(fn) }
+  }
+  const uninstallListeners = new Set<() => void>()
+  const watchUninstall = (fn: () => void): (() => void) => {
+    uninstallListeners.add(fn)
+    return () => { uninstallListeners.delete(fn) }
   }
   const gateway = raw as Record<string | symbol, unknown>
   const shape = checkGatewayShape(raw)
@@ -3301,6 +3339,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             clock,
             getCurrentSession,
             watchCurrentSession,
+            watchUninstall,
             summarySync,
           })
         })()
@@ -3378,6 +3417,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     uninstall() {
       if (!installed) return
       installed = false
+      for (const listener of [...uninstallListeners]) listener()
       // The catalog watcher dies with the wrap (T52-fix2): a late online
       // transition after this point belongs to another generation.
       offCatalogWatch?.()
