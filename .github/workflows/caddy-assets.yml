@@ -1,12 +1,23 @@
 # Prebuild Caddy with github.com/caddy-dns/cloudflare for all 5 gateway-wizard
 # target platforms and publish them to the `caddy-cloudflare` GitHub Release.
-# Why: caddyserver.com/api/download compiles on the fly and throttles downloads
-# (~13 KB/s, >45 min per binary), whereas GitHub Release assets download in
-# seconds and work seamlessly with mainland China GitHub acceleration mirrors.
+#
+# Automatically tracks upstream `caddyserver/caddy` (latest release) and
+# `caddy-dns/cloudflare` (latest tag) on a daily schedule — skipping the Go
+# cross-compile when the `caddy-cloudflare` release notes already record the
+# same `upstream: caddy=<ver> cloudflare-dns=<ver>` stamp (unless forced via
+# workflow_dispatch).
 name: caddy-assets
 
 on:
+  schedule:
+    # Check upstream daily at 04:17 UTC
+    - cron: '17 4 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force rebuild even if upstream versions have not changed'
+        required: false
+        default: 'false'
 
 jobs:
   build-caddy:
@@ -16,14 +27,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check upstream Caddy & caddy-dns/cloudflare versions
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          CADDY_VER=$(gh api repos/caddyserver/caddy/releases/latest --jq '.tag_name')
+          CF_DNS_VER=$(gh api 'repos/caddy-dns/cloudflare/tags?per_page=1' --jq '.[0].name')
+          STAMP="upstream: caddy=${CADDY_VER} cloudflare-dns=${CF_DNS_VER}"
+          echo "Detected $STAMP"
+          echo "caddy_ver=$CADDY_VER" >> "$GITHUB_OUTPUT"
+          echo "cf_dns_ver=$CF_DNS_VER" >> "$GITHUB_OUTPUT"
+          echo "stamp=$STAMP" >> "$GITHUB_OUTPUT"
+
+          CURRENT_BODY=$(gh release view caddy-cloudflare --json body --jq '.body' 2>/dev/null || echo "")
+          if [ "$FORCE" != "true" ] && printf '%s\n' "$CURRENT_BODY" | grep -Fq "$STAMP"; then
+            echo "Release caddy-cloudflare is already at $STAMP; skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Will build and publish $STAMP."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-go@v5
+        if: steps.check.outputs.should_build == 'true'
         with:
           go-version: '1.24.x'
 
       - name: Install xcaddy
+        if: steps.check.outputs.should_build == 'true'
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
       - name: Cross-compile Caddy with caddy-dns/cloudflare
+        if: steps.check.outputs.should_build == 'true'
+        env:
+          CADDY_VER: ${{ steps.check.outputs.caddy_ver }}
+          CF_DNS_VER: ${{ steps.check.outputs.cf_dns_ver }}
         run: |
           mkdir -p dist
           export CGO_ENABLED=0
@@ -36,12 +76,16 @@ jobs:
           do
             set -- $pair
             os=$1; arch=$2; asset=$3
-            echo "=== Building $asset ($os/$arch) ==="
+            echo "=== Building $asset ($os/$arch) with Caddy $CADDY_VER + caddy-dns/cloudflare@$CF_DNS_VER ==="
             if [ "$os" = "windows" ]; then
-              GOOS=$os GOARCH=$arch xcaddy build --with github.com/caddy-dns/cloudflare --output "dist/$asset"
+              GOOS=$os GOARCH=$arch xcaddy build "$CADDY_VER" \
+                --with "github.com/caddy-dns/cloudflare@$CF_DNS_VER" \
+                --output "dist/$asset"
             else
               rm -rf build-tmp && mkdir -p build-tmp
-              GOOS=$os GOARCH=$arch xcaddy build --with github.com/caddy-dns/cloudflare --output "build-tmp/caddy"
+              GOOS=$os GOARCH=$arch xcaddy build "$CADDY_VER" \
+                --with "github.com/caddy-dns/cloudflare@$CF_DNS_VER" \
+                --output "build-tmp/caddy"
               chmod 0755 build-tmp/caddy
               tar --format=ustar -czf "dist/$asset" -C build-tmp caddy
               rm -rf build-tmp
@@ -50,17 +94,25 @@ jobs:
           done
 
       - name: Publish to caddy-cloudflare release
+        if: steps.check.outputs.should_build == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CADDY_VER: ${{ steps.check.outputs.caddy_ver }}
+          CF_DNS_VER: ${{ steps.check.outputs.cf_dns_ver }}
+          STAMP: ${{ steps.check.outputs.stamp }}
         run: |
           TAG="caddy-cloudflare"
+          NOTES=$(printf "Prebuilt Caddy (%s) with github.com/caddy-dns/cloudflare (%s) for dsh-zen-remote gateway wizard.\n\n<!-- %s -->" "$CADDY_VER" "$CF_DNS_VER" "$STAMP")
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             git tag -f "$TAG"
             git push -f origin "$TAG"
             gh release create "$TAG" \
-              --title "Prebuilt Caddy with caddy-dns/cloudflare" \
-              --notes "Prebuilt Caddy binaries with github.com/caddy-dns/cloudflare for dsh-zen-remote gateway wizard." \
+              --title "Prebuilt Caddy $CADDY_VER + caddy-dns/cloudflare $CF_DNS_VER" \
+              --notes "$NOTES" \
               dist/*
           else
             gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" \
+              --title "Prebuilt Caddy $CADDY_VER + caddy-dns/cloudflare $CF_DNS_VER" \
+              --notes "$NOTES"
           fi
