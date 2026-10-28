@@ -30,6 +30,7 @@ const PLUGIN_SOURCES = [
   '/tmp/bs-versions/0.28.0-alpha.0/lib/index.js',
   '/tmp/bs-versions/0.28.0/lib/index.js',
   '/tmp/bs-versions/0.28.1/lib/index.js',
+  '/tmp/bs-versions/0.28.2/lib/index.js',
 ]
 
 /** Scratch space for the server-side share store — OUTSIDE the repository
@@ -95,8 +96,8 @@ test('PB-15: the 0.26.0 additions carry the right dispositions; both versions no
   // Both versions register: normalizeAdapter refuses an installed version
   // outside `versions`, so each list entry must normalize clean.
   const { adapter } = await loadAdapter()
-  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1'])
-  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1']) {
+  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2'])
+  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2']) {
     const core = await importLib('plugin-adapter-core.js')
     const adaptersMod = await importLib('adapters/index.js')
     const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
