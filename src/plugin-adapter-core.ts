@@ -371,8 +371,8 @@ export function adapterDigestOf(plugin: string, version: string, routes: Normali
   return createHash('sha256').update(canonical, 'utf8').digest('hex').slice(0, 16)
 }
 
-/** The prefix-match rule, shared verbatim by both halves: equality or one
- * path segment deeper, on the RAW undecoded pathname. */
+/** The prefix-match rule, shared verbatim by both halves: equality, or any
+ * deeper sub-path (`startsWith(path + '/')`), on the RAW undecoded pathname. */
 export function adapterPathMatches(route: NormalizedAdapterRoute, pathname: string): boolean {
   if (route.match === 'exact') return pathname === route.path
   return pathname === route.path || pathname.startsWith(`${route.path}/`)
