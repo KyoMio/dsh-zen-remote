@@ -80,6 +80,7 @@ import { createVerificationManager } from './wizard/verify.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
+import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js'
 
 // The plugin bridge's public types (PB-1), re-exported so another plugin's
 // author can `import type { … } from 'dsh-zen-remote'` without reaching into
@@ -127,8 +128,11 @@ export const CLIENT_CONFIG_ROUTE = '/_dsh/mobile-nav/client-config'
 /** Workspace-relative directory uploads land in (also the `@` prefix the composer inserts). */
 export const UPLOAD_DIR = '.dsh-uploads'
 
-/** Body cap when the plugin row sets no `maxUploadBytes`. */
-export const DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+// The phone composer's default body cap lives in upload-limits.ts with the
+// plugin's other upload numbers (the comment there spells out why this must
+// stay phone-only and never size the relay); re-exported so the main entry's
+// public surface keeps the name.
+export { DEFAULT_MAX_UPLOAD_BYTES }
 
 /** Longest filename, in bytes, that survives sanitization (ext4/APFS leaf limit is 255). */
 const MAX_NAME_BYTES = 180

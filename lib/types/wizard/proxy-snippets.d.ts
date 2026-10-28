@@ -31,9 +31,10 @@ export interface SnippetInput {
  * nginx: a complete server block. The WebSocket upgrade map sits outside
  * the server (http-level context) — the snippet says so in a comment, the
  * user pastes it into the http/server scope their setup offers. Long
- * idle tunnels need the 3600s read/send timeouts, uploads the 128m
- * client body cap, and streaming the buffering switch — all three are
- * the shapes DSH's relay traffic actually needs.
+ * idle tunnels need the 3600s read/send timeouts, uploads the 512m
+ * client body cap (nginx's `m` is MiB — 512m covers the relay's 500 MiB
+ * upload ceiling with headroom), and streaming the buffering switch — all
+ * three are the shapes DSH's relay traffic actually needs.
  */
 export declare function nginxSnippet(input: SnippetInput): SnippetResult;
 /**

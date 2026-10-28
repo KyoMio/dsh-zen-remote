@@ -657,11 +657,17 @@ test('0.28.0-alpha.0 / 0.28.0: git.graph is a session-scoped read; changes.ops d
   }
 })
 
-test('PB-12: the adapter upload cap equals the relay upload budget', async () => {
-  const relayServerMod = await importLib('relay-server.js')
+test('PB-12: the upload route rides the shared relay budget; the api route keeps the plugin\u2019s own 1 MiB', async () => {
+  // The upload cap no longer hand-copies the relay budget — the adapter
+  // imports MAX_UPLOAD_BYTES from lib/upload-limits.js like everyone else,
+  // so a "the two numbers move together" pair-pin would be a tautology and
+  // is gone with the copy. What stays worth pinning: the route really
+  // declares that constant, and the api route's cap is better-sidebar's own
+  // 1 MiB (lib/index.js:863), not the relay's.
+  const { MAX_UPLOAD_BYTES } = await importLib('upload-limits.js')
   const { adapter } = await loadAdapter()
   const upload = adapter.routes.find((route) => route.path === '/sidebar/upload')
-  assert.equal(upload.maxBody, relayServerMod.MAX_UPLOAD_BYTES, 'the two numbers move together')
+  assert.equal(upload.maxBody, MAX_UPLOAD_BYTES)
   const api = adapter.routes.find((route) => route.path === '/sidebar/api')
   assert.equal(api.maxBody, 1024 * 1024, 'the api body cap is the plugin\u2019s own 1 MiB')
 })

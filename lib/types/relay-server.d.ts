@@ -30,6 +30,7 @@ import type { ShareStore } from './share-store.js';
 import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js';
 import { type PluginTunnelRoutes } from './plugin-tunnel.js';
 import type { PluginLoopback } from './plugin-loopback.js';
+import { MAX_UPLOAD_BYTES } from './upload-limits.js';
 import type { NormalizedAdapter } from './plugin-adapter-core.js';
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
@@ -38,31 +39,7 @@ import type { NormalizedAdapter } from './plugin-adapter-core.js';
  * `…/relay//…` shapes and never `…/relay/ping`.
  */
 export declare const RELAY_PREFIX = "/_dsh/zen-remote/relay";
-/**
- * Body ceiling for the binary upload channel alone (T51): a shared session's
- * non-image file attachments. DSH's own upload route has NO byte cap — the
- * host stores the stream verbatim (`saveFileStreamVerbatim` →
- * `publishImmutableObjectStream`, RT dsh-attachment-local lib/index.js
- * ~699-716; the 20 MiB `maxImageBytes` there covers INLINE images only), so
- * there is no host number to mirror and this relay picks its own: 500 MiB
- * per upload, checked first against `Content-Length` (refused before a byte
- * moves) and then counted while the stream is pumped (a chunked body has no
- * length header — the sub-client's undici forbids hand-set length headers,
- * so the streaming count is the path its uploads normally take). Past the
- * cap the forward is aborted, the rest of the request is drained and the
- * answer is 413 `payload-too-large`.
- *
- * SLOW-LINK BOUND (T51-fix, for the docs): a single legitimate upload is
- * also bounded in TIME. The sub-client's own round-trip budget now caps at
- * 15 minutes (relay-client.ts, the T31-fix rule), but the HOST's HTTP server
- * keeps Node's default 300 s request deadline — that is the binding limit:
- * a 500 MiB body needs roughly 14 Mbps sustained end to end, and a slower
- * link fails the call (the client-side refusal keeps the connection state)
- * rather than hanging. Raising the cap past what that deadline can carry
- * would only move the failure, so 500 MiB is the honest ceiling for the
- * current transport.
- */
-export declare const MAX_UPLOAD_BYTES: number;
+export { MAX_UPLOAD_BYTES };
 /** The `/api` route the upload channel dispatches into, verbatim from the
  * host's own registration (RT dsh-client-file-upload lib/index.js:73). */
 export declare const UPLOAD_HTTP_PATH = "/api/session/uploadFileBinary";
