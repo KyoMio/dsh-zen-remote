@@ -144,4 +144,4 @@ content-type: application/json; charset=utf-8
 4. **测试**：方法表与目标插件源码集合的对照测试（源码缺失时 skip）、每种定位的改写、响应改写、版本漂移不登记、e2e 至少读写各一条全链路。可插拔的静态扫描与空表回归由 `test/adapters-pluggable.test.cjs` 自动覆盖新适配器。
 5. **文档**：两份 README 的兼容清单、`docs/interface.md`、安全边界（整机数据时写明等于什么权限）同步更新。
 
-路由匹配：协作声明只支持 **exact 路径**；适配器路由额外支持**前缀匹配**（`match: 'prefix'`，会话 id 在路径段时按段定位）。
+路由匹配：2.4 起协作声明与适配器同规则——exact 与 `prefix: true` 前缀都支持，query / 路径段 / JSON 体三种定位两半共用 adapter-core 同一组函数；剩下的真实差别都在适配器一侧：`local: true` 的纯本机路由（声明没有这个字段）、按请求判定的 `deny` 钩子（声明侧是静态 `deny: true` 标记，按「远程上下文」整体拒绝）、`client.request` / `client.response` / `server.request` 三个钩子（声明侧只有 `rewriteIds` 的请求局部改写）、以及多版本 `versions` 清单加 `surfaces` 表（协作声明一次只登记一代）。

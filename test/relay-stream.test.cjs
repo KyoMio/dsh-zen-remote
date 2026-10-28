@@ -880,9 +880,14 @@ test('backpressure: the pump parks on a full socket and resumes in order after d
     gate.finish()
     // Frame 1 exceeds every buffer on the path: its write must return false,
     // the pump must park on drain, and frames 2/3 must stay QUEUED — not
-    // pulled, not buffered line-by-line.
-    await waitFor(() => gate.queued >= 2)
-    await new Promise((resolve) => setTimeout(resolve, 150))
+    // pulled, not buffered line-by-line. The windows carry deliberate slack
+    // (2026-10-28 forensics: this case passes 10/10 in isolation on both the
+    // pre-phase baseline and main, and flakes at the same rate on BOTH when
+    // the whole file runs — baseline 2/6, main 1/6 — so it is whole-file
+    // load sensitivity, not a regression of any change; the widened waits
+    // keep the assertions' semantics untouched).
+    await waitFor(() => gate.queued >= 2, 10_000)
+    await new Promise((resolve) => setTimeout(resolve, 500))
     assert.equal(open.lines.length, 0, 'the paused client has parsed no complete line')
     assert.ok(gate.queued >= 2, `frames 2 and 3 are still queued (got ${gate.queued})`)
 
