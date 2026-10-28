@@ -1,6 +1,6 @@
 /**
  * The dsh-better-sidebar adapter (PB-12), written against EXACTLY
- * versions 0.25.0, 0.26.0, 0.26.1, 0.28.0-alpha.0, 0.28.0 and 0.28.1 (PB-15 widened the list; 0.26.1 is a
+ * versions 0.25.0, 0.26.0, 0.26.1, 0.28.0-alpha.0, 0.28.0, 0.28.1 and 0.28.2 (PB-15 widened the list; 0.26.1 is a
  * perf-only patch with the same wire surface as 0.26.0; 0.26.0 is a JSON-api
  * superset of 0.25.0 — it grows fs.readPage and the sidechat dequeue/model/
  * models methods, and moves fs.write's content onto the new raw-text
@@ -66,7 +66,14 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
   // (paged git-log companion to git.graph — session-scoped read via
   // gitCwdOf, base64url cursor in / commits out, no session ids in the
   // answer; verified against the npm build's lib/index.js:8986).
-  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1'],
+  // 0.28.2 (cold-cwd OOM fix): same routes, WebSockets and JSON-api method
+  // set as 0.28.1 (verified against the npm build's lib/index.js). Only the
+  // backend's cwd resolution changed: a DETACHED session now roots at its
+  // stored header cwd (`sessionPersistence.stat`, header-only) instead of a
+  // full-log `sessionQuery.observeSession`, then the host defaultDirectory,
+  // and only then a client `cwd` hint — so the server hook's cwd stripping
+  // below stays correct (if anything, the client hint matters less).
+  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2'],
   routes: [
     {
       // The JSON API: the method name rides the path tail, the session
