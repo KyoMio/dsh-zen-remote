@@ -192,8 +192,8 @@ export declare function normalizeAdapter(input: unknown, installedVersion: strin
  * different locating rule is a different adapter), hex, first 16 chars.
  * Routes arrive path-sorted, so order never moves the hash. */
 export declare function adapterDigestOf(plugin: string, version: string, routes: NormalizedAdapterRoute[]): string;
-/** The prefix-match rule, shared verbatim by both halves: equality or one
- * path segment deeper, on the RAW undecoded pathname. */
+/** The prefix-match rule, shared verbatim by both halves: equality, or any
+ * deeper sub-path (`startsWith(path + '/')`), on the RAW undecoded pathname. */
 export declare function adapterPathMatches(route: NormalizedAdapterRoute, pathname: string): boolean;
 /** The adapter route a forwarded request hit, or `undefined`. `local`
  * routes never match here — they stay on the sub-client's own machine in
