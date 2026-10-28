@@ -295,7 +295,7 @@ Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_
 
 | Plugin | Adaptation summary | Version tested |
 | --- | --- | --- |
-| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | Full-screen mobile right-sidebar drawer with notch safe-area padding and swipe-back; **Plugin Bridge** built-in adapter for `0.25.0`, `0.26.0`, `0.26.1`, `0.28.0-alpha.0`, and `0.28.0` (reads/writes host file/Git/task panels in remote sessions with host owner consent) | 0.19.1 / adapter 0.25–0.28.0 |
+| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | Full-screen mobile right-sidebar drawer with notch safe-area padding and swipe-back; **Plugin Bridge** built-in adapter for `0.25.0` through `0.28.2` (seven versions) (reads/writes host file/Git/task panels in remote sessions with host owner consent) | 0.19.1 / adapter 0.25–0.28.2 |
 | [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | Repositions AgentTeams floating pill below session header and preserves parent session back-link | 0.1.9 |
 | [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | Moves usage & balance entry into the mobile home chips bar | 0.2.9 |
 | [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | Moves scheduled tasks entry into the mobile home chips bar | 0.2.3 |
