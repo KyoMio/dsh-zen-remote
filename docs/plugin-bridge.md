@@ -91,6 +91,7 @@ content-type: application/json; charset=utf-8
 | `server-changed` | 会话 id 指向另一台服务端（切换服务端后页面未刷新） |
 | `bad-query` | 会话参数重复，或虚拟会话 id 解析失败（浏览器侧缺失 / 为空的请求走本地放行，到不了 503） |
 | `method-not-bridged` | 请求方法不在该路由声明的 `methods` 内（未声明即只转发 GET） |
+| `route-denied` | 路由声明了 `deny: true`：远程会话（或浏览器当前打开的就是远程会话）命中即拒，本机数据不进远程面板；本地会话不受影响 |
 | `not-shared` / `busy` / `plugin-unknown` / `plugin-mismatch` / `route-undeclared` / `loopback-auth` / `internal` | 服务端中继路由的对应拒绝原样透传（会话未共享 / 该设备并发超限 / 服务端无此登记 / 版本或摘要不符 / 路径未声明 / 服务端回环鉴权失败 / 服务端内部错误） |
 
 ## 限制
