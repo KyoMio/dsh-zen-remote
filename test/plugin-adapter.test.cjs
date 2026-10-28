@@ -155,6 +155,38 @@ test('PB-11 core: validation — versions gate, typo guard, local routes stay ou
   assert.equal(mixed.declaration.routes[0].path, '/p/data')
 })
 
+test('PB-23b core: the prefix tail red line — the four illegal shapes refuse on the RAW tail, equality and non-matches stay false', async () => {
+  const core = await importLib('plugin-adapter-core.js')
+  const prefix = core.normalizeAdapter(
+    { plugin: 'p', versions: ['1'], routes: [{ path: '/p/api', match: 'prefix', locator: { in: 'path-segment', index: 0 } }] }, '1',
+  ).routes[0]
+  const exact = core.normalizeAdapter(
+    { plugin: 'p', versions: ['1'], routes: [{ path: '/p/e', match: 'exact', locator: { in: 'query', name: 'sid' } }] }, '1',
+  ).routes[0]
+
+  // The four shapes the declaration red line carries, judged on the tail
+  // the prefix match admits: `?`, `#`, `..` (raw and EVERY `%2e`/`%2E`
+  // encoding — the mixed `.%2e.` decodes to dot-dot, so any encoded dot
+  // refuses), whitespace.
+  const violations = ['/p/api/a?x=1', '/p/api/a#f', '/p/api/../s', '/p/api/%2e%2e/s', '/p/api/%2E%2E/s', '/p/api/.%2e.', '/p/api/a b', '/p/api/a\tb']
+  for (const pathname of violations) assert.equal(core.adapterTailShapeViolation(prefix, pathname), true, pathname)
+
+  // Legal tails: plain segments, dots inside a name (only the `..` pair is
+  // the red line), an encoded space — and the honest boundary of the raw
+  // rule: `%252e%252e` (double-encoded) carries no raw `%2e`, so it passes;
+  // it only becomes dot-dot past a SECOND decode, a host behavior this rule
+  // deliberately does not speculate about (the verdict is byte-law, not
+  // decoder-law).
+  const legal = ['/p/api/open', '/p/api/readme.txt', '/p/api/a%20b', '/p/api/x%252ey', '/p/api', '/p/api/%252e%252e']
+  for (const pathname of legal) assert.equal(core.adapterTailShapeViolation(prefix, pathname), false, pathname)
+
+  // Equality hits and non-matches are not this function's verdict: no tail,
+  // or the caller's routing refusal answers first.
+  assert.equal(core.adapterTailShapeViolation(exact, '/p/e'), false)
+  assert.equal(core.adapterTailShapeViolation(exact, '/p/e/..'), false, 'a non-matching pathname reads no violation')
+  assert.equal(core.adapterTailShapeViolation(prefix, '/p/apix'), false, 'a near-miss reads no violation')
+})
+
 // ---- 2. the client half -------------------------------------------------------
 
 /** The fake host (PB-4's shape): a real http server dispatching through the
@@ -622,6 +654,56 @@ test('PB-11 server: consent off refuses 403; stale (yielded) coordinates refuse 
     assert.equal(stale.status, 409)
     assert.equal((await stale.json()).error.code, 'plugin-mismatch')
     assert.equal(loopbackHits.length, 0, 'nothing reached the loopback')
+  } finally {
+    await server.stop()
+  }
+})
+
+test('PB-23b server: an illegal prefix tail refuses 400 before the loopback; legal tails (plain, dotted, encoded) still forward verbatim', async () => {
+  const core = await importLib('plugin-adapter-core.js')
+  const loopbackHits = []
+  const adapter = core.normalizeAdapter(
+    {
+      plugin: 'some-panel', versions: ['1.2.3'],
+      routes: [{ path: '/some-panel/api', match: 'prefix', methods: ['GET'], locator: { in: 'path-segment', index: 0 } }],
+    }, '1.2.3',
+  )
+  const server = await startServerSide({ adapter, shared: ['session-a', 'a b', 'readme.txt'], loopbackHits })
+  try {
+    // The four illegal tail shapes — each answers 400 `bad-request` and the
+    // recording loopback stays at zero: the tail never rides into a request
+    // line.
+    const illegal = [
+      '/some-panel/api/session-a?x=1',
+      '/some-panel/api/session-a#frag',
+      '/some-panel/api/../secret',
+      '/some-panel/api/%2e%2e/secret',
+      '/some-panel/api/a b',
+    ]
+    for (const path of illegal) {
+      const res = await server.pluginPost(path, '')
+      assert.equal(res.status, 400, `${path}: status`)
+      assert.deepEqual(await res.json(), { ok: false, error: { code: 'bad-request' } }, `${path}: body`)
+      assert.equal(res.headers.get('x-zen-remote-error'), 'bad-request', `${path}: marker header`)
+      assert.equal(loopbackHits.length, 0, `${path}: the loopback saw nothing`)
+    }
+
+    // The red line sits AFTER the coordinate check: stale coordinates keep
+    // their 409 even with an illegal tail.
+    const stale = await server.pluginPost('/some-panel/api/..%2fsecret', '', { digest: 'deadbeefdeadbeef' })
+    assert.equal(stale.status, 409)
+    assert.equal((await stale.json()).error.code, 'plugin-mismatch')
+
+    // Legal tails keep forwarding VERBATIM (the loopback fake records the
+    // path it received): a plain segment, dots inside a name, and an encoded
+    // space — the encoding the red line does NOT refuse (no `%2e` inside).
+    for (const [path, id] of [['/some-panel/api/session-a', 'session-a'], ['/some-panel/api/readme.txt', 'readme.txt'], ['/some-panel/api/a%20b', 'a b']]) {
+      const ok = await server.pluginPost(path, '', { method: 'GET' })
+      assert.equal(ok.status, 200, `${path}: status`)
+      await ok.text()
+      assert.equal(loopbackHits.at(-1).path, path, `${path}: the loopback received the tail verbatim`)
+    }
+    assert.equal(loopbackHits.length, 3, 'exactly the three legal requests moved')
   } finally {
     await server.stop()
   }

@@ -52,7 +52,7 @@ import { isLoopbackAuthError } from './plugin-loopback.js'
 import { INVOKE_BINARY_RESULT_METHODS, markInvokeBinary } from './invoke-binary.js'
 import { MAX_INVOKE_BODY_BYTES, MAX_UPLOAD_BYTES } from './upload-limits.js'
 import type { NormalizedAdapter, AdapterVerdict } from './plugin-adapter-core.js'
-import { matchAdapterRoute, locateAdapterIds, adapterOwnsRegistryEntry, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
+import { matchAdapterRoute, adapterTailShapeViolation, locateAdapterIds, adapterOwnsRegistryEntry, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
 
 /**
  * Registration prefix on the host webServer. Deliberately WITHOUT the
@@ -1599,6 +1599,15 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           // adapter's registered pair.
           if (pluginVersion !== adapter.declaration.version || pluginDigest !== adapter.digest) {
             relayPluginError(res, 409, 'plugin-mismatch')
+            return
+          }
+          // PB-23b: the prefix tail's shape red line — the SAME shared rule
+          // the cooperative chain applies inside validatePluginCall (400
+          // `bad-request`), so an illegal tail (`?`, `#`, `..` in any
+          // encoding, whitespace) never reaches the loopback through either
+          // half.
+          if (adapterTailShapeViolation(adapterRoute, routePath)) {
+            relayPluginError(res, 400, 'bad-request')
             return
           }
           // Whole-machine data by definition: the live consent wall, the
