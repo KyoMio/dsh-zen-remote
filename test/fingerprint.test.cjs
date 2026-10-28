@@ -313,11 +313,16 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     '0.2.1-rc.3': 'r:8e0209aa5eb8',
     // 0.2.1-rc.4: typert.remote-client.js byte-identical to rc.3.
     '0.2.1-rc.4': 'r:8e0209aa5eb8',
+    // 0.2.2-alpha.2: six new endpoints (session/events, observeEvent,
+    // observeProjections, observeState, state, wait), 21 → 27; the 21 existing
+    // ones keep their ids. Mixed 0.2.1/0.2.2 pairs report `session` as different.
+    '0.2.2-alpha.2': 'r:6763de393b71',
   }
+  const ENDPOINTS = { '0.2.2-alpha.2': 27 }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
   const remote = await import('../node_modules/@deepseek-ai/dsh-api-session-controller/lib/typert.remote-client.js')
-  assert.equal(remote.default.descriptors.length, 21)
+  assert.equal(remote.default.descriptors.length, ENDPOINTS[version] ?? 21)
   const fingerprints = await computeFingerprints(fakeCtx({ local: { list: () => remote.default.descriptors } }), { anchors: [] })
   assert.equal(fingerprints.session, PINS[version])
 })
