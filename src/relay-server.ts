@@ -1883,15 +1883,22 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         async (maxBody) => {
           const chunks: Buffer[] = []
           let size = 0
-          for await (const chunk of req) {
-            size += (chunk as Buffer).length
-            if (size > maxBody) return { kind: 'over' as const }
-            chunks.push(Buffer.from(chunk as Uint8Array))
+          try {
+            for await (const chunk of req) {
+              size += (chunk as Buffer).length
+              if (size > maxBody) return { kind: 'over' as const }
+              chunks.push(Buffer.from(chunk as Uint8Array))
+            }
+          } catch {
+            // A read error (the client hung up mid-body) folds into the
+            // corrupt verdict — readJsonObject's `error` fold — never a
+            // throw into the host webserver's outer catch.
+            return { kind: 'corrupt' as const }
           }
           const buffered = Buffer.concat(chunks)
-          if (buffered.length === 0) return { kind: 'body' as const, buffered, given: false }
+          if (buffered.length === 0) return { kind: 'body' as const, buffered }
           try {
-            return { kind: 'body' as const, buffered, given: true, parsed: JSON.parse(buffered.toString('utf8')) }
+            return { kind: 'body' as const, buffered, parsed: JSON.parse(buffered.toString('utf8')) }
           } catch {
             return { kind: 'corrupt' as const }
           }

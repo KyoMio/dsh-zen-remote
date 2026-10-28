@@ -22,6 +22,7 @@ const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
 const { createBridgeRegistry, normalizeDeclaration } = require('../lib/plugin-bridge.js')
 const { createPluginLoopback } = require('../lib/plugin-loopback.js')
+const { createPluginTunnel } = require('../lib/plugin-tunnel.js')
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-plugin-relay-'))
 process.on('exit', () => { try { fs.rmSync(ROOT, { recursive: true, force: true }) } catch { /* best effort */ } })
@@ -110,7 +111,7 @@ function startFakePluginServer() {
  * DECLARATION_INPUT, a consent map the test can flip live, and a loopback
  * over the fake plugin server. `overrides` re-shapes the wiring per test.
  */
-async function makeWiring(name, { consent = {}, registryOverride, getTokenUrl, getTarget, omitBridge } = {}) {
+async function makeWiring(name, { consent = {}, registryOverride, getTokenUrl, getTarget, omitBridge, withTunnel } = {}) {
   const home = path.join(ROOT, name)
   fs.mkdirSync(home, { recursive: true })
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
@@ -119,6 +120,10 @@ async function makeWiring(name, { consent = {}, registryOverride, getTokenUrl, g
   const registry = registryOverride ?? createBridgeRegistry()
   if (registryOverride === undefined) registry.register(DECLARATION_INPUT)
   const consentBox = { map: consent }
+  const loopback = createPluginLoopback({
+    getTarget: getTarget ?? pluginServer.target,
+    getTokenUrl: getTokenUrl ?? pluginServer.tokenUrl,
+  })
   const handler = createRelayHandler({
     secret: SECRET,
     store,
@@ -128,10 +133,18 @@ async function makeWiring(name, { consent = {}, registryOverride, getTokenUrl, g
       pluginBridge: {
         registry,
         getConsent: () => consentBox.map,
-        loopback: createPluginLoopback({
-          getTarget: getTarget ?? pluginServer.target,
-          getTokenUrl: getTokenUrl ?? pluginServer.tokenUrl,
-        }),
+        loopback,
+        // PB-24: the byte tunnel's server half, for the open-route refusals.
+        // The validation chain answers before any dial, so the target (the
+        // fake plugin server) is only ever a shape for the wiring.
+        ...(withTunnel ? {
+          tunnel: createPluginTunnel({
+            bridge: { registry, getConsent: () => consentBox.map, loopback },
+            getTarget: getTarget ?? pluginServer.target,
+            isAccessible: (sessionId) => store.isAccessible(sessionId, () => undefined),
+            heartbeatMs: 15_000,
+          }),
+        } : {}),
       },
     }),
   })
@@ -357,6 +370,79 @@ test('PB-23b: an illegal prefix tail refuses 400 bad-request before the loopback
     assert.equal(encoded.status, 200)
     await encoded.text()
     assert.equal(wiring.pluginServer.state.requests.at(-1).url, '/p/files/a%20b?sessionId=session-shared', 'the encoded tail rode verbatim')
+  } finally { await wiring.stop() }
+})
+
+// ---- PB-24: declaration-v2 locator refusals ------------------------------------
+
+test("PB-24: the v2 locator's server-side walls each refuse before the loopback — the tunnel open included", async () => {
+  const wiring = await makeWiring('v2-refusals', { registryOverride: createBridgeRegistry(), withTunnel: true })
+  try {
+    const V2_DECL = {
+      plugin: 'test-panel',
+      version: '1.0.0',
+      routes: [
+        // Two body fields: the share wall checks EVERY hit, not just the
+        // first. POST-declared: a body only rides a write method.
+        { path: '/notes/body', scope: 'session', methods: ['POST'], locator: { in: 'json-body', fields: ['sessionId', 'teamId'] } },
+        // A small maxBody so the over-limit wall is one cheap request.
+        { path: '/notes/capped', scope: 'session', methods: ['POST'], maxBody: 64, locator: { in: 'json-body', fields: ['sessionId'] } },
+        // Declared for the byte tunnel yet body-locating: the open carries
+        // no body reader, so this route can never be validated.
+        { path: '/notes/live', scope: 'session', upgrade: true, locator: { in: 'json-body', fields: ['sessionId'] } },
+      ],
+    }
+    const v2Digest = normalizeDeclaration(V2_DECL).digest
+    wiring.registry.register(V2_DECL)
+
+    const cases = [
+      // Two located ids, one shared one not: every hit is share-checked.
+      ['not-shared', 403, { zrPath: '/notes/body', body: '{"sessionId":"session-shared","teamId":"session-secret"}', headers: { 'x-zr-method': 'POST' } }],
+      // A real shared id next to a zr~ virtual id: the virtual half is not
+      // in the share table — a hand-crafted mix cannot ride a shared
+      // neighbor in.
+      ['not-shared', 403, { zrPath: '/notes/body', body: '{"sessionId":"session-shared","teamId":"zr~srv~abc123"}', headers: { 'x-zr-method': 'POST' } }],
+      // A body past the route's maxBody: the reader stops mid-stream, 413.
+      ['body-too-large', 413, { zrPath: '/notes/capped', body: `{"sessionId":"session-shared","pad":"${'x'.repeat(64)}"}`, headers: { 'x-zr-method': 'POST' } }],
+      // An unparsable body: the reader folds it corrupt, the chain answers
+      // the query-convention code bad-query.
+      ['bad-query', 400, { zrPath: '/notes/body', body: '{"sessionId":"session-shared"', headers: { 'x-zr-method': 'POST' } }],
+      // An empty body locates nothing — the query's sessionId (the 2.1
+      // convention, still pluginFetch's default) cannot satisfy a json-body
+      // route.
+      ['bad-request', 400, { zrPath: '/notes/body', body: '', headers: { 'x-zr-method': 'POST' } }],
+      // A body without any declared field locates nothing either.
+      ['bad-request', 400, { zrPath: '/notes/body', body: '{"other":"x"}', headers: { 'x-zr-method': 'POST' } }],
+    ]
+    for (const [code, status, overrides] of cases) {
+      const before = wiring.pluginServer.state.requests.length
+      const res = await wiring.pluginFetch(ROUTE, { digest: v2Digest, ...overrides })
+      assert.equal(res.status, status, `${code}: status`)
+      assert.deepEqual(await res.json(), { ok: false, error: { code } }, `${code}: body`)
+      assert.equal(res.headers.get('x-zen-remote-error'), code, `${code}: marker header`)
+      assert.equal(wiring.pluginServer.state.requests.length, before, `${code}: the plugin saw nothing`)
+    }
+
+    // The tunnel open passes no body reader (an open request is empty-bodied
+    // by contract): a body-locating route refuses inside the shared chain —
+    // even one declared upgrade: true — before the upgrade check is reached.
+    const beforeOpen = wiring.pluginServer.state.requests.length
+    const open = await fetch(`http://127.0.0.1:${wiring._port}/_dsh/zen-remote/relay/v1/plugin-tunnel/open`, {
+      method: 'POST',
+      headers: {
+        ...AUTH,
+        'x-zr-plugin': 'test-panel',
+        'x-zr-plugin-version': '1.0.0',
+        'x-zr-plugin-digest': v2Digest,
+        'x-zr-path': '/notes/live',
+        'x-zr-query': '',
+      },
+      body: JSON.stringify({ headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' } }),
+    })
+    assert.equal(open.status, 400)
+    assert.deepEqual(await open.json(), { ok: false, error: { code: 'bad-request' } })
+    assert.equal(open.headers.get('x-zen-remote-error'), 'bad-request')
+    assert.equal(wiring.pluginServer.state.requests.length, beforeOpen, 'the open dialed nothing')
   } finally { await wiring.stop() }
 })
 

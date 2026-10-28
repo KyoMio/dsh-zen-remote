@@ -53,7 +53,6 @@ export type PluginCallValidation = {
 export type PluginCallBodyReader = (maxBody: number) => Promise<{
     kind: 'body';
     buffered: Buffer;
-    given: boolean;
     parsed?: unknown;
 } | {
     kind: 'over';
