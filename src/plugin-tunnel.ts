@@ -50,7 +50,7 @@ export type PluginCallValidation =
  * the reader entirely (an open request is empty-bodied by contract, so a
  * body-locating upgrade route can never be validated and refuses). */
 export type PluginCallBodyReader = (maxBody: number) => Promise<
-  | { kind: 'body'; buffered: Buffer; given: boolean; parsed?: unknown }
+  | { kind: 'body'; buffered: Buffer; parsed?: unknown }
   | { kind: 'over' }
   | { kind: 'corrupt' }
 >
