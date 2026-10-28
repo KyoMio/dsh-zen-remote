@@ -3,8 +3,8 @@
  * 用户硬要求：适配器整块移除后不影响其他功能。三项检查钉住它：
  *  ① 以空适配器数组跑一遍插件桥协作全链路——核心转发一个字节都不差；
  *  ② 静态扫描 src 下的全部 ts：`src/adapters/` 之外只有接线文件（src/index.ts）
- *     import `./adapters/index`，且没有任何文件 import 适配器子目录——
- *     删目录的爆炸半径被钉在接线的一行 import 上；
+ *     import `./adapters/index`，且适配器子目录也只有接线文件可以 import（PB-19 起，包括 better-sidebar 的纯函数 surface 抽取器）——
+ *     删目录的爆炸半径被钉在接线这一个文件的 import 上；
  *  ③ ADAPTERS 里每个适配器形状合法（versions 非空、路由可规范化）。
  */
 'use strict'
@@ -54,6 +54,12 @@ function scanAdapterImports() {
         // adapters/.
         if (file.startsWith('adapters/')) continue
         subdirImporters.push(`${file} -> ${spec} (types must only be imported from inside adapters/)`)
+      } else if (file === 'index.ts') {
+        // The wiring may import adapter subdirectory PURE utilities too
+        // (PB-19: the better-sidebar surface extractor feeds the surfaces
+        // whitelist) — still inside the ONE file whose breakage is the whole
+        // delete blast radius.
+        continue
       } else subdirImporters.push(`${file} -> ${spec} (adapter subdirectories are importable from nowhere)`)
     }
   }

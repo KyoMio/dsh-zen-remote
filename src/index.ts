@@ -16,6 +16,7 @@
  */
 
 import { createOwnerPeerSource, createSharedApiFetchGetter } from './owner-peer.js'
+import { readFileSync } from 'node:fs'
 import { lstat, mkdir, open, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -65,6 +66,12 @@ import type { PluginRouteInterceptDiagnostics, PluginRouteInterceptHandle, WebSe
 import { normalizeAdapter, adapterOwnsRegistryEntry } from './plugin-adapter-core.js'
 import type { NormalizedAdapter } from './plugin-adapter-core.js'
 import { ADAPTERS } from './adapters/index.js'
+// PB-19: the better-sidebar surface extractor, a PURE utility inside the
+// adapters directory — the one subdirectory import the wiring makes besides
+// the ADAPTERS array (test/adapters-pluggable.test.cjs pins both to this
+// file). The fs read that feeds it also lives HERE: nothing inside
+// src/adapters/ touches the disk.
+import { betterSidebarSurfaceDigest, extractBetterSidebarSurface, surfaceLooksHealthy } from './adapters/dsh-better-sidebar/surface.js'
 import { createRelayHandler, loadServerId, RELAY_PREFIX, resolveDshVersion } from './relay-server.js'
 import type { RelayGateway, RelayHandler } from './relay-server.js'
 import { createBridgeRegistry, compareBridges } from './plugin-bridge.js'
@@ -592,12 +599,18 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // (`packageOf(name, ctx.baseUrl)` — verified on 0.2.0-rc.2 to answer
   // `{name, version, dir, …}` or undefined; any other shape, a missing
   // service or a probe failure reads as "not installed" and the adapter
-  // stays out). A plugin that registers its OWN cooperative declaration
-  // always wins: the adapter yields at registration time (logged), and the
-  // runtime re-checks the registry digest on every request. Both roles run
-  // this loop — the registry entries drive the handshake table, the bridge
-  // verdicts and the settings listing on either side, while the returned
-  // array feeds the two request halves.
+  // stays out). PB-19 exception: a version OUTSIDE the list still registers
+  // when the installed build's wire-surface digest (extracted here from its
+  // lib/index.js, the wiring being the only place the feature touches the
+  // disk) is whitelisted in the adapter's `surfaces` table — a wire-identical
+  // patch release bridges without a zen-remote release, and every failure of
+  // the extraction is logged apart from the digest-mismatch refusal. A plugin
+  // that registers its OWN cooperative declaration always wins: the adapter
+  // yields at registration time (logged), and the runtime re-checks the
+  // registry digest on every request. Both roles run this loop — the registry
+  // entries drive the handshake table, the bridge verdicts and the settings
+  // listing on either side, while the returned array feeds the two request
+  // halves.
   const adapters: NormalizedAdapter[] = []
   {
     const adapterWarn = (text: string): void => { ctx.logger?.warn('dsh-zen-remote adapter: %s', text) }
@@ -605,7 +618,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       try {
         const holder = ctx as unknown as { get?: (name: string) => unknown; baseUrl?: string }
         const packages = holder.get?.('pluginPackages') as { packageOf?: (specifier: string, parentURL: string) => unknown } | undefined
-        const found = packages?.packageOf?.(adapter.plugin, holder.baseUrl ?? '') as { version?: unknown } | undefined
+        const found = packages?.packageOf?.(adapter.plugin, holder.baseUrl ?? '') as { version?: unknown; dir?: unknown } | undefined
         const installedVersion = found !== null && typeof found === 'object' && typeof (found as { version?: unknown }).version === 'string'
           ? (found as { version: string }).version
           : undefined
@@ -613,14 +626,44 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           adapterWarn(`${adapter.plugin}: target package (or its version) not found; not registered`)
           continue
         }
-        const normalized = normalizeAdapter(adapter, installedVersion)
+        // PB-19: a version outside the adapter's list gets ONE more chance —
+        // its wire surface. Extract it, hash it, and let normalizeAdapter
+        // judge the digest against the adapter's `surfaces` table. Anything
+        // that goes wrong here leaves the digest undefined — the core then
+        // refuses as a plain unlisted version, and the warns below name WHY
+        // no digest was offered (no dir, unreadable file, lost dispatch
+        // table), distinct from a digest that simply missed.
+        const unlisted = !adapter.versions.includes(installedVersion)
+        let surfaceDigest: string | undefined
+        if (unlisted) {
+          const dir = typeof found?.dir === 'string' && found.dir !== '' ? found.dir : undefined
+          if (dir === undefined) {
+            adapterWarn(`${adapter.plugin}: version ${installedVersion} is unlisted and packageOf gave no dir; no surface digest to offer`)
+          } else {
+            try {
+              const surface = extractBetterSidebarSurface(readFileSync(join(dir, 'lib/index.js'), 'utf8'))
+              if (!surfaceLooksHealthy(surface)) {
+                adapterWarn(`${adapter.plugin}: surface extractor lost the dispatch table (${surface.methods.length} methods) — treating as unknown surface`)
+              } else {
+                surfaceDigest = betterSidebarSurfaceDigest(surface)
+              }
+            } catch (error) {
+              adapterWarn(`${adapter.plugin}: cannot read ${join(dir, 'lib/index.js')} for a surface digest: ${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+        }
+        const normalized = normalizeAdapter(adapter, installedVersion, surfaceDigest === undefined ? undefined : { surfaceDigest })
         if (registry.get(normalized.plugin) !== undefined) {
           adapterWarn(`${normalized.plugin}: the plugin registers its own bridge declaration; the adapter yields`)
           continue
         }
         registry.registerNormalized(normalized.declaration)
         adapters.push(normalized)
-        ctx.logger?.info('dsh-zen-remote adapter: %s adapted at version %s', normalized.plugin, installedVersion)
+        if (unlisted && surfaceDigest !== undefined) {
+          ctx.logger?.info('dsh-zen-remote adapter: %s bridged by surface digest %s (version %s unlisted)', normalized.plugin, surfaceDigest, installedVersion)
+        } else {
+          ctx.logger?.info('dsh-zen-remote adapter: %s adapted at version %s', normalized.plugin, installedVersion)
+        }
       } catch (error) {
         adapterWarn(`${adapter.plugin} refused: ${error instanceof Error ? error.message : String(error)}`)
       }
