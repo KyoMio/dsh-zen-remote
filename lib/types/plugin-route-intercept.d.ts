@@ -17,6 +17,17 @@
  * Everything else — undeclared routes, local sessions — flows to the
  * original route untouched.
  *
+ * PB-22 gives the two remaining declaration-v2 flags their client meaning:
+ * a `deny: true` route answers the uniform 503 with reason `route-denied`
+ * whenever a REMOTE context touches it — the request locating a virtual id,
+ * or the browser's CURRENT session being one (T62's signal) — while a local
+ * session passes through exactly as before; a `rewriteIds: true` route's
+ * JSON answer is buffered (the 8 MB adapter cap) and deep-scanned, every
+ * string EXACTLY equal to one of the request's own real session ids
+ * rewritten to its virtual form (`zr~` carries the real id inside, so the
+ * request's own hits ARE the read-only mapping — no table is consulted or
+ * written), unknown strings passing through untouched.
+ *
  * The un-bridged refusals answer a UNIFORM 503 shape (header
  * `x-zen-remote: unbridged`, JSON body naming the reason) — and, decisive
  * for the security posture, they answer WITHOUT the local plugin handler
@@ -103,8 +114,9 @@ export interface InstallPluginRouteInterceptOptions {
      * read live per call). A VIRTUAL id means a remote session's panel is
      * the request's origin — the signal an adapter route's `deny` hook uses
      * to refuse requests (like better-sidebar's `open.external`) that carry
-     * no session field of their own. Absent → deny hooks see `undefined`
-     * and judge conservatively. */
+     * no session field of their own, and (PB-22) the same-origin wall a
+     * cooperative route's `deny: true` raises. Absent → deny judges
+     * conservatively (only the request's own ids speak). */
     getCurrentSession?: () => string | undefined;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;

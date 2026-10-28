@@ -17,6 +17,17 @@
  * Everything else — undeclared routes, local sessions — flows to the
  * original route untouched.
  *
+ * PB-22 gives the two remaining declaration-v2 flags their client meaning:
+ * a `deny: true` route answers the uniform 503 with reason `route-denied`
+ * whenever a REMOTE context touches it — the request locating a virtual id,
+ * or the browser's CURRENT session being one (T62's signal) — while a local
+ * session passes through exactly as before; a `rewriteIds: true` route's
+ * JSON answer is buffered (the 8 MB adapter cap) and deep-scanned, every
+ * string EXACTLY equal to one of the request's own real session ids
+ * rewritten to its virtual form (`zr~` carries the real id inside, so the
+ * request's own hits ARE the read-only mapping — no table is consulted or
+ * written), unknown strings passing through untouched.
+ *
  * The un-bridged refusals answer a UNIFORM 503 shape (header
  * `x-zen-remote: unbridged`, JSON body naming the reason) — and, decisive
  * for the security posture, they answer WITHOUT the local plugin handler
@@ -32,7 +43,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { BridgeLocator, BridgeRegistry, BridgeStatus, NormalizedBridgeRoute } from './plugin-bridge.js'
-import { routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeUpgradesOf } from './plugin-bridge.js'
+import { routeDeniesRemoteOf, routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeRewritesIdsOf, routeUpgradesOf } from './plugin-bridge.js'
 import { PassThrough, Readable, Transform } from 'node:stream'
 import type { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
@@ -50,6 +61,127 @@ export type WebServerShapeCheck = { ok: true } | { ok: false; reasons: string[] 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** PB-22: the rewriteIds deep scan — every string in the parsed JSON that is
+ * EXACTLY a key of `known` becomes its virtual form; everything else passes
+ * through untouched. The mapping's membership is the ONLY rewrite trigger —
+ * no shape guessing (a session-id-LOOKING string the request never carried
+ * is not ours to rewrite), and object KEYS are left alone: the scan walks
+ * object values, array items and bare strings, exactly the positions a
+ * response can hand an id back to the browser in. Containers are rebuilt
+ * unconditionally, which keeps the rule obvious at the cost of allocations
+ * bounded by the 8 MB buffer cap. */
+function deepRewriteIds(value: unknown, known: ReadonlyMap<string, string>): unknown {
+  if (typeof value === 'string') return known.get(value) ?? value
+  if (Array.isArray(value)) return value.map((item) => deepRewriteIds(item, known))
+  if (isRecord(value)) {
+    const out: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(value)) out[key] = deepRewriteIds(item, known)
+    return out
+  }
+  return value
+}
+
+/** Pump a response body reader into the browser response with real
+ * backpressure — the one discipline every verbatim passthrough runs. The
+ * `close` listener settles the wait when the browser vanishes mid-body (a
+ * lost drain event would otherwise hang the write loop). */
+async function pumpResponse(
+  res: ServerResponse,
+  reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> },
+): Promise<void> {
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!res.write(value)) {
+      await new Promise<void>((resolve) => {
+        const settled = (): void => {
+          res.off('drain', settled)
+          res.off('close', settled)
+          resolve()
+        }
+        res.once('drain', settled)
+        res.once('close', settled)
+      })
+    }
+  }
+}
+
+/** PB-22: a rewriteIds route's JSON answer — buffered whole (the 8 MB
+ * adapter cap), deep-scanned with the request's own real→virtual mapping,
+ * re-serialized with a corrected content-length. Past the cap, a non-JSON
+ * content type, or a parse failure the answer passes through untouched (the
+ * adapter discipline): a rewrite is strictly better-than-nothing, never a
+ * reason to mangle or refuse an answer. The caller has already handled the
+ * relay's refusal marker — this owns the entire normal answer. */
+async function answerRewriteIds(
+  res: ServerResponse,
+  response: Response,
+  known: ReadonlyMap<string, string>,
+): Promise<void> {
+  const contentType = response.headers.get('content-type')
+  const verbatimHeaders = {
+    ...(contentType !== null ? { 'content-type': contentType } : {}),
+    ...(response.headers.get('content-length') !== null ? { 'content-length': response.headers.get('content-length')! } : {}),
+    ...(response.headers.get('cache-control') !== null ? { 'cache-control': response.headers.get('cache-control')! } : {}),
+  }
+  const reader = response.body?.getReader()
+  if (reader === undefined || contentType === null || !contentType.includes('application/json')) {
+    res.writeHead(response.status, verbatimHeaders)
+    if (reader !== undefined) await pumpResponse(res, reader)
+    res.end()
+    return
+  }
+  const chunks: Buffer[] = []
+  let size = 0
+  let overflow = false
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    size += value.length
+    // The over-cap chunk ITSELF is body content — it lands in the
+    // passthrough buffer too; only the REWRITE is cancelled.
+    chunks.push(Buffer.from(value))
+    if (size > MAX_ADAPTER_RESPONSE_BUFFER_BYTES) {
+      overflow = true
+      break
+    }
+  }
+  if (overflow) {
+    res.writeHead(response.status, verbatimHeaders)
+    for (const chunk of chunks) {
+      if (!res.write(chunk)) {
+        await new Promise<void>((resolve) => {
+          const settled = (): void => {
+            res.off('drain', settled)
+            res.off('close', settled)
+            resolve()
+          }
+          res.once('drain', settled)
+          res.once('close', settled)
+        })
+      }
+    }
+    await pumpResponse(res, reader)
+    res.end()
+    return
+  }
+  const text = Buffer.concat(chunks).toString('utf8')
+  let outBody: Buffer
+  try {
+    outBody = Buffer.from(JSON.stringify(deepRewriteIds(JSON.parse(text), known)), 'utf8')
+  } catch {
+    // Not JSON after all (or the scan hit something unserializable): the
+    // original bytes pass through, length recomputed for the corrected
+    // header set.
+    outBody = Buffer.from(text, 'utf8')
+    res.writeHead(response.status, { ...verbatimHeaders, 'content-length': String(outBody.length) })
+    res.end(outBody)
+    return
+  }
+  res.writeHead(response.status, { ...verbatimHeaders, 'content-length': String(outBody.length) })
+  res.end(outBody)
 }
 
 /** Pure inspection of the RAW webServer instance — nothing is mutated, so a
@@ -123,8 +255,9 @@ export interface InstallPluginRouteInterceptOptions {
    * read live per call). A VIRTUAL id means a remote session's panel is
    * the request's origin — the signal an adapter route's `deny` hook uses
    * to refuse requests (like better-sidebar's `open.external`) that carry
-   * no session field of their own. Absent → deny hooks see `undefined`
-   * and judge conservatively. */
+   * no session field of their own, and (PB-22) the same-origin wall a
+   * cooperative route's `deny: true` raises. Absent → deny judges
+   * conservatively (only the request's own ids speak). */
   getCurrentSession?: () => string | undefined
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
@@ -161,6 +294,14 @@ interface DeclaredHit {
   methods: string[]
   /** The EFFECTIVE body cap (PB-9), in bytes. */
   maxBody: number
+  /** PB-22: the route refuses a REMOTE context outright (`deny: true` —
+   * local-only data): the surrogate answers `route-denied` instead of
+   * forwarding or passing through whenever the request carries a virtual id
+   * or the browser's current session is one. */
+  deny: boolean
+  /** PB-22: the route's JSON answers are deep-scanned for the request's own
+   * real session ids and re-serialized with their virtual forms. */
+  rewriteIds: boolean
   /** The same effective values folded into the adapter-core route shape —
    * the object locate/classify/rewrite consume (PB-21, see
    * {@link bridgeRouteAsAdapterRoute}). */
@@ -172,8 +313,9 @@ interface DeclaredHit {
  * classify → rewrite functions the adapters run — never a second copy of
  * those rules — so the cooperative route is handed to them as the
  * NormalizedAdapterRoute those functions consume. Every field comes from a
- * plugin-bridge effective reader; `deny` stays unset until PB-22 gives it
- * a cooperative meaning. */
+ * plugin-bridge effective reader; `deny` stays unset — the cooperative
+ * `deny: true` flag is a static declaration, not an adapter-style hook, so
+ * the surrogate halves judge it themselves (PB-22). */
 function bridgeRouteAsAdapterRoute(route: NormalizedBridgeRoute): NormalizedAdapterRoute {
   return {
     path: route.path,
@@ -302,6 +444,8 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           prefix: routePrefixOf(route),
           methods: routeMethodsOf(route),
           maxBody: routeMaxBodyOf(route),
+          deny: routeDeniesRemoteOf(route),
+          rewriteIds: routeRewritesIdsOf(route),
           view,
         }
       }
@@ -361,6 +505,20 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         return
       }
       const value = values.length === 1 ? values[0] : undefined
+      // PB-22: a `deny: true` route refuses a REMOTE context outright — the
+      // request locating a virtual id, or the browser's CURRENT session
+      // being one (T62's signal; requests like open.external carry no id of
+      // their own). The uniform 503 with the route's own reason: the local
+      // handler is never reached, and the forward path below is unreachable
+      // for this route. A local session's request without a virtual id falls
+      // through — `deny` must not touch local behavior.
+      if (declared.deny) {
+        const current = getCurrentSession?.()
+        if ((current !== undefined && isVirtual(current)) || (value !== undefined && value.startsWith('zr~'))) {
+          answerUnbridged(res, declared.plugin, 'route-denied')
+          return
+        }
+      }
       // A LOCAL id (or none at all): the original route's business — its
       // handler runs exactly as if we were never here.
       if (value === undefined || value === '' || !value.startsWith('zr~')) {
@@ -412,6 +570,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       // The session id rides the CHECKED parse, restored to its ORIGINAL
       // form, re-serialized once — what was judged is what is forwarded.
       searchParams.set(declared.locator.name, parts.id)
+      // PB-22: the request's own real→virtual pair — the READ-ONLY mapping a
+      // rewriteIds route's answer scan consults (`zr~` carries the real id
+      // inside, so the ids this very request named are exactly the ones the
+      // answer may hand back; nothing outside this exchange is read, and
+      // nothing here writes any session table).
+      const idMapping: ReadonlyMap<string, string> = new Map([[parts.id, value]])
       const controller = new AbortController()
       // The counting gate's failure has its OWN abort signal (PB-9-fix, the
       // mirror of the relay route's bodyGateError): tripping the gate is a
@@ -489,6 +653,13 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           answerUnbridged(res, declared.plugin, refusal)
           return
         }
+        // PB-22: a rewriteIds route's answer is buffered and deep-scanned
+        // (the ids this request named come back virtual); everything else —
+        // non-JSON answers included — streams verbatim.
+        if (declared.rewriteIds) {
+          await answerRewriteIds(res, response, idMapping)
+          return
+        }
         const contentType = response.headers.get('content-type')
         const contentLength = response.headers.get('content-length')
         const cacheControl = response.headers.get('cache-control')
@@ -500,23 +671,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // Stream the body through with real backpressure; a mid-stream
         // failure with headers already out can only cut the response.
         const reader = response.body?.getReader()
-        if (reader !== undefined) {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            if (!res.write(value)) {
-              await new Promise<void>((resolve) => {
-                const settled = (): void => {
-                  res.off('drain', settled)
-                  res.off('close', settled)
-                  resolve()
-                }
-                res.once('drain', settled)
-                res.once('close', settled)
-              })
-            }
-          }
-        }
+        if (reader !== undefined) await pumpResponse(res, reader)
         res.end()
       } catch (error) {
         // The gate's local flag FIRST (PB-9-fix): the counting gate tripped
@@ -606,6 +761,17 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const method = req.method ?? 'GET'
         const hasBody = method !== 'GET' && method !== 'HEAD'
 
+        // PB-22: the deny wall's current-session half — a remote panel is
+        // the request's origin even when it carries no id of its own
+        // (open.external's shape). Refused before any body byte is read.
+        if (declared.deny) {
+          const current = getCurrentSession?.()
+          if (current !== undefined && isVirtual(current)) {
+            answerUnbridged(res, plugin, 'route-denied')
+            return
+          }
+        }
+
         // A json-body route buffers the request body up front, bounded by
         // the route's own maxBody — the cooperative 413 shape, answered
         // locally, the plugin never reached. A path-segment route's body is
@@ -664,6 +830,14 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           }
           throw error
         }
+        // PB-22: the deny wall's request half — the locate found a virtual
+        // id (a remote verdict, or a mixed one: that too means a virtual id
+        // sat in the request). This route never serves a remote context, so
+        // the answer is the route's own refusal, not the mixed shape.
+        if (declared.deny && verdict.kind !== 'local') {
+          answerUnbridged(res, plugin, 'route-denied')
+          return
+        }
         if (verdict.kind === 'local') {
           await passthrough(bufferedBody)
           return
@@ -679,6 +853,13 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           return
         }
         const serverId = getServerId()
+        // PB-22: the request's own real→virtual pairs, collected while the
+        // wall validates each hit — the READ-ONLY mapping a rewriteIds
+        // route's answer scan consults (`zr~` carries the real id inside, so
+        // the ids this very request named are exactly the ones the answer
+        // may hand back; nothing outside this exchange is read, and nothing
+        // here writes any session table).
+        const idMapping = new Map<string, string>()
         for (const idHit of verdict.hits) {
           const parts = fromVirtual(idHit.value)
           if (parts === undefined || parts.id === '') {
@@ -689,6 +870,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             answerUnbridged(res, plugin, 'server-changed')
             return
           }
+          idMapping.set(parts.id, idHit.value)
         }
         // The bridge verdicts judged from the SAME live table the query
         // half reads.
@@ -770,11 +952,15 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         )
         // Down from here the query half's response discipline verbatim: the
         // relay refusal marker, the three cooperative headers, the pump
-        // with real backpressure.
+        // with real backpressure — plus (PB-22) the rewriteIds branch.
         const refusal = response.headers.get('x-zen-remote-error')
         if (refusal !== null) {
           await response.body?.cancel().catch(() => {})
           answerUnbridged(res, plugin, refusal)
+          return
+        }
+        if (declared.rewriteIds) {
+          await answerRewriteIds(res, response, idMapping)
           return
         }
         const contentType = response.headers.get('content-type')
@@ -786,23 +972,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
         })
         const reader = response.body?.getReader()
-        if (reader !== undefined) {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            if (!res.write(value)) {
-              await new Promise<void>((resolve) => {
-                const settled = (): void => {
-                  res.off('drain', settled)
-                  res.off('close', settled)
-                  resolve()
-                }
-                res.once('drain', settled)
-                res.once('close', settled)
-              })
-            }
-          }
-        }
+        if (reader !== undefined) await pumpResponse(res, reader)
         res.end()
       } catch (error) {
         // The gate's local flag first (the query half's shape): the 413
@@ -1106,23 +1276,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             ...Object.assign({}, ...allowlistedHeaders),
           })
           const reader = response.body?.getReader()
-          if (reader !== undefined) {
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-              if (!res.write(value)) {
-                await new Promise<void>((resolve) => {
-                  const settled = (): void => {
-                    res.off('drain', settled)
-                    res.off('close', settled)
-                    resolve()
-                  }
-                  res.once('drain', settled)
-                  res.once('close', settled)
-                })
-              }
-            }
-          }
+          if (reader !== undefined) await pumpResponse(res, reader)
           res.end()
           return
         }
@@ -1166,21 +1320,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
               })
             }
           }
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            if (!res.write(value)) {
-              await new Promise<void>((resolve) => {
-                const settled = (): void => {
-                  res.off('drain', settled)
-                  res.off('close', settled)
-                  resolve()
-                }
-                res.once('drain', settled)
-                res.once('close', settled)
-              })
-            }
-          }
+          await pumpResponse(res, reader)
           res.end()
           return
         }
@@ -1275,7 +1415,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
 
   const targetWithUpgrades = webServer as { upgrades: Map<string, unknown> }
   const savedUpgradesGet = targetWithUpgrades.upgrades.get
-  const upgradeRoutesOf = (pathname: string): { plugin: string; version: string; digest: string; path: string; sessionParam: string } | undefined => {
+  const upgradeRoutesOf = (pathname: string): { plugin: string; version: string; digest: string; path: string; sessionParam: string; deny: boolean } | undefined => {
     if (!installed) return undefined
     for (const declaration of registry.list()) {
       for (const route of declaration.routes) {
@@ -1286,6 +1426,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             digest: declaration.digest,
             path: route.path,
             sessionParam: route.sessionParam,
+            deny: routeDeniesRemoteOf(route),
           }
         }
       }
@@ -1295,7 +1436,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
 
   /** The tunnel's surrogate upgrade handler. Every outcome — refusal,
    * teardown, the byte pumping — owns the socket's whole remaining life. */
-  const surrogateUpgrade = (declared: { plugin: string; version: string; digest: string; path: string; sessionParam: string }, originalHandler: unknown) =>
+  const surrogateUpgrade = (declared: { plugin: string; version: string; digest: string; path: string; sessionParam: string; deny: boolean }, originalHandler: unknown) =>
     (req: IncomingMessage, socket: Socket, head: Buffer): void => {
       // The host never awaits an upgrade handler — the async body runs on
       // its own and every failure path owns the socket's teardown.
@@ -1328,6 +1469,18 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           return
         }
         const value = values.length === 1 ? values[0] : undefined
+        // PB-22: the deny wall on the tunnel — the HTTP surrogate's rule
+        // verbatim. A remote context (the request's own virtual id, or the
+        // browser's reported current session) never opens a byte tunnel into
+        // a route declared `deny: true`; a local session's upgrade passes
+        // through untouched.
+        if (declared.deny) {
+          const current = getCurrentSession?.()
+          if ((current !== undefined && isVirtual(current)) || (value !== undefined && value.startsWith('zr~'))) {
+            answerUnbridgedSocket(socket, declared.plugin, 'route-denied')
+            return
+          }
+        }
         // A LOCAL session (or no parameter at all): the original upgrade
         // handler's business, the head bytes untouched.
         if (value === undefined || value === '' || !value.startsWith('zr~')) {

@@ -1,5 +1,5 @@
 /* dsh-zen-remote · the plugin bridge's route interception, declaration-v2
- * locators (PB-21)
+ * locators (PB-21) + the deny / rewriteIds client semantics (PB-22)
  *
  * The cooperative surrogate generalized: a route declared with a v2
  * `locator` (json-body, or path-segment on a `prefix: true` route) runs the
@@ -19,11 +19,23 @@
  *     pathname, and an ambiguous hit resolves in declaration order.
  * The 2.1 query-locator behavior itself is pinned by
  * plugin-route-intercept.test.cjs, untouched by this task.
+ *
+ * PB-22 pins the two remaining v2 flags on top:
+ *   - a `deny: true` route answers the uniform 503 reason `route-denied`
+ *     the moment a REMOTE context touches it — the request locating a
+ *     virtual id, or the browser's reported CURRENT session being one —
+ *     while a local session's requests land on the local handler verbatim;
+ *   - a `rewriteIds: true` route's JSON answer is buffered (8 MB cap) and
+ *     deep-scanned: every string EXACTLY equal to one of the request's own
+ *     real ids comes back virtual (envelope fields, arrays, nested objects
+ *     alike), unknown strings pass through, and over the cap — or without
+ *     the declaration, or for non-JSON answers — the bytes pass verbatim.
  */
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const net = require('node:net')
 const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
 const { createBridgeRegistry, normalizeDeclaration } = require('../lib/plugin-bridge.js')
 const { toVirtual } = require('../lib/virtual-id.js')
@@ -48,6 +60,20 @@ const DECLARED_V2 = {
     // A streaming (non-buffered) body on a path-segment route rides the
     // cooperative counting gate.
     { path: '/v2/upload', scope: 'session', prefix: true, methods: ['POST'], maxBody: 1024, locator: { in: 'path-segment', index: 0 } },
+    // PB-22 deny: a 2.1-style query route and a json-body route that refuse
+    // a REMOTE context outright (local-only data behind them).
+    { path: '/v2/deny-query', scope: 'session', deny: true },
+    { path: '/v2/deny-body', scope: 'session', methods: ['POST'], locator: { in: 'json-body', fields: ['sessionId'] }, deny: true },
+    // PB-22 deny on the tunnel: an upgrade route with the same flag never
+    // opens a byte tunnel for a remote context.
+    { path: '/v2/deny-ws', scope: 'session', upgrade: true, deny: true },
+    // PB-22 rewriteIds: the answer's JSON is deep-scanned for the request's
+    // own real ids — query locator and json-body locator alike.
+    { path: '/v2/rewrite', scope: 'session', rewriteIds: true },
+    { path: '/v2/rewrite-body', scope: 'session', methods: ['POST'], locator: { in: 'json-body', fields: ['sessionId', 'childId'] }, rewriteIds: true },
+    // The rewrite CONTROL: the same query shape, no rewriteIds — answers
+    // must pass verbatim.
+    { path: '/v2/plain', scope: 'session' },
   ],
 }
 const V2_DIGEST = normalizeDeclaration(DECLARED_V2).digest
@@ -63,7 +89,7 @@ const VB = toVirtual(SERVER_ID, 'session-b')
  * tables, hit counters as the security observable.
  */
 function startFakeHost() {
-  const hits = { localCommand: 0, localMedia: 0, localOld: 0, localAmb: 0, localAmbSub: 0 }
+  const hits = { localCommand: 0, localMedia: 0, localOld: 0, localAmb: 0, localAmbSub: 0, localDenyQuery: 0, localDenyBody: 0 }
   let fallback = undefined
   const raw = {
     exact: new Map(),
@@ -104,6 +130,17 @@ function startFakeHost() {
       res.end()
     }).catch(() => { try { res.destroy() } catch { /* gone */ } })
   })
+  // The upgrade face (PB-10): the host hands the looked-up handler the raw
+  // socket; an undeclared upgrade path is destroyed.
+  server.on('upgrade', (req, socket, head) => {
+    const rawPath = new URL(req.url ?? '/', 'http://x').pathname
+    const entry = raw.upgrades.get(rawPath)
+    if (entry !== undefined && typeof entry.handler === 'function') {
+      entry.handler(req, socket, head)
+      return
+    }
+    socket.destroy()
+  })
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const port = server.address().port
@@ -127,6 +164,7 @@ function startFakeHost() {
           }
           raw.register({ kind: 'exact', path: '/v2/command', handler: bodyEcho('localCommand') })
           raw.register({ kind: 'exact', path: '/v2/amb/sub', handler: bodyEcho('localAmbSub') })
+          raw.register({ kind: 'exact', path: '/v2/deny-body', handler: bodyEcho('localDenyBody') })
           const urlEcho = (key) => async (req, res) => {
             hits[key] += 1
             res.writeHead(200, { 'content-type': 'application/json' })
@@ -135,6 +173,16 @@ function startFakeHost() {
           raw.register({ kind: 'prefix', path: '/v2/media', handler: urlEcho('localMedia') })
           raw.register({ kind: 'prefix', path: '/v2/old', handler: urlEcho('localOld') })
           raw.register({ kind: 'prefix', path: '/v2/amb', handler: urlEcho('localAmb') })
+          raw.register({ kind: 'exact', path: '/v2/deny-query', handler: urlEcho('localDenyQuery') })
+          // The deny upgrade route's LOCAL handler: answers a plain 101 so a
+          // passthrough is distinguishable from a refusal or a dead socket.
+          raw.upgrades.set('/v2/deny-ws', {
+            path: '/v2/deny-ws',
+            handler: (req, socket) => {
+              socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+              socket.end()
+            },
+          })
         },
         get: (pathWithQuery, { headers = {}, signal, method, body } = {}) =>
           fetch(`http://127.0.0.1:${port}${pathWithQuery}`, {
@@ -151,10 +199,12 @@ function startFakeHost() {
 /**
  * The fake relay: records every arrival (forwarded coordinates + the body),
  * echoes a json-body forward verbatim so the test can prove the exact
- * rewritten bytes crossed the boundary.
+ * rewritten bytes crossed the boundary. `state.reply` (PB-22 tests) replaces
+ * the echo with a programmable answer: (req, res, body) => void owns the
+ * response entirely; unset, the built-in echo answers.
  */
 function startFakeRelay() {
-  const state = { hits: [] }
+  const state = { hits: [], reply: undefined }
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://relay.internal')
     const chunks = []
@@ -171,6 +221,10 @@ function startFakeRelay() {
         ct: req.headers['content-type'],
         body,
       })
+      if (state.reply !== undefined) {
+        state.reply(req, res, body)
+        return
+      }
       if (url.pathname === '/_dsh/zen-remote/relay/v1/plugin' && req.headers['x-zr-path'] === '/v2/command') {
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ echoed: body, ct: req.headers['content-type'] }))
@@ -238,7 +292,10 @@ function fakeRelayClient(relayPort) {
   return client
 }
 
-/** Host + relay + registry + install, wired for the v2 declaration. */
+/** Host + relay + registry + install, wired for the v2 declaration. The
+ * T62 current-session signal rides a mutable box the tests flip (`h.
+ * setCurrentSession`); `undefined` — the default — is "the wiring reports
+ * nothing", exactly the signal's absent shape. */
 async function startV2Harness() {
   const host = await startFakeHost()
   host.registerLocalPlugin()
@@ -246,12 +303,14 @@ async function startV2Harness() {
   const relayClient = fakeRelayClient(relay.__port)
   const registry = createBridgeRegistry()
   registry.register(DECLARED_V2)
+  const sessionBox = { value: undefined }
   const handle = installPluginRouteIntercept({
     webServer: host.raw,
     registry,
     relay: relayClient,
     getServerId: () => SERVER_ID,
     getStatus: () => [{ plugin: 'v2-panel', bridged: true, localVersion: '2.0.0', serverVersion: '2.0.0' }],
+    getCurrentSession: () => sessionBox.value,
     log: () => {},
   })
   return {
@@ -259,6 +318,7 @@ async function startV2Harness() {
     relay,
     relayClient,
     handle,
+    setCurrentSession(value) { sessionBox.value = value },
     stop: async () => {
       handle.uninstall()
       await relay.stop()
@@ -460,6 +520,218 @@ test('PB-21: a path-segment route streams its body through the counting gate —
     assert.deepEqual(await chunked.json(), { ok: false, error: { code: 'zr-plugin-body-too-large' } })
     assert.equal(h.relayClient.offlineVerdicts.length, 0, 'the gate trip is a caller verdict, never offline')
     assert.equal(h.relay.state.hits.filter((entry) => entry.zrPath.startsWith('/v2/upload')).length, 1, 'only the legal body was ever forwarded')
+  } finally {
+    await h.stop()
+  }
+})
+
+// ---- PB-22: deny + rewriteIds ----------------------------------------------
+
+test('PB-22: a deny route refuses a remote context — the request id, the current session, or a zr~-shaped id — and serves local sessions untouched', async () => {
+  const h = await startV2Harness()
+  try {
+    // Remote by the request's own id (no current-session report at all —
+    // the request alone speaks).
+    const remote = await h.host.get(`/v2/deny-query?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(remote.status, 503)
+    assert.equal(remote.headers.get('x-zen-remote'), 'unbridged')
+    assert.deepEqual(await remote.json(), { ok: false, error: { code: 'zr-plugin-unbridged', reason: 'route-denied', plugin: 'v2-panel' } })
+    assert.equal(h.host.hits.localDenyQuery, 0, 'the local handler never ran')
+    assert.equal(h.relay.state.hits.length, 0, 'nothing was forwarded either — deny never bridges')
+    assert.equal(h.relayClient.forwarded.length, 0)
+
+    // Remote by the browser's CURRENT session alone (no id in the request —
+    // the open.external shape; only the T62 signal makes it judgeable).
+    h.setCurrentSession(VB)
+    const current = await h.host.get('/v2/deny-query')
+    assert.equal(current.status, 503)
+    assert.equal((await current.json()).error.reason, 'route-denied')
+    assert.equal(h.host.hits.localDenyQuery, 0)
+
+    // A local session's requests — with an id, without one — land on the
+    // local handler exactly as if the bridge did not exist.
+    h.setCurrentSession('local-current')
+    const localWithId = await h.host.get('/v2/deny-query?sessionId=local-1')
+    assert.equal(localWithId.status, 200)
+    assert.deepEqual(await localWithId.json(), { local: true, url: '/v2/deny-query?sessionId=local-1' })
+    const localNoId = await h.host.get('/v2/deny-query')
+    assert.equal(localNoId.status, 200)
+    assert.deepEqual(await localNoId.json(), { local: true, url: '/v2/deny-query' })
+    assert.equal(h.host.hits.localDenyQuery, 2)
+
+    // A zr~-SHAPED but unparseable id still reads as a remote-context
+    // request: route-denied, never the local plugin.
+    h.setCurrentSession(undefined)
+    const malformed = await h.host.get('/v2/deny-query?sessionId=zr~bad')
+    assert.equal(malformed.status, 503)
+    assert.equal((await malformed.json()).error.reason, 'route-denied')
+    assert.equal(h.host.hits.localDenyQuery, 2)
+    assert.equal(h.handle.diagnostics().refusalsByReason['route-denied'], 3)
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-22: a deny route with a v2 locator — the current-session wall sits before body work, the request wall catches any located virtual id', async () => {
+  const h = await startV2Harness()
+  try {
+    // Current session remote, LOCAL id in the body → refused by the
+    // current-session wall BEFORE the body is judged: a CORRUPT body still
+    // answers route-denied, not bad-query.
+    h.setCurrentSession(VA)
+    const corrupt = await h.host.get('/v2/deny-body', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"sessionId": "local-x"' })
+    assert.equal(corrupt.status, 503)
+    assert.equal((await corrupt.json()).error.reason, 'route-denied')
+    assert.equal(h.host.hits.localDenyBody, 0)
+    assert.equal(h.relay.state.hits.length, 0)
+
+    // No current-session report; the request itself carries a virtual id →
+    // the request wall refuses (a mixed body would refuse the same way).
+    h.setCurrentSession(undefined)
+    const remote = await h.host.get('/v2/deny-body', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: VA }) })
+    assert.equal(remote.status, 503)
+    assert.equal((await remote.json()).error.reason, 'route-denied')
+    assert.equal(h.relayClient.forwarded.length, 0)
+
+    // Local session, local id → the local handler, original bytes replayed.
+    const localBody = JSON.stringify({ sessionId: 'local-x' })
+    const local = await h.host.get('/v2/deny-body', { method: 'POST', headers: { 'content-type': 'application/json' }, body: localBody })
+    assert.equal(local.status, 200)
+    assert.deepEqual(await local.json(), { local: true, body: localBody })
+    assert.equal(h.host.hits.localDenyBody, 1)
+  } finally {
+    await h.stop()
+  }
+})
+
+test("PB-22: a rewriteIds route deep-scans its JSON answer — the request's own ids come back virtual from envelope fields, arrays and nested objects; unknown strings pass", async () => {
+  const h = await startV2Harness()
+  try {
+    // The envelope shape that beat the field-level rewriter (f6b570f): the
+    // id sits under {ok, value:{childId}}, not on a declared field.
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { childId: 'session-a' } }))
+    }
+    const res = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(res.status, 200)
+    const text = await res.text()
+    assert.deepEqual(JSON.parse(text), { ok: true, value: { childId: VA } }, 'the envelope\'s real id came back virtual')
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(text), 'the content-length is the REWRITTEN byte count')
+
+    // Two ids in the request (json-body locator): both known everywhere in
+    // the answer — envelope fields, array items, nested objects — while
+    // same-shaped unknowns pass untouched (exact equality only, no shape
+    // guessing).
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        ok: true,
+        value: {
+          childId: 'session-b',
+          items: ['session-a', 'session-b', 'session-unknown', 'session-a-suffix'],
+          deep: { inner: 'session-a' },
+          count: 2,
+        },
+      }))
+    }
+    const res2 = await h.host.get('/v2/rewrite-body', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: VA, childId: VB }) })
+    assert.equal(res2.status, 200)
+    assert.deepEqual(await res2.json(), {
+      ok: true,
+      value: {
+        childId: VB,
+        items: [VA, VB, 'session-unknown', 'session-a-suffix'],
+        deep: { inner: VA },
+        count: 2,
+      },
+    })
+    assert.equal(h.host.hits.localCommand, 0)
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-22: a deny upgrade route refuses a remote context before any tunnel opens; a local session upgrades through', async () => {
+  const h = await startV2Harness()
+  try {
+    // Raw-socket speak: the upgrade request bytes, the whole answer back.
+    const speak = (target) => new Promise((resolve, reject) => {
+      const socket = net.connect(h.host.port, '127.0.0.1', () => {
+        socket.write(`GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`)
+      })
+      let data = ''
+      socket.on('data', (chunk) => { data += chunk.toString('utf8') })
+      socket.on('close', () => resolve(data))
+      socket.on('error', reject)
+      const timer = setTimeout(() => { socket.destroy(); reject(new Error('upgrade answer timed out')) }, 5000)
+      socket.on('close', () => clearTimeout(timer))
+    })
+    // Remote by the request's own id: the uniform 503 on the raw socket —
+    // the handshake never completes and no tunnel was ever opened (the fake
+    // relay client has no tunnel door; a try would have destroyed the
+    // socket with no 503 bytes).
+    const refused = await speak(`/v2/deny-ws?sessionId=${encodeURIComponent(VA)}`)
+    assert.match(refused, /^HTTP\/1\.1 503/)
+    assert.match(refused, /x-zen-remote: unbridged/)
+    assert.match(refused, /"reason":"route-denied"/)
+    assert.equal(h.relay.state.hits.length, 0)
+
+    // Remote by the current session alone (no id in the request at all).
+    h.setCurrentSession(VB)
+    const refusedCurrent = await speak('/v2/deny-ws')
+    assert.match(refusedCurrent, /"reason":"route-denied"/)
+
+    // A local session's upgrade passes through to the local handler's 101.
+    h.setCurrentSession(undefined)
+    const local = await speak('/v2/deny-ws')
+    assert.match(local, /^HTTP\/1\.1 101/)
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-22: an over-cap (>8 MB) JSON answer passes through untouched — ids and all', async () => {
+  const h = await startV2Harness()
+  try {
+    const pad = 'x'.repeat(9 * 1024 * 1024)
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { pad, childId: 'session-a' } }))
+    }
+    const res = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(res.status, 200)
+    const parsed = await res.json()
+    assert.equal(parsed.value.childId, 'session-a', 'NOT virtualized — past the buffer cap the answer is never rewritten')
+    assert.equal(parsed.value.pad.length, pad.length, 'the body crossed byte-intact')
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-22: answers of routes without rewriteIds — and non-JSON answers of rewrite routes — pass verbatim', async () => {
+  const h = await startV2Harness()
+  try {
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { childId: 'session-a' } }))
+    }
+    // The control: the SAME answer shape, no rewriteIds declared → the real
+    // id reaches the browser untouched (behavior unchanged, PB-22 or not).
+    const plain = await h.host.get(`/v2/plain?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(plain.status, 200)
+    assert.deepEqual(await plain.json(), { ok: true, value: { childId: 'session-a' } })
+
+    // A rewrite route's non-JSON answer streams verbatim too — the scan is
+    // strictly for JSON answers.
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('session-a')
+    }
+    const text = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(text.status, 200)
+    assert.equal(text.headers.get('content-type'), 'text/plain')
+    assert.equal(await text.text(), 'session-a')
   } finally {
     await h.stop()
   }
