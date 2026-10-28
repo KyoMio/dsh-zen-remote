@@ -171,6 +171,13 @@ test('PB-23b core: the prefix tail red line — the four illegal shapes refuse o
   const violations = ['/p/api/a?x=1', '/p/api/a#f', '/p/api/../s', '/p/api/%2e%2e/s', '/p/api/%2E%2E/s', '/p/api/.%2e.', '/p/api/a b', '/p/api/a\tb']
   for (const pathname of violations) assert.equal(core.adapterTailShapeViolation(prefix, pathname), true, pathname)
 
+  // The false-kill surface is INTENTIONAL (PB-23b review nit-2), pinned here
+  // as a test fact: `config%2ejson` decodes to the harmless `config.json`
+  // and `a..b` is a harmless file name — both refuse anyway, because the
+  // byte-law rule cannot see decoded intent and stays strict on purpose.
+  assert.equal(core.adapterTailShapeViolation(prefix, '/p/api/config%2ejson'), true, 'config%2ejson refuses by design')
+  assert.equal(core.adapterTailShapeViolation(prefix, '/p/api/a..b'), true, 'a..b refuses by design')
+
   // Legal tails: plain segments, dots inside a name (only the `..` pair is
   // the red line), an encoded space — and the honest boundary of the raw
   // rule: `%252e%252e` (double-encoded) carries no raw `%2e`, so it passes;

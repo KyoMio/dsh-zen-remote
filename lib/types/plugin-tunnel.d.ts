@@ -28,7 +28,10 @@ import type { PluginLoopback } from './plugin-loopback.js';
 /** The shared validation verdict for the two plugin routes (PB-3, reused by
  * the tunnel open in PB-10): the whole chain from the coordinate headers to
  * the consent wall, minus each route's own extras (the method check for
- * `v1/plugin`, the upgrade mark here). First failure wins, in this order. */
+ * `v1/plugin`, the upgrade mark here). First failure wins, in this order.
+ * `bufferedBody` carries a json-body route's request bytes (PB-24: the share
+ * check must read the located id, so the body is consumed by validating) —
+ * the loopback sends THIS buffer, never a re-read of the request. */
 export type PluginCallValidation = {
     ok: true;
     declaration: NormalizedDeclaration;
@@ -36,16 +39,38 @@ export type PluginCallValidation = {
     params: URLSearchParams;
     sessionId: string;
     normalizedQuery: string;
+    bufferedBody?: Buffer;
 } | {
     ok: false;
     status: number;
     code: string;
 };
+/** The json-body locator's body reader (PB-24): the caller owns the request
+ * stream — `v1/plugin` buffers it bounded by the route's `maxBody` (413 past
+ * the cap, mirroring the adapter half's discipline), the tunnel open omits
+ * the reader entirely (an open request is empty-bodied by contract, so a
+ * body-locating upgrade route can never be validated and refuses). */
+export type PluginCallBodyReader = (maxBody: number) => Promise<{
+    kind: 'body';
+    buffered: Buffer;
+    given: boolean;
+    parsed?: unknown;
+} | {
+    kind: 'over';
+} | {
+    kind: 'corrupt';
+}>;
 /** Validate one plugin-bridge call's coordinates — the parse-once query
  * discipline (the re-serialization of THIS parse is the only string the
  * tunnel's upgrade request may carry), the share table with its ancestor
  * walk, and the live consent wall. `bridge.getConsent()` throwing reads as
- * unknown consent, and unknown consent stays home. */
+ * unknown consent, and unknown consent stays home. The share wall reads the
+ * route's EFFECTIVE locator (PB-24): the query convention — `sessionParam`
+ * folded in by {@link routeLocatorOf} — keeps its exactly-once rule, while a
+ * declaration-v2 locator re-locates over the SAME adapter-core rule the
+ * sub-client classified with and share-checks EVERY hit; a json-body route's
+ * body is consumed by validating (the reader above), and the verdict carries
+ * the bytes for the loopback. */
 export declare function validatePluginCall(bridge: {
     registry: BridgeRegistry;
     getConsent: () => Record<string, boolean>;
@@ -55,7 +80,7 @@ export declare function validatePluginCall(bridge: {
     pluginDigest: string;
     routePath: string;
     rawQuery: string;
-}, isAccessible: (sessionId: string) => boolean): PluginCallValidation;
+}, isAccessible: (sessionId: string) => boolean, readJsonBody?: PluginCallBodyReader): Promise<PluginCallValidation>;
 /** Largest single downstream data LINE (base64 will inflate by 4/3 — the cap
  * is on the RAW bytes carried, and the line stays well under typical proxy
  * line limits this way). */

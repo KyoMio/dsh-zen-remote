@@ -1872,14 +1872,37 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       // match — exact, or a prefix route's deeper RAW paths — the parse-once
       // query, the share table, the consent wall) are SHARED with the tunnel
       // open route — see validatePluginCall. This route's own extras are the
-      // method check (3b) and the body gate (3c) below.
-      const validation = validatePluginCall(
+      // method check (3b) and the body gate (3c) below. PB-24: a json-body
+      // route's body is consumed BY validating (the share wall reads the
+      // located id), bounded by the route's maxBody — the loopback then
+      // sends exactly that share-checked buffer, never a re-read.
+      const validation = await validatePluginCall(
         bridge,
         { pluginName, pluginVersion, pluginDigest, routePath, rawQuery },
         isAccessible,
+        async (maxBody) => {
+          const chunks: Buffer[] = []
+          let size = 0
+          for await (const chunk of req) {
+            size += (chunk as Buffer).length
+            if (size > maxBody) return { kind: 'over' as const }
+            chunks.push(Buffer.from(chunk as Uint8Array))
+          }
+          const buffered = Buffer.concat(chunks)
+          if (buffered.length === 0) return { kind: 'body' as const, buffered, given: false }
+          try {
+            return { kind: 'body' as const, buffered, given: true, parsed: JSON.parse(buffered.toString('utf8')) }
+          } catch {
+            return { kind: 'corrupt' as const }
+          }
+        },
       )
       if (!validation.ok) {
         relayPluginError(res, validation.status, validation.code)
+        // The reader's over-limit stop leaves the request half-read — the
+        // tail drains after the answer (the T51 discipline; only the reader
+        // can produce this code on this path).
+        if (validation.code === 'body-too-large') void drainUpload(req, 0, drainDeadlineMs)
         return
       }
       const route = validation.route
@@ -1895,10 +1918,11 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       //     `maxBody` refuses BEFORE a byte moves (the T51 pre-check
       //     discipline — the tail is drained after the answer); a chunked
       //     body carries no length header and is counted while it streams,
-      //     in the pump below.
+      //     in the pump below. A json-body route skips this gate: its body
+      //     was already consumed and bounded by validating.
       const maxBody = routeMaxBodyOf(route)
       const declaredLength = Number(headerValue(req, 'content-length'))
-      if (!bodylessMethod && Number.isFinite(declaredLength) && declaredLength > maxBody) {
+      if (!bodylessMethod && validation.bufferedBody === undefined && Number.isFinite(declaredLength) && declaredLength > maxBody) {
         relayPluginError(res, 413, 'body-too-large')
         await drainUpload(req, 0, drainDeadlineMs)
         return
@@ -1947,7 +1971,11 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // reads the recorded error first.
         const bodyAbort = new AbortController()
         const bodySignal = AbortSignal.any([hangUp.signal, bodyAbort.signal])
-        if (!bodylessMethod) {
+        if (validation.bufferedBody !== undefined) {
+          // PB-24: the json-body route's bytes were consumed by validating —
+          // the loopback sends exactly the share-checked buffer.
+          bodyStream = Readable.from(validation.bufferedBody)
+        } else if (!bodylessMethod) {
           let pumped = 0
           const gate = new Transform({
             transform(chunk: Buffer, _encoding, callback) {

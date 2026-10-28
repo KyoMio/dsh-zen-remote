@@ -28,7 +28,7 @@ import { connect as tlsConnect } from 'node:tls'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import { pluginBridgeError, responseJson } from './http.js'
-import { adapterPathMatches, adapterTailShapeViolation, type NormalizedAdapterRoute } from './plugin-adapter-core.js'
+import { adapterPathMatches, adapterTailShapeViolation, locateAdapterIds, type NormalizedAdapterRoute } from './plugin-adapter-core.js'
 import { routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeUpgradesOf } from './plugin-bridge.js'
 import type { BridgeRegistry, NormalizedBridgeRoute, NormalizedDeclaration } from './plugin-bridge.js'
 import type { PluginLoopback } from './plugin-loopback.js'
@@ -36,10 +36,24 @@ import type { PluginLoopback } from './plugin-loopback.js'
 /** The shared validation verdict for the two plugin routes (PB-3, reused by
  * the tunnel open in PB-10): the whole chain from the coordinate headers to
  * the consent wall, minus each route's own extras (the method check for
- * `v1/plugin`, the upgrade mark here). First failure wins, in this order. */
+ * `v1/plugin`, the upgrade mark here). First failure wins, in this order.
+ * `bufferedBody` carries a json-body route's request bytes (PB-24: the share
+ * check must read the located id, so the body is consumed by validating) —
+ * the loopback sends THIS buffer, never a re-read of the request. */
 export type PluginCallValidation =
-  | { ok: true; declaration: NormalizedDeclaration; route: NormalizedBridgeRoute; params: URLSearchParams; sessionId: string; normalizedQuery: string }
+  | { ok: true; declaration: NormalizedDeclaration; route: NormalizedBridgeRoute; params: URLSearchParams; sessionId: string; normalizedQuery: string; bufferedBody?: Buffer }
   | { ok: false; status: number; code: string }
+
+/** The json-body locator's body reader (PB-24): the caller owns the request
+ * stream — `v1/plugin` buffers it bounded by the route's `maxBody` (413 past
+ * the cap, mirroring the adapter half's discipline), the tunnel open omits
+ * the reader entirely (an open request is empty-bodied by contract, so a
+ * body-locating upgrade route can never be validated and refuses). */
+export type PluginCallBodyReader = (maxBody: number) => Promise<
+  | { kind: 'body'; buffered: Buffer; given: boolean; parsed?: unknown }
+  | { kind: 'over' }
+  | { kind: 'corrupt' }
+>
 
 /** The cooperative route through the adapter core's matcher (PB-23): the
  * path rule is ONE rule on both halves — {@link adapterPathMatches} decides,
@@ -64,12 +78,19 @@ function asAdapterRoute(route: NormalizedBridgeRoute): NormalizedAdapterRoute {
  * discipline (the re-serialization of THIS parse is the only string the
  * tunnel's upgrade request may carry), the share table with its ancestor
  * walk, and the live consent wall. `bridge.getConsent()` throwing reads as
- * unknown consent, and unknown consent stays home. */
-export function validatePluginCall(
+ * unknown consent, and unknown consent stays home. The share wall reads the
+ * route's EFFECTIVE locator (PB-24): the query convention — `sessionParam`
+ * folded in by {@link routeLocatorOf} — keeps its exactly-once rule, while a
+ * declaration-v2 locator re-locates over the SAME adapter-core rule the
+ * sub-client classified with and share-checks EVERY hit; a json-body route's
+ * body is consumed by validating (the reader above), and the verdict carries
+ * the bytes for the loopback. */
+export async function validatePluginCall(
   bridge: { registry: BridgeRegistry; getConsent: () => Record<string, boolean> },
   coords: { pluginName: string; pluginVersion: string; pluginDigest: string; routePath: string; rawQuery: string },
   isAccessible: (sessionId: string) => boolean,
-): PluginCallValidation {
+  readJsonBody?: PluginCallBodyReader,
+): Promise<PluginCallValidation> {
   const declaration = bridge.registry.get(coords.pluginName)
   if (declaration === undefined) return { ok: false, status: 404, code: 'plugin-unknown' }
   if (declaration.version !== coords.pluginVersion || declaration.digest !== coords.pluginDigest) {
@@ -96,10 +117,35 @@ export function validatePluginCall(
   } catch {
     return { ok: false, status: 400, code: 'bad-query' }
   }
-  const ids = params.getAll(route.sessionParam)
-  const sessionId = ids.length === 1 ? ids[0] : undefined
-  if (sessionId === undefined || sessionId === '') return { ok: false, status: 400, code: 'bad-query' }
-  if (!isAccessible(sessionId)) return { ok: false, status: 403, code: 'not-shared' }
+  const locator = routeLocatorOf(route)
+  let sessionId: string
+  let bufferedBody: Buffer | undefined
+  if (locator.in === 'query') {
+    const ids = params.getAll(locator.name)
+    const queryId = ids.length === 1 ? ids[0] : undefined
+    if (queryId === undefined || queryId === '') return { ok: false, status: 400, code: 'bad-query' }
+    if (!isAccessible(queryId)) return { ok: false, status: 403, code: 'not-shared' }
+    sessionId = queryId
+  } else {
+    let parsedBody: unknown
+    if (locator.in === 'json-body') {
+      if (readJsonBody === undefined) return { ok: false, status: 400, code: 'bad-request' }
+      const read = await readJsonBody(routeMaxBodyOf(route))
+      if (read.kind === 'over') return { ok: false, status: 413, code: 'body-too-large' }
+      if (read.kind === 'corrupt') return { ok: false, status: 400, code: 'bad-query' }
+      bufferedBody = read.buffered
+      parsedBody = read.parsed
+    }
+    const hits = locateAdapterIds(asAdapterRoute(route), coords.routePath, params, parsedBody)
+    // The sub-client only forwards a classified-remote request, so a v2
+    // locator call that locates NOTHING is malformed here — the adapter
+    // half's rule verbatim.
+    if (hits.length === 0) return { ok: false, status: 400, code: 'bad-request' }
+    for (const hit of hits) {
+      if (!isAccessible(hit.value)) return { ok: false, status: 403, code: 'not-shared' }
+    }
+    sessionId = hits[0].value
+  }
   if (route.scope === 'server') {
     let consent: Record<string, boolean> = {}
     try {
@@ -109,7 +155,7 @@ export function validatePluginCall(
     }
     if (consent[coords.pluginName] !== true) return { ok: false, status: 403, code: 'consent-off' }
   }
-  return { ok: true, declaration, route, params, sessionId, normalizedQuery: params.toString() }
+  return { ok: true, declaration, route, params, sessionId, normalizedQuery: params.toString(), ...(bufferedBody !== undefined ? { bufferedBody } : {}) }
 }
 
 /** Largest single downstream data LINE (base64 will inflate by 4/3 — the cap
@@ -290,7 +336,10 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
         pluginBridgeError(res, 400, 'bad-request')
         return
       }
-      const validation = validatePluginCall(bridge, coords, options.isAccessible)
+      // No body reader here: an open request is empty-bodied by contract, so
+      // a json-body-locator route can never be validated and answers
+      // bad-request inside the shared chain.
+      const validation = await validatePluginCall(bridge, coords, options.isAccessible)
       if (!validation.ok) {
         pluginBridgeError(res, validation.status, validation.code)
         return

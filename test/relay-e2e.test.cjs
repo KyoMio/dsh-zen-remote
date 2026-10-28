@@ -3030,3 +3030,209 @@ test('e2e PB-13: fs-watch speaks through the tunnel both ways and agent-opens pu
     await dshStop()
   }
 })
+
+// ---- PB-24: a declarative v2 plugin crosses the whole chain --------------------
+
+test('e2e PB-24: a declarative v2 plugin — json-body, prefix, deny, rewriteIds — crosses the whole chain', async () => {
+  // The fake DSH: the server-side plugin's routes. The deny route's twin
+  // records hits but must never be reached — the refusal answers on the
+  // sub-client before any forward.
+  const dshHits = []
+  const fakeDsh = http.createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://x')
+    if (url.pathname === '/') {
+      res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+      res.end()
+      return
+    }
+    if (url.pathname === '/zb/api') {
+      const chunks = []
+      req.on('data', (c) => chunks.push(c))
+      req.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+        dshHits.push({ path: url.pathname, body })
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ served: true, sessionId: body.sessionId ?? null }))
+      })
+      return
+    }
+    if (url.pathname.startsWith('/zb/files/')) {
+      dshHits.push({ path: url.pathname, sessionId: url.searchParams.get('sessionId') })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ file: true, path: url.pathname }))
+      return
+    }
+    if (url.pathname === '/zb/whoami') {
+      dshHits.push({ path: url.pathname, sessionId: url.searchParams.get('sessionId') })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ me: 'session-a', friend: 'session-b', list: ['session-a', 'session-c'] }))
+      return
+    }
+    if (url.pathname === '/zb/vault') {
+      dshHits.push({ path: url.pathname })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ vault: true }))
+      return
+    }
+    res.writeHead(404)
+    res.end()
+  })
+  await new Promise((resolve) => fakeDsh.listen(0, '127.0.0.1', resolve))
+  const dshPort = fakeDsh.address().port
+  const dshStop = () => new Promise((done) => { fakeDsh.closeAllConnections(); fakeDsh.close(done) })
+
+  // The declarative v2 plugin: the four behaviors under test, one route each.
+  const DECLARATION = {
+    plugin: 'zb-panel',
+    version: '2.0.0',
+    routes: [
+      // json-body locating + rewriteIds: the request's id crosses REAL, the
+      // answer's id comes back VIRTUAL — both directions in one exchange.
+      { path: '/zb/api', scope: 'session', methods: ['POST'], maxBody: 4096, locator: { in: 'json-body', fields: ['sessionId'] }, rewriteIds: true },
+      // prefix: the full matched sub-path forwards, the query id rewrites.
+      { path: '/zb/files', scope: 'session', prefix: true, locator: { in: 'query', name: 'sessionId' } },
+      // rewriteIds alone: the answer's deep scan rewrites the request's OWN
+      // id; ids the request never carried pass verbatim (the documented
+      // request-local boundary).
+      { path: '/zb/whoami', scope: 'session', rewriteIds: true },
+      // deny: local-only data — a remote context never crosses.
+      { path: '/zb/vault', scope: 'session', deny: true },
+    ],
+  }
+  const digest = normalizeDeclaration(DECLARATION).digest
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => ({ 'zb-panel': { version: '2.0.0', digest, serverScopeConsent: true } }),
+    pluginBridge: {
+      registry: (() => { const r = createBridgeRegistry(); r.register(DECLARATION); return r })(),
+      getConsent: () => ({ 'zb-panel': true }),
+      loopback: createPluginLoopback({
+        getTarget: () => ({ protocol: 'http:', port: dshPort }),
+        getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+      }),
+    },
+  })
+
+  const hostRaw = {
+    exact: new Map(), prefixes: new Map(), upgrades: new Map(),
+    match(pathname) {
+      const exact = this.exact.get(pathname)
+      if (exact !== undefined) return exact
+      for (const [, route] of this.prefixes) {
+        if (pathname === route.path || pathname.startsWith(`${route.path}/`)) return route
+      }
+      return undefined
+    },
+    register(route) { (route.kind === 'exact' ? this.exact : this.prefixes).set(route.path, route); return () => undefined },
+  }
+  // The deny route's LOCAL handler: the pass-through target proving a local
+  // session's request runs exactly as if the bridge were not installed.
+  const localHits = []
+  hostRaw.register({ kind: 'exact', path: '/zb/vault', handler: async (req, res) => {
+    localHits.push(req.url)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ local: true }))
+  } })
+  const subServer = http.createServer((req, res) => {
+    Promise.resolve(hostRaw.match(new URL(req.url ?? '/', 'http://x').pathname)).then(async (route) => {
+      if (route !== undefined) {
+        await route.handler(req, res)
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    }).catch(() => { try { res.destroy() } catch { /* gone */ } })
+  })
+  await new Promise((resolve) => subServer.listen(0, '127.0.0.1', resolve))
+  const subPort = subServer.address().port
+  const subStop = () => new Promise((done) => { subServer.closeAllConnections(); subServer.close(done) })
+
+  const localRegistry = createBridgeRegistry()
+  localRegistry.register(DECLARATION)
+  // The T62 current-session signal, wired like src/index.ts: the deny wall
+  // reads it live per request.
+  const sessionBox = { value: undefined }
+  const handle = installPluginRouteIntercept({
+    webServer: hostRaw,
+    registry: localRegistry,
+    relay: env.client,
+    getServerId: () => env.client.handshakeInfo?.serverId,
+    getStatus: () => compareBridges(localRegistry.list(), env.client.handshakeInfo?.plugins, env.client.state === 'online'),
+    getCurrentSession: () => sessionBox.value,
+    log: () => {},
+  })
+
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const virtual = toVirtual(info.serverId, 'session-a')
+
+    // json-body: the body id crosses REAL, the answer id comes back VIRTUAL.
+    const api = await fetch(`http://127.0.0.1:${subPort}/zb/api`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: virtual, note: 'hello' }),
+    })
+    assert.equal(api.status, 200, await api.clone().text())
+    assert.deepEqual(await api.json(), { served: true, sessionId: virtual }, 'the answer id came back VIRTUAL')
+    assert.equal(dshHits.length, 1)
+    assert.equal(dshHits[0].body.sessionId, 'session-a', 'the plugin received the REAL id')
+    assert.equal(dshHits[0].body.note, 'hello', 'the untouched field crossed verbatim')
+
+    // The share wall reads the LOCATED body id: an unshared session's id
+    // refuses before the plugin is ever reached.
+    const secret = await fetch(`http://127.0.0.1:${subPort}/zb/api`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: toVirtual(info.serverId, 'session-secret') }),
+    })
+    assert.equal(secret.status, 503)
+    assert.equal(secret.headers.get('x-zen-remote'), 'unbridged')
+    assert.deepEqual(await secret.json(), { ok: false, error: { code: 'zr-plugin-unbridged', reason: 'not-shared', plugin: 'zb-panel' } })
+    assert.equal(dshHits.length, 1, 'the unshared id never reached the plugin')
+
+    // prefix: the full sub-path reaches the plugin, the query id REAL.
+    const file = await fetch(`http://127.0.0.1:${subPort}/zb/files/docs/readme.md?sessionId=${encodeURIComponent(virtual)}`)
+    assert.equal(file.status, 200, await file.clone().text())
+    assert.equal(dshHits.length, 2)
+    assert.equal(dshHits[1].path, '/zb/files/docs/readme.md', 'the full sub-path reached the plugin')
+    assert.equal(dshHits[1].sessionId, 'session-a', 'the query id arrived REAL')
+
+    // rewriteIds: the request's own id comes back virtual from an envelope
+    // field and an array; ids the request never carried stay verbatim.
+    const who = await fetch(`http://127.0.0.1:${subPort}/zb/whoami?sessionId=${encodeURIComponent(virtual)}`)
+    assert.equal(who.status, 200, await who.clone().text())
+    assert.deepEqual(await who.json(), {
+      me: virtual,
+      friend: 'session-b',
+      list: [virtual, 'session-c'],
+    }, 'own id VIRTUAL, new ids verbatim')
+    assert.equal(dshHits.length, 3)
+
+    // deny, request id: the uniform 503 route-denied, nothing crossed.
+    const denied = await fetch(`http://127.0.0.1:${subPort}/zb/vault?sessionId=${encodeURIComponent(virtual)}`)
+    assert.equal(denied.status, 503)
+    assert.equal(denied.headers.get('x-zen-remote'), 'unbridged')
+    assert.deepEqual(await denied.json(), { ok: false, error: { code: 'zr-plugin-unbridged', reason: 'route-denied', plugin: 'zb-panel' } })
+    assert.equal(localHits.length, 0)
+    assert.equal(dshHits.length, 3, 'the server-side plugin saw nothing new')
+
+    // deny, current session: a remote panel is refused without carrying an
+    // id of its own (T62's signal read through the real install).
+    sessionBox.value = virtual
+    const deniedCurrent = await fetch(`http://127.0.0.1:${subPort}/zb/vault`)
+    assert.equal(deniedCurrent.status, 503)
+    assert.deepEqual(await deniedCurrent.json(), { ok: false, error: { code: 'zr-plugin-unbridged', reason: 'route-denied', plugin: 'zb-panel' } })
+    sessionBox.value = undefined
+
+    // deny, local session: the local handler runs, the relay never sees it.
+    const localPass = await fetch(`http://127.0.0.1:${subPort}/zb/vault?sessionId=session-local`)
+    assert.equal(localPass.status, 200)
+    assert.deepEqual(await localPass.json(), { local: true })
+    assert.equal(localHits.length, 1)
+    assert.equal(dshHits.length, 3, 'the local pass never crossed the relay')
+  } finally {
+    handle.uninstall()
+    await env.stop()
+    await subStop()
+    await dshStop()
+  }
+})

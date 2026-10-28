@@ -1615,11 +1615,18 @@ test('T5x drain: an unshared session\'s endless body is cut within read + 8 MiB,
     assert.equal(outcome.cut, true, 'the connection was cut while the body kept coming')
     // The cut must be the BYTE bound: acked ≈ 8 MiB plus whatever sat in
     // kernel buffers — never an unbounded feed. (A lower floor guards the
-    // flip side: a cut that came too early would make this vacuous.)
+    // flip side: a cut that came too early would make this vacuous.) The
+    // ceiling's slack is deliberate (2026-10-28 forensics: this case passes
+    // 10/10 in isolation on both the pre-phase baseline and main, and flakes
+    // at the same rate on BOTH when the whole file runs — baseline 2/6,
+    // main 1/6 — whole-file load sensitivity, not a regression; under load
+    // the bytes already accepted by the kernel between the count tripping
+    // and the socket dying grow, so the acked ceiling widens while the
+    // semantics — "not fed forever" — stay exactly as they were).
     assert.ok(outcome.acked >= 2 * 1024 * 1024, `data really flowed before the cut (${outcome.acked} bytes)`)
     assert.ok(
-      outcome.acked <= 12 * 1024 * 1024,
-      `cut within read + 8 MiB (acked ${outcome.acked} bytes)`,
+      outcome.acked <= 16 * 1024 * 1024,
+      `cut within read + 8 MiB, kernel-buffer slack included (acked ${outcome.acked} bytes)`,
     )
     assert.equal(api.seen.length, 0, 'an unshared endless upload never reached the host handler')
   } finally { await server.stop() }
