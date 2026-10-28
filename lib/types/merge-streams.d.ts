@@ -165,6 +165,18 @@ export interface WorkspaceMergerOptions extends MergerIdentity {
     /** T65: the clock the tombstone hide-grace runs on. Default Date.now;
      * tests advance an injectable fake to cross the grace. */
     now?: () => number;
+    /** PB-25b: the known-real-session inventory report — every time the
+     * session registry changes, the FULL current set of real ids this merger
+     * knows (the sessionHome keys: live ids and tombstones alike, each one the
+     * UI holds as a `zr~` id under this identity) is handed over as a fresh
+     * snapshot. REPLACE semantics, never a delta: the consumer's share is
+     * redefined wholesale by every report, so no invalidation bookkeeping
+     * exists on either side. Documented ceiling: an id that appears (or
+     * leaves) between two registry changes is invisible to the consumer until
+     * the next change reports — dumb but correct, and the wiring owns the
+     * other half of the contract (read-only consumption; the plugin-route
+     * rewrite never mutates merge state). */
+    onKnownSessions?: (ids: ReadonlySet<string>) => void;
 }
 export interface WorkspaceMerger {
     readonly serverId: string;

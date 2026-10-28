@@ -162,6 +162,7 @@ function install(raw, relay, overrides = {}) {
     getServerId: overrides.getServerId ?? (() => SERVER_ID),
     ...(overrides.getCurrentSession !== undefined ? { getCurrentSession: overrides.getCurrentSession } : {}),
     ...(overrides.clock !== undefined ? { clock: overrides.clock } : {}),
+    ...(overrides.createSessionInventorySlot !== undefined ? { createSessionInventorySlot: overrides.createSessionInventorySlot } : {}),
     log: logging.log,
   })
   // T52-fix3: installing into an already-online relay fires one proactive
@@ -819,6 +820,49 @@ test('workspace/follow merges the two legs: local first, remote upserts + merged
   assert.equal(done.done, true)
   assert.ok(relay.streams[1].aborted, 'the remote leg was aborted')
   assert.ok(gateway.streamCalls[0].signal.aborted, 'the local leg rides the same external signal')
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('PB-25b wiring: the merged stream reports its real-session inventory through the slot — replace per refresh, dropped with the stream', async () => {
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const relay = createControllableRelay()
+  const events = []
+  const { handle } = install(gateway, relay, {
+    // The wiring's slot, recorded: every report is that stream's FULL set
+    // (replace — never a delta), and the stream end disposes the share.
+    createSessionInventorySlot: () => ({
+      replace: (ids) => events.push({ replace: [...ids].sort() }),
+      dispose: () => events.push('disposed'),
+    }),
+  })
+  const iterator = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal }))[Symbol.asyncIterator]()
+  localGate.push(LOCAL_BASELINE)
+  await readSome(iterator, 1)
+  assert.equal(relay.streams.length, 1)
+  // The remote baseline learns per workspace record — one full-set report
+  // each (original ids, tombstones included).
+  relay.streams[0].gate.push(REMOTE_BASELINE)
+  await readSome(iterator, 5)
+  // The reconnecting baseline diffs w-2 away: the learn of w-1 reports the
+  // still-complete set, the same refresh's forget of w-2 reports it WITHOUT
+  // session-c — a session that left the sub-client's view stops being known
+  // with the refresh that removed it.
+  relay.streams[0].gate.push({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', ['session-a'])], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(iterator, 5)
+  // Stream end → the share is dropped with the stream (the ids may no
+  // longer be in the UI's view).
+  controller.abort()
+  const done = await iterator.next()
+  assert.equal(done.done, true)
+  assert.deepEqual(events, [
+    { replace: ['session-a', 'session-b'] },
+    { replace: ['session-a', 'session-b', 'session-c'] },
+    { replace: ['session-a', 'session-b', 'session-c'] },
+    { replace: ['session-a', 'session-b'] },
+    'disposed',
+  ])
   localGate.finish()
   handle.uninstall()
 })

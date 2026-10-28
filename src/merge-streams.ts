@@ -220,6 +220,18 @@ export interface WorkspaceMergerOptions extends MergerIdentity {
   /** T65: the clock the tombstone hide-grace runs on. Default Date.now;
    * tests advance an injectable fake to cross the grace. */
   now?: () => number
+  /** PB-25b: the known-real-session inventory report — every time the
+   * session registry changes, the FULL current set of real ids this merger
+   * knows (the sessionHome keys: live ids and tombstones alike, each one the
+   * UI holds as a `zr~` id under this identity) is handed over as a fresh
+   * snapshot. REPLACE semantics, never a delta: the consumer's share is
+   * redefined wholesale by every report, so no invalidation bookkeeping
+   * exists on either side. Documented ceiling: an id that appears (or
+   * leaves) between two registry changes is invisible to the consumer until
+   * the next change reports — dumb but correct, and the wiring owns the
+   * other half of the contract (read-only consumption; the plugin-route
+   * rewrite never mutates merge state). */
+  onKnownSessions?: (ids: ReadonlySet<string>) => void
 }
 
 export interface WorkspaceMerger {
@@ -285,6 +297,7 @@ export interface WorkspaceMerger {
  */
 export function createWorkspaceMerger(options: WorkspaceMergerOptions): WorkspaceMerger {
   const onDiagnostic = options.onDiagnostic
+  const onKnownSessions = options.onKnownSessions
   let identity: MergerIdentity = { serverId: options.serverId, serverName: options.serverName }
 
   // The locally observed truth, updated from every local baseline / order /
@@ -359,19 +372,43 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
    * remembered under THIS workspace as its last home (originals, cumulative). */
   function learnSessions(record: Record<string, unknown>, workspaceId: string): void {
     if (!Array.isArray(record.sessionIds)) return
-    for (const id of record.sessionIds) if (typeof id === 'string') sessionHome.set(id, workspaceId)
+    let learned = false
+    for (const id of record.sessionIds) {
+      if (typeof id === 'string') {
+        sessionHome.set(id, workspaceId)
+        learned = true
+      }
+    }
+    // PB-25b: the inventory grew — re-report the full set (replace-style;
+    // see onKnownSessions). Once per record with string ids, never per id.
+    if (learned) reportKnownSessions()
   }
 
   /** Drop the ids whose last home was this workspace — tombstones die with
    * their group (a server remove / a workspace diffed away; a session that
    * moved on lives under its NEW home and survives this). */
   function forgetWorkspace(workspaceId: string): void {
+    let forgot = false
     for (const [id, home] of sessionHome) {
       if (home === workspaceId) {
         sessionHome.delete(id)
         closedAt.delete(id)
+        forgot = true
       }
     }
+    // PB-25b: the inventory shrank — the gone ids must leave the consumer's
+    // share with this refresh, or a session that left the sub-client's view
+    // would keep being rewritten.
+    if (forgot) reportKnownSessions()
+  }
+
+  /** PB-25b: the inventory report — the FULL sessionHome key set as a fresh
+   * snapshot, handed to the callback replace-style. Fired at the three
+   * registry mutation points (learn / forget / the identity end) rather than
+   * once per frame: a frame that changes nothing costs nothing, and any
+   * future frame type that touches the registry reports automatically. */
+  function reportKnownSessions(): void {
+    onKnownSessions?.(new Set(sessionHome.keys()))
   }
 
   /** T65: stamp the ids that JUST left a workspace's live list (their
@@ -885,6 +922,9 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       // So does the shown set: a NEW server may reuse original workspace ids,
       // and a stale entry would forward the new server's empty groups.
       shown.clear()
+      // PB-25b: the inventory died with the identity — the empty report is
+      // what empties the consumer's share (a NEW server mints new ids).
+      reportKnownSessions()
       return out
     },
   }

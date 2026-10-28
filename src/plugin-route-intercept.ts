@@ -35,6 +35,18 @@
  * string gains the virtual shell of THIS request's server id; missing paths
  * are no-ops and nothing is ever guessed beyond the declared positions.
  *
+ * PB-25b widens the value scan's lookup from the request-local mapping to
+ * the request-local mapping UNION the KNOWN-real-session inventory: the
+ * merged global streams report every real id the sub-client currently holds
+ * (the sidebar's `zr~` rows — subagents.live's object keys, workflows.list
+ * rows: ids in the browser's view but not in THIS request), and a string
+ * exactly equal to one of those is rewritten too, in the same request-sourced
+ * virtual shell. The inventory is READ-ONLY consumption — the scan never
+ * touches merge state — and it is read live per answer: a stream refresh
+ * replaces its share, and the next answer sees the fresh union (ids that
+ * appear between two refreshes wait for the next refresh — the documented
+ * ceiling). Without the option the scan is exactly the PB-22 behavior.
+ *
  * The un-bridged refusals answer a UNIFORM 503 shape (header
  * `x-zen-remote: unbridged`, JSON body naming the reason) — and, decisive
  * for the security posture, they answer WITHOUT the local plugin handler
@@ -78,13 +90,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * object values, array items and bare strings, exactly the positions a
  * response can hand an id back to the browser in. Containers are rebuilt
  * unconditionally, which keeps the rule obvious at the cost of allocations
- * bounded by the 8 MB buffer cap. */
-function deepRewriteIds(value: unknown, known: ReadonlyMap<string, string>): unknown {
-  if (typeof value === 'string') return known.get(value) ?? value
-  if (Array.isArray(value)) return value.map((item) => deepRewriteIds(item, known))
+ * bounded by the 8 MB buffer cap.
+ *
+ * PB-25b adds the second lookup: a string exactly equal to a member of
+ * `knownIds` (the merged streams' known-real-session inventory, `undefined`
+ * when the wiring passed none — the scan then stays exactly the request-local
+ * behavior) is rewritten into THIS request's virtual shell, same source as
+ * the position rewrite's serverId. Already-virtual strings are never
+ * re-wrapped, and the set is read-only: the scan consults it, never mutates
+ * it. */
+function deepRewriteIds(
+  value: unknown,
+  known: ReadonlyMap<string, string>,
+  knownIds: ReadonlySet<string> | undefined,
+  serverId: string,
+): unknown {
+  if (typeof value === 'string') {
+    const mapped = known.get(value)
+    if (mapped !== undefined) return mapped
+    if (knownIds !== undefined && !isVirtual(value) && knownIds.has(value)) return toVirtual(serverId, value)
+    return value
+  }
+  if (Array.isArray(value)) return value.map((item) => deepRewriteIds(item, known, knownIds, serverId))
   if (isRecord(value)) {
     const out: Record<string, unknown> = {}
-    for (const [key, item] of Object.entries(value)) out[key] = deepRewriteIds(item, known)
+    for (const [key, item] of Object.entries(value)) out[key] = deepRewriteIds(item, known, knownIds, serverId)
     return out
   }
   return value
@@ -141,8 +171,9 @@ async function pumpResponse(
   }
 }
 
-/** PB-22/PB-25a: a rewriteIds route's JSON answer — buffered whole (the 8 MB
- * adapter cap), deep-scanned with the request's own real→virtual mapping
+/** PB-22/PB-25a/PB-25b: a rewriteIds route's JSON answer — buffered whole
+ * (the 8 MB adapter cap), deep-scanned with the request's own real→virtual
+ * mapping PLUS the known-real-session inventory (read live by the caller),
  * plus, when the route declared field paths, the position rewrite on those
  * paths, re-serialized with a corrected content-length. Past the cap, a
  * non-JSON content type, or a parse failure the answer passes through
@@ -156,6 +187,7 @@ async function answerRewriteIds(
   known: ReadonlyMap<string, string>,
   fields: readonly string[] | undefined,
   serverId: string,
+  knownIds: ReadonlySet<string> | undefined,
 ): Promise<void> {
   const contentType = response.headers.get('content-type')
   const verbatimHeaders = {
@@ -207,7 +239,7 @@ async function answerRewriteIds(
   const text = Buffer.concat(chunks).toString('utf8')
   let outBody: Buffer
   try {
-    const scanned = deepRewriteIds(JSON.parse(text), known)
+    const scanned = deepRewriteIds(JSON.parse(text), known, knownIds, serverId)
     if (fields !== undefined) rewriteIdsAtFields(scanned, fields, serverId)
     outBody = Buffer.from(JSON.stringify(scanned), 'utf8')
   } catch {
@@ -298,6 +330,19 @@ export interface InstallPluginRouteInterceptOptions {
    * cooperative route's `deny: true` raises. Absent → deny judges
    * conservatively (only the request's own ids speak). */
   getCurrentSession?: () => string | undefined
+  /** PB-25b: the KNOWN real session ids of this sub-client — the merged
+   * global streams' session inventories, unioned by the wiring. Read LIVE
+   * per rewriteIds answer, not captured at install: the streams report after
+   * the intercept installs, and a stream refresh replaces its share
+   * replace-style, so a getter is the only form that sees the fresh union —
+   * the same live-read discipline as getServerId/getStatus/getCurrentSession
+   * above. A rewriteIds route's value scan rewrites a string exactly equal
+   * to a member even when THIS request never carried it (the id already sits
+   * in the browser's view — subagents.live's object keys, workflows.list
+   * rows), wrapped in THIS request's virtual shell. The set is READ-ONLY
+   * consumption: nothing here mutates merge state. Absent → the scan is
+   * exactly the request-local PB-22 behavior. */
+  getKnownRealIds?: () => ReadonlySet<string>
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
 }
@@ -404,6 +449,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   const { webServer, registry, relay, getServerId, getStatus, log } = options
   const adapters = options.adapters ?? []
   const getCurrentSession = options.getCurrentSession
+  const getKnownRealIds = options.getKnownRealIds
   const target = webServer as { match: (this: unknown, pathname: string) => unknown }
   const savedMatch = target.match
 
@@ -618,8 +664,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       // PB-22: the request's own real→virtual pair — the READ-ONLY mapping a
       // rewriteIds route's answer scan consults (`zr~` carries the real id
       // inside, so the ids this very request named are exactly the ones the
-      // answer may hand back; nothing outside this exchange is read, and
-      // nothing here writes any session table).
+      // answer may hand back). PB-25b: the scan consults ONE more source
+      // beside this mapping — the known-real-session inventory, read live at
+      // the answer (never copied here) and consumed read-only; nothing here
+      // writes any session table.
       const idMapping: ReadonlyMap<string, string> = new Map([[parts.id, value]])
       const controller = new AbortController()
       // The counting gate's failure has its OWN abort signal (PB-9-fix, the
@@ -702,9 +750,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // (the ids this request named come back virtual); everything else —
         // non-JSON answers included — streams verbatim. PB-25a: a
         // `{ fields }` declaration adds the position rewrite, under THIS
-        // request's own server id.
+        // request's own server id. PB-25b: the scan's lookup widens to the
+        // known inventory, read live right here (undefined when the wiring
+        // passed no getter — the scan stays request-local).
         if (declared.rewriteIds) {
-          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, parts.serverId)
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, parts.serverId, getKnownRealIds?.())
           return
         }
         const contentType = response.headers.get('content-type')
@@ -904,11 +954,13 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // wall validates each hit — the READ-ONLY mapping a rewriteIds
         // route's answer scan consults (`zr~` carries the real id inside, so
         // the ids this very request named are exactly the ones the answer
-        // may hand back; nothing outside this exchange is read, and nothing
-        // here writes any session table). PB-25a: the SAME unwrap hands the
-        // position rewrite its server id — the ids this request located live
-        // under it, so a NEWLY-created id joins them (the query half's
-        // source verbatim; `remote` always has at least one hit).
+        // may hand back). PB-25a: the SAME unwrap hands the position rewrite
+        // its server id — the ids this request located live under it, so a
+        // NEWLY-created id joins them (the query half's source verbatim;
+        // `remote` always has at least one hit). PB-25b: the scan consults
+        // ONE more source beside this mapping — the known-real-session
+        // inventory, read live at the answer (never copied here) and
+        // consumed read-only; nothing here writes any session table.
         const idMapping = new Map<string, string>()
         let locatedServerId: string | undefined
         for (const idHit of verdict.hits) {
@@ -1012,7 +1064,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           return
         }
         if (declared.rewriteIds) {
-          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, locatedServerId!)
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, locatedServerId!, getKnownRealIds?.())
           return
         }
         const contentType = response.headers.get('content-type')

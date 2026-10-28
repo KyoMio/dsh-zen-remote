@@ -35,6 +35,18 @@
  * string gains the virtual shell of THIS request's server id; missing paths
  * are no-ops and nothing is ever guessed beyond the declared positions.
  *
+ * PB-25b widens the value scan's lookup from the request-local mapping to
+ * the request-local mapping UNION the KNOWN-real-session inventory: the
+ * merged global streams report every real id the sub-client currently holds
+ * (the sidebar's `zr~` rows — subagents.live's object keys, workflows.list
+ * rows: ids in the browser's view but not in THIS request), and a string
+ * exactly equal to one of those is rewritten too, in the same request-sourced
+ * virtual shell. The inventory is READ-ONLY consumption — the scan never
+ * touches merge state — and it is read live per answer: a stream refresh
+ * replaces its share, and the next answer sees the fresh union (ids that
+ * appear between two refreshes wait for the next refresh — the documented
+ * ceiling). Without the option the scan is exactly the PB-22 behavior.
+ *
  * The un-bridged refusals answer a UNIFORM 503 shape (header
  * `x-zen-remote: unbridged`, JSON body naming the reason) — and, decisive
  * for the security posture, they answer WITHOUT the local plugin handler
@@ -125,6 +137,19 @@ export interface InstallPluginRouteInterceptOptions {
      * cooperative route's `deny: true` raises. Absent → deny judges
      * conservatively (only the request's own ids speak). */
     getCurrentSession?: () => string | undefined;
+    /** PB-25b: the KNOWN real session ids of this sub-client — the merged
+     * global streams' session inventories, unioned by the wiring. Read LIVE
+     * per rewriteIds answer, not captured at install: the streams report after
+     * the intercept installs, and a stream refresh replaces its share
+     * replace-style, so a getter is the only form that sees the fresh union —
+     * the same live-read discipline as getServerId/getStatus/getCurrentSession
+     * above. A rewriteIds route's value scan rewrites a string exactly equal
+     * to a member even when THIS request never carried it (the id already sits
+     * in the browser's view — subagents.live's object keys, workflows.list
+     * rows), wrapped in THIS request's virtual shell. The set is READ-ONLY
+     * consumption: nothing here mutates merge state. Absent → the scan is
+     * exactly the request-local PB-22 behavior. */
+    getKnownRealIds?: () => ReadonlySet<string>;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
 }
