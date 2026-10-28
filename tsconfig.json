@@ -18,6 +18,7 @@
   },
   "include": [
     "src/index.ts",
+    "src/adapters/dsh-better-sidebar/surface.ts",
     "src/wizard/status.ts",
     "src/wizard/binary.ts",
     "src/wizard/binary-io.ts",
