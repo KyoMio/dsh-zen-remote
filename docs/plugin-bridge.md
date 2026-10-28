@@ -54,7 +54,7 @@ export function apply(ctx: Context) {
 | `sessionParam` | 可选，缺省 `'sessionId'`；须匹配 `/^[A-Za-z][A-Za-z0-9_]{0,63}$/`——你的接口用别的名字接会话 id 时在这里声明 |
 | `stream` | 可选，缺省 `false`；标记该路由以流式响应回答 |
 | `methods` | 可选，缺省 `['GET']`；大写 HTTP 方法数组，只接受 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`，去重并按字典序排序后进规范化与摘要（2.2 起，写请求） |
-| `maxBody` | 可选，缺省 `1048576`（1 MiB）；请求体上限（字节），正整数，最高 64 MiB（2.2 起） |
+| `maxBody` | 可选，缺省 `1048576`（1 MiB）；请求体上限（字节），正整数，最高 500 MiB（与中继上传上限同源单一定义，PB-20 起） |
 | `upgrade` | 可选；置 `true` 标记该路由是 WebSocket 升级端点，远程会话里经字节隧道转发（2.2 起，见下文「WebSocket 路由」）。只能为 `true` 或省略；不能与 `stream` 同用；升级路由只有 GET——显式 `methods` 里出现其他方法登记即报错 |
 
 声明里出现未知字段直接报错（防拼错）。`methods`、`maxBody` 与 `upgrade` 只在**显式给出**时进摘要——2.1 时代（没有这三个字段）的声明，摘要与当年完全一致，升级不破坏已桥接状态。2.1 只匹配 **exact 路径**：声明的 `path` 与请求 pathname 完全相等才算命中，把 `path` 写成前缀不会覆盖子路径。
