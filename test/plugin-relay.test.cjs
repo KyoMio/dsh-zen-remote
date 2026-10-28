@@ -191,8 +191,8 @@ test('PB-3: the refusal codes each get their case, and every refusal carries the
       ['plugin-mismatch', 409, { version: '9.9.9' }],
       ['plugin-mismatch', 409, { digest: '0'.repeat(16) }],
       ['route-undeclared', 404, { zrPath: '/panel/undeclared' }],
-      // Prefix semantics are NOT this task: a declared exact path does not
-      // cover longer paths under it.
+      // Prefix semantics are opt-in (PB-23): without `prefix: true` a
+      // declared exact path does not cover longer paths under it.
       ['route-undeclared', 404, { zrPath: '/panel/data/extra' }],
       ['bad-query', 400, { query: 'other=1' }],
       ['bad-query', 400, { query: 'sessionId=session-shared&sessionId=session-shared' }],
@@ -224,6 +224,83 @@ test('PB-3: the refusal codes each get their case, and every refusal carries the
     })
     assert.equal(withBody.status, 400)
     assert.equal(withBody.headers.get('x-zen-remote-error'), 'bad-request')
+  } finally { await wiring.stop() }
+})
+
+// ---- PB-23: prefix routes ------------------------------------------------------
+
+test('PB-23: a prefix-declared route admits its sub-paths — the loopback sees the raw x-zr-path; exact stays exact; the walls read the hit route', async () => {
+  const wiring = await makeWiring('prefix-routes', { registryOverride: createBridgeRegistry() })
+  try {
+    // /p/media/a is DELIBERATELY also declared exact and server-scoped: the
+    // path-sorted declaration order meets the PREFIX /p/media first, so the
+    // multi-hit rule (first hit in declaration order) is observable as a
+    // 200 without consent at the bottom of this test.
+    const PREFIX_DECL = {
+      plugin: 'test-panel',
+      version: '1.0.0',
+      routes: [
+        { path: '/p/api', scope: 'session' },
+        { path: '/p/get-only', scope: 'session', prefix: true, methods: ['GET'] },
+        { path: '/p/media', scope: 'session', prefix: true },
+        { path: '/p/media/a', scope: 'server' },
+      ],
+    }
+    const prefixDigest = normalizeDeclaration(PREFIX_DECL).digest
+    wiring.registry.register(PREFIX_DECL)
+    wiring.consentBox.map = {}
+
+    // Declared sub-paths pass — one segment and many segments deeper (the
+    // rule is `pathname === path || pathname.startsWith(path + '/')`, the
+    // SAME one the adapter segment applies) — and the loopback receives the
+    // x-zr-path VERBATIM: the full path as the sub-client forwarded it,
+    // next to the re-serialized query.
+    const one = await wiring.pluginFetch(ROUTE, { zrPath: '/p/media/file/42', digest: prefixDigest })
+    assert.equal(one.status, 200)
+    assert.equal((await one.json()).path, '/p/media/file/42', 'the plugin saw the declared sub-path')
+    const deep = await wiring.pluginFetch(ROUTE, { zrPath: '/p/media/a/b', query: 'sessionId=session-shared&v=2', digest: prefixDigest })
+    assert.equal(deep.status, 200, 'an any-depth tail is still the prefix route\'s')
+    await deep.text()
+    assert.equal(
+      wiring.pluginServer.state.requests.at(-1).url,
+      '/p/media/a/b?sessionId=session-shared&v=2',
+      'the loopback saw the original path and the checked query',
+    )
+
+    // Undeclared paths refuse with the standing shape — including the
+    // near-miss: a prefix hit needs the "/" separator, never a raw prefix.
+    for (const undeclared of ['/p/nowhere', '/p/mediax']) {
+      const res = await wiring.pluginFetch(ROUTE, { zrPath: undeclared, digest: prefixDigest })
+      assert.equal(res.status, 404, `${undeclared}: status`)
+      assert.deepEqual(await res.json(), { ok: false, error: { code: 'route-undeclared' } }, `${undeclared}: body`)
+      assert.equal(res.headers.get('x-zen-remote-error'), 'route-undeclared', `${undeclared}: marker header`)
+    }
+
+    // An exact declaration does NOT grow prefix semantics: /p/api declared
+    // without `prefix: true` keeps its sub-paths undeclared.
+    const exactTail = await wiring.pluginFetch(ROUTE, { zrPath: '/p/api/x', digest: prefixDigest })
+    assert.equal(exactTail.status, 404)
+    assert.equal(exactTail.headers.get('x-zen-remote-error'), 'route-undeclared')
+
+    // The per-route walls read the HIT route: the prefix route declared GET
+    // only, so another method on its sub-path answers 405 and reaches
+    // nothing.
+    const before = wiring.pluginServer.state.requests.length
+    const undeclaredMethod = await wiring.pluginFetch(ROUTE, {
+      zrPath: '/p/get-only/media',
+      digest: prefixDigest,
+      headers: { 'x-zr-method': 'DELETE' },
+    })
+    assert.equal(undeclaredMethod.status, 405)
+    assert.equal(undeclaredMethod.headers.get('x-zen-remote-error'), 'method-undeclared')
+    assert.equal(wiring.pluginServer.state.requests.length, before, 'the plugin saw nothing')
+
+    // The ordering pin: /p/media/a is declared exact + server-scoped, but
+    // the declaration order meets the prefix /p/media first — the call
+    // rides THAT route, so consent-off still serves it.
+    const ordered = await wiring.pluginFetch(ROUTE, { zrPath: '/p/media/a', digest: prefixDigest })
+    assert.equal(ordered.status, 200, 'the first hit in declaration order (the prefix route) owns the call')
+    await ordered.text()
   } finally { await wiring.stop() }
 })
 
