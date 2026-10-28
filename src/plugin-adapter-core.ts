@@ -147,7 +147,9 @@ export interface AdapterHooks {
 export interface NormalizedAdapter {
   plugin: string
   /** The exact versions this adapter was written against; the INSTALLED
-   * version must be among them or the adapter does not register. */
+   * version must be among them — or its wire surface must be whitelisted in
+   * the adapter's `surfaces` table (PB-19) — or the adapter does not
+   * register. */
   versions: readonly string[]
   routes: NormalizedAdapterRoute[]
   /** The digest of the ROUTE TABLE (locator and match included) — the
@@ -186,13 +188,19 @@ function fail(field: string, detail: string): never {
  * absolute paths, off the host-owned `/_dsh/` and `/api` prefixes) — an
  * adapter must not be able to reach anything a declaration cannot. The
  * installed version must be listed EXACTLY (`versions` are what the
- * adapter was written against); anything else refuses the adapter whole.
+ * adapter was written against) — with ONE out (PB-19): a version outside
+ * the list is admitted anyway when `options.surfaceDigest` — the wiring's
+ * extraction of the INSTALLED build's wire surface — is a key of the
+ * adapter's `surfaces` table; the registration then carries the installed
+ * version with the usual route-table digest, so two machines on the same
+ * unlisted-but-surface-identical release still agree. A miss refuses with
+ * the digest and the table's size in the message, for the logs.
  * @throws with a field-naming message on any illegal shape.
  */
-export function normalizeAdapter(input: unknown, installedVersion: string): NormalizedAdapter {
+export function normalizeAdapter(input: unknown, installedVersion: string, options?: { surfaceDigest?: string }): NormalizedAdapter {
   if (!isRecord(input)) fail('adapter', 'expected an object')
   for (const key of Object.keys(input)) {
-    if (key !== 'plugin' && key !== 'versions' && key !== 'routes' && key !== 'client' && key !== 'server') {
+    if (key !== 'plugin' && key !== 'versions' && key !== 'routes' && key !== 'client' && key !== 'server' && key !== 'surfaces') {
       fail(key, 'unknown field (typo guard)')
     }
   }
@@ -203,8 +211,21 @@ export function normalizeAdapter(input: unknown, installedVersion: string): Norm
   if (!Array.isArray(versions) || versions.length === 0 || versions.some((v) => typeof v !== 'string' || v === '')) {
     fail('versions', 'must be a non-empty array of version strings')
   }
+  // The surfaces table is validated whenever present, listed version or not
+  // (a malformed credential must not lurk until the one version that needs it).
+  if (input.surfaces !== undefined) {
+    if (!isRecord(input.surfaces)) fail('surfaces', 'expected an object (digest16 → remark)')
+    for (const [key, value] of Object.entries(input.surfaces)) {
+      if (!/^[0-9a-f]{16}$/u.test(key)) fail(`surfaces.${key}`, 'the key must be a 16-hex surface digest')
+      if (typeof value !== 'string' || value === '') fail(`surfaces.${key}`, 'the remark must be a non-empty string')
+    }
+  }
   if (!versions.includes(installedVersion)) {
-    fail('versions', `installed version "${installedVersion}" is not among the adapter's versions`)
+    const surfaceDigest = options?.surfaceDigest
+    const surfaces = input.surfaces as Record<string, string> | undefined
+    if (!(surfaceDigest !== undefined && surfaces !== undefined && surfaceDigest in surfaces)) {
+      fail('versions', `installed version "${installedVersion}" is not among the adapter's versions (surface ${surfaceDigest ?? 'not computed'} vs ${surfaces === undefined ? 0 : Object.keys(surfaces).length} listed)`)
+    }
   }
   if (!Array.isArray(routes) || routes.length === 0) fail('routes', 'must be a non-empty array')
   if (routes.length > MAX_ROUTES) fail('routes', `${routes.length} routes exceeds the ${MAX_ROUTES} cap`)

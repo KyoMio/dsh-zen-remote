@@ -2533,7 +2533,7 @@ test('e2e PB-11: a fake adapter forwards a JSON-body request for a remote sessio
 
 // ---- PB-12: the better-sidebar adapter crosses the whole chain -----------------
 
-test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html preview across the full chain; a drifted version never bridges', async () => {
+test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html preview across the full chain; a drifted version bridges only through its wire surface', async () => {
   // The fake DSH: better-sidebar's real route shapes (the /sidebar/api
   // dispatcher, the file media route, the html preview with its CSP).
   const dshHits = []
@@ -2637,6 +2637,11 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
     },
   }
   const adapter = normalizeAdapter(ADAPTER_INPUT, '0.25.0')
+  // PB-19: the surface-admitted twin — the SAME route table, but the version
+  // (0.27.0) sits OUTSIDE `versions` and gets in through the surfaces table
+  // (the 0.28.1 generation digest stands in for "wire-identical upstream").
+  const surfaceInput = { ...ADAPTER_INPUT, surfaces: { '65a0acaeb56f87d9': 'the 0.28.1 generation' } }
+  const surfaceAdapter = normalizeAdapter(surfaceInput, '0.27.0', { surfaceDigest: '65a0acaeb56f87d9' })
   const env = await boot({
     shared: ['session-a'],
     plugins: () => ({ 'dsh-better-sidebar': { version: '0.25.0', digest: adapter.digest, serverScopeConsent: true } }),
@@ -2735,10 +2740,11 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
     assert.equal(dshHits[3].query.get('path'), 'notes.md')
     assert.equal(dshHits[3].body, 'the document text', 'the text body crossed verbatim')
 
-    // A drifted version (the plugin updated past the adapter's table)
-    // never bridges: the local registry carries 0.25.0/0.26.0/0.26.1, the server
-    // announces 0.27.0 — compareBridges reads version-mismatch, and the
-    // request refuses with the uniform 503 instead of forwarding.
+    // (PB-19, case 1) A version outside the table whose surface MISSES never
+    // bridges — the original drifted behavior, twice over: normalizeAdapter
+    // refuses the registration outright (nothing exists to forward with),
+    // and a two-end version disagreement still reads version-mismatch.
+    assert.throws(() => normalizeAdapter(surfaceInput, '0.27.0', { surfaceDigest: '0000000000000000' }), /not among the adapter's versions/)
     const driftedRegistry = createBridgeRegistry()
     driftedRegistry.registerNormalized(adapter.declaration)
     const driftedStatus = compareBridges(
@@ -2748,6 +2754,53 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
     )
     assert.equal(driftedStatus[0].bridged, false)
     assert.equal(driftedStatus[0].reason, 'version-mismatch')
+
+    // (PB-19, case 2) Version outside the table, surface HIT → the full
+    // PB-12 chain bridges: both ends register the surface-admitted 0.27.0,
+    // the server's plugins table announces the same version/digest pair, and
+    // a read crosses with the id rewrite — the exact relief ADR-0003 promises.
+    handle.uninstall()
+    const surfaceEnv = await boot({
+      shared: ['session-a'],
+      plugins: () => ({ 'dsh-better-sidebar': { version: '0.27.0', digest: surfaceAdapter.digest, serverScopeConsent: true } }),
+      pluginBridge: {
+        registry: (() => { const r = createBridgeRegistry(); r.registerNormalized(surfaceAdapter.declaration); return r })(),
+        getConsent: () => ({ 'dsh-better-sidebar': true }),
+        loopback: createPluginLoopback({
+          getTarget: () => ({ protocol: 'http:', port: dshPort }),
+          getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+        }),
+        adapters: [surfaceAdapter],
+      },
+    })
+    const surfaceRegistry = createBridgeRegistry()
+    surfaceRegistry.registerNormalized(surfaceAdapter.declaration)
+    const surfaceHandle = installPluginRouteIntercept({
+      webServer: hostRaw,
+      registry: surfaceRegistry,
+      relay: surfaceEnv.client,
+      getServerId: () => surfaceEnv.client.handshakeInfo?.serverId,
+      getStatus: () => compareBridges(surfaceRegistry.list(), surfaceEnv.client.handshakeInfo?.plugins, surfaceEnv.client.state === 'online'),
+      adapters: [surfaceAdapter],
+      log: () => {},
+    })
+    try {
+      const surfaceInfo = await surfaceEnv.client.connect()
+      assert.equal(surfaceEnv.client.state, 'online')
+      const surfaceVirtual = toVirtual(surfaceInfo.serverId, 'session-a')
+      const hitsBefore = dshHits.length
+      const surfaceRead = await fetch(`http://127.0.0.1:${subPort}/sidebar/api/git.status`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: surfaceVirtual }),
+      })
+      assert.equal(surfaceRead.status, 200, await surfaceRead.clone().text())
+      assert.equal((await surfaceRead.json()).sessionId, surfaceVirtual, 'the answer id came back VIRTUAL for the surface-admitted version')
+      assert.equal(dshHits[hitsBefore].path, '/sidebar/api/git.status')
+      assert.equal(dshHits[hitsBefore].body.sessionId, 'session-a', 'the fake plugin saw the REAL id')
+    } finally {
+      surfaceHandle.uninstall()
+      await surfaceEnv.stop()
+    }
   } finally {
     handle.uninstall()
     await env.stop()

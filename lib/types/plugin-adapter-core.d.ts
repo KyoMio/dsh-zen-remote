@@ -149,7 +149,9 @@ export interface AdapterHooks {
 export interface NormalizedAdapter {
     plugin: string;
     /** The exact versions this adapter was written against; the INSTALLED
-     * version must be among them or the adapter does not register. */
+     * version must be among them — or its wire surface must be whitelisted in
+     * the adapter's `surfaces` table (PB-19) — or the adapter does not
+     * register. */
     versions: readonly string[];
     routes: NormalizedAdapterRoute[];
     /** The digest of the ROUTE TABLE (locator and match included) — the
@@ -173,10 +175,18 @@ export declare const MAX_ADAPTER_BODY_BYTES: number;
  * absolute paths, off the host-owned `/_dsh/` and `/api` prefixes) — an
  * adapter must not be able to reach anything a declaration cannot. The
  * installed version must be listed EXACTLY (`versions` are what the
- * adapter was written against); anything else refuses the adapter whole.
+ * adapter was written against) — with ONE out (PB-19): a version outside
+ * the list is admitted anyway when `options.surfaceDigest` — the wiring's
+ * extraction of the INSTALLED build's wire surface — is a key of the
+ * adapter's `surfaces` table; the registration then carries the installed
+ * version with the usual route-table digest, so two machines on the same
+ * unlisted-but-surface-identical release still agree. A miss refuses with
+ * the digest and the table's size in the message, for the logs.
  * @throws with a field-naming message on any illegal shape.
  */
-export declare function normalizeAdapter(input: unknown, installedVersion: string): NormalizedAdapter;
+export declare function normalizeAdapter(input: unknown, installedVersion: string, options?: {
+    surfaceDigest?: string;
+}): NormalizedAdapter;
 /** The digest of one adapter's route table: sha256 over a canonical JSON of
  * `{plugin, version, routes}` — the locator and the match mode INCLUDED (a
  * different locating rule is a different adapter), hex, first 16 chars.

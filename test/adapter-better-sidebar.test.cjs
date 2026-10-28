@@ -110,6 +110,60 @@ test('PB-18: extractBetterSidebarSurface is deterministic and groups the fixture
   assert.equal(mod.surfaceLooksHealthy(mod.extractBetterSidebarSurface('')), false)
 })
 
+// ---- PB-19: the surfaces whitelist — version unlisted, wire surface known ------
+
+test('PB-19: an unlisted version registers through its surface digest; a miss, an unknown digest and the plain two-argument call refuse', async () => {
+  const core = await importLib('plugin-adapter-core.js')
+  const adaptersMod = await importLib('adapters/index.js')
+  const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
+  // The literal the adapter pins as the 0.28.1 generation (the fixture test
+  // below re-derives every key from the plugin source; this one works without
+  // the fixtures so the admission CONTRACT is always checked).
+  assert.equal(typeof raw.surfaces['65a0acaeb56f87d9'], 'string', 'the 0.28.1 generation is whitelisted')
+
+  // A hypothetical wire-identical future release: outside `versions`, inside
+  // the surface whitelist → it registers with the INSTALLED version and the
+  // usual route-table digest (version included), so two machines on the same
+  // unlisted release still agree at compareBridges time.
+  const normalized = core.normalizeAdapter(raw, '0.29.0', { surfaceDigest: '65a0acaeb56f87d9' })
+  assert.equal(normalized.declaration.version, '0.29.0')
+  assert.equal(normalized.digest, core.adapterDigestOf('dsh-better-sidebar', '0.29.0', normalized.routes))
+
+  // A digest the table does not list refuses — the deadbeef probe — and so
+  // does a call that offers no digest at all (the two-argument form).
+  assert.throws(() => core.normalizeAdapter(raw, '0.29.0', { surfaceDigest: 'deadbeefdeadbeef' }), /not among the adapter's versions/)
+  assert.throws(() => core.normalizeAdapter(raw, '0.29.0'), /not among the adapter's versions/)
+
+  // Listed versions register exactly as before: a table full of keys the
+  // installed version does not hash to never disturbs the normal path —
+  // here a key NO listed version hashes to.
+  const noised = { ...raw, surfaces: { ...raw.surfaces, abcdef0123456789: 'a key no version hashes to' } }
+  const listed = core.normalizeAdapter(noised, '0.25.0')
+  assert.equal(listed.declaration.version, '0.25.0')
+  assert.equal(listed.digest, core.adapterDigestOf('dsh-better-sidebar', '0.25.0', listed.routes))
+})
+
+test('PB-19: every listed version hashes into the surfaces table; the table holds exactly the four generations', async () => {
+  const absent = PLUGIN_SOURCES.filter((sourcePath) => !fs.existsSync(sourcePath))
+  if (absent.length > 0) {
+    test.skip(`plugin sources are not on this machine (${absent.join(', ')}); the surfaces-table check is skipped`)
+    return
+  }
+  const surfaceMod = await importLib('adapters/dsh-better-sidebar/surface.js')
+  const adaptersMod = await importLib('adapters/index.js')
+  const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
+  const computed = new Set()
+  for (const version of raw.versions) {
+    const sourcePath = `/tmp/bs-versions/${version}/lib/index.js`
+    assert.ok(fs.existsSync(sourcePath), `${sourcePath} is on disk`)
+    const digest = surfaceMod.betterSidebarSurfaceDigest(surfaceMod.extractBetterSidebarSurface(fs.readFileSync(sourcePath, 'utf8')))
+    computed.add(digest)
+    assert.ok(raw.surfaces[digest] !== undefined, `${version}'s surface digest ${digest} is whitelisted as "${raw.surfaces[digest]}"`)
+  }
+  assert.equal(computed.size, 4, 'the seven listed versions collapse to four distinct wire generations')
+  assert.deepEqual(Object.keys(raw.surfaces).sort(), [...computed].sort(), 'the table holds exactly those generations — nothing stale, nothing missing')
+})
+
 test('PB-15: the 0.26.0 additions carry the right dispositions; both versions normalize; /sidebar/write is declared', async () => {
   const adapterMod = await importLib('adapters/dsh-better-sidebar/methods.js')
   const specOf = (name) => adapterMod.SIDEBAR_METHODS[name]
