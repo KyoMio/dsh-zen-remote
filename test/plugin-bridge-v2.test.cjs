@@ -145,7 +145,7 @@ test('locator rejects illegal shapes, naming the field', () => {
   }
 })
 
-test('prefix, deny and rewriteIds accept only true, and refuse anything else, naming the field', () => {
+test('prefix and deny accept only true; rewriteIds accepts true or { fields }, and refuse anything else, naming the field', () => {
   const fields = ['prefix', 'deny', 'rewriteIds']
   for (const field of fields) {
     const ok = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', [field]: true }] })

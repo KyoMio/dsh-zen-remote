@@ -840,6 +840,11 @@ test('PB-25a: missing paths, walks through scalars and arrays, already-virtual a
     reply({ a: { b: ['session-new'] } })
     const arrayWalk = await h.host.get(`/v2/create-deep?sessionId=${encodeURIComponent(VA)}`)
     assert.deepEqual(await arrayWalk.json(), { a: { b: ['session-new'] } })
+    // A NULL mid-path segment (a: null) walks the same dead branch — the
+    // review's adversarial shape, pinned here.
+    reply({ a: null })
+    const nullWalk = await h.host.get(`/v2/create-deep?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await nullWalk.json(), { a: null })
 
     // Already-virtual and empty values ON the declared path: skipped, never
     // double-wrapped, never conjured.
