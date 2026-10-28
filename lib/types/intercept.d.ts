@@ -270,6 +270,18 @@ export interface InterceptDiagnostics {
      * oldest first, capped at 200. */
     closedSessions: ClosedSessionRecord[];
 }
+/** PB-25b: one merged global stream's share of the KNOWN-real-session
+ * inventory. REPLACE semantics: each `replace` call carries that stream's
+ * FULL current set (the workspace merger's sessionHome snapshot — every real
+ * id the sidebar currently holds as a `zr~` id), never a delta; `dispose`
+ * drops the share (the stream ended — its merger is gone, its ids may no
+ * longer be in the UI's view). The wiring unions the live shares into the
+ * read-only set the plugin-route rewrite consults; nothing here hands out a
+ * mutable reference to merge state. */
+export interface SessionInventorySlot {
+    replace(ids: ReadonlySet<string>): void;
+    dispose(): void;
+}
 export interface InstallInterceptOptions {
     /** The RAW gateway instance (`ctx.typertGateway[symbols.original]`), not
      * the cordis proxy — own properties on the proxy are ignored by everyone. */
@@ -294,6 +306,13 @@ export interface InstallInterceptOptions {
      * read got wrong — so the value must be carried in. Default: permanently
      * `unavailable` (the conservative fallback — tombstones stay). */
     getCurrentSession?: () => CurrentSessionRead;
+    /** PB-25b: the inventory slot factory — one slot per merged global stream
+     * (only the workspace merger ever reports; the control merger has no
+     * session inventory). The wiring unions the live slots' shares into the
+     * set the plugin-route rewrite reads. Absent: no shares are ever reported
+     * and the plugin-route value scan stays exactly the request-local
+     * behavior. */
+    createSessionInventorySlot?: () => SessionInventorySlot;
 }
 export interface InterceptHandle {
     /** Remove both own properties, restoring exactly what was installed over

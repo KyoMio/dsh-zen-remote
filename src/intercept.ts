@@ -605,6 +605,19 @@ export interface InterceptDiagnostics {
   closedSessions: ClosedSessionRecord[]
 }
 
+/** PB-25b: one merged global stream's share of the KNOWN-real-session
+ * inventory. REPLACE semantics: each `replace` call carries that stream's
+ * FULL current set (the workspace merger's sessionHome snapshot — every real
+ * id the sidebar currently holds as a `zr~` id), never a delta; `dispose`
+ * drops the share (the stream ended — its merger is gone, its ids may no
+ * longer be in the UI's view). The wiring unions the live shares into the
+ * read-only set the plugin-route rewrite consults; nothing here hands out a
+ * mutable reference to merge state. */
+export interface SessionInventorySlot {
+  replace(ids: ReadonlySet<string>): void
+  dispose(): void
+}
+
 export interface InstallInterceptOptions {
   /** The RAW gateway instance (`ctx.typertGateway[symbols.original]`), not
    * the cordis proxy — own properties on the proxy are ignored by everyone. */
@@ -629,6 +642,13 @@ export interface InstallInterceptOptions {
    * read got wrong — so the value must be carried in. Default: permanently
    * `unavailable` (the conservative fallback — tombstones stay). */
   getCurrentSession?: () => CurrentSessionRead
+  /** PB-25b: the inventory slot factory — one slot per merged global stream
+   * (only the workspace merger ever reports; the control merger has no
+   * session inventory). The wiring unions the live slots' shares into the
+   * set the plugin-route rewrite reads. Absent: no shares are ever reported
+   * and the plugin-route value scan stays exactly the request-local
+   * behavior. */
+  createSessionInventorySlot?: () => SessionInventorySlot
 }
 
 export interface InterceptHandle {
@@ -1339,6 +1359,10 @@ interface MergedGlobalStreamDeps {
    * sync can announce list rows the UI has no summary for; the control
    * route carries no session lists and never calls it. */
   summarySync: SessionSummarySync
+  /** PB-25b: the inventory slot factory (the wiring's union feed — see
+   * {@link SessionInventorySlot}). One slot per merged stream, disposed with
+   * it; absent when the wiring passed no factory. */
+  createSessionInventorySlot?: () => SessionInventorySlot
 }
 
 /**
@@ -1366,13 +1390,25 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
     log?.('client merge dropped a frame on %s: %s', endpoint, message)
   }
   const initial = relayIdentityOf(relay)
+  // PB-25b: this stream's inventory share — the workspace merger reports its
+  // full real-id set through it (replace-style), and the share dies with the
+  // stream (both exits below: the degraded local-only path and the main
+  // teardown). The control merger has no session inventory and never
+  // reports.
+  const sessionSlot = deps.createSessionInventorySlot?.()
   // Created eagerly so the local leg is observed from its first frame on.
   // The empty identity is a placeholder: the remote pump retargets before
   // any remote frame is ever fed (it only runs under a real handshake).
   let merger: WorkspaceMerger | ControlMerger =
     endpoint === 'session/control'
       ? createControlMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic })
-      : createWorkspaceMerger({ serverId: initial?.serverId ?? '', serverName: initial?.serverName ?? '', onDiagnostic, now: clock.now })
+      : createWorkspaceMerger({
+          serverId: initial?.serverId ?? '',
+          serverName: initial?.serverName ?? '',
+          onDiagnostic,
+          now: clock.now,
+          ...(sessionSlot !== undefined ? { onKnownSessions: (ids: ReadonlySet<string>) => sessionSlot.replace(ids) } : {}),
+        })
 
   /**
    * The status annotation (T34) the CURRENT relay state maps onto, applied
@@ -1563,6 +1599,9 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
     // Remote-side setup failed: degrade to a pure local passthrough so the
     // UI's own stream is untouched and the remote leg never starts.
     log?.('client merge on %s degraded to local-only: %s', endpoint, messageOf(error))
+    // PB-25b: this stream never reports (no remote leg) — drop its share
+    // before the degraded passthrough takes over.
+    sessionSlot?.dispose()
     yield* localOnly(local)
     return
   }
@@ -1740,6 +1779,9 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
     if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
     currentController?.abort()
     flushWaiters()
+    // PB-25b: the stream is over — its inventory share leaves the wiring's
+    // union (its ids may no longer be in the UI's view).
+    sessionSlot?.dispose()
     // Best-effort half-close of the local stream the consumer walked away
     // from — never awaited: an upstream that ignores return() must not
     // hang the teardown.
@@ -2425,6 +2467,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // outlives individual stream generations so a nudge from a workspace leg
   // reaches whichever $events generation is open.
   const summarySync = createSessionSummarySync()
+  // PB-25b: the inventory slot factory (the wiring's union feed) — passed
+  // down to every merged stream, which owns one slot for its lifetime.
+  const createSessionInventorySlot = options.createSessionInventorySlot
   // T62: the current-session getter and the live-merged-stream listener
   // registry behind handle.currentSessionChanged().
   const getCurrentSession = options.getCurrentSession ?? (() => ({ kind: 'unavailable' }) as const)
@@ -3341,6 +3386,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             watchCurrentSession,
             watchUninstall,
             summarySync,
+            createSessionInventorySlot,
           })
         })()
       }

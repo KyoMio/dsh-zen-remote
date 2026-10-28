@@ -37,6 +37,13 @@
  * virtual / empty values are skipped, and the browser sending the wrapped id
  * back closes the loop (the follow-up request forwards the real half). The
  * buffering discipline (8 MB cap, non-JSON verbatim) is unchanged.
+ *
+ * PB-25b pins the value scan's widened lookup: the wiring's known-real-id
+ * inventory (a lazily-read ReadonlySet — the choice over a snapshot, which
+ * would be permanently empty since the streams report after the install)
+ * joins the request-local mapping, so an id in the browser's view but not in
+ * THIS request is rewritten too, while strings outside the set, already-
+ * virtual ones and the option-absent case all stay exactly PB-22.
  */
 'use strict'
 const { test } = require('node:test')
@@ -306,8 +313,11 @@ function fakeRelayClient(relayPort) {
 /** Host + relay + registry + install, wired for the v2 declaration. The
  * T62 current-session signal rides a mutable box the tests flip (`h.
  * setCurrentSession`); `undefined` — the default — is "the wiring reports
- * nothing", exactly the signal's absent shape. */
-async function startV2Harness() {
+ * nothing", exactly the signal's absent shape. PB-25b: pass `{ knownIds:
+ * true }` to wire the known-real-id inventory against the same kind of box
+ * (`h.knownBox.value`); without it the option is ABSENT — the zero-change
+ * control the PB-25b tests lean on. */
+async function startV2Harness({ knownIds } = {}) {
   const host = await startFakeHost()
   host.registerLocalPlugin()
   const relay = await startFakeRelay()
@@ -315,6 +325,7 @@ async function startV2Harness() {
   const registry = createBridgeRegistry()
   registry.register(DECLARED_V2)
   const sessionBox = { value: undefined }
+  const knownBox = { value: undefined }
   const handle = installPluginRouteIntercept({
     webServer: host.raw,
     registry,
@@ -322,6 +333,7 @@ async function startV2Harness() {
     getServerId: () => SERVER_ID,
     getStatus: () => [{ plugin: 'v2-panel', bridged: true, localVersion: '2.0.0', serverVersion: '2.0.0' }],
     getCurrentSession: () => sessionBox.value,
+    ...(knownIds ? { getKnownRealIds: () => knownBox.value } : {}),
     log: () => {},
   })
   return {
@@ -329,6 +341,7 @@ async function startV2Harness() {
     relay,
     relayClient,
     handle,
+    knownBox,
     setCurrentSession(value) { sessionBox.value = value },
     stop: async () => {
       handle.uninstall()
@@ -880,6 +893,115 @@ test('PB-25a: the buffering discipline is unchanged for a fields route — over-
     const plain = await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)
     assert.equal(plain.status, 200)
     assert.equal(await plain.text(), 'session-new')
+  } finally {
+    await h.stop()
+  }
+})
+
+// ---- PB-25b: the known-real-id inventory widens the by-value scan -----------
+
+test('PB-25b: an id in the KNOWN inventory but never in the request is rewritten; strings outside the set pass untouched', async () => {
+  const h = await startV2Harness({ knownIds: true })
+  try {
+    h.knownBox.value = new Set(['session-live', 'session-other'])
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        ok: true,
+        value: {
+          key: 'session-live',
+          list: ['session-live', 'session-ghost', 'session-live-suffix'],
+          deep: { inner: 'session-live' },
+          requested: 'session-a',
+          alreadyVirtual: VA,
+          count: 0,
+        },
+      }))
+    }
+    // The request carries ONLY session-a — session-live comes from the
+    // inventory (the subagents.live object keys / workflows.list rows
+    // shape: in the browser's view, not in this request). 'session-ghost'
+    // and 'session-live-suffix' are outside the set: exact equality only,
+    // the same no-shape-guessing boundary as PB-22. The already-virtual
+    // string is never re-wrapped.
+    const res = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), {
+      ok: true,
+      value: {
+        key: toVirtual(SERVER_ID, 'session-live'),
+        list: [toVirtual(SERVER_ID, 'session-live'), 'session-ghost', 'session-live-suffix'],
+        deep: { inner: toVirtual(SERVER_ID, 'session-live') },
+        requested: VA,
+        alreadyVirtual: VA,
+        count: 0,
+      },
+    })
+
+    // The json-body locator half reads the same inventory.
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, row: 'session-live', other: 'session-ghost' }))
+    }
+    const res2 = await h.host.get('/v2/rewrite-body', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: VA }),
+    })
+    assert.equal(res2.status, 200)
+    assert.deepEqual(await res2.json(), {
+      ok: true,
+      row: toVirtual(SERVER_ID, 'session-live'),
+      other: 'session-ghost',
+    })
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-25b: the inventory is read LIVE per answer — a stream refresh replaces the set and the next answer obeys it', async () => {
+  const h = await startV2Harness({ knownIds: true })
+  try {
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { old: 'session-live', fresh: 'session-fresh' } }))
+    }
+    h.knownBox.value = new Set(['session-live'])
+    const first = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await first.json(), {
+      ok: true,
+      value: { old: toVirtual(SERVER_ID, 'session-live'), fresh: 'session-fresh' },
+    })
+    // The stream refreshed (the merger's replace-style report — the
+    // merge-streams seam pinned in merge-streams.test.cjs): session-live
+    // left the inventory, session-fresh entered. The SAME answer shape now
+    // rewrites the other id — a snapshot taken at install could never see
+    // either, which is why the option is a lazy getter.
+    h.knownBox.value = new Set(['session-fresh'])
+    const second = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await second.json(), {
+      ok: true,
+      value: { old: 'session-live', fresh: toVirtual(SERVER_ID, 'session-fresh') },
+    })
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-25b: without getKnownRealIds wired the scan stays request-local — an inventory-shaped real id passes verbatim', async () => {
+  const h = await startV2Harness()
+  try {
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { mine: 'session-a', theirs: 'session-live' } }))
+    }
+    const res = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(res.status, 200)
+    assert.deepEqual(
+      await res.json(),
+      { ok: true, value: { mine: VA, theirs: 'session-live' } },
+      'the option is absent: only the request-carried id is rewritten (PB-22 behavior verbatim)',
+    )
   } finally {
     await h.stop()
   }

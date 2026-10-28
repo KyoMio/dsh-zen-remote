@@ -360,6 +360,71 @@ test('CP4-client-fix2: onRemoteGone clears the tombstones with the identity — 
   assert.deepEqual(out[0].workspace.sessionIds, [toVirtual('ffffffff', 's2')])
 })
 
+// -- 5b. the known-session inventory report (PB-25b) --------------------------
+//
+// The report is the merge-streams half of the plugin-route rewrite's
+// knownRealIds source: every registry change hands the consumer the FULL
+// current set of real ids (replace-style — never a delta), so a session that
+// left the sub-client's view stops being rewritten with the same refresh
+// that removed it. Every test above runs WITHOUT the callback — the
+// option-absent zero-change half is pinned by the suite as a whole.
+
+function recordingMerger() {
+  const reports = []
+  const m = createWorkspaceMerger({ serverId: SID, serverName: NAME, onKnownSessions: (ids) => reports.push([...ids].sort()) })
+  return { m, reports }
+}
+
+test('PB-25b: the inventory report carries the full sessionHome set per change — tombstones included', () => {
+  const { m, reports } = recordingMerger()
+  m.onLocal(LOCAL_BASELINE)
+  // The baseline learns per workspace record — w-1:{s1,s2} then w-2:{s3} —
+  // each report the FULL set as of that record.
+  m.onRemote(REMOTE_BASELINE)
+  assert.deepEqual(reports, [['s1', 's2'], ['s1', 's2', 's3']])
+  // An upsert dropping s2 from w-1 tombstones it — the UI keeps the id (its
+  // group still lists it as a zr~ row), so the inventory keeps it too.
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s1']) })
+  assert.deepEqual(reports[2], ['s1', 's2', 's3'])
+  // A frame that touches no session registry reports nothing.
+  m.onRemote({ type: 'order', workspaceIds: ['w-2', 'w-1'] })
+  assert.equal(reports.length, 3, 'an order frame reports nothing')
+  // An upsert adding a session reports exactly the full new set.
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-2', '远端二', ['s3', 's4']) })
+  assert.deepEqual(reports[3], ['s1', 's2', 's3', 's4'])
+})
+
+test('PB-25b: a session that leaves the inventory (its workspace diffed away) drops out of the report — the replace seam', () => {
+  const { m, reports } = recordingMerger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  // The reconnecting baseline diffs w-2 away: forgetWorkspace takes s3 out
+  // and the SAME refresh reports the set without it — the consumer never
+  // holds a gone id (the wiring's scan stops rewriting it immediately).
+  m.onRemote({ type: 'baseline', value: { items: [W1], archivedSessionIds: [], pinnedSessionIds: [] } })
+  assert.deepEqual(reports[reports.length - 1], ['s1', 's2'])
+})
+
+test('PB-25b: onRemoteGone reports the empty set; the next identity reports fresh', () => {
+  const { m, reports } = recordingMerger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  m.onRemoteGone()
+  assert.deepEqual(reports[reports.length - 1], [], 'the identity end empties the share')
+  m.retarget({ serverId: 'ffffffff', serverName: '新服务器' })
+  m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-9', '新一', ['s9'])], archivedSessionIds: [], pinnedSessionIds: [] } })
+  assert.deepEqual(reports[reports.length - 1], ['s9'], 'the new identity reports its own ids only')
+})
+
+test('PB-25b: a workspace remove takes its tombstones out of the inventory', () => {
+  const { m, reports } = recordingMerger()
+  m.onLocal(LOCAL_BASELINE)
+  m.onRemote(REMOTE_BASELINE)
+  m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s2']) }) // s1 tombstoned under w-1
+  m.onRemote({ type: 'remove', workspaceId: 'w-1' })
+  assert.deepEqual(reports[reports.length - 1], ['s3'], 'w-1 died with s1 and s2; only w-2\'s s3 remains')
+})
+
 // -- 6. the control merger -----------------------------------------------------------
 
 test('control: a remote baseline is exploded into per-key projections with virtual ids; local frames pass through', () => {

@@ -56,7 +56,7 @@ import { createRelayClient, RelayError, volatileUpdateTouchesServerName } from '
 import type { RelayClient } from './relay-client.js'
 import { computeFingerprints } from './fingerprint.js'
 import { runSelfCheck, installIntercept } from './intercept.js'
-import type { CurrentSessionRead, InterceptDiagnostics, InterceptHandle } from './intercept.js'
+import type { CurrentSessionRead, InterceptDiagnostics, InterceptHandle, SessionInventorySlot } from './intercept.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { checkFetchRouteShape, installFetchRouteIntercept } from './fetch-route-intercept.js'
@@ -1348,6 +1348,39 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // carries nothing new costs one compare.
       interceptHandle?.currentSessionChanged()
     }
+    // PB-25b: the KNOWN-real-session inventory — the union of the merged
+    // global streams' session snapshots (the workspace merger's sessionHome:
+    // every real id the sidebar currently holds as a `zr~` row). Each merged
+    // stream owns one slot; a report REPLACES that stream's share (never a
+    // delta — merge-streams' contract) and the union rebuilds wholesale on
+    // every report and dispose (stream count is single digits). The
+    // plugin-route rewrite reads the union LIVE per answer through the
+    // getter — the same live-read discipline as getServerId/getStatus: a
+    // snapshot captured at install time would be permanently empty (the
+    // streams start reporting after the install), and an id that appears
+    // between two stream refreshes waits for the next refresh by design
+    // (the documented ceiling in merge-streams.ts). Read-only consumption:
+    // nothing below ever mutates what a merger handed over.
+    const knownSessionShares = new Map<SessionInventorySlot, ReadonlySet<string>>()
+    const knownRealIds = new Set<string>()
+    const rebuildKnownRealIds = (): void => {
+      knownRealIds.clear()
+      for (const share of knownSessionShares.values()) {
+        for (const id of share) knownRealIds.add(id)
+      }
+    }
+    const createSessionInventorySlot = (): SessionInventorySlot => {
+      const slot: SessionInventorySlot = {
+        replace(ids) {
+          knownSessionShares.set(slot, ids)
+          rebuildKnownRealIds()
+        },
+        dispose() {
+          if (knownSessionShares.delete(slot)) rebuildKnownRealIds()
+        },
+      }
+      return slot
+    }
     const interceptDiagnostics = (): InterceptDiagnostics | undefined => {
       if (interceptHandle !== undefined) return interceptHandle.diagnostics()
       if (interceptRefused !== undefined) {
@@ -1381,6 +1414,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         relay: relayClient,
         getServerId: () => relayClient.handshakeInfo?.serverId,
         getCurrentSession: () => reportedCurrentSession,
+        // PB-25b: each merged stream reports its real-session inventory
+        // share into the union above.
+        createSessionInventorySlot,
         log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
       })
       interceptHandle = handle
@@ -1538,6 +1574,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // routes' deny hooks read (better-sidebar's open.external carries
         // no session field of its own).
         getCurrentSession: () => (reportedCurrentSession.kind === 'open' ? reportedCurrentSession.sessionId : undefined),
+        // PB-25b: the known-real-session union, read LIVE per rewriteIds
+        // answer — the rewriteIds deep scan rewrites an id that already sits
+        // in the browser's view even when this request never carried it.
+        getKnownRealIds: () => knownRealIds,
         log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
       })
       pluginRouteHandle = handle
