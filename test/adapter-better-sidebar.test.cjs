@@ -79,6 +79,36 @@ test('PB-12/PB-15 table: every method the 0.25.0+0.26.0 sources dispatch is in t
   assert.deepEqual(extra, [], `table entries neither source dispatches: ${extra.join(', ')}`)
 })
 
+// ---- PB-18: the surface extractor — same wire, same digest -----------------------
+
+test('PB-18: extractBetterSidebarSurface is deterministic and groups the fixture versions by wire generation', async () => {
+  const absent = PLUGIN_SOURCES.filter((sourcePath) => !fs.existsSync(sourcePath))
+  if (absent.length > 0) {
+    test.skip(`plugin sources are not on this machine (${absent.join(', ')}); the surface extraction is skipped`)
+    return
+  }
+  const mod = await importLib('adapters/dsh-better-sidebar/surface.js')
+  const surfaces = new Map()
+  for (const sourcePath of PLUGIN_SOURCES) {
+    const source = fs.readFileSync(sourcePath, 'utf8')
+    const surface = mod.extractBetterSidebarSurface(source)
+    // Deterministic: same source in, identical arrays out, twice in a row.
+    assert.deepEqual(mod.extractBetterSidebarSurface(source), surface, `${sourcePath} extraction is not deterministic`)
+    assert.equal(mod.surfaceLooksHealthy(surface), true, `${sourcePath}: extraction looks empty (${surface.methods.length} methods, ${surface.routes.length} routes)`)
+    surfaces.set(sourcePath, { surface, digest: mod.betterSidebarSurfaceDigest(surface) })
+  }
+  const digestOf = (version) => surfaces.get(`/tmp/bs-versions/${version}/lib/index.js`).digest
+  // Wire-identical patch releases share a digest — the whole point of ADR-0003:
+  // 0.26.1 was perf-only, 0.28.2 only changed backend cwd resolution.
+  assert.equal(digestOf('0.26.0'), digestOf('0.26.1'), '0.26.0 and 0.26.1 must share a wire surface')
+  assert.equal(digestOf('0.28.1'), digestOf('0.28.2'), '0.28.1 and 0.28.2 must share a wire surface')
+  // Distinct generations differ: fs.readPage arrived in 0.26.0, git.history in 0.28.1.
+  assert.notEqual(digestOf('0.25.0'), digestOf('0.26.0'), '0.25.0 and 0.26.0 are different wire surfaces')
+  assert.notEqual(digestOf('0.26.0'), digestOf('0.28.1'), '0.26.x and 0.28.1 are different wire surfaces')
+  // And the empty-source tell: nothing healthy about a non-build.
+  assert.equal(mod.surfaceLooksHealthy(mod.extractBetterSidebarSurface('')), false)
+})
+
 test('PB-15: the 0.26.0 additions carry the right dispositions; both versions normalize; /sidebar/write is declared', async () => {
   const adapterMod = await importLib('adapters/dsh-better-sidebar/methods.js')
   const specOf = (name) => adapterMod.SIDEBAR_METHODS[name]
