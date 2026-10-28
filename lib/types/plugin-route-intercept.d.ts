@@ -9,7 +9,12 @@
  * cannot be served locally (the session lives on the server): the surrogate
  * handler forwards it through `relay.pluginRequest` (PB-3's
  * `relay/v1/plugin`) with the real id restored, and streams the answer
- * back. Everything else — undeclared routes, local sessions — flows to the
+ * back (PB-21: where the id lives is the route's own declaration — the 2.1
+ * query parameter, or a declaration-v2 locator in a prefix route's path
+ * segment or the JSON body; the v2 shapes ride the SAME adapter-core
+ * locate → classify → rewrite functions the adapters run, and a
+ * `prefix: true` route forwards its full matched, rewritten path).
+ * Everything else — undeclared routes, local sessions — flows to the
  * original route untouched.
  *
  * The un-bridged refusals answer a UNIFORM 503 shape (header

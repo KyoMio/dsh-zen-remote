@@ -9,7 +9,12 @@
  * cannot be served locally (the session lives on the server): the surrogate
  * handler forwards it through `relay.pluginRequest` (PB-3's
  * `relay/v1/plugin`) with the real id restored, and streams the answer
- * back. Everything else — undeclared routes, local sessions — flows to the
+ * back (PB-21: where the id lives is the route's own declaration — the 2.1
+ * query parameter, or a declaration-v2 locator in a prefix route's path
+ * segment or the JSON body; the v2 shapes ride the SAME adapter-core
+ * locate → classify → rewrite functions the adapters run, and a
+ * `prefix: true` route forwards its full matched, rewritten path).
+ * Everything else — undeclared routes, local sessions — flows to the
  * original route untouched.
  *
  * The un-bridged refusals answer a UNIFORM 503 shape (header
@@ -26,8 +31,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { BridgeRegistry, BridgeStatus } from './plugin-bridge.js'
-import { routeMethodsOf, routeMaxBodyOf, routeUpgradesOf } from './plugin-bridge.js'
+import type { BridgeLocator, BridgeRegistry, BridgeStatus, NormalizedBridgeRoute } from './plugin-bridge.js'
+import { routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeUpgradesOf } from './plugin-bridge.js'
 import { PassThrough, Readable, Transform } from 'node:stream'
 import type { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
@@ -141,14 +146,45 @@ interface DeclaredHit {
   plugin: string
   version: string
   digest: string
-  /** The declared route path — the exact string the forward uses. */
+  /** The declared route path — what an exact route forwards verbatim (a
+   * prefix route forwards its full matched pathname instead). */
   path: string
-  sessionParam: string
+  /** The EFFECTIVE session-id locator (PB-21, {@link routeLocatorOf}): the
+   * declared locator, or the 2.1 query-parameter convention read as one —
+   * a route never runs without a locating rule. */
+  locator: BridgeLocator
+  /** The EFFECTIVE prefix mark (PB-21, {@link routePrefixOf}): the route
+   * admits its variable path tail. */
+  prefix: boolean
   /** The EFFECTIVE forwardable methods (PB-9): the declared list, or
    * `['GET']` when the route declared none. */
   methods: string[]
   /** The EFFECTIVE body cap (PB-9), in bytes. */
   maxBody: number
+  /** The same effective values folded into the adapter-core route shape —
+   * the object locate/classify/rewrite consume (PB-21, see
+   * {@link bridgeRouteAsAdapterRoute}). */
+  view: NormalizedAdapterRoute
+}
+
+/** The NormalizedBridgeRoute read through the adapter-core route shapes
+ * (PB-21): the declaration-v2 locators must ride the SAME locate →
+ * classify → rewrite functions the adapters run — never a second copy of
+ * those rules — so the cooperative route is handed to them as the
+ * NormalizedAdapterRoute those functions consume. Every field comes from a
+ * plugin-bridge effective reader; `deny` stays unset until PB-22 gives it
+ * a cooperative meaning. */
+function bridgeRouteAsAdapterRoute(route: NormalizedBridgeRoute): NormalizedAdapterRoute {
+  return {
+    path: route.path,
+    match: routePrefixOf(route) ? 'prefix' : 'exact',
+    methods: routeMethodsOf(route),
+    maxBody: routeMaxBodyOf(route),
+    stream: route.stream,
+    upgrade: routeUpgradesOf(route),
+    locator: routeLocatorOf(route),
+    local: false,
+  }
 }
 
 export function installPluginRouteIntercept(options: InstallPluginRouteInterceptOptions): PluginRouteInterceptHandle {
@@ -244,30 +280,39 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       ? (route as { handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> }).handler
       : undefined
 
-  /** The declared route this pathname hits — EXACT equality only this task
-   * (a declared prefix does not cover longer paths; that arrives with
-   * PB-12). First plugin in registry order wins, deterministically. */
+  /** The declared route this pathname hits — exact equality, or, for a
+   * route declared `prefix: true` (PB-21), equality or one path segment
+   * deeper on the RAW undecoded pathname. The rule is `adapterPathMatches`
+   * itself, run against the route's adapter-core view, so the cooperative
+   * match can never drift from the adapters'. First plugin in registry
+   * order wins, and within it the first route in declaration order — a
+   * pathname two routes of one plugin can both hit belongs to the earlier
+   * one, exactly as the exact-only lookup always did. */
   const declaredRouteOf = (pathname: string): DeclaredHit | undefined => {
     for (const declaration of registry.list()) {
       for (const route of declaration.routes) {
-        if (route.path === pathname) {
-          return {
-            plugin: declaration.plugin,
-            version: declaration.version,
-            digest: declaration.digest,
-            path: route.path,
-            sessionParam: route.sessionParam,
-            methods: routeMethodsOf(route),
-            maxBody: routeMaxBodyOf(route),
-          }
+        const view = bridgeRouteAsAdapterRoute(route)
+        if (!adapterPathMatches(view, pathname)) continue
+        return {
+          plugin: declaration.plugin,
+          version: declaration.version,
+          digest: declaration.digest,
+          path: route.path,
+          locator: routeLocatorOf(route),
+          prefix: routePrefixOf(route),
+          methods: routeMethodsOf(route),
+          maxBody: routeMaxBodyOf(route),
+          view,
         }
       }
     }
     return undefined
   }
 
-  /** The surrogate handler: ONE query parse, the virtual-id gate, the
-   * unbridged walls in contract order, then the relay round-trip. */
+  /** The surrogate handler, query locator's half (every 2.1 route and an
+   * explicit query declaration): ONE query parse, the virtual-id gate, the
+   * unbridged walls in contract order, then the relay round-trip. A
+   * declaration-v2 locator dispatches to the PB-21 half below. */
   const surrogateHandler = (declared: DeclaredHit, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
     async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
       const passthrough = async (): Promise<void> => {
@@ -284,16 +329,28 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         await passthrough()
         return
       }
+      // PB-21: a v2 locator (path-segment / json-body) runs the adapter-core
+      // pipeline in its own half — the query locator keeps THIS code path
+      // verbatim. The dispatch sits after the installed check, so the v2
+      // half never runs chained-over either.
+      if (declared.locator.in !== 'query') {
+        await surrogateV2Handler(declared, originalHandler)(req, res)
+        return
+      }
       // ONE parse of the query (the session parameter's home — `match` only
-      // ever saw the pathname): everything below reads THIS parse.
-      let searchParams: URLSearchParams
+      // ever saw the pathname): everything below reads THIS parse. The
+      // parameter NAME is the effective locator's (the 2.1 sessionParam for
+      // a route that declared no locator — the same value routeLocatorOf
+      // reads back out).
+      let requestUrl: URL
       try {
-        searchParams = new URL(req.url ?? '/', 'http://local').searchParams
+        requestUrl = new URL(req.url ?? '/', 'http://local')
       } catch {
         answerUnbridged(res, declared.plugin, 'bad-query')
         return
       }
-      const values = searchParams.getAll(declared.sessionParam)
+      const searchParams = requestUrl.searchParams
+      const values = searchParams.getAll(declared.locator.name)
       // The parameter appearing MORE than once is a shape violation the
       // bridge refuses (bad-query) — never a passthrough, and never a
       // forward of whichever duplicate a parser happens to keep. Its TOTAL
@@ -354,7 +411,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       log?.('plugin route %s forwards for %s', declared.path, declared.plugin)
       // The session id rides the CHECKED parse, restored to its ORIGINAL
       // form, re-serialized once — what was judged is what is forwarded.
-      searchParams.set(declared.sessionParam, parts.id)
+      searchParams.set(declared.locator.name, parts.id)
       const controller = new AbortController()
       // The counting gate's failure has its OWN abort signal (PB-9-fix, the
       // mirror of the relay route's bodyGateError): tripping the gate is a
@@ -408,7 +465,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             plugin: declared.plugin,
             version: declared.version,
             digest: declared.digest,
-            path: declared.path,
+            // A prefix route (PB-21) forwards its FULL matched pathname —
+            // the declared base alone would lose the variable tail; an
+            // exact route's pathname IS the declared path, the bytes that
+            // always travelled.
+            path: declared.prefix ? requestUrl.pathname : declared.path,
             query: searchParams.toString(),
             method,
             ...(hasBody ? { body: bodyStream } : {}),
@@ -487,6 +548,282 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         }
         const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : 'offline'
         answerUnbridged(res, declared.plugin, code === 'aborted' ? 'offline' : code)
+      } finally {
+        res.off('close', onClientGone)
+      }
+    }
+
+  /** The PB-21 surrogate half for the declaration-v2 locators — json-body,
+   * and path-segment on a prefix route: the adapter surrogate's pipeline
+   * (locate → classify → walls → rewrite → the relay round-trip) run
+   * through the SAME adapter-core functions against the route's
+   * adapter-core view. The response discipline stays the query half's —
+   * three headers, no hooks: `deny` and `rewriteIds` are PB-22's business.
+   * Dispatch above guarantees `installed` and a non-query locator. */
+  const surrogateV2Handler = (declared: DeclaredHit, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      const plugin = declared.plugin
+      // The local passthrough. A json-body route has ALREADY consumed the
+      // request body by the time this runs (the classify needs the parsed
+      // body), so the replay hands the buffered bytes back behind the
+      // original request's metadata — the shape a local handler actually
+      // reads (method/url/headers/pipe).
+      const passthrough = async (replayBody?: Buffer): Promise<void> => {
+        if (originalHandler === undefined) {
+          res.writeHead(404)
+          res.end()
+          return
+        }
+        if (replayBody !== undefined) {
+          const replay = new PassThrough()
+          replay.end(replayBody)
+          Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
+          await originalHandler(replay as unknown as IncomingMessage, res)
+          return
+        }
+        await originalHandler(req, res)
+      }
+      let controller: AbortController | undefined
+      const onClientGone = (): void => {
+        if (controller !== undefined && !res.writableEnded) controller.abort()
+      }
+      res.on('close', onClientGone)
+      // The counting gate's LOCAL flag (the query half's PB-9-fix shape): a
+      // tripped gate answers the local 413 in the catch below — never an
+      // offline verdict, never a half-written response.
+      let bodyGateFailed = false
+      const bodyAbort = new AbortController()
+      try {
+        let url: URL
+        try {
+          url = new URL(req.url ?? '/', 'http://local')
+        } catch {
+          answerUnbridged(res, plugin, 'bad-query')
+          return
+        }
+        const pathname = url.pathname
+        const searchParams = url.searchParams
+        const method = req.method ?? 'GET'
+        const hasBody = method !== 'GET' && method !== 'HEAD'
+
+        // A json-body route buffers the request body up front, bounded by
+        // the route's own maxBody — the cooperative 413 shape, answered
+        // locally, the plugin never reached. A path-segment route's body is
+        // never consumed by locating; it streams through the counting gate
+        // at the forward.
+        let bufferedBody: Buffer | undefined
+        if (hasBody && declared.locator.in === 'json-body') {
+          const chunks: Buffer[] = []
+          let size = 0
+          let over = false
+          for await (const chunk of req) {
+            size += (chunk as Buffer).length
+            if (size > declared.maxBody) {
+              over = true
+              break
+            }
+            chunks.push(Buffer.from(chunk as Uint8Array))
+          }
+          if (over) {
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.writeHead(413)
+            res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+            recordRefusal(plugin, 'body-too-large')
+            log?.('plugin request for %s refused locally: body-too-large (%s buffered)', declared.path, size)
+            return
+          }
+          bufferedBody = Buffer.concat(chunks)
+        }
+        // A present body must parse as JSON when the route locates in it —
+        // a corrupted body refuses rather than falling through to the local
+        // plugin with a body the locate could not judge (the adapter half's
+        // shared rule).
+        let parsedBody: unknown
+        let bodyGiven = false
+        if (hasBody && declared.locator.in === 'json-body' && bufferedBody !== undefined && bufferedBody.length > 0) {
+          try {
+            parsedBody = JSON.parse(bufferedBody.toString('utf8'))
+            bodyGiven = true
+          } catch {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+        }
+        // The remote/local verdict on the ids as they arrived — the
+        // adapter-core classify (locate inside), no second copy of the
+        // rule: every id virtual → forward, none → local, a mix → the
+        // uniform refusal (docs/adr/0001: a remote session never reaches a
+        // local plugin).
+        let verdict: AdapterRemoteVerdict
+        try {
+          verdict = classifyAdapterRequest(declared.view, pathname, searchParams, bodyGiven ? parsedBody : undefined)
+        } catch (error) {
+          if (error instanceof AdapterMultiValueQueryError) {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+          throw error
+        }
+        if (verdict.kind === 'local') {
+          await passthrough(bufferedBody)
+          return
+        }
+        if (verdict.kind === 'mixed') {
+          answerUnbridged(res, plugin, 'bad-query')
+          return
+        }
+        // Remote: the route's method wall, then the per-id server walls —
+        // the query half's gates, re-run per located id.
+        if (!declared.methods.includes(method)) {
+          answerUnbridged(res, plugin, 'method-not-bridged')
+          return
+        }
+        const serverId = getServerId()
+        for (const idHit of verdict.hits) {
+          const parts = fromVirtual(idHit.value)
+          if (parts === undefined || parts.id === '') {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+          if (parts.serverId !== serverId) {
+            answerUnbridged(res, plugin, 'server-changed')
+            return
+          }
+        }
+        // The bridge verdicts judged from the SAME live table the query
+        // half reads.
+        const status = getStatus().find((entry) => entry.plugin === plugin)
+        if (status === undefined || !status.bridged) {
+          answerUnbridged(res, plugin, status?.reason ?? 'not-on-server')
+          return
+        }
+        // Real ids in, coordinates rewritten — the adapter-core rewrite:
+        // the query re-serialized, the path segment re-encoded, the JSON
+        // body re-serialized. The forward carries the REWRITTEN pathname —
+        // a prefix route's full matched path, never the declared base.
+        const rewrite = rewriteAdapterRequest(declared.view, pathname, searchParams, bodyGiven ? parsedBody : undefined, verdict.hits, (virtualId) => fromVirtual(virtualId)!.id)
+        forwarded += 1
+        log?.('plugin route %s forwards for %s', rewrite.pathname, plugin)
+        controller = new AbortController()
+        const forwardSignal = AbortSignal.any([controller.signal, bodyAbort.signal])
+        const accept = typeof req.headers.accept === 'string' ? req.headers.accept : undefined
+        const range = typeof req.headers.range === 'string' ? req.headers.range : undefined
+        const requestContentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined
+        const declaredLength = Number(req.headers['content-length'])
+        let bodyStream: ReadableStream<Uint8Array> | null = null
+        let contentLength: number | undefined
+        if (hasBody && declared.locator.in === 'json-body') {
+          // The buffer forwards in full: the (possibly rewritten)
+          // re-serialization when ids sat in it, the original bytes
+          // otherwise. The REWRITTEN byte count is the declared length —
+          // the budget reads what actually travels.
+          const payload = rewrite.bodyText !== undefined ? Buffer.from(rewrite.bodyText, 'utf8') : bufferedBody ?? Buffer.alloc(0)
+          contentLength = payload.length
+          bodyStream = Readable.toWeb(Readable.from(payload)) as ReadableStream<Uint8Array>
+        } else if (hasBody) {
+          // The pre-check first — a DECLARED Content-Length past the cap
+          // never starts a round-trip — then the counting gate for a
+          // chunked body, exactly the query half's PB-9 discipline.
+          if (Number.isFinite(declaredLength) && declaredLength > declared.maxBody) {
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.writeHead(413)
+            res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+            recordRefusal(plugin, 'body-too-large')
+            log?.('plugin request for %s refused locally: body-too-large (%s declared)', declared.path, req.headers['content-length'])
+            return
+          }
+          let pumped = 0
+          const gate = new Transform({
+            transform(chunk: Buffer, _encoding, callback) {
+              pumped += chunk.length
+              if (pumped > declared.maxBody) {
+                callback(new Error('zr-plugin-body-too-large'))
+                return
+              }
+              callback(null, chunk)
+            },
+          })
+          req.on('error', (error) => gate.destroy(error))
+          gate.on('error', () => {
+            if (!bodyGateFailed) bodyGateFailed = true
+            bodyAbort.abort()
+          })
+          bodyStream = Readable.toWeb(gate) as ReadableStream<Uint8Array>
+          req.pipe(gate)
+          if (Number.isFinite(declaredLength) && declaredLength > 0) contentLength = declaredLength
+        }
+        const response = await relay.pluginRequest(
+          {
+            plugin,
+            version: declared.version,
+            digest: declared.digest,
+            path: rewrite.pathname,
+            query: rewrite.query.toString(),
+            method,
+            ...(bodyStream !== null ? { body: bodyStream } : {}),
+            ...(bodyStream !== null && requestContentType !== undefined ? { contentType: requestContentType } : {}),
+            ...(bodyStream !== null && contentLength !== undefined ? { contentLength } : {}),
+            ...(accept !== undefined ? { accept } : {}),
+            ...(range !== undefined ? { range } : {}),
+          },
+          forwardSignal,
+        )
+        // Down from here the query half's response discipline verbatim: the
+        // relay refusal marker, the three cooperative headers, the pump
+        // with real backpressure.
+        const refusal = response.headers.get('x-zen-remote-error')
+        if (refusal !== null) {
+          await response.body?.cancel().catch(() => {})
+          answerUnbridged(res, plugin, refusal)
+          return
+        }
+        const contentType = response.headers.get('content-type')
+        const responseLength = response.headers.get('content-length')
+        const cacheControl = response.headers.get('cache-control')
+        res.writeHead(response.status, {
+          ...(contentType !== null ? { 'content-type': contentType } : {}),
+          ...(responseLength !== null ? { 'content-length': responseLength } : {}),
+          ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+        })
+        const reader = response.body?.getReader()
+        if (reader !== undefined) {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            if (!res.write(value)) {
+              await new Promise<void>((resolve) => {
+                const settled = (): void => {
+                  res.off('drain', settled)
+                  res.off('close', settled)
+                  resolve()
+                }
+                res.once('drain', settled)
+                res.once('close', settled)
+              })
+            }
+          }
+        }
+        res.end()
+      } catch (error) {
+        // The gate's local flag first (the query half's shape): the 413
+        // still fits while the browser's headers are not out.
+        if (bodyGateFailed && !res.headersSent) {
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.writeHead(413)
+          res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+          recordRefusal(plugin, 'body-too-large')
+          return
+        }
+        if (controller?.signal.aborted || res.destroyed || res.headersSent) {
+          try {
+            res.destroy()
+          } catch {
+            // Already gone.
+          }
+          return
+        }
+        const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : 'offline'
+        answerUnbridged(res, plugin, code === 'aborted' ? 'offline' : code)
       } finally {
         res.off('close', onClientGone)
       }
@@ -897,9 +1234,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   /** The wrapped match: original verdict first, then the adapter routes
    * (PB-11 — BEFORE the declaration lookup: the adapter's registry entry
    * IS a declaration, and the cooperative surrogate's query-sessionParam
-   * logic is not how an adapter request is judged), then the exact
-   * declaration lookup — an undeclared pathname returns whatever the
-   * original match answered, untouched. */
+   * logic is not how an adapter request is judged), then the declaration
+   * lookup — exact paths plus (PB-21) a declared prefix route's full
+   * match. An undeclared pathname returns whatever the original match
+   * answered, untouched. */
   const wrappedMatch = function match(this: unknown, pathname: string): unknown {
     const route = savedMatch.call(this, pathname)
     if (!installed) return route
