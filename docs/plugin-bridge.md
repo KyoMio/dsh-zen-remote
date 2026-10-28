@@ -56,8 +56,14 @@ export function apply(ctx: Context) {
 | `methods` | 可选，缺省 `['GET']`；大写 HTTP 方法数组，只接受 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`，去重并按字典序排序后进规范化与摘要（2.2 起，写请求） |
 | `maxBody` | 可选，缺省 `1048576`（1 MiB）；请求体上限（字节），正整数，最高 500 MiB（与中继上传上限同源单一定义，PB-20 起） |
 | `upgrade` | 可选；置 `true` 标记该路由是 WebSocket 升级端点，远程会话里经字节隧道转发（2.2 起，见下文「WebSocket 路由」）。只能为 `true` 或省略；不能与 `stream` 同用；升级路由只有 GET——显式 `methods` 里出现其他方法登记即报错 |
+| `locator` | 可选（2.4 起）；会话 id 在请求里的位置，替代 `sessionParam`（两者同写登记即报错）：`{ in: 'query', name }` 指定查询参数；`{ in: 'path-segment', index }` 数声明路径之后的第 index 段（0 起）；`{ in: 'json-body', fields }` 取 JSON 体的顶层字段（可列多个，出现几个算几个）。`path-segment` 必须配 `prefix: true`；不写 `locator` 时 `sessionParam` 语义原样保留 |
+| `prefix` | 可选（2.4 起）；置 `true` 时命中 `path` 本身或其任意子路径（`path/…`，按未解码的原始路径名判断，与适配器同一条规则）。不能与 `upgrade` 同用 |
+| `deny` | 可选（2.4 起）；置 `true` 标记路由的数据只在本机有意义：远程会话里命中即拒——请求带虚拟会话 id，或浏览器当前打开的就是远程会话——统一 503 `route-denied`，字节隧道路由同样生效；本地会话完全不受影响 |
+| `rewriteIds` | 可选（2.4 起）；置 `true` 时把远程转发回来的 JSON 响应缓冲（上限 8 MB，超限原样直通）后做深扫改写：凡与**请求自带的**真实会话 id 确切相等的字符串，换回虚拟形态交还浏览器。**边界**：只认请求自带 id 的确切相等——响应里请求未携带的真实会话 id（如 sidechat.start 新建的 childId）会**原样到达浏览器**，需要新 id 回流的创建类流程在远程面板会断（浏览器拿真实 id 发后续请求会被判本地、拿到空数据），那类插件应继续走适配器路线。不能与 `stream` 同用 |
 
-声明里出现未知字段直接报错（防拼错）。`methods`、`maxBody` 与 `upgrade` 只在**显式给出**时进摘要——2.1 时代（没有这三个字段）的声明，摘要与当年完全一致，升级不破坏已桥接状态。2.1 只匹配 **exact 路径**：声明的 `path` 与请求 pathname 完全相等才算命中，把 `path` 写成前缀不会覆盖子路径。
+声明里出现未知字段直接报错（防拼错）。`methods`、`maxBody`、`upgrade` 与 2.4 的四个字段（`locator`/`prefix`/`deny`/`rewriteIds`）只在**显式给出**时进摘要——2.1 时代（没有这些字段）的声明，摘要与当年完全一致，升级不破坏已桥接状态。2.1 只匹配 **exact 路径**；2.4 起声明 `prefix: true` 的路由额外命中其子路径（见上表）。
+
+两个字段同写时 `deny` 优先：远程命中的请求先被 `route-denied` 拒下，`rewriteIds` 的改写不可达（本地请求两边都不触发，响应原样交回）。`upgrade` 路由上的 `rewriteIds` 在隧道半边被忽略——隧道搬运的是不透明字节，无从改写；同一声明路由被当作普通 HTTP 请求命中时照常生效。
 
 ## 你的插件要守的约定
 
@@ -97,7 +103,7 @@ content-type: application/json; charset=utf-8
 ## 限制
 
 - 2.1 只转发 **GET**；2.2 起路由可声明 `methods` 开放写方法（POST 等），请求体经中继流式转发，受该路由 `maxBody` 约束（缺省 1 MiB）——超限在本地即回答 413，不落本机、不到服务端。
-- 只匹配 **exact 路径**；前缀声明不生效。
+- 2.1 只匹配 **exact 路径**；2.4 起声明 `prefix: true` 的路由额外命中其子路径（见「声明字段表」）。
 
 ## WebSocket 路由（2.2 起）
 
