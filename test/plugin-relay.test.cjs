@@ -304,6 +304,62 @@ test('PB-23: a prefix-declared route admits its sub-paths — the loopback sees 
   } finally { await wiring.stop() }
 })
 
+test('PB-23b: an illegal prefix tail refuses 400 bad-request before the loopback; legal tails (plain and encoded-id) still forward', async () => {
+  const wiring = await makeWiring('tail-shapes', { registryOverride: createBridgeRegistry() })
+  try {
+    const PREFIX_DECL = {
+      plugin: 'test-panel',
+      version: '1.0.0',
+      routes: [{ path: '/p/files', scope: 'session', prefix: true }],
+    }
+    const prefixDigest = normalizeDeclaration(PREFIX_DECL).digest
+    wiring.registry.register(PREFIX_DECL)
+
+    // The four illegal tail shapes, one case each — `?` (would break the
+    // parse-once query discipline: the loopback appends its own `?query`
+    // and a host splits at the FIRST one), `#`, `..` (raw AND the `%2e`
+    // encodings — any encoded dot refuses, the mixed `.%2e.` form decodes
+    // to dot-dot too), whitespace. EVERY refusal answers 400 `bad-request`
+    // and the fake plugin server records nothing.
+    const illegal = [
+      '/p/files/a?x=1',
+      '/p/files/a#frag',
+      '/p/files/../secret',
+      '/p/files/%2e%2e/secret',
+      '/p/files/%2E%2E/secret',
+      '/p/files/.%2e.',
+      '/p/files/a b',
+      '/p/files/a\tb',
+    ]
+    for (const zrPath of illegal) {
+      const before = wiring.pluginServer.state.requests.length
+      const res = await wiring.pluginFetch(ROUTE, { zrPath, digest: prefixDigest })
+      assert.equal(res.status, 400, `${JSON.stringify(zrPath)}: status`)
+      assert.deepEqual(await res.json(), { ok: false, error: { code: 'bad-request' } }, `${JSON.stringify(zrPath)}: body`)
+      assert.equal(res.headers.get('x-zen-remote-error'), 'bad-request', `${JSON.stringify(zrPath)}: marker header`)
+      assert.equal(wiring.pluginServer.state.requests.length, before, `${JSON.stringify(zrPath)}: the plugin server saw nothing`)
+    }
+
+    // The tail check is part of the route-match step: it answers BEFORE the
+    // query parse (an illegal tail plus an invalid query reads bad-request,
+    // not bad-query).
+    const order = await wiring.pluginFetch(ROUTE, { zrPath: '/p/files/a#frag', query: 'other=1', digest: prefixDigest })
+    assert.equal(order.status, 400)
+    assert.equal(order.headers.get('x-zen-remote-error'), 'bad-request')
+
+    // Legal tails keep forwarding verbatim — a plain segment (dots inside a
+    // name are fine, only the `..` pair is not) and an encoded segment (a
+    // space encoded as %20 — the one encoding the red line does NOT refuse).
+    const plain = await wiring.pluginFetch(ROUTE, { zrPath: '/p/files/readme.txt', digest: prefixDigest })
+    assert.equal(plain.status, 200)
+    await plain.text()
+    const encoded = await wiring.pluginFetch(ROUTE, { zrPath: '/p/files/a%20b', digest: prefixDigest })
+    assert.equal(encoded.status, 200)
+    await encoded.text()
+    assert.equal(wiring.pluginServer.state.requests.at(-1).url, '/p/files/a%20b?sessionId=session-shared', 'the encoded tail rode verbatim')
+  } finally { await wiring.stop() }
+})
+
 test('PB-3: the parse-once query — a control-character key cannot fork check and dispatch', async () => {
   const wiring = await makeWiring('query-once')
   try {

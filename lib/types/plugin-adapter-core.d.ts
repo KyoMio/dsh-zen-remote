@@ -195,6 +195,10 @@ export declare function adapterDigestOf(plugin: string, version: string, routes:
 /** The prefix-match rule, shared verbatim by both halves: equality, or any
  * deeper sub-path (`startsWith(path + '/')`), on the RAW undecoded pathname. */
 export declare function adapterPathMatches(route: NormalizedAdapterRoute, pathname: string): boolean;
+/** Whether {@link adapterPathMatches} hit via a deeper tail whose shape
+ * breaks the red line — `false` for a non-match (the caller's routing
+ * refusal answers first) and for an equality hit (no tail at all). */
+export declare function adapterTailShapeViolation(route: NormalizedAdapterRoute, pathname: string): boolean;
 /** The adapter route a forwarded request hit, or `undefined`. `local`
  * routes never match here — they stay on the sub-client's own machine in
  * both directions, so the server half must never see (nor serve) them. */

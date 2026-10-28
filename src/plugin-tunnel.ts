@@ -28,7 +28,7 @@ import { connect as tlsConnect } from 'node:tls'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import { pluginBridgeError, responseJson } from './http.js'
-import { adapterPathMatches, type NormalizedAdapterRoute } from './plugin-adapter-core.js'
+import { adapterPathMatches, adapterTailShapeViolation, type NormalizedAdapterRoute } from './plugin-adapter-core.js'
 import { routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeUpgradesOf } from './plugin-bridge.js'
 import type { BridgeRegistry, NormalizedBridgeRoute, NormalizedDeclaration } from './plugin-bridge.js'
 import type { PluginLoopback } from './plugin-loopback.js'
@@ -83,6 +83,13 @@ export function validatePluginCall(
   // declaration instead of being trusted.
   const route = declaration.routes.find((candidate) => adapterPathMatches(asAdapterRoute(candidate), coords.routePath))
   if (route === undefined) return { ok: false, status: 404, code: 'route-undeclared' }
+  // PB-23b: a prefix hit's variable tail carries the declaration-side shape
+  // red lines itself (`?`, `#`, `..` — encoded forms included — and
+  // whitespace; the shared rule, the adapter segment's too). 400
+  // `bad-request`, the coordinate-shape code this chain already answers.
+  if (adapterTailShapeViolation(asAdapterRoute(route), coords.routePath)) {
+    return { ok: false, status: 400, code: 'bad-request' }
+  }
   let params: URLSearchParams
   try {
     params = new URLSearchParams(coords.rawQuery)
