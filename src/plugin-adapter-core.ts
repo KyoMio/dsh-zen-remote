@@ -166,8 +166,9 @@ const MAX_ROUTES = 64
 
 /** The body cap an ADAPTER route may declare: the relay's own upload
  * budget (`MAX_UPLOAD_BYTES` in upload-limits.ts), which the better-sidebar
- * upload route rides. Wider than the cooperative declaration's 64 MiB
- * because raw media uploads are exactly what an adapter exists to carry. */
+ * upload route rides. The same 500 MiB the cooperative declaration's
+ * maxBody allows — both read the one constant since PB-20; raw media
+ * uploads are exactly what an adapter exists to carry. */
 export const MAX_ADAPTER_BODY_BYTES = MAX_UPLOAD_BYTES
 
 function isRecord(value: unknown): value is Record<string, unknown> {
