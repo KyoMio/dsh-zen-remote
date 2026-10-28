@@ -28,6 +28,13 @@
  * request's own hits ARE the read-only mapping — no table is consulted or
  * written), unknown strings passing through untouched.
  *
+ * PB-25a adds the position form: `rewriteIds: { fields }` declares the dot
+ * paths where the response's NEWLY-CREATED session ids sit (a creation
+ * route's `childId` was never in the request, so no value scan can catch
+ * it). On top of the value scan, each declared path's non-empty, non-virtual
+ * string gains the virtual shell of THIS request's server id; missing paths
+ * are no-ops and nothing is ever guessed beyond the declared positions.
+ *
  * The un-bridged refusals answer a UNIFORM 503 shape (header
  * `x-zen-remote: unbridged`, JSON body naming the reason) — and, decisive
  * for the security posture, they answer WITHOUT the local plugin handler
