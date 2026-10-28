@@ -296,7 +296,7 @@ cd ~/.dsh/profiles/desktop && pnpm install
 
 | 插件 | 移动端与远程适配内容 | 实测版本 |
 | --- | --- | --- |
-| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 移动端右栏全屏抽屉、左缘滑回与安全区避让；**插件桥**内置适配 `0.25.0`、`0.26.0`、`0.26.1`、`0.28.0-alpha.0`、`0.28.0` 五版（服务端授权后远程会话可直接读写服务端文件/Git/任务面板） | 0.19.1 / 适配器 0.25–0.28.0 |
+| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | 移动端右栏全屏抽屉、左缘滑回与安全区避让；**插件桥**内置适配 `0.25.0` 至 `0.28.2` 七版（服务端授权后远程会话可直接读写服务端文件/Git/任务面板） | 0.19.1 / 适配器 0.25–0.28.2 |
 | [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | AgentTeams 活动浮层避让会话顶栏、子代理头部保留父会话一键返回 | 0.1.9 |
 | [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | 用量与余额入口收进手机主屏 chips 行 | 0.2.9 |
 | [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | 定时任务入口收进手机主屏 chips 行 | 0.2.3 |
