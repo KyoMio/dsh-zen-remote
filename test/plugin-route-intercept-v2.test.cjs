@@ -637,6 +637,7 @@ test("PB-22: a rewriteIds route deep-scans its JSON answer — the request's own
     }
     const res2 = await h.host.get('/v2/rewrite-body', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: VA, childId: VB }) })
     assert.equal(res2.status, 200)
+    // 'session-unknown' / 'session-a-suffix' passing through verbatim IS the documented rewriteIds boundary (docs/plugin-bridge.md field table): a real id the request never carried — sidechat.start's new-childId shape — reaches the browser untouched by design, not an oversight.
     assert.deepEqual(await res2.json(), {
       ok: true,
       value: {
