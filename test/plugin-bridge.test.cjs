@@ -15,7 +15,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { normalizeDeclaration, createBridgeRegistry, compareBridges, routeMethodsOf, routeMaxBodyOf, routeUpgradesOf } = require('../lib/plugin-bridge.js')
+const { normalizeDeclaration, createBridgeRegistry, compareBridges, routeMethodsOf, routeMaxBodyOf, routeUpgradesOf, MAX_ROUTE_BODY_BYTES } = require('../lib/plugin-bridge.js')
 
 /** One legal declaration everything else is patched from. */
 const DECL = {
@@ -282,8 +282,11 @@ test('PB-9: methods validates, uppercases nothing (strict), dedupes and sorts; d
   assert.deepEqual(routeMethodsOf(normalized.routes[0]), ['DELETE', 'GET', 'POST'])
 })
 
-test('PB-9: maxBody must be a positive integer up to 64 MiB; omitted reads as 1 MiB', () => {
-  for (const bad of [0, -1, 1.5, 'x', true, 64 * 1024 * 1024 + 1]) {
+test('PB-9: maxBody must be a positive integer up to the MAX_ROUTE_BODY_BYTES ceiling; omitted reads as 1 MiB', () => {
+  // PB-20 aligned the ceiling with the upload limit (500 MiB); the
+  // over-ceiling sample reads the constant so this test survives a future
+  // raise (the exact boundary is pinned in plugin-bridge-v2.test.cjs).
+  for (const bad of [0, -1, 1.5, 'x', true, MAX_ROUTE_BODY_BYTES + 1]) {
     assert.throws(
       () => normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', maxBody: bad }] }),
       /maxBody/,

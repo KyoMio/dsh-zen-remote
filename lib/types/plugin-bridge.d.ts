@@ -11,12 +11,15 @@
  * ({@link createBridgeRegistry}), and the local-vs-server comparison that a
  * later task feeds handshake data into ({@link compareBridges}).
  *
- * Pure logic by design: no DSH imports, no I/O, no clocks — the digest is
+ * Pure logic by design: no DSH imports (the one exception is the
+ * pure-constants src/upload-limits.ts, itself zero-import), no I/O, no
+ * clocks — the digest is
  * the only place node:crypto appears, which is fine because this module only
  * ever runs in the backend process. Nothing here talks to the relay or the
  * network; the handshake side and the request rewrite side are later tasks
  * that consume a {@link BridgeRegistry} through src/index.ts.
  */
+import { MAX_UPLOAD_BYTES } from './upload-limits.js';
 /** Where a bridged route's caller supplies the session id. `'session'` — the
  * data is scoped to one session, forwarded after the server checks the share.
  * `'server'` — whole-machine data (e.g. every zcode task), which the server
@@ -25,10 +28,34 @@ export type BridgeScope = 'session' | 'server';
 /** The HTTP methods a bridged route may forward (PB-9). 2.1 accepted GET
  * only; the write methods arrived with the `methods` field. */
 export declare const BRIDGE_METHODS: readonly ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"];
-/** The body cap a route may declare (`maxBody`), in bytes: 64 MiB. */
-export declare const MAX_ROUTE_BODY_BYTES: number;
+/** The body cap a route may declare (`maxBody`), in bytes. This is the SAME
+ * single 500 MiB ceiling {@link MAX_UPLOAD_BYTES} defines in
+ * src/upload-limits.ts, re-exported under the bridge-local name so existing
+ * consumers stay untouched: three ceilings that used to be three numbers —
+ * the relay's `/v1/upload` route, the sub-client's streaming upload forward
+ * (both reading upload-limits.ts directly) and this bridge `maxBody` cap
+ * (hand-copied 64 MiB before declaration-v2) — now share one definition, so
+ * they can never drift apart again. */
+export { MAX_UPLOAD_BYTES as MAX_ROUTE_BODY_BYTES };
 /** The body cap a route gets when it declares none: 1 MiB. */
 export declare const DEFAULT_ROUTE_BODY_BYTES: number;
+/** Where a bridged route's caller supplies the session id — the `locator`
+ * field (declaration-v2). The same three shapes as the adapter core's
+ * `AdapterLocator`: `query` names the search parameter; `path-segment`
+ * counts segments AFTER the declared path (a `prefix` route's variable
+ * part); `json-body` names TOP-LEVEL fields of the parsed JSON request
+ * body. A route without a locator keeps the 2.1 behavior: the session id
+ * rides the query parameter named `sessionParam`. */
+export type BridgeLocator = {
+    in: 'query';
+    name: string;
+} | {
+    in: 'path-segment';
+    index: number;
+} | {
+    in: 'json-body';
+    fields: string[];
+};
 /** One forwardable route as a plugin declares it. `sessionParam` names the
  * URL query parameter carrying the session id (default `'sessionId'`);
  * `stream` marks routes answered as an event stream rather than one JSON
@@ -38,7 +65,17 @@ export declare const DEFAULT_ROUTE_BODY_BYTES: number;
  * (PB-9) caps the forwarded request body in bytes; omitted means
  * {@link DEFAULT_ROUTE_BODY_BYTES}. `upgrade` (PB-10) marks the route as a
  * WebSocket endpoint carried over the byte tunnel — GET-only, mutually
- * exclusive with `stream`. */
+ * exclusive with `stream`.
+ *
+ * The four declaration-v2 fields: `locator` replaces the query-parameter
+ * session-id convention with an explicit {@link BridgeLocator} (mutually
+ * exclusive with `sessionParam`); `prefix: true` admits the route's
+ * variable path tail (sub-paths under `path`) — required for a
+ * `path-segment` locator, refused together with `upgrade` for now; `deny:
+ * true` marks a route the sub-client refuses to serve from a REMOTE
+ * session (local-only data); `rewriteIds: true` asks the sub-client to
+ * rewrite real↔virtual session ids inside the JSON it forwards — never
+ * legal on a `stream` route, whose response is never buffered. */
 export interface BridgeRoute {
     path: string;
     scope: BridgeScope;
@@ -47,6 +84,10 @@ export interface BridgeRoute {
     methods?: readonly string[];
     maxBody?: number;
     upgrade?: boolean;
+    locator?: BridgeLocator;
+    prefix?: boolean;
+    deny?: boolean;
+    rewriteIds?: boolean;
 }
 /** What a plugin hands `zenRemote.bridge(...)` — the raw, unvalidated shape. */
 export interface BridgeDeclaration {
@@ -59,7 +100,11 @@ export interface BridgeDeclaration {
  * explicitly — the distinction is load-bearing for the digest (see the
  * canonical form in {@link normalizeDeclaration}), while consumers read the
  * EFFECTIVE values through {@link routeMethodsOf} / {@link routeMaxBodyOf}
- * / {@link routeUpgradesOf}. */
+ * / {@link routeUpgradesOf}. The four declaration-v2 fields (`locator`,
+ * `prefix`, `deny`, `rewriteIds`) follow the same explicit-only rule, and
+ * each carries its own effective reader:
+ * {@link routeLocatorOf} / {@link routePrefixOf} / {@link routeDeniesRemoteOf}
+ * / {@link routeRewritesIdsOf}. */
 export interface NormalizedBridgeRoute {
     path: string;
     scope: BridgeScope;
@@ -68,6 +113,12 @@ export interface NormalizedBridgeRoute {
     methods: string[] | undefined;
     maxBody: number | undefined;
     upgrade: boolean | undefined;
+    /** Present only when declared — an ABSENT key (not a `locator: undefined`
+     * key) keeps the digest-compatible shape and deep-equality of 2.1 routes. */
+    locator?: BridgeLocator;
+    prefix?: true;
+    deny?: true;
+    rewriteIds?: true;
 }
 /** The effective upgrade mark of one normalized route. */
 export declare function routeUpgradesOf(route: NormalizedBridgeRoute): boolean;
@@ -75,6 +126,19 @@ export declare function routeUpgradesOf(route: NormalizedBridgeRoute): boolean;
 export declare function routeMethodsOf(route: NormalizedBridgeRoute): string[];
 /** The effective body cap of one normalized route, in bytes. */
 export declare function routeMaxBodyOf(route: NormalizedBridgeRoute): number;
+/** The effective session-id locator of one normalized route. A route that
+ * declared none keeps the 2.1 convention: the session id rides the query
+ * parameter named by `sessionParam`. */
+export declare function routeLocatorOf(route: NormalizedBridgeRoute): BridgeLocator;
+/** The effective prefix mark of one normalized route: does the route admit
+ * its variable path tail (sub-paths under `path`)? */
+export declare function routePrefixOf(route: NormalizedBridgeRoute): boolean;
+/** The effective remote-deny mark of one normalized route: must this route
+ * refuse to serve a REMOTE session (local-only data)? */
+export declare function routeDeniesRemoteOf(route: NormalizedBridgeRoute): boolean;
+/** The effective id-rewrite mark of one normalized route: does the
+ * sub-client rewrite real↔virtual session ids while forwarding? */
+export declare function routeRewritesIdsOf(route: NormalizedBridgeRoute): boolean;
 /** A declaration after validation: every route field filled, routes sorted
  * by path, and the 16-hex-char digest both ends will compare. */
 export interface NormalizedDeclaration {

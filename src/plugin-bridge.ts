@@ -11,7 +11,9 @@
  * ({@link createBridgeRegistry}), and the local-vs-server comparison that a
  * later task feeds handshake data into ({@link compareBridges}).
  *
- * Pure logic by design: no DSH imports, no I/O, no clocks — the digest is
+ * Pure logic by design: no DSH imports (the one exception is the
+ * pure-constants src/upload-limits.ts, itself zero-import), no I/O, no
+ * clocks — the digest is
  * the only place node:crypto appears, which is fine because this module only
  * ever runs in the backend process. Nothing here talks to the relay or the
  * network; the handshake side and the request rewrite side are later tasks
@@ -19,6 +21,7 @@
  */
 
 import { createHash } from 'node:crypto'
+import { MAX_UPLOAD_BYTES } from './upload-limits.js'
 
 /** Where a bridged route's caller supplies the session id. `'session'` — the
  * data is scoped to one session, forwarded after the server checks the share.
@@ -30,11 +33,30 @@ export type BridgeScope = 'session' | 'server'
  * only; the write methods arrived with the `methods` field. */
 export const BRIDGE_METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'] as const
 
-/** The body cap a route may declare (`maxBody`), in bytes: 64 MiB. */
-export const MAX_ROUTE_BODY_BYTES = 64 * 1024 * 1024
+/** The body cap a route may declare (`maxBody`), in bytes. This is the SAME
+ * single 500 MiB ceiling {@link MAX_UPLOAD_BYTES} defines in
+ * src/upload-limits.ts, re-exported under the bridge-local name so existing
+ * consumers stay untouched: three ceilings that used to be three numbers —
+ * the relay's `/v1/upload` route, the sub-client's streaming upload forward
+ * (both reading upload-limits.ts directly) and this bridge `maxBody` cap
+ * (hand-copied 64 MiB before declaration-v2) — now share one definition, so
+ * they can never drift apart again. */
+export { MAX_UPLOAD_BYTES as MAX_ROUTE_BODY_BYTES }
 
 /** The body cap a route gets when it declares none: 1 MiB. */
 export const DEFAULT_ROUTE_BODY_BYTES = 1024 * 1024
+
+/** Where a bridged route's caller supplies the session id — the `locator`
+ * field (declaration-v2). The same three shapes as the adapter core's
+ * `AdapterLocator`: `query` names the search parameter; `path-segment`
+ * counts segments AFTER the declared path (a `prefix` route's variable
+ * part); `json-body` names TOP-LEVEL fields of the parsed JSON request
+ * body. A route without a locator keeps the 2.1 behavior: the session id
+ * rides the query parameter named `sessionParam`. */
+export type BridgeLocator =
+  | { in: 'query'; name: string }
+  | { in: 'path-segment'; index: number }
+  | { in: 'json-body'; fields: string[] }
 
 /** One forwardable route as a plugin declares it. `sessionParam` names the
  * URL query parameter carrying the session id (default `'sessionId'`);
@@ -45,7 +67,17 @@ export const DEFAULT_ROUTE_BODY_BYTES = 1024 * 1024
  * (PB-9) caps the forwarded request body in bytes; omitted means
  * {@link DEFAULT_ROUTE_BODY_BYTES}. `upgrade` (PB-10) marks the route as a
  * WebSocket endpoint carried over the byte tunnel — GET-only, mutually
- * exclusive with `stream`. */
+ * exclusive with `stream`.
+ *
+ * The four declaration-v2 fields: `locator` replaces the query-parameter
+ * session-id convention with an explicit {@link BridgeLocator} (mutually
+ * exclusive with `sessionParam`); `prefix: true` admits the route's
+ * variable path tail (sub-paths under `path`) — required for a
+ * `path-segment` locator, refused together with `upgrade` for now; `deny:
+ * true` marks a route the sub-client refuses to serve from a REMOTE
+ * session (local-only data); `rewriteIds: true` asks the sub-client to
+ * rewrite real↔virtual session ids inside the JSON it forwards — never
+ * legal on a `stream` route, whose response is never buffered. */
 export interface BridgeRoute {
   path: string
   scope: BridgeScope
@@ -54,6 +86,10 @@ export interface BridgeRoute {
   methods?: readonly string[]
   maxBody?: number
   upgrade?: boolean
+  locator?: BridgeLocator
+  prefix?: boolean
+  deny?: boolean
+  rewriteIds?: boolean
 }
 
 /** What a plugin hands `zenRemote.bridge(...)` — the raw, unvalidated shape. */
@@ -68,7 +104,11 @@ export interface BridgeDeclaration {
  * explicitly — the distinction is load-bearing for the digest (see the
  * canonical form in {@link normalizeDeclaration}), while consumers read the
  * EFFECTIVE values through {@link routeMethodsOf} / {@link routeMaxBodyOf}
- * / {@link routeUpgradesOf}. */
+ * / {@link routeUpgradesOf}. The four declaration-v2 fields (`locator`,
+ * `prefix`, `deny`, `rewriteIds`) follow the same explicit-only rule, and
+ * each carries its own effective reader:
+ * {@link routeLocatorOf} / {@link routePrefixOf} / {@link routeDeniesRemoteOf}
+ * / {@link routeRewritesIdsOf}. */
 export interface NormalizedBridgeRoute {
   path: string
   scope: BridgeScope
@@ -77,6 +117,12 @@ export interface NormalizedBridgeRoute {
   methods: string[] | undefined
   maxBody: number | undefined
   upgrade: boolean | undefined
+  /** Present only when declared — an ABSENT key (not a `locator: undefined`
+   * key) keeps the digest-compatible shape and deep-equality of 2.1 routes. */
+  locator?: BridgeLocator
+  prefix?: true
+  deny?: true
+  rewriteIds?: true
 }
 
 /** The effective upgrade mark of one normalized route. */
@@ -92,6 +138,31 @@ export function routeMethodsOf(route: NormalizedBridgeRoute): string[] {
 /** The effective body cap of one normalized route, in bytes. */
 export function routeMaxBodyOf(route: NormalizedBridgeRoute): number {
   return route.maxBody ?? DEFAULT_ROUTE_BODY_BYTES
+}
+
+/** The effective session-id locator of one normalized route. A route that
+ * declared none keeps the 2.1 convention: the session id rides the query
+ * parameter named by `sessionParam`. */
+export function routeLocatorOf(route: NormalizedBridgeRoute): BridgeLocator {
+  return route.locator ?? { in: 'query', name: route.sessionParam }
+}
+
+/** The effective prefix mark of one normalized route: does the route admit
+ * its variable path tail (sub-paths under `path`)? */
+export function routePrefixOf(route: NormalizedBridgeRoute): boolean {
+  return route.prefix === true
+}
+
+/** The effective remote-deny mark of one normalized route: must this route
+ * refuse to serve a REMOTE session (local-only data)? */
+export function routeDeniesRemoteOf(route: NormalizedBridgeRoute): boolean {
+  return route.deny === true
+}
+
+/** The effective id-rewrite mark of one normalized route: does the
+ * sub-client rewrite real↔virtual session ids while forwarding? */
+export function routeRewritesIdsOf(route: NormalizedBridgeRoute): boolean {
+  return route.rewriteIds === true
 }
 
 /** A declaration after validation: every route field filled, routes sorted
@@ -162,11 +233,11 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
   const normalizedRoutes = routes.map((route, index): NormalizedBridgeRoute => {
     if (!isPlainObject(route)) fail(`routes[${index}]`, 'expected an object')
     for (const key of Object.keys(route)) {
-      if (key !== 'path' && key !== 'scope' && key !== 'sessionParam' && key !== 'stream' && key !== 'methods' && key !== 'maxBody' && key !== 'upgrade') {
+      if (key !== 'path' && key !== 'scope' && key !== 'sessionParam' && key !== 'stream' && key !== 'methods' && key !== 'maxBody' && key !== 'upgrade' && key !== 'locator' && key !== 'prefix' && key !== 'deny' && key !== 'rewriteIds') {
         fail(`routes[${index}].${key}`, 'unknown field (typo guard)')
       }
     }
-    const { path, scope, sessionParam, stream, methods, maxBody, upgrade } = route
+    const { path, scope, sessionParam, stream, methods, maxBody, upgrade, locator, prefix, deny, rewriteIds } = route
     if (typeof path !== 'string' || path === '') fail(`routes[${index}].path`, 'must be a non-empty string')
     if (!path.startsWith('/')) fail(`routes[${index}].path`, `"${path}" must start with "/"`)
     if (path.includes('?')) fail(`routes[${index}].path`, `"${path}" must not contain "?"`)
@@ -215,8 +286,8 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
     // default.
     let normalizedMaxBody: number | undefined
     if (maxBody !== undefined) {
-      if (typeof maxBody !== 'number' || !Number.isInteger(maxBody) || maxBody <= 0 || maxBody > MAX_ROUTE_BODY_BYTES) {
-        fail(`routes[${index}].maxBody`, `must be a positive integer up to ${MAX_ROUTE_BODY_BYTES}`)
+      if (typeof maxBody !== 'number' || !Number.isInteger(maxBody) || maxBody <= 0 || maxBody > MAX_UPLOAD_BYTES) {
+        fail(`routes[${index}].maxBody`, `must be a positive integer up to ${MAX_UPLOAD_BYTES}`)
       }
       normalizedMaxBody = maxBody
     }
@@ -224,6 +295,15 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
     // declaration, not a toggle), it cannot coexist with `stream` (a route
     // is one thing), and it is GET-only — an explicit `methods` naming
     // anything else cannot be an upgrade route.
+    // PB-20: `prefix` — a declaration that the route admits its variable
+    // path tail (sub-paths under `path`), required by a `path-segment`
+    // locator below and refused next to `upgrade` (checked in the upgrade
+    // block). Only `true` is legal — this is a declaration, not a toggle.
+    let normalizedPrefix: true | undefined
+    if (prefix !== undefined) {
+      if (prefix !== true) fail(`routes[${index}].prefix`, 'must be true or omitted')
+      normalizedPrefix = true
+    }
     let normalizedUpgrade: boolean | undefined
     if (upgrade !== undefined) {
       if (upgrade !== true) fail(`routes[${index}].upgrade`, 'must be true or omitted')
@@ -231,18 +311,86 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
       if (normalizedMethods !== undefined && normalizedMethods.some((entry) => entry !== 'GET')) {
         fail(`routes[${index}].upgrade`, 'upgrade routes are GET-only')
       }
+      if (normalizedPrefix === true) {
+        fail(`routes[${index}].prefix`, 'cannot be combined with upgrade — a WebSocket tunnel over a prefix route is left for when a need shows up')
+      }
       normalizedUpgrade = true
     }
-    return { path, scope, sessionParam: param, stream: streamFlag, methods: normalizedMethods, maxBody: normalizedMaxBody, upgrade: normalizedUpgrade }
+    // PB-20: `locator` — where the session id lives, REPLACING the
+    // query-parameter convention (so the two fields can never coexist; a
+    // route without one keeps `sessionParam`'s 2.1 semantics). Shapes and
+    // the path-segment/prefix pairing mirror the adapter core's locator
+    // (PB-11) so the two ends read identically.
+    let normalizedLocator: BridgeLocator | undefined
+    if (locator !== undefined) {
+      if (sessionParam !== undefined) {
+        fail(`routes[${index}].locator`, 'cannot be combined with sessionParam — a route locates its session id one way')
+      }
+      if (!isPlainObject(locator)) fail(`routes[${index}].locator`, 'expected an object')
+      if (locator.in === 'query') {
+        if (typeof locator.name !== 'string' || !SESSION_PARAM_PATTERN.test(locator.name)) {
+          fail(`routes[${index}].locator.name`, `"${String(locator.name)}" must match ${SESSION_PARAM_PATTERN.source}`)
+        }
+        normalizedLocator = { in: 'query', name: locator.name }
+      } else if (locator.in === 'path-segment') {
+        if (typeof locator.index !== 'number' || !Number.isInteger(locator.index) || locator.index < 0) {
+          fail(`routes[${index}].locator.index`, 'must be a non-negative integer')
+        }
+        if (normalizedPrefix !== true) {
+          fail(`routes[${index}].locator`, 'path-segment locating needs prefix: true (the id lives in the variable tail only a prefix route admits)')
+        }
+        normalizedLocator = { in: 'path-segment', index: locator.index }
+      } else if (locator.in === 'json-body') {
+        if (!Array.isArray(locator.fields) || locator.fields.length === 0 || locator.fields.some((entry) => typeof entry !== 'string' || entry === '')) {
+          fail(`routes[${index}].locator.fields`, 'must be a non-empty array of field names')
+        }
+        normalizedLocator = { in: 'json-body', fields: [...locator.fields] }
+      } else {
+        fail(`routes[${index}].locator.in`, 'must be "query", "path-segment" or "json-body"')
+      }
+    }
+    // PB-20: `deny` — the route must refuse a REMOTE session (its data is
+    // local-only). Only `true` is legal.
+    let normalizedDeny: true | undefined
+    if (deny !== undefined) {
+      if (deny !== true) fail(`routes[${index}].deny`, 'must be true or omitted')
+      normalizedDeny = true
+    }
+    // PB-20: `rewriteIds` — the sub-client rewrites real↔virtual session
+    // ids while forwarding. Never legal on a stream route: a streaming
+    // response is never buffered, so there is nothing to rewrite.
+    let normalizedRewriteIds: true | undefined
+    if (rewriteIds !== undefined) {
+      if (rewriteIds !== true) fail(`routes[${index}].rewriteIds`, 'must be true or omitted')
+      if (streamFlag) fail(`routes[${index}].rewriteIds`, 'cannot be combined with stream — a streaming response is never buffered, so there are no ids to rewrite')
+      normalizedRewriteIds = true
+    }
+    // Explicit-only (digest rule): the four v2 fields attach to the
+    // normalized route ONLY when declared — an absent key, not an
+    // `undefined` one, so the canonical form and the deep-equality shape of
+    // 2.1-era routes stay byte-for-byte what they were.
+    return {
+      path,
+      scope,
+      sessionParam: param,
+      stream: streamFlag,
+      methods: normalizedMethods,
+      maxBody: normalizedMaxBody,
+      upgrade: normalizedUpgrade,
+      ...(normalizedLocator !== undefined && { locator: normalizedLocator }),
+      ...(normalizedPrefix && { prefix: normalizedPrefix }),
+      ...(normalizedDeny && { deny: normalizedDeny }),
+      ...(normalizedRewriteIds && { rewriteIds: normalizedRewriteIds }),
+    }
   })
   normalizedRoutes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 
   // Fixed key order = the canonical form both ends hash; insertion order of
   // the object literal IS the contract, JSON.stringify never sorts. The
-  // route entries carry `methods` / `maxBody` ONLY when the plugin declared
-  // them — `JSON.stringify` drops `undefined` values, but the explicit
-  // conditional documents the intent and keeps the PB-1 compatibility
-  // visible instead of incidental.
+  // route entries carry `methods` / `maxBody` / `upgrade` and the four v2
+  // fields ONLY when the plugin declared them — `JSON.stringify` drops
+  // `undefined` values, but the explicit conditional documents the intent
+  // and keeps the PB-1 compatibility visible instead of incidental.
   const canonical = JSON.stringify({
     plugin,
     version,
@@ -256,6 +404,10 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
       if (route.methods !== undefined) entry.methods = route.methods
       if (route.maxBody !== undefined) entry.maxBody = route.maxBody
       if (route.upgrade !== undefined) entry.upgrade = route.upgrade
+      if (route.locator !== undefined) entry.locator = route.locator
+      if (route.prefix !== undefined) entry.prefix = route.prefix
+      if (route.deny !== undefined) entry.deny = route.deny
+      if (route.rewriteIds !== undefined) entry.rewriteIds = route.rewriteIds
       return entry
     }),
   })
