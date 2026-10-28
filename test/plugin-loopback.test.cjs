@@ -229,16 +229,30 @@ test('a chunked plugin answer streams in order with its whitelisted headers', as
     const response = await loopback.request('GET', '/panel/hold', 'sessionId=s1', {}, null, new AbortController().signal)
     assert.equal(response.status, 200)
     assert.equal(response.contentType, 'application/x-ndjson')
+    // Chunk BOUNDARIES are not part of the contract: TCP/HTTP may coalesce
+    // back-to-back writes (Node 24 delivers 'chunk-2\n' + 'chunk-3\n' as one
+    // 'data' event, Node 22 as two). What the loopback owes the caller is the
+    // bytes in wire order, and that it streams — the first chunk must reach
+    // the caller while the plugin still holds the response open.
     const seen = []
+    let firstData
+    const first = new Promise((resolve) => { firstData = resolve })
     const done = new Promise((resolve) => {
-      response.stream.on('data', (chunk) => seen.push(chunk.toString('utf8')))
+      response.stream.on('data', (chunk) => {
+        seen.push(chunk.toString('utf8'))
+        firstData()
+      })
       response.stream.on('end', resolve)
     })
+    await first
+    assert.equal(seen.join(''), 'chunk-1\n', 'the first chunk streams through before the rest is written')
     dsh.release('chunk-2\n')
     dsh.release('chunk-3\n')
     dsh.finish()
     await done
-    assert.deepEqual(seen, ['chunk-1\n', 'chunk-2\n', 'chunk-3\n'], 'the chunks arrive in wire order')
+    assert.ok(seen.length >= 1, 'at least one data event')
+    assert.ok(seen.every((c) => c.length > 0), 'no empty data events')
+    assert.equal(seen.join(''), 'chunk-1\nchunk-2\nchunk-3\n', 'the bytes arrive complete and in wire order')
   } finally {
     await dsh.stop()
   }
