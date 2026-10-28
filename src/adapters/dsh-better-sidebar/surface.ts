@@ -10,14 +10,20 @@
  * digest over that reduction whitelists every version whose WIRE SURFACE matches
  * a blessed one — regardless of the version string.
  *
- * What the extraction is NOT: a general static analyzer. It knows better-sidebar's
- * two shapes — the route literals it registers, and the `"x.y": async (…)`
+ * What the extraction is NOT: a general static analyzer, nor a pure wire
+ * oracle. It knows better-sidebar's two shapes — the `"x.y": async (…)`
  * dispatch-table entries inside its bundled lib/index.js (the same recognition
- * test/adapter-better-sidebar.test.cjs layer 1 has pinned since PB-12). Comments
- * and formatting cannot move (the npm build strips them); an internal refactor
- * that renames variables cannot move it; a bundler that stops emitting the
- * literals CAN — which fails closed (no digest match → the adapter stays out,
- * exactly the unlisted-version behavior of today).
+ * test/adapter-better-sidebar.test.cjs layer 1 has pinned since PB-12), and
+ * every `/sidebar/…` string literal the bundle carries. The npm build KEEPS
+ * comments (0.28.2 ships ~470 `/**` blocks, some quoting path strings), and the
+ * routes set below therefore collects registered routes, prefix checks and
+ * comment mentions alike — the digest is stable exactly as long as ALL those
+ * literals are (PB-18 review, verified with comment add/remove probes). That
+ * is STRICTER than "wire unchanged": an upstream release that only edits a
+ * path-mentioning comment changes the digest and fails closed to the
+ * unlisted-version behavior of today — never an unsafe forward, just a smaller
+ * auto-bridge hit rate than a pure wire comparison would give. A bundler that
+ * stops emitting the literals at all fails the same closed direction.
  *
  * Pure by the adapters rule: node:crypto only, no fs, no DSH imports.
  */
@@ -39,23 +45,28 @@ const NAMESPACE_PATTERN = /^(session|fs|git|changes|subagents|workflows|teams|se
  * the table — the wiring logs that distinctly from "surface changed". */
 export const MIN_SURFACE_METHODS = 45
 
-/** `/sidebar/…` route literals the bundle registers (upload rides a prefix,
- * the media route a deeper one — every generation spells them out literally). */
-const ROUTE_PATTERN = /\/sidebar\/[a-z0-9./:-]+/giu
+/** Every `/sidebar/…` literal in the bundle — registered routes (the upload
+ * prefix, the deeper media route) plus prefix checks and comment mentions.
+ * Lowercase only on purpose: the routes themselves are lowercase, and a
+ * case-insensitive scan would swallow uppercase prose noise for no gain
+ * (PB-18 review nit — the `i` flag is deliberately absent). */
+const ROUTE_PATTERN = /\/sidebar\/[a-z0-9./:-]+/gu
 
 /** `"ns.method":` dispatch-table entries (`async` optional after the colon). */
 const METHOD_PATTERN = /"([a-zA-Z]+\.[a-zA-Z-]+)":\s*(?:async\s*)?\(/gu
 
-/** Reduce one build's lib/index.js source to its wire surface. Deterministic:
- * same source in, same sorted arrays out — the digest below is a pure function
- * of the surface, and patch releases that leave the wire alone (0.28.2's cwd
- * fix, 0.26.1's perf work) hash identically to their predecessor. */
+/** Reduce one build's lib/index.js source to its surface fingerprint.
+ * Deterministic: same source in, same sorted arrays out — the digest below is
+ * a pure function of the surface. Empirically, wire-identical patch releases
+ * also hash identically (0.26.1's perf work, 0.28.2's cwd fix — both kept
+ * every extracted literal); see the header for why that is a fact about those
+ * releases, not a structural guarantee. */
 export function extractBetterSidebarSurface(source: string): BetterSidebarSurface {
   const routes = new Set<string>()
   for (const match of source.matchAll(ROUTE_PATTERN)) {
-    // A route literal immediately followed by a period was matched through a
-    // sentence like "/sidebar/api/foo.bar" — trim the trailing dot the pattern
-    // can pick up off a following sentence (the PB-12 layer-1 behavior).
+    // A literal matched through a sentence like "/sidebar/api/foo." would drag
+    // a sentence-period into the set — trim one trailing dot so prose mentions
+    // normalize to the same literal the code registers.
     routes.add(match[0].replace(/\.$/u, ''))
   }
   const methods = new Set<string>()

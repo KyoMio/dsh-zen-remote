@@ -105,6 +105,7 @@ test('PB-18: extractBetterSidebarSurface is deterministic and groups the fixture
   // Distinct generations differ: fs.readPage arrived in 0.26.0, git.history in 0.28.1.
   assert.notEqual(digestOf('0.25.0'), digestOf('0.26.0'), '0.25.0 and 0.26.0 are different wire surfaces')
   assert.notEqual(digestOf('0.26.0'), digestOf('0.28.1'), '0.26.x and 0.28.1 are different wire surfaces')
+  assert.notEqual(digestOf('0.28.0'), digestOf('0.28.1'), '0.28.0 and 0.28.1 are different wire surfaces (git.history)')
   // And the empty-source tell: nothing healthy about a non-build.
   assert.equal(mod.surfaceLooksHealthy(mod.extractBetterSidebarSurface('')), false)
 })
