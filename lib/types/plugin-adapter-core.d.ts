@@ -160,12 +160,10 @@ export interface NormalizedAdapter {
     declaration: NormalizedDeclaration;
     hooks: AdapterHooks;
 }
-/** The body cap an ADAPTER route may declare: 500 MiB — the relay's own
- * upload budget (lib/relay-server.js `MAX_UPLOAD_BYTES`), which the
- * better-sidebar upload route rides. Wider than the cooperative
- * declaration's 64 MiB because raw media uploads are exactly what an
- * adapter exists to carry; test/adapter-better-sidebar.test.cjs pins the
- * two numbers together. */
+/** The body cap an ADAPTER route may declare: the relay's own upload
+ * budget (`MAX_UPLOAD_BYTES` in upload-limits.ts), which the better-sidebar
+ * upload route rides. Wider than the cooperative declaration's 64 MiB
+ * because raw media uploads are exactly what an adapter exists to carry. */
 export declare const MAX_ADAPTER_BODY_BYTES: number;
 /** Validate one adapter's route table and fold it, together with the
  * INSTALLED plugin version, into the registry-ready form.

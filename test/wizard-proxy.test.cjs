@@ -48,7 +48,7 @@ test('nginx snippet: full server block with upgrade map, forwarding headers, tim
   assert.ok(result.text.includes('server_name dsh.example.com;'))
   assert.ok(result.text.includes('proxy_pass http://127.0.0.1:4088;'))
   assert.ok(result.text.includes('proxy_buffering off;'), 'streaming needs buffering off')
-  assert.ok(result.text.includes('client_max_body_size 128m;'))
+  assert.ok(result.text.includes('client_max_body_size 512m;'), 'the cap covers the relay 500 MiB upload ceiling')
   assert.ok(result.text.includes('proxy_read_timeout 3600s;'))
   assert.ok(result.text.includes('proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'))
 })

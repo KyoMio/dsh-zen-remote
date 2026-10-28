@@ -24,6 +24,7 @@ declare module '@deepseek-ai/cordis' {
 import type { AdminAdmission } from './admin-routes.js';
 import type { RelayClient } from './relay-client.js';
 import type { BridgeRegistry } from './plugin-bridge.js';
+import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js';
 export type { BridgeDeclaration, ZenRemoteService } from './plugin-bridge.js';
 export { Config, resolveRole } from './config.js';
 export { sameOriginPost } from './http.js';
@@ -35,8 +36,7 @@ export declare const UPLOAD_ROUTE = "/_dsh/mobile-nav/upload";
 export declare const CLIENT_CONFIG_ROUTE = "/_dsh/mobile-nav/client-config";
 /** Workspace-relative directory uploads land in (also the `@` prefix the composer inserts). */
 export declare const UPLOAD_DIR = ".dsh-uploads";
-/** Body cap when the plugin row sets no `maxUploadBytes`. */
-export declare const DEFAULT_MAX_UPLOAD_BYTES: number;
+export { DEFAULT_MAX_UPLOAD_BYTES };
 /** The live client-role relay client, if one was built. */
 export declare function getRelayClient(): RelayClient | undefined;
 /** The live bridge registry, if a plugin row is currently applied. */

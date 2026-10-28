@@ -133,9 +133,9 @@ server {
 
         # 必须加：nginx 默认 client_max_body_size 只有 1m，而中继的 JSON
         # invoke（远程会话带图消息，上限 32MiB）和附件二进制上传
-        # （relay/v1/upload，上限 100MiB）都远超——缺了这条，文字消息正常、
+        # （relay/v1/upload，上限 500MiB）都远超——缺了这条，文字消息正常、
         # 一发图片就被掐断，子客户端界面报一个没有内容的错误（实测 2026-10-10）。
-        client_max_body_size 128m;
+        client_max_body_size 512m;
     }
 }
 ```
@@ -238,7 +238,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 - **`Error 1033` / 隧道离线**：`cloudflared` 服务没起来或 token 过期。`cloudflared tunnel info <名字>` 看连接数，`sudo launchctl list | grep cloudflared`（macOS）或 `systemctl status cloudflared`（Linux）看服务状态。
 - **502 Bad Gateway**：隧道通了但回源失败——网关没在跑，或 Public Hostname 的 URL 写成了 `3080`（DSH 本体）而不是 `3088`（网关）。写 3080 会绕开整个配对墙，**等于把 DSH 裸奔到公网**，务必确认是 3088。
 - **对话流卡住 / 消息不出来**：WebSocket 没通。Cloudflare 免费版支持 WebSocket，一般是 Zero Trust 里给这个 hostname 挂了 Access 策略拦住了升级请求，或者 ingress 里写了 `disableChunkedEncoding`。
-- **上传大文件失败**：Cloudflare 免费版单请求体上限 100MB。本插件默认上传上限 20MB，低于它，正常不会撞上；真要传更大的文件，先调 Cloudflare 套餐再调 `maxUploadBytes`。
+- **上传大文件失败**：中继通道的附件上传上限是 500MiB，已超 Cloudflare 免费版单请求体 100MB 的墙——走 CF Tunnel 时，超过 100MB 的上传会先被 Cloudflare 拒掉（HTTP 413），与插件配置无关；要么调 Cloudflare 套餐，要么让大文件走不经 CF 的通道。
 - **想再收紧一层**：可以在 Zero Trust → Access 里给这个 hostname 加一条策略（邮箱 OTP 之类），叠在配对码之前。不是必须的，配对墙本身已经是一道认证。
 
 #### 配好后自检（任何反代都做一遍）
@@ -355,7 +355,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `/v1/stream` | POST | 打开一条 DSH 流式订阅。**NDJSON 格式**：响应体每行一条 JSON；`{"type":"ping"}` 心跳行（默认 15 秒一条）防止反代把闲置流掐掉，每条都带当下的 `serverName` / `deviceName`（服务端改名约 15 秒内到达所有客户端）；共享关闭/订阅失效时补一行 `{"type":"error","error":{"code":"unshared"}}` 再结束 |
 | `/v1/event-result` | POST | 审批/提问这类「需要应答事件」的应答回传（`{eventId, result}`），服务端按转发记录核对归属后转交 |
 | `/v1/http` | POST | 改动摘要 / diff 面板的 plain-HTTP 长尾：请求体 `{route, query}` 只登记 `changes.summary` / `changes.diff` 两条、只转发 GET（查询串是这次调用的坐标，不是要转发的请求体）；查询串按允许清单**规范化重建**——只保留 `sessionId`（恰好一次，过共享表）与 `seq` / `index`（至多一次、十进制非负整数），未知参数丢弃，合成 URL 只由规范化结果拼成（两次解析对控制字符的处理差异曾是越权读取口子）——随后**进程内**交给宿主 `/api` 共享 fetch handler，不走回环 HTTP |
-| `/v1/upload` | POST | 远程会话的**非图片附件**上传：请求体是原始字节流（不是 JSON）；查询串按允许清单规范化重建——只保留 `sessionId`（恰好一次、过共享表，未共享 403）与 `name`（至多一次）；上限 100 MiB，`Content-Length` 预检加流式计数双保险，超限 413（先回拒绝再排空尾部字节）；每设备并发 8（超出 429）；随后与 `/v1/http` 一样**进程内**交给宿主 `/api` 共享 handler——上传回执落进的会话与之后 `session/prompt` 解析附件引用的会话是同一个 |
+| `/v1/upload` | POST | 远程会话的**非图片附件**上传：请求体是原始字节流（不是 JSON）；查询串按允许清单规范化重建——只保留 `sessionId`（恰好一次、过共享表，未共享 403）与 `name`（至多一次）；上限 500 MiB，`Content-Length` 预检加流式计数双保险，超限 413（先回拒绝再排空尾部字节）；每设备并发 8（超出 429）；随后与 `/v1/http` 一样**进程内**交给宿主 `/api` 共享 handler——上传回执落进的会话与之后 `session/prompt` 解析附件引用的会话是同一个 |
 | `/v1/unshare` | POST | 子客户端主动关闭某会话的远程（只认共享表内的会话） |
 
 **允许清单里的方法**（其余一律 `forbidden-method`）：会话读写（`session/follow`、`session/page`、`session/prompt`、`session/cancel`、`session/rename`、`session/selectModel`、`session/updateQueue`、`session/attachment`、`session/projections`）、新建与分叉（`session/create`、`session/fork`，结果自动共享）、子智能体（`subagents/prompt`、`subagents/interruptByParent`，按父会话判定）、附件与 @ 引用（`fileUploads/upload`、`fileReferences/list`、`sessionReferenceResolver/candidates`）、面板长尾（`goals/*` 五个、`commands/list|execute`、`agentPresets/select`、`sessionFeedback/record`）、文件树与预览（`workspaceFiles/list|changes|read|readBytes|stat`）、终端（`terminal/*`）、任务（`job/list|follow|kill`）、`skills/list`、消息反馈（`messageFeedback/*`）、`schedule/list`、工作区会话操作（`workspace/pinSession` 等）、以及四个全局读：`session/control` 流、`session/list`、`workspace/follow` 流与 `session/modelCatalog`。前三个不带会话参数，安全靠**输出过滤**：每一帧/每一行结果先按共享表过滤，未共享会话的行到不了客户端；`session/list` 结果行里指向不可访问会话的 `parentSessionId` 字段也会被删掉（行的其余部分照常透传）。`session/modelCatalog` 同样无参数、全局只读——它就是服务端的模型提供方目录，只有分组与模型 id、显示名，不带会话数据；服务端会把结果里的 `failures` 数组清空（宿主的逐组错误文本可能带端点或凭据细节，客户端本来也不展示它）。`sessionReferenceResolver/candidates`（@ 引用候选）的答案带**每一个**服务端会话的标题、目录与现成 mention，同样走行级输出过滤，只放行已共享会话的行。审批/提问事件经 `$zr/events` 订阅转发，逐事件按 `agentId` 判定可达性；已共享会话的运行状态事件（`api-session/status` emit）也经同一条订阅转发（T75），按 `args[0]` 里的会话 id 判定可达性——这是唯一一种被放行的 emit。
