@@ -61,6 +61,23 @@ for (const file of DOCS) {
   }
 }
 
+// --- a2. the READMEs' marketing claim ("up to 500 MiB file uploads") rides the
+// same number (no `/v1/upload` table there — the mention just has to exist
+// and match, so raising the cap drags the READMEs along) ---------------------
+
+const READMES = ['README.md', 'README.zh-CN.md']
+
+for (const file of READMES) {
+  const text = readFileSync(join(root, file), 'utf8')
+  const mibs = [...text.matchAll(/(\d+)\s*MiB/g)].map((match) => Number(match[1]))
+  if (!mibs.includes(capMib)) {
+    failures.push(`${file}: no "${capMib} MiB" mention found — the upload-cap claim drifted from MAX_UPLOAD_BYTES`)
+  }
+  for (const mib of new Set(mibs)) {
+    if (mib !== capMib && mib > 100) failures.push(`${file}: mentions ${mib} MiB — a stale upload-cap claim? (only ${capMib} is the relay number)`)
+  }
+}
+
 // --- b. every nginx body cap we hand out covers the relay -------------------
 
 const NGINX_CAP = /client_max_body_size\s+(\d+)m\s*;/g
