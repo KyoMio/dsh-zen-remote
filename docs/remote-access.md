@@ -399,7 +399,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `x-zr-query` | query 字符串（不带 `?`，会话参数已是真实 id） |
 | `accept`、`range` | 唯二透传给插件的请求头 |
 
-**校验次序**（任一失败即返回，响应带头 `x-zen-remote-error: <code>`）：网关密钥与标记 → 请求体必须为空 → 坐标头形状 → 插件在本机注册表 → 版本与摘要都等于本机 → `x-zr-path` 与声明路由**完全相等**（2.1 只有 exact 语义）→ query 只解析一次、会话参数（该路由声明的 `sessionParam`）恰好一个且非空 → 会话过共享表（含祖先链）→ `scope:'server'` 路由需 `pluginBridgeConsent[plugin] === true`（现场读行配置）→ 每设备并发预算。通过后用 `URLSearchParams` 把**解析结果重新序列化**成 query 再发出——校验的与发出去的是同一个字符串。
+**校验次序**（任一失败即返回，响应带头 `x-zen-remote-error: <code>`）：网关密钥与标记 → 请求体必须为空 → 坐标头形状 → 插件在本机注册表 → 版本与摘要都等于本机 → `x-zr-path` 与声明路由匹配——exact 路由完全相等，`prefix: true` 路由同时收更深子路径（PB-23 起，与适配器段同规则；多条命中按声明次序取第一条，`x-zr-path` 原样不解码）→ query 只解析一次、会话参数（该路由声明的 `sessionParam`）恰好一个且非空 → 会话过共享表（含祖先链）→ `scope:'server'` 路由需 `pluginBridgeConsent[plugin] === true`（现场读行配置）→ 每设备并发预算。通过后用 `URLSearchParams` 把**解析结果重新序列化**成 query 再发出——校验的与发出去的是同一个字符串。
 
 **错误码与状态**：
 
@@ -409,7 +409,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `bad-request` | 400 | 带请求体；坐标头缺失或不成形 |
 | `plugin-unknown` | 404 | 本机注册表无此插件 |
 | `plugin-mismatch` | 409 | 版本或摘要与本机声明不等 |
-| `route-undeclared` | 404 | 路径不精确等于任何声明路由 |
+| `route-undeclared` | 404 | 路径既不等于任何 exact 声明，也不是任何 `prefix: true` 声明的子路径 |
 | `bad-query` | 400 | 会话参数缺失、重复或为空 |
 | `not-shared` | 403 | 会话不可达 |
 | `consent-off` | 403 | 整机数据路由且主人未同意 |
@@ -433,7 +433,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `/v1/plugin-tunnel/send` | `x-zr-tunnel`（open 首行给的隧道 id）、`x-zr-seq`（从 0 起严格递增） | 原始字节，≤ 64 KiB | `{"ok":true}`——等插件那条 socket 收下字节才回（背压：插件收不动，这次的 send 就慢） |
 | `/v1/plugin-tunnel/close` | `x-zr-tunnel` | 无 | `{"ok":true}`，幂等（未知 id 也答 ok） |
 
-open 的校验链与 `/v1/plugin` **完全共享**（注册表 → 版本与摘要 → exact 路由 → parse-once query → 共享表 → 同意墙，次序与错误码一致），外加一条自己的墙：路由还必须声明 `upgrade: true`——普通路由背后没有可拨的 WebSocket 端点，404 `route-undeclared`。通过后中继**自己拨本机 web server**（net/tls、只限回环；自签 https 仅对字面 `127.0.0.1` 放宽证书校验），用收到的四个头与操作者 cookie 手写升级请求（Origin 不写），把 socket 字节逐行泵进 NDJSON 流：
+open 的校验链与 `/v1/plugin` **完全共享**（注册表 → 版本与摘要 → 声明路由匹配（exact / prefix）→ parse-once query → 共享表 → 同意墙，次序与错误码一致），外加一条自己的墙：路由还必须声明 `upgrade: true`——普通路由背后没有可拨的 WebSocket 端点，404 `route-undeclared`（`prefix` 不许与 `upgrade` 同声明，前缀子路径到不了隧道）。通过后中继**自己拨本机 web server**（net/tls、只限回环；自签 https 仅对字面 `127.0.0.1` 放宽证书校验），用收到的四个头与操作者 cookie 手写升级请求（Origin 不写），把 socket 字节逐行泵进 NDJSON 流：
 
 - 首行 `{"type":"open","tunnel":"<32 位十六进制>"}`——子客户端收到它就停止 HTTP、开始读流；拨号失败不丢连接，变成一行 `end` 再关闭；
 - `{"type":"data","b64":"…"}`——上游字节（base64），每行最多 48 KiB **原始**字节（base64 会膨胀 4/3，上限按裸字节算）；

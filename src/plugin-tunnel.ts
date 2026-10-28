@@ -28,7 +28,8 @@ import { connect as tlsConnect } from 'node:tls'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import { pluginBridgeError, responseJson } from './http.js'
-import { routeUpgradesOf } from './plugin-bridge.js'
+import { adapterPathMatches, type NormalizedAdapterRoute } from './plugin-adapter-core.js'
+import { routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeUpgradesOf } from './plugin-bridge.js'
 import type { BridgeRegistry, NormalizedBridgeRoute, NormalizedDeclaration } from './plugin-bridge.js'
 import type { PluginLoopback } from './plugin-loopback.js'
 
@@ -39,6 +40,25 @@ import type { PluginLoopback } from './plugin-loopback.js'
 export type PluginCallValidation =
   | { ok: true; declaration: NormalizedDeclaration; route: NormalizedBridgeRoute; params: URLSearchParams; sessionId: string; normalizedQuery: string }
   | { ok: false; status: number; code: string }
+
+/** The cooperative route through the adapter core's matcher (PB-23): the
+ * path rule is ONE rule on both halves — {@link adapterPathMatches} decides,
+ * fed the declaration route converted to its shape (exact by default;
+ * `prefix: true` becomes the adapter's `match: 'prefix'`). A hand-copied
+ * predicate here could drift from the adapter segment's rule; the conversion
+ * cannot. Only `path` and `match` are actually read by the matcher. */
+function asAdapterRoute(route: NormalizedBridgeRoute): NormalizedAdapterRoute {
+  return {
+    path: route.path,
+    match: routePrefixOf(route) ? 'prefix' : 'exact',
+    methods: routeMethodsOf(route),
+    maxBody: routeMaxBodyOf(route),
+    stream: route.stream,
+    upgrade: routeUpgradesOf(route),
+    locator: routeLocatorOf(route),
+    local: false,
+  }
+}
 
 /** Validate one plugin-bridge call's coordinates — the parse-once query
  * discipline (the re-serialization of THIS parse is the only string the
@@ -55,7 +75,13 @@ export function validatePluginCall(
   if (declaration.version !== coords.pluginVersion || declaration.digest !== coords.pluginDigest) {
     return { ok: false, status: 409, code: 'plugin-mismatch' }
   }
-  const route = declaration.routes.find((candidate) => candidate.path === coords.routePath)
+  // First hit in the declaration's (path-sorted) order wins. PB-23: an
+  // exact-declared route matches equality alone; a `prefix: true` route also
+  // admits every deeper RAW path (`x-zr-path` is matched undecoded, the
+  // module-wide discipline) — the SAME rule the adapter segment applies, so
+  // the sub-client's prefix forwarding (PB-21) is checked here against the
+  // declaration instead of being trusted.
+  const route = declaration.routes.find((candidate) => adapterPathMatches(asAdapterRoute(candidate), coords.routePath))
   if (route === undefined) return { ok: false, status: 404, code: 'route-undeclared' }
   let params: URLSearchParams
   try {
