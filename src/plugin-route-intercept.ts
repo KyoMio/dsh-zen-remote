@@ -28,6 +28,13 @@
  * request's own hits ARE the read-only mapping — no table is consulted or
  * written), unknown strings passing through untouched.
  *
+ * PB-25a adds the position form: `rewriteIds: { fields }` declares the dot
+ * paths where the response's NEWLY-CREATED session ids sit (a creation
+ * route's `childId` was never in the request, so no value scan can catch
+ * it). On top of the value scan, each declared path's non-empty, non-virtual
+ * string gains the virtual shell of THIS request's server id; missing paths
+ * are no-ops and nothing is ever guessed beyond the declared positions.
+ *
  * The un-bridged refusals answer a UNIFORM 503 shape (header
  * `x-zen-remote: unbridged`, JSON body naming the reason) — and, decisive
  * for the security posture, they answer WITHOUT the local plugin handler
@@ -43,7 +50,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { BridgeLocator, BridgeRegistry, BridgeStatus, NormalizedBridgeRoute } from './plugin-bridge.js'
-import { routeDeniesRemoteOf, routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeRewritesIdsOf, routeUpgradesOf } from './plugin-bridge.js'
+import { routeDeniesRemoteOf, routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeRewriteFieldsOf, routeRewritesIdsOf, routeUpgradesOf } from './plugin-bridge.js'
 import { PassThrough, Readable, Transform } from 'node:stream'
 import type { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
@@ -83,6 +90,32 @@ function deepRewriteIds(value: unknown, known: ReadonlyMap<string, string>): unk
   return value
 }
 
+/** PB-25a: the position-based half of a `rewriteIds: { fields }` route's
+ * rewrite. Runs AFTER the value scan above, on the (rebuilt, private) parsed
+ * answer: each declared dot path is walked object-by-object, and a path that
+ * exists and holds a NON-EMPTY, NON-virtual string gains its virtual shell
+ * (`zr~<serverId>~<id>`, the serverId of the request this answer belongs to
+ * — a forward always located one). A path that does not exist — or that
+ * would walk through an array or a scalar — is a no-op: the answer's shape
+ * is the plugin's business, never a rewrite trigger (no shape guessing), and
+ * array elements stay the value scan's business (the declaration refuses
+ * numeric segments outright). Already-virtual values are skipped, so a known
+ * id sitting on a declared path is rewritten exactly once, by whichever half
+ * reached it first. */
+function rewriteIdsAtFields(root: unknown, fields: readonly string[], serverId: string): void {
+  for (const field of fields) {
+    const segments = field.split('.')
+    let node: unknown = root
+    for (const segment of segments.slice(0, -1)) {
+      node = isRecord(node) ? node[segment] : undefined
+    }
+    if (!isRecord(node)) continue
+    const key = segments[segments.length - 1]
+    const value = node[key]
+    if (typeof value === 'string' && value !== '' && !isVirtual(value)) node[key] = toVirtual(serverId, value)
+  }
+}
+
 /** Pump a response body reader into the browser response with real
  * backpressure — the one discipline every verbatim passthrough runs. The
  * `close` listener settles the wait when the browser vanishes mid-body (a
@@ -108,17 +141,21 @@ async function pumpResponse(
   }
 }
 
-/** PB-22: a rewriteIds route's JSON answer — buffered whole (the 8 MB
- * adapter cap), deep-scanned with the request's own real→virtual mapping,
- * re-serialized with a corrected content-length. Past the cap, a non-JSON
- * content type, or a parse failure the answer passes through untouched (the
- * adapter discipline): a rewrite is strictly better-than-nothing, never a
- * reason to mangle or refuse an answer. The caller has already handled the
- * relay's refusal marker — this owns the entire normal answer. */
+/** PB-22/PB-25a: a rewriteIds route's JSON answer — buffered whole (the 8 MB
+ * adapter cap), deep-scanned with the request's own real→virtual mapping
+ * plus, when the route declared field paths, the position rewrite on those
+ * paths, re-serialized with a corrected content-length. Past the cap, a
+ * non-JSON content type, or a parse failure the answer passes through
+ * untouched (the adapter discipline): a rewrite is strictly
+ * better-than-nothing, never a reason to mangle or refuse an answer. The
+ * caller has already handled the relay's refusal marker — this owns the
+ * entire normal answer. */
 async function answerRewriteIds(
   res: ServerResponse,
   response: Response,
   known: ReadonlyMap<string, string>,
+  fields: readonly string[] | undefined,
+  serverId: string,
 ): Promise<void> {
   const contentType = response.headers.get('content-type')
   const verbatimHeaders = {
@@ -170,7 +207,9 @@ async function answerRewriteIds(
   const text = Buffer.concat(chunks).toString('utf8')
   let outBody: Buffer
   try {
-    outBody = Buffer.from(JSON.stringify(deepRewriteIds(JSON.parse(text), known)), 'utf8')
+    const scanned = deepRewriteIds(JSON.parse(text), known)
+    if (fields !== undefined) rewriteIdsAtFields(scanned, fields, serverId)
+    outBody = Buffer.from(JSON.stringify(scanned), 'utf8')
   } catch {
     // Not JSON after all (or the scan hit something unserializable): the
     // original bytes pass through, length recomputed for the corrected
@@ -300,8 +339,13 @@ interface DeclaredHit {
    * or the browser's current session is one. */
   deny: boolean
   /** PB-22: the route's JSON answers are deep-scanned for the request's own
-   * real session ids and re-serialized with their virtual forms. */
+   * real session ids and re-serialized with their virtual forms. Both
+   * `rewriteIds` forms mark it true. */
   rewriteIds: boolean
+  /** PB-25a: the declared field paths of a `{ fields }`-form `rewriteIds`
+   * route — where the response's NEWLY-CREATED session ids sit. `undefined`
+   * for a `true` route (value scan only) and for a route without the field. */
+  rewriteFields: readonly string[] | undefined
   /** The same effective values folded into the adapter-core route shape —
    * the object locate/classify/rewrite consume (PB-21, see
    * {@link bridgeRouteAsAdapterRoute}). */
@@ -446,6 +490,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           maxBody: routeMaxBodyOf(route),
           deny: routeDeniesRemoteOf(route),
           rewriteIds: routeRewritesIdsOf(route),
+          rewriteFields: routeRewriteFieldsOf(route),
           view,
         }
       }
@@ -655,9 +700,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         }
         // PB-22: a rewriteIds route's answer is buffered and deep-scanned
         // (the ids this request named come back virtual); everything else —
-        // non-JSON answers included — streams verbatim.
+        // non-JSON answers included — streams verbatim. PB-25a: a
+        // `{ fields }` declaration adds the position rewrite, under THIS
+        // request's own server id.
         if (declared.rewriteIds) {
-          await answerRewriteIds(res, response, idMapping)
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, parts.serverId)
           return
         }
         const contentType = response.headers.get('content-type')
@@ -858,8 +905,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // route's answer scan consults (`zr~` carries the real id inside, so
         // the ids this very request named are exactly the ones the answer
         // may hand back; nothing outside this exchange is read, and nothing
-        // here writes any session table).
+        // here writes any session table). PB-25a: the SAME unwrap hands the
+        // position rewrite its server id — the ids this request located live
+        // under it, so a NEWLY-created id joins them (the query half's
+        // source verbatim; `remote` always has at least one hit).
         const idMapping = new Map<string, string>()
+        let locatedServerId: string | undefined
         for (const idHit of verdict.hits) {
           const parts = fromVirtual(idHit.value)
           if (parts === undefined || parts.id === '') {
@@ -871,6 +922,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             return
           }
           idMapping.set(parts.id, idHit.value)
+          locatedServerId = parts.serverId
         }
         // The bridge verdicts judged from the SAME live table the query
         // half reads.
@@ -960,7 +1012,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           return
         }
         if (declared.rewriteIds) {
-          await answerRewriteIds(res, response, idMapping)
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, locatedServerId!)
           return
         }
         const contentType = response.headers.get('content-type')

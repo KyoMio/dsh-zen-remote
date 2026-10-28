@@ -26,6 +26,7 @@ const {
   routePrefixOf,
   routeDeniesRemoteOf,
   routeRewritesIdsOf,
+  routeRewriteFieldsOf,
   routeMaxBodyOf,
   MAX_ROUTE_BODY_BYTES,
 } = require('../lib/plugin-bridge.js')
@@ -255,4 +256,75 @@ test('routeLocatorOf defaults to the query-parameter convention; the boolean rea
 
   const custom = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', sessionParam: 'sid' }] }).routes[0]
   assert.deepEqual(routeLocatorOf(custom), { in: 'query', name: 'sid' })
+})
+
+// --- PB-25a: the rewriteIds { fields } form ------------------------------------
+
+test('PB-25a: a rewriteIds fields declaration hashes EXACTLY as its hand-written canonical JSON says', () => {
+  const decl = {
+    plugin: 'creator',
+    version: '4.0.0',
+    routes: [
+      { path: '/c/create', scope: 'session', rewriteIds: { fields: ['value.childId', 'meta.parentId'] } },
+      { path: '/c/echo', scope: 'session', rewriteIds: true },
+    ],
+  }
+  // The fields form serializes as a plain JSON object in the SAME slot the
+  // `true` form occupies (after deny); field order is verbatim. The `true`
+  // route's canonical bytes are UNCHANGED from PB-22 — the two pins above
+  // (2.1-era, v2) carry that compatibility, this one pins the new shape.
+  const canonical =
+    '{"plugin":"creator","version":"4.0.0","routes":[' +
+    '{"path":"/c/create","scope":"session","sessionParam":"sessionId","stream":false,"rewriteIds":{"fields":["value.childId","meta.parentId"]}},' +
+    '{"path":"/c/echo","scope":"session","sessionParam":"sessionId","stream":false,"rewriteIds":true}]}'
+  assert.equal(normalizeDeclaration(decl).digest, digestOfCanonical(canonical))
+})
+
+test('PB-25a: true and { fields } are different declarations — different digests, both enabling the reader', () => {
+  const bool = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', rewriteIds: true }] })
+  const fields = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', rewriteIds: { fields: ['value.childId'] } }] })
+  assert.notEqual(bool.digest, fields.digest)
+  assert.equal(routeRewritesIdsOf(bool.routes[0]), true)
+  assert.equal(routeRewritesIdsOf(fields.routes[0]), true, 'both forms enable the rewrite')
+})
+
+test('PB-25a: the fields form — legal shapes stored verbatim, illegal shapes refused naming the field', () => {
+  // Legal: dot paths of [A-Za-z0-9_-] segments, verbatim order.
+  const ok = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', rewriteIds: { fields: ['value.childId', 'top', 'a-b_C0'] } }] })
+  assert.deepEqual(ok.routes[0].rewriteIds, { fields: ['value.childId', 'top', 'a-b_C0'] })
+  assert.deepEqual([...routeRewriteFieldsOf(ok.routes[0])], ['value.childId', 'top', 'a-b_C0'])
+  // A `true` route exposes NO fields — the position rewrite is declared-only.
+  const bool = normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', rewriteIds: true }] }).routes[0]
+  assert.equal(routeRewriteFieldsOf(bool), undefined)
+  assert.equal(routeRewriteFieldsOf(normalizeDeclaration(DECL).routes[0]), undefined)
+
+  const bad = [
+    ['empty fields array', { fields: [] }],
+    ['fields missing', {}],
+    ['fields not an array', { fields: 'value.childId' }],
+    ['non-string entry', { fields: ['ok', 3] }],
+    ['empty entry', { fields: [''] }],
+    ['empty middle segment', { fields: ['a..b'] }],
+    ['leading dot', { fields: ['.a'] }],
+    ['trailing dot', { fields: ['a.'] }],
+    ['space in segment', { fields: ['value.child id'] }],
+    ['wildcard segment', { fields: ['value.*'] }],
+    ['bracket index syntax', { fields: ['items[0]'] }],
+    ['numeric segment (array index)', { fields: ['items.0.id'] }],
+    ['unknown object key', { fields: ['ok'], extra: 1 }],
+  ]
+  for (const [why, rewriteIds] of bad) {
+    assert.throws(
+      () => normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', rewriteIds }] }),
+      /rewriteIds/,
+      `rewriteIds fields: ${why} must be refused`,
+    )
+  }
+})
+
+test('PB-25a: the fields form cannot ride a stream route either', () => {
+  assert.throws(
+    () => normalizeDeclaration({ ...DECL, routes: [{ path: '/x', scope: 'session', stream: true, rewriteIds: { fields: ['a.b'] } }] }),
+    /rewriteIds.*stream|stream.*rewriteIds/,
+  )
 })

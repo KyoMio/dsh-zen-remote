@@ -46,6 +46,23 @@ export { MAX_UPLOAD_BYTES as MAX_ROUTE_BODY_BYTES }
 /** The body cap a route gets when it declares none: 1 MiB. */
 export const DEFAULT_ROUTE_BODY_BYTES = 1024 * 1024
 
+/** The `fields` form of a route's `rewriteIds` (PB-25a): the DOT PATHS where
+ * the response's NEWLY-CREATED session ids sit — ids a creation route mints
+ * (`sidechat.start`'s `childId`), which were never in the request and so are
+ * invisible to the value deep-scan. Each path walks objects only: segments
+ * of `[A-Za-z0-9_-]`, non-empty, no wildcards, no numeric (array-index)
+ * segments — array elements stay the value scan's business. */
+export interface BridgeRewriteFields {
+  fields: readonly string[]
+}
+
+/** A route's `rewriteIds` value: `true` — deep-scan the answer for the
+ * request's own ids (the 2.4 echo shape) — or the {@link BridgeRewriteFields}
+ * object, which adds the position-based rewrite on top. The two are
+ * DIFFERENT declarations: each hashes its own way, and an old `true`
+ * declaration's digest is bit-for-bit what it always was. */
+export type BridgeRewriteIds = true | BridgeRewriteFields
+
 /** Where a bridged route's caller supplies the session id — the `locator`
  * field (declaration-v2). The same three shapes as the adapter core's
  * `AdapterLocator`: `query` names the search parameter; `path-segment`
@@ -75,8 +92,10 @@ export type BridgeLocator =
  * variable path tail (sub-paths under `path`) — required for a
  * `path-segment` locator, refused together with `upgrade` for now; `deny:
  * true` marks a route the sub-client refuses to serve from a REMOTE
- * session (local-only data); `rewriteIds: true` asks the sub-client to
- * rewrite real↔virtual session ids inside the JSON it forwards — never
+ * is local-only data); `rewriteIds` asks the sub-client to rewrite
+ * real↔virtual session ids inside the JSON it forwards — `true` deep-scans
+ * for the request's own ids, `{ fields }` additionally wraps the
+ * NEWLY-CREATED ids sitting at the declared positions (PB-25a) — never
  * legal on a `stream` route, whose response is never buffered. */
 export interface BridgeRoute {
   path: string
@@ -89,7 +108,7 @@ export interface BridgeRoute {
   locator?: BridgeLocator
   prefix?: boolean
   deny?: boolean
-  rewriteIds?: boolean
+  rewriteIds?: BridgeRewriteIds
 }
 
 /** What a plugin hands `zenRemote.bridge(...)` — the raw, unvalidated shape. */
@@ -108,7 +127,7 @@ export interface BridgeDeclaration {
  * `prefix`, `deny`, `rewriteIds`) follow the same explicit-only rule, and
  * each carries its own effective reader:
  * {@link routeLocatorOf} / {@link routePrefixOf} / {@link routeDeniesRemoteOf}
- * / {@link routeRewritesIdsOf}. */
+ * / {@link routeRewritesIdsOf} / {@link routeRewriteFieldsOf}. */
 export interface NormalizedBridgeRoute {
   path: string
   scope: BridgeScope
@@ -122,7 +141,7 @@ export interface NormalizedBridgeRoute {
   locator?: BridgeLocator
   prefix?: true
   deny?: true
-  rewriteIds?: true
+  rewriteIds?: BridgeRewriteIds
 }
 
 /** The effective upgrade mark of one normalized route. */
@@ -160,9 +179,19 @@ export function routeDeniesRemoteOf(route: NormalizedBridgeRoute): boolean {
 }
 
 /** The effective id-rewrite mark of one normalized route: does the
- * sub-client rewrite real↔virtual session ids while forwarding? */
+ * sub-client rewrite real↔virtual session ids while forwarding? Both
+ * `rewriteIds` forms enable it (`true` and `{ fields }` alike) — which form
+ * decides only whether the POSITION rewrite joins the value scan. */
 export function routeRewritesIdsOf(route: NormalizedBridgeRoute): boolean {
-  return route.rewriteIds === true
+  return route.rewriteIds !== undefined
+}
+
+/** The declared field paths of a `{ fields }`-form `rewriteIds` route
+ * (PB-25a) — where the response's NEWLY-CREATED session ids sit. `undefined`
+ * for a `true` route and for a route without the field: the position
+ * rewrite exists only when explicitly declared. */
+export function routeRewriteFieldsOf(route: NormalizedBridgeRoute): readonly string[] | undefined {
+  return typeof route.rewriteIds === 'object' ? route.rewriteIds.fields : undefined
 }
 
 /** A declaration after validation: every route field filled, routes sorted
@@ -189,6 +218,13 @@ const PLUGIN_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u
 
 /** Query-parameter name carrying the session id. */
 const SESSION_PARAM_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/u
+
+/** One dot-path segment of a `rewriteIds: { fields }` declaration (PB-25a):
+ * `[A-Za-z0-9_-]`, non-empty. The full path splits on `.`; a segment of
+ * ONLY digits is an array index and refused separately below — array
+ * elements are the value deep-scan's business, and a declaration that could
+ * never match (the position rewrite walks objects only) must not register. */
+const REWRITE_FIELD_SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/u
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -356,14 +392,40 @@ export function normalizeDeclaration(input: unknown): NormalizedDeclaration {
       if (deny !== true) fail(`routes[${index}].deny`, 'must be true or omitted')
       normalizedDeny = true
     }
-    // PB-20: `rewriteIds` — the sub-client rewrites real↔virtual session
-    // ids while forwarding. Never legal on a stream route: a streaming
-    // response is never buffered, so there is nothing to rewrite.
-    let normalizedRewriteIds: true | undefined
+    // PB-20/PB-25a: `rewriteIds` — the sub-client rewrites real↔virtual
+    // session ids while forwarding. Two forms: `true` (the 2.4 echo shape —
+    // the value deep-scan over the request's own ids) and `{ fields }`
+    // (PB-25a — adds the position rewrite where NEWLY-CREATED ids sit).
+    // Never legal on a stream route: a streaming response is never buffered,
+    // so there is nothing to rewrite. The two forms hash DIFFERENTLY (see
+    // the canonical form below); an old `true` declaration's digest is
+    // bit-for-bit what it always was.
+    let normalizedRewriteIds: BridgeRewriteIds | undefined
     if (rewriteIds !== undefined) {
-      if (rewriteIds !== true) fail(`routes[${index}].rewriteIds`, 'must be true or omitted')
+      if (rewriteIds === true) {
+        normalizedRewriteIds = true
+      } else if (isPlainObject(rewriteIds)) {
+        for (const key of Object.keys(rewriteIds)) {
+          if (key !== 'fields') fail(`routes[${index}].rewriteIds.${key}`, 'unknown field (typo guard)')
+        }
+        const { fields } = rewriteIds
+        if (!Array.isArray(fields) || fields.length === 0 || fields.some((entry) => typeof entry !== 'string')) {
+          fail(`routes[${index}].rewriteIds.fields`, 'must be a non-empty array of dot paths')
+        }
+        for (const entry of fields as string[]) {
+          const segments = entry.split('.')
+          if (segments.some((segment) => !REWRITE_FIELD_SEGMENT_PATTERN.test(segment))) {
+            fail(`routes[${index}].rewriteIds.fields`, `"${entry}" must be a dot path of non-empty [A-Za-z0-9_-] segments`)
+          }
+          if (segments.some((segment) => /^\d+$/u.test(segment))) {
+            fail(`routes[${index}].rewriteIds.fields`, `"${entry}" must not carry an array index — array elements are the value deep-scan's business`)
+          }
+        }
+        normalizedRewriteIds = { fields: [...fields] }
+      } else {
+        fail(`routes[${index}].rewriteIds`, 'must be true, { fields: [...] } or omitted')
+      }
       if (streamFlag) fail(`routes[${index}].rewriteIds`, 'cannot be combined with stream — a streaming response is never buffered, so there are no ids to rewrite')
-      normalizedRewriteIds = true
     }
     // Explicit-only (digest rule): the four v2 fields attach to the
     // normalized route ONLY when declared — an absent key, not an

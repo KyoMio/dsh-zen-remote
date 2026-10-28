@@ -30,6 +30,13 @@
  *     real ids comes back virtual (envelope fields, arrays, nested objects
  *     alike), unknown strings pass through, and over the cap — or without
  *     the declaration, or for non-JSON answers — the bytes pass verbatim.
+ *
+ * PB-25a pins the `{ fields }` form on top: the response's NEWLY-CREATED id
+ * at a declared dot path gains its virtual shell (the value scan cannot see
+ * it — the request never carried it), missing paths are no-ops, already
+ * virtual / empty values are skipped, and the browser sending the wrapped id
+ * back closes the loop (the follow-up request forwards the real half). The
+ * buffering discipline (8 MB cap, non-JSON verbatim) is unchanged.
  */
 'use strict'
 const { test } = require('node:test')
@@ -71,6 +78,10 @@ const DECLARED_V2 = {
     // own real ids — query locator and json-body locator alike.
     { path: '/v2/rewrite', scope: 'session', rewriteIds: true },
     { path: '/v2/rewrite-body', scope: 'session', methods: ['POST'], locator: { in: 'json-body', fields: ['sessionId', 'childId'] }, rewriteIds: true },
+    // PB-25a rewriteIds { fields }: the position form — the response's
+    // NEWLY-CREATED id at a declared dot path gains its virtual shell.
+    { path: '/v2/create', scope: 'session', rewriteIds: { fields: ['value.childId'] } },
+    { path: '/v2/create-deep', scope: 'session', rewriteIds: { fields: ['a.b.c', 'top'] } },
     // The rewrite CONTROL: the same query shape, no rewriteIds — answers
     // must pass verbatim.
     { path: '/v2/plain', scope: 'session' },
@@ -733,6 +744,137 @@ test('PB-22: answers of routes without rewriteIds — and non-JSON answers of re
     assert.equal(text.status, 200)
     assert.equal(text.headers.get('content-type'), 'text/plain')
     assert.equal(await text.text(), 'session-a')
+  } finally {
+    await h.stop()
+  }
+})
+
+// ---- PB-25a: rewriteIds { fields } — the position form ----------------------
+
+test('PB-25a: a rewriteIds fields route wraps the NEWLY-created id at its declared position; the true form beside it does not', async () => {
+  const h = await startV2Harness()
+  try {
+    // 'session-new' was never in the request — only the position declaration
+    // can see it. The SAME string under an UNDECLARED key stays raw:
+    // positions are declared, never guessed.
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { childId: 'session-new' }, shadow: 'session-new' }))
+    }
+    const wrapped = toVirtual(SERVER_ID, 'session-new')
+    const res = await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(res.status, 200)
+    const text = await res.text()
+    assert.deepEqual(JSON.parse(text), { ok: true, value: { childId: wrapped }, shadow: 'session-new' },
+      "the declared position wrapped; the undeclared same string did NOT")
+    assert.equal(Number(res.headers.get('content-length')), Buffer.byteLength(text), 'the content-length is the REWRITTEN byte count')
+
+    // The control: the SAME answer shape on a `true`-form route — the new id
+    // reaches the browser raw (the value scan's documented boundary), while
+    // the request's own id still comes back virtual from any position.
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { childId: 'session-new' }, echo: 'session-a' }))
+    }
+    const trueForm = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(trueForm.status, 200)
+    assert.deepEqual(await trueForm.json(), { ok: true, value: { childId: 'session-new' }, echo: VA })
+
+    // The closed loop: the browser sends the wrapped id back; the bridge
+    // reads it as virtual and forwards the real half to the plugin.
+    h.relay.state.reply = undefined
+    const follow = await h.host.get(`/v2/plain?sessionId=${encodeURIComponent(wrapped)}`)
+    assert.equal(follow.status, 200)
+    assert.equal(h.relay.state.hits.at(-1).zrQuery, 'sessionId=session-new')
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-25a: value scan and declared positions coexist — every string rewritten exactly once, at depth', async () => {
+  const h = await startV2Harness()
+  try {
+    // a.b.c is DECLARED and holds a KNOWN id: rewritten once, to the very
+    // form the value scan produces — never a double shell. top is DECLARED
+    // with a fresh id (the position wrap's own catch); a.b.d is undeclared
+    // and known (the value scan); a.b.e is undeclared and fresh (nobody's).
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        top: 'session-new',
+        a: { b: { c: 'session-a', d: 'session-a', e: 'session-new' } },
+      }))
+    }
+    const res = await h.host.get(`/v2/create-deep?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), {
+      top: toVirtual(SERVER_ID, 'session-new'),
+      a: { b: { c: VA, d: VA, e: 'session-new' } },
+    })
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-25a: missing paths, walks through scalars and arrays, already-virtual and empty values are all no-ops', async () => {
+  const h = await startV2Harness()
+  try {
+    const reply = (body) => {
+      h.relay.state.reply = (req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(body))
+      }
+    }
+    // A declared path the answer never grew: a structural no-op.
+    reply({ ok: true, unrelated: 'x' })
+    const missing = await h.host.get(`/v2/create-deep?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(missing.status, 200)
+    assert.deepEqual(await missing.json(), { ok: true, unrelated: 'x' })
+
+    // The walk hits a SCALAR (`a` is a string) or an ARRAY (the declaration
+    // refuses numeric segments — arrays are the value scan's business): no
+    // position write, the answer passes structurally unchanged.
+    reply({ a: 'scalar' })
+    const scalar = await h.host.get(`/v2/create-deep?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await scalar.json(), { a: 'scalar' })
+    reply({ a: { b: ['session-new'] } })
+    const arrayWalk = await h.host.get(`/v2/create-deep?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await arrayWalk.json(), { a: { b: ['session-new'] } })
+
+    // Already-virtual and empty values ON the declared path: skipped, never
+    // double-wrapped, never conjured.
+    reply({ ok: true, value: { childId: VB } })
+    const virtual = await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await virtual.json(), { ok: true, value: { childId: VB } })
+    reply({ ok: true, value: { childId: '' } })
+    const empty = await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await empty.json(), { ok: true, value: { childId: '' } })
+  } finally {
+    await h.stop()
+  }
+})
+
+test('PB-25a: the buffering discipline is unchanged for a fields route — over-cap and non-JSON answers pass verbatim', async () => {
+  const h = await startV2Harness()
+  try {
+    const pad = 'x'.repeat(9 * 1024 * 1024)
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { pad, childId: 'session-new' } }))
+    }
+    const over = await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(over.status, 200)
+    const parsed = await over.json()
+    assert.equal(parsed.value.childId, 'session-new', 'NOT wrapped — past the buffer cap the answer is never rewritten')
+    assert.equal(parsed.value.pad.length, pad.length, 'the body crossed byte-intact')
+
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end('session-new')
+    }
+    const plain = await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(plain.status, 200)
+    assert.equal(await plain.text(), 'session-new')
   } finally {
     await h.stop()
   }

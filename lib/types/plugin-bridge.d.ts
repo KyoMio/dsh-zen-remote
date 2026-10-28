@@ -39,6 +39,21 @@ export declare const BRIDGE_METHODS: readonly ["GET", "HEAD", "POST", "PUT", "PA
 export { MAX_UPLOAD_BYTES as MAX_ROUTE_BODY_BYTES };
 /** The body cap a route gets when it declares none: 1 MiB. */
 export declare const DEFAULT_ROUTE_BODY_BYTES: number;
+/** The `fields` form of a route's `rewriteIds` (PB-25a): the DOT PATHS where
+ * the response's NEWLY-CREATED session ids sit — ids a creation route mints
+ * (`sidechat.start`'s `childId`), which were never in the request and so are
+ * invisible to the value deep-scan. Each path walks objects only: segments
+ * of `[A-Za-z0-9_-]`, non-empty, no wildcards, no numeric (array-index)
+ * segments — array elements stay the value scan's business. */
+export interface BridgeRewriteFields {
+    fields: readonly string[];
+}
+/** A route's `rewriteIds` value: `true` — deep-scan the answer for the
+ * request's own ids (the 2.4 echo shape) — or the {@link BridgeRewriteFields}
+ * object, which adds the position-based rewrite on top. The two are
+ * DIFFERENT declarations: each hashes its own way, and an old `true`
+ * declaration's digest is bit-for-bit what it always was. */
+export type BridgeRewriteIds = true | BridgeRewriteFields;
 /** Where a bridged route's caller supplies the session id — the `locator`
  * field (declaration-v2). The same three shapes as the adapter core's
  * `AdapterLocator`: `query` names the search parameter; `path-segment`
@@ -73,8 +88,10 @@ export type BridgeLocator = {
  * variable path tail (sub-paths under `path`) — required for a
  * `path-segment` locator, refused together with `upgrade` for now; `deny:
  * true` marks a route the sub-client refuses to serve from a REMOTE
- * session (local-only data); `rewriteIds: true` asks the sub-client to
- * rewrite real↔virtual session ids inside the JSON it forwards — never
+ * is local-only data); `rewriteIds` asks the sub-client to rewrite
+ * real↔virtual session ids inside the JSON it forwards — `true` deep-scans
+ * for the request's own ids, `{ fields }` additionally wraps the
+ * NEWLY-CREATED ids sitting at the declared positions (PB-25a) — never
  * legal on a `stream` route, whose response is never buffered. */
 export interface BridgeRoute {
     path: string;
@@ -87,7 +104,7 @@ export interface BridgeRoute {
     locator?: BridgeLocator;
     prefix?: boolean;
     deny?: boolean;
-    rewriteIds?: boolean;
+    rewriteIds?: BridgeRewriteIds;
 }
 /** What a plugin hands `zenRemote.bridge(...)` — the raw, unvalidated shape. */
 export interface BridgeDeclaration {
@@ -104,7 +121,7 @@ export interface BridgeDeclaration {
  * `prefix`, `deny`, `rewriteIds`) follow the same explicit-only rule, and
  * each carries its own effective reader:
  * {@link routeLocatorOf} / {@link routePrefixOf} / {@link routeDeniesRemoteOf}
- * / {@link routeRewritesIdsOf}. */
+ * / {@link routeRewritesIdsOf} / {@link routeRewriteFieldsOf}. */
 export interface NormalizedBridgeRoute {
     path: string;
     scope: BridgeScope;
@@ -118,7 +135,7 @@ export interface NormalizedBridgeRoute {
     locator?: BridgeLocator;
     prefix?: true;
     deny?: true;
-    rewriteIds?: true;
+    rewriteIds?: BridgeRewriteIds;
 }
 /** The effective upgrade mark of one normalized route. */
 export declare function routeUpgradesOf(route: NormalizedBridgeRoute): boolean;
@@ -137,8 +154,15 @@ export declare function routePrefixOf(route: NormalizedBridgeRoute): boolean;
  * refuse to serve a REMOTE session (local-only data)? */
 export declare function routeDeniesRemoteOf(route: NormalizedBridgeRoute): boolean;
 /** The effective id-rewrite mark of one normalized route: does the
- * sub-client rewrite real↔virtual session ids while forwarding? */
+ * sub-client rewrite real↔virtual session ids while forwarding? Both
+ * `rewriteIds` forms enable it (`true` and `{ fields }` alike) — which form
+ * decides only whether the POSITION rewrite joins the value scan. */
 export declare function routeRewritesIdsOf(route: NormalizedBridgeRoute): boolean;
+/** The declared field paths of a `{ fields }`-form `rewriteIds` route
+ * (PB-25a) — where the response's NEWLY-CREATED session ids sit. `undefined`
+ * for a `true` route and for a route without the field: the position
+ * rewrite exists only when explicitly declared. */
+export declare function routeRewriteFieldsOf(route: NormalizedBridgeRoute): readonly string[] | undefined;
 /** A declaration after validation: every route field filled, routes sorted
  * by path, and the 16-hex-char digest both ends will compare. */
 export interface NormalizedDeclaration {
