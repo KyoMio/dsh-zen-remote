@@ -223,7 +223,7 @@ export function normalizeAdapter(input: unknown, installedVersion: string, optio
   if (!versions.includes(installedVersion)) {
     const surfaceDigest = options?.surfaceDigest
     const surfaces = input.surfaces as Record<string, string> | undefined
-    if (!(surfaceDigest !== undefined && surfaces !== undefined && surfaceDigest in surfaces)) {
+    if (!(surfaceDigest !== undefined && surfaces !== undefined && Object.hasOwn(surfaces, surfaceDigest))) {
       fail('versions', `installed version "${installedVersion}" is not among the adapter's versions (surface ${surfaceDigest ?? 'not computed'} vs ${surfaces === undefined ? 0 : Object.keys(surfaces).length} listed)`)
     }
   }
