@@ -313,6 +313,8 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     '0.2.1-rc.3': 'r:8e0209aa5eb8',
     // 0.2.1-rc.4: typert.remote-client.js byte-identical to rc.3.
     '0.2.1-rc.4': 'r:8e0209aa5eb8',
+    // 0.2.1-rc.5: typert.remote-client.js byte-identical to rc.4.
+    '0.2.1-rc.5': 'r:8e0209aa5eb8',
     // 0.2.2-alpha.2: six new endpoints (session/events, observeEvent,
     // observeProjections, observeState, state, wait), 21 → 27; the 21 existing
     // ones keep their ids. Mixed 0.2.1/0.2.2 pairs report `session` as different.
