@@ -34,6 +34,8 @@ export declare const zh: {
     readonly activityOpen: "查看子代理与后台任务";
     readonly infoStatTurns: "轮次";
     readonly infoStatSteps: "步骤";
+    readonly infoStatTurnsSteps: "轮次 / 步数";
+    readonly infoStatSpeed: "输出速度";
     readonly infoStatTtft: "首字延迟";
     readonly infoStatLlm: "模型耗时";
     readonly infoStatTool: "工具耗时";

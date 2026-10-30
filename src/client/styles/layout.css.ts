@@ -139,12 +139,18 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
   [data-phase] [class$="_actions"] {
     overflow: hidden !important;
   }
+  /* The 24h clock ("18:06" / "MM-DD 18:06") is a fixed-size item: it must
+     never be the thing that shrinks. DSH 0.2.x wraps it with the usage
+     button in an inline-flex _endInfo (min-width: 0), so a shrinkable
+     time (the old flex: 0 1 auto + min-width: 0) got squeezed inside that
+     non-wrapping box and "18:06" broke into two lines. flex: none pins its
+     width; the turn-tail rules in content.css.ts let _endInfo wrap as a
+     whole instead. */
   [data-phase] [class$="_actions"] [class$="_timeEnd"] {
-    flex: 0 1 auto !important;
-    min-width: 0 !important;
+    flex: none !important;
+    white-space: nowrap !important;
     overflow: hidden !important;
     text-overflow: ellipsis !important;
-    white-space: nowrap !important;
   }
 
   [data-phase] [class$="_scroll"]:has(p) {

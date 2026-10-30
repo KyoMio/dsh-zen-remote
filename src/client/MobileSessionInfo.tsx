@@ -100,6 +100,17 @@ function formatDuration(ms: number): string {
   return `${Math.floor(whole / 60)}m${whole % 60}s`
 }
 
+/**
+ * Decode-throughput figure: whole tokens from ten up, one decimal below.
+ * Ported digit-for-digit from dsh-client-ui-chat lib/client.js
+ * formatTokensPerSecond (DSH 0.2.x TurnUsagePanel; verified 2026-10-30),
+ * which also owns the "{tps} tok/s" unit the cell appends.
+ */
+function formatTokensPerSecond(tps: number): string {
+  const clamped = Math.max(0, tps)
+  return clamped >= 10 ? String(Math.round(clamped)) : String(Math.round(clamped * 10) / 10)
+}
+
 /** Sum of the three disjoint prompt-side billing buckets. */
 function billedInputTokens(usage: { uncachedInputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }): number {
   return usage.uncachedInputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
@@ -448,8 +459,24 @@ export function MobileSessionInfo({
   }
 
   const cells: Array<{ label: string; value: string; sub: string | undefined }> = [
-    { label: t('infoStatTurns'), value: stats === undefined ? NA : String(stats.turns), sub: undefined },
-    { label: t('infoStatSteps'), value: stats === undefined ? NA : String(stats.steps), sub: undefined },
+    /* Turns and steps share one cell ("3 / 12") so the grid stays 2×3 with
+       output speed taking the freed slot (UI-1, 2026-10-30). */
+    {
+      label: t('infoStatTurnsSteps'),
+      value: stats === undefined ? NA : `${stats.turns} / ${stats.steps}`,
+      sub: undefined,
+    },
+    /* Same guard and formula as the official TurnUsagePanel: decodeMs > 0
+       is its "we have a throughput reading" test, so a session with no
+       usage-reporting step shows the placeholder, never "0 tok/s". */
+    {
+      label: t('infoStatSpeed'),
+      value:
+        stats === undefined || stats.decodeMs <= 0
+          ? NA
+          : `${formatTokensPerSecond(stats.decodeTokens / (stats.decodeMs / 1e3))} tok/s`,
+      sub: undefined,
+    },
     {
       label: t('infoStatTtft'),
       value: stats === undefined || stats.ttftSteps === 0 ? NA : formatDuration(stats.ttftMs / stats.ttftSteps),
