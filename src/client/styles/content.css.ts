@@ -84,15 +84,25 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
     max-width: none !important;
   }
 
-  /* Turn-tail metadata (2026-08-18): the timing stats ("18:06 · 用时 29秒 ·
-     首 token 0.9秒 · 163 tok/s") are desktop-hover-revealed (official
-     [data-time-hover-root] gate holds them at opacity 0 until :hover /
-     :focus-within) — a phone never hovers, so they were simply invisible;
-     and even ignoring that, the row is nowrap + overflow:hidden (plus this
-     plugin's own legacy ellipsis clamp in layout.css.ts), which clipped the
-     text. On phones: always visible, own full-width line under the action
-     icons, wrapping freely, one type size down. !important + the extra
-     [class$="_actions"] hop out-specifies both upstream and layout.css.ts. */
+  /* Turn-tail metadata (2026-08-18; reshaped 2026-10-30 for DSH 0.2.x): the
+     tail's 24h clock is desktop-hover-revealed (official
+     [data-time-hover-root] gate holds it at opacity 0 until :hover /
+     :focus-within) — a phone never hovers, so it was simply invisible; and
+     the row is a fixed-height nowrap + overflow:hidden flex line (plus this
+     plugin's own clamp in layout.css.ts), which clipped it.
+
+     DSH 0.2.x (MessageIconActions, dsh-client-ui-chat) groups the usage
+     button (TurnUsagePanel) and the clock (_timeEnd) inside ONE inline-flex
+     _endInfo (min-width: 0; align-items: center; gap: 8px; margin-left: 8px)
+     that never wraps internally. The 0.1.x-era rule here gave _timeEnd
+     flex-basis: 100% + white-space: normal — inside _endInfo that no longer
+     reads as "own full-width line", it reads as "shrink to nothing and
+     break", and with the transcript-wide overflow-wrap: anywhere above,
+     "18:06" rendered as two lines. On phones now: always visible; the row
+     may grow in height and wrap; _endInfo drops to the next line as one
+     unit when icons + usage + clock do not fit; the clock itself never
+     shrinks or breaks. !important + the extra [class$="_actions"] hop
+     out-specifies both upstream and layout.css.ts. */
   /* Pin the tail row's width chain before allowing wrap: with wrap enabled
      the row's intrinsic (shrink-to-fit) width collapses to its widest
      single icon, taking the whole tail down to ~16px. */
@@ -100,9 +110,26 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
   [data-chat-flow-kind="turn-tail"] [class$="_actions"] {
     width: 100%;
   }
+  /* height: auto releases the upstream fixed height: calc(28px + …);
+     overflow: visible beats layout.css.ts's overflow: hidden (same
+     specificity — this file is concatenated last, so it wins the tie). A
+     wrapped second line must not be cut off vertically; min-height keeps
+     the one-line case at the upstream height so nothing shifts when it
+     fits. */
   [data-chat-flow-kind="turn-tail"] [class$="_actions"] {
     flex-wrap: wrap;
     row-gap: 2px;
+    height: auto !important;
+    min-height: 28px;
+    overflow: visible !important;
+  }
+  /* _endInfo moves as a whole: flex: none so the usage + clock group is
+     never asked to shrink — when the row is too narrow the entire group
+     wraps to the next line instead of compressing the clock inside it.
+     max-width keeps an unusually long usage label inside the column. */
+  [data-chat-flow-kind="turn-tail"] [class$="_actions"] [class$="_endInfo"] {
+    flex: none;
+    max-width: 100%;
   }
   /* Wide companion to the rule below: mirrors the upstream hover-gate
      selector shape directly, with no assumptions about the tail's DOM
@@ -113,13 +140,16 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
     opacity: 1 !important;
     transition: none !important;
   }
+  /* overflow-wrap / word-break: normal undo the [data-chat-flow]
+     overflow-wrap: anywhere inherited from the top of this block — that is
+     the rule that let "18:06" break between digits once its box was
+     squeezed. */
   [data-chat-flow-kind="turn-tail"] [class$="_actions"] [class$="_timeEnd"] {
     opacity: 1 !important;
-    flex-basis: 100% !important;
-    white-space: normal !important;
-    overflow: visible !important;
-    text-overflow: clip !important;
-    padding-left: 0 !important;
+    flex: none !important;
+    white-space: nowrap !important;
+    overflow-wrap: normal !important;
+    word-break: normal !important;
     font-size: 12px;
     line-height: 18px;
   }
