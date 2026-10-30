@@ -22,6 +22,48 @@ export declare const PROCESS_KINDS: readonly ["context", "tool-call", "command"]
 export declare const THINK = "[data-variant=\"think\"]";
 /** Per-item override written while its turn is expanded. */
 export declare const OPEN = "data-mnav-fold-open";
+/** The DOM surface {@link hasContentOutside} reads — kept this narrow so the
+ * verdict is testable off-DOM (test/turn-fold-blank-step.test.cjs). */
+export interface ContentNode {
+    readonly nodeType: number;
+    readonly textContent: string | null;
+    readonly childNodes: ArrayLike<ContentNode>;
+    readonly tagName?: string;
+    matches?(selector: string): boolean;
+}
+/**
+ * True when `node` renders anything a reader could see outside the subtrees
+ * that match `skip`: a non-blank text node, or a {@link SELF_VISIBLE} element.
+ * Structural, no class names — same discipline as the rest of this effect.
+ */
+export declare function hasContentOutside(node: ContentNode, skip: string | null): boolean;
+/**
+ * True when the reasoning rows are the ONLY thing this row renders, so the
+ * whole flow item has to go: the flow column is `display: flex` with
+ * `gap: 16px`, and an emptied-out flex item still claims its gap — the
+ * reader would see the folded steps as a column of blank bands.
+ * Structural test, no class names: outside the reasoning rows the row holds
+ * nothing visible — only wrappers. Each reasoning block sits in its own
+ * ProcessReasoning wrapper, and since DSH 0.2.1-rc.5 a block whose display
+ * text is empty once a leading `<signature>…</signature>` is stripped renders
+ * its ReasoningRow as null and leaves that wrapper empty; an empty wrapper
+ * beside a Think must not keep the row unfolded.
+ */
+export declare function foldsWholeRow(row: ContentNode, thinks: readonly unknown[]): boolean;
+/**
+ * True for an assistant-step row that renders nothing at all — no Think, no
+ * prose, no image, no notice. DSH 0.2.1-rc.5 produces one for a step whose
+ * only reasoning is a `<signature>…</signature>` (ReasoningRow hides itself,
+ * the wrappers stay). It is not process to count in the chip, and it is not
+ * content either: left alone it is a blank band in the flow (the gap again),
+ * so it is hidden on its own marker ({@link BLANK}) that the chip's open
+ * override never releases. On 0.2.1-rc.2, which renders such a block as an
+ * ordinary Think, the row is not blank and folds exactly as before.
+ */
+export declare function isBlankStep(row: ContentNode): boolean;
+/** Marker of a {@link isBlankStep} row; the stylesheet hides it while the
+ * fold is live. Never counted, never opened. */
+export declare const BLANK = "data-mnav-blank";
 /**
  * S8 — collapse a turn's process into one summary row (< 768px by default;
  * every width when the plugin row sets `config.turnFoldDesktop` or a browser
