@@ -317,13 +317,16 @@ function fakeRelayClient(relayPort) {
  * true }` to wire the known-real-id inventory against the same kind of box
  * (`h.knownBox.value`); without it the option is ABSENT — the zero-change
  * control the PB-25b tests lean on. */
-async function startV2Harness({ knownIds } = {}) {
+async function startV2Harness({ knownIds, onMintedVirtualIds, adapters, extraStatus = [] } = {}) {
   const host = await startFakeHost()
   host.registerLocalPlugin()
   const relay = await startFakeRelay()
   const relayClient = fakeRelayClient(relay.__port)
   const registry = createBridgeRegistry()
   registry.register(DECLARED_V2)
+  // PB-26a: an adapter's registry entry IS its declaration (the yield rule
+  // reads ownership off it), registered the way the wiring does.
+  for (const adapter of adapters ?? []) registry.registerNormalized(adapter.declaration)
   const sessionBox = { value: undefined }
   const knownBox = { value: undefined }
   const handle = installPluginRouteIntercept({
@@ -331,9 +334,11 @@ async function startV2Harness({ knownIds } = {}) {
     registry,
     relay: relayClient,
     getServerId: () => SERVER_ID,
-    getStatus: () => [{ plugin: 'v2-panel', bridged: true, localVersion: '2.0.0', serverVersion: '2.0.0' }],
+    getStatus: () => [{ plugin: 'v2-panel', bridged: true, localVersion: '2.0.0', serverVersion: '2.0.0' }, ...extraStatus],
     getCurrentSession: () => sessionBox.value,
     ...(knownIds ? { getKnownRealIds: () => knownBox.value } : {}),
+    ...(adapters !== undefined ? { adapters } : {}),
+    ...(onMintedVirtualIds !== undefined ? { onMintedVirtualIds } : {}),
     log: () => {},
   })
   return {
@@ -1002,6 +1007,114 @@ test('PB-25b: without getKnownRealIds wired the scan stays request-local — an 
       { ok: true, value: { mine: VA, theirs: 'session-live' } },
       'the option is absent: only the request-carried id is rewritten (PB-22 behavior verbatim)',
     )
+  } finally {
+    await h.stop()
+  }
+})
+
+// ---- PB-26a: minted virtual ids reach the summary sync --------------------------
+
+test('PB-26a: a rewriteIds fields route reports the virtual ids it MINTED — once per answer, deduped, never for already-virtual / missing / scan-rewritten positions', async () => {
+  const minted = []
+  const h = await startV2Harness({ onMintedVirtualIds: (ids) => minted.push([...ids]) })
+  try {
+    // sidechat.start's shape: the NEW child id sits at the declared position
+    // and was never in the request — the only way the client can learn a
+    // subagent/sidechat row exists (it rides no workspace/follow frame).
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { childId: 'session-side-1' } }))
+    }
+    const res = await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { ok: true, value: { childId: toVirtual(SERVER_ID, 'session-side-1') } })
+    assert.deepEqual(minted, [[toVirtual(SERVER_ID, 'session-side-1')]], 'exactly one report carrying the minted virtual id')
+
+    // Nothing minted → no report: the position already virtual, or absent.
+    minted.length = 0
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { childId: toVirtual(SERVER_ID, 'session-side-1') } }))
+    }
+    await (await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)).json()
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: {} }))
+    }
+    await (await h.host.get(`/v2/create?sessionId=${encodeURIComponent(VA)}`)).json()
+    assert.deepEqual(minted, [], 'an already-virtual or missing position mints nothing and reports nothing')
+
+    // Two declared positions, one fresh id in both, the third a KNOWN id the
+    // value scan already wrapped: one report, the fresh id once, the known
+    // id absent (the scan's rewrite is not a mint — that row is in view).
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ top: 'session-side-2', a: { b: { c: 'session-a' } } }))
+    }
+    const deep = await h.host.get(`/v2/create-deep?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await deep.json(), { top: toVirtual(SERVER_ID, 'session-side-2'), a: { b: { c: VA } } })
+    assert.deepEqual(minted, [[toVirtual(SERVER_ID, 'session-side-2')]])
+
+    // A `true`-form route (value scan only) never mints.
+    minted.length = 0
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, value: { childId: 'session-side-3' }, echo: 'session-a' }))
+    }
+    await (await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(VA)}`)).json()
+    assert.deepEqual(minted, [], 'the value scan reports nothing')
+  } finally {
+    await h.stop()
+  }
+})
+
+test("PB-26a: an adapter's client.response virtualize calls are reported as minted ids after the hook returns; a throwing hook reports nothing", async () => {
+  const { normalizeAdapter } = require('../lib/plugin-adapter-core.js')
+  const adapter = normalizeAdapter(
+    {
+      plugin: 'side-panel',
+      versions: ['1.2.3'],
+      client: {
+        // better-sidebar's sidechat.start answer: the child id comes back
+        // virtual through the hook's own virtualize — the same call that
+        // must tell the summary sync a row was born.
+        response: (ctx) => {
+          if (ctx.body.boom === true) throw new Error('hook failure')
+          return { ...ctx.body, childId: ctx.virtualize(ctx.body.childId), again: ctx.virtualize(ctx.body.childId) }
+        },
+      },
+      routes: [{ path: '/side-panel/sidechat/start', match: 'exact', locator: { in: 'query', name: 'sessionId' } }],
+    },
+    '1.2.3',
+  )
+  const minted = []
+  const h = await startV2Harness({
+    onMintedVirtualIds: (ids) => minted.push([...ids]),
+    adapters: [adapter],
+    extraStatus: [{ plugin: 'side-panel', bridged: true, localVersion: '1.2.3', serverVersion: '1.2.3' }],
+  })
+  try {
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, childId: 'session-side-9' }))
+    }
+    const res = await h.host.get(`/side-panel/sidechat/start?sessionId=${encodeURIComponent(VA)}`)
+    assert.equal(res.status, 200)
+    const virtualChild = toVirtual(SERVER_ID, 'session-side-9')
+    assert.deepEqual(await res.json(), { ok: true, childId: virtualChild, again: virtualChild })
+    assert.deepEqual(minted, [[virtualChild]], 'one report, the twice-virtualized id once')
+
+    // The hook throws: the answer passes through untouched and nothing is
+    // reported — a virtualize call inside a failed hook minted nothing the
+    // browser will ever see.
+    minted.length = 0
+    h.relay.state.reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, childId: 'session-side-10', boom: true }))
+    }
+    const failed = await h.host.get(`/side-panel/sidechat/start?sessionId=${encodeURIComponent(VA)}`)
+    assert.deepEqual(await failed.json(), { ok: true, childId: 'session-side-10', boom: true })
+    assert.deepEqual(minted, [])
   } finally {
     await h.stop()
   }

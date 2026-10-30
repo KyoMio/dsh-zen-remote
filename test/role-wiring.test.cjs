@@ -787,6 +787,58 @@ test('T33a-fix: a throwing agent/created listener is swallowed and warned, never
   )
 })
 
+test('PB-26a: agent/created records a subagent child in the parent index AT ONCE — a header-less child event already refreshes the shared parent, startup and resume alike', async () => {
+  const index = await import(INDEX_URL)
+  // Two shared parents with hour-old clocks, one per creation source. The
+  // child itself never enters the table (T33a), so the only way its motion
+  // shows up on disk is through the parent link — and the session/event
+  // below carries NO header, so the index cannot learn the link there: only
+  // agent/created could have recorded it. (Before PB-26a a sidechat child
+  // reached the index on its FIRST session/event at the earliest, so the
+  // relay answered not-shared for it in between.)
+  const sharesFile = path.join(TEMP_HOME, 'zen-remote-shares.json')
+  const oldStamp = Date.now() - 3_600_000
+  fs.writeFileSync(sharesFile, JSON.stringify({
+    version: 1,
+    sessions: {
+      'parent-startup': { sharedAt: oldStamp, lastActivityAt: oldStamp },
+      'parent-resume': { sharedAt: oldStamp, lastActivityAt: oldStamp },
+    },
+  }))
+  const { ctx, listeners } = makeCtx()
+  index.apply(ctx, {})
+  const created = listeners.find((l) => l.event === 'agent/created').listener
+  const onEvent = listeners.find((l) => l.event === 'session/event').listener
+  // The live Session shape: `session.id` is a getter over the header's
+  // single copy, and the header carries dsh-session's two subagent fields.
+  const child = (id, parentSession) => ({
+    id,
+    header: { version: 4, id, createdAt: oldStamp, isSeeded: false, origin: 'subagent', parentSession },
+  })
+
+  // sidechat.start → agents.create: source 'startup'.
+  created({ agent: { id: 'side-startup', session: child('side-startup', 'parent-startup') }, source: 'startup' })
+  assert.equal(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['side-startup'], undefined, 'the child itself still never enters the table')
+  onEvent({ id: 'side-startup' }, { type: 'user/message' })
+  const afterStartup = JSON.parse(fs.readFileSync(sharesFile, 'utf8'))
+  assert.ok(afterStartup.sessions['parent-startup'].lastActivityAt > oldStamp, "the child's header-less event reached its parent — the link was recorded by agent/created")
+  assert.equal(afterStartup.sessions['parent-resume'].lastActivityAt, oldStamp, 'the other parent is untouched')
+
+  // A cold-restored child (source 'resume') is indexed the same way, before
+  // the early return that keeps resumes out of the share table.
+  created({ agent: { id: 'side-resume', session: child('side-resume', 'parent-resume') }, source: 'resume' })
+  assert.equal(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['side-resume'], undefined, "source 'resume' still never shares")
+  onEvent({ id: 'side-resume' }, { type: 'user/message' })
+  assert.ok(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['parent-resume'].lastActivityAt > oldStamp, 'a resumed child is linked too')
+
+  // The control: a top-level creation records nothing, and a stranger's
+  // header-less event moves no clock.
+  created({ agent: { id: 'top-1', session: { id: 'top-1', header: { version: 4, id: 'top-1', createdAt: oldStamp, isSeeded: false } } }, source: 'startup' })
+  const before = JSON.parse(fs.readFileSync(sharesFile, 'utf8'))
+  onEvent({ id: 'nobody' }, { type: 'user/message' })
+  assert.deepEqual(JSON.parse(fs.readFileSync(sharesFile, 'utf8')), before, 'an unlinked stranger moves nothing')
+})
+
 // ---- PB-1: the zenRemote service ------------------------------------------------
 
 test('PB-1: BOTH roles provide a zenRemote service whose bridge() registers, validates and disposes', async () => {

@@ -337,6 +337,12 @@ export interface InterceptHandle {
      * re-judges NOW — the mergers dedupe no-change calls — instead of
      * waiting for the next frame or the 1s fallback poll. */
     currentSessionChanged(): void;
+    /** PB-26a: trigger a summary-sync check for virtual session ids discovered
+     * OUTSIDE workspace/follow (a sidechat childId the plugin bridge just
+     * minted in a response rewrite, for instance). Empty and non-virtual
+     * entries are dropped; a batch with nothing left is a no-op. Reaches every
+     * live merged `$events` stream, and the pending slot when none is open. */
+    nudgeSummarySync(ids: readonly string[]): void;
 }
 /** Rewrite one stream frame's session ids to virtual form. */
 export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown;

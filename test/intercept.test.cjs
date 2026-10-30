@@ -3362,11 +3362,16 @@ test('T75: a real-time status frame that lands mid-fetch outranks the list snaps
   releaseList()
   // The snapshot lands: the live frame's session is NOT overwritten (no
   // second status frame for it); the untouched row passes. The summary
-  // sync's announce rode the same gate and follows.
+  // sync's announce rode the same gate and follows — and (PB-26a) because
+  // the live flip to idle predates the announce whose row still says
+  // running, a realigning status frame follows THAT row's added frame
+  // at once (the host's mergeSummary would otherwise re-mark it running
+  // from the stale snapshot). The idle row saw no live frame: added only.
   const rest = await readSome(iterator, 1)
   assert.deepEqual(rest, [{ type: 'emit', event: 'api-session/status', args: [toVirtual(SERVER_ID, 'session-idle'), false] }])
-  const added = await readSome(iterator, 2)
-  assert.deepEqual(added.map((frame) => frame.event), ['api-session/added', 'api-session/added'])
+  const added = await readSome(iterator, 3)
+  assert.deepEqual(added.map((frame) => frame.event), ['api-session/added', 'api-session/status', 'api-session/added'])
+  assert.deepEqual(added[1].args, [toVirtual(SERVER_ID, 'session-shared'), false], 'the realign carries the LIVE value, not the snapshot\'s')
   await iterator.return?.(undefined)
 })
 
@@ -3393,6 +3398,162 @@ test('T75: the status sync obeys the local-ready gate — it defers until the UI
     frames.filter((frame) => frame.event === 'api-session/status'),
     T75_STATUS_FRAMES,
   )
+  await iterator.return?.(undefined)
+})
+
+// -- PB-26a: sidechat / subagent rows outside workspace/follow -----------------------
+
+const V_SIDE_1 = toVirtual(SERVER_ID, 'session-side-1')
+const V_SIDE_2 = toVirtual(SERVER_ID, 'session-side-2')
+
+/** A relay online from the start (no serving-period syncs muddy the
+ * baseline) whose `session/list` answers only after `release()` — the slow
+ * server window a quick sidechat turn can end inside. The wire shape stays
+ * policed. */
+function onlineRelayWithHangingList(rows) {
+  const relay = createControllableRelay()
+  relay.invokeValues = { 'session/modelCatalog': SERVER_CATALOG }
+  let release = () => {}
+  const listGate = new Promise((resolve) => { release = resolve })
+  const baseInvoke = relay.invoke
+  relay.invoke = function (namespace, method, args, signal) {
+    if (namespace === 'session' && method === 'list') {
+      const keys = args !== null && typeof args === 'object' && !Array.isArray(args) ? Object.keys(args) : []
+      if (!(keys.length === 1 && keys[0] === '_request')) {
+        return Promise.reject(new RelayError('gateway/arguments-invalid', 'session/list expects { _request: {...} }'))
+      }
+      relay.invokes.push({ namespace, method, args, signal })
+      return listGate.then(() => ({ items: rows }))
+    }
+    return baseInvoke(namespace, method, args, signal)
+  }
+  const listCalls = () => relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length
+  return { relay, release: () => release(), listCalls }
+}
+
+test('PB-26a: a real-time status for an UNANNOUNCED remote session (a sidechat child rides no workspace/follow frame) pulls session/list and announces the row; a flip during the pull is re-pushed right after the added frame', async () => {
+  // The child's row as the server lists it AFTER the pull began: still
+  // `running: true` from the snapshot's point of view.
+  const { relay, release, listCalls } = onlineRelayWithHangingList([{ sessionId: 'session-side-1', updatedAt: 7, running: true }])
+  const { iterator, localGate } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  const gate = relay.streams[0].gate
+  assert.equal(listCalls(), 0, 'an already-online relay runs no serving-period sync — the baseline is clean')
+
+  // The child's turn starts: the server forwards status true. The UI has
+  // no summary for this id (the host's handleSessionStatus drops the frame
+  // for a session it does not list), so the leg must go and fetch the row.
+  gate.push({ type: 'emit', event: 'api-session/status', args: ['session-side-1', true] })
+  const [live] = await readSome(iterator, 1)
+  assert.deepEqual(live, { type: 'emit', event: 'api-session/status', args: [V_SIDE_1, true] }, 'the live frame still crosses at once')
+  await waitUntil(() => listCalls() === 1)
+
+  // The quick turn ends while the pull hangs: status false travels live
+  // (and, as the T65-fix rule says, a nudge landing mid-flight queues its
+  // own follow-up round instead of joining the stale one).
+  gate.push({ type: 'emit', event: 'api-session/status', args: ['session-side-1', false] })
+  const [liveFalse] = await readSome(iterator, 1)
+  assert.deepEqual(liveFalse, { type: 'emit', event: 'api-session/status', args: [V_SIDE_1, false] })
+  assert.equal(listCalls(), 1, 'no second pull while the first is in flight')
+
+  // The snapshot lands: the row is announced with the snapshot's stale
+  // `running: true` — and the latest LIVE value follows immediately, so the
+  // host's mergeSummary never leaves the row marked running.
+  release()
+  const [added, realigned] = await readSome(iterator, 2)
+  assert.deepEqual(added, { type: 'emit', event: 'api-session/added', args: [{ sessionId: V_SIDE_1, updatedAt: 7, running: true }] })
+  assert.deepEqual(realigned, { type: 'emit', event: 'api-session/status', args: [V_SIDE_1, false] })
+
+  // The queued follow-up round pulls once more (its snapshot is fresh) and
+  // announces nothing new; the stream stays otherwise silent.
+  await waitUntil(() => listCalls() === 2)
+  localGate.push({ type: 'emit', event: 'commands/change', args: [] })
+  const [next] = await readSome(iterator, 1)
+  assert.deepEqual(next, { type: 'emit', event: 'commands/change', args: [] }, 'no re-announce, no stray status frame')
+
+  // Once announced, a later status for the same id is just a status frame:
+  // no pull, no realign.
+  gate.push({ type: 'emit', event: 'api-session/status', args: ['session-side-1', true] })
+  const [later] = await readSome(iterator, 1)
+  assert.deepEqual(later, { type: 'emit', event: 'api-session/status', args: [V_SIDE_1, true] })
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCalls(), 2, 'an announced id never pulls again')
+  await iterator.return?.(undefined)
+})
+
+test('PB-26a: a status that AGREES with the announced row adds no realign frame', async () => {
+  const { relay, release, listCalls } = onlineRelayWithHangingList([{ sessionId: 'session-side-1', updatedAt: 7, running: true }])
+  const { iterator, localGate } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push({ type: 'emit', event: 'api-session/status', args: ['session-side-1', true] })
+  await readSome(iterator, 1)
+  await waitUntil(() => listCalls() === 1)
+  release()
+  const [added] = await readSome(iterator, 1)
+  assert.equal(added.event, 'api-session/added')
+  localGate.push({ type: 'emit', event: 'commands/change', args: [] })
+  const [next] = await readSome(iterator, 1)
+  assert.deepEqual(next, { type: 'emit', event: 'commands/change', args: [] }, 'the snapshot already says running — nothing to realign')
+  await iterator.return?.(undefined)
+})
+
+test('PB-26a: handle.nudgeSummarySync announces a virtual id discovered outside workspace/follow (the bridge minted it); non-virtual and empty ids are ignored, an announced id stays quiet', async () => {
+  const relay = createControllableRelay()
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [{ sessionId: 'session-side-2', updatedAt: 9 }] },
+  }
+  enforceSessionListWireShape(relay)
+  const { iterator, localGate, handle } = await openMergedEvents(relay)
+  localGate.push(READY)
+  await readSome(iterator, 1)
+  await waitForStream(relay, 1)
+  const listCalls = () => relay.invokes.filter((call) => call.namespace === 'session' && call.method === 'list').length
+  assert.equal(listCalls(), 0)
+
+  // The plugin bridge just rewrote a sidechat.start answer: the minted id
+  // reaches the sync through the handle — mixed in with the junk a careless
+  // caller could pass, which must not trigger anything.
+  handle.nudgeSummarySync(['', 'session-local-plain', V_SIDE_2])
+  const [added] = await readSome(iterator, 1)
+  assert.deepEqual(added, { type: 'emit', event: 'api-session/added', args: [{ sessionId: V_SIDE_2, updatedAt: 9 }] })
+  assert.equal(listCalls(), 1)
+
+  // No virtual id at all → no pull. An announced id → quiet.
+  handle.nudgeSummarySync(['', 'session-local-plain'])
+  handle.nudgeSummarySync([])
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCalls(), 1, 'nothing virtual, nothing pulled')
+  handle.nudgeSummarySync([V_SIDE_2])
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(listCalls(), 1, 'an announced id nudges nothing')
+  localGate.push({ type: 'emit', event: 'commands/change', args: [] })
+  const [next] = await readSome(iterator, 1)
+  assert.deepEqual(next, { type: 'emit', event: 'commands/change', args: [] }, 'no re-announce')
+  await iterator.return?.(undefined)
+})
+
+test('PB-26a: a nudge that lands BEFORE the $events stream opens is served at the stream\'s ready (the pending slot)', async () => {
+  const relay = createControllableRelay()
+  relay.invokeValues = {
+    'session/modelCatalog': SERVER_CATALOG,
+    'session/list': { items: [{ sessionId: 'session-side-2', updatedAt: 9 }] },
+  }
+  enforceSessionListWireShape(relay)
+  const controller = new AbortController()
+  const { gateway, localGate } = createMergeGateway(controller.signal)
+  const { handle } = install(gateway, relay)
+  handle.nudgeSummarySync([V_SIDE_2])
+  const merged = await gateway.wireTap('$events', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const iterator = merged[Symbol.asyncIterator]()
+  localGate.push(READY)
+  const [ready, added] = await readSome(iterator, 2)
+  assert.deepEqual(ready, READY)
+  assert.deepEqual(added, { type: 'emit', event: 'api-session/added', args: [{ sessionId: V_SIDE_2, updatedAt: 9 }] })
   await iterator.return?.(undefined)
 })
 

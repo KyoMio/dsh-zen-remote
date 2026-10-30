@@ -150,6 +150,14 @@ export interface InstallPluginRouteInterceptOptions {
      * consumption: nothing here mutates merge state. Absent → the scan is
      * exactly the request-local PB-22 behavior. */
     getKnownRealIds?: () => ReadonlySet<string>;
+    /** PB-26a: called with the virtual session ids a response rewrite
+     * PRODUCED — a `rewriteIds.fields` route's wrapped positions, or the ids
+     * an adapter's `client.response` hook passed through `virtualize` (e.g.
+     * better-sidebar's `sidechat.start` childId) — so the session-summary
+     * sync can announce subagent/sidechat rows that never appear in
+     * workspace/follow. At most once per answer, deduped, only when there is
+     * something to report; a throwing callback never fails the answer. */
+    onMintedVirtualIds?: (virtualIds: readonly string[]) => void;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
 }
