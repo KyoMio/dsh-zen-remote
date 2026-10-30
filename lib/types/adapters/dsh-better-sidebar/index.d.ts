@@ -15,8 +15,11 @@
  * model spend (commit-message generation), documented as such; NO path
  * fencing; `open.external` refuses for a remote session; `settings.*` and
  * `/sidebar/bundle` stay local; the adapter registers as whole-machine
- * data (consent per plugin, default off). PB-15: the 0.26.0 WebSocket
- * `/sidebar/ws/sidechat` is deliberately NOT declared (not bridged).
+ * data (consent per plugin, default off). PB-15 left the 0.26.0 WebSocket
+ * `/sidebar/ws/sidechat` undeclared; PB-26b bridges it — its ids ride the
+ * post-handshake JSON frames (`{"op":"watch","threadIds":[...]}`), which
+ * the json-body upgrade gate locates, classifies and rewrites frame by
+ * frame on both halves.
  *
  * The `cwd` handling is the one subtle part: better-sidebar resolves a
  * request's working directory as the session's own `header.cwd` first and

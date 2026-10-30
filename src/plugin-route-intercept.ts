@@ -63,12 +63,22 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { BridgeLocator, BridgeRegistry, BridgeStatus, NormalizedBridgeRoute } from './plugin-bridge.js'
 import { routeDeniesRemoteOf, routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeRewriteFieldsOf, routeRewritesIdsOf, routeUpgradesOf } from './plugin-bridge.js'
-import { PassThrough, Readable, Transform } from 'node:stream'
+import { PassThrough, Readable, Transform, Duplex } from 'node:stream'
+import { createHash } from 'node:crypto'
 import type { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
+import { encodeRfc6455Frame, parseRfc6455Frames, type Rfc6455Frame } from './plugin-tunnel.js'
 import type { NormalizedAdapter, NormalizedAdapterRoute, AdapterIdHit, AdapterVerdict, AdapterRemoteVerdict } from './plugin-adapter-core.js'
-import { adapterPathMatches, classifyAdapterRequest, rewriteAdapterRequest, adapterOwnsRegistryEntry, MAX_ADAPTER_RESPONSE_BUFFER_BYTES, ADAPTER_RESPONSE_HEADER_ALLOWLIST, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
+import { adapterPathMatches, classifyAdapterRequest, locateAdapterIds, rewriteAdapterRequest, adapterOwnsRegistryEntry, MAX_ADAPTER_RESPONSE_BUFFER_BYTES, ADAPTER_RESPONSE_HEADER_ALLOWLIST, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
+
+/** The RFC 6455 handshake GUID — the SHA-1 input of Sec-WebSocket-Accept. */
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+/** The byte triplet that ends every HTTP/1.1 header block — the seam where
+ * an upgrade answer's HEAD stops and its WebSocket frames begin (PB-26b:
+ * both directions strip or buffer up to this mark). */
+const HEADER_END = Buffer.from('\r\n\r\n', 'utf8')
 
 /** Structural verdict of {@link checkWebServerShape}: the facts the wrap
  * reads per request — the `match` function the host's handle calls, the two
@@ -1565,7 +1575,28 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
 
   const targetWithUpgrades = webServer as { upgrades: Map<string, unknown> }
   const savedUpgradesGet = targetWithUpgrades.upgrades.get
-  const upgradeRoutesOf = (pathname: string): { plugin: string; version: string; digest: string; path: string; sessionParam: string; deny: boolean } | undefined => {
+  /** One declared upgrade-route hit, as the surrogate consumes it. The
+   * PB-26b fields: the EFFECTIVE locator (a json-body upgrade's ids ride
+   * the post-handshake frames, never the query), the rewriteIds flags the
+   * downstream frames honor, the route's adapter-core view (the classify/
+   * rewrite runs on it), and the OWNING adapter when the route is an
+   * adapter's — its `client.response` hook rewrites the downstream frames
+   * (`undefined` for a cooperative declaration, and for an adapter that
+   * yielded its registry entry). */
+  interface DeclaredUpgrade {
+    plugin: string
+    version: string
+    digest: string
+    path: string
+    sessionParam: string
+    deny: boolean
+    locator: BridgeLocator
+    rewriteIds: boolean
+    rewriteFields: readonly string[] | undefined
+    view: NormalizedAdapterRoute
+    adapter: NormalizedAdapter | undefined
+  }
+  const upgradeRoutesOf = (pathname: string): DeclaredUpgrade | undefined => {
     if (!installed) return undefined
     for (const declaration of registry.list()) {
       for (const route of declaration.routes) {
@@ -1577,6 +1608,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             path: route.path,
             sessionParam: route.sessionParam,
             deny: routeDeniesRemoteOf(route),
+            locator: routeLocatorOf(route),
+            rewriteIds: routeRewritesIdsOf(route),
+            rewriteFields: routeRewriteFieldsOf(route),
+            view: bridgeRouteAsAdapterRoute(route),
+            adapter: adapterRouteOf(pathname)?.adapter,
           }
         }
       }
@@ -1584,14 +1620,436 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     return undefined
   }
 
+  /** PB-26b: the json-body upgrade surrogate — the frame-level twin of the
+   * HTTP surrogates. The exchange: the browser gets the 101 IMMEDIATELY (its
+   * `onopen` fires and the first frame — better-sidebar's sidechat watch —
+   * is on the wire), then every incoming text frame is located against the
+   * route's locator and classified. LOCAL ids pipe the exchange into the
+   * plugin's own upgrade handler over an in-memory socket (the handler's
+   * 101 head is stripped — the browser already has one). VIRTUAL ids open a
+   * PB-10 byte tunnel whose upstream is RE-FRAMED masked (each text frame's
+   * ids rewritten real, per-frame — the server's send gate re-checks them
+   * against the share wall) and whose downstream frames are rewritten
+   * virtual (the adapter's response hook, or the cooperative rewriteIds
+   * scan) before the browser sees them. A mixed or foreign-server frame
+   * kills the exchange — docs/adr/0001 holds frame by frame. */
+  const jsonBodyUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown, req: IncomingMessage, socket: Socket, head: Buffer): Promise<void> =>
+    (async () => {
+      const plugin = declared.plugin
+      const socketGone = (): boolean => socket.destroyed || !socket.writable
+      const destroySocket = (): void => {
+        try {
+          socket.destroy()
+        } catch {
+          // Already gone.
+        }
+      }
+      // The post-101 refusal channel: the handshake is OUT, so no HTTP
+      // status fits anymore — the refusal is recorded and the socket dies.
+      const refuseAndDie = (reason: string): void => {
+        recordRefusal(plugin, reason)
+        log?.('plugin upgrade refused for %s: %s', plugin, reason)
+        destroySocket()
+      }
+      // The deny wall (the HTTP halves' current-session rule, pre-101 — the
+      // answerUnbridgedSocket answer still fits here): a remote panel never
+      // opens this route at all.
+      if (declared.deny) {
+        const current = getCurrentSession?.()
+        if (current !== undefined && isVirtual(current)) {
+          answerUnbridgedSocket(socket, plugin, 'route-denied')
+          return
+        }
+      }
+      // The two headers the handshake cannot exist without — we answer it
+      // OURSELVES this time, so a missing one refuses before anything is
+      // written.
+      const wsKey = typeof req.headers['sec-websocket-key'] === 'string' ? req.headers['sec-websocket-key'] : undefined
+      const wsVersion = typeof req.headers['sec-websocket-version'] === 'string' ? req.headers['sec-websocket-version'] : undefined
+      if (wsKey === undefined || wsVersion === undefined) {
+        answerUnbridgedSocket(socket, plugin, 'bad-query')
+        return
+      }
+      // The 101 goes out NOW: the browser's onopen fires and its first frame
+      // is what decides the route below. Extensions are offered to nobody —
+      // not echoed here, not offered upstream (the tunnel opens with the
+      // key and version alone) — so every frame stays plain text and the
+      // rewrites below can never land on compressed bytes.
+      try {
+        socket.write(
+          `HTTP/1.1 101 Switching Protocols\r\n` +
+            `Upgrade: websocket\r\n` +
+            `Connection: Upgrade\r\n` +
+            `Sec-WebSocket-Accept: ${createHash('sha1').update(wsKey + WS_GUID).digest('base64')}\r\n` +
+            `\r\n`,
+        )
+      } catch {
+        return
+      }
+
+      // ---- the local pipe: an in-memory socket behind the real handler ----
+      let localSocket: Duplex | undefined
+      const startLocal = (): void => {
+        if (typeof originalHandler !== 'function') {
+          // No local handler to serve the local verdict through — the
+          // exchange is dead either way.
+          destroySocket()
+          return
+        }
+        // The handler's writes arrive through the Duplex's writable side;
+        // its reads come from OUR writes. The 101 head the handler produces
+        // is stripped (the browser already has one) — every byte after the
+        // header end is a WebSocket frame and crosses verbatim.
+        const pipe = new Duplex({
+          write(chunk: Buffer, _encoding, callback) {
+            forwardFromLocal(chunk)
+            callback()
+          },
+          read() {},
+        })
+        // net.Socket methods the handler may call that a Duplex lacks.
+        const socketShaped = pipe as unknown as { setTimeout(): unknown; setNoDelay(): unknown }
+        socketShaped.setTimeout = () => {}
+        socketShaped.setNoDelay = () => {}
+        let headerSeen = false
+        let headerBuffer = Buffer.alloc(0)
+        const forwardFromLocal = (chunk: Buffer): void => {
+          if (socketGone()) return
+          if (headerSeen) {
+            socket.write(chunk)
+            return
+          }
+          headerBuffer = Buffer.concat([headerBuffer, chunk])
+          const end = headerBuffer.indexOf(HEADER_END)
+          if (end === -1) return
+          headerSeen = true
+          const rest = headerBuffer.subarray(end + HEADER_END.length)
+          headerBuffer = Buffer.alloc(0)
+          if (rest.length > 0) socket.write(rest)
+        }
+        pipe.on('close', () => destroySocket())
+        socket.on('close', () => {
+          try {
+            pipe.destroy()
+          } catch {
+            // Already gone.
+          }
+        })
+        localSocket = pipe
+        // The handler owns the exchange from here — its async body runs on
+        // its own, exactly as the host would run it.
+        const handler = originalHandler as (request: IncomingMessage, sock: Socket, earlyHead: Buffer) => unknown
+        void Promise.resolve(handler(req, pipe as unknown as Socket, Buffer.alloc(0))).catch(() => destroySocket())
+      }
+
+      // ---- the remote pipe: the PB-10 tunnel, frame by frame -------------
+      let tunnelHandle: { tunnel: string; frames: AsyncIterable<Uint8Array> } | undefined
+      // The connection-wide real→virtual mapping the rewriteIds deep scan
+      // consults: EVERY validated remote frame's ids merge in (a watch list
+      // that grows mid-connection makes the later answers rewritable too —
+      // the deep scan only knows the ids this exchange has carried).
+      const idMapping = new Map<string, string>()
+      let upstreamSeq = 0
+      let upstreamBroken = false
+      let teardownTunnel: () => void = () => {}
+      const killExchange = (): void => {
+        teardownTunnel()
+        destroySocket()
+      }
+      /** ONE text frame onto the OPEN tunnel: the ids named by `hits`
+       * rewritten real (an empty list — the unsubscribe-all — crosses
+       * verbatim), re-framed MASKED (client style — the server's send gate
+       * parses and re-checks them), sent in the chain's order. A transport
+       * failure tears the whole exchange down (counter, close, socket) —
+       * never a silent broken flag: that would leak `tunnelsCurrent` and
+       * leave the browser hanging on a dead tunnel. */
+      const sendTextUpstream = async (frame: Rfc6455Frame, parsedJson: unknown, hits: AdapterIdHit[]): Promise<void> => {
+        if (upstreamBroken || tunnelHandle === undefined) return
+        const rewrite = hits.length > 0
+          ? rewriteAdapterRequest(declared.view, declared.path, new URLSearchParams(), parsedJson, hits, (virtualId) => fromVirtual(virtualId)!.id)
+          : undefined
+        const payload = rewrite?.bodyText !== undefined ? Buffer.from(rewrite.bodyText, 'utf8') : frame.payload
+        const seq = upstreamSeq
+        upstreamSeq += 1
+        try {
+          await relay.pluginTunnelSend(tunnelHandle.tunnel, seq, encodeRfc6455Frame(0x1, payload, true, frame.fin))
+        } catch {
+          killExchange()
+        }
+      }
+      /** The downstream river: the tunnel's byte frames → rewritten text
+       * frames on the browser socket. The plugin's 101 head is stripped
+       * FIRST (the browser already has ours); each text frame is rewritten
+       * (adapter hook, else the cooperative rewriteIds scan) and re-framed
+       * UNMASKED (server style); every other frame crosses verbatim. */
+      const startDownstream = (opened: { tunnel: string; frames: AsyncIterable<Uint8Array> }, serverId: string): void => {
+        void (async () => {
+          let downstream = Buffer.alloc(0)
+          let headerSeen = false
+          try {
+            for await (const chunk of opened.frames) {
+              if (socketGone()) break
+              downstream = Buffer.concat([downstream, chunk])
+              if (!headerSeen) {
+                const end = downstream.indexOf(HEADER_END)
+                if (end === -1) continue
+                headerSeen = true
+                downstream = downstream.subarray(end + HEADER_END.length)
+              }
+              const parsed = parseRfc6455Frames(downstream)
+              downstream = downstream.subarray(parsed.consumed)
+              if (parsed.violated) break
+              for (const frame of parsed.frames) {
+                if (frame.opcode !== 0x1) {
+                  socket.write(frame.raw)
+                  continue
+                }
+                let outPayload = frame.payload
+                try {
+                  const parsedJson = JSON.parse(frame.payload.toString('utf8'))
+                  const responseHook = declared.adapter?.hooks.client?.response
+                  let hooked = false
+                  if (responseHook !== undefined) {
+                    outPayload = Buffer.from(JSON.stringify(responseHook({
+                      status: 200,
+                      pathname: declared.path,
+                      body: parsedJson,
+                      virtualize: (id: string) => toVirtual(serverId, id),
+                      isVirtual: (value: unknown) => isVirtual(value),
+                    })), 'utf8')
+                    hooked = true
+                  } else if (declared.rewriteIds) {
+                    const scanned = deepRewriteIds(parsedJson, idMapping, getKnownRealIds?.(), serverId)
+                    if (declared.rewriteFields !== undefined) rewriteIdsAtFields(scanned, declared.rewriteFields, serverId)
+                    outPayload = Buffer.from(JSON.stringify(scanned), 'utf8')
+                    hooked = true
+                  }
+                  // Neither hook applies: the frame crosses verbatim.
+                  if (!hooked) outPayload = frame.payload
+                } catch {
+                  // A frame that will not parse (or a hook that threw)
+                  // crosses untouched — a rewrite is better-than-nothing,
+                  // never a reason to mangle a push.
+                }
+                if (socketGone()) break
+                // The re-frame carries the ORIGINAL frame's fin bit — a
+                // fragmented push stays fragmented, a whole frame stays
+                // whole.
+                if (!socket.write(encodeRfc6455Frame(0x1, outPayload, false, frame.fin))) {
+                  await new Promise<void>((resolve) => {
+                    const settled = (): void => {
+                      socket.off('drain', settled)
+                      socket.off('close', settled)
+                      resolve()
+                    }
+                    socket.once('drain', settled)
+                    socket.once('close', settled)
+                  })
+                  if (socketGone()) break
+                }
+              }
+            }
+          } catch {
+            // The tunnel transport died — the browser socket follows below.
+          }
+          if (!socketGone()) destroySocket()
+        })()
+      }
+      /** ONE text frame through the walls. The FIRST one decides the
+       * exchange's path (local pipe or remote tunnel) and the connection
+       * never switches: a frame that would take the OTHER path is a
+       * cross-frame mix and kills the exchange (docs/adr/0001, frame by
+       * frame). The one exception is the id-LESS frame on a tunnel-bound
+       * connection — better-sidebar's `{"op":"watch","threadIds":[]}`
+       * unsubscribe-all carries no id and no local meaning, so it keeps
+       * riding the tunnel verbatim. */
+      const handleTextFrame = async (frame: Rfc6455Frame): Promise<void> => {
+        let parsedJson: unknown
+        try {
+          parsedJson = JSON.parse(frame.payload.toString('utf8'))
+        } catch {
+          refuseAndDie('bad-query')
+          return
+        }
+        let verdict: AdapterRemoteVerdict
+        try {
+          verdict = classifyAdapterRequest(declared.view, declared.path, new URLSearchParams(), parsedJson)
+        } catch {
+          refuseAndDie('bad-query')
+          return
+        }
+        if (verdict.kind === 'mixed') {
+          refuseAndDie('bad-query')
+          return
+        }
+        const rawHits = locateAdapterIds(declared.view, declared.path, new URLSearchParams(), parsedJson)
+        if (verdict.kind === 'local') {
+          if (tunnelHandle !== undefined) {
+            // Bound to the remote tunnel: the id-less frame stays on it, a
+            // REAL local id is a cross-frame mix — never a pivot to the
+            // local plugin.
+            if (rawHits.length === 0) {
+              await sendTextUpstream(frame, parsedJson, [])
+              return
+            }
+            refuseAndDie('bad-query')
+            killExchange()
+            return
+          }
+          if (localSocket === undefined) {
+            startLocal()
+            if (localSocket === undefined) return
+          }
+          // The browser's frame enters the handler's READ side (push) — the
+          // Duplex's write side is the handler's own answer channel.
+          localSocket.push(frame.raw)
+          return
+        }
+        // Remote. The FIRST remote frame opens the tunnel; every hit must
+        // belong to THIS handshake's server. A connection already bound to
+        // the local pipe never pivots to the tunnel.
+        if (localSocket !== undefined) {
+          refuseAndDie('bad-query')
+          try {
+            localSocket.destroy()
+          } catch {
+            // Already gone.
+          }
+          return
+        }
+        const serverId = getServerId()
+        if (serverId === undefined) {
+          refuseAndDie('server-changed')
+          return
+        }
+        const mapping = new Map<string, string>()
+        for (const idHit of verdict.hits) {
+          const parts = fromVirtual(idHit.value)
+          if (parts === undefined || parts.id === '' || parts.serverId !== serverId) {
+            refuseAndDie('server-changed')
+            return
+          }
+          mapping.set(parts.id, idHit.value)
+        }
+        // This frame's ids join the connection-wide mapping (see idMapping).
+        for (const [key, value] of mapping) idMapping.set(key, value)
+        if (tunnelHandle === undefined) {
+          const status = getStatus().find((entry) => entry.plugin === plugin)
+          if (status === undefined || !status.bridged) {
+            refuseAndDie(status?.reason ?? 'not-on-server')
+            return
+          }
+          const controller = new AbortController()
+          socket.on('close', () => controller.abort())
+          let opened: { tunnel: string; frames: AsyncIterable<Uint8Array> }
+          try {
+            log?.('opening tunnel for %s', declared.path)
+            opened = await relay.pluginTunnelOpen(
+              {
+                plugin,
+                version: declared.version,
+                digest: declared.digest,
+                path: declared.path,
+                query: '',
+                wsHeaders: { 'sec-websocket-key': wsKey, 'sec-websocket-version': wsVersion },
+              },
+              controller.signal,
+            )
+          } catch (error) {
+            const rawCode = (error as { code?: unknown } | null)?.code
+            refuseAndDie(typeof rawCode === 'string' && rawCode !== '' ? rawCode : 'offline')
+            return
+          }
+          tunnelsCurrent += 1
+          tunnelsOpened += 1
+          tunnelHandle = opened
+          log?.('tunnel open for %s: %s', declared.path, opened.tunnel)
+          teardownTunnel = (): void => {
+            if (upstreamBroken) return
+            upstreamBroken = true
+            tunnelsCurrent -= 1
+            tunnelsClosed += 1
+            void relay.pluginTunnelClose(opened.tunnel).catch(() => {})
+          }
+          socket.on('close', teardownTunnel)
+          socket.on('error', teardownTunnel)
+          startDownstream(opened, serverId)
+        }
+        await sendTextUpstream(frame, parsedJson, verdict.hits)
+      }
+      const handleFrame = async (frame: Rfc6455Frame): Promise<void> => {
+        // Control frames (close/ping/pong) carry no session ids and cross
+        // VERBATIM on whichever path exists — the close handshake completes
+        // the honest way (the plugin's reply close rides back downstream,
+        // the socket-close handlers tear the tunnel down in turn). With no
+        // path yet, a close just closes.
+        if (frame.opcode !== 0x1 && frame.opcode !== 0x2) {
+          if (localSocket !== undefined) {
+            localSocket.push(frame.raw)
+            return
+          }
+          if (tunnelHandle !== undefined && !upstreamBroken) {
+            const seq = upstreamSeq
+            upstreamSeq += 1
+            try {
+              await relay.pluginTunnelSend(tunnelHandle.tunnel, seq, frame.raw)
+            } catch {
+              // The send died: tear the exchange down COMPLETELY — the
+              // counter, the close, the browser socket (a bare broken flag
+              // would leak `tunnelsCurrent` and hang the browser).
+              killExchange()
+            }
+            return
+          }
+          if (frame.opcode === 0x8) killExchange()
+          return
+        }
+        await handleTextFrame(frame)
+      }
+      // ---- frame intake: the early head bytes, then every socket byte ----
+      // Complete frames dispatch through ONE serialized chain (the arrival
+      // order is the wire order the plugin and the browser both assume); a
+      // declared-oversize frame is a broken sender — refused, never awaited.
+      let intake = Buffer.from(head)
+      let chain: Promise<void> = Promise.resolve()
+      socket.on('data', (chunk: Buffer) => {
+        if (socketGone()) return
+        intake = Buffer.concat([intake, chunk])
+        const parsedFrames = parseRfc6455Frames(intake)
+        intake = intake.subarray(parsedFrames.consumed)
+        if (parsedFrames.violated) {
+          refuseAndDie('bad-query')
+          return
+        }
+        for (const frame of parsedFrames.frames) {
+          chain = chain
+            .then(() => handleFrame(frame))
+            .catch(() => destroySocket())
+        }
+      })
+    })().catch(() => {
+      try {
+        socket.destroy()
+      } catch {
+        // Already gone.
+      }
+    })
+
   /** The tunnel's surrogate upgrade handler. Every outcome — refusal,
    * teardown, the byte pumping — owns the socket's whole remaining life. */
-  const surrogateUpgrade = (declared: { plugin: string; version: string; digest: string; path: string; sessionParam: string; deny: boolean }, originalHandler: unknown) =>
+  const surrogateUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown) =>
     (req: IncomingMessage, socket: Socket, head: Buffer): void => {
       // The host never awaits an upgrade handler — the async body runs on
       // its own and every failure path owns the socket's teardown.
       void (async () => {
         log?.('upgrade entered for %s', declared.path)
+        // PB-26b: a json-body upgrade's ids ride the POST-HANDSHAKE frames —
+        // there is no session query parameter for the byte-tunnel half below
+        // to read, so the frame-level half owns the whole exchange.
+        if (declared.locator.in !== 'query') {
+          await jsonBodyUpgrade(declared, originalHandler, req, socket, head)
+          return
+        }
       const socketGone = (): boolean => socket.destroyed || !socket.writable
       const passthrough = (): void => {
         if (typeof originalHandler === 'function') {

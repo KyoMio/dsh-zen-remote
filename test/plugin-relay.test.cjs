@@ -388,7 +388,9 @@ test("PB-24: the v2 locator's server-side walls each refuse before the loopback 
         // A small maxBody so the over-limit wall is one cheap request.
         { path: '/notes/capped', scope: 'session', methods: ['POST'], maxBody: 64, locator: { in: 'json-body', fields: ['sessionId'] } },
         // Declared for the byte tunnel yet body-locating: the open carries
-        // no body reader, so this route can never be validated.
+        // no body reader, so the open-phase chain locates nothing — and
+        // since PB-26b that is exactly the json-body upgrade shape whose
+        // ids arrive in the later WebSocket frames (per-frame send gate).
         { path: '/notes/live', scope: 'session', upgrade: true, locator: { in: 'json-body', fields: ['sessionId'] } },
       ],
     }
@@ -424,9 +426,31 @@ test("PB-24: the v2 locator's server-side walls each refuse before the loopback 
     }
 
     // The tunnel open passes no body reader (an open request is empty-bodied
-    // by contract): a body-locating route refuses inside the shared chain —
-    // even one declared upgrade: true — before the upgrade check is reached.
-    const beforeOpen = wiring.pluginServer.state.requests.length
+    // by contract): a body-locating route that is NOT an upgrade still
+    // refuses inside the shared chain — nothing owns the ids an open cannot
+    // carry. The upgrade case below is PB-26b's exception.
+    const beforePlain = wiring.pluginServer.state.requests.length
+    const plainOpen = await fetch(`http://127.0.0.1:${wiring._port}/_dsh/zen-remote/relay/v1/plugin-tunnel/open`, {
+      method: 'POST',
+      headers: {
+        ...AUTH,
+        'x-zr-plugin': 'test-panel',
+        'x-zr-plugin-version': '1.0.0',
+        'x-zr-plugin-digest': v2Digest,
+        'x-zr-path': '/notes/body',
+        'x-zr-query': '',
+      },
+      body: JSON.stringify({ headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' } }),
+    })
+    assert.equal(plainOpen.status, 400)
+    assert.deepEqual(await plainOpen.json(), { ok: false, error: { code: 'bad-request' } })
+    assert.equal(plainOpen.headers.get('x-zen-remote-error'), 'bad-request')
+    assert.equal(wiring.pluginServer.state.requests.length, beforePlain, 'the open dialed nothing')
+
+    // PB-26b: an UPGRADE json-body route OPENS — its handshake is an
+    // empty-bodied GET and the ids ride the LATER WebSocket text frames,
+    // each share-checked by the send gate before the plugin sees one (end
+    // to end in relay-e2e). The river opens and the upstream is dialed.
     const open = await fetch(`http://127.0.0.1:${wiring._port}/_dsh/zen-remote/relay/v1/plugin-tunnel/open`, {
       method: 'POST',
       headers: {
@@ -439,10 +463,14 @@ test("PB-24: the v2 locator's server-side walls each refuse before the loopback 
       },
       body: JSON.stringify({ headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' } }),
     })
-    assert.equal(open.status, 400)
-    assert.deepEqual(await open.json(), { ok: false, error: { code: 'bad-request' } })
-    assert.equal(open.headers.get('x-zen-remote-error'), 'bad-request')
-    assert.equal(wiring.pluginServer.state.requests.length, beforeOpen, 'the open dialed nothing')
+    assert.equal(open.status, 200)
+    let openLine
+    for await (const chunk of open.body) {
+      openLine = JSON.parse(Buffer.from(chunk).toString('utf8').split('\n')[0])
+      break
+    }
+    assert.equal(openLine.type, 'open', 'the NDJSON river opened for the json-body upgrade route')
+    assert.match(openLine.tunnel, /^[0-9a-f]{32}$/)
   } finally { await wiring.stop() }
 })
 

@@ -25,6 +25,7 @@
 
 import { connect as netConnect } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
+import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Socket } from 'node:net'
 import { pluginBridgeError, responseJson } from './http.js'
@@ -47,8 +48,11 @@ export type PluginCallValidation =
 /** The json-body locator's body reader (PB-24): the caller owns the request
  * stream — `v1/plugin` buffers it bounded by the route's `maxBody` (413 past
  * the cap, mirroring the adapter half's discipline), the tunnel open omits
- * the reader entirely (an open request is empty-bodied by contract, so a
- * body-locating upgrade route can never be validated and refuses). */
+ * the reader entirely (an open request is empty-bodied by contract). Since
+ * PB-26b that open-phase gap is fine for an `upgrade: true` route — its ids
+ * ride the LATER WebSocket text frames and the send gate share-checks each
+ * one — while a NON-upgrade json-body route still refuses at open: nothing
+ * would ever own its ids. */
 export type PluginCallBodyReader = (maxBody: number) => Promise<
   | { kind: 'body'; buffered: Buffer; parsed?: unknown }
   | { kind: 'over' }
@@ -126,6 +130,15 @@ export async function validatePluginCall(
     if (queryId === undefined || queryId === '') return { ok: false, status: 400, code: 'bad-query' }
     if (!isAccessible(queryId)) return { ok: false, status: 403, code: 'not-shared' }
     sessionId = queryId
+  } else if (locator.in === 'json-body' && readJsonBody === undefined && routeUpgradesOf(route)) {
+    // PB-26b: a json-body UPGRADE route's handshake is an empty-bodied GET —
+    // the ids ride the JSON text frames the browser sends AFTER the
+    // handshake, and the tunnel's send gate share-checks every one of those
+    // frames ({@link frameShareVerdict}) before a byte reaches the plugin.
+    // The open phase locates nothing and validates no body; the consent
+    // wall below still applies, and the tunnel carries the route so the
+    // gate can judge the frames.
+    sessionId = ''
   } else {
     let parsedBody: unknown
     if (locator.in === 'json-body') {
@@ -169,6 +182,136 @@ export const TUNNEL_UP_CHUNK_BYTES = 64 * 1024
 /** Concurrent tunnels per device. */
 export const MAX_TUNNELS_PER_DEVICE = 8
 
+// ---- PB-26b: the RFC 6455 frame gate for json-body upgrade routes -----------
+//
+// A `locator: { in: 'json-body' }` upgrade route carries its session ids in
+// the JSON text frames the browser sends AFTER the handshake (the sidechat
+// ws watch: `{"op":"watch","threadIds":[...]}`) — the handshake itself is an
+// empty-bodied GET, so the open-phase share wall has nothing to judge. The
+// gate lives on the SEND path instead: the sub-client's upstream chunks are
+// split into frames, and every text frame is located + share-checked before
+// a byte of it reaches the plugin. Query-locator upgrade routes never parse
+// a frame — their bytes stay a 100% opaque stream (docs/adr/0002).
+
+/** One RFC 6455 frame split off a byte stream. */
+export interface Rfc6455Frame {
+  opcode: number
+  fin: boolean
+  /** The payload with the client mask removed (both directions parse; the
+   * mask belongs to client frames only and is undone here either way). */
+  payload: Buffer
+  /** The frame's complete wire bytes, mask included — the verbatim form a
+   * validated frame is forwarded in. */
+  raw: Buffer
+}
+
+/** The frame-size cap the gate parses (per frame, declared length): a
+ * browser watch frame is a few KiB at most, and an unbounded declared
+ * length would let a broken sender grow the parse buffer forever. */
+export const MAX_GATE_FRAME_BYTES = 1024 * 1024
+
+/** Split the COMPLETE frames at the front of `buffer` — client frames
+ * (masked) and server frames (unmasked) alike. A partial frame at the tail
+ * stays unconsumed for the next chunk; `violated` reports a frame whose
+ * DECLARED length exceeds {@link MAX_GATE_FRAME_BYTES} (the caller refuses,
+ * never waits for bytes that must not arrive). */
+export function parseRfc6455Frames(buffer: Buffer): { frames: Rfc6455Frame[]; consumed: number; violated: boolean } {
+  const frames: Rfc6455Frame[] = []
+  let offset = 0
+  while (true) {
+    const remain = buffer.length - offset
+    if (remain < 2) break
+    const fin = (buffer[offset] & 0x80) !== 0
+    const opcode = buffer[offset] & 0x0f
+    const masked = (buffer[offset + 1] & 0x80) !== 0
+    let length = buffer[offset + 1] & 0x7f
+    let headerLength = 2
+    if (length === 126) {
+      if (remain < 4) break
+      length = buffer.readUInt16BE(offset + 2)
+      headerLength = 4
+    } else if (length === 127) {
+      if (remain < 10) break
+      const declared = buffer.readBigUInt64BE(offset + 2)
+      if (declared > BigInt(MAX_GATE_FRAME_BYTES)) return { frames, consumed: offset, violated: true }
+      length = Number(declared)
+      headerLength = 10
+    }
+    if (length > MAX_GATE_FRAME_BYTES) return { frames, consumed: offset, violated: true }
+    const maskLength = masked ? 4 : 0
+    if (remain < headerLength + maskLength + length) break
+    const maskAt = offset + headerLength
+    const payloadAt = maskAt + maskLength
+    const end = payloadAt + length
+    const payload = Buffer.from(buffer.subarray(payloadAt, end))
+    if (masked) {
+      const mask = buffer.subarray(maskAt, payloadAt)
+      for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4]
+    }
+    frames.push({ opcode, fin, payload, raw: Buffer.from(buffer.subarray(offset, end)) })
+    offset = end
+  }
+  return { frames, consumed: offset, violated: false }
+}
+
+/** Encode one RFC 6455 frame. `mask: true` produces the CLIENT side's
+ * masked form (4 fresh random bytes, payload XORed) — the bytes the sub-
+ * client forwards must look like the browser's own. `false` is the server
+ * side's plain form (frames toward the browser). `fin` (default true) is
+ * the frame's FIN bit — a fragmented frame keeps its fragmentation shape
+ * when the gate re-frames it. */
+export function encodeRfc6455Frame(opcode: number, payload: Buffer, mask: boolean, fin = true): Buffer {
+  const firstByte = (fin ? 0x80 : 0x00) | (opcode & 0x0f)
+  const maskBit = mask ? 0x80 : 0
+  const length = payload.length
+  let head: Buffer
+  if (length < 126) {
+    head = Buffer.from([firstByte, maskBit | length])
+  } else if (length < 65536) {
+    head = Buffer.alloc(4)
+    head[0] = firstByte
+    head[1] = maskBit | 126
+    head.writeUInt16BE(length, 2)
+  } else {
+    head = Buffer.alloc(10)
+    head[0] = firstByte
+    head[1] = maskBit | 127
+    head.writeBigUInt64BE(BigInt(length), 2)
+  }
+  if (!mask) return Buffer.concat([head, payload])
+  const maskKey = randomBytes(4)
+  const masked = Buffer.from(payload)
+  for (let i = 0; i < masked.length; i += 1) masked[i] ^= maskKey[i % 4]
+  return Buffer.concat([head, maskKey, masked])
+}
+
+/** The share-wall verdict of ONE client text frame (PB-26b): the frame's
+ * JSON is located against the route's OWN locator and every hit is share-
+ * checked — the same adapter-core rule the open phase runs for query and
+ * body routes. Non-text frames (close/ping/pong/binary) carry no session
+ * ids and pass. A frame that locates NOTHING (an empty `threadIds` array —
+ * the unsubscribe-all — or a non-object JSON) is admitted: there is no id
+ * to check. */
+function frameShareVerdict(route: NormalizedBridgeRoute, frame: Rfc6455Frame, isAccessible: (sessionId: string) => boolean): { ok: true } | { ok: false; status: number; code: string } {
+  if (frame.opcode !== 0x1) return { ok: true }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(frame.payload.toString('utf8'))
+  } catch {
+    return { ok: false, status: 400, code: 'bad-request' }
+  }
+  let hits
+  try {
+    hits = locateAdapterIds(asAdapterRoute(route), route.path, new URLSearchParams(), parsed)
+  } catch {
+    return { ok: false, status: 400, code: 'bad-query' }
+  }
+  for (const hit of hits) {
+    if (!isAccessible(hit.value)) return { ok: false, status: 403, code: 'not-shared' }
+  }
+  return { ok: true }
+}
+
 /** The four WebSocket headers the open body may carry, verbatim. */
 const TUNNEL_CLIENT_HEADERS = ['sec-websocket-key', 'sec-websocket-version', 'sec-websocket-protocol', 'sec-websocket-extensions'] as const
 
@@ -192,6 +335,13 @@ interface Tunnel {
   /** The next upstream sequence the client must send. */
   expectedSeq: number
   heartbeat: ReturnType<typeof setInterval>
+  /** PB-26b: the validated route — a json-body upgrade tunnel's send gate
+   * reads its locator to judge every upstream text frame. */
+  route: NormalizedBridgeRoute
+  /** PB-26b: the upstream frame-parse buffer. PRESENT ONLY on a json-body
+   * upgrade tunnel (the frame gate is enabled); a query-locator upgrade
+   * stays `undefined` — its bytes pass through 100% opaque, zero parsing. */
+  upFrameBuffer: Buffer | undefined
 }
 
 export interface CreatePluginTunnelOptions {
@@ -258,6 +408,27 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
     const raw = req.headers[name]
     const value = Array.isArray(raw) ? raw[0] : raw
     return typeof value === 'string' ? value : undefined
+  }
+
+  /** PB-26b: run the frame gate over the tunnel's accumulated upstream
+   * buffer — split the complete frames, share-check every TEXT one against
+   * the route's locator and return the verified wire bytes for the plugin.
+   * A refusal returns the verdict and the caller owns the channel (an HTTP
+   * status on `send`; an end line on the early head bytes): the refused
+   * frame and everything after it NEVER reach upstream. Frames that locate
+   * no id (the empty-array unsubscribe) are admitted verbatim. */
+  const admitUpstreamFrames = (tunnel: Tunnel, isAccessible: (sessionId: string) => boolean): { ok: true; bytes: Buffer } | { ok: false; status: number; code: string } => {
+    const buffer = tunnel.upFrameBuffer!
+    const parsed = parseRfc6455Frames(buffer)
+    if (parsed.violated) return { ok: false, status: 400, code: 'bad-request' }
+    const verified: Buffer[] = []
+    for (const frame of parsed.frames) {
+      const verdict = frameShareVerdict(tunnel.route, frame, isAccessible)
+      if (!verdict.ok) return verdict
+      verified.push(frame.raw)
+    }
+    tunnel.upFrameBuffer = buffer.subarray(parsed.consumed)
+    return { ok: true, bytes: Buffer.concat(verified) }
   }
 
   return {
@@ -336,9 +507,11 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
         pluginBridgeError(res, 400, 'bad-request')
         return
       }
-      // No body reader here: an open request is empty-bodied by contract, so
-      // a json-body-locator route can never be validated and answers
-      // bad-request inside the shared chain.
+      // No body reader here: an open request is empty-bodied by contract. A
+      // NON-upgrade json-body route answers bad-request inside the shared
+      // chain (nothing would ever own its ids); an `upgrade: true` one is
+      // admitted with an empty session (PB-26b) — its ids arrive in the
+      // later WebSocket frames and the send gate owns them.
       const validation = await validatePluginCall(bridge, coords, options.isAccessible)
       if (!validation.ok) {
         pluginBridgeError(res, validation.status, validation.code)
@@ -381,11 +554,14 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
         return
       }
       const id = (await import('node:crypto')).randomBytes(16).toString('hex')
+      const gated = routeUpgradesOf(validation.route) && routeLocatorOf(validation.route).in === 'json-body'
       const tunnel: Tunnel = {
         device,
         upstream,
         res,
         expectedSeq: 0,
+        route: validation.route,
+        upFrameBuffer: gated ? Buffer.alloc(0) : undefined,
         heartbeat: setInterval(() => {
           writeLine(res, { type: 'ping' })
         }, options.heartbeatMs),
@@ -417,7 +593,22 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
         '\r\n',
       ]
       upstream.write(requestLines.join('\r\n'))
-      if (head.length > 0) upstream.write(head)
+      // PB-26b: the gated tunnel admits even its EARLY head bytes through
+      // the same per-frame wall — the client half never sends head on a
+      // json-body route, so bytes here are a bypass attempt and the tunnel
+      // dies with an end line (the river is already open — no HTTP status
+      // fits anymore) instead of slipping ids past the share check.
+      if (tunnel.upFrameBuffer !== undefined && head.length > 0) {
+        tunnel.upFrameBuffer = Buffer.concat([tunnel.upFrameBuffer, head])
+        const admitted = admitUpstreamFrames(tunnel, options.isAccessible)
+        if (!admitted.ok) {
+          teardown(tunnel, id, 'client-closed')
+          return
+        }
+        if (admitted.bytes.length > 0) upstream.write(admitted.bytes)
+      } else if (head.length > 0) {
+        upstream.write(head)
+      }
 
       // Upstream bytes → downstream data lines, at most 48 KiB PER LINE, with
       // the slow-reader discipline: a full socket pauses the UPSTREAM read, so
@@ -508,22 +699,41 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
       }
       const bytes = Buffer.concat(chunks)
       tunnel.expectedSeq = seq + 1
+      // PB-26b: a json-body upgrade tunnel parses its upstream bytes into
+      // RFC 6455 frames FIRST — every text frame is located and share-
+      // checked before a byte of it reaches the plugin; a refused frame
+      // answers the send's own HTTP status and tears the tunnel down. An
+      // opaque (query-locator) tunnel skips the gate entirely.
+      let outbound: Buffer = bytes
+      if (tunnel.upFrameBuffer !== undefined) {
+        tunnel.upFrameBuffer = Buffer.concat([tunnel.upFrameBuffer, bytes])
+        const admitted = admitUpstreamFrames(tunnel, options.isAccessible)
+        if (!admitted.ok) {
+          pluginBridgeError(res, admitted.status, admitted.code)
+          teardown(tunnel, tunnelId, 'client-closed')
+          return
+        }
+        outbound = admitted.bytes
+      }
       // Backpressure: the answer waits for the upstream socket to take the
       // bytes, so a stalled plugin makes THIS send slow instead of growing
-      // buffers here.
-      const flushed = tunnel.upstream.write(bytes)
-      if (!flushed) {
-        await new Promise<void>((resolve) => {
-          const settled = (): void => {
-            tunnel.upstream.off('drain', settled)
-            tunnel.upstream.off('close', settled)
-            tunnel.upstream.off('error', settled)
-            resolve()
-          }
-          tunnel.upstream.once('drain', settled)
-          tunnel.upstream.once('close', settled)
-          tunnel.upstream.once('error', settled)
-        })
+      // buffers here. A gated chunk may hold no complete frame yet — nothing
+      // to write, the bytes stay in the parse buffer, the send answers ok.
+      if (outbound.length > 0) {
+        const flushed = tunnel.upstream.write(outbound)
+        if (!flushed) {
+          await new Promise<void>((resolve) => {
+            const settled = (): void => {
+              tunnel.upstream.off('drain', settled)
+              tunnel.upstream.off('close', settled)
+              tunnel.upstream.off('error', settled)
+              resolve()
+            }
+            tunnel.upstream.once('drain', settled)
+            tunnel.upstream.once('close', settled)
+            tunnel.upstream.once('error', settled)
+          })
+        }
       }
       if (tunnels.get(tunnelId) !== tunnel) {
         // The tunnel died while the bytes were draining.

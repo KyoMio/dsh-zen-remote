@@ -3031,6 +3031,180 @@ test('e2e PB-13: fs-watch speaks through the tunnel both ways and agent-opens pu
   }
 })
 
+// ---- PB-26b: the sidechat ws (a json-body upgrade) crosses the whole chain ----
+
+test('e2e PB-26b: ws/sidechat watch frames rewrite both ways through the frame gate; an unshared thread id never reaches the plugin', async () => {
+  // The fake DSH: the sidechat ws endpoint — handshake, watch recording, a
+  // push back per watched thread (the REAL id on the wire, exactly the
+  // 0.26 push shape) — plus the cookie exchange the tunnel's loopback rides.
+  const dshState = { opened: 0, watched: [] }
+  const sidechatSockets = new Set()
+  const fakeDsh = http.createServer((req, res) => {
+    res.writeHead(303, { 'set-cookie': 'dsh-auth=e2e; Path=/', location: '/' })
+    res.end()
+  })
+  fakeDsh.on('upgrade', (req, socket) => {
+    sidechatSockets.add(socket)
+    socket.on('close', () => sidechatSockets.delete(socket))
+    if (new URL(req.url ?? '/', 'http://dsh.internal').pathname !== '/sidebar/ws/sidechat') {
+      socket.destroy()
+      return
+    }
+    dshState.opened += 1
+    const key = req.headers['sec-websocket-key']
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`)
+    socket.on('data', (chunk) => {
+      const frame = wsDecodeClientFrame(chunk)
+      if (frame === null || frame.opcode !== 0x1) return
+      const message = JSON.parse(frame.text)
+      if (message.op === 'watch') {
+        dshState.watched.push(message.threadIds)
+        for (const tid of message.threadIds) {
+          socket.write(wsEncodeText(JSON.stringify({ threadId: tid })))
+        }
+      }
+    })
+  })
+  await new Promise((resolve) => fakeDsh.listen(0, '127.0.0.1', resolve))
+  const dshPort = fakeDsh.address().port
+  const dshStop = () => new Promise((done) => {
+    // Upgraded sockets escape closeAllConnections (the PB-10 finding).
+    for (const socket of sidechatSockets) socket.destroy()
+    fakeDsh.closeAllConnections()
+    fakeDsh.close(done)
+  })
+
+  // The REAL better-sidebar adapter at its listed 0.25.0 version — the
+  // declaration under test is the one production registers, with the
+  // PB-26b sidechat route and the threadId response hook.
+  const adaptersMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'adapters', 'index.js')).href)
+  const rawAdapter = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
+  const adapter = normalizeAdapter(rawAdapter, '0.25.0')
+
+  // The tunnel's server half — the frame gate lives in its send route.
+  const pluginTunnelMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-tunnel.js')).href)
+  const pluginLoopbackObj = createPluginLoopback({
+    getTarget: () => ({ protocol: 'http:', port: dshPort }),
+    getTokenUrl: () => `http://127.0.0.1:${dshPort}/?token=t`,
+  })
+  const pluginTunnel = pluginTunnelMod.createPluginTunnel({
+    bridge: { registry: (() => { const r = createBridgeRegistry(); r.registerNormalized(adapter.declaration); return r })(), getConsent: () => ({ 'dsh-better-sidebar': true }), loopback: pluginLoopbackObj },
+    getTarget: () => ({ protocol: 'http:', port: dshPort }),
+    // The sidechat child inherits its parent's share (the ancestor chain
+    // the sidechat.* HTTP calls pass through too).
+    isAccessible: (sessionId) => sessionId === 'session-a' || sessionId === 'session-child-9',
+    heartbeatMs: 15_000,
+  })
+  const env = await boot({
+    shared: ['session-a'],
+    plugins: () => ({ 'dsh-better-sidebar': { version: '0.25.0', digest: adapter.digest, serverScopeConsent: true } }),
+    pluginBridge: {
+      registry: (() => { const r = createBridgeRegistry(); r.registerNormalized(adapter.declaration); return r })(),
+      getConsent: () => ({ 'dsh-better-sidebar': true }),
+      loopback: pluginLoopbackObj,
+      adapters: [adapter],
+      tunnel: pluginTunnel,
+    },
+  })
+
+  const hostRaw = {
+    exact: new Map(), prefixes: new Map(), upgrades: new Map(),
+    match(pathname) { return this.exact.get(pathname) },
+    register(route) { this.exact.set(route.path, route); return () => undefined },
+  }
+  const subServer = http.createServer(() => {})
+  subServer.on('upgrade', (req, socket, head) => {
+    const route = hostRaw.upgrades.get(new URL(req.url ?? '/', 'http://x').pathname)
+    if (route !== undefined) {
+      route.handler(req, socket, head)
+      return
+    }
+    socket.destroy()
+  })
+  await new Promise((resolve) => subServer.listen(0, '127.0.0.1', resolve))
+  const subPort = subServer.address().port
+  // Node stops tracking an UPGRADED socket (closeAllConnections never sees
+  // it — the PB-10 finding), so the teardown destroys every connection this
+  // server accepted by hand before closing.
+  const subSockets = new Set()
+  subServer.on('connection', (socket) => {
+    subSockets.add(socket)
+    socket.on('close', () => subSockets.delete(socket))
+  })
+  const subStop = () => new Promise((done) => {
+    for (const socket of subSockets) socket.destroy()
+    subServer.closeAllConnections()
+    subServer.close(done)
+  })
+
+  const localRegistry = createBridgeRegistry()
+  localRegistry.registerNormalized(adapter.declaration)
+  const handle = installPluginRouteIntercept({
+    webServer: hostRaw,
+    registry: localRegistry,
+    relay: env.client,
+    getServerId: () => env.client.handshakeInfo?.serverId,
+    getStatus: () => compareBridges(localRegistry.list(), env.client.handshakeInfo?.plugins, env.client.state === 'online'),
+    adapters: [adapter],
+    log: () => {},
+  })
+
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const serverId = info.serverId
+    const virtualChild = toVirtual(serverId, 'session-child-9')
+
+    // ---- the happy path: the browser's watch frame crosses REAL, the
+    // plugin's push comes back VIRTUAL — the exact better-sidebar exchange,
+    // with NO query parameter on the upgrade URL at all.
+    const ws = new WebSocket(`ws://127.0.0.1:${subPort}/sidebar/ws/sidechat`)
+    const opened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), 5000)
+      ws.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      ws.addEventListener('error', (event) => { clearTimeout(timer); resolve(`error: ${event.message ?? event.error ?? 'unknown'}`) })
+      ws.addEventListener('close', (event) => { clearTimeout(timer); resolve(`close code=${event.code}`) })
+    })
+    assert.equal(opened, true, `the 101 answered without any query parameter: ${JSON.stringify(opened)}`)
+    const messages = []
+    ws.addEventListener('message', (event) => { messages.push(String(event.data)) })
+    ws.send(JSON.stringify({ op: 'watch', threadIds: [virtualChild] }))
+    await waitFor(() => dshState.watched.length > 0)
+    assert.deepEqual(dshState.watched, [['session-child-9']], 'the plugin saw the REAL child id')
+    await waitFor(() => messages.length > 0)
+    assert.deepEqual(messages.map((text) => JSON.parse(text).threadId), [virtualChild], 'the push arrived VIRTUAL (the response hook rewrote the frame)')
+    ws.close()
+    await new Promise((resolve) => setTimeout(resolve, 200))
+
+    // ---- the share wall, frame by frame: an unshared thread id is refused
+    // on the server's send gate — the plugin never sees it, and the refusal
+    // tears the tunnel (and with it the browser socket) down.
+    const watchedBefore = dshState.watched.length
+    const unshared = new WebSocket(`ws://127.0.0.1:${subPort}/sidebar/ws/sidechat`)
+    const unsharedOpened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5000)
+      unshared.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      unshared.addEventListener('error', () => { clearTimeout(timer); resolve(false) })
+    })
+    assert.equal(unsharedOpened, true, 'the second socket opened (the 101 is unconditional)')
+    const unsharedOutcome = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('still-open'), 5000)
+      unshared.addEventListener('close', () => { clearTimeout(timer); resolve('closed') })
+      unshared.addEventListener('error', () => { clearTimeout(timer); resolve('errored') })
+      unshared.send(JSON.stringify({ op: 'watch', threadIds: [toVirtual(serverId, 'session-unshared')] }))
+    })
+    assert.notEqual(unsharedOutcome, 'still-open', `the unshared watch killed the connection: ${JSON.stringify(unsharedOutcome)}`)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(dshState.watched.length, watchedBefore, 'the unshared id never reached the plugin')
+    unshared.close()
+  } finally {
+    handle.uninstall()
+    await env.stop()
+    await subStop()
+    await dshStop()
+  }
+})
+
 // ---- PB-24: a declarative v2 plugin crosses the whole chain --------------------
 
 test('e2e PB-24: a declarative v2 plugin — json-body, prefix, deny, rewriteIds — crosses the whole chain', async () => {
