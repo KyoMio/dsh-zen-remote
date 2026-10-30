@@ -15,3 +15,18 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # @deepseek-ai/* 全部手工管理：34 个 dsh-* 是 dev 闭包（升级要走
+      # fingerprint 钉 + rc.2/rc.5 双版本沙箱验证的流程，见 PR #40），
+      # cordis/cosmokit/schemastery 也是刻意钉版。别让 dependabot 自动提。
+      - dependency-name: "@deepseek-ai/*"
+      # TS 大版本需要迁移（TS 7 移除 moduleResolution=node10，实测 tsc 挂，
+      # PR #45）；小版本照常跟。
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # React types 跟宿主运行时（React 18）走，19 与 @types/react ~18 错配
+      # （PR #47）；整体迁 19 时两包一起手动动。
+      - dependency-name: "@types/react-dom"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/react"
+        update-types: ["version-update:semver-major"]
