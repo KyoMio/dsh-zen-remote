@@ -671,6 +671,12 @@ export interface InterceptHandle {
    * re-judges NOW — the mergers dedupe no-change calls — instead of
    * waiting for the next frame or the 1s fallback poll. */
   currentSessionChanged(): void
+  /** PB-26a: trigger a summary-sync check for virtual session ids discovered
+   * OUTSIDE workspace/follow (a sidechat childId the plugin bridge just
+   * minted in a response rewrite, for instance). Empty and non-virtual
+   * entries are dropped; a batch with nothing left is a no-op. Reaches every
+   * live merged `$events` stream, and the pending slot when none is open. */
+  nudgeSummarySync(ids: readonly string[]): void
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -2013,6 +2019,15 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
   /** The ids the in-flight round asked (its triggering batches) — marked at
    * completion, joined by nothing (mid-flight batches queue instead). */
   let askingNow: string[] = []
+  /** PB-26a: the newest REAL-TIME running flag this stream delivered per
+   * VIRTUAL session id (the leg's forwarded `api-session/status` frames
+   * only — never the synthesized status-sync frames). Read when a row is
+   * first announced: a status frame that reached the UI BEFORE its row
+   * existed was dropped by the host (handleSessionStatus only updates
+   * sessions already in its summaries), and a flip during the list pull is
+   * newer than the snapshot's `running` — either way the announce must be
+   * followed by the live value. Cleared with a fresh serving period. */
+  const latestLiveStatus = new Map<string, boolean>()
   const scheduleRetry = (): void => {
     if (retryTimer !== undefined || retryAt.size === 0) return
     const earliest = Math.min(...retryAt.values())
@@ -2072,6 +2087,15 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
           if (announced.has(rowId)) continue
           announced.add(rowId)
           channel.push(frame)
+          // PB-26a: the row is born in the UI carrying the snapshot's
+          // `running`; when this stream delivered a live status for it the
+          // host could not apply (no row yet) or that postdates the
+          // snapshot, realign right behind the added frame — only when the
+          // two disagree, a matching flag needs no second frame.
+          const liveRunning = latestLiveStatus.get(rowId)
+          if (liveRunning !== undefined && liveRunning !== (isPlainObject(row) && row.running === true)) {
+            channel.push({ type: 'emit', event: 'api-session/status', args: [rowId, liveRunning] })
+          }
         }
         // T65-fix ask bookkeeping: a returned id is announced and done; an
         // id the server did NOT return either exhausts its attempts or
@@ -2206,6 +2230,10 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
       askedForGood.clear()
       askAttempts.clear()
       retryAt.clear()
+      // PB-26a: the live flags belong to the serving period that delivered
+      // them — the status re-sync below re-reads every row from a fresh
+      // snapshot.
+      latestLiveStatus.clear()
       if (retryTimer !== undefined) {
         clock.clearTimeout(retryTimer)
         retryTimer = undefined
@@ -2370,6 +2398,20 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
             if (isPlainObject(frame) && frame.type === 'emit' && frame.event === 'api-session/status') {
               const rowId = Array.isArray(frame.args) ? frame.args[0] : undefined
               if (typeof rowId === 'string' && rowId !== '') liveStatusSeq.set(rowId, ++statusSeq)
+              // PB-26a: the rewritten frame is the proved shape (`args` =
+              // [virtualId, running]). Remember the live flag under the
+              // VIRTUAL id, and — when this stream has not announced the row
+              // — pull the list now: a sidechat / subagent child rides no
+              // workspace/follow frame, so this status is the client's first
+              // (and, until the next turn, only) notice that the row exists.
+              // The frame itself still crosses at once, below.
+              const args = isPlainObject(rewritten) && Array.isArray(rewritten.args) ? rewritten.args : undefined
+              const virtualId = args?.[0]
+              const running = args?.[1]
+              if (typeof virtualId === 'string' && typeof running === 'boolean') {
+                latestLiveStatus.set(virtualId, running)
+                if (!announced.has(virtualId)) handleForwardedBatch([virtualId])
+              }
             }
             // The orphan-close bookkeeping rides the two id-carrying frame
             // types: waterfalls enter the record (once per leg — a repeat
@@ -3497,6 +3539,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     },
     currentSessionChanged() {
       for (const listener of [...currentSessionListeners]) listener()
+    },
+    nudgeSummarySync(ids: readonly string[]) {
+      const virtualIds = ids.filter((id) => typeof id === 'string' && id !== '' && isVirtual(id))
+      if (virtualIds.length > 0) summarySync.noteForwardedSessionIds(virtualIds)
     },
   }
 }

@@ -131,8 +131,11 @@ function deepRewriteIds(
  * array elements stay the value scan's business (the declaration refuses
  * numeric segments outright). Already-virtual values are skipped, so a known
  * id sitting on a declared path is rewritten exactly once, by whichever half
- * reached it first. */
-function rewriteIdsAtFields(root: unknown, fields: readonly string[], serverId: string): void {
+ * reached it first. Returns the virtual ids this pass MINTED (PB-26a) —
+ * exactly the positions it wrapped, deduped; a position the value scan
+ * already wrapped is not a mint (that row is in the browser's view). */
+function rewriteIdsAtFields(root: unknown, fields: readonly string[], serverId: string): string[] {
+  const minted = new Set<string>()
   for (const field of fields) {
     const segments = field.split('.')
     let node: unknown = root
@@ -142,8 +145,13 @@ function rewriteIdsAtFields(root: unknown, fields: readonly string[], serverId: 
     if (!isRecord(node)) continue
     const key = segments[segments.length - 1]
     const value = node[key]
-    if (typeof value === 'string' && value !== '' && !isVirtual(value)) node[key] = toVirtual(serverId, value)
+    if (typeof value === 'string' && value !== '' && !isVirtual(value)) {
+      const virtualId = toVirtual(serverId, value)
+      node[key] = virtualId
+      minted.add(virtualId)
+    }
   }
+  return [...minted]
 }
 
 /** Pump a response body reader into the browser response with real
@@ -180,7 +188,10 @@ async function pumpResponse(
  * untouched (the adapter discipline): a rewrite is strictly
  * better-than-nothing, never a reason to mangle or refuse an answer. The
  * caller has already handled the relay's refusal marker — this owns the
- * entire normal answer. */
+ * entire normal answer. PB-26a: the virtual ids the position rewrite minted
+ * are reported through `onMinted` — at most once per answer, only when there
+ * are any, and only after the rewritten body is what the browser receives
+ * (a serialization failure passes the original bytes and reports nothing). */
 async function answerRewriteIds(
   res: ServerResponse,
   response: Response,
@@ -188,6 +199,7 @@ async function answerRewriteIds(
   fields: readonly string[] | undefined,
   serverId: string,
   knownIds: ReadonlySet<string> | undefined,
+  onMinted: ((virtualIds: readonly string[]) => void) | undefined,
 ): Promise<void> {
   const contentType = response.headers.get('content-type')
   const verbatimHeaders = {
@@ -238,9 +250,10 @@ async function answerRewriteIds(
   }
   const text = Buffer.concat(chunks).toString('utf8')
   let outBody: Buffer
+  let minted: string[] = []
   try {
     const scanned = deepRewriteIds(JSON.parse(text), known, knownIds, serverId)
-    if (fields !== undefined) rewriteIdsAtFields(scanned, fields, serverId)
+    if (fields !== undefined) minted = rewriteIdsAtFields(scanned, fields, serverId)
     outBody = Buffer.from(JSON.stringify(scanned), 'utf8')
   } catch {
     // Not JSON after all (or the scan hit something unserializable): the
@@ -253,6 +266,14 @@ async function answerRewriteIds(
   }
   res.writeHead(response.status, { ...verbatimHeaders, 'content-length': String(outBody.length) })
   res.end(outBody)
+  if (minted.length > 0 && onMinted !== undefined) {
+    try {
+      onMinted(minted)
+    } catch {
+      // Bookkeeping for the sidebar — never a reason to fail an answer
+      // the browser already has.
+    }
+  }
 }
 
 /** Pure inspection of the RAW webServer instance — nothing is mutated, so a
@@ -343,6 +364,14 @@ export interface InstallPluginRouteInterceptOptions {
    * consumption: nothing here mutates merge state. Absent → the scan is
    * exactly the request-local PB-22 behavior. */
   getKnownRealIds?: () => ReadonlySet<string>
+  /** PB-26a: called with the virtual session ids a response rewrite
+   * PRODUCED — a `rewriteIds.fields` route's wrapped positions, or the ids
+   * an adapter's `client.response` hook passed through `virtualize` (e.g.
+   * better-sidebar's `sidechat.start` childId) — so the session-summary
+   * sync can announce subagent/sidechat rows that never appear in
+   * workspace/follow. At most once per answer, deduped, only when there is
+   * something to report; a throwing callback never fails the answer. */
+  onMintedVirtualIds?: (virtualIds: readonly string[]) => void
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
 }
@@ -450,6 +479,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   const adapters = options.adapters ?? []
   const getCurrentSession = options.getCurrentSession
   const getKnownRealIds = options.getKnownRealIds
+  const onMintedVirtualIds = options.onMintedVirtualIds
   const target = webServer as { match: (this: unknown, pathname: string) => unknown }
   const savedMatch = target.match
 
@@ -754,7 +784,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // known inventory, read live right here (undefined when the wiring
         // passed no getter — the scan stays request-local).
         if (declared.rewriteIds) {
-          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, parts.serverId, getKnownRealIds?.())
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, parts.serverId, getKnownRealIds?.(), onMintedVirtualIds)
           return
         }
         const contentType = response.headers.get('content-type')
@@ -1064,7 +1094,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           return
         }
         if (declared.rewriteIds) {
-          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, locatedServerId!, getKnownRealIds?.())
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, locatedServerId!, getKnownRealIds?.(), onMintedVirtualIds)
           return
         }
         const contentType = response.headers.get('content-type')
@@ -1430,12 +1460,20 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         }
         const text = Buffer.concat(chunks).toString('utf8')
         let rewrittenBody: unknown
+        // PB-26a: every id the hook virtualizes is a row the browser is
+        // about to learn of (sidechat.start's childId) — collected here,
+        // reported only once the hook's answer is what the browser gets.
+        const minted = new Set<string>()
         try {
           rewrittenBody = responseHook({
             status: response.status,
             pathname,
             body: JSON.parse(text),
-            virtualize: (id: string) => toVirtual(serverId ?? '', id),
+            virtualize: (id: string) => {
+              const virtualId = toVirtual(serverId ?? '', id)
+              if (isVirtual(virtualId)) minted.add(virtualId)
+              return virtualId
+            },
             isVirtual: (value: unknown) => isVirtual(value),
           })
         } catch {
@@ -1459,6 +1497,14 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           'content-length': String(outBody.length),
         })
         res.end(outBody)
+        if (minted.size > 0 && onMintedVirtualIds !== undefined) {
+          try {
+            onMintedVirtualIds([...minted])
+          } catch {
+            // Sidebar bookkeeping — never a reason to fail an answer the
+            // browser already has.
+          }
+        }
       } catch (error) {
         if (controller?.signal.aborted || res.destroyed || res.headersSent) {
           try {
