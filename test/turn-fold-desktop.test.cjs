@@ -101,8 +101,10 @@ const emit = () => {
     .replace(/^export const TURN_FOLD_CSS/m, 'const TURN_FOLD_CSS')
   const head = `const PROCESS_KINDS = ${JSON.stringify(PROCESS_KINDS)},`
     + ` THINK = ${JSON.stringify(THINK)}, OPEN = ${JSON.stringify(OPEN)};`
-  // eslint-disable-next-line no-eval
-  return eval(`${head} ${body}; TURN_FOLD_CSS`)
+  // A fresh VM context instead of eval: the template only reads the three
+  // constants declared in `head`, and the script's completion value is the
+  // emitted string, so the result is identical without in-scope eval.
+  return require('node:vm').runInNewContext(`${head} ${body}; TURN_FOLD_CSS`)
 }
 
 test('the compiled CSS string really contains both copies', () => {
