@@ -1,0 +1,17 @@
+# Dependabot：GitHub Actions 版本（钉 SHA 后也由它按 `# vX.Y.Z` 注释提升）
+# + npm 依赖（pnpm，pnpm-lock.yaml 在仓库根，ecosystem 名仍写 npm）。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
