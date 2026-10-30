@@ -111,39 +111,97 @@ const ACTIVE_ATTR = 'data-mnav-fold-on'
 /** Selector of the one row kind that can fold whole — see {@link foldsWholeRow}. */
 const STEP_SELECTOR = '[data-chat-flow-kind="assistant-step"]'
 
+/** Elements that show something without a text node of their own. Every other
+ * element is a wrapper: it is content only if something inside it is. */
+const SELF_VISIBLE = new Set([
+  'AUDIO', 'CANVAS', 'EMBED', 'HR', 'IFRAME', 'IMG', 'INPUT', 'OBJECT',
+  'PICTURE', 'SELECT', 'SVG', 'TEXTAREA', 'VIDEO',
+])
+
+/** The DOM surface {@link hasContentOutside} reads — kept this narrow so the
+ * verdict is testable off-DOM (test/turn-fold-blank-step.test.cjs). */
+export interface ContentNode {
+  readonly nodeType: number
+  readonly textContent: string | null
+  readonly childNodes: ArrayLike<ContentNode>
+  readonly tagName?: string
+  matches?(selector: string): boolean
+}
+
+/**
+ * True when `node` renders anything a reader could see outside the subtrees
+ * that match `skip`: a non-blank text node, or a {@link SELF_VISIBLE} element.
+ * Structural, no class names — same discipline as the rest of this effect.
+ */
+export function hasContentOutside(node: ContentNode, skip: string | null): boolean {
+  if (node.nodeType === 3) return (node.textContent ?? '').trim() !== ''
+  if (node.nodeType !== 1) return false
+  if (skip !== null && node.matches?.(skip) === true) return false
+  if (SELF_VISIBLE.has((node.tagName ?? '').toUpperCase())) return true
+  const children = node.childNodes
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i]
+    if (child !== undefined && hasContentOutside(child, skip)) return true
+  }
+  return false
+}
+
 /**
  * True when the reasoning rows are the ONLY thing this row renders, so the
  * whole flow item has to go: the flow column is `display: flex` with
  * `gap: 16px`, and an emptied-out flex item still claims its gap — the
  * reader would see the folded steps as a column of blank bands.
- * Structural test, no class names: every ancestor from the reasoning rows'
- * shared parent up to the flow item must be an only child.
+ * Structural test, no class names: outside the reasoning rows the row holds
+ * nothing visible — only wrappers. Each reasoning block sits in its own
+ * ProcessReasoning wrapper, and since DSH 0.2.1-rc.5 a block whose display
+ * text is empty once a leading `<signature>…</signature>` is stripped renders
+ * its ReasoningRow as null and leaves that wrapper empty; an empty wrapper
+ * beside a Think must not keep the row unfolded.
  */
-function foldsWholeRow(row: Element, thinks: readonly Element[]): boolean {
-  const first = thinks[0]
-  if (first === undefined) return false
-  const body = first.parentElement
-  if (body === null || body.childElementCount !== thinks.length) return false
-  let node: Element = body
-  while (node !== row) {
-    const parent = node.parentElement
-    if (parent === null) return false
-    if (parent.childElementCount !== 1) return false
-    node = parent
-  }
-  return true
+export function foldsWholeRow(row: ContentNode, thinks: readonly unknown[]): boolean {
+  if (thinks.length === 0) return false
+  return !hasContentOutside(row, THINK)
 }
 
-/** The process items one flow row contributes: the row itself, its reasoning
- * rows, or nothing at all. */
-function processItems(row: Element): readonly Element[] {
+/**
+ * True for an assistant-step row that renders nothing at all — no Think, no
+ * prose, no image, no notice. DSH 0.2.1-rc.5 produces one for a step whose
+ * only reasoning is a `<signature>…</signature>` (ReasoningRow hides itself,
+ * the wrappers stay). It is not process to count in the chip, and it is not
+ * content either: left alone it is a blank band in the flow (the gap again),
+ * so it is hidden on its own marker ({@link BLANK}) that the chip's open
+ * override never releases. On 0.2.1-rc.2, which renders such a block as an
+ * ordinary Think, the row is not blank and folds exactly as before.
+ */
+export function isBlankStep(row: ContentNode): boolean {
+  return !hasContentOutside(row, null)
+}
+
+/** Marker of a {@link isBlankStep} row; the stylesheet hides it while the
+ * fold is live. Never counted, never opened. */
+export const BLANK = 'data-mnav-blank'
+
+/** Hold {@link BLANK} on an assistant-step row exactly while it is
+ * {@link isBlankStep} — set the moment it empties, dropped the moment
+ * anything (a Think, prose, an image) arrives in it. */
+function markBlank(row: Element, thinks: readonly Element[]): void {
+  if (thinks.length === 0 && isBlankStep(row)) row.setAttribute(BLANK, '')
+  else row.removeAttribute(BLANK)
+}
+
+/** The process items one flow row contributes — the row itself, its reasoning
+ * rows, or nothing at all — and how many steps they are on the chip: a row
+ * folded whole still counts each reasoning block it holds, so the count does
+ * not depend on how the row had to be hidden. */
+function processItems(row: Element): { readonly items: readonly Element[], readonly steps: number } {
   const kind = row.getAttribute('data-chat-flow-kind')
-  if (kind === null) return []
-  if (PROCESS_KIND_SET.has(kind)) return [row]
-  if (kind !== 'assistant-step') return []
+  if (kind === null) return { items: [], steps: 0 }
+  if (PROCESS_KIND_SET.has(kind)) return { items: [row], steps: 1 }
+  if (kind !== 'assistant-step') return { items: [], steps: 0 }
   const thinks = [...row.querySelectorAll(THINK)]
-  if (thinks.length === 0) return []
-  return foldsWholeRow(row, thinks) ? [row] : thinks
+  markBlank(row, thinks)
+  if (thinks.length === 0) return { items: [], steps: 0 }
+  return { items: foldsWholeRow(row, thinks) ? [row] : thinks, steps: thinks.length }
 }
 
 /**
@@ -170,6 +228,8 @@ interface Group {
   readonly key: string
   /** Every process element of this turn, in flow order. */
   readonly items: Element[]
+  /** Steps the chip announces (see {@link processItems}). */
+  steps: number
 }
 
 /** Split the flow column into turns: a group runs from one user/steering row
@@ -183,10 +243,12 @@ function groupsOf(flow: Element): readonly Group[] {
     const kind = row.getAttribute('data-chat-flow-kind')
     if (kind === null) continue
     if (current === undefined || TURN_HEAD_KINDS.has(kind)) {
-      current = { key: row.getAttribute('data-chat-flow-key') ?? `pos${groups.length}`, items: [] }
+      current = { key: row.getAttribute('data-chat-flow-key') ?? `pos${groups.length}`, items: [], steps: 0 }
       groups.push(current)
     }
-    current.items.push(...processItems(row))
+    const { items, steps } = processItems(row)
+    current.items.push(...items)
+    current.steps += steps
   }
   return groups
 }
@@ -279,7 +341,7 @@ export function installTurnFold(ctx: ClientContext): void {
         const groupRunning = running && index === groups.length - 1
         if (groupRunning) chip.dataset['running'] = ''
         else delete chip.dataset['running']
-        label(chip, group.items.length, groupRunning)
+        label(chip, group.steps, groupRunning)
         live.add(group.key)
       })
 
@@ -301,6 +363,11 @@ export function installTurnFold(ctx: ClientContext): void {
         if (liveItems.has(stale)) continue
         stale.removeAttribute(FOLD)
         stale.removeAttribute(OPEN)
+      }
+      // {@link BLANK} is held by groupsOf on every assistant-step row of this
+      // column; anything else carrying it left the column (or changed kind).
+      for (const stale of flow.querySelectorAll(`[${BLANK}]`)) {
+        if (stale.parentElement !== flow || !stale.matches(STEP_SELECTOR)) stale.removeAttribute(BLANK)
       }
     }
 
@@ -359,6 +426,9 @@ export function installTurnFold(ctx: ClientContext): void {
         const thinks = [...row.querySelectorAll(THINK)]
         if (thinks.length > 0 && foldsWholeRow(row, thinks)) row.setAttribute(FOLD, '')
         else row.removeAttribute(FOLD)
+        // Same frame for the blank row (see {@link isBlankStep}): hidden
+        // before it paints its band, shown before its first content paints.
+        markBlank(row, thinks)
       }
     }
 
@@ -396,6 +466,7 @@ export function installTurnFold(ctx: ClientContext): void {
         item.removeAttribute(FOLD)
         item.removeAttribute(OPEN)
       }
+      for (const item of document.querySelectorAll(`[${BLANK}]`)) item.removeAttribute(BLANK)
     }
 
     const attach = (): void => {
