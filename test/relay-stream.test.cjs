@@ -874,28 +874,30 @@ test('backpressure: the pump parks on a full socket and resumes in order after d
     const gate = parts.streams[0]
     const big = 'x'.repeat(2 * 1024 * 1024)
     const frame = (seq) => ({ type: 'event', event: { type: 'big', seq, time: seq, data: { pad: big } } })
-    gate.push(frame(1))
-    gate.push(frame(2))
-    gate.push(frame(3))
+    // The parked state must hold by MARGIN, not by luck: the total volume has
+    // to exceed every buffer on the path combined. 2026-10-30: the old 3×2 MiB
+    // fitted entirely into the Ubuntu 26 runner's autotuned socket buffers
+    // (wmem + rmem, tens of MiB per side) — the pump never parked, the queue
+    // kept draining during the settle sleep, and the "still queued" assert
+    // read an empty queue. 48×2 MiB = 96 MiB leaves ≥16 frames queued under
+    // any plausible buffer pair. (2026-10-28 forensics: whole-file load
+    // sensitivity also lives here; the waits below keep their slack.)
+    const FRAMES = 48
+    for (let seq = 1; seq <= FRAMES; seq++) gate.push(frame(seq))
     gate.finish()
     // Frame 1 exceeds every buffer on the path: its write must return false,
-    // the pump must park on drain, and frames 2/3 must stay QUEUED — not
-    // pulled, not buffered line-by-line. The windows carry deliberate slack
-    // (2026-10-28 forensics: this case passes 10/10 in isolation on both the
-    // pre-phase baseline and main, and flakes at the same rate on BOTH when
-    // the whole file runs — baseline 2/6, main 1/6 — so it is whole-file
-    // load sensitivity, not a regression of any change; the widened waits
-    // keep the assertions' semantics untouched).
+    // the pump must park on drain, and the rest must stay QUEUED — not
+    // pulled, not buffered line-by-line.
     await waitFor(() => gate.queued >= 2, 10_000)
     await new Promise((resolve) => setTimeout(resolve, 500))
     assert.equal(open.lines.length, 0, 'the paused client has parsed no complete line')
-    assert.ok(gate.queued >= 2, `frames 2 and 3 are still queued (got ${gate.queued})`)
+    assert.ok(gate.queued >= 2, `the frames beyond the buffers are still queued (got ${gate.queued})`)
 
     open.res.resume()
     await open.done
     assert.deepEqual(
       open.lines.map((line) => line.frame?.event?.seq ?? line.type),
-      [1, 2, 3, 'end'],
+      Array.from({ length: FRAMES }, (_, i) => i + 1).concat('end'),
       'everything arrives, in order, after the drain',
     )
   } finally { await server.stop() }
