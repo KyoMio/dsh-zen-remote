@@ -876,12 +876,13 @@ test('backpressure: the pump parks on a full socket and resumes in order after d
     const frame = (seq) => ({ type: 'event', event: { type: 'big', seq, time: seq, data: { pad: big } } })
     // The parked state must hold by MARGIN, not by luck: the total volume has
     // to exceed every buffer on the path combined. 2026-10-30: the old 3×2 MiB
-    // fitted entirely into the Ubuntu 26 runner's autotuned socket buffers
-    // (wmem + rmem, tens of MiB per side) — the pump never parked, the queue
-    // kept draining during the settle sleep, and the "still queued" assert
-    // read an empty queue. 48×2 MiB = 96 MiB leaves ≥16 frames queued under
-    // any plausible buffer pair. (2026-10-28 forensics: whole-file load
-    // sensitivity also lives here; the waits below keep their slack.)
+    // fitted entirely through the CI runner's loopback path (kernel wmem +
+    // client rmem keep draining while the app is paused) within the 500 ms
+    // settle sleep — the pump unparked, the queue drained to 0, and the
+    // "still queued" assert read an empty queue (twice, ~504 ms each, on the
+    // ubuntu-24.04 image; the 2026-10-28 whole-file flake is the same
+    // mechanism racing). 48×2 MiB = 96 MiB leaves ≥16 frames queued under any
+    // plausible buffer pair; the waits below keep their slack.
     const FRAMES = 48
     for (let seq = 1; seq <= FRAMES; seq++) gate.push(frame(seq))
     gate.finish()
