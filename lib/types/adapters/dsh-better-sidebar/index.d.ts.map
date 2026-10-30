@@ -1,1 +1,1 @@
-{"version":3,"file":"index.d.ts","sourceRoot":"","sources":["../../../../src/adapters/dsh-better-sidebar/index.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;;;;;;;;;;;;;;;;;;GA6BG;AAEH,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,aAAa,CAAA;AAahD,eAAO,MAAM,uBAAuB,EAAE,aA8JrC,CAAA"}
+{"version":3,"file":"index.d.ts","sourceRoot":"","sources":["../../../../src/adapters/dsh-better-sidebar/index.ts"],"names":[],"mappings":"AAAA;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;GAgCG;AAEH,OAAO,KAAK,EAAE,aAAa,EAAE,MAAM,aAAa,CAAA;AAahD,eAAO,MAAM,uBAAuB,EAAE,aAwLrC,CAAA"}

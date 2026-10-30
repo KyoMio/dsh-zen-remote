@@ -63,7 +63,7 @@ export function apply(ctx: Context) {
 
 声明里出现未知字段直接报错（防拼错）。`methods`、`maxBody`、`upgrade` 与 2.4 的四个字段（`locator`/`prefix`/`deny`/`rewriteIds`）只在**显式给出**时进摘要——2.1 时代（没有这些字段）的声明，摘要与当年完全一致，升级不破坏已桥接状态。2.1 只匹配 **exact 路径**；2.4 起声明 `prefix: true` 的路由额外命中其子路径（见上表）。
 
-两个字段同写时 `deny` 优先：远程命中的请求先被 `route-denied` 拒下，`rewriteIds` 的改写不可达（本地请求两边都不触发，响应原样交回）。`upgrade` 路由上的 `rewriteIds` 在隧道半边被忽略——隧道搬运的是不透明字节，无从改写；同一声明路由被当作普通 HTTP 请求命中时照常生效。
+两个字段同写时 `deny` 优先：远程命中的请求先被 `route-denied` 拒下，`rewriteIds` 的改写不可达（本地请求两边都不触发，响应原样交回）。`upgrade` 路由上的 `rewriteIds`：query 定位的升级路由在隧道半边被忽略——隧道搬运的是不透明字节，无从改写（同一声明路由被当作普通 HTTP 请求命中时照常生效）；json-body 定位的升级路由（PB-26b）则照常作用在**下行文本帧**上——帧先解 JSON、深扫或按位改写后重新封帧再给浏览器。
 
 ## 你的插件要守的约定
 
@@ -107,7 +107,7 @@ content-type: application/json; charset=utf-8
 
 ## WebSocket 路由（2.2 起）
 
-路由声明 `upgrade: true` 后即成为 WebSocket 升级端点：远程会话里浏览器对该路径的 `new WebSocket(...)` 由子客户端本机接住，经中继的**字节隧道**接到服务端本机插件——升级请求头（`sec-websocket-key` / `sec-websocket-version`，及可选的 `sec-websocket-protocol` / `sec-websocket-extensions`）与双向字节各自**原样搬运，两端都不解析 WebSocket 帧**：101 响应、每个帧、关闭字节都是不透明字节，真正的握手由插件路由在服务端本机完成。三路由的协议形状见 `docs/remote-access.md` 的「插件桥」一节；决策记录见 `docs/adr/0002`。
+路由声明 `upgrade: true` 后即成为 WebSocket 升级端点：远程会话里浏览器对该路径的 `new WebSocket(...)` 由子客户端本机接住，经中继的**字节隧道**接到服务端本机插件——升级请求头（`sec-websocket-key` / `sec-websocket-version`，及可选的 `sec-websocket-protocol` / `sec-websocket-extensions`）与双向字节各自**原样搬运，两端都不解析 WebSocket 帧**：101 响应、每个帧、关闭字节都是不透明字节，真正的握手由插件路由在服务端本机完成。例外（PB-26b）：`locator: { in: 'json-body' }` 的升级路由（会话 id 在连接后的 JSON 文本帧里，握手本身是不带体的 GET）逐帧处理——客户端把每个文本帧的虚拟 id 还原成真实 id 再按序转发，服务端对每个文本帧按共享表核对后才交给插件，`rewriteIds` 声明（或适配器的响应钩子）也会作用在下行文本帧上；query 定位的升级路由保持不透明字节直通。三路由的协议形状见 `docs/remote-access.md` 的「插件桥」一节；决策记录见 `docs/adr/0002`。
 
 浏览器侧没有新接口：拿到的仍是原生 `WebSocket`，感知不到隧道。升级无法转发时（未桥接、会话不可达等原因）浏览器看到的就是一次握手失败——子客户端在 socket 上回答与 HTTP 改道相同的 503 `zr-plugin-unbridged` 形状（reason 取值见上表），表现为 `error` / `close` 事件。
 

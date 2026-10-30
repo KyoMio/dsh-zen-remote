@@ -48,8 +48,11 @@ export type PluginCallValidation = {
 /** The json-body locator's body reader (PB-24): the caller owns the request
  * stream — `v1/plugin` buffers it bounded by the route's `maxBody` (413 past
  * the cap, mirroring the adapter half's discipline), the tunnel open omits
- * the reader entirely (an open request is empty-bodied by contract, so a
- * body-locating upgrade route can never be validated and refuses). */
+ * the reader entirely (an open request is empty-bodied by contract). Since
+ * PB-26b that open-phase gap is fine for an `upgrade: true` route — its ids
+ * ride the LATER WebSocket text frames and the send gate share-checks each
+ * one — while a NON-upgrade json-body route still refuses at open: nothing
+ * would ever own its ids. */
 export type PluginCallBodyReader = (maxBody: number) => Promise<{
     kind: 'body';
     buffered: Buffer;
@@ -88,6 +91,38 @@ export declare const TUNNEL_DOWN_CHUNK_BYTES: number;
 export declare const TUNNEL_UP_CHUNK_BYTES: number;
 /** Concurrent tunnels per device. */
 export declare const MAX_TUNNELS_PER_DEVICE = 8;
+/** One RFC 6455 frame split off a byte stream. */
+export interface Rfc6455Frame {
+    opcode: number;
+    fin: boolean;
+    /** The payload with the client mask removed (both directions parse; the
+     * mask belongs to client frames only and is undone here either way). */
+    payload: Buffer;
+    /** The frame's complete wire bytes, mask included — the verbatim form a
+     * validated frame is forwarded in. */
+    raw: Buffer;
+}
+/** The frame-size cap the gate parses (per frame, declared length): a
+ * browser watch frame is a few KiB at most, and an unbounded declared
+ * length would let a broken sender grow the parse buffer forever. */
+export declare const MAX_GATE_FRAME_BYTES: number;
+/** Split the COMPLETE frames at the front of `buffer` — client frames
+ * (masked) and server frames (unmasked) alike. A partial frame at the tail
+ * stays unconsumed for the next chunk; `violated` reports a frame whose
+ * DECLARED length exceeds {@link MAX_GATE_FRAME_BYTES} (the caller refuses,
+ * never waits for bytes that must not arrive). */
+export declare function parseRfc6455Frames(buffer: Buffer): {
+    frames: Rfc6455Frame[];
+    consumed: number;
+    violated: boolean;
+};
+/** Encode one RFC 6455 frame. `mask: true` produces the CLIENT side's
+ * masked form (4 fresh random bytes, payload XORed) — the bytes the sub-
+ * client forwards must look like the browser's own. `false` is the server
+ * side's plain form (frames toward the browser). `fin` (default true) is
+ * the frame's FIN bit — a fragmented frame keeps its fragmentation shape
+ * when the gate re-frames it. */
+export declare function encodeRfc6455Frame(opcode: number, payload: Buffer, mask: boolean, fin?: boolean): Buffer;
 export interface CreatePluginTunnelOptions {
     bridge: {
         registry: BridgeRegistry;

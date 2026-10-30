@@ -205,6 +205,52 @@ test('PB-15: the 0.26.0 additions carry the right dispositions; both versions no
 
 // ---- shared fixtures -----------------------------------------------------------
 
+/** Minimal RFC 6455 helpers (text frames only): the unmasked server-frame
+ * encoder and the masked client-frame decoder — the same shapes the e2e
+ * file uses, kept local so this file stays dependency-free. */
+function wsEncodeText(text) {
+  const payload = Buffer.from(text, 'utf8')
+  const length = payload.length
+  let head
+  if (length < 126) {
+    head = Buffer.from([0x81, length])
+  } else if (length < 65536) {
+    head = Buffer.alloc(4)
+    head[0] = 0x81
+    head[1] = 126
+    head.writeUInt16BE(length, 2)
+  } else {
+    head = Buffer.alloc(10)
+    head[0] = 0x81
+    head[1] = 127
+    head.writeBigUInt64BE(BigInt(length), 2)
+  }
+  return Buffer.concat([head, payload])
+}
+function wsDecodeClientFrame(chunk) {
+  if (chunk.length < 2) return null
+  const opcode = chunk[0] & 0x0f
+  const masked = (chunk[1] & 0x80) !== 0
+  let length = chunk[1] & 0x7f
+  let offset = 2
+  if (length === 126) {
+    if (chunk.length < 4) return null
+    length = chunk.readUInt16BE(2)
+    offset = 4
+  } else if (length === 127) {
+    if (chunk.length < 10) return null
+    length = Number(chunk.readBigUInt64BE(2))
+    offset = 10
+  }
+  const mask = masked ? chunk.subarray(offset, offset + 4) : null
+  if (masked) offset += 4
+  const payload = chunk.subarray(offset, offset + length)
+  if (masked) {
+    for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i % 4]
+  }
+  return { opcode, text: payload.toString('utf8') }
+}
+
 async function loadAdapter() {
   const adaptersMod = await importLib('adapters/index.js')
   const core = await importLib('plugin-adapter-core.js')
@@ -214,7 +260,7 @@ async function loadAdapter() {
 }
 
 function startFakeHost() {
-  const hits = { local: 0, localWs: 0 }
+  const hits = { local: 0, localWs: 0, localSidechat: 0 }
   let raw
   const server = http.createServer((req, res) => {
     Promise.resolve(raw.match(new URL(req.url ?? '/', 'http://x').pathname)).then(async (route) => {
@@ -291,6 +337,27 @@ function startFakeHost() {
           socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
         },
       })
+      // The LOCAL sidechat ws endpoint (PB-26b): a LOCAL watch thread lands
+      // HERE through the frame half's in-memory pipe — the handler answers
+      // with its own 101 (which the frame half strips — the browser already
+      // has one) and echoes the watched thread ids back.
+      raw.upgrades.set('/sidebar/ws/sidechat', {
+        path: '/sidebar/ws/sidechat',
+        handler: (req, socket) => {
+          hits.localSidechat += 1
+          const key = req.headers['sec-websocket-key']
+          const accept = key === undefined
+            ? 'invalid'
+            : require('node:crypto').createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+          socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+          socket.on('data', (chunk) => {
+            const frame = wsDecodeClientFrame(chunk)
+            if (frame === null || frame.opcode !== 0x1) return
+            const message = JSON.parse(frame.text)
+            socket.write(wsEncodeText(JSON.stringify({ local: true, watched: message.threadIds ?? [] })))
+          })
+        },
+      })
       resolve({
         raw, hits, port,
         get: (pathWithQuery, init = {}) => fetch(`http://127.0.0.1:${port}${pathWithQuery}`, init),
@@ -304,11 +371,17 @@ function startFakeHost() {
   })
 }
 
-function fakeRelayClient() {
+function fakeRelayClient({ failSends = false } = {}) {
   const forwarded = []
   const answers = new Map()
+  // PB-26b: the frame half's tunnel doors — recorded so a client-side test
+  // can assert the re-framed watch bytes without a full relay stack.
+  const tunnelOpens = []
+  const tunnelSends = []
   return {
     forwarded,
+    tunnelOpens,
+    tunnelSends,
     answer(path, answer) { answers.set(path, answer) },
     pluginRequest: async (request) => {
       const bodyChunks = []
@@ -323,6 +396,20 @@ function fakeRelayClient() {
       const answer = answers.get(request.path) ?? { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ok: true, value: {} }) }
       return new Response(answer.body, { status: answer.status, headers: answer.headers })
     },
+    // The frames stream never yields (the downstream pump parks on it until
+    // the socket closes) — a client-side test drives only the upstream.
+    pluginTunnelOpen: async (request) => {
+      tunnelOpens.push(request)
+      return {
+        tunnel: `t-${tunnelOpens.length}`,
+        frames: { [Symbol.asyncIterator]: () => ({ next: () => new Promise(() => {}) }) },
+      }
+    },
+    pluginTunnelSend: async (tunnel, seq, bytes) => {
+      if (failSends) throw Object.assign(new Error('send died'), { code: 'offline' })
+      tunnelSends.push({ tunnel, seq, bytes: Buffer.from(bytes) })
+    },
+    pluginTunnelClose: async () => {},
   }
 }
 
@@ -728,7 +815,7 @@ test('PB-12: the upload route rides the shared relay budget; the api route keeps
 
 // ---- PB-13: the two WebSockets and the sidechat loop ---------------------------
 
-test('PB-13: both WS routes are in the declaration table as upgrades; the tunnel opens through the adapter registration', async () => {
+test('PB-13/PB-26b: the WS routes are in the declaration table as upgrades; the sidechat frame gate reads its locator off the registry', async () => {
   const { adapter } = await loadAdapter()
   for (const path of ['/sidebar/ws/agent-opens', '/sidebar/ws/fs-watch']) {
     const route = adapter.routes.find((entry) => entry.path === path)
@@ -743,7 +830,25 @@ test('PB-13: both WS routes are in the declaration table as upgrades; the tunnel
     const declared = adapter.declaration.routes.find((entry) => entry.path === path)
     assert.ok(declared !== undefined, `${path} reached the registry`)
     assert.equal(declared.upgrade, true)
+    // The 2.1 query convention keeps its exact old declaration shape: NO
+    // locator key at all (the digest-compatible form).
+    assert.equal('locator' in declared, false, `${path}'s declaration stays locator-free`)
   }
+
+  // PB-26b: the sidechat push feed — the upgrade URL carries NO query, the
+  // ids ride the post-handshake JSON frames, so the declaration KEEPS the
+  // json-body locator: the tunnel's validation and the client's frame gate
+  // read where the ids actually arrive.
+  const sidechat = adapter.routes.find((entry) => entry.path === '/sidebar/ws/sidechat')
+  assert.ok(sidechat !== undefined, '/sidebar/ws/sidechat is declared')
+  assert.equal(sidechat.upgrade, true)
+  assert.equal(sidechat.match, 'exact')
+  assert.deepEqual(sidechat.methods, ['GET'])
+  assert.deepEqual(sidechat.locator, { in: 'json-body', fields: ['threadIds'] })
+  const declaredSidechat = adapter.declaration.routes.find((entry) => entry.path === '/sidebar/ws/sidechat')
+  assert.ok(declaredSidechat !== undefined, '/sidebar/ws/sidechat reached the registry')
+  assert.equal(declaredSidechat.upgrade, true)
+  assert.deepEqual(declaredSidechat.locator, { in: 'json-body', fields: ['threadIds'] })
 })
 
 test('PB-13 sidechat loop: start forwards and virtualizes the childId; prompt takes the virtual id back to the REAL one; the server admits it through the ancestor chain', async () => {
@@ -801,5 +906,156 @@ test('PB-13 sidechat loop: start forwards and virtualizes the childId; prompt ta
     assert.equal(loopbackHits.length, 1, 'the stranger never reached the loopback')
   } finally {
     await server.stop()
+  }
+})
+
+// ---- PB-26b: the sidechat WebSocket (json-body upgrade) ------------------------
+
+test('PB-26b core: the sidechat watch frame locates, classifies and rewrites its threadIds as a batch', async () => {
+  const core = await importLib('plugin-adapter-core.js')
+  const { adapter } = await loadAdapter()
+  const route = adapter.routes.find((entry) => entry.path === '/sidebar/ws/sidechat')
+  assert.ok(route !== undefined)
+  const noQuery = new URLSearchParams()
+  const pathname = '/sidebar/ws/sidechat'
+
+  // A watch frame with TWO virtual ids: both locate under the same field.
+  const watch = { op: 'watch', threadIds: ['zr~a1b2c3d4~session-1', 'zr~a1b2c3d4~session-2'] }
+  assert.deepEqual(core.locateAdapterIds(route, pathname, noQuery, watch), [
+    { kind: 'json-body', key: 'threadIds', value: 'zr~a1b2c3d4~session-1' },
+    { kind: 'json-body', key: 'threadIds', value: 'zr~a1b2c3d4~session-2' },
+  ])
+  const verdict = core.classifyAdapterRequest(route, pathname, noQuery, watch)
+  assert.equal(verdict.kind, 'remote', 'every id virtual → remote')
+  const rewrite = core.rewriteAdapterRequest(route, pathname, noQuery, watch, verdict.hits, (virtualId) => core.fromVirtual(virtualId).id)
+  assert.equal(rewrite.bodyText, JSON.stringify({ op: 'watch', threadIds: ['session-1', 'session-2'] }), 'the op field rides along, both ids REAL, order intact')
+
+  // A MIXED batch is malformed for the bridge — refuse, never guess.
+  const mixed = { op: 'watch', threadIds: [virtual('session-1'), 'session-local'] }
+  assert.equal(core.classifyAdapterRequest(route, pathname, noQuery, mixed).kind, 'mixed')
+
+  // A LOCAL-only watch (no virtual id) classifies local — the frame pipe
+  // into the plugin's own handler.
+  const localWatch = { op: 'watch', threadIds: ['session-local'] }
+  assert.equal(core.classifyAdapterRequest(route, pathname, noQuery, localWatch).kind, 'local')
+
+  // The unsubscribe-all (empty list) locates NOTHING — admitted verbatim.
+  assert.deepEqual(core.locateAdapterIds(route, pathname, noQuery, { op: 'watch', threadIds: [] }), [])
+  assert.equal(core.classifyAdapterRequest(route, pathname, noQuery, { op: 'watch', threadIds: [] }).kind, 'local')
+
+  // A single-id scalar field still locates exactly as before (the string
+  // shape the HTTP routes use).
+  assert.deepEqual(core.locateAdapterIds(route, pathname, noQuery, { threadIds: virtual('s-1') }), [
+    { kind: 'json-body', key: 'threadIds', value: virtual('s-1') },
+  ])
+})
+
+test('PB-26b client: a LOCAL watch thread pipes into the plugin\u2019s own sidechat handler; a REMOTE one opens the tunnel with the ids rewritten REAL', async () => {
+  const host = await startFakeHost()
+  const relay = fakeRelayClient()
+  const { adapter } = await loadAdapter()
+  const handle = await installedIntercept(host, relay, adapter)
+  try {
+    // ---- LOCAL: the watch ids are plain local ids — the frame half wires
+    // the exchange into the plugin's own upgrade handler (its 101 head is
+    // stripped; the browser sees exactly one) and the echo comes back.
+    const localWs = new WebSocket(`ws://127.0.0.1:${host.port}/sidebar/ws/sidechat`)
+    const localOpened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), 3000)
+      localWs.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      localWs.addEventListener('error', () => { clearTimeout(timer); resolve(false) })
+    })
+    assert.equal(localOpened, true, 'the local handshake opened')
+    const localMessages = []
+    localWs.addEventListener('message', (event) => { localMessages.push(String(event.data)) })
+    localWs.send(JSON.stringify({ op: 'watch', threadIds: ['session-local'] }))
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(host.hits.localSidechat, 1, 'the plugin\u2019s OWN sidechat handler served the local watch')
+    assert.deepEqual(localMessages, [JSON.stringify({ local: true, watched: ['session-local'] })], 'the echo crossed the in-memory pipe')
+    assert.equal(relay.tunnelOpens.length, 0, 'no tunnel for a local thread')
+
+    // ---- REMOTE: the watch ids are virtual — the frame half opens the
+    // byte tunnel and re-frames the watch with the ids REAL (masked, client
+    // style — exactly what the server's send gate parses and re-checks).
+    const remoteWs = new WebSocket(`ws://127.0.0.1:${host.port}/sidebar/ws/sidechat`)
+    const remoteOpened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), 3000)
+      remoteWs.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      remoteWs.addEventListener('error', () => { clearTimeout(timer); resolve(false) })
+    })
+    assert.equal(remoteOpened, true, 'the remote handshake opened (the 101 answers immediately)')
+    remoteWs.send(JSON.stringify({ op: 'watch', threadIds: [virtual('session-a'), virtual('session-b')] }))
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(relay.tunnelOpens.length, 1, 'one tunnel opened')
+    assert.equal(relay.tunnelOpens[0].path, '/sidebar/ws/sidechat')
+    assert.equal(relay.tunnelOpens[0].query, '', 'the upgrade carries no query at all')
+    assert.equal(host.hits.localSidechat, 1, 'the remote watch never touched the local handler')
+    assert.equal(relay.tunnelSends.length, 1, 'the watch crossed as one ordered chunk')
+    assert.equal(relay.tunnelSends[0].seq, 0)
+    const frame = wsDecodeClientFrame(relay.tunnelSends[0].bytes)
+    assert.ok(frame !== null && frame.opcode === 0x1, 'the chunk is one masked text frame')
+    assert.deepEqual(JSON.parse(frame.text), { op: 'watch', threadIds: ['session-a', 'session-b'] }, 'the plugin will see the REAL ids, batch intact')
+
+    // An id-LESS frame on the tunnel-bound connection (the unsubscribe-all)
+    // stays ON the tunnel — never a pivot to the local handler.
+    remoteWs.send(JSON.stringify({ op: 'watch', threadIds: [] }))
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(relay.tunnelSends.length, 2, 'the unsubscribe-all rode the tunnel verbatim')
+    assert.equal(host.hits.localSidechat, 1, 'the unsubscribe-all never opened the local handler')
+    const emptyFrame = wsDecodeClientFrame(relay.tunnelSends[1].bytes)
+    assert.ok(emptyFrame !== null && emptyFrame.opcode === 0x1, 'the unsubscribe-all is one text frame')
+    assert.deepEqual(JSON.parse(emptyFrame.text), { op: 'watch', threadIds: [] })
+
+    // A REAL local id after the tunnel is up is a cross-frame mix: the
+    // exchange dies, and the local handler is never reached.
+    remoteWs.send(JSON.stringify({ op: 'watch', threadIds: ['session-local'] }))
+    const localAfterRemote = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('still-open'), 3000)
+      remoteWs.addEventListener('close', () => { clearTimeout(timer); resolve('closed') })
+      remoteWs.addEventListener('error', () => { clearTimeout(timer); resolve('errored') })
+    })
+    assert.notEqual(localAfterRemote, 'still-open', 'the cross-frame local id closed the exchange')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(relay.tunnelSends.length, 2, 'the local id never travelled')
+    assert.equal(host.hits.localSidechat, 1, 'the local handler was never reached from the tunnel-bound connection')
+
+    localWs.close()
+    remoteWs.close()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  } finally {
+    handle.uninstall()
+    await host.stop()
+  }
+})
+
+test('PB-26b-fix: a failed tunnel send tears the exchange down completely — counters, close, socket', async () => {
+  const host = await startFakeHost()
+  const relay = fakeRelayClient({ failSends: true })
+  const { adapter } = await loadAdapter()
+  const handle = await installedIntercept(host, relay, adapter)
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:${host.port}/sidebar/ws/sidechat`)
+    const opened = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('timeout'), 3000)
+      ws.addEventListener('open', () => { clearTimeout(timer); resolve(true) })
+      ws.addEventListener('error', () => { clearTimeout(timer); resolve(false) })
+    })
+    assert.equal(opened, true, 'the handshake opened (the failure is downstream of it)')
+    const outcome = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('still-open'), 3000)
+      ws.addEventListener('close', () => { clearTimeout(timer); resolve('closed') })
+      ws.addEventListener('error', () => { clearTimeout(timer); resolve('errored') })
+      ws.send(JSON.stringify({ op: 'watch', threadIds: [virtual('session-a')] }))
+    })
+    assert.notEqual(outcome, 'still-open', 'the failed send closed the browser socket')
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    const diag = handle.diagnostics()
+    assert.equal(diag.tunnelsOpened, 1, 'the tunnel opened before the send died')
+    assert.equal(diag.tunnelsCurrent, 0, 'no tunnel counter leaked')
+    assert.equal(diag.tunnelsClosed, 1, 'the teardown counted exactly once')
+    ws.close()
+  } finally {
+    handle.uninstall()
+    await host.stop()
   }
 })
