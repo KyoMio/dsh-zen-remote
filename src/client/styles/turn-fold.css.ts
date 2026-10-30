@@ -83,6 +83,15 @@ const rules = (scope: string): string => `
     display: none !important;
   }
 
+  /* An assistant-step row that renders nothing at all (effects/turn-fold.ts
+     isBlankStep — DSH 0.2.1-rc.5 leaves one behind for a step whose only
+     reasoning is a <signature>…</signature>). Not a step: never counted on
+     the chip and never released by the open override, it would only ever
+     paint the flow column's 16px gap as a blank band. Literal mirror of BLANK in effects/turn-fold.ts. */
+  ${scope} [data-chat-flow] > [data-mnav-blank] {
+    display: none !important;
+  }
+
   /* Compact chip, sized like the composer's own pills rather than a button:
      it is a reading affordance in the middle of the message flow, so it has
      to stay quieter than the content around it. The flow column is a flex
