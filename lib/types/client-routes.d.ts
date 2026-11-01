@@ -25,6 +25,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AdminAdmission } from './admin-routes.js';
+import type { LogRingEntry } from './log-ring.js';
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js';
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js';
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js';
@@ -65,6 +66,14 @@ export declare const CLIENT_NETWORK_HINT_ROUTE = "/_dsh/zen-remote/client/networ
  * answers the empty `{state:'unpaired', versionMismatch:false, serverName:'',
  * closed:{}}` conclusion. It carries no token and no server address. */
 export declare const CLIENT_REMOTE_STATUS_ROUTE = "/_dsh/zen-remote/client/remote-status";
+/** GET: the redacted diagnostic report (CU-3, SPEC 方案 C) — `_meta`,
+ * `config`, `status`, optional `gateway`, `logs` plates, assembled by
+ * {@link assembleDebugReport} and safe to paste into a GitHub issue. Mounted
+ * on BOTH roles (each answers its own report); a request that arrived
+ * through the gateway is refused BEFORE dispatch (the wizard's via wall) —
+ * diagnostics are a machine-local export, and the gateway must never be able
+ * to fetch this machine's report for its own device table either. */
+export declare const CLIENT_DEBUG_REPORT_ROUTE = "/_dsh/zen-remote/client/debug-report";
 /** POST `{sessionId: <虚拟 id>}`: close one remote session from THIS machine
  * (T34) — the backend forwards the ORIGINAL id through the relay's
  * `POST relay/v1/unshare`, so the server closes it with reason `'client'`. */
@@ -139,6 +148,20 @@ export interface ClientHandlerOptions {
      * a client handler WITHOUT the sink answers the same 404 (no sink, no
      * route). */
     onCurrentSession?: (read: CurrentSessionRead) => void;
+    /** CU-3, the debug-report route's inputs — all optional; the route answers
+     * its 404-shaped refusal without them (an unwired composition must not
+     * pretend to have diagnostics). Wired on BOTH role mounts.
+     *
+     * The log ring's snapshot (CU-1), oldest first. */
+    getLogSnapshot?: () => readonly LogRingEntry[];
+    /** The gateway child's summary plate (HOST mount only): liveness, port,
+     * device and share counts — counts, never tokens. May be async (it probes
+     * the gateway's own status). */
+    getGatewaySummary?: () => Record<string, unknown> | Promise<Record<string, unknown>>;
+    /** The profile context's display name, when the composition has one. */
+    getProfileName?: () => string | undefined;
+    /** This package's own version, read at module load in src/index.ts. */
+    getPluginVersion?: () => string;
 }
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 /**

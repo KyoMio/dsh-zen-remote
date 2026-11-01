@@ -39,6 +39,17 @@ function isHttpAllowedHost(hostname: string): boolean {
   return isAllowedIpv4(hostname)
 }
 
+/**
+ * Whether one hostname sits in a private/loopback network — the same verdict
+ * {@link isHttpAllowedHost} applies inside `normalizeServerUrl`, exported for
+ * the debug report's serverUrl shaper (CU-2): the one place outside the
+ * normalizer that needs the private-network fact, kept here so the address
+ * classes can never drift apart from what pairing actually accepts.
+ */
+export function isPrivateNetworkHost(hostname: string): boolean {
+  return isHttpAllowedHost(hostname)
+}
+
 /** Dotted-quad check against the allowed ranges. The hostname comes from a
  * parsed URL, so it is already canonical (the WHATWG parser folds exotic
  * spellings like `010.0x0A.0.3` into plain decimal before we ever see it). */

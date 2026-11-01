@@ -91,6 +91,11 @@ function startClientServer(row, overrides = {}) {
     ...(overrides.getPluginBridgeStatus !== undefined ? { getPluginBridgeStatus: overrides.getPluginBridgeStatus } : {}),
     ...(overrides.remoteStatusOnly !== undefined ? { remoteStatusOnly: overrides.remoteStatusOnly } : {}),
     ...(overrides.onCurrentSession !== undefined ? { onCurrentSession: overrides.onCurrentSession } : {}),
+    // CU-3: the debug-report route's inputs.
+    ...(overrides.getLogSnapshot !== undefined ? { getLogSnapshot: overrides.getLogSnapshot } : {}),
+    ...(overrides.getGatewaySummary !== undefined ? { getGatewaySummary: overrides.getGatewaySummary } : {}),
+    ...(overrides.getProfileName !== undefined ? { getProfileName: overrides.getProfileName } : {}),
+    ...(overrides.getPluginVersion !== undefined ? { getPluginVersion: overrides.getPluginVersion } : {}),
   })
   const server = http.createServer((req, res) => { void handler(req, res) })
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })))
@@ -1751,4 +1756,186 @@ test('PR29 network-hint: the route reads the relay client LIVE — the getter is
     const appeared = await request(port, { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, headers: sameOrigin(port), body: {} })
     assert.deepEqual(JSON.parse(appeared.body), { ok: true, reachable: true, reconnected: true })
   } finally { await closeServer(server) }
+})
+
+// ---- CU-3: the debug-report route ------------------------------------------------
+
+test('CU-2 drift pin: the redactor address classes agree with the pairing normalizer ranges', () => {
+  // src/debug-redact.ts restates the private ranges (it must import nothing
+  // under the check scripts' strip-only type stripping); this lib-level test
+  // keeps the two verdicts from drifting apart.
+  const { isPrivateNetworkHost } = require('../lib/client-pairing.js')
+  const { serverUrlShape } = require('../lib/debug-redact.js')
+  const table = [
+    ['127.0.0.1', 'loopback'], ['localhost', 'loopback'], ['[::1]', 'loopback'],
+    ['10.0.0.5', 'lan-ip'], ['172.16.1.1', 'lan-ip'], ['192.168.1.10', 'lan-ip'], ['100.64.0.9', 'lan-ip'],
+    ['1.2.3.4', 'public-ip'],
+    // S4: the range edges just outside 172.16/12 and 100.64/10.
+    ['172.15.0.1', 'public-ip'], ['100.128.0.1', 'public-ip'],
+    ['myserver.example.com', 'domain'], ['nas.local', 'domain'],
+  ]
+  for (const [host, cls] of table) {
+    const shape = serverUrlShape(`http://${host}`)
+    assert.equal(shape, `http://${cls}`, host)
+    // The redactor names mDNS names `domain` on purpose (they are NAMES, not
+    // IP addresses), while the pairing predicate admits `*.local` as plain-
+    // http private hosts — that one bucket is intentionally wider there, so
+    // it is pinned separately below instead of in this agreement loop.
+    if (host.endsWith('.local')) continue
+    const privateHost = isPrivateNetworkHost(host.replace(/^\[/u, '').replace(/\]$/u, ''))
+    assert.equal(
+      privateHost,
+      cls === 'loopback' || cls === 'lan-ip',
+      `${host}: the redactor class and the pairing predicate must agree`,
+    )
+  }
+  assert.equal(isPrivateNetworkHost('nas.local'), true, 'the pairing predicate still admits mDNS names for plain http')
+})
+
+test('CU-3 debug-report: 200 with every plate — and no token, hostname or path survives', async () => {
+  const row = makeRow({ deviceToken: 'tok-0123456789abcdef0123456789abcdef0123456789abcdef' })
+  const logRing = [
+    { t: '2026-11-01T12:00:00.000Z', level: 'info', msg: 'row apply: role=client plugin=2.3.6 dsh=0.2.1-rc.5' },
+    { t: '2026-11-01T12:00:01.000Z', level: 'warn', msg: 'refused: /Users/alice/work/x.txt' },
+  ]
+  const { server, port } = await startClientServer(row, {
+    getLogSnapshot: () => logRing,
+    getProfileName: () => 'default',
+    getPluginVersion: () => '2.3.6',
+  })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE })
+    assert.equal(res.status, 200)
+    const report = JSON.parse(res.body)
+    assert.deepEqual(Object.keys(report), ['_meta', 'config', 'status', 'logs'], 'all plates, gateway absent on a client mount')
+    assert.equal(report._meta.role, 'client')
+    assert.equal(report._meta.pluginVersion, '2.3.6')
+    assert.equal(report._meta.profile, 'default')
+    assert.equal(typeof report._meta.dshVersion, 'string')
+    assert.equal(typeof report._meta.platform, 'string')
+    assert.equal(typeof report._meta.generatedAt, 'string')
+    assert.equal(report.config.serverUrl, `http://loopback:${gwPort}`, 'serverUrl is a shape, never the address')
+    assert.equal(report.status.state, 'connected', 'the status plate is the live status body')
+    assert.equal(report.status.serverUrl, `http://loopback:${gwPort}`, 'the status body\u2019s serverUrl degrades too')
+    assert.equal(report.logs.length, 2)
+    assert.equal(report.logs[0].msg, 'row apply: role=client plugin=2.3.6 dsh=0.2.1-rc.5', 'a clean line passes verbatim')
+    assert.ok(report.logs[1].msg.includes('<路径:x.txt>'), 'a log path keeps only its leaf')
+    assert.ok(!res.body.includes('/Users/alice'), 'the log path\u2019s directories are gone')
+    assert.ok(!res.body.includes('127.0.0.1'), 'no raw address anywhere in the report')
+    assert.ok(!res.body.includes('tok-0123456789abcdef'), 'the row token never reaches the report')
+  } finally { await closeServer(server) }
+})
+
+test('CU-3 debug-report: the host mount answers its own report; without wiring it 404s', async () => {
+  const row = makeRow({ serverUrl: '', deviceToken: '' })
+  const wired = await startClientServer(row, {
+    remoteStatusOnly: true,
+    getLogSnapshot: () => [],
+    getGatewaySummary: async () => ({ reachable: false, shareCount: 0 }),
+    getPluginVersion: () => '2.3.6',
+  })
+  try {
+    const res = await request(wired.port, { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE })
+    assert.equal(res.status, 200)
+    const report = JSON.parse(res.body)
+    assert.deepEqual(Object.keys(report), ['_meta', 'config', 'status', 'gateway', 'logs'], 'the host mount carries the gateway plate')
+    assert.equal(report.gateway.reachable, false)
+    assert.equal(report.config.serverUrl, 'unset', 'a host row without credentials shapes to unset')
+    assert.equal(report.status.state, 'unpaired', 'the host status plate reads unpaired')
+  } finally { await closeServer(wired.server) }
+
+  const unwired = await startClientServer(row, { remoteStatusOnly: true })
+  try {
+    const res = await request(unwired.port, { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE })
+    assert.equal(res.status, 404, 'no log snapshot wired — the route does not exist')
+    assert.equal(JSON.parse(res.body).error.code, 'not-found')
+  } finally { await closeServer(unwired.server) }
+})
+
+test('CU-3 debug-report: admit first, then the via wall, before any dispatch', async () => {
+  const row = makeRow()
+  // The via wall: a gateway-forwarded request is refused with via-gateway —
+  // even on the host mount (whose other routes 404 long before).
+  const mounted = await startClientServer(row, {
+    remoteStatusOnly: true,
+    getLogSnapshot: () => [],
+  })
+  try {
+    const via = await request(mounted.port, { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE, headers: { 'x-zen-remote-via': 'gateway' } })
+    assert.equal(via.status, 403)
+    assert.equal(JSON.parse(via.body).error.code, 'via-gateway')
+    // Admit still runs FIRST: an unadmitted request is DSH's 401, via or not.
+    const unadmitted = await startClientServer(row, {
+      admit: () => ({ rejection: 401 }),
+      getLogSnapshot: () => [],
+    })
+    try {
+      const refused = await request(unadmitted.port, { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE, headers: { 'x-zen-remote-via': 'gateway' } })
+      assert.equal(refused.status, 401, 'admit is wall 1')
+    } finally { await closeServer(unadmitted.server) }
+  } finally { await closeServer(mounted.server) }
+})
+
+test('CU-3 debug-report: non-GET is 405 with the Allow header', async () => {
+  const row = makeRow()
+  const { server, port } = await startClientServer(row, { getLogSnapshot: () => [] })
+  try {
+    const res = await request(port, { method: 'POST', path: routes.CLIENT_DEBUG_REPORT_ROUTE, headers: sameOrigin(port), body: {} })
+    assert.equal(res.status, 405)
+    assert.equal(res.headers.allow, 'GET')
+  } finally { await closeServer(server) }
+})
+
+test('CU-3 debug-report: a status lastError with an embedded path comes out redacted', async () => {
+  const row = makeRow()
+  const relay = fakeRelay({
+    state: 'offline',
+    lastError: 'ECONNREFUSED at /Users/alice/secret/tunnel.dump',
+    connect: async () => { throw new RelayError('offline', 'connect failed') },
+  })
+  const { server, port } = await startClientServer(row, { getRelayClient: () => relay, getLogSnapshot: () => [] })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE })
+    assert.equal(res.status, 200)
+    const report = JSON.parse(res.body)
+    assert.equal(report.status.state, 'unreachable')
+    assert.ok(report.status.lastError.includes('<路径:tunnel.dump>'), 'the embedded path keeps only its leaf')
+    assert.ok(!res.body.includes('/Users/alice'), 'the path\u2019s directories are gone')
+    assert.ok(!res.body.includes('127.0.0.1'), 'the serverUrl degraded to its shape')
+  } finally { await closeServer(server) }
+})
+
+test('CU-fix S2: a rejected upload reaches the log ring through the warn the route hands in', async () => {
+  // Required BEFORE the dynamic import below pulls lib/ in as ESM (the
+  // ERR_REQUIRE_ESM_RACE_CONDITION note at the top of this file).
+  const { createLogRing, createPluginLog } = require('../lib/log-ring.js')
+  const { handleUpload } = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'index.js')).href)
+  const ring = createLogRing()
+  const loggerLines = []
+  const log = createPluginLog(ring, { warn: (...args) => { loggerLines.push(args) } })
+  // No live session: the upload is refused with 404 session-not-found — the
+  // rejection path. The context logger throws if touched: with a warn handed
+  // in, the line must go through it (logger + ring), never around it.
+  const ctx = {
+    sessions: { get: () => undefined },
+    logger: { warn: () => { throw new Error('the bare context logger must not be used when warn is passed') } },
+  }
+  const server = http.createServer((req, res) => { void handleUpload(ctx, 1024, req, res, undefined, log.warn) })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const res = await request(server.address().port, { method: 'POST', path: '/_dsh/mobile-nav/upload?session=nope&name=x.txt', body: 'hello', headers: { 'content-type': 'application/octet-stream' } })
+    assert.equal(res.status, 404)
+    assert.equal(loggerLines.length, 1, 'the context logger still gets the line (double write)')
+    const entries = ring.snapshot()
+    assert.equal(entries.length, 1)
+    assert.equal(entries[0].level, 'warn')
+    assert.match(entries[0].msg, /^dsh-mobile-nav upload rejected: live Session not found: nope$/u)
+  } finally { await closeServer(server) }
+
+  // Wiring pin: the production upload route hands apply()'s double-writer in.
+  const source = require('node:fs').readFileSync(path.join(__dirname, '..', 'src', 'index.ts'), 'utf8')
+  const anchor = source.indexOf("'dsh-mobile-nav: upload route'")
+  assert.notEqual(anchor, -1, 'the upload route registration is the anchor')
+  const call = source.slice(source.lastIndexOf('return handleUpload(', anchor), anchor)
+  assert.match(call, /admit\(admitReq\),\s*logWarn,\s*\)/u, 'the route passes logWarn as the warn argument')
 })

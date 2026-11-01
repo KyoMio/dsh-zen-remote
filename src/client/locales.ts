@@ -265,6 +265,13 @@ export const zh = {
   'settings.client.diagUploadRedirectOk': '已安装 · 上传已接管',
   'settings.client.diagUploadRedirectRefused': '拒装：{reason}',
   'settings.client.diagUploadRedirectPending': '服务注入未触发 · connection {connection} · fileUploads {fileUploads}',
+  // --- CU-4 诊断信息导出（设置页最底部，两种角色都有） ---
+  'settings.debug.title': '诊断信息',
+  'settings.debug.export': '导出诊断信息',
+  'settings.debug.exporting': '正在生成…',
+  'settings.debug.hint': '下载一份脱敏后的诊断文件（版本、配置形态、连接诊断、插件日志）。令牌与密钥、对话内容、附件和完整文件路径一律不包含，服务器地址只保留类型。建议从机与主服务器各导一份，可直接附到 GitHub issue。',
+  'settings.debug.done': '诊断文件已下载',
+  'settings.debug.fail': '导出失败：无法生成诊断报告',
   // --- PB-5 插件桥：主服务端同意小节 + 子客户端诊断小节 ---
   'settings.bridge.title': '插件桥',
   'settings.bridge.empty': '暂无插件登记插件桥',
@@ -778,6 +785,13 @@ export const en: Record<MobileNavKey, string> = {
   'settings.client.diagUploadRedirectOk': 'Installed · upload wrapped',
   'settings.client.diagUploadRedirectRefused': 'Refused: {reason}',
   'settings.client.diagUploadRedirectPending': 'Service inject never fired · connection {connection} · fileUploads {fileUploads}',
+  // --- CU-4: the diagnostics export (bottom of the settings page, both roles) ---
+  'settings.debug.title': 'Diagnostics',
+  'settings.debug.export': 'Export diagnostics',
+  'settings.debug.exporting': 'Generating…',
+  'settings.debug.hint': 'Download a redacted diagnostics file (versions, config shape, connection diagnostics, plugin log). Tokens and secrets, conversation content, attachments and full file paths are never included; server addresses keep only their type. Export one on the client and one on the server — both can be attached to a GitHub issue as-is.',
+  'settings.debug.done': 'Diagnostics file downloaded',
+  'settings.debug.fail': 'Export failed: the diagnostics report could not be generated',
   // --- PB-5 plugin bridge: host consent section + sub-client diagnostics ---
   'settings.bridge.title': 'Plugin bridge',
   'settings.bridge.empty': 'No plugin has registered a bridge yet',

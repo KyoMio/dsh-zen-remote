@@ -45,6 +45,7 @@ import {
   ADMIN_STATUS_ROUTE,
   CLIENT_CLAIM_ROUTE,
   CLIENT_CONFIG_ROUTE,
+  CLIENT_DEBUG_REPORT_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
   claimDeviceNameOf,
@@ -58,6 +59,8 @@ import {
 } from '../../client-data/settings-form.ts'
 import { bridgeSectionState, togglePluginConsent } from '../../client-data/plugin-bridge.ts'
 import type { PluginBridgeStatusView } from '../../client-data/plugin-bridge.ts'
+import { CURRENT_SESSION_STORAGE_KEY, parseCurrentSessionStorage } from '../../client-data/current-session.ts'
+import { isRemoteSessionId } from '../../client-data/remote-drop.ts'
 import type {
   AdminStatusBody,
   ClaimRouteBody,
@@ -137,6 +140,45 @@ async function postJson(url: string, payload: Record<string, unknown>): Promise<
   } catch {
     return { ok: false, sent: 0, failed: 0 }
   }
+}
+
+/** CU-4: the export's download name, `zen-remote-debug-<role>-<yyyymmdd-hhmm>.json`,
+ * stamped in the browser's local time (the file is for the user's own
+ * folder; the report's `_meta.generatedAt` carries the exact UTC instant). */
+function debugExportFileName(role: 'host' | 'client', now: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
+  return `zen-remote-debug-${role}-${stamp}.json`
+}
+
+/** CU-4: one transient notice for the export's outcome — the same inline-
+ * styled overlay habit the remote-drop guard's folder toast uses (styles
+ * stay inline: nothing of this goes into pwa/app.css or the style sheets),
+ * one at a time, gone after 3 s, never intercepting taps. */
+let debugToast: HTMLDivElement | undefined
+let debugToastTimer: number | undefined
+function showDebugToast(text: string): void {
+  if (debugToastTimer !== undefined) window.clearTimeout(debugToastTimer)
+  debugToast?.remove()
+  const el = document.createElement('div')
+  el.dataset.zenRemote = 'debug-export-toast'
+  el.textContent = text
+  el.style.cssText = [
+    'position:fixed', 'left:50%', 'transform:translateX(-50%)',
+    'bottom:calc(env(safe-area-inset-bottom, 0px) + 32px)',
+    'z-index:2147483000',
+    'background:rgba(0,0,0,.82)', 'color:#fff',
+    'font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+    'padding:10px 16px', 'border-radius:10px', 'max-width:90vw', 'text-align:center',
+    'pointer-events:none',
+  ].join(';')
+  document.body.appendChild(el)
+  debugToast = el
+  debugToastTimer = window.setTimeout(() => {
+    el.remove()
+    if (debugToast === el) debugToast = undefined
+    debugToastTimer = undefined
+  }, 3000)
 }
 
 export function SettingsSection(props: SettingsSectionProps) {
@@ -228,6 +270,8 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   // JS dialog methods, so renames edit inline).
   const [renaming, setRenaming] = useState<{ id: string, draft: string } | null>(null)
   const [pushTest, setPushTest] = useState<PushTest>({ state: 'idle' })
+  // CU-4: the debug export's in-flight marker.
+  const [debugBusy, setDebugBusy] = useState(false)
 
   // The client group's pairing form (T16). The address prefills from the row
   // (once the shared form's document is served) until the user types into it;
@@ -569,6 +613,48 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     setPushTest({ state: 'busy' })
     const result = await postJson(ADMIN_PUSH_TEST_ROUTE, {})
     setPushTest(result.ok ? { state: 'ok', sent: result.sent, failed: result.failed } : { state: 'fail' })
+  }
+
+  // CU-4 导出诊断信息: the backend's redacted report (both roles answer
+  // their own), merged with the two facts only THIS page can read — the
+  // attachment-entry guard's browser-side counters and whether the session
+  // open right now is a remote one — then downloaded as one JSON file. The
+  // browser plate carries counters and a boolean, nothing else: no session
+  // id, no storage dump.
+  const runDebugExport = async (): Promise<void> => {
+    setDebugBusy(true)
+    try {
+      const res = await fetch(CLIENT_DEBUG_REPORT_ROUTE)
+      if (!res.ok) throw new StatusError(res.status)
+      const report = await res.json() as Record<string, unknown>
+      let remote = false
+      try {
+        const current = parseCurrentSessionStorage(window.localStorage.getItem(CURRENT_SESSION_STORAGE_KEY))
+        remote = current.kind === 'open' && isRemoteSessionId(current.sessionId)
+      } catch { /* storage unreadable: report not-remote */ }
+      const merged = {
+        ...report,
+        browser: {
+          remoteDrop: remoteDropDiagnostics(),
+          currentSession: { remote },
+        },
+      }
+      const blob = new Blob([`${JSON.stringify(merged, null, 2)}\n`], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = debugExportFileName(clientRole ? 'client' : 'host', new Date())
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      // Revoked on the next tick: some engines start the download only
+      // after the click handler returns.
+      window.setTimeout(() => { URL.revokeObjectURL(url) }, 0)
+      showDebugToast(t('settings.debug.done'))
+    } catch {
+      showDebugToast(t('settings.debug.fail'))
+    }
+    setDebugBusy(false)
   }
 
   // --- client group (T16) ----------------------------------------------------
@@ -1313,6 +1399,24 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
           )}
         </div>
       )}
+
+      {/* CU-4: the diagnostics export — the very bottom of the page, on
+          BOTH roles (a host's report has its own value: the gateway plate),
+          outside the form frame so it works while the namespace is
+          read-only. Existing classes only: no new style rules anywhere. */}
+      <div className="zr-settings-card">
+        <div className="zr-settings-field">
+          <div className="zr-settings-head">
+            {/* The row's control is a Button (not labelable): a span, not a control-less label. */}
+            <span className="zr-settings-head-title">{t('settings.debug.title')}</span>
+            <span style={{ flex: 1 }} />
+            <Button variant="outline" size="sm" disabled={debugBusy} onClick={() => { void runDebugExport() }}>
+              {debugBusy ? t('settings.debug.exporting') : t('settings.debug.export')}
+            </Button>
+          </div>
+          <p className="zr-settings-hint">{t('settings.debug.hint')}</p>
+        </div>
+      </div>
     </div>
   )
 }

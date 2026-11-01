@@ -136,10 +136,17 @@ export function apply(ctx, config) {
         handle = null
         return
       }
+      // CU-1：spawn 成功回报（配置端口；网关遇端口被占会自行重试，最终端口
+      // 以 /lan-gate/status 为准）。可选回调，缺省或抛错都不影响子进程。
+      try { config?.gatewayEvent?.('spawn', { port: values.port }) } catch (e) { /* ignore */ }
       handle.done.then((outcome) => {
         console.log(`[dsh-zen-remote-gateway] gateway exited code=${outcome.exitCode} signal=${outcome.signal}`)
+        // CU-1：子进程生命周期回报给主入口的日志环（诊断导出用）。回调是可选
+        // 的（旧式独立加载没有它），且绝不能影响子进程自身的收尾。
+        try { config?.gatewayEvent?.('exit', { code: outcome.exitCode, signal: outcome.signal }) } catch (e) { /* ignore */ }
       }).catch((err) => {
         console.error(`[dsh-zen-remote-gateway] spawn failed: ${String(err && err.message || err)}`)
+        try { config?.gatewayEvent?.('exit', { error: String(err && err.message || err) }) } catch (e) { /* ignore */ }
       })
       if (timer) {
         // 子进程输出读两拍（T17b-fix）：1.5s 的一拍是老习惯，但网关遇到端口

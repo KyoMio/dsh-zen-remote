@@ -125,8 +125,14 @@ export declare function safeUploadName(raw: string): string;
  *   request must ask the connection service itself, its refusal relayed
  *   verbatim — same first wall as the admin and client routes. Optional only
  *   for the direct-drive check scripts; production always passes it.
+ * @param warn - where the rejection line goes. apply() passes its double-
+ *   writer (context logger + the CU-1 log ring), so a rejected upload — the
+ *   very path issue #49 is triaged on — shows up in the debug report. The
+ *   ring is per-apply on purpose (a row reload clears it), which is why it
+ *   arrives as a parameter instead of a module singleton. Defaults to the
+ *   context logger for the direct-drive check scripts.
  */
-export declare function handleUpload(ctx: Context, maxBytes: number, req: IncomingMessage, res: ServerResponse, admit?: (req: IncomingMessage) => AdminAdmission): Promise<void>;
+export declare function handleUpload(ctx: Context, maxBytes: number, req: IncomingMessage, res: ServerResponse, admit?: (req: IncomingMessage) => AdminAdmission, warn?: (format: string, ...args: unknown[]) => void): Promise<void>;
 /**
  * Host half: mount the upload route wherever a webServer and live sessions
  * exist. Both are injected INSIDE apply rather than declared as a top-level
