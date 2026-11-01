@@ -87,6 +87,7 @@ import { createVerificationManager } from './wizard/verify.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
+import { createLogRing, createPluginLog } from './log-ring.js'
 import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js'
 
 // The plugin bridge's public types (PB-1), re-exported so another plugin's
@@ -111,6 +112,19 @@ import * as push from '../dsh-push.mjs'
 
 /** Exact route the phone composer POSTs one file body to. */
 export const UPLOAD_ROUTE = '/_dsh/mobile-nav/upload'
+
+/**
+ * This package's own version, read once off the package root (`../package.json`
+ * resolves there both from src/ under the type-stripping scripts and from the
+ * built lib/ in production). The debug report's `_meta` plate carries it —
+ * issue triage starts at "which build is this" — and the row-apply log line
+ * stamps it. Unreadable file degrades to `'unknown'`, never throws.
+ */
+let pluginVersion = 'unknown'
+try {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown }
+  if (typeof pkg?.version === 'string' && pkg.version !== '') pluginVersion = pkg.version
+} catch { /* keep 'unknown' */ }
 
 /**
  * The one piece of cordis the typert interception needs at RUNTIME: the
@@ -457,6 +471,12 @@ async function writeUpload(
  *   request must ask the connection service itself, its refusal relayed
  *   verbatim — same first wall as the admin and client routes. Optional only
  *   for the direct-drive check scripts; production always passes it.
+ * @param warn - where the rejection line goes. apply() passes its double-
+ *   writer (context logger + the CU-1 log ring), so a rejected upload — the
+ *   very path issue #49 is triaged on — shows up in the debug report. The
+ *   ring is per-apply on purpose (a row reload clears it), which is why it
+ *   arrives as a parameter instead of a module singleton. Defaults to the
+ *   context logger for the direct-drive check scripts.
  */
 export async function handleUpload(
   ctx: Context,
@@ -464,6 +484,7 @@ export async function handleUpload(
   req: IncomingMessage,
   res: ServerResponse,
   admit?: (req: IncomingMessage) => AdminAdmission,
+  warn?: (format: string, ...args: unknown[]) => void,
 ): Promise<void> {
   if (admit !== undefined) {
     const admission = admit(req)
@@ -502,7 +523,8 @@ export async function handleUpload(
   } catch (error) {
     const status = error instanceof UploadError ? error.status : 400
     const code = error instanceof UploadError ? error.code : 'upload-rejected'
-    ctx.logger.warn('dsh-mobile-nav upload rejected: %s', message(error))
+    if (warn !== undefined) warn('dsh-mobile-nav upload rejected: %s', message(error))
+    else ctx.logger.warn('dsh-mobile-nav upload rejected: %s', message(error))
     responseJson(res, status, { ok: false, error: { code, message: message(error) } })
   }
 }
@@ -529,7 +551,20 @@ export async function handleUpload(
  *   request.
  */
 export function apply(ctx: Context, config: MobileNavConfig = {}): void {
+  // CU-1: the plugin's own log ring (SPEC 方案 C) — rebuilt per apply, so a
+  // row reload clears it (expected: the report describes THIS process
+  // generation). `logWarn` / `logInfo` are the branch-shared double-writers:
+  // every line below reaches the context logger exactly as before and the
+  // ring besides, so the debug report (CU-2) can answer "what did the plugin
+  // actually log" without a log file (the desktop app writes none).
+  const ring = createLogRing()
+  const pluginLog = createPluginLog(ring, ctx.logger as Parameters<typeof createPluginLog>[1])
+  const logWarn = pluginLog.warn
+  const logInfo = pluginLog.info
   const effective = resolveConfig(config, readFileConfig(), process.env)
+  // Lifecycle: the row came up. Role and both versions are the first things
+  // an issue report needs.
+  ring.push('info', 'row apply: role=%s plugin=%s dsh=%s', effective.values.role, pluginVersion, resolveDshVersion())
   // RD-6 probe fact: whether the fetch-route inject callback (below, in the
   // client-half wiring) ever fired. On a composition where `connection` or
   // `fileUploads` never becomes available the callback stays silently
@@ -599,7 +634,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // failing the row over — the bridge stays off, everything else keeps
   // working — so it degrades to a warning like the session feeds do.
   const registry = createBridgeRegistry({
-    warn: (text) => { ctx.logger?.warn('dsh-zen-remote plugin bridge: %s', text) },
+    warn: (text) => { logWarn('dsh-zen-remote plugin bridge: %s', text) },
   })
   bridgeRegistry = registry
   try {
@@ -608,7 +643,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     }
     ctx.provide('zenRemote', service)
   } catch (error) {
-    ctx.logger?.warn('dsh-zen-remote: cannot provide the "zenRemote" service: %s', message(error))
+    logWarn('dsh-zen-remote: cannot provide the "zenRemote" service: %s', message(error))
   }
   ctx.effect(() => () => {
     if (bridgeRegistry === registry) bridgeRegistry = undefined
@@ -632,7 +667,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // halves.
   const adapters: NormalizedAdapter[] = []
   {
-    const adapterWarn = (text: string): void => { ctx.logger?.warn('dsh-zen-remote adapter: %s', text) }
+    const adapterWarn = (text: string): void => { logWarn('dsh-zen-remote adapter: %s', text) }
     for (const adapter of ADAPTERS) {
       try {
         const holder = ctx as unknown as { get?: (name: string) => unknown; baseUrl?: string }
@@ -679,13 +714,25 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         registry.registerNormalized(normalized.declaration)
         adapters.push(normalized)
         if (unlisted && surfaceDigest !== undefined) {
-          ctx.logger?.info('dsh-zen-remote adapter: %s bridged by surface digest %s (version %s unlisted)', normalized.plugin, surfaceDigest, installedVersion)
+          logInfo('dsh-zen-remote adapter: %s bridged by surface digest %s (version %s unlisted)', normalized.plugin, surfaceDigest, installedVersion)
         } else {
-          ctx.logger?.info('dsh-zen-remote adapter: %s adapted at version %s', normalized.plugin, installedVersion)
+          logInfo('dsh-zen-remote adapter: %s adapted at version %s', normalized.plugin, installedVersion)
         }
       } catch (error) {
         adapterWarn(`${adapter.plugin} refused: ${error instanceof Error ? error.message : String(error)}`)
       }
+    }
+  }
+  // CU-3: the debug-report route's profile fact — read per call through the
+  // reflection layer's store lookup (a composition without profileContext
+  // answers undefined, and a throwing read degrades to undefined too).
+  const profileName = (): string | undefined => {
+    try {
+      const holder = ctx as unknown as { get?: (name: string) => unknown }
+      const profile = holder.get?.('profileContext') as { name?: unknown } | undefined
+      return typeof profile?.name === 'string' && profile.name !== '' ? profile.name : undefined
+    } catch {
+      return undefined
     }
   }
   if (effective.values.role === 'host') {
@@ -696,7 +743,24 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // gateway child through LAN_GATE_RELAY_SECRET and kept here for the
     // relay routes below. The push half never sees it.
     const relaySecret = randomBytes(32).toString('hex')
-    ctx.plugin(gateway, { ...effective.values, relaySecret })
+    // CU-1 lifecycle: the gateway child's spawn/exit, reported back through
+    // this hook (lan-gate.mjs reads it off the config object it is handed).
+    // The child runs in a subprocess whose console the ring cannot see, so
+    // these two lines are the debug report's only record of it. Either call
+    // must never break the gateway half — lan-gate.mjs guards its side, we
+    // guard ours. The hook rides as a NON-enumerable property: it is wiring,
+    // not configuration — the gateway's config stays exactly "resolved values
+    // + relaySecret" for every spread, deep compare and serialization (the
+    // role-wiring test pins that shape), while a direct read still finds it.
+    const gatewayEvent = (event: 'spawn' | 'exit', detail: Record<string, unknown>): void => {
+      try {
+        if (event === 'spawn') ring.push('info', 'gateway spawned (port=%s)', String(detail.port ?? '?'))
+        else ring.push('warn', 'gateway exited (code=%s signal=%s error=%s)', String(detail.code ?? '—'), String(detail.signal ?? '—'), String(detail.error ?? '—'))
+      } catch { /* the ring must never break the wiring */ }
+    }
+    const gatewayConfig: Record<string, unknown> = { ...effective.values, relaySecret }
+    Object.defineProperty(gatewayConfig, 'gatewayEvent', { value: gatewayEvent, enumerable: false })
+    ctx.plugin(gateway, gatewayConfig)
     ctx.plugin(push, effective.values)
     // The shared-session table backing the relay's access control. The relay
     // route consumes it below; the activity tracker and idle sweeper (T22c)
@@ -739,7 +803,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         tracker.onEvent(sessionId, event.type)
       })
     } catch (error) {
-      ctx.logger.warn('dsh-zen-remote cannot listen on "session/event": %s', message(error))
+      logWarn('dsh-zen-remote cannot listen on "session/event": %s', message(error))
     }
     // Auto-share and fork-following (T33a), off `agent/created` — the only
     // host event that fires EXACTLY ONCE per NEW session. Its `source` is
@@ -777,11 +841,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             parentOf: parentIndex.parentOf,
           })
         } catch (error) {
-          ctx.logger.warn('dsh-zen-remote cannot share new session "%s": %s', agent.id, message(error))
+          logWarn('dsh-zen-remote cannot share new session "%s": %s', agent.id, message(error))
         }
       })
     } catch (error) {
-      ctx.logger.warn('dsh-zen-remote cannot listen on "agent/created": %s', message(error))
+      logWarn('dsh-zen-remote cannot listen on "agent/created": %s', message(error))
     }
     // Busy restore (T33a): `busy` is never persisted, so right after a row
     // restart every shared session believes itself idle — including one whose
@@ -804,19 +868,19 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           sessionPersistence?: { list(): Promise<readonly PersistedSessionSnapshot[]> } | undefined
         }).sessionPersistence
         if (persistence === undefined) {
-          ctx.logger.warn('dsh-zen-remote: no sessionPersistence service — pre-restart subagent sessions stay not-shared until they emit an event')
+          logWarn('dsh-zen-remote: no sessionPersistence service — pre-restart subagent sessions stay not-shared until they emit an event')
           return
         }
         void persistence
           .list()
           .then((snapshots) => {
             const recorded = seedParentIndexFromSnapshots(parentIndex, snapshots)
-            if (recorded > 0) ctx.logger.info?.('dsh-zen-remote: restored %d persisted parent links', recorded)
+            if (recorded > 0) logInfo('dsh-zen-remote: restored %d persisted parent links', recorded)
           })
-          .catch((error: unknown) => ctx.logger.warn('dsh-zen-remote cannot seed parent links from persisted sessions: %s', message(error)))
+          .catch((error: unknown) => logWarn('dsh-zen-remote cannot seed parent links from persisted sessions: %s', message(error)))
       })
     } catch (error) {
-      ctx.logger.warn('dsh-zen-remote cannot listen on "sessionPersistence": %s', message(error))
+      logWarn('dsh-zen-remote cannot listen on "sessionPersistence": %s', message(error))
     }
     // Settings-surface admin routes (T14). The browser cannot call the
     // gateway's loopback-only admin API from DSH's origin, so the host
@@ -1240,6 +1304,35 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         }
       }, 'dsh-zen-remote: relay route')
     })
+    // CU-3 (host mount): the gateway child's summary plate for the debug
+    // report — one best-effort probe of the gateway's own status endpoint
+    // (the same seam the wizard's runtime probe reads) reduced to liveness,
+    // port and COUNTS. The endpoint's device rows carry no tokens and we
+    // keep none of their fields anyway; the share table's size is read off
+    // the store this apply owns. The gateway being down IS the summary.
+    const gatewaySummary = async (): Promise<Record<string, unknown>> => {
+      let reachable = false
+      let port: number | undefined
+      let deviceCount: number | undefined
+      let pushSubscriptions: number | undefined
+      try {
+        const response = await fetch(`http://127.0.0.1:${effective.values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
+        reachable = response.ok
+        if (reachable) {
+          const body = await response.json() as { port?: unknown; devices?: unknown; pushSubscriptions?: unknown }
+          if (typeof body?.port === 'number') port = body.port
+          if (Array.isArray(body?.devices)) deviceCount = body.devices.length
+          if (typeof body?.pushSubscriptions === 'number') pushSubscriptions = body.pushSubscriptions
+        }
+      } catch { /* unreachable is an honest answer */ }
+      return {
+        reachable,
+        ...(port === undefined ? {} : { port }),
+        ...(deviceCount === undefined ? {} : { deviceCount }),
+        ...(pushSubscriptions === undefined ? {} : { pushSubscriptions }),
+        shareCount: store.list().length,
+      }
+    }
     // The remote-status route lives on BOTH roles (T34-fix): it is what the
     // client-half parts poll, and a desktop app can switch roles without a
     // code path change — on a host it reads the empty
@@ -1258,6 +1351,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           getRowConfig: () => config,
           remoteStatusOnly: true,
           getServiceProbe: uploadServiceProbe(clientCtx),
+          getLogSnapshot: () => ring.snapshot(),
+          getGatewaySummary: gatewaySummary,
+          getProfileName: profileName,
+          getPluginVersion: () => pluginVersion,
         }),
       }), 'dsh-zen-remote: client routes (host)')
     })
@@ -1299,6 +1396,22 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // fresh handshake or a link flip shows up at the very next read.
     const pluginBridgeStatus = (): BridgeStatus[] =>
       compareBridges(registry.list(), relayClient.handshakeInfo?.plugins, relayClient.state === 'online')
+    // CU-1 lifecycle: the relay link's flips enter the ring — `online` with
+    // the server id it handshook, `offline` with the mapped failure code
+    // (relayClient.lastError is a short code by contract, never free text).
+    // subscribe re-announces the CURRENT state when only the handshake
+    // identity moved (the T59 heartbeat), so the dedupe below keeps the
+    // heartbeats out of the ring: one line per actual state change.
+    let lastRelayRingState: string | undefined
+    const offRelayRing = relayClient.subscribe((state) => {
+      if (state === lastRelayRingState) return
+      lastRelayRingState = state
+      if (state === 'online') {
+        ring.push('info', 'relay link online (server=%s)', relayClient.handshakeInfo?.serverId ?? '?')
+      } else if (state === 'offline') {
+        ring.push('warn', 'relay link offline (code=%s)', relayClient.lastError ?? '?')
+      }
+    })
     // A stopped or reloaded row must not leave a stale instance where the
     // module getter can hand it out (T23a-fix), and its reconnect machinery
     // (T43) must not outlive the row either: stop() cancels the armed retry
@@ -1306,6 +1419,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // dispose from clearing a NEWER row's instance that a reload already
     // installed.
     ctx.effect(() => () => {
+      offRelayRing()
       relayClient.stop()
       if (clientRelayClient === relayClient) clientRelayClient = undefined
     }, 'dsh-zen-remote: relay client disposal')
@@ -1341,7 +1455,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           off()
         }
       } catch (error) {
-        ctx.logger.warn('dsh-zen-remote: cannot listen on "loader/volatile-update" for relay credentials: %s', message(error))
+        logWarn('dsh-zen-remote: cannot listen on "loader/volatile-update" for relay credentials: %s', message(error))
         return () => {}
       }
     }, 'dsh-zen-remote: relay credentials watcher')
@@ -1352,7 +1466,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     void relayClient.connect().catch((error) => {
       if (error instanceof RelayError && error.code === 'unpaired') return
       const code = error instanceof RelayError ? error.code : 'error'
-      ctx.logger.warn('dsh-zen-remote relay client initial connect failed (%s): %s', code, message(error))
+      logWarn('dsh-zen-remote relay client initial connect failed (%s): %s', code, message(error))
     })
     // The typertGateway interception (T23b-1): remote-session calls ride the
     // relay, everything else reaches the local gateway untouched. The live
@@ -1416,9 +1530,6 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       return undefined
     }
     ctx.inject(['typertGateway'], (gatewayCtx) => {
-      // Degraded logging: the real cordis context always carries a logger,
-      // but a row fake without one must not crash apply.
-      const logWarn = (...args: Parameters<Context['logger']['warn']>): void => { ctx.logger?.warn(...args) }
       const proxy = (gatewayCtx as Context & { typertGateway?: unknown }).typertGateway
       const raw = proxy !== null && typeof proxy === 'object'
         ? (proxy as Record<PropertyKey, unknown>)[symbols.original]
@@ -1444,7 +1555,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // PB-25b: each merged stream reports its real-session inventory
         // share into the union above.
         createSessionInventorySlot,
-        log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
+        log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
       })
       interceptHandle = handle
       gatewayCtx.effect(() => () => {
@@ -1466,7 +1577,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       void runSelfCheck(raw, {
         handle,
         log: logWarn,
-        info: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
+        info: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
         getPeer: createOwnerPeerSource(() => gatewayCtx.reflect.get('connection')),
       })
     })
@@ -1515,8 +1626,6 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // chain a second wrap over the first (behaviorally right, structurally
       // dirty) and overwrite the diagnostics' installedVia.
       if (fetchRouteHandle !== undefined || fetchRouteRefused !== undefined) return
-      const logWarn = (...args: Parameters<Context['logger']['warn']>): void => { ctx.logger?.warn(...args) }
-      const logInfo = (...args: Parameters<Context['logger']['info']>): void => { ctx.logger?.info(...args) }
       const proxy = (connectionCtx as Context & { connection?: unknown }).connection
       const raw = proxy !== null && typeof proxy === 'object'
         ? (proxy as unknown as Record<PropertyKey, unknown>)[symbols.original]
@@ -1543,6 +1652,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       })
       fetchRouteHandle = handle
       fetchRouteInstalledVia = 'inject'
+      // CU-1 lifecycle: a successful install logs nothing today (the wrap's
+      // own log lines only fire per call), so the ring gets one explicit
+      // record — the debug report's "did the redirect actually attach" fact.
+      // The refused and fallback paths funnel through logWarn/logInfo below
+      // and enter the ring that way.
+      ring.push('info', 'fetch-route intercept attached (via=inject)')
       connectionCtx.effect(() => () => {
         handle.uninstall()
         if (fetchRouteHandle === handle) {
@@ -1605,7 +1720,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // RAW instance, which can differ from what the proxy exposed).
         fetchRouteFallbackTriedAt = new Date().toISOString()
         stopFallbackTimer()
-        ctx.logger?.warn('dsh-zen-remote fetch-route fallback declined: %s', shape.reasons.join('; '))
+        logWarn('dsh-zen-remote fetch-route fallback declined: %s', shape.reasons.join('; '))
         return
       }
       const raw = connection !== null && typeof connection === 'object'
@@ -1614,19 +1729,19 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       if (raw === null || typeof raw !== 'object') {
         fetchRouteFallbackTriedAt = new Date().toISOString()
         stopFallbackTimer()
-        ctx.logger?.warn('dsh-zen-remote fetch-route fallback declined: %s', 'original: connection[symbols.original] is not an object')
+        logWarn('dsh-zen-remote fetch-route fallback declined: %s', 'original: connection[symbols.original] is not an object')
         return
       }
       const handle = installFetchRouteIntercept({
         connection: raw,
         relay: relayClient,
         getServerId: () => relayClient.handshakeInfo?.serverId,
-        log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
+        log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
       })
       fetchRouteHandle = handle
       fetchRouteInstalledVia = 'fallback'
       stopFallbackTimer()
-      ctx.logger?.info('dsh-zen-remote fetch-route intercept installed via the fallback timer (inject never fired)')
+      logInfo('dsh-zen-remote fetch-route intercept installed via the fallback timer (inject never fired)')
       // Same disposal contract as the inject path: the wrap dies with the
       // row (the fallback has no service context of its own to hang on).
       ctx.effect(() => () => {
@@ -1669,7 +1784,6 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       return undefined
     }
     ctx.inject(['webServer'], (wsCtx) => {
-      const logWarn = (...args: Parameters<Context['logger']['warn']>): void => { ctx.logger?.warn(...args) }
       const proxy = (wsCtx as Context & { webServer?: unknown }).webServer
       const raw = proxy !== null && typeof proxy === 'object'
         ? (proxy as unknown as Record<PropertyKey, unknown>)[symbols.original]
@@ -1708,7 +1822,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // client's only early notice of a row that rides no workspace/follow
         // frame — hand it to the summary sync so the sidebar row appears.
         onMintedVirtualIds: (ids) => { interceptHandle?.nudgeSummarySync(ids) },
-        log: (format, ...args) => { ctx.logger?.info(`dsh-zen-remote ${format}`, ...args) },
+        log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
       })
       pluginRouteHandle = handle
       wsCtx.effect(() => () => {
@@ -1730,6 +1844,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           getPluginRouteIntercept: pluginRouteDiagnostics,
           getPluginBridgeStatus: pluginBridgeStatus,
           onCurrentSession,
+          getLogSnapshot: () => ring.snapshot(),
+          getProfileName: profileName,
+          getPluginVersion: () => pluginVersion,
         }),
       }), 'dsh-zen-remote: client routes')
     })
@@ -1756,17 +1873,21 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // dispose-and-reload entry. A fake context without a fiber (the route
   // tests) only ever reaches the warn.
   const reload = (): void => {
+    // CU-1 lifecycle: the row is about to reload — the ring dies with this
+    // apply right after, so this line is the reload's only witness in the
+    // NEXT generation's report (the fresh apply's row-apply line follows).
+    ring.push('info', 'row reload: a restart-required setting changed, reloading the plugin row')
     const fiber = (ctx as { fiber?: { restart?: () => Promise<unknown> } }).fiber
     if (fiber?.restart === undefined) {
-      ctx.logger.warn('dsh-zen-remote: a restart-required setting changed, but no fiber is available to reload the plugin row')
+      logWarn('dsh-zen-remote: a restart-required setting changed, but no fiber is available to reload the plugin row')
       return
     }
     try {
       Promise.resolve(fiber.restart()).catch((error) => {
-        ctx.logger.warn('dsh-zen-remote: plugin row reload failed: %s', message(error))
+        logWarn('dsh-zen-remote: plugin row reload failed: %s', message(error))
       })
     } catch (error) {
-      ctx.logger.warn('dsh-zen-remote: plugin row reload failed: %s', message(error))
+      logWarn('dsh-zen-remote: plugin row reload failed: %s', message(error))
     }
   }
   ctx.effect(() => {
@@ -1779,7 +1900,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     try {
       ctx.on('loader/volatile-update', () => { watcher.checkNow() })
     } catch (error) {
-      ctx.logger.warn('dsh-zen-remote: cannot listen on "loader/volatile-update": %s', message(error))
+      logWarn('dsh-zen-remote: cannot listen on "loader/volatile-update": %s', message(error))
     }
     return watcher.stop
   }, 'dsh-zen-remote: restart watcher')
@@ -1811,6 +1932,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           req,
           res,
           (admitReq) => webCtx.connection.admit(admitReq),
+          logWarn,
         )
       },
     }), 'dsh-mobile-nav: upload route')

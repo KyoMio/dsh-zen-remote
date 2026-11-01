@@ -97,6 +97,9 @@ export const CLIENT_CLAIM_ROUTE = '/_dsh/zen-remote/client/claim'
 export const CLIENT_STATUS_ROUTE = '/_dsh/zen-remote/client/status'
 /** T43: one immediate reconnect — answered 409 unless the client is offline. */
 export const CLIENT_RECONNECT_ROUTE = '/_dsh/zen-remote/client/reconnect'
+/** CU-4: the redacted diagnostic report (GET, both roles, machine-local only
+ * — a gateway-forwarded fetch is refused server-side). */
+export const CLIENT_DEBUG_REPORT_ROUTE = '/_dsh/zen-remote/client/debug-report'
 
 /** The lightweight client-facing config route (host half, both roles): the
  * settings page's FALLBACK role probe (T17) — it registers wherever a

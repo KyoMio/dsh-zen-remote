@@ -27,6 +27,14 @@ export type NormalizeResult = {
     reason: NormalizeFailure;
 };
 /**
+ * Whether one hostname sits in a private/loopback network — the same verdict
+ * {@link isHttpAllowedHost} applies inside `normalizeServerUrl`, exported for
+ * the debug report's serverUrl shaper (CU-2): the one place outside the
+ * normalizer that needs the private-network fact, kept here so the address
+ * classes can never drift apart from what pairing actually accepts.
+ */
+export declare function isPrivateNetworkHost(hostname: string): boolean;
+/**
  * Normalize one user-typed server address to the exact string the client
  * stores and probes: surrounding whitespace and trailing slashes gone, no
  * path (beyond `/`), no query, no fragment, no embedded credentials, and a

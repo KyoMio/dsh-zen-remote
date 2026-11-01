@@ -25,10 +25,13 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { homedir } from 'node:os'
 import type { AdminAdmission } from './admin-routes.js'
 import { classifyClaimResponse, classifyProbe, CLAIM_PATH, normalizeServerUrl, RELAY_PING_PATH } from './client-pairing.js'
 import type { ClaimOutcome, ProbeState } from './client-pairing.js'
-import { unwrapVolatile } from './config.js'
+import { readFileConfig, resolveConfig, unwrapVolatile } from './config.js'
+import { assembleDebugReport } from './debug-report.js'
+import type { LogRingEntry } from './log-ring.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js'
@@ -37,6 +40,7 @@ import type { BridgeStatus } from './plugin-bridge.js'
 import { RELAY_HTTP_ROUTES } from './relay-access.js'
 import { relayCredentialsDigest, RelayError } from './relay-client.js'
 import type { RelayClient, RelayHttpResult } from './relay-client.js'
+import { resolveDshVersion } from './relay-server.js'
 import { fromVirtual } from './virtual-id.js'
 
 /** Prefix all client routes live under (one webServer prefix registration). */
@@ -79,6 +83,15 @@ export const CLIENT_NETWORK_HINT_ROUTE = `${CLIENT_ROUTE_PREFIX}/network-hint`
  * answers the empty `{state:'unpaired', versionMismatch:false, serverName:'',
  * closed:{}}` conclusion. It carries no token and no server address. */
 export const CLIENT_REMOTE_STATUS_ROUTE = `${CLIENT_ROUTE_PREFIX}/remote-status`
+
+/** GET: the redacted diagnostic report (CU-3, SPEC 方案 C) — `_meta`,
+ * `config`, `status`, optional `gateway`, `logs` plates, assembled by
+ * {@link assembleDebugReport} and safe to paste into a GitHub issue. Mounted
+ * on BOTH roles (each answers its own report); a request that arrived
+ * through the gateway is refused BEFORE dispatch (the wizard's via wall) —
+ * diagnostics are a machine-local export, and the gateway must never be able
+ * to fetch this machine's report for its own device table either. */
+export const CLIENT_DEBUG_REPORT_ROUTE = `${CLIENT_ROUTE_PREFIX}/debug-report`
 
 /** POST `{sessionId: <虚拟 id>}`: close one remote session from THIS machine
  * (T34) — the backend forwards the ORIGINAL id through the relay's
@@ -172,6 +185,20 @@ export interface ClientHandlerOptions {
    * a client handler WITHOUT the sink answers the same 404 (no sink, no
    * route). */
   onCurrentSession?: (read: CurrentSessionRead) => void
+  /** CU-3, the debug-report route's inputs — all optional; the route answers
+   * its 404-shaped refusal without them (an unwired composition must not
+   * pretend to have diagnostics). Wired on BOTH role mounts.
+   *
+   * The log ring's snapshot (CU-1), oldest first. */
+  getLogSnapshot?: () => readonly LogRingEntry[]
+  /** The gateway child's summary plate (HOST mount only): liveness, port,
+   * device and share counts — counts, never tokens. May be async (it probes
+   * the gateway's own status). */
+  getGatewaySummary?: () => Record<string, unknown> | Promise<Record<string, unknown>>
+  /** The profile context's display name, when the composition has one. */
+  getProfileName?: () => string | undefined
+  /** This package's own version, read at module load in src/index.ts. */
+  getPluginVersion?: () => string
 }
 
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -397,6 +424,103 @@ function remoteStatusStateOf(relay: RelayClient | undefined): 'online' | 'offlin
 }
 
 /**
+ * The status route's body, computed exactly as the CLIENT_STATUS_ROUTE
+ * branch always has — extracted (CU-3) so the debug-report route can embed
+ * the same diagnostics aggregation without a second implementation. All
+ * reads are live per call: volatile row fields, the interception getters,
+ * the relay client's current state. May await one bounded probe or connect
+ * (never longer than the probe timeout).
+ */
+async function statusBodyOf(options: ClientHandlerOptions): Promise<Record<string, unknown>> {
+  const fetchImpl: FetchLike = options.fetchImpl ?? ((url, init) => fetch(url, init))
+  // The typert interception's view (T23b-1) rides on EVERY status
+  // answer, whatever the connection state — the settings surface needs
+  // it to explain a refused install even while unpaired. The interface
+  // compat verdict (T42) appears once there is something to report: a
+  // stored comparison from the relay client's last handshake, or any
+  // incompatible call the interceptor recorded. Absent otherwise —
+  // nothing to show, and the settings block presence-gates on exactly
+  // that.
+  const intercept = options.getIntercept?.()
+  const fetchRouteIntercept = options.getFetchRouteIntercept?.()
+  const serviceProbe = options.getServiceProbe?.()
+  const pluginRouteIntercept = options.getPluginRouteIntercept?.()
+  const compatRelay = options.getRelayClient?.()
+  const compat =
+    compatRelay?.compat !== undefined || (intercept?.incompatibleCalls.length ?? 0) > 0
+      ? {
+          identical: compatRelay?.compat?.identical ?? [],
+          different: compatRelay?.compat?.different ?? [],
+          unavailable: compatRelay?.compat?.unavailable ?? [],
+          incompatibleCalls: intercept?.incompatibleCalls ?? [],
+        }
+      : undefined
+  const withDiagnostics = (body: Record<string, unknown>): Record<string, unknown> => {
+    // PB-2: the per-plugin bridge verdict rides EVERY status answer —
+    // the settings surface explains a not-bridged plugin whatever the
+    // connection state (unpaired reads all-offline, the honest verdict).
+    let next: Record<string, unknown> = { ...body, pluginBridge: options.getPluginBridgeStatus?.() ?? [] }
+    if (intercept !== undefined) next = { ...next, intercept }
+    if (fetchRouteIntercept !== undefined) next = { ...next, fetchRouteIntercept }
+    if (serviceProbe !== undefined) next = { ...next, serviceProbe }
+    if (pluginRouteIntercept !== undefined) next = { ...next, pluginRouteIntercept }
+    return compat === undefined ? next : { ...next, compat }
+  }
+  // The ROW decides its own two shapes first, per request (both fields
+  // are volatile { get() } wrappers — only the row object apply()
+  // received is a live source): without both credentials nothing is
+  // paired, and a stored address that no longer normalizes must never
+  // see the token (T16-fix).
+  const row = options.getRowConfig()
+  const record = row !== null && typeof row === 'object' && !Array.isArray(row) ? row as Record<string, unknown> : {}
+  const serverUrl = stringOrEmpty(unwrapVolatile(record.serverUrl)).trim()
+  const token = stringOrEmpty(unwrapVolatile(record.deviceToken))
+  if (token === '' || serverUrl === '') {
+    return withDiagnostics({ state: 'unpaired' })
+  }
+  const normalized = normalizeServerUrl(serverUrl)
+  if (!normalized.ok) {
+    return withDiagnostics({ state: 'invalid-url' })
+  }
+  const relay = options.getRelayClient?.()
+  if (relay === undefined) {
+    // T16 shape: no relay client wired — the ping probe is the answer.
+    const state = await probe(fetchImpl, normalized.url, token)
+    return withDiagnostics({ state, serverUrl: normalized.url })
+  }
+  // The cached verdict is trusted only over the EXACT credentials the
+  // handshake earned it with: an online state whose digest no longer
+  // matches the row (address edited, re-pair) is an answer about a
+  // DIFFERENT server and falls through to a live connect instead
+  // (T23a-fix). The token never enters this body — the digest is a
+  // one-way sha256 prefix computed on both sides.
+  if (
+    relay.state === 'online' &&
+    relay.handshakeInfo !== undefined &&
+    relay.lastHandshakeDigest !== undefined &&
+    relay.lastHandshakeDigest === relayCredentialsDigest(normalized.url, token)
+  ) {
+    return withDiagnostics(deviceStatusBody(relay.state, relay.handshakeInfo, normalized.url, relay.deviceNameSyncing))
+  }
+  // Everything else — never connected, offline, connecting, revoked,
+  // stale credentials — gets ONE live connect bounded by the probe
+  // timeout; its FRESH result is the answer, never the possibly stale
+  // cached state. A failed attempt additionally carries the relay
+  // client's reconnect machinery readout (T43): when the next
+  // automatic retry fires and which code failed last — both free of
+  // credential material by contract.
+  try {
+    const info = await withProbeTimeout(relay.connect())
+    return withDiagnostics(deviceStatusBody('online', info, normalized.url, relay.deviceNameSyncing))
+  } catch (error) {
+    const body: Record<string, unknown> = { state: probeStateOfRelayError(error), serverUrl: normalized.url }
+    if (relay.nextRetryAt !== null && relay.nextRetryAt !== undefined) body.nextRetryAt = relay.nextRetryAt
+    if (relay.lastError !== undefined) body.lastError = relay.lastError
+    return withDiagnostics(body)
+  }
+}
+
+/**
  * Build the client route handler for one plugin row. The returned handler
  * owns the full response lifecycle of every request under
  * {@link CLIENT_ROUTE_PREFIX} and never throws.
@@ -416,10 +540,24 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
     const route = new URL(req.url ?? '/', 'http://dsh.internal').pathname
     const method = req.method ?? 'GET'
     try {
-      // The host mount's least-exposure wall (T41a-fix2): only remote-status
-      // exists here, and it sits BEHIND the admission wall like every other
-      // route. The shape of the refusal matches the unknown-path fallthrough.
-      if (options.remoteStatusOnly === true && route !== CLIENT_REMOTE_STATUS_ROUTE) {
+      // CU-3: the debug-report route's via wall, BEFORE any dispatch (the
+      // wizard's rule): a request wearing the gateway's marker arrived from
+      // a remote device, and a forwarded request presents as same-origin
+      // (the gateway rewrites Origin/Host) — the marker is the only honest
+      // signal. The report is a machine-local export; the gateway must
+      // never be able to fetch this machine's diagnostics either.
+      if (route === CLIENT_DEBUG_REPORT_ROUTE && req.headers['x-zen-remote-via'] !== undefined) {
+        responseJson(res, 403, {
+          ok: false,
+          error: { code: 'via-gateway', message: '诊断报告只能在本机导出' },
+        })
+        return
+      }
+      // The host mount's least-exposure wall (T41a-fix2): remote-status and
+      // the debug report (CU-3, both roles answer their own) exist here,
+      // and both sit BEHIND the admission wall like every other route. The
+      // shape of the refusal matches the unknown-path fallthrough.
+      if (options.remoteStatusOnly === true && route !== CLIENT_REMOTE_STATUS_ROUTE && route !== CLIENT_DEBUG_REPORT_ROUTE) {
         responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown client route' } })
         return
       }
@@ -485,95 +623,63 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
           return
         }
-        // The typert interception's view (T23b-1) rides on EVERY status
-        // answer, whatever the connection state — the settings surface needs
-        // it to explain a refused install even while unpaired. The interface
-        // compat verdict (T42) appears once there is something to report: a
-        // stored comparison from the relay client's last handshake, or any
-        // incompatible call the interceptor recorded. Absent otherwise —
-        // nothing to show, and the settings block presence-gates on exactly
-        // that.
-        const intercept = options.getIntercept?.()
-        const fetchRouteIntercept = options.getFetchRouteIntercept?.()
-        const serviceProbe = options.getServiceProbe?.()
-        const pluginRouteIntercept = options.getPluginRouteIntercept?.()
-        const compatRelay = options.getRelayClient?.()
-        const compat =
-          compatRelay?.compat !== undefined || (intercept?.incompatibleCalls.length ?? 0) > 0
-            ? {
-                identical: compatRelay?.compat?.identical ?? [],
-                different: compatRelay?.compat?.different ?? [],
-                unavailable: compatRelay?.compat?.unavailable ?? [],
-                incompatibleCalls: intercept?.incompatibleCalls ?? [],
-              }
-            : undefined
-        const withDiagnostics = (body: Record<string, unknown>): Record<string, unknown> => {
-          // PB-2: the per-plugin bridge verdict rides EVERY status answer —
-          // the settings surface explains a not-bridged plugin whatever the
-          // connection state (unpaired reads all-offline, the honest verdict).
-          let next: Record<string, unknown> = { ...body, pluginBridge: options.getPluginBridgeStatus?.() ?? [] }
-          if (intercept !== undefined) next = { ...next, intercept }
-          if (fetchRouteIntercept !== undefined) next = { ...next, fetchRouteIntercept }
-          if (serviceProbe !== undefined) next = { ...next, serviceProbe }
-          if (pluginRouteIntercept !== undefined) next = { ...next, pluginRouteIntercept }
-          return compat === undefined ? next : { ...next, compat }
+        responseJson(res, 200, await statusBodyOf(options))
+        return
+      }
+      if (route === CLIENT_DEBUG_REPORT_ROUTE) {
+        // Unwired composition (no log ring handed over): the same shape an
+        // unknown path gets — an old host must not pretend to have a report.
+        const logs = options.getLogSnapshot?.()
+        if (logs === undefined) {
+          responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown client route' } })
+          return
         }
-        // The ROW decides its own two shapes first, per request (both fields
-        // are volatile { get() } wrappers — only the row object apply()
-        // received is a live source): without both credentials nothing is
-        // paired, and a stored address that no longer normalizes must never
-        // see the token (T16-fix).
+        if (method !== 'GET') {
+          res.setHeader('Allow', 'GET')
+          responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
+          return
+        }
+        // The picked config summary (CU-2's construction layer): field by
+        // NAME, never a spread — deviceToken and the other secret row fields
+        // are structurally absent; the assembler's deep redactor is the
+        // second layer behind this. serverUrl travels to the assembler raw
+        // and comes out as a shape (scheme + address class + port).
         const row = options.getRowConfig()
         const record = row !== null && typeof row === 'object' && !Array.isArray(row) ? row as Record<string, unknown> : {}
-        const serverUrl = stringOrEmpty(unwrapVolatile(record.serverUrl)).trim()
-        const token = stringOrEmpty(unwrapVolatile(record.deviceToken))
-        if (token === '' || serverUrl === '') {
-          responseJson(res, 200, withDiagnostics({ state: 'unpaired' }))
-          return
-        }
-        const normalized = normalizeServerUrl(serverUrl)
-        if (!normalized.ok) {
-          responseJson(res, 200, withDiagnostics({ state: 'invalid-url' }))
-          return
-        }
-        const relay = options.getRelayClient?.()
-        if (relay === undefined) {
-          // T16 shape: no relay client wired — the ping probe is the answer.
-          const state = await probe(fetchImpl, normalized.url, token)
-          responseJson(res, 200, withDiagnostics({ state, serverUrl: normalized.url }))
-          return
-        }
-        // The cached verdict is trusted only over the EXACT credentials the
-        // handshake earned it with: an online state whose digest no longer
-        // matches the row (address edited, re-pair) is an answer about a
-        // DIFFERENT server and falls through to a live connect instead
-        // (T23a-fix). The token never enters this body — the digest is a
-        // one-way sha256 prefix computed on both sides.
-        if (
-          relay.state === 'online' &&
-          relay.handshakeInfo !== undefined &&
-          relay.lastHandshakeDigest !== undefined &&
-          relay.lastHandshakeDigest === relayCredentialsDigest(normalized.url, token)
-        ) {
-          responseJson(res, 200, withDiagnostics(deviceStatusBody(relay.state, relay.handshakeInfo, normalized.url, relay.deviceNameSyncing)))
-          return
-        }
-        // Everything else — never connected, offline, connecting, revoked,
-        // stale credentials — gets ONE live connect bounded by the probe
-        // timeout; its FRESH result is the answer, never the possibly stale
-        // cached state. A failed attempt additionally carries the relay
-        // client's reconnect machinery readout (T43): when the next
-        // automatic retry fires and which code failed last — both free of
-        // credential material by contract.
-        try {
-          const info = await withProbeTimeout(relay.connect())
-          responseJson(res, 200, withDiagnostics(deviceStatusBody('online', info, normalized.url, relay.deviceNameSyncing)))
-        } catch (error) {
-          const body: Record<string, unknown> = { state: probeStateOfRelayError(error), serverUrl: normalized.url }
-          if (relay.nextRetryAt !== null && relay.nextRetryAt !== undefined) body.nextRetryAt = relay.nextRetryAt
-          if (relay.lastError !== undefined) body.lastError = relay.lastError
-          responseJson(res, 200, withDiagnostics(body))
-        }
+        const values = resolveConfig(record, readFileConfig(), process.env).values
+        const rawMaxUpload: unknown = unwrapVolatile(record.maxUploadBytes)
+        const maxUploadBytes = typeof rawMaxUpload === 'number' && Number.isFinite(rawMaxUpload) && rawMaxUpload > 0
+          ? rawMaxUpload
+          : undefined
+        const rawProfile = options.getProfileName?.()
+        const report = assembleDebugReport({
+          meta: {
+            generatedAt: new Date().toISOString(),
+            pluginVersion: options.getPluginVersion?.() ?? 'unknown',
+            dshVersion: resolveDshVersion(),
+            platform: `${process.platform} ${process.arch}`,
+            role: String(values.role),
+            ...(rawProfile === undefined ? {} : { profileName: rawProfile }),
+          },
+          configSummary: {
+            role: values.role,
+            host: values.host,
+            port: values.port,
+            idleHours: values.idleHours,
+            maxUploadBytes,
+            autoShareNewSessions: values.autoShareNewSessions,
+            pluginBridgeConsent: values.pluginBridgeConsent,
+            pushSummary: values.pushSummary,
+            pushTurnEnd: values.pushTurnEnd,
+            pushTool: values.pushTool,
+            serverUrl: stringOrEmpty(unwrapVolatile(record.serverUrl)).trim(),
+          },
+          statusBody: await statusBodyOf(options),
+          ...(options.getGatewaySummary === undefined ? {} : { gatewaySummary: await options.getGatewaySummary() }),
+          logs,
+          home: homedir(),
+        })
+        responseJson(res, 200, report)
         return
       }
       if (route === CLIENT_RECONNECT_ROUTE) {

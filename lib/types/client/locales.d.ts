@@ -251,6 +251,12 @@ export declare const zh: {
     readonly 'settings.client.diagUploadRedirectOk': "已安装 · 上传已接管";
     readonly 'settings.client.diagUploadRedirectRefused': "拒装：{reason}";
     readonly 'settings.client.diagUploadRedirectPending': "服务注入未触发 · connection {connection} · fileUploads {fileUploads}";
+    readonly 'settings.debug.title': "诊断信息";
+    readonly 'settings.debug.export': "导出诊断信息";
+    readonly 'settings.debug.exporting': "正在生成…";
+    readonly 'settings.debug.hint': "下载一份脱敏后的诊断文件（版本、配置形态、连接诊断、插件日志）。令牌与密钥、对话内容、附件和完整文件路径一律不包含，服务器地址只保留类型。建议从机与主服务器各导一份，可直接附到 GitHub issue。";
+    readonly 'settings.debug.done': "诊断文件已下载";
+    readonly 'settings.debug.fail': "导出失败：无法生成诊断报告";
     readonly 'settings.bridge.title': "插件桥";
     readonly 'settings.bridge.empty': "暂无插件登记插件桥";
     readonly 'settings.bridge.loading': "正在读取插件桥登记…";
