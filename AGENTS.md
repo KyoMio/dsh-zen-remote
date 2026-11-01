@@ -16,7 +16,7 @@
 | `src/config.ts` | 配置模型：四层回退（env > 插件行 > `lan-gate.config.json` > 默认值）、loader 的 `Config` schema（全 volatile）、`resolveRole` |
 | `src/http.ts` | host 路由共用的 JSON 响应封装与同源 POST 门 |
 | `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
-| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（两角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff） |
+| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（两角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff）、`debug-report`（脱敏诊断报告，via 墙先于分派，CU-3） |
 | `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
 | `src/share-store.ts` | 共享会话表（`~/.dsh/zen-remote-shares.json`，持久化，重启恢复），中继访问控制的事实来源 |
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
@@ -37,6 +37,8 @@
 | `src/client-data/plugin-bridge.ts` | 设置页纯函数（PB-5）：桥接状态 → 文案键、整机数据同意表的切换（只动一键）；浏览器半边，不 import 主包 |
 | `src/fetch-route-intercept.ts` | 子客户端本机拦截的第二半：包装宿主连接服务 `fetchRoutes` 表的上传与导出两项——远程会话的非图片附件经 `relay/v1/upload` 流式转服务端（超限本地拒、失败回宿主自己的 200 失败信封）、虚拟 id 的导出后台 403（形态检测、懒装重试、卸载守卫） |
 | `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数、零依赖；client-data 半边许可 import 它做 zr~ 判定，先例 remote-drop.ts / remote-status.ts） |
+| `src/log-ring.ts` | 诊断导出用内存日志环（CU-1）：上限 300 条、进程内不落盘；index.ts 两分支的 logWarn/logInfo 收口双写（ctx.logger + 环），生命周期事件（row apply/reload、网关 spawn/exit、relay online/offline、fetch-route 安装含 via）push 进环 |
+| `src/debug-report.ts` + `src/debug-redact.ts` | 诊断报告装配与脱敏器（CU-2，纯逻辑零 DSH import）：装配 getter 注入拼 `_meta/config/status/gateway/logs` 五板块、配置按字段名挑选（秘密构造性缺席）；脱敏器 URL 走**哨兵摘出-还原**（userinfo→`<token>@`、host→地址类型、端口与 path 保留、query 长值单独 token 化）、家目录折叠先于 token 趟；`scripts/check-debug-report.mjs` 真值表钉住全部形态（含哨兵伪造） |
 | `src/merge-streams.ts` | 三条全局流/列表的本地 + 远程合并状态机（侧边栏远程分组） |
 | `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
 | `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
