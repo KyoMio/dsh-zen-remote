@@ -209,7 +209,7 @@ Notifications fire only when **you are actually needed**, along two independent 
   - Automatic LAN / Tailscale IPv4 discovery and local network probing, backed by the gateway's private-IP wall (`403 public-direct-forbidden`) against accidental public exposure
   - Dedicated **Manage Devices** modal and automatic sidebar cleanup on client unpair/revocation
 - **Cross-Desktop Remote Sessions (Client)**:
-  - Full-featured remote sessions in the sidebar: history, streaming, approvals/questions, server model catalog, file tree, changes summary/diff, server-side terminal, windowed artifact downloads, server-side LibreOffice PDF preview, up to 500 MiB file uploads, and drag-and-drop file upload interception
+  - Full-featured remote sessions in the sidebar: history, streaming, approvals/questions, server model catalog, file tree, changes summary/diff, server-side terminal, windowed artifact downloads, server-side LibreOffice PDF preview, up to 500 MiB file uploads, and drag-and-drop file upload interception; in remote sessions, non-image files added via the paperclip picker or pasted are likewise converted to byte uploads instead of unreadable local-path references
 - **Plugin Bridge**:
   - Cooperative plugins and built-in adapters (such as `dsh-better-sidebar`) route their panel requests in remote sessions to the host machine (with explicit owner consent for whole-machine data). See [Plugin Bridge Guide](docs/plugin-bridge.md).
 

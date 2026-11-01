@@ -543,12 +543,13 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
     'the client role never subscribes the session feeds but watches volatile updates twice (restart watcher + relay credentials)',
   )
   assert.equal(typeof client.listeners[0].listener, 'function')
-  // The client role has four effects: the PB-1 bridge registry disposal
+  // The client role has five effects: the PB-1 bridge registry disposal
   // (before the role branch), the relay client's disposal (T23a-fix, which
   // stops the reconnect machinery and clears the module slot), the T43
-  // credentials watcher's unsubscribe, and the restart watcher (T17) — never
-  // the sweeper, which stays host-only.
-  assert.equal(client.effects.length, 4, 'the client role starts the bridge disposal, the relay disposal, the credentials watcher and the restart watcher')
+  // credentials watcher's unsubscribe, the restart watcher (T17), and — since
+  // BU-1 — the fetch-route FALLBACK timer's cleanup (stops the bounded probe
+  // when the row unloads). Never the sweeper, which stays host-only.
+  assert.equal(client.effects.length, 5, 'the client role starts the bridge disposal, the relay disposal, the credentials watcher, the restart watcher and the fetch-route fallback timer cleanup')
   for (const stop of client.effects) assert.equal(typeof stop, 'function', 'each effect returned a stop function')
   assert.notEqual(index.getRelayClient(), undefined, 'the client role installs its relay client in the module slot')
   for (const stop of client.effects) stop()
@@ -879,7 +880,9 @@ test('PB-1: BOTH roles provide a zenRemote service whose bridge() registers, val
 
     // The identity-guarded disposal effect clears the module slot for THIS
     // row (and only this row — a reload replaces the slot before this runs).
-    assert.equal(effects.length, role === 'host' ? 3 : 4)
+    // The client role's fifth effect (BU-1) is the fetch-route fallback
+    // timer's cleanup; effects[0] is still the bridge registry disposal.
+    assert.equal(effects.length, role === 'host' ? 3 : 5)
     effects[0]()
     assert.equal(index.getBridgeRegistry(), undefined, `the ${role} row disposal cleared the module slot`)
   }

@@ -15,7 +15,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { FILE_UPLOAD_PATH, SESSION_EXPORT_PATH, checkFetchRouteShape, installFetchRouteIntercept } = require('../lib/fetch-route-intercept.js')
+const { FILE_UPLOAD_PATH, SESSION_EXPORT_PATH, checkFetchRouteShape, installFetchRouteIntercept, shouldFallbackInstall } = require('../lib/fetch-route-intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { MAX_UPLOAD_BYTES } = require('../lib/relay-server.js')
 const { RelayError } = require('../lib/relay-client.js')
@@ -522,4 +522,84 @@ test('diagnostics: counters, flags, attach refusals and the failure ring — no 
 
 test('the cap the local pre-refusal quotes is the relay module cap', () => {
   assert.equal(MAX_UPLOAD_BYTES, 500 * 1024 * 1024, 'the message and the gate must move together')
+})
+
+// ---- the fallback install judgment (BU-1) ---------------------------------
+
+test('fallback (BU-1): shouldFallbackInstall truth table — only the untouched-and-served row fires', () => {
+  // injectSeen x handleSet x refused x servicesPresent: exactly one row may
+  // fire — the RD-6 shape (inject silently PENDING, nothing installed, no
+  // refusal, BOTH services present). Every other row is a verdict the
+  // fallback must respect.
+  const rows = [
+    // RD-6: the pending inject, services in place — the fallback's one job.
+    [{ injectSeen: false, handleSet: false, refused: false, servicesPresent: true }, true],
+    // The inject callback fired: the primary path owns the install now.
+    [{ injectSeen: true, handleSet: false, refused: false, servicesPresent: true }, false],
+    // Already installed (by either path): the double-install guard.
+    [{ injectSeen: false, handleSet: true, refused: false, servicesPresent: true }, false],
+    // Already refused: a verdict, not a wait — never retried by the timer.
+    [{ injectSeen: false, handleSet: false, refused: true, servicesPresent: true }, false],
+    // Services absent: a legitimate startup wait (or no upload service at
+    // all) — the inject stays first choice, the timer keeps waiting.
+    [{ injectSeen: false, handleSet: false, refused: false, servicesPresent: false }, false],
+    // Combinations never seen in the wild, pinned anyway: any set bit wins.
+    [{ injectSeen: true, handleSet: true, refused: true, servicesPresent: false }, false],
+    [{ injectSeen: true, handleSet: false, refused: false, servicesPresent: false }, false],
+    [{ injectSeen: false, handleSet: true, refused: true, servicesPresent: true }, false],
+    [{ injectSeen: false, handleSet: false, refused: true, servicesPresent: false }, false],
+  ]
+  for (const [state, expected] of rows) {
+    assert.equal(shouldFallbackInstall(state), expected, JSON.stringify(state))
+  }
+})
+
+test('fallback (BU-1): after a fallback install a later inject trigger stands down — one wrap, one counter', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay()
+  // The fallback tick fires (the RD-6 row) and installs through the SAME
+  // install function the inject path uses.
+  assert.equal(shouldFallbackInstall({ injectSeen: false, handleSet: false, refused: false, servicesPresent: true }), true)
+  const fallbackHandle = install(connection, relay)
+  try {
+    const entry = connection.fetchRoutes.get(FILE_UPLOAD_PATH)
+    const wrappedAfterFallback = entry.fetch
+    assert.equal(fallbackHandle.diagnostics().installed, true)
+    assert.equal(fallbackHandle.diagnostics().uploadWrapped, true)
+    // The inject callback fires afterwards: its double-install guard reads
+    // the same slots the fallback wrote — the pure judgment says stand down,
+    // and the wiring returns WITHOUT calling install a second time. There is
+    // no second install to observe directly here; what is pinned is that the
+    // entry still holds exactly the fallback's wrapper (a chained second
+    // wrap would have replaced it) and the counter stays single.
+    assert.equal(
+      shouldFallbackInstall({ injectSeen: true, handleSet: true, refused: false, servicesPresent: true }),
+      false,
+      'the guard the inject callback runs before installing',
+    )
+    assert.equal(connection.fetchRoutes.get(FILE_UPLOAD_PATH).fetch, wrappedAfterFallback)
+    // One upload through the wrap: forwarded once, counted once.
+    const response = await entry.fetch(uploadRequest(toVirtual(SERVER_ID, LOCAL_ID)))
+    assert.deepEqual(JSON.parse(await response.text()), RECEIPT)
+    assert.equal(relay.calls.length, 1)
+    assert.equal(fallbackHandle.diagnostics().uploadCalls, 1, 'no second wrapper doubled the counters')
+    assert.equal(fallbackHandle.diagnostics().uploadForwarded, 1)
+  } finally { fallbackHandle.uninstall() }
+})
+
+test('fallback (BU-1): a refusal recorded by the primary path keeps every fallback tick idle', () => {
+  const connection = fakeConnection({ upload: { requestBody: 'buffered' } })
+  const relay = fakeRelay()
+  // The inject path ran first and refused the upload entry (misshaped):
+  // refused = true — the timer's judgment is false even with services up.
+  assert.equal(shouldFallbackInstall({ injectSeen: true, handleSet: false, refused: true, servicesPresent: true }), false)
+  // What the primary install DOES cover still stands: the healthy export
+  // route wrapped, exactly once.
+  const handle = install(connection, relay)
+  try {
+    const diagnostics = handle.diagnostics()
+    assert.equal(diagnostics.exportWrapped, true)
+    assert.equal(diagnostics.uploadAttachRefused !== undefined, true)
+    assert.equal(connection.fetchRoutes.get(SESSION_EXPORT_PATH).fetch.name, 'wrappedExport', 'the single export wrapper from this install')
+  } finally { handle.uninstall() }
 })

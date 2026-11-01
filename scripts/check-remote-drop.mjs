@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import {
   decideRemoteDrop,
+  decideRemoteIntake,
   isRemoteSessionId,
   rewrapFiles,
 } from '../src/client-data/remote-drop.ts'
@@ -109,6 +110,135 @@ assert.deepEqual(pair.map((f) => f.name), ['report.pdf', 'a.txt'])
   assert.ok(effects.includes('function dismissHostDropOverlay'), 'the guard defines dismissHostDropOverlay')
   const calls = effects.match(/^\s*dismissHostDropOverlay\(\)\s*$/gm)?.length ?? 0
   assert.equal(calls, 1, `the folder-block branch calls dismissHostDropOverlay() as a standalone statement (saw ${calls})`)
+  // The picker's structural gate refuses a `webkitdirectory` input on the
+  // SAME line as the other four traits (RU-fix adoption 2): a third-party
+  // hidden+multiple+no-accept folder picker must not be redirected.
+  assert.ok(
+    /input\.type !== 'file' \|\| !input\.multiple \|\| !input\.hidden \|\| input\.hasAttribute\('accept'\) \|\| input\.webkitdirectory/.test(effects),
+    'the picker gate checks type/multiple/hidden/accept/webkitdirectory in one condition',
+  )
 }
+
+// ---- 7. decideRemoteIntake (AU-1): the picker / paste entry decision ----------
+// Reusable descriptor builders. `pathFile` = carries a disk path, not an image
+// — the ONE shape that lands on the host's zero-copy `@path` chip and the only
+// one the intake may intercept. `imageFile` = carries a path but is an image
+// (already byte-uploads). `pathlessFile` = no path (already byte-uploads).
+const pathFile = { entry: 'picker', isDirectory: false, hasPath: true, isImage: false }
+const imageFile = { entry: 'picker', isDirectory: false, hasPath: true, isImage: true }
+const pathlessFile = { entry: 'picker', isDirectory: false, hasPath: false, isImage: false }
+const pasteFile = { entry: 'paste', isDirectory: false, hasPath: true, isImage: false }
+const dropFile = { entry: 'drop', isDirectory: false, hasPath: true, isImage: false }
+
+const intake = (overrides, items = [pathFile]) =>
+  decideRemoteIntake({
+    trusted: true,
+    hasHostPaths: true,
+    currentSessionId: REMOTE_ID,
+    items,
+    ...overrides,
+  })
+
+// 7a. the three gates hold for EVERY entry — one row per gate per entry
+// (untrusted → no bridge → local session), plus the drop entry as a control.
+{
+  const gateRows = [
+    [{ entry: 'picker' }, { trusted: false }, 'passthrough', 'untrusted-event'],
+    [{ entry: 'picker' }, { hasHostPaths: false }, 'passthrough', 'no-host-paths'],
+    [{ entry: 'picker' }, { currentSessionId: LOCAL_ID }, 'passthrough', 'not-remote-session'],
+    [{ entry: 'paste' }, { trusted: false }, 'passthrough', 'untrusted-event'],
+    [{ entry: 'paste' }, { hasHostPaths: false }, 'passthrough', 'no-host-paths'],
+    [{ entry: 'paste' }, { currentSessionId: LOCAL_ID }, 'passthrough', 'not-remote-session'],
+    [{ entry: 'drop' }, { trusted: false }, 'passthrough', 'untrusted-event'],
+    [{ entry: 'drop' }, { hasHostPaths: false }, 'passthrough', 'no-host-paths'],
+    [{ entry: 'drop' }, { currentSessionId: LOCAL_ID }, 'passthrough', 'not-remote-session'],
+  ]
+  for (const [entryOverride, gateOverride, action, reason] of gateRows) {
+    const item = { ...pathFile, ...entryOverride }
+    assert.deepEqual(
+      intake({ ...gateOverride, currentSessionId: gateOverride.currentSessionId ?? REMOTE_ID }, [item]),
+      { action, reason },
+      `gate row ${JSON.stringify({ ...entryOverride, ...gateOverride })}`,
+    )
+  }
+}
+
+// 7b. picker intervention: ONLY the path-carrying non-image file redirects.
+assert.deepEqual(intake({}, [pathFile]), { action: 'redirect', reason: 'remote-path-files' }, 'picker: a path-carrying non-image redirects')
+assert.deepEqual(intake({}, [{ ...pathFile, isImage: true }]), { action: 'passthrough', reason: 'no-path-or-image-only' }, 'picker: a pure-image pick passes through (the image branch already uploads bytes)') // 钉子
+assert.deepEqual(intake({}, [pathlessFile]), { action: 'passthrough', reason: 'no-path-or-image-only' }, 'picker: a pathless file passes through')
+assert.deepEqual(
+  intake({}, [{ ...pathFile, hasPath: false }, { ...pathFile, isImage: true }]),
+  { action: 'passthrough', reason: 'no-path-or-image-only' },
+  'picker: mixed pathless + image still passes through — no bad-branch file in the batch',
+)
+assert.deepEqual(
+  intake({}, [pathlessFile, { ...pathFile, isImage: true }, pathFile]),
+  { action: 'redirect', reason: 'remote-path-files' },
+  'picker: ONE bad-branch file in the batch redirects the whole intake',
+)
+
+// 7c. paste: only kind:'file' clipboard items reach the descriptors, so a
+// plain-text paste arrives as an EMPTY list (钉子) — and an image-only paste
+// passes through exactly like the picker's.
+assert.deepEqual(intake({}, []), { action: 'passthrough', reason: 'no-files' }, 'paste: an empty file list (plain text) passes through') // 钉子
+assert.deepEqual(intake({}, [{ ...pasteFile }]), { action: 'redirect', reason: 'remote-path-files' }, 'paste: a path-carrying non-image redirects')
+assert.deepEqual(
+  intake({}, [{ ...pasteFile, isImage: true }]),
+  { action: 'passthrough', reason: 'no-path-or-image-only' },
+  'paste: a pasted screenshot (image with a path) passes through — unchanged behavior',
+)
+assert.deepEqual(
+  intake({}, [{ ...pasteFile, hasPath: false }]),
+  { action: 'passthrough', reason: 'no-path-or-image-only' },
+  'paste: a pathless file passes through',
+)
+
+// 7d. drop entries keep the FROZEN "any file intervenes" semantics: even a
+// pathless / image drop item redirects (decideRemoteDrop never looked at
+// paths), while the same items through picker/paste would pass through.
+assert.deepEqual(
+  intake({}, [{ ...dropFile, hasPath: false, isImage: true }]),
+  { action: 'redirect', reason: 'remote-path-files' },
+  'drop: any file intervenes, frozen semantics',
+)
+assert.deepEqual(
+  intake({}, [{ ...dropFile, hasPath: false, isImage: true }, pathlessFile]),
+  { action: 'redirect', reason: 'remote-path-files' },
+  'mixed entries: one drop item keeps the whole intake on the drop semantics',
+)
+
+// 7e. directories block ahead of every redirect, in any entry (钉子: the
+// directory rule outranks a bad-branch file in the same batch).
+assert.deepEqual(
+  intake({}, [{ ...pasteFile, isDirectory: true }, pasteFile]),
+  { action: 'block-directories', reason: 'contains-directory' },
+  'paste: a directory blocks even with a redirect-worthy file present',
+) // 钉子
+assert.deepEqual(
+  intake({}, [{ ...pathFile, isDirectory: true }]),
+  { action: 'block-directories', reason: 'contains-directory' },
+  'picker: a directory blocks (defensive — the picker has none, the rule is shared)',
+)
+assert.deepEqual(
+  intake({}, [{ ...dropFile, isDirectory: true }]),
+  { action: 'block-directories', reason: 'contains-directory' },
+  'drop entries block on directories like decideRemoteDrop',
+)
+// Gates outrank the directory rule: a local session never intervenes, even on
+// a folder (folders must keep working locally).
+assert.deepEqual(
+  intake({ currentSessionId: LOCAL_ID }, [{ ...pasteFile, isDirectory: true }]),
+  { action: 'passthrough', reason: 'not-remote-session' },
+  'a directory in a LOCAL session passes through — the gates come first',
+)
+
+// 7f. no inventory at all: deciding blind could eat a working flow — pass
+// through even in a remote session. (Direct call: the helper's default list
+// would mask the undefined.)
+assert.deepEqual(
+  decideRemoteIntake({ trusted: true, hasHostPaths: true, currentSessionId: REMOTE_ID, items: undefined }),
+  { action: 'passthrough', reason: 'no-entry-api' },
+)
 
 console.log('check-remote-drop: ok')

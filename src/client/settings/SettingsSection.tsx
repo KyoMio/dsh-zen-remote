@@ -1201,9 +1201,10 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   )}
                 </>
               )}
-              {/* RD-3: the remote drop guard's own line — installed state
-                  plus the five counters. Browser-side values, so unlike the
-                  rows above it never rides the client/status body. */}
+              {/* RD-3: the attachment-entry guard's own line — installed state
+                  plus the five counters, with the per-entry split below it
+                  (AU-2: drop / picker / paste). Browser-side values, so unlike
+                  the rows above it never rides the client/status body. */}
               {(dropDiag.installed || dropDiag.notInstalledReason !== undefined) && (
                 <div className="zr-settings-field">
                   <div className="zr-settings-head">
@@ -1220,6 +1221,18 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                       })
                       : t('settings.client.diagRemoteDropOff', { reason: dropDiag.notInstalledReason ?? '—' })}
                   </p>
+                  {dropDiag.installed && (
+                    <p className="zr-settings-hint">
+                      {t('settings.client.diagRemoteDropEntries', {
+                        dropI: dropDiag.interceptedBy.drop,
+                        pickerI: dropDiag.interceptedBy.picker,
+                        pasteI: dropDiag.interceptedBy.paste,
+                        dropP: dropDiag.passthroughBy.drop,
+                        pickerP: dropDiag.passthroughBy.picker,
+                        pasteP: dropDiag.passthroughBy.paste,
+                      })}
+                    </p>
+                  )}
                 </div>
               )}
               {/* RD-6: the upload-redirect (fetch-route intercept) line — rides

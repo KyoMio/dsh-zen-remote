@@ -243,8 +243,9 @@ export declare const zh: {
     readonly 'settings.client.diagRecentFailures': "最近的远程调用失败";
     readonly 'settings.client.diagCompatGroups': "指纹有差异的组：{groups}";
     readonly 'settings.client.diagCompatCalls': "最近的不兼容调用";
-    readonly 'settings.client.diagRemoteDrop': "远程拖拽守卫";
+    readonly 'settings.client.diagRemoteDrop': "附件入口守卫";
     readonly 'settings.client.diagRemoteDropOk': "已安装 · 拦截 {intercepted} · 重派发 {redispatched} · 文件夹 {blocked} · 放行 {passthrough} · 重包失败 {failed}";
+    readonly 'settings.client.diagRemoteDropEntries': "分入口 · 拦截 拖拽 {dropI} / 回形针 {pickerI} / 粘贴 {pasteI} · 放行 拖拽 {dropP} / 回形针 {pickerP} / 粘贴 {pasteP}";
     readonly 'settings.client.diagRemoteDropOff': "未安装（{reason}）";
     readonly 'settings.client.diagUploadRedirect': "上传改道";
     readonly 'settings.client.diagUploadRedirectOk': "已安装 · 上传已接管";
