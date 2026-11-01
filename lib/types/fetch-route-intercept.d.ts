@@ -71,6 +71,32 @@ export interface FetchRouteEntry {
     fetch: (request: Request) => Promise<Response>;
 }
 /**
+ * Whether the FALLBACK install may fire on this tick (SPEC §2, the RD-6
+ * machine-local failure: `ctx.inject(['connection','fileUploads'])` silently
+ * stays PENDING on some compositions — the callback never runs, the wrap
+ * never installs, and every remote upload dies on the local backend with no
+ * diagnostic beyond "inject not seen"). All four facts must line up:
+ * - `injectSeen === false` — the inject callback has NOT fired (if it had,
+ *   the primary path either installed or recorded a refusal itself);
+ * - `handleSet === false` — no install happened yet, via EITHER path (the
+ *   double-install guard, checked again at the moment of installation);
+ * - `refused === false` — no install was refused yet (a refusal is a
+ *   verdict, not a pending state; retrying it would only re-learn it);
+ * - `servicesPresent` — the reflection layer answers BOTH `connection` and
+ *   `fileUploads`, i.e. the services exist and only the inject callback is
+ *   stuck. Without them there is nothing to wrap and the inject may still
+ *   be legitimately waiting (normal startup ordering) — the fallback keeps
+ *   out of the way and inject stays the first choice.
+ * Pure judgment over injectable state, so the whole truth table is
+ * assertable in Node.
+ */
+export declare function shouldFallbackInstall(state: {
+    injectSeen: boolean;
+    handleSet: boolean;
+    refused: boolean;
+    servicesPresent: boolean;
+}): boolean;
+/**
  * Check the RAW connection service instance against the shape the wrap
  * depends on. Pure inspection — nothing is mutated, so a failed check
  * leaves every route exactly as it was. Only the structural facts refuse;

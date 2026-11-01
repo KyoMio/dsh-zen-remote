@@ -125,3 +125,106 @@ export function decideRemoteDrop(input: RemoteDropInput): RemoteDropDecision {
 export function rewrapFiles(files: Iterable<File>): File[] {
   return Array.from(files, (file) => new File([file], file.name, { type: file.type, lastModified: file.lastModified }))
 }
+
+// ---------------------------------------------------------------------------
+// AU-1: the intake decision — the same three gates extended to the picker
+// (hidden file input's `change`) and paste entries. issue #49: the drop guard
+// alone left those two entries on the zero-copy path chip, so a REMOTE
+// session's attachment named a file on the sub-client's disk. The decision
+// keeps the drop semantics frozen in `decideRemoteDrop` (its truth table is a
+// regression pin) and answers the two new entries here, where the fix's
+// minimal-intervention rule can be expressed: only a file that CARRIES a path
+// and is NOT an image takes the bad zero-copy branch (addFiles), so only
+// those are worth intercepting — pathless and image files already upload
+// bytes and must stay untouched.
+// ---------------------------------------------------------------------------
+
+/** Which entry an intake item arrived through. `drop` keeps the redispatch
+ * semantics of {@link decideRemoteDrop} (any file intervenes); `picker` /
+ * `paste` intervene only on the path-carrying non-image files. */
+export type RemoteIntakeEntry = 'drop' | 'picker' | 'paste'
+
+/** One intake item, reduced to what the decision needs. `hasPath` is the
+ * bridge's `pathFor(file) !== ''` — the same fact the host's zero-copy
+ * branch keys on; `isImage` is `file.type` starting with `image/` (the
+ * host's own image classification). A `paste` item with no file behind it
+ * never becomes a descriptor (the effect only collects `kind: 'file'`
+ * clipboard items), so plain-text paste arrives as an EMPTY list. */
+export interface RemoteIntakeDescriptor {
+  entry: RemoteIntakeEntry
+  isDirectory: boolean
+  hasPath: boolean
+  isImage: boolean
+}
+
+/** Everything the intake decision may look at — the same three gates as
+ * {@link decideRemoteDrop}, injectable so no DOM is needed. */
+export interface RemoteIntakeInput {
+  /** `__DSH_HOST_PATHS__` exists — the Electron preload's zero-copy bridge. */
+  hasHostPaths: boolean
+  /** The currently open session id, or `undefined` when no signal. */
+  currentSessionId: string | undefined
+  /** `event.isTrusted` — the re-entry guard for our redispatched events. */
+  trusted: boolean
+  /** Descriptor per collected file. `undefined` means the caller could not
+   * even enumerate the items — with no inventory there is nothing safe to
+   * judge, so this passes through (today's behavior). */
+  items: readonly RemoteIntakeDescriptor[] | undefined
+}
+
+export type RemoteIntakeAction = 'passthrough' | 'redirect' | 'block-directories'
+
+/** Stable machine-readable why, one per branch, ordered by the gate sequence
+ * in {@link decideRemoteIntake}. */
+export type RemoteIntakeReason =
+  | 'untrusted-event'
+  | 'no-host-paths'
+  | 'not-remote-session'
+  | 'no-entry-api'
+  | 'contains-directory'
+  | 'no-files'
+  | 'no-path-or-image-only'
+  | 'remote-path-files'
+
+export interface RemoteIntakeDecision {
+  action: RemoteIntakeAction
+  reason: RemoteIntakeReason
+}
+
+/**
+ * The three gates, then the intervention rule. The gates are decideRemoteDrop's
+ * verbatim (all must affirmatively pass — a missing signal reads as local and
+ * never intervenes); the rule after them:
+ * 1. `items === undefined` — no inventory, pass through (`no-entry-api`;
+ *    deciding blind could eat a working flow);
+ * 2. any directory — `block-directories`, ahead of every redirect: a folder
+ *    cannot be fixed by single-file upload, the whole intake is stopped with
+ *    a toast (same semantics as the drop branch);
+ * 3. no items at all — passthrough (`no-files`; the plain-text paste shape);
+ * 4. otherwise — `redirect` when ANY item is a `drop` item (the frozen
+ *    "any file intervenes" semantics) or carries a path while not being an
+ *    image (the zero-copy bad branch — exactly what issue #49 broke on);
+ *    `no-path-or-image-only` passthrough when none does.
+ *
+ * Drop-entry parity pin: a `drop` item's intervention semantics here are
+ * kept EQUIVALENT to `decideRemoteDrop` — same gates, directory rule and
+ * "any file intervenes" — with exactly ONE deliberate divergence: when
+ * `items === undefined`, `decideRemoteDrop` redispatches (a drop always has
+ * a Files payload worth re-shaping) while this function passes through
+ * (`no-entry-api` — an intake caller that cannot even enumerate its items
+ * must not be intercepted blind). If either function's gate sequence or
+ * drop-entry rule changes, update the other in the same commit; the truth
+ * tables in scripts/check-remote-drop.mjs pin both sides.
+ */
+export function decideRemoteIntake(input: RemoteIntakeInput): RemoteIntakeDecision {
+  if (!input.trusted) return { action: 'passthrough', reason: 'untrusted-event' }
+  if (!input.hasHostPaths) return { action: 'passthrough', reason: 'no-host-paths' }
+  if (!isRemoteSessionId(input.currentSessionId)) return { action: 'passthrough', reason: 'not-remote-session' }
+  if (input.items === undefined) return { action: 'passthrough', reason: 'no-entry-api' }
+  if (input.items.some((item) => item.isDirectory)) return { action: 'block-directories', reason: 'contains-directory' }
+  if (input.items.length === 0) return { action: 'passthrough', reason: 'no-files' }
+  const intervenes = input.items.some((item) => item.entry === 'drop' || (item.hasPath && !item.isImage))
+  return intervenes
+    ? { action: 'redirect', reason: 'remote-path-files' }
+    : { action: 'passthrough', reason: 'no-path-or-image-only' }
+}

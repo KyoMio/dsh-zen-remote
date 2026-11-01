@@ -255,9 +255,10 @@ export const zh = {
   'settings.client.diagRecentFailures': '最近的远程调用失败',
   'settings.client.diagCompatGroups': '指纹有差异的组：{groups}',
   'settings.client.diagCompatCalls': '最近的不兼容调用',
-  // --- RD-3 远程会话拖拽守卫的诊断行（浏览器端计数，渲染时现读） ---
-  'settings.client.diagRemoteDrop': '远程拖拽守卫',
+  // --- RD-3/AU-3 附件入口守卫的诊断行（浏览器端计数，渲染时现读） ---
+  'settings.client.diagRemoteDrop': '附件入口守卫',
   'settings.client.diagRemoteDropOk': '已安装 · 拦截 {intercepted} · 重派发 {redispatched} · 文件夹 {blocked} · 放行 {passthrough} · 重包失败 {failed}',
+  'settings.client.diagRemoteDropEntries': '分入口 · 拦截 拖拽 {dropI} / 回形针 {pickerI} / 粘贴 {pasteI} · 放行 拖拽 {dropP} / 回形针 {pickerP} / 粘贴 {pasteP}',
   'settings.client.diagRemoteDropOff': '未安装（{reason}）',
   // --- RD-6 上传改道（fetch-route 拦截）的诊断行：读 remote-status 的 serviceProbe ---
   'settings.client.diagUploadRedirect': '上传改道',
@@ -766,10 +767,11 @@ export const en: Record<MobileNavKey, string> = {
   'settings.client.diagRecentFailures': 'Recent remote call failures',
   'settings.client.diagCompatGroups': 'Groups with fingerprint differences: {groups}',
   'settings.client.diagCompatCalls': 'Recent incompatible calls',
-  // --- RD-3: the remote drop guard's diagnostics line (browser-side
+  // --- RD-3/AU-3: the attachment-entry guard's diagnostics line (browser-side
   // counters, read at render time) ---
-  'settings.client.diagRemoteDrop': 'Remote drop guard',
+  'settings.client.diagRemoteDrop': 'Attachment entry guard',
   'settings.client.diagRemoteDropOk': 'Installed · intercepted {intercepted} · redispatched {redispatched} · folders {blocked} · passthrough {passthrough} · rewrap failed {failed}',
+  'settings.client.diagRemoteDropEntries': 'By entry · intercepted drop {dropI} / picker {pickerI} / paste {pasteI} · passthrough drop {dropP} / picker {pickerP} / paste {pasteP}',
   'settings.client.diagRemoteDropOff': 'Not installed ({reason})',
   // --- RD-6: the upload-redirect (fetch-route intercept) diagnostics row ---
   'settings.client.diagUploadRedirect': 'Upload redirect',
