@@ -472,6 +472,12 @@ npm test   # boots a mock upstream, runs the gateway/auth/push suites: proxy+inj
 
 ---
 
+## Troubleshooting: attach the debug report before screenshots
+
+When filing a GitHub issue, first click **Export diagnostics** at the very bottom of the plugin settings page **on the machine that misbehaves** and attach the downloaded JSON. It carries versions, role, config shapes (no addresses, no tokens), every interception/redirect diagnostic counter, the upload-redirect probe (`installedVia` tells whether the fetch-route wrap came in via inject or the fallback), and the last ~300 plugin event log lines (event codes and id shapes only — never conversation content), all passed through two redaction layers (absolute paths keep only their leaf, URL hostnames degrade to an address class, token-shaped runs are masked). Exporting from both the server and the sub-client is ideal. Remote devices **cannot** fetch this report through the gateway (refused by the via wall) — it exports locally only.
+
+---
+
 ## Layout
 
 | Path | Role |
