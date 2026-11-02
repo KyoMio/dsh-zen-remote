@@ -85,9 +85,10 @@ tag 名与 `package.json` 版本一致性 → `pnpm publish`（npm Trusted Publi
 OIDC 无令牌，provenance 自动生成）→ **建 GitHub Release**。
 
 Release 那步刻意排在 npm 之后：它宣告的是「这个版本已经发出去了」，npm 失败就
-不该留下一个指向不存在版本的发布页。发布说明用 `--generate-notes` 按上一个 tag
-以来的提交自动生成，这一步可重入（先 `gh release view` 查在不在，在就跳过），
-重跑失败的 workflow 不会因为 Release 已存在而挂掉。
+不该留下一个指向不存在版本的发布页。正文来源见下方 CHANGELOG 段（该版本的那一
+段 + 自上一版本以来的全部提交）；这一步可重入（先 `gh release view` 查在不在，
+在就跳过），重跑失败的 workflow 不会因为 Release 已存在而挂掉。checkout 带
+`fetch-depth: 0`（提交列表要全历史）。
 
 CHANGELOG（2026-11-02 起有 `CHANGELOG.md`）：只记用户可感知的变化，未发布段落
 攒着待发内容；**发版前**把「未发布」标题改成该版本号 + 日期，随 `npm version
