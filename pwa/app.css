@@ -45,9 +45,20 @@ html:not([data-lan-device="desktop"]) {
  * trigger-happy and disorienting: any accidental overscroll reloaded the
  * page and dropped them back to the conversation list mid-chat). This rule
  * stands on its own now — it just stops the browser's native gesture from
- * firing an unwanted reload inside the standalone PWA. */
+ * firing an unwanted reload inside the standalone PWA.
+ *
+ * html AND body, both axes (2026-11-02): the viewport's overscroll behavior
+ * propagates from html per spec, but engines have historically read body —
+ * the same reason the phone shell (styles/home.css.ts) sets it on both. The
+ * old body-only form left the VIEWPORT-level rubber band alive at tablet
+ * widths (<768px is covered again by home.css with !important; 768px+ and
+ * the >=1024px standalone PWA had nothing), so a tablet PWA could be dragged
+ * up/down and bounced back. overscroll-behavior (not -y) also absorbs the
+ * sideways bounce; inner scrollers are untouched — they keep their own
+ * scrolling, only their edge-overscroll no longer chains into the document. */
+html:not([data-lan-device="desktop"]),
 html:not([data-lan-device="desktop"]) body {
-  overscroll-behavior-y: none;
+  overscroll-behavior: none;
 }
 
 /* Apply the pinch-to-resize font scale. touch-gestures.js sets

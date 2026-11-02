@@ -25,6 +25,9 @@
   `(min-width: 1024px) and (display-mode: standalone)` 双门控规则补齐上下两个安全区
   （锚定官方 AppFrame，`border-box` + `--mnav-sat`/`--mnav-sab`）；桌面浏览器与
   桌面 App 构造性 no-op，≥1024px 桌面逐像素不变的硬约束不受影响。
+- **平板 PWA 整页可拖动弹回**：壳级 `overscroll-behavior` 此前只写在 body 且仅
+  纵轴，视口级橡皮筋在 768px 以上仍然活着。现 html/body 双写、双向杀掉；
+  内部滚动区不受影响，只是边缘滚动不再链到整页。
 
 ## 2.3.6（2026-10-31）
 
