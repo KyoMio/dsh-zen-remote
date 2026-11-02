@@ -86,9 +86,14 @@ OIDC 无令牌，provenance 自动生成）→ **建 GitHub Release**。
 
 Release 那步刻意排在 npm 之后：它宣告的是「这个版本已经发出去了」，npm 失败就
 不该留下一个指向不存在版本的发布页。发布说明用 `--generate-notes` 按上一个 tag
-以来的提交自动生成，所以**提交信息就是 changelog**，不另外维护文件。这一步可重入
-（先 `gh release view` 查在不在，在就跳过），重跑失败的 workflow 不会因为
-Release 已存在而挂掉。
+以来的提交自动生成，这一步可重入（先 `gh release view` 查在不在，在就跳过），
+重跑失败的 workflow 不会因为 Release 已存在而挂掉。
+
+CHANGELOG（2026-11-02 起有 `CHANGELOG.md`）：只记用户可感知的变化，未发布段落
+攒着待发内容；**发版前**把「未发布」标题改成该版本号 + 日期，随 `npm version
+patch` 的 version commit 一起提交（脚本只同步 README 徽章，CHANGELOG 是手动步）。
+此前「提交信息就是 changelog、不另维护文件」的约定作废；GitHub Release 的自动
+生成说明照旧保留，两者不冲突（Release 是逐提交全量，CHANGELOG 是人工摘要）。
 
 需要人工配置的只有一处：npmjs.com 的包设置里登记可信发布者
 `KyoMio/dsh-zen-remote` + 文件名 `publish.yml`。GitHub Release 那步用的是
