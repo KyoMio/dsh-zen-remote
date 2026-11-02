@@ -92,8 +92,10 @@ Release 那步刻意排在 npm 之后：它宣告的是「这个版本已经发�
 CHANGELOG（2026-11-02 起有 `CHANGELOG.md`）：只记用户可感知的变化，未发布段落
 攒着待发内容；**发版前**把「未发布」标题改成该版本号 + 日期，随 `npm version
 patch` 的 version commit 一起提交（脚本只同步 README 徽章，CHANGELOG 是手动步）。
-此前「提交信息就是 changelog、不另维护文件」的约定作废；GitHub Release 的自动
-生成说明照旧保留，两者不冲突（Release 是逐提交全量，CHANGELOG 是人工摘要）。
+此前「提交信息就是 changelog、不另维护文件」的约定作废。GitHub Release 正文
+**就是 CHANGELOG 里该版本的那一段**（workflow 用同一条 awk 提取，缺段会在 npm
+发布前被守卫挡下），其下自动附「自上一版本以来的全部提交」（git log 现算，
+不再用 `--generate-notes`——它无法与 --notes-file 共存，且正文来源要可预测）。
 
 需要人工配置的只有一处：npmjs.com 的包设置里登记可信发布者
 `KyoMio/dsh-zen-remote` + 文件名 `publish.yml`。GitHub Release 那步用的是
