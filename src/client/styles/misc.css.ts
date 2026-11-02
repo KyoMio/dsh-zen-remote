@@ -125,4 +125,42 @@ export const MISC_CSS = `  /* ---------- hero composer on mobile ----------
     display: none !important;
   }
 }
+
+/* ---------- tablet standalone PWA: pay the safe area above 1023px ---------- */
+/* The gateway serves viewport-fit=cover to every non-desktop device (see
+   coverViewport in lan-gate-server), phone-chrome only manages the meta at
+   <=1023px, and every compensation rule in layout.css lives behind the same
+   1023px breakpoint and the data-mobile-nav frame marker MobileNavOverlay
+   only sets there. A wide tablet's home-screen PWA — iPad landscape, the
+   12.9"/13" iPad portrait at exactly 1024, Android tablets — therefore
+   painted under the status bar with nothing paying the inset: the top row
+   of controls sat in the system area and was hard to tap.
+
+   Anchor: the official AppFrame (ui-layout AppFrame.tsx) is the direct
+   parent of the [data-shell-overlay] layer — the same element
+   MobileNavOverlay's findFrame() resolves — and the frame already pads
+   ITSELF for the Windows titlebar (padding-top: --dsh-windows-titlebar-height
+   in AppFrame.module.css), so padding the frame is the host's own pattern
+   for system bars.
+
+   Structural no-op everywhere else, by construction:
+   - display-mode: standalone matches only an installed PWA; desktop
+     browsers report browser.
+   - The Electron app never receives this stylesheet at all (the
+     isDesktopShell gate in client/index.tsx) and never gets cover.
+   - env() insets are hard 0 in every desktop browser, so even a browser
+     that somehow matched the media query computes 0px padding; on iPads
+     the bottom inset is 0 too (no home indicator) — the bottom line only
+     ever pays out on Android tablets with a gesture/nav bar.
+   box-sizing is load-bearing (the S2.1 lesson, see the frame rule in
+   layout.css): the official frame is height:100% content-box, and padding
+   without border-box would grow it past the viewport instead of reserving
+   the strip. Pinned by scripts/check-tablet-safe-area.mjs. */
+@media (min-width: 1024px) and (display-mode: standalone) {
+  :has(> [data-shell-overlay]) {
+    box-sizing: border-box !important;
+    padding-top: var(--mnav-sat) !important;
+    padding-bottom: var(--mnav-sab) !important;
+  }
+}
 `

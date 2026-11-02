@@ -169,6 +169,8 @@ PWA，再进来就是冷启动。插件自己的边缘手势也触发不了—�
 
 页面各表面的安全区留白统一收进两个可注入的 CSS 变量（`--mnav-sat`/`--mnav-sab`），平时读 `env(safe-area-inset-*)`，调试参数在时可以整体假冒——这是后面两层缓解的基础。
 
+这套补偿原本止步于 1023px 断点，但网关对一切非 desktop 设备都注入 `viewport-fit=cover`，于是**宽幅平板的独立 PWA（≥1024px：iPad 横屏、12.9/13 吋 iPad 竖屏恰好 1024、安卓平板）**会画进状态栏下方而无人买单——顶部控件被系统区压住、难以点按。现由 `misc.css.ts` 一条 `(min-width: 1024px) and (display-mode: standalone)` 双门控的规则补偿：锚点是官方 AppFrame（`[data-shell-overlay]` 的直接父层，与 `findFrame()` 同源），`border-box` + 上下两个变量。桌面浏览器（display-mode 不匹配）、桌面 App（整个样式表被 `dshDesktop` 门挡掉、也拿不到 cover）与一切 `env()` 为 0 的环境构造性 no-op，≥1024px 桌面逐像素不变的硬约束不受影响；规则由 `scripts/check-tablet-safe-area.mjs` 钉住。
+
 在这套变量之上，iOS 26.x 的 Safari/PWA 上出现了一个已知系统缺陷：独立（加到主屏）PWA 第一次弹出软键盘后，布局视口会永久性地比屏幕矮一截（`innerHeight`/`visualViewport.height`/`100dvh` 一起变小），直到整个 app 被彻底退出重开。这不是本插件的 bug，社区已有记录（[参考文章](https://dev.to/cederhook/fixing-the-ios-standalone-pwa-keyboard-bug-that-shrinks-your-viewport-for-good-63d)），本插件只做了两层缓解，不是根治：
 
 1. **视口下沉检测**——检测到系统在底部裁掉一截可视区域时，把底部安全区补偿归零，避免在已经空白的系统条上再叠一层空白；
