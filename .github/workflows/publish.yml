@@ -17,6 +17,9 @@ jobs:
       id-token: write # OIDC：Trusted Publishing 认证 + provenance 签名都靠它
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Release 附录要列「自上一 tag 以来的全部提交」，fetch-depth 0 拿全历史。
+          fetch-depth: 0
 
       - uses: pnpm/action-setup@v6 # 版本读 package.json 的 packageManager 字段
 
@@ -48,6 +51,22 @@ jobs:
             exit 1
           fi
 
+      # CHANGELOG 守卫（npm 发布之前就挡住）：本次 tag 的版本段必须已存在且非空。
+      # 发版纪律是「未发布」标题在打 tag 前改成该版本号 + 日期；忘了改，这里非零
+      # 退出，不会默默发一个 Release 正文为空的版本（守卫只认 tag，与上一条的
+      # package.json 一致性检查互为独立证据）。
+      - name: CHANGELOG section guard
+        run: |
+          section=$(awk -v ver="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## " ver "($|（)" { grab = 1; next }
+            /^## / { grab = 0 }
+            grab { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}')
+          if [ -z "$section" ]; then
+            echo "CHANGELOG.md 没有 ${GITHUB_REF_NAME#v} 的版本段（标题还是「未发布」？），发版前先改标题再打 tag。" >&2
+            exit 1
+          fi
+
       # Trusted Publishing：pnpm ≥10.14 原生支持 OIDC（packageManager 钉的
       # 11.7.0 满足），provenance 随可信发布自动生成，无需令牌与 --provenance。
       - run: pnpm publish --no-git-checks
@@ -55,8 +74,10 @@ jobs:
       # Release 排在 npm 之后：它宣告的是「这个版本已经发出去了」。npm 那步失败
       # 就不该留下 Release，顺序反过来会得到一个指向不存在版本的发布页。
       #
-      # gh 是 ubuntu-latest 自带的，不引第三方 action；--generate-notes 让
-      # GitHub 按上一个 tag 以来的提交自动写发布说明，不用维护 changelog 文件。
+      # 正文 = CHANGELOG.md 里本版本的那一段（人工摘要，与守卫同一条 awk 提取），
+      # 附录 = 自上一 tag 以来的全部提交（git log 现算，替代 --generate-notes——
+      # 它无法与 --notes-file 共存，且正文来源要可预测：CHANGELOG 是什么，Release
+      # 就是什么）。标题下的版本日期与 npm 包版本以 CHANGELOG 段首行为准。
       # --verify-tag 拒绝给不存在的 tag 建 Release（手滑删过 tag 又重跑时会挡住）。
       #
       # 先 view 再 create：重跑一次失败的 workflow 是常事，而 create 撞上已存在的
@@ -67,9 +88,27 @@ jobs:
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "release $GITHUB_REF_NAME 已存在，跳过"
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --verify-tag \
-              --title "$GITHUB_REF_NAME" \
-              --generate-notes
+            exit 0
           fi
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## " ver "($|（)" { grab = 1; next }
+            /^## / { grab = 0 }
+            grab { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' > release-body.md
+          prev=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME"^ 2>/dev/null || true)
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "#### 自上一版本以来的全部提交"
+            echo ""
+            if [ -n "$prev" ]; then
+              git log --oneline --no-decorate "$prev..$GITHUB_REF_NAME"
+            else
+              git log --oneline --no-decorate "$GITHUB_REF_NAME" | head -50
+            fi
+          } >> release-body.md
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-body.md
