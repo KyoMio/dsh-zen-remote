@@ -126,6 +126,10 @@ test('filterControlFrame: projection frames pass or drop whole by their session 
   assert.equal(filterControlFrame(frame, only(['S-shared'])), null)
   const kept = { type: 'projection', sessionId: 'S-shared', key: 'title', value: 'x', seq: 7 }
   assert.deepEqual(filterControlFrame(kept, only(['S-shared'])), kept)
+  // DSH 0.2.2-alpha.3's batched shape: same verdict by session id, payload untouched
+  const batched = { type: 'projection', sessionId: 'S-shared', seq: 8, changes: [{ key: 'title', val: 'y' }] }
+  assert.deepEqual(filterControlFrame(batched, only(['S-shared'])), batched)
+  assert.equal(filterControlFrame({ ...batched, sessionId: 'S-secret' }, only(['S-shared'])), null)
 })
 
 test('filterControlFrame: unknown or malformed frames are dropped', () => {

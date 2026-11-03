@@ -275,6 +275,33 @@ export interface ControlMerger {
     readonly hasPendingHide: boolean;
     retarget(identity: MergerIdentity): void;
 }
+/** One `session/control` projection change, independent of the wire shape. */
+export interface ControlProjectionChange {
+    key: string;
+    value: unknown;
+}
+/**
+ * Read the changes of one live `session/control` `projection` frame in either
+ * wire shape. DSH 0.2.2-alpha.3 batched the frame per committed event —
+ * `{type:'projection', sessionId, seq, changes:[{key, val}]}` (its client
+ * face's handleControlFrame iterates `frame.changes`) — where 0.2.1 and
+ * 0.2.2-alpha.2 send one key per frame, `{type:'projection', sessionId, key,
+ * value, seq}` (that client face reads `frame.key` / `frame.value`). A
+ * `changes` array wins when present; `undefined` means neither shape is
+ * usable (a malformed entry spoils the whole frame, like every other
+ * malformed frame here).
+ */
+export declare function controlProjectionChanges(frame: Record<string, unknown>): ControlProjectionChange[] | undefined;
+/**
+ * One single-key `session/control` projection frame that BOTH client
+ * generations apply: the per-key `key` / `value` fields for DSH ≤ 0.2.2-alpha.2
+ * and a one-entry `changes` list for ≥ 0.2.2-alpha.3. Neither client face
+ * validates stream frames (the gateway client only runs a binary `decode`),
+ * and each reads only its own fields, so the extra ones are inert. Splitting a
+ * batched frame into one frame per key at the same seq is lossless: the
+ * projection store applies per key (`seq <= row.seq` per row).
+ */
+export declare function controlProjectionFrame(sessionId: string, key: string, value: unknown, seq: number): Record<string, unknown>;
 /**
  * The session/control merger. The control stream is key-value projection
  * traffic with no ordering constraints between sessions, so it needs no

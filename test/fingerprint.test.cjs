@@ -319,8 +319,13 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     // observeProjections, observeState, state, wait), 21 → 27; the 21 existing
     // ones keep their ids. Mixed 0.2.1/0.2.2 pairs report `session` as different.
     '0.2.2-alpha.2': 'r:6763de393b71',
+    // 0.2.2-alpha.3: the live `projection` frame of session/control and
+    // session/observeProjections is batched per event (`seq, changes[{key,
+    // val}]` replaces `key, value, seq`); session/list rows drop
+    // contextPressure/contextBreakdown; 27 endpoints, ids unchanged.
+    '0.2.2-alpha.3': 'r:838e5469a423',
   }
-  const ENDPOINTS = { '0.2.2-alpha.2': 27 }
+  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27 }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
   const remote = await import('../node_modules/@deepseek-ai/dsh-api-session-controller/lib/typert.remote-client.js')
