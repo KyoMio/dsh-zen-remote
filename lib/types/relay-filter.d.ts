@@ -34,9 +34,10 @@ export declare function filterWorkspaceFrame(frame: unknown, isAccessible: Acces
 /**
  * Filter one `session/control` frame. Exactly two frame types exist:
  * `baseline{value:{projections: Record<sessionId, {asOfSeq, values}>}}` — the
- * per-session map keeps only accessible keys — and `projection{sessionId, key,
- * value, seq}` — kept whole or dropped by its session id. Anything else is
- * dropped.
+ * per-session map keeps only accessible keys — and `projection{sessionId, …}`
+ * (per-key `key, value, seq` up to DSH 0.2.2-alpha.2, batched `seq,
+ * changes[]` from alpha.3) — kept whole or dropped by its session id, so either
+ * shape passes untouched. Anything else is dropped.
  *
  * The baseline record is rebuilt with `defineProperty` because a session id of
  * `__proto__` must become an own data property of the new record, not fire the

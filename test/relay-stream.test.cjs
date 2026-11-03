@@ -495,13 +495,22 @@ test('stream: session/control filters foreign projections, then synthesizes them
       { type: 'frame', frame: { type: 'projection', sessionId: 'S-shared', key: 'title', value: 'yes', seq: 4 } },
     ])
 
+    // DSH 0.2.2-alpha.3's batched frame is filtered by session id the same way and passes untouched.
+    gate.push({ type: 'projection', sessionId: 'S-secret', seq: 5, changes: [{ key: 'title', val: 'nope' }] })
+    gate.push({ type: 'projection', sessionId: 'S-shared', seq: 6, changes: [{ key: 'title', val: 'yes2' }, { key: 'todos', val: [] }] })
+    await waitFor(() => open.lines.length >= 3)
+    assert.deepEqual(open.lines[2], {
+      type: 'frame',
+      frame: { type: 'projection', sessionId: 'S-shared', seq: 6, changes: [{ key: 'title', val: 'yes2' }, { key: 'todos', val: [] }] },
+    })
+
     // Sharing S-secret fetches its current projections and emits one
     // synthesized projection frame per key, seq = the reported asOfSeq.
     parts.store.share('S-secret')
-    await waitFor(() => open.lines.length >= 4)
-    assert.deepEqual(open.lines.slice(2), [
-      { type: 'frame', frame: { type: 'projection', sessionId: 'S-secret', key: 'title', value: 'fresh', seq: 9 } },
-      { type: 'frame', frame: { type: 'projection', sessionId: 'S-secret', key: 'permissions', value: { currentValue: 'default' }, seq: 9 } },
+    await waitFor(() => open.lines.length >= 5)
+    assert.deepEqual(open.lines.slice(3), [
+      { type: 'frame', frame: { type: 'projection', sessionId: 'S-secret', key: 'title', value: 'fresh', seq: 9, changes: [{ key: 'title', val: 'fresh' }] } },
+      { type: 'frame', frame: { type: 'projection', sessionId: 'S-secret', key: 'permissions', value: { currentValue: 'default' }, seq: 9, changes: [{ key: 'permissions', val: { currentValue: 'default' } }] } },
     ])
 
     // Unshare synthesizes nothing: the workspace stream removes the session.

@@ -27,6 +27,7 @@
  */
 
 import { withPeer } from './owner-peer.js'
+import { controlProjectionFrame } from './merge-streams.js'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { Readable, Transform } from 'node:stream'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
@@ -2508,8 +2509,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           })
         } else if (decision.filter === 'control') {
           // A newly shared session needs its current projections: fetch
-          // them once and emit one synthesized `projection` frame per key,
-          // shaped exactly like the upstream frames. An unshared session
+          // them once and emit one synthesized `projection` frame per key in
+          // the dual shape both DSH generations read (per-key key/value for
+          // ≤ 0.2.2-alpha.2, a one-entry `changes` list for ≥ alpha.3). An unshared session
           // synthesizes nothing — the client drops it via the workspace
           // stream's re-filtered upserts.
           const syncProjections = async (sessionId: string): Promise<void> => {
@@ -2528,7 +2530,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             const values = isPlainObject(result.values) ? result.values : {}
             const seq = typeof result.asOfSeq === 'number' ? result.asOfSeq : 0
             for (const key of Object.keys(values)) {
-              void writeLine({ type: 'frame', frame: { type: 'projection', sessionId, key, value: values[key], seq } })
+              void writeLine({ type: 'frame', frame: controlProjectionFrame(sessionId, key, values[key], seq) })
             }
           }
           unsubscribe = store.subscribe((event) => {

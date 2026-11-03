@@ -50,6 +50,7 @@
     "prepack": "npm run build"
   },
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
@@ -83,7 +84,8 @@
     "url": "git+https://github.com/KyoMio/dsh-zen-remote.git"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=18",
+    "dsh": ">=0.2.1-alpha.2 <0.3.0-0"
   },
   "packageManager": "pnpm@11.7.0",
   "dependencies": {
