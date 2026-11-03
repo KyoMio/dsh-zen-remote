@@ -44,6 +44,9 @@ const SERVER_ID = '721b94fb'
 const LOCAL_ID = 'session-712828e2-492f-4ad1-8a88-ece10ecc4cc0'
 const VIRTUAL_ID = toVirtual(SERVER_ID, LOCAL_ID)
 
+// DSH ≤0.2.2-alpha.2 per-key fields + the ≥alpha.3 one-entry `changes` list (dual shape).
+const P = (frame) => ({ ...frame, changes: [{ key: frame.key, val: frame.value }] })
+
 // -- the fakes -----------------------------------------------------------------
 
 /**
@@ -1281,12 +1284,12 @@ test('session/control merges: a remote baseline explodes into virtual projection
   relay.streams[0].gate.push({ type: 'baseline', value: { projections: { 'session-a': { asOfSeq: 7, values: { title: '远端', todos: [] } } } } })
   const exploded = await readSome(iterator, 2)
   assert.deepEqual(exploded, [
-    { type: 'projection', sessionId: toVirtual(SERVER_ID, 'session-a'), key: 'title', value: '远端', seq: 7 },
-    { type: 'projection', sessionId: toVirtual(SERVER_ID, 'session-a'), key: 'todos', value: [], seq: 7 },
+    P({ type: 'projection', sessionId: toVirtual(SERVER_ID, 'session-a'), key: 'title', value: '远端', seq: 7 }),
+    P({ type: 'projection', sessionId: toVirtual(SERVER_ID, 'session-a'), key: 'todos', value: [], seq: 7 }),
   ])
   relay.streams[0].gate.push({ type: 'projection', sessionId: 'session-a', key: 'title', value: '改名', seq: 8 })
   assert.deepEqual(await readSome(iterator, 1), [
-    { type: 'projection', sessionId: toVirtual(SERVER_ID, 'session-a'), key: 'title', value: '改名', seq: 8 },
+    P({ type: 'projection', sessionId: toVirtual(SERVER_ID, 'session-a'), key: 'title', value: '改名', seq: 8 }),
   ])
 
   // the remote stream ENDS: control emits no removal frames — local keeps flowing

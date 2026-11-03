@@ -17,6 +17,9 @@ const { toVirtual, VIRTUAL_GROUP_NAME_MARK } = require('../lib/virtual-id.js')
 const SID = 'a1b2c3d4'
 const NAME = '主服务器'
 const V = (id) => toVirtual(SID, id)
+
+// DSH ≤0.2.2-alpha.2 per-key fields + the ≥alpha.3 one-entry `changes` list (dual shape).
+const P = (frame) => ({ ...frame, changes: [{ key: frame.key, val: frame.value }] })
 const MARK = VIRTUAL_GROUP_NAME_MARK
 
 const LOCAL_WS = {
@@ -437,19 +440,19 @@ test('control: a remote baseline is exploded into per-key projections with virtu
     value: { projections: { s1: { asOfSeq: 7, values: { title: '远端标题', sessionListMetadata: { blank: false, lastPromptAt: 5 } } } } },
   })
   assert.equal(out.length, 2)
-  assert.deepEqual(out[0], { type: 'projection', sessionId: V('s1'), key: 'title', value: '远端标题', seq: 7 })
-  assert.deepEqual(out[1], {
+  assert.deepEqual(out[0], P({ type: 'projection', sessionId: V('s1'), key: 'title', value: '远端标题', seq: 7 }))
+  assert.deepEqual(out[1], P({
     type: 'projection',
     sessionId: V('s1'),
     key: 'sessionListMetadata',
     value: { blank: false, lastPromptAt: 5 },
     seq: 7,
-  })
+  }))
   assert.ok(out.every((frame) => frame.type !== 'baseline'))
 
   // live single-key updates virtualize the session id, everything else verbatim
   assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', key: 'title', value: '新', seq: 8 }), [
-    { type: 'projection', sessionId: V('s1'), key: 'title', value: '新', seq: 8 },
+    P({ type: 'projection', sessionId: V('s1'), key: 'title', value: '新', seq: 8 }),
   ])
   // unknown types dropped; onRemoteGone is silent by design
   const dropped = []
@@ -475,12 +478,12 @@ test('control: remote frames before the local baseline are buffered, then flushe
   const out = m.onLocal(localBaseline)
   assert.equal(out.length, 3)
   assert.equal(out[0], localBaseline)
-  assert.deepEqual(out[1], { type: 'projection', sessionId: V('s1'), key: 'title', value: '远端', seq: 7 })
-  assert.deepEqual(out[2], { type: 'projection', sessionId: V('s1'), key: 'title', value: '改', seq: 8 })
+  assert.deepEqual(out[1], P({ type: 'projection', sessionId: V('s1'), key: 'title', value: '远端', seq: 7 }))
+  assert.deepEqual(out[2], P({ type: 'projection', sessionId: V('s1'), key: 'title', value: '改', seq: 8 }))
 
   // afterwards remote frames flow directly again
   assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', key: 'title', value: '再改', seq: 9 }), [
-    { type: 'projection', sessionId: V('s1'), key: 'title', value: '再改', seq: 9 },
+    P({ type: 'projection', sessionId: V('s1'), key: 'title', value: '再改', seq: 9 }),
   ])
   // a second local baseline is a passthrough (no double flush)
   assert.deepEqual(m.onLocal({ type: 'baseline', value: { projections: {} } }).length, 1)
@@ -498,7 +501,7 @@ test('control: a zero-event session (asOfSeq -1) is skipped with a diagnostic, n
     type: 'baseline',
     value: { projections: { 's-empty': { asOfSeq: -1, values: { title: '空会话' } }, 's-live': { asOfSeq: 4, values: { title: '活着' } } } },
   })
-  assert.deepEqual(out, [{ type: 'projection', sessionId: V('s-live'), key: 'title', value: '活着', seq: 4 }])
+  assert.deepEqual(out, [P({ type: 'projection', sessionId: V('s-live'), key: 'title', value: '活着', seq: 4 })])
   assert.equal(dropped.length, 1)
   assert.match(dropped[0], /s-empty/)
   assert.match(dropped[0], /-1/)
@@ -509,8 +512,51 @@ test('control: a zero-event session (asOfSeq -1) is skipped with a diagnostic, n
   assert.deepEqual(dropped.length, 2)
   // seq 0 is a legitimate value and passes
   assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's', key: 'title', value: 'x', seq: 0 }), [
-    { type: 'projection', sessionId: V('s'), key: 'title', value: 'x', seq: 0 },
+    P({ type: 'projection', sessionId: V('s'), key: 'title', value: 'x', seq: 0 }),
   ])
+})
+
+test('control: DSH 0.2.2-alpha.3 batched projection frames split into one dual-shape frame per key', () => {
+  const dropped = []
+  const m = createControlMerger({ serverId: SID, onDiagnostic: (message) => dropped.push(message) })
+  m.onLocal({ type: 'baseline', value: { projections: {} } })
+  // alpha.3: one frame per committed event, `changes[]` with `val`.
+  assert.deepEqual(
+    m.onRemote({
+      type: 'projection',
+      sessionId: 's1',
+      seq: 12,
+      changes: [
+        { key: 'title', val: '批量' },
+        { key: 'modelSelection', val: { next: { provider: 'codex', model: 'sol' } } },
+      ],
+    }),
+    [
+      P({ type: 'projection', sessionId: V('s1'), key: 'title', value: '批量', seq: 12 }),
+      P({ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { next: { provider: V('codex'), model: 'sol' } }, seq: 12 }),
+    ],
+    'each key keeps the event seq; modelSelection providers still go virtual',
+  )
+  // every emitted frame satisfies BOTH client faces: ≤alpha.2 reads key/value, ≥alpha.3 iterates changes
+  const [frame] = m.onRemote({ type: 'projection', sessionId: 's1', seq: 13, changes: [{ key: 'todos', val: [] }] })
+  assert.equal(frame.key, 'todos')
+  assert.deepEqual(frame.value, [])
+  assert.deepEqual(frame.changes, [{ key: 'todos', val: [] }])
+  // an already dual-shape frame (a newer relay server's synthesized one) reads through `changes`
+  assert.deepEqual(m.onRemote(P({ type: 'projection', sessionId: 's1', key: 'title', value: 'd', seq: 14 })), [
+    P({ type: 'projection', sessionId: V('s1'), key: 'title', value: 'd', seq: 14 }),
+  ])
+  // an empty batch emits nothing and is not an error
+  assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', seq: 15, changes: [] }), [])
+  assert.equal(dropped.length, 0)
+  // malformed batches are dropped whole, with a diagnostic
+  assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', seq: 16, changes: [{ key: 'title' }] }), [])
+  assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', seq: 17, changes: [null] }), [])
+  assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', seq: 18 }), [])
+  assert.equal(dropped.length, 3)
+  // the seq guard still runs first
+  assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', seq: -1, changes: [{ key: 'title', val: 'x' }] }), [])
+  assert.equal(dropped.length, 4)
 })
 
 test('control: retarget moves the virtualization to the new server id', () => {
@@ -518,7 +564,7 @@ test('control: retarget moves the virtualization to the new server id', () => {
   m.onLocal({ type: 'baseline', value: { projections: {} } })
   m.retarget({ serverId: 'ffffffff', serverName: '新' })
   assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', key: 'title', value: 'x', seq: 1 }), [
-    { type: 'projection', sessionId: toVirtual('ffffffff', 's1'), key: 'title', value: 'x', seq: 1 },
+    P({ type: 'projection', sessionId: toVirtual('ffffffff', 's1'), key: 'title', value: 'x', seq: 1 }),
   ])
 })
 
@@ -924,7 +970,7 @@ test('T34: the control merger accepts setStatus and answers [] — projections c
   assert.deepEqual(m.onStatusChanged(), [])
   // the control stream keeps converting frames normally afterwards
   assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', key: 'title', value: 'x', seq: 2 }), [
-    { type: 'projection', sessionId: V('s1'), key: 'title', value: 'x', seq: 2 },
+    P({ type: 'projection', sessionId: V('s1'), key: 'title', value: 'x', seq: 2 }),
   ])
 })
 
@@ -1060,23 +1106,23 @@ test('T52-fix3 control merger: modelSelection projection frames get their provid
     value: { projections: { s1: { asOfSeq: 9, values: { modelSelection: { lastUsed: { provider: 'codex', model: 'sol' }, next: null } } } } },
   })
   assert.deepEqual(exploded, [
-    { type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: { provider: V('codex'), model: 'sol' }, next: null }, seq: 9 },
+    P({ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: { provider: V('codex'), model: 'sol' }, next: null }, seq: 9 }),
   ])
   // The live single-key path.
   assert.deepEqual(
     m.onRemote({ type: 'projection', sessionId: 's1', key: 'modelSelection', value: { lastUsed: null, next: { provider: 'codex', model: 'sol' } }, seq: 10 }),
-    [{ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: null, next: { provider: V('codex'), model: 'sol' } }, seq: 10 }],
+    [P({ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { lastUsed: null, next: { provider: V('codex'), model: 'sol' } }, seq: 10 })],
   )
   // Any other key stays verbatim.
   assert.deepEqual(m.onRemote({ type: 'projection', sessionId: 's1', key: 'title', value: 't', seq: 11 }), [
-    { type: 'projection', sessionId: V('s1'), key: 'title', value: 't', seq: 11 },
+    P({ type: 'projection', sessionId: V('s1'), key: 'title', value: 't', seq: 11 }),
   ])
 
   // T52-fix3: no catalog gate anywhere — a provider no catalog lists goes
   // virtual exactly the same (first-write-wins per seq forbids the gate).
   assert.deepEqual(
     m.onRemote({ type: 'projection', sessionId: 's1', key: 'modelSelection', value: { next: { provider: 'claude', model: 'sonnet' } }, seq: 12 }),
-    [{ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { next: { provider: V('claude'), model: 'sonnet' } }, seq: 12 }],
+    [P({ type: 'projection', sessionId: V('s1'), key: 'modelSelection', value: { next: { provider: V('claude'), model: 'sonnet' } }, seq: 12 })],
     'an unlisted provider is virtualized identically',
   )
 })

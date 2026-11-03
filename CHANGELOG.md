@@ -5,6 +5,18 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 兼容
+
+- **DSH 0.2.2-alpha.3**：`session/control` 的实时 `projection` 帧改为按事件批量
+  （`seq` + `changes[{key, val}]`，取代逐键的 `key` / `value`）。子客户端合并远程
+  控制流时两种形态都能读，并统一拆成「逐键字段 + 单条 `changes`」的双形态帧，
+  本机 DSH 新旧版本都能直接应用（本机与服务端版本不一致时会话标题、模型选择等
+  投影不再停更或打断控制流）；服务端补发的投影帧同样改为双形态。
+- 插件清单声明 `dsh.manifestVersion: 1` 与 `engines.dsh: ">=0.2.1-alpha.2 <0.3.0-0"`
+  （含预发布：覆盖 npm latest 0.2.1-rc.5 与 alpha 通道 0.2.2-alpha.3）。
+
 ## 2.3.7（2026-11-02）
 
 ### 新增
