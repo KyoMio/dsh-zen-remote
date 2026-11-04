@@ -48,6 +48,7 @@ import {
   CLIENT_DEBUG_REPORT_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
+  awaitClientStatusReady,
   claimDeviceNameOf,
   createLatestGate,
   clientStatusLineOf,
@@ -56,6 +57,7 @@ import {
   localOpsAllowed,
   normalizePairingCode,
   shouldFollowServerDeviceName,
+  shouldReloadAfterClientActivation,
 } from '../../client-data/settings-form.ts'
 import { bridgeSectionState, togglePluginConsent } from '../../client-data/plugin-bridge.ts'
 import type { PluginBridgeStatusView } from '../../client-data/plugin-bridge.ts'
@@ -678,6 +680,11 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     setClaimBusy(true)
     setClaimFail(null)
     setClaimWriteFailed(false)
+    // UX-1: captured BEFORE the pairing — whether the page ran as client, and
+    // whether the backend's stream interceptor was already active per the
+    // last client/status diagnostics.
+    const wasEffectiveClient = clientRole
+    const streamInterceptAlreadyActive = clientView?.intercept?.installed === true
     // T60: one name for both halves of the round-trip — trimmed and legal
     // ({@link claimDeviceNameOf}), sent to the server AND written into the
     // row when the claim lands.
@@ -710,6 +717,20 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         // could not store falls back to the name we actually sent.
         const echoed = typeof body.deviceName === 'string' && body.deviceName !== '' ? claimDeviceNameOf(body.deviceName, claimName) : claimName
         const landed = await config.writeClientPairing(urlToWrite, body.token, echoed)
+        if (landed && shouldReloadAfterClientActivation({
+          wasEffectiveClient,
+          nowClientRole: true,
+          savedOrPaired: true,
+          streamInterceptAlreadyActive,
+        })) {
+          // UX-1: FIRST pairing on a page whose resident global streams were
+          // opened unwrapped (or with the interceptor inactive) — wait out the
+          // backend's row-reload window, then reload so the streams reopen
+          // wrapped and the server's sessions enter the sidebar.
+          setClaimBusy(false)
+          void awaitClientStatusReady().then(() => window.location.reload())
+          return
+        }
         if (landed) {
           // The draft did its job — it now equals the displayed value, and
           // keeping it would be a phantom edit (T60).
@@ -990,7 +1011,28 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
           state={form}
           onSave={() => {
             const reloadsRow = saveReloadsRow()
-            void config.save().then((landed) => { if (landed) saveLanded(reloadsRow) })
+            // UX-1: captured BEFORE the save — whether the page ran as client,
+            // and whether the backend's stream interceptor was already active
+            // per the last client/status diagnostics.
+            const wasEffectiveClient = clientRole
+            const streamInterceptAlreadyActive = clientView?.intercept?.installed === true
+            void config.save().then((landed) => {
+              if (!landed) return
+              if (shouldReloadAfterClientActivation({
+                wasEffectiveClient,
+                nowClientRole: config.savedRoleIsClient(),
+                savedOrPaired: true,
+                streamInterceptAlreadyActive,
+              })) {
+                // UX-1: the save first-activated the client interceptor while
+                // this page's resident global streams were opened unwrapped —
+                // wait out the row-reload window, then reload so the streams
+                // reopen wrapped and the server's sessions enter the sidebar.
+                void awaitClientStatusReady().then(() => window.location.reload())
+                return
+              }
+              saveLanded(reloadsRow)
+            })
           }}
           onDiscard={() => { config.discard() }}
         >

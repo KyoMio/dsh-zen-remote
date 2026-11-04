@@ -18,8 +18,11 @@
 import assert from 'node:assert/strict'
 import {
   CLIENT_RECONNECT_ROUTE,
+  CLIENT_STATUS_ROUTE,
+  awaitClientStatusReady,
   claimDeviceNameOf,
   shouldFollowServerDeviceName,
+  shouldReloadAfterClientActivation,
   createLatestGate,
   clientStatusLineOf,
   deriveClientStatusView,
@@ -934,4 +937,64 @@ test('T59: hasDraft tracks the staged map; writeDeviceName lands one serverName 
   assert.equal(await form.writeDeviceName('服务端的名'), true)
   assert.deepEqual(state.mutateCalls.at(-1).ops, [{ op: 'set', path: ['serverName'], value: '服务端的名' }])
   assert.equal(state.mutateCalls.at(-1).expectedRevision, 8, 'fenced like every direct write')
+})
+
+// ---- UX-1: the reload-after-first-client-activation decision -----------------
+
+test('shouldReloadAfterClientActivation truth table: nothing saved or not client never reloads', () => {
+  // The write did not land — nothing changed, no reload ever.
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: false, nowClientRole: true, savedOrPaired: false }), false)
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: true, nowClientRole: true, savedOrPaired: false }), false)
+  // The role is not (or not becoming) client — no reload even though it saved.
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: false, nowClientRole: false, savedOrPaired: true }), false)
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: true, nowClientRole: false, savedOrPaired: true }), false)
+})
+
+test('shouldReloadAfterClientActivation: a host→client switch always reloads', () => {
+  // The page opened while 'host': its three global streams are unwrapped, so
+  // the switch must reload no matter what the (absent) diagnostics said.
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: false, nowClientRole: true, savedOrPaired: true }), true)
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: false, nowClientRole: true, savedOrPaired: true, streamInterceptAlreadyActive: false }), true)
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: false, nowClientRole: true, savedOrPaired: true, streamInterceptAlreadyActive: true }), true, 'a stale positive flag cannot beat the switch')
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: false, nowClientRole: true, savedOrPaired: true, streamInterceptAlreadyActive: undefined }), true, 'unknown diagnostics still reloads on a role switch')
+})
+
+test('shouldReloadAfterClientActivation: already client reloads only when the intercept was NOT active', () => {
+  // First pairing completed on an already-client page whose backend
+  // interceptor had not installed yet (openWireStream never wrapped) — reload.
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: true, nowClientRole: true, savedOrPaired: true, streamInterceptAlreadyActive: false }), true)
+  // Re-pairing / renaming on an already-active client — NO reload (the
+  // restart-watcher rewraps in place, the open streams keep working).
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: true, nowClientRole: true, savedOrPaired: true, streamInterceptAlreadyActive: true }), false)
+  // Unknown diagnostics (an older server without the intercept field) never
+  // reloads by itself — the flag must be an explicit false.
+  assert.equal(shouldReloadAfterClientActivation({ wasEffectiveClient: true, nowClientRole: true, savedOrPaired: true, streamInterceptAlreadyActive: undefined }), false)
+})
+
+test('CLIENT_STATUS_ROUTE is the poll target for the post-activation wait', () => {
+  assert.equal(CLIENT_STATUS_ROUTE, '/_dsh/zen-remote/client/status')
+})
+
+test('awaitClientStatusReady resolves on the first ok answer', async () => {
+  let calls = 0
+  const fetchFn = async () => { calls += 1; return { ok: true } }
+  await awaitClientStatusReady(fetchFn, 5_000, 10)
+  assert.equal(calls, 1, 'one ok answer ends the wait immediately')
+})
+
+test('awaitClientStatusReady keeps polling until an ok answer arrives', async () => {
+  let calls = 0
+  const fetchFn = async () => { calls += 1; return calls < 3 ? { ok: false } : { ok: true } }
+  await awaitClientStatusReady(fetchFn, 5_000, 5)
+  assert.equal(calls, 3, 'polls through the not-ready answers')
+})
+
+test('awaitClientStatusReady gives up after the deadline and still resolves', async () => {
+  let calls = 0
+  const fetchFn = async () => { calls += 1; throw new Error('row reloading') }
+  const started = Date.now()
+  await assert.doesNotReject(awaitClientStatusReady(fetchFn, 60, 10))
+  const elapsed = Date.now() - started
+  assert.ok(elapsed >= 50, `waited out the deadline (elapsed ${elapsed}ms)`)
+  assert.ok(calls >= 2, `polled more than once before giving up (${calls} calls)`)
 })
