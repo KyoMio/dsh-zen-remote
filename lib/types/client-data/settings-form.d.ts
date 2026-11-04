@@ -283,6 +283,42 @@ export declare function normalizePairingCode(input: string): string;
  */
 export declare function shouldFollowServerDeviceName(deviceName: string, rowName: string, hasDraft: boolean): boolean;
 /**
+ * Whether one successful client-side activation (a staged-save role switch, a
+ * first pairing) needs a page reload: the backend's restart-watcher only
+ * installs the stream interceptor when the row reloads into client mode, and
+ * the page's three resident global streams were opened under whatever gateway
+ * object was current AT LOAD TIME. Without a reload they stay unwrapped and
+ * the server's remote sessions never enter the merged sidebar lists.
+ *
+ * - A write that did not land, or a save that is not heading to `client`,
+ *   never reloads.
+ * - A host→client switch always reloads: the streams predate the interceptor.
+ * - An already-client page reloads only when the diagnostics say the
+ *   interceptor was NOT yet active (`streamInterceptAlreadyActive === false`).
+ *   `undefined` — an older server that answers no diagnostics — is UNKNOWN and
+ *   stays on the safe no-reload side (a re-pairing must not needlessly reload).
+ */
+export interface ClientActivationReloadInput {
+    /** Whether the page was ALREADY an effective client before this operation. */
+    wasEffectiveClient: boolean;
+    /** Whether the role after the operation is (or is switching to) client. */
+    nowClientRole: boolean;
+    /** Whether this operation actually landed (the save / pairing write). */
+    savedOrPaired: boolean;
+    /** The client/status diagnostics' interceptor flag before the operation
+     * (derived by the caller); `undefined` when unknown. */
+    streamInterceptAlreadyActive?: boolean;
+}
+export declare function shouldReloadAfterClientActivation(input: ClientActivationReloadInput): boolean;
+/**
+ * Poll {@link CLIENT_STATUS_ROUTE} until the backend answers ok — the bounded
+ * wait before the post-activation reload, covering the restart-watcher's row
+ * reload window (the route 404s / fails while the row restarts). Resolves
+ * after `maxMs` regardless, so the reload always fires. Injectable fetch and
+ * timings keep the check script fast; defaults are the page's 3 s / 250 ms.
+ */
+export declare function awaitClientStatusReady(fetchFn?: typeof fetch, maxMs?: number, intervalMs?: number): Promise<void>;
+/**
  * Latest-wins sequencing for the status loads: every request takes a ticket,
  * and only the newest ticket may still apply its result. An earlier request
  * that answers LATE is dropped, so a stale body can never overwrite a fresh

@@ -33,11 +33,13 @@ import {
   CLIENT_CONFIG_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
+  awaitClientStatusReady,
   claimDeviceNameOf,
   clientStatusLineOf,
   deriveClientStatusView,
   deriveSettingsView,
   normalizePairingCode,
+  shouldReloadAfterClientActivation,
 } from '../../client-data/settings-form.ts'
 import { qrMatrix } from '../../client-data/qr.ts'
 import {
@@ -761,6 +763,12 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const runClientClaim = async (): Promise<void> => {
     setFormError(null)
     setClientClaimFail(null)
+    // UX-1: the facts that decide the post-pairing reload — whether the page
+    // opened as an already-effective client, and whether the backend's
+    // stream interceptor was already active (from the last client/status
+    // diagnostics). Captured BEFORE the role switch and the claim below.
+    const wasEffectiveClient = effectiveClient
+    const streamInterceptAlreadyActive = clientView?.intercept?.installed === true
     const trimmedUrl = clientServerUrl.trim()
     const normalizedCode = normalizePairingCode(clientPairCode)
     if (trimmedUrl === '' || !/^https?:\/\//i.test(trimmedUrl)) {
@@ -801,7 +809,21 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       if (body?.ok === true && typeof body.token === 'string' && body.token !== '') {
         const urlToWrite = typeof body.serverUrl === 'string' && body.serverUrl !== '' ? body.serverUrl : trimmedUrl
         const echoed = typeof body.deviceName === 'string' && body.deviceName.trim() !== '' ? body.deviceName.trim() : deviceName
-        await config.writeClientPairing(urlToWrite, body.token, echoed)
+        const landed = await config.writeClientPairing(urlToWrite, body.token, echoed)
+        if (landed && shouldReloadAfterClientActivation({
+          wasEffectiveClient,
+          nowClientRole: true,
+          savedOrPaired: true,
+          streamInterceptAlreadyActive,
+        })) {
+          // UX-1: this was the FIRST client activation while the page's three
+          // resident global streams were opened unwrapped — wait out the
+          // backend's row-reload window, then reload so the streams reopen
+          // wrapped and the server's shared sessions enter the sidebar.
+          await awaitClientStatusReady()
+          window.location.reload()
+          return
+        }
         setClientPairCode('')
         await loadClientStatus()
         setStep('verify')

@@ -433,6 +433,63 @@ export function shouldFollowServerDeviceName(deviceName: string, rowName: string
   return deviceName !== '' && deviceName !== rowName && !hasDraft
 }
 
+// --- UX-1: reload after the FIRST client activation ---------------------------
+
+/**
+ * Whether one successful client-side activation (a staged-save role switch, a
+ * first pairing) needs a page reload: the backend's restart-watcher only
+ * installs the stream interceptor when the row reloads into client mode, and
+ * the page's three resident global streams were opened under whatever gateway
+ * object was current AT LOAD TIME. Without a reload they stay unwrapped and
+ * the server's remote sessions never enter the merged sidebar lists.
+ *
+ * - A write that did not land, or a save that is not heading to `client`,
+ *   never reloads.
+ * - A host→client switch always reloads: the streams predate the interceptor.
+ * - An already-client page reloads only when the diagnostics say the
+ *   interceptor was NOT yet active (`streamInterceptAlreadyActive === false`).
+ *   `undefined` — an older server that answers no diagnostics — is UNKNOWN and
+ *   stays on the safe no-reload side (a re-pairing must not needlessly reload).
+ */
+export interface ClientActivationReloadInput {
+  /** Whether the page was ALREADY an effective client before this operation. */
+  wasEffectiveClient: boolean
+  /** Whether the role after the operation is (or is switching to) client. */
+  nowClientRole: boolean
+  /** Whether this operation actually landed (the save / pairing write). */
+  savedOrPaired: boolean
+  /** The client/status diagnostics' interceptor flag before the operation
+   * (derived by the caller); `undefined` when unknown. */
+  streamInterceptAlreadyActive?: boolean
+}
+
+export function shouldReloadAfterClientActivation(input: ClientActivationReloadInput): boolean {
+  if (!input.savedOrPaired || !input.nowClientRole) return false
+  if (!input.wasEffectiveClient) return true
+  if (input.streamInterceptAlreadyActive === false) return true
+  return false
+}
+
+/**
+ * Poll {@link CLIENT_STATUS_ROUTE} until the backend answers ok — the bounded
+ * wait before the post-activation reload, covering the restart-watcher's row
+ * reload window (the route 404s / fails while the row restarts). Resolves
+ * after `maxMs` regardless, so the reload always fires. Injectable fetch and
+ * timings keep the check script fast; defaults are the page's 3 s / 250 ms.
+ */
+export async function awaitClientStatusReady(fetchFn: typeof fetch = fetch, maxMs = 3000, intervalMs = 250): Promise<void> {
+  const deadline = Date.now() + maxMs
+  while (true) {
+    try {
+      if ((await fetchFn(CLIENT_STATUS_ROUTE)).ok) return
+    } catch {
+      // the row is mid-reload; keep polling
+    }
+    if (Date.now() >= deadline) return
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
+}
+
 /**
  * Latest-wins sequencing for the status loads: every request takes a ticket,
  * and only the newest ticket may still apply its result. An earlier request
