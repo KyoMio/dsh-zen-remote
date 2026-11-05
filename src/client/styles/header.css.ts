@@ -128,6 +128,14 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      instead of centered. Pinning the row makes it one 48px band again. */
   [data-phase] header [class$="_titleRow"] {
     position: relative;
+    /* UX-2 (2026-11-04): the host gives this row container-type: inline-size,
+       which implies layout containment — making the row the containing block
+       for every descendant position:fixed. That shifted every viewport
+       coordinate effects/native-trigger-overlay.ts writes by the safe-area
+       top and the row's horizontal padding. normal hands fixed descendants
+       back to the viewport; the phone block owns this layout, so nothing
+       scoped container queries against the row here. */
+    container-type: normal !important;
     display: grid;
     grid-template-columns: 92px 1fr 92px;
     grid-template-rows: minmax(48px, auto);
@@ -195,44 +203,23 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     min-width: 0;
     overflow: hidden;
   }
-  /* Subagent sessions keep ONE ancestor crumb (2026-08-18): the PC header
-     lets you tap the parent session's title to switch back — that affordance
-     was lost on phone when the whole parent chain was hidden as "多余项".
-     Show only the immediate parent (for agent-teams member sessions that IS
-     the captain/main session; deeper ancestors stay hidden — a 3-level chain
-     cannot fit the ~206px center column at 390px). The parent crumb is the
-     official breadcrumb <button> (dsh-client-ui-conversation renders
-     open(parentId) as its onClick), so tapping needs no JS from this plugin,
-     and main sessions (chain length 1) have no :nth-last-child(2) seg at
-     all — the centered single title is pixel-identical to before. */
-  [data-phase] header [class$="_crumbSeg"]:not(:nth-last-child(-n+2)) {
+  /* Subagent sessions hide every ancestor crumb (UX-2, 2026-11-04 —
+     supersedes the 2026-08-18 "keep ONE ancestor" rule). DSH 0.2.1 turned
+     the parent crumb into a session-TREE popup trigger
+     (…_switcherTrigger[aria-haspopup="tree"]) instead of a direct
+     switch-back tap, and that popup is desktop geometry on the phone; the
+     back button and the home stack stay the way back. Main sessions render
+     a single span with no segs at all, so :not(:last-child) never matches
+     there. */
+  [data-phase] header [class$="_crumbSeg"]:not(:last-child) {
     display: none !important;
   }
-  [data-phase] header [class$="_crumbSeg"]:nth-last-child(2) {
-    display: inline-flex;
-    align-items: center;
-    flex: none;
-    min-width: 0;
-    max-width: 38%;
-  }
-  /* Ancestors BEFORE the parent seg are hidden, which would leave the
-     parent seg's own leading "/" dangling at the start of the title. */
-  [data-phase] header [class$="_crumbSeg"]:nth-last-child(2) [class$="_crumbSep"] {
+  /* With the parent seg gone, the current seg's own leading "/" would
+     dangle before the title; the dissolved trigger container's stray
+     separator is covered by this same rule (its slot rules below hide it
+     too). One blanket rule instead of per-segment cases. */
+  [data-phase] header [class$="_crumbSep"] {
     display: none !important;
-  }
-  /* Parent crumb: small tertiary text so the 19px current title stays the
-     visual anchor; min-height keeps a finger-sized target inside the 48px
-     row. Specificity (0,4,1) outranks the shared 19px _crumb rule below. */
-  [data-phase] header [class$="_crumbSeg"]:nth-last-child(2) [class$="_crumb"] {
-    font-size: 13px;
-    font-weight: 400;
-    color: var(--dsw-alias-label-tertiary, rgba(0, 0, 0, .45));
-    min-height: 44px;
-    display: inline-flex;
-    align-items: center;
-    padding: 0 2px 0 6px;
-    touch-action: manipulation;
-    -webkit-tap-highlight-color: transparent;
   }
   [data-phase] header [class$="_crumbSeg"]:last-child {
     display: flex;
@@ -240,10 +227,6 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     min-width: 0;
     max-width: 100%;
   }
-  /* The last seg's own "/" is the divider between parent and current title —
-     it only exists when there IS an ancestor (index > 0), so it can simply
-     stay visible now that the parent seg shows. (It used to be hidden here:
-     with the parent hidden it dangled before the title.) */
   /* BOTH selectors are required: [class$=] matches the whole class
      ATTRIBUTE's suffix, and the current-session title button's attribute is
      "wSkVaW_crumb wSkVaW_crumbCurrent" — it ends in _crumbCurrent, so the _crumb
@@ -353,12 +336,17 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      pointer-events on the trigger: that is exactly what would take the tap
      target away again.
 
-     CSS keeps only two chores. Dissolve the root so its box (and its
-     stray separator, hidden below) stops occupying the breadcrumb, and let
-     the trigger participate from wherever the overlay pins it. And no menu
-     re-anchoring anymore: the 0.1.1 popover portals to <body> as
-     position:fixed and positions itself from the trigger's viewport rect
-     (measured 336px wide, fully on screen at 411px). */
+     CSS keeps only the resting dissolve: the root's box (and its stray
+     separator, hidden below) stops occupying the breadcrumb until the
+     overlay pins it. The measurement chore moved to the overlay (UX-2,
+     2026-11-04): the 0.1.1+ popover portals to <body> as position:fixed
+     and sizes itself from the OUTER anchor container (the official
+     rootRef, the trigger's parent div) — a display:contents root has no
+     box, so rootRef.getBoundingClientRect() was all zeros and the panel
+     landed at 12,12 inside the status bar. effects/
+     native-trigger-overlay.ts now pins container + trigger to the pill's
+     rect together (its inline display beats this rule's !important, style
+     attribute outranks selectors at author-important). */
   [data-phase] header [data-slot="conversation.session.header.actions"] > *:has(> button[class$="_trigger"]),
   [data-phase] header [data-slot="conversation.session.header.lineage"] > *:has(> button[class$="_trigger"]) {
     display: contents !important;
@@ -366,6 +354,18 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   [data-phase] header [data-slot="conversation.session.header.actions"] [class$="_separator"],
   [data-phase] header [data-slot="conversation.session.header.lineage"] [class$="_separator"] {
     display: none !important;
+  }
+  /* The popovers themselves portal to <body> as position:fixed layers
+     (class suffix _menu, z-index 100) and place themselves from the pill's
+     viewport rect with margin 12 — the overlay above is what makes that
+     rect correct. This is only a floor: the panels' 336px width overflows
+     320px-class phones, and a tall list must not run under the notch or
+     the home indicator. [id$="-menu"] keeps the composer's model menu out
+     of it — composer.css.ts owns that surface, and this file sits before
+     it in styles/index.ts so its own rules still win the tie. */
+  body > [class$="_menu"]:not([id$="-menu"]) {
+    max-width: calc(100vw - 24px) !important;
+    max-height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 24px) !important;
   }
   /* The agent-preset mode badge specifically survives the blanket hide
      above: layout.css.ts's shared <=1023px block targets it directly

@@ -74,7 +74,13 @@ type ActivityState = 'running' | 'done' | 'warning'
  * the root through `:has()` instead of naming it.
  */
 const HEADER = '[data-phase] header'
-const SUBAGENT_TRIGGER = `${HEADER} button[aria-haspopup="tree"]`
+/* UX-2 (2026-11-04): narrowed by the action-button class tail. The bare
+   `button[aria-haspopup="tree"]` matched the breadcrumb's parent-session
+   switcher first (`…_switcherTrigger` — also a tree popup), so both the
+   overlay and this fallback check resolved to the wrong button. The suffix
+   matcher is case-sensitive and `_switcherTrigger` does not end in
+   `_trigger`. Must stay in lockstep with effects/native-trigger-overlay.ts. */
+const SUBAGENT_TRIGGER = `${HEADER} button[class$="_trigger"][aria-haspopup="tree"]`
 const JOBS_TRIGGER = `${HEADER} button[class$="_trigger"]:not([aria-haspopup])`
 
 /** One glanceable group: icon + count + state dot; opens the official popover. */
