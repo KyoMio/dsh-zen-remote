@@ -31,6 +31,7 @@ const PLUGIN_SOURCES = [
   '/tmp/bs-versions/0.28.0/lib/index.js',
   '/tmp/bs-versions/0.28.1/lib/index.js',
   '/tmp/bs-versions/0.28.2/lib/index.js',
+  '/tmp/bs-versions/0.30.0/lib/index.js',
 ]
 
 /** Scratch space for the server-side share store — OUTSIDE the repository
@@ -106,6 +107,7 @@ test('PB-18: extractBetterSidebarSurface is deterministic and groups the fixture
   assert.notEqual(digestOf('0.25.0'), digestOf('0.26.0'), '0.25.0 and 0.26.0 are different wire surfaces')
   assert.notEqual(digestOf('0.26.0'), digestOf('0.28.1'), '0.26.x and 0.28.1 are different wire surfaces')
   assert.notEqual(digestOf('0.28.0'), digestOf('0.28.1'), '0.28.0 and 0.28.1 are different wire surfaces (git.history)')
+  assert.notEqual(digestOf('0.28.2'), digestOf('0.30.0'), '0.28.2 and 0.30.0 are different wire surfaces (/sidebar/sidechat-image)')
   // And the empty-source tell: nothing healthy about a non-build.
   assert.equal(mod.surfaceLooksHealthy(mod.extractBetterSidebarSurface('')), false)
 })
@@ -143,7 +145,7 @@ test('PB-19: an unlisted version registers through its surface digest; a miss, a
   assert.equal(listed.digest, core.adapterDigestOf('dsh-better-sidebar', '0.25.0', listed.routes))
 })
 
-test('PB-19: every listed version hashes into the surfaces table; the table holds exactly the four generations', async () => {
+test('PB-19: every listed version hashes into the surfaces table; the table holds exactly the five generations', async () => {
   const absent = PLUGIN_SOURCES.filter((sourcePath) => !fs.existsSync(sourcePath))
   if (absent.length > 0) {
     test.skip(`plugin sources are not on this machine (${absent.join(', ')}); the surfaces-table check is skipped`)
@@ -160,7 +162,7 @@ test('PB-19: every listed version hashes into the surfaces table; the table hold
     computed.add(digest)
     assert.ok(raw.surfaces[digest] !== undefined, `${version}'s surface digest ${digest} is whitelisted as "${raw.surfaces[digest]}"`)
   }
-  assert.equal(computed.size, 4, 'the seven listed versions collapse to four distinct wire generations')
+  assert.equal(computed.size, 5, 'the eight listed versions collapse to five distinct wire generations')
   assert.deepEqual(Object.keys(raw.surfaces).sort(), [...computed].sort(), 'the table holds exactly those generations — nothing stale, nothing missing')
 })
 
@@ -181,8 +183,8 @@ test('PB-15: the 0.26.0 additions carry the right dispositions; both versions no
   // Both versions register: normalizeAdapter refuses an installed version
   // outside `versions`, so each list entry must normalize clean.
   const { adapter } = await loadAdapter()
-  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2'])
-  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2']) {
+  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0'])
+  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0']) {
     const core = await importLib('plugin-adapter-core.js')
     const adaptersMod = await importLib('adapters/index.js')
     const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
@@ -798,7 +800,7 @@ test('0.28.0-alpha.0 / 0.28.0: git.graph is a session-scoped read; changes.ops d
   }
 })
 
-test('PB-12: the upload route rides the shared relay budget; the api route keeps the plugin\u2019s own 1 MiB', async () => {
+test('PB-12: the upload route rides the shared relay budget; the api route admits the 0.30.0 image-prompt ceiling', async () => {
   // The upload cap no longer hand-copies the relay budget — the adapter
   // imports MAX_UPLOAD_BYTES from lib/upload-limits.js like everyone else,
   // so a "the two numbers move together" pair-pin would be a tautology and
@@ -810,7 +812,12 @@ test('PB-12: the upload route rides the shared relay budget; the api route keeps
   const upload = adapter.routes.find((route) => route.path === '/sidebar/upload')
   assert.equal(upload.maxBody, MAX_UPLOAD_BYTES)
   const api = adapter.routes.find((route) => route.path === '/sidebar/api')
-  assert.equal(api.maxBody, 1024 * 1024, 'the api body cap is the plugin\u2019s own 1 MiB')
+  assert.equal(api.maxBody, 1024 * 1024 + 4 * Math.ceil((20 * 1024 * 1024) / 3) + 32, 'the api body cap admits 0.30.0\u2019s image-prompt ceiling')
+  const image = adapter.routes.find((route) => route.path === '/sidebar/sidechat-image')
+  assert.ok(image !== undefined, '/sidebar/sidechat-image is declared (0.30.0)')
+  assert.equal(image.match, 'exact')
+  assert.deepEqual(image.methods, ['GET'])
+  assert.deepEqual(image.locator, { in: 'query', name: 'childId' })
 })
 
 // ---- PB-13: the two WebSockets and the sidechat loop ---------------------------

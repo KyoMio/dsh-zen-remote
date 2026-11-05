@@ -1,6 +1,6 @@
 /**
  * The dsh-better-sidebar adapter (PB-12), written against EXACTLY
- * versions 0.25.0, 0.26.0, 0.26.1, 0.28.0-alpha.0, 0.28.0, 0.28.1 and 0.28.2 (PB-15 widened the list; 0.26.1 is a
+ * versions 0.25.0, 0.26.0, 0.26.1, 0.28.0-alpha.0, 0.28.0, 0.28.1, 0.28.2 and 0.30.0 (PB-15 widened the list; 0.26.1 is a
  * perf-only patch with the same wire surface as 0.26.0; 0.26.0 is a JSON-api
  * superset of 0.25.0 — it grows fs.readPage and the sidechat dequeue/model/
  * models methods, and moves fs.write's content onto the new raw-text
@@ -42,6 +42,15 @@ import { SIDEBAR_METHODS, sidebarMethodNameOf } from './methods.js'
  * backend would accept anyway. */
 const SIDEBAR_MAX_BODY_BYTES = 1024 * 1024
 
+/** 0.30.0: a `sidechat.prompt` carrying images reads its body under
+ * `sidechatPromptBodyLimit` (lib/index.js:7004) — 1 MiB of metadata plus the
+ * base64 of at most SIDECHAT_MAX_MESSAGE_IMAGE_BYTES = 20 MiB of images and
+ * 4 bytes per image (≤ 8). Every other method keeps the plugin's own 1 MiB
+ * (`readJsonBody`'s default), so the route cap only has to admit this one
+ * ceiling; the backend still enforces the per-method limit itself. */
+const SIDEBAR_IMAGE_PROMPT_MAX_BODY_BYTES =
+  SIDEBAR_MAX_BODY_BYTES + 4 * Math.ceil((20 * 1024 * 1024) / 3) + 4 * 8
+
 /** The method name out of a `/sidebar/api/*` pathname, or `''`. */
 const apiMethodOf = (pathname: string): string => sidebarMethodNameOf(pathname) ?? ''
 
@@ -70,7 +79,13 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
   // full-log `sessionQuery.observeSession`, then the host defaultDirectory,
   // and only then a client `cwd` hint — so the server hook's cwd stripping
   // below stays correct (if anything, the client hint matters less).
-  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2'],
+  // 0.30.0 (DSH 0.2.2-rc.1+): same JSON-api method set and WebSockets; one
+  // new EXACT GET route, `/sidebar/sidechat-image?childId&messageId&blockIndex`
+  // (lib/index.js:9869-9896), which streams a saved side-chat image — bridged
+  // below on its `childId`. `sidechat.prompt` grows an `images` array (base64,
+  // up to ~27.7 MiB body) — the api route cap widens to that. GenUI, quote
+  // chips and editor draft backup are client-only (no new host routes).
+  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0'],
   // PB-19 (ADR-0003): the wire-surface whitelist. Keys are digest16 over the
   // PB-18 extractor's reduction (`surface.ts` beside this file) of the npm
   // builds' lib/index.js, computed off /tmp/bs-versions/{version}/lib/index.js:
@@ -78,6 +93,7 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
   //   96465143373a31a7 — the 0.26.0 generation (0.26.1 hashes identically)
   //   6ed29a896101e681 — the 0.28.0 generation (0.28.0-alpha.0 identically)
   //   65a0acaeb56f87d9 — the 0.28.1 generation (0.28.2 identically)
+  //   394de9f588d37092 — the 0.30.0 generation (+ /sidebar/sidechat-image)
   // An installed version outside `versions` still registers when its build
   // hashes into one of these (a wire-identical patch release bridges without
   // a zen-remote release); anything else fails closed to the unlisted-version
@@ -88,6 +104,7 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
     '96465143373a31a7': 'the 0.26.0 generation (0.26.1 identical)',
     '6ed29a896101e681': 'the 0.28.0 generation (0.28.0-alpha.0 identical)',
     '65a0acaeb56f87d9': 'the 0.28.1 generation (0.28.2 identical)',
+    '394de9f588d37092': 'the 0.30.0 generation',
   },
   routes: [
     {
@@ -97,7 +114,7 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
       path: '/sidebar/api',
       match: 'prefix',
       methods: ['POST'],
-      maxBody: SIDEBAR_MAX_BODY_BYTES,
+      maxBody: SIDEBAR_IMAGE_PROMPT_MAX_BODY_BYTES,
       locator: { in: 'json-body', fields: ['sessionId', 'rootSessionId', 'childId'] },
       deny: ({ pathname, currentSessionId }) => {
         const name = apiMethodOf(pathname)
@@ -121,6 +138,9 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
     // claims the EXACT documented path — a sub-path (if a future version
     // grows one) stays local rather than being guessed at.
     { path: '/sidebar/file', match: 'exact', methods: ['GET'], locator: { in: 'query', name: 'sessionId' } },
+    // 0.30.0: a saved side-chat image (lib/index.js:9869-9896) — the child
+    // session id rides the query; the answer is raw image bytes with no ids.
+    { path: '/sidebar/sidechat-image', match: 'exact', methods: ['GET'], locator: { in: 'query', name: 'childId' } },
     // The archive download (lib/index.js:6949-6985).
     { path: '/sidebar/archive', match: 'exact', methods: ['GET'], locator: { in: 'query', name: 'sessionId' } },
     // The raw upload (lib/index.js:6905-6948): binary bytes, capped by the
