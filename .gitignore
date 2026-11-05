@@ -15,3 +15,6 @@ docs/push-policy.md
 
 # Share-image working tickets (local, not shipped)
 .scratch/
+
+# Per-order planning notes (super-marshal worktrees; not shipped)
+tasks/

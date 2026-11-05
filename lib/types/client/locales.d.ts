@@ -11,6 +11,7 @@ export declare const zh: {
     readonly previewExitFullscreen: "退出全屏";
     readonly allWorkspaces: "全部";
     readonly switchWorkspace: "切换工作区";
+    readonly pickWorkspaceNew: "选择工作区开始";
     readonly newSession: "新建会话";
     readonly noSessions: "暂无会话，点击右下角加号新建";
     readonly homeStatusOngoing: "运行中";
