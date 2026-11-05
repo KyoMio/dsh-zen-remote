@@ -26,38 +26,73 @@ import type { ClientContext } from '../compat/types.ts'
 const PHONE = '(max-width: 767px)'
 const HEADER = '[data-phase] header'
 
-/** Pill → the official trigger it fronts. Same ARIA split the pills use. */
+/**
+ * Pill → the official trigger it fronts. Same ARIA split the pills use,
+ * narrowed by the action-button class tail (UX-2, 2026-11-04): the bare
+ * `button[aria-haspopup="tree"]` matched the breadcrumb's parent-session
+ * switcher first (`…_switcherTrigger` — also a tree popup, earlier in
+ * document order), so the pill got the wrong button laid over it. The
+ * suffix matcher is case-sensitive and `_switcherTrigger` does not end in
+ * `_trigger`, so the catalog trigger is the only match left.
+ */
 const PAIRS: ReadonlyArray<{ pill: string, trigger: string }> = [
-  { pill: '[data-activity-kind="subagent"]', trigger: `${HEADER} button[aria-haspopup="tree"]` },
+  { pill: '[data-activity-kind="subagent"]', trigger: `${HEADER} button[class$="_trigger"][aria-haspopup="tree"]` },
   { pill: '[data-activity-kind="job"]', trigger: `${HEADER} button[class$="_trigger"]:not([aria-haspopup])` },
 ]
 
-/** Marks a trigger we have taken over, so cleanup can find it again. */
+/** Marks a trigger (and its anchor container) we have taken over, so cleanup can find them again. */
 const TAKEN = 'data-zen-overlay'
+
+/** The shared fixed-viewport box: exactly what the portalled popover measures against. */
+function pin(el: HTMLElement, r: { left: number, top: number, width: number, height: number }, display?: string): void {
+  el.style.setProperty('position', 'fixed', 'important')
+  el.style.setProperty('left', `${r.left}px`, 'important')
+  el.style.setProperty('top', `${r.top}px`, 'important')
+  el.style.setProperty('width', `${r.width}px`, 'important')
+  el.style.setProperty('height', `${r.height}px`, 'important')
+  el.style.setProperty('margin', '0', 'important')
+  el.style.setProperty('padding', '0', 'important')
+  el.style.setProperty('border', '0', 'important')
+  if (display !== undefined) el.style.setProperty('display', display, 'important')
+}
 
 function place(trigger: HTMLElement, pill: Element): void {
   const r = pill.getBoundingClientRect()
   if (r.width === 0 || r.height === 0) return
   trigger.setAttribute(TAKEN, '')
+  pin(trigger, r)
   // Fixed, not absolute: the header's containing block is not the pill's, and
   // fixed rects are exactly what the portalled popover measures against.
-  trigger.style.setProperty('position', 'fixed', 'important')
-  trigger.style.setProperty('left', `${r.left}px`, 'important')
-  trigger.style.setProperty('top', `${r.top}px`, 'important')
-  trigger.style.setProperty('width', `${r.width}px`, 'important')
-  trigger.style.setProperty('height', `${r.height}px`, 'important')
-  trigger.style.setProperty('margin', '0', 'important')
-  trigger.style.setProperty('padding', '0', 'important')
-  trigger.style.setProperty('border', '0', 'important')
   trigger.style.setProperty('opacity', '0', 'important')
   trigger.style.setProperty('overflow', 'hidden', 'important')
   trigger.style.setProperty('pointer-events', 'auto', 'important')
   trigger.style.setProperty('z-index', '3', 'important')
+  // The official popover (useAnchoredPosition) sizes itself from the OUTER
+  // anchor container — the trigger's parent div, the official rootRef — not
+  // the button. header.css.ts dissolves that container with
+  // display:contents, so its rect was all zeros and the panel landed at
+  // 12,12 inside the status bar (UX-2). Give the anchor the pill's exact
+  // box: the inline display beats the stylesheet's display:contents
+  // !important (the style attribute outranks selectors at author-important),
+  // so rootRef.getBoundingClientRect() finally sees the pill. pointer-events
+  // none keeps the invisible box from ever stealing a tap — the trigger
+  // child above it is the tappable one.
+  const anchor = trigger.parentElement
+  if (anchor !== null && anchor.closest(HEADER) !== null) {
+    anchor.setAttribute(TAKEN, '')
+    pin(anchor, r, 'block')
+    anchor.style.setProperty('pointer-events', 'none', 'important')
+  }
 }
 
 function release(trigger: HTMLElement): void {
   trigger.removeAttribute(TAKEN)
   trigger.style.cssText = ''
+  const anchor = trigger.parentElement
+  if (anchor !== null && anchor.hasAttribute(TAKEN)) {
+    anchor.removeAttribute(TAKEN)
+    anchor.style.cssText = ''
+  }
 }
 
 export function installNativeTriggerOverlay(ctx: ClientContext): void {
