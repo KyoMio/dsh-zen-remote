@@ -92,6 +92,31 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
     padding-top: var(--mnav-sat) !important;
     padding-bottom: var(--mnav-sab) !important;
   }
+  /* Right sidebar start/guide page (dsh-client-ui-sidebar-right GuideBody):
+     the host sets .Dv5QdW_tabBody { height: 100%; overflow: hidden } and
+     .F6Huca_guide { min-height: 100%; justify-content: center } with no
+     overflow-y. When many tab entries are registered (e.g. better-sidebar +
+     plugins), the centered flex column overflows equally out the top and
+     bottom of the locked 100%-height box — clipping the leading entries
+     ("文件", "Git") above y=0 with no way to scroll. Make the guide itself
+     the scroll container and replace justify-content:center with auto
+     margins on the first item and ::after so short lists stay centered
+     while long lists start cleanly at the top and scroll end-to-end. */
+  [data-sidebar-right-guide] {
+    flex: 1 1 0 !important;
+    min-height: 0 !important;
+    justify-content: flex-start !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    padding-top: 24px !important;
+    padding-bottom: 24px !important;
+  }
+  [data-sidebar-right-guide] > :first-child {
+    margin-top: auto !important;
+  }
+  [data-sidebar-right-guide]::after {
+    margin-bottom: auto !important;
+  }
 
   /* Expanded state (frame without data-sidebar-collapsed) slides the drawer in.
      The open state must be transform:none — NOT translateX(0): an identity

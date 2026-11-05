@@ -395,8 +395,12 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
     display: inline-flex !important;
   }
 
-  /* Back button: 44pt touch target, leftmost column. */
+  /* Back button: 44pt touch target, leftmost column.
+     order: -1 keeps it to the left of @deepseek-ai/dsh-experimental-client-ui-agent-team's
+     TeamAction ([data-team-action], registered into header.actions at order -20 with
+     default flex order 0). */
   [data-mobile-nav="header-back"] {
+    order: -1;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -412,6 +416,13 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
   }
   [data-mobile-nav="header-back"]:active {
     opacity: .6;
+  }
+  /* TeamAction's own stylesheet hides .XdyUwa_triggerLabel via
+     @container (width<=480px) against _titleRow's container-type: inline-size.
+     Shedding container-type on _titleRow above (UX-2) disabled that container
+     query, so hide the label explicitly on phone and keep only the icon. */
+  [data-phase] header [data-team-action] [class$="_triggerLabel"] {
+    display: none !important;
   }
 
   /* Info + workbench utility buttons, rightmost column. */
@@ -503,6 +514,7 @@ export const HEADER_CSS = `/* ---------- session header five-piece reflow (< 768
      top:100% lands both on the same 28px line. z-index puts it above the
      row it overlaps. */
   [data-mobile-nav="header-activity"] {
+    pointer-events: none;
     position: absolute;
     right: 0;
     top: 100%;

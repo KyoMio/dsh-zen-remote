@@ -76,12 +76,16 @@ function place(trigger: HTMLElement, pill: Element): void {
   // !important (the style attribute outranks selectors at author-important),
   // so rootRef.getBoundingClientRect() finally sees the pill. pointer-events
   // none keeps the invisible box from ever stealing a tap — the trigger
-  // child above it is the tappable one.
+  // child above it is the tappable one. z-index 3 is required on the anchor
+  // too: position:fixed unconditionally creates a stacking context (even at
+  // z-index:auto, stack level 0), which otherwise traps the trigger's own
+  // z-index:3 underneath [data-mobile-nav="header-activity"] (z-index:1).
   const anchor = trigger.parentElement
   if (anchor !== null && anchor.closest(HEADER) !== null) {
     anchor.setAttribute(TAKEN, '')
     pin(anchor, r, 'block')
     anchor.style.setProperty('pointer-events', 'none', 'important')
+    anchor.style.setProperty('z-index', '3', 'important')
   }
 }
 
