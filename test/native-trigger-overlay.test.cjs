@@ -192,6 +192,7 @@ async function bootOverlay({ phone }) {
 const OVERLAY_SRC = readFileSync(join(ROOT, 'src', 'client', 'effects', 'native-trigger-overlay.ts'), 'utf8')
 const HEADER_TSX = readFileSync(join(ROOT, 'src', 'client', 'MobileSessionHeader.tsx'), 'utf8')
 const HEADER_CSS = readFileSync(join(ROOT, 'src', 'client', 'styles', 'header.css.ts'), 'utf8')
+const LAYOUT_CSS = readFileSync(join(ROOT, 'src', 'client', 'styles', 'layout.css.ts'), 'utf8')
 const phone = HEADER_CSS.slice(HEADER_CSS.indexOf('@media (max-width: 767px)'))
 
 test('both the overlay and the fallback check use the class-tail tree selector', () => {
@@ -235,6 +236,7 @@ test('place() pins trigger AND anchor container to the pill rect', async () => {
       assertPinned(trigger, trigger.attrs.class)
       assertPinned(anchor, `${anchor.attrs.class} (anchor)`)
       assert.equal(anchor.style.props.get('display'), 'block !important', 'anchor display beats the stylesheet contents dissolve')
+      assert.equal(anchor.style.props.get('z-index'), '3 !important', 'anchor fixed stacking context must sit above header-activity (z-index: 1)')
       assert.equal(trigger.style.props.get('opacity'), '0 !important', 'trigger stays invisible')
       assert.equal(anchor.style.props.get('opacity'), undefined, 'the anchor needs no own opacity — its content is the hidden trigger')
     }
@@ -310,4 +312,23 @@ test('body-portalled header menus get a safe-area + max-width floor', () => {
   assert.match(rule[1], /max-width:\s*calc\(100vw - 24px\)\s*!important/, 'narrow phones must not clip the panel')
   assert.match(rule[1], /env\(safe-area-inset-top/, 'the panel must stay inside the top safe area')
   assert.match(rule[1], /env\(safe-area-inset-bottom/, 'the panel must clear the home indicator')
+})
+
+test('back button orders before agent-team trigger and agent-team label stays hidden on phone', () => {
+  const backRule = /(?:^|\n)\s*\[data-mobile-nav="header-back"\]\s*\{([^}]*)\}/.exec(phone)
+  assert.ok(backRule, 'header-back rule missing in phone block')
+  assert.match(backRule[1], /order:\s*-1\b/, 'header-back must sit to the left of [data-team-action]')
+  assert.match(
+    phone,
+    /\[data-phase\] header \[data-team-action\] \[class\$="_triggerLabel"\]\s*\{[^}]*display:\s*none\s*!important/,
+    'shedding container-type on _titleRow disables the host container query, so hide _triggerLabel explicitly',
+  )
+})
+
+test('right sidebar guide page scrolls vertically without clipping leading entries', () => {
+  const guideRule = /\[data-sidebar-right-guide\]\s*\{([^}]*)\}/.exec(LAYOUT_CSS)
+  assert.ok(guideRule, 'missing [data-sidebar-right-guide] rule in layout.css.ts')
+  assert.match(guideRule[1], /overflow-y:\s*auto\s*!important/, 'guide must scroll when tab entries overflow')
+  assert.match(guideRule[1], /justify-content:\s*flex-start\s*!important/, 'replace center alignment so top entries are not pushed above y=0')
+  assert.match(LAYOUT_CSS, /\[data-sidebar-right-guide\] > :first-child\s*\{[^}]*margin-top:\s*auto\s*!important/, 'short guide lists stay centered via auto margins')
 })
