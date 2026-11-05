@@ -42,6 +42,20 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
     padding-top: var(--mnav-sat) !important;
   }
 
+  /* DSH 0.2.2-rc.1+: AppFrame pins centerCol to grid-area: 1/2 (column 2,
+     which is 0px wide in our 1-column mobile grid) and inserts a
+     [data-sidebar-mask] div before sidebarCol when viewport < 768. Pin
+     centerCol to column 1 so it fills the 1fr track, hide the host mask
+     (MobileNavOverlay renders its own backdrop on tablet, and MobileHome
+     replaces the drawer on phone), and match sidebarCol by its stable class
+     suffix alongside :first-child. */
+  [data-mobile-nav="frame"] > [class$="_centerCol"] {
+    grid-area: 1 / 1 !important;
+  }
+  [data-mobile-nav="frame"] > [data-sidebar-mask] {
+    display: none !important;
+  }
+
   /* The sidebar column (first grid child) becomes a left drawer. The drawer
      hugs the sidebar content exactly (the wide sidebar carries an inline
      width, ~280px): a fixed 92vw box would leave a white strip where the
@@ -52,7 +66,8 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
      before) left 14px of the drawer plus a long 32px-blur shadow gradient
      visible along the left edge of the main UI. No box-shadow at all: the
      dimmed backdrop already separates drawer from content. */
-  [data-mobile-nav="frame"] > :first-child {
+  [data-mobile-nav="frame"] > :first-child,
+  [data-mobile-nav="frame"] > [class$="_sidebarCol"] {
     position: absolute !important;
     inset: 0 auto 0 0 !important;
     width: max-content !important;
@@ -127,7 +142,8 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
      overflow:hidden drawer to scrollLeft=102, and every static child (plus the
      fixed overlay) shifts 102px off-screen. With transform:none the overlay is
      viewport-anchored: it dims the full screen and the sheet sits at left:8. */
-  [data-mobile-nav="frame"]:not([data-sidebar-collapsed]) > :first-child {
+  [data-mobile-nav="frame"]:not([data-sidebar-collapsed]) > :first-child,
+  [data-mobile-nav="frame"]:not([data-sidebar-collapsed]) > [class$="_sidebarCol"] {
     transform: none !important;
   }
 

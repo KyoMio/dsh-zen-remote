@@ -5,6 +5,18 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 2.3.10（2026-11-06）
+
+### 修复
+
+- **适配 DSH 0.2.2-rc.1 移动端会话页空屏与首页设置按钮失灵**：DSH 0.2.2-rc.1 的
+  `AppFrame` 给主栏显式设置 `grid-area: 1/2`（落入移动端单列网格的 `0px` 第 2 列导致进入
+  会话一片空白），并在 `< 768px` 新增 `[data-sidebar-mask]`（作为首个子元素挤掉原先
+  `:first-child` 侧栏选择器）、`[data-shell-leading]` 左上角悬浮按钮与侧栏 `inert` /
+  `visibility: hidden`。现将主栏显式钉回第 1 列（`grid-area: 1 / 1`）、按稳定类名后缀
+  `[class$="_sidebarCol"]` 匹配侧栏并隐藏宿主遮罩与左上角悬浮按钮，同时在手机壳下剥离侧栏
+  `inert` 属性，恢复会话页正常渲染及首页设置按钮、底部芯片代点。
+
 ## 2.3.9（2026-11-05）
 
 ### 新增

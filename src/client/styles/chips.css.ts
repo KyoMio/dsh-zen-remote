@@ -55,12 +55,17 @@ export const CHIPS_CSS = `/* ---------- chips row + settings entry (S5) --------
      logoRow/newSession/regionArea at \`display: flex\`, which is only
      hidden from view by being fully underneath the usage-stats panel's
      opaque body, not by this rule. */
-  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) {
+  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay),
+  [data-mobile-nav="frame"] > [class$="_sidebarCol"]:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) {
     display: contents !important;
+    visibility: visible !important;
   }
   [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_logoRow"],
   [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_newSession"],
-  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_regionArea"] {
+  [data-mobile-nav="frame"] > :first-child:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_regionArea"],
+  [data-mobile-nav="frame"] > [class$="_sidebarCol"]:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_logoRow"],
+  [data-mobile-nav="frame"] > [class$="_sidebarCol"]:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_newSession"],
+  [data-mobile-nav="frame"] > [class$="_sidebarCol"]:has([aria-modal="true"], [data-usage-stats-panel], .dshst-overlay) [class$="_regionArea"] {
     display: none !important;
   }
 

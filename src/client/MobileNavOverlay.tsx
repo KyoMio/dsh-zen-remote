@@ -128,7 +128,9 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
       if (document.querySelector('[aria-modal="true"]') !== null) return
       const target = event.target as HTMLElement | null
       if (target === null) return
-      const drawer = document.querySelector<HTMLElement>('[data-mobile-nav="frame"] > :first-child')
+      const drawer = document.querySelector<HTMLElement>(
+        '[data-mobile-nav="frame"] > [class$="_sidebarCol"], [data-mobile-nav="frame"] > :first-child:not([data-sidebar-mask])',
+      )
       if (drawer === null || !drawer.contains(target)) return
       // A session row's own action buttons — the "Session actions" kebab
       // (delete / rename), revealed on hover / long-press — open an edit

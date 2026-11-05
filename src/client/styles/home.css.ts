@@ -72,8 +72,12 @@ export const HOME_CSS = `/* ---------- phone app shell (< 768px) ---------- */
 
   /* The official sidebar is no longer a drawer on a phone — the home screen
      replaced it. Hidden outright (not translated off-screen) so it cannot
-     capture taps or hold layout. */
-  [data-mobile-nav="frame"] > :first-child {
+     capture taps or hold layout. DSH 0.2.2-rc.1+ inserts [data-sidebar-mask]
+     before [class$="_sidebarCol"] and mounts [data-shell-leading] (the host's
+     own floating drawer opener) on < 768px; hide all three. */
+  [data-mobile-nav="frame"] > :first-child,
+  [data-mobile-nav="frame"] > [class$="_sidebarCol"],
+  [data-mobile-nav="frame"] > [data-shell-leading] {
     display: none !important;
   }
   /* The header's drawer toggle opened that sidebar; with it gone the button
