@@ -332,3 +332,28 @@ test('right sidebar guide page scrolls vertically without clipping leading entri
   assert.match(guideRule[1], /justify-content:\s*flex-start\s*!important/, 'replace center alignment so top entries are not pushed above y=0')
   assert.match(LAYOUT_CSS, /\[data-sidebar-right-guide\] > :first-child\s*\{[^}]*margin-top:\s*auto\s*!important/, 'short guide lists stay centered via auto margins')
 })
+
+test('DSH 0.2.2-rc.1 AppFrame: centerCol is pinned to column 1 and drawerMask/leadingSeat are handled', () => {
+  const { HOME_CSS } = require('../src/client/styles/home.css.ts')
+  const { CHIPS_CSS } = require('../src/client/styles/chips.css.ts')
+  assert.match(
+    LAYOUT_CSS,
+    /\[data-mobile-nav="frame"\] > \[class\$="_centerCol"\]\s*\{[^}]*grid-area:\s*1\s*\/\s*1\s*!important/,
+    '0.2.2-rc.1 sets .centerCol { grid-area: 1/2 }, which lands in our 0px 2nd track unless overridden to 1/1',
+  )
+  assert.match(
+    LAYOUT_CSS,
+    /\[data-mobile-nav="frame"\] > \[data-sidebar-mask\]\s*\{[^}]*display:\s*none\s*!important/,
+    '0.2.2-rc.1 inserts [data-sidebar-mask] before sidebarCol when < 768px',
+  )
+  assert.match(
+    HOME_CSS,
+    /\[data-mobile-nav="frame"\] > \[class\$="_sidebarCol"\][\s\S]*?\[data-mobile-nav="frame"\] > \[data-shell-leading\]\s*\{[^}]*display:\s*none\s*!important/,
+    'phone shell must hide [class$="_sidebarCol"] and [data-shell-leading] even when [data-sidebar-mask] is :first-child',
+  )
+  assert.match(
+    CHIPS_CSS,
+    /\[data-mobile-nav="frame"\] > \[class\$="_sidebarCol"\]:has\(\[aria-modal="true"\][\s\S]*?visibility:\s*visible\s*!important/,
+    'chips portal fix must match [class$="_sidebarCol"] and override 0.2.2-rc.1 visibility:hidden',
+  )
+})

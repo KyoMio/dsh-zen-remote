@@ -383,7 +383,25 @@ export function MobileHome({
       return
     }
     frame.setAttribute('data-mobile-view', view)
-    return () => frame.removeAttribute('data-mobile-view')
+    // DSH 0.2.2-rc.1+ puts `inert=""` on `[class$="_sidebarCol"]` while
+    // `drawer && sidebarCollapsed` (< 768px). Because home.css.ts already
+    // hides sidebarCol with `display: none !important`, `inert` is redundant
+    // for accessibility/tab order, but per HTML spec an `inert` ancestor
+    // suppresses synthetic `.click()` (breaking openSettings and harvested
+    // sidebar-footer chips) and blocks pointer events inside non-portal
+    // sidebar dialogs. Strip it and keep it stripped while the phone shell
+    // owns the viewport.
+    const sidebarCol = frame.querySelector<HTMLElement>(':scope > [class$="_sidebarCol"]')
+    const clearInert = (): void => {
+      if (sidebarCol?.hasAttribute('inert')) sidebarCol.removeAttribute('inert')
+    }
+    clearInert()
+    const observer = sidebarCol ? new MutationObserver(clearInert) : null
+    observer?.observe(sidebarCol!, { attributes: true, attributeFilter: ['inert'] })
+    return () => {
+      observer?.disconnect()
+      frame.removeAttribute('data-mobile-view')
+    }
   }, [phone, view])
 
   const enter = (start: () => void): void => {
