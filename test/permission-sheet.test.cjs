@@ -38,14 +38,23 @@ const css = readFileSync(join(ROOT, 'src', 'client', 'styles', 'composer.css.ts'
 const sheet = css.slice(css.indexOf('export const COMPOSER_CSS'))
 
 const PORTAL_RULE = 'body > div[role="menu"][data-zen-sheet="perm"]'
+// UX-3: the hero workspace menu gets its own marker value so a pick inside
+// it can start the switch lock without ever touching permission options.
+const WS_RULE = 'body > div[role="menu"][data-zen-sheet="workspace"]'
 
 // -- the stylesheet ------------------------------------------------------------
 
 test('T70 css: the portaled permission menu joins the bottom-sheet rule, the row rule and the :has gate', () => {
-  // All three section-4/4a rules name the portal form.
+  // All three section-4/4a rules name the portal forms; the workspace
+  // selector sits right beside the model menu (a comment separates it from
+  // the perm line).
   assert.ok(
-    sheet.includes(`${PORTAL_RULE},\n  ${'${MODEL_MENU}'} {\n    position: fixed !important;`),
-    'the portal menu sits in the bottom-sheet rule beside the model menu',
+    sheet.includes(`${WS_RULE},\n  ${'${MODEL_MENU}'} {\n    position: fixed !important;`),
+    'the workspace sheet sits in the bottom-sheet rule beside the model menu',
+  )
+  assert.ok(
+    sheet.includes(`${PORTAL_RULE},`) && sheet.indexOf(PORTAL_RULE) < sheet.indexOf(WS_RULE),
+    'the permission portal stays in the same rule, ahead of the workspace one',
   )
   assert.ok(
     sheet.includes(`${PORTAL_RULE} [role="menuitem"],`),
@@ -74,10 +83,32 @@ test('T70 css: the portal rules live inside the PHONE media block only', () => {
   assert.notEqual(blockStart, -1, 'the phone media block exists')
   const blockEnd = sheet.indexOf('\n}\n', blockStart)
   assert.notEqual(blockEnd, -1, 'the media block closes')
-  for (const needle of [PORTAL_RULE, 'body:has(> div[role="menu"][data-zen-sheet="perm"])']) {
+  for (const needle of [
+    PORTAL_RULE,
+    WS_RULE,
+    'body:has(> div[role="menu"][data-zen-sheet="perm"])',
+    'body:has(> div[role="menu"][data-zen-sheet="workspace"])',
+    'html[data-zen-ws-switching] [data-slot="conversation.composer.bar"]',
+  ]) {
     const at = sheet.indexOf(needle, blockStart)
     assert.ok(at !== -1 && at < blockEnd, `${needle} sits inside the phone media block`)
   }
+})
+
+test('UX-3 css: the workspace sheet gets the same row treatment as the permission sheet', () => {
+  assert.ok(sheet.includes(`${WS_RULE} [role="menuitem"],`), 'the workspace sheet rows get the 44pt+ treatment')
+  assert.ok(
+    sheet.includes('body:has(> div[role="menu"][data-zen-sheet="workspace"]) [data-chat-flow] + div'),
+    'the jump-to-latest :has() gate also matches the workspace sheet',
+  )
+})
+
+test('UX-3 css: the switch lock dead-zones and dims the composer inside the phone block', () => {
+  const at = sheet.indexOf('html[data-zen-ws-switching] [data-slot="conversation.composer.bar"] {')
+  assert.notEqual(at, -1, 'the lock rule exists')
+  const block = sheet.slice(at, at + 240)
+  assert.ok(block.includes('pointer-events: none !important;'), 'the composer cannot be tapped while switching')
+  assert.ok(block.includes('opacity: .6 !important;'), 'the lock reads as a visible dim, not a silent freeze')
 })
 
 // -- the marking decisions (pure, structural candidates) ------------------------
@@ -105,14 +136,76 @@ test('T70 effect: an unmarked body-level portal menu is markable; a marked one i
 })
 
 test('T70 effect: only a phone-shell click inside the permission trigger arms the window', async () => {
-  const { clickArmsPermissionSheet } = await loadEffect()
+  const { sheetKindForTrigger } = await loadEffect()
   const trigger = candidate({ closest: (selectors) => (selectors.includes('permission') ? {} : null) })
   const other = candidate({ closest: () => null })
 
-  assert.equal(clickArmsPermissionSheet(trigger, true), true, 'the trigger click arms')
-  assert.equal(clickArmsPermissionSheet(other, true), false, 'any other button never arms — its menus stay unmarked')
-  assert.equal(clickArmsPermissionSheet(null, true), false, 'a text-node/absent target never arms')
-  assert.equal(clickArmsPermissionSheet(trigger, false), false, 'the desktop shell never arms — no sheet marking there')
+  assert.equal(sheetKindForTrigger(trigger, true), 'perm', 'the permission trigger click arms as perm')
+  assert.equal(sheetKindForTrigger(other, true), null, 'any other button never arms — its menus stay unmarked')
+  assert.equal(sheetKindForTrigger(null, true), null, 'a text-node/absent target never arms')
+  assert.equal(sheetKindForTrigger(trigger, false), null, 'the desktop shell never arms — no sheet marking there')
+})
+
+test('UX-3 effect: the hero workspace triggers arm as workspace sheets', async () => {
+  const { sheetKindForTrigger } = await loadEffect()
+  const chip = candidate({ closest: (s) => (s.includes('aria-haspopup="menu"]') ? {} : null) })
+  const card = candidate({ closest: (s) => (s.includes('cardWorkspaceTrigger') ? {} : null) })
+
+  assert.equal(sheetKindForTrigger(chip, true), 'workspace', 'the hero WorkspaceChip arms the workspace sheet')
+  assert.equal(sheetKindForTrigger(card, true), 'workspace', 'the placeholder card trigger arms the workspace sheet')
+  assert.equal(sheetKindForTrigger(chip, false), null, 'desktop keeps the floating menu')
+})
+
+test('UX-3 effect: pointerdown lands on a workspace trigger only', async () => {
+  const { pointerdownOnWorkspaceTrigger } = await loadEffect()
+  const chip = candidate({ closest: (s) => (s.includes('aria-haspopup="menu"]') ? {} : null) })
+  const card = candidate({ closest: (s) => (s.includes('cardWorkspaceTrigger') ? {} : null) })
+  const perm = candidate({ closest: (s) => (s.includes('permission') ? {} : null) })
+  const other = candidate({ closest: () => null })
+
+  assert.equal(pointerdownOnWorkspaceTrigger(chip), true, 'the chip is a toggle-race trigger')
+  assert.equal(pointerdownOnWorkspaceTrigger(card), true, 'the placeholder card is too')
+  assert.equal(pointerdownOnWorkspaceTrigger(perm), false, 'the permission trigger toggles by click alone — never suppressed')
+  assert.equal(pointerdownOnWorkspaceTrigger(other), false)
+  assert.equal(pointerdownOnWorkspaceTrigger(null), false)
+})
+
+test('UX-3 effect: a menuitem click inside the marked WORKSPACE sheet starts the switch', async () => {
+  const { menuitemClickStartsWorkspaceSwitch } = await loadEffect()
+  const wsItem = candidate({ closest: (s) => (s.includes('menuitem') ? {} : null) })
+
+  assert.equal(menuitemClickStartsWorkspaceSwitch(wsItem), true, 'a workspace pick starts the lock')
+  assert.equal(menuitemClickStartsWorkspaceSwitch(candidate({ closest: () => null })), false, 'clicks outside the sheet never do')
+  assert.equal(menuitemClickStartsWorkspaceSwitch(null), false)
+  // The lock keys on the WORKSPACE marker, never on a bare menu item: pin
+  // the discriminating selector text so a permission option can never lock
+  // the composer.
+  const source = readFileSync(join(ROOT, 'src', 'client', 'effects', 'permission-sheet.ts'), 'utf8')
+  assert.ok(
+    source.includes('data-zen-sheet="workspace"] button[role="menuitem"]'),
+    'the lock selector names the marked workspace sheet',
+  )
+})
+
+test('UX-3 effect: the switch releases when the session moved and the placeholder is gone', async () => {
+  const { workspaceSwitchSettled } = await loadEffect()
+  const probe = (session, placeholder) => ({
+    currentSessionValue: () => session,
+    placeholderOpen: () => placeholder,
+  })
+
+  assert.equal(workspaceSwitchSettled(probe('S2', false), 'S1'), true, 'the new session mounted and the picker card is gone')
+  assert.equal(workspaceSwitchSettled(probe('S1', false), 'S1'), false, 'same session id — selectWorkspace no-oped, keep waiting')
+  assert.equal(workspaceSwitchSettled(probe('S2', true), 'S1'), false, 'the placeholder card is still up — the workspace is not chosen yet')
+})
+
+test('UX-3 action: decideNewSessionAction starts pinned/auto-single/none and defers the multi pick', async () => {
+  const { decideNewSessionAction } = await import('../src/client-data/new-session.ts?' + Math.random())
+
+  assert.deepEqual(decideNewSessionAction('w1', ['w1', 'w2']), { kind: 'start', workspaceId: 'w1' }, 'a selected workspace starts directly')
+  assert.deepEqual(decideNewSessionAction(undefined, []), { kind: 'start', workspaceId: undefined }, 'no workspaces at all — nothing to pick')
+  assert.deepEqual(decideNewSessionAction(undefined, ['only']), { kind: 'start', workspaceId: 'only' }, 'exactly one workspace auto-starts')
+  assert.deepEqual(decideNewSessionAction(undefined, ['a', 'b']), { kind: 'pick-workspace' }, 'several workspaces and none selected — open the drawer')
 })
 
 // -- the install (textual: the observer needs a DOM Node has none of) ----------
@@ -126,10 +219,12 @@ test('T70 effect: the install watches body childList, exits early when unarmed, 
   assert.ok(source.includes('if (!armed) return'), 'an unarmed window never marks')
   // The mark itself goes through the pure decision + the one attribute.
   assert.ok(source.includes('isUnmarkedPortalMenu(node)'), 'added nodes go through the pure decision')
-  assert.ok(source.includes("root.setAttribute(SHEET_MARKER, SHEET_VALUE)"), 'the marker lands as an attribute')
-  // Teardown stops both listeners.
+  assert.ok(source.includes('root.setAttribute(SHEET_MARKER, armedKind)'), 'the marker lands as an attribute (perm or workspace)')
+  // Teardown stops both listeners and the switch lock.
   assert.ok(source.includes("removeEventListener('click', onCaptureClick, true)"), 'the capture click listener is removed')
+  assert.ok(source.includes("removeEventListener('pointerdown', onCapturePointerDown, true)"), 'the capture pointerdown listener is removed')
   assert.ok(source.includes('observer.disconnect()'), 'the observer disconnects')
+  assert.ok(source.includes('releaseLock()'), 'teardown releases the switch lock')
 })
 
 // -- the install, behaviorally (fake Element/window/document/MutationObserver) --
@@ -137,12 +232,22 @@ test('T70 effect: the install watches body childList, exits early when unarmed, 
 /**
  * A minimal DOM simulation good enough to run the REAL installPermissionSheet
  * (the same shape the review's t70review-sim.mjs used): Element with
- * matches/get/setAttribute/closest, a click-listener trap on document, a
- * manual MutationObserver callback, and a querySelector that answers the
- * guard's one question — is a MARKED menu still on the page?
+ * matches/get/set/removeAttribute/closest, click+pointerdown-listener traps
+ * on document, a documentElement carrying the switch-lock marker, a
+ * querySelector that answers the four lookups the effect makes (marked menu?
+ * current session? placeholder card?), and MutationObserver instances kept
+ * in install order (0 = the arming observer, 1 = the lazy switch-lock
+ * observer that only exists after a workspace pick).
  */
-async function bootSim() {
-  const state = { clickListener: undefined, moCallback: undefined, menus: [] }
+async function bootSim({ session = null, placeholder = false } = {}) {
+  const state = {
+    clickListener: undefined,
+    pointerdownListener: undefined,
+    observers: [],
+    menus: [],
+    sessionNode: null,
+    placeholderOpen: placeholder,
+  }
   class FakeElement {
     constructor(kind) {
       this.kind = kind
@@ -151,38 +256,92 @@ async function bootSim() {
     matches(selectors) { return selectors === 'body > div[role="menu"]' && this.kind === 'menu' }
     getAttribute(name) { return this.attrs[name] ?? null }
     setAttribute(name, value) { this.attrs[name] = value }
-    closest(selectors) { return this.kind === 'permTrigger' && selectors.includes('permission') ? this : null }
+    removeAttribute(name) { delete this.attrs[name] }
+    closest(selectors) {
+      if (selectors.includes('permission')) return this.kind === 'permTrigger' ? this : null
+      if (selectors.includes('menuitem')) return this.kind === 'wsMenuitem' ? this : null
+      // The workspace selector is a comma list — mirror real closest()
+      // semantics: the element matches if EITHER alternative matches it.
+      if (selectors.includes('aria-haspopup="menu"]') && this.kind === 'wsChip') return this
+      if (selectors.includes('cardWorkspaceTrigger') && this.kind === 'wsCard') return this
+      return null
+    }
   }
   globalThis.Element = FakeElement
   globalThis.window = { matchMedia: () => ({ matches: true }) }
+  const html = new FakeElement('html')
   globalThis.document = {
+    documentElement: html,
     body: {},
-    addEventListener: (type, fn) => { if (type === 'click') state.clickListener = fn },
-    removeEventListener: (type, fn) => { if (state.clickListener === fn) state.clickListener = undefined },
-    querySelector: () => state.menus.find((menu) => menu.attrs['data-zen-sheet'] === 'perm') ?? null,
+    addEventListener: (type, fn) => {
+      if (type === 'click') state.clickListener = fn
+      if (type === 'pointerdown') state.pointerdownListener = fn
+    },
+    removeEventListener: (type, fn) => {
+      if (state.clickListener === fn) state.clickListener = undefined
+      if (state.pointerdownListener === fn) state.pointerdownListener = undefined
+    },
+    querySelector: (selectors) => {
+      if (selectors.includes('data-zen-sheet')) {
+        return state.menus.find((menu) => menu.attrs['data-zen-sheet'] != null) ?? null
+      }
+      if (selectors.includes('data-conversation-session')) return state.sessionNode
+      if (selectors.includes('_cardWorkspaceTrigger')) return state.placeholderOpen ? new FakeElement('placeholderCard') : null
+      return null
+    },
   }
   globalThis.MutationObserver = class {
-    constructor(cb) { state.moCallback = cb }
-    observe() { /* the test drives the callback by hand */ }
-    disconnect() { state.moCallback = undefined }
+    constructor(cb) { this.cb = cb; state.observers.push(this) }
+    observe() { this.observing = true }
+    disconnect() { this.observing = false }
+  }
+  if (session !== null) {
+    state.sessionNode = new FakeElement('session')
+    state.sessionNode.attrs['data-conversation-session'] = session
   }
   const mod = await loadEffect()
   let stop
   mod.installPermissionSheet({ effect: (fn) => { stop = fn() } })
-  const trigger = new FakeElement('permTrigger')
+  const permTrigger = new FakeElement('permTrigger')
+  const wsChip = new FakeElement('wsChip')
+  const wsCard = new FakeElement('wsCard')
   return {
-    trigger,
-    tapTrigger() {
+    state,
+    el: (kind) => new FakeElement(kind),
+    html,
+    permTrigger,
+    wsChip,
+    wsCard,
+    click(target) {
+      const event = {
+        target,
+        prevented: false,
+        stopped: false,
+        preventDefault() { this.prevented = true },
+        stopPropagation() { this.stopped = true },
+      }
       // After an uninstall the listener is gone: the click lands nowhere.
-      state.clickListener?.({ target: trigger })
+      state.clickListener?.(event)
+      return event
     },
+    pointerdown(target) {
+      state.pointerdownListener?.({ target })
+    },
+    // Sugar for the T70 tests: a plain tap on the permission trigger.
+    tapTrigger() { this.click(permTrigger) },
     addMenu() {
       const menu = new FakeElement('menu')
       state.menus.push(menu)
       // After an uninstall the observer is disconnected: the DOM changes
       // but nothing is told about it.
-      state.moCallback?.([{ addedNodes: [menu] }])
+      state.observers[0]?.cb([{ addedNodes: [menu] }])
       return menu
+    },
+    lockMo() { return state.observers[1] },
+    setSession(value) {
+      const node = new FakeElement('session')
+      node.attrs['data-conversation-session'] = value
+      state.sessionNode = node
     },
     unmount() { stop() },
     cleanup() {
@@ -239,6 +398,112 @@ test('T70-fix behavior: after uninstall nothing is marked', async () => {
     sim.tapTrigger()
     const menu = sim.addMenu()
     assert.equal(menu.getAttribute('data-zen-sheet'), null, 'an uninstalled effect never marks')
+  } finally { sim.cleanup() }
+})
+
+// -- UX-3 behavior: workspace sheet, toggle debounce, switch lock ---------------
+
+test('UX-3 behavior: a workspace chip click arms a WORKSPACE-marked sheet', async () => {
+  const sim = await bootSim()
+  try {
+    sim.click(sim.wsChip)
+    const menu = sim.addMenu()
+    assert.equal(menu.getAttribute('data-zen-sheet'), 'workspace', 'the workspace menu gets its own marker value')
+    // The host unmounts the sheet on close — only then can the placeholder
+    // card trigger arm the next one.
+    sim.state.menus.length = 0
+    sim.click(sim.wsCard)
+    const menu2 = sim.addMenu()
+    assert.equal(menu2.getAttribute('data-zen-sheet'), 'workspace')
+  } finally { sim.cleanup() }
+})
+
+test('UX-3 behavior: a tap on the open workspace chip closes — the toggle click is swallowed', async () => {
+  const sim = await bootSim()
+  try {
+    sim.pointerdown(sim.wsChip)
+    sim.click(sim.wsChip)
+    const menu = sim.addMenu()
+    assert.equal(menu.getAttribute('data-zen-sheet'), 'workspace', 'open works through pointerdown+click')
+
+    // Second tap while open: the host Menu closed on the outside pointerdown;
+    // the trigger's own click must not flip it straight back open.
+    sim.pointerdown(sim.wsChip)
+    const e = sim.click(sim.wsChip)
+    assert.ok(e.prevented && e.stopped, 'the toggle click is swallowed whole')
+    const stray = sim.addMenu()
+    assert.equal(stray.getAttribute('data-zen-sheet'), null, 'the close tap arms nothing — a stray menu is never mis-marked')
+
+    // Self-heal: if the pointerdown close did NOT land (the marked menu is
+    // still on the page at click time), the NEXT tap falls through to the
+    // host's own toggle instead of being swallowed forever.
+    sim.pointerdown(sim.wsChip)
+    const e2 = sim.click(sim.wsChip)
+    assert.ok(!e2.prevented && !e2.stopped, 'a tap that could not close passes through to the host toggle')
+  } finally { sim.cleanup() }
+})
+
+test('UX-3 behavior: a pointerdown elsewhere never arms the swallow', async () => {
+  const sim = await bootSim()
+  try {
+    sim.pointerdown(sim.wsChip)
+    sim.click(sim.wsChip)
+    sim.addMenu()
+    // Tap somewhere that is not a workspace trigger (the mask behind the
+    // sheet): the click must pass through untouched.
+    const e = sim.click(sim.permTrigger)
+    assert.ok(!e.prevented && !e.stopped, 'unrelated clicks are never swallowed')
+  } finally { sim.cleanup() }
+})
+
+test('UX-3 behavior: picking a workspace item locks the composer until the session settles', async () => {
+  const sim = await bootSim({ session: 'S1', placeholder: true })
+  try {
+    sim.click(sim.el('wsMenuitem'))
+    assert.equal(sim.html.getAttribute('data-zen-ws-switching'), '1', 'the lock lands on <html>')
+
+    // Not settled yet: the placeholder card is still up (the same session).
+    sim.lockMo().cb([])
+    assert.equal(sim.html.getAttribute('data-zen-ws-switching'), '1', 'placeholder still up — the lock holds')
+
+    // Settle: the conversation remounted on S2 and the picker card is gone.
+    sim.setSession('S2')
+    sim.state.placeholderOpen = false
+    sim.lockMo().cb([])
+    assert.equal(sim.html.getAttribute('data-zen-ws-switching'), null, 'settled — the lock releases')
+  } finally { sim.cleanup() }
+})
+
+test('UX-3 behavior: a permission option click never locks the composer', async () => {
+  const sim = await bootSim({ session: 'S1', placeholder: false })
+  try {
+    sim.click(sim.el('permMenuitem'))
+    assert.equal(sim.html.getAttribute('data-zen-ws-switching'), null, 'perm-menu items are outside the lock selector')
+  } finally { sim.cleanup() }
+})
+
+test('UX-3 behavior: the switch lock self-releases after the 1.5 s cap', async () => {
+  const sim = await bootSim({ session: 'S1', placeholder: true })
+  try {
+    sim.click(sim.el('wsMenuitem'))
+    assert.equal(sim.html.getAttribute('data-zen-ws-switching'), '1')
+    await wait(1_700)
+    assert.equal(sim.html.getAttribute('data-zen-ws-switching'), null, 'the cap releases the lock on its own')
+  } finally { sim.cleanup() }
+})
+
+test('UX-3 behavior: uninstall clears the lock and both listeners', async () => {
+  const sim = await bootSim({ session: 'S1', placeholder: true })
+  try {
+    sim.click(sim.el('wsMenuitem'))
+    assert.equal(sim.html.getAttribute('data-zen-ws-switching'), '1')
+    sim.unmount()
+    assert.equal(sim.html.getAttribute('data-zen-ws-switching'), null, 'teardown releases the lock')
+    sim.pointerdown(sim.wsChip)
+    const e = sim.click(sim.wsChip)
+    assert.ok(!e.prevented && !e.stopped, 'both capture listeners are gone')
+    const menu = sim.addMenu()
+    assert.equal(menu.getAttribute('data-zen-sheet'), null, 'the arming observer is gone too')
   } finally { sim.cleanup() }
 })
 

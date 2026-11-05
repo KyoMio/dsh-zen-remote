@@ -21,6 +21,7 @@ import type { createNavStore } from './nav-store.ts'
 import type { WorkspaceFilter } from './nav-store.ts'
 import type { MobileNavKey } from './locales.ts'
 import { dotState } from './session-dot.ts'
+import { decideNewSessionAction } from '../client-data/new-session.ts'
 import { MobileHomeChips, MobileHomeChipsSheetBody } from './MobileHomeChips.tsx'
 
 /** Full props for the phone home screen (shell.overlay entry). */
@@ -280,7 +281,7 @@ export function MobileHome({
   // list re-renders on any session change anyway (the running dots live here).
   const sessions = useSessions((s) => s)
   const workspaces = useWorkspaces((s) => s)
-  const [sheet, setSheet] = useState<'filter' | 'chips' | null>(null)
+  const [sheet, setSheet] = useState<'filter' | 'chips' | 'new-session' | null>(null)
   /** The one row whose archive action is swiped open (null = none). */
   const [swipeOpen, setSwipeOpen] = useState<SessionId | null>(null)
   // 0.1.2 的待处理交互来源；0.1.1 没有这个标准 prop，读到 undefined 时用一个
@@ -560,7 +561,19 @@ export function MobileHome({
         data-mobile-nav="home-fab"
         aria-label={t('newSession')}
         title={t('newSession')}
-        onClick={() => enter(() => startSession(selectedWorkspace?.workspaceId))}
+        onClick={() => {
+          // UX-3: never enter a dangling no-workspace session. With "all"
+          // selected (the common case — the host's own sessions belong to no
+          // workspace) the decision either auto-starts the only workspace or
+          // opens the workspace drawer first; the session then starts with a
+          // workspace attached from the first frame.
+          const action = decideNewSessionAction(
+            selectedWorkspace?.workspaceId,
+            workspaces.items.map((item) => item.workspaceId),
+          )
+          if (action.kind === 'start') enter(() => startSession(action.workspaceId))
+          else setSheet('new-session')
+        }}
       >
         <IconPlusOutlineRegular size={18} />
         <span>{t('newSession')}</span>
@@ -575,13 +588,15 @@ export function MobileHome({
             aria-label={t('close')}
             onClick={() => setSheet(null)}
           />
-          {/* Two sheets share this one container (chrome + S6 drag-to-close
+          {/* Three sheets share this one container (chrome + S6 drag-to-close
             * + mask-click-close, all keyed off data-mobile-nav="home-sheet"
             * generically — effects/gestures.ts): the workspace switcher
-            * (role="menu", unchanged) and the S5 chip-customize toggle list
-            * (MobileHomeChipsSheetBody, no menu semantics — its rows are
-            * switches, not menu items that close the sheet on click). */}
-          <div data-mobile-nav="home-sheet" role={sheet === 'filter' ? 'menu' : undefined}>
+            * (role="menu", unchanged), the UX-3 new-session workspace pick
+            * (role="menu" — its rows navigate and close), and the S5
+            * chip-customize toggle list (MobileHomeChipsSheetBody, no menu
+            * semantics — its rows are switches, not menu items that close
+            * the sheet on click). */}
+          <div data-mobile-nav="home-sheet" role={sheet === 'chips' ? undefined : 'menu'}>
             {sheet === 'filter' && (
               <>
                 <div data-mobile-nav="home-sheet-title">{t('switchWorkspace')}</div>
@@ -607,6 +622,28 @@ export function MobileHome({
                     onClick={() => {
                       actions.filter(item.workspaceId)
                       setSheet(null)
+                    }}
+                  >
+                    {item.title}
+                  </button>
+                ))}
+              </>
+            )}
+            {sheet === 'new-session' && (
+              <>
+                <div data-mobile-nav="home-sheet-title">{t('pickWorkspaceNew')}</div>
+                {workspaces.items.map((item) => (
+                  <button
+                    key={item.workspaceId}
+                    type="button"
+                    role="menuitem"
+                    data-mobile-nav="home-sheet-item"
+                    onClick={() => {
+                      // Pin the list to the picked workspace (so backing out
+                      // of the blank session lands on ITS list) and start the
+                      // session with that workspace from the first frame.
+                      actions.filter(item.workspaceId)
+                      enter(() => startSession(item.workspaceId))
                     }}
                   >
                     {item.title}

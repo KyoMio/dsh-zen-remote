@@ -345,6 +345,12 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      …, open-in-app, deliverables, …), and none opens through this trigger
      while no marked menu is up. */
   body > div[role="menu"][data-zen-sheet="perm"],
+  /* UX-3: the hero page's workspace menu, marked by the same effect through
+     its own two triggers (the WorkspaceChip and the placeholder card) with
+     the workspace value — a distinct marker so the pick that starts the
+     workspace switch (effects/permission-sheet.ts) can key on THIS sheet
+     without ever touching permission options. */
+  body > div[role="menu"][data-zen-sheet="workspace"],
   ${MODEL_MENU} {
     position: fixed !important;
     left: 0 !important;
@@ -377,6 +383,7 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
      older hosts. */
   ${PERM} [role="menu"] [role="menuitem"],
   body > div[role="menu"][data-zen-sheet="perm"] [role="menuitem"],
+  body > div[role="menu"][data-zen-sheet="workspace"] [role="menuitem"],
   ${MODEL_MENU} [role="menuitem"],
   ${MODEL_MENU} [role="menuitemradio"],
   ${MODEL_MENU} [class$="_option"],
@@ -525,10 +532,27 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   body:has(> [id$="-menu"][class$="_menu"]:is([role="menu"], [role="group"])) [data-chat-flow] + div,
   /* T70: the portaled permission menu (marked by effects/permission-sheet.ts). */
   body:has(> div[role="menu"][data-zen-sheet="perm"]) [data-chat-flow] + div,
+  /* UX-3: the portaled hero workspace menu, same treatment. */
+  body:has(> div[role="menu"][data-zen-sheet="workspace"]) [data-chat-flow] + div,
   /* T-issue30: an inline menu a parked chip opened (escaped to a fixed
      sheet by 4a). */
   body:has([data-zen-sheet-extras] [role="menu"]) [data-chat-flow] + div {
     display: none !important;
+  }
+  /* --- 4c. UX-3: the workspace switch lock ---
+     Between picking a workspace in the hero sheet and the new blank session
+     landing (selectWorkspace → POST /api/session/create → replaceMain
+     remounts the conversation), the composer still belongs to the OLD blank
+     session: a message sent in that window lands there and is then wiped by
+     the remount, bouncing the UI back to the "choose a workspace" state.
+     effects/permission-sheet.ts stamps data-zen-ws-switching on <html> for
+     exactly that window — the lock releases when the conversation root's
+     data-conversation-session has moved and the placeholder card is gone,
+     with a 1.5 s cap — and the dim (not just pointer-events) makes the
+     freeze visible instead of reading as a dead input. */
+  html[data-zen-ws-switching] [data-slot="conversation.composer.bar"] {
+    pointer-events: none !important;
+    opacity: .6 !important;
   }
   /* --- 5. input box: two lines minimum, five lines maximum ---
      The official autosizer drives the box off the hidden mirror's height, so
