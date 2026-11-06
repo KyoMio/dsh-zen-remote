@@ -8,6 +8,10 @@
  * - `parseRemoteStatusBody(body, now)` maps the
  *   `GET /_dsh/zen-remote/client/remote-status` body
  *   (`{ state, versionMismatch, serverName, closed }`) into a tolerant view;
+ *   since MS-6 the body's `servers` dict (per handshake serverId) parses
+ *   alongside, and `resolveServerStatusView(view, sessionId)` picks the
+ *   session's OWN server entry — falling back to the top-level mirror (the
+ *   FIRST pool entry) whenever the dict cannot answer;
  * - `describeRemoteStatus(view)` maps one view to the icon's three states —
  *   online (lit) / offline (grey; `revoked` / `unpaired` count as offline —
  *   the link is not serving either way) / mismatch (yellow, only ever while
@@ -38,6 +42,20 @@ export declare const CLIENT_UNSHARE_ROUTE = "/_dsh/zen-remote/client/unshare";
 export type RemoteStatusState = 'online' | 'offline' | 'revoked' | 'unpaired';
 /** Why the server closed a session's remote access. */
 export type RemoteClosedReason = 'manual' | 'client' | 'idle';
+/**
+ * ONE paired server's serving state (MS-6): the same four facts the top
+ * level has always carried, scoped to the server whose handshake minted the
+ * `serverId`. The route (src/client-routes.ts, MS-5) serves these under
+ * `servers`, keyed by serverId; the top level mirrors the FIRST pool entry
+ * for the pre-MS-6 page.
+ */
+export interface RemoteServerStatusView {
+    state: RemoteStatusState;
+    versionMismatch: boolean;
+    serverName: string;
+    /** The plugins whose bridge verdict is bridged RIGHT NOW on THIS server. */
+    bridgedPlugins: readonly string[];
+}
 /** One parsed status body, stamped with the parse time for future decay. */
 export interface RemoteStatusView {
     state: RemoteStatusState;
@@ -49,6 +67,10 @@ export interface RemoteStatusView {
      * nothing is ever considered bridged on a shape the parse does not
      * trust. */
     bridgedPlugins: readonly string[];
+    /** Per-server views keyed by the handshake serverId (MS-6). A legacy body
+     * without the field parses to the empty dict — the parts then fall back to
+     * the top-level mirror. */
+    servers: Readonly<Record<string, RemoteServerStatusView>>;
     /** When this view was parsed off a GET body. */
     asOf: number;
 }
@@ -73,6 +95,26 @@ export declare function parseRemoteStatusBody(body: unknown, now: number): Remot
  * spends.
  */
 export declare function shouldStampBridgeAttribute(bridgedPlugins: unknown, plugin: string): boolean;
+/**
+ * Which server's facts ONE session reads (MS-6): given the session id on
+ * screen, its virtual form names the owning serverId, and THAT server's
+ * entry answers — per-server isolation for the icon, the banner and the
+ * bridge stamp. Everything else falls back to the TOP-LEVEL view, the
+ * pre-MS-6 answer: a session id that is not virtual (a local session), a
+ * serverId the dict never answered (its entry never handshook), a legacy
+ * body without a dict, or no session id at all. Tolerant the same way as
+ * the parse: hand-rolled views without `servers` never throw here.
+ */
+export declare function resolveServerStatusView(view: RemoteStatusView | undefined | null, sessionId?: string): RemoteServerStatusView | undefined;
+/**
+ * Whether the remote session CURRENTLY ON SCREEN has its own server's bridge
+ * verdict going its way (MS-6): the verdict comes from the session's server
+ * entry ({@link resolveServerStatusView}), not the page-wide mirror of the
+ * FIRST pool entry — with several servers paired, A bridging a plugin must
+ * not un-hide it over B's sessions. Tolerant like the 2-argument core it
+ * wraps: a garbage or missing list reads as "not bridged".
+ */
+export declare function shouldStampBridgeForSession(view: RemoteStatusView | undefined, sessionId: string | undefined, plugin: string): boolean;
 /** The plugin the bridge stamp names. */
 export declare const BRIDGE_STAMP_PLUGIN = "dsh-better-sidebar";
 /** The html attribute the stamp writes (`data-zr-bridge-dsh-better-sidebar`). */
@@ -94,7 +136,11 @@ export interface RemoteStatusDescription {
     state: 'online' | 'offline' | 'mismatch' | 'revoked' | 'unpaired';
     hoverText: string;
 }
-export declare function describeRemoteStatus(view: RemoteStatusView | undefined | null, t?: RemoteStatusFormatter): RemoteStatusDescription;
+export declare function describeRemoteStatus(view: RemoteStatusView | undefined | null, t?: RemoteStatusFormatter, 
+/** MS-6: the session on screen — its virtual id picks its OWN server's
+ * entry; omitted (or unanswered by the dict) keeps the pre-MS-6 top-level
+ * read. */
+sessionId?: string): RemoteStatusDescription;
 /** The locale keys `bannerText` needs. */
 export type RemoteBannerTextKey = 'remoteBannerOffline' | 'remoteBannerRevoked' | 'remoteBannerUnpaired' | 'remoteBannerClosedIdle' | 'remoteBannerClosedManual' | 'remoteBannerClosedClient';
 export type RemoteBannerFormatter = (key: RemoteBannerTextKey) => string;

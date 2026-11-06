@@ -12,7 +12,14 @@
  * row layer applies the same rule when the fields land there, so a client
  * that accepts something the resolver would silently drop would only set
  * the user up for a mystery.
+ *
+ * MS-6 adds the paired-pool overview pieces: the pool count is a first-class
+ * "configured" signal (MS-5 pairs straight into the pool store, not the
+ * row), and {@link deriveClientOverviewSummary} derives the overview card's
+ * counters and its two lights (connection health / pool fill) off the
+ * `client/status` pool list.
  */
+import type { ClientServerView } from './settings-form.ts';
 /** Wizard route constants — mirror of src/wizard/routes.ts. */
 export declare const WIZARD_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/status";
 export declare const WIZARD_VERIFY_ROUTE = "/_dsh/zen-remote/admin/wizard/verify";
@@ -129,7 +136,12 @@ export type WizardPath = 'caddy' | 'external' | 'cloudflared' | 'lan';
 export declare function initialStep(status: WizardStatusBody | undefined): WizardStep;
 /**
  * Whether the inline overview card should render the configured status
- * dashboard instead of the first-time setup prompt.
+ * dashboard instead of the first-time setup prompt. MS-6: the paired pool's
+ * size is the client's first-class signal — since MS-5 a claim lands in the
+ * pool store and never touches the row's `serverUrl` / `deviceToken`, so a
+ * freshly multi-paired machine with an empty row must still read as
+ * configured. `> 0` answers true no matter what the other inputs say; the
+ * field is optional and an omitted one (or a zero) changes nothing.
  */
 export declare function isWizardConfigured(input: {
     effectiveClient: boolean;
@@ -139,6 +151,7 @@ export declare function isWizardConfigured(input: {
     tokenConfigured: boolean;
     clientServerUrl: string;
     clientState: string | undefined;
+    pairedServerCount?: number;
 }): boolean;
 export interface WizardFormSeed {
     domain: string;
@@ -211,6 +224,35 @@ export interface ClientWizardLights {
     /** Whether the session-sync and plugin-bridge interceptors are active. */
     sync: LightState;
 }
+/** The overview card's derived counters and lights (MS-6): the 第 3 格
+ * 「连接状态」 shows `M / N 台在线` with {@link WizardOverviewSummary.connectionLight}
+ * summarizing the pool's health, and the 第 4 格 「已配对服务端」 shows
+ * `已配对 N / maxServers 台` with {@link WizardOverviewSummary.serversLight}
+ * turning red exactly at the cap. Input is the DERIVED pool list
+ * ({@link ClientServerView} — the view vocabulary's state words), in pairing
+ * order; order never matters to the counts. */
+export interface WizardOverviewSummary {
+    totalCount: number;
+    onlineCount: number;
+    /** Everything that is neither connected nor revoked (unreachable,
+     * unexpected, incompatible, invalid-url, …). */
+    offlineCount: number;
+    revokedCount: number;
+    maxServers: number;
+    limitReached: boolean;
+    connectionLight: LightState;
+    serversLight: LightState;
+}
+/**
+ * Derive the sub-client overview summary off one derived pool list: green
+ * only when EVERY paired server is connected; red when any server is in a
+ * state that will not recover on its own (revoked / incompatible /
+ * invalid-url) or when the pool is FULL — the cap is a servers fact, so a
+ * full pool of healthy connections still shows a red servers light while its
+ * connection light stays green; amber for the rest (nothing paired yet, or
+ * servers the retry ladder is still working on).
+ */
+export declare function deriveClientOverviewSummary(servers: readonly ClientServerView[], maxServers?: number): WizardOverviewSummary;
 /**
  * Derive the three status lights for the desktop sub-client verification
  * step (`role === 'client'`).

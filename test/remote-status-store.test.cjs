@@ -273,3 +273,127 @@ test('gate: view undefined (no GET yet) and OFFLINE both pass — the hint goes 
     assert.equal(recent.at(-1).method, 'GET', 'offline: the follow-up refresh runs')
   } finally { off() }
 })
+
+// ---- MS-6: the per-server views (servers dict) -----------------------------------
+
+/** A poll body the MS-5 route answers with TWO paired servers: A online with
+ * better-sidebar bridged, B offline without the bridge. The top level
+ * mirrors A (the FIRST pool entry) for the old page. */
+function multiServerBody() {
+  return {
+    state: 'online',
+    versionMismatch: false,
+    serverName: 'A-main',
+    closed: {},
+    bridgedPlugins: ['dsh-better-sidebar'],
+    servers: {
+      aaaa1111: { state: 'online', versionMismatch: false, serverName: 'A-main', bridgedPlugins: ['dsh-better-sidebar'] },
+      bbbb2222: { state: 'offline', versionMismatch: false, serverName: 'B-backup', bridgedPlugins: [] },
+    },
+  }
+}
+
+const t = (key) => `#${key}`
+
+test('MS-6: parseRemoteStatusBody carries the servers dict tolerantly', async () => {
+  const { parseRemoteStatusBody } = await importStore()
+  const now = 1_700_000_000_000
+
+  const view = parseRemoteStatusBody(multiServerBody(), now)
+  assert.deepEqual(view.servers.aaaa1111, {
+    state: 'online', versionMismatch: false, serverName: 'A-main', bridgedPlugins: ['dsh-better-sidebar'],
+  })
+  assert.deepEqual(view.servers.bbbb2222, {
+    state: 'offline', versionMismatch: false, serverName: 'B-backup', bridgedPlugins: [],
+  })
+
+  // The top-level fields still ride through unchanged (the old page's truth).
+  assert.equal(view.state, 'online')
+  assert.equal(view.serverName, 'A-main')
+  assert.deepEqual(view.bridgedPlugins, ['dsh-better-sidebar'])
+
+  // Garbage shapes degrade, never throw: a non-object dict, junk entries, a
+  // junk field inside an entry, an empty serverId key.
+  assert.deepEqual(parseRemoteStatusBody({ servers: 'garbage' }, now).servers, {})
+  assert.deepEqual(parseRemoteStatusBody({ servers: 42 }, now).servers, {})
+  assert.deepEqual(parseRemoteStatusBody({ servers: ['a'] }, now).servers, {})
+  assert.deepEqual(
+    parseRemoteStatusBody({ servers: { aaaa1111: 'garbage' } }, now).servers.aaaa1111,
+    { state: 'offline', versionMismatch: false, serverName: '', bridgedPlugins: [] },
+  )
+  assert.deepEqual(
+    parseRemoteStatusBody({ servers: { aaaa1111: { state: 'online', bridgedPlugins: 'x', versionMismatch: 1 } } }, now).servers.aaaa1111,
+    { state: 'online', versionMismatch: false, serverName: '', bridgedPlugins: [] },
+  )
+  assert.deepEqual(parseRemoteStatusBody({ servers: { '': { state: 'online' } } }, now).servers, {}, 'an empty serverId owns no entry')
+
+  // A legacy single-server body (no servers field) parses exactly as before,
+  // with an EMPTY dict — the fallback path serves the parts.
+  const legacy = parseRemoteStatusBody({ state: 'online', serverName: 's', closed: { s1: 'idle' } }, now)
+  assert.deepEqual(legacy.servers, {})
+  assert.equal(legacy.state, 'online')
+})
+
+test('MS-6: resolveServerStatusView picks the session\u2019s server, falling back to the top level', async () => {
+  const { parseRemoteStatusBody, resolveServerStatusView } = await importStore()
+  const view = parseRemoteStatusBody(multiServerBody(), 1)
+
+  assert.equal(resolveServerStatusView(view, 'zr~aaaa1111~s1'), view.servers.aaaa1111, 'the session\u2019s own server entry')
+  assert.equal(resolveServerStatusView(view, 'zr~bbbb2222~s2'), view.servers.bbbb2222)
+  // A session whose server never answered (an entry without a serverId) falls
+  // back to the TOP-LEVEL view — the old single-server answer.
+  assert.equal(resolveServerStatusView(view, 'zr~cccc3333~x'), view)
+  // Non-virtual and missing session ids keep the top-level fallback too.
+  assert.equal(resolveServerStatusView(view, 'session-local'), view)
+  assert.equal(resolveServerStatusView(view, undefined), view)
+  assert.equal(resolveServerStatusView(view), view)
+  assert.equal(resolveServerStatusView(undefined, 'zr~aaaa1111~s1'), undefined)
+  assert.equal(resolveServerStatusView(null, 'zr~aaaa1111~s1'), undefined)
+
+  // A hand-rolled view without a servers field (every pre-MS-6 caller) must
+  // not throw and must answer the top-level view.
+  const legacy = { state: 'online', versionMismatch: false, serverName: 's', closed: {}, bridgedPlugins: [], asOf: 1 }
+  assert.equal(resolveServerStatusView(legacy, 'zr~aaaa1111~s1'), legacy)
+})
+
+test('MS-6 acceptance: describeRemoteStatus answers per server for the icon', async () => {
+  const { parseRemoteStatusBody, describeRemoteStatus } = await importStore()
+  const view = parseRemoteStatusBody(multiServerBody(), 1)
+
+  assert.deepEqual(describeRemoteStatus(view, t, 'zr~aaaa1111~s1'), { state: 'online', hoverText: '#remoteStatusOnline' })
+  assert.deepEqual(describeRemoteStatus(view, t, 'zr~bbbb2222~s2'), { state: 'offline', hoverText: '#remoteStatusOffline' })
+
+  // Without a session id (or with one the dict cannot answer) the behavior is
+  // exactly the pre-MS-6 one: the top-level view decides.
+  assert.deepEqual(describeRemoteStatus(view, t), { state: 'online', hoverText: '#remoteStatusOnline' })
+  assert.deepEqual(describeRemoteStatus(view, t, 'zr~cccc3333~x'), { state: 'online', hoverText: '#remoteStatusOnline' })
+  assert.deepEqual(describeRemoteStatus(undefined, t, 'zr~aaaa1111~s1'), { state: 'offline', hoverText: '#remoteStatusOffline' })
+
+  // A per-server mismatch only ever shows while THAT server is online.
+  const mismatched = parseRemoteStatusBody({
+    ...multiServerBody(),
+    servers: {
+      ...multiServerBody().servers,
+      bbbb2222: { state: 'online', versionMismatch: true, serverName: 'B-backup', bridgedPlugins: [] },
+    },
+  }, 1)
+  assert.deepEqual(describeRemoteStatus(mismatched, t, 'zr~bbbb2222~s2'), { state: 'mismatch', hoverText: '#remoteStatusMismatch' })
+})
+
+test('MS-6 acceptance: bannerText answers per server for the composer', async () => {
+  const { parseRemoteStatusBody, bannerText } = await importStore()
+  const view = parseRemoteStatusBody(multiServerBody(), 1)
+
+  // A online: no banner. B offline: the temporarily-readonly line.
+  assert.equal(bannerText(view, 'zr~aaaa1111~s1', t), undefined)
+  assert.equal(bannerText(view, 'zr~bbbb2222~s2', t), '#remoteBannerOffline')
+
+  // The closed map stays SESSION-keyed (virtual ids embed their server, so
+  // one global dict cannot collide) and still outranks the link state.
+  const closed = parseRemoteStatusBody({
+    ...multiServerBody(),
+    closed: { 'zr~bbbb2222~s2': 'idle' },
+  }, 1)
+  assert.equal(bannerText(closed, 'zr~bbbb2222~s2', t), '#remoteBannerClosedIdle')
+  assert.equal(bannerText(closed, 'zr~aaaa1111~s1', t), undefined, 'B\u2019s closure says nothing about A\u2019s session')
+})
