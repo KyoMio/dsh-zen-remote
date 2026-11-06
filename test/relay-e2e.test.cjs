@@ -24,6 +24,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
+const { createRelayPool } = require('../lib/relay-pool.js')
 const { createRelayClient, RelayError } = require('../lib/relay-client.js')
 const { createClientHandler } = require('../lib/client-routes.js')
 const { installIntercept } = require('../lib/intercept.js')
@@ -3408,5 +3409,544 @@ test('e2e PB-24: a declarative v2 plugin — json-body, prefix, deny, rewriteIds
     await env.stop()
     await subStop()
     await dshStop()
+  }
+})
+
+// ---- MS-9: two main servers, one sub-client (the multi-server E2E) ------------
+
+/**
+ * One INDEPENDENT main-server stack for the multi-server tests: the same
+ * pieces boot() assembles (fake DSH service → real gateway child → proxy hop
+ * with forwarded headers → paired desktop device), but with its OWN proxy,
+ * ports and home — two of these run side by side, so nothing here may touch
+ * the module-global single-server fixture above (gwPort / proxy / proxyPort).
+ * `sessionListAnswer` / `pageAnswer` are mutable so the test can script the
+ * fake DSH service AFTER it knows which stack pairs first.
+ */
+let stackCounter = 0
+async function bootStack(opts = {}) {
+  const { serverName = 'MS9服务器', invoke } = opts
+  const home = path.join(ROOT, `stack-${stackCounter++}`)
+  fs.mkdirSync(home, { recursive: true })
+  const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+  const invokeCalls = []
+  const streams = []
+  const eventsGates = []
+  const eventResults = []
+  const env = { home, store, invokeCalls, streams, eventsGates, eventResults, serverName, sessionListAnswer: { items: [] } }
+  const gateway = {
+    invoke: async (call) => {
+      invokeCalls.push(call)
+      // The proactive per-entry catalog fetch (T52-fix3) answers here, like
+      // boot()'s fake does; session/list is scriptable per stack through
+      // env.sessionListAnswer (the merge route and the summary sync both ride it).
+      if (call.namespace === 'session' && call.method === 'modelCatalog') {
+        return { default: null, routableProviders: [], groups: [], failures: [] }
+      }
+      if (call.namespace === 'session' && call.method === 'list') return env.sessionListAnswer
+      if (invoke !== undefined) return invoke(call)
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+    stream: async (call) => {
+      const gate = makeGate(call)
+      streams.push(gate)
+      return gate.iterable
+    },
+    wireStream: {
+      open: async (endpoint, payload, uplink, peer, signal) => {
+        if (endpoint !== '$events') {
+          throw Object.assign(new Error(`no wireStream fake for ${endpoint}`), { code: 'test/not-implemented' })
+        }
+        const gate = makeEventsGate(signal)
+        eventsGates.push(gate)
+        return gate.iterable
+      },
+    },
+    dispatchRpc: async (endpoint, payload, signal, peer) => {
+      eventResults.push({ endpoint, payload, signal, peer })
+      return { ok: true, value: undefined }
+    },
+  }
+  const handler = createRelayHandler({
+    secret: SECRET,
+    store,
+    gateway,
+    serverInfo: {
+      serverId: loadServerId(home),
+      serverName: () => serverName,
+      dshVersion: '0.0.0-e2e',
+    },
+  })
+  const target = http.createServer((req, res) => { handler(req, res).catch(() => { try { res.destroy() } catch { /* gone */ } }) })
+  await new Promise((resolve) => target.listen(0, '127.0.0.1', resolve))
+  const targetPort = target.address().port
+
+  // THIS stack's public-internet hop: forwarded headers play the reverse
+  // proxy, so the pool's client counts as a remote desktop device.
+  const gwPort = await freePort()
+  const proxyServer = http.createServer((req, res) => {
+    const headers = { ...req.headers, 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' }
+    delete headers.connection
+    delete headers['keep-alive']
+    let upstream
+    res.on('close', () => { try { if (upstream !== undefined) upstream.destroy() } catch { /* gone */ } })
+    upstream = http.request({ host: '127.0.0.1', port: gwPort, method: req.method, path: req.url, headers }, (upRes) => {
+      const out = { ...upRes.headers }
+      delete out['transfer-encoding']
+      delete out.connection
+      delete out['keep-alive']
+      res.writeHead(upRes.statusCode || 502, out)
+      res.flushHeaders()
+      upRes.pipe(res)
+    })
+    upstream.on('error', () => {
+      try { if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }) } catch { /* gone */ }
+      try { res.end() } catch { /* gone */ }
+    })
+    req.pipe(upstream)
+  })
+  await new Promise((resolve) => proxyServer.listen(0, '127.0.0.1', resolve))
+  env.proxyPort = proxyServer.address().port
+
+  const gw = startGatewayAt(home, gwPort, targetPort, { LAN_GATE_RELAY_SECRET: SECRET })
+  await gw.ready
+  const paired = await pairDesktop(gwPort, 'MS9台式机')
+  env.serverId = loadServerId(home)
+  env.token = paired.token
+  env.deviceId = paired.id
+  env.stop = async () => {
+    handler.closeAll('e2e teardown')
+    await stopAll({ close: (done) => { target.closeAllConnections(); target.close(done) } }, gw.child)
+    await new Promise((resolve) => { proxyServer.closeAllConnections(); proxyServer.close(resolve) })
+  }
+  return env
+}
+
+/** The REAL pool over one state file, with the intercept's pool hub wired
+ * through a mutable ref (the handle does not exist at pool creation — the
+ * same ordering src/index.ts lives with). */
+function makePool(stateFile) {
+  const wiring = { notePoolEvent: () => {} }
+  const pool = createRelayPool({
+    stateFile,
+    computeOwnFingerprints: () => ({}),
+    onStateChange: () => wiring.notePoolEvent(),
+    onServerRemoved: () => wiring.notePoolEvent(),
+  })
+  return { pool, wiring }
+}
+
+/** The client routes (createClientHandler, pool mode) on a plain port, the
+ * same composition the CLIENT role's mount serves. */
+async function startClientRouteServer(pool, getIntercept) {
+  const handler = createClientHandler({
+    admit: () => ({}),
+    getRowConfig: () => ({}),
+    pool,
+    ...(getIntercept !== undefined ? { getIntercept } : {}),
+  })
+  const server = http.createServer((req, res) => { void handler(req, res) })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  const stop = () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve) })
+  return { port, stop }
+}
+
+/** Post one same-origin JSON body to a client route. */
+function postRoute(port, route, body) {
+  return fetch(`http://127.0.0.1:${port}${route}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}` },
+    body: JSON.stringify(body),
+  })
+}
+
+/** Drain a merged stream into an array forever — the tolerant way to consume
+ * a stream that carries background noise (the summary/status sync frames)
+ * while the test waits for ONE specific frame. */
+async function drainInto(iterator, sink) {
+  try {
+    for (;;) {
+      const result = await iterator.next()
+      if (result.done === true) break
+      sink.push(result.value)
+    }
+  } catch { /* the abort path ends here */ }
+}
+
+test('e2e MS-9: two main servers pair into one sub-client — the sidebar merges in PAIRING order with -1/-2 names, session/list follows, and unpairing one leaves the other serving', async () => {
+  const MS9_NAME = 'MS9同名服务器'
+  // Both stacks report the SAME server name: only the -1/-2 derivation can
+  // disambiguate the two sidebar groups.
+  const stackOne = await bootStack({ serverName: MS9_NAME })
+  const stackTwo = await bootStack({ serverName: MS9_NAME })
+  const stateFile = path.join(ROOT, `pool-merge-${stackCounter}.json`)
+  const { pool, wiring } = makePool(stateFile)
+  let first
+  let second
+  try {
+    // Pair the HIGHER serverId first on purpose: the merged order can then
+    // never be explained by id sorting — only by pairing order.
+    ;[first, second] = stackOne.serverId > stackTwo.serverId ? [stackOne, stackTwo] : [stackTwo, stackOne]
+    first.sessionListAnswer = { items: [{ sessionId: 's1a', title: '甲会话', updatedAt: 1 }] }
+    second.sessionListAnswer = { items: [{ sessionId: 's2a', title: '乙会话', updatedAt: 1 }] }
+    first.store.share('s1a')
+    second.store.share('s2a')
+    const V1 = (id) => toVirtual(first.serverId, id)
+    const V2 = (id) => toVirtual(second.serverId, id)
+
+    const pairedFirst = await pool.pair({
+      serverUrl: `http://127.0.0.1:${first.proxyPort}`,
+      token: first.token,
+      deviceId: first.deviceId,
+      deviceName: 'MS9台式机',
+    })
+    assert.equal(pairedFirst.ok, true)
+    await waitFor(() => pool.entries().length === 1 && pool.entries()[0].client.state === 'online')
+    assert.equal(pool.entries()[0].serverId, first.serverId)
+    const pairedSecond = await pool.pair({
+      serverUrl: `http://127.0.0.1:${second.proxyPort}`,
+      token: second.token,
+      deviceId: second.deviceId,
+      deviceName: 'MS9台式机',
+    })
+    assert.equal(pairedSecond.ok, true)
+    await waitFor(() => pool.entries().length === 2 && pool.entries()[1].client.state === 'online')
+    await waitFor(() => pool.entries()[1].serverId === second.serverId)
+    // Duplicate names number in PAIRING order.
+    assert.deepEqual(pool.entries().map((entry) => entry.displayName), [`${MS9_NAME}-1`, `${MS9_NAME}-2`])
+
+    // The sub-client half: a controllable local gateway + the POOL install,
+    // with the pool hub wired like index.ts wires it.
+    const controller = new AbortController()
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalMergeGateway(localGate)
+    const handle = installIntercept({ raw: localGateway, pool, log: () => {} })
+    wiring.notePoolEvent = () => handle.notePoolEvent()
+
+    // The merged sidebar stream through the sub-client's own wire adapter.
+    const merged = await localGateway.wireTap('workspace/follow', { args: {} }, undefined, localGateway.operatorPeer(), controller.signal, { signal: controller.signal })
+    const iterator = merged[Symbol.asyncIterator]()
+
+    const LOCAL_WS = {
+      workspaceId: 'ws-local',
+      path: '/home/me/local',
+      title: '本地',
+      sessionIds: ['session-local'],
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    }
+    localGate.push({ type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: [], pinnedSessionIds: [] } })
+    const initial = await collectFrames(iterator, 1)
+    assert.deepEqual(initial[0].value.items.map((workspace) => workspace.workspaceId), ['ws-local'])
+
+    // First-paired server's baseline crosses as ONE virtualized group with
+    // the -1 name and only its SHARED sessions (s1x stays unshared).
+    await waitFor(() => first.streams.some((gate) => gate.call.namespace === 'workspace' && gate.call.method === 'follow'))
+    const firstWsGate = first.streams.find((gate) => gate.call.namespace === 'workspace')
+    firstWsGate.push({
+      type: 'baseline',
+      value: {
+        items: [{
+          workspaceId: 'w-1',
+          path: '/srv/first',
+          title: '甲工作区',
+          sessionIds: ['s1a', 's1x'],
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        }],
+        archivedSessionIds: [],
+        pinnedSessionIds: [],
+      },
+    })
+    const afterFirst = await collectFrames(iterator, 4)
+    assert.deepEqual(afterFirst[0], {
+      type: 'upsert',
+      workspace: {
+        workspaceId: V1('w-1'),
+        path: '/srv/first',
+        title: `${MS9_NAME}-1 · 甲工作区`,
+        sessionIds: [V1('s1a')],
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    })
+    assert.deepEqual(afterFirst[1], { type: 'order', workspaceIds: ['ws-local', V1('w-1')] })
+    assert.equal(afterFirst[2].type, 'archived')
+    assert.equal(afterFirst[3].type, 'pinned')
+
+    // Second-paired server's baseline: the order frame extends in PAIRING
+    // order — first's group still leads (its serverId sorts LOWER by
+    // construction, so only the pairing order explains this).
+    await waitFor(() => second.streams.some((gate) => gate.call.namespace === 'workspace' && gate.call.method === 'follow'))
+    const secondWsGate = second.streams.find((gate) => gate.call.namespace === 'workspace')
+    secondWsGate.push({
+      type: 'baseline',
+      value: {
+        items: [{
+          workspaceId: 'w-2',
+          path: '/srv/second',
+          title: '乙工作区',
+          sessionIds: ['s2a', 's2x'],
+          createdAt: '2026-01-02T00:00:00.000Z',
+          updatedAt: '2026-01-02T00:00:00.000Z',
+        }],
+        archivedSessionIds: [],
+        pinnedSessionIds: [],
+      },
+    })
+    const afterSecond = await collectFrames(iterator, 4)
+    assert.deepEqual(afterSecond[0].workspace.workspaceId, V2('w-2'))
+    assert.deepEqual(afterSecond[0].workspace.title, `${MS9_NAME}-2 · 乙工作区`)
+    assert.deepEqual(afterSecond[1], { type: 'order', workspaceIds: ['ws-local', V1('w-1'), V2('w-2')] })
+
+    // The unscoped list merges in the SAME pairing order: local rows first,
+    // then first-paired's, then second-paired's.
+    const listEnvelope = await localGateway.rpcBridge('session/list', { args: {} }, undefined, undefined)
+    assert.deepEqual(listEnvelope, {
+      ok: true,
+      value: {
+        items: [
+          { sessionId: 'session-local', updatedAt: 1 },
+          { sessionId: V1('s1a'), title: '甲会话', updatedAt: 1 },
+          { sessionId: V2('s2a'), title: '乙会话', updatedAt: 1 },
+        ],
+      },
+    })
+
+    // The client routes over the pool: status reports BOTH in pairing order
+    // with the derived names, the 8-server cap, and no credential material.
+    const routes = await startClientRouteServer(pool, () => handle.diagnostics())
+    try {
+      const status = await fetch(`http://127.0.0.1:${routes.port}/_dsh/zen-remote/client/status`)
+      const statusBody = await status.json()
+      assert.equal(statusBody.state, 'online')
+      assert.equal(statusBody.maxServers, 8)
+      assert.deepEqual(statusBody.servers.map((entry) => entry.displayName), [`${MS9_NAME}-1`, `${MS9_NAME}-2`])
+      assert.deepEqual(statusBody.servers.map((entry) => entry.serverId), [first.serverId, second.serverId])
+      assert.ok(statusBody.servers.every((entry) => entry.state === 'online'))
+      assert.equal(JSON.stringify(statusBody).includes(first.token), false)
+
+      // Remove the FIRST-paired server through the route. Two facts cross the
+      // still-open sidebar stream, in order: the survivor's rename (the
+      // duplicate name is gone, so its -2 suffix disappears and the group
+      // re-upserts), then the removed server's group remove + the re-aired
+      // trio without it.
+      const unpair = await postRoute(routes.port, '/_dsh/zen-remote/client/unpair', { entryId: pairedFirst.entry.entryId })
+      assert.deepEqual(await unpair.json(), { ok: true, removed: 1 })
+      const gone = await collectFrames(iterator, 8)
+      assert.deepEqual(gone[0], {
+        type: 'upsert',
+        workspace: {
+          workspaceId: V2('w-2'),
+          path: '/srv/second',
+          title: `${MS9_NAME} · 乙工作区`,
+          sessionIds: [V2('s2a')],
+          createdAt: '2026-01-02T00:00:00.000Z',
+          updatedAt: '2026-01-02T00:00:00.000Z',
+        },
+      })
+      assert.deepEqual(gone[1], { type: 'order', workspaceIds: ['ws-local', V2('w-2')] })
+      assert.deepEqual(gone[4], { type: 'remove', workspaceId: V1('w-1') })
+      assert.deepEqual(gone[5], { type: 'order', workspaceIds: ['ws-local', V2('w-2')] })
+      assert.ok(gone.every((frame) => !JSON.stringify(frame).includes(V1('w-1')) || frame.type === 'remove'), 'the removed group never re-airs')
+
+      // The removed server's leg is torn down for real.
+      assert.equal(pool.entries().length, 1)
+      await waitFor(() => firstWsGate.aborted)
+
+      // The state file keeps only the survivor.
+      const onDisk = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+      assert.deepEqual(onDisk.servers.map((record) => record.serverId), [second.serverId])
+
+      // The survivor still serves END TO END: a fresh share on ITS side
+      // synthesizes an upsert that crosses with both its sessions.
+      second.store.share('s2x')
+      const live = await collectFrames(iterator, 4)
+      assert.deepEqual(live[0].workspace.workspaceId, V2('w-2'))
+      assert.deepEqual(live[0].workspace.sessionIds, [V2('s2a'), V2('s2x')])
+
+      // And the route view shrank to one server.
+      const statusAfter = await fetch(`http://127.0.0.1:${routes.port}/_dsh/zen-remote/client/status`)
+      const after = await statusAfter.json()
+      assert.deepEqual(after.servers.map((entry) => entry.displayName), [MS9_NAME])
+    } finally {
+      await routes.stop()
+    }
+
+    controller.abort()
+    const done = await iterator.next()
+    assert.equal(done.done, true)
+    handle.uninstall()
+  } finally {
+    await pool.stop()
+    await first.stop()
+    await second.stop()
+  }
+})
+
+test('e2e MS-9: calls route BY serverId — invoke, stream and approval answers travel only their own server\'s chain, the unshare route closes the right store, and a foreign serverId reads remote-mismatch', async () => {
+  const stackOne = await bootStack({
+    serverName: 'MS9路由甲',
+    invoke: async (call) => {
+      if (call.namespace === 'session' && call.method === 'page') return { page: '甲服务端', echoed: call.args.request.address.sessionId }
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+  })
+  const stackTwo = await bootStack({
+    serverName: 'MS9路由乙',
+    invoke: async (call) => {
+      if (call.namespace === 'session' && call.method === 'page') return { page: '乙服务端', echoed: call.args.request.address.sessionId }
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+  })
+  const { pool, wiring } = makePool(path.join(ROOT, `pool-route-${stackCounter}.json`))
+  try {
+    stackOne.sessionListAnswer = { items: [{ sessionId: 's1a', title: '甲会话', updatedAt: 1 }] }
+    stackTwo.sessionListAnswer = { items: [{ sessionId: 's2a', title: '乙会话', updatedAt: 1 }] }
+    stackOne.store.share('s1a')
+    stackTwo.store.share('s2a')
+    const pairedOne = await pool.pair({
+      serverUrl: `http://127.0.0.1:${stackOne.proxyPort}`,
+      token: stackOne.token,
+      deviceId: stackOne.deviceId,
+      deviceName: 'MS9台式机',
+    })
+    const pairedTwo = await pool.pair({
+      serverUrl: `http://127.0.0.1:${stackTwo.proxyPort}`,
+      token: stackTwo.token,
+      deviceId: stackTwo.deviceId,
+      deviceName: 'MS9台式机',
+    })
+    await waitFor(() => pool.entries().length === 2 && pool.entries().every((entry) => entry.client.state === 'online'))
+    await waitFor(() => pool.entries().every((entry) => entry.serverId !== undefined))
+    const SID_ONE = stackOne.serverId
+    const SID_TWO = stackTwo.serverId
+    const V1 = (id) => toVirtual(SID_ONE, id)
+    const V2 = (id) => toVirtual(SID_TWO, id)
+
+    const controller = new AbortController()
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalEventsGateway(localGate)
+    const handle = installIntercept({ raw: localGateway, pool, log: () => {} })
+    wiring.notePoolEvent = () => handle.notePoolEvent()
+
+    // The merged $events stream, drained in the background — the summary and
+    // status sync add frames of their own, so the tests wait on predicates.
+    const merged = await localGateway.wireTap('$events', { args: {} }, undefined, localGateway.operatorPeer(), controller.signal, { signal: controller.signal })
+    const iterator = merged[Symbol.asyncIterator]()
+    localGate.push({ type: 'ready', clientId: 'local-ui-client', host: { home: '/local/home' } })
+    const drained = []
+    const drain = drainInto(iterator, drained)
+    await waitFor(() => drained.length >= 1)
+    assert.deepEqual(drained[0], { type: 'ready', clientId: 'local-ui-client', host: { home: '/local/home' } })
+    await waitFor(() => stackOne.eventsGates.length === 1 && stackTwo.eventsGates.length === 1)
+
+    // ---- invoke routing: each server sees ONLY its own session's page read.
+    const pageOne = await localGateway.rpcBridge(
+      'session/page',
+      { args: { request: { address: { kind: 'session', sessionId: V1('s1a') } } } },
+      undefined,
+      localGateway.operatorPeer(),
+    )
+    assert.deepEqual(pageOne, { ok: true, value: { page: '甲服务端', echoed: 's1a' } })
+    const pageTwo = await localGateway.rpcBridge(
+      'session/page',
+      { args: { request: { address: { kind: 'session', sessionId: V2('s2a') } } } },
+      undefined,
+      localGateway.operatorPeer(),
+    )
+    assert.deepEqual(pageTwo, { ok: true, value: { page: '乙服务端', echoed: 's2a' } })
+    const pagesOf = (stack) => stack.invokeCalls.filter((call) => call.namespace === 'session' && call.method === 'page')
+    assert.deepEqual(pagesOf(stackOne).map((call) => call.args.request.address.sessionId), ['s1a'])
+    assert.deepEqual(pagesOf(stackTwo).map((call) => call.args.request.address.sessionId), ['s2a'])
+
+    // ---- event answer routing: server ONE's waterfall crosses virtualized,
+    // the answer rides back to ONE only, with the original id and the
+    // server's own clientId; server TWO never sees either frame.
+    stackOne.eventsGates[0].push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-a-1', agentId: 's1a', request: { toolName: 'Bash', callId: 'c1', reason: 'run a command' } })
+    await waitFor(() => drained.some((frame) => frame.type === 'waterfall' && frame.eventId.endsWith('.evt-a-1')))
+    const seenOne = drained.find((frame) => frame.type === 'waterfall' && frame.eventId.endsWith('.evt-a-1'))
+    assert.equal(seenOne.eventId.startsWith(V1('')), true)
+    assert.deepEqual(seenOne.agentId, V1('s1a'))
+    const answerOne = await localGateway.rpcBridge(
+      '$events/result',
+      { args: { clientId: 'local-ui-client', eventId: seenOne.eventId, outcome: { kind: 'result', value: 'allowed-once' } } },
+      undefined,
+      undefined,
+    )
+    assert.deepEqual(answerOne, { ok: true, value: undefined })
+    await waitFor(() => stackOne.eventResults.length >= 1)
+    assert.deepEqual(stackOne.eventResults[0].payload, {
+      args: { clientId: 'srv-events-client', eventId: 'evt-a-1', outcome: { kind: 'result', value: 'allowed-once' } },
+    })
+    assert.equal(stackTwo.eventResults.length, 0, 'server ONE\'s answer never reached server TWO')
+
+    // Server TWO's own waterfall answers on ITS leg, ONE's count untouched.
+    stackTwo.eventsGates[0].push({ type: 'waterfall', event: 'approval/request', eventId: 'evt-b-1', agentId: 's2a', request: { toolName: 'Bash', callId: 'c2' } })
+    await waitFor(() => drained.some((frame) => frame.type === 'waterfall' && frame.eventId.endsWith('.evt-b-1')))
+    const seenTwo = drained.find((frame) => frame.type === 'waterfall' && frame.eventId.endsWith('.evt-b-1'))
+    assert.equal(seenTwo.eventId.startsWith(V2('')), true)
+    await localGateway.rpcBridge(
+      '$events/result',
+      { args: { clientId: 'local-ui-client', eventId: seenTwo.eventId, outcome: { kind: 'result', value: 'allowed-once' } } },
+      undefined,
+      undefined,
+    )
+    await waitFor(() => stackTwo.eventResults.length >= 1)
+    assert.deepEqual(stackTwo.eventResults[0].payload.args.eventId, 'evt-b-1')
+    assert.equal(stackOne.eventResults.length, 1)
+    assert.equal(localGateway.rpcCalls.filter((call) => call.endpoint === '$events/result').length, 0, 'no answer ever reached the local gateway')
+
+    // ---- stream routing: server TWO's session page streams from TWO only.
+    const stream = await localGateway.wireTap(
+      'session/follow',
+      { args: { request: { address: { kind: 'session', sessionId: V2('s2a') } } } },
+      undefined,
+      undefined,
+      undefined,
+      { signal: undefined },
+    )
+    const streamIterator = stream[Symbol.asyncIterator]()
+    const pending = streamIterator.next()
+    await waitFor(() => stackTwo.streams.some((gate) => gate.call.namespace === 'session' && gate.call.method === 'follow'))
+    const twoGate = stackTwo.streams.find((gate) => gate.call.namespace === 'session' && gate.call.method === 'follow')
+    assert.deepEqual(twoGate.call.args, { request: { address: { kind: 'session', sessionId: 's2a' } } })
+    assert.equal(stackOne.streams.some((gate) => gate.call.namespace === 'session'), false, 'server ONE saw no stream')
+    twoGate.push({ type: 'event', event: { type: 'turn/start', seq: 1, time: 1, data: {} } })
+    const frame = await pending
+    assert.equal(frame.value.event.type, 'turn/start')
+
+    // ---- the unshare route closes the RIGHT store through the whole chain.
+    const routes = await startClientRouteServer(pool, () => handle.diagnostics())
+    try {
+      const close = await postRoute(routes.port, '/_dsh/zen-remote/client/unshare', { sessionId: V2('s2a') })
+      assert.deepEqual(await close.json(), { ok: true })
+      await waitFor(() => !stackTwo.store.isShared('s2a'))
+      assert.equal(stackOne.store.isShared('s1a'), true, 'server ONE\'s share never blinked')
+      let thrown
+      try { await streamIterator.next() } catch (error) { thrown = error }
+      assert.ok(thrown instanceof Error && thrown.code === 'unshared', `the open TWO page died with unshared, got: ${thrown}`)
+      await waitFor(() => twoGate.aborted)
+
+      // A foreign serverId (paired nowhere) reads remote-mismatch, nothing
+      // travels.
+      const ghost = await postRoute(routes.port, '/_dsh/zen-remote/client/unshare', { sessionId: toVirtual('deadbeef', 'session-x') })
+      const ghostBody = await ghost.json()
+      assert.equal(ghostBody.ok, false)
+      assert.equal(ghostBody.error.code, 'remote-mismatch')
+      assert.equal(stackOne.store.isShared('s1a'), true)
+      assert.equal(stackTwo.store.isShared('s2a'), false)
+    } finally {
+      await routes.stop()
+    }
+
+    controller.abort()
+    await drain
+    handle.uninstall()
+  } finally {
+    await pool.stop()
+    await stackOne.stop()
+    await stackTwo.stop()
   }
 })

@@ -18,7 +18,8 @@
 | `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
 | `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（两角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff）、`debug-report`（脱敏诊断报告，via 墙先于分派，CU-3） |
 | `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
-| `src/share-store.ts` | 共享会话表（`~/.dsh/zen-remote-shares.json`，持久化，重启恢复），中继访问控制的事实来源 |
+| `src/state-store.ts` | 主进程三合一状态存储（MS-1）：`~/.dsh/zen-remote-state.json`（0600、tmp+rename 原子写）统一承载本机 `serverId`、共享表、已配对服务端（最多 8 条），并做旧 `zen-remote-server.json` / `zen-remote-shares.json` 的一次性自动迁移与清理 |
+| `src/share-store.ts` | 共享会话表（读写 `~/.dsh/zen-remote-state.json` 的 `sessions` 段，持久化，重启恢复），中继访问控制的事实来源 |
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
 | `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
 | `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
@@ -27,6 +28,7 @@
 | `src/relay-filter.ts` | 全局流与全局列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
 | `src/session-reference.ts` | 两端共用的 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队消息 edit、`commands/execute` 全部字符串）：服务端照它校验、子客户端照它改写，同一份规则防两端漂移 |
 | `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
+| `src/relay-pool.ts` | 多服务端中继连接池（MS-2，最多 8 台）：按配对顺序管理每台的 `RelayClient`，握手回写 `serverId`/`serverName` 并对同 `serverId` 的旧条目去重（保留最新配对），重名显示名按配对顺序派生 `-1`/`-2`（`deriveDisplayServerNames`），支持按 entryId/serverId 定位、单台/全部重连、移除与改名广播 |
 | `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`，远程会话调用改走中继、虚拟 id 改写、面板判定（客户端那张字段表也在这里） |
 | `src/intercept-shape.ts` | 被包装方法的形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
 | `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端比对 `compareBridges`；不 import DSH、不碰 I/O |
