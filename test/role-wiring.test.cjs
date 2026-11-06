@@ -567,18 +567,25 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
 
 test('T22c-fix: the captured session/event listener refreshes the shared table and ignores id-less sessions', async () => {
   const index = await import(INDEX_URL)
-  // The store is born inside apply() reading <DSH_HOME>/zen-remote-shares.json,
-  // so the test pre-seeds session 'x' with an hour-old stamp BEFORE apply and
-  // watches that file afterwards: the first touch after a load is written
-  // through immediately (share-store's 60s throttle only caps REPEAT writes).
-  const sharesFile = path.join(TEMP_HOME, 'zen-remote-shares.json')
+  // MS-1 automatic migration, still verified end to end through apply(): the
+  // store is born inside apply() reading <DSH_HOME>/zen-remote-state.json, so
+  // a LEGACY zen-remote-shares.json seeds session 'x' (with an hour-old
+  // stamp) BEFORE apply — apply() must fold it into the state file, delete
+  // the legacy file, and the first touch after the load writes through
+  // immediately (share-store's 60s throttle only caps REPEAT writes).
+  const legacyShares = path.join(TEMP_HOME, 'zen-remote-shares.json')
+  const stateFile = path.join(TEMP_HOME, 'zen-remote-state.json')
   const oldStamp = Date.now() - 3_600_000
-  fs.writeFileSync(sharesFile, JSON.stringify({
+  fs.writeFileSync(legacyShares, JSON.stringify({
     version: 1,
     sessions: { x: { sharedAt: oldStamp, lastActivityAt: oldStamp } },
   }))
   const { ctx, listeners } = makeCtx()
   index.apply(ctx, {})
+  assert.equal(fs.existsSync(legacyShares), false, 'the legacy shares file was migrated away')
+  const sharesFile = stateFile
+  const migrated = JSON.parse(fs.readFileSync(sharesFile, 'utf8'))
+  assert.deepEqual(migrated.sessions.x, { sharedAt: oldStamp, lastActivityAt: oldStamp }, 'the row moved into the state file')
   const listener = listeners.find((l) => l.event === 'session/event').listener
 
   // A session-shaped stub carrying the DSH header fields the parent index
@@ -600,7 +607,7 @@ test('T22c-fix: the captured session/event listener refreshes the shared table a
 
 test('T33a: the host role restores busy on startup, auto-shares fresh top-level sessions, follows forks, and skips children; the client role does none of it', async () => {
   const index = await import(INDEX_URL)
-  const sharesFile = path.join(TEMP_HOME, 'zen-remote-shares.json')
+  const sharesFile = path.join(TEMP_HOME, 'zen-remote-state.json')
 
   // A wiring ctx whose inject EXECUTES whenever every service exists — the
   // admin routes need connection, the busy restore needs agents, the relay
@@ -761,7 +768,7 @@ test('T33a-fix: a throwing agent/created listener is swallowed and warned, never
   const index = await import(INDEX_URL)
   // The feed dispatches SERIALLY: a rejection rolls the whole session
   // creation back, so the listener must contain its own failures.
-  fs.rmSync(path.join(TEMP_HOME, 'zen-remote-shares.json'), { force: true })
+  fs.rmSync(path.join(TEMP_HOME, 'zen-remote-state.json'), { force: true })
   const { ctx, listeners, warns } = makeCtx()
   index.apply(ctx, { autoShareNewSessions: true })
   const created = listeners.find((l) => l.event === 'agent/created').listener
@@ -783,7 +790,7 @@ test('T33a-fix: a throwing agent/created listener is swallowed and warned, never
     source: 'startup',
   })
   assert.ok(
-    JSON.parse(fs.readFileSync(path.join(TEMP_HOME, 'zen-remote-shares.json'), 'utf8')).sessions['after-boom'],
+    JSON.parse(fs.readFileSync(path.join(TEMP_HOME, 'zen-remote-state.json'), 'utf8')).sessions['after-boom'],
     'the listener keeps working after a swallowed failure',
   )
 })
@@ -797,7 +804,7 @@ test('PB-26a: agent/created records a subagent child in the parent index AT ONCE
   // agent/created could have recorded it. (Before PB-26a a sidechat child
   // reached the index on its FIRST session/event at the earliest, so the
   // relay answered not-shared for it in between.)
-  const sharesFile = path.join(TEMP_HOME, 'zen-remote-shares.json')
+  const sharesFile = path.join(TEMP_HOME, 'zen-remote-state.json')
   const oldStamp = Date.now() - 3_600_000
   fs.writeFileSync(sharesFile, JSON.stringify({
     version: 1,

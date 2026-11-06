@@ -173,9 +173,26 @@ test('handshake: complete fields, stable serverId across requests and handler in
       assert.equal(body3.serverId, body1.serverId, 'the id is persisted per DSH_HOME, not per instance')
     } finally { await server2.stop() }
 
-    const onDisk = JSON.parse(fs.readFileSync(path.join(parts.home, 'zen-remote-server.json'), 'utf8'))
-    assert.equal(onDisk.serverId, body1.serverId, 'and the persisted file carries it')
+    const onDisk = JSON.parse(fs.readFileSync(path.join(parts.home, 'zen-remote-state.json'), 'utf8'))
+    assert.equal(onDisk.serverId, body1.serverId, 'and the persisted state file carries it')
   } finally { await server.stop() }
+})
+
+test('loadServerId migrates a legacy zen-remote-server.json identity into the state file (MS-1)', () => {
+  const home = path.join(ROOT, 'serverid-migration')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(path.join(home, 'zen-remote-server.json'), JSON.stringify({ serverId: 'feedbeef' }))
+
+  const id = loadServerId(home)
+  assert.equal(id, 'feedbeef', 'the legacy identity is kept — paired devices never see a stranger')
+
+  const state = JSON.parse(fs.readFileSync(path.join(home, 'zen-remote-state.json'), 'utf8'))
+  assert.equal(state.serverId, 'feedbeef', 'it now lives in the state file')
+  assert.equal(fs.existsSync(path.join(home, 'zen-remote-server.json')), false, 'the legacy file is deleted after the migration')
+  assert.equal((fs.statSync(path.join(home, 'zen-remote-state.json')).mode & 0o777), 0o600, 'the state file is 0600')
+
+  // A second call reads the migrated id straight from the state file.
+  assert.equal(loadServerId(home), 'feedbeef')
 })
 
 test('handshake: an empty request body is accepted, non-JSON content is 400', async () => {

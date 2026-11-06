@@ -195,9 +195,12 @@ export interface RelayHandler {
 }
 /**
  * Read the persisted server id, creating (and persisting) one on first use.
- * A missing file is the normal first run; an unreadable or damaged file must
- * never take the host down, so every failure degrades to a fresh per-process
- * id that simply is not remembered across restarts.
+ * A pre-multi-server `zen-remote-server.json` identity migrates in first
+ * (and its file is deleted) — an upgraded host keeps its id, so paired
+ * devices never see a stranger. A missing file is the normal first run; an
+ * unreadable or damaged file must never take the host down, so every failure
+ * degrades to a fresh per-process id that simply is not remembered across
+ * restarts.
  */
 export declare function loadServerId(home: string): string;
 /**

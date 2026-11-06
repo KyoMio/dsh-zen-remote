@@ -100,7 +100,7 @@ export type { BridgeDeclaration, ZenRemoteService } from './plugin-bridge.js'
 // plugin row's public surface stays on the main entry. The same-origin gate
 // moved to src/http.ts next to the response envelope (T14) but its export
 // stays here for scripts/check-upload-endpoint.mjs.
-export { Config, resolveRole } from './config.js'
+export { Config, resolveRole, servesRole, connectsRole } from './config.js'
 export { sameOriginPost } from './http.js'
 
 // The two sub-plugin entries the host role loads. They ship as plain .mjs at
@@ -767,8 +767,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // keep its "quiet for idleHours → close" promise. The settings surface is
     // a later task.
     const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+    // MS-1: the table now lives INSIDE the three-in-one state file (alongside
+    // the server identity and the paired-servers list); share-store's loader
+    // migrates a legacy zen-remote-shares.json in and every write preserves
+    // the other two top-level fields.
     const store = createShareStore({
-      file: join(home, 'zen-remote-shares.json'),
+      file: join(home, 'zen-remote-state.json'),
       idleHours: effective.values.idleHours,
     })
     // The live relay handler, kept so the admin shares route can read viewer
