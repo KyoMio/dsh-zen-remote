@@ -47,6 +47,26 @@ test('T74: the model-menu group rules key on the data-zr-group stamp and the htm
   )
 })
 
+test('MS-4: another paired server\'s groups (remote-other) hide in a remote session AND outside one', () => {
+  // A remote session on server A shows only A's groups: B's are stamped
+  // remote-other by the effect and hidden here…
+  assert.match(
+    sheet,
+    /html\[data-zr-remote-session="1"\] section\[role="group"\]\[data-zr-group="remote-other"\] \{\s*display: none !important;/,
+  )
+  // …and a local session hides every remote group, remote-other included.
+  assert.match(
+    sheet,
+    /html:not\(\[data-zr-remote-session\]\) section\[role="group"\]\[data-zr-group="remote-other"\] \{\s*display: none !important;/,
+  )
+  // The plain-remote stamp must NOT be hidden inside a remote session —
+  // those are the open session's own server's groups.
+  assert.ok(
+    !/html\[data-zr-remote-session="1"\] section\[role="group"\]\[data-zr-group="remote"\]/.test(sheet),
+    'the session\'s own server groups stay visible',
+  )
+})
+
 test('T52-fix: native <option> rows with a virtual group value are hidden unconditionally', () => {
   // dsh-vision-router's settings render its vision-backend picker as
   // <option value={group.id}> and its filter keeps zr~ groups; a virtual

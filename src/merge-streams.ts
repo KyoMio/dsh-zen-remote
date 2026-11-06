@@ -142,7 +142,7 @@
  * `zr~<serverId>~provider/model` fallback string (the pre-fix2 display).
  */
 
-import { fromVirtual, isVirtual, toVirtual, VIRTUAL_GROUP_NAME_MARK } from './virtual-id.js'
+import { encodeServerIdZeroWidth, fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
 
 /** The (serverId, serverName) pair a merger virtualizes with. A re-handshake
  * with a different server retargets the SAME merger ({@link retarget}) so the
@@ -1282,7 +1282,9 @@ export function mergeSessionList(localResult: unknown, remoteResult: unknown, se
  *   order, RT dsh-client-ui-model-selection lib/client.js:510 — appended
  *   groups render last); each group id becomes the virtual group id
  *   `zr~<serverId>~<original>` and its name is prefixed
- *   `${VIRTUAL_GROUP_NAME_MARK}${serverName} · ${name}` — the same workspace
+ *   `${encodeServerIdZeroWidth(serverId)}${serverName} · ${name}` (MS-4: the
+ *   WORD JOINER mark plus the serverId as 32 zero-width bits, so the browser
+ *   can hide OTHER paired servers' groups too) — the same workspace
  *   title discipline the merger uses, PLUS the invisible WORD JOINER (T74):
  *   the model menu's groups stopped carrying their id in the markup (0.2.0's
  *   MenuGroup renders `aria-labelledby={useId()}` only), so the browser
@@ -1328,7 +1330,7 @@ export function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, id
       ...group,
       id,
       ...(typeof group.name === 'string'
-        ? { name: `${VIRTUAL_GROUP_NAME_MARK}${identity.serverName} · ${group.name}` }
+        ? { name: `${encodeServerIdZeroWidth(identity.serverId)}${identity.serverName} · ${group.name}` }
         : {}),
     })
   }

@@ -1119,3 +1119,185 @@ test("PB-26a: an adapter's client.response virtualize calls are reported as mint
     await h.stop()
   }
 })
+
+// ---- MS-4: per-serverId routing (getRelayForServer / getStatusForServer /
+// getKnownRealIdsForServer) ---------------------------------------------------
+//
+// Two paired servers A and B, each with its OWN fake relay, bridge verdicts
+// and known-real-id inventory. The single-server options are still passed
+// (the legacy shape stays required) but wired to a DECOY that would let
+// everything through — any request reaching it, or any verdict read off it,
+// is a routing leak.
+
+const POOL_A = 'aaaa1111'
+const POOL_B = 'bbbb2222'
+const WS_DECLARED = { plugin: 'ws-panel', version: '1.0.0', routes: [{ path: '/ws/tunnel', scope: 'session', upgrade: true }] }
+
+/** A relay client stub with a tunnel door that records the open and
+ * refuses with a recognizable code — the raw socket then carries that code
+ * as the 503 reason, which proves WHICH relay was asked. */
+function withTunnelStub(client, label) {
+  client.tunnelOpens = []
+  client.pluginTunnelOpen = async (request) => {
+    client.tunnelOpens.push(request)
+    throw Object.assign(new Error('stub'), { code: `tunnel-refused-${label}` })
+  }
+  return client
+}
+
+async function startPoolHarness() {
+  const host = await startFakeHost()
+  host.registerLocalPlugin()
+  const relayA = await startFakeRelay()
+  const relayB = await startFakeRelay()
+  const decoyRelay = await startFakeRelay()
+  const clients = {
+    [POOL_A]: withTunnelStub(fakeRelayClient(relayA.__port), 'a'),
+    [POOL_B]: withTunnelStub(fakeRelayClient(relayB.__port), 'b'),
+  }
+  const decoy = withTunnelStub(fakeRelayClient(decoyRelay.__port), 'decoy')
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED_V2)
+  registry.register(WS_DECLARED)
+  const bridged = (plugin, version) => ({ plugin, bridged: true, localVersion: version, serverVersion: version })
+  const statuses = {
+    [POOL_A]: [bridged('v2-panel', '2.0.0'), bridged('ws-panel', '1.0.0')],
+    [POOL_B]: [bridged('v2-panel', '2.0.0'), bridged('ws-panel', '1.0.0')],
+  }
+  const known = { [POOL_A]: new Set(['session-live-a']), [POOL_B]: new Set(['session-live-b']) }
+  const statusReads = []
+  const handle = installPluginRouteIntercept({
+    webServer: host.raw,
+    registry,
+    relay: decoy,
+    getServerId: () => 'deadbeef',
+    getStatus: () => [bridged('v2-panel', '2.0.0'), bridged('ws-panel', '1.0.0')],
+    getKnownRealIds: () => new Set(['session-live-a', 'session-live-b']),
+    getRelayForServer: (serverId) => clients[serverId],
+    getStatusForServer: (serverId) => { statusReads.push(serverId); return statuses[serverId] ?? [] },
+    getKnownRealIdsForServer: (serverId) => known[serverId] ?? new Set(),
+    log: () => {},
+  })
+  return {
+    host, relayA, relayB, decoyRelay, clients, decoy, statuses, statusReads,
+    stop: async () => {
+      handle.uninstall()
+      await relayA.stop()
+      await relayB.stop()
+      await decoyRelay.stop()
+      await host.stop()
+    },
+  }
+}
+
+test('MS-4: query and json-body routes forward each server\'s ids through THAT server\'s relay, judged by THAT server\'s bridge verdicts', async () => {
+  const h = await startPoolHarness()
+  try {
+    const toA = await h.host.get(`/v2/plain?sessionId=${encodeURIComponent(toVirtual(POOL_A, 'session-a1'))}`)
+    assert.equal(toA.status, 200)
+    const toB = await h.host.get(`/v2/plain?sessionId=${encodeURIComponent(toVirtual(POOL_B, 'session-b1'))}`)
+    assert.equal(toB.status, 200)
+    assert.deepEqual(h.relayA.state.hits.map((hit) => hit.zrQuery), ['sessionId=session-a1'])
+    assert.deepEqual(h.relayB.state.hits.map((hit) => hit.zrQuery), ['sessionId=session-b1'])
+
+    // The json-body half routes the same way.
+    const bodyB = await h.host.get('/v2/command', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: toVirtual(POOL_B, 'session-b2'), note: 'x' }),
+    })
+    assert.equal(bodyB.status, 200)
+    assert.deepEqual(JSON.parse(h.relayB.state.hits[1].body), { sessionId: 'session-b2', note: 'x' })
+    assert.equal(h.relayA.state.hits.length, 1)
+
+    // B's plugin goes unbridged: B's requests refuse with B's OWN reason,
+    // A keeps forwarding — no cross-talk between the two verdict tables.
+    h.statuses[POOL_B] = [{ plugin: 'v2-panel', bridged: false, reason: 'version-mismatch', localVersion: '2.0.0' }]
+    const refusedB = await h.host.get(`/v2/plain?sessionId=${encodeURIComponent(toVirtual(POOL_B, 'session-b1'))}`)
+    assert.equal(refusedB.status, 503)
+    assert.equal((await refusedB.json()).error.reason, 'version-mismatch')
+    const stillA = await h.host.get(`/v2/plain?sessionId=${encodeURIComponent(toVirtual(POOL_A, 'session-a1'))}`)
+    assert.equal(stillA.status, 200)
+    assert.equal(h.relayB.state.hits.length, 2, 'the refused B request never left')
+    assert.equal(h.relayA.state.hits.length, 2)
+    assert.ok(h.statusReads.includes(POOL_A) && h.statusReads.includes(POOL_B), 'each server\'s verdicts were read by its own id')
+
+    // A server the pool does not hold: server-changed, nothing forwarded.
+    const unknown = await h.host.get(`/v2/plain?sessionId=${encodeURIComponent(toVirtual('cccc3333', 'session-c'))}`)
+    assert.equal(unknown.status, 503)
+    assert.equal((await unknown.json()).error.reason, 'server-changed')
+    assert.equal(h.decoyRelay.state.hits.length, 0, 'the single-server relay is never used in pool mode')
+    assert.equal(h.host.hits.localCommand, 0, 'no remote request ever reached the local plugin')
+  } finally {
+    await h.stop()
+  }
+})
+
+test('MS-4: one request naming ids of TWO servers refuses server-changed — nothing forwarded anywhere', async () => {
+  const h = await startPoolHarness()
+  try {
+    const res = await h.host.get('/v2/command', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: toVirtual(POOL_A, 'session-a1'), childId: toVirtual(POOL_B, 'session-b1') }),
+    })
+    assert.equal(res.status, 503)
+    assert.equal((await res.json()).error.reason, 'server-changed')
+    assert.equal(h.relayA.state.hits.length + h.relayB.state.hits.length + h.decoyRelay.state.hits.length, 0)
+    assert.equal(h.host.hits.localCommand, 0)
+  } finally {
+    await h.stop()
+  }
+})
+
+test('MS-4: a rewriteIds answer consults ONLY its own server\'s known-real-id inventory', async () => {
+  const h = await startPoolHarness()
+  try {
+    const reply = (req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ a: 'session-live-a', b: 'session-live-b' }))
+    }
+    h.relayA.state.reply = reply
+    h.relayB.state.reply = reply
+    const viaA = await h.host.get(`/v2/rewrite?sessionId=${encodeURIComponent(toVirtual(POOL_A, 'session-a1'))}`)
+    assert.deepEqual(await viaA.json(), { a: toVirtual(POOL_A, 'session-live-a'), b: 'session-live-b' })
+    const viaB = await h.host.get('/v2/rewrite-body', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: toVirtual(POOL_B, 'session-b1') }),
+    })
+    assert.deepEqual(await viaB.json(), { a: 'session-live-a', b: toVirtual(POOL_B, 'session-live-b') })
+  } finally {
+    await h.stop()
+  }
+})
+
+test('MS-4: a WebSocket upgrade opens its tunnel on its own server\'s relay; an unknown server refuses before any tunnel', async () => {
+  const h = await startPoolHarness()
+  try {
+    const speak = (target) => new Promise((resolve, reject) => {
+      const socket = net.connect(h.host.port, '127.0.0.1', () => {
+        socket.write(`GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`)
+      })
+      let data = ''
+      socket.on('data', (chunk) => { data += chunk.toString('utf8') })
+      socket.on('close', () => resolve(data))
+      socket.on('error', reject)
+      const timer = setTimeout(() => { socket.destroy(); reject(new Error('upgrade answer timed out')) }, 5000)
+      socket.on('close', () => clearTimeout(timer))
+    })
+    const viaA = await speak(`/ws/tunnel?sessionId=${encodeURIComponent(toVirtual(POOL_A, 'session-a1'))}`)
+    assert.match(viaA, /"reason":"tunnel-refused-a"/)
+    const viaB = await speak(`/ws/tunnel?sessionId=${encodeURIComponent(toVirtual(POOL_B, 'session-b1'))}`)
+    assert.match(viaB, /"reason":"tunnel-refused-b"/)
+    assert.deepEqual(h.clients[POOL_A].tunnelOpens.map((r) => r.query), ['sessionId=session-a1'])
+    assert.deepEqual(h.clients[POOL_B].tunnelOpens.map((r) => r.query), ['sessionId=session-b1'])
+
+    const unknown = await speak(`/ws/tunnel?sessionId=${encodeURIComponent(toVirtual('cccc3333', 'session-c'))}`)
+    assert.match(unknown, /^HTTP\/1\.1 503/)
+    assert.match(unknown, /"reason":"server-changed"/)
+    assert.equal(h.decoy.tunnelOpens.length, 0, 'the single-server relay never opened a tunnel')
+  } finally {
+    await h.stop()
+  }
+})

@@ -1,9 +1,10 @@
 import type { ClientContext, MobileSessionRow } from '../compat/types.ts'
 import { mainSessionIdOf } from '../compat/types.ts'
-import { isVirtual } from '../../virtual-id.ts'
+import { fromVirtual, isVirtual } from '../../virtual-id.ts'
 import { REMOTE_SESSION_CSS } from '../styles/remote-session.css.ts'
 import { BRIDGE_STAMP_ATTRIBUTE, BRIDGE_STAMP_PLUGIN, getRemoteStatusStore, shouldStampBridgeAttribute, subscribeIfVirtual } from '../../client-data/remote-status.ts'
 import { en, zh } from '../locales.ts'
+import { REMOTE_SERVER_ATTRIBUTE } from '../../client-data/model-group-side.ts'
 
 /**
  * The remote-session marker (T41b): the CURRENT main-view session id, read
@@ -13,6 +14,12 @@ import { en, zh } from '../locales.ts'
  * otherwise. remote-session.css.ts turns the attribute into the hiding of
  * every open-on-the-server-machine entry, so the decision lives at the one
  * place that knows the session and never inside component DOM.
+ *
+ * MS-4: with several servers paired, the virtual id's serverId half is
+ * stamped alongside as `data-zr-remote-server="<serverId>"` — the model
+ * menu's per-server isolation (effects/model-group-side.ts reads it to hide
+ * the OTHER paired servers' groups; remote-session.css.ts hides them). Both
+ * attributes move together: a local session (or unmount) clears both.
  *
  * The official tie-break is kept verbatim: when the previous answer is still
  * mainView-retained it STAYS the answer, and only otherwise does the first
@@ -66,8 +73,14 @@ export function installRemoteSessionGuard(ctx: ClientContext): void {
     const apply = (): void => {
       const sessionId = currentMainSessionIdOf(ctx)
       const root = document.documentElement
-      if (sessionId !== undefined && isVirtual(sessionId)) root.setAttribute('data-zr-remote-session', '1')
-      else root.removeAttribute('data-zr-remote-session')
+      const parts = sessionId !== undefined ? fromVirtual(sessionId) : undefined
+      if (parts !== undefined) {
+        root.setAttribute('data-zr-remote-session', '1')
+        if (root.getAttribute(REMOTE_SERVER_ATTRIBUTE) !== parts.serverId) root.setAttribute(REMOTE_SERVER_ATTRIBUTE, parts.serverId)
+      } else {
+        root.removeAttribute('data-zr-remote-session')
+        root.removeAttribute(REMOTE_SERVER_ATTRIBUTE)
+      }
     }
     apply()
     const offs: Array<() => void> = [ctx.sessions.list.subscribe(apply)]
@@ -79,6 +92,7 @@ export function installRemoteSessionGuard(ctx: ClientContext): void {
     return () => {
       for (const off of offs) off()
       document.documentElement.removeAttribute('data-zr-remote-session')
+      document.documentElement.removeAttribute(REMOTE_SERVER_ATTRIBUTE)
     }
   }, 'dsh-zen-remote: remote-session attribute')
 

@@ -374,6 +374,18 @@ export interface InstallPluginRouteInterceptOptions {
    * consumption: nothing here mutates merge state. Absent → the scan is
    * exactly the request-local PB-22 behavior. */
   getKnownRealIds?: () => ReadonlySet<string>
+  /** MS-4: the per-server faces of the connection pool. A request whose
+   * located ids are `zr~<serverId>~…` is validated, forwarded and
+   * response-rewritten against THAT server alone: its relay client
+   * (`undefined` — a server the pool does not hold — refuses
+   * `server-changed`), its bridge verdicts and its known-real-id inventory.
+   * Each is optional and falls back on its own to the single-server face
+   * above: no `getRelayForServer` → `relay` exactly when the id belongs to
+   * `getServerId()`; no `getStatusForServer` → `getStatus()`; no
+   * `getKnownRealIdsForServer` → `getKnownRealIds()`. All read live. */
+  getRelayForServer?: (serverId: string) => RelayClient | undefined
+  getStatusForServer?: (serverId: string) => BridgeStatus[]
+  getKnownRealIdsForServer?: (serverId: string) => ReadonlySet<string>
   /** PB-26a: called with the virtual session ids a response rewrite
    * PRODUCED — a `rewriteIds.fields` route's wrapped positions, or the ids
    * an adapter's `client.response` hook passed through `virtualize` (e.g.
@@ -490,6 +502,34 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   const getCurrentSession = options.getCurrentSession
   const getKnownRealIds = options.getKnownRealIds
   const onMintedVirtualIds = options.onMintedVirtualIds
+  const { getRelayForServer, getStatusForServer, getKnownRealIdsForServer } = options
+  /** MS-4: the relay client serving one server id, or `undefined` (the
+   * `server-changed` refusal). */
+  const relayOfServer = (serverId: string): RelayClient | undefined =>
+    getRelayForServer !== undefined ? getRelayForServer(serverId) : serverId === getServerId() ? relay : undefined
+  const statusesOfServer = (serverId: string): BridgeStatus[] =>
+    getStatusForServer !== undefined ? getStatusForServer(serverId) : getStatus()
+  const knownRealIdsOfServer = (serverId: string): ReadonlySet<string> | undefined =>
+    getKnownRealIdsForServer !== undefined ? getKnownRealIdsForServer(serverId) : getKnownRealIds?.()
+  /** MS-4: the one server every located virtual id of a request belongs to,
+   * with its relay client — or the refusal reason, judged id by id in hit
+   * order (the single-server walls' order). A request naming ids of two
+   * servers is refused like a foreign one: it has no single home. */
+  const serverOfHits = (hits: readonly AdapterIdHit[]): { serverId: string; relay: RelayClient } | 'bad-query' | 'server-changed' => {
+    let located: { serverId: string; relay: RelayClient } | undefined
+    for (const idHit of hits) {
+      const parts = fromVirtual(idHit.value)
+      if (parts === undefined || parts.id === '') return 'bad-query'
+      if (located === undefined) {
+        const target = relayOfServer(parts.serverId)
+        if (target === undefined) return 'server-changed'
+        located = { serverId: parts.serverId, relay: target }
+      } else if (parts.serverId !== located.serverId) {
+        return 'server-changed'
+      }
+    }
+    return located ?? 'bad-query'
+  }
   const target = webServer as { match: (this: unknown, pathname: string) => unknown }
   const savedMatch = target.match
 
@@ -661,7 +701,8 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         answerUnbridged(res, declared.plugin, 'bad-query')
         return
       }
-      if (parts.serverId !== getServerId()) {
+      const targetRelay = relayOfServer(parts.serverId)
+      if (targetRelay === undefined) {
         answerUnbridged(res, declared.plugin, 'server-changed')
         return
       }
@@ -687,7 +728,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         log?.('plugin request for %s refused locally: body-too-large (%s declared)', declared.path, req.headers['content-length'])
         return
       }
-      const status = getStatus().find((entry) => entry.plugin === declared.plugin)
+      const status = statusesOfServer(parts.serverId).find((entry) => entry.plugin === declared.plugin)
       if (status === undefined || !status.bridged) {
         answerUnbridged(res, declared.plugin, status?.reason ?? 'not-on-server')
         return
@@ -757,7 +798,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           bodyStream = Readable.toWeb(gate) as ReadableStream<Uint8Array>
           req.pipe(gate)
         }
-        const response = await relay.pluginRequest(
+        const response = await targetRelay.pluginRequest(
           {
             plugin: declared.plugin,
             version: declared.version,
@@ -794,7 +835,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // known inventory, read live right here (undefined when the wiring
         // passed no getter — the scan stays request-local).
         if (declared.rewriteIds) {
-          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, parts.serverId, getKnownRealIds?.(), onMintedVirtualIds)
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, parts.serverId, knownRealIdsOfServer(parts.serverId), onMintedVirtualIds)
           return
         }
         const contentType = response.headers.get('content-type')
@@ -989,7 +1030,6 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           answerUnbridged(res, plugin, 'method-not-bridged')
           return
         }
-        const serverId = getServerId()
         // PB-22: the request's own real→virtual pairs, collected while the
         // wall validates each hit — the READ-ONLY mapping a rewriteIds
         // route's answer scan consults (`zr~` carries the real id inside, so
@@ -1001,24 +1041,19 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // ONE more source beside this mapping — the known-real-session
         // inventory, read live at the answer (never copied here) and
         // consumed read-only; nothing here writes any session table.
-        const idMapping = new Map<string, string>()
-        let locatedServerId: string | undefined
-        for (const idHit of verdict.hits) {
-          const parts = fromVirtual(idHit.value)
-          if (parts === undefined || parts.id === '') {
-            answerUnbridged(res, plugin, 'bad-query')
-            return
-          }
-          if (parts.serverId !== serverId) {
-            answerUnbridged(res, plugin, 'server-changed')
-            return
-          }
-          idMapping.set(parts.id, idHit.value)
-          locatedServerId = parts.serverId
+        // MS-4: every located id must name ONE server the wiring serves;
+        // that server's relay, verdicts and inventory carry the rest.
+        const home = serverOfHits(verdict.hits)
+        if (home === 'bad-query' || home === 'server-changed') {
+          answerUnbridged(res, plugin, home)
+          return
         }
+        const locatedServerId = home.serverId
+        const idMapping = new Map<string, string>()
+        for (const idHit of verdict.hits) idMapping.set(fromVirtual(idHit.value)!.id, idHit.value)
         // The bridge verdicts judged from the SAME live table the query
         // half reads.
-        const status = getStatus().find((entry) => entry.plugin === plugin)
+        const status = statusesOfServer(locatedServerId).find((entry) => entry.plugin === plugin)
         if (status === undefined || !status.bridged) {
           answerUnbridged(res, plugin, status?.reason ?? 'not-on-server')
           return
@@ -1078,7 +1113,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           req.pipe(gate)
           if (Number.isFinite(declaredLength) && declaredLength > 0) contentLength = declaredLength
         }
-        const response = await relay.pluginRequest(
+        const response = await home.relay.pluginRequest(
           {
             plugin,
             version: declared.version,
@@ -1104,7 +1139,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           return
         }
         if (declared.rewriteIds) {
-          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, locatedServerId!, getKnownRealIds?.(), onMintedVirtualIds)
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, locatedServerId, knownRealIdsOfServer(locatedServerId), onMintedVirtualIds)
           return
         }
         const contentType = response.headers.get('content-type')
@@ -1300,23 +1335,18 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           answerUnbridged(res, plugin, 'method-not-bridged')
           return
         }
-        const serverId = getServerId()
-        for (const idHit of verdict.hits) {
-          const parts = fromVirtual(idHit.value)
-          if (parts === undefined || parts.id === '') {
-            answerUnbridged(res, plugin, 'bad-query')
-            return
-          }
-          if (parts.serverId !== serverId) {
-            answerUnbridged(res, plugin, 'server-changed')
-            return
-          }
+        // MS-4: one home server for every located id.
+        const home = serverOfHits(verdict.hits)
+        if (home === 'bad-query' || home === 'server-changed') {
+          answerUnbridged(res, plugin, home)
+          return
         }
+        const serverId = home.serverId
         // The bridge verdicts (version skew, consent, offline…) judged from
         // the SAME live table the cooperative surrogate reads — the
         // adapter's registry entry makes the plugin indistinguishable from
         // a cooperative one here.
-        const status = getStatus().find((entry) => entry.plugin === plugin)
+        const status = statusesOfServer(serverId).find((entry) => entry.plugin === plugin)
         if (status === undefined || !status.bridged) {
           answerUnbridged(res, plugin, status?.reason ?? 'not-on-server')
           return
@@ -1375,7 +1405,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           bodyStream = Readable.toWeb(gate) as ReadableStream<Uint8Array>
           req.pipe(gate)
         }
-        const response = await relay.pluginRequest(
+        const response = await home.relay.pluginRequest(
           {
             plugin,
             version: adapter.declaration.version,
@@ -1480,7 +1510,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             pathname,
             body: JSON.parse(text),
             virtualize: (id: string) => {
-              const virtualId = toVirtual(serverId ?? '', id)
+              const virtualId = toVirtual(serverId, id)
               if (isVirtual(virtualId)) minted.add(virtualId)
               return virtualId
             },
@@ -1744,6 +1774,9 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
 
       // ---- the remote pipe: the PB-10 tunnel, frame by frame -------------
       let tunnelHandle: { tunnel: string; frames: AsyncIterable<Uint8Array> } | undefined
+      // MS-4: the server the tunnel was opened on — set together with
+      // tunnelHandle, the relay every later send and the close travel.
+      let tunnelServer: { serverId: string; relay: RelayClient } | undefined
       // The connection-wide real→virtual mapping the rewriteIds deep scan
       // consults: EVERY validated remote frame's ids merge in (a watch list
       // that grows mid-connection makes the later answers rewritable too —
@@ -1764,7 +1797,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
        * never a silent broken flag: that would leak `tunnelsCurrent` and
        * leave the browser hanging on a dead tunnel. */
       const sendTextUpstream = async (frame: Rfc6455Frame, parsedJson: unknown, hits: AdapterIdHit[]): Promise<void> => {
-        if (upstreamBroken || tunnelHandle === undefined) return
+        if (upstreamBroken || tunnelHandle === undefined || tunnelServer === undefined) return
         const rewrite = hits.length > 0
           ? rewriteAdapterRequest(declared.view, declared.path, new URLSearchParams(), parsedJson, hits, (virtualId) => fromVirtual(virtualId)!.id)
           : undefined
@@ -1772,7 +1805,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const seq = upstreamSeq
         upstreamSeq += 1
         try {
-          await relay.pluginTunnelSend(tunnelHandle.tunnel, seq, encodeRfc6455Frame(0x1, payload, true, frame.fin))
+          await tunnelServer.relay.pluginTunnelSend(tunnelHandle.tunnel, seq, encodeRfc6455Frame(0x1, payload, true, frame.fin))
         } catch {
           killExchange()
         }
@@ -1819,7 +1852,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
                     })), 'utf8')
                     hooked = true
                   } else if (declared.rewriteIds) {
-                    const scanned = deepRewriteIds(parsedJson, idMapping, getKnownRealIds?.(), serverId)
+                    const scanned = deepRewriteIds(parsedJson, idMapping, knownRealIdsOfServer(serverId), serverId)
                     if (declared.rewriteFields !== undefined) rewriteIdsAtFields(scanned, declared.rewriteFields, serverId)
                     outPayload = Buffer.from(JSON.stringify(scanned), 'utf8')
                     hooked = true
@@ -1917,24 +1950,18 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           }
           return
         }
-        const serverId = getServerId()
-        if (serverId === undefined) {
+        // MS-4: the frame's ids name one served server, and once the tunnel
+        // is open every later frame must name the tunnel's own server.
+        const home = serverOfHits(verdict.hits)
+        if (home === 'bad-query' || home === 'server-changed' || (tunnelServer !== undefined && home.serverId !== tunnelServer.serverId)) {
           refuseAndDie('server-changed')
           return
         }
-        const mapping = new Map<string, string>()
-        for (const idHit of verdict.hits) {
-          const parts = fromVirtual(idHit.value)
-          if (parts === undefined || parts.id === '' || parts.serverId !== serverId) {
-            refuseAndDie('server-changed')
-            return
-          }
-          mapping.set(parts.id, idHit.value)
-        }
+        const serverId = home.serverId
         // This frame's ids join the connection-wide mapping (see idMapping).
-        for (const [key, value] of mapping) idMapping.set(key, value)
+        for (const idHit of verdict.hits) idMapping.set(fromVirtual(idHit.value)!.id, idHit.value)
         if (tunnelHandle === undefined) {
-          const status = getStatus().find((entry) => entry.plugin === plugin)
+          const status = statusesOfServer(serverId).find((entry) => entry.plugin === plugin)
           if (status === undefined || !status.bridged) {
             refuseAndDie(status?.reason ?? 'not-on-server')
             return
@@ -1944,7 +1971,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           let opened: { tunnel: string; frames: AsyncIterable<Uint8Array> }
           try {
             log?.('opening tunnel for %s', declared.path)
-            opened = await relay.pluginTunnelOpen(
+            opened = await home.relay.pluginTunnelOpen(
               {
                 plugin,
                 version: declared.version,
@@ -1962,6 +1989,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           }
           tunnelsCurrent += 1
           tunnelsOpened += 1
+          tunnelServer = home
           tunnelHandle = opened
           log?.('tunnel open for %s: %s', declared.path, opened.tunnel)
           teardownTunnel = (): void => {
@@ -1969,7 +1997,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             upstreamBroken = true
             tunnelsCurrent -= 1
             tunnelsClosed += 1
-            void relay.pluginTunnelClose(opened.tunnel).catch(() => {})
+            void home.relay.pluginTunnelClose(opened.tunnel).catch(() => {})
           }
           socket.on('close', teardownTunnel)
           socket.on('error', teardownTunnel)
@@ -1988,11 +2016,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             localSocket.push(frame.raw)
             return
           }
-          if (tunnelHandle !== undefined && !upstreamBroken) {
+          if (tunnelHandle !== undefined && tunnelServer !== undefined && !upstreamBroken) {
             const seq = upstreamSeq
             upstreamSeq += 1
             try {
-              await relay.pluginTunnelSend(tunnelHandle.tunnel, seq, frame.raw)
+              await tunnelServer.relay.pluginTunnelSend(tunnelHandle.tunnel, seq, frame.raw)
             } catch {
               // The send died: tear the exchange down COMPLETELY — the
               // counter, the close, the browser socket (a bare broken flag
@@ -2100,7 +2128,8 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
           return
         }
-        if (parts.serverId !== getServerId()) {
+        const tunnelRelay = relayOfServer(parts.serverId)
+        if (tunnelRelay === undefined) {
           answerUnbridgedSocket(socket, declared.plugin, 'server-changed')
           return
         }
@@ -2108,7 +2137,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // the tunnel opens only for a plugin bridged RIGHT NOW — an absent
         // or unbridged status refuses with its own reason, and the local
         // plugin handler is never reached.
-        const bridgeStatus = getStatus().find((entry) => entry.plugin === declared.plugin)
+        const bridgeStatus = statusesOfServer(parts.serverId).find((entry) => entry.plugin === declared.plugin)
         if (bridgeStatus === undefined || !bridgeStatus.bridged) {
           answerUnbridgedSocket(socket, declared.plugin, bridgeStatus?.reason ?? 'not-on-server')
           return
@@ -2129,7 +2158,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         let tunnel: { tunnel: string; frames: AsyncIterable<Uint8Array> }
         try {
           log?.('opening tunnel for %s', declared.path)
-          tunnel = await relay.pluginTunnelOpen(
+          tunnel = await tunnelRelay.pluginTunnelOpen(
             {
               plugin: declared.plugin,
               version: declared.version,
@@ -2207,7 +2236,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             pending = pending.then(async () => {
               if (upstreamBroken) return
               try {
-                await relay.pluginTunnelSend(tunnel.tunnel, seq, bytes, controller.signal)
+                await tunnelRelay.pluginTunnelSend(tunnel.tunnel, seq, bytes, controller.signal)
               } catch {
                 upstreamBroken = true
               }
@@ -2218,7 +2247,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           upstreamBroken = true
           tunnelsCurrent -= 1
           tunnelsClosed += 1
-          void relay.pluginTunnelClose(tunnel.tunnel).catch(() => {})
+          void tunnelRelay.pluginTunnelClose(tunnel.tunnel).catch(() => {})
         }
         socket.on('close', teardownTunnel)
         socket.on('error', teardownTunnel)

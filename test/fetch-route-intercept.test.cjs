@@ -603,3 +603,81 @@ test('fallback (BU-1): a refusal recorded by the primary path keeps every fallba
     assert.equal(connection.fetchRoutes.get(SESSION_EXPORT_PATH).fetch.name, 'wrappedExport', 'the single export wrapper from this install')
   } finally { handle.uninstall() }
 })
+
+// ---- MS-4: per-serverId upload routing (getRelayForServer) -----------------
+
+const SERVER_A = 'aaaa1111'
+const SERVER_B = 'bbbb2222'
+
+/** A pool-shaped install: the single-server `relay`/`getServerId` stay in
+ * the options (the legacy shape is still required) but are decoys — with
+ * getRelayForServer present, routing must come from it alone. */
+function installPool(connection, relays, decoy = fakeRelay({ serverId: 'deadbeef' })) {
+  const handle = installFetchRouteIntercept({
+    connection,
+    relay: decoy,
+    getServerId: () => decoy.handshakeInfo.serverId,
+    getRelayForServer: (serverId) => relays[serverId],
+    attachRetryMs: 5,
+    attachAttempts: 40,
+  })
+  return { handle, decoy }
+}
+
+test('MS-4: uploads to server A and server B sessions each ride their OWN relay client', async () => {
+  const connection = fakeConnection()
+  const relayA = fakeRelay({ serverId: SERVER_A })
+  const relayB = fakeRelay({ serverId: SERVER_B })
+  const { handle, decoy } = installPool(connection, { [SERVER_A]: relayA, [SERVER_B]: relayB })
+  try {
+    const entry = connection.fetchRoutes.get(FILE_UPLOAD_PATH)
+    const toA = await entry.fetch(uploadRequest(toVirtual(SERVER_A, 'session-on-a'), 'to-a', 'a.txt'))
+    assert.deepEqual(JSON.parse(await toA.text()), RECEIPT)
+    const toB = await entry.fetch(uploadRequest(toVirtual(SERVER_B, 'session-on-b'), 'to-b!', 'b.txt'))
+    assert.deepEqual(JSON.parse(await toB.text()), RECEIPT)
+
+    assert.equal(relayA.calls.length, 1, 'A got exactly its own upload')
+    assert.equal(relayA.calls[0].options.sessionId, 'session-on-a', 'A got the REAL id of its session')
+    assert.equal(relayA.calls[0].options.name, 'a.txt')
+    assert.equal(relayA.calls[0].bytes.toString('utf8'), 'to-a')
+    assert.equal(relayB.calls.length, 1, 'B got exactly its own upload')
+    assert.equal(relayB.calls[0].options.sessionId, 'session-on-b')
+    assert.equal(relayB.calls[0].bytes.toString('utf8'), 'to-b!')
+    assert.equal(decoy.calls.length, 0, 'the single-server relay is never consulted in pool mode')
+    assert.equal(connection.seen.upload.length, 0, 'the local route never ran')
+    assert.equal(handle.diagnostics().uploadForwarded, 2)
+  } finally { handle.uninstall() }
+})
+
+test('MS-4: a server the pool does not hold answers remote-mismatch; a held-but-offline one remote-offline', async () => {
+  const connection = fakeConnection()
+  const relayA = fakeRelay({ serverId: SERVER_A, state: 'offline' })
+  const { handle, decoy } = installPool(connection, { [SERVER_A]: relayA })
+  try {
+    const entry = connection.fetchRoutes.get(FILE_UPLOAD_PATH)
+    // Not in the pool (unpaired away, never paired) — and NOT rescued by the
+    // decoy's own handshake id either.
+    for (const serverId of [SERVER_B, 'deadbeef']) {
+      const response = await entry.fetch(uploadRequest(toVirtual(serverId, LOCAL_ID)))
+      assert.equal(response.status, 200)
+      assert.deepEqual(await response.json(), { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端', details: {} } }, serverId)
+    }
+    // In the pool but not online.
+    const offline = await entry.fetch(uploadRequest(toVirtual(SERVER_A, LOCAL_ID)))
+    assert.deepEqual(await offline.json(), { ok: false, error: { code: 'remote-offline', message: '服务端离线，远程会话暂时无法上传文件', details: {} } })
+    assert.equal(relayA.calls.length, 0)
+    assert.equal(decoy.calls.length, 0)
+    assert.deepEqual(handle.diagnostics().recentFailures.map((r) => r.code), ['remote-mismatch', 'remote-mismatch', 'remote-offline'])
+  } finally { handle.uninstall() }
+})
+
+test('MS-4: a local session id still reaches the local route untouched in pool mode', async () => {
+  const connection = fakeConnection()
+  const relayA = fakeRelay({ serverId: SERVER_A })
+  const { handle } = installPool(connection, { [SERVER_A]: relayA })
+  try {
+    const response = await connection.fetchRoutes.get(FILE_UPLOAD_PATH).fetch(uploadRequest(LOCAL_ID, 'local-bytes'))
+    assert.deepEqual(await response.json(), { ok: true, value: { receiptId: 'local', bytes: 11 } })
+    assert.equal(relayA.calls.length, 0)
+  } finally { handle.uninstall() }
+})

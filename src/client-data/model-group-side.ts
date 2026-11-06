@@ -28,7 +28,13 @@
  * counts as a mark, so it can never decide a container by accident.
  */
 
-import { VIRTUAL_GROUP_NAME_MARK } from '../virtual-id.ts'
+import { VIRTUAL_GROUP_NAME_MARK, decodeServerIdZeroWidth } from '../virtual-id.ts'
+
+/** MS-4: the <html> attribute carrying the open REMOTE session's server id
+ * (`zr~<serverId>~…`'s middle half). Written by effects/remote-session.ts
+ * together with `data-zr-remote-session`, read by
+ * effects/model-group-side.ts as the `activeRemoteServerId`. */
+export const REMOTE_SERVER_ATTRIBUTE = 'data-zr-remote-server'
 
 /** One group's display description, as the DOM shows it. */
 export interface ModelGroupHeading {
@@ -42,10 +48,29 @@ export interface ModelGroupHeading {
 /** Per-group verdict, in input order: `remote` for marked headings, `local`
  * for the rest of a container that has at least one, and `undefined` —
  * "stamp nothing" — for every group of a container that holds no mark at
- * all. */
-export type ModelGroupSide = 'remote' | 'local' | undefined
+ * all. MS-4 adds `remote-other`: with a session's own server id known
+ * ({@link classifyModelGroupsForSession}'s `activeRemoteServerId`), a
+ * marked group whose DECODED server id is a DIFFERENT paired server — the
+ * model menu must show only the models of the server the open session
+ * lives on. */
+export type ModelGroupSide = 'remote' | 'local' | 'remote-other' | undefined
 
 export function classifyModelGroups(groups: readonly ModelGroupHeading[]): ModelGroupSide[] {
+  return classifyModelGroupsForSession(groups)
+}
+
+/**
+ * The MS-4 extension: with `activeRemoteServerId` set (the `zr~<serverId>~`
+ * half of the session the browser has open, effects/remote-session.ts),
+ * each marked heading's embedded server id (decodeServerIdZeroWidth)
+ * decides between plain `remote` (the open session's own server, or a
+ * heading whose server cannot be decoded — shown, never hidden) and
+ * `remote-other` (a DIFFERENT paired server's group — hidden in a remote
+ * session by remote-session.css.ts). Without the argument the verdicts
+ * are exactly {@link classifyModelGroups}'s — the single-paired-server
+ * behavior, byte for byte.
+ */
+export function classifyModelGroupsForSession(groups: readonly ModelGroupHeading[], activeRemoteServerId?: string): ModelGroupSide[] {
   // Per container: did any heading carry the mark? Containers are decided
   // independently — one mixed model menu must not turn an all-local
   // container (a second menu elsewhere on the page) into "hide everything
@@ -55,11 +80,13 @@ export function classifyModelGroups(groups: readonly ModelGroupHeading[]): Model
     const had = marked.get(group.containerKey) ?? false
     marked.set(group.containerKey, had || group.headingText.startsWith(VIRTUAL_GROUP_NAME_MARK))
   }
-  return groups.map((group) =>
-    marked.get(group.containerKey)
-      ? group.headingText.startsWith(VIRTUAL_GROUP_NAME_MARK)
-        ? 'remote'
-        : 'local'
-      : undefined,
-  )
+  return groups.map((group) => {
+    if (!marked.get(group.containerKey)) return undefined
+    if (!group.headingText.startsWith(VIRTUAL_GROUP_NAME_MARK)) return 'local'
+    if (activeRemoteServerId !== undefined) {
+      const groupServerId = decodeServerIdZeroWidth(group.headingText)
+      if (groupServerId !== undefined && groupServerId !== activeRemoteServerId) return 'remote-other'
+    }
+    return 'remote'
+  })
 }

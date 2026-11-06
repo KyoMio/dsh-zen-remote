@@ -27,6 +27,11 @@
  * Defensive like the rest of client-data: an empty or missing heading never
  * counts as a mark, so it can never decide a container by accident.
  */
+/** MS-4: the <html> attribute carrying the open REMOTE session's server id
+ * (`zr~<serverId>~…`'s middle half). Written by effects/remote-session.ts
+ * together with `data-zr-remote-session`, read by
+ * effects/model-group-side.ts as the `activeRemoteServerId`. */
+export declare const REMOTE_SERVER_ATTRIBUTE = "data-zr-remote-server";
 /** One group's display description, as the DOM shows it. */
 export interface ModelGroupHeading {
     /** Groups sharing one container share one key (the effect numbers the
@@ -38,7 +43,23 @@ export interface ModelGroupHeading {
 /** Per-group verdict, in input order: `remote` for marked headings, `local`
  * for the rest of a container that has at least one, and `undefined` —
  * "stamp nothing" — for every group of a container that holds no mark at
- * all. */
-export type ModelGroupSide = 'remote' | 'local' | undefined;
+ * all. MS-4 adds `remote-other`: with a session's own server id known
+ * ({@link classifyModelGroupsForSession}'s `activeRemoteServerId`), a
+ * marked group whose DECODED server id is a DIFFERENT paired server — the
+ * model menu must show only the models of the server the open session
+ * lives on. */
+export type ModelGroupSide = 'remote' | 'local' | 'remote-other' | undefined;
 export declare function classifyModelGroups(groups: readonly ModelGroupHeading[]): ModelGroupSide[];
+/**
+ * The MS-4 extension: with `activeRemoteServerId` set (the `zr~<serverId>~`
+ * half of the session the browser has open, effects/remote-session.ts),
+ * each marked heading's embedded server id (decodeServerIdZeroWidth)
+ * decides between plain `remote` (the open session's own server, or a
+ * heading whose server cannot be decoded — shown, never hidden) and
+ * `remote-other` (a DIFFERENT paired server's group — hidden in a remote
+ * session by remote-session.css.ts). Without the argument the verdicts
+ * are exactly {@link classifyModelGroups}'s — the single-paired-server
+ * behavior, byte for byte.
+ */
+export declare function classifyModelGroupsForSession(groups: readonly ModelGroupHeading[], activeRemoteServerId?: string): ModelGroupSide[];
 //# sourceMappingURL=model-group-side.d.ts.map

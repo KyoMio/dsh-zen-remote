@@ -245,11 +245,25 @@ html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) [d
 
    KNOWN BOUNDARY (accepted, not fixed): in a remote session, searching the
    model menu and pressing Enter can commit a HIDDEN local model — the
-   interceptor refuses it with its usual message. */
+   interceptor refuses it with its usual message.
+
+   MS-4, several paired servers: each remote group heading also carries its
+   server id (zero-width bits after the mark, virtual-id.ts
+   encodeServerIdZeroWidth), and the effect reads the open session's server
+   off html[data-zr-remote-server] (effects/remote-session.ts). A remote
+   group of a DIFFERENT server is stamped "remote-other": hidden inside a
+   remote session (only the open session's own server's models can run
+   there) and, like every remote group, outside one. */
 html[data-zr-remote-session="1"] section[role="group"][data-zr-group="local"] {
   display: none !important;
 }
+html[data-zr-remote-session="1"] section[role="group"][data-zr-group="remote-other"] {
+  display: none !important;
+}
 html:not([data-zr-remote-session]) section[role="group"][data-zr-group="remote"] {
+  display: none !important;
+}
+html:not([data-zr-remote-session]) section[role="group"][data-zr-group="remote-other"] {
   display: none !important;
 }
 

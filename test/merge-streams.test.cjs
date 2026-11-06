@@ -12,7 +12,7 @@ const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
 const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue, localWorkspaceLists, composeMergedWorkspaceFrames } = require('../lib/merge-streams.js')
-const { toVirtual, VIRTUAL_GROUP_NAME_MARK } = require('../lib/virtual-id.js')
+const { toVirtual, VIRTUAL_GROUP_NAME_MARK, encodeServerIdZeroWidth, decodeServerIdZeroWidth } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
 const NAME = '主服务器'
@@ -1040,9 +1040,13 @@ test('T52/T74 mergeModelCatalogs: server groups append after the local ones with
   assert.deepEqual(merged.groups, [
     local.groups[0],
     local.groups[1],
-    { id: V('codex'), name: `${MARK}${NAME} · Codex`, models: [{ id: 'sol', name: 'Sol' }] },
-    { id: V('claude'), name: `${MARK}${NAME} · Claude`, models: [{ id: 'sonnet', name: 'Sonnet' }] },
+    // MS-4: the mark is now the full zero-width serverId prefix, so the
+    // browser can tell WHICH paired server each group came from.
+    { id: V('codex'), name: `${encodeServerIdZeroWidth(SID)}${NAME} · Codex`, models: [{ id: 'sol', name: 'Sol' }] },
+    { id: V('claude'), name: `${encodeServerIdZeroWidth(SID)}${NAME} · Claude`, models: [{ id: 'sonnet', name: 'Sonnet' }] },
   ])
+  assert.ok(merged.groups[2].name.startsWith(MARK), 'still starts with the T74 mark')
+  assert.equal(decodeServerIdZeroWidth(merged.groups[2].name), SID, 'the heading decodes back to its server')
   // The default drives blank LOCAL sessions; server failures never alarm the
   // dropdown (each failure row's Retry reloads the whole local catalog).
   assert.equal(merged.default, local.default)
@@ -1066,6 +1070,18 @@ test('T52/T74 mergeModelCatalogs: server groups append after the local ones with
   assert.equal(noName.groups.length, 3)
   assert.equal(noName.groups[2].id, V('noname'))
   assert.equal(Object.hasOwn(noName.groups[2], 'name'), false, 'nameless in, nameless out — no mark either')
+})
+
+test('MS-4 mergeModelCatalogs: two servers\' groups carry distinct decodable server ids; a non-hex id keeps the bare mark', () => {
+  const local = { groups: [{ id: 'openai', name: 'OpenAI' }] }
+  const remote = { groups: [{ id: 'codex', name: 'Codex' }] }
+  const viaA = mergeModelCatalogs(local, remote, { serverId: 'aaaa1111', serverName: '书房' })
+  const both = mergeModelCatalogs(viaA, remote, { serverId: 'bbbb2222', serverName: '书房' })
+  assert.deepEqual(both.groups.map((g) => decodeServerIdZeroWidth(g.name)), [undefined, 'aaaa1111', 'bbbb2222'])
+  // A server id outside the 8-hex handshake format degrades to the legacy
+  // single mark: still a marked (remote) heading, server undecodable.
+  const odd = mergeModelCatalogs(local, remote, { serverId: 'not-hex', serverName: '书房' })
+  assert.equal(odd.groups[1].name, `${MARK}书房 · Codex`)
 })
 
 test('T52-fix3 virtualizeModelSelectionValue: providers always go virtual, nulls and foreign keys pass', () => {
