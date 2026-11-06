@@ -48,7 +48,10 @@ import {
   CLIENT_DEBUG_REPORT_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
+  CLIENT_UNPAIR_ROUTE,
+  MAX_PAIRED_SERVERS,
   awaitClientStatusReady,
+  canSubmitClientPairing,
   claimDeviceNameOf,
   createLatestGate,
   clientStatusLineOf,
@@ -56,7 +59,6 @@ import {
   deriveSettingsView,
   localOpsAllowed,
   normalizePairingCode,
-  shouldFollowServerDeviceName,
   shouldReloadAfterClientActivation,
 } from '../../client-data/settings-form.ts'
 import { bridgeSectionState, togglePluginConsent } from '../../client-data/plugin-bridge.ts'
@@ -68,6 +70,7 @@ import type {
   ClaimRouteBody,
   ClientConfigBody,
   ClientConnectionView,
+  ClientServerView,
   ClientStatusBody,
   SettingsDeviceView,
   SettingsFieldState,
@@ -242,7 +245,37 @@ function pairFailText(fail: PairFail, t: SectionT): string {
     }
     case 'unreachable': return t('settings.client.failUnreachable')
     case 'role-mismatch': return t('settings.client.failRoleMismatch')
+    case 'limit-reached': return t('settings.client.failLimitReached')
     default: return t('settings.client.failUnexpected')
+  }
+}
+
+/** Whether one paired server has anything for the per-server diagnostics
+ * group (MS-7): a last error, a compat block, or bridge verdicts. */
+function serverHasDiag(server: ClientServerView): boolean {
+  return server.lastError !== '' || server.compat !== undefined || server.pluginBridge.length > 0
+}
+
+/** One paired server's state badge (MS-7): copy plus the tone the badge
+ * wears — `live` green for connected, `warn` for an offline row (with the
+ * retry countdown when one is armed), `invalid` red for a verdict only a
+ * re-pair or an upgrade fixes. */
+function serverStateBadge(server: ClientServerView, now: number, t: SectionT): { text: string, tone: 'live' | 'warn' | 'invalid' | undefined } {
+  switch (server.state) {
+    case 'connected': return { text: t('settings.client.serverStateConnected'), tone: 'live' }
+    case 'unreachable':
+    case 'unexpected': {
+      if (server.nextRetryAt === undefined) return { text: t('settings.client.serverStateOffline'), tone: 'warn' }
+      const seconds = Math.max(0, Math.ceil((server.nextRetryAt - now) / 1000))
+      return {
+        text: seconds > 0 ? t('settings.client.serverStateRetry', { seconds }) : t('settings.client.serverStateRetrySoon'),
+        tone: 'warn',
+      }
+    }
+    case 'revoked': return { text: t('settings.client.serverStateRevoked'), tone: 'invalid' }
+    case 'incompatible': return { text: t('settings.client.serverStateIncompatible'), tone: 'invalid' }
+    case 'invalid-url': return { text: t('settings.client.serverStateInvalidUrl'), tone: 'invalid' }
+    default: return { text: t('settings.client.serverStateUnpaired'), tone: undefined }
   }
 }
 
@@ -284,11 +317,16 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   const [pairCode, setPairCode] = useState('')
   const [claimBusy, setClaimBusy] = useState(false)
   const [claimFail, setClaimFail] = useState<PairFail | null>(null)
-  const [claimWriteFailed, setClaimWriteFailed] = useState(false)
   const [unpairBusy, setUnpairBusy] = useState(false)
   const [unpairDone, setUnpairDone] = useState(false)
   // T43: the 立即重连 button's in-flight marker.
   const [reconnectBusy, setReconnectBusy] = useState(false)
+  // MS-7: the pool list's in-flight row action — the entry id, or 'all' for
+  // the remove-all — and whether the last one failed.
+  const [entryBusy, setEntryBusy] = useState<string | null>(null)
+  const [entryActionFailed, setEntryActionFailed] = useState(false)
+  // MS-7: the 重新配对 action focuses the code box.
+  const pairCodeRef = useRef<HTMLInputElement | null>(null)
 
   const loadStatus = useCallback(() => {
     const ticket = statusGate.next()
@@ -320,24 +358,9 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       })
   }, [statusGate])
 
-  // T59: the SERVER's record of this device's name wins over the row —
-  // unless the user is mid-edit (a staged draft in the field). One direct
-  // write lands it in the row's serverName; that write's own volatile
-  // update reaches the backend with both sides now EQUAL, so the push path
-  // stays silent and the two ends cannot bounce the name back and forth.
-  // T59-fix: the decision runs HERE, on each FRESH answer, judging the row
-  // and the draft AS THEY ARE at that moment — never off a stale
-  // `clientView` racing a row change (an effect keyed on the row value
-  // would fire on every save with the PREVIOUS poll's name and write the
-  // old one straight back over the user's fresh save).
-  const followServerDeviceName = useCallback((view: ClientConnectionView): void => {
-    if (!config.savedRoleIsClient()) return
-    if (view.state !== 'connected') return
-    const rowName = typeof config.rowValue('serverName') === 'string' ? config.rowValue('serverName') as string : ''
-    if (!shouldFollowServerDeviceName(view.deviceName, rowName, config.hasDraft('serverName'))) return
-    void config.writeDeviceName(view.deviceName)
-  }, [config])
-
+  // MS-7: the device name flows ONE way — a saved row serverName is
+  // broadcast to every paired server by the backend pool; a server-side
+  // record of this device's name never writes back into the row.
   const loadClientStatus = useCallback(() => {
     const ticket = clientGate.next()
     fetch(CLIENT_STATUS_ROUTE)
@@ -347,9 +370,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       })
       .then((body) => {
         if (!clientGate.isLatest(ticket)) return
-        const view = deriveClientStatusView(body)
-        setClientLoad({ state: 'ready', view })
-        followServerDeviceName(view)
+        setClientLoad({ state: 'ready', view: deriveClientStatusView(body) })
       })
       .catch(() => {
         if (!clientGate.isLatest(ticket)) return
@@ -357,18 +378,39 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
           ? { state: 'stale', view: prev.view }
           : { state: 'error' })
       })
-  }, [clientGate, followServerDeviceName])
+  }, [clientGate])
 
   // The client group's rendered view, hoisted for the countdown ticker and
   // the retry-follow refresh below (T43).
   const clientView = clientLoad.state === 'ready' || clientLoad.state === 'stale' ? clientLoad.view : undefined
+  // MS-7: the paired-server pool, in pairing order (empty on a legacy body),
+  // and the cap the counters and the red alert read.
+  const serverRows: readonly ClientServerView[] = clientView?.servers ?? []
+  const maxServers = clientView?.maxServers ?? MAX_PAIRED_SERVERS
   // RD-3: the remote drop guard's browser-side counters, read at render
   // time — no snapshot state of its own: the initial mount, the 15s
   // connected-status poll and the countdown ticker all re-render this page,
   // and each render takes the values as they are right then.
   const dropDiag = remoteDropDiagnostics()
-  const clientRetryAt = clientView?.nextRetryAt
+  // MS-7: the SOONEST armed retry across the top level and every pool row —
+  // each offline row counts down in its own badge, and the follow refresh
+  // below fires after whichever retry comes due first.
+  const clientRetryAt = [clientView?.nextRetryAt, ...serverRows.map((server) => server.nextRetryAt)]
+    .reduce<number | undefined>((soonest, at) => (at !== undefined && (soonest === undefined || at < soonest) ? at : soonest), undefined)
   const clientCountingDown = clientRetryAt !== undefined
+  // MS-7 diagnostics gates: the per-server group, the pre-pool fallback to
+  // the top-level mirrors, and whether the section has any line at all.
+  const legacyTopDiag = clientView !== undefined && serverRows.length === 0
+  const hasServerDiag = serverRows.some(serverHasDiag)
+  const diagVisible = clientView !== undefined && (
+    clientView.intercept !== undefined
+    || clientView.pluginRouteIntercept !== undefined
+    || clientView.uploadProbe !== undefined
+    || dropDiag.installed
+    || dropDiag.notInstalledReason !== undefined
+    || hasServerDiag
+    || (legacyTopDiag && (clientView.lastError !== '' || clientView.compat !== undefined || (clientView.pluginBridge?.length ?? 0) > 0))
+  )
 
   // Offline with a pending retry: refresh the status shortly after the
   // retry comes due, so a server that came back flips the line to connected
@@ -670,24 +712,30 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   }, [pairUrlTouched, pairUrl, rowServerUrl])
 
   const codeNormalized = normalizePairingCode(pairCode)
-  // T60: an INVALID device-name draft (red box — blank-but-nonempty or over
-  // the cap) blocks the pairing: the claim would silently substitute the
-  // default copy and the server would register a name the user never asked
-  // for. A VALID draft pairs fine — it lands in the row with the write.
-  const claimAllowed = form.available && form.writable && !claimBusy && codeNormalized.length === 8 && !form.serverName.invalid
+  // MS-7: the whole gate is the MS-6 pure truth table — an address and a
+  // complete code, a quiet page, a valid device-name draft (T60: a red-boxed
+  // name would silently pair under the fallback copy), and the 8-server cap,
+  // which blocks only a NEW address: re-entering an already-paired one
+  // re-pairs it in place, at 8/8 too.
+  const claimVerdict = canSubmitClientPairing({
+    pairUrl,
+    pairCode: codeNormalized,
+    servers: serverRows,
+    maxServers,
+    busy: claimBusy,
+    deviceNameInvalid: form.serverName.invalid,
+  })
+  const claimAllowed = form.available && form.writable && claimVerdict.allowed
 
   const runClaim = async (): Promise<void> => {
     setClaimBusy(true)
     setClaimFail(null)
-    setClaimWriteFailed(false)
     // UX-1: captured BEFORE the pairing — whether the page ran as client, and
     // whether the backend's stream interceptor was already active per the
     // last client/status diagnostics.
     const wasEffectiveClient = clientRole
     const streamInterceptAlreadyActive = clientView?.intercept?.installed === true
-    // T60: one name for both halves of the round-trip — trimmed and legal
-    // ({@link claimDeviceNameOf}), sent to the server AND written into the
-    // row when the claim lands.
+    // T60: the name registers trimmed and legal ({@link claimDeviceNameOf}).
     const claimName = claimDeviceNameOf(form.serverName.text, t('settings.client.deviceNameDefault'))
     try {
       const res = await fetch(CLIENT_CLAIM_ROUTE, {
@@ -695,8 +743,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         headers: { 'Content-Type': 'application/json' },
         // T57: the name registers under the shared 设备名称 field's current
         // displayed value (a staged draft counts), falling back to the
-        // default copy when the field is empty — the client page reads no
-        // admin baseline (T55), so an unstored name displays empty here.
+        // default copy when the field is empty.
         body: JSON.stringify({
           serverUrl: pairUrl.trim(),
           code: codeNormalized,
@@ -704,49 +751,30 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         }),
       })
       const body = await res.json().catch(() => ({})) as ClaimRouteBody
-      if (res.ok && body.ok === true && typeof body.token === 'string' && body.token !== '') {
-        // The backend echoes the address it validated; write the credentials
-        // AND the registered name through ONE mutate, then clear the code
-        // and re-read the connection state. The name is the SERVER's
-        // confirmed echo when the claim carried one (the gateway may have
-        // trimmed or uniquified it at registration), else the name we
-        // actually sent (T60) — either way the row now matches the server.
-        const urlToWrite = typeof body.serverUrl === 'string' && body.serverUrl !== '' ? body.serverUrl : pairUrl.trim()
-        // T59-fix: the echo is judged by the SAME rules as our own draft
-        // (claimDeviceNameOf trims and validates) — a server answer we
-        // could not store falls back to the name we actually sent.
-        const echoed = typeof body.deviceName === 'string' && body.deviceName !== '' ? claimDeviceNameOf(body.deviceName, claimName) : claimName
-        const landed = await config.writeClientPairing(urlToWrite, body.token, echoed)
-        if (landed && shouldReloadAfterClientActivation({
+      if (res.ok && body.ok === true) {
+        // MS-5/MS-7: the backend landed the pairing straight into
+        // zen-remote-state.json (the token never reaches the browser), so
+        // there is nothing to write here — only the FIRST activation still
+        // reloads, so the page's resident global streams reopen wrapped.
+        if (shouldReloadAfterClientActivation({
           wasEffectiveClient,
           nowClientRole: true,
           savedOrPaired: true,
           streamInterceptAlreadyActive,
         })) {
-          // UX-1: FIRST pairing on a page whose resident global streams were
-          // opened unwrapped (or with the interceptor inactive) — wait out the
-          // backend's row-reload window, then reload so the streams reopen
-          // wrapped and the server's sessions enter the sidebar.
           setClaimBusy(false)
           void awaitClientStatusReady().then(() => window.location.reload())
           return
         }
-        if (landed) {
-          // The draft did its job — it now equals the displayed value, and
-          // keeping it would be a phantom edit (T60).
-          config.discardField('serverName')
-          setPairCode('')
-          setPairUrl(urlToWrite)
-          setUnpairDone(false)
-          loadClientStatus()
-        } else {
-          setClaimWriteFailed(true)
-        }
+        setPairCode('')
+        if (typeof body.serverUrl === 'string' && body.serverUrl !== '') setPairUrl(body.serverUrl)
+        setUnpairDone(false)
+        loadClientStatus()
       } else {
-        // Every other shape is a failure (T16-fix): a non-OK status, a body
-        // whose `ok` is not true, a missing token — shown with the classified
-        // code when the route sent one. The body's `message` is ignored: the
-        // wording is this build's dictionary (pairFailText).
+        // Every other shape is a failure (T16-fix), shown with the classified
+        // code when the route sent one (MS-5 adds `limit-reached`). The
+        // body's `message` is ignored: the wording is this build's
+        // dictionary (pairFailText).
         const fail: PairFail = { code: typeof body.code === 'string' && body.code !== '' ? body.code : 'unexpected' }
         if (typeof body.retryAfterMs === 'number') fail.retryAfterMs = body.retryAfterMs
         setClaimFail(fail)
@@ -766,6 +794,67 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       setUnpairDone(true)
       loadClientStatus()
     }
+  }
+
+  /** MS-7: one POST of the pool list's row actions — whether it answered ok. */
+  const postClientRoute = async (route: string, payload: string): Promise<boolean> => {
+    try {
+      const res = await fetch(route, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+      })
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
+  // MS-7 立即重连 for ONE server: refresh now (the state is at least
+  // "connecting") and once more after the attempt can have settled — the
+  // T43 top-level button's cadence, per entry.
+  const runEntryReconnect = async (entryId: string): Promise<void> => {
+    setEntryBusy(entryId)
+    setEntryActionFailed(false)
+    if (await postClientRoute(CLIENT_RECONNECT_ROUTE, JSON.stringify({ entryId }))) {
+      loadClientStatus()
+      refreshTimers.current.push(window.setTimeout(() => { loadClientStatus() }, 1500))
+    } else {
+      setEntryActionFailed(true)
+    }
+    setEntryBusy(null)
+  }
+
+  // MS-7 移除: forget one paired server (the server's own device record is
+  // untouched — the confirm copy says so).
+  const runUnpairEntry = async (entryId: string): Promise<void> => {
+    if (!window.confirm(t('settings.client.unpairServerConfirm'))) return
+    setEntryBusy(entryId)
+    setEntryActionFailed(false)
+    if (await postClientRoute(CLIENT_UNPAIR_ROUTE, JSON.stringify({ entryId }))) loadClientStatus()
+    else setEntryActionFailed(true)
+    setEntryBusy(null)
+  }
+
+  // MS-7 全部移除: forget every paired server at once.
+  const runUnpairAllServers = async (): Promise<void> => {
+    if (!window.confirm(t('settings.client.unpairAllServersConfirm'))) return
+    setEntryBusy('all')
+    setEntryActionFailed(false)
+    if (await postClientRoute(CLIENT_UNPAIR_ROUTE, JSON.stringify({ all: true }))) loadClientStatus()
+    else setEntryActionFailed(true)
+    setEntryBusy(null)
+  }
+
+  // MS-7 重新配对: point the pairing form at this server — its address in the
+  // box (an already-paired address passes the cap gate), a blank code, the
+  // focus on the code box so the user only types the fresh code.
+  const repurposeServer = (server: ClientServerView): void => {
+    setPairUrl(server.serverUrl)
+    setPairUrlTouched(true)
+    setPairCode('')
+    setClaimFail(null)
+    pairCodeRef.current?.focus()
   }
 
   const formDisabled = !form.available || !form.writable
@@ -1209,7 +1298,19 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
           operations, so they render even while the namespace is read-only. */}
       {clientRole && (
         <div className="zr-settings-card">
-          <h3 className="zr-settings-card-title">{t('settings.client.connectTitle')}</h3>
+          <h3 className="zr-settings-card-title">
+            {t('settings.client.connectTitle')}
+            <span className="zr-settings-badge" data-invalid={clientView?.limitReached === true ? 'true' : undefined}>{t('settings.client.poolCount', { count: serverRows.length, max: maxServers })}</span>
+          </h3>
+          <p className="zr-settings-hint" style={{ paddingTop: 4 }}>{t('settings.client.poolCapNote', { max: maxServers })}</p>
+          {/* MS-7: the full pool's alert — loud red bold on purpose: a new
+              address is refused until a server is removed, while re-entering
+              an already-paired address still re-pairs it in place. */}
+          {clientView?.limitReached === true && (
+            <p className="zr-settings-limit-alert" data-invalid="true">
+              {t('settings.client.limitReached', { count: serverRows.length, max: maxServers })}
+            </p>
+          )}
           <div className="zr-settings-field">
             <div className="zr-settings-head">
               <label htmlFor="zr-settings-client-server">{t('settings.client.serverUrl')}</label>
@@ -1231,6 +1332,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
             </div>
             <input
               id="zr-settings-client-code"
+              ref={pairCodeRef}
               className="zr-settings-input zr-settings-code-input"
               type="text"
               autoComplete="off"
@@ -1252,8 +1354,58 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                 draft is invalid — this line says why. */}
             {form.serverName.invalid && <span className="zr-settings-hint" data-invalid="true">{t('settings.client.fixDeviceName')}</span>}
             {claimFail !== null && <span className="zr-settings-hint" data-invalid="true">{pairFailText(claimFail, t)}</span>}
-            {claimWriteFailed && <span className="zr-settings-hint" data-invalid="true">{t('settings.client.failWrite')}</span>}
           </div>
+
+          {/* MS-7: the paired main servers, in pairing order — one row per
+              pool entry with its own state badge and actions. The cap only
+              ever gates NEW addresses, so 重新配对 stays usable at 8/8. */}
+          <h3 className="zr-settings-card-title">{t('settings.client.serversTitle')}</h3>
+          {serverRows.length === 0 && (
+            <p className="zr-settings-hint" style={{ padding: '8px 0 12px' }}>{t('settings.client.serversEmpty', { max: maxServers })}</p>
+          )}
+          {serverRows.map((server) => {
+            const badge = serverStateBadge(server, now, t)
+            return (
+              <div className="zr-settings-device" key={server.entryId}>
+                <div className="zr-settings-device-head">
+                  <span className="zr-settings-device-name">{server.displayName !== '' ? server.displayName : server.serverUrl}</span>
+                  <span
+                    className="zr-settings-badge"
+                    data-live={badge.tone === 'live' ? 'true' : undefined}
+                    data-warn={badge.tone === 'warn' ? 'true' : undefined}
+                    data-invalid={badge.tone === 'invalid' ? 'true' : undefined}
+                  >
+                    {badge.text}
+                  </span>
+                  <span className="zr-settings-hint">{server.serverUrl}</span>
+                </div>
+                <div className="zr-settings-device-actions">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={entryBusy !== null || server.nextRetryAt === undefined}
+                    onClick={() => { void runEntryReconnect(server.entryId) }}
+                  >
+                    {entryBusy === server.entryId ? t('settings.client.reconnectBusy') : t('settings.client.reconnect')}
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={entryBusy !== null} onClick={() => { repurposeServer(server) }}>
+                    {t('settings.client.repair')}
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={entryBusy !== null} onClick={() => { void runUnpairEntry(server.entryId) }}>
+                    {t('settings.client.serverRemove')}
+                  </Button>
+                </div>
+              </div>
+            )
+          })}
+          {entryActionFailed && <p className="zr-settings-hint" data-invalid="true">{t('settings.actionFail')}</p>}
+          {serverRows.length > 0 && (
+            <div className="zr-settings-row" style={{ paddingBottom: 12 }}>
+              <Button variant="ghost" size="sm" disabled={entryBusy !== null} onClick={() => { void runUnpairAllServers() }}>
+                {t('settings.client.unpairAllServers')}
+              </Button>
+            </div>
+          )}
 
           <h3 className="zr-settings-card-title">{t('settings.client.statusTitle')}</h3>
           <div className="zr-settings-row" style={{ paddingBottom: 4 }}>
@@ -1291,11 +1443,16 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               groups render only when the response carried their fields —
               earlier servers answer neither, and the section itself only
               exists when there is at least one line to show. PB-5 adds the
-              bridge rows and the rerouting note on the same presence gate. */}
-          {clientView !== undefined && (clientView.lastError !== '' || clientView.intercept !== undefined || clientView.compat !== undefined || (clientView.pluginBridge?.length ?? 0) > 0 || clientView.pluginRouteIntercept !== undefined || dropDiag.installed || dropDiag.notInstalledReason !== undefined) && (
+              bridge rows and the rerouting note on the same presence gate.
+              MS-7: the interceptor, the attachment-entry guard and the
+              upload redirect are GLOBAL (one per machine); the last error,
+              the fingerprint groups and the bridge verdicts are PER SERVER
+              (the pool group at the bottom). A legacy body without servers[]
+              keeps the top-level mirrors (legacyTopDiag). */}
+          {diagVisible && clientView !== undefined && (
             <>
               <h3 className="zr-settings-card-title">{t('settings.client.diagTitle')}</h3>
-              {clientView.lastError !== '' && (
+              {legacyTopDiag && clientView.lastError !== '' && (
                 <p className="zr-settings-hint" data-invalid={clientView.state === 'unreachable' ? 'true' : undefined}>
                   {t('settings.client.diagLastError', { code: clientView.lastError })}
                 </p>
@@ -1396,7 +1553,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   </div>
                 )
               })()}
-              {clientView.compat !== undefined && (
+              {legacyTopDiag && clientView.compat !== undefined && (
                 <>
                   {clientView.compat.mismatchedGroups.length > 0 && (
                     <p className="zr-settings-hint" data-invalid="true">
@@ -1417,7 +1574,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   )}
                 </>
               )}
-              {(clientView.pluginBridge?.length ?? 0) > 0 && clientView.pluginBridge !== undefined && (
+              {legacyTopDiag && (clientView.pluginBridge?.length ?? 0) > 0 && clientView.pluginBridge !== undefined && (
                 <div className="zr-settings-field">
                   <div className="zr-settings-head">
                     <label>{t('settings.bridge.title')}</label>
@@ -1436,6 +1593,41 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                 <p className="zr-settings-hint" data-invalid="true">
                   {t('settings.bridge.interceptOff', { reason: clientView.pluginRouteIntercept.reasons.join('; ') || '—' })}
                 </p>
+              )}
+              {hasServerDiag && (
+                <div className="zr-settings-field">
+                  <div className="zr-settings-head">
+                    <label>{t('settings.client.serverDiagTitle')}</label>
+                  </div>
+                  {serverRows.filter(serverHasDiag).map((server) => (
+                    <div className="zr-settings-device" key={server.entryId}>
+                      <span className="zr-settings-device-name">{server.displayName !== '' ? server.displayName : server.serverUrl}</span>
+                      {server.lastError !== '' && (
+                        <p className="zr-settings-hint" data-invalid={server.state === 'unreachable' ? 'true' : undefined}>
+                          {t('settings.client.diagLastError', { code: server.lastError })}
+                        </p>
+                      )}
+                      {server.compat !== undefined && server.compat.mismatchedGroups.length > 0 && (
+                        <p className="zr-settings-hint" data-invalid="true">
+                          {t('settings.client.diagCompatGroups', { groups: server.compat.mismatchedGroups.join(', ') })}
+                        </p>
+                      )}
+                      {server.compat?.recentCalls.map((failure, index) => (
+                        <p key={index} className="zr-settings-hint">
+                          {t('settings.client.diagCompatCalls')} · {new Date(failure.time).toLocaleString()} · {failure.method !== '' ? failure.method : '—'} · {failure.code}
+                        </p>
+                      ))}
+                      {server.pluginBridge.map((row: PluginBridgeStatusView) => (
+                        <p key={row.plugin} className="zr-settings-hint">
+                          {t('settings.bridge.title')} · {row.plugin} · {row.localVersion !== '' ? `v${row.localVersion}` : '—'} ·{' '}
+                          {row.stateKey === 'settings.bridge.stateVersionMismatch'
+                            ? t(row.stateKey, { version: row.serverVersion ?? '?' })
+                            : t(row.stateKey)}
+                        </p>
+                      ))}
+                    </div>
+                  ))}
+                </div>
               )}
             </>
           )}
