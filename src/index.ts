@@ -1529,7 +1529,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       }
       return undefined
     }
-    ctx.inject(['typertGateway'], (gatewayCtx) => {
+    ctx.inject(['typertGateway', 'connection'], (gatewayCtx) => {
       const proxy = (gatewayCtx as Context & { typertGateway?: unknown }).typertGateway
       const raw = proxy !== null && typeof proxy === 'object'
         ? (proxy as Record<PropertyKey, unknown>)[symbols.original]
@@ -1572,8 +1572,14 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // none). Failure handling lives in runSelfCheck, which records the
       // verdict via noteSelfCheck.
       // DSH 0.2.1-alpha.3: the probe needs an owner Peer of its own (the
-      // gateway's operatorPeer fallback is gone) — read `connection` through
-      // the reflection layer so a composition without it still installs.
+      // gateway's operatorPeer fallback is gone), and a Peer can only be
+      // minted from the connection service — which the host gateway's own
+      // constructor pulls in through a NESTED inject, so typertGateway alone
+      // never guarantees it is up. `connection` therefore rides the inject
+      // declaration (issue #53): the install WAITS for the peer source
+      // instead of running a probe that cannot pass and tearing the
+      // interception down (one retry, then uninstall, no recovery) on hosts
+      // where connection merely lags startup.
       void runSelfCheck(raw, {
         handle,
         log: logWarn,

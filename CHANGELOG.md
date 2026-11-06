@@ -5,6 +5,17 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 修复
+
+- **修复冷启动竞态导致「会话与插件同步：异常」**（[#53](https://github.com/KyoMio/dsh-zen-remote/issues/53)）：
+  DSH 0.2.1-alpha.3 起网关调用必须自带 Peer，而客户端同步拦截的安装只等网关服务——
+  宿主的 connection 服务经另一层注入、可能显著滞后（插件多、启动慢的机器上尤甚）。
+  自检在 Peer 缺位时以 `reading 'signal'` 失败并按策略卸载拦截，此后无恢复路径，
+  表现为远程会话同步失效、需手动重载插件。现在安装声明等待 connection 服务，
+  服务到齐才安装并自检；0.1.7 / Electron 组合本就无此安装路径，行为不变。
+
 ## 2.3.10（2026-11-06）
 
 ### 修复
