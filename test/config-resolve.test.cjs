@@ -125,6 +125,23 @@ test('lang and role only accept their enum members', async () => {
   assert.equal(resolveConfig({ role: 'server' }, { role: 'client' }, {}).values.role, 'client', 'an invalid row role can be rescued by the file')
   assert.equal(resolveConfig({ role: 'server' }, {}, {}).values.role, 'host')
   assert.equal(resolveConfig({ role: 'client' }, {}, {}).values.role, 'client')
+  assert.equal(resolveConfig({ role: 'peer' }, {}, {}).values.role, 'peer', 'the MS three-value enum accepts peer')
+  assert.equal(resolveConfig({ role: 'Peer' }, {}, {}).values.role, 'host', 'peer is exact-match like the others')
+  assert.equal(resolveConfig({}, { role: 'peer' }, {}).values.role, 'peer', 'the file layer carries peer too')
+})
+
+test('servesRole / connectsRole answer the role truth table', async () => {
+  const { servesRole, connectsRole } = await load()
+  // Serving = the gateway/relay/push halves mount. Dialing = the relay
+  // client/pool runs. A peer does BOTH; that is the whole point of the role.
+  for (const [role, serves, connects] of [
+    ['host', true, false],
+    ['client', false, true],
+    ['peer', true, true],
+  ]) {
+    assert.equal(servesRole(role), serves, `servesRole('${role}')`)
+    assert.equal(connectsRole(role), connects, `connectsRole('${role}')`)
+  }
 })
 
 test('non-numeric pushDebounceMs and rateLimit fall to their defaults', async () => {

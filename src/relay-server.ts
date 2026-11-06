@@ -30,11 +30,11 @@ import { withPeer } from './owner-peer.js'
 import { controlProjectionFrame } from './merge-streams.js'
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { Readable, Transform } from 'node:stream'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ShareStore } from './share-store.js'
+import { ensureServerIdMigrated, readStateFile, STATE_FILE_NAME, writeStateFile } from './state-store.js'
 import { decideHttpRoute, decideInvoke, decideStream, decideUploadQuery, parseEventResultBody } from './relay-access.js'
 import {
   createWorkspaceFollowState,
@@ -316,30 +316,38 @@ export interface RelayHandler {
  * countable about the deployment. */
 const SERVER_ID_PATTERN = /^[0-9a-f]{8}$/
 
-const SERVER_ID_FILE = 'zen-remote-server.json'
+/**
+ * The state file the server identity lives in since MS-1 — the same file the
+ * share table (`sessions`) and the paired-servers list (`servers`) use, so
+ * every writer of one field must preserve the other two. `loadServerId`
+ * reads and writes it only through state-store's merged doors.
+ */
+const SERVER_ID_FILE = STATE_FILE_NAME
 
 /**
  * Read the persisted server id, creating (and persisting) one on first use.
- * A missing file is the normal first run; an unreadable or damaged file must
- * never take the host down, so every failure degrades to a fresh per-process
- * id that simply is not remembered across restarts.
+ * A pre-multi-server `zen-remote-server.json` identity migrates in first
+ * (and its file is deleted) — an upgraded host keeps its id, so paired
+ * devices never see a stranger. A missing file is the normal first run; an
+ * unreadable or damaged file must never take the host down, so every failure
+ * degrades to a fresh per-process id that simply is not remembered across
+ * restarts.
  */
 export function loadServerId(home: string): string {
   const file = join(home, SERVER_ID_FILE)
+  ensureServerIdMigrated(file)
   try {
-    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'))
-    const id = (parsed as { serverId?: unknown } | null)?.serverId
-    if (typeof id === 'string' && SERVER_ID_PATTERN.test(id)) return id
+    const state = readStateFile(file)
+    if (state.serverId !== undefined && SERVER_ID_PATTERN.test(state.serverId)) return state.serverId
   } catch {
-    // First run, unreadable path, or unparsable JSON — mint a new one below.
+    // Damaged state: mint a new one below (state-store never throws, but the
+    // belt stays on).
   }
   const id = randomBytes(4).toString('hex')
   try {
-    // tmp + rename, the same atomic dance the share table uses: a crash
-    // mid-write must not leave a half-file that would corrupt the next read.
-    mkdirSync(home, { recursive: true })
-    writeFileSync(`${file}.tmp`, JSON.stringify({ serverId: id }))
-    renameSync(`${file}.tmp`, file)
+    // The merged write: sessions/servers already in the file survive, and the
+    // atomic tmp(0600)+rename dance is state-store's job now.
+    writeStateFile(file, (current) => ({ ...current, version: 1, serverId: id }))
   } catch {
     // Unwritable home: the id stays process-local. Nothing may throw here.
   }

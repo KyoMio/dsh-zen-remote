@@ -41,9 +41,11 @@ const SERVER_NAME_MAX = 40
 
 /** The effective configuration one resolved value set, defaults included. */
 export interface ZenRemoteConfig {
-  /** Which half of the plugin runs in this DSH process; anything the layers
-   * leave unresolved means `'host'` (see {@link resolveRole}). */
-  role: 'host' | 'client'
+  /** Which half of the plugin runs in this DSH process. `'host'` serves the
+   * gateway and never dials out; `'client'` dials one server and serves no
+   * gateway; `'peer'` (MS Phase 2) does both. Anything the layers leave
+   * unresolved means `'host'` (see {@link resolveRole}). */
+  role: 'host' | 'client' | 'peer'
   /** Port the gateway child listens on. */
   port: number
   /** Bind address of the gateway child. */
@@ -335,7 +337,7 @@ interface FieldResolver<T> {
 }
 
 const FIELDS: { [K in keyof ZenRemoteConfig]: FieldResolver<ZenRemoteConfig[K]> } = {
-  role: { row: oneOf('host', 'client'), file: oneOf('host', 'client') },
+  role: { row: oneOf('host', 'client', 'peer'), file: oneOf('host', 'client', 'peer') },
   port: { env: envNumber('LAN_GATE_PORT', intIn(1, 65535)), row: intIn(1, 65535), file: lenientFileNumber(intIn(1, 65535)) },
   host: { env: envString('LAN_GATE_HOST'), row: nonEmptyString, file: nonEmptyString },
   targetPort: { env: envNumber('LAN_GATE_TARGET_PORT', intIn(1, 65535)), row: intIn(1, 65535) },
@@ -475,19 +477,42 @@ export function readFileConfig(env: NodeJS.ProcessEnv = process.env): Record<str
 }
 
 /**
- * The normalized role behind a row's `role` knob. Anything but the exact
- * string `'client'` means host, so a typo degrades to the full plugin rather
- * than silently dropping the gateway and push halves. The value is read
- * through {@link unwrapVolatile} first: since T17 every row field arrives as
- * a `{ get() }` live reference, and comparing the wrapper itself against
- * `'client'` would always answer host (T17b). Resolution-order note:
- * {@link resolveConfig} validates each layer against the two-member enum
- * first, so an invalid row role can still be rescued by the file layer; this
- * function answers the final merged value. Kept on the main entry's export
- * surface for test/role-wiring.test.cjs.
+ * The normalized role behind a row's `role` knob. Only the exact strings
+ * `'client'` and `'peer'` mean those roles — everything else degrades to
+ * host, so a typo runs the full plugin rather than silently dropping the
+ * gateway and push halves. The value is read through {@link unwrapVolatile}
+ * first: since T17 every row field arrives as a `{ get() }` live reference,
+ * and comparing the wrapper itself against a role string would always answer
+ * host (T17b). Resolution-order note: {@link resolveConfig} validates each
+ * layer against the enum first, so an invalid row role can still be rescued
+ * by the file layer; this function answers the final merged value. Kept on
+ * the main entry's export surface for test/role-wiring.test.cjs.
  */
-export function resolveRole(row: unknown): 'host' | 'client' {
-  return unwrapVolatile((row as { role?: unknown } | null | undefined)?.role) === 'client' ? 'client' : 'host'
+export function resolveRole(row: unknown): 'host' | 'client' | 'peer' {
+  const value = unwrapVolatile((row as { role?: unknown } | null | undefined)?.role)
+  if (value === 'client') return 'client'
+  if (value === 'peer') return 'peer'
+  return 'host'
+}
+
+/**
+ * Whether the role serves remote access to OTHER machines: host and peer do
+ * (the gateway, relay and push halves mount), a pure client does not. The
+ * role-gate the wiring reads INSTEAD of a `=== 'host'` compare, so a peer
+ * deploy gets the serving halves without every call site growing a third
+ * branch (MS Phase 2 wires it through).
+ */
+export function servesRole(role: 'host' | 'client' | 'peer'): boolean {
+  return role !== 'client'
+}
+
+/**
+ * Whether the role dials OUT to paired servers: client and peer do (the
+ * relay client / pool), a pure host has nothing to dial. {@link servesRole}'s
+ * counterpart.
+ */
+export function connectsRole(role: 'host' | 'client' | 'peer'): boolean {
+  return role !== 'host'
 }
 
 /**

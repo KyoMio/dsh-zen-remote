@@ -26,7 +26,7 @@ import type { RelayClient } from './relay-client.js';
 import type { BridgeRegistry } from './plugin-bridge.js';
 import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js';
 export type { BridgeDeclaration, ZenRemoteService } from './plugin-bridge.js';
-export { Config, resolveRole } from './config.js';
+export { Config, resolveRole, servesRole, connectsRole } from './config.js';
 export { sameOriginPost } from './http.js';
 /** Exact route the phone composer POSTs one file body to. */
 export declare const UPLOAD_ROUTE = "/_dsh/mobile-nav/upload";

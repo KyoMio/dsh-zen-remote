@@ -81,6 +81,15 @@ test('share and unshare return values and events', (t) => {
   assert.equal(events.length, 2, 'repeat unshare emits nothing')
 })
 
+test('a virtual id (`zr~…`) never enters the table (MS-1 guard)', (t) => {
+  const clock = makeClock(T0)
+  const store = createShareStore({ file: tempFile(t), idleHours: 48, now: clock.now })
+
+  assert.equal(store.share('zr~12345678~s1'), false, 'a virtual session id is refused at the entry')
+  assert.equal(store.isShared('zr~12345678~s1'), false, 'and it never lands in the table')
+  assert.deepEqual(store.list(), [], 'the file-side table stays empty')
+})
+
 // ---- 2. idle expiry, touch pushes the deadline, touch ignores strangers ----
 
 test('idle expiry: sweep closes exactly at idleMs, touch defers', (t) => {

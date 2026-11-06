@@ -24,8 +24,10 @@
  * idle by definition until the caller says otherwise.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { readFileSync, renameSync } from 'node:fs'
+import { basename } from 'node:path'
+import { isVirtual } from './virtual-id.js'
+import { ensureSharesMigrated, readStateFile, STATE_FILE_NAME, writeStateFile } from './state-store.js'
 
 /** One row of the table, as `list()` reports it. */
 export interface ShareEntry {
@@ -154,37 +156,62 @@ export function createShareStore(options: ShareStoreOptions): ShareStore {
 
   // ---- startup load (synchronous, once) ----
   //
-  // Missing file = first run, empty table. Unreadable path (a directory,
-  // permissions) also starts empty but is NOT quarantined — renaming
-  // something we could not even read could eat a live directory.
-  let raw: string | null = null
-  try {
-    raw = readFileSync(file, 'utf8')
-  } catch {
-    raw = null
-  }
-  if (raw !== null) {
-    let parsed: unknown
+  // Two container shapes. When this store backs the MS-1 three-in-one state
+  // file (`zen-remote-state.json`), loading goes through state-store's
+  // reader: the legacy `zen-remote-shares.json` migrates in first (and is
+  // deleted), and a version:1 container without a sessions map is legal —
+  // the file also carries serverId/servers other writers may have filled.
+  // Any OTHER file name keeps the historical shares-file semantics verbatim:
+  // anything that is not `{version:1, sessions:{…}}` quarantines the whole
+  // file. Unreadable paths (a directory, permissions) start empty either way
+  // and are NOT quarantined — renaming something we could not even read
+  // could eat a live directory.
+  const isStateFile = basename(file) === STATE_FILE_NAME
+  if (isStateFile) {
     try {
-      parsed = JSON.parse(raw)
+      ensureSharesMigrated(file)
     } catch {
-      parsed = undefined
+      // Startup must not fail on a migration hiccup; the legacy file stays.
     }
-    // Container-level damage (unparseable JSON, wrong version, wrong shape)
-    // quarantines the whole file; row-level damage (one bad record) only
-    // skips that record — the rest of the table is worth keeping.
-    if (isPlainObject(parsed) && parsed.version === FILE_VERSION && isPlainObject(parsed.sessions)) {
-      for (const [id, value] of Object.entries(parsed.sessions)) {
+    const state = readStateFile(file)
+    if (state.sessions !== undefined) {
+      for (const [id, value] of Object.entries(state.sessions)) {
         if (!isValidId(id) || !isPlainObject(value)) continue
         const { sharedAt, lastActivityAt } = value
         if (!isFiniteNumber(sharedAt) || !isFiniteNumber(lastActivityAt)) continue
         sessions.set(id, { sharedAt, lastActivityAt, busy: false })
       }
-    } else {
+    }
+  } else {
+    let raw: string | null = null
+    try {
+      raw = readFileSync(file, 'utf8')
+    } catch {
+      raw = null
+    }
+    if (raw !== null) {
+      let parsed: unknown
       try {
-        renameSync(file, `${file}.corrupt-${now()}`)
+        parsed = JSON.parse(raw)
       } catch {
-        // Keep the empty table either way; startup must not fail here.
+        parsed = undefined
+      }
+      // Container-level damage (unparseable JSON, wrong version, wrong shape)
+      // quarantines the whole file; row-level damage (one bad record) only
+      // skips that record — the rest of the table is worth keeping.
+      if (isPlainObject(parsed) && parsed.version === FILE_VERSION && isPlainObject(parsed.sessions)) {
+        for (const [id, value] of Object.entries(parsed.sessions)) {
+          if (!isValidId(id) || !isPlainObject(value)) continue
+          const { sharedAt, lastActivityAt } = value
+          if (!isFiniteNumber(sharedAt) || !isFiniteNumber(lastActivityAt)) continue
+          sessions.set(id, { sharedAt, lastActivityAt, busy: false })
+        }
+      } else {
+        try {
+          renameSync(file, `${file}.corrupt-${now()}`)
+        } catch {
+          // Keep the empty table either way; startup must not fail here.
+        }
       }
     }
   }
@@ -212,9 +239,10 @@ export function createShareStore(options: ShareStoreOptions): ShareStore {
       fileSessions[id] = { sharedAt: row.sharedAt, lastActivityAt: row.lastActivityAt }
     }
     try {
-      mkdirSync(dirname(file), { recursive: true })
-      writeFileSync(`${file}.tmp`, JSON.stringify({ version: FILE_VERSION, sessions: fileSessions }))
-      renameSync(`${file}.tmp`, file)
+      // The merged write door: whatever ELSE the file carries (serverId and
+      // servers in the MS-1 state file, any extra top-level fields in a
+      // plain shares file) survives every table write.
+      writeStateFile(file, (current) => ({ ...current, version: FILE_VERSION, sessions: fileSessions }))
       lastWriteError = undefined
     } catch (error) {
       lastWriteError = error
@@ -237,6 +265,11 @@ export function createShareStore(options: ShareStoreOptions): ShareStore {
 
   const store: ShareStore = {
     share(sessionId) {
+      // A virtual id (`zr~<serverId>~…`) names a session that lives on a
+      // REMOTE server — this table is the local server's access control, and
+      // letting a virtual id in would make the local relay hand out access
+      // under an id it cannot resolve. Never enters the table.
+      if (isVirtual(sessionId)) return false
       if (!isValidId(sessionId)) return false
       const t = now()
       const existing = sessions.get(sessionId)

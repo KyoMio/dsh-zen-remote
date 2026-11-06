@@ -18,6 +18,8 @@
   },
   "include": [
     "src/index.ts",
+    "src/state-store.ts",
+    "src/relay-pool.ts",
     "src/adapters/dsh-better-sidebar/surface.ts",
     "src/wizard/status.ts",
     "src/wizard/binary.ts",
