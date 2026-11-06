@@ -13,13 +13,18 @@ const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
 const { installIntercept } = require('../lib/intercept.js')
-const { toVirtual, VIRTUAL_GROUP_NAME_MARK: MARK } = require('../lib/virtual-id.js')
+const { toVirtual, VIRTUAL_GROUP_NAME_MARK: MARK, encodeServerIdZeroWidth } = require('../lib/virtual-id.js')
 const { RelayError } = require('../lib/relay-client.js')
 
 const SID_A = 'aaa11111'
 const SID_B = 'bbb22222'
 const VA = (id) => toVirtual(SID_A, id)
 const VB = (id) => toVirtual(SID_B, id)
+// MS-4: a remote model group's heading carries the server id's 32 zero-width
+// bits between two marks, BEFORE the display name — the browser half reads
+// the server back out of the heading text alone.
+const MARK_A = encodeServerIdZeroWidth(SID_A)
+const MARK_B = encodeServerIdZeroWidth(SID_B)
 
 // -- the fakes (mirrors of intercept.test.cjs's) --------------------------------
 
@@ -609,10 +614,10 @@ test('MS-3 modelCatalog: per-server caches, displayName-prefixed group names, of
     envelope.value.groups,
     [
       { id: 'local-prov', name: '本地' },
-      { id: VA('prov-a'), name: `${MARK}MacBook-1 · ProvA` },
-      { id: VB('prov-b'), name: `${MARK}MacBook-2 · ProvB` },
+      { id: VA('prov-a'), name: `${MARK_A}MacBook-1 · ProvA` },
+      { id: VB('prov-b'), name: `${MARK_B}MacBook-2 · ProvB` },
     ],
-    'the group names carry each server\'s display name behind the invisible mark',
+    'the group names carry each server\'s id bits and display name behind the invisible mark (MS-4 encoding)',
   )
   const callsAfterFirst = relayA.invokes.length + relayB.invokes.length
   assert.equal(callsAfterFirst, 2, 'one fetch per online server')
@@ -620,7 +625,7 @@ test('MS-3 modelCatalog: per-server caches, displayName-prefixed group names, of
   // A goes offline: its cached groups still merge, B is fetched fresh.
   relayA.transition('offline')
   const offlineEnvelope = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, gateway.operatorPeer())
-  assert.deepEqual(offlineEnvelope.value.groups[1], { id: VA('prov-a'), name: `${MARK}MacBook-1 · ProvA` }, 'A\'s cache survives its outage')
+  assert.deepEqual(offlineEnvelope.value.groups[1], { id: VA('prov-a'), name: `${MARK_A}MacBook-1 · ProvA` }, 'A\'s cache survives its outage')
   assert.equal(relayA.invokes.length, callsAfterFirst - 1, 'the offline leg was not asked again')
 
   // A leaves the pool entirely: its groups must not outlive the entry.

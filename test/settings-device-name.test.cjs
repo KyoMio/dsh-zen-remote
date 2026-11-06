@@ -91,22 +91,21 @@ test('T59: the backend forwards a committed row name through the volatile-update
   // The push logic itself (queueDeviceName's contract: differing name →
   // endpoint, equal name → no-op, offline → queued for the next online) is
   // pinned in relay-client.test.cjs. This pins the WIRING: the row's
-  // serverName feeds queueDeviceName on the loader's volatile-update
-  // announcement, beside the credentials watcher that already lived there.
+  // serverName feeds the POOL's broadcast (MS-5 — one rename reaches every
+  // paired server) on the loader's volatile-update announcement.
   const index = readFileSync(join(ROOT, 'src', 'index.ts'), 'utf8')
   const watcherAt = index.indexOf("'dsh-zen-remote: relay credentials watcher'")
   assert.notEqual(watcherAt, -1, 'the credentials watcher is the anchor')
   const effectSource = index.slice(index.indexOf("ctx.on('loader/volatile-update'"), watcherAt)
-  assert.ok(effectSource.includes('relayClient.credentialsChanged()'), 'the credentials watch is intact')
   assert.ok(effectSource.includes('volatileUpdateTouchesServerName(paths)'), 'the push filters on the CHANGED paths (T59-fix: an unrelated knob never queues a push)')
-  assert.ok(effectSource.includes('queueDeviceName'), 'the committed row name is queued for the gateway push')
+  assert.ok(effectSource.includes('queueDeviceNameAll'), 'the committed row name is broadcast to every paired server')
   assert.ok(effectSource.includes('unwrapVolatile(row.serverName)'), 'the name is read LIVE off the volatile row')
   // T59-fix: NO boot-time push — the row's loaded name is stale by
   // definition (the server's table may have been edited meanwhile), and an
   // unconditional boot push would overwrite an administrator's rename.
-  assert.equal(index.includes('queueDeviceName'), true)
-  const bootPushes = index.split('relayClient.queueDeviceName(').length - 1
-  assert.equal(bootPushes, 1, 'exactly one queue call site: the volatile-update listener, nothing at startup')
+  assert.equal(index.includes('queueDeviceNameAll'), true)
+  const bootPushes = index.split('relayPool.queueDeviceNameAll(').length - 1
+  assert.equal(bootPushes, 1, 'exactly one broadcast call site: the volatile-update listener, nothing at startup')
 })
 
 test('T59-fix: the settings page follows the name at the STATUS ANSWER, not off a row-keyed effect', () => {

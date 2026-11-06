@@ -22,6 +22,7 @@ declare module '@deepseek-ai/cordis' {
     }
 }
 import type { AdminAdmission } from './admin-routes.js';
+import type { RelayPool } from './relay-pool.js';
 import type { RelayClient } from './relay-client.js';
 import type { BridgeRegistry } from './plugin-bridge.js';
 import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js';
@@ -37,8 +38,14 @@ export declare const CLIENT_CONFIG_ROUTE = "/_dsh/mobile-nav/client-config";
 /** Workspace-relative directory uploads land in (also the `@` prefix the composer inserts). */
 export declare const UPLOAD_DIR = ".dsh-uploads";
 export { DEFAULT_MAX_UPLOAD_BYTES };
-/** The live client-role relay client, if one was built. */
+/** The live client-role relay client, if one was built. MS-5: the wiring no
+ * longer builds one — the relay POOL below replaced it — so this stays
+ * undefined in production compositions; the getter (and the client-routes
+ * option of the same shape) remain for the single-client contract's old
+ * consumers and tests. */
 export declare function getRelayClient(): RelayClient | undefined;
+/** The live client-role relay pool, if one was built. */
+export declare function getRelayPool(): RelayPool | undefined;
 /** The live bridge registry, if a plugin row is currently applied. */
 export declare function getBridgeRegistry(): BridgeRegistry | undefined;
 /** Host half config. Every field below arrives through the loader as a

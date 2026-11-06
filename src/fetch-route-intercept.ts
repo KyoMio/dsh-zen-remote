@@ -215,11 +215,13 @@ export interface InstallFetchRouteInterceptOptions {
    * (`ctx.connection[symbols.original]`) — the one whose `fetchRoutes` Map
    * the shared handler reads per request. */
   connection: object
-  /** The client relay client (T23a) the uploads travel through. */
-  relay: RelayClient
-  /** The CURRENT handshake's server id, read live per call; `undefined`
-   * makes every remote upload a `remote-offline`. */
-  getServerId: () => string | undefined
+  /** SINGLE-SERVER mode: the client relay client (T23a) the uploads travel
+   * through. Required together with {@link getServerId} unless
+   * {@link getRelayForServer} is given (MS-5's pool wiring). */
+  relay?: RelayClient
+  /** SINGLE-SERVER mode: the CURRENT handshake's server id, read live per
+   * call; `undefined` makes every remote upload a `remote-offline`. */
+  getServerId?: () => string | undefined
   /** MS-4: the relay client serving ONE paired server, looked up by the
    * virtual id's serverId half per upload (the connection pool's
    * `getByServerId`). When given, routing reads it alone: `undefined` (a
@@ -304,6 +306,17 @@ const LINK_DOWN_CODES: ReadonlySet<string> = new Set(['offline', 'unpaired', 're
  */
 export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOptions): FetchRouteInterceptHandle {
   const { connection, relay, getServerId, getRelayForServer, log } = options
+  // Exactly one mode, like installIntercept: the pool face or the single
+  // row client — a wiring that passes neither would silently send every
+  // remote upload to remote-offline, so it is refused here instead.
+  if (getRelayForServer === undefined && (relay === undefined || getServerId === undefined)) {
+    throw new Error('installFetchRouteIntercept requires either `relay` + `getServerId` (single server) or `getRelayForServer`')
+  }
+  // The single-server facts, proven present by the guard above. The
+  // single-server code path reads THESE (never the optionals), so the old
+  // behavior stays byte-identical without a narrowing dance.
+  const singleRelay = relay as RelayClient
+  const singleGetServerId = getServerId as () => string | undefined
   const attachRetryMs = options.attachRetryMs ?? DEFAULT_ATTACH_RETRY_MS
   const attachAttempts = options.attachAttempts ?? DEFAULT_ATTACH_ATTEMPTS
   const shape = checkFetchRouteShape(connection)
@@ -337,10 +350,10 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
       if (target === undefined) return 'remote-mismatch'
       return target.state === 'online' ? target : 'remote-offline'
     }
-    const current = getServerId()
-    if (relay.state !== 'online' || current === undefined) return 'remote-offline'
+    const current = singleGetServerId()
+    if (singleRelay.state !== 'online' || current === undefined) return 'remote-offline'
     if (serverId !== current) return 'remote-mismatch'
-    return relay
+    return singleRelay
   }
 
   const wrappedUpload = async (request: Request): Promise<Response> => {
