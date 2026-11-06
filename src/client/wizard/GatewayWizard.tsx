@@ -21,6 +21,7 @@ import type {
   AdminStatusBody,
   ClaimRouteBody,
   ClientConnectionView,
+  ClientServerView,
   ClientStatusBody,
   SettingsDeviceView,
   ZenRemoteSettingsForm,
@@ -33,9 +34,10 @@ import {
   CLIENT_CONFIG_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
+  CLIENT_UNPAIR_ROUTE,
   awaitClientStatusReady,
+  canSubmitClientPairing,
   claimDeviceNameOf,
-  clientStatusLineOf,
   deriveClientStatusView,
   deriveSettingsView,
   normalizePairingCode,
@@ -55,6 +57,8 @@ import {
   WIZARD_VERIFY_ROUTE,
   caddyFailureCopy,
   configureReadiness,
+  deriveClientOverviewSummary,
+  deriveClientServerLights,
   deriveClientWizardLights,
   deriveWizardLights,
   formSeedOf,
@@ -157,22 +161,6 @@ const PATH_OPTIONS = [
   ['lan', 'wizard.path.lan', 'wizard.path.lanDesc'],
 ] as const
 
-function clientStatusCopy(view: ClientConnectionView, now: number, t: GatewayWizardProps['t']): string {
-  const line = clientStatusLineOf(view, now)
-  switch (line.kind) {
-    case 'connectedName': return t('settings.client.statusConnectedName', { serverName: line.serverName })
-    case 'connected': return t('settings.client.statusConnected', { serverUrl: line.serverUrl })
-    case 'offlineRetry': return t('settings.client.statusOfflineRetry', { seconds: line.seconds })
-    case 'offlineRetrySoon': return t('settings.client.statusOfflineRetrySoon')
-    case 'unreachable': return t('settings.client.statusUnreachable')
-    case 'revoked': return t('settings.client.statusRevoked')
-    case 'incompatible': return t('settings.client.statusIncompatible')
-    case 'unexpected': return t('settings.client.statusUnexpected')
-    case 'invalidUrl': return t('settings.client.statusInvalidUrl')
-    default: return t('settings.client.statusUnpaired')
-  }
-}
-
 function claimFailCopy(code: string, retryAfterMs: number | undefined, t: GatewayWizardProps['t']): string {
   switch (code) {
     case 'invalid': return t('settings.client.failInvalid')
@@ -184,7 +172,42 @@ function claimFailCopy(code: string, retryAfterMs: number | undefined, t: Gatewa
     }
     case 'unreachable': return t('settings.client.failUnreachable')
     case 'role-mismatch': return t('settings.client.failRoleMismatch')
+    case 'limit-reached': return t('settings.client.failLimitReached')
     default: return t('settings.client.failUnexpected')
+  }
+}
+
+/** The verdicts that will not recover on their own (MS-8): a pool row's dot
+ * turns red on these, amber on everything else, green only when connected. */
+const SERVER_DEAD_STATES: ReadonlySet<ClientServerView['state']> = new Set(['revoked', 'incompatible', 'invalid-url'])
+
+/** One paired server's dot state in the management surfaces (MS-8). */
+function serverDotState(state: ClientServerView['state']): 'pass' | 'pending' | 'fail' {
+  if (state === 'connected') return 'pass'
+  return SERVER_DEAD_STATES.has(state) ? 'fail' : 'pending'
+}
+
+/**
+ * One paired server's badge copy + tone (MS-8): the settings page's
+ * per-server wording on the same keys, so the wizard's management modal and
+ * the settings block cannot drift apart in what a state is CALLED.
+ */
+function serverBadgeCopy(server: ClientServerView, now: number, t: GatewayWizardProps['t']): { text: string; tone: 'live' | 'warn' | 'invalid' | undefined } {
+  switch (server.state) {
+    case 'connected': return { text: t('settings.client.serverStateConnected'), tone: 'live' }
+    case 'unreachable':
+    case 'unexpected': {
+      if (server.nextRetryAt === undefined) return { text: t('settings.client.serverStateOffline'), tone: 'warn' }
+      const seconds = Math.max(0, Math.ceil((server.nextRetryAt - now) / 1000))
+      return {
+        text: seconds > 0 ? t('settings.client.serverStateRetry', { seconds }) : t('settings.client.serverStateRetrySoon'),
+        tone: 'warn',
+      }
+    }
+    case 'revoked': return { text: t('settings.client.serverStateRevoked'), tone: 'invalid' }
+    case 'incompatible': return { text: t('settings.client.serverStateIncompatible'), tone: 'invalid' }
+    case 'invalid-url': return { text: t('settings.client.serverStateInvalidUrl'), tone: 'invalid' }
+    default: return { text: t('settings.client.serverStateUnpaired'), tone: undefined }
   }
 }
 
@@ -262,8 +285,14 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [clientClaimFail, setClientClaimFail] = useState<{ code: string; retryAfterMs?: number } | null>(null)
   const [clientView, setClientView] = useState<ClientConnectionView | undefined>()
   const [clientLoading, setClientLoading] = useState(false)
-  const [clientReconnectBusy, setClientReconnectBusy] = useState(false)
   const [clientUnpairBusy, setClientUnpairBusy] = useState(false)
+  // MS-8: the paired-server pool's management surfaces — the 已配对服务端
+  // 管理弹窗, the entry the wizard's step 3 is staring at, and the per-entry
+  // action busy/failed markers both the modal and step 3 share.
+  const [serversModalOpen, setServersModalOpen] = useState(false)
+  const [activeClientEntryId, setActiveClientEntryId] = useState<string | undefined>()
+  const [serverBusyEntry, setServerBusyEntry] = useState<string | null>(null)
+  const [serverActionFailed, setServerActionFailed] = useState(false)
 
   // The saved role, live.
   const roleSnapshot = useSyncExternalStore(
@@ -388,9 +417,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }
 
-  // Close the wizard modal or devices modal on Escape when no sub-card is open and not mid-save.
+  // Close the wizard modal, devices modal or servers modal on Escape when no sub-card is open and not mid-save.
   useEffect(() => {
-    if ((!modalOpen && !devicesModalOpen) || card !== undefined) return
+    if ((!modalOpen && !devicesModalOpen && !serversModalOpen) || card !== undefined) return
     const onKey = (event: KeyboardEvent): void => {
       if (event.key === 'Escape' && !savingConfig && !clientClaimBusy && !deviceBusy) {
         if (renamingDevice !== null) {
@@ -401,12 +430,16 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           setDevicesModalOpen(false)
           return
         }
+        if (serversModalOpen) {
+          setServersModalOpen(false)
+          return
+        }
         setModalOpen(false)
       }
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [modalOpen, devicesModalOpen, card, savingConfig, clientClaimBusy, deviceBusy, renamingDevice])
+  }, [modalOpen, devicesModalOpen, serversModalOpen, card, savingConfig, clientClaimBusy, deviceBusy, renamingDevice])
 
   // Seed the entry step AND the configure forms from the FIRST ready
   // wizard status on a host deployment.
@@ -779,6 +812,14 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       setFormError('bad-client-code')
       return
     }
+    // MS-8: a NEW address at a full pool is refused locally (the button is
+    // gated too — this backs it up); an already-paired address still
+    // re-pairs its entry in place, which is how a revoked token at 8/8
+    // gets back in.
+    if (claimGate.blockedByLimit) {
+      setClientClaimFail({ code: 'limit-reached' })
+      return
+    }
     setClientClaimBusy(true)
     try {
       // If the deployment is currently running as 'host', switch role to 'client'
@@ -799,18 +840,28 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       const response = await fetch(CLIENT_CLAIM_ROUTE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // MS-5 pool mode: the route reads `name` (the settings page's field).
         body: JSON.stringify({
           serverUrl: trimmedUrl,
           code: normalizedCode,
-          deviceName,
+          name: deviceName,
         }),
       })
       const body = (await response.json()) as ClaimRouteBody
-      if (body?.ok === true && typeof body.token === 'string' && body.token !== '') {
-        const urlToWrite = typeof body.serverUrl === 'string' && body.serverUrl !== '' ? body.serverUrl : trimmedUrl
-        const echoed = typeof body.deviceName === 'string' && body.deviceName.trim() !== '' ? body.deviceName.trim() : deviceName
-        const landed = await config.writeClientPairing(urlToWrite, body.token, echoed)
-        if (landed && shouldReloadAfterClientActivation({
+      if (body?.ok === true) {
+        if (typeof body.entryId === 'string' && body.entryId !== '') {
+          // Pool mode: the pairing landed straight in the pool store (the
+          // token never rides the answer) — remember WHICH entry the wizard
+          // just touched so step 3 opens on it.
+          setActiveClientEntryId(body.entryId)
+        } else if (typeof body.token === 'string' && body.token !== '') {
+          // Legacy single-server route: the token rides the answer and the
+          // row is the store.
+          const urlToWrite = typeof body.serverUrl === 'string' && body.serverUrl !== '' ? body.serverUrl : trimmedUrl
+          const echoed = typeof body.deviceName === 'string' && body.deviceName.trim() !== '' ? body.deviceName.trim() : deviceName
+          await config.writeClientPairing(urlToWrite, body.token, echoed)
+        }
+        if (shouldReloadAfterClientActivation({
           wasEffectiveClient,
           nowClientRole: true,
           savedOrPaired: true,
@@ -839,18 +890,6 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }
 
-  const runClientReconnect = async (): Promise<void> => {
-    setClientReconnectBusy(true)
-    try {
-      await fetch(CLIENT_RECONNECT_ROUTE, { method: 'POST' })
-      await loadClientStatus()
-    } catch {
-      // ignore
-    } finally {
-      setClientReconnectBusy(false)
-    }
-  }
-
   const runClientUnpair = async (): Promise<void> => {
     setClientUnpairBusy(true)
     try {
@@ -862,6 +901,27 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     } finally {
       setClientUnpairBusy(false)
     }
+  }
+
+  // MS-8: one paired server's management action — the reconnect route's
+  // `{ entryId }` shape or the unpair route's. The status refresh runs
+  // either way so the surface re-renders on the pool's verdict.
+  const runServerAction = async (route: string, entryId: string, payload: Record<string, unknown>): Promise<void> => {
+    setServerBusyEntry(entryId)
+    setServerActionFailed(false)
+    try {
+      const response = await fetch(route, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      if (!response.ok) setServerActionFailed(true)
+    } catch {
+      setServerActionFailed(true)
+    } finally {
+      setServerBusyEntry(null)
+    }
+    await loadClientStatus()
   }
 
   // Managed-Caddy & Tunnel controls (GW-13a / GW-13b): keyed strictly off the
@@ -989,6 +1049,22 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     clientState: clientView?.state,
     interceptInstalled: clientView?.intercept?.installed,
   })
+  // MS-8: the paired-server pool as the overview grid, wizard steps 2-3 and
+  // the management modal all read it. The step-3 selection falls back to the
+  // first row (pairing order) when nothing is recorded yet or the recorded
+  // entry was removed.
+  const serverRows = clientView?.servers ?? []
+  const poolSummary = deriveClientOverviewSummary(serverRows, clientView?.maxServers)
+  const activeServer = serverRows.find((server) => server.entryId === activeClientEntryId) ?? serverRows[0]
+  const serverLights = deriveClientServerLights(activeServer)
+  // The pairing form's cap gate (MS-8): blockedByLimit is true only for a NEW
+  // address at a full pool — an already-paired address never trips it.
+  const claimGate = canSubmitClientPairing({
+    pairUrl: clientServerUrl,
+    pairCode: clientPairCode,
+    servers: serverRows,
+    ...(clientView !== undefined ? { maxServers: clientView.maxServers } : {}),
+  })
   const verified = poll?.result === 'pass'
   const qr = startResult?.ok === true ? qrMatrix(startResult.publicUrl) : null
 
@@ -1015,10 +1091,17 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     tokenConfigured: roleSnapshot.deviceToken.configured,
     clientServerUrl,
     clientState: clientView?.state,
+    pairedServerCount: serverRows.length,
   })
 
   const statusSummary = (() => {
     if (effectiveClient) {
+      if (poolSummary.totalCount > 0) {
+        return {
+          state: (poolSummary.onlineCount > 0 ? 'pass' : 'pending') as 'pass' | 'pending',
+          text: `${t('wizard.role.client')} · ${t('wizard.overview.clientOnlineCount', { online: poolSummary.onlineCount, total: poolSummary.totalCount })}`,
+        }
+      }
       if (clientView?.state === 'connected') {
         const label = clientView.serverName !== '' ? clientView.serverName : (clientView.serverUrl || t('wizard.role.client'))
         return { state: 'pass' as const, text: `${t('wizard.role.client')} · ${label}` }
@@ -1053,6 +1136,15 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     setModalOpen(true)
   }
 
+  // MS-8: 「+ 添加服务端」 — a BLANK pairing form on step 2, so a stale
+  // address or code from an earlier pairing can never ride into the new one.
+  const openAddServerWizard = (): void => {
+    setClientServerUrl('')
+    setClientPairCode('')
+    setClientClaimFail(null)
+    openWizardAt('configure', { role: 'client' })
+  }
+
   return (
     <div data-zen-remote="wizard">
       <div className="zr-wizard-header">
@@ -1079,32 +1171,68 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 <p className="zr-wizard-overviewSub">{clientDeviceName.trim() !== '' ? clientDeviceName : t('settings.client.deviceNameDefault')}</p>
               </div>
               <div className="zr-wizard-overviewItem">
-                <p className="zr-wizard-overviewLabel">{t('wizard.overview.clientCredLabel')}</p>
+                <p className="zr-wizard-overviewLabel">{t('wizard.overview.clientSyncLabel')}</p>
                 <p className="zr-wizard-overviewValue">
-                  <span className="zr-wizard-dot" data-state={clientLights.credential} />
-                  <span>{roleSnapshot.deviceToken.configured ? t('settings.client.tokenSet') : t('settings.client.statusUnpaired')}</span>
+                  <span className="zr-wizard-dot" data-state={clientLights.sync} />
+                  <span>
+                    {clientLights.sync === 'pass'
+                      ? t('wizard.overview.syncOk')
+                      : clientLights.sync === 'fail'
+                        ? t('wizard.overview.syncBad')
+                        : t('wizard.overview.syncPending')}
+                  </span>
                 </p>
-                <p className="zr-wizard-overviewSub">{t(LIGHT_LABEL[clientLights.credential])}</p>
+                <p className="zr-wizard-overviewSub">{t(LIGHT_LABEL[clientLights.sync])}</p>
               </div>
               <div className="zr-wizard-overviewItem">
                 <p className="zr-wizard-overviewLabel">{t('wizard.overview.clientConnLabel')}</p>
                 <p className="zr-wizard-overviewValue">
-                  <span className="zr-wizard-dot" data-state={clientLights.connection} />
-                  <span>
-                    {clientView === undefined
-                      ? (clientLoading ? t('settings.client.statusRefreshing') : t('settings.client.statusUnpaired'))
-                      : clientStatusCopy(clientView, now, t)}
-                  </span>
+                  <span className="zr-wizard-dot" data-state={poolSummary.connectionLight} />
+                  <span>{t('wizard.overview.clientOnlineCount', { online: poolSummary.onlineCount, total: poolSummary.totalCount })}</span>
                 </p>
-                <p className="zr-wizard-overviewSub">{t(LIGHT_LABEL[clientLights.connection])}</p>
+                <p className="zr-wizard-overviewSub">
+                  {poolSummary.totalCount === 0
+                    ? t('settings.client.statusUnpaired')
+                    : poolSummary.offlineCount === 0 && poolSummary.revokedCount === 0
+                      ? t('wizard.overview.clientAllOnline')
+                      : [
+                          poolSummary.offlineCount > 0 ? t('wizard.overview.clientOfflineCount', { count: poolSummary.offlineCount }) : '',
+                          poolSummary.revokedCount > 0 ? t('wizard.overview.clientRevokedCount', { count: poolSummary.revokedCount }) : '',
+                        ].filter((line) => line !== '').join(' · ')}
+                </p>
               </div>
               <div className="zr-wizard-overviewItem">
-                <p className="zr-wizard-overviewLabel">{t('wizard.overview.clientServerLabel')}</p>
-                <p className="zr-wizard-overviewValue">
-                  <span className="zr-wizard-dot" data-state={clientLights.sync} />
-                  <span>{clientView?.serverUrl || clientServerUrl || '—'}</span>
+                <div className="zr-wizard-overviewHead">
+                  <p className="zr-wizard-overviewLabel">{t('wizard.overview.clientServersLabel')}</p>
+                  <button
+                    type="button"
+                    className="zr-wizard-linkBtn"
+                    onClick={() => {
+                      setServerActionFailed(false)
+                      setServersModalOpen(true)
+                    }}
+                  >
+                    {t('wizard.overview.manageServers')}
+                  </button>
+                </div>
+                <p className="zr-wizard-overviewValue" data-limit={poolSummary.limitReached ? 'true' : undefined}>
+                  <span className="zr-wizard-dot" data-state={poolSummary.serversLight} />
+                  <span>
+                    {poolSummary.limitReached
+                      ? t('wizard.overview.clientPairedFull', { count: poolSummary.totalCount, max: poolSummary.maxServers })
+                      : t('settings.client.poolCount', { count: poolSummary.totalCount, max: poolSummary.maxServers })}
+                  </span>
                 </p>
-                <p className="zr-wizard-overviewSub">{t('wizard.client.lightSync')}：{t(LIGHT_LABEL[clientLights.sync])}</p>
+                <p className="zr-wizard-overviewSub" data-limit={poolSummary.limitReached ? 'true' : undefined}>
+                  {poolSummary.limitReached
+                    ? t('wizard.overview.limitNote', { max: poolSummary.maxServers })
+                    : serverRows.length === 0
+                      ? t('settings.client.serversEmpty', { max: poolSummary.maxServers })
+                      : t('wizard.overview.clientPairedNames', {
+                          names: serverRows.map((server) => (server.displayName !== '' ? server.displayName : server.serverUrl)).join('、'),
+                          max: poolSummary.maxServers,
+                        })}
+                </p>
               </div>
             </div>
 
@@ -1118,18 +1246,6 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 >
                   {clientLoading ? t('settings.client.statusRefreshing') : t('settings.client.statusRefresh')}
                 </button>
-                {clientView?.nextRetryAt !== undefined ? (
-                  <button
-                    type="button"
-                    className="zr-wizard-btn"
-                    disabled={clientReconnectBusy}
-                    onClick={() => { void runClientReconnect() }}
-                  >
-                    {clientReconnectBusy ? t('settings.client.reconnectBusy') : t('settings.client.reconnect')}
-                  </button>
-                ) : null}
-              </div>
-              <div className="zr-wizard-row">
                 <button
                   type="button"
                   className="zr-wizard-btn"
@@ -1137,12 +1253,25 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 >
                   {t('wizard.overview.reconfigure')}
                 </button>
+              </div>
+              <div className="zr-wizard-row">
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  onClick={() => {
+                    setServerActionFailed(false)
+                    setServersModalOpen(true)
+                  }}
+                >
+                  {t('wizard.overview.manageServers')}
+                </button>
                 <button
                   type="button"
                   className="zr-wizard-btn zr-wizard-btnPrimary"
-                  onClick={() => openWizardAt(roleSnapshot.deviceToken.configured ? 'verify' : 'configure', { role: 'client' })}
+                  disabled={poolSummary.limitReached}
+                  onClick={openAddServerWizard}
                 >
-                  {t('wizard.overview.clientDetail')}
+                  {t('wizard.overview.addServer')}
                 </button>
               </div>
             </div>
@@ -1572,6 +1701,16 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                     </>
                   ) : (
                     <>
+                      {/* MS-8: the pool cap is stated on EVERY entry into a
+                          new pairing, and a full pool shouts in red. */}
+                      <p className="zr-wizard-notice">
+                        {t('wizard.client.poolCapNote', { count: serverRows.length, max: poolSummary.maxServers })}
+                      </p>
+                      {poolSummary.limitReached ? (
+                        <p className="zr-wizard-notice" data-tone="error">
+                          {t('wizard.overview.limitNote', { max: poolSummary.maxServers })}
+                        </p>
+                      ) : null}
                       <div className="zr-wizard-formStack">
                         <div className="zr-wizard-field">
                           <label className="zr-wizard-label" htmlFor="zr-wizard-client-device">{t('wizard.client.deviceName')}</label>
@@ -1659,10 +1798,14 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                           {t('wizard.client.skipToStatus')}
                         </button>
                       ) : null}
+                      {/* MS-8: at a full pool only an already-paired address
+                          may pass — the gate lifts the moment the typed URL
+                          names one (覆盖重配), so a revoked token at 8/8 can
+                          still re-pair its own server. */}
                       <button
                         type="button"
                         className="zr-wizard-btn zr-wizard-btnPrimary"
-                        disabled={clientClaimBusy}
+                        disabled={clientClaimBusy || claimGate.blockedByLimit}
                         onClick={() => { void runClientClaim() }}
                       >
                         {clientClaimBusy ? t('wizard.client.pairingBusy') : t('wizard.client.pairAndConnect')}
@@ -1881,59 +2024,95 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                     </>
                   ) : (
                     <>
+                      {/* MS-8: with more than one paired server the step
+                          switches between them; the selection defaults to the
+                          entry the last pairing (or the management modal)
+                          touched. */}
+                      {serverRows.length > 1 ? (
+                        <div className="zr-wizard-targetTabs" role="tablist" aria-label={t('wizard.client.serverPicker')}>
+                          {serverRows.map((server) => {
+                            const selected = activeServer?.entryId === server.entryId
+                            return (
+                              <button
+                                key={server.entryId}
+                                type="button"
+                                role="tab"
+                                aria-selected={selected}
+                                className="zr-wizard-targetTab"
+                                data-selected={selected}
+                                onClick={() => setActiveClientEntryId(server.entryId)}
+                              >
+                                {server.displayName !== '' ? server.displayName : server.serverUrl}
+                              </button>
+                            )
+                          })}
+                        </div>
+                      ) : null}
+
+                      {activeServer !== undefined ? (
+                        <div className="zr-wizard-serviceInfo">
+                          <span className="zr-wizard-dot" data-state={serverDotState(activeServer.state)} />
+                          <span className="zr-wizard-lightName">{activeServer.displayName !== '' ? activeServer.displayName : activeServer.serverUrl}</span>
+                          <span className="zr-wizard-hint">{activeServer.serverUrl}</span>
+                        </div>
+                      ) : null}
+
                       <ul className="zr-wizard-lights">
                         {CLIENT_LIGHT_ORDER.map(({ key, light }) => (
-                          <li key={key} className="zr-wizard-light" data-state={clientLights[light]}>
+                          <li key={key} className="zr-wizard-light" data-state={serverLights[light]}>
                             <div className="zr-wizard-lightMain">
-                              <span className="zr-wizard-dot" data-state={clientLights[light]} />
+                              <span className="zr-wizard-dot" data-state={serverLights[light]} />
                               <span className="zr-wizard-lightName">{t(key)}</span>
                             </div>
-                            <span className="zr-wizard-lightState" data-state={clientLights[light]}>{t(LIGHT_LABEL[clientLights[light]])}</span>
+                            <span className="zr-wizard-lightState" data-state={serverLights[light]}>{t(LIGHT_LABEL[serverLights[light]])}</span>
                           </li>
                         ))}
                       </ul>
 
-                      <div className="zr-wizard-clientBox">
-                        <p className="zr-wizard-label">{t('settings.client.statusTitle')}</p>
-                        <p
-                          className="zr-wizard-notice"
-                          data-tone={clientView?.state === 'connected' ? 'ok' : clientLights.connection === 'fail' ? 'error' : undefined}
-                        >
-                          {clientView === undefined
-                            ? (clientLoading ? t('settings.client.statusRefreshing') : t('settings.client.statusUnpaired'))
-                            : clientStatusCopy(clientView, now, t)}
-                        </p>
+                      {activeServer !== undefined ? (
+                        <div className="zr-wizard-row">
+                          {activeServer.nextRetryAt !== undefined ? (
+                            <button
+                              type="button"
+                              className="zr-wizard-btn zr-wizard-btnPrimary"
+                              disabled={serverBusyEntry !== null}
+                              onClick={() => { void runServerAction(CLIENT_RECONNECT_ROUTE, activeServer.entryId, { entryId: activeServer.entryId }) }}
+                            >
+                              {serverBusyEntry === activeServer.entryId ? t('settings.client.reconnectBusy') : t('settings.client.reconnect')}
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="zr-wizard-btn"
+                            disabled={serverBusyEntry !== null}
+                            onClick={() => {
+                              if (!window.confirm(t('settings.client.unpairServerConfirm'))) return
+                              const entryId = activeServer.entryId
+                              void runServerAction(CLIENT_UNPAIR_ROUTE, entryId, { entryId }).then(() => {
+                                setActiveClientEntryId((current) => (current === entryId ? undefined : current))
+                              })
+                            }}
+                          >
+                            {t('settings.client.serverRemove')}
+                          </button>
+                        </div>
+                      ) : null}
+
+                      {/* Legacy row-token fallback: a pre-pool pairing kept
+                          its token in the row — unpairing it stays possible
+                          even with no pool rows on screen. */}
+                      {serverRows.length === 0 && roleSnapshot.deviceToken.configured ? (
                         <div className="zr-wizard-row">
                           <button
                             type="button"
                             className="zr-wizard-btn"
-                            disabled={clientLoading}
-                            onClick={() => { void loadClientStatus() }}
+                            disabled={clientUnpairBusy}
+                            onClick={() => { void runClientUnpair() }}
                           >
-                            {clientLoading ? t('settings.client.statusRefreshing') : t('settings.client.statusRefresh')}
+                            {clientUnpairBusy ? t('settings.client.unpairBusy') : t('settings.client.unpair')}
                           </button>
-                          {clientView?.nextRetryAt !== undefined ? (
-                            <button
-                              type="button"
-                              className="zr-wizard-btn zr-wizard-btnPrimary"
-                              disabled={clientReconnectBusy}
-                              onClick={() => { void runClientReconnect() }}
-                            >
-                              {clientReconnectBusy ? t('settings.client.reconnectBusy') : t('settings.client.reconnect')}
-                            </button>
-                          ) : null}
-                          {roleSnapshot.deviceToken.configured ? (
-                            <button
-                              type="button"
-                              className="zr-wizard-btn"
-                              disabled={clientUnpairBusy}
-                              onClick={() => { void runClientUnpair() }}
-                            >
-                              {clientUnpairBusy ? t('settings.client.unpairBusy') : t('settings.client.unpair')}
-                            </button>
-                          ) : null}
                         </div>
-                      </div>
+                      ) : null}
                     </>
                   )}
                 </div>
@@ -1976,6 +2155,17 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                         onClick={() => { void runDesktopPair() }}
                       >
                         {desktopPairing !== undefined && desktopPairing.expiresAt > now ? t('wizard.desktop.regenerate') : t('wizard.desktop.generate')}
+                      </button>
+                    ) : null}
+                    {/* MS-8: keep adding servers without leaving the wizard —
+                        until the pool is full. */}
+                    {wizardRole === 'client' && !poolSummary.limitReached ? (
+                      <button
+                        type="button"
+                        className="zr-wizard-btn zr-wizard-btnPrimary"
+                        onClick={openAddServerWizard}
+                      >
+                        {t('wizard.client.continueAdd')}
                       </button>
                     ) : null}
                     <button
@@ -2185,6 +2375,177 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                   className="zr-wizard-btn"
                   disabled={deviceBusy}
                   onClick={() => setDevicesModalOpen(false)}
+                >
+                  {t('wizard.card.close')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {serversModalOpen ? (
+        <div
+          data-zen-remote="wizard-modal"
+          onClick={() => {
+            if (serverBusyEntry === null) setServersModalOpen(false)
+          }}
+        >
+          <div
+            className="zr-wizard-modalDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('wizard.serversModal.title')}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="zr-wizard-modalHeader">
+              <div className="zr-wizard-headerText">
+                <p className="zr-wizard-modalTitle">{t('wizard.serversModal.title')}</p>
+                <p className="zr-wizard-subtitle" data-limit={poolSummary.limitReached ? 'true' : undefined}>
+                  {t('wizard.serversModal.subtitle', { count: serverRows.length, max: poolSummary.maxServers })}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="zr-wizard-cardCloseIcon"
+                aria-label={t('wizard.card.close')}
+                disabled={serverBusyEntry !== null}
+                onClick={() => setServersModalOpen(false)}
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="zr-wizard-modalBody">
+              {/* MS-8: a full pool shouts here too — this is the surface a
+                  user at 8/8 lands on when they try to add one more. */}
+              {poolSummary.limitReached ? (
+                <p className="zr-wizard-notice" data-tone="error">
+                  {t('wizard.overview.limitNote', { max: poolSummary.maxServers })}
+                </p>
+              ) : null}
+              {serverActionFailed ? (
+                <p className="zr-wizard-notice" data-tone="error">{t('settings.actionFail')}</p>
+              ) : null}
+
+              {serverRows.length === 0 ? (
+                <p className="zr-wizard-notice">{t('settings.client.serversEmpty', { max: poolSummary.maxServers })}</p>
+              ) : (
+                <ul className="zr-wizard-deviceList">
+                  {serverRows.map((server) => {
+                    const badge = serverBadgeCopy(server, now, t)
+                    const name = server.displayName !== '' ? server.displayName : server.serverUrl
+                    return (
+                      <li key={server.entryId} className="zr-wizard-deviceItem">
+                        <div className="zr-wizard-deviceHead">
+                          <div className="zr-wizard-deviceTitleRow">
+                            <span className="zr-wizard-dot" data-state={serverDotState(server.state)} />
+                            <span className="zr-wizard-lightName">{name}</span>
+                            <span className="zr-wizard-deviceBadge" data-tone={badge.tone}>
+                              {badge.text}
+                            </span>
+                          </div>
+                          <span className="zr-wizard-hint">{server.serverUrl}</span>
+                        </div>
+
+                        <div className="zr-wizard-deviceActions">
+                          <button
+                            type="button"
+                            className="zr-wizard-linkBtn"
+                            disabled={serverBusyEntry !== null}
+                            onClick={() => {
+                              setServersModalOpen(false)
+                              setActiveClientEntryId(server.entryId)
+                              openWizardAt('verify', { role: 'client' })
+                            }}
+                          >
+                            {t('wizard.serversModal.viewStatus')}
+                          </button>
+                          {server.nextRetryAt !== undefined ? (
+                            <button
+                              type="button"
+                              className="zr-wizard-linkBtn"
+                              disabled={serverBusyEntry !== null}
+                              onClick={() => { void runServerAction(CLIENT_RECONNECT_ROUTE, server.entryId, { entryId: server.entryId }) }}
+                            >
+                              {serverBusyEntry === server.entryId ? t('settings.client.reconnectBusy') : t('settings.client.reconnect')}
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="zr-wizard-linkBtn"
+                            disabled={serverBusyEntry !== null}
+                            onClick={() => {
+                              // 覆盖重配 pre-fills the entry's own address, so
+                              // it stays usable at a FULL pool (an already-paired
+                              // address never trips the cap).
+                              setServersModalOpen(false)
+                              setClientServerUrl(server.serverUrl)
+                              setClientPairCode('')
+                              setClientClaimFail(null)
+                              openWizardAt('configure', { role: 'client' })
+                            }}
+                          >
+                            {t('settings.client.repair')}
+                          </button>
+                          <button
+                            type="button"
+                            className="zr-wizard-linkBtn"
+                            disabled={serverBusyEntry !== null}
+                            onClick={() => {
+                              if (!window.confirm(t('settings.client.unpairServerConfirm'))) return
+                              const entryId = server.entryId
+                              void runServerAction(CLIENT_UNPAIR_ROUTE, entryId, { entryId }).then(() => {
+                                setActiveClientEntryId((current) => (current === entryId ? undefined : current))
+                              })
+                            }}
+                          >
+                            {t('settings.client.serverRemove')}
+                          </button>
+                        </div>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+            </div>
+
+            <div className="zr-wizard-modalFooter">
+              <div className="zr-wizard-row">
+                {serverRows.length > 0 ? (
+                  <button
+                    type="button"
+                    className="zr-wizard-btn"
+                    disabled={serverBusyEntry !== null}
+                    onClick={() => {
+                      if (window.confirm(t('settings.client.unpairAllServersConfirm'))) {
+                        void runServerAction(CLIENT_UNPAIR_ROUTE, 'all', { all: true }).then(() => {
+                          setActiveClientEntryId(undefined)
+                        })
+                      }
+                    }}
+                  >
+                    {t('settings.client.unpairAllServers')}
+                  </button>
+                ) : null}
+              </div>
+              <div className="zr-wizard-row">
+                <button
+                  type="button"
+                  className="zr-wizard-btn zr-wizard-btnPrimary"
+                  disabled={poolSummary.limitReached || serverBusyEntry !== null}
+                  onClick={() => {
+                    setServersModalOpen(false)
+                    openAddServerWizard()
+                  }}
+                >
+                  {t('wizard.overview.addServer')}
+                </button>
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  disabled={serverBusyEntry !== null}
+                  onClick={() => setServersModalOpen(false)}
                 >
                   {t('wizard.card.close')}
                 </button>

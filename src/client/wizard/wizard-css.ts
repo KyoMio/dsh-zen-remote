@@ -138,6 +138,18 @@ export const WIZARD_CSS = `
   overflow-wrap: anywhere;
   word-break: break-word;
 }
+/* MS-8: the pool cap's loud form — the 已配对服务端 cell's value and sub
+   wear data-limit="true" at 8/8 and turn bold red (the same loudness the
+   settings page's limit alert uses). */
+[data-zen-remote="wizard"] .zr-wizard-overviewValue[data-limit="true"] {
+  color: var(--dsw-alias-state-error-primary, #d5304f);
+  font-weight: 700;
+}
+[data-zen-remote="wizard"] .zr-wizard-overviewSub[data-limit="true"],
+[data-zen-remote="wizard-modal"] .zr-wizard-subtitle[data-limit="true"] {
+  color: var(--dsw-alias-state-error-primary, #d5304f);
+  font-weight: 600;
+}
 [data-zen-remote="wizard"] .zr-wizard-emptyBanner {
   display: flex;
   align-items: center;
@@ -772,6 +784,17 @@ export const WIZARD_CSS = `
   border: 1px solid var(--dsw-alias-border-l2);
   background: var(--dsw-alias-bg-layer-2, var(--dsw-alias-bg-module-platform));
   color: var(--dsw-alias-label-secondary);
+}
+/* MS-8: the servers-modal state badge tones — green online, amber offline,
+   red for a verdict only a re-pair or an upgrade fixes. */
+[data-zen-remote="wizard"] .zr-wizard-deviceBadge[data-tone="live"] {
+  color: var(--dsw-alias-state-success-primary, #16a34a);
+}
+[data-zen-remote="wizard"] .zr-wizard-deviceBadge[data-tone="warn"] {
+  color: var(--dsw-alias-state-warning-primary, #b8860b);
+}
+[data-zen-remote="wizard"] .zr-wizard-deviceBadge[data-tone="invalid"] {
+  color: var(--dsw-alias-state-error-primary, #d5304f);
 }
 [data-zen-remote="wizard"] .zr-wizard-deviceActions {
   display: flex;
