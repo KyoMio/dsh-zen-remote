@@ -35,7 +35,7 @@ for (const key of Object.keys(process.env)) {
 
 const { checkGatewayShape } = require('../lib/intercept-shape.js')
 const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS, REMOTE_READ_METHODS, isRemoteWrite, rewriteRemoteEventFrame } = require('../lib/intercept.js')
-const { toVirtual, VIRTUAL_GROUP_NAME_MARK: MARK } = require('../lib/virtual-id.js')
+const { toVirtual, VIRTUAL_GROUP_NAME_MARK: MARK, encodeServerIdZeroWidth } = require('../lib/virtual-id.js')
 const { encodeSessionReferenceUri, decodeSessionReferenceUri } = require('../lib/relay-server.js')
 const { RelayError } = require('../lib/relay-client.js')
 const { symbols } = require('@deepseek-ai/cordis')
@@ -43,6 +43,9 @@ const { symbols } = require('@deepseek-ai/cordis')
 const SERVER_ID = '721b94fb'
 const LOCAL_ID = 'session-712828e2-492f-4ad1-8a88-ece10ecc4cc0'
 const VIRTUAL_ID = toVirtual(SERVER_ID, LOCAL_ID)
+// MS-4: a remote model group's heading opens with the server id's zero-width
+// bit encoding (the bare legacy MARK is the no-server fallback shape).
+const SERVER_MARK = encodeServerIdZeroWidth(SERVER_ID)
 
 // DSH ≤0.2.2-alpha.2 per-key fields + the ≥alpha.3 one-entry `changes` list (dual shape).
 const P = (frame) => ({ ...frame, changes: [{ key: frame.key, val: frame.value }] })
@@ -2012,12 +2015,13 @@ test('T51: the fetch-route wiring installs beside the typert wrap and the status
   assert.equal(status.fetchRouteIntercept.shape.ok, true)
 
   // A virtual upload is refused locally with the UI-parseable envelope (the
-  // row is unpaired → remote-offline, T51-fix's 200 contract); a local id
+  // MS-5 pool face: an id whose server the empty pool does not hold reads
+  // remote-mismatch, still under T51-fix's 200 contract); a local id
   // reaches the original route untouched.
   const virtual = toVirtual(SERVER_ID, LOCAL_ID)
   const refused = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(virtual))
   assert.equal(refused.status, 200)
-  assert.equal((await refused.json()).error.code, 'remote-offline')
+  assert.equal((await refused.json()).error.code, 'remote-mismatch')
   assert.equal(uploadSeen.length, 0)
   const local = await connection.routes.get(FILE_UPLOAD_PATH).fetch(uploadRequestOf(LOCAL_ID))
   assert.equal(await local.text(), 'local-upload')
@@ -3842,7 +3846,7 @@ test('T52: session/modelCatalog merges the relay groups behind the local ones; o
   assert.deepEqual(merged.groups[1], LOCAL_CATALOG.groups[1])
   assert.deepEqual(merged.groups[2], {
     id: toVirtual(SERVER_ID, 'codex'),
-    name: `${MARK}测试服务器 · Codex`,
+    name: `${SERVER_MARK}测试服务器 · Codex`,
     models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }],
   })
   // default and failures stay LOCAL (server failures never alarm the
@@ -3870,7 +3874,7 @@ test('T52: session/modelCatalog merges the relay groups behind the local ones; o
   assert.equal(offlineAnswer.ok, true)
   assert.deepEqual(offlineAnswer.value.groups[2], {
     id: toVirtual(SERVER_ID, 'codex'),
-    name: `${MARK}测试服务器 · Codex`,
+    name: `${SERVER_MARK}测试服务器 · Codex`,
     models: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }],
   })
   assert.deepEqual(offlineAnswer.value.failures, LOCAL_CATALOG.failures, 'only the local failures travel')

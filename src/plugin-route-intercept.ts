@@ -340,15 +340,19 @@ export interface InstallPluginRouteInterceptOptions {
   webServer: object
   /** The local declaration registry (the `zenRemote` service's table). */
   registry: BridgeRegistry
-  /** The client relay client; `pluginRequest` is the forwarding door. */
-  relay: RelayClient
-  /** The CURRENT handshake's server id, read live per call; a virtual id
-   * minted for another server (or before any handshake) refuses
-   * `server-changed`. */
-  getServerId: () => string | undefined
-  /** The PB-2 bridge verdicts, computed live per call; a plugin that is
-   * not bridged right now refuses with the status's own reason. */
-  getStatus: () => BridgeStatus[]
+  /** SINGLE-SERVER mode: the client relay client; `pluginRequest` is the
+   * forwarding door. Required together with {@link getServerId} and
+   * {@link getStatus} unless the MS-4 per-server faces below are given
+   * (MS-5's pool wiring). */
+  relay?: RelayClient
+  /** SINGLE-SERVER mode: the CURRENT handshake's server id, read live per
+   * call; a virtual id minted for another server (or before any handshake)
+   * refuses `server-changed`. */
+  getServerId?: () => string | undefined
+  /** SINGLE-SERVER mode: the PB-2 bridge verdicts, computed live per call; a
+   * plugin that is not bridged right now refuses with the status's own
+   * reason. */
+  getStatus?: () => BridgeStatus[]
   /** The validated adapters (PB-11), as the wiring registered them.
    * Absent/empty — the pluggable default — means no adapter routes exist
    * and this interception behaves exactly as before. */
@@ -497,18 +501,34 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       },
     }
   }
-  const { webServer, registry, relay, getServerId, getStatus, log } = options
+  const { webServer, registry, log } = options
   const adapters = options.adapters ?? []
   const getCurrentSession = options.getCurrentSession
   const getKnownRealIds = options.getKnownRealIds
   const onMintedVirtualIds = options.onMintedVirtualIds
+  const { relay, getServerId, getStatus } = options
   const { getRelayForServer, getStatusForServer, getKnownRealIdsForServer } = options
+  // Exactly one mode, like installIntercept: the pool faces or the single
+  // row client — a wiring that passes neither would refuse every forwarded
+  // request as server-changed / not-bridged, so it is refused here instead.
+  if (
+    (getRelayForServer === undefined && (relay === undefined || getServerId === undefined))
+    || (getStatusForServer === undefined && getStatus === undefined)
+  ) {
+    throw new Error(
+      'installPluginRouteIntercept requires either `relay` + `getServerId` + `getStatus` (single server) or `getRelayForServer` + `getStatusForServer` (pool)',
+    )
+  }
+  // The single-server facts, proven present by the guard above.
+  const singleRelay = relay as RelayClient
+  const singleGetServerId = getServerId as () => string | undefined
+  const singleGetStatus = getStatus as () => BridgeStatus[]
   /** MS-4: the relay client serving one server id, or `undefined` (the
    * `server-changed` refusal). */
   const relayOfServer = (serverId: string): RelayClient | undefined =>
-    getRelayForServer !== undefined ? getRelayForServer(serverId) : serverId === getServerId() ? relay : undefined
+    getRelayForServer !== undefined ? getRelayForServer(serverId) : serverId === singleGetServerId() ? singleRelay : undefined
   const statusesOfServer = (serverId: string): BridgeStatus[] =>
-    getStatusForServer !== undefined ? getStatusForServer(serverId) : getStatus()
+    getStatusForServer !== undefined ? getStatusForServer(serverId) : singleGetStatus()
   const knownRealIdsOfServer = (serverId: string): ReadonlySet<string> | undefined =>
     getKnownRealIdsForServer !== undefined ? getKnownRealIdsForServer(serverId) : getKnownRealIds?.()
   /** MS-4: the one server every located virtual id of a request belongs to,

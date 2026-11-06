@@ -116,15 +116,19 @@ export interface InstallPluginRouteInterceptOptions {
     webServer: object;
     /** The local declaration registry (the `zenRemote` service's table). */
     registry: BridgeRegistry;
-    /** The client relay client; `pluginRequest` is the forwarding door. */
-    relay: RelayClient;
-    /** The CURRENT handshake's server id, read live per call; a virtual id
-     * minted for another server (or before any handshake) refuses
-     * `server-changed`. */
-    getServerId: () => string | undefined;
-    /** The PB-2 bridge verdicts, computed live per call; a plugin that is
-     * not bridged right now refuses with the status's own reason. */
-    getStatus: () => BridgeStatus[];
+    /** SINGLE-SERVER mode: the client relay client; `pluginRequest` is the
+     * forwarding door. Required together with {@link getServerId} and
+     * {@link getStatus} unless the MS-4 per-server faces below are given
+     * (MS-5's pool wiring). */
+    relay?: RelayClient;
+    /** SINGLE-SERVER mode: the CURRENT handshake's server id, read live per
+     * call; a virtual id minted for another server (or before any handshake)
+     * refuses `server-changed`. */
+    getServerId?: () => string | undefined;
+    /** SINGLE-SERVER mode: the PB-2 bridge verdicts, computed live per call; a
+     * plugin that is not bridged right now refuses with the status's own
+     * reason. */
+    getStatus?: () => BridgeStatus[];
     /** The validated adapters (PB-11), as the wiring registered them.
      * Absent/empty — the pluggable default — means no adapter routes exist
      * and this interception behaves exactly as before. */

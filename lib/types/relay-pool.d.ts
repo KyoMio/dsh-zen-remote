@@ -72,8 +72,10 @@ export interface RelayPoolOptions {
         serverUrl?: string;
         deviceToken?: string;
     } | undefined;
-    /** This side's own interface fingerprints (T42), handed to every client. */
-    computeOwnFingerprints: () => Record<string, string>;
+    /** This side's own interface fingerprints (T42), handed to every client.
+     * May be async (the real wiring computes against the typert registry,
+     * which loads package by package); the clients await it per handshake. */
+    computeOwnFingerprints: () => Record<string, string> | Promise<Record<string, string>>;
     /** Outbound fetch for the clients; defaults to the global one. */
     fetchImpl?: typeof fetch;
     /** Clock for the clients' reconnect machinery; defaults to the real one. */

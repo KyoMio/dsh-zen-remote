@@ -87,6 +87,8 @@ function startClientServer(row, overrides = {}) {
     getRowConfig: overrides.getRowConfig || (() => row),
     ...(overrides.fetchImpl !== undefined ? { fetchImpl: overrides.fetchImpl } : {}),
     ...(overrides.getRelayClient !== undefined ? { getRelayClient: overrides.getRelayClient } : {}),
+    ...(overrides.pool !== undefined ? { pool: overrides.pool } : {}),
+    ...(overrides.getPluginBridgeStatusForServer !== undefined ? { getPluginBridgeStatusForServer: overrides.getPluginBridgeStatusForServer } : {}),
     ...(overrides.getIntercept !== undefined ? { getIntercept: overrides.getIntercept } : {}),
     ...(overrides.getPluginBridgeStatus !== undefined ? { getPluginBridgeStatus: overrides.getPluginBridgeStatus } : {}),
     ...(overrides.remoteStatusOnly !== undefined ? { remoteStatusOnly: overrides.remoteStatusOnly } : {}),
@@ -1938,4 +1940,470 @@ test('CU-fix S2: a rejected upload reaches the log ring through the warn the rou
   assert.notEqual(anchor, -1, 'the upload route registration is the anchor')
   const call = source.slice(source.lastIndexOf('return handleUpload(', anchor), anchor)
   assert.match(call, /admit\(admitReq\),\s*logWarn,\s*\)/u, 'the route passes logWarn as the warn argument')
+})
+
+// ---- MS-5: the pool mode (multi-server sub-client) ----------------------------
+
+const UNPAIR_ROUTE = '/_dsh/zen-remote/client/unpair'
+
+test('MS-5: the unpair route constant sits under the client prefix', async () => {
+  assert.equal(routes.CLIENT_UNPAIR_ROUTE, UNPAIR_ROUTE)
+})
+
+/** A RelayPool stand-in with exactly the surface the client routes consume,
+ * recording every mutating call. `entries` is the live array the getters
+ * read; `overrides` replaces any method for one scenario. */
+function fakePool(entries, overrides = {}) {
+  const calls = { pair: [], unpair: [], unpairAll: 0, reconnect: [], probeRestore: 0, deviceName: [] }
+  const pool = {
+    calls,
+    entries: () => entries,
+    getByEntryId: (entryId) => entries.find((entry) => entry.entryId === entryId),
+    getByServerId: (serverId) => entries.find((entry) => entry.serverId === serverId),
+    pair: async (input) => {
+      calls.pair.push(input)
+      const existing = entries.find((entry) => entry.serverUrl === input.serverUrl)
+      if (existing !== undefined) return { ok: true, entry: existing, replaced: true }
+      if (entries.length >= 8) return { ok: false, code: 'limit-reached' }
+      const view = {
+        entryId: `fresh-${entries.length + 1}`,
+        serverUrl: input.serverUrl,
+        serverId: undefined,
+        serverName: undefined,
+        displayName: input.serverUrl,
+        client: fakeRelay({ state: 'connecting' }),
+        createdAt: 1,
+      }
+      entries.push(view)
+      return { ok: true, entry: view, replaced: false }
+    },
+    unpair: (entryId) => {
+      calls.unpair.push(entryId)
+      const index = entries.findIndex((entry) => entry.entryId === entryId)
+      if (index === -1) return false
+      entries.splice(index, 1)
+      return true
+    },
+    unpairAll: () => {
+      calls.unpairAll += 1
+      const count = entries.length
+      entries.length = 0
+      return count
+    },
+    reconnect: async (entryId) => {
+      calls.reconnect.push(entryId ?? null)
+      if (entryId !== undefined) {
+        const entry = entries.find((candidate) => candidate.entryId === entryId)
+        return entry !== undefined && entry.client.reconnect() === true
+      }
+      let any = false
+      for (const entry of entries) {
+        if (entry.client.state === 'offline') any = entry.client.reconnect() || any
+      }
+      return any
+    },
+    probeAndRestoreAll: async () => {
+      calls.probeRestore += 1
+      return { reachable: true, reconnected: true }
+    },
+    queueDeviceNameAll: (name) => { calls.deviceName.push(name) },
+    stop: () => {},
+    ...overrides,
+  }
+  return pool
+}
+
+/** One pool entry view with a fake relay client. */
+function makeEntry(entryId, serverId, serverUrl, name, clientOverrides = {}) {
+  const client = fakeRelay({ state: 'online', handshakeInfo: { relayProtocol: 1, serverId, serverName: name, dshVersion: '2.0.0', fingerprints: {} }, ...clientOverrides })
+  if (client.nextRetryAt === undefined) client.nextRetryAt = null
+  return {
+    entryId,
+    serverUrl,
+    serverId: clientOverrides.serverIdView !== undefined ? clientOverrides.serverIdView : serverId,
+    serverName: clientOverrides.serverNameView !== undefined ? clientOverrides.serverNameView : name,
+    displayName: clientOverrides.displayName ?? name,
+    client,
+    createdAt: 1,
+  }
+}
+
+test('MS-5 claim pool mode: the pairing lands in the pool, the response carries NO token', async () => {
+  const pool = fakePool([])
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  try {
+    const before = gwSeen.length
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: gwUrl, code: 'AAAAAA33', name: '书房电脑' },
+    })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.deepEqual(body, { ok: true, entryId: 'fresh-1', deviceId: 'dev1', deviceName: '台式机', serverUrl: gwUrl }, 'entryId + the normalized address, never the token')
+    assert.equal(body.token, undefined)
+    assert.equal(pool.calls.pair.length, 1)
+    assert.deepEqual(pool.calls.pair[0], { serverUrl: gwUrl, token: 'tok-gateway', deviceId: 'dev1', deviceName: '台式机' }, 'the gateway token went straight into the pool')
+    assert.equal(gwSeen.length, before + 1, 'the claim round-trip still reached the gateway')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 claim pool mode: the 8-server cap refuses a NEW address BEFORE any network request', async () => {
+  const entries = []
+  for (let i = 0; i < 8; i += 1) entries.push(makeEntry(`e${i}`, `0000000${i}`, `http://10.0.0.${i + 1}:3080`, `srv-${i}`))
+  const pool = fakePool(entries)
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  try {
+    const before = gwSeen.length
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: 'http://10.9.9.9:3080', code: 'AAAAAA44', name: '新台' },
+    })
+    assert.equal(res.status, 409)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, code: 'limit-reached' })
+    assert.equal(gwSeen.length, before, 'the refusal is local — the gateway never saw the pairing code')
+    assert.equal(pool.calls.pair.length, 0, 'nothing was paired')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 claim pool mode: an ALREADY-paired address re-pairs fine at 8/8 (token refresh)', async () => {
+  const entries = []
+  for (let i = 0; i < 7; i += 1) entries.push(makeEntry(`e${i}`, `0000000${i}`, `http://10.0.0.${i + 1}:3080`, `srv-${i}`))
+  // The already-paired address is the MOCK gateway's: the re-pair really
+  // redeems a fresh code there, at the cap too.
+  entries.push(makeEntry('e7', '00000007', gwUrl, 'srv-7'))
+  const target = entries[7]
+  const pool = fakePool(entries)
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  try {
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: target.serverUrl, code: 'AAAAAA55', name: '覆盖重配' },
+    })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.ok, true)
+    assert.equal(body.entryId, target.entryId, 'the same address keeps its entry')
+    assert.equal(body.token, undefined)
+    assert.equal(pool.calls.pair.length, 1)
+    assert.equal(pool.calls.pair[0].serverUrl, target.serverUrl)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 claim pool mode: a gateway refusal classifies as before and never touches the pool', async () => {
+  const pool = fakePool([])
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  try {
+    gwState.claimReply = () => [403, { ok: false, reason: 'bad-code' }]
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: gwUrl, code: 'AAAAAAAA', name: 'n' },
+    })
+    assert.deepEqual(JSON.parse(res.body), { ok: false, code: 'bad-code' })
+    assert.equal(pool.calls.pair.length, 0, 'a failed redemption pairs nothing')
+  } finally {
+    gwState.claimReply = () => [200, { ok: true, id: 'dev1', name: '台式机', token: 'tok-gateway' }]
+    await closeServer(server)
+  }
+})
+
+test('MS-5 unpair: the wall order holds and the two shapes route to unpair/unpairAll', async () => {
+  const entries = [makeEntry('e1', 'abcd1234', 'http://10.0.0.1:3080', 'A'), makeEntry('e2', 'ffffffff', 'http://10.0.0.2:3080', 'B')]
+  const pool = fakePool(entries)
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  const headers = sameOrigin(port)
+  try {
+    const unadmitted = await startClientServer(makeRow(), { pool: fakePool([]), admit: () => ({ rejection: 401 }) })
+    const r401 = await request(unadmitted.port, { method: 'POST', path: UNPAIR_ROUTE, headers: sameOrigin(unadmitted.port), body: { all: true } })
+    assert.equal(r401.status, 401)
+    await closeServer(unadmitted.server)
+
+    const crossSite = await request(port, { method: 'POST', path: UNPAIR_ROUTE, headers: { origin: 'http://evil.example' }, body: { all: true } })
+    assert.equal(crossSite.status, 403)
+
+    const wrongMethod = await request(port, { method: 'GET', path: UNPAIR_ROUTE, headers })
+    assert.equal(wrongMethod.status, 405)
+    assert.equal(wrongMethod.headers.allow, 'POST')
+
+    const badParams = await request(port, { method: 'POST', path: UNPAIR_ROUTE, headers, body: {} })
+    assert.equal(badParams.status, 400, 'neither all nor entryId is a bad request')
+    const blankId = await request(port, { method: 'POST', path: UNPAIR_ROUTE, headers, body: { entryId: '' } })
+    assert.equal(blankId.status, 400)
+    const wrongType = await request(port, { method: 'POST', path: UNPAIR_ROUTE, headers, body: { entryId: 42 } })
+    assert.equal(wrongType.status, 400)
+
+    const one = await request(port, { method: 'POST', path: UNPAIR_ROUTE, headers, body: { entryId: 'e1' } })
+    assert.equal(one.status, 200)
+    assert.deepEqual(JSON.parse(one.body), { ok: true, removed: 1 })
+    assert.deepEqual(pool.calls.unpair, ['e1'])
+
+    const gone = await request(port, { method: 'POST', path: UNPAIR_ROUTE, headers, body: { entryId: 'nope' } })
+    assert.deepEqual(JSON.parse(gone.body), { ok: true, removed: 0 }, 'an unknown entry answers removed: 0')
+
+    const all = await request(port, { method: 'POST', path: UNPAIR_ROUTE, headers, body: { all: true } })
+    assert.deepEqual(JSON.parse(all.body), { ok: true, removed: 1 }, 'the one entry left after the removal above')
+    assert.equal(pool.calls.unpairAll, 1)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 unpair: without a pool the route does not exist', async () => {
+  const { server, port } = await startClientServer(makeRow())
+  try {
+    const res = await request(port, { method: 'POST', path: UNPAIR_ROUTE, headers: sameOrigin(port), body: { all: true } })
+    assert.equal(res.status, 404)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'not-found', message: 'Unknown client route' } })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 reconnect pool mode: no body reconnects every OFFLINE server, entryId targets one', async () => {
+  const offlineTries = []
+  const entries = [
+    makeEntry('e1', 'abcd1234', 'http://10.0.0.1:3080', 'A'),
+    makeEntry('e2', 'ffffffff', 'http://10.0.0.2:3080', 'B', { state: 'offline', reconnect: () => { offlineTries.push('e2'); return true } }),
+    makeEntry('e3', '1234abcd', 'http://10.0.0.3:3080', 'C', { state: 'offline', reconnect: () => { offlineTries.push('e3'); return true } }),
+  ]
+  const pool = fakePool(entries)
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  const headers = sameOrigin(port)
+  try {
+    const emptyBody = await request(port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers, body: {} })
+    assert.equal(emptyBody.status, 200)
+    assert.deepEqual(JSON.parse(emptyBody.body), { ok: true, started: true })
+    assert.deepEqual(offlineTries.sort(), ['e2', 'e3'], 'only the offline entries were reconnected')
+
+    offlineTries.length = 0
+    const targeted = await request(port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers, body: { entryId: 'e2' } })
+    assert.equal(targeted.status, 200)
+    assert.deepEqual(JSON.parse(targeted.body), { ok: true })
+    assert.deepEqual(offlineTries, ['e2'], 'exactly the named entry')
+
+    const onlineTarget = await request(port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers, body: { entryId: 'e1' } })
+    assert.equal(onlineTarget.status, 409)
+    assert.deepEqual(JSON.parse(onlineTarget.body), { ok: false, error: { code: 'not-offline', message: 'The client is not offline' } })
+
+    const unknown = await request(port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers, body: { entryId: 'nope' } })
+    assert.equal(unknown.status, 404)
+    assert.deepEqual(JSON.parse(unknown.body), { ok: false, error: { code: 'not-found', message: 'No such paired server' } })
+
+    const allOnline = fakePool([makeEntry('e1', 'abcd1234', 'http://10.0.0.1:3080', 'A')])
+    const second = await startClientServer(makeRow(), { pool: allOnline })
+    try {
+      const quiet = await request(second.port, { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, headers: sameOrigin(second.port), body: {} })
+      assert.equal(quiet.status, 200)
+      assert.deepEqual(JSON.parse(quiet.body), { ok: true, started: false }, 'nothing offline, nothing started')
+    } finally {
+      await closeServer(second.server)
+    }
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 status pool mode: servers array in pairing order, no token anywhere, top level mirrors the first', async () => {
+  const entries = [
+    makeEntry('e1', 'abcd1234', 'http://10.0.0.1:3080', 'A', {
+      handshakeInfo: { relayProtocol: 1, serverId: 'abcd1234', serverName: 'A', dshVersion: '2.0.0', fingerprints: {}, deviceName: '台式机A' },
+      compat: { identical: ['g1'], different: ['g2'], unavailable: [] },
+    }),
+    makeEntry('e2', undefined, 'http://10.0.0.2:3080', 'B', {
+      state: 'offline',
+      nextRetryAt: 1234567890123,
+      serverIdView: 'ffffffff',
+      serverNameView: '旧名B',
+      displayName: 'B-1',
+    }),
+  ]
+  entries[1].client.lastError = 'offline'
+  const bridgeFor = (serverId, client) => [{ plugin: `bridge-${serverId ?? 'none'}-${client.state}`, bridged: true }]
+  const pool = fakePool(entries)
+  const { server, port } = await startClientServer(makeRow(), { pool, getPluginBridgeStatusForServer: bridgeFor })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.maxServers, 8)
+    assert.equal(body.state, 'online', 'the top level keeps the FIRST entry\'s state')
+    assert.equal(body.serverUrl, 'http://10.0.0.1:3080')
+    assert.equal(body.serverName, 'A')
+    assert.equal(body.deviceName, '台式机A')
+    assert.deepEqual(body.servers, [
+      {
+        entryId: 'e1',
+        serverId: 'abcd1234',
+        serverUrl: 'http://10.0.0.1:3080',
+        serverName: 'A',
+        displayName: 'A',
+        state: 'online',
+        nextRetryAt: null,
+        compat: { identical: ['g1'], different: ['g2'], unavailable: [] },
+        pluginBridge: [{ plugin: 'bridge-abcd1234-online', bridged: true }],
+      },
+      {
+        entryId: 'e2',
+        serverId: 'ffffffff',
+        serverUrl: 'http://10.0.0.2:3080',
+        serverName: '旧名B',
+        displayName: 'B-1',
+        state: 'offline',
+        nextRetryAt: 1234567890123,
+        lastError: 'offline',
+        pluginBridge: [{ plugin: 'bridge-ffffffff-offline', bridged: true }],
+      },
+    ])
+    assert.equal(JSON.parse(res.body).token, undefined)
+    assert.ok(!res.body.includes('tok'), 'no credential material anywhere in the body')
+    // Diagnostics fields stay at the top level, per-server compat/pluginBridge ride the items.
+    assert.deepEqual(body.pluginBridge, [{ plugin: 'bridge-abcd1234-online', bridged: true }], 'top-level pluginBridge mirrors the first entry')
+    assert.deepEqual(body.compat, { identical: ['g1'], different: ['g2'], unavailable: [], incompatibleCalls: [] })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 status pool mode: an empty pool answers unpaired with maxServers', async () => {
+  const pool = fakePool([])
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.state, 'unpaired')
+    assert.equal(body.maxServers, 8)
+    assert.deepEqual(body.servers, [])
+    assert.deepEqual(body.pluginBridge, [])
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 status pool mode: the row credentials are never consulted, the pool is the truth', async () => {
+  // A pool-mode mount with an EMPTY row: the old route would answer
+  // unpaired-from-the-row and probe nothing; the pool mode answers from the
+  // pool's paired list even so.
+  const pool = fakePool([makeEntry('e1', 'abcd1234', gwUrl, 'A')])
+  const { server, port } = await startClientServer(makeRow({ serverUrl: '', deviceToken: '' }), { pool })
+  try {
+    const before = gwSeen.length
+    const body = JSON.parse((await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })).body)
+    assert.equal(body.state, 'online')
+    assert.equal(body.servers.length, 1)
+    assert.equal(gwSeen.length, before, 'no ping probe — the live client is the source')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 remote-status pool mode: per-serverId map with state/versionMismatch/serverName/bridgedPlugins', async () => {
+  const entries = [
+    makeEntry('e1', 'abcd1234', 'http://10.0.0.1:3080', 'A', {
+      compat: { identical: [], different: ['g9'], unavailable: [] },
+    }),
+    makeEntry('e2', 'ffffffff', 'http://10.0.0.2:3080', 'B', { state: 'revoked', serverNameView: 'B' }),
+    makeEntry('e3', undefined, 'http://10.0.0.3:3080', 'C', { state: 'connecting', serverIdView: undefined, serverNameView: 'C' }),
+  ]
+  const bridgeFor = (serverId) => (
+    serverId === 'abcd1234'
+      ? [{ plugin: 'zzz-later', bridged: true }, { plugin: 'aaa-first', bridged: true }, { plugin: 'not-bridged', bridged: false }]
+      : []
+  )
+  const interceptDiagnostics = { installed: true, shape: { ok: true, reasons: [], notes: [] }, recentFailures: [], incompatibleCalls: [], closedSessions: [{ sessionId: 'zr~abcd1234~s9', reason: 'closed' }] }
+  const pool = fakePool(entries)
+  const { server, port } = await startClientServer(makeRow(), { pool, getPluginBridgeStatusForServer: bridgeFor, getIntercept: () => interceptDiagnostics })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_REMOTE_STATUS_ROUTE })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.deepEqual(body.servers, {
+      abcd1234: { state: 'online', versionMismatch: true, serverName: 'A', bridgedPlugins: ['aaa-first', 'zzz-later'] },
+      ffffffff: { state: 'revoked', versionMismatch: false, serverName: 'B', bridgedPlugins: [] },
+    }, 'an entry without a handshake serverId is not addressable and is skipped')
+    // The top-level compatibility fields survive, mirroring the FIRST entry.
+    assert.equal(body.state, 'online')
+    assert.equal(body.versionMismatch, true)
+    assert.equal(body.serverName, 'A')
+    assert.deepEqual(body.closed, { 'zr~abcd1234~s9': 'closed' })
+    assert.deepEqual(body.bridgedPlugins, ['aaa-first', 'zzz-later'])
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 unshare pool mode: the session id\'s serverId picks the client, a foreign server refuses locally', async () => {
+  const unshared = []
+  const a = makeEntry('e1', 'abcd1234', 'http://10.0.0.1:3080', 'A', { unshare: async (id) => { unshared.push(['a', id]) } })
+  const b = makeEntry('e2', 'ffffffff', 'http://10.0.0.2:3080', 'B', { unshare: async (id) => { unshared.push(['b', id]) } })
+  const pool = fakePool([a, b])
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  const headers = sameOrigin(port)
+  try {
+    const toB = await request(port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers, body: { sessionId: 'zr~ffffffff~session-b' } })
+    assert.equal(toB.status, 200)
+    assert.deepEqual(JSON.parse(toB.body), { ok: true })
+    const toA = await request(port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers, body: { sessionId: 'zr~abcd1234~session-a' } })
+    assert.deepEqual(JSON.parse(toA.body), { ok: true })
+    assert.deepEqual(unshared, [['b', 'session-b'], ['a', 'session-a']], 'each virtual id reached ITS OWN server with the ORIGINAL id')
+
+    const foreign = await request(port, { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, headers, body: { sessionId: 'zr~99999999~session-x' } })
+    assert.equal(foreign.status, 200)
+    assert.deepEqual(JSON.parse(foreign.body), { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端' } })
+    assert.equal(unshared.length, 2, 'the unheld server saw nothing')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 http pool mode: per-server routing, offline reads remote-offline, unheld reads remote-mismatch', async () => {
+  const calls = []
+  const a = makeEntry('e1', 'abcd1234', 'http://10.0.0.1:3080', 'A', {
+    http: async (route, query) => { calls.push(['a', route, query]); return { status: 200, contentType: 'application/json', body: '{"from":"a"}' } },
+  })
+  const b = makeEntry('e2', 'ffffffff', 'http://10.0.0.2:3080', 'B', { state: 'offline' })
+  const pool = fakePool([a, b])
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  try {
+    const ok = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${encodeURIComponent('zr~abcd1234~session-1')}&seq=3` })
+    assert.equal(ok.status, 200)
+    assert.deepEqual(JSON.parse(ok.body), { from: 'a' })
+    assert.deepEqual(calls, [['a', 'changes.summary', 'sessionId=session-1&seq=3']])
+
+    const offline = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${encodeURIComponent('zr~ffffffff~session-2')}` })
+    assert.equal(offline.status, 503)
+    assert.deepEqual(JSON.parse(offline.body), { ok: false, error: { code: 'remote-offline' } })
+
+    const foreign = await request(port, { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}changes.summary?sessionId=${encodeURIComponent('zr~99999999~session-3')}` })
+    assert.equal(foreign.status, 400)
+    assert.deepEqual(JSON.parse(foreign.body), { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端' } })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('MS-5 network-hint pool mode: one probe-and-restore sweep answers the hint', async () => {
+  const pool = fakePool([makeEntry('e1', 'abcd1234', 'http://10.0.0.1:3080', 'A')])
+  const { server, port } = await startClientServer(makeRow(), { pool })
+  try {
+    const res = await request(port, { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, headers: sameOrigin(port), body: {} })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true, reachable: true, reconnected: true })
+    assert.equal(pool.calls.probeRestore, 1)
+  } finally {
+    await closeServer(server)
+  }
 })

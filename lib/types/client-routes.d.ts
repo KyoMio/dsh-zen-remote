@@ -31,6 +31,7 @@ import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js';
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js';
 import type { BridgeStatus } from './plugin-bridge.js';
 import type { RelayClient } from './relay-client.js';
+import type { RelayPool } from './relay-pool.js';
 /** Prefix all client routes live under (one webServer prefix registration). */
 export declare const CLIENT_ROUTE_PREFIX = "/_dsh/zen-remote/client";
 /** POST `{serverUrl, code, name}`: redeem a desktop pairing code. */
@@ -84,6 +85,12 @@ export declare const CLIENT_UNSHARE_ROUTE = "/_dsh/zen-remote/client/unshare";
  * means a readable signal says nothing is open; the sink stores the value
  * and re-judges the mergers immediately. */
 export declare const CLIENT_CURRENT_SESSION_ROUTE = "/_dsh/zen-remote/client/current-session";
+/** POST `{entryId?: string, all?: boolean}` (MS-5): remove one paired server
+ * by its entry id, or every paired server at once (`all: true`). The paired
+ * list lives in `zen-remote-state.json`; this route goes through the pool so
+ * the live clients stop with their records. Pool-mode only — a mount without
+ * a pool has no paired list to edit and answers the unknown-path 404. */
+export declare const CLIENT_UNPAIR_ROUTE = "/_dsh/zen-remote/client/unpair";
 /** Prefix of the plain-HTTP relay routes (T41b):
  * `GET ${CLIENT_HTTP_ROUTE_PREFIX}<route>?<query>` relays one intercepted
  * `/api/<route>` call (the fetch wrapper's rewrites land here) to the
@@ -113,6 +120,21 @@ export interface ClientHandlerOptions {
      * never connected, so the settings page still gets a fresh answer while
      * the startup `connect()` is still unpaired. */
     getRelayClient?: () => RelayClient | undefined;
+    /** MS-5 POOL mode: the multi-server relay pool. When present it REPLACES
+     * the row-driven single-client facts everywhere: the paired list (not the
+     * row's serverUrl/deviceToken) is the truth, claim pairs straight into the
+     * pool (the token never reaches the browser), unpair/reconnect address
+     * pool entries, and status / remote-status report the whole list (the
+     * top level keeps the FIRST entry's fields so the existing page keeps
+     * rendering). The single-`getRelayClient` form above stays exactly as it
+     * was for the old wiring and the tests. */
+    pool?: RelayPool;
+    /** MS-5: the PB-2 bridge verdict for ONE pool entry, computed PER CALL off
+     * that entry's own handshake table and connection state — per-server
+     * isolation for the status / remote-status bodies. Undefined (old tests,
+     * the unwired host mount): every per-server `pluginBridge` / per-server
+     * `bridgedPlugins` list reads `[]`. */
+    getPluginBridgeStatusForServer?: (serverId: string | undefined, client: RelayClient) => BridgeStatus[];
     /** The typert interception's diagnostics (T23b-1), read live per request.
      * Shapes, counters and failure codes only — never a token. Undefined when
      * this composition never even attempted an install (no typertGateway). */

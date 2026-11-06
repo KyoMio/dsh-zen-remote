@@ -226,6 +226,23 @@ const report = assembleDebugReport({
     state: 'unreachable',
     serverUrl: 'https://myserver.example.com',
     lastError,
+    // MS-5: the pool mode's per-server rows carry every paired server's REAL
+    // address; each must come out as a shape, never the address itself.
+    // MS-5-fix: the row's OTHER fields are poisoned too (a hostile server
+    // name can carry a home path and a domain — both arrive verbatim from
+    // the handshake), so the shaper rebuild must not restore what the deep
+    // pass cleaned.
+    servers: [
+      {
+        entryId: 'e1',
+        serverUrl: 'https://myserver.example.com:443',
+        serverName: 'host /Users/alice/box https://mybox.example.com',
+        displayName: 'display /Users/alice/box https://mybox.example.com',
+        state: 'online',
+      },
+      { entryId: 'e2', serverUrl: 'http://192.168.1.10:3080', state: 'offline', nextRetryAt: 1234567890123 },
+      { entryId: 'e3', serverUrl: '' },
+    ],
   },
   gatewaySummary: { reachable: true, port: 3080, deviceCount: 2, shareCount: 1 },
   logs: [
@@ -244,12 +261,35 @@ assert.equal(report._meta.pluginVersion, '2.3.6', '_meta carries the plugin vers
 const serialized = JSON.stringify(report)
 // JSON round-trip: the report the user downloads must parse back.
 assert.deepEqual(JSON.parse(serialized), report, 'the report survives a JSON round-trip')
-for (const poison of [TOKEN_64, HEX_32, 'B'.repeat(64), 'myserver.example.com', '/Users/alice', '10.0.0.5', '192.168.1.10', '/var/tmp/secret', '9f8e7d6c5b4a3210']) {
+for (const poison of [TOKEN_64, HEX_32, 'B'.repeat(64), 'myserver.example.com', 'mybox.example.com', '/Users/alice', '10.0.0.5', '192.168.1.10', '/var/tmp/secret', '9f8e7d6c5b4a3210']) {
   assert.ok(!serialized.includes(poison), `poisoned input "${poison.slice(0, 24)}…" is not recoverable from the output`)
 }
 assert.equal(report.config.serverUrl, 'https://domain', 'config.serverUrl is a shape, not the address')
 assert.equal(report.config.host, 'lan-ip', 'config.host is a bind shape, not the address (S3)')
 assert.equal(report.status.serverUrl, 'https://domain', 'status.serverUrl degraded through the deep pass')
+// MS-5: every pool server row's address is a SHAPE — the scheme-default port
+// is omitted and unset degrades, the shaper's own normalization, not just the
+// deep pass's URL downgrade.
+assert.deepEqual(report.status.servers[0], {
+  entryId: 'e1',
+  serverUrl: 'https://domain',
+  serverName: 'host ~/box https://domain',
+  displayName: 'display ~/box https://domain',
+  state: 'online',
+}, 'the default port went away with the host; the poisoned row fields came out redacted')
+assert.equal(report.status.servers[1].serverUrl, 'http://lan-ip:3080', 'a LAN address keeps only class+port')
+assert.equal(report.status.servers[2].serverUrl, 'unset', 'an unset address degrades to unset')
+// MS-5-fix regression: the serverUrl shaper rebuild must not RESTORE the raw
+// row — serverName / displayName / lastError travel through redactValue like
+// every other string, so a hostile handshake-supplied name leaks neither a
+// home path nor a hostname into the report.
+for (const field of ['serverName', 'displayName']) {
+  const text = String(report.status.servers[0][field])
+  assert.ok(!text.includes('/Users/alice'), `servers[0].${field} keeps no home path`)
+  assert.ok(!text.includes('mybox.example.com'), `servers[0].${field} keeps no hostname`)
+  assert.ok(text.includes('~/box'), `servers[0].${field} keeps the home-folded leaf`)
+  assert.ok(text.includes('https://domain'), `servers[0].${field} keeps only the degraded host class`)
+}
 assert.ok(String(report.status.lastError).includes('<路径:x.bin>'), 'the status lastError kept only the path leaf')
 assert.ok(String(report.logs[1].msg).includes('~/work/x.txt'), 'log lines keep the home-folded tail')
 assert.ok(String(report.logs[1].msg).includes('<token>'), 'log lines lose token runs')

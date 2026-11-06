@@ -544,25 +544,99 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
   )
   assert.equal(typeof client.listeners[0].listener, 'function')
   // The client role has five effects: the PB-1 bridge registry disposal
-  // (before the role branch), the relay client's disposal (T23a-fix, which
-  // stops the reconnect machinery and clears the module slot), the T43
-  // credentials watcher's unsubscribe, the restart watcher (T17), and — since
-  // BU-1 — the fetch-route FALLBACK timer's cleanup (stops the bounded probe
-  // when the row unloads). Never the sweeper, which stays host-only.
-  assert.equal(client.effects.length, 5, 'the client role starts the bridge disposal, the relay disposal, the credentials watcher, the restart watcher and the fetch-route fallback timer cleanup')
+  // (before the role branch), the relay POOL's disposal (MS-5, which stops
+  // every client and clears the module slot), the device-name watcher's
+  // unsubscribe (the T43/T59 credentials watcher's successor), the restart
+  // watcher (T17), and — since BU-1 — the fetch-route FALLBACK timer's
+  // cleanup (stops the bounded probe when the row unloads). Never the
+  // sweeper, which stays host-only.
+  assert.equal(client.effects.length, 5, 'the client role starts the bridge disposal, the pool disposal, the device-name watcher, the restart watcher and the fetch-route fallback timer cleanup')
   for (const stop of client.effects) assert.equal(typeof stop, 'function', 'each effect returned a stop function')
-  assert.notEqual(index.getRelayClient(), undefined, 'the client role installs its relay client in the module slot')
+  assert.equal(index.getRelayClient(), undefined, 'the single relay client is gone from the pool wiring (MS-5)')
+  assert.notEqual(index.getRelayPool(), undefined, 'the client role installs its relay pool in the module slot')
   for (const stop of client.effects) stop()
-  assert.equal(index.getRelayClient(), undefined, 'the disposal clears the module slot')
+  assert.equal(index.getRelayPool(), undefined, 'the disposal clears the pool slot')
 
   // A row switching from client to host clears the stale instance too.
   const reinstall = makeCtx()
   index.apply(reinstall.ctx, { role: 'client' })
-  assert.notEqual(index.getRelayClient(), undefined, 'a fresh client apply installs a new instance')
+  assert.notEqual(index.getRelayPool(), undefined, 'a fresh client apply installs a new pool')
   const switched = makeCtx()
   index.apply(switched.ctx, {})
-  assert.equal(index.getRelayClient(), undefined, 'a host-role apply clears any stale client instance')
+  assert.equal(index.getRelayPool(), undefined, 'a host-role apply clears any stale pool')
   for (const stop of [...reinstall.effects, ...switched.effects]) stop()
+})
+
+test('MS-5: the client role builds the relay pool over the state file, migrates the row credentials into it, and broadcasts a rename', async () => {
+  const index = await import(INDEX_URL)
+  // Fresh state file for this test alone.
+  const stateFile = path.join(TEMP_HOME, 'zen-remote-state.json')
+  fs.rmSync(stateFile, { force: true })
+
+  // A mock relay server the pool's client can actually reach and handshake
+  // with: the handshake answers protocol 1, the device-name route records
+  // the broadcast push and echoes it back (the T59 gateway contract).
+  const seen = []
+  const mock = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      seen.push({ method: req.method, url: String(req.url).split('?')[0], body: Buffer.concat(chunks).toString('utf8') })
+      if (req.method === 'POST' && req.url === '/_dsh/zen-remote/relay/v1/handshake') {
+        sendJson(res, 200, { ok: true, relayProtocol: 1, serverId: 'abcd1234', serverName: 'srv', dshVersion: '0.0.0', fingerprints: {} })
+        return
+      }
+      if (req.method === 'POST' && req.url === '/_dsh/zen-remote/relay/v1/device/name') {
+        sendJson(res, 200, { ok: true, name: JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}').name })
+        return
+      }
+      sendJson(res, 404, { ok: false })
+    })
+  })
+  function sendJson(res, status, body) {
+    const bytes = Buffer.from(JSON.stringify(body))
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': String(bytes.length) })
+    res.end(bytes)
+  }
+  await new Promise((resolve) => mock.listen(0, '127.0.0.1', resolve))
+  const mockUrl = `http://127.0.0.1:${mock.address().port}`
+
+  const { ctx, listeners, effects } = makeCtx()
+  try {
+    index.apply(ctx, { role: 'client', serverUrl: `${mockUrl}/`, deviceToken: 'tok-migrate', serverName: '新名字' })
+    const pool = index.getRelayPool()
+    assert.ok(pool, 'the client apply built the pool')
+
+    // The row's legacy single-server credentials became servers[0] on disk,
+    // with the address normalized (trailing slash gone).
+    const persisted = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    assert.equal(persisted.servers.length, 1)
+    assert.equal(persisted.servers[0].serverUrl, mockUrl)
+    assert.equal(persisted.servers[0].token, 'tok-migrate')
+
+    // The pool dialed the mock; the handshake made it online.
+    await waitFor(() => pool.entries().length === 1 && pool.entries()[0].client.state === 'online', 5000, 'the pool client reached the mock relay')
+    assert.equal(pool.entries()[0].serverId, 'abcd1234', 'the handshake server id landed on the entry view')
+
+    // A committed serverName change broadcasts to every paired server: the
+    // client pushed the name to the gateway's device table (T59 contract).
+    const nameWatcher = listeners.find((l) => l.event === 'loader/volatile-update')
+    assert.ok(nameWatcher, 'the device-name watcher is subscribed')
+    nameWatcher.listener([['serverName']])
+    await waitFor(() => seen.some((r) => r.url === '/_dsh/zen-remote/relay/v1/device/name'), 5000, 'the rename was broadcast to the paired server')
+    const push = seen.find((r) => r.url === '/_dsh/zen-remote/relay/v1/device/name')
+    assert.equal(push.body, '{"name":"新名字"}', 'the row serverName travelled verbatim to the paired server')
+
+    // An unrelated volatile commit must not touch the servers.
+    const before = seen.length
+    nameWatcher.listener([['idleHours']])
+    await sleep(300)
+    assert.equal(seen.length, before, 'an unrelated knob never broadcasts')
+  } finally {
+    for (const stop of effects) stop()
+    mock.close()
+    fs.rmSync(stateFile, { force: true })
+  }
 })
 
 test('T22c-fix: the captured session/event listener refreshes the shared table and ignores id-less sessions', async () => {

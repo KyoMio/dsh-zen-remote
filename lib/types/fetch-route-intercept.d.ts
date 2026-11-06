@@ -149,11 +149,13 @@ export interface InstallFetchRouteInterceptOptions {
      * (`ctx.connection[symbols.original]`) — the one whose `fetchRoutes` Map
      * the shared handler reads per request. */
     connection: object;
-    /** The client relay client (T23a) the uploads travel through. */
-    relay: RelayClient;
-    /** The CURRENT handshake's server id, read live per call; `undefined`
-     * makes every remote upload a `remote-offline`. */
-    getServerId: () => string | undefined;
+    /** SINGLE-SERVER mode: the client relay client (T23a) the uploads travel
+     * through. Required together with {@link getServerId} unless
+     * {@link getRelayForServer} is given (MS-5's pool wiring). */
+    relay?: RelayClient;
+    /** SINGLE-SERVER mode: the CURRENT handshake's server id, read live per
+     * call; `undefined` makes every remote upload a `remote-offline`. */
+    getServerId?: () => string | undefined;
     /** MS-4: the relay client serving ONE paired server, looked up by the
      * virtual id's serverId half per upload (the connection pool's
      * `getByServerId`). When given, routing reads it alone: `undefined` (a
