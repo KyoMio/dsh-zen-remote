@@ -80,7 +80,7 @@ cd ~/.dsh/profiles/desktop && pnpm install
 - **Upgrading with HMR on**: remove `dsh-zen-remote` first, then install the new version (`dsh plugin --profile <name> remove dsh-zen-remote` → `add dsh-zen-remote`, or Uninstall → Add in the Plugins page).
 - **DSH 0.2.1-alpha.3+ profile reset**: `dsh --profile <name> --from-default-profile <template>` replaces an existing custom profile with a fresh copy; back up `~/.dsh/profiles/<name>` first.
 - **Upgrading from 1.x**: since 2.0.0 the composition layer is a single row (`dsh-zen-remote`). Remove any legacy `dsh-zen-remote-gateway`, `dsh-zen-remote-push`, or manual `dsh-push.mjs` lines from `cordis.patch.yml`. Existing `~/.dsh/lan-gate.config.json` settings and paired devices carry over automatically.
-- **Uninstalling**: click **Uninstall** on the `dsh-zen-remote` plugin page and restart. To also wipe pairing and share state, delete `~/.dsh/lan-gate-state.json`, `~/.dsh/lan-gate.config.json`, `~/.dsh/zen-remote-shares.json`, and `~/.dsh/zen-remote-server.json`.
+- **Uninstalling**: click **Uninstall** on the `dsh-zen-remote` plugin page and restart. To also wipe pairing and share state, delete `~/.dsh/lan-gate-state.json`, `~/.dsh/lan-gate.config.json`, and `~/.dsh/zen-remote-state.json` (older versions also kept `~/.dsh/zen-remote-shares.json` and `~/.dsh/zen-remote-server.json` — they migrate into the state file automatically on first start and are then deleted).
 
 </details>
 
@@ -145,6 +145,7 @@ On the second computer running the DSH desktop app:
 2. **Step 1**: select **Act as Desktop Client** and click **Next**.
 3. **Step 2**: enter a name for this computer (e.g. `Living-Room-Mac`), the host's gateway URL (`https://` for public URLs, or `http://192.168.x.x:3088` / `http://100.x.x.x:3088` for LAN / Tailscale), and the 8-character desktop pairing code from the host, then click **Pair & Connect**.
 4. **Step 3**: once all three status lights (**Pairing token**, **Server connection**, **Session & plugin sync**) turn green, the host's shared workspaces and sessions appear in your left sidebar immediately.
+5. **More servers**: one client can stay paired with up to **8 main servers** at once — click **+ Add Server** in the wizard (or manage the paired list in the servers modal / settings card: reconnect, re-pair, remove, remove all). Every server's groups merge into the sidebar **in pairing order**; when several paired servers report the same name they are numbered `Name-1`, `Name-2` automatically (the suffixes disappear once a rename removes the collision), and removing a server tears down only its own groups while the others keep serving.
 
 ---
 
@@ -172,7 +173,7 @@ Remote access is controlled per session (or automatically enabled for new sessio
 
 ### Working in Remote Sessions on a Desktop Client
 
-- **Sidebar groups**: once a host workspace has at least one remote-enabled session, a **"Server Name · Workspace Name"** group appears in the client's sidebar. Click any session to view full history, stream responses, approve tools, use the server terminal, browse files and diffs, download deliverables, or drag-and-drop files to upload.
+- **Sidebar groups**: once a host workspace has at least one remote-enabled session, a **"Server Name · Workspace Name"** group appears in the client's sidebar. Click any session to view full history, stream responses, approve tools, use the server terminal, browse files and diffs, download deliverables, or drag-and-drop files to upload. With several paired servers (up to 8) the groups stack in pairing order after your local workspaces; duplicate server names are disambiguated with `-1` / `-2` suffixes in pairing order, and removing a server in settings drops only its own groups.
 
   ![Remote workspace group in the desktop client sidebar](docs/images/client-sidebar.png)
 
@@ -210,6 +211,7 @@ Notifications fire only when **you are actually needed**, along two independent 
   - Dedicated **Manage Devices** modal and automatic sidebar cleanup on client unpair/revocation
 - **Cross-Desktop Remote Sessions (Client)**:
   - Full-featured remote sessions in the sidebar: history, streaming, approvals/questions, server model catalog, file tree, changes summary/diff, server-side terminal, windowed artifact downloads, server-side LibreOffice PDF preview, up to 500 MiB file uploads, and drag-and-drop file upload interception; in remote sessions, non-image files added via the paperclip picker or pasted are likewise converted to byte uploads instead of unreadable local-path references
+  - **Multi-server connection pool (up to 8 main servers)**: each server's sidebar groups merge in pairing order (duplicate names numbered `-1` / `-2`), calls and approval answers route strictly by `serverId`, and removing a server tears down only its own groups
 - **Plugin Bridge**:
   - Cooperative plugins and built-in adapters (such as `dsh-better-sidebar`) route their panel requests in remote sessions to the host machine (with explicit owner consent for whole-machine data). See [Plugin Bridge Guide](docs/plugin-bridge.md).
 
@@ -233,7 +235,7 @@ Each field resolves in order: **environment variable > plugin row settings > `~/
 | Field | Default | What it does |
 | --- | --- | --- |
 | `role` | `host` | `host` runs gateway + push + sharing; `client` connects to a remote host |
-| `serverName` | computer name | **Device name** (≤ 40 chars): sidebar group title on a host, registered device name on a client; syncs both ways automatically |
+| `serverName` | computer name | **Device name** (≤ 40 chars): sidebar group title on a host, registered device name on a client; renaming on a client broadcasts the new name to all its paired servers (one-way — the server never rewrites it) |
 | `port` | `3088` | Gateway port; retries upward (up to +20) if occupied |
 | `host` | `127.0.0.1` | Gateway bind address (`127.0.0.1` for local proxy/tunnel, `0.0.0.0` for LAN/Tailscale direct) |
 | `targetPort` | *(auto)* | Local DSH Web UI port; leave empty to auto-discover the host's listening port |
@@ -249,8 +251,8 @@ Each field resolves in order: **environment variable > plugin row settings > `~/
 | `idleHours` | `48` | Idle-sleep window in hours for shared sessions; range `(0, 8760]` |
 | `autoShareNewSessions` | off | Automatically enable remote access on new sessions created on the host |
 | `pluginBridgeConsent` | `{}` | Whole-machine data consent map (`pluginName -> boolean`) for the plugin bridge |
-| `serverUrl` *(client)* | empty | Remote server gateway URL (`https://` required for public hosts; `http://` allowed on private LAN/Tailscale ranges) |
-| `deviceToken` *(client)* | empty | Paired client token (secret field, redacted everywhere) |
+| `serverUrl` *(client)* | empty | Remote server gateway URL (`https://` required for public hosts; `http://` allowed on private LAN/Tailscale ranges). Legacy single-server field: the paired list now lives in `~/.dsh/zen-remote-state.json` (up to 8 servers) and these row credentials migrate into it automatically on first start |
+| `deviceToken` *(client)* | empty | Paired client token (secret field, redacted everywhere). Legacy single-server field, migrated into `~/.dsh/zen-remote-state.json` like `serverUrl`; new pairings go through the settings card / wizard and never echo the token back to the browser |
 | `turnFoldDesktop` | off | Enable turn-process folding on desktop widths as well as mobile |
 | `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` | `0.42` / `400` / `15` | Soft-keyboard lift calibration fallback for environments where the OS hides keyboard height |
 | `maxUploadBytes` | 20 MB | Mobile attachment upload cap |
@@ -269,7 +271,7 @@ Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_
 - **Unshared sessions are strictly isolated at the relay**: list rows, history, live events, approvals/questions, and embedded `dsh-session:` references for unshared sessions are filtered or refused server-side.
 - **Public direct-connection guard on `0.0.0.0`**: even when the gateway binds `0.0.0.0` for LAN / Tailscale mode, `isPrivateOrLoopbackIp` only admits direct connections from loopback, RFC1918 LAN ranges, link-local, and Tailscale (`100.64.0.0/10` / `fd7a:115c:a1e0::/48`); any unproxied direct connection from a public internet IP is rejected with `403 public-direct-forbidden`.
 - **Admin actions are local-only**: minting pairing codes, changing device roles, running the setup wizard, and revoking devices are only permitted directly on the host machine.
-- **Data & privacy**: the plugin reports nothing to any third party. Pairing state lives in `~/.dsh/lan-gate-state.json`, shared sessions in `~/.dsh/zen-remote-shares.json`, and Cloudflare tokens in `0600` files under `~/.dsh/zen-remote-ingress/`.
+- **Data & privacy**: the plugin reports nothing to any third party. Pairing state lives in `~/.dsh/lan-gate-state.json`; the client role's state file `~/.dsh/zen-remote-state.json` (`0600`) carries the local server identity, the shared-session table, and every paired server's record including its token (up to 8 servers); Cloudflare tokens live in `0600` files under `~/.dsh/zen-remote-ingress/`.
 
 ### Version Tolerance
 
