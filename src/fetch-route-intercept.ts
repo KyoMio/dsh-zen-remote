@@ -220,6 +220,14 @@ export interface InstallFetchRouteInterceptOptions {
   /** The CURRENT handshake's server id, read live per call; `undefined`
    * makes every remote upload a `remote-offline`. */
   getServerId: () => string | undefined
+  /** MS-4: the relay client serving ONE paired server, looked up by the
+   * virtual id's serverId half per upload (the connection pool's
+   * `getByServerId`). When given, routing reads it alone: `undefined` (a
+   * server the pool does not hold) answers `remote-mismatch`, a held client
+   * that is not online `remote-offline`. Absent — the single-server wiring —
+   * the upload goes through `relay` exactly when the id belongs to
+   * `getServerId()`, with the original verdict order. */
+  getRelayForServer?: (serverId: string) => RelayClient | undefined
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
   /** The lazy-attach retry cadence (T51-fix): how often the table is
@@ -295,7 +303,7 @@ const LINK_DOWN_CODES: ReadonlySet<string> = new Set(['offline', 'unpaired', 're
  * present-but-misshaped.
  */
 export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOptions): FetchRouteInterceptHandle {
-  const { connection, relay, getServerId, log } = options
+  const { connection, relay, getServerId, getRelayForServer, log } = options
   const attachRetryMs = options.attachRetryMs ?? DEFAULT_ATTACH_RETRY_MS
   const attachAttempts = options.attachAttempts ?? DEFAULT_ATTACH_ATTEMPTS
   const shape = checkFetchRouteShape(connection)
@@ -318,6 +326,21 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
   const recordFailure = (route: FetchRouteFailureRecord['route'], code: string): void => {
     if (failures.length >= MAX_FAILURES) failures.shift()
     failures.push({ time: new Date().toISOString(), route, code })
+  }
+
+  /** The relay client one virtual id's upload travels through, or the
+   * refusal. Single-server mode keeps the original order (offline before
+   * mismatch); pool mode (MS-4) asks the pool for the id's own server. */
+  const uploadRelayFor = (serverId: string): RelayClient | 'remote-offline' | 'remote-mismatch' => {
+    if (getRelayForServer !== undefined) {
+      const target = getRelayForServer(serverId)
+      if (target === undefined) return 'remote-mismatch'
+      return target.state === 'online' ? target : 'remote-offline'
+    }
+    const current = getServerId()
+    if (relay.state !== 'online' || current === undefined) return 'remote-offline'
+    if (serverId !== current) return 'remote-mismatch'
+    return relay
   }
 
   const wrappedUpload = async (request: Request): Promise<Response> => {
@@ -356,14 +379,14 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
       log?.('upload for %s refused locally: payload-too-large (%s declared)', sessionId, declaredLength)
       return uploadFailure('payload-too-large', OVERSIZE_MESSAGE)
     }
-    const serverId = getServerId()
-    if (relay.state !== 'online' || serverId === undefined) {
+    const target = uploadRelayFor(parts.serverId)
+    if (target === 'remote-offline') {
       counters.uploadRefused += 1
       recordFailure('upload', 'remote-offline')
       log?.('upload for %s refused: relay not online', sessionId)
       return uploadFailure('remote-offline', OFFLINE_MESSAGE)
     }
-    if (parts.serverId !== serverId) {
+    if (target === 'remote-mismatch') {
       counters.uploadRefused += 1
       recordFailure('upload', 'remote-mismatch')
       log?.('upload for %s refused: belongs to another server', sessionId)
@@ -374,7 +397,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
       // The request's own body stream rides to the server UNREAD by us; the
       // browser's abort signal rides along so a cancelled picker closes the
       // relay round-trip too.
-      const result = await relay.upload(
+      const result = await target.upload(
         { sessionId: parts.id, name: firstQuery(url, 'name'), body: request.body, bytes: declared },
         request.signal,
       )

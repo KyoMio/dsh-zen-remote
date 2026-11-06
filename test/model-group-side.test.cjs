@@ -21,6 +21,7 @@ const assert = require('node:assert/strict')
 
 const loadPure = () => import('../src/client-data/model-group-side.ts?' + Math.random())
 const loadEffect = () => import('../src/client/effects/model-group-side.ts?' + Math.random())
+const loadVirtualId = () => import('../src/virtual-id.ts?' + Math.random())
 
 // Pinned literally: U+2060 WORD JOINER is the mark both ends must agree on.
 const MARK = '\u2060'
@@ -69,6 +70,68 @@ test('T74 classify: containers decide independently of one another', async () =>
   ])
   assert.deepEqual(verdicts, ['remote', 'local', undefined, undefined],
     'the mixed menu decides; the all-local menu one stays unstamped')
+})
+
+// -- MS-4: per-session-server classification (classifyModelGroupsForSession) ---------
+
+test('MS-4 classify: the bare classifier keeps its old shape — no remote-other ever', async () => {
+  const pure = await loadPure()
+  const { encodeServerIdZeroWidth } = await loadVirtualId()
+  const headingA = `${encodeServerIdZeroWidth('aaaa1111')}书房 A · Codex`
+  const headingB = `${encodeServerIdZeroWidth('bbbb2222')}书房 B · Codex`
+  // The two-argument entry point WITHOUT an active server id must equal the
+  // one-argument classifier: the legacy stamping behavior.
+  assert.deepEqual(
+    pure.classifyModelGroupsForSession([
+      { containerKey: 1, headingText: headingA },
+      { containerKey: 1, headingText: headingB },
+      { containerKey: 1, headingText: 'OpenAI' },
+    ]),
+    pure.classifyModelGroups([{ containerKey: 1, headingText: headingA }, { containerKey: 1, headingText: headingB }, { containerKey: 1, headingText: 'OpenAI' }]),
+  )
+  assert.deepEqual(pure.classifyModelGroups([{ containerKey: 1, headingText: headingA }]), ['remote'],
+    'no remote-other without an active server id — the single-server verdicts stand')
+})
+
+test('MS-4 classify: with an active server, the other server\'s groups stamp remote-other', async () => {
+  const { classifyModelGroupsForSession } = await loadPure()
+  const { encodeServerIdZeroWidth } = await loadVirtualId()
+  // One mixed menu: local groups, server A's groups, server B's groups —
+  // exactly what a multi-paired client's merged catalog renders.
+  const verdicts = classifyModelGroupsForSession([
+    { containerKey: 1, headingText: `${encodeServerIdZeroWidth('aaaa1111')}书房 A · Codex` },
+    { containerKey: 1, headingText: 'DeepSeek 账号' },
+    { containerKey: 1, headingText: `${encodeServerIdZeroWidth('bbbb2222')}书房 B · Codex` },
+    { containerKey: 1, headingText: `${encodeServerIdZeroWidth('aaaa1111')}书房 A · Claude` },
+  ], 'aaaa1111')
+  assert.deepEqual(verdicts, ['remote', 'local', 'remote-other', 'remote'],
+    'A is the open session\'s server: its groups remote, B\'s remote-other, local untouched')
+})
+
+test('MS-4 classify: a remote group whose server cannot be decoded never stamps remote-other', async () => {
+  const { classifyModelGroupsForSession } = await loadPure()
+  // The legacy bare mark (an upgrade-window heading), and a BROKEN window
+  // (33rd bit char visible, no terminator) — both decode to undefined:
+  // "remote, server unknown" — shown, never hidden.
+  const brokenWindow = `${MARK}${'\u200b'.repeat(31)}${'\u200c'}书房 · 破损`
+  const verdicts = classifyModelGroupsForSession([
+    { containerKey: 1, headingText: `${MARK}书房 · Codex` },
+    { containerKey: 1, headingText: brokenWindow },
+  ], 'aaaa1111')
+  assert.deepEqual(verdicts, ['remote', 'remote'],
+    'undecodable remote groups stay plain remote')
+})
+
+test('MS-4 classify: the container rule governs the per-server verdict too', async () => {
+  const { classifyModelGroupsForSession } = await loadPure()
+  const { encodeServerIdZeroWidth } = await loadVirtualId()
+  const verdicts = classifyModelGroupsForSession([
+    { containerKey: 2, headingText: 'DeepSeek 账号' },
+    { containerKey: 2, headingText: 'OpenAI' },
+    { containerKey: 3, headingText: `${encodeServerIdZeroWidth('bbbb2222')}B · 模型` },
+  ], 'aaaa1111')
+  assert.deepEqual(verdicts, [undefined, undefined, 'remote-other'],
+    'the undecided container stamps nothing; the marked one decides per server')
 })
 
 // -- the heading resolution order (effects/model-group-side.ts) ------------------------

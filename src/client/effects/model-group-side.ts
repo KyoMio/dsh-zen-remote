@@ -1,5 +1,5 @@
 import type { ClientContext } from '../compat/types.ts'
-import { classifyModelGroups, type ModelGroupHeading } from '../../client-data/model-group-side.ts'
+import { classifyModelGroupsForSession, REMOTE_SERVER_ATTRIBUTE, type ModelGroupHeading, type ModelGroupSide } from '../../client-data/model-group-side.ts'
 
 /**
  * T74: stamp every model-menu group with the side of the pairing it belongs
@@ -10,6 +10,13 @@ import { classifyModelGroups, type ModelGroupHeading } from '../../client-data/m
  * only a container holding at least one marked (WORD JOINER-prefixed, see
  * virtual-id.ts) heading is decided at all, so every other menu and the
  * whole rest of the page is never touched.
+ *
+ * MS-4: the open remote session's server id (`data-zr-remote-server` on
+ * <html>, written by effects/remote-session.ts) is the classifier's
+ * `activeRemoteServerId` — a remote group whose heading decodes to a
+ * DIFFERENT paired server is stamped `remote-other`. Switching between two
+ * servers' sessions changes no group DOM at all, so a second observer
+ * watches that one <html> attribute and rescans the moment it moves.
  *
  * Synchronous in the observer callback, never behind rAF: the callback is a
  * microtask and runs before this frame paints, so a group that must be
@@ -22,8 +29,8 @@ import { classifyModelGroups, type ModelGroupHeading } from '../../client-data/m
 const GROUP_SELECTOR = 'section[role="group"]'
 
 /** The stamp this effect writes; remote-session.css.ts hides
- * `[data-zr-group="local"]` in a remote session and
- * `[data-zr-group="remote"]` everywhere else. */
+ * `[data-zr-group="local"]` and `[data-zr-group="remote-other"]` in a
+ * remote session and both remote stamps everywhere else. */
 const STAMP = 'data-zr-group'
 
 /**
@@ -69,7 +76,7 @@ function isGroupish(node: Node): boolean {
 
 export function installModelGroupSide(ctx: ClientContext): void {
   ctx.effect(() => {
-    const applyVerdict = (section: Element, verdict: 'remote' | 'local' | undefined): void => {
+    const applyVerdict = (section: Element, verdict: ModelGroupSide): void => {
       // Write only on change — the observer does not watch attributes (so a
       // stamp cannot re-trigger it), but a removed section's container may
       // be re-decided, and an unconditional set would still churn
@@ -99,7 +106,8 @@ export function installModelGroupSide(ctx: ClientContext): void {
         const text = headingTextOf(section, (id) => document.getElementById(id))
         rows.push({ section, containerKey: key, headingText: text ?? '' })
       }
-      const verdicts = classifyModelGroups(rows)
+      const activeRemoteServerId = document.documentElement.getAttribute(REMOTE_SERVER_ATTRIBUTE) ?? undefined
+      const verdicts = classifyModelGroupsForSession(rows, activeRemoteServerId)
       rows.forEach((row, i) => applyVerdict(row.section, verdicts[i]))
     }
 
@@ -115,6 +123,11 @@ export function installModelGroupSide(ctx: ClientContext): void {
       }
     })
     observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+    // MS-4: the session's server moves on <html> alone (A's session → B's
+    // with the menu open touches no group) — rescan synchronously, same
+    // no-rAF discipline as above.
+    const serverObserver = new MutationObserver(() => scan())
+    serverObserver.observe(document.documentElement, { attributes: true, attributeFilter: [REMOTE_SERVER_ATTRIBUTE] })
     // The initial paint may already hold groups (session restored under an
     // open menu): stamp them synchronously at install, like every observer
     // effect here does.
@@ -122,6 +135,7 @@ export function installModelGroupSide(ctx: ClientContext): void {
 
     return () => {
       observer.disconnect()
+      serverObserver.disconnect()
       // Undo every stamp so the host DOM reads exactly as before the effect
       // ran — the CSS rules key on the stamp, so this un-hides everything.
       for (const section of document.querySelectorAll(`${GROUP_SELECTOR}[${STAMP}]`)) {

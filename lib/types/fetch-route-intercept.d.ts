@@ -154,6 +154,14 @@ export interface InstallFetchRouteInterceptOptions {
     /** The CURRENT handshake's server id, read live per call; `undefined`
      * makes every remote upload a `remote-offline`. */
     getServerId: () => string | undefined;
+    /** MS-4: the relay client serving ONE paired server, looked up by the
+     * virtual id's serverId half per upload (the connection pool's
+     * `getByServerId`). When given, routing reads it alone: `undefined` (a
+     * server the pool does not hold) answers `remote-mismatch`, a held client
+     * that is not online `remote-offline`. Absent — the single-server wiring —
+     * the upload goes through `relay` exactly when the id belongs to
+     * `getServerId()`, with the original verdict order. */
+    getRelayForServer?: (serverId: string) => RelayClient | undefined;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
     /** The lazy-attach retry cadence (T51-fix): how often the table is

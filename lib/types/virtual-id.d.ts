@@ -32,6 +32,27 @@ export declare const VIRTUAL_ID_PREFIX = "zr~";
  * text.
  */
 export declare const VIRTUAL_GROUP_NAME_MARK = "\u2060";
+/**
+ * MS-4: the invisible prefix a REMOTE model-menu group heading carries
+ * before its server name (merge-streams.ts mergeModelCatalogs). The full
+ * form is `${MARK}${32 zero-width bits}${MARK}` — the 32 bits of the
+ * 8-hex serverId (MSB first per nibble), ZERO_BIT for 0 and ONE_BIT for 1
+ * — so the browser half can tell WHICH server a remote model group came
+ * from (effects/model-group-side.ts classifies per-server hiding from
+ * heading text alone). A serverId that is not 8 lowercase hex (the format
+ * every real handshake carries) degrades to the bare legacy mark: the
+ * heading stays a marked remote heading, just without a decodable server.
+ */
+export declare function encodeServerIdZeroWidth(serverId: unknown): string;
+/**
+ * MS-4: read the server id back out of one group heading, or `undefined`.
+ * Strict like every decoder here: the text must start with the mark, the
+ * window right after it must be exactly 32 zero-width bits closed by the
+ * terminator mark — anything else (the legacy bare-mark heading, visible
+ * text, a short or long bit run, a missing terminator) answers
+ * `undefined`, which the classifier reads as "remote, server unknown".
+ */
+export declare function decodeServerIdZeroWidth(headingText: unknown): string | undefined;
 /** The two halves {@link fromVirtual} recovers from a virtual id. */
 export interface VirtualIdParts {
     serverId: string;

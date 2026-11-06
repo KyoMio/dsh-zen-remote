@@ -150,6 +150,18 @@ export interface InstallPluginRouteInterceptOptions {
      * consumption: nothing here mutates merge state. Absent → the scan is
      * exactly the request-local PB-22 behavior. */
     getKnownRealIds?: () => ReadonlySet<string>;
+    /** MS-4: the per-server faces of the connection pool. A request whose
+     * located ids are `zr~<serverId>~…` is validated, forwarded and
+     * response-rewritten against THAT server alone: its relay client
+     * (`undefined` — a server the pool does not hold — refuses
+     * `server-changed`), its bridge verdicts and its known-real-id inventory.
+     * Each is optional and falls back on its own to the single-server face
+     * above: no `getRelayForServer` → `relay` exactly when the id belongs to
+     * `getServerId()`; no `getStatusForServer` → `getStatus()`; no
+     * `getKnownRealIdsForServer` → `getKnownRealIds()`. All read live. */
+    getRelayForServer?: (serverId: string) => RelayClient | undefined;
+    getStatusForServer?: (serverId: string) => BridgeStatus[];
+    getKnownRealIdsForServer?: (serverId: string) => ReadonlySet<string>;
     /** PB-26a: called with the virtual session ids a response rewrite
      * PRODUCED — a `rewriteIds.fields` route's wrapped positions, or the ids
      * an adapter's `client.response` hook passed through `virtualize` (e.g.
