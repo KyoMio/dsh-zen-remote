@@ -449,6 +449,48 @@ test('a shape refusal installs nothing (wiring)', async () => {
   assert.ok(status.intercept.shape.reasons.length > 0)
 })
 
+test('issue #53: the intercept waits for the connection service — absent means no install, present means install + self-check pass', async () => {
+  const { apply } = await import(INDEX_URL)
+  const gateway = new Alpha3TypertGateway()
+  const ownerPeer = { principal: { kind: 'owner' }, interactions: 'answer', signal: new AbortController().signal }
+
+  // typertGateway up, connection NOT yet: the install inject must not fire.
+  // Before the fix the callback ran on typertGateway alone, the self-check
+  // could not mint an owner Peer (the host gateway service only pulls
+  // connection in through a NESTED inject, so it lags), the alpha.3 gateway
+  // answered `reading 'signal'` and the one-retry-then-uninstall policy tore
+  // the whole interception down with no recovery path.
+  const early = makeWiringCtx({ typertGateway: { [symbols.original]: gateway } })
+  apply(early.ctx, { role: 'client' })
+  assert.equal(Object.prototype.hasOwnProperty.call(gateway, 'openWireStream'), false,
+    'no wrap while the connection service is absent')
+  assert.equal(Object.prototype.hasOwnProperty.call(gateway, 'dispatchRpc'), false)
+  assert.ok(!early.warns.some((args) => String(args[0]).includes('client intercept')),
+    'the typert intercept wiring stayed silent while connection was absent (the plugin-route intercept refusal above is its own, unrelated install)')
+
+  // connection arrives — a fresh apply is the unit-level stand-in for the
+  // service registering after the gateway: the inject now fires, the wrap
+  // installs, and the self-check opens workspace/follow AS the minted owner
+  // Peer instead of undefined.
+  const wired = makeWiringCtx({
+    connection: { createPeer: () => ownerPeer },
+    typertGateway: { [symbols.original]: gateway },
+  })
+  apply(wired.ctx, { role: 'client' })
+  assert.equal(Object.prototype.hasOwnProperty.call(gateway, 'openWireStream'), true,
+    'the wrap installed once connection is available')
+  const deadline = Date.now() + 2_000
+  while (!wired.infos.some((args) => String(args[0]).includes('self-check passed'))) {
+    if (Date.now() > deadline) {
+      assert.fail('the self-check never passed — infos=' + JSON.stringify(wired.infos.map(String))
+        + ' warns=' + JSON.stringify(wired.warns.map(String)))
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  assert.equal(gateway.streamCalls.at(-1).peer, ownerPeer,
+    'the probe reached the gateway as the minted owner Peer, never undefined')
+})
+
 // -- 2. local passthrough ---------------------------------------------------------
 
 test('a call without virtual ids reaches the original method untouched', async () => {
