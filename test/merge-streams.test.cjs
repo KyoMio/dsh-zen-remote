@@ -11,7 +11,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue } = require('../lib/merge-streams.js')
+const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue, localWorkspaceLists, composeMergedWorkspaceFrames } = require('../lib/merge-streams.js')
 const { toVirtual, VIRTUAL_GROUP_NAME_MARK } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
@@ -1691,4 +1691,104 @@ test('T63/T65 e2e at the merger level: a hidden closed-remote session rides the 
   assert.deepEqual(hidden, [{ type: 'archived', archivedSessionIds: [V('s2')] }])
   const refresh = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', ['s1']) })
   assert.deepEqual(virtualSessionIdsInWorkspaceFrames(refresh), [V('s1'), V('s2')])
+})
+
+// -- MS-3: multi-server composition helpers ------------------------------------
+
+test('MS-3 parts(): exposes the locally observed lists and this server\'s virtualized remote contribution', () => {
+  const m = merger()
+  assert.deepEqual(
+    m.parts(),
+    {
+      local: { orderIds: [], archivedIds: [], pinnedIds: [] },
+      remote: { orderIds: [], archivedIds: [], pinnedIds: [], workspaces: [] },
+    },
+    'before anything the parts are empty',
+  )
+
+  m.onLocal(LOCAL_BASELINE)
+  const beforeRemote = m.parts()
+  assert.deepEqual(beforeRemote.local, { orderIds: ['ws-local'], archivedIds: [], pinnedIds: [] })
+  assert.deepEqual(beforeRemote.remote.workspaces, [], 'no remote state yet')
+
+  m.onRemote(REMOTE_BASELINE)
+  const parts = m.parts()
+  assert.deepEqual(parts.local, { orderIds: ['ws-local'], archivedIds: [], pinnedIds: [] })
+  assert.deepEqual(parts.remote.orderIds, [V('w-1'), V('w-2')], 'shown remote workspaces in remote order, virtualized')
+  assert.deepEqual(
+    parts.remote.workspaces.map((workspace) => workspace.workspaceId),
+    [V('w-1'), V('w-2')],
+    'the forwarded workspace records, virtualized',
+  )
+  assert.deepEqual(parts.remote.archivedIds, [V('s2')], 'remote archived ids virtualized')
+  assert.deepEqual(parts.remote.pinnedIds, [V('s3')], 'remote pinned ids virtualized')
+  // The parts are snapshots: mutating them must not corrupt the merger.
+  parts.remote.orderIds.push('junk')
+  assert.deepEqual(m.parts().remote.orderIds, [V('w-1'), V('w-2')])
+})
+
+test('MS-3 parts(): a local-only frame never marks this server shown and keeps remote workspaces empty until carried', () => {
+  const m = merger()
+  m.onLocal({ type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: ['session-l1'], pinnedSessionIds: ['session-l1'] } })
+  m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', [])], archivedSessionIds: [], pinnedSessionIds: [] } })
+  // T56: an empty group is held back — the parts must reflect that.
+  assert.deepEqual(m.parts().remote.orderIds, [], 'a never-shown workspace has no order position')
+  assert.deepEqual(m.parts().remote.workspaces, [], 'a never-shown workspace is not forwarded')
+})
+
+test('MS-3 localWorkspaceLists(): reads the cumulative local lists one workspace/follow frame observes', () => {
+  const empty = { orderIds: [], archivedIds: [], pinnedIds: [] }
+  const baseline = localWorkspaceLists(
+    { type: 'baseline', value: { items: [{ workspaceId: 'a' }, 'b'], archivedSessionIds: ['x'], pinnedSessionIds: ['y'] } },
+    empty,
+  )
+  assert.deepEqual(baseline, { orderIds: ['a', 'b'], archivedIds: ['x'], pinnedIds: ['y'] }, 'a baseline replaces all three lists')
+
+  const afterOrder = localWorkspaceLists({ type: 'order', workspaceIds: ['c'] }, baseline)
+  assert.deepEqual(afterOrder, { orderIds: ['c'], archivedIds: ['x'], pinnedIds: ['y'] }, 'an order frame replaces the order only')
+
+  const afterArchived = localWorkspaceLists({ type: 'archived', archivedSessionIds: ['z'] }, afterOrder)
+  assert.deepEqual(afterArchived, { orderIds: ['c'], archivedIds: ['z'], pinnedIds: ['y'] })
+
+  const afterPinned = localWorkspaceLists({ type: 'pinned', pinnedSessionIds: ['w'] }, afterArchived)
+  assert.deepEqual(afterPinned, { orderIds: ['c'], archivedIds: ['z'], pinnedIds: ['w'] })
+
+  assert.deepEqual(localWorkspaceLists({ type: 'upsert', workspace: {} }, afterPinned), afterPinned, 'other frames observe nothing')
+  assert.deepEqual(localWorkspaceLists('junk', empty), empty, 'malformed frames observe nothing')
+})
+
+test('MS-3 composeMergedWorkspaceFrames(): local first, then each server\'s contribution in the given order', () => {
+  const local = { orderIds: ['ws-local'], archivedIds: ['l-arch'], pinnedIds: ['l-pin'] }
+  const serverA = {
+    orderIds: [toVirtual('aaa11111', 'w-a')],
+    archivedIds: [toVirtual('aaa11111', 'sa'), toVirtual('aaa11111', 'shared')],
+    pinnedIds: [toVirtual('aaa11111', 'pa')],
+    workspaces: [{ workspaceId: toVirtual('aaa11111', 'w-a'), title: 'A · 工作区' }],
+  }
+  const serverB = {
+    orderIds: [toVirtual('bbb22222', 'w-b')],
+    archivedIds: [toVirtual('bbb22222', 'shared')],
+    pinnedIds: [toVirtual('bbb22222', 'pb')],
+    workspaces: [{ workspaceId: toVirtual('bbb22222', 'w-b'), title: 'B · 工作区' }],
+  }
+
+  const composed = composeMergedWorkspaceFrames(local, [serverA, serverB])
+  assert.deepEqual(composed.order, { type: 'order', workspaceIds: ['ws-local', toVirtual('aaa11111', 'w-a'), toVirtual('bbb22222', 'w-b')] })
+  assert.deepEqual(
+    composed.archived,
+    { type: 'archived', archivedSessionIds: ['l-arch', toVirtual('aaa11111', 'sa'), toVirtual('aaa11111', 'shared'), toVirtual('bbb22222', 'shared')] },
+    'the archived set is deduplicated in local + slot order',
+  )
+  assert.deepEqual(
+    composed.pinned,
+    { type: 'pinned', pinnedSessionIds: ['l-pin', toVirtual('aaa11111', 'pa'), toVirtual('bbb22222', 'pb')] },
+    'the pinned list is local + slots in order',
+  )
+  assert.deepEqual(composed.workspaces, [serverA.workspaces[0], serverB.workspaces[0]], 'workspaces flatten in slot order')
+
+  const empty = composeMergedWorkspaceFrames(local, [])
+  assert.deepEqual(empty.order, { type: 'order', workspaceIds: ['ws-local'] }, 'no remotes: local only')
+  assert.deepEqual(empty.archived, { type: 'archived', archivedSessionIds: ['l-arch'] })
+  assert.deepEqual(empty.pinned, { type: 'pinned', pinnedSessionIds: ['l-pin'] })
+  assert.deepEqual(empty.workspaces, [])
 })
