@@ -108,50 +108,39 @@ test('T59: the backend forwards a committed row name through the volatile-update
   assert.equal(bootPushes, 1, 'exactly one broadcast call site: the volatile-update listener, nothing at startup')
 })
 
-test('T59-fix: the settings page follows the name at the STATUS ANSWER, not off a row-keyed effect', () => {
+test('MS-7: the settings page no longer follows the server-side name back into the row', () => {
   const section = readFileSync(join(ROOT, 'src', 'client', 'settings', 'SettingsSection.tsx'), 'utf8')
-  // The race source is gone: no effect keyed on the row's serverName value
-  // (it re-ran on every save holding the PREVIOUS poll's name and wrote the
-  // old one back over the fresh save).
+  // The T59 row-keyed race source stays gone…
   assert.ok(!section.includes('rowDeviceName'), 'the row-value follow effect is gone')
-  // The decision now runs where the FRESH answer lands, judging the row and
-  // the draft as they are at that moment.
+  // …and since MS-7 so is the status-answer follow: the local name only
+  // flows OUT (the pool broadcasts it to every paired server, pinned above);
+  // a server-side record never overwrites the row's serverName.
+  assert.ok(!section.includes('followServerDeviceName'), 'the status-answer follow is gone')
+  assert.ok(!section.includes('writeDeviceName'), 'nothing writes a server-side name into the row')
   const loadAt = section.indexOf('const loadClientStatus = useCallback(')
-  const followDefAt = section.indexOf('const followServerDeviceName = useCallback(')
-  const callAt = section.indexOf('followServerDeviceName(view)', loadAt)
-  for (const [label, at] of [['the follow decision', followDefAt], ['its call in the status load', callAt]]) {
-    assert.notEqual(at, -1, `${label} present`)
-  }
-  assert.ok(followDefAt < loadAt, 'the decision is declared before the loader uses it')
-  assert.ok(callAt > loadAt, 'the decision runs on every fresh status answer')
+  assert.notEqual(loadAt, -1, 'the status loader is the anchor')
 })
 
-// ---- T60: the pairing round-trip lands the name in the row --------------------
+// ---- T60 / MS-7: the pairing round-trip ------------------------------------
 
-test('T60: runClaim writes the registered name with the credentials and retires the draft', () => {
-  // The claim name is computed ONCE per attempt (sent AND written).
+test('T60/MS-7: runClaim sends the registered name; the backend (not the row) keeps the pairing', () => {
+  // The claim name is computed ONCE per attempt and sent.
   assert.ok(source.includes('const claimName = claimDeviceNameOf('), 'one claim name per attempt')
   const claimAt = source.indexOf('const claimName = claimDeviceNameOf(')
   const sendAt = source.indexOf('name: claimName,', claimAt)
   assert.notEqual(sendAt, -1, 'the claim body sends exactly that name')
-  // The write: the server's echo wins, else the sent name; same mutate as
-  // the credentials.
-  const writeAt = source.indexOf('config.writeClientPairing(urlToWrite, body.token, echoed)')
-  assert.notEqual(writeAt, -1, 'the registered name rides the SAME direct write')
-  const echoBlock = source.slice(source.indexOf('const echoed =', claimAt), writeAt)
-  assert.ok(echoBlock.includes('body.deviceName'), 'the server-confirmed echo has priority')
-  assert.ok(echoBlock.includes(': claimName'), 'the sent name is the fallback')
-  // The draft did its job: retired after a LANDED write (not before).
-  const landedAt = source.indexOf('if (landed) {', claimAt)
-  const landedBlock = source.slice(landedAt, source.indexOf('}', landedAt))
-  assert.ok(landedBlock.includes("config.discardField('serverName')"), 'a landed write clears the stale draft')
+  // MS-5/MS-7: the token lands in zen-remote-state.json server-side and
+  // never reaches the browser — no row write follows the claim.
+  assert.ok(!source.includes('config.writeClientPairing('), 'the claim does not write the row')
+  assert.ok(!source.includes('body.token'), 'the page reads no token from the claim answer')
 })
 
 test('T60: an invalid device-name draft disables pairing and says why', () => {
-  // The gate…
-  const allowedAt = source.indexOf('const claimAllowed =')
-  const allowedLine = source.slice(allowedAt, source.indexOf('\n', allowedAt))
-  assert.ok(allowedLine.includes('!form.serverName.invalid'), 'an invalid draft blocks the pairing button')
+  // The gate (MS-7: through the shared pure truth table)…
+  const allowedAt = source.indexOf('canSubmitClientPairing({')
+  assert.notEqual(allowedAt, -1, 'the pairing gate runs canSubmitClientPairing')
+  const allowedCall = source.slice(allowedAt, source.indexOf('})', allowedAt))
+  assert.ok(allowedCall.includes('deviceNameInvalid: form.serverName.invalid'), 'an invalid draft blocks the pairing button')
   // …and the visible reason, in the pairing area (after the button row).
   const buttonAt = source.indexOf("t('settings.client.pair')}")
   const hintAt = source.indexOf("t('settings.client.fixDeviceName')")

@@ -227,6 +227,21 @@ export const SETTINGS_CSS = `
 [data-zen-remote="settings"] .zr-settings-badge[data-live="true"] {
   color: var(--dsw-alias-state-success-primary, #16a34a);
 }
+[data-zen-remote="settings"] .zr-settings-badge[data-invalid="true"] {
+  color: var(--dsw-alias-state-error-primary, #d5304f);
+}
+/* MS-7: the full-pool alert must be impossible to miss — red, bold, framed. */
+[data-zen-remote="settings"] .zr-settings-limit-alert,
+[data-zen-remote="settings"] .zr-settings-limit-alert[data-invalid="true"] {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.5;
+  color: var(--dsw-alias-state-error-primary, #d5304f);
+  border: 1px solid var(--dsw-alias-state-error-primary, #d5304f);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 8px 0 4px;
+}
 [data-zen-remote="settings"] .zr-settings-footer {
   display: flex;
   align-items: center;
