@@ -81,20 +81,23 @@
 
 import { RelayError, defaultClock } from './relay-client.js'
 import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
+import type { RelayPool } from './relay-pool.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
 import { INVOKE_BINARY_RESULT_METHODS, extractResultAttachments, restoreInvokeBinary, type ResultAttachment } from './invoke-binary.js'
 import {
+  composeMergedWorkspaceFrames,
   createControlMerger,
   createWorkspaceMerger,
+  localWorkspaceLists,
   mergeModelCatalogs,
   mergeSessionList,
   sessionSummaryAddedFrames,
   virtualSessionIdsInWorkspaceFrames,
   virtualizeModelSelectionValue,
 } from './merge-streams.js'
-import type { ControlMerger, MergerAnnotation, MergerIdentity, WorkspaceMerger } from './merge-streams.js'
+import type { ControlMerger, MergerAnnotation, MergerIdentity, RemoteWorkspaceContribution, WorkspaceMerger } from './merge-streams.js'
 
 /** The session-locating argument fields, as registered per method. Identical
  * in name and meaning to relay-access.ts's `SessionField`; a field named
@@ -622,12 +625,21 @@ export interface InstallInterceptOptions {
   /** The RAW gateway instance (`ctx.typertGateway[symbols.original]`), not
    * the cordis proxy — own properties on the proxy are ignored by everyone. */
   raw: object
-  /** The client relay client (T23a) the calls travel through. */
-  relay: RelayClient
-  /** The CURRENT handshake's server id, read live per call; `undefined`
-   * (never handshook) makes every remote call a `remote-offline` — a
-   * different fact from pointing at the wrong server (`remote-mismatch`). */
-  getServerId: () => string | undefined
+  /** SINGLE-SERVER mode (the original wiring, kept for compatibility): the
+   * one client relay client the calls travel through. Either this + 
+   * {@link getServerId}, or {@link pool} — never required together. */
+  relay?: RelayClient
+  /** SINGLE-SERVER mode: the CURRENT handshake's server id, read live per
+   * call; `undefined` (never handshook) makes every remote call a
+   * `remote-offline` — a different fact from pointing at the wrong server
+   * (`remote-mismatch`). */
+  getServerId?: () => string | undefined
+  /** MS-3 POOL mode: the multi-server relay pool (up to
+   * `MAX_PAIRED_SERVERS` paired servers). When present it replaces the
+   * single-relay routing: every call/stream/event routes by the virtual
+   * id's `serverId` to the matching pool entry, and the three global reads
+   * plus the model catalog merge ALL paired servers in pairing order. */
+  pool?: RelayPool
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
   /** Clock/timers for the merged streams' reopen backoff (CP4); defaults to
@@ -645,10 +657,12 @@ export interface InstallInterceptOptions {
   /** PB-25b: the inventory slot factory — one slot per merged global stream
    * (only the workspace merger ever reports; the control merger has no
    * session inventory). The wiring unions the live slots' shares into the
-   * set the plugin-route rewrite reads. Absent: no shares are ever reported
-   * and the plugin-route value scan stays exactly the request-local
-   * behavior. */
-  createSessionInventorySlot?: () => SessionInventorySlot
+   * set the plugin-route rewrite consults. MS-3: the factory receives the
+   * slot's `serverId`, so a pool wiring can keep per-server inventories
+   * (the plain single-server wiring can ignore the argument). Absent: no
+   * shares are ever reported and the plugin-route value scan stays exactly
+   * the request-local behavior. */
+  createSessionInventorySlot?: (serverId?: string) => SessionInventorySlot
 }
 
 export interface InterceptHandle {
@@ -677,6 +691,13 @@ export interface InterceptHandle {
    * entries are dropped; a batch with nothing left is a no-op. Reaches every
    * live merged `$events` stream, and the pending slot when none is open. */
   nudgeSummarySync(ids: readonly string[]): void
+  /** MS-3 (pool mode only meaningful, harmless otherwise): the pool's entry
+   * set or any entry's identity moved — the wiring forwards the pool's
+   * `onServerRemoved` / `onStateChange` callbacks here. Every live merged
+   * stream re-scans `pool.entries()` NOW: slots for removed entries leave
+   * (only THAT server's shown groups and pending events are torn down),
+   * slots for new entries start, and renames re-title the groups. */
+  notePoolEvent(): void
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -2495,6 +2516,1000 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
   }
 }
 
+// ---- MS-3: the pool-mode merged streams ------------------------------------
+//
+// The pool-mode counterparts of the two merged streams above. They keep the
+// SAME outer contract (the local stream is the base; a remote death emits
+// nothing; the hold/reopen discipline) but run ONE leg per pooled server:
+// every slot is keyed by its handshake `serverId`, the slot set is
+// re-scanned on every pool event and every slot's own state change, and the
+// canonical merged frames compose the slots' contributions in PAIRING order
+// (pool.entries() order — the connect order never reorders the sidebar).
+// A removed entry tears down only ITS slot: only that server's shown
+// workspace groups leave the sidebar and only that server's pending
+// approvals get the synthesized cancels.
+
+interface PoolGlobalSlot {
+  kind: 'workspace' | 'control'
+  serverId: string
+  entryId: string
+  client: RelayClient
+  merger: WorkspaceMerger | ControlMerger
+  /** The pool display name this slot's merger is currently titled with. */
+  viewName: string
+  controller: AbortController | undefined
+  offState: () => void
+  annotation: MergerAnnotation
+  reopenDelayMs: number
+  removed: boolean
+  /** PB-25b, pool form: one inventory slot per WORKSPACE server, disposed
+   * with the slot (the single-server stream's slot dies with the stream). */
+  inventory: SessionInventorySlot | undefined
+}
+
+interface MergedGlobalStreamMultiDeps {
+  endpoint: 'workspace/follow' | 'session/control'
+  namespace: string
+  method: string
+  local: AsyncIterable<unknown>
+  pool: RelayPool
+  signal: AbortSignal | undefined
+  recordFailure: (endpoint: string, code: string) => void
+  log: ((format: string, ...args: unknown[]) => void) | undefined
+  clock: RelayClock
+  getCurrentSession: () => CurrentSessionRead
+  watchCurrentSession(fn: () => void): () => void
+  watchUninstall(fn: () => void): () => void
+  summarySync: SessionSummarySync
+  createSessionInventorySlot?: (serverId?: string) => SessionInventorySlot
+  /** Subscribe to the wiring's pool-event broadcasts (handle.notePoolEvent).
+   * Every broadcast re-scans the slot set. */
+  watchPool(fn: () => void): () => void
+}
+
+/**
+ * The pool-mode merged global stream. Per server slot the same rules as the
+ * single-server merged stream apply; the slots' outputs differ only in the
+ * GLOBAL frames (`order` / `archived` / `pinned` and the baseline's merged
+ * lists), which are never taken from a slot's own merger — they are
+ * composed canonically from every slot's contribution in pairing order
+ * (composeMergedWorkspaceFrames). Per-workspace frames (upserts and
+ * removes) are slot-local facts and pass as the merger produced them.
+ */
+async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): AsyncGenerator<unknown, void, undefined> {
+  const { endpoint, namespace, method, local, pool, signal, recordFailure, log, clock } = deps
+  if (signal?.aborted === true) return
+  const isWorkspace = endpoint === 'workspace/follow'
+  const onDiagnostic = (message: string): void => {
+    log?.('client multi merge dropped a frame on %s: %s', endpoint, message)
+  }
+  const channel = createFrameChannel()
+  let alive = true
+  const slots = new Map<string, PoolGlobalSlot>()
+  const onlineWaiters: (() => void)[] = []
+  const flushWaiters = (): void => {
+    for (const wake of onlineWaiters.splice(0)) wake()
+  }
+  const waitAny = async (): Promise<void> => {
+    await new Promise<void>((resolve) => {
+      onlineWaiters.push(resolve)
+    })
+  }
+  // The orchestrator's LOCAL truth, folded from every local frame — the one
+  // source the canonical composition reads its local lists from (a slot's
+  // merger keeps its own copy only for its discarded single-server frames).
+  let localSeen = false
+  let localBaselineFrame: unknown = undefined
+  let localLists = { orderIds: [], archivedIds: [], pinnedIds: [] } as { orderIds: string[]; archivedIds: string[]; pinnedIds: string[] }
+
+  const annotationOf = (client: RelayClient): MergerAnnotation => {
+    const state = client.state
+    if (state === 'revoked') return 'revoked'
+    if (state === 'unpaired') return 'unpaired'
+    if (state !== 'online') return 'offline'
+    const different = client.compat?.different
+    return different !== undefined && different.length > 0 ? 'mismatch' : 'none'
+  }
+  const workspaceMergerOf = (slot: PoolGlobalSlot): WorkspaceMerger | undefined =>
+    slot.kind === 'workspace' ? (slot.merger as WorkspaceMerger) : undefined
+
+  const pushOut = (frames: readonly unknown[]): void => {
+    if (frames.length === 0) return
+    for (const frame of frames) channel.push(frame)
+    if (isWorkspace) {
+      const ids = virtualSessionIdsInWorkspaceFrames(frames)
+      if (ids.length > 0) deps.summarySync.noteForwardedSessionIds(ids)
+    }
+  }
+  const orderedRemoteParts = (): { slot: PoolGlobalSlot; remote: RemoteWorkspaceContribution }[] => {
+    const out: { slot: PoolGlobalSlot; remote: RemoteWorkspaceContribution }[] = []
+    if (!isWorkspace) return out
+    for (const entry of pool.entries()) {
+      if (entry.serverId === undefined) continue
+      const slot = slots.get(entry.serverId)
+      const merger = slot !== undefined ? workspaceMergerOf(slot) : undefined
+      if (slot === undefined || merger === undefined) continue
+      out.push({ slot, remote: merger.parts().remote })
+    }
+    return out
+  }
+  /** The canonical merged global frames over ALL current slots — pairing
+   * order, local first. Only past the local baseline: before it the slots
+   * cache their remote state and the frames would order workspaces the
+   * local baseline would immediately erase. */
+  const composedFrames = (): { order: unknown; archived: unknown; pinned: unknown } | undefined => {
+    if (!localSeen || !isWorkspace) return undefined
+    const parts = orderedRemoteParts()
+    return composeMergedWorkspaceFrames(localLists, parts.map((part) => part.remote))
+  }
+  const pushCanonicalTrio = (): void => {
+    const composed = composedFrames()
+    if (composed !== undefined) pushOut([composed.order, composed.archived, composed.pinned])
+  }
+
+  // -- current-session judging (T58/T62), across every slot ------------------
+  const informCurrentSession = (): void => {
+    const read = deps.getCurrentSession()
+    if (read.kind === 'unavailable') return
+    let changed = false
+    for (const slot of [...slots.values()]) {
+      if (slot.merger.setCurrentSession(read.kind === 'open' ? read.sessionId : undefined).length > 0) changed = true
+    }
+    if (!changed || !localSeen || !isWorkspace) return
+    const parts = orderedRemoteParts()
+    pushOut([composeMergedWorkspaceFrames(localLists, parts.map((part) => part.remote)).archived])
+  }
+  const anyPendingHide = (): boolean => {
+    for (const slot of [...slots.values()]) {
+      if (slot.merger.hasPendingHide) return true
+    }
+    return false
+  }
+  let sessionPoll: unknown = undefined
+  const pollCurrentSession = (): void => {
+    sessionPoll = undefined
+    if (!alive) return
+    if (anyPendingHide()) informCurrentSession()
+    if (alive && anyPendingHide()) sessionPoll = clock.setTimeout(pollCurrentSession, CURRENT_SESSION_POLL_MS)
+  }
+  const ensureSessionPoll = (): void => {
+    if (sessionPoll === undefined && alive && anyPendingHide()) {
+      sessionPoll = clock.setTimeout(pollCurrentSession, CURRENT_SESSION_POLL_MS)
+    }
+  }
+
+  // -- slot lifecycle ----------------------------------------------------------
+  const removeSlot = (serverId: string, slot: PoolGlobalSlot): void => {
+    slots.delete(serverId)
+    slot.removed = true
+    slot.offState()
+    slot.controller?.abort()
+    if (slot.inventory !== undefined) {
+      slot.inventory.dispose()
+      slot.inventory = undefined
+    }
+    // Only THIS server's shown groups leave; the canonical trio then re-airs
+    // the merged order/archived/pinned over the surviving slots (the
+    // merger's own trailing local-only restores are superseded by it).
+    if (!isWorkspace) return
+    const merger = slot.merger as WorkspaceMerger
+    const gone = merger.onRemoteGone()
+    pushOut(gone.filter((frame) => isPlainObject(frame) && frame.type === 'remove'))
+    pushCanonicalTrio()
+  }
+  const applySlotAnnotation = (slot: PoolGlobalSlot, next: MergerAnnotation): void => {
+    if (next === slot.annotation) return
+    slot.annotation = next
+    slot.merger.setStatus(next)
+    if (!isWorkspace) return
+    const merger = slot.merger as WorkspaceMerger
+    const frames = merger.onStatusChanged()
+    if (frames.length > 0) {
+      pushOut(frames.filter((frame) => isPlainObject(frame) && frame.type === 'upsert'))
+      pushCanonicalTrio()
+    }
+  }
+  const refreshOneViewName = (slot: PoolGlobalSlot, nextName: string): void => {
+    slot.viewName = nextName
+    slot.merger.retarget({ serverId: slot.serverId, serverName: nextName })
+    if (!isWorkspace) return
+    const merger = slot.merger as WorkspaceMerger
+    const frames = merger.onServerRenamed()
+    if (frames.length > 0) {
+      pushOut(frames)
+      pushCanonicalTrio()
+    }
+  }
+  const refreshViewNames = (): void => {
+    for (const entry of pool.entries()) {
+      const slot = entry.serverId !== undefined ? slots.get(entry.serverId) : undefined
+      if (slot !== undefined && slot.viewName !== entry.displayName) refreshOneViewName(slot, entry.displayName)
+    }
+  }
+
+  const pumpSlot = async (slot: PoolGlobalSlot): Promise<void> => {
+    // Whole body guarded: ANY escape stops THIS server's leg only.
+    try {
+      while (alive && !slot.removed) {
+        if (slot.client.state !== 'online') {
+          await waitAny()
+          continue
+        }
+        const controller = new AbortController()
+        slot.controller = controller
+        try {
+          const stream = slot.client.openStream(namespace, method, {}, controller.signal)
+          let served = false
+          for await (const frame of stream) {
+            // Post-abort lines the transport already decoded must not reach
+            // the merger (same discipline as the single-server pumps).
+            if (!alive || slot.removed || controller.signal.aborted) break
+            if (!served) {
+              served = true
+              slot.reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+            }
+            informCurrentSession()
+            const out = slot.merger.onRemote(frame)
+            if (out.length > 0) {
+              if (isWorkspace) {
+                pushOut(out.filter((outFrame) => isPlainObject(outFrame) && (outFrame.type === 'upsert' || outFrame.type === 'remove')))
+                pushCanonicalTrio()
+              } else {
+                pushOut(out)
+              }
+            }
+            ensureSessionPoll()
+          }
+        } catch (error) {
+          if (alive && !slot.removed && !controller.signal.aborted && signal?.aborted !== true) {
+            recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
+          }
+        } finally {
+          if (slot.controller === controller) slot.controller = undefined
+        }
+        if (!alive || slot.removed) return
+        slot.merger.onRemoteDown()
+        if (slot.client.state === 'online') {
+          await waitReopen(clock, waitAny, slot.reopenDelayMs)
+          slot.reopenDelayMs = Math.min(slot.reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
+          continue
+        }
+        await waitAny()
+      }
+    } catch (error) {
+      if (alive) onDiagnostic(`remote leg of ${slot.serverId} stopped: ${messageOf(error)}`)
+    }
+  }
+
+  /** Re-read pool.entries(): create slots for new handshook servers (in
+   * pairing order), refresh display names, remove slots whose server left.
+   * Also heals a re-handshake that renamed the entry's serverId. */
+  const scanSlots = (): void => {
+    const seen = new Set<string>()
+    for (const entry of pool.entries()) {
+      const serverId = entry.serverId
+      if (serverId === undefined) continue
+      seen.add(serverId)
+      const existing = slots.get(serverId)
+      if (existing !== undefined) {
+        if (existing.viewName !== entry.displayName) refreshOneViewName(existing, entry.displayName)
+        continue
+      }
+      const inventory = isWorkspace && deps.createSessionInventorySlot !== undefined
+        ? deps.createSessionInventorySlot(serverId)
+        : undefined
+      const merger = isWorkspace
+        ? createWorkspaceMerger({
+            serverId,
+            serverName: entry.displayName,
+            onDiagnostic,
+            now: clock.now,
+            ...(inventory !== undefined ? { onKnownSessions: (ids: ReadonlySet<string>) => inventory.replace(ids) } : {}),
+          })
+        : createControlMerger({ serverId, serverName: entry.displayName, onDiagnostic })
+      const slot: PoolGlobalSlot = {
+        kind: isWorkspace ? 'workspace' : 'control',
+        serverId,
+        entryId: entry.entryId,
+        client: entry.client,
+        merger,
+        viewName: entry.displayName,
+        controller: undefined,
+        offState: () => {},
+        annotation: annotationOf(entry.client),
+        reopenDelayMs: REMOTE_REOPEN_FIRST_MS,
+        removed: false,
+        inventory,
+      }
+      merger.setStatus(slot.annotation)
+      slot.offState = slot.client.subscribe((state) => {
+        try {
+          // The set itself may have changed (a dedupe renamed the entry's
+          // serverId, a rename moved the display name) — re-scan first.
+          scanSlots()
+          if (state === 'unpaired' || state === 'revoked') {
+            applySlotAnnotation(slot, annotationOf(slot.client))
+            slot.merger.onRemoteDown()
+            slot.controller?.abort()
+            return
+          }
+          applySlotAnnotation(slot, annotationOf(slot.client))
+          if (state === 'online') refreshViewNames()
+        } catch (error) {
+          log?.('client multi merge slot state handler failed on %s: %s', serverId, messageOf(error))
+        } finally {
+          flushWaiters()
+        }
+      })
+      slots.set(serverId, slot)
+      // A slot born mid-stream missed the local baseline — replay it (its
+      // output is discarded; the replay only sets the merger's localSeen and
+      // local lists). Runs BEFORE the pump starts, so the buffer is empty.
+      if (localBaselineFrame !== undefined) {
+        for (const out of slot.merger.onLocal(localBaselineFrame)) void out
+      }
+      void pumpSlot(slot)
+    }
+    for (const [serverId, slot] of [...slots]) {
+      if (!seen.has(serverId)) removeSlot(serverId, slot)
+    }
+  }
+
+  // -- local frames -------------------------------------------------------------
+  const pushLocalWorkspace = (frame: unknown): void => {
+    localLists = localWorkspaceLists(frame, localLists)
+    // Every slot's merger must observe the local frames too — its localSeen
+    // gate (nothing leaves its onRemote before the local baseline passed)
+    // and its own local lists live there. Its OUTPUT is discarded: the
+    // single-server global frames (its merged order/archived/pinned) are
+    // superseded by the canonical composition over ALL slots.
+    for (const slot of [...slots.values()]) {
+      for (const out of slot.merger.onLocal(frame)) void out
+    }
+    if (!isPlainObject(frame)) {
+      pushOut([frame])
+      return
+    }
+    if (frame.type === 'baseline') {
+      localSeen = true
+      localBaselineFrame = frame
+      const parts = orderedRemoteParts()
+      const remotes = parts.map((part) => part.remote)
+      const hasRemote = remotes.some(
+        (remote) => remote.orderIds.length + remote.archivedIds.length + remote.pinnedIds.length + remote.workspaces.length > 0,
+      )
+      if (!hasRemote) {
+        pushOut([frame])
+        return
+      }
+      const value = isPlainObject(frame.value) ? frame.value : {}
+      const items = Array.isArray(value.items) ? value.items : []
+      const composed = composeMergedWorkspaceFrames(localLists, remotes)
+      pushOut([
+        {
+          ...frame,
+          value: {
+            ...value,
+            items: [...items, ...composed.workspaces],
+            archivedSessionIds: composed.archived.archivedSessionIds,
+            pinnedSessionIds: composed.pinned.pinnedSessionIds,
+          },
+        },
+        ...composed.workspaces.map((workspace) => ({ type: 'upsert', workspace })),
+      ])
+      return
+    }
+    const remotes = orderedRemoteParts().map((part) => part.remote)
+    if (frame.type === 'order') {
+      if (!remotes.some((remote) => remote.orderIds.length > 0)) {
+        pushOut([frame])
+        return
+      }
+      pushOut([composeMergedWorkspaceFrames(localLists, remotes).order])
+      return
+    }
+    if (frame.type === 'archived') {
+      if (!remotes.some((remote) => remote.archivedIds.length > 0)) {
+        pushOut([frame])
+        return
+      }
+      pushOut([composeMergedWorkspaceFrames(localLists, remotes).archived])
+      return
+    }
+    if (frame.type === 'pinned') {
+      if (!remotes.some((remote) => remote.pinnedIds.length > 0)) {
+        pushOut([frame])
+        return
+      }
+      pushOut([composeMergedWorkspaceFrames(localLists, remotes).pinned])
+      return
+    }
+    // upsert / remove / anything else local: purely local facts.
+    pushOut([frame])
+  }
+  const pushLocalControl = (frame: unknown): void => {
+    if (isPlainObject(frame) && frame.type === 'baseline') {
+      pushOut([frame])
+      // Each slot's buffered pre-baseline projections flush behind it (the
+      // slots' own baseline copies are the SAME frame object — skip those).
+      for (const slot of [...slots.values()]) {
+        for (const out of slot.merger.onLocal(frame)) {
+          if (out !== frame) pushOut([out])
+        }
+      }
+      return
+    }
+    pushOut([frame])
+    for (const slot of [...slots.values()]) slot.merger.onLocal(frame)
+  }
+
+  const offCurrentSession = deps.watchCurrentSession(informCurrentSession)
+  const offUninstall = deps.watchUninstall(() => {
+    try {
+      const read = deps.getCurrentSession()
+      for (const slot of [...slots.values()]) {
+        slot.merger.setCurrentSession(read.kind === 'open' ? read.sessionId : undefined)
+        applySlotAnnotation(slot, 'unpaired')
+        slot.merger.onRemoteDown()
+        slot.controller?.abort()
+      }
+    } catch {
+      // ignore teardown errors
+    } finally {
+      flushWaiters()
+    }
+  })
+  const offPool = deps.watchPool(() => {
+    try {
+      scanSlots()
+      refreshViewNames()
+    } catch (error) {
+      log?.('client multi merge pool rescan failed on %s: %s', endpoint, messageOf(error))
+    } finally {
+      flushWaiters()
+    }
+  })
+
+  const onExternalAbort = (): void => {
+    alive = false
+    for (const slot of [...slots.values()]) slot.controller?.abort()
+    flushWaiters()
+    channel.end()
+  }
+  if (signal !== undefined) signal.addEventListener('abort', onExternalAbort)
+
+  scanSlots()
+  informCurrentSession()
+
+  const localIterator = local[Symbol.asyncIterator]()
+  const pumpLocal = async (): Promise<void> => {
+    try {
+      while (alive) {
+        const result = await localIterator.next()
+        if (result.done === true) break
+        informCurrentSession()
+        if (isWorkspace) pushLocalWorkspace(result.value)
+        else pushLocalControl(result.value)
+        ensureSessionPoll()
+      }
+    } catch (error) {
+      // The local stream is the one the UI opened: its failure is the
+      // merged stream's failure (a remote death never is).
+      if (alive) channel.fail(error)
+      return
+    }
+    if (!alive) return
+    alive = false
+    for (const slot of [...slots.values()]) slot.controller?.abort()
+    flushWaiters()
+    channel.end()
+  }
+
+  void pumpLocal()
+  try {
+    while (true) {
+      const result = await channel.next()
+      if (result.done === true) break
+      yield result.value
+    }
+  } finally {
+    alive = false
+    if (sessionPoll !== undefined) clock.clearTimeout(sessionPoll)
+    offCurrentSession()
+    offUninstall()
+    offPool()
+    if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
+    for (const slot of [...slots.values()]) {
+      slot.removed = true
+      slot.offState()
+      slot.controller?.abort()
+      slot.inventory?.dispose()
+    }
+    slots.clear()
+    flushWaiters()
+    void Promise.resolve(localIterator.return?.(undefined)).catch(() => {})
+  }
+}
+
+interface PoolEventSlot {
+  serverId: string
+  client: RelayClient
+  controller: AbortController | undefined
+  offState: () => void
+  /** This server's shown-and-uncanceled virtual eventIds — the orphan-close
+   * record. PER SLOT by design: a leg dying closes only its own prompts. */
+  shownEvents: Set<string>
+  reopenDelayMs: number
+  removed: boolean
+  displayName: string
+  /** T52 refresh key for this slot (its identity while serving). */
+  notedIdentity: string | undefined
+  stateSeen: RelayState | undefined
+  statusInFlight: boolean
+  statusPending: boolean
+  statusDeferred: boolean
+}
+
+interface MergedEventsStreamMultiDeps {
+  local: AsyncIterable<unknown>
+  pool: RelayPool
+  signal: AbortSignal | undefined
+  recordFailure: (endpoint: string, code: string) => void
+  log: ((format: string, ...args: unknown[]) => void) | undefined
+  clock: RelayClock
+  summarySync: SessionSummarySync
+  watchPool(fn: () => void): () => void
+}
+
+/**
+ * The pool-mode merged `$events` stream: one `$zr/events` leg per pooled
+ * server, each with its own orphan-close record. The T52 catalog refresh
+ * fires whenever any slot's serving identity appears, changes, or leaves;
+ * the T63/T65 summary sync and the T75 status sync fetch from the OWNING
+ * server of each id (virtual ids carry the serverId), per slot on its own
+ * serving periods.
+ */
+async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): AsyncGenerator<unknown, void, undefined> {
+  const { local, pool, signal, recordFailure, log, clock } = deps
+  if (signal?.aborted === true) return
+  const channel = createFrameChannel()
+  let alive = true
+  const slots = new Map<string, PoolEventSlot>()
+  const onlineWaiters: (() => void)[] = []
+  const flushWaiters = (): void => {
+    for (const wake of onlineWaiters.splice(0)) wake()
+  }
+  const waitAny = async (): Promise<void> => {
+    await new Promise<void>((resolve) => {
+      onlineWaiters.push(resolve)
+    })
+  }
+  let localOpened = false
+  let deferredRefresh = false
+  const pushRefresh = (): void => {
+    if (!localOpened) {
+      deferredRefresh = true
+      return
+    }
+    channel.push(catalogRefreshFrame())
+  }
+  const noteSlotIdentity = (slot: PoolEventSlot): void => {
+    const key = slot.client.state === 'online' ? `${slot.serverId}\u0000${slot.displayName}` : undefined
+    if (key === slot.notedIdentity) return
+    slot.notedIdentity = key
+    if (key !== undefined) pushRefresh()
+  }
+
+  // -- T63/T65/T75 bookkeeping: global maps over VIRTUAL ids (globally
+  // unique across servers), per-slot fetch rounds. Same discipline as the
+  // single-server stream — see mergedEventsStream for the full story.
+  const announced = new Set<string>()
+  const askAttempts = new Map<string, number>()
+  const askedForGood = new Set<string>()
+  const retryAt = new Map<string, number>()
+  const MAX_ASK_ATTEMPTS = 3
+  const ASK_RETRY_FIRST_MS = 2_000
+  const ASK_RETRY_SECOND_MS = 10_000
+  let retryTimer: unknown = undefined
+  let midFlightBatches: string[] = []
+  let askingNow: string[] = []
+  let summarySyncInFlight = false
+  let deferredSummarySync = false
+  const latestLiveStatus = new Map<string, boolean>()
+  let statusSeq = 0
+  const liveStatusSeq = new Map<string, number>()
+
+  const scheduleRetry = (): void => {
+    if (retryTimer !== undefined || retryAt.size === 0) return
+    const earliest = Math.min(...retryAt.values())
+    retryTimer = clock.setTimeout(() => {
+      retryTimer = undefined
+      if (!alive) return
+      const nowMs = clock.now()
+      const due: string[] = []
+      for (const [id, at] of retryAt) {
+        if (at <= nowMs) {
+          retryAt.delete(id)
+          due.push(id)
+        }
+      }
+      if (due.length > 0) runSummarySync(due)
+    }, Math.max(0, earliest - clock.now()))
+  }
+  const runSummarySync = (triggerIds: readonly string[] = []): void => {
+    if (!alive) return
+    if (!localOpened) {
+      deferredSummarySync = true
+      return
+    }
+    if (summarySyncInFlight) {
+      midFlightBatches.push(...triggerIds)
+      return
+    }
+    const rounds: { slot: PoolEventSlot; ids: string[] }[] = []
+    if (triggerIds.length === 0) {
+      for (const slot of [...slots.values()]) {
+        if (slot.client.state === 'online') rounds.push({ slot, ids: [] })
+      }
+    } else {
+      for (const id of triggerIds) {
+        const parts = fromVirtual(id)
+        if (parts === undefined) continue
+        const slot = slots.get(parts.serverId)
+        if (slot === undefined || slot.client.state !== 'online') continue
+        let round = rounds.find((candidate) => candidate.slot === slot)
+        if (round === undefined) {
+          round = { slot, ids: [] }
+          rounds.push(round)
+        }
+        round.ids.push(id)
+      }
+    }
+    if (rounds.length === 0) return
+    summarySyncInFlight = true
+    askingNow = [...triggerIds]
+    for (const round of rounds) {
+      for (const id of round.ids) askAttempts.set(id, (askAttempts.get(id) ?? 0) + 1)
+    }
+    void Promise.all(
+      rounds.map((round) =>
+        round.slot.client
+          .invoke('session', 'list', { _request: {} }, undefined)
+          .then(
+            (value) => ({ round, value, error: undefined as unknown }),
+            (error: unknown) => ({ round, value: undefined, error }),
+          ),
+      ),
+    ).then((results) => {
+      summarySyncInFlight = false
+      if (!alive) return
+      askingNow = []
+      for (const result of results) {
+        if (result.error !== undefined) {
+          recordFailure('session/list', result.error instanceof RelayError ? result.error.code : 'internal')
+          continue
+        }
+        const frames = sessionSummaryAddedFrames(result.value, result.round.slot.serverId)
+        const returned = new Set<string>()
+        for (const frame of frames) {
+          const row = (frame as { args: unknown[] }).args[0]
+          const rowId = isPlainObject(row) && typeof row.sessionId === 'string' ? row.sessionId : undefined
+          if (rowId === undefined) continue
+          returned.add(rowId)
+          if (announced.has(rowId)) continue
+          announced.add(rowId)
+          channel.push(frame)
+          const liveRunning = latestLiveStatus.get(rowId)
+          if (liveRunning !== undefined && liveRunning !== (isPlainObject(row) && row.running === true)) {
+            channel.push({ type: 'emit', event: 'api-session/status', args: [rowId, liveRunning] })
+          }
+        }
+        for (const id of result.round.ids) {
+          if (returned.has(id)) {
+            retryAt.delete(id)
+            continue
+          }
+          const attempts = askAttempts.get(id) ?? 0
+          if (attempts >= MAX_ASK_ATTEMPTS) askedForGood.add(id)
+          else retryAt.set(id, clock.now() + (attempts <= 1 ? ASK_RETRY_FIRST_MS : ASK_RETRY_SECOND_MS))
+        }
+      }
+      scheduleRetry()
+      const queued = midFlightBatches
+      midFlightBatches = []
+      if (queued.length > 0) runSummarySync(queued)
+    })
+  }
+  const handleForwardedBatch = (ids: readonly string[]): void => {
+    if (!ids.some((id) => !announced.has(id) && !askedForGood.has(id) && !retryAt.has(id))) return
+    runSummarySync(ids)
+  }
+  /** T75 per slot: re-push every row's running flag from a fresh snapshot
+   * of THIS server when its serving period starts. */
+  const runStatusSync = (slot: PoolEventSlot): void => {
+    if (!alive) return
+    if (!localOpened) {
+      slot.statusDeferred = true
+      return
+    }
+    if (slot.statusInFlight) {
+      slot.statusPending = true
+      return
+    }
+    if (slot.client.state !== 'online') return
+    slot.statusInFlight = true
+    // The race guard arms here (see the single-server stream): only frames
+    // arriving after this point outrank the snapshot — older records have a
+    // lower seq than startSeq and never block.
+    const startSeq = ++statusSeq
+    void slot.client.invoke('session', 'list', { _request: {} }, undefined).then(
+      (value) => {
+        slot.statusInFlight = false
+        if (!alive) return
+        const rows = isPlainObject(value) && Array.isArray(value.items) ? value.items : []
+        for (const row of rows) {
+          if (!isPlainObject(row) || typeof row.sessionId !== 'string' || row.sessionId === '') continue
+          if ((liveStatusSeq.get(row.sessionId) ?? 0) > startSeq) continue
+          channel.push({
+            type: 'emit',
+            event: 'api-session/status',
+            args: [toVirtual(slot.serverId, row.sessionId), row.running === true],
+          })
+        }
+        if (slot.statusPending) {
+          slot.statusPending = false
+          runStatusSync(slot)
+        }
+      },
+      (error: unknown) => {
+        slot.statusInFlight = false
+        if (!alive) return
+        recordFailure('session/list', error instanceof RelayError ? error.code : 'internal')
+        if (slot.statusPending) {
+          slot.statusPending = false
+          runStatusSync(slot)
+        }
+      },
+    )
+  }
+  /** One slot's fresh serving period: the ask bookkeeping gets another
+   * chance, and this server's rows are re-synced (statuses first). */
+  const noteFirstOnline = (slot: PoolEventSlot): void => {
+    askedForGood.clear()
+    askAttempts.clear()
+    retryAt.clear()
+    latestLiveStatus.clear()
+    if (retryTimer !== undefined) {
+      clock.clearTimeout(retryTimer)
+      retryTimer = undefined
+    }
+    runStatusSync(slot)
+    runSummarySync()
+  }
+
+  const pumpSlot = async (slot: PoolEventSlot): Promise<void> => {
+    try {
+      while (alive && !slot.removed) {
+        if (slot.client.state !== 'online') {
+          await waitAny()
+          continue
+        }
+        const controller = new AbortController()
+        slot.controller = controller
+        try {
+          const stream = slot.client.openStream('$zr', 'events', {}, controller.signal)
+          let served = false
+          for await (const frame of stream) {
+            if (!alive || slot.removed || controller.signal.aborted) break
+            if (!served) {
+              served = true
+              slot.reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+            }
+            const rewritten = rewriteRemoteEventFrame(frame, slot.serverId)
+            if (rewritten === null) continue
+            // T75 race guard + PB-26a live status, exactly as the single
+            // server stream keeps them — keyed by ids that are already
+            // globally unique (virtual or original-then-virtualized).
+            if (isPlainObject(frame) && frame.type === 'emit' && frame.event === 'api-session/status') {
+              const rowId = Array.isArray(frame.args) ? frame.args[0] : undefined
+              if (typeof rowId === 'string' && rowId !== '') liveStatusSeq.set(rowId, ++statusSeq)
+              const args = isPlainObject(rewritten) && Array.isArray(rewritten.args) ? rewritten.args : undefined
+              const virtualId = args?.[0]
+              const running = args?.[1]
+              if (typeof virtualId === 'string' && typeof running === 'boolean') {
+                latestLiveStatus.set(virtualId, running)
+                if (!announced.has(virtualId)) handleForwardedBatch([virtualId])
+              }
+            }
+            const eventId =
+              isPlainObject(rewritten) && typeof rewritten.eventId === 'string' ? rewritten.eventId : undefined
+            if (eventId !== undefined) {
+              if (isPlainObject(frame) && frame.type === 'waterfall') {
+                if (slot.shownEvents.has(eventId)) continue
+                slot.shownEvents.add(eventId)
+              } else if (isPlainObject(frame) && frame.type === 'cancel') {
+                slot.shownEvents.delete(eventId)
+              }
+            }
+            channel.push(rewritten)
+          }
+        } catch (error) {
+          if (alive && !slot.removed && !controller.signal.aborted && signal?.aborted !== true) {
+            recordFailure('$zr/events', error instanceof RelayError ? error.code : 'internal')
+          }
+        } finally {
+          if (slot.controller === controller) slot.controller = undefined
+        }
+        // THIS leg is over — close only ITS prompts. A disconnect is not a
+        // verdict; the reopen re-delivers still-pending events under the
+        // SAME ids (the server prefixes them per subscription, so the
+        // virtual ids differ — DSH shows them fresh, the old cancels already
+        // closed the stale prompts).
+        for (const eventId of slot.shownEvents) channel.push({ type: 'cancel', eventId })
+        slot.shownEvents = new Set()
+        if (!alive || slot.removed) return
+        if (slot.client.state === 'online') {
+          await waitReopen(clock, waitAny, slot.reopenDelayMs)
+          slot.reopenDelayMs = Math.min(slot.reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
+          continue
+        }
+        await waitAny()
+      }
+    } catch (error) {
+      if (alive) log?.('client events remote leg of %s stopped: %s', slot.serverId, messageOf(error))
+    }
+  }
+
+  const scanSlots = (): void => {
+    const seen = new Set<string>()
+    for (const entry of pool.entries()) {
+      const serverId = entry.serverId
+      if (serverId === undefined) continue
+      seen.add(serverId)
+      const existing = slots.get(serverId)
+      if (existing !== undefined) {
+        if (existing.displayName !== entry.displayName) {
+          existing.displayName = entry.displayName
+          noteSlotIdentity(existing)
+        }
+        continue
+      }
+      const slot: PoolEventSlot = {
+        serverId,
+        client: entry.client,
+        controller: undefined,
+        offState: () => {},
+        shownEvents: new Set(),
+        reopenDelayMs: REMOTE_REOPEN_FIRST_MS,
+        removed: false,
+        displayName: entry.displayName,
+        notedIdentity: undefined,
+        stateSeen: undefined,
+        statusInFlight: false,
+        statusPending: false,
+        statusDeferred: false,
+      }
+      slot.offState = slot.client.subscribe((state) => {
+        try {
+          const firstOnline = state === 'online' && slot.stateSeen !== 'online'
+          slot.stateSeen = state
+          if (state === 'unpaired' || state === 'revoked') {
+            slot.controller?.abort()
+            noteSlotIdentity(slot)
+            return
+          }
+          noteSlotIdentity(slot)
+          if (state === 'online' && firstOnline) noteFirstOnline(slot)
+        } catch (error) {
+          log?.('client events merge slot state handler failed on %s: %s', serverId, messageOf(error))
+        } finally {
+          flushWaiters()
+        }
+      })
+      slots.set(serverId, slot)
+      void pumpSlot(slot)
+      // Install into an already-serving server: subscribe replayed nothing.
+      if (slot.client.state === 'online') {
+        slot.stateSeen = 'online'
+        noteSlotIdentity(slot)
+        noteFirstOnline(slot)
+      }
+    }
+    for (const [serverId, slot] of [...slots]) {
+      if (!seen.has(serverId)) {
+        slots.delete(serverId)
+        slot.removed = true
+        slot.offState()
+        slot.controller?.abort()
+        // Only THIS server's pending prompts get the synthesized cancels.
+        for (const eventId of slot.shownEvents) channel.push({ type: 'cancel', eventId })
+        slot.shownEvents.clear()
+      }
+    }
+  }
+
+  const offSyncRequest = deps.summarySync.onForwardedSessionIds(handleForwardedBatch)
+  const offPool = deps.watchPool(() => {
+    try {
+      scanSlots()
+    } catch (error) {
+      log?.('client events merge pool rescan failed: %s', messageOf(error))
+    } finally {
+      flushWaiters()
+    }
+  })
+
+  const onExternalAbort = (): void => {
+    alive = false
+    for (const slot of [...slots.values()]) slot.controller?.abort()
+    flushWaiters()
+    channel.end()
+  }
+  if (signal !== undefined) signal.addEventListener('abort', onExternalAbort)
+
+  scanSlots()
+
+  const localIterator = local[Symbol.asyncIterator]()
+  const pumpLocal = async (): Promise<void> => {
+    try {
+      while (alive) {
+        const result = await localIterator.next()
+        if (result.done === true) break
+        channel.push(result.value)
+        if (!localOpened) {
+          localOpened = true
+          if (deferredRefresh) {
+            deferredRefresh = false
+            channel.push(catalogRefreshFrame())
+          }
+          const pendingBatch = deps.summarySync.consumePendingRequest()
+          if (deferredSummarySync || pendingBatch.length > 0) {
+            deferredSummarySync = false
+            runSummarySync(pendingBatch)
+          }
+          for (const slot of [...slots.values()]) {
+            if (slot.statusDeferred) {
+              slot.statusDeferred = false
+              runStatusSync(slot)
+            }
+          }
+        }
+      }
+    } catch (error) {
+      if (alive) channel.fail(error)
+      return
+    }
+    if (!alive) return
+    alive = false
+    for (const slot of [...slots.values()]) slot.controller?.abort()
+    flushWaiters()
+    channel.end()
+  }
+
+  void pumpLocal()
+  try {
+    while (true) {
+      const result = await channel.next()
+      if (result.done === true) break
+      yield result.value
+    }
+  } finally {
+    alive = false
+    if (retryTimer !== undefined) clock.clearTimeout(retryTimer)
+    offSyncRequest()
+    offPool()
+    if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
+    for (const slot of [...slots.values()]) {
+      slot.removed = true
+      slot.offState()
+      slot.controller?.abort()
+    }
+    slots.clear()
+    flushWaiters()
+    void Promise.resolve(localIterator.return?.(undefined)).catch(() => {})
+  }
+}
+
 /**
  * Install the two own-property wrappers on the raw gateway. Assumes
  * {@link checkGatewayShape} passed (the wiring gates on it) — this function
@@ -2502,8 +3517,22 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
  * that install over deliberately odd shapes.
  */
 export function installIntercept(options: InstallInterceptOptions): InterceptHandle {
-  const { raw, relay, getServerId, log } = options
+  const { raw, log } = options
   const clock = options.clock ?? defaultClock
+  // MS-3: exactly one mode — the pool when given, the single row client
+  // otherwise. Installing with neither is a wiring bug; refuse loudly at
+  // install instead of crashing on the first remote call.
+  const pool = options.pool
+  const relay = options.relay
+  const getServerId = options.getServerId
+  if (pool === undefined && (relay === undefined || getServerId === undefined)) {
+    throw new Error('installIntercept requires either `relay` + `getServerId` (single server) or `pool`')
+  }
+  // The single-server facts, proven present by the check above. The
+  // single-server code paths read THESE (never the optional originals), so
+  // the old behavior stays byte-identical without a narrowing dance.
+  const singleRelay = relay as RelayClient
+  const singleGetServerId = getServerId as () => string | undefined
   // T63: the summary-sync hub shared by the merged streams — the workspace
   // route nudges, the events leg fetches-and-announces. One per install: it
   // outlives individual stream generations so a nudge from a workspace leg
@@ -2512,6 +3541,17 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // PB-25b: the inventory slot factory (the wiring's union feed) — passed
   // down to every merged stream, which owns one slot for its lifetime.
   const createSessionInventorySlot = options.createSessionInventorySlot
+  // MS-3: the pool-event hub behind handle.notePoolEvent() — the wiring
+  // forwards the pool's onStateChange/onServerRemoved callbacks here, and
+  // every live merged stream (plus the pool-mode catalog watcher below)
+  // re-scans on the broadcast.
+  const poolListeners = new Set<() => void>()
+  const watchPool = (fn: () => void): (() => void) => {
+    poolListeners.add(fn)
+    return () => {
+      poolListeners.delete(fn)
+    }
+  }
   // T62: the current-session getter and the live-merged-stream listener
   // registry behind handle.currentSessionChanged().
   const getCurrentSession = options.getCurrentSession ?? (() => ({ kind: 'unavailable' }) as const)
@@ -2567,6 +3607,12 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     if (generation !== catalogGeneration) return
     serverCatalogCache = { identity, value }
   }
+  /** MS-3 pool mode: the per-server form of the same cache — one entry per
+   * known `serverId`, keyed by it. An offline entry keeps serving its cache
+   * (the groups must not go blank mid-outage); an entry that LEAVES the pool
+   * takes its cache with it (its groups must not outlive the pairing). */
+  const serverCatalogCaches = new Map<string, { identity: MergerIdentity; value: unknown }>()
+  const catalogGenerations = new Map<string, number>()
   /** One server-catalog fetch whose answer only feeds the cache (T52-fix2):
    * the proactive pull that runs as soon as the relay serves — and once at
    * install when the relay already serves (subscribe replays no state —
@@ -2576,9 +3622,26 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * user-visible path and answers local-only there). */
   const fetchServerCatalog = (identity: MergerIdentity): void => {
     const generation = catalogGeneration
-    void relay.invoke('session', 'modelCatalog', {}, undefined).then(
+    void singleRelay.invoke('session', 'modelCatalog', {}, undefined).then(
       (value) => {
         rememberServerCatalog(identity, value, generation)
+      },
+      (error: unknown) => {
+        recordFailure('session/modelCatalog', error instanceof RelayError ? error.code : 'internal')
+      },
+    )
+  }
+  /** MS-3 pool mode: the per-server proactive fetch. The identity's display
+   * name is the POOL's (the `-1`/`-2` disambiguated one) — it titles the
+   * merged catalog's virtual groups. Generation-guarded per server, like
+   * the single-server fetch above. */
+  const fetchServerCatalogFor = (entry: { serverId: string; displayName: string; client: RelayClient }): void => {
+    const serverId = entry.serverId
+    const generation = catalogGenerations.get(serverId) ?? 0
+    void entry.client.invoke('session', 'modelCatalog', {}, undefined).then(
+      (value) => {
+        if ((catalogGenerations.get(serverId) ?? 0) !== generation) return
+        serverCatalogCaches.set(serverId, { identity: { serverId, serverName: entry.displayName }, value })
       },
       (error: unknown) => {
         recordFailure('session/modelCatalog', error instanceof RelayError ? error.code : 'internal')
@@ -2597,28 +3660,73 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // contained: the sync body cannot throw, and the fetch settles through
   // .then/.catch above.
   let offCatalogWatch: (() => void) | undefined
-  try {
-    offCatalogWatch = relay.subscribe((state) => {
-      if (state === 'unpaired' || state === 'revoked') {
-        catalogGeneration += 1
-        serverCatalogCache = undefined
-        return
+  if (pool === undefined) {
+    try {
+      offCatalogWatch = singleRelay.subscribe((state) => {
+        if (state === 'unpaired' || state === 'revoked') {
+          catalogGeneration += 1
+          serverCatalogCache = undefined
+          return
+        }
+        if (state !== 'online') return
+        const identity = relayIdentityOf(singleRelay)
+        if (identity !== undefined) fetchServerCatalog(identity)
+      })
+      // Install into an already-serving relay: subscribe replayed nothing, so
+      // the transition-based fetch would wait for the NEXT flap — fill the
+      // cache now instead (T52-fix3).
+      if (singleRelay.state === 'online') {
+        const identity = relayIdentityOf(singleRelay)
+        if (identity !== undefined) fetchServerCatalog(identity)
       }
-      if (state !== 'online') return
-      const identity = relayIdentityOf(relay)
-      if (identity !== undefined) fetchServerCatalog(identity)
-    })
-    // Install into an already-serving relay: subscribe replayed nothing, so
-    // the transition-based fetch would wait for the NEXT flap — fill the
-    // cache now instead (T52-fix3).
-    if (relay.state === 'online') {
-      const identity = relayIdentityOf(relay)
-      if (identity !== undefined) fetchServerCatalog(identity)
+    } catch (error) {
+      // Subscription failed: the cache still fills whenever the UI opens a
+      // dropdown (the route's own fetch), only later.
+      log?.('client catalog watcher unavailable: %s', messageOf(error))
     }
-  } catch (error) {
-    // Subscription failed: the cache still fills whenever the UI opens a
-    // dropdown (the route's own fetch), only later.
-    log?.('client catalog watcher unavailable: %s', messageOf(error))
+  } else {
+    // MS-3 pool mode: one watcher per entry, rescanned on every pool event.
+    // `unpaired` / `revoked` drop THAT server's cache and bump its
+    // generation; `online` proactively refetches it (an entry appearing
+    // already online is fetched at attach, same as the single-server
+    // install-into-online above).
+    const catalogWatched = new Map<string, () => void>()
+    offCatalogWatch = watchPool(() => {
+      const seen = new Set<string>()
+      for (const entry of pool.entries()) {
+        seen.add(entry.entryId)
+        if (catalogWatched.has(entry.entryId)) continue
+        const unsubscribe = entry.client.subscribe((state) => {
+          // The entry's serverId is read LIVE — a re-handshake may have
+          // renamed it since this listener attached.
+          const live = pool.entries().find((candidate) => candidate.entryId === entry.entryId)
+          const serverId = live?.serverId
+          if (serverId === undefined) return
+          if (state === 'unpaired' || state === 'revoked') {
+            catalogGenerations.set(serverId, (catalogGenerations.get(serverId) ?? 0) + 1)
+            serverCatalogCaches.delete(serverId)
+            return
+          }
+          if (state !== 'online') return
+          const current = live ?? entry
+          if (current.serverId !== undefined) {
+            fetchServerCatalogFor({ serverId: current.serverId, displayName: current.displayName, client: current.client })
+          }
+        })
+        catalogWatched.set(entry.entryId, unsubscribe)
+        if (entry.client.state === 'online' && entry.serverId !== undefined) {
+          fetchServerCatalogFor({ serverId: entry.serverId, displayName: entry.displayName, client: entry.client })
+        }
+      }
+      for (const [entryId, unsubscribe] of [...catalogWatched]) {
+        if (!seen.has(entryId)) {
+          unsubscribe()
+          catalogWatched.delete(entryId)
+        }
+      }
+    })
+    // Run the initial scan through the hub so the same rescan logic runs.
+    for (const listener of [...poolListeners]) listener()
   }
   const registerClosed = (sessionId: string, reason: ClosedSessionRecord['reason']): void => {
     closedSessions.delete(sessionId)
@@ -2695,26 +3803,42 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   }
 
   /**
-   * The shared validation both routes apply before forwarding: the relay
-   * client must have completed a handshake (else `remote-offline` — nothing
-   * is connected yet, which is not the same as being pointed at the wrong
-   * server), every virtual id in the call must belong to ONE server, and to
-   * the server the handshake named (`remote-mismatch`); the method must be
-   * in the table (`remote-unsupported`). A refusal is recorded once, here,
-   * by the caller passing it through {@link failEnvelope}.
+   * The shared validation both routes apply before forwarding — now (MS-3)
+   * resolving the TARGET SERVER as well as the call's shape. The single
+   * `relay` mode keeps the original verdict order byte-for-byte (offline →
+   * mismatch → unsupported); pool mode routes by the virtual id's serverId:
+   * no handshook server in the pool answers `remote-offline`, a handshook
+   * pool without the target server answers `remote-mismatch`, and the
+   * matched entry's client is the forwarding leg. A refusal is recorded
+   * once, here, by the caller passing it through {@link failEnvelope}.
    */
-  type Verdict = { ok: true; serverId: string } | { ok: false; code: string; message: string }
+  const OFFLINE_MESSAGE = '尚未连接到服务端'
+  const MISMATCH_MESSAGE = '此远程会话属于其他主服务端'
+  type Verdict = { ok: true; client: RelayClient; serverId: string } | { ok: false; code: string; message: string }
   function validate(endpoint: string, virtuals: VirtualParts[]): Verdict {
     const first = virtuals[0].serverId
-    const current = getServerId()
-    if (current === undefined) return { ok: false, code: 'remote-offline', message: '尚未连接到服务端' }
-    if (virtuals.some((parts) => parts.serverId !== first) || current !== first) {
-      return { ok: false, code: 'remote-mismatch', message: '此远程会话属于其他主服务端' }
+    if (pool === undefined) {
+      const current = singleGetServerId()
+      if (current === undefined) return { ok: false, code: 'remote-offline', message: OFFLINE_MESSAGE }
+      if (virtuals.some((parts) => parts.serverId !== first) || current !== first) {
+        return { ok: false, code: 'remote-mismatch', message: MISMATCH_MESSAGE }
+      }
+      if (CLIENT_METHOD_FIELDS[endpoint] === undefined) {
+        return { ok: false, code: 'remote-unsupported', message: '此功能暂不支持远程会话' }
+      }
+      return { ok: true, client: singleRelay, serverId: first }
     }
+    if (virtuals.some((parts) => parts.serverId !== first)) {
+      return { ok: false, code: 'remote-mismatch', message: MISMATCH_MESSAGE }
+    }
+    const known = pool.entries().filter((entry) => entry.serverId !== undefined)
+    if (known.length === 0) return { ok: false, code: 'remote-offline', message: OFFLINE_MESSAGE }
+    const target = known.find((entry) => entry.serverId === first)
+    if (target === undefined) return { ok: false, code: 'remote-mismatch', message: MISMATCH_MESSAGE }
     if (CLIENT_METHOD_FIELDS[endpoint] === undefined) {
       return { ok: false, code: 'remote-unsupported', message: '此功能暂不支持远程会话' }
     }
-    return { ok: true, serverId: first }
+    return { ok: true, client: target.client, serverId: first }
   }
 
   /**
@@ -2742,7 +3866,18 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       )
     }
     const endpoint = '$events/result'
-    const current = getServerId()
+    const route = ((): { client: RelayClient } | 'offline' | 'missing' | 'mismatch' => {
+      if (pool === undefined) {
+        const current = singleGetServerId()
+        if (current === undefined || singleRelay.state !== 'online') return 'offline'
+        if (virtual.serverId !== current) return 'mismatch'
+        return { client: singleRelay }
+      }
+      const target = pool.getByServerId(virtual.serverId)
+      if (target === undefined) return 'missing'
+      if (target.client.state !== 'online') return 'offline'
+      return { client: target.client }
+    })()
     // Offline (T34-fix): a refusal envelope would RESTART the UI's whole
     // `$events` generation — the client face's answer() throws on a
     // `!response.ok` body and the pump treats that as a delivery failure
@@ -2751,15 +3886,25 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // synthesized cancels the dying leg already sent have closed these
     // prompts anyway. Answer the silent ok DSH itself gives a stale result,
     // and record the refusal in the diagnostics ring instead — the
-    // non-online write-refusal message, so the banner's word matches.
-    if (current === undefined || relay.state !== 'online') {
+    // non-online write-refusal message, so the banner's word matches. In
+    // pool mode a leg the pool no longer serves (`missing` — unpaired away,
+    // deduped, never paired) reads the same way: nothing can settle those
+    // events anymore, so the silent ok wins there too. The single-server
+    // mismatch keeps its original REFUSAL envelope (wrong server is a
+    // different fact from a leg that just left).
+    if (route === 'offline') {
       failEnvelope(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
       return { ok: true, value: undefined }
     }
-    if (virtual.serverId !== current) return failEnvelope(endpoint, 'remote-mismatch', '此远程会话属于其他主服务端')
+    if (route === 'missing') {
+      failEnvelope(endpoint, 'remote-mismatch', MISMATCH_MESSAGE)
+      return { ok: true, value: undefined }
+    }
+    if (route === 'mismatch') return failEnvelope(endpoint, 'remote-mismatch', MISMATCH_MESSAGE)
+    const client = route.client
     return (async (): Promise<DispatchEnvelope> => {
       try {
-        await relay.postEventResult(virtual.id, isPlainObject(args) ? args.outcome : undefined, signal)
+        await client.postEventResult(virtual.id, isPlainObject(args) ? args.outcome : undefined, signal)
         return { ok: true, value: undefined }
       } catch (error) {
         const code = error instanceof RelayError ? error.code : 'internal'
@@ -2802,11 +3947,13 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // A WRITE while the relay is not serving (T34, whitelist rule per
     // T34-fix): refused here, never sent — the call could only fail out
     // there, and the read paths answer for themselves (forwarded as today,
-    // failing with their own transport error).
-    if (isRemoteWrite(endpoint) && relay.state !== 'online') {
+    // failing with their own transport error). Pool mode (MS-3): the verdict
+    // names the TARGET leg — its state is the one that counts.
+    if (isRemoteWrite(endpoint) && verdict.client.state !== 'online') {
       return failEnvelope(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
     }
     const serverId = verdict.serverId
+    const client = verdict.client
     const slash = endpoint.indexOf('/')
     const namespace = slash === -1 ? endpoint : endpoint.slice(0, slash)
     const method = slash === -1 ? '' : endpoint.slice(slash + 1)
@@ -2834,7 +3981,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       if (!references.ok) {
         return failEnvelope(endpoint, 'remote-unsupported', '引用的会话不在服务端上，无法转发')
       }
-      const value = await relay.invoke(namespace, method, clone, signal)
+      const value = await client.invoke(namespace, method, clone, signal)
       // The session answered: any closed-session entry for it is stale
       // (re-shared and served again) — the banner may go.
       clearClosed(virtuals)
@@ -2897,20 +4044,20 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * can never reach us (subscribe's contract keeps listener faults contained
    * on the client side).
    */
-  function waitForOnline(signal: AbortSignal | undefined): Promise<ServeWait> {
+  function waitForOnline(client: RelayClient, signal: AbortSignal | undefined): Promise<ServeWait> {
     return new Promise<ServeWait>((resolve) => {
       if (signal?.aborted === true) {
         resolve('aborted')
         return
       }
-      if (relay.state === 'online') {
+      if (client.state === 'online') {
         resolve('online')
         return
       }
       // The wall may already be down when the wait starts (the leg died and
       // the state flipped before this call) — same verdict as below.
-      if (relay.state === 'revoked' || relay.state === 'unpaired') {
-        resolve(relay.state)
+      if (client.state === 'revoked' || client.state === 'unpaired') {
+        resolve(client.state)
         return
       }
       let off: (() => void) | undefined
@@ -2922,7 +4069,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         resolve(verdict)
       }
       const onAbort = (): void => settle('aborted')
-      off = relay.subscribe((state) => {
+      off = client.subscribe((state) => {
         if (state === 'online') settle('online')
         else if (state === 'revoked' || state === 'unpaired') settle(state)
       })
@@ -2955,14 +4102,14 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * current backoff step. `aborted` only on caller abort; `revoked` /
    * `unpaired` when the pairing wall came down (CP5).
    */
-  async function waitServeAgain(signal: AbortSignal | undefined, backoffMs: number): Promise<ServeWait> {
-    if (relay.state === 'online') {
+  async function waitServeAgain(client: RelayClient, signal: AbortSignal | undefined, backoffMs: number): Promise<ServeWait> {
+    if (client.state === 'online') {
       await delayWait(signal, backoffMs)
       if (signal?.aborted === true) return 'aborted'
-      if (relay.state !== 'online') return waitForOnline(signal)
+      if (client.state !== 'online') return waitForOnline(client, signal)
       return 'online'
     }
-    return waitForOnline(signal)
+    return waitForOnline(client, signal)
   }
 
   /**
@@ -3007,6 +4154,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    */
   async function* rewriteUpstream(
     endpoint: string,
+    client: RelayClient,
     upstream: AsyncIterable<unknown>,
     serverId: string,
     claimed: VirtualParts[],
@@ -3103,7 +4251,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         if (!SESSION_STREAM_HOLD_ENDPOINTS.has(endpoint)) {
           throw new CodedStreamError(code, messageOf(error))
         }
-        const serve = await waitServeAgain(signal, reopenDelayMs)
+        const serve = await waitServeAgain(client, signal, reopenDelayMs)
         if (serve === 'aborted') return
         // The pairing wall came down while held (CP5): no ladder climbs back
         // from `revoked`/`unpaired` — only the settings page can — so the
@@ -3131,6 +4279,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * virtualized session ids. Paged requests, an offline relay, a non-ok local
    * envelope and a failed remote call all answer the local result untouched —
    * only a remote failure is recorded.
+   *
+   * MS-3 pool mode: EVERY online server's first page is fetched
+   * concurrently and folded in `pool.entries()` order (pairing order), one
+   * `mergeSessionList` per server. A failing leg is recorded and skipped —
+   * the other servers' rows still merge.
    */
   async function mergedSessionListCall(
     endpoint: string,
@@ -3151,10 +4304,31 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // Only the first page merges: a cursor pages the local list alone.
     const request = isPlainObject(args) ? args._request : undefined
     if (isPlainObject(request) && request.cursor !== undefined) return localEnvelope
-    const identity = relayIdentityOf(relay)
-    if (identity === undefined || relay.state !== 'online') return localEnvelope
+    if (pool !== undefined) {
+      const online = pool.entries().filter((entry) => entry.serverId !== undefined && entry.client.state === 'online')
+      if (online.length === 0) return localEnvelope
+      const settled = await Promise.all(
+        online.map((entry) =>
+          entry.client.invoke('session', 'list', isPlainObject(args) ? args : {}, signal).then(
+            (value) => ({ ok: true as const, value, serverId: entry.serverId as string }),
+            (error: unknown) => ({ ok: false as const, error, serverId: entry.serverId as string }),
+          ),
+        ),
+      )
+      let value = localEnvelope.value
+      for (const result of settled) {
+        if (!result.ok) {
+          recordFailure(endpoint, result.error instanceof RelayError ? result.error.code : 'internal')
+          continue
+        }
+        value = mergeSessionList(value, result.value, result.serverId)
+      }
+      return { ok: true, value }
+    }
+    const identity = relayIdentityOf(singleRelay)
+    if (identity === undefined || singleRelay.state !== 'online') return localEnvelope
     try {
-      const remote = await relay.invoke('session', 'list', isPlainObject(args) ? args : {}, signal)
+      const remote = await singleRelay.invoke('session', 'list', isPlainObject(args) ? args : {}, signal)
       return { ok: true, value: mergeSessionList(localEnvelope.value, remote, identity.serverId) }
     } catch (error) {
       recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
@@ -3197,8 +4371,52 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     )) as unknown
     // A local failure is the answer — there is nothing to merge into.
     if (!isPlainObject(localEnvelope) || localEnvelope.ok !== true) return localEnvelope
-    const identity = relayIdentityOf(relay)
-    if (identity !== undefined && relay.state === 'online') {
+    if (pool !== undefined) {
+      // MS-3: every PAIRED server contributes its own groups, folded in
+      // pairing order; each server's last fetched catalog is cached by its
+      // serverId so an offline server keeps its groups while the online ones
+      // refetch. A cache whose server left the pool dies with the entry.
+      const entries = pool.entries().filter((entry) => entry.serverId !== undefined)
+      if (entries.length === 0) return localEnvelope
+      const online = entries.filter((entry) => entry.client.state === 'online')
+      const settled =
+        online.length === 0
+          ? []
+          : await Promise.all(
+              online.map((entry) =>
+                entry.client.invoke('session', 'modelCatalog', {}, signal).then(
+                  (value) => ({ ok: true as const, value, serverId: entry.serverId as string }),
+                  (error: unknown) => ({ ok: false as const, error, serverId: entry.serverId as string }),
+                ),
+              ),
+            )
+      const resultsByServer = new Map(settled.map((result) => [result.serverId, result]))
+      let acc = localEnvelope.value
+      for (const entry of entries) {
+        const serverId = entry.serverId as string
+        const identity: MergerIdentity = { serverId, serverName: entry.displayName }
+        const result = resultsByServer.get(serverId)
+        if (result === undefined) {
+          const cached = serverCatalogCaches.get(serverId)
+          if (cached !== undefined) acc = mergeModelCatalogs(acc, cached.value, cached.identity)
+          continue
+        }
+        if (!result.ok) {
+          recordFailure(endpoint, result.error instanceof RelayError ? result.error.code : 'internal')
+          const cached = serverCatalogCaches.get(serverId)
+          if (cached !== undefined) acc = mergeModelCatalogs(acc, cached.value, cached.identity)
+          continue
+        }
+        serverCatalogCaches.set(serverId, { identity, value: result.value })
+        acc = mergeModelCatalogs(acc, result.value, identity)
+      }
+      for (const serverId of [...serverCatalogCaches.keys()]) {
+        if (!entries.some((entry) => entry.serverId === serverId)) serverCatalogCaches.delete(serverId)
+      }
+      return { ok: true, value: acc }
+    }
+    const identity = relayIdentityOf(singleRelay)
+    if (identity !== undefined && singleRelay.state === 'online') {
       try {
         // The method has NO parameters (RT lib/typert.remote-client.js:1019) —
         // the relay route allows it field-less (relay-access.ts), filters the
@@ -3209,7 +4427,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         // the counter and the answer never re-enters the cache — the caller
         // still gets its (live) answer, it asked while the link served.
         const generation = catalogGeneration
-        const remote = await relay.invoke('session', 'modelCatalog', {}, signal)
+        const remote = await singleRelay.invoke('session', 'modelCatalog', {}, signal)
         rememberServerCatalog(identity, remote, generation)
         return { ok: true, value: mergeModelCatalogs(localEnvelope.value, remote, identity) }
       } catch (error) {
@@ -3219,7 +4437,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     }
     // Not serving normally. A pairing wall is a verdict about the server
     // itself — its groups must not outlive it.
-    if (relay.state === 'unpaired' || relay.state === 'revoked') {
+    if (singleRelay.state === 'unpaired' || singleRelay.state === 'revoked') {
       serverCatalogCache = undefined
       return localEnvelope
     }
@@ -3280,10 +4498,19 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     if (sessionParts === undefined) {
       return { code: 'remote-unsupported', message: '该模型分组属于远程服务端，无法在本机会话中使用' }
     }
-    if (getServerId() !== sessionParts.serverId) return undefined
+    // MS-3: the session's server is looked up in the POOL (by the virtual
+    // id's serverId); a pool without that server falls through to the
+    // generic path's verdict (offline / mismatch). The message names the
+    // pool's display name — the same `-1`/`-2` disambiguated one the merged
+    // catalog groups are titled with.
+    const displayName = ((): string | undefined => {
+      if (pool !== undefined) return pool.getByServerId(sessionParts.serverId)?.displayName
+      if (singleGetServerId() !== sessionParts.serverId) return undefined
+      return relayIdentityOf(singleRelay)?.serverName
+    })()
+    if (displayName === undefined) return undefined
     if (providerParts === undefined) {
-      const serverName = relayIdentityOf(relay)?.serverName ?? '服务端'
-      return { code: 'remote-unsupported', message: `请选择「${serverName} · …」分组里的模型` }
+      return { code: 'remote-unsupported', message: `请选择「${displayName} · …」分组里的模型` }
     }
     if (providerParts.serverId !== sessionParts.serverId) {
       return { code: 'remote-mismatch', message: '此模型分组属于其他主服务端' }
@@ -3379,7 +4606,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       return (async (): Promise<unknown> => {
         const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control, uplinkWindow)
         if (!isAsyncIterable(local)) return local
-        return mergedEventsStream({ local, relay, signal, recordFailure, log, clock, summarySync })
+        if (pool !== undefined) {
+          return mergedEventsStreamMulti({ local, pool, signal, recordFailure, log, clock, summarySync, watchPool })
+        }
+        return mergedEventsStream({ local, relay: singleRelay, signal, recordFailure, log, clock, summarySync })
       })()
     }
     const args = argsOf(payload)
@@ -3414,12 +4644,31 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           // it); the remote leg carries no uplink.
           const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control, uplinkWindow)
           if (!isAsyncIterable(local)) return local
+          if (pool !== undefined) {
+            return mergedGlobalStreamMulti({
+              endpoint,
+              namespace,
+              method,
+              local,
+              pool,
+              signal,
+              recordFailure,
+              log,
+              clock,
+              getCurrentSession,
+              watchCurrentSession,
+              watchUninstall,
+              summarySync,
+              createSessionInventorySlot,
+              watchPool,
+            })
+          }
           return mergedGlobalStream({
             endpoint,
             namespace,
             method,
             local,
-            relay,
+            relay: singleRelay,
             signal,
             recordFailure,
             log,
@@ -3428,7 +4677,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             watchCurrentSession,
             watchUninstall,
             summarySync,
-            createSessionInventorySlot,
+            ...(createSessionInventorySlot !== undefined
+              ? { createSessionInventorySlot: () => createSessionInventorySlot(undefined) }
+              : {}),
           })
         })()
       }
@@ -3449,8 +4700,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // T34 rule applied to the stream route): `terminal/follow` is the one
     // write-shaped STREAM in the table — its attachment takes over the
     // terminal's input control — so opening it into a dead link must refuse
-    // here, exactly like every other mutation.
-    if (isRemoteWrite(endpoint) && relay.state !== 'online') {
+    // here, exactly like every other mutation. MS-3: the TARGET leg's state
+    // is the one that counts.
+    if (isRemoteWrite(endpoint) && verdict.client.state !== 'online') {
       throwRecorded(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
     }
     // The multiplexed wire channel ALWAYS hands us an UplinkInbox here —
@@ -3460,6 +4712,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // would reject every remote stream the UI opens.
     releaseUplink(uplink)
     const serverId = verdict.serverId
+    const client = verdict.client
     const slash = endpoint.indexOf('/')
     const namespace = slash === -1 ? endpoint : endpoint.slice(0, slash)
     const method = slash === -1 ? '' : endpoint.slice(slash + 1)
@@ -3475,7 +4728,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // through the outage and reopens the leg when the relay serves again
       // (CP4); every other endpoint's first read fails out with the original
       // code (CP5 scope, the pre-CP4 behavior).
-      upstream = relay.openStream(namespace, method, clone, signal)
+      upstream = client.openStream(namespace, method, clone, signal)
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
       throwRecorded(endpoint, code, messageOf(error))
@@ -3489,8 +4742,8 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // the endpoints OUTSIDE the list end with the original code at once,
     // their consumers rendering a clean end as a terminal (CP5,
     // SESSION_STREAM_HOLD_ENDPOINTS).
-    return rewriteUpstream(endpoint, upstream, serverId, virtuals, signal, () =>
-      relay.openStream(namespace, method, clone, signal),
+    return rewriteUpstream(endpoint, client, upstream, serverId, virtuals, signal, () =>
+      client.openStream(namespace, method, clone, signal),
     )
   }
 
@@ -3543,6 +4796,12 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     nudgeSummarySync(ids: readonly string[]) {
       const virtualIds = ids.filter((id) => typeof id === 'string' && id !== '' && isVirtual(id))
       if (virtualIds.length > 0) summarySync.noteForwardedSessionIds(virtualIds)
+    },
+    notePoolEvent() {
+      // MS-3: broadcast to every pool watcher — the live merged streams'
+      // re-scans and the pool-mode catalog watcher (already registered as
+      // one of the listeners in pool mode). No-op in single-server mode.
+      for (const listener of [...poolListeners]) listener()
     },
   }
 }

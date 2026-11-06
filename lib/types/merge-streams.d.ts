@@ -178,6 +178,25 @@ export interface WorkspaceMergerOptions extends MergerIdentity {
      * rewrite never mutates merge state). */
     onKnownSessions?: (ids: ReadonlySet<string>) => void;
 }
+/** The lists a workspace merger contributes to the MS-3 multi-server
+ * composition: the locally observed truth (identical across every slot fed
+ * the same local stream) and this server's virtualized remote contribution
+ * (shown workspaces in remote order, archived = remote archived + the T58
+ * hidden closed sessions, pinned). Snapshots — the caller may mutate them
+ * freely; nothing here hands out a live reference. */
+export interface WorkspaceMergerParts {
+    local: {
+        orderIds: string[];
+        archivedIds: string[];
+        pinnedIds: string[];
+    };
+    remote: {
+        orderIds: string[];
+        archivedIds: string[];
+        pinnedIds: string[];
+        workspaces: Record<string, unknown>[];
+    };
+}
 export interface WorkspaceMerger {
     readonly serverId: string;
     readonly serverName: string;
@@ -231,6 +250,13 @@ export interface WorkspaceMerger {
      * for a serverId change the remote state must be gone first (onRemoteGone
      * first); for a rename it may stay. */
     retarget(identity: MergerIdentity): void;
+    /** MS-3: the composition inputs the multi-server orchestrator builds the
+     * canonical merged frames from — the locally observed lists and this
+     * server's virtualized remote contribution, as snapshots. Reading the
+     * workspaces runs the same {@link forwardVisible} visibility gate the
+     * frame paths use (T56/T58), so the parts can never expose a group the
+     * frames would withhold. */
+    parts(): WorkspaceMergerParts;
 }
 /**
  * The workspace/follow merger. Remote state is a Map keyed by the ORIGINAL
@@ -434,4 +460,50 @@ export declare function virtualSessionIdsInWorkspaceFrames(frames: readonly unkn
  * remote result means "the server said nothing" — no frames.
  */
 export declare function sessionSummaryAddedFrames(remoteResult: unknown, serverId: string): unknown[];
+/** The cumulative LOCAL lists one workspace merger's `local` side holds. */
+export interface LocalWorkspaceLists {
+    orderIds: string[];
+    archivedIds: string[];
+    pinnedIds: string[];
+}
+/**
+ * MS-3: fold one LOCAL `workspace/follow` frame into the orchestrator's
+ * cumulative local lists — the baseline replaces all three, `order` /
+ * `archived` / `pinned` each replace their own list, and every other frame
+ * (upsert / remove / junk) observes nothing. The parsing is the merger's own
+ * `observeLocal` reading, extracted so the multi-server orchestrator keeps
+ * the same truth WITHOUT a second shape definition drifting away from it.
+ */
+export declare function localWorkspaceLists(frame: unknown, current: LocalWorkspaceLists): LocalWorkspaceLists;
+/** One slot's remote contribution for {@link composeMergedWorkspaceFrames}
+ * — the `remote` half of {@link WorkspaceMergerParts}. */
+export interface RemoteWorkspaceContribution {
+    orderIds: string[];
+    archivedIds: string[];
+    pinnedIds: string[];
+    workspaces: Record<string, unknown>[];
+}
+/**
+ * MS-3: the canonical merged frames over N servers — local first, then each
+ * server's contribution in the given (pairing) order. The order list is
+ * plain concatenation, the archived set is DEDUPLICATED in that order (the
+ * single-server merger dedupes the same way), and pinned concatenates (the
+ * single-server pinned frame never deduped either). With no remotes the
+ * frames collapse to the local-only form.
+ */
+export declare function composeMergedWorkspaceFrames(local: LocalWorkspaceLists, remotes: readonly RemoteWorkspaceContribution[]): {
+    order: {
+        type: 'order';
+        workspaceIds: string[];
+    };
+    archived: {
+        type: 'archived';
+        archivedSessionIds: string[];
+    };
+    pinned: {
+        type: 'pinned';
+        pinnedSessionIds: string[];
+    };
+    workspaces: Record<string, unknown>[];
+};
 //# sourceMappingURL=merge-streams.d.ts.map

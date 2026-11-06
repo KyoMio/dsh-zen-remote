@@ -79,6 +79,7 @@
  *   generation (client face: pumpEvents aborts on answer failures).
  */
 import type { RelayClient, RelayClock } from './relay-client.js';
+import type { RelayPool } from './relay-pool.js';
 import type { GatewayShapeCheck } from './intercept-shape.js';
 import { type ResultAttachment } from './invoke-binary.js';
 /** The session-locating argument fields, as registered per method. Identical
@@ -286,12 +287,21 @@ export interface InstallInterceptOptions {
     /** The RAW gateway instance (`ctx.typertGateway[symbols.original]`), not
      * the cordis proxy — own properties on the proxy are ignored by everyone. */
     raw: object;
-    /** The client relay client (T23a) the calls travel through. */
-    relay: RelayClient;
-    /** The CURRENT handshake's server id, read live per call; `undefined`
-     * (never handshook) makes every remote call a `remote-offline` — a
-     * different fact from pointing at the wrong server (`remote-mismatch`). */
-    getServerId: () => string | undefined;
+    /** SINGLE-SERVER mode (the original wiring, kept for compatibility): the
+     * one client relay client the calls travel through. Either this +
+     * {@link getServerId}, or {@link pool} — never required together. */
+    relay?: RelayClient;
+    /** SINGLE-SERVER mode: the CURRENT handshake's server id, read live per
+     * call; `undefined` (never handshook) makes every remote call a
+     * `remote-offline` — a different fact from pointing at the wrong server
+     * (`remote-mismatch`). */
+    getServerId?: () => string | undefined;
+    /** MS-3 POOL mode: the multi-server relay pool (up to
+     * `MAX_PAIRED_SERVERS` paired servers). When present it replaces the
+     * single-relay routing: every call/stream/event routes by the virtual
+     * id's `serverId` to the matching pool entry, and the three global reads
+     * plus the model catalog merge ALL paired servers in pairing order. */
+    pool?: RelayPool;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
     /** Clock/timers for the merged streams' reopen backoff (CP4); defaults to
@@ -309,10 +319,12 @@ export interface InstallInterceptOptions {
     /** PB-25b: the inventory slot factory — one slot per merged global stream
      * (only the workspace merger ever reports; the control merger has no
      * session inventory). The wiring unions the live slots' shares into the
-     * set the plugin-route rewrite reads. Absent: no shares are ever reported
-     * and the plugin-route value scan stays exactly the request-local
-     * behavior. */
-    createSessionInventorySlot?: () => SessionInventorySlot;
+     * set the plugin-route rewrite consults. MS-3: the factory receives the
+     * slot's `serverId`, so a pool wiring can keep per-server inventories
+     * (the plain single-server wiring can ignore the argument). Absent: no
+     * shares are ever reported and the plugin-route value scan stays exactly
+     * the request-local behavior. */
+    createSessionInventorySlot?: (serverId?: string) => SessionInventorySlot;
 }
 export interface InterceptHandle {
     /** Remove both own properties, restoring exactly what was installed over
@@ -343,6 +355,13 @@ export interface InterceptHandle {
      * entries are dropped; a batch with nothing left is a no-op. Reaches every
      * live merged `$events` stream, and the pending slot when none is open. */
     nudgeSummarySync(ids: readonly string[]): void;
+    /** MS-3 (pool mode only meaningful, harmless otherwise): the pool's entry
+     * set or any entry's identity moved — the wiring forwards the pool's
+     * `onServerRemoved` / `onStateChange` callbacks here. Every live merged
+     * stream re-scans `pool.entries()` NOW: slots for removed entries leave
+     * (only THAT server's shown groups and pending events are torn down),
+     * slots for new entries start, and renames re-title the groups. */
+    notePoolEvent(): void;
 }
 /** Rewrite one stream frame's session ids to virtual form. */
 export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown;

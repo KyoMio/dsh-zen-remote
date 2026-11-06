@@ -234,6 +234,22 @@ export interface WorkspaceMergerOptions extends MergerIdentity {
   onKnownSessions?: (ids: ReadonlySet<string>) => void
 }
 
+/** The lists a workspace merger contributes to the MS-3 multi-server
+ * composition: the locally observed truth (identical across every slot fed
+ * the same local stream) and this server's virtualized remote contribution
+ * (shown workspaces in remote order, archived = remote archived + the T58
+ * hidden closed sessions, pinned). Snapshots — the caller may mutate them
+ * freely; nothing here hands out a live reference. */
+export interface WorkspaceMergerParts {
+  local: { orderIds: string[]; archivedIds: string[]; pinnedIds: string[] }
+  remote: {
+    orderIds: string[]
+    archivedIds: string[]
+    pinnedIds: string[]
+    workspaces: Record<string, unknown>[]
+  }
+}
+
 export interface WorkspaceMerger {
   readonly serverId: string
   readonly serverName: string
@@ -287,6 +303,13 @@ export interface WorkspaceMerger {
    * for a serverId change the remote state must be gone first (onRemoteGone
    * first); for a rename it may stay. */
   retarget(identity: MergerIdentity): void
+  /** MS-3: the composition inputs the multi-server orchestrator builds the
+   * canonical merged frames from — the locally observed lists and this
+   * server's virtualized remote contribution, as snapshots. Reading the
+   * workspaces runs the same {@link forwardVisible} visibility gate the
+   * frame paths use (T56/T58), so the parts can never expose a group the
+   * frames would withhold. */
+  parts(): WorkspaceMergerParts
 }
 
 /**
@@ -625,6 +648,22 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
 
     retarget(next: MergerIdentity): void {
       identity = { serverId: next.serverId, serverName: next.serverName }
+    },
+
+    parts(): WorkspaceMergerParts {
+      return {
+        local: {
+          orderIds: [...localOrder],
+          archivedIds: [...localArchived],
+          pinnedIds: [...localPinned],
+        },
+        remote: {
+          orderIds: remoteIds(),
+          archivedIds: [...remoteArchivedVirtual(), ...[...hiddenSessions].map(virtualize)],
+          pinnedIds: remotePinnedVirtual(),
+          workspaces: virtualWorkspaces(),
+        },
+      }
     },
 
     onLocal(frame: unknown): unknown[] {
@@ -1400,4 +1439,90 @@ export function sessionSummaryAddedFrames(remoteResult: unknown, serverId: strin
     frames.push({ type: 'emit', event: 'api-session/added', args: [row] })
   }
   return frames
+}
+
+// ---- MS-3: multi-server composition -----------------------------------------
+
+/** The cumulative LOCAL lists one workspace merger's `local` side holds. */
+export interface LocalWorkspaceLists {
+  orderIds: string[]
+  archivedIds: string[]
+  pinnedIds: string[]
+}
+
+/**
+ * MS-3: fold one LOCAL `workspace/follow` frame into the orchestrator's
+ * cumulative local lists — the baseline replaces all three, `order` /
+ * `archived` / `pinned` each replace their own list, and every other frame
+ * (upsert / remove / junk) observes nothing. The parsing is the merger's own
+ * `observeLocal` reading, extracted so the multi-server orchestrator keeps
+ * the same truth WITHOUT a second shape definition drifting away from it.
+ */
+export function localWorkspaceLists(frame: unknown, current: LocalWorkspaceLists): LocalWorkspaceLists {
+  if (!isPlainObject(frame)) return current
+  if (frame.type === 'baseline') {
+    const value = isPlainObject(frame.value) ? frame.value : {}
+    return {
+      orderIds: idList(value.items),
+      archivedIds: stringList(value.archivedSessionIds),
+      pinnedIds: stringList(value.pinnedSessionIds),
+    }
+  }
+  if (frame.type === 'order') return { ...current, orderIds: stringList(frame.workspaceIds) }
+  if (frame.type === 'archived') return { ...current, archivedIds: stringList(frame.archivedSessionIds) }
+  if (frame.type === 'pinned') return { ...current, pinnedIds: stringList(frame.pinnedSessionIds) }
+  return current
+}
+
+/** One slot's remote contribution for {@link composeMergedWorkspaceFrames}
+ * — the `remote` half of {@link WorkspaceMergerParts}. */
+export interface RemoteWorkspaceContribution {
+  orderIds: string[]
+  archivedIds: string[]
+  pinnedIds: string[]
+  workspaces: Record<string, unknown>[]
+}
+
+/**
+ * MS-3: the canonical merged frames over N servers — local first, then each
+ * server's contribution in the given (pairing) order. The order list is
+ * plain concatenation, the archived set is DEDUPLICATED in that order (the
+ * single-server merger dedupes the same way), and pinned concatenates (the
+ * single-server pinned frame never deduped either). With no remotes the
+ * frames collapse to the local-only form.
+ */
+export function composeMergedWorkspaceFrames(
+  local: LocalWorkspaceLists,
+  remotes: readonly RemoteWorkspaceContribution[],
+): {
+  order: { type: 'order'; workspaceIds: string[] }
+  archived: { type: 'archived'; archivedSessionIds: string[] }
+  pinned: { type: 'pinned'; pinnedSessionIds: string[] }
+  workspaces: Record<string, unknown>[]
+} {
+  const orderIds = [...local.orderIds]
+  const archived: string[] = []
+  const seenArchived = new Set<string>()
+  const addArchived = (ids: readonly string[]): void => {
+    for (const id of ids) {
+      if (seenArchived.has(id)) continue
+      seenArchived.add(id)
+      archived.push(id)
+    }
+  }
+  addArchived(local.archivedIds)
+  const pinnedIds = [...local.pinnedIds]
+  const workspaces: Record<string, unknown>[] = []
+  for (const remote of remotes) {
+    orderIds.push(...remote.orderIds)
+    addArchived(remote.archivedIds)
+    pinnedIds.push(...remote.pinnedIds)
+    workspaces.push(...remote.workspaces)
+  }
+  return {
+    order: { type: 'order', workspaceIds: orderIds },
+    archived: { type: 'archived', archivedSessionIds: archived },
+    pinned: { type: 'pinned', pinnedSessionIds: pinnedIds },
+    workspaces,
+  }
 }
