@@ -53,7 +53,10 @@ export function RemoteStatusIcon({ sessionId, status, t }: RemoteStatusIconProps
   // The explicit virtual-id gate stays: the page-wide store's snapshot can
   // still be ready from a PREVIOUS remote session when a local one opens.
   if (!isVirtual(sessionId) || !snap.ready) return null
-  const description = describeRemoteStatus(snap.view, t)
+  // MS-6: the session's virtual id picks its OWN server's entry — with
+  // several servers paired, A online and B offline light and grey their own
+  // sessions independently.
+  const description = describeRemoteStatus(snap.view, t, sessionId)
   const close = (): void => {
     // Offline recovers on its own; revoked / unpaired do not (T34-fix) —
     // each says its own word instead of "reconnecting".

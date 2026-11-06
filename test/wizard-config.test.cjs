@@ -312,3 +312,99 @@ test('respondStatus answers the config WITHOUT the ingress fields', async () => 
   assert.ok(!raw.includes('secret-domain.example.com'), 'the ingress domain must not leak anywhere in the body')
   assert.ok(!raw.includes('secret@example.com'), 'the acme email must not leak anywhere in the body')
 })
+
+// --- MS-6: the browser-half wizard data layer (src/client-data/wizard.ts) -----
+
+/** The browser-half modules load the dynamic .ts way (Node >= 23.6 type
+ * stripping) — they are import-free of the host half, unlike the lib/ drives
+ * above. */
+const loadBrowser = async (rel) => import(pathToFileURL(path.join(__dirname, '..', 'src', rel)).href)
+
+/** One ClientServerView-shaped row (settings-form.ts's deriveClientStatusView
+ * output shape) with only the fields the summary reads. */
+const serverRow = (state, serverUrl = 'http://x.local') => ({
+  entryId: serverUrl, serverId: 'aaaa1111', serverUrl, serverName: 'srv',
+  displayName: 'srv', state, nextRetryAt: undefined, lastError: '',
+  compat: undefined, pluginBridge: [],
+})
+
+test('MS-6: isWizardConfigured — pairedServerCount > 0 alone means configured', async () => {
+  const { isWizardConfigured } = await loadBrowser('client-data/wizard.ts')
+  const nothingElse = {
+    effectiveClient: true,
+    wizardStatus: undefined,
+    pairedDeviceCount: 0,
+    hasSavedHostConfig: false,
+    tokenConfigured: false,
+    clientServerUrl: '',
+    clientState: undefined,
+  }
+  // MS-5 pairs straight into the pool store, never the row: the pool count is
+  // the first-class configured signal on a client.
+  assert.equal(isWizardConfigured({ ...nothingElse, pairedServerCount: 3 }), true)
+  assert.equal(isWizardConfigured({ ...nothingElse, pairedServerCount: 1 }), true)
+  assert.equal(isWizardConfigured({ ...nothingElse, pairedServerCount: 0 }), false, 'zero servers changes nothing')
+  // Omitted (an old caller) keeps the pre-MS-6 verdicts verbatim.
+  assert.equal(isWizardConfigured({ ...nothingElse }), false)
+  // A host page with paired servers configured (or any count) stays true —
+  // the count never UN-configures a host, it only ever configures.
+  assert.equal(isWizardConfigured({ ...nothingElse, effectiveClient: false, pairedServerCount: 2 }), true)
+  assert.equal(isWizardConfigured({ ...nothingElse, effectiveClient: false, pairedServerCount: 0, wizardStatus: { ok: true, mode: 'off', publicUrl: '' } }), false)
+})
+
+test('MS-6: deriveClientOverviewSummary counts the pool and picks the two lights', async () => {
+  const { deriveClientOverviewSummary } = await loadBrowser('client-data/wizard.ts')
+  const { MAX_PAIRED_SERVERS } = await loadBrowser('client-data/settings-form.ts')
+  assert.equal(MAX_PAIRED_SERVERS, 8)
+
+  // Empty pool: amber on both lights, 0 / 8, no limit.
+  assert.deepEqual(deriveClientOverviewSummary([]), {
+    totalCount: 0, onlineCount: 0, offlineCount: 0, revokedCount: 0,
+    maxServers: 8, limitReached: false, connectionLight: 'pending', serversLight: 'pending',
+  })
+
+  // All connected: green on both.
+  assert.deepEqual(deriveClientOverviewSummary([serverRow('connected'), serverRow('connected', 'http://y.local')]), {
+    totalCount: 2, onlineCount: 2, offlineCount: 0, revokedCount: 0,
+    maxServers: 8, limitReached: false, connectionLight: 'pass', serversLight: 'pass',
+  })
+
+  // Mixed: offline entries are the amber middle, revoked turns the connection
+  // light red (it never recovers on its own).
+  const mixed = [serverRow('connected'), serverRow('unreachable'), serverRow('revoked')]
+  const summary = deriveClientOverviewSummary(mixed)
+  assert.equal(summary.totalCount, 3)
+  assert.equal(summary.onlineCount, 1)
+  assert.equal(summary.offlineCount, 1)
+  assert.equal(summary.revokedCount, 1)
+  assert.equal(summary.connectionLight, 'fail')
+
+  // Offline WITHOUT a dead verdict stays amber (auto-retry is under way).
+  assert.equal(deriveClientOverviewSummary([serverRow('connected'), serverRow('unreachable')]).connectionLight, 'pending')
+  // The user-action verdicts are all "dead" for the summary light.
+  for (const dead of ['revoked', 'incompatible', 'invalid-url']) {
+    assert.equal(
+      deriveClientOverviewSummary([serverRow('connected'), serverRow(dead)]).connectionLight,
+      'fail',
+      `${dead} turns the summary light red`,
+    )
+  }
+
+  // The 8-server cap: full pool is red on the servers light even while every
+  // connection is green.
+  const full = Array.from({ length: 8 }, (_, i) => serverRow('connected', `http://x${i}.local`))
+  const fullSummary = deriveClientOverviewSummary(full)
+  assert.equal(fullSummary.limitReached, true)
+  assert.equal(fullSummary.serversLight, 'fail')
+  assert.equal(fullSummary.connectionLight, 'pass', 'the cap is a servers fact, not a connection failure')
+
+  // Seven of eight: nearly full, but not the limit.
+  const seven = full.slice(0, 7)
+  assert.equal(deriveClientOverviewSummary(seven).limitReached, false)
+
+  // An explicit maxServers (mirroring the body's) decides the same way.
+  const two = [serverRow('connected'), serverRow('connected', 'http://y.local')]
+  assert.equal(deriveClientOverviewSummary(two, 2).limitReached, true)
+  assert.equal(deriveClientOverviewSummary(two, 2).maxServers, 2)
+  assert.equal(deriveClientOverviewSummary(two, 5).limitReached, false)
+})

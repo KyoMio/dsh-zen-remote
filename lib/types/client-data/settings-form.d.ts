@@ -86,9 +86,20 @@ export declare const CLIENT_CLAIM_ROUTE = "/_dsh/zen-remote/client/claim";
 export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
 /** T43: one immediate reconnect — answered 409 unless the client is offline. */
 export declare const CLIENT_RECONNECT_ROUTE = "/_dsh/zen-remote/client/reconnect";
+/** MS-6: POST `{ entryId }` (or `{ all: true }`) removes one / all paired
+ * servers from the pool (host half: src/client-routes.ts, mirrored here
+ * because the browser half cannot import the host module). */
+export declare const CLIENT_UNPAIR_ROUTE = "/_dsh/zen-remote/client/unpair";
 /** CU-4: the redacted diagnostic report (GET, both roles, machine-local only
  * — a gateway-forwarded fetch is refused server-side). */
 export declare const CLIENT_DEBUG_REPORT_ROUTE = "/_dsh/zen-remote/client/debug-report";
+/**
+ * MS-6: the paired-server pool's cap — the browser mirror of
+ * src/state-store.ts's constant of the same name (the host module cannot be
+ * imported here). The settings page and the wizard read it for the
+ * `已配对 N / 8 台` counters and the limit gating.
+ */
+export declare const MAX_PAIRED_SERVERS = 8;
 /** The lightweight client-facing config route (host half, both roles): the
  * settings page's FALLBACK role probe (T17) — it registers wherever a
  * webServer exists, and since T17 its body carries the effective `role`
@@ -152,6 +163,12 @@ export interface ClientStatusBody {
     /** RD-6: the upload-redirect service probe (presence-gated — an older
      * plugin answers without it). */
     serviceProbe?: unknown;
+    /** MS-6: the pool list, one row per paired server (`poolStatusBodyOf`'s
+     * `servers`), presence-gated like every diagnostic field — a pre-MS-5
+     * server (or the row-probe fallback) answers without it. */
+    servers?: unknown;
+    /** MS-6: the pool cap as the body reports it (8). */
+    maxServers?: unknown;
 }
 /** One remote-call failure line in the diagnostics lists. `time` is epoch
  * milliseconds — ISO-stamped rings are parsed at derive time; `method`
@@ -179,6 +196,27 @@ export interface ClientCompatView {
     mismatchedGroups: string[];
     /** The most recent incompatible calls (at most 10). */
     recentCalls: ClientDiagFailureView[];
+}
+/**
+ * MS-6: ONE paired server of the pool, as the per-server list renders it —
+ * the parsed form of one `client/status` `servers[]` row (no token ever
+ * rides any status answer). `state` speaks the same view vocabulary as the
+ * top level (the wire aliases mapped); every field degrades to its default
+ * on a junk row, and a row without an `entryId` (the route's stable key)
+ * drops whole.
+ */
+export interface ClientServerView {
+    entryId: string;
+    serverId: string;
+    serverUrl: string;
+    serverName: string;
+    /** The pool's deduplicated display name (`-1` / `-2` suffixes included). */
+    displayName: string;
+    state: ClientConnectionView['state'];
+    nextRetryAt: number | undefined;
+    lastError: string;
+    compat: ClientCompatView | undefined;
+    pluginBridge: PluginBridgeStatusView[];
 }
 /** One client connection as the block renders it. */
 export interface ClientConnectionView {
@@ -209,6 +247,15 @@ export interface ClientConnectionView {
      * through tolerantly (undefined when the body carried none — an older
      * plugin — and the diagnostics row stays hidden). */
     uploadProbe: Readonly<Record<string, unknown>> | undefined;
+    /** MS-6: every paired server of the pool, in pairing order. Empty on a
+     * legacy body (or a row-less unpaired answer) — the pre-MS-6 page shape. */
+    servers: readonly ClientServerView[];
+    /** MS-6: the pool's cap, from the body when it carried a sane number,
+     * {@link MAX_PAIRED_SERVERS} otherwise. */
+    maxServers: number;
+    /** MS-6: `servers.length >= maxServers` — the red 已配满 note and the
+     * new-address submit gate both read this. */
+    limitReached: boolean;
 }
 /**
  * Map one `client/status` body into the view the client group renders.
@@ -273,6 +320,36 @@ export declare const PAIRING_CODE_LENGTH = 8;
  * 32-character pairing-code alphabet (excluding 0/O/1/I/L and symbols), and
  * capped at 8 characters. */
 export declare function normalizePairingCode(input: string): string;
+/** What {@link canSubmitClientPairing} decides. */
+export interface CanSubmitClientPairingVerdict {
+    /** The 配对 button may act: everything locally checkable passes. */
+    allowed: boolean;
+    /** The typed address names an already-paired server — the claim will
+     * UPDATE that entry's token in place, not add a ninth one. */
+    isOverwrite: boolean;
+    /** A NEW address while the pool is full (`servers.length >= maxServers`):
+     * the claim must not even leave the page (the route would answer
+     * `limit-reached`). An overwrite never sets this. */
+    blockedByLimit: boolean;
+}
+/**
+ * The 配对 button's whole gate, as one pure truth table (MS-6): the claim
+ * needs an address and a COMPLETE 8-character pairing code (the input box
+ * normalizes as the user types; this judge is the same bar the route's code
+ * grammar enforces), a quiet page (`busy`), and a valid device-name draft
+ * (`deviceNameInvalid`, T60 — a red-boxed name would silently pair under the
+ * fallback copy). The pool cap blocks only NEW addresses: a full pool still
+ * accepts re-pairing an existing one in place, which is how a user whose
+ * token was revoked at 8/8 gets back in.
+ */
+export declare function canSubmitClientPairing(input: {
+    pairUrl: string;
+    pairCode: string;
+    servers: readonly ClientServerView[];
+    maxServers?: number;
+    busy?: boolean;
+    deviceNameInvalid?: boolean;
+}): CanSubmitClientPairingVerdict;
 /**
  * Whether the settings page may follow the SERVER's record of this device's
  * name into the row (T59): the body carried a name, it differs from the row

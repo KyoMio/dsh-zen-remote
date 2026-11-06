@@ -97,9 +97,21 @@ export const CLIENT_CLAIM_ROUTE = '/_dsh/zen-remote/client/claim'
 export const CLIENT_STATUS_ROUTE = '/_dsh/zen-remote/client/status'
 /** T43: one immediate reconnect — answered 409 unless the client is offline. */
 export const CLIENT_RECONNECT_ROUTE = '/_dsh/zen-remote/client/reconnect'
+/** MS-6: POST `{ entryId }` (or `{ all: true }`) removes one / all paired
+ * servers from the pool (host half: src/client-routes.ts, mirrored here
+ * because the browser half cannot import the host module). */
+export const CLIENT_UNPAIR_ROUTE = '/_dsh/zen-remote/client/unpair'
 /** CU-4: the redacted diagnostic report (GET, both roles, machine-local only
  * — a gateway-forwarded fetch is refused server-side). */
 export const CLIENT_DEBUG_REPORT_ROUTE = '/_dsh/zen-remote/client/debug-report'
+
+/**
+ * MS-6: the paired-server pool's cap — the browser mirror of
+ * src/state-store.ts's constant of the same name (the host module cannot be
+ * imported here). The settings page and the wizard read it for the
+ * `已配对 N / 8 台` counters and the limit gating.
+ */
+export const MAX_PAIRED_SERVERS = 8
 
 /** The lightweight client-facing config route (host half, both roles): the
  * settings page's FALLBACK role probe (T17) — it registers wherever a
@@ -169,6 +181,12 @@ export interface ClientStatusBody {
   /** RD-6: the upload-redirect service probe (presence-gated — an older
    * plugin answers without it). */
   serviceProbe?: unknown
+  /** MS-6: the pool list, one row per paired server (`poolStatusBodyOf`'s
+   * `servers`), presence-gated like every diagnostic field — a pre-MS-5
+   * server (or the row-probe fallback) answers without it. */
+  servers?: unknown
+  /** MS-6: the pool cap as the body reports it (8). */
+  maxServers?: unknown
 }
 
 /** One remote-call failure line in the diagnostics lists. `time` is epoch
@@ -201,6 +219,28 @@ export interface ClientCompatView {
   recentCalls: ClientDiagFailureView[]
 }
 
+/**
+ * MS-6: ONE paired server of the pool, as the per-server list renders it —
+ * the parsed form of one `client/status` `servers[]` row (no token ever
+ * rides any status answer). `state` speaks the same view vocabulary as the
+ * top level (the wire aliases mapped); every field degrades to its default
+ * on a junk row, and a row without an `entryId` (the route's stable key)
+ * drops whole.
+ */
+export interface ClientServerView {
+  entryId: string
+  serverId: string
+  serverUrl: string
+  serverName: string
+  /** The pool's deduplicated display name (`-1` / `-2` suffixes included). */
+  displayName: string
+  state: ClientConnectionView['state']
+  nextRetryAt: number | undefined
+  lastError: string
+  compat: ClientCompatView | undefined
+  pluginBridge: PluginBridgeStatusView[]
+}
+
 /** One client connection as the block renders it. */
 export interface ClientConnectionView {
   state: 'unpaired' | 'connected' | 'revoked' | 'unreachable' | 'unexpected' | 'invalid-url' | 'incompatible'
@@ -227,6 +267,15 @@ export interface ClientConnectionView {
    * through tolerantly (undefined when the body carried none — an older
    * plugin — and the diagnostics row stays hidden). */
   uploadProbe: Readonly<Record<string, unknown>> | undefined
+  /** MS-6: every paired server of the pool, in pairing order. Empty on a
+   * legacy body (or a row-less unpaired answer) — the pre-MS-6 page shape. */
+  servers: readonly ClientServerView[]
+  /** MS-6: the pool's cap, from the body when it carried a sane number,
+   * {@link MAX_PAIRED_SERVERS} otherwise. */
+  maxServers: number
+  /** MS-6: `servers.length >= maxServers` — the red 已配满 note and the
+   * new-address submit gate both read this. */
+  limitReached: boolean
 }
 
 const CLIENT_STATES: readonly ClientConnectionView['state'][] = ['unpaired', 'connected', 'revoked', 'unreachable', 'unexpected', 'invalid-url', 'incompatible']
@@ -238,6 +287,42 @@ const CLIENT_STATES: readonly ClientConnectionView['state'][] = ['unpaired', 'co
 const WIRE_STATE_ALIASES: Readonly<Record<string, ClientConnectionView['state']>> = {
   online: 'connected',
   offline: 'unreachable',
+}
+
+/** The view `state` for one raw wire word: the vocabulary verbatim, the T55
+ * aliases mapped, anything else the conservative `unpaired`. Shared by the
+ * top level and every `servers[]` row. */
+function clientStateOf(raw: unknown): ClientConnectionView['state'] {
+  const word = typeof raw === 'string' ? raw : ''
+  return CLIENT_STATES.includes(word as ClientConnectionView['state'])
+    ? word as ClientConnectionView['state']
+    : WIRE_STATE_ALIASES[word] ?? 'unpaired'
+}
+
+/** The finite-number gate every epoch-ms wire field passes. */
+function finiteOrUndefined(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+/** MS-6: one `servers[]` row into its view. Tolerant like the top level —
+ * a junk field degrades, a row without the route's stable `entryId` key
+ * drops whole. */
+function deriveClientServerView(value: unknown): ClientServerView | undefined {
+  const record = asRecord(value)
+  const entryId = asStringSet(record.entryId)
+  if (entryId === '') return undefined
+  return {
+    entryId,
+    serverId: asStringSet(record.serverId),
+    serverUrl: asStringSet(record.serverUrl),
+    serverName: asStringSet(record.serverName),
+    displayName: asStringSet(record.displayName),
+    state: clientStateOf(record.state),
+    nextRetryAt: finiteOrUndefined(record.nextRetryAt),
+    lastError: asStringSet(record.lastError),
+    compat: deriveCompatView(record.compat),
+    pluginBridge: derivePluginBridgeStatuses(record.pluginBridge),
+  }
 }
 
 /** At most `cap` strings out of an array-shaped value; anything else is none. */
@@ -325,18 +410,20 @@ export function deriveClientStatusView(body: ClientStatusBody): ClientConnection
   // diagnostics below it showed live relay calls. `offline` rides the same
   // mapping to the probe word for it; anything else unknown still degrades
   // to `unpaired`.
-  const rawState = typeof safe.state === 'string' ? safe.state : ''
-  const state = CLIENT_STATES.includes(rawState as ClientConnectionView['state'])
-    ? rawState as ClientConnectionView['state']
-    : WIRE_STATE_ALIASES[rawState] ?? 'unpaired'
-  const nextRetryAt = typeof safe.nextRetryAt === 'number' && Number.isFinite(safe.nextRetryAt)
-    ? safe.nextRetryAt
-    : undefined
+  const state = clientStateOf(safe.state)
+  // MS-6: the pool list rides as `servers[]` (one row per paired entry); a
+  // legacy single-server body answers the empty list and the pre-MS-6 page
+  // shape otherwise.
+  const servers = (Array.isArray(safe.servers) ? safe.servers : [])
+    .map(deriveClientServerView)
+    .filter((row): row is ClientServerView => row !== undefined)
+  const maxServersRaw = finiteOrUndefined(safe.maxServers)
+  const maxServers = maxServersRaw !== undefined && maxServersRaw >= 1 ? maxServersRaw : MAX_PAIRED_SERVERS
   return {
     state,
     serverUrl: typeof safe.serverUrl === 'string' ? safe.serverUrl : '',
     serverName: typeof safe.serverName === 'string' ? safe.serverName : '',
-    nextRetryAt,
+    nextRetryAt: finiteOrUndefined(safe.nextRetryAt),
     lastError: typeof safe.lastError === 'string' ? safe.lastError : '',
     deviceName: typeof safe.deviceName === 'string' ? safe.deviceName : '',
     intercept: deriveInterceptView(safe.intercept),
@@ -346,6 +433,9 @@ export function deriveClientStatusView(body: ClientStatusBody): ClientConnection
     uploadProbe: safe.serviceProbe !== null && typeof safe.serviceProbe === 'object'
       ? Object.freeze({ ...(safe.serviceProbe as Record<string, unknown>) })
       : undefined,
+    servers,
+    maxServers,
+    limitReached: servers.length >= maxServers,
   }
 }
 
@@ -419,6 +509,61 @@ export function normalizePairingCode(input: string): string {
     .toUpperCase()
     .replace(/[^ABCDEFGHJKMNPQRSTUVWXYZ23456789]/g, '')
     .slice(0, PAIRING_CODE_LENGTH)
+}
+
+/**
+ * The address comparison the overwrite judgment makes (MS-6): trim padding,
+ * drop trailing slashes. Light on purpose — the backend re-normalizes the
+ * address authoritatively on claim; here it only decides whether the typed
+ * address NAMES an already-paired server, and `http://x.local:3088/` must
+ * count as that server while `http://x.local:3089` must not.
+ */
+function normalizedPairAddress(url: string): string {
+  return url.trim().replace(/\/+$/u, '')
+}
+
+/** What {@link canSubmitClientPairing} decides. */
+export interface CanSubmitClientPairingVerdict {
+  /** The 配对 button may act: everything locally checkable passes. */
+  allowed: boolean
+  /** The typed address names an already-paired server — the claim will
+   * UPDATE that entry's token in place, not add a ninth one. */
+  isOverwrite: boolean
+  /** A NEW address while the pool is full (`servers.length >= maxServers`):
+   * the claim must not even leave the page (the route would answer
+   * `limit-reached`). An overwrite never sets this. */
+  blockedByLimit: boolean
+}
+
+/**
+ * The 配对 button's whole gate, as one pure truth table (MS-6): the claim
+ * needs an address and a COMPLETE 8-character pairing code (the input box
+ * normalizes as the user types; this judge is the same bar the route's code
+ * grammar enforces), a quiet page (`busy`), and a valid device-name draft
+ * (`deviceNameInvalid`, T60 — a red-boxed name would silently pair under the
+ * fallback copy). The pool cap blocks only NEW addresses: a full pool still
+ * accepts re-pairing an existing one in place, which is how a user whose
+ * token was revoked at 8/8 gets back in.
+ */
+export function canSubmitClientPairing(input: {
+  pairUrl: string
+  pairCode: string
+  servers: readonly ClientServerView[]
+  maxServers?: number
+  busy?: boolean
+  deviceNameInvalid?: boolean
+}): CanSubmitClientPairingVerdict {
+  const maxServers = input.maxServers ?? MAX_PAIRED_SERVERS
+  const address = normalizedPairAddress(input.pairUrl)
+  const isOverwrite = address !== ''
+    && input.servers.some((server) => normalizedPairAddress(server.serverUrl) === address)
+  const blockedByLimit = !isOverwrite && input.servers.length >= maxServers
+  const allowed = address !== ''
+    && normalizePairingCode(input.pairCode).length === PAIRING_CODE_LENGTH
+    && !blockedByLimit
+    && input.busy !== true
+    && input.deviceNameInvalid !== true
+  return { allowed, isOverwrite, blockedByLimit }
 }
 
 /**

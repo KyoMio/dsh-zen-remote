@@ -8,6 +8,10 @@
  * - `parseRemoteStatusBody(body, now)` maps the
  *   `GET /_dsh/zen-remote/client/remote-status` body
  *   (`{ state, versionMismatch, serverName, closed }`) into a tolerant view;
+ *   since MS-6 the body's `servers` dict (per handshake serverId) parses
+ *   alongside, and `resolveServerStatusView(view, sessionId)` picks the
+ *   session's OWN server entry — falling back to the top-level mirror (the
+ *   FIRST pool entry) whenever the dict cannot answer;
  * - `describeRemoteStatus(view)` maps one view to the icon's three states —
  *   online (lit) / offline (grey; `revoked` / `unpaired` count as offline —
  *   the link is not serving either way) / mismatch (yellow, only ever while
@@ -29,7 +33,7 @@
  */
 
 import { createLatestGate } from './settings-form.ts'
-import { isVirtual } from '../virtual-id.ts'
+import { fromVirtual, isVirtual } from '../virtual-id.ts'
 import { zh } from '../client/locales.ts'
 
 /** Same-origin client route feeding this store (host half: T34,
@@ -47,6 +51,21 @@ export type RemoteStatusState = 'online' | 'offline' | 'revoked' | 'unpaired'
 /** Why the server closed a session's remote access. */
 export type RemoteClosedReason = 'manual' | 'client' | 'idle'
 
+/**
+ * ONE paired server's serving state (MS-6): the same four facts the top
+ * level has always carried, scoped to the server whose handshake minted the
+ * `serverId`. The route (src/client-routes.ts, MS-5) serves these under
+ * `servers`, keyed by serverId; the top level mirrors the FIRST pool entry
+ * for the pre-MS-6 page.
+ */
+export interface RemoteServerStatusView {
+  state: RemoteStatusState
+  versionMismatch: boolean
+  serverName: string
+  /** The plugins whose bridge verdict is bridged RIGHT NOW on THIS server. */
+  bridgedPlugins: readonly string[]
+}
+
 /** One parsed status body, stamped with the parse time for future decay. */
 export interface RemoteStatusView {
   state: RemoteStatusState
@@ -58,6 +77,10 @@ export interface RemoteStatusView {
    * nothing is ever considered bridged on a shape the parse does not
    * trust. */
   bridgedPlugins: readonly string[]
+  /** Per-server views keyed by the handshake serverId (MS-6). A legacy body
+   * without the field parses to the empty dict — the parts then fall back to
+   * the top-level mirror. */
+  servers: Readonly<Record<string, RemoteServerStatusView>>
   /** When this view was parsed off a GET body. */
   asOf: number
 }
@@ -69,12 +92,26 @@ export interface RemoteStatusSnapshot {
   view: RemoteStatusView | undefined
 }
 
+/** The tolerant per-entry parse the top level and the `servers` dict share:
+ * a garbage shape is "not online yet", a garbage field degrades to its
+ * default — never a throw into the polling loop. */
+function parseServerStatusEntry(value: unknown): RemoteServerStatusView {
+  const record = value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+  return {
+    state: record.state === 'online' || record.state === 'revoked' || record.state === 'unpaired' ? record.state : 'offline',
+    versionMismatch: record.versionMismatch === true,
+    serverName: typeof record.serverName === 'string' ? record.serverName : '',
+    bridgedPlugins: Array.isArray(record.bridgedPlugins)
+      ? record.bridgedPlugins.filter((name): name is string => typeof name === 'string' && name !== '')
+      : [],
+  }
+}
+
 /** Parse one GET body tolerantly: a garbage shape is "not online yet", a
  * garbage field degrades to its default — never a throw into the polling
  * loop. */
 export function parseRemoteStatusBody(body: unknown, now: number): RemoteStatusView {
   const record = body !== null && typeof body === 'object' ? (body as Record<string, unknown>) : {}
-  const state = record.state === 'online' || record.state === 'revoked' || record.state === 'unpaired' ? record.state : 'offline'
   const closed: Record<string, RemoteClosedReason> = {}
   if (record.closed !== null && typeof record.closed === 'object') {
     for (const [sessionId, reason] of Object.entries(record.closed as Record<string, unknown>)) {
@@ -82,14 +119,20 @@ export function parseRemoteStatusBody(body: unknown, now: number): RemoteStatusV
       closed[sessionId] = reason === 'client' || reason === 'idle' ? reason : 'manual'
     }
   }
+  // MS-6: the per-server dict, keyed by the handshake serverId. A legacy
+  // body (or a broken one) parses to the EMPTY dict — the parts then read
+  // the top-level mirror, the pre-MS-6 answer.
+  const servers: Record<string, RemoteServerStatusView> = {}
+  if (record.servers !== null && typeof record.servers === 'object' && !Array.isArray(record.servers)) {
+    for (const [serverId, entry] of Object.entries(record.servers as Record<string, unknown>)) {
+      if (serverId === '') continue
+      servers[serverId] = parseServerStatusEntry(entry)
+    }
+  }
   return {
-    state,
-    versionMismatch: record.versionMismatch === true,
-    serverName: typeof record.serverName === 'string' ? record.serverName : '',
+    ...parseServerStatusEntry(record),
     closed,
-    bridgedPlugins: Array.isArray(record.bridgedPlugins)
-      ? record.bridgedPlugins.filter((name): name is string => typeof name === 'string' && name !== '')
-      : [],
+    servers,
     asOf: now,
   }
 }
@@ -108,6 +151,48 @@ export function parseRemoteStatusBody(body: unknown, now: number): RemoteStatusV
  */
 export function shouldStampBridgeAttribute(bridgedPlugins: unknown, plugin: string): boolean {
   return Array.isArray(bridgedPlugins) && bridgedPlugins.includes(plugin)
+}
+
+/**
+ * Which server's facts ONE session reads (MS-6): given the session id on
+ * screen, its virtual form names the owning serverId, and THAT server's
+ * entry answers — per-server isolation for the icon, the banner and the
+ * bridge stamp. Everything else falls back to the TOP-LEVEL view, the
+ * pre-MS-6 answer: a session id that is not virtual (a local session), a
+ * serverId the dict never answered (its entry never handshook), a legacy
+ * body without a dict, or no session id at all. Tolerant the same way as
+ * the parse: hand-rolled views without `servers` never throw here.
+ */
+export function resolveServerStatusView(
+  view: RemoteStatusView | undefined | null,
+  sessionId?: string,
+): RemoteServerStatusView | undefined {
+  if (view === undefined || view === null) return undefined
+  if (sessionId !== undefined) {
+    const parts = fromVirtual(sessionId)
+    if (parts !== undefined) {
+      const server = view.servers?.[parts.serverId]
+      if (server !== undefined) return server
+    }
+  }
+  // RemoteStatusView structurally carries every RemoteServerStatusView field.
+  return view
+}
+
+/**
+ * Whether the remote session CURRENTLY ON SCREEN has its own server's bridge
+ * verdict going its way (MS-6): the verdict comes from the session's server
+ * entry ({@link resolveServerStatusView}), not the page-wide mirror of the
+ * FIRST pool entry — with several servers paired, A bridging a plugin must
+ * not un-hide it over B's sessions. Tolerant like the 2-argument core it
+ * wraps: a garbage or missing list reads as "not bridged".
+ */
+export function shouldStampBridgeForSession(
+  view: RemoteStatusView | undefined,
+  sessionId: string | undefined,
+  plugin: string,
+): boolean {
+  return shouldStampBridgeAttribute(resolveServerStatusView(view, sessionId)?.bridgedPlugins, plugin)
 }
 
 /** The plugin the bridge stamp names. */
@@ -149,12 +234,17 @@ export interface RemoteStatusDescription {
 export function describeRemoteStatus(
   view: RemoteStatusView | undefined | null,
   t: RemoteStatusFormatter = createZhRemoteStatusFormatter(),
+  /** MS-6: the session on screen — its virtual id picks its OWN server's
+   * entry; omitted (or unanswered by the dict) keeps the pre-MS-6 top-level
+   * read. */
+  sessionId?: string,
 ): RemoteStatusDescription {
-  if (view === undefined || view === null) return { state: 'offline', hoverText: t('remoteStatusOffline') }
-  if (view.state === 'revoked') return { state: 'revoked', hoverText: t('remoteStatusRevoked') }
-  if (view.state === 'unpaired') return { state: 'unpaired', hoverText: t('remoteStatusUnpaired') }
-  if (view.state === 'online') {
-    return view.versionMismatch
+  const status = resolveServerStatusView(view, sessionId)
+  if (status === undefined) return { state: 'offline', hoverText: t('remoteStatusOffline') }
+  if (status.state === 'revoked') return { state: 'revoked', hoverText: t('remoteStatusRevoked') }
+  if (status.state === 'unpaired') return { state: 'unpaired', hoverText: t('remoteStatusUnpaired') }
+  if (status.state === 'online') {
+    return status.versionMismatch
       ? { state: 'mismatch', hoverText: t('remoteStatusMismatch') }
       : { state: 'online', hoverText: t('remoteStatusOnline') }
   }
@@ -190,18 +280,23 @@ export function bannerText(
   sessionId: string,
   t: RemoteBannerFormatter = (key) => zh[key],
 ): string | undefined {
+  // The closed map is SESSION-keyed (virtual ids embed their server, so one
+  // global dict cannot collide) and outranks every link-level line.
   const reason = view?.closed[sessionId]
   if (reason === 'idle') return t('remoteBannerClosedIdle')
   if (reason === 'client') return t('remoteBannerClosedClient')
   // 'manual' — and any word this build does not know (a newer server's
   // vocabulary): a closure with no certain reason reads as the manual close.
   if (reason !== undefined) return t('remoteBannerClosedManual')
-  if (view !== undefined && view !== null) {
-    if (view.state === 'offline') return t('remoteBannerOffline')
+  // MS-6: the link-level line reads the SESSION'S OWN server, not the page's
+  // first-entry mirror.
+  const status = resolveServerStatusView(view, sessionId)
+  if (status !== undefined) {
+    if (status.state === 'offline') return t('remoteBannerOffline')
     // T41a-fix2: a revoked token / an unpaired client is not "reconnecting"
     // — the composer must not sit disabled on a promise no reconnect keeps.
-    if (view.state === 'revoked') return t('remoteBannerRevoked')
-    if (view.state === 'unpaired') return t('remoteBannerUnpaired')
+    if (status.state === 'revoked') return t('remoteBannerRevoked')
+    if (status.state === 'unpaired') return t('remoteBannerUnpaired')
   }
   return undefined
 }

@@ -2,7 +2,7 @@ import type { ClientContext, MobileSessionRow } from '../compat/types.ts'
 import { mainSessionIdOf } from '../compat/types.ts'
 import { fromVirtual, isVirtual } from '../../virtual-id.ts'
 import { REMOTE_SESSION_CSS } from '../styles/remote-session.css.ts'
-import { BRIDGE_STAMP_ATTRIBUTE, BRIDGE_STAMP_PLUGIN, getRemoteStatusStore, shouldStampBridgeAttribute, subscribeIfVirtual } from '../../client-data/remote-status.ts'
+import { BRIDGE_STAMP_ATTRIBUTE, BRIDGE_STAMP_PLUGIN, getRemoteStatusStore, shouldStampBridgeForSession, subscribeIfVirtual } from '../../client-data/remote-status.ts'
 import { en, zh } from '../locales.ts'
 import { REMOTE_SERVER_ATTRIBUTE } from '../../client-data/model-group-side.ts'
 
@@ -117,7 +117,7 @@ export function installRemoteSessionGuard(ctx: ClientContext): void {
     }
     const applyBridge = (): void => {
       const view = store.getSnapshot().view
-      if (shouldStampBridgeAttribute(view?.bridgedPlugins, BRIDGE_STAMP_PLUGIN)) {
+      if (shouldStampBridgeForSession(view, currentMainSessionIdOf(ctx), BRIDGE_STAMP_PLUGIN)) {
         root.setAttribute(BRIDGE_STAMP_ATTRIBUTE, '1')
         root.style.removeProperty('--zr-bridge-note')
       } else {
@@ -135,7 +135,13 @@ export function installRemoteSessionGuard(ctx: ClientContext): void {
         applyBridge()
         return
       }
-      if (!virtualNow && offStore !== undefined) {
+      // MS-6: remote A → remote B keeps the subscription, but the verdict
+      // belongs to the session's own server and must be re-judged.
+      if (virtualNow) {
+        applyBridge()
+        return
+      }
+      if (offStore !== undefined) {
         offStore()
         offStore = undefined
         clear()

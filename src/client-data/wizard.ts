@@ -12,7 +12,16 @@
  * row layer applies the same rule when the fields land there, so a client
  * that accepts something the resolver would silently drop would only set
  * the user up for a mystery.
+ *
+ * MS-6 adds the paired-pool overview pieces: the pool count is a first-class
+ * "configured" signal (MS-5 pairs straight into the pool store, not the
+ * row), and {@link deriveClientOverviewSummary} derives the overview card's
+ * counters and its two lights (connection health / pool fill) off the
+ * `client/status` pool list.
  */
+
+import { MAX_PAIRED_SERVERS } from './settings-form.ts'
+import type { ClientServerView } from './settings-form.ts'
 
 /** Wizard route constants — mirror of src/wizard/routes.ts. */
 export const WIZARD_STATUS_ROUTE = '/_dsh/zen-remote/admin/wizard/status'
@@ -130,7 +139,12 @@ export function initialStep(status: WizardStatusBody | undefined): WizardStep {
 
 /**
  * Whether the inline overview card should render the configured status
- * dashboard instead of the first-time setup prompt.
+ * dashboard instead of the first-time setup prompt. MS-6: the paired pool's
+ * size is the client's first-class signal — since MS-5 a claim lands in the
+ * pool store and never touches the row's `serverUrl` / `deviceToken`, so a
+ * freshly multi-paired machine with an empty row must still read as
+ * configured. `> 0` answers true no matter what the other inputs say; the
+ * field is optional and an omitted one (or a zero) changes nothing.
  */
 export function isWizardConfigured(input: {
   effectiveClient: boolean
@@ -140,7 +154,9 @@ export function isWizardConfigured(input: {
   tokenConfigured: boolean
   clientServerUrl: string
   clientState: string | undefined
+  pairedServerCount?: number
 }): boolean {
+  if ((input.pairedServerCount ?? 0) > 0) return true
   if (input.effectiveClient) {
     return input.tokenConfigured || input.clientServerUrl.trim() !== '' || input.clientState === 'connected'
   }
@@ -311,6 +327,68 @@ const CLIENT_FAIL_STATES: ReadonlySet<string> = new Set([
   'invalid-url',
   'unexpected',
 ])
+
+/**
+ * The view states that will NOT come back on their own (MS-6): a revoked
+ * token, an incompatible interface, an address that no longer parses — each
+ * needs the settings page before that server serves again. They turn the
+ * overview's connection light red; a merely `unreachable` server is mid-retry
+ * and stays amber.
+ */
+const CLIENT_DEAD_STATES: ReadonlySet<string> = new Set(['revoked', 'incompatible', 'invalid-url'])
+
+/** The overview card's derived counters and lights (MS-6): the 第 3 格
+ * 「连接状态」 shows `M / N 台在线` with {@link WizardOverviewSummary.connectionLight}
+ * summarizing the pool's health, and the 第 4 格 「已配对服务端」 shows
+ * `已配对 N / maxServers 台` with {@link WizardOverviewSummary.serversLight}
+ * turning red exactly at the cap. Input is the DERIVED pool list
+ * ({@link ClientServerView} — the view vocabulary's state words), in pairing
+ * order; order never matters to the counts. */
+export interface WizardOverviewSummary {
+  totalCount: number
+  onlineCount: number
+  /** Everything that is neither connected nor revoked (unreachable,
+   * unexpected, incompatible, invalid-url, …). */
+  offlineCount: number
+  revokedCount: number
+  maxServers: number
+  limitReached: boolean
+  connectionLight: LightState
+  serversLight: LightState
+}
+
+/**
+ * Derive the sub-client overview summary off one derived pool list: green
+ * only when EVERY paired server is connected; red when any server is in a
+ * state that will not recover on its own (revoked / incompatible /
+ * invalid-url) or when the pool is FULL — the cap is a servers fact, so a
+ * full pool of healthy connections still shows a red servers light while its
+ * connection light stays green; amber for the rest (nothing paired yet, or
+ * servers the retry ladder is still working on).
+ */
+export function deriveClientOverviewSummary(
+  servers: readonly ClientServerView[],
+  maxServers: number = MAX_PAIRED_SERVERS,
+): WizardOverviewSummary {
+  const totalCount = servers.length
+  let onlineCount = 0
+  let revokedCount = 0
+  let deadCount = 0
+  for (const server of servers) {
+    if (server.state === 'connected') onlineCount += 1
+    if (server.state === 'revoked') revokedCount += 1
+    if (CLIENT_DEAD_STATES.has(server.state)) deadCount += 1
+  }
+  const offlineCount = totalCount - onlineCount - revokedCount
+  const limitReached = totalCount >= maxServers
+  const connectionLight: LightState = totalCount === 0
+    ? 'pending'
+    : onlineCount === totalCount
+      ? 'pass'
+      : deadCount > 0 ? 'fail' : 'pending'
+  const serversLight: LightState = limitReached ? 'fail' : totalCount > 0 ? 'pass' : 'pending'
+  return { totalCount, onlineCount, offlineCount, revokedCount, maxServers, limitReached, connectionLight, serversLight }
+}
 
 /**
  * Derive the three status lights for the desktop sub-client verification
