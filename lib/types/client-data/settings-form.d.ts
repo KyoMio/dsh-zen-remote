@@ -306,6 +306,11 @@ export interface ClaimRouteBody {
     token?: unknown;
     deviceId?: unknown;
     deviceName?: unknown;
+    /** MS-8: the pool entry the pairing landed in (pool-mode answers carry it;
+     * the legacy single-server answer carries `token` instead and no
+     * `entryId` — the token never reaches the browser in pool mode). The
+     * wizard records it as the step-3 selected server. */
+    entryId?: unknown;
     /** The normalized address the backend validated — what the form writes. */
     serverUrl?: unknown;
     code?: string;

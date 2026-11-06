@@ -497,7 +497,7 @@ export declare const zh: {
     readonly 'wizard.overview.devicesSummary': "手机/网页 {web} 台 · 桌面客户端 {desktop} 台";
     readonly 'wizard.overview.devicesNone': "暂未配对设备";
     readonly 'wizard.overview.clientCredLabel': "本地配对凭证";
-    readonly 'wizard.overview.clientConnLabel': "服务端连接";
+    readonly 'wizard.overview.clientConnLabel': "连接状态";
     readonly 'wizard.overview.clientServerLabel': "远端服务端地址";
     readonly 'wizard.overview.startSetup': "开始配置向导";
     readonly 'wizard.overview.reconfigure': "修改接入配置";
@@ -519,6 +519,26 @@ export declare const zh: {
     readonly 'wizard.devicesModal.title': "已配对设备管理";
     readonly 'wizard.devicesModal.subtitle': "查看与管理已配对的手机/网页设备及桌面客户端，支持改名、切换布局或吊销凭证";
     readonly 'wizard.devicesModal.retest': "重新测试连通性";
+    readonly 'wizard.overview.clientSyncLabel': "会话与插件同步";
+    readonly 'wizard.overview.syncOk': "正常";
+    readonly 'wizard.overview.syncBad': "异常";
+    readonly 'wizard.overview.syncPending': "未连接";
+    readonly 'wizard.overview.clientOnlineCount': "在线 {online} / {total} 台";
+    readonly 'wizard.overview.clientOfflineCount': "离线 {count} 台";
+    readonly 'wizard.overview.clientRevokedCount': "已吊销 {count} 台";
+    readonly 'wizard.overview.clientAllOnline': "全部在线";
+    readonly 'wizard.overview.clientServersLabel': "已配对服务端";
+    readonly 'wizard.overview.clientPairedFull': "已配满 {count} / {max} 台（已达上限）";
+    readonly 'wizard.overview.clientPairedNames': "{names}（上限 {max} 台）";
+    readonly 'wizard.overview.limitNote': "已达 {max} 台上限，添加前请先移除旧服务端";
+    readonly 'wizard.overview.manageServers': "管理服务端";
+    readonly 'wizard.overview.addServer': "+ 添加服务端";
+    readonly 'wizard.serversModal.title': "已配对主服务端管理";
+    readonly 'wizard.serversModal.subtitle': "最多同时连接 {max} 台主服务端（当前 {count} / {max} 台）";
+    readonly 'wizard.serversModal.viewStatus': "查看状态";
+    readonly 'wizard.client.poolCapNote': "最多同时连接 {max} 台主服务端（当前已配对 {count} / {max} 台）";
+    readonly 'wizard.client.continueAdd': "+ 继续添加另一台";
+    readonly 'wizard.client.serverPicker': "选择要查看的服务端";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

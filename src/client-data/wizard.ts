@@ -408,6 +408,27 @@ export function deriveClientWizardLights(input: {
   }
 }
 
+/**
+ * The wizard step-3's three lights for ONE selected paired server (MS-8):
+ * the credential is green by the row's own existence (the token lives in the
+ * pool store, never in the row) and red only when the server refused it
+ * (`revoked`); the connection follows the same fail-set the global lights
+ * use (an offline server mid-retry is red here too — the step is staring at
+ * THAT one server, not the pool); sync is green on a connected row whose
+ * interface groups all match, red on a compat mismatch, amber otherwise.
+ * `undefined` (nothing paired, or nothing selected yet) keeps all three
+ * amber.
+ */
+export function deriveClientServerLights(server: ClientServerView | undefined): ClientWizardLights {
+  if (server === undefined) return { credential: 'pending', connection: 'pending', sync: 'pending' }
+  const connected = server.state === 'connected'
+  return {
+    credential: server.state === 'revoked' ? 'fail' : 'pass',
+    connection: connected ? 'pass' : CLIENT_FAIL_STATES.has(server.state) ? 'fail' : 'pending',
+    sync: connected ? ((server.compat?.mismatchedGroups.length ?? 0) > 0 ? 'fail' : 'pass') : 'pending',
+  }
+}
+
 /** Pairing-code countdown, whole seconds, never negative. */
 export function pairingSecondsLeft(expiresAt: number, now: number): number {
   return Math.max(0, Math.ceil((expiresAt - now) / 1000))

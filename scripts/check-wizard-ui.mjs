@@ -24,6 +24,7 @@ import {
   tunnelCheckCopy,
   tunnelFailureCopy,
   caddySnippetText,
+  deriveClientServerLights,
   deriveClientWizardLights,
   deriveWizardLights,
   formSeedOf,
@@ -229,6 +230,30 @@ await test('deriveClientWizardLights: reflects token and client connection state
   )
 })
 
+await test('deriveClientServerLights: one paired server row drives the wizard step-3 lights (MS-8)', () => {
+  // A minimal pool row: the view shape deriveClientStatusView answers.
+  const row = (state, extra = {}) => ({
+    entryId: 'e1', serverId: 's1', serverUrl: 'http://x.local:3088', serverName: 'srv',
+    displayName: 'srv', state, nextRetryAt: undefined, lastError: '', compat: undefined, pluginBridge: [],
+    ...extra,
+  })
+  // Nothing selected (no pool rows at all): all three stay amber.
+  assert.deepEqual(deriveClientServerLights(undefined), { credential: 'pending', connection: 'pending', sync: 'pending' })
+  // A healthy connected row: everything green.
+  assert.deepEqual(deriveClientServerLights(row('connected')), { credential: 'pass', connection: 'pass', sync: 'pass' })
+  // Connected but the interface groups differ from the server's: sync red.
+  assert.deepEqual(
+    deriveClientServerLights(row('connected', { compat: { mismatchedGroups: ['session'], recentCalls: [] } })),
+    { credential: 'pass', connection: 'pass', sync: 'fail' },
+  )
+  // Revoked: the credential AND the connection are both dead, sync stays amber.
+  assert.deepEqual(deriveClientServerLights(row('revoked')), { credential: 'fail', connection: 'fail', sync: 'pending' })
+  // Offline mid-retry: the token is fine, the connection is red, sync waits.
+  assert.deepEqual(deriveClientServerLights(row('unreachable')), { credential: 'pass', connection: 'fail', sync: 'pending' })
+  // Incompatible: connection red, credential still fine.
+  assert.deepEqual(deriveClientServerLights(row('incompatible')), { credential: 'pass', connection: 'fail', sync: 'pending' })
+})
+
 await test('formSeedOf: the configure forms seed from the wizard projection, not admin/status (GW-fix-3/M1)', () => {
   // The projection carries the ingress fields; admin/status does not (GW-1
   // strips them) — seeding from there would silently never backfill.
@@ -415,6 +440,13 @@ const WIZARD_KEYS = [
   'wizard.modal.saveAndNext', 'wizard.modal.finish',
   'wizard.light.probing', 'wizard.overview.manageDevices',
   'wizard.devicesModal.title', 'wizard.devicesModal.subtitle', 'wizard.devicesModal.retest',
+  'wizard.overview.clientSyncLabel', 'wizard.overview.syncOk', 'wizard.overview.syncBad', 'wizard.overview.syncPending',
+  'wizard.overview.clientOnlineCount', 'wizard.overview.clientOfflineCount', 'wizard.overview.clientRevokedCount',
+  'wizard.overview.clientAllOnline', 'wizard.overview.clientServersLabel', 'wizard.overview.clientPairedFull',
+  'wizard.overview.clientPairedNames', 'wizard.overview.limitNote',
+  'wizard.overview.manageServers', 'wizard.overview.addServer',
+  'wizard.serversModal.title', 'wizard.serversModal.subtitle', 'wizard.serversModal.viewStatus',
+  'wizard.client.poolCapNote', 'wizard.client.continueAdd', 'wizard.client.serverPicker',
 ]
 
 // The cards' step counts are part of the walkthrough contract (GW-11).
