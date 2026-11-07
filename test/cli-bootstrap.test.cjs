@@ -118,6 +118,7 @@ test('args: 命令路由全表——help/version/未知命令/host·client 子�
     { argv: ['host', 'ingress', 'nope'], command: 'unknown', unknownCommand: 'host ingress nope' },
     { argv: ['client', 'wat'], command: 'unknown', unknownCommand: 'client wat' },
     { argv: ['setup'], command: 'setup' },
+    { argv: ['setup', 'http://10.0.0.2:3080'], command: 'setup', target: 'http://10.0.0.2:3080' },
     { argv: ['status'], command: 'status' },
     { argv: ['host', 'device', 'pair'], command: 'host.device.pair' },
     { argv: ['host', 'device', 'list'], command: 'host.device.list' },

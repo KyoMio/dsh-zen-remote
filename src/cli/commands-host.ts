@@ -88,8 +88,9 @@ async function fetchRecord(ctx: CliExecutionContext, method: string, path: strin
 }
 
 /** The anti-shadowing config write, reporting `env-shadowed` and generic
- * failures through the translator. */
-async function writeConfigOrReport(ctx: CliExecutionContext, set: Record<string, unknown>): Promise<boolean> {
+ * failures through the translator. Shared with `command-setup.ts`'s role
+ * switch, which writes the same way. */
+export async function writeConfigOrReport(ctx: CliExecutionContext, set: Record<string, unknown>): Promise<boolean> {
   const { t } = ctx
   const result = await ctx.ipc.writeConfig({ set })
   const body = plainOf(result.body)

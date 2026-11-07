@@ -20,6 +20,10 @@
  * status answers before any prompt.
  */
 import type { CliExecutionContext } from './context.js';
+/** The anti-shadowing config write, reporting `env-shadowed` and generic
+ * failures through the translator. Shared with `command-setup.ts`'s role
+ * switch, which writes the same way. */
+export declare function writeConfigOrReport(ctx: CliExecutionContext, set: Record<string, unknown>): Promise<boolean>;
 /**
  * `host device pair [--device-role web|desktop-client] [--json]` — mint one
  * pairing code through the admin pair route and print it with everything

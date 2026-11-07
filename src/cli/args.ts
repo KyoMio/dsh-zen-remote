@@ -196,7 +196,11 @@ function routeCommand(positionals: readonly string[], options: CliOptions): Pars
     unknownCommand: words.filter((word) => word !== undefined).join(' '),
   })
 
-  if (c1 === 'setup') return { command: 'setup', options }
+  if (c1 === 'setup') {
+    // `setup <hostUrl>` — the client branch's pairing address as a positional
+    // (equivalent to `--host-url`; the flag still wins when both appear).
+    return { command: 'setup', options, ...(c2 === undefined ? {} : { target: c2 }) }
+  }
   if (c1 === 'status') return { command: 'status', options }
 
   if (c1 === 'host') {
@@ -236,9 +240,6 @@ function routeCommand(positionals: readonly string[], options: CliOptions): Pars
  * must not fall into the interactive wizard).
  */
 export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
-  if (argv.includes('--help') || argv.includes('-h')) return { command: 'help', options: defaultOptions() }
-  if (argv.includes('--version') || argv.includes('-v')) return { command: 'version', options: defaultOptions() }
-
   const options = defaultOptions()
   const positionals: string[] = []
   let index = 0
@@ -246,6 +247,9 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
     const token = argv[index]
     if (token === undefined) break
     index += 1
+    if (token === '--help' || token === '-h' || token === '--version' || token === '-v') {
+      continue
+    }
     if (token === '--debug') {
       // `--debug [outPath]`: a following non-flag token is the output path,
       // anything else (nothing, another flag) means the default filename.
@@ -278,6 +282,8 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliArgs {
     positionals.push(token)
   }
 
+  if (argv.includes('--help') || argv.includes('-h')) return { command: 'help', options }
+  if (argv.includes('--version') || argv.includes('-v')) return { command: 'version', options }
   if (positionals.length === 0) return { command: 'help', options }
   return routeCommand(positionals, options)
 }

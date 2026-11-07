@@ -6,6 +6,9 @@
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
+  "bin": {
+    "dsh-zen-remote": "bin/zen-remote.mjs"
+  },
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",
@@ -21,6 +24,7 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "bin",
     "lan-gate.mjs",
     "dsh-push.mjs",
     "lib",
