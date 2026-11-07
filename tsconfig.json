@@ -31,6 +31,7 @@
     "src/cli/context.ts",
     "src/cli/commands-status.ts",
     "src/cli/commands-client.ts",
+    "src/cli/commands-host.ts",
     "src/client-data/qr.ts",
     "src/wizard/status.ts",
     "src/wizard/binary.ts",
