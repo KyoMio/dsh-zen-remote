@@ -31,5 +31,9 @@ export interface CliExecutionContext {
     /** `client pair`'s online-wait poll interval (default 250ms; tests shrink
      * it — the 10s budget itself stays fixed). */
     pollIntervalMs?: number;
+    /** `host ingress verify`'s Ctrl-C seam: the entry point (CLI-5's main)
+     * aborts it on SIGINT so the phone-pairing wait can be skipped gracefully;
+     * tests abort it directly. */
+    abortSignal?: AbortSignal;
 }
 //# sourceMappingURL=context.d.ts.map
