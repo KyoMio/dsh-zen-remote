@@ -57,6 +57,24 @@ dsh plugin --profile web add dsh-zen-remote
 
 > `dsh plugin` 必须带 `--profile` 指定目标 profile。桌面端的 `desktop` profile 由 App 独占管理，命令行会拒绝 `--profile desktop`，桌面端请直接使用上面的界面安装。
 
+### 无头服务器 CLI 一键向导（`dsh-zen-remote`）
+
+插件自带同包分发的命令行工具，远程 VPS 与无头环境（`dsh web`）无需打开浏览器插件页即可完成全部配置与配对：
+
+```sh
+npx dsh-zen-remote setup        # 三步向导：选角色 → 选接入方式 → 三灯验证 + 终端二维码配对
+dsh-zen-remote status           # 当前角色、网关与连接状态（--json 机器可读；--debug 导出脱敏诊断报告）
+dsh-zen-remote host device pair --device-role web   # host：配对手机 / 电脑（desktop-client 配另一台电脑）
+dsh-zen-remote host ingress start --mode lan        # host：配置公网接入（caddy | cloudflared | external | lan）
+dsh-zen-remote host ingress verify                  # host：三灯连通验证（--no-wait 跳过等待手机配对）
+dsh-zen-remote client pair http://192.168.1.2:3088 --code 12345678   # client：配对远端 host
+dsh-zen-remote client list                          # client：列出已配对的 host（最多 8 台）
+```
+
+- `setup` 先自动完成预检：扫描候选 profile 多选安装插件（`desktop` 一律跳过）、拉起 DSH 守护 / 应用，再进入交互向导；脚本化场景加 `--yes` 并补全参数（如 `setup --role host --ingress lan --no-wait --yes`）即全自动零提问，缺必填参数立即报错不挂起。
+- CLI 与插件之间走本机 0600 权限的 IPC socket（同机同用户即授权），Caddy / Cloudflare Tunnel 始终由插件进程托管，CLI 绝不另起进程。
+- `--lang zh|en` 切换双语输出；不带参数或 `--help` 查看完整命令树。
+
 <details>
 <summary>手动编辑 Profile / 本地开发（<code>link:</code> 安装）与升级、卸载说明</summary>
 
@@ -95,6 +113,8 @@ cd ~/.dsh/profiles/desktop && pnpm install
 打开 DSH **「插件」页 → 点击 `dsh-zen-remote`**，页面顶部就是**「远程访问与设备配对」**向导卡片：
 
 ![插件详情页顶部的「远程访问与设备配对」状态总览卡片](docs/images/wizard-overview.png)
+
+> **无头服务器**（`dsh web` / VPS）不打开浏览器也能走完同样的三步向导：在终端运行 `npx dsh-zen-remote setup` 即可，命令见[「安装」章节的 CLI 说明](#无头服务器-cli-一键向导dsh-zen-remote)。
 
 ---
 

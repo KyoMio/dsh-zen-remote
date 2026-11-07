@@ -57,6 +57,24 @@ dsh plugin --profile web add dsh-zen-remote
 
 > `dsh plugin` requires `--profile` to name the target profile. The desktop app's `desktop` profile is managed exclusively by the app (`--profile desktop` is refused on the CLI), so use the UI install above on the desktop app.
 
+### The bundled CLI wizard (`dsh-zen-remote`)
+
+The plugin ships a same-package command line tool, so remote VPS / headless machines (`dsh web`) can complete the whole setup and pairing flow without opening the plugin page in a browser:
+
+```sh
+npx dsh-zen-remote setup        # the 3-step wizard: role → ingress → three-light verify + terminal-QR pairing
+dsh-zen-remote status           # current role, gateway & connection state (--json; --debug writes the redacted report)
+dsh-zen-remote host device pair --device-role web   # host: pair a phone / browser (desktop-client pairs another computer)
+dsh-zen-remote host ingress start --mode lan        # host: configure public ingress (caddy | cloudflared | external | lan)
+dsh-zen-remote host ingress verify                  # host: three-light reachability check (--no-wait skips the pairing wait)
+dsh-zen-remote client pair http://192.168.1.2:3088 --code 12345678   # client: pair a remote host
+dsh-zen-remote client list                          # client: list paired hosts (up to 8)
+```
+
+- `setup` runs its preflight first: candidate profiles are scanned with a multi-select install (`desktop` is always skipped), the DSH daemon / app is launched, then the interactive wizard starts. For scripts add `--yes` plus the options (e.g. `setup --role host --ingress lan --no-wait --yes`) for a fully non-interactive run — missing required options fail fast instead of hanging.
+- The CLI talks to the plugin over a 0600 local IPC socket (same machine, same user = authorized); Caddy / Cloudflare Tunnel stay owned by the plugin process — the CLI never spawns them.
+- `--lang zh|en` switches the bilingual output; run without arguments or with `--help` for the full command tree.
+
 <details>
 <summary>Manual Profile Edit / Local Development (<code>link:</code>), Upgrading & Uninstall</summary>
 
@@ -95,6 +113,8 @@ The same plugin supports two roles:
 Open **Plugins → `dsh-zen-remote`** in DSH. The **Remote Access & Device Pairing** card sits right at the top of the page:
 
 ![Remote Access & Device Pairing overview card on the plugin detail page](docs/images/wizard-overview.png)
+
+> **Headless servers** (`dsh web` / a VPS) can run the same three-step wizard in a terminal with `npx dsh-zen-remote setup` — see [the CLI section under Install](#the-bundled-cli-wizard-dsh-zen-remote).
 
 ---
 

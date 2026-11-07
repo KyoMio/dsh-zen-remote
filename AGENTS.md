@@ -50,6 +50,7 @@
 | `lan-gate.mjs` | 网关子插件入口，由主入口按 host 角色加载（不再自己占插件行）：spawn 子进程，共享密钥只经它进子进程 |
 | `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，Node stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀 |
 | `dsh-push.mjs` | 推送子插件（与网关一起由主入口加载）：回合结束推送 + `push_notify` 工具 |
+| `bin/zen-remote.mjs` + `src/cli/**` → `lib/cli/` | 命令行工具 `dsh-zen-remote`（bin 入口只加载 `lib/cli/main.js`）：插件进程内的 0600 IPC socket 服务端与 CLI 侧发现/客户端（`ipc-server.ts` / `ipc-client.ts`）、防遮蔽配置写入（`config-writer.ts`）、参数解析与双语 i18n（`args.ts` / `i18n.ts`）、`status` / `host *` / `client *` 子命令（`commands-*.ts`）、`setup` 三步向导与角色切换联动（`command-setup.ts`）、多选 profile 安装与 DSH 自动拉起（`bootstrap.ts`）；全部经 IPC 驱动插件进程，CLI 自己绝不 spawn caddy / cloudflared |
 | `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标 |
 | `test/*.test.cjs` | 网关侧测试（真子进程 + mock 上游）+ 中继端到端（`relay-e2e.test.cjs`）+ 纯逻辑导入测试 |
 | `scripts/check-*.mjs` | 界面侧自检（纯 `node:assert`，靠 Node ≥23.6 类型剥离直接 import `.ts`） |
