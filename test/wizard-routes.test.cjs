@@ -727,6 +727,10 @@ test('the wizard effect disposal stops the managed Caddy before unregistering', 
       on() { return () => {} },
       effect(fn, name) { disposers.push({ name, disposer: fn() }) },
       logger: { warn() {} },
+      // CLI-1：managed ingress 的 subprocess 服务改在 apply 层读取（真实
+      // cordis 的 Context 类型上 reflect 是必需属性，BU-1 fallback 早已
+      // 这样读 connection），fake 跟上这个真相。
+      reflect: { get: (name) => services[name] },
       inject(deps, cb) {
         if (!deps.every((d) => services[d] !== undefined)) return
         const target = {
