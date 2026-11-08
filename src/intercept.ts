@@ -698,6 +698,13 @@ export interface InterceptHandle {
    * (only THAT server's shown groups and pending events are torn down),
    * slots for new entries start, and renames re-title the groups. */
   notePoolEvent(): void
+  /** P55-2: resolve which remote session (serverId + real sessionId) should
+   * serve a path-only `/api/file?path=...` request, or `undefined` when the
+   * local route should handle it. Read by the fetch-route wrap (its media
+   * mount only exists while the wiring hands THIS handle's method over), so
+   * a Markdown image of a remote session's reply loads from the server's
+   * disk instead of 404ing on the sub-client's own. */
+  resolveRemoteFileScope(path: string): { serverId: string; sessionId: string } | undefined
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -3516,6 +3523,33 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
  * records the verdict but does not re-gate, so it stays usable in tests
  * that install over deliberately odd shapes.
  */
+/**
+ * P55-2: whether `filePath` lives at or under `cwd` — the /api/file
+ * attribution test. Both paths are compared backslash-folded to `/` (a
+ * server-Windows cwd meets a server-Windows image path, and the Markdown
+ * renderer may hand either separator over), trailing separators of `cwd`
+ * are dropped, and the match is exact-or-subpath (`cwd + '/'` prefix — a
+ * directory merely PREFIXED by the cwd string is not a match). Windows
+ * drive-rooted pairs compare case-insensitively WHOLE (`C:\Users` vs
+ * `c:\users` — the drive letter is the visible case hazard, but NTFS is
+ * case-insensitive end to end, and a missed match costs a permanently
+ * broken image while an over-match needs two same-server cwds differing
+ * only by case); everything else stays case-sensitive (POSIX is).
+ * Deliberately NOT node:path — the two ends may run on different platforms,
+ * so the rule is pure string arithmetic over the server's paths.
+ */
+export function pathMatchesCwd(filePath: string, cwd: string): boolean {
+  const slashify = (value: string): string => value.replaceAll('\\', '/')
+  const file = slashify(filePath)
+  let root = slashify(cwd)
+  while (root.length > 1 && root.endsWith('/')) root = root.slice(0, -1)
+  if (root === '') return false
+  const matches = (f: string, r: string): boolean => f === r || f.startsWith(`${r}/`)
+  if (matches(file, root)) return true
+  if (/^[a-z]:/i.test(root) && /^[a-z]:/i.test(file)) return matches(file.toLowerCase(), root.toLowerCase())
+  return false
+}
+
 export function installIntercept(options: InstallInterceptOptions): InterceptHandle {
   const { raw, log } = options
   const clock = options.clock ?? defaultClock
@@ -3581,6 +3615,100 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // the session it holds for is served again, so a re-enabled remote comes
   // back with a fresh history instead of staying blind under its banner.
   const closedClearWaiters = new Set<() => void>()
+  // P55-2: the /api/file attribution state. `remoteSessionCwds` maps each
+  // remote session's VIRTUAL id to its cwd as last seen (snapshot header,
+  // session/list rows); `activeRemoteFollows` holds every live remote
+  // `session/follow` this process opened (symbol-keyed so concurrent pages
+  // each hold their own); `lastFollowedSession` is the follow the wrapper
+  // answered MOST RECENTLY, local or remote — together they resolve a
+  // path-only image request to its owning session without waiting for the
+  // browser's 1s current-session report. All in-memory, session-scale
+  // (the cwd map is capped like the closed-session registry). The
+  // `session/control` merge is deliberately NOT a source: its frame
+  // vocabulary (RT dsh-api-session-controller lib/typert.remote-client.js —
+  // `baseline` with value.projections, `projection` with sessionId/seq/
+  // changes) carries no session summary and no cwd, so a scan there could
+  // never record anything.
+  type RemoteSessionCwd = { serverId: string; sessionId: string; cwd: string }
+  const remoteSessionCwds = new Map<string, RemoteSessionCwd>()
+  const activeRemoteFollows = new Map<symbol, { serverId: string; sessionId: string }>()
+  let lastFollowedSession: { kind: 'remote'; serverId: string; sessionId: string } | { kind: 'local' } | undefined
+  const MAX_REMOTE_SESSION_CWDS = 200
+  const recordRemoteSessionCwd = (serverId: string, rawSessionId: unknown, cwd: unknown): void => {
+    if (typeof rawSessionId !== 'string' || rawSessionId === '') return
+    if (typeof cwd !== 'string' || cwd === '') return
+    const key = toVirtual(serverId, rawSessionId)
+    // Re-insert to refresh the recency order, then cap like `closedSessions`.
+    remoteSessionCwds.delete(key)
+    if (remoteSessionCwds.size >= MAX_REMOTE_SESSION_CWDS) {
+      const oldest = remoteSessionCwds.keys().next()
+      if (oldest.done !== true) remoteSessionCwds.delete(oldest.value)
+    }
+    remoteSessionCwds.set(key, { serverId, sessionId: rawSessionId, cwd })
+  }
+  /** Record every cwd a remote `session/list` result carries (both merge
+   * modes call this on the RAW remote value, before ids go virtual). */
+  const noteRemoteSessionListCwds = (remoteResult: unknown, serverId: string): void => {
+    if (!isPlainObject(remoteResult) || !Array.isArray(remoteResult.items)) return
+    for (const item of remoteResult.items) {
+      if (!isPlainObject(item)) continue
+      const id = typeof item.sessionId === 'string' && item.sessionId !== ''
+        ? item.sessionId
+        : typeof item.id === 'string' && item.id !== ''
+          ? item.id
+          : undefined
+      if (id === undefined) continue
+      recordRemoteSessionCwd(serverId, id, item.cwd)
+    }
+  }
+  /**
+   * The resolution the /api/file wrap buys with one call. Steps, in order:
+   * A) the ACTIVE remote session — the browser-reported current session
+   * (unless this process's newest follow went LOCAL, which is the newer
+   * fact), else the newest follow, else the newest live remote follow;
+   * B) a precise cwd match — the active session's own cwd first, then any
+   * known cwd the path falls under (a session with a LIVE follow preferred,
+   * else the most recently refreshed match);
+   * C) no cwd claim anywhere → the active remote (so a just-opened page's
+   * first image resolves with zero cwd knowledge), or `undefined` when no
+   * remote session is active — a local session's images stay local.
+   */
+  const resolveRemoteFileScope = (rawPath: string): { serverId: string; sessionId: string } | undefined => {
+    if (typeof rawPath !== 'string' || rawPath === '') return undefined
+    let activeRemote: { serverId: string; sessionId: string } | undefined
+    const current = getCurrentSession()
+    if (current.kind === 'open') {
+      const parts = fromVirtual(current.sessionId)
+      if (parts !== undefined && lastFollowedSession?.kind !== 'local') {
+        activeRemote = { serverId: parts.serverId, sessionId: parts.id }
+      }
+    }
+    if (activeRemote === undefined && lastFollowedSession?.kind === 'remote') {
+      activeRemote = { serverId: lastFollowedSession.serverId, sessionId: lastFollowedSession.sessionId }
+    }
+    if (activeRemote === undefined && activeRemoteFollows.size > 0) {
+      const values = [...activeRemoteFollows.values()]
+      const last = values[values.length - 1]
+      if (last !== undefined) activeRemote = { ...last }
+    }
+    if (activeRemote !== undefined) {
+      const own = remoteSessionCwds.get(toVirtual(activeRemote.serverId, activeRemote.sessionId))
+      if (own !== undefined && pathMatchesCwd(rawPath, own.cwd)) {
+        return { serverId: own.serverId, sessionId: own.sessionId }
+      }
+    }
+    const followedVirtuals = new Set([...activeRemoteFollows.values()].map((entry) => toVirtual(entry.serverId, entry.sessionId)))
+    let latestMatch: RemoteSessionCwd | undefined
+    let followedMatch: RemoteSessionCwd | undefined
+    for (const entry of remoteSessionCwds.values()) {
+      if (!pathMatchesCwd(rawPath, entry.cwd)) continue
+      latestMatch = entry
+      if (followedVirtuals.has(toVirtual(entry.serverId, entry.sessionId))) followedMatch = entry
+    }
+    if (followedMatch !== undefined) return { serverId: followedMatch.serverId, sessionId: followedMatch.sessionId }
+    if (latestMatch !== undefined) return { serverId: latestMatch.serverId, sessionId: latestMatch.sessionId }
+    return activeRemote
+  }
   // The last successfully fetched SERVER model catalog (T52-fix), kept for
   // the offline merges of the `session/modelCatalog` route below — cleared
   // on a pairing wall (eagerly, by the T52-fix2 catalog watcher; the route's
@@ -4186,6 +4314,12 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             // closed-session entry for it is stale (T34).
             clearClosed(claimed)
           }
+          // P55-2: the snapshot's header carries the session identity and its
+          // cwd in ORIGINAL ids — record before the rewrite below virtualizes
+          // them, so /api/file can attribute the session's own image paths.
+          if (endpoint === 'session/follow' && isPlainObject(frame) && frame.type === 'snapshot' && isPlainObject(frame.header)) {
+            recordRemoteSessionCwd(serverId, frame.header.id, frame.header.cwd)
+          }
           yield rewriteFrame(endpoint, frame, serverId)
         }
         return
@@ -4326,6 +4460,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           recordFailure(endpoint, result.error instanceof RelayError ? result.error.code : 'internal')
           continue
         }
+        // P55-2: the RAW remote rows (original ids) feed the /api/file cwd
+        // registry before the merge virtualizes them.
+        noteRemoteSessionListCwds(result.value, result.serverId)
         value = mergeSessionList(value, result.value, result.serverId)
       }
       return { ok: true, value }
@@ -4334,6 +4471,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     if (identity === undefined || singleRelay.state !== 'online') return localEnvelope
     try {
       const remote = await singleRelay.invoke('session', 'list', isPlainObject(args) ? args : {}, signal)
+      noteRemoteSessionListCwds(remote, identity.serverId)
       return { ok: true, value: mergeSessionList(localEnvelope.value, remote, identity.serverId) }
     } catch (error) {
       recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
@@ -4621,6 +4759,22 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     const fields = CLIENT_METHOD_FIELDS[endpoint]
     const virtuals = collectVirtuals(fields, args)
     if (virtuals.length === 0) {
+      // P55-2: a LOCAL session/follow (a well-formed session address whose id
+      // is not virtual) is the newest fact about which page the user is on —
+      // recorded at the same instant the wrap is reached, so a later image
+      // request never resolves against the remote session just left.
+      if (endpoint === 'session/follow') {
+        const address = isPlainObject(args) && isPlainObject(args.request) ? args.request.address : undefined
+        if (
+          isPlainObject(address) &&
+          address.kind === 'session' &&
+          typeof address.sessionId === 'string' &&
+          address.sessionId !== '' &&
+          !isVirtual(address.sessionId)
+        ) {
+          lastFollowedSession = { kind: 'local' }
+        }
+      }
       if (endpoint === 'workspace/follow' || endpoint === 'session/control') {
         // The startup self-check probe wants the LOCAL baseline only — no
         // remote leg, no merge (its payload is registered in probePayloads).
@@ -4747,9 +4901,28 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // the endpoints OUTSIDE the list end with the original code at once,
     // their consumers rendering a clean end as a terminal (CP5,
     // SESSION_STREAM_HOLD_ENDPOINTS).
-    return rewriteUpstream(endpoint, client, upstream, serverId, virtuals, signal, () =>
+    const held = rewriteUpstream(endpoint, client, upstream, serverId, virtuals, signal, () =>
       client.openStream(namespace, method, clone, signal),
     )
+    // P55-2: a remote session/follow is recorded the instant the wrap is
+    // reached (before any frame, before any browser report) — the first
+    // <img> of the page cannot race a 1s poll. The follow stays in
+    // `activeRemoteFollows` for the generator's whole life and leaves in its
+    // finally, so the map holds exactly the LIVE follows.
+    if (endpoint === 'session/follow') {
+      const claimed = virtuals[0]
+      lastFollowedSession = { kind: 'remote', serverId: claimed.serverId, sessionId: claimed.id }
+      const token = Symbol()
+      activeRemoteFollows.set(token, { serverId: claimed.serverId, sessionId: claimed.id })
+      return (async function* () {
+        try {
+          yield* held
+        } finally {
+          activeRemoteFollows.delete(token)
+        }
+      })()
+    }
+    return held
   }
 
 
@@ -4763,6 +4936,13 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     uninstall() {
       if (!installed) return
       installed = false
+      // P55-2: the attribution state dies with the wrap — the fetch-route
+      // half reads the wiring's live `interceptHandle` slot, which the
+      // uninstall clears, so this is hygiene; a stale map must never
+      // outlive the interception that fed it.
+      remoteSessionCwds.clear()
+      activeRemoteFollows.clear()
+      lastFollowedSession = undefined
       for (const listener of [...uninstallListeners]) listener()
       // The catalog watcher dies with the wrap (T52-fix2): a late online
       // transition after this point belongs to another generation. MS-5: in
@@ -4812,6 +4992,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // one of the listeners in pool mode). No-op in single-server mode.
       for (const listener of [...poolListeners]) listener()
     },
+    resolveRemoteFileScope,
   }
 }
 

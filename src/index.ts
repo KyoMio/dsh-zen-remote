@@ -1743,8 +1743,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       }
       // Shape first, like the typert wrap: a failed check leaves every route
       // exactly as it was — local uploads untouched, remote uploads keep
-      // failing with the honest local error.
-      const shape = checkFetchRouteShape(raw)
+      // failing with the honest local error. (The media note rides along:
+      // this wiring always hands a resolveRemoteFileScope over, P55-2.)
+      const shape = checkFetchRouteShape(raw, true)
       if (!shape.ok) {
         fetchRouteRefused = shape
         logWarn('dsh-zen-remote fetch-route intercept not installed: %s', shape.reasons.join('; '))
@@ -1754,6 +1755,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         connection: raw,
         // MS-5 pool mode: each upload's serverId half picks its own client.
         getRelayForServer: (serverId) => relayPool.getByServerId(serverId)?.client,
+        // P55-2: the /api/file media route forwards to the session the
+        // intercept currently holds — read LIVE per request, so an uninstalled
+        // (or not-yet-installed) typert wrap answers undefined and the media
+        // request passes through to the local route.
+        resolveRemoteFileScope: (filePath) => interceptHandle?.resolveRemoteFileScope(filePath),
         log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
       })
       fetchRouteHandle = handle
@@ -1819,7 +1825,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       }
       // Shape against the proxy first (fetchRoutes reads through it); the
       // raw instance comes off the same symbols slot the inject path uses.
-      const shape = checkFetchRouteShape(connection)
+      // (The media note rides along — same install options as the inject
+      // path, P55-2.)
+      const shape = checkFetchRouteShape(connection, true)
       if (!shape.ok) {
         // Structural mismatch is a verdict, not a wait: record the attempt
         // and stop. A later inject trigger may still install (it checks the
@@ -1842,6 +1850,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         connection: raw,
         // MS-5 pool mode: each upload's serverId half picks its own client.
         getRelayForServer: (serverId) => relayPool.getByServerId(serverId)?.client,
+        // P55-2: same live read as the inject path — the media route follows
+        // whichever typert intercept is currently installed.
+        resolveRemoteFileScope: (filePath) => interceptHandle?.resolveRemoteFileScope(filePath),
         log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
       })
       fetchRouteHandle = handle

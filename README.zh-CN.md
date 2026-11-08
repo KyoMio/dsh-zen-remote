@@ -264,6 +264,8 @@ cd ~/.dsh/profiles/desktop && pnpm install
 | `trustedProxies` | 空 | 逗号分隔的受信任反代 IP（反代不在本机时配置） |
 | `vapidSubject` | `mailto:admin@localhost` | Web Push 联系标识（**iOS 必须为真实邮箱或 `https://` 网址**，否则 Apple 拒收） |
 | `lang` | `auto` | 网关页面与通知语言：`auto`（跟随浏览器）、`zh`、`en` |
+| `pushEnabled` | 开 | 会话通知总开关；关闭后停用全部自动推送，也不再注册 `push_notify` 工具与提示词段落 |
+| `pushSessionName` | 关 | 推送正文第一行加「来源会话：<会话名>」（标题保持固定事件标题不变） |
 | `pushTurnEnd` | 关 | 普通回合结束时是否也发送推送（等授权/等回答的通知恒开，不受此项影响） |
 | `pushEvents` | `agent/turn-stopping` | 触发回合结束推送的事件名（逗号分隔） |
 | `pushDebounceMs` | `15000` | 两条自动推送之间的最小间隔毫秒数 |
@@ -278,7 +280,7 @@ cd ~/.dsh/profiles/desktop && pnpm install
 | `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` | `0.42` / `400` / `15` | 软键盘高度不可见环境下的输入框抬升校准参数 |
 | `maxUploadBytes` | 20 MB | 手机端单次附件上传大小上限 |
 
-历史环境变量（优先级高于插件行）：`LAN_GATE_PORT`、`LAN_GATE_HOST`、`LAN_GATE_TARGET_PORT`、`LAN_GATE_RATE_LIMIT`、`LAN_GATE_TRUSTED_PROXIES`、`LAN_GATE_VAPID_SUBJECT`、`LAN_GATE_LANG`、`DSH_PUSH_TURN_END`、`DSH_PUSH_EVENTS`、`DSH_PUSH_DEBOUNCE_MS`、`DSH_PUSH_SUMMARY`、`DSH_PUSH_TOOL`、`DSH_PUSH_LANG`、`DSH_PUSH_APPROVAL_GRACE_MS`。
+历史环境变量（优先级高于插件行）：`LAN_GATE_PORT`、`LAN_GATE_HOST`、`LAN_GATE_TARGET_PORT`、`LAN_GATE_RATE_LIMIT`、`LAN_GATE_TRUSTED_PROXIES`、`LAN_GATE_VAPID_SUBJECT`、`LAN_GATE_LANG`、`DSH_PUSH_ENABLED`、`DSH_PUSH_SESSION_NAME`、`DSH_PUSH_TURN_END`、`DSH_PUSH_EVENTS`、`DSH_PUSH_DEBOUNCE_MS`、`DSH_PUSH_SUMMARY`、`DSH_PUSH_TOOL`、`DSH_PUSH_LANG`、`DSH_PUSH_APPROVAL_GRACE_MS`。
 
 </details>
 

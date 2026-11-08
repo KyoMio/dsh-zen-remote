@@ -362,6 +362,16 @@ export interface InterceptHandle {
      * (only THAT server's shown groups and pending events are torn down),
      * slots for new entries start, and renames re-title the groups. */
     notePoolEvent(): void;
+    /** P55-2: resolve which remote session (serverId + real sessionId) should
+     * serve a path-only `/api/file?path=...` request, or `undefined` when the
+     * local route should handle it. Read by the fetch-route wrap (its media
+     * mount only exists while the wiring hands THIS handle's method over), so
+     * a Markdown image of a remote session's reply loads from the server's
+     * disk instead of 404ing on the sub-client's own. */
+    resolveRemoteFileScope(path: string): {
+        serverId: string;
+        sessionId: string;
+    } | undefined;
 }
 /** Rewrite one stream frame's session ids to virtual form. */
 export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown;
@@ -442,6 +452,22 @@ export interface SessionSummarySync {
  * records the verdict but does not re-gate, so it stays usable in tests
  * that install over deliberately odd shapes.
  */
+/**
+ * P55-2: whether `filePath` lives at or under `cwd` — the /api/file
+ * attribution test. Both paths are compared backslash-folded to `/` (a
+ * server-Windows cwd meets a server-Windows image path, and the Markdown
+ * renderer may hand either separator over), trailing separators of `cwd`
+ * are dropped, and the match is exact-or-subpath (`cwd + '/'` prefix — a
+ * directory merely PREFIXED by the cwd string is not a match). Windows
+ * drive-rooted pairs compare case-insensitively WHOLE (`C:\Users` vs
+ * `c:\users` — the drive letter is the visible case hazard, but NTFS is
+ * case-insensitive end to end, and a missed match costs a permanently
+ * broken image while an over-match needs two same-server cwds differing
+ * only by case); everything else stays case-sensitive (POSIX is).
+ * Deliberately NOT node:path — the two ends may run on different platforms,
+ * so the rule is pure string arithmetic over the server's paths.
+ */
+export declare function pathMatchesCwd(filePath: string, cwd: string): boolean;
 export declare function installIntercept(options: InstallInterceptOptions): InterceptHandle;
 export interface SelfCheckOptions {
     /** How long the probe may wait for its first frame; default 5000 ms. */

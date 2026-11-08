@@ -67,3 +67,19 @@ export const DEFAULT_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
  * like any other oversized read.
  */
 export const MAX_INVOKE_BODY_BYTES = 32 * 1024 * 1024
+
+/**
+ * Cap for ONE forwarded `/api/file` media answer (P55-2): the sub-client's
+ * fetch-route wrap pulls a remote session's inline image / media file
+ * through `workspaceFiles/readBytes` and answers the browser's native
+ * `<img>` request with the bytes. Deliberately TIGHTER than the host's own
+ * `maxImageBytes` default (50 MiB, RT dsh-attachment-local
+ * DEFAULT_MAX_IMAGE_BYTES): every forwarded byte rides the relay's JSON
+ * channel base64-encoded (~1.33×), so 50 MiB would move ~67 MiB through the
+ * link — 20 MiB answers everything a reply body realistically embeds and
+ * fails fast past it. NOT related to {@link DEFAULT_MAX_UPLOAD_BYTES}
+ * (which sizes the phone composer's uploads); the equal value is
+ * coincidence, kept as one definition here only so the drift scanner sees
+ * every MiB-scale ceiling exactly once.
+ */
+export const MAX_FILE_MEDIA_BYTES = 20 * 1024 * 1024

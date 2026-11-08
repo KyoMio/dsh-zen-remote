@@ -49,7 +49,9 @@
 import { RelayError } from './relay-client.js'
 import type { RelayClient } from './relay-client.js'
 import { fromVirtual } from './virtual-id.js'
+import { restoreInvokeBinary } from './invoke-binary.js'
 import { MAX_UPLOAD_BYTES } from './relay-server.js'
+import { MAX_FILE_MEDIA_BYTES } from './upload-limits.js'
 
 /** The host's upload route, verbatim from its registration (RT
  * dsh-client-file-upload lib/index.js:73). */
@@ -59,12 +61,77 @@ export const FILE_UPLOAD_PATH = '/api/session/uploadFileBinary'
  * lib/index.js:488). */
 export const SESSION_EXPORT_PATH = '/api/session.export'
 
+/** The host's media route (P55-2): how a Markdown image `![a](path)` in a
+ * session body actually loads — the renderer resolves the path against the
+ * session cwd into an ABSOLUTE server path and the browser's `<img>` asks
+ * for `/api/file?path=<encoded>` natively (no `window.fetch`, no
+ * `sessionId`), landing in this very table (RT
+ * dsh-api-session-controller lib/types/media-references.js:
+ * `registerFetchRoute({ path: '/api/file', methods: ['GET','HEAD'],
+ * requestBody: 'buffered', … })`). */
+export const FILE_MEDIA_PATH = '/api/file'
+
+/** The byte cap one forwarded file may answer with — defined once in
+ * src/upload-limits.ts (the one home of every MiB-scale ceiling, per the
+ * upload unification and scripts/check-upload-limits.mjs), re-exported
+ * here for the consumers the route narrative belongs to. */
+export { MAX_FILE_MEDIA_BYTES }
+
+/** The response headers every forwarded file answer carries — the host's
+ * own /api/file set (RT lib/types/media-references.js BASE_HEADERS +
+ * NO_STORE), so a remote-served image meets exactly the sandbox the local
+ * route would have given it. */
+const FILE_BASE_HEADERS: Record<string, string> = {
+  'Cache-Control': 'private, no-store',
+  'X-Content-Type-Options': 'nosniff',
+  'Content-Security-Policy': "sandbox; default-src 'none'",
+}
+
+/** Extension → Content-Type for the forwarded answers. A fixed table (the
+ * host routes through `mime-types`; the reply-body vocabulary fits a table)
+ * with the same conservative default. */
+const FILE_MEDIA_TYPES: Readonly<Record<string, string>> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  svg: 'image/svg+xml',
+  bmp: 'image/bmp',
+  ico: 'image/x-icon',
+  avif: 'image/avif',
+  pdf: 'application/pdf',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  json: 'application/json',
+  txt: 'text/plain; charset=utf-8',
+  log: 'text/plain; charset=utf-8',
+  md: 'text/markdown; charset=utf-8',
+  html: 'text/html; charset=utf-8',
+}
+
+/** The Content-Type one forwarded file answers with, read from its path
+ * extension (case-folded; no extension → the stream default). */
+function mediaTypeOfPath(filePath: string): string {
+  const dot = filePath.lastIndexOf('.')
+  if (dot === -1) return 'application/octet-stream'
+  return FILE_MEDIA_TYPES[filePath.slice(dot + 1).toLowerCase()] ?? 'application/octet-stream'
+}
+
 /** The remote upload cap, the relay's own 500 MiB (relay-server.ts explains
  * why the host has no number to mirror). Interpolated into the local
  * oversize refusal so the card names the real limit. */
 const UPLOAD_CAP_MIB = Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024))
 
 const OVERSIZE_MESSAGE = `文件超过远程上传上限（${UPLOAD_CAP_MIB} MiB）`
+/** The media-read cap message (P55-2) — a different gate, a different
+ * number, never the upload card's wording. */
+const FILE_MEDIA_CAP_MIB = Math.floor(MAX_FILE_MEDIA_BYTES / (1024 * 1024))
+const FILE_MEDIA_OVERSIZE_MESSAGE = `文件超过远程读取上限（${FILE_MEDIA_CAP_MIB} MiB）`
 const OFFLINE_MESSAGE = '服务端离线，远程会话暂时无法上传文件'
 const MISMATCH_MESSAGE = '此远程会话属于其他主服务端'
 /** The mid-upload transport death (T5x): the socket died UNDER the body —
@@ -124,9 +191,14 @@ export function shouldFallbackInstall(state: {
  * Check the RAW connection service instance against the shape the wrap
  * depends on. Pure inspection — nothing is mutated, so a failed check
  * leaves every route exactly as it was. Only the structural facts refuse;
- * the two entries' facts are described in `notes` (they attach lazily).
+ * the entries' facts are described in `notes` (they attach lazily).
+ *
+ * `probeFileMedia` (P55-2) adds the `/api/file` entry's note and — load-
+ * bearing for the legacy probe-count pins — its table READ. It defaults to
+ * false so a caller without a `resolveRemoteFileScope` (every pre-P55-2
+ * call site and test) touches exactly the two routes it always did.
  */
-export function checkFetchRouteShape(connection: unknown): FetchRouteShapeCheck {
+export function checkFetchRouteShape(connection: unknown, probeFileMedia = false): FetchRouteShapeCheck {
   if (!isRecord(connection) || Array.isArray(connection)) {
     return { ok: false, reasons: ['connection: not an object'] }
   }
@@ -139,6 +211,7 @@ export function checkFetchRouteShape(connection: unknown): FetchRouteShapeCheck 
     notes: [
       describeEntry(routes.get(FILE_UPLOAD_PATH), 'upload', ['POST'], 'streaming'),
       describeEntry(routes.get(SESSION_EXPORT_PATH), 'export', ['GET', 'HEAD'], 'buffered'),
+      ...(probeFileMedia ? [describeEntry(routes.get(FILE_MEDIA_PATH), 'file', ['GET', 'HEAD'], 'buffered')] : []),
     ],
   }
 }
@@ -172,7 +245,7 @@ export interface FetchRouteFailureRecord {
   /** ISO timestamp of the moment the refusal was answered. */
   time: string
   /** Which wrapper answered it. */
-  route: 'upload' | 'export'
+  route: 'upload' | 'export' | 'file'
   code: string
 }
 
@@ -208,6 +281,24 @@ export interface FetchRouteInterceptDiagnostics {
   exportBlocked: number
   /** The most recent refusals, oldest first, capped. */
   recentFailures: FetchRouteFailureRecord[]
+  // ---- the /api/file media wrap (P55-2) — present ONLY when the wiring
+  // handed a resolveRemoteFileScope over; absent otherwise, which is how the
+  // legacy diagnostics consumers (and tests) tell the two generations apart.
+  /** The media entry currently holds our wrapper. */
+  fileWrapped?: boolean
+  /** The media entry was absent at last check and the attach retry is still
+   * running. */
+  filePending?: boolean
+  /** The media entry was present but misshaped — attach refused for THIS
+   * route only; the reason is stable diagnostics text. */
+  fileAttachRefused?: string | undefined
+  /** Every media request that entered the wrapper, passthroughs included. */
+  fileCalls?: number
+  /** Media requests served through the relay. */
+  fileForwarded?: number
+  /** Media requests refused (offline, mismatch, relay/remote errors,
+   * oversize). */
+  fileRefused?: number
 }
 
 export interface InstallFetchRouteInterceptOptions {
@@ -230,6 +321,12 @@ export interface InstallFetchRouteInterceptOptions {
    * the upload goes through `relay` exactly when the id belongs to
    * `getServerId()`, with the original verdict order. */
   getRelayForServer?: (serverId: string) => RelayClient | undefined
+  /** P55-2: the intercept handle's session-attribution answer (live, so the
+   * wiring forwards `interceptHandle?.resolveRemoteFileScope`). Its PRESENCE
+   * is the media mount's switch: without it, `/api/file` is never probed,
+   * wrapped, or counted — the pre-P55-2 behavior, byte for byte (the
+   * legacy probe-count pins depend on this). */
+  resolveRemoteFileScope?: (path: string) => { serverId: string; sessionId: string } | undefined
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
   /** The lazy-attach retry cadence (T51-fix): how often the table is
@@ -317,14 +414,19 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
   // behavior stays byte-identical without a narrowing dance.
   const singleRelay = relay as RelayClient
   const singleGetServerId = getServerId as () => string | undefined
+  const resolveRemoteFileScope = options.resolveRemoteFileScope
+  // The media mount's switch (P55-2): its presence probes, wraps and counts
+  // `/api/file`; its absence keeps every pre-P55-2 behavior byte-identical —
+  // including the exact fetchRoutes probe counts the legacy tests pin.
+  const fileMediaEnabled = resolveRemoteFileScope !== undefined
   const attachRetryMs = options.attachRetryMs ?? DEFAULT_ATTACH_RETRY_MS
   const attachAttempts = options.attachAttempts ?? DEFAULT_ATTACH_ATTEMPTS
-  const shape = checkFetchRouteShape(connection)
+  const shape = checkFetchRouteShape(connection, fileMediaEnabled)
   const routes = (connection as { fetchRoutes: Map<string, FetchRouteEntry> }).fetchRoutes
 
   let installed = true
   const failures: FetchRouteFailureRecord[] = []
-  const counters = { uploadCalls: 0, uploadForwarded: 0, uploadRefused: 0, exportBlocked: 0 }
+  const counters = { uploadCalls: 0, uploadForwarded: 0, uploadRefused: 0, exportBlocked: 0, fileCalls: 0, fileForwarded: 0, fileRefused: 0 }
 
   // The per-route attach state. `undefined` entry = absent so far (the
   // retry may still land it); a refusal string = present-but-misshaped,
@@ -335,6 +437,9 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
   let exportEntry: FetchRouteEntry | undefined
   let savedExport: FetchRouteEntry['fetch'] | undefined
   let exportAttachRefused: string | undefined
+  let fileEntry: FetchRouteEntry | undefined
+  let savedFile: FetchRouteEntry['fetch'] | undefined
+  let fileAttachRefused: string | undefined
 
   const recordFailure = (route: FetchRouteFailureRecord['route'], code: string): void => {
     if (failures.length >= MAX_FAILURES) failures.shift()
@@ -361,6 +466,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
     // The other half may have registered while we were installing: every
     // real call re-probes a still-missing route before doing anything else.
     if (installed && exportEntry === undefined && exportAttachRefused === undefined) attachExport()
+    if (installed && fileMediaEnabled && fileEntry === undefined && fileAttachRefused === undefined) attachFile()
     const passthrough = (): Promise<Response> =>
       (savedUpload as FetchRouteEntry['fetch']).call(uploadEntry, request)
     // An uninstalled (chained-over) wrap is INERT, not absent.
@@ -451,6 +557,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
 
   const wrappedExport = async (request: Request): Promise<Response> => {
     if (installed && uploadEntry === undefined && uploadAttachRefused === undefined) attachUpload()
+    if (installed && fileMediaEnabled && fileEntry === undefined && fileAttachRefused === undefined) attachFile()
     const passthrough = (): Promise<Response> =>
       savedExport !== undefined ? savedExport.call(exportEntry, request) : Promise.resolve(new Response('not found', { status: 404 }))
     if (!installed) return passthrough()
@@ -467,6 +574,143 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
     counters.exportBlocked += 1
     recordFailure('export', 'remote-unsupported')
     return statusFailure(403, 'remote-unsupported', '远程会话不支持导出')
+  }
+
+  /** One /api/file answer the relay could not serve, with the honest
+   * status. The `<img>` consumer reads the status alone (it renders no
+   * error body), so unlike the upload wrap these keep real statuses — a
+   * 200-with-envelope here would render a BROKEN image while pretending
+   * success. */
+  const fetchRemoteFile = async (
+    scope: { serverId: string; sessionId: string },
+    filePath: string,
+    request: Request,
+    passthrough: () => Promise<Response>,
+  ): Promise<Response> => {
+    const target = uploadRelayFor(scope.serverId)
+    if (target === 'remote-offline') {
+      counters.fileRefused += 1
+      recordFailure('file', 'remote-offline')
+      return statusFailure(503, 'remote-offline', '服务端离线，远程文件暂时无法读取')
+    }
+    if (target === 'remote-mismatch') {
+      counters.fileRefused += 1
+      recordFailure('file', 'remote-mismatch')
+      return statusFailure(403, 'remote-mismatch', MISMATCH_MESSAGE)
+    }
+    if (typeof (target as { invoke?: unknown }).invoke !== 'function') {
+      counters.fileRefused += 1
+      recordFailure('file', 'internal')
+      return statusFailure(502, 'internal', '远程文件读取失败')
+    }
+    const mediaType = mediaTypeOfPath(filePath)
+    try {
+      if (request.method === 'HEAD') {
+        // Size only: stat answers `bytes` (RT dsh-api-workspace-files
+        // lib/typert.remote-client.js — the result carries
+        // absolutePath/version and an OPTIONAL `bytes`).
+        const stat = await target.invoke('workspaceFiles', 'stat', { workspaceFileScopeId: scope.sessionId, path: filePath }, request.signal)
+        const size = isRecord(stat) && typeof stat.bytes === 'number' ? stat.bytes : undefined
+        if (size !== undefined && size > MAX_FILE_MEDIA_BYTES) {
+          counters.fileRefused += 1
+          return statusFailure(413, 'file-too-large', FILE_MEDIA_OVERSIZE_MESSAGE)
+        }
+        return new Response(null, {
+          status: 200,
+          headers: {
+            ...FILE_BASE_HEADERS,
+            'Content-Type': mediaType,
+            ...(size !== undefined ? { 'Content-Length': String(size) } : {}),
+          },
+        })
+      }
+      // Whole file: readBytes answers a marker-encoded result
+      // (`data: {$zr-u8: base64}` on the JSON channel), restored here.
+      const raw = await target.invoke(
+        'workspaceFiles',
+        'readBytes',
+        { workspaceFileScopeId: scope.sessionId, path: filePath, options: {} },
+        request.signal,
+      )
+      const restored = restoreInvokeBinary(raw)
+      const data = isRecord(restored) && restored.data instanceof Uint8Array ? (restored.data as Uint8Array) : undefined
+      if (data === undefined) {
+        counters.fileRefused += 1
+        recordFailure('file', 'internal')
+        return statusFailure(502, 'internal', '远程文件读取失败')
+      }
+      if (data.byteLength > MAX_FILE_MEDIA_BYTES) {
+        counters.fileRefused += 1
+        return statusFailure(413, 'file-too-large', FILE_MEDIA_OVERSIZE_MESSAGE)
+      }
+      return new Response(data.slice(), {
+        status: 200,
+        headers: { ...FILE_BASE_HEADERS, 'Content-Type': mediaType, 'Content-Length': String(data.byteLength) },
+      })
+    } catch (error) {
+      const code = error instanceof RelayError ? error.code : 'internal'
+      recordFailure('file', code)
+      log?.('file %s for %s failed through the relay: %s', filePath, scope.sessionId, code)
+      // The file the session cited may exist on BOTH machines (the reply
+      // quoted a path the sub-client also has, or the remote record is
+      // stale): a not-found answer falls back to the LOCAL route once —
+      // its 200 is adopted, anything else becomes our 404.
+      if (code === 'workspace-file/not-found' || code === 'FS_NOT_FOUND') {
+        const local = await passthrough()
+        if (local.status === 200) return local
+        counters.fileRefused += 1
+        return statusFailure(404, 'file-not-found', '远程与本机都不存在该文件')
+      }
+      counters.fileRefused += 1
+      if (code === 'workspace-file/too-large' || code === 'FS_TOO_LARGE') {
+        return statusFailure(413, 'file-too-large', FILE_MEDIA_OVERSIZE_MESSAGE)
+      }
+      if (
+        code === 'workspace-file/not-regular-file' ||
+        code === 'FS_NOT_REGULAR_FILE' ||
+        code === 'FS_PERMISSION_DENIED' ||
+        code === 'FS_SANDBOX_DENIED' ||
+        code === 'not-shared'
+      ) {
+        return statusFailure(403, code, '远程文件不可读取')
+      }
+      if (LINK_DOWN_CODES.has(code)) return statusFailure(503, code, '服务端离线，远程文件暂时无法读取')
+      return statusFailure(502, code, '远程文件读取失败')
+    }
+  }
+
+  const wrappedFile = async (request: Request): Promise<Response> => {
+    counters.fileCalls += 1
+    // The other halves may have registered while we were installing (the
+    // same courtesy the upload and export wrappers pay each other).
+    if (installed && uploadEntry === undefined && uploadAttachRefused === undefined) attachUpload()
+    if (installed && exportEntry === undefined && exportAttachRefused === undefined) attachExport()
+    const passthrough = (): Promise<Response> =>
+      savedFile !== undefined ? savedFile.call(fileEntry, request) : Promise.resolve(new Response('not found', { status: 404 }))
+    // An uninstalled (chained-over) wrap is INERT, not absent.
+    if (!installed) return passthrough()
+    if (request.method !== 'GET' && request.method !== 'HEAD') return passthrough()
+    let url: URL
+    try {
+      url = new URL(request.url)
+    } catch {
+      return passthrough()
+    }
+    if (url.pathname !== FILE_MEDIA_PATH) return passthrough()
+    const filePath = firstQuery(url, 'path')
+    if (filePath === undefined || filePath === '' || filePath.includes('\0')) return passthrough()
+    // Which remote session owns this path — an explicit VIRTUAL sessionId
+    // in the URL decides on its own (forward-compat for callers that know
+    // their session); otherwise the intercept handle attributes by cwd and
+    // current-session. `undefined` = the LOCAL route's business.
+    const explicit = firstQuery(url, 'sessionId')
+    const explicitParts = explicit === undefined || explicit === '' ? undefined : fromVirtual(explicit)
+    const scope = explicitParts !== undefined
+      ? { serverId: explicitParts.serverId, sessionId: explicitParts.id }
+      : resolveRemoteFileScope?.(filePath)
+    if (scope === undefined) return passthrough()
+    counters.fileForwarded += 1
+    return fetchRemoteFile(scope, filePath, request, passthrough)
   }
 
   // ---- the per-route attach (T51-fix) --------------------------------------
@@ -511,10 +755,33 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
     return true
   }
 
+  /** The media half of {@link attachUpload} (P55-2). Runs only when the
+   * wiring handed a `resolveRemoteFileScope` over — without it the route is
+   * never probed at all, which is what keeps the legacy installs (and the
+   * probe-count pins) byte-identical. */
+  const attachFile = (): boolean => {
+    if (!fileMediaEnabled || !installed) return true
+    if (fileEntry !== undefined) return true
+    const candidate = routes.get(FILE_MEDIA_PATH)
+    if (candidate === undefined) return false
+    const problem = entryProblem(candidate, ['GET', 'HEAD'], 'buffered')
+    if (problem !== undefined) {
+      fileAttachRefused = problem
+      log?.('file media route attach refused: %s', problem)
+      return true
+    }
+    fileEntry = candidate
+    savedFile = fileEntry.fetch
+    fileEntry.fetch = wrappedFile
+    log?.('file media route attached')
+    return true
+  }
+
   // First attach, right now: whatever the table already held is wrapped
   // before this returns.
   attachUpload()
   attachExport()
+  attachFile()
 
   // The bounded retry for what was absent (T51-fix): a probe every
   // attachRetryMs, at most attachAttempts of them, stopped early once
@@ -533,7 +800,9 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
     // itself, so once a route's attach is refused it must not keep the
     // bounded retry spinning idle past it — only a route that is still
     // genuinely absent counts as pending. (Mirrors the `uploadPending` /
-    // `exportPending` diagnostics flags.)
+    // `exportPending` / `filePending` diagnostics flags.) The media clause
+    // exists only when the scope resolver was handed over (P55-2).
+    (fileMediaEnabled && fileEntry === undefined && fileAttachRefused === undefined) ||
     (uploadEntry === undefined && uploadAttachRefused === undefined) ||
     (exportEntry === undefined && exportAttachRefused === undefined)
   if (stillPending() && attempts < attachAttempts) {
@@ -541,6 +810,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
       attempts += 1
       attachUpload()
       attachExport()
+      attachFile()
       if (!stillPending() || attempts >= attachAttempts) stopRetrying()
     }, attachRetryMs)
     if (typeof retryTimer.unref === 'function') retryTimer.unref()
@@ -556,6 +826,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
       // original would silently drop ITS wrap. Ours goes inert instead.
       if (uploadEntry !== undefined && uploadEntry.fetch === wrappedUpload) uploadEntry.fetch = savedUpload as FetchRouteEntry['fetch']
       if (exportEntry !== undefined && exportEntry.fetch === wrappedExport) exportEntry.fetch = savedExport as FetchRouteEntry['fetch']
+      if (fileEntry !== undefined && fileEntry.fetch === wrappedFile) fileEntry.fetch = savedFile as FetchRouteEntry['fetch']
     },
     diagnostics(): FetchRouteInterceptDiagnostics {
       return {
@@ -567,7 +838,23 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
         exportPending: installed && exportEntry === undefined && exportAttachRefused === undefined,
         uploadAttachRefused,
         exportAttachRefused,
-        ...counters,
+        // The upload/export counters spread verbatim; the file counters and
+        // flags stay ABSENT unless the media mount is enabled (P55-2), so a
+        // pre-P55-2 diagnostics consumer sees the exact old key set.
+        uploadCalls: counters.uploadCalls,
+        uploadForwarded: counters.uploadForwarded,
+        uploadRefused: counters.uploadRefused,
+        exportBlocked: counters.exportBlocked,
+        ...(fileMediaEnabled
+          ? {
+              fileWrapped: fileEntry !== undefined && fileEntry.fetch === wrappedFile,
+              filePending: installed && fileEntry === undefined && fileAttachRefused === undefined,
+              fileAttachRefused,
+              fileCalls: counters.fileCalls,
+              fileForwarded: counters.fileForwarded,
+              fileRefused: counters.fileRefused,
+            }
+          : {}),
         recentFailures: [...failures],
       }
     },

@@ -5255,3 +5255,134 @@ test('CP5: a waterfall the aborted $events generation already decoded never reac
   )
   await iterator.return?.(undefined)
 })
+
+// -- P55-2: resolveRemoteFileScope — the /api/file session attribution --------
+
+test('P55-2: resolveRemoteFileScope answers the just-opened remote follow at once, before any browser report', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.streamFrames = [
+    { type: 'snapshot', header: { version: 4, id: LOCAL_ID, cwd: '/srv/work' }, cursor: 0, records: [] },
+  ]
+  // Default install: no getCurrentSession injected — permanently `unavailable`,
+  // so EVERY answer below comes from the follow tracking alone.
+  const { handle } = install(gateway, relay)
+  assert.equal(handle.resolveRemoteFileScope('/srv/work/chart.png'), undefined, 'nothing is known before the first follow opens')
+
+  // Opening the stream settles the answer SYNCHRONOUSLY — the wrapper marks
+  // the followed session before it returns, so the first <img> of the page
+  // (which races the 1s current-session report) cannot fall to the local 404.
+  const iterable = gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined })
+  assert.deepEqual(
+    handle.resolveRemoteFileScope('/tmp/some-unrelated/render.png'),
+    { serverId: SERVER_ID, sessionId: LOCAL_ID },
+    'a path no known cwd claims falls back to the just-opened remote session (step C)',
+  )
+
+  // The snapshot frame's header.cwd feeds the precise match: a path under the
+  // session's cwd resolves to THAT session even while nothing else knows it.
+  await drained(iterable)
+  assert.deepEqual(
+    handle.resolveRemoteFileScope('/srv/work/sub/dir/notes.md'),
+    { serverId: SERVER_ID, sessionId: LOCAL_ID },
+    'a subpath of the snapshot cwd matches the session (step B)',
+  )
+  assert.deepEqual(
+    handle.resolveRemoteFileScope('relative.png'),
+    { serverId: SERVER_ID, sessionId: LOCAL_ID },
+    'no cwd claim anywhere still falls back to the active remote session (step C)',
+  )
+  handle.uninstall()
+})
+
+test('P55-2: resolveRemoteFileScope matches session/list cwds precisely (POSIX and Windows, drive-letter case)', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.invokeValues['session/list'] = {
+    items: [
+      { sessionId: 'session-posix', cwd: '/Volumes/Data/work' },
+      { sessionId: 'session-win', cwd: 'C:\\Users\\dev\\proj' },
+    ],
+  }
+  const { handle } = install(gateway, relay)
+  // The merged list pull records each remote row's cwd under its ORIGINAL id.
+  await gateway.rpcBridge('session/list', { args: {} }, undefined, undefined)
+
+  assert.deepEqual(
+    handle.resolveRemoteFileScope('/Volumes/Data/work/out/chart.png'),
+    { serverId: SERVER_ID, sessionId: 'session-posix' },
+    'a POSIX subpath matches the session whose cwd roots it',
+  )
+  assert.equal(
+    handle.resolveRemoteFileScope('/Volumes/Data/other/chart.png'),
+    undefined,
+    'a sibling directory of a known cwd is not a match',
+  )
+  assert.deepEqual(
+    handle.resolveRemoteFileScope('C:\\Users\\dev\\proj\\build\\out.png'),
+    { serverId: SERVER_ID, sessionId: 'session-win' },
+    'a Windows backslash path matches its session',
+  )
+  assert.deepEqual(
+    handle.resolveRemoteFileScope('c:/users/dev/proj/readme.md'),
+    { serverId: SERVER_ID, sessionId: 'session-win' },
+    'the drive letter compares case-insensitively and forward slashes normalize',
+  )
+  assert.equal(
+    handle.resolveRemoteFileScope('C:\\Users\\dev\\project\\x.png'),
+    undefined,
+    'a directory merely prefixed by the cwd string is not a match',
+  )
+  handle.uninstall()
+})
+
+test('P55-2: after switching to a local follow, paths off every remote cwd answer undefined; known cwds still match', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.streamFrames = [
+    { type: 'snapshot', header: { version: 4, id: LOCAL_ID, cwd: '/srv/work' }, cursor: 0, records: [] },
+  ]
+  const { handle } = install(gateway, relay)
+  const remoteFollow = gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined })
+  await drained(remoteFollow)
+  assert.deepEqual(handle.resolveRemoteFileScope('/srv/work/a.png'), { serverId: SERVER_ID, sessionId: LOCAL_ID })
+
+  // The user navigates to a LOCAL session: the follow carries a non-virtual
+  // session address, so the wrapper marks the switch at once.
+  const localFollow = gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: 'session-local-1' } } } }, undefined, undefined, undefined, { signal: undefined })
+  await drained(localFollow)
+  assert.equal(
+    handle.resolveRemoteFileScope('/tmp/elsewhere/x.png'),
+    undefined,
+    'the active remote is gone; a path no cwd claims stays local',
+  )
+  assert.deepEqual(
+    handle.resolveRemoteFileScope('/srv/work/a.png'),
+    { serverId: SERVER_ID, sessionId: LOCAL_ID },
+    'a precise cwd match still forwards to the remote session that owns the file',
+  )
+  handle.uninstall()
+})
+
+test('P55-2: the reported current session drives the fallback until a local follow contradicts it', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  let current = { kind: 'open', sessionId: VIRTUAL_ID }
+  const { handle } = install(gateway, relay, { getCurrentSession: () => current })
+  assert.deepEqual(
+    handle.resolveRemoteFileScope('/anything/x.png'),
+    { serverId: SERVER_ID, sessionId: LOCAL_ID },
+    'step A reads the browser-reported virtual session first',
+  )
+
+  // A local follow in THIS process is the newer fact — the report (which may
+  // lag a reload by up to the report interval) must not override it.
+  const localFollow = gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: 'session-local-1' } } } }, undefined, undefined, undefined, { signal: undefined })
+  await drained(localFollow)
+  assert.equal(handle.resolveRemoteFileScope('/anything/x.png'), undefined, 'the local follow wins over a stale virtual report')
+
+  // And the browser catching up clears the contradiction again.
+  current = { kind: 'open', sessionId: 'session-local-1' }
+  assert.equal(handle.resolveRemoteFileScope('/anything/x.png'), undefined, 'a local current session never forwards')
+  handle.uninstall()
+})
