@@ -15,7 +15,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { FILE_UPLOAD_PATH, SESSION_EXPORT_PATH, checkFetchRouteShape, installFetchRouteIntercept, shouldFallbackInstall } = require('../lib/fetch-route-intercept.js')
+const { FILE_UPLOAD_PATH, SESSION_EXPORT_PATH, FILE_MEDIA_PATH, MAX_FILE_MEDIA_BYTES, checkFetchRouteShape, installFetchRouteIntercept, shouldFallbackInstall } = require('../lib/fetch-route-intercept.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { MAX_UPLOAD_BYTES } = require('../lib/relay-server.js')
 const { RelayError } = require('../lib/relay-client.js')
@@ -29,7 +29,7 @@ const RECEIPT = { ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'at
  * Either entry can be omitted (or reshaped) to exercise the lazy attach and
  * the per-route refusal. */
 function fakeConnection(opts = {}) {
-  const seen = { upload: [], export: [] }
+  const seen = { upload: [], export: [], file: [] }
   const routes = new Map()
   if (opts.upload !== null) {
     routes.set(FILE_UPLOAD_PATH, {
@@ -57,6 +57,21 @@ function fakeConnection(opts = {}) {
       },
     })
   }
+  // P55-2: the host's media route (SessionMediaReferences registers GET/HEAD
+  // buffered exactly like this). Present by default — installs WITHOUT a
+  // resolveRemoteFileScope never probe or wrap it, so the legacy tests see
+  // nothing.
+  if (opts.file !== null) {
+    routes.set(FILE_MEDIA_PATH, {
+      methods: new Set(['GET', 'HEAD']),
+      requestBody: 'buffered',
+      ...(opts.file ?? {}),
+      fetch: async (request) => {
+        seen.file.push(request)
+        return new Response('local-file', { status: 200, headers: { 'content-type': 'text/plain' } })
+      },
+    })
+  }
   return { fetchRoutes: routes, seen }
 }
 
@@ -66,9 +81,16 @@ function fakeConnection(opts = {}) {
 function fakeRelay(overrides = {}) {
   const calls = []
   let play = overrides.play ?? { status: 200, contentType: 'application/json; charset=utf-8', body: JSON.stringify(RECEIPT) }
+  // P55-2: the invoke face the /api/file wrapper reads — records every call
+  // and plays one staged answer (a value or an Error). Separate from the
+  // upload `calls` ring so the legacy assertions stay untouched.
+  let invokePlay = overrides.invokePlay ?? undefined
+  const invokes = []
   return {
     calls,
     setPlay: (next) => { play = next },
+    invokes,
+    setInvokePlay: (next) => { invokePlay = next },
     state: overrides.state ?? 'online',
     handshakeInfo: { relayProtocol: 1, serverId: overrides.serverId ?? SERVER_ID, serverName: '假服务器', dshVersion: '0.0.0', fingerprints: {} },
     async upload(options, signal) {
@@ -80,6 +102,11 @@ function fakeRelay(overrides = {}) {
       calls.push(record)
       if (play instanceof Error) throw play
       return play
+    },
+    async invoke(namespace, method, args, signal) {
+      invokes.push({ namespace, method, args, signal })
+      if (invokePlay instanceof Error) throw invokePlay
+      return invokePlay
     },
   }
 }
@@ -680,4 +707,297 @@ test('MS-4: a local session id still reaches the local route untouched in pool m
     assert.deepEqual(await response.json(), { ok: true, value: { receiptId: 'local', bytes: 11 } })
     assert.equal(relayA.calls.length, 0)
   } finally { handle.uninstall() }
+})
+
+// ---- P55-2: the /api/file media wrap --------------------------------------
+
+/** A bytes answer shaped the way the relay channel carries it: the server
+ * marks readBytes's Uint8Array as `{ $zr-u8: base64 }` (invoke-binary.ts). */
+function bytesAnswer(buffer) {
+  return { offset: 0, data: { '$zr-u8': Buffer.from(buffer).toString('base64') }, eof: true, absolutePath: '/srv/work/f', version: 'v1' }
+}
+
+function fileRequest(path, init = {}) {
+  const query = new URLSearchParams({ path })
+  if (init.sessionId !== undefined) query.set('sessionId', init.sessionId)
+  return new Request(`http://dsh.internal/api/file?${query.toString()}`, { method: init.method ?? 'GET' })
+}
+
+/** An install whose resolver attributes `/srv/work/…` to the SERVER_ID
+ * session and declines everything else. */
+const installFile = (connection, relay, resolver = (path) => (path.startsWith('/srv/work/') ? { serverId: SERVER_ID, sessionId: LOCAL_ID } : undefined)) =>
+  install(connection, relay, { resolveRemoteFileScope: resolver })
+
+test('file (P55-2): GET forwards readBytes, restores the $zr-u8 bytes and answers 200 with the safe headers', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay()
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01])
+  relay.setInvokePlay(bytesAnswer(PNG))
+  const handle = installFile(connection, relay)
+  try {
+    assert.equal(handle.diagnostics().fileWrapped, true, 'the media route is wrapped when a resolver is present')
+    const request = fileRequest('/srv/work/chart.png')
+    const response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(request)
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('content-type'), 'image/png')
+    assert.equal(response.headers.get('x-content-type-options'), 'nosniff')
+    assert.equal(response.headers.get('content-security-policy'), "sandbox; default-src 'none'")
+    assert.equal(response.headers.get('cache-control'), 'private, no-store')
+    assert.equal(response.headers.get('content-length'), String(PNG.length))
+    assert.ok(Buffer.from(await response.arrayBuffer()).equals(PNG), 'the exact bytes came back')
+    assert.equal(relay.invokes.length, 1)
+    assert.deepEqual(
+      { namespace: relay.invokes[0].namespace, method: relay.invokes[0].method, args: relay.invokes[0].args },
+      { namespace: 'workspaceFiles', method: 'readBytes', args: { workspaceFileScopeId: LOCAL_ID, path: '/srv/work/chart.png', options: {} } },
+      'the REAL session id and the absolute path ride to the server',
+    )
+    assert.equal(relay.invokes[0].signal, request.signal, 'the browser abort rides along')
+    assert.equal(connection.seen.file.length, 0, 'the local media route was never reached')
+    const diagnostics = handle.diagnostics()
+    assert.equal(diagnostics.fileCalls, 1)
+    assert.equal(diagnostics.fileForwarded, 1)
+    assert.equal(diagnostics.fileRefused, 0)
+  } finally { handle.uninstall() }
+})
+
+test('file (P55-2): the media type comes from the path extension', async () => {
+  const rows = [
+    ['a.md', 'text/markdown; charset=utf-8'],
+    ['b.HTML', 'text/html; charset=utf-8'],
+    ['c.svg', 'image/svg+xml'],
+    ['d.mp4', 'video/mp4'],
+    ['e.log', 'text/plain; charset=utf-8'],
+    ['no-ext', 'application/octet-stream'],
+  ]
+  for (const [name, expected] of rows) {
+    const connection = fakeConnection()
+    const relay = fakeRelay()
+    relay.setInvokePlay(bytesAnswer('x'))
+    const handle = installFile(connection, relay)
+    try {
+      const response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest(`/srv/work/${name}`))
+      assert.equal(response.status, 200, name)
+      assert.equal(response.headers.get('content-type'), expected, name)
+    } finally { handle.uninstall() }
+  }
+})
+
+test('file (P55-2): HEAD forwards stat and answers Content-Length without a body', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay()
+  relay.setInvokePlay({ absolutePath: '/srv/work/chart.png', version: 'v1', bytes: 4321 })
+  const handle = installFile(connection, relay)
+  try {
+    const response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/chart.png', { method: 'HEAD' }))
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('content-type'), 'image/png')
+    assert.equal(response.headers.get('content-length'), '4321')
+    const body = await response.arrayBuffer()
+    assert.equal(body.byteLength, 0, 'a HEAD answer carries no body')
+    assert.equal(relay.invokes.length, 1)
+    assert.deepEqual(
+      { namespace: relay.invokes[0].namespace, method: relay.invokes[0].method, args: relay.invokes[0].args },
+      { namespace: 'workspaceFiles', method: 'stat', args: { workspaceFileScopeId: LOCAL_ID, path: '/srv/work/chart.png' } },
+      'stat takes the scope and the path, no options',
+    )
+    assert.equal(connection.seen.file.length, 0)
+  } finally { handle.uninstall() }
+})
+
+test('file (P55-2): oversize answers 413 — the stat gate, the byte gate and the too-large error alike', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay()
+  const handle = installFile(connection, relay)
+  try {
+    // stat reports a size past the cap: refused before any body moves.
+    relay.setInvokePlay({ absolutePath: '/srv/work/huge.png', version: 'v1', bytes: MAX_FILE_MEDIA_BYTES + 1 })
+    let response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/huge.png', { method: 'HEAD' }))
+    assert.equal(response.status, 413)
+    assert.equal(relay.invokes.length, 1, 'stat ran, readBytes never did')
+
+    // The server's own cap refuses the read (workspace-file/too-large).
+    relay.setInvokePlay(new RelayError('workspace-file/too-large', '"huge.png" exceeds the cap', 413))
+    response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/huge.png'))
+    assert.equal(response.status, 413)
+    assert.equal(relay.invokes.length, 2)
+
+    // A restored body past the cap (the server cap was raised, ours stands) is refused too.
+    relay.setInvokePlay(bytesAnswer(Buffer.alloc(MAX_FILE_MEDIA_BYTES + 1)))
+    response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/huge.png'))
+    assert.equal(response.status, 413)
+    assert.equal(handle.diagnostics().fileRefused, 3)
+  } finally { handle.uninstall() }
+})
+
+test('file (P55-2): a remote not-found falls back to the local route — its 200 is adopted, otherwise 404', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay()
+  // The ORIGINAL local route is swapped before install (so the wrap saves
+  // THIS one) and answers via a flag the test flips mid-test.
+  let localMisses = false
+  connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch = async (request) => {
+    connection.seen.file.push(request)
+    return localMisses ? new Response('missing', { status: 404 }) : new Response('local-file', { status: 200, headers: { 'content-type': 'text/plain' } })
+  }
+  relay.setInvokePlay(new RelayError('workspace-file/not-found', 'no entry at "/srv/work/gone.png"', 404))
+  const handle = installFile(connection, relay)
+  try {
+    // The local route still has the file: its answer wins.
+    let response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/gone.png'))
+    assert.equal(response.status, 200)
+    assert.equal(await response.text(), 'local-file', 'the local answer was adopted')
+    assert.equal(connection.seen.file.length, 1)
+
+    // The local route misses too: an honest 404 for the <img> to unload on.
+    localMisses = true
+    response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/gone.png'))
+    assert.equal(response.status, 404)
+    assert.equal(relay.invokes.length, 2, 'both attempts went through the relay first')
+  } finally { handle.uninstall() }
+})
+
+test('file (P55-2): relay refusals map to honest statuses — permission 403, link death 503, other 502', async () => {
+  const rows = [
+    [new RelayError('FS_PERMISSION_DENIED', 'denied'), 403],
+    [new RelayError('workspace-file/not-regular-file', 'a directory', 403), 403],
+    [new RelayError('not-shared', 'the session is not shared any more', 403), 403],
+    [new RelayError('offline', 'the chain answered 502', 502), 503],
+    [new RelayError('gateway/invocation-unavailable', 'no such method', 400), 502],
+    ['plain-error', 502],
+  ]
+  for (const [play, expected] of rows) {
+    const connection = fakeConnection()
+    const relay = fakeRelay()
+    relay.setInvokePlay(play === 'plain-error' ? new Error('boom') : play)
+    const handle = installFile(connection, relay, () => ({ serverId: SERVER_ID, sessionId: LOCAL_ID }))
+    try {
+      const response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/x.png'))
+      assert.equal(response.status, expected, `code ${(play.code ?? 'plain')} → ${expected}`)
+      assert.equal(connection.seen.file.length, 0, `the local route stayed out of a ${expected}`)
+    } finally { handle.uninstall() }
+  }
+})
+
+test('file (P55-2): an offline relay answers 503 and another server\'s scope 403s, nothing travels', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay({ state: 'offline' })
+  const handle = installFile(connection, relay)
+  try {
+    const response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/chart.png'))
+    assert.equal(response.status, 503)
+    assert.equal(relay.invokes.length, 0)
+    assert.equal(handle.diagnostics().fileRefused, 1)
+  } finally { handle.uninstall() }
+
+  const connection2 = fakeConnection()
+  const relay2 = fakeRelay()
+  const foreign = installFile(connection2, relay2, () => ({ serverId: 'ffffffff', sessionId: 's' }))
+  try {
+    const response = await connection2.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/chart.png'))
+    assert.equal(response.status, 403, 'a server the single-server wiring does not hold refuses')
+    assert.equal(relay2.invokes.length, 0)
+  } finally { foreign.uninstall() }
+})
+
+test('file (P55-2): an explicit virtual sessionId forwards without cwd help; a local one passes through', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay()
+  relay.setInvokePlay(bytesAnswer('x'))
+  const handle = installFile(connection, relay, () => undefined)
+  try {
+    const remote = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/anywhere/x.png', { sessionId: toVirtual(SERVER_ID, LOCAL_ID) }))
+    assert.equal(remote.status, 200)
+    assert.equal(relay.invokes.length, 1, 'the explicit virtual id decided the scope on its own')
+    assert.equal(relay.invokes[0].args.workspaceFileScopeId, LOCAL_ID)
+
+    const local = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/anywhere/x.png', { sessionId: LOCAL_ID }))
+    assert.equal(local.status, 200)
+    assert.equal(await local.text(), 'local-file', 'the local id reached the local route')
+    assert.equal(relay.invokes.length, 1, 'nothing extra traveled')
+  } finally { handle.uninstall() }
+})
+
+test('file (P55-2): a path the resolver declines passes through to the local route untouched', async () => {
+  const connection = fakeConnection()
+  const relay = fakeRelay()
+  const handle = installFile(connection, relay)
+  try {
+    const response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/local/only/shot.png'))
+    assert.equal(response.status, 200)
+    assert.equal(await response.text(), 'local-file')
+    assert.equal(connection.seen.file.length, 1, 'the ORIGINAL route answered')
+    assert.equal(relay.invokes.length, 0, 'nothing traveled')
+    const diagnostics = handle.diagnostics()
+    assert.equal(diagnostics.fileForwarded, 0)
+    assert.equal(diagnostics.fileCalls, 1)
+  } finally { handle.uninstall() }
+})
+
+test('file (P55-2): without a resolver the media route is never probed, wrapped or counted', async () => {
+  class CountingMap extends Map {
+    constructor() {
+      super()
+      this.gets = {}
+    }
+    get(key) {
+      this.gets[key] = (this.gets[key] ?? 0) + 1
+      return super.get(key)
+    }
+  }
+  const connection = fakeConnection()
+  const counting = new CountingMap()
+  for (const [key, value] of connection.fetchRoutes) counting.set(key, value)
+  connection.fetchRoutes = counting
+  const relay = fakeRelay()
+  const handle = install(connection, relay, { attachRetryMs: 10, attachAttempts: 10 })
+  try {
+    const diagnostics = handle.diagnostics()
+    assert.equal(diagnostics.fileWrapped, undefined, 'the media fields stay absent without the resolver')
+    assert.equal(diagnostics.filePending, undefined)
+    assert.equal(diagnostics.fileCalls, undefined)
+    // The legacy routes probed exactly twice each (shape check + first
+    // attach); the media route was NEVER read.
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    assert.equal(counting.gets[FILE_UPLOAD_PATH], 2)
+    assert.equal(counting.gets[SESSION_EXPORT_PATH], 2)
+    assert.equal(counting.gets[FILE_MEDIA_PATH], undefined, 'no probe ever touched the media route')
+    // And the unwrapped route serves directly.
+    const response = await counting.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/chart.png'))
+    assert.equal(await response.text(), 'local-file')
+  } finally { handle.uninstall() }
+})
+
+test('file (P55-2): with a resolver a late-registered media entry attaches via the retry and serves', async () => {
+  const connection = fakeConnection({ file: null })
+  const relay = fakeRelay()
+  relay.setInvokePlay(bytesAnswer('x'))
+  const handle = installFile(connection, relay)
+  try {
+    let diagnostics = handle.diagnostics()
+    assert.equal(diagnostics.fileWrapped, false)
+    assert.equal(diagnostics.filePending, true, 'absent and still retrying')
+
+    connection.fetchRoutes.set(FILE_MEDIA_PATH, {
+      methods: new Set(['GET', 'HEAD']),
+      requestBody: 'buffered',
+      fetch: async () => new Response('local-file', { status: 200 }),
+    })
+    const start = Date.now()
+    while (Date.now() - start < 2000) {
+      if (handle.diagnostics().fileWrapped) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    diagnostics = handle.diagnostics()
+    assert.equal(diagnostics.fileWrapped, true, 'the late media entry got wrapped')
+    assert.equal(diagnostics.filePending, false)
+
+    const response = await connection.fetchRoutes.get(FILE_MEDIA_PATH).fetch(fileRequest('/srv/work/chart.png'))
+    assert.equal(response.status, 200)
+    assert.equal(relay.invokes.length, 1)
+  } finally { handle.uninstall() }
+})
+
+test('file (P55-2): the pinned cap and the media route path name', () => {
+  assert.equal(FILE_MEDIA_PATH, '/api/file')
+  assert.equal(MAX_FILE_MEDIA_BYTES, 20 * 1024 * 1024)
 })

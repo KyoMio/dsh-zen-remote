@@ -263,6 +263,8 @@ Each field resolves in order: **environment variable > plugin row settings > `~/
 | `trustedProxies` | empty | Comma-separated trusted proxy IPs when the reverse proxy runs on another machine |
 | `vapidSubject` | `mailto:admin@localhost` | Web Push contact (**must be a real `mailto:` or `https://` URL for iOS delivery**) |
 | `lang` | `auto` | Gateway & notification language: `auto` (browser `Accept-Language`), `zh`, or `en` |
+| `pushEnabled` | on | Master switch for session notifications; off stops every automatic push and unregisters the `push_notify` tool and its system-prompt hint |
+| `pushSessionName` | off | Open the notification body with `Session: <name>` (the source session's name; the title keeps the fixed event heading) |
 | `pushTurnEnd` | off | Also send a push when an ordinary turn finishes (approvals/questions always push) |
 | `pushEvents` | `agent/turn-stopping` | Comma-separated events that count as turn end when `pushTurnEnd` is on |
 | `pushDebounceMs` | `15000` | Minimum interval (ms) between automatic pushes |
@@ -277,7 +279,7 @@ Each field resolves in order: **environment variable > plugin row settings > `~/
 | `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` | `0.42` / `400` / `15` | Soft-keyboard lift calibration fallback for environments where the OS hides keyboard height |
 | `maxUploadBytes` | 20 MB | Mobile attachment upload cap |
 
-Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_HOST`, `LAN_GATE_TARGET_PORT`, `LAN_GATE_RATE_LIMIT`, `LAN_GATE_TRUSTED_PROXIES`, `LAN_GATE_VAPID_SUBJECT`, `LAN_GATE_LANG`, `DSH_PUSH_TURN_END`, `DSH_PUSH_EVENTS`, `DSH_PUSH_DEBOUNCE_MS`, `DSH_PUSH_SUMMARY`, `DSH_PUSH_TOOL`, `DSH_PUSH_LANG`, `DSH_PUSH_APPROVAL_GRACE_MS`.
+Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_HOST`, `LAN_GATE_TARGET_PORT`, `LAN_GATE_RATE_LIMIT`, `LAN_GATE_TRUSTED_PROXIES`, `LAN_GATE_VAPID_SUBJECT`, `LAN_GATE_LANG`, `DSH_PUSH_ENABLED`, `DSH_PUSH_SESSION_NAME`, `DSH_PUSH_TURN_END`, `DSH_PUSH_EVENTS`, `DSH_PUSH_DEBOUNCE_MS`, `DSH_PUSH_SUMMARY`, `DSH_PUSH_TOOL`, `DSH_PUSH_LANG`, `DSH_PUSH_APPROVAL_GRACE_MS`.
 
 </details>
 

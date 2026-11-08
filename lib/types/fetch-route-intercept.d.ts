@@ -46,12 +46,27 @@
  * and ours goes inert instead (the same posture as intercept.ts).
  */
 import type { RelayClient } from './relay-client.js';
+import { MAX_FILE_MEDIA_BYTES } from './upload-limits.js';
 /** The host's upload route, verbatim from its registration (RT
  * dsh-client-file-upload lib/index.js:73). */
 export declare const FILE_UPLOAD_PATH = "/api/session/uploadFileBinary";
 /** The host's session-log export route (RT dsh-session-log-export
  * lib/index.js:488). */
 export declare const SESSION_EXPORT_PATH = "/api/session.export";
+/** The host's media route (P55-2): how a Markdown image `![a](path)` in a
+ * session body actually loads — the renderer resolves the path against the
+ * session cwd into an ABSOLUTE server path and the browser's `<img>` asks
+ * for `/api/file?path=<encoded>` natively (no `window.fetch`, no
+ * `sessionId`), landing in this very table (RT
+ * dsh-api-session-controller lib/types/media-references.js:
+ * `registerFetchRoute({ path: '/api/file', methods: ['GET','HEAD'],
+ * requestBody: 'buffered', … })`). */
+export declare const FILE_MEDIA_PATH = "/api/file";
+/** The byte cap one forwarded file may answer with — defined once in
+ * src/upload-limits.ts (the one home of every MiB-scale ceiling, per the
+ * upload unification and scripts/check-upload-limits.mjs), re-exported
+ * here for the consumers the route narrative belongs to. */
+export { MAX_FILE_MEDIA_BYTES };
 /** Verdict of {@link checkFetchRouteShape}. STRUCTURAL only: `ok` answers
  * "is this a connection service with a fetch-route table at all"; each
  * route's entry findings travel as `notes` — present/absent/misshaped — and
@@ -100,15 +115,20 @@ export declare function shouldFallbackInstall(state: {
  * Check the RAW connection service instance against the shape the wrap
  * depends on. Pure inspection — nothing is mutated, so a failed check
  * leaves every route exactly as it was. Only the structural facts refuse;
- * the two entries' facts are described in `notes` (they attach lazily).
+ * the entries' facts are described in `notes` (they attach lazily).
+ *
+ * `probeFileMedia` (P55-2) adds the `/api/file` entry's note and — load-
+ * bearing for the legacy probe-count pins — its table READ. It defaults to
+ * false so a caller without a `resolveRemoteFileScope` (every pre-P55-2
+ * call site and test) touches exactly the two routes it always did.
  */
-export declare function checkFetchRouteShape(connection: unknown): FetchRouteShapeCheck;
+export declare function checkFetchRouteShape(connection: unknown, probeFileMedia?: boolean): FetchRouteShapeCheck;
 /** One refusal the wrappers answered, in the diagnostics ring. */
 export interface FetchRouteFailureRecord {
     /** ISO timestamp of the moment the refusal was answered. */
     time: string;
     /** Which wrapper answered it. */
-    route: 'upload' | 'export';
+    route: 'upload' | 'export' | 'file';
     code: string;
 }
 /** What the client status route surfaces about this interception: flags,
@@ -143,6 +163,21 @@ export interface FetchRouteInterceptDiagnostics {
     exportBlocked: number;
     /** The most recent refusals, oldest first, capped. */
     recentFailures: FetchRouteFailureRecord[];
+    /** The media entry currently holds our wrapper. */
+    fileWrapped?: boolean;
+    /** The media entry was absent at last check and the attach retry is still
+     * running. */
+    filePending?: boolean;
+    /** The media entry was present but misshaped — attach refused for THIS
+     * route only; the reason is stable diagnostics text. */
+    fileAttachRefused?: string | undefined;
+    /** Every media request that entered the wrapper, passthroughs included. */
+    fileCalls?: number;
+    /** Media requests served through the relay. */
+    fileForwarded?: number;
+    /** Media requests refused (offline, mismatch, relay/remote errors,
+     * oversize). */
+    fileRefused?: number;
 }
 export interface InstallFetchRouteInterceptOptions {
     /** The RAW connection service instance
@@ -164,6 +199,15 @@ export interface InstallFetchRouteInterceptOptions {
      * the upload goes through `relay` exactly when the id belongs to
      * `getServerId()`, with the original verdict order. */
     getRelayForServer?: (serverId: string) => RelayClient | undefined;
+    /** P55-2: the intercept handle's session-attribution answer (live, so the
+     * wiring forwards `interceptHandle?.resolveRemoteFileScope`). Its PRESENCE
+     * is the media mount's switch: without it, `/api/file` is never probed,
+     * wrapped, or counted — the pre-P55-2 behavior, byte for byte (the
+     * legacy probe-count pins depend on this). */
+    resolveRemoteFileScope?: (path: string) => {
+        serverId: string;
+        sessionId: string;
+    } | undefined;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
     /** The lazy-attach retry cadence (T51-fix): how often the table is
