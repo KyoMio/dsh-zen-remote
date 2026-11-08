@@ -148,3 +148,13 @@ test('T60: an invalid device-name draft disables pairing and says why', () => {
   assert.ok(hintAt > buttonAt, 'the fix-it hint renders in the pairing area')
   assert.ok(source.includes("form.serverName.invalid && <span"), 'the hint is gated on the draft being invalid')
 })
+
+test('push switches use Switch and disable dependent switches when pushEnabled is off', () => {
+  assert.ok(!source.includes('type="checkbox"'), 'SettingsSection boolean controls use Switch, not checkbox')
+  assert.ok(source.includes("const pushOff = form.pushEnabled.text !== 'true'"), 'pushOff derives from the master switch')
+  assert.ok(source.includes('checked={!parentDisabled && state.text === \'true\'}'), 'dependent switches show off when parentDisabled')
+  for (const field of ['pushSessionName', 'pushSummary', 'pushTurnEnd', 'pushTool']) {
+    assert.match(source, new RegExp(`bool\\(form\\.${field},\\s*'${field}',[^\\n]+,\\s*pushOff\\)`), `${field} is gated by pushOff`)
+  }
+})
+

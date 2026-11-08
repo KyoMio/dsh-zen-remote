@@ -956,29 +956,27 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   )
 
   // Boolean control (the shared fields have no checkbox): label row + switch.
-  const bool = (state: SettingsFieldState, field: string, label: string, hint: string) => (
-    <div className="zr-settings-field" key={field}>
+  const bool = (state: SettingsFieldState, field: string, label: string, hint: string, parentDisabled = false) => (
+    <div className="zr-settings-field" key={field} data-disabled={parentDisabled ? 'true' : undefined}>
       <div className="zr-settings-head">
-        <label htmlFor={`zr-settings-${field}`}>{label}</label>
+        <span className="zr-settings-head-title">{label}</span>
         {state.overridden && <span className="zr-settings-badge">{t('settings.overridden')}</span>}
         {state.overridden && (
-          <button type="button" className="zr-settings-reset" disabled={formDisabled || state.locked} onClick={() => { config.resetField(field) }}>{t('settings.reset')}</button>
+          <button type="button" className="zr-settings-reset" disabled={formDisabled || state.locked || parentDisabled} onClick={() => { config.resetField(field) }}>{t('settings.reset')}</button>
         )}
-        <span className="zr-settings-check-row">
-          <input
-            id={`zr-settings-${field}`}
-            type="checkbox"
-            disabled={formDisabled || state.locked}
-            checked={state.text === 'true'}
-            onChange={(e) => { config.stage(field, e.currentTarget.checked ? 'true' : 'false') }}
-          />
-        </span>
+        <Switch
+          disabled={formDisabled || state.locked || parentDisabled}
+          checked={!parentDisabled && state.text === 'true'}
+          label={label}
+          onChange={(checked) => { config.stage(field, checked ? 'true' : 'false') }}
+        />
       </div>
       <p className="zr-settings-hint">{hint}</p>
       {clearPreviewNote(state)}
       {annotations(field)}
     </div>
   )
+  const pushOff = form.pushEnabled.text !== 'true'
 
   const deviceRow = (device: SettingsDeviceView) => (
     <div className="zr-settings-device" key={device.id}>
@@ -1153,15 +1151,14 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               {text(form.vapidSubject, 'vapidSubject', t('settings.fieldVapidSubject'), t('settings.fieldVapidSubjectHint'), '')}
 
               <h3 className="zr-settings-card-title">{t('settings.pushTitle')}</h3>
-              {/* P55-1: the master switch and the session-name line lead the
-                  group — the off switch below hides nothing visually (the
-                  other controls stay renderable) but apply() wires nothing
-                  until it is back on. */}
+              {/* P55-1: the master switch leads the group; when off, the
+                  dependent push switches below are disabled and visually
+                  switched off, and apply() wires nothing until it is back on. */}
               {bool(form.pushEnabled, 'pushEnabled', t('settings.fieldPushEnabled'), t('settings.fieldPushEnabledHint'))}
-              {bool(form.pushSessionName, 'pushSessionName', t('settings.fieldPushSessionName'), t('settings.fieldPushSessionNameHint'))}
-              {bool(form.pushSummary, 'pushSummary', t('settings.fieldPushSummary'), t('settings.fieldPushSummaryHint'))}
-              {bool(form.pushTurnEnd, 'pushTurnEnd', t('settings.fieldPushTurnEnd'), t('settings.fieldPushTurnEndHint'))}
-              {bool(form.pushTool, 'pushTool', t('settings.fieldPushTool'), t('settings.fieldPushToolHint'))}
+              {bool(form.pushSessionName, 'pushSessionName', t('settings.fieldPushSessionName'), t('settings.fieldPushSessionNameHint'), pushOff)}
+              {bool(form.pushSummary, 'pushSummary', t('settings.fieldPushSummary'), t('settings.fieldPushSummaryHint'), pushOff)}
+              {bool(form.pushTurnEnd, 'pushTurnEnd', t('settings.fieldPushTurnEnd'), t('settings.fieldPushTurnEndHint'), pushOff)}
+              {bool(form.pushTool, 'pushTool', t('settings.fieldPushTool'), t('settings.fieldPushToolHint'), pushOff)}
               {text(form.pushDebounceMs, 'pushDebounceMs', t('settings.fieldPushDebounceMs'), t('settings.fieldPushDebounceMsHint'), t('settings.invalidNonNegativeInt'), true)}
               {select(form.lang, 'lang', t('settings.fieldLang'), t('settings.fieldLangHint'), ['auto', 'zh', 'en'], (option) => (
                 option === 'auto' ? t('settings.langAuto') : option === 'zh' ? t('settings.langZh') : t('settings.langEn')

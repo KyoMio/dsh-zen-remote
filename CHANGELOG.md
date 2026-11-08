@@ -9,9 +9,11 @@
 
 ### 新增
 
-- **会话通知总开关与来源会话名**（[#55](https://github.com/KyoMio/dsh-zen-remote/issues/55)）：新增 `pushEnabled`（默认开）——关闭后停用全部自动推送、不再注册 `push_notify` 工具与提示词段落；新增 `pushSessionName`（默认关）——开启后推送正文第一行为「来源会话：<会话名>」/ `Session: <name>`，标题保持固定事件标题不变。两开关均在设置页「推送」卡片，环境变量 `DSH_PUSH_ENABLED` / `DSH_PUSH_SESSION_NAME`。
+- **会话通知总开关与来源会话名**（[#55](https://github.com/KyoMio/dsh-zen-remote/issues/55)）：新增 `pushEnabled`（默认开）——关闭后停用全部自动推送、不再注册 `push_notify` 工具与提示词段落，设置页下方通知子开关同步置灰且回落为关闭态；新增 `pushSessionName`（默认关）——开启后推送正文第一行为「来源会话：<会话名>」/ `Session: <name>`，标题保持固定事件标题不变。通知与共享布尔开关统一改为滑动开关，环境变量 `DSH_PUSH_ENABLED` / `DSH_PUSH_SESSION_NAME`。
 
 ### 修复
+
+- **PWA 通知状态栏/任务栏小图标实心方块问题**：通知 `badge` 原先复用了带不透明蓝底的 `icon-192.png`，系统按单色 Alpha 掩码渲染时变成实心方块；现改为透明底纯白鲸鱼剪影 `badge-96.png`（同时在 `manifest.json` 登记 `monochrome` 图标）。
 
 - **远程会话正文图片无法显示**：子客户端查看远程会话时，回复正文里的 Markdown 图片（及右侧栏文档预览）发起的 `/api/file?path=…` 请求原来落到本机磁盘（URL 不带会话 id、浏览器原生 `<img>` 请求不走拦截），服务端路径在本机不存在直接 404，React `onError` 随即卸载 `<img>` 显示「图片无法预览」。现在子客户端按「当前活跃远程会话 + 各远程会话 cwd 前缀匹配」判定归属，将文件与媒体读取透明转发到所属主服务端已授权的 `workspaceFiles/readBytes` / `stat`（20 MiB 上限，响应头与本机路由一致）；远端报不存在时回退本机路由，本地会话请求零副作用直通。
 
