@@ -273,3 +273,25 @@ test('minting the code restarts nothing: after start, only status reads fly', as
     await new Promise((resolve) => gw.server.close(resolve))
   }
 })
+
+test('start with allowUnprobed: mints pairing code with probeWarning when self-probe fails, and desktop-client newcomer passes check()', async () => {
+  const gw = await startMockGateway({ devices: [{ id: 'dev-old', role: 'web' }] })
+  try {
+    const failedProbe = { kind: 'unreachable', reason: 'network', detail: 'ECONNREFUSED', ms: 2 }
+    const { manager } = makeManager(gw.port, { probeResult: failedProbe })
+    const result = await manager.start({ publicUrl: 'http://100.64.0.10:3088', allowUnprobed: true })
+    assert.equal(result.ok, true)
+    assert.equal(result.pairingCode, 'VERIFCODE')
+    assert.equal(result.publicUrl, 'http://100.64.0.10:3088')
+    assert.deepEqual(result.probeWarning, failedProbe)
+    assert.equal(manager.hasSession(), true)
+
+    // A desktop-client pairs (no lastWebClaim cookie record): check() passes.
+    gw.state.devices.push({ id: 'dev-desktop', role: 'desktop-client' })
+    const checked = await manager.check()
+    assert.equal(checked.result, 'pass')
+    assert.equal(checked.deviceId, 'dev-desktop')
+  } finally {
+    await new Promise((resolve) => gw.server.close(resolve))
+  }
+})

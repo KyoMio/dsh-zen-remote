@@ -14,6 +14,8 @@
  * private-network allowances) and a 10 s ceiling per request.
  */
 
+import http from 'node:http'
+import https from 'node:https'
 import { normalizeServerUrl } from '../client-pairing.js'
 
 /** What answered on `GET <publicUrl>/`. */
@@ -106,11 +108,61 @@ export interface ProbeOptions {
  * the caller is an XHR/API client and makes `GET /` answer 401 JSON
  * `{"ok":false,"reason":"unpaired"}` instead of the HTML pairing page;
  * `/lan-gate/admin` answers 403 JSON regardless of `Accept`). */
-async function probeOnce(
-  fetchImpl: typeof fetch,
+async function probeOnceDirect(
   url: string,
   timeoutMs: number,
 ): Promise<{ status: number; contentType: string; body: string }> {
+  const parsed = new URL(url)
+  const mod = parsed.protocol === 'https:' ? https : http
+  return await new Promise((resolve, reject) => {
+    const req = mod.request(
+      parsed,
+      {
+        method: 'GET',
+        headers: { Accept: 'text/html' },
+        agent: false,
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (chunk: Buffer | Uint8Array) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+        })
+        res.on('end', () => {
+          clearTimeout(timer)
+          resolve({
+            status: res.statusCode ?? 0,
+            contentType: String(res.headers['content-type'] ?? ''),
+            body: Buffer.concat(chunks).toString('utf8'),
+          })
+        })
+        res.on('error', (err) => {
+          clearTimeout(timer)
+          reject(err)
+        })
+      },
+    )
+    const timer = setTimeout(() => {
+      const timeoutError = new Error('The operation was aborted due to timeout')
+      timeoutError.name = 'TimeoutError'
+      req.destroy(timeoutError)
+    }, timeoutMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    req.on('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    req.end()
+  })
+}
+
+async function probeOnce(
+  fetchImpl: typeof fetch | undefined,
+  url: string,
+  timeoutMs: number,
+): Promise<{ status: number; contentType: string; body: string }> {
+  if (fetchImpl === undefined) {
+    return await probeOnceDirect(url, timeoutMs)
+  }
   const response = await fetchImpl(url, {
     redirect: 'manual',
     signal: AbortSignal.timeout(timeoutMs),
@@ -136,7 +188,7 @@ export async function probeHostPath(publicUrl: unknown, options: ProbeOptions = 
   if (!normalized.ok) {
     return { kind: 'unreachable', reason: normalized.reason === 'insecure-http' ? 'insecure-http' : 'invalid-url', ms: 0 }
   }
-  const fetchImpl = options.fetchImpl ?? fetch
+  const fetchImpl = options.fetchImpl
   const timeoutMs = options.timeoutMs ?? 10_000
   try {
     const [root, admin] = await Promise.all([

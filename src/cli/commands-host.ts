@@ -505,11 +505,18 @@ async function saveCfTokenIfProvided(ctx: CliExecutionContext): Promise<boolean>
 }
 
 /** Ask for the token exactly when none is saved yet (interactive runs
- * only) — a token already on disk must never be re-asked. */
-async function askCfTokenIfUnconfigured(ctx: CliExecutionContext, wizard: ServerRow | null): Promise<boolean> {
+ * only) — a token already on disk must never be re-asked. Prints the
+ * mode-specific Cloudflare permission checklist right before the prompt. */
+async function askCfTokenIfUnconfigured(
+  ctx: CliExecutionContext,
+  wizard: ServerRow | null,
+  mode: 'caddy' | 'cloudflared' = 'caddy',
+): Promise<boolean> {
   if (ctx.args.options.cfToken !== undefined && ctx.args.options.cfToken !== '') return true
   if (wizard?.cfTokenConfigured === true) return true
   if (!ctx.interactive || ctx.prompter === undefined) return true
+  ctx.stdout.write(`\n${ctx.t('setup.cfTokenGuide.title')}\n`)
+  ctx.stdout.write(`${ctx.t(mode === 'cloudflared' ? 'setup.cfTokenGuide.tunnel' : 'setup.cfTokenGuide.caddy')}\n`)
   const token = await ctx.prompter.inputText(ctx.t('setup.cfTokenQuestion'), undefined, undefined)
   if (token.trim() === '') return true
   const result = await ctx.ipc.request('POST', WIZARD_CF_TOKEN_ROUTE, { token: token.trim() })
@@ -608,12 +615,15 @@ async function startCloudflared(ctx: CliExecutionContext, sources: IngressSource
   const domain = await resolveDomain(ctx, sources.wizard)
   if (domain === null) return 1
   if (!(await saveCfTokenIfProvided(ctx))) return 1
-  if (!(await askCfTokenIfUnconfigured(ctx, sources.wizard))) return 1
+  if (!(await askCfTokenIfUnconfigured(ctx, sources.wizard, 'cloudflared'))) return 1
 
   const check = await ipc.request('POST', WIZARD_TUNNEL_CHECK_ROUTE, { domain })
   const checkBody = plainOf(check.body)
   if (check.status !== 200 || checkBody?.ok !== true) {
     out.write(`${tunnelFailureLine(t, 'host.ingress.tunnelCheckFailed', checkBody)}\n`)
+    if (checkBody?.reason === 'auth' || checkBody?.reason === 'zone-not-found') {
+      out.write(`${t('setup.cfTokenGuide.title')}\n${t('setup.cfTokenGuide.tunnel')}\n`)
+    }
     return 1
   }
 
@@ -650,6 +660,9 @@ async function startCloudflared(ctx: CliExecutionContext, sources: IngressSource
     }
     if (setup.status !== 200 || setupBody?.ok !== true) {
       out.write(`${tunnelFailureLine(t, 'host.ingress.tunnelSetupFailed', setupBody)}\n`)
+      if (setupBody?.reason === 'auth' || setupBody?.reason === 'zone-not-found') {
+        out.write(`${t('setup.cfTokenGuide.title')}\n${t('setup.cfTokenGuide.tunnel')}\n`)
+      }
       return 1
     }
   }
@@ -751,17 +764,42 @@ async function startExternal(ctx: CliExecutionContext, sources: IngressSources):
 
 /** LAN / Tailscale direct: rebind the gateway to 0.0.0.0, clear the
  * managed ingress mode, and wait (bounded) for the restarted gateway to
- * answer the admin status again. */
+ * answer the admin status again on 0.0.0.0. */
 async function startLan(ctx: CliExecutionContext, sources: IngressSources): Promise<number> {
-  const { t, args, ipc } = ctx
+  const { t, args } = ctx
   const out = ctx.stdout
+  const port = gatewayPortOf(sources.wizard, sources.admin)
   let lanUrl = args.options.publicUrl
   if (lanUrl === undefined || lanUrl === '') {
-    const lan = typeof sources.wizard?.lanAddress === 'string' && sources.wizard.lanAddress !== '' ? sources.wizard.lanAddress : ''
-    if (lan !== '') {
-      lanUrl = `http://${lan}:${gatewayPortOf(sources.wizard, sources.admin)}`
+    const rawCandidates = Array.isArray(sources.wizard?.lanAddresses) ? sources.wizard.lanAddresses : []
+    const candidates = rawCandidates
+      .map((item) => plainOf(item))
+      .filter((item): item is ServerRow => item !== null && typeof item.ip === 'string' && item.ip !== '')
+    if (candidates.length > 1 && ctx.interactive && ctx.prompter !== undefined) {
+      const labels = [
+        ...candidates.map((c) => {
+          const tag = c.kind === 'tailscale' ? 'Tailscale' : 'LAN'
+          const iface = typeof c.iface === 'string' && c.iface !== '' ? ` · ${c.iface}` : ''
+          return `http://${String(c.ip)}:${port} (${tag}${iface})`
+        }),
+        t('host.ingress.lanPickCustom'),
+      ]
+      const picked = await ctx.prompter.selectOne(t('host.ingress.lanPickQuestion'), labels, 0)
+      const chosen = candidates[picked]
+      if (chosen !== undefined) {
+        lanUrl = `http://${String(chosen.ip)}:${port}`
+      } else {
+        lanUrl = await askText(ctx, 'public-url', t('setup.publicUrlQuestion'))
+      }
+    } else if (candidates.length === 1) {
+      lanUrl = `http://${String(candidates[0].ip)}:${port}`
     } else {
-      lanUrl = await askText(ctx, 'public-url', t('setup.publicUrlQuestion'))
+      const lan = typeof sources.wizard?.lanAddress === 'string' && sources.wizard.lanAddress !== '' ? sources.wizard.lanAddress : ''
+      if (lan !== '') {
+        lanUrl = `http://${lan}:${port}`
+      } else {
+        lanUrl = await askText(ctx, 'public-url', t('setup.publicUrlQuestion'))
+      }
     }
   }
   if (!(await writeConfigOrReport(ctx, {
@@ -775,10 +813,16 @@ async function startLan(ctx: CliExecutionContext, sources: IngressSources): Prom
   out.write(`${t('host.ingress.lanWaiting', { seconds: waitSeconds })}\n`)
   const interval = ctx.pollIntervalMs ?? LAN_POLL_INTERVAL_DEFAULT_MS
   const deadline = Date.now() + waitSeconds * 1000
+  const checkHostField = typeof sources.wizard?.gatewayActualHost === 'string'
   await sleep(interval) // the restart watcher needs a beat to see the rebind
   while (true) {
     const admin = await fetchRecord(ctx, 'GET', ADMIN_STATUS_ROUTE)
-    if (admin?.gatewayReachable === true) break
+    if (admin?.gatewayReachable === true) {
+      if (!checkHostField) break
+      const latestWizard = await fetchRecord(ctx, 'GET', WIZARD_STATUS_ROUTE)
+      const actualHost = latestWizard?.gatewayActualHost
+      if (actualHost === undefined || actualHost === '0.0.0.0' || actualHost === '::') break
+    }
     if (Date.now() >= deadline) {
       out.write(`${t('host.ingress.lanTimeout', { seconds: waitSeconds })}\n`)
       return 1
@@ -956,14 +1000,30 @@ export async function runHostIngressVerifyCommand(ctx: CliExecutionContext): Pro
       publicUrl = await askText(ctx, 'public-url', t('setup.publicUrlQuestion'))
     }
 
-    const start = await ipc.request('POST', WIZARD_VERIFY_ROUTE, { publicUrl })
-    const startBody = plainOf(start.body)
-    const started = start.status === 200 && startBody?.ok === true
+    let start = await ipc.request('POST', WIZARD_VERIFY_ROUTE, { publicUrl })
+    let startBody = plainOf(start.body)
+    let started = start.status === 200 && startBody?.ok === true
+    // In LAN / Tailscale mode (`http://` private/Tailscale origin), the original
+    // DSH Web UI only listens on 127.0.0.1, so the user cannot open the Web UI
+    // to see a pairing code — the CLI is the ONLY place that can output it. If
+    // the local gateway is up (Light 1 ready) but the machine's self-probe of
+    // its own LAN/Tailscale IP hit a virtual-interface hairpin or routing
+    // restriction (`probe-failed`), fall back to `allowUnprobed: true` so the
+    // pairing code and QR are still minted for real device verification.
+    if (!started && startBody?.reason === 'probe-failed' && publicUrl.startsWith('http://')) {
+      const retry = await ipc.request('POST', WIZARD_VERIFY_ROUTE, { publicUrl, allowUnprobed: true })
+      const retryBody = plainOf(retry.body)
+      if (retry.status === 200 && retryBody?.ok === true) {
+        start = retry
+        startBody = retryBody
+        started = true
+      }
+    }
 
     if (args.options.json) {
       // --json is a machine-readable run: the structured verdict, no
       // interactive wait either way.
-      if (!started) {
+      if (!started || startBody === null) {
         const reason = typeof startBody?.reason === 'string' && startBody.reason !== '' ? startBody.reason : 'internal'
         out.write(`${JSON.stringify({ ok: false, reason }, null, 2)}\n`)
         return 1
@@ -978,7 +1038,7 @@ export async function runHostIngressVerifyCommand(ctx: CliExecutionContext): Pro
     }
 
     out.write(`${t('host.ingress.verifyTitle', { publicUrl })}\n`)
-    if (!started) {
+    if (!started || startBody === null) {
       const reason = typeof startBody?.reason === 'string' && startBody.reason !== '' ? startBody.reason : 'internal'
       renderVerifyFailure(ctx, reason, startBody?.detail)
       return 1
@@ -987,13 +1047,18 @@ export async function runHostIngressVerifyCommand(ctx: CliExecutionContext): Pro
     const verifiedUrl = typeof startBody.publicUrl === 'string' && startBody.publicUrl !== '' ? startBody.publicUrl : publicUrl
 
     out.write(`${t('setup.verifyLight1', { state: t('common.done') })}\n`)
-    out.write(`${t('setup.verifyLight2', { state: t('common.done') })}\n`)
+    if (startBody.probeWarning !== undefined) {
+      out.write(`${t('host.ingress.verifyLanProbeWarn')}\n`)
+    } else {
+      out.write(`${t('setup.verifyLight2', { state: t('common.done') })}\n`)
+    }
     if (verifiedUrl !== '') {
-      out.write(`${t('setup.pairingQr')}\n`)
+      out.write(`\n${t('setup.pairingQr')}\n`)
       const qr = renderTerminalQr(verifiedUrl)
       if (qr !== null) out.write(`${qr}\n`)
+      out.write(`  ${verifiedUrl}\n`)
     }
-    out.write(`${t('setup.pairingCode', { code })}\n`)
+    out.write(`\n${t('setup.divider')}\n  ${t('setup.pairingCode', { code })}\n${t('setup.divider')}\n`)
 
     if (args.options.noWait) {
       out.write(`${t('host.ingress.verifySkipped')}\n`)

@@ -66,13 +66,20 @@ export interface WizardForwardedSourceInput {
  * fields. Token presence is reported as booleans only; port as the gateway
  * child's ACTUAL listening port (it may differ from the configured one).
  */
+export interface WizardLanCandidate {
+    ip: string;
+    kind: 'tailscale' | 'lan';
+    iface: string;
+}
 export interface WizardRuntimeInput {
     cfTokenConfigured?: unknown;
     tunnelTokenConfigured?: unknown;
     caddyRunning?: unknown;
     cloudflaredRunning?: unknown;
     gatewayActualPort?: unknown;
+    gatewayActualHost?: unknown;
     lanAddress?: unknown;
+    lanAddresses?: unknown;
     lastHostProbe?: WizardRecordInput | null;
     lastExternalVerification?: WizardRecordInput | null;
     lastForwardedSource?: WizardForwardedSourceInput | null;
@@ -100,7 +107,9 @@ export interface WizardStatus {
     caddyRunning: boolean;
     cloudflaredRunning: boolean;
     gatewayActualPort: number | null;
+    gatewayActualHost?: string;
     lanAddress?: string;
+    lanAddresses?: WizardLanCandidate[];
     lastHostProbe: WizardStatusRecord | null;
     lastExternalVerification: WizardStatusRecord | null;
     lastForwardedSource: WizardStatusForwardedSource | null;

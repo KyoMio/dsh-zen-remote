@@ -96,7 +96,7 @@ export function createReadlinePrompter(input?: Readable, output?: Writable, t?: 
 
   return {
     async selectOne(question, choices, defaultIndex) {
-      write(`? ${question}\n`)
+      write(`\n? ${question}\n`)
       choices.forEach((choice, i) => write(`  ${i + 1}. ${choice}${i === defaultIndex ? `（${translator('prompt.defaultLabel')}）` : ''}\n`))
       while (true) {
         const line = await ask(translator('prompt.selectOne', { max: choices.length, default: defaultIndex + 1 }))
@@ -108,7 +108,7 @@ export function createReadlinePrompter(input?: Readable, output?: Writable, t?: 
     },
 
     async selectMulti(question, choices, defaultIndices, allowCustomInput = false) {
-      write(`? ${question}\n`)
+      write(`\n? ${question}\n`)
       const defaults = new Set(defaultIndices)
       choices.forEach((choice, i) => write(`  ${defaults.has(i) ? '[x]' : '[ ]'} ${i + 1}. ${choice}\n`))
       if (allowCustomInput) write(`${translator('prompt.customEntryLine', { entry: translator('install.customEntry') })}\n`)
@@ -147,6 +147,7 @@ export function createReadlinePrompter(input?: Readable, output?: Writable, t?: 
     },
 
     async inputText(question, defaultValue, validate) {
+      write('\n')
       while (true) {
         const suffix = defaultValue === undefined ? '' : `（${translator('prompt.defaultLabel')}：${defaultValue}）`
         const line = await ask(`? ${question}${suffix} `)
@@ -165,6 +166,7 @@ export function createReadlinePrompter(input?: Readable, output?: Writable, t?: 
     },
 
     async confirm(question, defaultYes = true) {
+      write('\n')
       while (true) {
         const line = await ask(`? ${question} ${defaultYes ? translator('prompt.confirmY') : translator('prompt.confirmN')} `)
         if (line === '') return defaultYes

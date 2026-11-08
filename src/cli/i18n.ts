@@ -296,6 +296,17 @@ const ZH: Readonly<Record<string, string>> = {
   'host.ingress.trustProxyFailed': '信任列表更新失败。',
   'host.ingress.lanWaiting': '等待网关在 0.0.0.0 重新就绪（最多 {seconds} 秒）…',
   'host.ingress.lanTimeout': '等待网关重启超时（{seconds} 秒）：请确认 DSH 正常运行后重试。',
+  'setup.divider': '────────────────────────────────────────────────────────────',
+  'setup.step1Title': '[步骤 1/3] 选择本机运行角色 (host / client)',
+  'setup.step2HostTitle': '[步骤 2/3] 配置 host 接入方式',
+  'setup.step2ClientTitle': '[步骤 2/3] 连接并配对远端 host',
+  'setup.step3HostTitle': '[步骤 3/3] 连通性验证与设备配对',
+  'setup.cfTokenGuide.title': '  Cloudflare API 令牌权限要求（https://dash.cloudflare.com/profile/api-tokens → 创建令牌 →「编辑区域 DNS」模板）：',
+  'setup.cfTokenGuide.caddy': '  • 区域 (Zone) · DNS · 编辑 (Edit) —— 必选（区域资源选「包括 · 特定区域 · 你的域名」）',
+  'setup.cfTokenGuide.tunnel': '  • 区域 (Zone) · DNS · 编辑 (Edit) —— 写入隧道 CNAME 解析记录\n  • 区域 (Zone) · 区域 (Zone) · 读取 (Read) —— 定位域名所属 Zone ID\n  • 账户 (Account) · Cloudflare Tunnel · 编辑 (Edit) —— 创建与配置隧道\n  • 账户 (Account) · 账户设置 (Account Settings) · 读取 (Read) —— 读取账户 ID',
+  'host.ingress.lanPickQuestion': '检测到多个内网 / Tailscale 地址，请选择要使用的访问地址：',
+  'host.ingress.lanPickCustom': '手动输入其他局域网 / Tailscale 地址',
+  'host.ingress.verifyLanProbeWarn': '第 2 盏：公开地址可达 —— 本机自检受限（虚拟网卡 / 路由隔离），已直接生成配对码供外部设备连接验证',
 }
 
 const EN: Readonly<Record<string, string>> = {
@@ -576,6 +587,17 @@ const EN: Readonly<Record<string, string>> = {
   'host.ingress.trustProxyFailed': 'Updating the trust list failed.',
   'host.ingress.lanWaiting': 'Waiting for the gateway to come back on 0.0.0.0 (up to {seconds}s) …',
   'host.ingress.lanTimeout': 'Timed out waiting for the gateway restart ({seconds}s): make sure DSH is running, then retry.',
+  'setup.divider': '────────────────────────────────────────────────────────────',
+  'setup.step1Title': '[Step 1/3] Choose this machine\'s role (host / client)',
+  'setup.step2HostTitle': '[Step 2/3] Configure host ingress',
+  'setup.step2ClientTitle': '[Step 2/3] Pair with a remote host',
+  'setup.step3HostTitle': '[Step 3/3] Connectivity verification & device pairing',
+  'setup.cfTokenGuide.title': '  Cloudflare API token permissions (https://dash.cloudflare.com/profile/api-tokens → Create Token → "Edit zone DNS" template):',
+  'setup.cfTokenGuide.caddy': '  • Zone · DNS · Edit — required (Zone Resources: Include · Specific zone · your domain)',
+  'setup.cfTokenGuide.tunnel': '  • Zone · DNS · Edit — write the tunnel CNAME record\n  • Zone · Zone · Read — locate the domain Zone ID\n  • Account · Cloudflare Tunnel · Edit — create and configure the tunnel\n  • Account · Account Settings · Read — read the Account ID',
+  'host.ingress.lanPickQuestion': 'Multiple LAN / Tailscale addresses detected — pick the address to use:',
+  'host.ingress.lanPickCustom': 'Enter another LAN / Tailscale address manually',
+  'host.ingress.verifyLanProbeWarn': 'Light 2: public address reachable — local self-probe skipped (virtual interface / routing isolation); pairing code minted for direct device verification',
 }
 
 const DICTIONARIES: Readonly<Record<CliLang, Readonly<Record<string, string>>>> = { zh: ZH, en: EN }

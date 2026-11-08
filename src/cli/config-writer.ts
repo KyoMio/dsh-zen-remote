@@ -88,6 +88,37 @@ export type WriteCliConfigResult =
   | { ok: true; values: ZenRemoteConfig }
   | { ok: false; code: 'env-shadowed'; field: string; envVar: string }
 
+/**
+ * Keys that CLI explicitly wrote to `lan-gate.config.json` and unshadowed in
+ * `cordis.patch.yml` during this process lifetime, keyed by `dshHome`. When
+ * `fiber.restart()` reloads the plugin row, `cordis-plugin-loader` re-hydrates
+ * the new `config` object from its in-memory patch snapshot (without
+ * re-reading `cordis.patch.yml` from disk), which would otherwise re-shadow
+ * the file layer with stale `{ get() }` wrappers. `applyUnshadowedRowKeys`
+ * strips those stale wrappers on the reloaded `apply()`, and a subsequent
+ * Web UI save (`loader/volatile-update`) clears them via
+ * `clearUnshadowedRowKeys`.
+ */
+const unshadowedByHome = new Map<string, Set<string>>()
+
+export function applyUnshadowedRowKeys(dshHome: string, row: Record<string, unknown> | undefined): void {
+  if (row === undefined || row === null || typeof row !== 'object') return
+  const keys = unshadowedByHome.get(dshHome)
+  if (keys === undefined) return
+  for (const key of keys) {
+    const val = row[key]
+    if (val !== null && typeof val === 'object' && typeof (val as { get?: unknown }).get === 'function') {
+      delete row[key]
+    }
+  }
+}
+
+export function clearUnshadowedRowKeys(dshHome: string, keys: readonly string[]): void {
+  const set = unshadowedByHome.get(dshHome)
+  if (set === undefined) return
+  for (const key of keys) set.delete(key)
+}
+
 /** Read `<dshHome>/lan-gate.config.json` — `{}` when absent or unparsable,
  * the same degrade-not-throw contract as src/config.ts's readFileConfig. */
 function readFileAt(dshHome: string): Record<string, unknown> {
@@ -284,8 +315,16 @@ export function writeCliConfig(options: WriteCliConfigOptions): WriteCliConfigRe
     // Step 3a — the row layer: the loader wrapped the row's volatile fields
     // in `{ get() }` references, but they are still plain own properties of
     // the same object apply() holds — a delete makes the NEXT resolveConfig
-    // fall through this layer to the freshly written file.
+    // fall through this layer to the freshly written file. Record the keys
+    // for this `dshHome` so a subsequent `fiber.restart()` also strips the
+    // loader's re-hydrated in-memory `{ get() }` wrappers.
+    let remembered = unshadowedByHome.get(options.dshHome)
+    if (remembered === undefined) {
+      remembered = new Set<string>()
+      unshadowedByHome.set(options.dshHome, remembered)
+    }
     for (const key of targetKeys) {
+      remembered.add(key)
       if (key in row) delete row[key]
     }
 

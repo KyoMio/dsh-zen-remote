@@ -943,3 +943,114 @@ test('host ingress verify：无地址可用且非交互——缺 --public-url �
     await stopHost({ home, handle })
   }
 })
+
+test('host ingress verify：LAN/Tailscale (http://) 本机自检 probe-failed 时自动 allowUnprobed 兜底出码，不锁死无头机', async () => {
+  const verifyBodies = []
+  const { mods, home, handle, ipc } = await startHost({
+    tag: 'verify-lan-unprobed',
+    admin: HOST_ADMIN,
+    wizard: {
+      '/_dsh/zen-remote/admin/wizard/status': {
+        body: {
+          ...WIZARD_LAN_ONLY['/_dsh/zen-remote/admin/wizard/status'].body,
+          publicUrl: 'http://100.64.0.8:3088',
+        },
+      },
+      [ROUTES.verify]: (res, seen) => {
+        verifyBodies.push(seen.body)
+        const body = seen.body?.allowUnprobed === true
+          ? {
+            ok: true,
+            pairingCode: 'LAN88888',
+            publicUrl: 'http://100.64.0.8:3088',
+            expiresAt: Date.now() + 600_000,
+            probeWarning: { kind: 'unreachable', reason: 'network' },
+          }
+          : { ok: false, reason: 'probe-failed', detail: { kind: 'unreachable', reason: 'network' } }
+        const bytes = Buffer.from(JSON.stringify(body))
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': String(bytes.length) })
+        res.end(bytes)
+      },
+    },
+  })
+  try {
+    const ctx = makeCtx(mods, { argv: ['host', 'ingress', 'verify', '--no-wait'], ipc })
+    const code = await mods.runHostIngressVerifyCommand(ctx)
+    assert.equal(code, 0)
+    assert.equal(verifyBodies.length, 2, 'retried with allowUnprobed: true')
+    assert.equal(verifyBodies[1].allowUnprobed, true)
+    const text = ctx.stdout.text()
+    assert.match(text, /第 1 盏：本地网关就绪 —— 完成/u)
+    assert.match(text, /已直接生成配对码/u)
+    assert.match(text, /配对码：LAN88888/u)
+  } finally {
+    await stopHost({ home, handle })
+  }
+})
+
+test('host ingress start cloudflared：交互询问 CF Token 前打印 4 项权限指引；start lan 多网卡时支持交互选择并等 gatewayActualHost=0.0.0.0', async () => {
+  let wizardPolls = 0
+  const { mods, home, handle, ipc } = await startHost({
+    tag: 'cf-guide-and-lan-multi',
+    admin: HOST_ADMIN,
+    wizard: {
+      ...WIZARD_STOPS,
+      '/_dsh/zen-remote/admin/wizard/status': (res) => {
+        wizardPolls += 1
+        const body = {
+          ok: true,
+          mode: 'off',
+          domain: 'tea.example.com',
+          httpsPort: 443,
+          publicUrl: '',
+          cfTokenConfigured: false,
+          tunnelTokenConfigured: false,
+          caddyRunning: false,
+          cloudflaredRunning: false,
+          gatewayActualPort: 3088,
+          gatewayActualHost: wizardPolls >= 3 ? '0.0.0.0' : '127.0.0.1',
+          lanAddress: '10.0.0.5',
+          lanAddresses: [
+            { ip: '100.64.0.9', kind: 'tailscale', iface: 'tailscale0' },
+            { ip: '10.0.0.5', kind: 'lan', iface: 'eth0' },
+          ],
+          lastHostProbe: null,
+          lastExternalVerification: null,
+          lastForwardedSource: null,
+        }
+        const bytes = Buffer.from(JSON.stringify(body))
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': String(bytes.length) })
+        res.end(bytes)
+      },
+      [ROUTES.cfToken]: { body: { ok: true, configured: true } },
+      [ROUTES.tunnelCheck]: { body: { ok: false, reason: 'auth' } },
+    },
+  })
+  try {
+    // 1) cloudflared 提示权限清单
+    const cfCtx = makeCtx(mods, {
+      argv: ['host', 'ingress', 'start', '--mode', 'cloudflared'],
+      ipc,
+      interactive: true,
+      prompter: fakePrompter({ inputs: ['CF_TOK_123'] }),
+    })
+    assert.equal(await mods.runHostIngressStartCommand(cfCtx), 1)
+    const cfOut = cfCtx.stdout.text()
+    assert.match(cfOut, /Cloudflare API 令牌权限要求/u)
+    assert.match(cfOut, /Cloudflare Tunnel · 编辑/u)
+    assert.match(cfOut, /账户设置 .* 读取/u)
+
+    // 2) lan 多网卡选择 + 等待 gatewayActualHost 变为 0.0.0.0
+    const lanCtx = makeCtx(mods, {
+      argv: ['host', 'ingress', 'start', '--mode', 'lan'],
+      ipc,
+      interactive: true,
+      pollIntervalMs: 15,
+      prompter: fakePrompter({ selects: [0] }),
+    })
+    assert.equal(await mods.runHostIngressStartCommand(lanCtx), 0)
+    assert.ok(wizardPolls >= 3, 'waited until gatewayActualHost became 0.0.0.0')
+  } finally {
+    await stopHost({ home, handle })
+  }
+})
