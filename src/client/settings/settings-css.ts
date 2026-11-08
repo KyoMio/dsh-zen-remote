@@ -52,6 +52,9 @@ export const SETTINGS_CSS = `
 [data-zen-remote="settings"] .zr-settings-field + .zr-settings-field {
   border-top: 1px solid var(--dsw-alias-border-l2);
 }
+[data-zen-remote="settings"] .zr-settings-field[data-disabled="true"] {
+  opacity: 0.5;
+}
 [data-zen-remote="settings"] .zr-settings-head {
   display: flex;
   align-items: center;

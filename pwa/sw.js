@@ -39,6 +39,7 @@ const RUNTIME_CACHE = 'dsh-mobile-pwa-runtime-v4'
 
 const SHELL_PATHS = new Set([
   '/pwa/manifest.json',
+  '/pwa/icons/badge-96.png',
   '/pwa/icons/icon-192.png',
   '/pwa/icons/icon-512.png',
   '/pwa/icons/icon-maskable-512.png',
@@ -108,6 +109,7 @@ self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(SHELL_CACHE).then((cache) => cache.addAll([
       '/pwa/manifest.json',
+      '/pwa/icons/badge-96.png',
       '/pwa/icons/icon-192.png',
       '/pwa/icons/icon-512.png',
       '/pwa/icons/icon-maskable-512.png'
@@ -247,7 +249,7 @@ self.addEventListener('push', (event) => {
   const options = {
     body: data.body || T.pushBody,
     icon: '/pwa/icons/icon-192.png',
-    badge: '/pwa/icons/icon-192.png',
+    badge: '/pwa/icons/badge-96.png',
     tag: data.tag || 'dsh-agent-done',
     renotify: true,
     data: data.data || {}

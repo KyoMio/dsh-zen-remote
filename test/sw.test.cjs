@@ -299,3 +299,32 @@ test('sw: cross-origin requests are left alone (event.respondWith never called)'
   })
   assert.strictEqual(called, false)
 })
+
+test('sw: push notification uses monochrome badge-96.png for badge and icon-192.png for icon', async () => {
+  const calls = []
+  const listeners = {}
+  const context = vm.createContext({
+    self: {
+      location: { origin: ORIGIN },
+      registration: { showNotification: async (title, options) => { calls.push({ title, options }) } },
+      addEventListener: (type, fn) => { listeners[type] = fn }
+    },
+    caches: { open: async () => ({ match: async () => undefined, put: async () => {}, addAll: async () => {} }), keys: async () => [] },
+    fetch: async () => ({ ok: true }),
+    URL,
+    Set,
+    Response,
+    console
+  })
+  vm.runInContext(SW_SOURCE, context, { filename: 'sw.js' })
+  let shown
+  listeners.push({
+    data: { json: () => ({ title: 'T', body: 'B' }) },
+    waitUntil: (p) => { shown = p }
+  })
+  await shown
+  assert.strictEqual(calls.length, 1)
+  assert.strictEqual(calls[0].options.icon, '/pwa/icons/icon-192.png')
+  assert.strictEqual(calls[0].options.badge, '/pwa/icons/badge-96.png')
+})
+
