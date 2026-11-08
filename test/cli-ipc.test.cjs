@@ -252,6 +252,8 @@ test('POST /config 写 lan-gate.config.json、解除 row 与 cordis.patch.yml �
   assert.equal(ENV_VAR_BY_FIELD.pushSummary, 'DSH_PUSH_SUMMARY')
   assert.equal(ENV_VAR_BY_FIELD.pushTurnEnd, 'DSH_PUSH_TURN_END')
   assert.equal(ENV_VAR_BY_FIELD.pushTool, 'DSH_PUSH_TOOL')
+  assert.equal(ENV_VAR_BY_FIELD.pushEnabled, 'DSH_PUSH_ENABLED')
+  assert.equal(ENV_VAR_BY_FIELD.pushSessionName, 'DSH_PUSH_SESSION_NAME')
 
   const home = makeHome('config')
   const patchPath = path.join(home, 'profiles', 'web', 'cordis.patch.yml')

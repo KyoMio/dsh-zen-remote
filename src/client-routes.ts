@@ -850,6 +850,8 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
             pushSummary: values.pushSummary,
             pushTurnEnd: values.pushTurnEnd,
             pushTool: values.pushTool,
+            pushEnabled: values.pushEnabled,
+            pushSessionName: values.pushSessionName,
             serverUrl: stringOrEmpty(unwrapVolatile(record.serverUrl)).trim(),
           },
           statusBody: await statusBodyOf(options),

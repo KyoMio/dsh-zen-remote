@@ -3,10 +3,10 @@
  * effect (T17): `role` chooses which halves load; `port` / `host` /
  * `targetPort` / `rateLimit` / `trustedProxies` become the gateway child's
  * runtime shape; `vapidSubject` / `lang` / `pushEvents` / `pushDebounceMs` /
- * `pushSummary` / `pushTurnEnd` / `pushTool` are the push leg's startup
- * values. Everything else (serverName, idleHours, autoShareNewSessions,
- * serverUrl, deviceToken, and the interface-half knobs) is read live per use
- * and needs no reload.
+ * `pushSummary` / `pushTurnEnd` / `pushTool` / `pushEnabled` /
+ * `pushSessionName` are the push leg's startup values. Everything else
+ * (serverName, idleHours, autoShareNewSessions, serverUrl, deviceToken, and
+ * the interface-half knobs) is read live per use and needs no reload.
  *
  * Single source shared by both halves: the host's restart watcher
  * (src/restart-watcher.ts) fingerprints exactly these fields, and the
@@ -30,6 +30,8 @@ export const RESTART_FIELDS = [
   'pushSummary',
   'pushTurnEnd',
   'pushTool',
+  'pushEnabled',
+  'pushSessionName',
 ] as const
 
 /** One field of {@link RESTART_FIELDS}. */

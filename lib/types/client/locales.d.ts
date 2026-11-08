@@ -110,6 +110,10 @@ export declare const zh: {
     readonly 'settings.invalidPort': "需要 1–65535 的整数";
     readonly 'settings.invalidPositiveInt': "需要正整数";
     readonly 'settings.pushTitle': "推送";
+    readonly 'settings.fieldPushEnabled': "启用会话通知";
+    readonly 'settings.fieldPushEnabledHint': "总开关：关闭后停止所有自动推送，且不注册 push_notify 工具与系统提示词。";
+    readonly 'settings.fieldPushSessionName': "推送来源会话名";
+    readonly 'settings.fieldPushSessionNameHint': "在推送正文第一行显示「来源会话：<会话名>」。";
     readonly 'settings.fieldPushSummary': "推送内容摘要";
     readonly 'settings.fieldPushSummaryHint': "在推送正文中包含回合的最终文本或待回答的问题。";
     readonly 'settings.fieldPushTurnEnd': "回合结束推送";

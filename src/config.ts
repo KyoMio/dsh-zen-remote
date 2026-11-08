@@ -71,6 +71,12 @@ export interface ZenRemoteConfig {
   pushTurnEnd: boolean
   /** Register the model-facing `push_notify` tool. */
   pushTool: boolean
+  /** Master switch for session notifications: when false, disables all push
+   * listeners and does not register push_notify. */
+  pushEnabled: boolean
+  /** Include the source session name on the first line of push notification
+   * bodies. */
+  pushSessionName: boolean
   /** Server display name, at most {@link SERVER_NAME_MAX} characters. */
   serverName: string
   /** Idle-sleep window of a remote-enabled session: after this many hours
@@ -122,6 +128,8 @@ export const DEFAULTS: ZenRemoteConfig = {
   pushSummary: false,
   pushTurnEnd: false,
   pushTool: true,
+  pushEnabled: true,
+  pushSessionName: false,
   serverName: defaultServerName(),
   idleHours: 48,
   autoShareNewSessions: false,
@@ -350,6 +358,12 @@ const FIELDS: { [K in keyof ZenRemoteConfig]: FieldResolver<ZenRemoteConfig[K]> 
   pushSummary: { env: envBool('DSH_PUSH_SUMMARY', (raw) => raw === '1'), row: boolLike, file: boolLike },
   pushTurnEnd: { env: envBool('DSH_PUSH_TURN_END', (raw) => raw === '1'), row: boolLike, file: boolLike },
   pushTool: { env: envBool('DSH_PUSH_TOOL', (raw) => raw !== '0'), row: boolLike, file: boolLike },
+  // The master switch copies pushTool's env shape (default on, only the exact
+  // '0' flips it off); the session-name line copies pushSummary's (default
+  // off, '1' turns it on). Both restart the push leg because apply() wires
+  // its listeners from them (P55-1) — hence the RESTART_FIELDS entries.
+  pushEnabled: { env: envBool('DSH_PUSH_ENABLED', (raw) => raw !== '0'), row: boolLike, file: boolLike },
+  pushSessionName: { env: envBool('DSH_PUSH_SESSION_NAME', (raw) => raw === '1'), row: boolLike, file: boolLike },
   serverName: { row: serverNameOf, file: serverNameOf },
   idleHours: { row: inRange(0, 8760), file: inRange(0, 8760) },
   autoShareNewSessions: { row: boolLike, file: boolLike },
@@ -446,6 +460,8 @@ export function resolveConfig(
     pushSummary: resolveField('pushSummary', safeRow, safeFile, env, sources),
     pushTurnEnd: resolveField('pushTurnEnd', safeRow, safeFile, env, sources),
     pushTool: resolveField('pushTool', safeRow, safeFile, env, sources),
+    pushEnabled: resolveField('pushEnabled', safeRow, safeFile, env, sources),
+    pushSessionName: resolveField('pushSessionName', safeRow, safeFile, env, sources),
     serverName: resolveField('serverName', safeRow, safeFile, env, sources),
     idleHours: resolveField('idleHours', safeRow, safeFile, env, sources),
     autoShareNewSessions: resolveField('autoShareNewSessions', safeRow, safeFile, env, sources),
@@ -561,6 +577,11 @@ export const Config = z.object({
   pushSummary: z.any().volatile(),
   pushTurnEnd: z.any().volatile(),
   pushTool: z.any().volatile(),
+  // Push-leg master switch and session-name line (P55-1): apply() wires its
+  // listeners and the push_notify tool from them, so both reload the row on
+  // change (RESTART_FIELDS).
+  pushEnabled: z.any().volatile(),
+  pushSessionName: z.any().volatile(),
   serverName: z.any().volatile(),
   idleHours: z.any().volatile(),
   autoShareNewSessions: z.any().volatile(),

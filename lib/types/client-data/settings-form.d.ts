@@ -589,7 +589,7 @@ export declare function boolField(field: string): SettingsFieldSpec;
  */
 export declare function consentField(field: string): SettingsFieldSpec;
 /** Names of the row fields the settings page edits, in group order. */
-export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushDebounceMs' | 'lang' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'pluginBridgeConsent';
+export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushEnabled' | 'pushSessionName' | 'pushDebounceMs' | 'lang' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'pluginBridgeConsent';
 /** Longest legal `serverName`, mirroring src/config.ts's cap. */
 export declare const SERVER_NAME_MAX = 40;
 /** Upper bound of `idleHours`, mirroring src/config.ts. */
@@ -706,6 +706,8 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
     pushSummary: SettingsFieldState;
     pushTurnEnd: SettingsFieldState;
     pushTool: SettingsFieldState;
+    pushEnabled: SettingsFieldState;
+    pushSessionName: SettingsFieldState;
     pushDebounceMs: SettingsFieldState;
     lang: SettingsFieldState;
     serverName: SettingsFieldState;

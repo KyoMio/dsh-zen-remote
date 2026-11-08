@@ -245,6 +245,48 @@ test('env boolean semantics: DSH_PUSH_SUMMARY/TURN_END are 1-gated, DSH_PUSH_TOO
   })
 })
 
+test('pushEnabled defaults on and only DSH_PUSH_ENABLED=0 turns it off; pushSessionName defaults off and only DSH_PUSH_SESSION_NAME=1 turns it on (P55-1)', async () => {
+  const { resolveConfig } = await load()
+  assert.equal(resolveConfig({}, {}, {}).values.pushEnabled, true, 'the master switch defaults to on')
+  assert.equal(resolveConfig({}, {}, {}).sources.pushEnabled, 'default')
+  assert.equal(resolveConfig({}, {}, {}).values.pushSessionName, false, 'the session-name line defaults to off')
+  assert.equal(resolveConfig({}, {}, {}).sources.pushSessionName, 'default')
+
+  // pushEnabled copies pushTool's env shape: on by default, '0' flips it off.
+  await withEnvVar('DSH_PUSH_ENABLED', '0', async () => {
+    const r = resolveConfig({}, {}, process.env)
+    assert.equal(r.values.pushEnabled, false)
+    assert.equal(r.sources.pushEnabled, 'env')
+  })
+  await withEnvVar('DSH_PUSH_ENABLED', '1', async () => {
+    assert.equal(resolveConfig({}, {}, process.env).values.pushEnabled, true)
+  })
+  await withEnvVar('DSH_PUSH_ENABLED', 'yes', async () => {
+    assert.equal(resolveConfig({}, {}, process.env).values.pushEnabled, true, 'like pushTool, anything but exactly "0" keeps it on')
+  })
+
+  // pushSessionName copies pushSummary's env shape: off by default, '1' turns it on.
+  await withEnvVar('DSH_PUSH_SESSION_NAME', '1', async () => {
+    const r = resolveConfig({}, {}, process.env)
+    assert.equal(r.values.pushSessionName, true)
+    assert.equal(r.sources.pushSessionName, 'env')
+  })
+  await withEnvVar('DSH_PUSH_SESSION_NAME', '0', async () => {
+    assert.equal(resolveConfig({}, {}, process.env).values.pushSessionName, false, 'anything but "1" stays off')
+  })
+
+  // Env beats an opposing row/file value.
+  await withEnvVar('DSH_PUSH_ENABLED', '0', async () => {
+    assert.equal(resolveConfig({ pushEnabled: true }, { pushEnabled: true }, process.env).values.pushEnabled, false)
+  })
+
+  // Row and file layers go through the same boolLike as the other booleans.
+  assert.equal(resolveConfig({ pushEnabled: false }, {}, {}).values.pushEnabled, false)
+  assert.equal(resolveConfig({ pushEnabled: 'nope' }, {}, {}).values.pushEnabled, true, 'an illegal row value falls through to the default')
+  assert.equal(resolveConfig({}, { pushSessionName: 1 }, {}).values.pushSessionName, true)
+  assert.equal(resolveConfig({}, { pushSessionName: 'yes' }, {}).values.pushSessionName, false, 'the string "yes" is not a boolean')
+})
+
 // --- normalization ---------------------------------------------------------
 
 test('trustedProxies normalizes an array into a comma-separated string', async () => {
@@ -376,6 +418,7 @@ test('Config parses a fully populated row and leaves an empty row free of defaul
     role: 'client', port: 4000, host: '0.0.0.0', targetPort: 3080, rateLimit: 60,
     trustedProxies: ['10.0.0.1'], vapidSubject: 'mailto:x@y.z', lang: 'zh',
     pushEvents: 'a/b', pushDebounceMs: 1000, pushSummary: true, pushTurnEnd: true, pushTool: false,
+    pushEnabled: false, pushSessionName: true,
     serverName: 'phone', idleHours: 24, autoShareNewSessions: true,
     pluginBridgeConsent: { '@acme/panel': true },
     ingressMode: 'caddy', ingressDomain: 'dsh.example.com', ingressHttpsPort: 8443,
@@ -433,6 +476,7 @@ test('a fully populated Config row resolves with EVERY source = row (T17)', asyn
     role: 'client', port: 4000, host: '0.0.0.0', targetPort: 3080, rateLimit: 60,
     trustedProxies: ['10.0.0.1'], vapidSubject: 'mailto:x@y.z', lang: 'zh',
     pushEvents: 'a/b', pushDebounceMs: 1000, pushSummary: true, pushTurnEnd: true, pushTool: false,
+    pushEnabled: false, pushSessionName: true,
     serverName: 'phone', idleHours: 24, autoShareNewSessions: true,
     pluginBridgeConsent: { '@acme/panel': true },
     ingressMode: 'caddy', ingressDomain: 'dsh.example.com', ingressHttpsPort: 8443,

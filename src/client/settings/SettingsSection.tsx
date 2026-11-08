@@ -1153,6 +1153,12 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               {text(form.vapidSubject, 'vapidSubject', t('settings.fieldVapidSubject'), t('settings.fieldVapidSubjectHint'), '')}
 
               <h3 className="zr-settings-card-title">{t('settings.pushTitle')}</h3>
+              {/* P55-1: the master switch and the session-name line lead the
+                  group — the off switch below hides nothing visually (the
+                  other controls stay renderable) but apply() wires nothing
+                  until it is back on. */}
+              {bool(form.pushEnabled, 'pushEnabled', t('settings.fieldPushEnabled'), t('settings.fieldPushEnabledHint'))}
+              {bool(form.pushSessionName, 'pushSessionName', t('settings.fieldPushSessionName'), t('settings.fieldPushSessionNameHint'))}
               {bool(form.pushSummary, 'pushSummary', t('settings.fieldPushSummary'), t('settings.fieldPushSummaryHint'))}
               {bool(form.pushTurnEnd, 'pushTurnEnd', t('settings.fieldPushTurnEnd'), t('settings.fieldPushTurnEndHint'))}
               {bool(form.pushTool, 'pushTool', t('settings.fieldPushTool'), t('settings.fieldPushToolHint'))}

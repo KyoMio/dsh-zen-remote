@@ -62,6 +62,12 @@ export interface ZenRemoteConfig {
     pushTurnEnd: boolean;
     /** Register the model-facing `push_notify` tool. */
     pushTool: boolean;
+    /** Master switch for session notifications: when false, disables all push
+     * listeners and does not register push_notify. */
+    pushEnabled: boolean;
+    /** Include the source session name on the first line of push notification
+     * bodies. */
+    pushSessionName: boolean;
     /** Server display name, at most {@link SERVER_NAME_MAX} characters. */
     serverName: string;
     /** Idle-sleep window of a remote-enabled session: after this many hours
@@ -201,6 +207,8 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     pushSummary: z<any, any, "volatile">;
     pushTurnEnd: z<any, any, "volatile">;
     pushTool: z<any, any, "volatile">;
+    pushEnabled: z<any, any, "volatile">;
+    pushSessionName: z<any, any, "volatile">;
     serverName: z<any, any, "volatile">;
     idleHours: z<any, any, "volatile">;
     autoShareNewSessions: z<any, any, "volatile">;
@@ -231,6 +239,8 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     pushSummary: z<any, any, "volatile">;
     pushTurnEnd: z<any, any, "volatile">;
     pushTool: z<any, any, "volatile">;
+    pushEnabled: z<any, any, "volatile">;
+    pushSessionName: z<any, any, "volatile">;
     serverName: z<any, any, "volatile">;
     idleHours: z<any, any, "volatile">;
     autoShareNewSessions: z<any, any, "volatile">;

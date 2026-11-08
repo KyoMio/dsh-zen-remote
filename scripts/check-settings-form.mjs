@@ -69,14 +69,16 @@ const GATEWAY = {
 const VALUES = {
   role: 'host', port: 4000, host: '0.0.0.0', trustedProxies: '', rateLimit: 60,
   vapidSubject: 'mailto:admin@example.net', lang: 'zh', pushSummary: true,
-  pushTurnEnd: false, pushTool: true, pushDebounceMs: 5000, serverName: 'studio',
+  pushTurnEnd: false, pushTool: true, pushEnabled: true, pushSessionName: false,
+  pushDebounceMs: 5000, serverName: 'studio',
   idleHours: 24, autoShareNewSessions: false,
 }
 
 const SOURCES = {
   role: 'row', port: 'file', host: 'row', trustedProxies: 'default', rateLimit: 'env',
   vapidSubject: 'row', lang: 'default', pushSummary: 'row', pushTurnEnd: 'default',
-  pushTool: 'env', pushDebounceMs: 'row', serverName: 'row', idleHours: 'default',
+  pushTool: 'env', pushEnabled: 'default', pushSessionName: 'row',
+  pushDebounceMs: 'row', serverName: 'row', idleHours: 'default',
   autoShareNewSessions: 'default',
 }
 
@@ -119,6 +121,13 @@ assert.equal(view.fields.trustedProxies.savedRowInvalid, false, 'no row-layer en
 // The effective value rides through verbatim.
 assert.equal(view.fields.port.value, 4000)
 assert.equal(view.fields.pushSummary.value, true)
+// P55-1: the master switch and the session-name line render like any boolean.
+assert.equal(view.fields.pushEnabled.value, true)
+assert.equal(view.fields.pushEnabled.source, 'default')
+assert.equal(view.fields.pushEnabled.locked, false)
+assert.equal(view.fields.pushSessionName.value, false)
+assert.equal(view.fields.pushSessionName.source, 'row')
+assert.equal(view.fields.pushSessionName.savedRowInvalid, false, 'the row layer IS the winner for pushSessionName')
 
 // Devices and the pairing code are read from the NESTED gateway payload.
 assert.deepEqual(view.devices.map((d) => [d.id, d.role, d.kind, d.hasPush]), [
