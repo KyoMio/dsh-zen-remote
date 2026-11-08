@@ -71,6 +71,8 @@ export type WriteCliConfigResult = {
     field: string;
     envVar: string;
 };
+export declare function applyUnshadowedRowKeys(dshHome: string, row: Record<string, unknown> | undefined): void;
+export declare function clearUnshadowedRowKeys(dshHome: string, keys: readonly string[]): void;
 /**
  * Remove `keys` from EVERY `- id: dsh-zen-remote` (or bare `id:`) entry's
  * `config:` block, purely textually: a key line and its deeper-indented

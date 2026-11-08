@@ -72,13 +72,21 @@ export interface WizardForwardedSourceInput {
  * fields. Token presence is reported as booleans only; port as the gateway
  * child's ACTUAL listening port (it may differ from the configured one).
  */
+export interface WizardLanCandidate {
+  ip: string
+  kind: 'tailscale' | 'lan'
+  iface: string
+}
+
 export interface WizardRuntimeInput {
   cfTokenConfigured?: unknown
   tunnelTokenConfigured?: unknown
   caddyRunning?: unknown
   cloudflaredRunning?: unknown
   gatewayActualPort?: unknown
+  gatewayActualHost?: unknown
   lanAddress?: unknown
+  lanAddresses?: unknown
   lastHostProbe?: WizardRecordInput | null
   lastExternalVerification?: WizardRecordInput | null
   lastForwardedSource?: WizardForwardedSourceInput | null
@@ -109,7 +117,9 @@ export interface WizardStatus {
   caddyRunning: boolean
   cloudflaredRunning: boolean
   gatewayActualPort: number | null
+  gatewayActualHost?: string
   lanAddress?: string
+  lanAddresses?: WizardLanCandidate[]
   lastHostProbe: WizardStatusRecord | null
   lastExternalVerification: WizardStatusRecord | null
   lastForwardedSource: WizardStatusForwardedSource | null
@@ -154,6 +164,21 @@ function forwardedSourceOf(input: WizardForwardedSourceInput | null | undefined)
   return { ip, at }
 }
 
+function lanCandidatesOf(value: unknown): WizardLanCandidate[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const out: WizardLanCandidate[] = []
+  for (const item of value) {
+    if (item === null || typeof item !== 'object') continue
+    const ip = (item as { ip?: unknown }).ip
+    const kind = (item as { kind?: unknown }).kind
+    const iface = (item as { iface?: unknown }).iface
+    if (typeof ip !== 'string' || ip === '') continue
+    if (kind !== 'tailscale' && kind !== 'lan') continue
+    out.push({ ip, kind, iface: typeof iface === 'string' ? iface : '' })
+  }
+  return out.length > 0 ? out : undefined
+}
+
 /**
  * Build the sanitized wizard status. Both arguments are optional so a
  * composition can answer before anything is configured; the all-empty
@@ -161,6 +186,7 @@ function forwardedSourceOf(input: WizardForwardedSourceInput | null | undefined)
  * no tokens configured, no memories).
  */
 export function projectWizardStatus(declared: WizardDeclaredInput = {}, runtime: WizardRuntimeInput = {}): WizardStatus {
+  const lanAddresses = lanCandidatesOf(runtime.lanAddresses)
   return {
     ok: true,
     mode: modeOf(declared.ingressMode),
@@ -172,7 +198,9 @@ export function projectWizardStatus(declared: WizardDeclaredInput = {}, runtime:
     caddyRunning: runtime.caddyRunning === true,
     cloudflaredRunning: runtime.cloudflaredRunning === true,
     gatewayActualPort: portOf(runtime.gatewayActualPort),
+    ...(typeof runtime.gatewayActualHost === 'string' && runtime.gatewayActualHost !== '' ? { gatewayActualHost: runtime.gatewayActualHost } : {}),
     ...(typeof runtime.lanAddress === 'string' && runtime.lanAddress !== '' ? { lanAddress: runtime.lanAddress } : {}),
+    ...(lanAddresses !== undefined ? { lanAddresses } : {}),
     lastHostProbe: recordOf(runtime.lastHostProbe),
     lastExternalVerification: recordOf(runtime.lastExternalVerification),
     lastForwardedSource: forwardedSourceOf(runtime.lastForwardedSource),

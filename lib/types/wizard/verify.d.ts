@@ -54,6 +54,7 @@ export type VerificationStartResult = {
     pairingCode: string;
     publicUrl: string;
     expiresAt: number;
+    probeWarning?: unknown;
 } | {
     ok: false;
     reason: 'no-public-url' | 'bad-public-url' | 'runtime-not-ready' | 'gateway-unreachable' | 'probe-failed' | 'pair-refused';
@@ -87,6 +88,7 @@ export interface VerificationManager {
     start(input: {
         publicUrl: unknown;
         probeOnly?: boolean;
+        allowUnprobed?: boolean;
     }): Promise<VerificationStartResult>;
     check(): Promise<VerificationCheckResult>;
     /** Whether a verification session is open (the route surfaces it for the

@@ -216,6 +216,11 @@ async function preflight(ctx: SetupCommandContext): Promise<{ ipc: CliIpcClient;
 // Step 1: the role
 // ===========================================================================
 
+function printStepHeader(ctx: SetupCommandContext, titleKey: string): void {
+  const { t, stdout } = ctx
+  stdout.write(`\n${t('setup.divider')}\n${t(titleKey)}\n${t('setup.divider')}\n`)
+}
+
 /** Resolve the target role: the flag wins (peer / garbage answered with the
  * bilingual refusal), an interactive run asks with the current role
  * highlighted, a headless run fails fast on the missing option. */
@@ -231,6 +236,7 @@ async function resolveTargetRole(ctx: SetupCommandContext, ping: CliPingResponse
     return undefined
   }
   if (ctx.interactive && ctx.prompter !== undefined) {
+    printStepHeader(ctx, 'setup.step1Title')
     const picked = await ctx.prompter.selectOne(
       t('setup.roleQuestion'),
       [t('setup.roleHost'), t('setup.roleClient')],
@@ -271,6 +277,7 @@ async function runHostBranch(ctx: SetupCommandContext, ipc: CliIpcClient): Promi
   // current effective config offers "keep and verify" as choice 0 (in a
   // headless run that keep IS the answer — re-running setup on a configured
   // host must not blow away the working ingress).
+  printStepHeader(ctx, 'setup.step2HostTitle')
   const wizard = await fetchBody(() => ipc.request('GET', WIZARD_STATUS_ROUTE))
   const hasIngress = (textOf(wizard, 'mode') !== '' && textOf(wizard, 'mode') !== 'off')
     || textOf(wizard, 'publicUrl') !== ''
@@ -317,6 +324,7 @@ async function runHostBranch(ctx: SetupCommandContext, ipc: CliIpcClient): Promi
 
   // Step 3: the three-light verification, with the interactive retry menu
   // when the first two lights fail (a headless run just reports).
+  printStepHeader(ctx, 'setup.step3HostTitle')
   while (true) {
     const verifyCode = await runHostIngressVerifyCommand(
       commandCtx(ctx, ['host', 'ingress', 'verify', ...carryOptionArgs(options)], ipc),
@@ -342,10 +350,12 @@ async function runHostBranch(ctx: SetupCommandContext, ipc: CliIpcClient): Promi
   const settled = await fetchBody(() => ipc.request('GET', WIZARD_STATUS_ROUTE))
   const settledMode = textOf(settled, 'mode') === '' ? 'off' : textOf(settled, 'mode')
   const settledUrl = textOf(settled, 'publicUrl')
+  out.write(`\n${t('setup.divider')}\n`)
   out.write(`${t('setup.summary.title')}\n`)
   out.write(`${t('setup.summary.role', { role: 'host' })}\n`)
   out.write(`${t('setup.summary.ingress', { mode: settledMode, publicUrl: settledUrl === '' ? '—' : settledUrl })}\n`)
   out.write(`${t('setup.summary.hint')}\n`)
+  out.write(`${t('setup.divider')}\n`)
   return 0
 }
 
@@ -364,6 +374,8 @@ async function runClientBranch(ctx: SetupCommandContext, ipc: CliIpcClient): Pro
   const { t, args } = ctx
   const out = ctx.stdout
   const options = args.options
+
+  printStepHeader(ctx, 'setup.step2ClientTitle')
 
   // Command-line pairing answers short-circuit the menu entirely. The address
   // may come as the positional (`setup <hostUrl>`) or the flag — the flag
@@ -448,10 +460,12 @@ async function runClientBranch(ctx: SetupCommandContext, ipc: CliIpcClient): Pro
   // Completion summary: the pool as it stands NOW.
   const settled = await fetchBody(() => ipc.request('GET', CLIENT_STATUS_ROUTE))
   const settledServers = serversOfRow(settled)
+  out.write(`\n${ctx.t('setup.divider')}\n`)
   out.write(`${ctx.t('setup.summary.title')}\n`)
   out.write(`${ctx.t('setup.summary.role', { role: 'client' })}\n`)
   out.write(`${ctx.t('setup.summary.client', { count: settledServers.length, max: poolMaxOf(settled) })}\n`)
   out.write(`${ctx.t('setup.summary.hint')}\n`)
+  out.write(`${ctx.t('setup.divider')}\n`)
   return 0
 }
 

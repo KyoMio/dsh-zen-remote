@@ -138,6 +138,7 @@ export interface WizardHandlerOptions {
         start: (input: {
             publicUrl: unknown;
             probeOnly?: boolean;
+            allowUnprobed?: boolean;
         }) => Promise<VerificationStartResult>;
         check: () => Promise<VerificationCheckResult>;
     };

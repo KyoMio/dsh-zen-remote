@@ -91,7 +91,7 @@ import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
 import { createLogRing, createPluginLog } from './log-ring.js'
 import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js'
-import { writeCliConfig } from './cli/config-writer.js'
+import { applyUnshadowedRowKeys, clearUnshadowedRowKeys, writeCliConfig } from './cli/config-writer.js'
 import { acquireCliIpcServer } from './cli/ipc-server.js'
 import type { CliIpcDelegate, CliRouteHandler } from './cli/ipc-server.js'
 
@@ -575,6 +575,8 @@ export async function handleUpload(
  *   request.
  */
 export function apply(ctx: Context, config: MobileNavConfig = {}): void {
+  const initialHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  applyUnshadowedRowKeys(initialHome, config as Record<string, unknown>)
   // CU-1: the plugin's own log ring (SPEC 方案 C) — rebuilt per apply, so a
   // row reload clears it (expected: the report describes THIS process
   // generation). `logWarn` / `logInfo` are the branch-shared double-writers:
@@ -953,48 +955,54 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // "stale" verdict the config fingerprint produces, arriving via the
     // process generation instead.
     const currentMode = (): string => getConfig().values.ingressMode
-    const detectLanAddress = (): string | undefined => {
+    const detectLanCandidates = (): { ip: string; kind: 'tailscale' | 'lan'; iface: string }[] => {
       try {
         const nets = networkInterfaces()
-        let tailscaleIp: string | undefined
-        let lanIp: string | undefined
-        for (const entries of Object.values(nets)) {
+        const tailscale: { ip: string; kind: 'tailscale' | 'lan'; iface: string }[] = []
+        const primaryLan: { ip: string; kind: 'tailscale' | 'lan'; iface: string }[] = []
+        const bridgeLan: { ip: string; kind: 'tailscale' | 'lan'; iface: string }[] = []
+        for (const [iface, entries] of Object.entries(nets)) {
           if (!Array.isArray(entries)) continue
+          const isContainerBridge = /^(?:docker\d*|br-|veth|cni\d*|flannel|virbr\d*|cali)/i.test(iface)
           for (const entry of entries) {
             if (!entry || entry.internal || entry.family !== 'IPv4') continue
             const addr = entry.address
-            if (
+            if (/^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(addr)) {
+              tailscale.push({ ip: addr, kind: 'tailscale', iface })
+            } else if (
               /^192\.168\./.test(addr)
               || /^10\./.test(addr)
               || /^172\.(?:1[6-9]|2\d|3[01])\./.test(addr)
             ) {
-              lanIp ??= addr
-            } else if (/^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(addr)) {
-              tailscaleIp ??= addr
+              if (isContainerBridge) bridgeLan.push({ ip: addr, kind: 'lan', iface })
+              else primaryLan.push({ ip: addr, kind: 'lan', iface })
             }
           }
         }
-        return lanIp ?? tailscaleIp
+        return [...tailscale, ...primaryLan, ...bridgeLan]
       } catch {
-        return undefined
+        return []
       }
     }
     // One runtime probe per request: the gateway's own status (source-IP
     // detection + the ACTUAL port for snippets/QR), plus our processes'
     // liveness for the projection.
     const buildRuntime = async () => {
-      const lanAddress = detectLanAddress()
+      const lanAddresses = detectLanCandidates()
+      const lanAddress = (lanAddresses.find((c) => c.kind === 'lan') ?? lanAddresses[0])?.ip
       try {
         const response = await fetch(`http://127.0.0.1:${effective.values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
-        if (!response.ok) return { caddyRunning: caddyManager?.isRunning() === true, lanAddress }
-        const body = (await response.json()) as { port?: unknown; lastForwardedSource?: unknown }
+        if (!response.ok) return { caddyRunning: caddyManager?.isRunning() === true, lanAddress, lanAddresses }
+        const body = (await response.json()) as { host?: unknown; port?: unknown; lastForwardedSource?: unknown }
         return {
           lastForwardedSource: detectForwardedSource(body),
           // GW-fix-3/M2: the wizard's snippets and QR target the
           // gateway's ACTUAL port (it may have retried past the
           // configured one).
           gatewayActualPort: typeof body?.port === 'number' ? body.port : undefined,
+          gatewayActualHost: typeof body?.host === 'string' ? body.host : undefined,
           lanAddress,
+          lanAddresses,
           caddyRunning: caddyManager?.isRunning() === true,
           cloudflaredRunning: cloudflaredManager?.isRunning() === true,
           tunnelTokenConfigured: cloudflaredManager !== undefined,
@@ -1005,6 +1013,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // its null shape and the UI offers nothing.
         return {
           lanAddress,
+          lanAddresses,
           caddyRunning: caddyManager?.isRunning() === true,
           cloudflaredRunning: cloudflaredManager?.isRunning() === true,
           tunnelTokenConfigured: tunnelTokenConfigured(home),
@@ -2033,7 +2042,15 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // Registration failure degrades to a warning, like the session feeds
     // above: the poll trigger keeps the watcher fully functional without it.
     try {
-      ctx.on('loader/volatile-update', () => { watcher.checkNow() })
+      ctx.on('loader/volatile-update', (paths) => {
+        if (Array.isArray(paths)) {
+          const topKeys = paths
+            .map((p) => (Array.isArray(p) && typeof p[0] === 'string' ? p[0] : undefined))
+            .filter((k): k is string => k !== undefined)
+          if (topKeys.length > 0) clearUnshadowedRowKeys(home, topKeys)
+        }
+        watcher.checkNow()
+      })
     } catch (error) {
       logWarn('dsh-zen-remote: cannot listen on "loader/volatile-update": %s', message(error))
     }

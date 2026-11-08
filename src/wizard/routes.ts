@@ -142,7 +142,7 @@ export interface WizardHandlerOptions {
    * POST mints the pairing code, GET polls the session. Absent — a wiring
    * that predates GW-9 — and both answer 501 like the placeholders. */
   verify?: {
-    start: (input: { publicUrl: unknown; probeOnly?: boolean }) => Promise<VerificationStartResult>
+    start: (input: { publicUrl: unknown; probeOnly?: boolean; allowUnprobed?: boolean }) => Promise<VerificationStartResult>
     check: () => Promise<VerificationCheckResult>
   }
 }
@@ -497,6 +497,7 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
         responseJson(res, 200, await verify.start({
           publicUrl: body.publicUrl,
           ...(body.probeOnly === true ? { probeOnly: true } : {}),
+          ...(body.allowUnprobed === true ? { allowUnprobed: true } : {}),
         }))
         return
       }

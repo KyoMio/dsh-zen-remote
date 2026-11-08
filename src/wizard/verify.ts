@@ -54,7 +54,7 @@ export interface VerificationManagerOptions {
 }
 
 export type VerificationStartResult =
-  | { ok: true; pairingCode: string; publicUrl: string; expiresAt: number }
+  | { ok: true; pairingCode: string; publicUrl: string; expiresAt: number; probeWarning?: unknown }
   | {
     ok: false
     reason: 'no-public-url' | 'bad-public-url' | 'runtime-not-ready' | 'gateway-unreachable' | 'probe-failed' | 'pair-refused'
@@ -75,6 +75,7 @@ export type VerificationCheckResult =
 /** What the wizard reads off one gateway status answer. */
 interface GatewayStatusView {
   deviceIds: string[]
+  deviceRoles: Map<string, string>
   port: number | null
   lastWebClaim: { id: string; secure: boolean; at: number } | null
 }
@@ -105,7 +106,7 @@ interface VerificationSession {
 }
 
 export interface VerificationManager {
-  start(input: { publicUrl: unknown; probeOnly?: boolean }): Promise<VerificationStartResult>
+  start(input: { publicUrl: unknown; probeOnly?: boolean; allowUnprobed?: boolean }): Promise<VerificationStartResult>
   check(): Promise<VerificationCheckResult>
   /** Whether a verification session is open (the route surfaces it for the
    * UI's 「待外部验证」 state). */
@@ -140,10 +141,19 @@ export function createVerificationManager(options: VerificationManagerOptions): 
     if (reply === null || reply.status < 200 || reply.status >= 300) return null
     const body = reply.body as { devices?: unknown; port?: unknown; lastWebClaim?: unknown }
     if (body === null || typeof body !== 'object') return null
-    const deviceIds: string[] = Array.isArray(body.devices)
-      ? body.devices.map((device) => (device !== null && typeof device === 'object' ? (device as { id?: unknown }).id : undefined))
-          .filter((id): id is string => typeof id === 'string')
-      : []
+    const deviceIds: string[] = []
+    const deviceRoles = new Map<string, string>()
+    if (Array.isArray(body.devices)) {
+      for (const device of body.devices) {
+        if (device === null || typeof device !== 'object') continue
+        const id = (device as { id?: unknown }).id
+        const role = (device as { role?: unknown }).role
+        if (typeof id === 'string') {
+          deviceIds.push(id)
+          if (typeof role === 'string') deviceRoles.set(id, role)
+        }
+      }
+    }
     const port = typeof body.port === 'number' ? body.port : null
     const claim = body.lastWebClaim
     const lastWebClaim = claim !== null && typeof claim === 'object'
@@ -153,11 +163,11 @@ export function createVerificationManager(options: VerificationManagerOptions): 
           at: typeof (claim as { at?: unknown }).at === 'number' ? (claim as { at: number }).at : 0,
         }
       : null
-    return { deviceIds, port, lastWebClaim }
+    return { deviceIds, deviceRoles, port, lastWebClaim }
   }
 
   return {
-    async start({ publicUrl, probeOnly }) {
+    async start({ publicUrl, probeOnly, allowUnprobed }) {
       if (typeof publicUrl !== 'string' || publicUrl.trim() === '') return { ok: false, reason: 'no-public-url' }
       // Same admission as the probe: https anywhere, plain http only into
       // the private-network allowances. The URL the phone will open must
@@ -171,7 +181,8 @@ export function createVerificationManager(options: VerificationManagerOptions): 
       if (statusBefore === null) return { ok: false, reason: 'gateway-unreachable' }
 
       const outcome = await (options.probe ?? probeHostPath)(normalized.url)
-      if (outcome.kind !== 'reached' || outcome.root !== 'gateway-pairing-page' || outcome.admin !== 'gateway-admin-403') {
+      const probeOk = outcome.kind === 'reached' && outcome.root === 'gateway-pairing-page' && outcome.admin === 'gateway-admin-403'
+      if (!probeOk && allowUnprobed !== true) {
         return { ok: false, reason: 'probe-failed', detail: outcome }
       }
 
@@ -192,7 +203,13 @@ export function createVerificationManager(options: VerificationManagerOptions): 
         knownDeviceIds: new Set(statusBefore.deviceIds),
         fingerprint: verificationFingerprint(options.getValues(), statusBefore.port),
       }
-      return { ok: true, pairingCode: session.code, publicUrl: session.publicUrl, expiresAt: session.expiresAt }
+      return {
+        ok: true,
+        pairingCode: session.code,
+        publicUrl: session.publicUrl,
+        expiresAt: session.expiresAt,
+        ...(probeOk ? {} : { probeWarning: outcome }),
+      }
     },
 
     async check() {
@@ -219,6 +236,10 @@ export function createVerificationManager(options: VerificationManagerOptions): 
           // reverse proxy and intentionally issues a non-Secure cookie.
           if (isHttps && !claim.secure) return { result: 'cookie-insecure', deviceId }
           return { result: 'pass', deviceId, at: claim.at }
+        }
+        if (status.deviceRoles.get(deviceId) === 'desktop-client') {
+          session = null
+          return { result: 'pass', deviceId, at: now() }
         }
         // A claim record that has not surfaced (or names a different,
         // later claim): keep polling rather than bless an unverified cookie.
