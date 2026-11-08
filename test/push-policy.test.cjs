@@ -69,7 +69,7 @@ test('turn end: debounced, and carries the summary when one was extracted', asyn
   assert.strictEqual(tooSoon.shouldNotify, false)
   assert.strictEqual(tooSoon.reason, 'debounced')
 
-  const ok = decideNotification({ kind: 'turn-end', now, lastSent: now - 15_000, summary: '改完了三个文件' }, c)
+  const ok = decideNotification({ kind: 'turn-end', now, lastSent: now - 15_000, summary: '改完了三个文件' }, cfg({ turnEndEnabled: true, includeSummary: true }))
   assert.strictEqual(ok.shouldNotify, true)
   assert.strictEqual(ok.body, '改完了三个文件')
 })
@@ -350,4 +350,156 @@ test('turn-end: an unreadable session header stays quiet instead of assuming top
   const listener = src.match(/const onTurnEnd = \(payload\) => \{([\s\S]*?)\n  \}/)
   assert.ok(listener, 'onTurnEnd still present')
   assert.match(listener[1], /if \(!header\) return/, 'bail out before firing when the header is missing')
+})
+
+// --- session title (P55-1) ---------------------------------------------------
+
+test('sessionTitle extracts the newest session/title, skips blank titles, clips to 40', async () => {
+  const { sessionTitle } = await freshImport()
+
+  // Scanned from the end: the LAST title event wins, whitespace collapsed.
+  const events = [
+    { type: 'session/title', data: { title: 'First name' } },
+    { type: 'assistant/message', data: { turn: 1 } },
+    { type: 'session/title', data: { title: '  Renamed \n later ' } },
+  ]
+  assert.strictEqual(sessionTitle(events), 'Renamed later')
+
+  // A blank title does not win — an older named one still answers.
+  assert.strictEqual(
+    sessionTitle([{ type: 'session/title', data: { title: '   ' } }, { type: 'session/title', data: { title: 'real' } }]),
+    'real',
+  )
+  assert.strictEqual(sessionTitle([{ type: 'session/title', data: { title: '\n\t' } }]), '')
+
+  // Clipped to SESSION_TITLE_MAX (40) characters.
+  assert.strictEqual(sessionTitle([{ type: 'session/title', data: { title: 'x'.repeat(60) } }]).length, 40)
+
+  // Garbage in, '' out.
+  assert.strictEqual(sessionTitle(undefined), '')
+  assert.strictEqual(sessionTitle('nope'), '')
+  assert.strictEqual(sessionTitle([]), '')
+  assert.strictEqual(sessionTitle([{ type: 'tool/call', data: { name: 'bash' } }]), '')
+  assert.strictEqual(sessionTitle([{ type: 'session/title', data: { title: 42 } }]), '')
+})
+
+test('pushEnabled:false skips every kind as push-disabled; absent cfg field stays on', async () => {
+  const { decideNotification } = await freshImport()
+  const c = cfg({ pushEnabled: false, turnEndEnabled: true })
+  for (const kind of ['turn-end', 'approval', 'question']) {
+    const d = decideNotification(at({ kind, toolName: 'bash', question: 'q?', summary: 's', delegationDepth: 0 }), c)
+    assert.strictEqual(d.shouldNotify, false, `${kind} must be skipped when the master switch is off`)
+    assert.strictEqual(d.reason, 'push-disabled')
+    assert.strictEqual(d.title, '')
+    assert.strictEqual(d.body, '')
+  }
+  // Backward compat: policy tests (and old callers) build cfg without the
+  // field — absent must read as "on", never as disabled.
+  assert.strictEqual(decideNotification(at({ kind: 'approval', toolName: 'bash' }), cfg()).shouldNotify, true)
+})
+
+test('includeSessionName prefixes a second body line on every kind; titles unchanged in all four quadrants', async () => {
+  const mod = await freshImport()
+  const { decideNotification } = mod
+
+  const NAME = '重构登录模块'
+  const named = (over) => cfg({ includeSessionName: true, ...over })
+  const unnamed = (over) => cfg(over)
+  const input = (over) => at({ sessionName: NAME, toolName: 'bash', question: '要用 A 还是 B？', summary: '改完了', delegationDepth: 0, ...over })
+
+  // --- turn-end (opt-in on, not debounced) ---
+  const turnEndTitle = decideNotification(input({ kind: 'turn-end' }), unnamed({ turnEndEnabled: true })).title
+  assert.strictEqual(turnEndTitle, 'DSH 任务完成')
+  const quads = [
+    { name: false, summary: false, body: '智能体已完成当前回合' },
+    { name: true, summary: false, body: `来源会话：${NAME}\n智能体已完成当前回合` },
+    { name: false, summary: true, body: '改完了' },
+    { name: true, summary: true, body: `来源会话：${NAME}\n改完了` },
+  ]
+  for (const q of quads) {
+    const d = decideNotification(input({ kind: 'turn-end' }), unnamed({ turnEndEnabled: true, includeSummary: q.summary, includeSessionName: q.name }))
+    assert.strictEqual(d.shouldNotify, true)
+    assert.strictEqual(d.title, turnEndTitle, 'the turn-end title must not change with the session-name switch')
+    assert.strictEqual(d.body, q.body, `turn-end quadrant name:${q.name} summary:${q.summary}`)
+  }
+
+  // --- approval ---
+  const approvalTitle = decideNotification(input({ kind: 'approval' }), unnamed()).title
+  assert.strictEqual(approvalTitle, 'DSH 等你授权')
+  const approvalQuads = [
+    { name: false, summary: false, body: 'bash 需要授权才能继续' },
+    { name: true, summary: false, body: `来源会话：${NAME}\nbash 需要授权才能继续` },
+  ]
+  for (const q of approvalQuads) {
+    const d = decideNotification(input({ kind: 'approval' }), unnamed({ includeSummary: q.summary, includeSessionName: q.name }))
+    assert.strictEqual(d.shouldNotify, true)
+    assert.strictEqual(d.title, approvalTitle, 'the approval title must not change with the session-name switch')
+    assert.strictEqual(d.body, q.body, `approval quadrant name:${q.name} summary:${q.summary}`)
+  }
+
+  // --- question ---
+  const questionTitle = decideNotification(input({ kind: 'question' }), unnamed()).title
+  assert.strictEqual(questionTitle, 'DSH 等你回答')
+  const questionQuads = [
+    { name: false, summary: false, body: '智能体提了一个问题，正在等你回答' },
+    { name: true, summary: false, body: `来源会话：${NAME}\n智能体提了一个问题，正在等你回答` },
+    { name: false, summary: true, body: '要用 A 还是 B？' },
+    { name: true, summary: true, body: `来源会话：${NAME}\n要用 A 还是 B？` },
+  ]
+  for (const q of questionQuads) {
+    const d = decideNotification(input({ kind: 'question' }), unnamed({ includeSummary: q.summary, includeSessionName: q.name }))
+    assert.strictEqual(d.shouldNotify, true)
+    assert.strictEqual(d.title, questionTitle, 'the question title must not change with the session-name switch')
+    assert.strictEqual(d.body, q.body, `question quadrant name:${q.name} summary:${q.summary}`)
+  }
+})
+
+test('sessionName: English copy reads "Session: <name>", a blank or non-string name degrades to one line', async () => {
+  process.env.DSH_PUSH_LANG = 'en'
+  try {
+    const { decideNotification } = await freshImport()
+    const enNamed = decideNotification(at({ kind: 'approval', toolName: 'bash', sessionName: 'refactor login' }), cfg({ includeSessionName: true }))
+    assert.strictEqual(enNamed.body, 'Session: refactor login\nbash needs approval to continue')
+
+    // A whitespace-only name is clipped to '' — no empty prefix line.
+    const blank = decideNotification(at({ kind: 'approval', toolName: 'bash', sessionName: '   ' }), cfg({ includeSessionName: true }))
+    assert.strictEqual(blank.body, 'bash needs approval to continue')
+
+    // A non-string sessionName (the field never made it into the fire input)
+    // degrades to the plain single-line body.
+    const absent = decideNotification(at({ kind: 'approval', toolName: 'bash', sessionName: undefined }), cfg({ includeSessionName: true }))
+    assert.strictEqual(absent.body, 'bash needs approval to continue')
+
+    // A legacy caller without includeSessionName at all stays single-line.
+    const legacy = decideNotification(at({ kind: 'approval', toolName: 'bash', sessionName: 'refactor login' }), cfg())
+    assert.strictEqual(legacy.body, 'bash needs approval to continue')
+  } finally { delete process.env.DSH_PUSH_LANG }
+})
+
+test('wiring: sessionName rides fire() into the body, resolved from the session event log', async () => {
+  process.env.DSH_PUSH_APPROVAL_GRACE_MS = '60'
+  const mod = await freshImport()
+  const listeners = new Map()
+  mod.apply({
+    on: (e, cb) => { listeners.set(e, cb); return () => {} },
+    inject: () => {},
+    effect: (fn) => fn()
+  }, { pushSessionName: true, pushSummary: false, lang: 'zh' })
+  const onSessionEvent = listeners.get('session/event')
+  assert.ok(onSessionEvent, 'the plugin still listens on session/event')
+
+  const sent = []
+  const original = global.fetch
+  global.fetch = async (url, opts) => { sent.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) } }
+  try {
+    const session = { id: 's-named', events: [{ type: 'session/title', data: { title: '  排查 \n 推送 ' } }] }
+    // Question leg fires immediately — no grace timer involved.
+    onSessionEvent(session, { type: 'tool/call', data: { name: 'ask_user_question', arguments: '{"questions":[{"question":"继续吗？"}]}' } })
+    // Approval leg fires after the (shrunk) grace period.
+    onSessionEvent(session, { type: 'approval/asked', data: { id: 'w-named', toolName: 'bash' } })
+    await new Promise((r) => setTimeout(r, 300))
+    assert.strictEqual(sent.length, 2, 'both legs fired')
+    assert.strictEqual(sent[0].body, '来源会话：排查 推送\n智能体提了一个问题，正在等你回答')
+    assert.strictEqual(sent[1].body, '来源会话：排查 推送\nbash 需要授权才能继续')
+  } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
 })

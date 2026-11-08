@@ -953,6 +953,8 @@ export type SettingsFieldName =
   | 'pushSummary'
   | 'pushTurnEnd'
   | 'pushTool'
+  | 'pushEnabled'
+  | 'pushSessionName'
   | 'pushDebounceMs'
   | 'lang'
   | 'serverName'
@@ -974,6 +976,8 @@ export const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
   textField('trustedProxies'),
   intField('rateLimit', 1, Number.MAX_SAFE_INTEGER),
   textField('vapidSubject'),
+  boolField('pushEnabled'),
+  boolField('pushSessionName'),
   boolField('pushSummary'),
   boolField('pushTurnEnd'),
   boolField('pushTool'),
@@ -1192,6 +1196,8 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
   pushSummary: SettingsFieldState
   pushTurnEnd: SettingsFieldState
   pushTool: SettingsFieldState
+  pushEnabled: SettingsFieldState
+  pushSessionName: SettingsFieldState
   pushDebounceMs: SettingsFieldState
   lang: SettingsFieldState
   serverName: SettingsFieldState

@@ -213,6 +213,63 @@ test('push_notify: not registered when lan-gate.config.json sets {"pushTool": fa
   }
 })
 
+test('pushEnabled:false: apply attaches no listeners, registers no tool, and never pushes (P55-1)', async () => {
+  const mod = await freshImport()
+  // A recording ctx: apply with the master switch off must not touch ANY of
+  // these — no ctx.on wiring, no ctx.inject scheduling (neither the tool nor
+  // the system-prompt section), no registration, no HTTP.
+  const wiredEvents = []
+  const injectedDeps = []
+  const registered = []
+  const ctx = {
+    on: (event) => { wiredEvents.push(event); return () => {} },
+    inject: (deps, cb) => {
+      injectedDeps.push([...deps])
+      if (deps.includes('tools')) cb(Object.assign(Object.create(ctx), { tools: { register: (t) => { registered.push(t); return () => {} } } }))
+    },
+    effect: (fn) => fn()
+  }
+
+  await withMockFetch(() => ({ ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) }), async (calls) => {
+    mod.apply(ctx, { pushEnabled: false, pushTurnEnd: true, pushTool: true })
+    assert.deepStrictEqual(wiredEvents, [], 'no event listener may be attached when notifications are disabled')
+    assert.deepStrictEqual(injectedDeps, [], 'no tool/systemPrompt injection may be scheduled')
+    assert.deepStrictEqual(registered, [], 'push_notify must not be registered')
+    assert.deepStrictEqual(calls, [], 'no push request may leave the process')
+  })
+})
+
+test('pushEnabled:false via DSH_PUSH_ENABLED=0 behaves the same as the row value', async () => {
+  const original = process.env.DSH_PUSH_ENABLED
+  process.env.DSH_PUSH_ENABLED = '0'
+  try {
+    const mod = await freshImport()
+    const wiredEvents = []
+    const injectedDeps = []
+    const registered = []
+    const ctx = {
+      on: (event) => { wiredEvents.push(event); return () => {} },
+      inject: (deps, cb) => {
+        injectedDeps.push([...deps])
+        if (deps.includes('tools')) cb(Object.assign(Object.create(ctx), { tools: { register: (t) => { registered.push(t); return () => {} } } }))
+      },
+      effect: (fn) => fn()
+    }
+    await withMockFetch(() => ({ ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) }), async (calls) => {
+      // pushTurnEnd: true on the row proves the master switch wins over the
+      // opt-in leg being on — nothing may push regardless.
+      mod.apply(ctx, { pushTurnEnd: true, pushTool: true })
+      assert.deepStrictEqual(wiredEvents, [])
+      assert.deepStrictEqual(injectedDeps, [])
+      assert.deepStrictEqual(registered, [])
+      assert.deepStrictEqual(calls, [])
+    })
+  } finally {
+    if (original === undefined) delete process.env.DSH_PUSH_ENABLED
+    else process.env.DSH_PUSH_ENABLED = original
+  }
+})
+
 test('push_notify: gracefully skipped (no throw) when the "tools" service is not present', async () => {
   const mod = await freshImport()
   const { ctx, registered } = makeCtx({ withTools: false })

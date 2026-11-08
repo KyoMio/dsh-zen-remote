@@ -50,7 +50,7 @@ test('restartKey is sensitive to exactly the restart-required fields', async () 
     role: 'host', port: 3088, host: '127.0.0.1', targetPort: undefined, rateLimit: 120,
     trustedProxies: '', vapidSubject: 'mailto:admin@localhost', lang: 'auto',
     pushEvents: 'agent/turn-stopping', pushDebounceMs: 15000, pushSummary: false,
-    pushTurnEnd: false, pushTool: true,
+    pushTurnEnd: false, pushTool: true, pushEnabled: true, pushSessionName: false,
     // The live-read fields: changing any of these must NOT move the key.
     serverName: 'box', idleHours: 48, autoShareNewSessions: false,
     serverUrl: 'https://gw.example', deviceToken: 'tok',
@@ -72,7 +72,7 @@ test('restartKey is sensitive to exactly the restart-required fields', async () 
     role: 'client', port: 4000, host: '0.0.0.0', targetPort: 3080, rateLimit: 1,
     trustedProxies: '10.0.0.1', vapidSubject: 'mailto:x@y.z', lang: 'zh',
     pushEvents: 'other/event', pushDebounceMs: 1, pushSummary: true,
-    pushTurnEnd: true, pushTool: false,
+    pushTurnEnd: true, pushTool: false, pushEnabled: false, pushSessionName: true,
   }
   assert.deepEqual(Object.keys(flips).sort(), [...RESTART_FIELDS].sort(), 'the flip table covers the whole set')
   for (const [field, value] of Object.entries(flips)) {

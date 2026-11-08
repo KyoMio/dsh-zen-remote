@@ -56,7 +56,8 @@ const COPY = {
     questionTitle: 'DSH 等你回答',
     questionBody: '智能体提了一个问题，正在等你回答',
     turnEndTitle: 'DSH 任务完成',
-    turnEndBody: '智能体已完成当前回合'
+    turnEndBody: '智能体已完成当前回合',
+    sessionPrefix: '来源会话：{name}'
   },
   en: {
     lastTool: 'Last executed: {tool}',
@@ -66,7 +67,8 @@ const COPY = {
     questionTitle: 'DSH is waiting for your answer',
     questionBody: 'The agent asked a question and is waiting for your answer',
     turnEndTitle: 'DSH task finished',
-    turnEndBody: 'The agent finished the current turn'
+    turnEndBody: 'The agent finished the current turn',
+    sessionPrefix: 'Session: {name}'
   }
 }
 
@@ -114,6 +116,28 @@ async function sendPush(title, body, gatewayPort) {
 
 const SUMMARY_MAX = 120
 const clip = (s) => String(s).replace(/\s+/g, ' ').trim().slice(0, SUMMARY_MAX)
+
+// Session-name cap for the push body's prefix line (P55-1): a session title
+// is a one-line context hint on a lock screen, not the whole story — shorter
+// than the summary cap on purpose. clipTitle shares clip's whitespace
+// collapsing but keeps its own bound.
+const SESSION_TITLE_MAX = 40
+const clipTitle = (s) => String(s).replace(/\s+/g, ' ').trim().slice(0, SESSION_TITLE_MAX)
+
+// The display name of a session, from its append-only event log: the LAST
+// `session/title` event, whitespace-collapsed and clipped. Blank titles are
+// skipped (an older named one still answers); garbage in, '' out.
+export function sessionTitle(events) {
+  if (!Array.isArray(events)) return ''
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]
+    if (ev && ev.type === 'session/title' && ev.data && typeof ev.data.title === 'string') {
+      const clipped = clipTitle(ev.data.title)
+      if (clipped !== '') return clipped
+    }
+  }
+  return ''
+}
 
 // ---------------------------------------------------------------------------
 // Pure decision layer. Everything below this line up to `apply()` is a pure
@@ -208,14 +232,33 @@ const skip = (reason) => ({ shouldNotify: false, title: '', body: '', reason })
  *   summary         already-extracted turn summary  ('turn-end')
  *   toolName        tool awaiting approval          ('approval')
  *   question        pending question text           ('question')
- * @param {object} cfg { turnEndEnabled, debounceMs, includeSummary, lang }
+ *   sessionName     source session's display title  (all kinds, P55-1)
+ * @param {object} cfg { turnEndEnabled, debounceMs, includeSummary, lang,
+ *   pushEnabled, includeSessionName }
  *   lang is the resolved notification language ('en' | 'zh'); when absent
  *   (policy tests build their own cfg) DSH_PUSH_LANG decides, else Chinese.
+ *   pushEnabled absent reads as true (legacy cfg objects stay valid);
+ *   includeSessionName absent reads as off.
  * @returns {{shouldNotify: boolean, title: string, body: string, reason: string}}
  */
 export function decideNotification(input, cfg) {
+  // The master switch (P55-1) wins over every leg, the never-swallowed
+  // approval leg included — turning notifications off means OFF.
+  if (cfg && cfg.pushEnabled === false) return skip('push-disabled')
   const copy = COPY[resolveLang(cfg.lang)]
   const debounced = (input.now - input.lastSent) < cfg.debounceMs
+
+  // The optional first body line: `来源会话：<名>` / `Session: <name>`, then
+  // the kind's own body on the second line. Only when the switch is on AND
+  // the caller resolved a non-empty name — otherwise the body stays exactly
+  // the pre-P55-1 single line.
+  const withSessionName = (coreBody) => {
+    if (cfg && cfg.includeSessionName === true && typeof input.sessionName === 'string') {
+      const name = clipTitle(input.sessionName)
+      if (name !== '') return `${copy.sessionPrefix.replace('{name}', name)}\n${coreBody}`
+    }
+    return coreBody
+  }
 
   switch (input.kind) {
     // Event leg. Exempt from the debounce on purpose: "a tool is waiting for
@@ -224,23 +267,31 @@ export function decideNotification(input, cfg) {
       return {
         shouldNotify: true,
         title: copy.approvalTitle,
-        body: input.toolName ? copy.approvalBody.replace('{tool}', input.toolName) : copy.approvalBodyPlain,
+        body: withSessionName(input.toolName ? copy.approvalBody.replace('{tool}', input.toolName) : copy.approvalBodyPlain),
         reason: 'approval-pending'
       }
     case 'question':
       return {
         shouldNotify: true,
         title: copy.questionTitle,
-        body: (cfg.includeSummary && input.question) || copy.questionBody,
+        body: withSessionName((cfg.includeSummary && input.question) || copy.questionBody),
         reason: 'question-pending'
       }
 
-    // Turn end. Opt-in, top-level only, debounced.
+    // Turn end. Opt-in, top-level only, debounced. includeSummary reads
+    // three-valued: undefined (legacy callers that pass input.summary
+    // directly) behaves like true, only an explicit false blanks it —
+    // apply() passes '' unless the summary leg is on anyway.
     case 'turn-end':
       if (!cfg.turnEndEnabled) return skip('turn-end-disabled')
       if ((input.delegationDepth ?? 0) !== 0) return skip('subagent')
       if (debounced) return skip('debounced')
-      return { shouldNotify: true, title: copy.turnEndTitle, body: input.summary || copy.turnEndBody, reason: 'turn-end' }
+      return {
+        shouldNotify: true,
+        title: copy.turnEndTitle,
+        body: withSessionName((cfg.includeSummary !== false ? input.summary : '') || copy.turnEndBody),
+        reason: 'turn-end'
+      }
 
     default:
       return skip('unknown-kind')
@@ -412,6 +463,15 @@ export function apply(ctx, config) {
   // masked by whatever the object happened to contain. Precedence:
   // env > row > lan-gate.config.json > defaults (src/config.ts).
   const values = resolveConfig(config ?? {}, readFileConfig(), process.env).values
+  // The master switch (P55-1): off means the whole push half never wires —
+  // no turn-end listeners, no approval/question leg, no push_notify tool,
+  // no system-prompt section, and therefore nothing can push at all.
+  // Absent reads as on, so legacy rows keep their behavior.
+  const pushEnabled = values.pushEnabled !== false
+  if (!pushEnabled) {
+    console.log('[dsh-zen-remote-push] notifications disabled (DSH_PUSH_ENABLED=0 / pushEnabled:false)')
+    return
+  }
   const gatewayPort = Number(values.port ?? 3088)
   const events = String(values.pushEvents ?? 'agent/turn-stopping').split(',').map((s) => s.trim()).filter(Boolean)
   const lang = resolveLang(values.lang)
@@ -422,7 +482,24 @@ export function apply(ctx, config) {
     turnEndEnabled: values.pushTurnEnd === true,
     debounceMs: Number(values.pushDebounceMs ?? 15000),
     includeSummary: values.pushSummary === true,
+    // Always true here (the disabled case returned above) — decideNotification
+    // still reads it so a direct policy call honors the switch.
+    pushEnabled: true,
+    includeSessionName: values.pushSessionName === true,
     lang
+  }
+
+  // Session-title cache (P55-1): sessionId -> clipped title. Warm from the
+  // `session/title` feed the moment a rename lands, so the approval and
+  // question legs never re-walk the whole event log per fire.
+  const titlesBySession = new Map()
+  const resolveSessionName = (session) => {
+    if (!cfg.includeSessionName || !session) return ''
+    const cached = session.id ? titlesBySession.get(session.id) : undefined
+    if (cached) return cached
+    const extracted = sessionTitle(sessionEvents(session))
+    if (extracted && session.id) titlesBySession.set(session.id, extracted)
+    return extracted
   }
 
   // The one piece of mutable state: when the last push went out. Wrapped so
@@ -454,10 +531,14 @@ export function apply(ctx, config) {
     // letting subagent turn ends back in. Turn-end is the low-value leg, so
     // when the session cannot be identified, stay quiet.
     if (!header) return
+    // One event-log walk serves both the summary and the session name
+    // (P55-1); neither leg on means the log is never read at all.
+    const evs = (cfg.includeSummary || cfg.includeSessionName) ? sessionEvents(session) : []
     fire({
       kind: 'turn-end',
       delegationDepth: header && header.delegationDepth,
-      summary: cfg.includeSummary ? turnSummary(sessionEvents(session), payload && payload.turn, lang) : ''
+      summary: cfg.includeSummary ? turnSummary(evs, payload && payload.turn, lang) : '',
+      sessionName: cfg.includeSessionName ? (titlesBySession.get(session.id) || sessionTitle(evs)) : ''
     })
   }
   for (const event of events) {
@@ -476,12 +557,17 @@ export function apply(ctx, config) {
   try {
     ctx.on('session/event', (_session, event) => {
       if (!event || !event.data) return
+      // P55-1: warm the title cache the moment a rename lands, so a later
+      // approval/question push names the session it came from.
+      if (event.type === 'session/title' && typeof event.data.title === 'string' && _session && _session.id) {
+        titlesBySession.set(_session.id, clipTitle(event.data.title))
+      }
       if (event.type === 'approval/asked') {
         const id = event.data.id
         const toolName = event.data.toolName
         const timer = setTimeout(() => {
           armed.delete(id)
-          fire({ kind: 'approval', toolName })
+          fire({ kind: 'approval', toolName, sessionName: resolveSessionName(_session) })
         }, graceMs)
         if (typeof timer.unref === 'function') timer.unref()
         armed.set(id, timer)
@@ -489,7 +575,7 @@ export function apply(ctx, config) {
         const timer = armed.get(event.data.id)
         if (timer !== undefined) { clearTimeout(timer); armed.delete(event.data.id) }
       } else if (event.type === 'tool/call' && event.data.name === ASK_USER_TOOL) {
-        fire({ kind: 'question', question: pendingQuestionText(event.data.arguments) })
+        fire({ kind: 'question', question: pendingQuestionText(event.data.arguments), sessionName: resolveSessionName(_session) })
       }
     })
   } catch (e) {

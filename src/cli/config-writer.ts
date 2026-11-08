@@ -52,6 +52,8 @@ export const ENV_VAR_BY_FIELD: Readonly<Partial<Record<keyof ZenRemoteConfig, st
   pushSummary: 'DSH_PUSH_SUMMARY',
   pushTurnEnd: 'DSH_PUSH_TURN_END',
   pushTool: 'DSH_PUSH_TOOL',
+  pushEnabled: 'DSH_PUSH_ENABLED',
+  pushSessionName: 'DSH_PUSH_SESSION_NAME',
 }
 
 export interface WriteCliConfigOptions {
