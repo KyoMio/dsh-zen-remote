@@ -18,7 +18,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const { restoreBusy, onSessionCreated } = require('../lib/share-ops.js')
+const { restoreBusy, onSessionCreated, isBlankSession, isFirstTurnStart } = require('../lib/share-ops.js')
 const { createShareStore } = require('../lib/share-store.js')
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-share-ops-'))
@@ -160,4 +160,85 @@ test('onSessionCreated: sharing an already-shared fork is a no-op that keeps sha
   assert.equal(onSessionCreated({ id: 'fork-1', parentSession: 'source' }, { store, autoShare: false, parentOf: noopParent }), false)
   const second = store.list().find((e) => e.sessionId === 'fork-1')
   assert.equal(second.sharedAt, first.sharedAt, 'sharedAt stays at the first share')
+})
+
+test('isBlankSession: identifies unseeded non-subagent sessions with no turn/start in snapshotEvents()', () => {
+  const blankEvents = [
+    { type: 'permission/preset', seq: 0 },
+    { type: 'sandbox/mode', seq: 1 },
+    { type: 'session/end-seed', seq: 2 },
+    { type: 'model/selection', seq: 3 },
+  ]
+  assert.equal(
+    isBlankSession({
+      header: { id: 'blank-1', isSeeded: false },
+      snapshotEvents: () => blankEvents,
+    }),
+    true,
+    'a persisted blank session with no turn/start is blank',
+  )
+  assert.equal(
+    isBlankSession({
+      header: { id: 'established-1', isSeeded: false },
+      snapshotEvents: () => [...blankEvents, { type: 'turn/start', seq: 4, data: { turn: 1 } }],
+    }),
+    false,
+    'once turn/start is in the log, the session is no longer blank',
+  )
+  assert.equal(
+    isBlankSession({
+      header: { id: 'fork-1', isSeeded: true, parentSession: 'src' },
+      snapshotEvents: () => [],
+    }),
+    false,
+    'a seeded fork is never treated as a blank placeholder',
+  )
+  assert.equal(
+    isBlankSession({
+      header: { id: 'child-1', isSeeded: false, origin: 'subagent', parentSession: 'p' },
+      snapshotEvents: () => [],
+    }),
+    false,
+    'a subagent child is never treated as a blank placeholder',
+  )
+  assert.equal(isBlankSession({ header: { id: 'no-fn', isSeeded: false } }), false)
+  assert.equal(
+    isBlankSession({
+      header: { id: 'throws', isSeeded: false },
+      snapshotEvents: () => { throw new Error('boom') },
+    }),
+    false,
+  )
+  // Prefers turnBoundaryOf (DSH 0.2+ non-deprecated projection reader) when available.
+  assert.equal(
+    isBlankSession(
+      { header: { id: 'via-projection-blank', isSeeded: false } },
+      () => ({ openTurnStartSeq: null, lastTurn: 0 }),
+    ),
+    true,
+    'turnBoundaryOf(openTurnStartSeq: null, lastTurn: 0) marks a session blank without calling snapshotEvents',
+  )
+  assert.equal(
+    isBlankSession(
+      { header: { id: 'via-projection-used', isSeeded: false }, snapshotEvents: () => [] },
+      () => ({ openTurnStartSeq: null, lastTurn: 1 }),
+    ),
+    false,
+    'turnBoundaryOf(lastTurn > 0) wins over snapshotEvents',
+  )
+})
+
+test('isFirstTurnStart: matches only turn 1 of an unseeded top-level session', () => {
+  const topSession = { header: { id: 'top-1', isSeeded: false } }
+  assert.equal(isFirstTurnStart(topSession, { type: 'turn/start', data: { turn: 1 } }), true)
+  assert.equal(isFirstTurnStart(topSession, { type: 'turn/start', data: { turn: 2 } }), false)
+  assert.equal(isFirstTurnStart(topSession, { type: 'user/message', data: { turn: 1 } }), false)
+  assert.equal(
+    isFirstTurnStart({ header: { id: 'fork-1', isSeeded: true } }, { type: 'turn/start', data: { turn: 1 } }),
+    false,
+  )
+  assert.equal(
+    isFirstTurnStart({ header: { id: 'sub-1', isSeeded: false, origin: 'subagent' } }, { type: 'turn/start', data: { turn: 1 } }),
+    false,
+  )
 })

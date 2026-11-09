@@ -45,8 +45,8 @@ import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
 import type { AdminHandlerOptions, SessionQueryLike } from './admin-routes.js'
 import { CLIENT_ROUTE_PREFIX, createClientHandler } from './client-routes.js'
 import { responseJson, sameOriginPost } from './http.js'
-import { onSessionCreated, restoreBusy } from './share-ops.js'
-import type { AgentStatusLike } from './share-ops.js'
+import { isBlankSession, isFirstTurnStart, onSessionCreated, restoreBusy } from './share-ops.js'
+import type { AgentStatusLike, TurnBoundaryLike } from './share-ops.js'
 import type { AdminAdmission } from './admin-routes.js'
 import { startRestartWatcher } from './restart-watcher.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
@@ -855,6 +855,16 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // clocks and the relay can walk the same chain for reachability.
     const parentIndex = createParentIndex()
     const tracker = createActivityTracker(store, parentIndex.parentOf)
+    // Track sessions explicitly unshared by a user or client during this row's
+    // lifetime so the `turn/start` (turn 1) fallback for `reuseLive` blank
+    // sessions never overrides an intentional manual unshare before Turn 1.
+    const manuallyUnshared = new Set<string>()
+    store.subscribe((ev) => {
+      if (ev.type === 'shared') manuallyUnshared.delete(ev.sessionId)
+      else if (ev.type === 'unshared' && (ev.reason === 'manual' || ev.reason === 'client')) {
+        manuallyUnshared.add(ev.sessionId)
+      }
+    })
     try {
       ctx.on('session/event', (session, event) => {
         // Record the parent link BEFORE tracking, so a child's very first
@@ -862,22 +872,36 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         parentIndex.observe(session)
         const sessionId: unknown = session?.id
         if (typeof sessionId !== 'string' || sessionId === '') return
+        // When `session/create` reuses a blank session that was ALREADY live
+        // in memory (`reuseLive`), DSH emits no `agent/created`. If that blank
+        // session was not shared (e.g. `autoShareNewSessions` was turned on
+        // after it was pre-created, or its idle window expired in memory) and
+        // was not manually unshared while blank, share it as Turn 1 starts so
+        // `tracker.onEvent` right below marks it busy too.
+        if (isFirstTurnStart(session, event) && !manuallyUnshared.has(sessionId) && !store.isShared(sessionId)) {
+          try {
+            onSessionCreated(session.header, {
+              store,
+              autoShare: resolveConfig(config, readFileConfig(), process.env).values.autoShareNewSessions,
+              parentOf: parentIndex.parentOf,
+            })
+          } catch (error) {
+            logWarn('dsh-zen-remote cannot share new session "%s": %s', sessionId, message(error))
+          }
+        }
         tracker.onEvent(sessionId, event.type)
       })
     } catch (error) {
       logWarn('dsh-zen-remote cannot listen on "session/event": %s', message(error))
     }
-    // Auto-share and fork-following (T33a), off `agent/created` — the only
-    // host event that fires EXACTLY ONCE per NEW session. Its `source` is
-    // 'startup' for fresh creation (top-level, fork and subagent all go
+    // Auto-share and fork-following (T33a), off `agent/created`. Its `source`
+    // is 'startup' for fresh creation (top-level, fork and subagent all go
     // through the same factory call) and 'resume' when a persisted session
-    // re-enters the live store, so filtering on 'startup' is what keeps a
-    // manually-closed session closed across reopens — `session/created`
-    // re-fires on resume and `api-session/added` also fires when an agent is
-    // disposed, so neither qualifies. The payload's agent id IS the session
-    // id (dsh-agent keys its registry by it; its typert wire type is
-    // `dsh-session/types#SessionId`), and by announce time the fresh header
-    // already carries the subagent/fork markers the share decision reads.
+    // re-enters the live store. DSH's "New Session" (`createInWorkspace` →
+    // `session/create`) reuses persisted blank sessions (zero turns ever
+    // started) via `agents.resume`, which arrives with `source === 'resume'`;
+    // `isBlankSession` lets those reclaimed placeholders auto-share while
+    // keeping established conversations closed across reopens.
     // autoShareNewSessions is a volatile row setting: resolved at EVENT time,
     // never snapshotted here.
     try {
@@ -896,7 +920,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           // whose share it inherits through its parent, and the forwarded
           // status frames the client needs to announce the row never left.
           parentIndex.observe(agent.session)
-          if (source !== 'startup') return
+          const turnBoundaryOf = (s: unknown): TurnBoundaryLike | undefined => {
+            const ag = reflectNow()?.get('agents') as { turnBoundaryOf?: (sess: unknown) => TurnBoundaryLike } | undefined
+            return typeof ag?.turnBoundaryOf === 'function' ? ag.turnBoundaryOf(s) : undefined
+          }
+          if (source !== 'startup' && !(source === 'resume' && isBlankSession(agent.session, turnBoundaryOf))) return
+          if (typeof agent.id === 'string') manuallyUnshared.delete(agent.id)
           onSessionCreated(agent.session.header, {
             store,
             autoShare: resolveConfig(config, readFileConfig(), process.env).values.autoShareNewSessions,

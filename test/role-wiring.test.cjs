@@ -829,6 +829,89 @@ test('T33a: the host role restores busy on startup, auto-shares fresh top-level 
   created({ agent: { id: 'resumed-2', session: { header: { version: 4, id: 'resumed-2', createdAt: stamp, isSeeded: true, parentSession: 'also-unknown' } } }, source: 'resume' })
   assert.equal(JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['resumed-2'], undefined, "source 'resume' never shares, fork header or not")
 
+  // Reused persisted blank session (DSH 0.2.2+ session/create → agents.resume):
+  // source is 'resume', but snapshotEvents() has no 'turn/start', so it IS a
+  // newly claimed blank placeholder and auto-shares when the knob is on.
+  created({
+    agent: {
+      id: 'reused-blank-1',
+      session: {
+        header: { version: 4, id: 'reused-blank-1', createdAt: stamp, isSeeded: false },
+        snapshotEvents: () => [{ type: 'permission/preset', seq: 0 }, { type: 'session/end-seed', seq: 1 }],
+      },
+    },
+    source: 'resume',
+  })
+  assert.ok(
+    JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['reused-blank-1'],
+    'a persisted blank session reclaimed via agents.resume is auto-shared',
+  )
+
+  // Whereas a resumed session that ALREADY had a turn stays out.
+  created({
+    agent: {
+      id: 'resumed-established-1',
+      session: {
+        header: { version: 4, id: 'resumed-established-1', createdAt: stamp, isSeeded: false },
+        snapshotEvents: () => [{ type: 'turn/start', seq: 0, data: { turn: 1 } }, { type: 'turn/end', seq: 1 }],
+      },
+    },
+    source: 'resume',
+  })
+  assert.equal(
+    JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['resumed-established-1'],
+    undefined,
+    'an established session resumed from disk is never re-shared',
+  )
+
+  // Live blank reuse (reuseLive in session/create emits no agent/created):
+  // when Turn 1 starts on an unseeded live blank session, session/event
+  // auto-shares it and marks it busy, unless it was manually unshared first.
+  const onEvent = listeners.find((l) => l.event === 'session/event').listener
+  onEvent(
+    { id: 'live-blank-1', header: { version: 4, id: 'live-blank-1', createdAt: stamp, isSeeded: false } },
+    { type: 'turn/start', data: { turn: 1 } },
+  )
+  assert.ok(
+    JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['live-blank-1'],
+    'turn 1 on an unshared live blank session auto-shares it',
+  )
+
+  // If the user manually unshared a blank session before Turn 1, Turn 1 must
+  // respect that manual unshare and leave it closed.
+  const unshareRes = { status: 0, body: '', setHeader() {}, writeHead(code) { this.status = code }, end(bytes) { if (bytes !== undefined) this.body = bytes.toString() } }
+  await adminRoute.handler(
+    jsonReq('POST', '/_dsh/zen-remote/admin/shares', { 'sec-fetch-site': 'same-origin' }, { action: 'unshare', sessionId: 'reused-blank-1' }),
+    unshareRes,
+  )
+  assert.equal(unshareRes.status, 200)
+  onEvent(
+    { id: 'reused-blank-1', header: { version: 4, id: 'reused-blank-1', createdAt: stamp, isSeeded: false } },
+    { type: 'turn/start', data: { turn: 1 } },
+  )
+  assert.equal(
+    JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['reused-blank-1'],
+    undefined,
+    'a manually unshared blank session stays closed when Turn 1 starts',
+  )
+
+  // Re-claiming a manually-unshared blank session via agent/created resets
+  // manuallyUnshared and shares it again.
+  created({
+    agent: {
+      id: 'reused-blank-1',
+      session: {
+        header: { version: 4, id: 'reused-blank-1', createdAt: stamp, isSeeded: false },
+        snapshotEvents: () => [{ type: 'session/end-seed', seq: 0 }],
+      },
+    },
+    source: 'resume',
+  })
+  assert.ok(
+    JSON.parse(fs.readFileSync(sharesFile, 'utf8')).sessions['reused-blank-1'],
+    're-claiming a blank session via agent/created clears manuallyUnshared and shares it',
+  )
+
   // Same wiring, client role: no creation feed, no admin prefix — the
   // service being present changes nothing.
   const clientRoutes = []
