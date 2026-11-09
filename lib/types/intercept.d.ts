@@ -168,6 +168,18 @@ export declare const REMOTE_READ_METHODS: ReadonlySet<string>;
  * the read whitelist does not name (T34-fix). */
 export declare function isRemoteWrite(endpoint: string): boolean;
 /**
+ * Stream endpoints whose caller-supplied `uplink` iterable and
+ * `uplinkWindow` travel to the relay instead of being half-closed locally
+ * with `releaseUplink`. DSH 0.2.2+ replaced `terminal/follow|write|resize`
+ * with the duplex `terminal/attach` stream (`TerminalInput` write/resize
+ * commands ride the uplink; `ack` frames ride the downlink). The relay
+ * client's pump (relay-client.ts) is the other half: it forwards the host's
+ * frames through the server's `/v1/stream-uplink` channel and releases the
+ * host inbox itself when the stream ends — the interceptor only hands the
+ * iterable over, it never half-closes a member of this set.
+ */
+export declare const REMOTE_UPLINK_STREAM_METHODS: ReadonlySet<string>;
+/**
  * T58/T62: the vocabulary of the current-session signal. The value travels
  * from the BROWSER — the only place the host's persisted selection
  * (localStorage `dsh.sessions.current`) is readable — through the client

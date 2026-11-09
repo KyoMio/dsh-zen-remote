@@ -207,9 +207,9 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'terminal/close': ['agentId'],
   'terminal/follow': ['agentId'],
   // TA-1: the 0.2.2 duplex stream (follow+write+resize merged), located by
-  // the same agentId. The interceptor's uplink wiring (feeding the relay's
-  // openStream options) lands in TA-2; today the entry keeps the two method
-  // tables method-for-method identical so the registry test stays green.
+  // the same agentId. TA-2 wired the interceptor half: the host's uplink
+  // inbox and its window travel to the relay's openStream options (see
+  // REMOTE_UPLINK_STREAM_METHODS) instead of being half-closed.
   'terminal/attach': ['agentId'],
   // the retain/list half locates by a plain top-level json sessionId
   'terminal/list': ['sessionId'],
@@ -351,6 +351,19 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
 export function isRemoteWrite(endpoint: string): boolean {
   return !REMOTE_READ_METHODS.has(endpoint)
 }
+
+/**
+ * Stream endpoints whose caller-supplied `uplink` iterable and
+ * `uplinkWindow` travel to the relay instead of being half-closed locally
+ * with `releaseUplink`. DSH 0.2.2+ replaced `terminal/follow|write|resize`
+ * with the duplex `terminal/attach` stream (`TerminalInput` write/resize
+ * commands ride the uplink; `ack` frames ride the downlink). The relay
+ * client's pump (relay-client.ts) is the other half: it forwards the host's
+ * frames through the server's `/v1/stream-uplink` channel and releases the
+ * host inbox itself when the stream ends — the interceptor only hands the
+ * iterable over, it never half-closes a member of this set.
+ */
+export const REMOTE_UPLINK_STREAM_METHODS: ReadonlySet<string> = new Set(['terminal/attach'])
 
 /** The refusal a write gets while the relay is not serving (T34). */
 const WRITE_OFFLINE_MESSAGE = '服务端离线，远程会话暂时只读'
@@ -524,6 +537,26 @@ function releaseUplink(uplink: unknown): void {
   } catch {
     // A non-iterable uplink has nothing to release.
   }
+}
+
+/**
+ * The shape check one duplex stream's `uplinkWindow` must pass before it
+ * travels (TA-2) — the same rule the server re-applies on `/v1/stream`
+ * (relay-server.ts): positive safe-integer `maxBytes`, non-negative
+ * safe-integer `frameOverheadBytes`. Anything else — an older host's
+ * `undefined`, a non-object, a fractional or negative budget — comes back
+ * `undefined` and the stream forwards with the relay's own default window:
+ * the numbers are the host's contract with itself, garbage is dropped, never
+ * refused.
+ */
+function normalizeUplinkWindow(raw: unknown): { maxBytes: number; frameOverheadBytes: number } | undefined {
+  if (!isPlainObject(raw)) return undefined
+  const { maxBytes, frameOverheadBytes } = raw
+  if (typeof maxBytes !== 'number' || !Number.isSafeInteger(maxBytes) || maxBytes <= 0) return undefined
+  if (typeof frameOverheadBytes !== 'number' || !Number.isSafeInteger(frameOverheadBytes) || frameOverheadBytes < 0) {
+    return undefined
+  }
+  return { maxBytes, frameOverheadBytes }
 }
 
 /** One remote-call failure in the diagnostics ring. */
@@ -4859,22 +4892,37 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       )
     }
     const verdict = validate(endpoint, virtuals)
-    if (!verdict.ok) throwRecorded(endpoint, verdict.code, verdict.message)
+    if (!verdict.ok) {
+      // TA-2: a refusal must not leak the host's UplinkInbox — half-close it
+      // before the coded throw, the same courtesy the forwarded path's own
+      // failure paths extend below.
+      releaseUplink(uplink)
+      throwRecorded(endpoint, verdict.code, verdict.message)
+    }
     // A WRITE stream while the relay is not serving (CP4, the invoke route's
-    // T34 rule applied to the stream route): `terminal/follow` is the one
-    // write-shaped STREAM in the table — its attachment takes over the
-    // terminal's input control — so opening it into a dead link must refuse
+    // T34 rule applied to the stream route): the write-shaped STREAMS of the
+    // table — `terminal/follow`, and its 0.2.2 duplex successor
+    // `terminal/attach` (REMOTE_UPLINK_STREAM_METHODS) — take over the
+    // terminal's input control, so opening them into a dead link must refuse
     // here, exactly like every other mutation. MS-3: the TARGET leg's state
     // is the one that counts.
     if (isRemoteWrite(endpoint) && verdict.client.state !== 'online') {
+      releaseUplink(uplink)
       throwRecorded(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
     }
     // The multiplexed wire channel ALWAYS hands us an UplinkInbox here —
-    // never undefined. Remote streams consume no uplink items, so the uplink
-    // is half-closed and the stream forwarded (the host's own move for its
-    // `$events` subscription, gateway releaseUplink). Rejecting uplinks
-    // would reject every remote stream the UI opens.
-    releaseUplink(uplink)
+    // never undefined. One-directional remote streams consume no uplink
+    // items, so the uplink is half-closed and the stream forwarded (the
+    // host's own move for its `$events` subscription, gateway releaseUplink).
+    // TA-2: a DUPLEX member of REMOTE_UPLINK_STREAM_METHODS keeps its inbox —
+    // the host's TerminalInput write/resize commands ride it, so the iterable
+    // and the mux's uplink window (shape-checked, garbage dropped) travel to
+    // the relay client's pump instead; the pump releases the iterable itself
+    // when the stream ends. Rejecting uplinks would reject every remote
+    // stream the UI opens.
+    const forwardsUplink = REMOTE_UPLINK_STREAM_METHODS.has(endpoint) && isAsyncIterable(uplink)
+    if (!forwardsUplink) releaseUplink(uplink)
+    const normalizedWindow = forwardsUplink ? normalizeUplinkWindow(uplinkWindow) : undefined
     const serverId = verdict.serverId
     const client = verdict.client
     const slash = endpoint.indexOf('/')
@@ -4892,8 +4940,22 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // through the outage and reopens the leg when the relay serves again
       // (CP4); every other endpoint's first read fails out with the original
       // code (CP5 scope, the pre-CP4 behavior).
-      upstream = client.openStream(namespace, method, clone, signal)
+      upstream = forwardsUplink
+        ? client.openStream(
+            namespace,
+            method,
+            clone,
+            signal,
+            {
+              uplink: uplink as AsyncIterable<unknown>,
+              ...(normalizedWindow !== undefined ? { uplinkWindow: normalizedWindow } : {}),
+            },
+          )
+        : client.openStream(namespace, method, clone, signal)
     } catch (error) {
+      // TA-2: a synchronous openStream failure (an unpaired relay) strands
+      // the forwarded inbox — the pump never started, so half-close it here.
+      if (forwardsUplink) releaseUplink(uplink)
       const code = error instanceof RelayError ? error.code : 'internal'
       throwRecorded(endpoint, code, messageOf(error))
     }
