@@ -183,6 +183,9 @@ interface RelayMethod {
    * forwarded. Like the global reads it claims no session field — access is
    * judged per frame / per answer. */
   events?: true
+  /** Set on duplex streams (`terminal/attach` in DSH 0.2.2+): the stream
+   * route accepts an `uplink` queue and exposes it to `/v1/stream-uplink`. */
+  uplink?: true
 }
 
 /**
@@ -302,6 +305,11 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'terminal/rename': { fields: ['agentId'] },
   'terminal/close': { fields: ['agentId'] },
   'terminal/follow': { fields: ['agentId'], stream: true },
+  // TA-1: the 0.2.2 duplex stream — follow+write+resize merged into one
+  // subscription with an `uplink` half (keystrokes/resize from the client).
+  // Same attachment semantics as follow (exclusive input control), same
+  // server-side trust premise; follow/write/resize stay for ≤ 0.2.1 hosts.
+  'terminal/attach': { fields: ['agentId'], stream: true, uplink: true },
   // the retain/list half locates by a plain top-level json sessionId
   'terminal/list': { fields: ['sessionId'] },
   'terminal/retain': { fields: ['sessionId'], stream: true },
@@ -350,9 +358,10 @@ export type InvokeDecision = { allow: true; filter?: InvokeFilter } | { allow: f
 /** One stream decision: allow (global streams carry a `streamFilter`, scoped
  * streams list the session ids the subscription depends on — the relay kills
  * the stream and counts viewers with them, and the event subscription sets
- * `events`), or the 403 reason. */
+ * `events`; a duplex entry sets `uplink` so the route arms the
+ * `/v1/stream-uplink` channel), or the 403 reason. */
 export type StreamDecision =
-  | { allow: true; filter?: StreamFilter; sessionIds: string[]; events?: true }
+  | { allow: true; filter?: StreamFilter; sessionIds: string[]; events?: true; uplink?: true }
   | { allow: false; reason: InvokeDenyReason }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -496,7 +505,9 @@ export function decideStream(
   for (const id of claimed.ids) {
     if (!isAccessible(id)) return { allow: false, reason: 'not-shared' }
   }
-  return { allow: true, sessionIds: claimed.ids }
+  return entry.uplink === true
+    ? { allow: true, sessionIds: claimed.ids, uplink: true }
+    : { allow: true, sessionIds: claimed.ids }
 }
 
 /**

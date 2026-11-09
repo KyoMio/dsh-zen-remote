@@ -4772,6 +4772,11 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
     // attachment becomes read-only", RT dsh-api-terminal-controller) — a
     // state change, refused offline like every other mutation.
     'terminal/follow',
+    // TA-1: the 0.2.2 duplex stream — same attachment semantics as follow
+    // (exclusive input control) plus the write/resize uplink, so it sits on
+    // the write side too (refused remote-offline). The interceptor's own
+    // uplink wiring lands in TA-2.
+    'terminal/attach',
   ])
   for (const endpoint of Object.keys(CLIENT_METHOD_FIELDS)) {
     assert.ok(

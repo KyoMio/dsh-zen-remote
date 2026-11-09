@@ -635,6 +635,32 @@ test('decideStream: the T41a scoped streams claim their ids and refuse the invok
   }
 })
 
+// -- TA-1: terminal/attach — the 0.2.2 duplex stream -----------------------------------
+
+test('decideStream: terminal/attach allows with the uplink marker, refuses unshared and on invoke', () => {
+  const args = { agentId: 'S-a', id: 'term-1', window: { cols: 80, rows: 24 } }
+  // DSH 0.2.2 merged follow+write+resize into one duplex stream: the decision
+  // carries `uplink: true` so the route arms the /v1/stream-uplink channel.
+  assert.deepEqual(decideStream('terminal', 'attach', args, only(['S-a'])), {
+    allow: true,
+    sessionIds: ['S-a'],
+    uplink: true,
+  })
+  assert.deepEqual(decideStream('terminal', 'attach', { agentId: 'VICTIM', id: 'term-1' }, only(['S-a'])), {
+    allow: false,
+    reason: 'not-shared',
+  })
+  // Stream-delivered: riding the invoke route is forbidden like every stream.
+  assert.deepEqual(decideInvoke('terminal', 'attach', args, yes), { allow: false, reason: 'forbidden-method' })
+  // The single-direction sibling carries NO uplink marker.
+  assert.deepEqual(decideStream('terminal', 'follow', { agentId: 'S-a', id: 'term-1' }, only(['S-a'])), {
+    allow: true,
+    sessionIds: ['S-a'],
+  })
+  // Missing agentId is unauthorizable, exactly like the rest of the terminal half.
+  assert.deepEqual(decideStream('terminal', 'attach', { id: 'term-1' }, yes), { allow: false, reason: 'no-session' })
+})
+
 // -- T41b: the plain-HTTP route registry (relay/v1/http) --------------------------
 
 test('decideHttpRoute: only the two registered routes allow, everything else is unknown-route', () => {

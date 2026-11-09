@@ -57,6 +57,9 @@ const RELAY_PROTOCOL = 1
 const HANDSHAKE_PATH = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE_PATH = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM_PATH = '/_dsh/zen-remote/relay/v1/stream'
+/** TA-1: the duplex uplink's post route — one JSON body of frames per call,
+ * sequenced by the pump below. */
+const STREAM_UPLINK_PATH = '/_dsh/zen-remote/relay/v1/stream-uplink'
 /** the relay's existing authenticated health route
  * (`GET …/relay/ping`, answers `{ok:true}`). Used by probeHealth() only. */
 const PING_PATH = '/_dsh/zen-remote/relay/ping'
@@ -360,8 +363,12 @@ export interface RelayClient {
   /** Open the NDJSON stream route. `frame` lines are yielded, `ping` lines
    * only refresh the idle clock, `end` finishes the iteration, an `error`
    * line throws its RelayError. A caller abort ENDS the iteration normally;
-   * `break` aborts the underlying request. */
-  openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown>
+   * `break` aborts the underlying request. TA-1: with `options.uplink` the
+   * stream is DUPLEX — the server's handshake line names the stream id and
+   * the pump forwards the host's frames through `/v1/stream-uplink`
+   * (single-flight batched, strictly ordered); an uplink refusal surfaces as
+   * the stream's error, and the host iterable is always released. */
+  openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal, options?: RelayStreamOptions): AsyncIterable<unknown>
   /** One plain-HTTP round-trip (T41b): `route` / `query` name a registered
    * `/api` GET (relay-access's RELAY_HTTP_ROUTES; `query` is the URL-encoded
    * query string with the session id already restored). Resolves with the
@@ -470,6 +477,21 @@ export interface RelayHttpResult {
 }
 
 /**
+ * The duplex-stream options (TA-1). `uplink` is the HOST-side frame source
+ * (the local `UplinkInbox` a `terminal/attach` session writes keystrokes and
+ * resize frames into); while the stream is open the pump below forwards its
+ * frames to the server through `/v1/stream-uplink`, single-flight batched,
+ * and — on stream exit — calls its `return()` so the host inbox is released
+ * even when the pump was parked mid-read. `uplinkWindow` is the host's own
+ * inbox budget, forwarded verbatim so the relay's bounded queue and the
+ * host's overflow accounting mean the same thing.
+ */
+export interface RelayStreamOptions {
+  uplink?: AsyncIterable<unknown>
+  uplinkWindow?: { maxBytes: number; frameOverheadBytes: number }
+}
+
+/**
  * The credential digest recorded beside a completed handshake (T23a-fix):
  * sha256 over `url + "\n" + token`, first 16 hex chars. Enough to detect a
  * changed address or a re-pair, without keeping — or ever exposing — a
@@ -522,6 +544,7 @@ type LineVerdict =
   | { kind: 'end' }
   | { kind: 'error'; error: RelayError }
   | { kind: 'info'; serverName?: string; deviceName?: string }
+  | { kind: 'uplink'; streamId: string }
 
 /** A string field of an info line, or undefined — absent, blank or not a string. */
 function infoString(value: unknown): string | undefined {
@@ -538,6 +561,13 @@ function classifyLine(line: string): LineVerdict {
   if (!isRecord(parsed)) return { kind: 'none' }
   if (parsed.type === 'frame' && 'frame' in parsed) return { kind: 'frame', frame: parsed.frame }
   if (parsed.type === 'end') return { kind: 'end' }
+  // TA-1: the duplex handshake line — the server naming the stream id the
+  // uplink posts must carry. A client that opened one-direction (or an older
+  // client that predates the channel) never sees this verdict: the check
+  // rides inside classifyLine, so unrecognized shapes fall to `none` below.
+  if (parsed.type === 'uplink' && typeof parsed.streamId === 'string' && parsed.streamId !== '') {
+    return { kind: 'uplink', streamId: parsed.streamId }
+  }
   if (parsed.type === 'error') {
     const detail = isRecord(parsed.error) ? parsed.error : {}
     const code = typeof detail.code === 'string' && detail.code !== '' ? detail.code : 'internal'
@@ -1782,12 +1812,18 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     })
   }
 
-  function openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown> {
+  function openStream(
+    namespace: string,
+    method: string,
+    args: unknown,
+    signal?: AbortSignal,
+    options?: RelayStreamOptions,
+  ): AsyncIterable<unknown> {
     // Eager, not generator-lazy: an unconfigured client fails at CALL time,
     // exactly like connect/invoke, instead of hiding the error inside the
     // first next().
     requireCredentials()
-    return streamLines(namespace, method, args, signal)
+    return streamLines(namespace, method, args, signal, options)
   }
 
   /**
@@ -1797,12 +1833,24 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * and the generator's own exit — `break`, a thrown error line, normal
    * end — which tears the request down so the server's upstream does not
    * keep pumping behind a consumer that left.
+   *
+   * TA-1: with `options.uplink` the pump is DUPLEX. An independent async
+   * task consumes the host's iterable the moment the 200 lands (frames read
+   * before the handshake line are buffered locally, never lost), and a
+   * single-in-flight flush loop batches them into `/v1/stream-uplink` posts:
+   * while one post is on the wire the newer frames accumulate in
+   * `pendingItems` and leave as ONE follow-up batch — strictly ordered seq
+   * numbers without a second concurrent request, which is what keeps the
+   * host's own input sequencing intact. An uplink refusal is the stream's
+   * error: it aborts the downstream controller so the consumer sees the
+   * RelayError, never a silent drop.
    */
   async function* streamLines(
     namespace: string,
     method: string,
     args: unknown,
     signal: AbortSignal | undefined,
+    options: RelayStreamOptions | undefined,
   ): AsyncGenerator<unknown> {
     if (signal?.aborted) return
     // Re-checked: the generator body runs at the first next(), so the
@@ -1813,6 +1861,62 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       controller.abort()
     }
     if (signal !== undefined) signal.addEventListener('abort', onExternalAbort)
+
+    // ---- the uplink pump's state (TA-1) --------------------------------
+    const uplink = options?.uplink
+    let uplinkIterator: AsyncIterator<unknown> | undefined
+    let uplinkError: unknown
+    let pumpStopped = false
+    let assignedStreamId: string | undefined
+    let nextSeq = 1
+    let uplinkEnded = false
+    let endSent = false
+    let flushing = false
+    const pendingItems: unknown[] = []
+
+    /** The single-flight flush loop: one POST at a time, everything read
+     * while it flew leaving as the next batch. Called from the consume task
+     * and from the handshake-line verdict; re-entry while flushing is a
+     * no-op (the running loop already sees the newest state on every turn). */
+    const flushUplink = async (): Promise<void> => {
+      if (flushing || pumpStopped || assignedStreamId === undefined) return
+      flushing = true
+      try {
+        while (!pumpStopped && (pendingItems.length > 0 || (uplinkEnded && !endSent))) {
+          const batch = pendingItems.splice(0, pendingItems.length)
+          const sendEnd = uplinkEnded && pendingItems.length === 0 && !endSent
+          if (batch.length === 0 && !sendEnd) break
+          if (sendEnd) endSent = true
+          const seq = nextSeq++
+          try {
+            await exchange(
+              STREAM_UPLINK_PATH,
+              JSON.stringify({
+                streamId: assignedStreamId,
+                seq,
+                ...(batch.length > 0 ? { items: batch } : {}),
+                ...(sendEnd ? { end: true } : {}),
+              }),
+              controller.signal,
+              true,
+              { url, token },
+              { timeoutSetsOffline: false },
+            )
+          } catch (error) {
+            // The refusal (or a transport death that is not the caller's own
+            // abort) kills the DOWNSTREAM too: the caller must see the
+            // uplink's error instead of a silently dead terminal input.
+            if (!controller.signal.aborted) {
+              uplinkError = error
+              controller.abort()
+            }
+            return
+          }
+        }
+      } finally {
+        flushing = false
+      }
+    }
 
     let idleFired = false
     let headersTimedOut = false
@@ -1849,7 +1953,16 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       let response: Response
       try {
         response = await fetchImpl(`${url}${STREAM_PATH}`, {
-          ...requestInit(token, JSON.stringify({ namespace, method, args })),
+          ...requestInit(
+            token,
+            JSON.stringify({
+              namespace,
+              method,
+              args,
+              ...(uplink !== undefined ? { uplink: true } : {}),
+              ...(uplink !== undefined && options?.uplinkWindow !== undefined ? { uplinkWindow: options.uplinkWindow } : {}),
+            }),
+          ),
           signal: controller.signal,
         })
       } catch (error) {
@@ -1881,6 +1994,31 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       setState('online')
       if (response.body === null) return
       armIdle()
+      // TA-1: the uplink consume task starts with the downstream — frames
+      // the host pushes before the handshake line arrives land in
+      // pendingItems and flush the moment the id is known.
+      if (uplink !== undefined) {
+        const iterator = uplink[Symbol.asyncIterator]()
+        uplinkIterator = iterator
+        void (async (): Promise<void> => {
+          try {
+            while (true) {
+              const result = await iterator.next()
+              if (result.done) break
+              pendingItems.push(result.value)
+              void flushUplink()
+            }
+            uplinkEnded = true
+            void flushUplink()
+          } catch (error) {
+            // A host-side iterable failure is this stream's failure too.
+            if (!controller.signal.aborted && !pumpStopped) {
+              uplinkError = error
+              controller.abort()
+            }
+          }
+        })()
+      }
       const decoder = new TextDecoder()
       let buffer = ''
       reader = response.body.getReader()
@@ -1910,6 +2048,13 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
             // T59: the heartbeat's names, folded in quietly — a state-sparing
             // notify wakes the interceptor's rename path without any reconnect.
             applyInfoDelta(verdict.serverName, verdict.deviceName)
+          } else if (verdict.kind === 'uplink') {
+            // TA-1: the duplex handshake. The FIRST line names the stream;
+            // any later one is ignored (one id per stream, ever).
+            if (assignedStreamId === undefined) {
+              assignedStreamId = verdict.streamId
+              void flushUplink()
+            }
           }
         }
       }
@@ -1927,10 +2072,17 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           throw verdict.error
         } else if (verdict.kind === 'info') {
           applyInfoDelta(verdict.serverName, verdict.deviceName)
+        } else if (verdict.kind === 'uplink' && assignedStreamId === undefined) {
+          assignedStreamId = verdict.streamId
+          void flushUplink()
         }
       }
     } catch (error) {
       if (signal?.aborted) return
+      // TA-1: an uplink refusal outranks the transport noise the abort it
+      // caused surfaces as — the caller sees the relay's own error code
+      // (`out-of-order`, `uplink-overflow`, …), the actionable one.
+      if (uplinkError !== undefined) throw uplinkError
       if (error instanceof RelayError) throw error
       // Anything else escaping the body read is the transport dying.
       noteFailure('offline')
@@ -1940,6 +2092,12 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       disarmIdle()
       clearTimeout(headerTimer)
       if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
+      // TA-1: stop the pump and release the host iterable — a parked next()
+      // (empty inbox, pump waiting) would otherwise pin the host's
+      // UplinkInbox after the stream is gone. return() on an exhausted
+      // iterator is a no-op; a missing one is skipped.
+      pumpStopped = true
+      void Promise.resolve(uplinkIterator?.return?.()).catch(() => {})
       // Release the body even if a custom fetchImpl ignored the signal —
       // an in-flight reader keeps the connection's buffers alive. Cancel
       // may reject on an already-dead stream; that is fine.

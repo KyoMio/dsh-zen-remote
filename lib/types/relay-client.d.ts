@@ -231,8 +231,12 @@ export interface RelayClient {
     /** Open the NDJSON stream route. `frame` lines are yielded, `ping` lines
      * only refresh the idle clock, `end` finishes the iteration, an `error`
      * line throws its RelayError. A caller abort ENDS the iteration normally;
-     * `break` aborts the underlying request. */
-    openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal): AsyncIterable<unknown>;
+     * `break` aborts the underlying request. TA-1: with `options.uplink` the
+     * stream is DUPLEX — the server's handshake line names the stream id and
+     * the pump forwards the host's frames through `/v1/stream-uplink`
+     * (single-flight batched, strictly ordered); an uplink refusal surfaces as
+     * the stream's error, and the host iterable is always released. */
+    openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal, options?: RelayStreamOptions): AsyncIterable<unknown>;
     /** One plain-HTTP round-trip (T41b): `route` / `query` name a registered
      * `/api` GET (relay-access's RELAY_HTTP_ROUTES; `query` is the URL-encoded
      * query string with the session id already restored). Resolves with the
@@ -340,6 +344,23 @@ export interface RelayHttpResult {
     /** The underlying response body, decoded as text (both registered routes
      * answer buffered JSON). */
     body: string;
+}
+/**
+ * The duplex-stream options (TA-1). `uplink` is the HOST-side frame source
+ * (the local `UplinkInbox` a `terminal/attach` session writes keystrokes and
+ * resize frames into); while the stream is open the pump below forwards its
+ * frames to the server through `/v1/stream-uplink`, single-flight batched,
+ * and — on stream exit — calls its `return()` so the host inbox is released
+ * even when the pump was parked mid-read. `uplinkWindow` is the host's own
+ * inbox budget, forwarded verbatim so the relay's bounded queue and the
+ * host's overflow accounting mean the same thing.
+ */
+export interface RelayStreamOptions {
+    uplink?: AsyncIterable<unknown>;
+    uplinkWindow?: {
+        maxBytes: number;
+        frameOverheadBytes: number;
+    };
 }
 /**
  * The credential digest recorded beside a completed handshake (T23a-fix):

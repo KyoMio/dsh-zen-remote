@@ -43,6 +43,24 @@ export { MAX_UPLOAD_BYTES };
 /** The `/api` route the upload channel dispatches into, verbatim from the
  * host's own registration (RT dsh-client-file-upload lib/index.js:73). */
 export declare const UPLOAD_HTTP_PATH = "/api/session/uploadFileBinary";
+/**
+ * The duplex uplink's buffering ceiling (TA-1): how many bytes of
+ * not-yet-consumed uplink frames one live stream may hold — the same budget
+ * the host's own stream inbox applies (`DEFAULT_STREAM_INBOX_BYTES`), so a
+ * stalled terminal consumer backs up at exactly the point the local session
+ * would have. Past it the `/v1/stream-uplink` route answers 413
+ * `uplink-overflow` and the stream is aborted.
+ */
+export declare const MAX_STREAM_UPLINK_BYTES = 262144;
+/** The per-stream uplink window the client may advertise (TA-1): how many
+ * bytes the host's uplink inbox buffers before it stops draining, and the
+ * per-frame framing overhead it charges against that budget. The relay
+ * forwards it verbatim — only the shape is validated, the numbers are the
+ * host's own contract with itself. */
+export interface RelayUplinkWindow {
+    maxBytes: number;
+    frameOverheadBytes: number;
+}
 /** Shape of the `typertGateway` service this route needs (measured live,
  * docs/spike-relay.md §2.1: invoke returns the unwrapped business value and
  * throws errors carrying a string `code`; stream opens one `mode: 'stream'`
@@ -78,6 +96,12 @@ export interface RelayGateway {
         args: unknown;
         signal?: AbortSignal;
         peer?: unknown;
+        /** TA-1: the duplex uplink queue (a duplex method like `terminal/attach`
+         * reads keystrokes/resize frames from it). Absent on one-direction
+         * streams — the field's presence IS the duplex flag. */
+        uplink?: AsyncIterable<unknown>;
+        /** TA-1: the client's advertised uplink window, forwarded verbatim. */
+        uplinkWindow?: RelayUplinkWindow;
     }): Promise<AsyncIterable<unknown>>;
     /** The host's wire adapter, shared by the WebSocket mux and the local
      * transports. `open` is the async 0.2.0 method. */

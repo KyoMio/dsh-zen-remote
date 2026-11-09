@@ -79,6 +79,26 @@ export { MAX_UPLOAD_BYTES }
  * host's own registration (RT dsh-client-file-upload lib/index.js:73). */
 export const UPLOAD_HTTP_PATH = '/api/session/uploadFileBinary'
 
+/**
+ * The duplex uplink's buffering ceiling (TA-1): how many bytes of
+ * not-yet-consumed uplink frames one live stream may hold — the same budget
+ * the host's own stream inbox applies (`DEFAULT_STREAM_INBOX_BYTES`), so a
+ * stalled terminal consumer backs up at exactly the point the local session
+ * would have. Past it the `/v1/stream-uplink` route answers 413
+ * `uplink-overflow` and the stream is aborted.
+ */
+export const MAX_STREAM_UPLINK_BYTES = 262_144
+
+/** The per-stream uplink window the client may advertise (TA-1): how many
+ * bytes the host's uplink inbox buffers before it stops draining, and the
+ * per-frame framing overhead it charges against that budget. The relay
+ * forwards it verbatim — only the shape is validated, the numbers are the
+ * host's own contract with itself. */
+export interface RelayUplinkWindow {
+  maxBytes: number
+  frameOverheadBytes: number
+}
+
 /** Error messages forwarded to the client are clipped to this many chars. */
 const MAX_MESSAGE_CHARS = 500
 
@@ -187,6 +207,12 @@ export interface RelayGateway {
     args: unknown
     signal?: AbortSignal
     peer?: unknown
+    /** TA-1: the duplex uplink queue (a duplex method like `terminal/attach`
+     * reads keystrokes/resize frames from it). Absent on one-direction
+     * streams — the field's presence IS the duplex flag. */
+    uplink?: AsyncIterable<unknown>
+    /** TA-1: the client's advertised uplink window, forwarded verbatim. */
+    uplinkWindow?: RelayUplinkWindow
   }): Promise<AsyncIterable<unknown>>
   /** The host's wire adapter, shared by the WebSocket mux and the local
    * transports. `open` is the async 0.2.0 method. */
@@ -791,6 +817,114 @@ function errorOf(error: unknown): { code: string; message?: string; details?: Re
 }
 
 /**
+ * The bounded async queue behind one live duplex stream's uplink half (TA-1).
+ * The `/v1/stream-uplink` route pushes the client's frames in; the gateway's
+ * stream implementation (the host's own uplink consumer) pulls them out.
+ *
+ * Three states beyond "open", each with its own door:
+ * - `ended`: the client half-closed (`end: true`). Queued items still drain;
+ *   the iteration finishes cleanly once the buffer is empty. A push AFTER the
+ *   end is a client bug — it records `failure` and aborts the stream.
+ * - `failure`: a post-end push or a buffer overflow. The recorded error is
+ *   thrown to the consumer, and the stream's abort fires (the route cannot
+ *   push anymore, so the downstream is torn down with it).
+ * - `closed`: the stream is over (its own finally, or closeAll). Everything
+ *   is dropped; further pushes are silently swallowed (`'ok'`) — the route's
+ *   answer for a dead stream is the 404 unknown-stream, so the swallow only
+ *   covers the race between the two.
+ *
+ * The waiter is woken on EVERY state change (item, end, close, failure) so a
+ * parked `next()` never sits on a stale promise: the iteration is the host's
+ * consumer, and a missed wake would hang a terminal that just died.
+ */
+class RelayUplinkQueue {
+  private readonly items: Array<{ value: unknown; bytes: number }> = []
+  private bufferedBytes = 0
+  private ended = false
+  private closed = false
+  private failure: Error | undefined
+  private waiter: (() => void) | undefined
+
+  constructor(
+    private readonly maxBytes: number,
+    private readonly onFail: () => void,
+  ) {}
+
+  /** One frame in. `frameBytes` is the frame's serialized size — the same
+   * accounting the host's inbox charges, so the ceiling here means the same
+   * thing it means locally. */
+  push(value: unknown, frameBytes: number): 'ok' | 'after-end' | 'overflow' {
+    if (this.closed || this.failure !== undefined) return 'ok'
+    if (this.ended) {
+      this.failure = new Error('uplink frame arrived after end')
+      this.wake()
+      this.onFail()
+      return 'after-end'
+    }
+    if (this.bufferedBytes + frameBytes > this.maxBytes) {
+      this.failure = new Error('uplink buffer overflow')
+      this.wake()
+      this.onFail()
+      return 'overflow'
+    }
+    this.items.push({ value, bytes: frameBytes })
+    this.bufferedBytes += frameBytes
+    this.wake()
+    return 'ok'
+  }
+
+  /** The client half-closed: queued items still drain, then the iteration
+   * ends. Idempotent. */
+  end(): void {
+    if (this.ended) return
+    this.ended = true
+    this.wake()
+  }
+
+  /** The whole stream is over: drop everything, finish every parked reader,
+   * swallow all future pushes. Idempotent. */
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    this.items.length = 0
+    this.bufferedBytes = 0
+    this.wake()
+  }
+
+  private wake(): void {
+    const wake = this.waiter
+    this.waiter = undefined
+    wake?.()
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<unknown> {
+    return {
+      next: () => this.next(),
+      return: () => {
+        this.close()
+        return Promise.resolve({ value: undefined, done: true })
+      },
+    }
+  }
+
+  private async next(): Promise<IteratorResult<unknown>> {
+    while (true) {
+      if (this.closed) return { value: undefined, done: true }
+      const entry = this.items.shift()
+      if (entry !== undefined) {
+        this.bufferedBytes -= entry.bytes
+        return { value: entry.value, done: false }
+      }
+      if (this.failure !== undefined) throw this.failure
+      if (this.ended) return { value: undefined, done: true }
+      await new Promise<void>((resolve) => {
+        this.waiter = resolve
+      })
+    }
+  }
+}
+
+/**
  * One live `$zr/events` subscription's forwarding bookkeeping (T32). The
  * answer route (`relay/v1/event-result`) proves an `eventId` was forwarded
  * through HERE before it composes the gateway payload, so the registry is
@@ -903,6 +1037,27 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
    * route searches these for every incoming eventId. A closed
    * subscription removes itself; closeAll empties the set. */
   const liveEventSubscriptions = new Set<EventsSubscription>()
+
+  /**
+   * The live duplex streams' uplink halves (TA-1), keyed by the `streamId`
+   * the handshake line handed the client. The `/v1/stream-uplink` route
+   * resolves every post through THIS table, which is the whole ownership
+   * story: the id is a 16-byte random value only the opening device ever
+   * learned, the device check binds it to that one pairing, the session
+   * list is re-judged against the share table at post time, and the seq
+   * counter keeps replays and reordered posts out. A stream's own finally
+   * removes its entry; closeAll closes every queue first so no consumer
+   * parks on a dead stream.
+   */
+  interface ActiveUplinkStream {
+    streamId: string
+    device: string
+    sessionIds: readonly string[]
+    nextSeq: number
+    queue: RelayUplinkQueue
+    abort: () => void
+  }
+  const liveUplinkStreams = new Map<string, ActiveUplinkStream>()
 
   /** Latest `job/list` rows seen per session — the recent-state half of the
    * job ownership check (the other half is a one-shot list on a cache miss).
@@ -2295,6 +2450,69 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       return
     }
 
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/stream-uplink`) {
+      // The duplex uplink's post route (TA-1): one JSON body of frames for a
+      // stream opened with `uplink: true`, resolved against the live-uplink
+      // table. Four walls in order, each with its own status: the shape
+      // (400), the stream id and its owning device (404 — unknown-stream,
+      // deliberately indistinguishable between "no such stream" and "not
+      // yours", so a foreign device learns nothing), the share table at post
+      // time (403 — an unshared session's keystrokes must die with the
+      // share), and the sequence counter (409 — replays and reordered posts
+      // would corrupt the host's own input sequencing).
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const streamId = body.streamId
+      const seq = body.seq
+      const items = body.items
+      const end = body.end
+      if (
+        typeof streamId !== 'string' ||
+        streamId === '' ||
+        typeof seq !== 'number' ||
+        !Number.isSafeInteger(seq) ||
+        seq < 1 ||
+        (items !== undefined && !Array.isArray(items)) ||
+        (end !== undefined && typeof end !== 'boolean') ||
+        !((Array.isArray(items) && items.length > 0) || end === true)
+      ) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      const entry = liveUplinkStreams.get(streamId)
+      if (entry === undefined || entry.device !== device) {
+        responseJson(res, 404, { ok: false, error: { code: 'unknown-stream' } })
+        return
+      }
+      if (!entry.sessionIds.every((id) => isAccessible(id))) {
+        responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+        return
+      }
+      if (seq !== entry.nextSeq) {
+        responseJson(res, 409, { ok: false, error: { code: 'out-of-order' } })
+        return
+      }
+      entry.nextSeq += 1
+      if (Array.isArray(items)) {
+        for (const item of items) {
+          const itemBytes = Buffer.byteLength(JSON.stringify(item) ?? '', 'utf8')
+          const status = entry.queue.push(item, itemBytes)
+          if (status === 'after-end') {
+            responseJson(res, 400, { ok: false, error: { code: 'uplink-after-end' } })
+            return
+          }
+          if (status === 'overflow') {
+            responseJson(res, 413, { ok: false, error: { code: 'uplink-overflow' } })
+            return
+          }
+        }
+      }
+      if (end === true) entry.queue.end()
+      responseJson(res, 200, { ok: true })
+      return
+    }
+
     if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/stream`) {
       // Body validation identical to invoke: one JSON object naming the
       // method and carrying object args.
@@ -2321,6 +2539,25 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // stream is allowed, so a 403 here is the same shape invoke answers.
         responseJson(res, 403, { ok: false, error: { code: decision.reason } })
         return
+      }
+      // TA-1: the client's advertised uplink window, shape-checked ONCE here —
+      // only a well-formed window travels to the gateway; garbage (a zero or
+      // negative budget, a fractional value) is dropped, never refused: the
+      // numbers are the host's own contract with itself, and a missing one
+      // just means the host default applies.
+      let uplinkWindow: RelayUplinkWindow | undefined
+      if (isPlainObject(body.uplinkWindow)) {
+        const candidate = body.uplinkWindow
+        if (
+          typeof candidate.maxBytes === 'number' &&
+          Number.isSafeInteger(candidate.maxBytes) &&
+          candidate.maxBytes > 0 &&
+          typeof candidate.frameOverheadBytes === 'number' &&
+          Number.isSafeInteger(candidate.frameOverheadBytes) &&
+          candidate.frameOverheadBytes >= 0
+        ) {
+          uplinkWindow = { maxBytes: candidate.maxBytes, frameOverheadBytes: candidate.frameOverheadBytes }
+        }
       }
       const device = headerValue(req, 'x-zen-remote-device') ?? ''
       if ((streamsByDevice.get(device) ?? 0) >= MAX_STREAMS_PER_DEVICE) {
@@ -2487,6 +2724,31 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           })
         }
 
+        // ---- TA-1: the duplex uplink -------------------------------------
+        // A duplex decision the client took up: build the bounded queue the
+        // gateway will read keystrokes from, register it for the
+        // /v1/stream-uplink route, and send the handshake line FIRST —
+        // before the upstream is even open — so the client may start posting
+        // the moment it sees the id. The write chain serializes the line
+        // ahead of any frame; registration precedes the open so a post that
+        // races the handshake still finds the entry (its seq order and the
+        // share table keep it honest either way).
+        let uplinkStreamId: string | undefined
+        let uplinkQueue: RelayUplinkQueue | undefined
+        if (decision.uplink === true && body.uplink === true) {
+          uplinkStreamId = randomBytes(16).toString('hex')
+          uplinkQueue = new RelayUplinkQueue(MAX_STREAM_UPLINK_BYTES, () => hangUp.abort())
+          liveUplinkStreams.set(uplinkStreamId, {
+            streamId: uplinkStreamId,
+            device,
+            sessionIds: decision.sessionIds,
+            nextSeq: 1,
+            queue: uplinkQueue,
+            abort: () => hangUp.abort(),
+          })
+          void writeLine({ type: 'uplink', streamId: uplinkStreamId })
+        }
+
         // ---- share-change synchronization (T22b §4) --------------------
 
         // The `$zr/events` forwarding bookkeeping (T32): registered for the
@@ -2646,11 +2908,25 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           } else {
             // `$zr/events` opens through the wire adapter (the ONLY door to
             // the forwarded-event stream); every other route is a typert
-            // stream method.
+            // stream method. TA-1: a duplex stream rides with its uplink
+            // queue (the field's PRESENCE is the duplex flag the gateway
+            // reads) and the shape-checked window, both optional.
             const iterable =
               eventsSub !== undefined
                 ? await openEventsStream(hangUp.signal)
-                : await gateway.stream(withPeer({ namespace, method, args, signal: hangUp.signal }, options.getPeer))
+                : await gateway.stream(
+                    withPeer(
+                      {
+                        namespace,
+                        method,
+                        args,
+                        signal: hangUp.signal,
+                        ...(uplinkQueue !== undefined ? { uplink: uplinkQueue } : {}),
+                        ...(uplinkWindow !== undefined ? { uplinkWindow } : {}),
+                      },
+                      options.getPeer,
+                    ),
+                  )
             for await (const frame of iterable) {
               if (finished || clientGone) break
               if (namespace === 'job' && method === 'list') rememberJobs(ownerSessionIdOf(args), frame)
@@ -2675,6 +2951,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           clearInterval(heartbeat)
           unsubscribe()
           tableUnsubscribers.delete(unsubscribe)
+          // TA-1: the uplink half dies with the stream — deregistered BEFORE
+          // the queue closes, so a post racing the teardown answers
+          // unknown-stream instead of feeding a dead queue, and the gateway's
+          // consumer is finished instead of parked forever.
+          if (uplinkStreamId !== undefined) liveUplinkStreams.delete(uplinkStreamId)
+          uplinkQueue?.close()
           if (eventsSub !== undefined) {
             liveEventSubscriptions.delete(eventsSub)
             eventsSub.events.clear()
@@ -2718,6 +3000,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       sub.events.clear()
     }
     liveEventSubscriptions.clear()
+    // TA-1: the duplex uplinks die with the handler — close() finishes every
+    // parked gateway consumer (a terminal read must not hang on a reload)
+    // and later posts answer unknown-stream; the streams' own finallys then
+    // find their entries already gone and delete nothing.
+    for (const entry of liveUplinkStreams.values()) entry.queue.close()
+    liveUplinkStreams.clear()
     // Remember the reason for requests still inside their ownership probe —
     // they read it at the pre-open gate. Killing the open streams runs their
     // normal teardown (error line, res.end, abort), whose finally releases

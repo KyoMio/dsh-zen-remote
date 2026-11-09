@@ -143,12 +143,14 @@ export type InvokeDecision = {
 /** One stream decision: allow (global streams carry a `streamFilter`, scoped
  * streams list the session ids the subscription depends on — the relay kills
  * the stream and counts viewers with them, and the event subscription sets
- * `events`), or the 403 reason. */
+ * `events`; a duplex entry sets `uplink` so the route arms the
+ * `/v1/stream-uplink` channel), or the 403 reason. */
 export type StreamDecision = {
     allow: true;
     filter?: StreamFilter;
     sessionIds: string[];
     events?: true;
+    uplink?: true;
 } | {
     allow: false;
     reason: InvokeDenyReason;
