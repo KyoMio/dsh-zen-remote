@@ -79,7 +79,13 @@ async function startServer(handler) {
   const port = server.address().port
   return {
     port,
-    stop: () => new Promise((resolve) => server.close(resolve)),
+    stop: () => new Promise((resolve) => {
+      // Deterministic teardown (relay-stream.test.cjs's rule): the raw
+      // stream sockets an assertion failure may leave behind would otherwise
+      // pin server.close() forever — connections go first, then close.
+      server.closeAllConnections()
+      server.close(resolve)
+    }),
     async fetch(pathName, opts = {}) {
       return fetch(`http://127.0.0.1:${port}${pathName}`, {
         method: opts.method || 'GET',
@@ -1737,4 +1743,321 @@ test('T5x upload slot: a synthetic-request build failure leaves the device budge
     for (const req of stalled) { try { req.destroy() } catch { /* gone */ } }
     await server.stop()
   }
+})
+
+// ---- TA-1: the duplex uplink channel (terminal/attach, DSH 0.2.2+) ---------------
+
+/** Poll until the predicate holds; times out loud, never silently. */
+async function waitFor(predicate, ms = 2000, label = '') {
+  const start = Date.now()
+  while (!predicate()) {
+    if (Date.now() - start > ms) throw new Error(`waitFor timeout${label === '' ? '' : `: ${label}`}`)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+/** Open one stream with a RAW node:http request and collect its NDJSON lines
+ * (the same harness relay-stream.test.cjs drives; a plain fetch would pool
+ * the socket and pin the test process). Resolves once the HEADERS arrive. */
+function openStream(server, body, headers = AUTH) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port: server.port, method: 'POST',
+      path: '/_dsh/zen-remote/relay/v1/stream',
+      headers: { ...headers, 'content-type': 'application/json', connection: 'close' },
+      agent: false,
+    }, (res) => {
+      const lines = []
+      let buffer = ''
+      let doneResolve
+      const done = new Promise((r) => { doneResolve = r })
+      let ended = false
+      const finish = () => {
+        if (ended) return
+        ended = true
+        doneResolve()
+      }
+      res.on('data', (chunk) => {
+        buffer += chunk.toString('utf8')
+        let idx
+        while ((idx = buffer.indexOf('\n')) >= 0) {
+          const raw = buffer.slice(0, idx)
+          buffer = buffer.slice(idx + 1)
+          if (raw.trim() === '') continue
+          try { lines.push(JSON.parse(raw)) } catch { lines.push({ parseError: raw }) }
+        }
+      })
+      res.on('end', finish)
+      res.on('close', finish)
+      resolve({ status: res.statusCode, headers: res.headers, res, req, lines, done })
+    })
+    req.on('error', () => { /* the destroy() below surfaces here */ })
+    req.end(JSON.stringify(body))
+  })
+}
+
+/** One controllable upstream `terminal/attach` gate: the test pushes frames,
+ * finishes or fails it; the route's abort lands as a gateway/cancelled throw.
+ * The duplex half arrives ON THE CALL (`call.uplink`) — the queue the relay
+ * built for /v1/stream-uplink. */
+function makeAttachGate(call) {
+  const pending = []
+  let wake = () => {}
+  let settled = 'open' // 'open' | 'done' | { error }
+  call.signal?.addEventListener('abort', () => {
+    if (settled === 'open') {
+      settled = { error: Object.assign(new Error(`Remote invocation "${call.namespace}/${call.method}" was aborted`), { code: 'gateway/cancelled' }) }
+      wake()
+    }
+  })
+  const iterable = (async function* () {
+    yield { type: 'snapshot', header: { id: call.args?.id ?? 'term-1' } }
+    while (true) {
+      if (pending.length > 0) {
+        const next = pending.shift()
+        if (next.kind === 'frame') yield next.frame
+        else if (next.kind === 'throw') throw next.error
+        else return
+      } else if (settled !== 'open') {
+        if (settled === 'done') return
+        throw settled.error
+      } else {
+        await new Promise((resolve) => { wake = resolve })
+      }
+    }
+  })()
+  return {
+    call,
+    iterable,
+    push: (frame) => { pending.push({ kind: 'frame', frame }); wake() },
+    finish: () => { pending.push({ kind: 'return' }); wake() },
+    get aborted() { return call.signal?.aborted === true },
+  }
+}
+
+/** Consume one uplink queue to completion, recording every item. */
+function consumeUplink(queue) {
+  const received = []
+  let error
+  let settled = false
+  const promise = (async () => {
+    for await (const item of queue) received.push(item)
+  })().catch((e) => { error = e }).finally(() => { settled = true })
+  return { received, error: () => error, settled: () => settled, promise }
+}
+
+const uplinkPost = (server, body, headers = AUTH) =>
+  server.fetch('/_dsh/zen-remote/relay/v1/stream-uplink', post('/u', body, headers))
+
+test('TA-1 uplink: attach with uplink:true answers the handshake line, passes the queue+window through, forwards posts in order', async () => {
+  const parts = makeParts('uplink-ok')
+  parts.store.share('S-a')
+  const gates = []
+  parts.gateway.stream = async (call) => {
+    const gate = makeAttachGate(call)
+    gates.push(gate)
+    return gate.iterable
+  }
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, {
+      namespace: 'terminal', method: 'attach',
+      args: { agentId: 'S-a', id: 'term-1', window: { cols: 80, rows: 24 } },
+      uplink: true,
+      uplinkWindow: { maxBytes: 1000, frameOverheadBytes: 8 },
+    })
+    assert.equal(open.status, 200)
+    // The FIRST line is the uplink handshake: the client learns the stream id
+    // before it may POST a single frame. (openStream resolves on HEADERS —
+    // the first data chunk lands a tick later; the gate's snapshot frame may
+    // already have followed it.)
+    await waitFor(() => open.lines.length >= 1, 2000, 'handshake line')
+    assert.equal(open.lines[0].type, 'uplink')
+    assert.match(open.lines[0].streamId, /^[0-9a-f]{32}$/, 'a fresh 16-byte hex id per stream')
+    const streamId = open.lines[0].streamId
+
+    await waitFor(() => gates.length === 1)
+    const gate = gates[0]
+    assert.equal(gate.call.namespace, 'terminal')
+    assert.equal(gate.call.method, 'attach')
+    assert.deepEqual(gate.call.uplinkWindow, { maxBytes: 1000, frameOverheadBytes: 8 }, 'uplinkWindow rides through verbatim')
+    assert.equal(typeof gate.call.uplink?.[Symbol.asyncIterator], 'function', 'the gateway got the uplink queue as an async iterable')
+
+    const consume = consumeUplink(gate.call.uplink)
+    const first = await uplinkPost(server, { streamId, seq: 1, items: [{ type: 'write', data: 'ls\n' }] })
+    assert.equal(first.status, 200)
+    assert.deepEqual(await first.json(), { ok: true })
+    await waitFor(() => consume.received.length >= 1)
+    assert.deepEqual(consume.received, [{ type: 'write', data: 'ls\n' }], 'the frame reached the gateway queue in order')
+
+    const second = await uplinkPost(server, { streamId, seq: 2, end: true })
+    assert.equal(second.status, 200)
+    await waitFor(consume.settled)
+    assert.equal(consume.error(), undefined, 'end:true finishes the queue cleanly')
+    assert.deepEqual(consume.received, [{ type: 'write', data: 'ls\n' }])
+
+    // A frame AFTER the end is a client bug — 400, and the stream dies (the
+    // queue recorded the failure and aborted the downstream).
+    const late = await uplinkPost(server, { streamId, seq: 3, items: [{ type: 'write', data: 'x' }] })
+    assert.equal(late.status, 400)
+    assert.deepEqual(await late.json(), { ok: false, error: { code: 'uplink-after-end' } })
+    await waitFor(() => gate.aborted, 2000)
+
+    gate.finish()
+    await open.done
+    assert.equal(open.lines.some((line) => line.type === 'uplink' && line !== open.lines[0]), false, 'exactly one handshake line')
+  } finally { await server.stop() }
+})
+
+test('TA-1 uplink: unknown stream and foreign device 404, out-of-order 409, unshared 403, overflow 413 + abort, malformed 400', async () => {
+  const parts = makeParts('uplink-bounds')
+  parts.store.share('S-a')
+  const gates = []
+  parts.gateway.stream = async (call) => {
+    const gate = makeAttachGate(call)
+    gates.push(gate)
+    return gate.iterable
+  }
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, {
+      namespace: 'terminal', method: 'attach',
+      args: { agentId: 'S-a', id: 'term-1' }, uplink: true,
+    })
+    await waitFor(() => open.lines.length >= 1, 2000, 'handshake line')
+    const streamId = open.lines[0].streamId
+    await waitFor(() => gates.length === 1)
+    const gate = gates[0]
+
+    // Unknown id: no live stream by that name.
+    const unknown = await uplinkPost(server, { streamId: 'deadbeef'.repeat(4), seq: 1, items: [{ x: 1 }] })
+    assert.equal(unknown.status, 404)
+    assert.deepEqual(await unknown.json(), { ok: false, error: { code: 'unknown-stream' } })
+
+    // Cross-device: the id is live but belongs to another pairing.
+    const foreign = await uplinkPost(server, { streamId, seq: 1, items: [{ x: 1 }] }, { ...AUTH, 'x-zen-remote-device': 'device-other' })
+    assert.equal(foreign.status, 404)
+    assert.deepEqual(await foreign.json(), { ok: false, error: { code: 'unknown-stream' } })
+
+    // Out of order: seq must count from 1 without gaps, and a refused seq
+    // leaves the counter untouched (the corrected seq:1 below still passes).
+    const late = await uplinkPost(server, { streamId, seq: 2, items: [{ x: 1 }] })
+    assert.equal(late.status, 409)
+    assert.deepEqual(await late.json(), { ok: false, error: { code: 'out-of-order' } })
+
+    const consume = consumeUplink(gate.call.uplink)
+    const first = await uplinkPost(server, { streamId, seq: 1, items: [{ type: 'write', data: 'ok' }] })
+    assert.equal(first.status, 200)
+    await waitFor(() => consume.received.length >= 1)
+
+    // Shape validation, before any ownership check.
+    for (const [label, body] of [
+      ['no streamId', { seq: 2, items: [{ x: 1 }] }],
+      ['empty streamId', { streamId: '', seq: 2, items: [{ x: 1 }] }],
+      ['seq 0', { streamId, seq: 0, items: [{ x: 1 }] }],
+      ['seq float', { streamId, seq: 2.5, items: [{ x: 1 }] }],
+      ['items not array', { streamId, seq: 2, items: 'x' }],
+      ['end not boolean', { streamId, seq: 2, end: 1 }],
+      ['neither items nor end', { streamId, seq: 2 }],
+      ['empty items, no end', { streamId, seq: 2, items: [] }],
+    ]) {
+      const res = await uplinkPost(server, body)
+      assert.equal(res.status, 400, label)
+      assert.deepEqual(await res.json(), { ok: false, error: { code: 'bad-request' } }, label)
+    }
+
+    // The share table closing the session kills the whole channel: the
+    // stream's own unshare subscription (T22b) ends the downstream AND its
+    // finally removes the live entry, so a post arriving after the teardown
+    // is refused `unknown-stream`. Within the teardown race window the post
+    // would reach the route's share check first and get the 403 not-shared —
+    // either verdict is a refusal, never a 200, and the downstream stream
+    // itself ends with the `unshared` error line.
+    parts.store.unshare('S-a', 'manual')
+    const closed = await uplinkPost(server, { streamId, seq: 2, items: [{ x: 1 }] })
+    assert.equal((await closed.json()).ok, false, 'an unshared session must never accept uplink posts')
+    assert.ok(closed.status === 403 || closed.status === 404, `unshared post refused, got ${closed.status}`)
+    await open.done
+    assert.equal(
+      open.lines.some((line) => line.type === 'error' && line.error?.code === 'unshared'),
+      true,
+      'the unshare ended the stream with the unshared line',
+    )
+
+    // Overflow — a FRESH stream, its queue deliberately UNCONSUMED so the
+    // buffered bytes can only exceed the cap (256 KiB). An illegal
+    // uplinkWindow meanwhile must NOT reach the gateway.
+    parts.store.share('S-a')
+    const openB = await openStream(server, {
+      namespace: 'terminal', method: 'attach',
+      args: { agentId: 'S-a', id: 'term-2' }, uplink: true,
+      uplinkWindow: { maxBytes: 0, frameOverheadBytes: -1 },
+    })
+    await waitFor(() => openB.lines.length >= 1, 2000, 'handshake line B')
+    const streamIdB = openB.lines[0].streamId
+    await waitFor(() => gates.length === 2)
+    const gateB = gates[1]
+    assert.equal(gateB.call.uplinkWindow, undefined, 'an illegal uplinkWindow is dropped, not forwarded')
+    const big = await uplinkPost(server, { streamId: streamIdB, seq: 1, items: [{ type: 'write', data: 'x'.repeat(270_000) }] })
+    assert.equal(big.status, 413)
+    assert.deepEqual(await big.json(), { ok: false, error: { code: 'uplink-overflow' } })
+    await waitFor(() => gateB.aborted, 2000)
+    assert.equal(gateB.aborted, true, 'the overflow aborted the downstream stream')
+  } finally { await server.stop() }
+})
+
+test('TA-1 uplink: a single-direction stream carries no handshake line and no queue', async () => {
+  const parts = makeParts('uplink-absent')
+  parts.store.share('S-a')
+  const gates = []
+  parts.gateway.stream = async (call) => {
+    const gate = makeAttachGate(call)
+    gates.push(gate)
+    return gate.iterable
+  }
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'terminal', method: 'follow', args: { agentId: 'S-a', id: 'term-1' } })
+    assert.equal(open.status, 200)
+    await waitFor(() => gates.length === 1, 2000, 'gateway stream')
+    gates[0].push({ type: 'output', data: 'hi' })
+    gates[0].finish()
+    await open.done
+    assert.equal(open.lines[0].type, 'frame', 'the first line is a frame, not an uplink handshake')
+    assert.equal(open.lines.some((line) => line.type === 'uplink'), false)
+    assert.equal(gates[0].call.uplink, undefined)
+    assert.equal(gates[0].call.uplinkWindow, undefined)
+  } finally { await server.stop() }
+})
+
+test('TA-1 uplink: closeAll closes every live queue — posts answer unknown-stream and consumers finish', async () => {
+  const parts = makeParts('uplink-closeall')
+  parts.store.share('S-a')
+  const gates = []
+  parts.gateway.stream = async (call) => {
+    const gate = makeAttachGate(call)
+    gates.push(gate)
+    return gate.iterable
+  }
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, {
+      namespace: 'terminal', method: 'attach',
+      args: { agentId: 'S-a', id: 'term-1' }, uplink: true,
+    })
+    await waitFor(() => open.lines.length >= 1, 2000, 'handshake line')
+    const streamId = open.lines[0].streamId
+    await waitFor(() => gates.length === 1)
+    const consume = consumeUplink(gates[0].call.uplink)
+    assert.equal(consume.settled(), false, 'the consumer is parked on the queue')
+
+    parts.handler.closeAll('row reload')
+    await waitFor(consume.settled)
+    assert.equal(consume.error(), undefined, 'close() finishes the parked consumer instead of hanging it')
+    assert.deepEqual(consume.received, [])
+
+    const after = await uplinkPost(server, { streamId, seq: 1, items: [{ x: 1 }] })
+    assert.equal(after.status, 404)
+    assert.deepEqual(await after.json(), { ok: false, error: { code: 'unknown-stream' } })
+  } finally { await server.stop() }
 })

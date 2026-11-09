@@ -20,6 +20,7 @@ const { createRelayClient, relayCredentialsDigest, volatileUpdateTouchesServerNa
 const HANDSHAKE = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM = '/_dsh/zen-remote/relay/v1/stream'
+const STREAM_UPLINK = '/_dsh/zen-remote/relay/v1/stream-uplink'
 const UNSHARE = '/_dsh/zen-remote/relay/v1/unshare'
 const UPLOAD = '/_dsh/zen-remote/relay/v1/upload'
 const DEVICE_NAME = '/_dsh/zen-remote/relay/v1/device/name'
@@ -89,6 +90,13 @@ function startFakeRelay() {
       if (route === STREAM) {
         if (scenario.stream) { scenario.stream(req, res, body); return }
         sendJson(res, 403, { ok: false, error: { code: 'forbidden-method' } })
+        return
+      }
+      if (route === STREAM_UPLINK) {
+        // TA-1: the duplex uplink channel — a scenario contract like the
+        // JSON routes (records into `seen` like every route).
+        const answered = scenario.streamUplink !== undefined ? scenario.streamUplink(req, res, body) : [200, { ok: true }]
+        if (answered !== undefined) sendJson(res, answered[0], answered[1])
         return
       }
       if (route === DEVICE_NAME) {
@@ -1906,6 +1914,175 @@ test('T59-fix2: a push whose connection dies MID-FLIGHT re-queues instead of dro
     await waitFor(() => pushes() === 2)
     await waitFor(() => client.deviceNameSyncing === false)
     assert.equal(client.handshakeInfo.deviceName, 'B')
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+// ---- TA-1: openStream duplex uplink (terminal/attach, DSH 0.2.2+) -----------------
+
+/** A test-side uplink source shaped like the host's UplinkInbox: push() feeds
+ * frames, end() finishes it, `returned` records a return() call — the pump's
+ * release discipline is observable. The waiter is a SINGLE-SHOT handoff: one
+ * parked next() consumes one wake, a second push while the pump is still
+ * draining lands in the queue and satisfies the NEXT next() call directly. */
+function makeUplinkSource() {
+  const pending = []
+  let waiter = null
+  let ended = false
+  let returned = false
+  return {
+    iterable: {
+      [Symbol.asyncIterator]() {
+        return {
+          next: () => {
+            if (pending.length > 0) return Promise.resolve({ value: pending.shift(), done: false })
+            if (ended) return Promise.resolve({ value: undefined, done: true })
+            return new Promise((resolve) => {
+              waiter = () => {
+                waiter = null
+                if (pending.length > 0) resolve({ value: pending.shift(), done: false })
+                else if (ended) resolve({ value: undefined, done: true })
+              }
+            })
+          },
+          return: () => {
+            returned = true
+            ended = true
+            const w = waiter
+            waiter = null
+            w?.()
+            return Promise.resolve({ value: undefined, done: true })
+          },
+        }
+      },
+    },
+    push: (item) => { pending.push(item); const w = waiter; waiter = null; w?.() },
+    end: () => { ended = true; const w = waiter; waiter = null; w?.() },
+    get returned() { return returned },
+  }
+}
+
+const uplinkHits = (relay) => relay.seen.filter((r) => r.url === STREAM_UPLINK)
+
+test('TA-1 uplink: early frames survive, in-flight frames batch, seq counts 1,2,…, the source is released at the end', async () => {
+  const relay = await startFakeRelay()
+  // The stream answers the handshake line, then one frame, then keeps the
+  // downstream open with pings. The server ends it once the client's end:true
+  // has landed (what the real host does when the terminal detaches).
+  let downstreamRes
+  relay.scenario.stream = (req, res) => {
+    downstreamRes = res
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+    res.write(JSON.stringify({ type: 'uplink', streamId: 'srv-stream-1' }) + '\n')
+    res.write(JSON.stringify({ type: 'frame', frame: { type: 'snapshot' } }) + '\n')
+    const timer = setInterval(() => { try { res.write('{"type":"ping"}\n') } catch { clearInterval(timer) } }, 30)
+    res.on('close', () => { clearInterval(timer); try { res.destroy() } catch { /* gone */ } })
+  }
+  // The FIRST uplink post stalls 150ms in flight — the batching window.
+  let firstUplink = true
+  relay.scenario.streamUplink = (req, res, body) => {
+    if (firstUplink) {
+      firstUplink = false
+      setTimeout(() => { if (!res.destroyed) sendJson(res, 200, { ok: true }) }, 150)
+      return undefined // answered asynchronously
+    }
+    if (body && body.end === true) {
+      // The end accepted → the server detaches the terminal: the downstream
+      // gets its end line, and the pump's release discipline is observable.
+      setTimeout(() => {
+        if (!res.destroyed) sendJson(res, 200, { ok: true })
+        try { downstreamRes.end('{"type":"end"}\n') } catch { /* gone */ }
+      }, 10)
+      return undefined
+    }
+    return [200, { ok: true }]
+  }
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    const up = makeUplinkSource()
+    // The early frame is pushed BEFORE the stream even opens: the pump is not
+    // running yet, so this must survive in the host iterable until the pump
+    // pulls it — never dropped, never sent twice.
+    up.push({ type: 'write', data: 'early\n' })
+
+    const collected = collect(client.openStream('terminal', 'attach', { agentId: 's', id: 'term-1' }, undefined, {
+      uplink: up.iterable,
+      uplinkWindow: { maxBytes: 4096, frameOverheadBytes: 24 },
+    }))
+
+    // The open request carries the duplex marker and the window verbatim.
+    await waitFor(() => relay.seen.some((r) => r.url === STREAM))
+    const openHit = relay.seen.find((r) => r.url === STREAM)
+    assert.equal(openHit.body.uplink, true)
+    assert.deepEqual(openHit.body.uplinkWindow, { maxBytes: 4096, frameOverheadBytes: 24 })
+
+    // seq:1 = the early frame alone, sent as soon as the handshake named the id.
+    await waitFor(() => uplinkHits(relay).length >= 1)
+    assert.deepEqual(uplinkHits(relay)[0].body, { streamId: 'srv-stream-1', seq: 1, items: [{ type: 'write', data: 'early\n' }] })
+
+    // While seq:1 is IN FLIGHT (the 150ms stall), two more frames arrive —
+    // they must merge into ONE follow-up request, not race out in parallel.
+    up.push({ type: 'write', data: 'a' })
+    up.push({ type: 'write', data: 'b\n' })
+    await waitFor(() => uplinkHits(relay).length >= 2)
+    assert.deepEqual(uplinkHits(relay)[1].body, { streamId: 'srv-stream-1', seq: 2, items: [{ type: 'write', data: 'a' }, { type: 'write', data: 'b\n' }] })
+
+    // Ending the source emits exactly one end frame, without items — the
+    // server then closes the downstream (the scenario above).
+    up.end()
+    await waitFor(() => uplinkHits(relay).length >= 3)
+    assert.deepEqual(uplinkHits(relay)[2].body, { streamId: 'srv-stream-1', seq: 3, end: true })
+    assert.equal(uplinkHits(relay).length, 3, 'no duplicate end, no stray frames')
+
+    const { frames, error } = await collected
+    assert.equal(error, undefined, `the downstream ended cleanly through the uplink traffic: ${error}`)
+    assert.deepEqual(frames, [{ type: 'snapshot' }])
+    await waitFor(() => up.returned, 1000)
+    assert.equal(up.returned, true, 'the pump released the host iterable (return() called)')
+    assert.equal(client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('TA-1 uplink: a refused uplink post surfaces its code to the stream consumer', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.stream = (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+    res.write(JSON.stringify({ type: 'uplink', streamId: 'srv-stream-2' }) + '\n')
+    const timer = setInterval(() => { try { res.write('{"type":"ping"}\n') } catch { clearInterval(timer) } }, 30)
+    res.on('close', () => { clearInterval(timer); try { res.destroy() } catch { /* gone */ } })
+  }
+  relay.scenario.streamUplink = () => [409, { ok: false, error: { code: 'out-of-order' } }]
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    const up = makeUplinkSource()
+    up.push({ type: 'write', data: 'x' })
+    const { frames, error } = await collect(client.openStream('terminal', 'attach', { agentId: 's', id: 'term-1' }, undefined, { uplink: up.iterable }))
+    assert.deepEqual(frames, [], 'the downstream produced no frames before the uplink refusal')
+    assert.ok(error instanceof RelayError, `expected the uplink RelayError, got: ${error}`)
+    assert.equal(error.code, 'out-of-order', 'the uplink refusal IS the stream error the caller sees')
+    assert.equal(client.state, 'online', 'a per-call uplink refusal does not judge the link')
+    assert.equal(up.returned, true, 'the source was released on the failure path too')
+  } finally { await relay.stop() }
+})
+
+test('TA-1 uplink: a one-direction stream still parses unknown lines silently and sends no uplink posts', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.stream = (req, res) => {
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+    // An OLD-style server would never send this line; a client that opened
+    // without uplink must ignore it, not crash.
+    res.write(JSON.stringify({ type: 'uplink', streamId: 'srv-stream-3' }) + '\n')
+    res.end('{"type":"frame","frame":{"n":1}}\n{"type":"end"}\n')
+  }
+  try {
+    const { client } = makeClient(relay.port)
+    await client.connect()
+    const { frames, error } = await collect(client.openStream('session', 'follow', {}))
+    assert.equal(error, undefined)
+    assert.deepEqual(frames, [{ n: 1 }])
+    assert.equal(uplinkHits(relay).length, 0, 'no uplink posts without the duplex option')
     assert.equal(client.state, 'online')
   } finally { await relay.stop() }
 })
