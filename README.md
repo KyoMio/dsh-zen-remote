@@ -1,5 +1,5 @@
 <h1 align="center">dsh-zen-remote</h1>
-<p align="center">One DeepSeek Harness plugin, two roles. The <b>host</b> turns DSH into a phone-reachable PWA (mobile UI, pairing gateway, lock-screen push) and shares chosen sessions to paired desktops. The <b>client</b> runs inside another DSH desktop app and puts the host's shared sessions right into its own sidebar — full history, live progress, messages, approvals, terminal, everything executes on the host.</p>
+<p align="center">One DeepSeek Harness plugin, two roles. The <b>host</b> turns DSH into a phone-reachable PWA (mobile UI, pairing gateway, lock-screen push) and shares chosen sessions to paired desktops. The <b>client</b> runs inside another DSH desktop app and puts the host's shared sessions right into its own sidebar (up to <b>8 hosts</b> connected simultaneously) — full history, live progress, messages, approvals, terminal, everything executes on the host.</p>
 
 <p align="center">
 <a href="https://www.npmjs.com/package/dsh-zen-remote"><img src="https://img.shields.io/npm/v/dsh-zen-remote?style=flat-square&color=5B4CF0&logo=npm&label=npm" alt="npm version"></a>
@@ -21,7 +21,7 @@
 | ![Session list home](assets/home.png) | ![Session page](assets/session.png) | ![Session info card](assets/info.png) |
 
 | Composer permission sheet | Pairing page a public visitor sees |
-| --- | --- |
+| --- | --- | --- |
 | ![Composer permission sheet](assets/sheet.png) | ![Pairing page](assets/pairing.png) |
 
 > Screenshots are a 390×844 phone viewport in the light theme; both themes are supported. The pairing page is drawn by the gateway in DSH's official style, following the system light / dark appearance.
@@ -33,7 +33,7 @@
 1. [Install](#1-install)
 2. [Quick Start (Unified Setup & Pairing Wizard)](#2-quick-start-unified-setup--pairing-wizard)
    - [Scenario A: Set up as Host (Phone & Desktop Access)](#scenario-a-set-up-as-host-phone--desktop-access)
-   - [Scenario B: Set up another computer as Desktop Client](#scenario-b-set-up-another-computer-as-desktop-client)
+   - [Scenario B: Set up as Desktop Client (Connect up to 8 Hosts)](#scenario-b-set-up-as-desktop-client-connect-up-to-8-hosts)
 3. [Daily Usage: Session Sharing & Cross-Device Workflow](#3-daily-usage-session-sharing--cross-device-workflow)
 4. [Lock-Screen Push: When Notifications Fire](#4-lock-screen-push-when-notifications-fire)
 5. [Features](#5-features)
@@ -52,28 +52,43 @@ Open the **Plugins** page in the DSH sidebar → click **Add plugin** → type `
 
 ```sh
 dsh plugin --profile web add dsh-zen-remote
-# then restart dsh web
+# then restart dsh web (or run `npx dsh-zen-remote setup` to install, start, and configure in one go)
 ```
 
 > `dsh plugin` requires `--profile` to name the target profile. The desktop app's `desktop` profile is managed exclusively by the app (`--profile desktop` is refused on the CLI), so use the UI install above on the desktop app.
 
-### The bundled CLI wizard (`dsh-zen-remote`)
+### Headless Server CLI Wizard (`dsh-zen-remote`)
 
-The plugin ships a same-package command line tool, so remote VPS / headless machines (`dsh web`) can complete the whole setup and pairing flow without opening the plugin page in a browser:
+The plugin ships a bundled CLI tool so remote VPS / headless servers (`dsh web`) can complete the entire setup, ingress configuration, three-light verification, and QR / desktop pairing flow in a terminal without opening a browser:
 
 ```sh
-npx dsh-zen-remote setup        # the 3-step wizard: role → ingress → three-light verify + terminal-QR pairing
-dsh-zen-remote status           # current role, gateway & connection state (--json; --debug writes the redacted report)
-dsh-zen-remote host device pair --device-role web   # host: pair a phone / browser (desktop-client pairs another computer)
-dsh-zen-remote host ingress start --mode lan        # host: configure public ingress (caddy | cloudflared | external | lan)
-dsh-zen-remote host ingress verify                  # host: three-light reachability check (--no-wait skips the pairing wait)
-dsh-zen-remote client pair http://192.168.1.2:3088 --code 12345678   # client: pair a remote host
-dsh-zen-remote client list                          # client: list paired hosts (up to 8)
+npx dsh-zen-remote setup        # 3-step interactive wizard: role → ingress → verify + terminal QR & desktop pairing
+dsh-zen-remote status           # current role, gateway & connection state (--json; --debug exports redacted diagnostics)
 ```
 
-- `setup` runs its preflight first: candidate profiles are scanned with a multi-select install (`desktop` is always skipped), the DSH daemon / app is launched, then the interactive wizard starts. For scripts add `--yes` plus the options (e.g. `setup --role host --ingress lan --no-wait --yes`) for a fully non-interactive run — missing required options fail fast instead of hanging.
-- The CLI talks to the plugin over a 0600 local IPC socket (same machine, same user = authorized); Caddy / Cloudflare Tunnel stay owned by the plugin process — the CLI never spawns them.
-- `--lang zh|en` switches the bilingual output; run without arguments or with `--help` for the full command tree.
+<details>
+<summary>Expand full CLI subcommand reference (<code>host</code> / <code>client</code> / non-interactive flags)</summary>
+
+```sh
+# Host commands (when role is host)
+dsh-zen-remote host device pair --device-role web              # mint a phone/browser pairing code + terminal QR (or desktop-client)
+dsh-zen-remote host device list                                # list paired devices (--json supported)
+dsh-zen-remote host device revoke <id|--all> [--yes]           # revoke one or all paired devices
+dsh-zen-remote host ingress start --mode lan                   # configure & start ingress (caddy | cloudflared | external | lan)
+dsh-zen-remote host ingress stop [--yes]                       # stop managed Caddy / Cloudflare Tunnel processes
+dsh-zen-remote host ingress verify [--no-wait]                 # three-light check + mint web QR & desktop pairing codes
+dsh-zen-remote host ingress snippet [--proxy nginx|caddy|lucky] # print reverse-proxy config snippets
+
+# Client commands (when role is client, up to 8 paired hosts)
+dsh-zen-remote client pair http://192.168.1.2:3088 --code 12345678 [--name My-Mac]
+dsh-zen-remote client list                                     # list all paired hosts (up to 8) and connection states
+dsh-zen-remote client unpair <hostUrl|entryId|--all> [--yes]   # remove one or all paired hosts
+```
+
+- **Preflight & non-interactive automation**: `setup` automatically scans candidate profiles for multi-select plugin installation (`desktop` is skipped) and launches the DSH daemon / app before starting the wizard. Pass `--yes` with the required flags (e.g. `setup --role host --ingress lan --no-wait --yes`) for unattended scripts.
+- **Architecture**: the CLI communicates with the running plugin over a `0600` local IPC socket (`~/.dsh/zen-remote-cli.sock`); Caddy and `cloudflared` stay managed by the plugin process. Use `--lang zh|en` to switch output language.
+
+</details>
 
 <details>
 <summary>Manual Profile Edit / Local Development (<code>link:</code>), Upgrading & Uninstall</summary>
@@ -108,64 +123,57 @@ cd ~/.dsh/profiles/desktop && pnpm install
 
 The same plugin supports two roles:
 - **Server (`role: host`, default)**: runs your sessions, spawns the local security gateway and Web Push service, and lets your phone (PWA) or another computer connect.
-- **Desktop Client (`role: client`)**: runs inside another computer's DSH desktop app, connects to the host, and mounts the host's shared sessions directly into its own sidebar (without spawning a local gateway or fighting for port 3088).
+- **Desktop Client (`role: client`)**: runs inside another computer's DSH desktop app, connects to **up to 8 hosts simultaneously**, and mounts their shared sessions directly into its own sidebar (without spawning a local gateway or fighting for port 3088).
 
-Open **Plugins → `dsh-zen-remote`** in DSH. The **Remote Access & Device Pairing** card sits right at the top of the page:
+Open **Plugins → `dsh-zen-remote`** in DSH. The **Remote Access & Device Pairing** card sits right at the top of the page (or run `npx dsh-zen-remote setup` on a headless server):
 
 ![Remote Access & Device Pairing overview card on the plugin detail page](docs/images/wizard-overview.png)
-
-> **Headless servers** (`dsh web` / a VPS) can run the same three-step wizard in a terminal with `npx dsh-zen-remote setup` — see [the CLI section under Install](#the-bundled-cli-wizard-dsh-zen-remote).
 
 ---
 
 ### Scenario A: Set up as Host (Phone & Desktop Access)
 
-Click **Start Setup Wizard** (or **Reconfigure Wizard** if already configured) to complete setup in three guided steps:
+Click **Start Setup Wizard** (or **Reconfigure Wizard**) to complete setup in three guided steps:
 
 #### Step 1: Choose "Act as Server (Host)" & an Access Method
 
 ![Wizard Step 1: Choose machine role and server access method](docs/images/wizard-step1-role-path.png)
 
-Pick one of the four access methods based on your network environment (switching methods automatically stops any managed process from the previous mode and updates the gateway bind address):
-
 | Access method | Best for | What the wizard automates |
 | --- | --- | --- |
-| **Managed Caddy (Recommended)** | Public IP (or router port forwarding) + domain on Cloudflare | Automatically downloads a prebuilt `Caddy + caddy-dns/cloudflare` binary (auto-accelerated via mainland China mirrors when needed) and issues/renews TLS certificates via DNS-01; gateway listens only on `127.0.0.1:3088` |
-| **Existing Reverse Proxy** | Already running Nginx, Caddy, or Lucky | Generates ready-to-paste proxy snippets with WebSocket and `X-Forwarded-*` headers, plus one-click `trustedProxies` registration (full manual guide: [docs/remote-access.en.md](docs/remote-access.en.md)) |
-| **Cloudflare Tunnel** | No public IP / no router port forwarding + domain on Cloudflare | Automatically downloads `cloudflared` (with mainland China mirror failover), creates or reuses a tunnel via the Cloudflare API, writes the DNS CNAME record, and starts the tunnel; gateway listens only on `127.0.0.1:3088` |
-| **LAN / Tailscale Direct** | Same Wi-Fi / LAN or shared Tailscale virtual network | No domain or TLS certificate needed; auto-detects the machine's LAN / Tailscale IPv4 address and binds `0.0.0.0:3088`, while the gateway's built-in **private-IP wall** rejects any unproxied direct connection from a public internet IP (`403 public-direct-forbidden`) |
+| **Managed Caddy (Recommended)** | Public IP (or router port forwarding) + domain on Cloudflare | Downloads prebuilt `Caddy + caddy-dns/cloudflare` and issues/renews TLS certificates via DNS-01 (`127.0.0.1:3088`) |
+| **Existing Reverse Proxy** | Already running Nginx, Caddy, or Lucky | Generates ready-to-paste proxy snippets + one-click `trustedProxies` registration ([manual guide](docs/remote-access.en.md)) |
+| **Cloudflare Tunnel** | No public IP / no port forwarding + domain on Cloudflare | Downloads `cloudflared`, creates/reuses a tunnel, configures CNAME, and starts the tunnel (`127.0.0.1:3088`) |
+| **LAN / Tailscale Direct** | Same Wi-Fi / LAN or shared Tailscale network | Auto-detects LAN / Tailscale IPv4 and binds `0.0.0.0:3088` behind the built-in **private-IP wall** (`403 public-direct-forbidden`) |
 
 #### Step 2: Fill in Connection Parameters
-- **Managed Caddy / Cloudflare Tunnel**: enter your public domain (e.g. `dsh.example.com`) and paste your Cloudflare API Token (click *"How do I get an API token?"* for step-by-step instructions and required permissions, or *"Domain not on Cloudflare yet?"* for onboarding steps).
-- **Existing Reverse Proxy**: enter the external `https://` URL of your proxy and copy the generated Nginx / Caddy / Lucky configuration snippet.
-- **LAN / Tailscale Direct**: the wizard automatically detects and pre-fills `http://<your-LAN-or-Tailscale-IP>:3088`.
+- **Managed Caddy / Cloudflare Tunnel**: enter your public domain (e.g. `dsh.example.com`) and paste your Cloudflare API Token.
+- **Existing Reverse Proxy**: enter the external `https://` URL and copy the generated Nginx / Caddy / Lucky configuration snippet.
+- **LAN / Tailscale Direct**: confirm the auto-detected `http://<your-LAN-or-Tailscale-IP>:3088` address.
 
 #### Step 3: Verify Connectivity & Pair Devices
 
 ![Wizard Step 3: Automatic connectivity check, phone QR pairing, and desktop client pairing](docs/images/wizard-step3-verify-pair.png)
 
-1. **Start Ingress Service & Auto-Probe**:
-   - For Managed Caddy or Cloudflare Tunnel, click **Start Caddy** or **Create & Start Tunnel** in the service bar.
-   - The wizard automatically probes **Local gateway ready** and **Access URL reachable** (verifying that `/` serves the `401` pairing page and `/lan-gate/admin` returns `403`).
-2. **Pair Phone / Browser (Web App)**:
-   - On the **Pair Phone / Browser (QR)** tab, click **Generate Pairing QR**.
-   - Scan the QR code with your phone camera or browser, enter the 8-character pairing code, and use **"Add to Home Screen"** to install DSH as a standalone PWA with lock-screen push notifications.
-3. **Pair Another Computer (Desktop Client)**:
-   - Switch to the **Pair Desktop Client** tab, click **Generate Desktop Pairing Code**, and click **Copy Server URL & Code** to send to your other computer.
+1. **Start Ingress Service & Auto-Probe**: click **Start Caddy** or **Create & Start Tunnel** if applicable; the wizard automatically checks **Local gateway ready** and **Access URL reachable**.
+2. **Pair Phone / Browser (Web App)**: on the **Pair Phone / Browser (QR)** tab, click **Generate Pairing QR**, scan with your phone, enter the 8-character code, and use **"Add to Home Screen"** to install DSH as a standalone PWA with lock-screen push.
+3. **Pair Another Computer (Desktop Client)**: switch to the **Pair Desktop Client** tab, click **Generate Desktop Pairing Code**, and click **Copy Server URL & Code**.
 
-> **Quick actions after setup**: once configured, you can directly click **Pair Phone (QR)**, **Pair Desktop Client**, or **Manage Devices** (rename devices, switch device roles, revoke one or all devices, or send a test push) right from the overview card footer without re-running the wizard.
+> **Quick actions after setup**: once configured, you can directly click **Pair Phone (QR)**, **Pair Desktop Client**, or **Manage Devices** right from the overview card footer without re-running the wizard.
 
 ---
 
-### Scenario B: Set up another computer as Desktop Client
+### Scenario B: Set up as Desktop Client (Connect up to 8 Hosts)
 
-On the second computer running the DSH desktop app:
+On another computer running the DSH desktop app (or via `dsh-zen-remote client pair <hostUrl> --code <8-char-code>` on the CLI):
 
-1. Open **Plugins → `dsh-zen-remote`** and click **Start Setup Wizard**.
-2. **Step 1**: select **Act as Desktop Client** and click **Next**.
-3. **Step 2**: enter a name for this computer (e.g. `Living-Room-Mac`), the host's gateway URL (`https://` for public URLs, or `http://192.168.x.x:3088` / `http://100.x.x.x:3088` for LAN / Tailscale), and the 8-character desktop pairing code from the host, then click **Pair & Connect**.
+1. Open **Plugins → `dsh-zen-remote`** and click **Start Setup Wizard** (or **+ Add Server** if already in client mode).
+2. **Step 1**: select **Desktop Client** and click **Next**.
+3. **Step 2**: enter this computer's display name (e.g. `Living-Room-Mac`), the host's gateway URL (`https://` for public URLs, or `http://192.168.x.x:3088` / `http://100.x.x.x:3088` for LAN / Tailscale), and the 8-character desktop pairing code from the host, then click **Pair & Connect**.
 4. **Step 3**: once all three status lights (**Pairing token**, **Server connection**, **Session & plugin sync**) turn green, the host's shared workspaces and sessions appear in your left sidebar immediately.
-5. **More servers**: one client can stay paired with up to **8 main servers** at once — click **+ Add Server** in the wizard (or manage the paired list in the servers modal / settings card: reconnect, re-pair, remove, remove all). Every server's groups merge into the sidebar **in pairing order**; when several paired servers report the same name they are numbered `Name-1`, `Name-2` automatically (the suffixes disappear once a rename removes the collision), and removing a server tears down only its own groups while the others keep serving.
+5. **Multi-Server Management (up to 8 hosts)**:
+   - Click **+ Add Another Server** in Step 3, **+ Add Server** on the overview card, or **Manage Servers** to view per-server status, **Reconnect**, **Re-pair**, **Remove**, or **Remove All** (when all `8 / 8` slots are full, a red limit notice appears; re-pairing an existing URL still overwrites in place).
+   - Sidebar groups from all paired hosts merge **in pairing order** after your local workspaces. Duplicate host names are automatically numbered `Name-1`, `Name-2`; model pickers, connection status icons, read-only banners, plugin bridges, and file uploads are strictly isolated per host `serverId`.
 
 ---
 
@@ -174,18 +182,18 @@ On the second computer running the DSH desktop app:
 | | **Web App Device (Phone / Tablet / Browser)** | **Desktop Client (Another DSH Desktop App)** |
 | --- | --- | --- |
 | Visible sessions | **All** sessions on the host | **Only** sessions with remote access enabled on the host (enforced server-side) |
-| Credential | Long-lived HttpOnly cookie | Secret device token stored in the plugin config (`Bearer` token) |
+| Credential | Long-lived HttpOnly cookie | Secret device token stored in `~/.dsh/zen-remote-state.json` (`Bearer` token) |
 
 ### Enabling or Disabling Remote Access on a Session
 
-Remote access is controlled per session (or automatically enabled for new sessions if you turn on *Auto-share new sessions* in Step 2 of the wizard). You can toggle it from four places:
+Remote access is controlled per session (or automatically enabled for new sessions if you turn on *Auto-share new sessions*). You can toggle it from four places:
 
 1. **Host sidebar**: open a session's `"…"` menu and click **开启远程 / 关闭远程** (Enable / Disable remote);
 
    ![Enabling remote access from a session's menu on the host](docs/images/host-share-menu.png)
 
-2. **Host session header**: click the globe icon in the session title row (hover to see remaining idle time; a dot indicates a desktop client is currently viewing it);
-3. **Phone (Web App) session info card**: open the info card at the top right of a session and toggle **远程访问** (Remote access);
+2. **Host session header**: click the globe icon in the session title row (hover to see remaining idle time; a green dot indicates a desktop client is currently viewing it);
+3. **Phone (Web App) session info card**: open the `ⓘ` info card at the top right of a session and toggle **远程访问** (Remote access);
 
    <p align="center"><img src="docs/images/mobile-info-remote.png" alt="Remote access toggle inside the phone session info card" width="320"></p>
 
@@ -193,11 +201,11 @@ Remote access is controlled per session (or automatically enabled for new sessio
 
 ### Working in Remote Sessions on a Desktop Client
 
-- **Sidebar groups**: once a host workspace has at least one remote-enabled session, a **"Server Name · Workspace Name"** group appears in the client's sidebar. Click any session to view full history, stream responses, approve tools, use the server terminal, browse files and diffs, download deliverables, or drag-and-drop files to upload. With several paired servers (up to 8) the groups stack in pairing order after your local workspaces; duplicate server names are disambiguated with `-1` / `-2` suffixes in pairing order, and removing a server in settings drops only its own groups.
+- **Sidebar groups**: once a host workspace has at least one remote-enabled session, a **"Server Name · Workspace Name"** group appears in the client's sidebar (up to 8 paired hosts, stacked in pairing order). Click any session to view full history, stream responses, approve tools, use the server terminal, browse files and diffs, preview inline images, download deliverables, or drag/paste/pick files to upload.
 
   ![Remote workspace group in the desktop client sidebar](docs/images/client-sidebar.png)
 
-- **Closing & idle sleep**: a shared session automatically closes remote access after **48 hours** (`idleHours`) of inactivity (mid-turn sessions or sessions waiting on approvals/questions never sleep). When remote access is closed—or when the client unpairs or its token is revoked—remote sessions are automatically archived/hidden from the sidebar; an actively open session displays a "remote closed" banner and recovers automatically if re-shared.
+- **Closing & idle sleep**: a shared session automatically closes remote access after **48 hours** (`idleHours`) of inactivity (running or waiting sessions never sleep). Closed or unpaired sessions are automatically archived/hidden from the sidebar; an actively open session displays a "remote closed" banner and recovers automatically if re-shared.
 
   ![Banner shown when remote access is closed on an open session](docs/images/client-remote-closed.png)
 
@@ -205,35 +213,22 @@ Remote access is controlled per session (or automatically enabled for new sessio
 
 ## 4. Lock-Screen Push: When Notifications Fire
 
-Notifications fire only when **you are actually needed**, along two independent paths (all payloads are end-to-end encrypted with `aes128gcm`):
+Notifications fire only when **you are actually needed**, along two independent paths (all payloads are end-to-end encrypted with `aes128gcm`; toggle `pushEnabled` to disable all notifications and unregister `push_notify`, or enable `pushSessionName` to show `Session: <name>` on the first line of the notification body):
 
-1. **System-triggered (always on, never suppressed by debounce)**:
-   - **Tool waiting for approval**: pushes *"DSH needs your approval"* with the tool name. Waits `DSH_PUSH_APPROVAL_GRACE_MS` (default 5s) before sending so fast auto-approver plugins can answer first without buzzing your phone.
+1. **System-triggered (always on when `pushEnabled` is on, never suppressed by debounce)**:
+   - **Tool waiting for approval**: pushes *"DSH needs your approval"* with the tool name after `DSH_PUSH_APPROVAL_GRACE_MS` (default 5s, so fast auto-approvers can answer first without buzzing your phone).
    - **`ask_user_question` waiting for your answer**: pushes *"DSH is waiting for your answer"*.
-   - Works for both top-level sessions and subagent sessions across Web and Desktop hosts.
 2. **Model-triggered (`push_notify` tool)**:
-   - Called by the agent when you asked to be notified upon completion, or when it hits a blocker that requires your decision.
-   - Ordinary turn completions do not push by default (enable `pushTurnEnd` in advanced settings if you want a push after every turn; enable `pushSummary` to include up to 120 characters of the final reply in the notification body).
+   - Called by the agent when you asked to be notified upon completion, or when it hits a blocker that requires your decision. Ordinary turn completions do not push by default (enable `pushTurnEnd` if wanted; enable `pushSummary` to include up to 120 characters of the final reply).
 
 ---
 
 ## 5. Features
 
-- **Mobile PWA UI (Host)**:
-  - Two-level page stack (session list home + standalone session page with left-edge swipe back, Android back-gesture support, first-frame boot skeleton, and immutable asset caching)
-  - Home-screen plugin entry chips (auto-discovered per installed plugin, individually toggleable)
-  - Compact mobile composer with bottom sheets for permissions/models and direct phone attachment uploads
-  - Session info card (6-tile stats, log export, rename, fork, archive, one-tap full-conversation PNG share image, and remote access switch)
-- **Unified Setup & Pairing Wizard (2.3)**:
-  - Top-of-page 2×2 live overview card and 3-step modal wizard covering all four host ingress modes (Managed Caddy, Existing Reverse Proxy, Cloudflare Tunnel, LAN / Tailscale Direct) and Desktop Client pairing
-  - Automatic download of prebuilt `Caddy + caddy-dns/cloudflare` and `cloudflared` binaries with mainland China network auto-detection, mirror acceleration (`gh-proxy.com` / `ghfast.top`), connect/stall failover watchdogs, and daily upstream release tracking via GitHub Actions
-  - Automatic LAN / Tailscale IPv4 discovery and local network probing, backed by the gateway's private-IP wall (`403 public-direct-forbidden`) against accidental public exposure
-  - Dedicated **Manage Devices** modal and automatic sidebar cleanup on client unpair/revocation
-- **Cross-Desktop Remote Sessions (Client)**:
-  - Full-featured remote sessions in the sidebar: history, streaming, approvals/questions, server model catalog, file tree, changes summary/diff, server-side terminal, windowed artifact downloads, server-side LibreOffice PDF preview, up to 500 MiB file uploads, and drag-and-drop file upload interception; in remote sessions, non-image files added via the paperclip picker or pasted are likewise converted to byte uploads instead of unreadable local-path references
-  - **Multi-server connection pool (up to 8 main servers)**: each server's sidebar groups merge in pairing order (duplicate names numbered `-1` / `-2`), calls and approval answers route strictly by `serverId`, and removing a server tears down only its own groups
-- **Plugin Bridge**:
-  - Cooperative plugins and built-in adapters (such as `dsh-better-sidebar`) route their panel requests in remote sessions to the host machine (with explicit owner consent for whole-machine data). See [Plugin Bridge Guide](docs/plugin-bridge.md).
+- **Mobile PWA UI (Host)**: two-level page stack (session list home + session page with swipe-back and Android back-gesture support, first-frame boot skeleton, immutable asset caching), auto-discovered plugin entry chips, compact mobile composer with bottom sheets and phone attachment uploads, and a session info card (6-tile stats with `tok/s` output speed, log export, rename, fork, archive, one-tap full-conversation PNG share image, and remote access switch).
+- **Unified Setup Wizard & Headless CLI (`dsh-zen-remote`)**: top-of-page 2×2 live overview card, 3-step modal wizard, and a full-featured terminal CLI (`setup` / `status` / `host` / `client`) covering all four host ingress modes (Managed Caddy, Existing Reverse Proxy, Cloudflare Tunnel, LAN / Tailscale Direct with private-IP wall) and client pairing.
+- **Cross-Desktop Remote Sessions & Multi-Server Pool (Client)**: connect up to **8 main servers** simultaneously in pairing order; supports full history & live streaming, approval/question sync, per-server isolated model catalog, file tree & Git diffs, duplex server-side terminal (`terminal/attach`), inline Markdown image & media forwarding, windowed artifact downloads, server-side LibreOffice PDF preview, up to 500 MiB file uploads (drag-and-drop, paperclip picker, and paste), and one-click redacted diagnostics export.
+- **Plugin Bridge**: cooperative plugins and built-in adapters (such as `dsh-better-sidebar` `0.25.0`–`0.30.1`) route their panel HTTP and WebSocket requests in remote sessions to the host machine (with explicit owner consent for whole-machine data). See [Plugin Bridge Guide](docs/plugin-bridge.md).
 
 In depth: [Interface Design](docs/interface.md) · [Public Access & Relay Protocol](docs/remote-access.en.md)
 
@@ -241,16 +236,16 @@ In depth: [Interface Design](docs/interface.md) · [Public Access & Relay Protoc
 
 ## 6. Advanced Settings & Field Reference
 
-Day-to-day setup and device management are handled entirely by the **Remote Access & Device Pairing Wizard** at the top of the `dsh-zen-remote` page. To fine-tune individual low-level fields, click `dsh-zen-remote` a second time under **Included components** on the plugin detail page.
-
-<details>
-<summary>View underlying component settings screenshots & full field reference table</summary>
-
-Each field resolves in order: **environment variable > plugin row settings > `~/.dsh/lan-gate.config.json` > default**. Saving a field that requires a gateway/push restart reloads the plugin row automatically without restarting the app.
+Day-to-day setup and device management are handled entirely by the **Remote Access & Device Pairing Wizard** (or `npx dsh-zen-remote setup`). To fine-tune individual low-level fields, click `dsh-zen-remote` a second time under **Included components** on the plugin detail page.
 
 | Host Role & Pairing Cards | Shared Sessions List | Client Settings & Diagnostics |
 | --- | --- | --- |
 | ![Host role](docs/images/host-settings-role.png) ![Host pairing](docs/images/host-pairing.png) | ![Shared sessions](docs/images/host-settings-shares.png) | ![Client settings](docs/images/client-settings.png) |
+
+<details>
+<summary>Expand full configuration field reference table & environment variables</summary>
+
+Each field resolves in order: **environment variable > plugin row settings > `~/.dsh/lan-gate.config.json` > default**. Saving a field that requires a gateway/push restart reloads the plugin row automatically without restarting the app.
 
 | Field | Default | What it does |
 | --- | --- | --- |
@@ -287,23 +282,14 @@ Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_
 
 ## 7. Security Model, Version Tolerance & Known Notes
 
-### Security Model
-
-- **A paired desktop client is a trusted device**: the remote session terminal runs as the **host's OS user**, file-preview endpoints can read files accessible to the host process, and the client can create sessions in any host workspace.
-- **Unshared sessions are strictly isolated at the relay**: list rows, history, live events, approvals/questions, and embedded `dsh-session:` references for unshared sessions are filtered or refused server-side.
-- **Public direct-connection guard on `0.0.0.0`**: even when the gateway binds `0.0.0.0` for LAN / Tailscale mode, `isPrivateOrLoopbackIp` only admits direct connections from loopback, RFC1918 LAN ranges, link-local, and Tailscale (`100.64.0.0/10` / `fd7a:115c:a1e0::/48`); any unproxied direct connection from a public internet IP is rejected with `403 public-direct-forbidden`.
-- **Admin actions are local-only**: minting pairing codes, changing device roles, running the setup wizard, and revoking devices are only permitted directly on the host machine.
-- **Data & privacy**: the plugin reports nothing to any third party. Pairing state lives in `~/.dsh/lan-gate-state.json`; the client role's state file `~/.dsh/zen-remote-state.json` (`0600`) carries the local server identity, the shared-session table, and every paired server's record including its token (up to 8 servers); Cloudflare tokens live in `0600` files under `~/.dsh/zen-remote-ingress/`.
-
-### Version Tolerance
-
-1. **Relay protocol version**: both host and client must run the same `dsh-zen-remote` version.
-2. **DSH host version**: DSH versions may differ between host and client. Normalized interface fingerprints are compared during handshake; any differing group is annotated `"（版本有差异）"` and degrades only the affected panel.
-
-### Known Limitations & Third-Party Plugin Support
+- **Trusted client & strict session isolation**: a paired desktop client runs terminals and file previews as the host's OS user, while unshared sessions are strictly filtered and refused at the relay layer. Even when binding `0.0.0.0` for LAN/Tailscale, the gateway's private-IP wall rejects any unproxied public internet IP (`403 public-direct-forbidden`), and all admin/wizard mutations are restricted to the host machine itself.
+- **Version tolerance**: both ends must run the same `dsh-zen-remote` version; DSH host versions may differ (interface fingerprints are compared at handshake and degrade only mismatched panels).
 
 <details>
-<summary>Expand known limitations, iOS PWA notes & adapted third-party plugins</summary>
+<summary>Expand security & state-file details, known limitations, iOS PWA notes & adapted third-party plugins</summary>
+
+**Data & state files**
+- The plugin reports nothing to any third party. Pairing state lives in `~/.dsh/lan-gate-state.json`; the unified state file `~/.dsh/zen-remote-state.json` (`0600`) carries the local `serverId`, the shared-session table `sessions`, and the client's paired servers list `servers` (up to 8 servers, tokens included); Cloudflare tokens live in `0600` files under `~/.dsh/zen-remote-ingress/`.
 
 **Known limitations**
 - With multiple DSH windows open simultaneously on a client, active-session detection may occasionally dismiss a closed session early.
