@@ -82,6 +82,7 @@ import type { RelayClient, RelayClock } from './relay-client.js';
 import type { RelayPool } from './relay-pool.js';
 import type { GatewayShapeCheck } from './intercept-shape.js';
 import { type ResultAttachment } from './invoke-binary.js';
+import type { MergerLang } from './merge-streams.js';
 /** The session-locating argument fields, as registered per method. Identical
  * in name and meaning to relay-access.ts's `SessionField`; a field named
  * without a dot is TOP-LEVEL. `request.workspaceId` locates a remote create
@@ -179,6 +180,7 @@ export declare function isRemoteWrite(endpoint: string): boolean;
  * iterable over, it never half-closes a member of this set.
  */
 export declare const REMOTE_UPLINK_STREAM_METHODS: ReadonlySet<string>;
+export type InterceptLang = MergerLang;
 /**
  * T58/T62: the vocabulary of the current-session signal. The value travels
  * from the BROWSER — the only place the host's persisted selection
@@ -337,6 +339,9 @@ export interface InstallInterceptOptions {
      * shares are ever reported and the plugin-route value scan stays exactly
      * the request-local behavior. */
     createSessionInventorySlot?: (serverId?: string) => SessionInventorySlot;
+    /** Language for error messages and sidebar group suffixes (`'zh'` default,
+     * `'en'` English). Accepts a getter for live resolution. */
+    lang?: InterceptLang | (() => InterceptLang) | undefined;
 }
 export interface InterceptHandle {
     /** Remove both own properties, restoring exactly what was installed over

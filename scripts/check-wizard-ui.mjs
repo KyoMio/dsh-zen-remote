@@ -447,6 +447,7 @@ const WIZARD_KEYS = [
   'wizard.overview.manageServers', 'wizard.overview.addServer',
   'wizard.serversModal.title', 'wizard.serversModal.subtitle', 'wizard.serversModal.viewStatus',
   'wizard.client.poolCapNote', 'wizard.client.continueAdd', 'wizard.client.serverPicker',
+  'wizard.desktop.addressFallback', 'wizard.desktop.copiedText',
 ]
 
 // The cards' step counts are part of the walkthrough contract (GW-11).
@@ -484,6 +485,10 @@ await test('the browser snippet mirrors are byte-identical to the host templates
   assert.equal(nginxSnippetText(SNIPPET_INPUT), nginxSnippet(SNIPPET_INPUT).text)
   assert.equal(caddySnippetText(SNIPPET_INPUT), caddySnippet(SNIPPET_INPUT).text)
   assert.deepEqual(luckyStepTexts(SNIPPET_INPUT), luckySteps(SNIPPET_INPUT).steps)
+  const enInput = { ...SNIPPET_INPUT, lang: 'en' }
+  assert.equal(nginxSnippetText(enInput), nginxSnippet(enInput).text)
+  assert.equal(caddySnippetText(enInput), caddySnippet(enInput).text)
+  assert.deepEqual(luckyStepTexts(enInput), luckySteps(enInput).steps)
   // The mirrors refuse the same inputs the host refuses.
   for (const bad of [{ ...SNIPPET_INPUT, domain: 'a b' }, { ...SNIPPET_INPUT, upstreamHost: 'x/y' }, { ...SNIPPET_INPUT, upstreamPort: 0 }]) {
     assert.equal(nginxSnippetText(bad), null)

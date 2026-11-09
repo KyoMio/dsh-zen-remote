@@ -290,6 +290,7 @@ export interface SnippetInput {
     domain: string;
     upstreamHost: string;
     upstreamPort: number;
+    lang?: 'zh' | 'en' | undefined;
 }
 export declare function nginxSnippetText(input: SnippetInput): string | null;
 export declare function caddySnippetText(input: SnippetInput): string | null;

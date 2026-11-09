@@ -51,7 +51,7 @@ test('T62 equals: content, not identity', async () => {
 // `roleAnswer` has NO destructuring default on purpose: `undefined` is a
 // real answer here (a failed probe), and a default would turn it into a
 // definite verdict.
-function makeEnv({ initial = '{}', roleAnswer, failFirst = false, resendIntervalMs } = {}) {
+function makeEnv({ initial = '{}', roleAnswer, failFirst = false, resendIntervalMs, getLang } = {}) {
   const posted = []
   let storageValue = initial
   let fail = failFirst
@@ -73,6 +73,7 @@ function makeEnv({ initial = '{}', roleAnswer, failFirst = false, resendInterval
       probeRole: async () => roleAnswer,
       intervalMs: 5,
       ...(resendIntervalMs !== undefined ? { resendIntervalMs } : {}),
+      ...(getLang !== undefined ? { getLang } : {}),
     })
   }
   env.load = load
@@ -181,6 +182,28 @@ test('T66 reporter: an unchanged value re-posts once per resend window; a change
     // inside it.
     await wait(15)
     assert.equal(env.posted.length, 3)
+  } finally {
+    env.stop()
+  }
+})
+
+test('I18N-3 reporter: forwards UI language and re-posts when language changes', async () => {
+  let lang = 'zh'
+  const env = makeEnv({
+    initial: JSON.stringify({ sessionId: 'zr~721b94fb~s1' }),
+    roleAnswer: 'client',
+    getLang: () => lang,
+  })
+  await env.load()
+  try {
+    await wait(30)
+    assert.equal(env.posted.length, 1)
+    assert.deepEqual(env.posted[0].body, { sessionId: 'zr~721b94fb~s1', lang: 'zh' })
+
+    lang = 'en'
+    await wait(30)
+    assert.equal(env.posted.length, 2)
+    assert.deepEqual(env.posted[1].body, { sessionId: 'zr~721b94fb~s1', lang: 'en' })
   } finally {
     env.stop()
   }

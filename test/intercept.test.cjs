@@ -176,6 +176,7 @@ function install(raw, relay, overrides = {}) {
     ...(overrides.getCurrentSession !== undefined ? { getCurrentSession: overrides.getCurrentSession } : {}),
     ...(overrides.clock !== undefined ? { clock: overrides.clock } : {}),
     ...(overrides.createSessionInventorySlot !== undefined ? { createSessionInventorySlot: overrides.createSessionInventorySlot } : {}),
+    ...(overrides.lang !== undefined ? { lang: overrides.lang } : {}),
     log: logging.log,
   })
   // T52-fix3: installing into an already-online relay fires one proactive
@@ -749,6 +750,12 @@ test('before the first handshake the answer is remote-offline, not mismatch', as
   // server — the settings surface words them differently.
   assert.deepEqual(envelope, { ok: false, error: { code: 'remote-offline', message: '尚未连接到服务端', details: {} } })
   handle.uninstall()
+
+  // English mode renders English messages
+  const { handle: enHandle } = install(gateway, relay, { getServerId: () => undefined, lang: 'en' })
+  const enEnvelope = await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined)
+  assert.deepEqual(enEnvelope, { ok: false, error: { code: 'remote-offline', message: 'Not connected to the server yet', details: {} } })
+  enHandle.uninstall()
 })
 
 // -- 7. uplink ---------------------------------------------------------------------

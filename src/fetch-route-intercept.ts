@@ -126,19 +126,41 @@ function mediaTypeOfPath(filePath: string): string {
  * why the host has no number to mirror). Interpolated into the local
  * oversize refusal so the card names the real limit. */
 const UPLOAD_CAP_MIB = Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024))
-
-const OVERSIZE_MESSAGE = `文件超过远程上传上限（${UPLOAD_CAP_MIB} MiB）`
-/** The media-read cap message (P55-2) — a different gate, a different
- * number, never the upload card's wording. */
 const FILE_MEDIA_CAP_MIB = Math.floor(MAX_FILE_MEDIA_BYTES / (1024 * 1024))
-const FILE_MEDIA_OVERSIZE_MESSAGE = `文件超过远程读取上限（${FILE_MEDIA_CAP_MIB} MiB）`
-const OFFLINE_MESSAGE = '服务端离线，远程会话暂时无法上传文件'
-const MISMATCH_MESSAGE = '此远程会话属于其他主服务端'
-/** The mid-upload transport death (T5x): the socket died UNDER the body —
- * most plausibly the server's size gate cutting an undeclared oversize
- * upload, possibly a network fault. Not a link verdict (the upload route
- * never judges the link, T51-fix), so the card must not say 服务端离线. */
-const INTERRUPTED_MESSAGE = `上传中断，文件可能超过远程上传上限（${UPLOAD_CAP_MIB} MiB）或网络不稳定`
+
+export type FetchRouteLang = 'zh' | 'en'
+
+const FETCH_ROUTE_COPY = {
+  zh: {
+    oversize: `文件超过远程上传上限（${UPLOAD_CAP_MIB} MiB）`,
+    fileMediaOversize: `文件超过远程读取上限（${FILE_MEDIA_CAP_MIB} MiB）`,
+    offlineUpload: '服务端离线，远程会话暂时无法上传文件',
+    mismatch: '此远程会话属于其他主服务端',
+    interrupted: `上传中断，文件可能超过远程上传上限（${UPLOAD_CAP_MIB} MiB）或网络不稳定`,
+    exportUnsupported: '远程会话不支持导出',
+    offlineFile: '服务端离线，远程文件暂时无法读取',
+    fileFailed: '远程文件读取失败',
+    fileNotFound: '远程与本机都不存在该文件',
+    fileForbidden: '远程文件不可读取',
+  },
+  en: {
+    oversize: `File exceeds the remote upload limit (${UPLOAD_CAP_MIB} MiB)`,
+    fileMediaOversize: `File exceeds the remote read limit (${FILE_MEDIA_CAP_MIB} MiB)`,
+    offlineUpload: 'Server offline — cannot upload files to this remote session right now',
+    mismatch: 'This remote session belongs to another server',
+    interrupted: `Upload interrupted — the file may exceed the remote upload limit (${UPLOAD_CAP_MIB} MiB) or the connection dropped`,
+    exportUnsupported: 'Export is not supported for remote sessions',
+    offlineFile: 'Server offline — remote file cannot be read right now',
+    fileFailed: 'Failed to read remote file',
+    fileNotFound: 'File not found on the server or on this machine',
+    fileForbidden: 'Remote file is not readable',
+  },
+} as const
+
+function resolveFetchRouteLang(lang: FetchRouteLang | (() => FetchRouteLang) | undefined): FetchRouteLang {
+  const value = typeof lang === 'function' ? lang() : lang
+  return value === 'en' ? 'en' : 'zh'
+}
 
 /** Verdict of {@link checkFetchRouteShape}. STRUCTURAL only: `ok` answers
  * "is this a connection service with a fetch-route table at all"; each
@@ -334,6 +356,9 @@ export interface InstallFetchRouteInterceptOptions {
    * before giving up. Defaults 3000 ms × 10; tests shrink both. */
   attachRetryMs?: number
   attachAttempts?: number
+  /** Language for error messages (`'zh'` default, `'en'` English). Accepts a
+   * getter for live resolution. */
+  lang?: FetchRouteLang | (() => FetchRouteLang) | undefined
 }
 
 export interface FetchRouteInterceptHandle {
@@ -441,6 +466,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
   let savedFile: FetchRouteEntry['fetch'] | undefined
   let fileAttachRefused: string | undefined
 
+  const copy = () => FETCH_ROUTE_COPY[resolveFetchRouteLang(options.lang)]
   const recordFailure = (route: FetchRouteFailureRecord['route'], code: string): void => {
     if (failures.length >= MAX_FAILURES) failures.shift()
     failures.push({ time: new Date().toISOString(), route, code })
@@ -496,20 +522,20 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
       counters.uploadRefused += 1
       recordFailure('upload', 'payload-too-large')
       log?.('upload for %s refused locally: payload-too-large (%s declared)', sessionId, declaredLength)
-      return uploadFailure('payload-too-large', OVERSIZE_MESSAGE)
+      return uploadFailure('payload-too-large', copy().oversize)
     }
     const target = uploadRelayFor(parts.serverId)
     if (target === 'remote-offline') {
       counters.uploadRefused += 1
       recordFailure('upload', 'remote-offline')
       log?.('upload for %s refused: relay not online', sessionId)
-      return uploadFailure('remote-offline', OFFLINE_MESSAGE)
+      return uploadFailure('remote-offline', copy().offlineUpload)
     }
     if (target === 'remote-mismatch') {
       counters.uploadRefused += 1
       recordFailure('upload', 'remote-mismatch')
       log?.('upload for %s refused: belongs to another server', sessionId)
-      return uploadFailure('remote-mismatch', MISMATCH_MESSAGE)
+      return uploadFailure('remote-mismatch', copy().mismatch)
     }
     counters.uploadForwarded += 1
     try {
@@ -542,9 +568,9 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
         // judges the link — while a status-carrying `offline` is the relay
         // CHAIN answering 502/503/504, which IS the gateway being down.
         if (error.code === 'offline' && error.status === undefined) {
-          return uploadFailure('upload-interrupted', INTERRUPTED_MESSAGE)
+          return uploadFailure('upload-interrupted', copy().interrupted)
         }
-        return uploadFailure('remote-offline', OFFLINE_MESSAGE)
+        return uploadFailure('remote-offline', copy().offlineUpload)
       }
       // A business answer — the relay's own refusal (`not-shared`,
       // `payload-too-large`, …) or the upstream route's failure envelope —
@@ -573,7 +599,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
     if (parts === undefined) return passthrough()
     counters.exportBlocked += 1
     recordFailure('export', 'remote-unsupported')
-    return statusFailure(403, 'remote-unsupported', '远程会话不支持导出')
+    return statusFailure(403, 'remote-unsupported', copy().exportUnsupported)
   }
 
   /** One /api/file answer the relay could not serve, with the honest
@@ -591,17 +617,17 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
     if (target === 'remote-offline') {
       counters.fileRefused += 1
       recordFailure('file', 'remote-offline')
-      return statusFailure(503, 'remote-offline', '服务端离线，远程文件暂时无法读取')
+      return statusFailure(503, 'remote-offline', copy().offlineFile)
     }
     if (target === 'remote-mismatch') {
       counters.fileRefused += 1
       recordFailure('file', 'remote-mismatch')
-      return statusFailure(403, 'remote-mismatch', MISMATCH_MESSAGE)
+      return statusFailure(403, 'remote-mismatch', copy().mismatch)
     }
     if (typeof (target as { invoke?: unknown }).invoke !== 'function') {
       counters.fileRefused += 1
       recordFailure('file', 'internal')
-      return statusFailure(502, 'internal', '远程文件读取失败')
+      return statusFailure(502, 'internal', copy().fileFailed)
     }
     const mediaType = mediaTypeOfPath(filePath)
     try {
@@ -613,7 +639,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
         const size = isRecord(stat) && typeof stat.bytes === 'number' ? stat.bytes : undefined
         if (size !== undefined && size > MAX_FILE_MEDIA_BYTES) {
           counters.fileRefused += 1
-          return statusFailure(413, 'file-too-large', FILE_MEDIA_OVERSIZE_MESSAGE)
+          return statusFailure(413, 'file-too-large', copy().fileMediaOversize)
         }
         return new Response(null, {
           status: 200,
@@ -637,11 +663,11 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
       if (data === undefined) {
         counters.fileRefused += 1
         recordFailure('file', 'internal')
-        return statusFailure(502, 'internal', '远程文件读取失败')
+        return statusFailure(502, 'internal', copy().fileFailed)
       }
       if (data.byteLength > MAX_FILE_MEDIA_BYTES) {
         counters.fileRefused += 1
-        return statusFailure(413, 'file-too-large', FILE_MEDIA_OVERSIZE_MESSAGE)
+        return statusFailure(413, 'file-too-large', copy().fileMediaOversize)
       }
       return new Response(data.slice(), {
         status: 200,
@@ -659,11 +685,11 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
         const local = await passthrough()
         if (local.status === 200) return local
         counters.fileRefused += 1
-        return statusFailure(404, 'file-not-found', '远程与本机都不存在该文件')
+        return statusFailure(404, 'file-not-found', copy().fileNotFound)
       }
       counters.fileRefused += 1
       if (code === 'workspace-file/too-large' || code === 'FS_TOO_LARGE') {
-        return statusFailure(413, 'file-too-large', FILE_MEDIA_OVERSIZE_MESSAGE)
+        return statusFailure(413, 'file-too-large', copy().fileMediaOversize)
       }
       if (
         code === 'workspace-file/not-regular-file' ||
@@ -672,10 +698,10 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
         code === 'FS_SANDBOX_DENIED' ||
         code === 'not-shared'
       ) {
-        return statusFailure(403, code, '远程文件不可读取')
+        return statusFailure(403, code, copy().fileForbidden)
       }
-      if (LINK_DOWN_CODES.has(code)) return statusFailure(503, code, '服务端离线，远程文件暂时无法读取')
-      return statusFailure(502, code, '远程文件读取失败')
+      if (LINK_DOWN_CODES.has(code)) return statusFailure(503, code, copy().offlineFile)
+      return statusFailure(502, code, copy().fileFailed)
     }
   }
 

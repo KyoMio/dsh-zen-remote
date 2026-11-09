@@ -59,13 +59,24 @@ test('caddy snippet: the site block is one reverse_proxy line', () => {
   assert.equal(result.text, 'dsh.example.com {\n    reverse_proxy 127.0.0.1:4088\n}\n')
 })
 
-test('lucky steps: three lines, listen 443, upstream target, catch-all switch', () => {
+test('lucky steps: three lines, listen 443, upstream target, catch-all switch (zh and en)', () => {
   const result = snippets.luckySteps({ upstreamHost: '127.0.0.1', upstreamPort: 4088 })
   assert.equal(result.ok, true)
   assert.equal(result.steps.length, 3)
   assert.ok(result.steps[0].includes('443'))
   assert.ok(result.steps[1].includes('http://127.0.0.1:4088'))
   assert.ok(result.steps[2].includes('万事大吉'))
+
+  const enSteps = snippets.luckySteps({ upstreamHost: '127.0.0.1', upstreamPort: 4088, lang: 'en' })
+  assert.equal(enSteps.ok, true)
+  assert.equal(enSteps.steps.length, 3)
+  assert.ok(enSteps.steps[0].includes('443'))
+  assert.ok(enSteps.steps[1].includes('http://127.0.0.1:4088'))
+  assert.ok(enSteps.steps[2].includes('catch-all'))
+
+  const enNginx = snippets.nginxSnippet({ ...VALID, lang: 'en' })
+  assert.equal(enNginx.ok, true)
+  assert.ok(enNginx.text.startsWith('# Place this in the http {} block'))
 })
 
 test('snippet inputs are injection-proof: scheme, path, newline, braces, bad ports all refuse', () => {

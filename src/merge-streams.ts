@@ -162,12 +162,26 @@ export interface MergerIdentity {
  * English forms live in src/client/locales.ts, `remoteGroup*` keys).
  */
 export type MergerAnnotation = 'none' | 'offline' | 'revoked' | 'unpaired' | 'mismatch'
+export type MergerLang = 'zh' | 'en'
 
-const ANNOTATION_SUFFIX: Record<Exclude<MergerAnnotation, 'none'>, string> = {
-  offline: '（离线）',
-  revoked: '（令牌已吊销）',
-  unpaired: '（已解除配对）',
-  mismatch: '（版本有差异）',
+const ANNOTATION_SUFFIX_BY_LANG: Record<MergerLang, Record<Exclude<MergerAnnotation, 'none'>, string>> = {
+  zh: {
+    offline: '（离线）',
+    revoked: '（令牌已吊销）',
+    unpaired: '（已解除配对）',
+    mismatch: '（版本有差异）',
+  },
+  en: {
+    offline: ' (offline)',
+    revoked: ' (token revoked)',
+    unpaired: ' (unpaired)',
+    mismatch: ' (version mismatch)',
+  },
+}
+
+function resolveMergerLang(lang: MergerLang | (() => MergerLang) | undefined): MergerLang {
+  const value = typeof lang === 'function' ? lang() : lang
+  return value === 'en' ? 'en' : 'zh'
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -199,12 +213,13 @@ function virtualizeWorkspace(
   record: Record<string, unknown>,
   identity: MergerIdentity,
   annotation: MergerAnnotation,
+  lang: MergerLang = 'zh',
 ): Record<string, unknown> {
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
   const out: Record<string, unknown> = { ...record }
   if (typeof record.workspaceId === 'string') out.workspaceId = virtualize(record.workspaceId)
   if (typeof record.title === 'string') {
-    const suffix = annotation === 'none' ? '' : ANNOTATION_SUFFIX[annotation]
+    const suffix = annotation === 'none' ? '' : ANNOTATION_SUFFIX_BY_LANG[lang][annotation]
     out.title = `${identity.serverName} · ${record.title}${suffix}`
   }
   if (Array.isArray(record.sessionIds)) {
@@ -220,6 +235,9 @@ export interface WorkspaceMergerOptions extends MergerIdentity {
   /** T65: the clock the tombstone hide-grace runs on. Default Date.now;
    * tests advance an injectable fake to cross the grace. */
   now?: () => number
+  /** Language for status annotation suffixes on group titles (`'zh'` default,
+   * `'en'` English). Accepts a getter for live resolution. */
+  lang?: MergerLang | (() => MergerLang) | undefined
   /** PB-25b: the known-real-session inventory report — every time the
    * session registry changes, the FULL current set of real ids this merger
    * knows (the sessionHome keys: live ids and tombstones alike, each one the
@@ -541,7 +559,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
    * session stays in its group so the host's「显示已归档」filter can show it
    * in place — hiding is purely the archived set. */
   function forwardWorkspace(record: Record<string, unknown>): Record<string, unknown> {
-    const out = virtualizeWorkspace(record, identity, annotation)
+    const out = virtualizeWorkspace(record, identity, annotation, resolveMergerLang(options.lang))
     const workspaceId = typeof record.workspaceId === 'string' ? record.workspaceId : undefined
     const live = stringList(record.sessionIds)
     if (workspaceId === undefined || !Array.isArray(out.sessionIds)) return out

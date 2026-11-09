@@ -26,6 +26,8 @@ export interface SnippetInput {
     upstreamHost: unknown;
     /** The gateway's ACTUAL port. */
     upstreamPort: unknown;
+    /** Language of the header comment (`'zh'` default, `'en'` English). */
+    lang?: 'zh' | 'en' | undefined;
 }
 /**
  * nginx: a complete server block. The WebSocket upgrade map sits outside
@@ -57,5 +59,6 @@ export type StepsResult = {
 export declare function luckySteps(input: {
     upstreamHost: unknown;
     upstreamPort: unknown;
+    lang?: 'zh' | 'en' | undefined;
 }): StepsResult;
 //# sourceMappingURL=proxy-snippets.d.ts.map

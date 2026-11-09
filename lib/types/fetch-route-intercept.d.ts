@@ -67,6 +67,7 @@ export declare const FILE_MEDIA_PATH = "/api/file";
  * upload unification and scripts/check-upload-limits.mjs), re-exported
  * here for the consumers the route narrative belongs to. */
 export { MAX_FILE_MEDIA_BYTES };
+export type FetchRouteLang = 'zh' | 'en';
 /** Verdict of {@link checkFetchRouteShape}. STRUCTURAL only: `ok` answers
  * "is this a connection service with a fetch-route table at all"; each
  * route's entry findings travel as `notes` — present/absent/misshaped — and
@@ -215,6 +216,9 @@ export interface InstallFetchRouteInterceptOptions {
      * before giving up. Defaults 3000 ms × 10; tests shrink both. */
     attachRetryMs?: number;
     attachAttempts?: number;
+    /** Language for error messages (`'zh'` default, `'en'` English). Accepts a
+     * getter for live resolution. */
+    lang?: FetchRouteLang | (() => FetchRouteLang) | undefined;
 }
 export interface FetchRouteInterceptHandle {
     /** Restore every attached entry — each ONLY while it still holds our

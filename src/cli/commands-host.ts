@@ -401,10 +401,11 @@ export async function runHostDeviceRevokeCommand(ctx: CliExecutionContext): Prom
  * generator refused an input (a broken wizard status), true otherwise. */
 function printSnippet(ctx: CliExecutionContext, kind: string, domain: string, port: number): boolean {
   const { t } = ctx
+  const lang: 'zh' | 'en' = t('common.done') === 'Done' ? 'en' : 'zh'
   const out = ctx.stdout
   const upstreamHost = '127.0.0.1'
   if (kind === 'nginx') {
-    const snippet = nginxSnippet({ domain, upstreamHost, upstreamPort: port })
+    const snippet = nginxSnippet({ domain, upstreamHost, upstreamPort: port, lang })
     if (!snippet.ok) {
       out.write(`${t('host.ingress.error.badDomain')}\n`)
       return false
@@ -414,7 +415,7 @@ function printSnippet(ctx: CliExecutionContext, kind: string, domain: string, po
     return true
   }
   if (kind === 'caddy') {
-    const snippet = caddySnippet({ domain, upstreamHost, upstreamPort: port })
+    const snippet = caddySnippet({ domain, upstreamHost, upstreamPort: port, lang })
     if (!snippet.ok) {
       out.write(`${t('host.ingress.error.badDomain')}\n`)
       return false
@@ -423,7 +424,7 @@ function printSnippet(ctx: CliExecutionContext, kind: string, domain: string, po
     out.write(`${snippet.text}\n`)
     return true
   }
-  const steps = luckySteps({ upstreamHost, upstreamPort: port })
+  const steps = luckySteps({ upstreamHost, upstreamPort: port, lang })
   if (!steps.ok) {
     out.write(`${t('host.ingress.error.badDomain')}\n`)
     return false

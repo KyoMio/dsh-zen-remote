@@ -267,6 +267,20 @@ test('wrap (T51-fix): a DECLARED body past the relay cap is refused locally — 
     assert.equal(connection.seen.upload.length, 0)
     assert.equal(handle.diagnostics().uploadRefused, 1)
   } finally { handle.uninstall() }
+
+  // English mode renders English error message
+  const enHandle = install(connection, relay, { lang: 'en' })
+  try {
+    const request = new Request(`http://127.0.0.1:19387${FILE_UPLOAD_PATH}?sessionId=${encodeURIComponent(toVirtual(SERVER_ID, LOCAL_ID))}&name=huge.bin`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream', 'content-length': String(600 * 1024 * 1024) },
+      body: Buffer.from('tiny'),
+      duplex: 'half',
+    })
+    const response = await connection.fetchRoutes.get(FILE_UPLOAD_PATH).fetch(request)
+    const body = await response.json()
+    assert.equal(body.error.message, 'File exceeds the remote upload limit (500 MiB)')
+  } finally { enHandle.uninstall() }
 })
 
 test('wrap: a relay refusal keeps the host 200-envelope contract; a link death is the same envelope', async () => {

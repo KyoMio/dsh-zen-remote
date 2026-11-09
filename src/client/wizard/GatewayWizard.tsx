@@ -779,12 +779,12 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     if (wizardStatus?.lanAddress !== undefined && wizardStatus.lanAddress !== '') {
       return `http://${wizardStatus.lanAddress}:${port}`
     }
-    return `http://<服务端局域网IP>:${port}`
-  }, [path, serverUrl, readiness, wizardStatus])
+    return t('wizard.desktop.addressFallback', { port: String(port) })
+  }, [path, serverUrl, readiness, wizardStatus, t])
 
   const copyDesktopInfo = async (): Promise<void> => {
     if (desktopPairing === undefined) return
-    const text = `服务端地址：${resolvedHostEndpoint}\n桌面客户端配对码：${desktopPairing.code}`
+    const text = t('wizard.desktop.copiedText', { address: resolvedHostEndpoint, code: desktopPairing.code })
     try {
       await navigator.clipboard?.writeText(text)
       setDesktopCopied(true)
@@ -1880,7 +1880,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                             {tunnelResult.existing.map((tunnel) => (
                               <button key={tunnel.id} type="button" className="zr-wizard-linkBtn" disabled={disabled || tunnelBusy}
                                 onClick={() => { setAdoptTunnelId(tunnel.id); void setupTunnelNow(tunnel.id) }}>
-                                {t('wizard.tunnel.useExisting')}：{tunnel.name}（{tunnel.status}）
+                                {t('wizard.tunnel.useExisting')}: {tunnel.name} ({tunnel.status})
                               </button>
                             ))}
                           </div>

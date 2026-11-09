@@ -97,7 +97,7 @@ import {
   virtualSessionIdsInWorkspaceFrames,
   virtualizeModelSelectionValue,
 } from './merge-streams.js'
-import type { ControlMerger, MergerAnnotation, MergerIdentity, RemoteWorkspaceContribution, WorkspaceMerger } from './merge-streams.js'
+import type { ControlMerger, MergerAnnotation, MergerIdentity, MergerLang, RemoteWorkspaceContribution, WorkspaceMerger } from './merge-streams.js'
 
 /** The session-locating argument fields, as registered per method. Identical
  * in name and meaning to relay-access.ts's `SessionField`; a field named
@@ -365,12 +365,41 @@ export function isRemoteWrite(endpoint: string): boolean {
  */
 export const REMOTE_UPLINK_STREAM_METHODS: ReadonlySet<string> = new Set(['terminal/attach'])
 
-/** The refusal a write gets while the relay is not serving (T34). */
-const WRITE_OFFLINE_MESSAGE = '服务端离线，远程会话暂时只读'
+export type InterceptLang = MergerLang
 
-/** What a call or stream on a closed remote session answers in place of the
- * relay's own text (T73) — the banner already says why. */
-const CLOSED_MESSAGE = '远程已关闭'
+const INTERCEPT_COPY = {
+  zh: {
+    writeOffline: '服务端离线，远程会话暂时只读',
+    closed: '远程已关闭',
+    notConnected: '尚未连接到服务端',
+    mismatch: '此远程会话属于其他主服务端',
+    unsupported: '此功能暂不支持远程会话',
+    referenceNotOnServer: '引用的会话不在服务端上，无法转发',
+    revoked: '配对令牌已被吊销，请在设置页重新配对',
+    unpaired: '尚未与服务端配对，请在设置页完成配对',
+    modelGroupRemote: '该模型分组属于远程服务端，无法在本机会话中使用',
+    modelGroupPickServer: (displayName: string) => `请选择「${displayName} · …」分组里的模型`,
+    modelGroupMismatch: '此模型分组属于其他主服务端',
+  },
+  en: {
+    writeOffline: 'Server offline — remote session is temporarily read-only',
+    closed: 'Remote closed',
+    notConnected: 'Not connected to the server yet',
+    mismatch: 'This remote session belongs to another server',
+    unsupported: 'This feature is not supported in remote sessions yet',
+    referenceNotOnServer: 'Referenced session is not on the server and cannot be forwarded',
+    revoked: 'Pairing token was revoked — please pair again in Settings',
+    unpaired: 'Not paired with the server yet — please pair in Settings',
+    modelGroupRemote: 'This model group belongs to a remote server and cannot be used in a local session',
+    modelGroupPickServer: (displayName: string) => `Select a model under "${displayName} · …"`,
+    modelGroupMismatch: 'This model group belongs to another server',
+  },
+} as const
+
+function resolveInterceptLang(lang: InterceptLang | (() => InterceptLang) | undefined): InterceptLang {
+  const value = typeof lang === 'function' ? lang() : lang
+  return value === 'en' ? 'en' : 'zh'
+}
 
 /**
  * The RelayError codes that mean "the LINK went down under a live stream"
@@ -701,6 +730,9 @@ export interface InstallInterceptOptions {
    * shares are ever reported and the plugin-route value scan stays exactly
    * the request-local behavior. */
   createSessionInventorySlot?: (serverId?: string) => SessionInventorySlot
+  /** Language for error messages and sidebar group suffixes (`'zh'` default,
+   * `'en'` English). Accepts a getter for live resolution. */
+  lang?: InterceptLang | (() => InterceptLang) | undefined
 }
 
 export interface InterceptHandle {
@@ -1435,6 +1467,7 @@ interface MergedGlobalStreamDeps {
    * {@link SessionInventorySlot}). One slot per merged stream, disposed with
    * it; absent when the wiring passed no factory. */
   createSessionInventorySlot?: () => SessionInventorySlot
+  lang?: InterceptLang | (() => InterceptLang) | undefined
 }
 
 /**
@@ -1479,6 +1512,7 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
           serverName: initial?.serverName ?? '',
           onDiagnostic,
           now: clock.now,
+          lang: deps.lang,
           ...(sessionSlot !== undefined ? { onKnownSessions: (ids: ReadonlySet<string>) => sessionSlot.replace(ids) } : {}),
         })
 
@@ -1536,7 +1570,13 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
   // away, and a navigation writes no relay frames. An `unavailable` read is
   // skipped entirely: the merger falls back to the conservative tombstone
   // behavior then.
+  let lastLang: InterceptLang = resolveInterceptLang(deps.lang)
   const informCurrentSession = (): void => {
+    const nextLang = resolveInterceptLang(deps.lang)
+    if (nextLang !== lastLang) {
+      lastLang = nextLang
+      for (const frame of merger.onStatusChanged()) channel.push(frame)
+    }
     const read = deps.getCurrentSession()
     if (read.kind === 'unavailable') return
     for (const frame of merger.setCurrentSession(read.kind === 'open' ? read.sessionId : undefined)) channel.push(frame)
@@ -2610,6 +2650,7 @@ interface MergedGlobalStreamMultiDeps {
   /** Subscribe to the wiring's pool-event broadcasts (handle.notePoolEvent).
    * Every broadcast re-scans the slot set. */
   watchPool(fn: () => void): () => void
+  lang?: InterceptLang | (() => InterceptLang) | undefined
 }
 
 /**
@@ -2693,7 +2734,25 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
   }
 
   // -- current-session judging (T58/T62), across every slot ------------------
+  let lastLang: InterceptLang = resolveInterceptLang(deps.lang)
   const informCurrentSession = (): void => {
+    const nextLang = resolveInterceptLang(deps.lang)
+    if (nextLang !== lastLang) {
+      lastLang = nextLang
+      if (isWorkspace) {
+        let langUpserted = false
+        for (const slot of [...slots.values()]) {
+          const merger = workspaceMergerOf(slot)
+          if (merger === undefined) continue
+          const frames = merger.onStatusChanged()
+          if (frames.length > 0) {
+            pushOut(frames.filter((frame) => isPlainObject(frame) && frame.type === 'upsert'))
+            langUpserted = true
+          }
+        }
+        if (langUpserted) pushCanonicalTrio()
+      }
+    }
     const read = deps.getCurrentSession()
     if (read.kind === 'unavailable') return
     let changed = false
@@ -2849,6 +2908,7 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
             serverName: entry.displayName,
             onDiagnostic,
             now: clock.now,
+            lang: deps.lang,
             ...(inventory !== undefined ? { onKnownSessions: (ids: ReadonlySet<string>) => inventory.replace(ids) } : {}),
           })
         : createControlMerger({ serverId, serverName: entry.displayName, onDiagnostic })
@@ -3983,31 +4043,31 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * matched entry's client is the forwarding leg. A refusal is recorded
    * once, here, by the caller passing it through {@link failEnvelope}.
    */
-  const OFFLINE_MESSAGE = '尚未连接到服务端'
-  const MISMATCH_MESSAGE = '此远程会话属于其他主服务端'
+  const copy = () => INTERCEPT_COPY[resolveInterceptLang(options.lang)]
   type Verdict = { ok: true; client: RelayClient; serverId: string } | { ok: false; code: string; message: string }
   function validate(endpoint: string, virtuals: VirtualParts[]): Verdict {
     const first = virtuals[0].serverId
+    const c = copy()
     if (pool === undefined) {
       const current = singleGetServerId()
-      if (current === undefined) return { ok: false, code: 'remote-offline', message: OFFLINE_MESSAGE }
+      if (current === undefined) return { ok: false, code: 'remote-offline', message: c.notConnected }
       if (virtuals.some((parts) => parts.serverId !== first) || current !== first) {
-        return { ok: false, code: 'remote-mismatch', message: MISMATCH_MESSAGE }
+        return { ok: false, code: 'remote-mismatch', message: c.mismatch }
       }
       if (CLIENT_METHOD_FIELDS[endpoint] === undefined) {
-        return { ok: false, code: 'remote-unsupported', message: '此功能暂不支持远程会话' }
+        return { ok: false, code: 'remote-unsupported', message: c.unsupported }
       }
       return { ok: true, client: singleRelay, serverId: first }
     }
     if (virtuals.some((parts) => parts.serverId !== first)) {
-      return { ok: false, code: 'remote-mismatch', message: MISMATCH_MESSAGE }
+      return { ok: false, code: 'remote-mismatch', message: c.mismatch }
     }
     const known = pool.entries().filter((entry) => entry.serverId !== undefined)
-    if (known.length === 0) return { ok: false, code: 'remote-offline', message: OFFLINE_MESSAGE }
+    if (known.length === 0) return { ok: false, code: 'remote-offline', message: c.notConnected }
     const target = known.find((entry) => entry.serverId === first)
-    if (target === undefined) return { ok: false, code: 'remote-mismatch', message: MISMATCH_MESSAGE }
+    if (target === undefined) return { ok: false, code: 'remote-mismatch', message: c.mismatch }
     if (CLIENT_METHOD_FIELDS[endpoint] === undefined) {
-      return { ok: false, code: 'remote-unsupported', message: '此功能暂不支持远程会话' }
+      return { ok: false, code: 'remote-unsupported', message: c.unsupported }
     }
     return { ok: true, client: target.client, serverId: first }
   }
@@ -4064,14 +4124,14 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // mismatch keeps its original REFUSAL envelope (wrong server is a
     // different fact from a leg that just left).
     if (route === 'offline') {
-      failEnvelope(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
+      failEnvelope(endpoint, 'remote-offline', copy().writeOffline)
       return { ok: true, value: undefined }
     }
     if (route === 'missing') {
-      failEnvelope(endpoint, 'remote-mismatch', MISMATCH_MESSAGE)
+      failEnvelope(endpoint, 'remote-mismatch', copy().mismatch)
       return { ok: true, value: undefined }
     }
-    if (route === 'mismatch') return failEnvelope(endpoint, 'remote-mismatch', MISMATCH_MESSAGE)
+    if (route === 'mismatch') return failEnvelope(endpoint, 'remote-mismatch', copy().mismatch)
     const client = route.client
     return (async (): Promise<DispatchEnvelope> => {
       try {
@@ -4121,7 +4181,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // failing with their own transport error). Pool mode (MS-3): the verdict
     // names the TARGET leg — its state is the one that counts.
     if (isRemoteWrite(endpoint) && verdict.client.state !== 'online') {
-      return failEnvelope(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
+      return failEnvelope(endpoint, 'remote-offline', copy().writeOffline)
     }
     const serverId = verdict.serverId
     const client = verdict.client
@@ -4150,7 +4210,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       const references = restoreSessionReferences(clone, namespace, method, serverId)
       clone = references.args
       if (!references.ok) {
-        return failEnvelope(endpoint, 'remote-unsupported', '引用的会话不在服务端上，无法转发')
+        return failEnvelope(endpoint, 'remote-unsupported', copy().referenceNotOnServer)
       }
       const value = await client.invoke(namespace, method, clone, signal)
       // The session answered: any closed-session entry for it is stale
@@ -4181,7 +4241,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       recordFailure(endpoint, code)
       // A call on a closed session reads like the banner, not like the
       // relay's bare code (T73).
-      const message = code === 'not-shared' ? CLOSED_MESSAGE : messageOf(error)
+      const message = code === 'not-shared' ? copy().closed : messageOf(error)
       return { ok: false, error: { code, message, details: error instanceof RelayError && isPlainObject(error.details) ? error.details : {} } }
     }
   }
@@ -4415,7 +4475,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             if (onCleared !== undefined) closedClearWaiters.delete(onCleared)
             return
           }
-          throw new CodedStreamError(code, CLOSED_MESSAGE)
+          throw new CodedStreamError(code, copy().closed)
         }
         recordFailure(endpoint, code)
         // A link-down fact (CP4), scoped by CP5: only the carrier-retry
@@ -4437,9 +4497,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         // would freeze the panel with no verdict and no wake-up.
         if (serve !== 'online') {
           recordFailure(endpoint, serve)
+          const c = copy()
           throw new CodedStreamError(
             serve,
-            serve === 'revoked' ? '配对令牌已被吊销，请在设置页重新配对' : '尚未与服务端配对，请在设置页完成配对',
+            serve === 'revoked' ? c.revoked : c.unpaired,
           )
         }
         if (callerAborted()) return
@@ -4676,8 +4737,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     const sessionParts = fromVirtual(sessionId)
     const providerParts = fromVirtual(provider)
     if (sessionParts === undefined && providerParts === undefined) return undefined
+    const c = copy()
     if (sessionParts === undefined) {
-      return { code: 'remote-unsupported', message: '该模型分组属于远程服务端，无法在本机会话中使用' }
+      return { code: 'remote-unsupported', message: c.modelGroupRemote }
     }
     // MS-3: the session's server is looked up in the POOL (by the virtual
     // id's serverId); a pool without that server falls through to the
@@ -4691,10 +4753,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     })()
     if (displayName === undefined) return undefined
     if (providerParts === undefined) {
-      return { code: 'remote-unsupported', message: `请选择「${displayName} · …」分组里的模型` }
+      return { code: 'remote-unsupported', message: c.modelGroupPickServer(displayName) }
     }
     if (providerParts.serverId !== sessionParts.serverId) {
-      return { code: 'remote-mismatch', message: '此模型分组属于其他主服务端' }
+      return { code: 'remote-mismatch', message: c.modelGroupMismatch }
     }
     return { args: { ...args, request: { ...request, provider: providerParts.id } } }
   }
@@ -4858,6 +4920,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
               summarySync,
               createSessionInventorySlot,
               watchPool,
+              lang: options.lang,
             })
           }
           return mergedGlobalStream({
@@ -4874,6 +4937,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             watchCurrentSession,
             watchUninstall,
             summarySync,
+            lang: options.lang,
             ...(createSessionInventorySlot !== undefined
               ? { createSessionInventorySlot: () => createSessionInventorySlot(undefined) }
               : {}),
@@ -4908,7 +4972,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // is the one that counts.
     if (isRemoteWrite(endpoint) && verdict.client.state !== 'online') {
       releaseUplink(uplink)
-      throwRecorded(endpoint, 'remote-offline', WRITE_OFFLINE_MESSAGE)
+      throwRecorded(endpoint, 'remote-offline', copy().writeOffline)
     }
     // The multiplexed wire channel ALWAYS hands us an UplinkInbox here —
     // never undefined. One-directional remote streams consume no uplink

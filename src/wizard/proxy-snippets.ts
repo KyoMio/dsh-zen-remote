@@ -26,6 +26,8 @@ export interface SnippetInput {
   upstreamHost: unknown
   /** The gateway's ACTUAL port. */
   upstreamPort: unknown
+  /** Language of the header comment (`'zh'` default, `'en'` English). */
+  lang?: 'zh' | 'en' | undefined
 }
 
 /** Integers in [1, 65535] only. */
@@ -56,8 +58,11 @@ export function nginxSnippet(input: SnippetInput): SnippetResult {
   const parts = validatedParts(input)
   if ('error' in parts) return parts.error
   const { domain, upstream, port } = parts
+  const headerComment = input.lang === 'en'
+    ? '# Place this in the http {} block (skip if you already have this map)'
+    : '# 这段放在 http {} 层（若已有同名 map 则跳过）'
   const text = [
-    '# 这段放在 http {} 层（若已有同名 map 则跳过）',
+    headerComment,
     'map $http_upgrade $connection_upgrade {',
     '    default upgrade;',
     "    ''      close;",
@@ -113,11 +118,21 @@ export type StepsResult =
  * flip the catch-all switch. Text only — Lucky has no config file format
  * to generate.
  */
-export function luckySteps(input: { upstreamHost: unknown; upstreamPort: unknown }): StepsResult {
+export function luckySteps(input: { upstreamHost: unknown; upstreamPort: unknown; lang?: 'zh' | 'en' | undefined }): StepsResult {
   const upstream = hostOf(input.upstreamHost)
   if (upstream === undefined) return { ok: false, error: 'bad-upstream-host' }
   const port = portOf(input.upstreamPort)
   if (port === undefined) return { ok: false, error: 'bad-upstream-port' }
+  if (input.lang === 'en') {
+    return {
+      ok: true,
+      steps: [
+        'In Lucky "Web Service", create a new rule listening on port 443 and bind your domain.',
+        `Set the backend (reverse proxy target) to http://${upstream}:${port} and enable WebSocket support.`,
+        'Turn on the catch-all switch to allow all paths, then save.',
+      ],
+    }
+  }
   return {
     ok: true,
     steps: [

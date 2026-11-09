@@ -208,7 +208,9 @@ export interface ClientHandlerOptions {
    * mount's remoteStatusOnly wall 404s the route before this matters, and
    * a client handler WITHOUT the sink answers the same 404 (no sink, no
    * route). */
-  onCurrentSession?: (read: CurrentSessionRead) => void
+  onCurrentSession?: (read: CurrentSessionRead, reportedLang?: 'zh' | 'en') => void
+  /** Language for route error messages (`'zh'` default, `'en'` English). */
+  lang?: 'zh' | 'en' | (() => 'zh' | 'en') | undefined
   /** CU-3, the debug-report route's inputs — all optional; the route answers
    * its 404-shaped refusal without them (an unwired composition must not
    * pretend to have diagnostics). Wired on BOTH role mounts.
@@ -627,6 +629,12 @@ async function statusBodyOf(options: ClientHandlerOptions): Promise<Record<strin
  */
 export function createClientHandler(options: ClientHandlerOptions): ClientHandler {
   const fetchImpl: FetchLike = options.fetchImpl ?? ((url, init) => fetch(url, init))
+  const resolveLang = (): 'zh' | 'en' => {
+    const value = typeof options.lang === 'function' ? options.lang() : options.lang
+    return value === 'en' ? 'en' : 'zh'
+  }
+  const mismatchMessage = (): string =>
+    resolveLang() === 'en' ? 'This remote session belongs to another server' : '此远程会话属于其他主服务端'
   return async (req, res) => {
     // Wall 1: DSH's own admission, relaying its refusal verbatim.
     const admission = options.admit(req)
@@ -649,7 +657,10 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
       if (route === CLIENT_DEBUG_REPORT_ROUTE && req.headers['x-zen-remote-via'] !== undefined) {
         responseJson(res, 403, {
           ok: false,
-          error: { code: 'via-gateway', message: '诊断报告只能在本机导出' },
+          error: {
+            code: 'via-gateway',
+            message: resolveLang() === 'en' ? 'Diagnostics report can only be exported on this machine' : '诊断报告只能在本机导出',
+          },
         })
         return
       }
@@ -1055,7 +1066,8 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           return
         }
         const read: CurrentSessionRead = raw === null ? { kind: 'none' } : { kind: 'open', sessionId: raw }
-        sink(read)
+        const reportedLang = body.lang === 'en' ? ('en' as const) : body.lang === 'zh' ? ('zh' as const) : undefined
+        sink(read, reportedLang)
         responseJson(res, 200, { ok: true })
         return
       }
@@ -1087,7 +1099,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         if (pool !== undefined) {
           const entry = pool.getByServerId(parts.serverId)
           if (entry === undefined) {
-            responseJson(res, 200, { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端' } })
+            responseJson(res, 200, { ok: false, error: { code: 'remote-mismatch', message: mismatchMessage() } })
             return
           }
           try {
@@ -1108,7 +1120,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         // just answer not-shared out there — the mismatch is answerable
         // locally, with the code the interceptor uses for the same fact.
         if (relay.handshakeInfo === undefined || relay.handshakeInfo.serverId !== parts.serverId) {
-          responseJson(res, 200, { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端' } })
+          responseJson(res, 200, { ok: false, error: { code: 'remote-mismatch', message: mismatchMessage() } })
           return
         }
         try {
@@ -1162,7 +1174,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
         if (pool !== undefined) {
           const entry = pool.getByServerId(parts.serverId)
           if (entry === undefined) {
-            responseJson(res, 400, { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端' } })
+            responseJson(res, 400, { ok: false, error: { code: 'remote-mismatch', message: mismatchMessage() } })
             return
           }
           if (entry.client.state !== 'online') {
@@ -1190,7 +1202,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           return
         }
         if (relay.handshakeInfo?.serverId !== parts.serverId) {
-          responseJson(res, 400, { ok: false, error: { code: 'remote-mismatch', message: '此远程会话属于其他主服务端' } })
+          responseJson(res, 400, { ok: false, error: { code: 'remote-mismatch', message: mismatchMessage() } })
           return
         }
         url.searchParams.set('sessionId', parts.id)

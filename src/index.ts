@@ -775,6 +775,14 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   let cliWizardHandler: CliRouteHandler | undefined
   let cliAdminHandler: CliRouteHandler | undefined
   let cliClientHandler: CliRouteHandler | undefined
+  let reportedBrowserLang: 'zh' | 'en' | undefined
+  const resolveActiveLang = (): 'zh' | 'en' => {
+    const cfg = resolveConfig(config, readFileConfig(), process.env).values.lang
+    if (cfg === 'en') return 'en'
+    if (cfg === 'zh') return 'zh'
+    if (reportedBrowserLang !== undefined) return reportedBrowserLang
+    return 'zh'
+  }
   /** The managed ingress children THIS row generation owns (host branch
    * only): the restart-watcher disposer stops them, which is the ONLY stop
    * on compositions without a webServer (there the wizard effect — the
@@ -1431,6 +1439,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           getGatewaySummary: gatewaySummary,
           getProfileName: profileName,
           getPluginVersion: () => pluginVersion,
+          lang: resolveActiveLang,
         }),
       }), 'dsh-zen-remote: client routes (host)')
     })
@@ -1448,6 +1457,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       getGatewaySummary: gatewaySummary,
       getProfileName: profileName,
       getPluginVersion: () => pluginVersion,
+      lang: resolveActiveLang,
     })
   }
   if (connectsRole(effective.values.role)) {
@@ -1574,8 +1584,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // first report arrives the value is `unavailable` and the intercept
     // keeps its conservative tombstone behavior.
     let reportedCurrentSession: CurrentSessionRead = { kind: 'unavailable' }
-    const onCurrentSession = (read: CurrentSessionRead): void => {
+    const onCurrentSession = (read: CurrentSessionRead, reportedLang?: 'zh' | 'en'): void => {
       reportedCurrentSession = read
+      if (reportedLang !== undefined) reportedBrowserLang = reportedLang
       // Re-judge NOW — the merger dedupes no-change calls, so a report that
       // carries nothing new costs one compare.
       interceptHandle?.currentSessionChanged()
@@ -1661,6 +1672,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // from the wiring with the row client.)
         pool: relayPool,
         getCurrentSession: () => reportedCurrentSession,
+        lang: resolveActiveLang,
         // PB-25b: each merged stream reports its real-session inventory
         // share into the union above.
         createSessionInventorySlot,
@@ -1769,6 +1781,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // (or not-yet-installed) typert wrap answers undefined and the media
         // request passes through to the local route.
         resolveRemoteFileScope: (filePath) => interceptHandle?.resolveRemoteFileScope(filePath),
+        lang: resolveActiveLang,
         log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
       })
       fetchRouteHandle = handle
@@ -1862,6 +1875,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // P55-2: same live read as the inject path — the media route follows
         // whichever typert intercept is currently installed.
         resolveRemoteFileScope: (filePath) => interceptHandle?.resolveRemoteFileScope(filePath),
+        lang: resolveActiveLang,
         log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
       })
       fetchRouteHandle = handle
@@ -1985,6 +1999,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       getLogSnapshot: () => ring.snapshot(),
       getProfileName: profileName,
       getPluginVersion: () => pluginVersion,
+      lang: resolveActiveLang,
     })
     cliClientHandler = createClientHandler(clientOptionsFor(noopAdmit, ctx))
     ctx.inject(['webServer', 'connection'], (clientCtx) => {

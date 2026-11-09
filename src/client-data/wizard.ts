@@ -466,6 +466,7 @@ export interface SnippetInput {
   domain: string
   upstreamHost: string
   upstreamPort: number
+  lang?: 'zh' | 'en' | undefined
 }
 
 /** Same grammar the row layer and the host half enforce. */
@@ -479,8 +480,11 @@ function valid(input: SnippetInput): { domain: string; upstream: string; port: n
 export function nginxSnippetText(input: SnippetInput): string | null {
   const parts = valid(input)
   if (parts === null) return null
+  const headerComment = input.lang === 'en'
+    ? '# Place this in the http {} block (skip if you already have this map)'
+    : '# 这段放在 http {} 层（若已有同名 map 则跳过）'
   return [
-    '# 这段放在 http {} 层（若已有同名 map 则跳过）',
+    headerComment,
     'map $http_upgrade $connection_upgrade {',
     '    default upgrade;',
     "    ''      close;",
@@ -519,6 +523,13 @@ export function caddySnippetText(input: SnippetInput): string | null {
 export function luckyStepTexts(input: SnippetInput): string[] | null {
   const parts = valid(input)
   if (parts === null) return null
+  if (input.lang === 'en') {
+    return [
+      'In Lucky "Web Service", create a new rule listening on port 443 and bind your domain.',
+      `Set the backend (reverse proxy target) to http://${parts.upstream}:${parts.port} and enable WebSocket support.`,
+      'Turn on the catch-all switch to allow all paths, then save.',
+    ]
+  }
   return [
     '在 Lucky 的「Web 服务」里新建一条规则，监听 443 端口，绑定你的域名。',
     `后端（反代目标）填 http://${parts.upstream}:${parts.port}，开启 WebSocket 支持。`,
