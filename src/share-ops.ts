@@ -32,11 +32,92 @@ export interface AgentStatusLike {
 
 /** The slice of a DSH session header the share decision reads. Field names
  * per `validateSessionHeader`: `id` (matches the session id), `origin`
- * (only legal value `'subagent'`), `parentSession` (a string when set). */
+ * (only legal value `'subagent'`), `parentSession` (a string when set),
+ * `isSeeded` (true on a fork). */
 export interface CreatedSessionHeaderLike {
   id?: unknown
   origin?: unknown
   parentSession?: unknown
+  isSeeded?: unknown
+}
+
+/** The slice of a DSH Session read to detect an unused blank placeholder
+ * reclaimed by `session/create` (`dsh-api-session-controller`'s `claim`
+ * resumes persisted blank sessions with `source: 'resume'`). */
+export interface CreatedSessionLike {
+  header?: CreatedSessionHeaderLike | null | undefined
+  snapshotEvents?: (() => readonly { type?: unknown }[]) | undefined
+}
+
+/** The slice of `ctx.agents.turnBoundaryOf(session)` (DSH 0.2+ projection
+ * reader, the non-deprecated replacement for `snapshotEvents()`). */
+export interface TurnBoundaryLike {
+  openTurnStartSeq?: unknown
+  lastTurn?: unknown
+}
+
+/**
+ * Whether `session` is an unseeded, non-subagent blank session (zero turns
+ * ever started). DSH's `createInWorkspace` reuses persisted blank sessions
+ * via `session/create` → `agents.resume` (`source: 'resume'`); judging
+ * blankness lets `agent/created` auto-share a reclaimed blank placeholder
+ * while keeping established conversations closed across reopens.
+ *
+ * Prefers `turnBoundaryOf(session)` (DSH's `sessionProjections`-backed
+ * `ctx.agents.turnBoundaryOf`, the predicate `dsh-api-session-controller`'s
+ * own `isBlank` uses: `openTurnStartSeq === null && lastTurn === 0`); falls
+ * back to `session.snapshotEvents()` when `turnBoundaryOf` is absent (DSH
+ * 0.1.7 compatibility or unit-test mocks; ponytail: remove `snapshotEvents`
+ * fallback once 0.1.7 support is dropped and `@deepseek-ai/dsh-session`
+ * retires synchronous event-log reads).
+ */
+export function isBlankSession(
+  session: CreatedSessionLike | undefined | null,
+  turnBoundaryOf?: ((session: CreatedSessionLike) => TurnBoundaryLike | undefined) | undefined,
+): boolean {
+  if (session === null || typeof session !== 'object') return false
+  const header = session.header
+  if (header === null || typeof header !== 'object') return false
+  if (header.origin === 'subagent' || header.isSeeded === true) return false
+  if (typeof header.id !== 'string' || header.id === '') return false
+  if (typeof turnBoundaryOf === 'function') {
+    try {
+      const boundary = turnBoundaryOf(session)
+      if (boundary !== null && typeof boundary === 'object') {
+        return boundary.openTurnStartSeq === null && boundary.lastTurn === 0
+      }
+    } catch {
+      // Fall through to snapshotEvents when the projection reader is unavailable.
+    }
+  }
+  if (typeof session.snapshotEvents !== 'function') return false
+  try {
+    const events = session.snapshotEvents()
+    if (!Array.isArray(events)) return false
+    return !events.some((event) => event !== null && typeof event === 'object' && event.type === 'turn/start')
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether `event` is the very first `turn/start` (`turn === 1`) of an
+ * unseeded non-subagent session. Covers the in-memory `reuseLive` path of
+ * `session/create`, where a live blank session (created before
+ * `autoShareNewSessions` was enabled, or after its idle window expired in
+ * memory) is reused without emitting `agent/created`.
+ */
+export function isFirstTurnStart(
+  session: { header?: CreatedSessionHeaderLike | null | undefined } | undefined | null,
+  event: { type?: unknown; data?: unknown } | undefined | null,
+): boolean {
+  if (event === null || typeof event !== 'object' || event.type !== 'turn/start') return false
+  const data = event.data as { turn?: unknown } | null | undefined
+  if (data === null || typeof data !== 'object' || data.turn !== 1) return false
+  const header = session?.header
+  if (header === null || typeof header !== 'object') return false
+  if (header.origin === 'subagent' || header.isSeeded === true) return false
+  return typeof header.id === 'string' && header.id !== ''
 }
 
 /**

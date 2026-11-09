@@ -29,12 +29,58 @@ export interface AgentStatusLike {
 }
 /** The slice of a DSH session header the share decision reads. Field names
  * per `validateSessionHeader`: `id` (matches the session id), `origin`
- * (only legal value `'subagent'`), `parentSession` (a string when set). */
+ * (only legal value `'subagent'`), `parentSession` (a string when set),
+ * `isSeeded` (true on a fork). */
 export interface CreatedSessionHeaderLike {
     id?: unknown;
     origin?: unknown;
     parentSession?: unknown;
+    isSeeded?: unknown;
 }
+/** The slice of a DSH Session read to detect an unused blank placeholder
+ * reclaimed by `session/create` (`dsh-api-session-controller`'s `claim`
+ * resumes persisted blank sessions with `source: 'resume'`). */
+export interface CreatedSessionLike {
+    header?: CreatedSessionHeaderLike | null | undefined;
+    snapshotEvents?: (() => readonly {
+        type?: unknown;
+    }[]) | undefined;
+}
+/** The slice of `ctx.agents.turnBoundaryOf(session)` (DSH 0.2+ projection
+ * reader, the non-deprecated replacement for `snapshotEvents()`). */
+export interface TurnBoundaryLike {
+    openTurnStartSeq?: unknown;
+    lastTurn?: unknown;
+}
+/**
+ * Whether `session` is an unseeded, non-subagent blank session (zero turns
+ * ever started). DSH's `createInWorkspace` reuses persisted blank sessions
+ * via `session/create` → `agents.resume` (`source: 'resume'`); judging
+ * blankness lets `agent/created` auto-share a reclaimed blank placeholder
+ * while keeping established conversations closed across reopens.
+ *
+ * Prefers `turnBoundaryOf(session)` (DSH's `sessionProjections`-backed
+ * `ctx.agents.turnBoundaryOf`, the predicate `dsh-api-session-controller`'s
+ * own `isBlank` uses: `openTurnStartSeq === null && lastTurn === 0`); falls
+ * back to `session.snapshotEvents()` when `turnBoundaryOf` is absent (DSH
+ * 0.1.7 compatibility or unit-test mocks; ponytail: remove `snapshotEvents`
+ * fallback once 0.1.7 support is dropped and `@deepseek-ai/dsh-session`
+ * retires synchronous event-log reads).
+ */
+export declare function isBlankSession(session: CreatedSessionLike | undefined | null, turnBoundaryOf?: ((session: CreatedSessionLike) => TurnBoundaryLike | undefined) | undefined): boolean;
+/**
+ * Whether `event` is the very first `turn/start` (`turn === 1`) of an
+ * unseeded non-subagent session. Covers the in-memory `reuseLive` path of
+ * `session/create`, where a live blank session (created before
+ * `autoShareNewSessions` was enabled, or after its idle window expired in
+ * memory) is reused without emitting `agent/created`.
+ */
+export declare function isFirstTurnStart(session: {
+    header?: CreatedSessionHeaderLike | null | undefined;
+} | undefined | null, event: {
+    type?: unknown;
+    data?: unknown;
+} | undefined | null): boolean;
 /**
  * Re-mark the busy flags a restart wiped. `busy` is deliberately never
  * persisted, so after a plugin-row restart every shared session resumes as

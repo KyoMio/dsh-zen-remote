@@ -5,6 +5,12 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 2.4.1（2026-11-09）
+
+### 修复
+
+- **修复新会话自动开启远程共享在复用空白占位会话时失效**：适配 DSH 0.2.2+ 新建会话优先复用工作区内空白占位会话（`source: 'resume'` 或内存态 `reuseLive`）的机制，复用空白会话或首次开启第一轮对话时正常按配置自动开启远程共享。
+
 ## 2.4.0（2026-11-09）
 
 ### 新增
