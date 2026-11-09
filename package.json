@@ -36,7 +36,6 @@
     "cordis.patch.yml",
     "cordis.patch.yml.example",
     "llms.txt",
-    "AGENTS.md",
     "CHANGELOG.md",
     "README.md",
     "README.zh-CN.md",
@@ -44,6 +43,7 @@
     "!docs/push-policy.md",
     "!docs/SPEC.md",
     "!docs/spike-relay.md",
+    "!docs/adr",
     "!docs/images"
   ],
   "scripts": {

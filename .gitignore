@@ -8,13 +8,16 @@ node_modules/
 test/.tmp/
 *.tgz
 
-# Local planning note, deliberately not shipped: it records the pre-implementation
-# guesses (several of which turned out wrong) and is superseded by README's
-# notification section and docs/remote-access.md.
+# Local planning and engineering notes, deliberately not shipped
 docs/push-policy.md
+docs/SPEC.md
+docs/spike-relay.md
+docs/adr/
+GLOSSARY.md
 
 # Share-image working tickets (local, not shipped)
 .scratch/
 
 # Per-order planning notes (super-marshal worktrees; not shipped)
 tasks/
+.dsh-tasks/
