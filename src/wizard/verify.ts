@@ -54,7 +54,7 @@ export interface VerificationManagerOptions {
 }
 
 export type VerificationStartResult =
-  | { ok: true; pairingCode: string; publicUrl: string; expiresAt: number; probeWarning?: unknown }
+  | { ok: true; pairingCode: string; desktopPairingCode?: string; publicUrl: string; expiresAt: number; probeWarning?: unknown }
   | {
     ok: false
     reason: 'no-public-url' | 'bad-public-url' | 'runtime-not-ready' | 'gateway-unreachable' | 'probe-failed' | 'pair-refused'
@@ -191,7 +191,7 @@ export function createVerificationManager(options: VerificationManagerOptions): 
       }
 
       const pair = await callGateway('POST', '/lan-gate/pair', { role: 'web' })
-      const pairBody = pair?.body as { ok?: unknown; code?: unknown; expiresAt?: unknown } | undefined
+      const pairBody = pair?.body as { ok?: unknown; code?: unknown; desktopCode?: unknown; expiresAt?: unknown } | undefined
       if (pair === null || pair.status < 200 || pair.status >= 300 || pairBody?.ok !== true || typeof pairBody.code !== 'string' || typeof pairBody.expiresAt !== 'number') {
         return { ok: false, reason: 'pair-refused', detail: pair === null ? null : pair.status }
       }
@@ -206,6 +206,7 @@ export function createVerificationManager(options: VerificationManagerOptions): 
       return {
         ok: true,
         pairingCode: session.code,
+        ...(typeof pairBody.desktopCode === 'string' && pairBody.desktopCode !== '' ? { desktopPairingCode: pairBody.desktopCode } : {}),
         publicUrl: session.publicUrl,
         expiresAt: session.expiresAt,
         ...(probeOk ? {} : { probeWarning: outcome }),
