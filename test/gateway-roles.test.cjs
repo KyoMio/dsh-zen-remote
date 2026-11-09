@@ -408,3 +408,25 @@ test('T13-fix-5: set-role for a nonexistent device returns 404 no-device', async
     assert.strictEqual(JSON.parse(r.body).reason, 'no-device')
   } finally { await stop() }
 })
+
+test('dual pairing codes: /lan-gate/pair mints both web code and desktopCode simultaneously, and both redeem on their respective channels', async () => {
+  const { stop } = await boot()
+  try {
+    const gen = await request(PORT, { method: 'POST', path: '/lan-gate/pair', body: { role: 'web' } })
+    const gj = JSON.parse(gen.body)
+    assert.strictEqual(gj.ok, true)
+    assert.ok(typeof gj.code === 'string' && gj.code.length === 8)
+    assert.ok(typeof gj.desktopCode === 'string' && gj.desktopCode.length === 8)
+    assert.notStrictEqual(gj.code, gj.desktopCode)
+
+    // Desktop client redeems `desktopCode` directly without invalidating `code`.
+    const desk = await request(PORT, { method: 'POST', path: '/lan-gate/pair/claim-desktop', headers: REMOTE_HEADERS, body: { code: gj.desktopCode, name: 'MacBook' } })
+    assert.strictEqual(desk.status, 200)
+    assert.strictEqual(JSON.parse(desk.body).ok, true)
+
+    // Phone browser still redeems `code`.
+    const web = await request(PORT, { method: 'POST', path: '/lan-gate/pair/claim', headers: REMOTE_HEADERS, body: { code: gj.code, name: 'iPhone' } })
+    assert.strictEqual(web.status, 200)
+    assert.ok(cookieFrom(web))
+  } finally { await stop() }
+})

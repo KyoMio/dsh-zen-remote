@@ -52,6 +52,7 @@ export interface VerificationManagerOptions {
 export type VerificationStartResult = {
     ok: true;
     pairingCode: string;
+    desktopPairingCode?: string;
     publicUrl: string;
     expiresAt: number;
     probeWarning?: unknown;

@@ -962,6 +962,7 @@ test('host ingress verify：LAN/Tailscale (http://) 本机自检 probe-failed �
           ? {
             ok: true,
             pairingCode: 'LAN88888',
+            desktopPairingCode: 'DESK9999',
             publicUrl: 'http://100.64.0.8:3088',
             expiresAt: Date.now() + 600_000,
             probeWarning: { kind: 'unreachable', reason: 'network' },
@@ -983,6 +984,8 @@ test('host ingress verify：LAN/Tailscale (http://) 本机自检 probe-failed �
     assert.match(text, /第 1 盏：本地网关就绪 —— 完成/u)
     assert.match(text, /已直接生成配对码/u)
     assert.match(text, /配对码：LAN88888/u)
+    assert.match(text, /桌面客户端配对码：DESK9999/u)
+    assert.match(text, /dsh-zen-remote client pair http:\/\/100\.64\.0\.8:3088 --code DESK9999/u)
   } finally {
     await stopHost({ home, handle })
   }

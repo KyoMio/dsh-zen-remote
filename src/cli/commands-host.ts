@@ -246,18 +246,7 @@ export async function runHostDevicePairCommand(ctx: CliExecutionContext): Promis
     fetchRecord(ctx, 'GET', ADMIN_STATUS_ROUTE),
   ])
   const url = publicUrlOf(wizard, admin)
-
-  if (args.options.json) {
-    out.write(`${JSON.stringify({
-      ok: true,
-      deviceRole,
-      code,
-      expiresAt,
-      role: deviceRole,
-      ...(url === '' ? {} : { url }),
-    }, null, 2)}\n`)
-    return 0
-  }
+  const desktopCode = typeof pairBody?.desktopCode === 'string' ? pairBody.desktopCode : ''
 
   out.write(`${t('host.device.pairTitle')}\n`)
   if (deviceRole === 'web') {
@@ -277,6 +266,12 @@ export async function runHostDevicePairCommand(ctx: CliExecutionContext): Promis
     out.write(`${t('host.device.noAddress')}\n`)
   }
   out.write(`${t('host.device.pairingCode', { code, minutes })}\n`)
+  if (deviceRole === 'web' && desktopCode !== '') {
+    out.write(`${t('setup.desktopPairingCode', { code: desktopCode })}\n`)
+    if (url !== '') {
+      out.write(`  ${t('setup.desktopPairingCmd', { url, code: desktopCode })}\n`)
+    }
+  }
   return 0
 }
 
@@ -1044,6 +1039,7 @@ export async function runHostIngressVerifyCommand(ctx: CliExecutionContext): Pro
       return 1
     }
     const code = typeof startBody.pairingCode === 'string' ? startBody.pairingCode : ''
+    const desktopCode = typeof startBody.desktopPairingCode === 'string' ? startBody.desktopPairingCode : ''
     const verifiedUrl = typeof startBody.publicUrl === 'string' && startBody.publicUrl !== '' ? startBody.publicUrl : publicUrl
 
     out.write(`${t('setup.verifyLight1', { state: t('common.done') })}\n`)
@@ -1058,7 +1054,15 @@ export async function runHostIngressVerifyCommand(ctx: CliExecutionContext): Pro
       if (qr !== null) out.write(`${qr}\n`)
       out.write(`  ${verifiedUrl}\n`)
     }
-    out.write(`\n${t('setup.divider')}\n  ${t('setup.pairingCode', { code })}\n${t('setup.divider')}\n`)
+    out.write(`\n${t('setup.divider')}\n`)
+    out.write(`  ${t('setup.pairingCode', { code })}\n`)
+    if (desktopCode !== '') {
+      out.write(`  ${t('setup.desktopPairingCode', { code: desktopCode })}\n`)
+      if (verifiedUrl !== '') {
+        out.write(`  ${t('setup.desktopPairingCmd', { url: verifiedUrl, code: desktopCode })}\n`)
+      }
+    }
+    out.write(`${t('setup.divider')}\n`)
 
     if (args.options.noWait) {
       out.write(`${t('host.ingress.verifySkipped')}\n`)
