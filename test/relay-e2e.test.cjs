@@ -1113,7 +1113,10 @@ class LocalTerminalGateway {
       open: (endpoint, payload, uplink, peer, signal) => this.openWireStream(endpoint, payload, uplink, peer, signal, { signal }),
     }
     this.rpcBridge = (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer)
-    this.wireTap = (endpoint, payload, uplink, peer, signal, control) => this.openWireStream(endpoint, payload, uplink, peer, control.signal, control)
+    // The 7th open argument (DSH 0.2.1-alpha.3+, named `window` in the real
+    // wire adapter's source) rides through, exactly like production.
+    this.wireTap = (endpoint, payload, uplink, peer, signal, control, window) =>
+      this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window)
   }
   operatorPeer() { return { id: 'operator-peer' } }
   async dispatchRpc(endpoint, payload, signal, peer) {
@@ -1192,6 +1195,145 @@ test('e2e T41a: terminal/create + terminal/follow work through the sub-client, a
     assert.ok(thrown instanceof Error && thrown.code === 'unshared', `expected unshared, got: ${thrown}`)
     assert.equal(thrown.isDSHRemoteError, true, 'the code survives the host wire because the error is marked')
     await waitFor(() => gate.aborted)
+    handle.uninstall()
+  } finally { await env.stop() }
+})
+
+// ---- TA-2: the terminal/attach duplex stream end to end ----------------------------
+
+/**
+ * TA-2: a stand-in for the host's UplinkInbox (DSH 0.2.2 TerminalInput): the
+ * test pushes write/resize commands in and the relay client's pump carries
+ * them to the server through `/v1/stream-uplink`. Records whether `return()`
+ * was called — the pump's teardown releases the host inbox when the stream
+ * dies, the interceptor must NOT have released it at open time.
+ */
+function createAttachUplink() {
+  const pending = []
+  let wake = () => {}
+  let finished = false
+  let returnCalled = false
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => {
+          while (pending.length === 0 && !finished) {
+            await new Promise((resolve) => { wake = resolve })
+          }
+          if (pending.length > 0) return { value: pending.shift(), done: false }
+          return { value: undefined, done: true }
+        },
+        return: async () => {
+          returnCalled = true
+          finished = true
+          wake()
+          return { value: undefined, done: true }
+        },
+      }
+    },
+    push: (frame) => { pending.push(frame); wake() },
+    get returnCalled() { return returnCalled },
+  }
+}
+
+test('e2e TA-2: terminal/create + terminal/attach duplex stream through the sub-client, unshare kills it with unshared', async () => {
+  const env = await boot({
+    shared: ['session-a'],
+    invoke: (call) => {
+      if (call.namespace === 'terminal' && call.method === 'create') {
+        return {
+          id: call.args.request.id,
+          title: 'zsh',
+          shell: { path: '/bin/zsh', args: [], name: 'zsh' },
+          cwd: '/srv',
+          cols: call.args.request.cols,
+          rows: call.args.request.rows,
+          state: 'running',
+          exitCode: null,
+        }
+      }
+      throw Object.assign(new Error(`no invoke fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' })
+    },
+  })
+  try {
+    const info = await env.client.connect()
+    const V = (id) => toVirtual(info.serverId, id)
+    const localGateway = new LocalTerminalGateway()
+    const handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    // The PTY is created SERVER-side (same as the follow test).
+    const created = await localGateway.rpcBridge('terminal/create', { args: { agentId: V('session-a'), request: { id: 'term-e2e', cols: 80, rows: 24 } } }, undefined, undefined)
+    assert.equal(created.ok, true)
+    await waitFor(() => env.invokeCalls.some((call) => call.namespace === 'terminal' && call.method === 'create'))
+
+    // The duplex attach: the host inbox and its mux window ride through the
+    // interceptor (virtual agentId restored) and the relay client's pump
+    // (`uplink: true` in the open body) to the relay server, which hands the
+    // gateway a bounded queue and answers the handshake line.
+    const uplink = createAttachUplink()
+    const uplinkWindow = { maxBytes: 8192, frameOverheadBytes: 32 }
+    const stream = await localGateway.wireTap('terminal/attach', { args: { agentId: V('session-a'), id: 'term-e2e', attachmentId: 'att-e2e' } }, uplink, undefined, undefined, { signal: undefined }, uplinkWindow)
+    const iterator = stream[Symbol.asyncIterator]()
+    const pending = iterator.next()
+    await waitFor(() => env.streams.some((gate) => gate.call.namespace === 'terminal' && gate.call.method === 'attach'))
+    const gate = env.streams.find((item) => item.call.namespace === 'terminal')
+    assert.deepEqual(gate.call.args, { agentId: 'session-a', id: 'term-e2e', attachmentId: 'att-e2e' }, 'the ORIGINAL session id reached the server')
+    assert.equal(typeof gate.call.uplink?.[Symbol.asyncIterator], 'function', 'the gateway got the bounded uplink queue')
+    assert.deepEqual(gate.call.uplinkWindow, uplinkWindow, 'the advertised window rode through verbatim')
+
+    // Consume the queue the way the host's attach implementation would.
+    const received = []
+    let consumeDone = false
+    const consume = (async () => {
+      for await (const item of gate.call.uplink) received.push(item)
+      consumeDone = true
+    })()
+
+    // Down: the opening snapshot survives the whole chain, window intact.
+    gate.push({ type: 'snapshot', sequence: 0, screen: '$ ', writable: true, inputWindow: uplinkWindow, info: { id: 'term-e2e', title: 'zsh', cols: 80, rows: 24, state: 'running', exitCode: null } })
+    const first = await pending
+    assert.equal(first.value.type, 'snapshot')
+    assert.equal(first.value.writable, true)
+    assert.deepEqual(first.value.inputWindow, uplinkWindow)
+
+    // Up: a write and a resize land on the server IN ORDER, through the
+    // single-flight batching pump.
+    uplink.push({ type: 'write', sequence: 1, data: 'pwd\n' })
+    uplink.push({ type: 'resize', sequence: 2, cols: 120, rows: 40 })
+    await waitFor(() => received.length >= 2)
+    assert.deepEqual(received, [
+      { type: 'write', sequence: 1, data: 'pwd\n' },
+      { type: 'resize', sequence: 2, cols: 120, rows: 40 },
+    ])
+
+    // Down: the server's answers ride back in order.
+    gate.push({ type: 'ack', sequence: 1 })
+    gate.push({ type: 'output', sequence: 1, data: '/srv\r\n' })
+    gate.push({ type: 'ack', sequence: 2 })
+    const answers = []
+    for (let i = 0; i < 3; i += 1) answers.push((await iterator.next()).value)
+    assert.deepEqual(answers, [
+      { type: 'ack', sequence: 1 },
+      { type: 'output', sequence: 1, data: '/srv\r\n' },
+      { type: 'ack', sequence: 2 },
+    ])
+
+    // Closing the session's remote access kills the attach with the SAME
+    // unshared end every session-scoped stream gets; the pump releases the
+    // host inbox and the server-side queue consumer finishes.
+    env.store.unshare('session-a', 'manual')
+    let thrown
+    try { await iterator.next() } catch (error) { thrown = error }
+    assert.ok(thrown instanceof Error && thrown.code === 'unshared', `expected unshared, got: ${thrown}`)
+    assert.equal(thrown.isDSHRemoteError, true, 'the code survives the host wire because the error is marked')
+    await waitFor(() => gate.aborted)
+    await waitFor(() => consumeDone)
+    await waitFor(() => uplink.returnCalled)
     handle.uninstall()
   } finally { await env.stop() }
 })

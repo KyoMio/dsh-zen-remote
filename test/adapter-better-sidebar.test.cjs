@@ -181,10 +181,12 @@ test('PB-15: the 0.26.0 additions carry the right dispositions; both versions no
   assert.deepEqual({ ...specOf('sidechat.models') }, { kind: 'read', local: true })
 
   // Both versions register: normalizeAdapter refuses an installed version
-  // outside `versions`, so each list entry must normalize clean.
+  // outside `versions`, so each list entry must normalize clean. 0.30.1 is
+  // the wire-identical patch of 0.30.0 (TA-2) — it lists under the same
+  // `394de9f588d37092` surface digest.
   const { adapter } = await loadAdapter()
-  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0'])
-  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0']) {
+  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0', '0.30.1'])
+  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0', '0.30.1']) {
     const core = await importLib('plugin-adapter-core.js')
     const adaptersMod = await importLib('adapters/index.js')
     const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')

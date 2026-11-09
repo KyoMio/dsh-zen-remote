@@ -34,7 +34,7 @@ for (const key of Object.keys(process.env)) {
 }
 
 const { checkGatewayShape } = require('../lib/intercept-shape.js')
-const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS, REMOTE_READ_METHODS, isRemoteWrite, rewriteRemoteEventFrame } = require('../lib/intercept.js')
+const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS, REMOTE_READ_METHODS, REMOTE_UPLINK_STREAM_METHODS, isRemoteWrite, rewriteRemoteEventFrame } = require('../lib/intercept.js')
 const { toVirtual, VIRTUAL_GROUP_NAME_MARK: MARK, encodeServerIdZeroWidth } = require('../lib/virtual-id.js')
 const { encodeSessionReferenceUri, decodeSessionReferenceUri } = require('../lib/relay-server.js')
 const { RelayError } = require('../lib/relay-client.js')
@@ -68,9 +68,13 @@ class FakeTypertGateway {
       open: (endpoint, payload, uplink, peer, signal) => this.openWireStream(endpoint, payload, uplink, peer, signal, { signal }),
     }
     // The /api bridge and the wire tap, exactly as the real constructor
-    // registers them — arrow functions over `this`.
+    // registers them — arrow functions over `this`. The wire tap forwards the
+    // mux's uplink window verbatim (DSH 0.2.1-alpha.3+, 7th argument, named
+    // `window` in the real source — checkGatewayShape pins the literal call
+    // site) the way the real wire adapter does.
     this.rpcBridge = (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer)
-    this.wireTap = (endpoint, payload, uplink, peer, signal, control) => this.openWireStream(endpoint, payload, uplink, peer, control.signal, control)
+    this.wireTap = (endpoint, payload, uplink, peer, signal, control, window) =>
+      this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window)
   }
   operatorPeer() { return { id: 'operator-peer' } }
   dispatchRpc(endpoint, payload, signal, peer) {
@@ -128,8 +132,11 @@ function createFakeRelay() {
       if (relay.invokeThrow) return Promise.reject(relay.invokeThrow)
       return Promise.resolve(relay.invokeValue)
     },
-    openStream(namespace, method, args, signal) {
-      relay.streams.push({ namespace, method, args, signal })
+    openStream(namespace, method, args, signal, options) {
+      // TA-2: the duplex stream options are recorded ONLY when present — the
+      // one-directional assertions below compare the whole record with
+      // deepEqual and must keep passing unchanged.
+      relay.streams.push({ namespace, method, args, signal, ...(options !== undefined ? { options } : {}) })
       return (async function* () {
         if (relay.streamThrow) throw relay.streamThrow
         for (const frame of relay.streamFrames) yield frame
@@ -225,9 +232,45 @@ function createGate(signal) {
   return {
     iterable,
     push: (frame) => { pending.push({ kind: 'frame', frame }); wake() },
-    finish: () => { finished = true; wake() },
+    finish: () => { pending.push({ kind: 'return' }); wake() },
     throwNow: (error) => { pending.push({ kind: 'throw', error }); wake() },
     get aborted() { return signal?.aborted === true },
+  }
+}
+
+/**
+ * TA-2: a stand-in for the host's UplinkInbox — an async iterable the test
+ * pushes terminal commands into. It records whether the iterator's `return()`
+ * was called, which is how releaseUplink half-closes a stream it decided not
+ * to forward: the duplex attach test asserts the call is ABSENT, the refusal
+ * tests assert it happened.
+ */
+function createFakeUplink() {
+  const pending = []
+  let wake = () => {}
+  let finished = false
+  let returnCalled = false
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => {
+          while (pending.length === 0 && !finished) {
+            await new Promise((resolve) => { wake = resolve })
+          }
+          if (pending.length > 0) return { value: pending.shift(), done: false }
+          return { value: undefined, done: true }
+        },
+        return: async () => {
+          returnCalled = true
+          finished = true
+          wake()
+          return { value: undefined, done: true }
+        },
+      }
+    },
+    push: (frame) => { pending.push(frame); wake() },
+    end: () => { finished = true; wake() },
+    get returnCalled() { return returnCalled },
   }
 }
 
@@ -4500,6 +4543,115 @@ test('workspaceFiles/changes forwards as a stream with the restored workspaceFil
   handle.uninstall()
 })
 
+// -- TA-2: the terminal/attach duplex stream (DSH 0.2.2+) ---------------------------
+// 0.2.2 merged terminal/follow + write + resize into one stream whose uplink
+// carries TerminalInput write/resize commands; the interceptor must hand the
+// host inbox and its mux window to the relay instead of half-closing it, and
+// must keep every refusal path half-closing it.
+
+test('TA-2: terminal/attach forwards the host uplink and window to the relay; the downlink frames pass through', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.streamFrames = [
+    { type: 'snapshot', sequence: 0, screen: '$ ', writable: true, inputWindow: { maxBytes: 4096, frameOverheadBytes: 16 }, info: { id: 'term-1', title: 'zsh', cols: 80, rows: 24, state: 'running', exitCode: null } },
+    { type: 'output', sequence: 1, data: '/srv\r\n' },
+    { type: 'state', sequence: 2, state: 'running' },
+    { type: 'ack', sequence: 1 },
+  ]
+  const { handle } = install(gateway, relay)
+  const uplink = createFakeUplink()
+  const uplinkWindow = { maxBytes: 4096, frameOverheadBytes: 16 }
+  const frames = []
+  for await (const frame of gateway.wireTap('terminal/attach', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-9' } }, uplink, undefined, undefined, { signal: undefined }, uplinkWindow)) {
+    frames.push(frame)
+  }
+  assert.deepEqual(frames, relay.streamFrames, 'snapshot/output/state/ack frames carry no session id — untouched')
+  assert.equal(relay.streams.length, 1)
+  assert.deepEqual(relay.streams[0].args, { agentId: LOCAL_ID, id: 'term-1', attachmentId: 'att-9' }, 'the virtual agentId was restored')
+  assert.equal(relay.streams[0].options.uplink, uplink, 'the HOST inbox itself rides to relay.openStream — not a half-close')
+  assert.deepEqual(relay.streams[0].options.uplinkWindow, uplinkWindow, 'the mux window rides through verbatim')
+  assert.equal(uplink.returnCalled, false, 'the duplex uplink was NOT half-closed by the interceptor')
+  handle.uninstall()
+})
+
+test('TA-2: the uplink window is shape-checked client-side too — garbage is dropped, an older host forwards the bare uplink', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const uplink = createFakeUplink()
+
+  // A zero budget is not a window: dropped, never refused (the numbers are
+  // the host's own contract with itself — the server re-checks the shape).
+  gateway.wireTap('terminal/attach', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-1' } }, uplink, undefined, undefined, { signal: undefined }, { maxBytes: 0, frameOverheadBytes: 8 })
+  assert.deepEqual(relay.streams[0].options, { uplink }, 'maxBytes: 0 dropped the window')
+
+  // Fractional bytes are equally not a window.
+  gateway.wireTap('terminal/attach', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-1' } }, uplink, undefined, undefined, { signal: undefined }, { maxBytes: 4096.5, frameOverheadBytes: -1 })
+  assert.deepEqual(relay.streams[1].options, { uplink }, 'fractional/negative values dropped the window')
+
+  // A non-object window (an older/malformed mux) is dropped the same way.
+  gateway.wireTap('terminal/attach', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-1' } }, uplink, undefined, undefined, { signal: undefined }, 'junk')
+  assert.deepEqual(relay.streams[2].options, { uplink }, 'a non-object window dropped')
+
+  // An older host (the 5-argument open path) passes no window at all: the
+  // bare uplink still forwards — the relay applies its own default window.
+  gateway.wireTap('terminal/attach', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-1' } }, uplink, undefined, undefined, { signal: undefined })
+  assert.deepEqual(relay.streams[3].options, { uplink }, 'no window in, no window out — the uplink still forwards')
+  handle.uninstall()
+})
+
+test('TA-2: terminal/attach opened offline refuses remote-offline at call time and releases the host uplink', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  relay.transition('offline')
+  const uplink = createFakeUplink()
+  assert.throws(
+    () => gateway.wireTap('terminal/attach', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-1' } }, uplink, undefined, undefined, { signal: undefined }),
+    (error) => error.code === 'remote-offline',
+  )
+  assert.deepEqual(relay.streams, [], 'nothing reached the relay')
+  assert.equal(uplink.returnCalled, true, 'the refused open half-closed the host inbox instead of leaking it')
+  assert.equal(handle.diagnostics().recentFailures.at(-1).endpoint, 'terminal/attach')
+  assert.equal(handle.diagnostics().recentFailures.at(-1).code, 'remote-offline')
+  handle.uninstall()
+})
+
+test('TA-2: terminal/attach aimed at a different server refuses remote-mismatch and releases the host uplink', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  const uplink = createFakeUplink()
+  const other = toVirtual('ffffffff', 'session-a')
+  assert.throws(
+    () => gateway.wireTap('terminal/attach', { args: { agentId: other, id: 'term-1', attachmentId: 'att-1' } }, uplink, undefined, undefined, { signal: undefined }),
+    (error) => error.code === 'remote-mismatch',
+  )
+  assert.deepEqual(relay.streams, [])
+  assert.equal(uplink.returnCalled, true, 'the validate refusal released the host inbox too')
+  handle.uninstall()
+})
+
+test('TA-2: terminal/attach ends with unshared when the server closes the session remote', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.streamThrow = new RelayError('unshared', 'shared session session-a was unshared (manual)')
+  const { handle } = install(gateway, relay)
+  const uplink = createFakeUplink()
+  let thrown
+  try {
+    for await (const frame of gateway.wireTap('terminal/attach', { args: { agentId: VIRTUAL_ID, id: 'term-1', attachmentId: 'att-1' } }, uplink, undefined, undefined, { signal: undefined })) {
+      void frame
+    }
+  } catch (error) {
+    thrown = error
+  }
+  assert.ok(thrown instanceof Error && thrown.code === 'unshared', `expected unshared, got: ${thrown}`)
+  assert.equal(thrown.isDSHRemoteError, true, 'the code survives the host wire because the error is marked')
+  assert.deepEqual(handle.diagnostics().closedSessions, [{ sessionId: VIRTUAL_ID, reason: 'manual' }], 'the closure registered like every session-scoped stream')
+  handle.uninstall()
+})
+
 // -- T41a-fix: session-reference discipline — mention virtualization, prompt-text
 // -- restore, local-reference refusal, and the shared dsh-session codec ---------------
 
@@ -4791,6 +4943,14 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
   // spot-check the read side (the full list lives in the source comment)
   for (const endpoint of ['session/page', 'session/attachment', 'session/list', 'fileReferences/list', 'job/list', 'workspace/follow']) {
     assert.equal(isRemoteWrite(endpoint), false, endpoint)
+  }
+  // TA-2: the duplex set names exactly the stream the host feeds an uplink
+  // into; every member must be a table entry and a WRITE (an uplink is input
+  // — offline it refuses rather than silently swallowing keystrokes).
+  assert.deepEqual([...REMOTE_UPLINK_STREAM_METHODS], ['terminal/attach'])
+  for (const endpoint of REMOTE_UPLINK_STREAM_METHODS) {
+    assert.ok(CLIENT_METHOD_FIELDS[endpoint] !== undefined, `${endpoint} is in the client table`)
+    assert.equal(isRemoteWrite(endpoint), true, endpoint)
   }
 })
 
