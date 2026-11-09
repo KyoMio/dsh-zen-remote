@@ -53,15 +53,19 @@ jobs:
       - uses: actions/setup-go@v7
         if: steps.check.outputs.should_build == 'true'
         with:
-          go-version: '1.24.x'
+          go-version: 'stable'
+          cache: false
 
       - name: Install xcaddy
         if: steps.check.outputs.should_build == 'true'
+        env:
+          GOTOOLCHAIN: auto
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
       - name: Cross-compile Caddy with caddy-dns/cloudflare
         if: steps.check.outputs.should_build == 'true'
         env:
+          GOTOOLCHAIN: auto
           CADDY_VER: ${{ steps.check.outputs.caddy_ver }}
           CF_DNS_VER: ${{ steps.check.outputs.cf_dns_ver }}
         run: |
