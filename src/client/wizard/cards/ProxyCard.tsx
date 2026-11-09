@@ -23,7 +23,8 @@ export interface ProxyCardProps {
 
 export function ProxyCard({ t, domain, upstreamPort, onCheck, onClose }: ProxyCardProps): ReactNode {
   const [tab, setTab] = useState<SnippetKind>('nginx')
-  const input = { domain, upstreamHost: '127.0.0.1', upstreamPort }
+  const lang: 'zh' | 'en' = t('wizard.card.close') === 'Close' ? 'en' : 'zh'
+  const input = { domain, upstreamHost: '127.0.0.1', upstreamPort, lang }
   const text = tab === 'nginx'
     ? nginxSnippetText(input)
     : tab === 'caddy' ? caddySnippetText(input) : (luckyStepTexts(input) ?? []).join('\n')

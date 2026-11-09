@@ -207,9 +207,13 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
       // because a forwarded request presents as same-origin (the gateway
       // rewrites Origin/Host); the marker is the identifying signal.
       if (req.headers['x-zen-remote-via'] !== undefined) {
+        const isEn = options.getConfig().values.lang === 'en'
         responseJson(res, 403, {
           ok: false,
-          error: { code: 'via-gateway', message: '配置引导只能在服务端本机操作' },
+          error: {
+            code: 'via-gateway',
+            message: isEn ? 'Setup wizard is only available on the server machine' : '配置引导只能在服务端本机操作',
+          },
         })
         return
       }
@@ -258,11 +262,14 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
         // env / row values SHADOW the file layer the persister writes: a
         // write there would silently do nothing. Refuse honestly instead.
         if (resolved.source === 'env' || resolved.source === 'row') {
+          const isEn = options.getConfig().values.lang === 'en'
           responseJson(res, 409, {
             ok: false,
             error: {
               code: 'proxy-list-shadowed',
-              message: `trustedProxies 目前由${resolved.source === 'env' ? '环境变量' : '插件行配置'}提供，请先清掉那边的值再自动信任`,
+              message: isEn
+                ? `trustedProxies is currently provided by ${resolved.source === 'env' ? 'environment variables' : 'plugin row config'} — clear that value first`
+                : `trustedProxies 目前由${resolved.source === 'env' ? '环境变量' : '插件行配置'}提供，请先清掉那边的值再自动信任`,
             },
           })
           return
@@ -277,9 +284,13 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
         // quick succession must not lose either IP.
         const landed = await trust.write(resolved.value, merged)
         if (landed === false) {
+          const isEn = options.getConfig().values.lang === 'en'
           responseJson(res, 409, {
             ok: false,
-            error: { code: 'trust-list-changed', message: '信任列表刚被其他操作修改，请刷新后重试' },
+            error: {
+              code: 'trust-list-changed',
+              message: isEn ? 'Trusted proxy list was just modified — refresh and retry' : '信任列表刚被其他操作修改，请刷新后重试',
+            },
           })
           return
         }
@@ -381,7 +392,14 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
             : values.ingressDomain
           const domain = hostOf(rawDomain)
           if (domain === undefined) {
-            responseJson(res, 400, { ok: false, error: { code: 'no-domain', message: '保存一个有效的公开域名后再启动' } })
+            const isEn = values.lang === 'en'
+            responseJson(res, 400, {
+              ok: false,
+              error: {
+                code: 'no-domain',
+                message: isEn ? 'Save a valid public domain before starting' : '保存一个有效的公开域名后再启动',
+              },
+            })
             return
           }
           const rawPort = typeof body?.httpsPort === 'number' && Number.isSafeInteger(body.httpsPort) && body.httpsPort >= 1 && body.httpsPort <= 65535

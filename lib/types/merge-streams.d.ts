@@ -158,6 +158,7 @@ export interface MergerIdentity {
  * English forms live in src/client/locales.ts, `remoteGroup*` keys).
  */
 export type MergerAnnotation = 'none' | 'offline' | 'revoked' | 'unpaired' | 'mismatch';
+export type MergerLang = 'zh' | 'en';
 export interface WorkspaceMergerOptions extends MergerIdentity {
     /** Diagnostics for frames this merger dropped (unknown type or malformed).
      * Optional: without it the drop is silent. */
@@ -165,6 +166,9 @@ export interface WorkspaceMergerOptions extends MergerIdentity {
     /** T65: the clock the tombstone hide-grace runs on. Default Date.now;
      * tests advance an injectable fake to cross the grace. */
     now?: () => number;
+    /** Language for status annotation suffixes on group titles (`'zh'` default,
+     * `'en'` English). Accepts a getter for live resolution. */
+    lang?: MergerLang | (() => MergerLang) | undefined;
     /** PB-25b: the known-real-session inventory report — every time the
      * session registry changes, the FULL current set of real ids this merger
      * knows (the sessionHome keys: live ids and tombstones alike, each one the

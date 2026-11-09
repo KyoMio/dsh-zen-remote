@@ -946,6 +946,21 @@ test('T34: revoked / unpaired / mismatch annotations each render their suffix', 
   const [frame] = m.onStatusChanged()
   assert.equal(frame.workspace.title, `${NAME} · 远端一（令牌已吊销）`)
   assert.ok(!frame.workspace.title.includes('（离线）'))
+
+  // English mode renders English status suffixes
+  const enMerger = createWorkspaceMerger({ serverId: SID, serverName: NAME, lang: 'en' })
+  enMerger.onLocal(LOCAL_BASELINE)
+  enMerger.onRemote(REMOTE_BASELINE)
+  for (const [annotation, suffix] of [
+    ['offline', ' (offline)'],
+    ['revoked', ' (token revoked)'],
+    ['unpaired', ' (unpaired)'],
+    ['mismatch', ' (version mismatch)'],
+  ]) {
+    enMerger.setStatus(annotation)
+    const [enFrame] = enMerger.onStatusChanged()
+    assert.equal(enFrame.workspace.title, `${NAME} · 远端一${suffix}`, `en:${annotation}`)
+  }
 })
 
 test('T34: onStatusChanged is silent before the local baseline and with no remote state', () => {

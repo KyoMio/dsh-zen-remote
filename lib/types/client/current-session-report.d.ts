@@ -18,6 +18,10 @@ export interface CurrentSessionReporterOptions {
     intervalMs?: number;
     /** The unconditional re-send window (T66); default 30000ms. */
     resendIntervalMs?: number;
+    /** Optional UI language reader (`'zh'` | `'en'`); when present (or when
+     * `<html lang>` is set in the browser), the value rides the POST body as
+     * `lang` so the backend merger can localize sidebar group suffixes. */
+    getLang?: () => 'zh' | 'en' | undefined;
 }
 /**
  * Start the reporter loop. Returns the disposer (listeners + interval) the

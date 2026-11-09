@@ -64,6 +64,10 @@ export interface CurrentSessionReporterOptions {
   intervalMs?: number
   /** The unconditional re-send window (T66); default 30000ms. */
   resendIntervalMs?: number
+  /** Optional UI language reader (`'zh'` | `'en'`); when present (or when
+   * `<html lang>` is set in the browser), the value rides the POST body as
+   * `lang` so the backend merger can localize sidebar group suffixes. */
+  getLang?: () => 'zh' | 'en' | undefined
 }
 
 /** One reportable value — `unavailable` never travels. */
@@ -83,9 +87,19 @@ export function startCurrentSessionReporter(options: CurrentSessionReporterOptio
       return undefined
     }
   }
-  const post = (report: ReportableReport): Promise<unknown> => {
+  const readLang = (): 'zh' | 'en' | undefined => {
+    if (options.getLang !== undefined) return options.getLang()
+    const doc = (globalThis as { document?: { documentElement?: { lang?: unknown } } }).document
+    const htmlLang = doc?.documentElement?.lang
+    if (typeof htmlLang === 'string' && htmlLang !== '') {
+      return htmlLang.toLowerCase().startsWith('zh') ? 'zh' : 'en'
+    }
+    return undefined
+  }
+  const post = (report: ReportableReport, lang: 'zh' | 'en' | undefined): Promise<unknown> => {
     const doFetch = options.fetchImpl ?? fetch
-    const body = report.kind === 'open' ? { sessionId: report.sessionId } : { sessionId: null }
+    const base = report.kind === 'open' ? { sessionId: report.sessionId } : { sessionId: null }
+    const body = lang !== undefined ? { ...base, lang } : base
     return doFetch(options.route ?? CURRENT_SESSION_ROUTE, {
       method: 'POST',
       headers: { 'content-type': 'application/json; charset=utf-8' },
@@ -100,6 +114,7 @@ export function startCurrentSessionReporter(options: CurrentSessionReporterOptio
   // T66: the timestamp of the last accepted post drives the slow unconditional
   // re-send (0 = due immediately, which is the page-load post).
   let lastReported: CurrentSessionReport | undefined
+  let lastReportedLang: 'zh' | 'en' | undefined
   let lastSentAt = 0
   const resendEveryMs = options.resendIntervalMs ?? RESEND_INTERVAL_MS
   let role: 'host' | 'client' | undefined
@@ -115,15 +130,24 @@ export function startCurrentSessionReporter(options: CurrentSessionReporterOptio
     if (role !== 'client') return
     const report = parseCurrentSessionStorage(readRaw())
     if (report.kind === 'unavailable') return
+    const lang = readLang()
     const now = Date.now()
     // T66: inside the re-send window an unchanged value says nothing; once
     // the window passes, the CURRENT value re-posts even unchanged — the
     // backend may have been reset underneath the page.
     const resendDue = now - lastSentAt >= resendEveryMs
-    if (!resendDue && lastReported !== undefined && currentSessionReportEquals(report, lastReported)) return
+    if (
+      !resendDue &&
+      lastReported !== undefined &&
+      currentSessionReportEquals(report, lastReported) &&
+      lang === lastReportedLang
+    ) {
+      return
+    }
     try {
-      await post(report)
+      await post(report, lang)
       lastReported = report
+      lastReportedLang = lang
       lastSentAt = now
     } catch {
       // Silent: the next tick sees the unchanged lastReported and retries.

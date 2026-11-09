@@ -387,6 +387,7 @@ export declare const zh: {
     readonly 'wizard.desktop.generate': "生成桌面客户端配对码";
     readonly 'wizard.desktop.regenerate': "重新生成配对码";
     readonly 'wizard.desktop.copyInfo': "复制地址与配对码";
+    readonly 'wizard.desktop.copiedText': "服务端地址：{address}\n桌面客户端配对码：{code}";
     readonly 'wizard.desktop.guide': "在另一台电脑打开本插件详情页，第 1 步选「作为桌面客户端」，第 2 步填入上方服务端地址与 8 位配对码即可完成连接。";
     readonly 'wizard.desktop.pairedTitle': "已连接的桌面客户端（{count}）";
     readonly 'wizard.desktop.pairedEmpty': "暂未配对桌面客户端";

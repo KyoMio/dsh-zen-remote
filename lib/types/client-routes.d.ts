@@ -169,7 +169,9 @@ export interface ClientHandlerOptions {
      * mount's remoteStatusOnly wall 404s the route before this matters, and
      * a client handler WITHOUT the sink answers the same 404 (no sink, no
      * route). */
-    onCurrentSession?: (read: CurrentSessionRead) => void;
+    onCurrentSession?: (read: CurrentSessionRead, reportedLang?: 'zh' | 'en') => void;
+    /** Language for route error messages (`'zh'` default, `'en'` English). */
+    lang?: 'zh' | 'en' | (() => 'zh' | 'en') | undefined;
     /** CU-3, the debug-report route's inputs — all optional; the route answers
      * its 404-shaped refusal without them (an unwired composition must not
      * pretend to have diagnostics). Wired on BOTH role mounts.
