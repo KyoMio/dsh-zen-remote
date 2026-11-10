@@ -1,0 +1,555 @@
+/* ============================================================
+   The Quiet Workbench — Zen Remote 网关控制台设计系统（PG-6a）
+   ------------------------------------------------------------
+   三条铁律：
+   1. The Single Lift Rule：只有下拉菜单（.menu）与模态框（.modal）
+      允许带 --shadow-menu；其余一律扁平 + 1px 细线分割。
+   2. The Dot Rule：状态只用 8px 实心圆点（.dot.ok/.warn/.danger）
+      配 13px 文字，绝不给徽章或单元格填满状态底色。
+   3. The One Tint Rule：同一屏最多一个概览格带底色
+      （有加入申请 → --warn-tint；身份异常 → --danger-tint）。
+   ============================================================ */
+
+/* ---------- 设计令牌（色板零偏差） ---------- */
+
+:root,
+html[data-theme='light'] {
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+
+  --ink: #1b2028;
+  --ink-2: #4d5664;
+  --ink-3: #636c79;
+
+  --line: #e3e6eb;
+  --line-strong: #c9ced6;
+
+  --accent: #2f55c6;
+  --accent-solid: #2f55c6;
+  --accent-solid-hover: #2747a8;
+  --accent-tint: #edf1fc;
+
+  --ok: #2e8a57;
+  --warn: #b4761a;
+  --warn-tint: #fbf5e8;
+  --danger: #c23b3b;
+  --danger-tint: #fbeeed;
+
+  --shadow-menu: 0 8px 24px rgba(15, 20, 30, 0.12);
+}
+
+html[data-theme='dark'] {
+  --bg: #121418;
+  --surface: #181b20;
+  --surface-2: #1f232a;
+
+  --ink: #e7eaee;
+  --ink-2: #b3bac4;
+  --ink-3: #8d95a1;
+
+  --line: #2a2f37;
+  --line-strong: #3a404a;
+
+  --accent: #8fa9f2;
+  --accent-solid: #3a60d0;
+  --accent-solid-hover: #4a6fdc;
+  --accent-tint: #1e2840;
+
+  --ok: #4fb37c;
+  --warn: #d9a14a;
+  --warn-tint: #2a2416;
+  --danger: #e06666;
+  --danger-tint: #2e1c1c;
+
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+/* ---------- 基底 ---------- */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* 数据等宽：设备数、速率、字节数 */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- The Dot Rule ---------- */
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.dot.ok {
+  background: var(--ok);
+}
+
+.dot.warn {
+  background: var(--warn);
+}
+
+.dot.danger {
+  background: var(--danger);
+}
+
+.dot-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+/* ---------- The One Tint Rule（同一屏最多用一处） ---------- */
+
+.tint-warn {
+  background: var(--warn-tint);
+}
+
+.tint-danger {
+  background: var(--danger-tint);
+}
+
+/* ---------- 顶栏（56px sticky） ---------- */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: var(--accent-solid);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  flex: none;
+}
+
+.brand-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.topbar-divider {
+  width: 1px;
+  height: 24px;
+  background: var(--line);
+  flex: none;
+}
+
+.topbar-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  margin: 0;
+}
+
+.topbar-spacer {
+  flex: 1;
+}
+
+/* ---------- 网络切换器（自定义下拉，唯一允许带投影的部件之一） ---------- */
+
+.switcher-wrap {
+  position: relative;
+  min-width: 0;
+}
+
+.net-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  max-width: 280px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.net-switcher:hover {
+  background: var(--surface-2);
+}
+
+.net-switcher-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.net-switcher-count {
+  color: var(--ink-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.chevron {
+  color: var(--ink-3);
+  font-size: 10px;
+  flex: none;
+}
+
+/* ---------- 下拉菜单 / 模态框（Single Lift Rule 的全部受益者） ---------- */
+
+.menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  min-width: 220px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: var(--shadow-menu);
+  z-index: 100;
+}
+
+.menu-switcher {
+  left: 0;
+}
+
+.menu-account {
+  right: 0;
+  width: 232px;
+  min-width: 232px;
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.menu-item:hover {
+  background: var(--surface-2);
+}
+
+.menu-check {
+  width: 16px;
+  flex: none;
+  color: var(--accent);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.menu-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menu-item-count {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+.menu-item-label {
+  flex: 1;
+}
+
+.menu-item-state {
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+.menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
+}
+
+.account-identity {
+  padding: 8px 10px;
+}
+
+.account-email {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-role {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+/* ---------- 账号按钮（顶栏右侧唯一控件） ---------- */
+
+.account-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.account-button:hover {
+  background: var(--surface-2);
+}
+
+.account-button .account-email {
+  font-weight: 400;
+  font-size: 13px;
+  max-width: 200px;
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--accent-tint);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  flex: none;
+}
+
+/* ---------- 按钮（扁平，4px 圆角） ---------- */
+
+.btn {
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.btn:hover {
+  background: var(--surface-2);
+}
+
+.btn.primary {
+  background: var(--accent-solid);
+  border-color: var(--accent-solid);
+  color: #fff;
+}
+
+.btn.primary:hover {
+  background: var(--accent-solid-hover);
+}
+
+.btn.block {
+  width: 100%;
+  height: 36px;
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* ---------- 输入框 ---------- */
+
+.field {
+  margin-bottom: 14px;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.input {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.input::placeholder {
+  color: var(--ink-3);
+}
+
+.input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* ---------- 登录注册页（居中卡片，扁平） ---------- */
+
+.login-view {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.login-card {
+  width: 320px;
+  padding: 28px 24px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.login-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.login-brand .brand-mark {
+  width: 28px;
+  height: 28px;
+}
+
+.login-brand-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.tabs {
+  display: flex;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.tab {
+  flex: 1;
+  padding: 8px 0;
+  margin-bottom: -1px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--ink-3);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.tab[aria-selected='true'] {
+  color: var(--ink);
+  font-weight: 600;
+  border-bottom-color: var(--accent-solid);
+}
+
+.login-hint {
+  margin: 0 0 14px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.form-error {
+  margin: 12px 0 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+/* ---------- 应用壳与内容区 ---------- */
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-content {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+
+.page-title {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.boot-splash {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+}

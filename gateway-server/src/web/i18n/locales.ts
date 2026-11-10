@@ -1,0 +1,157 @@
+// 控制台中英双语词典（PG-6a）。纯数据 + 纯函数，零 DOM 依赖：
+// 后端 tsc 把它编译进 dist/web/（测试直接 import），浏览器半边经 tsconfig.web.json
+// 类型检查，两边共享同一份实现。
+//
+// 「说人话」规范：zh 词条是界面文案的唯一事实来源。概览首屏严禁出现
+// LAN / P2P / RELAY / NAT / TOFU / E2EE / Ed25519 / joinKey 等技术缩写，
+// 对应的白话词条见 path.* / identity.*（如 path.lan = 局域网直连）。
+// test/web-store.test.mjs 钉住 zh/en 键 100% 对称与黑话扫描。
+
+export type Locale = 'zh' | 'en';
+
+export type LocaleKey = keyof typeof ZH;
+
+export type TranslateVars = Record<string, string | number>;
+
+/** 组件持有的已绑定语言的取词函数 */
+export type TranslateFn = (key: LocaleKey, vars?: TranslateVars) => string;
+
+/** localStorage 里持久化语言选择的键 */
+export const LOCALE_STORAGE_KEY = 'zen-remote-console.locale';
+
+export const ZH = {
+  'app.title': 'Zen Remote 网关',
+  'app.loading': '加载中…',
+  'view.networks': '网络管理',
+  'view.admin': '网关管理',
+
+  'nav.networks': '网络',
+
+  'network.name': '名称',
+  'network.devices': '设备',
+  'network.deviceLimit': '设备上限',
+  'network.inviteLink': '邀请链接',
+  'network.rotateInviteLink': '重置邀请链接',
+  'network.joinRequests': '加入申请',
+  'network.createNew': '新建网络…',
+
+  'summary.onlineDevices': '在线设备',
+
+  'identity.verified': '身份已验证',
+  'identity.mismatch': '身份异常 / 身份变了',
+
+  'path.lan': '局域网直连',
+  'path.direct': '直连',
+  'path.relay': '经网关中转',
+
+  'status.online': '在线',
+  'status.offline': '离线',
+  'status.pending': '待审批',
+
+  'admin.allowSignup': '开放注册',
+  'admin.perDeviceRelayLimit': '单台设备中转限速',
+
+  'auth.login': '登录',
+  'auth.signup': '注册',
+  'auth.email': '邮箱',
+  'auth.emailPlaceholder': 'you@example.com',
+  'auth.password': '密码',
+  'auth.signupQuotaHint': '注册后最多可以创建 {n} 个网络',
+
+  'account.role.admin': '管理员',
+  'account.role.user': '普通用户',
+  'account.logout': '退出登录',
+  'account.darkMode': '深色模式',
+  'account.on': '开',
+  'account.off': '关',
+  'account.language': 'English / 中文',
+
+  'error.invalidCredentials': '邮箱或密码不对',
+  'error.accountDisabled': '该账号已被停用',
+  'error.signupDisabled': '这个网关没有开放注册',
+  'error.emailTaken': '这个邮箱已经注册过了',
+  'error.generic': '出了点问题，请稍后重试',
+  'error.network': '连不上网关，请稍后再试',
+} as const;
+
+export const EN: Record<LocaleKey, string> = {
+  'app.title': 'Zen Remote Gateway',
+  'app.loading': 'Loading…',
+  'view.networks': 'Networks',
+  'view.admin': 'Gateway admin',
+
+  'nav.networks': 'Networks',
+
+  'network.name': 'Name',
+  'network.devices': 'Devices',
+  'network.deviceLimit': 'Device limit',
+  'network.inviteLink': 'Invite link',
+  'network.rotateInviteLink': 'Reset invite link',
+  'network.joinRequests': 'Join requests',
+  'network.createNew': 'New network…',
+
+  'summary.onlineDevices': 'Online devices',
+
+  'identity.verified': 'Identity verified',
+  'identity.mismatch': 'Identity changed',
+
+  'path.lan': 'Direct on local network',
+  'path.direct': 'Direct connection',
+  'path.relay': 'Relayed through gateway',
+
+  'status.online': 'Online',
+  'status.offline': 'Offline',
+  'status.pending': 'Pending',
+
+  'admin.allowSignup': 'Open signup',
+  'admin.perDeviceRelayLimit': 'Per-device relay speed limit',
+
+  'auth.login': 'Sign in',
+  'auth.signup': 'Sign up',
+  'auth.email': 'Email',
+  'auth.emailPlaceholder': 'you@example.com',
+  'auth.password': 'Password',
+  'auth.signupQuotaHint': 'After signing up you can create up to {n} networks',
+
+  'account.role.admin': 'Administrator',
+  'account.role.user': 'Member',
+  'account.logout': 'Sign out',
+  'account.darkMode': 'Dark mode',
+  'account.on': 'On',
+  'account.off': 'Off',
+  'account.language': 'English / 中文',
+
+  'error.invalidCredentials': 'Wrong email or password',
+  'error.accountDisabled': 'This account has been disabled',
+  'error.signupDisabled': 'Signup is disabled on this gateway',
+  'error.emailTaken': 'That email is already registered',
+  'error.generic': 'Something went wrong, please retry',
+  'error.network': 'Cannot reach the gateway, please retry',
+};
+
+export const LOCALES: Record<Locale, Record<LocaleKey, string>> = { zh: ZH, en: EN };
+
+/** 语言标签 → 界面语言：zh* 归 zh，en* 归 en，其余回落 zh */
+export function pickLocale(languageTag: string): Locale {
+  const tag = languageTag.toLowerCase();
+  if (tag.startsWith('zh')) return 'zh';
+  if (tag.startsWith('en')) return 'en';
+  return 'zh';
+}
+
+/** 持久化选择优先；未设置或值无效时按浏览器语言识别 */
+export function resolveLocale(stored: unknown, navigatorLanguage: string): Locale {
+  if (stored === 'zh' || stored === 'en') return stored;
+  return pickLocale(navigatorLanguage);
+}
+
+/** 取词条并做 {name} 插值；键不存在直接抛错（TS 类型已挡住绝大多数拼写错误） */
+export function translate(locale: Locale, key: LocaleKey, vars?: TranslateVars): string {
+  const raw = (LOCALES[locale] as Record<string, string | undefined>)[key];
+  if (raw === undefined) throw new Error(`missing translation key: ${String(key)}`);
+  if (vars === undefined) return raw;
+  return raw.replace(/\{(\w+)\}/g, (match, name: string) => {
+    const value = vars[name];
+    return value === undefined ? match : String(value);
+  });
+}
