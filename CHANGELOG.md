@@ -5,6 +5,12 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 新增
+
+- **可配置多服务端配对上限 `maxServers`**：子客户端的配对上限（默认 8 台）现可在设置里调整（整数 1–64），环境变量 `LAN_GATE_MAX_SERVERS` 亦可覆盖；改动即时生效，无需重载插件行。
+
 ## 2.4.1（2026-11-09）
 
 ### 修复

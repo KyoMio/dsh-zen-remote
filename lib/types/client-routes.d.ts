@@ -186,6 +186,16 @@ export interface ClientHandlerOptions {
     getProfileName?: () => string | undefined;
     /** This package's own version, read at module load in src/index.ts. */
     getPluginVersion?: () => string;
+    /** PG-2: the live pairing cap (`resolveConfig`'s `maxServers`), read PER
+     * REQUEST — the field is volatile and deliberately not a restart field, so
+     * a change reaches the next request without any reload. POOL-mode mounts
+     * do NOT read this for the cap (PG-2-fix): status and the claim pre-check
+     * follow {@link effectiveMaxServers}, i.e. `pool.maxServers()` — the one
+     * synthesis that folds the peer mode's network cap in, matching what
+     * `pool.pair()` enforces. This getter answers only as the fallback for a
+     * mount without a pool, or a pool predating the getter (test stubs).
+     * Missing answers the historic constant 8. */
+    getMaxServers?: () => number;
 }
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 /**

@@ -74,6 +74,14 @@ export interface ZenRemoteConfig {
      * without new activity the remote connection closes on its own; running or
      * waiting sessions never count. (0, 8760]. */
     idleHours: number;
+    /** How many relay servers one sub-client may keep paired at once
+     * (PG-2): integer [1, 64], default 8. Like idleHours this is a LIVE
+     * field — the relay pool and the client routes read it per request, so a
+     * change applies without reloading the row; deliberately NOT in
+     * RESTART_FIELDS. In peer mode a network-reported
+     * `maxPeersFromGateway` may lower the effective value further (see the
+     * relay pool's `maxServers()`). */
+    maxServers: number;
     /** Auto-share every newly created session to the paired phone (T16). */
     autoShareNewSessions: boolean;
     /** Per-plugin consent for bridging whole-machine data (plugin bridge,
@@ -211,6 +219,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     pushSessionName: z<any, any, "volatile">;
     serverName: z<any, any, "volatile">;
     idleHours: z<any, any, "volatile">;
+    maxServers: z<any, any, "volatile">;
     autoShareNewSessions: z<any, any, "volatile">;
     pluginBridgeConsent: z<any, any, "volatile">;
     ingressMode: z<any, any, "volatile">;
@@ -243,6 +252,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     pushSessionName: z<any, any, "volatile">;
     serverName: z<any, any, "volatile">;
     idleHours: z<any, any, "volatile">;
+    maxServers: z<any, any, "volatile">;
     autoShareNewSessions: z<any, any, "volatile">;
     pluginBridgeConsent: z<any, any, "volatile">;
     ingressMode: z<any, any, "volatile">;

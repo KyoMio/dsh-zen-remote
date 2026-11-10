@@ -161,6 +161,48 @@ assert.equal(
   'N3: a long home path folds to ~/… and keeps its tail',
 )
 
+// ---- 6f. PG-2: the peer invite URIs (zr-net://) are first-class secrets ------
+// The invite carries the gateway address AND the join key; both must die.
+const INVITE_HOST = 'gw.secret.example'
+const INVITE_JOIN_KEY = 'my-secret-join-key'
+const INVITE_NET_ID = '9f4e2a1088c3b001'
+const PG2_PRIVATE_KEY_HEX = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
+const invite = redactText(`invite zr-net://${INVITE_HOST}:19393/${INVITE_NET_ID}#${INVITE_JOIN_KEY} shared`, {})
+assert.equal(invite, `invite zr-net://domain:19393/${INVITE_NET_ID}#<token> shared`, 'the invite keeps its shape: scheme, port and network id; host and join key die')
+for (const leak of [INVITE_HOST, INVITE_JOIN_KEY, 'secret.example']) {
+  assert.ok(!invite.includes(leak), `zr-net: "${leak}" is not recoverable`)
+}
+// zr-nets:// (TLS-forced) and zr-net+insecure:// (plaintext, local tests) get
+// the same treatment, each keeping its own scheme.
+assert.equal(
+  redactText(`pairing zr-nets://${INVITE_HOST}/${INVITE_NET_ID}#${INVITE_JOIN_KEY} ok`, {}),
+  `pairing zr-nets://domain/${INVITE_NET_ID}#<token> ok`,
+  'zr-nets:// degrades the same way (scheme default port omitted)',
+)
+assert.equal(
+  redactText(`scan zr-net+insecure://192.168.1.10:19393/${INVITE_NET_ID}#${INVITE_JOIN_KEY} ok`, {}),
+  `scan zr-net+insecure://lan-ip:19393/${INVITE_NET_ID}#<token> ok`,
+  'zr-net+insecure:// degrades to the address class like ws://',
+)
+// The fragment folds UNCONDITIONALLY — a join key shorter than the 32-char
+// token-run threshold is still a credential.
+assert.equal(
+  redactText(`zr-net://${INVITE_HOST}/${INVITE_NET_ID}#abc123`, {}),
+  `zr-net://domain/${INVITE_NET_ID}#<token>`,
+  'a short join key folds too; the fragment is a credential by definition',
+)
+// An invite WITHOUT a fragment keeps its degraded host and its network id.
+assert.equal(
+  redactText(`trailing zr-nets://${INVITE_HOST}/${INVITE_NET_ID}.`, {}),
+  `trailing zr-nets://domain/${INVITE_NET_ID}.`,
+  'a fragmentless invite keeps only scheme+class+network id (trailing punctuation peeled)',
+)
+// A 64-hex Ed25519 private seed in free text dies as a token run.
+const keyLine = redactText(`node identity privateKeyHex=${PG2_PRIVATE_KEY_HEX} leaked`, {})
+assert.ok(!keyLine.includes(PG2_PRIVATE_KEY_HEX), 'the private seed is not recoverable')
+assert.ok(keyLine.includes('<token>'))
+
 // ---- 6c. S1: base64url runs (a JWT) die whole --------------------------------
 const JWT_PAYLOAD = 'eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ'
 const JWT_SIG = 'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'
@@ -313,5 +355,32 @@ const input = { configSummary: { deviceToken: TOKEN_64 }, statusBody: { lastErro
 assembleDebugReport({ meta: { generatedAt: 'g', pluginVersion: 'v', dshVersion: 'd', platform: 'p', role: 'host' }, ...input, home: '/' })
 assert.equal(input.configSummary.deviceToken, TOKEN_64, 'input config untouched')
 assert.equal(input.statusBody.lastError, '/opt/x.bin', 'input status untouched')
+
+// ---- 11. PG-2: a report poisoned with a peer identity and an invite URI ------
+// The state file holds a private seed and the invite link; a debug report
+// must carry NEITHER, wherever in the plates they surface.
+const pg2Report = assembleDebugReport({
+  meta: { generatedAt: '2026-11-10T00:00:00.000Z', pluginVersion: '2.4.1', dshVersion: '0.2.1', platform: 'darwin arm64', role: 'peer' },
+  configSummary: { role: 'peer', maxServers: 16 },
+  statusBody: {
+    state: 'online',
+    lastError: `join failed for zr-net://${INVITE_HOST}:19393/${INVITE_NET_ID}#${INVITE_JOIN_KEY}`,
+  },
+  logs: [
+    { t: '2026-11-10T00:00:00.000Z', level: 'warn', msg: `identity materialized privateKeyHex=${PG2_PRIVATE_KEY_HEX}` },
+    { t: '2026-11-10T00:00:01.000Z', level: 'info', msg: `peer network invite zr-nets://${INVITE_HOST}/${INVITE_NET_ID}#${INVITE_JOIN_KEY}` },
+  ],
+  home: HOME_UNIX,
+})
+const pg2Serialized = JSON.stringify(pg2Report)
+assert.deepEqual(JSON.parse(pg2Serialized), pg2Report, 'the PG-2 report survives a JSON round-trip')
+for (const poison of [PG2_PRIVATE_KEY_HEX, INVITE_HOST, INVITE_JOIN_KEY, 'secret.example', `zr-net://${INVITE_HOST}`, `#${INVITE_JOIN_KEY}`]) {
+  assert.ok(!pg2Serialized.includes(poison), `PG-2 poisoned input "${poison.slice(0, 24)}…" is not recoverable from the report`)
+}
+assert.equal(pg2Report.config.maxServers, 16, 'maxServers is a number, it rides the config plate')
+assert.ok(String(pg2Report.status.lastError).includes('zr-net://domain:19393'), 'the status lastError keeps the degraded invite shape')
+assert.ok(String(pg2Report.status.lastError).includes('#<token>'), 'the join key became #<token>')
+assert.ok(String(pg2Report.logs[0].msg).includes('<token>'), 'the log-line private seed died')
+assert.ok(String(pg2Report.logs[1].msg).includes('zr-nets://domain'), 'the log-line invite degrades')
 
 console.log('check-debug-report: all assertions passed')

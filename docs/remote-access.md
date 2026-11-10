@@ -292,6 +292,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `LAN_GATE_TRUSTED_PROXIES` | 空 | 逗号分隔的 IP 列表。反代和网关不在同一台机器（回环地址）时，把反代的出口 IP 填进来，网关才会信任它带来的 `X-Forwarded-For`/`X-Forwarded-Proto` |
 | `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | Web Push 的 VAPID 联系人字段。**务必改成真实邮箱或 https 网址**：Apple 会用 `403 BadJwtToken` 拒绝占位符，导致 iOS 设备静默收不到推送（Google/Mozilla 不校验）。填错时启动日志有告警 |
 | `LAN_GATE_LANG` | `auto` | 网关自己那几个页面（配对页、限流页、管理页）和注入到应用里的推送开关卡片用什么语言。`auto` 按请求的 `Accept-Language` 决定——配对访客唯一会主动交出的语言信号；没有这个头就用中文。`zh`/`en` 写死，不再看浏览器 |
+| `LAN_GATE_MAX_SERVERS` | `8` | 子客户端（`client`/`peer` 角色）最多同时配对几台服务端；整数 `1..64`。现场读取：改了不用重载插件行，下一次配对/状态查询就生效。peer 模式下网络下发的 `maxPeersFromGateway`：此变量未设置时直接以其为准，设置过则取两者中较小的 |
 | `LAN_GATE_RELAY_SECRET` | （自动生成） | 中继共享密钥，2.0 起桌面应用端的请求靠它向 DSH 的中继路由自证「标记头是网关写的」。**由插件在每次加载主入口时现生成**（32 字节随机数经环境变量交给网关子进程，无条件覆盖），**不可由外部指定**——宿主环境里手工设置的值会在子进程启动时被覆盖或删除；插件没带（client 角色、旧式独立加载）时密钥功能关闭，网关对空密钥不加头 |
 | `DSH_PUSH_LANG` | `zh` | 推送通知本身的文案语言（等授权 / 等回答 / 回合完成）。2.0 起它只是对设置里 `lang` 的环境变量覆盖；都不设时中文。这里**不做自动探测**：通知是宿主进程生成的，既没有请求头，`launchd` 也不给它 `LANG`（中文用户的机器上 `Intl` 照样报 `en-US`）。要英文就显式设 `en` |
 

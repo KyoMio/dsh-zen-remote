@@ -225,6 +225,16 @@ export interface ClientHandlerOptions {
   getProfileName?: () => string | undefined
   /** This package's own version, read at module load in src/index.ts. */
   getPluginVersion?: () => string
+  /** PG-2: the live pairing cap (`resolveConfig`'s `maxServers`), read PER
+   * REQUEST — the field is volatile and deliberately not a restart field, so
+   * a change reaches the next request without any reload. POOL-mode mounts
+   * do NOT read this for the cap (PG-2-fix): status and the claim pre-check
+   * follow {@link effectiveMaxServers}, i.e. `pool.maxServers()` — the one
+   * synthesis that folds the peer mode's network cap in, matching what
+   * `pool.pair()` enforces. This getter answers only as the fallback for a
+   * mount without a pool, or a pool predating the getter (test stubs).
+   * Missing answers the historic constant 8. */
+  getMaxServers?: () => number
 }
 
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -517,11 +527,28 @@ function poolServerStatus(entry: RelayPoolEntryView, options: ClientHandlerOptio
 }
 
 /**
+ * The EFFECTIVE pairing cap for a pool-mode mount (PG-2-fix): the pool's own
+ * `maxServers()` is the one synthesis point that folds the peer mode's
+ * network-reported `maxPeersFromGateway` into the configured value, and
+ * `pool.pair()` enforces exactly that number — so the status body and the
+ * claim pre-check must read the SAME source, not the raw config value (two
+ * truths would let the pre-check admit what pair refuses, or the reverse).
+ * The live config getter (then the historic constant) answers only when
+ * there is no pool, or the pool predates the getter (test stubs).
+ */
+function effectiveMaxServers(pool: RelayPool | undefined, options: ClientHandlerOptions): number {
+  if (pool !== undefined && typeof pool.maxServers === 'function') return pool.maxServers()
+  return options.getMaxServers?.() ?? MAX_PAIRED_SERVERS
+}
+
+/**
  * The POOL status body (MS-5): the paired list is the truth — the row's
  * serverUrl/deviceToken are never consulted. The top level keeps the FIRST
  * entry's compatibility fields (the old single-server page keeps rendering)
- * and every entry reports as one `servers` row; `maxServers` names the cap.
- * An empty pool answers `unpaired` — the honest "nothing paired".
+ * and every entry reports as one `servers` row; `maxServers` names the
+ * EFFECTIVE cap — the pool's own synthesis (PG-2-fix), the same number
+ * `pool.pair()` enforces. An empty pool answers `unpaired` — the honest
+ * "nothing paired".
  */
 async function poolStatusBodyOf(options: ClientHandlerOptions): Promise<Record<string, unknown>> {
   const pool = options.pool as RelayPool
@@ -532,8 +559,9 @@ async function poolStatusBodyOf(options: ClientHandlerOptions): Promise<Record<s
     : []
   const withDiagnostics = diagnosticsDecorator(options, first?.client, bridgeOverride)
   const servers = entries.map((entry) => poolServerStatus(entry, options))
+  const maxServers = effectiveMaxServers(pool, options)
   if (first === undefined) {
-    return withDiagnostics({ state: 'unpaired', maxServers: MAX_PAIRED_SERVERS, servers })
+    return withDiagnostics({ state: 'unpaired', maxServers, servers })
   }
   const body = deviceStatusBody(
     first.client.state,
@@ -543,7 +571,7 @@ async function poolStatusBodyOf(options: ClientHandlerOptions): Promise<Record<s
   )
   if (first.client.nextRetryAt !== null && first.client.nextRetryAt !== undefined) body.nextRetryAt = first.client.nextRetryAt
   if (first.client.lastError !== undefined) body.lastError = first.client.lastError
-  return withDiagnostics({ ...body, maxServers: MAX_PAIRED_SERVERS, servers })
+  return withDiagnostics({ ...body, maxServers, servers })
 }
 
 /**
@@ -691,19 +719,23 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           responseJson(res, 400, { ok: false, code: normalized.reason })
           return
         }
-        // MS-5 pool mode: the 8-server cap is judged BEFORE the pairing
-        // round-trip — a refusal the user can fix locally (remove a server,
-        // or re-enter an already-paired address) must not spend a claim code
-        // on the wire. An address that is ALREADY paired is always allowed
-        // through: re-pairing it just refreshes the token in place, at 8/8
-        // too. The pool stays the single writer afterwards: the gateway's
+        // MS-5 pool mode: the pairing cap is judged BEFORE the round-trip —
+        // a refusal the user can fix locally (remove a server, or re-enter
+        // an already-paired address) must not spend a claim code on the
+        // wire. The cap is the POOL's effective cap ({@link
+        // effectiveMaxServers}, PG-2-fix): the same `pool.maxServers()`
+        // synthesis — gateway cap folded in — that `pool.pair()` enforces,
+        // so the pre-check can never disagree with the actual pairing. An
+        // address that is ALREADY paired is always allowed through:
+        // re-pairing it just refreshes the token in place, at the cap too.
+        // The pool stays the single writer afterwards: the gateway's
         // token goes straight into `zen-remote-state.json` and NEVER reaches
         // the browser — this response carries only the entry id and the
         // address echo.
         const pool = options.pool
         if (pool !== undefined) {
           const known = pool.entries().some((entry) => entry.serverUrl === normalized.url)
-          if (!known && pool.entries().length >= MAX_PAIRED_SERVERS) {
+          if (!known && pool.entries().length >= effectiveMaxServers(pool, options)) {
             responseJson(res, 409, { ok: false, code: 'limit-reached' })
             return
           }
@@ -855,6 +887,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
             host: values.host,
             port: values.port,
             idleHours: values.idleHours,
+            maxServers: values.maxServers,
             maxUploadBytes,
             autoShareNewSessions: values.autoShareNewSessions,
             pluginBridgeConsent: values.pluginBridgeConsent,

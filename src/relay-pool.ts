@@ -27,6 +27,7 @@
  * the tests drive the whole lifecycle without a socket.
  */
 
+import type { ConfigSource } from './config.js'
 import { createRelayClient } from './relay-client.js'
 import type { RelayClient, RelayClock, RelayState, CreateRelayClientOptions } from './relay-client.js'
 import type { PairedServerRecord } from './state-store.js'
@@ -119,6 +120,21 @@ export interface RelayPoolOptions {
   onStateChange?: (event: { entryId: string; serverId?: string; state: RelayState; lastError?: string }) => void
   /** Every entry removal, with why it left. */
   onServerRemoved?: (removed: { entryId: string; serverId?: string; reason: RelayPoolRemovalReason }) => void
+  // -- PG-2: the live pairing cap ------------------------------------------
+  // All three getters are read PER CALL (never snapshotted at construction):
+  // `maxServers` is a volatile row field, so a config change must reach the
+  // next pair()/status read without reloading the row.
+  /** The locally configured cap (`resolveConfig`'s `maxServers`), live.
+   * Missing answers {@link MAX_PAIRED_SERVERS}. */
+  getMaxServers?: () => number
+  /** Which config layer supplied the current `maxServers` (live). Only
+   * `'default'` lets the network's cap win OUTRIGHT; a user-chosen value is
+   * only lowered by it, never raised. Missing behaves like `'default'`. */
+  getMaxServersSource?: () => ConfigSource | undefined
+  /** The gateway's announced peer cap (peer mode: the state file's
+   * `peerNetwork.maxPeersFromGateway`), live. Missing/undefined means "no
+   * network cap known" and the local configuration answers alone. */
+  getPeerNetworkCap?: () => number | undefined
 }
 
 /** One in-memory entry: the record (mutated in place on re-pair/handshake),
@@ -132,6 +148,11 @@ interface PoolEntry {
 export interface RelayPool {
   /** Every entry in pairing order, with fresh display names. */
   entries(): RelayPoolEntryView[]
+  /** The EFFECTIVE pairing cap right now (PG-2): the locally configured
+   * `maxServers` (its getter is live), except in peer mode under a network-
+   * reported `maxPeersFromGateway`, where a default-layer config takes the
+   * gateway's cap outright and a user-chosen one is only lowered by it. */
+  maxServers(): number
   /** Locate one entry by its state-file record id. */
   getByEntryId(entryId: string): RelayPoolEntryView | undefined
   /** Locate one entry by its (handshake or persisted) server id. */
@@ -277,8 +298,25 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
     pool.delete(entry.record.id)
   }
 
+  // PG-2: the effective cap, computed per call from the live getters. The
+  // gateway cap only speaks in peer mode (a joined network); a sanitizing
+  // clamp keeps a hostile `maxPeersFromGateway` inside the config's own
+  // 1..64 band before it can raise anything.
+  const maxServers = (): number => {
+    const configured = options.getMaxServers?.() ?? MAX_PAIRED_SERVERS
+    const gatewayCap = options.getPeerNetworkCap?.()
+    if (typeof gatewayCap !== 'number' || !Number.isInteger(gatewayCap) || gatewayCap < 1) return configured
+    const cap = Math.min(64, gatewayCap)
+    const source = options.getMaxServersSource?.() ?? 'default'
+    // Source 'default' (or its absence): the network's word wins outright.
+    if (source === 'default') return cap
+    return Math.min(configured, cap)
+  }
+
   return {
     entries,
+
+    maxServers,
 
     getByEntryId(entryId) {
       return entries().find((view) => view.entryId === entryId)
@@ -289,7 +327,9 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
     },
 
     async pair(input) {
-      const result = upsertPairedServer(stateFile, input)
+      // The cap pair() enforces is the pool's own live answer, so a config
+      // change (or a freshly joined network) reaches the very next pairing.
+      const result = upsertPairedServer(stateFile, { ...input, maxServers: maxServers() })
       if (!result.ok) return result
       const existing = pool.get(result.record.id)
       if (existing !== undefined) {
