@@ -21,3 +21,19 @@ GLOSSARY.md
 # Per-order planning notes (super-marshal worktrees; not shipped)
 tasks/
 .dsh-tasks/
+
+# Gateway-server subproject: local runtime, build output, and all design/process/executor docs (never committed)
+gateway-server/node_modules/
+gateway-server/dist/
+gateway-server/data/
+gateway-server/.impeccable/
+gateway-server/.scratch/
+gateway-server/tasks/
+gateway-server/prototype/
+gateway-server/PRODUCT.md
+gateway-server/DESIGN.md
+gateway-server/AGENTS.md
+gateway-server/CLAUDE.md
+gateway-server/docs/ui-ux-spec.md
+gateway-server/docs/SPEC.md
+gateway-server/docs/adr/
