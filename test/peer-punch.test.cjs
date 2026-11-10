@@ -1,0 +1,776 @@
+/* dsh-zen-remote · peer-gateway PG-7 (tasks/peer-gateway/PG-7.md)
+ *
+ * src/peer/punch.ts — UDP path establishment for the peer network:
+ *   - collectLanEndpoints(): non-loopback IPv4 (RFC1918 + CGNAT 100.64/10)
+ *     interfaces formatted as `ip:port` candidates;
+ *   - probeStunNatType(): ONE local socket probes the gateway's primary
+ *     and (optional) alternate UDP ports with a signed `zr-stun-probe`
+ *     JSON packet; matching `stun-reply` reflexive ports classify as
+ *     public/cone, differing ports as symmetric, missing replies as
+ *     unknown;
+ *   - PeerPunchManager: per-peer 1000ms priority hole punch — signed
+ *     HELLO bursts every 100ms (≤10 rounds) to every candidate endpoint,
+ *     X25519 + Ed25519 handshake into PeerSessionCiphers, LAN/P2P path
+ *     classification with RTT, onPunchFallback at exactly 1000ms, silent
+ *     60s reprobe that hot-upgrades to direct later, 5s encrypted
+ *     PING/PONG keepalive with lost-direct detection after 3 misses,
+ *     and close() that clears every timer and socket handle.
+ *
+ * Everything here drives the BUILT lib/peer/punch.js like every other
+ * wiring test in this repo. The punch tests run REAL loopback UDP
+ * sockets against each other; only the state-machine clocks are
+ * injected so timing assertions stay deterministic.
+ */
+'use strict'
+const { test } = require('node:test')
+const assert = require('node:assert/strict')
+const dgram = require('node:dgram')
+const { createHash, createPrivateKey, createPublicKey, randomBytes, sign, verify } = require('node:crypto')
+
+const {
+  probeStunNatType,
+  PeerPunchManager,
+  collectLanEndpoints,
+  classifyPunchEndpoint,
+} = require('../lib/peer/punch.js')
+const { generatePeerIdentity } = require('../lib/peer/crypto.js')
+const { PeerFrameType } = require('../lib/peer/wire.js')
+const { PeerArqSession } = require('../lib/peer/arq.js')
+
+const NET_ID = 'a1b2c3d4e5f60718'
+
+// -- harness helpers -------------------------------------------------------------
+
+/** Deterministic virtual clock: timers fire only when advance() is called. */
+function manualClock() {
+  let now = 0
+  let nextId = 1
+  const timers = new Map()
+  return {
+    now: () => now,
+    setTimeout(fn, ms) {
+      const id = nextId++
+      timers.set(id, { at: now + ms, fn })
+      return id
+    },
+    clearTimeout(id) {
+      timers.delete(id)
+    },
+    advance(ms) {
+      const target = now + ms
+      for (;;) {
+        let best = null
+        for (const [id, t] of timers) {
+          if (t.at > target) continue
+          if (!best || t.at < best.t.at || (t.at === best.t.at && id < best.id)) best = { id, t }
+        }
+        if (!best) break
+        now = Math.max(now, best.t.at)
+        timers.delete(best.id)
+        best.t.fn()
+      }
+      now = target
+    },
+    pendingCount: () => timers.size,
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+function defer() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+async function withTimeout(promise, ms, label) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} within ${ms}ms`)), ms)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function openSocket(host = '127.0.0.1', port = 0) {
+  const socket = dgram.createSocket('udp4')
+  await new Promise((resolve, reject) => {
+    const onError = (err) => reject(err)
+    socket.once('error', onError)
+    socket.bind({ port, address: host }, () => {
+      socket.removeListener('error', onError)
+      resolve()
+    })
+  })
+  return socket
+}
+
+function waitClose(socket) {
+  return new Promise((resolve) => socket.once('close', resolve))
+}
+
+function endpointOf(socket) {
+  const address = socket.address()
+  return `${address.address}:${address.port}`
+}
+
+function ed25519PublicFromRaw(publicKeyHex) {
+  return createPublicKey({
+    key: { kty: 'OKP', crv: 'Ed25519', x: Buffer.from(publicKeyHex, 'hex').toString('base64url') },
+    format: 'jwk',
+  })
+}
+
+function ed25519PrivateFromRaw(identity) {
+  return createPrivateKey({
+    key: {
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: Buffer.from(identity.publicKeyHex, 'hex').toString('base64url'),
+      d: Buffer.from(identity.privateKeyHex, 'hex').toString('base64url'),
+    },
+    format: 'jwk',
+  })
+}
+
+function ed25519VerifyHex(message, publicKeyHex, sigHex) {
+  return verify(null, message, ed25519PublicFromRaw(publicKeyHex), Buffer.from(sigHex, 'hex'))
+}
+
+function ed25519SignHex(message, identity) {
+  return sign(null, message, ed25519PrivateFromRaw(identity)).toString('hex')
+}
+
+/** Manager on a real loopback UDP socket with an injected state-machine clock. */
+async function makeManager(identity, clock, hooks = {}, port = 0) {
+  const socket = await openSocket('127.0.0.1', port)
+  const mgr = new PeerPunchManager({ networkId: NET_ID, identity, socket, clock, ...hooks })
+  await mgr.ready()
+  return { mgr, socket }
+}
+
+/**
+ * Two managers punching each other over real loopback UDP. A initiates;
+ * B answers passively. Returns both managers plus the recorded events.
+ */
+async function establishPair(hooksA = {}, hooksB = {}) {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const clockA = manualClock()
+  const clockB = manualClock()
+  const events = { aReady: [], bReady: [], aFallback: 0, bFallback: 0, aLost: [], bLost: [] }
+  const aReadyDefer = defer()
+  const bReadyDefer = defer()
+  const { mgr: mgrA, socket: sockA } = await makeManager(A, clockA, {
+    onDirectReady: (id, info) => {
+      events.aReady.push({ id, info })
+      aReadyDefer.resolve({ id, info })
+    },
+    onPunchFallback: () => { events.aFallback += 1 },
+    onDirectLost: (id) => { events.aLost.push(id) },
+    ...hooksA,
+  })
+  const { mgr: mgrB, socket: sockB } = await makeManager(B, clockB, {
+    onDirectReady: (id, info) => {
+      events.bReady.push({ id, info })
+      bReadyDefer.resolve({ id, info })
+    },
+    onPunchFallback: () => { events.bFallback += 1 },
+    onDirectLost: (id) => { events.bLost.push(id) },
+    ...hooksB,
+  })
+  mgrA.beginPunch({
+    peerNodeId: B.nodeId,
+    peerPublicKeyHex: B.publicKeyHex,
+    lanEndpoints: [endpointOf(sockB)],
+    reflexiveEndpoint: null,
+  })
+  const aReady = await withTimeout(aReadyDefer.promise, 1000, 'A onDirectReady')
+  const bReady = await withTimeout(bReadyDefer.promise, 1000, 'B onDirectReady')
+  return { A, B, clockA, clockB, mgrA, mgrB, sockA, sockB, events, aReady, bReady }
+}
+
+async function closeManager(pair) {
+  const closed = waitClose(pair.socket)
+  pair.mgr.close()
+  await closed
+}
+
+/** A scripted STUN gateway: verifies the probe signature, answers per behavior(). */
+async function startFakeStun() {
+  const socket = await openSocket('127.0.0.1')
+  const seen = []
+  let behavior = (_packet, rinfo) => ({ ip: rinfo.address, port: rinfo.port })
+  socket.on('message', (buf, rinfo) => {
+    let packet
+    try {
+      packet = JSON.parse(buf.toString('utf8'))
+    } catch {
+      return
+    }
+    let sigOk = false
+    try {
+      const message = Buffer.from(
+        `zr-stun-v1|probe|${packet.networkId}|${packet.nodeId}|${packet.nonce}|${packet.timestamp}`,
+        'utf8',
+      )
+      sigOk = ed25519VerifyHex(message, packet.publicKeyHex, packet.sigHex)
+    } catch {
+      sigOk = false
+    }
+    seen.push({ packet, rinfo, sigOk })
+    if (!sigOk) return
+    const reply = behavior(packet, rinfo)
+    if (!reply) return
+    const out = Buffer.from(JSON.stringify({
+      zr: 1,
+      kind: 'zr-stun-reply',
+      nonce: reply.nonce ?? packet.nonce,
+      ip: reply.ip,
+      port: reply.port,
+    }))
+    socket.send(out, rinfo.port, rinfo.address)
+  })
+  return {
+    get port() { return socket.address().port },
+    get seen() { return seen },
+    set behavior(fn) { behavior = fn },
+    async close() {
+      socket.close()
+      await waitClose(socket)
+    },
+  }
+}
+
+const PROBE_IDENTITY = generatePeerIdentity()
+
+function probeBoth(primary, alt, timeoutMs = 400) {
+  return probeStunNatType({
+    primaryHost: '127.0.0.1',
+    primaryPort: primary.port,
+    altPort: alt.port,
+    networkId: NET_ID,
+    identity: PROBE_IDENTITY,
+    timeoutMs,
+  })
+}
+
+// -- 1. endpoint enumeration + classification --------------------------------------
+
+test('collectLanEndpoints keeps non-loopback IPv4 (RFC1918 + CGNAT + public), drops the rest', () => {
+  const interfaces = {
+    lo0: [
+      { address: '127.0.0.1', family: 'IPv4', internal: true },
+      { address: '::1', family: 'IPv6', internal: true },
+    ],
+    en0: [
+      { address: '192.168.1.10', family: 'IPv4', internal: false },
+      { address: 'fe80::abc', family: 'IPv6', internal: false },
+    ],
+    utun3: [{ address: '100.64.2.5', family: 'IPv4', internal: false }],
+    en1: [{ address: '169.254.9.9', family: 'IPv4', internal: false }],
+    en2: [{ address: '203.0.113.5', family: 4, internal: false }], // numeric family accepted too
+  }
+  assert.deepEqual(collectLanEndpoints(interfaces, 40000), [
+    '192.168.1.10:40000',
+    '100.64.2.5:40000',
+    '203.0.113.5:40000',
+  ])
+})
+
+test('classifyPunchEndpoint: LAN subnets + loopback + exact local ips → lan, everything else → p2p', () => {
+  const localIps = ['192.168.1.10', '100.64.2.5']
+  assert.equal(classifyPunchEndpoint('192.168.1.77:1234', localIps), 'lan', 'same /24 RFC1918')
+  assert.equal(classifyPunchEndpoint('192.168.9.77:1234', localIps), 'p2p', 'RFC1918 different subnet')
+  assert.equal(classifyPunchEndpoint('10.0.0.5:1', ['10.0.0.5']), 'lan', 'exact 10/8 match')
+  assert.equal(classifyPunchEndpoint('172.16.5.5:1', ['172.16.5.5']), 'lan', 'exact 172.16/12 match')
+  assert.equal(classifyPunchEndpoint('100.64.2.99:1', localIps), 'lan', 'CGNAT same /24 (Tailscale)')
+  assert.equal(classifyPunchEndpoint('100.64.99.99:1', localIps), 'p2p', 'CGNAT different subnet')
+  assert.equal(classifyPunchEndpoint('127.0.0.1:1', []), 'lan', 'loopback is the most LAN there is')
+  assert.equal(classifyPunchEndpoint('8.8.8.8:53', localIps), 'p2p', 'public endpoint')
+  assert.equal(classifyPunchEndpoint('203.0.113.9:443', ['203.0.113.9']), 'lan', 'public but exactly our own ip')
+  assert.equal(classifyPunchEndpoint('not-an-endpoint', localIps), 'p2p', 'unparseable never classifies as lan')
+})
+
+test('manager lanEndpoints(): real interface enumeration carrying the bound port', async () => {
+  const identity = generatePeerIdentity()
+  const { mgr, socket } = await makeManager(identity, manualClock())
+  try {
+    const port = socket.address().port
+    for (const endpoint of mgr.lanEndpoints()) {
+      const match = /^([0-9.]+):(\d+)$/.exec(endpoint)
+      assert.ok(match, `endpoint shaped ip:port — got ${endpoint}`)
+      assert.ok(!match[1].startsWith('127.'), 'no loopback candidates')
+      assert.equal(Number(match[2]), port, 'every candidate carries our bound port')
+    }
+  } finally {
+    await closeManager({ mgr, socket })
+  }
+})
+
+// -- 2. dual-port STUN self-check ---------------------------------------------------
+
+test('probe: both gateway ports agree + reflexive ip is local → public', async () => {
+  const primary = await startFakeStun()
+  const alt = await startFakeStun()
+  try {
+    const result = await probeBoth(primary, alt)
+    assert.equal(result.natType, 'public')
+    assert.match(result.reflexiveEndpoint, /^127\.0\.0\.1:\d+$/)
+    const srcPort = Number(result.reflexiveEndpoint.split(':')[1])
+    assert.equal(primary.seen[0].rinfo.port, srcPort, 'primary saw the real source port')
+    assert.equal(alt.seen[0].rinfo.port, srcPort, 'same socket → same mapping on the alt port')
+    assert.equal(primary.seen[0].sigOk, true, 'probe carried a valid Ed25519 signature')
+    assert.equal(primary.seen[0].packet.networkId, NET_ID)
+    assert.equal(primary.seen[0].packet.nodeId, PROBE_IDENTITY.nodeId)
+  } finally {
+    await primary.close()
+    await alt.close()
+  }
+})
+
+test('probe: ports agree but reflexive ip is not local → cone', async () => {
+  const primary = await startFakeStun()
+  const alt = await startFakeStun()
+  primary.behavior = (_packet, rinfo) => ({ ip: '203.0.113.7', port: rinfo.port })
+  alt.behavior = (_packet, rinfo) => ({ ip: '203.0.113.7', port: rinfo.port })
+  try {
+    const result = await probeBoth(primary, alt)
+    assert.equal(result.natType, 'cone')
+    assert.match(result.reflexiveEndpoint, /^203\.0\.113\.7:\d+$/)
+  } finally {
+    await primary.close()
+    await alt.close()
+  }
+})
+
+test('probe: primary and alt report different reflexive ports → symmetric', async () => {
+  const primary = await startFakeStun()
+  const alt = await startFakeStun()
+  primary.behavior = (_packet, rinfo) => ({ ip: '198.51.100.9', port: rinfo.port })
+  alt.behavior = (_packet, rinfo) => ({ ip: '198.51.100.9', port: rinfo.port + 7 })
+  try {
+    const result = await probeBoth(primary, alt)
+    assert.equal(result.natType, 'symmetric')
+    assert.match(result.reflexiveEndpoint, /^198\.51\.100\.9:\d+$/)
+    assert.notEqual(
+      Number(result.reflexiveEndpoint.split(':')[1]),
+      primary.seen[0].rinfo.port + 7,
+      'the reported endpoint is the PRIMARY mapping',
+    )
+  } finally {
+    await primary.close()
+    await alt.close()
+  }
+})
+
+test('probe: alt port never answers → unknown, endpoint from the primary', async () => {
+  const primary = await startFakeStun()
+  const alt = await startFakeStun()
+  alt.behavior = () => null
+  try {
+    const result = await probeBoth(primary, alt, 150)
+    assert.deepEqual(result, { reflexiveEndpoint: `127.0.0.1:${primary.seen[0].rinfo.port}`, natType: 'unknown' })
+    assert.equal(primary.seen[0].sigOk, true)
+  } finally {
+    await primary.close()
+    await alt.close()
+  }
+})
+
+test('probe: alt replies with a foreign nonce → ignored, still unknown', async () => {
+  const primary = await startFakeStun()
+  const alt = await startFakeStun()
+  alt.behavior = () => ({ ip: '127.0.0.1', port: 1, nonce: 'ffffffffffffffff' })
+  try {
+    const result = await probeBoth(primary, alt, 150)
+    assert.equal(result.natType, 'unknown')
+    assert.ok(result.reflexiveEndpoint.startsWith('127.0.0.1:'))
+    assert.equal(alt.seen.length, 1, 'the rogue reply arrived but was not trusted')
+  } finally {
+    await primary.close()
+    await alt.close()
+  }
+})
+
+test('probe: primary port never answers → null endpoint + unknown', async () => {
+  const primary = await startFakeStun()
+  const alt = await startFakeStun()
+  primary.behavior = () => null
+  try {
+    const started = Date.now()
+    const result = await probeBoth(primary, alt, 200)
+    const elapsed = Date.now() - started
+    assert.deepEqual(result, { reflexiveEndpoint: null, natType: 'unknown' })
+    assert.ok(elapsed >= 180, `waited for the primary timeout (took ${elapsed}ms)`)
+    assert.ok(elapsed < 1500, `timeout did not hang (took ${elapsed}ms)`)
+  } finally {
+    await primary.close()
+    await alt.close()
+  }
+})
+
+test('probe: no altPort configured → primary-only answer classifies as unknown', async () => {
+  const primary = await startFakeStun()
+  try {
+    const result = await probeStunNatType({
+      primaryHost: '127.0.0.1',
+      primaryPort: primary.port,
+      networkId: NET_ID,
+      identity: PROBE_IDENTITY,
+      timeoutMs: 300,
+    })
+    assert.equal(result.natType, 'unknown')
+    assert.match(result.reflexiveEndpoint, /^127\.0\.0\.1:\d+$/)
+  } finally {
+    await primary.close()
+  }
+})
+
+test('probe: malformed arguments throw before any socket work', async () => {
+  await assert.rejects(
+    () => probeStunNatType({ primaryHost: '', primaryPort: 1, networkId: NET_ID, identity: PROBE_IDENTITY }),
+    TypeError,
+  )
+  await assert.rejects(
+    () => probeStunNatType({ primaryHost: '127.0.0.1', primaryPort: 0, networkId: NET_ID, identity: PROBE_IDENTITY }),
+    RangeError,
+  )
+  await assert.rejects(
+    () => probeStunNatType({ primaryHost: '127.0.0.1', primaryPort: 1, networkId: 'short', identity: PROBE_IDENTITY }),
+    TypeError,
+  )
+  await assert.rejects(
+    () => probeStunNatType({ primaryHost: '127.0.0.1', primaryPort: 1, networkId: NET_ID, identity: { publicKeyHex: 'zz' } }),
+    TypeError,
+  )
+})
+
+// -- 3. the 1000ms punch state machine on real loopback UDP --------------------------
+
+test('two managers punch through real loopback UDP and derive interop E2EE ciphers < 200ms', async () => {
+  const bReceived = defer()
+  const pair = await establishPair({}, {
+    onEncryptedFrame: (header, plaintext) => bReceived.resolve({ header, plaintext }),
+  })
+  try {
+    const { A, B, mgrA, mgrB, sockB, events, aReady, bReady } = pair
+    assert.equal(aReady.id, B.nodeId)
+    assert.equal(bReady.id, A.nodeId)
+    assert.equal(events.aFallback, 0, 'no fallback on success')
+    assert.equal(events.bFallback, 0)
+    assert.equal(aReady.info.mode, 'lan', 'loopback classifies as LAN')
+    assert.equal(aReady.info.endpoint, endpointOf(sockB))
+    assert.equal(typeof aReady.info.rttMs, 'number')
+    assert.ok(aReady.info.rttMs >= 0)
+    // Self-certifying handshake produced strictly direction-isolated keys.
+    const aCiphers = mgrA.sessionCiphers(B.nodeId)
+    const bCiphers = mgrB.sessionCiphers(A.nodeId)
+    assert.ok(aCiphers, 'A derived session ciphers')
+    assert.ok(bCiphers, 'B derived session ciphers (passive side too)')
+    assert.equal(aCiphers.txKeyHex, bCiphers.rxKeyHex, 'A tx === B rx')
+    assert.equal(aCiphers.rxKeyHex, bCiphers.txKeyHex, 'A rx === B tx')
+    // The direct path carries sealed application frames end to end.
+    const sender = mgrA.frameSenderFor(B.nodeId)
+    sender(PeerFrameType.DATA, 7, Buffer.from('secret payload'), 0)
+    const received = await withTimeout(bReceived.promise, 250, 'sealed frame on the direct path')
+    assert.equal(Buffer.from(received.plaintext).toString(), 'secret payload')
+    assert.equal(received.header.srcNodeId, A.nodeId)
+    assert.equal(received.header.streamId, 7)
+    // Success cancels the punch window: advancing far past 1000ms fires nothing.
+    pair.clockA.advance(10_000)
+    assert.equal(events.aFallback, 0, 'window timer was cleared on success')
+  } finally {
+    await closeManager({ mgr: pair.mgrA, socket: pair.sockA })
+    await closeManager({ mgr: pair.mgrB, socket: pair.sockB })
+  }
+})
+
+test('an ARQ stream rides the punched direct path end to end', async () => {
+  let arqA = null
+  let arqB = null
+  const bParts = []
+  const bDone = defer()
+  const pair = await establishPair({
+    onEncryptedFrame: (header, plaintext) => {
+      if (arqA) arqA.handleFrame(header.frameType, header.streamId, plaintext, header.ack)
+    },
+  }, {
+    onEncryptedFrame: (header, plaintext) => {
+      if (!arqB) return
+      arqB.handleFrame(header.frameType, header.streamId, plaintext, header.ack)
+    },
+  })
+  const { A, B, mgrA, mgrB } = pair
+  try {
+    arqA = new PeerArqSession({
+      sendFrame: mgrA.frameSenderFor(B.nodeId),
+      onStreamData: () => {},
+    })
+    arqB = new PeerArqSession({
+      sendFrame: mgrB.frameSenderFor(A.nodeId),
+      onStreamData: (_streamId, chunk, final) => {
+        bParts.push(Buffer.from(chunk))
+        if (final) bDone.resolve(Buffer.concat(bParts))
+      },
+    })
+    const payload = randomBytes(300 * 1024)
+    const hash = createHash('sha256').update(payload).digest('hex')
+    const write = arqA.write(1, payload)
+    const finish = arqA.finish(1)
+    const out = await withTimeout(bDone.promise, 10_000, 'ARQ payload over the direct path')
+    assert.equal(out.length, payload.length, 'zero bytes lost over UDP direct')
+    assert.equal(createHash('sha256').update(out).digest('hex'), hash, 'SHA-256 identical over the direct path')
+    await Promise.all([write, finish])
+  } finally {
+    arqA?.closeAll()
+    arqB?.closeAll()
+    await closeManager({ mgr: pair.mgrA, socket: pair.sockA })
+    await closeManager({ mgr: pair.mgrB, socket: pair.sockB })
+  }
+})
+
+test('punch establishment completes within 200ms wall clock', async () => {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const ready = defer()
+  const { mgr: mgrA, socket: sockA } = await makeManager(A, manualClock(), {
+    onDirectReady: (id, info) => ready.resolve({ id, info }),
+  })
+  const { mgr: mgrB, socket: sockB } = await makeManager(B, manualClock(), {})
+  try {
+    const t0 = Date.now()
+    mgrA.beginPunch({
+      peerNodeId: B.nodeId,
+      peerPublicKeyHex: B.publicKeyHex,
+      lanEndpoints: [endpointOf(sockB)],
+      reflexiveEndpoint: null,
+    })
+    const info = await withTimeout(ready.promise, 200, 'onDirectReady within 200ms')
+    assert.ok(Date.now() - t0 < 200, `established in ${Date.now() - t0}ms`)
+    assert.equal(info.id, B.nodeId)
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
+    await closeManager({ mgr: mgrB, socket: sockB })
+  }
+})
+
+test('beginPunch refuses an identity whose nodeId is not the hash of its key', async () => {
+  const identity = generatePeerIdentity()
+  const { mgr, socket } = await makeManager(identity, manualClock())
+  try {
+    const stranger = generatePeerIdentity()
+    assert.throws(() => mgr.beginPunch({
+      peerNodeId: 'deadbeef',
+      peerPublicKeyHex: stranger.publicKeyHex,
+      lanEndpoints: ['127.0.0.1:1'],
+    }), TypeError, 'forged nodeId/publicKey binding rejected')
+    assert.throws(() => mgr.beginPunch({
+      peerNodeId: identity.nodeId,
+      peerPublicKeyHex: identity.publicKeyHex,
+      lanEndpoints: ['127.0.0.1:1'],
+    }), TypeError, 'punching yourself rejected')
+  } finally {
+    await closeManager({ mgr, socket })
+  }
+})
+
+test('handlePacket drops garbage and cross-network control packets without side effects', async () => {
+  const identity = generatePeerIdentity()
+  const { mgr, socket } = await makeManager(identity, manualClock())
+  const stranger = generatePeerIdentity()
+  try {
+    mgr.handlePacket(Buffer.from('not json at all'), { address: '127.0.0.1', port: 1 })
+    mgr.handlePacket(randomBytes(64), { address: '127.0.0.1', port: 1 })
+    mgr.handlePacket(Buffer.from(JSON.stringify({ zr: 1, kind: 'zr-hello' })), { address: '127.0.0.1', port: 1 })
+    // A validly signed HELLO for a DIFFERENT network must be ignored.
+    const eph = randomBytes(32).toString('hex')
+    const nonce = randomBytes(8).toString('hex')
+    const timestamp = 12345
+    const message = Buffer.from(`zr-punch-v1|hello|0000000000000000|${stranger.nodeId}|${eph}|${nonce}|${timestamp}`, 'utf8')
+    mgr.handlePacket(Buffer.from(JSON.stringify({
+      zr: 1,
+      kind: 'zr-hello',
+      networkId: '0000000000000000',
+      nodeId: stranger.nodeId,
+      publicKeyHex: stranger.publicKeyHex,
+      ephPubHex: eph,
+      nonce,
+      timestamp,
+      sigHex: ed25519SignHex(message, stranger),
+    })), { address: '127.0.0.1', port: 1 })
+    assert.equal(mgr.sessionCiphers(stranger.nodeId), null, 'no session materialized')
+  } finally {
+    await closeManager({ mgr, socket })
+  }
+})
+
+test('fallback fires exactly once, at exactly 1000ms of virtual time', async () => {
+  const identity = generatePeerIdentity()
+  const peer = generatePeerIdentity()
+  const blocker = await openSocket()
+  const deadPort = blocker.address().port
+  blocker.close()
+  await waitClose(blocker)
+  const clock = manualClock()
+  const fallbacks = []
+  const { mgr, socket } = await makeManager(identity, clock, {
+    onPunchFallback: (id) => fallbacks.push(id),
+  })
+  try {
+    mgr.beginPunch({
+      peerNodeId: peer.nodeId,
+      peerPublicKeyHex: peer.publicKeyHex,
+      lanEndpoints: [`127.0.0.1:${deadPort}`],
+      reflexiveEndpoint: null,
+    })
+    clock.advance(999)
+    assert.deepEqual(fallbacks, [], 'no fallback before the window expires')
+    clock.advance(1)
+    assert.deepEqual(fallbacks, [peer.nodeId], 'fallback at exactly 1000ms')
+    clock.advance(2000)
+    assert.equal(fallbacks.length, 1, 'fallback fires exactly once per window')
+    // The 60s reprobe fires at t=61000 and runs its OWN 1000ms window.
+    clock.advance(58_000) // → 61000: reprobe HELLOs fly
+    assert.equal(fallbacks.length, 1, 'reprobe start is silent')
+    clock.advance(999) // → 61999: still inside the reprobe window
+    assert.equal(fallbacks.length, 1)
+    clock.advance(1) // → 62000
+    assert.equal(fallbacks.length, 2, 'the reprobe round has its own window')
+  } finally {
+    await closeManager({ mgr, socket })
+  }
+})
+
+test('silent reprobe after fallback upgrades to direct once the endpoint comes alive', async () => {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const blocker = await openSocket()
+  const deadPort = blocker.address().port
+  blocker.close()
+  await waitClose(blocker)
+
+  const clockA = manualClock()
+  const events = { ready: [], fallback: 0 }
+  const readyDefer = defer()
+  const { mgr: mgrA, socket: sockA } = await makeManager(A, clockA, {
+    onDirectReady: (id, info) => {
+      events.ready.push({ id, info })
+      readyDefer.resolve({ id, info })
+    },
+    onPunchFallback: () => { events.fallback += 1 },
+  })
+  await mgrA.ready()
+  mgrA.beginPunch({
+    peerNodeId: B.nodeId,
+    peerPublicKeyHex: B.publicKeyHex,
+    lanEndpoints: [`127.0.0.1:${deadPort}`],
+    reflexiveEndpoint: null,
+  })
+  clockA.advance(1000)
+  assert.equal(events.fallback, 1, 'fallback fired for the blocked network')
+
+  // "The network unblocks": B's real UDP socket now lives on that exact port.
+  const bReady = defer()
+  const { mgr: mgrB, socket: sockB } = await makeManager(B, manualClock(), {
+    onDirectReady: (id, info) => bReady.resolve({ id, info }),
+  }, deadPort)
+  assert.equal(sockB.address().port, deadPort)
+
+  // The 60s silent reprobe fires and the fresh HELLO reaches B.
+  clockA.advance(60_000)
+  const aInfo = await withTimeout(readyDefer.promise, 250, 'reprobe upgraded to direct')
+  const bInfo = await withTimeout(bReady.promise, 250, 'B saw the reprobe too')
+  assert.equal(events.fallback, 1, 'no extra fallback fired')
+  assert.deepEqual(events.ready.map((entry) => entry.id), [B.nodeId])
+  assert.equal(aInfo.info.endpoint, endpointOf(sockB))
+  assert.equal(bInfo.id, A.nodeId)
+  // Ciphers interoperate after the late upgrade.
+  assert.equal(mgrA.sessionCiphers(B.nodeId).txKeyHex, mgrB.sessionCiphers(A.nodeId).rxKeyHex)
+  await closeManager({ mgr: mgrA, socket: sockA })
+  await closeManager({ mgr: mgrB, socket: sockB })
+})
+
+test('keepalive: pings are answered; 3 unanswered cycles trigger onDirectLost; reprobe keeps flying', async () => {
+  const pair = await establishPair()
+  const { A, B, clockA, mgrA, mgrB, sockB, events } = pair
+  try {
+    // The handshake itself records an RTT (measured hello→ack).
+    const handshakeRtt = mgrA.sessionRttMs(B.nodeId)
+    assert.ok(typeof handshakeRtt === 'number' && handshakeRtt >= 0, `handshake RTT recorded (got ${handshakeRtt})`)
+    // Four ANSWERED keepalive cycles: if the PING/PONG loop were broken,
+    // the 4th tick would see 15s of silence and declare the path lost.
+    for (let cycle = 1; cycle <= 4; cycle++) {
+      clockA.advance(5000)
+      await sleep(10) // let B's PONG land on A's socket before judging
+      assert.deepEqual(events.aLost, [], `answered cycle ${cycle} must not declare loss`)
+    }
+    assert.equal(events.aFallback, 0)
+
+    // B goes silent (closed socket → no more PONGs). Exactly three
+    // keepalive periods of silence (15s) declare the path lost.
+    const bPort = sockB.address().port
+    await closeManager({ mgr: mgrB, socket: sockB })
+    clockA.advance(5000)
+    await sleep(2)
+    assert.deepEqual(events.aLost, [], 'one silent period is not enough')
+    clockA.advance(5000)
+    await sleep(2)
+    assert.deepEqual(events.aLost, [], 'two silent periods is not enough')
+    clockA.advance(5000)
+    assert.deepEqual(events.aLost, [B.nodeId], 'three silent periods (15s) declare the direct path lost')
+    assert.equal(events.aFallback, 0, 'keepalive loss is not a punch fallback')
+
+    // The background reprobe survives the lost event and keeps flying HELLOs.
+    const raw = await openSocket('127.0.0.1', bPort)
+    const helloDefer = defer()
+    raw.once('message', (buf) => helloDefer.resolve(JSON.parse(buf.toString('utf8'))))
+    clockA.advance(60_000)
+    const hello = await withTimeout(helloDefer.promise, 250, 'reprobe HELLO after direct lost')
+    assert.equal(hello.kind, 'zr-hello')
+    assert.equal(hello.nodeId, A.nodeId)
+    raw.close()
+    await waitClose(raw)
+  } finally {
+    await closeManager({ mgr: mgrA, socket: pair.sockA })
+  }
+})
+
+test('close() clears every timer handle, closes the socket, and is idempotent', async () => {
+  const identity = generatePeerIdentity()
+  const blocker = await openSocket()
+  const deadPort = blocker.address().port
+  blocker.close()
+  await waitClose(blocker)
+  const clock = manualClock()
+  const events = { ready: 0, fallback: 0, lost: 0 }
+  const { mgr, socket } = await makeManager(identity, clock, {
+    onDirectReady: () => { events.ready += 1 },
+    onPunchFallback: () => { events.fallback += 1 },
+    onDirectLost: () => { events.lost += 1 },
+  })
+  const peer = generatePeerIdentity()
+  mgr.beginPunch({
+    peerNodeId: peer.nodeId,
+    peerPublicKeyHex: peer.publicKeyHex,
+    lanEndpoints: [`127.0.0.1:${deadPort}`],
+    reflexiveEndpoint: null,
+  })
+  assert.ok(clock.pendingCount() > 0, 'punch timers are pending before close')
+  const closed = waitClose(socket)
+  mgr.close()
+  await closed
+  mgr.close() // idempotent
+  assert.equal(clock.pendingCount(), 0, 'zero timer handles after close')
+  clock.advance(10 * 60_000)
+  assert.deepEqual(events, { ready: 0, fallback: 0, lost: 0 }, 'no callbacks after close')
+  mgr.handlePacket(Buffer.from('junk'), { address: '127.0.0.1', port: 1 })
+  assert.equal(mgr.sessionCiphers(peer.nodeId), null, 'sessions are gone after close')
+})
