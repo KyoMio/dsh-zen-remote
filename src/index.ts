@@ -52,8 +52,10 @@ import { startRestartWatcher } from './restart-watcher.js'
 import { handleShareExport, SHARE_EXPORT_ROUTE } from './share-export.js'
 import { createShareStore } from './share-store.js'
 import { createRelayPool } from './relay-pool.js'
-import { readPeerNetwork } from './state-store.js'
+import { ensurePeerIdentity, readPeerNetwork } from './state-store.js'
 import type { RelayPool } from './relay-pool.js'
+import { createPeerEngine } from './peer/engine.js'
+import type { PeerEngine } from './peer/engine.js'
 import { volatileUpdateTouchesServerName } from './relay-client.js'
 import type { RelayClient } from './relay-client.js'
 import { computeFingerprints } from './fingerprint.js'
@@ -198,6 +200,20 @@ let clientRelayPool: RelayPool | undefined
 /** The live client-role relay pool, if one was built. */
 export function getRelayPool(): RelayPool | undefined {
   return clientRelayPool
+}
+
+/**
+ * The peer-role engine (PG-8), created inside apply() when the row's role is
+ * `'peer'`: gateway WS control link, local TOFU anchoring, punch/mux paths
+ * and the pool's virtual mounts all live behind it. Same slot discipline as
+ * the pool — identity-guarded in the disposal effect, so a reloaded row
+ * never leaves a stale engine here. Undefined on every other role.
+ */
+let livePeerEngine: PeerEngine | undefined
+
+/** The live peer-role engine, if one was built. */
+export function getPeerEngine(): PeerEngine | undefined {
+  return livePeerEngine
 }
 
 /**
@@ -790,6 +806,13 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
    * historic owner of the stop — never fires). */
   const cliManagedChildren: Array<{ stop(): void }> = []
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  // PG-8: the peer role runs BOTH halves, so the connects branch needs two
+  // facts the serves branch owns — the relay secret (the marking header the
+  // mux stamps onto every inbound virtual request) and the live relay
+  // handler (the inbound end of the mux). Slots only; peer wiring reads them
+  // through getters so a not-yet-mounted handler answers undefined.
+  let servingRelaySecret: string | undefined
+  let servingRelayHandler: RelayHandler | undefined
   if (servesRole(effective.values.role)) {
     // A row that switched from client to host must not leave a stale relay
     // client where getRelayClient() can find it (T23a-fix) — and no stale
@@ -802,6 +825,8 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // gateway child through LAN_GATE_RELAY_SECRET and kept here for the
     // relay routes below. The push half never sees it.
     const relaySecret = randomBytes(32).toString('hex')
+    // PG-8: the peer half stamps this secret onto every mux-inbound request.
+    servingRelaySecret = relaySecret
     // CU-1 lifecycle: the gateway child's spawn/exit, reported back through
     // this hook (lan-gate.mjs reads it off the config object it is handed).
     // The child runs in a subprocess whose console the ring cannot see, so
@@ -1405,6 +1430,8 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // (T33a2) BEFORE the route is reachable, so no request can hit a
         // mounted route with an unpublished handler.
         relayHandler = handler
+        // PG-8: the mux's inbound end — same handler, same lifetime.
+        servingRelayHandler = handler
         // A row reload builds a NEW handler over a NEW share table; the open
         // streams of this one would push forever, unreachable by any unshare
         // (T22b-fix) — so the teardown ends them with a server-restart error
@@ -1415,6 +1442,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           handler.closeAll('plugin row reloaded')
           unregister()
           if (relayHandler === handler) relayHandler = undefined
+          if (servingRelayHandler === handler) servingRelayHandler = undefined
         }
       }, 'dsh-zen-remote: relay route')
     })
@@ -1560,12 +1588,40 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       },
     })
     clientRelayPool = relayPool
+    // PG-8: the peer role ALSO joins a virtual network — one engine owns the
+    // gateway WS control link, the local TOFU anchoring, the punch/mux paths
+    // and the pool's virtual mounts. Created beside the pool (it mounts into
+    // it), torn down with it (the SAME disposal effect — the role-wiring
+    // contract pins the top-level effect counts, so no new effect appears).
+    const peerEngine: PeerEngine | undefined = effective.values.role === 'peer'
+      ? createPeerEngine({
+          stateFile: clientStateFile,
+          identity: ensurePeerIdentity(clientStateFile),
+          relayPool,
+          // The mux's inbound end rides the serving half; both slots stay
+          // undefined until the relay route's own effect mounts it (and on
+          // compositions with no webServer — the mux then answers 503).
+          relayHandler: () => servingRelayHandler,
+          relaySecret: () => servingRelaySecret ?? '',
+          serverName: () => resolveConfig(config, readFileConfig(), process.env).values.serverName,
+          // The gateway's UDP STUN ports are not row-configured yet (a later
+          // task owns that surface) — the probe stays off here; punch works
+          // from the gateway-published lanEndpoints alone.
+          udpProbe: null,
+          log: (line) => { ring.push('info', 'peer: %s', line) },
+        })
+      : undefined
+    livePeerEngine = peerEngine
     // A stopped or reloaded row must not leave a stale pool where the module
     // getter can hand it out (T23a-fix's discipline), and its clients'
     // reconnect machinery must not outlive the row either: stop() ends every
     // client (which cancels armed retry timers and blocks scheduling). The
     // identity guard keeps a slow dispose from clearing a NEWER row's pool.
+    // The peer engine (when present) dies in the same breath — its virtual
+    // mounts, its WS link and its punch sockets all belong to this row.
     ctx.effect(() => () => {
+      peerEngine?.stop()
+      if (livePeerEngine === peerEngine) livePeerEngine = undefined
       relayPool.stop()
       if (clientRelayPool === relayPool) clientRelayPool = undefined
     }, 'dsh-zen-remote: relay pool disposal')

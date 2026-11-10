@@ -61,9 +61,10 @@ export interface RelayPoolEntryView {
     /** When the pairing was first added (epoch ms). */
     createdAt: number;
 }
-/** Why an entry left the pool: the user removed it, or a handshake proved it
- * a stale duplicate of another entry pointing at the same server. */
-export type RelayPoolRemovalReason = 'unpair' | 'dedupe';
+/** Why an entry left the pool: the user removed it, a handshake proved it
+ * a stale duplicate of another entry pointing at the same server — or it
+ * was a peer-network virtual mount the engine unmounted (PG-8). */
+export type RelayPoolRemovalReason = 'unpair' | 'dedupe' | 'virtual';
 export interface RelayPoolOptions {
     /** The state file (`<DSH_HOME>/zen-remote-state.json`). */
     stateFile: string;
@@ -139,7 +140,22 @@ export interface RelayPool {
     unpair(entryId: string): boolean;
     /** Stop everything and empty the paired list; answers the record count. */
     unpairAll(): number;
-    /** One entry's immediate reconnect, or every `offline` client's. Answers
+    /** Mount one MEMORY-ONLY virtual entry (PG-8, PeerEngine): its client
+     * reaches a joined peer through the mux's `fetchImpl` — the E2EE virtual
+     * HTTP adapter — and its `serverId` is the peer's nodeId, which is what
+     * the `zr~<serverId>~` virtual session ids carry. Never touches the state
+     * file, never runs the handshake dedupe, never counts against `pair()`'s
+     * disk cap. */
+    mountVirtual(input: {
+        entryId: string;
+        serverId: string;
+        serverName: string;
+        fetchImpl: typeof fetch;
+    }): RelayPoolEntryView;
+    /** Unmount one virtual entry (peer left / mismatch / disabled). */
+    unmountVirtual(entryId: string): boolean;
+    /** Whether an entry id is currently a mounted virtual entry. */
+    isVirtual(entryId: string): boolean; /** One entry's immediate reconnect, or every `offline` client's. Answers
      * whether any attempt was started. */
     reconnect(entryId?: string): Promise<boolean>;
     /** One authenticated ping per `offline` client; the reachable ones get

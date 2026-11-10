@@ -96,9 +96,10 @@ export interface RelayPoolEntryView {
   createdAt: number
 }
 
-/** Why an entry left the pool: the user removed it, or a handshake proved it
- * a stale duplicate of another entry pointing at the same server. */
-export type RelayPoolRemovalReason = 'unpair' | 'dedupe'
+/** Why an entry left the pool: the user removed it, a handshake proved it
+ * a stale duplicate of another entry pointing at the same server — or it
+ * was a peer-network virtual mount the engine unmounted (PG-8). */
+export type RelayPoolRemovalReason = 'unpair' | 'dedupe' | 'virtual'
 
 export interface RelayPoolOptions {
   /** The state file (`<DSH_HOME>/zen-remote-state.json`). */
@@ -138,11 +139,15 @@ export interface RelayPoolOptions {
 }
 
 /** One in-memory entry: the record (mutated in place on re-pair/handshake),
- * its client and the state-listener unsubscribe handle. */
+ * its client and the state-listener unsubscribe handle. `virtual` entries
+ * (PG-8) live ONLY in memory — the PeerEngine mounts one per joined peer
+ * whose client talks to the remote peer through the E2EE mux's fetch adapter,
+ * never through the disk's paired-servers list. */
 interface PoolEntry {
   record: PairedServerRecord
   client: RelayClient
   unsubscribe: () => void
+  virtual?: boolean
 }
 
 export interface RelayPool {
@@ -166,7 +171,17 @@ export interface RelayPool {
   unpair(entryId: string): boolean
   /** Stop everything and empty the paired list; answers the record count. */
   unpairAll(): number
-  /** One entry's immediate reconnect, or every `offline` client's. Answers
+  /** Mount one MEMORY-ONLY virtual entry (PG-8, PeerEngine): its client
+   * reaches a joined peer through the mux's `fetchImpl` — the E2EE virtual
+   * HTTP adapter — and its `serverId` is the peer's nodeId, which is what
+   * the `zr~<serverId>~` virtual session ids carry. Never touches the state
+   * file, never runs the handshake dedupe, never counts against `pair()`'s
+   * disk cap. */
+  mountVirtual(input: { entryId: string; serverId: string; serverName: string; fetchImpl: typeof fetch }): RelayPoolEntryView
+  /** Unmount one virtual entry (peer left / mismatch / disabled). */
+  unmountVirtual(entryId: string): boolean
+  /** Whether an entry id is currently a mounted virtual entry. */
+  isVirtual(entryId: string): boolean  /** One entry's immediate reconnect, or every `offline` client's. Answers
    * whether any attempt was started. */
   reconnect(entryId?: string): Promise<boolean>
   /** One authenticated ping per `offline` client; the reachable ones get
@@ -201,8 +216,12 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
   const buildView = (entry: PoolEntry, displayName: string): RelayPoolEntryView => ({
     entryId: entry.record.id,
     serverUrl: entry.record.serverUrl,
-    serverId: effectiveServerId(entry),
-    serverName: effectiveServerName(entry),
+    // Virtual entries (PG-8) report the MOUNTED serverId — the peer's
+    // nodeId — and ignore the handshake's own serverId: the `zr~<serverId>~`
+    // virtual session ids must carry the nodeId that names the peer on the
+    // network, not the peer machine's independent relay identity.
+    serverId: entry.virtual ? (entry.record.serverId ?? entry.record.id) : effectiveServerId(entry),
+    serverName: entry.virtual ? entry.record.serverName : effectiveServerName(entry),
     displayName,
     client: entry.client,
     createdAt: entry.record.createdAt,
@@ -218,13 +237,15 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
 
   /** The client's credential getters read the CURRENT record per request, so
    * a re-pair (an in-place record swap) reaches the next attempt directly. */
-  const createClientFor = (record: PairedServerRecord): RelayClient => {
+  const createClientFor = (record: PairedServerRecord, fetchOverride?: typeof fetch): RelayClient => {
     const liveRecord = (): PairedServerRecord => pool.get(record.id)?.record ?? record
     const clientOptions: CreateRelayClientOptions = {
       getServerUrl: () => liveRecord().serverUrl,
       getToken: () => liveRecord().token,
       computeOwnFingerprints: options.computeOwnFingerprints,
-      ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+      ...(fetchOverride !== undefined
+        ? { fetchImpl: fetchOverride }
+        : options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
       ...(options.clock !== undefined ? { clock: options.clock } : {}),
     }
     return createClientImpl(clientOptions)
@@ -237,6 +258,17 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
   const handleHandshake = (entry: PoolEntry): void => {
     const info = entry.client.handshakeInfo
     if (info === undefined) return
+    // Virtual entries (PG-8): the handshake still happens over the mux (the
+    // peer's relayHandler answers it) and refreshes the DISPLAY name only —
+    // the serverId half stays the mounted peer nodeId, and nothing is
+    // written to disk or deduped there.
+    if (entry.virtual) {
+      entry.record = {
+        ...entry.record,
+        ...(info.deviceName !== undefined && info.deviceName !== '' ? { deviceName: info.deviceName } : {}),
+      }
+      return
+    }
     const result = recordServerHandshake(stateFile, entry.record.id, {
       serverId: info.serverId,
       serverName: info.serverName,
@@ -348,6 +380,7 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
 
     unpair(entryId) {
       const entry = pool.get(entryId)
+      if (entry?.virtual === true) return this.unmountVirtual(entryId)
       const removed = removePairedServer(stateFile, entryId)
       if (entry !== undefined) detach(entry)
       if (removed) {
@@ -358,6 +391,50 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
         })
       }
       return removed
+    },
+
+    /** PG-8: one memory-only mount per joined peer; its entryId IS the peer
+     * nodeId, its `serverId` the same, its client rides the mux's fetch. */
+    mountVirtual(input) {
+      const existing = pool.get(input.entryId)
+      if (existing !== undefined) {
+        return entries().find((view) => view.entryId === input.entryId) as RelayPoolEntryView
+      }
+      const record: PairedServerRecord = {
+        id: input.entryId,
+        // A placeholder origin — the mux's fetch never opens a socket for it.
+        serverUrl: `http://zr-peer-${input.serverId}.virtual`,
+        token: 'peer-virtual',
+        serverId: input.serverId,
+        serverName: input.serverName,
+        createdAt: Date.now(),
+      }
+      const entry: PoolEntry = {
+        record,
+        client: createClientFor(record, input.fetchImpl),
+        unsubscribe: () => {},
+        virtual: true,
+      }
+      attach(entry)
+      pool.set(record.id, entry)
+      // The virtual client dials through the mux: a session that is not
+      // established YET fails the handshake exactly like a dead network —
+      // the client's own ladder retries until the mux path exists.
+      void entry.client.connect().catch(() => {})
+      const view = entries().find((candidate) => candidate.entryId === record.id)
+      return view as RelayPoolEntryView
+    },
+
+    unmountVirtual(entryId) {
+      const entry = pool.get(entryId)
+      if (entry === undefined || entry.virtual !== true) return false
+      detach(entry)
+      options.onServerRemoved?.({ entryId, serverId: entry.record.serverId, reason: 'virtual' })
+      return true
+    },
+
+    isVirtual(entryId) {
+      return pool.get(entryId)?.virtual === true
     },
 
     unpairAll() {

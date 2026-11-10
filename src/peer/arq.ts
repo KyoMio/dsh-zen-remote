@@ -145,6 +145,13 @@ function makeWaiter(): TxWaiter {
     resolve = res
     reject = rej
   })
+  // Rejection safety net (PG-8): a stream teardown (RST / closeAll) rejects
+  // EVERY waiter it finds — including ones whose consumer raced away or has
+  // not attached its own handler yet. One no-op catch makes the rejection
+  // never "unhandled" at the process level; callers' own await/catch still
+  // see the error exactly as before (Node counts handlers, and this no-op
+  // does not swallow their observation of the rejection).
+  promise.catch(() => {})
   const waiter: TxWaiter = {
     promise,
     remaining: 0,

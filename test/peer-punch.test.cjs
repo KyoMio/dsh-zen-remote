@@ -203,8 +203,17 @@ async function closeManager(pair) {
   await closed
 }
 
-/** A scripted STUN gateway: verifies the probe signature, answers per behavior(). */
-async function startFakeStun() {
+/**
+ * A scripted STUN gateway speaking the REAL gateway-server wire format
+ * (gateway-server/src/peer-hub/udp-stun.ts): request
+ * `{type:'stun-probe', …, signatureHex}` signed over
+ * `zr-stun-probe-v1|<networkId>|<nodeId>|<nonce>|<timestamp>`, reply
+ * `{type:'stun-reply', nonce, reflexiveIp, reflexivePort, serverPortRole}`.
+ * The `legacy` flag flips the reply to the pre-PG-8 node shape
+ * (`{kind:'zr-stun-reply', ip, port}`) so the node's dual-format reply
+ * parsing stays pinned.
+ */
+async function startFakeStun({ legacy = false, role = 'primary' } = {}) {
   const socket = await openSocket('127.0.0.1')
   const seen = []
   let behavior = (_packet, rinfo) => ({ ip: rinfo.address, port: rinfo.port })
@@ -218,10 +227,10 @@ async function startFakeStun() {
     let sigOk = false
     try {
       const message = Buffer.from(
-        `zr-stun-v1|probe|${packet.networkId}|${packet.nodeId}|${packet.nonce}|${packet.timestamp}`,
+        `zr-stun-probe-v1|${packet.networkId}|${packet.nodeId}|${packet.nonce}|${packet.timestamp}`,
         'utf8',
       )
-      sigOk = ed25519VerifyHex(message, packet.publicKeyHex, packet.sigHex)
+      sigOk = ed25519VerifyHex(message, packet.publicKeyHex, packet.signatureHex)
     } catch {
       sigOk = false
     }
@@ -229,13 +238,16 @@ async function startFakeStun() {
     if (!sigOk) return
     const reply = behavior(packet, rinfo)
     if (!reply) return
-    const out = Buffer.from(JSON.stringify({
-      zr: 1,
-      kind: 'zr-stun-reply',
-      nonce: reply.nonce ?? packet.nonce,
-      ip: reply.ip,
-      port: reply.port,
-    }))
+    const nonce = reply.nonce ?? packet.nonce
+    const out = legacy
+      ? Buffer.from(JSON.stringify({ zr: 1, kind: 'zr-stun-reply', nonce, ip: reply.ip, port: reply.port }))
+      : Buffer.from(JSON.stringify({
+          type: 'stun-reply',
+          nonce,
+          reflexiveIp: reply.ip,
+          reflexivePort: reply.port,
+          serverPortRole: role,
+        }))
     socket.send(out, rinfo.port, rinfo.address)
   })
   return {
@@ -451,6 +463,63 @@ test('probe: malformed arguments throw before any socket work', async () => {
     () => probeStunNatType({ primaryHost: '127.0.0.1', primaryPort: 1, networkId: NET_ID, identity: { publicKeyHex: 'zz' } }),
     TypeError,
   )
+})
+
+test('probe: a REUSED punch socket answers its own port and stays open', async () => {
+  const primary = await startFakeStun()
+  const socket = await openSocket('127.0.0.1')
+  try {
+    const result = await probeStunNatType({
+      primaryHost: '127.0.0.1',
+      primaryPort: primary.port,
+      networkId: NET_ID,
+      identity: PROBE_IDENTITY,
+      socket,
+      timeoutMs: 300,
+    })
+    assert.match(result.reflexiveEndpoint ?? '', new RegExp(`^127\\.0\\.0\\.1:${socket.address().port}$`),
+      'the reflexive endpoint must be the REUSED socket\'s own bound port')
+    // 单端口探测（无 altPort）本就判不出 NAT 类型：'unknown' 是单端口语义。
+    assert.equal(result.natType, 'unknown', 'a single-port probe stays unknown (no alt mapping to compare)')
+    // 复用不关闭：socket 仍可用于后续收发（打洞层继续持有）。
+    const stillOpen = await new Promise((resolve, reject) => {
+      const probe = Buffer.from(JSON.stringify({ ping: 1 }))
+      socket.send(probe, primary.port, '127.0.0.1', (err) => resolve(err === null))
+      setTimeout(() => resolve(false), 300).unref?.()
+    })
+    assert.equal(stillOpen, true, 'the reused socket stays open after the probe')
+  } finally {
+    socket.close()
+    await waitClose(socket)
+    await primary.close()
+  }
+})
+
+test('probe: the packet speaks the real gateway-server wire format', async () => {
+  const primary = await startFakeStun()
+  try {
+    await probeBoth(primary, primary, 200)
+    const packet = primary.seen[0].packet
+    assert.equal(packet.type, 'stun-probe', "the request's type field is 'stun-probe'")
+    assert.equal(typeof packet.signatureHex, 'string', 'the signature rides signatureHex (gateway field name)')
+    assert.equal(packet.publicKeyHex, PROBE_IDENTITY.publicKeyHex)
+    assert.match(packet.nonce, /^[0-9a-f]{16}$/, 'nonce is even-length hex (gateway validator accepts it)')
+  } finally {
+    await primary.close()
+  }
+})
+
+test('probe: the legacy {kind:zr-stun-reply, ip, port} reply shape still parses', async () => {
+  const primary = await startFakeStun({ legacy: true })
+  const alt = await startFakeStun({ legacy: true })
+  try {
+    const result = await probeBoth(primary, alt)
+    assert.equal(result.natType, 'public', 'legacy replies classify identically')
+    assert.match(result.reflexiveEndpoint, /^127\.0\.0\.1:\d+$/)
+  } finally {
+    await primary.close()
+    await alt.close()
+  }
 })
 
 // -- 3. the 1000ms punch state machine on real loopback UDP --------------------------
