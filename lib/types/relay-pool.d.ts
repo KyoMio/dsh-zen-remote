@@ -26,6 +26,7 @@
  * that record and calls `credentialsChanged()`. `createClient` is injectable:
  * the tests drive the whole lifecycle without a socket.
  */
+import type { ConfigSource } from './config.js';
 import { createRelayClient } from './relay-client.js';
 import type { RelayClient, RelayClock, RelayState } from './relay-client.js';
 import { MAX_PAIRED_SERVERS } from './state-store.js';
@@ -95,10 +96,26 @@ export interface RelayPoolOptions {
         serverId?: string;
         reason: RelayPoolRemovalReason;
     }) => void;
+    /** The locally configured cap (`resolveConfig`'s `maxServers`), live.
+     * Missing answers {@link MAX_PAIRED_SERVERS}. */
+    getMaxServers?: () => number;
+    /** Which config layer supplied the current `maxServers` (live). Only
+     * `'default'` lets the network's cap win OUTRIGHT; a user-chosen value is
+     * only lowered by it, never raised. Missing behaves like `'default'`. */
+    getMaxServersSource?: () => ConfigSource | undefined;
+    /** The gateway's announced peer cap (peer mode: the state file's
+     * `peerNetwork.maxPeersFromGateway`), live. Missing/undefined means "no
+     * network cap known" and the local configuration answers alone. */
+    getPeerNetworkCap?: () => number | undefined;
 }
 export interface RelayPool {
     /** Every entry in pairing order, with fresh display names. */
     entries(): RelayPoolEntryView[];
+    /** The EFFECTIVE pairing cap right now (PG-2): the locally configured
+     * `maxServers` (its getter is live), except in peer mode under a network-
+     * reported `maxPeersFromGateway`, where a default-layer config takes the
+     * gateway's cap outright and a user-chosen one is only lowered by it. */
+    maxServers(): number;
     /** Locate one entry by its state-file record id. */
     getByEntryId(entryId: string): RelayPoolEntryView | undefined;
     /** Locate one entry by its (handshake or persisted) server id. */

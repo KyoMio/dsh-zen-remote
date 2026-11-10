@@ -18,7 +18,7 @@
 | `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
 | `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（两角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff）、`debug-report`（脱敏诊断报告，via 墙先于分派，CU-3） |
 | `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
-| `src/state-store.ts` | 主进程三合一状态存储（MS-1）：`~/.dsh/zen-remote-state.json`（0600、tmp+rename 原子写）统一承载本机 `serverId`、共享表、已配对服务端（最多 8 条），并做旧 `zen-remote-server.json` / `zen-remote-shares.json` 的一次性自动迁移与清理 |
+| `src/state-store.ts` | 主进程三合一状态存储（MS-1）：`~/.dsh/zen-remote-state.json`（0600、tmp+rename 原子写）统一承载本机 `serverId`、共享表、已配对服务端（上限 `maxServers`，默认 8，PG-2 起可配），并做旧 `zen-remote-server.json` / `zen-remote-shares.json` 的一次性自动迁移与清理；PG-2 起另承载 peer 三块：`peerIdentity`（自证明 Ed25519 身份，读时校验 nodeId=hash(key)，坏块丢弃重建）、`peerNetwork`（入网成员记录）、`pinnedPeers`（本地 TOFU 公钥锚定，`verifyOrPinPeerKey` 绝不自动覆盖、`repinPeerKey` 仅显式调用换锚） |
 | `src/share-store.ts` | 共享会话表（读写 `~/.dsh/zen-remote-state.json` 的 `sessions` 段，持久化，重启恢复），中继访问控制的事实来源 |
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
 | `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |

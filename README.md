@@ -266,6 +266,7 @@ Each field resolves in order: **environment variable > plugin row settings > `~/
 | `pushSummary` | off | Include up to 120 chars of the final reply in notification bodies |
 | `pushTool` | on | Register the model-callable `push_notify` tool |
 | `idleHours` | `48` | Idle-sleep window in hours for shared sessions; range `(0, 8760]` |
+| `maxServers` *(client)* | `8` | How many servers one sub-client may keep paired at once; integer `1..64`, read live (no reload needed); env `LAN_GATE_MAX_SERVERS` outranks it. In peer mode a network-reported `maxPeersFromGateway` wins outright while this field is untouched, and only lowers it otherwise |
 | `autoShareNewSessions` | off | Automatically enable remote access on new sessions created on the host |
 | `pluginBridgeConsent` | `{}` | Whole-machine data consent map (`pluginName -> boolean`) for the plugin bridge |
 | `serverUrl` *(client)* | empty | Remote server gateway URL (`https://` required for public hosts; `http://` allowed on private LAN/Tailscale ranges). Legacy single-server field: the paired list now lives in `~/.dsh/zen-remote-state.json` (up to 8 servers) and these row credentials migrate into it automatically on first start |

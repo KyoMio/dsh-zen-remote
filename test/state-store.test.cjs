@@ -343,3 +343,318 @@ test('writeStateFile merges over the disk state: a partial updater never erases 
   assert.deepEqual(state.sessions, { s1: { sharedAt: 1, lastActivityAt: 2 } }, 'the belt keeps sessions')
   assert.equal(state.servers.length, 1, 'the field the updater DID name still lands')
 })
+
+// ---- 8. PG-2: the dynamic pairing cap ---------------------------------------
+
+test('upsertPairedServer honors the maxServers input; the default stays 8 (PG-2)', (t) => {
+  const { upsertPairedServer, listPairedServers } = mod
+  const file = tempStateFile(t)
+
+  // Default: the ninth NEW address is still refused (existing behavior).
+  for (let i = 1; i <= 8; i += 1) {
+    assert.equal(upsertPairedServer(file, { serverUrl: `http://10.0.0.${i}:3088`, token: `t${i}` }).ok, true)
+  }
+  assert.deepEqual(
+    upsertPairedServer(file, { serverUrl: 'http://10.0.1.1:3088', token: 't9' }),
+    { ok: false, code: 'limit-reached' },
+    'without the input the cap stays at the default 8',
+  )
+
+  // A DIFFERENT file with maxServers 16: the 9th..16th fit, the 17th refuses.
+  const wide = tempStateFile(t)
+  for (let i = 1; i <= 16; i += 1) {
+    const result = upsertPairedServer(wide, { serverUrl: `http://10.1.${Math.floor(i / 250)}.${(i % 250) + 1}:3088`, token: `t${i}`, maxServers: 16 })
+    assert.equal(result.ok, true, `server ${i} fits under maxServers 16`)
+  }
+  assert.equal(listPairedServers(wide).length, 16)
+  assert.deepEqual(
+    upsertPairedServer(wide, { serverUrl: 'http://10.2.2.2:3088', token: 't17', maxServers: 16 }),
+    { ok: false, code: 'limit-reached' },
+    'the 17th NEW address is refused at 16/16',
+  )
+  assert.equal(listPairedServers(wide).length, 16, 'the refusal wrote nothing')
+
+  // A TIGHT cap: maxServers 2 refuses the 3rd.
+  const tight = tempStateFile(t)
+  assert.equal(upsertPairedServer(tight, { serverUrl: 'http://10.3.0.1:3088', token: 'a', maxServers: 2 }).ok, true)
+  assert.equal(upsertPairedServer(tight, { serverUrl: 'http://10.3.0.2:3088', token: 'b', maxServers: 2 }).ok, true)
+  assert.deepEqual(
+    upsertPairedServer(tight, { serverUrl: 'http://10.3.0.3:3088', token: 'c', maxServers: 2 }),
+    { ok: false, code: 'limit-reached' },
+  )
+
+  // A re-pair of an EXISTING address never hits the cap — even over it (the
+  // list shrank? no — the cap can be exceeded only by a REMOVED input).
+  const repair = upsertPairedServer(tight, { serverUrl: 'http://10.3.0.1:3088/', token: 'a-new', maxServers: 2 })
+  assert.equal(repair.ok, true)
+  assert.equal(repair.replaced, true)
+
+  // A garbage input value degrades to the DEFAULT cap (8) — never to "zero"
+  // (which would refuse everything) nor to "infinite": the 3rd entry fits
+  // again, exactly as it would without the input.
+  assert.equal(upsertPairedServer(tight, { serverUrl: 'http://10.3.0.3:3088', token: 'c', maxServers: 0 }).ok, true, 'an illegal cap falls back to the default 8')
+  assert.equal(upsertPairedServer(tight, { serverUrl: 'http://10.3.0.4:3088', token: 'd', maxServers: 2.5 }).ok, true)
+  assert.equal(upsertPairedServer(tight, { serverUrl: 'http://10.3.0.5:3088', token: 'e', maxServers: Number.NaN }).ok, true)
+  for (let i = 6; i <= 8; i += 1) {
+    assert.equal(upsertPairedServer(tight, { serverUrl: `http://10.3.0.${i}:3088`, token: `t${i}` }).ok, true, `fallback default still admits server ${i}`)
+  }
+  assert.equal(upsertPairedServer(tight, { serverUrl: 'http://10.3.0.9:3088', token: 't9' }).ok, false, 'the fallback default still refuses the 9th')
+})
+
+// ---- 9. PG-2: peer identity / network / TOFU pinning storage -----------------
+
+/** An Ed25519 identity for the TOFU tests, via the peer crypto module. */
+let peerCrypto
+test.before(async () => {
+  peerCrypto = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'peer', 'crypto.js')).href)
+})
+
+test('ensurePeerIdentity: a fresh machine gets a 0600 identity and serverId = nodeId; a call again reuses it (PG-2)', (t) => {
+  const { ensurePeerIdentity, readStateFile } = mod
+  const file = tempStateFile(t)
+
+  const first = ensurePeerIdentity(file)
+  assert.match(first.nodeId, /^[0-9a-f]{8}$/, 'the node id is an 8-hex self-certifying id')
+  assert.match(first.publicKeyHex, /^[0-9a-f]{64}$/, 'the public key is 64 lowercase hex chars')
+  assert.match(first.privateKeyHex, /^[0-9a-f]{64}$/, 'the private seed is 64 lowercase hex chars')
+  assert.equal(peerCrypto.verifySelfCertifyingNodeId(first.nodeId, first.publicKeyHex), true, 'the id is the hash of the key')
+  assert.equal(first.serverId, first.nodeId, 'a machine with no serverId adopts the nodeId as its serverId')
+
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'the identity lives in the 0600 state file')
+  const state = readStateFile(file)
+  assert.deepEqual(
+    { nodeId: state.peerIdentity.nodeId, publicKeyHex: state.peerIdentity.publicKeyHex, privateKeyHex: state.peerIdentity.privateKeyHex },
+    { nodeId: first.nodeId, publicKeyHex: first.publicKeyHex, privateKeyHex: first.privateKeyHex },
+  )
+  assert.equal(typeof state.peerIdentity.createdAt, 'number')
+
+  // A second call is a pure read: same identity, no regeneration.
+  const second = ensurePeerIdentity(file)
+  assert.deepEqual(
+    { nodeId: second.nodeId, publicKeyHex: second.publicKeyHex, privateKeyHex: second.privateKeyHex },
+    { nodeId: first.nodeId, publicKeyHex: first.publicKeyHex, privateKeyHex: first.privateKeyHex },
+  )
+})
+
+test('ensurePeerIdentity: an existing legal serverId is never overwritten by the nodeId (PG-2)', (t) => {
+  const { ensurePeerIdentity, writeStateFile, readStateFile } = mod
+  const file = tempStateFile(t)
+  writeStateFile(file, () => ({ version: 1, serverId: 'abcd1234' }))
+
+  const identity = ensurePeerIdentity(file)
+  assert.equal(identity.nodeId, identity.nodeId)
+  assert.notEqual(identity.nodeId, 'abcd1234', 'the fresh nodeId has no reason to equal the old serverId')
+  assert.equal(identity.serverId, 'abcd1234', 'the OLD serverId is preserved')
+  assert.equal(readStateFile(file).serverId, 'abcd1234', 'and on disk too')
+
+  // A second call answers the same pair.
+  const again = ensurePeerIdentity(file)
+  assert.equal(again.nodeId, identity.nodeId)
+  assert.equal(again.serverId, 'abcd1234')
+})
+
+test('ensurePeerIdentity: a hostile or broken peerIdentity is regenerated, not trusted (PG-2)', (t) => {
+  const { ensurePeerIdentity, writeStateFile, readStateFile } = mod
+  const file = tempStateFile(t)
+  // A peerIdentity whose nodeId is NOT the hash of its key must never be
+  // reused — that is the whole self-certifying contract.
+  writeStateFile(file, (current) => ({
+    ...current,
+    version: 1,
+    peerIdentity: { publicKeyHex: 'ab'.repeat(32), privateKeyHex: 'cd'.repeat(32), nodeId: 'deadbeef', createdAt: 1 },
+  }))
+  const identity = ensurePeerIdentity(file)
+  assert.equal(peerCrypto.verifySelfCertifyingNodeId(identity.nodeId, identity.publicKeyHex), true, 'the regenerated identity is self-certifying')
+  assert.notEqual(identity.nodeId, 'deadbeef')
+
+  // A shape-broken identity (short key) regenerates too.
+  const file2 = tempStateFile(t)
+  writeStateFile(file2, (current) => ({
+    ...current,
+    version: 1,
+    peerIdentity: { publicKeyHex: 'abcd', privateKeyHex: 'ef01', nodeId: '12345678', createdAt: 1 },
+  }))
+  const fresh = ensurePeerIdentity(file2)
+  assert.equal(fresh.publicKeyHex.length, 64)
+})
+
+test('writePeerNetwork / readPeerNetwork round-trip; undefined clears; every other field survives (PG-2)', (t) => {
+  const { writePeerNetwork, readPeerNetwork, upsertPairedServer, readStateFile } = mod
+  const file = tempStateFile(t)
+
+  assert.equal(readPeerNetwork(file), undefined, 'no network yet')
+
+  const net = {
+    inviteUri: 'zr-net://gw.example.com:19393/9f4e2a1088c3b001#join-secret',
+    gatewayWsUrl: 'wss://gw.example.com:19393',
+    gatewayHttpOrigin: 'https://gw.example.com:19393',
+    networkId: '9f4e2a1088c3b001',
+    joinKey: 'join-secret',
+    disabledNodes: ['deadbeef'],
+    maxPeersFromGateway: 12,
+    joinedAt: 1000,
+  }
+  writePeerNetwork(file, net)
+  assert.deepEqual(readPeerNetwork(file), net, 'the record round-trips verbatim')
+
+  // Another writer must not clobber it (the three-in-one belt again).
+  upsertPairedServer(file, { serverUrl: 'http://10.0.0.1:3088', token: 't' })
+  assert.deepEqual(readPeerNetwork(file), net, 'a pairing write keeps the network record')
+
+  // Writing undefined removes the field — and only that field.
+  writePeerNetwork(file, undefined)
+  assert.equal(readPeerNetwork(file), undefined)
+  assert.equal(readStateFile(file).peerNetwork, undefined, 'the field left the file')
+  assert.equal(listLength(file), 1, 'the paired list survived the clear')
+})
+
+/** listPairedServers shorthand (the destructured import above stays stable). */
+function listLength(file) {
+  return mod.listPairedServers(file).length
+}
+
+test('setPeerNodeDisabled toggles a nodeId in peerNetwork.disabledNodes (PG-2)', (t) => {
+  const { writePeerNetwork, setPeerNodeDisabled, readPeerNetwork } = mod
+  const file = tempStateFile(t)
+  writePeerNetwork(file, {
+    gatewayWsUrl: 'wss://gw.example.com:19393',
+    gatewayHttpOrigin: 'https://gw.example.com:19393',
+    networkId: '9f4e2a1088c3b001',
+    joinedAt: 1000,
+  })
+
+  setPeerNodeDisabled(file, 'deadbeef', true)
+  assert.deepEqual(readPeerNetwork(file).disabledNodes, ['deadbeef'])
+  setPeerNodeDisabled(file, 'cafebeef', true)
+  assert.deepEqual(readPeerNetwork(file).disabledNodes, ['deadbeef', 'cafebeef'])
+  // Idempotent: disabling an already-disabled node must not duplicate it.
+  setPeerNodeDisabled(file, 'deadbeef', true)
+  assert.deepEqual(readPeerNetwork(file).disabledNodes, ['deadbeef', 'cafebeef'])
+
+  setPeerNodeDisabled(file, 'deadbeef', false)
+  assert.deepEqual(readPeerNetwork(file).disabledNodes, ['cafebeef'])
+  // Un-disable one that was never disabled: no error, no phantom entries.
+  setPeerNodeDisabled(file, '12345678', false)
+  assert.deepEqual(readPeerNetwork(file).disabledNodes, ['cafebeef'])
+  // Restoring the last one leaves the empty list, not undefined fields.
+  setPeerNodeDisabled(file, 'cafebeef', false)
+  assert.deepEqual(readPeerNetwork(file).disabledNodes, [])
+
+  // Without a network record there is nothing to toggle: a silent no-op.
+  const bare = tempStateFile(t)
+  assert.doesNotThrow(() => setPeerNodeDisabled(bare, 'deadbeef', true))
+  assert.equal(mod.readPeerNetwork(bare), undefined)
+})
+
+test('verifyOrPinPeerKey: pin-new → matched → key-mismatch, and never an auto-overwrite (PG-2)', (t) => {
+  const { verifyOrPinPeerKey, writeStateFile, readStateFile } = mod
+  const file = tempStateFile(t)
+
+  const honest = peerCrypto.generatePeerIdentity()
+  const collided = peerCrypto.generatePeerIdentity()
+
+  // A key whose id is not its hash is refused before anything is written.
+  const bad = peerCrypto.generatePeerIdentity()
+  assert.deepEqual(verifyOrPinPeerKey(file, 'deadbeef', bad.publicKeyHex), { ok: false, code: 'invalid-self-cert' })
+  assert.equal((readStateFile(file).pinnedPeers ?? {}).deadbeef, undefined, 'nothing was pinned')
+  // A malformed key shape lands in the same bucket (verify fails).
+  assert.deepEqual(verifyOrPinPeerKey(file, honest.nodeId, 'nothex'), { ok: false, code: 'invalid-self-cert' })
+
+  // First sight: pin it.
+  const first = verifyOrPinPeerKey(file, honest.nodeId, honest.publicKeyHex, 1000)
+  assert.deepEqual(first, { ok: true, status: 'pinned-new' })
+  const pinned = readStateFile(file).pinnedPeers[honest.nodeId]
+  assert.equal(pinned.publicKeyHex, honest.publicKeyHex)
+  assert.equal(pinned.firstSeenAt, 1000)
+  assert.equal(pinned.updatedAt, 1000)
+
+  // Second sight, same key: matched, and the pin is untouched.
+  const second = verifyOrPinPeerKey(file, honest.nodeId, honest.publicKeyHex, 2000)
+  assert.deepEqual(second, { ok: true, status: 'matched' })
+  assert.equal(readStateFile(file).pinnedPeers[honest.nodeId].updatedAt, 1000, 'a match is a read, not a write')
+
+  // A key that does NOT self-certify for this node id (the ordinary wrong
+  // peer / ordinary attack) can never even reach the pin comparison: it is
+  // invalid-self-cert, and the anchor is untouched.
+  const notForThisId = verifyOrPinPeerKey(file, honest.nodeId, collided.publicKeyHex, 3000)
+  assert.deepEqual(notForThisId, { ok: false, code: 'invalid-self-cert' })
+  assert.equal(readStateFile(file).pinnedPeers[honest.nodeId].publicKeyHex, honest.publicKeyHex)
+
+  // The key-mismatch branch fires for a DIFFERENT key that IS self-certifying
+  // for the same node id — a 32-bit hash collision, exactly the attack the
+  // TOFU anchor exists for. No honest test can mine one, so the disk is set
+  // into the post-collision state directly: the anchor for honest.nodeId
+  // holds the collided key, the wire presents the honest key (which still
+  // self-certifies for the id). The anchor must NOT move.
+  writeStateFile(file, (current) => ({
+    ...current,
+    version: 1,
+    pinnedPeers: { ...current.pinnedPeers, [honest.nodeId]: { publicKeyHex: collided.publicKeyHex, firstSeenAt: 1, updatedAt: 2 } },
+  }))
+  const mismatch = verifyOrPinPeerKey(file, honest.nodeId, honest.publicKeyHex, 3000)
+  assert.equal(mismatch.ok, false)
+  assert.equal(mismatch.code, 'key-mismatch')
+  assert.equal(mismatch.expectedPublicKeyHex, collided.publicKeyHex, 'the report names the pinned key')
+  assert.equal(readStateFile(file).pinnedPeers[honest.nodeId].publicKeyHex, collided.publicKeyHex, 'the anchor was NOT auto-overwritten')
+  assert.equal(readStateFile(file).pinnedPeers[honest.nodeId].updatedAt, 2, 'and not even a timestamp moved')
+})
+
+test('repinPeerKey: only an explicit call moves the anchor, and it verifies first (PG-2)', (t) => {
+  const { repinPeerKey, verifyOrPinPeerKey, writeStateFile, readStateFile } = mod
+  const file = tempStateFile(t)
+
+  const honest = peerCrypto.generatePeerIdentity()
+  const collided = peerCrypto.generatePeerIdentity()
+
+  assert.equal(verifyOrPinPeerKey(file, honest.nodeId, honest.publicKeyHex, 1000).status, 'pinned-new')
+
+  // An invalid replacement is refused and changes nothing.
+  assert.equal(repinPeerKey(file, honest.nodeId, 'nothex', 2000), false, 'a non-self-certifying key is refused')
+  assert.equal(repinPeerKey(file, honest.nodeId, collided.publicKeyHex, 2000), false, 'a key for a DIFFERENT id does not self-certify for this one')
+  assert.equal(readStateFile(file).pinnedPeers[honest.nodeId].publicKeyHex, honest.publicKeyHex)
+
+  // The collision world again (see the verifyOrPinPeerKey test): the anchor
+  // was subverted to the collided key; the user clicks 信任新身份 to trust
+  // the honest key. The explicit re-pin moves the anchor; firstSeenAt is
+  // preserved, updatedAt moves, and the NEXT verifyOrPinPeerKey answers
+  // matched for the restored key.
+  writeStateFile(file, (current) => ({
+    ...current,
+    version: 1,
+    pinnedPeers: { ...current.pinnedPeers, [honest.nodeId]: { publicKeyHex: collided.publicKeyHex, firstSeenAt: 1, updatedAt: 2 } },
+  }))
+  assert.equal(repinPeerKey(file, honest.nodeId, honest.publicKeyHex, 3000), true)
+  const pinned = readStateFile(file).pinnedPeers[honest.nodeId]
+  assert.equal(pinned.publicKeyHex, honest.publicKeyHex)
+  assert.equal(pinned.firstSeenAt, 1, 'the first-seen history is kept')
+  assert.equal(pinned.updatedAt, 3000)
+  assert.deepEqual(verifyOrPinPeerKey(file, honest.nodeId, honest.publicKeyHex, 4000), { ok: true, status: 'matched' })
+
+  // A re-pin of an UNPINNED node anchors it outright (verify passes, so the
+  // operator's explicit action is honored).
+  const fresh = peerCrypto.generatePeerIdentity()
+  assert.equal(repinPeerKey(file, fresh.nodeId, fresh.publicKeyHex, 6000), true)
+  assert.equal(readStateFile(file).pinnedPeers[fresh.nodeId].publicKeyHex, fresh.publicKeyHex)
+})
+
+test('the peer fields ride the write belt: a pairing write never wipes identity/network/pins (PG-2)', (t) => {
+  const { ensurePeerIdentity, writePeerNetwork, verifyOrPinPeerKey, upsertPairedServer, readStateFile } = mod
+  const file = tempStateFile(t)
+  const identity = ensurePeerIdentity(file)
+  writePeerNetwork(file, {
+    gatewayWsUrl: 'wss://gw.example.com:19393',
+    gatewayHttpOrigin: 'https://gw.example.com:19393',
+    networkId: '9f4e2a1088c3b001',
+    joinedAt: 1000,
+  })
+  const peer = peerCrypto.generatePeerIdentity()
+  verifyOrPinPeerKey(file, peer.nodeId, peer.publicKeyHex)
+
+  upsertPairedServer(file, { serverUrl: 'http://10.0.0.1:3088', token: 't' })
+
+  const state = readStateFile(file)
+  assert.equal(state.serverId, identity.nodeId)
+  assert.equal(state.peerIdentity.nodeId, identity.nodeId, 'the identity survived a pairing write')
+  assert.equal(state.peerNetwork.networkId, '9f4e2a1088c3b001', 'the network survived a pairing write')
+  assert.equal(state.pinnedPeers[peer.nodeId].publicKeyHex, peer.publicKeyHex, 'the pin survived a pairing write')
+})

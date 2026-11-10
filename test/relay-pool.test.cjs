@@ -386,3 +386,133 @@ test('queueDeviceNameAll broadcasts; reconnect and probeAndRestoreAll target off
   pool.stop()
   assert.equal(created.every((client) => client.stopped), true, 'stop() tears every client down')
 })
+
+// ---- PG-2: the dynamic maxServers cap -----------------------------------------
+
+test('pool.maxServers(): default 8, the live getter wins, and pair() forwards the dynamic cap', async (t) => {
+  const stateFile = tempStateFile(t)
+  const env = new Map()
+  const { factory } = makeFakeClientFactory(env)
+  let configured = 8
+  const pool = mod.createRelayPool(baseOptions(stateFile, {
+    createClient: factory,
+    getMaxServers: () => configured,
+  }))
+
+  assert.equal(pool.maxServers(), 8, 'the getter starts at the default 8')
+  assert.equal(mod.MAX_PAIRED_SERVERS, 8, 'the re-exported constant stays 8')
+
+  // Fill to 8/8 through pair() — the cap the getter reports is the cap pair
+  // enforces.
+  for (let i = 1; i <= 8; i += 1) {
+    const url = `http://10.0.0.${i}:3088`
+    env.set(`${url}|t${i}`, { serverId: String(i).padStart(8, '0'), serverName: `s${i}` })
+    const result = await pool.pair({ serverUrl: url, token: `t${i}` })
+    assert.equal(result.ok, true, `server ${i} fits`)
+  }
+  await settle()
+  assert.deepEqual(
+    await pool.pair({ serverUrl: 'http://10.0.1.1:3088', token: 't9' }),
+    { ok: false, code: 'limit-reached' },
+    'the ninth is refused at 8/8',
+  )
+
+  // The getter is LIVE (the volatile-field discipline): raising it to 16
+  // without any reload lets the ninth through immediately.
+  configured = 16
+  assert.equal(pool.maxServers(), 16)
+  env.set('http://10.0.1.1:3088|t9', { serverId: '99999999', serverName: 's9' })
+  const ninth = await pool.pair({ serverUrl: 'http://10.0.1.1:3088', token: 't9' })
+  assert.equal(ninth.ok, true, 'the raised cap admits the ninth server without a reload')
+  await settle()
+  assert.equal(pool.entries().length, 9)
+
+  // Lowering it again re-tightens the cap for the NEXT new address.
+  configured = 9
+  assert.deepEqual(
+    await pool.pair({ serverUrl: 'http://10.0.1.2:3088', token: 't10' }),
+    { ok: false, code: 'limit-reached' },
+  )
+  // A re-pair of an existing address still works over the cap.
+  const repair = await pool.pair({ serverUrl: 'http://10.0.0.1:3088', token: 't1' })
+  assert.equal(repair.ok, true)
+  assert.equal(repair.replaced, true)
+  pool.stop()
+})
+
+test('pool.maxServers(): no getters at all answers the module default', async (t) => {
+  const stateFile = tempStateFile(t)
+  const { factory } = makeFakeClientFactory(new Map())
+  const pool = mod.createRelayPool(baseOptions(stateFile, { createClient: factory }))
+  assert.equal(pool.maxServers(), 8, 'the plain pool keeps the historic 8')
+  pool.stop()
+})
+
+test('pool.maxServers(): the gateway cap applies only in peer mode, per the config source (PG-2)', async (t) => {
+  const stateFile = tempStateFile(t)
+  const { factory } = makeFakeClientFactory(new Map())
+  const mk = (overrides) => {
+    const pool = mod.createRelayPool(baseOptions(stateFile, { createClient: factory, ...overrides }))
+    const value = pool.maxServers()
+    pool.stop()
+    return value
+  }
+
+  // No network cap known: the configured value answers.
+  assert.equal(mk({ getMaxServers: () => 16 }), 16)
+
+  // A gateway cap with the config at its DEFAULT layer: the gateway wins.
+  assert.equal(mk({ getMaxServers: () => 8, getPeerNetworkCap: () => 12 }), 12, 'source default → maxPeersFromGateway')
+  // The source getter missing behaves like default (the peer wiring always
+  // passes it; the omission is a test-only composition).
+  assert.equal(mk({ getPeerNetworkCap: () => 12 }), 12)
+
+  // A user-configured cap (env/row/file): the TIGHTER of the two wins.
+  assert.equal(mk({ getMaxServers: () => 16, getPeerNetworkCap: () => 12, getMaxServersSource: () => 'env' }), 12, 'configured 16 under gateway 12 → 12')
+  assert.equal(mk({ getMaxServers: () => 10, getPeerNetworkCap: () => 12, getMaxServersSource: () => 'row' }), 10, 'configured 10 under gateway 12 → 10')
+  assert.equal(mk({ getMaxServers: () => 20, getPeerNetworkCap: () => 4, getMaxServersSource: () => 'file' }), 4)
+
+  // No gateway cap (peerNetwork absent → undefined): configured wins even in
+  // peer mode.
+  assert.equal(mk({ getMaxServers: () => 16, getPeerNetworkCap: () => undefined, getMaxServersSource: () => 'default' }), 16)
+
+  // The cap getter is consulted per call, never snapshotted at construction.
+  let configured = 8
+  let gatewayCap
+  const pool = mod.createRelayPool(baseOptions(stateFile, {
+    createClient: factory,
+    getMaxServers: () => configured,
+    getPeerNetworkCap: () => gatewayCap,
+    getMaxServersSource: () => 'default',
+  }))
+  assert.equal(pool.maxServers(), 8)
+  gatewayCap = 12
+  assert.equal(pool.maxServers(), 12, 'the network record arriving later changes the answer')
+  configured = 5
+  gatewayCap = undefined
+  assert.equal(pool.maxServers(), 5, 'and falling back moves with the live getter too')
+  pool.stop()
+})
+
+test('pool.pair() forwards the pool.maxServers() cap to the state store (PG-2)', async (t) => {
+  const stateFile = tempStateFile(t)
+  const env = new Map()
+  const { factory } = makeFakeClientFactory(env)
+  const pool = mod.createRelayPool(baseOptions(stateFile, {
+    createClient: factory,
+    getMaxServers: () => 2,
+  }))
+  for (let i = 1; i <= 2; i += 1) {
+    env.set(`http://10.4.0.${i}:3088|t${i}`, { serverId: String(i).padStart(8, '0'), serverName: `s${i}` })
+    assert.equal((await pool.pair({ serverUrl: `http://10.4.0.${i}:3088`, token: `t${i}` })).ok, true)
+  }
+  await settle()
+  assert.deepEqual(
+    await pool.pair({ serverUrl: 'http://10.4.0.3:3088', token: 't3' }),
+    { ok: false, code: 'limit-reached' },
+    'pair enforces the configured cap, not the constant',
+  )
+  const onDisk = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+  assert.equal(onDisk.servers.length, 2)
+  pool.stop()
+})

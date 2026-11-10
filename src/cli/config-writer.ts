@@ -54,6 +54,9 @@ export const ENV_VAR_BY_FIELD: Readonly<Partial<Record<keyof ZenRemoteConfig, st
   pushTool: 'DSH_PUSH_TOOL',
   pushEnabled: 'DSH_PUSH_ENABLED',
   pushSessionName: 'DSH_PUSH_SESSION_NAME',
+  // PG-2: the pairing cap has an env layer, so a CLI write must refuse when
+  // the variable shadows the file layer.
+  maxServers: 'LAN_GATE_MAX_SERVERS',
 }
 
 export interface WriteCliConfigOptions {

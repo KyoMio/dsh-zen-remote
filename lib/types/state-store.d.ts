@@ -64,11 +64,67 @@ export interface PairedServerRecord {
      * sidebar order and the -1/-2 numbering of duplicate display names. */
     createdAt: number;
 }
+/** This node's long-term peer-network identity (PG-2): a self-certifying
+ * Ed25519 key pair whose 8-hex `nodeId` is `sha256(publicKey)` truncated —
+ * anyone who sees the pair can verify the binding with one hash. The
+ * `privateKeyHex` seed is the most sensitive material in the whole state
+ * file; the 0600 mode is not optional. */
+export interface PeerIdentityRecord {
+    /** 32-byte raw Ed25519 public key, 64 lowercase hex chars. */
+    publicKeyHex: string;
+    /** 32-byte raw Ed25519 private seed, 64 lowercase hex chars. */
+    privateKeyHex: string;
+    /** `sha256(publicKeyHex bytes)` first 8 hex chars. */
+    nodeId: string;
+    /** When the identity was first materialized (epoch ms). */
+    createdAt: number;
+}
+/** This node's peer-network membership (PG-2): where the gateway lives,
+ * how to re-join, which nodes this machine disabled, and the peer cap the
+ * gateway announced. Written by the join flow; absent until joined. */
+export interface PeerNetworkRecord {
+    /** The `zr-net(s)://…` invite this machine joined through, kept for
+     * display/re-join; the join key fragment inside it is sensitive. */
+    inviteUri?: string;
+    /** The gateway's WebSocket endpoint. */
+    gatewayWsUrl: string;
+    /** The gateway's HTTP origin. */
+    gatewayHttpOrigin: string;
+    /** The 16-hex network id. */
+    networkId: string;
+    /** The invite's join key, when this machine is the one who holds it. */
+    joinKey?: string;
+    /** Node ids this machine's user disabled locally (never dial them). */
+    disabledNodes?: string[];
+    /** The peer cap the gateway announced (`maxPeersFromGateway`); the local
+     * `maxServers` config decides whether it wins outright or only lowers. */
+    maxPeersFromGateway?: number;
+    /** When this machine joined (epoch ms). */
+    joinedAt: number;
+}
+/** One TOFU-anchored peer public key (PG-2): the first public key this
+ * machine ever saw for `nodeId`, pinned on first sight. A later key for the
+ * same id is a `key-mismatch` — only an explicit user re-pin moves it. */
+export interface PinnedPeerKey {
+    /** The anchored 32-byte Ed25519 public key, 64 lowercase hex chars. */
+    publicKeyHex: string;
+    /** When the anchor was first pinned (epoch ms). */
+    firstSeenAt: number;
+    /** When the anchor last moved (a re-pin; epoch ms). */
+    updatedAt: number;
+}
 export interface ZenRemoteStateFile {
     version: 1;
     serverId?: string;
     sessions?: Record<string, PersistedShareRow>;
     servers?: PairedServerRecord[];
+    /** PG-2: the peer halves' three blocks — identity, network membership,
+     * TOFU anchors. `version` stays 1: readers of the older layout see a file
+     * whose fields they ignore, and the write belt below preserves fields it
+     * does not understand. */
+    peerIdentity?: PeerIdentityRecord;
+    peerNetwork?: PeerNetworkRecord;
+    pinnedPeers?: Record<string, PinnedPeerKey>;
 }
 /** The one legal shape of a persisted server id (relay-server.ts mints it). */
 export declare function isLegalServerId(value: unknown): value is string;
@@ -90,8 +146,9 @@ export declare function readStateFile(filePath: string): ZenRemoteStateFile;
  * that names only the field it owns must never erase the top-level fields it
  * did not name (the partial-updater shape caught in the MS-phase1 review). A
  * field the updater explicitly sets to `undefined` still goes away, so
- * removal stays expressible. The result is normalized to the four known
- * top-level fields before it reaches disk. Throws on I/O failure; callers
+ * removal stays expressible. The result is normalized to the known
+ * top-level fields (identity, table, list, and PG-2's peer blocks) before it
+ * reaches disk. Throws on I/O failure; callers
  * decide what that means (share-store records it, loadServerId degrades, the
  * migration helpers swallow it).
  */
@@ -124,8 +181,10 @@ export type UpsertPairingResult = {
     code: 'invalid-url' | 'limit-reached';
 };
 /**
- * Add or re-pair one server. A NEW address appends (refused past
- * {@link MAX_PAIRED_SERVERS}); an EXISTING address updates in place — same
+ * Add or re-pair one server. A NEW address appends (refused past the
+ * effective cap — `input.maxServers` when it is a legal positive integer,
+ * {@link MAX_PAIRED_SERVERS} otherwise; PG-2 lets the pool pass its live
+ * configured cap here); an EXISTING address updates in place — same
  * entry id, same position, same `createdAt`, fresh token and device fields —
  * which is why the cap never blocks a re-pair.
  */
@@ -135,6 +194,7 @@ export declare function upsertPairedServer(filePath: string, input: {
     deviceId?: string;
     deviceName?: string;
     now?: number;
+    maxServers?: number;
 }): UpsertPairingResult;
 /**
  * Fold one completed handshake into the record: `serverId`, `serverName` and
@@ -176,4 +236,82 @@ export declare function ensureStateMigrated(home: string, legacyClient?: {
     serverUrl?: unknown;
     deviceToken?: unknown;
 }): void;
+/** What {@link ensurePeerIdentity} answers: the identity's three fields plus
+ * the server id this machine keeps for the RELAY half (which predates the
+ * peer network and is deliberately independent of it). */
+export interface PeerIdentityWithServerId {
+    /** 32-byte raw Ed25519 public key, 64 lowercase hex chars. */
+    publicKeyHex: string;
+    /** 32-byte raw Ed25519 private seed, 64 lowercase hex chars. */
+    privateKeyHex: string;
+    /** The self-certifying 8-hex node id. */
+    nodeId: string;
+    /** The relay half's identity: an already-paired machine's old 8-hex id,
+     * or — on a machine that never had one — the nodeId itself. */
+    serverId: string;
+}
+/**
+ * This node's long-term peer identity, created on first use and reused
+ * forever after (PG-2). A stored identity is reused only when it is still
+ * LEGAL — the self-certifying binding (`nodeId === sha256(publicKey)` head)
+ * must verify, so a corrupted or hostile file regenerates instead of loading.
+ *
+ * The relay half's `serverId` is NOT replaced by the nodeId: a machine that
+ * already carries one keeps it (an upgrade that silently re-identified a
+ * paired server would orphan every sub-client's pairing). Only a machine
+ * with no `serverId` at all adopts the `nodeId` as one — same 8-hex shape,
+ * one less identifier to mint.
+ *
+ * Writes are atomic and 0600 through {@link writeStateFile}; the belt keeps
+ * the share table and the paired list intact.
+ */
+export declare function ensurePeerIdentity(filePath: string, now?: number): PeerIdentityWithServerId;
+/** The peer-network membership record, validated at read; absent until a
+ * join wrote one. */
+export declare function readPeerNetwork(filePath: string): PeerNetworkRecord | undefined;
+/**
+ * Write (or clear, with `undefined`) the peer-network membership. The input
+ * is the wiring's own validated record; the READ path is what validates, so
+ * a hostile file degrades to "not joined" without touching the write door's
+ * passthrough contract.
+ */
+export declare function writePeerNetwork(filePath: string, net: PeerNetworkRecord | undefined): void;
+/**
+ * Toggle one node id on `peerNetwork.disabledNodes` — the per-machine
+ * "never dial this node" list. Idempotent both ways; without a network
+ * record there is nothing to toggle, so it is a silent no-op (an
+ * un-joined machine disables nobody).
+ */
+export declare function setPeerNodeDisabled(filePath: string, nodeId: string, disabled: boolean): void;
+/** What {@link verifyOrPinPeerKey} answers. */
+export type VerifyOrPinPeerKeyResult = {
+    ok: true;
+    status: 'pinned-new' | 'matched';
+} | {
+    ok: false;
+    code: 'invalid-self-cert' | 'key-mismatch';
+    expectedPublicKeyHex?: string;
+};
+/**
+ * The local TOFU anchor for one peer's public key (PG-2), the defense
+ * against a COMPROMISED GATEWAY feeding this machine a substituted
+ * identity: the peer network's self-certifying ids are only as good as the
+ * first (nodeId, publicKey) pair this machine chose to believe.
+ *
+ * First sight pins the key and answers `pinned-new`; an identical key
+ * answers `matched` (a read, not a write); a DIFFERENT key for a pinned id
+ * answers `key-mismatch` naming the anchored key and NEVER overwrites —
+ * moving the anchor is {@link repinPeerKey}'s job, behind an explicit user
+ * action only. A key whose hash does not produce `nodeId` is refused as
+ * `invalid-self-cert` before anything is read from disk.
+ */
+export declare function verifyOrPinPeerKey(filePath: string, nodeId: string, publicKeyHex: string, now?: number): VerifyOrPinPeerKeyResult;
+/**
+ * Move a TOFU anchor to a NEW key — ONLY for the machine's user explicitly
+ * choosing "trust the new identity" after a legitimate re-key (or the
+ * `key-mismatch` above). The replacement must itself be self-certifying for
+ * the nodeId; anything else is refused and the anchor stays put. Answers
+ * whether the anchor moved.
+ */
+export declare function repinPeerKey(filePath: string, nodeId: string, newPublicKeyHex: string, now?: number): boolean;
 //# sourceMappingURL=state-store.d.ts.map

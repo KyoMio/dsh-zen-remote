@@ -78,6 +78,8 @@ function makeRow(overrides = {}) {
     serverUrl: overrides.serverUrl !== undefined ? overrides.serverUrl : gwUrl,
     deviceToken: overrides.deviceToken !== undefined ? overrides.deviceToken : 'tok-row',
     role: 'client',
+    // PG-2: the row layer of maxServers, for the debug report's config plate.
+    ...(overrides.maxServers !== undefined ? { maxServers: overrides.maxServers } : {}),
   }
 }
 
@@ -98,6 +100,8 @@ function startClientServer(row, overrides = {}) {
     ...(overrides.getGatewaySummary !== undefined ? { getGatewaySummary: overrides.getGatewaySummary } : {}),
     ...(overrides.getProfileName !== undefined ? { getProfileName: overrides.getProfileName } : {}),
     ...(overrides.getPluginVersion !== undefined ? { getPluginVersion: overrides.getPluginVersion } : {}),
+    // PG-2: the live maxServers cap the status/claim routes read per request.
+    ...(overrides.getMaxServers !== undefined ? { getMaxServers: overrides.getMaxServers } : {}),
   })
   const server = http.createServer((req, res) => { void handler(req, res) })
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })))
@@ -1964,7 +1968,9 @@ function fakePool(entries, overrides = {}) {
       calls.pair.push(input)
       const existing = entries.find((entry) => entry.serverUrl === input.serverUrl)
       if (existing !== undefined) return { ok: true, entry: existing, replaced: true }
-      if (entries.length >= 8) return { ok: false, code: 'limit-reached' }
+      // The fake's own cap mirrors the real pool's pair(): the DYNAMIC cap
+      // (overrides.pairCap, default the historic 8), not a constant.
+      if (entries.length >= (typeof overrides.pairCap === 'number' ? overrides.pairCap : 8)) return { ok: false, code: 'limit-reached' }
       const view = {
         entryId: `fresh-${entries.length + 1}`,
         serverUrl: input.serverUrl,
@@ -2291,6 +2297,163 @@ test('MS-5 status pool mode: an empty pool answers unpaired with maxServers', as
   } finally {
     await closeServer(server)
   }
+})
+
+// ---- PG-2: the status/claim routes read the LIVE maxServers --------------------
+
+test('PG-2 status pool mode: maxServers follows the live getter, not the constant', async () => {
+  let configured = 16
+  const pool = fakePool([])
+  const { server, port } = await startClientServer(makeRow(), { pool, getMaxServers: () => configured })
+  try {
+    const first = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.equal(JSON.parse(first.body).maxServers, 16, 'the getter answer rides the status body')
+
+    // The getter is live: a config change (LAN_GATE_MAX_SERVERS edited, a
+    // peerNetwork cap) shows up on the very next request without any reload.
+    configured = 4
+    const second = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.equal(JSON.parse(second.body).maxServers, 4)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-2 claim pool mode: a raised cap admits the 9th pairing; the refusal stays local', async () => {
+  const entries = []
+  for (let i = 0; i < 8; i += 1) entries.push(makeEntry(`e${i}`, `0000000${i}`, `http://10.0.0.${i + 1}:3080`, `srv-${i}`))
+  const pool = fakePool(entries, { pairCap: 16 })
+  const { server, port } = await startClientServer(makeRow(), { pool, getMaxServers: () => 16 })
+  try {
+    const before = gwSeen.length
+    // The ninth NEW address is the mock gateway's own — the point is that
+    // the route PROCEEDS to the round-trip instead of refusing locally.
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: gwUrl, code: 'AAAAAA55', name: '第九台' },
+    })
+    assert.equal(res.status, 200, 'under a 16 cap the ninth NEW address is NOT refused locally')
+    assert.equal(gwSeen.length, before + 1, 'the claim round-trip reached the gateway')
+    assert.equal(pool.calls.pair.length, 1, 'the pairing landed in the pool')
+    assert.equal(JSON.parse(res.body).entryId, 'fresh-9', 'the ninth entry joined the pool')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-2 claim pool mode: a lowered cap refuses below 8 too', async () => {
+  const entries = []
+  for (let i = 0; i < 4; i += 1) entries.push(makeEntry(`e${i}`, `0000000${i}`, `http://10.0.0.${i + 1}:3080`, `srv-${i}`))
+  const pool = fakePool(entries)
+  const { server, port } = await startClientServer(makeRow(), { pool, getMaxServers: () => 4 })
+  try {
+    const before = gwSeen.length
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: 'http://10.9.9.9:3080', code: 'AAAAAA66', name: '第五台' },
+    })
+    assert.equal(res.status, 409)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, code: 'limit-reached' })
+    assert.equal(gwSeen.length, before, 'the tightened cap is still a local refusal')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+// ---- PG-2-fix: status / claim pre-check follow pool.maxServers(), not the raw config ----
+// The pool's maxServers() is the ONE synthesis point that folds the peer
+// mode's network-reported maxPeersFromGateway into the configured value, and
+// pool.pair() enforces exactly that number. The routes must answer the same
+// number — a config-raw read would split the cap into two truths in peer
+// mode (the pre-check admits what pair refuses, or the reverse).
+
+test('PG-2-fix status: maxServers reports pool.maxServers() over a diverging config value', async () => {
+  // Config getter says 8, the pool synthesizes 12 (peer mode, gateway cap).
+  const wide = fakePool([], { maxServers: () => 12 })
+  const { server, port } = await startClientServer(makeRow(), { pool: wide, getMaxServers: () => 8 })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.equal(JSON.parse(res.body).maxServers, 12, 'the pool synthesis wins over the raw config 8')
+  } finally { await closeServer(server) }
+
+  // Reversed: config says 16, the pool synthesizes 4 — the tight one wins.
+  const tight = fakePool([], { maxServers: () => 4 })
+  const { server: server2, port: port2 } = await startClientServer(makeRow(), { pool: tight, getMaxServers: () => 16 })
+  try {
+    const res = await request(port2, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    assert.equal(JSON.parse(res.body).maxServers, 4, 'the pool synthesis wins over the raw config 16')
+  } finally { await closeServer(server2) }
+})
+
+test('PG-2-fix claim: a pool cap HIGHER than the config admits the pairing', async () => {
+  // 8 entries, config cap 8 (would refuse), pool synthesis 12 (must admit):
+  // the pre-check must follow the pool — the same cap pair() will enforce.
+  const entries = []
+  for (let i = 0; i < 8; i += 1) entries.push(makeEntry(`e${i}`, `0000000${i}`, `http://10.0.0.${i + 1}:3080`, `srv-${i}`))
+  const pool = fakePool(entries, { pairCap: 12, maxServers: () => 12 })
+  const { server, port } = await startClientServer(makeRow(), { pool, getMaxServers: () => 8 })
+  try {
+    const before = gwSeen.length
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: gwUrl, code: 'AAAAAA77', name: '第九台' },
+    })
+    assert.equal(res.status, 200, 'the pool cap 12 admits the ninth despite the config cap 8')
+    assert.equal(gwSeen.length, before + 1, 'the claim round-trip reached the gateway')
+    assert.equal(pool.calls.pair.length, 1, 'the pairing landed in the pool')
+  } finally { await closeServer(server) }
+})
+
+test('PG-2-fix claim: a pool cap LOWER than the config refuses locally', async () => {
+  // 4 entries, config cap 16 (would admit), pool synthesis 4 (must refuse):
+  // the local pre-check spends no claim code on the wire.
+  const entries = []
+  for (let i = 0; i < 4; i += 1) entries.push(makeEntry(`e${i}`, `0000000${i}`, `http://10.0.0.${i + 1}:3080`, `srv-${i}`))
+  const pool = fakePool(entries, { pairCap: 4, maxServers: () => 4 })
+  const { server, port } = await startClientServer(makeRow(), { pool, getMaxServers: () => 16 })
+  try {
+    const before = gwSeen.length
+    const res = await request(port, {
+      method: 'POST',
+      path: routes.CLIENT_CLAIM_ROUTE,
+      headers: sameOrigin(port),
+      body: { serverUrl: 'http://10.9.9.9:3080', code: 'AAAAAA88', name: '第五台' },
+    })
+    assert.equal(res.status, 409, 'the pool cap 4 refuses the fifth despite the config cap 16')
+    assert.deepEqual(JSON.parse(res.body), { ok: false, code: 'limit-reached' })
+    assert.equal(gwSeen.length, before, 'the refusal is local — the gateway never saw the code')
+    assert.equal(pool.calls.pair.length, 0, 'nothing was paired')
+  } finally { await closeServer(server) }
+})
+
+test('PG-2 debug report: the config plate names the resolved maxServers', async () => {
+  const row = makeRow({ maxServers: 12 })
+  const { server, port } = await startClientServer(row, {
+    getLogSnapshot: () => [],
+    getPluginVersion: () => '2.3.6',
+  })
+  try {
+    const res = await request(port, { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE })
+    assert.equal(res.status, 200)
+    const report = JSON.parse(res.body)
+    assert.equal(report.config.maxServers, 12, 'the row layer value reached the config plate')
+  } finally { await closeServer(server) }
+
+  // Without a row value the plate carries the default 8.
+  const { server: server2, port: port2 } = await startClientServer(makeRow(), {
+    getLogSnapshot: () => [],
+    getPluginVersion: () => '2.3.6',
+  })
+  try {
+    const res = await request(port2, { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE })
+    assert.equal(JSON.parse(res.body).config.maxServers, 8)
+  } finally { await closeServer(server2) }
 })
 
 test('MS-5 status pool mode: the row credentials are never consulted, the pool is the truth', async () => {

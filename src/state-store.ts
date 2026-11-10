@@ -35,6 +35,7 @@ import { randomBytes } from 'node:crypto'
 import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { normalizeServerUrl } from './client-pairing.js'
+import { generatePeerIdentity, verifySelfCertifyingNodeId } from './peer/crypto.js'
 
 /** The one state file this module owns, always directly under DSH_HOME. */
 export const STATE_FILE_NAME = 'zen-remote-state.json'
@@ -50,6 +51,10 @@ export const MAX_PAIRED_SERVERS = 8
 
 /** The 8-hex short server id shape (`randomBytes(4).toString('hex')`). */
 const SERVER_ID_PATTERN = /^[0-9a-f]{8}$/
+
+/** A 32-byte key in 64 lowercase hex chars — the Ed25519 identity keys'
+ * persisted shape (PG-2). */
+const KEY_HEX_PATTERN = /^[0-9a-f]{64}$/
 
 /** One row of the persisted share table (verbatim from share-store.ts). */
 export interface PersistedShareRow {
@@ -79,11 +84,70 @@ export interface PairedServerRecord {
   createdAt: number
 }
 
+/** This node's long-term peer-network identity (PG-2): a self-certifying
+ * Ed25519 key pair whose 8-hex `nodeId` is `sha256(publicKey)` truncated —
+ * anyone who sees the pair can verify the binding with one hash. The
+ * `privateKeyHex` seed is the most sensitive material in the whole state
+ * file; the 0600 mode is not optional. */
+export interface PeerIdentityRecord {
+  /** 32-byte raw Ed25519 public key, 64 lowercase hex chars. */
+  publicKeyHex: string
+  /** 32-byte raw Ed25519 private seed, 64 lowercase hex chars. */
+  privateKeyHex: string
+  /** `sha256(publicKeyHex bytes)` first 8 hex chars. */
+  nodeId: string
+  /** When the identity was first materialized (epoch ms). */
+  createdAt: number
+}
+
+/** This node's peer-network membership (PG-2): where the gateway lives,
+ * how to re-join, which nodes this machine disabled, and the peer cap the
+ * gateway announced. Written by the join flow; absent until joined. */
+export interface PeerNetworkRecord {
+  /** The `zr-net(s)://…` invite this machine joined through, kept for
+   * display/re-join; the join key fragment inside it is sensitive. */
+  inviteUri?: string
+  /** The gateway's WebSocket endpoint. */
+  gatewayWsUrl: string
+  /** The gateway's HTTP origin. */
+  gatewayHttpOrigin: string
+  /** The 16-hex network id. */
+  networkId: string
+  /** The invite's join key, when this machine is the one who holds it. */
+  joinKey?: string
+  /** Node ids this machine's user disabled locally (never dial them). */
+  disabledNodes?: string[]
+  /** The peer cap the gateway announced (`maxPeersFromGateway`); the local
+   * `maxServers` config decides whether it wins outright or only lowers. */
+  maxPeersFromGateway?: number
+  /** When this machine joined (epoch ms). */
+  joinedAt: number
+}
+
+/** One TOFU-anchored peer public key (PG-2): the first public key this
+ * machine ever saw for `nodeId`, pinned on first sight. A later key for the
+ * same id is a `key-mismatch` — only an explicit user re-pin moves it. */
+export interface PinnedPeerKey {
+  /** The anchored 32-byte Ed25519 public key, 64 lowercase hex chars. */
+  publicKeyHex: string
+  /** When the anchor was first pinned (epoch ms). */
+  firstSeenAt: number
+  /** When the anchor last moved (a re-pin; epoch ms). */
+  updatedAt: number
+}
+
 export interface ZenRemoteStateFile {
   version: 1
   serverId?: string
   sessions?: Record<string, PersistedShareRow>
   servers?: PairedServerRecord[]
+  /** PG-2: the peer halves' three blocks — identity, network membership,
+   * TOFU anchors. `version` stays 1: readers of the older layout see a file
+   * whose fields they ignore, and the write belt below preserves fields it
+   * does not understand. */
+  peerIdentity?: PeerIdentityRecord
+  peerNetwork?: PeerNetworkRecord
+  pinnedPeers?: Record<string, PinnedPeerKey>
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -97,6 +161,65 @@ function isFiniteNumber(value: unknown): value is number {
 /** The one legal shape of a persisted server id (relay-server.ts mints it). */
 export function isLegalServerId(value: unknown): value is string {
   return typeof value === 'string' && SERVER_ID_PATTERN.test(value)
+}
+
+// --- PG-2 field validators (read-time) --------------------------------------
+// Row-level validity is each consumer's business for the OLDER fields (the
+// share table validates rows, listPairedServers validates records); the peer
+// blocks get read-time validators here because they carry KEY MATERIAL: a
+// hostile or half-written block must degrade to absent, never load.
+
+/** A persisted identity is reusable only if its binding verifies: the nodeId
+ * must be the hash of the key — the whole PKI of the peer network, one line.
+ * A hand-edited or corrupted identity regenerates instead of loading. */
+function isLegalPeerIdentity(value: unknown): value is PeerIdentityRecord {
+  if (!isPlainObject(value)) return false
+  const { publicKeyHex, privateKeyHex, nodeId, createdAt } = value
+  return (
+    typeof publicKeyHex === 'string' && KEY_HEX_PATTERN.test(publicKeyHex)
+    && typeof privateKeyHex === 'string' && KEY_HEX_PATTERN.test(privateKeyHex)
+    && isLegalServerId(nodeId)
+    && isFiniteNumber(createdAt)
+    && verifySelfCertifyingNodeId(nodeId, publicKeyHex)
+  )
+}
+
+function normalizePeerNetwork(value: unknown): PeerNetworkRecord | undefined {
+  if (!isPlainObject(value)) return undefined
+  const { gatewayWsUrl, gatewayHttpOrigin, networkId, joinedAt } = value
+  if (typeof gatewayWsUrl !== 'string' || gatewayWsUrl === '') return undefined
+  if (typeof gatewayHttpOrigin !== 'string' || gatewayHttpOrigin === '') return undefined
+  if (typeof networkId !== 'string' || networkId === '') return undefined
+  if (!isFiniteNumber(joinedAt)) return undefined
+  const record: PeerNetworkRecord = { gatewayWsUrl, gatewayHttpOrigin, networkId, joinedAt }
+  if (typeof value.inviteUri === 'string' && value.inviteUri !== '') record.inviteUri = value.inviteUri
+  if (typeof value.joinKey === 'string' && value.joinKey !== '') record.joinKey = value.joinKey
+  if (Array.isArray(value.disabledNodes)) {
+    record.disabledNodes = value.disabledNodes.filter(
+      (node): node is string => typeof node === 'string' && SERVER_ID_PATTERN.test(node),
+    )
+  }
+  if (
+    isFiniteNumber(value.maxPeersFromGateway)
+    && Number.isInteger(value.maxPeersFromGateway)
+    && value.maxPeersFromGateway >= 1
+  ) {
+    record.maxPeersFromGateway = value.maxPeersFromGateway
+  }
+  return record
+}
+
+function normalizePinnedPeers(value: unknown): Record<string, PinnedPeerKey> | undefined {
+  if (!isPlainObject(value)) return undefined
+  const out: Record<string, PinnedPeerKey> = Object.create(null)
+  for (const [nodeId, entry] of Object.entries(value)) {
+    if (!SERVER_ID_PATTERN.test(nodeId) || !isPlainObject(entry)) continue
+    const { publicKeyHex, firstSeenAt, updatedAt } = entry
+    if (typeof publicKeyHex !== 'string' || !KEY_HEX_PATTERN.test(publicKeyHex)) continue
+    if (!isFiniteNumber(firstSeenAt) || !isFiniteNumber(updatedAt)) continue
+    out[nodeId] = { publicKeyHex, firstSeenAt, updatedAt }
+  }
+  return out
 }
 
 /**
@@ -126,9 +249,15 @@ export function readStateFile(filePath: string): ZenRemoteStateFile {
     if (isLegalServerId(parsed.serverId)) state.serverId = parsed.serverId
     // Row-level validity is each consumer's business (share-store validates
     // rows, listPairedServers validates records) — a legal container with a
-    // bad field just drops the field here.
+    // bad field just drops the field here. The PG-2 peer blocks are the
+    // exception: they carry key material, so a bad one drops at read time.
     if (isPlainObject(parsed.sessions)) state.sessions = parsed.sessions as Record<string, PersistedShareRow>
     if (Array.isArray(parsed.servers)) state.servers = parsed.servers as PairedServerRecord[]
+    if (isLegalPeerIdentity(parsed.peerIdentity)) state.peerIdentity = parsed.peerIdentity
+    const peerNetwork = normalizePeerNetwork(parsed.peerNetwork)
+    if (peerNetwork !== undefined) state.peerNetwork = peerNetwork
+    const pinnedPeers = normalizePinnedPeers(parsed.pinnedPeers)
+    if (pinnedPeers !== undefined) state.pinnedPeers = pinnedPeers
     return state
   }
   // Not a legal version:1 container. Salvage a bare legal serverId (the
@@ -153,8 +282,9 @@ export function readStateFile(filePath: string): ZenRemoteStateFile {
  * that names only the field it owns must never erase the top-level fields it
  * did not name (the partial-updater shape caught in the MS-phase1 review). A
  * field the updater explicitly sets to `undefined` still goes away, so
- * removal stays expressible. The result is normalized to the four known
- * top-level fields before it reaches disk. Throws on I/O failure; callers
+ * removal stays expressible. The result is normalized to the known
+ * top-level fields (identity, table, list, and PG-2's peer blocks) before it
+ * reaches disk. Throws on I/O failure; callers
  * decide what that means (share-store records it, loadServerId degrades, the
  * migration helpers swallow it).
  */
@@ -167,6 +297,11 @@ export function writeStateFile(filePath: string, updater: (current: ZenRemoteSta
   if (isLegalServerId(merged.serverId)) out.serverId = merged.serverId
   if (isPlainObject(merged.sessions)) out.sessions = merged.sessions
   if (Array.isArray(merged.servers)) out.servers = merged.servers
+  // The PG-2 peer blocks: write-time passthrough (the read path is the
+  // validator), so the three-in-one belt covers them exactly like the rest.
+  if (merged.peerIdentity !== undefined) out.peerIdentity = merged.peerIdentity
+  if (merged.peerNetwork !== undefined) out.peerNetwork = merged.peerNetwork
+  if (merged.pinnedPeers !== undefined) out.pinnedPeers = merged.pinnedPeers
   mkdirSync(dirname(filePath), { recursive: true })
   writeFileSync(`${filePath}.tmp`, JSON.stringify(out), { mode: 0o600 })
   // writeFileSync's mode only applies at creation; a leftover tmp from a
@@ -299,20 +434,25 @@ export type UpsertPairingResult =
   | { ok: false; code: 'invalid-url' | 'limit-reached' }
 
 /**
- * Add or re-pair one server. A NEW address appends (refused past
- * {@link MAX_PAIRED_SERVERS}); an EXISTING address updates in place — same
+ * Add or re-pair one server. A NEW address appends (refused past the
+ * effective cap — `input.maxServers` when it is a legal positive integer,
+ * {@link MAX_PAIRED_SERVERS} otherwise; PG-2 lets the pool pass its live
+ * configured cap here); an EXISTING address updates in place — same
  * entry id, same position, same `createdAt`, fresh token and device fields —
  * which is why the cap never blocks a re-pair.
  */
 export function upsertPairedServer(
   filePath: string,
-  input: { serverUrl: string; token: string; deviceId?: string; deviceName?: string; now?: number },
+  input: { serverUrl: string; token: string; deviceId?: string; deviceName?: string; now?: number; maxServers?: number },
 ): UpsertPairingResult {
   const normalized = normalizeServerUrl(input.serverUrl)
   if (!normalized.ok) return { ok: false, code: 'invalid-url' }
   const deviceId = typeof input.deviceId === 'string' && input.deviceId !== '' ? input.deviceId : undefined
   const deviceName = typeof input.deviceName === 'string' && input.deviceName !== '' ? input.deviceName : undefined
   const token = typeof input.token === 'string' ? input.token : ''
+  const cap = typeof input.maxServers === 'number' && Number.isInteger(input.maxServers) && input.maxServers >= 1
+    ? input.maxServers
+    : MAX_PAIRED_SERVERS
   const records = listPairedServers(filePath)
   const existingIndex = records.findIndex((record) => record.serverUrl === normalized.url)
   if (existingIndex !== -1) {
@@ -327,7 +467,7 @@ export function upsertPairedServer(
     writeStateFile(filePath, (current) => ({ ...current, version: 1, servers: nextServers }))
     return { ok: true, record: updated, replaced: true }
   }
-  if (records.length >= MAX_PAIRED_SERVERS) return { ok: false, code: 'limit-reached' }
+  if (records.length >= cap) return { ok: false, code: 'limit-reached' }
   const created = newPairedServerRecord(normalized.url, token, input.now, deviceId, deviceName)
   writeStateFile(filePath, (current) => ({ ...current, version: 1, servers: [...records, created] }))
   return { ok: true, record: created, replaced: false }
@@ -425,4 +565,156 @@ export function ensureStateMigrated(home: string, legacyClient?: { serverUrl?: u
       // Best effort — the legacy row credentials stay where they are.
     }
   }
+}
+
+// ---- PG-2: peer identity, network membership, TOFU pinning --------------------
+
+/** What {@link ensurePeerIdentity} answers: the identity's three fields plus
+ * the server id this machine keeps for the RELAY half (which predates the
+ * peer network and is deliberately independent of it). */
+export interface PeerIdentityWithServerId {
+  /** 32-byte raw Ed25519 public key, 64 lowercase hex chars. */
+  publicKeyHex: string
+  /** 32-byte raw Ed25519 private seed, 64 lowercase hex chars. */
+  privateKeyHex: string
+  /** The self-certifying 8-hex node id. */
+  nodeId: string
+  /** The relay half's identity: an already-paired machine's old 8-hex id,
+   * or — on a machine that never had one — the nodeId itself. */
+  serverId: string
+}
+
+/**
+ * This node's long-term peer identity, created on first use and reused
+ * forever after (PG-2). A stored identity is reused only when it is still
+ * LEGAL — the self-certifying binding (`nodeId === sha256(publicKey)` head)
+ * must verify, so a corrupted or hostile file regenerates instead of loading.
+ *
+ * The relay half's `serverId` is NOT replaced by the nodeId: a machine that
+ * already carries one keeps it (an upgrade that silently re-identified a
+ * paired server would orphan every sub-client's pairing). Only a machine
+ * with no `serverId` at all adopts the `nodeId` as one — same 8-hex shape,
+ * one less identifier to mint.
+ *
+ * Writes are atomic and 0600 through {@link writeStateFile}; the belt keeps
+ * the share table and the paired list intact.
+ */
+export function ensurePeerIdentity(filePath: string, now?: number): PeerIdentityWithServerId {
+  const current = readStateFile(filePath)
+  const existing = current.peerIdentity
+  const identity: PeerIdentityRecord = existing !== undefined
+    ? { ...existing }
+    : { ...generatePeerIdentity(), createdAt: now ?? Date.now() }
+  if (existing === undefined || current.serverId === undefined) {
+    writeStateFile(filePath, (fresh) => ({
+      ...fresh,
+      version: 1,
+      peerIdentity: identity,
+      ...(fresh.serverId === undefined ? { serverId: identity.nodeId } : {}),
+    }))
+  }
+  return {
+    publicKeyHex: identity.publicKeyHex,
+    privateKeyHex: identity.privateKeyHex,
+    nodeId: identity.nodeId,
+    serverId: current.serverId ?? identity.nodeId,
+  }
+}
+
+/** The peer-network membership record, validated at read; absent until a
+ * join wrote one. */
+export function readPeerNetwork(filePath: string): PeerNetworkRecord | undefined {
+  return readStateFile(filePath).peerNetwork
+}
+
+/**
+ * Write (or clear, with `undefined`) the peer-network membership. The input
+ * is the wiring's own validated record; the READ path is what validates, so
+ * a hostile file degrades to "not joined" without touching the write door's
+ * passthrough contract.
+ */
+export function writePeerNetwork(filePath: string, net: PeerNetworkRecord | undefined): void {
+  writeStateFile(filePath, (current) => ({ ...current, version: 1, peerNetwork: net }))
+}
+
+/**
+ * Toggle one node id on `peerNetwork.disabledNodes` — the per-machine
+ * "never dial this node" list. Idempotent both ways; without a network
+ * record there is nothing to toggle, so it is a silent no-op (an
+ * un-joined machine disables nobody).
+ */
+export function setPeerNodeDisabled(filePath: string, nodeId: string, disabled: boolean): void {
+  if (!isLegalServerId(nodeId)) return
+  writeStateFile(filePath, (current) => {
+    const net = current.peerNetwork
+    if (net === undefined) return current
+    const set = new Set(net.disabledNodes ?? [])
+    if (disabled) set.add(nodeId)
+    else set.delete(nodeId)
+    return { ...current, version: 1, peerNetwork: { ...net, disabledNodes: [...set] } }
+  })
+}
+
+/** What {@link verifyOrPinPeerKey} answers. */
+export type VerifyOrPinPeerKeyResult =
+  | { ok: true; status: 'pinned-new' | 'matched' }
+  | { ok: false; code: 'invalid-self-cert' | 'key-mismatch'; expectedPublicKeyHex?: string }
+
+/**
+ * The local TOFU anchor for one peer's public key (PG-2), the defense
+ * against a COMPROMISED GATEWAY feeding this machine a substituted
+ * identity: the peer network's self-certifying ids are only as good as the
+ * first (nodeId, publicKey) pair this machine chose to believe.
+ *
+ * First sight pins the key and answers `pinned-new`; an identical key
+ * answers `matched` (a read, not a write); a DIFFERENT key for a pinned id
+ * answers `key-mismatch` naming the anchored key and NEVER overwrites —
+ * moving the anchor is {@link repinPeerKey}'s job, behind an explicit user
+ * action only. A key whose hash does not produce `nodeId` is refused as
+ * `invalid-self-cert` before anything is read from disk.
+ */
+export function verifyOrPinPeerKey(
+  filePath: string,
+  nodeId: string,
+  publicKeyHex: string,
+  now?: number,
+): VerifyOrPinPeerKeyResult {
+  if (!verifySelfCertifyingNodeId(nodeId, publicKeyHex)) return { ok: false, code: 'invalid-self-cert' }
+  const key = publicKeyHex.toLowerCase()
+  const pinned = readStateFile(filePath).pinnedPeers?.[nodeId]
+  if (pinned === undefined) {
+    const at = now ?? Date.now()
+    writeStateFile(filePath, (current) => ({
+      ...current,
+      version: 1,
+      pinnedPeers: { ...current.pinnedPeers, [nodeId]: { publicKeyHex: key, firstSeenAt: at, updatedAt: at } },
+    }))
+    return { ok: true, status: 'pinned-new' }
+  }
+  if (pinned.publicKeyHex === key) return { ok: true, status: 'matched' }
+  return { ok: false, code: 'key-mismatch', expectedPublicKeyHex: pinned.publicKeyHex }
+}
+
+/**
+ * Move a TOFU anchor to a NEW key — ONLY for the machine's user explicitly
+ * choosing "trust the new identity" after a legitimate re-key (or the
+ * `key-mismatch` above). The replacement must itself be self-certifying for
+ * the nodeId; anything else is refused and the anchor stays put. Answers
+ * whether the anchor moved.
+ */
+export function repinPeerKey(filePath: string, nodeId: string, newPublicKeyHex: string, now?: number): boolean {
+  if (!verifySelfCertifyingNodeId(nodeId, newPublicKeyHex)) return false
+  const key = newPublicKeyHex.toLowerCase()
+  const at = now ?? Date.now()
+  writeStateFile(filePath, (current) => {
+    const pins: Record<string, PinnedPeerKey> = { ...current.pinnedPeers }
+    const existing = pins[nodeId]
+    pins[nodeId] = {
+      publicKeyHex: key,
+      firstSeenAt: existing !== undefined ? existing.firstSeenAt : at,
+      updatedAt: at,
+    }
+    return { ...current, version: 1, pinnedPeers: pins }
+  })
+  return true
 }
