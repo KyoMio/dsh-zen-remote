@@ -1,0 +1,22 @@
+{
+  "name": "@dsh-zen-remote/gateway-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "verify": "tsc -p tsconfig.json --noEmit",
+    "test": "node --experimental-sqlite --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.8.0"
+  }
+}
