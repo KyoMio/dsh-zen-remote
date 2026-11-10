@@ -783,12 +783,14 @@ export class PeerWsHub {
       return {
         nodeId: member.nodeId,
         name: member.name,
+        note: member.note,
         status: member.status,
         natType: conn?.natType ?? member.natType,
         lastIp: conn?.reflexive?.ip ?? member.lastIp,
         online: conn !== undefined,
         liveRelayKbps: this.limiter.liveRelayKbpsByNode(networkId, member.nodeId),
         cumulativeRelayBytes: member.cumulativeRelayBytes,
+        lastSeenAt: member.lastSeenAt,
       };
     });
     const links: TopologyLink[] = [];
