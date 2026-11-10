@@ -15,6 +15,8 @@ import type {
 import { buildNetworkRoutes } from './http/routes-networks.js';
 import { buildAdminRoutes } from './http/routes-admin.js';
 import { buildTopologyRoutes } from './http/routes-topology.js';
+import { createStaticHost } from './http/static-host.js';
+import type { StaticHost } from './http/static-host.js';
 import { ApiError } from './http/auth.js';
 import { StoreError } from './store/types.js';
 import type { GatewayStore } from './store/types.js';
@@ -33,6 +35,24 @@ export interface GatewayApiServerOptions {
   hooks?: GatewayHooks;
   /** PG-5 拓扑实时层（ws-hub）；提供后注册 /topology 与 /events 路由 */
   topology?: TopologyProvider;
+  /** PG-6b 控制台静态托管根目录（vite 产物 dist/public）；缺省不托管，纯 API 语义不变 */
+  staticRoot?: string;
+}
+
+/**
+ * 该不该由静态层接手：GET/HEAD 且第一个路径段不是 `api` / `peer`。
+ * WS 升级请求走 server 的 upgrade 事件，与这里的分发无关。
+ */
+function isConsolePath(req: IncomingMessage): boolean {
+  const method = req.method ?? '';
+  if (method !== 'GET' && method !== 'HEAD') return false;
+  try {
+    const { pathname } = new URL(req.url ?? '/', 'http://gateway.internal');
+    const first = pathname.slice(1).split('/', 1)[0] ?? '';
+    return first !== 'api' && first !== 'peer';
+  } catch {
+    return true; // 解析不了的 URL 交给静态层回 404
+  }
 }
 
 function safeDecodeSegment(segment: string): string {
@@ -107,9 +127,21 @@ export function createApiRequestHandler(options: GatewayApiServerOptions): (req:
       topology: options.topology,
     },
   };
-  return (req, res) => {
+  const staticHost: StaticHost | null = options.staticRoot !== undefined ? createStaticHost(options.staticRoot) : null;
+  const runDispatch = (req: IncomingMessage, res: ServerResponse): void => {
     dispatch(req, res, deps).catch(() => {
       sendError(res, 500, 'INTERNAL', 'internal server error');
+    });
+  };
+  return (req, res) => {
+    if (staticHost === null || !isConsolePath(req)) {
+      runDispatch(req, res);
+      return;
+    }
+    void staticHost(req, res).then((handled) => {
+      // 静态层只对非 GET/HEAD 返回 false，而 isConsolePath 已把这类请求挡在外面；
+      // 这条分支仅作为两道闸门语义不一致时的兜底
+      if (!handled) runDispatch(req, res);
     });
   };
 }

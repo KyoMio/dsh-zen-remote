@@ -1,0 +1,7 @@
+# pnpm 设置（≥10 起住 pnpm-workspace.yaml；package.json 的 pnpm 字段自 11 起
+# 不再读取，那份是给 ≤10 环境的兼容镜像）。
+# pnpm 11 移除了 onlyBuiltDependencies 系列，换名 allowBuilds；esbuild 的
+# postinstall 必须放行——strictDepBuilds 默认 true，未裁决的构建脚本会让
+# docker build 里 pnpm install 因 ERR_PNPM_IGNORED_BUILDS 退出 1。
+allowBuilds:
+  esbuild: true

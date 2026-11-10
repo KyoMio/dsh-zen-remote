@@ -93,6 +93,8 @@ export interface TopologyLink {
 export interface TopologyMemberRow {
   nodeId: string;
   name: string | null;
+  /** 归属者给设备写的备注（PG-6b 控制台设备列表展示） */
+  note: string | null;
   status: MemberStatus;
   /** 在线（WS 已认证入网）优先取内存 natType/lastIp，离线回落库值 */
   natType: NatType;
@@ -101,6 +103,8 @@ export interface TopologyMemberRow {
   /** 该成员作为发送方的实时中转速率 */
   liveRelayKbps: number;
   cumulativeRelayBytes: number;
+  /** 最后一次遥测/入网落库时间；从未上报过为 null（控制台显示「刚刚」） */
+  lastSeenAt: string | null;
 }
 
 /** GET /networks/:id/topology 与 SSE 共用的完整快照 */

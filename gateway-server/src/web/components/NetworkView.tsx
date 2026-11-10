@@ -1,0 +1,532 @@
+// 网络视图（PG-6b）：概览三格（网络 / 加入申请·身份异常 / 网关中转）+ 设备
+// 列表 + 「网络设置」「新建网络」两个居中模态框。
+//
+// 第 2 格严格遵守 One Tint Rule：身份异常（--danger-tint）优先于加入申请
+// （--warn-tint），无待办不带底色；同一屏只有这一格会带色。
+// 设备列表整行可点（Enter/Space 同效）进入原位详情（DeviceDetail）。
+// 弹窗开关存 ui 切片——SSE 只替换 topology 切片，打开中的弹窗、行内二次
+// 确认与输入中的草稿不会被实时推送冲掉。
+import { useEffect, useState } from 'react';
+
+import type { TranslateFn } from '../i18n/locales';
+import { classifyLinkPath, displayName, formatLatencyRange, formatRate, memberStatusView, relativeText, relativeTime } from '../format';
+import { Modal } from './Modal';
+import { DeviceDetail } from './DeviceDetail';
+import type {
+  AdmissionMode,
+  MemberAction,
+  NetworkView as NetworkSummary,
+  TopologyLink,
+  TopologySnapshot,
+  UiLocalState,
+} from '../store/console-store';
+
+export interface NetworkPatchInput {
+  name?: string;
+  admissionMode?: AdmissionMode;
+  maxPeers?: number;
+}
+
+export interface NetworkViewProps {
+  t: TranslateFn;
+  /** 当前选中的网络（store.networks 里的那一条） */
+  network: NetworkSummary;
+  /** store.topology[network.id]，SSE 未首推前是 null */
+  topology: TopologySnapshot | null;
+  ui: UiLocalState;
+  onUi: (patch: Partial<UiLocalState>) => void;
+  /** 成员/网络动作在途（按钮统一禁用防双击） */
+  busy: boolean;
+  /** 复制完整邀请链接（App 负责剪贴板与 Toast） */
+  onCopyInvite: () => void;
+  onPatchNetwork: (patch: NetworkPatchInput) => void;
+  onDeleteNetwork: () => void;
+  onRotateInviteKey: () => void;
+  onMemberAction: (nodeId: string, action: MemberAction) => void;
+  onRemoveMember: (nodeId: string) => void;
+}
+
+// ---------------------------------------------------------------- 网络设置模态框
+
+interface SettingsModalProps {
+  t: TranslateFn;
+  network: NetworkSummary;
+  busy: boolean;
+  onClose: () => void;
+  onPatch: (patch: NetworkPatchInput) => void;
+  onDelete: () => void;
+  onRotate: () => void;
+}
+
+function NetworkSettingsModal({ t, network, busy, onClose, onPatch, onDelete, onRotate }: SettingsModalProps) {
+  const [name, setName] = useState(network.name);
+  const [maxPeersDraft, setMaxPeersDraft] = useState(String(network.maxPeers));
+  const [confirmRotate, setConfirmRotate] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // 名称与上限：失焦或回车提交；非法值回滚显示服务端真值
+  const commitName = (): void => {
+    const trimmed = name.trim();
+    if (trimmed.length >= 1 && trimmed.length <= 32 && trimmed !== network.name) {
+      onPatch({ name: trimmed });
+    } else {
+      setName(network.name);
+    }
+  };
+  const commitMaxPeers = (): void => {
+    const value = Number(maxPeersDraft);
+    if (Number.isInteger(value) && value >= 2 && value <= 64 && value !== network.maxPeers) {
+      onPatch({ maxPeers: value });
+    } else {
+      setMaxPeersDraft(String(network.maxPeers));
+    }
+  };
+  const submitOnEnter = (event: { key: string; preventDefault: () => void }, commit: () => void): void => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    commit();
+  };
+
+  return (
+    <Modal title={t('network.settingsTitle')} onClose={onClose}>
+      <div className="modal-body">
+        <div className="field">
+          <label className="field-label" htmlFor="network-settings-name">
+            {t('network.name')}
+          </label>
+          <input
+            id="network-settings-name"
+            className="input"
+            type="text"
+            maxLength={32}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onBlur={commitName}
+            onKeyDown={(e) => submitOnEnter(e, commitName)}
+          />
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="network-settings-max-peers">
+            {t('network.deviceLimit')}
+          </label>
+          <input
+            id="network-settings-max-peers"
+            className="input input-narrow mono"
+            type="number"
+            min={2}
+            max={64}
+            step={1}
+            value={maxPeersDraft}
+            onChange={(e) => setMaxPeersDraft(e.target.value)}
+            onBlur={commitMaxPeers}
+            onKeyDown={(e) => submitOnEnter(e, commitMaxPeers)}
+          />
+        </div>
+
+        <fieldset className="field radio-group">
+          <legend className="field-label">{t('network.admissionMode')}</legend>
+          {(
+            [
+              ['both', t('network.admissionBoth')],
+              ['key', t('network.admissionKey')],
+              ['manual', t('network.admissionManual')],
+            ] as const
+          ).map(([mode, label]) => (
+            <label key={mode} className="radio-row">
+              <input
+                type="radio"
+                name="admission-mode"
+                checked={network.admissionMode === mode}
+                onChange={() => {
+                  if (network.admissionMode !== mode) onPatch({ admissionMode: mode });
+                }}
+              />
+              <span>{label}</span>
+            </label>
+          ))}
+        </fieldset>
+
+        <div className="danger-zone">
+          <p className="danger-title">{t('network.dangerZone')}</p>
+          <div className="danger-row">
+            <span>{t('network.rotateInviteLink')}</span>
+            <button
+              type="button"
+              className={confirmRotate ? 'btn danger solid' : 'btn danger'}
+              disabled={busy}
+              onClick={() => {
+                if (confirmRotate) {
+                  setConfirmRotate(false);
+                  onRotate();
+                } else {
+                  setConfirmRotate(true);
+                }
+              }}
+            >
+              {confirmRotate ? t('common.confirmReset') : t('common.reset')}
+            </button>
+          </div>
+          <div className="danger-row">
+            <span>{t('network.deleteNetwork')}</span>
+            <button
+              type="button"
+              className={confirmDelete ? 'btn danger solid' : 'btn danger'}
+              disabled={busy}
+              onClick={() => {
+                if (confirmDelete) {
+                  setConfirmDelete(false);
+                  onDelete();
+                } else {
+                  setConfirmDelete(true);
+                }
+              }}
+            >
+              {confirmDelete ? t('common.confirmDelete') : t('common.delete')}
+            </button>
+          </div>
+        </div>
+
+        <div className="modal-foot">
+          <button type="button" className="btn" onClick={onClose}>
+            {t('common.cancel')}
+          </button>
+          <button type="button" className="btn primary" onClick={onClose}>
+            {t('common.done')}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------- 新建网络模态框（App 也复用）
+
+export interface NewNetworkModalProps {
+  t: TranslateFn;
+  ui: UiLocalState;
+  onUi: (patch: Partial<UiLocalState>) => void;
+  busy: boolean;
+  onCreate: (name: string) => void;
+}
+
+export function NewNetworkModal({ t, ui, onUi, busy, onCreate }: NewNetworkModalProps) {
+  const name = ui.draftNetworkName.trim();
+  const valid = name.length >= 1 && name.length <= 32;
+  const close = (): void => onUi({ dialog: null });
+
+  return (
+    <Modal title={t('network.newNetworkTitle')} onClose={close}>
+      <form
+        className="modal-body"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (valid && !busy) onCreate(ui.draftNetworkName);
+        }}
+      >
+        <div className="field">
+          <label className="field-label" htmlFor="new-network-name">
+            {t('network.name')}
+          </label>
+          <input
+            id="new-network-name"
+            className="input"
+            type="text"
+            required
+            maxLength={32}
+            placeholder={t('network.namePlaceholder')}
+            autoFocus
+            value={ui.draftNetworkName}
+            onChange={(e) => onUi({ draftNetworkName: e.target.value })}
+          />
+        </div>
+        <div className="modal-foot">
+          <button type="button" className="btn" onClick={close}>
+            {t('common.cancel')}
+          </button>
+          <button type="submit" className="btn primary" disabled={!valid || busy}>
+            {t('common.create')}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------- 主视图
+
+export function NetworkView(props: NetworkViewProps) {
+  const {
+    t,
+    network,
+    topology,
+    ui,
+    onUi,
+    busy,
+    onCopyInvite,
+    onPatchNetwork,
+    onDeleteNetwork,
+    onRotateInviteKey,
+    onMemberAction,
+    onRemoveMember,
+  } = props;
+  const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
+
+  // 切换网络即退出详情：详情属于具体网络
+  useEffect(() => {
+    setDetailNodeId(null);
+  }, [network.id]);
+
+  const members = topology?.members ?? [];
+  const links = topology?.links ?? [];
+  const summary = topology?.summary ?? null;
+
+  const mismatched = members.filter((m) => m.status === 'mismatch');
+  const pending = members.filter((m) => m.status === 'pending');
+  const seatsFull = network.totalDevices >= network.maxPeers;
+
+  // 连接对统计（cell 3）：A→B 与 B→A 是同一条连接
+  const pairs = new Map<string, { direct: boolean }>();
+  for (const link of links) {
+    const key = link.srcNodeId < link.peerNodeId ? `${link.srcNodeId}|${link.peerNodeId}` : `${link.peerNodeId}|${link.srcNodeId}`;
+    const entry = pairs.get(key) ?? { direct: false };
+    if (classifyLinkPath(link.path) !== 'relay') entry.direct = true;
+    pairs.set(key, entry);
+  }
+  const directPairs = [...pairs.values()].filter((p) => p.direct).length;
+
+  const detailMember = detailNodeId !== null ? (members.find((m) => m.nodeId === detailNodeId) ?? null) : null;
+  if (detailMember !== null && topology !== null) {
+    return (
+      <DeviceDetail
+        t={t}
+        topology={topology}
+        member={detailMember}
+        ui={ui}
+        onUi={onUi}
+        busy={busy}
+        onBack={() => setDetailNodeId(null)}
+        onSelectDevice={setDetailNodeId}
+        onMemberAction={onMemberAction}
+        onRemoveMember={onRemoveMember}
+      />
+    );
+  }
+
+  const selfLinks = (nodeId: string): TopologyLink[] => links.filter((l) => l.srcNodeId === nodeId);
+
+  return (
+    <section className="network-view">
+      <div className="overview-grid">
+        {/* 第 1 格：网络 */}
+        <section className="overview-cell cell-network">
+          <div className="cell-head">
+            <h3 className="network-name">{network.name}</h3>
+            <button type="button" className="btn ghost" onClick={() => onUi({ dialog: 'network-settings' })}>
+              <span aria-hidden="true">⚙</span> {t('network.settings')}
+            </button>
+          </div>
+          <p className={`device-count mono${seatsFull ? ' full' : ''}`}>
+            {t('network.deviceCount', { online: network.onlineDevices, total: network.totalDevices })}
+            {seatsFull && <span className="count-full"> {t('network.capacityFull')}</span>}
+          </p>
+          <div className="invite-box">
+            <code className="invite-key mono">#••••••••</code>
+            <button type="button" className="btn primary" onClick={onCopyInvite}>
+              {t('common.copy')}
+            </button>
+          </div>
+          <p className="invite-hint">{t('network.inviteHint')}</p>
+        </section>
+
+        {/* 第 2 格：身份异常优先，其次加入申请；都没有则空态（无底色） */}
+        {mismatched.length > 0 ? (
+          <section className="overview-cell cell-requests tint-danger">
+            <p className="cell-label">
+              <span className="dot danger" aria-hidden="true" /> {t('overview.actionNeeded')}
+            </p>
+            {mismatched.map((member) => {
+              const target = `remove-member:${member.nodeId}`;
+              const confirming = ui.confirmTarget === target;
+              return (
+                <div key={member.nodeId} className="request-block">
+                  <p className="request-title">{t('requests.identityChanged', { name: displayName(member, t) })}</p>
+                  <p className="request-hint">{t('requests.identityChangedHint')}</p>
+                  <div className="request-actions">
+                    <button
+                      type="button"
+                      className={confirming ? 'btn danger solid' : 'btn danger'}
+                      onClick={() => {
+                        if (confirming) {
+                          onUi({ confirmTarget: null });
+                          onRemoveMember(member.nodeId);
+                        } else {
+                          onUi({ confirmTarget: target });
+                        }
+                      }}
+                    >
+                      {confirming ? t('common.confirmRemove') : t('common.remove')}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn primary"
+                      disabled={busy}
+                      onClick={() => {
+                        onUi({ confirmTarget: null });
+                        onMemberAction(member.nodeId, 'repin');
+                      }}
+                    >
+                      {t('requests.trustNewIdentity')}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </section>
+        ) : pending.length > 0 ? (
+          <section className="overview-cell cell-requests tint-warn">
+            <p className="cell-label">
+              <span className="dot warn" aria-hidden="true" /> {t('network.joinRequests')}
+              <span className="badge mono">{pending.length}</span>
+            </p>
+            {pending.map((member) => (
+              <div key={member.nodeId} className="request-block">
+                <p className="request-title">{displayName(member, t)}</p>
+                <p className="request-hint">
+                  {t('identity.verified')} · {relativeText(t, relativeTime(member.lastSeenAt, Date.now()))}
+                </p>
+                {seatsFull && <p className="request-hint warn-text">{t('requests.fullHint')}</p>}
+                <div className="request-actions">
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy}
+                    onClick={() => {
+                      onUi({ confirmTarget: null });
+                      onMemberAction(member.nodeId, 'reject');
+                    }}
+                  >
+                    {t('requests.reject')}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={busy || seatsFull}
+                    title={seatsFull ? t('requests.fullHint') : undefined}
+                    onClick={() => {
+                      onUi({ confirmTarget: null });
+                      onMemberAction(member.nodeId, 'approve');
+                    }}
+                  >
+                    {t('requests.approve')}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </section>
+        ) : (
+          <section className="overview-cell cell-requests">
+            <p className="cell-label">
+              <span className="dot muted" aria-hidden="true" /> {t('overview.requestsEmpty')}
+            </p>
+            <p className="empty-hint">{t('overview.requestsEmptyHint')}</p>
+          </section>
+        )}
+
+        {/* 第 3 格：网关中转 */}
+        <section className="overview-cell cell-relay">
+          <p className="cell-label">{t('overview.gatewayRelay')}</p>
+          <p className="rate mono">{formatRate(summary?.totalLiveRelayKbps ?? 0)}</p>
+          <p className="cell-sub">{t('overview.connections', { total: pairs.size, direct: directPairs })}</p>
+          <p className="e2ee-note">
+            <span aria-hidden="true">🔒</span> {t('overview.e2eeNote')}
+          </p>
+        </section>
+      </div>
+
+      {/* 设备列表 */}
+      <div className="device-section">
+        <h3 className="section-title">{t('network.devices')}</h3>
+        {members.length === 0 ? (
+          <p className="empty-hint">{t('devices.emptyHint')}</p>
+        ) : (
+          <table className="device-table">
+            <thead>
+              <tr>
+                <th scope="col">{t('network.devices')}</th>
+                <th scope="col">{t('devices.status')}</th>
+                <th scope="col">{t('devices.connections')}</th>
+                <th scope="col" className="mono-col">
+                  {t('devices.latency')}
+                </th>
+                <th scope="col" aria-hidden="true" />
+              </tr>
+            </thead>
+            <tbody>
+              {members.map((member) => {
+                const status = memberStatusView(member.status, member.online, t);
+                const own = selfLinks(member.nodeId);
+                const direct = own.filter((l) => classifyLinkPath(l.path) !== 'relay').length;
+                const relay = own.length - direct;
+                const latency = formatLatencyRange(own.map((l) => l.rttMs));
+                return (
+                  <tr
+                    key={member.nodeId}
+                    className="device-row"
+                    tabIndex={0}
+                    role="button"
+                    aria-label={displayName(member, t)}
+                    onClick={() => setDetailNodeId(member.nodeId)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        setDetailNodeId(member.nodeId);
+                      }
+                    }}
+                  >
+                    <td>
+                      <div className="device-name">{displayName(member, t)}</div>
+                      {member.note !== null && <div className="device-note">{member.note}</div>}
+                    </td>
+                    <td>
+                      <span className="dot-row">
+                        <span className={`dot ${status.dot}`} aria-hidden="true" />
+                        {status.word}
+                      </span>
+                    </td>
+                    <td className="conn-summary">
+                      <span className="conn-chip">
+                        <span className="dot ok" aria-hidden="true" />
+                        {t('devices.directCount', { n: direct })}
+                      </span>
+                      <span className="conn-chip">
+                        <span className="dot warn" aria-hidden="true" />
+                        {t('devices.relayCount', { n: relay })}
+                      </span>
+                    </td>
+                    <td className="mono">{latency}</td>
+                    <td className="row-arrow" aria-hidden="true">
+                      ›
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {ui.dialog === 'network-settings' && (
+        <NetworkSettingsModal
+          t={t}
+          network={network}
+          busy={busy}
+          onClose={() => onUi({ dialog: null, confirmTarget: null })}
+          onPatch={onPatchNetwork}
+          onDelete={onDeleteNetwork}
+          onRotate={onRotateInviteKey}
+        />
+      )}
+    </section>
+  );
+}

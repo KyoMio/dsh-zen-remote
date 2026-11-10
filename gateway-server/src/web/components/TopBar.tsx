@@ -43,7 +43,7 @@ function cycleMenuFocus(menu: HTMLElement | null, offset: 1 | -1): void {
   items[next]?.focus();
 }
 
-/** 两个菜单共用的行为：触发器/菜单引用、键盘导航、点击外部关闭 */
+/** 两个菜单共用的行为：触发器/菜单引用、打开即聚焦首项、键盘导航、点击外部关闭 */
 function useMenuBehavior(open: boolean, close: () => void) {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -61,6 +61,13 @@ function useMenuBehavior(open: boolean, close: () => void) {
       document.removeEventListener('mousedown', onPointerDown);
     };
   }, [open, close]);
+
+  // 打开即聚焦首项：菜单与本次 effect 同一轮提交，DOM 已就绪，直接 focus 即可
+  // （↑/↓ 的焦点循环从 document.activeElement 出发，预聚焦让键盘路径从首项开始）
+  useEffect(() => {
+    if (!open) return;
+    menuRef.current?.querySelector<HTMLElement>('[data-menu-item]')?.focus();
+  }, [open]);
 
   const onKeyDown = useCallback(
     (event: KeyboardEvent<HTMLDivElement>): void => {
@@ -93,6 +100,16 @@ export function TopBar(props: TopBarProps) {
   const closeSwitcher = useCallback(() => onUi({ networkSwitcherOpen: false }), [onUi]);
   const closeAccount = useCallback(() => onUi({ accountMenuOpen: false }), [onUi]);
 
+  // 两菜单互斥展开：打开其一先关掉另一个（menu 只有一处阴影与一处浮层，视觉上也只允许一个）
+  const toggleSwitcher = useCallback(
+    (): void => onUi({ networkSwitcherOpen: !ui.networkSwitcherOpen, accountMenuOpen: false }),
+    [onUi, ui.networkSwitcherOpen],
+  );
+  const toggleAccount = useCallback(
+    (): void => onUi({ accountMenuOpen: !ui.accountMenuOpen, networkSwitcherOpen: false }),
+    [onUi, ui.accountMenuOpen],
+  );
+
   const switcher = useMenuBehavior(ui.networkSwitcherOpen, closeSwitcher);
   const account = useMenuBehavior(ui.accountMenuOpen, closeAccount);
 
@@ -116,7 +133,7 @@ export function TopBar(props: TopBarProps) {
             className="net-switcher"
             aria-haspopup="menu"
             aria-expanded={ui.networkSwitcherOpen}
-            onClick={() => onUi({ networkSwitcherOpen: !ui.networkSwitcherOpen })}
+            onClick={toggleSwitcher}
           >
             <span className="net-switcher-name">{selected !== null ? selected.name : t('nav.networks')}</span>
             {selected !== null && (
@@ -187,7 +204,7 @@ export function TopBar(props: TopBarProps) {
           className="account-button"
           aria-haspopup="menu"
           aria-expanded={ui.accountMenuOpen}
-          onClick={() => onUi({ accountMenuOpen: !ui.accountMenuOpen })}
+          onClick={toggleAccount}
         >
           <span className="avatar" aria-hidden="true">
             {avatarInitial(user.email)}

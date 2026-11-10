@@ -64,12 +64,16 @@ export interface TopologySnapshot {
 export interface TopologyMemberRow {
   nodeId: string;
   name: string | null;
+  /** 归属者给设备写的备注 */
+  note: string | null;
   status: MemberStatus;
   natType: NatType;
   lastIp: string | null;
   online: boolean;
   liveRelayKbps: number;
   cumulativeRelayBytes: number;
+  /** 最后一次遥测/入网落库时间；从未上报过为 null（界面显示「刚刚」） */
+  lastSeenAt: string | null;
 }
 
 export interface TopologyLink {
@@ -135,6 +139,9 @@ export interface ConsoleState {
   meta: SessionMeta;
   networks: NetworkView[];
   topology: Readonly<Record<string, TopologySnapshot>>;
+  /** 网关管理页数据（仅管理员拉取）；settings 未拉到前是 null */
+  adminSettings: SystemSettings | null;
+  adminUsers: AdminUserRow[];
   ui: UiLocalState;
 }
 
@@ -145,6 +152,8 @@ export function createInitialState(): ConsoleState {
     meta: { allowSignup: false, maxNetworksPerUser: 3 },
     networks: [],
     topology: {},
+    adminSettings: null,
+    adminUsers: [],
     ui: {
       networkSwitcherOpen: false,
       accountMenuOpen: false,
@@ -167,7 +176,25 @@ export function applySession(state: ConsoleState, user: PublicUser, meta: Sessio
 
 /** 退出登录：清空 session 与全部业务数据切片（隐私），保留 ui 与 meta（表单草稿不丢） */
 export function setLoggedOut(state: ConsoleState, meta: SessionMeta): ConsoleState {
-  return { ...state, session: null, meta, networks: [], topology: {} };
+  return {
+    ...state,
+    session: null,
+    meta,
+    networks: [],
+    topology: {},
+    adminSettings: null,
+    adminUsers: [],
+  };
+}
+
+/** 管理员设置整体刷新（PATCH 成功后用返回值替换） */
+export function applyAdminSettings(state: ConsoleState, settings: SystemSettings): ConsoleState {
+  return { ...state, adminSettings: settings };
+}
+
+/** 管理员用户列表整体刷新 */
+export function applyAdminUsers(state: ConsoleState, users: AdminUserRow[]): ConsoleState {
+  return { ...state, adminUsers: users };
 }
 
 /** 网络列表整体刷新（REST 拉取的结果） */
@@ -233,6 +260,14 @@ export class ConsoleStore {
 
   readonly applyTopologySnapshot = (snapshot: TopologySnapshot): void => {
     this.setState(applyTopologySnapshot(this.state, snapshot));
+  };
+
+  readonly applyAdminSettings = (settings: SystemSettings): void => {
+    this.setState(applyAdminSettings(this.state, settings));
+  };
+
+  readonly applyAdminUsers = (users: AdminUserRow[]): void => {
+    this.setState(applyAdminUsers(this.state, users));
   };
 
   readonly patchUi = (patch: Partial<UiLocalState>): void => {
