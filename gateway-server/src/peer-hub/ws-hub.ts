@@ -1,0 +1,932 @@
+// 节点信令与零明文二进制帧中转中心（PG-5）。
+//
+// 挂在宿主 http.Server 的 upgrade 事件路径 /peer/v1/ws 上（WebSocketServer
+// noServer 模式），一条连接的生命周期由 ConnState.state 表达：
+//
+//   hanging    → 挑战应答通过但五态判定为 pending / mismatch：连接挂起在
+//                等待池，转发全阻断；管理员 REST approve / repin 后原地升级
+//                为 authorized（无需重连），拿到 peers 快照。
+//   authorized → 进内存路由表；二进制帧按 28B 明文头查表原样转发
+//                （srcNodeId 严格等于连接自身 nodeId，网关绝不解密载荷）。
+//   关闭        → authorized 广播 peer-left，路由表摘除；挂起池摘除。
+//
+// 与 PG-4 的打通全部经 GatewayHooks：approve/reject/pause/resume/repin/
+// remove/deleteNetwork/disableUser/settings 变更实时反映到内存路由表与
+// 在线连接。中转字节经 PeerRateLimiter 限速（超限丢弃背压）并累计
+// pendingRelayBytes，由内部定时器经 store.flushMemberTelemetry 落库。
+// 拓扑订阅（SSE）在成员变动、path-report、3s 速率跳动时重渲染快照推送。
+import { randomBytes } from 'node:crypto';
+import type { Server as HttpServer, IncomingMessage } from 'node:http';
+import type { Duplex } from 'node:stream';
+
+import { WebSocketServer } from 'ws';
+import type { RawData, WebSocket } from 'ws';
+
+import { DEFAULT_SETTINGS } from '../store/types.js';
+import type {
+  GatewayStore,
+  MemberRecord,
+  NatType,
+  NetworkRecord,
+  TelemetryUpdate,
+} from '../store/types.js';
+import type {
+  GatewayHooks,
+  MemberChangedEvent,
+  NetworkTopologySnapshot,
+  TopologyLink,
+  TopologyMemberRow,
+} from '../http/auth.js';
+import { decryptSecret } from '../master-key.js';
+import {
+  normalizeNetworkId,
+  normalizeNodeId,
+  normalizePublicKeyHex,
+  verifyGatewayChallengeSignature,
+  verifyJoinKeyProofHex,
+} from './peer-crypto.js';
+import { readRelayHeader } from './relay-frame.js';
+import { PeerRateLimiter } from './rate-limiter.js';
+import type { NatObservation } from './udp-stun.js';
+
+const WS_PATH = '/peer/v1/ws';
+/** auth/path-report 时间戳的新鲜度窗口（±） */
+const TIMESTAMP_WINDOW_MS = 5 * 60_000;
+const MAX_PATH_REPORTS_PER_NODE = 64;
+const MAX_LAN_ENDPOINTS = 16;
+
+export interface PeerWsHubOptions {
+  store: GatewayStore;
+  /** 秘密加密主密钥：入网时解密 joinKey 验证口令证明 */
+  masterKey: Buffer;
+  /** SSE 速率跳动推送间隔；缺省 3000ms，传 null 关闭 */
+  rateTickMs?: number | null;
+  /** 遥测刷盘（flushMemberTelemetry）间隔；缺省 5000ms，传 null 关闭 */
+  flushMs?: number | null;
+  /** 时间戳窗口，缺省 ±5 分钟 */
+  timestampWindowMs?: number;
+  now?: () => number;
+}
+
+/**
+ * 一条已通过挑战应答的连接。state = 'hanging' 时在挂起池（pending/mismatch
+ * 共用，具体等哪个动作看挂起原因——approve 与 repin 都通向同一升级路径）；
+ * state = 'authorized' 时在路由表；state = 'closed' 为终态（被踢/替换），
+ * RFC6455 close 握手窗口内任何帧一律拒收（见 killConn）。
+ */
+interface ConnState {
+  ws: WebSocket;
+  state: 'hanging' | 'authorized' | 'closed';
+  networkId: string;
+  nodeId: string;
+  ownerId: string;
+  maxPeers: number;
+  /** 认证通过的 64 hex 公钥；repin 晋级时随 store 同步为新公钥 */
+  publicKeyHex: string;
+  name: string | null;
+  lanEndpoints: string[];
+  natType: NatType;
+  reflexive: { ip: string; port: number } | null;
+  remoteIp: string | null;
+  connectedAt: number;
+  /** 该节点上报到各 peer 的路径观测 */
+  pathReports: Map<string, { path: string; rttMs: number }>;
+}
+
+interface PeerView {
+  nodeId: string;
+  publicKeyHex: string;
+  name: string | null;
+  lanEndpoints: string[];
+  natType: NatType;
+  reflexiveEndpoint: string | null;
+}
+
+const connKey = (networkId: string, nodeId: string): string => `${networkId}|${nodeId}`;
+
+function endpointString(reflexive: { ip: string; port: number } | null): string | null {
+  return reflexive !== null ? `${reflexive.ip}:${reflexive.port}` : null;
+}
+
+function peerView(conn: ConnState): PeerView {
+  return {
+    nodeId: conn.nodeId,
+    publicKeyHex: conn.publicKeyHex,
+    name: conn.name,
+    lanEndpoints: conn.lanEndpoints,
+    natType: conn.natType,
+    reflexiveEndpoint: endpointString(conn.reflexive),
+  };
+}
+
+function sendJson(ws: WebSocket, message: Record<string, unknown>): void {
+  if (ws.readyState !== ws.OPEN) return;
+  ws.send(JSON.stringify(message), () => {/* 写失败由 close/error 事件兜底 */});
+}
+
+/** 拒绝并关闭：先发原因再发 close 帧，同一条 TCP 流上按序到达（仅限未入网连接） */
+function deny(ws: WebSocket, reason: string): void {
+  sendJson(ws, { type: 'denied', reason });
+  ws.close(1008, reason.slice(0, 120));
+}
+
+/** 被踢连接的宽限毫秒数：够 denied 消息冲出内核缓冲，也封死 close 握手挂住的可能 */
+const KICK_GRACE_MS = 250;
+
+function toBuffer(data: RawData): Buffer {
+  if (Array.isArray(data)) return Buffer.concat(data);
+  if (data instanceof Buffer) return data;
+  return Buffer.from(data as ArrayBuffer);
+}
+
+function parseJsonObject(data: RawData): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(toBuffer(data).toString('utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+/** lanEndpoints：≤16 条、每条 1..64 字符的字符串（`ip:port` 形态由节点侧保证） */
+function parseLanEndpoints(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (trimmed.length < 1 || trimmed.length > 64) continue;
+    out.push(trimmed);
+    if (out.length >= MAX_LAN_ENDPOINTS) break;
+  }
+  return out;
+}
+
+function parseName(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed.length < 1 || trimmed.length > 64) return null;
+  return trimmed;
+}
+
+export class PeerWsHub {
+  readonly limiter: PeerRateLimiter;
+  private readonly store: GatewayStore;
+  private readonly masterKey: Buffer;
+  private readonly timestampWindowMs: number;
+  private readonly now: () => number;
+  private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+  /** 已授权在线路由表：networkId → nodeId → 连接 */
+  private readonly conns = new Map<string, Map<string, ConnState>>();
+  /** 挂起池：pending / mismatch 共用，等待 approve / repin */
+  private readonly hanging = new Map<string, ConnState>();
+  /** 本 hub 接纳的全部 socket（含尚未发 auth 的 preauth），close 时统一 terminate */
+  private readonly acceptedSockets = new Set<WebSocket>();
+  /** SSE 订阅者：networkId → 回调集合 */
+  private readonly subscribers = new Map<string, Set<(snapshot: NetworkTopologySnapshot) => void>>();
+  /** 上一次速率跳动推走的每网总速率（恒零不推） */
+  private readonly lastPublishedKbps = new Map<string, number>();
+  /** 待刷盘的 natType/lastIp 变更（flush 时与限速字节合并落库） */
+  private readonly pendingNat = new Map<string, { networkId: string; nodeId: string; natType?: NatType; lastIp?: string }>();
+  /** 系统实时 relayRateKbps；构造时异步拉一次，onSettingsChanged 钩子热更新 */
+  private rateKbps: number = DEFAULT_SETTINGS.relayRateKbps;
+  private rateTimer: NodeJS.Timeout | null = null;
+  private flushTimer: NodeJS.Timeout | null = null;
+  private closed = false;
+
+  constructor(options: PeerWsHubOptions) {
+    this.store = options.store;
+    this.masterKey = options.masterKey;
+    this.timestampWindowMs = options.timestampWindowMs ?? TIMESTAMP_WINDOW_MS;
+    this.now = options.now ?? Date.now;
+    this.limiter = new PeerRateLimiter({ now: this.now });
+    void this.store
+      .getSettings()
+      .then((settings) => {
+        if (!this.closed) this.rateKbps = settings.relayRateKbps;
+      })
+      .catch(() => {/* 库暂不可用时用默认速率，settings 变更钩子会再喂 */});
+    const rateTickMs = options.rateTickMs === undefined ? 3000 : options.rateTickMs;
+    if (rateTickMs !== null && rateTickMs > 0) {
+      this.rateTimer = setInterval(() => this.tickRates(), rateTickMs);
+      this.rateTimer.unref?.();
+    }
+    const flushMs = options.flushMs === undefined ? 5000 : options.flushMs;
+    if (flushMs !== null && flushMs > 0) {
+      this.flushTimer = setInterval(() => {
+        void this.flushTelemetry().catch(() => {/* 单次刷盘失败等下一轮 */});
+      }, flushMs);
+      this.flushTimer.unref?.();
+    }
+  }
+
+  // ------------------------------------------------------------ 生命周期
+
+  /** 挂到宿主 server 的 upgrade 事件；仅放行 /peer/v1/ws，其余路径直接销毁 */
+  attach(server: HttpServer): void {
+    server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+      let pathname = '';
+      try {
+        pathname = new URL(req.url ?? '/', 'http://gateway.internal').pathname;
+      } catch {
+        pathname = '';
+      }
+      if (pathname !== WS_PATH) {
+        socket.destroy();
+        return;
+      }
+      const remoteIp = req.socket.remoteAddress ?? null;
+      this.wss.handleUpgrade(req, socket, head, (ws) => this.setupConnection(ws, remoteIp));
+    });
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    if (this.rateTimer !== null) clearInterval(this.rateTimer);
+    if (this.flushTimer !== null) clearInterval(this.flushTimer);
+    this.rateTimer = null;
+    this.flushTimer = null;
+    // preauth socket 不在路由表/挂起池里，必须单独 terminate，
+    // 否则 wss.close 会等它永远不触发回调
+    for (const ws of this.acceptedSockets) ws.terminate();
+    this.acceptedSockets.clear();
+    for (const net of this.conns.values()) {
+      for (const conn of net.values()) conn.ws.terminate();
+    }
+    for (const conn of this.hanging.values()) conn.ws.terminate();
+    this.conns.clear();
+    this.hanging.clear();
+    this.subscribers.clear();
+    this.lastPublishedKbps.clear();
+    await new Promise<void>((resolve) => this.wss.close(() => resolve()));
+  }
+
+  // ------------------------------------------------------------ 连接建立
+
+  private setupConnection(ws: WebSocket, remoteIp: string | null): void {
+    if (this.closed) {
+      ws.close(1013, 'gateway shutting down');
+      return;
+    }
+    this.acceptedSockets.add(ws);
+    ws.on('close', () => {
+      this.acceptedSockets.delete(ws);
+    });
+    const challengeHex = randomBytes(32).toString('hex');
+    /** auth 通过后的连接状态；断开清理据此分流 */
+    let conn: ConnState | null = null;
+    let phase: 'preauth' | 'authed' | 'closed' = 'preauth';
+    sendJson(ws, { type: 'challenge', challengeHex });
+
+    ws.on('message', (data: RawData, isBinary: boolean) => {
+      if (phase !== 'preauth' && phase !== 'authed') return;
+      if (conn !== null && conn.state === 'closed') return; // 终态连接（close 握手窗口内）一律拒收
+      if (isBinary) {
+        this.relayBinary(conn, toBuffer(data));
+        return;
+      }
+      const message = parseJsonObject(data);
+      if (message === null) return;
+      if (phase === 'preauth') {
+        if (message['type'] !== 'auth') return;
+        phase = 'authed'; // 一条连接只受理一次 auth
+        void this.handleAuth(ws, message, challengeHex, remoteIp).then((state) => {
+          if (state !== null) conn = state;
+        });
+        return;
+      }
+      if (conn !== null && conn.state === 'authorized' && message['type'] === 'path-report') {
+        this.handlePathReport(conn, message);
+      }
+      // 其余类型（含已认证后再发 auth）一律忽略
+    });
+
+    ws.on('error', () => {
+      ws.terminate();
+    });
+
+    ws.on('close', () => {
+      phase = 'closed';
+      this.teardown(conn);
+    });
+  }
+
+  /** 连接断开：路由表/挂起池摘除、离线广播、对方拓扑里的过期路径清掉 */
+  private teardown(conn: ConnState | null): void {
+    if (conn === null) return; // preauth 就断开，无状态可清
+    if (conn.state === 'authorized') {
+      const net = this.conns.get(conn.networkId);
+      if (net !== undefined && net.get(conn.nodeId) === conn) {
+        net.delete(conn.nodeId);
+        if (net.size === 0) this.conns.delete(conn.networkId);
+        // 该节点下线后，其他成员上报的指向它的路径不再是可观测事实
+        for (const other of this.conns.get(conn.networkId)?.values() ?? []) {
+          other.pathReports.delete(conn.nodeId);
+        }
+        this.broadcast(conn.networkId, { type: 'peer-left', nodeId: conn.nodeId }, conn.nodeId);
+        void this.publishTopology(conn.networkId);
+      }
+      return;
+    }
+    const key = connKey(conn.networkId, conn.nodeId);
+    if (this.hanging.get(key) === conn) {
+      this.hanging.delete(key);
+      void this.publishTopology(conn.networkId);
+    }
+  }
+
+  /** 登记进内存路由表并通知全网（welcome 已由调用方先行下发） */
+  private registerAndAnnounce(conn: ConnState): void {
+    conn.state = 'authorized';
+    let net = this.conns.get(conn.networkId);
+    if (net === undefined) {
+      net = new Map();
+      this.conns.set(conn.networkId, net);
+    }
+    net.set(conn.nodeId, conn);
+    const others = [...net.values()].filter((c) => c !== conn);
+    this.broadcast(conn.networkId, {
+      type: 'peer-joined',
+      nodeId: conn.nodeId,
+      publicKeyHex: conn.publicKeyHex,
+      name: conn.name,
+      lanEndpoints: conn.lanEndpoints,
+      natType: conn.natType,
+      reflexiveEndpoint: endpointString(conn.reflexive),
+    }, conn.nodeId);
+    // 打洞协调：向配对节点对（新节点 ↔ 每个在线成员）同时下发；
+    // publicKeyHex 供对端做 TOFU 锚定与 E2EE 握手
+    for (const other of others) {
+      sendJson(conn.ws, {
+        type: 'punch-coordinate',
+        peerNodeId: other.nodeId,
+        publicKeyHex: other.publicKeyHex,
+        lanEndpoints: other.lanEndpoints,
+        reflexiveEndpoint: endpointString(other.reflexive),
+        natType: other.natType,
+        startAfterMs: 20,
+      });
+      sendJson(other.ws, {
+        type: 'punch-coordinate',
+        peerNodeId: conn.nodeId,
+        publicKeyHex: conn.publicKeyHex,
+        lanEndpoints: conn.lanEndpoints,
+        reflexiveEndpoint: endpointString(conn.reflexive),
+        natType: conn.natType,
+        startAfterMs: 20,
+      });
+    }
+    void this.publishTopology(conn.networkId);
+  }
+
+  private welcomeAuthorized(conn: ConnState): void {
+    const peers = [...(this.conns.get(conn.networkId)?.values() ?? [])]
+      .filter((c) => c !== conn)
+      .map(peerView);
+    sendJson(conn.ws, { type: 'welcome', status: 'authorized', maxPeers: conn.maxPeers, peers });
+  }
+
+  // ------------------------------------------------------------ 入网判定
+
+  /** 挑战应答判定。拒绝路径发 denied 并关闭（返回 null）；通过则登记并返回连接 */
+  private async handleAuth(
+    ws: WebSocket,
+    message: Record<string, unknown>,
+    challengeHex: string,
+    remoteIp: string | null,
+  ): Promise<ConnState | null> {
+    const networkId = normalizeNetworkId(message['networkId']);
+    const nodeId = normalizeNodeId(message['nodeId']);
+    const publicKeyHex = normalizePublicKeyHex(message['publicKeyHex']);
+    const timestamp = message['timestamp'];
+    const signatureHex = message['signatureHex'];
+    if (
+      networkId === null || nodeId === null || publicKeyHex === null ||
+      typeof timestamp !== 'number' || !Number.isInteger(timestamp) ||
+      typeof signatureHex !== 'string'
+    ) {
+      deny(ws, 'malformed auth message');
+      return null;
+    }
+    if (Math.abs(this.now() - timestamp) > this.timestampWindowMs) {
+      deny(ws, 'timestamp out of range');
+      return null;
+    }
+    if (!verifyGatewayChallengeSignature({ networkId, nodeId, publicKeyHex, challengeHex, timestamp, signatureHex })) {
+      deny(ws, 'challenge signature verification failed');
+      return null;
+    }
+    let network: NetworkRecord | null;
+    try {
+      network = await this.store.getNetwork(networkId);
+    } catch {
+      deny(ws, 'gateway storage unavailable');
+      return null;
+    }
+    if (network === null) {
+      deny(ws, 'network not found');
+      return null;
+    }
+    const proof = message['joinKeyProofHex'];
+    let joinKeyMatched = false;
+    if (typeof proof === 'string') {
+      try {
+        const joinKey = decryptSecret(network.joinKeyEnc, this.masterKey);
+        joinKeyMatched = verifyJoinKeyProofHex({ joinKey, networkId, nodeId, challengeHex, proofHex: proof });
+      } catch {
+        joinKeyMatched = false; // 密文损坏视同口令不匹配
+      }
+    }
+
+    // 同一身份重复连接：旧连接让位（半开连接重连的正常路径）
+    this.replaceExisting(networkId, nodeId);
+
+    const name = parseName(message['name']);
+    let member: MemberRecord | null;
+    try {
+      member = await this.store.upsertMemberJoinAttempt({
+        networkId,
+        nodeId,
+        name,
+        publicKeyHex,
+        joinKeyMatched,
+      });
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      deny(ws, code === 'limit-reached' ? 'network is full' : 'join attempt rejected by gateway');
+      return null;
+    }
+    if (member === null) {
+      deny(ws, 'join key rejected');
+      return null;
+    }
+
+    const conn: ConnState = {
+      ws,
+      state: 'hanging',
+      networkId,
+      nodeId,
+      ownerId: network.ownerId,
+      maxPeers: network.maxPeers,
+      publicKeyHex,
+      name,
+      lanEndpoints: parseLanEndpoints(message['lanEndpoints']),
+      natType: member.natType,
+      reflexive: null,
+      remoteIp,
+      connectedAt: this.now(),
+      pathReports: new Map(),
+    };
+
+    switch (member.status) {
+      case 'authorized': {
+        this.welcomeAuthorized(conn);
+        this.registerAndAnnounce(conn);
+        return conn;
+      }
+      case 'pending': {
+        sendJson(ws, { type: 'welcome', status: 'pending', maxPeers: network.maxPeers });
+        this.hanging.set(connKey(networkId, nodeId), conn);
+        void this.publishTopology(networkId);
+        return conn;
+      }
+      case 'mismatch': {
+        sendJson(ws, { type: 'welcome', status: 'mismatch' });
+        this.hanging.set(connKey(networkId, nodeId), conn);
+        void this.publishTopology(networkId);
+        return conn;
+      }
+      default: {
+        // paused / revoked：告知原因并关闭
+        deny(ws, `membership ${member.status}`);
+        return null;
+      }
+    }
+  }
+
+  /** 踢掉同 (networkId, nodeId) 的旧连接（authorized 与挂起各查一遍） */
+  private replaceExisting(networkId: string, nodeId: string): void {
+    const net = this.conns.get(networkId);
+    const old = net?.get(nodeId);
+    if (old !== undefined) {
+      this.killConn(old, 'replaced by a new connection');
+    }
+    const hangKey = connKey(networkId, nodeId);
+    const oldHang = this.hanging.get(hangKey);
+    if (oldHang !== undefined) {
+      this.killConn(oldHang, 'replaced by a new connection');
+    }
+  }
+
+  // ------------------------------------------------------------ 二进制中转
+
+  /**
+   * 零明文转发：只读 28B 明文头做路由判定（magic/version/长度/帧类型 +
+   * srcNodeId 严格等于本连接身份——源地址欺骗在这一步被丢弃），载荷
+   * 原样转交，网关永远没有明文。经令牌桶限速，超限丢弃（背压由发送端
+   * 的可靠层负责），转发字节计入滑窗与待刷盘计数。
+   */
+  private relayBinary(conn: ConnState | null, buf: Buffer): void {
+    if (conn === null || conn.state !== 'authorized') return; // 未入网/挂起/已踢连接一律丢弃
+    if (conn.ws.readyState !== conn.ws.OPEN) return; // close 握手期（CLOSING）或半开连接拒收
+    const header = readRelayHeader(buf);
+    if (header === null) return;
+    if (header.srcNodeId !== conn.nodeId) return; // 严禁源地址欺骗
+    if (header.dstNodeId === conn.nodeId) return; // 自环不发
+    const target = this.conns.get(conn.networkId)?.get(header.dstNodeId);
+    if (target === undefined) return; // 目标不在线（或非 authorized）
+    if (!this.limiter.tryRelay({ networkId: conn.networkId, nodeId: conn.nodeId, peerNodeId: header.dstNodeId }, buf.length, this.rateKbps)) {
+      return;
+    }
+    target.ws.send(buf, { binary: true }, () => {/* 写失败由 close 事件兜底 */});
+  }
+
+  // ------------------------------------------------------------ 路径遥测
+
+  /**
+   * path-report（FIX-2）：每条消息视为该节点当前路径视图的**完整快照**——
+   * 构建新表整表替换旧表，且只接纳本网当前在线（authorized 且在路由表里）
+   * 的对端，总量硬上限 MAX_PATH_REPORTS_PER_NODE。随机伪造的 peerNodeId 在
+   * 这里被过滤，内存不随报文放大；内容与旧表一致时不触发 SSE 重渲染。
+   */
+  private handlePathReport(conn: ConnState, message: Record<string, unknown>): void {
+    const peers = message['peers'];
+    if (!Array.isArray(peers)) return;
+    const online = this.conns.get(conn.networkId);
+    const next = new Map<string, { path: string; rttMs: number }>();
+    if (online !== undefined) {
+      for (const item of peers) {
+        if (next.size >= MAX_PATH_REPORTS_PER_NODE) break;
+        if (typeof item !== 'object' || item === null) continue;
+        const entry = item as Record<string, unknown>;
+        const peerNodeId = normalizeNodeId(entry['peerNodeId']);
+        const path = typeof entry['path'] === 'string' ? entry['path'] : null;
+        const rttMs = entry['rttMs'];
+        if (peerNodeId === null || path === null || path.length > 128 || typeof rttMs !== 'number' || !Number.isFinite(rttMs) || rttMs < 0) {
+          continue;
+        }
+        if (!online.has(peerNodeId)) continue; // 只留本网真实在线的对端
+        next.set(peerNodeId, { path, rttMs });
+      }
+    }
+    const changed =
+      next.size !== conn.pathReports.size ||
+      [...next].some(([peerId, report]) => {
+        const old = conn.pathReports.get(peerId);
+        return old === undefined || old.path !== report.path || old.rttMs !== report.rttMs;
+      });
+    conn.pathReports = next;
+    if (changed) void this.publishTopology(conn.networkId);
+  }
+
+  // ------------------------------------------------------------ NAT 观察（udp-stun 回调）
+
+  applyNatObservation(record: NatObservation): void {
+    const key = connKey(record.networkId, record.nodeId);
+    const conn = this.conns.get(record.networkId)?.get(record.nodeId) ?? this.hanging.get(key) ?? null;
+    if (conn !== null) {
+      const prevEndpoint = endpointString(conn.reflexive);
+      conn.natType = record.natType;
+      conn.reflexive = { ip: record.reflexiveIp, port: record.reflexivePort };
+      const nextEndpoint = endpointString(conn.reflexive);
+      // FIX-3：在线节点反射端点首次确定或发生变化时向同网在线同伴补发打洞
+      // 坐标——节点通常先连 WS 再做 UDP STUN 探测，入网时下发的首条
+      // punch-coordinate 里 reflexiveEndpoint 还是 null
+      if (conn.state === 'authorized' && nextEndpoint !== prevEndpoint) {
+        for (const other of this.conns.get(record.networkId)?.values() ?? []) {
+          if (other === conn) continue;
+          sendJson(other.ws, {
+            type: 'punch-coordinate',
+            peerNodeId: conn.nodeId,
+            publicKeyHex: conn.publicKeyHex,
+            lanEndpoints: conn.lanEndpoints,
+            reflexiveEndpoint: nextEndpoint,
+            natType: conn.natType,
+            startAfterMs: 20,
+          });
+        }
+      }
+    }
+    const pending = this.pendingNat.get(key) ?? { networkId: record.networkId, nodeId: record.nodeId };
+    pending.natType = record.natType;
+    pending.lastIp = record.reflexiveIp;
+    this.pendingNat.set(key, pending);
+    void this.publishTopology(record.networkId);
+  }
+
+  /** udp-stun 的 public 判定要用到节点上报的 lanEndpoints */
+  getLanEndpoints(networkId: string, nodeId: string): readonly string[] {
+    const conn = this.conns.get(networkId)?.get(nodeId) ?? this.hanging.get(connKey(networkId, nodeId));
+    return conn?.lanEndpoints ?? [];
+  }
+
+  // ------------------------------------------------------------ PG-4 钩子
+
+  readonly hooks: GatewayHooks = {
+    onMemberChanged: (event: MemberChangedEvent) => this.onMemberChanged(event),
+    onNetworkDeleted: (networkId: string) => this.onNetworkDeleted(networkId),
+    onSettingsChanged: (settings) => {
+      this.rateKbps = settings.relayRateKbps;
+    },
+    onUserDisabled: (userId: string) => this.onUserDisabled(userId),
+  };
+
+  private async onMemberChanged(event: MemberChangedEvent): Promise<void> {
+    const key = connKey(event.networkId, event.nodeId);
+    switch (event.action) {
+      case 'approve':
+      case 'repin': {
+        // 两条动作通向同一升级路径：挂起连接原地升级为 authorized
+        const conn = this.hanging.get(key);
+        if (conn === undefined) break;
+        this.hanging.delete(key);
+        // repin 后库里生效公钥即挂起连接入网时呈验的那把（store 已把
+        // candidate 提升为 publicKeyHex）；从库再同步一次，防判定路径变化
+        try {
+          const members = await this.store.listMembers(event.networkId);
+          const member = members.find((m) => m.nodeId === event.nodeId);
+          if (member !== undefined) conn.publicKeyHex = member.publicKeyHex;
+        } catch {
+          /* 查不到就保持呈验公钥 */
+        }
+        this.welcomeAuthorized(conn);
+        this.registerAndAnnounce(conn);
+        break;
+      }
+      case 'reject': {
+        const conn = this.hanging.get(key);
+        if (conn === undefined) break;
+        this.killConn(conn, 'rejected by administrator');
+        void this.publishTopology(event.networkId);
+        break;
+      }
+      case 'pause': {
+        const conn = this.conns.get(event.networkId)?.get(event.nodeId);
+        if (conn === undefined) break;
+        this.broadcast(event.networkId, { type: 'peer-paused', nodeId: event.nodeId }, event.nodeId);
+        this.killConn(conn, 'paused by administrator');
+        void this.publishTopology(event.networkId);
+        break;
+      }
+      case 'resume': {
+        // 暂停时连接已断，恢复通常发生在离线成员上；有连接也只需刷新拓扑
+        void this.publishTopology(event.networkId);
+        break;
+      }
+      case 'remove': {
+        const conn = this.conns.get(event.networkId)?.get(event.nodeId);
+        if (conn !== undefined) {
+          this.broadcast(event.networkId, { type: 'peer-left', nodeId: event.nodeId }, event.nodeId);
+          this.killConn(conn, 'removed from network');
+        }
+        const hang = this.hanging.get(key);
+        if (hang !== undefined) {
+          this.killConn(hang, 'removed from network');
+        }
+        void this.publishTopology(event.networkId);
+        break;
+      }
+    }
+  }
+
+  private removeFromRouting(conn: ConnState): void {
+    const net = this.conns.get(conn.networkId);
+    if (net !== undefined && net.get(conn.nodeId) === conn) {
+      net.delete(conn.nodeId);
+      if (net.size === 0) this.conns.delete(conn.networkId);
+    }
+  }
+
+  /**
+   * 统一断连（FIX-1）：先把 state 置为终态 'closed' 并从路由表/挂起池摘除——
+   * RFC6455 close 握手窗口内（恶意客户端不回 close 帧时 ws 库最长 30s 仍会
+   * 触发 message 事件），state 闸门 + readyState 双重校验让后续帧一律丢弃；
+   * 再发 denied、走 close 握手，并安排宽限期后 terminate 强拆，防止恶意
+   * 客户端挂住握手让 socket 迟迟不释放。
+   */
+  private killConn(conn: ConnState, reason: string): void {
+    if (conn.state === 'closed') return;
+    conn.state = 'closed';
+    this.removeFromRouting(conn);
+    const key = connKey(conn.networkId, conn.nodeId);
+    if (this.hanging.get(key) === conn) this.hanging.delete(key);
+    conn.pathReports.clear();
+    sendJson(conn.ws, { type: 'denied', reason });
+    conn.ws.close(1008, reason.slice(0, 120));
+    const killer = setTimeout(() => {
+      try {
+        conn.ws.terminate();
+      } catch {
+        /* 已关闭 */
+      }
+    }, KICK_GRACE_MS);
+    killer.unref?.();
+  }
+
+  private onNetworkDeleted(networkId: string): void {
+    const net = this.conns.get(networkId);
+    if (net !== undefined) {
+      for (const conn of [...net.values()]) this.killConn(conn, 'network deleted');
+    }
+    for (const [, conn] of [...this.hanging]) {
+      if (conn.networkId === networkId) this.killConn(conn, 'network deleted');
+    }
+    this.subscribers.delete(networkId);
+    this.lastPublishedKbps.delete(networkId);
+  }
+
+  private onUserDisabled(userId: string): void {
+    // 连接的 ownerId 是「网络归属者」：停用某租户即踢掉其名下全部网络的
+    // 全部在线节点——收 peer-left 的对象自己也在被踢，广播没有意义，
+    // 直接逐一拒绝即可（避免互踢消息穿插在 denied 之前）
+    const affected = new Set<string>();
+    for (const [networkId, net] of this.conns) {
+      for (const conn of [...net.values()]) {
+        if (conn.ownerId !== userId) continue;
+        this.killConn(conn, 'account disabled');
+        affected.add(networkId);
+      }
+    }
+    for (const [, conn] of [...this.hanging]) {
+      if (conn.ownerId !== userId) continue;
+      this.killConn(conn, 'account disabled');
+      affected.add(conn.networkId);
+    }
+    for (const networkId of affected) void this.publishTopology(networkId);
+  }
+
+  // ------------------------------------------------------------ 广播与订阅
+
+  /** 向同网其他 authorized 连接广播；excludeNodeId 为发起者 */
+  private broadcast(networkId: string, message: Record<string, unknown>, excludeNodeId?: string): void {
+    for (const conn of this.conns.get(networkId)?.values() ?? []) {
+      if (excludeNodeId !== undefined && conn.nodeId === excludeNodeId) continue;
+      sendJson(conn.ws, message);
+    }
+  }
+
+  /** TopologyProvider：渲染某网络的完整拓扑快照；网络不存在返回 null */
+  async renderTopology(networkId: string): Promise<NetworkTopologySnapshot | null> {
+    let network: NetworkRecord | null;
+    try {
+      network = await this.store.getNetwork(networkId);
+    } catch {
+      return null;
+    }
+    if (network === null) return null;
+    const members = await this.store.listMembers(networkId);
+    const online = this.conns.get(networkId) ?? new Map<string, ConnState>();
+
+    const rows: TopologyMemberRow[] = members.map((member) => {
+      const conn = online.get(member.nodeId);
+      return {
+        nodeId: member.nodeId,
+        name: member.name,
+        status: member.status,
+        natType: conn?.natType ?? member.natType,
+        lastIp: conn?.reflexive?.ip ?? member.lastIp,
+        online: conn !== undefined,
+        liveRelayKbps: this.limiter.liveRelayKbpsByNode(networkId, member.nodeId),
+        cumulativeRelayBytes: member.cumulativeRelayBytes,
+      };
+    });
+    const links: TopologyLink[] = [];
+    for (const conn of online.values()) {
+      for (const [peerNodeId, report] of conn.pathReports) {
+        links.push({
+          srcNodeId: conn.nodeId,
+          peerNodeId,
+          path: report.path,
+          rttMs: report.rttMs,
+          liveRelayKbps: this.limiter.liveRelayKbpsPair(networkId, conn.nodeId, peerNodeId),
+        });
+      }
+    }
+    const pendingRows = rows
+      .filter((row) => row.status === 'pending')
+      .map((row) => ({ nodeId: row.nodeId, name: row.name, lastIp: row.lastIp }));
+    return {
+      network: {
+        id: network.id,
+        name: network.name,
+        admissionMode: network.admissionMode,
+        maxPeers: network.maxPeers,
+      },
+      summary: {
+        onlineDevices: online.size,
+        pendingCount: pendingRows.length,
+        totalLiveRelayKbps: this.limiter.liveRelayKbpsByNetwork(networkId),
+      },
+      pending: pendingRows,
+      members: rows,
+      links,
+    };
+  }
+
+  /** TopologyProvider：订阅快照推送；返回退订函数 */
+  subscribe(networkId: string, cb: (snapshot: NetworkTopologySnapshot) => void): () => void {
+    let set = this.subscribers.get(networkId);
+    if (set === undefined) {
+      set = new Set();
+      this.subscribers.set(networkId, set);
+    }
+    set.add(cb);
+    return () => {
+      const current = this.subscribers.get(networkId);
+      if (current === undefined) return;
+      current.delete(cb);
+      if (current.size === 0) {
+        this.subscribers.delete(networkId);
+        this.lastPublishedKbps.delete(networkId);
+      }
+    };
+  }
+
+  /** 重渲染并推送快照；渲染失败静默（下一轮 tick 还会拿到） */
+  private async publishTopology(networkId: string): Promise<void> {
+    const set = this.subscribers.get(networkId);
+    if (set === undefined || set.size === 0) return;
+    let snapshot: NetworkTopologySnapshot | null;
+    try {
+      snapshot = await this.renderTopology(networkId);
+    } catch {
+      return;
+    }
+    if (snapshot === null) return;
+    for (const cb of set) {
+      try {
+        cb(snapshot);
+      } catch {
+        /* 单个订阅者写失败不拖累其他订阅者 */
+      }
+    }
+  }
+
+  /** 3s 速率跳动：每网总速率与上次推送值不同才推（恒零不推） */
+  private tickRates(): void {
+    for (const networkId of this.subscribers.keys()) {
+      const total = this.limiter.liveRelayKbpsByNetwork(networkId);
+      const last = this.lastPublishedKbps.get(networkId);
+      if (last !== undefined && Math.abs(total - last) < 1e-9) continue;
+      this.lastPublishedKbps.set(networkId, total);
+      void this.publishTopology(networkId);
+    }
+  }
+
+  // ------------------------------------------------------------ GatewayRuntimeStats
+
+  /** 在线设备数（authorized 连接），供网络视图与管理员用户列表 */
+  getOnlineCountByNetwork(networkId: string): number {
+    return this.conns.get(networkId)?.size ?? 0;
+  }
+
+  getOnlineCountByUser(userId: string): number {
+    let total = 0;
+    for (const net of this.conns.values()) {
+      for (const conn of net.values()) {
+        if (conn.ownerId === userId) total += 1;
+      }
+    }
+    return total;
+  }
+
+  getRelayKbpsByUser(userId: string): number {
+    let total = 0;
+    for (const [networkId, net] of this.conns) {
+      const owned = [...net.values()].some((conn) => conn.ownerId === userId);
+      if (owned) total += this.limiter.liveRelayKbpsByNetwork(networkId);
+    }
+    return total;
+  }
+
+  // ------------------------------------------------------------ 遥测刷盘
+
+  /** 手动触发一次刷盘（内部定时器也走这里）：限速字节 + NAT 变更合并落库 */
+  async flushTelemetry(): Promise<void> {
+    const drained = this.limiter.drainAllPending();
+    const updates = new Map<string, TelemetryUpdate>();
+    for (const item of drained) {
+      updates.set(connKey(item.networkId, item.nodeId), {
+        networkId: item.networkId,
+        nodeId: item.nodeId,
+        relayBytesDelta: item.bytes,
+      });
+    }
+    for (const nat of this.pendingNat.values()) {
+      const key = connKey(nat.networkId, nat.nodeId);
+      const existing = updates.get(key) ?? { networkId: nat.networkId, nodeId: nat.nodeId };
+      if (nat.natType !== undefined) existing.natType = nat.natType;
+      if (nat.lastIp !== undefined) existing.lastIp = nat.lastIp;
+      updates.set(key, existing);
+    }
+    this.pendingNat.clear();
+    if (updates.size === 0) return;
+    const list = [...updates.values()];
+    const seenAt = new Date(this.now()).toISOString();
+    for (const update of list) {
+      update.lastSeenAt = seenAt; // 只要这次有变更就顺手记 lastSeenAt
+    }
+    await this.store.flushMemberTelemetry(list);
+  }
+}
