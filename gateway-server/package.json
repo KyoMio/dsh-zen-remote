@@ -12,11 +12,13 @@
     "test": "node --experimental-sqlite --test \"test/*.test.mjs\""
   },
   "dependencies": {
-    "pg": "^8.13.0"
+    "pg": "^8.13.0",
+    "ws": "^8.22.2"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
     "@types/pg": "^8.11.0",
+    "@types/ws": "^8.18.2",
     "typescript": "^5.8.0"
   }
 }

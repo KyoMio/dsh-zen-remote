@@ -10,9 +10,11 @@ import type {
   GatewayRuntimeStats,
   RouteContext,
   RouteDef,
+  TopologyProvider,
 } from './http/auth.js';
 import { buildNetworkRoutes } from './http/routes-networks.js';
 import { buildAdminRoutes } from './http/routes-admin.js';
+import { buildTopologyRoutes } from './http/routes-topology.js';
 import { ApiError } from './http/auth.js';
 import { StoreError } from './store/types.js';
 import type { GatewayStore } from './store/types.js';
@@ -29,6 +31,8 @@ export interface GatewayApiServerOptions {
   runtime?: GatewayRuntimeStats;
   /** PG-5 实时钩子；缺省无钩子 */
   hooks?: GatewayHooks;
+  /** PG-5 拓扑实时层（ws-hub）；提供后注册 /topology 与 /events 路由 */
+  topology?: TopologyProvider;
 }
 
 function safeDecodeSegment(segment: string): string {
@@ -88,13 +92,19 @@ export function createApiRequestHandler(options: GatewayApiServerOptions): (req:
     sessionTtlMs: options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS,
   };
   const deps: DispatchDeps = {
-    routes: [...buildAuthRoutes(), ...buildNetworkRoutes(), ...buildAdminRoutes()],
+    routes: [
+      ...buildAuthRoutes(),
+      ...buildNetworkRoutes(),
+      ...buildAdminRoutes(),
+      ...(options.topology !== undefined ? buildTopologyRoutes() : []),
+    ],
     ctx: {
       store: options.store,
       masterKey: options.masterKey,
       config,
       runtime: options.runtime ?? NOOP_RUNTIME_STATS,
       hooks: options.hooks ?? {},
+      topology: options.topology,
     },
   };
   return (req, res) => {

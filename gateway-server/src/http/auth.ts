@@ -17,8 +17,10 @@ import { TLSSocket } from 'node:tls';
 import { hashPassword, verifyPassword } from '../master-key.js';
 import { StoreError } from '../store/types.js';
 import type {
+  AdmissionMode,
   GatewayStore,
   MemberStatus,
+  NatType,
   SystemSettings,
   UserRecord,
   UserRole,
@@ -75,6 +77,48 @@ export interface GatewayHooks {
   onUserDisabled?: (userId: string) => void | Promise<void>;
 }
 
+// ---------------------------------------------------------------- 拓扑快照（PG-5）
+
+/** 一对节点间的路径观测 + 该节点对的实时中转速率 */
+export interface TopologyLink {
+  srcNodeId: string;
+  peerNodeId: string;
+  /** 节点自报路径（如 'lan' / 'p2p' / 'relay'），原样透传给控制台 */
+  path: string;
+  rttMs: number;
+  liveRelayKbps: number;
+}
+
+/** 拓扑页的成员行：库中五态 + 内存在线状态合并视图 */
+export interface TopologyMemberRow {
+  nodeId: string;
+  name: string | null;
+  status: MemberStatus;
+  /** 在线（WS 已认证入网）优先取内存 natType/lastIp，离线回落库值 */
+  natType: NatType;
+  lastIp: string | null;
+  online: boolean;
+  /** 该成员作为发送方的实时中转速率 */
+  liveRelayKbps: number;
+  cumulativeRelayBytes: number;
+}
+
+/** GET /networks/:id/topology 与 SSE 共用的完整快照 */
+export interface NetworkTopologySnapshot {
+  network: { id: string; name: string; admissionMode: AdmissionMode; maxPeers: number };
+  summary: { onlineDevices: number; pendingCount: number; totalLiveRelayKbps: number };
+  pending: Array<{ nodeId: string; name: string | null; lastIp: string | null }>;
+  members: TopologyMemberRow[];
+  links: TopologyLink[];
+}
+
+/** 拓扑数据的窄接口：PG-5 的 ws-hub 实现，routes-topology 只依赖这里 */
+export interface TopologyProvider {
+  renderTopology(networkId: string): Promise<NetworkTopologySnapshot | null>;
+  /** 订阅某网络的快照推送（SSE）；返回退订函数。回调抛错由订阅方自行兜住 */
+  subscribe(networkId: string, cb: (snapshot: NetworkTopologySnapshot) => void): () => void;
+}
+
 export interface RouteContext {
   req: IncomingMessage;
   res: ServerResponse;
@@ -83,6 +127,8 @@ export interface RouteContext {
   config: ApiServerConfig;
   runtime: GatewayRuntimeStats;
   hooks: GatewayHooks;
+  /** PG-5 实时层；未装配（无 topology 选项）时拓扑路由不注册 */
+  topology?: TopologyProvider;
 }
 
 export type RouteHandler = (ctx: RouteContext, params: Record<string, string>) => Promise<void>;
