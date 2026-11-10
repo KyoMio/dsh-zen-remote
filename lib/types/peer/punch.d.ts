@@ -37,6 +37,9 @@
 import type { Socket as DgramSocket } from 'node:dgram';
 import type { PeerIdentityKeyPair, PeerSessionCiphers } from './crypto.js';
 import type { PeerFrameHeader } from './wire.js';
+/** 打洞/中转握手控制包的域分隔前缀——UDP 与网关 WS 两条路径共用同一形态。 */
+export declare const STUN_PROBE_DOMAIN = "zr-stun-probe-v1";
+export declare const PUNCH_DOMAIN = "zr-punch-v1";
 /** `os.networkInterfaces()` entries, loosened so hand-built fixtures type-check. */
 export interface LanInterfaceInfo {
     address: string;
@@ -67,13 +70,36 @@ export interface StunProbeResult {
     natType: PeerNatType;
 }
 /**
- * NAT self-check from ONE freshly bound UDP socket against the
- * gateway's primary port and (when `altPort > 0`) its alternate port.
- * Both ports agree → cone NAT (`public` when the reflexive ip is one
- * of this machine's own addresses — no NAT at all). They disagree →
- * symmetric NAT (per-destination mappings; simple hole punching cannot
- * work). Only the primary answers → `unknown`; nothing answers →
- * `unknown` with a null endpoint.
+ * NAT self-check against the gateway's primary port and (when
+ * `altPort > 0`) its alternate port. Both ports agree → cone NAT
+ * (`public` when the reflexive ip is one of this machine's own
+ * addresses — no NAT at all). They disagree → symmetric NAT
+ * (per-destination mappings; simple hole punching cannot work). Only
+ * the primary answers → `unknown`; nothing answers → `unknown` with a
+ * null endpoint.
+ *
+ * **Socket reuse (PG-8, load-bearing)**: pass `socket` to probe from an
+ * ALREADY-BOUND socket — the punch layer's own — instead of a throwaway.
+ * The gateway records and re-publishes the REFLEXIVE ENDPOINT it saw, and
+ * peers punch at that endpoint; only a probe from the punch socket itself
+ * makes the recorded port the one peers can actually reach. A probe from a
+ * temporary socket would register a port that is closed the moment the
+ * probe returns, and every punch at it would fly into the void. When
+ * `socket` is given it is NOT bound or closed here — the punch layer keeps
+ * owning it; this function attaches its own `message` listener for the
+ * probe's lifetime and removes exactly that listener on the way out (the
+ * punch manager's own listeners are untouched, and its `handlePacket`
+ * silently ignores non-frame `stun-reply` JSON anyway).
+ *
+ * Wire format (PG-8, aligned with gateway-server's udp-stun.ts): the
+ * probe is `{ type:'stun-probe', networkId, nodeId, publicKeyHex, nonce,
+ * timestamp, signatureHex }` signed over
+ * `zr-stun-probe-v1|<networkId>|<nodeId>|<nonce>|<timestamp>`; the reply
+ * is parsed leniently — the gateway's
+ * `{ type:'stun-reply', nonce, reflexiveIp, reflexivePort, serverPortRole }`
+ * AND the pre-PG-8 node shape `{ kind:'zr-stun-reply', ip, port }` both
+ * count, so a node updated ahead of its gateway (or behind it) keeps
+ * classifying.
  */
 export declare function probeStunNatType(options: {
     primaryHost: string;
@@ -82,7 +108,13 @@ export declare function probeStunNatType(options: {
     networkId: string;
     identity: PeerIdentityKeyPair;
     timeoutMs?: number;
+    /** Reuse an ALREADY-BOUND socket (the punch layer's own). Not closed here. */
+    socket?: DgramSocket;
 }): Promise<StunProbeResult>;
+/** Sign a raw message with the node's long-term identity (64-byte sig → 128 hex). Shared with the mux's WS-relayed control envelopes. */
+export declare function ed25519Sign(message: Buffer, identity: PeerIdentityKeyPair): string;
+/** Verify a raw-message Ed25519 signature against a raw 32-byte public key. Never throws. */
+export declare function ed25519Verify(message: Buffer, publicKeyHex: string, sigHex: string): boolean;
 export type PunchClock = {
     now(): number;
     setTimeout(fn: () => void, ms: number): unknown;

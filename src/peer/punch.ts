@@ -53,8 +53,9 @@ const HEX16 = /^[0-9a-fA-F]{16}$/
 const HEX64 = /^[0-9a-fA-F]{64}$/
 const HEX128 = /^[0-9a-fA-F]{128}$/
 
-const STUN_PROBE_DOMAIN = 'zr-stun-v1'
-const PUNCH_DOMAIN = 'zr-punch-v1'
+/** 打洞/中转握手控制包的域分隔前缀——UDP 与网关 WS 两条路径共用同一形态。 */
+export const STUN_PROBE_DOMAIN = 'zr-stun-probe-v1'
+export const PUNCH_DOMAIN = 'zr-punch-v1'
 
 /** `os.networkInterfaces()` entries, loosened so hand-built fixtures type-check. */
 export interface LanInterfaceInfo {
@@ -170,13 +171,36 @@ function isReflexiveIpLocal(ip: string): boolean {
 }
 
 /**
- * NAT self-check from ONE freshly bound UDP socket against the
- * gateway's primary port and (when `altPort > 0`) its alternate port.
- * Both ports agree → cone NAT (`public` when the reflexive ip is one
- * of this machine's own addresses — no NAT at all). They disagree →
- * symmetric NAT (per-destination mappings; simple hole punching cannot
- * work). Only the primary answers → `unknown`; nothing answers →
- * `unknown` with a null endpoint.
+ * NAT self-check against the gateway's primary port and (when
+ * `altPort > 0`) its alternate port. Both ports agree → cone NAT
+ * (`public` when the reflexive ip is one of this machine's own
+ * addresses — no NAT at all). They disagree → symmetric NAT
+ * (per-destination mappings; simple hole punching cannot work). Only
+ * the primary answers → `unknown`; nothing answers → `unknown` with a
+ * null endpoint.
+ *
+ * **Socket reuse (PG-8, load-bearing)**: pass `socket` to probe from an
+ * ALREADY-BOUND socket — the punch layer's own — instead of a throwaway.
+ * The gateway records and re-publishes the REFLEXIVE ENDPOINT it saw, and
+ * peers punch at that endpoint; only a probe from the punch socket itself
+ * makes the recorded port the one peers can actually reach. A probe from a
+ * temporary socket would register a port that is closed the moment the
+ * probe returns, and every punch at it would fly into the void. When
+ * `socket` is given it is NOT bound or closed here — the punch layer keeps
+ * owning it; this function attaches its own `message` listener for the
+ * probe's lifetime and removes exactly that listener on the way out (the
+ * punch manager's own listeners are untouched, and its `handlePacket`
+ * silently ignores non-frame `stun-reply` JSON anyway).
+ *
+ * Wire format (PG-8, aligned with gateway-server's udp-stun.ts): the
+ * probe is `{ type:'stun-probe', networkId, nodeId, publicKeyHex, nonce,
+ * timestamp, signatureHex }` signed over
+ * `zr-stun-probe-v1|<networkId>|<nodeId>|<nonce>|<timestamp>`; the reply
+ * is parsed leniently — the gateway's
+ * `{ type:'stun-reply', nonce, reflexiveIp, reflexivePort, serverPortRole }`
+ * AND the pre-PG-8 node shape `{ kind:'zr-stun-reply', ip, port }` both
+ * count, so a node updated ahead of its gateway (or behind it) keeps
+ * classifying.
  */
 export async function probeStunNatType(options: {
   primaryHost: string
@@ -185,6 +209,8 @@ export async function probeStunNatType(options: {
   networkId: string
   identity: PeerIdentityKeyPair
   timeoutMs?: number
+  /** Reuse an ALREADY-BOUND socket (the punch layer's own). Not closed here. */
+  socket?: DgramSocket
 }): Promise<StunProbeResult> {
   const primaryHost = options.primaryHost
   if (typeof primaryHost !== 'string' || primaryHost.length === 0) {
@@ -201,10 +227,41 @@ export async function probeStunNatType(options: {
   const identity = requireIdentity(options.identity)
   const timeoutMs = options.timeoutMs ?? 500
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1) throw new RangeError('timeoutMs must be an integer ≥ 1')
+  const reused = options.socket
+  if (reused !== undefined && typeof reused.send !== 'function') {
+    throw new TypeError('socket must be a dgram Socket when provided')
+  }
 
-  const socket = dgram.createSocket('udp4')
-  socket.on('error', () => {}) // ICMP port-unreachables are routine here; never crash
-  try {
+  // Reuse path: no bind, no close — the punch layer keeps the socket. Our
+  // own `message` listener is tracked so ONLY it is removed on exit.
+  let socket: DgramSocket
+  let bound = false
+  if (reused !== undefined) {
+    socket = reused
+    try {
+      bound = socket.address().port > 0
+    } catch {
+      bound = false
+    }
+    if (!bound) {
+      // Reused sockets are expected to be bound already (the punch layer
+      // binds its own); a stranger unbound socket is still usable — bind it
+      // here once, but leave it open (the caller closes what it passed).
+      await new Promise<void>((resolve, reject) => {
+        const onError = (err: Error) => {
+          socket.removeListener('error', onError)
+          reject(err)
+        }
+        socket.once('error', onError)
+        socket.bind(0, () => {
+          socket.removeListener('error', onError)
+          resolve()
+        })
+      })
+    }
+  } else {
+    socket = dgram.createSocket('udp4')
+    socket.on('error', () => {}) // ICMP port-unreachables are routine here; never crash
     await new Promise<void>((resolve, reject) => {
       const onError = (err: Error) => {
         socket.removeListener('error', onError)
@@ -216,60 +273,66 @@ export async function probeStunNatType(options: {
         resolve()
       })
     })
+  }
 
-    const nonce = randomBytes(8).toString('hex')
-    const timestamp = Date.now()
-    const message = Buffer.from(
-      `${STUN_PROBE_DOMAIN}|probe|${networkId}|${identity.nodeId}|${nonce}|${timestamp}`,
-      'utf8',
-    )
-    const packet = Buffer.from(JSON.stringify({
-      zr: 1,
-      kind: 'zr-stun-probe',
-      networkId,
-      nodeId: identity.nodeId,
-      publicKeyHex: identity.publicKeyHex,
-      nonce,
-      timestamp,
-      sigHex: ed25519Sign(message, identity),
-    }))
+  const nonce = randomBytes(8).toString('hex')
+  const timestamp = Date.now()
+  const message = Buffer.from(
+    `${STUN_PROBE_DOMAIN}|${networkId}|${identity.nodeId}|${nonce}|${timestamp}`,
+    'utf8',
+  )
+  const packet = Buffer.from(JSON.stringify({
+    type: 'stun-probe',
+    networkId,
+    nodeId: identity.nodeId,
+    publicKeyHex: identity.publicKeyHex,
+    nonce,
+    timestamp,
+    signatureHex: ed25519Sign(message, identity),
+  }))
 
-    // One socket, two remote ports: the mapping comparison is only
-    // meaningful because both probes share the same local endpoint.
-    const slots = new Map<number, 'primary' | 'alt'>()
-    const replies = new Map<'primary' | 'alt', { ip: string; port: number }>()
-    let settleEarly: () => void = () => {}
-    const early = new Promise<void>((resolve) => {
-      settleEarly = resolve
-    })
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const deadline = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, timeoutMs)
-    })
-    socket.on('message', (buf, rinfo) => {
-      let parsed: Record<string, unknown>
-      try {
-        parsed = JSON.parse(buf.toString('utf8'))
-      } catch {
-        return
-      }
-      if (!parsed || parsed.zr !== 1 || parsed.kind !== 'zr-stun-reply') return
-      if (parsed.nonce !== nonce) return
-      const ip = parsed.ip
-      const port = parsed.port
-      if (typeof ip !== 'string' || ip.length === 0) return
-      if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535) return
-      const slot = slots.get(rinfo.port)
-      if (!slot || replies.has(slot)) return
-      replies.set(slot, { ip, port })
-      if (replies.size === slots.size) settleEarly()
-    })
-    const send = (port: number, slot: 'primary' | 'alt'): void => {
-      slots.set(port, slot)
-      socket.send(packet, port, primaryHost, (err) => {
-        if (err) slots.delete(port)
-      })
+  // One socket, two remote ports: the mapping comparison is only
+  // meaningful because both probes share the same local endpoint.
+  const slots = new Map<number, 'primary' | 'alt'>()
+  const replies = new Map<'primary' | 'alt', { ip: string; port: number }>()
+  let settleEarly: () => void = () => {}
+  const early = new Promise<void>((resolve) => {
+    settleEarly = resolve
+  })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs)
+  })
+  const onMessage = (buf: Buffer, rinfo: { address: string; port: number }): void => {
+    let parsed: Record<string, unknown>
+    try {
+      parsed = JSON.parse(buf.toString('utf8'))
+    } catch {
+      return
     }
+    // Dual-format reply: the gateway's `type:'stun-reply'` and the legacy
+    // node shape `kind:'zr-stun-reply'` both carry (nonce, ip, port) under
+    // different names; read whichever is present.
+    const kind = parsed.type ?? parsed.kind
+    if (kind !== 'stun-reply' && kind !== 'zr-stun-reply') return
+    if (parsed.nonce !== nonce) return
+    const ip = parsed.reflexiveIp ?? parsed.ip
+    const port = parsed.reflexivePort ?? parsed.port
+    if (typeof ip !== 'string' || ip.length === 0) return
+    if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535) return
+    const slot = slots.get(rinfo.port)
+    if (!slot || replies.has(slot)) return
+    replies.set(slot, { ip, port })
+    if (replies.size === slots.size) settleEarly()
+  }
+  socket.on('message', onMessage)
+  const send = (port: number, slot: 'primary' | 'alt'): void => {
+    slots.set(port, slot)
+    socket.send(packet, port, primaryHost, (err) => {
+      if (err) slots.delete(port)
+    })
+  }
+  try {
     send(options.primaryPort, 'primary')
     if (altPort > 0) send(altPort, 'alt')
     await Promise.race([deadline, early])
@@ -283,13 +346,19 @@ export async function probeStunNatType(options: {
     if (primary.port !== alt.port) return { reflexiveEndpoint, natType: 'symmetric' }
     return { reflexiveEndpoint, natType: isReflexiveIpLocal(primary.ip) ? 'public' : 'cone' }
   } finally {
-    socket.close()
+    clearTimeout(timer)
+    // The reuse contract: leave the punch layer's socket exactly as we found
+    // it — our listener removed, everything else untouched. The throwaway
+    // path (no `socket` given) closes its own.
+    socket.removeListener('message', onMessage)
+    if (reused === undefined) socket.close()
   }
 }
 
 // -- Ed25519 helpers (crypto.ts keeps its JWK round-trips private) -------------------
 
-function ed25519Sign(message: Buffer, identity: PeerIdentityKeyPair): string {
+/** Sign a raw message with the node's long-term identity (64-byte sig → 128 hex). Shared with the mux's WS-relayed control envelopes. */
+export function ed25519Sign(message: Buffer, identity: PeerIdentityKeyPair): string {
   const privateKey = createPrivateKey({
     key: {
       kty: 'OKP',
@@ -302,7 +371,8 @@ function ed25519Sign(message: Buffer, identity: PeerIdentityKeyPair): string {
   return sign(null, message, privateKey).toString('hex')
 }
 
-function ed25519Verify(message: Buffer, publicKeyHex: string, sigHex: string): boolean {
+/** Verify a raw-message Ed25519 signature against a raw 32-byte public key. Never throws. */
+export function ed25519Verify(message: Buffer, publicKeyHex: string, sigHex: string): boolean {
   try {
     const publicKey = createPublicKey({
       key: { kty: 'OKP', crv: 'Ed25519', x: Buffer.from(publicKeyHex, 'hex').toString('base64url') },

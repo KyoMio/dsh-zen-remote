@@ -554,8 +554,25 @@ test('T22c + T17: the host role subscribes session/event and starts sweeper + re
   for (const stop of client.effects) assert.equal(typeof stop, 'function', 'each effect returned a stop function')
   assert.equal(index.getRelayClient(), undefined, 'the single relay client is gone from the pool wiring (MS-5)')
   assert.notEqual(index.getRelayPool(), undefined, 'the client role installs its relay pool in the module slot')
+  assert.equal(index.getPeerEngine(), undefined, 'a pure client never builds a peer engine (PG-8)')
   for (const stop of client.effects) stop()
   assert.equal(index.getRelayPool(), undefined, 'the disposal clears the pool slot')
+
+  // PG-8: the peer role runs BOTH halves — the engine mounts beside the
+  // pool and its teardown rides the SAME pool-disposal effect (the pinned
+  // top-level effect counts may not grow). listeners gain the client half's
+  // second volatile-update watcher on top of the host's three.
+  const peer = makeCtx()
+  index.apply(peer.ctx, { role: 'peer' })
+  assert.equal(peer.effects.length, 6, 'the peer role: bridge disposal, sweeper, pool disposal (engine rides it), device-name watcher, restart watcher, fetch-route fallback cleanup')
+  for (const stop of peer.effects) assert.equal(typeof stop, 'function', 'each effect returned a stop function')
+  assert.notEqual(index.getRelayPool(), undefined, 'the peer role keeps a relay pool for the virtual mounts')
+  assert.notEqual(index.getPeerEngine(), undefined, 'the peer role installs its peer engine in the module slot')
+  assert.notEqual(index.getPeerEngine().status(), undefined, 'the engine answers its status')
+  assert.equal(index.getPeerEngine().status().gatewayState, 'unconfigured', 'an engine without a join starts unconfigured')
+  for (const stop of peer.effects) stop()
+  assert.equal(index.getPeerEngine(), undefined, 'the pool disposal also clears the engine slot (PG-8)')
+  assert.equal(index.getRelayPool(), undefined, 'the disposal clears the peer role pool slot')
 
   // A row switching from client to host clears the stale instance too.
   const reinstall = makeCtx()

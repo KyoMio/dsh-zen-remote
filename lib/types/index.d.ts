@@ -23,6 +23,7 @@ declare module '@deepseek-ai/cordis' {
 }
 import type { AdminAdmission } from './admin-routes.js';
 import type { RelayPool } from './relay-pool.js';
+import type { PeerEngine } from './peer/engine.js';
 import type { RelayClient } from './relay-client.js';
 import type { BridgeRegistry } from './plugin-bridge.js';
 import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js';
@@ -46,6 +47,8 @@ export { DEFAULT_MAX_UPLOAD_BYTES };
 export declare function getRelayClient(): RelayClient | undefined;
 /** The live client-role relay pool, if one was built. */
 export declare function getRelayPool(): RelayPool | undefined;
+/** The live peer-role engine, if one was built. */
+export declare function getPeerEngine(): PeerEngine | undefined;
 /** The live bridge registry, if a plugin row is currently applied. */
 export declare function getBridgeRegistry(): BridgeRegistry | undefined;
 /** Host half config. Every field below arrives through the loader as a
