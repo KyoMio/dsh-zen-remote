@@ -21,7 +21,7 @@
 | ![会话列表主屏](assets/home.png) | ![会话页](assets/session.png) | ![会话信息卡](assets/info.png) |
 
 | composer 权限 sheet | 公网设备看到的配对页 |
-| --- | --- | --- |
+| --- | --- |
 | ![composer 权限 sheet](assets/sheet.png) | ![配对页](assets/pairing.png) |
 
 > 截图为 390×844 手机视口、浅色主题；深浅主题均适配。配对页由网关绘制，按 DSH 官方风格、跟随系统浅色 / 深色。
