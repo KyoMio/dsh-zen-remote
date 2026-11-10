@@ -20,6 +20,8 @@
     "src/index.ts",
     "src/state-store.ts",
     "src/relay-pool.ts",
+    "src/peer/crypto.ts",
+    "src/peer/wire.ts",
     "src/adapters/dsh-better-sidebar/surface.ts",
     "src/cli/config-writer.ts",
     "src/cli/ipc-server.ts",
