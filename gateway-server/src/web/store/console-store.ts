@@ -313,7 +313,9 @@ function defaultFetch(): FetchLike {
   if (impl === undefined) {
     throw new ConsoleApiError(0, 'NO_TRANSPORT', 'fetch is not available in this environment');
   }
-  return impl;
+  // 浏览器的 window.fetch 带 WebIDL 品牌检查：receiver 不是 Window 就抛
+  // Illegal invocation。绑死 globalThis，之后无论以什么形态调用都安全。
+  return impl.bind(globalThis);
 }
 
 function defaultEventSourceFactory(): EventSourceFactory {
@@ -371,12 +373,15 @@ export class ConsoleClient {
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
-    if (this.fetchImpl === undefined) {
+    // 以局部变量调用：方法属性形式（this.fetchImpl(...)）会把 ConsoleClient
+    // 实例当 receiver 传给注入件，浏览器的 WebIDL 品牌检查直接抛 Illegal invocation。
+    const fetchFn = this.fetchImpl;
+    if (fetchFn === undefined) {
       throw new ConsoleApiError(0, 'NO_TRANSPORT', 'fetch is not available in this environment');
     }
     let res: FetchResponseLike;
     try {
-      res = await this.fetchImpl(this.baseUrl + path, {
+      res = await fetchFn(this.baseUrl + path, {
         method,
         headers: body === undefined ? undefined : { 'content-type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -478,10 +483,12 @@ export class ConsoleClient {
    * 返回退订函数。
    */
   subscribeTopology(networkId: string, onSnapshot: (snapshot: TopologySnapshot) => void): () => void {
-    if (this.eventSourceFactoryImpl === undefined) {
+    // 同 request()：经局部变量调用，不把 ConsoleClient 实例当 receiver 传出去。
+    const makeEventSource = this.eventSourceFactoryImpl;
+    if (makeEventSource === undefined) {
       throw new ConsoleApiError(0, 'NO_TRANSPORT', 'EventSource is not available in this environment');
     }
-    const es = this.eventSourceFactoryImpl(`${this.baseUrl}/api/v1/networks/${encodeURIComponent(networkId)}/events`);
+    const es = makeEventSource(`${this.baseUrl}/api/v1/networks/${encodeURIComponent(networkId)}/events`);
     const handle = (event: { data?: unknown }): void => {
       if (typeof event?.data !== 'string') return;
       let parsed: unknown;

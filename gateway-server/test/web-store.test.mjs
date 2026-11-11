@@ -436,6 +436,79 @@ describe('ConsoleClient：SSE 订阅', () => {
   });
 });
 
+// ---------------------------------------------------------------- WebIDL this 接收器
+
+// 真实浏览器的 window.fetch 带 WebIDL 品牌检查（brand check）：receiver 不是
+// Window/globalThis 就抛 TypeError: Illegal invocation。Node 的 undici fetch
+// 不校验 this，所以这两个回归用例专门模拟浏览器行为，钉住调用形态：
+// defaultFetch() 必须 .bind(globalThis)，request()/subscribeTopology() 必须
+// 以局部变量调用注入件，绝不把 ConsoleClient 实例当 receiver 传出去。
+describe('ConsoleClient：WebIDL this 接收器（浏览器 Illegal invocation 回归）', () => {
+  test('默认 globalThis.fetch：品牌检查替身要求 receiver 恰为 globalThis（bind 已生效）', async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'fetch');
+    assert.ok(original, '运行环境必须有全局 fetch');
+    const brandCheckedFetch = function (url, init) {
+      // 严格模拟 Chromium：defaultFetch() 绑定 globalThis 后，绑定函数的
+      // receiver 恒为 globalThis；若仍是方法属性调用（this = client 实例）
+      // 或依赖隐式 undefined，都按浏览器语义抛 Illegal invocation。
+      if (this !== globalThis) {
+        throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+      }
+      return Promise.resolve(
+        jsonEnvelope(200, { ok: true, data: { authenticated: false, allowSignup: true, maxNetworksPerUser: 3 } }),
+      );
+    };
+    // Node 的全局 fetch 是 getter-only 属性，普通赋值在 strict mode 下会抛错，
+    // 用 defineProperty 原地替换、finally 按原描述符还原。
+    Object.defineProperty(globalThis, 'fetch', {
+      value: brandCheckedFetch,
+      writable: true,
+      enumerable: original.enumerable,
+      configurable: true,
+    });
+    try {
+      // 不传 fetchImpl：走 defaultFetch() 全局路径（构造时读取 globalThis.fetch）
+      const me = await new ConsoleClient().fetchMe();
+      assert.deepEqual(me, { authenticated: false, allowSignup: true, maxNetworksPerUser: 3 });
+    } finally {
+      Object.defineProperty(globalThis, 'fetch', original);
+    }
+  });
+
+  test('显式注入 fetchImpl / eventSourceFactory：不得以 ConsoleClient 实例为 this 调用', async () => {
+    const seenFetchReceivers = [];
+    const seenFactoryReceivers = [];
+    const esStub = {
+      addEventListener() {},
+      close() {},
+    };
+    const customFetch = async function (url) {
+      seenFetchReceivers.push(this);
+      return jsonEnvelope(200, { ok: true, data: { authenticated: false, allowSignup: true, maxNetworksPerUser: 3 } });
+    };
+    const customEsFactory = function (url) {
+      seenFactoryReceivers.push(this);
+      return esStub;
+    };
+    const client = new ConsoleClient({ fetchImpl: customFetch, eventSourceFactory: customEsFactory });
+
+    await client.fetchMe();
+    const unsubscribe = client.subscribeTopology('net-9', () => {});
+    unsubscribe();
+
+    assert.equal(seenFetchReceivers.length, 1);
+    assert.ok(
+      !(seenFetchReceivers[0] instanceof ConsoleClient),
+      'request() 不得把 ConsoleClient 实例当 this 传给注入的 fetch',
+    );
+    assert.equal(seenFactoryReceivers.length, 1);
+    assert.ok(
+      !(seenFactoryReceivers[0] instanceof ConsoleClient),
+      'subscribeTopology() 不得把 ConsoleClient 实例当 this 传给注入的工厂',
+    );
+  });
+});
+
 // ---------------------------------------------------------------- PG-6c：纯逻辑与数据语义
 
 const tZh = (key, vars) => translate('zh', key, vars);
