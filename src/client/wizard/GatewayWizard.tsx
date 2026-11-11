@@ -1053,9 +1053,10 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     return t('wizard.desktop.addressFallback', { port: String(port) })
   }, [path, serverUrl, readiness, wizardStatus, t])
 
-  // Fast 2s poll while waiting on gateway-side manual approval so the
-  // verify lights flip to green promptly once the administrator clicks Approve.
-  const waitingPeerApproval = modalOpen && step === 'verify' && wizardRole === 'peer' && peerView?.gatewayState === 'pending-approval'
+  // Fast 2s poll while connecting or waiting on gateway-side manual approval
+  // so the verify lights flip to green promptly once the handshake or Approve lands.
+  const waitingPeerApproval = modalOpen && step === 'verify' && wizardRole === 'peer'
+    && (peerView?.gatewayState === 'pending-approval' || peerView?.gatewayState === 'connecting')
   useEffect(() => {
     if (!waitingPeerApproval) return
     const handle = setInterval(() => { void loadPeerStatus() }, 2000)

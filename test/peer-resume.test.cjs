@@ -129,3 +129,48 @@ test('resumeFromState: stop 之后不再恢复', () => {
     fs.rmSync(home, { recursive: true, force: true })
   }
 })
+
+test('joinNetwork: 自管 UDP socket 连续多次改链接重连或 leave 后再入网不会因关闭旧 socket 而挂死', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-peer-rejoin-'))
+  try {
+    const stateFile = path.join(home, 'zen-remote-state.json')
+    const clock = fakeClock()
+    // 真实生产接线（src/index.ts）不传 udpSocket，由引擎自建自管
+    const engine = createPeerEngine({
+      stateFile,
+      identity: ensurePeerIdentity(stateFile),
+      relayPool: fakePool(),
+      relayHandler: () => undefined,
+      relaySecret: () => 'secret',
+      serverName: () => '测试机',
+      udpProbe: null,
+      clock,
+      log: () => {},
+    })
+    try {
+      const withTimeout = (promise, label) => Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out (hung on closed punchSocket)`)), 1500).unref?.()),
+      ])
+      const first = await withTimeout(engine.joinNetwork('zr-net+insecure://127.0.0.1:9/0123456789abcdef#key-1'), 'first join')
+      assert.deepEqual(first, { ok: true })
+      assert.equal(engine.status().networkId, '0123456789abcdef')
+
+      const second = await withTimeout(engine.joinNetwork('zr-net+insecure://127.0.0.1:9/fedcba9876543210#key-2'), 'second join after modifying link')
+      assert.deepEqual(second, { ok: true })
+      assert.equal(engine.status().networkId, 'fedcba9876543210')
+
+      engine.leaveNetwork()
+      await sleep(80)
+      assert.equal(engine.status().gatewayState, 'unconfigured', 'stale ws close must not overwrite unconfigured after leaveNetwork')
+
+      const third = await withTimeout(engine.joinNetwork('zr-net+insecure://127.0.0.1:9/1111222233334444#key-3'), 'third join after leave')
+      assert.deepEqual(third, { ok: true })
+      assert.equal(engine.status().networkId, '1111222233334444')
+    } finally {
+      engine.stop()
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
