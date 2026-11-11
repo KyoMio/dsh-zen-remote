@@ -1,11 +1,11 @@
 /**
  * CLI-5: the process entry point behind `bin/zen-remote.mjs`. `runCli` turns
- * a parsed argv into exactly one verdict: static answers (help, version,
- * the SPEC's `--role peer` refusal, unknown commands) render here; every
- * plugin-driving command first comes alive through `ensureDshRunning` and
- * then dispatches into the CLI-3/CLI-4 command functions over the discovered
- * IPC socket; `setup` owns its preflight (install + launch) and runs the
- * three-step wizard.
+ * a parsed argv into exactly one verdict: static answers (help, version, an
+ * unknown role value, unknown commands) render here; every plugin-driving
+ * command first comes alive through `ensureDshRunning` and then dispatches
+ * into the CLI-3/CLI-4 command functions over the discovered IPC socket;
+ * `setup` owns its preflight (install + launch) and runs the three-step
+ * wizard.
  *
  * Two things belong ONLY here: the interactivity verdict for the whole run
  * (TTY && !`--yes`, with the default readline prompter created lazily and —

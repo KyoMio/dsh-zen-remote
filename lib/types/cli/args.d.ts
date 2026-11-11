@@ -4,20 +4,19 @@
  * values, targets — and deliberately does not VALIDATE cross-field rules
  * (role gates, required targets): the command layer renders those verdicts
  * through the i18n dictionary. Two things the parser does decide on its own:
- * `--role peer` (and any unknown role value) is flagged `roleIssue` because
- * SPEC pins the "peer is not enabled" refusal at every entry point, and
- * `--debug`'s optional path argument is consumed only when it does not look
- * like another flag.
+ * an unknown `--role` value is flagged `roleIssue` (`host` / `client` /
+ * `peer` are all legal since PG-10), and `--debug`'s optional path argument
+ * is consumed only when it does not look like another flag.
  *
  * Global flags may appear before or after the command word; the leading
  * positional tokens ARE the command (`host device revoke dev-7` → three
  * command words + one target), everything flag-like is an option.
  */
-export type CliCommand = 'help' | 'version' | 'unknown' | 'setup' | 'status' | 'host.device.pair' | 'host.device.list' | 'host.device.revoke' | 'host.ingress.start' | 'host.ingress.stop' | 'host.ingress.verify' | 'host.ingress.snippet' | 'client.pair' | 'client.unpair' | 'client.list';
-/** Why a `--role` value cannot be used as-is. `peer-not-enabled` covers the
- * SPEC's reserved role; `invalid` covers everything the vocabulary does not
- * know. Absent when the value is `host` or `client`. */
-export type CliRoleIssue = 'peer-not-enabled' | 'invalid';
+export type CliCommand = 'help' | 'version' | 'unknown' | 'setup' | 'status' | 'host.device.pair' | 'host.device.list' | 'host.device.revoke' | 'host.ingress.start' | 'host.ingress.stop' | 'host.ingress.verify' | 'host.ingress.snippet' | 'client.pair' | 'client.unpair' | 'client.list' | 'peer.join' | 'peer.status' | 'peer.trust' | 'peer.leave';
+/** Why a `--role` value cannot be used as-is. `invalid` covers everything
+ * the vocabulary does not know. Absent when the value is `host`, `client`
+ * or `peer` — all three are legal since PG-10. */
+export type CliRoleIssue = 'invalid';
 export interface CliOptions {
     /** Raw `--lang` value — `resolveCliLang` (i18n.ts) interprets it later. */
     lang?: string;
@@ -53,6 +52,9 @@ export interface CliOptions {
     hostUrl?: string;
     code?: string;
     name?: string;
+    /** `--invite <uri>` — the `zr-net(s)://` invite link of the virtual
+     * network a peer node joins. */
+    invite?: string;
     all: boolean;
     /** Unrecognized `--flags`, collected instead of crashing — the command
      * layer decides whether to warn. */

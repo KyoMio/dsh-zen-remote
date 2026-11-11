@@ -39,6 +39,7 @@
     "src/cli/commands-status.ts",
     "src/cli/commands-client.ts",
     "src/cli/commands-host.ts",
+    "src/cli/commands-peer.ts",
     "src/cli/command-setup.ts",
     "src/cli/main.ts",
     "src/client-data/qr.ts",

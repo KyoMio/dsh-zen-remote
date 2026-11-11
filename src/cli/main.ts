@@ -1,11 +1,11 @@
 /**
  * CLI-5: the process entry point behind `bin/zen-remote.mjs`. `runCli` turns
- * a parsed argv into exactly one verdict: static answers (help, version,
- * the SPEC's `--role peer` refusal, unknown commands) render here; every
- * plugin-driving command first comes alive through `ensureDshRunning` and
- * then dispatches into the CLI-3/CLI-4 command functions over the discovered
- * IPC socket; `setup` owns its preflight (install + launch) and runs the
- * three-step wizard.
+ * a parsed argv into exactly one verdict: static answers (help, version, an
+ * unknown role value, unknown commands) render here; every plugin-driving
+ * command first comes alive through `ensureDshRunning` and then dispatches
+ * into the CLI-3/CLI-4 command functions over the discovered IPC socket;
+ * `setup` owns its preflight (install + launch) and runs the three-step
+ * wizard.
  *
  * Two things belong ONLY here: the interactivity verdict for the whole run
  * (TTY && !`--yes`, with the default readline prompter created lazily and —
@@ -31,6 +31,12 @@ import { createTranslator, resolveCliLang } from './i18n.js'
 import type { CliTranslator } from './i18n.js'
 import { runStatusCommand } from './commands-status.js'
 import { runClientListCommand, runClientPairCommand, runClientUnpairCommand } from './commands-client.js'
+import {
+  runPeerJoinCommand,
+  runPeerLeaveCommand,
+  runPeerStatusCommand,
+  runPeerTrustCommand,
+} from './commands-peer.js'
 import {
   runHostDeviceListCommand,
   runHostDevicePairCommand,
@@ -102,12 +108,13 @@ function printHelp(t: CliTranslator, out: { write(text: string): void }): void {
     `  ${t('help.command.clientPair')}`,
     `  ${t('help.command.clientUnpair')}`,
     `  ${t('help.command.clientList')}`,
+    `  ${t('help.command.peerFamily')}`,
     '',
     t('help.options'),
     ...([
       'lang', 'json', 'socket', 'wait', 'yes', 'noWait', 'debug', 'role', 'profile',
       'ingress', 'domain', 'cfToken', 'email', 'httpsPort', 'publicUrl', 'tunnelId',
-      'proxy', 'deviceRole', 'hostUrl', 'code', 'name', 'all',
+      'proxy', 'deviceRole', 'hostUrl', 'code', 'name', 'invite', 'all',
     ] as const).map((option) => `  ${t(`help.option.${option}`)}`),
     '',
     t('help.footer'),
@@ -124,10 +131,6 @@ function staticVerdict(parsed: ParsedCliArgs, t: CliTranslator, out: { write(tex
   if (parsed.command === 'version') {
     out.write(`${packageVersion}\n`)
     return 0
-  }
-  if (parsed.options.roleIssue === 'peer-not-enabled') {
-    out.write(`${t('err.role.peerNotEnabled')}\n`)
-    return 1
   }
   if (parsed.options.roleIssue === 'invalid') {
     out.write(`${t('err.role.invalid', { value: parsed.options.role ?? '' })}\n`)
@@ -264,6 +267,10 @@ export async function runCli(argv: readonly string[], deps?: CliRuntimeDeps): Pr
       case 'client.pair': return await runClientPairCommand(ctx)
       case 'client.unpair': return await runClientUnpairCommand(ctx)
       case 'client.list': return await runClientListCommand(ctx)
+      case 'peer.join': return await runPeerJoinCommand(ctx)
+      case 'peer.status': return await runPeerStatusCommand(ctx)
+      case 'peer.trust': return await runPeerTrustCommand(ctx)
+      case 'peer.leave': return await runPeerLeaveCommand(ctx)
       default: {
         // staticVerdict already handled help / version / unknown / setup —
         // the default arm is unreachable and only satisfies the exhaustiveness.

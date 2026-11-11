@@ -216,10 +216,10 @@ test('args: setup 的全套参数与 --role peer / 非法角色识别', async ()
   // --mode 与 --ingress 同义。
   assert.equal(parseCliArgs(['setup', '--mode', 'lan']).options.mode, 'lan')
 
-  // peer：保留原值并标记未启用；非法值标记 invalid；合法值无标记。
+  // peer：PG-10 起正式启用——合法角色不再标记 issue；非法值标记 invalid。
   const peer = parseCliArgs(['setup', '--role', 'peer'])
   assert.equal(peer.options.role, 'peer', 'the raw value survives')
-  assert.equal(peer.options.roleIssue, 'peer-not-enabled', 'peer is recognized as the not-enabled role')
+  assert.equal(peer.options.roleIssue, undefined, 'peer is an accepted role since PG-10')
   const bad = parseCliArgs(['setup', '--role', 'wizard'])
   assert.equal(bad.options.role, 'wizard')
   assert.equal(bad.options.roleIssue, 'invalid')
@@ -274,8 +274,8 @@ test('i18n: createTranslator 双语输出、参数插值、缺键回退，且文
   const en = createTranslator('en')
 
   for (const [name, t] of [['zh', zh], ['en', en]]) {
-    const peer = t('err.role.peerNotEnabled')
-    assert.notEqual(peer, 'err.role.peerNotEnabled', `${name} dictionary covers the peer gate`)
+    const peer = t('err.roleGate.peerCommands')
+    assert.notEqual(peer, 'err.roleGate.peerCommands', `${name} dictionary covers the peer gate`)
     assert.match(peer, /peer/u, `${name} peer message names the role`)
     const shadowed = t('err.envShadowed', { envVar: 'LAN_GATE_PORT', field: 'port' })
     assert.match(shadowed, /LAN_GATE_PORT/u, `${name} env-shadowed message names the variable`)
@@ -292,8 +292,8 @@ test('i18n: createTranslator 双语输出、参数插值、缺键回退，且文
     }
   }
   assert.match(zh('status.role.host'), /host/u)
-  assert.match(zh('err.role.peerNotEnabled'), /[\u4e00-\u9fff]/u, 'the zh copy is Chinese')
-  assert.doesNotMatch(en('err.role.peerNotEnabled'), /[\u4e00-\u9fff]/u, 'the en copy is free of Chinese')
+  assert.match(zh('err.roleGate.peerCommands'), /[\u4e00-\u9fff]/u, 'the zh copy is Chinese')
+  assert.doesNotMatch(en('err.roleGate.peerCommands'), /[\u4e00-\u9fff]/u, 'the en copy is free of Chinese')
 
   // 缺键回退：返回键名本身，不打空字符串。
   assert.equal(zh('no.such.key'), 'no.such.key')

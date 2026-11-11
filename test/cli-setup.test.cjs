@@ -267,7 +267,7 @@ test('main: 无参运行与 --help 输出双语完整命令树返回 0，不进�
   const en = await runCli(['--help'], runOpts({ stdout: enOut, extra: { env: { LC_ALL: 'en_US.UTF-8' } } }))
   assert.equal(en, 0)
   assert.match(enOut.text(), /Usage: dsh-zen-remote <command>/u)
-  assert.match(enOut.text(), /peer is not enabled yet/u)
+  assert.match(enOut.text(), /--role host\|client\|peer/u, 'peer is listed as a valid role since PG-10')
   assert.doesNotMatch(enOut.text(), /[\u4e00-\u9fff]/u, 'the en help has no Chinese')
 })
 
@@ -279,22 +279,21 @@ test('main: --version 输出注入的包版本返回 0', async () => {
   assert.equal(out.text().trim(), '9.9.9-test')
 })
 
-test('main: --role peer 在任何命令上直接拦截退出码 1；非法角色同样拦截', async () => {
-  const { runCli } = await loadModules()
-  for (const argv of [['--role', 'peer', 'setup'], ['setup', '--role', 'peer'], ['status', '--role', 'peer']]) {
-    const out = captureStdout()
-    const code = await runCli(['--lang', 'zh', ...argv], runOpts({ stdout: out }))
-    assert.equal(code, 1, `peer is refused for ${argv.join(' ')}`)
-    assert.match(out.text(), /peer 角色尚未启用/u)
-  }
+test('main: 非法角色直接拦截退出码 1；--role peer 自 PG-10 起合法不再拦截', async () => {
+  const { runCli, parseCliArgs } = await loadModules()
   const bad = captureStdout()
   const badCode = await runCli(['--lang', 'zh', 'setup', '--role', 'wizard'], runOpts({ stdout: bad }))
   assert.equal(badCode, 1)
   assert.match(bad.text(), /未知角色：wizard/u)
 
   const en = captureStdout()
-  await runCli(['--lang', 'en', 'setup', '--role', 'peer'], runOpts({ stdout: en }))
-  assert.match(en.text(), /The peer role is not enabled yet/u)
+  await runCli(['--lang', 'en', 'setup', '--role', 'wizard'], runOpts({ stdout: en }))
+  assert.match(en.text(), /Unknown role: wizard/u)
+
+  // peer 是合法角色：解析层不再标 issue（完整向导流程由 cli-peer-commands.test.cjs 覆盖）。
+  for (const argv of [['--role', 'peer', 'setup'], ['setup', '--role', 'peer'], ['status', '--role', 'peer']]) {
+    assert.equal(parseCliArgs(argv).options.roleIssue, undefined, `peer parses clean for ${argv.join(' ')}`)
+  }
 })
 
 test('main: 未知命令与非交互缺必填参数——结构化双语错误退出码 1', async () => {
