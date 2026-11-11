@@ -99,7 +99,7 @@ dsh-zen-remote client unpair <hostUrl|entryId|--all> [--yes]   # 移除单台或
 // ~/.dsh/profiles/desktop/package.json
 {
   "dependencies": {
-    "dsh-zen-remote": "^2.4.1"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^2.4.2"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
   }
 }
 ```
