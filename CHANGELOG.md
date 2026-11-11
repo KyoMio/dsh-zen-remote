@@ -5,6 +5,12 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 修复
+
+- **修复断网恢复后远程连接永久停留在离线**（[#56](https://github.com/KyoMio/dsh-zen-remote/issues/56)）：加入进行中的握手失败后不再丢失自动重试排程，「立即重连」按钮改按真实离线状态启用。
+
 ## 2.4.1（2026-11-09）
 
 ### 修复
