@@ -1323,3 +1323,119 @@ test('cordis.patch.yml carries exactly one insert row: the main entry', () => {
   const ids = [...fs.readFileSync(PATCH_PATH, 'utf8').matchAll(/^\s*-\s+id:\s*(\S+)\s*$/gm)].map((m) => m[1])
   assert.deepEqual(ids, ['dsh-zen-remote'])
 })
+
+test('peer role registers /_dsh/zen-remote/client exactly once on webServer (no host remoteStatusOnly collision) and serves peer/status + peer/join', async () => {
+  const index = await import(INDEX_URL)
+  const exact = new Map()
+  const prefixes = new Map()
+  const duplicateErrors = []
+  const disposers = []
+  const services = {
+    logger: { warn() {}, info() {} },
+    webServer: {
+      exact,
+      prefixes,
+      upgrades: new Map(),
+      match(pathname) {
+        if (exact.has(pathname)) return exact.get(pathname)
+        let best
+        for (const [p, route] of prefixes.entries()) {
+          if (pathname === p || pathname.startsWith(`${p}/`)) {
+            if (!best || p.length > best.path.length) best = route
+          }
+        }
+        return best
+      },
+      register(route) {
+        const table = route.kind === 'exact' ? exact : prefixes
+        if (table.has(route.path)) {
+          const err = new Error(`webserver: duplicate ${route.kind} route "${route.path}"`)
+          duplicateErrors.push(err.message)
+          throw err
+        }
+        table.set(route.path, route)
+        return () => { table.delete(route.path) }
+      },
+    },
+    sessions: { get: () => undefined },
+    sessionQuery: {},
+    connection: { admit: () => ({ peer: {} }) },
+    effectReturns: disposers,
+  }
+  const ctx = {
+    plugin() {},
+    provide() { return () => {} },
+    on() { return () => {} },
+    effect(fn) {
+      const stop = fn()
+      if (typeof stop === 'function') disposers.push(stop)
+    },
+    logger: services.logger,
+    reflect: { get: (name) => services[name] },
+    inject: (deps, cb) => {
+      if (!deps.every((d) => services[d] !== undefined)) return
+      const target = {
+        get: (name) => services[name],
+        reflect: { get: (name) => services[name] },
+        effect: (fn) => {
+          try {
+            const out = fn()
+            if (typeof out === 'function') disposers.push(out)
+            return out
+          } catch {
+            // Mirrors Cordis effect failure leaving earlier registrations intact.
+            return undefined
+          }
+        },
+      }
+      const scoped = new Proxy(target, {
+        get(t, prop) {
+          if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
+          if (deps.includes(prop)) return services[prop]
+          throw new Error(`cannot get property "${String(prop)}" without inject`)
+        },
+      })
+      cb(scoped)
+    },
+  }
+
+  index.apply(ctx, { role: 'peer' })
+  const server = http.createServer((req, res) => {
+    const pathname = new URL(req.url ?? '/', 'http://x').pathname
+    const matched = services.webServer.match(pathname)
+    if (!matched) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    void matched.handler(req, res)
+  })
+  const base = await listen(server)
+  try {
+    assert.deepEqual(duplicateErrors, [], 'peer role must not collide on duplicate webServer route registration')
+
+    const statusRes = await fetch(`${base}/_dsh/zen-remote/client/peer/status`)
+    assert.equal(statusRes.status, 200, 'peer/status must answer 200 on peer role, not 404 not-found')
+    const statusBody = await statusRes.json()
+    assert.equal(typeof statusBody.nodeId, 'string')
+
+    const joinRes = await fetch(`${base}/_dsh/zen-remote/client/peer/join`, {
+      method: 'POST',
+      headers: { origin: base, 'content-type': 'application/json' },
+      body: JSON.stringify({ inviteUri: 'zr-net+insecure://127.0.0.1:9/0123456789abcdef#test-key' }),
+    })
+    const joinBody = await joinRes.json()
+    assert.equal(joinRes.status, 200, `peer/join must answer 200 instead of ${joinRes.status} (${JSON.stringify(joinBody)})`)
+    assert.equal(joinBody.ok, true)
+
+    const reportRes = await fetch(`${base}/_dsh/zen-remote/client/debug-report`)
+    assert.equal(reportRes.status, 200)
+    const reportBody = await reportRes.json()
+    assert.equal(typeof reportBody.gateway, 'object', 'peer role debug report retains serving gateway summary')
+  } finally {
+    await close(server)
+    for (const stop of disposers.splice(0)) {
+      try { stop() } catch { /* ignore */ }
+    }
+  }
+})

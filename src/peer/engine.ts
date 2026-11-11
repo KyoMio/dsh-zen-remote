@@ -334,9 +334,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     ws = client
     client.on('open', () => {
+      if (ws !== client) return
       wsAttempt = 0
     })
     client.on('message', (data, isBinary) => {
+      if (ws !== client) return
       if (isBinary) {
         // 二进制帧只属于已入网连接；网关对挂起连接本来就不路由，这里再
         // 过一遍 TOFU 闸：非 eligible 成员的帧一律不进 mux。
@@ -360,9 +362,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     })
     client.on('close', (code, reason) => {
       log(`peer engine: gateway ws closed (code=${code} reason=${reason || '—'} state=${gatewayState})`)
-      if (ws === client) ws = null
+      if (ws !== client) return
+      ws = null
       if (stopped) return
-      if (gatewayState !== 'paused' && gatewayState !== 'revoked') {
+      if (gatewayState !== 'paused' && gatewayState !== 'revoked' && gatewayState !== 'unconfigured') {
         gatewayState = 'offline'
         scheduleReconnect()
       }
@@ -670,6 +673,13 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     mux = null
     punch?.close()
     punch = null
+    // PeerPunchManager.close() 关闭了底层 dgram socket；引擎自建的 punchSocket
+    // 必须清空引用，下一轮 joinNetwork 的 buildPunch() 才会重建已绑定新 socket，
+    // 避免在已关闭 socket 上等待 ready() 永久挂起。
+    if (punchSocket !== undefined && options.udpSocket === undefined) {
+      try { punchSocket.close() } catch { /* already closed */ }
+      punchSocket = undefined
+    }
     stunProbed = false
     natType = null
     maxPeers = null
@@ -724,22 +734,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     },
 
     leaveNetwork() {
-      for (const member of [...members.values()]) {
-        unmountPeer(member)
-        mux?.dropSession(member.nodeId)
-      }
-      members.clear()
-      if (pathReportTimer !== null) {
-        clock.clearTimeout(pathReportTimer)
-        pathReportTimer = null
-      }
-      wsReconnectable = false
-      try { ws?.close() } catch { /* dying */ }
-      punch?.close()
-      punch = null
-      stunProbed = false
-      natType = null
-      maxPeers = null
+      resetActiveSession()
       networkId = null
       gatewayState = 'unconfigured'
       writePeerNetwork(stateFile, undefined)

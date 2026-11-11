@@ -813,6 +813,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // through getters so a not-yet-mounted handler answers undefined.
   let servingRelaySecret: string | undefined
   let servingRelayHandler: RelayHandler | undefined
+  let servingGatewaySummary: (() => Promise<Record<string, unknown>>) | undefined
   if (servesRole(effective.values.role)) {
     // A row that switched from client to host must not leave a stale relay
     // client where getRelayClient() can find it (T23a-fix) — and no stale
@@ -1475,6 +1476,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         shareCount: store.list().length,
       }
     }
+    servingGatewaySummary = gatewaySummary
     // The remote-status route lives on BOTH roles (T34-fix): it is what the
     // client-half parts poll, and a desktop app can switch roles without a
     // code path change — on a host it reads the empty
@@ -1484,39 +1486,45 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // them 404 (least exposure — the prefix registration stays one route,
     // the handler just refuses everything but remote-status). Same admission
     // wall as the client role's mount.
-    ctx.inject(['webServer', 'connection'], (clientCtx) => {
-      clientCtx.effect(() => clientCtx.webServer.register({
-        kind: 'prefix',
-        path: CLIENT_ROUTE_PREFIX,
-        handler: createClientHandler({
-          admit: (req) => clientCtx.connection.admit(req),
-          getRowConfig: () => config,
-          remoteStatusOnly: true,
-          getServiceProbe: uploadServiceProbe(clientCtx),
-          getLogSnapshot: () => ring.snapshot(),
-          getGatewaySummary: gatewaySummary,
-          getProfileName: profileName,
-          getPluginVersion: () => pluginVersion,
-          lang: resolveActiveLang,
-        }),
-      }), 'dsh-zen-remote: client routes (host)')
-    })
-    // CLI-1: the IPC delegate's client face on a serving role — remote-status
-    // and the debug report answer (both are every role's own); the IPC
-    // prefix gate covers the pairing routes (409 wrong-role before any
-    // request reaches here), and the handler keeps the host mount's
-    // least-exposure wall besides.
-    cliClientHandler = createClientHandler({
-      admit: noopAdmit,
-      getRowConfig: () => config,
-      remoteStatusOnly: true,
-      getServiceProbe: uploadServiceProbe(ctx),
-      getLogSnapshot: () => ring.snapshot(),
-      getGatewaySummary: gatewaySummary,
-      getProfileName: profileName,
-      getPluginVersion: () => pluginVersion,
-      lang: resolveActiveLang,
-    })
+    // Peer role ALSO enters `connectsRole` below, which owns the full client
+    // prefix (`peer/*` included) — registering here too would throw duplicate
+    // prefix route on dsh-host-webserver and leave `remoteStatusOnly` masking
+    // every `/client/peer/*` request with 404 `not-found`.
+    if (!connectsRole(effective.values.role)) {
+      ctx.inject(['webServer', 'connection'], (clientCtx) => {
+        clientCtx.effect(() => clientCtx.webServer.register({
+          kind: 'prefix',
+          path: CLIENT_ROUTE_PREFIX,
+          handler: createClientHandler({
+            admit: (req) => clientCtx.connection.admit(req),
+            getRowConfig: () => config,
+            remoteStatusOnly: true,
+            getServiceProbe: uploadServiceProbe(clientCtx),
+            getLogSnapshot: () => ring.snapshot(),
+            getGatewaySummary: gatewaySummary,
+            getProfileName: profileName,
+            getPluginVersion: () => pluginVersion,
+            lang: resolveActiveLang,
+          }),
+        }), 'dsh-zen-remote: client routes (host)')
+      })
+      // CLI-1: the IPC delegate's client face on a pure host role — remote-status
+      // and the debug report answer (both are every role's own); the IPC
+      // prefix gate covers the pairing routes (409 wrong-role before any
+      // request reaches here), and the handler keeps the host mount's
+      // least-exposure wall besides.
+      cliClientHandler = createClientHandler({
+        admit: noopAdmit,
+        getRowConfig: () => config,
+        remoteStatusOnly: true,
+        getServiceProbe: uploadServiceProbe(ctx),
+        getLogSnapshot: () => ring.snapshot(),
+        getGatewaySummary: gatewaySummary,
+        getProfileName: profileName,
+        getPluginVersion: () => pluginVersion,
+        lang: resolveActiveLang,
+      })
+    }
   }
   if (connectsRole(effective.values.role)) {
     // Sub-client half (T16, T23a; MS-5 pool rewiring): the paired-servers
@@ -2107,6 +2115,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       getPluginRouteIntercept: pluginRouteDiagnostics,
       onCurrentSession,
       getLogSnapshot: () => ring.snapshot(),
+      ...(servingGatewaySummary === undefined ? {} : { getGatewaySummary: servingGatewaySummary }),
       getProfileName: profileName,
       getPluginVersion: () => pluginVersion,
       lang: resolveActiveLang,
