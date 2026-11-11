@@ -32,6 +32,12 @@ import {
   ADMIN_STATUS_ROUTE,
   CLIENT_CLAIM_ROUTE,
   CLIENT_CONFIG_ROUTE,
+  CLIENT_PEER_JOIN_ROUTE,
+  CLIENT_PEER_LEAVE_ROUTE,
+  CLIENT_PEER_REPROBE_ROUTE,
+  CLIENT_PEER_STATUS_ROUTE,
+  CLIENT_PEER_TOGGLE_MOUNT_ROUTE,
+  CLIENT_PEER_TRUST_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
   CLIENT_UNPAIR_ROUTE,
@@ -39,9 +45,11 @@ import {
   canSubmitClientPairing,
   claimDeviceNameOf,
   deriveClientStatusView,
+  derivePeerStatusView,
   deriveSettingsView,
   normalizePairingCode,
   shouldReloadAfterClientActivation,
+  type PeerStatusView,
 } from '../../client-data/settings-form.ts'
 import { qrMatrix } from '../../client-data/qr.ts'
 import {
@@ -60,6 +68,8 @@ import {
   deriveClientOverviewSummary,
   deriveClientServerLights,
   deriveClientWizardLights,
+  derivePeerOverviewSummary,
+  derivePeerWizardLights,
   deriveWizardLights,
   formSeedOf,
   initialStep,
@@ -67,10 +77,12 @@ import {
   isWizardConfigured,
   pairingSecondsLeft,
   stepAfterPick,
+  targetHostSaveRole,
   tunnelCheckCopy,
   tunnelFailureCopy,
   upstreamPortOf,
   type CaddyState,
+  type PeerDeviceView,
   type TunnelCheckWire,
   type TunnelSetupWire,
   type LightState,
@@ -152,7 +164,53 @@ const STEP_ORDER: readonly WizardStep[] = ['pick', 'configure', 'verify']
 const ROLE_OPTIONS = [
   ['host', 'wizard.role.host', 'wizard.role.hostDesc'],
   ['client', 'wizard.role.client', 'wizard.role.clientDesc'],
+  ['peer', 'wizard.role.peer', 'wizard.role.peerDesc'],
 ] as const
+
+/** The peer node's three verification lights, in display order (PG-9). */
+const PEER_LIGHT_ORDER: readonly { key: 'wizard.peer.lightIdentity' | 'wizard.peer.lightAdmission' | 'wizard.peer.lightDiscovery'; light: 'identity' | 'admission' | 'discovery' }[] = [
+  { key: 'wizard.peer.lightIdentity', light: 'identity' },
+  { key: 'wizard.peer.lightAdmission', light: 'admission' },
+  { key: 'wizard.peer.lightDiscovery', light: 'discovery' },
+]
+
+/** One network device's dot + path copy + tone (PG-9): `pass` on the usable
+ * paths, `fail` on a locally blocked identity, `pending` while offline. */
+function peerDeviceDot(path: PeerDeviceView['path']): 'pass' | 'pending' | 'fail' {
+  if (path === 'lan' || path === 'p2p' || path === 'relay') return 'pass'
+  return path === 'mismatch' ? 'fail' : 'pending'
+}
+
+function peerDevicePathCopy(path: PeerDeviceView['path'], t: GatewayWizardProps['t']): string {
+  switch (path) {
+    case 'lan': return t('wizard.peer.devicePathLan')
+    case 'p2p': return t('wizard.peer.devicePathP2p')
+    case 'relay': return t('wizard.peer.devicePathRelay')
+    case 'mismatch': return t('wizard.peer.devicePathMismatch')
+    default: return t('wizard.peer.devicePathOffline')
+  }
+}
+
+/** The gateway admission state's one-line copy on the peer surfaces (PG-9). */
+function peerStateCopy(state: string, t: GatewayWizardProps['t']): string {
+  switch (state) {
+    case 'authorized': return t('wizard.light.pass')
+    case 'pending-approval': return t('wizard.peer.pendingApproval')
+    case 'connecting': return t('wizard.peer.connecting')
+    case 'offline': return t('wizard.peer.offline')
+    case 'mismatch': return t('wizard.peer.mismatch')
+    case 'paused':
+    case 'revoked': return t('wizard.peer.revoked')
+    default: return t('wizard.peer.notJoined')
+  }
+}
+
+/** The join route's failure copy: the route's own codes plus a generic
+ * fallback. `invalid-invite` gets the paste-format copy. */
+function peerJoinFailCopy(code: string, t: GatewayWizardProps['t']): string {
+  if (code === 'invalid-invite') return t('wizard.peer.joinInvalid')
+  return t('wizard.peer.joinFailed', { reason: code })
+}
 
 const PATH_OPTIONS = [
   ['caddy', 'wizard.path.caddy', 'wizard.path.caddyDesc'],
@@ -256,7 +314,26 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [tunnelResult, setTunnelResult] = useState<TunnelSetupWire | undefined>()
   const [tunnelCheck, setTunnelCheck] = useState<TunnelCheckWire | undefined>()
   const [adoptTunnelId, setAdoptTunnelId] = useState<string | undefined>()
-  const [probedClient, setProbedClient] = useState<boolean | null>(null)
+  // PG-9: the probe keeps the client-config route's whole role answer — a
+  // peer row needs it as much as a client row does.
+  const [probedRole, setProbedRole] = useState<'host' | 'client' | 'peer' | null>(null)
+  // PG-9: the peer node's status view (client/peer/status), its polling and
+  // the join / manage surfaces' busy & failure markers.
+  const [peerView, setPeerView] = useState<PeerStatusView | undefined>()
+  const [peerLoading, setPeerLoading] = useState(false)
+  const [peerInvite, setPeerInvite] = useState('')
+  const [peerBusy, setPeerBusy] = useState(false)
+  const [peerFail, setPeerFail] = useState<string | null>(null)
+  const [peerNotice, setPeerNotice] = useState<'trustOk' | undefined>()
+  const [peerBusyNode, setPeerBusyNode] = useState<string | null>(null)
+  const [peerActionFailed, setPeerActionFailed] = useState(false)
+  const [peerDevicesModalOpen, setPeerDevicesModalOpen] = useState(false)
+  // PG-9-fix: the role-keep flag. The phone-PWA flows run under
+  // wizardRole 'host' — when the user entered them from a PEER surface the
+  // channel saves must write `role: 'peer'` (targetHostSaveRole), or the
+  // machine leaves its virtual network. A deliberate pick of host on the
+  // role cards clears it.
+  const [keepPeerRole, setKeepPeerRole] = useState(false)
 
   const selectPath = useCallback((nextPath: WizardPath): void => {
     setFormError(null)
@@ -300,20 +377,23 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     () => config.getSnapshot(),
   )
   const savedClient = config.savedRoleIsClient()
-  const effectiveClient = savedClient || (probedClient === true && !config.rowRoleKnown())
+  const savedPeer = config.savedRoleIsPeer()
+  const effectiveClient = savedClient || (probedRole === 'client' && !config.rowRoleKnown())
+  const effectivePeer = savedPeer || (probedRole === 'peer' && !config.rowRoleKnown())
 
   // When the row document carries no role at all, probe the lightweight
-  // client-config route (both roles register it).
+  // client-config route (every role registers it).
   useEffect(() => {
     if (config.rowRoleKnown()) return
     let cancelled = false
     fetch(CLIENT_CONFIG_ROUTE)
       .then((response) => (response.ok ? response.json() : undefined))
       .then((body: { role?: unknown } | undefined) => {
-        if (!cancelled) setProbedClient(body?.role === 'client')
+        if (cancelled) return
+        setProbedRole(body?.role === 'client' ? 'client' : body?.role === 'peer' ? 'peer' : 'host')
       })
       .catch(() => {
-        if (!cancelled) setProbedClient(false)
+        if (!cancelled) setProbedRole('host')
       })
     return () => { cancelled = true }
   }, [config, roleSnapshot])
@@ -322,7 +402,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const rowSeededRef = useRef(false)
   useEffect(() => {
     if (rowSeededRef.current || roleSnapshot.scopeStatus === 'loading') return
-    if (!config.rowRoleKnown() && probedClient === null) return
+    if (!config.rowRoleKnown() && probedRole === null) return
     rowSeededRef.current = true
     const rowName = typeof config.rowValue('serverName') === 'string' ? (config.rowValue('serverName') as string) : ''
     const rowAutoShare = config.rowValue('autoShareNewSessions')
@@ -336,10 +416,15 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     if (effectiveClient) {
       setWizardRole('client')
       setStep(roleSnapshot.deviceToken.configured || rowClientUrl !== '' ? 'verify' : 'configure')
+    } else if (effectivePeer) {
+      // PG-9: the peer overview is resident (not gated on `configured`), so
+      // the wizard itself stays at pick — the user opens it to paste an
+      // invite or to leave the network.
+      setWizardRole('peer')
     } else {
       setWizardRole('host')
     }
-  }, [roleSnapshot, probedClient, effectiveClient, config])
+  }, [roleSnapshot, probedRole, effectiveClient, effectivePeer, config])
 
   const loadClientStatus = useCallback(async (): Promise<void> => {
     setClientLoading(true)
@@ -355,6 +440,126 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       setClientLoading(false)
     }
   }, [])
+
+  // PG-9: the peer node's status poll — same shape as the client's, against
+  // the peer status route. A non-peer row answers 503; the view then stays
+  // undefined and the overview renders the not-joined copy.
+  const loadPeerStatus = useCallback(async (): Promise<void> => {
+    setPeerLoading(true)
+    try {
+      const response = await fetch(CLIENT_PEER_STATUS_ROUTE)
+      if (response.ok) {
+        setPeerView(derivePeerStatusView(await response.json()))
+      }
+    } catch {
+      // keep last peer view
+    } finally {
+      setPeerLoading(false)
+    }
+  }, [])
+
+  // PG-9: paste-invite join. Switching a host row into peer mode reloads the
+  // plugin first (the same wait the client claim applies), then the invite
+  // travels to the peer join route — the engine's refusal keeps its code.
+  const runPeerJoin = async (): Promise<void> => {
+    setFormError(null)
+    setPeerFail(null)
+    const invite = peerInvite.trim()
+    if (invite === '') {
+      setPeerFail('invalid-invite')
+      return
+    }
+    setPeerBusy(true)
+    const wasEffectivePeer = effectivePeer
+    try {
+      if (!wasEffectivePeer) {
+        try {
+          await props.saveRowFields({ role: 'peer' })
+          // PG-9-fix: poll the peer status route until the reloaded row
+          // serves it (the route answers 404/503 while the row restarts) —
+          // a fixed wait either sends the join too early (503
+          // peer-unavailable) or stalls the fast path.
+          for (let i = 0; i < 10; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 350))
+            try {
+              const probe = await fetch(CLIENT_PEER_STATUS_ROUTE)
+              if (probe.ok) break
+            } catch { /* keep waiting for the reload */ }
+          }
+        } catch {
+          // proceed to the join attempt; the route exists on every
+          // connects-role composition
+        }
+      }
+      const response = await fetch(CLIENT_PEER_JOIN_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inviteUri: invite }),
+      })
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: { code?: string } }
+      if (response.ok && body.ok === true) {
+        if (!wasEffectivePeer) {
+          // First peer activation: the row just reloaded under the page, and
+          // its resident global streams opened unwrapped — the same UX-1
+          // reload the client pairing applies (peer installs the intercept
+          // half too).
+          await awaitClientStatusReady()
+          window.location.reload()
+          return
+        }
+        setPeerInvite('')
+        await loadPeerStatus()
+        setStep('verify')
+      } else {
+        setPeerFail(body?.error?.code ?? 'unexpected')
+      }
+    } catch {
+      setPeerFail('unexpected')
+    } finally {
+      setPeerBusy(false)
+    }
+  }
+
+  // PG-9: leave the network — a confirmed write, then the status poll paints
+  // the not-joined overview again.
+  const runPeerLeave = async (): Promise<void> => {
+    setPeerActionFailed(false)
+    try {
+      const response = await fetch(CLIENT_PEER_LEAVE_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean }
+      setPeerActionFailed(!response.ok || body.ok !== true)
+      await loadPeerStatus()
+    } catch {
+      setPeerActionFailed(true)
+    }
+  }
+
+  // PG-9: one network-device management action — toggle-mount / trust —
+  // keyed by node id; the status refresh repaints the modal either way.
+  const runPeerNodeAction = async (route: string, nodeId: string, payload: Record<string, unknown>): Promise<void> => {
+    setPeerBusyNode(nodeId)
+    setPeerActionFailed(false)
+    setPeerNotice(undefined)
+    try {
+      const response = await fetch(route, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const body = (await response.json().catch(() => ({}))) as { ok?: boolean }
+      if (!response.ok || body.ok !== true) setPeerActionFailed(true)
+      if (route === CLIENT_PEER_TRUST_ROUTE && response.ok && body.ok === true) setPeerNotice('trustOk')
+    } catch {
+      setPeerActionFailed(true)
+    } finally {
+      setPeerBusyNode(null)
+    }
+    await loadPeerStatus()
+  }
 
   const hostTicketRef = useRef(0)
   const loadHostStatus = useCallback(async (): Promise<void> => {
@@ -383,17 +588,30 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }, [])
 
-  // Poll host routes when on host role, or client status when on client role.
+  // Poll the role's own status route: client status on a client, the peer
+  // node's network status on a peer (PG-9) — PLUS the host wizard + admin
+  // routes, because a peer's lower PWA section renders the gateway /
+  // ingress / device facts from exactly those (PG-9-fix); the host wizard +
+  // admin routes otherwise.
   useEffect(() => {
     if (effectiveClient) {
       void loadClientStatus()
       const handle = setInterval(() => { void loadClientStatus() }, 5000)
       return () => clearInterval(handle)
     }
+    if (effectivePeer) {
+      void loadPeerStatus()
+      void loadHostStatus()
+      const handle = setInterval(() => {
+        void loadPeerStatus()
+        void loadHostStatus()
+      }, 5000)
+      return () => clearInterval(handle)
+    }
     void loadHostStatus()
     const handle = setInterval(() => { void loadHostStatus() }, 5000)
     return () => clearInterval(handle)
-  }, [effectiveClient, loadClientStatus, loadHostStatus])
+  }, [effectiveClient, effectivePeer, loadClientStatus, loadPeerStatus, loadHostStatus])
 
   const runDeviceAction = async (payload: Record<string, unknown>): Promise<void> => {
     setDeviceBusy(true)
@@ -417,11 +635,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }
 
-  // Close the wizard modal, devices modal or servers modal on Escape when no sub-card is open and not mid-save.
+  // Close the wizard modal, either devices modal or the servers modal on Escape when no sub-card is open and not mid-save.
   useEffect(() => {
-    if ((!modalOpen && !devicesModalOpen && !serversModalOpen) || card !== undefined) return
+    if ((!modalOpen && !devicesModalOpen && !serversModalOpen && !peerDevicesModalOpen) || card !== undefined) return
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape' && !savingConfig && !clientClaimBusy && !deviceBusy) {
+      if (event.key === 'Escape' && !savingConfig && !clientClaimBusy && !deviceBusy && peerBusyNode === null) {
         if (renamingDevice !== null) {
           setRenamingDevice(null)
           return
@@ -434,20 +652,26 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           setServersModalOpen(false)
           return
         }
+        if (peerDevicesModalOpen) {
+          setPeerDevicesModalOpen(false)
+          return
+        }
         setModalOpen(false)
       }
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [modalOpen, devicesModalOpen, serversModalOpen, card, savingConfig, clientClaimBusy, deviceBusy, renamingDevice])
+  }, [modalOpen, devicesModalOpen, serversModalOpen, peerDevicesModalOpen, card, savingConfig, clientClaimBusy, deviceBusy, peerBusyNode, renamingDevice])
 
   // Seed the entry step AND the configure forms from the FIRST ready
-  // wizard status on a host deployment.
+  // wizard status on a host deployment — and on a PEER deployment too
+  // (PG-9-fix): its lower PWA section reads the same ingress facts, while
+  // the wizard itself stays at pick (the network overview is resident).
   const seededRef = useRef(false)
   useEffect(() => {
     if (seededRef.current || wizardStatus === undefined || effectiveClient) return
     seededRef.current = true
-    setStep(initialStep(wizardStatus))
+    if (!effectivePeer) setStep(initialStep(wizardStatus))
     const seed = formSeedOf(wizardStatus)
     if (seed.path !== undefined) setPath(seed.path)
     else if (wizardStatus.publicUrl !== '') setPath('lan')
@@ -458,7 +682,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     } else if (wizardStatus.mode === 'off' && wizardStatus.lanAddress !== undefined && wizardStatus.lanAddress !== '') {
       setServerUrl(`http://${wizardStatus.lanAddress}:${upstreamPortOf(wizardStatus)}`)
     }
-  }, [wizardStatus, effectiveClient])
+  }, [wizardStatus, effectiveClient, effectivePeer])
 
   // Verification polling: only while a web pairing session is active and could still move.
   const pollVerdict = poll?.result
@@ -585,12 +809,15 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         body: JSON.stringify({ token: rawToken }),
       })
       if (response.status === 404 && effectiveClient) {
+        // PG-9-fix: this reload path runs on a role switch — keep the role
+        // the user came from (a peer configuring its phone channel stays a
+        // peer).
         await props.saveRowFields({
-          role: 'host',
+          role: targetHostSaveRole(keepPeerRole),
           autoShareNewSessions: autoShare,
           ...(hostName.trim() !== '' ? { serverName: hostName.trim() } : {}),
         })
-        setProbedClient(false)
+        setProbedRole(keepPeerRole ? 'peer' : 'host')
         for (let i = 0; i < 6; i++) {
           await new Promise((resolve) => setTimeout(resolve, 650))
           const retry = await fetch(WIZARD_CF_TOKEN_ROUTE, {
@@ -628,8 +855,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     const needsLanHostBind = path === 'lan' && currentHostSetting !== '0.0.0.0' && currentHostSetting !== '::'
     try {
       try {
+        // PG-9-fix: a peer that came here for its phone channel keeps its
+        // row role — only a deliberate host pick on the role cards writes
+        // 'host' (targetHostSaveRole over the keep flag).
         const baseFields: Record<string, unknown> = {
-          role: 'host',
+          role: targetHostSaveRole(keepPeerRole),
           autoShareNewSessions: autoShare,
           ...(hostName.trim() !== '' ? { serverName: hostName.trim() } : {}),
         }
@@ -669,7 +899,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         // reload the plugin row and respawn the local gateway child process
         // before saving the token or probing.
         if (wasClient || needsLanHostBind) {
-          setProbedClient(false)
+          setProbedRole(keepPeerRole ? 'peer' : 'host')
           if (needsLanHostBind && !wasClient) {
             // Give the restart-watcher time to observe the `host` change and
             // restart the gateway child on 0.0.0.0.
@@ -1092,9 +1322,24 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     clientServerUrl,
     clientState: clientView?.state,
     pairedServerCount: serverRows.length,
+    // PG-9: a peer deployment renders its resident network overview no
+    // matter whether a network is joined yet — the row role alone configures
+    // the overview.
+    peerConfigured: effectivePeer,
   })
 
   const statusSummary = (() => {
+    if (effectivePeer) {
+      // PG-9: the header badge mirrors the network admission state — green
+      // once authorized, amber while joining or reconnecting, red on the
+      // terminal verdicts.
+      const state = peerView?.gatewayState ?? 'unconfigured'
+      const light = state === 'authorized' ? 'pass' : state === 'mismatch' || state === 'revoked' || state === 'paused' ? 'fail' : 'pending'
+      return {
+        state: light as 'pass' | 'pending' | 'fail',
+        text: peerView?.configured === true ? peerStateCopy(state, t) : t('wizard.peer.notJoined'),
+      }
+    }
     if (effectiveClient) {
       if (poolSummary.totalCount > 0) {
         return {
@@ -1128,10 +1373,25 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     return { state: 'pass' as const, text: wizardStatus.publicUrl || t('wizard.path.external') }
   })()
 
-  const openWizardAt = (targetStep: WizardStep, options?: { role?: WizardRole; target?: 'web' | 'desktop-client' }): void => {
+  // PG-9: the peer node's derived overview + lights, read off the polled
+  // peer status view (the view rows are structurally the wizard's
+  // PeerDeviceView). The devices light's cap follows the BODY's maxPeers —
+  // the gateway's announced cap — defaulting to the pool cap before the
+  // first welcome lands.
+  const peerDevices: readonly PeerDeviceView[] = peerView?.peers ?? []
+  const peerSummary = derivePeerOverviewSummary(peerDevices, peerView?.maxPeers ?? 8)
+  const peerLights = derivePeerWizardLights({
+    identityReady: (peerView?.nodeId ?? '') !== '',
+    gatewayState: peerView?.gatewayState ?? 'unconfigured',
+    peerCount: peerSummary.totalCount,
+    mismatchCount: peerSummary.mismatchCount,
+  })
+
+  const openWizardAt = (targetStep: WizardStep, options?: { role?: WizardRole; target?: 'web' | 'desktop-client'; keepPeerRole?: boolean }): void => {
     setFormError(null)
     if (options?.role !== undefined) setWizardRole(options.role)
     if (options?.target !== undefined) setPairTarget(options.target)
+    if (options?.keepPeerRole !== undefined) setKeepPeerRole(options.keepPeerRole)
     setStep(targetStep)
     setModalOpen(true)
   }
@@ -1153,7 +1413,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           <p className="zr-wizard-subtitle">{t('wizard.subtitle')}</p>
         </div>
         <div className="zr-wizard-statusBadge" data-state={statusSummary.state}>
-          <span className="zr-wizard-dot" data-state={statusSummary.state === 'pass' ? 'pass' : 'pending'} />
+          <span className="zr-wizard-dot" data-state={statusSummary.state === 'pass' ? 'pass' : statusSummary.state === 'fail' ? 'fail' : 'pending'} />
           <span>{statusSummary.text}</span>
         </div>
       </div>
@@ -1163,6 +1423,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
 
       {configured ? (
         effectiveClient ? (
+          /* --- the desktop sub-client's overview (MS-6/MS-8) --- */
           <>
             <div className="zr-wizard-overviewGrid">
               <div className="zr-wizard-overviewItem">
@@ -1272,6 +1533,182 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                   onClick={openAddServerWizard}
                 >
                   {t('wizard.overview.addServer')}
+                </button>
+              </div>
+            </div>
+          </>
+        ) : effectivePeer ? (
+          /* --- the peer node's resident network overview (PG-9): the mesh
+              half on top; the phone-PWA half keeps rendering BELOW through
+              the shared `!clientRole` settings surfaces, and the wizard's
+              own host tiles are simply not this machine's --- */
+          <>
+            <div className="zr-wizard-overviewGrid">
+              <div className="zr-wizard-overviewItem">
+                <p className="zr-wizard-overviewLabel">{t('wizard.overview.roleLabel')}</p>
+                <p className="zr-wizard-overviewValue">{t('wizard.role.peer')}</p>
+                <p className="zr-wizard-overviewSub">{peerView?.configured === true ? peerView.nodeId : t('wizard.peer.notJoined')}</p>
+              </div>
+              <div className="zr-wizard-overviewItem">
+                <p className="zr-wizard-overviewLabel">{t('wizard.overview.peerNetworkLabel')}</p>
+                <p className="zr-wizard-overviewValue">
+                  <span className="zr-wizard-dot" data-state={peerLights.admission} />
+                  <span>{peerView?.configured === true ? peerStateCopy(peerView.gatewayState, t) : t('wizard.overview.peerNetworkNone')}</span>
+                </p>
+                <p className="zr-wizard-overviewSub">{peerView?.networkId !== undefined ? peerView.networkId : ''}</p>
+              </div>
+              <div className="zr-wizard-overviewItem">
+                <p className="zr-wizard-overviewLabel">{t('wizard.overview.peerConnLabel')}</p>
+                <p className="zr-wizard-overviewValue">
+                  <span className="zr-wizard-dot" data-state={peerSummary.connectionLight} />
+                  <span>
+                    {peerSummary.totalCount === 0
+                      ? t('wizard.overview.peerConnNone')
+                      : t('wizard.overview.peerConnSummary', { direct: String(peerSummary.directCount), relay: String(peerSummary.relayCount) })}
+                  </span>
+                </p>
+                <p className="zr-wizard-overviewSub">
+                  {peerSummary.totalCount > 0
+                    ? t('wizard.overview.peerDevicesCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.totalCount) })
+                    : ''}
+                </p>
+              </div>
+              <div className="zr-wizard-overviewItem">
+                <div className="zr-wizard-overviewHead">
+                  <p className="zr-wizard-overviewLabel">{t('wizard.overview.peerDevicesLabel')}</p>
+                  <button
+                    type="button"
+                    className="zr-wizard-linkBtn"
+                    onClick={() => {
+                      setPeerActionFailed(false)
+                      setPeerNotice(undefined)
+                      setPeerDevicesModalOpen(true)
+                    }}
+                  >
+                    {t('wizard.peer.devicesModalTitle')}
+                  </button>
+                </div>
+                <p className="zr-wizard-overviewValue" data-limit={peerSummary.limitReached ? 'true' : undefined}>
+                  <span className="zr-wizard-dot" data-state={peerSummary.devicesLight} />
+                  <span>
+                    {peerSummary.limitReached
+                      ? t('wizard.overview.peerDevicesFull', { max: String(peerSummary.maxPeers) })
+                      : t('wizard.overview.peerDevicesCount', { count: String(peerSummary.totalCount), max: String(peerSummary.maxPeers) })}
+                  </span>
+                </p>
+                <p className="zr-wizard-overviewSub" data-limit={peerSummary.limitReached ? 'true' : undefined}>
+                  {peerSummary.limitReached
+                    ? t('wizard.overview.limitNote', { max: String(peerSummary.maxPeers) })
+                    : peerSummary.mismatchCount > 0
+                      ? t('wizard.peer.devicePathMismatch')
+                      : ''}
+                </p>
+              </div>
+            </div>
+
+            <div className="zr-wizard-footer">
+              <div className="zr-wizard-row">
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  disabled={peerLoading}
+                  onClick={() => { void loadPeerStatus() }}
+                >
+                  {peerLoading ? t('settings.client.statusRefreshing') : t('settings.client.statusRefresh')}
+                </button>
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  onClick={() => openWizardAt('pick', { role: 'peer' })}
+                >
+                  {t('wizard.peer.switchRole')}
+                </button>
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  onClick={() => {
+                    setPeerFail(null)
+                    openWizardAt('configure', { role: 'peer' })
+                  }}
+                >
+                  {t('wizard.peer.rejoin')}
+                </button>
+              </div>
+              <div className="zr-wizard-row">
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  onClick={() => {
+                    setPeerActionFailed(false)
+                    setPeerNotice(undefined)
+                    setPeerDevicesModalOpen(true)
+                  }}
+                >
+                  {t('wizard.peer.devicesModalTitle')}
+                </button>
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  disabled={peerView?.configured !== true}
+                  onClick={() => {
+                    if (!window.confirm(t('wizard.peer.leaveConfirm'))) return
+                    void runPeerLeave()
+                  }}
+                >
+                  {t('wizard.peer.leave')}
+                </button>
+              </div>
+            </div>
+
+            {/* PG-9-fix: the peer page's LOWER section — phone / browser
+                (PWA) access. This machine still runs the gateway half, so
+                the QR pairing, the channel configuration and the device
+                management stay reachable; the flows run under wizardRole
+                'host' with keepPeerRole set, so every save writes
+                `role: 'peer'` (targetHostSaveRole). */}
+            <div className="zr-wizard-phoneSection" data-zen-remote="wizard-phone">
+              <p className="zr-wizard-sectionTitle">{t('wizard.peer.pwaSectionTitle')}</p>
+              <div className="zr-wizard-serviceInfo">
+                <span className="zr-wizard-dot" data-state={gatewayReachable ? 'pass' : 'fail'} />
+                <span className="zr-wizard-lightName">
+                  {gatewayReachable
+                    ? t('wizard.overview.gatewayReady', { port: String(upstreamPortOf(wizardStatus)) })
+                    : t('wizard.overview.gatewayDown')}
+                </span>
+                <span className="zr-wizard-hint">{pathName(path)}{resolvedHostEndpoint !== '' ? ` · ${resolvedHostEndpoint}` : ''}</span>
+              </div>
+              <p className="zr-wizard-hint">
+                {allDevices.length > 0
+                  ? t('wizard.overview.devicesSummary', { web: String(webDeviceCount), desktop: String(desktopDevices.length) })
+                  : t('wizard.overview.devicesNone')}
+              </p>
+              <div className="zr-wizard-row">
+                <button
+                  type="button"
+                  className="zr-wizard-btn zr-wizard-btnPrimary"
+                  disabled={disabled}
+                  onClick={() => openWizardAt('verify', { role: 'host', target: 'web', keepPeerRole: true })}
+                >
+                  {t('wizard.peer.pairPhone')}
+                </button>
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  disabled={disabled}
+                  onClick={() => openWizardAt('configure', { role: 'host', keepPeerRole: true })}
+                >
+                  {t('wizard.peer.configurePhoneAccess')}
+                </button>
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  onClick={() => {
+                    setDeviceError(false)
+                    setRenamingDevice(null)
+                    setDevicesModalOpen(true)
+                  }}
+                >
+                  {t('wizard.peer.managePairedDevices')}
                 </button>
               </div>
             </div>
@@ -1465,6 +1902,10 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                           onClick={() => {
                             setFormError(null)
                             setWizardRole(roleValue)
+                            // PG-9-fix: a deliberate pick decides the keep flag —
+                            // only a peer pick keeps the peer role through the
+                            // channel-config saves below.
+                            setKeepPeerRole(roleValue === 'peer')
                           }}
                         >
                           <div className="zr-wizard-pathHead">
@@ -1511,6 +1952,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                         })}
                       </div>
                     </>
+                  ) : wizardRole === 'peer' ? (
+                    <p className="zr-wizard-notice">{t('wizard.role.peerPickNote')}</p>
                   ) : (
                     <p className="zr-wizard-notice">{t('wizard.role.clientPickNote')}</p>
                   )}
@@ -1528,7 +1971,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                     <span className="zr-wizard-footerHint">
                       {wizardRole === 'host'
                         ? `${t('wizard.role.host')} · ${pathName(path)}`
-                        : t('wizard.role.client')}
+                        : wizardRole === 'peer'
+                          ? t('wizard.role.peer')
+                          : t('wizard.role.client')}
                     </span>
                     <button
                       type="button"
@@ -1555,7 +2000,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                       {t('wizard.modal.selectedPlan', {
                         plan: wizardRole === 'host'
                           ? `${t('wizard.role.host')} · ${pathName(path)}`
-                          : t('wizard.role.client'),
+                          : wizardRole === 'peer'
+                            ? t('wizard.role.peer')
+                            : t('wizard.role.client'),
                       })}
                     </span>
                   </div>
@@ -1699,6 +2146,31 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                         </p>
                       ) : null}
                     </>
+                  ) : wizardRole === 'peer' ? (
+                    /* PG-9: the peer branch — one paste-and-join form; the
+                        three-light self-check is the VERIFY step. */
+                    <>
+                      <div className="zr-wizard-formStack">
+                        <div className="zr-wizard-field">
+                          <label className="zr-wizard-label" htmlFor="zr-wizard-peer-invite">{t('wizard.peer.inviteUri')}</label>
+                          <input
+                            id="zr-wizard-peer-invite"
+                            className="zr-wizard-input"
+                            type="text"
+                            autoComplete="off"
+                            spellCheck={false}
+                            placeholder={t('wizard.peer.inviteUriPlaceholder')}
+                            value={peerInvite}
+                            disabled={peerBusy}
+                            onChange={(event) => setPeerInvite(event.target.value)}
+                          />
+                          <p className="zr-wizard-hint">{t('wizard.peer.inviteUriHint')}</p>
+                        </div>
+                      </div>
+                      {peerFail !== null ? (
+                        <p className="zr-wizard-notice" data-tone="error">{peerJoinFailCopy(peerFail, t)}</p>
+                      ) : null}
+                    </>
                   ) : (
                     <>
                       {/* MS-8: the pool cap is stated on EVERY entry into a
@@ -1774,7 +2246,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                   <button
                     type="button"
                     className="zr-wizard-btn"
-                    disabled={disabled || savingConfig || clientClaimBusy}
+                    disabled={disabled || savingConfig || clientClaimBusy || peerBusy}
                     onClick={() => {
                       setFormError(null)
                       setStep('pick')
@@ -1790,6 +2262,15 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                       onClick={() => { void advanceFromConfigure() }}
                     >
                       {t('wizard.modal.saveAndNext')}
+                    </button>
+                  ) : wizardRole === 'peer' ? (
+                    <button
+                      type="button"
+                      className="zr-wizard-btn zr-wizard-btnPrimary"
+                      disabled={peerBusy}
+                      onClick={() => { void runPeerJoin() }}
+                    >
+                      {peerBusy ? t('wizard.peer.joining') : t('wizard.peer.join')}
                     </button>
                   ) : (
                     <div className="zr-wizard-row">
@@ -1820,7 +2301,46 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
               <>
                 <div className="zr-wizard-modalBody">
                   <p className="zr-wizard-stepIntro">{t('wizard.modal.step3Desc')}</p>
-                  {wizardRole === 'host' ? (
+                  {wizardRole === 'peer' ? (
+                    /* PG-9: the peer branch's three-light self-check — the
+                        identity, the admission state and device discovery,
+                        all read off the polled peer status. */
+                    <>
+                      <div className="zr-wizard-serviceInfo">
+                        <span className="zr-wizard-dot" data-state={peerLights.admission} />
+                        <span className="zr-wizard-lightName">{peerView?.configured === true ? peerStateCopy(peerView.gatewayState, t) : t('wizard.peer.notJoined')}</span>
+                        <span className="zr-wizard-hint">{peerView?.configured === true && peerView.networkId !== undefined ? peerView.networkId : ''}</span>
+                      </div>
+                      <ul className="zr-wizard-lights">
+                        {PEER_LIGHT_ORDER.map(({ key, light }) => {
+                          const state = peerLights[light]
+                          // The admission light's amber reads 「等待网络管理
+                          // 员批准」 instead of the generic 待验证 when the
+                          // gateway said pending.
+                          const labelText = light === 'admission' && peerView?.gatewayState === 'pending-approval'
+                            ? t('wizard.peer.pendingApproval')
+                            : light === 'discovery' && peerSummary.totalCount === 0 && peerView?.gatewayState === 'authorized'
+                              ? t('wizard.overview.peerConnNone')
+                              : t(LIGHT_LABEL[state])
+                          return (
+                            <li key={key} className="zr-wizard-light" data-state={state}>
+                              <div className="zr-wizard-lightMain">
+                                <span className="zr-wizard-dot" data-state={state} />
+                                <span className="zr-wizard-lightName">{t(key)}</span>
+                              </div>
+                              <span className="zr-wizard-lightState" data-state={state}>{labelText}</span>
+                            </li>
+                          )
+                        })}
+                      </ul>
+                      {peerNotice === 'trustOk' ? (
+                        <p className="zr-wizard-notice" data-tone="ok">{t('wizard.peer.trustOk')}</p>
+                      ) : null}
+                      {peerActionFailed ? (
+                        <p className="zr-wizard-notice" data-tone="error">{t('wizard.peer.actionFailed')}</p>
+                      ) : null}
+                    </>
+                  ) : wizardRole === 'host' ? (
                     <>
                       {caddyPath ? (
                         <div className="zr-wizard-serviceBar" data-zen-remote="wizard-caddy-controls">
@@ -2156,6 +2676,31 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                       >
                         {desktopPairing !== undefined && desktopPairing.expiresAt > now ? t('wizard.desktop.regenerate') : t('wizard.desktop.generate')}
                       </button>
+                    ) : null}
+                    {/* PG-9: the peer branch's reprobe — the punch rounds
+                        report through the status poll. */}
+                    {wizardRole === 'peer' && peerView?.configured === true ? (
+                      <>
+                        <button
+                          type="button"
+                          className="zr-wizard-btn zr-wizard-btnPrimary"
+                          disabled={peerBusyNode !== null}
+                          onClick={() => { void runPeerNodeAction(CLIENT_PEER_REPROBE_ROUTE, '', {}) }}
+                        >
+                          {t('wizard.devicesModal.retest')}
+                        </button>
+                        <button
+                          type="button"
+                          className="zr-wizard-btn"
+                          disabled={peerBusyNode !== null}
+                          onClick={() => {
+                            if (!window.confirm(t('wizard.peer.leaveConfirm'))) return
+                            void runPeerLeave().then(() => setModalOpen(false))
+                          }}
+                        >
+                          {t('wizard.peer.leave')}
+                        </button>
+                      </>
                     ) : null}
                     {/* MS-8: keep adding servers without leaving the wizard —
                         until the pool is full. */}
@@ -2546,6 +3091,133 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                   className="zr-wizard-btn"
                   disabled={serverBusyEntry !== null}
                   onClick={() => setServersModalOpen(false)}
+                >
+                  {t('wizard.card.close')}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {peerDevicesModalOpen ? (
+        <div
+          data-zen-remote="wizard-modal"
+          onClick={() => {
+            if (peerBusyNode === null) setPeerDevicesModalOpen(false)
+          }}
+        >
+          <div
+            className="zr-wizard-modalDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label={t('wizard.peer.devicesModalTitle')}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="zr-wizard-modalHeader">
+              <div className="zr-wizard-headerText">
+                <p className="zr-wizard-modalTitle">{t('wizard.peer.devicesModalTitle')}</p>
+                <p className="zr-wizard-subtitle" data-limit={peerSummary.limitReached ? 'true' : undefined}>
+                  {t('wizard.peer.devicesModalSubtitle')}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="zr-wizard-cardCloseIcon"
+                aria-label={t('wizard.card.close')}
+                disabled={peerBusyNode !== null}
+                onClick={() => setPeerDevicesModalOpen(false)}
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="zr-wizard-modalBody">
+              {peerSummary.limitReached ? (
+                <p className="zr-wizard-notice" data-tone="error">
+                  {t('wizard.overview.peerDevicesFull', { max: String(peerSummary.maxPeers) })}
+                </p>
+              ) : null}
+              {peerActionFailed ? (
+                <p className="zr-wizard-notice" data-tone="error">{t('wizard.peer.actionFailed')}</p>
+              ) : null}
+              {peerNotice === 'trustOk' ? (
+                <p className="zr-wizard-notice" data-tone="ok">{t('wizard.peer.trustOk')}</p>
+              ) : null}
+
+              {peerDevices.length === 0 ? (
+                <p className="zr-wizard-notice">{t('wizard.peer.devicesModalEmpty')}</p>
+              ) : (
+                <ul className="zr-wizard-deviceList">
+                  {peerDevices.map((device) => {
+                    const dot = peerDeviceDot(device.path)
+                    return (
+                      <li key={device.nodeId} className="zr-wizard-deviceItem">
+                        <div className="zr-wizard-deviceHead">
+                          <div className="zr-wizard-deviceTitleRow">
+                            <span className="zr-wizard-dot" data-state={dot} />
+                            <span className="zr-wizard-lightName">{device.name !== '' ? device.name : device.nodeId}</span>
+                            <span className="zr-wizard-deviceBadge" data-tone={device.path === 'mismatch' ? 'invalid' : dot === 'pass' ? 'live' : 'warn'}>
+                              {peerDevicePathCopy(device.path, t)}
+                            </span>
+                            {device.path !== 'mismatch' && device.path !== 'offline' && device.rttMs !== null ? (
+                              <span className="zr-wizard-deviceBadge">{t('wizard.peer.deviceRtt', { ms: String(device.rttMs) })}</span>
+                            ) : null}
+                          </div>
+                          <span className="zr-wizard-hint">{device.nodeId}</span>
+                        </div>
+
+                        {device.path === 'mismatch' ? (
+                          <>
+                            <p className="zr-wizard-notice" data-tone="error">{t('wizard.peer.mismatchNote')}</p>
+                            <div className="zr-wizard-deviceActions">
+                              <button
+                                type="button"
+                                className="zr-wizard-btn zr-wizard-btnPrimary"
+                                disabled={peerBusyNode !== null}
+                                onClick={() => { void runPeerNodeAction(CLIENT_PEER_TRUST_ROUTE, device.nodeId, { nodeId: device.nodeId }) }}
+                              >
+                                {t('wizard.peer.trustNew')}
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="zr-wizard-deviceActions">
+                            <label className="zr-wizard-checkRow">
+                              <input
+                                type="checkbox"
+                                checked={device.mounted}
+                                disabled={peerBusyNode !== null}
+                                onChange={(event) => {
+                                  void runPeerNodeAction(CLIENT_PEER_TOGGLE_MOUNT_ROUTE, device.nodeId, { nodeId: device.nodeId, mounted: event.currentTarget.checked })
+                                }}
+                              />
+                              <span>{device.mounted ? t('wizard.peer.deviceMount') : t('wizard.peer.deviceIgnore')}</span>
+                            </label>
+                          </div>
+                        )}
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+            </div>
+
+            <div className="zr-wizard-modalFooter">
+              <div className="zr-wizard-row">
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  disabled={peerBusyNode !== null}
+                  onClick={() => { void runPeerNodeAction(CLIENT_PEER_REPROBE_ROUTE, 'all', {}) }}
+                >
+                  {t('wizard.devicesModal.retest')}
+                </button>
+                <button
+                  type="button"
+                  className="zr-wizard-btn"
+                  disabled={peerBusyNode !== null}
+                  onClick={() => setPeerDevicesModalOpen(false)}
                 >
                   {t('wizard.card.close')}
                 </button>

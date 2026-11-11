@@ -66,11 +66,11 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 export type RemoteHeaderIconComponent = (props: RemoteHeaderIconProps) => ReactNode;
 /** The menu-item component (a .tsx factory result; parameter for Node). */
 export type RemoteShareMenuComponent = (props: RemoteShareMenuProps) => ReactNode;
-export declare function probeClientConfigRole(refetch?: boolean): Promise<'host' | 'client' | undefined>;
+export declare function probeClientConfigRole(refetch?: boolean): Promise<'host' | 'client' | 'peer' | undefined>;
 /** How one probe is issued — the real route reader, or the check/test
  * double. `refetch` mirrors {@link probeClientConfigRole}: true drops any
  * cached answer and asks again. */
-export type ClientConfigProbe = (refetch?: boolean) => Promise<'host' | 'client' | undefined>;
+export type ClientConfigProbe = (refetch?: boolean) => Promise<'host' | 'client' | 'peer' | undefined>;
 export interface WireSharesRoleOptions {
     /** Called once a definite verdict was applied (the no-configForms
      * fallback checks this before trusting its own probe). */

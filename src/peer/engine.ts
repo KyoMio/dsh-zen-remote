@@ -118,6 +118,10 @@ export interface PeerEngineOptions {
 
 export interface PeerEngine {
   joinNetwork(inviteUri: string): Promise<{ ok: true } | { ok: false; code: string }>
+  /** PG-9 启动自动恢复：state 文件里已有 peerNetwork 记录时按同一条
+   * join 序列（备好打洞 socket 与 mux，再连网关 WS）直接连回，已入网机器
+   * 重启 DSH 后无需重新粘贴邀请链接。未入网回答 false，什么也不做。 */
+  resumeFromState(): boolean
   leaveNetwork(): void
   setNodeDisabled(nodeId: string, disabled: boolean): void
   trustPeer(nodeId: string): boolean
@@ -666,6 +670,25 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       buildMux()
       connectWs()
       return { ok: true }
+    },
+
+    resumeFromState() {
+      if (stopped) return false
+      const net = readPeerNetwork(stateFile)
+      if (net === undefined) return false
+      networkId = net.networkId
+      wsReconnectable = true
+      wsAttempt = 0
+      // joinNetwork 的同一条序列，只是不落盘（记录已在）：apply 是同步的，
+      // 打洞 socket 的 ready 在后台等待，auth 帧晚一拍上送没有影响——
+      // challenge 本来就要等网关回应才发。
+      void (async () => {
+        const manager = buildPunch()
+        if (manager !== null) await manager.ready()
+        buildMux()
+        connectWs()
+      })()
+      return true
     },
 
     leaveNetwork() {

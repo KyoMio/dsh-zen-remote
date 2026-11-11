@@ -154,6 +154,26 @@ test('T62 reporter: a non-client role never reports', async () => {
   }
 })
 
+test('PG-9-fix reporter: a PEER role reports the current session exactly like a client', async () => {
+  // A peer node mounts the same remote sessions as a client — switching a
+  // zr~ panel must reach the backend route, or the plugin-bridge deny hooks
+  // lose their origin signal (T62). Only a HOST never reports.
+  const env = makeEnv({ initial: JSON.stringify({ sessionId: 'zr~721b94fb~s1' }), roleAnswer: 'peer' })
+  await env.load()
+  try {
+    await wait(40)
+    assert.deepEqual(env.posted, [
+      { url: '/_dsh/zen-remote/client/current-session', body: { sessionId: 'zr~721b94fb~s1' } },
+    ], 'the peer page posts the initial value like a client does')
+    env.setStorage(JSON.stringify({ sessionId: 'zr~aaaaaaaa~s2' }))
+    await wait(40)
+    assert.equal(env.posted.length, 2)
+    assert.deepEqual(env.posted[1].body, { sessionId: 'zr~aaaaaaaa~s2' })
+  } finally {
+    env.stop()
+  }
+})
+
 test('T66 reporter: an unchanged value re-posts once per resend window; a change posts immediately', async () => {
   const env = makeEnv({
     initial: JSON.stringify({ sessionId: 'zr~721b94fb~s1' }),

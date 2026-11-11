@@ -125,9 +125,20 @@ export type WizardVerifyStart = {
     reason: 'no-public-url' | 'bad-public-url' | 'runtime-not-ready' | 'gateway-unreachable' | 'probe-failed' | 'pair-refused';
     detail?: unknown;
 };
-/** The deployment role the unified wizard configures: server (`host`) or
- * desktop sub-client (`client`). */
-export type WizardRole = 'host' | 'client';
+/** The deployment role the unified wizard configures: server (`host`),
+ * desktop sub-client (`client`) or peer node (`peer`, PG-9 — joins a device
+ * network for two-way session access while keeping the phone-PWA half). */
+export type WizardRole = 'host' | 'client' | 'peer';
+/**
+ * The row role a channel-config save writes (PG-9-fix): the phone-PWA
+ * flows (Caddy / Cloudflare Tunnel / reverse proxy / LAN) run under
+ * `wizardRole: 'host'`, and a peer that opened them from its lower PWA
+ * section must keep its row role — writing `'host'` there would kick the
+ * machine out of its virtual network. `keepPeerRole` is set exactly when
+ * the user ENTERED the host-flow from a peer surface; a deliberate pick of
+ * 「作为主服务端」 on the role cards clears it.
+ */
+export declare function targetHostSaveRole(keepPeerRole: boolean): 'host' | 'peer';
 /** The three wizard steps: pick a path, fill its form, verify end to end. */
 export type WizardStep = 'pick' | 'configure' | 'verify';
 /** The four server-ingress paths (the three public ones plus LAN-only `'lan'`). */
@@ -152,6 +163,10 @@ export declare function isWizardConfigured(input: {
     clientServerUrl: string;
     clientState: string | undefined;
     pairedServerCount?: number;
+    /** PG-9: the peer engine reports a joined network. True answers
+     * configured no matter what the host/client signals say (a peer row has
+     * neither a wizard ingress nor paired servers, yet its overview renders). */
+    peerConfigured?: boolean;
 }): boolean;
 export interface WizardFormSeed {
     domain: string;
@@ -274,6 +289,75 @@ export declare function deriveClientWizardLights(input: {
  * amber.
  */
 export declare function deriveClientServerLights(server: ClientServerView | undefined): ClientWizardLights;
+/**
+ * One network device's connection path, in the VIEW vocabulary the peer
+ * status route answers: the three usable paths (`lan` 局域网直连 / `p2p`
+ * 直连 / `relay` 经网关中转), a locally blocked identity (`mismatch` — the
+ * device's public key moved under the same node id) and `offline` (not
+ * connected right now, or locally ignored).
+ */
+export type PeerDevicePath = 'lan' | 'p2p' | 'relay' | 'mismatch' | 'offline';
+/** One row of the peer status body's `peers` (PG-9). */
+export interface PeerDeviceView {
+    nodeId: string;
+    name: string;
+    mounted: boolean;
+    path: PeerDevicePath;
+    /** Round-trip time of the current path in ms; `null` when not connected. */
+    rttMs: number | null;
+}
+/** The peer node's overview counters and two lights (PG-9): the 第 3 格
+ * 「直连 / 中转连接」 summarizes the usable paths, the 第 4 格 「网内设备」
+ * counts `N / M 台` with {@link PeerOverviewSummary.devicesLight} turning
+ * red exactly at the cap (满额) or on a locally blocked identity. */
+export interface PeerOverviewSummary {
+    totalCount: number;
+    /** `lan` + `p2p` — the devices whose sessions flow without the gateway. */
+    directCount: number;
+    /** `relay` — reachable, but every frame rides the gateway. */
+    relayCount: number;
+    /** Locally blocked identities awaiting the 信任新身份 decision. */
+    mismatchCount: number;
+    offlineCount: number;
+    /** Devices whose shared sessions are currently mounted. */
+    mountedCount: number;
+    maxPeers: number;
+    limitReached: boolean;
+    connectionLight: LightState;
+    devicesLight: LightState;
+}
+/**
+ * Derive the peer overview summary off the status route's device rows
+ * ({@link PeerDeviceView}): the connection light is green when every device
+ * is on a usable path, red the moment one locally blocked identity waits
+ * for a trust decision, amber otherwise (empty network, all offline); the
+ * device light follows the cap — red exactly at `totalCount >= maxPeers`
+ * — and shares the mismatch red. Both stay amber on an empty network.
+ */
+export declare function derivePeerOverviewSummary(peers: readonly PeerDeviceView[], maxPeers: number): PeerOverviewSummary;
+/** The peer node's three wizard lights (PG-9): ① 本机身份已就绪, ② 网络准入
+ * 状态 (authorized green, pending-approval amber — the 「等待网络管理员批准」
+ * copy), ③ 设备发现与会话同步. */
+export interface PeerWizardLights {
+    identity: LightState;
+    admission: LightState;
+    discovery: LightState;
+}
+/**
+ * Derive the peer node's three lights off the peer status facts: identity is
+ * green once the engine reports a node id (amber while the engine is not
+ * wired); admission maps the gateway state (green `authorized`, amber
+ * `pending-approval` / `connecting` / `offline` / unconfigured, red
+ * `mismatch` / `revoked` / `paused`); discovery is green once devices ride
+ * the network, red when a local TOFU mismatch blocks one of them, amber on
+ * an empty or not-yet-authorized network.
+ */
+export declare function derivePeerWizardLights(input: {
+    identityReady: boolean;
+    gatewayState: string;
+    peerCount: number;
+    mismatchCount: number;
+}): PeerWizardLights;
 /** Pairing-code countdown, whole seconds, never negative. */
 export declare function pairingSecondsLeft(expiresAt: number, now: number): number;
 /**

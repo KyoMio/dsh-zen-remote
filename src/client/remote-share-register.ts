@@ -82,9 +82,9 @@ export type RemoteShareMenuComponent = (props: RemoteShareMenuProps) => ReactNod
  * T62: the current-session reporter reuses the same cached probe (one
  * route read per page, whatever part asks first).
  */
-let probeAnswer: 'host' | 'client' | undefined
-let probeInFlight: Promise<'host' | 'client' | undefined> | undefined
-export function probeClientConfigRole(refetch = false): Promise<'host' | 'client' | undefined> {
+let probeAnswer: 'host' | 'client' | 'peer' | undefined
+let probeInFlight: Promise<'host' | 'client' | 'peer' | undefined> | undefined
+export function probeClientConfigRole(refetch = false): Promise<'host' | 'client' | 'peer' | undefined> {
   if (!refetch) {
     if (probeAnswer !== undefined) return Promise.resolve(probeAnswer)
     if (probeInFlight !== undefined) return probeInFlight
@@ -98,7 +98,8 @@ export function probeClientConfigRole(refetch = false): Promise<'host' | 'client
       // A body without a role field (an older build) still reads host —
       // resolveConfig's "anything not exactly 'client'" default; only a
       // request-level failure stays undefined.
-      const answer: 'host' | 'client' | undefined = body === undefined ? undefined : body.role === 'client' ? 'client' : 'host'
+      const answer: 'host' | 'client' | 'peer' | undefined =
+        body === undefined ? undefined : body.role === 'client' ? 'client' : body.role === 'peer' ? 'peer' : 'host'
       if (answer !== undefined) probeAnswer = answer
       return answer
     })
@@ -110,7 +111,7 @@ export function probeClientConfigRole(refetch = false): Promise<'host' | 'client
 /** How one probe is issued — the real route reader, or the check/test
  * double. `refetch` mirrors {@link probeClientConfigRole}: true drops any
  * cached answer and asks again. */
-export type ClientConfigProbe = (refetch?: boolean) => Promise<'host' | 'client' | undefined>
+export type ClientConfigProbe = (refetch?: boolean) => Promise<'host' | 'client' | 'peer' | undefined>
 
 export interface WireSharesRoleOptions {
   /** Called once a definite verdict was applied (the no-configForms
@@ -145,7 +146,7 @@ export function wireSharesRole(
   options: WireSharesRoleOptions = {},
 ): () => void {
   const { onVerdict, probe = probeClientConfigRole } = options
-  let probed: 'host' | 'client' | undefined
+  let probed: 'host' | 'client' | 'peer' | undefined
   let lastStatus: 'loading' | 'ready' | 'unavailable' | undefined
   let probing = false
   /** Re-decide. `fromProbe` marks the re-entry after a probe settled: the
@@ -180,7 +181,10 @@ export function wireSharesRole(
     const verdict = settingsRoleOf(snap.status, snap, probed)
     if (verdict === 'unknown') return
     onVerdict?.()
-    store.setRole(verdict)
+    // A peer node shares like a host: it serves its own sessions to phones
+    // and desktop clients through its own gateway half — the store's
+    // two-word vocabulary has no `peer`, and it needs none.
+    store.setRole(verdict === 'client' ? 'client' : 'host')
   }
   const apply = (): void => { evaluate(false) }
   apply()
@@ -238,7 +242,8 @@ export function registerRemoteShareUi(
     // A definite answer wires the role; a FAILED probe wires nothing —
     // the parts stay dark (unknown) rather than guessing host
     // (T33b-fix2), and a wiring verdict that arrives later still wins.
+    // A peer shares like a host (its own sessions, its own gateway half).
     if (snapshotAnswered || answer === undefined) return
-    store.setRole(answer)
+    store.setRole(answer === 'client' ? 'client' : 'host')
   })
 }

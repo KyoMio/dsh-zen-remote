@@ -35,6 +35,8 @@ import type { LogRingEntry } from './log-ring.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js'
+import type { PeerEngine } from './peer/engine.js'
+import type { PeerMemberPath, PeerMemberState } from './peer/engine.js'
 import { responseJson, sameOriginPost } from './http.js'
 import type { BridgeStatus } from './plugin-bridge.js'
 import { RELAY_HTTP_ROUTES } from './relay-access.js'
@@ -113,6 +115,39 @@ export const CLIENT_CURRENT_SESSION_ROUTE = `${CLIENT_ROUTE_PREFIX}/current-sess
  * the live clients stop with their records. Pool-mode only — a mount without
  * a pool has no paired list to edit and answers the unknown-path 404. */
 export const CLIENT_UNPAIR_ROUTE = `${CLIENT_ROUTE_PREFIX}/unpair`
+
+/** Prefix of the peer-role management routes (PG-9). All of them sit behind
+ * the same walls as the rest of the prefix, PLUS the via-marker wall before
+ * dispatch: a request wearing the gateway's marker came from a remote
+ * device, and NO remote device may read or write this machine's peer state.
+ * The POSTs additionally run the same-origin gate; every answer is free of
+ * key material (`privateKeyHex`, the invite's `joinKey`). */
+export const CLIENT_PEER_PREFIX = `${CLIENT_ROUTE_PREFIX}/peer`
+
+/** GET: the peer engine's snapshot — this machine's node id, the gateway
+ * admission state, the joined network's id + HTTP origin, the announced
+ * device cap and one row per network device with its view path
+ * (`lan` / `p2p` / `relay` / `mismatch` / `offline`). */
+export const CLIENT_PEER_STATUS_ROUTE = `${CLIENT_PEER_PREFIX}/status`
+
+/** POST `{inviteUri}`: join a network by pasting its `zr-net(s)://…` invite.
+ * The engine's refusal keeps its code as a 400. */
+export const CLIENT_PEER_JOIN_ROUTE = `${CLIENT_PEER_PREFIX}/join`
+
+/** POST `{}`: leave the current network (unmount everything, close the WS,
+ * clear the persisted membership). */
+export const CLIENT_PEER_LEAVE_ROUTE = `${CLIENT_PEER_PREFIX}/leave`
+
+/** POST `{nodeId, mounted}`: mount or ignore one network device's shared
+ * sessions (forwards to `peerEngine.setNodeDisabled(nodeId, !mounted)`). */
+export const CLIENT_PEER_TOGGLE_MOUNT_ROUTE = `${CLIENT_PEER_PREFIX}/toggle-mount`
+
+/** POST `{nodeId}`: explicit local confirmation to trust a peer's NEW public
+ * key after a `mismatch` verdict (`peerEngine.trustPeer`). */
+export const CLIENT_PEER_TRUST_ROUTE = `${CLIENT_PEER_PREFIX}/trust`
+
+/** POST `{}`: re-run the UDP hole-punch for every eligible device. */
+export const CLIENT_PEER_REPROBE_ROUTE = `${CLIENT_PEER_PREFIX}/reprobe`
 
 /** Longest `sessionId` the current-session route accepts (T62): real ids —
  * a local `session-<uuid>` or a `zr~<serverId>~<id>` virtual id — are far
@@ -235,6 +270,14 @@ export interface ClientHandlerOptions {
    * mount without a pool, or a pool predating the getter (test stubs).
    * Missing answers the historic constant 8. */
   getMaxServers?: () => number
+  /** PG-9: the live peer-role engine, read PER REQUEST (undefined on a
+   * non-peer composition — every peer route then answers 503
+   * `peer-unavailable`). Wired only by the connects-role mount. */
+  getPeerEngine?: () => PeerEngine | undefined
+  /** PG-9: the joined network's HTTP origin for the peer status body, read
+   * PER REQUEST off the state file's `peerNetwork` block (absent when not
+   * joined). Address-shaped, never a secret. */
+  getPeerNetworkOrigin?: () => string | undefined
 }
 
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>
@@ -575,6 +618,49 @@ async function poolStatusBodyOf(options: ClientHandlerOptions): Promise<Record<s
 }
 
 /**
+ * One network device's view path (PG-9): the engine's internal state/path
+ * words mapped onto the four the settings page renders. A local TOFU
+ * mismatch is `mismatch`; a user-disabled device has no sessions to speak
+ * of, so it reads `offline`; an eligible device whose UDP/relay path is not
+ * up yet also reads `offline` (honest — nothing flows).
+ */
+function peerViewPath(state: PeerMemberState, path: PeerMemberPath): 'lan' | 'p2p' | 'relay' | 'mismatch' | 'offline' {
+  if (state === 'identity-mismatch') return 'mismatch'
+  if (state === 'disabled') return 'offline'
+  if (path === 'lan' || path === 'p2p' || path === 'relay') return path
+  return 'offline'
+}
+
+/**
+ * The peer status body (PG-9): the engine snapshot plus the joined
+ * network's HTTP origin, with every peer row cut down to the five fields
+ * the settings page renders — no engine-internal state word, and NEVER key
+ * material (the invite's `joinKey` and the identity's `privateKeyHex` live
+ * in the state file and never pass through here). `configured` is the
+ * engine's own answer: a network id means this machine has joined something.
+ */
+function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Record<string, unknown> {
+  const status = engine.status()
+  const peers = status.peers.map((peer) => ({
+    nodeId: peer.nodeId,
+    name: peer.name,
+    mounted: peer.mounted,
+    path: peerViewPath(peer.state, peer.path),
+    rttMs: peer.rttMs,
+  }))
+  const gatewayOrigin = options.getPeerNetworkOrigin?.()
+  return {
+    configured: status.networkId !== null,
+    nodeId: status.nodeId,
+    gatewayState: status.gatewayState,
+    ...(status.networkId !== null ? { networkId: status.networkId } : {}),
+    ...(gatewayOrigin !== undefined && status.networkId !== null ? { gatewayOrigin } : {}),
+    maxPeers: status.maxPeers,
+    peers,
+  }
+}
+
+/**
  * The status route's body, computed exactly as the CLIENT_STATUS_ROUTE
  * branch always has — extracted (CU-3) so the debug-report route can embed
  * the same diagnostics aggregation without a second implementation. All
@@ -688,6 +774,20 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           error: {
             code: 'via-gateway',
             message: resolveLang() === 'en' ? 'Diagnostics report can only be exported on this machine' : '诊断报告只能在本机导出',
+          },
+        })
+        return
+      }
+      // PG-9: the peer management routes' via wall, BEFORE any dispatch (the
+      // same rule the debug report applies): a gateway-marked request came
+      // from a remote device, and NO remote device may read or write this
+      // machine's peer state — not even the status snapshot.
+      if (route.startsWith(CLIENT_PEER_PREFIX) && req.headers['x-zen-remote-via'] !== undefined) {
+        responseJson(res, 403, {
+          ok: false,
+          error: {
+            code: 'via-gateway',
+            message: resolveLang() === 'en' ? 'Peer settings can only be changed on this machine' : '节点端设置只能在本机查看和修改',
           },
         })
         return
@@ -1252,6 +1352,92 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           if (!res.writableEnded && !res.destroyed) respondRelayFailure(res, error)
         }
         return
+      }
+      // PG-9: the peer management routes. The shared walls already ran —
+      // admit at the very top, the via-marker wall before dispatch — so per
+      // route it is method, same-origin (POSTs), body, engine. A mount
+      // without an engine (a plain client or host row) answers 503
+      // `peer-unavailable`: the routes are registered for the whole
+      // connects-role family, but only a peer row has something to manage.
+      if (route.startsWith(CLIENT_PEER_PREFIX)) {
+        const engine = options.getPeerEngine?.()
+        if (engine === undefined) {
+          responseJson(res, 503, { ok: false, error: { code: 'peer-unavailable' } })
+          return
+        }
+        if (route === CLIENT_PEER_STATUS_ROUTE) {
+          if (method !== 'GET') {
+            res.setHeader('Allow', 'GET')
+            responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
+            return
+          }
+          responseJson(res, 200, peerStatusBodyOf(engine, options))
+          return
+        }
+        if (route === CLIENT_PEER_JOIN_ROUTE || route === CLIENT_PEER_LEAVE_ROUTE || route === CLIENT_PEER_TOGGLE_MOUNT_ROUTE || route === CLIENT_PEER_TRUST_ROUTE || route === CLIENT_PEER_REPROBE_ROUTE) {
+          if (method !== 'POST') {
+            res.setHeader('Allow', 'POST')
+            responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use POST' } })
+            return
+          }
+          if (!sameOriginPost(req)) {
+            responseJson(res, 403, {
+              ok: false,
+              error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+            })
+            return
+          }
+          const body = await readJsonBody(req)
+          if (route === CLIENT_PEER_JOIN_ROUTE) {
+            const inviteUri = body.inviteUri
+            if (typeof inviteUri !== 'string' || inviteUri.trim() === '') {
+              responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'inviteUri (non-empty string) is required' } })
+              return
+            }
+            const outcome = await engine.joinNetwork(inviteUri)
+            if (outcome.ok) {
+              responseJson(res, 200, { ok: true })
+            } else {
+              responseJson(res, 400, { ok: false, error: { code: outcome.code } })
+            }
+            return
+          }
+          if (route === CLIENT_PEER_LEAVE_ROUTE) {
+            engine.leaveNetwork()
+            responseJson(res, 200, { ok: true })
+            return
+          }
+          if (route === CLIENT_PEER_TOGGLE_MOUNT_ROUTE) {
+            const nodeId = body.nodeId
+            const mounted = body.mounted
+            if (typeof nodeId !== 'string' || nodeId === '' || typeof mounted !== 'boolean') {
+              responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'nodeId (non-empty string) and mounted (boolean) are required' } })
+              return
+            }
+            // 引擎内部按小写 8-hex 存节点 id——路由层先归一，大小写粘贴无感。
+            engine.setNodeDisabled(nodeId.toLowerCase(), !mounted)
+            responseJson(res, 200, { ok: true })
+            return
+          }
+          if (route === CLIENT_PEER_TRUST_ROUTE) {
+            const nodeId = body.nodeId
+            if (typeof nodeId !== 'string' || nodeId === '') {
+              responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'nodeId (non-empty string) is required' } })
+              return
+            }
+            if (!engine.trustPeer(nodeId.toLowerCase())) {
+              responseJson(res, 404, { ok: false, error: { code: 'unknown-peer' } })
+              return
+            }
+            responseJson(res, 200, { ok: true })
+            return
+          }
+          // CLIENT_PEER_REPROBE_ROUTE: fire and answer — the punch rounds
+          // report their own outcome through the status poll.
+          engine.reprobePunch()
+          responseJson(res, 200, { ok: true })
+          return
+        }
       }
       responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown client route' } })
     } catch (error) {

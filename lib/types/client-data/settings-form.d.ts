@@ -93,6 +93,15 @@ export declare const CLIENT_UNPAIR_ROUTE = "/_dsh/zen-remote/client/unpair";
 /** CU-4: the redacted diagnostic report (GET, both roles, machine-local only
  * — a gateway-forwarded fetch is refused server-side). */
 export declare const CLIENT_DEBUG_REPORT_ROUTE = "/_dsh/zen-remote/client/debug-report";
+/** PG-9: the peer management routes (mirror of src/client-routes.ts's
+ * constants — the browser half cannot import the host module). The via wall
+ * and same-origin gates live server-side; the browser just talks to them. */
+export declare const CLIENT_PEER_STATUS_ROUTE = "/_dsh/zen-remote/client/peer/status";
+export declare const CLIENT_PEER_JOIN_ROUTE = "/_dsh/zen-remote/client/peer/join";
+export declare const CLIENT_PEER_LEAVE_ROUTE = "/_dsh/zen-remote/client/peer/leave";
+export declare const CLIENT_PEER_TOGGLE_MOUNT_ROUTE = "/_dsh/zen-remote/client/peer/toggle-mount";
+export declare const CLIENT_PEER_TRUST_ROUTE = "/_dsh/zen-remote/client/peer/trust";
+export declare const CLIENT_PEER_REPROBE_ROUTE = "/_dsh/zen-remote/client/peer/reprobe";
 /**
  * MS-6: the paired-server pool's cap — the browser mirror of
  * src/state-store.ts's constant of the same name (the host module cannot be
@@ -263,6 +272,54 @@ export interface ClientConnectionView {
  * "unpaired" instead of throwing into the plugin page.
  */
 export declare function deriveClientStatusView(body: ClientStatusBody): ClientConnectionView;
+/**
+ * The `GET /_dsh/zen-remote/client/peer/status` body as the peer section
+ * renders it (PG-9): this machine's node id, the gateway admission state,
+ * the joined network's id + HTTP origin (both absent while not joined), the
+ * announced device cap, and one tolerant row per network device. The route
+ * itself never carries key material, so neither does this view.
+ */
+export interface PeerStatusView {
+    /** The engine reports a joined network. */
+    configured: boolean;
+    /** This machine's 8-hex node id ('' when the body carried none). */
+    nodeId: string;
+    /** The engine's gateway state word verbatim (`authorized`,
+     * `pending-approval`, `connecting`, `offline`, `unconfigured`,
+     * `mismatch`, `paused`, `revoked`). */
+    gatewayState: string;
+    networkId: string | undefined;
+    gatewayOrigin: string | undefined;
+    maxPeers: number | undefined;
+    peers: PeerStatusDeviceView[];
+}
+/** One network-device row the peer section renders (wizard's
+ * {@link PeerDeviceView} shape, mirrored here — settings-form cannot import
+ * from wizard.ts, the wizard imports THIS module). */
+export interface PeerStatusDeviceView {
+    nodeId: string;
+    name: string;
+    mounted: boolean;
+    path: PeerDevicePathView;
+    rttMs: number | null;
+}
+/** The device row's path word (the wizard module's `PeerDevicePath`). */
+export type PeerDevicePathView = 'lan' | 'p2p' | 'relay' | 'mismatch' | 'offline';
+/**
+ * Map one `client/peer/status` body into the view the peer section renders.
+ * Tolerant like every derive in this file: a junk body (a plain-client 503
+ * JSON, an older plugin) reads "not configured, no devices" instead of
+ * throwing into the plugin page; a junk device row drops whole; an unknown
+ * path word degrades to `offline`.
+ */
+export declare function derivePeerStatusView(body: unknown): PeerStatusView;
+/**
+ * The export's download name, `zen-remote-debug-<role>-<yyyymmdd-hhmm>.json`,
+ * stamped in the browser's local time (CU-4). Extracted here so the check
+ * scripts can pin it and so a peer node exports under its OWN role word —
+ * `peer`, never the host name.
+ */
+export declare function debugExportFileName(role: 'host' | 'client' | 'peer', now: Date): string;
 /**
  * Which connection line the block renders (T43 diagnostics wording, chosen
  * as a pure descriptor so the copy table and the countdown math stay
@@ -435,7 +492,7 @@ export declare function createLatestGate(): LatestGate;
 export declare function savedRowRole(snapshot: {
     value?: unknown;
     user?: unknown;
-}): 'host' | 'client' | undefined;
+}): 'host' | 'client' | 'peer' | undefined;
 /**
  * The EFFECTIVE role for one scope snapshot — the shared two-level decision
  * every role-aware surface uses (the settings page via {@link settingsPollOf},
@@ -450,7 +507,7 @@ export declare function savedRowRole(snapshot: {
 export declare function settingsRoleOf(status: 'loading' | 'ready' | 'unavailable', snapshot: {
     value?: unknown;
     user?: unknown;
-}, probed?: 'host' | 'client'): 'unknown' | 'host' | 'client';
+}, probed?: 'host' | 'client' | 'peer'): 'unknown' | 'host' | 'client' | 'peer';
 /**
  * Which status source the page polls for one scope snapshot —
  * {@link settingsRoleOf} mapped onto poll sources (`'unknown'` polls
@@ -459,7 +516,7 @@ export declare function settingsRoleOf(status: 'loading' | 'ready' | 'unavailabl
 export declare function settingsPollOf(status: 'loading' | 'ready' | 'unavailable', snapshot: {
     value?: unknown;
     user?: unknown;
-}, probed?: 'host' | 'client'): 'none' | 'admin' | 'client';
+}, probed?: 'host' | 'client' | 'peer'): 'none' | 'admin' | 'client';
 /**
  * The row fields whose changed value reloads the plugin row after a save —
  * re-exported from src/restart-fields.ts, the single list the host half's
@@ -638,7 +695,7 @@ export interface SettingsView {
     /** The status route answered ok. */
     available: boolean;
     /** Which half this DSH process runs as (`client` shows only the role group). */
-    role: 'host' | 'client';
+    role: 'host' | 'client' | 'peer';
     /** Opened through the gateway (a remote device): server-local operations disabled. */
     viaGateway: boolean;
     /** Whether the gateway child answers. */
@@ -812,13 +869,19 @@ export declare class ZenRemoteSettingsForm {
      * row role always wins, so a staged-then-saved switch is never masked by a
      * stale probe.
      */
-    setProbedRole(role: 'host' | 'client' | undefined): void;
+    setProbedRole(role: 'host' | 'client' | 'peer' | undefined): void;
     /**
      * Whether the SAVED row role is client ({@link savedRowRole} over the live
      * snapshot, falling back to the probed role) — the page mode's single
      * source of truth.
      */
     savedRoleIsClient(): boolean;
+    /**
+     * Whether the SAVED row role is peer (PG-9) — the settings page's signal
+     * for the network-mesh section on top of the PWA half. A row-silent
+     * snapshot falls back to the probed role, exactly like {@link savedRoleIsClient}.
+     */
+    savedRoleIsPeer(): boolean;
     /**
      * Whether the row document answers the saved role at all (T17): false when
      * neither snapshot layer carries one — the page then probes the

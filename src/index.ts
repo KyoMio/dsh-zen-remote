@@ -1612,6 +1612,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         })
       : undefined
     livePeerEngine = peerEngine
+    // PG-9 启动自动恢复：state 文件里已有 peerNetwork 记录（本机曾入网）
+    // 就直接按 join 序列连回——重启 DSH 不再需要重新粘贴邀请链接。未入网
+    // 时 resumeFromState() 自己回答 false，什么也不做。
+    peerEngine?.resumeFromState()
     // A stopped or reloaded row must not leave a stale pool where the module
     // getter can hand it out (T23a-fix's discipline), and its clients'
     // reconnect machinery must not outlive the row either: stop() ends every
@@ -2091,6 +2095,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       pool: relayPool,
       // PG-2: the status body and the claim pre-check read the LIVE cap.
       getMaxServers: maxServersCap,
+      // PG-9: the peer management routes' live engine and the joined
+      // network's HTTP origin, both read per request. Undefined engine on a
+      // non-peer row — the routes then answer 503 peer-unavailable.
+      getPeerEngine: () => peerEngine,
+      getPeerNetworkOrigin: () => readPeerNetwork(clientStateFile)?.gatewayHttpOrigin,
       getPluginBridgeStatusForServer: pluginBridgeStatusFor,
       getIntercept: interceptDiagnostics,
       getFetchRouteIntercept: fetchRouteDiagnostics,
