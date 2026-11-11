@@ -549,6 +549,16 @@ export const WIZARD_CSS = `
   padding-top: 8px;
   border-top: 1px solid var(--dsw-alias-border-l2);
 }
+/* PG-9-fix: the peer page's lower PWA section — the same visual separation
+   the footer uses, so the two halves read as distinct panels. */
+[data-zen-remote="wizard"] .zr-wizard-phoneSection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+}
 [data-zen-remote="wizard"] .zr-wizard-footerHint {
   font-size: 12px;
   color: var(--dsw-alias-label-secondary);

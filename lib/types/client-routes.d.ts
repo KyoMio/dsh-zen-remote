@@ -29,6 +29,7 @@ import type { LogRingEntry } from './log-ring.js';
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js';
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js';
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js';
+import type { PeerEngine } from './peer/engine.js';
 import type { BridgeStatus } from './plugin-bridge.js';
 import type { RelayClient } from './relay-client.js';
 import type { RelayPool } from './relay-pool.js';
@@ -91,6 +92,32 @@ export declare const CLIENT_CURRENT_SESSION_ROUTE = "/_dsh/zen-remote/client/cur
  * the live clients stop with their records. Pool-mode only — a mount without
  * a pool has no paired list to edit and answers the unknown-path 404. */
 export declare const CLIENT_UNPAIR_ROUTE = "/_dsh/zen-remote/client/unpair";
+/** Prefix of the peer-role management routes (PG-9). All of them sit behind
+ * the same walls as the rest of the prefix, PLUS the via-marker wall before
+ * dispatch: a request wearing the gateway's marker came from a remote
+ * device, and NO remote device may read or write this machine's peer state.
+ * The POSTs additionally run the same-origin gate; every answer is free of
+ * key material (`privateKeyHex`, the invite's `joinKey`). */
+export declare const CLIENT_PEER_PREFIX = "/_dsh/zen-remote/client/peer";
+/** GET: the peer engine's snapshot — this machine's node id, the gateway
+ * admission state, the joined network's id + HTTP origin, the announced
+ * device cap and one row per network device with its view path
+ * (`lan` / `p2p` / `relay` / `mismatch` / `offline`). */
+export declare const CLIENT_PEER_STATUS_ROUTE = "/_dsh/zen-remote/client/peer/status";
+/** POST `{inviteUri}`: join a network by pasting its `zr-net(s)://…` invite.
+ * The engine's refusal keeps its code as a 400. */
+export declare const CLIENT_PEER_JOIN_ROUTE = "/_dsh/zen-remote/client/peer/join";
+/** POST `{}`: leave the current network (unmount everything, close the WS,
+ * clear the persisted membership). */
+export declare const CLIENT_PEER_LEAVE_ROUTE = "/_dsh/zen-remote/client/peer/leave";
+/** POST `{nodeId, mounted}`: mount or ignore one network device's shared
+ * sessions (forwards to `peerEngine.setNodeDisabled(nodeId, !mounted)`). */
+export declare const CLIENT_PEER_TOGGLE_MOUNT_ROUTE = "/_dsh/zen-remote/client/peer/toggle-mount";
+/** POST `{nodeId}`: explicit local confirmation to trust a peer's NEW public
+ * key after a `mismatch` verdict (`peerEngine.trustPeer`). */
+export declare const CLIENT_PEER_TRUST_ROUTE = "/_dsh/zen-remote/client/peer/trust";
+/** POST `{}`: re-run the UDP hole-punch for every eligible device. */
+export declare const CLIENT_PEER_REPROBE_ROUTE = "/_dsh/zen-remote/client/peer/reprobe";
 /** Prefix of the plain-HTTP relay routes (T41b):
  * `GET ${CLIENT_HTTP_ROUTE_PREFIX}<route>?<query>` relays one intercepted
  * `/api/<route>` call (the fetch wrapper's rewrites land here) to the
@@ -196,6 +223,14 @@ export interface ClientHandlerOptions {
      * mount without a pool, or a pool predating the getter (test stubs).
      * Missing answers the historic constant 8. */
     getMaxServers?: () => number;
+    /** PG-9: the live peer-role engine, read PER REQUEST (undefined on a
+     * non-peer composition — every peer route then answers 503
+     * `peer-unavailable`). Wired only by the connects-role mount. */
+    getPeerEngine?: () => PeerEngine | undefined;
+    /** PG-9: the joined network's HTTP origin for the peer status body, read
+     * PER REQUEST off the state file's `peerNetwork` block (absent when not
+     * joined). Address-shaped, never a secret. */
+    getPeerNetworkOrigin?: () => string | undefined;
 }
 export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 /**

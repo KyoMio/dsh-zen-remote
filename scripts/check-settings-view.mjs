@@ -14,12 +14,23 @@
 import assert from 'node:assert/strict'
 import {
   canSubmitClientPairing,
+  CLIENT_PEER_JOIN_ROUTE,
+  CLIENT_PEER_LEAVE_ROUTE,
+  CLIENT_PEER_REPROBE_ROUTE,
+  CLIENT_PEER_STATUS_ROUTE,
+  CLIENT_PEER_TOGGLE_MOUNT_ROUTE,
+  CLIENT_PEER_TRUST_ROUTE,
   CLIENT_UNPAIR_ROUTE,
   deriveClientStatusView,
+  derivePeerStatusView,
+  debugExportFileName,
   MAX_PAIRED_SERVERS,
   normalizePairingCode,
+  savedRowRole,
+  settingsPollOf,
+  settingsRoleOf,
 } from '../src/client-data/settings-form.ts'
-import { deriveClientOverviewSummary, isWizardConfigured } from '../src/client-data/wizard.ts'
+import { deriveClientOverviewSummary, derivePeerOverviewSummary, isWizardConfigured } from '../src/client-data/wizard.ts'
 import {
   bannerText,
   BRIDGE_STAMP_PLUGIN,
@@ -242,6 +253,126 @@ await test('remote-status per-server acceptance: the bridge stamp follows the se
   }, 1)
   assert.equal(shouldStampBridgeForSession(view, 'zr~aaaa1111~s1', BRIDGE_STAMP_PLUGIN), true)
   assert.equal(shouldStampBridgeForSession(view, 'zr~bbbb2222~s2', BRIDGE_STAMP_PLUGIN), false)
+})
+
+// ---------------------------------------------------------------------------
+// PG-9: the peer node's browser data layer — the peer/status body view, the
+// three-valued role decision (host / client / peer), and the network-device
+// summary's cap judgment as the settings page renders it.
+// ---------------------------------------------------------------------------
+
+await test('the PG-9 route constants name the six peer management paths', () => {
+  assert.equal(CLIENT_PEER_STATUS_ROUTE, '/_dsh/zen-remote/client/peer/status')
+  assert.equal(CLIENT_PEER_JOIN_ROUTE, '/_dsh/zen-remote/client/peer/join')
+  assert.equal(CLIENT_PEER_LEAVE_ROUTE, '/_dsh/zen-remote/client/peer/leave')
+  assert.equal(CLIENT_PEER_TOGGLE_MOUNT_ROUTE, '/_dsh/zen-remote/client/peer/toggle-mount')
+  assert.equal(CLIENT_PEER_TRUST_ROUTE, '/_dsh/zen-remote/client/peer/trust')
+  assert.equal(CLIENT_PEER_REPROBE_ROUTE, '/_dsh/zen-remote/client/peer/reprobe')
+})
+
+await test('derivePeerStatusView parses the peer/status body: configured, gateway facts and the device rows', () => {
+  const view = derivePeerStatusView({
+    configured: true,
+    nodeId: 'abcd1234',
+    gatewayState: 'authorized',
+    networkId: '0123456789abcdef',
+    gatewayOrigin: 'http://10.0.0.1:4088',
+    maxPeers: 8,
+    peers: [
+      { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 },
+      { nodeId: 'cccc3333', name: '换了钥的机器', mounted: false, path: 'mismatch', rttMs: null },
+      'garbage',
+      null,
+    ],
+  })
+  assert.equal(view.configured, true)
+  assert.equal(view.nodeId, 'abcd1234')
+  assert.equal(view.gatewayState, 'authorized')
+  assert.equal(view.networkId, '0123456789abcdef')
+  assert.equal(view.gatewayOrigin, 'http://10.0.0.1:4088')
+  assert.equal(view.maxPeers, 8)
+  assert.equal(view.peers.length, 2, 'junk rows drop whole')
+  assert.deepEqual(view.peers[0], { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 })
+  assert.deepEqual(view.peers[1], { nodeId: 'cccc3333', name: '换了钥的机器', mounted: false, path: 'mismatch', rttMs: null })
+})
+
+await test('derivePeerStatusView degrades tolerantly: junk bodies, unknown states, missing numbers', () => {
+  // A pre-peer answer (or a plain-client 503 JSON): nothing configured.
+  const empty = derivePeerStatusView({})
+  assert.equal(empty.configured, false)
+  assert.equal(empty.nodeId, '')
+  assert.equal(empty.gatewayState, 'unconfigured')
+  assert.equal(empty.networkId, undefined)
+  assert.equal(empty.gatewayOrigin, undefined)
+  assert.equal(empty.maxPeers, undefined)
+  assert.deepEqual(empty.peers, [])
+  // Total garbage degrades the same way — never throws into the page.
+  const junk = derivePeerStatusView('garbage')
+  assert.equal(junk.configured, false)
+  assert.deepEqual(junk.peers, [])
+  // A row with an unknown path degrades to offline; a missing rtt reads null;
+  // a row without a nodeId drops whole; junk numbers fall back.
+  const odd = derivePeerStatusView({
+    configured: true,
+    nodeId: 'abcd1234',
+    gatewayState: 'pending-approval',
+    maxPeers: 'eight',
+    peers: [
+      { nodeId: 'bbbb2222', name: '客厅电脑', mounted: true, path: 'warp' },
+      { name: 'no id', mounted: true, path: 'lan' },
+    ],
+  })
+  assert.equal(odd.gatewayState, 'pending-approval')
+  assert.equal(odd.maxPeers, undefined)
+  assert.equal(odd.peers.length, 1)
+  assert.equal(odd.peers[0].path, 'offline')
+  assert.equal(odd.peers[0].rttMs, null)
+  assert.equal(odd.peers[0].mounted, true)
+})
+
+await test('the role decision reads peer: savedRowRole, settingsRoleOf and the admin poll choice', () => {
+  // The saved row document decides first.
+  assert.equal(savedRowRole({ value: { role: 'peer' }, user: {} }), 'peer')
+  assert.equal(savedRowRole({ value: {}, user: { role: 'peer' } }), 'peer')
+  // The client-config probe fills a silent row with peer too.
+  assert.equal(settingsRoleOf('ready', { value: {}, user: {} }, 'peer'), 'peer')
+  assert.equal(settingsPollOf('ready', { value: {}, user: {} }, 'peer'), 'admin', 'a peer serves its own admin routes — the PWA half polls admin/status')
+  assert.equal(settingsPollOf('ready', { value: { role: 'peer' } }), 'admin')
+  // Client and host verdicts are untouched.
+  assert.equal(savedRowRole({ value: { role: 'client' }, user: {} }), 'client')
+  assert.equal(savedRowRole({ value: { role: 'host' }, user: {} }), 'host')
+  assert.equal(settingsPollOf('ready', { value: { role: 'client' } }), 'client')
+  // An exact-match-only guard survives.
+  assert.equal(savedRowRole({ value: { role: 'Peer' }, user: {} }), undefined)
+})
+
+await test('the peer network-device summary: the settings page sees the same cap-red judgment', () => {
+  const row = (path, over = {}) => ({
+    nodeId: over.nodeId ?? 'aaaa1111', name: over.name ?? '书房电脑',
+    mounted: over.mounted ?? true, path, rttMs: over.rttMs ?? 3,
+    ...over,
+  })
+  // 8 / 8: the counter's red word rides with limitReached + the red device light.
+  const full = derivePeerOverviewSummary(Array.from({ length: 8 }, (_, i) => row('lan', { nodeId: `node${i}` })), 8)
+  assert.equal(full.totalCount, 8)
+  assert.equal(full.maxPeers, 8)
+  assert.equal(full.limitReached, true)
+  assert.equal(full.devicesLight, 'fail')
+  // 3 / 8 healthy: green lights, direct/relay split for the 直连/中转 tile.
+  const part = derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('p2p', { nodeId: 'b' }), row('relay', { nodeId: 'c' })], 8)
+  assert.deepEqual(
+    { total: part.totalCount, direct: part.directCount, relay: part.relayCount, limit: part.limitReached, devices: part.devicesLight },
+    { total: 3, direct: 2, relay: 1, limit: false, devices: 'pass' },
+  )
+})
+
+await test('debugExportFileName stamps the peer role into the diagnostic export name (PG-9-fix)', () => {
+  const now = new Date(2026, 10, 10, 9, 7)
+  const pad = (n) => String(n).padStart(2, '0')
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
+  assert.equal(debugExportFileName('host', now), `zen-remote-debug-host-${stamp}.json`)
+  assert.equal(debugExportFileName('client', now), `zen-remote-debug-client-${stamp}.json`)
+  assert.equal(debugExportFileName('peer', now), `zen-remote-debug-peer-${stamp}.json`, 'a peer node must not export under the host name')
 })
 
 console.log('check-settings-view: ok')

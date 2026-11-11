@@ -245,6 +245,37 @@ test('T64 keeper: a non-client role never clicks and never writes', async () => 
   }
 })
 
+test('PG-9-fix keeper: a PEER role remembers and restores zr~ groups exactly like a client', async () => {
+  // A peer node mounts the same zr~ server groups as a client — the host's
+  // retainAccountKeys purge kills the expansion record on every load there
+  // too, so the keeper must run (only a HOST has no server groups).
+  const env = makeEnv({
+    hostView: { 'ws-local': true },
+    roleAnswer: 'peer',
+    rows: [
+      { key: 'zr~sid~w1', expanded: false },
+      { key: 'zr~sid~w2', expanded: false },
+    ],
+  })
+  await env.load()
+  try {
+    await wait(40)
+    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w2'], 'purged groups restore on a peer page like on a client page')
+    env.setHost({ 'ws-local': true, 'zr~sid~w1': true, 'zr~sid~w2': true })
+    env.setRowStates([
+      { key: 'zr~sid~w1', expanded: true },
+      { key: 'zr~sid~w2', expanded: true },
+    ])
+    await wait(40)
+    assert.deepEqual(JSON.parse(env.backing.get('zr.remoteGroupExpansion.v1')), {
+      'zr~sid~w1': true,
+      'zr~sid~w2': true,
+    }, 'the host-recorded values sync into the plugin memory on a peer page too')
+  } finally {
+    env.stop()
+  }
+})
+
 test('T66 keeper: a throwing localStorage neither rejects the tick nor clicks — and recovery works', async () => {
   // The storage wrapper (a private-mode quota, a poisoned extension) throws
   // on BOTH methods; the tick must swallow it and keep the loop alive.

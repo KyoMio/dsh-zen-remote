@@ -16,7 +16,7 @@ export interface RemoteGroupExpansionKeeperOptions {
      * broken or absent one makes every tick a no-op. */
     storage?: StorageLike;
     /** The role probe. Default: the shared cached client-config probe. */
-    probeRole?: () => Promise<'host' | 'client' | undefined>;
+    probeRole?: () => Promise<'host' | 'client' | 'peer' | undefined>;
     /** The sidebar's server group rows. Default: the real DOM query — rows
      * without a readable `aria-expanded` are skipped. Tests inject fake rows
      * with click recorders. */

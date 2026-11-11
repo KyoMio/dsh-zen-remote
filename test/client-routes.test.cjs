@@ -102,6 +102,10 @@ function startClientServer(row, overrides = {}) {
     ...(overrides.getPluginVersion !== undefined ? { getPluginVersion: overrides.getPluginVersion } : {}),
     // PG-2: the live maxServers cap the status/claim routes read per request.
     ...(overrides.getMaxServers !== undefined ? { getMaxServers: overrides.getMaxServers } : {}),
+    // PG-9: the peer engine (peer role only) and the joined network's HTTP
+    // origin, both read live per request.
+    ...(overrides.getPeerEngine !== undefined ? { getPeerEngine: overrides.getPeerEngine } : {}),
+    ...(overrides.getPeerNetworkOrigin !== undefined ? { getPeerNetworkOrigin: overrides.getPeerNetworkOrigin } : {}),
   })
   const server = http.createServer((req, res) => { void handler(req, res) })
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port })))
@@ -2566,6 +2570,309 @@ test('MS-5 network-hint pool mode: one probe-and-restore sweep answers the hint'
     assert.equal(res.status, 200)
     assert.deepEqual(JSON.parse(res.body), { ok: true, reachable: true, reconnected: true })
     assert.equal(pool.calls.probeRestore, 1)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// PG-9: the peer management routes (/client/peer/*). Every route sits behind
+// the SAME walls the client prefix has always applied — admit (above), the
+// via-marker wall BEFORE dispatch (a remote device must never read or write
+// this machine's peer state), same-origin for the POSTs — and never echoes
+// key material (privateKeyHex, joinKey). A fake PeerEngine records the calls.
+// ---------------------------------------------------------------------------
+
+const PEER_STATUS_PATH = '/_dsh/zen-remote/client/peer/status'
+const PEER_JOIN_PATH = '/_dsh/zen-remote/client/peer/join'
+const PEER_LEAVE_PATH = '/_dsh/zen-remote/client/peer/leave'
+const PEER_TOGGLE_MOUNT_PATH = '/_dsh/zen-remote/client/peer/toggle-mount'
+const PEER_TRUST_PATH = '/_dsh/zen-remote/client/peer/trust'
+const PEER_REPROBE_PATH = '/_dsh/zen-remote/client/peer/reprobe'
+
+/** A PeerEngine double: records every management call, answers a fixed
+ * status() unless the scenario overrides it. */
+function makePeerEngine(overrides = {}) {
+  const calls = []
+  return {
+    calls,
+    engine: {
+      joinNetwork: async (invite) => {
+        calls.push(['join', invite])
+        return overrides.joinResult ?? { ok: true }
+      },
+      leaveNetwork: () => { calls.push(['leave']) },
+      setNodeDisabled: (nodeId, disabled) => { calls.push(['disable', nodeId, disabled]) },
+      trustPeer: (nodeId) => { calls.push(['trust', nodeId]); return overrides.trustResult ?? true },
+      reprobePunch: () => { calls.push(['reprobe']) },
+      status: () => overrides.status ?? {
+        nodeId: 'abcd1234',
+        gatewayState: 'authorized',
+        networkId: '0123456789abcdef',
+        maxPeers: 8,
+        natType: 'cone',
+        peers: [
+          { nodeId: 'aaaa1111', name: '书房电脑', state: 'eligible', path: 'lan', rttMs: 3, mounted: true },
+          { nodeId: 'bbbb2222', name: '客厅电脑', state: 'eligible', path: 'none', rttMs: null, mounted: false },
+          { nodeId: 'cccc3333', name: '换了钥的机器', state: 'identity-mismatch', path: 'blocked', rttMs: null, mounted: false },
+          { nodeId: 'dddd4444', name: '被我忽略的机器', state: 'disabled', path: 'none', rttMs: null, mounted: false },
+        ],
+      },
+    },
+  }
+}
+
+test('PG-9 route constants name the six peer paths under the client prefix', async () => {
+  assert.equal(routes.CLIENT_PEER_PREFIX, '/_dsh/zen-remote/client/peer')
+  assert.equal(routes.CLIENT_PEER_STATUS_ROUTE, PEER_STATUS_PATH)
+  assert.equal(routes.CLIENT_PEER_JOIN_ROUTE, PEER_JOIN_PATH)
+  assert.equal(routes.CLIENT_PEER_LEAVE_ROUTE, PEER_LEAVE_PATH)
+  assert.equal(routes.CLIENT_PEER_TOGGLE_MOUNT_ROUTE, PEER_TOGGLE_MOUNT_PATH)
+  assert.equal(routes.CLIENT_PEER_TRUST_ROUTE, PEER_TRUST_PATH)
+  assert.equal(routes.CLIENT_PEER_REPROBE_ROUTE, PEER_REPROBE_PATH)
+})
+
+test('PG-9 via wall: a gateway-marked request is refused BEFORE dispatch on every peer route', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const viaHeaders = { 'x-zen-remote-via': 'gateway' }
+    const status = await request(port, { method: 'GET', path: PEER_STATUS_PATH, headers: viaHeaders })
+    assert.equal(status.status, 403)
+    assert.equal(JSON.parse(status.body).error.code, 'via-gateway')
+    for (const [path, body] of [
+      [PEER_JOIN_PATH, { inviteUri: 'zr-net://10.0.0.1:4088/0123456789abcdef' }],
+      [PEER_LEAVE_PATH, {}],
+      [PEER_TOGGLE_MOUNT_PATH, { nodeId: 'aaaa1111', mounted: false }],
+      [PEER_TRUST_PATH, { nodeId: 'cccc3333' }],
+      [PEER_REPROBE_PATH, {}],
+    ]) {
+      const res = await request(port, { method: 'POST', path, headers: { ...sameOrigin(port), ...viaHeaders }, body })
+      assert.equal(res.status, 403, path)
+      assert.equal(JSON.parse(res.body).error.code, 'via-gateway', path)
+    }
+    assert.deepEqual(calls, [], 'no engine call may fire behind the wall')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 status: the mapped peer list rides without any key material', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(
+    makeRow(),
+    { getPeerEngine: () => engine, getPeerNetworkOrigin: () => 'http://10.0.0.1:4088' },
+  )
+  try {
+    const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), {
+      configured: true,
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      gatewayOrigin: 'http://10.0.0.1:4088',
+      maxPeers: 8,
+      peers: [
+        { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 },
+        { nodeId: 'bbbb2222', name: '客厅电脑', mounted: false, path: 'offline', rttMs: null },
+        { nodeId: 'cccc3333', name: '换了钥的机器', mounted: false, path: 'mismatch', rttMs: null },
+        { nodeId: 'dddd4444', name: '被我忽略的机器', mounted: false, path: 'offline', rttMs: null },
+      ],
+    })
+    const raw = res.body
+    assert.ok(!raw.includes('privateKeyHex'), 'the private key never rides any peer answer')
+    assert.ok(!raw.includes('joinKey'), 'the join key never rides any peer answer')
+    assert.ok(!/[0-9a-f]{64}/.test(raw), 'no 64-hex key material anywhere in the body')
+    assert.deepEqual(calls, [], 'status is a pure read of the engine snapshot')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 status: an engine with no network answers configured:false and no network fields', async () => {
+  const { engine } = makePeerEngine({
+    status: { nodeId: 'abcd1234', gatewayState: 'unconfigured', networkId: null, maxPeers: null, natType: null, peers: [] },
+  })
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.configured, false)
+    assert.equal(body.nodeId, 'abcd1234')
+    assert.equal(body.gatewayState, 'unconfigured')
+    assert.ok(!('networkId' in body), 'no network id when unconfigured')
+    assert.ok(!('gatewayOrigin' in body), 'no gateway origin when unconfigured')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 status: no engine wired answers 503 peer-unavailable', async () => {
+  const { server, port } = await startClientServer(makeRow())
+  try {
+    const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(res.status, 503)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'peer-unavailable' } })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 join: a valid invite reaches joinNetwork verbatim; a bad one never leaves the route', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const ok = await request(port, {
+      method: 'POST',
+      path: PEER_JOIN_PATH,
+      headers: sameOrigin(port),
+      body: { inviteUri: 'zr-net://10.0.0.1:4088/0123456789abcdef#secret-key' },
+    })
+    assert.equal(ok.status, 200)
+    assert.deepEqual(JSON.parse(ok.body), { ok: true })
+    assert.deepEqual(calls, [['join', 'zr-net://10.0.0.1:4088/0123456789abcdef#secret-key']])
+
+    // Missing / wrong-type inviteUri is a local 400 before the engine is called.
+    const bad = await request(port, { method: 'POST', path: PEER_JOIN_PATH, headers: sameOrigin(port), body: { inviteUri: 42 } })
+    assert.equal(bad.status, 400)
+    assert.equal(JSON.parse(bad.body).error.code, 'bad-request')
+    const empty = await request(port, { method: 'POST', path: PEER_JOIN_PATH, headers: sameOrigin(port), body: {} })
+    assert.equal(empty.status, 400)
+    assert.equal(calls.length, 1, 'only the valid join reached the engine')
+
+    // GET on a POST route answers 405.
+    const wrongMethod = await request(port, { method: 'GET', path: PEER_JOIN_PATH })
+    assert.equal(wrongMethod.status, 405)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 join: the engine refusal keeps its code as a 400', async () => {
+  const { engine } = makePeerEngine({ joinResult: { ok: false, code: 'invalid-invite' } })
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const res = await request(port, {
+      method: 'POST',
+      path: PEER_JOIN_PATH,
+      headers: sameOrigin(port),
+      body: { inviteUri: 'zr-net://10.0.0.1:4088/bad' },
+    })
+    assert.equal(res.status, 400)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'invalid-invite' } })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 join: a cross-site origin is refused before the engine runs', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const res = await request(port, {
+      method: 'POST',
+      path: PEER_JOIN_PATH,
+      headers: { origin: 'https://evil.example' },
+      body: { inviteUri: 'zr-net://10.0.0.1:4088/0123456789abcdef' },
+    })
+    assert.equal(res.status, 403)
+    assert.equal(JSON.parse(res.body).error.code, 'origin-rejected')
+    assert.deepEqual(calls, [])
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 leave: reaches leaveNetwork with no body requirements', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const res = await request(port, { method: 'POST', path: PEER_LEAVE_PATH, headers: sameOrigin(port), body: {} })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true })
+    assert.deepEqual(calls, [['leave']])
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 toggle-mount: mounted:false disables the node, mounted:true re-enables it', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const off = await request(port, {
+      method: 'POST', path: PEER_TOGGLE_MOUNT_PATH, headers: sameOrigin(port),
+      body: { nodeId: 'AAAA1111', mounted: false },
+    })
+    assert.equal(off.status, 200)
+    assert.deepEqual(JSON.parse(off.body), { ok: true })
+    const on = await request(port, {
+      method: 'POST', path: PEER_TOGGLE_MOUNT_PATH, headers: sameOrigin(port),
+      body: { nodeId: 'aaaa1111', mounted: true },
+    })
+    assert.equal(on.status, 200)
+    assert.deepEqual(calls, [['disable', 'aaaa1111', true], ['disable', 'aaaa1111', false]], 'the node id is normalized, disabled = !mounted')
+    // Junk bodies refuse locally.
+    for (const body of [{ nodeId: 'aaaa1111' }, { mounted: false }, { nodeId: '', mounted: true }, { nodeId: 'aaaa1111', mounted: 'no' }]) {
+      const bad = await request(port, { method: 'POST', path: PEER_TOGGLE_MOUNT_PATH, headers: sameOrigin(port), body })
+      assert.equal(bad.status, 400)
+    }
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 trust: success answers ok; an unknown peer answers 404 unknown-peer', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const ok = await request(port, { method: 'POST', path: PEER_TRUST_PATH, headers: sameOrigin(port), body: { nodeId: 'cccc3333' } })
+    assert.equal(ok.status, 200)
+    assert.deepEqual(JSON.parse(ok.body), { ok: true })
+    assert.deepEqual(calls, [['trust', 'cccc3333']])
+  } finally {
+    await closeServer(server)
+  }
+  const unknown = makePeerEngine({ trustResult: false })
+  const { server: s2, port: p2 } = await startClientServer(makeRow(), { getPeerEngine: () => unknown.engine })
+  try {
+    const res = await request(p2, { method: 'POST', path: PEER_TRUST_PATH, headers: sameOrigin(p2), body: { nodeId: 'ffffffff' } })
+    assert.equal(res.status, 404)
+    assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'unknown-peer' } })
+  } finally {
+    await closeServer(s2)
+  }
+})
+
+test('PG-9 reprobe: fires the punch re-probe and answers ok', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const res = await request(port, { method: 'POST', path: PEER_REPROBE_PATH, headers: sameOrigin(port), body: {} })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true })
+    assert.deepEqual(calls, [['reprobe']])
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PG-9 POSTs without an engine answer 503 peer-unavailable', async () => {
+  const { server, port } = await startClientServer(makeRow())
+  try {
+    for (const [path, body] of [
+      [PEER_JOIN_PATH, { inviteUri: 'zr-net://10.0.0.1:4088/0123456789abcdef' }],
+      [PEER_LEAVE_PATH, {}],
+      [PEER_TOGGLE_MOUNT_PATH, { nodeId: 'aaaa1111', mounted: true }],
+      [PEER_TRUST_PATH, { nodeId: 'cccc3333' }],
+      [PEER_REPROBE_PATH, {}],
+    ]) {
+      const res = await request(port, { method: 'POST', path, headers: sameOrigin(port), body })
+      assert.equal(res.status, 503, path)
+      assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'peer-unavailable' } }, path)
+    }
   } finally {
     await closeServer(server)
   }

@@ -46,20 +46,28 @@ import {
   CLIENT_CLAIM_ROUTE,
   CLIENT_CONFIG_ROUTE,
   CLIENT_DEBUG_REPORT_ROUTE,
+  CLIENT_PEER_REPROBE_ROUTE,
+  CLIENT_PEER_STATUS_ROUTE,
+  CLIENT_PEER_TOGGLE_MOUNT_ROUTE,
+  CLIENT_PEER_TRUST_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
   CLIENT_UNPAIR_ROUTE,
   MAX_PAIRED_SERVERS,
   awaitClientStatusReady,
+  debugExportFileName,
   canSubmitClientPairing,
   claimDeviceNameOf,
   createLatestGate,
   clientStatusLineOf,
   deriveClientStatusView,
+  derivePeerStatusView,
   deriveSettingsView,
   localOpsAllowed,
   normalizePairingCode,
   shouldReloadAfterClientActivation,
+  type PeerStatusDeviceView,
+  type PeerStatusView,
 } from '../../client-data/settings-form.ts'
 import { bridgeSectionState, togglePluginConsent } from '../../client-data/plugin-bridge.ts'
 import type { PluginBridgeStatusView } from '../../client-data/plugin-bridge.ts'
@@ -145,15 +153,6 @@ async function postJson(url: string, payload: Record<string, unknown>): Promise<
   } catch {
     return { ok: false, sent: 0, failed: 0 }
   }
-}
-
-/** CU-4: the export's download name, `zen-remote-debug-<role>-<yyyymmdd-hhmm>.json`,
- * stamped in the browser's local time (the file is for the user's own
- * folder; the report's `_meta.generatedAt` carries the exact UTC instant). */
-function debugExportFileName(role: 'host' | 'client', now: Date): string {
-  const pad = (n: number): string => String(n).padStart(2, '0')
-  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
-  return `zen-remote-debug-${role}-${stamp}.json`
 }
 
 /** CU-4: one transient notice for the export's outcome — the same inline-
@@ -277,6 +276,84 @@ function serverStateBadge(server: ClientServerView, now: number, t: SectionT): {
     case 'invalid-url': return { text: t('settings.client.serverStateInvalidUrl'), tone: 'invalid' }
     default: return { text: t('settings.client.serverStateUnpaired'), tone: undefined }
   }
+}
+
+// --- PG-9: the peer node's mesh section pieces -------------------------------
+
+/** Copy of one network device's path badge — the same keys the wizard's
+ * modal reads, so the two surfaces cannot drift apart in what a path is
+ * CALLED (局域网直连 / 直连 / 经网关中转 / 身份异常 / 离线). */
+function peerDevicePathCopyOf(path: PeerStatusDeviceView['path'], t: SectionT): string {
+  switch (path) {
+    case 'lan': return t('wizard.peer.devicePathLan')
+    case 'p2p': return t('wizard.peer.devicePathP2p')
+    case 'relay': return t('wizard.peer.devicePathRelay')
+    case 'mismatch': return t('wizard.peer.devicePathMismatch')
+    default: return t('wizard.peer.devicePathOffline')
+  }
+}
+
+/** Copy of the gateway admission state's one-liner (the same words the
+ * wizard's peer surfaces use). */
+function peerStateCopyOf(state: string, t: SectionT): string {
+  switch (state) {
+    case 'authorized': return t('wizard.light.pass')
+    case 'pending-approval': return t('wizard.peer.pendingApproval')
+    case 'connecting': return t('wizard.peer.connecting')
+    case 'offline': return t('wizard.peer.offline')
+    case 'mismatch': return t('wizard.peer.mismatch')
+    case 'paused':
+    case 'revoked': return t('wizard.peer.revoked')
+    default: return t('wizard.peer.notJoined')
+  }
+}
+
+/** One network-device row of the mesh section (PG-9): name + path badge +
+ * RTT, then either the mount switch or — on a locally blocked identity —
+ * the loud mismatch note and the explicit trust button. */
+function PeerDeviceRow(props: {
+  device: PeerStatusDeviceView
+  busy: boolean
+  onToggle: (mounted: boolean) => void
+  onTrust: () => void
+  t: SectionT
+}): ReactNode {
+  const { device, busy, onToggle, onTrust, t } = props
+  const usable = device.path === 'lan' || device.path === 'p2p' || device.path === 'relay'
+  return (
+    <div className="zr-settings-device">
+      <div className="zr-settings-device-head">
+        <span className="zr-settings-device-name">{device.name !== '' ? device.name : device.nodeId}</span>
+        <span
+          className="zr-settings-badge"
+          data-live={usable ? 'true' : undefined}
+          data-invalid={device.path === 'mismatch' ? 'true' : undefined}
+        >
+          {peerDevicePathCopyOf(device.path, t)}
+        </span>
+        {usable && device.rttMs !== null ? (
+          <span className="zr-settings-badge">{t('wizard.peer.deviceRtt', { ms: String(device.rttMs) })}</span>
+        ) : null}
+        <span className="zr-settings-hint">{device.nodeId}</span>
+      </div>
+      {device.path === 'mismatch' ? (
+        <>
+          <p className="zr-settings-hint" data-invalid="true">{t('wizard.peer.mismatchNote')}</p>
+          <div className="zr-settings-device-actions">
+            <Button variant="outline" size="sm" disabled={busy} onClick={onTrust}>{t('wizard.peer.trustNew')}</Button>
+          </div>
+        </>
+      ) : (
+        <div className="zr-settings-device-actions">
+          <Switch
+            checked={device.mounted}
+            onChange={onToggle}
+            label={device.mounted ? t('wizard.peer.deviceMount') : t('wizard.peer.deviceIgnore')}
+          />
+        </div>
+      )}
+    </div>
+  )
 }
 
 function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
@@ -471,6 +548,60 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     ? deriveSettingsView(load.body, { now, rowUser: config.rowUser() })
     : undefined
   const clientRole = config.savedRoleIsClient()
+  // PG-9: the peer node's page — the network-mesh section on top, and the
+  // host's PWA half (pairing / devices / gateway status) below it UNCHANGED:
+  // a peer serves its own admin routes, so every `!clientRole` block renders
+  // for it exactly as on a host.
+  const peerRole = config.savedRoleIsPeer()
+
+  // The peer node's status poll (PG-9) — the mesh section's data source.
+  // Same stale-keeps-data contract as the admin/client loads; a non-peer
+  // composition never fires it.
+  const [peerView, setPeerView] = useState<PeerStatusView | undefined>()
+  const [peerBusyNode, setPeerBusyNode] = useState<string | null>(null)
+  const [peerActionFailed, setPeerActionFailed] = useState(false)
+  // One latest-wins ticket stream dedicated to the peer poll.
+  const peerStatusTicket = useMemo(createLatestGate, [])
+  const loadPeerStatus = useCallback(() => {
+    const ticket = peerStatusTicket.next()
+    fetch(CLIENT_PEER_STATUS_ROUTE)
+      .then((res) => {
+        if (!res.ok) return Promise.reject(new StatusError(res.status))
+        return res.json() as Promise<PeerStatusView>
+      })
+      .then((body) => {
+        if (!peerStatusTicket.isLatest(ticket)) return
+        setPeerView(derivePeerStatusView(body))
+      })
+      .catch(() => { /* keep the last view — the poll corrects */ })
+  }, [peerStatusTicket])
+  useEffect(() => {
+    if (!peerRole) return
+    loadPeerStatus()
+    const timer = window.setInterval(() => { loadPeerStatus() }, 5000)
+    return () => { window.clearInterval(timer) }
+  }, [peerRole, loadPeerStatus])
+
+  // PG-9: one network-device management action — toggle-mount or trust —
+  // then the poll repaints the section either way.
+  const runPeerNodeAction = async (route: string, nodeId: string, payload: Record<string, unknown>): Promise<void> => {
+    setPeerBusyNode(nodeId)
+    setPeerActionFailed(false)
+    try {
+      const res = await fetch(route, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean }
+      setPeerActionFailed(!res.ok || body.ok !== true)
+    } catch {
+      setPeerActionFailed(true)
+    } finally {
+      setPeerBusyNode(null)
+    }
+    loadPeerStatus()
+  }
 
   // The plugin bridge's registered-plugin listing (PB-5), host page only:
   // loaded once per page life and refreshed whenever a save lands (the
@@ -537,7 +668,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     fetch(CLIENT_CONFIG_ROUTE)
       .then((res) => (res.ok ? (res.json() as Promise<ClientConfigBody>) : undefined))
       .then((body) => {
-        if (!cancelled) config.setProbedRole(body?.role === 'client' ? 'client' : 'host')
+        if (!cancelled) config.setProbedRole(body?.role === 'client' ? 'client' : body?.role === 'peer' ? 'peer' : 'host')
       })
       .catch(() => {
         if (!cancelled) config.setProbedRole('host')
@@ -687,7 +818,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = debugExportFileName(clientRole ? 'client' : 'host', new Date())
+      anchor.download = debugExportFileName(clientRole ? 'client' : peerRole ? 'peer' : 'host', new Date())
       document.body.appendChild(anchor)
       anchor.click()
       anchor.remove()
@@ -1101,13 +1232,16 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
             // UX-1: captured BEFORE the save — whether the page ran as client,
             // and whether the backend's stream interceptor was already active
             // per the last client/status diagnostics.
-            const wasEffectiveClient = clientRole
+            // PG-9-fix: a peer activation reloads the page exactly like a
+            // client one — the peer row installs the same stream intercept,
+            // and this page's resident global streams opened unwrapped.
+            const wasEffectiveClient = clientRole || peerRole
             const streamInterceptAlreadyActive = clientView?.intercept?.installed === true
             void config.save().then((landed) => {
               if (!landed) return
               if (shouldReloadAfterClientActivation({
                 wasEffectiveClient,
-                nowClientRole: config.savedRoleIsClient(),
+                nowClientRole: config.savedRoleIsClient() || config.savedRoleIsPeer(),
                 savedOrPaired: true,
                 streamInterceptAlreadyActive,
               })) {
@@ -1124,8 +1258,8 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
           onDiscard={() => { config.discard() }}
         >
           <h3 className="zr-settings-card-title">{t('settings.roleTitle')}</h3>
-          {select(form.role, 'role', t('settings.role'), t('settings.roleHint'), ['host', 'client'], (option) => (
-            option === 'host' ? t('settings.roleHost') : t('settings.roleClient')
+          {select(form.role, 'role', t('settings.role'), t('settings.roleHint'), ['host', 'client', 'peer'], (option) => (
+            option === 'host' ? t('settings.roleHost') : option === 'peer' ? t('settings.rolePeer') : t('settings.roleClient')
           ))}
           {/* T57: the device name — the row's serverName field — lives in the
               role card on BOTH roles: on a host it is the server display name
@@ -1214,6 +1348,65 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
           )}
         </SettingsForm>
       </div>
+
+      {/* PG-9: the peer node's network-mesh section — the UPPER of the two
+          sections a peer page renders. The PWA half below (the host's
+          pairing / devices / gateway card) keeps rendering untouched, so a
+          peer keeps its full phone / browser access story. */}
+      {peerRole && (
+        <div className="zr-settings-card">
+          <h3 className="zr-settings-card-title">{t('settings.peer.title')}</h3>
+          <p className="zr-settings-hint" style={{ paddingTop: 4 }}>{t('settings.peer.subtitle')}</p>
+          {!peerView?.configured ? (
+            <p className="zr-settings-hint" style={{ padding: '8px 0 12px' }}>{t('settings.peer.notConfigured')}</p>
+          ) : (
+            <>
+              <div className="zr-settings-field">
+                <div className="zr-settings-head">
+                  <span className="zr-settings-head-title">{t('wizard.overview.peerNetworkLabel')}</span>
+                  <span
+                    className="zr-settings-badge"
+                    data-live={peerView.gatewayState === 'authorized' ? 'true' : undefined}
+                    data-invalid={peerView.gatewayState === 'mismatch' || peerView.gatewayState === 'revoked' || peerView.gatewayState === 'paused' ? 'true' : undefined}
+                  >
+                    {peerStateCopyOf(peerView.gatewayState, t)}
+                  </span>
+                </div>
+                <p className="zr-settings-hint">
+                  {t('wizard.overview.peerNodeLabel')} · {peerView.nodeId !== '' ? peerView.nodeId : '—'}
+                  {peerView.networkId !== undefined ? ` · ${peerView.networkId}` : ''}
+                </p>
+              </div>
+
+              <div className="zr-settings-field">
+                <div className="zr-settings-head">
+                  <span className="zr-settings-head-title">{t('wizard.overview.peerDevicesLabel')}</span>
+                </div>
+                {peerView.peers.length === 0 ? (
+                  <p className="zr-settings-hint" style={{ padding: '8px 0 12px' }}>{t('wizard.peer.devicesModalEmpty')}</p>
+                ) : (
+                  peerView.peers.map((device) => (
+                    <PeerDeviceRow
+                      key={device.nodeId}
+                      device={device}
+                      busy={peerBusyNode !== null}
+                      onToggle={(mounted) => { void runPeerNodeAction(CLIENT_PEER_TOGGLE_MOUNT_ROUTE, device.nodeId, { nodeId: device.nodeId, mounted }) }}
+                      onTrust={() => { void runPeerNodeAction(CLIENT_PEER_TRUST_ROUTE, device.nodeId, { nodeId: device.nodeId }) }}
+                      t={t}
+                    />
+                  ))
+                )}
+                {peerActionFailed && <p className="zr-settings-hint" data-invalid="true">{t('wizard.peer.actionFailed')}</p>}
+                <div className="zr-settings-row" style={{ paddingBottom: 12 }}>
+                  <Button variant="ghost" size="sm" disabled={peerBusyNode !== null} onClick={() => { void runPeerNodeAction(CLIENT_PEER_REPROBE_ROUTE, 'all', {}) }}>
+                    {t('wizard.devicesModal.retest')}
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
 
       {/* Instant operations — outside the form frame, so pairing, device
           management and the gateway status stay visible even while the

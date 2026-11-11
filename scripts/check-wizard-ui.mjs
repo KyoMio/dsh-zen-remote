@@ -26,6 +26,8 @@ import {
   caddySnippetText,
   deriveClientServerLights,
   deriveClientWizardLights,
+  derivePeerOverviewSummary,
+  derivePeerWizardLights,
   deriveWizardLights,
   formSeedOf,
   WIZARD_CF_TOKEN_ROUTE,
@@ -45,6 +47,7 @@ import {
   nginxSnippetText,
   pairingSecondsLeft,
   publicUrlFrom,
+  targetHostSaveRole,
   upstreamPortOf,
 } from '../src/client-data/wizard.ts'
 import { luckySteps, nginxSnippet, caddySnippet } from '../lib/wizard/proxy-snippets.js'
@@ -228,6 +231,79 @@ await test('deriveClientWizardLights: reflects token and client connection state
     deriveClientWizardLights({ tokenConfigured: true, clientState: 'unreachable' }),
     { credential: 'pass', connection: 'fail', sync: 'pending' },
   )
+})
+
+await test('derivePeerWizardLights: the peer node\'s three lights (PG-9)', () => {
+  // ① identity is green once the engine has a node id, amber before.
+  assert.equal(derivePeerWizardLights({ identityReady: false, gatewayState: 'unconfigured', peerCount: 0, mismatchCount: 0 }).identity, 'pending')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'unconfigured', peerCount: 0, mismatchCount: 0 }).identity, 'pass')
+  // ② admission: authorized is green; pending-approval is the amber
+  // 「等待网络管理员批准」; connecting/offline stay amber; mismatch,
+  // revoked and paused are red.
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', peerCount: 0, mismatchCount: 0 }).admission, 'pass')
+  for (const amber of ['pending-approval', 'connecting', 'offline', 'unconfigured']) {
+    assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: amber, peerCount: 0, mismatchCount: 0 }).admission, 'pending', amber)
+  }
+  for (const red of ['mismatch', 'revoked', 'paused']) {
+    assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: red, peerCount: 0, mismatchCount: 0 }).admission, 'fail', red)
+  }
+  // ③ discovery & sync: green once peers ride (mounted or not), red when a
+  // local TOFU mismatch blocks one, amber while the network is empty.
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', peerCount: 2, mismatchCount: 0 }).discovery, 'pass')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', peerCount: 0, mismatchCount: 0 }).discovery, 'pending')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', peerCount: 3, mismatchCount: 1 }).discovery, 'fail')
+  // A non-authorized gateway keeps discovery amber regardless of announcements.
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'connecting', peerCount: 1, mismatchCount: 0 }).discovery, 'pending')
+})
+
+await test('derivePeerOverviewSummary: counts, the cap\'s red device light and the connection light (PG-9)', () => {
+  const row = (path, over = {}) => ({
+    nodeId: over.nodeId ?? 'aaaa1111', name: over.name ?? '书房电脑',
+    mounted: over.mounted ?? true, path, rttMs: over.rttMs ?? 3,
+    ...over,
+  })
+  // Empty network: everything amber, no cap tripped.
+  assert.deepEqual(derivePeerOverviewSummary([], 8), {
+    totalCount: 0, directCount: 0, relayCount: 0, mismatchCount: 0, offlineCount: 0,
+    mountedCount: 0, maxPeers: 8, limitReached: false, connectionLight: 'pending', devicesLight: 'pending',
+  })
+  // A healthy mix: lan+p2p count direct, relay counts relayed; both lights green.
+  const mix = derivePeerOverviewSummary([
+    row('lan', { nodeId: 'a' }),
+    row('p2p', { nodeId: 'b', mounted: false }),
+    row('relay', { nodeId: 'c' }),
+    row('offline', { nodeId: 'd', mounted: false, rttMs: null }),
+  ], 8)
+  assert.equal(mix.totalCount, 4)
+  assert.equal(mix.directCount, 2)
+  assert.equal(mix.relayCount, 1)
+  assert.equal(mix.offlineCount, 1)
+  assert.equal(mix.mountedCount, 2)
+  assert.equal(mix.limitReached, false)
+  assert.equal(mix.connectionLight, 'pending', 'one device is offline mid-retry — the connection light stays amber')
+  assert.equal(mix.devicesLight, 'pass')
+  // All devices on usable paths: the connection light goes green.
+  assert.equal(
+    derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('p2p', { nodeId: 'b' }), row('relay', { nodeId: 'c' })], 8).connectionLight,
+    'pass',
+  )
+  // 满额红字：at the cap the device light goes red while the connection light stays green.
+  const full = derivePeerOverviewSummary(
+    Array.from({ length: 8 }, (_, i) => row('lan', { nodeId: `node${i}` })),
+    8,
+  )
+  assert.equal(full.limitReached, true)
+  assert.equal(full.devicesLight, 'fail')
+  assert.equal(full.connectionLight, 'pass')
+  // Under the cap is not full.
+  assert.equal(derivePeerOverviewSummary(Array.from({ length: 7 }, (_, i) => row('lan', { nodeId: `node${i}` })), 8).limitReached, false)
+  // An explicit smaller cap decides on its own.
+  assert.equal(derivePeerOverviewSummary([row('lan')], 1).devicesLight, 'fail')
+  // A locally blocked identity turns both lights red — the user must act.
+  const blocked = derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('mismatch', { nodeId: 'b', mounted: false, rttMs: null })], 8)
+  assert.equal(blocked.mismatchCount, 1)
+  assert.equal(blocked.devicesLight, 'fail')
+  assert.equal(blocked.connectionLight, 'fail')
 })
 
 await test('deriveClientServerLights: one paired server row drives the wizard step-3 lights (MS-8)', () => {
@@ -448,6 +524,29 @@ const WIZARD_KEYS = [
   'wizard.serversModal.title', 'wizard.serversModal.subtitle', 'wizard.serversModal.viewStatus',
   'wizard.client.poolCapNote', 'wizard.client.continueAdd', 'wizard.client.serverPicker',
   'wizard.desktop.addressFallback', 'wizard.desktop.copiedText',
+  // PG-9: the peer node's role card, join flow, three lights, overview tiles
+  // and the network-devices modal. The wording follows the glossary: the role
+  // is 节点端 (Peer Node), the paths are 局域网直连 / 直连 / 经网关中转, a
+  // key change is 身份异常 / 信任新身份, the invite is 邀请链接.
+  'wizard.role.peer', 'wizard.role.peerDesc', 'wizard.role.peerPickNote',
+  'wizard.peer.inviteUri', 'wizard.peer.inviteUriHint', 'wizard.peer.inviteUriPlaceholder',
+  'wizard.peer.join', 'wizard.peer.joining', 'wizard.peer.rejoin', 'wizard.peer.leave',
+  'wizard.peer.leaveConfirm',
+  'wizard.peer.lightIdentity', 'wizard.peer.lightAdmission', 'wizard.peer.lightDiscovery',
+  'wizard.peer.pendingApproval', 'wizard.peer.joinFailed', 'wizard.peer.joinInvalid',
+  'wizard.peer.connecting', 'wizard.peer.offline', 'wizard.peer.revoked', 'wizard.peer.mismatch',
+  'wizard.peer.notJoined',
+  'wizard.overview.peerNodeLabel', 'wizard.overview.peerNetworkLabel', 'wizard.overview.peerNetworkNone',
+  'wizard.overview.peerConnLabel', 'wizard.overview.peerConnSummary', 'wizard.overview.peerConnNone',
+  'wizard.overview.peerDevicesLabel', 'wizard.overview.peerDevicesCount', 'wizard.overview.peerDevicesFull',
+  'wizard.peer.devicesModalTitle', 'wizard.peer.devicesModalSubtitle', 'wizard.peer.devicesModalEmpty',
+  'wizard.peer.devicePathLan', 'wizard.peer.devicePathP2p', 'wizard.peer.devicePathRelay',
+  'wizard.peer.devicePathOffline', 'wizard.peer.devicePathMismatch', 'wizard.peer.deviceRtt',
+  'wizard.peer.deviceMount', 'wizard.peer.deviceIgnore',
+  'wizard.peer.mismatchNote', 'wizard.peer.trustNew', 'wizard.peer.trustOk', 'wizard.peer.actionFailed',
+  'wizard.peer.pwaSectionTitle', 'wizard.peer.switchRole', 'wizard.peer.pairPhone',
+  'wizard.peer.configurePhoneAccess', 'wizard.peer.managePairedDevices',
+  'settings.peer.title', 'settings.peer.subtitle', 'settings.peer.notConfigured',
 ]
 
 // The cards' step counts are part of the walkthrough contract (GW-11).
@@ -722,6 +821,22 @@ await test('registerGatewayWizard: mounts on plugins.bundle.config (top of bundl
   assert.equal(slotsRegistered[0].options.key, WIZARD_BUNDLE_KEY)
   assert.equal(slotsRegistered[0].options.key, 'dsh-zen-remote')
   assert.equal(slotsRegistered[0].component, stubWizard)
+})
+
+await test('targetHostSaveRole: the channel-config save keeps a peer a peer (PG-9-fix)', () => {
+  // The phone-PWA channel flows run under wizardRole 'host' — a peer that
+  // opens them from its lower PWA section must keep its row role after the
+  // save, or the machine is kicked out of the virtual network.
+  assert.equal(targetHostSaveRole(false), 'host')
+  assert.equal(targetHostSaveRole(true), 'peer')
+})
+
+await test('the banned word 互通端 appears nowhere in either dictionary (PG-9-fix)', () => {
+  for (const [locale, dict] of [['zh', zh], ['en', en]]) {
+    for (const [key, value] of Object.entries(dict)) {
+      assert.ok(!String(value).includes('互通端'), `${locale} ${key} must not use the banned word`)
+    }
+  }
 })
 
 console.log('check-wizard-ui: ok')

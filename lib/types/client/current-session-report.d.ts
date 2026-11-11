@@ -11,7 +11,7 @@ export interface CurrentSessionReporterOptions {
     /** Outbound POST transport. Default: the page's fetch. */
     fetchImpl?: (url: string, init: RequestInit) => Promise<unknown>;
     /** The role probe. Default: the shared cached client-config probe. */
-    probeRole?: () => Promise<'host' | 'client' | undefined>;
+    probeRole?: () => Promise<'host' | 'client' | 'peer' | undefined>;
     /** POST target. Default: the current-session route. */
     route?: string;
     /** The re-check interval; default 1000ms. */

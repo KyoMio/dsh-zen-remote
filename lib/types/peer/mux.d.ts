@@ -118,6 +118,8 @@ export declare class PeerMux {
     private handleEnvelope;
     /** 采用对端临时钥：每个新 (my, peer) 对只派生一次中转密码器。 */
     private integratePeerEphemeral;
+    /** 记一个死流 id；超过上限按插入顺序淘汰最老项（PG-9）。 */
+    private noteDeadStream;
     /** ARQ 顺序送达的一个入站分片（0 = 元数据，1+ = 体，fin = 结束）。 */
     private onStreamData;
     /** 单个入站分片的按向处理（ARQ 已保证顺序，无需重排缓冲）。 */

@@ -16,11 +16,12 @@
  * really for). Failures are silent — background plumbing must never log
  * or toast.
  *
- * Runs only in the CLIENT role (a host has no relay and no intercept): the
- * role comes from the SAME cached `client-config` probe the share parts
- * use — a definite 'client' starts reporting, a 'host' never reports, and
- * an undecided probe re-asks on each tick (once it lands the answer is
- * stable for the process's lifetime).
+ * Runs only in the CLIENT and PEER roles (a host has no relay and no
+ * intercept): the role comes from the SAME cached `client-config` probe the
+ * share parts use — a definite 'client' or 'peer' starts reporting (PG-9:
+ * a peer mounts the same remote sessions), a 'host' never reports, and an
+ * undecided probe re-asks on each tick (once it lands the answer is stable
+ * for the process's lifetime).
  */
 import { CURRENT_SESSION_STORAGE_KEY, currentSessionReportEquals, parseCurrentSessionStorage } from '../client-data/current-session.ts'
 import type { CurrentSessionReport } from '../client-data/current-session.ts'
@@ -57,7 +58,7 @@ export interface CurrentSessionReporterOptions {
   /** Outbound POST transport. Default: the page's fetch. */
   fetchImpl?: (url: string, init: RequestInit) => Promise<unknown>
   /** The role probe. Default: the shared cached client-config probe. */
-  probeRole?: () => Promise<'host' | 'client' | undefined>
+  probeRole?: () => Promise<'host' | 'client' | 'peer' | undefined>
   /** POST target. Default: the current-session route. */
   route?: string
   /** The re-check interval; default 1000ms. */
@@ -117,7 +118,7 @@ export function startCurrentSessionReporter(options: CurrentSessionReporterOptio
   let lastReportedLang: 'zh' | 'en' | undefined
   let lastSentAt = 0
   const resendEveryMs = options.resendIntervalMs ?? RESEND_INTERVAL_MS
-  let role: 'host' | 'client' | undefined
+  let role: 'host' | 'client' | 'peer' | undefined
   let inFlight = false
 
   const tick = async (): Promise<void> => {
@@ -127,7 +128,9 @@ export function startCurrentSessionReporter(options: CurrentSessionReporterOptio
       // definite answer is stable for the page's life.
       if (answer !== undefined) role = answer
     }
-    if (role !== 'client') return
+    // A peer mounts the same remote sessions as a client — its zr~ panel
+    // switches must reach the route too (PG-9-fix). Only a host idles.
+    if (role !== 'client' && role !== 'peer') return
     const report = parseCurrentSessionStorage(readRaw())
     if (report.kind === 'unavailable') return
     const lang = readLang()

@@ -20,8 +20,9 @@
  * only fight the host. A DOM that does not match the expected shape (no
  * row, no `aria-expanded`) is skipped silently.
  *
- * Runs only in the CLIENT role, via the SAME cached client-config probe as
- * the current-session reporter (T62) — a host has no server groups. The
+ * Runs only in the CLIENT and PEER roles (PG-9: a peer mounts the same
+ * server groups), via the SAME cached client-config probe as the
+ * current-session reporter (T62) — a host has no server groups. The
  * tick cadence is its own 1s interval (the shared shape, not a shared
  * timer): the restore must land right after the workspace list merges,
  * whenever that happens.
@@ -70,7 +71,7 @@ export interface RemoteGroupExpansionKeeperOptions {
    * broken or absent one makes every tick a no-op. */
   storage?: StorageLike
   /** The role probe. Default: the shared cached client-config probe. */
-  probeRole?: () => Promise<'host' | 'client' | undefined>
+  probeRole?: () => Promise<'host' | 'client' | 'peer' | undefined>
   /** The sidebar's server group rows. Default: the real DOM query — rows
    * without a readable `aria-expanded` are skipped. Tests inject fake rows
    * with click recorders. */
@@ -105,7 +106,7 @@ export function startRemoteGroupExpansionKeeper(options: RemoteGroupExpansionKee
     return out
   })
 
-  let role: 'host' | 'client' | undefined
+  let role: 'host' | 'client' | 'peer' | undefined
   // One auto-click per group per page load, ever — not per tick. (T66: a
   // group whose ROW disappears has its marker dropped — see the tick.)
   const clickedOnce = new Set<string>()
@@ -137,7 +138,10 @@ export function startRemoteGroupExpansionKeeper(options: RemoteGroupExpansionKee
       // definite answer is stable for the page's life.
       if (answer !== undefined) role = answer
     }
-    if (role !== 'client') return
+    // A peer mounts the same zr~ server groups as a client — the host's
+    // purge kills the expansion record there too (PG-9-fix). Only a host
+    // (no server groups) idles.
+    if (role !== 'client' && role !== 'peer') return
     const storage = readStorage()
     if (storage === undefined) return
     // A malformed value on either side degrades to an empty record (the
