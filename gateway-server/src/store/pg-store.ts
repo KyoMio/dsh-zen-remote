@@ -417,6 +417,18 @@ export class PgStore implements GatewayStore {
     return rows.map((row) => mapNetworkRow(row as Row));
   }
 
+  async listPublicNetworks(): Promise<Array<{ id: string; name: string; admissionMode: AdmissionMode }>> {
+    const { rows } = await this.query(
+      'SELECT n.id, n.name, n.admission_mode FROM networks n JOIN users u ON u.id = n.owner_id WHERE u.active = TRUE ORDER BY n.created_at, n.id',
+      [],
+    );
+    return rows.map((row) => ({
+      id: str((row as Row).id),
+      name: str((row as Row).name),
+      admissionMode: str((row as Row).admission_mode) as AdmissionMode,
+    }));
+  }
+
   async getNetwork(id: string): Promise<NetworkRecord | null> {
     const { rows } = await this.query('SELECT * FROM networks WHERE id = $1', [id]);
     return rows.length > 0 ? mapNetworkRow(rows[0] as Row) : null;

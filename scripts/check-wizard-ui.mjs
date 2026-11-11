@@ -529,11 +529,16 @@ const WIZARD_KEYS = [
   // is 节点端 (Peer Node), the paths are 局域网直连 / 直连 / 经网关中转, a
   // key change is 身份异常 / 信任新身份, the invite is 邀请链接.
   'wizard.role.peer', 'wizard.role.peerDesc', 'wizard.role.peerPickNote',
+  'wizard.peer.modeInvite', 'wizard.peer.modeGateway',
   'wizard.peer.inviteUri', 'wizard.peer.inviteUriHint', 'wizard.peer.inviteUriPlaceholder',
+  'wizard.peer.gatewayUrl', 'wizard.peer.gatewayUrlHint', 'wizard.peer.gatewayUrlPlaceholder',
+  'wizard.peer.selectNetwork', 'wizard.peer.selectNetworkHint', 'wizard.peer.requestJoin',
   'wizard.peer.join', 'wizard.peer.joining', 'wizard.peer.rejoin', 'wizard.peer.leave',
   'wizard.peer.leaveConfirm',
   'wizard.peer.lightIdentity', 'wizard.peer.lightAdmission', 'wizard.peer.lightDiscovery',
   'wizard.peer.pendingApproval', 'wizard.peer.joinFailed', 'wizard.peer.joinInvalid',
+  'wizard.peer.joinGatewayInvalid', 'wizard.peer.joinGatewayUnreachable',
+  'wizard.peer.joinNoNetwork', 'wizard.peer.joinManualDisabled',
   'wizard.peer.connecting', 'wizard.peer.offline', 'wizard.peer.revoked', 'wizard.peer.mismatch',
   'wizard.peer.notJoined',
   'wizard.overview.peerNodeLabel', 'wizard.overview.peerNetworkLabel', 'wizard.overview.peerNetworkNone',

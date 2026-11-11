@@ -35,6 +35,7 @@ import type { LogRingEntry } from './log-ring.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js'
+import { buildKeylessInviteUri, isLoopbackOrPrivateHostname, parseGatewayJoinInput } from './peer/crypto.js'
 import type { PeerEngine } from './peer/engine.js'
 import type { PeerMemberPath, PeerMemberState } from './peer/engine.js'
 import { responseJson, sameOriginPost } from './http.js'
@@ -1389,14 +1390,139 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           }
           const body = await readJsonBody(req)
           if (route === CLIENT_PEER_JOIN_ROUTE) {
-            const inviteUri = body.inviteUri
-            if (typeof inviteUri !== 'string' || inviteUri.trim() === '') {
-              responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'inviteUri (non-empty string) is required' } })
+            const rawInput = (stringOrEmpty(body.inviteUri) || stringOrEmpty(body.gatewayUrl)).trim()
+            const requestedNetworkId = stringOrEmpty(body.networkId).trim().toLowerCase()
+            if (rawInput === '') {
+              responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'inviteUri or gatewayUrl (non-empty string) is required' } })
               return
             }
-            const outcome = await engine.joinNetwork(inviteUri)
+            if (/^zr-net/i.test(rawInput)) {
+              const outcome = await engine.joinNetwork(rawInput)
+              if (outcome.ok) {
+                responseJson(res, 200, { ok: true })
+              } else {
+                responseJson(res, 400, { ok: false, error: { code: outcome.code } })
+              }
+              return
+            }
+            const parsed = parseGatewayJoinInput(rawInput)
+            if (parsed === null || parsed.kind === 'invite') {
+              responseJson(res, 400, { ok: false, error: { code: 'invalid-invite' } })
+              return
+            }
+
+            // Keyless manual-approval join by gateway address: discover joinable
+            // networks on `/peer/v1/networks`, then dial without `#joinKey` so
+            // the node lands in `pending` on the gateway console.
+            const candidates: Array<{ tls: boolean; origin: string }> =
+              parsed.schemeMode === 'https'
+                ? [{ tls: true, origin: `https://${parsed.rawHost}:${parsed.port}` }]
+                : parsed.schemeMode === 'http'
+                  ? [{ tls: false, origin: `http://${parsed.rawHost}:${parsed.port}` }]
+                  : isLoopbackOrPrivateHostname(parsed.hostname)
+                    ? [{ tls: false, origin: `http://${parsed.rawHost}:${parsed.port}` }]
+                    : parsed.port === 443
+                      ? [{ tls: true, origin: `https://${parsed.rawHost}:${parsed.port}` }]
+                      : [
+                          { tls: true, origin: `https://${parsed.rawHost}:${parsed.port}` },
+                          { tls: false, origin: `http://${parsed.rawHost}:${parsed.port}` },
+                        ]
+
+            let discovered: {
+              tls: boolean
+              networks: Array<{ id: string; name: string }>
+              totalNetworks: number
+            } | null = null
+
+            for (const candidate of candidates) {
+              try {
+                const probeRes = await fetchImpl(`${candidate.origin}/peer/v1/networks`, {
+                  method: 'GET',
+                  redirect: 'manual',
+                  signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
+                })
+                if (probeRes.status !== 200) continue
+                const rawJson = JSON.parse(await probeRes.text()) as Record<string, unknown>
+                if (rawJson === null || typeof rawJson !== 'object') continue
+                const payloadObj =
+                  rawJson.ok === true && rawJson.data !== null && typeof rawJson.data === 'object' && !Array.isArray(rawJson.data)
+                    ? (rawJson.data as Record<string, unknown>)
+                    : rawJson
+                if (!Array.isArray(payloadObj.networks)) continue
+                const networks: Array<{ id: string; name: string }> = []
+                let malformed = false
+                for (const item of payloadObj.networks) {
+                  if (
+                    item === null
+                    || typeof item !== 'object'
+                    || typeof (item as { id?: unknown }).id !== 'string'
+                    || !/^[0-9a-f]{16}$/i.test((item as { id: string }).id)
+                    || typeof (item as { name?: unknown }).name !== 'string'
+                  ) {
+                    malformed = true
+                    break
+                  }
+                  networks.push({
+                    id: (item as { id: string }).id.toLowerCase(),
+                    name: (item as { name: string }).name,
+                  })
+                }
+                if (malformed) continue
+                const totalNetworks =
+                  typeof payloadObj.totalNetworks === 'number' && Number.isFinite(payloadObj.totalNetworks)
+                    ? payloadObj.totalNetworks
+                    : networks.length
+                discovered = { tls: candidate.tls, networks, totalNetworks }
+                break
+              } catch {
+                // Try next scheme candidate if available.
+              }
+            }
+
+            if (discovered === null) {
+              responseJson(res, 502, { ok: false, error: { code: 'gateway-unreachable' } })
+              return
+            }
+
+            const explicitNetId = requestedNetworkId !== '' ? requestedNetworkId : (parsed.networkId ?? '')
+            let targetNetworkId: string
+            if (explicitNetId !== '') {
+              if (!/^[0-9a-f]{16}$/.test(explicitNetId)) {
+                responseJson(res, 400, { ok: false, error: { code: 'invalid-invite' } })
+                return
+              }
+              const matched = discovered.networks.find((n) => n.id === explicitNetId)
+              if (!matched) {
+                const code = discovered.totalNetworks > discovered.networks.length ? 'manual-disabled' : 'no-network'
+                responseJson(res, 400, { ok: false, error: { code } })
+                return
+              }
+              targetNetworkId = matched.id
+            } else if (discovered.networks.length === 1) {
+              targetNetworkId = discovered.networks[0].id
+            } else if (discovered.networks.length > 1) {
+              responseJson(res, 409, {
+                ok: false,
+                error: { code: 'select-network' },
+                networks: discovered.networks,
+              })
+              return
+            } else {
+              const code = discovered.totalNetworks > 0 ? 'manual-disabled' : 'no-network'
+              responseJson(res, 400, { ok: false, error: { code } })
+              return
+            }
+
+            const synthesizedUri = buildKeylessInviteUri({
+              rawHost: parsed.rawHost,
+              hostname: parsed.hostname,
+              port: parsed.port,
+              tls: discovered.tls,
+              networkId: targetNetworkId,
+            })
+            const outcome = await engine.joinNetwork(synthesizedUri)
             if (outcome.ok) {
-              responseJson(res, 200, { ok: true })
+              responseJson(res, 200, { ok: true, networkId: targetNetworkId, manualApproval: true })
             } else {
               responseJson(res, 400, { ok: false, error: { code: outcome.code } })
             }

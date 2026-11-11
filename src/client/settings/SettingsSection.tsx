@@ -46,6 +46,8 @@ import {
   CLIENT_CLAIM_ROUTE,
   CLIENT_CONFIG_ROUTE,
   CLIENT_DEBUG_REPORT_ROUTE,
+  CLIENT_PEER_JOIN_ROUTE,
+  CLIENT_PEER_LEAVE_ROUTE,
   CLIENT_PEER_REPROBE_ROUTE,
   CLIENT_PEER_STATUS_ROUTE,
   CLIENT_PEER_TOGGLE_MOUNT_ROUTE,
@@ -570,6 +572,12 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   const [peerView, setPeerView] = useState<PeerStatusView | undefined>()
   const [peerBusyNode, setPeerBusyNode] = useState<string | null>(null)
   const [peerActionFailed, setPeerActionFailed] = useState(false)
+  const [peerJoinMode, setPeerJoinMode] = useState<'invite' | 'gateway'>('invite')
+  const [peerJoinInput, setPeerJoinInput] = useState('')
+  const [peerCandidateNetworks, setPeerCandidateNetworks] = useState<readonly { id: string; name: string }[]>([])
+  const [peerSelectedNetId, setPeerSelectedNetId] = useState('')
+  const [peerJoinBusy, setPeerJoinBusy] = useState(false)
+  const [peerJoinFail, setPeerJoinFail] = useState<string | null>(null)
   // One latest-wins ticket stream dedicated to the peer poll.
   const peerStatusTicket = useMemo(createLatestGate, [])
   const loadPeerStatus = useCallback(() => {
@@ -611,6 +619,48 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       setPeerBusyNode(null)
     }
     loadPeerStatus()
+  }
+
+  const runSettingsPeerJoin = async (): Promise<void> => {
+    setPeerJoinFail(null)
+    const raw = peerJoinInput.trim()
+    if (raw === '') {
+      setPeerJoinFail(peerJoinMode === 'gateway' ? 'invalid-gateway' : 'invalid-invite')
+      return
+    }
+    setPeerJoinBusy(true)
+    try {
+      const payload = peerJoinMode === 'gateway'
+        ? { gatewayUrl: raw, ...(peerSelectedNetId !== '' ? { networkId: peerSelectedNetId } : {}) }
+        : { inviteUri: raw }
+      const res = await fetch(CLIENT_PEER_JOIN_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const body = (await res.json().catch(() => ({}))) as {
+        ok?: boolean
+        error?: { code?: string }
+        networks?: Array<{ id: string; name: string }>
+      }
+      if (res.ok && body.ok === true) {
+        setPeerJoinInput('')
+        setPeerCandidateNetworks([])
+        setPeerSelectedNetId('')
+        loadPeerStatus()
+      } else if (body?.error?.code === 'select-network' && Array.isArray(body.networks) && body.networks.length > 0) {
+        setPeerJoinMode('gateway')
+        setPeerCandidateNetworks(body.networks)
+        setPeerSelectedNetId(body.networks[0]?.id ?? '')
+      } else {
+        const code = body?.error?.code ?? 'unexpected'
+        setPeerJoinFail(code === 'invalid-invite' && peerJoinMode === 'gateway' ? 'invalid-gateway' : code)
+      }
+    } catch {
+      setPeerJoinFail('unexpected')
+    } finally {
+      setPeerJoinBusy(false)
+    }
   }
 
   // The plugin bridge's registered-plugin listing (PB-5), host page only:
@@ -1411,10 +1461,125 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   <Button variant="ghost" size="sm" disabled={peerBusyNode !== null} onClick={() => { void runPeerNodeAction(CLIENT_PEER_REPROBE_ROUTE, 'all', {}) }}>
                     {t('wizard.devicesModal.retest')}
                   </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={peerBusyNode !== null}
+                    onClick={() => {
+                      if (!window.confirm(t('wizard.peer.leaveConfirm'))) return
+                      void runPeerNodeAction(CLIENT_PEER_LEAVE_ROUTE, 'leave', {})
+                    }}
+                  >
+                    {t('wizard.peer.leave')}
+                  </Button>
                 </div>
               </div>
             </>
           )}
+
+          <div className="zr-settings-field" style={{ paddingTop: 4 }}>
+            <div className="zr-settings-role-cards" style={{ paddingBottom: 8 }}>
+              <label className="zr-settings-role-card" data-active={peerJoinMode === 'invite' ? 'true' : undefined}>
+                <span className="zr-settings-role-card-title">
+                  <input
+                    type="radio"
+                    name="zr-settings-peer-join-mode"
+                    checked={peerJoinMode === 'invite'}
+                    onChange={() => {
+                      setPeerJoinMode('invite')
+                      setPeerJoinFail(null)
+                    }}
+                  />
+                  {t('wizard.peer.modeInvite')}
+                </span>
+              </label>
+              <label className="zr-settings-role-card" data-active={peerJoinMode === 'gateway' ? 'true' : undefined}>
+                <span className="zr-settings-role-card-title">
+                  <input
+                    type="radio"
+                    name="zr-settings-peer-join-mode"
+                    checked={peerJoinMode === 'gateway'}
+                    onChange={() => {
+                      setPeerJoinMode('gateway')
+                      setPeerJoinFail(null)
+                    }}
+                  />
+                  {t('wizard.peer.modeGateway')}
+                </span>
+              </label>
+            </div>
+            <div className="zr-settings-head">
+              <label htmlFor="zr-settings-peer-input">
+                {peerJoinMode === 'gateway' ? t('wizard.peer.gatewayUrl') : t('wizard.peer.inviteUri')}
+              </label>
+            </div>
+            <input
+              id="zr-settings-peer-input"
+              className="zr-settings-input"
+              type="text"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={peerJoinMode === 'gateway' ? t('wizard.peer.gatewayUrlPlaceholder') : t('wizard.peer.inviteUriPlaceholder')}
+              value={peerJoinInput}
+              disabled={peerJoinBusy}
+              onChange={(e) => {
+                setPeerJoinInput(e.currentTarget.value)
+                setPeerCandidateNetworks([])
+                setPeerSelectedNetId('')
+                if (peerJoinFail !== null) setPeerJoinFail(null)
+              }}
+            />
+            <p className="zr-settings-hint">
+              {peerJoinMode === 'gateway' ? t('wizard.peer.gatewayUrlHint') : t('wizard.peer.inviteUriHint')}
+            </p>
+            {peerJoinMode === 'gateway' && peerCandidateNetworks.length > 1 && (
+              <div style={{ paddingTop: 8 }}>
+                <div className="zr-settings-head">
+                  <label htmlFor="zr-settings-peer-net">{t('wizard.peer.selectNetwork')}</label>
+                </div>
+                <select
+                  id="zr-settings-peer-net"
+                  className="zr-settings-input"
+                  disabled={peerJoinBusy}
+                  value={peerSelectedNetId}
+                  onChange={(e) => setPeerSelectedNetId(e.currentTarget.value)}
+                >
+                  {peerCandidateNetworks.map((net) => (
+                    <option key={net.id} value={net.id}>
+                      {net.name} ({net.id})
+                    </option>
+                  ))}
+                </select>
+                <p className="zr-settings-hint">{t('wizard.peer.selectNetworkHint')}</p>
+              </div>
+            )}
+            <div className="zr-settings-row" style={{ paddingTop: 8, paddingBottom: 8 }}>
+              <Button variant="outline" size="sm" disabled={peerJoinBusy} onClick={() => { void runSettingsPeerJoin() }}>
+                {peerJoinBusy
+                  ? t('wizard.peer.joining')
+                  : peerJoinMode === 'gateway'
+                    ? t('wizard.peer.requestJoin')
+                    : peerView?.configured
+                      ? t('wizard.peer.rejoin')
+                      : t('wizard.peer.join')}
+              </Button>
+              {peerJoinFail !== null && (
+                <span className="zr-settings-hint" data-invalid="true">
+                  {peerJoinFail === 'invalid-invite'
+                    ? t('wizard.peer.joinInvalid')
+                    : peerJoinFail === 'invalid-gateway'
+                      ? t('wizard.peer.joinGatewayInvalid')
+                      : peerJoinFail === 'gateway-unreachable'
+                        ? t('wizard.peer.joinGatewayUnreachable')
+                        : peerJoinFail === 'no-network'
+                          ? t('wizard.peer.joinNoNetwork')
+                          : peerJoinFail === 'manual-disabled'
+                            ? t('wizard.peer.joinManualDisabled')
+                            : t('wizard.peer.joinFailed', { reason: peerJoinFail })}
+                </span>
+              )}
+            </div>
+          </div>
         </div>
       )}
 

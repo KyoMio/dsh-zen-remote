@@ -928,4 +928,62 @@ describe('publicUrl 主机与运行时统计注入（独立实例）', () => {
     assert.equal(adminRow.onlineDevices, 0);
     assert.equal(adminRow.relayKbps, 0);
   });
+
+  test('GET /peer/v1/networks：免登录仅返回可人工审批（both/manual）活跃租户网络，零敏感字段', async () => {
+    await api(handle.base, 'POST', '/api/v1/networks', {
+      cookie: tenantCookie,
+      body: { name: 'key-only-net', admissionMode: 'key' },
+    });
+    const manualRes = await api(handle.base, 'POST', '/api/v1/networks', {
+      cookie: adminCookie,
+      body: { name: 'manual-net', admissionMode: 'manual' },
+    });
+    assert.equal(manualRes.status, 200);
+
+    const pub = await api(handle.base, 'GET', '/peer/v1/networks');
+    assert.equal(pub.status, 200);
+    assert.equal(pub.json.ok, true);
+    assert.equal(pub.json.data.totalNetworks, 3);
+    assert.deepEqual(
+      pub.json.data.networks.map((n) => n.name),
+      ['via-public-url', 'manual-net'],
+    );
+    for (const row of pub.json.data.networks) {
+      assert.deepEqual(Object.keys(row).sort(), ['id', 'name']);
+    }
+  });
+});
+
+describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口反代）', () => {
+  test('公网 IP 跑明文 http:// 时 joinUri 发出 zr-net+insecure://，避免节点端误连 wss://', async () => {
+    const h = await startServer({ publicUrl: 'http://203.0.113.10:19393' });
+    try {
+      await seedUsers(h.store);
+      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'http-public' } });
+      assert.equal(res.status, 200);
+      assert.equal(
+        res.json.data.joinUri,
+        `zr-net+insecure://203.0.113.10:19393/${res.json.data.id}#${res.json.data.joinKey}`,
+      );
+    } finally {
+      await stopServer(h);
+    }
+  });
+
+  test('https:// 反代未显式带端口时自动补 :443，防止节点端回落默认 19393', async () => {
+    const h = await startServer({ publicUrl: 'https://zr.example.com' });
+    try {
+      await seedUsers(h.store);
+      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'https-proxy' } });
+      assert.equal(res.status, 200);
+      assert.equal(
+        res.json.data.joinUri,
+        `zr-net://zr.example.com:443/${res.json.data.id}#${res.json.data.joinKey}`,
+      );
+    } finally {
+      await stopServer(h);
+    }
+  });
 });

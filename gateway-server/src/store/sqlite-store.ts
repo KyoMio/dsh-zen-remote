@@ -374,6 +374,19 @@ export class SqliteStore implements GatewayStore {
     return rows.map(mapNetworkRow);
   }
 
+  async listPublicNetworks(): Promise<Array<{ id: string; name: string; admissionMode: AdmissionMode }>> {
+    const rows = this.db
+      .prepare(
+        'SELECT n.id, n.name, n.admission_mode FROM networks n JOIN users u ON u.id = n.owner_id WHERE u.active = 1 ORDER BY n.created_at, n.id',
+      )
+      .all() as Row[];
+    return rows.map((row) => ({
+      id: str(row.id),
+      name: str(row.name),
+      admissionMode: str(row.admission_mode) as AdmissionMode,
+    }));
+  }
+
   async getNetwork(id: string): Promise<NetworkRecord | null> {
     const row = this.getNetworkRow(id);
     return row === undefined ? null : mapNetworkRow(row);

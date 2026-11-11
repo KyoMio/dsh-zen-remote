@@ -283,6 +283,13 @@ export interface CreateNetworkInput {
   maxPeers: number;
 }
 
+/** 节点端按网关地址发现网络时的最小公开摘要（不含 joinKeyEnc、不含 ownerId） */
+export interface PublicNetworkSummary {
+  id: string;
+  name: string;
+  admissionMode: AdmissionMode;
+}
+
 export interface GatewayStore {
   // 系统动态设置
   getSettings(): Promise<SystemSettings>;
@@ -308,6 +315,8 @@ export interface GatewayStore {
   /** 普通租户建网数超过系统 maxNetworksPerUser 时抛 quota-exceeded；admin 不受限 */
   createNetwork(input: CreateNetworkInput): Promise<NetworkRecord>;
   listNetworksByOwner(ownerId: string): Promise<NetworkRecord[]>;
+  /** 活跃账号名下的网络公开摘要（供节点端按网关地址发现并申请人工审批入网） */
+  listPublicNetworks(): Promise<PublicNetworkSummary[]>;
   getNetwork(id: string): Promise<NetworkRecord | null>;
   updateNetwork(id: string, patch: NetworkPatch): Promise<NetworkRecord | null>;
   rotateNetworkJoinKey(id: string, newJoinKeyEnc: string): Promise<void>;

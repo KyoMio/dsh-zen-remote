@@ -15,6 +15,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { copyTextToClipboard } from '../clipboard.ts'
 
 export interface WizardCardProps {
   title: string
@@ -47,14 +48,10 @@ export function WizardCard({ title, children, copyText, copyLabel, copiedLabel, 
 
   const copy = async (): Promise<void> => {
     if (copyText === undefined || copyText === null || copyText === '') return
-    try {
-      await navigator.clipboard.writeText(copyText)
+    if (await copyTextToClipboard(copyText)) {
       setCopied(true)
       if (copiedTimer.current !== undefined) clearTimeout(copiedTimer.current)
       copiedTimer.current = setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Clipboard denial (permissions, non-secure context): the snippet is
-      // selectable text anyway.
     }
   }
 

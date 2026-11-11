@@ -645,12 +645,44 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     return mux
   }
 
+  const resetActiveSession = (): void => {
+    for (const member of [...members.values()]) {
+      unmountPeer(member)
+      mux?.dropSession(member.nodeId)
+    }
+    members.clear()
+    if (wsReconnectTimer !== null) {
+      clock.clearTimeout(wsReconnectTimer)
+      wsReconnectTimer = null
+    }
+    if (pathReportTimer !== null) {
+      clock.clearTimeout(pathReportTimer)
+      pathReportTimer = null
+    }
+    if (pathReportArmed.timer !== null) {
+      clock.clearTimeout(pathReportArmed.timer)
+      pathReportArmed.timer = null
+    }
+    wsReconnectable = false
+    try { ws?.close() } catch { /* dying */ }
+    ws = null
+    mux?.close()
+    mux = null
+    punch?.close()
+    punch = null
+    stunProbed = false
+    natType = null
+    maxPeers = null
+  }
+
   return {
     async joinNetwork(invite) {
       if (stopped) return { ok: false, code: 'stopped' }
       const parsed = parseInviteUri(invite)
       if (parsed === null) return { ok: false, code: 'invalid-invite' }
       const existing = readPeerNetwork(stateFile)
+      // 切换网络或重填地址重新入网时，先拆掉上一轮挂起/在线的 WS、mux 与打洞器。
+      resetActiveSession()
       writePeerNetwork(stateFile, {
         inviteUri: invite,
         gatewayWsUrl: parsed.wsUrl,
