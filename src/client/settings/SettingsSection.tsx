@@ -463,6 +463,16 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   // MS-7: the paired-server pool, in pairing order (empty on a legacy body),
   // and the cap the counters and the red alert read.
   const serverRows: readonly ClientServerView[] = clientView?.servers ?? []
+  // #56: the 立即重连 entries key off the REAL offline state, never the
+  // presence of a scheduled retry — the ladder can legitimately sit
+  // offline with no timer armed (a handshake a retry joined just died),
+  // and gating on nextRetryAt disabled every manual entrance in exactly
+  // that state. View 'unreachable' is the wire 'offline' (T55 alias);
+  // online / connecting / unpaired / revoked / incompatible stay closed,
+  // matching the route's offline-only contract.
+  const entryReconnectable = (server: ClientServerView): boolean => server.state === 'unreachable'
+  const anyReconnectable = clientView !== undefined
+    && (serverRows.length > 0 ? serverRows.some(entryReconnectable) : clientView.state === 'unreachable')
   const maxServers = clientView?.maxServers ?? MAX_PAIRED_SERVERS
   // RD-3: the remote drop guard's browser-side counters, read at render
   // time — no snapshot state of its own: the initial mount, the 15s
@@ -1579,7 +1589,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   <Button
                     variant="ghost"
                     size="sm"
-                    disabled={entryBusy !== null || server.nextRetryAt === undefined}
+                    disabled={entryBusy !== null || !entryReconnectable(server)}
                     onClick={() => { void runEntryReconnect(server.entryId) }}
                   >
                     {entryBusy === server.entryId ? t('settings.client.reconnectBusy') : t('settings.client.reconnect')}
@@ -1608,14 +1618,14 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
             <p className="zr-settings-status-line" style={{ flex: 1 }} data-down={clientView !== undefined && (clientView.state === 'unreachable' || clientView.state === 'unexpected' || clientView.state === 'revoked' || clientView.state === 'invalid-url' || clientView.state === 'incompatible') ? 'true' : undefined}>
               {clientView === undefined ? '' : clientStatusText(clientView, now, t)}
             </p>
-            {/* T43 立即重连: the response carrying a nextRetryAt is the one
-                honest "the relay is offline with a retry armed" signal — the
-                probe word underneath may be unreachable or unexpected; the
-                route 409s anything else anyway (T43-fix). */}
+            {/* T43 立即重连（#56 重订资格）：按钮看真实 offline 状态
+                （'unreachable' = wire 'offline'），不再要求 nextRetryAt ——
+                梯子可能恰好没有计时器在排（刚加入的握手死掉），那正是
+                最需要手动入口的时刻；路由对非 offline 本就 409。 */}
             <Button
               variant="outline"
               size="sm"
-              disabled={clientView === undefined || clientView.nextRetryAt === undefined || reconnectBusy}
+              disabled={clientView === undefined || !anyReconnectable || reconnectBusy}
               onClick={() => { void runReconnect() }}
             >
               {reconnectBusy ? t('settings.client.reconnectBusy') : t('settings.client.reconnect')}
