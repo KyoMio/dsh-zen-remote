@@ -1293,6 +1293,110 @@ test('T43-fix: concurrent connects while a retry is armed join into ONE handshak
   } finally { await relay.stop() }
 })
 
+// ---- #56: a joiner's failure must re-arm the ladder -----------------------------
+//
+// The killer timeline: a fired retry's connect() JOINED an in-flight
+// handshake (the connectInFlight dedupe), and a concurrent business
+// request's transport failure moved the state back to 'offline' while that
+// handshake was still on the wire. When the joined handshake then dies,
+// the catch's 'connecting' restore never runs — without the settle-time
+// scheduleRetry, NOTHING re-arms the ladder and the client sits offline
+// forever with nextRetryAt=null (and the settings page's old
+// nextRetryAt-keyed buttons left no manual way back).
+
+test('#56: a retry that joined an in-flight handshake re-arms the ladder when it dies offline', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  const { client, setUrl } = makeClient(relay.port, { clock })
+  const deadUrl = `http://127.0.0.1:${await deadPort()}`
+  try {
+    await client.connect()
+    assert.equal(client.state, 'online')
+
+    // Request A dies on transport -> offline, T1 armed (1s).
+    setUrl(deadUrl)
+    await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
+    assert.equal(client.nextRetryAt, clock.now() + 1000)
+
+    // T1 fires: the handshake STALLS on the wire, state 'connecting'.
+    let killStalled = () => {}
+    relay.scenario.handshake = (req, res) => {
+      killStalled = () => { try { res.destroy() } catch { /* gone */ } }
+      return undefined // never answers on its own
+    }
+    setUrl(`http://127.0.0.1:${relay.port}`)
+    clock.advance(1000)
+    await waitFor(() => handshakeHits(relay) === 2)
+    assert.equal(client.state, 'connecting')
+
+    // Request B dies on transport while the handshake is in flight -> back
+    // to offline, T2 armed (2s).
+    setUrl(deadUrl)
+    await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
+    assert.equal(client.nextRetryAt, clock.now() + 2000)
+
+    // T2 fires and JOINS the stalled handshake — no new wire attempt.
+    clock.advance(2000)
+    await sleep(30)
+    assert.equal(handshakeHits(relay), 2, 'the fired retry joined the in-flight handshake')
+    assert.equal(client.state, 'offline')
+
+    // The joined handshake dies: the settle must re-arm the ladder (step 3
+    // = 5s — A and B already walked steps 1 and 2).
+    killStalled()
+    await waitFor(() => client.nextRetryAt !== null && clock.pending === 1)
+    assert.equal(client.state, 'offline')
+    assert.equal(client.nextRetryAt, clock.now() + 5000, 'the settle re-armed the next ladder step')
+
+    // And the ladder keeps walking: the next fired attempt is a REAL new
+    // handshake whose own failure re-arms 10s the ordinary way.
+    relay.scenario.handshake = OFFLINE_502
+    setUrl(`http://127.0.0.1:${relay.port}`)
+    clock.advance(client.nextRetryAt - clock.now())
+    await waitFor(() => handshakeHits(relay) === 3 && clock.pending === 1)
+    assert.equal(client.state, 'offline')
+    assert.equal(client.nextRetryAt, clock.now() + 10000, 'the ladder is alive again')
+  } finally { await relay.stop() }
+})
+
+test('#56: a manual reconnect that joined an in-flight handshake re-arms the ladder too', async () => {
+  const relay = await startFakeRelay()
+  const clock = fakeClock()
+  const { client, setUrl } = makeClient(relay.port, { clock })
+  const deadUrl = `http://127.0.0.1:${await deadPort()}`
+  try {
+    await client.connect()
+
+    // Offline with the stalled handshake in flight, exactly like the test
+    // above (A dies -> T1 fires -> handshake #2 stalls; B dies -> offline).
+    setUrl(deadUrl)
+    await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
+    let killStalled = () => {}
+    relay.scenario.handshake = (req, res) => {
+      killStalled = () => { try { res.destroy() } catch { /* gone */ } }
+      return undefined
+    }
+    setUrl(`http://127.0.0.1:${relay.port}`)
+    clock.advance(1000)
+    await waitFor(() => handshakeHits(relay) === 2)
+    setUrl(deadUrl)
+    await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
+
+    // The user's 立即重连 cancels the armed wait and JOINS the stalled
+    // handshake — its death must re-arm the ladder all the same.
+    assert.equal(client.reconnect(), true)
+    await sleep(30)
+    assert.equal(handshakeHits(relay), 2, 'the manual reconnect joined the in-flight handshake')
+    assert.equal(client.state, 'offline')
+    killStalled()
+    await waitFor(() => client.nextRetryAt !== null && clock.pending === 1)
+    // reconnect() reset the ladder to step 1 (its cancelRetry zeroes the
+    // attempt count) BEFORE joining — the settle arms the FIRST wait, the
+    // documented "manual attempt, fresh ladder" semantics.
+    assert.equal(client.nextRetryAt, clock.now() + 1000, 'the manual joiner\'s settle re-armed the ladder at step 1')
+  } finally { await relay.stop() }
+})
+
 // ---- interface compatibility (T42) --------------------------------------------
 
 test('compat: matching fingerprints compare identical; differing groups are named', async () => {
