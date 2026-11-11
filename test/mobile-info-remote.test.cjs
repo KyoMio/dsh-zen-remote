@@ -78,6 +78,7 @@ test('T67 view: the gate — client role, unanswered table, subagent session all
   assert.equal(shareCardRemoteView({ ...base, role: 'unknown' }).visible, false, 'an unwired role renders nothing')
   assert.equal(shareCardRemoteView({ ...base, ready: false }).visible, false, 'never answered → nothing')
   assert.equal(shareCardRemoteView({ ...base, subagent: true }).visible, false, 'the server refuses to share a subagent alone')
+  assert.equal(shareCardRemoteView({ ...base, sessionId: 'zr~abcd1234~session-1' }).visible, false, 'a virtual remote session in peer mode never shows a second host share control')
 })
 
 // -- the component's wiring (textual: .tsx has no Node harness) ---------------

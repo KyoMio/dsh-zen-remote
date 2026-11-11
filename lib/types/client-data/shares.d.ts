@@ -132,6 +132,7 @@ export interface ShareCardRemoteView {
  * ever colored that state, it never had copy for it).
  */
 export declare function shareCardRemoteView(args: {
+    sessionId?: string | undefined;
     ready: boolean;
     role: SharesSnapshot['role'];
     subagent: boolean;

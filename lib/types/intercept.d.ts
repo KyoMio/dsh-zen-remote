@@ -390,6 +390,18 @@ export interface InterceptHandle {
         sessionId: string;
     } | undefined;
 }
+/**
+ * Execute `fn` while bypassing {@link installIntercept} on this process's
+ * `typertGateway` so server-side handlers (`relayHandler`, `admin-routes`) in
+ * dual-role `peer` mode read/mutate ONLY local sessions and never re-enter
+ * outbound merged streams (anti-daisy-chaining + stream-storm prevention).
+ */
+export declare function runWithoutIntercept<T>(fn: () => T): T;
+/**
+ * Build a local-only view over `typertGateway` whose `invoke`, `stream`,
+ * `wireStream.open` and `dispatchEventResult` bypass {@link installIntercept}.
+ */
+export declare function createLocalOnlyGateway<G extends object>(gateway: G): G;
 /** Rewrite one stream frame's session ids to virtual form. */
 export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown;
 /** Rewrite one invoke result's session ids to virtual form. */

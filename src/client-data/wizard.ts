@@ -501,6 +501,7 @@ export interface PeerOverviewSummary {
 export function derivePeerOverviewSummary(
   peers: readonly PeerDeviceView[],
   maxPeers: number,
+  options?: { includeSelf?: boolean },
 ): PeerOverviewSummary {
   let directCount = 0
   let relayCount = 0
@@ -514,14 +515,15 @@ export function derivePeerOverviewSummary(
     else offlineCount += 1
     if (peer.mounted) mountedCount += 1
   }
-  const totalCount = peers.length
+  const peerCount = peers.length
+  const totalCount = peerCount + (options?.includeSelf ? 1 : 0)
   const usable = directCount + relayCount
   const limitReached = totalCount >= maxPeers
   const connectionLight: LightState = mismatchCount > 0
     ? 'fail'
-    : totalCount === 0 || usable === 0
+    : peerCount === 0 || usable === 0
       ? 'pending'
-      : usable === totalCount ? 'pass' : 'pending'
+      : usable === peerCount ? 'pass' : 'pending'
   const devicesLight: LightState = totalCount === 0
     ? 'pending'
     : limitReached || mismatchCount > 0 ? 'fail' : 'pass'

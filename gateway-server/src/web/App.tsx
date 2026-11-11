@@ -297,6 +297,22 @@ export function App() {
     [refreshTopology, refreshNetworks, showToast],
   );
 
+  const handleRenameMember = useCallback(
+    async (networkId: string, nodeId: string, name: string): Promise<void> => {
+      setActionBusy(true);
+      try {
+        await client.patchMember(networkId, nodeId, { name });
+        await refreshTopology(networkId);
+        showToast('toast.saved');
+      } catch {
+        showToast('error.generic');
+      } finally {
+        setActionBusy(false);
+      }
+    },
+    [refreshTopology, showToast],
+  );
+
   const handlePatchNetwork = useCallback(
     async (networkId: string, patch: NetworkPatchInput): Promise<void> => {
       setActionBusy(true);
@@ -469,6 +485,7 @@ export function App() {
             onDeleteNetwork={() => void handleDeleteNetwork(selected.id)}
             onRotateInviteKey={() => void handleRotateInviteKey(selected.id)}
             onMemberAction={(nodeId, action) => void handleMemberAction(selected.id, nodeId, action)}
+            onRenameMember={(nodeId, name) => void handleRenameMember(selected.id, nodeId, name)}
             onRemoveMember={(nodeId) => void handleRemoveMember(selected.id, nodeId)}
           />
         ) : (

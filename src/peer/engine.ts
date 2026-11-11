@@ -126,6 +126,8 @@ export interface PeerEngine {
   leaveNetwork(): void
   setNodeDisabled(nodeId: string, disabled: boolean): void
   trustPeer(nodeId: string): boolean
+  /** 向网关宣告本机最新设备显示名，网关落盘并向同网在线节点广播 `peer-renamed`。 */
+  announceSelfName(name: string): void
   reprobePunch(): void
   status(): PeerEngineStatus
   stop(): void
@@ -286,6 +288,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.publicKeyHex = info.publicKeyHex
     member.state = 'eligible'
     mux.ensureSession(nodeId, info.publicKeyHex, member.name)
+    mux.setPeerName(nodeId, member.name)
+    if (member.mounted) options.relayPool.updateVirtualName(nodeId, member.name)
     mountPeer(member)
     if (info.startPunch && punch !== null) {
       try {
@@ -422,8 +426,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       const status = message['status']
       if (status === 'authorized') {
         gatewayState = 'authorized'
+        const livePeerIds = new Set<string>()
         for (const peer of Array.isArray(message['peers']) ? (message['peers'] as Array<Record<string, unknown>>) : []) {
           if (typeof peer?.nodeId !== 'string' || typeof peer?.publicKeyHex !== 'string') continue
+          const pid = peer.nodeId.toLowerCase()
+          livePeerIds.add(pid)
           announcePeer({
             nodeId: peer.nodeId,
             publicKeyHex: peer.publicKeyHex,
@@ -433,24 +440,33 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
             startPunch: true,
           })
         }
+        // 差集清理：断线期间离网、暂停或被移除的旧设备不再出现在 welcome.peers，
+        // 必须同步卸载并删除虚拟条目，否则会继续占名（-1/-2）并留下删不掉的工作区。
+        for (const existingId of [...members.keys()]) {
+          if (!livePeerIds.has(existingId)) memberGone(existingId)
+        }
         runStunProbeOnce()
         armPathReport()
         schedulePathReport()
-      } else if (status === 'pending') {
-        gatewayState = 'pending-approval'
-      } else if (status === 'mismatch') {
-        gatewayState = 'mismatch'
+      } else {
+        for (const existingId of [...members.keys()]) memberGone(existingId)
+        if (status === 'pending') {
+          gatewayState = 'pending-approval'
+        } else if (status === 'mismatch') {
+          gatewayState = 'mismatch'
+        }
       }
       return
     }
     if (type === 'denied') {
       // 拒绝在握手前后都可能到达（挂起时被踢 / 入网后被暂停）——必须在
       // authorized 闸之前处理，否则挂在 connecting/pending 的连接会把拒绝
-      // 静默吞掉，永远停在旧状态。
+      // 静默吞掉，永远停在旧状态；同时卸载全部已挂载的远端工作区。
       const reason = typeof message['reason'] === 'string' ? message['reason'] : ''
       deniedReason = reason !== '' ? reason : null
       wsReconnectable = false
       gatewayState = reason.includes('paused') ? 'paused' : 'revoked'
+      for (const existingId of [...members.keys()]) memberGone(existingId)
       log(`peer engine: gateway denied (${reason || 'no reason'})`)
       try { ws?.close() } catch { /* dying */ }
       return
@@ -466,6 +482,19 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         reflexiveEndpoint: typeof message['reflexiveEndpoint'] === 'string' ? message['reflexiveEndpoint'] : null,
         startPunch: true,
       })
+      return
+    }
+    if (type === 'peer-renamed') {
+      if (typeof message['nodeId'] !== 'string' || typeof message['name'] !== 'string') return
+      const rid = (message['nodeId'] as string).toLowerCase()
+      const newName = (message['name'] as string).trim()
+      if (newName === '') return
+      const member = members.get(rid)
+      if (member !== undefined) {
+        member.name = newName
+        mux?.setPeerName(rid, newName)
+        options.relayPool.updateVirtualName(rid, newName)
+      }
       return
     }
     if (type === 'peer-left') {
@@ -762,13 +791,35 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     setNodeDisabled(nodeId, disabled) {
       const id = nodeId.toLowerCase()
       setPeerNodeDisabled(stateFile, id, disabled)
+      const member = members.get(id)
       if (disabled) {
-        const member = members.get(id)
         if (member !== undefined) {
           member.state = 'disabled'
+          member.path = 'none'
           unmountPeer(member)
           mux?.dropSession(id)
+          schedulePathReport()
         }
+      } else if (member !== undefined && gatewayState === 'authorized') {
+        announcePeer({
+          nodeId: id,
+          publicKeyHex: member.publicKeyHex,
+          name: member.name,
+          lanEndpoints: member.lastLanEndpoints,
+          reflexiveEndpoint: member.lastReflexive,
+          startPunch: true,
+        })
+        if (member.state === 'eligible') mux?.enableRelayPath(id)
+        schedulePathReport()
+      }
+    },
+
+    announceSelfName(name) {
+      if (stopped) return
+      const trimmed = typeof name === 'string' ? name.trim().slice(0, 64) : ''
+      if (trimmed === '') return
+      if (gatewayState === 'authorized' || gatewayState === 'pending-approval') {
+        sendControl({ type: 'rename', name: trimmed })
       }
     },
 

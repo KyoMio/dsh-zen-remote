@@ -298,6 +298,10 @@ export class PeerWsHub {
       }
       if (conn !== null && conn.state === 'authorized' && message['type'] === 'path-report') {
         this.handlePathReport(conn, message);
+        return;
+      }
+      if (conn !== null && (conn.state === 'authorized' || conn.state === 'hanging') && message['type'] === 'rename') {
+        void this.handleRename(conn, message);
       }
       // 其余类型（含已认证后再发 auth）一律忽略
     });
@@ -470,7 +474,7 @@ export class PeerWsHub {
       ownerId: network.ownerId,
       maxPeers: network.maxPeers,
       publicKeyHex,
-      name,
+      name: member.name ?? name,
       lanEndpoints: parseLanEndpoints(message['lanEndpoints']),
       natType: member.natType,
       reflexive: null,
@@ -550,6 +554,23 @@ export class PeerWsHub {
    * 的对端，总量硬上限 MAX_PATH_REPORTS_PER_NODE。随机伪造的 peerNodeId 在
    * 这里被过滤，内存不随报文放大；内容与旧表一致时不触发 SSE 重渲染。
    */
+  private async handleRename(conn: ConnState, message: Record<string, unknown>): Promise<void> {
+    if (typeof message['name'] !== 'string') return;
+    const trimmed = message['name'].trim();
+    if (trimmed.length < 1 || trimmed.length > 64) return;
+    if (conn.name === trimmed) return;
+    conn.name = trimmed;
+    try {
+      await this.store.updateMemberProfile(conn.networkId, conn.nodeId, { name: trimmed });
+    } catch {
+      return;
+    }
+    if (conn.state === 'authorized') {
+      this.broadcast(conn.networkId, { type: 'peer-renamed', nodeId: conn.nodeId, name: trimmed }, conn.nodeId);
+    }
+    void this.publishTopology(conn.networkId);
+  }
+
   private handlePathReport(conn: ConnState, message: Record<string, unknown>): void {
     const peers = message['peers'];
     if (!Array.isArray(peers)) return;
@@ -684,6 +705,20 @@ export class PeerWsHub {
         if (hang !== undefined) {
           this.killConn(hang, 'removed from network');
         }
+        void this.publishTopology(event.networkId);
+        break;
+      }
+      case 'rename': {
+        const nextName = typeof event.name === 'string' && event.name.trim() !== '' ? event.name.trim() : null;
+        const conn = this.conns.get(event.networkId)?.get(event.nodeId);
+        if (conn !== undefined) {
+          conn.name = nextName;
+          if (nextName !== null) {
+            this.broadcast(event.networkId, { type: 'peer-renamed', nodeId: event.nodeId, name: nextName }, event.nodeId);
+          }
+        }
+        const hang = this.hanging.get(key);
+        if (hang !== undefined) hang.name = nextName;
         void this.publishTopology(event.networkId);
         break;
       }

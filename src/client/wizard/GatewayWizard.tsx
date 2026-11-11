@@ -29,6 +29,7 @@ import type {
 import {
   ADMIN_ACTION_ROUTE,
   ADMIN_PAIR_ROUTE,
+  ADMIN_PLUGIN_BRIDGE_ROUTE,
   ADMIN_STATUS_ROUTE,
   CLIENT_CLAIM_ROUTE,
   CLIENT_CONFIG_ROUTE,
@@ -52,6 +53,7 @@ import {
   type PeerStatusView,
 } from '../../client-data/settings-form.ts'
 import { qrMatrix } from '../../client-data/qr.ts'
+import { readAdminBridgeRow, togglePluginConsent, type AdminBridgeRowView } from '../../client-data/plugin-bridge.ts'
 import {
   WIZARD_CADDY_START_ROUTE,
   WIZARD_CADDY_STATUS_ROUTE,
@@ -345,6 +347,10 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [peerBusyNode, setPeerBusyNode] = useState<string | null>(null)
   const [peerActionFailed, setPeerActionFailed] = useState(false)
   const [peerDevicesModalOpen, setPeerDevicesModalOpen] = useState(false)
+  const [renamingSelfDraft, setRenamingSelfDraft] = useState<string | null>(null)
+  const [renamingSelfBusy, setRenamingSelfBusy] = useState(false)
+  const [bridgeRows, setBridgeRows] = useState<readonly AdminBridgeRowView[]>([])
+  const [bridgeBusyPlugin, setBridgeBusyPlugin] = useState<string | null>(null)
   // PG-9-fix: the role-keep flag. The phone-PWA flows run under
   // wizardRole 'host' — when the user entered them from a PEER surface the
   // channel saves must write `role: 'peer'` (targetHostSaveRole), or the
@@ -611,7 +617,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const loadHostStatus = useCallback(async (): Promise<void> => {
     const mine = ++hostTicketRef.current
     try {
-      const [wizardResponse, adminResponse] = await Promise.all([fetch(WIZARD_STATUS_ROUTE), fetch(ADMIN_STATUS_ROUTE)])
+      const [wizardResponse, adminResponse, bridgeResponse] = await Promise.all([
+        fetch(WIZARD_STATUS_ROUTE),
+        fetch(ADMIN_STATUS_ROUTE),
+        fetch(ADMIN_PLUGIN_BRIDGE_ROUTE).catch(() => undefined),
+      ])
       if (wizardResponse.ok && mine === hostTicketRef.current) {
         const body = (await wizardResponse.json()) as WizardStatusBody
         if (body?.ok === true) setWizardStatus(body)
@@ -628,11 +638,66 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           }
         }
       }
+      if (bridgeResponse?.ok === true && mine === hostTicketRef.current) {
+        const body = (await bridgeResponse.json().catch(() => undefined)) as { value?: { plugins?: unknown } } | undefined
+        if (Array.isArray(body?.value?.plugins)) {
+          const parsed: AdminBridgeRowView[] = []
+          for (const item of body.value.plugins) {
+            const row = readAdminBridgeRow(item)
+            if (row !== undefined) parsed.push(row)
+          }
+          setBridgeRows(parsed)
+        }
+      }
       if (mine === hostTicketRef.current) setStatusLoaded(true)
     } catch {
       // keep the last ready data
     }
   }, [])
+
+  const saveSelfDeviceName = async (draft: string): Promise<void> => {
+    const trimmed = draft.trim()
+    setRenamingSelfBusy(true)
+    try {
+      await props.saveRowFields(
+        trimmed !== '' ? { serverName: trimmed } : {},
+        trimmed === '' ? { unset: ['serverName'] } : undefined,
+      )
+      setHostName(trimmed)
+      setClientDeviceName(trimmed)
+      setRenamingSelfDraft(null)
+      await loadPeerStatus()
+    } catch {
+      // keep draft open so user can retry
+    } finally {
+      setRenamingSelfBusy(false)
+    }
+  }
+
+  const toggleWizardPluginConsent = async (plugin: string, allow: boolean): Promise<void> => {
+    setBridgeBusyPlugin(plugin)
+    try {
+      let current: Record<string, boolean> = {}
+      const raw = config.rowValue('pluginBridgeConsent')
+      if (typeof raw === 'string' && raw.trim() !== '') {
+        try {
+          const parsed: unknown = JSON.parse(raw)
+          if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            current = parsed as Record<string, boolean>
+          }
+        } catch { /* ignore malformed draft */ }
+      } else if (raw !== null && typeof raw === 'object' && !Array.isArray(raw)) {
+        current = raw as Record<string, boolean>
+      }
+      const next = togglePluginConsent(current, plugin, allow)
+      await props.saveRowFields({ pluginBridgeConsent: JSON.stringify(next) })
+      await loadHostStatus()
+    } catch {
+      // keep previous state; poll corrects
+    } finally {
+      setBridgeBusyPlugin(null)
+    }
+  }
 
   // Poll the role's own status route: client status on a client, the peer
   // node's network status on a peer (PG-9) — PLUS the host wizard + admin
@@ -1432,13 +1497,15 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   // the gateway's announced cap — defaulting to the pool cap before the
   // first welcome lands.
   const peerDevices: readonly PeerDeviceView[] = peerView?.peers ?? []
-  const peerSummary = derivePeerOverviewSummary(peerDevices, peerView?.maxPeers ?? 8)
+  const peerSelfJoined = peerView?.configured === true && (peerView.gatewayState === 'authorized' || peerView.gatewayState === 'paused')
+  const peerSummary = derivePeerOverviewSummary(peerDevices, peerView?.maxPeers ?? 8, { includeSelf: peerSelfJoined })
   const peerLights = derivePeerWizardLights({
     identityReady: (peerView?.nodeId ?? '') !== '',
     gatewayState: peerView?.gatewayState ?? 'unconfigured',
-    peerCount: peerSummary.totalCount,
+    peerCount: peerDevices.length,
     mismatchCount: peerSummary.mismatchCount,
   })
+  const serverScopeBridges = useMemo(() => bridgeRows.filter((row) => row.hasServerScope), [bridgeRows])
 
   const openWizardAt = (targetStep: WizardStep, options?: { role?: WizardRole; target?: 'web' | 'desktop-client'; keepPeerRole?: boolean }): void => {
     setFormError(null)
@@ -1598,9 +1665,61 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           <>
             <div className="zr-wizard-overviewGrid">
               <div className="zr-wizard-overviewItem">
-                <p className="zr-wizard-overviewLabel">{t('wizard.overview.roleLabel')}</p>
+                <div className="zr-wizard-overviewHead">
+                  <p className="zr-wizard-overviewLabel">{t('wizard.overview.roleLabel')}</p>
+                  {renamingSelfDraft === null ? (
+                    <button
+                      type="button"
+                      className="zr-wizard-linkBtn"
+                      disabled={disabled || renamingSelfBusy}
+                      onClick={() => setRenamingSelfDraft(hostName.trim())}
+                    >
+                      {t('settings.deviceRename')}
+                    </button>
+                  ) : null}
+                </div>
                 <p className="zr-wizard-overviewValue">{t('wizard.role.peer')}</p>
-                <p className="zr-wizard-overviewSub">{peerView?.configured === true ? peerView.nodeId : t('wizard.peer.notJoined')}</p>
+                {renamingSelfDraft !== null ? (
+                  <div className="zr-wizard-row" style={{ marginTop: 6 }}>
+                    <input
+                      className="zr-wizard-input"
+                      style={{ flex: 1, minWidth: 110 }}
+                      aria-label={t('wizard.client.deviceName')}
+                      placeholder={t('wizard.client.deviceNamePlaceholder')}
+                      maxLength={64}
+                      value={renamingSelfDraft}
+                      disabled={renamingSelfBusy}
+                      autoFocus
+                      onChange={(event) => setRenamingSelfDraft(event.currentTarget.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') void saveSelfDeviceName(renamingSelfDraft)
+                        if (event.key === 'Escape') setRenamingSelfDraft(null)
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="zr-wizard-btn zr-wizard-btnPrimary"
+                      disabled={renamingSelfBusy}
+                      onClick={() => { void saveSelfDeviceName(renamingSelfDraft) }}
+                    >
+                      {t('settings.renameSave')}
+                    </button>
+                    <button
+                      type="button"
+                      className="zr-wizard-btn"
+                      disabled={renamingSelfBusy}
+                      onClick={() => setRenamingSelfDraft(null)}
+                    >
+                      {t('settings.renameCancel')}
+                    </button>
+                  </div>
+                ) : (
+                  <p className="zr-wizard-overviewSub">
+                    {hostName.trim() !== ''
+                      ? `${hostName.trim()}${peerView?.nodeId ? ` · ${peerView.nodeId}` : ''}`
+                      : (peerView?.configured === true ? peerView.nodeId : t('wizard.peer.notJoined'))}
+                  </p>
+                )}
               </div>
               <div className="zr-wizard-overviewItem">
                 <p className="zr-wizard-overviewLabel">{t('wizard.overview.peerNetworkLabel')}</p>
@@ -1615,14 +1734,14 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 <p className="zr-wizard-overviewValue">
                   <span className="zr-wizard-dot" data-state={peerSummary.connectionLight} />
                   <span>
-                    {peerSummary.totalCount === 0
+                    {peerDevices.length === 0
                       ? t('wizard.overview.peerConnNone')
                       : t('wizard.overview.peerConnSummary', { direct: String(peerSummary.directCount), relay: String(peerSummary.relayCount) })}
                   </span>
                 </p>
                 <p className="zr-wizard-overviewSub">
-                  {peerSummary.totalCount > 0
-                    ? t('wizard.overview.peerDevicesCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.totalCount) })
+                  {peerDevices.length > 0
+                    ? t('wizard.overview.peerDevicesCount', { count: String(peerSummary.mountedCount), max: String(peerDevices.length) })
                     : ''}
                 </p>
               </div>
@@ -1764,6 +1883,23 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                   {t('wizard.peer.managePairedDevices')}
                 </button>
               </div>
+              {serverScopeBridges.length > 0 ? (
+                <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--zr-wizard-border, rgba(127, 127, 127, 0.18))' }}>
+                  <p className="zr-wizard-sectionTitle">{t('settings.bridge.title')}</p>
+                  {serverScopeBridges.map((row) => (
+                    <label key={row.plugin} className="zr-wizard-checkRow" style={{ marginTop: 6 }}>
+                      <input
+                        type="checkbox"
+                        checked={row.consent}
+                        disabled={disabled || bridgeBusyPlugin !== null}
+                        onChange={(event) => { void toggleWizardPluginConsent(row.plugin, event.currentTarget.checked) }}
+                      />
+                      <span>{row.plugin} · {t('settings.bridge.consentToggle')}</span>
+                    </label>
+                  ))}
+                  <p className="zr-wizard-hint" style={{ marginTop: 4 }}>{t('settings.bridge.consentHint')}</p>
+                </div>
+              ) : null}
             </div>
           </>
         ) : (
@@ -2466,7 +2602,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                           // gateway said pending.
                           const labelText = light === 'admission' && peerView?.gatewayState === 'pending-approval'
                             ? t('wizard.peer.pendingApproval')
-                            : light === 'discovery' && peerSummary.totalCount === 0 && peerView?.gatewayState === 'authorized'
+                            : light === 'discovery' && peerDevices.length === 0 && peerView?.gatewayState === 'authorized'
                               ? t('wizard.overview.peerConnNone')
                               : t(LIGHT_LABEL[state])
                           return (
@@ -3310,6 +3446,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                             {device.path !== 'mismatch' && device.path !== 'offline' && device.rttMs !== null ? (
                               <span className="zr-wizard-deviceBadge">{t('wizard.peer.deviceRtt', { ms: String(device.rttMs) })}</span>
                             ) : null}
+                            {device.path !== 'mismatch' && !device.mounted ? (
+                              <span className="zr-wizard-deviceBadge">{t('wizard.peer.deviceIgnore')}</span>
+                            ) : null}
                           </div>
                           <span className="zr-wizard-hint">{device.nodeId}</span>
                         </div>
@@ -3339,7 +3478,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                                   void runPeerNodeAction(CLIENT_PEER_TOGGLE_MOUNT_ROUTE, device.nodeId, { nodeId: device.nodeId, mounted: event.currentTarget.checked })
                                 }}
                               />
-                              <span>{device.mounted ? t('wizard.peer.deviceMount') : t('wizard.peer.deviceIgnore')}</span>
+                              <span>{t('wizard.peer.deviceMount')}</span>
                             </label>
                           </div>
                         )}

@@ -22,6 +22,7 @@ import type {
   CreateUserInput,
   GatewayStore,
   JoinAttemptInput,
+  MemberProfilePatch,
   MemberRecord,
   MemberStatus,
   NatType,
@@ -576,6 +577,23 @@ export class PgStore implements GatewayStore {
       const updated = await tx(
         'UPDATE network_members SET status = $3, public_key_hex = $4, candidate_public_key_hex = $5 WHERE network_id = $1 AND node_id = $2 RETURNING *',
         [networkId, nodeId, outcome.next, nextPublicKey, null],
+      );
+      return mapMemberRow(updated.rows[0] as Row);
+    });
+  }
+
+  async updateMemberProfile(networkId: string, nodeId: string, patch: MemberProfilePatch): Promise<MemberRecord> {
+    return this.inTransaction(async (tx) => {
+      const found = await tx('SELECT * FROM network_members WHERE network_id = $1 AND node_id = $2', [networkId, nodeId]);
+      if (found.rows.length === 0) {
+        throw new StoreError('member-not-found', `member ${nodeId} does not exist in network ${networkId}`);
+      }
+      const row = found.rows[0] as Row;
+      const nextName = 'name' in patch ? (patch.name ?? null) : (typeof row.name === 'string' ? row.name : null);
+      const nextNote = 'note' in patch ? (patch.note ?? null) : (typeof row.note === 'string' ? row.note : null);
+      const updated = await tx(
+        'UPDATE network_members SET name = $3, note = $4 WHERE network_id = $1 AND node_id = $2 RETURNING *',
+        [networkId, nodeId, nextName, nextNote],
       );
       return mapMemberRow(updated.rows[0] as Row);
     });

@@ -214,10 +214,12 @@ function virtualizeWorkspace(
   identity: MergerIdentity,
   annotation: MergerAnnotation,
   lang: MergerLang = 'zh',
+  workspaceEpoch = 0,
 ): Record<string, unknown> {
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
+  const virtualizeWs = (id: string): string => toVirtual(identity.serverId, workspaceEpoch > 0 ? `#${workspaceEpoch}~${id}` : id)
   const out: Record<string, unknown> = { ...record }
-  if (typeof record.workspaceId === 'string') out.workspaceId = virtualize(record.workspaceId)
+  if (typeof record.workspaceId === 'string') out.workspaceId = virtualizeWs(record.workspaceId)
   if (typeof record.title === 'string') {
     const suffix = annotation === 'none' ? '' : ANNOTATION_SUFFIX_BY_LANG[lang][annotation]
     out.title = `${identity.serverName} · ${record.title}${suffix}`
@@ -229,6 +231,11 @@ function virtualizeWorkspace(
 }
 
 export interface WorkspaceMergerOptions extends MergerIdentity {
+  /** Monotonic re-mount epoch (`0` on first mount, incremented each time the
+   * same serverId's slot emitted `remove` frames) so re-mounted virtual
+   * workspaceIds bypass DSH `ClientWorkspaceModel`'s page-lifetime `removedIds`
+   * blacklist without requiring a page reload. */
+  workspaceEpoch?: number
   /** Diagnostics for frames this merger dropped (unknown type or malformed).
    * Optional: without it the drop is silent. */
   onDiagnostic?: (message: string) => void
@@ -401,11 +408,16 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   // The status annotation every virtualized title currently carries (T34).
   let annotation: MergerAnnotation = 'none'
   const now = options.now ?? Date.now
+  const workspaceEpoch = typeof options.workspaceEpoch === 'number' && Number.isInteger(options.workspaceEpoch) && options.workspaceEpoch > 0
+    ? options.workspaceEpoch
+    : 0
 
   const virtualize = (id: string): string => toVirtual(identity.serverId, id)
+  const virtualizeWorkspaceId = (id: string): string =>
+    toVirtual(identity.serverId, workspaceEpoch > 0 ? `#${workspaceEpoch}~${id}` : id)
   // Only SHOWN workspaces travel in order frames (T56): a hidden group has no
   // position the UI knows about.
-  const remoteIds = (): string[] => [...remote.keys()].filter((id) => shown.has(id)).map(virtualize)
+  const remoteIds = (): string[] => [...remote.keys()].filter((id) => shown.has(id)).map(virtualizeWorkspaceId)
   const remoteArchivedVirtual = (): string[] => remoteArchived.map(virtualize)
   const remotePinnedVirtual = (): string[] => remotePinned.map(virtualize)
 
@@ -559,7 +571,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
    * session stays in its group so the host's「显示已归档」filter can show it
    * in place — hiding is purely the archived set. */
   function forwardWorkspace(record: Record<string, unknown>): Record<string, unknown> {
-    const out = virtualizeWorkspace(record, identity, annotation, resolveMergerLang(options.lang))
+    const out = virtualizeWorkspace(record, identity, annotation, resolveMergerLang(options.lang), workspaceEpoch)
     const workspaceId = typeof record.workspaceId === 'string' ? record.workspaceId : undefined
     const live = stringList(record.sessionIds)
     if (workspaceId === undefined || !Array.isArray(out.sessionIds)) return out
@@ -798,7 +810,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
             // Only a workspace the UI was SHOWN may receive a remove (T56) —
             // the model blacklists the id forever; a never-shown one is
             // unknown to the UI and leaves silently.
-            if (shown.has(id)) out.push({ type: 'remove', workspaceId: virtualize(id) })
+            if (shown.has(id)) out.push({ type: 'remove', workspaceId: virtualizeWorkspaceId(id) })
           }
           out.push(mergedOrderFrame(), mergedArchivedFrame(), mergedPinnedFrame())
           return out
@@ -853,7 +865,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           // remove — the model would blacklist the id against any future
           // re-share of the same workspace id.
           if (!shown.has(id)) return []
-          return [{ type: 'remove', workspaceId: virtualize(id) }, mergedOrderFrame()]
+          return [{ type: 'remove', workspaceId: virtualizeWorkspaceId(id) }, mergedOrderFrame()]
         }
         case 'order': {
           if (!Array.isArray(frame.workspaceIds)) {
@@ -957,7 +969,7 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
       // T58-fix: hidden sessions alone also demand the restore — their ids
       // sit in the UI's archived set and must leave it with the identity.
       if (localSeen && (removedIds.length > 0 || remoteArchived.length > 0 || remotePinned.length > 0 || hiddenSessions.size > 0)) {
-        for (const id of removedIds) out.push({ type: 'remove', workspaceId: virtualize(id) })
+        for (const id of removedIds) out.push({ type: 'remove', workspaceId: virtualizeWorkspaceId(id) })
         out.push({ type: 'order', workspaceIds: [...localOrder] })
         out.push({ type: 'archived', archivedSessionIds: [...localArchived] })
         out.push({ type: 'pinned', pinnedSessionIds: [...localPinned] })

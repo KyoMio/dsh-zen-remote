@@ -60,13 +60,15 @@ export const NOOP_RUNTIME_STATS: GatewayRuntimeStats = {
   getRelayKbpsByUser: () => 0,
 };
 
-/** 成员五态操作（含 DELETE 彻底移除）后的事件，供 PG-5 实时通知 WS 与 SSE */
+/** 成员五态操作（含 DELETE 彻底移除与 PATCH 改名）后的事件，供 PG-5 实时通知 WS 与 SSE */
 export interface MemberChangedEvent {
   networkId: string;
   nodeId: string;
-  action: 'approve' | 'reject' | 'pause' | 'resume' | 'repin' | 'remove';
+  action: 'approve' | 'reject' | 'pause' | 'resume' | 'repin' | 'remove' | 'rename';
   /** 迁移后的成员状态；remove（行已删除）记为 revoked */
   status: MemberStatus;
+  /** action === 'rename' 时的新显示名 */
+  name?: string | null;
 }
 
 /** PG-5 钩子：HTTP 侧状态变更后通知实时层；钩子抛错不回滚 HTTP 操作 */

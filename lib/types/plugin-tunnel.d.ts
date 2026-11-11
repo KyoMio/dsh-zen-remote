@@ -138,6 +138,9 @@ export interface CreatePluginTunnelOptions {
     isAccessible: (sessionId: string) => boolean;
     /** Heartbeat interval for the open stream (the ping lines). */
     heartbeatMs: number;
+    /** Per-apply in-memory loopback marker bypassing `installPluginRouteIntercept`
+     * when both halves run on the same `webServer` (peer mode). */
+    loopbackSecret?: string;
 }
 export interface PluginTunnelRoutes {
     /** `POST relay/v1/plugin-tunnel/open`. */

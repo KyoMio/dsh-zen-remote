@@ -440,6 +440,7 @@ export function MobileSessionInfo({
   // window.confirm, but remote access is reversible with one more tap and
   // the switch itself states the outcome.
   const remoteRow = shareCardRemoteView({
+    sessionId,
     ready: shareSnap.ready,
     role: shareSnap.role,
     subagent: row?.origin === 'subagent',

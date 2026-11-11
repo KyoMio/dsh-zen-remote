@@ -443,6 +443,10 @@ export class ConsoleClient {
     await this.request('POST', `/api/v1/networks/${encodeURIComponent(networkId)}/members/${encodeURIComponent(nodeId)}/${action}`);
   }
 
+  async patchMember(networkId: string, nodeId: string, patch: { name?: string | null; note?: string | null }): Promise<void> {
+    await this.request('PATCH', `/api/v1/networks/${encodeURIComponent(networkId)}/members/${encodeURIComponent(nodeId)}`, patch);
+  }
+
   async removeMember(networkId: string, nodeId: string): Promise<void> {
     await this.request('DELETE', `/api/v1/networks/${encodeURIComponent(networkId)}/members/${encodeURIComponent(nodeId)}`);
   }

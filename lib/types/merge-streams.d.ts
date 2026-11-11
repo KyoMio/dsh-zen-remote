@@ -160,6 +160,11 @@ export interface MergerIdentity {
 export type MergerAnnotation = 'none' | 'offline' | 'revoked' | 'unpaired' | 'mismatch';
 export type MergerLang = 'zh' | 'en';
 export interface WorkspaceMergerOptions extends MergerIdentity {
+    /** Monotonic re-mount epoch (`0` on first mount, incremented each time the
+     * same serverId's slot emitted `remove` frames) so re-mounted virtual
+     * workspaceIds bypass DSH `ClientWorkspaceModel`'s page-lifetime `removedIds`
+     * blacklist without requiring a page reload. */
+    workspaceEpoch?: number;
     /** Diagnostics for frames this merger dropped (unknown type or malformed).
      * Optional: without it the drop is silent. */
     onDiagnostic?: (message: string) => void;

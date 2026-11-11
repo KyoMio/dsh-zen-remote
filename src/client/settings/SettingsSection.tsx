@@ -341,6 +341,9 @@ function PeerDeviceRow(props: {
         {usable && device.rttMs !== null ? (
           <span className="zr-settings-badge">{t('wizard.peer.deviceRtt', { ms: String(device.rttMs) })}</span>
         ) : null}
+        {device.path !== 'mismatch' && !device.mounted ? (
+          <span className="zr-settings-badge">{t('wizard.peer.deviceIgnore')}</span>
+        ) : null}
         <span className="zr-settings-hint">{device.nodeId}</span>
       </div>
       {device.path === 'mismatch' ? (
@@ -355,7 +358,7 @@ function PeerDeviceRow(props: {
           <Switch
             checked={device.mounted}
             onChange={onToggle}
-            label={device.mounted ? t('wizard.peer.deviceMount') : t('wizard.peer.deviceIgnore')}
+            label={t('wizard.peer.deviceMount')}
           />
         </div>
       )}
@@ -1394,7 +1397,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                         <div className="zr-settings-head">
                           <label>{t('settings.bridge.consentToggle')}</label>
                           <Switch
-                            checked={current[row.plugin] === true}
+                            checked={peerRole ? current[row.plugin] !== false : current[row.plugin] === true}
                             onChange={(checked) => {
                               config.stage('pluginBridgeConsent', JSON.stringify(togglePluginConsent(current, row.plugin, checked)))
                             }}

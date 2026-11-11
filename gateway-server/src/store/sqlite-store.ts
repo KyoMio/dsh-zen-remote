@@ -24,6 +24,7 @@ import type {
   CreateUserInput,
   GatewayStore,
   JoinAttemptInput,
+  MemberProfilePatch,
   MemberRecord,
   MemberStatus,
   NatType,
@@ -540,6 +541,23 @@ export class SqliteStore implements GatewayStore {
         .run(outcome.next, nextPublicKey, networkId, nodeId);
       const updated = this.getMemberRow(networkId, nodeId);
       if (updated === undefined) throw new StoreError('member-not-found', 'member disappeared after transition');
+      return mapMemberRow(updated);
+    });
+  }
+
+  async updateMemberProfile(networkId: string, nodeId: string, patch: MemberProfilePatch): Promise<MemberRecord> {
+    return this.tx(() => {
+      const existing = this.getMemberRow(networkId, nodeId);
+      if (existing === undefined) {
+        throw new StoreError('member-not-found', `member ${nodeId} does not exist in network ${networkId}`);
+      }
+      const nextName = 'name' in patch ? (patch.name ?? null) : (typeof existing.name === 'string' ? existing.name : null);
+      const nextNote = 'note' in patch ? (patch.note ?? null) : (typeof existing.note === 'string' ? existing.note : null);
+      this.db
+        .prepare('UPDATE network_members SET name = ?, note = ? WHERE network_id = ? AND node_id = ?')
+        .run(nextName, nextNote, networkId, nodeId);
+      const updated = this.getMemberRow(networkId, nodeId);
+      if (updated === undefined) throw new StoreError('member-not-found', 'member disappeared after profile update');
       return mapMemberRow(updated);
     });
   }

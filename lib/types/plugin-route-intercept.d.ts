@@ -174,6 +174,11 @@ export interface InstallPluginRouteInterceptOptions {
      * workspace/follow. At most once per answer, deduped, only when there is
      * something to report; a throwing callback never fails the answer. */
     onMintedVirtualIds?: (virtualIds: readonly string[]) => void;
+    /** Per-apply in-memory loopback marker: when `servesRole` and `connectsRole`
+     * share one `webServer` (peer mode), a request arriving from this process's
+     * own `pluginLoopback` / `pluginTunnel` carries this secret and passes
+     * straight through to the local plugin handler (header stripped). */
+    loopbackSecret?: string;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
 }

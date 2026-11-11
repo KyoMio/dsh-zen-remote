@@ -136,6 +136,11 @@ export interface RelayPoolOptions {
    * `peerNetwork.maxPeersFromGateway`), live. Missing/undefined means "no
    * network cap known" and the local configuration answers alone. */
   getPeerNetworkCap?: () => number | undefined
+  /** Peer mode: do not load or migrate persisted `client`-mode paired servers
+   * from `zen-remote-state.json` — only virtual network mounts belong in the
+   * pool while running as `peer`, so old non-network records never occupy
+   * display names (`-1`/`-2`) or leave stale sidebar workspaces. */
+  skipPersistedServers?: boolean
 }
 
 /** One in-memory entry: the record (mutated in place on re-pair/handshake),
@@ -180,8 +185,12 @@ export interface RelayPool {
   mountVirtual(input: { entryId: string; serverId: string; serverName: string; fetchImpl: typeof fetch }): RelayPoolEntryView
   /** Unmount one virtual entry (peer left / mismatch / disabled). */
   unmountVirtual(entryId: string): boolean
+  /** Update one mounted virtual entry's serverName (peer rename) and notify
+   * pool listeners so merged workspace titles refresh immediately. */
+  updateVirtualName(entryId: string, serverName: string): boolean
   /** Whether an entry id is currently a mounted virtual entry. */
-  isVirtual(entryId: string): boolean  /** One entry's immediate reconnect, or every `offline` client's. Answers
+  isVirtual(entryId: string): boolean
+  /** One entry's immediate reconnect, or every `offline` client's. Answers
    * whether any attempt was started. */
   reconnect(entryId?: string): Promise<boolean>
   /** One authenticated ping per `offline` client; the reachable ones get
@@ -207,11 +216,13 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
   const pool = new Map<string, PoolEntry>()
 
   /** The handshake id a view should report: live handshake first, then the
-   * persisted record (a fresh entry that never reached the server yet). */
+   * persisted record (a fresh entry that never reached the server yet).
+   * Virtual peer entries always report their mounted nodeId/name rather than
+   * the remote DSH host's own serverId. */
   const effectiveServerId = (entry: PoolEntry): string | undefined =>
-    entry.client.handshakeInfo?.serverId ?? entry.record.serverId
+    entry.virtual ? (entry.record.serverId ?? entry.record.id) : (entry.client.handshakeInfo?.serverId ?? entry.record.serverId)
   const effectiveServerName = (entry: PoolEntry): string | undefined =>
-    entry.client.handshakeInfo?.serverName ?? entry.record.serverName
+    entry.virtual ? entry.record.serverName : (entry.client.handshakeInfo?.serverName ?? entry.record.serverName)
 
   const buildView = (entry: PoolEntry, displayName: string): RelayPoolEntryView => ({
     entryId: entry.record.id,
@@ -313,16 +324,19 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
   }
 
   // Startup: fold the legacy row credentials in (only when the list is still
-  // empty), then one client per record.
-  const legacy = options.legacySource?.()
-  if (legacy !== undefined) {
-    try {
-      migrateLegacyClientIntoServers(stateFile, legacy)
-    } catch {
-      // Best effort — the row keeps its credentials for the next start.
+  // empty), then one client per record — skipped in peer mode so non-network
+  // paired records stay dormant until switching back to client mode.
+  if (options.skipPersistedServers !== true) {
+    const legacy = options.legacySource?.()
+    if (legacy !== undefined) {
+      try {
+        migrateLegacyClientIntoServers(stateFile, legacy)
+      } catch {
+        // Best effort — the row keeps its credentials for the next start.
+      }
     }
+    for (const record of listPairedServers(stateFile)) addEntry(record)
   }
-  for (const record of listPairedServers(stateFile)) addEntry(record)
 
   const detach = (entry: PoolEntry): void => {
     entry.unsubscribe()
@@ -430,6 +444,21 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
       if (entry === undefined || entry.virtual !== true) return false
       detach(entry)
       options.onServerRemoved?.({ entryId, serverId: entry.record.serverId, reason: 'virtual' })
+      return true
+    },
+
+    updateVirtualName(entryId, serverName) {
+      const entry = pool.get(entryId)
+      const trimmed = typeof serverName === 'string' ? serverName.trim() : ''
+      if (entry === undefined || entry.virtual !== true || trimmed === '') return false
+      if (entry.record.serverName === trimmed) return false
+      entry.record = { ...entry.record, serverName: trimmed }
+      options.onStateChange?.({
+        entryId: entry.record.id,
+        serverId: effectiveServerId(entry),
+        state: entry.client.state,
+        ...(entry.client.lastError !== undefined ? { lastError: entry.client.lastError } : {}),
+      })
       return true
     },
 

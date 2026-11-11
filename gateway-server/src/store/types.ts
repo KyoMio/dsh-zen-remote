@@ -135,6 +135,11 @@ export interface NetworkPatch {
   maxPeers?: number;
 }
 
+export interface MemberProfilePatch {
+  name?: string | null;
+  note?: string | null;
+}
+
 export interface JoinAttemptInput {
   networkId: string;
   nodeId: string;
@@ -334,6 +339,8 @@ export interface GatewayStore {
   upsertMemberJoinAttempt(input: JoinAttemptInput): Promise<MemberRecord | null>;
   /** 非法迁移抛 invalid-transition；满额抛 limit-reached；成员不存在抛 member-not-found */
   transitionMemberStatus(networkId: string, nodeId: string, action: TransitionAction): Promise<MemberRecord>;
+  /** 修改成员显示名称或备注；成员不存在抛 member-not-found */
+  updateMemberProfile(networkId: string, nodeId: string, patch: MemberProfilePatch): Promise<MemberRecord>;
   removeMember(networkId: string, nodeId: string): Promise<void>;
   listMembers(networkId: string): Promise<MemberRecord[]>;
   /** 批量累加中继字节并更新 lastIp / natType / lastSeenAt */

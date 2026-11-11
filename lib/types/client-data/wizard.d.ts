@@ -334,7 +334,9 @@ export interface PeerOverviewSummary {
  * device light follows the cap — red exactly at `totalCount >= maxPeers`
  * — and shares the mismatch red. Both stay amber on an empty network.
  */
-export declare function derivePeerOverviewSummary(peers: readonly PeerDeviceView[], maxPeers: number): PeerOverviewSummary;
+export declare function derivePeerOverviewSummary(peers: readonly PeerDeviceView[], maxPeers: number, options?: {
+    includeSelf?: boolean;
+}): PeerOverviewSummary;
 /** The peer node's three wizard lights (PG-9): ① 本机身份已就绪, ② 网络准入
  * 状态 (authorized green, pending-approval amber — the 「等待网络管理员批准」
  * copy), ③ 设备发现与会话同步. */

@@ -13,6 +13,7 @@ import { ApiError, readJsonObjectBody, requireUser, runHook, sendOk } from './au
 import type { RouteContext, RouteDef } from './auth.js';
 import type {
   AdmissionMode,
+  MemberProfilePatch,
   MemberRecord,
   NetworkPatch,
   NetworkRecord,
@@ -232,6 +233,53 @@ async function handleMemberTransition(
   sendOk(ctx.res, { member });
 }
 
+async function handlePatchMember(ctx: RouteContext, params: Record<string, string>): Promise<void> {
+  const user = await requireUser(ctx);
+  const networkId = params['id'] ?? '';
+  await loadOwnedNetwork(ctx, user.id, networkId);
+  const nodeId = params['nodeId'] ?? '';
+  const body = await readJsonObjectBody(ctx.req);
+  const patch: MemberProfilePatch = {};
+  if ('name' in body) {
+    if (body['name'] === null) {
+      patch.name = null;
+    } else if (typeof body['name'] === 'string') {
+      const trimmed = body['name'].trim();
+      if (trimmed.length < 1 || trimmed.length > 64) {
+        throw new ApiError(400, 'INVALID_REQUEST', 'name must be 1..64 characters');
+      }
+      patch.name = trimmed;
+    } else {
+      throw new ApiError(400, 'INVALID_REQUEST', 'name must be a string or null');
+    }
+  }
+  if ('note' in body) {
+    if (body['note'] === null) {
+      patch.note = null;
+    } else if (typeof body['note'] === 'string') {
+      const trimmed = body['note'].trim();
+      if (trimmed.length > 120) {
+        throw new ApiError(400, 'INVALID_REQUEST', 'note must be at most 120 characters');
+      }
+      patch.note = trimmed === '' ? null : trimmed;
+    } else {
+      throw new ApiError(400, 'INVALID_REQUEST', 'note must be a string or null');
+    }
+  }
+  if (!('name' in patch) && !('note' in patch)) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'at least one of name or note is required');
+  }
+  const member = await ctx.store.updateMemberProfile(networkId, nodeId, patch);
+  await runHook(ctx.hooks.onMemberChanged, {
+    networkId: member.networkId,
+    nodeId: member.nodeId,
+    action: 'rename',
+    status: member.status,
+    name: member.name,
+  });
+  sendOk(ctx.res, { member });
+}
+
 async function handleDeleteMember(ctx: RouteContext, params: Record<string, string>): Promise<void> {
   const user = await requireUser(ctx);
   const networkId = params['id'] ?? '';
@@ -272,6 +320,7 @@ export function buildNetworkRoutes(): RouteDef[] {
     { method: 'POST', path: '/api/v1/networks/:id/members/:nodeId/pause', handler: (ctx, p) => handleMemberTransition(ctx, p, 'pause') },
     { method: 'POST', path: '/api/v1/networks/:id/members/:nodeId/resume', handler: (ctx, p) => handleMemberTransition(ctx, p, 'resume') },
     { method: 'POST', path: '/api/v1/networks/:id/members/:nodeId/repin', handler: (ctx, p) => handleMemberTransition(ctx, p, 'repin') },
+    { method: 'PATCH', path: '/api/v1/networks/:id/members/:nodeId', handler: handlePatchMember },
     { method: 'DELETE', path: '/api/v1/networks/:id/members/:nodeId', handler: handleDeleteMember },
   ];
 }

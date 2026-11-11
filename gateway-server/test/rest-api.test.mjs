@@ -987,3 +987,58 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
     }
   });
 });
+
+describe('PATCH /api/v1/networks/:id/members/:nodeId（成员重命名与备注）', () => {
+  test('owner 可修改设备名称与备注；空名/超长返回 400；跨租户或未知节点返回 404', async () => {
+    const h = await startServer();
+    try {
+      await seedUsers(h.store);
+      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const tenantCookie = await login(h.base, TENANT_EMAIL, TENANT_PASSWORD);
+      const netRes = await api(h.base, 'POST', '/api/v1/networks', {
+        cookie: tenantCookie,
+        body: { name: 'rename-net' },
+      });
+      const netId = netRes.json.data.id;
+      await seedMember(h.store, netId, 'bb001122', 'authorized');
+
+      const okRes = await api(h.base, 'PATCH', `/api/v1/networks/${netId}/members/bb001122`, {
+        cookie: tenantCookie,
+        body: { name: '客厅 Mac Studio', note: '主力机' },
+      });
+      assert.equal(okRes.status, 200);
+      assert.equal(okRes.json.ok, true);
+      assert.equal(okRes.json.data.member.name, '客厅 Mac Studio');
+      assert.equal(okRes.json.data.member.note, '主力机');
+      assert.equal(h.hooks.memberChanged.length, 1);
+      assert.equal(h.hooks.memberChanged[0].action, 'rename');
+      assert.equal(h.hooks.memberChanged[0].name, '客厅 Mac Studio');
+
+      const emptyName = await api(h.base, 'PATCH', `/api/v1/networks/${netId}/members/bb001122`, {
+        cookie: tenantCookie,
+        body: { name: '   ' },
+      });
+      assert.equal(emptyName.status, 400);
+
+      const longName = await api(h.base, 'PATCH', `/api/v1/networks/${netId}/members/bb001122`, {
+        cookie: tenantCookie,
+        body: { name: 'x'.repeat(65) },
+      });
+      assert.equal(longName.status, 400);
+
+      const unknownNode = await api(h.base, 'PATCH', `/api/v1/networks/${netId}/members/deadbeef`, {
+        cookie: tenantCookie,
+        body: { name: 'ghost' },
+      });
+      assert.equal(unknownNode.status, 404);
+
+      const foreignOwner = await api(h.base, 'PATCH', `/api/v1/networks/${netId}/members/bb001122`, {
+        cookie: adminCookie,
+        body: { name: 'hijack' },
+      });
+      assert.equal(foreignOwner.status, 404);
+    } finally {
+      await stopServer(h);
+    }
+  });
+});

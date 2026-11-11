@@ -101,6 +101,8 @@ export interface PeerEngine {
     leaveNetwork(): void;
     setNodeDisabled(nodeId: string, disabled: boolean): void;
     trustPeer(nodeId: string): boolean;
+    /** 向网关宣告本机最新设备显示名，网关落盘并向同网在线节点广播 `peer-renamed`。 */
+    announceSelfName(name: string): void;
     reprobePunch(): void;
     status(): PeerEngineStatus;
     stop(): void;

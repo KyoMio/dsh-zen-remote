@@ -76,6 +76,12 @@ export interface CreatePluginLoopbackOptions {
      * cookie can never be obtained and every bridged call fails
      * `loopback-auth`. */
     getTokenUrl: () => string | undefined;
+    /** Per-apply in-memory loopback marker: when `servesRole` and `connectsRole`
+     * share one `webServer` (peer mode), the serving loopback hop stamps this
+     * secret onto `x-zen-remote-loopback` so `installPluginRouteIntercept` lets
+     * the request reach the real local plugin handler without re-entering its
+     * own remote/current-session walls. */
+    loopbackSecret?: string;
 }
 export interface PluginLoopback {
     /** The cookie the tunnel executor (PB-10) needs to write its OWN upgrade

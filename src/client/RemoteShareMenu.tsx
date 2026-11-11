@@ -23,6 +23,7 @@ import { IconLinkOutlineRegular, MenuItemButton } from '@deepseek-ai/dsh-client-
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { shareFailText } from '../client-data/shares.ts'
 import type { SharesStore } from '../client-data/shares.ts'
+import { isVirtual } from '../virtual-id.ts'
 import { NS } from './locales.ts'
 
 export interface RemoteShareMenuProps extends PropsRuntime<'sidebar.workspaces.session.menu.item'>, PropsLocale<typeof NS> {
@@ -32,12 +33,13 @@ export interface RemoteShareMenuProps extends PropsRuntime<'sidebar.workspaces.s
 
 export function RemoteShareMenuItem({ sessionId, shares, useSessions, useMenuOpenState, t }: RemoteShareMenuProps) {
   const [, setMenuOpen] = useMenuOpenState()
+  const virtual = isVirtual(sessionId)
   const snap = useSyncExternalStore(
-    useCallback((onStoreChange: () => void) => shares.subscribe(onStoreChange), [shares]),
+    useCallback((onStoreChange: () => void) => (virtual ? () => {} : shares.subscribe(onStoreChange)), [shares, virtual]),
     () => shares.getSnapshot(),
   )
   const row = useSessions((sessions) => sessions.byId[sessionId])
-  if (!snap.ready || snap.role !== 'host' || row?.origin === 'subagent') return null
+  if (virtual || !snap.ready || snap.role !== 'host' || row?.origin === 'subagent') return null
   const shared = snap.entries.some((entry) => entry.sessionId === sessionId)
   return (
     <MenuItemButton

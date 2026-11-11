@@ -3,7 +3,7 @@
 // mismatch 专属的红色说明条 + 信任新身份；四个技术元数据字段 + 「到其他
 // 设备的连接」表——每一行都是一条固定的平实原因文案，点击整行切换到那台
 // 设备的详情。数据全部来自拓扑快照（SSE 实时推送，不另发请求）。
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 
 import type { TranslateFn } from '../i18n/locales';
@@ -27,6 +27,7 @@ export interface DeviceDetailProps {
   /** 点击「到其他设备的连接」的某一行 → 切换到那台设备 */
   onSelectDevice: (nodeId: string) => void;
   onMemberAction: (nodeId: string, action: MemberAction) => void;
+  onRenameMember?: (nodeId: string, name: string) => void;
   onRemoveMember: (nodeId: string) => void;
 }
 
@@ -44,12 +45,19 @@ function natWord(natType: NatType, t: TranslateFn): string {
 }
 
 export function DeviceDetail(props: DeviceDetailProps) {
-  const { t, topology, member, ui, onUi, busy, onBack, onSelectDevice, onMemberAction, onRemoveMember } = props;
+  const { t, topology, member, ui, onUi, busy, onBack, onSelectDevice, onMemberAction, onRenameMember, onRemoveMember } = props;
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName] = useState(member.name ?? '');
 
-  // Esc 返回全部设备；弹窗打开时让位（Modal 自带 Esc 处理，这里不抢）
+  useEffect(() => {
+    setEditingName(false);
+    setDraftName(member.name ?? '');
+  }, [member.nodeId, member.name]);
+
+  // Esc 返回全部设备；弹窗打开或改名输入中时让位
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key !== 'Escape' || ui.dialog !== null) return;
+      if (event.key !== 'Escape' || ui.dialog !== null || editingName) return;
       event.preventDefault();
       onBack();
     };
@@ -57,7 +65,17 @@ export function DeviceDetail(props: DeviceDetailProps) {
     return () => {
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [onBack, ui.dialog]);
+  }, [onBack, ui.dialog, editingName]);
+
+  const commitRename = (): void => {
+    const trimmed = draftName.trim();
+    setEditingName(false);
+    if (trimmed.length >= 1 && trimmed.length <= 64 && trimmed !== (member.name ?? '')) {
+      onRenameMember?.(member.nodeId, trimmed);
+    } else {
+      setDraftName(member.name ?? '');
+    }
+  };
 
   const status = memberStatusView(member.status, member.online, t);
   const confirmTarget = `remove-member:${member.nodeId}`;
@@ -92,13 +110,63 @@ export function DeviceDetail(props: DeviceDetailProps) {
       <div className="detail-head">
         {/* Dot Rule：圆点旁必须带状态词 */}
         <div className="detail-title">
-          <h2 className="detail-name">{displayName(member, t)}</h2>
+          {editingName ? (
+            <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}>
+              <input
+                className="input"
+                type="text"
+                maxLength={64}
+                autoFocus
+                value={draftName}
+                onChange={(e) => setDraftName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitRename();
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setEditingName(false);
+                    setDraftName(member.name ?? '');
+                  }
+                }}
+              />
+              <button type="button" className="btn primary" disabled={busy || draftName.trim() === ''} onClick={commitRename}>
+                {t('common.save')}
+              </button>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy}
+                onClick={() => {
+                  setEditingName(false);
+                  setDraftName(member.name ?? '');
+                }}
+              >
+                {t('common.cancel')}
+              </button>
+            </div>
+          ) : (
+            <h2 className="detail-name">{displayName(member, t)}</h2>
+          )}
           <span className="dot-row">
             <span className={`dot ${status.dot}`} aria-hidden="true" />
             {status.word}
           </span>
         </div>
         <div className="detail-actions">
+          {onRenameMember !== undefined && !editingName && (
+            <button
+              type="button"
+              className="btn"
+              disabled={busy}
+              onClick={() => {
+                setDraftName(member.name ?? displayName(member, t));
+                setEditingName(true);
+              }}
+            >
+              {t('devices.rename')}
+            </button>
+          )}
           {(member.status === 'authorized' || member.status === 'paused') && (
             <button
               type="button"
