@@ -29,7 +29,7 @@
 | `src/session-reference.ts` | 两端共用的 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队消息 edit、`commands/execute` 全部字符串）：服务端照它校验、子客户端照它改写，同一份规则防两端漂移 |
 | `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
 | `src/relay-pool.ts` | 多服务端中继连接池（MS-2，最多 8 台）：按配对顺序管理每台的 `RelayClient`，握手回写 `serverId`/`serverName` 并对同 `serverId` 的旧条目去重（保留最新配对），重名显示名按配对顺序派生 `-1`/`-2`（`deriveDisplayServerNames`），支持按 entryId/serverId 定位、单台/全部重连、移除与改名广播 |
-| `src/peer/` | 节点端（`peer`）双路径组网引擎：`wire.ts` 线协议纯编解码（28B 明文路由头 + ≤1200B 密文帧）与帧算术、`crypto.ts` 自证明 Ed25519 身份（`nodeId = sha256(pub)[0..8]`）、`zr-net://` 邀请链接解析与会话级 Ephemeral X25519 + ChaCha20-Poly1305 AEAD、`arq.ts` 1200B 滑动窗口可靠流、`punch.ts` 双 UDP STUN 与 1000ms 打洞状态机（60s 静默重探、`lan`/`p2p` 路径分类）、`mux.ts` 虚拟 HTTP 多路复用、`engine.ts` 网关控制信令（`/peer/v1/ws` 挑战应答握手）与独立本地 TOFU 公钥锚定（mismatch 本机拦截）、挂载复用 `relay-pool` 的侧边栏合并 |
+| `src/peer/` | 节点端（`peer`）双路径组网引擎：`wire.ts` 线协议纯编解码（28B 明文路由头 + ≤1200B 密文帧）与帧算术、`crypto.ts` 自证明 Ed25519 身份（`nodeId = sha256(pub)[0..8]`）、`zr-net://` 邀请链接解析与会话级 Ephemeral X25519 + AES-256-GCM AEAD（兼容 Node OpenSSL 与 Electron BoringSSL）、`arq.ts` 1200B 滑动窗口可靠流、`punch.ts` 双 UDP STUN 与 1000ms 打洞状态机（60s 静默重探、`lan`/`p2p` 路径分类）、`mux.ts` 虚拟 HTTP 多路复用、`engine.ts` 网关控制信令（`/peer/v1/ws` 挑战应答握手）与独立本地 TOFU 公钥锚定（mismatch 本机拦截）、挂载复用 `relay-pool` 的侧边栏合并 |
 | `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`，远程会话调用改走中继、虚拟 id 改写、面板判定（客户端那张字段表也在这里） |
 | `src/intercept-shape.ts` | 被包装方法的形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
 | `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端比对 `compareBridges`；不 import DSH、不碰 I/O |

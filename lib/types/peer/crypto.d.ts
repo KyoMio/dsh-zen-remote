@@ -20,7 +20,9 @@
  * 3. Forward-secret peer sessions. Two nodes exchange ONE ephemeral
  *    X25519 key pair each (signed by their long-term identities), derive
  *    HKDF from the DH shared secret into TWO direction keys, and talk
- *    chacha20-poly1305. Strict dual-simplex: what A uses to encrypt is
+ *    aes-256-gcm (natively hardware-accelerated in both Node OpenSSL and
+ *    Electron BoringSSL, where EVP_get_cipherbyname lacks chacha20-poly1305).
+ *    Strict dual-simplex: what A uses to encrypt is
  *    exactly what B uses to decrypt and never anything else, so a key is
  *    never used in both directions. The receiver keeps a WireGuard-style
  *    64-entry sliding replay window whose state ONLY advances on an

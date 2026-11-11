@@ -481,9 +481,9 @@ export class PgStore implements GatewayStore {
           ? null
           : { status: decodeMemberStatus(str(existingRow.status)), publicKeyHex: str(existingRow.public_key_hex) };
 
-      // 容量计数只在需要授权/待审判定时才查（keep/mismatch 用不到）
+      // 容量计数在首次准入、revoked 重入或 pending 补交有效口令直升时查询
       let capacityUsed = 0;
-      if (decisionExisting === null || decisionExisting.status === 'revoked') {
+      if (decisionExisting === null || decisionExisting.status === 'revoked' || decisionExisting.status === 'pending') {
         const counted = await tx(
           "SELECT COUNT(*) AS count FROM network_members WHERE network_id = $1 AND status IN ('authorized','paused','mismatch')",
           [input.networkId],

@@ -819,6 +819,77 @@ describe('manual 模式 pending 与管理员实时放行', () => {
       await gw.close();
     }
   });
+
+  test('准入模式完整矩阵：manual 持邀请链接进 pending 审批放行；both 无口令转有效口令直升 authorized；key 轮换口令不影响存量已授权节点', async () => {
+    const gw = await startGateway();
+    try {
+      // 1) manual 模式：节点粘贴邀请链接（携带正确 joinKey）不得被拒，应进入 pending，批准后原地升级 authorized
+      const manualNet = await createNetwork(gw, { mode: 'manual', maxPeers: 4 });
+      const m1 = identity();
+      const wsM1 = await wsOpen(gw.base);
+      await authNode(wsM1, m1, { networkId: manualNet.id, joinKey: manualNet.joinKey, name: 'manual-invite-node' });
+      const welcomeM1 = await wsJson(wsM1);
+      assert.equal(welcomeM1.type, 'welcome', `manual 持邀请链接不应返回 denied: ${JSON.stringify(welcomeM1)}`);
+      assert.equal(welcomeM1.status, 'pending');
+      const approveRes = await api(gw.base, 'POST', `/api/v1/networks/${manualNet.id}/members/${m1.nodeId}/approve`, { cookie: gw.tenantCookie });
+      assert.equal(approveRes.status, 200);
+      const promotedM1 = await wsJson(wsM1);
+      assert.equal(promotedM1.type, 'welcome');
+      assert.equal(promotedM1.status, 'authorized');
+      wsM1.close();
+
+      // 2) both 模式：先通过网关地址无口令入网停在 pending，再换有效邀请链接重连应直接 authorized
+      const bothNet = await createNetwork(gw, { mode: 'both', maxPeers: 4 });
+      const b1 = identity();
+      const wsB1Pending = await wsOpen(gw.base);
+      await authNode(wsB1Pending, b1, { networkId: bothNet.id, omitProof: true, name: 'both-upgrade-node' });
+      assert.equal((await wsJson(wsB1Pending)).status, 'pending');
+      wsB1Pending.close();
+      await wsClosed(wsB1Pending);
+
+      const wsB1Auth = await wsOpen(gw.base);
+      await authNode(wsB1Auth, b1, { networkId: bothNet.id, joinKey: bothNet.joinKey, name: 'both-upgrade-node' });
+      const welcomeB1 = await wsJson(wsB1Auth);
+      assert.equal(welcomeB1.type, 'welcome');
+      assert.equal(welcomeB1.status, 'authorized');
+      wsB1Auth.close();
+
+      // 3) key 模式：有效链接直接 authorized；轮换口令后旧链接对新节点失效，但已授权节点重连（即使无新口令）依然保持 authorized
+      const keyNet = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const k1 = identity();
+      const wsK1 = await wsOpen(gw.base);
+      await authNode(wsK1, k1, { networkId: keyNet.id, joinKey: keyNet.joinKey, name: 'key-node-1' });
+      assert.equal((await wsJson(wsK1)).status, 'authorized');
+      wsK1.close();
+      await wsClosed(wsK1);
+
+      const rotRes = await api(gw.base, 'POST', `/api/v1/networks/${keyNet.id}/rotate-key`, { cookie: gw.tenantCookie });
+      assert.equal(rotRes.status, 200);
+      const newKey = rotRes.json.data.joinKey;
+      assert.notEqual(newKey, keyNet.joinKey);
+
+      // 新节点用旧链接被拒
+      const k2 = identity();
+      const wsK2Old = await wsOpen(gw.base);
+      await authNode(wsK2Old, k2, { networkId: keyNet.id, joinKey: keyNet.joinKey, name: 'key-node-old' });
+      assert.equal((await wsJson(wsK2Old)).type, 'denied');
+      await wsClosed(wsK2Old);
+
+      // 新节点用新链接自动准入
+      const wsK2New = await wsOpen(gw.base);
+      await authNode(wsK2New, k2, { networkId: keyNet.id, joinKey: newKey, name: 'key-node-new' });
+      assert.equal((await wsJson(wsK2New)).status, 'authorized');
+      wsK2New.close();
+
+      // 已授权存量节点持旧链接重连仍然 authorized
+      const wsK1Reconnect = await wsOpen(gw.base);
+      await authNode(wsK1Reconnect, k1, { networkId: keyNet.id, joinKey: keyNet.joinKey, name: 'key-node-1' });
+      assert.equal((await wsJson(wsK1Reconnect)).status, 'authorized');
+      wsK1Reconnect.close();
+    } finally {
+      await gw.close();
+    }
+  });
 });
 
 describe('mismatch 与 repin 恢复', () => {

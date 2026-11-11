@@ -704,3 +704,33 @@ test('parseGatewayJoinInput & buildKeylessInviteUri: supports gateway addresses 
     assert.equal(parseGatewayJoinInput(bad), null, `should reject ${bad}`)
   }
 })
+
+test('Electron BoringSSL AEAD compatibility: session seal/open uses aes-256-gcm (BoringSSL lacks chacha20-poly1305)', () => {
+  const crypto = require('node:crypto')
+  const session = freshPeerSession()
+  const plaintext = Buffer.from('boringssl-safe-frame', 'utf8')
+  const frame = packEncryptedFrame(
+    ROUTING_HEADER({
+      srcNodeId: session.A.nodeId,
+      dstNodeId: session.B.nodeId,
+      seq: 7n,
+    }),
+    plaintext,
+    session.ciphersA,
+  )
+  const header = frame.subarray(0, PEER_HEADER_BYTES)
+  const sealed = frame.subarray(PEER_HEADER_BYTES)
+
+  // Must match native aes-256-gcm (present in both Node OpenSSL and Electron BoringSSL,
+  // whereas chacha20-poly1305 throws ERR_CRYPTO_UNKNOWN_CIPHER under Electron 44 BoringSSL).
+  const nonce = Buffer.alloc(12)
+  nonce.writeBigUInt64BE(7n, 4)
+  const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(session.ciphersA.txKeyHex, 'hex'), nonce, { authTagLength: 16 })
+  decipher.setAAD(Buffer.from(header))
+  decipher.setAuthTag(Buffer.from(sealed.subarray(sealed.byteLength - 16)))
+  const openedByAesGcm = Buffer.concat([
+    decipher.update(Buffer.from(sealed.subarray(0, sealed.byteLength - 16))),
+    decipher.final(),
+  ])
+  assert.deepEqual(openedByAesGcm, plaintext)
+})

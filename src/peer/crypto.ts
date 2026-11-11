@@ -20,7 +20,9 @@
  * 3. Forward-secret peer sessions. Two nodes exchange ONE ephemeral
  *    X25519 key pair each (signed by their long-term identities), derive
  *    HKDF from the DH shared secret into TWO direction keys, and talk
- *    chacha20-poly1305. Strict dual-simplex: what A uses to encrypt is
+ *    aes-256-gcm (natively hardware-accelerated in both Node OpenSSL and
+ *    Electron BoringSSL, where EVP_get_cipherbyname lacks chacha20-poly1305).
+ *    Strict dual-simplex: what A uses to encrypt is
  *    exactly what B uses to decrypt and never anything else, so a key is
  *    never used in both directions. The receiver keeps a WireGuard-style
  *    64-entry sliding replay window whose state ONLY advances on an
@@ -560,7 +562,7 @@ const KEY_BYTES = 32
 const PEER_KDF_OUTPUT_BYTES = 64
 const REPLAY_WINDOW_BITS = 64n
 const REPLAY_WINDOW_MASK = (1n << REPLAY_WINDOW_BITS) - 1n
-/** seq is a u64: nonce = 4 zero bytes + big-endian seq (12 bytes total for chacha20-poly1305). */
+/** seq is a u64: nonce = 4 zero bytes + big-endian seq (12 bytes total for aes-256-gcm). */
 const SEQ_MAX = (1n << 64n) - 1n
 const HEADER_BYTES = 28
 const AEAD_TAG_BYTES = 16
@@ -802,8 +804,8 @@ export function derivePeerSessionCiphers(params: {
       const header = requireHeader(header28)
       requireSeq(seq, 'seq')
       const payload = asBufferView(plaintext)
-      const cipher = createCipheriv('chacha20-poly1305', Buffer.from(txKeyHex, 'hex'), nonceFor(seq), { authTagLength: AEAD_TAG_BYTES })
-      cipher.setAAD(header, { plaintextLength: payload.byteLength })
+      const cipher = createCipheriv('aes-256-gcm', Buffer.from(txKeyHex, 'hex'), nonceFor(seq), { authTagLength: AEAD_TAG_BYTES })
+      cipher.setAAD(header)
       const ciphertext = Buffer.concat([cipher.update(payload), cipher.final()])
       return Buffer.concat([ciphertext, cipher.getAuthTag()])
     },
@@ -820,8 +822,8 @@ export function derivePeerSessionCiphers(params: {
         if (!rxWindow.admit(seq)) return null
         const tag = sealed.subarray(sealed.byteLength - AEAD_TAG_BYTES)
         const ciphertext = sealed.subarray(0, sealed.byteLength - AEAD_TAG_BYTES)
-        const decipher = createDecipheriv('chacha20-poly1305', Buffer.from(rxKeyHex, 'hex'), nonceFor(seq), { authTagLength: AEAD_TAG_BYTES })
-        decipher.setAAD(header, { plaintextLength: ciphertext.byteLength })
+        const decipher = createDecipheriv('aes-256-gcm', Buffer.from(rxKeyHex, 'hex'), nonceFor(seq), { authTagLength: AEAD_TAG_BYTES })
+        decipher.setAAD(header)
         decipher.setAuthTag(tag)
         const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()])
         rxWindow.commit(seq)

@@ -40,6 +40,7 @@ export interface PeerEnginePeerStatus {
 export interface PeerEngineStatus {
     nodeId: string;
     gatewayState: PeerGatewayState;
+    deniedReason?: string | null;
     networkId: string | null;
     maxPeers: number | null;
     natType: PeerNatType | null;

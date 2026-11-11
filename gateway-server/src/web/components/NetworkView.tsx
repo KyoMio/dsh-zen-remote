@@ -355,7 +355,7 @@ export function NetworkView(props: NetworkViewProps) {
               {t('common.copy')}
             </button>
           </div>
-          <p className="invite-hint">{t('network.inviteHint')}</p>
+          <p className="invite-hint">{t(network.admissionMode === 'manual' ? 'network.inviteHintManual' : 'network.inviteHint')}</p>
         </section>
 
         {/* 第 2 格：身份异常优先，其次加入申请；都没有则空态（无底色） */}

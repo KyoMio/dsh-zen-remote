@@ -577,6 +577,9 @@ export declare const zh: {
     readonly 'wizard.peer.connecting': "正在连接网络…";
     readonly 'wizard.peer.offline': "与网络网关断开，正在自动重连…";
     readonly 'wizard.peer.revoked': "已被网络管理员移除或暂停";
+    readonly 'wizard.peer.deniedBadKey': "邀请链接已失效或密钥不匹配，请向管理员获取最新链接";
+    readonly 'wizard.peer.deniedFull': "该虚拟网络设备数已达上限";
+    readonly 'wizard.peer.deniedNoNetwork': "未找到该虚拟网络（可能已被删除）";
     readonly 'wizard.peer.mismatch': "网络身份校验未通过";
     readonly 'wizard.peer.notJoined': "尚未加入任何设备网络";
     readonly 'wizard.overview.peerNodeLabel': "本机角色与节点 ID";
