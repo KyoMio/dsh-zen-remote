@@ -467,6 +467,8 @@ export interface PeerStatusView {
    * `pending-approval`, `connecting`, `offline`, `unconfigured`,
    * `mismatch`, `paused`, `revoked`). */
   gatewayState: string
+  /** Optional gateway denial reason when `gatewayState` is `revoked`/`paused`. */
+  deniedReason?: string | undefined
   networkId: string | undefined
   gatewayOrigin: string | undefined
   maxPeers: number | undefined
@@ -524,6 +526,7 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     configured: safe.configured === true,
     nodeId: asStringSet(safe.nodeId),
     gatewayState: typeof safe.gatewayState === 'string' && safe.gatewayState !== '' ? safe.gatewayState : 'unconfigured',
+    deniedReason: asStringSet(safe.deniedReason) || undefined,
     networkId: asStringSet(safe.networkId) || undefined,
     gatewayOrigin: asStringSet(safe.gatewayOrigin) || undefined,
     maxPeers,

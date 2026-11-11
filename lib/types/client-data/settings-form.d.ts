@@ -288,6 +288,8 @@ export interface PeerStatusView {
      * `pending-approval`, `connecting`, `offline`, `unconfigured`,
      * `mismatch`, `paused`, `revoked`). */
     gatewayState: string;
+    /** Optional gateway denial reason when `gatewayState` is `revoked`/`paused`. */
+    deniedReason?: string | undefined;
     networkId: string | undefined;
     gatewayOrigin: string | undefined;
     maxPeers: number | undefined;

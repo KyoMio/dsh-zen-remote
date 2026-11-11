@@ -766,7 +766,11 @@ export class PeerPunchManager {
         return
       }
       session.lastPingSentAt = this.clock.now()
-      this.sendEncryptedTo(session, PeerFrameType.PING, 0, randomBytes(8), 0)
+      try {
+        this.sendEncryptedTo(session, PeerFrameType.PING, 0, randomBytes(8), 0)
+      } catch {
+        // Socket closing or transient datagram failure — keepalive timeout handles lost links cleanly.
+      }
       this.armTimer(session, tick, this.keepAliveMsOrDefault())
     }
     this.armTimer(session, tick, this.keepAliveMsOrDefault())
@@ -793,7 +797,11 @@ export class PeerPunchManager {
     for (const endpoint of session.candidates) {
       const parsed = parseEndpoint(endpoint)
       if (!parsed) continue
-      this.socket.send(packet, parsed.port, parsed.host)
+      try {
+        this.socket.send(packet, parsed.port, parsed.host)
+      } catch {
+        // Unroutable or closed UDP socket — skip candidate without crashing host timers.
+      }
     }
   }
 
@@ -814,7 +822,11 @@ export class PeerPunchManager {
       timestamp,
       sigHex: ed25519Sign(message, this.identity),
     }))
-    this.socket.send(packet, rinfo.port, rinfo.address)
+    try {
+      this.socket.send(packet, rinfo.port, rinfo.address)
+    } catch {
+      // Closed or unroutable UDP socket.
+    }
   }
 
   private handleControlPacket(bytes: Uint8Array, rinfo: { address: string; port: number }): void {
@@ -942,7 +954,11 @@ export class PeerPunchManager {
     session.endpoint = `${rinfo.address}:${rinfo.port}`
     if (header.frameType === PeerFrameType.PING) {
       if (session.state === 'direct') {
-        this.sendEncryptedTo(session, PeerFrameType.PONG, 0, Buffer.from(plaintext), 0)
+        try {
+          this.sendEncryptedTo(session, PeerFrameType.PONG, 0, Buffer.from(plaintext), 0)
+        } catch {
+          // Transient send failure; peer keepalive retries.
+        }
       }
       return
     }
@@ -982,7 +998,11 @@ export class PeerPunchManager {
       payload,
       session.ciphers,
     )
-    this.socket.send(frame, parsed.port, parsed.host)
+    try {
+      this.socket.send(frame, parsed.port, parsed.host)
+    } catch {
+      // Closed or unroutable UDP socket; ARQ / keepalive handles packet loss cleanly.
+    }
   }
 }
 

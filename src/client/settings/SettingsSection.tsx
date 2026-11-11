@@ -297,15 +297,20 @@ function peerDevicePathCopyOf(path: PeerStatusDeviceView['path'], t: SectionT): 
 
 /** Copy of the gateway admission state's one-liner (the same words the
  * wizard's peer surfaces use). */
-function peerStateCopyOf(state: string, t: SectionT): string {
+function peerStateCopyOf(state: string, t: SectionT, deniedReason?: string): string {
   switch (state) {
     case 'authorized': return t('wizard.light.pass')
     case 'pending-approval': return t('wizard.peer.pendingApproval')
     case 'connecting': return t('wizard.peer.connecting')
     case 'offline': return t('wizard.peer.offline')
     case 'mismatch': return t('wizard.peer.mismatch')
-    case 'paused':
-    case 'revoked': return t('wizard.peer.revoked')
+    case 'paused': return t('wizard.peer.revoked')
+    case 'revoked': {
+      if (deniedReason === 'join key rejected') return t('wizard.peer.deniedBadKey')
+      if (deniedReason === 'network is full') return t('wizard.peer.deniedFull')
+      if (deniedReason === 'network not found') return t('wizard.peer.deniedNoNetwork')
+      return t('wizard.peer.revoked')
+    }
     default: return t('wizard.peer.notJoined')
   }
 }
@@ -1429,7 +1434,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                     data-live={peerView.gatewayState === 'authorized' ? 'true' : undefined}
                     data-invalid={peerView.gatewayState === 'mismatch' || peerView.gatewayState === 'revoked' || peerView.gatewayState === 'paused' ? 'true' : undefined}
                   >
-                    {peerStateCopyOf(peerView.gatewayState, t)}
+                    {peerStateCopyOf(peerView.gatewayState, t, peerView.deniedReason)}
                   </span>
                 </div>
                 <p className="zr-settings-hint">

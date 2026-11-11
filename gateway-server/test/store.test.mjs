@@ -377,12 +377,18 @@ describe('SqliteStore', () => {
     assert.match(p.nodeId, HEX8);
     assert.equal(p.publicKeyHex, 'aaaaaaaa' + 'pub');
 
+    // manual 模式（「每台都需要我批准」）：即使持有效邀请链接（matched: true）加入，
+    // 也必须进入 pending 等管理员审批，绝不能被当作口令错误拒绝返回 null
+    const pWithInvite = await join(manualNet, 'aaabbbcc', { matched: true });
+    assert.ok(pWithInvite !== null, 'manual 模式下使用有效邀请链接加入不应被拒绝');
+    assert.equal(pWithInvite.status, 'pending');
+
     const a = await join(keyNet, 'bbbbbbbb', { matched: true });
     assert.equal(a.status, 'authorized');
     assert.equal(a.candidatePublicKeyHex, null);
   });
 
-  test('入网判定：key 口令不匹配 → 拒绝不入库；both 双路径', async () => {
+  test('入网判定：key 口令不匹配 → 拒绝不入库；both 双路径与 pending 补交有效邀请链接直升 authorized', async () => {
     const rejected = await join(keyNet, 'cccccccc', { matched: false });
     assert.equal(rejected, null);
     const members = await store.listMembers(keyNet.id);
@@ -391,6 +397,10 @@ describe('SqliteStore', () => {
     const bothNet = await store.createNetwork({ ownerId: adminId, name: 'both-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 4 });
     assert.equal((await join(bothNet, 'dddddddd', { matched: true })).status, 'authorized');
     assert.equal((await join(bothNet, 'eeeeeeee', { matched: false })).status, 'pending');
+    // pending 成员随后粘贴有效邀请链接（同公钥 + matched: true）重新握手，应直接升级为 authorized
+    assert.equal((await join(bothNet, 'eeeeeeee', { matched: true })).status, 'authorized');
+    // manual 模式下 pending 成员即使带邀请链接重试，仍保持 pending 等待人工批准
+    assert.equal((await join(manualNet, 'aaabbbcc', { matched: true })).status, 'pending');
   });
 
   test('F3：口令正确但已准入满额 → 抛 limit-reached（不再与口令错误混淆为 null）', async () => {

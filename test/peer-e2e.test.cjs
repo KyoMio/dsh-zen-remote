@@ -661,3 +661,53 @@ test('PG-8 #3: 本机 TOFU 锚点与网关通告分叉 → 独立阻断，trustP
     await gw.close()
   }
 })
+
+// ---------------------------------------------------------------- 5. 准入模式全矩阵与拒绝原因透传
+
+test('PG-8 #5: manual 模式持有效邀请链接进 pending 审批放行互通，key 模式错误口令透传 deniedReason 后换正确链接恢复', async () => {
+  const gw = await startGateway()
+  const manualNet = await createNetwork(gw, { mode: 'manual' })
+  const keyNet = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  try {
+    const A = await startNode(gw, { name: 'manual-a', shared: ['s-m1'] })
+    const B = await startNode(gw, { name: 'manual-b' })
+    const C = await startNode(gw, { name: 'key-c' })
+    nodes.push(A, B, C)
+
+    // 1) manual 模式：A 持完整邀请链接（含正确 joinKey）加入 → 必须停在 pending-approval，绝不变成 revoked
+    await A.engine.joinNetwork(inviteUri(gw, manualNet.id, manualNet.joinKey))
+    await waitFor(() => A.engine.status().gatewayState === 'pending-approval', 8000, 'A pending under manual mode with invite link')
+    assert.equal(A.engine.status().deniedReason, null)
+
+    // B 无口令加入同一 manual 网络 → 同样停在 pending-approval
+    await B.engine.joinNetwork(inviteUri(gw, manualNet.id, undefined))
+    await waitFor(() => B.engine.status().gatewayState === 'pending-approval', 8000, 'B pending under manual mode without key')
+
+    // 管理员依次批准 A、B → 双方实时升级为 authorized 并完成端到端加密互挂
+    const appA = await api(gw.base, 'POST', `/api/v1/networks/${manualNet.id}/members/${A.identity.nodeId}/approve`, { cookie: gw.tenantCookie })
+    assert.equal(appA.status, 200)
+    const appB = await api(gw.base, 'POST', `/api/v1/networks/${manualNet.id}/members/${B.identity.nodeId}/approve`, { cookie: gw.tenantCookie })
+    assert.equal(appB.status, 200)
+    await waitFor(() => A.engine.status().gatewayState === 'authorized', 8000, 'A authorized after approve')
+    await waitFor(() => B.engine.status().gatewayState === 'authorized', 8000, 'B authorized after approve')
+
+    const virtualAonB = await waitPeerOnline(B, A.identity.nodeId)
+    A.listResults.set('*', { items: [{ sessionId: 's-m1', title: 'manual-session' }] })
+    const listed = await virtualAonB.client.invoke('session', 'list', { request: {} })
+    assert.equal(listed.items[0].sessionId, 's-m1')
+
+    // 2) key 模式：C 先用错误邀请密钥加入 → revoked 且 deniedReason === 'join key rejected'
+    await C.engine.joinNetwork(inviteUri(gw, keyNet.id, 'wrong-key-value'))
+    await waitFor(() => C.engine.status().gatewayState === 'revoked', 8000, 'C denied on wrong joinKey')
+    assert.equal(C.engine.status().deniedReason, 'join key rejected')
+
+    // C 换正确邀请链接重连 → 自动准入 authorized，deniedReason 清空
+    await C.engine.joinNetwork(inviteUri(gw, keyNet.id, keyNet.joinKey))
+    await waitFor(() => C.engine.status().gatewayState === 'authorized', 8000, 'C authorized after valid joinKey')
+    assert.equal(C.engine.status().deniedReason, null)
+  } finally {
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})

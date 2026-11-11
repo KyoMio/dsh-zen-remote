@@ -191,24 +191,30 @@ export interface JoinDecisionInput {
 }
 
 /**
- * 入网状态决策（PG-3 任务单语义 + PG-3-fix F3）：
+ * 入网状态决策（PG-3 任务单语义 + PG-3-fix F3 + manual/both 全矩阵校准）：
  * - 已存在且非 revoked、公钥不同 → 'mismatch'（暂存候选，等管理员裁决）；
- * - 已存在且非 revoked、公钥相同 → 'keep'（保持现状，幂等）；
+ * - 已存在且非 revoked、公钥相同：
+ *   - 若当前为 'pending' 且本次持有效口令（key/both 模式） → 按新准入校验席位升 'authorize' 或 'limit-reached'；
+ *   - 其余状态 → 'keep'（保持现状，幂等；manual 下持邀请链接重试仍保持 pending）；
  * - 新成员或此前 revoked：
  *   - 口令匹配（key/both 模式）且席位未满 → 'authorize'；
- *   - 口令匹配但席位满 → 'limit-reached'（store 层转 StoreError——上层需要向节点端
+ *   - 口令匹配（key/both 模式）但席位满 → 'limit-reached'（store 层转 StoreError——上层需要向节点端
  *     明确区分「网络已满」与「口令错误」，两者不能都落成 null）；
- *   - 无口令且 manual/both → 'pending'（待审批，不占席位，approve 时再查容量）；
+ *   - manual 模式（无论是否带邀请口令）或 both 模式无有效口令 → 'pending'（待审批，不占席位，approve 时再查容量）；
  *   - key 模式口令不匹配 → 'reject'，拒绝不入库。
  */
 export function decideJoinAttempt(input: JoinDecisionInput): JoinDecision {
   const { admissionMode, maxPeers, existing, incomingPublicKeyHex, joinKeyMatched, capacityUsed } = input;
-  if (existing !== null && existing.status !== 'revoked') {
-    return existing.publicKeyHex !== incomingPublicKeyHex ? 'mismatch' : 'keep';
-  }
   const keyAdmitted = joinKeyMatched && (admissionMode === 'key' || admissionMode === 'both');
+  if (existing !== null && existing.status !== 'revoked') {
+    if (existing.publicKeyHex !== incomingPublicKeyHex) return 'mismatch';
+    if (existing.status === 'pending' && keyAdmitted) {
+      return capacityUsed < maxPeers ? 'authorize' : 'limit-reached';
+    }
+    return 'keep';
+  }
   if (keyAdmitted) return capacityUsed < maxPeers ? 'authorize' : 'limit-reached';
-  if (!joinKeyMatched && (admissionMode === 'manual' || admissionMode === 'both')) return 'pending';
+  if (admissionMode === 'manual' || admissionMode === 'both') return 'pending';
   return 'reject';
 }
 

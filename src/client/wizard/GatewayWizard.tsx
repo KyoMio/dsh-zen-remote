@@ -193,15 +193,20 @@ function peerDevicePathCopy(path: PeerDeviceView['path'], t: GatewayWizardProps[
 }
 
 /** The gateway admission state's one-line copy on the peer surfaces (PG-9). */
-function peerStateCopy(state: string, t: GatewayWizardProps['t']): string {
+function peerStateCopy(state: string, t: GatewayWizardProps['t'], deniedReason?: string): string {
   switch (state) {
     case 'authorized': return t('wizard.light.pass')
     case 'pending-approval': return t('wizard.peer.pendingApproval')
     case 'connecting': return t('wizard.peer.connecting')
     case 'offline': return t('wizard.peer.offline')
     case 'mismatch': return t('wizard.peer.mismatch')
-    case 'paused':
-    case 'revoked': return t('wizard.peer.revoked')
+    case 'paused': return t('wizard.peer.revoked')
+    case 'revoked': {
+      if (deniedReason === 'join key rejected') return t('wizard.peer.deniedBadKey')
+      if (deniedReason === 'network is full') return t('wizard.peer.deniedFull')
+      if (deniedReason === 'network not found') return t('wizard.peer.deniedNoNetwork')
+      return t('wizard.peer.revoked')
+    }
     default: return t('wizard.peer.notJoined')
   }
 }
@@ -1385,7 +1390,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       const light = state === 'authorized' ? 'pass' : state === 'mismatch' || state === 'revoked' || state === 'paused' ? 'fail' : 'pending'
       return {
         state: light as 'pass' | 'pending' | 'fail',
-        text: peerView?.configured === true ? peerStateCopy(state, t) : t('wizard.peer.notJoined'),
+        text: peerView?.configured === true ? peerStateCopy(state, t, peerView.deniedReason) : t('wizard.peer.notJoined'),
       }
     }
     if (effectiveClient) {
@@ -1601,7 +1606,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 <p className="zr-wizard-overviewLabel">{t('wizard.overview.peerNetworkLabel')}</p>
                 <p className="zr-wizard-overviewValue">
                   <span className="zr-wizard-dot" data-state={peerLights.admission} />
-                  <span>{peerView?.configured === true ? peerStateCopy(peerView.gatewayState, t) : t('wizard.overview.peerNetworkNone')}</span>
+                  <span>{peerView?.configured === true ? peerStateCopy(peerView.gatewayState, t, peerView.deniedReason) : t('wizard.overview.peerNetworkNone')}</span>
                 </p>
                 <p className="zr-wizard-overviewSub">{peerView?.networkId !== undefined ? peerView.networkId : ''}</p>
               </div>
@@ -2450,7 +2455,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                     <>
                       <div className="zr-wizard-serviceInfo">
                         <span className="zr-wizard-dot" data-state={peerLights.admission} />
-                        <span className="zr-wizard-lightName">{peerView?.configured === true ? peerStateCopy(peerView.gatewayState, t) : t('wizard.peer.notJoined')}</span>
+                        <span className="zr-wizard-lightName">{peerView?.configured === true ? peerStateCopy(peerView.gatewayState, t, peerView.deniedReason) : t('wizard.peer.notJoined')}</span>
                         <span className="zr-wizard-hint">{peerView?.configured === true && peerView.networkId !== undefined ? peerView.networkId : ''}</span>
                       </div>
                       <ul className="zr-wizard-lights">

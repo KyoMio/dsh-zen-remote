@@ -74,6 +74,7 @@ export interface PeerEnginePeerStatus {
 export interface PeerEngineStatus {
   nodeId: string
   gatewayState: PeerGatewayState
+  deniedReason?: string | null
   networkId: string | null
   maxPeers: number | null
   natType: PeerNatType | null
@@ -163,6 +164,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let stopped = false
   let networkId: string | null = null
   let gatewayState: PeerGatewayState = 'unconfigured'
+  let deniedReason: string | null = null
   let maxPeers: number | null = null
   let natType: PeerNatType | null = null
   let stunProbed = false
@@ -415,6 +417,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       return
     }
     if (type === 'welcome') {
+      deniedReason = null
       maxPeers = typeof message['maxPeers'] === 'number' && Number.isInteger(message['maxPeers']) ? (message['maxPeers'] as number) : maxPeers
       const status = message['status']
       if (status === 'authorized') {
@@ -445,6 +448,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       // authorized 闸之前处理，否则挂在 connecting/pending 的连接会把拒绝
       // 静默吞掉，永远停在旧状态。
       const reason = typeof message['reason'] === 'string' ? message['reason'] : ''
+      deniedReason = reason !== '' ? reason : null
       wsReconnectable = false
       gatewayState = reason.includes('paused') ? 'paused' : 'revoked'
       log(`peer engine: gateway denied (${reason || 'no reason'})`)
@@ -600,18 +604,27 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     // 打洞 socket 时才指向 peers 可达的端口。注入 socket（测试/防火墙包装）
     // 未绑定时这里代绑；没有注入时引擎自建一个并持有（stop 时关闭），
     // punch 管理器因此永远走「自带 socket」的路径（ownsSocket=false）。
-    if (options.udpSocket !== undefined) {
+    if (options.udpSocket !== undefined && punchSocket === undefined) {
       let bound = true
       try {
         bound = options.udpSocket.address().port > 0
       } catch {
         bound = false
       }
-      if (!bound) {
-        options.udpSocket.bind({ port: 0, address: '0.0.0.0' }, () => {})
+      if (bound) {
+        punchSocket = options.udpSocket
+      } else {
+        try {
+          options.udpSocket.bind({ port: 0, address: '0.0.0.0' }, () => {})
+          punchSocket = options.udpSocket
+        } catch {
+          // 前一轮 resetActiveSession 中 PeerPunchManager.close() 已关闭注入的 socket，
+          // dgram.Socket 关闭后不可重绑（ERR_SOCKET_DGRAM_NOT_RUNNING），回退自建新 socket。
+          punchSocket = undefined
+        }
       }
-      punchSocket = options.udpSocket
-    } else if (punchSocket === undefined) {
+    }
+    if (punchSocket === undefined) {
       const socket = createSocket('udp4')
       socket.unref?.()
       socket.bind({ port: 0, address: '0.0.0.0' }, () => {})
@@ -676,13 +689,14 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     // PeerPunchManager.close() 关闭了底层 dgram socket；引擎自建的 punchSocket
     // 必须清空引用，下一轮 joinNetwork 的 buildPunch() 才会重建已绑定新 socket，
     // 避免在已关闭 socket 上等待 ready() 永久挂起。
-    if (punchSocket !== undefined && options.udpSocket === undefined) {
+    if (punchSocket !== undefined && punchSocket !== options.udpSocket) {
       try { punchSocket.close() } catch { /* already closed */ }
-      punchSocket = undefined
     }
+    punchSocket = undefined
     stunProbed = false
     natType = null
     maxPeers = null
+    deniedReason = null
   }
 
   return {
@@ -725,10 +739,15 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       // 打洞 socket 的 ready 在后台等待，auth 帧晚一拍上送没有影响——
       // challenge 本来就要等网关回应才发。
       void (async () => {
-        const manager = buildPunch()
-        if (manager !== null) await manager.ready()
-        buildMux()
-        connectWs()
+        try {
+          const manager = buildPunch()
+          if (manager !== null) await manager.ready()
+          if (stopped || punch !== manager) return
+          buildMux()
+          connectWs()
+        } catch (err) {
+          log(`peer engine: resumeFromState failed: ${err instanceof Error ? err.message : String(err)}`)
+        }
       })()
       return true
     },
@@ -804,6 +823,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       return {
         nodeId: identity.nodeId,
         gatewayState,
+        deniedReason,
         networkId,
         maxPeers,
         natType,
@@ -814,6 +834,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     stop() {
       if (stopped) return
       stopped = true
+      deniedReason = null
       for (const member of [...members.values()]) unmountPeer(member)
       members.clear()
       if (wsReconnectTimer !== null) {
@@ -835,7 +856,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       punch?.close()
       punch = null
       // 自建 socket 在这里收口；注入的 socket 归调用方，引擎不代关。
-      if (punchSocket !== undefined && options.udpSocket === undefined) {
+      if (punchSocket !== undefined && punchSocket !== options.udpSocket) {
         try { punchSocket.close() } catch { /* already closed */ }
       }
       punchSocket = undefined

@@ -437,8 +437,8 @@ export class SqliteStore implements GatewayStore {
           publicKeyHex: str(existing.public_key_hex),
         };
       }
-      // 快速路径之外的容量计数只在需要授权/待审判定时才查（keep/mismatch 用不到）
-      if (decisionExisting === null || decisionExisting.status === 'revoked') {
+      // 快速路径之外的容量计数在首次准入、revoked 重入或 pending 补交有效口令直升时查询
+      if (decisionExisting === null || decisionExisting.status === 'revoked' || decisionExisting.status === 'pending') {
         const countRow = this.db
           .prepare(
             "SELECT COUNT(*) AS n FROM network_members WHERE network_id = ? AND status IN ('authorized','paused','mismatch')",
