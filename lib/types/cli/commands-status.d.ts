@@ -32,15 +32,22 @@ export declare function stateLabelOf(t: CliTranslator, value: unknown): string;
 export declare function compatLabelOf(t: CliTranslator, value: unknown): string;
 /** The bridged-plugin half: how many of the row's plugins are bridged. */
 export declare function bridgeLabelOf(t: CliTranslator, value: unknown): string;
+/** The peer gateway admission label (PG-10): the seven engine states
+ * translated, an unknown value rendered as-is. Shared with the `peer`
+ * command family's own renderings. */
+export declare function gatewayStateLabel(t: CliTranslator, value: unknown): string;
+/** The peer connection-path label: 局域网直连 / 直连 / 经网关中转 / 身份异常 /
+ * 离线. Unknown values render as 离线, the engine's default verdict. */
+export declare function peerPathLabelOf(t: CliTranslator, value: unknown): string;
 /** One paired-host row, the exact shape both surfaces print:
  * `[entryId] displayName  serverUrl  state  compat/bridge`. */
 export declare function serverLineText(t: CliTranslator, row: ServerRow): string;
 /**
  * `dsh-zen-remote status [--json] [--debug [outPath]]`. Identity from one
- * ping; the host surfaces (admin status, wizard status, share list) and the
- * client pool status each fetched only when the role answers them. Exit
- * codes: 0 on any answered status, 1 when the ping itself or the debug
- * round-trip failed.
+ * ping; the host surfaces (admin status, wizard status, share list), the
+ * client pool status, and — on a peer node — the peer engine snapshot are
+ * each fetched only when the role answers them. Exit codes: 0 on any
+ * answered status, 1 when the ping itself or the debug round-trip failed.
  */
 export declare function runStatusCommand(ctx: CliExecutionContext): Promise<number>;
 //# sourceMappingURL=commands-status.d.ts.map

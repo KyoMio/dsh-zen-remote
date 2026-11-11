@@ -12,11 +12,14 @@
  * THAT live IPC client.
  *
  * Step 1 is the role. Switching mirrors GatewayWizard.tsx's discipline
- * exactly: host → client stops the managed Caddy / Cloudflare tunnel through
- * their IPC stop routes BEFORE writing `role: 'client'`, then polls ping
- * until `connects`; client → host writes `role: 'host'` and polls until
- * `serves` (the row reloads under the CLI — the hot-swap socket never
- * drops).
+ * exactly: anything → client stops the managed Caddy / Cloudflare tunnel
+ * through their IPC stop routes BEFORE writing `role: 'client'` (a peer
+ * serves the gateway too, so peer → client stops them as well), then polls
+ * ping until `connects`; → host writes `role: 'host'` and polls until
+ * `serves`; → peer writes `role: 'peer'` and polls until the peer surface
+ * answers — NEVER stopping the managed ingress children, because
+ * `servesRole('peer')` stays true and the phone gateway channel survives
+ * (the row reloads under the CLI — the hot-swap socket never drops).
  *
  * Steps 2 & 3 are NOT reimplementations: the host branch drives
  * `runHostIngressStartCommand` / `runHostIngressVerifyCommand` (mode
@@ -47,8 +50,9 @@ import {
   writeConfigOrReport,
 } from './commands-host.js'
 import { runClientPairCommand, runClientUnpairCommand } from './commands-client.js'
+import { runPeerJoinCommand } from './commands-peer.js'
 import { WIZARD_STATUS_ROUTE, WIZARD_CADDY_STOP_ROUTE, WIZARD_TUNNEL_STOP_ROUTE } from '../wizard/routes.js'
-import { CLIENT_STATUS_ROUTE } from '../client-routes.js'
+import { CLIENT_STATUS_ROUTE, CLIENT_PEER_STATUS_ROUTE } from '../client-routes.js'
 
 /** Everything `runSetupCommand` needs beyond a plain command context: the
  * preflight owns discovery and launch, so it takes the same injectable
@@ -110,8 +114,8 @@ function commandCtx(ctx: SetupCommandContext, argv: string[], ipc: CliIpcClient)
 
 /** The user's setup options, re-issued as argv for the driven subcommands —
  * the inner flows read the SAME values (`--domain`, `--cf-token`,
- * `--no-wait`, …) they would have read from a direct `host` / `client`
- * invocation. */
+ * `--no-wait`, …) they would have read from a direct `host` / `client` /
+ * `peer` invocation. */
 function carryOptionArgs(options: CliOptions): string[] {
   const argv: string[] = []
   if (options.wait !== 20) argv.push('--wait', String(options.wait))
@@ -126,6 +130,7 @@ function carryOptionArgs(options: CliOptions): string[] {
   if (options.hostUrl !== undefined) argv.push('--host-url', options.hostUrl)
   if (options.code !== undefined) argv.push('--code', options.code)
   if (options.name !== undefined) argv.push('--name', options.name)
+  if (options.invite !== undefined) argv.push('--invite', options.invite)
   return argv
 }
 
@@ -221,28 +226,26 @@ function printStepHeader(ctx: SetupCommandContext, titleKey: string): void {
   stdout.write(`\n${t('setup.divider')}\n${t(titleKey)}\n${t('setup.divider')}\n`)
 }
 
-/** Resolve the target role: the flag wins (peer / garbage answered with the
- * bilingual refusal), an interactive run asks with the current role
- * highlighted, a headless run fails fast on the missing option. */
-async function resolveTargetRole(ctx: SetupCommandContext, ping: CliPingResponse): Promise<'host' | 'client' | undefined> {
+/** Resolve the target role: the flag wins (garbage answered with the
+ * bilingual refusal — `host` / `client` / `peer` are all legal since PG-10),
+ * an interactive run asks with the current role highlighted, a headless run
+ * fails fast on the missing option. */
+async function resolveTargetRole(ctx: SetupCommandContext, ping: CliPingResponse): Promise<'host' | 'client' | 'peer' | undefined> {
   const { t, args } = ctx
   const requested = args.options.role
-  if (requested === 'host' || requested === 'client') return requested
+  if (requested === 'host' || requested === 'client' || requested === 'peer') return requested
   if (requested !== undefined) {
-    const message = requested === 'peer'
-      ? t('err.role.peerNotEnabled')
-      : t('err.role.invalid', { value: requested })
-    ctx.stdout.write(`${message}\n`)
+    ctx.stdout.write(`${t('err.role.invalid', { value: requested })}\n`)
     return undefined
   }
   if (ctx.interactive && ctx.prompter !== undefined) {
     printStepHeader(ctx, 'setup.step1Title')
     const picked = await ctx.prompter.selectOne(
       t('setup.roleQuestion'),
-      [t('setup.roleHost'), t('setup.roleClient')],
-      ping.role === 'client' ? 1 : 0,
+      [t('setup.roleHost'), t('setup.roleClient'), t('setup.rolePeer')],
+      ping.role === 'client' ? 1 : ping.role === 'peer' ? 2 : 0,
     )
-    return picked === 1 ? 'client' : 'host'
+    return picked === 1 ? 'client' : picked === 2 ? 'peer' : 'host'
   }
   throw new MissingRequiredOptionError('role')
 }
@@ -470,6 +473,58 @@ async function runClientBranch(ctx: SetupCommandContext, ipc: CliIpcClient): Pro
 }
 
 // ===========================================================================
+// Steps 2 & 3, peer branch
+// ===========================================================================
+
+/**
+ * The peer branch: collect the invite link (with the keep-current-network
+ * offer when this machine is already in one), drive `peer join` (the SAME
+ * command the `peer` family uses — invite validation, optional name, the
+ * join POST and the bounded admission wait), then summarize the node state
+ * next to the local gateway state.
+ */
+async function runPeerBranch(ctx: SetupCommandContext, ipc: CliIpcClient): Promise<number> {
+  const { t, args } = ctx
+  const out = ctx.stdout
+  const options = args.options
+
+  printStepHeader(ctx, 'setup.step2PeerTitle')
+
+  const invite = options.invite ?? args.target
+  const current = await fetchBody(() => ipc.request('GET', CLIENT_PEER_STATUS_ROUTE))
+  const alreadyIn = current?.configured === true
+  const keepCurrent = alreadyIn && invite === undefined && ctx.interactive && ctx.prompter !== undefined
+    ? await ctx.prompter.confirm(t('setup.peerKeepQuestion'), true)
+    : alreadyIn && invite === undefined // headless without an invite: keep what works
+  if (!keepCurrent) {
+    // The SAME join flow `peer join` uses; the invite rides the positional
+    // or the carried `--invite`, so the inner flow reads the same values.
+    const pairArgv = ['peer', 'join', ...carryOptionArgs(options)]
+    if (options.invite === undefined && invite !== undefined) pairArgv.push(invite)
+    const joinCode = await runPeerJoinCommand(commandCtx(ctx, pairArgv, ipc))
+    if (joinCode !== 0) return joinCode
+  }
+
+  // Completion summary: the node + gateway state as it stands NOW.
+  const [settled, wizard] = await Promise.all([
+    fetchBody(() => ipc.request('GET', CLIENT_PEER_STATUS_ROUTE)),
+    fetchBody(() => ipc.request('GET', WIZARD_STATUS_ROUTE)),
+  ])
+  const settledState = settled?.configured === true
+    ? `${t(`peer.gateway.${typeof settled.gatewayState === 'string' ? settled.gatewayState : 'offline'}`)} · ${typeof settled.networkId === 'string' ? settled.networkId : ''}`
+    : t('peer.status.notJoined')
+  const mode = textOf(wizard, 'mode') === '' ? 'off' : textOf(wizard, 'mode')
+  out.write(`\n${t('setup.divider')}\n`)
+  out.write(`${t('setup.summary.title')}\n`)
+  out.write(`${t('setup.summary.role', { role: 'peer' })}\n`)
+  out.write(`${t('setup.summary.peer', { state: settledState })}\n`)
+  out.write(`${t('setup.summary.peerGateway', { mode })}\n`)
+  out.write(`${t('setup.summary.peerHint')}\n`)
+  out.write(`${t('setup.divider')}\n`)
+  return 0
+}
+
+// ===========================================================================
 // The whole wizard
 // ===========================================================================
 
@@ -489,16 +544,17 @@ export async function runSetupCommand(ctx: SetupCommandContext): Promise<number>
   if (target === undefined) return 1
 
   // Step 1's switch sync (GatewayWizard.tsx's discipline): the managed
-  // ingress processes belong to the outgoing role and are stopped before
-  // the config write; the polls ride out the restart-watcher reload over
-  // the hot-swap socket.
-  const pollUntil = async (want: (ping: CliPingResponse) => boolean): Promise<boolean> => {
+  // ingress processes belong to the outgoing role and are stopped ONLY when
+  // the target role cannot serve them (`servesRole` false — switching to
+  // `client`); the polls ride out the restart-watcher reload over the
+  // hot-swap socket.
+  const pollUntil = async (want: (ping: CliPingResponse) => boolean | Promise<boolean>): Promise<boolean> => {
     const interval = ctx.pollIntervalMs ?? ROLE_POLL_INTERVAL_DEFAULT_MS
     const deadline = Date.now() + waitSeconds * 1000
     while (true) {
       try {
         const current = await ipc.ping()
-        if (want(current)) return true
+        if (await want(current)) return true
       } catch {
         // A reload window can drop one ping — the deadline decides.
       }
@@ -508,10 +564,15 @@ export async function runSetupCommand(ctx: SetupCommandContext): Promise<number>
   }
 
   if (target === 'host') {
-    if (!up.ping.serves) {
+    if (up.ping.role !== 'host') {
+      // A peer already serves (`servesRole('peer')` is true), so the old
+      // `!serves` gate silently SKIPPED the write and left the machine a
+      // peer forever (PG-10-fix). Gate on the role instead — and switching
+      // peer→host never stops the managed ingress children: both roles
+      // serve, the gateway and tunnel stay up.
       ctx.stdout.write(`${t('setup.switchingToHost')}\n`)
       if (!(await writeConfigOrReport(commandCtx(ctx, ['status'], ipc), { role: 'host' }))) return 1
-      if (!(await pollUntil((ping) => ping.serves === true))) {
+      if (!(await pollUntil((ping) => ping.role === 'host' && ping.serves === true))) {
         ctx.stdout.write(`${t('setup.roleSwitchTimeout', { seconds: waitSeconds })}\n`)
         return 1
       }
@@ -519,7 +580,30 @@ export async function runSetupCommand(ctx: SetupCommandContext): Promise<number>
     return await runHostBranch(ctx, ipc)
   }
 
+  if (target === 'peer') {
+    if (up.ping.role !== 'peer') {
+      // The PG-10 iron rule: switching to peer NEVER stops the managed
+      // Caddy / cloudflared children — `servesRole('peer')` is true, so the
+      // phone / browser gateway channel survives the switch.
+      ctx.stdout.write(`${t('setup.switchingToPeer')}\n`)
+      if (!(await writeConfigOrReport(commandCtx(ctx, ['status'], ipc), { role: 'peer' }))) return 1
+      const peerReady = async (ping: CliPingResponse): Promise<boolean> => {
+        if (ping.role !== 'peer') return false
+        // Past the reload window: the peer surface must answer before the
+        // wizard moves on.
+        return (await fetchBody(() => ipc.request('GET', CLIENT_PEER_STATUS_ROUTE))) !== null
+      }
+      if (!(await pollUntil(peerReady))) {
+        ctx.stdout.write(`${t('setup.roleSwitchTimeout', { seconds: waitSeconds })}\n`)
+        return 1
+      }
+    }
+    return await runPeerBranch(ctx, ipc)
+  }
+
   if (up.ping.serves) {
+    // host→client AND peer→client: the outgoing role was serving the
+    // gateway, so the managed ingress children stop before the write.
     ctx.stdout.write(`${t('setup.switchingToClient')}\n`)
     // Best-effort stops: a refused stop must not block the role switch.
     try {
@@ -531,7 +615,10 @@ export async function runSetupCommand(ctx: SetupCommandContext): Promise<number>
   }
   if (up.ping.role !== 'client') {
     if (!(await writeConfigOrReport(commandCtx(ctx, ['status'], ipc), { role: 'client' }))) return 1
-    if (!(await pollUntil((ping) => ping.connects === true))) {
+    // A peer's old row already answers `connects: true`, so `connects` alone
+    // passed the poll on the first beat and the wizard raced into the client
+    // branch before the reload landed (PG-10-fix). The ROLE must read client.
+    if (!(await pollUntil((ping) => ping.role === 'client' && ping.connects === true))) {
       ctx.stdout.write(`${t('setup.roleSwitchTimeout', { seconds: waitSeconds })}\n`)
       return 1
     }

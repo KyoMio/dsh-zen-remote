@@ -12,11 +12,14 @@
  * THAT live IPC client.
  *
  * Step 1 is the role. Switching mirrors GatewayWizard.tsx's discipline
- * exactly: host → client stops the managed Caddy / Cloudflare tunnel through
- * their IPC stop routes BEFORE writing `role: 'client'`, then polls ping
- * until `connects`; client → host writes `role: 'host'` and polls until
- * `serves` (the row reloads under the CLI — the hot-swap socket never
- * drops).
+ * exactly: anything → client stops the managed Caddy / Cloudflare tunnel
+ * through their IPC stop routes BEFORE writing `role: 'client'` (a peer
+ * serves the gateway too, so peer → client stops them as well), then polls
+ * ping until `connects`; → host writes `role: 'host'` and polls until
+ * `serves`; → peer writes `role: 'peer'` and polls until the peer surface
+ * answers — NEVER stopping the managed ingress children, because
+ * `servesRole('peer')` stays true and the phone gateway channel survives
+ * (the row reloads under the CLI — the hot-swap socket never drops).
  *
  * Steps 2 & 3 are NOT reimplementations: the host branch drives
  * `runHostIngressStartCommand` / `runHostIngressVerifyCommand` (mode

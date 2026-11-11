@@ -16,7 +16,7 @@ import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ADMIN_STATUS_ROUTE, ADMIN_SHARES_ROUTE } from '../admin-routes.js'
 import { WIZARD_STATUS_ROUTE } from '../wizard/routes.js'
-import { CLIENT_STATUS_ROUTE } from '../client-routes.js'
+import { CLIENT_STATUS_ROUTE, CLIENT_PEER_STATUS_ROUTE } from '../client-routes.js'
 import type { CliIpcRequestResult } from './ipc-client.js'
 import type { CliPingResponse } from './ipc-client.js'
 import type { CliTranslator } from './i18n.js'
@@ -89,6 +89,34 @@ export function bridgeLabelOf(t: CliTranslator, value: unknown): string {
   const plugins = arrayOf(value)
   const bridged = plugins.filter((entry) => plainOf(entry)?.bridged === true).length
   return t('status.client.bridgeCount', { count: bridged })
+}
+
+/** The peer gateway admission label (PG-10): the seven engine states
+ * translated, an unknown value rendered as-is. Shared with the `peer`
+ * command family's own renderings. */
+export function gatewayStateLabel(t: CliTranslator, value: unknown): string {
+  switch (value) {
+    case 'idle': return t('peer.gateway.idle')
+    case 'connecting': return t('peer.gateway.connecting')
+    case 'pending-approval': return t('peer.gateway.pending-approval')
+    case 'authorized': return t('peer.gateway.authorized')
+    case 'paused': return t('peer.gateway.paused')
+    case 'revoked': return t('peer.gateway.revoked')
+    case 'offline': return t('peer.gateway.offline')
+    default: return stringOf(value) === '' ? t('peer.gateway.offline') : String(value)
+  }
+}
+
+/** The peer connection-path label: 局域网直连 / 直连 / 经网关中转 / 身份异常 /
+ * 离线. Unknown values render as 离线, the engine's default verdict. */
+export function peerPathLabelOf(t: CliTranslator, value: unknown): string {
+  switch (value) {
+    case 'lan': return t('peer.path.lan')
+    case 'p2p': return t('peer.path.p2p')
+    case 'relay': return t('peer.path.relay')
+    case 'mismatch': return t('peer.path.mismatch')
+    default: return t('peer.path.offline')
+  }
 }
 
 /** One paired-host row, the exact shape both surfaces print:
@@ -225,6 +253,41 @@ function renderClientSection(t: CliTranslator, client: ServerRow): string[] {
   return lines
 }
 
+/** The terminal peer section (PG-10): the node's virtual-network facts —
+ * node id, joined network + gateway, admission state, and one row per
+ * network device. A missing engine answer renders nothing (the section title
+ * alone) instead of failing the command. */
+function renderPeerSection(t: CliTranslator, peer: ServerRow | null): string[] {
+  const lines: string[] = [t('peer.status.title')]
+  if (peer === null) return lines
+  const nodeId = typeof peer.nodeId === 'string' ? peer.nodeId : ''
+  lines.push(`  ${t('peer.status.nodeId', { nodeId })}`)
+  if (peer.configured !== true) {
+    lines.push(`  ${t('peer.status.notJoined')}`)
+    return lines
+  }
+  const networkId = typeof peer.networkId === 'string' ? peer.networkId : ''
+  const origin = typeof peer.gatewayOrigin === 'string' && peer.gatewayOrigin !== '' ? peer.gatewayOrigin : '—'
+  lines.push(`  ${t('peer.status.joined', { networkId, origin })}`)
+  lines.push(`  ${t('peer.status.gatewayState', { state: gatewayStateLabel(t, peer.gatewayState) })}`)
+  const peers = arrayOf(peer.peers)
+    .map((row) => plainOf(row))
+    .filter((row): row is ServerRow => row !== null)
+  lines.push(`  ${t('peer.status.deviceCount', { count: peers.length })}`)
+  for (const row of peers) {
+    const rttMs = row.rttMs
+    const rtt = typeof rttMs === 'number' && Number.isFinite(rttMs) ? t('peer.status.rtt', { rttMs }) : '—'
+    lines.push(t('peer.status.deviceLine', {
+      name: typeof row.name === 'string' ? row.name : '',
+      nodeId: typeof row.nodeId === 'string' ? row.nodeId : '',
+      path: peerPathLabelOf(t, row.path),
+      rtt,
+      mounted: row.mounted === true ? t('peer.mounted.yes') : t('peer.mounted.no'),
+    }))
+  }
+  return lines
+}
+
 /** The `--json` body: identity always, the sections the role answers. */
 function statusJsonBody(
   ping: CliPingResponse,
@@ -232,6 +295,7 @@ function statusJsonBody(
   wizard: ServerRow | null,
   shares: ServerRow | null,
   client: ServerRow | null,
+  peer: ServerRow | null,
 ): ServerRow {
   const body: ServerRow = {
     experimental: true,
@@ -244,15 +308,16 @@ function statusJsonBody(
   if (ping.connects && client !== null) {
     body.client = { maxServers: typeof client.maxServers === 'number' ? client.maxServers : 8, servers: arrayOf(client.servers) }
   }
+  if (ping.role === 'peer' && peer !== null) body.peer = peer
   return body
 }
 
 /**
  * `dsh-zen-remote status [--json] [--debug [outPath]]`. Identity from one
- * ping; the host surfaces (admin status, wizard status, share list) and the
- * client pool status each fetched only when the role answers them. Exit
- * codes: 0 on any answered status, 1 when the ping itself or the debug
- * round-trip failed.
+ * ping; the host surfaces (admin status, wizard status, share list), the
+ * client pool status, and — on a peer node — the peer engine snapshot are
+ * each fetched only when the role answers them. Exit codes: 0 on any
+ * answered status, 1 when the ping itself or the debug round-trip failed.
  */
 export async function runStatusCommand(ctx: CliExecutionContext): Promise<number> {
   const { t, ipc, args } = ctx
@@ -271,15 +336,16 @@ export async function runStatusCommand(ctx: CliExecutionContext): Promise<number
 
   // The role decides which surfaces exist; fetches run concurrently and any
   // failure degrades to "no information" rather than failing the command.
-  const [admin, wizard, shares, client] = await Promise.all([
+  const [admin, wizard, shares, client, peer] = await Promise.all([
     ping.serves ? fetchBody(() => ipc.request('GET', ADMIN_STATUS_ROUTE)) : Promise.resolve(null),
     ping.serves ? fetchBody(() => ipc.request('GET', WIZARD_STATUS_ROUTE)) : Promise.resolve(null),
     ping.serves ? fetchBody(() => ipc.request('GET', ADMIN_SHARES_ROUTE)) : Promise.resolve(null),
     ping.connects ? fetchBody(() => ipc.request('GET', CLIENT_STATUS_ROUTE)) : Promise.resolve(null),
+    ping.role === 'peer' ? fetchBody(() => ipc.request('GET', CLIENT_PEER_STATUS_ROUTE)) : Promise.resolve(null),
   ])
 
   if (args.options.json) {
-    out.write(`${JSON.stringify(statusJsonBody(ping, admin, wizard, shares, client), null, 2)}\n`)
+    out.write(`${JSON.stringify(statusJsonBody(ping, admin, wizard, shares, client, peer), null, 2)}\n`)
     return 0
   }
 
@@ -289,6 +355,7 @@ export async function runStatusCommand(ctx: CliExecutionContext): Promise<number
     t('status.pluginVersion', { version: ping.pluginVersion }),
   ]
   if (ping.profileName !== undefined) lines.push(t('status.profile', { profile: ping.profileName }))
+  if (ping.role === 'peer') lines.push(...renderPeerSection(t, peer))
   if (ping.serves) lines.push(...renderHostSection(t, admin, wizard, shares))
   if (ping.connects && client !== null) lines.push(...renderClientSection(t, client))
   out.write(`${lines.join('\n')}\n`)

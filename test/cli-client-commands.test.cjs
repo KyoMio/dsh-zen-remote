@@ -332,27 +332,38 @@ test('status：client 角色 --json——client 板块带 maxServers 与 servers
   }
 })
 
-test('status：peer 角色标注「手工设置，未启用」，无数据时 host 板块如实留白、client 板块缺席', async () => {
+test('status：peer 角色标注「peer（节点端）」，节点端板块与 host 板块如实渲染', async () => {
   const mods = await loadModules()
   const home = makeHome('status-peer')
   let handle
   try {
-    const canned = cannedDelegate({ role: 'peer', serverName: '手工机' })
+    const peerClient = {
+      '/_dsh/zen-remote/client/peer/status': {
+        body: {
+          configured: true, nodeId: 'aa1b2c3d', gatewayState: 'authorized',
+          networkId: 'abcdef1234567890', gatewayOrigin: 'https://gw.example.com', maxPeers: 8,
+          peers: [{ nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 }],
+        },
+      },
+    }
+    const canned = cannedDelegate({ role: 'peer', serverName: '手工机', admin: HOST_ADMIN, wizard: HOST_WIZARD, client: peerClient })
     handle = await mods.createCliIpcServer({ dshHome: home, delegate: canned.delegate })
     const ipc = mods.createCliIpcClient(handle.socketPath)
     const ctx = makeCtx(mods, { argv: ['status'], ipc })
     assert.equal(await mods.runStatusCommand(ctx), 0)
     const text = ctx.stdout.text()
-    assert.match(text, /peer（手工设置，未启用）/u)
+    assert.match(text, /peer（节点端）/u)
     assert.match(text, /本机名称：手工机/u)
-    // servesRole/connectsRole 对 peer 都为 true（两半都挂载），板块如实渲染；
-    // canned 未挂任何 admin/client 路由 → 无数据留白。
+    // servesRole/connectsRole 对 peer 都为 true（两半都挂载）：节点端板块与
+    // 手机网关板块同时如实渲染。
+    assert.match(text, /节点端（虚拟网络互通）：/u)
+    assert.match(text, /本机节点 ID：aa1b2c3d/u)
+    assert.match(text, /网关接入状态：已接入/u)
     assert.match(text, /host 状态：/u)
-    assert.match(text, /网关未在监听/u)
-    assert.doesNotMatch(text, /client 状态：/u, 'no client/status answer means no client section')
+    assert.match(text, /网关监听中（端口 3088）/u)
     const en = makeCtx(mods, { argv: ['status'], ipc, lang: 'en' })
     await mods.runStatusCommand(en)
-    assert.match(en.stdout.text(), /peer \(manual config, not enabled\)/u)
+    assert.match(en.stdout.text(), /peer \(peer node\)/u)
   } finally {
     if (handle !== undefined) await handle.close()
     cleanup(home)

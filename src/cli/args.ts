@@ -4,10 +4,9 @@
  * values, targets — and deliberately does not VALIDATE cross-field rules
  * (role gates, required targets): the command layer renders those verdicts
  * through the i18n dictionary. Two things the parser does decide on its own:
- * `--role peer` (and any unknown role value) is flagged `roleIssue` because
- * SPEC pins the "peer is not enabled" refusal at every entry point, and
- * `--debug`'s optional path argument is consumed only when it does not look
- * like another flag.
+ * an unknown `--role` value is flagged `roleIssue` (`host` / `client` /
+ * `peer` are all legal since PG-10), and `--debug`'s optional path argument
+ * is consumed only when it does not look like another flag.
  *
  * Global flags may appear before or after the command word; the leading
  * positional tokens ARE the command (`host device revoke dev-7` → three
@@ -30,11 +29,15 @@ export type CliCommand =
   | 'client.pair'
   | 'client.unpair'
   | 'client.list'
+  | 'peer.join'
+  | 'peer.status'
+  | 'peer.trust'
+  | 'peer.leave'
 
-/** Why a `--role` value cannot be used as-is. `peer-not-enabled` covers the
- * SPEC's reserved role; `invalid` covers everything the vocabulary does not
- * know. Absent when the value is `host` or `client`. */
-export type CliRoleIssue = 'peer-not-enabled' | 'invalid'
+/** Why a `--role` value cannot be used as-is. `invalid` covers everything
+ * the vocabulary does not know. Absent when the value is `host`, `client`
+ * or `peer` — all three are legal since PG-10. */
+export type CliRoleIssue = 'invalid'
 
 export interface CliOptions {
   /** Raw `--lang` value — `resolveCliLang` (i18n.ts) interprets it later. */
@@ -71,6 +74,9 @@ export interface CliOptions {
   hostUrl?: string
   code?: string
   name?: string
+  /** `--invite <uri>` — the `zr-net(s)://` invite link of the virtual
+   * network a peer node joins. */
+  invite?: string
   all: boolean
   /** Unrecognized `--flags`, collected instead of crashing — the command
    * layer decides whether to warn. */
@@ -89,7 +95,7 @@ export interface ParsedCliArgs {
 }
 
 /** `--flag value` options, mapped onto CliOptions field names. */
-const VALUE_OPTIONS: Readonly<Record<string, 'lang' | 'socket' | 'wait' | 'role' | 'profile' | 'ingress' | 'mode' | 'domain' | 'cfToken' | 'email' | 'httpsPort' | 'publicUrl' | 'tunnelId' | 'proxy' | 'deviceRole' | 'hostUrl' | 'code' | 'name'>> = {
+const VALUE_OPTIONS: Readonly<Record<string, 'lang' | 'socket' | 'wait' | 'role' | 'profile' | 'ingress' | 'mode' | 'domain' | 'cfToken' | 'email' | 'httpsPort' | 'publicUrl' | 'tunnelId' | 'proxy' | 'deviceRole' | 'hostUrl' | 'code' | 'name' | 'invite'>> = {
   '--lang': 'lang',
   '--socket': 'socket',
   '--wait': 'wait',
@@ -108,6 +114,7 @@ const VALUE_OPTIONS: Readonly<Record<string, 'lang' | 'socket' | 'wait' | 'role'
   '--host-url': 'hostUrl',
   '--code': 'code',
   '--name': 'name',
+  '--invite': 'invite',
 }
 
 /** Boolean switches. `-y` is the only short alias (the one SPEC names). */
@@ -153,8 +160,7 @@ function assignValue(field: (typeof VALUE_OPTIONS)[string], raw: string, options
     }
     case 'role': {
       options.role = raw
-      if (raw === 'peer') options.roleIssue = 'peer-not-enabled'
-      else if (!KNOWN_ROLES.has(raw)) options.roleIssue = 'invalid'
+      if (!KNOWN_ROLES.has(raw)) options.roleIssue = 'invalid'
       return
     }
     case 'lang': options.lang = raw; return
@@ -171,6 +177,7 @@ function assignValue(field: (typeof VALUE_OPTIONS)[string], raw: string, options
     case 'hostUrl': options.hostUrl = raw; return
     case 'code': options.code = raw; return
     case 'name': options.name = raw; return
+    case 'invite': options.invite = raw; return
   }
 }
 
@@ -227,6 +234,22 @@ function routeCommand(positionals: readonly string[], options: CliOptions): Pars
       return { command: `client.${c2}`, options, ...(target === undefined ? {} : { target }) }
     }
     if (c2 === 'list') return { command: 'client.list', options }
+    return unknown([c1, c2])
+  }
+
+  if (c1 === 'peer') {
+    if (c2 === 'join') {
+      // `peer join [inviteUri]` — exactly one slot for the invite link; a
+      // second positional is a typo'd command, not part of a URI.
+      if (positionals.length > 3) return unknown([c1, c2, ...positionals.slice(3)])
+      return { command: 'peer.join', options, ...(c3 === undefined ? {} : { target: c3 }) }
+    }
+    if (c2 === 'status' && c3 === undefined) return { command: 'peer.status', options }
+    if (c2 === 'trust') {
+      if (positionals.length > 3) return unknown([c1, c2, ...positionals.slice(3)])
+      return { command: 'peer.trust', options, ...(c3 === undefined ? {} : { target: c3 }) }
+    }
+    if (c2 === 'leave' && c3 === undefined) return { command: 'peer.leave', options }
     return unknown([c1, c2])
   }
 
