@@ -79,6 +79,7 @@ export interface ParsedInviteUri {
     defaultTls: boolean;
 }
 export declare const PEER_INVITE_DEFAULT_PORT = 19393;
+export declare function isLoopbackOrPrivateHostname(hostname: string): boolean;
 /**
  * Parse an invite URI. Returns `null` for ANY malformed input — never
  * throws, because the string arrives from QR codes, copy-paste, and other
@@ -93,6 +94,37 @@ export declare function formatInviteUri(params: {
     networkId: string;
     joinKey?: string;
     scheme?: 'zr-net' | 'zr-nets' | 'zr-net+insecure';
+}): string;
+export type ParsedGatewayJoinInput = {
+    kind: 'invite';
+    inviteUri: string;
+    parsed: ParsedInviteUri;
+} | {
+    kind: 'gateway';
+    rawHost: string;
+    hostname: string;
+    port: number;
+    schemeMode: 'http' | 'https' | 'auto';
+    networkId?: string;
+};
+/**
+ * Parse user input for joining a peer network: either a full `zr-net://...`
+ * invite URI OR a gateway address (`http://host[:port]`, `https://host[:port]`,
+ * `ws(s)://...`, or bare `host[:port]` defaulting to port 19393, optionally
+ * carrying `/<16-hex-networkId>`) for gateway-side manual approval.
+ */
+export declare function parseGatewayJoinInput(input: string): ParsedGatewayJoinInput | null;
+/**
+ * Construct a canonical keyless invite URI (`zr-net` / `zr-nets` /
+ * `zr-net+insecure`) that round-trips through {@link parseInviteUri} to the
+ * exact `tls` transport and `rawHost:port`.
+ */
+export declare function buildKeylessInviteUri(params: {
+    rawHost: string;
+    hostname: string;
+    port: number;
+    tls: boolean;
+    networkId: string;
 }): string;
 /** Sign one gateway admission challenge with the node's long-term identity (64-byte signature → 128 hex). */
 export declare function signGatewayChallenge(params: {

@@ -94,6 +94,7 @@ import {
   type WizardVerifyStart,
 } from '../../client-data/wizard.ts'
 import { NS } from '../locales.ts'
+import { copyTextToClipboard } from '../clipboard.ts'
 import { MigrateCard } from './cards/MigrateCard.tsx'
 import { PortForwardCard } from './cards/PortForwardCard.tsx'
 import { ProxyCard } from './cards/ProxyCard.tsx'
@@ -208,8 +209,15 @@ function peerStateCopy(state: string, t: GatewayWizardProps['t']): string {
 /** The join route's failure copy: the route's own codes plus a generic
  * fallback. `invalid-invite` gets the paste-format copy. */
 function peerJoinFailCopy(code: string, t: GatewayWizardProps['t']): string {
-  if (code === 'invalid-invite') return t('wizard.peer.joinInvalid')
-  return t('wizard.peer.joinFailed', { reason: code })
+  switch (code) {
+    case 'invalid-invite': return t('wizard.peer.joinInvalid')
+    case 'invalid-gateway': return t('wizard.peer.joinGatewayInvalid')
+    case 'gateway-unreachable': return t('wizard.peer.joinGatewayUnreachable')
+    case 'no-network': return t('wizard.peer.joinNoNetwork')
+    case 'manual-disabled': return t('wizard.peer.joinManualDisabled')
+    case 'select-network': return t('wizard.peer.selectNetworkHint')
+    default: return t('wizard.peer.joinFailed', { reason: code })
+  }
 }
 
 const PATH_OPTIONS = [
@@ -321,7 +329,11 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   // the join / manage surfaces' busy & failure markers.
   const [peerView, setPeerView] = useState<PeerStatusView | undefined>()
   const [peerLoading, setPeerLoading] = useState(false)
+  const [peerJoinMode, setPeerJoinMode] = useState<'invite' | 'gateway'>('invite')
   const [peerInvite, setPeerInvite] = useState('')
+  const [peerGatewayUrl, setPeerGatewayUrl] = useState('')
+  const [peerCandidateNetworks, setPeerCandidateNetworks] = useState<readonly { id: string; name: string }[]>([])
+  const [peerSelectedNetId, setPeerSelectedNetId] = useState('')
   const [peerBusy, setPeerBusy] = useState(false)
   const [peerFail, setPeerFail] = useState<string | null>(null)
   const [peerNotice, setPeerNotice] = useState<'trustOk' | undefined>()
@@ -458,23 +470,28 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }, [])
 
-  // PG-9: paste-invite join. Switching a host row into peer mode reloads the
-  // plugin first (the same wait the client claim applies), then the invite
-  // travels to the peer join route — the engine's refusal keeps its code.
+  // PG-9: paste-invite OR gateway-address manual-approval join. Switching a
+  // host row into peer mode reloads the plugin first, then the invite or
+  // gatewayUrl travels to the peer join route.
   const runPeerJoin = async (): Promise<void> => {
     setFormError(null)
     setPeerFail(null)
-    const invite = peerInvite.trim()
-    if (invite === '') {
-      setPeerFail('invalid-invite')
+    const rawInput = (peerJoinMode === 'gateway' ? peerGatewayUrl : peerInvite).trim()
+    if (rawInput === '') {
+      setPeerFail(peerJoinMode === 'gateway' ? 'invalid-gateway' : 'invalid-invite')
       return
     }
     setPeerBusy(true)
     const wasEffectivePeer = effectivePeer
+    const trimmedName = hostName.trim()
+    const currentRowName = typeof config.rowValue('serverName') === 'string' ? (config.rowValue('serverName') as string).trim() : ''
     try {
       if (!wasEffectivePeer) {
         try {
-          await props.saveRowFields({ role: 'peer' })
+          await props.saveRowFields({
+            role: 'peer',
+            ...(trimmedName !== '' ? { serverName: trimmedName } : {}),
+          })
           // PG-9-fix: poll the peer status route until the reloaded row
           // serves it (the route answers 404/503 while the row restarts) —
           // a fixed wait either sends the join too early (503
@@ -490,13 +507,26 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           // proceed to the join attempt; the route exists on every
           // connects-role composition
         }
+      } else if (trimmedName !== '' && trimmedName !== currentRowName) {
+        try {
+          await props.saveRowFields({ serverName: trimmedName })
+        } catch {
+          // non-fatal; join still proceeds with current node name
+        }
       }
+      const payload = peerJoinMode === 'gateway'
+        ? { gatewayUrl: rawInput, ...(peerSelectedNetId !== '' ? { networkId: peerSelectedNetId } : {}) }
+        : { inviteUri: rawInput }
       const response = await fetch(CLIENT_PEER_JOIN_ROUTE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ inviteUri: invite }),
+        body: JSON.stringify(payload),
       })
-      const body = (await response.json().catch(() => ({}))) as { ok?: boolean; error?: { code?: string } }
+      const body = (await response.json().catch(() => ({}))) as {
+        ok?: boolean
+        error?: { code?: string }
+        networks?: Array<{ id: string; name: string }>
+      }
       if (response.ok && body.ok === true) {
         if (!wasEffectivePeer) {
           // First peer activation: the row just reloaded under the page, and
@@ -508,10 +538,21 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           return
         }
         setPeerInvite('')
+        setPeerCandidateNetworks([])
+        setPeerSelectedNetId('')
         await loadPeerStatus()
         setStep('verify')
+      } else if (body?.error?.code === 'select-network' && Array.isArray(body.networks) && body.networks.length > 0) {
+        if (peerJoinMode !== 'gateway') {
+          setPeerJoinMode('gateway')
+          setPeerGatewayUrl(rawInput)
+        }
+        setPeerCandidateNetworks(body.networks)
+        setPeerSelectedNetId(body.networks[0]?.id ?? '')
+        setPeerFail(null)
       } else {
-        setPeerFail(body?.error?.code ?? 'unexpected')
+        const errCode = body?.error?.code ?? 'unexpected'
+        setPeerFail(errCode === 'invalid-invite' && peerJoinMode === 'gateway' ? 'invalid-gateway' : errCode)
       }
     } catch {
       setPeerFail('unexpected')
@@ -1012,14 +1053,20 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     return t('wizard.desktop.addressFallback', { port: String(port) })
   }, [path, serverUrl, readiness, wizardStatus, t])
 
+  // Fast 2s poll while waiting on gateway-side manual approval so the
+  // verify lights flip to green promptly once the administrator clicks Approve.
+  const waitingPeerApproval = modalOpen && step === 'verify' && wizardRole === 'peer' && peerView?.gatewayState === 'pending-approval'
+  useEffect(() => {
+    if (!waitingPeerApproval) return
+    const handle = setInterval(() => { void loadPeerStatus() }, 2000)
+    return () => clearInterval(handle)
+  }, [waitingPeerApproval, loadPeerStatus])
+
   const copyDesktopInfo = async (): Promise<void> => {
     if (desktopPairing === undefined) return
     const text = t('wizard.desktop.copiedText', { address: resolvedHostEndpoint, code: desktopPairing.code })
-    try {
-      await navigator.clipboard?.writeText(text)
+    if (await copyTextToClipboard(text)) {
       setDesktopCopied(true)
-    } catch {
-      // ignore clipboard refusal
     }
   }
 
@@ -2147,25 +2194,119 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                       ) : null}
                     </>
                   ) : wizardRole === 'peer' ? (
-                    /* PG-9: the peer branch — one paste-and-join form; the
-                        three-light self-check is the VERIFY step. */
+                    /* PG-9: the peer branch — supports pasting an invite link
+                        OR entering the relay gateway URL for manual approval;
+                        the three-light self-check is the VERIFY step. */
                     <>
                       <div className="zr-wizard-formStack">
                         <div className="zr-wizard-field">
-                          <label className="zr-wizard-label" htmlFor="zr-wizard-peer-invite">{t('wizard.peer.inviteUri')}</label>
+                          <label className="zr-wizard-label" htmlFor="zr-wizard-peer-name">{t('wizard.hostName')}</label>
                           <input
-                            id="zr-wizard-peer-invite"
+                            id="zr-wizard-peer-name"
                             className="zr-wizard-input"
                             type="text"
-                            autoComplete="off"
-                            spellCheck={false}
-                            placeholder={t('wizard.peer.inviteUriPlaceholder')}
-                            value={peerInvite}
+                            maxLength={40}
+                            placeholder={t('wizard.hostNamePlaceholder')}
+                            value={hostName}
                             disabled={peerBusy}
-                            onChange={(event) => setPeerInvite(event.target.value)}
+                            onChange={(event) => setHostName(event.target.value)}
                           />
-                          <p className="zr-wizard-hint">{t('wizard.peer.inviteUriHint')}</p>
+                          <p className="zr-wizard-hint">{t('wizard.hostNameHint')}</p>
                         </div>
+
+                        <div className="zr-wizard-targetTabs" role="tablist">
+                          <button
+                            type="button"
+                            role="tab"
+                            aria-selected={peerJoinMode === 'invite'}
+                            className="zr-wizard-targetTab"
+                            data-selected={peerJoinMode === 'invite'}
+                            disabled={peerBusy}
+                            onClick={() => {
+                              setPeerJoinMode('invite')
+                              setPeerFail(null)
+                            }}
+                          >
+                            {t('wizard.peer.modeInvite')}
+                          </button>
+                          <button
+                            type="button"
+                            role="tab"
+                            aria-selected={peerJoinMode === 'gateway'}
+                            className="zr-wizard-targetTab"
+                            data-selected={peerJoinMode === 'gateway'}
+                            disabled={peerBusy}
+                            onClick={() => {
+                              setPeerJoinMode('gateway')
+                              setPeerFail(null)
+                            }}
+                          >
+                            {t('wizard.peer.modeGateway')}
+                          </button>
+                        </div>
+
+                        {peerJoinMode === 'invite' ? (
+                          <div className="zr-wizard-field">
+                            <label className="zr-wizard-label" htmlFor="zr-wizard-peer-invite">{t('wizard.peer.inviteUri')}</label>
+                            <input
+                              id="zr-wizard-peer-invite"
+                              className="zr-wizard-input"
+                              type="text"
+                              autoComplete="off"
+                              spellCheck={false}
+                              placeholder={t('wizard.peer.inviteUriPlaceholder')}
+                              value={peerInvite}
+                              disabled={peerBusy}
+                              onChange={(event) => {
+                                setPeerInvite(event.target.value)
+                                if (peerFail !== null) setPeerFail(null)
+                              }}
+                            />
+                            <p className="zr-wizard-hint">{t('wizard.peer.inviteUriHint')}</p>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="zr-wizard-field">
+                              <label className="zr-wizard-label" htmlFor="zr-wizard-peer-gateway">{t('wizard.peer.gatewayUrl')}</label>
+                              <input
+                                id="zr-wizard-peer-gateway"
+                                className="zr-wizard-input"
+                                type="text"
+                                autoComplete="off"
+                                spellCheck={false}
+                                placeholder={t('wizard.peer.gatewayUrlPlaceholder')}
+                                value={peerGatewayUrl}
+                                disabled={peerBusy}
+                                onChange={(event) => {
+                                  setPeerGatewayUrl(event.target.value)
+                                  setPeerCandidateNetworks([])
+                                  setPeerSelectedNetId('')
+                                  if (peerFail !== null) setPeerFail(null)
+                                }}
+                              />
+                              <p className="zr-wizard-hint">{t('wizard.peer.gatewayUrlHint')}</p>
+                            </div>
+                            {peerCandidateNetworks.length > 1 ? (
+                              <div className="zr-wizard-field">
+                                <label className="zr-wizard-label" htmlFor="zr-wizard-peer-network">{t('wizard.peer.selectNetwork')}</label>
+                                <select
+                                  id="zr-wizard-peer-network"
+                                  className="zr-wizard-select"
+                                  disabled={peerBusy}
+                                  value={peerSelectedNetId}
+                                  onChange={(event) => setPeerSelectedNetId(event.currentTarget.value)}
+                                >
+                                  {peerCandidateNetworks.map((net) => (
+                                    <option key={net.id} value={net.id}>
+                                      {net.name} ({net.id})
+                                    </option>
+                                  ))}
+                                </select>
+                                <p className="zr-wizard-hint">{t('wizard.peer.selectNetworkHint')}</p>
+                              </div>
+                            ) : null}
+                          </>
+                        )}
                       </div>
                       {peerFail !== null ? (
                         <p className="zr-wizard-notice" data-tone="error">{peerJoinFailCopy(peerFail, t)}</p>
@@ -2270,7 +2411,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                       disabled={peerBusy}
                       onClick={() => { void runPeerJoin() }}
                     >
-                      {peerBusy ? t('wizard.peer.joining') : t('wizard.peer.join')}
+                      {peerBusy ? t('wizard.peer.joining') : peerJoinMode === 'gateway' ? t('wizard.peer.requestJoin') : t('wizard.peer.join')}
                     </button>
                   ) : (
                     <div className="zr-wizard-row">

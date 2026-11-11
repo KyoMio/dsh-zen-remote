@@ -1456,3 +1456,56 @@ test('i18n: zh/en 键集完全对称；zh 零「互通端」；en 零中文字�
   assert.doesNotMatch(zh('err.role.invalid'), /尚未启用/u)
   assert.equal(en('status.role.peer'), 'peer (peer node)')
 })
+
+test('peer join: 支持直接输入中继网关地址（手动审批准入）及多网络交互选择', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('join-gw-url')
+  let handle
+  try {
+    let joinCalls = 0
+    const { handle: h, canned } = await startIpcServer(home, {
+      role: 'peer',
+      client: {
+        [ROUTES.peerStatus]: { body: () => peerStatusBody('pending-approval') },
+        [ROUTES.peerJoin]: (res, seen) => {
+          joinCalls += 1
+          if (joinCalls === 1 && !seen.body.networkId) {
+            const payload = JSON.stringify({
+              ok: false,
+              error: { code: 'select-network' },
+              networks: [
+                { id: '1111222233334444', name: '默认网络' },
+                { id: 'aaaabbbbccccdddd', name: '研发网络' },
+              ],
+            })
+            res.writeHead(409, { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(payload)) })
+            res.end(payload)
+            return
+          }
+          const okBody = JSON.stringify({ ok: true, networkId: seen.body.networkId, manualApproval: true })
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(okBody)) })
+          res.end(okBody)
+        },
+      },
+    })
+    handle = h
+    const prompter = fakePrompter({ selects: [1] })
+    const ctx = makeCtx(mods, {
+      argv: ['peer', 'join', 'http://192.168.1.88:19393', '--no-wait'],
+      ipc: mods.createCliIpcClient(handle.socketPath),
+      interactive: true,
+      prompter,
+      pollIntervalMs: 15,
+    })
+    const code = await mods.runPeerJoinCommand(ctx)
+    assert.equal(code, 0)
+    const joins = canned.requests.filter((r) => r.path === ROUTES.peerJoin)
+    assert.equal(joins.length, 2)
+    assert.deepEqual(joins[0].body, { gatewayUrl: 'http://192.168.1.88:19393' })
+    assert.deepEqual(joins[1].body, { gatewayUrl: 'http://192.168.1.88:19393', networkId: 'aaaabbbbccccdddd' })
+    assert.match(ctx.stdout.text(), /等待管理员在网关控制台批准/u)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})

@@ -26,11 +26,57 @@ function generateJoinKey(): string {
   return randomBytes(32).toString('hex');
 }
 
-function joinHost(ctx: RouteContext, reqHost: string | undefined): string {
-  if (ctx.config.publicUrl !== undefined) {
-    return new URL(ctx.config.publicUrl).host;
+function isLoopbackOrPrivateHostname(hostname: string): boolean {
+  const h = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1).toLowerCase() : hostname.toLowerCase();
+  if (h === 'localhost' || h === '::1') return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (v4 !== null) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    if (a > 255 || b > 255) return false;
+    if (a === 127 || a === 10) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    return false;
   }
-  return reqHost ?? '';
+  if (h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80')) return true;
+  return false;
+}
+
+function extractHostname(hostHeader: string): string {
+  if (hostHeader.startsWith('[')) {
+    const close = hostHeader.indexOf(']');
+    return close === -1 ? hostHeader : hostHeader.slice(1, close);
+  }
+  const colon = hostHeader.indexOf(':');
+  return colon === -1 ? hostHeader : hostHeader.slice(0, colon);
+}
+
+/**
+ * 解析邀请链接的协议头与 authority（对齐插件端 `parseInviteUri` 的默认端口 19393 与公私网 TLS 推断）：
+ * - 配置了 `publicUrl` 时：严格遵循其 `https:` / `http:` 协议；若未显式写端口（如反代 443/80），补齐默认端口，
+ *   防止节点端把无端口邀请链接误回落到 19393；
+ * - 未配 `publicUrl` 时：从 `X-Forwarded-Proto` 与 `Host` 推断；公网 IP 直连跑明文 HTTP（如 Docker 19393 裸跑）
+ *   时发出 `zr-net+insecure://`，避免节点端把公网地址误走 `wss://` 握手失败；私网/回环继续保持简短 `zr-net://`。
+ */
+function buildJoinEndpoint(ctx: RouteContext): { scheme: 'zr-net' | 'zr-nets' | 'zr-net+insecure'; authority: string } {
+  if (ctx.config.publicUrl !== undefined) {
+    const pub = new URL(ctx.config.publicUrl);
+    const isTls = pub.protocol === 'https:';
+    const isPrivate = isLoopbackOrPrivateHostname(pub.hostname);
+    const authority = pub.port !== '' ? pub.host : `${pub.hostname}:${isTls ? '443' : '80'}`;
+    const scheme = isTls ? (isPrivate ? 'zr-nets' : 'zr-net') : (isPrivate ? 'zr-net' : 'zr-net+insecure');
+    return { scheme, authority };
+  }
+  const authority = ctx.req.headers['host'] ?? '';
+  const hostname = extractHostname(authority);
+  const forwardedProto = String(ctx.req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim().toLowerCase();
+  const isTls = forwardedProto === 'https';
+  const isPrivate = hostname === '' || isLoopbackOrPrivateHostname(hostname);
+  const scheme = isTls ? (isPrivate ? 'zr-nets' : 'zr-net') : (isPrivate ? 'zr-net' : 'zr-net+insecure');
+  return { scheme, authority };
 }
 
 function parseName(value: unknown): string {
@@ -71,7 +117,7 @@ async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<R
       pendingCount += 1;
     }
   }
-  const host = joinHost(ctx, ctx.req.headers['host']);
+  const endpoint = buildJoinEndpoint(ctx);
   return {
     id: network.id,
     name: network.name,
@@ -79,7 +125,7 @@ async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<R
     maxPeers: network.maxPeers,
     createdAt: network.createdAt,
     joinKey,
-    joinUri: `zr-net://${host}/${network.id}#${joinKey}`,
+    joinUri: `${endpoint.scheme}://${endpoint.authority}/${network.id}#${joinKey}`,
     onlineDevices: ctx.runtime.getOnlineCountByNetwork(network.id),
     totalDevices,
     pendingCount,
@@ -200,8 +246,22 @@ async function handleDeleteMember(ctx: RouteContext, params: Record<string, stri
   sendOk(ctx.res, { networkId, nodeId, removed: true });
 }
 
+/**
+ * 节点端按网关地址发现可人工审批加入的网络（免 Cookie 公开面）：
+ * 只返回允许无口令转人工审批（`manual` / `both`）的网络 `{ id, name }` 与总网络数 `totalNetworks`
+ * （供节点端区分「网关尚未建网」与「网络均关闭人工审批」），绝不暴露 `joinKey`、`ownerId` 或成员表。
+ */
+async function handleListPeerJoinableNetworks(ctx: RouteContext): Promise<void> {
+  const all = await ctx.store.listPublicNetworks();
+  const networks = all
+    .filter((n) => n.admissionMode === 'manual' || n.admissionMode === 'both')
+    .map((n) => ({ id: n.id, name: n.name }));
+  sendOk(ctx.res, { networks, totalNetworks: all.length });
+}
+
 export function buildNetworkRoutes(): RouteDef[] {
   return [
+    { method: 'GET', path: '/peer/v1/networks', handler: handleListPeerJoinableNetworks },
     { method: 'GET', path: '/api/v1/networks', handler: handleListNetworks },
     { method: 'POST', path: '/api/v1/networks', handler: handleCreateNetwork },
     { method: 'PATCH', path: '/api/v1/networks/:id', handler: handlePatchNetwork },

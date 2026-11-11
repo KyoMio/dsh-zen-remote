@@ -18,6 +18,7 @@ import {
   maskInviteUri,
   memberStatusView,
 } from '../dist/web/format.js';
+import { copyTextToClipboard } from '../dist/web/clipboard.js';
 import {
   ConsoleApiError,
   ConsoleClient,
@@ -740,5 +741,84 @@ describe('PG-6c 新增双语词条', () => {
     assert.equal(LOCALES.zh['admin.disabledTag'], '已停用');
     assert.equal(LOCALES.en['admin.disabledTag'], 'Disabled');
     assert.equal(LOCALES.en['devices.clickHint'], 'Click a device to see how it connects to others');
+  });
+});
+
+describe('clipboard：非安全上下文 HTTP 剪贴板回退（回归修复）', () => {
+  function makeMockDoc(execResult = true) {
+    const appended = [];
+    const removed = [];
+    let restoredFocus = false;
+    let copiedValue = null;
+    const doc = {
+      activeElement: {
+        focus() {
+          restoredFocus = true;
+        },
+      },
+      body: {
+        appendChild(node) {
+          appended.push(node);
+          return node;
+        },
+        removeChild(node) {
+          removed.push(node);
+          return node;
+        },
+      },
+      createElement(tag) {
+        assert.equal(tag, 'textarea');
+        return {
+          value: '',
+          readOnly: false,
+          style: { position: '', top: '', left: '', opacity: '', pointerEvents: '' },
+          setAttribute() {},
+          focus() {},
+          select() {
+            copiedValue = this.value;
+          },
+          setSelectionRange() {},
+        };
+      },
+      execCommand(cmd) {
+        assert.equal(cmd, 'copy');
+        return execResult;
+      },
+    };
+    return { doc, getCopied: () => copiedValue, appended, removed, isFocusRestored: () => restoredFocus };
+  }
+
+  test('HTTP 部署下 navigator.clipboard 为 undefined 时，不抛 TypeError 并自动走 execCommand("copy")', async () => {
+    const mock = makeMockDoc(true);
+    const ok = await copyTextToClipboard('zr-net+insecure://203.0.113.10:19393/0123456789abcdef#secret', {
+      navigator: {}, // 非安全上下文：navigator.clipboard === undefined
+      document: mock.doc,
+    });
+    assert.equal(ok, true);
+    assert.equal(mock.getCopied(), 'zr-net+insecure://203.0.113.10:19393/0123456789abcdef#secret');
+    assert.equal(mock.appended.length, 1);
+    assert.equal(mock.removed.length, 1);
+    assert.equal(mock.isFocusRestored(), true);
+  });
+
+  test('标准 navigator.clipboard.writeText 被权限拒绝时，继续回落 execCommand("copy")', async () => {
+    const mock = makeMockDoc(true);
+    const ok = await copyTextToClipboard('zr-net://127.0.0.1:19393/0123456789abcdef#k', {
+      navigator: {
+        clipboard: {
+          async writeText() {
+            throw new Error('NotAllowedError');
+          },
+        },
+      },
+      document: mock.doc,
+    });
+    assert.equal(ok, true);
+    assert.equal(mock.getCopied(), 'zr-net://127.0.0.1:19393/0123456789abcdef#k');
+  });
+
+  test('标准 API 与 DOM 均不可用时返回 false，绝不抛未捕获异常', async () => {
+    const ok = await copyTextToClipboard('test', { navigator: {} });
+    assert.equal(ok, false);
   });
 });

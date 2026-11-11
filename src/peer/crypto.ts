@@ -206,7 +206,7 @@ const HOSTNAME_PATTERN = /^[A-Za-z0-9._\-]+$/
 const BRACKETED_IPV6_PATTERN = /^\[[0-9A-Fa-f:.]+\]$/
 const PORT_PATTERN = /^\d+$/
 
-function isLoopbackOrPrivateHostname(hostname: string): boolean {
+export function isLoopbackOrPrivateHostname(hostname: string): boolean {
   const h = hostname.toLowerCase()
   if (h === 'localhost') return true
   const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h)
@@ -232,7 +232,7 @@ function isLoopbackOrPrivateHostname(hostname: string): boolean {
  * numeric, or unbracketed multi-colon IPv6 (ambiguous with host:port —
  * rejected, never guessed).
  */
-function parseInviteAuthority(authority: string): { rawHost: string; hostname: string; port: number } | null {
+function parseInviteAuthority(authority: string, defaultPort: number = PEER_INVITE_DEFAULT_PORT): { rawHost: string; hostname: string; port: number } | null {
   let rawHost: string
   let portPart: string | undefined
   if (authority.startsWith('[')) {
@@ -246,7 +246,7 @@ function parseInviteAuthority(authority: string): { rawHost: string; hostname: s
     }
     const inner = rawHost.slice(1, -1)
     if (inner.length === 0 || !BRACKETED_IPV6_PATTERN.test(rawHost)) return null
-    return { rawHost, hostname: inner.toLowerCase(), port: parsePortOr(portPart) }
+    return { rawHost, hostname: inner.toLowerCase(), port: parsePortOr(portPart, defaultPort) }
   }
   const colons = authority.split(':').length - 1
   if (colons > 1) return null // unbracketed IPv6 — ambiguous, reject
@@ -258,13 +258,13 @@ function parseInviteAuthority(authority: string): { rawHost: string; hostname: s
     rawHost = authority
   }
   if (rawHost.length === 0 || !HOSTNAME_PATTERN.test(rawHost)) return null
-  return { rawHost, hostname: rawHost.toLowerCase(), port: parsePortOr(portPart) }
+  return { rawHost, hostname: rawHost.toLowerCase(), port: parsePortOr(portPart, defaultPort) }
 }
 
-function parsePortOr(portPart: string | undefined): number {
+function parsePortOr(portPart: string | undefined, defaultPort: number = PEER_INVITE_DEFAULT_PORT): number {
   // Only a fully ABSENT `:port` falls back to the default; an explicit
   // empty port (`host:/id`) is malformed, never guessed.
-  if (portPart === undefined) return PEER_INVITE_DEFAULT_PORT
+  if (portPart === undefined) return defaultPort
   if (!PORT_PATTERN.test(portPart)) return -1 // sentinel: invalid, caught by the caller's range check
   return Number(portPart)
 }
@@ -340,6 +340,108 @@ export function formatInviteUri(params: {
   const networkId = requireNetworkId(params.networkId, 'networkId')
   const fragment = params.joinKey === undefined || params.joinKey === '' ? '' : `#${encodeURIComponent(params.joinKey)}`
   return `${scheme}://${host}/${networkId}${fragment}`
+}
+
+export type ParsedGatewayJoinInput =
+  | { kind: 'invite'; inviteUri: string; parsed: ParsedInviteUri }
+  | {
+      kind: 'gateway'
+      rawHost: string
+      hostname: string
+      port: number
+      schemeMode: 'http' | 'https' | 'auto'
+      networkId?: string
+    }
+
+const GATEWAY_URL_SCHEME_PATTERN = /^(https?|wss?):\/\//i
+
+/**
+ * Parse user input for joining a peer network: either a full `zr-net://...`
+ * invite URI OR a gateway address (`http://host[:port]`, `https://host[:port]`,
+ * `ws(s)://...`, or bare `host[:port]` defaulting to port 19393, optionally
+ * carrying `/<16-hex-networkId>`) for gateway-side manual approval.
+ */
+export function parseGatewayJoinInput(input: string): ParsedGatewayJoinInput | null {
+  if (typeof input !== 'string') return null
+  const trimmed = input.trim()
+  if (trimmed === '') return null
+
+  const asInvite = parseInviteUri(trimmed)
+  if (asInvite !== null) {
+    return { kind: 'invite', inviteUri: trimmed, parsed: asInvite }
+  }
+
+  // Reject unknown schemes (e.g. `ftp://`, malformed `zr-net://` missing networkId).
+  const schemeMatch = GATEWAY_URL_SCHEME_PATTERN.exec(trimmed)
+  if (!schemeMatch && /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(trimmed)) {
+    return null
+  }
+
+  let schemeMode: 'http' | 'https' | 'auto' = 'auto'
+  let defaultPort = PEER_INVITE_DEFAULT_PORT
+  let rest = trimmed
+  if (schemeMatch) {
+    const proto = schemeMatch[1].toLowerCase()
+    const isTls = proto === 'https' || proto === 'wss'
+    schemeMode = isTls ? 'https' : 'http'
+    defaultPort = isTls ? 443 : 80
+    rest = trimmed.slice(schemeMatch[0].length)
+  }
+
+  // Strip empty trailing `#` (common when copying console SPA URLs), reject non-empty query/hash.
+  if (rest.includes('?')) return null
+  const hashIdx = rest.indexOf('#')
+  if (hashIdx !== -1) {
+    if (rest.slice(hashIdx + 1).trim() !== '') return null
+    rest = rest.slice(0, hashIdx)
+  }
+
+  const slashIdx = rest.indexOf('/')
+  const authority = slashIdx === -1 ? rest : rest.slice(0, slashIdx)
+  let pathPart = slashIdx === -1 ? '' : rest.slice(slashIdx + 1)
+  if (authority === '') return null
+
+  const address = parseInviteAuthority(authority, defaultPort)
+  if (!address || address.port < 1 || address.port > 65535) return null
+
+  pathPart = pathPart.replace(/\/+$/u, '')
+  if (pathPart.toLowerCase() === 'peer/v1/ws') {
+    pathPart = ''
+  }
+  let networkId: string | undefined
+  if (pathPart !== '') {
+    if (!NETWORK_ID_PATTERN.test(pathPart)) return null
+    networkId = pathPart.toLowerCase()
+  }
+
+  return {
+    kind: 'gateway',
+    rawHost: address.rawHost,
+    hostname: address.hostname,
+    port: address.port,
+    schemeMode,
+    ...(networkId !== undefined ? { networkId } : {}),
+  }
+}
+
+/**
+ * Construct a canonical keyless invite URI (`zr-net` / `zr-nets` /
+ * `zr-net+insecure`) that round-trips through {@link parseInviteUri} to the
+ * exact `tls` transport and `rawHost:port`.
+ */
+export function buildKeylessInviteUri(params: {
+  rawHost: string
+  hostname: string
+  port: number
+  tls: boolean
+  networkId: string
+}): string {
+  const networkId = requireNetworkId(params.networkId, 'networkId')
+  const isPrivate = isLoopbackOrPrivateHostname(params.hostname)
+  const scheme: 'zr-net' | 'zr-nets' | 'zr-net+insecure' = params.tls
+    ? (isPrivate ? 'zr-nets' : 'zr-net')
+    : (isPrivate ? 'zr-net' : 'zr-net+insecure')
+  return `${scheme}://${params.rawHost}:${params.port}/${networkId}`
 }
 
 // -- 3. gateway challenge + join-key proof -----------------------------------------

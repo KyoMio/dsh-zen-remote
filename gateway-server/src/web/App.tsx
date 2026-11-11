@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 
 import { AdminView } from './components/AdminView';
+import { copyTextToClipboard } from './clipboard';
 import { LoginView } from './components/LoginView';
 import { NetworkView, NewNetworkModal } from './components/NetworkView';
 import type { NetworkPatchInput } from './components/NetworkView';
@@ -367,10 +368,9 @@ export function App() {
 
   const handleCopyInvite = useCallback(
     (joinUri: string): void => {
-      void navigator.clipboard
-        .writeText(joinUri)
-        .then(() => showToast('toast.inviteCopied'))
-        .catch(() => showToast('toast.copyFailed'));
+      void copyTextToClipboard(joinUri).then((copied) => {
+        showToast(copied ? 'toast.inviteCopied' : 'toast.copyFailed');
+      });
     },
     [showToast],
   );

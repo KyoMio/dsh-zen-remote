@@ -2877,3 +2877,117 @@ test('PG-9 POSTs without an engine answer 503 peer-unavailable', async () => {
     await closeServer(server)
   }
 })
+
+test('peer join by gatewayUrl: single-network auto-join, multi-network 409 select-network, and plain-HTTP public host', async () => {
+  // 1. Single network on plain-HTTP public IP -> synthesizes zr-net+insecure:// and returns manualApproval: true.
+  {
+    const { engine, calls } = makePeerEngine()
+    const fetchCalls = []
+    const fetchImpl = async (url) => {
+      fetchCalls.push(String(url))
+      return new Response(
+        JSON.stringify({ ok: true, data: { networks: [{ id: '1122334455667788', name: 'Office Mesh' }], totalNetworks: 1 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl })
+    try {
+      const res = await request(port, {
+        method: 'POST',
+        path: PEER_JOIN_PATH,
+        headers: sameOrigin(port),
+        body: { gatewayUrl: 'http://203.0.113.99:19393' },
+      })
+      assert.equal(res.status, 200)
+      assert.deepEqual(JSON.parse(res.body), {
+        ok: true,
+        networkId: '1122334455667788',
+        manualApproval: true,
+      })
+      assert.deepEqual(fetchCalls, ['http://203.0.113.99:19393/peer/v1/networks'])
+      assert.deepEqual(calls, [['join', 'zr-net+insecure://203.0.113.99:19393/1122334455667788']])
+    } finally {
+      await closeServer(server)
+    }
+  }
+
+  // 2. Multiple networks -> first POST returns 409 select-network + networks[]; second POST with networkId joins.
+  {
+    const { engine, calls } = makePeerEngine()
+    const fetchImpl = async () => new Response(
+      JSON.stringify({
+        ok: true,
+        data: {
+          networks: [
+            { id: 'aaaa111122223333', name: 'Home' },
+            { id: 'bbbb444455556666', name: 'Studio' },
+          ],
+          totalNetworks: 2,
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+    const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl })
+    try {
+      const first = await request(port, {
+        method: 'POST',
+        path: PEER_JOIN_PATH,
+        headers: sameOrigin(port),
+        body: { gatewayUrl: 'http://192.168.1.20:19393' },
+      })
+      assert.equal(first.status, 409)
+      const firstBody = JSON.parse(first.body)
+      assert.equal(firstBody.error.code, 'select-network')
+      assert.equal(firstBody.networks.length, 2)
+      assert.equal(calls.length, 0)
+
+      const second = await request(port, {
+        method: 'POST',
+        path: PEER_JOIN_PATH,
+        headers: sameOrigin(port),
+        body: { gatewayUrl: 'http://192.168.1.20:19393', networkId: 'bbbb444455556666' },
+      })
+      assert.equal(second.status, 200)
+      assert.deepEqual(calls, [['join', 'zr-net://192.168.1.20:19393/bbbb444455556666']])
+    } finally {
+      await closeServer(server)
+    }
+  }
+
+  // 3. Key-only gateway -> 400 manual-disabled; unreachable gateway -> 502 gateway-unreachable.
+  {
+    const { engine } = makePeerEngine()
+    const fetchKeyOnly = async () => new Response(
+      JSON.stringify({ ok: true, data: { networks: [], totalNetworks: 1 } }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+    const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl: fetchKeyOnly })
+    try {
+      const res = await request(port, {
+        method: 'POST',
+        path: PEER_JOIN_PATH,
+        headers: sameOrigin(port),
+        body: { gatewayUrl: 'http://192.168.1.20:19393' },
+      })
+      assert.equal(res.status, 400)
+      assert.equal(JSON.parse(res.body).error.code, 'manual-disabled')
+    } finally {
+      await closeServer(server)
+    }
+
+    const fetchDown = async () => { throw new Error('ECONNREFUSED') }
+    const { server: s2, port: p2 } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl: fetchDown })
+    try {
+      const res = await request(p2, {
+        method: 'POST',
+        path: PEER_JOIN_PATH,
+        headers: sameOrigin(p2),
+        body: { gatewayUrl: 'http://192.168.1.20:19393' },
+      })
+      assert.equal(res.status, 502)
+      assert.equal(JSON.parse(res.body).error.code, 'gateway-unreachable')
+    } finally {
+      await closeServer(s2)
+    }
+  }
+})

@@ -24,6 +24,8 @@ const {
   verifySelfCertifyingNodeId,
   parseInviteUri,
   formatInviteUri,
+  parseGatewayJoinInput,
+  buildKeylessInviteUri,
   signGatewayChallenge,
   verifyGatewayChallenge,
   computeJoinKeyProof,
@@ -648,4 +650,57 @@ test('dual-simplex interop: A→B and B→A both round-trip through sealed frame
   assert.ok(atA)
   assert.equal(Buffer.from(atA.plaintext).toString(), 'from B')
   assert.equal(atA.header.srcNodeId, session.B.nodeId)
+})
+
+test('parseGatewayJoinInput & buildKeylessInviteUri: supports gateway addresses and plain-HTTP public hosts', () => {
+  const invite = parseGatewayJoinInput('zr-net://192.168.1.10:19393/0123456789abcdef#secret')
+  assert.equal(invite?.kind, 'invite')
+
+  const httpPub = parseGatewayJoinInput('http://203.0.113.10:19393/')
+  assert.deepEqual(httpPub, {
+    kind: 'gateway',
+    rawHost: '203.0.113.10',
+    hostname: '203.0.113.10',
+    port: 19393,
+    schemeMode: 'http',
+  })
+
+  // Plain-HTTP on a public IP MUST synthesize zr-net+insecure:// so parseInviteUri uses ws:// rather than wss://.
+  const pubKeyless = buildKeylessInviteUri({
+    rawHost: '203.0.113.10',
+    hostname: '203.0.113.10',
+    port: 19393,
+    tls: false,
+    networkId: '0123456789abcdef',
+  })
+  assert.equal(pubKeyless, 'zr-net+insecure://203.0.113.10:19393/0123456789abcdef')
+  const roundTripped = parseInviteUri(pubKeyless)
+  assert.equal(roundTripped?.wsUrl, 'ws://203.0.113.10:19393')
+  assert.equal(roundTripped?.joinKey, undefined)
+
+  // HTTPS without explicit port defaults to 443, optionally carrying /<16-hex>.
+  const httpsDom = parseGatewayJoinInput('https://zr.example.com/ABCDEF0123456789#')
+  assert.deepEqual(httpsDom, {
+    kind: 'gateway',
+    rawHost: 'zr.example.com',
+    hostname: 'zr.example.com',
+    port: 443,
+    schemeMode: 'https',
+    networkId: 'abcdef0123456789',
+  })
+
+  // Bare host defaults to port 19393 and auto schemeMode.
+  const bare = parseGatewayJoinInput('192.168.1.50')
+  assert.deepEqual(bare, {
+    kind: 'gateway',
+    rawHost: '192.168.1.50',
+    hostname: '192.168.1.50',
+    port: 19393,
+    schemeMode: 'auto',
+  })
+
+  // Malformed paths / schemes are rejected.
+  for (const bad of ['', '   ', 'http://gw.example.com/not-a-net-id', 'ftp://gw.example.com', 'zr-net://gw/bad']) {
+    assert.equal(parseGatewayJoinInput(bad), null, `should reject ${bad}`)
+  }
 })

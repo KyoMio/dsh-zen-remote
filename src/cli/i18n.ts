@@ -243,10 +243,12 @@ const ZH: Readonly<Record<string, string>> = {
   'client.addAnother': '是否继续添加下一台 host？',
 
   // ---- peer role（节点端） ----------------------------------------------------------------
-  'peer.prompt.invite': '邀请链接（zr-net:// 或 zr-nets:// 开头）：',
-  'peer.error.inviteInvalid': '邀请链接格式无效：应以 zr-net:// 或 zr-nets:// 开头（形如 zr-net://主机:端口/网络ID#密钥）。',
+  'peer.prompt.invite': '邀请链接或中继网关地址（zr-net://… 或 http(s)://主机:端口）：',
+  'peer.error.inviteInvalid': '邀请链接或网关地址格式无效：请输入 zr-net(s)://主机:端口/网络ID#密钥，或中继网关地址 http(s)://主机:端口。',
   'peer.error.nameWriteFailed': '本机显示名写入失败。',
   'peer.error.configWriteFailed': '配置写入失败。',
+  'peer.join.selectNetwork': '该网关上有多个可加入的虚拟网络，请选择目标网络：',
+  'peer.join.selectNetworkRequired': '该网关上有多个可加入的虚拟网络（{networks}），请在地址末尾附上 /<网络ID> 指定目标网络。',
   'peer.join.confirmSwitch': '当前角色是 {role}，加入虚拟网络需要切换为 peer（节点端）角色（手机 / 浏览器接入通道保留不变）。切换？',
   'peer.join.needPeerRole': '当前角色是 {role}，不是 peer（节点端）：请先运行 dsh-zen-remote setup --role peer，或加 --yes 自动切换。',
   'peer.join.switching': '切换到 peer（节点端）：写入配置并等待节点端就绪 …',
@@ -593,10 +595,12 @@ const EN: Readonly<Record<string, string>> = {
   'client.addAnother': 'Add another host?',
 
   // ---- peer role (peer node) ----------------------------------------------------------------
-  'peer.prompt.invite': 'Invite link (starts with zr-net:// or zr-nets://): ',
-  'peer.error.inviteInvalid': 'That invite link does not parse: it must start with zr-net:// or zr-nets:// (like zr-net://host:port/networkId#key).',
+  'peer.prompt.invite': 'Invite link or relay gateway URL (zr-net://… or http(s)://host:port): ',
+  'peer.error.inviteInvalid': 'Invalid invite link or gateway URL: enter zr-net(s)://host:port/networkId#key or a gateway address like http(s)://host:port.',
   'peer.error.nameWriteFailed': 'Writing this machine\'s display name failed.',
   'peer.error.configWriteFailed': 'Writing the config failed.',
+  'peer.join.selectNetwork': 'Multiple virtual networks accept join requests on this gateway — pick one:',
+  'peer.join.selectNetworkRequired': 'Multiple virtual networks exist on this gateway ({networks}) — append /<networkId> to the gateway URL to pick one.',
   'peer.join.confirmSwitch': 'The current role is {role}; joining a virtual network needs the peer role (the phone / browser access channel stays up). Switch?',
   'peer.join.needPeerRole': 'The current role is {role}, not peer: run dsh-zen-remote setup --role peer first, or pass --yes to switch automatically.',
   'peer.join.switching': 'Switching to peer: writing the config and waiting for the node surface …',

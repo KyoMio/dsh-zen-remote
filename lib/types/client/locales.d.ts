@@ -547,10 +547,18 @@ export declare const zh: {
     readonly 'wizard.client.serverPicker': "选择要查看的服务端";
     readonly 'wizard.role.peer': "作为节点端（Peer Node）";
     readonly 'wizard.role.peerDesc': "加入设备网络，与其他电脑双向互通会话，同时保留手机扫码访问本机";
-    readonly 'wizard.role.peerPickNote': "切为节点端后，本机加入一台网关组织的设备网络，与网内电脑互相查看会话；本机原有的手机扫码访问不受影响。点击「下一步」粘贴邀请链接入网。";
+    readonly 'wizard.role.peerPickNote': "切为节点端后，本机加入一台网关组织的设备网络，与网内电脑互相查看会话；本机原有的手机扫码访问不受影响。点击「下一步」粘贴邀请链接或输入中继网关地址申请入网。";
+    readonly 'wizard.peer.modeInvite': "粘贴邀请链接";
+    readonly 'wizard.peer.modeGateway': "输入网关地址（手动审批）";
     readonly 'wizard.peer.inviteUri': "邀请链接";
     readonly 'wizard.peer.inviteUriHint': "在网络管理员（网关所在机器）的管理界面生成，粘贴完整的 zr-net:// 或 zr-nets:// 链接";
     readonly 'wizard.peer.inviteUriPlaceholder': "zr-net://…";
+    readonly 'wizard.peer.gatewayUrl': "中继网关地址";
+    readonly 'wizard.peer.gatewayUrlHint': "输入自建中继网关的访问地址（无需邀请密钥），提交后在网关控制台点击「批准」即可完成入网";
+    readonly 'wizard.peer.gatewayUrlPlaceholder': "http://192.168.1.10:19393 或 https://zr.example.com";
+    readonly 'wizard.peer.selectNetwork': "选择要加入的虚拟网络";
+    readonly 'wizard.peer.selectNetworkHint': "该网关上有多个允许申请加入的虚拟网络，请选择目标网络后再提交";
+    readonly 'wizard.peer.requestJoin': "申请加入网络";
     readonly 'wizard.peer.join': "加入网络";
     readonly 'wizard.peer.joining': "正在加入网络…";
     readonly 'wizard.peer.rejoin': "更换网络 / 重新入网";
@@ -562,6 +570,10 @@ export declare const zh: {
     readonly 'wizard.peer.pendingApproval': "已提交入网申请，等待网络管理员批准";
     readonly 'wizard.peer.joinFailed': "加入网络失败：{reason}";
     readonly 'wizard.peer.joinInvalid': "邀请链接格式无效，请粘贴完整的 zr-net:// 或 zr-nets:// 链接";
+    readonly 'wizard.peer.joinGatewayInvalid': "网关地址格式无效，请输入如 http://192.168.1.10:19393 或 https://zr.example.com";
+    readonly 'wizard.peer.joinGatewayUnreachable': "无法连接到该中继网关，请检查地址、端口及网关容器是否已启动";
+    readonly 'wizard.peer.joinNoNetwork': "该网关尚未创建任何虚拟网络，请先在网关控制台创建网络";
+    readonly 'wizard.peer.joinManualDisabled': "该网关上的网络未开启手动审批准入，请改用邀请链接加入";
     readonly 'wizard.peer.connecting': "正在连接网络…";
     readonly 'wizard.peer.offline': "与网络网关断开，正在自动重连…";
     readonly 'wizard.peer.revoked': "已被网络管理员移除或暂停";
@@ -598,7 +610,7 @@ export declare const zh: {
     readonly 'wizard.peer.actionFailed': "操作失败，请重试";
     readonly 'settings.peer.title': "网络与设备互通";
     readonly 'settings.peer.subtitle': "作为节点端与其他电脑互挂会话；下方保留手机 / 浏览器接入的配置";
-    readonly 'settings.peer.notConfigured': "尚未加入设备网络——在上方向导选择「作为节点端」并粘贴邀请链接即可加入";
+    readonly 'settings.peer.notConfigured': "尚未加入设备网络——可直接在下方粘贴邀请链接或输入中继网关地址（由网关侧手动审批）加入";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;
