@@ -13,6 +13,12 @@ import {
   translate,
 } from '../dist/web/i18n/locales.js';
 import {
+  derivePeerConnRow,
+  filterJoinedMembers,
+  maskInviteUri,
+  memberStatusView,
+} from '../dist/web/format.js';
+import {
   ConsoleApiError,
   ConsoleClient,
   ConsoleStore,
@@ -427,5 +433,239 @@ describe('ConsoleClient：SSE 订阅', () => {
     es.dispatch('topology-updated', { data: JSON.stringify(snap) });
     assert.equal(got.length, 1);
     unsubscribe();
+  });
+});
+
+// ---------------------------------------------------------------- PG-6c：纯逻辑与数据语义
+
+const tZh = (key, vars) => translate('zh', key, vars);
+const tEn = (key, vars) => translate('en', key, vars);
+
+function makeMember(nodeId, status, overrides = {}) {
+  return {
+    nodeId,
+    name: `dev-${nodeId}`,
+    note: null,
+    status,
+    natType: 'cone',
+    lastIp: null,
+    online: true,
+    liveRelayKbps: 0,
+    cumulativeRelayBytes: 0,
+    lastSeenAt: null,
+    ...overrides,
+  };
+}
+
+describe('format：邀请链接掩码 maskInviteUri', () => {
+  test('保留 # 之前的 zr-net:// 前缀，只把入网口令换成圆点', () => {
+    assert.equal(
+      maskInviteUri('zr-net://gw.local:19393/0123456789abcdef#secret'),
+      'zr-net://gw.local:19393/0123456789abcdef#••••••••',
+    );
+  });
+
+  test('不含 # 时原样返回', () => {
+    assert.equal(maskInviteUri('zr-net://gw.local/0123456789abcdef'), 'zr-net://gw.local/0123456789abcdef');
+  });
+
+  test('第一个 # 之后的内容整体掩掉（口令里出现 # 也不泄露）', () => {
+    assert.equal(maskInviteUri('zr-net://gw.local/0123456789abcdef#a#b'), 'zr-net://gw.local/0123456789abcdef#••••••••');
+  });
+});
+
+describe('format：占席位成员过滤 filterJoinedMembers', () => {
+  test('只保留 authorized / paused / mismatch，pending 与 revoked 不进设备表', () => {
+    const members = [
+      makeMember('a', 'authorized'),
+      makeMember('b', 'pending'),
+      makeMember('c', 'paused'),
+      makeMember('d', 'mismatch'),
+      makeMember('e', 'revoked'),
+    ];
+    assert.deepEqual(
+      filterJoinedMembers(members).map((m) => m.nodeId),
+      ['a', 'c', 'd'],
+      'pending（只在加入申请格）与 revoked（已移除）必须被滤掉',
+    );
+  });
+
+  test('空列表与全过滤后为空数组，顺序保持原样', () => {
+    assert.deepEqual(filterJoinedMembers([]), []);
+    const members = [makeMember('x', 'revoked'), makeMember('y', 'pending')];
+    assert.deepEqual(filterJoinedMembers(members), []);
+    const kept = [makeMember('m', 'mismatch'), makeMember('n', 'authorized')];
+    assert.deepEqual(
+      filterJoinedMembers(kept).map((m) => m.nodeId),
+      ['m', 'n'],
+    );
+  });
+});
+
+describe('format：成员状态圆点 memberStatusView', () => {
+  test('paused 用中性圆点（Warn 只留给中转连接点与加入申请），词不变', () => {
+    assert.deepEqual(memberStatusView('paused', false, tZh), { dot: 'muted', word: '已暂停' });
+    assert.deepEqual(memberStatusView('paused', true, tZh), { dot: 'muted', word: '已暂停' });
+    assert.deepEqual(memberStatusView('paused', true, tEn), { dot: 'muted', word: 'Paused' });
+  });
+
+  test('其余四档圆点档位保持钉住', () => {
+    assert.deepEqual(memberStatusView('authorized', true, tZh), { dot: 'ok', word: '在线' });
+    assert.deepEqual(memberStatusView('authorized', false, tZh), { dot: 'muted', word: '离线' });
+    assert.deepEqual(memberStatusView('pending', false, tZh), { dot: 'warn', word: '待审批' });
+    assert.deepEqual(memberStatusView('mismatch', false, tZh), { dot: 'danger', word: '身份变了' });
+    assert.deepEqual(memberStatusView('revoked', false, tZh), { dot: 'muted', word: '已移除' });
+  });
+});
+
+describe('format：设备间连接行 derivePeerConnRow', () => {
+  const linksOf = (...links) => links;
+
+  test('身份异常（self 或任一方 mismatch）→ danger 阻断文案，不再漏判成「设备当前离线」', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const expectedZh = { dot: 'danger', kindWord: '已阻断', reason: '身份异常，连接已阻断', latency: '—' };
+    assert.deepEqual(derivePeerConnRow(tZh, { ...self, status: 'mismatch' }, other, []), expectedZh);
+    assert.deepEqual(derivePeerConnRow(tZh, self, { ...other, status: 'mismatch' }, []), expectedZh);
+    // mismatch 优先于对方暂停与链路存在
+    const lanLink = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 12, liveRelayKbps: 0 };
+    assert.deepEqual(derivePeerConnRow(tZh, self, { ...other, status: 'mismatch' }, linksOf(lanLink)), expectedZh);
+  });
+
+  test('英文阻断文案对齐 ui-ux-spec §3.5', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'mismatch');
+    assert.deepEqual(derivePeerConnRow(tEn, self, other, []), {
+      dot: 'danger',
+      kindWord: 'Blocked',
+      reason: 'Identity changed, connection blocked',
+      latency: '—',
+    });
+  });
+
+  test('对方暂停 → muted 未连接 + 「对方已暂停」；自己暂停 → muted 未连接 + 本机暂停原因', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    assert.deepEqual(derivePeerConnRow(tZh, self, { ...other, status: 'paused' }, []), {
+      dot: 'muted',
+      kindWord: '未连接',
+      reason: '对方已暂停',
+      latency: '—',
+    });
+    assert.deepEqual(derivePeerConnRow(tZh, { ...self, status: 'paused' }, other, []), {
+      dot: 'muted',
+      kindWord: '未连接',
+      reason: '设备已被暂停，连接已断开',
+      latency: '—',
+    });
+    assert.equal(translate('en', 'device.reasonPeerPaused'), 'The other device is paused');
+  });
+
+  test('任一方离线 → muted「设备当前离线」，优先于已存在的链路', () => {
+    const self = makeMember('self', 'authorized');
+    const otherOffline = makeMember('other', 'authorized', { online: false });
+    assert.deepEqual(derivePeerConnRow(tZh, self, otherOffline, []), {
+      dot: 'muted',
+      kindWord: '未连接',
+      reason: '设备当前离线',
+      latency: '—',
+    });
+    const lanLink = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 12, liveRelayKbps: 0 };
+    assert.deepEqual(derivePeerConnRow(tZh, self, otherOffline, linksOf(lanLink)).reason, '设备当前离线');
+    assert.equal(derivePeerConnRow(tZh, { ...self, online: false }, makeMember('other', 'authorized'), []).reason, '设备当前离线');
+  });
+
+  test('局域网直连 → ok / 局域网直连 / 在同一个局域网内 / 真实延迟；反向登记的链路同样算数', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const forward = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 12, liveRelayKbps: 0 };
+    const expected = { dot: 'ok', kindWord: '局域网直连', reason: '在同一个局域网内', latency: '12 ms' };
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(forward)), expected);
+    const backward = { srcNodeId: 'other', peerNodeId: 'self', path: 'lan', rttMs: 12, liveRelayKbps: 0 };
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(backward)), expected);
+  });
+
+  test('直连 → ok / 直连 / 已打通直连，不经过网关', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    for (const path of ['p2p', 'direct']) {
+      const link = { srcNodeId: 'self', peerNodeId: 'other', path, rttMs: 5, liveRelayKbps: 0 };
+      assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(link)), {
+        dot: 'ok',
+        kindWord: '直连',
+        reason: '已打通直连，不经过网关',
+        latency: '5 ms',
+      });
+    }
+  });
+
+  test('中转按对称型网络区分原因：本机对称 / 对方对称 / 普通中转', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const link = { srcNodeId: 'self', peerNodeId: 'other', path: 'relay', rttMs: 40, liveRelayKbps: 8 };
+
+    assert.deepEqual(derivePeerConnRow(tZh, { ...self, natType: 'symmetric' }, other, linksOf(link)), {
+      dot: 'warn',
+      kindWord: '经网关中转',
+      reason: '这台设备的网络不支持直连，已自动中转 · 8 KB/s',
+      latency: '40 ms',
+    });
+    assert.deepEqual(derivePeerConnRow(tZh, self, { ...other, natType: 'symmetric' }, linksOf(link)), {
+      dot: 'warn',
+      kindWord: '经网关中转',
+      reason: '对方网络不支持直连，已自动中转 · 8 KB/s',
+      latency: '40 ms',
+    });
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(link)), {
+      dot: 'warn',
+      kindWord: '经网关中转',
+      reason: '这台设备/对方网络不支持直连，已自动中转 · 8 KB/s',
+      latency: '40 ms',
+    });
+    // 双方都对称时优先说本机的原因
+    assert.equal(
+      derivePeerConnRow(tZh, { ...self, natType: 'symmetric' }, { ...other, natType: 'symmetric' }, linksOf(link)).reason,
+      '这台设备的网络不支持直连，已自动中转 · 8 KB/s',
+    );
+  });
+
+  test('双方在线且已授权但无链路 → muted「还没有建立连接」', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, []), {
+      dot: 'muted',
+      kindWord: '未连接',
+      reason: '还没有建立连接',
+      latency: '—',
+    });
+  });
+});
+
+describe('PG-6c 新增双语词条', () => {
+  test('席位计数改为 占席位数 / 上限（{count} / {max}）', () => {
+    assert.equal(LOCALES.zh['network.deviceCount'], '{count} / {max} 台设备');
+    assert.equal(LOCALES.en['network.deviceCount'], '{count} / {max} devices');
+    assert.equal(LOCALES.en['network.capacityFull'], '· Full');
+    assert.equal(translate('zh', 'network.deviceCount', { count: 2, max: 8 }), '2 / 8 台设备');
+  });
+
+  test('设备间连接固定原因词条（中英对照）', () => {
+    assert.equal(LOCALES.zh['device.reasonMismatchBlocked'], '身份异常，连接已阻断');
+    assert.equal(LOCALES.en['device.reasonMismatchBlocked'], 'Identity changed, connection blocked');
+    assert.equal(LOCALES.zh['device.reasonPeerPaused'], '对方已暂停');
+    assert.equal(LOCALES.en['device.reasonPeerPaused'], 'The other device is paused');
+    assert.equal(LOCALES.zh['device.reasonRelaySelf'], '这台设备的网络不支持直连，已自动中转 · {rate}');
+    assert.equal(LOCALES.zh['device.reasonRelayPeer'], '对方网络不支持直连，已自动中转 · {rate}');
+  });
+
+  test('设备列表引导、空态、危险区说明与管理页停用标记词条', () => {
+    assert.equal(LOCALES.zh['devices.clickHint'], '点击设备，查看它和其他设备怎么连接');
+    assert.equal(LOCALES.zh['devices.empty'], '还没有设备加入');
+    assert.equal(LOCALES.zh['devices.emptyBody'], '在装了 dsh-zen-remote 的电脑上，把角色设为「节点端」，粘贴上面的邀请链接。');
+    assert.equal(LOCALES.zh['network.rotateHint'], '旧链接立即失效，已加入的设备不受影响');
+    assert.equal(LOCALES.zh['network.deleteHint'], '所有设备会立即断开，无法恢复');
+    assert.equal(LOCALES.zh['admin.disabledTag'], '已停用');
+    assert.equal(LOCALES.en['admin.disabledTag'], 'Disabled');
+    assert.equal(LOCALES.en['devices.clickHint'], 'Click a device to see how it connects to others');
   });
 });
