@@ -1,7 +1,7 @@
 <h1 align="center">Remote access (gateway half)</h1>
 <p align="center">Turn DeepSeek Harness into a mobile PWA you can safely reach from the public internet: pairing-code auth + token identity + real Web Push, with your own reverse proxy terminating TLS — plus device roles and the remote relay that serves paired desktop clients.</p>
 
-> Full documentation for the gateway half of `dsh-zen-remote`: reverse proxy, device roles and pairing, environment variables, admin API, the remote relay, push, security boundary.
+> Full documentation for the gateway half of `dsh-zen-remote`: reverse proxy, device roles and pairing, environment variables, admin API, the remote relay, peer virtual networking, push, security boundary.
 > Installation and quick start live in the [root README](../README.md); interface-side detail in [interface.md](interface.md) (Chinese).
 
 Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate) secure-gateway base, with PWA differentiation.
@@ -15,6 +15,7 @@ Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-ga
 | 🔑 **Public-internet identity** | The gateway listens on `127.0.0.1` only, sitting behind your own reverse proxy. New devices trade a pairing code for a long-lived device token (cookie `lg_device` for web devices, a JSON token for desktop clients) — identity follows the token, not the source IP |
 | 👥 **Device roles** | A pairing code is minted for one role: **web app device** (phones/tablets/browsers through the gateway, see all sessions) or **desktop app device** (another DSH desktop running this plugin as the client role — relay prefix only, shared sessions only). A code offered to the wrong channel is refused with a clear message, not consumed |
 | 📡 **Remote relay** | Desktop clients talk to the host over zen-remote's own relay protocol (HTTP invokes + NDJSON stream subscriptions); the server re-verifies session ownership per request against a per-method allowlist — data of an unshared session never leaves the box |
+| 🕸️ **Peer networking** | `role: peer`: join a self-hosted virtual network with one `zr-net://` invite link — machines in the network discover each other in both directions and mount each other's remote-enabled sessions into their sidebars; LAN / UDP hole-punch direct paths first, a 1-second seamless fallback to the gateway's end-to-end-encrypted relay; details in [Peer nodes & virtual networking](#peer-nodes--virtual-networking) below |
 | 📱 **Real PWA** | `manifest.json` + service worker: once the proxy provides HTTPS, "Add to Home Screen" actually works — standalone full-screen app with icon, splash, theme-color, maskable assets; cold start paints the phone home screen's frame before the JS bundle exists instead of a blank page |
 | 🌐 **Offline** | SW v4: the true static shell AND every content-addressed URL (Vite filename hashes, DSH's `?rev=<build revision>` plugin batches (a sha1 slice over mtime/ctime/size)) are cache-first; everything else (unhashed JS/CSS, API, page HTML) stays network-first — a new deploy changes the URL instead of the bytes behind one, so the phone is both fast and never stale |
 | ⚡ **Instant first paint** | The gateway inlines an app-shaped skeleton (top bar / session cards / new-session pill) into the first HTML byte and removes it the moment DSH renders into `#root`; explicit "desktop" devices are never injected and ≥1024px hides it in CSS, so desktop stays pixel-identical |
@@ -405,6 +406,51 @@ The open route's validation chain is **entirely shared** with `/v1/plugin` (regi
 - The final line `{"type":"end","reason":"upstream-closed"|"upstream-error"|"client-closed"}` precedes the stream close; close bytes the plugin sent (if any) already travelled as data lines — no WebSocket close frame is synthesized.
 
 The open body caps at 1 MiB (413 past it); each device holds at most 8 concurrent tunnels, 429 `busy` past that. A tunnel belongs to the device that opened it (`x-zen-remote-device`): another device's send/close answers 404 `tunnel-unknown`; a send whose `x-zr-seq` is not the expected sequence answers 409 `tunnel-out-of-order` and **closes the tunnel immediately** — a broken ordering contract makes the stream untrustworthy. Beyond these tunnel-specific codes, every other refusal matches the `/v1/plugin` error table (the validation chain is shared).
+
+---
+
+## Peer nodes & virtual networking
+
+`role: peer` is the third role: the machine keeps every serving half of a `host` (phone/browser QR access, lock-screen push, session sharing stay mounted) while joining a virtual network organized by a self-hosted relay gateway (`gateway-server/`, deployment in [`gateway-server/README.md`](../gateway-server/README.md)). Member machines discover each other automatically in both directions and mount each other's **remote-enabled** sessions into their sidebars — no public IP, no per-machine pairing codes, one invite link per machine.
+
+### The three roles compared
+
+| Role | `servesRole` (serving halves mounted: gateway / relay / push) | `connectsRole` (dial-out halves mounted: relay client / pool) | In one line |
+| --- | --- | --- | --- |
+| `host` (default) | ✅ | ❌ | This machine is a server: phones and desktop clients connect in |
+| `client` | ❌ | ✅ | This machine is a sub-client: connects to others, serves nobody |
+| `peer` | ✅ | ✅ | This machine is both a server and a network member: keeps phone QR access and push, joins the virtual network |
+
+Role resolution discipline: `resolveRole` accepts only the exact strings `client` / `peer` — anything else degrades to `host`, so a typo cannot amputate half the plugin. `role: peer` and `maxServers` (`LAN_GATE_MAX_SERVERS`, 1–64, default 8) are tunable in the advanced settings table; in peer mode a network-reported `maxPeersFromGateway` wins outright when the field is unset locally, and can only lower it otherwise.
+
+### The invite link
+
+```
+zr-net://<host>[:port]/<networkId>[#<joinKey>]
+```
+
+- `zr-nets://…` forces TLS (wss / https); `zr-net+insecure://…` forces plaintext (local tests only); plain `zr-net://` infers from the hostname — loopback / private IPv4 / ULA / `.localhost` go plaintext, everything else TLS.
+- `#<joinKey>` is a **first-join credential only**: the join challenge-response handshake binds the identity with it once, and it never travels as a plaintext URL path afterwards.
+- Links are generated in the gateway's web console; the parser lives in `parseInviteUri` in `src/peer/crypto.ts`.
+- CLI joining: `npx dsh-zen-remote setup --role peer --invite "zr-net://…"`, or `dsh-zen-remote peer join <uri>`; `peer status` shows this machine's nodeId, admission state, and the network's peers with their live connection paths; `peer trust <nodeId>` explicitly re-trusts a changed identity after a mismatch block; `peer leave` leaves the network.
+
+### Connection path priority
+
+Each pair of member machines picks its path in this order:
+
+1. **`lan` — LAN direct**: the peer's address is in the same subnet (RFC1918 / CGNAT /24, or loopback);
+2. **`p2p` — UDP hole-punched direct**: the gateway's dual UDP ports (primary + alt, see the gateway deployment docs) exchange punch coordinates and the machines connect directly;
+3. **`relay` — gateway ciphertext relay**: when no direct path is ready within the 1000ms punch window, traffic transparently switches to the gateway's WebSocket — still end-to-end encrypted, unreadable to the gateway.
+
+A silent background re-probe runs every 60 seconds; once a direct path opens, the session upgrades back to it without dropping a byte (the degrade/hot-swap behaviors are pinned by `test/peer-e2e.test.cjs`).
+
+### Security model & zero-knowledge boundary
+
+- **Self-certifying identity**: `nodeId = sha256(Ed25519 public key)[0..8]` — anyone holding the `(nodeId, public key)` pair can verify it independently; the gateway cannot forge a device it has never seen.
+- **Per-session end-to-end encryption**: for every pair of nodes and every session, both sides exchange ONE **ephemeral** X25519 key pair (signed by their long-term Ed25519 identities, replay/substitution-proof) and derive bidirectional simplex ChaCha20-Poly1305 AEAD keys via HKDF (forward-secret). The wire protocol's 28-byte routing header is the only plaintext (the gateway routes on it alone); payloads are unreadable to the gateway.
+- **Independent local TOFU pinning**: each machine pins its network peers' public keys in its own state file (`pinnedPeers` in `~/.dsh/zen-remote-state.json`; `verifyOrPinPeerKey` never auto-overwrites). Even if a gateway administrator resets a device's identity and the console shows `mismatch`, every other machine keeps refusing it locally (`identity-mismatch` — no handshake, no mounting) until someone at that machine explicitly clicks "trust new identity" or runs `dsh-zen-remote peer trust <nodeId>` to re-pin.
+- **Anti `zr~` re-nesting**: a remote session this machine mounts carries a `zr~<serverId>~<id>` virtual id; the share table refuses to register a virtual id as this machine's own shared session — "A mounts B, B re-exports A's sessions to C" chaining cannot happen, so session data crosses at most one hop in the network.
+- **Zero-knowledge gateway**: the gateway sees routing headers and ciphertext frames only, holds no session keys; what an administrator sees in the console is membership and online state, never session content.
 
 ---
 

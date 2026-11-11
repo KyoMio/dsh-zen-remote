@@ -13,10 +13,10 @@
 | `package.json` | 单包声明：`dsh.bundle.patch` → `cordis.patch.yml`，`dsh.client` → `exports["./client"]` |
 | `cordis.patch.yml` | 组合层，**一行** insert（`dsh-zen-remote`），随包自带；网关与推送由主入口按角色加载，不再各占一行 |
 | `src/index.ts` → `lib/index.js` | 主入口（插件行 `dsh-zen-remote`）：读 `role`，host 就 `ctx.plugin()` 加载网关与推送子插件，并挂 host 路由（附件上传 / 客户端配置 / 分享导出 / 管理 / 子客户端 / 中继） |
-| `src/config.ts` | 配置模型：四层回退（env > 插件行 > `lan-gate.config.json` > 默认值）、loader 的 `Config` schema（全 volatile）、`resolveRole` |
+| `src/config.ts` | 配置模型：四层回退（env > 插件行 > `lan-gate.config.json` > 默认值）、loader 的 `Config` schema（全 volatile）、`resolveRole`（`host` / `client` / `peer` 三角色，非精确串一律降级 host）与 `servesRole`（host+peer 对外服务）/ `connectsRole`（client+peer 对外连接）两个角色闸 |
 | `src/http.ts` | host 路由共用的 JSON 响应封装与同源 POST 门 |
 | `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
-| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（两角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff）、`debug-report`（脱敏诊断报告，via 墙先于分派，CU-3） |
+| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（三角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff）、`debug-report`（脱敏诊断报告，via 墙先于分派，CU-3） |
 | `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
 | `src/state-store.ts` | 主进程三合一状态存储（MS-1）：`~/.dsh/zen-remote-state.json`（0600、tmp+rename 原子写）统一承载本机 `serverId`、共享表、已配对服务端（上限 `maxServers`，默认 8，PG-2 起可配），并做旧 `zen-remote-server.json` / `zen-remote-shares.json` 的一次性自动迁移与清理；PG-2 起另承载 peer 三块：`peerIdentity`（自证明 Ed25519 身份，读时校验 nodeId=hash(key)，坏块丢弃重建）、`peerNetwork`（入网成员记录）、`pinnedPeers`（本地 TOFU 公钥锚定，`verifyOrPinPeerKey` 绝不自动覆盖、`repinPeerKey` 仅显式调用换锚） |
 | `src/share-store.ts` | 共享会话表（读写 `~/.dsh/zen-remote-state.json` 的 `sessions` 段，持久化，重启恢复），中继访问控制的事实来源 |
@@ -29,6 +29,7 @@
 | `src/session-reference.ts` | 两端共用的 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队消息 edit、`commands/execute` 全部字符串）：服务端照它校验、子客户端照它改写，同一份规则防两端漂移 |
 | `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
 | `src/relay-pool.ts` | 多服务端中继连接池（MS-2，最多 8 台）：按配对顺序管理每台的 `RelayClient`，握手回写 `serverId`/`serverName` 并对同 `serverId` 的旧条目去重（保留最新配对），重名显示名按配对顺序派生 `-1`/`-2`（`deriveDisplayServerNames`），支持按 entryId/serverId 定位、单台/全部重连、移除与改名广播 |
+| `src/peer/` | 节点端（`peer`）双路径组网引擎：`wire.ts` 线协议纯编解码（28B 明文路由头 + ≤1200B 密文帧）与帧算术、`crypto.ts` 自证明 Ed25519 身份（`nodeId = sha256(pub)[0..8]`）、`zr-net://` 邀请链接解析与会话级 Ephemeral X25519 + ChaCha20-Poly1305 AEAD、`arq.ts` 1200B 滑动窗口可靠流、`punch.ts` 双 UDP STUN 与 1000ms 打洞状态机（60s 静默重探、`lan`/`p2p` 路径分类）、`mux.ts` 虚拟 HTTP 多路复用、`engine.ts` 网关控制信令（`/peer/v1/ws` 挑战应答握手）与独立本地 TOFU 公钥锚定（mismatch 本机拦截）、挂载复用 `relay-pool` 的侧边栏合并 |
 | `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`，远程会话调用改走中继、虚拟 id 改写、面板判定（客户端那张字段表也在这里） |
 | `src/intercept-shape.ts` | 被包装方法的形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
 | `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端比对 `compareBridges`；不 import DSH、不碰 I/O |
@@ -50,7 +51,8 @@
 | `lan-gate.mjs` | 网关子插件入口，由主入口按 host 角色加载（不再自己占插件行）：spawn 子进程，共享密钥只经它进子进程 |
 | `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，Node stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀 |
 | `dsh-push.mjs` | 推送子插件（与网关一起由主入口加载）：回合结束推送 + `push_notify` 工具 |
-| `bin/zen-remote.mjs` + `src/cli/**` → `lib/cli/` | 命令行工具 `dsh-zen-remote`（bin 入口只加载 `lib/cli/main.js`）：插件进程内的 0600 IPC socket 服务端与 CLI 侧发现/客户端（`ipc-server.ts` / `ipc-client.ts`）、防遮蔽配置写入（`config-writer.ts`）、参数解析与双语 i18n（`args.ts` / `i18n.ts`）、`status` / `host *` / `client *` 子命令（`commands-*.ts`）、`setup` 三步向导与角色切换联动（`command-setup.ts`）、多选 profile 安装与 DSH 自动拉起（`bootstrap.ts`）；全部经 IPC 驱动插件进程，CLI 自己绝不 spawn caddy / cloudflared |
+| `bin/zen-remote.mjs` + `src/cli/**` → `lib/cli/` | 命令行工具 `dsh-zen-remote`（bin 入口只加载 `lib/cli/main.js`）：插件进程内的 0600 IPC socket 服务端与 CLI 侧发现/客户端（`ipc-server.ts` / `ipc-client.ts`）、防遮蔽配置写入（`config-writer.ts`）、参数解析与双语 i18n（`args.ts` / `i18n.ts`）、`status` / `host *` / `client *` / `peer *` 子命令（`commands-*.ts`）、`setup` 三步向导与三角色切换联动（`command-setup.ts`）、多选 profile 安装与 DSH 自动拉起（`bootstrap.ts`）；全部经 IPC 驱动插件进程，CLI 自己绝不 spawn caddy / cloudflared |
+| `gateway-server/` | 独立自建中继网关与 Web 控制台子包（源码同仓维护，**不进入** `dsh-zen-remote` npm 发布包；独立 `tsconfig` / `pnpm --dir gateway-server build|verify|test`）：虚拟网络管理、五态成员准入（`pending` / `authorized` / `paused` / `mismatch` / `revoked`）、双端口 UDP STUN 打洞协调与零知识 E2EE 密文中转（网关无私钥、只路由密文帧），Docker 单容器交付；部署与运维文档见 `gateway-server/README.md`（只写给最终部署者，不含内部过程文档） |
 | `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标 |
 | `test/*.test.cjs` | 网关侧测试（真子进程 + mock 上游）+ 中继端到端（`relay-e2e.test.cjs`）+ 纯逻辑导入测试 |
 | `scripts/check-*.mjs` | 界面侧自检（纯 `node:assert`，靠 Node ≥23.6 类型剥离直接 import `.ts`） |
@@ -116,6 +118,11 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
 
 ## 合仓后仍然成立的硬约束
 
+- **gateway-server 不进发布包**：`package.json` 的 `files` 白名单刻意不含
+  `gateway-server/`，主仓 build/verify/test 也不碰它——它有自己的
+  `pnpm --dir gateway-server <cmd>` 三件套。改动网关后记得单独跑那三条命令；
+  严禁 `git add -f` 它被 `.gitignore` 忽略的设计/原型/过程文档
+  （`.impeccable/`、`prototype/`、`PRODUCT.md`、`DESIGN.md`、`docs/`）。
 - **网关是子进程**：`lan-gate.mjs` 只负责 spawn + 生命周期，永远不要把
   `lib/lan-gate-server.cjs` import 进 DSH 进程。
 - **中继共享密钥不落地**：主入口每次 apply 现生成 `LAN_GATE_RELAY_SECRET`，
