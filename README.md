@@ -1,5 +1,5 @@
 <h1 align="center">dsh-zen-remote</h1>
-<p align="center">One DeepSeek Harness plugin, two roles. The <b>host</b> turns DSH into a phone-reachable PWA (mobile UI, pairing gateway, lock-screen push) and shares chosen sessions to paired desktops. The <b>client</b> runs inside another DSH desktop app and puts the host's shared sessions right into its own sidebar (up to <b>8 hosts</b> connected simultaneously) — full history, live progress, messages, approvals, terminal, everything executes on the host.</p>
+<p align="center">One DeepSeek Harness plugin, three roles. The <b>host</b> turns DSH into a phone-reachable PWA (mobile UI, pairing gateway, lock-screen push) and shares chosen sessions to paired desktops. The <b>client</b> runs inside another DSH desktop app and puts the host's shared sessions right into its own sidebar (up to <b>8 hosts</b> connected simultaneously) — full history, live progress, messages, approvals, terminal, everything executes on the host. The <b>peer</b> joins a self-hosted virtual network with a single <code>zr-net://</code> invite link: machines in the network discover each other automatically and mount each other's remote-enabled sessions into their sidebars (LAN / NAT hole-punch direct paths first, a seamless fallback to the gateway's end-to-end-encrypted relay when no direct path exists), while keeping this machine's own phone/browser QR access and lock-screen push.</p>
 
 <p align="center">
 <a href="https://www.npmjs.com/package/dsh-zen-remote"><img src="https://img.shields.io/npm/v/dsh-zen-remote?style=flat-square&color=5B4CF0&logo=npm&label=npm" alt="npm version"></a>
@@ -34,6 +34,7 @@
 2. [Quick Start (Unified Setup & Pairing Wizard)](#2-quick-start-unified-setup--pairing-wizard)
    - [Scenario A: Set up as Host (Phone & Desktop Access)](#scenario-a-set-up-as-host-phone--desktop-access)
    - [Scenario B: Set up as Desktop Client (Connect up to 8 Hosts)](#scenario-b-set-up-as-desktop-client-connect-up-to-8-hosts)
+   - [Scenario C: Join a Self-Hosted Virtual Network as a Peer Node](#scenario-c-join-a-self-hosted-virtual-network-as-a-peer-node)
 3. [Daily Usage: Session Sharing & Cross-Device Workflow](#3-daily-usage-session-sharing--cross-device-workflow)
 4. [Lock-Screen Push: When Notifications Fire](#4-lock-screen-push-when-notifications-fire)
 5. [Features](#5-features)
@@ -67,7 +68,7 @@ dsh-zen-remote status           # current role, gateway & connection state (--js
 ```
 
 <details>
-<summary>Expand full CLI subcommand reference (<code>host</code> / <code>client</code> / non-interactive flags)</summary>
+<summary>Expand full CLI subcommand reference (<code>host</code> / <code>client</code> / <code>peer</code> / non-interactive flags)</summary>
 
 ```sh
 # Host commands (when role is host)
@@ -83,6 +84,13 @@ dsh-zen-remote host ingress snippet [--proxy nginx|caddy|lucky] # print reverse-
 dsh-zen-remote client pair http://192.168.1.2:3088 --code 12345678 [--name My-Mac]
 dsh-zen-remote client list                                     # list all paired hosts (up to 8) and connection states
 dsh-zen-remote client unpair <hostUrl|entryId|--all> [--yes]   # remove one or all paired hosts
+
+# Peer commands (when role is peer, join a self-hosted virtual network)
+npx dsh-zen-remote setup --role peer --invite "zr-net://gw.example.com/0123456789abcdef#join-key" [--yes]
+dsh-zen-remote peer join "zr-net://gw.example.com/0123456789abcdef#join-key" [--name My-Mac] [--yes]
+dsh-zen-remote peer status                                     # nodeId, admission state, network peers & their connection paths (--json)
+dsh-zen-remote peer trust <nodeId>                             # explicitly trust a peer's new identity after a mismatch
+dsh-zen-remote peer leave [--yes]                              # leave the network (phone/browser QR access is not affected)
 ```
 
 - **Preflight & non-interactive automation**: `setup` automatically scans candidate profiles for multi-select plugin installation (`desktop` is skipped) and launches the DSH daemon / app before starting the wizard. Pass `--yes` with the required flags (e.g. `setup --role host --ingress lan --no-wait --yes`) for unattended scripts.
@@ -121,9 +129,10 @@ cd ~/.dsh/profiles/desktop && pnpm install
 
 ## 2. Quick Start (Unified Setup & Pairing Wizard)
 
-The same plugin supports two roles:
+The same plugin supports three roles:
 - **Server (`role: host`, default)**: runs your sessions, spawns the local security gateway and Web Push service, and lets your phone (PWA) or another computer connect.
 - **Desktop Client (`role: client`)**: runs inside another computer's DSH desktop app, connects to **up to 8 hosts simultaneously**, and mounts their shared sessions directly into its own sidebar (without spawning a local gateway or fighting for port 3088).
+- **Peer Node (`role: peer`)**: joins a **self-hosted virtual network** with a single `zr-net://` invite link — machines in the network discover each other automatically in both directions and mount each other's remote-enabled sessions into their sidebars (LAN / UDP hole-punch direct paths preferred, with a 1-second seamless fallback to the gateway's end-to-end-encrypted relay), **while this machine keeps its own phone/browser QR access and lock-screen push**. No public IP or per-machine pairing codes needed; joining a network does not fight for port 3088 either.
 
 Open **Plugins → `dsh-zen-remote`** in DSH. The **Remote Access & Device Pairing** card sits right at the top of the page (or run `npx dsh-zen-remote setup` on a headless server):
 
@@ -177,6 +186,36 @@ On another computer running the DSH desktop app (or via `dsh-zen-remote client p
 
 ---
 
+### Scenario C: Join a Self-Hosted Virtual Network as a Peer Node
+
+Multiple computers, one mesh, zero public IPs: one person deploys the **self-hosted relay gateway** ([`gateway-server/`](gateway-server/README.md) — a single Docker container with its own web console), creates a virtual network, and hands every member a `zr-net://` invite link. Each machine joins with that one link; there are no per-machine pairing codes to copy around.
+
+On each computer that should join the network:
+
+1. Open **Plugins → `dsh-zen-remote`** and click **Start Setup Wizard**.
+2. **Step 1**: select **Peer Node** and click **Next** (switching to peer keeps this machine's serving halves — phone/browser QR access and lock-screen push keep working exactly as before).
+3. **Step 2**: paste the full invite link (`zr-net://…` / `zr-nets://…`, generated in the gateway's web console) and click **Join Network**. If the network requires manual admission, the wizard shows *"pending approval"* until an administrator approves the device in the gateway console.
+4. **Step 3**: once the three status lights (**Local identity ready**, **Network admission**, **Peer discovery & session sync**) turn green, the other member machines' remote-enabled sessions appear in your sidebar automatically — and your own remote-enabled sessions appear in theirs. No further action per machine.
+
+Or do it all from the terminal (headless servers):
+
+```sh
+npx dsh-zen-remote setup --role peer --invite "zr-net://gw.example.com/0123456789abcdef#join-key"
+dsh-zen-remote peer status        # nodeId, admission state, network peers & their live connection paths
+dsh-zen-remote peer trust <nodeId> # explicitly re-trust a peer whose identity changed (after a mismatch warning)
+dsh-zen-remote peer leave         # leave the network
+```
+
+How the network moves your data:
+
+- **Direct first**: sessions ride LAN direct or UDP hole-punched P2P paths whenever possible. The gateway coordinates the hole punch over dual UDP STUN ports.
+- **Seamless fallback**: if no direct path is established within 1 second, traffic transparently switches to the gateway's **end-to-end-encrypted relay** — the gateway only ever forwards ciphertext frames it cannot decrypt. A silent background re-probe (every 60s) upgrades the path automatically when a direct route appears later.
+- **Zero-knowledge identities**: every machine has a self-certifying node identity (`nodeId` = hash of its Ed25519 public key), and each machine pins its peers' public keys locally (TOFU) — a gateway-side identity reset cannot silently impersonate anyone; the machine being impersonated stays blocked until someone at that machine explicitly trusts the new identity.
+
+> Deploying the gateway itself: see [`gateway-server/README.md`](gateway-server/README.md) — one `docker run`, ports `19393/tcp+udp` and `19394/udp`, initial admin credentials printed to the first-boot log.
+
+---
+
 ## 3. Daily Usage: Session Sharing & Cross-Device Workflow
 
 | | **Web App Device (Phone / Tablet / Browser)** | **Desktop Client (Another DSH Desktop App)** |
@@ -226,8 +265,9 @@ Notifications fire only when **you are actually needed**, along two independent 
 ## 5. Features
 
 - **Mobile PWA UI (Host)**: two-level page stack (session list home + session page with swipe-back and Android back-gesture support, first-frame boot skeleton, immutable asset caching), auto-discovered plugin entry chips, compact mobile composer with bottom sheets and phone attachment uploads, and a session info card (6-tile stats with `tok/s` output speed, log export, rename, fork, archive, one-tap full-conversation PNG share image, and remote access switch).
-- **Unified Setup Wizard & Headless CLI (`dsh-zen-remote`)**: top-of-page 2×2 live overview card, 3-step modal wizard, and a full-featured terminal CLI (`setup` / `status` / `host` / `client`) covering all four host ingress modes (Managed Caddy, Existing Reverse Proxy, Cloudflare Tunnel, LAN / Tailscale Direct with private-IP wall) and client pairing.
+- **Unified Setup Wizard & Headless CLI (`dsh-zen-remote`)**: top-of-page 2×2 live overview card, 3-step modal wizard, and a full-featured terminal CLI (`setup` / `status` / `host` / `client` / `peer`) covering all four host ingress modes (Managed Caddy, Existing Reverse Proxy, Cloudflare Tunnel, LAN / Tailscale Direct with private-IP wall), client pairing, and peer network joining (`peer join` / `status` / `trust` / `leave`).
 - **Cross-Desktop Remote Sessions & Multi-Server Pool (Client)**: connect up to **8 main servers** simultaneously in pairing order; supports full history & live streaming, approval/question sync, per-server isolated model catalog, file tree & Git diffs, duplex server-side terminal (`terminal/attach`), inline Markdown image & media forwarding, windowed artifact downloads, server-side LibreOffice PDF preview, up to 500 MiB file uploads (drag-and-drop, paperclip picker, and paste), and one-click redacted diagnostics export.
+- **Peer Virtual Networking (`peer`) & Self-Hosted Gateway (`gateway-server/`)**: join a self-hosted virtual network with one `zr-net://` invite link; automatic two-way discovery mounts member machines' remote-enabled sessions into each sidebar over LAN / UDP hole-punch direct paths (1-second seamless fallback to the gateway's end-to-end-encrypted relay, silent 60s re-probe upgrades); self-certifying node identities with independent local TOFU pinning; the gateway ships as a separate single-container deployment with a web console (virtual network management, five-state member admission, dual-port UDP STUN coordination, zero-plaintext relay).
 - **Plugin Bridge**: cooperative plugins and built-in adapters (such as `dsh-better-sidebar` `0.25.0`–`0.30.1`) route their panel HTTP and WebSocket requests in remote sessions to the host machine (with explicit owner consent for whole-machine data). See [Plugin Bridge Guide](docs/plugin-bridge.md).
 
 In depth: [Interface Design](docs/interface.md) · [Public Access & Relay Protocol](docs/remote-access.en.md)
@@ -249,7 +289,7 @@ Each field resolves in order: **environment variable > plugin row settings > `~/
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `role` | `host` | `host` runs gateway + push + sharing; `client` connects to a remote host |
+| `role` | `host` | `host` runs gateway + push + sharing; `client` connects to remote hosts; `peer` joins a self-hosted virtual network while keeping the serving halves (gateway, push, sharing) mounted |
 | `serverName` | computer name | **Device name** (≤ 40 chars): sidebar group title on a host, registered device name on a client; renaming on a client broadcasts the new name to all its paired servers (one-way — the server never rewrites it) |
 | `port` | `3088` | Gateway port; retries upward (up to +20) if occupied |
 | `host` | `127.0.0.1` | Gateway bind address (`127.0.0.1` for local proxy/tunnel, `0.0.0.0` for LAN/Tailscale direct) |
@@ -284,6 +324,7 @@ Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_
 ## 7. Security Model, Version Tolerance & Known Notes
 
 - **Trusted client & strict session isolation**: a paired desktop client runs terminals and file previews as the host's OS user, while unshared sessions are strictly filtered and refused at the relay layer. Even when binding `0.0.0.0` for LAN/Tailscale, the gateway's private-IP wall rejects any unproxied public internet IP (`403 public-direct-forbidden`), and all admin/wizard mutations are restricted to the host machine itself.
+- **Peer networking is zero-knowledge & end-to-end encrypted**: traffic between two member machines is sealed with per-session ephemeral X25519 + ChaCha20-Poly1305 ciphers (forward-secret, identities signed); the gateway only routes opaque ciphertext frames and never holds session keys. Node identities are self-certifying (`nodeId` = hash of the Ed25519 public key), and each machine pins its peers' keys independently (TOFU): even a gateway-side identity reset stays blocked on every other machine (`mismatch`) until someone at that machine explicitly re-trusts the new identity.
 - **Version tolerance**: both ends must run the same `dsh-zen-remote` version; DSH host versions may differ (interface fingerprints are compared at handshake and degrade only mismatched panels).
 
 <details>
