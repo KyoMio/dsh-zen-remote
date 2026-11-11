@@ -28,9 +28,15 @@ const dgram = require('node:dgram')
 const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
 const { createRelayPool } = require('../lib/relay-pool.js')
-const { ensurePeerIdentity, readPeerNetwork, readStateFile } = require('../lib/state-store.js')
+const { ensurePeerIdentity, readPeerNetwork, readStateFile, upsertPairedServer } = require('../lib/state-store.js')
 const { createPeerEngine } = require('../lib/peer/engine.js')
 const { toVirtual } = require('../lib/virtual-id.js')
+const { installIntercept, createLocalOnlyGateway } = require('../lib/intercept.js')
+const { createBridgeRegistry } = require('../lib/plugin-bridge.js')
+const { createPluginLoopback } = require('../lib/plugin-loopback.js')
+const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
+const { normalizeAdapter } = require('../lib/plugin-adapter-core.js')
+const { ADAPTERS } = require('../lib/adapters/index.js')
 
 // gateway-server（独立包编译产物）
 const { createGatewayApiServer } = require('../gateway-server/dist/server.js')
@@ -708,6 +714,620 @@ test('PG-8 #5: manual 模式持有效邀请链接进 pending 审批放行互通�
     assert.equal(C.engine.status().deniedReason, null)
   } finally {
     for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+// ---------------------------------------------------------------- 6. 双端同挂 installIntercept 不触发流风暴，远程历史与实时流式回复正常
+
+/**
+ * 仿真真实 DSH 宿主中 TypertGatewayService 的动态方法分派：
+ * `invoke` / `stream` / `wireStream.open` 全部经由实例属性 `this.dispatchRpc`
+ * 与 `this.openWireStream` 调用——与生产环境 `role === 'peer'` 下 `servesRole`
+ * 和 `connectsRole` 共享同一个 `typertGateway` 完全一致。
+ */
+class PeerHostGateway {
+  constructor(handlers) {
+    this.handlers = handlers
+    this.wireStream = {
+      open: (endpoint, payload, uplink, peer, signal) => this.openWireStream(endpoint, payload, uplink, peer, signal, { signal }),
+    }
+    this.rpcBridge = (endpoint, payload, signal, peer) => this.dispatchRpc(endpoint, payload, signal, peer)
+    this.wireTap = (endpoint, payload, uplink, peer, signal, control, window) =>
+      this.openWireStream(endpoint, payload, uplink, peer, control.signal, control, window)
+  }
+  async dispatchRpc(endpoint, payload, signal, peer) {
+    return this.handlers.dispatchRpc(endpoint, payload, signal, peer)
+  }
+  async openWireStream(endpoint, payload, uplink, peer, signal, control) {
+    return this.handlers.openWireStream(endpoint, payload, uplink, peer, signal, control)
+  }
+  async invoke(call) {
+    const endpoint = `${call.namespace}/${call.method}`
+    const res = await this.dispatchRpc(endpoint, { args: call.args }, call.signal, call.peer)
+    if (res && res.ok === false) {
+      throw Object.assign(new Error(res.error?.message ?? 'rpc failed'), { code: res.error?.code ?? 'rpc-failed' })
+    }
+    return res && typeof res === 'object' && 'value' in res ? res.value : res
+  }
+  stream(call) {
+    const endpoint = `${call.namespace}/${call.method}`
+    const self = this
+    return {
+      async *[Symbol.asyncIterator]() {
+        const inner = await self.openWireStream(endpoint, { args: call.args }, undefined, call.peer, call.signal, { signal: call.signal })
+        yield* inner
+      },
+    }
+  }
+}
+
+async function startFullPeerNode(gw, { name, shared = [], localWorkspaceId = 'ws-local', localSessionId = 's-local' } = {}) {
+  const home = path.join(ROOT, `full-${name}-${Math.random().toString(36).slice(2, 6)}`)
+  fs.mkdirSync(home, { recursive: true })
+  const stateFile = path.join(home, 'zen-remote-state.json')
+  const identity = ensurePeerIdentity(stateFile)
+  const punchSocket = await openUdp()
+  const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+  for (const id of shared) store.share(id)
+
+  const sessionFollowFeeders = new Map()
+  const promptsReceived = []
+  const createdWorkspaceIds = []
+  let activeLocalStreams = 0
+  let peakLocalStreams = 0
+
+  function openHeldStream(initialFrames, signal, onRegister) {
+    const queue = [...initialFrames.map((frame) => ({ kind: 'frame', frame }))]
+    let closed = false
+    let wake = () => {}
+    activeLocalStreams += 1
+    if (activeLocalStreams > peakLocalStreams) peakLocalStreams = activeLocalStreams
+    const release = () => {
+      if (!closed) {
+        closed = true
+        activeLocalStreams -= 1
+        wake()
+      }
+    }
+    signal?.addEventListener('abort', release)
+    const push = (frame) => {
+      if (closed) return
+      queue.push({ kind: 'frame', frame })
+      wake()
+    }
+    if (onRegister) onRegister({ push, close: release })
+    return (async function* () {
+      try {
+        for (;;) {
+          if (queue.length > 0) {
+            yield queue.shift().frame
+          } else if (closed) {
+            return
+          } else {
+            await new Promise((resolve) => { wake = resolve })
+          }
+        }
+      } finally {
+        release()
+      }
+    })()
+  }
+
+  const rawGateway = new PeerHostGateway({
+    async dispatchRpc(endpoint, payload) {
+      const args = payload?.args ?? {}
+      if (endpoint === 'session/list') {
+        return { ok: true, value: { items: [{ sessionId: localSessionId, title: `${name}-title` }] } }
+      }
+      if (endpoint === 'session/modelCatalog') {
+        return { ok: true, value: { default: null, routableProviders: [], groups: [], failures: [] } }
+      }
+      if (endpoint === 'session/prompt') {
+        const req = args?.request ?? args ?? {}
+        promptsReceived.push(req)
+        const sid = req.sessionId
+        const feeder = sessionFollowFeeders.get(sid)
+        if (feeder) {
+          setImmediate(() => {
+            feeder.push({ type: 'assistant-stream', chunk: { kind: 'text', delta: `reply-from-${name}:${req.content ?? ''}` } })
+          })
+        }
+        return { ok: true, value: { accepted: true } }
+      }
+      if (endpoint === 'session/create') {
+        createdWorkspaceIds.push(args?.request?.workspaceId)
+        store.share('s-created')
+        return { ok: true, value: { sessionId: 's-created' } }
+      }
+      return { ok: true, value: {} }
+    },
+    async openWireStream(endpoint, payload, _uplink, _peer, signal) {
+      const args = payload?.args ?? {}
+      if (endpoint === 'workspace/follow') {
+        return openHeldStream([
+          {
+            type: 'baseline',
+            value: {
+              items: [{ workspaceId: localWorkspaceId, title: `${name}-ws`, sessionIds: [localSessionId] }],
+              orderIds: [localWorkspaceId],
+              archivedSessionIds: [],
+              pinnedSessionIds: [],
+            },
+          },
+        ], signal)
+      }
+      if (endpoint === 'session/control') {
+        return openHeldStream([
+          { type: 'baseline', value: { projections: { [localSessionId]: { title: `${name}-title` } } } },
+        ], signal)
+      }
+      if (endpoint === '$events') {
+        return openHeldStream([], signal)
+      }
+      if (endpoint === 'session/follow') {
+        const sid = args?.request?.address?.sessionId
+        return openHeldStream(
+          [{ type: 'snapshot', header: { id: sid, cwd: '/tmp' }, events: [{ kind: 'user', text: 'history-hello' }] }],
+          signal,
+          (feeder) => {
+            sessionFollowFeeders.set(sid, feeder)
+            signal?.addEventListener('abort', () => {
+              if (sessionFollowFeeders.get(sid) === feeder) sessionFollowFeeders.delete(sid)
+            })
+          },
+        )
+      }
+      throw Object.assign(new Error(`unexpected stream ${endpoint}`), { code: 'test/unexpected-stream' })
+    },
+  })
+
+  let interceptHandle
+  let currentServerName = name
+  const relayPool = createRelayPool({
+    stateFile,
+    skipPersistedServers: true,
+    computeOwnFingerprints: () => ({}),
+    onStateChange: () => { interceptHandle?.notePoolEvent() },
+    onServerRemoved: () => { interceptHandle?.notePoolEvent() },
+  })
+  interceptHandle = installIntercept({
+    raw: rawGateway,
+    pool: relayPool,
+  })
+
+  const relayHandler = createRelayHandler({
+    secret: SECRET,
+    store,
+    gateway: createLocalOnlyGateway(rawGateway),
+    serverInfo: {
+      serverId: loadServerId(home),
+      serverName: () => currentServerName,
+      dshVersion: '0.0.0-peer-e2e',
+      fingerprints: () => ({}),
+      plugins: () => ({}),
+    },
+    heartbeatMs: 300,
+  })
+
+  const engine = createPeerEngine({
+    stateFile,
+    identity,
+    relayPool,
+    relayHandler: () => relayHandler,
+    relaySecret: () => SECRET,
+    serverName: () => currentServerName,
+    udpSocket: punchSocket,
+    udpProbe: { primaryPort: gw.udp.primaryPort, altPort: gw.udp.altPort ?? 0 },
+    punch: { punchWindowMs: 1000, punchIntervalMs: 100, punchRounds: 10, reprobeIntervalMs: 60_000 },
+  })
+
+  return {
+    name,
+    setServerName: (n) => {
+      currentServerName = n
+      engine.announceSelfName(n)
+    },
+    identity,
+    home,
+    stateFile,
+    store,
+    rawGateway,
+    relayPool,
+    interceptHandle,
+    relayHandler,
+    engine,
+    promptsReceived,
+    createdWorkspaceIds,
+    get activeLocalStreams() { return activeLocalStreams },
+    get peakLocalStreams() { return peakLocalStreams },
+    stop: () => {
+      interceptHandle.uninstall()
+      engine.stop()
+      relayPool.stop()
+      try { punchSocket.close() } catch { /* already closed */ }
+    },
+  }
+}
+
+test('PG-8 #6: 双端同装 installIntercept 打开全局流不产生流风暴（无 too-many-streams），远程历史加载与实时流式回复正常', async () => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  const aborts = []
+  try {
+    assert.equal(typeof createLocalOnlyGateway, 'function', 'createLocalOnlyGateway must be exported from intercept')
+    const A = await startFullPeerNode(gw, { name: 'Alpha', shared: ['s-a1'], localWorkspaceId: 'ws-a', localSessionId: 's-a1' })
+    const B = await startFullPeerNode(gw, { name: 'Beta', shared: ['s-b1'], localWorkspaceId: 'ws-b', localSessionId: 's-b1' })
+    nodes.push(A, B)
+
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitPeerOnline(A, B.identity.nodeId)
+    await waitPeerOnline(B, A.identity.nodeId)
+
+    // 模拟两端各自的桌面窗口同时打开 workspace/follow + session/control + $events 三条全局合并流
+    const openUiStreams = async (node) => {
+      const ac = new AbortController()
+      aborts.push(ac)
+      const wsFrames = []
+      const wsIter = await node.rawGateway.openWireStream('workspace/follow', { args: {} }, undefined, undefined, ac.signal, { signal: ac.signal })
+      const ctrlIter = await node.rawGateway.openWireStream('session/control', { args: {} }, undefined, undefined, ac.signal, { signal: ac.signal })
+      const evIter = await node.rawGateway.openWireStream('$events', {}, undefined, undefined, ac.signal, { signal: ac.signal })
+      ;(async () => { for await (const f of wsIter) wsFrames.push(f) })().catch(() => {})
+      ;(async () => { for await (const _ of ctrlIter) { /* drain */ } })().catch(() => {})
+      ;(async () => { for await (const _ of evIter) { /* drain */ } })().catch(() => {})
+      return wsFrames
+    }
+    const wsFramesA = await openUiStreams(A)
+    const wsFramesB = await openUiStreams(B)
+
+    const virtualBSessionOnA = toVirtual(B.identity.nodeId, 's-b1')
+    await waitFor(
+      () => wsFramesA.some((f) => f.type === 'upsert' && Array.isArray(f.workspace?.sessionIds) && f.workspace.sessionIds.includes(virtualBSessionOnA)),
+      8000,
+      'A sidebar received virtualized workspace from B',
+    )
+    const virtualASessionOnB = toVirtual(A.identity.nodeId, 's-a1')
+    await waitFor(
+      () => wsFramesB.some((f) => f.type === 'upsert' && Array.isArray(f.workspace?.sessionIds) && f.workspace.sessionIds.includes(virtualASessionOnB)),
+      8000,
+      'B sidebar received virtualized workspace from A',
+    )
+
+    // 确认绝无指数级互拉流风暴：每端本地流数量保持个位数（本地 UI 3 条 + 对端中继拉取的 2~3 条）
+    await sleep(300)
+    assert.ok(A.peakLocalStreams <= 10, `A peakLocalStreams should stay bounded, got ${A.peakLocalStreams}`)
+    assert.ok(B.peakLocalStreams <= 10, `B peakLocalStreams should stay bounded, got ${B.peakLocalStreams}`)
+
+    // 从 A 打开远程会话 zr~<nodeB>~s-b1 的 session/follow：不得报 429 too-many-streams，立即拿到历史快照
+    const followAc = new AbortController()
+    aborts.push(followAc)
+    const followFrames = []
+    const followIter = await A.rawGateway.openWireStream(
+      'session/follow',
+      { args: { request: { address: { kind: 'session', sessionId: virtualBSessionOnA } } } },
+      undefined,
+      undefined,
+      followAc.signal,
+      { signal: followAc.signal },
+    )
+    ;(async () => {
+      for await (const frame of followIter) followFrames.push(frame)
+    })().catch(() => {})
+
+    await waitFor(() => followFrames.some((f) => f.type === 'snapshot'), 5000, 'remote session/follow delivered history snapshot')
+    assert.equal(followFrames[0].header.id, virtualBSessionOnA)
+
+    // 从 A 向远程会话发送消息，断言 B 收到真实 sessionId，且 A 实时收到流式回复帧
+    const promptRes = await A.rawGateway.dispatchRpc(
+      'session/prompt',
+      { args: { request: { sessionId: virtualBSessionOnA, content: 'ping-live' } } },
+      undefined,
+      undefined,
+    )
+    assert.equal(promptRes.ok, true)
+    await waitFor(
+      () => followFrames.some((f) => f.type === 'assistant-stream' && f.chunk?.delta === 'reply-from-Beta:ping-live'),
+      5000,
+      'remote session/follow streamed live assistant reply back to A',
+    )
+    assert.equal(B.promptsReceived[0].sessionId, 's-b1')
+  } finally {
+    for (const ac of aborts) ac.abort()
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+// ---------------------------------------------------------------- 7. 卸载后再手动挂载、断线重连清理陈旧设备、设备重命名实时同步
+
+test('PG-8 #7: 手动卸载后再次挂载可恢复且生成新工作区纪元 id、welcome 差集清理离网设备、重命名实时同步且跳过非网络配对记录', async () => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  const aborts = []
+  try {
+    const A = await startFullPeerNode(gw, { name: 'DupHost', shared: ['s-a1'], localWorkspaceId: 'ws-a', localSessionId: 's-a1' })
+    // 在 B 的状态文件里预埋一条旧 client 模式的同名配对记录，验证 peer 模式 skipPersistedServers 不会让它占用 DupHost-1
+    upsertPairedServer(path.join(ROOT, 'unused.json'), { serverUrl: 'http://192.168.1.9:3088', token: 'tok' })
+    const B = await startFullPeerNode(gw, { name: 'Viewer', shared: ['s-b1'], localWorkspaceId: 'ws-b', localSessionId: 's-b1' })
+    upsertPairedServer(B.stateFile, { serverUrl: 'http://192.168.1.9:3088', token: 'tok', serverName: 'DupHost' })
+    // 重建一个带 skipPersistedServers 的池验证不会混入旧 client 记录
+    const cleanCheckPool = createRelayPool({ stateFile: B.stateFile, skipPersistedServers: true })
+    assert.equal(cleanCheckPool.entries().length, 0, 'peer mode pool must ignore persisted client-mode servers')
+    cleanCheckPool.stop()
+
+    nodes.push(A, B)
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitPeerOnline(B, A.identity.nodeId)
+
+    const ac = new AbortController()
+    aborts.push(ac)
+    const wsFramesB = []
+    const wsIter = await B.rawGateway.openWireStream('workspace/follow', { args: {} }, undefined, undefined, ac.signal, { signal: ac.signal })
+    ;(async () => { for await (const f of wsIter) wsFramesB.push(f) })().catch(() => {})
+
+    const epoch0WsId = toVirtual(A.identity.nodeId, 'ws-a')
+    await waitFor(
+      () => wsFramesB.some((f) => f.type === 'upsert' && f.workspace?.workspaceId === epoch0WsId),
+      8000,
+      'initial mount emits epoch-0 workspaceId',
+    )
+
+    // 1) 点击取消挂载（disabled=true）→ 自动发出 remove 卸载工作区
+    B.engine.setNodeDisabled(A.identity.nodeId, true)
+    assert.equal(B.engine.status().peers.find((p) => p.nodeId === A.identity.nodeId)?.mounted, false)
+    await waitFor(
+      () => wsFramesB.some((f) => f.type === 'remove' && f.workspaceId === epoch0WsId),
+      5000,
+      'unmount emits workspace remove',
+    )
+
+    // 2) 再次点击手动挂载（disabled=false）→ 必须重新挂载上线，且使用新纪元 workspaceId 绕开前端 ClientWorkspaceModel.removedIds 黑名单
+    B.engine.setNodeDisabled(A.identity.nodeId, false)
+    assert.equal(B.engine.status().peers.find((p) => p.nodeId === A.identity.nodeId)?.mounted, true)
+    await waitPeerOnline(B, A.identity.nodeId)
+    const epoch1WsId = toVirtual(A.identity.nodeId, '#1~ws-a')
+    await waitFor(
+      () => wsFramesB.some((f) => f.type === 'upsert' && f.workspace?.workspaceId === epoch1WsId),
+      8000,
+      're-mount emits fresh epoch-1 workspaceId so UI sidebar restores immediately',
+    )
+
+    // 在新纪元工作区上新建会话：intercept 必须剥掉 #1~ 还原真实 ws-a
+    const createRes = await B.rawGateway.dispatchRpc(
+      'session/create',
+      { args: { request: { workspaceId: epoch1WsId } } },
+      undefined,
+      undefined,
+    )
+    assert.equal(createRes.ok, true)
+    assert.equal(A.createdWorkspaceIds[0], 'ws-a')
+
+    // 3) 设备重命名（节点自改名 + 网关控制台 PATCH 改名）→ 对端实时收到 peer-renamed 并更新工作区显示名
+    A.setServerName('StudioMac')
+    await waitFor(
+      () => B.engine.status().peers.find((p) => p.nodeId === A.identity.nodeId)?.name === 'StudioMac',
+      5000,
+      'B peer status reflects A self-rename',
+    )
+    await waitFor(
+      () => wsFramesB.some((f) => f.type === 'upsert' && f.workspace?.workspaceId === epoch1WsId && String(f.workspace?.title).includes('StudioMac')),
+      5000,
+      'B sidebar workspace title updated live after A self-rename',
+    )
+
+    const patchRes = await api(gw.base, 'PATCH', `/api/v1/networks/${net.id}/members/${A.identity.nodeId}`, {
+      cookie: gw.tenantCookie,
+      body: { name: 'OfficeMini' },
+    })
+    assert.equal(patchRes.status, 200)
+    await waitFor(
+      () => B.engine.status().peers.find((p) => p.nodeId === A.identity.nodeId)?.name === 'OfficeMini',
+      5000,
+      'gateway console PATCH member rename propagated to B',
+    )
+  } finally {
+    for (const ac of aborts) ac.abort()
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+// ---------------------------------------------------------------- 8. peer 模式文件目录侧栏（dsh-better-sidebar）默认放行且回环不重入拦截
+
+test('PG-8 #8: peer 模式下 dsh-better-sidebar 远程会话请求默认桥接 200（无 503 consent-off 且回环不串扰），显式 false 时返回 503', async () => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  const servers = []
+  try {
+    const sidebarAdapter = ADAPTERS.find((a) => a.plugin === 'dsh-better-sidebar')
+    assert.ok(sidebarAdapter, 'dsh-better-sidebar adapter must exist')
+
+    let serverExplicitConsent = {}
+    const makeBridgedPeer = async (name, shared) => {
+      const home = path.join(ROOT, `sb-${name}-${Math.random().toString(36).slice(2, 6)}`)
+      fs.mkdirSync(home, { recursive: true })
+      const stateFile = path.join(home, 'zen-remote-state.json')
+      const identity = ensurePeerIdentity(stateFile)
+      const punchSocket = await openUdp()
+      const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+      for (const id of shared) store.share(id)
+
+      const registry = createBridgeRegistry()
+      const normalized = normalizeAdapter(sidebarAdapter, sidebarAdapter.versions[0])
+      registry.registerNormalized(normalized.declaration)
+      const adapters = [normalized]
+      const loopbackSecret = `loopback-secret-${name}-${Math.random().toString(16).slice(2)}`
+
+      // 模拟真实 dsh-host-webserver + dsh-better-sidebar 路由表
+      const routes = new Map()
+      routes.set('/sidebar/api', {
+        kind: 'prefix',
+        path: '/sidebar/api',
+        handler: async (req, res) => {
+          const chunks = []
+          for await (const c of req) chunks.push(c)
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ ok: true, servedBy: name, sessionId: body.sessionId, entries: ['README.md'] }))
+        },
+      })
+      const webServer = {
+        exact: new Map(),
+        prefixes: new Map(),
+        upgrades: new Map(),
+        match(pathname) {
+          for (const [p, r] of routes.entries()) {
+            if (pathname === p || pathname.startsWith(`${p}/`)) return r
+          }
+          return undefined
+        },
+      }
+      const httpServer = http.createServer((req, res) => {
+        const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+        if (pathname === '/__auth') {
+          res.writeHead(303, { 'set-cookie': 'dsh_auth=ok; Path=/', location: '/' })
+          res.end()
+          return
+        }
+        const matched = webServer.match(pathname)
+        if (!matched) { res.writeHead(404); res.end(); return }
+        void matched.handler(req, res)
+      })
+      await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve))
+      servers.push(httpServer)
+      const port = httpServer.address().port
+
+      const loopback = createPluginLoopback({
+        getTarget: () => ({ protocol: 'http:', port }),
+        getTokenUrl: () => `http://127.0.0.1:${port}/__auth`,
+        loopbackSecret,
+      })
+
+      const effectivePeerConsent = () => {
+        const out = {}
+        for (const decl of registry.list()) {
+          out[decl.plugin] = serverExplicitConsent[decl.plugin] ?? true
+        }
+        return out
+      }
+
+      const gateway = {
+        invoke: async () => ({ items: [] }),
+        stream: async () => (async function* () {})(),
+        wireStream: { open: async () => (async function* () {})() },
+        dispatchRpc: async () => ({ ok: true, value: {} }),
+      }
+
+      const relayHandler = createRelayHandler({
+        secret: SECRET,
+        store,
+        gateway,
+        serverInfo: {
+          serverId: loadServerId(home),
+          serverName: () => name,
+          dshVersion: '0.0.0-peer-e2e',
+          fingerprints: () => ({}),
+          plugins: () => {
+            const consent = effectivePeerConsent()
+            const table = {}
+            for (const decl of registry.list()) {
+              table[decl.plugin] = {
+                version: decl.version,
+                digest: decl.digest,
+                serverScopeConsent: consent[decl.plugin] === true,
+              }
+            }
+            return table
+          },
+        },
+        pluginBridge: {
+          registry,
+          getConsent: effectivePeerConsent,
+          loopback,
+          adapters,
+        },
+      })
+
+      const relayPool = createRelayPool({ stateFile, skipPersistedServers: true, computeOwnFingerprints: () => ({}) })
+      const { compareBridges } = require('../lib/plugin-bridge.js')
+      const intercept = installPluginRouteIntercept({
+        webServer,
+        registry,
+        adapters,
+        loopbackSecret,
+        getRelayForServer: (sid) => relayPool.getByServerId(sid)?.client,
+        getStatusForServer: (sid) => {
+          const entry = relayPool.getByServerId(sid)
+          return entry ? compareBridges(registry.list(), entry.client.handshakeInfo?.plugins, entry.client.state === 'online') : []
+        },
+        // 故意让服务端自己的浏览器正停在另一个虚拟会话上，验证回环请求不会触发本机拦截串扰
+        getCurrentSession: () => 'zr~deadbeef~other-remote',
+      })
+
+      const engine = createPeerEngine({
+        stateFile,
+        identity,
+        relayPool,
+        relayHandler: () => relayHandler,
+        relaySecret: () => SECRET,
+        serverName: () => name,
+        udpSocket: punchSocket,
+        udpProbe: null,
+        punch: { punchWindowMs: 400, punchIntervalMs: 100, punchRounds: 4, reprobeIntervalMs: 60_000 },
+      })
+
+      return {
+        name,
+        identity,
+        port,
+        relayPool,
+        engine,
+        stop: () => {
+          intercept.uninstall()
+          engine.stop()
+          relayPool.stop()
+          try { punchSocket.close() } catch { /* ignore */ }
+        },
+      }
+    }
+
+    const A = await makeBridgedPeer('PeerA', ['s-a1'])
+    const B = await makeBridgedPeer('PeerB', ['s-b1'])
+    nodes.push(A, B)
+
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitPeerOnline(A, B.identity.nodeId)
+    await waitPeerOnline(B, A.identity.nodeId)
+
+    // 从 A 请求远程会话 zr~<nodeB>~s-b1 的文件树：默认同意放行 → 200 OK
+    const treeRes = await fetch(`http://127.0.0.1:${A.port}/sidebar/api/fs.tree`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: toVirtual(B.identity.nodeId, 's-b1'), path: '.' }),
+    })
+    assert.equal(treeRes.status, 200, 'dsh-better-sidebar fs.tree must answer 200 instead of 503 on peer session')
+    const treeBody = await treeRes.json()
+    assert.equal(treeBody.servedBy, 'PeerB')
+    assert.equal(treeBody.sessionId, 's-b1', 'virtual sessionId rewritten to real id on PeerB')
+
+    // 当 PeerB 显式关闭 dsh-better-sidebar 同意开关时 → 503 consent-off
+    serverExplicitConsent = { 'dsh-better-sidebar': false }
+    await A.relayPool.getByServerId(B.identity.nodeId).client.connect()
+    const deniedRes = await fetch(`http://127.0.0.1:${A.port}/sidebar/api/fs.tree`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: toVirtual(B.identity.nodeId, 's-b1'), path: '.' }),
+    })
+    assert.equal(deniedRes.status, 503)
+  } finally {
+    for (const node of nodes) node.stop()
+    await Promise.all(servers.map((s) => new Promise((r) => s.close(r))))
     await gw.close()
   }
 })

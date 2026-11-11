@@ -79,6 +79,7 @@
  *   generation (client face: pumpEvents aborts on answer failures).
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { RelayError, defaultClock } from './relay-client.js'
 import type { RelayClient, RelayClock, RelayState } from './relay-client.js'
 import type { RelayPool } from './relay-pool.js'
@@ -964,10 +965,84 @@ function collectVirtuals(fields: readonly SessionField[] | undefined, args: unkn
  * Only slots actually holding virtual ids are touched; every collected
  * virtual has already been verified to belong to one server.
  */
+const interceptBypass = new AsyncLocalStorage<boolean>()
+
+/**
+ * Execute `fn` while bypassing {@link installIntercept} on this process's
+ * `typertGateway` so server-side handlers (`relayHandler`, `admin-routes`) in
+ * dual-role `peer` mode read/mutate ONLY local sessions and never re-enter
+ * outbound merged streams (anti-daisy-chaining + stream-storm prevention).
+ */
+export function runWithoutIntercept<T>(fn: () => T): T {
+  return interceptBypass.run(true, fn)
+}
+
+function wrapLocalOnlyAsyncIterable<T>(iterable: AsyncIterable<T>): AsyncIterable<T> {
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<T> {
+      const iterator = runWithoutIntercept(() => iterable[Symbol.asyncIterator]())
+      return {
+        next: (...args) => runWithoutIntercept(() => iterator.next(...args)),
+        ...(typeof iterator.return === 'function'
+          ? { return: (value?: unknown) => runWithoutIntercept(() => iterator.return!(value)) }
+          : {}),
+        ...(typeof iterator.throw === 'function'
+          ? { throw: (e?: unknown) => runWithoutIntercept(() => iterator.throw!(e)) }
+          : {}),
+      }
+    },
+  }
+}
+
+function wrapMaybePromisedIterable(result: unknown): unknown {
+  if (result !== null && typeof result === 'object' && typeof (result as PromiseLike<unknown>).then === 'function') {
+    return (result as Promise<unknown>).then((resolved) =>
+      isAsyncIterable(resolved) ? wrapLocalOnlyAsyncIterable(resolved) : resolved,
+    )
+  }
+  return isAsyncIterable(result) ? wrapLocalOnlyAsyncIterable(result) : result
+}
+
+/**
+ * Build a local-only view over `typertGateway` whose `invoke`, `stream`,
+ * `wireStream.open` and `dispatchEventResult` bypass {@link installIntercept}.
+ */
+export function createLocalOnlyGateway<G extends object>(gateway: G): G {
+  const cachedWireStream = (() => {
+    const ws = (gateway as { wireStream?: unknown }).wireStream
+    if (ws === null || typeof ws !== 'object') return undefined
+    return new Proxy(ws as object, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver)
+        if (prop === 'open' && typeof value === 'function') {
+          return (...args: unknown[]) => wrapMaybePromisedIterable(runWithoutIntercept(() => Reflect.apply(value, target, args)))
+        }
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  })()
+
+  return new Proxy(gateway, {
+    get(target, prop, receiver) {
+      if (prop === 'wireStream' && cachedWireStream !== undefined) return cachedWireStream
+      const value = Reflect.get(target, prop, receiver)
+      if ((prop === 'invoke' || prop === 'dispatchRpc' || prop === 'dispatchEventResult') && typeof value === 'function') {
+        return (...args: unknown[]) => runWithoutIntercept(() => Reflect.apply(value, target, args))
+      }
+      if ((prop === 'stream' || prop === 'openWireStream') && typeof value === 'function') {
+        return (...args: unknown[]) => wrapMaybePromisedIterable(runWithoutIntercept(() => Reflect.apply(value, target, args)))
+      }
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+}
+
 function restoreRegisteredFields(fields: readonly SessionField[], args: unknown): void {
   forEachRegisteredSlot(fields, args, (container, key) => {
     const parts = fromVirtual(container[key])
-    if (parts !== undefined) container[key] = parts.id
+    if (parts !== undefined) {
+      container[key] = key === 'workspaceId' ? parts.id.replace(/^#\d+~/, '') : parts.id
+    }
   })
 }
 
@@ -2650,6 +2725,7 @@ interface MergedGlobalStreamMultiDeps {
   /** Subscribe to the wiring's pool-event broadcasts (handle.notePoolEvent).
    * Every broadcast re-scans the slot set. */
   watchPool(fn: () => void): () => void
+  workspaceEpochs?: Map<string, number>
   lang?: InterceptLang | (() => InterceptLang) | undefined
 }
 
@@ -2798,7 +2874,11 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
     if (!isWorkspace) return
     const merger = slot.merger as WorkspaceMerger
     const gone = merger.onRemoteGone()
-    pushOut(gone.filter((frame) => isPlainObject(frame) && frame.type === 'remove'))
+    const removes = gone.filter((frame) => isPlainObject(frame) && frame.type === 'remove')
+    if (removes.length > 0 && deps.workspaceEpochs !== undefined) {
+      deps.workspaceEpochs.set(serverId, (deps.workspaceEpochs.get(serverId) ?? 0) + 1)
+    }
+    pushOut(removes)
     pushCanonicalTrio()
   }
   const applySlotAnnotation = (slot: PoolGlobalSlot, next: MergerAnnotation): void => {
@@ -2906,6 +2986,7 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
         ? createWorkspaceMerger({
             serverId,
             serverName: entry.displayName,
+            workspaceEpoch: deps.workspaceEpochs?.get(serverId) ?? 0,
             onDiagnostic,
             now: clock.now,
             lang: deps.lang,
@@ -3678,6 +3759,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // every live merged stream (plus the pool-mode catalog watcher below)
   // re-scans on the broadcast.
   const poolListeners = new Set<() => void>()
+  const workspaceEpochs = new Map<string, number>()
   const watchPool = (fn: () => void): (() => void) => {
     poolListeners.add(fn)
     return () => {
@@ -4771,7 +4853,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // An uninstalled wrap is INERT, not absent: another plugin may have
     // wrapped over us and kept a reference to this very function, so it must
     // degrade to a plain passthrough instead of forwarding anything.
-    if (!installed) {
+    if (!installed || interceptBypass.getStore() === true) {
       return (chainTarget.dispatchRpc as (...callArgs: unknown[]) => unknown).call(raw, endpoint, payload, signal, peer)
     }
     counters.dispatchRpc += 1
@@ -4824,7 +4906,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // (undefined on older hosts and on the 5-argument wireStream.open path).
     uplinkWindow?: unknown,
   ): unknown {
-    if (!installed) {
+    if (!installed || interceptBypass.getStore() === true) {
       return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
         raw,
         endpoint,
@@ -4920,6 +5002,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
               summarySync,
               createSessionInventorySlot,
               watchPool,
+              workspaceEpochs,
               lang: options.lang,
             })
           }

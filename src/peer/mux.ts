@@ -177,6 +177,8 @@ export class PeerMux {
   private readonly options: PeerMuxOptions
   private readonly clock: MuxClock
   private readonly sessions = new Map<string, MuxSession>()
+  /** 对端会话拆建后延续单调递增的 streamId，避免落入对端未过期的 deadStreams 窗口。 */
+  private readonly nextStreamIds = new Map<string, number>()
   private closed = false
 
   constructor(options: PeerMuxOptions) {
@@ -214,8 +216,8 @@ export class PeerMux {
       punchSender: null,
       streams: new Map(),
       deadStreams: new Set(),
-      // 奇偶发起权：nodeId 字典序较小一方用奇数流 id，较大一方用偶数。
-      nextStreamId: id < this.options.identity.nodeId ? 1 : 2,
+      // 奇偶发起权：nodeId 字典序较小一方用奇数流 id，较大一方用偶数；若同进程内曾拆掉过会话则接着涨。
+      nextStreamId: this.nextStreamIds.get(id) ?? (id < this.options.identity.nodeId ? 1 : 2),
       helloTimer: null,
       helloTries: 0,
       closed: false,
@@ -223,10 +225,17 @@ export class PeerMux {
     this.sessions.set(id, session)
   }
 
+  /** 更新已建会话记录的对端设备名（入站虚拟请求 x-zen-remote-device-name 跟随最新名称）。 */
+  setPeerName(nodeId: string, peerName: string): void {
+    const session = this.sessions.get(nodeId.toLowerCase())
+    if (session && peerName.trim() !== '') session.peerName = peerName.trim()
+  }
+
   /** 拆掉一个对端的会话（peer-left / mismatch / 本机禁用）：流中止、表清理。 */
   dropSession(nodeId: string): void {
     const session = this.sessions.get(nodeId.toLowerCase())
     if (!session) return
+    this.nextStreamIds.set(session.nodeId, session.nextStreamId)
     this.clearHelloTimer(session)
     session.closed = true
     session.arq.closeAll()

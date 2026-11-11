@@ -63,10 +63,14 @@ export declare class PeerMux {
     private readonly options;
     private readonly clock;
     private readonly sessions;
+    /** 对端会话拆建后延续单调递增的 streamId，避免落入对端未过期的 deadStreams 窗口。 */
+    private readonly nextStreamIds;
     private closed;
     constructor(options: PeerMuxOptions);
     /** 为一个已通过 TOFU 的对端建立（或复用）mux 会话。 */
     ensureSession(nodeId: string, peerPublicKeyHex: string, peerName: string): void;
+    /** 更新已建会话记录的对端设备名（入站虚拟请求 x-zen-remote-device-name 跟随最新名称）。 */
+    setPeerName(nodeId: string, peerName: string): void;
     /** 拆掉一个对端的会话（peer-left / mismatch / 本机禁用）：流中止、表清理。 */
     dropSession(nodeId: string): void;
     hasSession(nodeId: string): boolean;

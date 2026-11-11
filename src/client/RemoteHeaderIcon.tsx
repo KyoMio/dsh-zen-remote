@@ -32,6 +32,7 @@ import { IconGlobeOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { describeShare, shareFailText, subscribeIfNotPhoneShell } from '../client-data/shares.ts'
 import type { SharesStore } from '../client-data/shares.ts'
+import { isVirtual } from '../virtual-id.ts'
 import { isDesktopShell } from './compat/desktop.ts'
 import { NS } from './locales.ts'
 
@@ -61,17 +62,19 @@ function usePhoneShell(): boolean {
 
 export function RemoteHeaderIcon({ sessionId, shares, useSessions, t }: RemoteHeaderIconProps) {
   const phoneShell = usePhoneShell()
+  const virtual = isVirtual(sessionId)
   const snap = useSyncExternalStore(
     useCallback(
-      (onStoreChange: () => void) => subscribeIfNotPhoneShell(shares, phoneShell, onStoreChange),
-      [shares, phoneShell],
+      (onStoreChange: () => void) => subscribeIfNotPhoneShell(shares, phoneShell || virtual, onStoreChange),
+      [shares, phoneShell, virtual],
     ),
     () => shares.getSnapshot(),
   )
   const row = useSessions((sessions) => sessions.byId[sessionId])
   // Hooks stay above the gate: both subscriptions exist on every render
-  // path, the button only on a host with a ready table.
-  if (!snap.ready || snap.role !== 'host' || row?.origin === 'subagent') return null
+  // path, the button only on a host with a ready table (never on a virtual
+  // zr~ remote session, which renders RemoteStatusIcon instead).
+  if (virtual || !snap.ready || snap.role !== 'host' || row?.origin === 'subagent') return null
   const entry = snap.entries.find((candidate) => candidate.sessionId === sessionId)
   const description = describeShare(entry, Date.now(), t)
   const toggle = (): void => {

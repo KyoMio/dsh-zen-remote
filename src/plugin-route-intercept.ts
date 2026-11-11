@@ -64,7 +64,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { BridgeLocator, BridgeRegistry, BridgeStatus, NormalizedBridgeRoute } from './plugin-bridge.js'
 import { routeDeniesRemoteOf, routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeRewriteFieldsOf, routeRewritesIdsOf, routeUpgradesOf } from './plugin-bridge.js'
 import { PassThrough, Readable, Transform, Duplex } from 'node:stream'
-import { createHash } from 'node:crypto'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import type { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
@@ -398,6 +398,11 @@ export interface InstallPluginRouteInterceptOptions {
    * workspace/follow. At most once per answer, deduped, only when there is
    * something to report; a throwing callback never fails the answer. */
   onMintedVirtualIds?: (virtualIds: readonly string[]) => void
+  /** Per-apply in-memory loopback marker: when `servesRole` and `connectsRole`
+   * share one `webServer` (peer mode), a request arriving from this process's
+   * own `pluginLoopback` / `pluginTunnel` carries this secret and passes
+   * straight through to the local plugin handler (header stripped). */
+  loopbackSecret?: string
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
 }
@@ -552,6 +557,20 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   }
   const target = webServer as { match: (this: unknown, pathname: string) => unknown }
   const savedMatch = target.match
+  const loopbackSecretBytes = typeof options.loopbackSecret === 'string' && options.loopbackSecret !== ''
+    ? Buffer.from(options.loopbackSecret, 'utf8')
+    : undefined
+  const isLoopbackBypass = (req: IncomingMessage): boolean => {
+    if (loopbackSecretBytes === undefined) return false
+    const raw = req.headers['x-zen-remote-loopback']
+    const candidate = Array.isArray(raw) ? raw[0] : raw
+    if (typeof candidate !== 'string' || candidate === '') return false
+    const candidateBytes = Buffer.from(candidate, 'utf8')
+    if (candidateBytes.length !== loopbackSecretBytes.length) return false
+    if (!timingSafeEqual(candidateBytes, loopbackSecretBytes)) return false
+    delete req.headers['x-zen-remote-loopback']
+    return true
+  }
 
   let installed = true
   let forwarded = 0
@@ -660,7 +679,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       }
       // Chained-over: inert passthrough, exactly the posture of the other
       // intercepts.
-      if (!installed) {
+      if (!installed || isLoopbackBypass(req)) {
         await passthrough()
         return
       }
@@ -1254,7 +1273,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       }
       // Chained-over: inert passthrough, exactly the posture of the other
       // intercepts.
-      if (!installed) {
+      if (!installed || isLoopbackBypass(req)) {
         await passthrough()
         return
       }
@@ -2090,6 +2109,13 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       // The host never awaits an upgrade handler — the async body runs on
       // its own and every failure path owns the socket's teardown.
       void (async () => {
+        if (!installed || isLoopbackBypass(req)) {
+          if (typeof originalHandler === 'function') originalHandler(req, socket, head)
+          else {
+            try { socket.destroy() } catch { /* Already gone. */ }
+          }
+          return
+        }
         log?.('upgrade entered for %s', declared.path)
         // PB-26b: a json-body upgrade's ids ride the POST-HANDSHAKE frames —
         // there is no session query parameter for the byte-tunnel half below

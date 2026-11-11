@@ -304,6 +304,18 @@ await test('derivePeerOverviewSummary: counts, the cap\'s red device light and t
   assert.equal(blocked.mismatchCount, 1)
   assert.equal(blocked.devicesLight, 'fail')
   assert.equal(blocked.connectionLight, 'fail')
+  // includeSelf: when authorized in a network alone, 网内设备 counts this machine (1 / 8), while connectionLight stays amber (no peer links yet).
+  const soloJoined = derivePeerOverviewSummary([], 8, { includeSelf: true })
+  assert.equal(soloJoined.totalCount, 1)
+  assert.equal(soloJoined.devicesLight, 'pass')
+  assert.equal(soloJoined.connectionLight, 'pending')
+  assert.equal(soloJoined.limitReached, false)
+  // includeSelf at cap (3 peers + self = 4 / 4): limitReached trips.
+  const fullWithSelf = derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('lan', { nodeId: 'b' }), row('lan', { nodeId: 'c' })], 4, { includeSelf: true })
+  assert.equal(fullWithSelf.totalCount, 4)
+  assert.equal(fullWithSelf.limitReached, true)
+  assert.equal(fullWithSelf.devicesLight, 'fail')
+  assert.equal(fullWithSelf.connectionLight, 'pass')
 })
 
 await test('deriveClientServerLights: one paired server row drives the wizard step-3 lights (MS-8)', () => {

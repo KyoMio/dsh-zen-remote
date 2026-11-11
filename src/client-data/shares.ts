@@ -27,6 +27,7 @@
  *   read, so exactly one poll loop exists no matter how many parts mount.
  */
 
+import { isVirtual } from '../virtual-id.ts'
 import { createLatestGate } from './settings-form.ts'
 import { zh } from '../client/locales.ts'
 
@@ -212,6 +213,7 @@ export interface ShareCardRemoteView {
  * ever colored that state, it never had copy for it).
  */
 export function shareCardRemoteView(args: {
+  sessionId?: string | undefined
   ready: boolean
   role: SharesSnapshot['role']
   subagent: boolean
@@ -219,7 +221,7 @@ export function shareCardRemoteView(args: {
   now: number
   t: ShareCardFormatter
 }): ShareCardRemoteView {
-  if (!args.ready || args.role !== 'host' || args.subagent) {
+  if (!args.ready || args.role !== 'host' || args.subagent || (args.sessionId !== undefined && isVirtual(args.sessionId))) {
     return { visible: false, shared: false, line: '' }
   }
   const entry = args.entry

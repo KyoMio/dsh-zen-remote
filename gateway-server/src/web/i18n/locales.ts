@@ -79,6 +79,7 @@ export const ZH = {
   // ---- PG-6b：通用按钮 ----
   'common.cancel': '取消',
   'common.done': '完成',
+  'common.save': '保存',
   'common.create': '创建',
   'common.copy': '复制',
   'common.remove': '移除',
@@ -140,6 +141,7 @@ export const ZH = {
   'devices.connections': '连接',
   'devices.pause': '暂停',
   'devices.resume': '恢复',
+  'devices.rename': '重命名',
   'devices.deviceId': '设备 ID',
   'devices.publicAddr': '公网地址',
   'devices.networkType': '网络类型',
@@ -260,6 +262,7 @@ export const EN: Record<LocaleKey, string> = {
 
   'common.cancel': 'Cancel',
   'common.done': 'Done',
+  'common.save': 'Save',
   'common.create': 'Create',
   'common.copy': 'Copy',
   'common.remove': 'Remove',
@@ -317,6 +320,7 @@ export const EN: Record<LocaleKey, string> = {
   'devices.connections': 'Connections',
   'devices.pause': 'Pause',
   'devices.resume': 'Resume',
+  'devices.rename': 'Rename',
   'devices.deviceId': 'Device ID',
   'devices.publicAddr': 'Public address',
   'devices.networkType': 'Network type',

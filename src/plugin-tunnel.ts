@@ -352,6 +352,9 @@ export interface CreatePluginTunnelOptions {
   isAccessible: (sessionId: string) => boolean
   /** Heartbeat interval for the open stream (the ping lines). */
   heartbeatMs: number
+  /** Per-apply in-memory loopback marker bypassing `installPluginRouteIntercept`
+   * when both halves run on the same `webServer` (peer mode). */
+  loopbackSecret?: string
 }
 
 export interface PluginTunnelRoutes {
@@ -590,6 +593,9 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
         ...(rawHeaders?.['sec-websocket-protocol'] !== undefined ? [`Sec-WebSocket-Protocol: ${cleanHeaderValue(rawHeaders['sec-websocket-protocol'])}`] : []),
         ...(rawHeaders?.['sec-websocket-extensions'] !== undefined ? [`Sec-WebSocket-Extensions: ${cleanHeaderValue(rawHeaders['sec-websocket-extensions'])}`] : []),
         ...(cookie !== '' ? [`Cookie: ${cookie}`] : []),
+        ...(options.loopbackSecret !== undefined && options.loopbackSecret !== ''
+          ? [`X-Zen-Remote-Loopback: ${options.loopbackSecret}`]
+          : []),
         '\r\n',
       ]
       upstream.write(requestLines.join('\r\n'))

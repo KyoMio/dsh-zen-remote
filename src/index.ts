@@ -59,7 +59,7 @@ import type { PeerEngine } from './peer/engine.js'
 import { volatileUpdateTouchesServerName } from './relay-client.js'
 import type { RelayClient } from './relay-client.js'
 import { computeFingerprints } from './fingerprint.js'
-import { runSelfCheck, installIntercept } from './intercept.js'
+import { createLocalOnlyGateway, runSelfCheck, installIntercept } from './intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics, InterceptHandle, SessionInventorySlot } from './intercept.js'
 import { checkGatewayShape } from './intercept-shape.js'
 import type { GatewayShapeCheck } from './intercept-shape.js'
@@ -814,6 +814,17 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   let servingRelaySecret: string | undefined
   let servingRelayHandler: RelayHandler | undefined
   let servingGatewaySummary: (() => Promise<Record<string, unknown>>) | undefined
+  const pluginLoopbackSecret = randomBytes(32).toString('hex')
+  const effectivePluginConsent = (): Record<string, boolean> => {
+    const resolved = resolveConfig(config, readFileConfig(), process.env)
+    const rawConsent = resolved.values.pluginBridgeConsent
+    if (resolved.values.role !== 'peer') return rawConsent
+    const merged: Record<string, boolean> = { ...rawConsent }
+    for (const declaration of registry.list()) {
+      if (!(declaration.plugin in merged)) merged[declaration.plugin] = true
+    }
+    return merged
+  }
   if (servesRole(effective.values.role)) {
     // A row that switched from client to host must not leave a stale relay
     // client where getRelayClient() can find it (T23a-fix) — and no stale
@@ -1211,7 +1222,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // (`cannot get property … without inject`), which would turn every
       // shares request into a 500.
       store,
-      typert: () => reflectNow()?.get('typertGateway') as RelayGateway | undefined,
+      typert: () => {
+        const g = reflectNow()?.get('typertGateway') as RelayGateway | undefined
+        return g !== undefined ? createLocalOnlyGateway(g) : undefined
+      },
       getPeer: createOwnerPeerSource(() => reflectNow()?.get('connection')),
       listAgents: () => (reflectNow()?.get('agents') as { list(): readonly AgentStatusLike[] } | undefined)?.list() ?? [],
       // The "who is looking" badge (T33a2): read through whichever relay
@@ -1228,7 +1242,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // that registered its own declaration stops being marked).
       pluginBridge: {
         registry,
-        getConsent: () => getConfig().values.pluginBridgeConsent,
+        getConsent: effectivePluginConsent,
         adaptedPlugins: () => new Set(adapters.filter((adapter) => adapterOwnsRegistryEntry(adapter, registry.get(adapter.plugin))).map((adapter) => adapter.plugin)),
       },
     })
@@ -1352,12 +1366,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         }
         // One loopback executor for BOTH plugin halves (the HTTP forward and
         // the PB-10 tunnel): a single cookie cache behind two consumers.
-        const pluginLoopback = createPluginLoopback({ getTarget: getLoopbackTarget, getTokenUrl })
-        const pluginConsent = () => resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent
+        const pluginLoopback = createPluginLoopback({ getTarget: getLoopbackTarget, getTokenUrl, loopbackSecret: pluginLoopbackSecret })
+        const pluginConsent = effectivePluginConsent
         const handler = createRelayHandler({
           secret: relaySecret,
           store,
-          gateway: gatewayService,
+          gateway: createLocalOnlyGateway(gatewayService),
           getApiFetch,
           // DSH 0.2.1-alpha.3: one cached owner/answer Peer for every relay
           // gateway call — `$events/result` must come from the Peer that
@@ -1389,7 +1403,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             // through resolveConfig on the SAME row object (a volatile field,
             // read at use time per the hard constraint, never snapshotted).
             plugins: () => {
-              const consent = resolveConfig(config, readFileConfig(), process.env).values.pluginBridgeConsent
+              const consent = pluginConsent()
               const table: Record<string, ServerPluginEntry> = {}
               for (const declaration of registry.list()) {
                 table[declaration.plugin] = {
@@ -1419,6 +1433,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
               getTarget: getLoopbackTarget,
               isAccessible: (sessionId) => store.isAccessible(sessionId, parentIndex.parentOf),
               heartbeatMs: 15_000,
+              loopbackSecret: pluginLoopbackSecret,
             }),
           },
         })
@@ -1571,6 +1586,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     const relayPool = createRelayPool({
       stateFile: clientStateFile,
       legacySource: legacyCredentials,
+      skipPersistedServers: effective.values.role === 'peer',
       // PG-2: pair() and maxServers() read the live cap per call.
       getMaxServers: maxServersCap,
       getMaxServersSource: maxServersSource,
@@ -1669,7 +1685,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         const off = ctx.on('loader/volatile-update', (paths) => {
           if (!volatileUpdateTouchesServerName(paths)) return
           const name = unwrapVolatile(row.serverName)
-          if (typeof name === 'string' && name.trim() !== '') relayPool.queueDeviceNameAll(name)
+          if (typeof name === 'string' && name.trim() !== '') {
+            relayPool.queueDeviceNameAll(name)
+            peerEngine?.announceSelfName(name)
+          }
         })
         return () => {
           off()
@@ -2055,6 +2074,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       const handle = installPluginRouteIntercept({
         webServer: raw,
         registry,
+        loopbackSecret: pluginLoopbackSecret,
         // MS-5 pool mode: validation, forwarding and response rewriting are
         // judged against the located id's OWN server — its relay client, its
         // bridge verdicts (its handshake's plugin table against the local

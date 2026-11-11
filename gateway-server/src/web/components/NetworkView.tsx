@@ -43,6 +43,7 @@ export interface NetworkViewProps {
   onDeleteNetwork: () => void;
   onRotateInviteKey: () => void;
   onMemberAction: (nodeId: string, action: MemberAction) => void;
+  onRenameMember?: (nodeId: string, name: string) => void;
   onRemoveMember: (nodeId: string) => void;
 }
 
@@ -280,6 +281,7 @@ export function NetworkView(props: NetworkViewProps) {
     onDeleteNetwork,
     onRotateInviteKey,
     onMemberAction,
+    onRenameMember,
     onRemoveMember,
   } = props;
   const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
@@ -326,6 +328,7 @@ export function NetworkView(props: NetworkViewProps) {
         onBack={() => setDetailNodeId(null)}
         onSelectDevice={setDetailNodeId}
         onMemberAction={onMemberAction}
+        onRenameMember={onRenameMember}
         onRemoveMember={onRemoveMember}
       />
     );

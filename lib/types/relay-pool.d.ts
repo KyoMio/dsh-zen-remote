@@ -108,6 +108,11 @@ export interface RelayPoolOptions {
      * `peerNetwork.maxPeersFromGateway`), live. Missing/undefined means "no
      * network cap known" and the local configuration answers alone. */
     getPeerNetworkCap?: () => number | undefined;
+    /** Peer mode: do not load or migrate persisted `client`-mode paired servers
+     * from `zen-remote-state.json` — only virtual network mounts belong in the
+     * pool while running as `peer`, so old non-network records never occupy
+     * display names (`-1`/`-2`) or leave stale sidebar workspaces. */
+    skipPersistedServers?: boolean;
 }
 export interface RelayPool {
     /** Every entry in pairing order, with fresh display names. */
@@ -154,8 +159,12 @@ export interface RelayPool {
     }): RelayPoolEntryView;
     /** Unmount one virtual entry (peer left / mismatch / disabled). */
     unmountVirtual(entryId: string): boolean;
+    /** Update one mounted virtual entry's serverName (peer rename) and notify
+     * pool listeners so merged workspace titles refresh immediately. */
+    updateVirtualName(entryId: string, serverName: string): boolean;
     /** Whether an entry id is currently a mounted virtual entry. */
-    isVirtual(entryId: string): boolean; /** One entry's immediate reconnect, or every `offline` client's. Answers
+    isVirtual(entryId: string): boolean;
+    /** One entry's immediate reconnect, or every `offline` client's. Answers
      * whether any attempt was started. */
     reconnect(entryId?: string): Promise<boolean>;
     /** One authenticated ping per `offline` client; the reachable ones get
