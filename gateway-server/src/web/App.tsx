@@ -87,6 +87,28 @@ export function App() {
     }
   }, [theme]);
 
+  // 语言落到 <html lang>（屏幕阅读器发音）与标签页标题
+  useEffect(() => {
+    document.documentElement.lang = locale === 'zh' ? 'zh-CN' : 'en';
+    document.title = t('app.title');
+  }, [locale, t]);
+
+  // 行内二次确认的「点任意别处即取消」：确认态存在时，凡点击不在带
+  // data-confirm-trigger 的按钮上（含确认按钮自己），一律取消确认态。
+  // 点击确认按钮本身时 React 的 onClick 先于这里的 document 级监听执行。
+  const confirmTarget = state.ui.confirmTarget;
+  useEffect(() => {
+    if (confirmTarget === null) return;
+    const onClick = (event: MouseEvent): void => {
+      if (event.target instanceof Element && event.target.closest('[data-confirm-trigger]')) return;
+      store.patchUi({ confirmTarget: null });
+    };
+    document.addEventListener('click', onClick);
+    return () => {
+      document.removeEventListener('click', onClick);
+    };
+  }, [confirmTarget]);
+
   useEffect(() => {
     if (toast === null) return;
     const timer = setTimeout(() => {

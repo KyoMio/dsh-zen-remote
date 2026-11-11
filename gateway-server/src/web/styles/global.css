@@ -170,11 +170,9 @@ button {
   place-items: center;
   width: 24px;
   height: 24px;
-  border-radius: 6px;
-  background: var(--accent-solid);
-  color: #fff;
-  font-size: 13px;
-  font-weight: 700;
+  border-radius: 4px;
+  background: var(--ink);
+  color: var(--surface);
   flex: none;
 }
 
@@ -436,7 +434,7 @@ button {
 
 .input {
   width: 100%;
-  height: 36px;
+  height: 34px;
   padding: 0 10px;
   border: 1px solid var(--line-strong);
   border-radius: 4px;
@@ -619,7 +617,7 @@ button {
 
 .overview-cell {
   background: var(--surface);
-  padding: 16px;
+  padding: 22px 24px;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -669,8 +667,7 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
-  color: var(--ink-3);
-  letter-spacing: 2px;
+  color: var(--ink-2);
 }
 
 .invite-hint {
@@ -749,17 +746,81 @@ button {
   color: var(--ink-3);
 }
 
-/* ---------- 设备列表 / 连接表（扁平表格，≤767px 变两列卡片） ---------- */
+/* ---------- 设备列表 / 连接表（扁平表格，≤767px 变全宽单列卡片） ---------- */
+
+/* 工作台模块化：设备区、设备详情、管理页都是白底工作面 + 1px 细线，不把表格裸露在灰画布上 */
+.device-section,
+.device-detail,
+.admin-view {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  padding: 20px 24px;
+}
 
 .device-section {
   margin-top: 20px;
 }
 
+.devices-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .section-title {
-  margin: 0 0 8px;
+  margin: 0;
   font-size: 13px;
   font-weight: 600;
   color: var(--ink-2);
+}
+
+.muted-count {
+  color: var(--ink-3);
+  font-weight: 400;
+}
+
+.section-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.empty-devices {
+  margin-top: 12px;
+  padding: 28px 20px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 4px;
+  text-align: center;
+}
+
+.empty-devices h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.empty-devices p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-3);
+}
+
+.empty-line {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.muted {
+  color: var(--ink-3);
+}
+
+tr.device-row.is-paused .device-name,
+tr.device-row.is-paused .device-note {
+  color: var(--ink-3);
 }
 
 .device-table {
@@ -859,10 +920,14 @@ tr.device-row:hover {
   flex-wrap: wrap;
 }
 
-.detail-name {
+.detail-title {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.detail-name {
   margin: 0;
   font-size: 18px;
   font-weight: 600;
@@ -874,13 +939,24 @@ tr.device-row:hover {
   gap: 8px;
 }
 
+/* 身份异常提示条：浅红底 + 1px 边框，左说明右主按钮（本区域唯一的蓝色主按钮） */
 .detail-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
   margin: 12px 0 0;
   padding: 10px 12px;
+  border: 1px solid var(--danger);
   border-radius: 4px;
   background: var(--danger-tint);
-  color: var(--danger);
   font-size: 13px;
+}
+
+.detail-alert .alert-text {
+  margin: 0;
+  color: var(--ink-2);
 }
 
 .meta-grid {
@@ -1027,6 +1103,10 @@ tr.device-row:hover {
   background: rgba(15, 20, 30, 0.45);
 }
 
+html[data-theme='dark'] .modal-overlay {
+  background: rgba(0, 0, 0, 0.6);
+}
+
 .modal {
   width: min(420px, 100%);
   max-height: calc(100vh - 48px);
@@ -1085,6 +1165,12 @@ tr.device-row:hover {
   color: var(--ink-2);
 }
 
+.danger-hint {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
 /* ---------- 底部提示条（扁平：无投影，细边框） ---------- */
 
 .toast {
@@ -1134,6 +1220,18 @@ tr.device-row:hover {
 }
 
 @media (max-width: 767px) {
+  /* 窄屏顶栏只留品牌标识、网络切换器与头像 */
+  .topbar {
+    padding: 0 12px;
+    gap: 8px;
+  }
+
+  .brand-title,
+  .topbar-divider,
+  .account-button .account-email {
+    display: none;
+  }
+
   .overview-grid {
     grid-template-columns: 1fr;
   }
@@ -1142,6 +1240,7 @@ tr.device-row:hover {
     grid-column: auto;
   }
 
+  /* 表格变全宽单列卡片：tbody 落回 block，每条 tr 自己成一张两列网格卡片 */
   .device-table,
   .device-table tbody {
     display: block;
@@ -1151,29 +1250,75 @@ tr.device-row:hover {
     display: none;
   }
 
-  .device-table tbody {
+  .device-table tr.device-row,
+  .admin-table tbody tr {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-  }
-
-  .device-table tr.device-row {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 4px;
-    padding: 10px;
-    border: 1px solid var(--line);
-    border-radius: 4px;
+    grid-template-columns: 1fr auto;
+    gap: 6px 12px;
+    padding: 14px 16px;
     border-bottom: 1px solid var(--line);
   }
 
   .device-table td {
-    padding: 2px 0;
+    padding: 0;
     border-bottom: none;
+  }
+
+  /* 设备表：行 1 设备名 | 状态；行 2 连接汇总跨整行；行 3 延迟跨整行 */
+  .device-table td.device-cell-name {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .device-table td.device-cell-status {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+
+  .device-table td.conn-summary,
+  .device-table td.device-cell-latency {
+    grid-column: 1 / -1;
+  }
+
+  /* 连接表：行 1 设备名 | 延迟；行 2 连接方式跨整行；行 3 原因说明跨整行 */
+  .conn-table td.device-cell-latency {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+
+  .conn-table td.conn-kind-cell,
+  .conn-table td.conn-reason {
+    grid-column: 1 / -1;
+  }
+
+  /* 管理员表：行 1 账号 | 在线；行 2 角色；行 3 网络配额；行 4 当前中转；行 5 操作按钮 */
+  .admin-table td.admin-cell-user {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .admin-table td.admin-cell-online {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+  }
+
+  .admin-table td.admin-cell-role,
+  .admin-table td.admin-cell-networks,
+  .admin-table td.admin-cell-relay,
+  .admin-table td.admin-cell-actions {
+    grid-column: 1 / -1;
   }
 
   .device-table td.row-arrow {
     display: none;
+  }
+
+  .device-section,
+  .device-detail,
+  .admin-view {
+    padding: 14px 12px;
   }
 }

@@ -7,12 +7,10 @@ import { useEffect } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 
 import type { TranslateFn } from '../i18n/locales';
-import { classifyLinkPath, displayName, formatBytes, formatLatencyRange, formatRate, memberStatusView } from '../format';
-import type { LinkKind, StatusDot } from '../format';
+import { derivePeerConnRow, displayName, filterJoinedMembers, formatBytes, memberStatusView } from '../format';
 import type {
   MemberAction,
   NatType,
-  TopologyLink,
   TopologyMemberRow,
   TopologySnapshot,
   UiLocalState,
@@ -32,15 +30,6 @@ export interface DeviceDetailProps {
   onRemoveMember: (nodeId: string) => void;
 }
 
-/** 连接方式行：圆点档位 + 状态词 + 固定平实原因 + 等宽延迟 */
-interface ConnRow {
-  other: TopologyMemberRow;
-  dot: StatusDot;
-  kindWord: string;
-  reason: string;
-  latency: string;
-}
-
 function natWord(natType: NatType, t: TranslateFn): string {
   switch (natType) {
     case 'cone':
@@ -52,51 +41,6 @@ function natWord(natType: NatType, t: TranslateFn): string {
     case 'unknown':
       return t('nat.unknown');
   }
-}
-
-/** 两设备间的路径观测：优先本机自报，缺了看对方上报（路径是双向对称的事实） */
-function findLink(links: readonly TopologyLink[], a: string, b: string): TopologyLink | null {
-  return (
-    links.find((l) => l.srcNodeId === a && l.peerNodeId === b) ??
-    links.find((l) => l.srcNodeId === b && l.peerNodeId === a) ??
-    null
-  );
-}
-
-function deriveConnRow(t: TranslateFn, self: TopologyMemberRow, other: TopologyMemberRow, links: readonly TopologyLink[]): ConnRow {
-  const link = findLink(links, self.nodeId, other.nodeId);
-  const latency = link !== null ? formatLatencyRange([link.rttMs]) : '—';
-  const kindFor = (kind: LinkKind): { dot: StatusDot; kindWord: string; reason: string } => {
-    switch (kind) {
-      case 'lan':
-        return { dot: 'ok', kindWord: t('path.lan'), reason: t('device.reasonLan') };
-      case 'direct':
-        return { dot: 'ok', kindWord: t('path.direct'), reason: t('device.reasonDirect') };
-      case 'relay':
-        return {
-          dot: 'warn',
-          kindWord: t('path.relay'),
-          reason: t('device.reasonRelay', { rate: formatRate(link?.liveRelayKbps ?? 0) }),
-        };
-    }
-  };
-
-  if (other.status === 'paused') {
-    return { other, dot: 'danger', kindWord: t('device.blocked'), reason: t('device.blockedReasonPaused'), latency };
-  }
-  if (other.status === 'revoked') {
-    return { other, dot: 'danger', kindWord: t('device.blocked'), reason: t('device.blockedReasonRevoked'), latency };
-  }
-  if (link !== null) {
-    return { other, latency, ...kindFor(classifyLinkPath(link.path)) };
-  }
-  if (other.status === 'pending') {
-    return { other, dot: 'muted', kindWord: t('device.notConnected'), reason: t('device.notConnectedPending'), latency };
-  }
-  if (!other.online) {
-    return { other, dot: 'muted', kindWord: t('device.notConnected'), reason: t('device.notConnectedOffline'), latency };
-  }
-  return { other, dot: 'muted', kindWord: t('device.notConnected'), reason: t('device.notConnectedIdle'), latency };
 }
 
 export function DeviceDetail(props: DeviceDetailProps) {
@@ -118,7 +62,10 @@ export function DeviceDetail(props: DeviceDetailProps) {
   const status = memberStatusView(member.status, member.online, t);
   const confirmTarget = `remove-member:${member.nodeId}`;
   const confirmingRemove = ui.confirmTarget === confirmTarget;
-  const rows = topology.members.filter((m) => m.nodeId !== member.nodeId).map((other) => deriveConnRow(t, member, other, topology.links));
+  // 连接表只遍历占席位成员（pending 在申请格、revoked 已移除），固定原因文案下沉在 format.ts
+  const rows = filterJoinedMembers(topology.members)
+    .filter((m) => m.nodeId !== member.nodeId)
+    .map((other) => ({ other, ...derivePeerConnRow(t, member, other, topology.links) }));
 
   const toggleConfirmRemove = (): void => {
     if (confirmingRemove) {
@@ -143,16 +90,15 @@ export function DeviceDetail(props: DeviceDetailProps) {
       </button>
 
       <div className="detail-head">
-        <h2 className="detail-name">
-          <span className={`dot ${status.dot}`} aria-hidden="true" />
-          {displayName(member, t)}
-        </h2>
+        {/* Dot Rule：圆点旁必须带状态词 */}
+        <div className="detail-title">
+          <h2 className="detail-name">{displayName(member, t)}</h2>
+          <span className="dot-row">
+            <span className={`dot ${status.dot}`} aria-hidden="true" />
+            {status.word}
+          </span>
+        </div>
         <div className="detail-actions">
-          {member.status === 'mismatch' && (
-            <button type="button" className="btn primary" disabled={busy} onClick={() => onMemberAction(member.nodeId, 'repin')}>
-              {t('requests.trustNewIdentity')}
-            </button>
-          )}
           {(member.status === 'authorized' || member.status === 'paused') && (
             <button
               type="button"
@@ -165,6 +111,7 @@ export function DeviceDetail(props: DeviceDetailProps) {
           )}
           <button
             type="button"
+            data-confirm-trigger
             className={confirmingRemove ? 'btn danger solid' : 'btn danger'}
             disabled={busy}
             onClick={toggleConfirmRemove}
@@ -176,7 +123,10 @@ export function DeviceDetail(props: DeviceDetailProps) {
 
       {member.status === 'mismatch' && (
         <div className="detail-alert" role="alert">
-          {t('requests.identityChangedHint')}
+          <p className="alert-text">{t('requests.identityChangedHint')}</p>
+          <button type="button" className="btn primary" disabled={busy} onClick={() => onMemberAction(member.nodeId, 'repin')}>
+            {t('requests.trustNewIdentity')}
+          </button>
         </div>
       )}
 
@@ -221,23 +171,22 @@ export function DeviceDetail(props: DeviceDetailProps) {
                 key={row.other.nodeId}
                 className="device-row"
                 tabIndex={0}
-                role="button"
                 aria-label={`${displayName(row.other, t)} — ${row.kindWord}`}
                 onClick={() => onSelectDevice(row.other.nodeId)}
                 onKeyDown={(event) => openByKey(event, row.other.nodeId)}
               >
-                <td>
+                <td className="device-cell-name">
                   <div className="device-name">{displayName(row.other, t)}</div>
                   {row.other.note !== null && <div className="device-note">{row.other.note}</div>}
                 </td>
-                <td>
+                <td className="conn-kind-cell">
                   <div className="conn-kind">
                     <span className={`dot ${row.dot}`} aria-hidden="true" />
                     {row.kindWord}
                   </div>
                 </td>
                 <td className="conn-reason">{row.reason}</td>
-                <td className="mono">{row.latency}</td>
+                <td className="device-cell-latency mono">{row.latency}</td>
                 <td className="row-arrow" aria-hidden="true">
                   ›
                 </td>

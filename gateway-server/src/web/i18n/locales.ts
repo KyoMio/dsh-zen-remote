@@ -90,9 +90,11 @@ export const ZH = {
 
   // ---- PG-6b：网络概览与设置 ----
   'network.settings': '设置',
-  'network.deviceCount': '{online} / {total} 台设备',
+  'network.deviceCount': '{count} / {max} 台设备',
   'network.capacityFull': '· 已满',
   'network.inviteHint': '在新设备的 zen-remote 里粘贴这个链接即可加入',
+  'network.rotateHint': '旧链接立即失效，已加入的设备不受影响',
+  'network.deleteHint': '所有设备会立即断开，无法恢复',
   'network.settingsTitle': '网络设置',
   'network.newNetworkTitle': '新建网络',
   'network.namePlaceholder': '例如：家里',
@@ -124,7 +126,9 @@ export const ZH = {
   // ---- PG-6b：设备列表与详情 ----
   'devices.back': '全部设备',
   'devices.unnamed': '未命名设备',
-  'devices.empty': '还没有设备',
+  'devices.clickHint': '点击设备，查看它和其他设备怎么连接',
+  'devices.empty': '还没有设备加入',
+  'devices.emptyBody': '在装了 dsh-zen-remote 的电脑上，把角色设为「节点端」，粘贴上面的邀请链接。',
   'devices.emptyHint': '设备入网后会显示在这里',
   'devices.directCount': '直连 {n}',
   'devices.relayCount': '中转 {n}',
@@ -152,6 +156,10 @@ export const ZH = {
   'device.reasonLan': '在同一个局域网内',
   'device.reasonDirect': '已打通直连，不经过网关',
   'device.reasonRelay': '这台设备/对方网络不支持直连，已自动中转 · {rate}',
+  'device.reasonRelaySelf': '这台设备的网络不支持直连，已自动中转 · {rate}',
+  'device.reasonRelayPeer': '对方网络不支持直连，已自动中转 · {rate}',
+  'device.reasonMismatchBlocked': '身份异常，连接已阻断',
+  'device.reasonPeerPaused': '对方已暂停',
 
   // ---- PG-6b：网络类型（说人话） ----
   'nat.cone': '常规网络',
@@ -182,6 +190,7 @@ export const ZH = {
   'admin.disable': '停用',
   'admin.confirmDisable': '确认停用',
   'admin.enable': '启用',
+  'admin.disabledTag': '已停用',
 
   // ---- PG-6b：底部提示条 ----
   'toast.inviteCopied': '已复制邀请链接',
@@ -260,9 +269,11 @@ export const EN: Record<LocaleKey, string> = {
   'common.confirmDelete': 'Confirm delete',
 
   'network.settings': 'Settings',
-  'network.deviceCount': '{online} / {total} devices',
-  'network.capacityFull': '· full',
+  'network.deviceCount': '{count} / {max} devices',
+  'network.capacityFull': '· Full',
   'network.inviteHint': 'Paste this link into zen-remote on a new device to join',
+  'network.rotateHint': 'The old link stops working immediately; already joined devices are not affected',
+  'network.deleteHint': 'All devices disconnect immediately; this cannot be undone',
   'network.settingsTitle': 'Network settings',
   'network.newNetworkTitle': 'New network',
   'network.namePlaceholder': 'e.g. Home',
@@ -291,7 +302,9 @@ export const EN: Record<LocaleKey, string> = {
 
   'devices.back': 'All devices',
   'devices.unnamed': 'Unnamed device',
-  'devices.empty': 'No devices yet',
+  'devices.clickHint': 'Click a device to see how it connects to others',
+  'devices.empty': 'No devices have joined yet',
+  'devices.emptyBody': 'On a computer with dsh-zen-remote installed, set the role to node and paste the invite link above.',
   'devices.emptyHint': 'Devices will appear here after they join',
   'devices.directCount': 'Direct {n}',
   'devices.relayCount': 'Relayed {n}',
@@ -318,6 +331,10 @@ export const EN: Record<LocaleKey, string> = {
   'device.reasonLan': 'On the same local network',
   'device.reasonDirect': 'Direct connection established; no gateway involved',
   'device.reasonRelay': 'Either side cannot connect directly, so traffic is relayed · {rate}',
+  'device.reasonRelaySelf': "This device's network does not support direct connections, so traffic is relayed · {rate}",
+  'device.reasonRelayPeer': "The other device's network does not support direct connections, so traffic is relayed · {rate}",
+  'device.reasonMismatchBlocked': 'Identity changed, connection blocked',
+  'device.reasonPeerPaused': 'The other device is paused',
 
   'nat.cone': 'Regular network',
   'nat.symmetric': 'Symmetric (no direct path)',
@@ -345,6 +362,7 @@ export const EN: Record<LocaleKey, string> = {
   'admin.disable': 'Disable',
   'admin.confirmDisable': 'Confirm disable',
   'admin.enable': 'Enable',
+  'admin.disabledTag': 'Disabled',
 
   'toast.inviteCopied': 'Invite link copied',
   'toast.inviteReset': 'Invite link has been reset',

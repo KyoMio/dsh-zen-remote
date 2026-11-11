@@ -58,3 +58,61 @@ describe('打包纪律（PG-6b-fix）', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------- UI/UX 静态守卫（PG-6c）
+
+/** 取出 @media <query> 的整个规则体（平衡括号扫描，不靠脆弱的正则截断） */
+function mediaBlock(css, query) {
+  const start = css.indexOf(`@media ${query}`);
+  assert.notEqual(start, -1, `global.css 缺少 @media ${query} 媒体查询`);
+  let depth = 0;
+  let bodyStart = -1;
+  for (let i = start; i < css.length; i++) {
+    const ch = css[i];
+    if (ch === '{') {
+      if (depth === 0) bodyStart = i;
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return css.slice(bodyStart + 1, i);
+    }
+  }
+  assert.fail(`@media ${query} 的规则体没有闭合`);
+}
+
+describe('UI/UX 静态守卫（PG-6c）', () => {
+  test('≤767px：顶栏隐藏品牌标题/分割线/账号邮箱，表格是全宽单列卡片而非 tbody 双列并排', () => {
+    const css = read('src/web/styles/global.css');
+    const narrow = mediaBlock(css, '(max-width: 767px)');
+    assert.match(
+      narrow,
+      /[^{}]*\.brand-title[^{]*\{[^}]*display:\s*none/,
+      '窄屏顶栏只留品牌标识，.brand-title 必须隐藏',
+    );
+    assert.match(narrow, /\.topbar-divider/, '窄屏必须隐藏顶栏分割线');
+    assert.match(
+      narrow,
+      /[^{}]*\.account-button \.account-email[^{]*\{[^}]*display:\s*none/,
+      '窄屏必须隐藏账号按钮里的邮箱（只留头像）',
+    );
+    assert.match(narrow, /tbody\s*\{[^}]*display:\s*block/, '窄屏 tbody 落回 block，由每行自己成卡片');
+    assert.doesNotMatch(
+      narrow,
+      /tbody\s*\{[^}]*grid-template-columns:\s*1fr\s+1fr/,
+      '窄屏 tbody 不得再做 1fr 1fr 并排网格（两台设备挤成并排窄卡是已修掉的破版）',
+    );
+    assert.doesNotMatch(
+      css,
+      /tbody\s*\{[^}]*grid-template-columns:\s*1fr\s+1fr/,
+      '任何断点都不允许 tbody 的 1fr 1fr 并排网格',
+    );
+  });
+
+  test('设备表与连接表的 <tr> 不得带非法 role="button"（保留 row 语义与键盘可达）', () => {
+    for (const file of ['src/web/components/NetworkView.tsx', 'src/web/components/DeviceDetail.tsx']) {
+      const source = read(file);
+      assert.doesNotMatch(source, /<tr[^>]*role="button"/, `${file}：<tr> 上的 role="button" 破坏表格无障碍树`);
+      assert.match(source, /tabIndex={0}/, `${file}：行必须保留 tabIndex={0} 键盘可达`);
+    }
+  });
+});

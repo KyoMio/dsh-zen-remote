@@ -163,8 +163,10 @@ function QuotaModal({ t, settings, onClose, onPatch }: QuotaModalProps) {
 export function AdminView(props: AdminViewProps) {
   const { t, users, settings, currentUserId, ui, onUi, onPatchSettings, onSetUserActive } = props;
 
-  const totalOnline = users.reduce((sum, user) => sum + user.onlineDevices, 0);
-  const totalRelayKbps = users.reduce((sum, user) => sum + user.relayKbps, 0);
+  // 页头汇总只统计启用中的账号（停用账号的设备已断开、不再中转）
+  const activeUsers = users.filter((user) => user.active);
+  const totalOnline = activeUsers.reduce((sum, user) => sum + user.onlineDevices, 0);
+  const totalRelayKbps = activeUsers.reduce((sum, user) => sum + user.relayKbps, 0);
   const quotaOpen = ui.dialog === 'admin-quota';
 
   return (
@@ -178,7 +180,7 @@ export function AdminView(props: AdminViewProps) {
             {t('admin.currentRelay', { rate: formatRate(totalRelayKbps) })}
           </p>
         </div>
-        <button type="button" className="btn" onClick={() => onUi({ dialog: 'admin-quota' })}>
+        <button type="button" className="btn ghost" onClick={() => onUi({ dialog: 'admin-quota' })}>
           <span aria-hidden="true">⚙</span> {t('admin.registrationQuota')}
         </button>
       </div>
@@ -206,18 +208,30 @@ export function AdminView(props: AdminViewProps) {
             const confirmingDisable = ui.confirmTarget === disableTarget;
             return (
               <tr key={user.id} className={user.active ? undefined : 'user-disabled'}>
-                <td className="user-email">{user.email}</td>
-                <td>{user.role === 'admin' ? t('account.role.admin') : t('account.role.user')}</td>
-                <td className="mono">
-                  {user.networkCount} / {settings !== null ? settings.maxNetworksPerUser : '—'}
+                <td className="admin-cell-user">
+                  <div className="user-email mono">{user.email}</div>
+                  {!user.active && <div className="device-note">{t('admin.disabledTag')}</div>}
                 </td>
-                <td className="mono">{user.onlineDevices}</td>
-                <td className="mono">{formatRate(user.relayKbps)}</td>
-                <td>
+                <td className="admin-cell-role">{user.role === 'admin' ? t('account.role.admin') : t('account.role.user')}</td>
+                <td className="admin-cell-networks mono">
+                  {user.role === 'admin' ? (
+                    <>
+                      {user.networkCount} / ∞
+                    </>
+                  ) : (
+                    <>
+                      {user.networkCount} / {settings !== null ? settings.maxNetworksPerUser : '—'}
+                    </>
+                  )}
+                </td>
+                <td className="admin-cell-online mono">{user.onlineDevices}</td>
+                <td className="admin-cell-relay mono">{formatRate(user.relayKbps)}</td>
+                <td className="admin-cell-actions">
                   {user.id !== currentUserId &&
                     (user.active ? (
                       <button
                         type="button"
+                        data-confirm-trigger
                         className={confirmingDisable ? 'btn danger solid' : 'btn danger'}
                         onClick={() => {
                           if (confirmingDisable) {

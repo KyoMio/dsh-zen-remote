@@ -3,7 +3,7 @@
 // 浏览器半边经 tsconfig.web.json 类型检查——两边共享同一份实现。
 
 import type { TranslateFn } from './i18n/locales.js';
-import type { MemberStatus, TopologyMemberRow } from './store/console-store.js';
+import type { MemberStatus, TopologyLink, TopologyMemberRow } from './store/console-store.js';
 
 /** 实时中转速率：'0 KB/s'、'12 KB/s'、'1.5 MB/s'（任务单要求等宽大字展示） */
 export function formatRate(kbps: number): string {
@@ -90,7 +90,7 @@ export function displayName(member: TopologyMemberRow, t: TranslateFn): string {
 
 export type StatusDot = 'ok' | 'warn' | 'danger' | 'muted';
 
-/** 成员五态 + 在线位 → 圆点档位与状态词（Dot Rule：圆点只这四档） */
+/** 成员五态 + 在线位 → 圆点档位与状态词（Dot Rule：圆点只这四档；Warn 只留给中转连接点与加入申请） */
 export function memberStatusView(status: MemberStatus, online: boolean, t: TranslateFn): { dot: StatusDot; word: string } {
   switch (status) {
     case 'authorized':
@@ -98,10 +98,105 @@ export function memberStatusView(status: MemberStatus, online: boolean, t: Trans
     case 'pending':
       return { dot: 'warn', word: t('status.pending') };
     case 'paused':
-      return { dot: 'warn', word: t('status.paused') };
+      return { dot: 'muted', word: t('status.paused') };
     case 'mismatch':
       return { dot: 'danger', word: t('status.mismatch') };
     case 'revoked':
       return { dot: 'muted', word: t('status.revoked') };
   }
+}
+
+// ---------------------------------------------------------------- 邀请链接掩码
+
+/**
+ * 邀请链接只掩入网口令：保留 # 之前的 zr-net://<host>/<networkId>（设备名、
+ * 网络标识要看得见），# 之后整体换成圆点；不含 # 时原样返回。
+ */
+export function maskInviteUri(joinUri: string): string {
+  const hashIndex = joinUri.indexOf('#');
+  if (hashIndex === -1) return joinUri;
+  return `${joinUri.slice(0, hashIndex)}#••••••••`;
+}
+
+// ---------------------------------------------------------------- 占席位成员
+
+/**
+ * 底部设备表与设备详情连接表只看占席位成员（authorized / paused / mismatch）：
+ * pending 只出现在概览「加入申请」格，revoked 已移除，都不该混进设备列表。
+ */
+export function filterJoinedMembers(members: readonly TopologyMemberRow[]): TopologyMemberRow[] {
+  return members.filter((m) => m.status === 'authorized' || m.status === 'paused' || m.status === 'mismatch');
+}
+
+// ---------------------------------------------------------------- 设备间连接行
+
+/** 「到其他设备的连接」表的一行：圆点档位 + 连接方式词 + 固定平实原因 + 等宽延迟 */
+export interface PeerConnRow {
+  dot: StatusDot;
+  kindWord: string;
+  reason: string;
+  latency: string;
+}
+
+/** 两设备间的路径观测：优先本机自报，缺了看对方上报（路径是双向对称的事实） */
+function findLink(links: readonly TopologyLink[], a: string, b: string): TopologyLink | null {
+  return (
+    links.find((l) => l.srcNodeId === a && l.peerNodeId === b) ??
+    links.find((l) => l.srcNodeId === b && l.peerNodeId === a) ??
+    null
+  );
+}
+
+/**
+ * 固定原因文案表（对齐 ui-ux-spec §3.5）：身份异常阻断最优先，其次对方暂停 /
+ * 本机暂停 / 离线，再才是真实链路（局域网 / 直连 / 中转），最后是空闲未连接。
+ * 判序即语义：有链路但任一方离线时仍显示「设备当前离线」。
+ */
+export function derivePeerConnRow(
+  t: TranslateFn,
+  self: TopologyMemberRow,
+  other: TopologyMemberRow,
+  links: readonly TopologyLink[],
+): PeerConnRow {
+  const notConnected = (reason: string): PeerConnRow => ({
+    dot: 'muted',
+    kindWord: t('device.notConnected'),
+    reason,
+    latency: '—',
+  });
+
+  if (self.status === 'mismatch' || other.status === 'mismatch') {
+    return { dot: 'danger', kindWord: t('device.blocked'), reason: t('device.reasonMismatchBlocked'), latency: '—' };
+  }
+  if (other.status === 'paused') {
+    return notConnected(t('device.reasonPeerPaused'));
+  }
+  if (self.status === 'paused') {
+    return notConnected(t('device.blockedReasonPaused'));
+  }
+  if (!self.online || !other.online) {
+    return notConnected(t('device.notConnectedOffline'));
+  }
+
+  const link = findLink(links, self.nodeId, other.nodeId);
+  if (link !== null) {
+    const latency = formatLatencyRange([link.rttMs]);
+    switch (classifyLinkPath(link.path)) {
+      case 'lan':
+        return { dot: 'ok', kindWord: t('path.lan'), reason: t('device.reasonLan'), latency };
+      case 'direct':
+        return { dot: 'ok', kindWord: t('path.direct'), reason: t('device.reasonDirect'), latency };
+      case 'relay': {
+        const rate = formatRate(link.liveRelayKbps);
+        const reason =
+          self.natType === 'symmetric'
+            ? t('device.reasonRelaySelf', { rate })
+            : other.natType === 'symmetric'
+              ? t('device.reasonRelayPeer', { rate })
+              : t('device.reasonRelay', { rate });
+        return { dot: 'warn', kindWord: t('path.relay'), reason, latency };
+      }
+    }
+  }
+  return notConnected(t('device.notConnectedIdle'));
 }

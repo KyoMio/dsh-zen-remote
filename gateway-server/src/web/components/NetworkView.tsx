@@ -9,7 +9,7 @@
 import { useEffect, useState } from 'react';
 
 import type { TranslateFn } from '../i18n/locales';
-import { classifyLinkPath, displayName, formatLatencyRange, formatRate, memberStatusView, relativeText, relativeTime } from '../format';
+import { classifyLinkPath, displayName, filterJoinedMembers, formatLatencyRange, formatRate, maskInviteUri, memberStatusView, relativeText, relativeTime } from '../format';
 import { Modal } from './Modal';
 import { DeviceDetail } from './DeviceDetail';
 import type {
@@ -52,17 +52,21 @@ interface SettingsModalProps {
   t: TranslateFn;
   network: NetworkSummary;
   busy: boolean;
+  ui: UiLocalState;
+  onUi: (patch: Partial<UiLocalState>) => void;
   onClose: () => void;
   onPatch: (patch: NetworkPatchInput) => void;
   onDelete: () => void;
   onRotate: () => void;
 }
 
-function NetworkSettingsModal({ t, network, busy, onClose, onPatch, onDelete, onRotate }: SettingsModalProps) {
+function NetworkSettingsModal({ t, network, busy, ui, onUi, onClose, onPatch, onDelete, onRotate }: SettingsModalProps) {
   const [name, setName] = useState(network.name);
   const [maxPeersDraft, setMaxPeersDraft] = useState(String(network.maxPeers));
-  const [confirmRotate, setConfirmRotate] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  // 危险按钮的两击确认统一走 ui.confirmTarget：同一时刻只有一个处于确认态，
+  // 且点弹窗外任何位置都会被 App 的 document 级监听取消
+  const confirmingRotate = ui.confirmTarget === 'rotate-key';
+  const confirmingDelete = ui.confirmTarget === 'delete-network';
 
   // 名称与上限：失焦或回车提交；非法值回滚显示服务端真值
   const commitName = (): void => {
@@ -150,39 +154,47 @@ function NetworkSettingsModal({ t, network, busy, onClose, onPatch, onDelete, on
         <div className="danger-zone">
           <p className="danger-title">{t('network.dangerZone')}</p>
           <div className="danger-row">
-            <span>{t('network.rotateInviteLink')}</span>
+            <div>
+              <span>{t('network.rotateInviteLink')}</span>
+              <p className="danger-hint">{t('network.rotateHint')}</p>
+            </div>
             <button
               type="button"
-              className={confirmRotate ? 'btn danger solid' : 'btn danger'}
+              data-confirm-trigger
+              className={confirmingRotate ? 'btn danger solid' : 'btn danger'}
               disabled={busy}
               onClick={() => {
-                if (confirmRotate) {
-                  setConfirmRotate(false);
+                if (confirmingRotate) {
+                  onUi({ confirmTarget: null });
                   onRotate();
                 } else {
-                  setConfirmRotate(true);
+                  onUi({ confirmTarget: 'rotate-key' });
                 }
               }}
             >
-              {confirmRotate ? t('common.confirmReset') : t('common.reset')}
+              {confirmingRotate ? t('common.confirmReset') : t('common.reset')}
             </button>
           </div>
           <div className="danger-row">
-            <span>{t('network.deleteNetwork')}</span>
+            <div>
+              <span>{t('network.deleteNetwork')}</span>
+              <p className="danger-hint">{t('network.deleteHint')}</p>
+            </div>
             <button
               type="button"
-              className={confirmDelete ? 'btn danger solid' : 'btn danger'}
+              data-confirm-trigger
+              className={confirmingDelete ? 'btn danger solid' : 'btn danger'}
               disabled={busy}
               onClick={() => {
-                if (confirmDelete) {
-                  setConfirmDelete(false);
+                if (confirmingDelete) {
+                  onUi({ confirmTarget: null });
                   onDelete();
                 } else {
-                  setConfirmDelete(true);
+                  onUi({ confirmTarget: 'delete-network' });
                 }
               }}
             >
-              {confirmDelete ? t('common.confirmDelete') : t('common.delete')}
+              {confirmingDelete ? t('common.confirmDelete') : t('common.delete')}
             </button>
           </div>
         </div>
@@ -281,9 +293,15 @@ export function NetworkView(props: NetworkViewProps) {
   const links = topology?.links ?? [];
   const summary = topology?.summary ?? null;
 
+  // 设备表只看占席位成员；pending 留在加入申请格，revoked 已移除
+  const joinedMembers = filterJoinedMembers(members);
   const mismatched = members.filter((m) => m.status === 'mismatch');
   const pending = members.filter((m) => m.status === 'pending');
-  const seatsFull = network.totalDevices >= network.maxPeers;
+  // 席位计数 = 占席位数（authorized + paused + mismatch）/ 设备上限 maxPeers；
+  // 拓扑未首推时回落到网络列表里的 totalDevices / maxPeers
+  const joinedCount = topology !== null ? joinedMembers.length : network.totalDevices;
+  const maxPeers = topology?.network.maxPeers ?? network.maxPeers;
+  const seatsFull = joinedCount >= maxPeers;
 
   // 连接对统计（cell 3）：A→B 与 B→A 是同一条连接
   const pairs = new Map<string, { direct: boolean }>();
@@ -327,11 +345,12 @@ export function NetworkView(props: NetworkViewProps) {
             </button>
           </div>
           <p className={`device-count mono${seatsFull ? ' full' : ''}`}>
-            {t('network.deviceCount', { online: network.onlineDevices, total: network.totalDevices })}
+            {t('network.deviceCount', { count: joinedCount, max: maxPeers })}
             {seatsFull && <span className="count-full"> {t('network.capacityFull')}</span>}
           </p>
+          <span className="field-label">{t('network.inviteLink')}</span>
           <div className="invite-box">
-            <code className="invite-key mono">#••••••••</code>
+            <code className="invite-key mono">{maskInviteUri(network.joinUri)}</code>
             <button type="button" className="btn primary" onClick={onCopyInvite}>
               {t('common.copy')}
             </button>
@@ -355,6 +374,7 @@ export function NetworkView(props: NetworkViewProps) {
                   <div className="request-actions">
                     <button
                       type="button"
+                      data-confirm-trigger
                       className={confirming ? 'btn danger solid' : 'btn danger'}
                       onClick={() => {
                         if (confirming) {
@@ -426,10 +446,9 @@ export function NetworkView(props: NetworkViewProps) {
           </section>
         ) : (
           <section className="overview-cell cell-requests">
-            <p className="cell-label">
-              <span className="dot muted" aria-hidden="true" /> {t('overview.requestsEmpty')}
-            </p>
-            <p className="empty-hint">{t('overview.requestsEmptyHint')}</p>
+            <p className="cell-label">{t('network.joinRequests')}</p>
+            <p className="empty-line">{t('overview.requestsEmpty')}</p>
+            <p className="invite-hint">{t('overview.requestsEmptyHint')}</p>
           </section>
         )}
 
@@ -446,9 +465,17 @@ export function NetworkView(props: NetworkViewProps) {
 
       {/* 设备列表 */}
       <div className="device-section">
-        <h3 className="section-title">{t('network.devices')}</h3>
-        {members.length === 0 ? (
-          <p className="empty-hint">{t('devices.emptyHint')}</p>
+        <div className="devices-head">
+          <h2 className="section-title">
+            {t('network.devices')} <span className="muted-count">{joinedMembers.length}</span>
+          </h2>
+          <p className="section-hint">{t('devices.clickHint')}</p>
+        </div>
+        {joinedMembers.length === 0 ? (
+          <div className="empty-devices">
+            <h3>{t('devices.empty')}</h3>
+            <p>{t('devices.emptyBody')}</p>
+          </div>
         ) : (
           <table className="device-table">
             <thead>
@@ -463,18 +490,18 @@ export function NetworkView(props: NetworkViewProps) {
               </tr>
             </thead>
             <tbody>
-              {members.map((member) => {
+              {joinedMembers.map((member) => {
                 const status = memberStatusView(member.status, member.online, t);
                 const own = selfLinks(member.nodeId);
                 const direct = own.filter((l) => classifyLinkPath(l.path) !== 'relay').length;
                 const relay = own.length - direct;
                 const latency = formatLatencyRange(own.map((l) => l.rttMs));
+                const showConn = member.status === 'authorized' && member.online && own.length > 0;
                 return (
                   <tr
                     key={member.nodeId}
-                    className="device-row"
+                    className={`device-row${member.status === 'paused' ? ' is-paused' : ''}`}
                     tabIndex={0}
-                    role="button"
                     aria-label={displayName(member, t)}
                     onClick={() => setDetailNodeId(member.nodeId)}
                     onKeyDown={(event) => {
@@ -484,27 +511,37 @@ export function NetworkView(props: NetworkViewProps) {
                       }
                     }}
                   >
-                    <td>
+                    <td className="device-cell-name">
                       <div className="device-name">{displayName(member, t)}</div>
                       {member.note !== null && <div className="device-note">{member.note}</div>}
                     </td>
-                    <td>
+                    <td className="device-cell-status">
                       <span className="dot-row">
                         <span className={`dot ${status.dot}`} aria-hidden="true" />
                         {status.word}
                       </span>
                     </td>
                     <td className="conn-summary">
-                      <span className="conn-chip">
-                        <span className="dot ok" aria-hidden="true" />
-                        {t('devices.directCount', { n: direct })}
-                      </span>
-                      <span className="conn-chip">
-                        <span className="dot warn" aria-hidden="true" />
-                        {t('devices.relayCount', { n: relay })}
-                      </span>
+                      {showConn ? (
+                        <>
+                          {direct > 0 && (
+                            <span className="conn-chip">
+                              <span className="dot ok" aria-hidden="true" />
+                              {t('devices.directCount', { n: direct })}
+                            </span>
+                          )}
+                          {relay > 0 && (
+                            <span className="conn-chip">
+                              <span className="dot warn" aria-hidden="true" />
+                              {t('devices.relayCount', { n: relay })}
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
                     </td>
-                    <td className="mono">{latency}</td>
+                    <td className="device-cell-latency mono">{latency}</td>
                     <td className="row-arrow" aria-hidden="true">
                       ›
                     </td>
@@ -521,6 +558,8 @@ export function NetworkView(props: NetworkViewProps) {
           t={t}
           network={network}
           busy={busy}
+          ui={ui}
+          onUi={onUi}
           onClose={() => onUi({ dialog: null, confirmTarget: null })}
           onPatch={onPatchNetwork}
           onDelete={onDeleteNetwork}

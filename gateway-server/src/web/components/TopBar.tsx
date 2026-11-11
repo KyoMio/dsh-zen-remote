@@ -93,6 +93,19 @@ function avatarInitial(email: string): string {
   return (email.charAt(0) || '?').toUpperCase();
 }
 
+/** 品牌标识：极简双节点连线（替代通用字母色块，去模板感） */
+function BrandMark() {
+  return (
+    <span className="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none">
+        <path d="M8 16 16 8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+        <circle cx="7" cy="17" r="3" fill="currentColor" />
+        <circle cx="17" cy="7" r="3" fill="currentColor" />
+      </svg>
+    </span>
+  );
+}
+
 export function TopBar(props: TopBarProps) {
   const { t, user, networks, selectedNetworkId, onSelectNetwork, onCreateNetwork, view, onChangeView } = props;
   const { theme, onToggleTheme, onToggleLocale, onLogout, ui, onUi } = props;
@@ -117,9 +130,7 @@ export function TopBar(props: TopBarProps) {
 
   return (
     <header className="topbar">
-      <span className="brand-mark" aria-hidden="true">
-        Z
-      </span>
+      <BrandMark />
       <span className="brand-title">{t('app.title')}</span>
       <span className="topbar-divider" aria-hidden="true" />
 
@@ -137,8 +148,8 @@ export function TopBar(props: TopBarProps) {
           >
             <span className="net-switcher-name">{selected !== null ? selected.name : t('nav.networks')}</span>
             {selected !== null && (
-              <span className="net-switcher-count mono">
-                {selected.onlineDevices}/{selected.totalDevices}
+              <span className="net-switcher-count mono" title={`${t('network.devices')} / ${t('network.deviceLimit')}`}>
+                {selected.totalDevices}/{selected.maxPeers}
               </span>
             )}
             <span className="chevron" aria-hidden="true">
@@ -169,9 +180,9 @@ export function TopBar(props: TopBarProps) {
                     <span className="menu-item-name">{network.name}</span>
                     <span
                       className="menu-item-count mono"
-                      title={`${t('summary.onlineDevices')} / ${t('network.devices')}`}
+                      title={`${t('network.devices')} / ${t('network.deviceLimit')}`}
                     >
-                      {network.onlineDevices}/{network.totalDevices}
+                      {network.totalDevices}/{network.maxPeers}
                     </span>
                   </button>
                 );
