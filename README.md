@@ -21,7 +21,7 @@
 | ![Session list home](assets/home.png) | ![Session page](assets/session.png) | ![Session info card](assets/info.png) |
 
 | Composer permission sheet | Pairing page a public visitor sees |
-| --- | --- | --- |
+| --- | --- |
 | ![Composer permission sheet](assets/sheet.png) | ![Pairing page](assets/pairing.png) |
 
 > Screenshots are a 390×844 phone viewport in the light theme; both themes are supported. The pairing page is drawn by the gateway in DSH's official style, following the system light / dark appearance.
