@@ -21,12 +21,12 @@ docker run -d --name zr-gateway \
   -p 19393:19393/tcp \
   -p 19393:19393/udp \
   -p 19394:19394/udp \
-  -v ./data:/data \
+  -v zr-gateway-data:/data \
   zr-gateway
 ```
 
 - 端口：`19393/tcp`（Web 控制台 + WebSocket）、`19393/udp`（STUN 主口）、`19394/udp`（STUN 辅口）。**TCP 与 UDP 都要映射**——少了 UDP 口，打洞协调不工作，所有设备都只能走中转。
-- 数据卷：镜像内数据目录固定为 `/data`（上面 `-v ./data:/data` 把它持久化到宿主机当前目录的 `data/`），里面是 SQLite 库与自动生成的 `master.key`（权限 `0600`）。升级镜像时保留这个目录即可，所有网络与成员数据都在里面。
+- 数据卷：镜像以非 root 用户（`zr`，`uid=100:gid=101`）运行，数据目录固定为 `/data`。推荐使用命名卷 `-v zr-gateway-data:/data`（Docker 首挂自动继承镜像内 `zr:zr` 属主）；若在 Linux 宿主机改用目录挂载（`-v $(pwd)/data:/data`），请先执行 `mkdir -p ./data && sudo chown 100:101 ./data`。升级镜像时保留该卷或目录即可，SQLite 库与自动生成的 `master.key`（权限 `0600`）都在里面。
 - **首次启动看日志拿管理员密码**：
 
   ```sh
