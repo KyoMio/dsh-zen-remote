@@ -60,7 +60,7 @@
  *   half — every one takes `agent` as its first parameter, wire `agentId`,
  *   source `lookup: 'agent'`, wireTypeSymbol `SessionId` (the same shape
  *   T31 verified for fileUploads/fileReferences).
- * - `workspaceFiles/list|changes|read|readBytes|stat` carry a TOP-LEVEL
+ * - `workspaceFiles/list|changes|read|readBytes|stat|search` carry a TOP-LEVEL
  *   `workspaceFileScopeId`: the host registers the `workspaceFileScope`
  *   lookup with wireTypeSymbol `SessionId` and resolves it by session —
  *   `sessions.get(sessionId).header.cwd` is only the BASE for relative
@@ -68,8 +68,9 @@
  *   not a containment: absolute paths anywhere the server process can read
  *   are served (see the registry note below). The field itself is
  *   share-checked like any session id.
- * - `terminal/list` and `terminal/retain` take a plain TOP-LEVEL json
- *   `sessionId` (source `'json'`, not a lookup) — same check.
+ * - `terminal/list`, `terminal/retain` and (0.2.2-rc.2) `terminal/watch`
+ *   take a plain TOP-LEVEL json `sessionId` (source `'json'`, not a
+ *   lookup) — same check.
  * - `sessionFeedback/record` carries `request.sessionId` — a plain B-type.
  * - `sessionReferenceResolver/candidates` (@ mentions) answers with EVERY
  *   server session — title, cwd, and a ready-made `dsh-session:` mention
@@ -84,6 +85,12 @@
  *   does not descend from the claimed parent fails its own check, so the
  *   "shared parent + foreign child" decoy refuses here before DSH's own
  *   lineage validation is ever reached.
+ * - `subagents/interruptByUser` (0.2.2-rc.2, the rename of
+ *   `interruptByParent`) takes only the top-level `childSessionId` — the
+ *   user addresses the target Session directly, with no parent or mode.
+ *   The child is still share-checked through the same `parentOf`
+ *   inheritance. `interruptByParent` stays registered so a 0.2.2-rc.1 host
+ *   (npm `latest`) keeps working.
  *
  * PROMPT TEXT REFERENCES ARE CHECKED TOO: a prompt whose text carries a
  * canonical `dsh-session:<base64url(id)>` address makes DSH inject that
