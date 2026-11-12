@@ -327,8 +327,15 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     // 0.2.2-rc.1: typert.remote-client.js byte-identical to alpha.3 (rc.1 only
     // moves cordis/schemastery/cosmokit from alpha to stable; 27 endpoints).
     '0.2.2-rc.1': 'r:838e5469a423',
+    // 0.2.2-rc.2: still 27 endpoints, same ids and order; describe docs grew
+    // (656→731 lines) and SessionProjectionMap gained additive
+    // conversationContinuation. Computed in bwrap via
+    // scripts/verify-fingerprint-live.mjs against the npm 0.2.2-rc.2 closure:
+    // r:c3b0734019c7. Mixed rc.1/rc.2 pairs report `session` (and files,
+    // subagent, job, events) as different, never a hard refuse.
+    '0.2.2-rc.2': 'r:c3b0734019c7',
   }
-  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27, '0.2.2-rc.1': 27 }
+  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27, '0.2.2-rc.1': 27, '0.2.2-rc.2': 27 }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
   const remote = await import('../node_modules/@deepseek-ai/dsh-api-session-controller/lib/typert.remote-client.js')
