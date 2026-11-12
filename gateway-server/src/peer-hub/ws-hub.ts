@@ -212,9 +212,13 @@ export class PeerWsHub {
   private admissionEpoch = 0;
   // Retain the last disable across re-enable: only newer attempts may join again.
   private readonly ownerDisabledEpoch = new Map<string, number>();
-  // PC-03 fix1：每成员授权代次（与 ownerDisabledEpoch 同一代次模式）。本成员的
-  // 状态迁移（pause 等）递增；在途的连接晋升（resume/approve 提升内含 await
-  // 窗口）以捕获值做同步复核，任何后到的状态变化都使旧晋升失效。
+  // PC-03 fix1/fix2：每成员授权代次（与 ownerDisabledEpoch 同一代次模式）。
+  // 除 rename 外的成员动作在 onMemberChanged 入口递增；两类在途快照以捕获值
+  // 做同步复核：(1) 池中连接的 resume/approve 晋升；(2) 尚未落地的在途认证
+  // （handleAuth）。任何后到的状态变化都使旧快照失效。生命周期 = hub 进程
+  // 生命周期：条目是每成员一个小整数，刻意不删——删除会让「已删代次」与
+  // 「从未变化」（0）重新相等，放过过期快照；增长上界是本进程见过的
+  // (network|node) 身份数，不落库、进程重启即清零。
   private readonly memberEpochs = new Map<string, number>();
 
   constructor(options: PeerWsHubOptions) {
@@ -489,6 +493,10 @@ export class PeerWsHub {
     }
 
     const name = parseName(message['name']);
+    // PC-03 fix2：关键成员读写（upsertMemberJoinAttempt）之前捕获成员代次——
+    // 此后到注册之间的所有 await 窗口内，管理员的 pause/remove 等正常操作
+    // 都会递增它（见 onMemberChanged），末尾同步复核使过期快照失效。
+    const memberEpoch = this.memberEpochs.get(connKey(networkId, nodeId)) ?? 0;
     let member: MemberRecord | null;
     try {
       member = await this.store.upsertMemberJoinAttempt({
@@ -510,6 +518,16 @@ export class PeerWsHub {
 
     // Revalidate after the async join write, before any routing/hanging registration.
     if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
+    // PC-03 fix2：成员代次同步复核——这是最后一个 await 之后的闸，到这里与
+    // 注册之间没有任何 await。认证中途落下的状态变化使 member 快照过期：不按
+    // 旧状态注册/放行/挂起，直接关闭连接。刻意不发 denied——节点把一切
+    // denied 视为终止性拒绝并停止重连（wsReconnectable=false），会把暂时性
+    // pause 变成永久停机；静默关闭让节点沿既有有界退避重连，下一次认证按
+    // 最新持久授权重新判定。
+    if ((this.memberEpochs.get(connKey(networkId, nodeId)) ?? 0) !== memberEpoch) {
+      ws.close(1013, 'membership changed during authentication');
+      return null;
+    }
     this.replaceExisting(networkId, nodeId);
     const conn: ConnState = {
       ws,
@@ -744,6 +762,14 @@ export class PeerWsHub {
 
   private async onMemberChanged(event: MemberChangedEvent): Promise<void> {
     const key = connKey(event.networkId, event.nodeId);
+    // PC-03 fix2：除 rename（不改授权）外的成员动作都是授权事实变化——统一在
+    // 入口递增成员代次，使两类在途快照失效：(1) fix1 的在途晋升（连接已在
+    // 池中，等其 await 窗口过去后同步复核）；(2) 尚未落地（不在任何池里、钩子
+    // 够不到）的在途认证（handleAuth 末尾同步复核）。pause/resume/approve/
+    // reject/repin/remove 全部覆盖；重复动作幂等（代次递增本身无可见效果）。
+    if (event.action !== 'rename') {
+      this.memberEpochs.set(key, (this.memberEpochs.get(key) ?? 0) + 1);
+    }
     switch (event.action) {
       case 'approve':
       case 'repin': {
@@ -762,10 +788,9 @@ export class PeerWsHub {
         break;
       }
       case 'pause': {
-        // fix1：无论连接在路由表还是暂停池，先递增本成员授权代次——落在任何
-        // 在途晋升（resume/approve 提升的 await 窗口）之后的 pause 都使旧晋升
-        // 失效；已在暂停池的重复 pause 幂等（代次递增本身无可见效果）
-        this.memberEpochs.set(key, (this.memberEpochs.get(key) ?? 0) + 1);
+        // fix1：无论连接在路由表还是暂停池，落在任何在途晋升（resume/approve
+        // 提升的 await 窗口）之后的 pause 都使旧晋升失效；已在暂停池的重复
+        // pause 幂等（代次递增本身无可见效果）
         const conn = this.conns.get(event.networkId)?.get(event.nodeId);
         if (conn === undefined) break; // 已离线或已在暂停池：无连接动作
         this.broadcast(event.networkId, { type: 'peer-paused', nodeId: event.nodeId }, event.nodeId);
