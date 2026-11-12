@@ -575,11 +575,6 @@ export class PeerPunchManager {
       throw new TypeError('peerNodeId is not the self-certifying hash of peerPublicKeyHex')
     }
     if (nodeId === this.identity.nodeId) throw new TypeError('cannot punch ourselves')
-    const existing = this.sessions.get(nodeId)
-    if (existing) {
-      this.clearSessionTimers(existing)
-      this.sessions.delete(nodeId)
-    }
     const candidates: string[] = []
     const raw = [...(Array.isArray(peer.lanEndpoints) ? peer.lanEndpoints : [])]
     if (peer.reflexiveEndpoint) raw.push(peer.reflexiveEndpoint)
@@ -587,6 +582,20 @@ export class PeerPunchManager {
       if (typeof endpoint === 'string' && parseEndpoint(endpoint) && !candidates.includes(endpoint)) {
         candidates.push(endpoint)
       }
+    }
+    const existing = this.sessions.get(nodeId)
+    if (existing) {
+      // Preserve an already-confirmed direct UDP session when late control
+      // signals (e.g. punch-coordinate) arrive — wiping ciphers mid-flight
+      // would drop active ARQ stream frames.
+      if (existing.state === 'direct' && existing.peerPublicKeyHex === peer.peerPublicKeyHex && existing.ciphers) {
+        for (const ep of candidates) {
+          if (!existing.candidates.includes(ep)) existing.candidates.push(ep)
+        }
+        return
+      }
+      this.clearSessionTimers(existing)
+      this.sessions.delete(nodeId)
     }
     const session = this.createSession(nodeId, peer.peerPublicKeyHex, candidates)
     this.startPunchRounds(session)
@@ -628,7 +637,8 @@ export class PeerPunchManager {
   }
 
   sessionCiphers(peerNodeId: string): PeerSessionCiphers | null {
-    return this.sessions.get(peerNodeId.toLowerCase())?.ciphers ?? null
+    const session = this.sessions.get(peerNodeId.toLowerCase())
+    return session?.state === 'direct' ? session.ciphers : null
   }
 
   /** Last PING→PONG round trip for the peer, or null before the first PONG. */
@@ -861,7 +871,11 @@ export class PeerPunchManager {
     if (!session) return
     // Answer FIRST — the peer's RTT clock is already running.
     this.sendHelloAck(session, packet.nonce, rinfo)
-    this.integratePeerEphemeral(session, packet.ephPubHex, rinfo)
+    // An inbound HELLO only proves peer → us UDP reachability, NOT us → peer!
+    // Derive ciphers so we can open the peer's follow-up encrypted confirmation
+    // frame, but do NOT flip into `direct` until bidirectional reachability is
+    // proven (prevents asymmetric NAT/firewall from blackholing outbound replies).
+    this.integratePeerEphemeral(session, packet.ephPubHex, rinfo, session.state === 'direct')
   }
 
   private onHelloAck(packet: Record<string, unknown>, rinfo: { address: string; port: number }): void {
@@ -884,7 +898,15 @@ export class PeerPunchManager {
     if (typeof session.lastHelloSentAt === 'number') {
       session.rttMs = Math.max(0, this.clock.now() - session.lastHelloSentAt)
     }
-    this.integratePeerEphemeral(session, packet.ephPubHex, rinfo)
+    this.integratePeerEphemeral(session, packet.ephPubHex, rinfo, true)
+    // Immediately send an encrypted PING so the responder confirms round-trip
+    // (us → peer HELLO, peer → us ACK, us → peer sealed PING) in 0.5 RTT.
+    try {
+      session.lastPingSentAt = this.clock.now()
+      this.sendEncryptedTo(session, PeerFrameType.PING, 0, randomBytes(8), 0)
+    } catch {
+      // Transient send failure; keepalive will retry.
+    }
   }
 
   private ensureSession(nodeId: string, publicKeyHex: string, candidates: string[]): PunchSession | null {
@@ -909,23 +931,25 @@ export class PeerPunchManager {
     session: PunchSession,
     peerEphPubHex: string,
     rinfo: { address: string; port: number },
+    confirmDirect: boolean,
   ): void {
     session.endpoint = `${rinfo.address}:${rinfo.port}`
-    if (session.peerEphPubHex === peerEphPubHex) return
-    session.peerEphPubHex = peerEphPubHex
-    const ciphers = derivePeerSessionCiphers({
-      networkId: this.networkId,
-      myNodeId: this.identity.nodeId,
-      peerNodeId: session.peerNodeId,
-      myEphPrivateKeyHex: session.myEph.privateKeyHex,
-      myEphPublicKeyHex: session.myEph.publicKeyHex,
-      peerEphPublicKeyHex: peerEphPubHex,
-    })
-    session.ciphers = ciphers
+    if (session.peerEphPubHex !== peerEphPubHex || session.ciphers === null) {
+      session.peerEphPubHex = peerEphPubHex
+      session.ciphers = derivePeerSessionCiphers({
+        networkId: this.networkId,
+        myNodeId: this.identity.nodeId,
+        peerNodeId: session.peerNodeId,
+        myEphPrivateKeyHex: session.myEph.privateKeyHex,
+        myEphPublicKeyHex: session.myEph.publicKeyHex,
+        peerEphPublicKeyHex: peerEphPubHex,
+      })
+    }
+    if (!confirmDirect || !session.ciphers) return
     const pairKey = `${session.myEph.publicKeyHex}|${peerEphPubHex}`
-    if (session.derivedPair === pairKey) return
+    if (session.state === 'direct' && session.derivedPair === pairKey) return
     session.derivedPair = pairKey
-    this.completeDirect(session, ciphers)
+    this.completeDirect(session, session.ciphers)
   }
 
   private completeDirect(session: PunchSession, ciphers: PeerSessionCiphers): void {
@@ -952,6 +976,13 @@ export class PeerPunchManager {
     // Any authenticated frame refreshes the peer's current endpoint —
     // a roaming phone behind NAT gets followed automatically.
     session.endpoint = `${rinfo.address}:${rinfo.port}`
+    // Opening an AEAD-authenticated frame under ciphers derived from our
+    // HELLO-ACK proves our HELLO-ACK reached the peer AND their encrypted
+    // traffic reaches us: 3-way bidirectional UDP confirmation complete!
+    if (session.state !== 'direct' && session.ciphers && session.peerEphPubHex) {
+      session.derivedPair = `${session.myEph.publicKeyHex}|${session.peerEphPubHex}`
+      this.completeDirect(session, session.ciphers)
+    }
     if (header.frameType === PeerFrameType.PING) {
       if (session.state === 'direct') {
         try {

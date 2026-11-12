@@ -843,3 +843,121 @@ test('close() clears every timer handle, closes the socket, and is idempotent', 
   mgr.handlePacket(Buffer.from('junk'), { address: '127.0.0.1', port: 1 })
   assert.equal(mgr.sessionCiphers(peer.nodeId), null, 'sessions are gone after close')
 })
+
+test('asymmetric one-way UDP (A -> B arrives, B -> A dropped) never puts B into a one-way direct blackhole', async () => {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const clockA = manualClock()
+  const clockB = manualClock()
+  const readyA = []
+  const readyB = []
+  const fallbackA = []
+  const dataAtA = []
+
+  const { mgr: mgrA, socket: sockA } = await makeManager(A, clockA, {
+    onDirectReady: (id, info) => readyA.push({ id, info }),
+    onPunchFallback: (id) => fallbackA.push(id),
+    onEncryptedFrame: (header, plaintext) => dataAtA.push({ id: header.srcNodeId, text: Buffer.from(plaintext).toString('utf8') }),
+  })
+  const { mgr: mgrB, socket: sockB } = await makeManager(B, clockB, {
+    onDirectReady: (id, info) => readyB.push({ id, info }),
+    onPunchFallback: () => {},
+  })
+  let blockBtoA = true
+  const realSendB = sockB.send.bind(sockB)
+  sockB.send = (buf, port, address, cb) => {
+    if (blockBtoA && port === sockA.address().port) {
+      if (typeof cb === 'function') cb(null)
+      return
+    }
+    return realSendB(buf, port, address, cb)
+  }
+
+  try {
+    const portA = sockA.address().port
+    const portB = sockB.address().port
+    mgrB.beginPunch({
+      peerNodeId: A.nodeId,
+      peerPublicKeyHex: A.publicKeyHex,
+      lanEndpoints: [`127.0.0.1:${portA}`],
+      reflexiveEndpoint: null,
+    })
+    mgrA.beginPunch({
+      peerNodeId: B.nodeId,
+      peerPublicKeyHex: B.publicKeyHex,
+      lanEndpoints: [`127.0.0.1:${portB}`],
+      reflexiveEndpoint: null,
+    })
+
+    // Let A's HELLO reach B while B's HELLO-ACK is dropped by A's firewall/NAT.
+    await sleep(30)
+    clockA.advance(250)
+    await sleep(30)
+    clockA.advance(1000)
+    await sleep(20)
+
+    assert.deepEqual(fallbackA, [B.nodeId], 'A falls back after 1000ms punch window')
+    assert.equal(readyA.length, 0, 'A never received B -> A packets, so A is not direct')
+    assert.equal(
+      readyB.length,
+      0,
+      'B MUST NOT enter direct on unconfirmed inbound zr-hello alone (otherwise B blackholes all outbound stream frames!)',
+    )
+
+    // Now unblock B -> A and trigger A's reprobe: 3-way confirmation completes on both sides!
+    blockBtoA = false
+    clockA.advance(60_000)
+    await withTimeout(
+      (async () => {
+        while (readyA.length === 0 || readyB.length === 0) await sleep(10)
+      })(),
+      500,
+      'both A and B enter direct once B -> A UDP is reachable',
+    )
+    assert.equal(readyA.length, 1)
+    assert.equal(readyB.length, 1)
+
+    mgrB.frameSenderFor(A.nodeId)(PeerFrameType.DATA, 7, Buffer.from('live-reply'), 0)
+    await withTimeout(
+      (async () => {
+        while (dataAtA.length === 0) await sleep(5)
+      })(),
+      250,
+      'B -> A encrypted stream frame arrives after 3-way direct confirmation',
+    )
+    assert.deepEqual(dataAtA, [{ id: B.nodeId, text: 'live-reply' }])
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
+    await closeManager({ mgr: mgrB, socket: sockB })
+  }
+})
+
+test('beginPunch on an already-direct peer preserves live session ciphers without dropping frames', async () => {
+  const receivedByA = []
+  const pair = await establishPair({
+    onEncryptedFrame: (_header, plaintext) => receivedByA.push(Buffer.from(plaintext).toString('utf8')),
+  })
+  try {
+    // Simulate gateway punch-coordinate arriving after LAN direct is already live:
+    pair.mgrB.beginPunch({
+      peerNodeId: pair.A.nodeId,
+      peerPublicKeyHex: pair.A.publicKeyHex,
+      lanEndpoints: [`127.0.0.1:${pair.sockA.address().port}`],
+      reflexiveEndpoint: `203.0.113.9:${pair.sockA.address().port}`,
+    })
+    assert.notEqual(pair.mgrB.sessionCiphers(pair.A.nodeId), null, 'live direct session ciphers must not be wiped')
+
+    pair.mgrB.frameSenderFor(pair.A.nodeId)(PeerFrameType.DATA, 1, Buffer.from('still-connected'), 0)
+    await withTimeout(
+      (async () => {
+        while (receivedByA.length === 0) await sleep(5)
+      })(),
+      250,
+      'frame delivered over preserved direct session',
+    )
+    assert.deepEqual(receivedByA, ['still-connected'])
+  } finally {
+    await closeManager({ mgr: pair.mgrA, socket: pair.sockA })
+    await closeManager({ mgr: pair.mgrB, socket: pair.sockB })
+  }
+})

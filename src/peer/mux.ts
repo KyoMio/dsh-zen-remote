@@ -96,8 +96,9 @@ interface ResponseMeta {
 interface MuxStream {
   streamId: number
   initiator: boolean
-  /** 入站方向已解析元数据（fragment 0 已处理）。 */
+  /** 入站方向已解析元数据（fragment 0+ 元数据段已处理）。 */
   inboundMetaDone: boolean
+  inboundMetaBuf: Buffer
   inboundFinished: boolean
   /** initiator 侧：响应元数据（fragment 0）已到达。 */
   responseResolved: boolean
@@ -282,7 +283,9 @@ export class PeerMux {
     if (!session || session.closed || this.closed) return
     if (session.ciphers !== null) {
       if (session.path !== 'ws') {
+        const before = session.path
         session.path = 'ws'
+        if (before === 'none') session.arq.flushInflight()
         this.options.onPathChanged?.(session.nodeId, 'ws')
       }
       return
@@ -297,6 +300,7 @@ export class PeerMux {
     session.punchSender = sender
     const before = session.path
     session.path = 'udp'
+    if (before === 'none') session.arq.flushInflight()
     if (before !== 'udp') this.options.onPathChanged?.(session.nodeId, 'udp')
   }
 
@@ -307,6 +311,7 @@ export class PeerMux {
     const before = session.path
     session.path = session.ciphers !== null ? 'ws' : 'none'
     if (session.path === 'none') this.beginHello(session)
+    else if (before === 'none') session.arq.flushInflight()
     if (before !== session.path) this.options.onPathChanged?.(session.nodeId, session.path)
   }
 
@@ -426,32 +431,51 @@ export class PeerMux {
         }
 
         const run = async (): Promise<void> => {
-          await this.writeArq(session, stream, Buffer.from(JSON.stringify({ t: 'req', m: method, p: pathWithQuery, h: headers }), 'utf8'))
+          const metaBytes = Buffer.from(
+            `${JSON.stringify({ t: 'req', m: method, p: pathWithQuery, h: headers })}\n`,
+            'utf8',
+          )
           const body = init?.body ?? (url instanceof globalThis.Request ? url.body : null)
-          if (body !== null && body !== undefined) {
-            if (typeof body === 'string') {
-              await this.writeArq(session, stream, Buffer.from(body, 'utf8'))
-            } else if (body instanceof Uint8Array) {
-              await this.writeArq(session, stream, body)
-            } else if (body instanceof ArrayBuffer) {
-              await this.writeArq(session, stream, new Uint8Array(body))
-            } else if (typeof (body as ReadableStream).getReader === 'function') {
-              const reader = (body as ReadableStream<Uint8Array>).getReader()
-              for (;;) {
-                const { done, value } = await reader.read()
-                if (done) break
-                await this.writeArq(session, stream, value)
-              }
-            } else {
-              const asText = await new Response(body as BodyInit).text()
-              await this.writeArq(session, stream, Buffer.from(asText, 'utf8'))
+          // Pipeline buffered requests (meta + body + FIN) into ARQ synchronously
+          // in a single flight (1 RTT instead of 3 sequential SACK-awaited RTTs).
+          if (body === null || body === undefined) {
+            void this.writeArq(session, stream, metaBytes)
+            if (!stream.outboundFinished) {
+              stream.outboundFinished = true
+              await session.arq.finish(streamId).catch(() => {})
             }
+            return
+          }
+          if (typeof body === 'string' || body instanceof Uint8Array || body instanceof ArrayBuffer) {
+            const bodyBytes = typeof body === 'string'
+              ? Buffer.from(body, 'utf8')
+              : body instanceof Uint8Array
+                ? body
+                : new Uint8Array(body)
+            void this.writeArq(session, stream, metaBytes)
+            if (bodyBytes.byteLength > 0) void this.writeArq(session, stream, bodyBytes)
+            if (!stream.outboundFinished) {
+              stream.outboundFinished = true
+              await session.arq.finish(streamId).catch(() => {})
+            }
+            return
+          }
+          if (typeof (body as ReadableStream).getReader === 'function') {
+            void this.writeArq(session, stream, metaBytes)
+            const reader = (body as ReadableStream<Uint8Array>).getReader()
+            for (;;) {
+              const { done, value } = await reader.read()
+              if (done) break
+              await this.writeArq(session, stream, value)
+            }
+          } else {
+            const asText = await new Response(body as BodyInit).text()
+            void this.writeArq(session, stream, metaBytes)
+            if (asText.length > 0) void this.writeArq(session, stream, Buffer.from(asText, 'utf8'))
           }
           if (!stream.outboundFinished) {
             stream.outboundFinished = true
-            const fin = stream.writeChain.then(() => session.arq.finish(streamId))
-            stream.writeChain = fin.catch(() => {})
-            await fin
+            await session.arq.finish(streamId).catch(() => {})
           }
         }
         run().catch((err) => {
@@ -661,8 +685,9 @@ export class PeerMux {
     session.ciphers = ciphers
     this.clearHelloTimer(session)
     this.options.log?.(`mux: relay handshake complete for ${session.nodeId} (path=${session.path})`)
-    if (session.path !== 'ws') {
+    if (session.path === 'none') {
       session.path = 'ws'
+      session.arq.flushInflight()
       this.options.onPathChanged?.(session.nodeId, 'ws')
     }
   }
@@ -689,20 +714,42 @@ export class PeerMux {
     this.onFragment(session, stream, chunk, final)
   }
 
-  /** 单个入站分片的按向处理（ARQ 已保证顺序，无需重排缓冲）。 */
+  /** 单个入站分片的按向处理（ARQ 已保证顺序，元数据支持跨分片与换行定界）。 */
   private onFragment(session: MuxSession, stream: MuxStream, chunk: Uint8Array, final: boolean): void {
+    const MAX_META_BYTES = 65_536
     if (stream.initiator) {
-      // 应答方 → 发起方：分片 0 = 响应元数据，1+ = 响应体。
+      // 应答方 → 发起方：首段为响应元数据（以 \n 定界，兼容旧单包无 \n JSON），其余为响应体。
       if (!stream.inboundMetaDone) {
-        stream.inboundMetaDone = true
-        const meta = parseResponseMeta(chunk)
-        if (meta === null) {
-          this.abortStream(session, stream, new Error('malformed peer response metadata'))
-          return
+        stream.inboundMetaBuf = stream.inboundMetaBuf.length === 0
+          ? Buffer.from(chunk)
+          : Buffer.concat([stream.inboundMetaBuf, chunk])
+        const nl = stream.inboundMetaBuf.indexOf(0x0a)
+        let meta: ResponseMeta | null = null
+        let remainder: Buffer = Buffer.alloc(0)
+        if (nl >= 0) {
+          meta = parseResponseMeta(stream.inboundMetaBuf.subarray(0, nl))
+          remainder = stream.inboundMetaBuf.subarray(nl + 1)
+          if (meta === null) {
+            this.abortStream(session, stream, new Error('malformed peer response metadata'))
+            return
+          }
+        } else {
+          meta = parseResponseMeta(stream.inboundMetaBuf)
+          if (meta === null) {
+            if (final || stream.inboundMetaBuf.length > MAX_META_BYTES) {
+              this.abortStream(session, stream, new Error('malformed peer response metadata'))
+            }
+            return
+          }
         }
+        stream.inboundMetaDone = true
+        stream.inboundMetaBuf = Buffer.alloc(0)
         stream.responseResolve?.(meta)
         stream.responseResolve = null
-      } else if (stream.bodyController !== null) {
+        if (remainder.length > 0 && stream.bodyController !== null) {
+          enqueueInto(stream.bodyController, remainder)
+        }
+      } else if (stream.bodyController !== null && chunk.byteLength > 0) {
         enqueueInto(stream.bodyController, chunk)
       }
       if (final) {
@@ -713,17 +760,40 @@ export class PeerMux {
       }
       return
     }
-    // 发起方 → 应答方：分片 0 = 请求元数据，1+ = 请求体。
+    // 发起方 → 应答方：首段为请求元数据（以 \n 定界，兼容旧单包无 \n JSON），其余为请求体。
     if (!stream.inboundMetaDone) {
-      stream.inboundMetaDone = true
-      const meta = parseRequestMeta(chunk)
-      if (meta === null) {
-        this.resetStream(session, stream)
-        this.noteDeadStream(session, stream.streamId)
-        return
+      stream.inboundMetaBuf = stream.inboundMetaBuf.length === 0
+        ? Buffer.from(chunk)
+        : Buffer.concat([stream.inboundMetaBuf, chunk])
+      const nl = stream.inboundMetaBuf.indexOf(0x0a)
+      let meta: RequestMeta | null = null
+      let remainder: Buffer = Buffer.alloc(0)
+      if (nl >= 0) {
+        meta = parseRequestMeta(stream.inboundMetaBuf.subarray(0, nl))
+        remainder = stream.inboundMetaBuf.subarray(nl + 1)
+        if (meta === null) {
+          this.resetStream(session, stream)
+          this.noteDeadStream(session, stream.streamId)
+          return
+        }
+      } else {
+        meta = parseRequestMeta(stream.inboundMetaBuf)
+        if (meta === null) {
+          if (final || stream.inboundMetaBuf.length > MAX_META_BYTES) {
+            this.resetStream(session, stream)
+            this.noteDeadStream(session, stream.streamId)
+          }
+          return
+        }
       }
+      stream.inboundMetaDone = true
+      stream.inboundMetaBuf = Buffer.alloc(0)
+      this.options.log?.(`mux: inbound request ${meta.m} ${meta.p} from ${session.nodeId} on stream ${stream.streamId}`)
       this.materializeInboundRequest(session, stream, meta)
-    } else if (stream.req !== null) {
+      if (remainder.length > 0 && stream.req !== null) {
+        stream.req.push(Buffer.from(remainder))
+      }
+    } else if (stream.req !== null && chunk.byteLength > 0) {
       stream.req.push(Buffer.from(chunk))
     }
     if (final && stream.req !== null && !stream.inboundFinished) {
@@ -773,27 +843,11 @@ export class PeerMux {
     session.streams.delete(stream.streamId)
   }
 
-  /** 对端发起了一条流：解析请求元数据并派发进本机 relayHandler。 */
+  /** 对端发起了一条流：建流并交给 onFragment 累积/解析请求元数据与体。 */
   private openInbound(session: MuxSession, streamId: number, chunk: Uint8Array, final: boolean): void {
-    const meta = parseRequestMeta(chunk)
-    if (meta === null) {
-      if (!session.closed) {
-        try { session.arq.reset(streamId) } catch { /* 会话没了 */ }
-      }
-      this.noteDeadStream(session, streamId)
-      return
-    }
     const stream = newStream(streamId, false)
-    // 首包元数据已在上面解析成 meta——置位后后续分片才走「请求体」分支，
-    // 否则 body 分片会被误当元数据再次解析、resetStream 杀掉整条流。
-    stream.inboundMetaDone = true
     session.streams.set(stream.streamId, stream)
-    this.options.log?.(`mux: inbound request ${meta.m} ${meta.p} from ${session.nodeId} on stream ${streamId}`)
-    this.materializeInboundRequest(session, stream, meta)
-    if (final && stream.req !== null) {
-      stream.inboundFinished = true
-      stream.req.push(null)
-    }
+    this.onFragment(session, stream, chunk, final)
   }
 
   /** 构造虚拟 `req`/`res` 并直接调用本机 relayHandler。 */
@@ -807,6 +861,8 @@ export class PeerMux {
       method: meta.m,
       url: meta.p,
       httpVersion: '1.1',
+      httpVersionMajor: 1,
+      httpVersionMinor: 1,
       rawHeaders: [] as string[],
       // 密码学认证后的标记头（PG-8）：E2EE 会话本身就是认证——mux 盖上与网关
       // 标记等价的头，relayHandler 的密钥门照常应答。
@@ -956,41 +1012,33 @@ export class PeerMux {
     }
   }
 
-  /** 响应元数据只发一次，其后是体分片，完结时 FIN。 */
+  /** 响应元数据只发一次，其后是体分片，完结时 FIN（全部同步入 ARQ 队列，严守 FIFO 字节序）。 */
   private writeResponseMetaAndBody(session: MuxSession, stream: MuxStream, chunk: Buffer, fin: boolean): void {
     if (session.closed || session.streams.get(stream.streamId) !== stream) return
     if (!stream.resMetaSent) {
       stream.resMetaSent = true
       const meta = stream.captureHead
       this.options.log?.(`mux: response meta → ${session.nodeId} stream ${stream.streamId} status=${meta?.status}`)
-      const metaJson = Buffer.from(JSON.stringify({
-        t: 'res',
-        s: meta?.status ?? 200,
-        st: meta?.statusText ?? '',
-        h: meta?.headers ?? {},
-      }), 'utf8')
-      const step = session.arq
-        .write(stream.streamId, metaJson)
-        .then(() => (chunk.length > 0 ? session.arq.write(stream.streamId, chunk) : Promise.resolve()))
-        .then(() => {
-          if (fin && !stream.outboundFinished) {
-            stream.outboundFinished = true
-            return session.arq.finish(stream.streamId)
-          }
-          return undefined
-        })
-        .catch(() => {})
-      stream.writeChain = stream.writeChain.then(() => step)
-      return
+      const metaJson = Buffer.from(
+        `${JSON.stringify({
+          t: 'res',
+          s: meta?.status ?? 200,
+          st: meta?.statusText ?? '',
+          h: meta?.headers ?? {},
+        })}\n`,
+        'utf8',
+      )
+      const metaStep = session.arq.write(stream.streamId, metaJson).catch(() => {})
+      stream.writeChain = stream.writeChain.then(() => metaStep)
     }
     if (chunk.length > 0) {
-      const step = session.arq.write(stream.streamId, chunk).catch(() => {})
-      stream.writeChain = stream.writeChain.then(() => step)
+      const bodyStep = session.arq.write(stream.streamId, chunk).catch(() => {})
+      stream.writeChain = stream.writeChain.then(() => bodyStep)
     }
     if (fin && !stream.outboundFinished) {
       stream.outboundFinished = true
-      const step = stream.writeChain.then(() => session.arq.finish(stream.streamId)).catch(() => {})
-      stream.writeChain = step
+      const finStep = session.arq.finish(stream.streamId).catch(() => {})
+      stream.writeChain = stream.writeChain.then(() => finStep)
     }
   }
 
@@ -1000,8 +1048,8 @@ export class PeerMux {
     if (stream.captureParts.length > 0) this.parseCapture(session, stream, true)
     if (!stream.outboundFinished) {
       stream.outboundFinished = true
-      const step = stream.writeChain.then(() => session.arq.finish(stream.streamId)).catch(() => {})
-      stream.writeChain = step
+      const finStep = session.arq.finish(stream.streamId).catch(() => {})
+      stream.writeChain = stream.writeChain.then(() => finStep)
     }
   }
 }
@@ -1013,6 +1061,7 @@ function newStream(streamId: number, initiator: boolean): MuxStream {
     streamId,
     initiator,
     inboundMetaDone: false,
+    inboundMetaBuf: Buffer.alloc(0),
     inboundFinished: false,
     responseResolved: false,
     responseResolve: null,

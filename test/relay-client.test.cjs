@@ -2190,3 +2190,140 @@ test('TA-1 uplink: a one-direction stream still parses unknown lines silently an
     assert.equal(client.state, 'online')
   } finally { await relay.stop() }
 })
+
+test('peer virtual fetchImpl: pluginTunnelOpen and pluginTunnelClose use fetchImpl instead of global fetch and keep state online', async () => {
+  const relay = await startFakeRelay()
+  const TUNNEL_OPEN = '/_dsh/zen-remote/relay/v1/plugin-tunnel/open'
+  const TUNNEL_CLOSE = '/_dsh/zen-remote/relay/v1/plugin-tunnel/close'
+  let tunnelOpened = 0
+  let tunnelClosed = 0
+  const virtualServer = http.createServer((req, res) => {
+    const route = String(req.url).split('?')[0]
+    if (route === HANDSHAKE) {
+      sendJson(res, 200, HANDSHAKE_OK()[1])
+      return
+    }
+    if (route === TUNNEL_OPEN) {
+      tunnelOpened += 1
+      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+      res.write(JSON.stringify({ type: 'open', tunnel: 'tun-peer-1' }) + '\n')
+      res.write(JSON.stringify({ type: 'data', b64: Buffer.from('hello-ws').toString('base64') }) + '\n')
+      res.end(JSON.stringify({ type: 'end' }) + '\n')
+      return
+    }
+    if (route === TUNNEL_CLOSE) {
+      tunnelClosed += 1
+      sendJson(res, 200, { ok: true })
+      return
+    }
+    sendJson(res, 404, { ok: false, error: { code: 'not-found' } })
+  })
+  await new Promise((r) => virtualServer.listen(0, '127.0.0.1', r))
+  const vPort = virtualServer.address().port
+
+  const states = []
+  try {
+    const client = createRelayClient({
+      // Virtual peer hostname that fails OS DNS if global fetch() is called!
+      getServerUrl: () => 'http://zr-peer-abcd1234.virtual',
+      getToken: () => 'tok-peer',
+      infoRefreshMs: 0,
+      fetchImpl: (url, init) => {
+        const rewritten = String(url).replace('http://zr-peer-abcd1234.virtual', `http://127.0.0.1:${vPort}`)
+        return fetch(rewritten, init)
+      },
+    })
+    client.subscribe((s) => states.push(s))
+    await client.connect()
+    assert.equal(client.state, 'online')
+    states.length = 0
+
+    const opened = await client.pluginTunnelOpen({
+      plugin: 'dsh-better-sidebar',
+      version: '1.0.0',
+      digest: '0123456789abcdef',
+      path: '/sidebar/ws/agent-opens',
+      query: '?sessionId=s-1',
+      wsHeaders: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' },
+    })
+    assert.equal(opened.tunnel, 'tun-peer-1')
+    const chunks = []
+    for await (const bytes of opened.frames) {
+      chunks.push(Buffer.from(bytes).toString('utf8'))
+    }
+    assert.deepEqual(chunks, ['hello-ws'])
+
+    await client.pluginTunnelClose('tun-peer-1')
+    assert.equal(tunnelOpened, 1)
+    assert.equal(tunnelClosed, 1)
+    assert.equal(client.state, 'online', 'virtual peer tunnel open/close must never flip client offline')
+    assert.deepEqual(states, [], 'zero state transitions during virtual tunnel open/close')
+  } finally {
+    virtualServer.closeAllConnections()
+    await new Promise((r) => virtualServer.close(r))
+    await relay.stop()
+  }
+})
+
+test('pluginTunnelOpen: caller abort before headers throws RelayError(aborted) without flipping client offline', async () => {
+  const TUNNEL_OPEN = '/_dsh/zen-remote/relay/v1/plugin-tunnel/open'
+  const stalledReqs = []
+  const virtualServer = http.createServer((req, res) => {
+    const route = String(req.url).split('?')[0]
+    if (route === HANDSHAKE) {
+      sendJson(res, 200, HANDSHAKE_OK()[1])
+      return
+    }
+    if (route === TUNNEL_OPEN) {
+      stalledReqs.push({ req, res })
+      // Intentionally stall before writing response headers
+      return
+    }
+    sendJson(res, 404, { ok: false, error: { code: 'not-found' } })
+  })
+  await new Promise((r) => virtualServer.listen(0, '127.0.0.1', r))
+  const vPort = virtualServer.address().port
+
+  const states = []
+  try {
+    const client = createRelayClient({
+      getServerUrl: () => 'http://zr-peer-abcd1234.virtual',
+      getToken: () => 'tok-peer',
+      infoRefreshMs: 0,
+      fetchImpl: (url, init) => {
+        const rewritten = String(url).replace('http://zr-peer-abcd1234.virtual', `http://127.0.0.1:${vPort}`)
+        return fetch(rewritten, init)
+      },
+    })
+    client.subscribe((s) => states.push(s))
+    await client.connect()
+    states.length = 0
+
+    const ac = new AbortController()
+    const pending = client.pluginTunnelOpen(
+      {
+        plugin: 'dsh-better-sidebar',
+        version: '1.0.0',
+        digest: '0123456789abcdef',
+        path: '/sidebar/ws/fs-watch',
+        query: '?sessionId=s-1',
+        wsHeaders: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' },
+      },
+      ac.signal,
+    )
+    await waitFor(() => stalledReqs.length === 1)
+    ac.abort()
+
+    await assert.rejects(
+      pending,
+      (err) => err instanceof RelayError && err.code === 'aborted',
+      'aborting pluginTunnelOpen must surface RelayError(aborted)',
+    )
+    assert.equal(client.state, 'online', 'caller abort on session switch must NOT mark RelayClient offline')
+    assert.deepEqual(states, [])
+  } finally {
+    for (const s of stalledReqs) { try { s.res.destroy() } catch { /* ignore */ } }
+    virtualServer.closeAllConnections()
+    await new Promise((r) => virtualServer.close(r))
+  }
+})

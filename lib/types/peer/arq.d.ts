@@ -131,6 +131,14 @@ export declare class PeerArqSession {
     inflightTotal(): number;
     /** Fragments queued but not yet admitted to the send window. */
     queuedTotal(): number;
+    /**
+     * Immediately retransmit all unacked in-flight fragments and reset their RTO
+     * timers to `rtoMs` (called when a physical path transitions from `'none'` to
+     * ready so fragments queued during initial handshake fly without waiting for
+     * backed-off RTO timers).
+     */
+    flushInflight(): void;
+    private trySendFrame;
     private ensureTx;
     private currentAck;
     private pump;
