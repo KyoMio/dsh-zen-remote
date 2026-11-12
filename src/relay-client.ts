@@ -123,6 +123,34 @@ function invokeTimeoutMs(requestTimeoutMs: number, bodyJson: string): number {
   return sizeBackedTimeoutMs(requestTimeoutMs, Buffer.byteLength(bodyJson, 'utf8'))
 }
 
+/**
+ * The budget one upload round-trip gets (PC-05): the size-backed budget
+ * above, plus — for a peer-virtual client with a KNOWN length — ONE
+ * path-recovery margin. The margin exists because a peer transport's direct
+ * UDP path can die MID-UPLOAD: the engine's loss detection (15 s by
+ * default) then moves the mux session onto the gateway WS relay and the
+ * same request's ARQ fragments resume over the new path — the stream never
+ * notices, but the round-trip budget must outlive the detection window.
+ * It is armed exactly once per upload (the one exchange timer), so no
+ * number of path changes can renew it, the whole upload is never retried,
+ * and the 900 s total cap still binds.
+ */
+export function uploadBudgetMs(requestTimeoutMs: number, bytes: number | undefined, recoveryMarginMs = 0): number {
+  const base = sizeBackedTimeoutMs(requestTimeoutMs, bytes)
+  if (bytes === undefined || recoveryMarginMs <= 0) return base
+  return Math.min(base + recoveryMarginMs, Math.max(requestTimeoutMs, INVOKE_TIMEOUT_CAP_MS))
+}
+
+/**
+ * The production margin the pool's peer-virtual mounts pass ({@link
+ * uploadBudgetMs}): sized to cover the peer transport's direct-loss
+ * detection window (15 s at the punch layer's defaults) plus the WS relay
+ * handshake and the first relayed frames — with a little headroom — so one
+ * mid-upload path death fits inside the same round trip. Internal wiring,
+ * never a user knob.
+ */
+export const PEER_UPLOAD_RECOVERY_MARGIN_MS = 20_000
+
 /** 0 or less disables the periodic refresh entirely (tests that count
  * handshakes inject 0; the T59 refresh test injects the real cadence). */
 function infoRefreshDelay(options: CreateRelayClientOptions): number {
@@ -275,6 +303,15 @@ export interface CreateRelayClientOptions {
    * empty map — every group lands `unavailable`). Absent: `compat` stays
    * undefined and no comparison ever runs (the host role's client, tests). */
   computeOwnFingerprints?: () => Promise<Record<string, string>> | Record<string, string>
+  /**
+   * PC-05: the ONE path-recovery margin added to KNOWN-length upload budgets
+   * ({@link uploadBudgetMs}). Only the pool's peer-virtual mounts pass it —
+   * plain pair() clients leave it unset and keep the T51 budget verbatim
+   * (the internal wiring difference, never a user knob). An unknown length
+   * never gains it (the cap already is the honest budget for an end not in
+   * sight), and it never lifts the 900 s total cap.
+   */
+  uploadRecoveryMarginMs?: number
 }
 
 export interface RelayClient {
@@ -597,6 +634,10 @@ function classifyLine(line: string): LineVerdict {
 export function createRelayClient(options: CreateRelayClientOptions): RelayClient {
   const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+  // PC-05: the peer-virtual wiring passes the production margin; a plain
+  // client leaves it unset. A build-time wiring fact, like the timeouts —
+  // never a volatile row field.
+  const uploadRecoveryMarginMs = options.uploadRecoveryMarginMs ?? 0
   const fetchImpl: typeof fetch = options.fetchImpl ?? ((url, init) => fetch(url, init))
   const clock: RelayClock = options.clock ?? defaultClock
 
@@ -1531,15 +1572,16 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           controller.close()
         },
       })
-    // The budget scales with the DECLARED size (T31-fix's rule); a timeout
-    // deliberately does not move the connection state — a slow upload is a
-    // slow call, not a dead link.
+    // The budget scales with the DECLARED size (T31-fix's rule) and — on a
+    // peer-virtual client — carries the one path-recovery margin (PC-05); a
+    // timeout deliberately does not move the connection state — a slow
+    // upload is a slow call, not a dead link.
     const payload = await exchangeRequest(
       `${creds.url}${UPLOAD_PATH}?${params.toString()}`,
       uploadInit(creds.token, body),
       signal,
       true,
-      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, options.bytes), timeoutSetsOffline: false, transportSetsOffline: false },
+      { timeoutMs: uploadBudgetMs(requestTimeoutMs, options.bytes, uploadRecoveryMarginMs), timeoutSetsOffline: false, transportSetsOffline: false },
     )
     const value = payload.value
     if (

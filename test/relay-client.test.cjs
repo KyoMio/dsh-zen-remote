@@ -15,7 +15,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
-const { createRelayClient, relayCredentialsDigest, volatileUpdateTouchesServerName, RelayError } = require('../lib/relay-client.js')
+const { createRelayClient, relayCredentialsDigest, volatileUpdateTouchesServerName, uploadBudgetMs, PEER_UPLOAD_RECOVERY_MARGIN_MS, RelayError } = require('../lib/relay-client.js')
 
 const HANDSHAKE = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
@@ -139,6 +139,7 @@ function makeClient(port, overrides = {}) {
     getToken: () => token,
     ...(overrides.idleTimeoutMs !== undefined ? { idleTimeoutMs: overrides.idleTimeoutMs } : {}),
     ...(overrides.requestTimeoutMs !== undefined ? { requestTimeoutMs: overrides.requestTimeoutMs } : {}),
+    ...(overrides.uploadRecoveryMarginMs !== undefined ? { uploadRecoveryMarginMs: overrides.uploadRecoveryMarginMs } : {}),
     // T59: handshake-counting tests would see the periodic info refresh as
     // extra handshakes — off unless a test opts in.
     infoRefreshMs: overrides.infoRefreshMs ?? 0,
@@ -692,6 +693,87 @@ test('upload (T51-fix): a mid-flight transport death fails the CALL and leaves t
     assert.equal(client.state, 'online', 'an upload reset never judges the link')
     assert.equal(client.nextRetryAt, null, 'no reconnect was armed for a cut upload')
     assert.equal(client.lastError, 'offline', 'the failure code is still recorded for the diagnostics')
+  } finally { await relay.stop() }
+})
+
+// ---- PC-05: the peer-virtual upload recovery margin -----------------------------
+
+test('PC-05 contract: uploadBudgetMs adds ONE recovery margin to KNOWN lengths, never past the 900 s cap', () => {
+  const MIB = 1024 * 1024
+  // The production margin figure comes from the pool's virtual mount (the
+  // peer transport's direct-loss detection plus the WS relay handshake plus
+  // the relayed leg). The base budget itself stays the T31-fix size rule.
+  assert.equal(uploadBudgetMs(15_000, 2 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 39_000, '2 MiB known length: the 15+4 s size budget + one 20 s margin')
+  assert.equal(uploadBudgetMs(15_000, 2 * MIB, 0), 19_000, 'a zero margin is the plain size budget')
+  assert.equal(uploadBudgetMs(15_000, 2 * MIB), 19_000, 'a plain client: the size budget alone — unchanged')
+  assert.equal(uploadBudgetMs(15_000, undefined, PEER_UPLOAD_RECOVERY_MARGIN_MS), 900_000, 'unknown length: the cap, marginless — the honest budget for an end not in sight')
+  assert.equal(uploadBudgetMs(15_000, 0, PEER_UPLOAD_RECOVERY_MARGIN_MS), 35_000, 'a declared 0 keeps the base + margin (the floor keeps 0 MiB)')
+  assert.equal(uploadBudgetMs(15_000, 430 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 895_000, 'just under the cap the margin shows in full (875 s + 20 s)')
+  assert.equal(uploadBudgetMs(15_000, 435 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 900_000, 'the margin never lifts the 900 s total cap')
+  assert.equal(uploadBudgetMs(15_000, 500 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 900_000, 'a size budget already at the cap stays there')
+})
+
+test('PC-05: a virtual client\'s known-length upload rides out the recovery window; a plain client still times out at the old budget', async () => {
+  // Base 80 ms; the server answers after 200 ms — past the plain budget
+  // (80 ms at a 0 MiB declaration), inside base + injected margin (380 ms).
+  // The margin rides its option seam with a small value so no wall clock
+  // waits the production 20 s: the production figure is pinned by the
+  // contract test above, the real pool wiring by the peer upload e2e.
+  const relay = await startFakeRelay()
+  relay.scenario.upload = (req, res) => {
+    setTimeout(() => { if (!res.destroyed) sendJson(res, 200, RECEIPT_ENVELOPE) }, 200)
+  }
+  try {
+    const plain = makeClient(relay.port, { requestTimeoutMs: 80 })
+    await plain.client.connect()
+    await assert.rejects(
+      () => plain.client.upload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')), bytes: 0 }),
+      (error) => error.code === 'request-timeout',
+      'the plain client keeps the T51 budget — no margin',
+    )
+    const virtual = makeClient(relay.port, { requestTimeoutMs: 80, uploadRecoveryMarginMs: 300 })
+    await virtual.client.connect()
+    const result = await virtual.client.upload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')), bytes: 0 })
+    assert.equal(result.status, 200, 'the virtual client\'s known-length upload survived the recovery window')
+    assert.equal(virtual.client.state, 'online')
+  } finally { await relay.stop() }
+})
+
+test('PC-05: the margin is armed once — a stalled virtual upload fails bounded at base+margin, one fetch, no retry', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.upload = () => undefined // stalls forever
+  try {
+    const { client } = makeClient(relay.port, { requestTimeoutMs: 100, uploadRecoveryMarginMs: 400 })
+    await client.connect()
+    const start = Date.now()
+    await assert.rejects(
+      () => client.upload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')), bytes: 0 }),
+      (error) => error.code === 'request-timeout',
+    )
+    const elapsed = Date.now() - start
+    assert.ok(elapsed >= 500, `the deadline includes the margin (got ${elapsed} ms)`)
+    assert.ok(elapsed < 1500, `the deadline was armed ONCE — no renewal past base+margin (got ${elapsed} ms)`)
+    assert.equal(relay.seen.filter((hit) => hit.url === UPLOAD).length, 1, 'no whole-upload retry behind the caller\'s back')
+    assert.equal(client.state, 'online', 'a bounded upload timeout never judges the link')
+    assert.equal(client.nextRetryAt, null, 'no reconnect was armed for a slow upload')
+    assert.equal(client.lastError, 'request-timeout')
+  } finally { await relay.stop() }
+})
+
+test('PC-05: an active cancel still lands immediately — the margin never delays a caller abort', async () => {
+  const relay = await startFakeRelay()
+  relay.scenario.upload = () => undefined // stalls forever
+  try {
+    const { client } = makeClient(relay.port, { requestTimeoutMs: 100, uploadRecoveryMarginMs: 400 })
+    await client.connect()
+    const abort = new AbortController()
+    const start = Date.now()
+    const pending = client.upload({ sessionId: 'session-a', body: byteStreamOf(Buffer.from('x')), bytes: 0 }, abort.signal)
+    setTimeout(() => abort.abort(), 50)
+    await assert.rejects(() => pending, (error) => error.code === 'aborted')
+    const elapsed = Date.now() - start
+    assert.ok(elapsed < 450, `the cancel landed inside the deadline window, not at it (got ${elapsed} ms)`)
+    assert.equal(client.state, 'online', 'a caller abort never judges the link')
   } finally { await relay.stop() }
 })
 

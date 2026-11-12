@@ -47,6 +47,28 @@
 import type { RelayCompatVerdict } from './fingerprint.js';
 import type { ServerPluginEntry } from './plugin-bridge.js';
 /**
+ * The budget one upload round-trip gets (PC-05): the size-backed budget
+ * above, plus — for a peer-virtual client with a KNOWN length — ONE
+ * path-recovery margin. The margin exists because a peer transport's direct
+ * UDP path can die MID-UPLOAD: the engine's loss detection (15 s by
+ * default) then moves the mux session onto the gateway WS relay and the
+ * same request's ARQ fragments resume over the new path — the stream never
+ * notices, but the round-trip budget must outlive the detection window.
+ * It is armed exactly once per upload (the one exchange timer), so no
+ * number of path changes can renew it, the whole upload is never retried,
+ * and the 900 s total cap still binds.
+ */
+export declare function uploadBudgetMs(requestTimeoutMs: number, bytes: number | undefined, recoveryMarginMs?: number): number;
+/**
+ * The production margin the pool's peer-virtual mounts pass ({@link
+ * uploadBudgetMs}): sized to cover the peer transport's direct-loss
+ * detection window (15 s at the punch layer's defaults) plus the WS relay
+ * handshake and the first relayed frames — with a little headroom — so one
+ * mid-upload path death fits inside the same round trip. Internal wiring,
+ * never a user knob.
+ */
+export declare const PEER_UPLOAD_RECOVERY_MARGIN_MS = 20000;
+/**
  * The clock face the reconnect machinery runs on: wall time, timers and the
  * jitter source. Injectable so tests drive the whole backoff sequence
  * deterministically. The default timers are `unref()`ed — a pending retry
@@ -146,6 +168,15 @@ export interface CreateRelayClientOptions {
      * empty map — every group lands `unavailable`). Absent: `compat` stays
      * undefined and no comparison ever runs (the host role's client, tests). */
     computeOwnFingerprints?: () => Promise<Record<string, string>> | Record<string, string>;
+    /**
+     * PC-05: the ONE path-recovery margin added to KNOWN-length upload budgets
+     * ({@link uploadBudgetMs}). Only the pool's peer-virtual mounts pass it —
+     * plain pair() clients leave it unset and keep the T51 budget verbatim
+     * (the internal wiring difference, never a user knob). An unknown length
+     * never gains it (the cap already is the honest budget for an end not in
+     * sight), and it never lifts the 900 s total cap.
+     */
+    uploadRecoveryMarginMs?: number;
 }
 export interface RelayClient {
     readonly state: RelayState;
