@@ -2099,3 +2099,141 @@ async function waitForNatRecord(gw, nodeId, timeoutMs) {
     await sleep(25);
   }
 }
+
+describe('PC-03 fix2：初次入网认证的成员代次守卫', () => {
+  /** 在 C 的 upsertMemberJoinAttempt 之后拦住下一次 findUserById（认证末端
+   * owner 复查的 await 窗口），返回 { gateEntered, release }。 */
+  function gateAuthAtOwnerCheck(gw) {
+    const origFind = gw.store.findUserById.bind(gw.store);
+    const origUpsert = gw.store.upsertMemberJoinAttempt.bind(gw.store);
+    let sawUpsert = false;
+    let gateEntered = false;
+    let release = null;
+    const gated = new Promise((resolve) => { release = resolve; });
+    let gateConsumed = false;
+    gw.store.upsertMemberJoinAttempt = async (input) => { sawUpsert = true; return origUpsert(input); };
+    gw.store.findUserById = async (id) => {
+      if (sawUpsert && !gateConsumed) {
+        gateConsumed = true;
+        gateEntered = true;
+        await gated;
+      }
+      return origFind(id);
+    };
+    return {
+      gateEntered: () => gateEntered,
+      release,
+    };
+  }
+
+  test('认证在途时 pause——过期快照不落地；重连按最新授权受限挂起，resume 原地恢复', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, wsA } = await setupPair(gw);
+      const gate = gateAuthAtOwnerCheck(gw);
+
+      // C 凭邀请口令入网（自动准入）：upsert 落库 authorized 后挂在末端 owner 复查闸内
+      const c = identity();
+      const wsC = await wsOpen(gw.base);
+      t.after(() => wsC.close());
+      await authNode(wsC, c, { networkId: net.id, joinKey: net.joinKey, name: 'charlie', pauseHold: true });
+      for (let i = 0; i < 100 && !gate.gateEntered(); i++) await sleep(10);
+      assert.ok(gate.gateEntered(), '认证未进入末端 owner 复查窗口');
+
+      // 交错：管理员正常 pause（C 已落库 authorized → paused；尚未落地成连接）
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${c.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
+
+      // 释放闸：handleAuth 同步复核代次——静默关闭，不按旧 authorized 注册
+      gate.release();
+      await wsClosed(wsC, { timeoutMs: 2000 });
+      assert.equal(wsC.__textQueue.length, 0, '不得有旧 authorized welcome');
+      const topo = await getTopology(gw, net.id);
+      assert.equal(topo.members.find((m) => m.nodeId === c.nodeId).status, 'paused');
+      assert.equal(topo.members.find((m) => m.nodeId === c.nodeId).online, false, '过期认证不进业务路由');
+      assert.equal(topo.summary.onlineDevices, 2, '在线的仍是原有 A、B');
+
+      // C 重连（pauseHold）：按最新持久授权受限挂起，resume 后原地恢复
+      const wsC2 = await wsOpen(gw.base);
+      t.after(() => wsC2.close());
+      await authNode(wsC2, c, { networkId: net.id, joinKey: net.joinKey, name: 'charlie', pauseHold: true });
+      const held = await wsJson(wsC2);
+      assert.equal(held.type, 'welcome');
+      assert.equal(held.status, 'paused');
+      const res2 = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${c.nodeId}/resume`, { cookie: gw.tenantCookie });
+      assert.equal(res2.status, 200, JSON.stringify(res2.json));
+      const resumed = await wsJson(wsC2, { timeoutMs: 2000 });
+      assert.equal(resumed.type, 'welcome');
+      assert.equal(resumed.status, 'authorized');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('认证在途时 remove——旧认证不落地、不把已删成员写回；全新入网由 store 重新判定', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net } = await setupPair(gw);
+      const gate = gateAuthAtOwnerCheck(gw);
+
+      const c = identity();
+      const wsC = await wsOpen(gw.base);
+      t.after(() => wsC.close());
+      await authNode(wsC, c, { networkId: net.id, joinKey: net.joinKey, name: 'charlie' });
+      for (let i = 0; i < 100 && !gate.gateEntered(); i++) await sleep(10);
+      assert.ok(gate.gateEntered(), '认证未进入末端 owner 复查窗口');
+
+      const delRes = await api(gw.base, 'DELETE', `/api/v1/networks/${net.id}/members/${c.nodeId}`, { cookie: gw.tenantCookie });
+      assert.equal(delRes.status, 200, JSON.stringify(delRes.json));
+
+      gate.release();
+      await wsClosed(wsC, { timeoutMs: 2000 });
+      assert.equal(wsC.__textQueue.length, 0, '不得有旧 authorized welcome');
+      const topo = await getTopology(gw, net.id);
+      assert.equal(topo.members.some((m) => m.nodeId === c.nodeId), false, '已删除成员不在成员表');
+      assert.equal(topo.summary.onlineDevices, 2, '在线的仍是原有 A、B，旧认证不进业务路由');
+
+      // 全新入网（合法凭证）：store 按已删除重新判定，与旧认证复活无关
+      const wsC2 = await wsOpen(gw.base);
+      t.after(() => wsC2.close());
+      await authNode(wsC2, c, { networkId: net.id, joinKey: net.joinKey, name: 'charlie' });
+      const fresh = await wsJson(wsC2);
+      assert.equal(fresh.type, 'welcome');
+      assert.equal(fresh.status, 'authorized');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('无关成员的 pause 不影响在途认证（成员代次按成员隔离）', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, b, wsA, wsB } = await setupPair(gw);
+      const gate = gateAuthAtOwnerCheck(gw);
+
+      const c = identity();
+      const wsC = await wsOpen(gw.base);
+      t.after(() => wsC.close());
+      await authNode(wsC, c, { networkId: net.id, joinKey: net.joinKey, name: 'charlie', pauseHold: true });
+      for (let i = 0; i < 100 && !gate.gateEntered(); i++) await sleep(10);
+      assert.ok(gate.gateEntered(), '认证未进入末端 owner 复查窗口');
+
+      // 交错 pause 的是另一个成员 B（在线，降级受限保留）
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
+      assert.equal((await wsJson(wsB)).type, 'paused');
+      assert.equal((await wsJson(wsA)).type, 'peer-paused');
+
+      // C 的认证不受无关 pause 影响：正常完成注册
+      gate.release();
+      const welcome = await wsJson(wsC, { timeoutMs: 2000 });
+      assert.equal(welcome.type, 'welcome');
+      assert.equal(welcome.status, 'authorized');
+      const topo = await getTopology(gw, net.id);
+      assert.equal(topo.members.find((m) => m.nodeId === c.nodeId).status, 'authorized');
+      assert.equal(topo.summary.onlineDevices, 2, 'A 与 C 在线，B 受限挂起');
+    } finally {
+      await gw.close();
+    }
+  });
+});
