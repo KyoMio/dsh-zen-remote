@@ -159,10 +159,14 @@ for (const delayedReply of [true, false]) {
     f.connect(id, false); await tick();
     if (pending) { finish(); await pending; }
     else await udp.handlePacket(socket, 'alt', packet, remote);
-    assert.equal(observations.length, 0, 'old generation must not affect the replacement connection');
+    // PC-02：旧代次的主口探测在其连接仍存活时已即时发布一条 unknown（唯一一条）；
+    // 旧代次的在途/迟到辅助口探测不得对替换连接产生任何分类
+    assert.equal(observations.length, 1, 'old generation must not affect the replacement connection beyond its own primary publication');
+    assert.equal(observations[0].natType, 'unknown');
     await udp.handlePacket(socket, 'alt', packet, remote);
     await udp.handlePacket(socket, 'primary', packet, remote);
-    assert.equal(observations.length, 1, 'two observations in the new generation still classify');
+    assert.equal(observations.length, 2, 'new generation still classifies on top of the old generation primary publication');
+    assert.equal(observations[1].natType, 'cone');
   });
 }
 
@@ -178,6 +182,9 @@ test('UDP admission rejects disconnected identity and disable during send suppre
   let finish;
   const pending = udp.handlePacket({ send(reply, port, ip, cb) { sent.push(reply); finish = cb; } }, 'alt', packet, remote);
   await f.disable(); finish(); await pending;
-  assert.equal(observations.length, 0);
+  // PC-02：唯一观察是断开前主口探测即时发布的那条 unknown；禁用瞬间的在途
+  // 辅助口探测必须被代次守卫拦下（无新观察）
+  assert.equal(observations.length, 1);
+  assert.equal(observations[0].natType, 'unknown');
   await udp.handlePacket(socket, 'primary', packet, remote); assert.equal(sent.length, 2);
 });

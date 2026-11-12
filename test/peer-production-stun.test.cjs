@@ -50,7 +50,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 async function eventually(predicate, ms = 1500, what = 'condition') {
   const start = Date.now()
   for (;;) {
-    if (predicate()) return
+    // PC-02-fix1：await 谓词结果（同步谓词返回值照常等待）；总 deadline 不变。
+    // 此前 `if (predicate())` 对 async 谓词永真（Promise 恒真值），首轮即假通过。
+    if (await predicate()) return
     if (Date.now() - start > ms) throw new Error(`eventually timeout: ${what}`)
     await sleep(25)
   }
@@ -180,6 +182,18 @@ async function startBareNode(gateway, { udpProbe } = {}) {
 }
 
 const authorizedWelcome = (extra = {}) => ({ type: 'welcome', status: 'authorized', maxPeers: 8, peers: [], ...extra })
+
+test('PC-02-fix1: waitFor 对 async 谓词真实轮询——false→true 必须被多次调用', async (t) => {
+  let calls = 0
+  const startedAt = Date.now()
+  const flaky = async () => {
+    calls += 1
+    return calls >= 3 // 前两次 false，第三次才 true
+  }
+  await waitFor(flaky, 2000, 'async predicate flips to true')
+  assert.ok(calls >= 3, `async 谓词必须被多次调用后才通过（实际 ${calls} 次）`)
+  assert.ok(Date.now() - startedAt >= 50, '等待必须经历真实时间，不是首拍即过')
+})
 
 // ---------------------------------------------------------------- 引擎边界用例
 
@@ -744,6 +758,180 @@ test('PC-01b 生产接线: 真实 startGateway 下发 stun 端口 → 缺省引�
   assert.equal(typeof abRtt, 'number', '直连会话有 RTT')
 
   // 4) 直连可用：B 挂载 A 的虚拟条目并跨直连取到 A 的共享会话
+  await waitFor(() => {
+    const entry = B.relayPool.getByServerId(A.identity.nodeId)
+    return entry !== undefined && entry.client.state === 'online'
+  }, 15000, 'B mounted A online')
+  const virtualAonB = B.relayPool.getByServerId(A.identity.nodeId)
+  const listed = await virtualAonB.client.invoke('session', 'list', { request: {} })
+  assert.ok(
+    Array.isArray(listed.items) && listed.items.some((item) => item.sessionId === 's-a1'),
+    '直连路径上取到 A 的共享会话',
+  )
+})
+
+test('PC-02 生产接线: 辅助口关闭——主口发布反射端点(unknown)，无LAN候选仍建立可用直连', async (t) => {
+  const dataDir = path.join(SCRATCH, `gw-${randomHex(4)}`)
+  fs.mkdirSync(dataDir, { recursive: true })
+  const gw = await startGateway({
+    port: 0,
+    udpAltPort: 0, // PC-02 受试场景：配置层 0 = 辅助口关闭（组合根映射成 null）
+    publicUrl: undefined,
+    dataDir,
+    databaseUrl: undefined,
+    adminUser: ADMIN_EMAIL,
+    adminPassword: ADMIN_PASSWORD,
+    allowSignup: false,
+    defaultMaxPeers: 8,
+    maxNetworksPerUser: 3,
+    relayRateKbps: 1024,
+  })
+  const nodes = []
+  t.after(async () => {
+    for (const node of nodes.splice(0)) node.stop()
+    await gw.close()
+  })
+  assert.equal(gw.udpPorts.altPort, null, '夹具确认辅助口已关闭')
+  const cookie = await login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD)
+  const netRes = await api(gw.base, 'POST', '/api/v1/networks', {
+    body: { name: `net-pc02-${randomHex(3)}`, admissionMode: 'key' },
+    cookie,
+  })
+  assert.equal(netRes.status, 200, JSON.stringify(netRes.json))
+  const net = netRes.json.data
+  const invite = `zr-net+insecure://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
+
+  const A = await startProdNode('pc02-a', { shared: ['s-a1'] })
+  const B = await startProdNode('pc02-b')
+  nodes.push(A, B)
+  await A.engine.joinNetwork(invite)
+  await eventually(() => A.engine.status().gatewayState === 'authorized', 8000, 'A authorized')
+  await B.engine.joinNetwork(invite)
+  await eventually(() => B.engine.status().gatewayState === 'authorized', 8000, 'B authorized')
+
+  // 1) 引擎侧：welcome 只有主口 → 单口自查结论 unknown（探测真的发生了：
+  //    null 是从未探测，unknown 是查过、辅助口缺席——PC-01b 既有语义）
+  await eventually(() => A.engine.status().natType === 'unknown', 8000, 'A single-port self-check unknown')
+  await eventually(() => B.engine.status().natType === 'unknown', 8000, 'B single-port self-check unknown')
+
+  // 2) 网关侧（PC-02 受试断言）：仅主口观察也必须登记反射端点并发布坐标——
+  //    拓扑行 lastIp 落地、hub 内连接的 reflexive 可用（helper 修复后
+  //    async 谓词真实轮询）
+  await waitFor(async () => {
+    const topo = await api(gw.base, 'GET', `/api/v1/networks/${net.id}/topology`, { cookie })
+    assert.equal(topo.status, 200)
+    const rows = topo.json.data.members ?? []
+    return [A, B].every((node) => {
+      const row = rows.find((m) => m.nodeId === node.identity.nodeId)
+      return row !== undefined && row.natType === 'unknown' && row.lastIp === '127.0.0.1'
+    })
+  }, 8000, 'gateway published both primary-only reflexive endpoints')
+  for (const node of [A, B]) {
+    const conn = gw.hub.conns.get(net.id)?.get(node.identity.nodeId)
+    assert.ok(conn?.reflexive, `hub 已登记 ${node.name} 的反射端点`)
+    assert.equal(conn.reflexive.ip, '127.0.0.1')
+  }
+
+  // 3) 直连形成：主口反射端点是回环绑定 socket 的唯一可达候选——
+  //    只有主口发布也必须能建立直连（现状：无端点发布 → 无候选 → 不直连）
+  await waitFor(() => {
+    const peer = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+    return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
+  }, 15000, 'A↔B direct path with alt port disabled')
+  const abRtt = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId).rttMs
+  assert.equal(typeof abRtt, 'number', '直连会话有 RTT')
+
+  // 4) 直连可用：B 挂载 A 并跨直连取到 A 的共享会话
+  await waitFor(() => {
+    const entry = B.relayPool.getByServerId(A.identity.nodeId)
+    return entry !== undefined && entry.client.state === 'online'
+  }, 15000, 'B mounted A online')
+  const virtualAonB = B.relayPool.getByServerId(A.identity.nodeId)
+  const listed = await virtualAonB.client.invoke('session', 'list', { request: {} })
+  assert.ok(
+    Array.isArray(listed.items) && listed.items.some((item) => item.sessionId === 's-a1'),
+    '直连路径上取到 A 的共享会话',
+  )
+})
+
+test('PC-02-fix1 生产接线: 辅助口真实开启且公布但探测被丢弃——主口发布反射端点(unknown)，无LAN候选仍直连可用', async (t) => {
+  const dataDir = path.join(SCRATCH, `gw-${randomHex(4)}`)
+  fs.mkdirSync(dataDir, { recursive: true })
+  const gw = await startGateway({
+    port: 0,
+    udpAltPort: await reserveUdpPort(), // 辅助口真实绑定（区别于「配置关闭」场景）
+    publicUrl: undefined,
+    dataDir,
+    databaseUrl: undefined,
+    adminUser: ADMIN_EMAIL,
+    adminPassword: ADMIN_PASSWORD,
+    allowSignup: false,
+    defaultMaxPeers: 8,
+    maxNetworksPerUser: 3,
+    relayRateKbps: 1024,
+  })
+  const nodes = []
+  // 测试边界：摘掉已绑定辅助 socket 的 message 监听器（保存/t.after 恢复），
+  // 辅助口探测在本测试实例内被丢弃——对网关与真实网络丢包不可区分。
+  // 不改生产源码、不动系统防火墙，仅控制本测试实例。
+  const altSocket = gw.udp.alt
+  assert.ok(altSocket != null, '网关辅助 UDP socket 已绑定')
+  assert.notEqual(gw.udpPorts.altPort, null, '辅助端口已公布（welcome.stun.altPort 非 null）')
+  const savedAltListeners = altSocket.listeners('message')
+  altSocket.removeAllListeners('message')
+  t.after(async () => {
+    for (const listener of savedAltListeners) altSocket.on('message', listener)
+    for (const node of nodes.splice(0)) node.stop()
+    await gw.close()
+  })
+  const cookie = await login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD)
+  const netRes = await api(gw.base, 'POST', '/api/v1/networks', {
+    body: { name: `net-fix1deaf-${randomHex(3)}`, admissionMode: 'key' },
+    cookie,
+  })
+  assert.equal(netRes.status, 200, JSON.stringify(netRes.json))
+  const net = netRes.json.data
+  const invite = `zr-net+insecure://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
+
+  const A = await startProdNode('fix1deaf-a', { shared: ['s-a1'] })
+  const B = await startProdNode('fix1deaf-b')
+  nodes.push(A, B)
+  await A.engine.joinNetwork(invite)
+  await eventually(() => A.engine.status().gatewayState === 'authorized', 8000, 'A authorized')
+  await B.engine.joinNetwork(invite)
+  await eventually(() => B.engine.status().gatewayState === 'authorized', 8000, 'B authorized')
+
+  // 1) 引擎侧：welcome 双口 → 引擎两端口都探测；主口应答、辅口（被丢弃）无应答
+  //    → 引擎自查 unknown（需过其探测截止，unknown 是「查过、辅口未答」）
+  await eventually(() => A.engine.status().natType === 'unknown', 8000, 'A self-check unknown')
+  await eventually(() => B.engine.status().natType === 'unknown', 8000, 'B self-check unknown')
+
+  // 2) 网关侧：仅主口观察也必须登记反射端点并发布坐标（helper 已修复，
+  //    async 谓词真实轮询拓扑）
+  await waitFor(async () => {
+    const topo = await api(gw.base, 'GET', `/api/v1/networks/${net.id}/topology`, { cookie })
+    assert.equal(topo.status, 200)
+    const rows = topo.json.data.members ?? []
+    return [A, B].every((node) => {
+      const row = rows.find((m) => m.nodeId === node.identity.nodeId)
+      return row !== undefined && row.natType === 'unknown' && row.lastIp === '127.0.0.1'
+    })
+  }, 8000, 'gateway published primary-only reflexive endpoints with deaf alt port')
+  for (const node of [A, B]) {
+    const conn = gw.hub.conns.get(net.id)?.get(node.identity.nodeId)
+    assert.ok(conn?.reflexive, `hub 已登记 ${node.name} 的反射端点`)
+    assert.equal(conn.reflexive.ip, '127.0.0.1')
+  }
+
+  // 3) 直连形成：主口反射端点是回环绑定 socket 的唯一可达候选
+  await waitFor(() => {
+    const peer = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+    return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
+  }, 15000, 'A↔B direct path with deaf alt port')
+  const abRtt = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId).rttMs
+  assert.equal(typeof abRtt, 'number', '直连会话有 RTT')
+
+  // 4) 直连可用：B 挂载 A 并跨直连取到 A 的共享会话
   await waitFor(() => {
     const entry = B.relayPool.getByServerId(A.identity.nodeId)
     return entry !== undefined && entry.client.state === 'online'

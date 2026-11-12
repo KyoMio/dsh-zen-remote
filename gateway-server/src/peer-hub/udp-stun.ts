@@ -11,6 +11,13 @@
 //   反射 ip 一致而 port 不同（或 ip 也变）  → 'symmetric'（每目标新映射，
 //                                             打洞命中率极低，走中继为主）
 //
+// PC-02：主口观察是路由反射端点的唯一事实来源——主口回包即发布端点，不必等
+// 辅口配对（未配对时 natType='unknown'，辅口稍后返回再补充分类且端点仍取主口
+// 观察）；只辅助口可达只记槽位等主口，绝不冒充主口端点。分类只来自**当前
+// 新鲜**的主辅配对：两端口观察同代（同一连接准入 token）且都在 windowMs 内
+// 才判定；过窗后的仅主口观察诚实降级 unknown——不与签名时间戳容忍窗口
+// （timestampWindowMs）耦合，不设跨窗口的分类缓存。
+//
 // 判定结果经 onNatDetected 回调交给 ws-hub（更新内存端点与 natType、排入
 // 遥测刷盘、推控制台 SSE）。解析失败的包静默丢弃——UDP 上垃圾是常态。
 import { createSocket } from 'node:dgram';
@@ -23,7 +30,7 @@ export type ServerPortRole = 'primary' | 'alt';
 export interface NatObservation {
   networkId: string;
   nodeId: string;
-  natType: 'cone' | 'symmetric' | 'public';
+  natType: 'cone' | 'symmetric' | 'public' | 'unknown';
   reflexiveIp: string;
   reflexivePort: number;
   serverPortRole: ServerPortRole;
@@ -32,9 +39,10 @@ export interface NatObservation {
 export interface UdpStunOptions {
   /** 主 UDP 端口（0 交由内核分配——测试用） */
   primaryPort: number;
-  /** 辅助 UDP 端口：null/undefined = 不开辅助口（单口也能应答，只是判不出
-   *  NAT 类型）；0 = 内核分配随机端口；正数 = 固定端口。配置层
-   * `udpAltPort === 0 表示关闭` 的语义由组合根映射成 null */
+  /** 辅助 UDP 端口：null/undefined = 不开辅助口（主口探测照常应答并立即发布
+   *  反射端点，natType=unknown，判不出 NAT 分类）；0 = 内核分配随机端口；
+   *  正数 = 固定端口。配置层 `udpAltPort === 0 表示关闭` 的语义由组合根映射成
+   *  null */
   altPort?: number | null;
   /** 绑定地址，默认 '0.0.0.0' */
   host?: string;
@@ -60,6 +68,13 @@ interface ProbeSlot {
   port: number;
 }
 
+/** 一个 (networkId|nodeId) 的双端口探测槽位；NAT 分类只由当前新鲜的主辅
+ *  配对现场计算，无跨窗口缓存（PC-02 fix1） */
+interface SlotEntry {
+  primary?: ProbeSlot;
+  alt?: ProbeSlot;
+}
+
 const MAX_PACKET_BYTES = 1024;
 
 export class UdpStunService {
@@ -70,8 +85,8 @@ export class UdpStunService {
   private readonly standaloneAdmission = Symbol();
   private primary: Socket | null = null;
   private alt: Socket | null = null;
-  /** (networkId|nodeId) → 主/辅两个端口最近一次探测 */
-  private readonly slots = new Map<string, { primary?: ProbeSlot; alt?: ProbeSlot }>();
+  /** (networkId|nodeId) → 主/辅两个端口最近一次探测与代次内已判出的分类 */
+  private readonly slots = new Map<string, SlotEntry>();
 
   constructor(options: UdpStunOptions) {
     this.options = options;
@@ -159,10 +174,19 @@ export class UdpStunService {
     this.classify(networkId, nodeId, role, rinfo.address, rinfo.port, admission);
   }
 
-  /** 记录本次探测并与另一端口短窗口内的上次探测比对，判定 NAT 类型 */
+  /**
+   * 记录本次探测并发布 NAT 观察（PC-02）：
+   *
+   * - 主口观察：路由反射端点的唯一事实来源，无论辅口是否配对都立即发布——
+   *   配对成功发布 cone/public/symmetric，未配对发布 unknown。
+   * - 辅助口观察：只记槽位等主口配对；配对成功补充分类，端点仍取主口观察，
+   *   绝不冒充主口端点发布。
+   * - 配对要求：两端口观察同代（同一连接准入 token）且都在窗口内（fix1：
+   *   分类无跨窗口缓存，过窗即诚实降级 unknown）。
+   */
   private classify(networkId: string, nodeId: string, role: ServerPortRole, ip: string, port: number, admission: symbol): void {
     const key = `${networkId}|${nodeId}`;
-    const entry = this.slots.get(key) ?? {};
+    const entry: SlotEntry = this.slots.get(key) ?? {};
     const now = this.now();
     // 惰性清扫：条目一多就顺手裁掉窗口外的，防长期运行内存缓涨
     if (this.slots.size > 1024) {
@@ -175,19 +199,44 @@ export class UdpStunService {
     entry[role] = { admission, at: now, ip, port };
     this.slots.set(key, entry);
 
-    const otherRole: ServerPortRole = role === 'primary' ? 'alt' : 'primary';
-    const other = entry[otherRole];
-    if (other === undefined || other.admission !== admission || now - other.at > this.windowMs) return;
-
-    const sameIp = other.ip === ip;
-    const samePort = other.port === port;
-    let natType: 'cone' | 'symmetric' | 'public';
-    if (sameIp && samePort) {
-      const lan = this.options.lanEndpointsLookup?.(networkId, nodeId) ?? [];
-      natType = lan.includes(`${ip}:${port}`) ? 'public' : 'cone';
-    } else {
-      natType = 'symmetric';
+    const primary = entry['primary'];
+    const alt = entry['alt'];
+    if (
+      primary === undefined || alt === undefined ||
+      primary.admission !== alt.admission ||
+      now - primary.at > this.windowMs ||
+      now - alt.at > this.windowMs
+    ) {
+      // 未配对（缺另一口 / 跨代次 / 超窗）。只辅助口可达不发布——等主口；
+      // 主口立即发布（反射端点是路由事实，分类未定时 natType=unknown）
+      if (role !== 'primary') return;
+      this.publish(networkId, nodeId, 'unknown', ip, port, role);
+      return;
     }
+
+    const natType = this.comparePair(networkId, nodeId, primary, alt);
+    // 反射端点一律取主口观察（NAT 分类才比较主辅结果）
+    this.publish(networkId, nodeId, natType, primary.ip, primary.port, role);
+  }
+
+  /** 主辅两次反射比对判定 NAT 类型（判定口径不变） */
+  private comparePair(networkId: string, nodeId: string, primary: ProbeSlot, alt: ProbeSlot): 'cone' | 'symmetric' | 'public' {
+    if (primary.ip === alt.ip && primary.port === alt.port) {
+      const lan = this.options.lanEndpointsLookup?.(networkId, nodeId) ?? [];
+      return lan.includes(`${primary.ip}:${primary.port}`) ? 'public' : 'cone';
+    }
+    return 'symmetric';
+  }
+
+  /** 发布一条 NAT 观察；观察方故障不影响 UDP 服务 */
+  private publish(
+    networkId: string,
+    nodeId: string,
+    natType: NatObservation['natType'],
+    ip: string,
+    port: number,
+    role: ServerPortRole,
+  ): void {
     try {
       this.options.onNatDetected({
         networkId,
