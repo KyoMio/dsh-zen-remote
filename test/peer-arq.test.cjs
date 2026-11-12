@@ -23,6 +23,22 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const { createHash, randomBytes } = require('node:crypto')
+const { registerHooks, stripTypeScriptTypes } = require('node:module')
+const { existsSync, readFileSync } = require('node:fs')
+const { fileURLToPath } = require('node:url')
+registerHooks({
+  resolve(specifier, context, next) {
+    if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL?.startsWith('file:')) {
+      const url = new URL(specifier.replace(/\.js$/, '.ts'), context.parentURL)
+      if (existsSync(url)) return { url: url.href, shortCircuit: true }
+    }
+    return next(specifier, context)
+  },
+  load(url, context, next) {
+    if (url.endsWith('.ts')) return { format: 'module', shortCircuit: true, source: stripTypeScriptTypes(readFileSync(fileURLToPath(url), 'utf8'), { mode: 'transform' }) }
+    return next(url, context)
+  },
+})
 
 const {
   PeerArqSession,
@@ -33,7 +49,7 @@ const {
   ARQ_DEFAULT_WINDOW,
   ARQ_DEFAULT_RTO_MS,
   ARQ_DEFAULT_RTO_MAX_MS,
-} = require('../lib/peer/arq.js')
+} = require('../src/peer/arq.ts')
 const {
   PeerFrameType,
   packEncryptedFrame,
@@ -42,12 +58,12 @@ const {
   PEER_MAX_FRAME_BYTES,
   PEER_HEADER_BYTES,
   PEER_AEAD_TAG_BYTES,
-} = require('../lib/peer/wire.js')
+} = require('../src/peer/wire.ts')
 const {
   generatePeerIdentity,
   generateEphemeralX25519,
   derivePeerSessionCiphers,
-} = require('../lib/peer/crypto.js')
+} = require('../src/peer/crypto.ts')
 
 // -- harness helpers -------------------------------------------------------------
 
@@ -577,14 +593,18 @@ test('reset() aborts the send side, rejects pending writes, and the receiver dro
   assert.equal(rst.frameType, PeerFrameType.RST)
   assert.equal(rst.streamId, 1)
   clock.advance(1000)
-  assert.equal(sent.length, 2, 'no RTO timers survive the reset')
+  assert.ok(sent.length > 2, 'RST retries until acknowledged')
+  assert.equal(sent.filter(f => f.frameType === PeerFrameType.DATA).length, 1, 'DATA timers stop on reset')
+  session.handleFrame(PeerFrameType.RST, 1, Buffer.from([2]), 0)
+  assert.equal(clock.pendingCount(), 0)
   // Receiver tears down: reset callback fired, stale buffered fragment dropped.
   receiver.handleFrame(PeerFrameType.RST, 1, Buffer.alloc(0), 0)
   assert.equal(receiverResetWith, 1)
   assert.equal(receiverAssembler.chunkCount(1), 0, 'buffered fragment discarded by the reset')
-  // A fresh fragment on the same streamId starts a clean stream epoch.
+  // A stream ID belongs to one epoch for the entire session, including legacy retries.
   receiver.handleFrame(PeerFrameType.DATA, 1, sent[0].payload, 0)
-  assert.equal(receiverAssembler.chunkCount(1), 1, 'new epoch delivers seq 0 again')
+  assert.equal(receiverAssembler.chunkCount(1), 0, 'retired IDs never resurrect')
+  session.closeAll(); receiver.closeAll()
 })
 
 // -- 7. closeAll -------------------------------------------------------------------
@@ -700,13 +720,15 @@ test('10 MiB across two concurrent streams survives 20% loss + reorder and a mid
       await sleep(50)
     }
   })()
-  await Promise.all([
-    sessionA.write(1, buf1),
-    sessionA.finish(1),
-    sessionA.write(2, buf2),
-    sessionA.finish(2),
-    finalBoth,
-  ])
+  async function sendLarge(id, bytes) {
+    for (let offset = 0; offset < bytes.length; offset += 16384) {
+      const part = bytes.subarray(offset, offset + 16384)
+      while (!sessionA.tryWrite(id, part)) await sessionA.waitWritable(id, part.length)
+      assert.ok(sessionA.bufferedSendBytes() <= 4 * 1024 * 1024)
+    }
+    await sessionA.finish(id)
+  }
+  await Promise.all([sendLarge(1, buf1), sendLarge(2, buf2), finalBoth])
 
   assert.ok(link.dropped > 0, `loss actually injected (dropped ${link.dropped})`)
   assert.ok(link.forwarded > 8000, `transfer crossed the swap point (${link.forwarded} forwards)`)

@@ -63,7 +63,7 @@ export declare class PeerMux {
     private readonly options;
     private readonly clock;
     private readonly sessions;
-    /** 对端会话拆建后延续单调递增的 streamId，避免落入对端未过期的 deadStreams 窗口。 */
+    /** 对端会话拆建后延续单调递增的 streamId，避免复用对端已退休的 streamId。 */
     private readonly nextStreamIds;
     private closed;
     constructor(options: PeerMuxOptions);
@@ -105,7 +105,7 @@ export declare class PeerMux {
      * `ReadableStream` 体；`init.signal` 中止会对远端流发 RST。
      */
     createFetchForPeer(nodeId: string): typeof fetch;
-    /** 一次顺序 ARQ 写；路径未就绪的抛错在这里吞掉——ARQ 重传定时器补发。 */
+    /** Pipeline into a bounded byte budget; await capacity, never each frame's RTT. */
     private writeArq;
     /**
      * ARQ 的 sendFrame 接缝：发送时读取当前路径。UDP → punch 层封口；WS →
@@ -122,14 +122,10 @@ export declare class PeerMux {
     private handleEnvelope;
     /** 采用对端临时钥：每个新 (my, peer) 对只派生一次中转密码器。 */
     private integratePeerEphemeral;
-    /** 记一个死流 id；超过上限按插入顺序淘汰最老项（PG-9）。 */
-    private noteDeadStream;
     /** ARQ 顺序送达的一个入站分片（0 = 元数据，1+ = 体，fin = 结束）。 */
     private onStreamData;
     /** 单个入站分片的按向处理（ARQ 已保证顺序，元数据支持跨分片与换行定界）。 */
     private onFragment;
-    /** 对端对本流发了 RST：本地各件按「连接被切」销毁。 */
-    private onStreamReset;
     /** 杀掉一条流的本地表面并从流表移除（双向 FIN/RST 后不留驻内存）。 */
     private abortStream;
     /** 向对端发 RST（本侧中止方向）。 */
@@ -138,11 +134,8 @@ export declare class PeerMux {
     private openInbound;
     /** 构造虚拟 `req`/`res` 并直接调用本机 relayHandler。 */
     private materializeInboundRequest;
-    /** 对捕获的 ServerResponse 原始字节做增量 HTTP/1.1 响应解析。 */
+    /** Decode bounded slices, including partial HTTP chunks; never accumulate a body. */
     private parseCapture;
-    /** 响应元数据只发一次，其后是体分片，完结时 FIN（全部同步入 ARQ 队列，严守 FIFO 字节序）。 */
-    private writeResponseMetaAndBody;
-    /** res finish：补发残尾并 FIN（幂等，outboundFinished 守住）。 */
     private finishResponse;
 }
 /** mux 的 fetch 入参里允许的 body 形态（BodyInit 的窄化）。 */

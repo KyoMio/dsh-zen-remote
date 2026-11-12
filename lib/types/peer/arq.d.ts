@@ -32,6 +32,22 @@
  * the stream (merged onto the last queued fragment when one exists, a
  * dedicated zero-length fragment otherwise); RST aborts; `closeAll()`
  * clears every timer and rejects every pending write.
+ *
+ * Admission is bounded (256KiB/stream, 4MiB/session, 128 live streams by
+ * default). Large callers use tryWrite + waitWritable in bounded pieces;
+ * write still confirms delivery, but rejects rather than queues over budget.
+ * RST payload 1 requests an ACK, 2 acknowledges; empty remains legacy RST.
+ * DATA with no cumulative progress and RST retries expire after 30s; idle
+ * streams have no deadline. Retired IDs never reopen in this session.
+ * Final ACKs are cached for 60s (4096 reserved records/ranges). A legacy peer
+ * retrying FIN later receives RST, not successful completion; legacy RST
+ * has no confirmation, so remote cleanup cannot be guaranteed. Capacity
+ * exhaustion refuses new streams instead of evicting fresh terminal state.
+ * Cancel/refusal IDs are retired even when the active-stream limit is full.
+ * If permanent history itself cannot reserve another ID, admission closes
+ * permanently (existing streams continue), reports onAdmissionClosed, and
+ * new local writes explicitly require leaving/rejoining the peer network.
+ * No timer or range eviction silently reopens that admission boundary.
  */
 /** In-stream subheader: `[flags:1B][streamSeq:4B]`. */
 export declare const STREAM_HEADER_BYTES = 5;
@@ -66,7 +82,19 @@ export type ArqFrameSender = (frameType: number, streamId: number, payload: Uint
 export interface PeerArqOptions {
     sendFrame: ArqFrameSender;
     /** Ordered delivery of received stream chunks; `final` marks the FIN. */
-    onStreamData?: (streamId: number, chunk: Uint8Array, final: boolean) => void;
+    onStreamData?: (streamId: number, chunk: Uint8Array, final: boolean) => boolean | void;
+    /** Once per admitted stream, after duplex FIN or any abort. */
+    onStreamClosed?: (streamId: number, error?: Error) => void;
+    /** Permanent admission failure; existing streams continue. Rejoin to recover. */
+    onAdmissionClosed?: (error: Error) => void;
+    /** Outstanding DATA with no cumulative progress; idle streams have no deadline. */
+    retryTimeoutMs?: number;
+    terminalTtlMs?: number;
+    maxStreams?: number;
+    maxRetiredRanges?: number;
+    maxTerminalRecords?: number;
+    maxStreamBytes?: number;
+    maxSessionBytes?: number;
     /** The peer sent RST for this stream; all state for it is gone. */
     onStreamReset?: (streamId: number) => void;
     clock?: ArqClock;
@@ -98,6 +126,23 @@ export declare class PeerArqSession {
     private readonly txStreams;
     private readonly rxStreams;
     private closed;
+    private readonly onStreamClosed;
+    private readonly onAdmissionClosed;
+    private admissionClosed;
+    private readonly retryTimeoutMs;
+    private readonly terminalTtlMs;
+    private readonly maxStreams;
+    private readonly maxRetiredRanges;
+    private readonly maxTerminalRecords;
+    private readonly maxStreamBytes;
+    private readonly maxSessionBytes;
+    private sendBytes;
+    private receiveBytes;
+    private readonly writable;
+    private readonly active;
+    private readonly retired;
+    private readonly terminal;
+    private readonly resets;
     constructor(options: PeerArqOptions);
     /**
      * Queue `bytes` on the stream and resolve once every fragment of this
@@ -138,6 +183,25 @@ export declare class PeerArqSession {
      * backed-off RTO timers).
      */
     flushInflight(): void;
+    /** Whole-block admission. false accepts no bytes; terminal/capacity errors throw. */
+    tryWrite(streamId: number, bytes: Uint8Array): boolean;
+    /** One admission waiter per stream; callers serialize writes, not ACKs. */
+    waitWritable(streamId: number, bytes?: number): Promise<void>;
+    bufferedSendBytes(): number;
+    bufferedReceiveBytes(): number;
+    private hasCapacity;
+    private wakeWritable;
+    /** Retry a previously refused delivery after consumer pull/read. */
+    resume(streamId: number): void;
+    private isRetired;
+    private admit;
+    private retire;
+    private admissionError;
+    /** Refused/cancelled IDs need permanent history, but no active-stream slot. */
+    private rememberRetired;
+    private maybeClose;
+    private armProgress;
+    private startReset;
     private trySendFrame;
     private ensureTx;
     private currentAck;
