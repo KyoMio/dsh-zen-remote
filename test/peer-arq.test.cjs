@@ -718,3 +718,91 @@ test('10 MiB across two concurrent streams survives 20% loss + reorder and a mid
   sessionA.closeAll()
   sessionB.closeAll()
 })
+
+// -- 11. unready path resilience, flushInflight, queue coalescing & ack=0 SACK ------
+
+test('survives throwing sendFrame while path is none, flushes immediately on flushInflight, coalesces queued small writes, and honors SACK bitmap at ack=0', async () => {
+  const assembler = makeAssembler()
+  let pathReady = false
+  const wire = []
+  let sessionB
+  const sessionA = new PeerArqSession({
+    windowSize: 2,
+    chunkSize: 200,
+    rtoMs: 500, // deliberately large so flushInflight() proves instant delivery (<80ms)
+    sendFrame: (frameType, streamId, payload, ack) => {
+      if (!pathReady) throw new Error('no physical path for peer')
+      const copy = Buffer.from(payload)
+      wire.push({ frameType, streamId, payload: copy, ack })
+      queueMicrotask(() => sessionB.handleFrame(frameType, streamId, copy, ack))
+    },
+  })
+  sessionB = new PeerArqSession({
+    windowSize: 2,
+    chunkSize: 200,
+    onStreamData: assembler.onStreamData,
+    sendFrame: (frameType, streamId, payload, ack) => {
+      if (!pathReady) throw new Error('no physical path for peer')
+      const copy = Buffer.from(payload)
+      queueMicrotask(() => sessionA.handleFrame(frameType, streamId, copy, ack))
+    },
+  })
+
+  try {
+    // Enqueue 6 small writes while pathReady === false (sendFrame throws!):
+    // First 2 enter inflight (seq 0, seq 1); next 4 queue behind windowSize=2 and coalesce!
+    const writes = [
+      sessionA.write(1, Buffer.from('token-0\n')),
+      sessionA.write(1, Buffer.from('token-1\n')),
+      sessionA.write(1, Buffer.from('token-2\n')),
+      sessionA.write(1, Buffer.from('token-3\n')),
+      sessionA.write(1, Buffer.from('token-4\n')),
+      sessionA.write(1, Buffer.from('token-5\n')),
+      sessionA.finish(1),
+    ]
+
+    // Bring path up and call flushInflight(): must deliver well before the 500ms RTO!
+    const t0 = Date.now()
+    pathReady = true
+    sessionA.flushInflight()
+    await Promise.all(writes)
+    const elapsed = Date.now() - t0
+    assert.ok(elapsed < 200, `flushInflight delivered in ${elapsed}ms without waiting 500ms RTO`)
+    assert.equal(
+      assembler.bytesOf(1).toString('utf8'),
+      'token-0\ntoken-1\ntoken-2\ntoken-3\ntoken-4\ntoken-5\n',
+    )
+    assert.equal(assembler.finalOf(1), true)
+    // 2 inflight + 1 coalesced data fragment (tokens 2..5 = 32B <= 200B, with FIN merged by finish) = 3 DATA frames (instead of 7)
+    const dataFrames = wire.filter((f) => f.frameType === PeerFrameType.DATA)
+    assert.equal(dataFrames.length, 3, `expected 3 coalesced DATA frames, got ${dataFrames.length}`)
+
+    // Verify SACK bitmap when ack === 0 (seq 0 dropped, seq 1 & 2 received):
+    const sentSeqs = []
+    const sackSender = new PeerArqSession({
+      windowSize: 8,
+      chunkSize: 50,
+      rtoMs: 60,
+      sendFrame: (frameType, _streamId, payload) => {
+        if (frameType === PeerFrameType.DATA) sentSeqs.push(subheaderOf(payload).seq)
+      },
+    })
+    const p0 = sackSender.write(9, Buffer.from('frag-0'))
+    const p1 = sackSender.write(9, Buffer.from('frag-1'))
+    const p2 = sackSender.write(9, Buffer.from('frag-2'))
+    assert.deepEqual(sentSeqs, [0, 1, 2])
+    // Peer lost seq=0 so cumulative ack=0; bitmap bit1 (seq 1) + bit2 (seq 2) = (1 << 1) | (1 << 2) = 0b110 = 6
+    const bitmap = Buffer.alloc(16)
+    bitmap[0] = (1 << 1) | (1 << 2)
+    sackSender.handleFrame(PeerFrameType.SACK, 9, bitmap, 0)
+    await Promise.all([p1, p2]) // p1 & p2 MUST settle immediately from the ack=0 SACK bitmap!
+    await sleep(80) // Let RTO fire once: ONLY seq 0 should retransmit, NOT seq 1 or 2!
+    assert.deepEqual(sentSeqs, [0, 1, 2, 0], 'only lost seq 0 retransmitted; seq 1 & 2 were selectively ACKed at ack=0')
+    sackSender.handleFrame(PeerFrameType.SACK, 9, Buffer.alloc(16), 3)
+    await p0
+    sackSender.closeAll()
+  } finally {
+    sessionA.closeAll()
+    sessionB.closeAll()
+  }
+})

@@ -1143,6 +1143,7 @@ test('PG-8 #8: peer 模式下 dsh-better-sidebar 远程会话请求默认桥接 
   const net = await createNetwork(gw, { mode: 'key' })
   const nodes = []
   const servers = []
+  const liveSockets = new Set()
   try {
     const sidebarAdapter = ADAPTERS.find((a) => a.plugin === 'dsh-better-sidebar')
     assert.ok(sidebarAdapter, 'dsh-better-sidebar adapter must exist')
@@ -1289,6 +1290,7 @@ test('PG-8 #8: peer 模式下 dsh-better-sidebar 远程会话请求默认桥接 
         engine,
         stop: () => {
           intercept.uninstall()
+          relayHandler.closeAll('stop')
           engine.stop()
           relayPool.stop()
           try { punchSocket.close() } catch { /* ignore */ }
@@ -1327,7 +1329,441 @@ test('PG-8 #8: peer 模式下 dsh-better-sidebar 远程会话请求默认桥接 
     assert.equal(deniedRes.status, 503)
   } finally {
     for (const node of nodes) node.stop()
-    await Promise.all(servers.map((s) => new Promise((r) => s.close(r))))
+    for (const sock of liveSockets) { try { sock.destroy() } catch { /* ignore */ } }
+    await Promise.all(servers.map((s) => new Promise((r) => { s.closeAllConnections?.(); s.close(r) })))
+    await gw.close()
+  }
+})
+
+// ============================================================================
+// 验收 9：高延迟中继 + 单向 UDP 黑洞 + 侧栏 WS 隧道切换会话 + 实时流式回复不断连不丢帧
+// ============================================================================
+
+test('PG-8 #9: high-latency WS relay + one-way UDP blackhole + sidebar WS session switching delivers live streaming replies with zero offline flaps', async () => {
+  const netMod = require('node:net')
+  const cryptoMod = require('node:crypto')
+  const gw = await startGateway()
+  // Inject realistic cross-region latency (70ms one-way = 140ms RTT) on binary relay frames at gateway!
+  const origUpgrade = gw.hub.wss.handleUpgrade.bind(gw.hub.wss)
+  gw.hub.wss.handleUpgrade = (req, sock, head, cb) => {
+    origUpgrade(req, sock, head, (ws) => {
+      const origSend = ws.send.bind(ws)
+      ws.send = (data, optsOrCb, maybeCb) => {
+        const binary = optsOrCb !== null && typeof optsOrCb === 'object' && optsOrCb.binary === true
+        if (binary) {
+          const copy = Buffer.from(data)
+          setTimeout(() => {
+            try { origSend(copy, optsOrCb, maybeCb) } catch { /* closed */ }
+          }, 70)
+          return
+        }
+        return origSend(data, optsOrCb, maybeCb)
+      }
+      cb(ws)
+    })
+  }
+
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  const servers = []
+  const liveSockets = new Set()
+
+  try {
+    const sidebarAdapter = ADAPTERS.find((a) => a.plugin === 'dsh-better-sidebar')
+    assert.ok(sidebarAdapter, 'dsh-better-sidebar adapter must exist')
+
+    async function makeStreamingPeer(name, sessionIds, { dropUdpToPort } = {}) {
+      const home = fs.mkdtempSync(path.join(ROOT, `live-${name}-`))
+      const stateFile = path.join(home, 'zen-remote-state.json')
+      const identity = ensurePeerIdentity(stateFile)
+      const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+      for (const sid of sessionIds) store.share(sid)
+
+      const punchSocket = await openUdp()
+      if (typeof dropUdpToPort === 'function') {
+        const realSend = punchSocket.send.bind(punchSocket)
+        punchSocket.send = (buf, port, address, cb) => {
+          if (dropUdpToPort(port)) {
+            if (typeof cb === 'function') cb(null)
+            return
+          }
+          return realSend(buf, port, address, cb)
+        }
+      }
+
+      // Live streaming state per session (mirrors SessionHistoryController.follow)
+      const followers = new Map() // sid -> Set<(frame) => void>
+      for (const sid of sessionIds) followers.set(sid, new Set())
+
+      const loopbackSecret = `loopback-${name}-secret`
+      const registry = createBridgeRegistry()
+      const normalized = normalizeAdapter(sidebarAdapter, sidebarAdapter.versions[0])
+      registry.registerNormalized(normalized.declaration)
+      const adapters = [normalized]
+      const routes = new Map()
+      routes.set('/sidebar/api', {
+        path: '/sidebar/api',
+        prefix: true,
+        handler: async (req, res) => {
+          const chunks = []
+          for await (const c of req) chunks.push(c)
+          const parsed = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, servedBy: name, sessionId: parsed.sessionId ?? null }))
+        },
+      })
+
+      const upgrades = new Map()
+      for (const wsPath of ['/sidebar/ws/agent-opens', '/sidebar/ws/fs-watch']) {
+        upgrades.set(wsPath, {
+          path: wsPath,
+          handler: (req, socket) => {
+            const key = req.headers['sec-websocket-key']
+            const accept = cryptoMod
+              .createHash('sha1')
+              .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+              .digest('base64')
+            const u = new URL(req.url ?? '/', 'http://127.0.0.1')
+            const sid = u.searchParams.get('sessionId') ?? ''
+            const greeting = Buffer.from(JSON.stringify({ wsPath, servedBy: name, sessionId: sid }), 'utf8')
+            // Unmasked server -> client text WS frame (0x81)
+            const wsFrame = Buffer.concat([Buffer.from([0x81, greeting.length]), greeting])
+            socket.write(
+              `HTTP/1.1 101 Switching Protocols\r\n`
+              + `Upgrade: websocket\r\n`
+              + `Connection: Upgrade\r\n`
+              + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+            )
+            socket.write(wsFrame)
+            socket.on('error', () => {})
+          },
+        })
+      }
+
+      const webServer = {
+        exact: new Map(),
+        prefixes: new Map(),
+        upgrades,
+        match(pathname) {
+          for (const [p, r] of routes.entries()) {
+            if (pathname === p || pathname.startsWith(`${p}/`)) return r
+          }
+          return undefined
+        },
+      }
+      const httpServer = http.createServer((req, res) => {
+        const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+        if (pathname === '/__auth') {
+          res.writeHead(303, { 'set-cookie': 'dsh_auth=ok; Path=/', location: '/' })
+          res.end()
+          return
+        }
+        const matched = webServer.match(pathname)
+        if (!matched) { res.writeHead(404); res.end(); return }
+        void matched.handler(req, res)
+      })
+      httpServer.on('connection', (sock) => {
+        liveSockets.add(sock)
+        sock.on('close', () => liveSockets.delete(sock))
+      })
+      httpServer.on('upgrade', (req, socket, head) => {
+        const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+        const entry = webServer.upgrades.get(pathname)
+        if (!entry) { socket.destroy(); return }
+        entry.handler(req, socket, head)
+      })
+      await new Promise((resolve) => httpServer.listen(0, '127.0.0.1', resolve))
+      servers.push(httpServer)
+      const port = httpServer.address().port
+
+      const loopback = createPluginLoopback({
+        getTarget: () => ({ protocol: 'http:', port }),
+        getTokenUrl: () => `http://127.0.0.1:${port}/__auth`,
+        loopbackSecret,
+      })
+
+      let turnDoneResolve = null
+      const gateway = {
+        invoke: async (call) => {
+          const { namespace: ns, method, args } = call
+          if (ns === 'session' && method === 'list') {
+            return { items: sessionIds.map((id) => ({ sessionId: id, title: `${name}:${id}` })) }
+          }
+          if (ns === 'session' && method === 'prompt') {
+            const sid = args.request.sessionId
+            const subs = followers.get(sid)
+            // Stream 80 live assistant-stream chunks asynchronously over ~240ms
+            void (async () => {
+              for (const fn of subs ?? []) {
+                fn({ kind: 'event', event: { seq: 1, type: 'turn-started' } })
+              }
+              for (let i = 0; i < 80; i += 1) {
+                await sleep(3)
+                const chunkText = `chunk-${i}-${'x'.repeat(80)}`
+                for (const fn of subs ?? []) {
+                  fn({
+                    kind: 'assistant-stream',
+                    event: { kind: 'chunk', turnId: 'turn-1', seq: i + 1, part: { type: 'text', text: chunkText } },
+                  })
+                }
+              }
+              for (const fn of subs ?? []) {
+                fn({ kind: 'assistant-stream', event: { kind: 'end', turnId: 'turn-1', status: 'completed' } })
+                fn({ kind: 'event', event: { seq: 2, type: 'turn-ended' } })
+              }
+              if (turnDoneResolve) turnDoneResolve()
+            })()
+            return { accepted: true, sessionId: sid }
+          }
+          return { ok: true }
+        },
+        stream: async (call) => {
+          const { namespace: ns, method, args, signal } = call
+          if (ns === 'session' && method === 'follow') {
+            const sid = args.request.address.sessionId
+            const queue = [{ kind: 'snapshot', session: { id: sid, status: 'idle' }, events: [] }]
+            let notify = null
+            let closed = false
+            const push = (frame) => {
+              if (closed) return
+              queue.push(frame)
+              if (notify) { const n = notify; notify = null; n() }
+            }
+            followers.get(sid)?.add(push)
+            const cleanup = () => {
+              closed = true
+              followers.get(sid)?.delete(push)
+              if (notify) { const n = notify; notify = null; n() }
+            }
+            signal?.addEventListener('abort', cleanup, { once: true })
+            return (async function* () {
+              try {
+                while (!closed) {
+                  while (queue.length > 0) yield queue.shift()
+                  if (closed) break
+                  await new Promise((r) => { notify = r })
+                }
+              } finally {
+                cleanup()
+              }
+            })()
+          }
+          return (async function* () {})()
+        },
+        wireStream: { open: async () => (async function* () {})() },
+        dispatchRpc: async () => ({ ok: true, value: {} }),
+      }
+
+      const relayHandler = createRelayHandler({
+        secret: SECRET,
+        store,
+        gateway,
+        serverInfo: {
+          serverId: loadServerId(home),
+          serverName: () => name,
+          dshVersion: '0.0.0-peer-e2e',
+          fingerprints: () => ({}),
+          plugins: () => {
+            const table = {}
+            for (const decl of registry.list()) {
+              table[decl.plugin] = { version: decl.version, digest: decl.digest, serverScopeConsent: true }
+            }
+            return table
+          },
+        },
+        pluginBridge: {
+          registry,
+          getConsent: () => ({ 'dsh-better-sidebar': true }),
+          loopback,
+          adapters,
+          tunnel: require('../lib/plugin-tunnel.js').createPluginTunnel({
+            bridge: { registry, getConsent: () => ({ 'dsh-better-sidebar': true }), loopback },
+            getTarget: () => ({ protocol: 'http:', port }),
+            isAccessible: (sid) => store.isAccessible(sid),
+            heartbeatMs: 15_000,
+            loopbackSecret,
+          }),
+        },
+      })
+
+      const relayPool = createRelayPool({ stateFile, skipPersistedServers: true, computeOwnFingerprints: () => ({}) })
+      const { compareBridges } = require('../lib/plugin-bridge.js')
+      const intercept = installPluginRouteIntercept({
+        webServer,
+        registry,
+        adapters,
+        loopbackSecret,
+        getRelayForServer: (sid) => relayPool.getByServerId(sid)?.client,
+        getStatusForServer: (sid) => {
+          const entry = relayPool.getByServerId(sid)
+          return entry ? compareBridges(registry.list(), entry.client.handshakeInfo?.plugins, entry.client.state === 'online') : []
+        },
+      })
+
+      const engine = createPeerEngine({
+        stateFile,
+        identity,
+        relayPool,
+        relayHandler: () => relayHandler,
+        relaySecret: () => SECRET,
+        serverName: () => name,
+        udpSocket: punchSocket,
+        udpProbe: null,
+        punch: { punchWindowMs: 400, punchIntervalMs: 100, punchRounds: 4, reprobeIntervalMs: 60_000 },
+      })
+
+      return {
+        name,
+        identity,
+        port,
+        punchPort: punchSocket.address().port,
+        relayPool,
+        engine,
+        waitNextTurnDone: () => new Promise((r) => { turnDoneResolve = r }),
+        stop: () => {
+          intercept.uninstall()
+          relayHandler.closeAll('stop')
+          engine.stop()
+          relayPool.stop()
+          try { punchSocket.close() } catch { /* ignore */ }
+        },
+      }
+    }
+
+    let portA = -1
+    const A = await makeStreamingPeer('PeerA', ['s-a1'])
+    portA = A.punchPort
+    // Asymmetric one-way UDP blackhole: A -> B UDP reaches B, but B -> A UDP is 100% dropped!
+    const B = await makeStreamingPeer('PeerB', ['s-b1', 's-b2'], {
+      dropUdpToPort: (dstPort) => dstPort === portA,
+    })
+    nodes.push(A, B)
+
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitPeerOnline(A, B.identity.nodeId, 12_000)
+    await waitPeerOnline(B, A.identity.nodeId, 12_000)
+
+    const clientToB = A.relayPool.getByServerId(B.identity.nodeId).client
+    const stateTransitions = []
+    clientToB.subscribe((s) => stateTransitions.push(s))
+
+    // Helper: open a real WebSocket upgrade to A's local webServer (as dsh-better-sidebar does on session switch)
+    function openSidebarWs(wsPath, virtualSessionId) {
+      return new Promise((resolve, reject) => {
+        const sock = netMod.connect(A.port, '127.0.0.1', () => {
+          const wsKey = cryptoMod.randomBytes(16).toString('base64')
+          // Include >1200B header padding to also exercise multi-fragment request metadata over PeerMux!
+          const bigCookie = `pad=${'c'.repeat(1400)}`
+          sock.write(
+            `GET ${wsPath}?sessionId=${encodeURIComponent(virtualSessionId)} HTTP/1.1\r\n`
+            + `Host: 127.0.0.1:${A.port}\r\n`
+            + `Upgrade: websocket\r\n`
+            + `Connection: Upgrade\r\n`
+            + `Sec-WebSocket-Key: ${wsKey}\r\n`
+            + `Sec-WebSocket-Version: 13\r\n`
+            + `Cookie: ${bigCookie}\r\n\r\n`,
+          )
+        })
+        let buf = Buffer.alloc(0)
+        sock.on('data', (c) => {
+          buf = Buffer.concat([buf, c])
+          const headerEnd = buf.indexOf('\r\n\r\n')
+          if (headerEnd === -1) return
+          const headStr = buf.subarray(0, headerEnd).toString('utf8')
+          if (!headStr.startsWith('HTTP/1.1 101')) {
+            reject(new Error(`WS upgrade failed: ${headStr.split('\r\n')[0]}`))
+            sock.destroy()
+            return
+          }
+          const rest = buf.subarray(headerEnd + 4)
+          if (rest.length >= 2) {
+            const payloadLen = rest[1] & 0x7f
+            if (rest.length >= 2 + payloadLen) {
+              const json = JSON.parse(rest.subarray(2, 2 + payloadLen).toString('utf8'))
+              resolve({ sock, greeting: json })
+            }
+          }
+        })
+        sock.on('error', reject)
+      })
+    }
+
+    // 1. Open remote session s-b1 + sidebar WS tunnels, then rapidly switch s-b1 -> s-b2 -> s-b1!
+    const vS1 = toVirtual(B.identity.nodeId, 's-b1')
+    const vS2 = toVirtual(B.identity.nodeId, 's-b2')
+
+    const ws1 = await openSidebarWs('/sidebar/ws/agent-opens', vS1)
+    assert.equal(ws1.greeting.servedBy, 'PeerB')
+    assert.equal(ws1.greeting.sessionId, 's-b1', 'WS tunnel rewrote virtual sessionId to s-b1 and delivered greeting in order')
+    ws1.sock.destroy() // Close on switch to s-b2
+
+    const ws2 = await openSidebarWs('/sidebar/ws/fs-watch', vS2)
+    assert.equal(ws2.greeting.sessionId, 's-b2')
+    ws2.sock.destroy() // Switch back to s-b1
+
+    const ws3 = await openSidebarWs('/sidebar/ws/agent-opens', vS1)
+    assert.equal(ws3.greeting.sessionId, 's-b1')
+
+    assert.equal(clientToB.state, 'online', 'switching remote sessions must keep RelayClient online')
+    assert.deepEqual(stateTransitions, [], 'ZERO offline/reconnecting flaps during session switches under high latency')
+
+    // 2. Open session/follow on s-b1 and send session/prompt — verify LIVE streaming before turn finishes!
+    const followAbort = new AbortController()
+    const streamIter = clientToB.openStream(
+      'session',
+      'follow',
+      { request: { address: { kind: 'session', sessionId: 's-b1' } } },
+      followAbort.signal,
+    )[Symbol.asyncIterator]()
+
+    const firstSnap = await streamIter.next()
+    assert.equal(firstSnap.value?.kind, 'snapshot')
+
+    const liveChunks = []
+    let turnEndedSeen = false
+    const pumpPromise = (async () => {
+      for (;;) {
+        const step = await streamIter.next()
+        if (step.done) break
+        const frame = step.value
+        if (frame?.kind === 'assistant-stream' && frame.event?.kind === 'chunk') {
+          liveChunks.push(frame.event.part.text)
+        }
+        if (frame?.kind === 'event' && frame.event?.type === 'turn-ended') {
+          turnEndedSeen = true
+          break
+        }
+      }
+    })()
+
+    let chunksMidTurn = 0
+    const turnDoneOnB = B.waitNextTurnDone().then(() => {
+      chunksMidTurn = liveChunks.length
+    })
+
+    const promptRes = await clientToB.invoke('session', 'prompt', {
+      request: {
+        sessionId: 's-b1',
+        content: [{ type: 'text', text: 'stream 80 chunks please' }],
+      },
+    })
+    assert.equal(promptRes.accepted, true)
+
+    await Promise.all([turnDoneOnB, pumpPromise])
+    followAbort.abort()
+    ws3.sock.destroy()
+
+    assert.ok(chunksMidTurn > 0, `expected live chunks to arrive mid-turn before turn ended on PeerB, got ${chunksMidTurn}`)
+    assert.equal(turnEndedSeen, true, 'turn-ended event delivered live over session/follow')
+    assert.equal(liveChunks.length, 80, 'all 80 assistant-stream chunks delivered live without switching sessions')
+    assert.equal(liveChunks[0], `chunk-0-${'x'.repeat(80)}`)
+    assert.equal(liveChunks[79], `chunk-79-${'x'.repeat(80)}`)
+    assert.deepEqual(stateTransitions, [], 'ZERO offline flaps throughout live streaming under latency + one-way UDP')
+  } finally {
+    for (const node of nodes) node.stop()
+    for (const sock of liveSockets) { try { sock.destroy() } catch { /* ignore */ } }
+    await Promise.all(servers.map((s) => new Promise((r) => { s.closeAllConnections?.(); s.close(r) })))
     await gw.close()
   }
 })

@@ -1671,31 +1671,60 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     signal?: AbortSignal,
   ): Promise<{ tunnel: string; frames: AsyncIterable<Uint8Array> }> {
     const creds = requireCredentials()
+    if (signal?.aborted) throw abortedError()
     const payload = {
       headers: request.wsHeaders,
       ...(request.head !== undefined && request.head !== '' ? { head: request.head } : {}),
     }
-    const response = await fetch(`${creds.url}${PLUGIN_TUNNEL_OPEN_PATH}`, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${creds.token}`,
-        accept: 'application/x-ndjson',
-        'content-type': 'application/json',
-        'x-zr-plugin': request.plugin,
-        'x-zr-plugin-version': request.version,
-        'x-zr-plugin-digest': request.digest,
-        'x-zr-path': request.path,
-        'x-zr-query': request.query,
-      },
-      body: JSON.stringify(payload),
-      redirect: 'manual',
-      signal,
-    }).catch((error: unknown) => {
+    const controller = new AbortController()
+    const onExternalAbort = (): void => {
+      controller.abort()
+    }
+    if (signal !== undefined) {
+      if (signal.aborted) controller.abort()
+      else signal.addEventListener('abort', onExternalAbort)
+    }
+    let headersTimedOut = false
+    const headerTimer = setTimeout(() => {
+      headersTimedOut = true
+      controller.abort()
+    }, requestTimeoutMs)
+    if (typeof headerTimer.unref === 'function') headerTimer.unref()
+
+    let response: Response
+    try {
+      response = await fetchImpl(`${creds.url}${PLUGIN_TUNNEL_OPEN_PATH}`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${creds.token}`,
+          accept: 'application/x-ndjson',
+          'content-type': 'application/json',
+          'x-zr-plugin': request.plugin,
+          'x-zr-plugin-version': request.version,
+          'x-zr-plugin-digest': request.digest,
+          'x-zr-path': request.path,
+          'x-zr-query': request.query,
+        },
+        body: JSON.stringify(payload),
+        redirect: 'manual',
+        signal: controller.signal,
+      })
+    } catch (error: unknown) {
+      clearTimeout(headerTimer)
+      signal?.removeEventListener('abort', onExternalAbort)
+      if (signal?.aborted) throw abortedError()
+      if (headersTimedOut) {
+        noteFailure('request-timeout')
+        throw new RelayError('request-timeout', `no response within ${requestTimeoutMs} ms`)
+      }
       noteFailure('offline')
       setState('offline')
       throw new RelayError('offline', messageOf(error))
-    })
+    }
+    clearTimeout(headerTimer)
+
     if (response.status < 200 || response.status >= 300 || response.body === null) {
+      signal?.removeEventListener('abort', onExternalAbort)
       // The refusal carries its code in the marker header (every
       // plugin-bridge wall does) — surface it verbatim.
       const code = response.headers.get('x-zen-remote-error') ?? `http-${response.status}`
@@ -1708,6 +1737,9 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let lineBuffer = ''
+    const cleanupSignal = (): void => {
+      signal?.removeEventListener('abort', onExternalAbort)
+    }
     const nextLine = async (): Promise<string | null> => {
       while (true) {
         const idx = lineBuffer.indexOf('\n')
@@ -1727,7 +1759,15 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     }
     // The FIRST line must name the tunnel; anything else up front is a
     // protocol violation the caller sees as a refused open.
-    const first = await nextLine()
+    let first: string | null
+    try {
+      first = await nextLine()
+    } catch (error: unknown) {
+      cleanupSignal()
+      try { void reader.cancel().catch(() => {}) } catch { /* ignore */ }
+      if (signal?.aborted) throw abortedError()
+      throw new RelayError('offline', messageOf(error))
+    }
     if (first !== null) {
       try {
         const parsed: unknown = JSON.parse(first)
@@ -1740,6 +1780,8 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       }
     }
     if (tunnelId === undefined) {
+      cleanupSignal()
+      try { void reader.cancel().catch(() => {}) } catch { /* ignore */ }
       const code = response.headers.get('x-zen-remote-error') ?? 'internal'
       throw new RelayError(code, `the tunnel open stream never named a tunnel`, response.status)
     }
@@ -1748,32 +1790,46 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         return {
           async next(): Promise<IteratorResult<Uint8Array>> {
             if (upstreamClosed) return { done: true, value: undefined }
-            while (true) {
-              const line = await nextLine()
-              if (line === null) {
-                upstreamClosed = true
-                return { done: true, value: undefined }
-              }
-              let parsed: unknown
-              try {
-                parsed = JSON.parse(line)
-              } catch {
-                continue // a damaged line is skipped, like every NDJSON reader here
-              }
-              if (parsed === null || typeof parsed !== 'object') continue
-              const frame = parsed as { type?: unknown; b64?: unknown; reason?: unknown }
-              if (frame.type === 'data' && typeof frame.b64 === 'string' && frame.b64 !== '') {
-                return { done: false, value: new Uint8Array(Buffer.from(frame.b64, 'base64')) }
-              }
-              if (frame.type === 'end') {
-                upstreamClosed = true
-                if (typeof frame.reason === 'string' && frame.reason === 'upstream-error') {
-                  pendingError = new RelayError('internal', 'the upstream tunnel socket failed')
+            try {
+              while (true) {
+                const line = await nextLine()
+                if (line === null) {
+                  upstreamClosed = true
+                  cleanupSignal()
+                  return { done: true, value: undefined }
                 }
-                return { done: true, value: undefined }
+                let parsed: unknown
+                try {
+                  parsed = JSON.parse(line)
+                } catch {
+                  continue // a damaged line is skipped, like every NDJSON reader here
+                }
+                if (parsed === null || typeof parsed !== 'object') continue
+                const frame = parsed as { type?: unknown; b64?: unknown; reason?: unknown }
+                if (frame.type === 'data' && typeof frame.b64 === 'string' && frame.b64 !== '') {
+                  return { done: false, value: new Uint8Array(Buffer.from(frame.b64, 'base64')) }
+                }
+                if (frame.type === 'end') {
+                  upstreamClosed = true
+                  cleanupSignal()
+                  if (typeof frame.reason === 'string' && frame.reason === 'upstream-error') {
+                    pendingError = new RelayError('internal', 'the upstream tunnel socket failed')
+                  }
+                  return { done: true, value: undefined }
+                }
+                // ping and anything unrecognized: skipped.
               }
-              // ping and anything unrecognized: skipped.
+            } catch (err) {
+              upstreamClosed = true
+              cleanupSignal()
+              throw err
             }
+          },
+          async return(): Promise<IteratorResult<Uint8Array>> {
+            upstreamClosed = true
+            cleanupSignal()
+            try { await reader.cancel() } catch { /* ignore */ }
+            return { done: true, value: undefined }
           },
         }
       },
@@ -1810,7 +1866,8 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
 
   async function pluginTunnelClose(tunnel: string, signal?: AbortSignal): Promise<void> {
     const creds = requireCredentials()
-    await fetch(`${creds.url}${PLUGIN_TUNNEL_CLOSE_PATH}`, {
+    if (signal?.aborted) throw abortedError()
+    await fetchImpl(`${creds.url}${PLUGIN_TUNNEL_CLOSE_PATH}`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${creds.token}`,
@@ -1820,6 +1877,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       redirect: 'manual',
       signal,
     }).catch((error: unknown) => {
+      if (signal?.aborted) throw abortedError()
       throw new RelayError('offline', messageOf(error))
     })
   }

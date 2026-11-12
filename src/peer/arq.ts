@@ -106,7 +106,7 @@ interface TxFragment {
   seq: number
   /** Full ARQ payload: subheader + data, retransmitted byte-identical. */
   payload: Buffer
-  waiter: TxWaiter | null
+  waiters: TxWaiter[]
   finWaiter: TxWaiter | null
   rto: number
   timer: unknown
@@ -115,7 +115,7 @@ interface TxFragment {
 interface QueuedFragment {
   data: Buffer
   fin: boolean
-  waiter: TxWaiter | null
+  waiters: TxWaiter[]
   finWaiter: TxWaiter | null
 }
 
@@ -243,16 +243,24 @@ export class PeerArqSession {
     if (tx.finQueued) return Promise.reject(new Error(`stream ${sid} already finished`))
     const data = asBufferView(bytes)
     if (data.byteLength === 0) return Promise.resolve()
-    const fragments = Math.ceil(data.byteLength / this.chunkSize)
     const waiter = makeWaiter()
-    waiter.remaining = fragments
+    waiter.remaining = 0
     for (let offset = 0; offset < data.byteLength; offset += this.chunkSize) {
-      tx.queue.push({
-        data: data.subarray(offset, Math.min(offset + this.chunkSize, data.byteLength)),
-        fin: false,
-        waiter,
-        finWaiter: null,
-      })
+      const slice = data.subarray(offset, Math.min(offset + this.chunkSize, data.byteLength))
+      const tail = tx.queue.length > 0 ? tx.queue[tx.queue.length - 1] : null
+      if (tail && !tail.fin && tail.data.byteLength + slice.byteLength <= this.chunkSize) {
+        tail.data = Buffer.concat([tail.data, slice])
+        tail.waiters.push(waiter)
+        waiter.remaining += 1
+      } else {
+        tx.queue.push({
+          data: slice,
+          fin: false,
+          waiters: [waiter],
+          finWaiter: null,
+        })
+        waiter.remaining += 1
+      }
     }
     this.pump(sid, tx)
     return waiter.promise
@@ -277,7 +285,7 @@ export class PeerArqSession {
       last.fin = true
       last.finWaiter = finWaiter
     } else {
-      tx.queue.push({ data: Buffer.alloc(0), fin: true, waiter: null, finWaiter })
+      tx.queue.push({ data: Buffer.alloc(0), fin: true, waiters: [], finWaiter })
     }
     this.pump(sid, tx)
     return finWaiter.promise
@@ -290,7 +298,7 @@ export class PeerArqSession {
     const tx = this.txStreams.get(sid)
     if (tx) this.teardownTx(sid, tx, new Error(`stream ${sid} reset`))
     this.rxStreams.delete(sid)
-    this.sendFrame(PeerFrameType.RST, sid, Buffer.alloc(0), 0)
+    this.trySendFrame(PeerFrameType.RST, sid, Buffer.alloc(0), 0)
   }
 
   /**
@@ -302,7 +310,7 @@ export class PeerArqSession {
   handleFrame(frameType: number, streamId: number, payload: Uint8Array, ack: number): void {
     if (this.closed) return
     if (typeof streamId !== 'number' || !Number.isInteger(streamId) || streamId < 0 || streamId > 0xffffffff) return
-    const ackValue = typeof ack === 'number' && Number.isInteger(ack) && ack > 0 ? ack : 0
+    const ackValue = typeof ack === 'number' && Number.isInteger(ack) && ack >= 0 ? ack : 0
     if (frameType === PeerFrameType.RST) {
       if (streamId === 0) return
       this.teardownTx(streamId, this.txStreams.get(streamId), new Error(`stream ${streamId} reset by peer`))
@@ -355,7 +363,34 @@ export class PeerArqSession {
     return total
   }
 
+  /**
+   * Immediately retransmit all unacked in-flight fragments and reset their RTO
+   * timers to `rtoMs` (called when a physical path transitions from `'none'` to
+   * ready so fragments queued during initial handshake fly without waiting for
+   * backed-off RTO timers).
+   */
+  flushInflight(): void {
+    if (this.closed) return
+    for (const [streamId, tx] of this.txStreams) {
+      for (const [seq, frag] of tx.inflight) {
+        this.clock.clearTimeout(frag.timer)
+        frag.rto = this.rtoMs
+        frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
+        this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
+      }
+      this.pump(streamId, tx)
+    }
+  }
+
   // -- internals -------------------------------------------------------------------
+
+  private trySendFrame(frameType: number, streamId: number, payload: Uint8Array, ack: number): void {
+    try {
+      this.sendFrame(frameType, streamId, payload, ack)
+    } catch {
+      // Physical path not ready or transiently unavailable; RTO / flushInflight recovers.
+    }
+  }
 
   private ensureTx(streamId: number): TxStream {
     let tx = this.txStreams.get(streamId)
@@ -381,14 +416,14 @@ export class PeerArqSession {
       const frag: TxFragment = {
         seq,
         payload: Buffer.concat([subheader, queued.data]),
-        waiter: queued.waiter,
+        waiters: queued.waiters,
         finWaiter: queued.finWaiter,
         rto: this.rtoMs,
         timer: null,
       }
       frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
       tx.inflight.set(seq, frag)
-      this.sendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
+      this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
     }
   }
 
@@ -398,8 +433,8 @@ export class PeerArqSession {
     const frag = tx?.inflight.get(seq)
     if (!tx || !frag) return
     frag.rto = Math.min(frag.rto * 2, this.rtoMaxMs)
-    this.sendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
     frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
+    this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
   }
 
   private onData(streamId: number, payload: Uint8Array, piggyAck: number): void {
@@ -453,12 +488,12 @@ export class PeerArqSession {
       const delta = seq - rx.expected
       if (delta >= 0 && delta < SACK_BITMAP_BITS) bitmap[delta >> 3] |= 1 << (delta & 7)
     }
-    this.sendFrame(PeerFrameType.SACK, streamId, bitmap, rx.expected)
+    this.trySendFrame(PeerFrameType.SACK, streamId, bitmap, rx.expected)
   }
 
   private onSack(streamId: number, payload: Uint8Array, ack: number): void {
     this.applyCumulative(streamId, ack)
-    if (!ArrayBuffer.isView(payload) || ack <= 0) return
+    if (!ArrayBuffer.isView(payload) || ack < 0) return
     const view = asBufferView(payload)
     for (let bit = 0; bit < SACK_BITMAP_BITS; bit++) {
       const byte = view[bit >> 3] ?? 0
@@ -490,25 +525,28 @@ export class PeerArqSession {
     this.pump(streamId, tx)
   }
 
-  private settle(tx: TxStream, frag: TxFragment): void {
-    for (const waiter of [frag.waiter, frag.finWaiter]) {
-      if (!waiter) continue
+  private settle(_tx: TxStream, frag: TxFragment): void {
+    for (const waiter of frag.waiters) {
       waiter.remaining -= 1
       if (waiter.remaining <= 0) waiter.resolve()
     }
-    frag.waiter = null
-    frag.finWaiter = null
+    frag.waiters = []
+    if (frag.finWaiter) {
+      frag.finWaiter.remaining -= 1
+      if (frag.finWaiter.remaining <= 0) frag.finWaiter.resolve()
+      frag.finWaiter = null
+    }
   }
 
   private teardownTx(streamId: number, tx: TxStream | undefined, error: Error): void {
     if (!tx) return
     for (const frag of tx.inflight.values()) this.clock.clearTimeout(frag.timer)
     for (const frag of tx.inflight.values()) {
-      frag.waiter?.reject(error)
+      for (const waiter of frag.waiters) waiter.reject(error)
       frag.finWaiter?.reject(error)
     }
     for (const queued of tx.queue) {
-      queued.waiter?.reject(error)
+      for (const waiter of queued.waiters) waiter.reject(error)
       queued.finWaiter?.reject(error)
     }
     tx.inflight.clear()

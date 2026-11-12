@@ -126,7 +126,7 @@ export declare class PeerMux {
     private noteDeadStream;
     /** ARQ 顺序送达的一个入站分片（0 = 元数据，1+ = 体，fin = 结束）。 */
     private onStreamData;
-    /** 单个入站分片的按向处理（ARQ 已保证顺序，无需重排缓冲）。 */
+    /** 单个入站分片的按向处理（ARQ 已保证顺序，元数据支持跨分片与换行定界）。 */
     private onFragment;
     /** 对端对本流发了 RST：本地各件按「连接被切」销毁。 */
     private onStreamReset;
@@ -134,13 +134,13 @@ export declare class PeerMux {
     private abortStream;
     /** 向对端发 RST（本侧中止方向）。 */
     private resetStream;
-    /** 对端发起了一条流：解析请求元数据并派发进本机 relayHandler。 */
+    /** 对端发起了一条流：建流并交给 onFragment 累积/解析请求元数据与体。 */
     private openInbound;
     /** 构造虚拟 `req`/`res` 并直接调用本机 relayHandler。 */
     private materializeInboundRequest;
     /** 对捕获的 ServerResponse 原始字节做增量 HTTP/1.1 响应解析。 */
     private parseCapture;
-    /** 响应元数据只发一次，其后是体分片，完结时 FIN。 */
+    /** 响应元数据只发一次，其后是体分片，完结时 FIN（全部同步入 ARQ 队列，严守 FIFO 字节序）。 */
     private writeResponseMetaAndBody;
     /** res finish：补发残尾并 FIN（幂等，outboundFinished 守住）。 */
     private finishResponse;
