@@ -12,6 +12,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { startGateway } from '../dist/main.js';
+import { createGatewayApiServer } from '../dist/server.js';
+import { SqliteStore } from '../dist/store/sqlite-store.js';
+import { deriveMasterKeyFromSecret } from '../dist/master-key.js';
+import { PeerWsHub } from '../dist/peer-hub/ws-hub.js';
+import { UdpStunService } from '../dist/peer-hub/udp-stun.js';
 import WebSocket from 'ws';
 
 const TEST_ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -491,6 +496,161 @@ describe('完整实例：API + WS + UDP 同进程协同', () => {
       }
     } finally {
       await first.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------- welcome STUN 端点公布（PC-01a）
+
+describe('welcome 公布真实 UDP STUN 端口', () => {
+  test('测试配置（随机主端口、辅助关闭）：authorized welcome 带真实 UDP 主端口，altPort 为 null', async () => {
+    // 测试夹具用 port 0 / udpAltPort 0（非生产默认 19393/19394）：UDP 主端口内核分配、辅助口关闭。
+    // config.port 同时是 HTTP 监听口（内核另分配），welcome 必须给 UDP bind 结果而不是它。
+    const gw = await startTestGateway();
+    try {
+      assert.equal(gw.udpPorts.altPort, null, '测试配置 udpAltPort=0 应关闭辅助口');
+      assert.ok(
+        Number.isInteger(gw.udpPorts.primaryPort) && gw.udpPorts.primaryPort >= 1 && gw.udpPorts.primaryPort <= 65535,
+        `实际绑定主端口应为有效整数，收到 ${gw.udpPorts.primaryPort}`,
+      );
+
+      const cookie = await login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const created = await api(gw.base, 'POST', '/api/v1/networks', { body: { name: 'net-stun-default', admissionMode: 'key' }, cookie });
+      const net = created.json.data;
+
+      const node = identity();
+      const ws = await wsOpen(gw.base);
+      try {
+        await authNode(ws, node, { networkId: net.id, joinKey: net.joinKey, name: 'stun-node' });
+        const welcome = await wsJson(ws);
+        assert.equal(welcome.type, 'welcome');
+        assert.equal(welcome.status, 'authorized');
+        assert.deepEqual(welcome.stun, { primaryPort: gw.udpPorts.primaryPort, altPort: null });
+        assert.ok(
+          Number.isInteger(welcome.stun.primaryPort) && welcome.stun.primaryPort >= 1 && welcome.stun.primaryPort <= 65535,
+          `welcome.stun.primaryPort 应为有效整数，收到 ${welcome.stun.primaryPort}`,
+        );
+      } finally {
+        ws.close();
+        await wsClosed(ws);
+      }
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('自定义辅助端口：welcome.stun 携带主/辅两个实际绑定端口', async () => {
+    const altPort = await reserveUdpPort();
+    const gw = await startTestGateway({ udpAltPort: altPort });
+    try {
+      assert.equal(gw.udpPorts.altPort, altPort);
+
+      const cookie = await login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const created = await api(gw.base, 'POST', '/api/v1/networks', { body: { name: 'net-stun-alt', admissionMode: 'key' }, cookie });
+      const net = created.json.data;
+
+      const node = identity();
+      const ws = await wsOpen(gw.base);
+      try {
+        await authNode(ws, node, { networkId: net.id, joinKey: net.joinKey, name: 'stun-node-alt' });
+        const welcome = await wsJson(ws);
+        assert.equal(welcome.status, 'authorized');
+        assert.deepEqual(welcome.stun, { primaryPort: gw.udpPorts.primaryPort, altPort });
+        assert.ok(
+          Number.isInteger(welcome.stun.altPort) && welcome.stun.altPort >= 1 && welcome.stun.altPort <= 65535,
+          `welcome.stun.altPort 应为有效整数，收到 ${welcome.stun.altPort}`,
+        );
+      } finally {
+        ws.close();
+        await wsClosed(ws);
+      }
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------- UDP 启动窗口安全（PC-01a fix1）
+
+describe('UDP 启动窗口：回调安全与端口就绪时序', () => {
+  test('hub 已建、端口未就绪时回调拒绝准入且无副作用；bind 完成后 welcome 才带真实端口', async () => {
+    // 与 main.ts 同型的组装（fix1 形态：hub 先建、UDP 回调恒转发已初始化的 hub、
+    // 真实端口经供给器在 bind 完成后才对 welcome 可见）。主口绑成即可投递 UDP 事件，
+    // 「主口已绑、辅助口未完成」的启动窗口无法从外部冻结——这里用同一危险状态
+    // （hub 在、端口供给器仍返回 null）直接调用初始回调验证安全性，仅调回调、
+    // 不发任何数据包。
+    const store = new SqliteStore({ path: path.join(makeDataDir(), 'gateway.sqlite') });
+    const masterKey = deriveMasterKeyFromSecret('pc-01a-fix1');
+    await store.ensureBootstrapAdmin({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD });
+    let boundPorts = null;
+    const hub = new PeerWsHub({ store, masterKey, rateTickMs: null, flushMs: null, stunPorts: () => boundPorts });
+    const admitProbe = (networkId, nodeId, publicKeyHex) => hub.admitStunProbe(networkId, nodeId, publicKeyHex);
+    const lanEndpointsLookup = (networkId, nodeId) => hub.getLanEndpoints(networkId, nodeId);
+    const onNatDetected = (record) => hub.applyNatObservation(record);
+    const udp = new UdpStunService({
+      primaryPort: 0,
+      altPort: null,
+      host: '127.0.0.1',
+      admitProbe,
+      lanEndpointsLookup,
+      onNatDetected,
+    });
+    const server = createGatewayApiServer({ store, masterKey, runtime: hub, hooks: hub.hooks, topology: hub });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    hub.attach(server);
+    const base = `http://127.0.0.1:${server.address().port}`;
+    let ws = null;
+    try {
+      // ---- 启动窗口（bind 前，端口供给器仍为 null）：回调必须安全且无业务副作用 ----
+      assert.equal(
+        admitProbe('0123456789abcdef', 'abcd1234', 'aa'.repeat(32)),
+        null,
+        '未就绪窗口必须明确拒绝准入（null），不得退回无准入 standalone 放行',
+      );
+      assert.deepEqual(lanEndpointsLookup('0123456789abcdef', 'abcd1234'), []);
+      onNatDetected({
+        networkId: '0123456789abcdef',
+        nodeId: 'abcd1234',
+        natType: 'cone',
+        reflexiveIp: '127.0.0.1',
+        reflexivePort: 40001,
+        serverPortRole: 'primary',
+      });
+      await hub.flushTelemetry();
+      assert.deepEqual(await store.listMembers('0123456789abcdef'), [], '窗口内的 NAT 通知不得落任何成员业务状态');
+
+      // ---- 正常 bind 生命周期：真实绑定完成后端口才经供给器可见 ----
+      boundPorts = await udp.bind();
+      assert.ok(
+        Number.isInteger(boundPorts.primaryPort) && boundPorts.primaryPort >= 1 && boundPorts.primaryPort <= 65535,
+        `bind 结果应为有效端口，收到 ${boundPorts.primaryPort}`,
+      );
+
+      const cookie = await login(base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const created = await api(base, 'POST', '/api/v1/networks', { body: { name: 'net-fix1', admissionMode: 'key' }, cookie });
+      const net = created.json.data;
+      const node = identity();
+      ws = await wsOpen(base);
+      await authNode(ws, node, { networkId: net.id, joinKey: net.joinKey, name: 'fix1-node' });
+      const welcome = await wsJson(ws);
+      assert.equal(welcome.status, 'authorized');
+      assert.deepEqual(welcome.stun, { primaryPort: boundPorts.primaryPort, altPort: null });
+    } finally {
+      if (ws !== null) {
+        ws.close();
+        await wsClosed(ws);
+      }
+      await hub.close();
+      await udp.close();
+      await new Promise((resolve) => {
+        server.closeIdleConnections?.();
+        server.closeAllConnections?.();
+        server.close(() => resolve());
+      });
+      await store.close();
     }
   });
 });
