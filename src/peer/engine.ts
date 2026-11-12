@@ -104,7 +104,11 @@ export interface PeerEngineOptions {
   serverName: () => string
   /** 自带已绑定的打洞 socket（测试防火墙注入）；缺省自建 udp4。 */
   udpSocket?: DgramSocket
-  /** 网关双 UDP 端口（STUN 自查）；null 关闭探测。 */
+  /** STUN 自查端口三态：缺省（生产）从 authorized welcome 的 `stun` 字段读
+   * 网关真实 UDP 端口（PC-01a 起下发；缺字段/形状坏明确降级 unknown）；
+   * `null` 明确关闭探测（welcome 也不看）；对象为受控调用者的固定端口
+   * 覆盖（welcome 不看）。三态共用同一生命周期：每条网关连接至多一次探测
+   * 或降级，连接断开重连即新代次重探（fix1）。 */
   udpProbe?: { primaryPort: number; altPort?: number } | null
   /** 打洞节奏（缺省全按 PG-7 规格）。 */
   punch?: PeerEnginePunchTimings
@@ -154,6 +158,23 @@ const realClock = {
   clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 }
 
+/**
+ * authorized welcome 的可选 `stun` 字段（PC-01a 网关契约：真实 UDP bind
+ * 端口，`{ primaryPort, altPort }`，altPort 为实际端口或 null）。welcome 是
+ * 网络边界上的外来数据：主口必须是 1..65535 的整数，辅助口必须是合法端口
+ * 或 null，形状不符一律回答 null——调用方据此明确降级 unknown，绝不拿垃圾
+ * 端口发包。
+ */
+const parseWelcomeStun = (value: unknown): { primaryPort: number; altPort: number | null } | null => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+  const stun = value as Record<string, unknown>
+  const primaryPort = stun['primaryPort']
+  if (typeof primaryPort !== 'number' || !Number.isInteger(primaryPort) || primaryPort < 1 || primaryPort > 65535) return null
+  const altPort = stun['altPort']
+  if (altPort !== null && (typeof altPort !== 'number' || !Number.isInteger(altPort) || altPort < 1 || altPort > 65535)) return null
+  return { primaryPort, altPort }
+}
+
 export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   const clock = options.clock ?? realClock
   const log = options.log ?? (() => {})
@@ -177,7 +198,15 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let deniedReason: string | null = null
   let maxPeers: number | null = null
   let natType: PeerNatType | null = null
-  let stunProbed = false
+  /** 网关连接代次：每次连接结束（WS close / resetActiveSession）即 +1。
+   * STUN 的「探测一次」以当前已获准的连接代次为单位，不是整个 joinNetwork
+   * 生命周期——网关侧重连即全新 ConnState（reflexive 置 null、STUN 准入绑定
+   * 本次连接 token），不重探新连接就没有 reflexiveEndpoint；网关重启换 UDP
+   * 端口或旧网关升级出 stun 字段也靠重连后的重探恢复。 */
+  let connEpoch = 0
+  /** 当前连接代次已做过的唯一一次探测（或降级）；-1 = 从未。同连接重复
+   * authorized welcome 不重发。 */
+  let stunProbedAtEpoch = -1
   let ws: WsClient | null = null
   let wsAttempt = 0
   let wsReconnectTimer: unknown = null
@@ -410,6 +439,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       if (ws !== client) return
       clearAuthDeadline()
       ws = null
+      // 连接结束即换代（PC-01b fix1）：本连接在途探测的迟到结果随之作废，
+      // 重连后的新连接按新代次重新探测登记反射端点。
+      connEpoch += 1
       if (stopped) return
       if (gatewayState !== 'paused' && gatewayState !== 'revoked' && gatewayState !== 'unconfigured') {
         gatewayState = 'offline'
@@ -497,7 +529,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           if (!livePeerIds.has(existingId)) memberGone(existingId)
         }
         refreshMounts()
-        runStunProbeOnce()
+        // PC-01b：STUN 端口来自本条 authorized welcome 的 stun 字段（生产缺省
+        // 路径；显式 udpProbe 在引擎内另行覆盖/关闭）。
+        runStunProbeOnce(message['stun'])
         armPathReport()
         schedulePathReport()
       } else {
@@ -577,11 +611,26 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
 
   // ------------------------------------------------------------ STUN 与 path-report
 
-  const runStunProbeOnce = (): void => {
-    if (stunProbed || stopped || options.udpProbe === null || punch === null) return
-    stunProbed = true
-    const probe = options.udpProbe
-    if (probe === undefined || probe.primaryPort < 1) return
+  const runStunProbeOnce = (welcomeStun: unknown): void => {
+    if (stopped || punch === null) return
+    if (options.udpProbe === null) return // 显式关闭：受控调用者的既有语义，welcome 也不看
+    if (stunProbedAtEpoch === connEpoch) return // 本连接代次已处理（探测或降级）
+    stunProbedAtEpoch = connEpoch
+    const epoch = connEpoch
+    const explicit = options.udpProbe
+    const probe = explicit !== undefined
+      ? { primaryPort: explicit.primaryPort, altPort: explicit.altPort ?? null }
+      : parseWelcomeStun(welcomeStun)
+    if (probe === null || probe.primaryPort < 1) {
+      if (explicit === undefined) {
+        // 生产缺省：authorized welcome 无可用 stun 端口（旧网关缺字段或形状
+        // 坏）——明确降级 unknown：不异常逃逸、不假报探测成功。本连接代次内
+        // 不重发；重连后的新连接重新评估（网关升级出有效字段即恢复探测）。
+        natType = 'unknown'
+        log('peer engine: STUN probe degraded to unknown — authorized welcome carries no usable stun ports')
+      }
+      return
+    }
     const net = readPeerNetwork(stateFile)
     if (net === undefined) return
     let hostname = '127.0.0.1'
@@ -591,7 +640,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     void probeStunNatType({
       primaryHost: hostname,
       primaryPort: probe.primaryPort,
-      ...(probe.altPort !== undefined && probe.altPort > 0 ? { altPort: probe.altPort } : {}),
+      ...(probe.altPort !== null && probe.altPort > 0 ? { altPort: probe.altPort } : {}),
       networkId: networkId ?? net.networkId,
       identity,
       // 承重墙（PG-8）：从打洞层自己的 socket 发探测——网关记录并广播的
@@ -601,10 +650,14 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       timeoutMs: 2000,
     })
       .then((result) => {
+        // 过期防护：stop、连接断开（换代）或换网/leave 之后的迟到结果一律
+        // 丢弃，不许覆盖新连接（或已清空的）探测状态。
+        if (stopped || epoch !== connEpoch) return
         natType = result.natType
         log(`peer engine: STUN probe → ${result.natType} (${result.reflexiveEndpoint ?? 'no reflexive answer'})`)
       })
       .catch(() => {
+        if (stopped || epoch !== connEpoch) return
         natType = 'unknown'
       })
   }
@@ -779,7 +832,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       try { punchSocket.close() } catch { /* already closed */ }
     }
     punchSocket = undefined
-    stunProbed = false
+    // 换代：resetActiveSession 先把 ws 置 null，旧连接的 close 事件因此不会
+    // 走到 close 回调里的换代（ws !== client 早退）——这里必须自己换代，
+    // 换网/leave 之后在途探测的迟到结果才不会写进新会话。
+    connEpoch += 1
     natType = null
     maxPeers = null
     deniedReason = null
