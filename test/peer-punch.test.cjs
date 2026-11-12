@@ -13,8 +13,9 @@
  *     X25519 + Ed25519 handshake into PeerSessionCiphers, LAN/P2P path
  *     classification with RTT, onPunchFallback at exactly 1000ms, silent
  *     60s reprobe that hot-upgrades to direct later, 5s encrypted
- *     PING/PONG keepalive with lost-direct detection after 3 misses,
- *     and close() that clears every timer and socket handle.
+ *     PING/PONG keepalive with lost-direct detection 15s after the last
+ *     authenticated receive (3 silent cycles, decoupled from the PING
+ *     tick), and close() that clears every timer and socket handle.
  *
  * Everything here drives the BUILT lib/peer/punch.js like every other
  * wiring test in this repo. The punch tests run REAL loopback UDP
@@ -159,31 +160,33 @@ async function makeManager(identity, clock, hooks = {}, port = 0) {
 /**
  * Two managers punching each other over real loopback UDP. A initiates;
  * B answers passively. Returns both managers plus the recorded events.
+ * `clockFactory` defaults to the manual clock; pass `() => undefined` to
+ * exercise the production `realClock` timer path (PC-04 real-process tests).
  */
-async function establishPair(hooksA = {}, hooksB = {}) {
+async function establishPair(hooksA = {}, hooksB = {}, clockFactory = manualClock) {
   const A = generatePeerIdentity()
   const B = generatePeerIdentity()
-  const clockA = manualClock()
-  const clockB = manualClock()
+  const clockA = clockFactory()
+  const clockB = clockFactory()
   const events = { aReady: [], bReady: [], aFallback: 0, bFallback: 0, aLost: [], bLost: [] }
   const aReadyDefer = defer()
   const bReadyDefer = defer()
   const { mgr: mgrA, socket: sockA } = await makeManager(A, clockA, {
     onDirectReady: (id, info) => {
-      events.aReady.push({ id, info })
+      events.aReady.push({ id, info, at: Date.now() })
       aReadyDefer.resolve({ id, info })
     },
     onPunchFallback: () => { events.aFallback += 1 },
-    onDirectLost: (id) => { events.aLost.push(id) },
+    onDirectLost: (id) => { events.aLost.push({ id, at: Date.now() }) },
     ...hooksA,
   })
   const { mgr: mgrB, socket: sockB } = await makeManager(B, clockB, {
     onDirectReady: (id, info) => {
-      events.bReady.push({ id, info })
+      events.bReady.push({ id, info, at: Date.now() })
       bReadyDefer.resolve({ id, info })
     },
     onPunchFallback: () => { events.bFallback += 1 },
-    onDirectLost: (id) => { events.bLost.push(id) },
+    onDirectLost: (id) => { events.bLost.push({ id, at: Date.now() }) },
     ...hooksB,
   })
   mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
@@ -801,7 +804,7 @@ test('keepalive: pings are answered; 3 unanswered cycles trigger onDirectLost; r
     await sleep(2)
     assert.deepEqual(events.aLost, [], 'two silent periods is not enough')
     clockA.advance(5000)
-    assert.deepEqual(events.aLost, [B.nodeId], 'three silent periods (15s) declare the direct path lost')
+    assert.deepEqual(events.aLost.map((entry) => entry.id), [B.nodeId], 'three silent periods (15s) declare the direct path lost')
     assert.equal(events.aFallback, 0, 'keepalive loss is not a punch fallback')
 
     // The background reprobe survives the lost event and keeps flying HELLOs.
@@ -966,5 +969,174 @@ test('beginPunch on an already-direct peer preserves live session ciphers withou
   } finally {
     await closeManager({ mgr: pair.mgrA, socket: pair.sockA })
     await closeManager({ mgr: pair.mgrB, socket: pair.sockB })
+  }
+})
+
+// -- 4. PC-04: loss deadline = lastSeen + keepAliveMs * keepAliveLostFrames ---------
+
+test('keepalive loss fires at exactly lastSeen+15000 across receive phases, not at the next PING tick', async () => {
+  // Phase 1: last valid receive at t=0 (silent from establishment) → loss at exactly 15000.
+  {
+    const pair = await establishPair()
+    const { B, clockA, mgrA, mgrB, sockB, events } = pair
+    try {
+      await closeManager({ mgr: mgrB, socket: sockB })
+      clockA.advance(14_999)
+      assert.deepEqual(events.aLost, [], '14999ms after the last receive is not enough')
+      clockA.advance(1) // → 15000 = lastSeen + 15000
+      assert.deepEqual(events.aLost.map((entry) => entry.id), [B.nodeId], 'loss at exactly lastSeen+15000')
+    } finally {
+      await closeManager({ mgr: mgrA, socket: pair.sockA })
+    }
+  }
+  // Phase 2: last valid receive at t=2000 (between PING ticks) → loss at exactly 17000.
+  {
+    const pair = await establishPair()
+    const { B, clockA, mgrA, mgrB, sockB, events } = pair
+    try {
+      clockA.advance(2_000)
+      mgrB.frameSenderFor(pair.A.nodeId)(PeerFrameType.DATA, 1, Buffer.from('late-frame'), 0)
+      await sleep(10) // the frame lands while the virtual clock sits at 2000 → lastSeen = 2000
+      await closeManager({ mgr: mgrB, socket: sockB })
+      clockA.advance(14_999) // → 16999, across the 15000 tick; the deadline is 17000
+      assert.deepEqual(events.aLost, [], 'not lost before lastSeen+15000 even across a PING tick')
+      clockA.advance(1) // → 17000
+      assert.deepEqual(events.aLost.map((entry) => entry.id), [B.nodeId], 'loss at exactly lastReceived(2000)+15000, not the 20000 tick')
+      clockA.advance(3_000) // → 20000: where the old tick sampling declared loss
+      assert.equal(events.aLost.length, 1, 'no duplicate loss at the old 5s tick moment')
+    } finally {
+      await closeManager({ mgr: mgrA, socket: pair.sockA })
+    }
+  }
+  // Phase 3: last valid receive at t=5200 (just after a PING tick) → loss at exactly 20200.
+  {
+    const pair = await establishPair()
+    const { B, clockA, mgrA, mgrB, sockB, events } = pair
+    try {
+      clockA.advance(5_200) // the 5000 tick fires and PINGs; B's PONG lands at virtual 5200
+      await sleep(10)
+      await closeManager({ mgr: mgrB, socket: sockB })
+      clockA.advance(14_999) // → 20199, across ticks at 10000/15000/20000 — none may declare loss
+      assert.deepEqual(events.aLost, [], 'silent PING ticks before the deadline never declare loss')
+      clockA.advance(1) // → 20200 = lastSeen + 15000
+      assert.deepEqual(events.aLost.map((entry) => entry.id), [B.nodeId], 'loss at exactly lastReceived(5200)+15000')
+    } finally {
+      await closeManager({ mgr: mgrA, socket: pair.sockA })
+    }
+  }
+})
+
+test('dropPeer during direct cancels the loss deadline: no late lost fires, no resurrection', async () => {
+  const pair = await establishPair()
+  const { B, clockA, mgrA, mgrB, sockB, sockA, events } = pair
+  try {
+    mgrA.dropPeer(B.nodeId)
+    await closeManager({ mgr: mgrB, socket: sockB })
+    clockA.advance(60_000)
+    assert.deepEqual(events.aLost, [], 'dropped peer has no loss deadline left to fire')
+    assert.equal(events.aReady.length, 1, 'a dropped session is never re-promoted to direct')
+    assert.equal(events.aFallback, 0, 'no punch fallback without an active punch round')
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
+  }
+})
+
+test('a keepalive loss fires exactly once; the silent reprobe never re-enters direct on its own', async () => {
+  const pair = await establishPair()
+  const { B, clockA, mgrA, mgrB, sockB, sockA, events } = pair
+  try {
+    await closeManager({ mgr: mgrB, socket: sockB })
+    clockA.advance(15_000)
+    assert.deepEqual(events.aLost.map((entry) => entry.id), [B.nodeId], 'loss declared once at the deadline')
+    clockA.advance(60_000) // → 75000: the silent reprobe fires HELLOs at the dead endpoint
+    assert.equal(events.aLost.length, 1, 'loss never fires twice for one direct epoch')
+    assert.equal(events.aReady.length, 1, 'no direct re-entry without a successful handshake')
+    assert.equal(events.aFallback, 0, 'reprobe HELLOs alone stay silent (window not yet expired)')
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
+  }
+})
+
+/**
+ * Real-clock pair (PC-04): both managers run the production `realClock`
+ * timer path with the default keepAliveMs=5000 / keepAliveLostFrames=3 —
+ * no shortened parameters. `events.aReady[0].at` is the same synchronous
+ * block that stamps `lastSeen`, so it anchors the loss deadline exactly.
+ */
+async function establishPairReal(hooksA = {}, hooksB = {}) {
+  return establishPair(hooksA, hooksB, () => undefined)
+}
+
+test('real-clock keepalive: healthy session runs past three cycles without a false loss; hard silence trips at lastSeen+15000', async () => {
+  const rxAt = []
+  const pair = await establishPairReal({
+    onEncryptedFrame: () => rxAt.push(Date.now()),
+  })
+  const { B, mgrA, mgrB, sockB, sockA, events } = pair
+  try {
+    // Healthy session: real PING/PONG round trips for 16.5s — more than
+    // three full keepalive cycles — must never declare a loss.
+    await sleep(16_500)
+    assert.deepEqual(events.aLost, [], 'a healthy session never false-loses past three keepalive cycles')
+    // Anchor the last valid receive with B's final frame (stamped in the
+    // same synchronous block as lastSeen), then B goes hard-silent.
+    mgrB.frameSenderFor(pair.A.nodeId)(PeerFrameType.DATA, 1, Buffer.from('last-frame'), 0)
+    await withTimeout(
+      (async () => {
+        while (rxAt.length === 0) await sleep(5)
+      })(),
+      2_000,
+      'the last frame reaches A',
+    )
+    const lastRx = rxAt[0]
+    await closeManager({ mgr: mgrB, socket: sockB })
+    await withTimeout(
+      (async () => {
+        while (events.aLost.length === 0) await sleep(20)
+      })(),
+      20_000,
+      'onDirectLost within 20s of hard silence',
+    )
+    const delay = events.aLost[0].at - lastRx
+    assert.equal(events.aLost[0].id, B.nodeId)
+    assert.ok(delay >= 15_000, `loss no earlier than lastSeen+15000 (got ${delay}ms)`)
+    assert.ok(delay <= 16_000, `loss within 1s scheduling slack of lastSeen+15000 (got ${delay}ms)`)
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
+  }
+})
+
+test('real-clock keepalive: a receive between PING ticks moves the loss to that receive+15000, not the next tick', async () => {
+  const rxAt = []
+  const pair = await establishPairReal({
+    onEncryptedFrame: () => rxAt.push(Date.now()),
+  })
+  const { mgrA, mgrB, sockB, sockA, events } = pair
+  try {
+    // One healthy real heartbeat cycle, then B's last frame lands at a
+    // non-tick moment; B goes hard-silent right after.
+    await sleep(2_000)
+    mgrB.frameSenderFor(pair.A.nodeId)(PeerFrameType.DATA, 1, Buffer.from('last-frame'), 0)
+    await withTimeout(
+      (async () => {
+        while (rxAt.length === 0) await sleep(5)
+      })(),
+      2_000,
+      'the last frame reaches A',
+    )
+    const lastRx = rxAt[0] // stamped in the same synchronous block as lastSeen
+    await closeManager({ mgr: mgrB, socket: sockB })
+    await withTimeout(
+      (async () => {
+        while (events.aLost.length === 0) await sleep(20)
+      })(),
+      20_000,
+      'onDirectLost within 20s of hard silence',
+    )
+    const delay = events.aLost[0].at - lastRx
+    assert.ok(delay >= 15_000, `loss no earlier than lastReceive+15000 (got ${delay}ms)`)
+    assert.ok(delay <= 16_000, `loss within 1s of lastReceive+15000, not the next 5s tick (got ${delay}ms)`)
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
   }
 })
