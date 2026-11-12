@@ -251,6 +251,8 @@ function udpSilence(sock, ms = 300) {
   });
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // ---------------------------------------------------------------- 裸 TCP WS 客户端（恶意形态：握完手不回 close 帧）
 
 /** 客户端 → 服务端的帧必须带掩码（RFC6455）；payload < 64KB */
@@ -487,8 +489,13 @@ async function startGateway(opts = {}) {
   const natRecords = [];
   const stun = new UdpStunService({
     primaryPort: 0,
-    altPort: 0,
+    // PC-02: stunAltDisabled=true 模拟配置层 udpAltPort=0（组合根映射成 null）
+    altPort: opts.stunAltDisabled ? null : 0,
     host: '127.0.0.1',
+    // PC-02: 缩短主/辅配对窗口，测「分类保留」不必等默认 10s
+    ...(opts.stunWindowMs !== undefined ? { windowMs: opts.stunWindowMs } : {}),
+    // 与生产组合根（main.ts）同款：准入绑定当前连接 token，代次守卫可测
+    admitProbe: (networkId, nodeId, publicKeyHex) => hub.admitStunProbe(networkId, nodeId, publicKeyHex),
     lanEndpointsLookup: (networkId, nodeId) => hub.getLanEndpoints(networkId, nodeId),
     onNatDetected: (rec) => { natRecords.push(rec); hub.applyNatObservation(rec); },
   });
@@ -1056,34 +1063,38 @@ describe('双 UDP 端口 STUN 与 NAT 判定', () => {
     }
   });
 
-  test('FIX-3：反射端点首次确定或变化时向同网同伴补发 punch-coordinate', async () => {
+  test('FIX-3/PC-02：反射端点首次确定或变化时向同网同伴补发 punch-coordinate', async () => {
     const gw = await startGateway();
+    const socks = [];
+    const mkSock = async () => { const sock = await udpSocket(); socks.push(sock); return sock; };
     try {
       const { net, a, b, wsB } = await setupPair(gw);
       const { primaryPort, altPort } = gw.udp;
 
-      // 首次 NAT 判定（同源端口双命中 → cone）→ B 收到补发打洞坐标
-      const s1 = await udpSocket();
+      // PC-02 时序：主口先到 → 立即补发携带反射端点的坐标（natType unknown，
+      // 辅口尚未配对）；辅口随后到达完成 cone 分类——端点未变，不再补发
+      const s1 = await mkSock();
       const p1 = s1.address().port;
       udpProbe(s1, primaryPort, a, { networkId: net.id, nonce: 'aa01' });
       await udpRecv(s1);
+      const punchUnknown = await wsJson(wsB);
+      assert.equal(punchUnknown.type, 'punch-coordinate');
+      assert.equal(punchUnknown.peerNodeId, a.nodeId);
+      assert.equal(punchUnknown.publicKeyHex, a.publicKeyHex, '补发打洞坐标必须携带对端公钥');
+      assert.equal(punchUnknown.reflexiveEndpoint, `127.0.0.1:${p1}`);
+      assert.equal(punchUnknown.natType, 'unknown', '主口观察必须先行发布（辅口未配对 → unknown）');
       udpProbe(s1, altPort, a, { networkId: net.id, nonce: 'aa02' });
       await udpRecv(s1);
-      const punch = await wsJson(wsB);
-      assert.equal(punch.type, 'punch-coordinate');
-      assert.equal(punch.peerNodeId, a.nodeId);
-      assert.equal(punch.publicKeyHex, a.publicKeyHex, '补发打洞坐标必须携带对端公钥');
-      assert.equal(punch.reflexiveEndpoint, `127.0.0.1:${p1}`);
-      assert.equal(punch.natType, 'cone');
-      s1.close();
+      assert.equal(gw.natRecords.at(-1).natType, 'cone', '辅口配对完成 cone 分类');
+      await wsSilence(wsB, 150); // 端点未变 → 不重复补发
 
-      // 反射端点变化（不同源端口 → symmetric）→ 再补发一次携带新端点。
-      // round-1 的槽位还在 10s 窗口内：s2 的 primary 探测会先与旧槽位判出
-      // 一次 symmetric（补发 s2 端点），随后 s3 产生携带新端点的补发——
-      // 两条都是合法判定，循环读到端点等于 p3 的那条为止
-      const s2 = await udpSocket();
-      const s3 = await udpSocket();
-      const p3 = s3.address().port;
+      // 反射端点变化（主口换新源端口）→ 再补发一次携带新端点；路由端点以
+      // 主口观察为准。round-1 的槽位还在 10s 窗口内：s2 的 primary 探测先与
+      // 旧辅口判出一次 symmetric（端点 p2）；s3 的辅口随后配对，端点仍取
+      // 主口 p2——两条发布的端点一致，只应看到一条新坐标
+      const s2 = await mkSock();
+      const s3 = await mkSock();
+      const p2 = s2.address().port;
       udpProbe(s2, primaryPort, a, { networkId: net.id, nonce: 'bb01' });
       await udpRecv(s2);
       udpProbe(s3, altPort, a, { networkId: net.id, nonce: 'bb02' });
@@ -1092,13 +1103,279 @@ describe('双 UDP 端口 STUN 与 NAT 判定', () => {
       const deadline = Date.now() + 2000;
       for (;;) {
         punch2 = await wsJson(wsB);
-        if (punch2.type === 'punch-coordinate' && punch2.peerNodeId === a.nodeId && punch2.reflexiveEndpoint === `127.0.0.1:${p3}`) break;
+        if (punch2.type === 'punch-coordinate' && punch2.peerNodeId === a.nodeId && punch2.reflexiveEndpoint === `127.0.0.1:${p2}`) break;
         if (Date.now() > deadline) throw new Error(`no re-punch with new endpoint, got ${JSON.stringify(punch2)}`);
       }
       assert.equal(punch2.natType, 'symmetric');
-      s2.close();
-      s3.close();
+      assert.equal(gw.natRecords.at(-1).reflexivePort, p2, '辅口配对发布的反射端点也以主口观察为准');
+      await wsSilence(wsB, 150);
     } finally {
+      for (const sock of socks.splice(0)) sock.close();
+      await gw.close();
+    }
+  });
+
+  // ------------------------------------------------------------ PC-02：主口可达即发布
+
+  test('PC-02：主口单独可达（辅助口黑洞）→ 立即发布反射端点，natType unknown', async () => {
+    const gw = await startGateway();
+    const socks = [];
+    const mkSock = async () => { const sock = await udpSocket(); socks.push(sock); return sock; };
+    try {
+      const { net, a, b, wsB } = await setupPair(gw);
+      const { primaryPort } = gw.udp;
+
+      // 只探测主口：辅助口的包从未发出——对网关而言与「辅助口实际丢包」不可区分
+      const s1 = await mkSock();
+      const p1 = s1.address().port;
+      udpProbe(s1, primaryPort, a, { networkId: net.id, nonce: 'cc01' });
+      const reply = await udpRecv(s1);
+      assert.equal(reply.type, 'stun-reply');
+      assert.equal(reply.serverPortRole, 'primary');
+
+      // 观察流：主口回包后立即发布一条 unknown 记录（现状：完全没有记录）
+      assert.deepEqual(gw.natRecords.at(-1), {
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'unknown',
+        reflexiveIp: '127.0.0.1',
+        reflexivePort: p1,
+        serverPortRole: 'primary',
+      });
+
+      // 可观察拓扑：A 的反射端点已登记（现状 lastIp 为 null）
+      const row = (await getTopology(gw, net.id)).members.find((m) => m.nodeId === a.nodeId);
+      assert.equal(row.natType, 'unknown');
+      assert.equal(row.lastIp, '127.0.0.1');
+
+      // 实际数据调用证据：同伴 B 收到携带 A 反射端点的补发打洞坐标
+      const punch = await wsJson(wsB);
+      assert.equal(punch.type, 'punch-coordinate');
+      assert.equal(punch.peerNodeId, a.nodeId);
+      assert.equal(punch.reflexiveEndpoint, `127.0.0.1:${p1}`);
+      assert.equal(punch.natType, 'unknown');
+    } finally {
+      for (const sock of socks.splice(0)) sock.close();
+      await gw.close();
+    }
+  });
+
+  test('PC-02：辅助口关闭（altPort null）→ 主口观察同样立即发布', async () => {
+    const gw = await startGateway({ stunAltDisabled: true });
+    const socks = [];
+    const mkSock = async () => { const sock = await udpSocket(); socks.push(sock); return sock; };
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+      const a = identity();
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey });
+      assert.equal((await wsJson(wsA)).status, 'authorized');
+      assert.equal(gw.udp.altPort, null, '夹具确认辅助口已关闭');
+
+      const s1 = await mkSock();
+      const p1 = s1.address().port;
+      udpProbe(s1, gw.udp.primaryPort, a, { networkId: net.id, nonce: 'dd01' });
+      const reply = await udpRecv(s1);
+      assert.equal(reply.serverPortRole, 'primary');
+
+      assert.deepEqual(gw.natRecords.at(-1), {
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'unknown',
+        reflexiveIp: '127.0.0.1',
+        reflexivePort: p1,
+        serverPortRole: 'primary',
+      });
+      const row = (await getTopology(gw, net.id)).members.find((m) => m.nodeId === a.nodeId);
+      assert.equal(row.natType, 'unknown');
+      assert.equal(row.lastIp, '127.0.0.1');
+    } finally {
+      for (const sock of socks.splice(0)) sock.close();
+      await gw.close();
+    }
+  });
+
+  test('PC-02：只辅助口可达不发布——先辅助后主口，端点以主口观察为准', async () => {
+    const gw = await startGateway();
+    const socks = [];
+    const mkSock = async () => { const sock = await udpSocket(); socks.push(sock); return sock; };
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+      const a = identity();
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey });
+      assert.equal((await wsJson(wsA)).status, 'authorized');
+      const { primaryPort, altPort } = gw.udp;
+
+      // 辅助口先到：只记槽位等主口配对，绝不冒充主口端点发布
+      const altSock = await mkSock();
+      const altPort0 = altSock.address().port;
+      udpProbe(altSock, altPort, a, { networkId: net.id, nonce: 'ee01' });
+      await udpRecv(altSock);
+      assert.equal(gw.natRecords.length, 0, '仅辅助口可达不得产生任何 NAT 记录');
+
+      // 主口后到（不同源端口 → symmetric）：发布端点必须取主口观察
+      const primarySock = await mkSock();
+      const primaryPort0 = primarySock.address().port;
+      udpProbe(primarySock, primaryPort, a, { networkId: net.id, nonce: 'ee02' });
+      await udpRecv(primarySock);
+      assert.deepEqual(gw.natRecords.at(-1), {
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'symmetric',
+        reflexiveIp: '127.0.0.1',
+        reflexivePort: primaryPort0,
+        serverPortRole: 'primary',
+      });
+      const row = (await getTopology(gw, net.id)).members.find((m) => m.nodeId === a.nodeId);
+      assert.equal(row.natType, 'symmetric');
+      assert.equal(row.lastIp, '127.0.0.1');
+    } finally {
+      for (const sock of socks.splice(0)) sock.close();
+      await gw.close();
+    }
+  });
+
+  test('PC-02：新鲜配对才分类——窗内反复主口更新继续配对，过窗正确降级 unknown', async () => {
+    const gw = await startGateway({ stunWindowMs: 250 });
+    const socks = [];
+    const mkSock = async () => { const sock = await udpSocket(); socks.push(sock); return sock; };
+    try {
+      const { net, a, b, wsB } = await setupPair(gw);
+      const { primaryPort, altPort } = gw.udp;
+
+      // 双端口正常分类 → cone
+      const s1 = await mkSock();
+      const p1 = s1.address().port;
+      udpProbe(s1, primaryPort, a, { networkId: net.id, nonce: 'ff01' });
+      await udpRecv(s1);
+      const punchUnknown = await wsJson(wsB);
+      assert.equal(punchUnknown.reflexiveEndpoint, `127.0.0.1:${p1}`);
+      assert.equal(punchUnknown.natType, 'unknown');
+      udpProbe(s1, altPort, a, { networkId: net.id, nonce: 'ff02' });
+      await udpRecv(s1);
+      assert.equal(gw.natRecords.at(-1).natType, 'cone');
+
+      // 窗口内仅主口更新（新源端口）：同代辅口仍新鲜 → 继续配对分类
+      // （不同源端口 → symmetric），不是无条件先发 unknown
+      const s2 = await mkSock();
+      const p2 = s2.address().port;
+      udpProbe(s2, primaryPort, a, { networkId: net.id, nonce: 'ff03' });
+      await udpRecv(s2);
+      assert.deepEqual(gw.natRecords.at(-1), {
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'symmetric',
+        reflexiveIp: '127.0.0.1',
+        reflexivePort: p2,
+        serverPortRole: 'primary',
+      });
+      const punchSymmetric = await wsJson(wsB);
+      assert.equal(punchSymmetric.reflexiveEndpoint, `127.0.0.1:${p2}`);
+      assert.equal(punchSymmetric.natType, 'symmetric');
+
+      // 等 > windowMs：主辅槽位过期。此后仅主口的观察没有新鲜配对——
+      // 正确降级为 unknown（诚实反映「当前分类不可知」），端点照常更新
+      await sleep(400);
+      const s3 = await mkSock();
+      const p3 = s3.address().port;
+      udpProbe(s3, primaryPort, a, { networkId: net.id, nonce: 'ff04' });
+      await udpRecv(s3);
+      assert.deepEqual(gw.natRecords.at(-1), {
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'unknown',
+        reflexiveIp: '127.0.0.1',
+        reflexivePort: p3,
+        serverPortRole: 'primary',
+      });
+      const punchDowngrade = await wsJson(wsB);
+      assert.equal(punchDowngrade.reflexiveEndpoint, `127.0.0.1:${p3}`);
+      assert.equal(punchDowngrade.natType, 'unknown');
+      const row = (await getTopology(gw, net.id)).members.find((m) => m.nodeId === a.nodeId);
+      assert.equal(row.natType, 'unknown', '过窗后的 unknown 是正确降级，不得沿用旧分类');
+    } finally {
+      for (const sock of socks.splice(0)) sock.close();
+      await gw.close();
+    }
+  });
+
+  test('PC-02：正常重连后代次守卫——旧连接的分类不混入新连接', async () => {
+    const gw = await startGateway();
+    const socks = [];
+    const mkSock = async () => { const sock = await udpSocket(); socks.push(sock); return sock; };
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+      const a = identity();
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey });
+      assert.equal((await wsJson(wsA)).status, 'authorized');
+      const { primaryPort, altPort } = gw.udp;
+
+      // 连接代次 1：双端口 cone
+      const s1 = await mkSock();
+      udpProbe(s1, primaryPort, a, { networkId: net.id, nonce: 'ab01' });
+      await udpRecv(s1);
+      udpProbe(s1, altPort, a, { networkId: net.id, nonce: 'ab02' });
+      await udpRecv(s1);
+      assert.equal(gw.natRecords.at(-1).natType, 'cone');
+
+      // 服务端断开 → 同一身份重新入网（新连接代次 2）
+      const conn = gw.hub.conns.get(net.id)?.get(a.nodeId);
+      assert.ok(conn, 'A 在路由表');
+      conn.ws.close();
+      await wsClosed(wsA);
+      const wsA2 = await wsOpen(gw.base);
+      await authNode(wsA2, a, { networkId: net.id, joinKey: net.joinKey });
+      assert.equal((await wsJson(wsA2)).status, 'authorized');
+
+      // 新代次仅主口探测：必须发布 unknown——既不能沿用旧代次的 cone，
+      // 也不能沉默（新连接没有反射端点可供同伴打洞）
+      const s2 = await mkSock();
+      const p2 = s2.address().port;
+      udpProbe(s2, primaryPort, a, { networkId: net.id, nonce: 'ab03' });
+      await udpRecv(s2);
+      assert.deepEqual(gw.natRecords.at(-1), {
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'unknown',
+        reflexiveIp: '127.0.0.1',
+        reflexivePort: p2,
+        serverPortRole: 'primary',
+      });
+      const row = (await getTopology(gw, net.id)).members.find((m) => m.nodeId === a.nodeId);
+      assert.equal(row.natType, 'unknown', '旧代次分类不得混入新连接');
+    } finally {
+      for (const sock of socks.splice(0)) sock.close();
+      await gw.close();
+    }
+  });
+
+  test('PC-02：同网多成员各自观察不串——记录与端点按节点各归各', async () => {
+    const gw = await startGateway();
+    const socks = [];
+    const mkSock = async () => { const sock = await udpSocket(); socks.push(sock); return sock; };
+    try {
+      const { net, a, b } = await setupPair(gw);
+      const { primaryPort } = gw.udp;
+      const sockA = await mkSock();
+      const sockB = await mkSock();
+      const portA = sockA.address().port;
+      const portB = sockB.address().port;
+      udpProbe(sockA, primaryPort, a, { networkId: net.id, nonce: 'cd01' });
+      await udpRecv(sockA);
+      udpProbe(sockB, primaryPort, b, { networkId: net.id, nonce: 'cd02' });
+      await udpRecv(sockB);
+
+      const rows = (await getTopology(gw, net.id)).members;
+      assert.equal(rows.find((m) => m.nodeId === a.nodeId).natType, 'unknown');
+      assert.equal(rows.find((m) => m.nodeId === b.nodeId).natType, 'unknown');
+      const recA = gw.natRecords.find((r) => r.nodeId === a.nodeId);
+      const recB = gw.natRecords.find((r) => r.nodeId === b.nodeId);
+      assert.equal(recA.reflexivePort, portA, 'A 的记录带 A 自己的反射端口');
+      assert.equal(recB.reflexivePort, portB, 'B 的记录带 B 自己的反射端口');
+    } finally {
+      for (const sock of socks.splice(0)) sock.close();
       await gw.close();
     }
   });
