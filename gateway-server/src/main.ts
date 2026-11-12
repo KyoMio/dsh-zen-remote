@@ -77,6 +77,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       primaryPort: config.port,
       // 配置层 `udpAltPort=0 表示关闭辅助口` → 映射成 udp-stun 的 null
       altPort: config.udpAltPort === 0 ? null : config.udpAltPort,
+      admitProbe: (networkId, nodeId, publicKeyHex) => hub.admitStunProbe(networkId, nodeId, publicKeyHex),
       lanEndpointsLookup: (networkId, nodeId) => hub.getLanEndpoints(networkId, nodeId),
       onNatDetected: (record) => hub.applyNatObservation(record),
     });

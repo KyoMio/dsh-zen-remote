@@ -45,11 +45,16 @@ export interface UdpStunOptions {
   now?: () => number;
   /** NAT 判定回调；抛错只记一次判定失败，不影响 UDP 服务 */
   onNatDetected: (record: NatObservation) => void;
+  /** Production must bind the hub's live admission check. Omission is standalone
+   * stateless STUN mode (also used by isolated protocol tests), not gateway authorization.
+   * Return a stable token for this connection, a new token on replacement, or null to deny. */
+  admitProbe?: (networkId: string, nodeId: string, publicKeyHex: string) => symbol | null;
   /** 查询节点上报的 lanEndpoints（`ip:port` 字符串数组），用于 public 判定 */
   lanEndpointsLookup?: (networkId: string, nodeId: string) => readonly string[];
 }
 
 interface ProbeSlot {
+  admission: symbol;
   at: number;
   ip: string;
   port: number;
@@ -62,6 +67,7 @@ export class UdpStunService {
   private readonly windowMs: number;
   private readonly timestampWindowMs: number;
   private readonly now: () => number;
+  private readonly standaloneAdmission = Symbol();
   private primary: Socket | null = null;
   private alt: Socket | null = null;
   /** (networkId|nodeId) → 主/辅两个端口最近一次探测 */
@@ -133,6 +139,11 @@ export class UdpStunService {
     })) return;
     if (Math.abs(this.now() - timestamp) > this.timestampWindowMs) return;
 
+    const admitted = () => this.options.admitProbe === undefined
+      ? this.standaloneAdmission : this.options.admitProbe(networkId, nodeId, publicKeyHex);
+    const admission = admitted();
+    if (admission === null) return;
+
     // 先原路回包再分类——反射应答不依赖对方是否探测过另一个端口
     const reply = Buffer.from(JSON.stringify({
       type: 'stun-reply',
@@ -143,11 +154,13 @@ export class UdpStunService {
     }));
     await new Promise<void>((resolve) => socket.send(reply, rinfo.port, rinfo.address, () => resolve()));
 
-    this.classify(networkId, nodeId, role, rinfo.address, rinfo.port);
+    // A disable/re-enable or same-identity reconnect invalidates this pending reply.
+    if (admitted() !== admission) return;
+    this.classify(networkId, nodeId, role, rinfo.address, rinfo.port, admission);
   }
 
   /** 记录本次探测并与另一端口短窗口内的上次探测比对，判定 NAT 类型 */
-  private classify(networkId: string, nodeId: string, role: ServerPortRole, ip: string, port: number): void {
+  private classify(networkId: string, nodeId: string, role: ServerPortRole, ip: string, port: number, admission: symbol): void {
     const key = `${networkId}|${nodeId}`;
     const entry = this.slots.get(key) ?? {};
     const now = this.now();
@@ -159,12 +172,12 @@ export class UdpStunService {
         if (!fresh) this.slots.delete(k);
       }
     }
-    entry[role] = { at: now, ip, port };
+    entry[role] = { admission, at: now, ip, port };
     this.slots.set(key, entry);
 
     const otherRole: ServerPortRole = role === 'primary' ? 'alt' : 'primary';
     const other = entry[otherRole];
-    if (other === undefined || now - other.at > this.windowMs) return;
+    if (other === undefined || other.admission !== admission || now - other.at > this.windowMs) return;
 
     const sameIp = other.ip === ip;
     const samePort = other.port === port;
