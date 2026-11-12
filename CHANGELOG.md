@@ -14,6 +14,10 @@
 - **命令行工具支持 `peer` 角色与子命令**：新增 `dsh-zen-remote setup --role peer` 与 `peer join / status / trust / leave`，向导同步支持「作为节点端」三步入网。
 - **可配置多服务端配对上限 `maxServers`**：子客户端的配对上限（默认 8 台）现可在设置里调整（整数 1–64），环境变量 `LAN_GATE_MAX_SERVERS` 亦可覆盖；改动即时生效，无需重载插件行。
 
+### 兼容
+
+- **适配 DSH 0.2.2-rc.2**：远程会话转发官方工作区文件搜索（`workspaceFiles/search`）、办公文档预览（`officeKit/render`，同时保留 0.2.2-rc.1 / npm `latest` 的 `officeToPdf/render`）、子智能体中断（`subagents/interruptByUser`，同时保留 `interruptByParent`），以及 Agent 终端侧栏的会话终端监视流（`terminal/watch`）。两端版本混连时会话 / 文件 / 子智能体等指纹组会显示为「不同」，不会硬拒绝。
+
 ### 修复
 
 - **加固节点握手与重连**：仅已准入身份参与 UDP 握手，非法密钥不再中断宿主，旧握手不能回滚活跃密钥；取消连接及认证超时可靠收口。保留无反代 HTTP/WS 接入，HTTPS/WSS 严格验证证书。

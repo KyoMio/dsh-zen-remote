@@ -69,7 +69,7 @@ test('the method list covers exactly the known binary-result methods', () => {
   // 2.2.6 added the Office preview converter: its result carries the complete
   // PDF bytes as `data: Uint8Array`, so it needs the same marker as a file
   // read.
-  assert.deepEqual([...INVOKE_BINARY_RESULT_METHODS], ['workspaceFiles/readBytes', 'officeToPdf/render'])
+  assert.deepEqual([...INVOKE_BINARY_RESULT_METHODS], ['workspaceFiles/readBytes', 'officeToPdf/render', 'officeKit/render'])
 })
 
 test('an EMPTY Uint8Array round-trips too (review 2026-10-14: the empty base64 string is a legal marker)', () => {

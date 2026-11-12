@@ -978,6 +978,28 @@ test('T31/T41a subagents: both calls forward with parent shared and child inheri
   } finally { await server.stop() }
 })
 
+test('T41a subagents/interruptByUser (0.2.2-rc.2): child inherited from shared parent, foreign child refuses', async () => {
+  // The renamed endpoint carries only childSessionId; the child still
+  // borrows the parent's share through parentOf. A foreign child refuses
+  // before DSH is asked. interruptByParent stays registered for 0.2.2-rc.1.
+  const parts = makeParts('t41a-interrupt-by-user', {
+    parentOf: (id) => (id === 'session-child' ? 'session-parent' : undefined),
+  })
+  parts.store.share('session-parent')
+  const server = await startServer(parts.handler)
+  try {
+    const interrupt = { childSessionId: 'session-child' }
+    const ok = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'interruptByUser', args: interrupt }, AUTH))
+    assert.equal(ok.status, 200)
+    assert.deepEqual(parts.calls[0].args, interrupt, 'top-level child id travels verbatim')
+
+    const foreign = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'subagents', method: 'interruptByUser', args: { childSessionId: 'session-foreign' } }, AUTH))
+    assert.equal(foreign.status, 403, 'a foreign child refuses')
+    assert.deepEqual(await foreign.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 1, 'the refusal never reached the gateway')
+  } finally { await server.stop() }
+})
+
 // ---- T41a-fix: @ candidates and prompt-text session references ---------------------
 
 test('T41a-fix reference codec: canonical base64url(JSON) round-trip, non-canonical rejected', () => {
