@@ -84,6 +84,32 @@ for (const method of ['follow', 'control']) {
   })
 }
 
+async function responseWithin(promise) {
+  let timer
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('peer response did not settle')), 500)
+    })])
+  } finally { clearTimeout(timer) }
+}
+
+for (const status of [204, 205, 304]) {
+  test(`peer response: ${status} resolves with a null body`, { timeout: 3000 }, async (t) => {
+    const fetch = pair(t, async (_req, res) => { res.writeHead(status); res.end() })
+    const response = await responseWithin(fetch('http://peer/no-content', { signal: AbortSignal.timeout(1000) }))
+    assert.equal(response.status, status)
+    assert.equal(response.body, null)
+    assert.equal(await response.text(), '')
+  })
+}
+
+test('peer response: invalid response metadata rejects instead of stranding fetch', { timeout: 3000 }, async (t) => {
+  const fetch = pair(t, async (_req, res) => {
+    res.socket.write('HTTP/1.1 200 OK\r\nbad\u0001name: value\r\n\r\n')
+  })
+  await assert.rejects(responseWithin(fetch('http://peer/invalid-header', { signal: AbortSignal.timeout(1000) })), /header/i)
+})
+
 test('peer response: repeated large writes drain and complete a content-length body', { timeout: 5000 }, async (t) => {
   const chunk = Buffer.alloc(200000, 'x')
   let response

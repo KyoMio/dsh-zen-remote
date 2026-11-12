@@ -390,23 +390,30 @@ export class PeerMux {
       return new Promise<Response>((resolve, reject) => {
         stream.responseResolve = (meta) => {
           if (settled) return
-          settled = true
-          stream.responseResolved = true
-          const resHeaders = new Headers()
-          for (const [name, value] of Object.entries(meta.headers)) {
-            // Response 自己管传输编码与长度；逐跳头不进适配层。
-            if (name === 'transfer-encoding' || name === 'content-length' || name === 'connection' || name === 'keep-alive') continue
-            resHeaders.set(name, value)
+          try {
+            const resHeaders = new Headers()
+            for (const [name, value] of Object.entries(meta.headers)) {
+              // Response 自己管传输编码与长度；逐跳头不进适配层。
+              if (name === 'transfer-encoding' || name === 'content-length' || name === 'connection' || name === 'keep-alive') continue
+              resHeaders.set(name, value)
+            }
+            const body = method === 'HEAD' || [204, 205, 304].includes(meta.status) ? null : new ReadableStream<Uint8Array>({
+              start: (controller) => {
+                stream.bodyController = controller
+              },
+              cancel: () => {
+                this.resetStream(session, stream)
+              },
+            })
+            const response = new Response(body, { status: meta.status, statusText: meta.statusText, headers: resHeaders })
+            // Commit only after validation: constructor failures must reject fetch.
+            settled = true
+            stream.responseResolved = true
+            resolve(response)
+          } catch (error) {
+            this.resetStream(session, stream)
+            this.abortStream(session, stream, error instanceof Error ? error : new Error(String(error)))
           }
-          const body = new ReadableStream<Uint8Array>({
-            start: (controller) => {
-              stream.bodyController = controller
-            },
-            cancel: () => {
-              this.resetStream(session, stream)
-            },
-          })
-          resolve(new Response(body, { status: meta.status, statusText: meta.statusText, headers: resHeaders }))
         }
         stream.responseReject = (err) => {
           if (settled) return
