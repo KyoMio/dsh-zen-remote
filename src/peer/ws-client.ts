@@ -20,6 +20,8 @@ import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 
 const WS_MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+const MAX_PENDING_BYTES = 1024 * 1024
+const CONTROL_RESERVE_BYTES = 64 * 1024
 
 /** 一个客户端帧头（payload ≤ 64KB 用 16 位长度；更大用 64 位）。 */
 function encodeClientFrame(opcode: number, payload: Buffer): Buffer {
@@ -68,8 +70,10 @@ export class WsClient extends EventEmitter {
   private closeSent = false
   private gotClose = false
   private closeTimer: ReturnType<typeof setTimeout> | null = null
+  private request: http.ClientRequest | null = null
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null
 
-  constructor(url: string, headers: Record<string, string> = {}) {
+  constructor(url: string, headers: Record<string, string> = {}, options: { handshakeTimeoutMs?: number } = {}) {
     super()
     this.url = url
     const parsed = new URL(url)
@@ -77,8 +81,12 @@ export class WsClient extends EventEmitter {
     if (parsed.protocol !== 'ws:' && !secure) throw new TypeError(`ws client: unsupported protocol ${parsed.protocol}`)
     const port = parsed.port !== '' ? Number(parsed.port) : secure ? 443 : 80
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new TypeError(`ws client: bad port ${parsed.port}`)
+    const handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000
+    if (!Number.isInteger(handshakeTimeoutMs) || handshakeTimeoutMs < 1 || handshakeTimeoutMs > 2_147_483_647) {
+      throw new TypeError('ws client: invalid handshakeTimeoutMs')
+    }
     const key = randomBytes(16).toString('base64')
-    const req = (secure ? https : http).request({
+    const req = this.request = (secure ? https : http).request({
       host: parsed.hostname,
       port,
       path: `${parsed.pathname}${parsed.search}`,
@@ -90,11 +98,17 @@ export class WsClient extends EventEmitter {
         'sec-websocket-version': '13',
         ...headers,
       },
-      // 桌面/局域网自签证书路径：引擎自己的 TLS 决策留给未来任务，这里
-      // 与网关自托管最常见的形态对齐（本地测试网关不持有效证书）。
-      ...(secure ? { rejectUnauthorized: false } : {}),
+      ...(secure ? { rejectUnauthorized: true } : {}),
     })
+    // Wall-clock deadline includes DNS/TCP/TLS, not only socket inactivity.
+    this.handshakeTimer = setTimeout(() => this.fail(new Error('ws client: handshake timeout')), handshakeTimeoutMs)
+    this.handshakeTimer.unref?.()
     req.on('upgrade', (res, socket, head) => {
+      if (this.state !== 'connecting') {
+        socket.destroy()
+        return
+      }
+      this.clearHandshake()
       const expect = createHash('sha1').update(`${key}${WS_MAGIC_GUID}`).digest('base64')
       if (res.headers.upgrade?.toLowerCase() !== 'websocket' || res.headers['sec-websocket-accept'] !== expect) {
         socket.destroy()
@@ -120,21 +134,25 @@ export class WsClient extends EventEmitter {
 
   /** 文本或二进制消息：字符串发 TEXT 帧，字节发 BINARY 帧（引擎的控制面靠
    * 文本/二进制分流——发错帧型网关会把 auth 当中转载荷丢掉）。 */
-  send(data: string | Uint8Array): void {
+  send(data: string | Uint8Array, control = false): void {
     if (this.state !== 'open' || this.socket === null) throw new Error('ws client: not open')
-    if (typeof data === 'string') {
-      this.socket.write(encodeClientFrame(0x1, Buffer.from(data, 'utf8')))
-      return
+    const text = typeof data === 'string'
+    const length = text ? Buffer.byteLength(data, 'utf8') : data.byteLength
+    const framedLength = length + (length < 126 ? 6 : length < 65536 ? 8 : 14)
+    const limit = text || control ? MAX_PENDING_BYTES : MAX_PENDING_BYTES - CONTROL_RESERVE_BYTES
+    // Reject BEFORE write: a false socket.write already accepted its bytes.
+    // ARQ retries rejected binary frames; its cancellation/ACKs retain a reserve.
+    if (this.socket.writableLength + framedLength > limit) {
+      throw Object.assign(new Error('ws client: send buffer full'), { code: 'ERR_PEER_BACKPRESSURE' })
     }
-    this.socket.write(encodeClientFrame(0x2, Buffer.from(data)))
+    this.socket.write(encodeClientFrame(text ? 0x1 : 0x2, Buffer.from(data)))
   }
 
   /** 发起关闭握手；对端 1000ms 内不回应即强拆。幂等。 */
   close(code = 1000, reason = ''): void {
     if (this.state === 'closed') return
     if (this.state === 'connecting') {
-      try { this.socket?.destroy() } catch { /* not connected yet */ }
-      this.state = 'closed'
+      this.finish(code, reason)
       return
     }
     if (!this.closeSent) {
@@ -245,9 +263,17 @@ export class WsClient extends EventEmitter {
     this.finish(1006, '')
   }
 
+  private clearHandshake(): void {
+    if (this.handshakeTimer !== null) clearTimeout(this.handshakeTimer)
+    this.handshakeTimer = null
+    this.request = null
+  }
+
   private finish(code: number, reason: string): void {
     if (this.state === 'closed') return
     this.state = 'closed'
+    this.request?.destroy()
+    this.clearHandshake()
     if (this.closeTimer !== null) {
       clearTimeout(this.closeTimer)
       this.closeTimer = null

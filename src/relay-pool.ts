@@ -132,9 +132,9 @@ export interface RelayPoolOptions {
    * `'default'` lets the network's cap win OUTRIGHT; a user-chosen value is
    * only lowered by it, never raised. Missing behaves like `'default'`. */
   getMaxServersSource?: () => ConfigSource | undefined
-  /** The gateway's announced peer cap (peer mode: the state file's
-   * `peerNetwork.maxPeersFromGateway`), live. Missing/undefined means "no
-   * network cap known" and the local configuration answers alone. */
+  /** The gateway's announced total member cap, INCLUDING this node (peer mode:
+   * the state file's `peerNetwork.maxPeersFromGateway`), live. Missing or invalid
+   * (<2) means "no network cap known" and local configuration answers alone. */
   getPeerNetworkCap?: () => number | undefined
   /** Peer mode: do not load or migrate persisted `client`-mode paired servers
    * from `zen-remote-state.json` — only virtual network mounts belong in the
@@ -161,7 +161,8 @@ export interface RelayPool {
   /** The EFFECTIVE pairing cap right now (PG-2): the locally configured
    * `maxServers` (its getter is live), except in peer mode under a network-
    * reported `maxPeersFromGateway`, where a default-layer config takes the
-   * gateway's cap outright and a user-chosen one is only lowered by it. */
+   * gateway's remote capacity (total minus self) and a user-chosen one is only
+   * lowered by it. */
   maxServers(): number
   /** Locate one entry by its state-file record id. */
   getByEntryId(entryId: string): RelayPoolEntryView | undefined
@@ -351,8 +352,9 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
   const maxServers = (): number => {
     const configured = options.getMaxServers?.() ?? MAX_PAIRED_SERVERS
     const gatewayCap = options.getPeerNetworkCap?.()
-    if (typeof gatewayCap !== 'number' || !Number.isInteger(gatewayCap) || gatewayCap < 1) return configured
-    const cap = Math.min(64, gatewayCap)
+    if (typeof gatewayCap !== 'number' || !Number.isSafeInteger(gatewayCap) || gatewayCap < 2) return configured
+    // The network count includes this node; pool entries are remote nodes only.
+    const cap = Math.min(64, gatewayCap - 1)
     const source = options.getMaxServersSource?.() ?? 'default'
     // Source 'default' (or its absence): the network's word wins outright.
     if (source === 'default') return cap

@@ -36,10 +36,14 @@ export declare class WsClient extends EventEmitter {
     private closeSent;
     private gotClose;
     private closeTimer;
-    constructor(url: string, headers?: Record<string, string>);
+    private request;
+    private handshakeTimer;
+    constructor(url: string, headers?: Record<string, string>, options?: {
+        handshakeTimeoutMs?: number;
+    });
     /** 文本或二进制消息：字符串发 TEXT 帧，字节发 BINARY 帧（引擎的控制面靠
      * 文本/二进制分流——发错帧型网关会把 auth 当中转载荷丢掉）。 */
-    send(data: string | Uint8Array): void;
+    send(data: string | Uint8Array, control?: boolean): void;
     /** 发起关闭握手；对端 1000ms 内不回应即强拆。幂等。 */
     close(code?: number, reason?: string): void;
     private onData;
@@ -47,6 +51,7 @@ export declare class WsClient extends EventEmitter {
     private deliver;
     private onSocketClosed;
     private fail;
+    private clearHandshake;
     private finish;
 }
 //# sourceMappingURL=ws-client.d.ts.map

@@ -38,7 +38,7 @@ import { PeerPunchManager } from './punch.js'
 import type { DirectReadyInfo, PunchPeerInfo } from './punch.js'
 import { PeerMux } from './mux.js'
 import type { PeerPath } from './mux.js'
-import { decodeFrameHeader } from './wire.js'
+import { decodeFrameHeader, PeerFrameType } from './wire.js'
 import {
   readPeerNetwork,
   repinPeerKey,
@@ -113,6 +113,8 @@ export interface PeerEngineOptions {
   /** WS 重连退避（缺省 1000ms 起、30000ms 封顶）。 */
   wsReconnectBaseMs?: number
   wsReconnectMaxMs?: number
+  /** Deadline after WS upgrade for an authentication outcome (default 10000ms). */
+  wsAuthTimeoutMs?: number
   clock?: { now(): number; setTimeout(fn: () => void, ms: number): unknown; clearTimeout(handle: unknown): void }
   log?: (line: string) => void
 }
@@ -129,6 +131,8 @@ export interface PeerEngine {
   /** 向网关宣告本机最新设备显示名，网关落盘并向同网在线节点广播 `peer-renamed`。 */
   announceSelfName(name: string): void
   reprobePunch(): void
+  /** Re-read the live pool cap and fill free slots; never evict existing mounts. */
+  refreshMounts(): void
   status(): PeerEngineStatus
   stop(): void
 }
@@ -162,6 +166,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   const pathReportMs = options.pathReportMs ?? 15_000
   const wsBase = options.wsReconnectBaseMs ?? 1_000
   const wsMax = options.wsReconnectMaxMs ?? 30_000
+  const wsAuthTimeoutMs = options.wsAuthTimeoutMs ?? 10_000
+  if (!Number.isInteger(wsAuthTimeoutMs) || wsAuthTimeoutMs < 1 || wsAuthTimeoutMs > 2_147_483_647) {
+    throw new TypeError('peer engine: invalid wsAuthTimeoutMs')
+  }
 
   let stopped = false
   let networkId: string | null = null
@@ -173,6 +181,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let ws: WsClient | null = null
   let wsAttempt = 0
   let wsReconnectTimer: unknown = null
+  let wsAuthTimer: unknown = null
   let wsReconnectable = true
   let punch: PeerPunchManager | null = null
   /** 打洞与 STUN 共用的 socket：注入的（引擎不关）或自建的（引擎关）。 */
@@ -185,8 +194,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   const sendGatewayBinary = (bytes: Uint8Array): void => {
     if (ws === null || ws.state !== 'open') return
     try {
-      ws.send(bytes)
+      ws.send(bytes, bytes[3] !== PeerFrameType.DATA)
     } catch (err) {
+      if (err instanceof Error && 'code' in err && err.code === 'ERR_PEER_BACKPRESSURE') return
       log(`peer engine: gateway ws send failed: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
@@ -225,6 +235,14 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     log(`peer engine: mounted virtual server for ${member.nodeId} (${entry.displayName})`)
   }
 
+  const refreshMounts = (): void => {
+    if (stopped || gatewayState !== 'authorized') return
+    for (const member of members.values()) {
+      if (mountCount() >= options.relayPool.maxServers()) break
+      if (member.state === 'eligible') mountPeer(member)
+    }
+  }
+
   const unmountPeer = (member: MemberRec): void => {
     if (!member.mounted) return
     member.mounted = false
@@ -235,6 +253,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.state = 'identity-mismatch'
     unmountPeer(member)
     mux?.dropSession(member.nodeId)
+    punch?.dropPeer(member.nodeId)
     log(`peer engine: TOFU key-mismatch for ${member.nodeId} — blocked locally until trustPeer()`)
   }
 
@@ -246,6 +265,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     lanEndpoints?: string[] | null
     reflexiveEndpoint?: string | null
     startPunch: boolean
+    deferMount?: boolean
   }): void => {
     if (stopped || networkId === null) return
     const nodeId = info.nodeId.toLowerCase()
@@ -275,6 +295,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       member.state = 'disabled'
       unmountPeer(member)
       mux.dropSession(nodeId)
+      punch?.dropPeer(nodeId)
+      if (!info.deferMount) refreshMounts()
       return
     }
 
@@ -283,6 +305,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (!tofu.ok) {
       member.publicKeyHex = info.publicKeyHex
       markMismatch(member)
+      if (!info.deferMount) refreshMounts()
       return
     }
     member.publicKeyHex = info.publicKeyHex
@@ -290,7 +313,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     mux.ensureSession(nodeId, info.publicKeyHex, member.name)
     mux.setPeerName(nodeId, member.name)
     if (member.mounted) options.relayPool.updateVirtualName(nodeId, member.name)
-    mountPeer(member)
+    if (!info.deferMount) refreshMounts()
     if (info.startPunch && punch !== null) {
       try {
         punch.beginPunch({
@@ -312,11 +335,17 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (member === undefined) return
     unmountPeer(member)
     mux?.dropSession(member.nodeId)
+    punch?.dropPeer(member.nodeId)
     members.delete(member.nodeId)
     schedulePathReport()
   }
 
   // ------------------------------------------------------------ WS 控制面
+
+  const clearAuthDeadline = (): void => {
+    if (wsAuthTimer !== null) clock.clearTimeout(wsAuthTimer)
+    wsAuthTimer = null
+  }
 
   const connectWs = (): void => {
     if (stopped || ws !== null) return
@@ -339,12 +368,22 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       return
     }
     ws = client
+    let authTimedOut = false
     client.on('open', () => {
       if (ws !== client) return
-      wsAttempt = 0
+      // Upgrade head may already contain a valid welcome before open fires.
+      if (gatewayState !== 'connecting') return
+      wsAuthTimer = clock.setTimeout(() => {
+        if (stopped || ws !== client || gatewayState !== 'connecting') return
+        clearAuthDeadline()
+        authTimedOut = true
+        gatewayState = 'offline'
+        log('peer engine: gateway authentication timeout')
+        client.close(1000, 'authentication timeout')
+      }, wsAuthTimeoutMs)
     })
     client.on('message', (data, isBinary) => {
-      if (ws !== client) return
+      if (ws !== client || authTimedOut) return
       if (isBinary) {
         // 二进制帧只属于已入网连接；网关对挂起连接本来就不路由，这里再
         // 过一遍 TOFU 闸：非 eligible 成员的帧一律不进 mux。
@@ -369,6 +408,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     client.on('close', (code, reason) => {
       log(`peer engine: gateway ws closed (code=${code} reason=${reason || '—'} state=${gatewayState})`)
       if (ws !== client) return
+      clearAuthDeadline()
       ws = null
       if (stopped) return
       if (gatewayState !== 'paused' && gatewayState !== 'revoked' && gatewayState !== 'unconfigured') {
@@ -396,7 +436,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (type === 'challenge') {
       const net = readPeerNetwork(stateFile)
       const challengeHex = message['challengeHex']
-      if (net === undefined || typeof challengeHex !== 'string') return
+      if (net === undefined || typeof challengeHex !== 'string' || !/^(?:[0-9a-f]{2})+$/i.test(challengeHex)) return
       const timestamp = clock.now()
       sendControl({
         type: 'auth',
@@ -421,9 +461,19 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       return
     }
     if (type === 'welcome') {
-      deniedReason = null
-      maxPeers = typeof message['maxPeers'] === 'number' && Number.isInteger(message['maxPeers']) ? (message['maxPeers'] as number) : maxPeers
       const status = message['status']
+      if (status !== 'authorized' && status !== 'pending' && status !== 'mismatch') return
+      wsAttempt = 0
+      clearAuthDeadline()
+      deniedReason = null
+      const announcedCap = message['maxPeers']
+      if (typeof announcedCap === 'number' && Number.isSafeInteger(announcedCap) && announcedCap >= 2) {
+        maxPeers = announcedCap
+        const net = readPeerNetwork(stateFile)
+        if (net !== undefined && net.maxPeersFromGateway !== announcedCap) {
+          writePeerNetwork(stateFile, { ...net, maxPeersFromGateway: announcedCap })
+        }
+      }
       if (status === 'authorized') {
         gatewayState = 'authorized'
         const livePeerIds = new Set<string>()
@@ -438,6 +488,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
             lanEndpoints: Array.isArray(peer.lanEndpoints) ? (peer.lanEndpoints as string[]) : null,
             reflexiveEndpoint: typeof peer.reflexiveEndpoint === 'string' ? peer.reflexiveEndpoint : null,
             startPunch: true,
+            deferMount: true,
           })
         }
         // 差集清理：断线期间离网、暂停或被移除的旧设备不再出现在 welcome.peers，
@@ -445,6 +496,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         for (const existingId of [...members.keys()]) {
           if (!livePeerIds.has(existingId)) memberGone(existingId)
         }
+        refreshMounts()
         runStunProbeOnce()
         armPathReport()
         schedulePathReport()
@@ -459,6 +511,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       return
     }
     if (type === 'denied') {
+      clearAuthDeadline()
       // 拒绝在握手前后都可能到达（挂起时被踢 / 入网后被暂停）——必须在
       // authorized 闸之前处理，否则挂在 connecting/pending 的连接会把拒绝
       // 静默吞掉，永远停在旧状态；同时卸载全部已挂载的远端工作区。
@@ -499,10 +552,12 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     if (type === 'peer-left') {
       if (typeof message['nodeId'] === 'string') memberGone(message['nodeId'])
+      refreshMounts()
       return
     }
     if (type === 'peer-paused') {
       if (typeof message['nodeId'] === 'string') memberGone(message['nodeId'])
+      refreshMounts()
       return
     }
     if (type === 'punch-coordinate') {
@@ -691,9 +746,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   }
 
   const resetActiveSession = (): void => {
+    clearAuthDeadline()
     for (const member of [...members.values()]) {
       unmountPeer(member)
       mux?.dropSession(member.nodeId)
+      punch?.dropPeer(member.nodeId)
     }
     members.clear()
     if (wsReconnectTimer !== null) {
@@ -798,6 +855,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           member.path = 'none'
           unmountPeer(member)
           mux?.dropSession(id)
+          punch?.dropPeer(id)
+          refreshMounts()
           schedulePathReport()
         }
       } else if (member !== undefined && gatewayState === 'authorized') {
@@ -859,6 +918,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       }
     },
 
+    refreshMounts,
+
     status() {
       const peers: PeerEnginePeerStatus[] = []
       for (const member of members.values()) {
@@ -885,6 +946,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     stop() {
       if (stopped) return
       stopped = true
+      clearAuthDeadline()
       deniedReason = null
       for (const member of [...members.values()]) unmountPeer(member)
       members.clear()

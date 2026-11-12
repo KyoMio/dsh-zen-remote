@@ -80,6 +80,8 @@ export interface PeerEngineOptions {
     /** WS 重连退避（缺省 1000ms 起、30000ms 封顶）。 */
     wsReconnectBaseMs?: number;
     wsReconnectMaxMs?: number;
+    /** Deadline after WS upgrade for an authentication outcome (default 10000ms). */
+    wsAuthTimeoutMs?: number;
     clock?: {
         now(): number;
         setTimeout(fn: () => void, ms: number): unknown;
@@ -104,6 +106,8 @@ export interface PeerEngine {
     /** 向网关宣告本机最新设备显示名，网关落盘并向同网在线节点广播 `peer-renamed`。 */
     announceSelfName(name: string): void;
     reprobePunch(): void;
+    /** Re-read the live pool cap and fill free slots; never evict existing mounts. */
+    refreshMounts(): void;
     status(): PeerEngineStatus;
     stop(): void;
 }

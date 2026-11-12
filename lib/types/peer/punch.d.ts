@@ -16,8 +16,8 @@
  * 3. `PeerPunchManager` — the per-peer 1000ms priority hole punch.
  *    When the relay hands us a peer's candidate endpoints we fire
  *    signed HELLO bursts (one per 100ms, at most 10 rounds) at every
- *    candidate with a fresh X25519 key; any valid HELLO is answered
- *    immediately, and the first bidirectional exchange derives
+ *    candidate with a fresh X25519 key; an admitted peer's valid HELLO is
+ *    answered immediately, and its signed ACK to our fresh nonce derives
  *    `PeerSessionCiphers` (PG-1 dual-simplex AEAD). The endpoint that
  *    worked is classified `lan` (RFC1918/CGNAT subnet or loopback match
  *    against our own interfaces) or `p2p`, with a measured RTT. If the
@@ -221,6 +221,8 @@ export declare class PeerPunchManager {
     sessionCiphers(peerNodeId: string): PeerSessionCiphers | null;
     /** Last PING→PONG round trip for the peer, or null before the first PONG. */
     sessionRttMs(peerNodeId: string): number | null;
+    /** Revoke gateway/local admission and discard all UDP state for this peer. */
+    dropPeer(peerNodeId: string): void;
     /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
     close(): void;
     private createSession;
@@ -242,7 +244,6 @@ export declare class PeerPunchManager {
     private handleControlPacket;
     private onHello;
     private onHelloAck;
-    private ensureSession;
     /**
      * Adopt a peer ephemeral key and (re)derive the session ciphers. The
      * working endpoint is refreshed on every call; derivation happens

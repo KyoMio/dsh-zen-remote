@@ -78,7 +78,7 @@ node --experimental-sqlite dist/main.js
 
 ## 反向代理与防火墙注意事项
 
-网关自身不内置 TLS。只在内网使用可以直接访问 `http://<主机>:19393/`；要公网或 HTTPS 访问，请在前面套一层 Nginx / Caddy，并注意：
+网关自身不内置 TLS，也没有证书配置页面。不部署反代时，可显式使用 `http://<主机>:19393/`（节点控制连接走 WS）；邀请链接应保留对应的明文 scheme，不要改成强制 TLS 的 `zr-nets://`。使用 HTTPS/WSS 时，请在前面套一层 Nginx / Caddy 提供可信证书；节点会验证证书信任链和主机名，验证失败不会自动降级为 HTTP/WS。明文入口不提供控制面的 TLS 身份保护，节点会话内容仍独立端到端加密。反代部署注意：
 
 1. **WebSocket 要放行升级**：节点端连网关走 `/peer/v1/ws`。Nginx 示例：
 

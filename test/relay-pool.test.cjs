@@ -461,16 +461,17 @@ test('pool.maxServers(): the gateway cap applies only in peer mode, per the conf
   // No network cap known: the configured value answers.
   assert.equal(mk({ getMaxServers: () => 16 }), 16)
 
-  // A gateway cap with the config at its DEFAULT layer: the gateway wins.
-  assert.equal(mk({ getMaxServers: () => 8, getPeerNetworkCap: () => 12 }), 12, 'source default → maxPeersFromGateway')
+  // The gateway count includes this node; the pool reports remote capacity.
+  assert.equal(mk({ getMaxServers: () => 8, getPeerNetworkCap: () => 12 }), 11, 'source default → maxPeersFromGateway - self')
   // The source getter missing behaves like default (the peer wiring always
   // passes it; the omission is a test-only composition).
-  assert.equal(mk({ getPeerNetworkCap: () => 12 }), 12)
+  assert.equal(mk({ getPeerNetworkCap: () => 12 }), 11)
 
   // A user-configured cap (env/row/file): the TIGHTER of the two wins.
-  assert.equal(mk({ getMaxServers: () => 16, getPeerNetworkCap: () => 12, getMaxServersSource: () => 'env' }), 12, 'configured 16 under gateway 12 → 12')
+  assert.equal(mk({ getMaxServers: () => 16, getPeerNetworkCap: () => 12, getMaxServersSource: () => 'env' }), 11, 'configured 16 under gateway 12 → 11 remotes')
   assert.equal(mk({ getMaxServers: () => 10, getPeerNetworkCap: () => 12, getMaxServersSource: () => 'row' }), 10, 'configured 10 under gateway 12 → 10')
-  assert.equal(mk({ getMaxServers: () => 20, getPeerNetworkCap: () => 4, getMaxServersSource: () => 'file' }), 4)
+  assert.equal(mk({ getMaxServers: () => 20, getPeerNetworkCap: () => 4, getMaxServersSource: () => 'file' }), 3)
+  assert.equal(mk({ getMaxServers: () => 8, getPeerNetworkCap: () => 1 }), 8, 'invalid network count ignored')
 
   // No gateway cap (peerNetwork absent → undefined): configured wins even in
   // peer mode.
@@ -487,7 +488,7 @@ test('pool.maxServers(): the gateway cap applies only in peer mode, per the conf
   }))
   assert.equal(pool.maxServers(), 8)
   gatewayCap = 12
-  assert.equal(pool.maxServers(), 12, 'the network record arriving later changes the answer')
+  assert.equal(pool.maxServers(), 11, 'the network record arriving later changes the answer')
   configured = 5
   gatewayCap = undefined
   assert.equal(pool.maxServers(), 5, 'and falling back moves with the live getter too')
