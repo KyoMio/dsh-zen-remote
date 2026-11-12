@@ -9,11 +9,14 @@ import crypto from 'node:crypto';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import { startGateway } from '../dist/main.js';
 import { createGatewayApiServer } from '../dist/server.js';
+import { resolveGatewayConfig } from '../dist/config.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
+import { SETTINGS_KEYS } from '../dist/store/types.js';
 import { deriveMasterKeyFromSecret } from '../dist/master-key.js';
 import { PeerWsHub } from '../dist/peer-hub/ws-hub.js';
 import { UdpStunService } from '../dist/peer-hub/udp-stun.js';
@@ -691,5 +694,135 @@ describe('无泄漏关停', () => {
     await gw.close();
     const elapsed = Date.now() - startedAt;
     assert.ok(elapsed < 3000, `close() 不应悬挂（耗时 ${elapsed}ms）`);
+  });
+});
+
+// ---------------------------------------------------------------- PC-07 部署配置播种
+
+// 这一组不走 makeConfig 直配对象，而是走 resolveGatewayConfig（env → GatewayConfig）
+// 再进 startGateway 的生产组装路径：证明环境变量里的部署配置真的进了 openStore 的
+// 播种，而不是只有测试直接给 store 传 seed 才生效。
+describe('PC-07 部署配置播种：resolveGatewayConfig → startGateway 生产接线（SQLite）', () => {
+  /** 四个部署键的 env 形态：与 resolveGatewayConfig 的变量名一一对应 */
+  function envFor(dataDir, { allowSignup, defaultMaxPeers, maxNetworksPerUser, relayRateKbps }) {
+    return {
+      ZR_GATEWAY_UDP_ALT_PORT: '0',
+      ZR_GATEWAY_DATA_DIR: dataDir,
+      ZR_GATEWAY_ADMIN_USER: ADMIN_EMAIL,
+      ZR_GATEWAY_ADMIN_PASSWORD: ADMIN_PASSWORD,
+      ZR_GATEWAY_ALLOW_SIGNUP: String(allowSignup),
+      ZR_GATEWAY_MAX_PEERS: String(defaultMaxPeers),
+      ZR_GATEWAY_MAX_NETWORKS_PER_USER: String(maxNetworksPerUser),
+      ZR_GATEWAY_RELAY_RATE_KBPS: String(relayRateKbps),
+    };
+  }
+
+  /** 生产解析 + 测试管线例外：四键全部走真实 env 解析，仅 HTTP 端口覆写 0（内核分配，避免与其他测试文件并发抢端口） */
+  function resolveForTest(env) {
+    return { ...resolveGatewayConfig(env), port: 0 };
+  }
+
+  const ENV_A = { allowSignup: true, defaultMaxPeers: 16, maxNetworksPerUser: 7, relayRateKbps: 128 };
+  const ENV_B = { allowSignup: false, defaultMaxPeers: 64, maxNetworksPerUser: 50, relayRateKbps: 1048576 };
+  const ENV_C = { allowSignup: false, defaultMaxPeers: 32, maxNetworksPerUser: 2, relayRateKbps: 512 };
+
+  async function adminCookie(gw) {
+    return login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+  }
+
+  test('空库：环境配置 true/16/7/128 经生产组装播种，REST 实际读值一致', async () => {
+    const gw = await startGateway(resolveForTest(envFor(makeDataDir(), ENV_A)));
+    try {
+      assert.equal(gw.admin.created, true);
+      const cookie = await adminCookie(gw);
+      const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie });
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+      assert.deepEqual(res.json.data, {
+        allowSignup: true,
+        maxNetworksPerUser: 7,
+        defaultMaxPeers: 16,
+        relayRateKbps: 128,
+      });
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('控制台修改持久化后，不同环境值重启不覆盖；admin 账号保持', async () => {
+    const dataDir = makeDataDir();
+    const gw1 = await startGateway(resolveForTest(envFor(dataDir, ENV_A)));
+    try {
+      const cookie = await adminCookie(gw1);
+      const patched = await api(gw1.base, 'PATCH', '/api/v1/admin/settings', {
+        body: { allowSignup: false, defaultMaxPeers: 24 },
+        cookie,
+      });
+      assert.equal(patched.status, 200, JSON.stringify(patched.json));
+      assert.equal(patched.json.data.allowSignup, false);
+    } finally {
+      await gw1.close(); // 前半步断言失败也归还已开的 HTTP/UDP/hub/store
+    }
+
+    // 全部四个键都已持久化：env_B 与库内值处处不同，重开后必须原样保留
+    const gw2 = await startGateway(resolveForTest(envFor(dataDir, ENV_B)));
+    try {
+      const res = await api(gw2.base, 'GET', '/api/v1/admin/settings', { cookie: await adminCookie(gw2) });
+      assert.deepEqual(res.json.data, {
+        allowSignup: false, // 控制台改过
+        maxNetworksPerUser: 7, // ENV_A 播种值，ENV_B 的 50 不得覆盖
+        defaultMaxPeers: 24, // 控制台改过
+        relayRateKbps: 128, // ENV_A 播种值，ENV_B 的 1048576 不得覆盖
+      });
+    } finally {
+      await gw2.close();
+    }
+  });
+
+  test('缺键逐键补齐：删掉 relay_rate_kbps 后重开，只按本轮环境补该键，其余保留', async () => {
+    const dataDir = makeDataDir();
+    const gw1 = await startGateway(resolveForTest(envFor(dataDir, ENV_A)));
+    try {
+      const cookie = await adminCookie(gw1);
+      const patched = await api(gw1.base, 'PATCH', '/api/v1/admin/settings', {
+        body: { maxNetworksPerUser: 5 },
+        cookie,
+      });
+      assert.equal(patched.status, 200, JSON.stringify(patched.json));
+      const created = await api(gw1.base, 'POST', '/api/v1/networks', {
+        body: { name: 'pc07-net', admissionMode: 'manual' },
+        cookie,
+      });
+      assert.equal(created.status, 200, JSON.stringify(created.json));
+    } finally {
+      await gw1.close(); // 前半步断言失败也归还已开的 HTTP/UDP/hub/store
+    }
+
+    // 模拟旧版本库缺键：裸开 SQLite 删掉单个设置行
+    const raw = new DatabaseSync(path.join(dataDir, 'gateway.sqlite'));
+    try {
+      raw.prepare('DELETE FROM system_settings WHERE key = ?').run(SETTINGS_KEYS.relayRateKbps);
+    } finally {
+      raw.close();
+    }
+
+    const gw2 = await startGateway(resolveForTest(envFor(dataDir, ENV_C)));
+    try {
+      const res = await api(gw2.base, 'GET', '/api/v1/admin/settings', { cookie: await adminCookie(gw2) });
+      assert.deepEqual(res.json.data, {
+        allowSignup: true, // ENV_A 播种值保留（ENV_C 是 false）
+        maxNetworksPerUser: 5, // 控制台改过的值保留（ENV_C 是 2）
+        defaultMaxPeers: 16, // ENV_A 播种值保留（ENV_C 是 32）
+        relayRateKbps: 512, // 唯一缺失的键按本轮 ENV_C 补齐
+      });
+      // admin 与其网络在两次重开后保持（初始化逻辑不得重置业务数据）
+      const nets = await api(gw2.base, 'GET', '/api/v1/networks', { cookie: await adminCookie(gw2) });
+      assert.equal(nets.status, 200);
+      assert.ok(
+        Array.isArray(nets.json.data) && nets.json.data.some((n) => n.name === 'pc07-net'),
+        `pc07-net 必须在重开后保留：${JSON.stringify(nets.json.data)}`,
+      );
+    } finally {
+      await gw2.close();
+    }
   });
 });
