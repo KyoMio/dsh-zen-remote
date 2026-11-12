@@ -890,6 +890,14 @@ export class PeerMux {
     Object.assign(req, { socket, connection: socket })
     const res = new ServerResponse(req as never)
     res.assignSocket(socket as never)
+    // A real http.Server forwards socket drain to its response; assignSocket
+    // alone does not. Without this, a large snapshot reaches the peer but
+    // relayHandler waits forever before pulling the next live frame.
+    socket.on('drain', () => {
+      if (!res.destroyed && !res.writableEnded && res.writableLength === 0) {
+        res.emit('drain')
+      }
+    })
     stream.req = req
     stream.res = res
 
