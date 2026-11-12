@@ -1579,6 +1579,10 @@ test('CLIENT_METHOD_FIELDS is method-for-method and field-for-field identical to
   assert.deepEqual(serverTable['sessionFeedback/record'], ['request.sessionId'])
   assert.deepEqual(serverTable['subagents/prompt'], ['request.parentSessionId', 'request.childSessionId'])
   assert.deepEqual(serverTable['subagents/interruptByParent'], ['parentSessionId', 'childSessionId'])
+  assert.deepEqual(serverTable['subagents/interruptByUser'], ['childSessionId'])
+  assert.deepEqual(serverTable['workspaceFiles/search'], ['workspaceFileScopeId'])
+  assert.deepEqual(serverTable['officeKit/render'], ['workspaceFileScopeId'])
+  assert.deepEqual(serverTable['terminal/watch'], ['sessionId'])
   // Every field either table names is one of the known field types — a typo
   // on either side fails here instead of silently matching itself.
   const KNOWN = new Set([
@@ -2435,6 +2439,13 @@ test('subagents calls rewrite BOTH id slots (request envelope and top level alik
     args: { childSessionId: toVirtual(SERVER_ID, 'session-child'), parentSessionId: toVirtual(SERVER_ID, 'session-parent'), mode: 'continuable' },
   }, undefined, undefined)
   assert.deepEqual(relay.invokes[1].args, { childSessionId: 'session-child', parentSessionId: 'session-parent', mode: 'continuable' }, 'both TOP-LEVEL slots are restored')
+
+  // 0.2.2-rc.2: only the child travels; a leftover parent id is unowned data
+  // and is left alone (the interceptor only restores registered fields).
+  await gateway.rpcBridge('subagents/interruptByUser', {
+    args: { childSessionId: toVirtual(SERVER_ID, 'session-child') },
+  }, undefined, undefined)
+  assert.deepEqual(relay.invokes[2].args, { childSessionId: 'session-child' }, 'the single top-level child id is restored')
   handle.uninstall()
 })
 
@@ -4485,6 +4496,41 @@ test('officeToPdf/render forwards with the restored workspaceFileScopeId and its
   handle.uninstall()
 })
 
+test('officeKit/render (0.2.2-rc.2) forwards with the restored workspaceFileScopeId and its PDF bytes as an attachment', async () => {
+  // Same shape as officeToPdf/render: the official document-preview plugin
+  // now calls officeKit.render. Bytes still ride the attachment channel.
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const pdf = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0, 1, 254, 255])
+  relay.invokeValue = {
+    data: { '$zr-u8': Buffer.from(pdf).toString('base64') },
+    absolutePath: '/srv/a/report.docx',
+    version: 'v1',
+    missingFonts: [],
+    eof: true,
+  }
+  const { handle } = install(gateway, relay)
+  const scopeVirtual = toVirtual(SERVER_ID, 'session-scope')
+  const envelope = await gateway.rpcBridge(
+    'officeKit/render',
+    { args: { workspaceFileScopeId: scopeVirtual, path: 'report.docx', priority: 'foreground' } },
+    undefined,
+    undefined,
+  )
+  assert.equal(envelope.ok, true)
+  assert.equal(envelope.value.data, null, 'the PDF bytes ride the attachment channel')
+  assert.equal(envelope.value.absolutePath, '/srv/a/report.docx')
+  assert.ok(Array.isArray(envelope.attachments) && envelope.attachments.length === 1)
+  assert.deepEqual(envelope.attachments[0].path, ['data'])
+  assert.deepEqual(Array.from(envelope.attachments[0].bytes), Array.from(pdf))
+  assert.deepEqual(relay.invokes[0].args, {
+    workspaceFileScopeId: 'session-scope',
+    path: 'report.docx',
+    priority: 'foreground',
+  }, 'the virtual scope is restored to the server session id, path/priority pass verbatim')
+  handle.uninstall()
+})
+
 test('terminal calls restore BOTH field halves: agentId for the PTY half, sessionId for retain/list', async () => {
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()
@@ -4906,6 +4952,7 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
     'session/fork',
     'subagents/prompt',
     'subagents/interruptByParent',
+    'subagents/interruptByUser',
     'fileUploads/upload',
     'job/kill',
     'messageFeedback/put',
@@ -4944,7 +4991,7 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
     )
   }
   // T31's five mutations are writes — refused remote-offline while offline.
-  for (const endpoint of ['session/create', 'session/fork', 'subagents/prompt', 'subagents/interruptByParent', 'fileUploads/upload']) {
+  for (const endpoint of ['session/create', 'session/fork', 'subagents/prompt', 'subagents/interruptByParent', 'subagents/interruptByUser', 'fileUploads/upload']) {
     assert.equal(isRemoteWrite(endpoint), true, endpoint)
   }
   // spot-check the read side (the full list lives in the source comment)
@@ -4971,6 +5018,7 @@ test('T34-fix: the T31 writes are refused remote-offline while the relay is not 
     ['session/fork', { args: { request: { sessionId: VIRTUAL_ID } } }],
     ['subagents/prompt', { args: { request: { parentSessionId: VIRTUAL_ID, content: [{ type: 'text', text: 'hi' }] } } }],
     ['subagents/interruptByParent', { args: { parentSessionId: VIRTUAL_ID } }],
+    ['subagents/interruptByUser', { args: { childSessionId: VIRTUAL_ID } }],
     ['fileUploads/upload', { args: { agentId: VIRTUAL_ID } }],
   ]
   for (const [endpoint, payload] of writes) {
