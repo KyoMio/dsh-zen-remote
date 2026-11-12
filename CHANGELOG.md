@@ -5,6 +5,12 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 兼容
+
+- **适配 DSH 0.2.2-rc.2**：远程会话转发官方工作区文件搜索（`workspaceFiles/search`）、办公文档预览（`officeKit/render`，同时保留 0.2.2-rc.1 / npm `latest` 的 `officeToPdf/render`）、子智能体中断（`subagents/interruptByUser`，同时保留 `interruptByParent`），以及 Agent 终端侧栏的会话终端监视流（`terminal/watch`）。两端版本混连时会话 / 文件 / 子智能体等指纹组会显示为「不同」，不会硬拒绝。
+
 ## 2.4.2（2026-11-11）
 
 ### 修复
