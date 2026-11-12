@@ -264,9 +264,14 @@ export class PgStore implements GatewayStore {
 
   // ---------------------------------------------------------------- settings
 
-  async getSettings(): Promise<SystemSettings> {
-    const { rows } = await this.query('SELECT key, value FROM system_settings', []);
+  /** settings 读取的共享入口：传入哪个查询函数就在哪条连接上跑（PC-06：事务内必须传 tx） */
+  private async querySettingsOn(q: PgQueryFn): Promise<SystemSettings> {
+    const { rows } = await q('SELECT key, value FROM system_settings', []);
     return parseSettingsRows(rows);
+  }
+
+  async getSettings(): Promise<SystemSettings> {
+    return this.querySettingsOn(this.query);
   }
 
   async updateSettings(patch: SettingsPatch): Promise<SystemSettings> {
@@ -393,7 +398,9 @@ export class PgStore implements GatewayStore {
       }
       if (str((owner.rows[0] as Row).role) !== 'admin') {
         // 单语句原子配额：COUNT 与限额同语句求值，超限行 over = true
-        const settings = await this.getSettings();
+        // （PC-06：settings 读取复用当前事务连接——这里已持 owner 行锁，再从外层池借
+        // 第二条连接会让同 owner 的并发请求在池耗尽后互相等待）
+        const settings = await this.querySettingsOn(tx);
         const counted = await tx(
           'SELECT COUNT(*) AS count, COUNT(*) >= $2 AS over FROM networks WHERE owner_id = $1',
           [input.ownerId, settings.maxNetworksPerUser],

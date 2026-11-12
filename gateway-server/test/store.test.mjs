@@ -746,6 +746,20 @@ describe('PgStore contract (mock query)', () => {
 
   const NOW = new Date('2026-11-10T08:00:00.000Z');
 
+  // PC-06：按路由应答并把每次调用记进独立数组（外层池与 tx 各自记账用）
+  function mockRoutesOnly(calls, routes) {
+    const TX_RE = /^(BEGIN|COMMIT|ROLLBACK)$/;
+    return async (sql, params = []) => {
+      const norm = String(sql).replace(/\s+/g, ' ').trim();
+      calls.push({ sql: norm, params });
+      if (TX_RE.test(norm)) return { rows: [] };
+      const hit = routes.find(([re]) => re.test(norm));
+      if (!hit) throw new Error(`mockRoutesOnly: unexpected SQL: ${norm}`);
+      const produce = hit[1];
+      return { rows: typeof produce === 'function' ? produce(params, calls) : produce };
+    };
+  }
+
   test('getSettings：snake_case 行与字符串值映射为 camelCase 强类型', async () => {
     const q = mockQuery([
       [/FROM system_settings/, [
@@ -998,6 +1012,63 @@ describe('PgStore contract (mock query)', () => {
     const pg = new PgStore(q);
     await rejectsCode(pg.transitionMemberStatus('net1', 'p1', 'repin'), 'invalid-transition');
     assert.deepEqual(q.txStatements(), ['BEGIN', 'ROLLBACK']);
+  });
+
+  // PC-06：事务接缝契约。真实 pool 模式下 withTransaction checkout 独立连接（tx），
+  // 事务体内若再调用 this.getSettings() 这类外层 query，就等于持事务连接去申请池内
+  // 第二条连接——同 owner 并发占用剩余连接后互相等待。此测试用独立 runner 复刻该形态：
+  // 外层池与 tx 分别记账，事务路径的任何 SQL 都不允许落到外层池上。
+  test('PC-06：createNetwork 事务内所有查询走 tx 连接，不得回调外层池', async () => {
+    const netRow = {
+      id: '0123456789abcdef',
+      owner_id: 'u1',
+      name: 'n',
+      admission_mode: 'key',
+      join_key_enc: 'enc',
+      max_peers: 4,
+      created_at: NOW,
+    };
+    const routes = [
+      [/FROM users WHERE id = .*FOR UPDATE/, [{ role: 'user' }]],
+      [/FROM system_settings/, [
+        { key: 'allow_signup', value: 'false' },
+        { key: 'max_networks_per_user', value: '3' },
+        { key: 'default_max_peers', value: '8' },
+        { key: 'relay_rate_kbps', value: '4096' },
+      ]],
+      [/COUNT\(\*\).*FROM networks WHERE owner_id/, [{ count: '0' }]],
+      [/INSERT INTO networks/, [netRow]],
+    ];
+    const outerCalls = [];
+    const txCalls = [];
+    const outer = mockRoutesOnly(outerCalls, routes);
+    const tx = mockRoutesOnly(txCalls, routes);
+    const pg = new PgStore(outer, {
+      withTransaction: (fn) => fn(tx), // 真实形态：tx 是独立连接，与外层池不同函数
+    });
+    const net = await pg.createNetwork({ ownerId: 'u1', name: 'n', admissionMode: 'key', joinKeyEnc: 'enc', maxPeers: 4 });
+    assert.equal(net.id, '0123456789abcdef');
+    assert.equal(outerCalls.length, 0, `事务路径不得在外层池上执行查询，实际: ${outerCalls.map((c) => c.sql).join('; ')}`);
+    const txSql = txCalls.map((c) => c.sql);
+    assert.ok(txSql.some((s) => /FROM users WHERE id = \$1 FOR UPDATE/.test(s)), 'owner 行锁应在 tx 上');
+    assert.ok(txSql.some((s) => /FROM system_settings/.test(s)), '配额 settings 应在 tx 上查询（复用事务连接）');
+    assert.ok(txSql.some((s) => /COUNT\(\*\).*FROM networks/.test(s)), '配额计数应在 tx 上');
+    assert.ok(txSql.some((s) => /INSERT INTO networks/.test(s)), '插入应在 tx 上');
+  });
+
+  test('PC-06：getSettings 非事务调用仍走外层池（行为不变）', async () => {
+    const routes = [
+      [/FROM system_settings/, [
+        { key: 'max_networks_per_user', value: '7' },
+      ]],
+    ];
+    const outerCalls = [];
+    const outer = mockRoutesOnly(outerCalls, routes);
+    const pg = new PgStore(outer);
+    const settings = await pg.getSettings();
+    assert.equal(settings.maxNetworksPerUser, 7);
+    assert.equal(outerCalls.length, 1);
+    assert.match(outerCalls[0].sql, /SELECT key, value FROM system_settings/);
   });
 
   test('F1：ensureBootstrapAdmin 与 setUserActive 均在事务内执行（PG 契约）', async () => {
