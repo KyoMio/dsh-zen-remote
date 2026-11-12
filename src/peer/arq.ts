@@ -32,6 +32,22 @@
  * the stream (merged onto the last queued fragment when one exists, a
  * dedicated zero-length fragment otherwise); RST aborts; `closeAll()`
  * clears every timer and rejects every pending write.
+ *
+ * Admission is bounded (256KiB/stream, 4MiB/session, 128 live streams by
+ * default). Large callers use tryWrite + waitWritable in bounded pieces;
+ * write still confirms delivery, but rejects rather than queues over budget.
+ * RST payload 1 requests an ACK, 2 acknowledges; empty remains legacy RST.
+ * DATA with no cumulative progress and RST retries expire after 30s; idle
+ * streams have no deadline. Retired IDs never reopen in this session.
+ * Final ACKs are cached for 60s (4096 reserved records/ranges). A legacy peer
+ * retrying FIN later receives RST, not successful completion; legacy RST
+ * has no confirmation, so remote cleanup cannot be guaranteed. Capacity
+ * exhaustion refuses new streams instead of evicting fresh terminal state.
+ * Cancel/refusal IDs are retired even when the active-stream limit is full.
+ * If permanent history itself cannot reserve another ID, admission closes
+ * permanently (existing streams continue), reports onAdmissionClosed, and
+ * new local writes explicitly require leaving/rejoining the peer network.
+ * No timer or range eviction silently reopens that admission boundary.
  */
 
 import { PeerFrameType, PEER_MAX_PLAINTEXT_BYTES } from './wire.js'
@@ -84,7 +100,19 @@ export type ArqFrameSender = (frameType: number, streamId: number, payload: Uint
 export interface PeerArqOptions {
   sendFrame: ArqFrameSender
   /** Ordered delivery of received stream chunks; `final` marks the FIN. */
-  onStreamData?: (streamId: number, chunk: Uint8Array, final: boolean) => void
+  onStreamData?: (streamId: number, chunk: Uint8Array, final: boolean) => boolean | void
+  /** Once per admitted stream, after duplex FIN or any abort. */
+  onStreamClosed?: (streamId: number, error?: Error) => void
+  /** Permanent admission failure; existing streams continue. Rejoin to recover. */
+  onAdmissionClosed?: (error: Error) => void
+  /** Outstanding DATA with no cumulative progress; idle streams have no deadline. */
+  retryTimeoutMs?: number
+  terminalTtlMs?: number
+  maxStreams?: number
+  maxRetiredRanges?: number
+  maxTerminalRecords?: number
+  maxStreamBytes?: number
+  maxSessionBytes?: number
   /** The peer sent RST for this stream; all state for it is gone. */
   onStreamReset?: (streamId: number) => void
   clock?: ArqClock
@@ -124,6 +152,12 @@ interface TxStream {
   queue: QueuedFragment[]
   inflight: Map<number, TxFragment>
   finQueued: boolean
+  finPromise: Promise<void> | null
+  finAcked: boolean
+  cumulative: number
+  progressTimer: unknown
+  pendingBytes: number
+  pendingWrites: number
 }
 
 interface RxBuffered {
@@ -136,6 +170,7 @@ interface RxStream {
   expected: number
   buffered: Map<number, RxBuffered>
   gotFin: boolean
+  flushing: boolean
 }
 
 function makeWaiter(): TxWaiter {
@@ -205,6 +240,24 @@ export class PeerArqSession {
   private readonly txStreams = new Map<number, TxStream>()
   private readonly rxStreams = new Map<number, RxStream>()
   private closed = false
+  private readonly onStreamClosed: PeerArqOptions['onStreamClosed']
+  private readonly onAdmissionClosed: PeerArqOptions['onAdmissionClosed']
+  private admissionClosed = false
+  private readonly retryTimeoutMs: number
+  private readonly terminalTtlMs: number
+  private readonly maxStreams: number
+  private readonly maxRetiredRanges: number
+  private readonly maxTerminalRecords: number
+  private readonly maxStreamBytes: number
+  private readonly maxSessionBytes: number
+  private sendBytes = 0
+  private receiveBytes = 0
+  private readonly writable = new Map<number, { bytes: number; waiter: TxWaiter }>()
+  private readonly active = new Set<number>()
+  // Permanent, parity-separated intervals: old implementations retransmit forever.
+  private readonly retired: [number, number][][] = [[], []]
+  private readonly terminal = new Map<number, { ack: number; until: number }>()
+  private readonly resets = new Map<number, { timer: unknown; until: number; rto: number }>()
 
   constructor(options: PeerArqOptions) {
     if (typeof options.sendFrame !== 'function') throw new TypeError('sendFrame must be a function')
@@ -228,6 +281,19 @@ export class PeerArqSession {
     this.rtoMaxMs = rtoMaxMs
     this.onStreamData = options.onStreamData
     this.onStreamReset = options.onStreamReset
+    this.onStreamClosed = options.onStreamClosed
+    this.onAdmissionClosed = options.onAdmissionClosed
+    this.retryTimeoutMs = options.retryTimeoutMs ?? 30_000
+    this.terminalTtlMs = options.terminalTtlMs ?? 60_000
+    this.maxStreams = options.maxStreams ?? 128
+    this.maxRetiredRanges = options.maxRetiredRanges ?? 4096
+    this.maxTerminalRecords = options.maxTerminalRecords ?? 4096
+    this.maxStreamBytes = options.maxStreamBytes ?? 256 * 1024
+    this.maxSessionBytes = options.maxSessionBytes ?? 4 * 1024 * 1024
+    for (const value of [this.retryTimeoutMs, this.terminalTtlMs, this.maxStreams, this.maxRetiredRanges, this.maxTerminalRecords, this.maxStreamBytes, this.maxSessionBytes]) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('ARQ limits must be positive integers')
+    }
+    if (this.terminalTtlMs < this.retryTimeoutMs) throw new RangeError('terminal TTL must cover retry timeout')
   }
 
   /**
@@ -239,11 +305,24 @@ export class PeerArqSession {
     const sid = requireStreamId(streamId)
     if (!ArrayBuffer.isView(bytes)) throw new TypeError('bytes must be a Uint8Array')
     if (this.closed) return Promise.reject(new Error('arq session closed'))
+    if (!this.admit(sid)) return Promise.reject(this.admissionError())
     const tx = this.ensureTx(sid)
     if (tx.finQueued) return Promise.reject(new Error(`stream ${sid} already finished`))
     const data = asBufferView(bytes)
     if (data.byteLength === 0) return Promise.resolve()
+    if (!this.hasCapacity(sid, data.byteLength)) return Promise.reject(new Error('ARQ byte budget exhausted; split writes and await admission'))
     const waiter = makeWaiter()
+    const byteLength = data.byteLength // do not retain the caller's potentially huge backing buffer
+    tx.pendingBytes += byteLength
+    tx.pendingWrites++
+    this.sendBytes += byteLength
+    const release = (): void => {
+      tx.pendingBytes -= byteLength
+      tx.pendingWrites--
+      this.sendBytes -= byteLength
+      this.wakeWritable()
+    }
+    void waiter.promise.then(release, release)
     waiter.remaining = 0
     for (let offset = 0; offset < data.byteLength; offset += this.chunkSize) {
       const slice = data.subarray(offset, Math.min(offset + this.chunkSize, data.byteLength))
@@ -254,7 +333,7 @@ export class PeerArqSession {
         waiter.remaining += 1
       } else {
         tx.queue.push({
-          data: slice,
+          data: Buffer.from(slice),
           fin: false,
           waiters: [waiter],
           finWaiter: null,
@@ -275,10 +354,12 @@ export class PeerArqSession {
   finish(streamId: number): Promise<void> {
     const sid = requireStreamId(streamId)
     if (this.closed) return Promise.reject(new Error('arq session closed'))
+    if (!this.admit(sid)) return Promise.reject(this.admissionError())
     const tx = this.ensureTx(sid)
-    if (tx.finQueued) return Promise.resolve() // idempotent
+    if (tx.finQueued) return tx.finPromise! // same completion, not premature success
     tx.finQueued = true
     const finWaiter = makeWaiter()
+    tx.finPromise = finWaiter.promise
     finWaiter.remaining = 1
     const last = tx.queue.length > 0 ? tx.queue[tx.queue.length - 1] : null
     if (last && !last.fin) {
@@ -295,10 +376,14 @@ export class PeerArqSession {
   reset(streamId: number): void {
     const sid = requireStreamId(streamId)
     if (this.closed) return
-    const tx = this.txStreams.get(sid)
-    if (tx) this.teardownTx(sid, tx, new Error(`stream ${sid} reset`))
-    this.rxStreams.delete(sid)
-    this.trySendFrame(PeerFrameType.RST, sid, Buffer.alloc(0), 0)
+    if (this.isRetired(sid)) return
+    if (!this.admit(sid)) {
+      this.rememberRetired(sid)
+      this.trySendFrame(PeerFrameType.RST, sid, Buffer.alloc(0), 0)
+      return
+    }
+    this.retire(sid, new Error(`stream ${sid} reset`))
+    this.startReset(sid)
   }
 
   /**
@@ -313,9 +398,24 @@ export class PeerArqSession {
     const ackValue = typeof ack === 'number' && Number.isInteger(ack) && ack >= 0 ? ack : 0
     if (frameType === PeerFrameType.RST) {
       if (streamId === 0) return
-      this.teardownTx(streamId, this.txStreams.get(streamId), new Error(`stream ${streamId} reset by peer`))
-      this.rxStreams.delete(streamId)
-      this.onStreamReset?.(streamId)
+      if (!ArrayBuffer.isView(payload) || payload.byteLength > 1) return
+      const kind = payload[0] ?? 0
+      if (kind === 2) {
+        const reset = this.resets.get(streamId)
+        if (reset) this.clock.clearTimeout(reset.timer)
+        this.resets.delete(streamId)
+        return
+      }
+      if (kind !== 0 && kind !== 1) return
+      if (this.active.has(streamId)) {
+        this.retire(streamId, new Error(`stream ${streamId} reset by peer`))
+        this.onStreamReset?.(streamId)
+      } else {
+        const retired = this.isRetired(streamId)
+        this.rememberRetired(streamId)
+        if (!retired && this.isRetired(streamId)) this.onStreamReset?.(streamId)
+      }
+      if (kind === 1) this.trySendFrame(PeerFrameType.RST, streamId, Buffer.from([2]), 0)
       return
     }
     if (streamId === 0) return
@@ -342,9 +442,11 @@ export class PeerArqSession {
   closeAll(): void {
     if (this.closed) return
     this.closed = true
-    for (const [sid, tx] of this.txStreams) {
-      this.teardownTx(sid, tx, new Error('arq session closed'))
-    }
+    for (const sid of [...this.active]) this.retire(sid, new Error('arq session closed'))
+    for (const reset of this.resets.values()) this.clock.clearTimeout(reset.timer)
+    this.resets.clear()
+    this.terminal.clear()
+    this.retired[0].length = this.retired[1].length = 0
     this.txStreams.clear()
     this.rxStreams.clear()
   }
@@ -382,6 +484,136 @@ export class PeerArqSession {
     }
   }
 
+  /** Whole-block admission. false accepts no bytes; terminal/capacity errors throw. */
+  tryWrite(streamId: number, bytes: Uint8Array): boolean {
+    requireStreamId(streamId)
+    if (!(bytes instanceof Uint8Array)) throw new TypeError('bytes must be a Uint8Array')
+    if (!this.admit(streamId)) throw this.admissionError()
+    if (this.txStreams.get(streamId)?.finQueued) throw new Error('ARQ stream already finished')
+    if (!this.hasCapacity(streamId, bytes.byteLength)) return false
+    // Completion errors are delivered through onStreamClosed. write() itself
+    // remains available to callers requiring per-write ACK confirmation.
+    void this.write(streamId, bytes).catch(() => {})
+    return true
+  }
+
+  /** One admission waiter per stream; callers serialize writes, not ACKs. */
+  waitWritable(streamId: number, bytes = 1): Promise<void> {
+    if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > Math.min(this.maxStreamBytes, this.maxSessionBytes)) return Promise.reject(new Error('ARQ write exceeds byte budget'))
+    if (!this.admit(requireStreamId(streamId))) return Promise.reject(this.admissionError())
+    if (this.hasCapacity(streamId, bytes)) return Promise.resolve()
+    let pending = this.writable.get(streamId)
+    if (!pending) { pending = { bytes, waiter: makeWaiter() }; this.writable.set(streamId, pending) }
+    return pending.waiter.promise
+  }
+
+  bufferedSendBytes(): number { return this.sendBytes }
+  bufferedReceiveBytes(): number { return this.receiveBytes }
+
+  private hasCapacity(id: number, bytes: number): boolean {
+    const tx = this.txStreams.get(id)
+    return (tx?.pendingBytes ?? 0) + bytes <= this.maxStreamBytes && this.sendBytes + bytes <= this.maxSessionBytes && (tx?.pendingWrites ?? 0) < 1024
+  }
+
+  private wakeWritable(): void {
+    for (const [id, pending] of this.writable) {
+      if (this.hasCapacity(id, pending.bytes)) { this.writable.delete(id); pending.waiter.resolve() }
+    }
+  }
+
+  /** Retry a previously refused delivery after consumer pull/read. */
+  resume(streamId: number): void {
+    const rx = this.rxStreams.get(streamId)
+    if (!rx) return
+    this.flush(streamId, rx)
+    this.sendSack(streamId, rx)
+  }
+
+  private isRetired(id: number): boolean {
+    return this.retired[id & 1].some(([lo, hi]) => id >= lo && id <= hi)
+  }
+
+  private admit(id: number): boolean {
+    if (this.closed || this.isRetired(id)) return false
+    if (this.active.has(id)) return true
+    if (this.admissionClosed) return false
+    const now = this.clock.now()
+    for (const [sid, entry] of this.terminal) if (entry.until <= now) this.terminal.delete(sid)
+    // Reserve one terminal record and worst-case interval for every active stream.
+    if (this.active.size >= this.maxStreams || this.terminal.size + this.active.size >= this.maxTerminalRecords ||
+        this.retired[0].length + this.retired[1].length + this.active.size >= this.maxRetiredRanges) return false
+    this.active.add(id)
+    return true
+  }
+
+  private retire(id: number, error?: Error): void {
+    if (!this.active.delete(id)) return
+    const ack = error ? 0 : this.currentAck(id)
+    this.teardownTx(id, this.txStreams.get(id), error ?? new Error('stream finished'))
+    const rx = this.rxStreams.get(id)
+    if (rx) for (const fragment of rx.buffered.values()) this.receiveBytes -= fragment.data.length
+    this.rxStreams.delete(id)
+    const pending = this.writable.get(id)
+    this.writable.delete(id)
+    pending?.waiter.reject(error ?? new Error('stream finished'))
+    this.rememberRetired(id)
+    this.terminal.set(id, { ack, until: this.clock.now() + this.terminalTtlMs })
+    this.onStreamClosed?.(id, error)
+  }
+
+  private admissionError(): Error {
+    return new Error(this.admissionClosed
+      ? 'ARQ admission exhausted; leave and rejoin the peer network'
+      : 'ARQ stream retired or capacity exhausted')
+  }
+
+  /** Refused/cancelled IDs need permanent history, but no active-stream slot. */
+  private rememberRetired(id: number): void {
+    if (this.isRetired(id) || this.admissionClosed) return
+    if (this.retired[0].length + this.retired[1].length + this.active.size >= this.maxRetiredRanges) {
+      this.admissionClosed = true
+      this.onAdmissionClosed?.(this.admissionError())
+      return
+    }
+    const ranges = this.retired[id & 1]
+    ranges.push([id, id])
+    ranges.sort((a, b) => a[0] - b[0])
+    for (let i = 1; i < ranges.length;) {
+      if (ranges[i][0] <= ranges[i - 1][1] + 2) {
+        ranges[i - 1][1] = Math.max(ranges[i - 1][1], ranges[i][1])
+        ranges.splice(i, 1)
+      } else i++
+    }
+  }
+
+  private maybeClose(id: number): void {
+    const tx = this.txStreams.get(id)
+    if (tx?.finAcked && !tx.queue.length && !tx.inflight.size && this.rxStreams.get(id)?.gotFin) this.retire(id)
+  }
+
+  private armProgress(id: number, tx: TxStream): void {
+    this.clock.clearTimeout(tx.progressTimer)
+    tx.progressTimer = this.clock.setTimeout(() => {
+      if (this.txStreams.get(id) !== tx) return
+      this.retire(id, new Error(`stream ${id} DATA no-progress timeout`))
+      this.startReset(id)
+    }, this.retryTimeoutMs)
+  }
+
+  private startReset(id: number): void {
+    if (this.closed || this.resets.has(id)) return
+    const state = { timer: null as unknown, until: this.clock.now() + this.retryTimeoutMs, rto: this.rtoMs }
+    this.resets.set(id, state)
+    const send = (): void => {
+      if (this.resets.get(id) !== state) return
+      if (this.clock.now() >= state.until) { this.resets.delete(id); return }
+      state.timer = this.clock.setTimeout(send, Math.min(state.rto, state.until - this.clock.now()))
+      state.rto = Math.min(state.rto * 2, this.rtoMaxMs)
+      this.trySendFrame(PeerFrameType.RST, id, Buffer.from([1]), 0)
+    }
+    send()
+  }
+
   // -- internals -------------------------------------------------------------------
 
   private trySendFrame(frameType: number, streamId: number, payload: Uint8Array, ack: number): void {
@@ -395,7 +627,7 @@ export class PeerArqSession {
   private ensureTx(streamId: number): TxStream {
     let tx = this.txStreams.get(streamId)
     if (!tx) {
-      tx = { nextSeq: 0, queue: [], inflight: new Map(), finQueued: false }
+      tx = { nextSeq: 0, queue: [], inflight: new Map(), finQueued: false, finPromise: null, finAcked: false, cumulative: 0, progressTimer: null, pendingBytes: 0, pendingWrites: 0 }
       this.txStreams.set(streamId, tx)
     }
     return tx
@@ -407,7 +639,7 @@ export class PeerArqSession {
 
   private pump(streamId: number, tx: TxStream): void {
     if (this.closed) return
-    while (tx.inflight.size < this.windowSize && tx.queue.length > 0) {
+    while (tx.inflight.size < this.windowSize && tx.nextSeq - tx.cumulative < this.windowSize && tx.queue.length > 0) {
       const queued = tx.queue.shift() as QueuedFragment
       const seq = tx.nextSeq++
       const subheader = Buffer.alloc(STREAM_HEADER_BYTES)
@@ -423,6 +655,7 @@ export class PeerArqSession {
       }
       frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
       tx.inflight.set(seq, frag)
+      if (tx.progressTimer === null) this.armProgress(streamId, tx)
       this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
     }
   }
@@ -439,7 +672,19 @@ export class PeerArqSession {
 
   private onData(streamId: number, payload: Uint8Array, piggyAck: number): void {
     if (piggyAck > 0) this.applyCumulative(streamId, piggyAck)
-    if (!ArrayBuffer.isView(payload) || payload.byteLength < STREAM_HEADER_BYTES) return
+    if (!ArrayBuffer.isView(payload) || payload.byteLength < STREAM_HEADER_BYTES || payload.byteLength > PEER_MAX_PLAINTEXT_BYTES) return
+    if (this.isRetired(streamId) || (this.admissionClosed && !this.active.has(streamId))) {
+      const terminal = this.terminal.get(streamId)
+      if (terminal && terminal.until > this.clock.now() && terminal.ack > 0) {
+        this.trySendFrame(PeerFrameType.SACK, streamId, Buffer.alloc(8), terminal.ack)
+      } else this.trySendFrame(PeerFrameType.RST, streamId, Buffer.alloc(0), 0)
+      return
+    }
+    if (!this.admit(streamId)) {
+      this.rememberRetired(streamId)
+      this.trySendFrame(PeerFrameType.RST, streamId, Buffer.alloc(0), 0)
+      return
+    }
     const view = asBufferView(payload)
     const flags = view[0]
     const seq = view.readUInt32BE(1)
@@ -447,7 +692,7 @@ export class PeerArqSession {
     const fin = (flags & STREAM_FLAG_FIN) !== 0
     let rx = this.rxStreams.get(streamId)
     if (!rx) {
-      rx = { expected: 0, buffered: new Map(), gotFin: false }
+      rx = { expected: 0, buffered: new Map(), gotFin: false, flushing: false }
       this.rxStreams.set(streamId, rx)
     }
     if (rx.gotFin || seq < rx.expected) {
@@ -456,37 +701,49 @@ export class PeerArqSession {
       return
     }
     if (!rx.buffered.has(seq)) {
-      if (rx.buffered.size >= RX_BUFFER_MAX) {
+      // Out-of-order SACKed bytes cannot be discarded. Reserve headroom for
+      // every stream's missing head so aggregate buffering cannot deadlock.
+      const reserve = seq === rx.expected ? 0 : Math.min(this.maxSessionBytes, this.maxStreams * ARQ_CHUNK_MAX_BYTES)
+      if (rx.buffered.size >= RX_BUFFER_MAX - (seq === rx.expected ? 0 : 1) ||
+          this.receiveBytes + data.length > this.maxSessionBytes - reserve) {
         this.sendSack(streamId, rx)
         return
       }
       rx.buffered.set(seq, { data: Buffer.from(data), fin })
+      this.receiveBytes += data.length
     }
     this.flush(streamId, rx)
     this.sendSack(streamId, rx)
   }
 
   private flush(streamId: number, rx: RxStream): void {
-    for (;;) {
-      const next = rx.buffered.get(rx.expected)
-      if (!next) return
-      rx.buffered.delete(rx.expected)
-      rx.expected += 1
-      const final = next.fin
-      if (final) {
-        rx.gotFin = true
-        rx.buffered.clear() // anything after FIN is junk
+    if (rx.flushing) return
+    rx.flushing = true
+    try {
+      for (;;) {
+        const next = rx.buffered.get(rx.expected)
+        if (!next) return
+        if (this.onStreamData?.(streamId, next.data, next.fin) === false) return
+        if (this.rxStreams.get(streamId) !== rx) return // delivery may synchronously cancel
+        rx.buffered.delete(rx.expected)
+        this.receiveBytes -= next.data.length
+        rx.expected += 1
+        const final = next.fin
+        if (final) {
+          rx.gotFin = true
+          for (const fragment of rx.buffered.values()) this.receiveBytes -= fragment.data.length
+          rx.buffered.clear() // anything after FIN is junk
+        }
+        if (final) { this.maybeClose(streamId); return }
       }
-      this.onStreamData?.(streamId, next.data, final)
-      if (final) return
-    }
+    } finally { rx.flushing = false }
   }
 
   private sendSack(streamId: number, rx: RxStream): void {
     const bitmap = Buffer.alloc(SACK_BITMAP_BYTES)
-    for (const seq of rx.buffered.keys()) {
+    for (const [seq, fragment] of rx.buffered) {
       const delta = seq - rx.expected
-      if (delta >= 0 && delta < SACK_BITMAP_BITS) bitmap[delta >> 3] |= 1 << (delta & 7)
+      if (!fragment.fin && delta > 0 && delta < SACK_BITMAP_BITS) bitmap[delta >> 3] |= 1 << (delta & 7)
     }
     this.trySendFrame(PeerFrameType.SACK, streamId, bitmap, rx.expected)
   }
@@ -504,7 +761,11 @@ export class PeerArqSession {
   private applyCumulative(streamId: number, ack: number): void {
     if (ack <= 0) return
     const tx = this.txStreams.get(streamId)
-    if (!tx) return
+    if (!tx || ack > tx.nextSeq) return
+    if (ack > tx.cumulative) {
+      tx.cumulative = ack
+      this.armProgress(streamId, tx)
+    }
     for (const [seq, frag] of tx.inflight) {
       if (seq < ack) {
         this.clock.clearTimeout(frag.timer)
@@ -513,25 +774,31 @@ export class PeerArqSession {
       }
     }
     this.pump(streamId, tx)
+    if (tx.inflight.size === 0 && tx.queue.length === 0) {
+      this.clock.clearTimeout(tx.progressTimer)
+      tx.progressTimer = null
+    }
+    this.maybeClose(streamId)
   }
 
   private settleFragment(streamId: number, seq: number): void {
     const tx = this.txStreams.get(streamId)
     const frag = tx?.inflight.get(seq)
-    if (!tx || !frag) return
+    if (!tx || !frag || frag.finWaiter) return // FIN needs cumulative delivery confirmation
     this.clock.clearTimeout(frag.timer)
     tx.inflight.delete(seq)
     this.settle(tx, frag)
     this.pump(streamId, tx)
   }
 
-  private settle(_tx: TxStream, frag: TxFragment): void {
+  private settle(tx: TxStream, frag: TxFragment): void {
     for (const waiter of frag.waiters) {
       waiter.remaining -= 1
       if (waiter.remaining <= 0) waiter.resolve()
     }
     frag.waiters = []
     if (frag.finWaiter) {
+      tx.finAcked = true
       frag.finWaiter.remaining -= 1
       if (frag.finWaiter.remaining <= 0) frag.finWaiter.resolve()
       frag.finWaiter = null
@@ -540,6 +807,7 @@ export class PeerArqSession {
 
   private teardownTx(streamId: number, tx: TxStream | undefined, error: Error): void {
     if (!tx) return
+    this.clock.clearTimeout(tx.progressTimer)
     for (const frag of tx.inflight.values()) this.clock.clearTimeout(frag.timer)
     for (const frag of tx.inflight.values()) {
       for (const waiter of frag.waiters) waiter.reject(error)

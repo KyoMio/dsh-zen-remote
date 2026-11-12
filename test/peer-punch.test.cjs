@@ -186,6 +186,7 @@ async function establishPair(hooksA = {}, hooksB = {}) {
     onDirectLost: (id) => { events.bLost.push(id) },
     ...hooksB,
   })
+  mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
   mgrA.beginPunch({
     peerNodeId: B.nodeId,
     peerPublicKeyHex: B.publicKeyHex,
@@ -592,12 +593,16 @@ test('an ARQ stream rides the punched direct path end to end', async () => {
     })
     const payload = randomBytes(300 * 1024)
     const hash = createHash('sha256').update(payload).digest('hex')
-    const write = arqA.write(1, payload)
-    const finish = arqA.finish(1)
-    const out = await withTimeout(bDone.promise, 10_000, 'ARQ payload over the direct path')
+    const send = (async () => {
+      for (let offset = 0; offset < payload.length; offset += 16 * 1024) {
+        const chunk = payload.subarray(offset, offset + 16 * 1024)
+        while (!arqA.tryWrite(1, chunk)) await arqA.waitWritable(1, chunk.length)
+      }
+      await arqA.finish(1)
+    })()
+    const [out] = await withTimeout(Promise.all([bDone.promise, send]), 10_000, 'ARQ payload over the direct path')
     assert.equal(out.length, payload.length, 'zero bytes lost over UDP direct')
     assert.equal(createHash('sha256').update(out).digest('hex'), hash, 'SHA-256 identical over the direct path')
-    await Promise.all([write, finish])
   } finally {
     arqA?.closeAll()
     arqB?.closeAll()
@@ -614,6 +619,7 @@ test('punch establishment completes within 200ms wall clock', async () => {
     onDirectReady: (id, info) => ready.resolve({ id, info }),
   })
   const { mgr: mgrB, socket: sockB } = await makeManager(B, manualClock(), {})
+  mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
   try {
     const t0 = Date.now()
     mgrA.beginPunch({
@@ -751,6 +757,7 @@ test('silent reprobe after fallback upgrades to direct once the endpoint comes a
   const { mgr: mgrB, socket: sockB } = await makeManager(B, manualClock(), {
     onDirectReady: (id, info) => bReady.resolve({ id, info }),
   }, deadPort)
+  mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
   assert.equal(sockB.address().port, deadPort)
 
   // The 60s silent reprobe fires and the fresh HELLO reaches B.

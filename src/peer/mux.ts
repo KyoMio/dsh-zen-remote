@@ -69,13 +69,9 @@ const GATEWAY_MIN_FRAME_BYTES = 44
 /** WS hello envelope 的重发节奏（TCP 可靠，这里只兜握手竞态与迟到坐标）。 */
 const HELLO_RETRY_MS = 400
 const HELLO_RETRY_MAX = 6
-/**
- * 一个会话 `deadStreams` 的上限（PG-9）：死流 id 只防「RST 之后迟到的分片
- * 复活流」，其新鲜度窗口其实只有几秒（ARQ 重传上限），但无限增长会让一个
- * 长命会话慢慢漏内存。超过上限按插入顺序淘汰最老项——最老的死流早就超出
- * 任何迟到分片能到达的窗口了。
- */
-const DEAD_STREAMS_CAP = 512
+const BODY_HIGH_WATER_BYTES = 64 * 1024
+const ADMISSION_CHUNK_BYTES = 16 * 1024
+const MAX_META_BYTES = 65_536
 
 /** 会话当前可用的物理路径。 */
 export type PeerPath = 'none' | 'udp' | 'ws'
@@ -108,18 +104,17 @@ interface MuxStream {
   /** responder 侧：虚拟请求对象与捕获型响应。 */
   req: Readable | null
   res: ServerResponse | null
-  /** 出站方向：响应元数据（fragment 0）是否已发出（responder）。 */
-  resMetaSent: boolean
   /** 出站方向是否已 FIN（各自方向恰好一次）。 */
   outboundFinished: boolean
-  /** 严格的出站写序（ARQ 顺序由同一链保证）。 */
-  writeChain: Promise<void>
+  /** Removed on every terminal path, including completed responses. */
+  removeAbortListener: (() => void) | null
+  bodyReader: ReadableStreamDefaultReader<Uint8Array> | null
+  bodySource: ReadableStream<Uint8Array> | null
   /** ServerResponse 的原始捕获字节与增量 HTTP/1.1 解析状态。 */
-  captureParts: Buffer[]
   captureHead: { status: number; statusText: string; headers: Record<string, string> } | null
   captureBody: Buffer
   captureChunkSize: number
-  captureChunkState: 'idle' | 'size' | 'data' | 'trailer' | 'done'
+  captureChunkState: 'idle' | 'size' | 'data' | 'crlf' | 'done'
 }
 
 interface MuxSession {
@@ -139,8 +134,6 @@ interface MuxSession {
   arq: PeerArqSession
   punchSender: PunchFrameSender | null
   streams: Map<number, MuxStream>
-  /** 已被 RST 的流 id：其后迟到的 DATA 分片不得把流入站半边复活。 */
-  deadStreams: Set<number>
   nextStreamId: number
   helloTimer: unknown
   helloTries: number
@@ -178,7 +171,7 @@ export class PeerMux {
   private readonly options: PeerMuxOptions
   private readonly clock: MuxClock
   private readonly sessions = new Map<string, MuxSession>()
-  /** 对端会话拆建后延续单调递增的 streamId，避免落入对端未过期的 deadStreams 窗口。 */
+  /** 对端会话拆建后延续单调递增的 streamId，避免复用对端已退休的 streamId。 */
   private readonly nextStreamIds = new Map<string, number>()
   private closed = false
 
@@ -212,11 +205,19 @@ export class PeerMux {
       arq: new PeerArqSession({
         sendFrame: (frameType, streamId, payload, ack) => this.dispatchFrame(session, frameType, streamId, payload, ack),
         onStreamData: (streamId, chunk, final) => this.onStreamData(session, streamId, chunk, final),
-        onStreamReset: (streamId) => this.onStreamReset(session, streamId),
+        clock: this.clock,
+        onAdmissionClosed: error => this.options.log?.(`mux: ${session.nodeId}: ${error.message}`),
+        onStreamClosed: (streamId, error) => {
+          const stream = session.streams.get(streamId)
+          if (!stream) return
+          stream.removeAbortListener?.()
+          stream.removeAbortListener = null
+          if (error) this.abortStream(session, stream, error)
+          else session.streams.delete(streamId)
+        },
       }),
       punchSender: null,
       streams: new Map(),
-      deadStreams: new Set(),
       // 奇偶发起权：nodeId 字典序较小一方用奇数流 id，较大一方用偶数；若同进程内曾拆掉过会话则接着涨。
       nextStreamId: this.nextStreamIds.get(id) ?? (id < this.options.identity.nodeId ? 1 : 2),
       helloTimer: null,
@@ -244,7 +245,6 @@ export class PeerMux {
       this.abortStream(session, stream, new Error('peer session closed'))
     }
     session.streams.clear()
-    session.deadStreams.clear()
     this.sessions.delete(session.nodeId)
     if (session.path !== 'none') {
       session.path = 'none'
@@ -396,23 +396,23 @@ export class PeerMux {
               // Response 自己管传输编码与长度；逐跳头不进适配层。
               if (name === 'transfer-encoding' || name === 'content-length' || name === 'connection' || name === 'keep-alive') continue
               resHeaders.set(name, value)
-            }
+           }
             const body = method === 'HEAD' || [204, 205, 304].includes(meta.status) ? null : new ReadableStream<Uint8Array>({
               start: (controller) => {
                 stream.bodyController = controller
               },
+              pull: () => { session.arq.resume(streamId) },
               cancel: () => {
                 this.resetStream(session, stream)
               },
-            })
+            }, { highWaterMark: BODY_HIGH_WATER_BYTES, size: chunk => chunk.byteLength })
             const response = new Response(body, { status: meta.status, statusText: meta.statusText, headers: resHeaders })
             // Commit only after validation: constructor failures must reject fetch.
             settled = true
             stream.responseResolved = true
             resolve(response)
           } catch (error) {
-            this.resetStream(session, stream)
-            this.abortStream(session, stream, error instanceof Error ? error : new Error(String(error)))
+            this.resetStream(session, stream, error instanceof Error ? error : new Error(String(error)))
           }
         }
         stream.responseReject = (err) => {
@@ -421,9 +421,10 @@ export class PeerMux {
           reject(err)
         }
 
+        const body = init?.body ?? (url instanceof globalThis.Request ? url.body : null)
+        if (body && typeof (body as ReadableStream).getReader === 'function') stream.bodySource = body as ReadableStream<Uint8Array>
         const onAbort = (): void => {
-          this.resetStream(session, stream)
-          stream.responseReject?.(new Error('the caller aborted the request'))
+          this.resetStream(session, stream, new Error('the caller aborted the request'))
           if (stream.bodyController !== null) {
             try { stream.bodyController.error(new Error('aborted')) } catch { /* already errored */ }
           }
@@ -435,6 +436,7 @@ export class PeerMux {
             return
           }
           signal.addEventListener('abort', onAbort, { once: true })
+          stream.removeAbortListener = () => signal.removeEventListener('abort', onAbort)
         }
 
         const run = async (): Promise<void> => {
@@ -442,52 +444,35 @@ export class PeerMux {
             `${JSON.stringify({ t: 'req', m: method, p: pathWithQuery, h: headers })}\n`,
             'utf8',
           )
-          const body = init?.body ?? (url instanceof globalThis.Request ? url.body : null)
-          // Pipeline buffered requests (meta + body + FIN) into ARQ synchronously
-          // in a single flight (1 RTT instead of 3 sequential SACK-awaited RTTs).
-          if (body === null || body === undefined) {
-            void this.writeArq(session, stream, metaBytes)
-            if (!stream.outboundFinished) {
-              stream.outboundFinished = true
-              await session.arq.finish(streamId).catch(() => {})
+          await this.writeArq(session, stream, metaBytes)
+          if (session.streams.get(streamId) !== stream) throw new Error('upload aborted before body admission')
+          if (body !== null && body !== undefined) {
+            if (typeof body === 'string' || body instanceof Uint8Array || body instanceof ArrayBuffer) {
+              const bytes = typeof body === 'string' ? Buffer.from(body) : body instanceof Uint8Array ? body : new Uint8Array(body)
+              await this.writeArq(session, stream, bytes)
+            } else {
+              const source = typeof (body as ReadableStream).getReader === 'function'
+                ? body as ReadableStream<Uint8Array> : new Response(body as BodyInit).body!
+              stream.bodySource = source
+              const reader = source.getReader()
+              stream.bodyReader = reader
+              try {
+                for (;;) {
+                  const { done, value } = await reader.read()
+                  if (session.streams.get(streamId) !== stream) throw new Error('upload aborted during read')
+                  if (done) break
+                  await this.writeArq(session, stream, value)
+                }
+              } finally { reader.releaseLock(); stream.bodyReader = null; stream.bodySource = null }
             }
-            return
           }
-          if (typeof body === 'string' || body instanceof Uint8Array || body instanceof ArrayBuffer) {
-            const bodyBytes = typeof body === 'string'
-              ? Buffer.from(body, 'utf8')
-              : body instanceof Uint8Array
-                ? body
-                : new Uint8Array(body)
-            void this.writeArq(session, stream, metaBytes)
-            if (bodyBytes.byteLength > 0) void this.writeArq(session, stream, bodyBytes)
-            if (!stream.outboundFinished) {
-              stream.outboundFinished = true
-              await session.arq.finish(streamId).catch(() => {})
-            }
-            return
-          }
-          if (typeof (body as ReadableStream).getReader === 'function') {
-            void this.writeArq(session, stream, metaBytes)
-            const reader = (body as ReadableStream<Uint8Array>).getReader()
-            for (;;) {
-              const { done, value } = await reader.read()
-              if (done) break
-              await this.writeArq(session, stream, value)
-            }
-          } else {
-            const asText = await new Response(body as BodyInit).text()
-            void this.writeArq(session, stream, metaBytes)
-            if (asText.length > 0) void this.writeArq(session, stream, Buffer.from(asText, 'utf8'))
-          }
-          if (!stream.outboundFinished) {
+          if (!stream.outboundFinished && session.streams.get(streamId) === stream) {
             stream.outboundFinished = true
-            await session.arq.finish(streamId).catch(() => {})
+            await session.arq.finish(streamId)
           }
         }
         run().catch((err) => {
-          this.resetStream(session, stream)
-          stream.responseReject?.(err instanceof Error ? err : new Error(String(err)))
+          this.resetStream(session, stream, err instanceof Error ? err : new Error(String(err)))
         })
       })
     }
@@ -495,11 +480,16 @@ export class PeerMux {
 
   // ------------------------------------------------------------ 内部
 
-  /** 一次顺序 ARQ 写；路径未就绪的抛错在这里吞掉——ARQ 重传定时器补发。 */
-  private writeArq(session: MuxSession, stream: MuxStream, bytes: Uint8Array): Promise<void> {
-    const step = session.arq.write(stream.streamId, bytes).catch(() => {})
-    stream.writeChain = stream.writeChain.then(() => step)
-    return step
+  /** Pipeline into a bounded byte budget; await capacity, never each frame's RTT. */
+  private async writeArq(session: MuxSession, stream: MuxStream, bytes: Uint8Array): Promise<void> {
+    for (let offset = 0; offset < bytes.byteLength; offset += ADMISSION_CHUNK_BYTES) {
+      const part = bytes.subarray(offset, offset + ADMISSION_CHUNK_BYTES)
+      for (;;) {
+        if (session.closed || session.streams.get(stream.streamId) !== stream) throw new Error('mux stream closed')
+        if (session.arq.tryWrite(stream.streamId, part)) break
+        await session.arq.waitWritable(stream.streamId, part.byteLength)
+      }
+    }
   }
 
   /**
@@ -544,19 +534,20 @@ export class PeerMux {
   private beginHello(session: MuxSession): void {
     if (session.closed || this.closed) return
     if (session.helloTimer !== null) return // 握手已在途
-    if (session.ciphers !== null) return
     ensureMyEphemeral(session)
+    if (session.nonce === null) session.nonce = randomBytes(8).toString('hex')
     session.helloTries = 0
-    this.sendHelloEnvelope(session)
     const tick = (): void => {
       session.helloTimer = null
-      if (session.closed || this.closed || session.ciphers !== null) return
+      if (session.closed || this.closed || session.nonce === null) return
       session.helloTries += 1
-      if (session.helloTries > HELLO_RETRY_MAX) return // 下一次坐标/路径事件再武装
-      this.sendHelloEnvelope(session)
+      if (session.helloTries > HELLO_RETRY_MAX) { session.nonce = null; return }
       session.helloTimer = this.clock.setTimeout(tick, HELLO_RETRY_MS)
+      this.sendHelloEnvelope(session)
     }
+    // Arm before sending: synchronous test/loopback delivery may consume nonce.
     session.helloTimer = this.clock.setTimeout(tick, HELLO_RETRY_MS)
+    this.sendHelloEnvelope(session)
   }
 
   private clearHelloTimer(session: MuxSession): void {
@@ -659,7 +650,9 @@ export class PeerMux {
       // 先应答——对端正等着 ack 完成握手。
       ensureMyEphemeral(session)
       this.sendHelloAckEnvelope(session, nonce)
-      this.integratePeerEphemeral(session, ephPubHex)
+      // HELLO is replayable within its TTL. Only a fresh challenge response
+      // may replace the working key; keep our DH key stable for old peers.
+      if (session.peerEphPubHex !== ephPubHex || session.ciphers === null) this.beginHello(session)
       return
     }
     if (parsed.kind === 'zr-hello-ack') {
@@ -677,19 +670,29 @@ export class PeerMux {
   /** 采用对端临时钥：每个新 (my, peer) 对只派生一次中转密码器。 */
   private integratePeerEphemeral(session: MuxSession, peerEphPubHex: string): void {
     if (session.closed) return
-    if (session.peerEphPubHex === peerEphPubHex && session.ciphers !== null) return
+    if (session.peerEphPubHex === peerEphPubHex && session.ciphers !== null) {
+      session.nonce = null
+      this.clearHelloTimer(session)
+      return
+    }
     const myEph = session.myEph
     if (myEph === null) return // 不会发生：hello/ack 两侧都有各自的临时钥
-    const ciphers = derivePeerSessionCiphers({
-      networkId: this.options.networkId,
-      myNodeId: this.options.identity.nodeId,
-      peerNodeId: session.nodeId,
-      myEphPrivateKeyHex: myEph.privateKeyHex,
-      myEphPublicKeyHex: myEph.publicKeyHex,
-      peerEphPublicKeyHex: peerEphPubHex,
-    })
+    let ciphers: PeerSessionCiphers
+    try {
+      ciphers = derivePeerSessionCiphers({
+        networkId: this.options.networkId,
+        myNodeId: this.options.identity.nodeId,
+        peerNodeId: session.nodeId,
+        myEphPrivateKeyHex: myEph.privateKeyHex,
+        myEphPublicKeyHex: myEph.publicKeyHex,
+        peerEphPublicKeyHex: peerEphPubHex,
+      })
+    } catch {
+      return // Signed but invalid/low-order DH key; retain the established cipher.
+    }
     session.peerEphPubHex = peerEphPubHex
     session.ciphers = ciphers
+    session.nonce = null // consume only after successful derivation
     this.clearHelloTimer(session)
     this.options.log?.(`mux: relay handshake complete for ${session.nodeId} (path=${session.path})`)
     if (session.path === 'none') {
@@ -701,29 +704,25 @@ export class PeerMux {
 
   // ---- ARQ → 流 ------------------------------------------------------
 
-  /** 记一个死流 id；超过上限按插入顺序淘汰最老项（PG-9）。 */
-  private noteDeadStream(session: MuxSession, streamId: number): void {
-    session.deadStreams.add(streamId)
-    if (session.deadStreams.size > DEAD_STREAMS_CAP) {
-      const oldest = session.deadStreams.values().next().value
-      if (oldest !== undefined) session.deadStreams.delete(oldest)
-    }
-  }
-
   /** ARQ 顺序送达的一个入站分片（0 = 元数据，1+ = 体，fin = 结束）。 */
-  private onStreamData(session: MuxSession, streamId: number, chunk: Uint8Array, final: boolean): void {
+  private onStreamData(session: MuxSession, streamId: number, chunk: Uint8Array, final: boolean): boolean {
     const stream = session.streams.get(streamId)
     if (!stream) {
-      if (session.deadStreams.has(streamId)) return // RST 之后迟到的分片不得复活流
       this.openInbound(session, streamId, chunk, final)
-      return
+      return true
+    }
+    // Refuse BEFORE any parse/enqueue/push side effect. push(false) itself
+    // accepts bytes, so only the next delivery is stalled.
+    if (stream.inboundMetaDone && chunk.byteLength > 0) {
+      if (stream.bodyController && (stream.bodyController.desiredSize ?? 0) < chunk.byteLength) return false
+      if (stream.req && stream.req.readableLength >= BODY_HIGH_WATER_BYTES) return false
     }
     this.onFragment(session, stream, chunk, final)
+    return true
   }
 
   /** 单个入站分片的按向处理（ARQ 已保证顺序，元数据支持跨分片与换行定界）。 */
   private onFragment(session: MuxSession, stream: MuxStream, chunk: Uint8Array, final: boolean): void {
-    const MAX_META_BYTES = 65_536
     if (stream.initiator) {
       // 应答方 → 发起方：首段为响应元数据（以 \n 定界，兼容旧单包无 \n JSON），其余为响应体。
       if (!stream.inboundMetaDone) {
@@ -737,15 +736,15 @@ export class PeerMux {
           meta = parseResponseMeta(stream.inboundMetaBuf.subarray(0, nl))
           remainder = stream.inboundMetaBuf.subarray(nl + 1)
           if (meta === null) {
-            this.abortStream(session, stream, new Error('malformed peer response metadata'))
+            this.resetStream(session, stream, new Error('malformed peer response metadata'))
             return
           }
         } else {
           meta = parseResponseMeta(stream.inboundMetaBuf)
           if (meta === null) {
             if (final || stream.inboundMetaBuf.length > MAX_META_BYTES) {
-              this.abortStream(session, stream, new Error('malformed peer response metadata'))
-            }
+              this.resetStream(session, stream, new Error('malformed peer response metadata'))
+           }
             return
           }
         }
@@ -763,7 +762,6 @@ export class PeerMux {
         stream.inboundFinished = true
         closeController(stream.bodyController)
         stream.bodyController = null
-        session.streams.delete(stream.streamId)
       }
       return
     }
@@ -780,7 +778,6 @@ export class PeerMux {
         remainder = stream.inboundMetaBuf.subarray(nl + 1)
         if (meta === null) {
           this.resetStream(session, stream)
-          this.noteDeadStream(session, stream.streamId)
           return
         }
       } else {
@@ -788,7 +785,6 @@ export class PeerMux {
         if (meta === null) {
           if (final || stream.inboundMetaBuf.length > MAX_META_BYTES) {
             this.resetStream(session, stream)
-            this.noteDeadStream(session, stream.streamId)
           }
           return
         }
@@ -809,18 +805,23 @@ export class PeerMux {
     }
   }
 
-  /** 对端对本流发了 RST：本地各件按「连接被切」销毁。 */
-  private onStreamReset(session: MuxSession, streamId: number): void {
-    this.noteDeadStream(session, streamId)
-    const stream = session.streams.get(streamId)
-    if (!stream) return
-    this.abortStream(session, stream, new Error('stream reset by peer'))
-  }
-
   /** 杀掉一条流的本地表面并从流表移除（双向 FIN/RST 后不留驻内存）。 */
   private abortStream(session: MuxSession, stream: MuxStream, err: Error): void {
+    session.streams.delete(stream.streamId)
+    stream.removeAbortListener?.()
+    stream.removeAbortListener = null
+    if (stream.bodyReader) {
+      void stream.bodyReader.cancel(err).catch(() => {})
+      stream.bodyReader.releaseLock()
+    } else if (stream.bodySource && !stream.bodySource.locked) {
+      void stream.bodySource.cancel(err).catch(() => {})
+    }
+    stream.bodyReader = null
+    stream.bodySource = null
     stream.responseReject?.(err)
     stream.responseReject = null
+    stream.responseResolve = null
+    stream.captureBody = Buffer.alloc(0)
     if (stream.bodyController !== null) {
       try { stream.bodyController.error(err) } catch { /* already closed */ }
       stream.bodyController = null
@@ -837,8 +838,8 @@ export class PeerMux {
   }
 
   /** 向对端发 RST（本侧中止方向）。 */
-  private resetStream(session: MuxSession, stream: MuxStream): void {
-    this.noteDeadStream(session, stream.streamId)
+  private resetStream(session: MuxSession, stream: MuxStream, error = new Error('mux stream reset')): void {
+    this.abortStream(session, stream, error)
     if (!session.closed) {
       try {
         session.arq.reset(stream.streamId)
@@ -863,7 +864,7 @@ export class PeerMux {
     stream: MuxStream,
     meta: RequestMeta,
   ): void {
-    const req = new Readable({ read() {} })
+    const req = new Readable({ highWaterMark: BODY_HIGH_WATER_BYTES, read: () => { session.arq.resume(stream.streamId) } })
     Object.assign(req, {
       method: meta.m,
       url: meta.p,
@@ -885,10 +886,12 @@ export class PeerMux {
       } as Record<string, string>,
     })
     const socket = new Writable({
+      highWaterMark: BODY_HIGH_WATER_BYTES,
       write: (chunk: Buffer, _enc, cb) => {
-        stream.captureParts.push(Buffer.from(chunk))
-        this.parseCapture(session, stream)
-        cb()
+        void this.parseCapture(session, stream, chunk).then(() => cb(), error => {
+          this.resetStream(session, stream, error instanceof Error ? error : new Error(String(error)))
+          cb(error instanceof Error ? error : new Error(String(error)))
+        })
       },
       // 响应被销毁（handler 死亡）时 'close' 必须能看到——relayHandler 的
       // 清理路径挂在 res 'close' 上，而 res 'close' 源自 socket 'close'。
@@ -908,10 +911,8 @@ export class PeerMux {
     stream.req = req
     stream.res = res
 
+    socket.on('error', () => {}) // errors already terminate the ARQ stream above
     res.on('finish', () => {
-      this.options.log?.(`mux: virtual response finished for ${session.nodeId} stream ${stream.streamId} (captured=${stream.captureParts.length} parts, head=${stream.captureHead !== null})`)
-      // 状态行、头、体全部捕获完毕；解析器已把能发的都发了——补发残尾并 FIN。
-      this.parseCapture(session, stream, true)
       this.finishResponse(session, stream)
     })
     res.on('close', () => {
@@ -942,131 +943,79 @@ export class PeerMux {
     })
   }
 
-  /** 对捕获的 ServerResponse 原始字节做增量 HTTP/1.1 响应解析。 */
-  private parseCapture(session: MuxSession, stream: MuxStream, final = false): void {
-    if (stream.captureParts.length === 0) return
-    let buf = Buffer.concat(stream.captureParts)
-    stream.captureParts = []
-    if (stream.captureHead === null) {
-      const headEnd = buf.indexOf('\r\n\r\n')
-      if (headEnd === -1) {
-        if (buf.length > 0) stream.captureParts.push(buf)
-        return
-      }
-      const head = buf.subarray(0, headEnd).toString('utf8')
-      const lines = head.split('\r\n')
-      const statusLine = lines.shift() ?? ''
-      const match = /^HTTP\/1\.[01] (\d{3})(?: (.*))?$/.exec(statusLine)
-      if (match === null) {
-        this.abortStream(session, stream, new Error('malformed virtual response head'))
-        return
-      }
-      const headers: Record<string, string> = {}
-      for (const line of lines) {
-        const colon = line.indexOf(':')
-        if (colon <= 0) continue
-        headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim()
-      }
-      stream.captureHead = { status: Number(match[1]), statusText: match[2] ?? '', headers }
-      buf = buf.subarray(headEnd + 4)
-      // 元数据尽早出站：流式响应的头先走，体随后。
-      this.writeResponseMetaAndBody(session, stream, Buffer.alloc(0), false)
-    }
-    stream.captureBody = Buffer.concat([stream.captureBody, buf])
-    const contentLength = stream.captureHead.headers['content-length'] !== undefined
-      ? Number(stream.captureHead.headers['content-length'])
-      : null
-    if (contentLength !== null && Number.isInteger(contentLength) && contentLength >= 0) {
-      // 缓冲型路由：等齐 content-length 一次性发（体通常就是一段小 JSON）。
-      if (stream.captureBody.length < contentLength) return
-      const chunk = stream.captureBody.subarray(0, contentLength)
+  /** Decode bounded slices, including partial HTTP chunks; never accumulate a body. */
+  private async parseCapture(session: MuxSession, stream: MuxStream, input: Buffer): Promise<void> {
+    // The producer owns input until its socket callback fires. No full-input copy;
+    // only the current 16KiB slice and an incomplete bounded header are retained.
+    for (let offset = 0; offset < input.length; offset += ADMISSION_CHUNK_BYTES) {
+      if (session.streams.get(stream.streamId) !== stream) throw new Error('mux stream closed')
+      let buf = input.subarray(offset, offset + ADMISSION_CHUNK_BYTES)
+      if (stream.captureBody.length) buf = Buffer.concat([stream.captureBody, buf])
       stream.captureBody = Buffer.alloc(0)
-      this.writeResponseMetaAndBody(session, stream, chunk, true)
-      stream.captureChunkState = 'done'
-      return
-    }
-    // Chunked：逐块增量解码（流式 NDJSON 路由）。
-    for (;;) {
-      if (stream.captureChunkState === 'idle' || stream.captureChunkState === 'size') {
-        const idx = stream.captureBody.indexOf('\r\n')
-        if (idx === -1) break
-        const size = parseInt(stream.captureBody.subarray(0, idx).toString('utf8').split(';')[0], 16)
-        stream.captureBody = stream.captureBody.subarray(idx + 2)
-        if (!Number.isInteger(size) || Number.isNaN(size) || size < 0) {
-          this.abortStream(session, stream, new Error('malformed chunked virtual response'))
-          return
-        }
-        if (size === 0) {
-          stream.captureChunkState = 'trailer'
+      if (stream.captureHead === null) {
+        const end = buf.indexOf('\r\n\r\n')
+        if (end < 0) {
+          if (buf.length > MAX_META_BYTES) throw new Error('virtual response head too large')
+          stream.captureBody = Buffer.from(buf)
           continue
         }
-        stream.captureChunkSize = size
-        stream.captureChunkState = 'data'
+        if (end > MAX_META_BYTES) throw new Error('virtual response head too large')
+        const lines = buf.subarray(0, end).toString('utf8').split('\r\n')
+        const match = /^HTTP\/1\.[01] (\d{3})(?: (.*))?$/.exec(lines.shift() ?? '')
+        if (!match) throw new Error('malformed virtual response head')
+        const headers: Record<string, string> = {}
+        for (const line of lines) {
+          const colon = line.indexOf(':')
+          if (colon > 0) headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim()
+        }
+        stream.captureHead = { status: Number(match[1]), statusText: match[2] ?? '', headers }
+        await this.writeArq(session, stream, Buffer.from(`${JSON.stringify({ t: 'res', s: Number(match[1]), st: match[2] ?? '', h: headers })}\n`))
+        buf = buf.subarray(end + 4)
+      }
+      const headers = stream.captureHead.headers
+      if (!/\bchunked\b/i.test(headers['transfer-encoding'] ?? '')) {
+        if (buf.length) await this.writeArq(session, stream, buf)
         continue
       }
-      if (stream.captureChunkState === 'data') {
-        if (stream.captureBody.length < stream.captureChunkSize + 2) break
-        const chunk = stream.captureBody.subarray(0, stream.captureChunkSize)
-        stream.captureBody = stream.captureBody.subarray(stream.captureChunkSize + 2) // 块 + CRLF
-        this.writeResponseMetaAndBody(session, stream, chunk, false)
-        stream.captureChunkState = 'size'
-        continue
+      while (buf.length) {
+        if (stream.captureChunkState === 'idle' || stream.captureChunkState === 'size') {
+          const end = buf.indexOf('\r\n')
+          if (end < 0) {
+            if (buf.length > MAX_META_BYTES) throw new Error('chunk header too large')
+            stream.captureBody = Buffer.from(buf)
+            break
+          }
+          const hex = buf.subarray(0, end).toString('ascii').split(';')[0]
+          if (!/^[0-9a-f]+$/i.test(hex)) throw new Error('malformed chunk size')
+          const size = Number.parseInt(hex, 16)
+          if (!Number.isSafeInteger(size)) throw new Error('invalid chunk size')
+          buf = buf.subarray(end + 2)
+          stream.captureChunkSize = size
+          stream.captureChunkState = size === 0 ? 'done' : 'data'
+        } else if (stream.captureChunkState === 'data') {
+          const size = Math.min(buf.length, stream.captureChunkSize)
+          await this.writeArq(session, stream, buf.subarray(0, size))
+          buf = buf.subarray(size)
+          stream.captureChunkSize -= size
+          if (stream.captureChunkSize === 0) stream.captureChunkState = 'crlf'
+        } else if (stream.captureChunkState === 'crlf') {
+          if (buf.length < 2) { stream.captureBody = Buffer.from(buf); break }
+          if (buf[0] !== 13 || buf[1] !== 10) throw new Error('malformed chunk delimiter')
+          buf = buf.subarray(2)
+          stream.captureChunkState = 'size'
+        } else break // trailers have no HTTP body bytes
       }
-      if (stream.captureChunkState === 'trailer') {
-        // 零长度块已见：体完结（尾部头无论什么形态都不再关心）。
-        this.writeResponseMetaAndBody(session, stream, Buffer.alloc(0), true)
-        stream.captureChunkState = 'done'
-        return
-      }
-      if (stream.captureChunkState === 'done') return
-    }
-    // finish 而无终止零块（理论不该发生）：仍照常收尾。字符串比较绕开
-    // TS 在循环出口处的联合类型收窄（收窄后的状态本来就到不了 'done'）。
-    if (final && (stream.captureChunkState as string) !== 'done') {
-      this.writeResponseMetaAndBody(session, stream, Buffer.alloc(0), true)
     }
   }
 
-  /** 响应元数据只发一次，其后是体分片，完结时 FIN（全部同步入 ARQ 队列，严守 FIFO 字节序）。 */
-  private writeResponseMetaAndBody(session: MuxSession, stream: MuxStream, chunk: Buffer, fin: boolean): void {
-    if (session.closed || session.streams.get(stream.streamId) !== stream) return
-    if (!stream.resMetaSent) {
-      stream.resMetaSent = true
-      const meta = stream.captureHead
-      this.options.log?.(`mux: response meta → ${session.nodeId} stream ${stream.streamId} status=${meta?.status}`)
-      const metaJson = Buffer.from(
-        `${JSON.stringify({
-          t: 'res',
-          s: meta?.status ?? 200,
-          st: meta?.statusText ?? '',
-          h: meta?.headers ?? {},
-        })}\n`,
-        'utf8',
-      )
-      const metaStep = session.arq.write(stream.streamId, metaJson).catch(() => {})
-      stream.writeChain = stream.writeChain.then(() => metaStep)
-    }
-    if (chunk.length > 0) {
-      const bodyStep = session.arq.write(stream.streamId, chunk).catch(() => {})
-      stream.writeChain = stream.writeChain.then(() => bodyStep)
-    }
-    if (fin && !stream.outboundFinished) {
-      stream.outboundFinished = true
-      const finStep = session.arq.finish(stream.streamId).catch(() => {})
-      stream.writeChain = stream.writeChain.then(() => finStep)
-    }
-  }
-
-  /** res finish：补发残尾并 FIN（幂等，outboundFinished 守住）。 */
   private finishResponse(session: MuxSession, stream: MuxStream): void {
-    if (session.streams.get(stream.streamId) !== stream) return
-    if (stream.captureParts.length > 0) this.parseCapture(session, stream, true)
-    if (!stream.outboundFinished) {
-      stream.outboundFinished = true
-      const finStep = session.arq.finish(stream.streamId).catch(() => {})
-      stream.writeChain = stream.writeChain.then(() => finStep)
-    }
+    if (session.streams.get(stream.streamId) !== stream || stream.outboundFinished) return
+    stream.outboundFinished = true
+    void session.arq.finish(stream.streamId).catch(error => {
+      this.resetStream(session, stream, error instanceof Error ? error : new Error(String(error)))
+    })
   }
+
 }
 
 // -- 模块级形态 ---------------------------------------------------------------------------
@@ -1084,10 +1033,10 @@ function newStream(streamId: number, initiator: boolean): MuxStream {
     bodyController: null,
     req: null,
     res: null,
-    resMetaSent: false,
     outboundFinished: false,
-    writeChain: Promise.resolve(),
-    captureParts: [],
+    removeAbortListener: null,
+    bodyReader: null,
+    bodySource: null,
     captureHead: null,
     captureBody: Buffer.alloc(0),
     captureChunkSize: 0,
