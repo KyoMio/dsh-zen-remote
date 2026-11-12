@@ -28,7 +28,7 @@
  */
 
 import type { ConfigSource } from './config.js'
-import { createRelayClient } from './relay-client.js'
+import { createRelayClient, PEER_UPLOAD_RECOVERY_MARGIN_MS } from './relay-client.js'
 import type { RelayClient, RelayClock, RelayState, CreateRelayClientOptions } from './relay-client.js'
 import type { PairedServerRecord } from './state-store.js'
 import {
@@ -248,8 +248,11 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
   }
 
   /** The client's credential getters read the CURRENT record per request, so
-   * a re-pair (an in-place record swap) reaches the next attempt directly. */
-  const createClientFor = (record: PairedServerRecord, fetchOverride?: typeof fetch): RelayClient => {
+   * a re-pair (an in-place record swap) reaches the next attempt directly.
+   * A peer-virtual mount passes the upload recovery margin (PC-05): only
+   * its known-length uploads ride the peer transport's mid-flight path
+   * recovery. */
+  const createClientFor = (record: PairedServerRecord, fetchOverride?: typeof fetch, uploadRecoveryMarginMs?: number): RelayClient => {
     const liveRecord = (): PairedServerRecord => pool.get(record.id)?.record ?? record
     const clientOptions: CreateRelayClientOptions = {
       getServerUrl: () => liveRecord().serverUrl,
@@ -259,6 +262,7 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
         ? { fetchImpl: fetchOverride }
         : options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
       ...(options.clock !== undefined ? { clock: options.clock } : {}),
+      ...(uploadRecoveryMarginMs !== undefined ? { uploadRecoveryMarginMs } : {}),
     }
     return createClientImpl(clientOptions)
   }
@@ -427,7 +431,7 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
       }
       const entry: PoolEntry = {
         record,
-        client: createClientFor(record, input.fetchImpl),
+        client: createClientFor(record, input.fetchImpl, PEER_UPLOAD_RECOVERY_MARGIN_MS),
         unsubscribe: () => {},
         virtual: true,
       }

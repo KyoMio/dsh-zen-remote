@@ -23,6 +23,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const dgram = require('node:dgram')
+const { createHash } = require('node:crypto')
 
 // 主仓（编译产物）
 const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
@@ -234,7 +235,7 @@ function makeFirewallSocket(realSocket) {
  * 真实 RelayPool + 真实 PeerEngine。宿主 typertGateway 的门扇形与 relay-e2e
  * 相同：`workspace/follow` 是可控的帧队列，`session/list` 等走可编程 invoke。
  */
-async function startNode(gw, { name, firewall = false, shared = [], heartbeatMs = 300 } = {}) {
+async function startNode(gw, { name, firewall = false, shared = [], heartbeatMs = 300, hostFetch } = {}) {
   const home = path.join(ROOT, `node-${name}-${Math.random().toString(36).slice(2, 6)}`)
   fs.mkdirSync(home, { recursive: true })
   const stateFile = path.join(home, 'zen-remote-state.json')
@@ -320,8 +321,9 @@ async function startNode(gw, { name, firewall = false, shared = [], heartbeatMs 
       plugins: () => ({}),
     },
     // v1/upload 的宿主转发被替身为一个回显信封——断言的是 mux 通道把二进制
-    // 请求体完整送到并带回响应，不是宿主上传路由本身。
-    getApiFetch: () => async (request) => {
+    // 请求体完整送到并带回响应，不是宿主上传路由本身。hostFetch 允许单测
+    // 换一个增量观测的替身（PC-05：边收边数、到点拉黑 UDP）。
+    getApiFetch: hostFetch !== undefined ? hostFetch : () => async (request) => {
       const bodyText = await request.text()
       return new Response(JSON.stringify({ ok: true, echoedBytes: bodyText.length, url: request.url }), {
         status: 200,
@@ -1764,6 +1766,115 @@ test('PG-8 #9: high-latency WS relay + one-way UDP blackhole + sidebar WS sessio
     for (const node of nodes) node.stop()
     for (const sock of liveSockets) { try { sock.destroy() } catch { /* ignore */ } }
     await Promise.all(servers.map((s) => new Promise((r) => { s.closeAllConnections?.(); s.close(r) })))
+    await gw.close()
+  }
+})
+
+// ---------------------------------------------------------------- PC-05：中途丢 UDP 的已知长度上传经 WS 恢复完成
+
+test('PC-05: 2MiB known-length upload rides out a mid-flight UDP blackout through the real virtual pool wiring', async (t) => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  const MIB = 1024 * 1024
+  const PAYLOAD = Buffer.alloc(2 * MIB)
+  for (let i = 0; i < PAYLOAD.length; i++) PAYLOAD[i] = i & 0xff
+  const EXPECTED_DIGEST = createHash('sha256').update(PAYLOAD).digest('hex')
+  const BLACKOUT_AT = 768 * 1024
+
+  // B（上传方）先装配成可拉黑形态：wrapper 一开始放行直连，黑窗由 A 的宿主
+  // 替身在收到 768KiB 时拉上——真实 loopback UDP 在途丢失，PC-04 的 15s
+  // 接收死线检测后经网关 WS 恢复。
+  let B
+  try {
+    // A 的宿主替身：增量计数 + sha256；≥768KiB 时拉黑 B 的 UDP（恰好一次）。
+    let blackedOut = false
+    let hostCalls = 0
+    let hostReceived = 0
+    let hostDigest = null
+    const A = await startNode(gw, {
+      name: 'node-a',
+      shared: ['s-a1'],
+      hostFetch: () => async (request) => {
+        hostCalls += 1
+        const hash = createHash('sha256')
+        const reader = request.body.getReader()
+        let received = 0
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          received += value.byteLength
+          hash.update(value)
+          if (!blackedOut && received >= BLACKOUT_AT) {
+            blackedOut = true
+            B.setFirewall(true)
+          }
+        }
+        hostReceived = received
+        hostDigest = hash.digest('hex')
+        return new Response(JSON.stringify({ ok: true, echoedBytes: received, sha256: hostDigest }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+    B = await startNode(gw, { name: 'node-b', firewall: true })
+    nodes.push(A, B)
+    B.setFirewall(false)
+
+    // 顺序入网，A↔B 打洞直连。
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitFor(() => A.engine.status().gatewayState === 'authorized', 8000, 'A authorized')
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitFor(() => B.engine.status().gatewayState === 'authorized', 8000, 'B authorized')
+    await waitFor(() => {
+      const peer = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+      return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
+    }, 15000, 'A↔B direct path')
+    // 真实 RelayPool 的虚拟挂载（mountVirtual 接线）——上传预算的恢复余量
+    // 必须经这条路到达，不是手工 new 一个带选项的 RelayClient。
+    const virtualBonA = await waitPeerOnline(B, A.identity.nodeId)
+    await waitPeerOnline(A, B.identity.nodeId)
+
+    // 源速可控：256KiB × 8 段、段间 60ms——正常全程远低于旧 19s 预算，
+    // 失败绝不来自慢源；断言看恢复等待本身。
+    let sent = 0
+    const drip = new ReadableStream({
+      async pull(controller) {
+        if (sent >= PAYLOAD.length) {
+          controller.close()
+          return
+        }
+        const end = Math.min(sent + 256 * 1024, PAYLOAD.length)
+        controller.enqueue(new Uint8Array(PAYLOAD.subarray(sent, end)))
+        sent = end
+        await new Promise((resolve) => setTimeout(resolve, 60))
+      },
+    })
+    const cancel = new AbortController()
+    const startedAt = Date.now()
+    const uploadPromise = virtualBonA.client.upload(
+      { sessionId: 's-a1', name: 'big.bin', body: drip, bytes: PAYLOAD.length },
+      cancel.signal,
+    )
+    const result = await uploadPromise
+    const elapsed = Date.now() - startedAt
+    t.diagnostic(`pc-05 elapsed=${elapsed}ms hostReceived=${hostReceived} hostCalls=${hostCalls} blackoutFired=${blackedOut}`)
+
+    assert.equal(result.status, 200)
+    const receipt = JSON.parse(result.body)
+    assert.equal(receipt.ok, true)
+    assert.equal(receipt.echoedBytes, PAYLOAD.length, `the byte count survived the recovery (got ${receipt.echoedBytes})`)
+    assert.equal(receipt.sha256, EXPECTED_DIGEST, 'the SHA256 survived the recovery')
+    assert.equal(hostCalls, 1, 'the business forward ran exactly once — no whole-upload retry')
+    assert.ok(elapsed >= 15_000 - 500, `the completion includes the real ~15s direct-loss detection (got ${elapsed} ms)`)
+    assert.ok(elapsed < 39_000, `within the recovery budget (got ${elapsed} ms)`)
+    cancel.abort() // 已完成——防御性 no-op
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    for (const node of nodes) node.stop()
     await gw.close()
   }
 })
