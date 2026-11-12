@@ -76,6 +76,8 @@ export interface PeerWsHubOptions {
  */
 interface ConnState {
   ws: WebSocket;
+  /** Opaque STUN generation; replacements with the same identity get a new token. */
+  stunAdmission: symbol;
   state: 'hanging' | 'authorized' | 'closed';
   networkId: string;
   nodeId: string;
@@ -194,6 +196,10 @@ export class PeerWsHub {
   private rateTimer: NodeJS.Timeout | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   private closed = false;
+  // In-flight reads may carry pre-disable snapshots (including PostgreSQL queries).
+  private admissionEpoch = 0;
+  // Retain the last disable across re-enable: only newer attempts may join again.
+  private readonly ownerDisabledEpoch = new Map<string, number>();
 
   constructor(options: PeerWsHubOptions) {
     this.store = options.store;
@@ -400,6 +406,7 @@ export class PeerWsHub {
     challengeHex: string,
     remoteIp: string | null,
   ): Promise<ConnState | null> {
+    const epoch = this.admissionEpoch;
     const networkId = normalizeNetworkId(message['networkId']);
     const nodeId = normalizeNodeId(message['nodeId']);
     const publicKeyHex = normalizePublicKeyHex(message['publicKeyHex']);
@@ -432,6 +439,7 @@ export class PeerWsHub {
       deny(ws, 'network not found');
       return null;
     }
+    if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
     const proof = message['joinKeyProofHex'];
     let joinKeyMatched = false;
     if (typeof proof === 'string') {
@@ -442,9 +450,6 @@ export class PeerWsHub {
         joinKeyMatched = false; // 密文损坏视同口令不匹配
       }
     }
-
-    // 同一身份重复连接：旧连接让位（半开连接重连的正常路径）
-    this.replaceExisting(networkId, nodeId);
 
     const name = parseName(message['name']);
     let member: MemberRecord | null;
@@ -466,8 +471,12 @@ export class PeerWsHub {
       return null;
     }
 
+    // Revalidate after the async join write, before any routing/hanging registration.
+    if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
+    this.replaceExisting(networkId, nodeId);
     const conn: ConnState = {
       ws,
+      stunAdmission: Symbol(),
       state: 'hanging',
       networkId,
       nodeId,
@@ -507,6 +516,25 @@ export class PeerWsHub {
         return null;
       }
     }
+  }
+
+  private admissionCurrent(ws: WebSocket, ownerId: string, epoch: number): boolean {
+    if (this.closed || ws.readyState !== ws.OPEN) return false;
+    if ((this.ownerDisabledEpoch.get(ownerId) ?? 0) <= epoch) return true;
+    deny(ws, 'admission changed');
+    return false;
+  }
+
+  private async checkOwnerAdmission(ws: WebSocket, ownerId: string, epoch: number): Promise<boolean> {
+    try {
+      const owner = await this.store.findUserById(ownerId);
+      if (this.closed || ws.readyState !== ws.OPEN) return false;
+      if (owner?.active && (this.ownerDisabledEpoch.get(ownerId) ?? 0) <= epoch) return true;
+      deny(ws, 'account disabled or admission changed');
+    } catch {
+      deny(ws, 'gateway storage unavailable');
+    }
+    return false;
   }
 
   /** 踢掉同 (networkId, nodeId) 的旧连接（authorized 与挂起各查一遍） */
@@ -636,6 +664,13 @@ export class PeerWsHub {
     void this.publishTopology(record.networkId);
   }
 
+  /** STUN observes only a live, owner-admitted identity; pending remains non-routing. */
+  admitStunProbe(networkId: string, nodeId: string, publicKeyHex: string): symbol | null {
+    const conn = this.conns.get(networkId)?.get(nodeId) ?? this.hanging.get(connKey(networkId, nodeId));
+    return !this.closed && conn !== undefined && conn.state !== 'closed' &&
+      conn.ws.readyState === conn.ws.OPEN && conn.publicKeyHex === publicKeyHex ? conn.stunAdmission : null;
+  }
+
   /** udp-stun 的 public 判定要用到节点上报的 lanEndpoints */
   getLanEndpoints(networkId: string, nodeId: string): readonly string[] {
     const conn = this.conns.get(networkId)?.get(nodeId) ?? this.hanging.get(connKey(networkId, nodeId));
@@ -661,16 +696,23 @@ export class PeerWsHub {
         // 两条动作通向同一升级路径：挂起连接原地升级为 authorized
         const conn = this.hanging.get(key);
         if (conn === undefined) break;
-        this.hanging.delete(key);
+        const epoch = this.admissionEpoch;
+        // Keep the connection visible to disable/delete hooks throughout async promotion.
         // repin 后库里生效公钥即挂起连接入网时呈验的那把（store 已把
         // candidate 提升为 publicKeyHex）；从库再同步一次，防判定路径变化
         try {
           const members = await this.store.listMembers(event.networkId);
           const member = members.find((m) => m.nodeId === event.nodeId);
-          if (member !== undefined) conn.publicKeyHex = member.publicKeyHex;
+          if (member?.status !== 'authorized') break;
+          conn.publicKeyHex = member.publicKeyHex;
         } catch {
-          /* 查不到就保持呈验公钥 */
+          this.killConn(conn, 'gateway storage unavailable');
+          break;
         }
+        if (!await this.checkOwnerAdmission(conn.ws, conn.ownerId, epoch) ||
+            !this.admissionCurrent(conn.ws, conn.ownerId, epoch) ||
+            conn.state !== 'hanging' || this.hanging.get(key) !== conn) break;
+        this.hanging.delete(key);
         this.welcomeAuthorized(conn);
         this.registerAndAnnounce(conn);
         break;
@@ -772,6 +814,7 @@ export class PeerWsHub {
   }
 
   private onUserDisabled(userId: string): void {
+    this.ownerDisabledEpoch.set(userId, ++this.admissionEpoch);
     // 连接的 ownerId 是「网络归属者」：停用某租户即踢掉其名下全部网络的
     // 全部在线节点——收 peer-left 的对象自己也在被踢，广播没有意义，
     // 直接逐一拒绝即可（避免互踢消息穿插在 denied 之前）
