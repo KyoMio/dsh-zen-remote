@@ -66,6 +66,9 @@ export interface PeerWsHubOptions {
   /** 时间戳窗口，缺省 ±5 分钟 */
   timestampWindowMs?: number;
   now?: () => number;
+  /** 生产实例的真实 UDP STUN 端口供给器：组合根在 UdpStunService.bind() 完成后才返回
+   * 实际绑定值（不得用配置值或 HTTP 端口冒充）；返回 null 或缺省时 welcome 不带 stun 字段 */
+  stunPorts?: () => { primaryPort: number; altPort: number | null } | null;
 }
 
 /**
@@ -178,6 +181,8 @@ export class PeerWsHub {
   private readonly masterKey: Buffer;
   private readonly timestampWindowMs: number;
   private readonly now: () => number;
+  /** 真实 UDP STUN 端口供给器；null 表示组合根未接入（welcome 不带 stun 字段） */
+  private readonly stunPorts: (() => { primaryPort: number; altPort: number | null } | null) | null;
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   /** 已授权在线路由表：networkId → nodeId → 连接 */
   private readonly conns = new Map<string, Map<string, ConnState>>();
@@ -206,6 +211,7 @@ export class PeerWsHub {
     this.masterKey = options.masterKey;
     this.timestampWindowMs = options.timestampWindowMs ?? TIMESTAMP_WINDOW_MS;
     this.now = options.now ?? Date.now;
+    this.stunPorts = options.stunPorts ?? null;
     this.limiter = new PeerRateLimiter({ now: this.now });
     void this.store
       .getSettings()
@@ -394,7 +400,15 @@ export class PeerWsHub {
     const peers = [...(this.conns.get(conn.networkId)?.values() ?? [])]
       .filter((c) => c !== conn)
       .map(peerView);
-    sendJson(conn.ws, { type: 'welcome', status: 'authorized', maxPeers: conn.maxPeers, peers });
+    // stun 为增量字段：真实 UDP 端口供节点打洞，旧节点忽略；端口未就绪时整字段缺席
+    const stunPorts = this.stunPorts?.() ?? null;
+    sendJson(conn.ws, {
+      type: 'welcome',
+      status: 'authorized',
+      maxPeers: conn.maxPeers,
+      peers,
+      ...(stunPorts !== null ? { stun: stunPorts } : {}),
+    });
   }
 
   // ------------------------------------------------------------ 入网判定

@@ -72,7 +72,15 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
   try {
     const admin = await store.ensureBootstrapAdmin({ email: config.adminUser, password: config.adminPassword });
 
-    const hub = new PeerWsHub({ store, masterKey });
+    // hub 先于 UDP 构造（PC-01a fix1）：udp-stun 先绑主口并装好 message 回调、
+    // 再 await 辅助口绑定，主口绑成后即可投递 UDP 事件——若把 hub 放到
+    // await udp.bind() 之后，「主口已绑、辅助口未完成」的启动窗口里回调会
+    // 访问未初始化的 hub。先建 hub 让全部 UDP 回调自安装起就转发已初始化对象：
+    // 窗口内无连接，admitStunProbe 明确返回 null（不退回无准入 standalone 模式）、
+    // 查询为空、通知无业务状态；真实绑定端口在 bind 完成后经供给器供给
+    // welcome（PC-01a），不把配置值或 HTTP 端口当 UDP 端口。
+    let udpPorts: { primaryPort: number; altPort: number | null } | null = null;
+    const hub = new PeerWsHub({ store, masterKey, stunPorts: () => udpPorts });
     const udp = new UdpStunService({
       primaryPort: config.port,
       // 配置层 `udpAltPort=0 表示关闭辅助口` → 映射成 udp-stun 的 null
@@ -81,7 +89,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       lanEndpointsLookup: (networkId, nodeId) => hub.getLanEndpoints(networkId, nodeId),
       onNatDetected: (record) => hub.applyNatObservation(record),
     });
-    const udpPorts = await udp.bind();
+    udpPorts = await udp.bind();
 
     const staticRoot = options.staticRoot ?? fileURLToPath(new URL('./public', import.meta.url));
     const server = createGatewayApiServer({
