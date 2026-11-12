@@ -25,8 +25,9 @@
  *    the gateway WS relay NOW — while a silent reprobe keeps retrying
  *    every 60s and hot-upgrades to direct on the first later success.
  *    Established paths are kept alive with 5s encrypted PING/PONG;
- *    `keepAliveLostFrames` (3) consecutive silent cycles declare the
- *    path lost (`onDirectLost`) and re-enter the reprobe cycle.
+ *    the path is declared lost (`onDirectLost`) exactly `keepAliveMs` *
+ *    `keepAliveLostFrames` (15s) after the last authenticated receive —
+ *    decoupled from the PING tick — and re-enters the reprobe cycle.
  *
  * Wire shapes here are JSON control packets (`zr:1`, Ed25519-signed over
  * a domain-separated canonical line) plus PG-1 sealed frames once
