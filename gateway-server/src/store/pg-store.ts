@@ -215,7 +215,7 @@ export class PgStore implements GatewayStore {
   }
 
   /** 运行时入口：动态加载 pg 驱动建池（本包未配置 ZR_GATEWAY_DATABASE_URL 时不会走到这里） */
-  static async connect(databaseUrl: string): Promise<PgStore> {
+  static async connect(databaseUrl: string, seed?: SystemSettings): Promise<PgStore> {
     const mod = (await import('pg')) as unknown as { Pool?: new (options: object) => PgPoolLike; default?: { Pool?: new (options: object) => PgPoolLike } };
     const PoolCtor = mod.Pool ?? mod.default?.Pool;
     if (PoolCtor === undefined) {
@@ -251,7 +251,17 @@ export class PgStore implements GatewayStore {
       },
       { withTransaction, onClose: () => pool.end() },
     );
-    await store.initSchema();
+    try {
+      await store.initSchema();
+      if (seed !== undefined) {
+        await store.seedSettings(seed);
+      }
+    } catch (error) {
+      // 初始化失败时归还本函数创建的 pool：store 尚未交付给调用方，没人能替它 close。
+      // 归还失败（连接已坏等）吞掉、原样抛出原始错误，不得用关闭错误覆盖初始化错误。
+      await pool.end().catch(() => {});
+      throw error;
+    }
     return store;
   }
 
@@ -260,6 +270,16 @@ export class PgStore implements GatewayStore {
     for (const ddl of PG_SCHEMA_STATEMENTS) {
       await this.query(ddl, []);
     }
+  }
+
+  /** 缺键逐键播种（ON CONFLICT DO NOTHING），已有键不被 seed 覆盖；多语句在同一事务连接上执行 */
+  private async seedSettings(seed: SystemSettings): Promise<void> {
+    await this.inTransaction(async (tx) => {
+      const insert = 'INSERT INTO system_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING';
+      for (const key of Object.keys(SETTINGS_KEYS) as Array<keyof SystemSettings>) {
+        await tx(insert, [SETTINGS_KEYS[key], encodeSettingsValue(seed[key])]);
+      }
+    });
   }
 
   // ---------------------------------------------------------------- settings

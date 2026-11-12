@@ -30,8 +30,10 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 import { PgStore } from '../dist/store/pg-store.js';
-import { StoreError } from '../dist/store/types.js';
+import { StoreError, SETTINGS_KEYS } from '../dist/store/types.js';
 import { encryptSecret, hashPassword } from '../dist/master-key.js';
+import { resolveGatewayConfig } from '../dist/config.js';
+import { startGateway } from '../dist/main.js';
 
 const urlFileEnv = process.env.ZR_TEST_PG_URL_FILE;
 const hasPg = typeof urlFileEnv === 'string' && urlFileEnv.trim().length > 0;
@@ -415,5 +417,209 @@ function runTestChild(mode, schema, deadlineMs) {
     assert.equal((await store.listNetworksByOwner(tenantId)).length, 0);
     assert.equal((await store.listNetworksByOwner(tenant2Id)).length, 0);
     assert.deepEqual(await store.listMembers(quotaNet.id), []);
+  });
+});
+
+// ---------------------------------------------------------------- PC-07 生产接线（真实 PG）
+
+// 与上一组不同：这里不走 PgStore.connect 直调，而是把 ZR_GATEWAY_DATABASE_URL 等
+// env 喂给 resolveGatewayConfig 再进 startGateway 的生产组装，证明部署配置真的经
+// openStore 播种进了真实 PG——而不是只有测试直接给 store 传 seed 才生效。
+(hasPg ? describe : describe.skip)('PC-07 生产接线：resolveGatewayConfig → startGateway 进真实 PG', () => {
+  /** 本轮网关数据目录（master.key）：mkdtemp 独占创建，返回值即拥有权事实；清理只认本轮变量 */
+  const DATA_DIR_PREFIX = '.pc07-gw-';
+  let dataDir = null; // 本轮 mkdtemp 返回的独占目录路径；不删除任何固定旧目录
+  let masterKeySnapshot = null; // 首次启动后的 master.key 内容，供重开用例钉住主密钥稳定
+
+  /** 删除守卫：只允许删本轮 mkdtemp 创建、前缀匹配且解析后位于本测试根内的目录 */
+  function removeOwnedDataDir(dir) {
+    if (typeof dir !== 'string' || !path.basename(dir).startsWith(DATA_DIR_PREFIX)) {
+      throw new Error(`refusing to remove data dir not owned by this round: ${String(dir)}`);
+    }
+    const resolved = path.resolve(dir);
+    const testRoot = path.resolve(import.meta.dirname);
+    if (!resolved.startsWith(testRoot + path.sep)) {
+      throw new Error(`refusing to remove data dir outside test root: ${resolved}`);
+    }
+    fs.rmSync(resolved, { recursive: true, force: true });
+  }
+
+  let rawUrl;
+  let ownedSchema = null; // 本轮独占 schema，CREATE 成功即拥有权事实
+
+  const ENV_A = {
+    ZR_GATEWAY_ALLOW_SIGNUP: 'true',
+    ZR_GATEWAY_MAX_PEERS: '16',
+    ZR_GATEWAY_MAX_NETWORKS_PER_USER: '7',
+    ZR_GATEWAY_RELAY_RATE_KBPS: '128',
+  };
+  const ENV_B = {
+    ZR_GATEWAY_ALLOW_SIGNUP: 'false',
+    ZR_GATEWAY_MAX_PEERS: '64',
+    ZR_GATEWAY_MAX_NETWORKS_PER_USER: '50',
+    ZR_GATEWAY_RELAY_RATE_KBPS: '1048576',
+  };
+  const ENV_C = {
+    ZR_GATEWAY_ALLOW_SIGNUP: 'false',
+    ZR_GATEWAY_MAX_PEERS: '32',
+    ZR_GATEWAY_MAX_NETWORKS_PER_USER: '2',
+    ZR_GATEWAY_RELAY_RATE_KBPS: '512',
+  };
+
+  function gatewayEnv(fourKeys) {
+    return {
+      ZR_GATEWAY_UDP_ALT_PORT: '0',
+      ZR_GATEWAY_DATA_DIR: dataDir,
+      ZR_GATEWAY_ADMIN_USER: 'pc07-admin@local',
+      ZR_GATEWAY_ADMIN_PASSWORD: 'pc07-admin-pass',
+      ZR_GATEWAY_DATABASE_URL: databaseUrlFor(ownedSchema, 'zr_pc07_gateway'),
+      ...fourKeys,
+    };
+  }
+
+  /** 生产解析 + 测试管线例外：四键与 DATABASE_URL 全部走真实 env 解析，仅 HTTP 端口覆写 0（内核分配） */
+  function resolveForTest(env) {
+    return { ...resolveGatewayConfig(env), port: 0 };
+  }
+
+  async function api(base, method, apiPath, { body, cookie } = {}) {
+    const headers = {};
+    if (cookie !== undefined) headers.cookie = cookie;
+    let payload;
+    if (body !== undefined) {
+      payload = JSON.stringify(body);
+      headers['content-type'] = 'application/json';
+      headers.origin = base; // 写请求过同源门（浏览器形态）
+    }
+    const res = await fetch(base + apiPath, { method, headers, body: payload });
+    const text = await res.text();
+    return { status: res.status, json: text.length > 0 ? JSON.parse(text) : null };
+  }
+
+  async function loginAdmin(gw) {
+    const res = await fetch(gw.base + '/api/v1/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'pc07-admin@local', password: 'pc07-admin-pass' }),
+    });
+    assert.equal(res.status, 200, `admin login failed: ${JSON.stringify(await res.json())}`);
+    const raw = res.headers.getSetCookie().find((c) => c.startsWith('zr_gw_session='));
+    assert.ok(raw, 'expected session cookie');
+    return raw.split(';')[0];
+  }
+
+  before(async () => {
+    rawUrl = readRawDatabaseUrl();
+    ownedSchema = await createOwnedSchema(rawUrl);
+    dataDir = fs.mkdtempSync(path.join(import.meta.dirname, DATA_DIR_PREFIX)); // 独占目录，开始不删任何既有目录
+  });
+
+  after(async () => {
+    const problems = [];
+    if (ownedSchema !== null) {
+      try {
+        await bounded('drop PC-07 主 schema', TEARDOWN_STEP_MS, dropOwnedSchema(rawUrl, ownedSchema));
+      } catch (error) {
+        problems.push(`drop schema: ${error.message}`);
+      }
+    }
+    if (dataDir !== null) {
+      try {
+        removeOwnedDataDir(dataDir); // 只删本轮 mkdtemp 创建且通过守卫核对的目录
+      } catch (error) {
+        problems.push(`rm dataDir: ${error.message}`);
+      }
+    }
+    if (problems.length > 0) {
+      throw new Error(`PC-07 收尾失败: ${problems.join('; ')}`);
+    }
+  });
+
+  test('空库：环境配置 true/16/7/128 经生产组装播种进真实 PG，REST 实际读值一致', { timeout: 30_000 }, async () => {
+    const gw = await startGateway(resolveForTest(gatewayEnv(ENV_A)));
+    try {
+      assert.equal(gw.admin.created, true);
+      assert.equal(gw.store.constructor.name, 'PgStore', 'databaseUrl 配置下生产组装必须真的用 PG');
+      masterKeySnapshot = fs.readFileSync(path.join(dataDir, 'master.key'));
+      const cookie = await loginAdmin(gw);
+      const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie });
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+      assert.deepEqual(res.json.data, {
+        allowSignup: true,
+        maxNetworksPerUser: 7,
+        defaultMaxPeers: 16,
+        relayRateKbps: 128,
+      });
+
+      // 控制台路径改一个键 + 建一个网络，供后续重开/缺键用例验证持久化优先
+      const patched = await api(gw.base, 'PATCH', '/api/v1/admin/settings', {
+        body: { defaultMaxPeers: 24 },
+        cookie,
+      });
+      assert.equal(patched.status, 200, JSON.stringify(patched.json));
+      const created = await api(gw.base, 'POST', '/api/v1/networks', {
+        body: { name: 'pc07-pg-net', admissionMode: 'manual' },
+        cookie,
+      });
+      assert.equal(created.status, 200, JSON.stringify(created.json));
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('已有键保持：不同环境值重开同一 schema，控制台修改与首次播种值都不被覆盖', { timeout: 30_000 }, async () => {
+    const gw = await startGateway(resolveForTest(gatewayEnv(ENV_B)));
+    try {
+      // 同一数据目录重开必须复用同一主密钥（不改写、不重建）
+      assert.deepEqual(fs.readFileSync(path.join(dataDir, 'master.key')), masterKeySnapshot, '主密钥重开必须稳定');
+      const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie: await loginAdmin(gw) });
+      assert.deepEqual(res.json.data, {
+        allowSignup: true, // ENV_A 播种值保留（ENV_B 是 false）
+        maxNetworksPerUser: 7, // ENV_A 播种值保留（ENV_B 是 50）
+        defaultMaxPeers: 24, // 控制台改过的值保留
+        relayRateKbps: 128, // ENV_A 播种值保留（ENV_B 是 1048576）
+      });
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('缺键逐键补齐：删除 relay_rate_kbps 后重开，只按本轮环境补该键，admin 与网络保持', { timeout: 30_000 }, async () => {
+    // 模拟旧版本库缺键：root 连接删掉单个设置行（只动本轮独占 schema）
+    await withRootClient(rawUrl, (c) =>
+      c.query(`DELETE FROM "${ownedSchema}".system_settings WHERE key = $1`, [SETTINGS_KEYS.relayRateKbps]),
+    );
+
+    const gw = await startGateway(resolveForTest(gatewayEnv(ENV_C)));
+    try {
+      const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie: await loginAdmin(gw) });
+      assert.deepEqual(res.json.data, {
+        allowSignup: true, // 保留（ENV_C 是 false）
+        maxNetworksPerUser: 7, // 保留（ENV_C 是 2）
+        defaultMaxPeers: 24, // 控制台值保留（ENV_C 是 32）
+        relayRateKbps: 512, // 唯一缺失的键按本轮 ENV_C 补齐
+      });
+      // 初始化逻辑不得重置业务数据：admin 可登录、控制台建的网络仍在
+      const nets = await api(gw.base, 'GET', '/api/v1/networks', { cookie: await loginAdmin(gw) });
+      assert.equal(nets.status, 200);
+      assert.ok(
+        Array.isArray(nets.json.data) && nets.json.data.some((n) => n.name === 'pc07-pg-net'),
+        `pc07-pg-net 必须在重开后保留：${JSON.stringify(nets.json.data)}`,
+      );
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('connect 初始化失败：连接池归还、原始错误原样抛出（受控正常存储失败，隔离子进程）', { timeout: 30_000 }, async () => {
+    // search_path 指向不存在的 schema：连接建立、建表必失败的纯配置型存储错误，
+    // 不涉及权限操纵或网络攻击。子进程内完成失败与归还计数（显式 exit，泄漏不挂进程）。
+    const outcome = await runTestChild('init-fail', ownedSchema, 20_000);
+    assert.equal(outcome.spawnError, undefined, `子进程启动失败: ${outcome.spawnError}`);
+    assert.equal(outcome.code, 0, `init-fail 子进程应正常结束（exit=${outcome.code}，stderr=${outcome.stderr.slice(0, 300)}）`);
+    const summary = JSON.parse(outcome.stdout.trim().split('\n').pop());
+    assert.equal(summary.rejected, true, 'connect 必须拒绝');
+    assert.match(summary.errorMessage, /exist/i, `原始错误必须保留: ${summary.errorMessage}`);
+    assert.equal(summary.leaked, 0, `初始化失败后连接池必须归还，泄漏 ${summary.leaked} 条服务端会话`);
   });
 });

@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS network_members (
 export interface SqliteStoreOptions {
   /** 数据库文件路径（或 ':memory:'）；缺省 ':memory:' */
   path?: string;
-  /** 空库首次播种的系统设置（传 resolveGatewayConfig 派生值）；已有库不会覆盖 */
+  /** 空库首次播种/缺键补齐的系统设置（传 resolveGatewayConfig 派生值）；已有键不会被覆盖 */
   seed?: SystemSettings;
 }
 
@@ -177,7 +177,7 @@ export class SqliteStore implements GatewayStore {
     }
   }
 
-  /** 空表才播种（INSERT OR IGNORE），已有库的设置不被 seed 覆盖 */
+  /** 缺键逐键播种（INSERT OR IGNORE），已有键不被 seed 覆盖 */
   private seedSettings(seed: SystemSettings): void {
     const insert = this.db.prepare('INSERT OR IGNORE INTO system_settings (key, value) VALUES (?, ?)');
     for (const key of Object.keys(SETTINGS_KEYS) as Array<keyof SystemSettings>) {

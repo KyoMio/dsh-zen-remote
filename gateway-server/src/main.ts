@@ -17,7 +17,7 @@ import { loadOrCreateMasterKey } from './master-key.js';
 import { createGatewayApiServer } from './server.js';
 import { PgStore } from './store/pg-store.js';
 import { SqliteStore } from './store/sqlite-store.js';
-import type { BootstrapAdminResult, GatewayStore } from './store/types.js';
+import type { BootstrapAdminResult, GatewayStore, SystemSettings } from './store/types.js';
 import { PeerWsHub } from './peer-hub/ws-hub.js';
 import { UdpStunService } from './peer-hub/udp-stun.js';
 
@@ -55,10 +55,18 @@ function listen(server: http.Server, port: number): Promise<void> {
 }
 
 async function openStore(config: GatewayConfig): Promise<GatewayStore> {
+  // 部署配置作为播种初始值进两种存储：空库按本轮配置播种、已有键不被覆盖、
+  // 缺键逐键补齐（两种 store 同一语义），重启绝不推翻控制台改过的持久化设置。
+  const seed: SystemSettings = {
+    allowSignup: config.allowSignup,
+    maxNetworksPerUser: config.maxNetworksPerUser,
+    defaultMaxPeers: config.defaultMaxPeers,
+    relayRateKbps: config.relayRateKbps,
+  };
   if (config.databaseUrl !== undefined) {
-    return PgStore.connect(config.databaseUrl);
+    return PgStore.connect(config.databaseUrl, seed);
   }
-  return new SqliteStore({ path: path.join(config.dataDir, 'gateway.sqlite') });
+  return new SqliteStore({ path: path.join(config.dataDir, 'gateway.sqlite'), seed });
 }
 
 /**
