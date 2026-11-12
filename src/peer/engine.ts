@@ -198,14 +198,17 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let deniedReason: string | null = null
   let maxPeers: number | null = null
   let natType: PeerNatType | null = null
-  /** 网关连接代次：每次连接结束（WS close / resetActiveSession）即 +1。
-   * STUN 的「探测一次」以当前已获准的连接代次为单位，不是整个 joinNetwork
-   * 生命周期——网关侧重连即全新 ConnState（reflexive 置 null、STUN 准入绑定
-   * 本次连接 token），不重探新连接就没有 reflexiveEndpoint；网关重启换 UDP
-   * 端口或旧网关升级出 stun 字段也靠重连后的重探恢复。 */
+  /** 网关连接/授权代次：每次连接结束（WS close / resetActiveSession）或授权
+   * 事实被撤销（PC-03 在线被暂停）即 +1。STUN 的「探测一次」以当前已获准的
+   * 代次为单位，不是整个 joinNetwork 生命周期——网关侧重连即全新 ConnState
+   * （reflexive 置 null、STUN 准入绑定本次连接 token），不重探新连接就没有
+   * reflexiveEndpoint；暂停期间网关拒绝探测准入，恢复沿用同一 WS 但授权/反射
+   * 端点事实已重建，必须重探；网关重启换 UDP 端口或旧网关升级出 stun 字段
+   * 也靠重连后的重探恢复。 */
   let connEpoch = 0
   /** 当前连接代次已做过的唯一一次探测（或降级）；-1 = 从未。同连接重复
-   * authorized welcome 不重发。 */
+   * authorized welcome 不重发；暂停换代（PC-03）后旧值失效，恢复 welcome
+   * 触发重探。 */
   let stunProbedAtEpoch = -1
   let ws: WsClient | null = null
   let wsAttempt = 0
@@ -443,7 +446,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       // 重连后的新连接按新代次重新探测登记反射端点。
       connEpoch += 1
       if (stopped) return
-      if (gatewayState !== 'paused' && gatewayState !== 'revoked' && gatewayState !== 'unconfigured') {
+      // PC-03：paused 不再豁免重连——暂停期间保持的是受限控制连接，断线后
+      // 沿既有有界退避恢复控制通道（auth 时按网关最新授权决定挂起或放行）。
+      // 旧网关 deny 出的 paused 由 wsReconnectable=false 兜底，不在此重连。
+      if (gatewayState !== 'revoked' && gatewayState !== 'unconfigured') {
         gatewayState = 'offline'
         scheduleReconnect()
       }
@@ -477,6 +483,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         publicKeyHex: identity.publicKeyHex,
         name: options.serverName(),
         lanEndpoints: punch?.lanEndpoints() ?? [],
+        // PC-03 能力位：被暂停时请求保留受限控制连接（等待管理员 resume 原地
+        // 恢复）。旧网关忽略未知字段，仍按 deny + 关闭处理。
+        pauseHold: true,
         timestamp,
         signatureHex: signGatewayChallenge({
           privateKeyHex: identity.privateKeyHex,
@@ -494,7 +503,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     if (type === 'welcome') {
       const status = message['status']
-      if (status !== 'authorized' && status !== 'pending' && status !== 'mismatch') return
+      if (status !== 'authorized' && status !== 'pending' && status !== 'mismatch' && status !== 'paused') return
       wsAttempt = 0
       clearAuthDeadline()
       deniedReason = null
@@ -540,6 +549,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           gatewayState = 'pending-approval'
         } else if (status === 'mismatch') {
           gatewayState = 'mismatch'
+        } else {
+          // PC-03：暂停挂起（断线重连/重启后 auth，成员仍是 paused）——
+          // 清空业务，保留这条受限控制连接与重连能力，等管理员 resume 后
+          // 同一条连接上的 welcome authorized 原地恢复。
+          gatewayState = 'paused'
         }
       }
       return
@@ -556,6 +570,20 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       for (const existingId of [...members.keys()]) memberGone(existingId)
       log(`peer engine: gateway denied (${reason || 'no reason'})`)
       try { ws?.close() } catch { /* dying */ }
+      return
+    }
+    if (type === 'paused') {
+      // PC-03：在线被暂停（新网关 + pauseHold 能力位）。与 denied 不同：
+      // 这条受限控制连接保留，仅承载状态/恢复通知。业务即刻清空（对端直连、
+      // 中转会话与挂载全部拆除）；授权事实被撤销即换代——暂停前在途探测的
+      // 迟到结果作废，恢复 welcome 触发必要重探（同连接重复 welcome 的
+      // 不重探闸不被误挡）。
+      if (gatewayState !== 'authorized') return
+      connEpoch += 1
+      natType = null
+      gatewayState = 'paused'
+      for (const existingId of [...members.keys()]) memberGone(existingId)
+      log('peer engine: paused by gateway — control connection held for resume')
       return
     }
     if (gatewayState !== 'authorized') return // peer-*/path 事件只在入网后有意义

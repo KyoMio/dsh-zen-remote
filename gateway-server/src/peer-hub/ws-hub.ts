@@ -8,7 +8,11 @@
 //                为 authorized（无需重连），拿到 peers 快照。
 //   authorized → 进内存路由表；二进制帧按 28B 明文头查表原样转发
 //                （srcNodeId 严格等于连接自身 nodeId，网关绝不解密载荷）。
-//   关闭        → authorized 广播 peer-left，路由表摘除；挂起池摘除。
+//   paused     → PC-03：已认证成员被暂停。连接降级为受限控制通道留在
+//                pausedConns 池（不路由帧、不受 path-report、STUN 准入拒绝），
+//                仅承载 {type:'paused'} 通知与 resume 后的原地恢复；auth 带
+//                pauseHold 能力位的新版节点才保留，旧版节点维持 deny + 关闭。
+//   关闭        → authorized 广播 peer-left，路由表摘除；挂起/暂停池摘除。
 //
 // 与 PG-4 的打通全部经 GatewayHooks：approve/reject/pause/resume/repin/
 // remove/deleteNetwork/disableUser/settings 变更实时反映到内存路由表与
@@ -74,14 +78,15 @@ export interface PeerWsHubOptions {
 /**
  * 一条已通过挑战应答的连接。state = 'hanging' 时在挂起池（pending/mismatch
  * 共用，具体等哪个动作看挂起原因——approve 与 repin 都通向同一升级路径）；
- * state = 'authorized' 时在路由表；state = 'closed' 为终态（被踢/替换），
+ * state = 'authorized' 时在路由表；state = 'paused' 时在暂停池（PC-03 受限
+ * 控制连接，等待 resume 原地恢复）；state = 'closed' 为终态（被踢/替换），
  * RFC6455 close 握手窗口内任何帧一律拒收（见 killConn）。
  */
 interface ConnState {
   ws: WebSocket;
   /** Opaque STUN generation; replacements with the same identity get a new token. */
   stunAdmission: symbol;
-  state: 'hanging' | 'authorized' | 'closed';
+  state: 'hanging' | 'authorized' | 'paused' | 'closed';
   networkId: string;
   nodeId: string;
   ownerId: string;
@@ -188,6 +193,8 @@ export class PeerWsHub {
   private readonly conns = new Map<string, Map<string, ConnState>>();
   /** 挂起池：pending / mismatch 共用，等待 approve / repin */
   private readonly hanging = new Map<string, ConnState>();
+  /** 暂停池（PC-03）：已认证成员被暂停后保留的受限控制连接，等待 resume 原地恢复 */
+  private readonly pausedConns = new Map<string, ConnState>();
   /** 本 hub 接纳的全部 socket（含尚未发 auth 的 preauth），close 时统一 terminate */
   private readonly acceptedSockets = new Set<WebSocket>();
   /** SSE 订阅者：networkId → 回调集合 */
@@ -205,6 +212,10 @@ export class PeerWsHub {
   private admissionEpoch = 0;
   // Retain the last disable across re-enable: only newer attempts may join again.
   private readonly ownerDisabledEpoch = new Map<string, number>();
+  // PC-03 fix1：每成员授权代次（与 ownerDisabledEpoch 同一代次模式）。本成员的
+  // 状态迁移（pause 等）递增；在途的连接晋升（resume/approve 提升内含 await
+  // 窗口）以捕获值做同步复核，任何后到的状态变化都使旧晋升失效。
+  private readonly memberEpochs = new Map<string, number>();
 
   constructor(options: PeerWsHubOptions) {
     this.store = options.store;
@@ -267,8 +278,10 @@ export class PeerWsHub {
       for (const conn of net.values()) conn.ws.terminate();
     }
     for (const conn of this.hanging.values()) conn.ws.terminate();
+    for (const conn of this.pausedConns.values()) conn.ws.terminate();
     this.conns.clear();
     this.hanging.clear();
+    this.pausedConns.clear();
     this.subscribers.clear();
     this.lastPublishedKbps.clear();
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
@@ -328,7 +341,7 @@ export class PeerWsHub {
     });
   }
 
-  /** 连接断开：路由表/挂起池摘除、离线广播、对方拓扑里的过期路径清掉 */
+  /** 连接断开：路由表/挂起池/暂停池摘除、离线广播、对方拓扑里的过期路径清掉 */
   private teardown(conn: ConnState | null): void {
     if (conn === null) return; // preauth 就断开，无状态可清
     if (conn.state === 'authorized') {
@@ -343,6 +356,13 @@ export class PeerWsHub {
         this.broadcast(conn.networkId, { type: 'peer-left', nodeId: conn.nodeId }, conn.nodeId);
         void this.publishTopology(conn.networkId);
       }
+      return;
+    }
+    if (conn.state === 'paused') {
+      // 暂停连接断开：对端早已被撤下业务（收过 peer-paused），拓扑无可见变化，
+      // 摘出暂停池即可；重连由节点自己的退避驱动（auth 后重新挂回本池）
+      const key = connKey(conn.networkId, conn.nodeId);
+      if (this.pausedConns.get(key) === conn) this.pausedConns.delete(key);
       return;
     }
     const key = connKey(conn.networkId, conn.nodeId);
@@ -455,6 +475,9 @@ export class PeerWsHub {
     }
     if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
     const proof = message['joinKeyProofHex'];
+    // PC-03 能力位：节点声明「被暂停时可保留受限控制连接」。旧版节点不带此
+    // 字段，维持既有 deny + 关闭语义；多余字段对旧网关无影响（additive）。
+    const pauseHold = message['pauseHold'] === true;
     let joinKeyMatched = false;
     if (typeof proof === 'string') {
       try {
@@ -524,8 +547,21 @@ export class PeerWsHub {
         void this.publishTopology(networkId);
         return conn;
       }
+      case 'paused': {
+        // PC-03：新版节点（pauseHold 能力位）保留受限控制连接等待管理员
+        // resume（原地恢复，无需重新入网）；旧版节点维持既有语义——告知
+        // 原因并关闭，由节点重启/手工入网恢复。
+        if (!pauseHold) {
+          deny(ws, `membership ${member.status}`);
+          return null;
+        }
+        conn.state = 'paused';
+        sendJson(ws, { type: 'welcome', status: 'paused', maxPeers: network.maxPeers });
+        this.pausedConns.set(connKey(networkId, nodeId), conn);
+        return conn;
+      }
       default: {
-        // paused / revoked：告知原因并关闭
+        // revoked（以及未带 pauseHold 能力位的旧版 paused）：告知原因并关闭
         deny(ws, `membership ${member.status}`);
         return null;
       }
@@ -551,7 +587,7 @@ export class PeerWsHub {
     return false;
   }
 
-  /** 踢掉同 (networkId, nodeId) 的旧连接（authorized 与挂起各查一遍） */
+  /** 踢掉同 (networkId, nodeId) 的旧连接（authorized / 挂起 / 暂停各查一遍） */
   private replaceExisting(networkId: string, nodeId: string): void {
     const net = this.conns.get(networkId);
     const old = net?.get(nodeId);
@@ -562,6 +598,10 @@ export class PeerWsHub {
     const oldHang = this.hanging.get(hangKey);
     if (oldHang !== undefined) {
       this.killConn(oldHang, 'replaced by a new connection');
+    }
+    const oldPaused = this.pausedConns.get(hangKey);
+    if (oldPaused !== undefined) {
+      this.killConn(oldPaused, 'replaced by a new connection');
     }
   }
 
@@ -708,27 +748,10 @@ export class PeerWsHub {
       case 'approve':
       case 'repin': {
         // 两条动作通向同一升级路径：挂起连接原地升级为 authorized
-        const conn = this.hanging.get(key);
-        if (conn === undefined) break;
-        const epoch = this.admissionEpoch;
-        // Keep the connection visible to disable/delete hooks throughout async promotion.
-        // repin 后库里生效公钥即挂起连接入网时呈验的那把（store 已把
-        // candidate 提升为 publicKeyHex）；从库再同步一次，防判定路径变化
-        try {
-          const members = await this.store.listMembers(event.networkId);
-          const member = members.find((m) => m.nodeId === event.nodeId);
-          if (member?.status !== 'authorized') break;
-          conn.publicKeyHex = member.publicKeyHex;
-        } catch {
-          this.killConn(conn, 'gateway storage unavailable');
-          break;
-        }
-        if (!await this.checkOwnerAdmission(conn.ws, conn.ownerId, epoch) ||
-            !this.admissionCurrent(conn.ws, conn.ownerId, epoch) ||
-            conn.state !== 'hanging' || this.hanging.get(key) !== conn) break;
-        this.hanging.delete(key);
-        this.welcomeAuthorized(conn);
-        this.registerAndAnnounce(conn);
+        await this.promoteHangingConn(event);
+        // PC-03：approve 对 paused 成员同样合法（paused→authorized），
+        // 挂起的受限连接一并原地恢复
+        if (event.action === 'approve') await this.promoteHeldPausedConn(event);
         break;
       }
       case 'reject': {
@@ -739,15 +762,21 @@ export class PeerWsHub {
         break;
       }
       case 'pause': {
+        // fix1：无论连接在路由表还是暂停池，先递增本成员授权代次——落在任何
+        // 在途晋升（resume/approve 提升的 await 窗口）之后的 pause 都使旧晋升
+        // 失效；已在暂停池的重复 pause 幂等（代次递增本身无可见效果）
+        this.memberEpochs.set(key, (this.memberEpochs.get(key) ?? 0) + 1);
         const conn = this.conns.get(event.networkId)?.get(event.nodeId);
-        if (conn === undefined) break;
+        if (conn === undefined) break; // 已离线或已在暂停池：无连接动作
         this.broadcast(event.networkId, { type: 'peer-paused', nodeId: event.nodeId }, event.nodeId);
-        this.killConn(conn, 'paused by administrator');
+        this.demoteToPaused(conn);
         void this.publishTopology(event.networkId);
         break;
       }
       case 'resume': {
-        // 暂停时连接已断，恢复通常发生在离线成员上；有连接也只需刷新拓扑
+        // PC-03：挂起的受限连接原地恢复（以数据库最新授权为准）；离线成员
+        // 沿自己的有界退避重连回来，auth 时按最新状态放行
+        await this.promoteHeldPausedConn(event);
         void this.publishTopology(event.networkId);
         break;
       }
@@ -760,6 +789,10 @@ export class PeerWsHub {
         const hang = this.hanging.get(key);
         if (hang !== undefined) {
           this.killConn(hang, 'removed from network');
+        }
+        const paused = this.pausedConns.get(key);
+        if (paused !== undefined) {
+          this.killConn(paused, 'removed from network');
         }
         void this.publishTopology(event.networkId);
         break;
@@ -775,10 +808,102 @@ export class PeerWsHub {
         }
         const hang = this.hanging.get(key);
         if (hang !== undefined) hang.name = nextName;
+        const paused = this.pausedConns.get(key);
+        if (paused !== undefined) paused.name = nextName;
         void this.publishTopology(event.networkId);
         break;
       }
     }
+  }
+
+  /** approve / repin 共用的挂起连接升级路径（原 onMemberChanged 的 case 体 + fix1 代次复核） */
+  private async promoteHangingConn(event: MemberChangedEvent): Promise<void> {
+    const key = connKey(event.networkId, event.nodeId);
+    const conn = this.hanging.get(key);
+    if (conn === undefined) return;
+    const epoch = this.admissionEpoch;
+    const memberEpoch = this.memberEpochs.get(key) ?? 0;
+    // Keep the connection visible to disable/delete hooks throughout async promotion.
+    // repin 后库里生效公钥即挂起连接入网时呈验的那把（store 已把
+    // candidate 提升为 publicKeyHex）；从库再同步一次，防判定路径变化
+    try {
+      const members = await this.store.listMembers(event.networkId);
+      const member = members.find((m) => m.nodeId === event.nodeId);
+      if (member?.status !== 'authorized') return;
+      conn.publicKeyHex = member.publicKeyHex;
+    } catch {
+      this.killConn(conn, 'gateway storage unavailable');
+      return;
+    }
+    // fix1：代次复核是最后一个 await 之后的同步闸——这里到发送之间没有
+    // await，落在 await 窗口内的 pause 已递增代次，旧晋升在此失效
+    if (!await this.checkOwnerAdmission(conn.ws, conn.ownerId, epoch) ||
+        !this.admissionCurrent(conn.ws, conn.ownerId, epoch) ||
+        conn.state !== 'hanging' || this.hanging.get(key) !== conn ||
+        (this.memberEpochs.get(key) ?? 0) !== memberEpoch) return;
+    this.hanging.delete(key);
+    this.welcomeAuthorized(conn);
+    this.registerAndAnnounce(conn);
+  }
+
+  /**
+   * PC-03：受限控制连接的恢复提升（resume 与 paused→approve 共用）。以数据库
+   * 最新授权为准——authorized：原地升级（welcome peers 快照 + 全网公告，与
+   * approve 晋级同一条路径）；仍 paused：保持挂起（重复/迟到恢复通知幂等，
+   * 新一轮暂停优先）；已删除/撤销/改待审：拒绝并关闭，迟到的恢复消息绝不
+   * 重新挂载。返回是否处理了一条挂起连接。
+   */
+  private async promoteHeldPausedConn(event: { networkId: string; nodeId: string }): Promise<boolean> {
+    const key = connKey(event.networkId, event.nodeId);
+    const conn = this.pausedConns.get(key);
+    if (conn === undefined) return false;
+    const epoch = this.admissionEpoch;
+    const memberEpoch = this.memberEpochs.get(key) ?? 0;
+    let member: MemberRecord | null = null;
+    try {
+      member = (await this.store.listMembers(event.networkId)).find((m) => m.nodeId === event.nodeId) ?? null;
+    } catch {
+      this.killConn(conn, 'gateway storage unavailable');
+      return true;
+    }
+    if (member === null || member.status === 'revoked' || member.status === 'mismatch' || member.status === 'pending') {
+      // 注意 reason 不得含 "paused"：节点端按 reason 分类恢复语义
+      this.killConn(conn, 'membership revoked or removed');
+      return true;
+    }
+    if (member.status === 'paused') return true; // 新一轮暂停已生效：保持受限挂起
+    // fix1：代次复核是最后一个 await 之后的同步闸——这里到发送之间没有
+    // await，落在 await 窗口内的 pause 已递增代次，旧晋升在此失效
+    if (!await this.checkOwnerAdmission(conn.ws, conn.ownerId, epoch) ||
+        !this.admissionCurrent(conn.ws, conn.ownerId, epoch) ||
+        conn.state !== 'paused' || this.pausedConns.get(key) !== conn ||
+        (this.memberEpochs.get(key) ?? 0) !== memberEpoch) return true;
+    this.pausedConns.delete(key);
+    // 与挂起晋级同款：从库再同步一次公钥，防判定路径变化
+    conn.publicKeyHex = member.publicKeyHex;
+    // fix1：恢复即新的授权事实——换发 STUN 准入代次（与节点 connEpoch 的暂停
+    // 换代一致）。恢复前在途观察的迟到回包按旧 token 复查不匹配，不落新观察；
+    // 恢复后的探测以新 token 登记，主辅槽不跨暂停混配
+    conn.stunAdmission = Symbol();
+    this.welcomeAuthorized(conn);
+    this.registerAndAnnounce(conn);
+    return true;
+  }
+
+  /**
+   * PC-03：pause 不断连——在线连接降级为受限控制连接（pausedConns 池）：
+   * 广播 peer-paused 后摘出路由表、清路径遥测，仅承载状态/恢复通知；
+   * 帧转发、path-report、rename、STUN 准入全部受限。
+   */
+  private demoteToPaused(conn: ConnState): void {
+    conn.state = 'paused';
+    this.removeFromRouting(conn);
+    conn.pathReports.clear();
+    // fix1：旧授权代次的 STUN 准入随暂停失效（暂停期间 admitStunProbe 本就
+    // 查不到此连接；这里换发保证 resume 换代后旧 token 一定不匹配）
+    conn.stunAdmission = Symbol();
+    this.pausedConns.set(connKey(conn.networkId, conn.nodeId), conn);
+    sendJson(conn.ws, { type: 'paused' });
   }
 
   private removeFromRouting(conn: ConnState): void {
@@ -802,6 +927,7 @@ export class PeerWsHub {
     this.removeFromRouting(conn);
     const key = connKey(conn.networkId, conn.nodeId);
     if (this.hanging.get(key) === conn) this.hanging.delete(key);
+    if (this.pausedConns.get(key) === conn) this.pausedConns.delete(key);
     conn.pathReports.clear();
     sendJson(conn.ws, { type: 'denied', reason });
     conn.ws.close(1008, reason.slice(0, 120));
@@ -823,6 +949,9 @@ export class PeerWsHub {
     for (const [, conn] of [...this.hanging]) {
       if (conn.networkId === networkId) this.killConn(conn, 'network deleted');
     }
+    for (const [, conn] of [...this.pausedConns]) {
+      if (conn.networkId === networkId) this.killConn(conn, 'network deleted');
+    }
     this.subscribers.delete(networkId);
     this.lastPublishedKbps.delete(networkId);
   }
@@ -841,6 +970,11 @@ export class PeerWsHub {
       }
     }
     for (const [, conn] of [...this.hanging]) {
+      if (conn.ownerId !== userId) continue;
+      this.killConn(conn, 'account disabled');
+      affected.add(conn.networkId);
+    }
+    for (const [, conn] of [...this.pausedConns]) {
       if (conn.ownerId !== userId) continue;
       this.killConn(conn, 'account disabled');
       affected.add(conn.networkId);

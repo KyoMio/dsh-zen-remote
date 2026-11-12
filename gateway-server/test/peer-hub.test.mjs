@@ -171,7 +171,7 @@ function wsSendJson(ws, obj) {
  * 走完挑战应答：读 challenge、（可选）算 join key 证明、签名 auth 上送。
  * 返回收到的 challenge 消息；后续 welcome 由调用方读。
  */
-async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [], timestamp = Date.now(), omitProof = false, badSignature = false, badIdentity = false } = {}) {
+async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [], timestamp = Date.now(), omitProof = false, badSignature = false, badIdentity = false, pauseHold = false } = {}) {
   const challenge = await wsJson(ws);
   assert.equal(challenge.type, 'challenge');
   assert.match(challenge.challengeHex, /^[0-9a-f]{64}$/);
@@ -192,6 +192,7 @@ async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [],
   if (joinKey !== undefined && !omitProof) {
     auth.joinKeyProofHex = joinProof(joinKey, networkId, presentedNodeId, challenge.challengeHex);
   }
+  if (pauseHold) auth.pauseHold = true;
   wsSendJson(ws, auth);
   return challenge;
 }
@@ -1484,7 +1485,7 @@ describe('二进制帧中转与源地址防伪造', () => {
 });
 
 describe('管理联动：pause / DELETE / deleteNetwork / disableUser 瞬间切断', () => {
-  test('pause 断开目标连接并广播 peer-paused，转发即刻停止', async () => {
+  test('pause 撤下目标成员业务并广播 peer-paused，resume 原地恢复', async () => {
     const gw = await startGateway();
     try {
       const { net, a, b, wsA, wsB } = await setupPair(gw);
@@ -1493,8 +1494,7 @@ describe('管理联动：pause / DELETE / deleteNetwork / disableUser 瞬间切�
       assert.equal(res.status, 200, JSON.stringify(res.json));
 
       const pausedAtB = await wsJson(wsB);
-      assert.equal(pausedAtB.type, 'denied');
-      await wsClosed(wsB);
+      assert.equal(pausedAtB.type, 'paused');
       const pausedAtA = await wsJson(wsA);
       assert.equal(pausedAtA.type, 'peer-paused');
       assert.equal(pausedAtA.nodeId, b.nodeId);
@@ -1506,10 +1506,15 @@ describe('管理联动：pause / DELETE / deleteNetwork / disableUser 瞬间切�
       assert.equal(topo.members.find((m) => m.nodeId === b.nodeId).status, 'paused');
       assert.equal(topo.members.find((m) => m.nodeId === b.nodeId).online, false);
 
-      // resume 后恢复授权状态（离线成员，无连接动作）
+      // resume：同一条连接原地恢复授权
       const res2 = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
       assert.equal(res2.status, 200);
-      assert.equal((await getTopology(gw, net.id)).members.find((m) => m.nodeId === b.nodeId).status, 'authorized');
+      const resumedAtB = await wsJson(wsB);
+      assert.equal(resumedAtB.type, 'welcome');
+      assert.equal(resumedAtB.status, 'authorized');
+      const topo2 = await getTopology(gw, net.id);
+      assert.equal(topo2.members.find((m) => m.nodeId === b.nodeId).status, 'authorized');
+      assert.equal(topo2.members.find((m) => m.nodeId === b.nodeId).online, true);
     } finally {
       await gw.close();
     }
@@ -1564,7 +1569,7 @@ describe('管理联动：pause / DELETE / deleteNetwork / disableUser 瞬间切�
     }
   });
 
-  test('FIX-1：pause 后 close 握手期（裸 TCP 客户端不回 close 帧）帧中转立即停止', async () => {
+  test('FIX-1：remove 后 close 握手期（裸 TCP 客户端不回 close 帧）帧中转立即停止', async () => {
     const gw = await startGateway();
     try {
       const { net, b, wsB } = await setupPair(gw);
@@ -1600,12 +1605,13 @@ describe('管理联动：pause / DELETE / deleteNetwork / disableUser 瞬间切�
       raw.sendBinary(probe);
       assert.deepEqual(await wsBinary(wsB), probe);
 
-      // 管理员 pause C：服务端发 denied + close 帧；裸客户端不回应 close
-      const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${c.nodeId}/pause`, { cookie: gw.tenantCookie });
+      // 管理员 DELETE C（PC-03 起 pause 改为保留受限连接，killConn 的 close
+      // 握手宽限路径由 remove 触发）：服务端发 denied + close 帧；裸客户端不回应 close
+      const res = await api(gw.base, 'DELETE', `/api/v1/networks/${net.id}/members/${c.nodeId}`, { cookie: gw.tenantCookie });
       assert.equal(res.status, 200, JSON.stringify(res.json));
       const denied = await raw.nextJson();
       assert.equal(denied.type, 'denied');
-      await wsJson(wsB); // peer-paused c
+      await wsJson(wsB); // peer-left c
 
       // 下一毫秒起 C 继续发帧：0 帧到达 B
       for (let i = 0; i < 5; i++) {
@@ -1734,3 +1740,362 @@ describe('path-report 与 /topology、SSE 联动', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------- PC-03：暂停受限控制连接与 resume 自动恢复
+
+describe('PC-03：pause 保留受限控制连接，resume 原地恢复', () => {
+  test('pauseHold 节点被 pause：收 paused 消息、连接保留、帧转发与 STUN 准入即刻受限', async (t) => {
+    const gw = await startGateway({ stunWindowMs: 50 });
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+
+      const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+
+      // 新版节点：收到 paused 控制消息而非 denied，连接保留
+      const pausedAtB = await wsJson(wsB);
+      assert.equal(pausedAtB.type, 'paused', `expected paused, got ${JSON.stringify(pausedAtB)}`);
+      const leftAtA = await wsJson(wsA);
+      assert.equal(leftAtA.type, 'peer-paused');
+      assert.equal(leftAtA.nodeId, b.nodeId);
+      t.after(() => wsB.close());
+
+      // 业务即刻受限：B 的帧不再转发给 A
+      wsB.send(frame({ src: b.nodeId, dst: a.nodeId }));
+      await wsSilence(wsA, 200);
+
+      // 拓扑：B 离线（不占在线数），状态 paused
+      const topo = await getTopology(gw, net.id);
+      assert.equal(topo.summary.onlineDevices, 1);
+      assert.equal(topo.members.find((m) => m.nodeId === b.nodeId).status, 'paused');
+      assert.equal(topo.members.find((m) => m.nodeId === b.nodeId).online, false);
+
+      // STUN 准入受限：暂停成员的探测不被接纳（无回应）
+      const sock = await udpSocket();
+      t.after(() => sock.close());
+      udpProbe(sock, gw.udp.primaryPort, b, { networkId: net.id });
+      await udpSilence(sock, 400);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('resume：受限连接原地升级 authorized（welcome peers + 双向 punch），转发恢复', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
+      assert.equal((await wsJson(wsB)).type, 'paused');
+      assert.equal((await wsJson(wsA)).type, 'peer-paused');
+
+      const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+
+      // 同一条连接上收到恢复 welcome（携带当前在线 peers 快照）
+      const resumedAtB = await wsJson(wsB, { timeoutMs: 2000 });
+      assert.equal(resumedAtB.type, 'welcome', `expected welcome, got ${JSON.stringify(resumedAtB)}`);
+      assert.equal(resumedAtB.status, 'authorized');
+      assert.deepEqual(resumedAtB.peers.map((p) => p.nodeId), [a.nodeId]);
+      // A 收到 B 重新入网广播 + 双向打洞坐标
+      const joinedAtA = await wsJson(wsA, { timeoutMs: 2000 });
+      assert.equal(joinedAtA.type, 'peer-joined');
+      assert.equal(joinedAtA.nodeId, b.nodeId);
+      const punchAtA = await wsJson(wsA, { timeoutMs: 2000 });
+      assert.equal(punchAtA.type, 'punch-coordinate');
+      const punchAtB = await wsJson(wsB, { timeoutMs: 2000 });
+      assert.equal(punchAtB.type, 'punch-coordinate');
+      assert.equal(punchAtB.peerNodeId, a.nodeId);
+
+      // 转发恢复：B → A 一帧原样到达
+      const probe = frame({ src: b.nodeId, dst: a.nodeId, payloadBytes: 8 });
+      wsB.send(probe);
+      assert.deepEqual(await wsBinary(wsA), probe);
+
+      const topo = await getTopology(gw, net.id);
+      assert.equal(topo.summary.onlineDevices, 2);
+      assert.equal(topo.members.find((m) => m.nodeId === b.nodeId).online, true);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('兼容：旧版节点在线被 pause 连接受限保留，断线重连（无能力位）仍 denied + 关闭', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, b, wsB } = await setupPair(gw);
+      const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+      // 在线暂停对新旧版本一致：连接降级受限。旧版节点忽略未知的 paused
+      // 消息也无碍——业务闸门在网关侧；恢复走 welcome/peer-joined 既有类型。
+      const pausedAtB = await wsJson(wsB);
+      assert.equal(pausedAtB.type, 'paused');
+
+      // 断线重连：auth 不带 pauseHold → 维持既有 denied + 关闭（不做欢迎
+      // 挂起——旧版节点不认识 paused 状态，挂起会卡进鉴权超时循环）
+      wsB.close();
+      const wsB2 = await wsOpen(gw.base);
+      t.after(() => wsB2.close());
+      await authNode(wsB2, b, { networkId: net.id, joinKey: net.joinKey, name: 'bravo' });
+      const denied = await wsJson(wsB2);
+      assert.equal(denied.type, 'denied');
+      assert.match(denied.reason, /paused/);
+      await wsClosed(wsB2);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('auth 时已处于 paused：pauseHold 节点收到 welcome paused 挂起等待，resume 后原地放行', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+
+      // 先 pause 在线成员 A（受限保留），再模拟网络闪断后以能力位重连
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${a.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
+      assert.equal((await wsJson(wsA)).type, 'paused');
+      assert.equal((await wsJson(wsB)).type, 'peer-paused');
+      wsA.close();
+
+      const wsA2 = await wsOpen(gw.base);
+      t.after(() => wsA2.close());
+      await authNode(wsA2, a, { networkId: net.id, joinKey: net.joinKey, name: 'alpha', pauseHold: true });
+      const welcomeA2 = await wsJson(wsA2);
+      assert.equal(welcomeA2.type, 'welcome');
+      assert.equal(welcomeA2.status, 'paused', `expected welcome paused, got ${JSON.stringify(welcomeA2)}`);
+      // 挂起期不进路由表：B 侧不收到 peer-joined，也无打洞坐标
+      await wsSilence(wsA2, 150);
+      const topo = await getTopology(gw, net.id);
+      assert.equal(topo.summary.onlineDevices, 1);
+
+      const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${a.nodeId}/resume`, { cookie: gw.tenantCookie });
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+      const resumedAtA = await wsJson(wsA2, { timeoutMs: 2000 });
+      assert.equal(resumedAtA.type, 'welcome');
+      assert.equal(resumedAtA.status, 'authorized');
+      assert.deepEqual(resumedAtA.peers.map((p) => p.nodeId), [b.nodeId]);
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+describe('PC-03：暂停池与最新持久授权的一致性', () => {
+  test('resume 提升前回读最新授权：成员已被删除则拒绝挂起连接，绝不重新挂载', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, b, wsB } = await setupPair(gw);
+      const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+      assert.equal((await wsJson(wsB)).type, 'paused');
+
+      // 竞态形态：resume REST 判定通过之后、钩子回读之前，成员被删除。
+      // 绕过 remove 钩子直接删库，再驱动与 REST 同一个钩子入口。
+      await gw.store.removeMember(net.id, b.nodeId);
+      await gw.hub.hooks.onMemberChanged({ networkId: net.id, nodeId: b.nodeId, action: 'resume', status: 'authorized' });
+
+      const deniedAtB = await wsJson(wsB);
+      assert.equal(deniedAtB.type, 'denied');
+      assert.doesNotMatch(deniedAtB.reason, /paused/, 'reason 不得含 paused（节点端按 reason 分类恢复语义）');
+      await wsClosed(wsB);
+      const topo = await getTopology(gw, net.id);
+      assert.equal(topo.members.some((m) => m.nodeId === b.nodeId), false, '成员已删除，不在拓扑里');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('paused 成员经 approve 恢复授权：挂起连接同样原地提升', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
+      assert.equal((await wsJson(wsB)).type, 'paused');
+      assert.equal((await wsJson(wsA)).type, 'peer-paused');
+
+      // approve 对 paused 合法（store 决策表：paused→authorized）
+      const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/approve`, { cookie: gw.tenantCookie });
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+      const resumedAtB = await wsJson(wsB, { timeoutMs: 2000 });
+      assert.equal(resumedAtB.type, 'welcome');
+      assert.equal(resumedAtB.status, 'authorized');
+      const joinedAtA = await wsJson(wsA, { timeoutMs: 2000 });
+      assert.equal(joinedAtA.type, 'peer-joined');
+      assert.equal(joinedAtA.nodeId, b.nodeId);
+      const probe = frame({ src: b.nodeId, dst: a.nodeId, payloadBytes: 8 });
+      wsB.send(probe);
+      assert.deepEqual(await wsBinary(wsA), probe, '转发随 approve 恢复');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('重复 resume 幂等：第二次无重复公告，连接保持授权', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
+      assert.equal((await wsJson(wsB)).type, 'paused');
+      assert.equal((await wsJson(wsA)).type, 'peer-paused');
+
+      const res1 = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
+      assert.equal(res1.status, 200, JSON.stringify(res1.json));
+      assert.equal((await wsJson(wsB)).type, 'welcome');
+      const punchAtB = await wsJson(wsB);
+      assert.equal(punchAtB.type, 'punch-coordinate');
+      assert.equal((await wsJson(wsA)).type, 'peer-joined');
+      const punchAtA = await wsJson(wsA);
+      assert.equal(punchAtA.type, 'punch-coordinate');
+
+      // 第二次 resume（store 幂等 authorized→authorized，钩子照发）：池已空，
+      // 只刷拓扑——不得向 A 重复公告、不得向 B 重复 welcome
+      const res2 = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
+      assert.equal(res2.status, 200, JSON.stringify(res2.json));
+      await wsSilence(wsA, 250);
+      await wsSilence(wsB, 250);
+      const probe = frame({ src: b.nodeId, dst: a.nodeId, payloadBytes: 8 });
+      wsB.send(probe);
+      assert.deepEqual(await wsBinary(wsA), probe, '转发保持恢复态');
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+describe('PC-03 fix1：交错生命周期与 STUN 授权代次', () => {
+  test('恢复晋升在途时再次 pause——旧晋升失效不重挂业务；新 resume 仍成功', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+
+      // 正常 pause：在线连接降级受限保留
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
+      assert.equal((await wsJson(wsB)).type, 'paused');
+      assert.equal((await wsJson(wsA)).type, 'peer-paused');
+
+      // 一次性闸：拦住下一次 store.findUserById（晋升的 owner 准入复查 await 窗口）
+      const origFindUser = gw.store.findUserById.bind(gw.store);
+      let gateEntered = false;
+      let release = null;
+      const gated = new Promise((resolve) => { release = resolve; });
+      gw.store.findUserById = async (id) => {
+        if (gateEntered) return origFindUser(id);
+        gateEntered = true;
+        await gated;
+        return origFindUser(id);
+      };
+
+      // 驱动 resume 钩子（与 REST handleMemberTransition 同一序列：先落库
+      // authorized，再进钩子）：listMembers 先读到 authorized，随后在
+      // findUserById 闸内挂起
+      await gw.store.transitionMemberStatus(net.id, b.nodeId, 'resume');
+      const resumeHook = gw.hub.hooks.onMemberChanged({ networkId: net.id, nodeId: b.nodeId, action: 'resume', status: 'authorized' });
+      // 等晋升推进到 owner 准入复查的 await 窗口内（闸入口置位）
+      for (let i = 0; i < 100 && !gateEntered; i++) await sleep(10);
+      assert.ok(gateEntered, '晋升未进入 owner 准入复查窗口');
+
+      // 交错：数据库再次落 paused + pause 钩子（连接在暂停池，pause 不触碰连接）
+      await gw.store.transitionMemberStatus(net.id, b.nodeId, 'pause');
+      await gw.hub.hooks.onMemberChanged({ networkId: net.id, nodeId: b.nodeId, action: 'pause', status: 'paused' });
+
+      // 释放闸：旧晋升带着过期事实继续走守卫
+      release();
+      await resumeHook;
+
+      // 最终状态以数据库为准：paused、不在线、无迟到 authorized/peer-joined、业务未恢复
+      const topo = await getTopology(gw, net.id);
+      assert.equal(topo.members.find((m) => m.nodeId === b.nodeId).status, 'paused');
+      assert.equal(topo.summary.onlineDevices, 1);
+      wsB.send(frame({ src: b.nodeId, dst: a.nodeId }));
+      await wsSilence(wsA, 200);
+
+      // 之后新的 resume 仍能成功
+      const res2 = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
+      assert.equal(res2.status, 200, JSON.stringify(res2.json));
+      const resumedAtB = await wsJson(wsB, { timeoutMs: 2000 });
+      assert.equal(resumedAtB.type, 'welcome');
+      assert.equal(resumedAtB.status, 'authorized');
+      const probe = frame({ src: b.nodeId, dst: a.nodeId, payloadBytes: 8 });
+      wsB.send(probe);
+      assert.deepEqual(await wsBinary(wsA), probe);
+      t.after(() => wsB.close());
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('同 WS 暂停→resume 换发 STUN 准入代次——旧回包回调不落新观察，新探测仍登记', async (t) => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+      const tokenBefore = gw.hub.admitStunProbe(net.id, b.nodeId, b.publicKeyHex);
+      assert.notEqual(tokenBefore, null, '在线授权成员应有 STUN 准入 token');
+
+      // 一次性扣住服务端 stun 回包的 send callback：handlePacket 在「await 回包
+      // 发送完成」之后才复查准入——扣住回调即把复查推迟到 pause/resume 之后
+      const origSend = gw.stun.primary.send.bind(gw.stun.primary);
+      let holdArmed = true;
+      let releaseReply = null;
+      const replyGate = new Promise((resolve) => { releaseReply = resolve; });
+      gw.stun.primary.send = (msg, port, address, cb) => {
+        if (holdArmed) {
+          holdArmed = false;
+          return origSend(msg, port, address, () => { replyGate.then(cb); });
+        }
+        return origSend(msg, port, address, cb);
+      };
+
+      // 暂停前 B 的正常探测：回包先到客户端（反射应答先于复查），旧代次
+      // admission 已捕获，复查尚未发生
+      const sock = await udpSocket();
+      t.after(() => sock.close());
+      udpProbe(sock, gw.udp.primaryPort, b, { networkId: net.id, nonce: 'aa01' });
+      const reply1 = await udpRecv(sock, { timeoutMs: 2000 });
+      assert.equal(reply1.nonce, 'aa01');
+
+      // 正常交错：pause（受限保留）→ resume（同一 WS 原地恢复）
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
+      assert.equal((await wsJson(wsB)).type, 'paused');
+      assert.equal((await wsJson(wsA)).type, 'peer-paused');
+      assert.equal(gw.hub.admitStunProbe(net.id, b.nodeId, b.publicKeyHex), null, '暂停期间准入拒绝');
+      const resumeRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
+      assert.equal(resumeRes.status, 200, JSON.stringify(resumeRes.json));
+      const resumedAtB = await wsJson(wsB, { timeoutMs: 2000 });
+      assert.equal(resumedAtB.type, 'welcome');
+      assert.equal(resumedAtB.status, 'authorized');
+
+      // 恢复后是新的准入代次（与节点 connEpoch 暂停换代一致）
+      const tokenAfter = gw.hub.admitStunProbe(net.id, b.nodeId, b.publicKeyHex);
+      assert.notEqual(tokenAfter, null);
+      assert.notEqual(tokenAfter, tokenBefore, '恢复后必须换发 STUN 准入 token');
+
+      // 释放扣住的旧回包回调：旧代次复查不匹配 → 旧观察不落地
+      releaseReply();
+      await sleep(120);
+      assert.equal(gw.natRecords.filter((r) => r.nodeId === b.nodeId).length, 0, '暂停前的迟到观察不得当作新事实');
+
+      // 新的正常探测仍登记成功
+      udpProbe(sock, gw.udp.primaryPort, b, { networkId: net.id, nonce: 'aa02' });
+      const reply2 = await udpRecv(sock, { timeoutMs: 2000 });
+      assert.equal(reply2.nonce, 'aa02');
+      await waitForNatRecord(gw, b.nodeId, 2000);
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+async function waitForNatRecord(gw, nodeId, timeoutMs) {
+  const start = Date.now();
+  for (;;) {
+    if (gw.natRecords.some((r) => r.nodeId === nodeId)) return;
+    if (Date.now() - start > timeoutMs) throw new Error(`waitForNatRecord timeout: ${nodeId}`);
+    await sleep(25);
+  }
+}
