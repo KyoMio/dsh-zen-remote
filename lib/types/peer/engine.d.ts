@@ -68,7 +68,11 @@ export interface PeerEngineOptions {
     serverName: () => string;
     /** 自带已绑定的打洞 socket（测试防火墙注入）；缺省自建 udp4。 */
     udpSocket?: DgramSocket;
-    /** 网关双 UDP 端口（STUN 自查）；null 关闭探测。 */
+    /** STUN 自查端口三态：缺省（生产）从 authorized welcome 的 `stun` 字段读
+     * 网关真实 UDP 端口（PC-01a 起下发；缺字段/形状坏明确降级 unknown）；
+     * `null` 明确关闭探测（welcome 也不看）；对象为受控调用者的固定端口
+     * 覆盖（welcome 不看）。三态共用同一生命周期：每条网关连接至多一次探测
+     * 或降级，连接断开重连即新代次重探（fix1）。 */
     udpProbe?: {
         primaryPort: number;
         altPort?: number;
