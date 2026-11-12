@@ -60,7 +60,7 @@ export declare function verifySelfCertifyingNodeId(nodeId: string, publicKeyHex:
  * `defaultTls` says which transport the SCHEME alone implies ( callers may
  * still connect the other way, e.g. an explicit local test override):
  * - `zr-nets://` forces TLS (wss/https) regardless of the host;
- * - `zr-net+insecure://` forces plaintext (ws/http), for local tests only;
+ * - `zr-net+insecure://` explicitly selects plaintext for gateways without TLS;
  * - plain `zr-net://` infers from the host: loopback / private v4 / ULA /
  *   link-local / Tailscale CGNAT (100.64.0.0/10) → plaintext, anything
  *   publicly routable → TLS, because a public path needs the reverse

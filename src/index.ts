@@ -1683,6 +1683,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     ctx.effect(() => {
       try {
         const off = ctx.on('loader/volatile-update', (paths) => {
+          peerEngine?.refreshMounts()
           if (!volatileUpdateTouchesServerName(paths)) return
           const name = unwrapVolatile(row.serverName)
           if (typeof name === 'string' && name.trim() !== '') {

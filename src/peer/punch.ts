@@ -16,8 +16,8 @@
  * 3. `PeerPunchManager` — the per-peer 1000ms priority hole punch.
  *    When the relay hands us a peer's candidate endpoints we fire
  *    signed HELLO bursts (one per 100ms, at most 10 rounds) at every
- *    candidate with a fresh X25519 key; any valid HELLO is answered
- *    immediately, and the first bidirectional exchange derives
+ *    candidate with a fresh X25519 key; an admitted peer's valid HELLO is
+ *    answered immediately, and its signed ACK to our fresh nonce derives
  *    `PeerSessionCiphers` (PG-1 dual-simplex AEAD). The endpoint that
  *    worked is classified `lan` (RFC1918/CGNAT subnet or loopback match
  *    against our own interfaces) or `p2p`, with a measured RTT. If the
@@ -459,6 +459,8 @@ interface PunchSession {
   myEph: PeerEphemeralKeyPair
   /** Nonce our HELLOs carry and their ACK must echo back. */
   nonce: string
+  /** Only an outstanding, unconsumed challenge can authorize a peer key. */
+  awaitingAck: boolean
   peerEphPubHex: string | null
   /** Guard so one derived key pair fires onDirectReady exactly once. */
   derivedPair: string | null
@@ -646,6 +648,14 @@ export class PeerPunchManager {
     return this.sessions.get(peerNodeId.toLowerCase())?.rttMs ?? null
   }
 
+  /** Revoke gateway/local admission and discard all UDP state for this peer. */
+  dropPeer(peerNodeId: string): void {
+    const nodeId = peerNodeId.toLowerCase()
+    const session = this.sessions.get(nodeId)
+    if (session) this.clearSessionTimers(session)
+    this.sessions.delete(nodeId)
+  }
+
   /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
   close(): void {
     if (this.closed) return
@@ -668,6 +678,7 @@ export class PeerPunchManager {
       state: 'punching',
       myEph: generateEphemeralX25519(),
       nonce: randomBytes(8).toString('hex'),
+      awaitingAck: true,
       peerEphPubHex: null,
       derivedPair: null,
       candidates,
@@ -710,6 +721,7 @@ export class PeerPunchManager {
     // derived from the previous ephemeral key.
     session.myEph = generateEphemeralX25519()
     session.nonce = randomBytes(8).toString('hex')
+    session.awaitingAck = true
     session.peerEphPubHex = null
     session.derivedPair = null
     session.ciphers = null
@@ -786,7 +798,7 @@ export class PeerPunchManager {
     this.armTimer(session, tick, this.keepAliveMsOrDefault())
   }
 
-  private sendHellos(session: PunchSession): void {
+  private sendHellos(session: PunchSession, endpoints = session.candidates): void {
     const timestamp = this.clock.now()
     session.lastHelloSentAt = timestamp
     const message = Buffer.from(
@@ -804,7 +816,7 @@ export class PeerPunchManager {
       timestamp,
       sigHex: ed25519Sign(message, this.identity),
     }))
-    for (const endpoint of session.candidates) {
+    for (const endpoint of endpoints) {
       const parsed = parseEndpoint(endpoint)
       if (!parsed) continue
       try {
@@ -867,15 +879,20 @@ export class PeerPunchManager {
       'utf8',
     )
     if (!ed25519Verify(message, packet.publicKeyHex, packet.sigHex)) return
-    const session = this.ensureSession(nodeId, packet.publicKeyHex, [`${rinfo.address}:${rinfo.port}`])
-    if (!session) return
-    // Answer FIRST — the peer's RTT clock is already running.
+    // Admission comes exclusively from beginPunch (gateway announcement + TOFU).
+    const session = this.sessions.get(nodeId)
+    if (!session || session.peerPublicKeyHex !== packet.publicKeyHex) return
     this.sendHelloAck(session, packet.nonce, rinfo)
-    // An inbound HELLO only proves peer → us UDP reachability, NOT us → peer!
-    // Derive ciphers so we can open the peer's follow-up encrypted confirmation
-    // frame, but do NOT flip into `direct` until bidirectional reachability is
-    // proven (prevents asymmetric NAT/firewall from blackholing outbound replies).
-    this.integratePeerEphemeral(session, packet.ephPubHex, rinfo, session.state === 'direct')
+    // A signed HELLO can be recorded forever. Never adopt its key or endpoint:
+    // ask the live identity to sign our fresh nonce instead. Keep the local DH
+    // key stable so simultaneous handshakes and legacy responders converge.
+    if (session.peerEphPubHex !== packet.ephPubHex || !session.ciphers) {
+      if (!session.awaitingAck) {
+        session.nonce = randomBytes(8).toString('hex')
+        session.awaitingAck = true
+      }
+      this.sendHellos(session, [`${rinfo.address}:${rinfo.port}`])
+    }
   }
 
   private onHelloAck(packet: Record<string, unknown>, rinfo: { address: string; port: number }): void {
@@ -889,7 +906,7 @@ export class PeerPunchManager {
     // Key pinning: the ack must come from the identity we set out to reach.
     if (!session || session.peerPublicKeyHex !== packet.publicKeyHex) return
     // The echoed nonce binds this ack to OUR current round; stale rounds die here.
-    if (packet.nonce !== session.nonce) return
+    if (!session.awaitingAck || packet.nonce !== session.nonce) return
     const message = Buffer.from(
       `${PUNCH_DOMAIN}|ack|${this.networkId}|${nodeId}|${packet.ephPubHex}|${packet.nonce}|${packet.timestamp}`,
       'utf8',
@@ -898,7 +915,8 @@ export class PeerPunchManager {
     if (typeof session.lastHelloSentAt === 'number') {
       session.rttMs = Math.max(0, this.clock.now() - session.lastHelloSentAt)
     }
-    this.integratePeerEphemeral(session, packet.ephPubHex, rinfo, true)
+    if (!this.integratePeerEphemeral(session, packet.ephPubHex, rinfo)) return
+    session.awaitingAck = false
     // Immediately send an encrypted PING so the responder confirms round-trip
     // (us → peer HELLO, peer → us ACK, us → peer sealed PING) in 0.5 RTT.
     try {
@@ -907,17 +925,6 @@ export class PeerPunchManager {
     } catch {
       // Transient send failure; keepalive will retry.
     }
-  }
-
-  private ensureSession(nodeId: string, publicKeyHex: string, candidates: string[]): PunchSession | null {
-    const existing = this.sessions.get(nodeId)
-    if (existing) {
-      // Key pinning: one nodeId is bound to the key the gateway (or the
-      // first valid handshake) told us about. A different key is an
-      // impostor — the id is the hash of the key, so both cannot be right.
-      return existing.peerPublicKeyHex === publicKeyHex ? existing : null
-    }
-    return this.createSession(nodeId, publicKeyHex, candidates)
   }
 
   /**
@@ -931,25 +938,31 @@ export class PeerPunchManager {
     session: PunchSession,
     peerEphPubHex: string,
     rinfo: { address: string; port: number },
-    confirmDirect: boolean,
-  ): void {
-    session.endpoint = `${rinfo.address}:${rinfo.port}`
+  ): boolean {
     if (session.peerEphPubHex !== peerEphPubHex || session.ciphers === null) {
+      let ciphers: PeerSessionCiphers
+      try {
+        ciphers = derivePeerSessionCiphers({
+          networkId: this.networkId,
+          myNodeId: this.identity.nodeId,
+          peerNodeId: session.peerNodeId,
+          myEphPrivateKeyHex: session.myEph.privateKeyHex,
+          myEphPublicKeyHex: session.myEph.publicKeyHex,
+          peerEphPublicKeyHex: peerEphPubHex,
+        })
+      } catch {
+        // Even a signed public key can be low-order/invalid. Preserve live state.
+        return false
+      }
       session.peerEphPubHex = peerEphPubHex
-      session.ciphers = derivePeerSessionCiphers({
-        networkId: this.networkId,
-        myNodeId: this.identity.nodeId,
-        peerNodeId: session.peerNodeId,
-        myEphPrivateKeyHex: session.myEph.privateKeyHex,
-        myEphPublicKeyHex: session.myEph.publicKeyHex,
-        peerEphPublicKeyHex: peerEphPubHex,
-      })
+      session.ciphers = ciphers
     }
-    if (!confirmDirect || !session.ciphers) return
+    session.endpoint = `${rinfo.address}:${rinfo.port}`
     const pairKey = `${session.myEph.publicKeyHex}|${peerEphPubHex}`
-    if (session.state === 'direct' && session.derivedPair === pairKey) return
+    if (session.state === 'direct' && session.derivedPair === pairKey) return true
     session.derivedPair = pairKey
     this.completeDirect(session, session.ciphers)
+    return true
   }
 
   private completeDirect(session: PunchSession, ciphers: PeerSessionCiphers): void {

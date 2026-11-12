@@ -421,7 +421,7 @@ The open body caps at 1 MiB (413 past it); each device holds at most 8 concurren
 | `client` | ❌ | ✅ | This machine is a sub-client: connects to others, serves nobody |
 | `peer` | ✅ | ✅ | This machine is both a server and a network member: keeps phone QR access and push, joins the virtual network |
 
-Role resolution discipline: `resolveRole` accepts only the exact strings `client` / `peer` — anything else degrades to `host`, so a typo cannot amputate half the plugin. `role: peer` and `maxServers` (`LAN_GATE_MAX_SERVERS`, 1–64, default 8) are tunable in the advanced settings table; in peer mode a network-reported `maxPeersFromGateway` wins outright when the field is unset locally, and can only lower it otherwise.
+Role resolution discipline: `resolveRole` accepts only the exact strings `client` / `peer` — anything else degrades to `host`, so a typo cannot amputate half the plugin. `role: peer` and `maxServers` (`LAN_GATE_MAX_SERVERS`, 1–64, default 8) are tunable in the advanced settings table; in peer mode the network-reported `maxPeersFromGateway` includes this machine, so the remote mount limit is that value minus one. An explicit local `maxServers` further limits it without being overwritten. When a member leaves or is ignored locally, eligible waiting peers fill the available slots. Lowering the local mount limit does not forcibly disconnect existing mounts; an administrator revoking admission still removes that peer immediately.
 
 ### The invite link
 
@@ -429,7 +429,8 @@ Role resolution discipline: `resolveRole` accepts only the exact strings `client
 zr-net://<host>[:port]/<networkId>[#<joinKey>]
 ```
 
-- `zr-nets://…` forces TLS (wss / https); `zr-net+insecure://…` forces plaintext (local tests only); plain `zr-net://` infers from the hostname — loopback / private IPv4 / ULA / `.localhost` go plaintext, everything else TLS.
+- `zr-nets://…` forces TLS (wss / https); `zr-net+insecure://…` explicitly uses HTTP/WS for a self-hosted gateway without a TLS reverse proxy; plain `zr-net://` infers from the hostname — loopback / private IPv4 / ULA / `.localhost` go plaintext, everything else TLS.
+- The gateway does not configure certificates itself, and direct HTTP/WS remains supported. For HTTPS/WSS, the reverse proxy supplies the certificate; nodes verify its trust chain and hostname and never silently fall back to plaintext. HTTP/WS lacks TLS authentication of the gateway control plane; session content still has separate end-to-end encryption and local TOFU.
 - `#<joinKey>` is a **first-join credential only**: the join challenge-response handshake binds the identity with it once, and it never travels as a plaintext URL path afterwards.
 - Links are generated in the gateway's web console; the parser lives in `parseInviteUri` in `src/peer/crypto.ts`.
 - CLI joining: `npx dsh-zen-remote setup --role peer --invite "zr-net://…"`, or `dsh-zen-remote peer join <uri>`; `peer status` shows this machine's nodeId, admission state, and the network's peers with their live connection paths; `peer trust <nodeId>` explicitly re-trusts a changed identity after a mismatch block; `peer leave` leaves the network.
@@ -443,6 +444,15 @@ Each pair of member machines picks its path in this order:
 3. **`relay` — gateway ciphertext relay**: when no direct path is ready within the 1000ms punch window, traffic transparently switches to the gateway's WebSocket — still end-to-end encrypted, unreadable to the gateway.
 
 A silent background re-probe runs every 60 seconds; once a direct path opens, the session upgrades back to it without dropping a byte (the degrade/hot-swap behaviors are pinned by `test/peer-e2e.test.cjs`).
+
+### Transport upgrades and resource limits
+
+- Both direct HTTP/WS and reverse-proxied HTTPS/WSS remain supported. TLS verifies certificates and never silently falls back to plaintext.
+- Updated nodes retain the existing binary frame types and work through existing relay gateways. Ordinary requests and large responses interoperate with older nodes; upgrade both nodes for cancellation acknowledgements, state reclamation and receive flow control on both sides.
+- Cancellation is acknowledged and retried for a bounded period. Older nodes do not acknowledge cancellation, so mixed versions cannot guarantee remote subscription cleanup after packet loss. Retries of a completed legacy stream after the final-ack cache expires (60 seconds by default) may receive a reset instead of a final acknowledgement; the request is never re-executed.
+- Budgets limit queued/in-flight bytes, not total file size. Large responses and uploads use a segmented pipeline. Progressing long transfers and quiet live sessions without outstanding data are not closed based on total duration; outstanding data that makes no progress for the transport deadline (30 seconds by default) fails explicitly and releases resources.
+- Extremely fragmented stream IDs can exhaust the permanent terminal-range budget. Existing active streams remain usable, but new streams are explicitly refused until the node rejoins with a new session; replay protection is never discarded to force recovery. Normal consecutive IDs merge into ranges rather than consuming one permanent range per completed request.
+- The disabled-account admission fix requires updating the separately deployed `gateway-server`; updating only desktop plugins does not replace gateway authentication logic.
 
 ### Security model & zero-knowledge boundary
 
