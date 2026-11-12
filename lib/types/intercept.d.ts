@@ -151,7 +151,7 @@ export type DispatchEnvelope = {
  * Everything else — `session/prompt|cancel|rename|selectModel|updateQueue`
  * (send, cancel, rename, model switch, inbox mutation), `session/create` /
  * `session/fork` (T31: new sessions on the server), `subagents/prompt` /
- * `subagents/interruptByParent` (T31: prompt/interrupt a remote subagent),
+ * `subagents/interruptByParent` / `subagents/interruptByUser` (T31: prompt/interrupt a remote subagent),
  * `fileUploads/upload` (T31: attachments into a remote session), `job/kill`,
  * `messageFeedback/put|delete`, the workspace session-list mutations, and
  * the T41a mutations (`goals/edit|pause|resume|clear`, `commands/execute`,

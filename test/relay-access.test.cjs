@@ -92,6 +92,35 @@ test('decideInvoke: officeToPdf/generation stays unregistered (answers locally, 
   assert.deepEqual(decideInvoke('officeToPdf', 'generation', {}, yes), { allow: false, reason: 'forbidden-method' })
 })
 
+// -- 0.2.2-rc.2: officeKit is the successor of officeToPdf (same ownership) ------
+
+test('decideInvoke: officeKit/render is owned by the workspaceFileScopeId (session id)', () => {
+  // Same lookup as officeToPdf/render and the workspace-files group. The
+  // official document-preview plugin now calls officeKit.render; officeToPdf
+  // stays registered so a 0.2.2-rc.1 host (npm latest) keeps working.
+  assert.deepEqual(
+    decideInvoke('officeKit', 'render', { workspaceFileScopeId: 'S-shared' }, only(['S-shared'])),
+    { allow: true },
+  )
+  assert.deepEqual(
+    decideInvoke('officeKit', 'render', { workspaceFileScopeId: 'S-other' }, only(['S-shared'])),
+    { allow: false, reason: 'not-shared' },
+  )
+  assert.deepEqual(
+    decideInvoke('officeKit', 'render', { request: { path: '/etc/passwd' } }, yes),
+    { allow: false, reason: 'no-session' },
+  )
+  assert.deepEqual(
+    decideInvoke('officeKit', 'render', { workspaceFileScopeId: 'S-shared', path: '/etc/passwd' }, only(['S-shared'])),
+    { allow: true },
+    'extra fields are never read (the registry discipline)',
+  )
+})
+
+test('decideInvoke: officeKit/generation stays unregistered (answers locally, never relayed)', () => {
+  assert.deepEqual(decideInvoke('officeKit', 'generation', {}, yes), { allow: false, reason: 'forbidden-method' })
+})
+
 // -- streaming entries refuse the invoke route ------------------------------------
 
 test('decideInvoke: a stream-only entry is forbidden on the invoke route', () => {
@@ -201,6 +230,7 @@ test('decideStream: non-stream and unregistered methods are forbidden-method', (
     ['session', 'fork', { request: { sessionId: 'S-a' } }],
     ['subagents', 'prompt', { request: { parentSessionId: 'S-a', childSessionId: 'C' } }],
     ['subagents', 'interruptByParent', { parentSessionId: 'S-a', childSessionId: 'C', mode: 'continuable' }],
+    ['subagents', 'interruptByUser', { childSessionId: 'C' }],
     ['fileUploads', 'upload', { agentId: 'S-a', request: { data: 'x' } }],
     ['fileReferences', 'list', { agentId: 'S-a', query: 'q' }],
     ['settings', 'update', {}],
@@ -392,6 +422,32 @@ test('decideInvoke: subagents/interruptByParent reads BOTH top-level ids', () =>
   )
 })
 
+test('decideInvoke: subagents/interruptByUser (0.2.2-rc.2) reads only the top-level childSessionId', () => {
+  // DSH 0.2.2-rc.2 renamed interruptByParent → interruptByUser and dropped
+  // parentSessionId / mode. The child still borrows its ancestor's share
+  // through parentOf; a foreign child refuses. A decoy parentSessionId is
+  // not a registered field and is not read. interruptByParent stays for
+  // 0.2.2-rc.1 (npm latest).
+  const family = (shared, child) => (id) => shared.includes(id) || id === child
+  const args = { childSessionId: 'S-child' }
+  assert.deepEqual(decideInvoke('subagents', 'interruptByUser', args, family(['S-parent'], 'S-child')), { allow: true })
+  assert.deepEqual(decideInvoke('subagents', 'interruptByUser', args, only([])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(
+    decideInvoke('subagents', 'interruptByUser', { childSessionId: 'S-foreign' }, family(['S-parent'], 'S-child')),
+    { allow: false, reason: 'not-shared' },
+    'a foreign child refuses',
+  )
+  assert.deepEqual(
+    decideInvoke('subagents', 'interruptByUser', { childSessionId: 'S-child', parentSessionId: 'VICTIM' }, family(['S-parent'], 'S-child')),
+    { allow: true },
+    'unregistered fields are never read',
+  )
+  assert.deepEqual(
+    decideInvoke('subagents', 'interruptByUser', { parentSessionId: 'S-parent' }, family(['S-parent'], 'S-child')),
+    { allow: false, reason: 'no-session' },
+  )
+})
+
 // -- T31: agentId-located calls — attachments and @ references -------------------------
 
 test('decideInvoke: fileUploads/upload and fileReferences/list are gated on the top-level agentId', () => {
@@ -529,6 +585,7 @@ test('decideInvoke: workspaceFiles reads read share-check the top-level workspac
     ['workspaceFiles', 'read', { workspaceFileScopeId: 'S-a', path: 'src/index.ts', range: { offset: 0 } }],
     ['workspaceFiles', 'readBytes', { workspaceFileScopeId: 'S-a', path: 'logo.png', options: {} }],
     ['workspaceFiles', 'stat', { workspaceFileScopeId: 'S-a', path: '.' }],
+    ['workspaceFiles', 'search', { workspaceFileScopeId: 'S-a', request: { query: 'foo', excludedPaths: [], includeHidden: false, respectGitignore: true } }],
   ]
   for (const [namespace, method, args] of cases) {
     assert.deepEqual(decideInvoke(namespace, method, args, only(shared)), { allow: true }, `${namespace}/${method} with a shared scope`)
@@ -612,6 +669,11 @@ test('decideStream: the T41a scoped streams claim their ids and refuse the invok
     allow: true,
     sessionIds: ['S-a'],
   })
+  // 0.2.2-rc.2: live Agent-terminal roster, same sessionId as retain/list.
+  assert.deepEqual(decideStream('terminal', 'watch', { sessionId: 'S-a' }, only(shared)), {
+    allow: true,
+    sessionIds: ['S-a'],
+  })
   assert.deepEqual(
     decideStream('workspaceFiles', 'changes', { workspaceFileScopeId: 'VICTIM', path: '.' }, only(shared)),
     { allow: false, reason: 'not-shared' },
@@ -621,11 +683,17 @@ test('decideStream: the T41a scoped streams claim their ids and refuse the invok
     reason: 'not-shared',
   })
   assert.deepEqual(decideStream('terminal', 'retain', { sessionId: '' }, yes), { allow: false, reason: 'no-session' })
+  assert.deepEqual(decideStream('terminal', 'watch', { sessionId: 'VICTIM' }, only(shared)), {
+    allow: false,
+    reason: 'not-shared',
+  })
+  assert.deepEqual(decideStream('terminal', 'watch', {}, yes), { allow: false, reason: 'no-session' })
   // ...and the invoke route refuses every one of them, like every stream method.
   for (const [namespace, method, args] of [
     ['workspaceFiles', 'changes', { workspaceFileScopeId: 'S-a', path: '.' }],
     ['terminal', 'follow', { agentId: 'S-a', id: 't', attachmentId: 'a' }],
     ['terminal', 'retain', { sessionId: 'S-a', id: 't' }],
+    ['terminal', 'watch', { sessionId: 'S-a' }],
   ]) {
     assert.deepEqual(
       decideInvoke(namespace, method, args, yes),

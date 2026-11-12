@@ -60,7 +60,7 @@
  *   half — every one takes `agent` as its first parameter, wire `agentId`,
  *   source `lookup: 'agent'`, wireTypeSymbol `SessionId` (the same shape
  *   T31 verified for fileUploads/fileReferences).
- * - `workspaceFiles/list|changes|read|readBytes|stat` carry a TOP-LEVEL
+ * - `workspaceFiles/list|changes|read|readBytes|stat|search` carry a TOP-LEVEL
  *   `workspaceFileScopeId`: the host registers the `workspaceFileScope`
  *   lookup with wireTypeSymbol `SessionId` and resolves it by session —
  *   `sessions.get(sessionId).header.cwd` is only the BASE for relative
@@ -68,8 +68,9 @@
  *   not a containment: absolute paths anywhere the server process can read
  *   are served (see the registry note below). The field itself is
  *   share-checked like any session id.
- * - `terminal/list` and `terminal/retain` take a plain TOP-LEVEL json
- *   `sessionId` (source `'json'`, not a lookup) — same check.
+ * - `terminal/list`, `terminal/retain` and (0.2.2-rc.2) `terminal/watch`
+ *   take a plain TOP-LEVEL json `sessionId` (source `'json'`, not a
+ *   lookup) — same check.
  * - `sessionFeedback/record` carries `request.sessionId` — a plain B-type.
  * - `sessionReferenceResolver/candidates` (@ mentions) answers with EVERY
  *   server session — title, cwd, and a ready-made `dsh-session:` mention
@@ -84,6 +85,12 @@
  *   does not descend from the claimed parent fails its own check, so the
  *   "shared parent + foreign child" decoy refuses here before DSH's own
  *   lineage validation is ever reached.
+ * - `subagents/interruptByUser` (0.2.2-rc.2, the rename of
+ *   `interruptByParent`) takes only the top-level `childSessionId` — the
+ *   user addresses the target Session directly, with no parent or mode.
+ *   The child is still share-checked through the same `parentOf`
+ *   inheritance. `interruptByParent` stays registered so a 0.2.2-rc.1 host
+ *   (npm `latest`) keeps working.
  *
  * PROMPT TEXT REFERENCES ARE CHECKED TOO: a prompt whose text carries a
  * canonical `dsh-session:<base64url(id)>` address makes DSH inject that
@@ -230,6 +237,10 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   // refuses before DSH is ever asked
   'subagents/prompt': { fields: ['request.parentSessionId', 'request.childSessionId'] },
   'subagents/interruptByParent': { fields: ['parentSessionId', 'childSessionId'] },
+  // 0.2.2-rc.2 renamed interruptByParent → interruptByUser and dropped
+  // parentSessionId / mode. The child still borrows its ancestor's share
+  // through parentOf. interruptByParent stays for 0.2.2-rc.1 (npm latest).
+  'subagents/interruptByUser': { fields: ['childSessionId'] },
   // attachments and @ references (T31) — the top-level agentId resolves
   // through the agent registry keyed by session id, so it IS the session id
   'fileUploads/upload': { fields: ['agentId'] },
@@ -265,6 +276,12 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'workspaceFiles/read': { fields: ['workspaceFileScopeId'] },
   'workspaceFiles/readBytes': { fields: ['workspaceFileScopeId'] },
   'workspaceFiles/stat': { fields: ['workspaceFileScopeId'] },
+  // 0.2.2-rc.2: official sidebar-files search bar
+  // (`remote.workspaceFiles.search(sessionId, request)`). Same
+  // workspaceFileScopeId ownership as list/stat; the Host walks the
+  // workspace and returns matches. A remote session without this entry
+  // gets `forbidden-method` on every search.
+  'workspaceFiles/search': { fields: ['workspaceFileScopeId'] },
   // Office document preview (2.2.6, remote Word/Excel/PPT). The document
   // preview's Office renderer does NOT convert on the client: it asks the
   // HOST's LibreOffice to turn doc/docx/xls/xlsx/ppt/pptx into PDF
@@ -288,6 +305,13 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   // INVOKE_BINARY_RESULT_METHODS — without that marker the JSON channel
   // flattens the typed array and the client's strict codec rejects it.
   'officeToPdf/render': { fields: ['workspaceFileScopeId'] },
+  // 0.2.2-rc.2 replaces officeToPdf with officeKit (same
+  // workspaceFileScopeId, same RenderedDocumentBytes result, same
+  // generation sibling left unregistered — RT dsh-office-kit
+  // lib/typert.remote-client.d.ts). The official document-preview plugin
+  // now calls `scope.remote.officeKit.render`. officeToPdf/render stays
+  // for 0.2.2-rc.1 (npm latest). Also in INVOKE_BINARY_RESULT_METHODS.
+  'officeKit/render': { fields: ['workspaceFileScopeId'] },
   // terminal (T41a) — opens SERVER-side by explicit user request (SPEC story
   // 45). What the client gets is a shell running AS THE SERVER USER, WITHOUT
   // the agent sandbox or approval restrictions (RT dsh-api-terminal-controller
@@ -313,6 +337,11 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   // the retain/list half locates by a plain top-level json sessionId
   'terminal/list': { fields: ['sessionId'] },
   'terminal/retain': { fields: ['sessionId'], stream: true },
+  // 0.2.2-rc.2: live roster stream the official sidebar uses to open and
+  // close Agent terminal tabs (`ctx.webTerminals.watch` →
+  // `remote.watch(sessionId)`). Same top-level sessionId as list/retain;
+  // frames are WebTerminalInfo[] (read-only).
+  'terminal/watch': { fields: ['sessionId'], stream: true },
   // session/* — the global control stream and the unscoped list
   'session/control': { fields: [], stream: true, streamFilter: 'control' },
   'session/list': { fields: [], resultFilter: 'session-list' },
