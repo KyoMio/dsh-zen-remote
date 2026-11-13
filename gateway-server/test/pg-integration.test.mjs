@@ -623,3 +623,175 @@ function runTestChild(mode, schema, deadlineMs) {
     assert.equal(summary.leaked, 0, `初始化失败后连接池必须归还，泄漏 ${summary.leaked} 条服务端会话`);
   });
 });
+
+// ---------------------------------------------------------------- PC-10 统一五态席位规则（真实 PG）
+
+// 契约：authorized/paused/mismatch 占席，pending/revoked 不占席；只有不占席 → 占席才新增
+// 一席并查空余，缩容超额存量在占席状态之间放行。与 store.test.mjs（SQLite）覆盖同一状态
+// 矩阵，另有界并发批次（8 并发以内）证明不超配、不死锁（statement_timeout 兜底）。
+(hasPg ? describe : describe.skip)('PC-10 统一席位规则：真实 PG 状态矩阵与有限并发', () => {
+  const masterKey = Buffer.alloc(32, 0xcd);
+  const enc = (s) => encryptSecret(s, masterKey);
+
+  let rawUrl;
+  let ownedSchema = null; // 本轮独占 schema，CREATE 成功即拥有权事实
+  let store;
+  let adminId;
+
+  async function join10(net, nodeId, { matched = true, pub } = {}) {
+    return store.upsertMemberJoinAttempt({
+      networkId: net.id,
+      nodeId,
+      name: `node-${nodeId}`,
+      publicKeyHex: pub ?? nodeId + 'a'.repeat(56), // 合同形状：8hex nodeId + 64hex 公钥
+      joinKeyMatched: matched,
+    });
+  }
+
+  async function memberInState10(net, nodeId, wanted) {
+    if (wanted === 'pending') return join10(net, nodeId, { matched: false });
+    if (wanted === 'authorized') return join10(net, nodeId, { matched: true });
+    if (wanted === 'paused') {
+      await join10(net, nodeId, { matched: true });
+      return store.transitionMemberStatus(net.id, nodeId, 'pause');
+    }
+    if (wanted === 'mismatch') {
+      await join10(net, nodeId, { matched: true });
+      return join10(net, nodeId, { pub: nodeId + 'c'.repeat(56), matched: true }); // 原位换钥
+    }
+    throw new Error(`unknown state ${wanted}`);
+  }
+
+  function limitReached(err) {
+    assert.ok(err instanceof StoreError, `expected StoreError, got ${err?.constructor?.name}: ${err?.message}`);
+    assert.equal(err.code, 'limit-reached');
+    return true;
+  }
+
+  before(async () => {
+    rawUrl = readRawDatabaseUrl();
+    ownedSchema = await createOwnedSchema(rawUrl);
+    store = await PgStore.connect(databaseUrlFor(ownedSchema, 'zr_pc10_seat'));
+    await store.ensureBootstrapAdmin({ email: 'pc10-admin@local', password: 'pc10-admin-pass' });
+    adminId = (await store.findUserByEmail('pc10-admin@local')).id;
+  });
+
+  after(async () => {
+    const problems = [];
+    if (store !== undefined) {
+      try {
+        await bounded('pc10 store.close', TEARDOWN_STEP_MS, store.close());
+      } catch (error) {
+        problems.push(`close: ${error.message}`);
+      }
+    }
+    if (ownedSchema !== null) {
+      try {
+        await bounded('drop PC-10 主 schema', TEARDOWN_STEP_MS, dropOwnedSchema(rawUrl, ownedSchema));
+      } catch (error) {
+        problems.push(`drop schema: ${error.message}`);
+      }
+    }
+    if (problems.length > 0) {
+      throw new Error(`PC-10 收尾失败: ${problems.join('; ')}`);
+    }
+  });
+
+  test('准入与 approve 同口径：满网（authorized+mismatch）拒绝一切新增占席，释放席位后空位可批', { timeout: 30_000 }, async () => {
+    const net = await store.createNetwork({ ownerId: adminId, name: 'pc10-caliber', admissionMode: 'both', joinKeyEnc: enc('pc10-k1'), maxPeers: 2 });
+    await memberInState10(net, '10aaaaaa', 'authorized');
+    await memberInState10(net, '20aaaaaa', 'mismatch'); // authorized 原位换钥，仍占第 2 席
+    // 新成员带口令 → limit-reached
+    await assert.rejects(join10(net, '30aaaaaa', { matched: true }), limitReached);
+    // pending 换公钥滑入 mismatch 也是新增占席 → limit-reached，行保持 pending
+    await memberInState10(net, '40aaaaaa', 'pending');
+    await assert.rejects(join10(net, '40aaaaaa', { pub: '40aaaaaa' + 'b'.repeat(56), matched: true }), limitReached);
+    const p = (await store.listMembers(net.id)).find((m) => m.nodeId === '40aaaaaa');
+    assert.equal(p.status, 'pending');
+    assert.equal(p.candidatePublicKeyHex, null);
+    // 手动 approve 同口径：2 席已满，approve（不占席 → 占席）拒绝
+    await assert.rejects(store.transitionMemberStatus(net.id, '40aaaaaa', 'approve'), limitReached);
+    // mismatch→reject 释放席位（占席 → 不占席），腾出的空位可被合法批准
+    await store.transitionMemberStatus(net.id, '20aaaaaa', 'reject');
+    const approved = await store.transitionMemberStatus(net.id, '40aaaaaa', 'approve');
+    assert.equal(approved.status, 'authorized');
+  });
+
+  test('占席→占席保持原席位：满网 repin/resume/幂等动作放行，非法 repin 仍拒绝', { timeout: 30_000 }, async () => {
+    const net = await store.createNetwork({ ownerId: adminId, name: 'pc10-keep-seat', admissionMode: 'both', joinKeyEnc: enc('pc10-k2'), maxPeers: 2 });
+    await memberInState10(net, '11aaaaaa', 'authorized');
+    await memberInState10(net, '12aaaaaa', 'paused'); // 2/2 占满
+    // authorized→mismatch 原位换钥（席位不变）→ repin 换锚成功
+    const swapped = await join10(net, '11aaaaaa', { pub: '11aaaaaa' + 'd'.repeat(56), matched: true });
+    assert.equal(swapped.status, 'mismatch');
+    const repinned = await store.transitionMemberStatus(net.id, '11aaaaaa', 'repin');
+    assert.equal(repinned.status, 'authorized');
+    assert.equal(repinned.publicKeyHex, '11aaaaaa' + 'd'.repeat(56));
+    // resume / 幂等动作不抛 limit-reached、不重复计席
+    assert.equal((await store.transitionMemberStatus(net.id, '12aaaaaa', 'resume')).status, 'authorized');
+    assert.equal((await store.transitionMemberStatus(net.id, '11aaaaaa', 'approve')).status, 'authorized');
+    assert.equal((await store.transitionMemberStatus(net.id, '12aaaaaa', 'pause')).status, 'paused');
+    // 非法迁移仍按原规则拒绝：authorized 不能 repin
+    await assert.rejects(
+      store.transitionMemberStatus(net.id, '11aaaaaa', 'repin'),
+      (err) => err instanceof StoreError && err.code === 'invalid-transition',
+    );
+  });
+
+  test('缩容超额存量：resume/repin 放行，新增占席仍拒绝（不断言总数小于新上限）', { timeout: 30_000 }, async () => {
+    const net = await store.createNetwork({ ownerId: adminId, name: 'pc10-shrink', admissionMode: 'both', joinKeyEnc: enc('pc10-k3'), maxPeers: 3 });
+    await memberInState10(net, '21aaaaaa', 'authorized');
+    await memberInState10(net, '22aaaaaa', 'paused');
+    await memberInState10(net, '23aaaaaa', 'mismatch'); // 3 名占席成员
+    await store.updateNetwork(net.id, { maxPeers: 1 }); // 缩容：存量全保留、超额
+    assert.equal((await store.transitionMemberStatus(net.id, '22aaaaaa', 'resume')).status, 'authorized');
+    const repinned = await store.transitionMemberStatus(net.id, '23aaaaaa', 'repin');
+    assert.equal(repinned.status, 'authorized');
+    await memberInState10(net, '24aaaaaa', 'pending');
+    await assert.rejects(store.transitionMemberStatus(net.id, '24aaaaaa', 'approve'), limitReached);
+    // 超额存量语义：只断言既定迁移的结果（3 名 authorized），不断言任何时刻占席总数 < 新上限
+    const statuses = (await store.listMembers(net.id)).map((m) => m.status);
+    assert.equal(statuses.filter((s) => s === 'authorized').length, 3);
+  });
+
+  test('有限并发批次：6 并发 approve 恰好 2 authorized/4 limit-reached；8 并发准入恰好 2 authorized，无死锁', { timeout: 30_000 }, async () => {
+    // 并发审批：6 个 pending 竞争 2 席（走原有网络行 FOR UPDATE 事务锁）
+    const approveNet = await store.createNetwork({ ownerId: adminId, name: 'pc10-conc-approve', admissionMode: 'manual', joinKeyEnc: enc('pc10-k4'), maxPeers: 2 });
+    const approveIds = ['31aaaaaa', '32aaaaaa', '33aaaaaa', '34aaaaaa', '35aaaaaa', '36aaaaaa'];
+    for (const id of approveIds) {
+      await memberInState10(approveNet, id, 'pending');
+    }
+    const approveResults = await Promise.allSettled(
+      approveIds.map((id) => store.transitionMemberStatus(approveNet.id, id, 'approve')),
+    );
+    const approved = approveResults.filter((r) => r.status === 'fulfilled');
+    const limitRejected = approveResults.filter(
+      (r) => r.status === 'rejected' && r.reason instanceof StoreError && r.reason.code === 'limit-reached',
+    );
+    const otherErrors = approveResults.filter((r) => r.status === 'rejected' && !limitRejected.includes(r));
+    assert.equal(
+      otherErrors.length,
+      0,
+      `并发批次只允许成功或 limit-reached：${otherErrors.map((r) => String(r.reason)).join('; ')}`,
+    );
+    assert.equal(approved.length, 2, '并发审批不得超配（恰好 2 席成功）');
+    assert.equal(limitRejected.length, 4);
+    const approveStatuses = (await store.listMembers(approveNet.id)).map((m) => m.status);
+    assert.equal(approveStatuses.filter((s) => s === 'authorized').length, 2);
+
+    // 并发准入：8 台带口令同时入网竞争 2 席
+    const joinNet = await store.createNetwork({ ownerId: adminId, name: 'pc10-conc-join', admissionMode: 'key', joinKeyEnc: enc('pc10-k5'), maxPeers: 2 });
+    const joinIds = ['41aaaaaa', '42aaaaaa', '43aaaaaa', '44aaaaaa', '45aaaaaa', '46aaaaaa', '47aaaaaa', '48aaaaaa'];
+    const joinResults = await Promise.allSettled(joinIds.map((id) => join10(joinNet, id, { matched: true })));
+    const joined = joinResults.filter((r) => r.status === 'fulfilled' && r.value.status === 'authorized');
+    const joinRejected = joinResults.filter(
+      (r) => r.status === 'rejected' && r.reason instanceof StoreError && r.reason.code === 'limit-reached',
+    );
+    const joinOtherErrors = joinResults.filter((r) => r.status === 'rejected' && !joinRejected.includes(r));
+    assert.equal(joinOtherErrors.length, 0, `并发准入只允许成功或 limit-reached：${joinOtherErrors.map((r) => String(r.reason)).join('; ')}`);
+    assert.equal(joined.length, 2, '并发准入不得超配（恰好 2 席成功）');
+    assert.equal(joinRejected.length, 6);
+    const joinStatuses = (await store.listMembers(joinNet.id)).map((m) => m.status);
+    assert.equal(joinStatuses.filter((s) => s === 'authorized').length, 2);
+  });
+});

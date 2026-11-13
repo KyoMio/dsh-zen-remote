@@ -9,6 +9,7 @@ import { generatePassword, hashPassword } from '../master-key.js';
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEYS,
+  SEAT_OCCUPYING_STATUSES,
   StoreError,
   decodeMemberStatus,
   encodeSettingsValue,
@@ -96,6 +97,9 @@ export interface SqliteStoreOptions {
 function nowIso(): string {
   return new Date().toISOString();
 }
+
+/** 占席状态 IN 列表（PC-10 统一口径，来源 SEAT_OCCUPYING_STATUSES；编译期常量，无注入面） */
+const OCCUPYING_SQL = SEAT_OCCUPYING_STATUSES.map((status) => `'${status}'`).join(',');
 
 function randomId16(): string {
   return randomBytes(8).toString('hex');
@@ -438,12 +442,11 @@ export class SqliteStore implements GatewayStore {
           publicKeyHex: str(existing.public_key_hex),
         };
       }
-      // 快速路径之外的容量计数在首次准入、revoked 重入或 pending 补交有效口令直升时查询
+      // 容量计数在首次准入、revoked 重入或 pending（补交口令直升 / 换钥滑入 mismatch）时查询；
+      // 口径与 approve 审批一致：authorized+paused+mismatch（PC-10 统一占席规则）
       if (decisionExisting === null || decisionExisting.status === 'revoked' || decisionExisting.status === 'pending') {
         const countRow = this.db
-          .prepare(
-            "SELECT COUNT(*) AS n FROM network_members WHERE network_id = ? AND status IN ('authorized','paused','mismatch')",
-          )
+          .prepare(`SELECT COUNT(*) AS n FROM network_members WHERE network_id = ? AND status IN (${OCCUPYING_SQL})`)
           .get(input.networkId) as Row;
         capacityUsed = toNum(countRow.n);
       }
@@ -524,10 +527,9 @@ export class SqliteStore implements GatewayStore {
         throw new StoreError('invalid-transition', `repin requires a stored candidate public key (member ${nodeId})`);
       }
       if (outcome.needsCapacityCheck === true) {
+        // PC-10 统一口径：mismatch 也占席，approve 的空位判定必须把 mismatch 计入
         const countRow = this.db
-          .prepare(
-            "SELECT COUNT(*) AS n FROM network_members WHERE network_id = ? AND status IN ('authorized','paused')",
-          )
+          .prepare(`SELECT COUNT(*) AS n FROM network_members WHERE network_id = ? AND status IN (${OCCUPYING_SQL})`)
           .get(networkId) as Row;
         if (toNum(countRow.n) >= toNum(row.max_peers)) {
           throw new StoreError('limit-reached', `network ${networkId} is at max peers (${str(row.max_peers)})`);

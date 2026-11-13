@@ -27,6 +27,13 @@ export function decodeMemberStatus(value: string): MemberStatus {
   }
 }
 
+/**
+ * 占席状态集合（PC-10 统一口径）：authorized / paused / mismatch 各占一席；
+ * pending（待审批）与 revoked（已吊销）不占席。两个 store 的容量计数 SQL 与
+ * REST 设备表展示共用同一口径，禁止各处自写字面量漂移。
+ */
+export const SEAT_OCCUPYING_STATUSES: ReadonlyArray<MemberStatus> = ['authorized', 'paused', 'mismatch'];
+
 export interface SystemSettings {
   allowSignup: boolean;
   maxNetworksPerUser: number;
@@ -196,8 +203,10 @@ export interface JoinDecisionInput {
 }
 
 /**
- * 入网状态决策（PG-3 任务单语义 + PG-3-fix F3 + manual/both 全矩阵校准）：
- * - 已存在且非 revoked、公钥不同 → 'mismatch'（暂存候选，等管理员裁决）；
+ * 入网状态决策（PG-3 任务单语义 + PG-3-fix F2/F3 + PC-10 统一席位口径 + manual/both 全矩阵校准）：
+ * - 已存在且非 revoked、公钥不同 → 'mismatch'（暂存候选，等管理员裁决）；但 pending（不占席）
+ *   换钥滑入 mismatch（占席）是新增席位，满额时同样明确抛 'limit-reached'，不允许借道占席；
+ *   authorized/paused → mismatch 是占席内的原位换钥，席位不变、不查容量；
  * - 已存在且非 revoked、公钥相同：
  *   - 若当前为 'pending' 且本次持有效口令（key/both 模式） → 按新准入校验席位升 'authorize' 或 'limit-reached'；
  *   - 其余状态 → 'keep'（保持现状，幂等；manual 下持邀请链接重试仍保持 pending）；
@@ -212,7 +221,12 @@ export function decideJoinAttempt(input: JoinDecisionInput): JoinDecision {
   const { admissionMode, maxPeers, existing, incomingPublicKeyHex, joinKeyMatched, capacityUsed } = input;
   const keyAdmitted = joinKeyMatched && (admissionMode === 'key' || admissionMode === 'both');
   if (existing !== null && existing.status !== 'revoked') {
-    if (existing.publicKeyHex !== incomingPublicKeyHex) return 'mismatch';
+    if (existing.publicKeyHex !== incomingPublicKeyHex) {
+      if (existing.status === 'pending') {
+        return capacityUsed < maxPeers ? 'mismatch' : 'limit-reached';
+      }
+      return 'mismatch';
+    }
     if (existing.status === 'pending' && keyAdmitted) {
       return capacityUsed < maxPeers ? 'authorize' : 'limit-reached';
     }
@@ -228,13 +242,12 @@ export function decideJoinAttempt(input: JoinDecisionInput): JoinDecision {
 export interface TransitionOutcome {
   next: MemberStatus;
   /**
-   * 迁移会新增席位占用时需要原子校验 authorized+paused < maxPeers，满额抛 limit-reached：
-   * - approve：pending 不占席，升为 authorized 会新增占用；
-   * - repin（PG-3-fix F2）：mismatch 本身不占席（不在 authorized+paused 计数里），
-   *   原本从 pending 滑入 mismatch 的成员 repin 会新增占用——这正是
-   *   「pending → mismatch → repin」三步绕过 maxPeers 的路径，必须拦截。
-   *   而原本是 authorized 的成员转 mismatch 时已经空出一个 authorized+paused 席位，
-   *   其 repin 满足 count < maxPeers，不会被误拦。paused→authorized 不改变占用，无需校验。
+   * 迁移会新增席位占用（不占席 → 占席）时需要原子校验 authorized+paused+mismatch < maxPeers，
+   * 满额抛 limit-reached（PC-10 统一口径：mismatch 也占席，计数必须含它）：
+   * - approve：pending 不占席，升为 authorized 会新增占用，满额拒绝；
+   * - repin / resume / 幂等 approve 是占席 → 占席，席位不变、不查容量——「pending → mismatch」
+   *   借道占席的路径已在入网决策（decideJoinAttempt）满额拦截，store 层无需再挡 repin；
+   *   缩容后的超额存量也必须能在占席状态之间恢复/换锚。
    */
   needsCapacityCheck?: boolean;
   /** repin：candidatePublicKeyHex 提升为 publicKeyHex 并清空候选 */
@@ -263,7 +276,8 @@ export function decideTransition(status: MemberStatus, action: TransitionAction)
       return 'invalid';
     case 'repin':
       if (status === 'mismatch') {
-        return { next: 'authorized', promoteCandidate: true, needsCapacityCheck: true, requiresCandidate: true };
+        // mismatch 本身占席：mismatch → authorized 席位保持，不再查容量（缩容超额存量也放行）
+        return { next: 'authorized', promoteCandidate: true, requiresCandidate: true };
       }
       return 'invalid';
   }
