@@ -286,7 +286,7 @@ test('invoke: the three reviewer bypasses are 403 and never reach the gateway', 
   const server = await startServer(parts.handler)
   try {
     const bypasses = [
-      ['session/search + decoy', { namespace: 'session', method: 'search', args: { request: { query: 'password', sessionId: 'S-shared' } } }, 'forbidden-method'],
+      ['schedule/update + decoy', { namespace: 'schedule', method: 'update', args: { request: { id: 's1', sessionId: 'S-shared' } } }, 'forbidden-method'],
       ['dynamicCordisRunner/invoke + agentId + decoy', { namespace: 'dynamicCordisRunner', method: 'invoke', args: { agentId: 'VICTIM', request: { code: 'x', sessionId: 'S-shared' } } }, 'forbidden-method'],
       // T31 registered subagents/prompt (judged by the parent): the decoy no
       // longer buys a forbidden-method — the unshared PARENT refuses, and the
@@ -2083,5 +2083,69 @@ test('TA-1 uplink: closeAll closes every live queue — posts answer unknown-str
     const after = await uplinkPost(server, { streamId, seq: 1, items: [{ x: 1 }] })
     assert.equal(after.status, 404)
     assert.deepEqual(await after.json(), { ok: false, error: { code: 'unknown-stream' } })
+  } finally { await server.stop() }
+})
+
+test('API-6 relay-server: agentPresets zero-share gate, workspace/insertSessionBefore & session/search filtering', async () => {
+  const parts = makeParts('api6-server', { stream: workspaceStream([WORKSPACE('w-1', '/srv/w-1')]) })
+  parts.gateway.invoke = async (call) => {
+    parts.calls.push(call)
+    if (call.namespace === 'workspace' && call.method === 'list') {
+      return { items: [{ workspaceId: 'w-1', path: '/srv/w-1', title: 'Repo', sessionIds: ['S-a', 'S-secret'] }] }
+    }
+    if (call.namespace === 'workspace' && call.method === 'insertSessionBefore') {
+      return { workspace: { workspaceId: 'w-1', path: '/srv/w-1', title: 'Repo', sessionIds: ['S-b', 'S-a', 'S-secret'] } }
+    }
+    if (call.namespace === 'session' && call.method === 'search') {
+      return { items: [{ sessionId: 'S-a', title: 'Shared' }, { sessionId: 'S-secret', title: 'Secret' }], hasMore: true }
+    }
+    if (call.namespace === 'agentPresets' && call.method === 'list') {
+      return { presets: [{ id: 'custom', name: 'SecretPrompt', isDefault: false }] }
+    }
+    if (call.namespace === 'agentPresets' && call.method === 'read') {
+      return { agentPreset: call.args.agentPreset, content: 'TOP SECRET' }
+    }
+    return { ok: true }
+  }
+  const server = await startServer(parts.handler)
+  try {
+    // Zero shared sessions -> list returns [], read returns 403 not-shared, gateway untouched
+    const listZero = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'agentPresets', method: 'list', args: {} }, AUTH))
+    assert.equal(listZero.status, 200)
+    assert.deepEqual(await listZero.json(), { ok: true, value: { presets: [] } })
+
+    const readZero = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'agentPresets', method: 'read', args: { agentPreset: 'custom' } }, AUTH))
+    assert.equal(readZero.status, 403)
+    assert.deepEqual(await readZero.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 0)
+
+    // Share S-a -> presets unlock, search filters S-secret, insertSessionBefore checks workspace + beforeSessionId
+    parts.store.share('S-a')
+    parts.store.share('S-b')
+
+    const listOk = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'agentPresets', method: 'list', args: {} }, AUTH))
+    assert.deepEqual(await listOk.json(), { ok: true, value: { presets: [{ id: 'custom', name: 'SecretPrompt', isDefault: false }] } })
+
+    const readOk = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'agentPresets', method: 'read', args: { agentPreset: 'custom' } }, AUTH))
+    assert.deepEqual(await readOk.json(), { ok: true, value: { agentPreset: 'custom', content: 'TOP SECRET' } })
+
+    const searchRes = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', post('/i', { namespace: 'session', method: 'search', args: { request: { query: 'x' } } }, AUTH))
+    assert.deepEqual(await searchRes.json(), { ok: true, value: { items: [{ sessionId: 'S-a', title: 'Shared' }], hasMore: true } })
+
+    const insertOk = await server.fetch(
+      '/_dsh/zen-remote/relay/v1/invoke',
+      post('/i', { namespace: 'workspace', method: 'insertSessionBefore', args: { request: { workspaceId: 'w-1', sessionId: 'S-b', beforeSessionId: 'S-a' } } }, AUTH),
+    )
+    assert.deepEqual(await insertOk.json(), {
+      ok: true,
+      value: { workspace: { workspaceId: 'w-1', path: '/srv/w-1', title: 'Repo', sessionIds: ['S-b', 'S-a'] } },
+    })
+
+    const insertMissingWs = await server.fetch(
+      '/_dsh/zen-remote/relay/v1/invoke',
+      post('/i', { namespace: 'workspace', method: 'insertSessionBefore', args: { request: { workspaceId: 'w-404', sessionId: 'S-b' } } }, AUTH),
+    )
+    assert.equal(insertMissingWs.status, 403)
+    assert.deepEqual(await insertMissingWs.json(), { ok: false, error: { code: 'workspace/not-found' } })
   } finally { await server.stop() }
 })
