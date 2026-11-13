@@ -7,6 +7,7 @@ import { generatePassword, hashPassword } from '../master-key.js';
 import {
   DEFAULT_SETTINGS,
   SETTINGS_KEYS,
+  SEAT_OCCUPYING_STATUSES,
   StoreError,
   decodeMemberStatus,
   encodeSettingsValue,
@@ -181,6 +182,9 @@ function sha256Hex(text: string): string {
 function isPgUniqueViolation(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === '23505';
 }
+
+/** 占席状态 IN 列表（PC-10 统一口径，来源 SEAT_OCCUPYING_STATUSES；编译期常量，无注入面） */
+const OCCUPYING_SQL = SEAT_OCCUPYING_STATUSES.map((status) => `'${status}'`).join(',');
 
 export class PgStore implements GatewayStore {
   private readonly query: PgQueryFn;
@@ -509,11 +513,12 @@ export class PgStore implements GatewayStore {
           ? null
           : { status: decodeMemberStatus(str(existingRow.status)), publicKeyHex: str(existingRow.public_key_hex) };
 
-      // 容量计数在首次准入、revoked 重入或 pending 补交有效口令直升时查询
+      // 容量计数在首次准入、revoked 重入或 pending（补交口令直升 / 换钥滑入 mismatch）时查询；
+      // 口径与 approve 审批一致：authorized+paused+mismatch（PC-10 统一占席规则）
       let capacityUsed = 0;
       if (decisionExisting === null || decisionExisting.status === 'revoked' || decisionExisting.status === 'pending') {
         const counted = await tx(
-          "SELECT COUNT(*) AS count FROM network_members WHERE network_id = $1 AND status IN ('authorized','paused','mismatch')",
+          `SELECT COUNT(*) AS count FROM network_members WHERE network_id = $1 AND status IN (${OCCUPYING_SQL})`,
           [input.networkId],
         );
         capacityUsed = toNum((counted.rows[0] as Row | undefined)?.count);
@@ -565,7 +570,7 @@ export class PgStore implements GatewayStore {
 
   async transitionMemberStatus(networkId: string, nodeId: string, action: TransitionAction): Promise<MemberRecord> {
     return this.inTransaction(async (tx) => {
-      // 锁网络行：同网络的容量裁决（approve/repin）串行化
+      // 锁网络行：同网络的容量裁决（approve）与状态迁移串行化
       const network = await tx('SELECT id, max_peers FROM networks WHERE id = $1 FOR UPDATE', [networkId]);
       if (network.rows.length === 0) {
         throw new StoreError('network-not-found', `network ${networkId} does not exist`);
@@ -591,8 +596,9 @@ export class PgStore implements GatewayStore {
         throw new StoreError('invalid-transition', `repin requires a stored candidate public key (member ${nodeId})`);
       }
       if (outcome.needsCapacityCheck === true) {
+        // PC-10 统一口径：mismatch 也占席，approve 的空位判定必须把 mismatch 计入
         const counted = await tx(
-          "SELECT COUNT(*) AS count FROM network_members WHERE network_id = $1 AND status IN ('authorized','paused')",
+          `SELECT COUNT(*) AS count FROM network_members WHERE network_id = $1 AND status IN (${OCCUPYING_SQL})`,
           [networkId],
         );
         const used = toNum((counted.rows[0] as Row | undefined)?.count);

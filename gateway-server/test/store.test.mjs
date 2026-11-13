@@ -496,6 +496,18 @@ describe('SqliteStore', () => {
     assert.equal((await store.transitionMemberStatus(net.id, 'b2aaaaaa', 'pause')).status, 'paused');
   });
 
+  test('PC-10：满网下幂等动作不抛 limit-reached、占席数不变（重复 approve/resume/pause 不重复计席）', async () => {
+    const net = await store.createNetwork({ ownerId: adminId, name: 'idem-full-net', admissionMode: 'key', joinKeyEnc: 'enc', maxPeers: 2 });
+    await memberInState(net, 'e7aaaaaa', 'authorized');
+    await memberInState(net, 'e8aaaaaa', 'paused'); // 2/2 占满
+    assert.equal((await store.transitionMemberStatus(net.id, 'e7aaaaaa', 'approve')).status, 'authorized');
+    assert.equal((await store.transitionMemberStatus(net.id, 'e7aaaaaa', 'approve')).status, 'authorized');
+    assert.equal((await store.transitionMemberStatus(net.id, 'e8aaaaaa', 'resume')).status, 'authorized');
+    assert.equal((await store.transitionMemberStatus(net.id, 'e8aaaaaa', 'pause')).status, 'paused');
+    const occupying = (await store.listMembers(net.id)).filter((m) => ['authorized', 'paused', 'mismatch'].includes(m.status)).length;
+    assert.equal(occupying, 2);
+  });
+
   test('approve 满额返回 limit-reached（pending 存量不放行）', async () => {
     // both 模式：口令入网占满席位，无口令进 pending 等审批
     const net = await store.createNetwork({ ownerId: adminId, name: 'limit-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 2 });
@@ -509,22 +521,55 @@ describe('SqliteStore', () => {
     assert.equal(still.status, 'pending');
   });
 
-  test('F2：pending→mismatch→repin 三步绕不过 maxPeers（满额 repin 抛 limit-reached）', async () => {
+  test('PC-10：满网 pending 换公钥 → 入网层抛 limit-reached 保持 pending（mismatch 占席，不借道滑入）；authorized→mismatch→repin 席位不变可换锚', async () => {
     const net = await store.createNetwork({ ownerId: adminId, name: 'bypass-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 2 });
     await join(net, 'b1aaaaaa', { matched: true });
     await join(net, 'b2aaaaaa', { matched: true }); // 两台 authorized 占满
     await join(net, 'b3aaaaaa', { matched: false }); // 第 3 台无口令进 pending（不占席）
-    await join(net, 'b3aaaaaa', { pub: 'b3aaaaaaNEW', matched: true }); // 换公钥 → mismatch
+    // pending（不占席）→ mismatch（占席）是新增席位：满网必须在入网层拒绝，不能借 mismatch 滑入占席
+    await rejectsCode(join(net, 'b3aaaaaa', { pub: 'b3aaaaaa' + 'ff'.repeat(28), matched: true }), 'limit-reached');
     const m = (await store.listMembers(net.id)).find((x) => x.nodeId === 'b3aaaaaa');
-    assert.equal(m.status, 'mismatch');
-    // repin 必须被容量拦截：此时 authorized+paused = 2 >= maxPeers
-    await rejectsCode(store.transitionMemberStatus(net.id, 'b3aaaaaa', 'repin'), 'limit-reached');
+    assert.equal(m.status, 'pending');
+    assert.equal(m.candidatePublicKeyHex, null);
 
-    // 合法路径不受误拦：authorized→mismatch→repin（mismatch 期间已空出一个 authorized 席位）
-    await join(net, 'b1aaaaaa', { pub: 'b1aaaaaaNEW', matched: true }); // b1: authorized → mismatch
+    // authorized→mismatch 是占席内的原位换钥（席位不变），满网下 repin 换锚放行
+    await join(net, 'b1aaaaaa', { pub: 'b1aaaaaa' + 'ee'.repeat(28), matched: true }); // b1: authorized → mismatch
     const repinned = await store.transitionMemberStatus(net.id, 'b1aaaaaa', 'repin');
     assert.equal(repinned.status, 'authorized');
-    assert.equal(repinned.publicKeyHex, 'b1aaaaaaNEW');
+    assert.equal(repinned.publicKeyHex, 'b1aaaaaa' + 'ee'.repeat(28));
+  });
+
+  test('PC-10：approve 计数与准入同口径——authorized+mismatch 两席占满时审批新 pending 拒绝；mismatch→reject 释放席位后空位可批', async () => {
+    const net = await store.createNetwork({ ownerId: adminId, name: 'mix-limit-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 2 });
+    await memberInState(net, 'c4aaaaaa', 'authorized');
+    await memberInState(net, 'c5aaaaaa', 'mismatch'); // authorized 原位换钥 → mismatch（仍占原席位）
+    await memberInState(net, 'c6aaaaaa', 'pending');
+    // 占席成员 2/2（authorized+mismatch 都占席）：approve（不占席 → 占席）必须拒绝
+    await rejectsCode(store.transitionMemberStatus(net.id, 'c6aaaaaa', 'approve'), 'limit-reached');
+    const still = (await store.listMembers(net.id)).find((m) => m.nodeId === 'c6aaaaaa');
+    assert.equal(still.status, 'pending');
+
+    // mismatch→reject 释放席位（占席 → 不占席），腾出的空位可被合法批准
+    await store.transitionMemberStatus(net.id, 'c5aaaaaa', 'reject'); // mismatch → revoked
+    const approved = await store.transitionMemberStatus(net.id, 'c6aaaaaa', 'approve');
+    assert.equal(approved.status, 'authorized');
+  });
+
+  test('PC-10：缩容后超额存量 resume/repin 保留原席位放行，新增占席仍拒绝（不断言总数小于新上限）', async () => {
+    const net = await store.createNetwork({ ownerId: adminId, name: 'shrink-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 3 });
+    await memberInState(net, 'd3aaaaaa', 'authorized');
+    await memberInState(net, 'd4aaaaaa', 'paused');
+    await memberInState(net, 'd5aaaaaa', 'mismatch'); // 3 名占席成员
+    await store.updateNetwork(net.id, { maxPeers: 1 }); // 缩容：存量全保留、瞬时超额
+    // 占席 → 占席：resume / repin 保留原席位，超额也不被重复计席拒绝
+    const resumed = await store.transitionMemberStatus(net.id, 'd4aaaaaa', 'resume');
+    assert.equal(resumed.status, 'authorized');
+    const repinned = await store.transitionMemberStatus(net.id, 'd5aaaaaa', 'repin');
+    assert.equal(repinned.status, 'authorized');
+    assert.equal(repinned.publicKeyHex, 'd5aaaaaacand');
+    // 缩容后新增占席仍拒绝：满额（超额）下批准新 pending 必须 limit-reached
+    await memberInState(net, 'd6aaaaaa', 'pending');
+    await rejectsCode(store.transitionMemberStatus(net.id, 'd6aaaaaa', 'approve'), 'limit-reached');
   });
 
   test('F2：repin 时候选公钥意外缺失 → invalid-transition，绝不把 null 写进公钥', async () => {
