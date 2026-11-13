@@ -75,6 +75,8 @@ export interface MemberChangedEvent {
 export interface GatewayHooks {
   onMemberChanged?: (event: MemberChangedEvent) => void | Promise<void>;
   onNetworkDeleted?: (networkId: string) => void | Promise<void>;
+  /** PC-08a：网络 PATCH（仅 maxPeers）持久化成功后通知；接收方以库中最新事实为准做幂等收敛 */
+  onNetworkUpdated?: (networkId: string) => void | Promise<void>;
   onSettingsChanged?: (settings: SystemSettings) => void | Promise<void>;
   onUserDisabled?: (userId: string) => void | Promise<void>;
 }
