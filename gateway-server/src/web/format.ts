@@ -25,12 +25,18 @@ export function formatBytes(bytes: number): string {
   return `${gb >= 100 ? Math.round(gb) : Math.round(gb * 10) / 10} GB`;
 }
 
-/** 延迟读数：单值 '12 ms'，区间取最值 '12–30 ms'，无数据 '—' */
-export function formatLatencyRange(rttMsValues: readonly number[]): string {
-  if (rttMsValues.length === 0) return '—';
+/**
+ * 延迟读数：单值 '12 ms'，区间取最值 '12–30 ms'，无数据 '—'。
+ * null（未知——中继/阻断路径没有测速协议）与实测 0 是两种观测：先滤掉
+ * null 与契约外的 junk 值（负数等）再取最值，绝不走 Math.min(null)=0 的
+ * 强转老路；实测 0 是真实数字，原样显示 '0 ms'。
+ */
+export function formatLatencyRange(rttMsValues: readonly (number | null)[]): string {
+  const known = rttMsValues.filter((v): v is number => v !== null && Number.isFinite(v) && v >= 0);
+  if (known.length === 0) return '—';
   const round = (v: number): number => Math.round(v * 10) / 10;
-  const min = round(Math.min(...rttMsValues));
-  const max = round(Math.max(...rttMsValues));
+  const min = round(Math.min(...known));
+  const max = round(Math.max(...known));
   return min === max ? `${min} ms` : `${min}–${max} ms`;
 }
 
@@ -72,13 +78,19 @@ export function relativeText(t: TranslateFn, rt: RelativeTime): string {
 
 // ---------------------------------------------------------------- 连接路径
 
-/** 节点自报路径 → 三类连接（lan=局域网直连 / direct=直连 / relay=经网关中转） */
-export type LinkKind = 'lan' | 'direct' | 'relay';
+/**
+ * 节点自报路径 → 五类连接（lan=局域网直连 / direct=直连 / relay=经网关中转 /
+ * blocked=节点本机阻断 / unknown=白名单外未知）。blocked 与 unknown 各自独立：
+ * 阻断不是中转，未知也不伪装成任何已知连接方式（PC16b）。
+ */
+export type LinkKind = 'lan' | 'direct' | 'relay' | 'blocked' | 'unknown';
 
 export function classifyLinkPath(path: string): LinkKind {
   if (path === 'lan') return 'lan';
   if (path === 'p2p' || path === 'direct') return 'direct';
-  return 'relay';
+  if (path === 'relay') return 'relay';
+  if (path === 'blocked') return 'blocked';
+  return 'unknown';
 }
 
 // ---------------------------------------------------------------- 成员状态展示
@@ -138,19 +150,18 @@ export interface PeerConnRow {
   latency: string;
 }
 
-/** 两设备间的路径观测：优先本机自报，缺了看对方上报（路径是双向对称的事实） */
-function findLink(links: readonly TopologyLink[], a: string, b: string): TopologyLink | null {
-  return (
-    links.find((l) => l.srcNodeId === a && l.peerNodeId === b) ??
-    links.find((l) => l.srcNodeId === b && l.peerNodeId === a) ??
-    null
+/** 两设备间的全部路径观测（每个方向各一条自报，两条都算事实） */
+function linksBetween(links: readonly TopologyLink[], a: string, b: string): TopologyLink[] {
+  return links.filter(
+    (l) => (l.srcNodeId === a && l.peerNodeId === b) || (l.srcNodeId === b && l.peerNodeId === a),
   );
 }
 
 /**
  * 固定原因文案表（对齐 ui-ux-spec §3.5）：身份异常阻断最优先，其次对方暂停 /
- * 本机暂停 / 离线，再才是真实链路（局域网 / 直连 / 中转），最后是空闲未连接。
- * 判序即语义：有链路但任一方离线时仍显示「设备当前离线」。
+ * 本机暂停 / 离线，再才是链路观测（节点本机阻断 / 局域网 / 直连 / 中转 /
+ * 未知路径），最后是空闲未连接。判序即语义：有链路但任一方离线时仍显示
+ * 「设备当前离线」。
  */
 export function derivePeerConnRow(
   t: TranslateFn,
@@ -178,8 +189,23 @@ export function derivePeerConnRow(
     return notConnected(t('device.notConnectedOffline'));
   }
 
-  const link = findLink(links, self.nodeId, other.nodeId);
-  if (link !== null) {
+  const pairLinks = linksBetween(links, self.nodeId, other.nodeId);
+  // 任一方向自报 blocked（节点本机 TOFU 阻断，双方在网关侧仍是正常成员）就按
+  // 阻断呈现——单向 blocked + 反向正常不能被「优选直连」合并掩盖。阻断路径没有
+  // 测速，延迟一律未知：不用反向链路或旧 last RTT 冒充当前阻断延迟。
+  if (pairLinks.some((l) => classifyLinkPath(l.path) === 'blocked')) {
+    return { dot: 'danger', kindWord: t('device.blocked'), reason: t('device.reasonNodeBlocked'), latency: '—' };
+  }
+  const link =
+    pairLinks.find((l) => classifyLinkPath(l.path) === 'lan') ??
+    pairLinks.find((l) => classifyLinkPath(l.path) === 'direct') ??
+    pairLinks.find((l) => classifyLinkPath(l.path) === 'relay') ??
+    pairLinks.find((l) => classifyLinkPath(l.path) === 'unknown');
+  if (link !== undefined) {
+    if (classifyLinkPath(link.path) === 'unknown') {
+      // 白名单外的自报：如实显示「未知」，不伪装成任何已知连接方式
+      return { dot: 'muted', kindWord: t('path.unknown'), reason: t('device.reasonUnknownPath'), latency: '—' };
+    }
     const latency = formatLatencyRange([link.rttMs]);
     switch (classifyLinkPath(link.path)) {
       case 'lan':
@@ -196,6 +222,10 @@ export function derivePeerConnRow(
               : t('device.reasonRelay', { rate });
         return { dot: 'warn', kindWord: t('path.relay'), reason, latency };
       }
+      case 'blocked':
+      case 'unknown':
+        // blocked 已在上面统一返回，这两个分支只为穷尽联合类型的兜底（不可达）
+        return { dot: 'muted', kindWord: t('path.unknown'), reason: t('device.reasonUnknownPath'), latency: '—' };
     }
   }
   return notConnected(t('device.notConnectedIdle'));

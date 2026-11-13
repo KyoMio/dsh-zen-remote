@@ -13,8 +13,10 @@ import {
   translate,
 } from '../dist/web/i18n/locales.js';
 import {
+  classifyLinkPath,
   derivePeerConnRow,
   filterJoinedMembers,
+  formatLatencyRange,
   maskInviteUri,
   memberStatusView,
 } from '../dist/web/format.js';
@@ -676,25 +678,26 @@ describe('format：设备间连接行 derivePeerConnRow', () => {
   test('中转按对称型网络区分原因：本机对称 / 对方对称 / 普通中转', () => {
     const self = makeMember('self', 'authorized');
     const other = makeMember('other', 'authorized');
-    const link = { srcNodeId: 'self', peerNodeId: 'other', path: 'relay', rttMs: 40, liveRelayKbps: 8 };
+    // PC16a 契约：中继没有测速协议，relay 链路的 rttMs 恒为 null（未知）
+    const link = { srcNodeId: 'self', peerNodeId: 'other', path: 'relay', rttMs: null, liveRelayKbps: 8 };
 
     assert.deepEqual(derivePeerConnRow(tZh, { ...self, natType: 'symmetric' }, other, linksOf(link)), {
       dot: 'warn',
       kindWord: '经网关中转',
       reason: '这台设备的网络不支持直连，已自动中转 · 8 KB/s',
-      latency: '40 ms',
+      latency: '—',
     });
     assert.deepEqual(derivePeerConnRow(tZh, self, { ...other, natType: 'symmetric' }, linksOf(link)), {
       dot: 'warn',
       kindWord: '经网关中转',
       reason: '对方网络不支持直连，已自动中转 · 8 KB/s',
-      latency: '40 ms',
+      latency: '—',
     });
     assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(link)), {
       dot: 'warn',
       kindWord: '经网关中转',
       reason: '这台设备/对方网络不支持直连，已自动中转 · 8 KB/s',
-      latency: '40 ms',
+      latency: '—',
     });
     // 双方都对称时优先说本机的原因
     assert.equal(
@@ -712,6 +715,133 @@ describe('format：设备间连接行 derivePeerConnRow', () => {
       reason: '还没有建立连接',
       latency: '—',
     });
+  });
+});
+
+// ---------------------------------------------------------------- PC-16b：blocked 与未知延迟的展示派生
+
+describe('PC-16b：classifyLinkPath 白名单分类', () => {
+  test('blocked 独立成类，不再默认归 relay', () => {
+    assert.equal(classifyLinkPath('blocked'), 'blocked');
+    assert.notEqual(classifyLinkPath('blocked'), 'relay');
+  });
+
+  test('正常 lan / p2p / direct / relay 分类保持不变', () => {
+    assert.equal(classifyLinkPath('lan'), 'lan');
+    assert.equal(classifyLinkPath('p2p'), 'direct');
+    assert.equal(classifyLinkPath('direct'), 'direct');
+    assert.equal(classifyLinkPath('relay'), 'relay');
+  });
+
+  test('白名单外的未知路径归 unknown，不伪装 relay', () => {
+    assert.equal(classifyLinkPath('future-path'), 'unknown');
+    assert.equal(classifyLinkPath(''), 'unknown');
+    assert.notEqual(classifyLinkPath('future-path'), 'relay');
+  });
+});
+
+describe('PC-16b：formatLatencyRange 未知与实测 0', () => {
+  test('null（未知）显示 —，绝不强转成 0 ms', () => {
+    assert.equal(formatLatencyRange([null]), '—');
+    assert.equal(formatLatencyRange([null, null]), '—');
+  });
+
+  test('实测 0 保持真实 0 ms，混合 null 与 0 也不吞掉实测值', () => {
+    assert.equal(formatLatencyRange([0]), '0 ms');
+    assert.equal(formatLatencyRange([null, 0]), '0 ms');
+  });
+
+  test('已知值区间与空列表行为保持', () => {
+    assert.equal(formatLatencyRange([]), '—');
+    assert.equal(formatLatencyRange([12]), '12 ms');
+    assert.equal(formatLatencyRange([12, 30]), '12–30 ms');
+    assert.equal(formatLatencyRange([null, 20]), '20 ms', '混合未知与实测时只对实测值取区间');
+  });
+});
+
+describe('PC-16b：derivePeerConnRow 阻断与未知路径', () => {
+  const linksOf = (...links) => links;
+
+  test('节点本机 TOFU 阻断（双方在网关侧都是正常成员）→ danger 已阻断 + 平实原因 + 延迟 —', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const blockedFwd = { srcNodeId: 'self', peerNodeId: 'other', path: 'blocked', rttMs: null, liveRelayKbps: 0 };
+    const expectedZh = { dot: 'danger', kindWord: '已阻断', reason: '至少一端未认可对方身份，连接已阻断', latency: '—' };
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(blockedFwd)), expectedZh);
+    assert.equal(derivePeerConnRow(tEn, self, other, linksOf(blockedFwd)).kindWord, 'Blocked');
+    assert.equal(derivePeerConnRow(tEn, self, other, linksOf(blockedFwd)).latency, '—');
+  });
+
+  test('阻断行的延迟一律 —：链路带着旧 RTT 也不冒充当前阻断路径延迟', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const blockedStale = { srcNodeId: 'self', peerNodeId: 'other', path: 'blocked', rttMs: 42, liveRelayKbps: 0 };
+    assert.equal(derivePeerConnRow(tZh, self, other, linksOf(blockedStale)).latency, '—');
+    // 反向登记的 blocked 同样算数（findLink 式只看本机自报会漏掉「对方阻断了我」）
+    const blockedBack = { srcNodeId: 'other', peerNodeId: 'self', path: 'blocked', rttMs: null, liveRelayKbps: 0 };
+    assert.equal(derivePeerConnRow(tZh, self, other, linksOf(blockedBack)).dot, 'danger');
+    assert.equal(derivePeerConnRow(tZh, self, other, linksOf(blockedBack)).kindWord, '已阻断');
+  });
+
+  test('单向 blocked + 反向 p2p 正常：不能被「优选直连」合并掩盖，阻断优先呈现', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const blockedFwd = { srcNodeId: 'self', peerNodeId: 'other', path: 'blocked', rttMs: null, liveRelayKbps: 0 };
+    const p2pBack = { srcNodeId: 'other', peerNodeId: 'self', path: 'p2p', rttMs: 5, liveRelayKbps: 0 };
+    const row = derivePeerConnRow(tZh, self, other, linksOf(blockedFwd, p2pBack));
+    assert.deepEqual(row, { dot: 'danger', kindWord: '已阻断', reason: '至少一端未认可对方身份，连接已阻断', latency: '—' });
+    // 反向的 p2p 观测不冒充阻断行的延迟（正常方向事实保留在数据里，不臆造双向正常）
+    assert.notEqual(row.latency, '5 ms');
+    // 方向互换：blocked 在反向、p2p 在正向，同样阻断优先
+    const rowFlipped = derivePeerConnRow(tZh, self, other, linksOf(p2pBack, blockedFwd));
+    assert.equal(rowFlipped.dot, 'danger');
+    assert.equal(rowFlipped.kindWord, '已阻断');
+  });
+
+  test('未知路径（白名单外）→ muted「未知」行，不伪装 relay/直连，延迟 —', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const weird = { srcNodeId: 'self', peerNodeId: 'other', path: 'future-path', rttMs: 7, liveRelayKbps: 0 };
+    const expectedZh = { dot: 'muted', kindWord: '未知', reason: '上报了无法识别的连接方式，暂时无法判定', latency: '—' };
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(weird)), expectedZh);
+    assert.equal(derivePeerConnRow(tEn, self, other, linksOf(weird)).kindWord, 'Unknown');
+  });
+
+  test('DB mismatch（成员状态身份异常）仍优先于链路 blocked，文案不变', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const blockedFwd = { srcNodeId: 'self', peerNodeId: 'other', path: 'blocked', rttMs: null, liveRelayKbps: 0 };
+    const expected = { dot: 'danger', kindWord: '已阻断', reason: '身份异常，连接已阻断', latency: '—' };
+    assert.deepEqual(derivePeerConnRow(tZh, { ...self, status: 'mismatch' }, other, linksOf(blockedFwd)), expected);
+    assert.deepEqual(derivePeerConnRow(tZh, self, { ...other, status: 'mismatch' }, linksOf(blockedFwd)), expected);
+  });
+
+  test('正常呈现保持：lan 实测 0 显示 0 ms，relay（rttMs null）显示 —，负延迟视作未知', () => {
+    const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
+    const lan0 = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 0, liveRelayKbps: 0 };
+    const rowLan = derivePeerConnRow(tZh, self, other, linksOf(lan0));
+    assert.deepEqual(rowLan, { dot: 'ok', kindWord: '局域网直连', reason: '在同一个局域网内', latency: '0 ms' });
+    const relayNull = { srcNodeId: 'self', peerNodeId: 'other', path: 'relay', rttMs: null, liveRelayKbps: 8 };
+    const rowRelay = derivePeerConnRow(tZh, self, other, linksOf(relayNull));
+    assert.equal(rowRelay.dot, 'warn');
+    assert.equal(rowRelay.kindWord, '经网关中转');
+    assert.equal(rowRelay.latency, '—');
+    const junkRtt = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: -3, liveRelayKbps: 0 };
+    assert.equal(derivePeerConnRow(tZh, self, other, linksOf(junkRtt)).latency, '—', '契约外 junk 值按未知处理，不当 0');
+  });
+});
+
+describe('PC-16b：新增双语词条', () => {
+  test('阻断原因 / 未知路径 / 阻断计数词条中英成对', () => {
+    assert.equal(LOCALES.zh['device.reasonNodeBlocked'], '至少一端未认可对方身份，连接已阻断');
+    assert.equal(LOCALES.en['device.reasonNodeBlocked'], 'At least one end rejected the other\u2019s identity; connection blocked');
+    assert.equal(LOCALES.zh['path.unknown'], '未知');
+    assert.equal(LOCALES.en['path.unknown'], 'Unknown');
+    assert.equal(LOCALES.zh['device.reasonUnknownPath'], '上报了无法识别的连接方式，暂时无法判定');
+    assert.equal(LOCALES.en['device.reasonUnknownPath'], 'The device reported an unrecognized connection type; cannot classify it yet');
+    assert.equal(translate('zh', 'devices.blockedCount', { n: 2 }), '阻断 2');
+    assert.equal(translate('en', 'devices.blockedCount', { n: 2 }), 'Blocked 2');
   });
 });
 
