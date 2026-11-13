@@ -112,6 +112,13 @@ interface PeerView {
   reflexiveEndpoint: string | null;
 }
 
+/** PC-08a fix1：每网络的容量观察状态，字段语义见 capacityFacts 字段注释 */
+interface NetworkCapacityFacts {
+  readTicket: number;
+  factVersion: number;
+  appliedMaxPeers: number | null;
+}
+
 const connKey = (networkId: string, nodeId: string): string => `${networkId}|${nodeId}`;
 
 function endpointString(reflexive: { ip: string; port: number } | null): string | null {
@@ -220,6 +227,16 @@ export class PeerWsHub {
   // 「从未变化」（0）重新相等，放过过期快照；增长上界是本进程见过的
   // (network|node) 身份数，不落库、进程重启即清零。
   private readonly memberEpochs = new Map<string, number>();
+  // PC-08a fix1：每网络容量观察状态（网络删除时清理）。数据库真值只在读的
+  // 那一刻成立，异步返回的是读时快照——三个字段把「观察」与「传播」分开：
+  //   readTicket     递增于每次 hook 读库发出；只有最新发出的读取允许落地，
+  //                  迟到完成的旧快照在此作废（乱序不回灌）
+  //   factVersion    递增于每次观察到的事实变化（成功应用且值不同）；auth/
+  //                  晋升据此判断「我读库之后事实是否又变过」——广播读库失败
+  //                  不递增，缓存滞后不会把读到真值的正常认证挡在门外
+  //   appliedMaxPeers 最近一次成功传播（广播+池快照改写）的值；同值幂等参考；
+  //                  读库失败不更新，同值重试 PATCH 即恢复传播
+  private readonly capacityFacts = new Map<string, NetworkCapacityFacts>();
 
   constructor(options: PeerWsHubOptions) {
     this.store = options.store;
@@ -466,6 +483,14 @@ export class PeerWsHub {
       deny(ws, 'challenge signature verification failed');
       return null;
     }
+    // PC-08a fix2：事实代次在读库**发出前**捕获。异步读取返回的是读时快照，
+    // 若结果迟到返回而期间已有事实变化被观察应用，拿到旧数据后才捕获会给旧
+    // maxPeers 贴上新代次、误过末端闸。发出前捕获使快照恒与发出时刻的代次
+    // 配对：窗口内发生过事实变化就在末端闸静默关闭，重连按新值放行（读取
+    // 执行前一刻恰好应用变化会多一次自愈重连，fail-closed 方向）。判定只用
+    // 观察代次、不拿广播缓存值比较——传播读库失败不动代次，读到真值的认证
+    // 照常放行（fix1 语义保持）。
+    const handshakeCapacityVersion = this.capacityFacts.get(networkId)?.factVersion ?? 0;
     let network: NetworkRecord | null;
     try {
       network = await this.store.getNetwork(networkId);
@@ -526,6 +551,15 @@ export class PeerWsHub {
     // 最新持久授权重新判定。
     if ((this.memberEpochs.get(connKey(networkId, nodeId)) ?? 0) !== memberEpoch) {
       ws.close(1013, 'membership changed during authentication');
+      return null;
+    }
+    // PC-08a fix1：认证途中观察到容量事实变化（代次前进）——握手期读到的
+    // maxPeers 已不可信，带旧快照落地会让 welcome 携带过期容量。沿成员代次
+    // 同款静默关闭（不发 denied，节点不会把暂时性变化误判为终止性拒绝），节点
+    // 沿既有有界退避重连，下一次认证直读库按新值放行。这是最后一个 await 之后
+    // 的同步闸，与注册之间无 await。
+    if ((this.capacityFacts.get(networkId)?.factVersion ?? 0) !== handshakeCapacityVersion) {
+      ws.close(1013, 'network changed during authentication');
       return null;
     }
     this.replaceExisting(networkId, nodeId);
@@ -754,6 +788,7 @@ export class PeerWsHub {
   readonly hooks: GatewayHooks = {
     onMemberChanged: (event: MemberChangedEvent) => this.onMemberChanged(event),
     onNetworkDeleted: (networkId: string) => this.onNetworkDeleted(networkId),
+    onNetworkUpdated: (networkId: string) => this.onNetworkUpdated(networkId),
     onSettingsChanged: (settings) => {
       this.rateKbps = settings.relayRateKbps;
     },
@@ -848,6 +883,7 @@ export class PeerWsHub {
     if (conn === undefined) return;
     const epoch = this.admissionEpoch;
     const memberEpoch = this.memberEpochs.get(key) ?? 0;
+    const capacityVersion = this.capacityFacts.get(event.networkId)?.factVersion ?? 0;
     // Keep the connection visible to disable/delete hooks throughout async promotion.
     // repin 后库里生效公钥即挂起连接入网时呈验的那把（store 已把
     // candidate 提升为 publicKeyHex）；从库再同步一次，防判定路径变化
@@ -860,6 +896,14 @@ export class PeerWsHub {
       this.killConn(conn, 'gateway storage unavailable');
       return;
     }
+    // PC-08a fix1：晋升容量以库中最新事实收敛，不依赖先前一次成功广播的快照
+    // （传播读库失败时快照滞后）；读不到就退回 hook 维护的快照，不影响授权判定
+    let freshCapacity: number | null = null;
+    try {
+      freshCapacity = (await this.store.getNetwork(event.networkId))?.maxPeers ?? null;
+    } catch {
+      freshCapacity = null;
+    }
     // fix1：代次复核是最后一个 await 之后的同步闸——这里到发送之间没有
     // await，落在 await 窗口内的 pause 已递增代次，旧晋升在此失效
     if (!await this.checkOwnerAdmission(conn.ws, conn.ownerId, epoch) ||
@@ -867,6 +911,11 @@ export class PeerWsHub {
         conn.state !== 'hanging' || this.hanging.get(key) !== conn ||
         (this.memberEpochs.get(key) ?? 0) !== memberEpoch) return;
     this.hanging.delete(key);
+    // 容量采纳的同步复核：读库期间无新观察到的事实变化才采纳本次读取；
+    // 有变化说明 hook 已把更新值直接应用到池上快照，welcome 照现值发
+    if (freshCapacity !== null && (this.capacityFacts.get(event.networkId)?.factVersion ?? 0) === capacityVersion) {
+      conn.maxPeers = freshCapacity;
+    }
     this.welcomeAuthorized(conn);
     this.registerAndAnnounce(conn);
   }
@@ -884,6 +933,7 @@ export class PeerWsHub {
     if (conn === undefined) return false;
     const epoch = this.admissionEpoch;
     const memberEpoch = this.memberEpochs.get(key) ?? 0;
+    const capacityVersion = this.capacityFacts.get(event.networkId)?.factVersion ?? 0;
     let member: MemberRecord | null = null;
     try {
       member = (await this.store.listMembers(event.networkId)).find((m) => m.nodeId === event.nodeId) ?? null;
@@ -897,6 +947,14 @@ export class PeerWsHub {
       return true;
     }
     if (member.status === 'paused') return true; // 新一轮暂停已生效：保持受限挂起
+    // PC-08a fix1：晋升容量以库中最新事实收敛，不依赖先前一次成功广播的快照；
+    // 读不到就退回 hook 维护的快照，不影响授权判定
+    let freshCapacity: number | null = null;
+    try {
+      freshCapacity = (await this.store.getNetwork(event.networkId))?.maxPeers ?? null;
+    } catch {
+      freshCapacity = null;
+    }
     // fix1：代次复核是最后一个 await 之后的同步闸——这里到发送之间没有
     // await，落在 await 窗口内的 pause 已递增代次，旧晋升在此失效
     if (!await this.checkOwnerAdmission(conn.ws, conn.ownerId, epoch) ||
@@ -906,6 +964,11 @@ export class PeerWsHub {
     this.pausedConns.delete(key);
     // 与挂起晋级同款：从库再同步一次公钥，防判定路径变化
     conn.publicKeyHex = member.publicKeyHex;
+    // 容量采纳的同步复核：读库期间无新观察到的事实变化才采纳本次读取；
+    // 有变化说明 hook 已把更新值直接应用到池上快照，welcome 照现值发
+    if (freshCapacity !== null && (this.capacityFacts.get(event.networkId)?.factVersion ?? 0) === capacityVersion) {
+      conn.maxPeers = freshCapacity;
+    }
     // fix1：恢复即新的授权事实——换发 STUN 准入代次（与节点 connEpoch 的暂停
     // 换代一致）。恢复前在途观察的迟到回包按旧 token 复查不匹配，不落新观察；
     // 恢复后的探测以新 token 登记，主辅槽不跨暂停混配
@@ -979,6 +1042,50 @@ export class PeerWsHub {
     }
     this.subscribers.delete(networkId);
     this.lastPublishedKbps.delete(networkId);
+    // PC-08a fix1：观察状态一并清除——在途 hook 完成的票据复核随之失配，迟到
+    // 完成不再落地；entry 消失本身即「删除事实」
+    this.capacityFacts.delete(networkId);
+  }
+
+  /**
+   * PC-08a fix1：网络容量变更（PATCH maxPeers 持久化成功后触发）。异步读库
+   * 返回的是**读时快照**而非完成时刻的真值，所以落地前必须两道同步复核：
+   * 票据（本读取是否已被更新的读取/删除超越，防乱序旧快照回灌）与幂等
+   * （与已传播值同值则无事实变化，不推送不改快照不递增代次）。读库失败直接
+   * 放弃且不动 appliedMaxPeers——同值重试 PATCH 即恢复传播，广播缓存滞后也
+   * 不会借道这里阻断认证。authorized 连接收增量 {type:'network-updated'}
+   * （刻意不发 welcome：那会改变状态并触发节点业务同步）；hanging/paused 池
+   * 只更新快照，approve/resume 晋升时另行直读库收敛。
+   */
+  private async onNetworkUpdated(networkId: string): Promise<void> {
+    // 发读取先领票：此后任何更新的读取（或删除清态）都让本次迟到完成作废
+    const issued = this.capacityFacts.get(networkId) ?? { readTicket: 0, factVersion: 0, appliedMaxPeers: null };
+    const readTicket = issued.readTicket + 1;
+    this.capacityFacts.set(networkId, { ...issued, readTicket });
+    let network: NetworkRecord | null;
+    try {
+      network = await this.store.getNetwork(networkId);
+    } catch {
+      return; // 库暂不可用：放弃本次（applied 不动），auth/welcome 始终直读库不受影响
+    }
+    if (network === null) return; // 网络已删：断连清理由 onNetworkDeleted 负责
+    // 最后应用/广播前的同步复核（此后无 await）：旧快照绝不回灌
+    const current = this.capacityFacts.get(networkId);
+    if (this.closed || current === undefined || current.readTicket !== readTicket) return;
+    if (current.appliedMaxPeers === network.maxPeers) return;
+    this.capacityFacts.set(networkId, { ...current, factVersion: current.factVersion + 1, appliedMaxPeers: network.maxPeers });
+    // 此处到发送之间没有任何 await：三个池的快照与广播是同一份事实的一次应用
+    const net = this.conns.get(networkId);
+    if (net !== undefined) {
+      for (const conn of net.values()) conn.maxPeers = network.maxPeers;
+    }
+    for (const [, conn] of this.hanging) {
+      if (conn.networkId === networkId) conn.maxPeers = network.maxPeers;
+    }
+    for (const [, conn] of this.pausedConns) {
+      if (conn.networkId === networkId) conn.maxPeers = network.maxPeers;
+    }
+    this.broadcast(networkId, { type: 'network-updated', networkId, maxPeers: network.maxPeers });
   }
 
   private onUserDisabled(userId: string): void {
