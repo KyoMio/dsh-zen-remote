@@ -230,7 +230,7 @@ const FOLLOW_ARGS = { request: { address: { kind: 'session', sessionId: 'session
  */
 let bootCounter = 0
 async function boot(opts = {}) {
-  const { shared = [], heartbeatMs, invoke, fingerprints, plugins, pluginBridge, apiFetch, parentOf } = opts
+  const { shared = [], workspaces, heartbeatMs, invoke, fingerprints, plugins, pluginBridge, apiFetch, parentOf } = opts
   const home = path.join(ROOT, `run-${bootCounter++}`)
   fs.mkdirSync(home, { recursive: true })
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
@@ -255,6 +255,9 @@ async function boot(opts = {}) {
     stream: async (call) => {
       const gate = makeGate(call)
       streams.push(gate)
+      if (workspaces !== undefined && call.namespace === 'workspace' && call.method === 'follow') {
+        gate.push({ type: 'baseline', value: { items: workspaces, archivedSessionIds: [], pinnedSessionIds: [] } })
+      }
       return gate.iterable
     },
     // T32: the two event surfaces — `$events` through the wire adapter, the
@@ -4090,5 +4093,368 @@ test('e2e MS-9: calls route BY serverId — invoke, stream and approval answers 
     await pool.stop()
     await stackOne.stop()
     await stackTwo.stop()
+  }
+})
+
+test('API-2 e2e: P0 endpoints and all 5 session-scoped $zr/events emits honor share boundaries', async () => {
+  const env = await boot({
+    shared: ['session-parent'],
+    invoke: async (call) => ({ echoed: `${call.namespace}/${call.method}` }),
+  })
+  const controller = new AbortController()
+  let handle
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const V = (id) => toVirtual(info.serverId, id)
+
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalEventsGateway(localGate)
+    handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    // Open merged $events stream
+    const merged = await localGateway.wireTap(
+      '$events',
+      { args: {} },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    )
+    const iterator = merged[Symbol.asyncIterator]()
+    localGate.push({ type: 'ready', clientId: 'local', host: { home: '/tmp' } })
+    await collectFrames(iterator, 1)
+    await waitFor(() => env.eventsGates.length === 1)
+
+    // 4 new session-scoped emits on shared session traverse & virtualize;
+    // emits for unshared session or malformed args are dropped server-side.
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/activity', args: ['session-secret', 999] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/activity', args: ['session-parent', 4242] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/error', args: ['session-parent', 'turn failed'] })
+    env.eventsGates[0].push({ type: 'emit', event: 'agent-preset/selected', args: ['session-parent', 'ptc'] })
+    env.eventsGates[0].push({ type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: 'session-secret' }] })
+    env.eventsGates[0].push({ type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: 'session-parent', goal: { title: 'Ship' } }] })
+
+    const emits = await collectFrames(iterator, 4)
+    assert.deepEqual(emits, [
+      { type: 'emit', event: 'api-session/activity', args: [V('session-parent'), 4242] },
+      { type: 'emit', event: 'api-session/error', args: [V('session-parent'), 'turn failed'] },
+      { type: 'emit', event: 'agent-preset/selected', args: [V('session-parent'), V('ptc')] },
+      { type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: V('session-parent'), goal: { title: 'Ship' } }] },
+    ])
+
+    // P0 invoke + stream checks over the real HTTP/NDJSON relay
+    const enableRes = await localGateway.rpcBridge('agentTeams/setEnabled', {
+      args: { agentId: V('session-parent'), enabled: true },
+    })
+    assert.equal(enableRes.ok, true)
+    assert.deepEqual(enableRes.value, { echoed: 'agentTeams/setEnabled' })
+    const recorded = env.invokeCalls.find((c) => c.namespace === 'agentTeams' && c.method === 'setEnabled')
+    assert.deepEqual(recorded?.args, { agentId: 'session-parent', enabled: true })
+
+    const deniedRes = await localGateway.rpcBridge('goals/create', {
+      args: { agentId: V('session-secret'), request: { title: 'x' } },
+    })
+    assert.equal(deniedRes.ok, false)
+    assert.equal(deniedRes.error.code, 'not-shared')
+
+    // toolResults/watch streams cleanly and dies with 'unshared' on unshare
+    const watchStream = await localGateway.wireTap(
+      'toolResults/watch',
+      { args: { request: { sessionId: V('session-parent'), toolCallId: 'tc-1' } } },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    )
+    const watchIter = watchStream[Symbol.asyncIterator]()
+    const firstPromise = watchIter.next()
+    await waitFor(() => env.streams.some((s) => s.call.namespace === 'toolResults' && s.call.method === 'watch'))
+    const watchGate = env.streams.find((s) => s.call.namespace === 'toolResults' && s.call.method === 'watch')
+    watchGate.push({ type: 'chunk', text: 'hello' })
+    const first = await firstPromise
+    assert.deepEqual(first.value, { type: 'chunk', text: 'hello' })
+
+    env.store.unshare('session-parent')
+    await assert.rejects(() => watchIter.next(), (err) => err && err.code === 'unshared')
+  } finally {
+    controller.abort()
+    handle?.uninstall()
+    await env.stop()
+  }
+})
+
+test('API-4 e2e: forgePanel/follow streams shared session and terminates with unshared; offline writes fail remote-offline', async () => {
+  const env = await boot({
+    shared: ['session-parent'],
+    invoke: async (call) => ({ ok: true, method: call.method }),
+  })
+  const controller = new AbortController()
+  let handle
+  try {
+    const info = await env.client.connect()
+    const V = (id) => toVirtual(info.serverId, id)
+    const localGateway = new LocalEventsGateway(makeLocalGate(controller.signal))
+    handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    const followStream = await localGateway.wireTap(
+      'forgePanel/follow',
+      { args: { sessionId: V('session-parent') } },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    )
+    const followIter = followStream[Symbol.asyncIterator]()
+    const firstPromise = followIter.next()
+    await waitFor(() => env.streams.some((s) => s.call.namespace === 'forgePanel' && s.call.method === 'follow'))
+    const gate = env.streams.find((s) => s.call.namespace === 'forgePanel' && s.call.method === 'follow')
+    gate.push({ type: 'state', branch: 'feat/x' })
+    assert.deepEqual((await firstPromise).value, { type: 'state', branch: 'feat/x' })
+
+    env.store.unshare('session-parent')
+    await assert.rejects(() => followIter.next(), (err) => err && err.code === 'unshared')
+
+    // Offline writes refuse locally without reaching relay
+    await env.killGateway()
+    await assert.rejects(() => env.client.invoke('session', 'page', FOLLOW_ARGS), (err) => err.code === 'offline')
+    assert.equal(env.client.state, 'offline')
+    for (const m of ['forgePanel/merge', 'forgePanel/refresh']) {
+      const res = await localGateway.rpcBridge(m, { args: { sessionId: V('session-parent') } })
+      assert.equal(res.ok, false)
+      assert.equal(res.error.code, 'remote-offline')
+    }
+  } finally {
+    controller.abort()
+    handle?.uninstall()
+    await env.stop()
+  }
+})
+
+test('API-5 e2e: forgePanel/changeRequestStates merges local + remote and tracks live share/unshare', async () => {
+  const env = await boot({
+    shared: ['s-shared'],
+    invoke: async (call) => {
+      if (call.namespace === 'session' && call.method === 'list') {
+        return {
+          items: [
+            {
+              sessionId: 's-shared',
+              projections: {
+                values: {
+                  forgeChangeRequests: [
+                    { url: 'https://gh/pr/1' },
+                    { url: 'https://gh/pr/dismissed', dismissed: true },
+                  ],
+                },
+              },
+            },
+            {
+              sessionId: 's-hidden',
+              projections: {
+                values: {
+                  forgeChangeRequests: [{ url: 'https://gh/pr/2' }],
+                },
+              },
+            },
+          ],
+        }
+      }
+      return { ok: true }
+    },
+  })
+  const controller = new AbortController()
+  let handle
+  try {
+    await env.client.connect()
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalEventsGateway(localGate)
+    const origOpen = localGateway.openWireStream.bind(localGateway)
+    localGateway.openWireStream = (endpoint, ...rest) =>
+      endpoint === 'forgePanel/changeRequestStates' ? localGate.iterable : origOpen(endpoint, ...rest)
+    handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    const stream = await localGateway.wireTap(
+      'forgePanel/changeRequestStates',
+      { args: {} },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    )
+    const iter = stream[Symbol.asyncIterator]()
+    const nextFrame = () => iter.next().then((r) => r.value)
+
+    const localPr = { url: 'https://gh/local', title: 'Local' }
+    const sharedPr = { url: 'https://gh/pr/1', title: 'Shared' }
+    const hiddenPr = { url: 'https://gh/pr/2', title: 'Hidden' }
+    const dismissedPr = { url: 'https://gh/pr/dismissed', title: 'Dismissed' }
+
+    localGate.push({ type: 'baseline', states: [localPr] })
+    assert.deepEqual(await nextFrame(), { type: 'baseline', states: [localPr] })
+
+    await waitFor(
+      () =>
+        env.streams.some((s) => s.call.namespace === 'forgePanel' && s.call.method === 'changeRequestStates') &&
+        env.streams.some((s) => s.call.namespace === 'session' && s.call.method === 'control'),
+    )
+    const remoteGate = env.streams.find((s) => s.call.namespace === 'forgePanel' && s.call.method === 'changeRequestStates')
+
+    remoteGate.push({ type: 'baseline', states: [sharedPr, hiddenPr, dismissedPr] })
+    assert.deepEqual(await nextFrame(), { type: 'changed', states: [sharedPr] })
+
+    // Live share unlocks hiddenPr immediately as changed
+    env.store.share('s-hidden')
+    assert.deepEqual(await nextFrame(), { type: 'changed', states: [hiddenPr] })
+
+    // Live unshare re-baselines keeping sharedPr + localPr while evicting hiddenPr
+    env.store.unshare('s-hidden')
+    assert.deepEqual(await nextFrame(), { type: 'baseline', states: [sharedPr, localPr] })
+  } finally {
+    controller.abort()
+    handle?.uninstall()
+    await env.stop()
+  }
+})
+
+test('API-6 e2e: workspace/insertSessionBefore, session/search, and agentPresets zero-share/select/create lifecycle', async () => {
+  const env = await boot({
+    shared: ['s-shared', 's-before'],
+    workspaces: [{ workspaceId: 'w-1', path: '/srv/w-1', title: 'Repo', sessionIds: ['s-before', 's-shared', 's-secret'] }],
+    invoke: async (call) => {
+      if (call.namespace === 'workspace' && call.method === 'list') {
+        return { items: [{ workspaceId: 'w-1', path: '/srv/w-1', title: 'Repo', sessionIds: ['s-before', 's-shared', 's-secret'] }] }
+      }
+      if (call.namespace === 'workspace' && call.method === 'insertSessionBefore') {
+        return {
+          workspace: {
+            workspaceId: 'w-1',
+            path: '/srv/w-1',
+            title: 'Repo',
+            sessionIds: ['s-shared', 's-before', 's-secret'],
+          },
+        }
+      }
+      if (call.namespace === 'session' && call.method === 'search') {
+        return {
+          items: [
+            { sessionId: 's-shared', title: 'Shared Hit' },
+            { sessionId: 's-secret', title: 'Secret Hit' },
+          ],
+          hasMore: true,
+        }
+      }
+      if (call.namespace === 'agentPresets' && call.method === 'list') {
+        return { presets: [{ id: 'ptc', isDefault: true }, { id: 'custom', name: '审计官', isDefault: false }] }
+      }
+      if (call.namespace === 'agentPresets' && call.method === 'read') {
+        return { agentPreset: call.args.agentPreset, content: 'Audit prompt' }
+      }
+      if (call.namespace === 'agentPresets' && call.method === 'select') {
+        return call.args.agentPreset
+      }
+      if (call.namespace === 'session' && call.method === 'create') {
+        return { sessionId: 's-created', agentPreset: call.args.request.agentPreset }
+      }
+      return { ok: true }
+    },
+  })
+  const controller = new AbortController()
+  let handle
+  try {
+    const info = await env.client.connect()
+    const V = (id) => toVirtual(info.serverId, id)
+    const localGateway = new LocalEventsGateway(makeLocalGate(controller.signal))
+    localGateway.dispatchRpc = async (endpoint) => {
+      if (endpoint === 'session/search') return { ok: true, value: { items: [{ sessionId: 'l-1', title: 'Local Hit' }], hasMore: false } }
+      if (endpoint === 'agentPresets/list') return { ok: true, value: { presets: [{ id: 'standard', isDefault: true }] } }
+      return { ok: true, value: undefined }
+    }
+    handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    // 1. workspace/insertSessionBefore allowed with shared beforeSessionId, unshared denied
+    const insertOk = await localGateway.rpcBridge('workspace/insertSessionBefore', {
+      args: { request: { workspaceId: V('w-1'), sessionId: V('s-shared'), beforeSessionId: V('s-before') } },
+    })
+    assert.equal(insertOk.ok, true)
+    assert.equal(insertOk.value.workspace.workspaceId, V('w-1'))
+    assert.deepEqual(insertOk.value.workspace.sessionIds, [V('s-shared'), V('s-before')])
+
+    const insertDenied = await localGateway.rpcBridge('workspace/insertSessionBefore', {
+      args: { request: { workspaceId: V('w-1'), sessionId: V('s-shared'), beforeSessionId: V('s-secret') } },
+    })
+    assert.equal(insertDenied.ok, false)
+    assert.equal(insertDenied.error.code, 'not-shared')
+
+    // 2. session/search merges local + shared remote hits and drops secret remote hits
+    const search = await localGateway.rpcBridge('session/search', { args: { request: { query: 'Hit' } } })
+    assert.deepEqual(search, {
+      ok: true,
+      value: {
+        items: [
+          { sessionId: 'l-1', title: 'Local Hit' },
+          { sessionId: V('s-shared'), title: 'Shared Hit' },
+        ],
+        hasMore: true,
+      },
+    })
+
+    // 3. agentPresets/list + read + select + session/create
+    const presets = await localGateway.rpcBridge('agentPresets/list', { args: {} })
+    assert.equal(presets.ok, true)
+    assert.equal(presets.value.presets.length, 3)
+    assert.equal(presets.value.presets[1].id, V('ptc'))
+    assert.equal(presets.value.presets[1].isDefault, false)
+    assert.match(presets.value.presets[1].name, /PTC 模式/)
+
+    const read = await localGateway.rpcBridge('agentPresets/read', { args: { agentPreset: V('custom') } })
+    assert.equal(read.ok, true)
+    assert.equal(read.value.agentPreset, V('custom'))
+    assert.equal(read.value.content, 'Audit prompt')
+
+    const selected = await localGateway.rpcBridge('agentPresets/select', {
+      args: { agentId: V('s-shared'), agentPreset: V('custom') },
+    })
+    assert.deepEqual(selected, { ok: true, value: V('custom') })
+
+    const created = await localGateway.rpcBridge('session/create', {
+      args: { request: { workspaceId: V('w-1'), agentPreset: V('ptc') } },
+    })
+    assert.deepEqual(created, { ok: true, value: { sessionId: V('s-created'), agentPreset: V('ptc') } })
+
+    // 4. Zero-shared-session privacy gate activates once all shared sessions are unshared
+    env.store.unshare('s-shared')
+    env.store.unshare('s-before')
+    env.store.unshare('s-created')
+    const listZero = await localGateway.rpcBridge('agentPresets/list', { args: {} })
+    assert.deepEqual(listZero, { ok: true, value: { presets: [{ id: 'standard', isDefault: true }] } })
+
+    const readZero = await localGateway.rpcBridge('agentPresets/read', { args: { agentPreset: V('custom') } })
+    assert.equal(readZero.ok, false)
+    assert.equal(readZero.error.code, 'not-shared')
+  } finally {
+    controller.abort()
+    handle?.uninstall()
+    await env.stop()
   }
 })

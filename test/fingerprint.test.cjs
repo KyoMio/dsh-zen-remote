@@ -386,3 +386,42 @@ test('compareFingerprints: hostile junk degrades to unavailable, never different
   assert.deepEqual(compareFingerprints(undefined, { session: 'r:aaa111' }).unavailable, ['session'])
   assert.deepEqual(compareFingerprints(undefined, undefined), { identical: [], different: [], unavailable: [] })
 })
+
+test('API-3: FINGERPRINT_GROUP_PACKAGES covers all 13 package groups + events = 14 keys with registry-tier hashing and unavailable fallback', async () => {
+  const expectedGroups = [
+    'session',
+    'workspace',
+    'job',
+    'files',
+    'subagent',
+    'goal',
+    'terminal',
+    'officeKit',
+    'agentTeam',
+    'userQuestions',
+    'actionCards',
+    'trajectory',
+    'forge',
+  ]
+  assert.deepEqual(Object.keys(FINGERPRINT_GROUP_PACKAGES), expectedGroups)
+
+  const fakeDescriptors = [
+    { id: '@deepseek-ai/dsh-experimental-client-ui-forge#forgePanel/follow', mode: 'stream' },
+    { id: '@deepseek-ai/dsh-agent-team#agentTeams/setEnabled', mode: 'invoke' },
+    { id: '@deepseek-ai/dsh-terminal#terminal/create', mode: 'invoke' },
+  ]
+  const fingerprints = await computeFingerprints({
+    reflect: { get: (name) => (name === 'typert' ? { local: { list: () => fakeDescriptors } } : undefined) },
+  })
+  assert.equal(Object.keys(fingerprints).length, 14)
+  assert.match(fingerprints.forge, /^r:[0-9a-f]{12}$/)
+  assert.match(fingerprints.agentTeam, /^r:[0-9a-f]{12}$/)
+  assert.match(fingerprints.terminal, /^r:[0-9a-f]{12}$/)
+  assert.equal(fingerprints.officeKit, FINGERPRINT_UNAVAILABLE)
+
+  const peerFingerprints = { ...fingerprints, officeKit: 'r:112233445566' }
+  const diff = compareFingerprints(fingerprints, peerFingerprints)
+  assert.equal(diff.different.length, 0)
+  assert.ok(diff.identical.includes('forge'))
+  assert.ok(diff.unavailable.includes('officeKit'))
+})

@@ -101,4 +101,22 @@ export interface WorkspaceFollowState {
     onShareChange(sessionId: string, isAccessible: Accessibility): Record<string, unknown>[];
 }
 export declare function createWorkspaceFollowState(): WorkspaceFollowState;
+export interface ForgeStatesState {
+    seedFromSessionList(listValue: unknown): void;
+    applyControlFrame(frame: unknown, isAccessible: Accessibility): Record<string, unknown>[];
+    filterUpstreamFrame(frame: unknown, isAccessible: Accessibility): Record<string, unknown> | null;
+    onShareChange(isAccessible: Accessibility): Record<string, unknown>[];
+}
+/**
+ * Tracks session -> non-dismissed `forgeChangeRequests` PR URL bindings plus all
+ * seen upstream change-request state records so `forgePanel/changeRequestStates`
+ * only exposes PR cards bound to currently accessible shared sessions.
+ */
+export declare function createForgeStatesState(): ForgeStatesState;
+/** Filter `workspace/insertSessionBefore`'s `WorkspaceValue` (`{ workspace }`)
+ * so `workspace.sessionIds` never reveals unshared session ids on the wire. */
+export declare function filterWorkspaceValueResult(value: unknown, isAccessible: Accessibility): unknown;
+/** Filter `session/search`'s `{ items, hasMore }` result so only hits whose
+ * `sessionId` passes `isAccessible` leave the server. */
+export declare function filterSessionSearchResult(value: unknown, isAccessible: Accessibility): unknown;
 //# sourceMappingURL=relay-filter.d.ts.map

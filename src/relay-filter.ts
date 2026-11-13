@@ -23,6 +23,8 @@
  * `projection`) come back unchanged.
  */
 
+import { controlProjectionChanges } from './merge-streams.js'
+
 /** The accessibility oracle: true when a session may travel to this client. */
 export type Accessibility = (sessionId: string) => boolean
 
@@ -289,4 +291,181 @@ export function createWorkspaceFollowState(): WorkspaceFollowState {
       return frames
     },
   }
+}
+
+function extractForgeBindingUrls(raw: unknown): Set<string> {
+  const urls = new Set<string>()
+  if (!Array.isArray(raw)) return urls
+  for (const item of raw) {
+    if (!isPlainObject(item)) continue
+    if (item.dismissed === true) continue
+    if (typeof item.url === 'string' && item.url !== '') urls.add(item.url)
+  }
+  return urls
+}
+
+export interface ForgeStatesState {
+  seedFromSessionList(listValue: unknown): void
+  applyControlFrame(frame: unknown, isAccessible: Accessibility): Record<string, unknown>[]
+  filterUpstreamFrame(frame: unknown, isAccessible: Accessibility): Record<string, unknown> | null
+  onShareChange(isAccessible: Accessibility): Record<string, unknown>[]
+}
+
+/**
+ * Tracks session -> non-dismissed `forgeChangeRequests` PR URL bindings plus all
+ * seen upstream change-request state records so `forgePanel/changeRequestStates`
+ * only exposes PR cards bound to currently accessible shared sessions.
+ */
+export function createForgeStatesState(): ForgeStatesState {
+  const bindingsBySession = new Map<string, Set<string>>()
+  const knownStates = new Map<string, Record<string, unknown>>()
+  let exposedUrls = new Set<string>()
+  let baselineSent = false
+
+  const setSessionBindings = (sessionId: string, urls: Set<string>): void => {
+    if (urls.size === 0) bindingsBySession.delete(sessionId)
+    else bindingsBySession.set(sessionId, urls)
+  }
+
+  const allowedUrls = (isAccessible: Accessibility): Set<string> => {
+    const allowed = new Set<string>()
+    for (const [sessionId, urls] of bindingsBySession) {
+      if (!isAccessible(sessionId)) continue
+      for (const url of urls) allowed.add(url)
+    }
+    return allowed
+  }
+
+  const reconcile = (isAccessible: Accessibility): Record<string, unknown>[] => {
+    if (!baselineSent) return []
+    const allowed = allowedUrls(isAccessible)
+    for (const url of exposedUrls) {
+      if (!allowed.has(url)) {
+        const nextExposed = new Set<string>()
+        const states: Record<string, unknown>[] = []
+        for (const [knownUrl, state] of knownStates) {
+          if (!allowed.has(knownUrl)) continue
+          nextExposed.add(knownUrl)
+          states.push(state)
+        }
+        exposedUrls = nextExposed
+        return [{ type: 'baseline', states }]
+      }
+    }
+    const unlocked: Record<string, unknown>[] = []
+    for (const [knownUrl, state] of knownStates) {
+      if (!allowed.has(knownUrl) || exposedUrls.has(knownUrl)) continue
+      exposedUrls.add(knownUrl)
+      unlocked.push(state)
+    }
+    return unlocked.length > 0 ? [{ type: 'changed', states: unlocked }] : []
+  }
+
+  return {
+    seedFromSessionList(listValue: unknown): void {
+      if (!isPlainObject(listValue) || !Array.isArray(listValue.items)) return
+      for (const item of listValue.items) {
+        if (!isPlainObject(item) || typeof item.sessionId !== 'string') continue
+        const values = isPlainObject(item.projections) && isPlainObject(item.projections.values)
+          ? item.projections.values
+          : isPlainObject(item.projectionValues)
+            ? item.projectionValues
+            : undefined
+        if (values !== undefined && Object.hasOwn(values, 'forgeChangeRequests')) {
+          setSessionBindings(item.sessionId, extractForgeBindingUrls(values.forgeChangeRequests))
+        }
+      }
+    },
+
+    applyControlFrame(frame: unknown, isAccessible: Accessibility): Record<string, unknown>[] {
+      if (!isPlainObject(frame)) return []
+      if (frame.type === 'baseline') {
+        const projections = isPlainObject(frame.value) && isPlainObject(frame.value.projections)
+          ? frame.value.projections
+          : undefined
+        if (projections === undefined) return []
+        for (const [sessionId, record] of Object.entries(projections)) {
+          if (!isPlainObject(record) || !isPlainObject(record.values)) continue
+          if (Object.hasOwn(record.values, 'forgeChangeRequests')) {
+            setSessionBindings(sessionId, extractForgeBindingUrls(record.values.forgeChangeRequests))
+          }
+        }
+        return reconcile(isAccessible)
+      }
+      if (frame.type === 'projection' && typeof frame.sessionId === 'string') {
+        const changes = controlProjectionChanges(frame)
+        if (changes === undefined) return []
+        let updated = false
+        for (const change of changes) {
+          if (change.key !== 'forgeChangeRequests') continue
+          setSessionBindings(frame.sessionId, extractForgeBindingUrls(change.value))
+          updated = true
+        }
+        return updated ? reconcile(isAccessible) : []
+      }
+      return []
+    },
+
+    filterUpstreamFrame(frame: unknown, isAccessible: Accessibility): Record<string, unknown> | null {
+      if (!isPlainObject(frame)) return null
+      if ((frame.type !== 'baseline' && frame.type !== 'changed') || !Array.isArray(frame.states)) return null
+      const validStates: Record<string, unknown>[] = []
+      for (const state of frame.states) {
+        if (isPlainObject(state) && typeof state.url === 'string' && state.url !== '') {
+          validStates.push(state)
+        }
+      }
+      if (frame.type === 'baseline') {
+        knownStates.clear()
+        for (const state of validStates) knownStates.set(state.url as string, state)
+        baselineSent = true
+        const allowed = allowedUrls(isAccessible)
+        const visible: Record<string, unknown>[] = []
+        const nextExposed = new Set<string>()
+        for (const state of validStates) {
+          const url = state.url as string
+          if (!allowed.has(url)) continue
+          nextExposed.add(url)
+          visible.push(state)
+        }
+        exposedUrls = nextExposed
+        return { ...frame, type: 'baseline', states: visible }
+      }
+      for (const state of validStates) knownStates.set(state.url as string, state)
+      if (!baselineSent) return null
+      const allowed = allowedUrls(isAccessible)
+      const visible: Record<string, unknown>[] = []
+      for (const state of validStates) {
+        const url = state.url as string
+        if (!allowed.has(url)) continue
+        exposedUrls.add(url)
+        visible.push(state)
+      }
+      return visible.length > 0 ? { ...frame, type: 'changed', states: visible } : null
+    },
+
+    onShareChange(isAccessible: Accessibility): Record<string, unknown>[] {
+      return reconcile(isAccessible)
+    },
+  }
+}
+
+/** Filter `workspace/insertSessionBefore`'s `WorkspaceValue` (`{ workspace }`)
+ * so `workspace.sessionIds` never reveals unshared session ids on the wire. */
+export function filterWorkspaceValueResult(value: unknown, isAccessible: Accessibility): unknown {
+  if (!isPlainObject(value) || !isPlainObject(value.workspace)) return value
+  return { ...value, workspace: accessibleWorkspace(value.workspace, isAccessible) }
+}
+
+/** Filter `session/search`'s `{ items, hasMore }` result so only hits whose
+ * `sessionId` passes `isAccessible` leave the server. */
+export function filterSessionSearchResult(value: unknown, isAccessible: Accessibility): unknown {
+  if (!isPlainObject(value) || !Array.isArray(value.items)) return value
+  const items: unknown[] = []
+  for (const item of value.items) {
+    if (!isPlainObject(item) || typeof item.sessionId !== 'string') continue
+    if (!isAccessible(item.sessionId)) continue
+    items.push(item)
+  }
+  return { ...value, items, hasMore: Boolean(value.hasMore) }
 }
