@@ -29,9 +29,20 @@ export declare function switchToPeerRole(ctx: CliExecutionContext): Promise<bool
  * [--no-wait] [--json]` — the full join flow: the role gate (with the
  * `--yes` / interactive switch that keeps the gateway channel alive), the
  * invite link, the optional display name, the join POST, and the bounded
- * wait for the gateway admission (pending-approval keeps waiting unless
- * `--no-wait`; revoked fails; timeout reports the still-pending state as
- * success with progress kept).
+ * wait for REAL readiness (PC-14b): only authorized + sync.ready exits 0
+ * with the three lights green; revoked / paused / mismatch / an identity
+ * block fail immediately; the budget ends non-zero with the last actual
+ * state; `--no-wait` claims `submitted` only (JSON names `submitted` and
+ * `ready` apart); Ctrl-C ends bounded with the 130 convention, keeping the
+ * submitted request's progress — never a leave.
+ *
+ * Fix1 hardening: the cancel signal and the hard wall-clock deadline cut the
+ * IN-FLIGHT status request itself (the socket idle timeout is not a wall
+ * clock — a slow drip of legal bytes keeps resetting it), a ready answer
+ * that lands past the deadline counts for nothing, the third light obeys
+ * the same verdict the exit code will, and `--json` runs print exactly one
+ * JSON document on stdout with every human line on stderr — failures
+ * included (`ok:false` / `submitted` / `ready:false` / `reason`).
  */
 export declare function runPeerJoinCommand(ctx: CliExecutionContext): Promise<number>;
 /**

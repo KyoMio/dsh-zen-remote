@@ -24,6 +24,10 @@ export interface CliExecutionContext {
   /** The ask-everything funnel; present whenever the run may prompt. */
   prompter?: CliPrompter
   stdout: { write(text: string): void }
+  /** `--json` runs' human-line sink (PC-14b-fix1): stdout keeps the single
+   * JSON document, every human copy line rides stderr; commands default to
+   * `process.stderr` when the entry point leaves this unset. */
+  stderr?: { write(text: string): void }
   /** Clock for the `status --debug` default filename; default `new Date()`. */
   now?: () => Date
   /** Working directory for that default path; default `process.cwd()`. */
