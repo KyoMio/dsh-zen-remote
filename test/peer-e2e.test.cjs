@@ -2491,8 +2491,8 @@ test('PC-12: WS relay handshake with a legacy-only peer completes at the v1 leve
 //   #2 REST 全局容量热改：PATCH /admin/settings 运行时改配额/默认席位并即时生效；
 //   #3 生产默认计时 60s 自动重探（本文件唯一的有界长测试，全程 ~70s 真实时钟）；
 //   #4 relay→direct 方向的上传中热切，SHA256 全程一致（direct→relay 由 PC-05 覆盖）。
-// 计时说明：startNode 的 punch 缺省 {1000,100,10,60_000} 与 src/peer/punch.ts
-// 生产旋钮（523-528 行）逐值相同——用例不另改计时参数，观测到的区间即默认值行为。
+// 计时说明：startNode 不注入 punch 旋钮；默认计时用例直接使用
+// src/peer/punch.ts 的生产缺省值，不靠测试中的等值配置替代缺省接线。
 
 test('PC-V1 #1: REST pause 把在线成员降为受限控制连接，resume 原地恢复互通', async () => {
   const gw = await startGateway()
