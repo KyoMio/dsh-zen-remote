@@ -11,7 +11,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createWorkspaceMerger, createControlMerger, mergeSessionList, mergeModelCatalogs, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue, localWorkspaceLists, composeMergedWorkspaceFrames } = require('../lib/merge-streams.js')
+const { createWorkspaceMerger, createControlMerger, createForgeStatesMerger, mergeSessionList, mergeModelCatalogs, mergeSessionSearch, mergeAgentPresetRosters, resolveRemotePresetName, virtualizeProjectionValue, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue, localWorkspaceLists, composeMergedWorkspaceFrames } = require('../lib/merge-streams.js')
 const { toVirtual, VIRTUAL_GROUP_NAME_MARK, encodeServerIdZeroWidth, decodeServerIdZeroWidth } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
@@ -1822,4 +1822,81 @@ test('MS-3 composeMergedWorkspaceFrames(): local first, then each server\'s cont
   assert.deepEqual(empty.archived, { type: 'archived', archivedSessionIds: ['l-arch'] })
   assert.deepEqual(empty.pinned, { type: 'pinned', pinnedSessionIds: ['l-pin'] })
   assert.deepEqual(empty.workspaces, [])
+})
+
+test('API-5 createForgeStatesMerger(): holds until local baseline, folds remote baselines as changed, and re-baselines on prune/disconnect', () => {
+  const m = createForgeStatesMerger()
+  const r1 = { url: 'https://github.com/org/repo/pull/1', status: 'open' }
+  const r2 = { url: 'https://github.com/org/repo/pull/2', status: 'open' }
+  const r3 = { url: 'https://github.com/org/repo/pull/3', status: 'merged' }
+  const l1 = { url: 'https://github.com/org/repo/pull/10', status: 'open' }
+  const lOverride = { url: 'https://github.com/org/repo/pull/1', status: 'local-wins' }
+
+  // Remote before local is cached silently until local baseline arrives
+  assert.deepEqual(m.onRemote('srv-1', { type: 'baseline', states: [r1] }), [])
+  assert.deepEqual(m.onLocal({ type: 'changed', states: [l1] }), [], 'changed before local baseline ignored')
+
+  // First local baseline composes cached remote + local (local wins on URL collision)
+  const initOut = m.onLocal({ type: 'baseline', states: [l1, lOverride] })
+  assert.equal(initOut.length, 1)
+  assert.equal(initOut[0].type, 'baseline')
+  assert.deepEqual(initOut[0].states, [lOverride, l1])
+
+  // Non-shrinking remote baseline from another server turns into changed
+  assert.deepEqual(m.onRemote('srv-2', { type: 'baseline', states: [r3] }), [
+    { type: 'changed', states: [r3] },
+  ])
+
+  // Expanding baseline on srv-1 turns into changed, suppressing local-owned PR URL
+  assert.deepEqual(m.onRemote('srv-1', { type: 'baseline', states: [r1, r2] }), [
+    { type: 'changed', states: [r2] },
+  ])
+
+  // Shrinking baseline on srv-1 re-baselines with srv-2 + local preserved (composedStates map order)
+  const prunedOut = m.onRemote('srv-1', { type: 'baseline', states: [r2] })
+  assert.equal(prunedOut.length, 1)
+  assert.equal(prunedOut[0].type, 'baseline')
+  assert.deepEqual(prunedOut[0].states, [r2, r3, l1, lOverride])
+
+  // srv-1 gone evicts srv-1 only and preserves srv-2 + local
+  const goneOut = m.onRemoteGone('srv-1')
+  assert.deepEqual(goneOut, [{ type: 'baseline', states: [r3, l1, lOverride] }])
+  assert.deepEqual(m.onRemoteGone('srv-1'), [], 'second onRemoteGone is no-op')
+})
+
+test('API-6 mergeSessionSearch, mergeAgentPresetRosters & agentPreset projection virtualization', () => {
+  const searched = mergeSessionSearch(
+    { items: [{ sessionId: 'l1', title: 'Local' }], hasMore: false },
+    { items: [{ sessionId: 's1', title: 'Remote' }, { bad: true }], hasMore: true },
+    SID,
+  )
+  assert.deepEqual(searched, {
+    items: [
+      { sessionId: 'l1', title: 'Local' },
+      { sessionId: V('s1'), title: 'Remote' },
+    ],
+    hasMore: true,
+  })
+
+  assert.equal(resolveRemotePresetName('standard', undefined, NAME, 'zh'), `[${NAME}] 标准模式`)
+  assert.equal(resolveRemotePresetName('cordis', undefined, NAME, 'en'), `[${NAME}] Creator mode`)
+  assert.equal(resolveRemotePresetName('custom', 'SpecWriter', NAME, 'en'), `[${NAME}] SpecWriter`)
+
+  const mergedPresets = mergeAgentPresetRosters(
+    { presets: [{ id: 'standard', isDefault: true }] },
+    { presets: [{ id: 'standard', isDefault: true }, { id: 'ptc', isDefault: false }, { id: 'custom', name: '审计' }] },
+    { serverId: SID, serverName: NAME },
+    'zh',
+  )
+  assert.deepEqual(mergedPresets, {
+    presets: [
+      { id: 'standard', isDefault: true },
+      { id: V('standard'), name: `[${NAME}] 标准模式`, isDefault: false },
+      { id: V('ptc'), name: `[${NAME}] PTC 模式`, isDefault: false },
+      { id: V('custom'), name: `[${NAME}] 审计`, isDefault: false },
+    ],
+  })
+
+  assert.equal(virtualizeProjectionValue('agentPreset', 'ptc', SID), V('ptc'))
+  assert.equal(virtualizeProjectionValue('agentPreset', '', SID), '')
 })

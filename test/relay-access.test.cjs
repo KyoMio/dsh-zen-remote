@@ -24,28 +24,25 @@ test('decideInvoke: the three reviewer bypass requests are forbidden-method, dec
   // ('S-shared') padded into fields the method does not own must not matter,
   // because the METHODS are not registered at all.
   assert.deepEqual(
-    decideInvoke('session', 'search', { request: { query: 'password', sessionId: 'S-shared' } }, only(['S-shared'])),
+    decideInvoke('schedule', 'update', { request: { id: 's1', sessionId: 'S-shared' } }, only(['S-shared'])),
     { allow: false, reason: 'forbidden-method' },
-    'session/search is located by query, not by any session id',
+    'schedule/update is not registered, even with a decoy shared sessionId',
   )
   assert.deepEqual(
-    decideInvoke('goals', 'create', { agentId: 'VICTIM', request: { objective: 'x', maxGoalRounds: 3, sessionId: 'S-shared' } }, only(['S-shared'])),
+    decideInvoke('dynamicCordisRunner', 'invoke', { agentId: 'VICTIM', request: { sessionId: 'S-shared' } }, only(['S-shared'])),
     { allow: false, reason: 'forbidden-method' },
-    'goals/create is located by a top-level agentId — still unregistered (no ownership story)',
+    'dynamicCordisRunner/invoke is located by a top-level agentId — still unregistered (no ownership story)',
   )
 })
 
 test('decideInvoke: any unregistered method refuses, with or without a request object', () => {
   for (const [namespace, method, args] of [
     ['settings', 'update', { ns: 'x', patch: {} }],
-    // T41a registered the goals bar, commands, the preset switches, the
-    // workspace-files group and the whole terminal half — the REST of those
+    // T41a / API-2 registered the goals bar, commands, the preset switches,
+    // the workspace-files group and the whole terminal half — the REST of those
     // namespaces stay closed (global data, third-party surfaces, or calls
     // the panels do not make remotely).
-    ['goals', 'create', { agentId: 'VICTIM', request: {} }],
-    ['goals', 'complete', { agentId: 'VICTIM', ref: {} }],
-    ['agentPresets', 'list', {}],
-    ['agentPresets', 'read', { agentPreset: 'p' }],
+    ['goals', 'remove', { agentId: 'VICTIM', request: {} }],
     ['permissionPresets', 'catalog', {}],
     ['dynamicCordisRunner', 'invoke', { agentId: 'VICTIM', request: {} }],
     ['schedule', 'delete', { request: { id: 's1', sessionId: 'S-shared' } }],
@@ -309,20 +306,32 @@ test('decideInvoke: missing, empty, or non-string field values are no-session', 
 
 // -- registered methods: request.address field --------------------------------------
 
-test('decideInvoke: address kind session uses sessionId, subagent uses parentSessionId', () => {
+test('decideInvoke: address kind session uses sessionId, subagent checks childSessionId + optional parentSessionId', () => {
   const shared = ['S-parent', 'S-direct']
+  const family = (roots, child) => (id) => roots.includes(id) || id === child
   assert.deepEqual(
     decideInvoke('session', 'page', { request: { address: { kind: 'session', sessionId: 'S-direct' }, throughSeq: 5 } }, only(shared)),
     { allow: true },
   )
   assert.deepEqual(
-    decideInvoke('session', 'page', { request: { address: { kind: 'subagent', parentSessionId: 'S-parent', childSessionId: 'S-child', mode: 'continuable' } } }, only(shared)),
+    decideInvoke('session', 'page', { request: { address: { kind: 'subagent', parentSessionId: 'S-parent', childSessionId: 'S-child', mode: 'continuable' } } }, family(shared, 'S-child')),
     { allow: true },
-    'a subagent call judges by its parent; DSH validates the parent-child link',
+    'both parent and child are accessible when child inherits parent share',
   )
   assert.deepEqual(
-    decideInvoke('session', 'page', { request: { address: { kind: 'subagent', parentSessionId: 'VICTIM' } } }, only(shared)),
+    decideInvoke('session', 'page', { request: { address: { kind: 'subagent', childSessionId: 'S-child' } } }, family(shared, 'S-child')),
+    { allow: true },
+    '0.2.2-rc.2 subagent address may omit parentSessionId and checks childSessionId',
+  )
+  assert.deepEqual(
+    decideInvoke('session', 'page', { request: { address: { kind: 'subagent', parentSessionId: 'S-parent', childSessionId: 'S-foreign', mode: 'continuable' } } }, family(shared, 'S-child')),
     { allow: false, reason: 'not-shared' },
+    'shared parent cannot smuggle a foreign child in address',
+  )
+  assert.deepEqual(
+    decideInvoke('session', 'page', { request: { address: { kind: 'subagent', parentSessionId: 'VICTIM', childSessionId: 'S-child' } } }, family(shared, 'S-child')),
+    { allow: false, reason: 'not-shared' },
+    'when parentSessionId is supplied, it is still share-checked',
   )
   assert.deepEqual(
     decideInvoke('session', 'page', { request: { address: { kind: 'session', sessionId: 'VICTIM' } } }, only(shared)),
@@ -337,9 +346,10 @@ test('decideInvoke: unknown address kinds and missing address ids are no-session
     { sessionId: 'S-x' },
     {},
     { kind: 'session' },
-    { kind: 'subagent', childSessionId: 'S-child' },
-    { kind: 'subagent', parentSessionId: '' },
-    { kind: 'subagent', parentSessionId: 3 },
+    { kind: 'subagent', parentSessionId: 'S-parent' },
+    { kind: 'subagent', childSessionId: '' },
+    { kind: 'subagent', parentSessionId: '', childSessionId: 'S-child' },
+    { kind: 'subagent', parentSessionId: 3, childSessionId: 'S-child' },
   ]) {
     assert.deepEqual(
       decideInvoke('session', 'page', { request: { address } }, yes),
@@ -401,7 +411,10 @@ test('decideInvoke: subagents/prompt checks parent AND child (child via ancestor
     decideInvoke('subagents', 'prompt', { request: { parentSessionId: 'VICTIM', childSessionId: 'S-shared' } }, only(['S-shared'])),
     { allow: false, reason: 'not-shared' },
   )
-  assert.deepEqual(decideInvoke('subagents', 'prompt', { request: { childSessionId: 'C' } }, yes), { allow: false, reason: 'no-session' })
+  assert.deepEqual(decideInvoke('subagents', 'prompt', { request: { childSessionId: 'S-child' } }, family(['S-parent'], 'S-child')), { allow: true })
+  assert.deepEqual(decideInvoke('subagents', 'prompt', { request: { childSessionId: 'S-foreign' } }, family(['S-parent'], 'S-child')), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideInvoke('subagents', 'prompt', { request: { childSessionId: 'C', parentSessionId: '' } }, yes), { allow: false, reason: 'no-session' })
+  assert.deepEqual(decideInvoke('subagents', 'prompt', { request: { parentSessionId: 'S-parent' } }, yes), { allow: false, reason: 'no-session' })
 })
 
 test('decideInvoke: subagents/interruptByParent reads BOTH top-level ids', () => {
@@ -788,4 +801,103 @@ test('decideHttpRoute: whitelisted parameters only, fixed order, garbage coordin
   // Percent-encoded key names decode like any other query text: two reads
   // of the same key are duplicates, not a decoy and a pass.
   assert.deepEqual(decideHttpRoute('changes.diff', 'sessionId=S-shared&%73essionId=S-secret&seq=1', yes), { allow: false, reason: 'no-session' })
+})
+
+test('API-2: P0 session-scoped endpoints enforce invoke/stream mode and session ownership', () => {
+  for (const [ns, method, args] of [
+    ['agentTeams', 'setEnabled', { agentId: 'S-shared', enabled: true }],
+    ['userQuestions', 'answer', { agentId: 'S-shared', callId: 'c1', answer: {} }],
+    ['actionCards', 'act', { agentId: 'S-shared', callId: 'c1', verb: 'confirm' }],
+    ['pluginRecommendations', 'describe', { agentId: 'S-shared', callId: 'c1' }],
+    ['goals', 'create', { agentId: 'S-shared', request: { title: 'g' } }],
+    ['goals', 'complete', { agentId: 'S-shared', ref: { id: 'g1' } }],
+  ]) {
+    assert.deepEqual(decideInvoke(ns, method, args, only(['S-shared'])), { allow: true }, `${ns}/${method}`)
+    assert.deepEqual(decideInvoke(ns, method, args, only([])), { allow: false, reason: 'not-shared' }, `${ns}/${method} unshared`)
+    assert.deepEqual(decideStream(ns, method, args, yes), { allow: false, reason: 'forbidden-method' }, `${ns}/${method} stream`)
+  }
+  for (const [ns, method, args] of [
+    ['userQuestions', 'attachWait', { agentId: 'S-shared', callId: 'c1' }],
+    ['toolResults', 'watch', { request: { sessionId: 'S-shared', toolCallId: 'c1' } }],
+  ]) {
+    assert.deepEqual(decideStream(ns, method, args, only(['S-shared'])), { allow: true, sessionIds: ['S-shared'] }, `${ns}/${method}`)
+    assert.deepEqual(decideStream(ns, method, args, only([])), { allow: false, reason: 'not-shared' }, `${ns}/${method} unshared`)
+    assert.deepEqual(decideInvoke(ns, method, args, yes), { allow: false, reason: 'forbidden-method' }, `${ns}/${method} invoke`)
+  }
+})
+
+test('API-4: 31 session-scoped forgePanel endpoints validate top-level sessionId and mode', () => {
+  const shared = { sessionId: 'S-shared' }
+  const secret = { sessionId: 'S-secret' }
+  assert.deepEqual(decideStream('forgePanel', 'follow', shared, only(['S-shared'])), { allow: true, sessionIds: ['S-shared'] })
+  assert.deepEqual(decideStream('forgePanel', 'follow', secret, only(['S-shared'])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideInvoke('forgePanel', 'follow', shared, yes), { allow: false, reason: 'forbidden-method' })
+
+  const unary = [
+    'branches',
+    'diffBases',
+    'localCommits',
+    'localDiff',
+    'localText',
+    'changeRequestChecks',
+    'changeRequestCommits',
+    'changeRequestDiff',
+    'changeRequestReview',
+    'changeRequestText',
+    'changeRequestViewed',
+    'reviewerCandidates',
+    'requestWorktree',
+    'cancelWorktree',
+    'continueInProject',
+    'restoreWorktree',
+    'retryWorktree',
+    'stopCreation',
+    'worktreeCleanup',
+    'refresh',
+    'track',
+    'dismiss',
+    'setFileViewed',
+    'changeRequestReviewWrite',
+    'submitReview',
+    'requestReviews',
+    'rerunChecks',
+    'markReady',
+    'updateBranch',
+    'merge',
+  ]
+  assert.equal(unary.length, 30)
+  for (const method of unary) {
+    assert.deepEqual(decideInvoke('forgePanel', method, shared, only(['S-shared'])), { allow: true }, method)
+    assert.deepEqual(decideInvoke('forgePanel', method, secret, only(['S-shared'])), { allow: false, reason: 'not-shared' }, `${method} unshared`)
+    assert.deepEqual(decideInvoke('forgePanel', method, { request: shared }, yes), { allow: false, reason: 'no-session' }, `${method} wrong nesting`)
+    assert.deepEqual(decideStream('forgePanel', method, shared, yes), { allow: false, reason: 'forbidden-method' }, `${method} stream`)
+  }
+})
+
+test('API-6: workspace/insertSessionBefore, session/search, and agentPresets/list|read access decisions', () => {
+  // workspace/insertSessionBefore: required workspaceId + sessionId; optional beforeSessionId
+  assert.deepEqual(
+    decideInvoke('workspace', 'insertSessionBefore', { request: { workspaceId: 'w-1', sessionId: 'S-a' } }, only(['S-a'])),
+    { allow: true, filter: 'workspace-value' },
+  )
+  assert.deepEqual(
+    decideInvoke('workspace', 'insertSessionBefore', { request: { workspaceId: 'w-1', sessionId: 'S-a', beforeSessionId: 'S-b' } }, only(['S-a', 'S-b'])),
+    { allow: true, filter: 'workspace-value' },
+  )
+  assert.deepEqual(
+    decideInvoke('workspace', 'insertSessionBefore', { request: { workspaceId: 'w-1', sessionId: 'S-a', beforeSessionId: 'S-secret' } }, only(['S-a'])),
+    { allow: false, reason: 'not-shared' },
+  )
+  assert.deepEqual(
+    decideInvoke('workspace', 'insertSessionBefore', { request: { sessionId: 'S-a' } }, yes),
+    { allow: false, reason: 'no-session' },
+  )
+
+  // session/search, agentPresets/list, agentPresets/read
+  assert.deepEqual(
+    decideInvoke('session', 'search', { request: { query: 'auth' } }, no),
+    { allow: true, filter: 'session-search' },
+  )
+  assert.deepEqual(decideInvoke('agentPresets', 'list', {}, no), { allow: true })
+  assert.deepEqual(decideInvoke('agentPresets', 'read', { agentPreset: 'standard' }, no), { allow: true })
 })
