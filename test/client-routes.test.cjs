@@ -16,6 +16,7 @@
 'use strict'
 const { test, before, after } = require('node:test')
 const assert = require('node:assert')
+const fs = require('node:fs')
 const http = require('node:http')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
@@ -2673,6 +2674,9 @@ test('PG-9 status: the mapped peer list rides without any key material', async (
       networkId: '0123456789abcdef',
       gatewayOrigin: 'http://10.0.0.1:4088',
       maxPeers: 8,
+      maxServers: 8,
+      mountedCount: 1,
+      limitReached: false,
       peers: [
         { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 },
         { nodeId: 'bbbb2222', name: '客厅电脑', mounted: false, path: 'offline', rttMs: null },
@@ -2704,6 +2708,122 @@ test('PG-9 status: an engine with no network answers configured:false and no net
     assert.equal(body.gatewayState, 'unconfigured')
     assert.ok(!('networkId' in body), 'no network id when unconfigured')
     assert.ok(!('gatewayOrigin' in body), 'no gateway origin when unconfigured')
+    // PC-11a: the LOCAL mount facts stay precise even with no network — the
+    // local cap (the historic default without a pool), zero mounts, open limit.
+    assert.equal(body.maxPeers, null, 'the raw network count stays unknown while unjoined')
+    assert.equal(body.maxServers, 8)
+    assert.equal(body.mountedCount, 0)
+    assert.equal(body.limitReached, false)
+  } finally {
+    await closeServer(server)
+  }
+})
+
+// ---- PC-11a: the capacity facts (maxServers / mountedCount / limitReached) -----
+// peer/status joins client/status in reporting the SAME effective mount cap —
+// `effectiveMaxServers`, i.e. pool.maxServers(), the one synthesis point —
+// while `maxPeers` keeps its raw network-total meaning (includes this node).
+// mountedCount counts THIS machine's actual mounts (the engine's own mounted
+// flags), never the discovered-online rows and never the network's seats.
+
+test('PC-11a status: maxServers matches client/status over the same pool', async () => {
+  const { engine } = makePeerEngine()
+  // The pool synthesizes 12 (peer mode, gateway cap) while the config says 8 —
+  // the production-same-style seam the PG-2-fix tests already pin for the
+  // client/status side; BOTH routes must answer the pool's number.
+  const wide = fakePool([], { maxServers: () => 12 })
+  const { server, port } = await startClientServer(makeRow(), { pool: wide, getMaxServers: () => 8, getPeerEngine: () => engine })
+  try {
+    const client = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    const peer = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(JSON.parse(client.body).maxServers, 12, 'client/status reads the pool synthesis')
+    assert.equal(JSON.parse(peer.body).maxServers, 12, 'peer/status reads the very same synthesis')
+    assert.equal(JSON.parse(peer.body).maxPeers, 8, 'raw maxPeers keeps the network total including self')
+  } finally {
+    await closeServer(server)
+  }
+
+  // Reversed: config says 16, the pool synthesizes 4 — the tight one wins on both.
+  const tight = fakePool([], { maxServers: () => 4 })
+  const { server: server2, port: port2 } = await startClientServer(makeRow(), { pool: tight, getMaxServers: () => 16, getPeerEngine: () => engine })
+  try {
+    const client = await request(port2, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    const peer = await request(port2, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(JSON.parse(client.body).maxServers, 4)
+    assert.equal(JSON.parse(peer.body).maxServers, 4)
+  } finally {
+    await closeServer(server2)
+  }
+})
+
+test('PC-11a status: mountedCount counts actual mounts, not the discovered rows', async () => {
+  const { engine } = makePeerEngine({
+    status: {
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      maxPeers: 8,
+      natType: 'cone',
+      peers: [
+        { nodeId: 'aaaa1111', name: '书房电脑', state: 'eligible', path: 'lan', rttMs: 3, mounted: true },
+        // discovered and online-ish, but NOT mounted — no seat on this machine
+        { nodeId: 'bbbb2222', name: '客厅电脑', state: 'eligible', path: 'relay', rttMs: null, mounted: false },
+        // the path fell offline, yet the mount itself is still up — still mounted
+        { nodeId: 'cccc3333', name: '断线还挂着的机器', state: 'eligible', path: 'none', rttMs: null, mounted: true },
+        { nodeId: 'dddd4444', name: '被我忽略的机器', state: 'disabled', path: 'none', rttMs: null, mounted: false },
+      ],
+    },
+  })
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.peers.length, 4, 'all four devices are discovered')
+    assert.equal(body.mountedCount, 2, 'exactly the two mounted flags count — not the two eligible rows')
+    assert.equal(body.maxServers, 8)
+    assert.equal(body.limitReached, false, '2 of 8 — room left')
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PC-11a status: limitReached follows the live pool cap; an over-cap stock stays visible', async () => {
+  const { engine } = makePeerEngine({
+    status: {
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      maxPeers: 8,
+      natType: 'cone',
+      peers: [
+        { nodeId: 'aaaa1111', name: '书房电脑', state: 'eligible', path: 'lan', rttMs: 3, mounted: true },
+        { nodeId: 'cccc3333', name: '客厅电脑', state: 'eligible', path: 'p2p', rttMs: 9, mounted: true },
+      ],
+    },
+  })
+  let cap = 2
+  const pool = fakePool([], { maxServers: () => cap })
+  const { server, port } = await startClientServer(makeRow(), { pool, getPeerEngine: () => engine })
+  try {
+    const full = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(JSON.parse(full.body).limitReached, true, '2 mounts of a 2 cap — full')
+    assert.equal(JSON.parse(full.body).mountedCount, 2)
+
+    // The cap is read per request: a hot config change (or a network cap
+    // broadcast) reaches the very next status answer without any reload.
+    cap = 5
+    const grown = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(JSON.parse(grown.body).maxServers, 5)
+    assert.equal(JSON.parse(grown.body).limitReached, false, 'the same 2 mounts now have room')
+
+    // A downscale never evicts the mounted stock (mountPeer only gates new
+    // mounts) — the excess stock stays visible and still reads as reached.
+    cap = 1
+    const shrunk = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(JSON.parse(shrunk.body).maxServers, 1)
+    assert.equal(JSON.parse(shrunk.body).mountedCount, 2, 'both mounts survive the shrink')
+    assert.equal(JSON.parse(shrunk.body).limitReached, true, '2 >= 1 — over-cap stock reads as reached')
   } finally {
     await closeServer(server)
   }
@@ -2718,6 +2838,158 @@ test('PG-9 status: no engine wired answers 503 peer-unavailable', async () => {
   } finally {
     await closeServer(server)
   }
+})
+
+// ---- PC-11a-fix1: the capacity facts over a REAL RelayPool ---------------------
+// The fakePool getter overrides prove delegation; only a REAL createRelayPool
+// proves the production synthesis itself. One real pool over a real
+// (temporary) state file — under .scratch/pc-11a, never /tmp — drives BOTH
+// routes: every capacity number must equal the pool's own live answer, never
+// a preset. The fake engine snapshot still carries the mounted rows and the
+// RAW network total; the fake relay clients are the same seam
+// relay-pool.test.cjs drives pair() with.
+
+/** A compact fake createRelayClient: the handshake answers from `env` keyed
+ * `url|token` (a miss means transport failure → offline). Same shape the
+ * real pool's pair()/status paths consume. */
+function makeRealPoolClientFactory(env) {
+  return (options) => ({
+    options,
+    state: 'unpaired',
+    handshakeInfo: undefined,
+    lastError: undefined,
+    nextRetryAt: null,
+    compat: undefined,
+    deviceNameSyncing: false,
+    stopped: false,
+    listeners: new Set(),
+    subscribe(listener) {
+      this.listeners.add(listener)
+      return () => this.listeners.delete(listener)
+    },
+    notify() {
+      for (const listener of [...this.listeners]) listener(this.state)
+    },
+    async connect() {
+      if (this.stopped) throw new Error('stopped')
+      const answer = env.get(`${this.options.getServerUrl()}|${this.options.getToken()}`)
+      if (answer === undefined) {
+        this.state = 'offline'
+        this.lastError = 'offline'
+        this.notify()
+        throw new Error('offline')
+      }
+      this.handshakeInfo = { relayProtocol: 1, serverId: answer.serverId, serverName: answer.serverName, dshVersion: 'test', fingerprints: {} }
+      this.state = 'online'
+      this.notify()
+      return this.handshakeInfo
+    },
+    reconnect() {
+      if (this.state !== 'offline' || this.stopped) return false
+      void this.connect().catch(() => {})
+      return true
+    },
+    probeHealth() {
+      return env.has(`${this.options.getServerUrl()}|${this.options.getToken()}`)
+    },
+    networkRestored() {
+      if (this.state !== 'offline' || this.stopped) return false
+      void this.connect().catch(() => {})
+      return true
+    },
+    credentialsChanged() {
+      void this.connect().catch(() => {})
+    },
+    queueDeviceName() {},
+    stop() {
+      this.stopped = true
+    },
+  })
+}
+
+/** Let the real pool's fire-and-forget connect() promises settle. */
+async function settlePool(rounds = 6) {
+  for (let i = 0; i < rounds; i += 1) await new Promise((resolve) => setImmediate(resolve))
+}
+
+test('PC-11a-fix1 status: a real pool drives both routes to the same capacity facts', async (t) => {
+  const scratchRoot = path.join(__dirname, '..', '.scratch', 'pc-11a')
+  fs.mkdirSync(scratchRoot, { recursive: true })
+  const dir = fs.mkdtempSync(path.join(scratchRoot, 'real-pool-'))
+  t.after(() => {
+    try { fs.rmSync(dir, { recursive: true, force: true }) } catch { /* already gone */ }
+  })
+
+  const poolMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'relay-pool.js')).href)
+  const env = new Map([['http://10.7.0.1:3088|tok-real', { serverId: 'real0001', serverName: '书房' }]])
+  let configured = 8
+  let source = 'default'
+  let gatewayCap
+  const pool = poolMod.createRelayPool({
+    stateFile: path.join(dir, 'zen-remote-state.json'),
+    computeOwnFingerprints: () => ({}),
+    createClient: makeRealPoolClientFactory(env),
+    getMaxServers: () => configured,
+    getMaxServersSource: () => source,
+    getPeerNetworkCap: () => gatewayCap,
+  })
+  t.after(() => pool.stop())
+  const paired = await pool.pair({ serverUrl: 'http://10.7.0.1:3088', token: 'tok-real' })
+  assert.equal(paired.ok, true, 'the real pool paired the one server')
+  await settlePool()
+  assert.equal(pool.entries().length, 1, 'the paired entry landed in the real pool')
+
+  // The fake engine snapshot carries the mounted rows and the RAW network
+  // total (12, self included); the mount CAP itself comes from the real pool.
+  const { engine } = makePeerEngine({
+    status: {
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      maxPeers: 12,
+      natType: 'cone',
+      peers: [
+        { nodeId: 'aaaa1111', name: '书房电脑', state: 'eligible', path: 'lan', rttMs: 3, mounted: true },
+        { nodeId: 'bbbb2222', name: '客厅电脑', state: 'eligible', path: 'none', rttMs: null, mounted: false },
+      ],
+    },
+  })
+  const { server, port } = await startClientServer(makeRow(), { pool, getMaxServers: () => configured, getPeerEngine: () => engine })
+  t.after(() => closeServer(server))
+  const both = async () => {
+    const client = await request(port, { method: 'GET', path: routes.CLIENT_STATUS_ROUTE })
+    const peer = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    return [JSON.parse(client.body), JSON.parse(peer.body)]
+  }
+
+  // Default-layer config under a 12-member network: the pool synthesizes
+  // 12 - self = 11; BOTH routes answer the pool's own live number.
+  gatewayCap = 12
+  let [client, peer] = await both()
+  assert.equal(peer.maxPeers, 12, 'raw maxPeers keeps the network total including self')
+  assert.equal(pool.maxServers(), 11, 'the real pool synthesizes network cap minus self')
+  assert.equal(client.maxServers, pool.maxServers(), 'client/status rides the real synthesis')
+  assert.equal(peer.maxServers, pool.maxServers(), 'peer/status rides the very same synthesis')
+  assert.equal(peer.mountedCount, 1)
+  assert.equal(peer.limitReached, false, '1 of 11 — room left')
+
+  // A user-chosen row cap is only lowered by the network: min(8, 11) = 8.
+  source = 'row'
+  ;[client, peer] = await both()
+  assert.equal(pool.maxServers(), 8, 'the explicit cap wins while tighter')
+  assert.equal(client.maxServers, pool.maxServers())
+  assert.equal(peer.maxServers, pool.maxServers())
+
+  // Hot network shrink (12 → 6, default layer): 6 - self = 5 on the very
+  // next read of BOTH routes; the mounted stock stays counted.
+  source = 'default'
+  gatewayCap = 6
+  ;[client, peer] = await both()
+  assert.equal(pool.maxServers(), 5, 'the live network change reached the pool synthesis')
+  assert.equal(client.maxServers, pool.maxServers())
+  assert.equal(peer.maxServers, pool.maxServers())
+  assert.equal(peer.mountedCount, 1, 'the mount stock survives the shrink')
+  assert.equal(peer.limitReached, false)
 })
 
 test('PG-9 join: a valid invite reaches joinNetwork verbatim; a bad one never leaves the route', async () => {

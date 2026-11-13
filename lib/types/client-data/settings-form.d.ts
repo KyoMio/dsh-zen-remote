@@ -292,7 +292,27 @@ export interface PeerStatusView {
     deniedReason?: string | undefined;
     networkId: string | undefined;
     gatewayOrigin: string | undefined;
+    /** The network's announced device cap, INCLUDING this node — verbatim from
+     * the body (undefined while it answered null / nothing). NOT the mount cap. */
     maxPeers: number | undefined;
+    /** PC-11a: this machine's EFFECTIVE remote-mount cap, verbatim from the
+     * body when it carried a safe integer in the config's own 1..64 band
+     * (PC-11a-fix1). `undefined` on an older body — or a fractional/out-of-band
+     * one — means UNKNOWN, never derived from `maxPeers - 1` (which would paper
+     * over a local explicit cap the old answer simply did not carry) and never
+     * the settings constant either. */
+    maxServers: number | undefined;
+    /** PC-11a: this machine's actual mounted remotes — the body's count when it
+     * carried a non-negative safe integer, otherwise the explicit `mounted`
+     * flags of the rows, and only when EVERY row carries one (PC-11a-fix1: a
+     * list with missing/ambiguous flags stays unknown instead of reading its
+     * unknowns as unmounted; an explicit empty list is a real zero). Never the
+     * discovered-online rows and never the network's occupied seats. */
+    mountedCount: number | undefined;
+    /** PC-11a: `mountedCount >= maxServers` once BOTH facts are known (an
+     * over-cap stock after a downscale reads `true`); `undefined` while the
+     * cap is unknown — `false` would claim room that may not exist. */
+    limitReached: boolean | undefined;
     peers: PeerStatusDeviceView[];
 }
 /** One network-device row the peer section renders (wizard's

@@ -26,6 +26,7 @@ import {
   createLatestGate,
   clientStatusLineOf,
   deriveClientStatusView,
+  derivePeerStatusView,
   deriveSettingsView,
   localOpsAllowed,
   normalizePairingCode,
@@ -1008,4 +1009,125 @@ test('awaitClientStatusReady gives up after the deadline and still resolves', as
   const elapsed = Date.now() - started
   assert.ok(elapsed >= 50, `waited out the deadline (elapsed ${elapsed}ms)`)
   assert.ok(calls >= 2, `polled more than once before giving up (${calls} calls)`)
+})
+
+// ---- PC-11a: the peer status view's capacity facts --------------------------
+// peer/status grows three additive fields — maxServers (this machine's
+// EFFECTIVE remote-mount cap), mountedCount (this machine's actual mounts)
+// and limitReached (mountedCount >= maxServers). The view receives them as
+// OPTIONAL fields: an older body without a valid cap stays UNKNOWN — never
+// maxPeers-1 (which would paper over a local explicit cap the old answer
+// simply did not carry) and never the settings constant 8 either.
+
+test('derivePeerStatusView receives the capacity facts when the body carries them', () => {
+  const view = derivePeerStatusView({
+    configured: true,
+    nodeId: 'abcd1234',
+    gatewayState: 'authorized',
+    maxPeers: 8,
+    maxServers: 3,
+    mountedCount: 7,
+    peers: [
+      { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 },
+      { nodeId: 'bbbb2222', name: '客厅电脑', mounted: false, path: 'offline', rttMs: null },
+    ],
+  })
+  assert.equal(view.maxServers, 3, 'the body cap rides verbatim')
+  assert.equal(view.mountedCount, 7, 'the body count wins over the row count (3 is over-cap stock)')
+  assert.equal(view.limitReached, true, '7 >= 3 — the over-cap stock still reads as reached')
+})
+
+test('derivePeerStatusView keeps an old body UNKNOWN instead of deriving a fake cap', () => {
+  // A pre-PC-11a answer: raw maxPeers only, but the rows still carry the
+  // explicit mounted flags.
+  const view = derivePeerStatusView({
+    configured: true,
+    nodeId: 'abcd1234',
+    gatewayState: 'authorized',
+    maxPeers: 8,
+    peers: [
+      { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 },
+      { nodeId: 'bbbb2222', name: '客厅电脑', mounted: false, path: 'offline', rttMs: null },
+      { nodeId: 'cccc3333', name: '断线还挂着的机器', mounted: true, path: 'none', rttMs: null },
+    ],
+  })
+  assert.equal(view.maxServers, undefined, 'no cap field means UNKNOWN — never maxPeers-1 = 7, never the 8 constant')
+  assert.equal(view.mountedCount, 2, 'the explicit mounted flags still count this machine\'s mounts')
+  assert.equal(view.limitReached, undefined, 'cap unknown — the limit fact stays unknown, not false')
+})
+
+test('derivePeerStatusView degrades the capacity facts on junk types and missing lists', () => {
+  // Junk cap / junk count: the cap goes unknown, the count falls back to the
+  // rows' explicit mounted flags.
+  const junk = derivePeerStatusView({
+    maxPeers: 8,
+    maxServers: 'eight',
+    mountedCount: -1,
+    peers: [{ nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 }],
+  })
+  assert.equal(junk.maxServers, undefined, 'a non-number (or <1) cap is no cap at all')
+  assert.equal(junk.mountedCount, 1, 'a junk count (<0) falls back to the row flags')
+  assert.equal(junk.limitReached, undefined, 'cap unknown — limit unknown')
+  // A sub-one cap is junk too (the pool cap band starts at 1).
+  const zero = derivePeerStatusView({ maxServers: 0, peers: [] })
+  assert.equal(zero.maxServers, undefined)
+  // No peers list at all: there are no explicit mounted fields to count —
+  // unknown, not a fabricated zero.
+  const noRows = derivePeerStatusView({ configured: false, maxPeers: null })
+  assert.equal(noRows.mountedCount, undefined)
+  assert.equal(noRows.limitReached, undefined)
+  // The empty body stays the pre-peer shape, capacity facts included.
+  const empty = derivePeerStatusView({})
+  assert.equal(empty.maxServers, undefined)
+  assert.equal(empty.mountedCount, undefined)
+  assert.equal(empty.limitReached, undefined)
+})
+
+// ---- PC-11a-fix1: integer + explicit-facts discipline -----------------------
+// The capacity facts count DEVICES: a fractional cap (1.5) or a 65th slot is
+// protocol junk and stays UNKNOWN — never rounded or clamped into a
+// plausible-looking lie. The cap mirrors the config's own 1..64 band; the
+// count stays unclamped so an over-cap stock after a downscale stays visible.
+// And the row fallback counts ONLY a list whose every row carries an explicit
+// boolean mounted flag — missing/ambiguous flags must not read as unmounted.
+
+test('derivePeerStatusView keeps fractional and out-of-band caps unknown (integer protocol)', () => {
+  for (const junk of [1.5, 65, 0, -3, 'eight', true]) {
+    const view = derivePeerStatusView({ maxServers: junk, mountedCount: 2, peers: [] })
+    assert.equal(view.maxServers, undefined, `cap ${JSON.stringify(junk)} is no cap at all`)
+    assert.equal(view.limitReached, undefined, 'cap unknown — limit unknown')
+  }
+  // The band edges themselves are valid: 1 and 64.
+  assert.equal(derivePeerStatusView({ maxServers: 1, peers: [] }).maxServers, 1)
+  assert.equal(derivePeerStatusView({ maxServers: 64, peers: [] }).maxServers, 64)
+  // A fractional body count is not a count either: it falls to the rows,
+  // and when the rows cannot answer, the count stays unknown.
+  const fractional = derivePeerStatusView({ maxServers: 4, mountedCount: 0.5, peers: [{ nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 1 }] })
+  assert.equal(fractional.mountedCount, 1, '0.5 mounts is junk — the explicit row flags answer instead')
+  assert.equal(fractional.limitReached, false)
+  const noList = derivePeerStatusView({ maxServers: 4, mountedCount: 2.5 })
+  assert.equal(noList.mountedCount, undefined, 'no list, junk count → unknown')
+  assert.equal(noList.limitReached, undefined)
+})
+
+test('derivePeerStatusView counts an old list only when every mounted flag is explicit', () => {
+  const viewOf = (peers) => derivePeerStatusView({ maxServers: 4, peers })
+  // One row without an explicit flag: the whole list is uncountable — the
+  // unknown must NOT read as unmounted.
+  const missing = viewOf([
+    { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 },
+    { nodeId: 'bbbb2222', name: '没给标志', path: 'offline', rttMs: null },
+  ])
+  assert.equal(missing.mountedCount, undefined, 'a missing flag makes the whole list uncountable')
+  assert.equal(missing.limitReached, undefined, 'cap known, count unknown → limit unknown')
+  // A non-boolean flag is just as ambiguous.
+  const nonBool = viewOf([{ nodeId: 'aaaa1111', name: '书房电脑', mounted: 'yes', path: 'lan', rttMs: 3 }])
+  assert.equal(nonBool.mountedCount, undefined)
+  // A junk row (not a record) poisons the list the same way.
+  const mixed = viewOf([{ nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 }, 'garbage'])
+  assert.equal(mixed.mountedCount, undefined)
+  // An explicit empty list is a real answer: zero mounts.
+  const empty = viewOf([])
+  assert.equal(empty.mountedCount, 0, 'an explicit [] is a countable zero')
+  assert.equal(empty.limitReached, false, '0 of 4 — room left')
 })
