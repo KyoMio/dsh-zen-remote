@@ -65,7 +65,7 @@ export interface CliIpcClient {
         set?: Record<string, unknown>;
         unset?: readonly string[];
     }): Promise<CliIpcRequestResult>;
-    request(method: string, path: string, body?: unknown, timeoutMs?: number): Promise<CliIpcRequestResult>;
+    request(method: string, path: string, body?: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<CliIpcRequestResult>;
 }
 /**
  * Walk the CLI socket candidates under `dshHome` (or only `explicitSocket`)

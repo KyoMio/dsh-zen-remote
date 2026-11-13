@@ -68,7 +68,7 @@ export interface CliIpcClient {
   getStatus(): Promise<unknown>
   getDebugReport(): Promise<unknown>
   writeConfig(input: { set?: Record<string, unknown>; unset?: readonly string[] }): Promise<CliIpcRequestResult>
-  request(method: string, path: string, body?: unknown, timeoutMs?: number): Promise<CliIpcRequestResult>
+  request(method: string, path: string, body?: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<CliIpcRequestResult>
 }
 
 /** Discovery ping budget: finding out whether anything answers must stay
@@ -96,8 +96,12 @@ interface IpcAnswer {
 }
 
 /** One http round trip over the socket. Rejects on transport errors; HTTP
- * error statuses are answers, not failures. */
-function ipcRequest(socketPath: string, method: string, route: string, body?: unknown, timeoutMs?: number): Promise<IpcAnswer> {
+ * error statuses are answers, not failures. `signal` (PC-14b-fix1) aborts
+ * the IN-FLIGHT request — the socket idle `timeout` alone is not a wall
+ * clock: a slow drip of legal bytes keeps resetting it, and a hung request
+ * must still be cut by the caller's Ctrl-C / deadline. Existing callers
+ * pass no signal and keep today's behavior. */
+function ipcRequest(socketPath: string, method: string, route: string, body?: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<IpcAnswer> {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? undefined : JSON.stringify(body)
     const headers: Record<string, string> = {}
@@ -105,17 +109,28 @@ function ipcRequest(socketPath: string, method: string, route: string, body?: un
       headers['content-type'] = 'application/json'
       headers['content-length'] = String(Buffer.byteLength(payload))
     }
+    const onAbort = (): void => {
+      req.destroy(new Error(`IPC request aborted: ${method} ${route}`))
+    }
+    const onDone = (): void => {
+      signal?.removeEventListener('abort', onAbort)
+    }
     const req = httpRequest({ socketPath, method, path: route, headers, agent: false, timeout: timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS }, (res) => {
       const chunks: Buffer[] = []
       res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)))
-      res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }))
-      res.on('error', reject)
+      res.on('end', () => { onDone(); resolve({ status: res.statusCode ?? 0, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }) })
+      res.on('error', (error) => { onDone(); reject(error) })
     })
+    if (signal !== undefined) {
+      if (signal.aborted) onAbort()
+      else signal.addEventListener('abort', onAbort, { once: true })
+    }
     req.on('timeout', () => {
       req.destroy()
+      onDone()
       reject(new Error(`IPC request timed out after ${timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS}ms: ${method} ${route}`))
     })
-    req.on('error', reject)
+    req.on('error', (error) => { onDone(); reject(error) })
     if (payload !== undefined) req.write(payload)
     req.end()
   })
@@ -195,8 +210,8 @@ function parseBody(text: string): unknown {
  * this phase already drives.
  */
 export function createCliIpcClient(socketPath: string): CliIpcClient {
-  const request = async (method: string, path: string, body?: unknown, timeoutMs?: number): Promise<CliIpcRequestResult> => {
-    const answer = await ipcRequest(socketPath, method, path, body, timeoutMs)
+  const request = async (method: string, path: string, body?: unknown, timeoutMs?: number, signal?: AbortSignal): Promise<CliIpcRequestResult> => {
+    const answer = await ipcRequest(socketPath, method, path, body, timeoutMs, signal)
     return { status: answer.status, body: parseBody(answer.text), headers: answer.headers }
   }
   return {
