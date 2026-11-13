@@ -79,8 +79,10 @@ export interface TopologyMemberRow {
 export interface TopologyLink {
   srcNodeId: string;
   peerNodeId: string;
+  /** 节点自报路径：白名单 lan / p2p / relay / blocked（PC16a），白名单外的值由展示层按未知处理 */
   path: string;
-  rttMs: number;
+  /** null = 未知（中继/阻断路径没有测速协议），与实测 0 是两种观测，不得强转 */
+  rttMs: number | null;
   liveRelayKbps: number;
 }
 

@@ -306,14 +306,19 @@ export function NetworkView(props: NetworkViewProps) {
   const seatsFull = joinedCount >= maxPeers;
 
   // 连接对统计（cell 3）：A→B 与 B→A 是同一条连接
-  const pairs = new Map<string, { direct: boolean }>();
+  const pairs = new Map<string, { direct: boolean; blocked: boolean }>();
   for (const link of links) {
     const key = link.srcNodeId < link.peerNodeId ? `${link.srcNodeId}|${link.peerNodeId}` : `${link.peerNodeId}|${link.srcNodeId}`;
-    const entry = pairs.get(key) ?? { direct: false };
-    if (classifyLinkPath(link.path) !== 'relay') entry.direct = true;
+    const entry = pairs.get(key) ?? { direct: false, blocked: false };
+    // 只有真实直连路径算「直连」：blocked / unknown 既不是直连也不是中转。
+    // 任一方向自报 blocked 的对整体不算直连——单向 blocked + 反向正常
+    // 不能被「反向能直连」合并成一条正常直连（PC16b）。
+    const kind = classifyLinkPath(link.path);
+    if (kind === 'lan' || kind === 'direct') entry.direct = true;
+    if (kind === 'blocked') entry.blocked = true;
     pairs.set(key, entry);
   }
-  const directPairs = [...pairs.values()].filter((p) => p.direct).length;
+  const directPairs = [...pairs.values()].filter((p) => p.direct && !p.blocked).length;
 
   const detailMember = detailNodeId !== null ? (members.find((m) => m.nodeId === detailNodeId) ?? null) : null;
   if (detailMember !== null && topology !== null) {
@@ -496,8 +501,10 @@ export function NetworkView(props: NetworkViewProps) {
               {joinedMembers.map((member) => {
                 const status = memberStatusView(member.status, member.online, t);
                 const own = selfLinks(member.nodeId);
-                const direct = own.filter((l) => classifyLinkPath(l.path) !== 'relay').length;
-                const relay = own.length - direct;
+                const ownKinds = own.map((l) => classifyLinkPath(l.path));
+                const direct = ownKinds.filter((k) => k === 'lan' || k === 'direct').length;
+                const relay = ownKinds.filter((k) => k === 'relay').length;
+                const blocked = ownKinds.filter((k) => k === 'blocked').length;
                 const latency = formatLatencyRange(own.map((l) => l.rttMs));
                 const showConn = member.status === 'authorized' && member.online && own.length > 0;
                 return (
@@ -537,6 +544,12 @@ export function NetworkView(props: NetworkViewProps) {
                             <span className="conn-chip">
                               <span className="dot warn" aria-hidden="true" />
                               {t('devices.relayCount', { n: relay })}
+                            </span>
+                          )}
+                          {blocked > 0 && (
+                            <span className="conn-chip">
+                              <span className="dot danger" aria-hidden="true" />
+                              {t('devices.blockedCount', { n: blocked })}
                             </span>
                           )}
                         </>

@@ -43,6 +43,7 @@ export const ZH = {
   'path.lan': '局域网直连',
   'path.direct': '直连',
   'path.relay': '经网关中转',
+  'path.unknown': '未知',
 
   'status.online': '在线',
   'status.offline': '离线',
@@ -134,6 +135,7 @@ export const ZH = {
   'devices.emptyHint': '设备入网后会显示在这里',
   'devices.directCount': '直连 {n}',
   'devices.relayCount': '中转 {n}',
+  'devices.blockedCount': '阻断 {n}',
   'devices.latency': '延迟',
   'devices.path': '连接方式',
   'devices.reason': '原因',
@@ -162,6 +164,8 @@ export const ZH = {
   'device.reasonRelaySelf': '这台设备的网络不支持直连，已自动中转 · {rate}',
   'device.reasonRelayPeer': '对方网络不支持直连，已自动中转 · {rate}',
   'device.reasonMismatchBlocked': '身份异常，连接已阻断',
+  'device.reasonNodeBlocked': '至少一端未认可对方身份，连接已阻断',
+  'device.reasonUnknownPath': '上报了无法识别的连接方式，暂时无法判定',
   'device.reasonPeerPaused': '对方已暂停',
 
   // ---- PG-6b：网络类型（说人话） ----
@@ -227,6 +231,7 @@ export const EN: Record<LocaleKey, string> = {
   'path.lan': 'Direct on local network',
   'path.direct': 'Direct connection',
   'path.relay': 'Relayed through gateway',
+  'path.unknown': 'Unknown',
 
   'status.online': 'Online',
   'status.offline': 'Offline',
@@ -313,6 +318,7 @@ export const EN: Record<LocaleKey, string> = {
   'devices.emptyHint': 'Devices will appear here after they join',
   'devices.directCount': 'Direct {n}',
   'devices.relayCount': 'Relayed {n}',
+  'devices.blockedCount': 'Blocked {n}',
   'devices.latency': 'Latency',
   'devices.path': 'Path',
   'devices.reason': 'Reason',
@@ -340,6 +346,8 @@ export const EN: Record<LocaleKey, string> = {
   'device.reasonRelaySelf': "This device's network does not support direct connections, so traffic is relayed · {rate}",
   'device.reasonRelayPeer': "The other device's network does not support direct connections, so traffic is relayed · {rate}",
   'device.reasonMismatchBlocked': 'Identity changed, connection blocked',
+  'device.reasonNodeBlocked': 'At least one end rejected the other\u2019s identity; connection blocked',
+  'device.reasonUnknownPath': 'The device reported an unrecognized connection type; cannot classify it yet',
   'device.reasonPeerPaused': 'The other device is paused',
 
   'nat.cone': 'Regular network',
