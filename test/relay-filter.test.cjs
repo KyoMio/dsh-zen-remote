@@ -17,6 +17,9 @@ const {
   filterSessionListResult,
   filterJobListFrame,
   createWorkspaceFollowState,
+  createForgeStatesState,
+  filterWorkspaceValueResult,
+  filterSessionSearchResult,
 } = require('../lib/relay-filter.js')
 
 const yes = () => true
@@ -320,4 +323,103 @@ test('T52-fix filterModelCatalogResult: failures emptied, everything else rides 
   assert.equal(filterModelCatalogResult(undefined), undefined)
   assert.deepEqual(filterModelCatalogResult({ groups: [] }), { groups: [] })
   assert.deepEqual(filterModelCatalogResult({ failures: [] }), { failures: [] })
+})
+
+test('API-5 createForgeStatesState: hides unshared/dismissed PRs, unlocks on share, and re-baselines on unshare', () => {
+  const shared = new Set(['s-shared'])
+  const isAccessible = (id) => shared.has(id)
+  const state = createForgeStatesState()
+
+  state.seedFromSessionList({
+    items: [
+      {
+        sessionId: 's-shared',
+        projections: {
+          values: {
+            forgeChangeRequests: [
+              { url: 'https://git/pr/1', dismissed: false },
+              { url: 'https://git/pr/dismissed', dismissed: true },
+            ],
+          },
+        },
+      },
+      {
+        sessionId: 's-secret',
+        projectionValues: {
+          forgeChangeRequests: [{ url: 'https://git/pr/2' }],
+        },
+      },
+    ],
+  })
+
+  const pr1 = { url: 'https://git/pr/1', title: 'Public' }
+  const pr2 = { url: 'https://git/pr/2', title: 'Secret' }
+  const prDismissed = { url: 'https://git/pr/dismissed', title: 'Dismissed' }
+
+  const filteredBase = state.filterUpstreamFrame({ type: 'baseline', states: [pr1, pr2, prDismissed] }, isAccessible)
+  assert.deepEqual(filteredBase, { type: 'baseline', states: [pr1] })
+
+  // Later changed frame for s-secret is suppressed from output but cached in knownStates
+  const pr2Updated = { url: 'https://git/pr/2', title: 'Secret v2' }
+  assert.equal(state.filterUpstreamFrame({ type: 'changed', states: [pr2Updated] }, isAccessible), null)
+
+  // Sharing s-secret unlocks its cached state as changed
+  shared.add('s-secret')
+  assert.deepEqual(state.onShareChange(isAccessible), [{ type: 'changed', states: [pr2Updated] }])
+
+  // Companion control projection update (both legacy and ≥alpha.3 changes formats) adds pr3 for s-shared
+  const pr3 = { url: 'https://git/pr/3', title: 'Alpha3' }
+  state.filterUpstreamFrame({ type: 'changed', states: [pr3] }, isAccessible)
+  const unlockedByControl = state.applyControlFrame(
+    {
+      type: 'projection',
+      sessionId: 's-shared',
+      seq: 2,
+      changes: [{ key: 'forgeChangeRequests', val: [{ url: 'https://git/pr/1' }, { url: 'https://git/pr/3' }] }],
+    },
+    isAccessible,
+  )
+  assert.deepEqual(unlockedByControl, [{ type: 'changed', states: [pr3] }])
+
+  // Unsharing s-secret triggers a clean baseline without pr2
+  shared.delete('s-secret')
+  assert.deepEqual(state.onShareChange(isAccessible), [{ type: 'baseline', states: [pr1, pr3] }])
+
+  // Legacy projection format dismissing pr3 also re-baselines cleanly
+  assert.deepEqual(
+    state.applyControlFrame(
+      {
+        type: 'projection',
+        sessionId: 's-shared',
+        key: 'forgeChangeRequests',
+        value: [{ url: 'https://git/pr/1' }, { url: 'https://git/pr/3', dismissed: true }],
+        seq: 3,
+      },
+      isAccessible,
+    ),
+    [{ type: 'baseline', states: [pr1] }],
+  )
+})
+
+test('API-6 filterWorkspaceValueResult & filterSessionSearchResult: drop unshared session ids cleanly', () => {
+  const wsInput = snapshot({
+    workspace: { workspaceId: 'w-1', title: 'Repo', sessionIds: ['s-shared', 's-secret'] },
+  })
+  assert.deepEqual(filterWorkspaceValueResult(wsInput, only(['s-shared'])), {
+    workspace: { workspaceId: 'w-1', title: 'Repo', sessionIds: ['s-shared'] },
+  })
+  assert.equal(filterWorkspaceValueResult('bad', yes), 'bad')
+
+  const searchInput = snapshot({
+    items: [
+      { sessionId: 's-shared', snippet: 'ok' },
+      { sessionId: 's-secret', snippet: 'hidden' },
+      'malformed',
+    ],
+    hasMore: 1,
+  })
+  assert.deepEqual(filterSessionSearchResult(searchInput, only(['s-shared'])), {
+    items: [{ sessionId: 's-shared', snippet: 'ok' }],
+    hasMore: true,
+  })
 })
