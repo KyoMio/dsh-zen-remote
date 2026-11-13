@@ -59,6 +59,15 @@ const TIMESTAMP_WINDOW_MS = 5 * 60_000;
 const MAX_PATH_REPORTS_PER_NODE = 64;
 const MAX_LAN_ENDPOINTS = 16;
 
+/**
+ * path-report 行的合法路径枚举（PC-16a）：节点自报的既有 lan/p2p/relay 三值
+ * 加 blocked（本机 TOFU 身份阻断——对端在网关侧在线，但本机拒绝一切握手）。
+ * 枚举外的值整行拒绝，绝不默认翻译成 relay：网关存储的是节点声明的观测，
+ * 不是网关的猜测。
+ */
+const PATH_REPORT_PATHS: readonly string[] = ['lan', 'p2p', 'relay', 'blocked'];
+type PeerReportPath = (typeof PATH_REPORT_PATHS)[number];
+
 export interface PeerWsHubOptions {
   store: GatewayStore;
   /** 秘密加密主密钥：入网时解密 joinKey 验证口令证明 */
@@ -99,8 +108,8 @@ interface ConnState {
   reflexive: { ip: string; port: number } | null;
   remoteIp: string | null;
   connectedAt: number;
-  /** 该节点上报到各 peer 的路径观测 */
-  pathReports: Map<string, { path: string; rttMs: number }>;
+  /** 该节点上报到各 peer 的路径观测（PC-16a：路径限合法枚举，RTT 可为 null=未知） */
+  pathReports: Map<string, { path: PeerReportPath; rttMs: number | null }>;
 }
 
 interface PeerView {
@@ -682,12 +691,6 @@ export class PeerWsHub {
 
   // ------------------------------------------------------------ 路径遥测
 
-  /**
-   * path-report（FIX-2）：每条消息视为该节点当前路径视图的**完整快照**——
-   * 构建新表整表替换旧表，且只接纳本网当前在线（authorized 且在路由表里）
-   * 的对端，总量硬上限 MAX_PATH_REPORTS_PER_NODE。随机伪造的 peerNodeId 在
-   * 这里被过滤，内存不随报文放大；内容与旧表一致时不触发 SSE 重渲染。
-   */
   private async handleRename(conn: ConnState, message: Record<string, unknown>): Promise<void> {
     if (typeof message['name'] !== 'string') return;
     const trimmed = message['name'].trim();
@@ -705,24 +708,39 @@ export class PeerWsHub {
     void this.publishTopology(conn.networkId);
   }
 
+  /**
+   * path-report（FIX-2 / PC-16a）：每条消息视为该节点当前路径视图的**完整
+   * 快照**——构建新表整表替换旧表（空表 `peers: []` 同样整表生效，缺失的行
+   * 直接消失，不合并保留幽灵边），且只接纳本网当前在线（authorized 且在
+   * 路由表里）的对端，总量硬上限 MAX_PATH_REPORTS_PER_NODE。行形状严格校验
+   * （PC-16a）：peerNodeId 必须是合法 8 hex 且**不指向自己**，path 必须在
+   * PATH_REPORT_PATHS 枚举内，rttMs 为 null（未知——中继/阻断路径没有测速
+   * 协议）或有限非负数；任一不符整行丢弃，绝不默认翻译成 relay。随机伪造
+   * 的 peerNodeId 在这里被过滤，内存不随报文放大；内容与旧表一致时不触发
+   * SSE 重渲染（null 与 0 是不同的观测，严格 !== 比较下不会互相吞掉）。
+   */
   private handlePathReport(conn: ConnState, message: Record<string, unknown>): void {
     const peers = message['peers'];
     if (!Array.isArray(peers)) return;
     const online = this.conns.get(conn.networkId);
-    const next = new Map<string, { path: string; rttMs: number }>();
+    const next = new Map<string, { path: PeerReportPath; rttMs: number | null }>();
     if (online !== undefined) {
       for (const item of peers) {
         if (next.size >= MAX_PATH_REPORTS_PER_NODE) break;
         if (typeof item !== 'object' || item === null) continue;
         const entry = item as Record<string, unknown>;
         const peerNodeId = normalizeNodeId(entry['peerNodeId']);
-        const path = typeof entry['path'] === 'string' ? entry['path'] : null;
+        const path = entry['path'];
         const rttMs = entry['rttMs'];
-        if (peerNodeId === null || path === null || path.length > 128 || typeof rttMs !== 'number' || !Number.isFinite(rttMs) || rttMs < 0) {
+        const rttValid = rttMs === null || (typeof rttMs === 'number' && Number.isFinite(rttMs) && rttMs >= 0);
+        if (
+          peerNodeId === null || peerNodeId === conn.nodeId ||
+          typeof path !== 'string' || !PATH_REPORT_PATHS.includes(path) || !rttValid
+        ) {
           continue;
         }
         if (!online.has(peerNodeId)) continue; // 只留本网真实在线的对端
-        next.set(peerNodeId, { path, rttMs });
+        next.set(peerNodeId, { path: path as PeerReportPath, rttMs });
       }
     }
     const changed =

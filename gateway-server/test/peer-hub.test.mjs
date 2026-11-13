@@ -1741,6 +1741,102 @@ describe('path-report 与 /topology、SSE 联动', () => {
   });
 });
 
+// ---------------------------------------------------------------- PC-16a：path-report 严格形状
+
+describe('PC-16a：path-report 只收合法路径枚举与 nullable RTT', () => {
+  test('blocked 路径配 null RTT 合法：原样入库进入拓扑（本地身份阻断可见）', async () => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA } = await setupPair(gw);
+      wsSendJson(wsA, { type: 'path-report', peers: [{ peerNodeId: b.nodeId, path: 'blocked', rttMs: null }] });
+      const link = (await getTopology(gw, net.id)).links
+        .find((l) => l.srcNodeId === a.nodeId && l.peerNodeId === b.nodeId);
+      assert.ok(link, 'blocked 行必须被接受（本地身份阻断是对端在线下的真实观测）');
+      assert.equal(link.path, 'blocked');
+      assert.equal(link.rttMs, null, '未知 RTT 必须保持 null，不得变 0');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('路径枚举白名单：未知路径整行拒绝，绝不默认翻译成 relay', async () => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA } = await setupPair(gw);
+      wsSendJson(wsA, {
+        type: 'path-report',
+        peers: [
+          { peerNodeId: b.nodeId, path: 'smoke-signal', rttMs: 7 },
+          { peerNodeId: b.nodeId, path: 'offline', rttMs: 0 },
+          { peerNodeId: b.nodeId, rttMs: 1 }, // path 缺失同样整行拒绝
+        ],
+      });
+      const links = (await getTopology(gw, net.id)).links.filter((l) => l.srcNodeId === a.nodeId);
+      assert.deepEqual(links, [], '非法路径枚举的行必须整行丢弃，而不是落到 relay 桶');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('self 上报排除：节点不能给自己造一条边', async () => {
+    const gw = await startGateway();
+    try {
+      const { net, a, wsA } = await setupPair(gw);
+      wsSendJson(wsA, { type: 'path-report', peers: [{ peerNodeId: a.nodeId, path: 'lan', rttMs: 1 }] });
+      const links = (await getTopology(gw, net.id)).links.filter((l) => l.srcNodeId === a.nodeId);
+      assert.deepEqual(links, [], '指向自己的行必须被排除');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('空表替换：peers: [] 清掉该节点此前上报的全部边', async () => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA } = await setupPair(gw);
+      wsSendJson(wsA, { type: 'path-report', peers: [{ peerNodeId: b.nodeId, path: 'p2p', rttMs: 12 }] });
+      assert.equal(
+        (await getTopology(gw, net.id)).links.filter((l) => l.srcNodeId === a.nodeId).length,
+        1,
+        '先确认边已入库（前置事实）',
+      );
+      wsSendJson(wsA, { type: 'path-report', peers: [] });
+      const links = (await getTopology(gw, net.id)).links.filter((l) => l.srcNodeId === a.nodeId);
+      assert.deepEqual(links, [], '空表是新全表：旧边必须消失，不得合并保留');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('RTT 值域：实测 0 保留为 0，负数与非数值整行拒绝，null 与 0 可区分', async () => {
+    const gw = await startGateway();
+    try {
+      const { net, a, b, wsA } = await setupPair(gw);
+      // 回环直连实测 0ms 是合法观测：必须原样保留，不得被当「未知」清洗
+      wsSendJson(wsA, { type: 'path-report', peers: [{ peerNodeId: b.nodeId, path: 'lan', rttMs: 0 }] });
+      let link = (await getTopology(gw, net.id)).links
+        .find((l) => l.srcNodeId === a.nodeId && l.peerNodeId === b.nodeId);
+      assert.ok(link && link.rttMs === 0, `实测 0ms 必须保留为 0（got ${JSON.stringify(link)})`);
+
+      // 负数与非数值整行拒绝
+      wsSendJson(wsA, {
+        type: 'path-report',
+        peers: [
+          { peerNodeId: b.nodeId, path: 'p2p', rttMs: -1 },
+          { peerNodeId: b.nodeId, path: 'p2p', rttMs: '12' },
+        ],
+      });
+      assert.deepEqual(
+        (await getTopology(gw, net.id)).links.filter((l) => l.srcNodeId === a.nodeId),
+        [],
+        '负数与非数值 RTT 的行必须整行丢弃',
+      );
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
 // ---------------------------------------------------------------- PC-03：暂停受限控制连接与 resume 自动恢复
 
 describe('PC-03：pause 保留受限控制连接，resume 原地恢复', () => {

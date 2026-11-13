@@ -87,9 +87,10 @@ export interface GatewayHooks {
 export interface TopologyLink {
   srcNodeId: string;
   peerNodeId: string;
-  /** 节点自报路径（如 'lan' / 'p2p' / 'relay'），原样透传给控制台 */
+  /** 节点自报路径（'lan' / 'p2p' / 'relay' / 'blocked'，PC-16a 起含本机身份阻断），原样透传给控制台 */
   path: string;
-  rttMs: number;
+  /** 实测往返延迟；null = 未知（中继/阻断路径没有测速协议，未知与实测 0 是两种观测） */
+  rttMs: number | null;
   liveRelayKbps: number;
 }
 

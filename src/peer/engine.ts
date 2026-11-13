@@ -20,7 +20,9 @@
  *    （`onDirectReady` → mux 路径切 UDP、拓扑记 `lan`/`p2p`）；窗口过期
  *    `onPunchFallback` → mux 起网关 WS 中转握手、路径记 `relay`；直连事后
  *    打通/丢失各自热切换路径，ARQ 在途分片随新路径重传不断流。每 15s 和
- *    任意路径变化向网关发 `path-report` 控制帧（`/topology` 的数据源）。
+ *    任意路径变化向网关发 `path-report` 控制帧（`/topology` 的数据源）：
+ *    本机 TOFU 阻断的对端如实报 `blocked`，RTT 未知为 null、实测 0 原样
+ *    保留，中继路径绝不沿用过期 UDP 延迟（PC-16a）。
  */
 
 import { createSocket } from 'node:dgram'
@@ -283,9 +285,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
 
   const markMismatch = (member: MemberRec): void => {
     member.state = 'identity-mismatch'
+    member.path = 'blocked' // PC-16a：本机身份阻断是真实观测，如实上报，不停留旧值伪装 relay/offline
     unmountPeer(member)
     mux?.dropSession(member.nodeId)
     punch?.dropPeer(member.nodeId)
+    schedulePathReport()
     log(`peer engine: TOFU key-mismatch for ${member.nodeId} — blocked locally until trustPeer()`)
   }
 
@@ -710,14 +714,40 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       })
   }
 
-  const currentPeerPaths = (): Array<{ peerNodeId: string; path: string; rttMs: number }> => {
-    const out: Array<{ peerNodeId: string; path: string; rttMs: number }> = []
+  /**
+   * 当前路径 RTT 的唯一选择口径（PC-16a fix1）：`status()` 与 path-report
+   * 共用同一份 RTT 事实——只在 UDP 直连（lan/p2p）路径读 punch 会话测量
+   * （HELLO-ACK / PING→PONG，实测 0 合法保留，未测得 null）；中继/未定
+   * （relay/none）、本机阻断（blocked）与非成员态（disabled）没有当前路径
+   * 的测量，一律 null。直连降中继后 punch 会话里残留的过期 UDP 值不得从
+   * 任何出口漏出去；不改 punch 内部诊断缓存，也不新增中继测速。
+   */
+  const currentPathRttMs = (member: MemberRec): number | null => {
+    if (member.state !== 'eligible') return null
+    if (member.path !== 'lan' && member.path !== 'p2p') return null
+    return punch?.sessionRttMs(member.nodeId) ?? null
+  }
+
+  /**
+   * path-report 行的生产口径（PC-16a）。每行是 `{ peerNodeId, path, rttMs }`：
+   * - eligible 成员：路径 lan/p2p（UDP 直连）或 relay（'none' 归一为中转面可用）；
+   *   RTT 按 currentPathRttMs 的口径取值。
+   * - identity-mismatch 成员：path 'blocked'、RTT null——本机 TOFU 阻断是
+   *   对端仍在线时的真实观测，如实上报（不伪装 relay/offline，也不整行隐藏）。
+   * - disabled 成员：不上报——本机显式停用，不进拓扑遥测。
+   * - self 不在 members 里，天然不出现在表中。
+   */
+  const currentPeerPaths = (): Array<{ peerNodeId: string; path: string; rttMs: number | null }> => {
+    const out: Array<{ peerNodeId: string; path: string; rttMs: number | null }> = []
     for (const member of members.values()) {
+      if (member.state === 'identity-mismatch') {
+        out.push({ peerNodeId: member.nodeId, path: 'blocked', rttMs: currentPathRttMs(member) })
+        continue
+      }
       if (member.state !== 'eligible') continue
       let path: PeerMemberPath = member.path
       if (path === 'none') path = 'relay' // 打洞在途/等待降级——中转面仍可用
-      const rtt = punch?.sessionRttMs(member.nodeId) ?? null
-      out.push({ peerNodeId: member.nodeId, path, rttMs: rtt ?? 0 })
+      out.push({ peerNodeId: member.nodeId, path, rttMs: currentPathRttMs(member) })
     }
     return out
   }
@@ -1002,6 +1032,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         startPunch: true,
       })
       mux?.enableRelayPath(id)
+      schedulePathReport() // PC-16a：blocked→放行是路径事实变化，及时顶掉旧边
       return true
     },
 
@@ -1032,7 +1063,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           name: member.name,
           state: member.state,
           path: member.path,
-          rttMs: punch?.sessionRttMs(member.nodeId) ?? null,
+          rttMs: currentPathRttMs(member),
           mounted: member.mounted,
         })
       }
