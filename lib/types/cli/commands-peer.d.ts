@@ -36,8 +36,10 @@ export declare function switchToPeerRole(ctx: CliExecutionContext): Promise<bool
 export declare function runPeerJoinCommand(ctx: CliExecutionContext): Promise<number>;
 /**
  * `peer status [--json]` — the peer engine's snapshot: this machine's node
- * id, the joined network (id + gateway origin), the admission state, and one
- * line per network device (path / rtt / mounted). `--json` echoes the
+ * id, the joined network (id + gateway origin), the admission state, the
+ * mount-capacity lines (PC-11c: the local mounts N/M against the effective
+ * cap, the full note when reached, the network-total cap separately), and
+ * one line per network device (path / rtt / mounted). `--json` echoes the
  * route's own body verbatim behind `ok: true`.
  */
 export declare function runPeerStatusCommand(ctx: CliExecutionContext): Promise<number>;

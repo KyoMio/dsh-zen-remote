@@ -27,7 +27,7 @@ import {
 } from '../client-routes.js'
 import type { CliExecutionContext } from './context.js'
 import type { CliTranslator } from './i18n.js'
-import { fetchBody, plainOf, gatewayStateLabel, peerPathLabelOf } from './commands-status.js'
+import { fetchBody, plainOf, gatewayStateLabel, peerPathLabelOf, peerCapacityLines } from './commands-status.js'
 import type { ServerRow } from './commands-status.js'
 
 /** The join wait's poll cadence: frequent by default, tests shrink it. The
@@ -300,8 +300,10 @@ export async function runPeerJoinCommand(ctx: CliExecutionContext): Promise<numb
 
 /**
  * `peer status [--json]` — the peer engine's snapshot: this machine's node
- * id, the joined network (id + gateway origin), the admission state, and one
- * line per network device (path / rtt / mounted). `--json` echoes the
+ * id, the joined network (id + gateway origin), the admission state, the
+ * mount-capacity lines (PC-11c: the local mounts N/M against the effective
+ * cap, the full note when reached, the network-total cap separately), and
+ * one line per network device (path / rtt / mounted). `--json` echoes the
  * route's own body verbatim behind `ok: true`.
  */
 export async function runPeerStatusCommand(ctx: CliExecutionContext): Promise<number> {
@@ -321,6 +323,7 @@ export async function runPeerStatusCommand(ctx: CliExecutionContext): Promise<nu
     const origin = stringOf(status, 'gatewayOrigin') === '' ? '—' : stringOf(status, 'gatewayOrigin')
     lines.push(`  ${t('peer.status.joined', { networkId: stringOf(status, 'networkId'), origin })}`)
     lines.push(`  ${t('peer.status.gatewayState', { state: gatewayStateLabel(t, status.gatewayState) })}`)
+    lines.push(...peerCapacityLines(t, status))
     const peers = peersOf(status)
     lines.push(`  ${t('peer.status.deviceCount', { count: peers.length })}`)
     for (const row of peers) {

@@ -69,7 +69,10 @@ async function loadModules(...urls) {
 
 // ---- 罐头数据 ----------------------------------------------------------------
 
-/** 节点端状态快照：覆盖 lan / p2p / relay / mismatch / offline 五种路径。 */
+/** 节点端状态快照：覆盖 lan / p2p / relay / mismatch / offline 五种路径。
+ * PC-11a 起真实路由始终携带四个容量字段（maxPeers 网络总上限含本机、
+ * maxServers 本机有效挂载上限、mountedCount 真实挂载数、limitReached），
+ * 罐头与真实契约同形：挂载 true 的两行（本机、书房机）对应 mountedCount 2。 */
 function peerStatusBody(gatewayState = 'authorized', overrides = {}) {
   const configured = overrides.configured ?? (gatewayState !== 'idle')
   return {
@@ -78,6 +81,9 @@ function peerStatusBody(gatewayState = 'authorized', overrides = {}) {
     gatewayState,
     ...(configured ? { networkId: 'abcdef1234567890', gatewayOrigin: 'https://gw.example.com' } : {}),
     maxPeers: 8,
+    maxServers: 8,
+    mountedCount: configured ? 2 : 0,
+    limitReached: false,
     peers: configured ? [
       { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
       { nodeId: 'bb22cc33', name: '书房机', mounted: true, path: 'p2p', rttMs: 12 },
@@ -834,6 +840,9 @@ test('peer status: 未入网与 --json 快照', async () => {
       nodeId: 'aa1b2c3d',
       gatewayState: 'idle',
       maxPeers: 8,
+      maxServers: 8,
+      mountedCount: 0,
+      limitReached: false,
       peers: [],
     })
   } finally {
@@ -1504,6 +1513,228 @@ test('peer join: 支持直接输入中继网关地址（手动审批准入）及
     assert.deepEqual(joins[0].body, { gatewayUrl: 'http://192.168.1.88:19393' })
     assert.deepEqual(joins[1].body, { gatewayUrl: 'http://192.168.1.88:19393', networkId: 'aaaabbbbccccdddd' })
     assert.match(ctx.stdout.text(), /等待管理员在网关控制台批准/u)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
+// ===========================================================================
+// 验收 9：PC-11c —— CLI 统一容量事实（peer status 与总 status 同口径）
+//
+// 服务端契约（PC-11a）：maxPeers = 网络总上限（含本机）；maxServers = 本机
+// 有效远端挂载上限；mountedCount = 本机真实挂载数；limitReached = 两者之比。
+// CLI 文本与网页同口径：本机挂载 N/M 一行、网络总上限独立一行、满额/超额
+// 说明已有挂载保留新增受限；旧端缺字段明示未知、绝不按 maxPeers-1 或常量
+// 8 推测；JSON 原样透传服务端字段（未知保持缺席，不伪造 0/8）。
+// ===========================================================================
+
+test('peer status: 容量行 —— 本机挂载 N/M 与网络总上限独立成行（中英）', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('pc11c-normal')
+  let handle
+  try {
+    const client = {
+      [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: { maxServers: 3, mountedCount: 2, limitReached: false } }) },
+    }
+    const { handle: h } = await startIpcServer(home, { role: 'peer', client })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+    const zh = makeCtx(mods, { argv: ['peer', 'status'], ipc, lang: 'zh' })
+    assert.equal(await mods.runPeerStatusCommand(zh), 0)
+    const zhText = zh.stdout.text()
+    assert.match(zhText, /本机已挂载 2 \/ 3 台远端设备/u)
+    assert.match(zhText, /网络设备上限 8 台（含本机）/u, 'the network-total cap rides as its own line, not folded into N/M')
+    assert.doesNotMatch(zhText, /已达本机挂载上限/u, 'under the cap means no full note')
+
+    const en = makeCtx(mods, { argv: ['peer', 'status'], ipc, lang: 'en' })
+    assert.equal(await mods.runPeerStatusCommand(en), 0)
+    const enText = en.stdout.text()
+    assert.match(enText, /2 \/ 3 remote devices mounted on this machine/u)
+    assert.match(enText, /Network device cap 8 \(this machine included\)/u)
+    assert.doesNotMatch(enText, /mount cap .* is reached/u)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
+test('peer status: 满额与超额 —— 提示指本机上限、已有挂载保留；超额存量不钳制', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('pc11c-full')
+  let handle
+  try {
+    // 满额：2/2 —— 默认网络上限 8 与显式本机上限 2 同时在场，两行不得混淆。
+    const fullClient = {
+      [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: { maxServers: 2, mountedCount: 2, limitReached: true } }) },
+    }
+    const { handle: h } = await startIpcServer(home, { role: 'peer', client: fullClient })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+    const full = makeCtx(mods, { argv: ['peer', 'status'], ipc, lang: 'zh' })
+    assert.equal(await mods.runPeerStatusCommand(full), 0)
+    const fullText = full.stdout.text()
+    assert.match(fullText, /本机已挂载 2 \/ 2 台远端设备/u)
+    assert.match(fullText, /已达本机挂载上限（2 台）：已有挂载保留，新增挂载前请先取消部分设备的挂载/u)
+    assert.match(fullText, /网络设备上限 8 台（含本机）/u, 'network cap stays 8 while the local cap is the smaller explicit 2')
+    assert.doesNotMatch(fullText, /已达本机挂载上限（8 台）/u, 'the full note blames the LOCAL cap, never the network total')
+
+    // 超额存量（上限下调后 mountedCount > maxServers）：数字照实、不钳到 2/2。
+    const overClient = {
+      [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: { maxServers: 2, mountedCount: 3, limitReached: true } }) },
+    }
+    const home2 = makeHome('pc11c-over')
+    const { handle: h2 } = await startIpcServer(home2, { role: 'peer', client: overClient })
+    const handle2 = h2
+    try {
+      const ipc2 = mods.createCliIpcClient(handle2.socketPath)
+      const over = makeCtx(mods, { argv: ['peer', 'status'], ipc: ipc2, lang: 'zh' })
+      assert.equal(await mods.runPeerStatusCommand(over), 0)
+      const overText = over.stdout.text()
+      assert.match(overText, /本机已挂载 3 \/ 2 台远端设备/u, 'the over-cap stock renders verbatim, never clamped')
+      assert.match(overText, /已达本机挂载上限（2 台）/u)
+    } finally {
+      await handle2.close()
+      cleanup(home2)
+    }
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
+test('总 status: peer 板块容量行与 peer status 同口径，热改下次调用即见（中英）', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('pc11c-total')
+  let handle
+  try {
+    // 同一罐头在三次调用之间热改（等同 maxServers 配置热改后的下一次查询）。
+    let current = peerStatusBody('authorized', { extra: { maxServers: 3, mountedCount: 2, limitReached: false } })
+    const client = { [ROUTES.peerStatus]: { body: () => current } }
+    const { handle: h } = await startIpcServer(home, { role: 'peer', client })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+    const zh = makeCtx(mods, { argv: ['status'], ipc, lang: 'zh' })
+
+    // 第一次：正常 2/3。
+    assert.equal(await mods.runStatusCommand(zh), 0)
+    assert.match(zh.stdout.text(), /本机已挂载 2 \/ 3 台远端设备/u)
+    assert.match(zh.stdout.text(), /网络设备上限 8 台（含本机）/u)
+    assert.doesNotMatch(zh.stdout.text(), /已达本机挂载上限/u)
+    zh.stdout.lines.length = 0
+
+    // 热改 → 满额 2/2：下一次调用立即反映新事实。
+    current = peerStatusBody('authorized', { extra: { maxServers: 2, mountedCount: 2, limitReached: true } })
+    assert.equal(await mods.runStatusCommand(zh), 0)
+    const fullText = zh.stdout.text()
+    assert.match(fullText, /本机已挂载 2 \/ 2 台远端设备/u)
+    assert.match(fullText, /已达本机挂载上限（2 台）：已有挂载保留，新增挂载前请先取消部分设备的挂载/u)
+    zh.stdout.lines.length = 0
+
+    // 热改 → 超额 3/2：超额存量照实显示。
+    current = peerStatusBody('authorized', { extra: { maxServers: 2, mountedCount: 3, limitReached: true } })
+    assert.equal(await mods.runStatusCommand(zh), 0)
+    assert.match(zh.stdout.text(), /本机已挂载 3 \/ 2 台远端设备/u)
+    zh.stdout.lines.length = 0
+
+    // 英文同口径。
+    const en = makeCtx(mods, { argv: ['status'], ipc, lang: 'en' })
+    assert.equal(await mods.runStatusCommand(en), 0)
+    const enText = en.stdout.text()
+    assert.match(enText, /3 \/ 2 remote devices mounted on this machine/u)
+    assert.match(enText, /The local mount cap \(2 devices\) is reached — existing mounts stay/u)
+    assert.match(enText, /Network device cap 8 \(this machine included\)/u)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
+test('peer status: 旧端缺字段 —— 容量未知明示、网络上限仍单独显示；JSON 不伪造', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('pc11c-legacy')
+  let handle
+  try {
+    // 旧端快照：只有 maxPeers，没有 PC-11a 的三个新字段。
+    const legacyBody = peerStatusBody('authorized')
+    delete legacyBody.maxServers
+    delete legacyBody.mountedCount
+    delete legacyBody.limitReached
+    const legacyClient = { [ROUTES.peerStatus]: { body: () => legacyBody } }
+    const { handle: h } = await startIpcServer(home, { role: 'peer', client: legacyClient })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+    const zh = makeCtx(mods, { argv: ['peer', 'status'], ipc, lang: 'zh' })
+    assert.equal(await mods.runPeerStatusCommand(zh), 0)
+    const text = zh.stdout.text()
+    assert.match(text, /本机挂载容量未知/u, 'missing fields say unknown explicitly')
+    assert.doesNotMatch(text, /本机已挂载 \d+ \/ \d+ 台远端设备/u, 'no N/M fabricated from maxPeers - 1 or the constant 8')
+    assert.match(text, /网络设备上限 8 台（含本机）/u, 'a known network cap still shows on its own line')
+
+    // 垃圾值（分数上限 / 负数挂载）同样按未知处理，不进文本。
+    const junkBody = peerStatusBody('authorized', { extra: { maxServers: 1.5, mountedCount: -1, limitReached: true } })
+    const junkClient = { [ROUTES.peerStatus]: { body: () => junkBody } }
+    const homeJunk = makeHome('pc11c-junk')
+    const { handle: h2 } = await startIpcServer(homeJunk, { role: 'peer', client: junkClient })
+    const handle2 = h2
+    try {
+      const junk = makeCtx(mods, { argv: ['peer', 'status'], ipc: mods.createCliIpcClient(handle2.socketPath), lang: 'zh' })
+      assert.equal(await mods.runPeerStatusCommand(junk), 0)
+      const junkText = junk.stdout.text()
+      assert.match(junkText, /本机挂载容量未知/u)
+      assert.doesNotMatch(junkText, /已达本机挂载上限/u, 'a junk limitReached is not trusted on its own')
+    } finally {
+      await handle2.close()
+      cleanup(homeJunk)
+    }
+
+    // JSON：旧端缺的字段保持缺席（不伪造 0/8），已有的 maxPeers 原样保留。
+    const json = makeCtx(mods, { argv: ['peer', 'status', '--json'], ipc, lang: 'zh' })
+    assert.equal(await mods.runPeerStatusCommand(json), 0)
+    const parsed = JSON.parse(json.stdout.text())
+    assert.equal(parsed.maxPeers, 8)
+    assert.ok(!('maxServers' in parsed), 'an absent maxServers stays absent in JSON')
+    assert.ok(!('mountedCount' in parsed), 'an absent mountedCount stays absent in JSON')
+    assert.ok(!('limitReached' in parsed), 'an absent limitReached stays absent in JSON')
+
+    // 总 status --json 同口径：peer 段原样透传。
+    const totalJson = makeCtx(mods, { argv: ['status', '--json'], ipc, lang: 'zh' })
+    assert.equal(await mods.runStatusCommand(totalJson), 0)
+    const totalParsed = JSON.parse(totalJson.stdout.text())
+    assert.equal(totalParsed.peer.maxPeers, 8)
+    assert.ok(!('maxServers' in totalParsed.peer))
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
+test('JSON: 结构化容量字段原样保留（超额不钳制、limitReached 不改写）', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('pc11c-json')
+  let handle
+  try {
+    const overClient = {
+      [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: { maxPeers: 8, maxServers: 2, mountedCount: 3, limitReached: true } }) },
+    }
+    const { handle: h } = await startIpcServer(home, { role: 'peer', client: overClient })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+    const peerJson = makeCtx(mods, { argv: ['peer', 'status', '--json'], ipc, lang: 'zh' })
+    assert.equal(await mods.runPeerStatusCommand(peerJson), 0)
+    const parsed = JSON.parse(peerJson.stdout.text())
+    assert.equal(parsed.maxPeers, 8)
+    assert.equal(parsed.maxServers, 2)
+    assert.equal(parsed.mountedCount, 3, 'the over-cap stock passes through verbatim, never clamped to the cap')
+    assert.equal(parsed.limitReached, true)
+
+    const totalJson = makeCtx(mods, { argv: ['status', '--json'], ipc, lang: 'zh' })
+    assert.equal(await mods.runStatusCommand(totalJson), 0)
+    const totalParsed = JSON.parse(totalJson.stdout.text())
+    assert.equal(totalParsed.peer.maxPeers, 8)
+    assert.equal(totalParsed.peer.maxServers, 2)
+    assert.equal(totalParsed.peer.mountedCount, 3)
+    assert.equal(totalParsed.peer.limitReached, true)
   } finally {
     if (handle !== undefined) await handle.close()
     cleanup(home)
