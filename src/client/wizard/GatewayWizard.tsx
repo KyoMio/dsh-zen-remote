@@ -70,6 +70,7 @@ import {
   deriveClientOverviewSummary,
   deriveClientServerLights,
   deriveClientWizardLights,
+  derivePeerDiscoveryLight,
   derivePeerOverviewSummary,
   derivePeerWizardLights,
   deriveWizardLights,
@@ -1491,12 +1492,17 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     return { state: 'pass' as const, text: wizardStatus.publicUrl || t('wizard.path.external') }
   })()
 
-  // PG-9 + PC-11b: the peer node's derived overview + lights, read off the
-  // polled peer status view (the view rows are structurally the wizard's
-  // PeerDeviceView). The mount-capacity facts are the body's OWN PC-11a
-  // fields — the display never divides the raw network cap by anything nor
-  // counts the discovered rows; before the first poll answers (or on an old
-  // body without the fields) every fact is unknown and says so.
+  // PG-9 + PC-11b + PC-14a: the peer node's derived overview + lights, read
+  // off the polled peer status view (the view rows are structurally the
+  // wizard's PeerDeviceView). The mount-capacity facts are the body's OWN
+  // PC-11a fields — the display never divides the raw network cap by anything
+  // nor counts the discovered rows; before the first poll answers (or on an
+  // old body without the fields) every fact is unknown and says so. PC-14a:
+  // the third light rides the body's OWN sync facts — a non-empty peers list
+  // or a lan path never turns it green; an old body reads the explicit
+  // unknown copy (peerView.sync undefined), and `ready` means the remote
+  // handshakes completed and syncing MAY START, never that session data has
+  // finished synchronizing.
   const peerDevices: readonly PeerDeviceView[] = peerView?.peers ?? []
   const peerSelfJoined = peerView?.configured === true && (peerView.gatewayState === 'authorized' || peerView.gatewayState === 'paused')
   const peerSummary = derivePeerOverviewSummary(peerDevices, {
@@ -1505,11 +1511,17 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     limitReached: peerView?.limitReached,
     maxPeers: peerView?.maxPeers,
   }, { includeSelf: peerSelfJoined })
+  const peerGatewayState = peerView?.gatewayState ?? 'unconfigured'
+  const peerDiscovery = derivePeerDiscoveryLight({
+    gatewayState: peerGatewayState,
+    mismatchCount: peerSummary.mismatchCount,
+    sync: peerView?.sync,
+  })
   const peerLights = derivePeerWizardLights({
     identityReady: (peerView?.nodeId ?? '') !== '',
-    gatewayState: peerView?.gatewayState ?? 'unconfigured',
-    peerCount: peerDevices.length,
+    gatewayState: peerGatewayState,
     mismatchCount: peerSummary.mismatchCount,
+    sync: peerView?.sync,
   })
   const serverScopeBridges = useMemo(() => bridgeRows.filter((row) => row.hasServerScope), [bridgeRows])
 
@@ -2618,11 +2630,15 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                           const state = peerLights[light]
                           // The admission light's amber reads 「等待网络管理
                           // 员批准」 instead of the generic 待验证 when the
-                          // gateway said pending.
+                          // gateway said pending. PC-14a: the discovery
+                          // light's line explains the body's own sync verdict
+                          // (ready / waiting / ignored / partial with counts
+                          // / blocked / not-mounted / unknown) — derived once
+                          // off the polled view, never re-guessed here.
                           const labelText = light === 'admission' && peerView?.gatewayState === 'pending-approval'
                             ? t('wizard.peer.pendingApproval')
-                            : light === 'discovery' && peerDevices.length === 0 && peerView?.gatewayState === 'authorized'
-                              ? t('wizard.overview.peerConnNone')
+                            : light === 'discovery'
+                              ? t(peerDiscovery.copyKey, peerDiscovery.copyParams)
                               : t(LIGHT_LABEL[state])
                           return (
                             <li key={key} className="zr-wizard-light" data-state={state}>
