@@ -93,7 +93,7 @@
   },
   "packageManager": "pnpm@11.7.0",
   "dependencies": {
-    "web-push": "^3.6.7"
+    "web-push": "^4.0.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "*",
