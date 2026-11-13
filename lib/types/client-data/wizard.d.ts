@@ -306,10 +306,33 @@ export interface PeerDeviceView {
     /** Round-trip time of the current path in ms; `null` when not connected. */
     rttMs: number | null;
 }
+/**
+ * The peer/status body's mount-capacity facts, verbatim from the
+ * `derivePeerStatusView` view's PC-11a fields (the wizard and the settings
+ * section both hand these over). Any field left out — or `undefined` — means
+ * that fact is UNKNOWN downstream; nothing here guesses a default. Two
+ * vocabularies that must never be conflated: `maxPeers` is the RAW network
+ * device cap INCLUDING this machine, while `maxServers` is this machine's
+ * EFFECTIVE remote-mount cap, and `mountedCount` counts this machine's
+ * mounted remotes — never the discovered rows (`peers.length`) and never
+ * the network's occupied seats.
+ */
+export interface PeerCapacityFacts {
+    /** This machine's effective remote-mount cap (undefined = unknown). */
+    maxServers?: number | undefined;
+    /** This machine's actually mounted remotes (undefined = unknown). */
+    mountedCount?: number | undefined;
+    /** `mountedCount >= maxServers` once BOTH are known; undefined otherwise. */
+    limitReached?: boolean | undefined;
+    /** The network's raw device cap including this node (undefined = unknown). */
+    maxPeers?: number | undefined;
+}
 /** The peer node's overview counters and two lights (PG-9): the 第 3 格
  * 「直连 / 中转连接」 summarizes the usable paths, the 第 4 格 「网内设备」
- * counts `N / M 台` with {@link PeerOverviewSummary.devicesLight} turning
- * red exactly at the cap (满额) or on a locally blocked identity. */
+ * shows 本机已挂载 N / M 台远端设备 with {@link PeerOverviewSummary.devicesLight}
+ * turning red exactly at the LOCAL mount cap (满额, PC-11a's tri-state) or
+ * on a locally blocked identity — amber while the capacity facts are unknown
+ * (an old body), never green on a guess. */
 export interface PeerOverviewSummary {
     totalCount: number;
     /** `lan` + `p2p` — the devices whose sessions flow without the gateway. */
@@ -319,22 +342,37 @@ export interface PeerOverviewSummary {
     /** Locally blocked identities awaiting the 信任新身份 decision. */
     mismatchCount: number;
     offlineCount: number;
-    /** Devices whose shared sessions are currently mounted. */
-    mountedCount: number;
-    maxPeers: number;
-    limitReached: boolean;
+    /** PC-11a: this machine's mounted remotes, verbatim from the body — NOT
+     * the discovered count and never derived from the rows here (unknown
+     * stays unknown). */
+    mountedCount: number | undefined;
+    /** PC-11a: this machine's effective mount cap (undefined = unknown). */
+    maxServers: number | undefined;
+    /** The network's raw device cap including this node (undefined =
+     * unknown). Annotation-only: the mount display never divides by it. */
+    maxPeers: number | undefined;
+    /** PC-11a tri-state: `true` at (or over) the local mount cap — an
+     * over-cap stock after a downscale stays `true` with the count shown
+     * unclamped — and `undefined` while the cap or the count is unknown
+     * (`false` would claim room that may not exist). */
+    limitReached: boolean | undefined;
     connectionLight: LightState;
     devicesLight: LightState;
 }
 /**
  * Derive the peer overview summary off the status route's device rows
- * ({@link PeerDeviceView}): the connection light is green when every device
- * is on a usable path, red the moment one locally blocked identity waits
- * for a trust decision, amber otherwise (empty network, all offline); the
- * device light follows the cap — red exactly at `totalCount >= maxPeers`
- * — and shares the mismatch red. Both stay amber on an empty network.
+ * ({@link PeerDeviceView}) and the body's capacity facts
+ * ({@link PeerCapacityFacts}): the connection light is green when every
+ * device is on a usable path, red the moment one locally blocked identity
+ * waits for a trust decision, amber otherwise (empty network, all offline);
+ * the device light follows the LOCAL mount cap — red exactly when
+ * `limitReached` is true, amber while it is unknown — and shares the
+ * mismatch red. The capacity facts pass through verbatim; when the flag is
+ * missing but both counts are known it is re-derived by the PC-11a
+ * definition (`mountedCount >= maxServers`), so a caller that carries the
+ * raw numbers cannot disagree with the route's own verdict.
  */
-export declare function derivePeerOverviewSummary(peers: readonly PeerDeviceView[], maxPeers: number, options?: {
+export declare function derivePeerOverviewSummary(peers: readonly PeerDeviceView[], capacity?: PeerCapacityFacts, options?: {
     includeSelf?: boolean;
 }): PeerOverviewSummary;
 /** The peer node's three wizard lights (PG-9): ① 本机身份已就绪, ② 网络准入

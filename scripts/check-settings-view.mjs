@@ -346,24 +346,42 @@ await test('the role decision reads peer: savedRowRole, settingsRoleOf and the a
   assert.equal(savedRowRole({ value: { role: 'Peer' }, user: {} }), undefined)
 })
 
-await test('the peer network-device summary: the settings page sees the same cap-red judgment', () => {
+await test('the peer mount-capacity summary: the settings page sees the same facts the wizard tiles do (PC-11b)', () => {
   const row = (path, over = {}) => ({
     nodeId: over.nodeId ?? 'aaaa1111', name: over.name ?? '书房电脑',
     mounted: over.mounted ?? true, path, rttMs: over.rttMs ?? 3,
     ...over,
   })
-  // 8 / 8: the counter's red word rides with limitReached + the red device light.
-  const full = derivePeerOverviewSummary(Array.from({ length: 8 }, (_, i) => row('lan', { nodeId: `node${i}` })), 8)
-  assert.equal(full.totalCount, 8)
+  // 满额 at the LOCAL mount cap: limitReached + the red device light ride the
+  // body's own facts (PC-11a), not the raw network cap.
+  const full = derivePeerOverviewSummary(
+    Array.from({ length: 3 }, (_, i) => row('lan', { nodeId: `node${i}` })),
+    { maxPeers: 8, maxServers: 3, mountedCount: 3, limitReached: true },
+  )
+  assert.equal(full.totalCount, 3)
+  assert.equal(full.maxServers, 3)
   assert.equal(full.maxPeers, 8)
   assert.equal(full.limitReached, true)
   assert.equal(full.devicesLight, 'fail')
-  // 3 / 8 healthy: green lights, direct/relay split for the 直连/中转 tile.
-  const part = derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('p2p', { nodeId: 'b' }), row('relay', { nodeId: 'c' })], 8)
-  assert.deepEqual(
-    { total: part.totalCount, direct: part.directCount, relay: part.relayCount, limit: part.limitReached, devices: part.devicesLight },
-    { total: 3, direct: 2, relay: 1, limit: false, devices: 'pass' },
+  // 2 / 3 mounted with 3 discovered: green light, direct/relay split for the
+  // 直连/中转 tile, and the mounted count stays the body's fact.
+  const part = derivePeerOverviewSummary(
+    [row('lan', { nodeId: 'a' }), row('p2p', { nodeId: 'b' }), row('relay', { nodeId: 'c', mounted: false })],
+    { maxPeers: 8, maxServers: 3, mountedCount: 2, limitReached: false },
   )
+  assert.deepEqual(
+    {
+      total: part.totalCount, mounted: part.mountedCount, direct: part.directCount,
+      relay: part.relayCount, limit: part.limitReached, devices: part.devicesLight,
+    },
+    { total: 3, mounted: 2, direct: 2, relay: 1, limit: false, devices: 'pass' },
+  )
+  // An old body without the capacity fields: unknown stays unknown — the
+  // settings line must not read the discovered rows as mounts.
+  const unknown = derivePeerOverviewSummary([row('lan'), row('p2p', { nodeId: 'b', mounted: false })], {})
+  assert.equal(unknown.mountedCount, undefined)
+  assert.equal(unknown.limitReached, undefined)
+  assert.equal(unknown.devicesLight, 'pending')
 })
 
 await test('debugExportFileName stamps the peer role into the diagnostic export name (PG-9-fix)', () => {

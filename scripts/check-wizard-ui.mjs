@@ -262,60 +262,93 @@ await test('derivePeerOverviewSummary: counts, the cap\'s red device light and t
     mounted: over.mounted ?? true, path, rttMs: over.rttMs ?? 3,
     ...over,
   })
-  // Empty network: everything amber, no cap tripped.
-  assert.deepEqual(derivePeerOverviewSummary([], 8), {
+  // PC-11b: the capacity facts are the peer/status body's OWN fields
+  // (PC-11a) — mountedCount/maxServers/limitReached/maxPeers verbatim; the
+  // helper must NOT re-derive them from the discovered rows (peers.length is
+  // the DISCOVERED count, never the mount count; maxPeers is the raw network
+  // cap incl. self, never the mount cap).
+  // Empty network, empty facts: everything amber, nothing claimed.
+  assert.deepEqual(derivePeerOverviewSummary([], {}), {
     totalCount: 0, directCount: 0, relayCount: 0, mismatchCount: 0, offlineCount: 0,
-    mountedCount: 0, maxPeers: 8, limitReached: false, connectionLight: 'pending', devicesLight: 'pending',
+    mountedCount: undefined, maxServers: undefined, maxPeers: undefined, limitReached: undefined,
+    connectionLight: 'pending', devicesLight: 'pending',
   })
-  // A healthy mix: lan+p2p count direct, relay counts relayed; both lights green.
+  // A healthy mix: lan+p2p count direct, relay counts relayed; the mounted
+  // count rides the body's fact (2 of the rows carry mounted), the cap is
+  // the body's effective 3 — NOT maxPeers-1 (raw network 16).
   const mix = derivePeerOverviewSummary([
     row('lan', { nodeId: 'a' }),
     row('p2p', { nodeId: 'b', mounted: false }),
     row('relay', { nodeId: 'c' }),
     row('offline', { nodeId: 'd', mounted: false, rttMs: null }),
-  ], 8)
+  ], { maxPeers: 16, maxServers: 3, mountedCount: 2, limitReached: false })
   assert.equal(mix.totalCount, 4)
   assert.equal(mix.directCount, 2)
   assert.equal(mix.relayCount, 1)
   assert.equal(mix.offlineCount, 1)
   assert.equal(mix.mountedCount, 2)
+  assert.equal(mix.maxServers, 3)
+  assert.equal(mix.maxPeers, 16)
   assert.equal(mix.limitReached, false)
   assert.equal(mix.connectionLight, 'pending', 'one device is offline mid-retry — the connection light stays amber')
-  assert.equal(mix.devicesLight, 'pass')
+  assert.equal(mix.devicesLight, 'pass', 'known capacity under the cap is the one green case')
   // All devices on usable paths: the connection light goes green.
   assert.equal(
-    derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('p2p', { nodeId: 'b' }), row('relay', { nodeId: 'c' })], 8).connectionLight,
+    derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('p2p', { nodeId: 'b' }), row('relay', { nodeId: 'c' })], { maxPeers: 8, maxServers: 3, mountedCount: 1, limitReached: false }).connectionLight,
     'pass',
   )
-  // 满额红字：at the cap the device light goes red while the connection light stays green.
+  // 满额：at the local mount cap the device light goes red while the
+  // connection light stays green.
   const full = derivePeerOverviewSummary(
-    Array.from({ length: 8 }, (_, i) => row('lan', { nodeId: `node${i}` })),
-    8,
+    Array.from({ length: 3 }, (_, i) => row('lan', { nodeId: `node${i}` })),
+    { maxPeers: 16, maxServers: 3, mountedCount: 3, limitReached: true },
   )
   assert.equal(full.limitReached, true)
   assert.equal(full.devicesLight, 'fail')
   assert.equal(full.connectionLight, 'pass')
-  // Under the cap is not full.
-  assert.equal(derivePeerOverviewSummary(Array.from({ length: 7 }, (_, i) => row('lan', { nodeId: `node${i}` })), 8).limitReached, false)
-  // An explicit smaller cap decides on its own.
-  assert.equal(derivePeerOverviewSummary([row('lan')], 1).devicesLight, 'fail')
-  // A locally blocked identity turns both lights red — the user must act.
-  const blocked = derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('mismatch', { nodeId: 'b', mounted: false, rttMs: null })], 8)
+  // A local explicit cap tighter than the network decides on its own
+  // (raw network 16, effective 3): discovered 3 ≠ mounted 3 — the counts
+  // stay separate vocabularies.
+  assert.equal(
+    derivePeerOverviewSummary([row('lan'), row('lan', { nodeId: 'b' }), row('lan', { nodeId: 'c', mounted: false })], { maxPeers: 16, maxServers: 2, mountedCount: 2, limitReached: true }).devicesLight,
+    'fail',
+  )
+  // 缩容后的超额存量：mounted above the (now smaller) cap reads true, the
+  // count is shown unclamped, existing mounts stay visible.
+  const overCap = derivePeerOverviewSummary(
+    Array.from({ length: 5 }, (_, i) => row('lan', { nodeId: `node${i}` })),
+    { maxPeers: 16, maxServers: 3, mountedCount: 5, limitReached: true },
+  )
+  assert.equal(overCap.limitReached, true)
+  assert.equal(overCap.mountedCount, 5, 'an over-cap stock is shown as-is, never clamped')
+  assert.equal(overCap.devicesLight, 'fail')
+  // UNKNOWN capacity (an old body without the PC-11a fields): the light
+  // stays amber and limitReached stays undefined — never a fake false
+  // (which would claim room that may not exist).
+  const unknown = derivePeerOverviewSummary([row('lan')], {})
+  assert.equal(unknown.mountedCount, undefined)
+  assert.equal(unknown.maxServers, undefined)
+  assert.equal(unknown.limitReached, undefined)
+  assert.equal(unknown.devicesLight, 'pending', 'unknown capacity is amber, not green and not red')
+  // Known counts without the flag still agree with the PC-11a definition.
+  assert.equal(derivePeerOverviewSummary([], { mountedCount: 2, maxServers: 3 }).limitReached, false)
+  assert.equal(derivePeerOverviewSummary([], { mountedCount: 3, maxServers: 3 }).limitReached, true)
+  // Known mounted but unknown cap stays unknown (the cap is the missing half).
+  assert.equal(derivePeerOverviewSummary([], { mountedCount: 2 }).limitReached, undefined)
+  // A locally blocked identity turns both lights red — the user must act —
+  // even when the capacity facts are unknown.
+  const blocked = derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('mismatch', { nodeId: 'b', mounted: false, rttMs: null })], {})
   assert.equal(blocked.mismatchCount, 1)
   assert.equal(blocked.devicesLight, 'fail')
   assert.equal(blocked.connectionLight, 'fail')
-  // includeSelf: when authorized in a network alone, 网内设备 counts this machine (1 / 8), while connectionLight stays amber (no peer links yet).
-  const soloJoined = derivePeerOverviewSummary([], 8, { includeSelf: true })
+  // includeSelf: the DISCOVERED count only — when authorized in a network
+  // alone it reads 1 (this machine), the mount facts stay the body's.
+  const soloJoined = derivePeerOverviewSummary([], { maxPeers: 8, maxServers: 3, mountedCount: 0, limitReached: false }, { includeSelf: true })
   assert.equal(soloJoined.totalCount, 1)
   assert.equal(soloJoined.devicesLight, 'pass')
   assert.equal(soloJoined.connectionLight, 'pending')
   assert.equal(soloJoined.limitReached, false)
-  // includeSelf at cap (3 peers + self = 4 / 4): limitReached trips.
-  const fullWithSelf = derivePeerOverviewSummary([row('lan', { nodeId: 'a' }), row('lan', { nodeId: 'b' }), row('lan', { nodeId: 'c' })], 4, { includeSelf: true })
-  assert.equal(fullWithSelf.totalCount, 4)
-  assert.equal(fullWithSelf.limitReached, true)
-  assert.equal(fullWithSelf.devicesLight, 'fail')
-  assert.equal(fullWithSelf.connectionLight, 'pass')
+  assert.equal(soloJoined.mountedCount, 0, 'self never counts as a mounted remote')
 })
 
 await test('deriveClientServerLights: one paired server row drives the wizard step-3 lights (MS-8)', () => {
@@ -555,7 +588,12 @@ const WIZARD_KEYS = [
   'wizard.peer.notJoined',
   'wizard.overview.peerNodeLabel', 'wizard.overview.peerNetworkLabel', 'wizard.overview.peerNetworkNone',
   'wizard.overview.peerConnLabel', 'wizard.overview.peerConnSummary', 'wizard.overview.peerConnNone',
-  'wizard.overview.peerDevicesLabel', 'wizard.overview.peerDevicesCount', 'wizard.overview.peerDevicesFull',
+  'wizard.overview.peerDevicesLabel',
+  // PC-11b: the unified mount-capacity wording — 本机已挂载 N / M 台远端设备
+  // as the main line, the RAW network cap annotated separately (含本机), the
+  // discovered count named 已发现, and the full note blaming the LOCAL cap.
+  'wizard.overview.peerMountCount', 'wizard.overview.peerMountUnknown', 'wizard.overview.peerMountFull',
+  'wizard.overview.peerNetworkCapNote', 'wizard.overview.peerMountedDiscovered', 'wizard.overview.peerDiscoveredCount',
   'wizard.peer.devicesModalTitle', 'wizard.peer.devicesModalSubtitle', 'wizard.peer.devicesModalEmpty',
   'wizard.peer.devicePathLan', 'wizard.peer.devicePathP2p', 'wizard.peer.devicePathRelay',
   'wizard.peer.devicePathOffline', 'wizard.peer.devicePathMismatch', 'wizard.peer.deviceRtt',
@@ -846,6 +884,17 @@ await test('targetHostSaveRole: the channel-config save keeps a peer a peer (PG-
   // save, or the machine is kicked out of the virtual network.
   assert.equal(targetHostSaveRole(false), 'host')
   assert.equal(targetHostSaveRole(true), 'peer')
+})
+
+// PC-11b: the pre-11a capacity wording is retired — the count mixed the
+// discovered total into a mount-cap shape and the full note blamed the
+// network cap. Their absence keeps the dictionaries from drifting back.
+await test('the retired capacity keys are gone from both dictionaries (PC-11b)', () => {
+  for (const [locale, dict] of [['zh', zh], ['en', en]]) {
+    for (const key of ['wizard.overview.peerDevicesCount', 'wizard.overview.peerDevicesFull']) {
+      assert.ok(!(key in dict), `${locale} must not carry the retired key ${key}`)
+    }
+  }
 })
 
 await test('the banned word 互通端 appears nowhere in either dictionary (PG-9-fix)', () => {

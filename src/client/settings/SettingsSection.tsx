@@ -73,6 +73,7 @@ import {
 } from '../../client-data/settings-form.ts'
 import { bridgeSectionState, togglePluginConsent } from '../../client-data/plugin-bridge.ts'
 import type { PluginBridgeStatusView } from '../../client-data/plugin-bridge.ts'
+import { derivePeerOverviewSummary } from '../../client-data/wizard.ts'
 import { CURRENT_SESSION_STORAGE_KEY, parseCurrentSessionStorage } from '../../client-data/current-session.ts'
 import { isRemoteSessionId } from '../../client-data/remote-drop.ts'
 import type {
@@ -357,6 +358,7 @@ function PeerDeviceRow(props: {
         <div className="zr-settings-device-actions">
           <Switch
             checked={device.mounted}
+            disabled={busy}
             onChange={onToggle}
             label={t('wizard.peer.deviceMount')}
           />
@@ -607,6 +609,19 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     const timer = window.setInterval(() => { loadPeerStatus() }, 5000)
     return () => { window.clearInterval(timer) }
   }, [peerRole, loadPeerStatus])
+
+  // PC-11b: the peer card's mount-capacity facts — the SAME derivation the
+  // wizard tiles use, off the same peer/status view (the PC-11a fields).
+  // Unknown stays unknown: an old body shows 容量未知, never a guessed N/M,
+  // and the raw network cap is annotation-only (含本机).
+  const peerSummary = peerView !== undefined
+    ? derivePeerOverviewSummary(peerView.peers, {
+        maxServers: peerView.maxServers,
+        mountedCount: peerView.mountedCount,
+        limitReached: peerView.limitReached,
+        maxPeers: peerView.maxPeers,
+      })
+    : undefined
 
   // PG-9: one network-device management action — toggle-mount or trust —
   // then the poll repaints the section either way.
@@ -1449,7 +1464,37 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               <div className="zr-settings-field">
                 <div className="zr-settings-head">
                   <span className="zr-settings-head-title">{t('wizard.overview.peerDevicesLabel')}</span>
+                  {/* PC-11b: the SAME mount facts the wizard's tile states —
+                      本机已挂载 N / M against the LOCAL effective cap, red at
+                      the cap, a plain unknown word on an old body. */}
+                  {peerSummary !== undefined ? (
+                    <span
+                      className="zr-settings-badge"
+                      data-invalid={peerSummary.limitReached === true ? 'true' : undefined}
+                      data-live={peerSummary.limitReached === false ? 'true' : undefined}
+                    >
+                      {peerSummary.mountedCount !== undefined && peerSummary.maxServers !== undefined
+                        ? t('wizard.overview.peerMountCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.maxServers) })
+                        : t('wizard.overview.peerMountUnknown')}
+                    </span>
+                  ) : null}
                 </div>
+                {/* PC-11b + fix1: the full note and the raw network cap are
+                    TWO independent lines — the cap note rides at ALL times
+                    the body carried a maxPeers (full, over-cap stock or
+                    unknown local cap alike), never folded into one long
+                    line. The note only explains; the switches stay the
+                    user's (the engine's mount gate remains the refusal). */}
+                {peerSummary?.limitReached === true ? (
+                  <p className="zr-settings-hint" data-invalid="true" style={{ paddingTop: 4 }}>
+                    {t('wizard.overview.peerMountFull', { max: String(peerSummary.maxServers ?? '') })}
+                  </p>
+                ) : null}
+                {peerSummary?.maxPeers !== undefined ? (
+                  <p className="zr-settings-hint" style={{ paddingTop: 4 }}>
+                    {t('wizard.overview.peerNetworkCapNote', { max: String(peerSummary.maxPeers) })}
+                  </p>
+                ) : null}
                 {peerView.peers.length === 0 ? (
                   <p className="zr-settings-hint" style={{ padding: '8px 0 12px' }}>{t('wizard.peer.devicesModalEmpty')}</p>
                 ) : (

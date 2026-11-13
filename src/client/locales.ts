@@ -615,8 +615,15 @@ export const zh = {
   'wizard.overview.peerConnSummary': '局域网直连 {direct} 台 · 经网关中转 {relay} 台',
   'wizard.overview.peerConnNone': '暂无在线设备',
   'wizard.overview.peerDevicesLabel': '网内设备',
-  'wizard.overview.peerDevicesCount': '{count} / {max} 台',
-  'wizard.overview.peerDevicesFull': '已达 {max} 台上限',
+  // PC-11b: 挂载容量的统一口径——主行是本机已挂载 N / M 台远端设备（M 是本机
+  // 有效上限），网络总上限只作独立标注（含本机），发现数必须叫「已发现」，
+  // 满额提示说明是本机挂载上限（已有挂载保留），容量未知就明说未知。
+  'wizard.overview.peerMountCount': '本机已挂载 {count} / {max} 台远端设备',
+  'wizard.overview.peerMountUnknown': '本机挂载容量未知',
+  'wizard.overview.peerMountFull': '已达本机挂载上限（{max} 台）：已有挂载保留，新增挂载前请先取消部分设备的挂载',
+  'wizard.overview.peerNetworkCapNote': '网络设备上限 {max} 台（含本机）',
+  'wizard.overview.peerMountedDiscovered': '本机已挂载 {count} 台 · 已发现 {total} 台',
+  'wizard.overview.peerDiscoveredCount': '已发现 {total} 台',
   'wizard.peer.devicesModalTitle': '管理网络设备',
   'wizard.peer.devicesModalSubtitle': '查看网内其他设备，控制是否挂载对方共享的会话',
   'wizard.peer.devicesModalEmpty': '网内暂无其他设备',
@@ -1252,8 +1259,17 @@ export const en: Record<MobileNavKey, string> = {
   'wizard.overview.peerConnSummary': '{direct} direct · {relay} via gateway relay',
   'wizard.overview.peerConnNone': 'No devices online',
   'wizard.overview.peerDevicesLabel': 'Network devices',
-  'wizard.overview.peerDevicesCount': '{count} / {max}',
-  'wizard.overview.peerDevicesFull': 'The {max}-device limit is reached',
+  // PC-11b: the unified mount-capacity wording — the main line counts THIS
+  // machine's mounted remotes against the LOCAL effective cap, the raw
+  // network cap rides as a separate annotation (self included), a kept
+  // discovered count says "discovered", and the full note blames the local
+  // cap with the existing mounts explicitly kept.
+  'wizard.overview.peerMountCount': '{count} / {max} remote devices mounted on this machine',
+  'wizard.overview.peerMountUnknown': 'Local mount capacity unknown',
+  'wizard.overview.peerMountFull': 'The local mount cap ({max} devices) is reached — existing mounts stay; unmount a device before adding another',
+  'wizard.overview.peerNetworkCapNote': 'Network device cap {max} (this machine included)',
+  'wizard.overview.peerMountedDiscovered': '{count} mounted · {total} discovered',
+  'wizard.overview.peerDiscoveredCount': '{total} devices discovered',
   'wizard.peer.devicesModalTitle': 'Manage Network Devices',
   'wizard.peer.devicesModalSubtitle': 'See the other devices in the network and choose whose shared sessions to mount',
   'wizard.peer.devicesModalEmpty': 'No other devices in the network yet',
