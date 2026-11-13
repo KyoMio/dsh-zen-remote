@@ -26,6 +26,7 @@ import {
   caddySnippetText,
   deriveClientServerLights,
   deriveClientWizardLights,
+  derivePeerDiscoveryLight,
   derivePeerOverviewSummary,
   derivePeerWizardLights,
   deriveWizardLights,
@@ -233,27 +234,72 @@ await test('deriveClientWizardLights: reflects token and client connection state
   )
 })
 
-await test('derivePeerWizardLights: the peer node\'s three lights (PG-9)', () => {
+await test('derivePeerDiscoveryLight: the third light rides the sync facts (PC-14a)', () => {
+  const light = (gatewayState, sync, mismatchCount = 0) =>
+    derivePeerDiscoveryLight({ gatewayState, mismatchCount, ...(sync !== undefined ? { sync } : {}) })
+
+  // ready + authorized → pass; the copy says the handshakes COMPLETED and
+  // syncing MAY START — never that any session data has finished syncing.
+  assert.deepEqual(light('authorized', { state: 'ready', reason: 'ok' }), { light: 'pass', copyKey: 'wizard.peer.syncReady' })
+  // A ready word under a non-authorized gateway must NOT pass: the admission
+  // fact gates the verdict (no cached-online bypass).
+  assert.equal(light('offline', { state: 'ready', reason: 'ok' }).light, 'pending', 'ready under a dead gateway stays pending')
+  assert.equal(light('revoked', { state: 'ready', reason: 'ok' }).light, 'pending', 'ready under revoked stays pending')
+  // partial → pending; KNOWN counts ride the copy as params, unknown counts
+  // never guess 0 (they degrade to the plain unknown copy).
+  assert.deepEqual(
+    light('authorized', { state: 'partial', reason: 'peers-partial', readyCount: 1, candidateCount: 2 }),
+    { light: 'pending', copyKey: 'wizard.peer.syncPartialReady', copyParams: { ready: '1', total: '2' } },
+  )
+  assert.equal(light('authorized', { state: 'partial', reason: 'peers-partial' }).copyKey, 'wizard.peer.syncUnknown', 'unknown partial counts stay unknown')
+  // waiting-peers / ignored → pending with their own copy.
+  assert.equal(light('authorized', { state: 'waiting-peers', reason: 'waiting-peers' }).copyKey, 'wizard.peer.syncWaitingPeers')
+  assert.equal(light('authorized', { state: 'ignored', reason: 'ignored' }).copyKey, 'wizard.peer.syncIgnored')
+  // blocked (a local TOFU anomaly) and a locally known mismatch → fail.
+  assert.deepEqual(light('authorized', { state: 'blocked', reason: 'identity-mismatch', readyCount: 1, candidateCount: 1 }), { light: 'fail', copyKey: 'wizard.peer.syncBlocked' })
+  assert.equal(light('authorized', { state: 'ready', reason: 'ok' }, 1).light, 'fail', 'a local mismatch fails the light even against a ready word')
+  // not-ready → the reason's own copy; unmounted is the NEUTRAL word (fix1:
+  // no capacity claim), gateway words fold into the network-not-ready copy.
+  assert.equal(light('authorized', { state: 'not-ready', reason: 'peers-not-mounted', candidateCount: 2, unmountedCount: 2 }).copyKey, 'wizard.peer.syncNotMounted')
+  assert.equal(light('authorized', { state: 'not-ready', reason: 'peers-not-online', candidateCount: 1 }).copyKey, 'wizard.peer.syncNotOnline')
+  for (const gateway of ['connecting', 'pending-approval', 'mismatch', 'paused', 'revoked', 'offline']) {
+    assert.equal(light(gateway, { state: 'not-ready', reason: `gateway-${gateway}` }).copyKey, 'wizard.peer.syncGatewayHold', gateway)
+  }
+  // An old body without sync (or an unknown state word) → pending UNKNOWN —
+  // never "peers non-empty is green"; a locally known mismatch still fails.
+  assert.deepEqual(light('authorized', undefined), { light: 'pending', copyKey: 'wizard.peer.syncUnknown' })
+  assert.deepEqual(light('authorized', { state: undefined, reason: undefined }), { light: 'pending', copyKey: 'wizard.peer.syncUnknown' })
+  assert.equal(light('authorized', undefined, 1).light, 'fail', 'a mismatch is a LOCAL fact — it fails even an old body')
+  // unconfigured → the not-joined copy.
+  assert.equal(light('unconfigured', { state: 'unconfigured', reason: 'unconfigured' }).copyKey, 'wizard.peer.notJoined')
+})
+
+await test('derivePeerWizardLights: the peer node\'s three lights (PG-9 + PC-14a)', () => {
   // ① identity is green once the engine has a node id, amber before.
-  assert.equal(derivePeerWizardLights({ identityReady: false, gatewayState: 'unconfigured', peerCount: 0, mismatchCount: 0 }).identity, 'pending')
-  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'unconfigured', peerCount: 0, mismatchCount: 0 }).identity, 'pass')
+  assert.equal(derivePeerWizardLights({ identityReady: false, gatewayState: 'unconfigured', mismatchCount: 0 }).identity, 'pending')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'unconfigured', mismatchCount: 0 }).identity, 'pass')
   // ② admission: authorized is green; pending-approval is the amber
   // 「等待网络管理员批准」; connecting/offline stay amber; mismatch,
   // revoked and paused are red.
-  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', peerCount: 0, mismatchCount: 0 }).admission, 'pass')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', mismatchCount: 0 }).admission, 'pass')
   for (const amber of ['pending-approval', 'connecting', 'offline', 'unconfigured']) {
-    assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: amber, peerCount: 0, mismatchCount: 0 }).admission, 'pending', amber)
+    assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: amber, mismatchCount: 0 }).admission, 'pending', amber)
   }
   for (const red of ['mismatch', 'revoked', 'paused']) {
-    assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: red, peerCount: 0, mismatchCount: 0 }).admission, 'fail', red)
+    assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: red, mismatchCount: 0 }).admission, 'fail', red)
   }
-  // ③ discovery & sync: green once peers ride (mounted or not), red when a
-  // local TOFU mismatch blocks one, amber while the network is empty.
-  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', peerCount: 2, mismatchCount: 0 }).discovery, 'pass')
-  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', peerCount: 0, mismatchCount: 0 }).discovery, 'pending')
-  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', peerCount: 3, mismatchCount: 1 }).discovery, 'fail')
-  // A non-authorized gateway keeps discovery amber regardless of announcements.
-  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'connecting', peerCount: 1, mismatchCount: 0 }).discovery, 'pending')
+  // ③ discovery & sync (PC-14a): ONLY the body's sync fact can turn it green
+  // — a non-empty peers list, a lan path or a mounted count never do.
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', mismatchCount: 0, sync: { state: 'ready' } }).discovery, 'pass')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', mismatchCount: 0, sync: { state: 'partial', readyCount: 1, candidateCount: 2 } }).discovery, 'pending')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', mismatchCount: 0, sync: { state: 'waiting-peers' } }).discovery, 'pending')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', mismatchCount: 0, sync: { state: 'blocked' } }).discovery, 'fail')
+  // The old-body rule (the decided fallback): no sync → pending UNKNOWN,
+  // except a locally known mismatch which still fails.
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', mismatchCount: 0 }).discovery, 'pending', 'old body: discovery must NOT go green off peerCount alone')
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', mismatchCount: 1 }).discovery, 'fail')
+  // A non-authorized gateway keeps discovery amber even against a ready word.
+  assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'connecting', mismatchCount: 0, sync: { state: 'ready' } }).discovery, 'pending')
 })
 
 await test('derivePeerOverviewSummary: counts, the cap\'s red device light and the connection light (PG-9)', () => {

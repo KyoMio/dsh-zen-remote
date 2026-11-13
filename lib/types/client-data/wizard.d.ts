@@ -19,7 +19,7 @@
  * counters and its two lights (connection health / pool fill) off the
  * `client/status` pool list.
  */
-import type { ClientServerView } from './settings-form.ts';
+import type { ClientServerView, PeerSyncReadinessView } from './settings-form.ts';
 /** Wizard route constants — mirror of src/wizard/routes.ts. */
 export declare const WIZARD_STATUS_ROUTE = "/_dsh/zen-remote/admin/wizard/status";
 export declare const WIZARD_VERIFY_ROUTE = "/_dsh/zen-remote/admin/wizard/verify";
@@ -375,9 +375,43 @@ export interface PeerOverviewSummary {
 export declare function derivePeerOverviewSummary(peers: readonly PeerDeviceView[], capacity?: PeerCapacityFacts, options?: {
     includeSelf?: boolean;
 }): PeerOverviewSummary;
-/** The peer node's three wizard lights (PG-9): ① 本机身份已就绪, ② 网络准入
- * 状态 (authorized green, pending-approval amber — the 「等待网络管理员批准」
- * copy), ③ 设备发现与会话同步. */
+/** The third light's copy vocabulary (PC-14a) — exactly the locale keys the
+ * derived verdicts may render, kept as a literal union so the component's
+ * typed `t` accepts it and a typo fails the build instead of rendering
+ * #MISSING. Every key here exists in BOTH dictionaries. */
+export type PeerDiscoveryCopyKey = 'wizard.peer.syncReady' | 'wizard.peer.syncWaitingPeers' | 'wizard.peer.syncIgnored' | 'wizard.peer.syncPartialReady' | 'wizard.peer.syncBlocked' | 'wizard.peer.syncNotMounted' | 'wizard.peer.syncNotOnline' | 'wizard.peer.syncGatewayHold' | 'wizard.peer.syncUnknown' | 'wizard.peer.notJoined';
+/** The third peer wizard light's verdict (PC-14a): the light word plus the
+ * locale key (and its params) the rendered state line reads from — the
+ * copy explains WHY the light is what it is, derived once here so the
+ * component only renders. */
+export interface PeerDiscoveryLightView {
+    light: LightState;
+    copyKey: PeerDiscoveryCopyKey;
+    copyParams?: Record<string, string>;
+}
+/**
+ * The third peer wizard light (设备发现与会话同步) off the body's OWN sync
+ * facts (PC-14a): `ready` under an authorized gateway is the ONLY green —
+ * never a non-empty peers list, a lan path or a mounted count. `partial` is
+ * honestly pending (its KNOWN ready/candidate counts ride the copy; unknown
+ * counts never guess 0); a blocked identity — and any locally known
+ * mismatch, which is a LOCAL fact that survives even an old body — is red;
+ * everything else is amber. An old body without the sync block (or with an
+ * unknown state word) reads the explicit UNKNOWN copy: the decided fallback,
+ * never "peers non-empty is green". The copy speaks of handshakes completed
+ * and syncing MAY START — never that any concrete session data has finished
+ * synchronizing.
+ */
+export declare function derivePeerDiscoveryLight(input: {
+    gatewayState: string;
+    mismatchCount: number;
+    sync?: PeerSyncReadinessView | undefined;
+}): PeerDiscoveryLightView;
+/** The peer node's three wizard lights (PG-9 + PC-14a): ① 本机身份已就绪,
+ * ② 网络准入状态 (authorized green, pending-approval amber — the
+ * 「等待网络管理员批准」copy), ③ 设备发现与会话同步 — the third light reads
+ * the body's sync facts through {@link derivePeerDiscoveryLight}; without
+ * them (an old body) it stays pending with the explicit unknown copy. */
 export interface PeerWizardLights {
     identity: LightState;
     admission: LightState;
@@ -388,15 +422,14 @@ export interface PeerWizardLights {
  * green once the engine reports a node id (amber while the engine is not
  * wired); admission maps the gateway state (green `authorized`, amber
  * `pending-approval` / `connecting` / `offline` / unconfigured, red
- * `mismatch` / `revoked` / `paused`); discovery is green once devices ride
- * the network, red when a local TOFU mismatch blocks one of them, amber on
- * an empty or not-yet-authorized network.
+ * `mismatch` / `revoked` / `paused`); discovery follows the sync facts per
+ * {@link derivePeerDiscoveryLight}.
  */
 export declare function derivePeerWizardLights(input: {
     identityReady: boolean;
     gatewayState: string;
-    peerCount: number;
     mismatchCount: number;
+    sync?: PeerSyncReadinessView | undefined;
 }): PeerWizardLights;
 /** Pairing-code countdown, whole seconds, never negative. */
 export declare function pairingSecondsLeft(expiresAt: number, now: number): number;

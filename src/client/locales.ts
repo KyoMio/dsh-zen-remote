@@ -593,6 +593,20 @@ export const zh = {
   'wizard.peer.lightIdentity': '本机身份已就绪',
   'wizard.peer.lightAdmission': '网络准入状态',
   'wizard.peer.lightDiscovery': '设备发现与会话同步',
+  // PC-14a: the third light's per-verdict lines off the body's own sync
+  // facts — 「可开始同步」 speaks of the completed handshakes, never of any
+  // concrete session data having finished synchronizing; the unmounted word
+  // stays NEUTRAL (fix1: no capacity claim — 满额说明 rides the PC-11a
+  // capacity fields elsewhere in the page).
+  'wizard.peer.syncReady': '远端握手完成，可开始同步',
+  'wizard.peer.syncWaitingPeers': '已入网，等待其他设备加入',
+  'wizard.peer.syncIgnored': '发现的设备均已被本机忽略',
+  'wizard.peer.syncPartialReady': '{ready} / {total} 台设备握手就绪',
+  'wizard.peer.syncBlocked': '有设备身份异常，等待本机信任确认',
+  'wizard.peer.syncNotMounted': '有设备尚未挂载',
+  'wizard.peer.syncNotOnline': '设备尚未完成握手',
+  'wizard.peer.syncGatewayHold': '设备网络尚未就绪',
+  'wizard.peer.syncUnknown': '同步状态未知',
   'wizard.peer.pendingApproval': '已提交入网申请，等待网络管理员批准',
   'wizard.peer.joinFailed': '加入网络失败：{reason}',
   'wizard.peer.joinInvalid': '邀请链接格式无效，请粘贴完整的 zr-net:// 或 zr-nets:// 链接',
@@ -1237,6 +1251,18 @@ export const en: Record<MobileNavKey, string> = {
   'wizard.peer.lightIdentity': 'Local identity ready',
   'wizard.peer.lightAdmission': 'Network admission',
   'wizard.peer.lightDiscovery': 'Device discovery & session sync',
+  // PC-14a: the third light's per-verdict lines (zh/en symmetric) — "ready
+  // to sync" speaks of completed handshakes, never of session data having
+  // finished synchronizing; the unmounted word stays neutral (fix1).
+  'wizard.peer.syncReady': 'Remote handshakes complete — ready to sync',
+  'wizard.peer.syncWaitingPeers': 'Joined the network — waiting for other devices',
+  'wizard.peer.syncIgnored': 'All discovered devices are ignored by this machine',
+  'wizard.peer.syncPartialReady': '{ready} / {total} devices handshake-ready',
+  'wizard.peer.syncBlocked': 'A device identity changed — waiting for local trust confirmation',
+  'wizard.peer.syncNotMounted': 'Some devices are not mounted yet',
+  'wizard.peer.syncNotOnline': 'Devices have not completed the handshake yet',
+  'wizard.peer.syncGatewayHold': 'The device network is not ready yet',
+  'wizard.peer.syncUnknown': 'Sync readiness unknown',
   'wizard.peer.pendingApproval': 'Join request submitted — waiting for the network administrator to approve',
   'wizard.peer.joinFailed': 'Joining failed: {reason}',
   'wizard.peer.joinInvalid': 'The invite link is malformed — paste the full zr-net:// or zr-nets:// link',
