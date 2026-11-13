@@ -9,11 +9,15 @@
  * write preserves `serverId` and `servers`, an identity write preserves the
  * table and the list.
  *
- * The file is 0600 on purpose: `servers` rows carry pairing tokens. The write
- * is the same atomic tmp+rename dance the share table has always used, with
- * an explicit chmod in front of the rename (writeFileSync's `mode` only
- * applies at creation — a leftover `.tmp` from a crashed run would keep its
- * old mode).
+ * The file is 0600 on purpose: `servers` rows carry pairing tokens and the
+ * peer identity carries the private seed. The write is the same atomic
+ * tmp+rename dance the share table has always used, with a MANDATORY chmod
+ * in front of the rename (writeFileSync's `mode` only applies at creation —
+ * a leftover `.tmp` from a crashed run would keep its old mode): a chmod
+ * that fails aborts the write, removes the tmp and surfaces the error, so a
+ * state file is never replaced by one of unknown mode (PC-13). The 0600 is a
+ * POSIX promise — on Windows chmodSync can only move the read-only
+ * attribute, and nothing here claims ACL equivalence.
  *
  * Migration (MS-1): the pre-multi-server layout kept three separate files —
  * `zen-remote-server.json` (the identity) and `zen-remote-shares.json` (the
@@ -129,18 +133,16 @@ export interface ZenRemoteStateFile {
 /** The one legal shape of a persisted server id (relay-server.ts mints it). */
 export declare function isLegalServerId(value: unknown): value is string;
 /**
- * Read and parse the state file. A missing file is the normal first run; a
- * damaged file reads as empty — quarantined as `<file>.corrupt-<now>` UNLESS
- * it still carries a migration source (a legal `serverId`, the one shape the
- * migration paths know how to rescue): renaming that away would silently
- * reset the server identity on the next load, so the file stays put and the
- * salvageable field rides along in the returned state.
- * Never throws.
+ * The tolerant read most callers want: identical to {@link readStateFileStrict}
+ * except that storage failures degrade to an empty state too. Never throws —
+ * a damaged or unreadable file degrades, never a dead plugin. Writers use the
+ * strict variant instead: overwriting a file they could not read is how
+ * state silently disappears (PC-13).
  */
 export declare function readStateFile(filePath: string): ZenRemoteStateFile;
 /**
  * The one write door: read the CURRENT file, let `updater` produce the next
- * state from it, then atomically replace the file (tmp at 0600, best-effort
+ * state from it, then atomically replace the file (tmp at 0600, mandatory
  * chmod, rename). Belt AND braces: the braces are the updaters in this module
  * spreading `current` explicitly; the belt is the merge below — an updater
  * that names only the field it owns must never erase the top-level fields it
@@ -148,7 +150,9 @@ export declare function readStateFile(filePath: string): ZenRemoteStateFile;
  * field the updater explicitly sets to `undefined` still goes away, so
  * removal stays expressible. The result is normalized to the known
  * top-level fields (identity, table, list, and PG-2's peer blocks) before it
- * reaches disk. Throws on I/O failure; callers
+ * reaches disk. The read is the STRICT one (PC-13): an existing file that
+ * cannot be read makes the write throw, never rename a fresh state over
+ * data the writer never saw. Throws on I/O failure; callers
  * decide what that means (share-store records it, loadServerId degrades, the
  * migration helpers swallow it).
  */
@@ -264,6 +268,13 @@ export interface PeerIdentityWithServerId {
  *
  * Writes are atomic and 0600 through {@link writeStateFile}; the belt keeps
  * the share table and the paired list intact.
+ *
+ * PC-13: the pure-reuse path below performs NO write, so a wide mode on an
+ * already-valid identity file would never be touched again — the mode is
+ * checked and repaired to 0600 BEFORE reading, and a failed repair (or an
+ * unreadable file, via the strict read) throws here. It must never be read
+ * as "no identity": that would mint a fresh private key and rename it over
+ * the old one.
  */
 export declare function ensurePeerIdentity(filePath: string, now?: number): PeerIdentityWithServerId;
 /** The peer-network membership record, validated at read; absent until a
