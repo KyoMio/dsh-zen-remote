@@ -37,12 +37,16 @@ import type { ShareStore } from './share-store.js'
 import { ensureServerIdMigrated, readStateFile, STATE_FILE_NAME, writeStateFile } from './state-store.js'
 import { decideHttpRoute, decideInvoke, decideStream, decideUploadQuery, parseEventResultBody } from './relay-access.js'
 import {
+  createForgeStatesState,
   createWorkspaceFollowState,
   filterControlFrame,
   filterJobListFrame,
   filterModelCatalogResult,
   filterSessionListResult,
+  filterSessionSearchResult,
   filterWorkspaceFrame,
+  filterWorkspaceValueResult,
+  type ForgeStatesState,
 } from './relay-filter.js'
 import { SESSION_REFERENCE_URI, collectReferenceTexts, decodeSessionReferenceUri } from './session-reference.js'
 import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js'
@@ -1572,6 +1576,35 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             return
           }
         }
+        // Zero-shared-session privacy gate for agent presets: an unshared server
+        // must not leak custom preset rosters or system-prompt markdown.
+        if (namespace === 'agentPresets' && (method === 'list' || method === 'read')) {
+          if (store.list().length === 0) {
+            if (method === 'list') {
+              responseJson(res, 200, { ok: true, value: { presets: [] } })
+            } else {
+              responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+            }
+            return
+          }
+        }
+        // Check target workspace existence (never share-checked) and re-run
+        // session ownership after awaiting the probe.
+        if (namespace === 'workspace' && method === 'insertSessionBefore') {
+          const request = isPlainObject(args) ? args.request : undefined
+          const workspaceId =
+            isPlainObject(request) && typeof request.workspaceId === 'string' && request.workspaceId !== ''
+              ? request.workspaceId
+              : undefined
+          if (workspaceId === undefined || !(await workspaceExists(workspaceId, hangUp.signal))) {
+            responseJson(res, 403, { ok: false, error: { code: 'workspace/not-found' } })
+            return
+          }
+          if (!decideInvoke(namespace, method, args, isAccessible).allow) {
+            responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+            return
+          }
+        }
         // T31-fix: the forwarded create is REBUILT as a whitelist, not
         // trimmed by deletion — exactly `{workspaceId, agentPreset?}` and
         // nothing else, so a hostile or buggy client cannot smuggle extra
@@ -1637,7 +1670,11 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               ? filterAccessibleCandidateRows(value, isAccessible)
               : decision.filter === 'model-catalog'
                 ? filterModelCatalogResult(value)
-                : value
+                : decision.filter === 'workspace-value'
+                  ? filterWorkspaceValueResult(value, isAccessible)
+                  : decision.filter === 'session-search'
+                    ? filterSessionSearchResult(value, isAccessible)
+                    : value
         // 2026-10-14: a binary-result method (workspaceFiles/readBytes) cannot
         // ride JSON.stringify — typed arrays collapse into plain objects and
         // the sub-client's own zod validation rejects the answer (remote image
@@ -2802,6 +2839,8 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
 
         let unsubscribe = (): void => {}
         let applyToState: ((frame: unknown) => void) | undefined
+        let forgeState: ForgeStatesState | undefined
+        let companionAbort: AbortController | undefined
 
         if (decision.filter === 'workspace') {
           // Keep the UNFILTERED latest workspace state so share changes can
@@ -2844,6 +2883,16 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           unsubscribe = store.subscribe((event) => {
             if (event.type !== 'shared' || finished || clientGone) return
             void syncProjections(event.sessionId)
+          })
+        } else if (decision.filter === 'forge-states') {
+          const state = createForgeStatesState()
+          forgeState = state
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'shared' && event.type !== 'unshared') return
+            if (finished || clientGone) return
+            for (const frame of state.onShareChange(isAccessible)) {
+              void writeLine({ type: 'frame', frame })
+            }
           })
         } else if (eventsSub !== undefined) {
           // `$zr/events` (T32-fix): the share table closing a session must
@@ -2898,10 +2947,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               ? (frame) => filterWorkspaceFrame(frame, isAccessible)
               : decision.filter === 'control'
                 ? (frame) => filterControlFrame(frame, isAccessible)
-                : namespace === 'job' && method === 'list'
-                  // 4b: ownerless and foreign jobs stay server-side.
-                  ? (frame) => filterJobListFrame(frame, ownerSessionIdOf(args))
-                  : (frame) => frame
+                : decision.filter === 'forge-states'
+                  ? (frame) => forgeState!.filterUpstreamFrame(frame, isAccessible)
+                  : namespace === 'job' && method === 'list'
+                    // 4b: ownerless and foreign jobs stay server-side.
+                    ? (frame) => filterJobListFrame(frame, ownerSessionIdOf(args))
+                    : (frame) => frame
 
         // closeAll's kill switch for THIS stream: idempotent, safe to call on
         // an already-finished stream. Registered only while the response is
@@ -2949,6 +3000,40 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             // stream method. TA-1: a duplex stream rides with its uplink
             // queue (the field's PRESENCE is the duplex flag the gateway
             // reads) and the shape-checked window, both optional.
+            if (forgeState !== undefined) {
+              companionAbort = new AbortController()
+              if (hangUp.signal.aborted) companionAbort.abort()
+              else hangUp.signal.addEventListener('abort', () => companionAbort?.abort(), { once: true })
+              try {
+                const listValue = await gateway.invoke(withPeer({
+                  namespace: 'session',
+                  method: 'list',
+                  args: { _request: {} },
+                  signal: companionAbort.signal,
+                }, options.getPeer))
+                forgeState.seedFromSessionList(listValue)
+              } catch {
+                // Best-effort seed; companion session/control below also streams baseline.
+              }
+              void (async () => {
+                try {
+                  const ctrl = await gateway.stream(withPeer({
+                    namespace: 'session',
+                    method: 'control',
+                    args: {},
+                    signal: companionAbort!.signal,
+                  }, options.getPeer))
+                  for await (const cf of ctrl) {
+                    if (finished || clientGone || companionAbort!.signal.aborted) break
+                    for (const out of forgeState!.applyControlFrame(cf, isAccessible)) {
+                      void writeLine({ type: 'frame', frame: out })
+                    }
+                  }
+                } catch {
+                  // Companion control stream is best-effort for live binding updates.
+                }
+              })()
+            }
             const iterable =
               eventsSub !== undefined
                 ? await openEventsStream(hangUp.signal)
@@ -2985,6 +3070,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             closeWith({ type: 'error', error: errorEnvelopeOf(error).error })
           }
         } finally {
+          companionAbort?.abort()
           openStreamKills.delete(killThisStream)
           clearInterval(heartbeat)
           unsubscribe()

@@ -151,7 +151,7 @@ type SessionField =
  * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
  * forwarding subscription is filtered by relay-server.ts itself — it needs
  * the per-eventId registry, not a pure frame function). */
-export type StreamFilter = 'workspace' | 'control'
+export type StreamFilter = 'workspace' | 'control' | 'forge-states'
 
 /** Which standing filter the caller must apply to an invoke result before it
  * travels: `session-list` narrows the unscoped `session/list` items
@@ -162,7 +162,12 @@ export type StreamFilter = 'workspace' | 'control'
  * `session/modelCatalog` `failures` array (T52-fix — relay-filter.ts: the
  * host's per-group error texts may carry endpoint or credential details, and
  * the client discards `failures` anyway). */
-export type InvokeFilter = 'session-list' | 'session-reference-candidates' | 'model-catalog'
+export type InvokeFilter =
+  | 'session-list'
+  | 'session-reference-candidates'
+  | 'model-catalog'
+  | 'workspace-value'
+  | 'session-search'
 
 interface RelayMethod {
   /** Every field that carries session ownership for this method. ALL of
@@ -204,8 +209,8 @@ interface RelayMethod {
  * The registry. Deliberately small: everything not listed here — plugin and
  * account management, settings, credentials, the methods located by other
  * ids (`schedule/update|delete|history`, `goals/create|complete`,
- * `fileUploads/list|resolve`, `agentPresets/list|read`,
- * `permissionPresets/*`, `dynamicCordisRunner/*`) — is refused by default.
+ * `fileUploads/list|resolve`, `permissionPresets/*`, `dynamicCordisRunner/*`) —
+ * is refused by default.
  *
  * T31 registered the five session-creating / agent-scoped calls after
  * verifying their ownership story (see the field notes above): creations
@@ -384,8 +389,47 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'workspace/unpinSession': { fields: ['request.sessionId'] },
   'workspace/archiveSession': { fields: ['request.sessionId'] },
   'workspace/unarchiveSession': { fields: ['request.sessionId'] },
+  'workspace/insertSessionBefore': { fields: ['request.workspaceId', 'request.sessionId'], optionalFields: ['request.beforeSessionId'], resultFilter: 'workspace-value' },
+  // global search & agent presets (privacy-gated / row-filtered)
+  'session/search': { fields: [], resultFilter: 'session-search' },
+  'agentPresets/list': { fields: [] },
+  'agentPresets/read': { fields: [] },
   // workspace — the global follow stream
   'workspace/follow': { fields: [], stream: true, streamFilter: 'workspace' },
+  // forgePanel — 31 session-scoped endpoints (top-level sessionId)
+  'forgePanel/follow': { fields: ['sessionId'], stream: true },
+  'forgePanel/branches': { fields: ['sessionId'] },
+  'forgePanel/diffBases': { fields: ['sessionId'] },
+  'forgePanel/localCommits': { fields: ['sessionId'] },
+  'forgePanel/localDiff': { fields: ['sessionId'] },
+  'forgePanel/localText': { fields: ['sessionId'] },
+  'forgePanel/changeRequestChecks': { fields: ['sessionId'] },
+  'forgePanel/changeRequestCommits': { fields: ['sessionId'] },
+  'forgePanel/changeRequestDiff': { fields: ['sessionId'] },
+  'forgePanel/changeRequestReview': { fields: ['sessionId'] },
+  'forgePanel/changeRequestText': { fields: ['sessionId'] },
+  'forgePanel/changeRequestViewed': { fields: ['sessionId'] },
+  'forgePanel/reviewerCandidates': { fields: ['sessionId'] },
+  'forgePanel/requestWorktree': { fields: ['sessionId'] },
+  'forgePanel/cancelWorktree': { fields: ['sessionId'] },
+  'forgePanel/continueInProject': { fields: ['sessionId'] },
+  'forgePanel/restoreWorktree': { fields: ['sessionId'] },
+  'forgePanel/retryWorktree': { fields: ['sessionId'] },
+  'forgePanel/stopCreation': { fields: ['sessionId'] },
+  'forgePanel/worktreeCleanup': { fields: ['sessionId'] },
+  'forgePanel/refresh': { fields: ['sessionId'] },
+  'forgePanel/track': { fields: ['sessionId'] },
+  'forgePanel/dismiss': { fields: ['sessionId'] },
+  'forgePanel/setFileViewed': { fields: ['sessionId'] },
+  'forgePanel/changeRequestReviewWrite': { fields: ['sessionId'] },
+  'forgePanel/submitReview': { fields: ['sessionId'] },
+  'forgePanel/requestReviews': { fields: ['sessionId'] },
+  'forgePanel/rerunChecks': { fields: ['sessionId'] },
+  'forgePanel/markReady': { fields: ['sessionId'] },
+  'forgePanel/updateBranch': { fields: ['sessionId'] },
+  'forgePanel/merge': { fields: ['sessionId'] },
+  // forgePanel — global PR badge state stream
+  'forgePanel/changeRequestStates': { fields: [], stream: true, streamFilter: 'forge-states' },
   // the forwarded-event subscription (T32): special entry, no session fields —
   // its frames are judged per `agentId`, its answers per forwarded `eventId`
   '$zr/events': { fields: [], stream: true, events: true },

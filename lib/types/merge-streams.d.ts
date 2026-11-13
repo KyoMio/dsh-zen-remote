@@ -159,6 +159,11 @@ export interface MergerIdentity {
  */
 export type MergerAnnotation = 'none' | 'offline' | 'revoked' | 'unpaired' | 'mismatch';
 export type MergerLang = 'zh' | 'en';
+/** One workspace record rewritten for the UI: ids virtualized, the title
+ * prefixed with the server name and — while an annotation is set — suffixed
+ * with its status copy. Values are copied — the caller's frame is never
+ * mutated. */
+export declare function virtualizeWorkspace(record: Record<string, unknown>, identity: MergerIdentity, annotation: MergerAnnotation, lang?: MergerLang, workspaceEpoch?: number): Record<string, unknown>;
 export interface WorkspaceMergerOptions extends MergerIdentity {
     /** Monotonic re-mount epoch (`0` on first mount, incremented each time the
      * same serverId's slot emitted `remove` frames) so re-mounted virtual
@@ -439,6 +444,19 @@ export declare function mergeModelCatalogs(localValue: unknown, remoteValue: unk
  * group-agnostic ids and stay as they are.
  */
 export declare function virtualizeModelSelectionValue(value: unknown, serverId: string): unknown;
+export interface ForgeStatesMerger {
+    onLocal(frame: unknown): unknown[];
+    onRemote(serverId: string, frame: unknown): unknown[];
+    onRemoteGone(serverId: string): unknown[];
+}
+/**
+ * Merge local and remote `forgePanel/changeRequestStates` frames into a
+ * single stream compatible with DSH's `foldStates` reducer (which clears its
+ * map on every `baseline` frame). Remote baselines fold in as `changed` frames
+ * once `localSeen` is established, except when a server shrinks/leaves and a
+ * composed `baseline` is required to evict stale remote URLs.
+ */
+export declare function createForgeStatesMerger(): ForgeStatesMerger;
 /**
  * Rewrite one projection key's value for a remote session so embedded
  * server-scoped ids (`modelSelection.provider`, `subagentCatalog[].id`,
@@ -531,4 +549,20 @@ export declare function composeMergedWorkspaceFrames(local: LocalWorkspaceLists,
     };
     workspaces: Record<string, unknown>[];
 };
+/**
+ * Merge one server's filtered `session/search` `{ items, hasMore }` answer
+ * onto the accumulator (local first, then each server), virtualizing every
+ * valid remote hit's `sessionId`.
+ */
+export declare function mergeSessionSearch(localResult: unknown, remoteResult: unknown, serverId: string): unknown;
+/** Format one remote agent preset display name with localized built-in fallback
+ * and `[<serverName>] ` prefix so the origin server stays clear. */
+export declare function resolveRemotePresetName(presetId: string, rawName: unknown, serverName: string, lang?: MergerLang): string;
+/**
+ * Merge one server's `agentPresets/list` roster onto the local answer: every
+ * remote preset gets a virtual `id`, `[serverName]`-prefixed display name
+ * (with built-in preset fallback), and `isDefault: false` so local default
+ * settings never accidentally pick a remote preset id.
+ */
+export declare function mergeAgentPresetRosters(localResult: unknown, remoteResult: unknown, identity: MergerIdentity, lang?: MergerLang): unknown;
 //# sourceMappingURL=merge-streams.d.ts.map

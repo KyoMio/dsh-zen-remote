@@ -34,7 +34,7 @@ for (const key of Object.keys(process.env)) {
 }
 
 const { checkGatewayShape } = require('../lib/intercept-shape.js')
-const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS, REMOTE_READ_METHODS, REMOTE_UPLINK_STREAM_METHODS, isRemoteWrite, rewriteRemoteEventFrame } = require('../lib/intercept.js')
+const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS, REMOTE_READ_METHODS, REMOTE_UPLINK_STREAM_METHODS, SESSION_STREAM_HOLD_ENDPOINTS, isRemoteWrite, rewriteRemoteEventFrame } = require('../lib/intercept.js')
 const { toVirtual, VIRTUAL_GROUP_NAME_MARK: MARK, encodeServerIdZeroWidth } = require('../lib/virtual-id.js')
 const { encodeSessionReferenceUri, decodeSessionReferenceUri } = require('../lib/relay-server.js')
 const { RelayError } = require('../lib/relay-client.js')
@@ -701,7 +701,7 @@ test('an unregistered method carrying a virtual id is refused before anything ru
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()
   const { handle } = install(gateway, relay)
-  const envelope = await gateway.rpcBridge('session/search', { args: { request: { query: 'x', sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  const envelope = await gateway.rpcBridge('schedule/update', { args: { request: { id: 's1', sessionId: VIRTUAL_ID } } }, undefined, undefined)
   // `details: {}` is what the UI's server-response parser REQUIRES — a
   // details-less failure throws `invalid server-response failure` there.
   assert.deepEqual(envelope, { ok: false, error: { code: 'remote-unsupported', message: '此功能暂不支持远程会话', details: {} } })
@@ -749,7 +749,7 @@ test('virtual ids from another server (or mixed servers) are remote-mismatch', a
   assert.equal(relay.invokes.length, 0)
 
   // b) two ids of DIFFERENT servers inside one call (deep-scanned table-miss)
-  const mixed = await gateway.rpcBridge('session/search', { args: { request: { sessionId: VIRTUAL_ID, query: toVirtual('eeeeeeee', 'x') } } }, undefined, undefined)
+  const mixed = await gateway.rpcBridge('schedule/update', { args: { request: { id: 's1', sessionId: VIRTUAL_ID, label: toVirtual('eeeeeeee', 'x') } } }, undefined, undefined)
   assert.equal(mixed.error.code, 'remote-mismatch')
 
   // c) a stream with a foreign id throws instead of answering
@@ -1620,14 +1620,14 @@ test('diagnostics reports the shape verdict, the self-check and the failure ring
   const relay = createFakeRelay()
   const { handle } = install(gateway, relay)
   handle.noteSelfCheck({ ok: true })
-  await gateway.rpcBridge('session/search', { args: { request: { sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  await gateway.rpcBridge('schedule/update', { args: { request: { id: 's1', sessionId: VIRTUAL_ID } } }, undefined, undefined)
   await gateway.rpcBridge('session/page', { args: { request: { address: { kind: 'session', sessionId: toVirtual('ffffffff', 's') } } } }, undefined, undefined)
   const diagnostics = handle.diagnostics()
   assert.equal(diagnostics.installed, true)
   assert.equal(diagnostics.shape.ok, true)
   assert.deepEqual(diagnostics.selfCheck, { ok: true })
   assert.deepEqual(diagnostics.recentFailures.map((f) => [f.endpoint, f.code]), [
-    ['session/search', 'remote-unsupported'],
+    ['schedule/update', 'remote-unsupported'],
     ['session/page', 'remote-mismatch'],
   ])
   for (const failure of diagnostics.recentFailures) assert.match(failure.time, /^\d{4}-\d{2}-\d{2}T/)
@@ -2399,7 +2399,7 @@ test('session/create rewrites the virtual workspaceId, drops sessionId, virtuali
   const args = { request: { workspaceId: workspaceVirtual, cwd: '/client/side', sessionId: 'session-chosen-locally' } }
   const envelope = await gateway.rpcBridge('session/create', { args }, undefined, undefined)
   assert.equal(envelope.ok, true)
-  assert.deepEqual(envelope.value, { sessionId: toVirtual(SERVER_ID, 'session-fresh'), agentPreset: 'default' }, 'the minted id travels virtualized')
+  assert.deepEqual(envelope.value, { sessionId: toVirtual(SERVER_ID, 'session-fresh'), agentPreset: toVirtual(SERVER_ID, 'default') }, 'the minted id and preset travel virtualized')
   assert.deepEqual(relay.invokes, [{
     namespace: 'session',
     method: 'create',
@@ -4426,7 +4426,7 @@ test('the T41a agentId group restores the top-level agentId; candidates rows vir
   assert.deepEqual(relay.invokes[1].args, { agentId: LOCAL_ID, line: '/model deepseek-chat', submittedAttachments: [] })
 
   // agentPresets/select and the @ resolver travel the same way.
-  await gateway.rpcBridge('agentPresets/select', { args: { agentId: VIRTUAL_ID, agentPreset: 'default' } }, undefined, undefined)
+  await gateway.rpcBridge('agentPresets/select', { args: { agentId: VIRTUAL_ID, agentPreset: toVirtual(SERVER_ID, 'default') } }, undefined, undefined)
   await gateway.rpcBridge('sessionReferenceResolver/candidates', { args: { agentId: VIRTUAL_ID, query: '调试' } }, undefined, undefined)
   assert.deepEqual(relay.invokes[2].args, { agentId: LOCAL_ID, agentPreset: 'default' })
   assert.deepEqual(relay.invokes[3].args, { agentId: LOCAL_ID, query: '调试' })
@@ -4999,6 +4999,7 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
     'workspace/unpinSession',
     'workspace/archiveSession',
     'workspace/unarchiveSession',
+    'workspace/insertSessionBefore',
     // T41a mutations
     'goals/edit',
     'goals/create',
@@ -5026,6 +5027,25 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
     // the write side too (refused remote-offline). The interceptor's own
     // uplink wiring lands in TA-2.
     'terminal/attach',
+    // API-4: 18 forgePanel write mutations
+    'forgePanel/requestWorktree',
+    'forgePanel/cancelWorktree',
+    'forgePanel/continueInProject',
+    'forgePanel/restoreWorktree',
+    'forgePanel/retryWorktree',
+    'forgePanel/stopCreation',
+    'forgePanel/worktreeCleanup',
+    'forgePanel/refresh',
+    'forgePanel/track',
+    'forgePanel/dismiss',
+    'forgePanel/setFileViewed',
+    'forgePanel/changeRequestReviewWrite',
+    'forgePanel/submitReview',
+    'forgePanel/requestReviews',
+    'forgePanel/rerunChecks',
+    'forgePanel/markReady',
+    'forgePanel/updateBranch',
+    'forgePanel/merge',
   ])
   for (const endpoint of Object.keys(CLIENT_METHOD_FIELDS)) {
     assert.ok(
@@ -5759,4 +5779,227 @@ test('API-2: rewriteRemoteEventFrame virtualizes all 5 session-scoped emits and 
   }
   assert.equal(SESSION_STREAM_HOLD_ENDPOINTS?.has('toolResults/watch') ?? false, false)
   assert.equal(SESSION_STREAM_HOLD_ENDPOINTS?.has('userQuestions/attachWait') ?? false, false)
+})
+
+test('API-4: 31 forgePanel session-scoped endpoints classify read vs write and forgePanel/follow stays outside SESSION_STREAM_HOLD_ENDPOINTS', async () => {
+  assert.equal(SESSION_STREAM_HOLD_ENDPOINTS.has('forgePanel/follow'), false)
+  assert.equal(isRemoteWrite('forgePanel/follow'), false)
+  for (const m of [
+    'forgePanel/branches',
+    'forgePanel/diffBases',
+    'forgePanel/localCommits',
+    'forgePanel/localDiff',
+    'forgePanel/localText',
+    'forgePanel/changeRequestChecks',
+    'forgePanel/changeRequestCommits',
+    'forgePanel/changeRequestDiff',
+    'forgePanel/changeRequestReview',
+    'forgePanel/changeRequestText',
+    'forgePanel/changeRequestViewed',
+    'forgePanel/reviewerCandidates',
+  ]) {
+    assert.equal(isRemoteWrite(m), false, m)
+  }
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+  relay.transition('offline')
+  for (const m of [
+    'forgePanel/requestWorktree',
+    'forgePanel/cancelWorktree',
+    'forgePanel/continueInProject',
+    'forgePanel/restoreWorktree',
+    'forgePanel/retryWorktree',
+    'forgePanel/stopCreation',
+    'forgePanel/worktreeCleanup',
+    'forgePanel/refresh',
+    'forgePanel/track',
+    'forgePanel/dismiss',
+    'forgePanel/setFileViewed',
+    'forgePanel/changeRequestReviewWrite',
+    'forgePanel/submitReview',
+    'forgePanel/requestReviews',
+    'forgePanel/rerunChecks',
+    'forgePanel/markReady',
+    'forgePanel/updateBranch',
+    'forgePanel/merge',
+  ]) {
+    assert.equal(isRemoteWrite(m), true, m)
+    const res = await gateway.rpcBridge(m, { args: { sessionId: VIRTUAL_ID } }, undefined, undefined)
+    assert.equal(res.ok, false, m)
+    assert.equal(res.error.code, 'remote-offline', m)
+  }
+  assert.equal(relay.invokes.length, 0)
+  handle.uninstall()
+})
+
+test('API-6: workspace/insertSessionBefore rejects mixed local/remote ids and virtualizes WorkspaceValue result', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const wsVirtual = toVirtual(SERVER_ID, 'w-1')
+  const beforeVirtual = toVirtual(SERVER_ID, 's-before')
+  relay.invokeValue = {
+    workspace: {
+      workspaceId: 'w-1',
+      title: '工作区',
+      path: '/srv/w-1',
+      sessionIds: ['s-1', 's-before'],
+    },
+  }
+  const { handle } = install(gateway, relay)
+
+  // Mixed local + remote ids are refused before reaching relay or local gateway
+  const mixed = await gateway.rpcBridge(
+    'workspace/insertSessionBefore',
+    { args: { request: { workspaceId: wsVirtual, sessionId: 'local-session', beforeSessionId: beforeVirtual } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(mixed.ok, false)
+  assert.equal(mixed.error.code, 'remote-mismatch')
+  assert.equal(relay.invokes.length, 0)
+  assert.equal(gateway.rpcCalls.length, 0)
+
+  // Same-server remote insert forwards stripped ids and virtualizes WorkspaceValue
+  const ok = await gateway.rpcBridge(
+    'workspace/insertSessionBefore',
+    { args: { request: { workspaceId: wsVirtual, sessionId: VIRTUAL_ID, beforeSessionId: beforeVirtual } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(ok.ok, true)
+  assert.deepEqual(relay.invokes[0].args, {
+    request: { workspaceId: 'w-1', sessionId: LOCAL_ID, beforeSessionId: 's-before' },
+  })
+  assert.equal(ok.value.workspace.workspaceId, wsVirtual)
+  assert.equal(ok.value.workspace.title, '测试服务器 · 工作区')
+  assert.deepEqual(ok.value.workspace.sessionIds, [toVirtual(SERVER_ID, 's-1'), beforeVirtual])
+  handle.uninstall()
+})
+
+test('API-6: session/search & agentPresets/* merge across local and remote, protect local settings, and validate select/create', async () => {
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+
+  // settings/update refuses any virtual preset id
+  const settingsRes = await gateway.rpcBridge(
+    'settings/update',
+    { args: { key: 'agent-preset-registry', patch: { selectedDefault: toVirtual(SERVER_ID, 'ptc') } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(settingsRes.ok, false)
+  assert.equal(settingsRes.error.code, 'remote-unsupported')
+  assert.equal(gateway.rpcCalls.length, 0)
+
+  // agentPresets/select routing: local+virtual, remote+local, cross-server mismatch, same-server echo
+  const localPlusRemotePreset = await gateway.rpcBridge(
+    'agentPresets/select',
+    { args: { agentId: 'local-session', agentPreset: toVirtual(SERVER_ID, 'ptc') } },
+    undefined,
+    undefined,
+  )
+  assert.equal(localPlusRemotePreset.ok, false)
+  assert.equal(localPlusRemotePreset.error.code, 'remote-unsupported')
+
+  const remotePlusLocalPreset = await gateway.rpcBridge(
+    'agentPresets/select',
+    { args: { agentId: VIRTUAL_ID, agentPreset: 'standard' } },
+    undefined,
+    undefined,
+  )
+  assert.equal(remotePlusLocalPreset.ok, false)
+  assert.equal(remotePlusLocalPreset.error.code, 'remote-unsupported')
+  assert.ok(remotePlusLocalPreset.error.message.includes('测试服务器'))
+
+  const crossServerSelect = await gateway.rpcBridge(
+    'agentPresets/select',
+    { args: { agentId: VIRTUAL_ID, agentPreset: toVirtual('ffffffff', 'ptc') } },
+    undefined,
+    undefined,
+  )
+  assert.equal(crossServerSelect.ok, false)
+  assert.equal(crossServerSelect.error.code, 'remote-mismatch')
+
+  relay.invokeValue = 'ptc'
+  const sameServerSelect = await gateway.rpcBridge(
+    'agentPresets/select',
+    { args: { agentId: VIRTUAL_ID, agentPreset: toVirtual(SERVER_ID, 'ptc') } },
+    undefined,
+    undefined,
+  )
+  assert.deepEqual(sameServerSelect, { ok: true, value: toVirtual(SERVER_ID, 'ptc') })
+
+  // session/create preset routing: local workspace + virtual preset refused; same server works
+  const createLocalWithRemotePreset = await gateway.rpcBridge(
+    'session/create',
+    { args: { request: { workspaceId: 'local-ws', agentPreset: toVirtual(SERVER_ID, 'cordis') } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(createLocalWithRemotePreset.ok, false)
+  assert.equal(createLocalWithRemotePreset.error.code, 'remote-unsupported')
+
+  relay.invokeValue = { sessionId: 's-new', agentPreset: 'cordis' }
+  const createRemoteWithRemotePreset = await gateway.rpcBridge(
+    'session/create',
+    { args: { request: { workspaceId: toVirtual(SERVER_ID, 'w-1'), agentPreset: toVirtual(SERVER_ID, 'cordis') } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(createRemoteWithRemotePreset.ok, true)
+  assert.deepEqual(createRemoteWithRemotePreset.value, {
+    sessionId: toVirtual(SERVER_ID, 's-new'),
+    agentPreset: toVirtual(SERVER_ID, 'cordis'),
+  })
+
+  // agentPresets/read routes virtual preset id and localizes built-in name
+  relay.invokeValue = { agentPreset: 'minimal', content: '# Minimal prompt' }
+  const readRes = await gateway.rpcBridge(
+    'agentPresets/read',
+    { args: { agentPreset: toVirtual(SERVER_ID, 'minimal') } },
+    undefined,
+    undefined,
+  )
+  assert.deepEqual(readRes, {
+    ok: true,
+    value: {
+      agentPreset: toVirtual(SERVER_ID, 'minimal'),
+      content: '# Minimal prompt',
+      name: '[测试服务器] 极简模式',
+    },
+  })
+
+  // agentPresets/list merges local + remote presets
+  gateway.spec.rpc = {
+    'agentPresets/list': { ok: true, value: { presets: [{ id: 'standard', isDefault: true }] } },
+    'session/search': { ok: true, value: { items: [{ sessionId: 'l-1', title: 'Local' }], hasMore: false } },
+  }
+  relay.invokeValue = { presets: [{ id: 'ptc', isDefault: true }, { id: 'custom', name: '代码审查', isDefault: false }] }
+  const listRes = await gateway.rpcBridge('agentPresets/list', { args: {} }, undefined, undefined)
+  assert.deepEqual(listRes, {
+    ok: true,
+    value: {
+      presets: [
+        { id: 'standard', isDefault: true },
+        { id: toVirtual(SERVER_ID, 'ptc'), name: '[测试服务器] PTC 模式', isDefault: false },
+        { id: toVirtual(SERVER_ID, 'custom'), name: '[测试服务器] 代码审查', isDefault: false },
+      ],
+    },
+  })
+
+  relay.invokeValue = { items: [{ sessionId: 's-hit', title: 'Remote' }], hasMore: true }
+  const searchRes = await gateway.rpcBridge('session/search', { args: { request: { query: 'test' } } }, undefined, undefined)
+  assert.deepEqual(searchRes, {
+    ok: true,
+    value: {
+      items: [
+        { sessionId: 'l-1', title: 'Local' },
+        { sessionId: toVirtual(SERVER_ID, 's-hit'), title: 'Remote' },
+      ],
+      hasMore: true,
+    },
+  })
+  handle.uninstall()
 })

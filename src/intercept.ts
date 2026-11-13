@@ -90,14 +90,19 @@ import { INVOKE_BINARY_RESULT_METHODS, extractResultAttachments, restoreInvokeBi
 import {
   composeMergedWorkspaceFrames,
   createControlMerger,
+  createForgeStatesMerger,
   createWorkspaceMerger,
   localWorkspaceLists,
+  mergeAgentPresetRosters,
   mergeModelCatalogs,
   mergeSessionList,
+  mergeSessionSearch,
+  resolveRemotePresetName,
   sessionSummaryAddedFrames,
   virtualSessionIdsInWorkspaceFrames,
   virtualizeModelSelectionValue,
   virtualizeProjectionValues,
+  virtualizeWorkspace,
 } from './merge-streams.js'
 export { virtualizeProjectionValues }
 import type { ControlMerger, MergerAnnotation, MergerIdentity, MergerLang, RemoteWorkspaceContribution, WorkspaceMerger } from './merge-streams.js'
@@ -263,8 +268,46 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'workspace/unpinSession': ['request.sessionId'],
   'workspace/archiveSession': ['request.sessionId'],
   'workspace/unarchiveSession': ['request.sessionId'],
+  'workspace/insertSessionBefore': ['request.workspaceId', 'request.sessionId'],
+  // Global search & agent presets
+  'session/search': [],
+  'agentPresets/list': [],
+  'agentPresets/read': [],
   // workspace — the global follow stream, merged like the two session/* reads
   'workspace/follow': [],
+  // forgePanel — 31 session-scoped endpoints (top-level sessionId) + 1 global stream
+  'forgePanel/follow': ['sessionId'],
+  'forgePanel/branches': ['sessionId'],
+  'forgePanel/diffBases': ['sessionId'],
+  'forgePanel/localCommits': ['sessionId'],
+  'forgePanel/localDiff': ['sessionId'],
+  'forgePanel/localText': ['sessionId'],
+  'forgePanel/changeRequestChecks': ['sessionId'],
+  'forgePanel/changeRequestCommits': ['sessionId'],
+  'forgePanel/changeRequestDiff': ['sessionId'],
+  'forgePanel/changeRequestReview': ['sessionId'],
+  'forgePanel/changeRequestText': ['sessionId'],
+  'forgePanel/changeRequestViewed': ['sessionId'],
+  'forgePanel/reviewerCandidates': ['sessionId'],
+  'forgePanel/requestWorktree': ['sessionId'],
+  'forgePanel/cancelWorktree': ['sessionId'],
+  'forgePanel/continueInProject': ['sessionId'],
+  'forgePanel/restoreWorktree': ['sessionId'],
+  'forgePanel/retryWorktree': ['sessionId'],
+  'forgePanel/stopCreation': ['sessionId'],
+  'forgePanel/worktreeCleanup': ['sessionId'],
+  'forgePanel/refresh': ['sessionId'],
+  'forgePanel/track': ['sessionId'],
+  'forgePanel/dismiss': ['sessionId'],
+  'forgePanel/setFileViewed': ['sessionId'],
+  'forgePanel/changeRequestReviewWrite': ['sessionId'],
+  'forgePanel/submitReview': ['sessionId'],
+  'forgePanel/requestReviews': ['sessionId'],
+  'forgePanel/rerunChecks': ['sessionId'],
+  'forgePanel/markReady': ['sessionId'],
+  'forgePanel/updateBranch': ['sessionId'],
+  'forgePanel/merge': ['sessionId'],
+  'forgePanel/changeRequestStates': [],
   // The forwarded-event subscription (T32): the client reaches it through
   // relay.openStream('$zr','events') directly, never through the local
   // gateway — the empty fields entry exists to keep the two tables pinned
@@ -276,6 +319,7 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
  * `CLIENT_METHOD_FIELDS` identically keyed to `RELAY_METHODS[endpoint].fields`). */
 export const OPTIONAL_CLIENT_METHOD_FIELDS: Partial<Record<string, readonly SessionField[]>> = {
   'subagents/prompt': ['request.parentSessionId'],
+  'workspace/insertSessionBefore': ['request.beforeSessionId'],
 }
 
 function allClientFields(endpoint: string): readonly SessionField[] | undefined {
@@ -387,6 +431,25 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   'terminal/retain',
   // 0.2.2-rc.2: live Agent-terminal roster (WebTerminalInfo[]); read-only.
   'terminal/watch',
+  // forgePanel: follow stream + 12 unary reads + global PR badge stream
+  'forgePanel/follow',
+  'forgePanel/branches',
+  'forgePanel/diffBases',
+  'forgePanel/localCommits',
+  'forgePanel/localDiff',
+  'forgePanel/localText',
+  'forgePanel/changeRequestChecks',
+  'forgePanel/changeRequestCommits',
+  'forgePanel/changeRequestDiff',
+  'forgePanel/changeRequestReview',
+  'forgePanel/changeRequestText',
+  'forgePanel/changeRequestViewed',
+  'forgePanel/reviewerCandidates',
+  'forgePanel/changeRequestStates',
+  // Global search & agent preset reads
+  'session/search',
+  'agentPresets/list',
+  'agentPresets/read',
 ])
 
 /** Whether `endpoint` (a client-table method) is a remote WRITE: anything
@@ -423,6 +486,10 @@ const INTERCEPT_COPY = {
     modelGroupRemote: '该模型分组属于远程服务端，无法在本机会话中使用',
     modelGroupPickServer: (displayName: string) => `请选择「${displayName} · …」分组里的模型`,
     modelGroupMismatch: '此模型分组属于其他主服务端',
+    presetRemoteOnLocal: '该智能体预设属于远程服务端，无法在本机会话中使用',
+    presetPickServer: (displayName: string) => `请选择「[${displayName}] …」智能体预设`,
+    presetMismatch: '此智能体预设属于其他主服务端',
+    presetRemoteDefault: '不能将远程智能体预设设为本机默认预设',
   },
   en: {
     writeOffline: 'Server offline — remote session is temporarily read-only',
@@ -436,6 +503,10 @@ const INTERCEPT_COPY = {
     modelGroupRemote: 'This model group belongs to a remote server and cannot be used in a local session',
     modelGroupPickServer: (displayName: string) => `Select a model under "${displayName} · …"`,
     modelGroupMismatch: 'This model group belongs to another server',
+    presetRemoteOnLocal: 'This agent preset belongs to a remote server and cannot be used in a local session',
+    presetPickServer: (displayName: string) => `Select an agent preset under "[${displayName}] …"`,
+    presetMismatch: 'This agent preset belongs to another server',
+    presetRemoteDefault: 'Remote agent presets cannot be set as the local default',
   },
 } as const
 
@@ -1342,7 +1413,16 @@ export function rewriteResult(endpoint: string, value: unknown, serverId: string
     // The one session id the result carries is the NEW session's, minted
     // server-side (create: `{sessionId, agentPreset?}`, fork: `{sessionId}`).
     if (!isPlainObject(value) || typeof value.sessionId !== 'string') return value
-    return { ...value, sessionId: virtualize(value.sessionId) }
+    const agentPreset =
+      endpoint === 'session/create' && typeof value.agentPreset === 'string' && value.agentPreset !== ''
+        ? virtualize(value.agentPreset)
+        : value.agentPreset
+    return endpoint === 'session/create' && value.agentPreset !== undefined
+      ? { ...value, sessionId: virtualize(value.sessionId), agentPreset }
+      : { ...value, sessionId: virtualize(value.sessionId) }
+  }
+  if (endpoint === 'agentPresets/select') {
+    return typeof value === 'string' && value !== '' ? virtualize(value) : value
   }
   if (endpoint === 'messageFeedback/list' || endpoint === 'messageFeedback/put' || endpoint === 'messageFeedback/delete') {
     if (!isPlainObject(value) || value.ok !== false || !isPlainObject(value.error)) return value
@@ -3302,6 +3382,232 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
   }
 }
 
+interface ForgeStatesStreamDeps {
+  local: AsyncIterable<unknown>
+  singleRelay?: RelayClient
+  pool?: RelayPool
+  signal: AbortSignal | undefined
+  recordFailure: (endpoint: string, code: string) => void
+  log?: (format: string, ...args: unknown[]) => void
+  clock: RelayClock
+  watchUninstall: (fn: () => void) => () => void
+  watchPool?: (fn: () => void) => () => void
+}
+
+/**
+ * Merged `forgePanel/changeRequestStates` stream across local + single relay or
+ * multi-server pool (keyed by `entry.serverId`).
+ */
+async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGenerator<unknown, void, undefined> {
+  const { local, singleRelay, pool, signal, recordFailure, log, clock } = deps
+  if (signal?.aborted === true) return
+  const merger = createForgeStatesMerger()
+  const channel = createFrameChannel()
+  let alive = true
+  const waiters: (() => void)[] = []
+  const flushWaiters = (): void => {
+    for (const wake of waiters.splice(0)) wake()
+  }
+  const waitAny = async (): Promise<void> => {
+    await new Promise<void>((resolve) => {
+      waiters.push(resolve)
+    })
+  }
+  const pushAll = (frames: readonly unknown[]): void => {
+    for (const f of frames) channel.push(f)
+  }
+
+  type ForgeSlot = {
+    serverId: string
+    client: RelayClient
+    controller: AbortController | undefined
+    offState: () => void
+    reopenDelayMs: number
+    removed: boolean
+  }
+  const slots = new Map<string, ForgeSlot>()
+  let singleServerId: string | undefined = undefined
+
+  const removeSlot = (serverId: string): void => {
+    const slot = slots.get(serverId)
+    if (slot === undefined) return
+    slots.delete(serverId)
+    slot.removed = true
+    slot.offState()
+    slot.controller?.abort()
+    pushAll(merger.onRemoteGone(serverId))
+  }
+
+  const pumpSlot = async (slot: ForgeSlot): Promise<void> => {
+    try {
+      while (alive && !slot.removed) {
+        if (slot.client.state !== 'online') {
+          await waitAny()
+          continue
+        }
+        const controller = new AbortController()
+        slot.controller = controller
+        try {
+          const stream = slot.client.openStream('forgePanel', 'changeRequestStates', {}, controller.signal)
+          let served = false
+          for await (const frame of stream) {
+            if (!alive || slot.removed || controller.signal.aborted) break
+            if (!served) {
+              served = true
+              slot.reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+            }
+            pushAll(merger.onRemote(slot.serverId, frame))
+          }
+        } catch (error) {
+          if (alive && !slot.removed && !controller.signal.aborted && signal?.aborted !== true) {
+            recordFailure('forgePanel/changeRequestStates', error instanceof RelayError ? error.code : 'internal')
+          }
+        } finally {
+          if (slot.controller === controller) slot.controller = undefined
+        }
+        if (!alive || slot.removed) return
+        if (slot.client.state === 'online') {
+          await waitReopen(clock, waitAny, slot.reopenDelayMs)
+          slot.reopenDelayMs = Math.min(slot.reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
+          continue
+        }
+        await waitAny()
+      }
+    } catch (error) {
+      if (alive) log?.('forgePanel/changeRequestStates remote leg stopped: %s', messageOf(error))
+    }
+  }
+
+  const attachSlot = (serverId: string, client: RelayClient): void => {
+    const slot: ForgeSlot = {
+      serverId,
+      client,
+      controller: undefined,
+      offState: () => {},
+      reopenDelayMs: REMOTE_REOPEN_FIRST_MS,
+      removed: false,
+    }
+    try {
+      slot.offState = client.subscribe((state) => {
+        try {
+          if (state === 'unpaired' || state === 'revoked') {
+            slot.controller?.abort()
+            pushAll(merger.onRemoteGone(serverId))
+          } else if (state === 'offline' || state === 'connecting' || state === 'incompatible') {
+            slot.controller?.abort()
+          }
+        } finally {
+          flushWaiters()
+        }
+      })
+    } catch {
+      slot.offState = () => {}
+    }
+    slots.set(serverId, slot)
+    void pumpSlot(slot)
+  }
+
+  const scan = (): void => {
+    if (pool !== undefined) {
+      const seen = new Set<string>()
+      for (const entry of pool.entries()) {
+        const sid = entry.serverId
+        if (sid === undefined) continue
+        seen.add(sid)
+        if (!slots.has(sid)) attachSlot(sid, entry.client)
+      }
+      for (const sid of [...slots.keys()]) {
+        if (!seen.has(sid)) removeSlot(sid)
+      }
+      return
+    }
+    if (singleRelay !== undefined) {
+      const identity = relayIdentityOf(singleRelay)
+      if (identity === undefined) return
+      if (singleServerId !== undefined && singleServerId !== identity.serverId) {
+        removeSlot(singleServerId)
+      }
+      if (!slots.has(identity.serverId)) {
+        singleServerId = identity.serverId
+        attachSlot(identity.serverId, singleRelay)
+      }
+    }
+  }
+
+  let offSingleScan: (() => void) | undefined
+  if (pool === undefined && singleRelay !== undefined) {
+    try {
+      offSingleScan = singleRelay.subscribe(() => {
+        try { scan() } finally { flushWaiters() }
+      })
+    } catch {
+      offSingleScan = undefined
+    }
+  }
+
+  const offPool = deps.watchPool?.(() => {
+    try { scan() } finally { flushWaiters() }
+  })
+  const offUninstall = deps.watchUninstall(() => {
+    for (const slot of [...slots.values()]) {
+      slot.controller?.abort()
+      pushAll(merger.onRemoteGone(slot.serverId))
+    }
+    flushWaiters()
+  })
+  const onAbort = (): void => {
+    alive = false
+    for (const slot of [...slots.values()]) slot.controller?.abort()
+    flushWaiters()
+    channel.end()
+  }
+  if (signal !== undefined) signal.addEventListener('abort', onAbort)
+
+  scan()
+
+  const localIterator = local[Symbol.asyncIterator]()
+  const pumpLocal = async (): Promise<void> => {
+    try {
+      while (alive) {
+        const next = await localIterator.next()
+        if (next.done === true) break
+        pushAll(merger.onLocal(next.value))
+      }
+    } catch (error) {
+      if (alive) channel.fail(error)
+      return
+    }
+    if (!alive) return
+    alive = false
+    for (const slot of [...slots.values()]) slot.controller?.abort()
+    flushWaiters()
+    channel.end()
+  }
+
+  void pumpLocal()
+  try {
+    while (true) {
+      const next = await channel.next()
+      if (next.done === true) break
+      yield next.value
+    }
+  } finally {
+    alive = false
+    offSingleScan?.()
+    offPool?.()
+    offUninstall()
+    if (signal !== undefined) signal.removeEventListener('abort', onAbort)
+    for (const slot of [...slots.values()]) {
+      slot.removed = true
+      slot.offState()
+      slot.controller?.abort()
+    }
+    slots.clear()
+    flushWaiters()
+    void Promise.resolve(localIterator.return?.(undefined)).catch(() => {})
+  }
+}
+
 interface PoolEventSlot {
   serverId: string
   client: RelayClient
@@ -4403,6 +4709,16 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           ...(extracted.attachments.length > 0 ? { attachments: extracted.attachments } : {}),
         }
       }
+      if (endpoint === 'workspace/insertSessionBefore' && isPlainObject(restored) && isPlainObject(restored.workspace)) {
+        const ws = virtualizeWorkspace(
+          restored.workspace,
+          { serverId, serverName: serverDisplayNameOf(serverId) ?? serverId },
+          'none',
+          resolveInterceptLang(options.lang),
+          workspaceEpochs.get(serverId) ?? 0,
+        )
+        return { ok: true, value: { ...restored, workspace: ws } }
+      }
       return { ok: true, value: rewriteResult(endpoint, restored, serverId) }
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
@@ -4895,6 +5211,208 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * agentPreset?}` at :162-167, `agentPresets/select` names a preset by id),
    * so this is the one call that needs the translation.
    */
+  function serverDisplayNameOf(serverId: string): string | undefined {
+    if (pool !== undefined) return pool.getByServerId(serverId)?.displayName
+    if (singleGetServerId() !== serverId) return undefined
+    return relayIdentityOf(singleRelay)?.serverName
+  }
+
+  function checkInsertSessionBeforeOrigin(args: unknown): { code: string; message: string } | undefined {
+    if (!isPlainObject(args) || !isPlainObject(args.request)) return undefined
+    const candidates: string[] = []
+    for (const rawField of [args.request.workspaceId, args.request.sessionId, args.request.beforeSessionId]) {
+      if (typeof rawField === 'string' && rawField !== '') candidates.push(rawField)
+    }
+    if (candidates.length === 0) return undefined
+    const anyVirtual = candidates.some((id) => isVirtual(id))
+    const anyLocal = candidates.some((id) => !isVirtual(id))
+    if (anyVirtual && anyLocal) {
+      return { code: 'remote-mismatch', message: copy().mismatch }
+    }
+    return undefined
+  }
+
+  function routeSelectAgentPreset(
+    endpoint: 'agentPresets/select' | 'session/create',
+    args: unknown,
+  ): { args: unknown } | { code: string; message: string } | undefined {
+    if (!isPlainObject(args)) return undefined
+    const c = copy()
+    if (endpoint === 'agentPresets/select') {
+      const agentId = args.agentId
+      const agentPreset = args.agentPreset
+      if (typeof agentId !== 'string' || typeof agentPreset !== 'string') return undefined
+      const targetParts = fromVirtual(agentId)
+      const presetParts = fromVirtual(agentPreset)
+      if (targetParts === undefined && presetParts === undefined) return undefined
+      if (targetParts === undefined) {
+        return { code: 'remote-unsupported', message: c.presetRemoteOnLocal }
+      }
+      const displayName = serverDisplayNameOf(targetParts.serverId)
+      if (displayName === undefined) return undefined
+      if (presetParts === undefined) {
+        return { code: 'remote-unsupported', message: c.presetPickServer(displayName) }
+      }
+      if (presetParts.serverId !== targetParts.serverId) {
+        return { code: 'remote-mismatch', message: c.presetMismatch }
+      }
+      return { args: { ...args, agentPreset: presetParts.id } }
+    }
+    const request = args.request
+    if (!isPlainObject(request) || typeof request.agentPreset !== 'string' || request.agentPreset === '') {
+      return undefined
+    }
+    const targetParts = typeof request.workspaceId === 'string' ? fromVirtual(request.workspaceId) : undefined
+    const presetParts = fromVirtual(request.agentPreset)
+    if (targetParts === undefined && presetParts === undefined) return undefined
+    if (targetParts === undefined) {
+      return { code: 'remote-unsupported', message: c.presetRemoteOnLocal }
+    }
+    const displayName = serverDisplayNameOf(targetParts.serverId)
+    if (displayName === undefined) return undefined
+    if (presetParts === undefined) {
+      return { code: 'remote-unsupported', message: c.presetPickServer(displayName) }
+    }
+    if (presetParts.serverId !== targetParts.serverId) {
+      return { code: 'remote-mismatch', message: c.presetMismatch }
+    }
+    return { args: { ...args, request: { ...request, agentPreset: presetParts.id } } }
+  }
+
+  async function mergedSessionSearchCall(
+    endpoint: string,
+    payload: unknown,
+    args: unknown,
+    signal: AbortSignal | undefined,
+    peer: unknown,
+  ): Promise<unknown> {
+    const localEnvelope = (await (chainTarget.dispatchRpc as (this: unknown, ...callArgs: unknown[]) => unknown).call(
+      raw,
+      endpoint,
+      payload,
+      signal,
+      peer,
+    )) as unknown
+    if (!isPlainObject(localEnvelope) || localEnvelope.ok !== true) return localEnvelope
+    if (pool !== undefined) {
+      const online = pool.entries().filter((entry) => entry.serverId !== undefined && entry.client.state === 'online')
+      if (online.length === 0) return localEnvelope
+      const settled = await Promise.all(
+        online.map((entry) =>
+          entry.client.invoke('session', 'search', isPlainObject(args) ? args : {}, signal).then(
+            (value) => ({ ok: true as const, value, serverId: entry.serverId as string }),
+            (error: unknown) => ({ ok: false as const, error, serverId: entry.serverId as string }),
+          ),
+        ),
+      )
+      let acc = localEnvelope.value
+      for (const result of settled) {
+        if (!result.ok) {
+          recordFailure(endpoint, result.error instanceof RelayError ? result.error.code : 'internal')
+          continue
+        }
+        acc = mergeSessionSearch(acc, result.value, result.serverId)
+      }
+      return { ok: true, value: acc }
+    }
+    const identity = relayIdentityOf(singleRelay)
+    if (identity === undefined || singleRelay.state !== 'online') return localEnvelope
+    try {
+      const remote = await singleRelay.invoke('session', 'search', isPlainObject(args) ? args : {}, signal)
+      return { ok: true, value: mergeSessionSearch(localEnvelope.value, remote, identity.serverId) }
+    } catch (error) {
+      recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
+      return localEnvelope
+    }
+  }
+
+  async function mergedAgentPresetsListCall(
+    endpoint: string,
+    payload: unknown,
+    signal: AbortSignal | undefined,
+    peer: unknown,
+  ): Promise<unknown> {
+    const localEnvelope = (await (chainTarget.dispatchRpc as (this: unknown, ...callArgs: unknown[]) => unknown).call(
+      raw,
+      endpoint,
+      payload,
+      signal,
+      peer,
+    )) as unknown
+    if (!isPlainObject(localEnvelope) || localEnvelope.ok !== true) return localEnvelope
+    const lang = resolveInterceptLang(options.lang)
+    if (pool !== undefined) {
+      const online = pool.entries().filter((entry) => entry.serverId !== undefined && entry.client.state === 'online')
+      if (online.length === 0) return localEnvelope
+      const settled = await Promise.all(
+        online.map((entry) =>
+          entry.client.invoke('agentPresets', 'list', {}, signal).then(
+            (value) => ({
+              ok: true as const,
+              value,
+              identity: { serverId: entry.serverId as string, serverName: entry.displayName },
+            }),
+            (error: unknown) => ({ ok: false as const, error }),
+          ),
+        ),
+      )
+      let acc = localEnvelope.value
+      for (const result of settled) {
+        if (!result.ok) {
+          recordFailure(endpoint, result.error instanceof RelayError ? result.error.code : 'internal')
+          continue
+        }
+        acc = mergeAgentPresetRosters(acc, result.value, result.identity, lang)
+      }
+      return { ok: true, value: acc }
+    }
+    const identity = relayIdentityOf(singleRelay)
+    if (identity === undefined || singleRelay.state !== 'online') return localEnvelope
+    try {
+      const remote = await singleRelay.invoke('agentPresets', 'list', {}, signal)
+      return { ok: true, value: mergeAgentPresetRosters(localEnvelope.value, remote, identity, lang) }
+    } catch (error) {
+      recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
+      return localEnvelope
+    }
+  }
+
+  async function forwardAgentPresetRead(
+    args: unknown,
+    signal: AbortSignal | undefined,
+    payload: unknown,
+    peer: unknown,
+  ): Promise<unknown> {
+    const rawPreset = isPlainObject(args) ? args.agentPreset : undefined
+    const parts = typeof rawPreset === 'string' ? fromVirtual(rawPreset) : undefined
+    if (parts === undefined) {
+      return (chainTarget.dispatchRpc as (...callArgs: unknown[]) => unknown).call(raw, 'agentPresets/read', payload, signal, peer)
+    }
+    const verdict = validate('agentPresets/read', [parts])
+    if (!verdict.ok) return failEnvelope('agentPresets/read', verdict.code, verdict.message)
+    try {
+      const remoteArgs = { ...(args as Record<string, unknown>), agentPreset: parts.id }
+      const value = await verdict.client.invoke('agentPresets', 'read', remoteArgs, signal)
+      if (!isPlainObject(value)) return { ok: true, value }
+      const rawId = typeof value.agentPreset === 'string' && value.agentPreset !== '' ? value.agentPreset : parts.id
+      const displayName = serverDisplayNameOf(verdict.serverId) ?? verdict.serverId
+      const lang = resolveInterceptLang(options.lang)
+      return {
+        ok: true,
+        value: {
+          ...value,
+          agentPreset: toVirtual(verdict.serverId, rawId),
+          name: resolveRemotePresetName(rawId, value.name, displayName, lang),
+        },
+      }
+    } catch (error) {
+      const code = error instanceof RelayError ? error.code : 'internal'
+      recordFailure('agentPresets/read', code)
+      const message = code === 'not-shared' ? copy().closed : messageOf(error)
+      return { ok: false, error: { code, message, details: error instanceof RelayError && isPlainObject(error.details) ? error.details : {} } }
+    }
+  }
+
   function routeSelectModel(args: unknown): { args: unknown } | { code: string; message: string } | undefined {
     if (!isPlainObject(args)) return undefined
     const request = args.request
@@ -4966,6 +5484,25 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         args = routed.args
       }
     }
+    if (endpoint === 'agentPresets/select' || endpoint === 'session/create') {
+      const routed = routeSelectAgentPreset(endpoint, args)
+      if (routed !== undefined) {
+        if ('code' in routed) return failEnvelope(endpoint, routed.code, routed.message)
+        args = routed.args
+      }
+    }
+    if (endpoint === 'workspace/insertSessionBefore') {
+      const bad = checkInsertSessionBeforeOrigin(args)
+      if (bad !== undefined) return failEnvelope(endpoint, bad.code, bad.message)
+    }
+    if (endpoint === 'settings/update') {
+      const found: VirtualParts[] = []
+      deepScanVirtualIds(args, 10, found)
+      if (found.length > 0) return failEnvelope('settings/update', 'remote-unsupported', copy().presetRemoteDefault)
+    }
+    if (endpoint === 'agentPresets/read') {
+      return forwardAgentPresetRead(args, signal, payload, peer)
+    }
     const fields = allClientFields(endpoint)
     const virtuals = collectVirtuals(fields, args)
     if (virtuals.length === 0) {
@@ -4974,6 +5511,12 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       }
       if (endpoint === 'session/modelCatalog') {
         return mergedModelCatalogCall(endpoint, payload, signal, peer)
+      }
+      if (endpoint === 'session/search') {
+        return mergedSessionSearchCall(endpoint, payload, args, signal, peer)
+      }
+      if (endpoint === 'agentPresets/list') {
+        return mergedAgentPresetsListCall(endpoint, payload, signal, peer)
       }
       return (chainTarget.dispatchRpc as (...callArgs: unknown[]) => unknown).call(raw, endpoint, payload, signal, peer)
     }
@@ -5042,6 +5585,34 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         ) {
           lastFollowedSession = { kind: 'local' }
         }
+      }
+      if (endpoint === 'forgePanel/changeRequestStates') {
+        if (probe !== undefined) {
+          return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
+            raw,
+            endpoint,
+            payload,
+            uplink,
+            peer,
+            signal,
+            control,
+            uplinkWindow,
+          )
+        }
+        const open = chainTarget.openWireStream as (this: unknown, ...callArgs: unknown[]) => unknown
+        return (async (): Promise<unknown> => {
+          const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control, uplinkWindow)
+          if (!isAsyncIterable(local)) return local
+          return mergedForgeStatesStream({
+            local,
+            ...(pool !== undefined ? { pool, watchPool } : { singleRelay }),
+            signal,
+            recordFailure,
+            log,
+            clock,
+            watchUninstall,
+          })
+        })()
       }
       if (endpoint === 'workspace/follow' || endpoint === 'session/control') {
         // The startup self-check probe wants the LOCAL baseline only — no
