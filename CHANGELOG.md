@@ -13,6 +13,8 @@
 - **自建中继网关与控制台（`gateway-server/`，源码同仓、不进 npm 发布包）**：单容器交付 Web 控制台、多租户虚拟网络管理、新设备审批开关、实时在线与连接路径状态、双端口 UDP STUN 打洞辅助与零知识密文中转（网关无私钥、只转发密文帧），部署见 `gateway-server/README.md`。
 - **命令行工具支持 `peer` 角色与子命令**：新增 `dsh-zen-remote setup --role peer` 与 `peer join / status / trust / leave`，向导同步支持「作为节点端」三步入网。
 - **可配置多服务端配对上限 `maxServers`**：子客户端的配对上限（默认 8 台）现可在设置里调整（整数 1–64），环境变量 `LAN_GATE_MAX_SERVERS` 亦可覆盖；改动即时生效，无需重载插件行。
+- **远程支持 DSH 0.2.2 的面板与交互 API**（需两端 DSH 0.2.2）：Forge 面板远程可用（31 个会话级方法 + 全局 PR 状态流 `forgePanel/changeRequestStates`，覆盖分支、diff、评审、Worktree 等读写与刷新），并新增全局会话搜索（`session/search`，按共享表逐行过滤）、Agent 预设查看与选择（`agentPresets/list|read|select`）、目标「创建 / 完成」与激活状态实时同步（`goals/create|complete`，goals 共 7 个方法）、提问应答与等待（`userQuestions/answer|attachWait`）、动作卡（`actionCards/act`）、工具结果监视流（`toolResults/watch`）、团队开关（`agentTeams/setEnabled`）、插件推荐（`pluginRecommendations/describe`）与工作区会话排序（`workspace/insertSessionBefore`）；`subagents/prompt` 的父会话参数随官方 0.2.2-rc.2 改为可选。较旧 DSH 上这些方法按「方法不存在」降级，不影响既有功能。
+- **Agent 预设的远程可见范围**：主服务端没有任何共享会话时，已配对设备读不到任何预设（`agentPresets/list` 返回空名册、`read` 直接拒绝）；**一旦共享任意一个会话**，已配对设备即可读取全机预设名册（自定义预设的名称、描述与失效原因），并按预设 id 读取任意预设的完整 YAML 文档（内容含系统提示词与子插件清单）——没有逐预设或按共享会话归属的过滤。共享会话即视为同意开放全部预设资料，请在共享前知情。
 
 ### 兼容
 
