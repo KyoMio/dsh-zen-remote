@@ -1577,7 +1577,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           }
         }
         // Zero-shared-session privacy gate for agent presets: an unshared server
-        // must not leak custom preset rosters or system-prompt markdown.
+        // must not leak custom preset rosters or system-prompt markdown. The
+        // gate is all-or-nothing and one-directional: once ANY session is
+        // shared, list/read pass through UNFILTERED — the paired client can
+        // read the machine-wide roster and any preset's YAML document
+        // (system prompt and sub-plugin manifests included). There is no
+        // per-preset or per-shared-session filtering beyond this gate.
         if (namespace === 'agentPresets' && (method === 'list' || method === 'read')) {
           if (store.list().length === 0) {
             if (method === 'list') {
