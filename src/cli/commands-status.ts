@@ -119,6 +119,84 @@ export function peerPathLabelOf(t: CliTranslator, value: unknown): string {
   }
 }
 
+// ===========================================================================
+// Peer mount-capacity facts (PC-11c) — one normalization and one line
+// renderer shared by `peer status` and the total `status` peer section, so
+// the two surfaces cannot disagree about the same body. The semantics mirror
+// the settings page's derive (PC-11a / PC-11b / PC-11a-fix1): `undefined`
+// means the body carried no usable fact — unknown renders as unknown, it is
+// never guessed from `maxPeers - 1` or the historic pairing constant.
+// ===========================================================================
+
+/** The mount-capacity facts one `client/peer/status` body normalizes to. */
+export interface PeerCapacityFacts {
+  /** The network's announced device cap INCLUDING this machine — the raw
+   * `maxPeers` verbatim when it answered a finite number. NOT the mount cap. */
+  maxPeers: number | undefined
+  /** This machine's EFFECTIVE remote-mount cap: a safe integer in the
+   * config's own 1..64 band; a fractional or out-of-band word is protocol
+   * junk and stays unknown. */
+  maxServers: number | undefined
+  /** This machine's actual mounted remotes: the body's count when it is a
+   * non-negative safe integer (never clamped — an over-cap stock after a
+   * downscale stays visible); without one, the per-row `mounted` flags count
+   * only when EVERY row of the list carries a boolean (an explicit empty
+   * list is a real zero; a list with missing flags stays unknown). */
+  mountedCount: number | undefined
+  /** `mountedCount >= maxServers` once BOTH facts are known; `undefined`
+   * otherwise — `false` would claim room that may not exist. */
+  limitReached: boolean | undefined
+}
+
+/** Normalize one peer status body's capacity facts. Pure, defensive: a junk
+ * body yields all-unknown, never a plausible-looking guess. */
+export function peerCapacityOf(body: ServerRow | null): PeerCapacityFacts {
+  const raw = body === null ? {} : body
+  const maxPeers = typeof raw.maxPeers === 'number' && Number.isFinite(raw.maxPeers) ? raw.maxPeers : undefined
+  const maxServersRaw = raw.maxServers
+  const maxServers = typeof maxServersRaw === 'number' && Number.isSafeInteger(maxServersRaw) && maxServersRaw >= 1 && maxServersRaw <= 64
+    ? maxServersRaw
+    : undefined
+  const rows = Array.isArray(raw.peers) ? raw.peers : undefined
+  const listCountable = rows !== undefined && rows.every((row) => {
+    const record = plainOf(row)
+    return record !== null && typeof record.mounted === 'boolean'
+  })
+  const mountedRaw = raw.mountedCount
+  const mountedCount = typeof mountedRaw === 'number' && Number.isSafeInteger(mountedRaw) && mountedRaw >= 0
+    ? mountedRaw
+    : listCountable
+      ? rows.filter((row) => plainOf(row)?.mounted === true).length
+      : undefined
+  return {
+    maxPeers,
+    maxServers,
+    mountedCount,
+    limitReached: mountedCount !== undefined && maxServers !== undefined ? mountedCount >= maxServers : undefined,
+  }
+}
+
+/** The capacity terminal lines, indent included — the mount N/M line (or the
+ * explicit unknown), the full note when the local cap is reached (existing
+ * mounts stay, new ones wait), and the network-total cap as its own line
+ * whenever the body announced one (even while the local capacity is
+ * unknown). */
+export function peerCapacityLines(t: CliTranslator, body: ServerRow | null): string[] {
+  const facts = peerCapacityOf(body)
+  const lines: string[] = [
+    `  ${facts.mountedCount !== undefined && facts.maxServers !== undefined
+      ? t('peer.status.mountCount', { count: facts.mountedCount, max: facts.maxServers })
+      : t('peer.status.mountUnknown')}`,
+  ]
+  if (facts.limitReached === true) {
+    lines.push(`  ${t('peer.status.mountFull', { max: facts.maxServers ?? '' })}`)
+  }
+  if (facts.maxPeers !== undefined) {
+    lines.push(`  ${t('peer.status.networkCap', { max: facts.maxPeers })}`)
+  }
+  return lines
+}
+
 /** One paired-host row, the exact shape both surfaces print:
  * `[entryId] displayName  serverUrl  state  compat/bridge`. */
 export function serverLineText(t: CliTranslator, row: ServerRow): string {
@@ -270,6 +348,7 @@ function renderPeerSection(t: CliTranslator, peer: ServerRow | null): string[] {
   const origin = typeof peer.gatewayOrigin === 'string' && peer.gatewayOrigin !== '' ? peer.gatewayOrigin : '—'
   lines.push(`  ${t('peer.status.joined', { networkId, origin })}`)
   lines.push(`  ${t('peer.status.gatewayState', { state: gatewayStateLabel(t, peer.gatewayState) })}`)
+  lines.push(...peerCapacityLines(t, peer))
   const peers = arrayOf(peer.peers)
     .map((row) => plainOf(row))
     .filter((row): row is ServerRow => row !== null)

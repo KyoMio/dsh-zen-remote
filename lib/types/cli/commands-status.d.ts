@@ -39,6 +39,34 @@ export declare function gatewayStateLabel(t: CliTranslator, value: unknown): str
 /** The peer connection-path label: 局域网直连 / 直连 / 经网关中转 / 身份异常 /
  * 离线. Unknown values render as 离线, the engine's default verdict. */
 export declare function peerPathLabelOf(t: CliTranslator, value: unknown): string;
+/** The mount-capacity facts one `client/peer/status` body normalizes to. */
+export interface PeerCapacityFacts {
+    /** The network's announced device cap INCLUDING this machine — the raw
+     * `maxPeers` verbatim when it answered a finite number. NOT the mount cap. */
+    maxPeers: number | undefined;
+    /** This machine's EFFECTIVE remote-mount cap: a safe integer in the
+     * config's own 1..64 band; a fractional or out-of-band word is protocol
+     * junk and stays unknown. */
+    maxServers: number | undefined;
+    /** This machine's actual mounted remotes: the body's count when it is a
+     * non-negative safe integer (never clamped — an over-cap stock after a
+     * downscale stays visible); without one, the per-row `mounted` flags count
+     * only when EVERY row of the list carries a boolean (an explicit empty
+     * list is a real zero; a list with missing flags stays unknown). */
+    mountedCount: number | undefined;
+    /** `mountedCount >= maxServers` once BOTH facts are known; `undefined`
+     * otherwise — `false` would claim room that may not exist. */
+    limitReached: boolean | undefined;
+}
+/** Normalize one peer status body's capacity facts. Pure, defensive: a junk
+ * body yields all-unknown, never a plausible-looking guess. */
+export declare function peerCapacityOf(body: ServerRow | null): PeerCapacityFacts;
+/** The capacity terminal lines, indent included — the mount N/M line (or the
+ * explicit unknown), the full note when the local cap is reached (existing
+ * mounts stay, new ones wait), and the network-total cap as its own line
+ * whenever the body announced one (even while the local capacity is
+ * unknown). */
+export declare function peerCapacityLines(t: CliTranslator, body: ServerRow | null): string[];
 /** One paired-host row, the exact shape both surfaces print:
  * `[entryId] displayName  serverUrl  state  compat/bridge`. */
 export declare function serverLineText(t: CliTranslator, row: ServerRow): string;
