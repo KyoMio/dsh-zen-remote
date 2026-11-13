@@ -45,6 +45,10 @@ const { SqliteStore } = require('../gateway-server/dist/store/sqlite-store.js')
 const { deriveMasterKeyFromSecret, hashPassword } = require('../gateway-server/dist/master-key.js')
 const { PeerWsHub } = require('../gateway-server/dist/peer-hub/ws-hub.js')
 const { UdpStunService } = require('../gateway-server/dist/peer-hub/udp-stun.js')
+// 生产组装入口（PC-V1 fix1 R2）：真实 resolveGatewayConfig → startGateway，
+// 不复制其装配（对照：下方本地 startGateway helper 是手工组合真实类）。
+const { startGateway: startProductionGateway } = require('../gateway-server/dist/main.js')
+const { resolveGatewayConfig } = require('../gateway-server/dist/config.js')
 
 const SECRET = 'peer-e2e-relay-secret-0123456789abcdef'.repeat(2).slice(0, 64)
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-peer-e2e-'))
@@ -359,7 +363,11 @@ async function startNode(gw, { name, firewall = false, firewallOpen = false, sha
     serverName: () => name,
     udpSocket: punchSocket,
     udpProbe: { primaryPort: gw.udp.primaryPort, altPort: gw.udp.altPort ?? 0 },
-    punch: { punchWindowMs: 1000, punchIntervalMs: 100, punchRounds: 10, reprobeIntervalMs: 60_000, ...(punch ?? {}) },
+    // punch 旋钮缺省不在这里覆盖（PC-V1 fix1 R1）：不传即 PeerPunchManager 的
+    // 生产缺省（punch.ts:1000ms 窗口 / 100ms×10 轮 / 60s 重探 / 5s×3 keepalive）。
+    // 在这里写等值基座会钉死旧值——生产默认一旦改变，默认计时验收仍会跑旧配置。
+    // 需要加速或钉值的用例显式传 punch。
+    ...(punch !== undefined ? { punch } : {}),
     ...(pathReportMs !== undefined ? { pathReportMs } : {}),
     ...(clock !== undefined ? { clock } : {}),
     log: (line) => logs.push(line),
@@ -2074,6 +2082,7 @@ test('PC-05: 2MiB known-length upload rides out a mid-flight UDP blackout throug
   try {
     // A 的宿主替身：增量计数 + sha256；≥768KiB 时拉黑 B 的 UDP（恰好一次）。
     let blackedOut = false
+    let blackedOutAt = 0
     let hostCalls = 0
     let hostReceived = 0
     let hostDigest = null
@@ -2092,6 +2101,7 @@ test('PC-05: 2MiB known-length upload rides out a mid-flight UDP blackout throug
           hash.update(value)
           if (!blackedOut && received >= BLACKOUT_AT) {
             blackedOut = true
+            blackedOutAt = Date.now()
             B.setFirewall(true)
           }
         }
@@ -2103,8 +2113,9 @@ test('PC-05: 2MiB known-length upload rides out a mid-flight UDP blackout throug
         })
       },
     })
+    nodes.push(A) // 节点成功创建即纳入清理集合——B 初始化失败也不留 A
     B = await startNode(gw, { name: 'node-b', firewall: true })
-    nodes.push(A, B)
+    nodes.push(B)
     B.setFirewall(false)
 
     // 顺序入网，A↔B 打洞直连。
@@ -2142,9 +2153,22 @@ test('PC-05: 2MiB known-length upload rides out a mid-flight UDP blackout throug
       { sessionId: 's-a1', name: 'big.bin', body: drip, bytes: PAYLOAD.length },
       cancel.signal,
     )
-    const result = await uploadPromise
+    // 15s 直连截止的精确起止点（PC-V1 fix1 R1）：t0 = 拉黑时刻（lastSeen 上下文
+    // 里最后一次认证收包≈此刻——上传在途，ARQ ACK 连续），t1 = B 的 peer 路径
+    // 首次翻成 relay（keepAlive 5000×3 死线触发 onDirectLost）。
+    uploadPromise.catch(() => {}) // 并发双任务先挂 no-op catch：任一分支失败不产生 unhandledRejection
+    const relayWatch = (async () => {
+      await waitFor(() => {
+        const peer = B.engine.status().peers.find((p) => p.nodeId === A.identity.nodeId)
+        return peer !== undefined && peer.path === 'relay'
+      }, 30_000, 'B degraded to relay after the default 15s keepalive deadline')
+      return Date.now()
+    })()
+    relayWatch.catch(() => {})
+    const [result, tRelaySeen] = await Promise.all([uploadPromise, relayWatch])
     const elapsed = Date.now() - startedAt
-    t.diagnostic(`pc-05 elapsed=${elapsed}ms hostReceived=${hostReceived} hostCalls=${hostCalls} blackoutFired=${blackedOut}`)
+    const cutoffMs = tRelaySeen - blackedOutAt
+    t.diagnostic(`pc-05 elapsed=${elapsed}ms cutoff=${cutoffMs}ms (blackout→relay) hostReceived=${hostReceived} hostCalls=${hostCalls} blackoutFired=${blackedOut}`)
 
     assert.equal(result.status, 200)
     const receipt = JSON.parse(result.body)
@@ -2152,7 +2176,10 @@ test('PC-05: 2MiB known-length upload rides out a mid-flight UDP blackout throug
     assert.equal(receipt.echoedBytes, PAYLOAD.length, `the byte count survived the recovery (got ${receipt.echoedBytes})`)
     assert.equal(receipt.sha256, EXPECTED_DIGEST, 'the SHA256 survived the recovery')
     assert.equal(hostCalls, 1, 'the business forward ran exactly once — no whole-upload retry')
-    assert.ok(elapsed >= 15_000 - 500, `the completion includes the real ~15s direct-loss detection (got ${elapsed} ms)`)
+    // 截止区间以真实起止点断言：死线 = lastSeen+15s，上传中段拉黑时 lastSeen≈拉黑时刻
+    //（ACK 连续），翻路径的观测延迟是毫秒级轮询。
+    assert.ok(cutoffMs >= 14_000, `the default 15s loss deadline ran from the blackout (got ${cutoffMs}ms)`)
+    assert.ok(cutoffMs < 17_000, `the loss detection fired at the deadline, not late (got ${cutoffMs}ms)`)
     assert.ok(elapsed < 39_000, `within the recovery budget (got ${elapsed} ms)`)
     cancel.abort() // 已完成——防御性 no-op
   } catch (err) {
@@ -2453,5 +2480,412 @@ test('PC-12: WS relay handshake with a legacy-only peer completes at the v1 leve
     assert.ok(!logs.some((line) => line.includes('hs=v2')), 'the legacy-initiated exchange stays at the v1 level')
   } finally {
     mux.close()
+  }
+})
+
+// ---------------------------------------------------------------- PC-V1：整合生产组装与跨运行时功能回归
+//
+// 四个正常功能用例补 PC-V1 验收缺口（均走真实 gateway-server + 真实 PeerEngine
+// 编译产物，宿主 typert 是唯一替身）：
+//   #1 pause/resume：REST 暂停 → PC-03 受限控制连接 → resume 原地恢复；
+//   #2 REST 全局容量热改：PATCH /admin/settings 运行时改配额/默认席位并即时生效；
+//   #3 生产默认计时 60s 自动重探（本文件唯一的有界长测试，全程 ~70s 真实时钟）；
+//   #4 relay→direct 方向的上传中热切，SHA256 全程一致（direct→relay 由 PC-05 覆盖）。
+// 计时说明：startNode 的 punch 缺省 {1000,100,10,60_000} 与 src/peer/punch.ts
+// 生产旋钮（523-528 行）逐值相同——用例不另改计时参数，观测到的区间即默认值行为。
+
+test('PC-V1 #1: REST pause 把在线成员降为受限控制连接，resume 原地恢复互通', async () => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  try {
+    const A = await startNode(gw, { name: 'node-a', shared: ['s-a1'] })
+    nodes.push(A) // 节点成功创建即纳入清理集合——B 初始化失败也不留 A
+    const B = await startNode(gw, { name: 'node-b', shared: ['s-b1'] })
+    nodes.push(B)
+    for (const node of [A, B]) {
+      await node.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+      await waitFor(() => node.engine.status().gatewayState === 'authorized', 8000, `${node.name} authorized`)
+    }
+    await waitPeerOnline(A, B.identity.nodeId)
+    await waitPeerOnline(B, A.identity.nodeId)
+
+    // 管理员暂停 B：REST 返回 paused，engine 收 {type:'paused'} 进入受限态。
+    const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${B.identity.nodeId}/pause`, { cookie: gw.tenantCookie })
+    assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json))
+    assert.equal(pauseRes.json.data.member.status, 'paused')
+    await waitFor(() => B.engine.status().gatewayState === 'paused', 8000, 'B entered the paused state in place')
+    // 对端视角：A 的 B 虚拟挂载被撤下（peer-paused → memberGone）。
+    await waitFor(() => A.relayPool.getByServerId(B.identity.nodeId) === undefined, 8000, 'A unmounted the paused member')
+
+    // resume：同一受限连接原地晋升，不重新入网；A 重新挂载 B，invoke 恢复。
+    const resumeRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${B.identity.nodeId}/resume`, { cookie: gw.tenantCookie })
+    assert.equal(resumeRes.status, 200, JSON.stringify(resumeRes.json))
+    assert.equal(resumeRes.json.data.member.status, 'authorized')
+    await waitFor(() => B.engine.status().gatewayState === 'authorized', 8000, 'B resumed in place (no rejoin)')
+    // A 重新挂载 B；调进「被暂停过的 B」证明它完全恢复服务。
+    const remountedAonB = await waitPeerOnline(A, B.identity.nodeId)
+    B.listResults.set('*', { items: [{ sessionId: 's-b1', title: 'B 的会话' }] })
+    const listed = await remountedAonB.client.invoke('session', 'list', { request: {} })
+    assert.equal(listed.items[0].sessionId, 's-b1', 'invoke into the resumed member works again')
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+test('PC-V1 #2: PATCH /admin/settings 热改全局容量，即时生效且存量网络与在线成员不受扰动', async () => {
+  const gw = await startGateway()
+  const nodes = []
+  try {
+    const net1 = await createNetwork(gw, { mode: 'key' })
+    const A = await startNode(gw, { name: 'node-a' })
+    nodes.push(A)
+    await A.engine.joinNetwork(inviteUri(gw, net1.id, net1.joinKey))
+    await waitFor(() => A.engine.status().gatewayState === 'authorized', 8000, 'A authorized on net1')
+
+    // 运行时热改：maxNetworksPerUser 4→2、defaultMaxPeers 8→3（不重启任何东西）。
+    const patchRes = await api(gw.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: gw.adminCookie,
+      body: { maxNetworksPerUser: 2, defaultMaxPeers: 3 },
+    })
+    assert.equal(patchRes.status, 200, JSON.stringify(patchRes.json))
+    assert.equal(patchRes.json.data.maxNetworksPerUser, 2)
+    assert.equal(patchRes.json.data.defaultMaxPeers, 3)
+
+    // 建满 2 个后再建即 409——新限额即时生效。
+    const net2 = await createNetwork(gw, { mode: 'key' })
+    assert.equal(net2.maxPeers, 3, 'new network picks up the hot defaultMaxPeers')
+    const over = await api(gw.base, 'POST', '/api/v1/networks', {
+      body: { name: 'over-quota', admissionMode: 'key' },
+      cookie: gw.tenantCookie,
+    })
+    assert.equal(over.status, 409, JSON.stringify(over.json))
+    assert.equal(over.json.error.code, 'QUOTA_EXCEEDED')
+
+    // 热改只约束增量：net1 的席位与 A 的在线成员身份原样保留。
+    const existingNetworks = await api(gw.base, 'GET', '/api/v1/networks', { cookie: gw.tenantCookie })
+    assert.equal(existingNetworks.status, 200)
+    assert.equal(existingNetworks.json.data.find((network) => network.id === net1.id)?.maxPeers, 8, 'existing network keeps its original maxPeers in the current API response')
+    await waitFor(() => A.engine.status().gatewayState === 'authorized', 8000, 'existing member unaffected by the shrink')
+
+    // 热调回去：建第 3 个网络立刻放行。
+    const raiseRes = await api(gw.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: gw.adminCookie,
+      body: { maxNetworksPerUser: 4 },
+    })
+    assert.equal(raiseRes.status, 200, JSON.stringify(raiseRes.json))
+    const net3 = await createNetwork(gw, { mode: 'key' })
+    assert.ok(net3.id, 'quota raise takes effect immediately on the next create')
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+test('PC-V1 #3: 生产默认计时——约1s降级后，防火墙恢复在 ~60s 默认重探节拍上自动复原直连（唯一有界长测试）', async (t) => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  try {
+    const A = await startNode(gw, { name: 'node-a', shared: ['s-a1'] })
+    nodes.push(A) // 节点成功创建即纳入清理集合——C 初始化失败也不留 A
+    // C 起步即 UDP 全丢（真实 socket + 阻断阀）。startNode 不再注入任何 punch
+    // 旋钮（PC-V1 fix1 R1）——本用例观测的是 PeerPunchManager 生产缺省本身
+    // （punch.ts:1000ms 窗口 / 100ms×10 轮 / 60s 重探），生产默认一改即被钉住。
+    const C = await startNode(gw, { name: 'node-c', firewall: true, shared: ['s-c1'] })
+    nodes.push(C)
+    for (const node of [A, C]) {
+      await node.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+      await waitFor(() => node.engine.status().gatewayState === 'authorized', 8000, `${node.name} authorized`)
+    }
+
+    // 约1s默认打洞窗口过期 → 降级 relay。用 peer 条目出现（announce 完成、
+    // 窗口开跑）到 path==='relay' 的区间观测默认 1000ms 窗口。
+    let tPunchStart = 0
+    await waitFor(() => {
+      const peer = A.engine.status().peers.find((p) => p.nodeId === C.identity.nodeId)
+      if (peer !== undefined && tPunchStart === 0) tPunchStart = Date.now()
+      return peer !== undefined && peer.path === 'relay'
+    }, 15000, 'A→C degraded to relay after the default 1000ms punch window')
+    const tDowngrade = Date.now()
+    const downgradeMs = tDowngrade - tPunchStart
+    t.diagnostic(`pc-v1#3 downgrade interval (default 1000ms window): ${downgradeMs}ms`)
+    assert.ok(downgradeMs >= 650, `the default punch window really ran before fallback (got ${downgradeMs}ms)`)
+    assert.ok(downgradeMs < 10_000, `fallback was prompt, not a long retry (got ${downgradeMs}ms)`)
+
+    await waitPeerOnline(A, C.identity.nodeId)
+    await waitPeerOnline(C, A.identity.nodeId)
+
+    // 恢复 UDP 通路，不调 reprobePunch——只等生产默认 60s 静默重探自己开轮。
+    C.setFirewall(false)
+    const tUnblocked = Date.now()
+    await waitFor(() => {
+      const peer = C.engine.status().peers.find((p) => p.nodeId === A.identity.nodeId)
+      return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
+    }, 90_000, 'C→A auto-recovered to direct on the default 60s reprobe cadence')
+    const tDirect = Date.now()
+    const sinceUnblocked = tDirect - tUnblocked
+    const sinceDowngrade = tDirect - tDowngrade
+    t.diagnostic(`pc-v1#3 auto-reprobe recovery: ${sinceUnblocked}ms after unblock, ${sinceDowngrade}ms after downgrade`)
+
+    // 复原确实等了 ~60s 节拍（不是别的快速通路），且确实在本测试内发生。
+    assert.ok(sinceDowngrade >= 55_000, `recovery waited for the default 60s reprobe cadence (got ${sinceDowngrade}ms since downgrade)`)
+    assert.ok(sinceUnblocked < 78_000, `auto recovery happened within the bounded budget (got ${sinceUnblocked}ms since unblock)`)
+    // A 侧同样收敛，且直连 RTT 是真实测量。
+    await waitFor(() => {
+      const peer = A.engine.status().peers.find((p) => p.nodeId === C.identity.nodeId)
+      return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
+    }, 15000, 'A also converged to the direct path')
+    const rtt = A.engine.status().peers.find((p) => p.nodeId === C.identity.nodeId).rttMs
+    assert.equal(typeof rtt, 'number', 'post-recovery direct RTT is a real measurement')
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    // 有界长测试的清理保险：无论断言成败都拆节点、关网关、关 STUN。
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+test('PC-V1 #4: 上传中 relay→direct 热切，SHA256 全程一致且宿主恰好收到一次（direct→relay 方向归 PC-05）', async (t) => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  const MIB = 1024 * 1024
+  const PAYLOAD = Buffer.alloc(2 * MIB)
+  for (let i = 0; i < PAYLOAD.length; i++) PAYLOAD[i] = (i * 7 + 3) & 0xff
+  const EXPECTED_DIGEST = createHash('sha256').update(PAYLOAD).digest('hex')
+  const cancel = new AbortController() // 声明在 try 外——finally 要能止损在途上传
+
+  try {
+    // A 的宿主替身：增量计数 + sha256（与 PC-05 同形）。
+    let hostCalls = 0
+    let hostReceived = 0
+    let hostDigest = null
+    const A = await startNode(gw, {
+      name: 'node-a',
+      shared: ['s-a1'],
+      hostFetch: () => async (request) => {
+        hostCalls += 1
+        const hash = createHash('sha256')
+        const reader = request.body.getReader()
+        let received = 0
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          received += value.byteLength
+          hash.update(value)
+          hostReceived = received
+        }
+        hostDigest = hash.digest('hex')
+        return new Response(JSON.stringify({ ok: true, echoedBytes: received, sha256: hostDigest }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+    nodes.push(A) // 节点成功创建即纳入清理集合——B 初始化失败也不留 A
+    // B 起步被阻断 → 先走 relay；上传开始后才放开并手动重探（确定性触发；
+    // 默认 60s 自动触发的时序归 PC-V1 #3 专测）。
+    const B = await startNode(gw, { name: 'node-b', firewall: true, shared: ['s-b1'] })
+    nodes.push(B)
+    for (const node of [A, B]) {
+      await node.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+      await waitFor(() => node.engine.status().gatewayState === 'authorized', 8000, `${node.name} authorized`)
+    }
+    const virtualBonA = await waitPeerOnline(B, A.identity.nodeId)
+    await waitPeerOnline(A, B.identity.nodeId)
+    const pathAtStart = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId).path
+    assert.equal(pathAtStart, 'relay', 'the upload starts on the relay path')
+
+    // 源速可控：8×256KiB、段间 400ms（~3s 源速 + relay 限速），保证热切落在
+    // 上传中段。观察到宿主收到首字节后才触发切换。
+    let sent = 0
+    const drip = new ReadableStream({
+      async pull(controller) {
+        if (sent >= PAYLOAD.length) {
+          controller.close()
+          return
+        }
+        const end = Math.min(sent + 256 * 1024, PAYLOAD.length)
+        controller.enqueue(new Uint8Array(PAYLOAD.subarray(sent, end)))
+        sent = end
+        await new Promise((resolve) => setTimeout(resolve, 400))
+      },
+    })
+    const startedAt = Date.now()
+    const uploadPromise = virtualBonA.client.upload(
+      { sessionId: 's-a1', name: 'switch.bin', body: drip, bytes: PAYLOAD.length },
+      cancel.signal,
+    )
+    let bytesAtSwitch = -1
+    const switchWatch = (async () => {
+      await waitFor(() => hostReceived > 0, 15000, 'first bytes flowed over relay')
+      B.setFirewall(false)
+      B.engine.reprobePunch()
+      await waitFor(() => {
+        const peer = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+        return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
+      }, 15000, 'hot-switch to direct while the upload is in flight')
+      bytesAtSwitch = hostReceived
+    })()
+
+    // 并发双任务（PC-V1 fix1）：两个 promise 创建后立即各挂 no-op catch，
+    // Promise.all 等待双方——任一分支先失败立即整测失败，不会等上传自然
+    // 跑完才发现 watcher 已死，也不会留 unhandledRejection。
+    uploadPromise.catch(() => {})
+    switchWatch.catch(() => {})
+    const [result] = await Promise.all([uploadPromise, switchWatch])
+    const elapsed = Date.now() - startedAt
+    t.diagnostic(`pc-v1#4 elapsed=${elapsed}ms bytesAtSwitch=${bytesAtSwitch} hostReceived=${hostReceived} hostCalls=${hostCalls}`)
+    const pathAfter = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId).path
+
+    assert.ok(pathAfter === 'lan' || pathAfter === 'p2p', `the path really switched mid-upload (got ${pathAfter})`)
+    assert.ok(bytesAtSwitch > 0, 'some bytes travelled over relay before the switch')
+    assert.ok(bytesAtSwitch < PAYLOAD.length, `the switch landed mid-upload, not after completion (got ${bytesAtSwitch}/${PAYLOAD.length})`)
+    assert.equal(result.status, 200)
+    const receipt = JSON.parse(result.body)
+    assert.equal(receipt.ok, true)
+    assert.equal(receipt.echoedBytes, PAYLOAD.length, `byte count survived the hot-switch (got ${receipt.echoedBytes})`)
+    assert.equal(receipt.sha256, EXPECTED_DIGEST, 'SHA256 survived the relay→direct hot-switch')
+    assert.equal(hostDigest, EXPECTED_DIGEST, 'the receiver-side incremental digest agrees')
+    assert.equal(hostCalls, 1, 'the business forward ran exactly once — no whole-upload retry')
+    const entry = B.relayPool.getByServerId(A.identity.nodeId)
+    assert.equal(entry.client.state, 'online', 'the virtual mount survived the path switch')
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    cancel.abort() // 成功时是防御性 no-op；任一分支失败时立即止损在途上传
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+test('PC-V1 #5: 生产 startGateway 组装入口承载 STUN 真实绑定、pause/resume、容量热改与已知长度上传', async (t) => {
+  // 与上方本地 helper 的差别（PC-V1 fix1 R2）：这里经 gateway-server 的生产
+  // 组装入口 startGateway——resolveGatewayConfig 解析 env、master.key 落盘、
+  // store（无 DATABASE_URL → SqliteStore）、PeerWsHub 生产选项（遥测刷盘与
+  // 限速 tick 都是真默认，不是 helper 的 null 特例）、UdpStunService 生产
+  // 单口形态、REST+WS 同服务器、逐层有界关停，全部由生产代码装配。
+  // 测试管线例外只有一处：HTTP 端口覆写 0（内核分配），与 pg-integration
+  // PC-07 的 resolveForTest 同一先例。
+  const gwHome = path.join(ROOT, `prod-gw-${Math.random().toString(36).slice(2, 8)}`)
+  fs.mkdirSync(gwHome, { recursive: true })
+  const env = {
+    ZR_GATEWAY_DATA_DIR: gwHome,
+    ZR_GATEWAY_ADMIN_USER: 'admin@pc-v1-prod',
+    ZR_GATEWAY_ADMIN_PASSWORD: 'pc-v1-prod-pass',
+    ZR_GATEWAY_ALLOW_SIGNUP: 'false',
+    ZR_GATEWAY_MAX_NETWORKS_PER_USER: '4',
+    ZR_GATEWAY_MAX_PEERS: '8',
+    ZR_GATEWAY_RELAY_RATE_KBPS: '512',
+    ZR_GATEWAY_UDP_ALT_PORT: '0', // 生产单口形态：辅助 STUN 口关闭
+  }
+  const config = { ...resolveGatewayConfig(env), port: 0 }
+  const inst = await startProductionGateway(config)
+  const nodes = []
+  try {
+    // 生产组装形态断言：STUN 主口真实内核端口；udpAltPort=0 → 辅助口关闭。
+    assert.ok(inst.udpPorts.primaryPort > 0, 'production STUN primary bound a real kernel port')
+    assert.equal(inst.udpPorts.altPort, null, 'udpAltPort=0 closes the secondary STUN port (production single-port shape)')
+    const gw = {
+      port: inst.port,
+      base: inst.base,
+      udp: { primaryPort: inst.udpPorts.primaryPort, altPort: 0 },
+      tenantCookie: await login(inst.base, env.ZR_GATEWAY_ADMIN_USER, env.ZR_GATEWAY_ADMIN_PASSWORD),
+    }
+
+    // —— 入网与 STUN 打洞直连（engine 的 udpProbe 指向生产 STUN 真实端口）——
+    const net = await createNetwork(gw, { mode: 'key' })
+    let hostCalls = 0
+    let hostReceived = 0
+    let hostDigest = null
+    const A = await startNode(gw, {
+      name: 'node-a',
+      shared: ['s-a1'],
+      hostFetch: () => async (request) => {
+        hostCalls += 1
+        const hash = createHash('sha256')
+        const reader = request.body.getReader()
+        let received = 0
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          received += value.byteLength
+          hash.update(value)
+          hostReceived = received
+        }
+        hostDigest = hash.digest('hex')
+        return new Response(JSON.stringify({ ok: true, echoedBytes: received, sha256: hostDigest }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+    nodes.push(A)
+    const B = await startNode(gw, { name: 'node-b', shared: ['s-b1'] })
+    nodes.push(B)
+    for (const node of [A, B]) {
+      await node.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+      await waitFor(() => node.engine.status().gatewayState === 'authorized', 8000, `${node.name} authorized`)
+    }
+    await waitFor(() => {
+      const peer = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+      return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
+    }, 15000, 'A↔B direct path via the production STUN port')
+    const virtualBonA = await waitPeerOnline(B, A.identity.nodeId)
+    await waitPeerOnline(A, B.identity.nodeId)
+
+    // —— 普通已知长度上传（256KiB 单段，直连路径，SHA256 收口）——
+    const payload = Buffer.alloc(256 * 1024)
+    for (let i = 0; i < payload.length; i++) payload[i] = (i * 11 + 5) & 0xff
+    const expectedDigest = createHash('sha256').update(payload).digest('hex')
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(payload))
+        controller.close()
+      },
+    })
+    const uploadResult = await virtualBonA.client.upload({ sessionId: 's-a1', name: 'prod.bin', body, bytes: payload.length })
+    assert.equal(uploadResult.status, 200)
+    const receipt = JSON.parse(uploadResult.body)
+    assert.equal(receipt.ok, true)
+    assert.equal(receipt.echoedBytes, payload.length)
+    assert.equal(receipt.sha256, expectedDigest, 'SHA256 over the production-assembled gateway path')
+    assert.equal(hostCalls, 1)
+
+    // —— pause/resume 经生产 REST+hub ——
+    const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${B.identity.nodeId}/pause`, { cookie: gw.tenantCookie })
+    assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json))
+    await waitFor(() => B.engine.status().gatewayState === 'paused', 8000, 'paused through the production assembly')
+    const resumeRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${B.identity.nodeId}/resume`, { cookie: gw.tenantCookie })
+    assert.equal(resumeRes.status, 200, JSON.stringify(resumeRes.json))
+    await waitFor(() => B.engine.status().gatewayState === 'authorized', 8000, 'resumed in place through the production assembly')
+    await waitPeerOnline(A, B.identity.nodeId)
+
+    // —— 容量热改经生产 REST（defaultMaxPeers 8→5，下一张网络即取新值）——
+    const patchRes = await api(gw.base, 'PATCH', '/api/v1/admin/settings', { cookie: gw.tenantCookie, body: { defaultMaxPeers: 5 } })
+    assert.equal(patchRes.status, 200, JSON.stringify(patchRes.json))
+    const net2 = await createNetwork(gw, { mode: 'key' })
+    assert.equal(net2.maxPeers, 5, 'the hot defaultMaxPeers took effect through the production assembly')
+
+    t.diagnostic(`pc-v1#5 prod ports http=${inst.port} udp=${inst.udpPorts.primaryPort} hostCalls=${hostCalls}`)
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    for (const node of nodes) node.stop()
+    // 生产入口的逐层有界关停（UDP → WS 末批确认 → HTTP → store）本身就是
+    // 被验证对象之一：close() 必须在预算内正常 resolve。
+    await inst.close()
   }
 })
