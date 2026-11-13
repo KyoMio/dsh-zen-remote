@@ -10,12 +10,69 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert')
+const { createHash } = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
+const { syncBuiltinESMExports } = require('node:module')
 
 const MODULE_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'state-store.js')).href
+
+// ---- PC-13 error injection ---------------------------------------------------
+//
+// lib/state-store.js imports node:fs by ESM named exports. Patching
+// require('node:fs') alone does NOT reach them — the named bindings only
+// re-sync with the CJS exports when module.syncBuiltinESMExports() runs.
+// Both directions are synced here: arm = patch + sync, disarm (always in the
+// test's finally) = restore the original function + sync back. The wrappers
+// throw ONLY where a test armed an exact path of its own and delegate
+// everything else, so no other code in the process is affected. This is a
+// standard-library seam — no resolve hooks, no generated shims.
+
+const realChmodSync = fs.chmodSync
+const realReadFileSync = fs.readFileSync
+let armedChmod = null
+let armedRead = null
+
+function armChmodFailure(targetPath, error) {
+  armedChmod = { path: targetPath, error }
+  fs.chmodSync = function patchedChmodSync(p, mode) {
+    if (armedChmod !== null && armedChmod.path === p) throw armedChmod.error
+    return realChmodSync(p, mode)
+  }
+  syncBuiltinESMExports()
+}
+
+function disarmChmodFailure() {
+  armedChmod = null
+  fs.chmodSync = realChmodSync
+  syncBuiltinESMExports()
+}
+
+/** A synthetic read failure shaped like the real thing (code, syscall, path). */
+function eacces(targetPath) {
+  const error = new Error(`simulated unreadable state file: ${targetPath}`)
+  error.code = 'EACCES'
+  error.syscall = 'open'
+  error.path = targetPath
+  return error
+}
+
+function armReadFailure(targetPath) {
+  armedRead = { path: targetPath }
+  fs.readFileSync = function patchedReadFileSync(p, options) {
+    if (armedRead !== null && armedRead.path === p) throw eacces(armedRead.path)
+    return realReadFileSync(p, options)
+  }
+  syncBuiltinESMExports()
+}
+
+function disarmReadFailure() {
+  armedRead = null
+  fs.readFileSync = realReadFileSync
+  syncBuiltinESMExports()
+}
 
 let mod
 test.before(async () => {
@@ -657,4 +714,156 @@ test('the peer fields ride the write belt: a pairing write never wipes identity/
   assert.equal(state.peerIdentity.nodeId, identity.nodeId, 'the identity survived a pairing write')
   assert.equal(state.peerNetwork.networkId, '9f4e2a1088c3b001', 'the network survived a pairing write')
   assert.equal(state.pinnedPeers[peer.nodeId].publicKeyHex, peer.publicKeyHex, 'the pin survived a pairing write')
+})
+
+// ---- 10. PC-13: permission repair is visible, never silent ------------------
+
+/** sha256 of a key, so a failed assertion never prints key material. */
+function keyHash(hex) {
+  return createHash('sha256').update(hex).digest('hex')
+}
+
+test('writeStateFile: a failed tmp chmod aborts the rename, keeps the original, cleans the tmp (PC-13)', (t) => {
+  const file = tempStateFile(t)
+  const { writeStateFile } = mod
+  writeStateFile(file, () => ({ version: 1, serverId: 'abcd1234', sessions: { s1: { sharedAt: 1, lastActivityAt: 2 } } }))
+  const before = fs.readFileSync(file, 'utf8')
+
+  armChmodFailure(`${file}.tmp`, new Error('simulated tmp chmod failure'))
+  let error = null
+  try {
+    writeStateFile(file, (current) => ({ ...current, version: 1, serverId: 'ffffffff' }))
+  } catch (caught) {
+    error = caught
+  } finally {
+    disarmChmodFailure()
+  }
+  assert.ok(error, 'the chmod failure must reach the caller, not be swallowed before the rename')
+  assert.equal(error.message, 'simulated tmp chmod failure', 'the ORIGINAL error surfaces')
+  assert.equal(fs.readFileSync(file, 'utf8'), before, 'the original file was not renamed over')
+  assert.equal(
+    fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith('.tmp')).length,
+    0,
+    'the aborted tmp of ours is cleaned up',
+  )
+
+  // The door is not wedged: a normal write still lands.
+  writeStateFile(file, (current) => ({ ...current, version: 1, sessions: { s2: { sharedAt: 3, lastActivityAt: 4 } } }))
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(after.serverId, 'abcd1234')
+  assert.equal(after.sessions.s2.lastActivityAt, 4)
+})
+
+test('writeStateFile: an unreadable state file fails the write instead of being silently replaced (PC-13)', (t) => {
+  const file = tempStateFile(t)
+  const { writeStateFile } = mod
+  writeStateFile(file, () => ({ version: 1, serverId: 'abcd1234', sessions: { s1: { sharedAt: 1, lastActivityAt: 2 } } }))
+  const before = fs.readFileSync(file, 'utf8')
+
+  // Deterministic: the read failure is injected for THIS path only, so the
+  // case does not depend on real mode bits — a root user could still read a
+  // 0000 file, and Windows' chmod cannot produce one at all.
+  armReadFailure(file)
+  let error = null
+  try {
+    writeStateFile(file, (current) => ({ ...current, version: 1, sessions: { s2: { sharedAt: 3, lastActivityAt: 4 } } }))
+  } catch (caught) {
+    error = caught
+  } finally {
+    disarmReadFailure()
+  }
+  assert.ok(error, 'a read error must not read as an empty file and get renamed over')
+  assert.equal(error.code, 'EACCES', 'the read failure itself is what surfaced')
+  assert.equal(fs.readFileSync(file, 'utf8'), before, 'the original data is intact and recoverable')
+  assert.equal(
+    fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith('.tmp')).length,
+    0,
+    'no tmp leftover from the refused write',
+  )
+})
+
+test('ensurePeerIdentity: reusing an identity repairs a world-readable file to 0600 without touching any data (PC-13)', (t) => {
+  const { ensurePeerIdentity } = mod
+  const file = tempStateFile(t)
+  const seed = peerCrypto.generatePeerIdentity()
+  // Written RAW (not through writeStateFile) so the file also carries a
+  // top-level field this code does not know — the reuse must not rewrite it.
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    serverId: 'abcd1234',
+    peerIdentity: { ...seed, createdAt: 1000 },
+    sessions: { s1: { sharedAt: 1, lastActivityAt: 2 } },
+    servers: [{ id: 'deadbeef', serverUrl: 'http://10.0.0.1:3088', token: 'tok', createdAt: 1 }],
+    futureField: { keep: true },
+  }))
+  fs.chmodSync(file, 0o644)
+  // POSIX mode-bit assertions only: Windows' chmodSync cannot express 0644
+  // or 0600 (it moves the read-only attribute), so gating JUST these two
+  // checks keeps the repair test itself running everywhere without faking a
+  // failure — or claiming ACL equivalence.
+  const posixModeBits = process.platform !== 'win32'
+  if (posixModeBits) assert.equal(fs.statSync(file).mode & 0o777, 0o644)
+  const rawBefore = fs.readFileSync(file, 'utf8')
+
+  const identity = ensurePeerIdentity(file)
+
+  if (posixModeBits) assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'the reuse path repaired the wide mode')
+  assert.equal(
+    keyHash(identity.privateKeyHex),
+    keyHash(seed.privateKeyHex),
+    'the private seed was reused, not regenerated (hash-compared)',
+  )
+  assert.equal(identity.nodeId, seed.nodeId)
+  assert.equal(identity.serverId, 'abcd1234', 'the old serverId is kept')
+  assert.equal(fs.readFileSync(file, 'utf8'), rawBefore, 'not one byte of content changed — no rewrite, unknown fields intact')
+})
+
+test('ensurePeerIdentity: a permission repair that fails errors loudly instead of regenerating (PC-13)', (t) => {
+  const { ensurePeerIdentity, readStateFile } = mod
+  const file = tempStateFile(t)
+  const first = ensurePeerIdentity(file)
+  fs.chmodSync(file, 0o644)
+
+  armChmodFailure(file, new Error('simulated repair failure'))
+  let error = null
+  try {
+    ensurePeerIdentity(file)
+  } catch (caught) {
+    error = caught
+  } finally {
+    disarmChmodFailure()
+  }
+  assert.ok(error, 'a repair that cannot be done must not be a silent no-op')
+  assert.equal(error.message, 'simulated repair failure', 'the ORIGINAL error surfaces')
+  const state = readStateFile(file)
+  assert.equal(state.peerIdentity.nodeId, first.nodeId, 'the identity was NOT regenerated')
+  assert.equal(keyHash(state.peerIdentity.privateKeyHex), keyHash(first.privateKeyHex), 'the original seed is still on disk')
+})
+
+test('ensurePeerIdentity: an unreadable state file is an explicit failure, not a fresh machine (PC-13)', (t) => {
+  const { ensurePeerIdentity, readStateFile } = mod
+  const file = tempStateFile(t)
+  const first = ensurePeerIdentity(file)
+
+  // Deterministic injection (see the writeStateFile unreadable test): no
+  // reliance on real mode bits, which root or Windows chmod could defeat.
+  armReadFailure(file)
+  let error = null
+  try {
+    ensurePeerIdentity(file)
+  } catch (caught) {
+    error = caught
+  } finally {
+    disarmReadFailure()
+  }
+  assert.ok(error, 'an unreadable file must not be mistaken for "no identity"')
+  const state = readStateFile(file)
+  assert.equal(state.peerIdentity.nodeId, first.nodeId, 'the original identity was not renamed away')
+  assert.equal(keyHash(state.peerIdentity.privateKeyHex), keyHash(first.privateKeyHex), 'the original seed survived')
+  assert.equal(state.serverId, first.serverId, 'the serverId survived')
+  assert.equal(
+    fs.readdirSync(path.dirname(file)).filter((name) => name.endsWith('.tmp')).length,
+    0,
+    'no rename attempt left a tmp behind',
+  )
 })
