@@ -558,18 +558,67 @@ interface ForwardableCancelFrame extends Record<string, unknown> {
 }
 
 /**
- * T75: the ONE emit shape the relay forwards — a single session's
- * running-state flip (`api-session/status`), exactly what the host emits on
- * `agent/status` (RT dsh-api-session-controller lib/index.js:2884-2886:
- * `ctx.emit("api-session/status", agent.id, status === "running")`), carried
- * on the wire as the client face's exact-keys emit with a JSON-array `args`
- * (RT dsh-api-gateway lib/index.js:846-853 builds `{type, event, args}`;
- * lib/client.js `parseRemoteEventFrame` demands that shape back).
+ * Session-scoped `$events` emit frames the relay forwards:
+ * - `api-session/status`: `[sessionId, boolean]`
+ * - `api-session/activity`: `[sessionId, updatedAt: number]`
+ * - `api-session/error`: `[sessionId, message: string]`
+ * - `agent-preset/selected`: `[sessionId, agentPreset: string]`
+ * - `goal/activation-changed`: `[{ sessionId, goal? }]`
+ * Every other emit (`api-session/added`, `settings/document-updated`, …)
+ * carries server-wide state and is dropped.
  */
-interface ForwardableStatusEmitFrame extends Record<string, unknown> {
-  type: 'emit'
-  event: 'api-session/status'
-  args: [string, boolean]
+interface ForwardableSessionEmit {
+  sessionId: string
+  buildFrame: () => { type: 'emit'; event: string; args: unknown[] }
+}
+
+function parseForwardableSessionEmit(frame: Record<string, unknown>): ForwardableSessionEmit | null {
+  if (
+    Reflect.ownKeys(frame).length !== 3 ||
+    !['type', 'event', 'args'].every((key) => Object.hasOwn(frame, key)) ||
+    !Array.isArray(frame.args)
+  ) {
+    return null
+  }
+  const event = frame.event
+  const args = frame.args
+  if (event === 'goal/activation-changed') {
+    if (args.length !== 1 || !isPlainObject(args[0])) return null
+    const payload = args[0]
+    const sessionId = payload.sessionId
+    if (!isEventId(sessionId)) return null
+    const keys = Reflect.ownKeys(payload)
+    const hasGoal = Object.hasOwn(payload, 'goal')
+    if (keys.length !== (hasGoal ? 2 : 1)) return null
+    if (hasGoal && !isPlainObject(payload.goal)) return null
+    const goal = hasGoal ? { ...(payload.goal as Record<string, unknown>) } : undefined
+    return {
+      sessionId,
+      buildFrame: () => ({
+        type: 'emit',
+        event,
+        args: [hasGoal ? { sessionId, goal } : { sessionId }],
+      }),
+    }
+  }
+  if (args.length !== 2 || !isEventId(args[0])) return null
+  const sessionId = args[0]
+  const value = args[1]
+  const valid =
+    event === 'api-session/status'
+      ? typeof value === 'boolean'
+      : event === 'api-session/activity'
+        ? typeof value === 'number' && Number.isFinite(value)
+        : event === 'api-session/error'
+          ? typeof value === 'string'
+          : event === 'agent-preset/selected'
+            ? isEventId(value)
+            : false
+  if (!valid || typeof event !== 'string') return null
+  return {
+    sessionId,
+    buildFrame: () => ({ type: 'emit', event, args: [sessionId, value] }),
+  }
 }
 
 function isForwardableWaterfall(frame: Record<string, unknown>): frame is ForwardableWaterfallFrame {
@@ -591,18 +640,6 @@ function isForwardableCancel(frame: Record<string, unknown>): frame is Forwardab
     Object.hasOwn(frame, 'type') &&
     Object.hasOwn(frame, 'eventId') &&
     isEventId(frame.eventId)
-  )
-}
-
-function isForwardableStatusEmit(frame: Record<string, unknown>): frame is ForwardableStatusEmitFrame {
-  return (
-    Reflect.ownKeys(frame).length === 3 &&
-    ['type', 'event', 'args'].every((key) => Object.hasOwn(frame, key)) &&
-    frame.event === 'api-session/status' &&
-    Array.isArray(frame.args) &&
-    frame.args.length === 2 &&
-    isEventId(frame.args[0]) &&
-    typeof frame.args[1] === 'boolean'
   )
 }
 
@@ -1274,10 +1311,11 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       return { ...frame, eventId: `${sub.token}.${frame.eventId}` }
     }
     if (frame.type === 'emit') {
-      // T75: the one share-scoped emit. A NEW frame with a fresh args array
-      // leaves — never the host's object itself.
-      if (!isForwardableStatusEmit(frame) || !isAccessible(frame.args[0])) return null
-      return { type: 'emit', event: frame.event, args: [frame.args[0], frame.args[1]] }
+      // Session-scoped emits pass strictly through the exact-keys gate and are
+      // checked against the share table; fresh objects/arrays leave.
+      const parsed = parseForwardableSessionEmit(frame)
+      if (parsed === null || !isAccessible(parsed.sessionId)) return null
+      return parsed.buildFrame()
     }
     return null
   }

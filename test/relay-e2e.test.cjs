@@ -4092,3 +4092,96 @@ test('e2e MS-9: calls route BY serverId — invoke, stream and approval answers 
     await stackTwo.stop()
   }
 })
+
+test('API-2 e2e: P0 endpoints and all 5 session-scoped $zr/events emits honor share boundaries', async () => {
+  const env = await boot({
+    shared: ['session-parent'],
+    invoke: async (call) => ({ echoed: `${call.namespace}/${call.method}` }),
+  })
+  const controller = new AbortController()
+  let handle
+  try {
+    const info = await env.client.connect()
+    assert.equal(env.client.state, 'online')
+    const V = (id) => toVirtual(info.serverId, id)
+
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalEventsGateway(localGate)
+    handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    // Open merged $events stream
+    const merged = await localGateway.wireTap(
+      '$events',
+      { args: {} },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    )
+    const iterator = merged[Symbol.asyncIterator]()
+    localGate.push({ type: 'ready', clientId: 'local', host: { home: '/tmp' } })
+    await collectFrames(iterator, 1)
+    await waitFor(() => env.eventsGates.length === 1)
+
+    // 4 new session-scoped emits on shared session traverse & virtualize;
+    // emits for unshared session or malformed args are dropped server-side.
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/activity', args: ['session-secret', 999] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/activity', args: ['session-parent', 4242] })
+    env.eventsGates[0].push({ type: 'emit', event: 'api-session/error', args: ['session-parent', 'turn failed'] })
+    env.eventsGates[0].push({ type: 'emit', event: 'agent-preset/selected', args: ['session-parent', 'ptc'] })
+    env.eventsGates[0].push({ type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: 'session-secret' }] })
+    env.eventsGates[0].push({ type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: 'session-parent', goal: { title: 'Ship' } }] })
+
+    const emits = await collectFrames(iterator, 4)
+    assert.deepEqual(emits, [
+      { type: 'emit', event: 'api-session/activity', args: [V('session-parent'), 4242] },
+      { type: 'emit', event: 'api-session/error', args: [V('session-parent'), 'turn failed'] },
+      { type: 'emit', event: 'agent-preset/selected', args: [V('session-parent'), V('ptc')] },
+      { type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: V('session-parent'), goal: { title: 'Ship' } }] },
+    ])
+
+    // P0 invoke + stream checks over the real HTTP/NDJSON relay
+    const enableRes = await localGateway.rpcBridge('agentTeams/setEnabled', {
+      args: { agentId: V('session-parent'), enabled: true },
+    })
+    assert.equal(enableRes.ok, true)
+    assert.deepEqual(enableRes.value, { echoed: 'agentTeams/setEnabled' })
+    const recorded = env.invokeCalls.find((c) => c.namespace === 'agentTeams' && c.method === 'setEnabled')
+    assert.deepEqual(recorded?.args, { agentId: 'session-parent', enabled: true })
+
+    const deniedRes = await localGateway.rpcBridge('goals/create', {
+      args: { agentId: V('session-secret'), request: { title: 'x' } },
+    })
+    assert.equal(deniedRes.ok, false)
+    assert.equal(deniedRes.error.code, 'not-shared')
+
+    // toolResults/watch streams cleanly and dies with 'unshared' on unshare
+    const watchStream = await localGateway.wireTap(
+      'toolResults/watch',
+      { args: { request: { sessionId: V('session-parent'), toolCallId: 'tc-1' } } },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    )
+    const watchIter = watchStream[Symbol.asyncIterator]()
+    const firstPromise = watchIter.next()
+    await waitFor(() => env.streams.some((s) => s.call.namespace === 'toolResults' && s.call.method === 'watch'))
+    const watchGate = env.streams.find((s) => s.call.namespace === 'toolResults' && s.call.method === 'watch')
+    watchGate.push({ type: 'chunk', text: 'hello' })
+    const first = await firstPromise
+    assert.deepEqual(first.value, { type: 'chunk', text: 'hello' })
+
+    env.store.unshare('session-parent')
+    await assert.rejects(() => watchIter.next(), (err) => err && err.code === 'unshared')
+  } finally {
+    controller.abort()
+    handle?.uninstall()
+    await env.stop()
+  }
+})

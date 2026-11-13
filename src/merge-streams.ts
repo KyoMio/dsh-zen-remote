@@ -1120,19 +1120,18 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
           )
           continue
         }
-        for (const key of Object.keys(values)) {
+        const virtualValues = virtualizeProjectionValues(values, identity.serverId)
+        for (const key of Object.keys(virtualValues)) {
           // The baseline gives one sequence number per projection record
-          // (`asOfSeq`) — every key of that record rides it. A modelSelection
-          // value additionally gets its provider ids virtualized (T52) so the
-          // UI matches it against the merged catalog's virtual groups —
-          // UNCONDITIONALLY (T52-fix3): the host's projection store is
-          // first-write-wins per seq, so a catalog-gated original value would
-          // occupy the seq and the later virtual rewrite could never land.
+          // (`asOfSeq`) — every key of that record rides it. Projection values
+          // that reference server ids (modelSelection, subagentCatalog,
+          // agentTeam) are rewritten unconditionally via virtualizeProjectionValues
+          // (T52-fix3: first-write-wins per seq forbids a catalog gate).
           out.push(
             controlProjectionFrame(
               virtualize(sessionId),
               key,
-              key === 'modelSelection' ? virtualizeModelSelectionValue(values[key], identity.serverId) : values[key],
+              virtualValues[key],
               asOfSeq,
             ),
           )
@@ -1167,10 +1166,7 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
         controlProjectionFrame(
           sessionId,
           key,
-          // The modelSelection update's providers go virtual with the session
-          // id (T52) — same unconditional rewrite as the exploded baseline
-          // above (T52-fix3: first-write-wins per seq forbids a catalog gate).
-          key === 'modelSelection' ? virtualizeModelSelectionValue(value, identity.serverId) : value,
+          virtualizeProjectionValue(key, value, identity.serverId),
           seq,
         ),
       )
@@ -1285,14 +1281,17 @@ export function mergeSessionList(localResult: unknown, remoteResult: unknown, se
     if (!isPlainObject(item) || typeof item.sessionId !== 'string') return item
     const out: Record<string, unknown> = { ...item, sessionId: virtualize(item.sessionId) }
     if (typeof item.parentSessionId === 'string') out.parentSessionId = virtualize(item.parentSessionId)
-    if (
-      isPlainObject(item.projections) &&
-      isPlainObject(item.projections.values) &&
-      Object.hasOwn(item.projections.values, 'modelSelection')
-    ) {
-      const values: Record<string, unknown> = { ...item.projections.values }
-      values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId)
-      out.projections = { ...item.projections, values }
+    if (isPlainObject(item.projections) && isPlainObject(item.projections.values)) {
+      const nextValues = virtualizeProjectionValues(item.projections.values, serverId)
+      if (nextValues !== item.projections.values) {
+        out.projections = { ...item.projections, values: nextValues }
+      }
+    }
+    if (isPlainObject(item.projectionValues)) {
+      const nextValues = virtualizeProjectionValues(item.projectionValues, serverId)
+      if (nextValues !== item.projectionValues) {
+        out.projectionValues = nextValues
+      }
     }
     return out
   })
@@ -1406,6 +1405,58 @@ export function virtualizeModelSelectionValue(value: unknown, serverId: string):
     }
   }
   return out
+}
+
+/**
+ * Rewrite one projection key's value for a remote session so embedded
+ * server-scoped ids (`modelSelection.provider`, `subagentCatalog[].id`,
+ * `agentTeam.tasks[].ownerId`) carry `zr~<serverId>~`. Unrecognized keys and
+ * malformed shapes pass through by identity.
+ */
+export function virtualizeProjectionValue(key: string, value: unknown, serverId: string): unknown {
+  if (key === 'modelSelection') return virtualizeModelSelectionValue(value, serverId)
+  if (key === 'subagentCatalog') {
+    if (!Array.isArray(value)) return value
+    return value.map((entry) =>
+      isPlainObject(entry) && typeof entry.id === 'string' && entry.id !== ''
+        ? { ...entry, id: toVirtual(serverId, entry.id) }
+        : entry,
+    )
+  }
+  if (key === 'agentTeam') {
+    if (!isPlainObject(value) || !Array.isArray(value.tasks)) return value
+    return {
+      ...value,
+      tasks: value.tasks.map((task) =>
+        isPlainObject(task) && typeof task.ownerId === 'string' && task.ownerId !== ''
+          ? { ...task, ownerId: toVirtual(serverId, task.ownerId) }
+          : task,
+      ),
+    }
+  }
+  return value
+}
+
+/**
+ * Virtualize every rewritable entry in a session projection `values` map
+ * (shared across `session/follow`, `session/projections`, `session/list`, and
+ * `session/control`). Returns the input map unchanged if nothing needed
+ * rewriting.
+ */
+export function virtualizeProjectionValues(
+  values: Record<string, unknown>,
+  serverId: string,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...values }
+  let changed = false
+  for (const key of Object.keys(out)) {
+    const next = virtualizeProjectionValue(key, out[key], serverId)
+    if (next !== out[key]) {
+      out[key] = next
+      changed = true
+    }
+  }
+  return changed ? out : values
 }
 
 /**
