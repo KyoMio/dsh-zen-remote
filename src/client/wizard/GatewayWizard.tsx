@@ -1491,14 +1491,20 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     return { state: 'pass' as const, text: wizardStatus.publicUrl || t('wizard.path.external') }
   })()
 
-  // PG-9: the peer node's derived overview + lights, read off the polled
-  // peer status view (the view rows are structurally the wizard's
-  // PeerDeviceView). The devices light's cap follows the BODY's maxPeers —
-  // the gateway's announced cap — defaulting to the pool cap before the
-  // first welcome lands.
+  // PG-9 + PC-11b: the peer node's derived overview + lights, read off the
+  // polled peer status view (the view rows are structurally the wizard's
+  // PeerDeviceView). The mount-capacity facts are the body's OWN PC-11a
+  // fields — the display never divides the raw network cap by anything nor
+  // counts the discovered rows; before the first poll answers (or on an old
+  // body without the fields) every fact is unknown and says so.
   const peerDevices: readonly PeerDeviceView[] = peerView?.peers ?? []
   const peerSelfJoined = peerView?.configured === true && (peerView.gatewayState === 'authorized' || peerView.gatewayState === 'paused')
-  const peerSummary = derivePeerOverviewSummary(peerDevices, peerView?.maxPeers ?? 8, { includeSelf: peerSelfJoined })
+  const peerSummary = derivePeerOverviewSummary(peerDevices, {
+    maxServers: peerView?.maxServers,
+    mountedCount: peerView?.mountedCount,
+    limitReached: peerView?.limitReached,
+    maxPeers: peerView?.maxPeers,
+  }, { includeSelf: peerSelfJoined })
   const peerLights = derivePeerWizardLights({
     identityReady: (peerView?.nodeId ?? '') !== '',
     gatewayState: peerView?.gatewayState ?? 'unconfigured',
@@ -1741,7 +1747,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 </p>
                 <p className="zr-wizard-overviewSub">
                   {peerDevices.length > 0
-                    ? t('wizard.overview.peerDevicesCount', { count: String(peerSummary.mountedCount), max: String(peerDevices.length) })
+                    ? (peerSummary.mountedCount !== undefined
+                      ? t('wizard.overview.peerMountedDiscovered', { count: String(peerSummary.mountedCount), total: String(peerDevices.length) })
+                      : t('wizard.overview.peerDiscoveredCount', { total: String(peerDevices.length) }))
                     : ''}
                 </p>
               </div>
@@ -1760,21 +1768,32 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                     {t('wizard.peer.devicesModalTitle')}
                   </button>
                 </div>
+                {/* PC-11b + fix1: the mount line reads the body's OWN facts —
+                    本机已挂载 N / M against the LOCAL effective cap; the raw
+                    network cap keeps its OWN sub line at ALL times (known
+                    maxPeers only — never invented), so a full local cap stays
+                    explainable against a larger network; an unknown capacity
+                    says so instead of showing 0 / 8. */}
                 <p className="zr-wizard-overviewValue" data-limit={peerSummary.limitReached ? 'true' : undefined}>
                   <span className="zr-wizard-dot" data-state={peerSummary.devicesLight} />
                   <span>
-                    {peerSummary.limitReached
-                      ? t('wizard.overview.peerDevicesFull', { max: String(peerSummary.maxPeers) })
-                      : t('wizard.overview.peerDevicesCount', { count: String(peerSummary.totalCount), max: String(peerSummary.maxPeers) })}
+                    {peerSummary.mountedCount !== undefined && peerSummary.maxServers !== undefined
+                      ? t('wizard.overview.peerMountCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.maxServers) })
+                      : t('wizard.overview.peerMountUnknown')}
                   </span>
                 </p>
-                <p className="zr-wizard-overviewSub" data-limit={peerSummary.limitReached ? 'true' : undefined}>
-                  {peerSummary.limitReached
-                    ? t('wizard.overview.limitNote', { max: String(peerSummary.maxPeers) })
-                    : peerSummary.mismatchCount > 0
-                      ? t('wizard.peer.devicePathMismatch')
-                      : ''}
-                </p>
+                {peerSummary.limitReached === true || peerSummary.mismatchCount > 0 ? (
+                  <p className="zr-wizard-overviewSub" data-limit={peerSummary.limitReached ? 'true' : undefined}>
+                    {peerSummary.limitReached === true
+                      ? t('wizard.overview.peerMountFull', { max: String(peerSummary.maxServers ?? '') })
+                      : t('wizard.peer.devicePathMismatch')}
+                  </p>
+                ) : null}
+                {peerSummary.maxPeers !== undefined ? (
+                  <p className="zr-wizard-overviewSub">
+                    {t('wizard.overview.peerNetworkCapNote', { max: String(peerSummary.maxPeers) })}
+                  </p>
+                ) : null}
               </div>
             </div>
 
@@ -3416,9 +3435,27 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
             </div>
 
             <div className="zr-wizard-modalBody">
-              {peerSummary.limitReached ? (
+              {/* PC-11b + fix1: the modal states the SAME mount facts as the
+                  tile — the local N / M line (a plain unknown word before the
+                  first poll answers) and the raw network cap on its OWN line
+                  whenever the body carried one, full or not. */}
+              {peerView?.configured === true ? (
+                <>
+                  <p className="zr-wizard-subtitle" data-limit={peerSummary.limitReached ? 'true' : undefined}>
+                    {peerSummary.mountedCount !== undefined && peerSummary.maxServers !== undefined
+                      ? t('wizard.overview.peerMountCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.maxServers) })
+                      : t('wizard.overview.peerMountUnknown')}
+                  </p>
+                  {peerSummary.maxPeers !== undefined ? (
+                    <p className="zr-wizard-subtitle">
+                      {t('wizard.overview.peerNetworkCapNote', { max: String(peerSummary.maxPeers) })}
+                    </p>
+                  ) : null}
+                </>
+              ) : null}
+              {peerSummary.limitReached === true ? (
                 <p className="zr-wizard-notice" data-tone="error">
-                  {t('wizard.overview.peerDevicesFull', { max: String(peerSummary.maxPeers) })}
+                  {t('wizard.overview.peerMountFull', { max: String(peerSummary.maxServers ?? '') })}
                 </p>
               ) : null}
               {peerActionFailed ? (
