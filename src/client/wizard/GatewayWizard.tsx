@@ -65,6 +65,7 @@ import {
   WIZARD_TUNNEL_STATUS_ROUTE,
   WIZARD_TUNNEL_STOP_ROUTE,
   WIZARD_VERIFY_ROUTE,
+  assemblePeerInviteUri,
   caddyFailureCopy,
   configureReadiness,
   deriveClientOverviewSummary,
@@ -215,10 +216,15 @@ function peerStateCopy(state: string, t: GatewayWizardProps['t'], deniedReason?:
 }
 
 /** The join route's failure copy: the route's own codes plus a generic
- * fallback. `invalid-invite` gets the paste-format copy. */
+ * fallback. `invalid-invite` gets the paste-format copy. PC-15's two
+ * `bad-adv-*` codes never leave this component — the advanced split-fill's
+ * local refusals, raised before any request. */
 function peerJoinFailCopy(code: string, t: GatewayWizardProps['t']): string {
   switch (code) {
     case 'invalid-invite': return t('wizard.peer.joinInvalid')
+    case 'bad-adv-gateway': return t('wizard.peer.advancedBadGateway')
+    case 'bad-adv-network-id': return t('wizard.peer.advancedBadNetworkId')
+    case 'bad-adv-join-key': return t('wizard.peer.advancedBadJoinKey')
     case 'invalid-gateway': return t('wizard.peer.joinGatewayInvalid')
     case 'gateway-unreachable': return t('wizard.peer.joinGatewayUnreachable')
     case 'no-network': return t('wizard.peer.joinNoNetwork')
@@ -340,6 +346,14 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [peerJoinMode, setPeerJoinMode] = useState<'invite' | 'gateway'>('invite')
   const [peerInvite, setPeerInvite] = useState('')
   const [peerGatewayUrl, setPeerGatewayUrl] = useState('')
+  // PC-15: the advanced split-fill's drafts (gateway address / network ID /
+  // optional passphrase). The passphrase is the sensitive draft — it dies on
+  // every mode switch, modal close and success (clearPeerAdvancedDrafts);
+  // a FAILED join keeps the form so the user can fix and retry.
+  const [peerAdvOpen, setPeerAdvOpen] = useState(false)
+  const [peerAdvGateway, setPeerAdvGateway] = useState('')
+  const [peerAdvNetId, setPeerAdvNetId] = useState('')
+  const [peerAdvJoinKey, setPeerAdvJoinKey] = useState('')
   const [peerCandidateNetworks, setPeerCandidateNetworks] = useState<readonly { id: string; name: string }[]>([])
   const [peerSelectedNetId, setPeerSelectedNetId] = useState('')
   const [peerBusy, setPeerBusy] = useState(false)
@@ -482,13 +496,69 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }, [])
 
+  // PC-15: the advanced split-fill dies whole — the expander collapses and
+  // all three drafts (including the sensitive passphrase) clear on a mode
+  // switch, a success, and every modal close, so a reopen never shows stale
+  // fields and no hidden draft can mix into the active mode. A FAILED join
+  // keeps the form for the fix-and-retry loop.
+  const clearPeerAdvancedDrafts = (): void => {
+    setPeerAdvOpen(false)
+    setPeerAdvGateway('')
+    setPeerAdvNetId('')
+    setPeerAdvJoinKey('')
+  }
+
+  // PC-15: the close transition (X / cancel / Escape / the post-leave close)
+  // is the one funnel every modal-close path shares.
+  useEffect(() => {
+    if (modalOpen) return
+    clearPeerAdvancedDrafts()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- stable setters only
+  }, [modalOpen])
+
+  // PC-15 fix1 R1: leaving the peer configure form by ANY path — 上一步 back
+  // to pick, a role pick on the pick step, a successful join's step change —
+  // clears the sensitive advanced drafts too. Only a FAILED join keeps them
+  // for the fix-and-retry loop; mid-form switches must not wait for the
+  // modal-close effect.
+  const peerAdvFormActive = step === 'configure' && wizardRole === 'peer'
+  const peerAdvFormActiveRef = useRef(false)
+  useEffect(() => {
+    if (peerAdvFormActive) {
+      peerAdvFormActiveRef.current = true
+      return
+    }
+    if (peerAdvFormActiveRef.current) {
+      peerAdvFormActiveRef.current = false
+      clearPeerAdvancedDrafts()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- stable setters only
+  }, [peerAdvFormActive])
+
   // PG-9: paste-invite OR gateway-address manual-approval join. Switching a
   // host row into peer mode reloads the plugin first, then the invite or
-  // gatewayUrl travels to the peer join route.
+  // gatewayUrl travels to the peer join route. PC-15 fix1 R1: with the
+  // advanced split-fill OPEN it is the ONLY active input — an open expander
+  // never falls back to the paste draft (which is cleared and disabled the
+  // moment the expander opens), so a stale paste can never ride a join
+  // meant for the advanced form; a missing part is a LOCAL refusal.
   const runPeerJoin = async (): Promise<void> => {
     setFormError(null)
     setPeerFail(null)
-    const rawInput = (peerJoinMode === 'gateway' ? peerGatewayUrl : peerInvite).trim()
+    const peerAdvActive = peerJoinMode === 'invite' && peerAdvOpen
+    let rawInput = (peerJoinMode === 'gateway' ? peerGatewayUrl : peerInvite).trim()
+    if (peerAdvActive) {
+      const assembled = assemblePeerInviteUri({
+        gatewayAddress: peerAdvGateway,
+        networkId: peerAdvNetId,
+        ...(peerAdvJoinKey !== '' ? { joinKey: peerAdvJoinKey } : {}),
+      })
+      if (!assembled.ok) {
+        setPeerFail(assembled.error)
+        return
+      }
+      rawInput = assembled.inviteUri
+    }
     if (rawInput === '') {
       setPeerFail(peerJoinMode === 'gateway' ? 'invalid-gateway' : 'invalid-invite')
       return
@@ -552,6 +622,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         setPeerInvite('')
         setPeerCandidateNetworks([])
         setPeerSelectedNetId('')
+        clearPeerAdvancedDrafts()
         await loadPeerStatus()
         setStep('verify')
       } else if (body?.error?.code === 'select-network' && Array.isArray(body.networks) && body.networks.length > 0) {
@@ -2398,6 +2469,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                             onClick={() => {
                               setPeerJoinMode('invite')
                               setPeerFail(null)
+                              clearPeerAdvancedDrafts()
                             }}
                           >
                             {t('wizard.peer.modeInvite')}
@@ -2412,6 +2484,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                             onClick={() => {
                               setPeerJoinMode('gateway')
                               setPeerFail(null)
+                              clearPeerAdvancedDrafts()
                             }}
                           >
                             {t('wizard.peer.modeGateway')}
@@ -2419,24 +2492,105 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                         </div>
 
                         {peerJoinMode === 'invite' ? (
-                          <div className="zr-wizard-field">
-                            <label className="zr-wizard-label" htmlFor="zr-wizard-peer-invite">{t('wizard.peer.inviteUri')}</label>
-                            <input
-                              id="zr-wizard-peer-invite"
-                              className="zr-wizard-input"
-                              type="text"
-                              autoComplete="off"
-                              spellCheck={false}
-                              placeholder={t('wizard.peer.inviteUriPlaceholder')}
-                              value={peerInvite}
-                              disabled={peerBusy}
-                              onChange={(event) => {
-                                setPeerInvite(event.target.value)
-                                if (peerFail !== null) setPeerFail(null)
+                          <>
+                            <div className="zr-wizard-field">
+                              <label className="zr-wizard-label" htmlFor="zr-wizard-peer-invite">{t('wizard.peer.inviteUri')}</label>
+                              <input
+                                id="zr-wizard-peer-invite"
+                                className="zr-wizard-input"
+                                type="text"
+                                autoComplete="off"
+                                spellCheck={false}
+                                placeholder={t('wizard.peer.inviteUriPlaceholder')}
+                                value={peerInvite}
+                                disabled={peerBusy || peerAdvOpen}
+                                onChange={(event) => {
+                                  setPeerInvite(event.target.value)
+                                  if (peerFail !== null) setPeerFail(null)
+                                }}
+                              />
+                              <p className="zr-wizard-hint">{peerAdvOpen ? t('wizard.peer.inviteUriPausedHint') : t('wizard.peer.inviteUriHint')}</p>
+                            </div>
+                            {/* PC-15: the advanced split-fill — a native
+                                <details> expander (keyboard-toggleable) whose
+                                fields assemble into the SAME invite payload.
+                                PC-15 fix1 R1: OPEN means these fields are the
+                                ONLY active input — opening clears the paste
+                                draft (the field above disables itself with a
+                                paused hint) and collapsing clears the advanced
+                                drafts (a reopened expander never shows the old
+                                masked passphrase); a FAILED join alone keeps
+                                the form. */}
+                            <details
+                              open={peerAdvOpen}
+                              onToggle={(event) => {
+                                const next = event.currentTarget.open
+                                setPeerAdvOpen(next)
+                                if (next) {
+                                  setPeerInvite('')
+                                  if (peerFail !== null) setPeerFail(null)
+                                } else {
+                                  clearPeerAdvancedDrafts()
+                                }
                               }}
-                            />
-                            <p className="zr-wizard-hint">{t('wizard.peer.inviteUriHint')}</p>
-                          </div>
+                            >
+                              <summary className="zr-wizard-linkBtn">{t('wizard.peer.advancedSummary')}</summary>
+                              <div className="zr-wizard-formStack">
+                                <div className="zr-wizard-field">
+                                  <label className="zr-wizard-label" htmlFor="zr-wizard-peer-adv-gateway">{t('wizard.peer.advancedGateway')}</label>
+                                  <input
+                                    id="zr-wizard-peer-adv-gateway"
+                                    className="zr-wizard-input"
+                                    type="text"
+                                    autoComplete="off"
+                                    spellCheck={false}
+                                    placeholder={t('wizard.peer.advancedGatewayPlaceholder')}
+                                    value={peerAdvGateway}
+                                    disabled={peerBusy}
+                                    onChange={(event) => {
+                                      setPeerAdvGateway(event.target.value)
+                                      if (peerFail !== null) setPeerFail(null)
+                                    }}
+                                  />
+                                  <p className="zr-wizard-hint">{t('wizard.peer.advancedGatewayHint')}</p>
+                                </div>
+                                <div className="zr-wizard-field">
+                                  <label className="zr-wizard-label" htmlFor="zr-wizard-peer-adv-net">{t('wizard.peer.advancedNetworkId')}</label>
+                                  <input
+                                    id="zr-wizard-peer-adv-net"
+                                    className="zr-wizard-input"
+                                    type="text"
+                                    autoComplete="off"
+                                    spellCheck={false}
+                                    placeholder={t('wizard.peer.advancedNetworkIdPlaceholder')}
+                                    value={peerAdvNetId}
+                                    disabled={peerBusy}
+                                    onChange={(event) => {
+                                      setPeerAdvNetId(event.target.value)
+                                      if (peerFail !== null) setPeerFail(null)
+                                    }}
+                                  />
+                                  <p className="zr-wizard-hint">{t('wizard.peer.advancedNetworkIdHint')}</p>
+                                </div>
+                                <div className="zr-wizard-field">
+                                  <label className="zr-wizard-label" htmlFor="zr-wizard-peer-adv-key">{t('wizard.peer.advancedJoinKey')}</label>
+                                  <input
+                                    id="zr-wizard-peer-adv-key"
+                                    className="zr-wizard-input"
+                                    type="password"
+                                    autoComplete="off"
+                                    value={peerAdvJoinKey}
+                                    disabled={peerBusy}
+                                    onChange={(event) => {
+                                      setPeerAdvJoinKey(event.target.value)
+                                      if (peerFail !== null) setPeerFail(null)
+                                    }}
+                                  />
+                                  <p className="zr-wizard-hint">{t('wizard.peer.advancedJoinKeyHint')}</p>
+                                </div>
+                              </div>
+                            </details>
+                          </>
                         ) : (
                           <>
                             <div className="zr-wizard-field">
