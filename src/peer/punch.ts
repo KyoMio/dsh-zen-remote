@@ -891,6 +891,13 @@ export class PeerPunchManager {
     // Admission comes exclusively from beginPunch (gateway announcement + TOFU).
     const session = this.sessions.get(parsed.nodeId)
     if (!session || session.peerPublicKeyHex !== parsed.publicKeyHex) return
+    // A peer can recover just before our scheduled reprobe. Give this exchange
+    // its own window now, so the old timer cannot rotate our key/nonce before
+    // the reply arrives. Admission still requires the ACK to our fresh nonce.
+    if (session.state === 'idle') {
+      this.clearSessionTimers(session)
+      this.startPunchRounds(session)
+    }
     session.hsBound = parsed.contract
     this.sendHelloAck(session, parsed.nonce, parsed.ephPubHex, rinfo)
     // A signed HELLO can be recorded forever. Never adopt its key or endpoint:
