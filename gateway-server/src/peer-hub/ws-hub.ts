@@ -17,7 +17,8 @@
 // 与 PG-4 的打通全部经 GatewayHooks：approve/reject/pause/resume/repin/
 // remove/deleteNetwork/disableUser/settings 变更实时反映到内存路由表与
 // 在线连接。中转字节经 PeerRateLimiter 限速（超限丢弃背压）并累计
-// pendingRelayBytes，由内部定时器经 store.flushMemberTelemetry 落库。
+// pendingRelayBytes，由串行化 flush 取批次快照经 store.flushMemberTelemetry
+// 落库、成功后才确认该批（PC-19：失败保留待写累计，不丢字节）。
 // 拓扑订阅（SSE）在成员变动、path-report、3s 速率跳动时重渲染快照推送。
 import { randomBytes } from 'node:crypto';
 import type { Server as HttpServer, IncomingMessage } from 'node:http';
@@ -223,6 +224,12 @@ export class PeerWsHub {
   private rateKbps: number = DEFAULT_SETTINGS.relayRateKbps;
   private rateTimer: NodeJS.Timeout | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
+  // PC-19 fix1：flush 意图合并状态机——任意时刻至多一个在途轮 + 至多一个合并
+  // 尾轮（挂死期间到达的全部重复意图共享它），不为每次 tick 排独立任务，队列
+  // 有界不随时间积累。flushInFlight 持有当前轮的原始 promise（成败随轮结算），
+  // flushTail 是已承诺给合并调用方的尾轮；尾轮开跑即接管在途身份。
+  private flushInFlight: Promise<void> | null = null;
+  private flushTail: Promise<void> | null = null;
   private closed = false;
   // In-flight reads may carry pre-disable snapshots (including PostgreSQL queries).
   private admissionEpoch = 0;
@@ -781,10 +788,15 @@ export class PeerWsHub {
         }
       }
     }
-    const pending = this.pendingNat.get(key) ?? { networkId: record.networkId, nodeId: record.nodeId };
-    pending.natType = record.natType;
-    pending.lastIp = record.reflexiveIp;
-    this.pendingNat.set(key, pending);
+    // PC-19 fix1 R2：新观测落成新 record，绝不原地改旧 record——flush 快照持有
+    // 的引用即观测身份，确认按引用相等只摘除确为本批的记录（同值复探或
+    // 值变走又变回都会产生新对象，不会被旧批的确认误吞）
+    this.pendingNat.set(key, {
+      networkId: record.networkId,
+      nodeId: record.nodeId,
+      natType: record.natType,
+      lastIp: record.reflexiveIp,
+    });
     void this.publishTopology(record.networkId);
   }
 
@@ -1280,25 +1292,78 @@ export class PeerWsHub {
 
   // ------------------------------------------------------------ 遥测刷盘
 
-  /** 手动触发一次刷盘（内部定时器也走这里）：限速字节 + NAT 变更合并落库 */
-  async flushTelemetry(): Promise<void> {
-    const drained = this.limiter.drainAllPending();
+  /**
+   * 触发一次刷盘（内部定时器、手动调用与未来关停补刷共用同一入口）。
+   * PC-19 fix1 意图合并：空闲即开一轮；已有在途轮时全部重叠意图合并为至多
+   * 一个尾轮（共享同一个 promise），绝不并发写库、不为每次调用排独立任务。
+   * 每个调用方观察自己所属轮的完成/失败：开轮者得该轮结果，合并者共享尾轮
+   * 结果（尾轮快照在开跑时取，覆盖登记前后到达的累计）。任何一轮失败只回给
+   * 所属调用方，不毒化状态机（下一轮照常），也没有后台自动重试——失败批次
+   * 原样保留待下一个正常入口。
+   */
+  flushTelemetry(): Promise<void> {
+    // 已登记尾轮：意图并入它，共享同一 promise（在途轮落定后它必然开跑）
+    if (this.flushTail !== null) return this.flushTail;
+    if (this.flushInFlight !== null) {
+      const handover = (): Promise<void> => {
+        // 尾轮开跑即接管在途身份：本尾轮执行期间的新意图可再登记一个尾轮，
+        // 不落空；上一轮成败都不拦住尾轮（尾轮结果只反映尾轮自身）
+        this.flushTail = null;
+        this.flushInFlight = tail;
+        return this.doFlushTelemetry();
+      };
+      const tail = this.flushInFlight.then(handover, handover);
+      // 结算观察（成败均然）：期间无人再登记尾轮则状态机回空闲。
+      // 旁观者也吞掉拒绝——尾轮的结果由合并进来的调用方各自 await 消费。
+      tail.then(
+        () => {
+          if (this.flushInFlight === tail && this.flushTail === null) this.flushInFlight = null;
+          if (this.flushTail === tail) this.flushTail = null;
+        },
+        () => {
+          if (this.flushInFlight === tail && this.flushTail === null) this.flushInFlight = null;
+          if (this.flushTail === tail) this.flushTail = null;
+        },
+      );
+      this.flushTail = tail;
+      return tail;
+    }
+    // 空闲：立即开一轮
+    const run = this.doFlushTelemetry();
+    // 结算观察：期间无人登记尾轮则回空闲；旁观者吞拒绝（调用方各自消费结果）
+    run.then(
+      () => {
+        if (this.flushInFlight === run && this.flushTail === null) this.flushInFlight = null;
+      },
+      () => {
+        if (this.flushInFlight === run && this.flushTail === null) this.flushInFlight = null;
+      },
+    );
+    this.flushInFlight = run;
+    return run;
+  }
+
+  /** 单轮刷盘：取稳定批次快照（限速字节 + NAT 变更合并）→ 写库 → 成功才确认该批 */
+  private async doFlushTelemetry(): Promise<void> {
+    const byteBatch = this.limiter.snapshotAllPending();
+    // NAT record 不可变（新观测永远换新对象，见 applyNatObservation）：快照持有
+    // record 引用即观测身份，写库在途的新观测不影响本批内容
+    const natBatch = [...this.pendingNat];
     const updates = new Map<string, TelemetryUpdate>();
-    for (const item of drained) {
+    for (const item of byteBatch) {
       updates.set(connKey(item.networkId, item.nodeId), {
         networkId: item.networkId,
         nodeId: item.nodeId,
         relayBytesDelta: item.bytes,
       });
     }
-    for (const nat of this.pendingNat.values()) {
-      const key = connKey(nat.networkId, nat.nodeId);
-      const existing = updates.get(key) ?? { networkId: nat.networkId, nodeId: nat.nodeId };
-      if (nat.natType !== undefined) existing.natType = nat.natType;
-      if (nat.lastIp !== undefined) existing.lastIp = nat.lastIp;
+    for (const [, record] of natBatch) {
+      const key = connKey(record.networkId, record.nodeId);
+      const existing = updates.get(key) ?? { networkId: record.networkId, nodeId: record.nodeId };
+      if (record.natType !== undefined) existing.natType = record.natType;
+      if (record.lastIp !== undefined) existing.lastIp = record.lastIp;
       updates.set(key, existing);
     }
-    this.pendingNat.clear();
     if (updates.size === 0) return;
     const list = [...updates.values()];
     const seenAt = new Date(this.now()).toISOString();
@@ -1306,5 +1371,12 @@ export class PeerWsHub {
       update.lastSeenAt = seenAt; // 只要这次有变更就顺手记 lastSeenAt
     }
     await this.store.flushMemberTelemetry(list);
+    // DB 成功才确认该批：扣减快照字节；NAT 条目仅当仍是快照那份 record（引用
+    // 相等）时摘除——在途新观测是新对象，保留待下轮。失败时确认整体不发生，
+    // 待写累计原样保留待下轮。
+    this.limiter.confirmFlushed(byteBatch);
+    for (const [key, record] of natBatch) {
+      if (this.pendingNat.get(key) === record) this.pendingNat.delete(key);
+    }
   }
 }

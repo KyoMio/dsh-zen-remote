@@ -643,25 +643,34 @@ export class PgStore implements GatewayStore {
     return rows.map((row) => mapMemberRow(row as Row));
   }
 
+  /**
+   * PC-19：整批在同一事务里全成/全败——中途普通 SQL 失败（如约束违反）回滚
+   * 已执行的前序语句，调用方重试整批不会重复计数。PC-06 连接纪律：事务内
+   * 一律用事务连接 tx，不借外层池连接。SQLite 侧同一 SQL 语义（见 sqlite-store
+   * 的 this.tx()），两后端同批原子。
+   */
   async flushMemberTelemetry(updates: TelemetryUpdate[]): Promise<void> {
-    for (const update of updates) {
-      await this.query(
-        `UPDATE network_members SET
-           cumulative_relay_bytes = cumulative_relay_bytes + $1,
-           last_ip = COALESCE($2, last_ip),
-           nat_type = COALESCE($3, nat_type),
-           last_seen_at = COALESCE($4, last_seen_at)
-         WHERE network_id = $5 AND node_id = $6`,
-        [
-          update.relayBytesDelta ?? 0,
-          update.lastIp ?? null,
-          update.natType ?? null,
-          update.lastSeenAt ?? null,
-          update.networkId,
-          update.nodeId,
-        ],
-      );
-    }
+    if (updates.length === 0) return;
+    await this.inTransaction(async (tx) => {
+      for (const update of updates) {
+        await tx(
+          `UPDATE network_members SET
+             cumulative_relay_bytes = cumulative_relay_bytes + $1,
+             last_ip = COALESCE($2, last_ip),
+             nat_type = COALESCE($3, nat_type),
+             last_seen_at = COALESCE($4, last_seen_at)
+           WHERE network_id = $5 AND node_id = $6`,
+          [
+            update.relayBytesDelta ?? 0,
+            update.lastIp ?? null,
+            update.natType ?? null,
+            update.lastSeenAt ?? null,
+            update.networkId,
+            update.nodeId,
+          ],
+        );
+      }
+    });
   }
 
   async close(): Promise<void> {

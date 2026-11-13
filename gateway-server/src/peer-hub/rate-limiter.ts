@@ -11,8 +11,9 @@
 //    KB/s = 1024 字节/秒（kilobytes，不是 kilobits），与 relayRateKbps
 //    配置和界面 KB/s 文案同单位：读数 = 窗口字节 / (窗口秒) / 1024，不乘 8。
 //    支持按全网 / 单节点 / 无序节点对聚合，供 /topology 与 GatewayRuntimeStats。
-// 3. pendingRelayBytes：自上次 drain 起每成员累计的中转字节，由 ws-hub 的
-//    定时刷盘经 store.flushMemberTelemetry 落库后清零。
+// 3. pendingRelayBytes：自上次确认起每成员累计的中转字节。PC-19：flush 取稳定
+//    批次快照（不清零），经 store.flushMemberTelemetry 落库成功后仅确认该批
+//    （confirmFlushed 扣减快照量）；写失败累计原样保留，在途新到字节并入下批。
 export interface RelayScope {
   networkId: string;
   nodeId: string;
@@ -146,15 +147,37 @@ export class PeerRateLimiter {
     return windowBytes / (this.windowMs / 1000) / 1024;
   }
 
-  /** 自上次 drain 起某成员累计的中转字节 */
+  /** 自上次确认起某成员累计的中转字节 */
   pendingRelayBytes(networkId: string, nodeId: string): number {
     return this.pending.get(memberKey({ networkId, nodeId }))?.bytes ?? 0;
   }
 
-  /** 取走全部待刷盘字节并清零（由 ws-hub 定时经 flushMemberTelemetry 落库） */
-  drainAllPending(): Array<{ networkId: string; nodeId: string; bytes: number }> {
-    const out = [...this.pending.values()].map((p) => ({ networkId: p.member.networkId, nodeId: p.member.nodeId, bytes: p.bytes }));
-    this.pending.clear();
-    return out;
+  /**
+   * 稳定批次快照（PC-19）：读走当前全部待刷盘累计但**不清零**——调用方写库
+   * 成功后经 confirmFlushed 只确认这一批；写失败时累计原样保留可重试，写库
+   * 在途新到的字节不属于本批、确认后留待下批。每成员各一个小整数累计，重试
+   * 逐次合并，不堆批次日志。
+   */
+  snapshotAllPending(): Array<{ networkId: string; nodeId: string; bytes: number }> {
+    return [...this.pending.values()].map((p) => ({
+      networkId: p.member.networkId,
+      nodeId: p.member.nodeId,
+      bytes: p.bytes,
+    }));
+  }
+
+  /**
+   * 确认一个已成功落库的批次（PC-19）：逐成员只扣减快照时刻的字节量。与
+   * 串行化 flush 配对使用（同一时刻只有一个在途批次），快照后在途新到的
+   * 字节保留待下批。
+   */
+  confirmFlushed(batch: ReadonlyArray<{ networkId: string; nodeId: string; bytes: number }>): void {
+    for (const item of batch) {
+      const key = memberKey(item);
+      const pending = this.pending.get(key);
+      if (pending === undefined) continue;
+      pending.bytes -= item.bytes;
+      if (pending.bytes <= 0) this.pending.delete(key);
+    }
   }
 }
