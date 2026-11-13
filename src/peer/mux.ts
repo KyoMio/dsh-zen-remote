@@ -41,12 +41,13 @@ import { Readable, Writable } from 'node:stream'
 
 import { PeerArqSession } from './arq.js'
 import {
+  buildPeerHandshakeEnvelope,
   derivePeerSessionCiphers,
   generateEphemeralX25519,
+  parsePeerHandshakeEnvelope,
   verifySelfCertifyingNodeId,
 } from './crypto.js'
-import type { PeerEphemeralKeyPair, PeerIdentityKeyPair, PeerSessionCiphers } from './crypto.js'
-import { ed25519Sign, ed25519Verify, PUNCH_DOMAIN } from './punch.js'
+import type { ParsedPeerHandshakeEnvelope, PeerEphemeralKeyPair, PeerIdentityKeyPair, PeerSessionCiphers } from './crypto.js'
 import type { PunchFrameSender } from './punch.js'
 import {
   decodeFrameHeader,
@@ -60,9 +61,7 @@ import {
 import type { PeerFrameHeader } from './wire.js'
 
 const NODE_ID_PATTERN = /^[0-9a-f]{8}$/
-const HEX64 = /^[0-9a-f]{64}$/
-const HEX128 = /^[0-9a-f]{128}$/
-/** hello/ack envelope 的时间戳新鲜度窗口。 */
+/** hello/ack envelope 的时间戳新鲜度窗口（PC-12 起移入共同契约解析，数值不变）。 */
 const ENVELOPE_TTL_MS = 30_000
 /** 网关中转的最小帧长：28B 头 + 16B（AEAD tag 起步）。明文 envelope 也必须够长。 */
 const GATEWAY_MIN_FRAME_BYTES = 44
@@ -127,6 +126,8 @@ interface MuxSession {
   myEph: PeerEphemeralKeyPair | null
   nonce: string | null
   peerEphPubHex: string | null
+  /** 本轮中转握手已达成的契约档位（内部诊断；`hsBound` 不是完整绑定以外的任何承诺）。 */
+  hsBound: 'v1' | 'v2' | null
   /** WS 密封帧的 AEAD 序列——每会话一个计数器，永不回绕复用。 */
   seq: bigint
   /** 明文 envelope 头的序列（只需唯一）。 */
@@ -200,6 +201,7 @@ export class PeerMux {
       myEph: null,
       nonce: null,
       peerEphPubHex: null,
+      hsBound: null,
       seq: 0n,
       envelopeSeq: 0n,
       arq: new PeerArqSession({
@@ -557,48 +559,36 @@ export class PeerMux {
     }
   }
 
-  /** `28B 头（HELLO, streamId 0）+ 签名 zr-punch-v1 hello JSON`，网关原样路由。 */
+  /** `28B 头（HELLO, streamId 0）+ dual 握手信封 JSON`，网关原样路由（只读路由头）。 */
   private sendHelloEnvelope(session: MuxSession): void {
     const myEph = session.myEph
     const nonce = session.nonce
     if (myEph === null || nonce === null) return
-    const timestamp = this.clock.now()
-    const message = Buffer.from(
-      `${PUNCH_DOMAIN}|hello|${this.options.networkId}|${this.options.identity.nodeId}|${myEph.publicKeyHex}|${nonce}|${timestamp}`,
-      'utf8',
-    )
-    this.sendEnvelope(session, Buffer.from(JSON.stringify({
-      zr: 1,
-      kind: 'zr-hello',
+    this.sendEnvelope(session, buildPeerHandshakeEnvelope({
+      kind: 'hello',
       networkId: this.options.networkId,
-      nodeId: this.options.identity.nodeId,
-      publicKeyHex: this.options.identity.publicKeyHex,
-      ephPubHex: myEph.publicKeyHex,
+      identity: this.options.identity,
+      selfEphPubHex: myEph.publicKeyHex,
+      peerNodeId: session.nodeId,
+      peerEphPubHex: null,
       nonce,
-      timestamp,
-      sigHex: ed25519Sign(message, this.options.identity),
-    }), 'utf8'))
+      timestamp: this.clock.now(),
+    }))
   }
 
-  private sendHelloAckEnvelope(session: MuxSession, echoNonce: string): void {
+  private sendHelloAckEnvelope(session: MuxSession, echoNonce: string, initiatorEphPubHex: string): void {
     const myEph = session.myEph
     if (myEph === null) return
-    const timestamp = this.clock.now()
-    const message = Buffer.from(
-      `${PUNCH_DOMAIN}|ack|${this.options.networkId}|${this.options.identity.nodeId}|${myEph.publicKeyHex}|${echoNonce}|${timestamp}`,
-      'utf8',
-    )
-    this.sendEnvelope(session, Buffer.from(JSON.stringify({
-      zr: 1,
-      kind: 'zr-hello-ack',
+    this.sendEnvelope(session, buildPeerHandshakeEnvelope({
+      kind: 'ack',
       networkId: this.options.networkId,
-      nodeId: this.options.identity.nodeId,
-      publicKeyHex: this.options.identity.publicKeyHex,
-      ephPubHex: myEph.publicKeyHex,
+      identity: this.options.identity,
+      selfEphPubHex: myEph.publicKeyHex,
+      peerNodeId: session.nodeId,
+      peerEphPubHex: initiatorEphPubHex,
       nonce: echoNonce,
-      timestamp,
-      sigHex: ed25519Sign(message, this.options.identity),
-    }), 'utf8'))
+      timestamp: this.clock.now(),
+    }))
   }
 
   private sendEnvelope(session: MuxSession, payload: Buffer): void {
@@ -621,50 +611,35 @@ export class PeerMux {
 
   /** 一个入站 envelope（HELLO, streamId 0）：hello→应答+整合；ack→整合。 */
   private handleEnvelope(session: MuxSession, payloadBytes: Uint8Array): void {
-    let parsed: Record<string, unknown>
-    try {
-      const text = Buffer.from(payloadBytes).toString('utf8').replace(/\x00+$/, '')
-      parsed = JSON.parse(text) as Record<string, unknown>
-    } catch {
-      return
-    }
-    if (!parsed || parsed.zr !== 1) return
-    const nodeId = typeof parsed.nodeId === 'string' ? parsed.nodeId.toLowerCase() : ''
-    const publicKeyHex = typeof parsed.publicKeyHex === 'string' ? parsed.publicKeyHex : ''
+    // PC-12：与 UDP 打洞共用同一份契约解析；±30s 新鲜度窗（ENVELOPE_TTL_MS）
+    // 以路径参数传入，数值与既有行为一致。
+    const parsed = parsePeerHandshakeEnvelope(payloadBytes, {
+      networkId: this.options.networkId,
+      selfNodeId: this.options.identity.nodeId,
+      nowMs: this.clock.now(),
+      timeWindowMs: ENVELOPE_TTL_MS,
+    })
+    if (!parsed) return
     // 键锚定：信封必须来自我们会话锚定的那把钥。
-    if (nodeId !== session.nodeId || !HEX64.test(publicKeyHex) || publicKeyHex !== session.peerPublicKeyHex) return
-    if (parsed.networkId !== this.options.networkId) return
-    const ephPubHex = typeof parsed.ephPubHex === 'string' ? parsed.ephPubHex : ''
-    const nonce = typeof parsed.nonce === 'string' ? parsed.nonce : ''
-    const timestamp = typeof parsed.timestamp === 'number' ? parsed.timestamp : 0
-    const sigHex = typeof parsed.sigHex === 'string' ? parsed.sigHex : ''
-    if (!HEX64.test(ephPubHex) || nonce === '' || !Number.isInteger(timestamp) || !HEX128.test(sigHex)) return
-    if (Math.abs(this.clock.now() - timestamp) > ENVELOPE_TTL_MS) return
+    if (parsed.nodeId !== session.nodeId || parsed.publicKeyHex !== session.peerPublicKeyHex) return
 
-    if (parsed.kind === 'zr-hello') {
-      const message = Buffer.from(
-        `${PUNCH_DOMAIN}|hello|${this.options.networkId}|${nodeId}|${ephPubHex}|${nonce}|${timestamp}`,
-        'utf8',
-      )
-      if (!ed25519Verify(message, publicKeyHex, sigHex)) return
+    if (parsed.kind === 'hello') {
+      session.hsBound = parsed.contract
       // 先应答——对端正等着 ack 完成握手。
       ensureMyEphemeral(session)
-      this.sendHelloAckEnvelope(session, nonce)
+      this.sendHelloAckEnvelope(session, parsed.nonce, parsed.ephPubHex)
       // HELLO is replayable within its TTL. Only a fresh challenge response
       // may replace the working key; keep our DH key stable for old peers.
-      if (session.peerEphPubHex !== ephPubHex || session.ciphers === null) this.beginHello(session)
+      if (session.peerEphPubHex !== parsed.ephPubHex || session.ciphers === null) this.beginHello(session)
       return
     }
-    if (parsed.kind === 'zr-hello-ack') {
-      // 回显 nonce 把 ack 绑定到我们在途的那一轮 hello。
-      if (session.nonce === null || nonce !== session.nonce) return
-      const message = Buffer.from(
-        `${PUNCH_DOMAIN}|ack|${this.options.networkId}|${nodeId}|${ephPubHex}|${nonce}|${timestamp}`,
-        'utf8',
-      )
-      if (!ed25519Verify(message, publicKeyHex, sigHex)) return
-      this.integratePeerEphemeral(session, ephPubHex)
-    }
+    // 回显 nonce 把 ack 绑定到我们在途的那一轮 hello。
+    if (session.nonce === null || parsed.nonce !== session.nonce) return
+    // v2 档纵深复核：回绑的 dstEph 必须是本机当前在途临时钥（v2 签名已覆盖，
+    // 复核零成本）。v1 档沿旧语义采信（nonce 回显 + 锚定公钥 + TTL）。
+    if (parsed.contract === 'v2' && (session.myEph === null || parsed.peerEphPubHex !== session.myEph.publicKeyHex)) return
+    session.hsBound = parsed.contract
+    this.integratePeerEphemeral(session, parsed.ephPubHex)
   }
 
   /** 采用对端临时钥：每个新 (my, peer) 对只派生一次中转密码器。 */
@@ -694,7 +669,8 @@ export class PeerMux {
     session.ciphers = ciphers
     session.nonce = null // consume only after successful derivation
     this.clearHelloTimer(session)
-    this.options.log?.(`mux: relay handshake complete for ${session.nodeId} (path=${session.path})`)
+    // PC-12：契约档位只标注在正常日志（v1 档是旧协议互通保障，不冒充完整绑定）。
+    this.options.log?.(`mux: relay handshake complete for ${session.nodeId} (path=${session.path}, hs=${session.hsBound ?? 'v1'})`)
     if (session.path === 'none') {
       session.path = 'ws'
       session.arq.flushInflight()

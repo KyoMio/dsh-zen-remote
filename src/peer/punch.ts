@@ -41,8 +41,15 @@ import os from 'node:os'
 import { createPrivateKey, createPublicKey, randomBytes, sign, verify } from 'node:crypto'
 import type { Socket as DgramSocket } from 'node:dgram'
 
-import { derivePeerSessionCiphers, generateEphemeralX25519, verifySelfCertifyingNodeId } from './crypto.js'
-import type { PeerEphemeralKeyPair, PeerIdentityKeyPair, PeerSessionCiphers } from './crypto.js'
+import {
+  buildPeerHandshakeEnvelope,
+  derivePeerSessionCiphers,
+  generateEphemeralX25519,
+  PEER_PUNCH_V1_DOMAIN,
+  parsePeerHandshakeEnvelope,
+  verifySelfCertifyingNodeId,
+} from './crypto.js'
+import type { ParsedPeerHandshakeEnvelope, PeerEphemeralKeyPair, PeerIdentityKeyPair, PeerSessionCiphers } from './crypto.js'
 import { PeerFrameType, decodeFrameHeader, packEncryptedFrame, unpackEncryptedFrame } from './wire.js'
 import type { PeerFrameHeader } from './wire.js'
 
@@ -50,13 +57,12 @@ import type { PeerFrameHeader } from './wire.js'
 
 const NODE_ID_PATTERN = /^[0-9a-f]{8}$/
 const NETWORK_ID_PATTERN = /^[0-9a-fA-F]{16}$/
-const HEX16 = /^[0-9a-fA-F]{16}$/
 const HEX64 = /^[0-9a-fA-F]{64}$/
-const HEX128 = /^[0-9a-fA-F]{128}$/
 
 /** 打洞/中转握手控制包的域分隔前缀——UDP 与网关 WS 两条路径共用同一形态。 */
 export const STUN_PROBE_DOMAIN = 'zr-stun-probe-v1'
-export const PUNCH_DOMAIN = 'zr-punch-v1'
+/** v1 域常量已下沉 crypto.ts（PC-12）；此处保留同名导出维持既有引用面。 */
+export const PUNCH_DOMAIN = PEER_PUNCH_V1_DOMAIN
 
 /** `os.networkInterfaces()` entries, loosened so hand-built fixtures type-check. */
 export interface LanInterfaceInfo {
@@ -405,6 +411,11 @@ export interface DirectReadyInfo {
   endpoint: string
   /** Handshake RTT when we initiated; 0 when we answered passively. */
   rttMs: number
+  /**
+   * 本条直连握手达成的契约档位（内部诊断，PC-12）：`'v2'` = dual 信封完整绑定
+   * 成立；`'v1'` = 旧协议互通保障（TOFU + nonce 回显），**不是**完整绑定。
+   */
+  hsBound: 'v1' | 'v2'
   ciphers: PeerSessionCiphers
 }
 
@@ -463,6 +474,8 @@ interface PunchSession {
   /** Only an outstanding, unconsumed challenge can authorize a peer key. */
   awaitingAck: boolean
   peerEphPubHex: string | null
+  /** 本轮握手已达成的契约档位（内部诊断；新窗口/新握手时清空重记）。 */
+  hsBound: 'v1' | 'v2' | null
   /** Guard so one derived key pair fires onDirectReady exactly once. */
   derivedPair: string | null
   candidates: string[]
@@ -681,6 +694,7 @@ export class PeerPunchManager {
       nonce: randomBytes(8).toString('hex'),
       awaitingAck: true,
       peerEphPubHex: null,
+      hsBound: null,
       derivedPair: null,
       candidates,
       endpoint: null,
@@ -724,6 +738,7 @@ export class PeerPunchManager {
     session.nonce = randomBytes(8).toString('hex')
     session.awaitingAck = true
     session.peerEphPubHex = null
+    session.hsBound = null
     session.derivedPair = null
     session.ciphers = null
     session.rttMs = null
@@ -814,21 +829,16 @@ export class PeerPunchManager {
   private sendHellos(session: PunchSession, endpoints = session.candidates): void {
     const timestamp = this.clock.now()
     session.lastHelloSentAt = timestamp
-    const message = Buffer.from(
-      `${PUNCH_DOMAIN}|hello|${this.networkId}|${this.identity.nodeId}|${session.myEph.publicKeyHex}|${session.nonce}|${timestamp}`,
-      'utf8',
-    )
-    const packet = Buffer.from(JSON.stringify({
-      zr: 1,
-      kind: 'zr-hello',
+    const packet = buildPeerHandshakeEnvelope({
+      kind: 'hello',
       networkId: this.networkId,
-      nodeId: this.identity.nodeId,
-      publicKeyHex: this.identity.publicKeyHex,
-      ephPubHex: session.myEph.publicKeyHex,
+      identity: this.identity,
+      selfEphPubHex: session.myEph.publicKeyHex,
+      peerNodeId: session.peerNodeId,
+      peerEphPubHex: null,
       nonce: session.nonce,
       timestamp,
-      sigHex: ed25519Sign(message, this.identity),
-    }))
+    })
     for (const endpoint of endpoints) {
       const parsed = parseEndpoint(endpoint)
       if (!parsed) continue
@@ -840,23 +850,22 @@ export class PeerPunchManager {
     }
   }
 
-  private sendHelloAck(session: PunchSession, echoNonce: string, rinfo: { address: string; port: number }): void {
-    const timestamp = this.clock.now()
-    const message = Buffer.from(
-      `${PUNCH_DOMAIN}|ack|${this.networkId}|${this.identity.nodeId}|${session.myEph.publicKeyHex}|${echoNonce}|${timestamp}`,
-      'utf8',
-    )
-    const packet = Buffer.from(JSON.stringify({
-      zr: 1,
-      kind: 'zr-hello-ack',
+  private sendHelloAck(
+    session: PunchSession,
+    echoNonce: string,
+    initiatorEphPubHex: string,
+    rinfo: { address: string; port: number },
+  ): void {
+    const packet = buildPeerHandshakeEnvelope({
+      kind: 'ack',
       networkId: this.networkId,
-      nodeId: this.identity.nodeId,
-      publicKeyHex: this.identity.publicKeyHex,
-      ephPubHex: session.myEph.publicKeyHex,
+      identity: this.identity,
+      selfEphPubHex: session.myEph.publicKeyHex,
+      peerNodeId: session.peerNodeId,
+      peerEphPubHex: initiatorEphPubHex,
       nonce: echoNonce,
-      timestamp,
-      sigHex: ed25519Sign(message, this.identity),
-    }))
+      timestamp: this.clock.now(),
+    })
     try {
       this.socket.send(packet, rinfo.port, rinfo.address)
     } catch {
@@ -865,41 +874,29 @@ export class PeerPunchManager {
   }
 
   private handleControlPacket(bytes: Uint8Array, rinfo: { address: string; port: number }): void {
-    let parsed: Record<string, unknown>
-    try {
-      parsed = JSON.parse(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8'))
-    } catch {
-      return
-    }
-    if (!parsed || typeof parsed !== 'object' || parsed.zr !== 1) return
-    if (parsed.networkId !== this.networkId) return
-    const nodeId = typeof parsed.nodeId === 'string' ? parsed.nodeId.toLowerCase() : ''
-    if (!NODE_ID_PATTERN.test(nodeId) || nodeId === this.identity.nodeId) return
-    if (parsed.kind === 'zr-hello') this.onHello(parsed, rinfo)
-    else if (parsed.kind === 'zr-hello-ack') this.onHelloAck(parsed, rinfo)
+    // PC-12：UDP 与 WS 共用同一份信封契约解析。UDP 传 timeWindowMs=0——
+    // 用户裁定本路径不新增时间窗（timestamp 只进签名，不做新鲜度检查）。
+    const parsed = parsePeerHandshakeEnvelope(bytes, {
+      networkId: this.networkId,
+      selfNodeId: this.identity.nodeId,
+      nowMs: this.clock.now(),
+      timeWindowMs: 0,
+    })
+    if (!parsed) return
+    if (parsed.kind === 'hello') this.onHello(parsed, rinfo)
+    else this.onHelloAck(parsed, rinfo)
   }
 
-  private onHello(packet: Record<string, unknown>, rinfo: { address: string; port: number }): void {
-    if (typeof packet.publicKeyHex !== 'string' || !HEX64.test(packet.publicKeyHex)) return
-    if (typeof packet.ephPubHex !== 'string' || !HEX64.test(packet.ephPubHex)) return
-    if (typeof packet.nonce !== 'string' || !HEX16.test(packet.nonce)) return
-    if (typeof packet.timestamp !== 'number' || !Number.isInteger(packet.timestamp)) return
-    if (typeof packet.sigHex !== 'string' || !HEX128.test(packet.sigHex)) return
-    const nodeId = (packet.nodeId as string).toLowerCase()
-    if (!verifySelfCertifyingNodeId(nodeId, packet.publicKeyHex)) return
-    const message = Buffer.from(
-      `${PUNCH_DOMAIN}|hello|${this.networkId}|${nodeId}|${packet.ephPubHex}|${packet.nonce}|${packet.timestamp}`,
-      'utf8',
-    )
-    if (!ed25519Verify(message, packet.publicKeyHex, packet.sigHex)) return
+  private onHello(parsed: ParsedPeerHandshakeEnvelope, rinfo: { address: string; port: number }): void {
     // Admission comes exclusively from beginPunch (gateway announcement + TOFU).
-    const session = this.sessions.get(nodeId)
-    if (!session || session.peerPublicKeyHex !== packet.publicKeyHex) return
-    this.sendHelloAck(session, packet.nonce, rinfo)
+    const session = this.sessions.get(parsed.nodeId)
+    if (!session || session.peerPublicKeyHex !== parsed.publicKeyHex) return
+    session.hsBound = parsed.contract
+    this.sendHelloAck(session, parsed.nonce, parsed.ephPubHex, rinfo)
     // A signed HELLO can be recorded forever. Never adopt its key or endpoint:
     // ask the live identity to sign our fresh nonce instead. Keep the local DH
     // key stable so simultaneous handshakes and legacy responders converge.
-    if (session.peerEphPubHex !== packet.ephPubHex || !session.ciphers) {
+    if (session.peerEphPubHex !== parsed.ephPubHex || !session.ciphers) {
       if (!session.awaitingAck) {
         session.nonce = randomBytes(8).toString('hex')
         session.awaitingAck = true
@@ -908,27 +905,20 @@ export class PeerPunchManager {
     }
   }
 
-  private onHelloAck(packet: Record<string, unknown>, rinfo: { address: string; port: number }): void {
-    if (typeof packet.publicKeyHex !== 'string' || !HEX64.test(packet.publicKeyHex)) return
-    if (typeof packet.ephPubHex !== 'string' || !HEX64.test(packet.ephPubHex)) return
-    if (typeof packet.nonce !== 'string' || !HEX16.test(packet.nonce)) return
-    if (typeof packet.timestamp !== 'number' || !Number.isInteger(packet.timestamp)) return
-    if (typeof packet.sigHex !== 'string' || !HEX128.test(packet.sigHex)) return
-    const nodeId = (packet.nodeId as string).toLowerCase()
-    const session = this.sessions.get(nodeId)
+  private onHelloAck(parsed: ParsedPeerHandshakeEnvelope, rinfo: { address: string; port: number }): void {
+    const session = this.sessions.get(parsed.nodeId)
     // Key pinning: the ack must come from the identity we set out to reach.
-    if (!session || session.peerPublicKeyHex !== packet.publicKeyHex) return
+    if (!session || session.peerPublicKeyHex !== parsed.publicKeyHex) return
     // The echoed nonce binds this ack to OUR current round; stale rounds die here.
-    if (!session.awaitingAck || packet.nonce !== session.nonce) return
-    const message = Buffer.from(
-      `${PUNCH_DOMAIN}|ack|${this.networkId}|${nodeId}|${packet.ephPubHex}|${packet.nonce}|${packet.timestamp}`,
-      'utf8',
-    )
-    if (!ed25519Verify(message, packet.publicKeyHex, packet.sigHex)) return
+    if (!session.awaitingAck || parsed.nonce !== session.nonce) return
+    // v2 档纵深复核：回绑的 dstEph 必须是本机当前在途临时钥（v2 签名已覆盖
+    // 这一等式，解析层复核零成本）。v1 档沿旧语义采信（nonce 回显 + 锚定公钥）。
+    if (parsed.contract === 'v2' && parsed.peerEphPubHex !== session.myEph.publicKeyHex) return
+    session.hsBound = parsed.contract
     if (typeof session.lastHelloSentAt === 'number') {
       session.rttMs = Math.max(0, this.clock.now() - session.lastHelloSentAt)
     }
-    if (!this.integratePeerEphemeral(session, packet.ephPubHex, rinfo)) return
+    if (!this.integratePeerEphemeral(session, parsed.ephPubHex, rinfo)) return
     session.awaitingAck = false
     // Immediately send an encrypted PING so the responder confirms round-trip
     // (us → peer HELLO, peer → us ACK, us → peer sealed PING) in 0.5 RTT.
@@ -988,6 +978,7 @@ export class PeerPunchManager {
       mode: classifyPunchEndpoint(endpoint, this.localIps),
       endpoint,
       rttMs: session.rttMs ?? 0,
+      hsBound: session.hsBound === 'v2' ? 'v2' : 'v1',
       ciphers,
     })
   }
