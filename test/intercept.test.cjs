@@ -593,7 +593,7 @@ test('session/page forwards the ORIGINAL id and passes the result through', asyn
   handle.uninstall()
 })
 
-test('a subagent address rewrites only parentSessionId', async () => {
+test('a subagent address restores childSessionId and optional parentSessionId, rejecting cross-server pairs', async () => {
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()
   const { handle } = install(gateway, relay)
@@ -603,7 +603,26 @@ test('a subagent address rewrites only parentSessionId', async () => {
   }, undefined, undefined)
   assert.equal(envelope.ok, true)
   assert.equal(relay.invokes[0].args.request.address.parentSessionId, 'session-parent')
-  assert.equal(relay.invokes[0].args.request.address.childSessionId, childId, 'the child id is already the server-side original')
+  assert.equal(relay.invokes[0].args.request.address.childSessionId, childId, 'non-virtual child id stays untouched')
+
+  const bothVirtual = await gateway.rpcBridge('session/page', {
+    args: { request: { address: { kind: 'subagent', parentSessionId: toVirtual(SERVER_ID, 'p2'), childSessionId: toVirtual(SERVER_ID, 'c2'), mode: 'continuable' } } },
+  }, undefined, undefined)
+  assert.equal(bothVirtual.ok, true)
+  assert.equal(relay.invokes[1].args.request.address.parentSessionId, 'p2')
+  assert.equal(relay.invokes[1].args.request.address.childSessionId, 'c2')
+
+  const childOnly = await gateway.rpcBridge('session/page', {
+    args: { request: { address: { kind: 'subagent', childSessionId: toVirtual(SERVER_ID, 'c3') } } },
+  }, undefined, undefined)
+  assert.equal(childOnly.ok, true)
+  assert.equal(relay.invokes[2].args.request.address.childSessionId, 'c3')
+
+  const cross = await gateway.rpcBridge('session/page', {
+    args: { request: { address: { kind: 'subagent', parentSessionId: toVirtual(SERVER_ID, 'p'), childSessionId: toVirtual('eeeeeeee', 'c') } } },
+  }, undefined, undefined)
+  assert.equal(cross.ok, false)
+  assert.equal(cross.error.code, 'remote-mismatch')
   handle.uninstall()
 })
 
@@ -690,7 +709,7 @@ test('an unregistered method carrying a virtual id is refused before anything ru
   assert.equal(relay.invokes.length, 0)
 
   await assert.rejects(
-    async () => gateway.wireTap('goals/create', { args: { agentId: VIRTUAL_ID, request: { objective: 'x', maxGoalRounds: 1 } } }, undefined, undefined, undefined, { signal: undefined }),
+    async () => gateway.wireTap('schedule/watch', { args: { agentId: VIRTUAL_ID, request: { objective: 'x', maxGoalRounds: 1 } } }, undefined, undefined, undefined, { signal: undefined }),
     (error) => error.isDSHRemoteError === true && error.code === 'remote-unsupported' && typeof error.details === 'object',
   )
   assert.equal(gateway.streamCalls.length, 0)
@@ -1577,7 +1596,7 @@ test('CLIENT_METHOD_FIELDS is method-for-method and field-for-field identical to
   assert.deepEqual(serverTable['terminal/retain'], ['sessionId'])
   assert.deepEqual(serverTable['workspaceFiles/list'], ['workspaceFileScopeId'])
   assert.deepEqual(serverTable['sessionFeedback/record'], ['request.sessionId'])
-  assert.deepEqual(serverTable['subagents/prompt'], ['request.parentSessionId', 'request.childSessionId'])
+  assert.deepEqual(serverTable['subagents/prompt'], ['request.childSessionId'])
   assert.deepEqual(serverTable['subagents/interruptByParent'], ['parentSessionId', 'childSessionId'])
   assert.deepEqual(serverTable['subagents/interruptByUser'], ['childSessionId'])
   assert.deepEqual(serverTable['workspaceFiles/search'], ['workspaceFileScopeId'])
@@ -1586,7 +1605,7 @@ test('CLIENT_METHOD_FIELDS is method-for-method and field-for-field identical to
   // Every field either table names is one of the known field types — a typo
   // on either side fails here instead of silently matching itself.
   const KNOWN = new Set([
-    'request.sessionId', 'request.address', 'request.parentSessionId', 'request.childSessionId', 'request.workspaceId',
+    'request.sessionId', 'request.address', 'request.parentSessionId', 'request.childSessionId', 'request.beforeSessionId', 'request.workspaceId',
     'parentSessionId', 'childSessionId', 'sessionId', 'workspaceFileScopeId', 'agentId',
   ])
   for (const fields of Object.values(serverTable)) {
@@ -2446,6 +2465,25 @@ test('subagents calls rewrite BOTH id slots (request envelope and top level alik
     args: { childSessionId: toVirtual(SERVER_ID, 'session-child') },
   }, undefined, undefined)
   assert.deepEqual(relay.invokes[2].args, { childSessionId: 'session-child' }, 'the single top-level child id is restored')
+
+  // API-1: DSH 0.2.2-rc.2 omits parentSessionId on subagents/prompt (only childSessionId).
+  await gateway.rpcBridge('subagents/prompt', {
+    args: { request: { requestId: 'r2', childSessionId: toVirtual(SERVER_ID, 'session-child-only'), mode: 'continuable', delivery: 'queue', content: [{ type: 'text', text: 'hi' }] } },
+  }, undefined, undefined)
+  assert.deepEqual(relay.invokes[3].args.request, {
+    requestId: 'r2',
+    childSessionId: 'session-child-only',
+    mode: 'continuable',
+    delivery: 'queue',
+    content: [{ type: 'text', text: 'hi' }],
+  })
+
+  // API-1: Mismatched parentSessionId & childSessionId across servers must be refused locally.
+  const cross = await gateway.rpcBridge('subagents/prompt', {
+    args: { request: { requestId: 'r3', parentSessionId: toVirtual(SERVER_ID, 'p'), childSessionId: toVirtual('eeeeeeee', 'c'), mode: 'continuable', delivery: 'queue', content: [] } },
+  }, undefined, undefined)
+  assert.equal(cross.ok, false)
+  assert.equal(cross.error.code, 'remote-mismatch')
   handle.uninstall()
 })
 
@@ -2473,7 +2511,7 @@ test('an unregistered agentId-located method with a virtual agentId is still ref
   const gateway = new FakeTypertGateway()
   const relay = createFakeRelay()
   const { handle } = install(gateway, relay)
-  const envelope = await gateway.rpcBridge('goals/create', { args: { agentId: VIRTUAL_ID, request: { objective: 'x', maxGoalRounds: 1 } } }, undefined, undefined)
+  const envelope = await gateway.rpcBridge('dynamicCordisRunner/invoke', { args: { agentId: VIRTUAL_ID, request: { code: 'x' } } }, undefined, undefined)
   assert.deepEqual(envelope, { ok: false, error: { code: 'remote-unsupported', message: '此功能暂不支持远程会话', details: {} } })
   assert.equal(relay.invokes.length, 0)
   assert.equal(gateway.rpcCalls.length, 0)
@@ -4963,9 +5001,14 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
     'workspace/unarchiveSession',
     // T41a mutations
     'goals/edit',
+    'goals/create',
+    'goals/complete',
     'goals/pause',
     'goals/resume',
     'goals/clear',
+    'agentTeams/setEnabled',
+    'userQuestions/answer',
+    'actionCards/act',
     'commands/execute',
     'agentPresets/select',
     'sessionFeedback/record',
@@ -5605,4 +5648,115 @@ test('P55-2: the reported current session drives the fallback until a local foll
   current = { kind: 'open', sessionId: 'session-local-1' }
   assert.equal(handle.resolveRemoteFileScope('/anything/x.png'), undefined, 'a local current session never forwards')
   handle.uninstall()
+})
+
+test('API-1: virtualizeProjectionValues rewrites subagentCatalog and agentTeam across follow, projections, list, and control', async () => {
+  const { createControlMerger, mergeSessionList } = require('../lib/merge-streams.js')
+  const { virtualizeProjectionValues } = require('../lib/intercept.js')
+  const subagentCatalog = [{ id: 'sub-1', mode: 'continuable' }, { id: 'sub-2', mode: 'one-shot' }]
+  const agentTeam = { teamId: 't1', tasks: [{ id: 'task-1', ownerId: 'agent-a' }, { id: 'task-2', ownerId: '' }] }
+  const modelSelection = { next: { provider: 'deepseek', model: 'chat' }, lastUsed: null }
+
+  const rawValues = { modelSelection, subagentCatalog, agentTeam, untypedFlag: true }
+  const direct = virtualizeProjectionValues(rawValues, SERVER_ID)
+  assert.deepEqual(direct.subagentCatalog, [
+    { id: toVirtual(SERVER_ID, 'sub-1'), mode: 'continuable' },
+    { id: toVirtual(SERVER_ID, 'sub-2'), mode: 'one-shot' },
+  ])
+  assert.deepEqual(direct.agentTeam, {
+    teamId: 't1',
+    tasks: [
+      { id: 'task-1', ownerId: toVirtual(SERVER_ID, 'agent-a') },
+      { id: 'task-2', ownerId: '' },
+    ],
+  })
+  assert.deepEqual(direct.modelSelection, { next: { provider: toVirtual(SERVER_ID, 'deepseek'), model: 'chat' }, lastUsed: null })
+  assert.equal(direct.untypedFlag, true)
+
+  // 1) session/follow snapshot
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  relay.streamFrames = [
+    { type: 'snapshot', header: { version: 4, id: LOCAL_ID, cwd: '/tmp' }, cursor: 1, records: [], projections: { values: rawValues } },
+  ]
+  const { handle } = install(gateway, relay)
+  const followFrames = await drained(
+    gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined }),
+  )
+  assert.deepEqual(followFrames[0].projections.values, direct)
+
+  // 2) session/projections
+  relay.invokeValue = { asOfSeq: 5, values: rawValues }
+  const projRes = await gateway.rpcBridge('session/projections', { args: { request: { sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  assert.equal(projRes.ok, true)
+  assert.deepEqual(projRes.value.values, direct)
+  handle.uninstall()
+
+  // 3) session/list (projections.values & projectionValues)
+  const mergedList = mergeSessionList(
+    { items: [] },
+    { items: [{ sessionId: 's1', projections: { asOfSeq: 2, values: rawValues }, projectionValues: rawValues }] },
+    SERVER_ID,
+  )
+  assert.deepEqual(mergedList.items[0].projections.values, direct)
+  assert.deepEqual(mergedList.items[0].projectionValues, direct)
+
+  // 4) session/control (baseline + live legacy key/value + 0.2.2 changes[])
+  const merger = createControlMerger({ serverId: SERVER_ID, serverName: 'srv' })
+  merger.onLocal({ type: 'baseline', value: { projections: {} } })
+  const baseOut = merger.onRemote({
+    type: 'baseline',
+    value: { projections: { s1: { asOfSeq: 3, values: rawValues } } },
+  })
+  const baseMap = Object.fromEntries(baseOut.map((f) => [f.key, f.value]))
+  assert.deepEqual(baseMap.subagentCatalog, direct.subagentCatalog)
+  assert.deepEqual(baseMap.agentTeam, direct.agentTeam)
+
+  const legacyOut = merger.onRemote({ type: 'projection', sessionId: 's1', seq: 4, key: 'subagentCatalog', value: subagentCatalog })
+  assert.deepEqual(legacyOut[0].value, direct.subagentCatalog)
+
+  const batchedOut = merger.onRemote({ type: 'projection', sessionId: 's1', seq: 5, changes: [{ key: 'agentTeam', val: agentTeam }] })
+  assert.deepEqual(batchedOut[0].value, direct.agentTeam)
+  assert.deepEqual(batchedOut[0].changes[0].val, direct.agentTeam)
+})
+
+test('API-2: rewriteRemoteEventFrame virtualizes all 5 session-scoped emits and drops malformed or global emits', () => {
+  const { rewriteRemoteEventFrame, SESSION_STREAM_HOLD_ENDPOINTS } = require('../lib/intercept.js')
+  assert.deepEqual(
+    rewriteRemoteEventFrame({ type: 'emit', event: 'api-session/status', args: ['s1', true] }, SERVER_ID),
+    { type: 'emit', event: 'api-session/status', args: [toVirtual(SERVER_ID, 's1'), true] },
+  )
+  assert.deepEqual(
+    rewriteRemoteEventFrame({ type: 'emit', event: 'api-session/activity', args: ['s1', 123456] }, SERVER_ID),
+    { type: 'emit', event: 'api-session/activity', args: [toVirtual(SERVER_ID, 's1'), 123456] },
+  )
+  assert.deepEqual(
+    rewriteRemoteEventFrame({ type: 'emit', event: 'api-session/error', args: ['s1', 'boom'] }, SERVER_ID),
+    { type: 'emit', event: 'api-session/error', args: [toVirtual(SERVER_ID, 's1'), 'boom'] },
+  )
+  assert.deepEqual(
+    rewriteRemoteEventFrame({ type: 'emit', event: 'agent-preset/selected', args: ['s1', 'standard'] }, SERVER_ID),
+    { type: 'emit', event: 'agent-preset/selected', args: [toVirtual(SERVER_ID, 's1'), toVirtual(SERVER_ID, 'standard')] },
+  )
+  assert.deepEqual(
+    rewriteRemoteEventFrame({ type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: 's1' }] }, SERVER_ID),
+    { type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: toVirtual(SERVER_ID, 's1') }] },
+  )
+  assert.deepEqual(
+    rewriteRemoteEventFrame({ type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: 's1', goal: { title: 'g' } }] }, SERVER_ID),
+    { type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: toVirtual(SERVER_ID, 's1'), goal: { title: 'g' } }] },
+  )
+  // Invalid / global / malformed shapes are dropped
+  for (const bad of [
+    { type: 'emit', event: 'api-session/activity', args: ['s1', Number.NaN] },
+    { type: 'emit', event: 'api-session/error', args: ['s1', { message: 'obj' }] },
+    { type: 'emit', event: 'agent-preset/selected', args: ['s1', ''] },
+    { type: 'emit', event: 'goal/activation-changed', args: [{ sessionId: 's1', extra: 1 }] },
+    { type: 'emit', event: 'api-session/added', args: [{ sessionId: 's1' }] },
+    { type: 'emit', event: 'api-session/status', args: ['s1', true], extra: 1 },
+  ]) {
+    assert.equal(rewriteRemoteEventFrame(bad, SERVER_ID), null, JSON.stringify(bad))
+  }
+  assert.equal(SESSION_STREAM_HOLD_ENDPOINTS?.has('toolResults/watch') ?? false, false)
+  assert.equal(SESSION_STREAM_HOLD_ENDPOINTS?.has('userQuestions/attachWait') ?? false, false)
 })

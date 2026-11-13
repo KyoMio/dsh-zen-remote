@@ -440,6 +440,20 @@ export declare function mergeModelCatalogs(localValue: unknown, remoteValue: unk
  */
 export declare function virtualizeModelSelectionValue(value: unknown, serverId: string): unknown;
 /**
+ * Rewrite one projection key's value for a remote session so embedded
+ * server-scoped ids (`modelSelection.provider`, `subagentCatalog[].id`,
+ * `agentTeam.tasks[].ownerId`) carry `zr~<serverId>~`. Unrecognized keys and
+ * malformed shapes pass through by identity.
+ */
+export declare function virtualizeProjectionValue(key: string, value: unknown, serverId: string): unknown;
+/**
+ * Virtualize every rewritable entry in a session projection `values` map
+ * (shared across `session/follow`, `session/projections`, `session/list`, and
+ * `session/control`). Returns the input map unchanged if nothing needed
+ * rewriting.
+ */
+export declare function virtualizeProjectionValues(values: Record<string, unknown>, serverId: string): Record<string, unknown>;
+/**
  * T63: the virtual session ids a set of FORWARDED workspace frames carries —
  * the `sessionIds` of `upsert` records and of baseline `value.items`. The
  * workspace route feeds these to the summary sync, which announces list rows

@@ -249,8 +249,10 @@ test('invoke: request.sessionId methods forward through the same gate', async ()
   } finally { await server.stop() }
 })
 
-test('invoke: a subagent address is judged by its shared parent', async () => {
-  const parts = makeParts('invoke-subagent')
+test('invoke: a subagent address is judged by its shared child and parent', async () => {
+  const parts = makeParts('invoke-subagent', {
+    parentOf: (id) => (id === 'session-child' ? 'session-parent' : undefined),
+  })
   parts.store.share('session-parent')
   const server = await startServer(parts.handler)
   try {
@@ -285,7 +287,7 @@ test('invoke: the three reviewer bypasses are 403 and never reach the gateway', 
   try {
     const bypasses = [
       ['session/search + decoy', { namespace: 'session', method: 'search', args: { request: { query: 'password', sessionId: 'S-shared' } } }, 'forbidden-method'],
-      ['goals/create + agentId + decoy', { namespace: 'goals', method: 'create', args: { agentId: 'VICTIM', request: { objective: 'x', maxGoalRounds: 3, sessionId: 'S-shared' } } }, 'forbidden-method'],
+      ['dynamicCordisRunner/invoke + agentId + decoy', { namespace: 'dynamicCordisRunner', method: 'invoke', args: { agentId: 'VICTIM', request: { code: 'x', sessionId: 'S-shared' } } }, 'forbidden-method'],
       // T31 registered subagents/prompt (judged by the parent): the decoy no
       // longer buys a forbidden-method — the unshared PARENT refuses, and the
       // padded shared sessionId changes nothing.

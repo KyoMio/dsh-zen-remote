@@ -97,7 +97,9 @@ import {
   sessionSummaryAddedFrames,
   virtualSessionIdsInWorkspaceFrames,
   virtualizeModelSelectionValue,
+  virtualizeProjectionValues,
 } from './merge-streams.js'
+export { virtualizeProjectionValues }
 import type { ControlMerger, MergerAnnotation, MergerIdentity, MergerLang, RemoteWorkspaceContribution, WorkspaceMerger } from './merge-streams.js'
 
 /** The session-locating argument fields, as registered per method. Identical
@@ -112,6 +114,7 @@ export type SessionField =
   | 'request.address'
   | 'request.parentSessionId'
   | 'request.childSessionId'
+  | 'request.beforeSessionId'
   | 'request.workspaceId'
   | 'parentSessionId'
   | 'childSessionId'
@@ -154,7 +157,7 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   // DSH re-validates the parent-child link; the child id arrives from server
   // frames VIRTUALIZED (session/follow snapshots carry it in header.id), so
   // it is restored like the parent before forwarding
-  'subagents/prompt': ['request.parentSessionId', 'request.childSessionId'],
+  'subagents/prompt': ['request.childSessionId'],
   'subagents/interruptByParent': ['parentSessionId', 'childSessionId'],
   // 0.2.2-rc.2 rename: only the child id travels (no parent, no mode).
   // interruptByParent stays for 0.2.2-rc.1 (npm latest).
@@ -164,13 +167,21 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   // agent registry).
   'fileUploads/upload': ['agentId'],
   'fileReferences/list': ['agentId'],
-  // goal panel (T41a) — top-level agentId, same shape as fileUploads;
-  // goals/create|complete stay unregistered (not in the UI's goal bar)
+  // goal panel (T41a + 0.2.2 P0 goals/create|complete) — top-level agentId
   'goals/get': ['agentId'],
+  'goals/create': ['agentId'],
   'goals/edit': ['agentId'],
+  'goals/complete': ['agentId'],
   'goals/pause': ['agentId'],
   'goals/resume': ['agentId'],
   'goals/clear': ['agentId'],
+  // P0 0.2.2 interactive tools / teams / recommendations / tool results
+  'agentTeams/setEnabled': ['agentId'],
+  'userQuestions/answer': ['agentId'],
+  'userQuestions/attachWait': ['agentId'],
+  'actionCards/act': ['agentId'],
+  'pluginRecommendations/describe': ['agentId'],
+  'toolResults/watch': ['request.sessionId'],
   // slash commands + the preset switches they drive (T41a)
   'commands/list': ['agentId'],
   'commands/execute': ['agentId'],
@@ -261,6 +272,19 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   '$zr/events': [],
 }
 
+/** Optional session-locating fields checked/restored when present (keeps
+ * `CLIENT_METHOD_FIELDS` identically keyed to `RELAY_METHODS[endpoint].fields`). */
+export const OPTIONAL_CLIENT_METHOD_FIELDS: Partial<Record<string, readonly SessionField[]>> = {
+  'subagents/prompt': ['request.parentSessionId'],
+}
+
+function allClientFields(endpoint: string): readonly SessionField[] | undefined {
+  const required = CLIENT_METHOD_FIELDS[endpoint]
+  if (required === undefined) return undefined
+  const optional = OPTIONAL_CLIENT_METHOD_FIELDS[endpoint]
+  return optional === undefined ? required : [...required, ...optional]
+}
+
 /** `dispatchRpc`'s failure shape as the UI mandates it: dsh-client-connection's
  * server-response parser (`invalid server-response failure`) and the gateway's
  * rpcErrorSchema both demand `code` AND `message` as strings AND `details` as
@@ -339,6 +363,9 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   // follow), which is a state change — it sits on the write side and is
   // refused remote-offline like every other mutation.
   'goals/get',
+  'userQuestions/attachWait',
+  'pluginRecommendations/describe',
+  'toolResults/watch',
   'commands/list',
   'sessionReferenceResolver/candidates',
   'workspaceFiles/list',
@@ -467,7 +494,7 @@ const LINK_DOWN_CODES: ReadonlySet<string> = new Set(['offline', 'server-restart
  * the honest terminal error, never a silent hold — the same safe default as
  * the READ whitelist below it.
  */
-const SESSION_STREAM_HOLD_ENDPOINTS: ReadonlySet<string> = new Set([
+export const SESSION_STREAM_HOLD_ENDPOINTS: ReadonlySet<string> = new Set([
   'session/follow',
   'job/list',
   'job/follow',
@@ -825,14 +852,6 @@ interface ForwardableCancelFrame extends Record<string, unknown> {
   eventId: string
 }
 
-/** T75: the one emit this client shows the UI (T75 — the server forwards no
- * other). Same shape the server's own gate proved before forwarding. */
-interface ForwardableStatusEmitFrame extends Record<string, unknown> {
-  type: 'emit'
-  event: 'api-session/status'
-  args: [string, boolean]
-}
-
 function isForwardableWaterfall(frame: Record<string, unknown>): frame is ForwardableWaterfallFrame {
   return (
     Reflect.ownKeys(frame).length === 5 &&
@@ -855,16 +874,60 @@ function isForwardableCancel(frame: Record<string, unknown>): frame is Forwardab
   )
 }
 
-function isForwardableStatusEmit(frame: Record<string, unknown>): frame is ForwardableStatusEmitFrame {
-  return (
-    Reflect.ownKeys(frame).length === 3 &&
-    ['type', 'event', 'args'].every((key) => Object.hasOwn(frame, key)) &&
-    frame.event === 'api-session/status' &&
-    Array.isArray(frame.args) &&
-    frame.args.length === 2 &&
-    isEventId(frame.args[0]) &&
-    typeof frame.args[1] === 'boolean'
-  )
+function parseForwardableSessionEmit(
+  frame: Record<string, unknown>,
+): { buildVirtualFrame: (virtualize: (id: string) => string) => { type: 'emit'; event: string; args: unknown[] } } | null {
+  if (
+    Reflect.ownKeys(frame).length !== 3 ||
+    !['type', 'event', 'args'].every((key) => Object.hasOwn(frame, key)) ||
+    !Array.isArray(frame.args)
+  ) {
+    return null
+  }
+  const event = frame.event
+  const args = frame.args
+  if (event === 'goal/activation-changed') {
+    if (args.length !== 1 || !isPlainObject(args[0])) return null
+    const payload = args[0]
+    const sessionId = payload.sessionId
+    if (!isEventId(sessionId)) return null
+    const keys = Reflect.ownKeys(payload)
+    const hasGoal = Object.hasOwn(payload, 'goal')
+    if (keys.length !== (hasGoal ? 2 : 1)) return null
+    if (hasGoal && !isPlainObject(payload.goal)) return null
+    const goal = hasGoal ? { ...(payload.goal as Record<string, unknown>) } : undefined
+    return {
+      buildVirtualFrame: (virtualize) => ({
+        type: 'emit',
+        event,
+        args: [hasGoal ? { sessionId: virtualize(sessionId), goal } : { sessionId: virtualize(sessionId) }],
+      }),
+    }
+  }
+  if (args.length !== 2 || !isEventId(args[0])) return null
+  const sessionId = args[0]
+  const value = args[1]
+  const valid =
+    event === 'api-session/status'
+      ? typeof value === 'boolean'
+      : event === 'api-session/activity'
+        ? typeof value === 'number' && Number.isFinite(value)
+        : event === 'api-session/error'
+          ? typeof value === 'string'
+          : event === 'agent-preset/selected'
+            ? isEventId(value)
+            : false
+  if (!valid || typeof event !== 'string') return null
+  return {
+    buildVirtualFrame: (virtualize) => ({
+      type: 'emit',
+      event,
+      args: [
+        virtualize(sessionId),
+        event === 'agent-preset/selected' ? virtualize(value as string) : value,
+      ],
+    }),
+  }
 }
 
 function messageOf(error: unknown): string {
@@ -899,7 +962,12 @@ const TOP_LEVEL_FIELDS: ReadonlySet<string> = new Set([
   'workspaceFileScopeId',
 ])
 
-const REQUEST_FIELDS: ReadonlySet<string> = new Set(['sessionId', 'parentSessionId', 'childSessionId'])
+const REQUEST_FIELDS: ReadonlySet<string> = new Set([
+  'sessionId',
+  'parentSessionId',
+  'childSessionId',
+  'beforeSessionId',
+])
 
 function forEachRegisteredSlot(
   fields: readonly SessionField[],
@@ -926,7 +994,10 @@ function forEachRegisteredSlot(
     const address = request.address
     if (!isPlainObject(address)) continue
     if (address.kind === 'session') visit(address, 'sessionId')
-    else if (address.kind === 'subagent') visit(address, 'parentSessionId')
+    else if (address.kind === 'subagent') {
+      visit(address, 'childSessionId')
+      if (address.parentSessionId !== undefined) visit(address, 'parentSessionId')
+    }
   }
 }
 
@@ -1239,10 +1310,9 @@ export function rewriteFrame(endpoint: string, frame: unknown, serverId: string)
     // control stream, never from folding events client-side
     // (dsh-api-session-controller lib/client.js:1616-1628).
     if (isPlainObject(frame.projections) && isPlainObject(frame.projections.values)) {
-      const values: Record<string, unknown> = { ...frame.projections.values }
-      if (Object.hasOwn(values, 'modelSelection')) {
-        values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId)
-        out.projections = { ...frame.projections, values }
+      const nextValues = virtualizeProjectionValues(frame.projections.values, serverId)
+      if (nextValues !== frame.projections.values) {
+        out.projections = { ...frame.projections, values: nextValues }
       }
     }
     return out
@@ -1327,17 +1397,16 @@ export function rewriteResult(endpoint: string, value: unknown, serverId: string
     // :381-428, and list rows travel the merged route's
     // mergeSessionList rewrite instead, merge-streams.ts.)
     if (!isPlainObject(value) || !isPlainObject(value.values)) return value
-    const values: Record<string, unknown> = { ...value.values }
+    const nextValues = virtualizeProjectionValues(value.values, serverId)
     // alpha.2 clients validate list/control projections with kind:'cached'|'sequenced'.
     // Older hosts (rc.2) omit it on the session/projections control-key result — synthesize.
     const withKind = typeof value.kind === 'string'
       ? value
       : (typeof value.asOfSeq === 'number' ? { ...value, kind: 'sequenced' as const } : value)
-    if (!Object.hasOwn(values, 'modelSelection')) {
-      return withKind === value ? value : { ...withKind, values }
+    if (nextValues === value.values) {
+      return withKind === value ? value : { ...withKind, values: nextValues }
     }
-    values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId)
-    return { ...withKind, values }
+    return { ...withKind, values: nextValues }
   }
   if (endpoint === 'session/selectModel') {
     // T52: the result echoes the selection it accepted (`{selected:
@@ -1396,8 +1465,9 @@ export function rewriteRemoteEventFrame(frame: unknown, serverId: string): unkno
   if (!isPlainObject(frame)) return null
   if (frame.type === 'ready') return null
   if (frame.type === 'emit') {
-    if (!isForwardableStatusEmit(frame)) return null
-    return { type: 'emit', event: frame.event, args: [virtualize(frame.args[0]), frame.args[1]] }
+    const parsed = parseForwardableSessionEmit(frame)
+    if (parsed === null) return null
+    return parsed.buildVirtualFrame(virtualize)
   }
   if (frame.type === 'waterfall') {
     if (!isForwardableWaterfall(frame)) return null
@@ -4287,7 +4357,8 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     const method = slash === -1 ? '' : endpoint.slice(slash + 1)
     try {
       let clone: unknown = structuredClone(args)
-      restoreRegisteredFields(CLIENT_METHOD_FIELDS[endpoint], clone)
+      const fields = allClientFields(endpoint)
+      if (fields !== undefined) restoreRegisteredFields(fields, clone)
       // A remote create never names its own session id: DSH mints one, and
       // adopting a caller-chosen id (create's idempotent-adopt path) could
       // resurrect or hijack a server-side session. The relay deletes the
@@ -4895,7 +4966,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         args = routed.args
       }
     }
-    const fields = CLIENT_METHOD_FIELDS[endpoint]
+    const fields = allClientFields(endpoint)
     const virtuals = collectVirtuals(fields, args)
     if (virtuals.length === 0) {
       if (endpoint === 'session/list') {
@@ -4953,7 +5024,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       })()
     }
     const args = argsOf(payload)
-    const fields = CLIENT_METHOD_FIELDS[endpoint]
+    const fields = allClientFields(endpoint)
     const virtuals = collectVirtuals(fields, args)
     if (virtuals.length === 0) {
       // P55-2: a LOCAL session/follow (a well-formed session address whose id
@@ -5094,7 +5165,8 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     let clone: unknown
     try {
       clone = structuredClone(args)
-      restoreRegisteredFields(CLIENT_METHOD_FIELDS[endpoint], clone)
+      const fields = allClientFields(endpoint)
+      if (fields !== undefined) restoreRegisteredFields(fields, clone)
       // Eager on purpose: an unpaired relay fails at CALL time, exactly like
       // the real openWireStream fails on a bad endpoint. An OFFLINE relay
       // does not fail here (openStream only validates credentials) — for the

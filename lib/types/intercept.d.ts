@@ -82,6 +82,8 @@ import type { RelayClient, RelayClock } from './relay-client.js';
 import type { RelayPool } from './relay-pool.js';
 import type { GatewayShapeCheck } from './intercept-shape.js';
 import { type ResultAttachment } from './invoke-binary.js';
+import { virtualizeProjectionValues } from './merge-streams.js';
+export { virtualizeProjectionValues };
 import type { MergerLang } from './merge-streams.js';
 /** The session-locating argument fields, as registered per method. Identical
  * in name and meaning to relay-access.ts's `SessionField`; a field named
@@ -90,7 +92,7 @@ import type { MergerLang } from './merge-streams.js';
  * probes the workspace and auto-shares the result); top-level
  * `sessionId` / `workspaceFileScopeId` ARE session ids (terminal's retain/list
  * half and the workspace-files group). */
-export type SessionField = 'request.sessionId' | 'request.address' | 'request.parentSessionId' | 'request.childSessionId' | 'request.workspaceId' | 'parentSessionId' | 'childSessionId' | 'sessionId' | 'workspaceFileScopeId' | 'agentId';
+export type SessionField = 'request.sessionId' | 'request.address' | 'request.parentSessionId' | 'request.childSessionId' | 'request.beforeSessionId' | 'request.workspaceId' | 'parentSessionId' | 'childSessionId' | 'sessionId' | 'workspaceFileScopeId' | 'agentId';
 /**
  * The client-side half of the server's `RELAY_METHODS` registry: which
  * argument field locates the session for each method. METHODS AND FIELDS
@@ -105,6 +107,9 @@ export type SessionField = 'request.sessionId' | 'request.address' | 'request.pa
  * answers with the relay's filtered ones (merge-streams.ts).
  */
 export declare const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField[]>>;
+/** Optional session-locating fields checked/restored when present (keeps
+ * `CLIENT_METHOD_FIELDS` identically keyed to `RELAY_METHODS[endpoint].fields`). */
+export declare const OPTIONAL_CLIENT_METHOD_FIELDS: Partial<Record<string, readonly SessionField[]>>;
 /** `dispatchRpc`'s failure shape as the UI mandates it: dsh-client-connection's
  * server-response parser (`invalid server-response failure`) and the gateway's
  * rpcErrorSchema both demand `code` AND `message` as strings AND `details` as
@@ -181,6 +186,45 @@ export declare function isRemoteWrite(endpoint: string): boolean;
  */
 export declare const REMOTE_UPLINK_STREAM_METHODS: ReadonlySet<string>;
 export type InterceptLang = MergerLang;
+/**
+ * The session-level streams the CP4 hold-through-the-outage behavior is FOR
+ * (CP5 scope): only these endpoints' UI consumers turn a CLEAN stream end
+ * (≥1 frame accepted) into a `RemoteStreamCarrierError` and reopen at once,
+ * so ending the held stream cleanly on recovery is the one signal they
+ * retry. Endpoint by endpoint, verified against the RT bundle:
+ *
+ * - `session/follow` — dsh-api-gateway lib/client.js:1165, the
+ *   RemoteJournalStream `ended` callback: accepted →
+ *   `RemoteStreamCarrierError("… ended without a terminal result")`, which
+ *   feeds `waitForRemoteStreamRetry`;
+ * - `job/list` / `job/follow` — dsh-api-job-controller lib/client.js:269/303,
+ *   the same shape ("ended before release" / "ended before settlement");
+ * - `session/control` — dsh-api-session-controller lib/client.js:387
+ *   ("session control stream ended without a terminal result");
+ * - `workspace/follow` — dsh-api-workspace-controller lib/client.js:477
+ *   ("Workspace state stream ended without a terminal result").
+ *
+ * Every endpoint OUTSIDE the list has a consumer that renders a clean end as
+ * a TERMINAL error, so a hold would leave it frozen on recovery with no
+ * retry — those end with the ORIGINAL error code the moment the link dies
+ * (the pre-CP4 behavior). Verified: `workspaceFiles/changes`
+ * (dsh-api-workspace-files lib/client.js:112 — plain
+ * `Error("workspace file changes of … ended")`; dsh-client-ui-sidebar-files
+ * lib/client.js:229 — `Error("Directory watch ended: …")`),
+ * `terminal/retain` (dsh-api-terminal-controller lib/client.js:549 —
+ * `RemoteError("terminal/unavailable", "Terminal hold ended")`),
+ * `terminal/follow` (same file, lib/client.js:240 —
+ * `TerminalViewError("attachmentEnded")`).
+ *
+ * `session/control` and `workspace/follow` travel the MERGED route today
+ * (empty field tables → `mergedGlobalStream`, which holds by its own T23b-2
+ * design), so on this route the list's live members are `session/follow`,
+ * `job/list` and `job/follow`; they stay listed to keep the RT fact in one
+ * place. A future stream endpoint nobody classifies lands OUTSIDE the list —
+ * the honest terminal error, never a silent hold — the same safe default as
+ * the READ whitelist below it.
+ */
+export declare const SESSION_STREAM_HOLD_ENDPOINTS: ReadonlySet<string>;
 /**
  * T58/T62: the vocabulary of the current-session signal. The value travels
  * from the BROWSER — the only place the host's persisted selection

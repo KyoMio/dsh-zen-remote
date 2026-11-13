@@ -93,6 +93,13 @@ export const FINGERPRINT_GROUP_PACKAGES: Readonly<Record<string, string>> = {
   files: '@deepseek-ai/dsh-api-workspace-files',
   subagent: '@deepseek-ai/dsh-subagent',
   goal: '@deepseek-ai/dsh-goal',
+  terminal: '@deepseek-ai/dsh-terminal',
+  officeKit: '@deepseek-ai/dsh-office-kit',
+  agentTeam: '@deepseek-ai/dsh-agent-team',
+  userQuestions: '@deepseek-ai/dsh-user-questions',
+  actionCards: '@deepseek-ai/dsh-action-cards',
+  trajectory: '@deepseek-ai/dsh-client-ui-trajectory',
+  forge: '@deepseek-ai/dsh-experimental-client-ui-forge',
 }
 
 /** Length of a fingerprint hex string (excluding the algorithm prefix). */
