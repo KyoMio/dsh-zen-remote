@@ -215,3 +215,92 @@ test('invalid network capacity is ignored without changing user cap', async t =>
   assert.equal(engine.status().maxPeers, null);
   assert.equal(readPeerNetwork(stateFile).maxPeersFromGateway, undefined);
 });
+
+// ---- PC-08b：增量 network-updated 广播的消费（welcome 之外的实时通道）----
+
+test('network-updated rise persists the same fact source and auto-fills slots without reconnect', async t => {
+  const { engine, pool, send, stateFile } = await setup(t, { count: 3, gatewayCap: 2 });
+  assert.equal(pool.entries().length, 1, 'welcome cap 2 → one remote mount');
+  send({ type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 4 });
+  await eventually(() => engine.status().maxPeers === 4);
+  assert.equal(readPeerNetwork(stateFile).maxPeersFromGateway, 4, 'same on-disk fact source as welcome');
+  assert.equal(pool.maxServers(), 3, 'pool reads the updated cap live (4 members minus self)');
+  assert.equal(pool.entries().length, 3, 'rise refills eligible slots automatically');
+});
+
+test('network-updated shrink keeps mounted peers and a freed slot waits until capacity rises', async t => {
+  const { engine, pool, peers, send, stateFile } = await setup(t, { count: 3, gatewayCap: 16 });
+  assert.equal(pool.entries().length, 3);
+  send({ type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 2 });
+  await eventually(() => engine.status().maxPeers === 2);
+  assert.equal(readPeerNetwork(stateFile).maxPeersFromGateway, 2);
+  assert.equal(pool.maxServers(), 1);
+  assert.equal(pool.entries().length, 3, 'shrink never evicts existing mounts');
+  engine.setNodeDisabled(peers[0].nodeId, true);
+  assert.equal(pool.entries().length, 2);
+  engine.setNodeDisabled(peers[0].nodeId, false);
+  assert.equal(pool.entries().length, 2, 'the freed slot must not refill beyond the shrunk cap');
+  send({ type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 4 });
+  await eventually(() => pool.entries().length === 3);
+  assert.equal(pool.entries().some(entry => entry.entryId === peers[0].nodeId), true, 'rise auto-mounts the waiting peer');
+});
+
+test('network-updated takes min with an explicit local maxServers', async t => {
+  const { engine, pool, send, stateFile } = await setup(t, { cap: 1, count: 3, gatewayCap: 16, configSource: 'row' });
+  assert.equal(pool.entries().length, 1);
+  send({ type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 64 });
+  await eventually(() => engine.status().maxPeers === 64);
+  assert.equal(readPeerNetwork(stateFile).maxPeersFromGateway, 64);
+  assert.equal(pool.maxServers(), 1, 'network update must not override a user-chosen cap, only lower it');
+  assert.equal(pool.entries().length, 1);
+});
+
+test('same-value network-updated is idempotent: no disk write and no remount', async t => {
+  const { engine, pool, mounts, send } = await setup(t, { count: 2, gatewayCap: 4 });
+  assert.equal(engine.status().maxPeers, 4);
+  const store = source('state-store.ts');
+  const original = store.writePeerNetwork;
+  let writes = 0;
+  store.writePeerNetwork = (...args) => { writes += 1; return original(...args); };
+  try {
+    const mountedBefore = mounts.length;
+    send({ type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 4 });
+    await delay(50);
+    assert.equal(writes, 0, 'same value must not touch the state file');
+    assert.equal(mounts.length, mountedBefore, 'same value must not remount');
+    send({ type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 6 });
+    await eventually(() => engine.status().maxPeers === 6);
+    assert.equal(writes, 1, 'a real change persists exactly once');
+    assert.equal(pool.maxServers(), 5);
+  } finally {
+    store.writePeerNetwork = original;
+  }
+});
+
+test('cross-network and malformed network-updated are ignored; the channel itself still works', async t => {
+  const { engine, pool, mounts, send, stateFile } = await setup(t, { count: 2, gatewayCap: 8 });
+  assert.equal(engine.status().maxPeers, 8);
+  const diskBefore = JSON.stringify(readPeerNetwork(stateFile));
+  const mountsBefore = mounts.length;
+  for (const message of [
+    { type: 'network-updated', networkId: 'ffffffffffffffff', maxPeers: 32 },
+    { type: 'network-updated', maxPeers: 9 },
+    { type: 'network-updated', networkId: '0123456789abcdef' },
+    { type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 1 },
+    { type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 65 },
+    { type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 2.5 },
+    { type: 'network-updated', networkId: '0123456789abcdef', maxPeers: NaN },
+    { type: 'network-updated', networkId: '0123456789abcdef', maxPeers: '9' },
+  ]) {
+    send(message);
+  }
+  await delay(50);
+  assert.equal(engine.status().maxPeers, 8, 'no bad message moved the in-memory cap');
+  assert.equal(JSON.stringify(readPeerNetwork(stateFile)), diskBefore, 'no bad message touched the disk');
+  assert.equal(mounts.length, mountsBefore, 'no bad message remounted');
+  assert.equal(pool.entries().length, 2);
+  send({ type: 'network-updated', networkId: '0123456789abcdef', maxPeers: 3 });
+  // 合法消息照样生效——证明上面的忽略是逐条判定，不是整条通道失聪。
+  await eventually(() => engine.status().maxPeers === 3);
+  assert.equal(readPeerNetwork(stateFile).maxPeersFromGateway, 3);
+});
