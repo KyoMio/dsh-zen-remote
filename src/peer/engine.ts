@@ -634,6 +634,26 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       })
       return
     }
+    if (type === 'network-updated') {
+      // PC-08b：网关管理员改容量的增量广播（PC-08a REST PATCH → ws-hub）。
+      // 只消费当前网络、2..64 的有限整数；跨网络的旧消息与形状坏的一律忽略
+      // ——不改内存状态、不落盘、不重排挂载。同值幂等：welcome 已把该值写进
+      // peerNetwork.maxPeersFromGateway 时直接早退，不重复写盘也不重排挂载。
+      // 落盘复用 welcome 的同一事实源；pool.maxServers() 每次调用现场读它，
+      // 升容后 refreshMounts 立即补位，缩容不踢既有挂载（mountPeer 的上限闸
+      // 只挡新增），本机显式 maxServers 由 pool 的 min 规则继续压住。
+      if (message['networkId'] !== networkId) return
+      const announced = message['maxPeers']
+      if (typeof announced !== 'number' || !Number.isSafeInteger(announced) || announced < 2 || announced > 64) return
+      if (announced === maxPeers) return
+      maxPeers = announced
+      const net = readPeerNetwork(stateFile)
+      if (net !== undefined && net.networkId === networkId && net.maxPeersFromGateway !== announced) {
+        writePeerNetwork(stateFile, { ...net, maxPeersFromGateway: announced })
+      }
+      refreshMounts()
+      return
+    }
     // 其余类型（含已认证后再来的 challenge）忽略。
   }
 
