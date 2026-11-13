@@ -221,6 +221,37 @@ export function patchUiState(state: ConsoleState, patch: Partial<UiLocalState>):
   return { ...state, ui: { ...state.ui, ...patch } };
 }
 
+// ---------------------------------------------------------------- PC-20：顶栏计数派生（SSE 事实 → 既有字段口径）
+
+/** 顶栏/切换菜单的设备计数三元组（与 REST NetworkView 的同名字段同口径） */
+export interface NetworkDeviceCounts {
+  /** 占席位成员：authorized + paused + mismatch */
+  totalDevices: number;
+  /** 当前在线连接数 */
+  onlineDevices: number;
+  /** 待审批申请数 */
+  pendingCount: number;
+}
+
+/**
+ * 顶栏计数派生（PC-20）：当前网络有实时快照时按快照事实计算，沿 REST
+ * NetworkView 的既有字段口径（服务端 routes-networks 的 networkView：占席
+ * = authorized + paused + mismatch，在线 = 当前连接数，待审批 = pending 数；
+ * 席位过滤与 format.ts 的 filterJoinedMembers 同一规则——那边依赖本模块的
+ * 类型，故在这里就地实现）。无快照（未订阅/未首推）或快照不属于这个网络
+ * （串网防护）时回落 REST 值——没订阅的网络不假称实时。
+ */
+export function deriveNetworkCounts(network: NetworkView, snapshot?: TopologySnapshot): NetworkDeviceCounts {
+  if (snapshot === undefined || snapshot.network.id !== network.id) {
+    return { totalDevices: network.totalDevices, onlineDevices: network.onlineDevices, pendingCount: network.pendingCount };
+  }
+  let totalDevices = 0;
+  for (const member of snapshot.members) {
+    if (member.status === 'authorized' || member.status === 'paused' || member.status === 'mismatch') totalDevices += 1;
+  }
+  return { totalDevices, onlineDevices: snapshot.summary.onlineDevices, pendingCount: snapshot.summary.pendingCount };
+}
+
 // ---------------------------------------------------------------- 可订阅 store
 
 /** useSyncExternalStore 友好的小 store：getState/subscribe 绑定 this，变更恰好发一次通知 */
@@ -281,6 +312,103 @@ export class ConsoleStore {
   };
 }
 
+// ---------------------------------------------------------------- PC-20：管理页 3 秒刷新循环（固定节拍、在途取消、过期作废）
+
+/** 定时器注入面：固定节拍用原生 interval 语义，浏览器用全局 setInterval，测试用假件 */
+export interface RefreshTimers {
+  /** setInterval 语义：每 ms 调一次 handler，返回可取消句柄 */
+  interval(handler: () => void, ms: number): unknown;
+  cancel(handle: unknown): void;
+}
+
+/** 一拍刷新的凭证：load 的落库核对、取消信号与收拍都必须经它 */
+export interface RefreshTicket {
+  /** 数据落库前核对：false = 本拍已作废（停表/换世代），结果必须丢弃 */
+  isCurrent(): boolean;
+  /** 本拍结束（成功/失败/被取消都算）必须恰好调一次：清本拍的在途标记 */
+  settle(): void;
+  /** 本拍的取消信号：stop()/换世代时被 abort，load 必须传给底层 fetch（PC-20 fix1 R2） */
+  signal: AbortSignal;
+}
+
+export interface ManagedRefreshCycleDeps {
+  intervalMs: number;
+  timers: RefreshTimers;
+  /** 拉一次数据；拿到的 ticket 用于世代核对、传取消信号与收拍 */
+  load(ticket: RefreshTicket): Promise<void>;
+}
+
+/**
+ * 固定节拍的 REST 轮询循环（PC-20 管理页；fix1 改为 interval 格点 + 在途取消）：
+ * - start() 立即拉一次（不占格点）并注册一张 intervalMs 的原生 interval；已在跑时重复 start 不叠加；
+ * - 格点触发时若本世代还有在途拍则跳过（忙碌跳过）——慢响应不打漂节拍、不叠加请求，
+ *   节拍始终是固定 3s 格点，不是「响应耗时 + 3s」（fix1 R3）；
+ * - stop() 清 interval、递增世代并 abort 在途请求——旧请求不能永久留在后台（fix1 R2）；
+ *   世代守卫（isCurrent）继续兜底不可取消的迟响应，迟到结果一律不落库；
+ * - 旧世代挂在途不挡新一代 start() 的立即拍（隐藏归来/重新登录都立即有新数据）。
+ */
+export class ManagedRefreshCycle {
+  private readonly deps: ManagedRefreshCycleDeps;
+  private stopped = true;
+  private generation = 0;
+  /** 本世代在途的拍；旧世代挂在途时不挡新世代（值为 null 表示当前无在途拍） */
+  private inFlightGeneration: number | null = null;
+  private inFlightController: AbortController | null = null;
+  private intervalHandle: unknown = null;
+
+  constructor(deps: ManagedRefreshCycleDeps) {
+    this.deps = deps;
+  }
+
+  /** 开始：立即拉一次并注册固定节拍 interval。已在跑时是空操作，不叠加 */
+  start(): void {
+    if (!this.stopped) return;
+    this.stopped = false;
+    this.tick();
+    this.intervalHandle = this.deps.timers.interval(() => this.fireTick(), this.deps.intervalMs);
+  }
+
+  /** 停：清 interval、递增世代并取消在途请求 */
+  stop(): void {
+    this.stopped = true;
+    this.generation += 1;
+    if (this.intervalHandle !== null) {
+      this.deps.timers.cancel(this.intervalHandle);
+      this.intervalHandle = null;
+    }
+    this.inFlightController?.abort();
+    this.inFlightController = null;
+  }
+
+  /** 固定格点触发：忙碌（本世代在途未收拍）则跳过这一拍，格点本身继续 */
+  private fireTick(): void {
+    if (this.stopped) return;
+    if (this.inFlightGeneration === this.generation) return;
+    this.tick();
+  }
+
+  private tick(): void {
+    if (this.stopped) return;
+    if (this.inFlightGeneration === this.generation) return;
+    const generation = this.generation;
+    const controller = new AbortController();
+    this.inFlightGeneration = generation;
+    this.inFlightController = controller;
+    void this.deps.load({
+      isCurrent: () => !this.stopped && generation === this.generation,
+      settle: () => this.settle(generation),
+      signal: controller.signal,
+    });
+  }
+
+  private settle(generation: number): void {
+    if (this.inFlightGeneration === generation) {
+      this.inFlightGeneration = null;
+      this.inFlightController = null;
+    }
+  }
+}
+
 // ---------------------------------------------------------------- REST + SSE 客户端
 
 /** 统一的业务错误：status 是 HTTP 状态码，code 是服务端错误码（INVALID_CREDENTIALS 等） */
@@ -303,7 +431,7 @@ export interface FetchResponseLike {
 
 export type FetchLike = (
   url: string,
-  init?: { method?: string; headers?: Record<string, string>; body?: string },
+  init?: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
 ) => Promise<FetchResponseLike>;
 
 /** EventSource 的最小结构类型：只用到 addEventListener 与 close */
@@ -378,7 +506,7 @@ export class ConsoleClient {
     this.eventSourceFactoryImpl = deps.eventSourceFactory ?? defaultEventSourceFactory();
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     // 以局部变量调用：方法属性形式（this.fetchImpl(...)）会把 ConsoleClient
     // 实例当 receiver 传给注入件，浏览器的 WebIDL 品牌检查直接抛 Illegal invocation。
     const fetchFn = this.fetchImpl;
@@ -391,6 +519,7 @@ export class ConsoleClient {
         method,
         headers: body === undefined ? undefined : { 'content-type': 'application/json' },
         body: body === undefined ? undefined : JSON.stringify(body),
+        signal,
       });
     } catch (err) {
       throw new ConsoleApiError(0, 'NETWORK_ERROR', err instanceof Error ? err.message : 'network request failed');
@@ -477,8 +606,9 @@ export class ConsoleClient {
     return this.request('PATCH', '/api/v1/admin/settings', patch);
   }
 
-  async adminListUsers(): Promise<AdminUserRow[]> {
-    return this.request('GET', '/api/v1/admin/users');
+  /** signal：管理页轮询的取消信号（PC-20 fix1——停表时 abort 在途拍），缺省行为不变 */
+  async adminListUsers(signal?: AbortSignal): Promise<AdminUserRow[]> {
+    return this.request('GET', '/api/v1/admin/users', undefined, signal);
   }
 
   async adminSetUserActive(userId: string, active: boolean): Promise<void> {
