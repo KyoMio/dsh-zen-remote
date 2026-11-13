@@ -40,6 +40,7 @@ import type { PeerIdentityKeyPair, PeerSessionCiphers } from './crypto.js';
 import type { PeerFrameHeader } from './wire.js';
 /** 打洞/中转握手控制包的域分隔前缀——UDP 与网关 WS 两条路径共用同一形态。 */
 export declare const STUN_PROBE_DOMAIN = "zr-stun-probe-v1";
+/** v1 域常量已下沉 crypto.ts（PC-12）；此处保留同名导出维持既有引用面。 */
 export declare const PUNCH_DOMAIN = "zr-punch-v1";
 /** `os.networkInterfaces()` entries, loosened so hand-built fixtures type-check. */
 export interface LanInterfaceInfo {
@@ -127,6 +128,11 @@ export interface DirectReadyInfo {
     endpoint: string;
     /** Handshake RTT when we initiated; 0 when we answered passively. */
     rttMs: number;
+    /**
+     * 本条直连握手达成的契约档位（内部诊断，PC-12）：`'v2'` = dual 信封完整绑定
+     * 成立；`'v1'` = 旧协议互通保障（TOFU + nonce 回显），**不是**完整绑定。
+     */
+    hsBound: 'v1' | 'v2';
     ciphers: PeerSessionCiphers;
 }
 /** Same frame-sending seam `src/peer/arq.ts` consumes after `onDirectReady`. */

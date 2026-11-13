@@ -114,7 +114,7 @@ export declare class PeerMux {
     private dispatchFrame;
     private beginHello;
     private clearHelloTimer;
-    /** `28B 头（HELLO, streamId 0）+ 签名 zr-punch-v1 hello JSON`，网关原样路由。 */
+    /** `28B 头（HELLO, streamId 0）+ dual 握手信封 JSON`，网关原样路由（只读路由头）。 */
     private sendHelloEnvelope;
     private sendHelloAckEnvelope;
     private sendEnvelope;

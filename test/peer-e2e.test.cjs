@@ -530,6 +530,15 @@ test('PG-8 #2: UDP 降级走网关 WS（零明文），恢复后热切回直连�
     const pong = await virtualConA.client.invoke('session', 'modelCatalog', {})
     assert.deepEqual(pong.groups, [], 'relay-path invoke works')
 
+    // PC-12：dual 信封完成网关中转握手后，mux 只在正常日志里标注 v2 完整绑定
+    //（不加界面、不进持久化）。
+    for (const node of [A, C]) {
+      assert.ok(
+        node.logs.some((line) => line.includes('mux: relay handshake complete') && line.includes('hs=v2')),
+        `${node.name} logged the v2 full binding for the relay handshake`,
+      )
+    }
+
     // —— 网关零明文断言：中转的二进制帧里没有会话标题、没有协议明文 ——
     const markers = [SESSION_TITLE, 's-a1', 's-c1', 'workspace/follow', 'relay/v1/', 'handshake', 'api-session/added']
     for (const buf of gw.relayedBinary) {
@@ -1876,5 +1885,297 @@ test('PC-05: 2MiB known-length upload rides out a mid-flight UDP blackout throug
   } finally {
     for (const node of nodes) node.stop()
     await gw.close()
+  }
+})
+
+// ---------------------------------------------------------------- PC-12 握手契约
+
+// PC-12 的路径级正常用例：dual 信封在真实 UDP 打洞与网关 WS 中转两条路径上的
+// 接线行为（v2 完整绑定 / 旧端互通的 v1 档）。旧端模拟用文件内冻结的 v1 配方
+// 现签构造（等价旧版发送/应答方），不构造任何攻击场景。
+
+const { sign: pc12EdSign, verify: pc12EdVerify } = require('node:crypto')
+const { PeerPunchManager } = require('../lib/peer/punch.js')
+const { generatePeerIdentity, generateEphemeralX25519 } = require('../lib/peer/crypto.js')
+
+const PC12_NET = 'a1b2c3d4e5f60718'
+
+/** 冻结的旧端 Ed25519 签名/验证配方（与已发布 lib/peer/punch.js 逐字节一致）。 */
+function pc12Jwk(identity) {
+  const { createPrivateKey } = require('node:crypto')
+  return createPrivateKey({
+    key: {
+      kty: 'OKP',
+      crv: 'Ed25519',
+      x: Buffer.from(identity.publicKeyHex, 'hex').toString('base64url'),
+      d: Buffer.from(identity.privateKeyHex, 'hex').toString('base64url'),
+    },
+    format: 'jwk',
+  })
+}
+
+function pc12LegacySign(message, identity) {
+  return pc12EdSign(null, message, pc12Jwk(identity)).toString('hex')
+}
+
+function pc12LegacyVerify(message, publicKeyHex, sigHex) {
+  try {
+    const { createPublicKey } = require('node:crypto')
+    const publicKey = createPublicKey({
+      key: { kty: 'OKP', crv: 'Ed25519', x: Buffer.from(publicKeyHex, 'hex').toString('base64url') },
+      format: 'jwk',
+    })
+    return pc12EdVerify(null, message, publicKey, Buffer.from(sigHex, 'hex'))
+  } catch {
+    return false
+  }
+}
+
+/** 真实 loopback UDP socket 上的 PeerPunchManager（真实时钟）。 */
+async function pc12MakeManager(identity, hooks = {}, port = 0) {
+  const socket = await openUdp()
+  const mgr = new PeerPunchManager({ networkId: PC12_NET, identity, socket, ...hooks })
+  await mgr.ready()
+  return { mgr, socket, port: socket.address().port }
+}
+
+async function pc12CloseManager(pair) {
+  await new Promise((resolve) => {
+    try {
+      pair.socket.close(() => resolve())
+    } catch {
+      resolve()
+    }
+  })
+  pair.mgr.close()
+}
+
+test('PC-12: simultaneous dual punch converges and both sides record the v2 full binding', async () => {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const readyA = []
+  const readyB = []
+  const pairA = await pc12MakeManager(A, {
+    onDirectReady: (id, info) => readyA.push({ id, info }),
+  })
+  const pairB = await pc12MakeManager(B, {
+    onDirectReady: (id, info) => readyB.push({ id, info }),
+  })
+  try {
+    // 同时发起：两边都先 beginPunch，再让任何 HELLO 飞行（打洞窗口 1000ms 真实时钟）。
+    pairA.mgr.beginPunch({
+      peerNodeId: B.nodeId,
+      peerPublicKeyHex: B.publicKeyHex,
+      lanEndpoints: [`127.0.0.1:${pairB.port}`],
+      reflexiveEndpoint: null,
+    })
+    pairB.mgr.beginPunch({
+      peerNodeId: A.nodeId,
+      peerPublicKeyHex: A.publicKeyHex,
+      lanEndpoints: [`127.0.0.1:${pairA.port}`],
+      reflexiveEndpoint: null,
+    })
+    await waitFor(() => readyA.length > 0 && readyB.length > 0, 5000, 'both sides direct')
+    assert.equal(readyA[0].id, B.nodeId)
+    assert.equal(readyB[0].id, A.nodeId)
+    assert.equal(readyA[0].info.hsBound, 'v2', 'A recorded the v2 full binding')
+    assert.equal(readyB[0].info.hsBound, 'v2', 'B recorded the v2 full binding')
+    // 双方派生出互为镜像的方向密钥。
+    const ciphersA = pairA.mgr.sessionCiphers(B.nodeId)
+    const ciphersB = pairB.mgr.sessionCiphers(A.nodeId)
+    assert.ok(ciphersA && ciphersB)
+    assert.equal(ciphersA.txKeyHex, ciphersB.rxKeyHex)
+    assert.equal(ciphersA.rxKeyHex, ciphersB.txKeyHex)
+  } finally {
+    await pc12CloseManager(pairA)
+    await pc12CloseManager(pairB)
+  }
+})
+
+test('PC-12: a legacy-only responder completes the UDP handshake at the v1 level (old-peer compatibility)', async () => {
+  const A = generatePeerIdentity() // 新端发起方
+  const legacy = generatePeerIdentity() // 旧版应答方：只按冻结的 v1 配方收发
+  const legacyEph = generateEphemeralX25519()
+  const readyA = []
+  const pairA = await pc12MakeManager(A, {
+    onDirectReady: (id, info) => readyA.push({ id, info }),
+  })
+  const responder = await openUdp()
+  try {
+    // 旧端行为：收到 HELLO 只读 v1 字段并按冻结模板验证 sigHex（新增字段被
+    // 旧端自然忽略），然后回一份纯 v1 ACK（不含任何新证明字段）。
+    responder.once('message', (buf, rinfo) => {
+      const hello = JSON.parse(buf.toString('utf8'))
+      const message = Buffer.from(
+        `zr-punch-v1|hello|${PC12_NET}|${hello.nodeId}|${hello.ephPubHex}|${hello.nonce}|${hello.timestamp}`,
+        'utf8',
+      )
+      if (!pc12LegacyVerify(message, hello.publicKeyHex, hello.sigHex)) return
+      const timestamp = Date.now()
+      const ackMessage = Buffer.from(
+        `zr-punch-v1|ack|${PC12_NET}|${legacy.nodeId}|${legacyEph.publicKeyHex}|${hello.nonce}|${timestamp}`,
+        'utf8',
+      )
+      const ack = Buffer.from(JSON.stringify({
+        zr: 1,
+        kind: 'zr-hello-ack',
+        networkId: PC12_NET,
+        nodeId: legacy.nodeId,
+        publicKeyHex: legacy.publicKeyHex,
+        ephPubHex: legacyEph.publicKeyHex,
+        nonce: hello.nonce,
+        timestamp,
+        sigHex: pc12LegacySign(ackMessage, legacy),
+      }), 'utf8')
+      responder.send(ack, rinfo.port, rinfo.address)
+    })
+    pairA.mgr.beginPunch({
+      peerNodeId: legacy.nodeId,
+      peerPublicKeyHex: legacy.publicKeyHex,
+      lanEndpoints: [`127.0.0.1:${responder.address().port}`],
+      reflexiveEndpoint: null,
+    })
+    await waitFor(() => readyA.length > 0, 5000, 'initiator completed against the legacy responder')
+    assert.equal(readyA[0].id, legacy.nodeId)
+    assert.equal(readyA[0].info.hsBound, 'v1', 'legacy-only link stays at the v1 level — no full-binding claim')
+    const ciphers = pairA.mgr.sessionCiphers(legacy.nodeId)
+    assert.ok(ciphers, 'v1 link still derives live session ciphers')
+  } finally {
+    await pc12CloseManager(pairA)
+    await new Promise((resolve) => responder.close(resolve))
+  }
+})
+
+test('PC-12: WS relay handshake with a legacy-only peer completes at the v1 level through the real PeerMux frame path', async () => {
+  // 旧端以文件内冻结的 v1 配方模拟（真实 PeerMux 收发 + 28B 路由头帧组装）：
+  // 新端 dual HELLO 被旧配方正常接收 → 旧端纯 v1 ACK 被新端 mux 接纳 → 会话落
+  // ws 且档位标注 v1（非 v2）；反向旧端发起 HELLO → 新端回 dual ACK → 旧配方
+  // 验 v1 半部通过。正常同步时钟（mux 默认 realClock，WS ±30s 窗保持）。
+  const { PeerMux } = require('../lib/peer/mux.js')
+  const {
+    encodeFrameHeader,
+    decodeFrameHeader,
+    PEER_FRAME_MAGIC,
+    PEER_FRAME_VERSION,
+    PeerFrameType,
+  } = require('../lib/peer/wire.js')
+
+  const A = generatePeerIdentity() // 新端
+  const legacy = generatePeerIdentity() // 旧端（冻结 v1 配方）
+  const legacyEph = generateEphemeralX25519()
+  const outbound = [] // 新端发出的中转帧（网关视角抄送）
+  const pathEvents = []
+  const logs = []
+  const mux = new PeerMux({
+    networkId: PC12_NET,
+    identity: A,
+    sendGatewayBinary: (bytes) => outbound.push(Buffer.from(bytes)),
+    relayHandler: () => undefined,
+    relaySecret: () => 'pc12-fix1-relay-secret',
+    onPathChanged: (nodeId, path) => pathEvents.push([nodeId, path]),
+    log: (line) => logs.push(line),
+  })
+  // 网关中转帧组装（与 mux sendEnvelope 同规则：28B 头 + 载荷补零到最小帧长）。
+  const relayFrame = (srcNodeId, dstNodeId, seq, payload) => {
+    const pad = Math.max(0, 44 - 28 - payload.length)
+    return Buffer.concat([
+      encodeFrameHeader({
+        magic: PEER_FRAME_MAGIC,
+        version: PEER_FRAME_VERSION,
+        frameType: PeerFrameType.HELLO,
+        srcNodeId,
+        dstNodeId,
+        streamId: 0,
+        seq,
+        ack: 0,
+      }),
+      payload,
+      Buffer.alloc(pad),
+    ])
+  }
+  const decodePayload = (frame) => JSON.parse(frame.subarray(28).toString('utf8').replace(/\x00+$/, ''))
+
+  try {
+    // —— 方向一：新端发起。真实 beginHello 发出 dual HELLO 帧 ——
+    mux.ensureSession(legacy.nodeId, legacy.publicKeyHex, 'legacy-peer')
+    mux.enableRelayPath(legacy.nodeId)
+    assert.equal(outbound.length, 1, 'exactly one HELLO frame sent')
+    const header = decodeFrameHeader(outbound[0])
+    assert.ok(header, 'outbound frame carries a valid 28B routing header')
+    assert.equal(header.frameType, PeerFrameType.HELLO)
+    assert.equal(header.streamId, 0)
+    assert.equal(header.srcNodeId, A.nodeId)
+    assert.equal(header.dstNodeId, legacy.nodeId)
+    const dualHello = decodePayload(outbound[0])
+    // 旧端只读 v1 字段并按冻结模板验 sigHex——dual 信封的 v1 半部必须原样成立。
+    const legacyHelloMessage = Buffer.from(
+      `zr-punch-v1|hello|${PC12_NET}|${dualHello.nodeId}|${dualHello.ephPubHex}|${dualHello.nonce}|${dualHello.timestamp}`,
+      'utf8',
+    )
+    assert.equal(pc12LegacyVerify(legacyHelloMessage, dualHello.publicKeyHex, dualHello.sigHex), true,
+      'the frozen legacy recipe accepts the dual HELLO v1 half')
+
+    // 旧端回一份纯 v1 ACK（冻结编码，无任何新证明字段）。
+    const ackTimestamp = Date.now()
+    const legacyAckMessage = Buffer.from(
+      `zr-punch-v1|ack|${PC12_NET}|${legacy.nodeId}|${legacyEph.publicKeyHex}|${dualHello.nonce}|${ackTimestamp}`,
+      'utf8',
+    )
+    const legacyAckPayload = Buffer.from(JSON.stringify({
+      zr: 1,
+      kind: 'zr-hello-ack',
+      networkId: PC12_NET,
+      nodeId: legacy.nodeId,
+      publicKeyHex: legacy.publicKeyHex,
+      ephPubHex: legacyEph.publicKeyHex,
+      nonce: dualHello.nonce,
+      timestamp: ackTimestamp,
+      sigHex: pc12LegacySign(legacyAckMessage, legacy),
+    }), 'utf8')
+    mux.handleGatewayFrame(relayFrame(legacy.nodeId, A.nodeId, 0n, legacyAckPayload))
+    // 新端接纳旧 ACK：会话落 ws，档位标注 v1（旧协议互通保障，不是完整绑定）。
+    assert.equal(mux.sessionPath(legacy.nodeId), 'ws', 'legacy ACK completes the relay handshake')
+    assert.ok(pathEvents.some(([, path]) => path === 'ws'), 'path reported ws')
+    assert.ok(
+      logs.some((line) => line.includes('mux: relay handshake complete') && line.includes('hs=v1')),
+      'mux logged the v1 level for the legacy-only link',
+    )
+    assert.ok(!logs.some((line) => line.includes('hs=v2')), 'no full-binding claim on a legacy link')
+
+    // —— 方向二：旧端发起。新端应以恰好一份 dual ACK 应答，其 v1 半部被旧配方接受 ——
+    const helloTimestamp2 = Date.now()
+    const legacyNonce2 = '1122334455667788'
+    const legacyHello2Message = Buffer.from(
+      `zr-punch-v1|hello|${PC12_NET}|${legacy.nodeId}|${legacyEph.publicKeyHex}|${legacyNonce2}|${helloTimestamp2}`,
+      'utf8',
+    )
+    const legacyHello2Payload = Buffer.from(JSON.stringify({
+      zr: 1,
+      kind: 'zr-hello',
+      networkId: PC12_NET,
+      nodeId: legacy.nodeId,
+      publicKeyHex: legacy.publicKeyHex,
+      ephPubHex: legacyEph.publicKeyHex,
+      nonce: legacyNonce2,
+      timestamp: helloTimestamp2,
+      sigHex: pc12LegacySign(legacyHello2Message, legacy),
+    }), 'utf8')
+    mux.handleGatewayFrame(relayFrame(legacy.nodeId, A.nodeId, 1n, legacyHello2Payload))
+    assert.equal(outbound.length, 2, 'mux answered the legacy HELLO with exactly one ACK frame')
+    const dualAck = decodePayload(outbound[1])
+    assert.equal(dualAck.kind, 'zr-hello-ack')
+    assert.equal(dualAck.nodeId, A.nodeId)
+    assert.equal(dualAck.peerNodeId, legacy.nodeId)
+    assert.equal(dualAck.nonce, legacyNonce2, 'the ACK echoes the legacy HELLO nonce')
+    assert.equal(dualAck.peerEphPubHex, legacyEph.publicKeyHex, 'the ACK binds the legacy HELLO ephemeral verbatim')
+    const legacyAckVerifyMessage = Buffer.from(
+      `zr-punch-v1|ack|${PC12_NET}|${dualAck.nodeId}|${dualAck.ephPubHex}|${dualAck.nonce}|${dualAck.timestamp}`,
+      'utf8',
+    )
+    assert.equal(pc12LegacyVerify(legacyAckVerifyMessage, dualAck.publicKeyHex, dualAck.sigHex), true,
+      'the frozen legacy recipe accepts the dual ACK v1 half (reverse direction)')
+    assert.ok(!logs.some((line) => line.includes('hs=v2')), 'the legacy-initiated exchange stays at the v1 level')
+  } finally {
+    mux.close()
   }
 })
