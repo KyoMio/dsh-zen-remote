@@ -5,7 +5,12 @@
 import type { TranslateFn } from './i18n/locales.js';
 import type { MemberStatus, TopologyLink, TopologyMemberRow } from './store/console-store.js';
 
-/** 实时中转速率：'0 KB/s'、'12 KB/s'、'1.5 MB/s'（任务单要求等宽大字展示） */
+/**
+ * 实时中转速率：'0 KB/s'、'12 KB/s'、'1.5 MB/s'（任务单要求等宽大字展示）。
+ * 入参单位契约（PC-17）：KB/s = 1024 字节/秒——即拓扑 API 里 liveRelayKbps /
+ * totalLiveRelayKbps / relayKbps 字段的数值（kilobytes，不是 kilobits），
+ * 与 relayRateKbps 配置同单位；字段名的 kbps 后缀只是历史拼写，不乘 8。
+ */
 export function formatRate(kbps: number): string {
   if (!Number.isFinite(kbps) || kbps <= 0) return '0 KB/s';
   if (kbps < 1024) return `${Math.round(kbps)} KB/s`;

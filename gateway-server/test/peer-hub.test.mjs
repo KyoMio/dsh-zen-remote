@@ -14,6 +14,7 @@ import { createGatewayApiServer } from '../dist/server.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { deriveMasterKeyFromSecret, hashPassword } from '../dist/master-key.js';
 import { PeerRateLimiter } from '../dist/peer-hub/rate-limiter.js';
+import { formatRate } from '../dist/web/format.js';
 import { UdpStunService } from '../dist/peer-hub/udp-stun.js';
 import { PeerWsHub } from '../dist/peer-hub/ws-hub.js';
 import WebSocket from 'ws';
@@ -585,20 +586,33 @@ describe('PeerRateLimiter（令牌桶 + 滑窗）', () => {
     assert.equal(lim.tryRelay({ networkId: 'other', nodeId: 'a' }, 8192, 8), true, '不同网络也是独立桶');
   });
 
-  test('5 秒滑动窗口速率：total / byNetwork / byNode / pair', () => {
+  test('PC-17 单位契约：5120 字节 / 5 秒窗口 → 1 KB/s，四路聚合一致', () => {
+    const clock = { now: 1_000_000 };
+    const lim = new PeerRateLimiter({ now: () => clock.now });
+    // liveRelayKbps 数值单位 = KB/s（1024 字节/秒），与 relayRateKbps 配置及界面 KB/s 一致
+    lim.tryRelay({ networkId: 'n1', nodeId: 'a', peerNodeId: 'b' }, 5120, 64);
+    assert.ok(Math.abs(lim.liveRelayKbpsTotal() - 1) < 1e-9, `total=${lim.liveRelayKbpsTotal()}`);
+    assert.ok(Math.abs(lim.liveRelayKbpsByNetwork('n1') - 1) < 1e-9);
+    assert.ok(Math.abs(lim.liveRelayKbpsByNode('n1', 'a') - 1) < 1e-9);
+    assert.ok(Math.abs(lim.liveRelayKbpsPair('n1', 'a', 'b') - 1) < 1e-9, 'pair 无序匹配');
+    assert.ok(Math.abs(lim.liveRelayKbpsPair('n1', 'b', 'a') - 1) < 1e-9);
+    assert.equal(lim.liveRelayKbpsByNetwork('n2'), 0);
+  });
+
+  test('5 秒滑动窗口速率按时求和、滑出归零：total / byNetwork / byNode / pair', () => {
     const clock = { now: 1_000_000 };
     const lim = new PeerRateLimiter({ now: () => clock.now });
     lim.tryRelay({ networkId: 'n1', nodeId: 'a', peerNodeId: 'b' }, 8192, 64); // t+0
     clock.now += 500;
     lim.tryRelay({ networkId: 'n1', nodeId: 'a', peerNodeId: 'b' }, 4096, 64); // t+0.5
     clock.now += 2000; // t+2.5：两条都在 5s 窗口内
-    // (8192+4096)*8/5/1024 = 19.2 kbps
-    assert.ok(Math.abs(lim.liveRelayKbpsTotal() - 19.2) < 1e-9, `total=${lim.liveRelayKbpsTotal()}`);
-    assert.ok(Math.abs(lim.liveRelayKbpsByNetwork('n1') - 19.2) < 1e-9);
+    // (8192+4096)/5/1024 = 2.4 KB/s（PC-17：窗口字节 / 窗口秒 / 1024，不乘 8）
+    assert.ok(Math.abs(lim.liveRelayKbpsTotal() - 2.4) < 1e-9, `total=${lim.liveRelayKbpsTotal()}`);
+    assert.ok(Math.abs(lim.liveRelayKbpsByNetwork('n1') - 2.4) < 1e-9);
     assert.equal(lim.liveRelayKbpsByNetwork('n2'), 0);
-    assert.ok(Math.abs(lim.liveRelayKbpsByNode('n1', 'a') - 19.2) < 1e-9);
-    assert.ok(Math.abs(lim.liveRelayKbpsPair('n1', 'a', 'b') - 19.2) < 1e-9, 'pair 无序匹配');
-    assert.ok(Math.abs(lim.liveRelayKbpsPair('n1', 'b', 'a') - 19.2) < 1e-9);
+    assert.ok(Math.abs(lim.liveRelayKbpsByNode('n1', 'a') - 2.4) < 1e-9);
+    assert.ok(Math.abs(lim.liveRelayKbpsPair('n1', 'a', 'b') - 2.4) < 1e-9, 'pair 无序匹配');
+    assert.ok(Math.abs(lim.liveRelayKbpsPair('n1', 'b', 'a') - 2.4) < 1e-9);
     clock.now += 4000; // t+6.5：全部滑出窗口
     assert.equal(lim.liveRelayKbpsTotal(), 0);
     assert.equal(lim.liveRelayKbpsPair('n1', 'a', 'b'), 0);
@@ -1479,6 +1493,78 @@ describe('二进制帧中转与源地址防伪造', () => {
       assert.equal(bRow.cumulativeRelayBytes, 48);
       assert.ok(aRow.lastSeenAt !== null);
     } finally {
+      await gw.close();
+    }
+  });
+});
+
+describe('PC-17：真实 HTTP 全链单位证据（5120 字节 / 5 秒窗口 → 1 KB/s）', () => {
+  test('5 个 1024B 合法帧经真实 hub 计量，topology 成员/链路/网络与管理员 API 响应字段读数均为 1，喂 formatter 显示 1 KB/s', async () => {
+    const gw = await startGateway();
+    let wsA;
+    let wsB;
+    try {
+      const { net, a, b, wsA: aSock, wsB: bSock } = await setupPair(gw);
+      wsA = aSock;
+      wsB = bSock;
+
+      // A → B 发 5 个总长 1024B 的合法中转帧（28B 路由头 + 980B 载荷 + 16B tag，
+      // frame() 的 payloadBytes 指明文载荷；单帧 ≤ 既有 1200B 上限），
+      // hub 按整帧 buf.length 计量共 5120 字节
+      const frames = [];
+      for (let i = 0; i < 5; i++) {
+        const f = frame({ src: a.nodeId, dst: b.nodeId, payloadBytes: 980, seq: BigInt(i + 1) });
+        assert.equal(f.length, 1024, `帧总长应 1024B，实际 ${f.length}`);
+        frames.push(f);
+        wsA.send(f);
+      }
+      for (let i = 0; i < 5; i++) {
+        assert.deepEqual(await wsBinary(wsB), frames[i], '5 帧应原样到达 B');
+      }
+
+      // A 自报对 B 的中转路径（节点正常上报行为）：让拓扑 links 出现 A→B 观测行，
+      // 才能从同一 HTTP 响应里核对该节点对范围的读数
+      wsA.send(JSON.stringify({ type: 'path-report', peers: [{ peerNodeId: b.nodeId, path: 'relay', rttMs: null }] }));
+      await wsSilence(wsB, 150); // path-report 无下行帧，顺带给 hub 一点处理余量
+
+      // 全程远小于 5 秒窗口：5120 字节都落在同一窗口 → 读数确定 = 5120 / 5 / 1024 = 1
+      const topo = await getTopology(gw, net.id); // 真实 GET /api/v1/networks/:id/topology（租户 cookie）
+      assert.ok(
+        Math.abs(topo.summary.totalLiveRelayKbps - 1) < 1e-9,
+        `网络 summary.totalLiveRelayKbps 应为 1，实际 ${topo.summary.totalLiveRelayKbps}`,
+      );
+      const senderRow = topo.members.find((m) => m.nodeId === a.nodeId);
+      assert.ok(senderRow !== undefined, '拓扑应有发送方成员行');
+      assert.ok(
+        Math.abs(senderRow.liveRelayKbps - 1) < 1e-9,
+        `发送方成员 liveRelayKbps 应为 1（按发送方统计），实际 ${senderRow.liveRelayKbps}`,
+      );
+      const relayLink = topo.links.find((l) => l.srcNodeId === a.nodeId && l.peerNodeId === b.nodeId);
+      assert.ok(relayLink !== undefined, '拓扑应有 A→B 链路观测行');
+      assert.ok(
+        Math.abs(relayLink.liveRelayKbps - 1) < 1e-9,
+        `链路 liveRelayKbps 应为 1，实际 ${relayLink.liveRelayKbps}`,
+      );
+
+      // 管理员 API（GET /api/v1/admin/users）：租户名下恰好该网络，relayKbps 按
+      // 归属网络合计——同一发送量在这个口径下同为 1，不改聚合规则凑数
+      const usersRes = await api(gw.base, 'GET', '/api/v1/admin/users', { cookie: gw.adminCookie });
+      assert.equal(usersRes.status, 200, JSON.stringify(usersRes.json));
+      const tenantRow = usersRes.json.data.find((u) => u.id === gw.tenantId);
+      assert.ok(tenantRow !== undefined, '管理员用户列表应有租户行');
+      assert.ok(
+        Math.abs(tenantRow.relayKbps - 1) < 1e-9,
+        `管理员 relayKbps 应为 1，实际 ${tenantRow.relayKbps}`,
+      );
+
+      // 真实 HTTP 响应字段喂 formatter：界面将显示 1 KB/s
+      assert.equal(formatRate(topo.summary.totalLiveRelayKbps), '1 KB/s');
+      assert.equal(formatRate(senderRow.liveRelayKbps), '1 KB/s');
+      assert.equal(formatRate(relayLink.liveRelayKbps), '1 KB/s');
+      assert.equal(formatRate(tenantRow.relayKbps), '1 KB/s');
+    } finally {
+      wsA?.close();
+      wsB?.close();
       await gw.close();
     }
   });

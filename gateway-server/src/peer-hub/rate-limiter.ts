@@ -5,7 +5,10 @@
 //    突发桶容量 = 1 秒的量。超限丢弃（背压从发送方 ACK 缺口自然回传），
 //    不做排队——排队只会把打满的带宽延迟变成堆积的内存。
 // 2. 5 秒滑动窗口速率：每次成功转发记一条 (时刻, 字节, 归属) 事件，读数时
-//    先裁掉窗口外的事件再求和。kbps = 窗口字节 * 8 / (窗口秒) / 1024。
+//    先裁掉窗口外的事件再求和。PC-17 单位契约：各 liveRelayKbps* 读数（含
+//    API 字段 liveRelayKbps / totalLiveRelayKbps / relayKbps）数值都是
+//    KB/s = 1024 字节/秒（kilobytes，不是 kilobits），与 relayRateKbps
+//    配置和界面 KB/s 文案同单位：读数 = 窗口字节 / (窗口秒) / 1024，不乘 8。
 //    支持按全网 / 单节点 / 无序节点对聚合，供 /topology 与 GatewayRuntimeStats。
 // 3. pendingRelayBytes：自上次 drain 起每成员累计的中转字节，由 ws-hub 的
 //    定时刷盘经 store.flushMemberTelemetry 落库后清零。
@@ -101,31 +104,32 @@ export class PeerRateLimiter {
     return total;
   }
 
-  /** 全网关实时中转速率（kbps） */
+  /** 全网关实时中转速率（KB/s，1024 字节/秒；字段名沿用 kbps 后缀保持 API 兼容） */
   liveRelayKbpsTotal(): number {
-    return this.kbps(this.sumWhere(() => true));
+    return this.kbPerSec(this.sumWhere(() => true));
   }
 
-  /** 单个虚拟网络的实时中转速率（kbps） */
+  /** 单个虚拟网络的实时中转速率（KB/s，1024 字节/秒） */
   liveRelayKbpsByNetwork(networkId: string): number {
-    return this.kbps(this.sumWhere((e) => e.networkId === networkId));
+    return this.kbPerSec(this.sumWhere((e) => e.networkId === networkId));
   }
 
-  /** 单成员（作为发送方）的实时速率（kbps） */
+  /** 单成员（作为发送方）的实时速率（KB/s，1024 字节/秒） */
   liveRelayKbpsByNode(networkId: string, nodeId: string): number {
-    return this.kbps(this.sumWhere((e) => e.networkId === networkId && e.nodeId === nodeId));
+    return this.kbPerSec(this.sumWhere((e) => e.networkId === networkId && e.nodeId === nodeId));
   }
 
-  /** 无序节点对的实时速率（kbps）：A→B 与 B→A 合并计 */
+  /** 无序节点对的实时速率（KB/s，1024 字节/秒）：A→B 与 B→A 合并计 */
   liveRelayKbpsPair(networkId: string, a: string, b: string): number {
     const wanted = pairKey(networkId, a, b);
-    return this.kbps(
+    return this.kbPerSec(
       this.sumWhere((e) => e.networkId === networkId && pairKey(networkId, e.nodeId, e.peerNodeId ?? '') === wanted),
     );
   }
 
-  private kbps(windowBytes: number): number {
-    return (windowBytes * 8) / (this.windowMs / 1000) / 1024;
+  /** 窗口字节 → KB/s（1024 字节/秒）。绝不乘 8：那是把单位变成 kilobits 的老错 */
+  private kbPerSec(windowBytes: number): number {
+    return windowBytes / (this.windowMs / 1000) / 1024;
   }
 
   /** 自上次 drain 起某成员累计的中转字节 */
