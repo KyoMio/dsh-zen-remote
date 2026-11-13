@@ -639,6 +639,16 @@ function peerViewPath(state: PeerMemberState, path: PeerMemberPath): 'lan' | 'p2
  * material (the invite's `joinKey` and the identity's `privateKeyHex` live
  * in the state file and never pass through here). `configured` is the
  * engine's own answer: a network id means this machine has joined something.
+ *
+ * PC-11a adds the mount-capacity facts next to the raw `maxPeers` (which
+ * keeps its network-total meaning, this node included): `maxServers` reads
+ * the SAME synthesis client/status reports ({@link effectiveMaxServers} —
+ * the pool's own answer, never a route-local `maxPeers - 1` re-derivation
+ * that would paper over a local explicit cap), `mountedCount` counts the
+ * engine's own mounted flags — this machine's actual mounts, not the
+ * discovered-online rows and not the network's occupied seats — and
+ * `limitReached` compares the two (an over-cap stock after a downscale
+ * stays visible as `true`; the mounts themselves are never evicted).
  */
 function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Record<string, unknown> {
   const status = engine.status()
@@ -650,6 +660,8 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     rttMs: peer.rttMs,
   }))
   const gatewayOrigin = options.getPeerNetworkOrigin?.()
+  const maxServers = effectiveMaxServers(options.pool, options)
+  const mountedCount = status.peers.filter((peer) => peer.mounted).length
   return {
     configured: status.networkId !== null,
     nodeId: status.nodeId,
@@ -658,6 +670,9 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     ...(status.networkId !== null ? { networkId: status.networkId } : {}),
     ...(gatewayOrigin !== undefined && status.networkId !== null ? { gatewayOrigin } : {}),
     maxPeers: status.maxPeers,
+    maxServers,
+    mountedCount,
+    limitReached: mountedCount >= maxServers,
     peers,
   }
 }

@@ -471,7 +471,27 @@ export interface PeerStatusView {
   deniedReason?: string | undefined
   networkId: string | undefined
   gatewayOrigin: string | undefined
+  /** The network's announced device cap, INCLUDING this node — verbatim from
+   * the body (undefined while it answered null / nothing). NOT the mount cap. */
   maxPeers: number | undefined
+  /** PC-11a: this machine's EFFECTIVE remote-mount cap, verbatim from the
+   * body when it carried a safe integer in the config's own 1..64 band
+   * (PC-11a-fix1). `undefined` on an older body — or a fractional/out-of-band
+   * one — means UNKNOWN, never derived from `maxPeers - 1` (which would paper
+   * over a local explicit cap the old answer simply did not carry) and never
+   * the settings constant either. */
+  maxServers: number | undefined
+  /** PC-11a: this machine's actual mounted remotes — the body's count when it
+   * carried a non-negative safe integer, otherwise the explicit `mounted`
+   * flags of the rows, and only when EVERY row carries one (PC-11a-fix1: a
+   * list with missing/ambiguous flags stays unknown instead of reading its
+   * unknowns as unmounted; an explicit empty list is a real zero). Never the
+   * discovered-online rows and never the network's occupied seats. */
+  mountedCount: number | undefined
+  /** PC-11a: `mountedCount >= maxServers` once BOTH facts are known (an
+   * over-cap stock after a downscale reads `true`); `undefined` while the
+   * cap is unknown — `false` would claim room that may not exist. */
+  limitReached: boolean | undefined
   peers: PeerStatusDeviceView[]
 }
 
@@ -522,6 +542,33 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     })
     .filter((row): row is PeerStatusDeviceView => row !== undefined)
   const maxPeers = finiteOrUndefined(safe.maxPeers)
+  // PC-11a-fix1: the capacity facts count DEVICES — safe integers only. A
+  // fractional cap (1.5) or a 65th slot is protocol junk and stays UNKNOWN,
+  // never rounded or clamped into a plausible-looking lie; the cap mirrors
+  // the config's own 1..64 band (the pool clamps the gateway's word to the
+  // same band), while the count stays unclamped so an over-cap stock after a
+  // downscale remains visible. maxPeers keeps its raw finite-number gate.
+  const maxServersRaw = safe.maxServers
+  const maxServers = typeof maxServersRaw === 'number' && Number.isSafeInteger(maxServersRaw) && maxServersRaw >= 1 && maxServersRaw <= 64
+    ? maxServersRaw
+    : undefined
+  // PC-11a-fix1: the row fallback counts ONLY a list that is explicitly
+  // countable — every row a record carrying a boolean `mounted`. A list with
+  // missing or ambiguous flags must not read its unknowns as unmounted (a
+  // pre-fix derivation reported "0 mounts" for exactly those bodies); no
+  // list at all has nothing to count. An explicit empty list is a real zero.
+  const hasList = Array.isArray(safe.peers)
+  const rawRows = hasList ? (safe.peers as unknown[]) : []
+  const listCountable = hasList && rawRows.every((row) => {
+    const record = row !== null && typeof row === 'object' && !Array.isArray(row) ? (row as Record<string, unknown>) : undefined
+    return record !== undefined && typeof record.mounted === 'boolean'
+  })
+  const mountedRaw = safe.mountedCount
+  const mountedCount = typeof mountedRaw === 'number' && Number.isSafeInteger(mountedRaw) && mountedRaw >= 0
+    ? mountedRaw
+    : listCountable
+      ? rawRows.filter((row) => (row as Record<string, unknown>).mounted === true).length
+      : undefined
   return {
     configured: safe.configured === true,
     nodeId: asStringSet(safe.nodeId),
@@ -530,6 +577,9 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     networkId: asStringSet(safe.networkId) || undefined,
     gatewayOrigin: asStringSet(safe.gatewayOrigin) || undefined,
     maxPeers,
+    maxServers,
+    mountedCount,
+    limitReached: mountedCount !== undefined && maxServers !== undefined ? mountedCount >= maxServers : undefined,
     peers,
   }
 }
