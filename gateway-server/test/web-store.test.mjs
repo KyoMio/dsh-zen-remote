@@ -17,9 +17,11 @@ import {
   derivePeerConnRow,
   filterJoinedMembers,
   formatLatencyRange,
+  formatRate,
   maskInviteUri,
   memberStatusView,
 } from '../dist/web/format.js';
+import { PeerRateLimiter } from '../dist/peer-hub/rate-limiter.js';
 import { copyTextToClipboard } from '../dist/web/clipboard.js';
 import {
   ConsoleApiError,
@@ -756,6 +758,32 @@ describe('PC-16b：formatLatencyRange 未知与实测 0', () => {
     assert.equal(formatLatencyRange([12]), '12 ms');
     assert.equal(formatLatencyRange([12, 30]), '12–30 ms');
     assert.equal(formatLatencyRange([null, 20]), '20 ms', '混合未知与实测时只对实测值取区间');
+  });
+});
+
+describe('PC-17：速率单位全链（meter → API 字段 → formatter 文案）', () => {
+  const linksOf = (...links) => links;
+
+  test('5120 字节 / 5 秒滑窗：meter 读数 1 → liveRelayKbps 字段 → 界面「1 KB/s」', () => {
+    const clock = { now: 1_000_000 };
+    const lim = new PeerRateLimiter({ now: () => clock.now });
+    lim.tryRelay({ networkId: 'n', nodeId: 'self', peerNodeId: 'other' }, 5120, 64);
+    // ws-hub 把 limiter 读数原样写进 link.liveRelayKbps（字段名不变，数值单位 KB/s）
+    const apiValue = lim.liveRelayKbpsPair('n', 'self', 'other');
+    assert.ok(Math.abs(apiValue - 1) < 1e-9, `API 字段值应为 1 KB/s，实际 ${apiValue}`);
+    assert.equal(formatRate(apiValue), '1 KB/s');
+    const link = { srcNodeId: 'self', peerNodeId: 'other', path: 'relay', rttMs: null, liveRelayKbps: apiValue };
+    const row = derivePeerConnRow(tZh, makeMember('self', 'authorized'), makeMember('other', 'authorized'), linksOf(link));
+    assert.equal(row.dot, 'warn');
+    assert.equal(row.reason, '这台设备/对方网络不支持直连，已自动中转 · 1 KB/s');
+  });
+
+  test('该读数经 formatRate 的量级换算不变：值就是 KB/s，不被再乘或除 8', () => {
+    // 2.4 KB/s（(8192+4096)/5/1024）必须原样显示，不得出现 19.2（×8）或 0.3（÷8）
+    assert.equal(formatRate(2.4), '2 KB/s');
+    assert.equal(formatRate(19.2), '19 KB/s');
+    // 与配置同单位对照：relayRateKbps=512 → 管理页直显 512 KB/s，formatter 对同值同词
+    assert.equal(formatRate(512), '512 KB/s');
   });
 });
 

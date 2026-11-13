@@ -55,6 +55,7 @@ export type NatType = 'cone' | 'symmetric' | 'public' | 'unknown';
 /** GET /networks/:id/topology 与 SSE 共用的完整快照（镜像服务端 NetworkTopologySnapshot） */
 export interface TopologySnapshot {
   network: { id: string; name: string; admissionMode: AdmissionMode; maxPeers: number };
+  /** totalLiveRelayKbps 数值单位：KB/s = 1024 字节/秒（PC-17 契约，不是 kilobits） */
   summary: { onlineDevices: number; pendingCount: number; totalLiveRelayKbps: number };
   pending: Array<{ nodeId: string; name: string | null; lastIp: string | null }>;
   members: TopologyMemberRow[];
@@ -70,6 +71,7 @@ export interface TopologyMemberRow {
   natType: NatType;
   lastIp: string | null;
   online: boolean;
+  /** 实时中转速率（作为发送方），KB/s = 1024 字节/秒（PC-17 契约） */
   liveRelayKbps: number;
   cumulativeRelayBytes: number;
   /** 最后一次遥测/入网落库时间；从未上报过为 null（界面显示「刚刚」） */
@@ -83,6 +85,7 @@ export interface TopologyLink {
   path: string;
   /** null = 未知（中继/阻断路径没有测速协议），与实测 0 是两种观测，不得强转 */
   rttMs: number | null;
+  /** 本对实时中转速率，KB/s = 1024 字节/秒（PC-17 契约） */
   liveRelayKbps: number;
 }
 
@@ -103,6 +106,7 @@ export interface AdminUserRow {
   createdAt: string;
   networkCount: number;
   onlineDevices: number;
+  /** 名下网络合计实时中转速率，KB/s = 1024 字节/秒（PC-17 契约） */
   relayKbps: number;
 }
 
