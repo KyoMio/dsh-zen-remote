@@ -1140,3 +1140,57 @@ test('real-clock keepalive: a receive between PING ticks moves the loss to that 
     await closeManager({ mgr: mgrA, socket: sockA })
   }
 })
+
+test('PC-V1: incoming recovery handshake survives the local reprobe deadline', async () => {
+  const { EventEmitter } = require('node:events')
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const clockA = manualClock()
+  const clockB = manualClock()
+  const packets = []
+  const sockets = new Map()
+  const socketAt = (port) => {
+    const socket = new EventEmitter()
+    socket.address = () => ({ address: '127.0.0.1', port })
+    socket.send = (bytes, targetPort) => packets.push({ bytes: Buffer.from(bytes), from: port, to: targetPort })
+    socket.close = () => socket.removeAllListeners()
+    sockets.set(port, socket)
+    return socket
+  }
+  const deliver = () => {
+    const packet = packets.shift()
+    assert.ok(packet, 'a normal handshake packet is queued')
+    sockets.get(packet.to)?.emit('message', packet.bytes, { address: '127.0.0.1', port: packet.from })
+  }
+  let readyA = 0
+  let readyB = 0
+  const a = new PeerPunchManager({ networkId: NET_ID, identity: A, clock: clockA, socket: socketAt(41001), onDirectReady: () => readyA++ })
+  const b = new PeerPunchManager({ networkId: NET_ID, identity: B, clock: clockB, socket: socketAt(41002), onDirectReady: () => readyB++ })
+  try {
+    // A has no reachable advertised address for B; B can reach A and A can
+    // reply to B's observed source. Both initial windows expire while offline.
+    a.beginPunch({ peerNodeId: B.nodeId, peerPublicKeyHex: B.publicKeyHex, lanEndpoints: [] })
+    b.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: ['127.0.0.1:41001'] })
+    clockA.advance(1000)
+    clockB.advance(1000)
+    packets.length = 0
+    clockA.advance(59_999)
+    clockB.advance(60_000)
+    deliver() // B's fresh HELLO reaches A just before A's scheduled reprobe.
+    deliver() // A's ACK reaches B; B now has a confirmed path.
+    assert.equal(readyB, 1)
+    clockA.advance(1) // Cross A's old reprobe deadline before B's ACK arrives.
+    for (let budget = 30; packets.length > 0; budget--) {
+      assert.ok(budget > 0, 'normal handshake exchange is finite')
+      deliver()
+    }
+    assert.equal(readyA, 1, 'A must finish the same exchange instead of discarding its pending challenge')
+    assert.ok(a.sessionCiphers(B.nodeId))
+    assert.ok(b.sessionCiphers(A.nodeId))
+  } finally {
+    a.close()
+    b.close()
+    assert.equal(clockA.pendingCount(), 0)
+    assert.equal(clockB.pendingCount(), 0)
+  }
+})
