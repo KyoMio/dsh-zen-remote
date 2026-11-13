@@ -451,6 +451,84 @@ export function deriveClientStatusView(body: ClientStatusBody): ClientConnection
 
 // --- PG-9: the peer status body view ------------------------------------------
 
+// --- PC-14a: the sync-readiness facts ------------------------------------------
+
+/**
+ * The sync block's overall verdict words (PC-14a). `ready` is the LICENSE to
+ * sync — every candidate peer handshake-online, nothing blocked — never a
+ * claim that any concrete session data finished synchronizing.
+ */
+export type PeerSyncStateView = 'ready' | 'partial' | 'not-ready' | 'waiting-peers' | 'ignored' | 'blocked' | 'unconfigured'
+
+const PEER_SYNC_STATES: readonly PeerSyncStateView[] = ['ready', 'partial', 'not-ready', 'waiting-peers', 'ignored', 'blocked', 'unconfigured']
+
+/**
+ * Why the verdict is what it is: `ok` for ready, the gateway admission word
+ * (`gateway-<state>`) for a non-authorized gateway, the concrete blocker
+ * word otherwise. A closed vocabulary — an unknown word degrades to
+ * undefined, never rendered raw. fix1: there is deliberately NO capacity
+ * word — `peers-not-mounted` is the neutral fact (a fresh announcement, a
+ * pending punch, a full cap and a failed mount all look identical to the
+ * snapshot), so the route never claims "capacity" without a proof; the
+ * capacity story stays with the body's own PC-11a fields.
+ */
+export type PeerSyncReasonView =
+  | 'ok'
+  | 'waiting-peers'
+  | 'ignored'
+  | 'identity-mismatch'
+  | 'gateway-connecting'
+  | 'gateway-pending-approval'
+  | 'gateway-mismatch'
+  | 'gateway-paused'
+  | 'gateway-revoked'
+  | 'gateway-offline'
+  | 'peers-not-mounted'
+  | 'peers-not-online'
+  | 'peers-partial'
+  | 'unconfigured'
+
+const PEER_SYNC_REASONS: readonly PeerSyncReasonView[] = [
+  'ok',
+  'waiting-peers',
+  'ignored',
+  'identity-mismatch',
+  'gateway-connecting',
+  'gateway-pending-approval',
+  'gateway-mismatch',
+  'gateway-paused',
+  'gateway-revoked',
+  'gateway-offline',
+  'peers-not-mounted',
+  'peers-not-online',
+  'peers-partial',
+  'unconfigured',
+]
+
+/**
+ * The peer/status body's sync-readiness block (PC-14a): the counts and the
+ * reason word the third wizard light (and any future UI/CLI surface) renders
+ * from. Additive and optional — an older body without the block stays
+ * `undefined`, never guessed from a non-empty peers list; an unknown word or
+ * a junk count degrades field-by-field to unknown.
+ */
+export interface PeerSyncReadinessView {
+  state: PeerSyncStateView | undefined
+  /** Candidates whose pool mount actually completed the remote handshake. */
+  readyCount: number | undefined
+  /** Eligible (not ignored, not mismatched) peers expected to connect. */
+  candidateCount: number | undefined
+  /** Candidates lacking a real pool mount — fresh announcement, pending
+   * punch, a full cap or a failed mount all look identical here (fix1: no
+   * reason to assume which). */
+  unmountedCount: number | undefined
+  /** User-ignored devices — excluded from the candidates, counted aside. */
+  ignoredCount: number | undefined
+  /** Locally blocked identities awaiting the trust decision. */
+  mismatchCount: number | undefined
+  reason: PeerSyncReasonView | undefined
+}
+
 /**
  * The `GET /_dsh/zen-remote/client/peer/status` body as the peer section
  * renders it (PG-9): this machine's node id, the gateway admission state,
@@ -493,6 +571,9 @@ export interface PeerStatusView {
    * cap is unknown — `false` would claim room that may not exist. */
   limitReached: boolean | undefined
   peers: PeerStatusDeviceView[]
+  /** PC-14a: the sync-readiness block (the third light's data). `undefined`
+   * on an older body — never guessed from the peers rows. */
+  sync: PeerSyncReadinessView | undefined
 }
 
 /** One network-device row the peer section renders (wizard's
@@ -569,6 +650,26 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     : listCountable
       ? rawRows.filter((row) => (row as Record<string, unknown>).mounted === true).length
       : undefined
+  // PC-14a: the sync block degrades field-by-field — an absent block (an
+  // older body, a plain-client 503 JSON) stays undefined, an unknown word or
+  // a junk count degrades to unknown; only finite non-negative safe integers
+  // count as counts and only the known enum words pass.
+  const syncRaw = safe.sync !== null && typeof safe.sync === 'object' && !Array.isArray(safe.sync)
+    ? (safe.sync as Record<string, unknown>)
+    : undefined
+  const syncCount = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined
+  const sync = syncRaw === undefined
+    ? undefined
+    : {
+      state: PEER_SYNC_STATES.includes(syncRaw.state as PeerSyncStateView) ? (syncRaw.state as PeerSyncStateView) : undefined,
+      readyCount: syncCount(syncRaw.readyCount),
+      candidateCount: syncCount(syncRaw.candidateCount),
+      unmountedCount: syncCount(syncRaw.unmountedCount),
+      ignoredCount: syncCount(syncRaw.ignoredCount),
+      mismatchCount: syncCount(syncRaw.mismatchCount),
+      reason: PEER_SYNC_REASONS.includes(syncRaw.reason as PeerSyncReasonView) ? (syncRaw.reason as PeerSyncReasonView) : undefined,
+    }
   return {
     configured: safe.configured === true,
     nodeId: asStringSet(safe.nodeId),
@@ -581,6 +682,7 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     mountedCount,
     limitReached: mountedCount !== undefined && maxServers !== undefined ? mountedCount >= maxServers : undefined,
     peers,
+    sync,
   }
 }
 

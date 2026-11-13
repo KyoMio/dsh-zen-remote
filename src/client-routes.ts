@@ -36,7 +36,7 @@ import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js'
 import { buildKeylessInviteUri, isLoopbackOrPrivateHostname, parseGatewayJoinInput } from './peer/crypto.js'
-import type { PeerEngine } from './peer/engine.js'
+import type { PeerEngine, PeerEngineStatus } from './peer/engine.js'
 import type { PeerMemberPath, PeerMemberState } from './peer/engine.js'
 import { responseJson, sameOriginPost } from './http.js'
 import type { BridgeStatus } from './plugin-bridge.js'
@@ -650,6 +650,110 @@ function peerViewPath(state: PeerMemberState, path: PeerMemberPath): 'lan' | 'p2
  * `limitReached` compares the two (an over-cap stock after a downscale
  * stays visible as `true`; the mounts themselves are never evicted).
  */
+// --- PC-14a: the sync-readiness facts ------------------------------------------
+
+/** The sync block's overall verdict (PC-14a): `ready` is the LICENSE to sync —
+ * every candidate peer handshake-online, nothing blocked — never a claim that
+ * any concrete session data finished synchronizing. */
+type PeerSyncState = 'ready' | 'partial' | 'not-ready' | 'waiting-peers' | 'ignored' | 'blocked' | 'unconfigured'
+
+/** The reason word for every non-authorized gateway verdict: the admission
+ * fact itself, prefixed so the field is self-describing downstream. */
+const PEER_GATEWAY_SYNC_REASONS: Readonly<Record<string, string>> = {
+  'connecting': 'gateway-connecting',
+  'pending-approval': 'gateway-pending-approval',
+  'mismatch': 'gateway-mismatch',
+  'paused': 'gateway-paused',
+  'revoked': 'gateway-revoked',
+  'offline': 'gateway-offline',
+}
+
+/**
+ * The peer/status body's additive `sync` object (PC-14a): the structured
+ * readiness facts the third wizard light (and any future UI/CLI surface)
+ * renders from, derived from the SAME engine snapshot and the SAME pool the
+ * rest of the body reads — never a second discovery state machine. No pool
+ * (or one that cannot answer entry lookups — an old test double) means no
+ * honest readiness fact: the field stays absent rather than guessing.
+ *
+ * The counting walks the engine's members and tracks each candidate's REAL
+ * mount through `mountVirtual`'s entryId seam (= the peer nodeId), demanding
+ * the pool's virtual flag: an old client pairing whose handshake happens to
+ * carry the same serverId word shares only the SHAPE (record ids are
+ * `randomBytes(4).hex`) and must never impersonate the mount. A candidate
+ * without a real mount is counted in `unmountedCount` and can never count
+ * ready — fix1: the reason stays the NEUTRAL `peers-not-mounted`, because a
+ * fresh announcement, a pending punch, a full cap or a failed mount all look
+ * identical to this snapshot and no cap-vs-occupancy proof runs here (the
+ * capacity story stays with the body's own PC-11a fields). Actively ignored
+ * devices are excluded from the candidates but keep their own count; a local
+ * TOFU mismatch blocks the whole verdict.
+ *
+ * `ready` speaks ONLY of the remote handshake having completed on every
+ * candidate mount (`client.state === 'online'`) — an empty shared-session
+ * list is perfectly ready. There is deliberately no `synced` fact: nothing
+ * in the engine or pool observes a concrete session data transfer completing.
+ */
+function peerSyncBodyOf(status: PeerEngineStatus, pool: RelayPool | undefined): Record<string, unknown> | undefined {
+  if (pool === undefined) return undefined
+  if (typeof pool.getByEntryId !== 'function' || typeof pool.isVirtual !== 'function') return undefined
+  let readyCount = 0
+  let candidateCount = 0
+  let unmountedCount = 0
+  let ignoredCount = 0
+  let mismatchCount = 0
+  for (const peer of status.peers) {
+    if (peer.state === 'identity-mismatch') {
+      mismatchCount += 1
+      continue
+    }
+    if (peer.state === 'disabled') {
+      ignoredCount += 1
+      continue
+    }
+    candidateCount += 1
+    const view = peer.mounted ? pool.getByEntryId(peer.nodeId) : undefined
+    if (view === undefined || !pool.isVirtual(peer.nodeId)) {
+      unmountedCount += 1
+      continue
+    }
+    if (view.client.state === 'online') readyCount += 1
+  }
+  let state: PeerSyncState
+  let reason: string
+  if (status.networkId === null || status.gatewayState === 'unconfigured') {
+    state = 'unconfigured'
+    reason = 'unconfigured'
+  } else if (status.gatewayState !== 'authorized') {
+    // The gateway admission fact gates the verdict: a stale online client
+    // from before the WS died must never read as ready. The counts stay
+    // honest; the state carries the real reason word.
+    state = 'not-ready'
+    reason = PEER_GATEWAY_SYNC_REASONS[status.gatewayState] ?? 'gateway-offline'
+  } else if (mismatchCount > 0) {
+    state = 'blocked'
+    reason = 'identity-mismatch'
+  } else if (candidateCount === 0 && ignoredCount > 0) {
+    state = 'ignored'
+    reason = 'ignored'
+  } else if (candidateCount === 0) {
+    state = 'waiting-peers'
+    reason = 'waiting-peers'
+  } else if (readyCount === candidateCount) {
+    state = 'ready'
+    reason = 'ok'
+  } else if (readyCount === 0) {
+    state = 'not-ready'
+    // fix1: unmounted covers a fresh announcement, a pending punch, a full
+    // cap or a failed mount alike — the neutral word only, no capacity claim.
+    reason = unmountedCount > 0 ? 'peers-not-mounted' : 'peers-not-online'
+  } else {
+    state = 'partial'
+    reason = unmountedCount > 0 ? 'peers-not-mounted' : 'peers-partial'
+  }
+  return { state, readyCount, candidateCount, unmountedCount, ignoredCount, mismatchCount, reason }
+}
+
 function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Record<string, unknown> {
   const status = engine.status()
   const peers = status.peers.map((peer) => ({
@@ -662,6 +766,7 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
   const gatewayOrigin = options.getPeerNetworkOrigin?.()
   const maxServers = effectiveMaxServers(options.pool, options)
   const mountedCount = status.peers.filter((peer) => peer.mounted).length
+  const sync = peerSyncBodyOf(status, options.pool)
   return {
     configured: status.networkId !== null,
     nodeId: status.nodeId,
@@ -674,6 +779,7 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     mountedCount,
     limitReached: mountedCount >= maxServers,
     peers,
+    ...(sync !== undefined ? { sync } : {}),
   }
 }
 

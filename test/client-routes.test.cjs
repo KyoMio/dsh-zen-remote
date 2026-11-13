@@ -1961,14 +1961,20 @@ test('MS-5: the unpair route constant sits under the client prefix', async () =>
 
 /** A RelayPool stand-in with exactly the surface the client routes consume,
  * recording every mutating call. `entries` is the live array the getters
- * read; `overrides` replaces any method for one scenario. */
+ * read; `overrides` replaces any method for one scenario. PC-14a adds the
+ * virtual-mount discrimination (`virtualIds` + `isVirtual`) the sync facts
+ * read — a scenario stages its virtual mounts there, plain paired entries
+ * stay non-virtual exactly like the real pool's records. */
 function fakePool(entries, overrides = {}) {
   const calls = { pair: [], unpair: [], unpairAll: 0, reconnect: [], probeRestore: 0, deviceName: [] }
+  const virtualIds = new Set(overrides.virtualIds ?? [])
   const pool = {
     calls,
+    virtualIds,
     entries: () => entries,
     getByEntryId: (entryId) => entries.find((entry) => entry.entryId === entryId),
     getByServerId: (serverId) => entries.find((entry) => entry.serverId === serverId),
+    isVirtual: (entryId) => virtualIds.has(entryId),
     pair: async (input) => {
       calls.pair.push(input)
       const existing = entries.find((entry) => entry.serverUrl === input.serverUrl)
@@ -2904,6 +2910,15 @@ function makeRealPoolClientFactory(env) {
     stop() {
       this.stopped = true
     },
+    // PC-14a: simulate a dropped link (or a re-dial caught mid-flight) — the
+    // observable effect a dead mux path has on the real client: the state
+    // word leaves `online`, the handshake fact goes away, listeners hear it.
+    drop(nextState = 'offline') {
+      this.state = nextState
+      this.handshakeInfo = undefined
+      this.lastError = nextState
+      this.notify()
+    },
   })
 }
 
@@ -2990,6 +3005,318 @@ test('PC-11a-fix1 status: a real pool drives both routes to the same capacity fa
   assert.equal(peer.maxServers, pool.maxServers())
   assert.equal(peer.mountedCount, 1, 'the mount stock survives the shrink')
   assert.equal(peer.limitReached, false)
+})
+
+// ---- PC-14a: the sync-readiness facts (the third light's data) ------------------
+// peer/status grows one additive `sync` object derived from the facts the
+// engine and the pool ALREADY hold: which discovered peers are eligible
+// candidates, how many of them have a REAL pool mount (entryId = nodeId, the
+// mountVirtual seam — never an old client pairing that happens to carry the
+// same serverId), and how many of those mounts' clients have actually
+// completed the remote handshake (`client.state === 'online'`). `ready` means
+// "every candidate is handshake-online and nothing is blocked" — the LICENSE
+// to sync, never a claim that any concrete session data finished
+// synchronizing (a peer sharing zero sessions is still perfectly ready), so
+// there is deliberately no `synced` field.
+
+test('PC-14a status: a real pool drives the sync facts live over the HTTP route (online ↔ offline/connecting)', async (t) => {
+  const scratchRoot = path.join(__dirname, '..', '.scratch', 'pc-14a')
+  fs.mkdirSync(scratchRoot, { recursive: true })
+  const dir = fs.mkdtempSync(path.join(scratchRoot, 'sync-'))
+  t.after(() => {
+    try { fs.rmSync(dir, { recursive: true, force: true }) } catch { /* already gone */ }
+  })
+
+  const poolMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'relay-pool.js')).href)
+  // Handshake answers keyed `url|token` — the virtual mounts' placeholder
+  // origins (`http://zr-peer-<nodeId>.virtual|peer-virtual`). bbbb2222 has
+  // none, so its mount's handshake fails exactly like a dead network.
+  const env = new Map([['http://zr-peer-aaaa1111.virtual|peer-virtual', { serverId: 'aaaa1111', serverName: '书房电脑' }]])
+  const pool = poolMod.createRelayPool({
+    stateFile: path.join(dir, 'zen-remote-state.json'),
+    computeOwnFingerprints: () => ({}),
+    createClient: makeRealPoolClientFactory(env),
+    skipPersistedServers: true,
+  })
+  t.after(() => pool.stop())
+
+  const { engine } = makePeerEngine({
+    status: {
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      maxPeers: 8,
+      natType: 'cone',
+      peers: [
+        { nodeId: 'aaaa1111', name: '书房电脑', state: 'eligible', path: 'lan', rttMs: 3, mounted: true },
+        { nodeId: 'bbbb2222', name: '客厅电脑', state: 'eligible', path: 'none', rttMs: null, mounted: true },
+        { nodeId: 'dddd4444', name: '被我忽略的机器', state: 'disabled', path: 'none', rttMs: null, mounted: false },
+      ],
+    },
+  })
+  // The engine's own mount seam (mountPeer verbatim): memory-only virtual
+  // entries keyed by the peer nodeId.
+  const throwFetch = async () => { throw new Error('the fake client never dials a socket') }
+  pool.mountVirtual({ entryId: 'aaaa1111', serverId: 'aaaa1111', serverName: '书房电脑', fetchImpl: throwFetch })
+  pool.mountVirtual({ entryId: 'bbbb2222', serverId: 'bbbb2222', serverName: '客厅电脑', fetchImpl: throwFetch })
+  await settlePool()
+  assert.equal(pool.isVirtual('aaaa1111') && pool.isVirtual('bbbb2222'), true, 'both mounts are virtual pool entries')
+
+  const { server, port } = await startClientServer(makeRow(), { pool, getPeerEngine: () => engine })
+  t.after(() => closeServer(server))
+  const syncOf = async () => {
+    const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(res.status, 200)
+    return JSON.parse(res.body).sync
+  }
+
+  // aaaa1111's mount handshake-online through the real pool client;
+  // bbbb2222's handshake fails → its mount sits offline. One ready of two
+  // candidates is honest PARTIAL; the ignored device counts aside.
+  assert.deepEqual(await syncOf(), {
+    state: 'partial',
+    readyCount: 1,
+    candidateCount: 2,
+    unmountedCount: 0,
+    ignoredCount: 1,
+    mismatchCount: 0,
+    reason: 'peers-partial',
+  })
+  assert.ok(!('synced' in (await syncOf())), 'no fabricated sync-completed signal exists')
+
+  // The second mount recovers (its network came back): the very next read
+  // answers READY — every candidate handshake-online, nothing blocked.
+  env.set('http://zr-peer-bbbb2222.virtual|peer-virtual', { serverId: 'bbbb2222', serverName: '客厅电脑' })
+  assert.equal(pool.getByEntryId('bbbb2222').client.reconnect(), true, 'the offline mount redials')
+  await settlePool()
+  assert.deepEqual(await syncOf(), {
+    state: 'ready',
+    readyCount: 2,
+    candidateCount: 2,
+    unmountedCount: 0,
+    ignoredCount: 1,
+    mismatchCount: 0,
+    reason: 'ok',
+  })
+
+  // The first link drops (mux path dies): the read leaves ready immediately.
+  pool.getByEntryId('aaaa1111').client.drop('offline')
+  assert.deepEqual(await syncOf(), {
+    state: 'partial',
+    readyCount: 1,
+    candidateCount: 2,
+    unmountedCount: 0,
+    ignoredCount: 1,
+    mismatchCount: 0,
+    reason: 'peers-partial',
+  })
+
+  // A re-dial caught mid-flight (`connecting`) is just as little ready.
+  pool.getByEntryId('bbbb2222').client.drop('connecting')
+  assert.deepEqual(await syncOf(), {
+    state: 'not-ready',
+    readyCount: 0,
+    candidateCount: 2,
+    unmountedCount: 0,
+    ignoredCount: 1,
+    mismatchCount: 0,
+    reason: 'peers-not-online',
+  })
+
+  // Recovery rides the SAME real client: back to partial, never stuck.
+  assert.equal(pool.getByEntryId('aaaa1111').client.reconnect(), true)
+  await settlePool()
+  const recovered = await syncOf()
+  assert.equal(recovered.state, 'partial')
+  assert.equal(recovered.readyCount, 1)
+})
+
+test('PC-14a status: the sync state matrix over the engine snapshot and pool client states', async () => {
+  const peer = (nodeId, name, state, mounted) => ({ nodeId, name, state, path: mounted ? 'lan' : 'none', rttMs: mounted ? 2 : null, mounted })
+  const entryOf = (nodeId, name, state) => ({
+    entryId: nodeId,
+    serverId: nodeId,
+    serverName: name,
+    serverUrl: `http://zr-peer-${nodeId}.virtual`,
+    displayName: name,
+    client: fakeRelay({ state }),
+    createdAt: 1,
+  })
+  const engineOf = (peers, gatewayState = 'authorized', networkId = '0123456789abcdef') =>
+    makePeerEngine({ status: { nodeId: 'abcd1234', gatewayState, networkId, maxPeers: 8, natType: 'cone', peers } }).engine
+  const read = async (engine, entries = [], virtualIds = []) => {
+    const pool = fakePool(entries, { virtualIds })
+    const { server, port } = await startClientServer(makeRow(), { pool, getPeerEngine: () => engine })
+    try {
+      const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+      assert.equal(res.status, 200)
+      return JSON.parse(res.body).sync
+    } finally {
+      await closeServer(server)
+    }
+  }
+
+  // 1. Not joined: the whole block reads unconfigured, zero everything.
+  assert.deepEqual(await read(engineOf([], 'unconfigured', null)), {
+    state: 'unconfigured', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'unconfigured',
+  })
+  // 2. Joined and authorized, nobody else on the network yet: waiting for
+  //    other devices — NOT a sync completion.
+  assert.deepEqual(await read(engineOf([])), {
+    state: 'waiting-peers', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'waiting-peers',
+  })
+  // 3. Every discovered device actively ignored: an explicit ignored verdict,
+  //    not a wait and never a success.
+  assert.deepEqual(
+    await read(engineOf([peer('aaaa1111', '书房电脑', 'disabled', false), peer('bbbb2222', '客厅电脑', 'disabled', false)])),
+    { state: 'ignored', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 2, mismatchCount: 0, reason: 'ignored' },
+  )
+  // 4. Eligible peers but no real mount, while the LOCAL cap has room (the
+  //    pool answers 8, nothing is mounted): the route knows only "not
+  //    mounted" — freshly discovered, punch pending, a full cap or a failed
+  //    mount all look identical here, so the reason must stay NEUTRAL and
+  //    never claim capacity without a cap-vs-occupancy proof (fix1).
+  assert.deepEqual(
+    await read(engineOf([peer('aaaa1111', '书房电脑', 'eligible', false), peer('bbbb2222', '客厅电脑', 'eligible', false)])),
+    { state: 'not-ready', readyCount: 0, candidateCount: 2, unmountedCount: 2, ignoredCount: 0, mismatchCount: 0, reason: 'peers-not-mounted' },
+  )
+  // 5. Every candidate handshake-online through its pool mount: ready — the
+  //    license to sync.
+  assert.deepEqual(
+    await read(
+      engineOf([peer('aaaa1111', '书房电脑', 'eligible', true), peer('bbbb2222', '客厅电脑', 'eligible', true)]),
+      [entryOf('aaaa1111', '书房电脑', 'online'), entryOf('bbbb2222', '客厅电脑', 'online')],
+      ['aaaa1111', 'bbbb2222'],
+    ),
+    { state: 'ready', readyCount: 2, candidateCount: 2, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'ok' },
+  )
+  // 6. Mixed: some online, some not — honest partial, never all-green.
+  assert.deepEqual(
+    await read(
+      engineOf([peer('aaaa1111', '书房电脑', 'eligible', true), peer('bbbb2222', '客厅电脑', 'eligible', true)]),
+      [entryOf('aaaa1111', '书房电脑', 'online'), entryOf('bbbb2222', '客厅电脑', 'offline')],
+      ['aaaa1111', 'bbbb2222'],
+    ),
+    { state: 'partial', readyCount: 1, candidateCount: 2, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'peers-partial' },
+  )
+  // 6b. fix1: one mount online, ANOTHER candidate not mounted at all — with
+  //     room under the cap this is still just partial; an unmounted peer must
+  //     never be dressed up as a capacity verdict.
+  assert.deepEqual(
+    await read(
+      engineOf([peer('aaaa1111', '书房电脑', 'eligible', true), peer('bbbb2222', '客厅电脑', 'eligible', false)]),
+      [entryOf('aaaa1111', '书房电脑', 'online')],
+      ['aaaa1111'],
+    ),
+    { state: 'partial', readyCount: 1, candidateCount: 2, unmountedCount: 1, ignoredCount: 0, mismatchCount: 0, reason: 'peers-not-mounted' },
+  )
+  // 7. A local TOFU mismatch blocks the whole verdict even while the rest
+  //    rides online — the trust decision is the real state.
+  assert.deepEqual(
+    await read(
+      engineOf([peer('aaaa1111', '书房电脑', 'eligible', true), peer('cccc3333', '换了钥的机器', 'identity-mismatch', false)]),
+      [entryOf('aaaa1111', '书房电脑', 'online')],
+      ['aaaa1111'],
+    ),
+    { state: 'blocked', readyCount: 1, candidateCount: 1, unmountedCount: 0, ignoredCount: 0, mismatchCount: 1, reason: 'identity-mismatch' },
+  )
+  // 8. The historical-pool trap: the gateway WS is gone but the mounts'
+  //    clients still read online. The counts stay honest; the STATE must not
+  //    claim ready off stale pool facts.
+  assert.deepEqual(
+    await read(
+      engineOf([peer('aaaa1111', '书房电脑', 'eligible', true)], 'offline'),
+      [entryOf('aaaa1111', '书房电脑', 'online')],
+      ['aaaa1111'],
+    ),
+    { state: 'not-ready', readyCount: 1, candidateCount: 1, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'gateway-offline' },
+  )
+  // 9. Every other non-authorized gateway verdict keeps its own reason word
+  //    (the members are gone by then — the engine clears them).
+  for (const [gatewayState, reason] of [
+    ['connecting', 'gateway-connecting'],
+    ['pending-approval', 'gateway-pending-approval'],
+    ['mismatch', 'gateway-mismatch'],
+    ['paused', 'gateway-paused'],
+    ['revoked', 'gateway-revoked'],
+  ]) {
+    const sync = await read(engineOf([], gatewayState))
+    assert.deepEqual(sync, {
+      state: 'not-ready', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason,
+    }, gatewayState)
+  }
+})
+
+test('PC-14a status: only real virtual mounts count — an old client pairing never impersonates a peer', async (t) => {
+  const scratchRoot = path.join(__dirname, '..', '.scratch', 'pc-14a')
+  fs.mkdirSync(scratchRoot, { recursive: true })
+  const dir = fs.mkdtempSync(path.join(scratchRoot, 'impersonation-'))
+  t.after(() => {
+    try { fs.rmSync(dir, { recursive: true, force: true }) } catch { /* already gone */ }
+  })
+
+  const poolMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'relay-pool.js')).href)
+  // A persisted DSH pairing whose handshake reports serverId 'aaaa1111' —
+  // the SAME word as the peer nodeId. Persisted record ids are
+  // randomBytes(4).hex (the same SHAPE as a nodeId), so only the virtual-flag
+  // discrimination can tell the two apart.
+  const env = new Map([
+    ['http://10.7.0.9:3088|tok-old', { serverId: 'aaaa1111', serverName: '旧配对' }],
+  ])
+  const pool = poolMod.createRelayPool({
+    stateFile: path.join(dir, 'zen-remote-state.json'),
+    computeOwnFingerprints: () => ({}),
+    createClient: makeRealPoolClientFactory(env),
+  })
+  t.after(() => pool.stop())
+  const paired = await pool.pair({ serverUrl: 'http://10.7.0.9:3088', token: 'tok-old' })
+  assert.equal(paired.ok, true)
+  const mounted = pool.mountVirtual({ entryId: 'aaaa1111', serverId: 'aaaa1111', serverName: '书房电脑', fetchImpl: async () => { throw new Error('unused') } })
+  await settlePool()
+  assert.equal(pool.getByEntryId('aaaa1111').entryId, 'aaaa1111', 'the entryId seam resolves the VIRTUAL mount, not the paired record')
+  assert.equal(pool.isVirtual('aaaa1111'), true)
+  assert.notEqual(paired.entry.entryId, 'aaaa1111', 'the paired record keeps its own random id')
+  assert.equal(paired.entry.client.state, 'online', 'the old pairing is handshake-online — exactly the impersonation bait')
+  assert.equal(mounted.client.state, 'offline', 'the virtual mount has no network yet')
+
+  const { engine } = makePeerEngine({
+    status: {
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      maxPeers: 8,
+      natType: 'cone',
+      peers: [{ nodeId: 'aaaa1111', name: '书房电脑', state: 'eligible', path: 'none', rttMs: null, mounted: true }],
+    },
+  })
+  const { server, port } = await startClientServer(makeRow(), { pool, getPeerEngine: () => engine })
+  t.after(() => closeServer(server))
+  const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+  assert.equal(res.status, 200)
+  // The ONLINE old pairing must not impersonate the offline peer mount:
+  // ready reads the virtual client (offline), so the verdict is not-ready.
+  assert.deepEqual(JSON.parse(res.body).sync, {
+    state: 'not-ready',
+    readyCount: 0,
+    candidateCount: 1,
+    unmountedCount: 0,
+    ignoredCount: 0,
+    mismatchCount: 0,
+    reason: 'peers-not-online',
+  })
+})
+
+test('PC-14a status: no pool wired keeps the old body shape (no sync facts, no guessing)', async () => {
+  const { engine } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal('sync' in body, false, 'without a pool there is no honest readiness fact — the field stays absent')
+  } finally {
+    await closeServer(server)
+  }
 })
 
 test('PG-9 join: a valid invite reaches joinNetwork verbatim; a bad one never leaves the route', async () => {
