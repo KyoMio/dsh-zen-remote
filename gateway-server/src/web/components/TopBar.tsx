@@ -7,7 +7,8 @@ import { useCallback, useEffect, useRef } from 'react';
 import type { KeyboardEvent } from 'react';
 
 import type { TranslateFn } from '../i18n/locales';
-import type { NetworkView, PublicUser, UiLocalState } from '../store/console-store';
+import { deriveNetworkCounts } from '../store/console-store';
+import type { NetworkView, PublicUser, TopologySnapshot, UiLocalState } from '../store/console-store';
 
 export type ViewKind = 'networks' | 'admin';
 
@@ -15,6 +16,8 @@ export interface TopBarProps {
   t: TranslateFn;
   user: PublicUser;
   networks: NetworkView[];
+  /** 全部拓扑切片（PC-20）：当前网络的计数改由它的 SSE 快照事实派生，其余网络回落 REST 值 */
+  topology: Readonly<Record<string, TopologySnapshot>>;
   selectedNetworkId: string | null;
   onSelectNetwork: (id: string) => void;
   onCreateNetwork: () => void;
@@ -107,7 +110,7 @@ function BrandMark() {
 }
 
 export function TopBar(props: TopBarProps) {
-  const { t, user, networks, selectedNetworkId, onSelectNetwork, onCreateNetwork, view, onChangeView } = props;
+  const { t, user, networks, topology, selectedNetworkId, onSelectNetwork, onCreateNetwork, view, onChangeView } = props;
   const { theme, onToggleTheme, onToggleLocale, onLogout, ui, onUi } = props;
 
   const closeSwitcher = useCallback(() => onUi({ networkSwitcherOpen: false }), [onUi]);
@@ -128,6 +131,18 @@ export function TopBar(props: TopBarProps) {
 
   const selected = networks.find((n) => n.id === selectedNetworkId) ?? null;
 
+  // PC-20：当前网络的计数跟随它的 SSE 快照事实（SSE 合并只进 topology 切片，
+  // 这里按既有字段口径现算，不回写 networks）；没快照的网络保持 REST 值。
+  const selectedSnapshot = selectedNetworkId !== null ? topology[selectedNetworkId] : undefined;
+
+  /** 一行的计数与上限：选中网络用快照派生，其余网络保持 REST 拉到的值 */
+  const rowCounts = (network: NetworkView): { totalDevices: number; maxPeers: number } => {
+    const snapshot = network.id === selectedNetworkId ? selectedSnapshot : undefined;
+    const counts = deriveNetworkCounts(network, snapshot);
+    return { totalDevices: counts.totalDevices, maxPeers: snapshot?.network.maxPeers ?? network.maxPeers };
+  };
+  const selectedCounts = selected !== null ? rowCounts(selected) : null;
+
   return (
     <header className="topbar">
       <BrandMark />
@@ -147,9 +162,9 @@ export function TopBar(props: TopBarProps) {
             onClick={toggleSwitcher}
           >
             <span className="net-switcher-name">{selected !== null ? selected.name : t('nav.networks')}</span>
-            {selected !== null && (
+            {selected !== null && selectedCounts !== null && (
               <span className="net-switcher-count mono" title={`${t('network.devices')} / ${t('network.deviceLimit')}`}>
-                {selected.totalDevices}/{selected.maxPeers}
+                {selectedCounts.totalDevices}/{selectedCounts.maxPeers}
               </span>
             )}
             <span className="chevron" aria-hidden="true">
@@ -161,6 +176,7 @@ export function TopBar(props: TopBarProps) {
             <div className="menu menu-switcher" role="menu" ref={switcher.menuRef} onKeyDown={switcher.onKeyDown}>
               {networks.map((network) => {
                 const isCurrent = network.id === selectedNetworkId;
+                const counts = rowCounts(network);
                 return (
                   <button
                     key={network.id}
@@ -182,7 +198,7 @@ export function TopBar(props: TopBarProps) {
                       className="menu-item-count mono"
                       title={`${t('network.devices')} / ${t('network.deviceLimit')}`}
                     >
-                      {network.totalDevices}/{network.maxPeers}
+                      {counts.totalDevices}/{counts.maxPeers}
                     </span>
                   </button>
                 );

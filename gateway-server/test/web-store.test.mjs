@@ -27,10 +27,12 @@ import {
   ConsoleApiError,
   ConsoleClient,
   ConsoleStore,
+  ManagedRefreshCycle,
   applyNetworks,
   applySession,
   applyTopologySnapshot,
   createInitialState,
+  deriveNetworkCounts,
   patchUiState,
   setLoggedOut,
 } from '../dist/web/store/console-store.js';
@@ -978,5 +980,220 @@ describe('clipboard：非安全上下文 HTTP 剪贴板回退（回归修复）'
   test('标准 API 与 DOM 均不可用时返回 false，绝不抛未捕获异常', async () => {
     const ok = await copyTextToClipboard('test', { navigator: {} });
     assert.equal(ok, false);
+  });
+});
+
+// ---------------------------------------------------------------- PC-20：顶栏 SSE 计数派生与管理页刷新循环
+
+describe('PC-20：顶栏计数沿当前网络 SSE 快照派生', () => {
+  test('快照在场按快照口径计数（占席=authorized+paused+mismatch）；无快照或串网快照回落 REST 值', () => {
+    const netA = 'a'.repeat(16);
+    const view = makeNetworkView(netA, '家里', { onlineDevices: 1, totalDevices: 3, pendingCount: 0 });
+    // 未订阅/未首推：保持 REST 拉到的值（没订阅的网络不假称实时）
+    assert.deepEqual(deriveNetworkCounts(view, undefined), { totalDevices: 3, onlineDevices: 1, pendingCount: 0 });
+
+    const snap = makeSnapshot(netA, {
+      summary: { onlineDevices: 2, pendingCount: 1, totalLiveRelayKbps: 4 },
+      members: [
+        makeMember('m1', 'authorized'),
+        makeMember('m2', 'paused', { online: false }),
+        makeMember('m3', 'mismatch', { online: false }),
+        makeMember('m4', 'pending'),
+        makeMember('m5', 'revoked', { online: false }),
+      ],
+    });
+    // 与 REST NetworkView 字段同口径：占席 3（pending/revoked 不占席）、在线 2、待审批 1
+    assert.deepEqual(deriveNetworkCounts(view, snap), { totalDevices: 3, onlineDevices: 2, pendingCount: 1 });
+
+    // 串网防护：别的网络的快照塞给本网视图 → 不采信，回落 REST
+    const snapB = makeSnapshot('b'.repeat(16), {
+      summary: { onlineDevices: 99, pendingCount: 99, totalLiveRelayKbps: 0 },
+      members: [],
+    });
+    assert.deepEqual(deriveNetworkCounts(view, snapB), { totalDevices: 3, onlineDevices: 1, pendingCount: 0 });
+  });
+
+  test('切网后旧流迟到：旧网快照只进旧网切片，新网的派生计数不被串改', () => {
+    const netA = 'a'.repeat(16);
+    const netB = 'b'.repeat(16);
+    let state = applyNetworks(createInitialState(), [makeNetworkView(netA, '家里'), makeNetworkView(netB, '办公室')]);
+    state = applyTopologySnapshot(state, makeSnapshot(netA));
+    const snapB = makeSnapshot(netB, { summary: { onlineDevices: 5, pendingCount: 0, totalLiveRelayKbps: 0 }, members: [] });
+    state = applyTopologySnapshot(state, snapB);
+    const viewB = state.networks.find((n) => n.id === netB);
+    const beforeB = deriveNetworkCounts(viewB, state.topology[netB]);
+    assert.deepEqual(beforeB, { totalDevices: 0, onlineDevices: 5, pendingCount: 0 });
+
+    // 已切到 B 后 A 的旧事件迟到：只改 A 自己的切片
+    const lateA = makeSnapshot(netA, { summary: { onlineDevices: 42, pendingCount: 42, totalLiveRelayKbps: 0 } });
+    const next = applyTopologySnapshot(state, lateA);
+    assert.equal(next.topology[netB], snapB, 'B 的切片引用不变');
+    assert.deepEqual(
+      deriveNetworkCounts(next.networks.find((n) => n.id === netB), next.topology[netB]),
+      beforeB,
+      'B 的顶栏派生计数不被旧网迟到事件串改',
+    );
+    assert.equal(
+      deriveNetworkCounts(next.networks.find((n) => n.id === netA), next.topology[netA]).onlineDevices,
+      42,
+      'A 的事实照常进 A 自己的切片',
+    );
+  });
+});
+
+describe('PC-20 fix1：管理页刷新循环（固定节拍、在途取消）', () => {
+  /** 假定时器：固定节拍用原生 interval 语义，记录注册、手动触发；cancel 即摘除 */
+  function fakeRefreshTimers() {
+    const intervals = new Map();
+    let nextHandle = 1;
+    return {
+      interval(handler, ms) {
+        const handle = nextHandle;
+        nextHandle += 1;
+        intervals.set(handle, { handler, ms });
+        return handle;
+      },
+      cancel(handle) {
+        intervals.delete(handle);
+      },
+      get intervalCount() {
+        return intervals.size;
+      },
+      soleIntervalMs() {
+        assert.equal(intervals.size, 1, `应恰好一张挂起 interval，实际 ${intervals.size}`);
+        return [...intervals.values()][0].ms;
+      },
+      fireInterval() {
+        assert.equal(intervals.size, 1, `应恰好一张挂起 interval，实际 ${intervals.size}`);
+        [...intervals.values()][0].handler();
+      },
+    };
+  }
+
+  /** 放完所有挂起的微任务，让挂起拍的后半段（isCurrent 核对 / settle）跑完 */
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+  test('start 立即拉一次并注册固定 3s interval；收拍不排下一拍（固定格点驱动）；忙碌格点跳过不叠加；stop 清 interval', async () => {
+    const timers = fakeRefreshTimers();
+    const tickets = [];
+    let releaseFirst;
+    const cycle = new ManagedRefreshCycle({
+      intervalMs: 3000,
+      timers,
+      load: async (ticket) => {
+        tickets.push(ticket);
+        if (tickets.length === 1) await new Promise((resolve) => { releaseFirst = resolve; }); // 首拍挂起，模拟 2s 慢响应
+        ticket.settle();
+      },
+    });
+
+    cycle.start();
+    assert.equal(tickets.length, 1, 'start 立即拉一次');
+    assert.equal(timers.intervalCount, 1, '整个运行期恰好一张 interval');
+    assert.equal(timers.soleIntervalMs(), 3000);
+    cycle.start();
+    assert.equal(tickets.length, 1, '已在跑的循环重复 start 不叠加立即拍');
+
+    // 首拍挂起期间的第 3 秒格点：忙碌跳过，不叠加请求
+    timers.fireInterval();
+    assert.equal(tickets.length, 1, '在途未收拍时格点拍必须跳过（慢响应不叠加）');
+
+    // 慢响应收拍：不得触发下一拍——固定 3s 格点是唯一驱动（fix1 R3）
+    releaseFirst();
+    await flush();
+    assert.equal(tickets.length, 1, '收拍不得立刻排下一拍（否则节拍变成 响应耗时+3s）');
+    assert.equal(timers.intervalCount, 1, '收拍不得重排/新增 interval');
+
+    // 下一个 3s 格点照常起拍：节拍不因响应耗时漂移
+    timers.fireInterval();
+    assert.equal(tickets.length, 2, '下一格点起拍');
+    assert.equal(tickets[1].signal.aborted, false, '新拍的取消信号未触发');
+
+    cycle.stop();
+    assert.equal(timers.intervalCount, 0, 'stop 清掉 interval');
+  });
+
+  test('stop abort 在途 signal、其迟到结果不落库；重开新信号立即拍；反复停开不累积活动请求', async () => {
+    const timers = fakeRefreshTimers();
+    const tickets = [];
+    const applied = [];
+    const gates = [];
+    const cycle = new ManagedRefreshCycle({
+      intervalMs: 3000,
+      timers,
+      load: async (ticket) => {
+        tickets.push(ticket);
+        if (gates.length > 0) await new Promise((resolve) => gates.shift()(resolve));
+        if (ticket.isCurrent()) applied.push(tickets.length);
+        ticket.settled = true; // 测试标记：settle 过的拍不再「在途」
+        ticket.settle();
+      },
+    });
+
+    // 第一拍挂起
+    let releaseFirst;
+    gates.push((resolve) => {
+      releaseFirst = resolve;
+    });
+    cycle.start();
+    assert.equal(tickets[0].signal.aborted, false, '运行中的拍不该被取消');
+
+    // stop：清 interval + abort 在途请求（fix1 R2：只作废结果不够，旧请求不能永久留在后台）
+    cycle.stop();
+    assert.equal(tickets[0].signal.aborted, true, 'stop 必须 abort 在途请求');
+    assert.equal(timers.intervalCount, 0, 'stop 清掉 interval');
+
+    // 被取消拍若仍迟到（不可取消的底层兜底场景）：世代守卫挡住，不落库
+    releaseFirst();
+    await flush();
+    assert.deepEqual(applied, [], '被取消世代的迟到结果不得落库');
+
+    // 重开：立即新拍、新 signal 未取消
+    cycle.start();
+    assert.equal(tickets.length, 2, '重开立即拉新的一拍');
+    assert.equal(timers.intervalCount, 1, '重开重新注册 interval');
+    assert.equal(tickets[1].signal.aborted, false, '新世代用新 signal');
+    assert.deepEqual(applied, [2], '新世代结果落库');
+
+    // 反复停开：旧信号全部 aborted，任意时刻至多一个未取消的活动请求
+    let releaseThird;
+    gates.push((resolve) => {
+      releaseThird = resolve;
+    });
+    timers.fireInterval();
+    assert.equal(tickets.length, 3, '格点拍拉第三拍');
+    cycle.stop();
+    cycle.start();
+    assert.equal(tickets.length, 4, '旧世代在途不挡新一代立即拍');
+    assert.equal(tickets[2].signal.aborted, true, '第三拍被 stop 取消');
+    assert.equal(tickets[3].signal.aborted, false);
+    releaseThird();
+    await flush();
+    assert.deepEqual(applied, [2, 4], '第三拍（旧世代）不落库，第四拍（当前世代）落库');
+    // R2 累积防护：被 stop 终止的世代其在途 signal 都已 abort（底层请求会被取消，
+    // 不永久留在后台）；不存在既未收拍又未取消的悬挂请求
+    assert.equal(tickets[0].signal.aborted, true, '第一拍被第一次 stop 取消');
+    assert.equal(tickets[2].signal.aborted, true, '第三拍被第二次 stop 取消');
+    assert.deepEqual(tickets.filter((t) => !t.settled && !t.signal.aborted), [], '不得存在既未收拍又未取消的悬挂请求');
+    cycle.stop();
+    // 第四拍已在 start#3 同步收拍（无东西可取消，signal 保持未取消是正确行为）；
+    // 在途拍被 stop 取消已由第一/第三拍断言覆盖
+    assert.deepEqual(tickets.filter((t) => !t.settled && !t.signal.aborted), [], '收尾后无悬挂请求');
+  });
+});
+
+describe('PC-20 fix1：ConsoleClient 把 AbortSignal 透传给底层 fetch', () => {
+  test('adminListUsers(signal) 原样透传；不传时保持旧行为', async () => {
+    const { calls, impl } = fakeFetch(() => jsonEnvelope(200, { ok: true, data: [] }));
+    const client = new ConsoleClient({ fetchImpl: impl });
+    const controller = new AbortController();
+
+    await client.adminListUsers(controller.signal);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, '/api/v1/admin/users');
+    assert.equal(calls[0].init.signal, controller.signal, 'signal 必须原样传给底层 fetch（停表时真取消）');
+
+    await client.adminListUsers();
+    assert.equal(calls[1].init.signal, undefined, '不传 signal 保持旧行为');
   });
 });

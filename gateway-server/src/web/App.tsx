@@ -14,7 +14,7 @@ import { TopBar } from './components/TopBar';
 import type { ViewKind } from './components/TopBar';
 import { LOCALE_STORAGE_KEY, resolveLocale, translate } from './i18n/locales';
 import type { Locale, LocaleKey, TranslateVars } from './i18n/locales';
-import { ConsoleApiError, ConsoleClient, ConsoleStore } from './store/console-store';
+import { ConsoleApiError, ConsoleClient, ConsoleStore, ManagedRefreshCycle } from './store/console-store';
 import type { MemberAction, SessionMeta, SystemSettings, UiLocalState } from './store/console-store';
 
 const client = new ConsoleClient();
@@ -22,6 +22,9 @@ const store = new ConsoleStore();
 
 const THEME_STORAGE_KEY = 'zen-remote-console.theme';
 type Theme = 'light' | 'dark';
+
+/** 管理页在线数/速率的 REST 刷新周期（PC-20） */
+const ADMIN_REFRESH_INTERVAL_MS = 3000;
 
 function readStoredTheme(): Theme {
   try {
@@ -186,24 +189,59 @@ export function App() {
     };
   }, [signedIn, selectedNetworkId, refreshTopology]);
 
-  // 网关管理页数据：进入视图拉一次；之后的刷新由各动作回调负责
+  // 网关管理页系统设置（配额）：进入视图拉一次，之后的更新由配额动作的 PATCH
+  // 返回值负责（fix1 R1：3 秒轮询只刷在线数/速率——配额是慢变配置，轮询它反而
+  // 会让正在编辑的开关/输入在两次击键之间被服务端旧值回写）。
   const isAdmin = state.session !== null && state.session.user.role === 'admin';
   useEffect(() => {
     if (view !== 'admin' || !isAdmin) return;
     let cancelled = false;
     void (async () => {
       try {
-        const [settings, users] = await Promise.all([client.adminGetSettings(), client.adminListUsers()]);
-        if (!cancelled) {
-          store.applyAdminSettings(settings);
-          store.applyAdminUsers(users);
-        }
+        const settings = await client.adminGetSettings();
+        if (!cancelled) store.applyAdminSettings(settings);
       } catch {
         /* 下次进入视图再拉 */
       }
     })();
     return () => {
       cancelled = true;
+    };
+  }, [view, isAdmin]);
+
+  // 管理页在线数/速率（PC-20 fix1）：当前视图 + document 可见 + 已登录管理员时，
+  // 固定 3 秒格点轮询 users——原生 interval + 忙碌跳过，慢响应不打漂节拍、不叠加。
+  // 隐藏/离开视图/退出登录停表并 abort 在途请求（旧请求不能永久留在后台）；
+  // 世代守卫兜底不可取消的迟响应。回到可见立即补一次再恢复固定节拍。
+  // 配额弹窗打开期间照常刷新（QuotaModal 的草稿是自身 useState，不随 props 重置）。
+  useEffect(() => {
+    if (view !== 'admin' || !isAdmin) return;
+    const cycle = new ManagedRefreshCycle({
+      intervalMs: ADMIN_REFRESH_INTERVAL_MS,
+      timers: {
+        interval: (handler, ms) => setInterval(handler, ms),
+        cancel: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
+      },
+      load: async (ticket) => {
+        try {
+          const users = await client.adminListUsers(ticket.signal);
+          if (ticket.isCurrent()) store.applyAdminUsers(users);
+        } catch {
+          /* 单拍失败或被取消不致命：settle 清在途标记，固定节拍照常继续 */
+        } finally {
+          ticket.settle();
+        }
+      },
+    });
+    const syncToVisibility = (): void => {
+      if (document.visibilityState === 'visible') cycle.start();
+      else cycle.stop();
+    };
+    syncToVisibility();
+    document.addEventListener('visibilitychange', syncToVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', syncToVisibility);
+      cycle.stop();
     };
   }, [view, isAdmin]);
 
@@ -448,6 +486,7 @@ export function App() {
         t={t}
         user={state.session.user}
         networks={state.networks}
+        topology={state.topology}
         selectedNetworkId={selectedNetworkId}
         onSelectNetwork={setSelectedNetworkId}
         onCreateNetwork={handleCreateNetworkOpen}
