@@ -334,8 +334,15 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     // r:c3b0734019c7. Mixed rc.1/rc.2 pairs report `session` (and files,
     // subagent, job, events) as different, never a hard refuse.
     '0.2.2-rc.2': 'r:c3b0734019c7',
+    // 0.2.2-rc.3: typert.remote-client.js is byte-identical to rc.2 (27
+    // endpoints, same ids and order). Host typert only adds the
+    // deepseekChatImport/owner-only error detail, which is not part of the
+    // remote fingerprint. Live hash against the npm 0.2.2-rc.3 closure is
+    // still r:c3b0734019c7. Other groups are likewise unchanged. npm latest
+    // remains 0.2.2-rc.1.
+    '0.2.2-rc.3': 'r:c3b0734019c7',
   }
-  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27, '0.2.2-rc.1': 27, '0.2.2-rc.2': 27 }
+  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27, '0.2.2-rc.1': 27, '0.2.2-rc.2': 27, '0.2.2-rc.3': 27 }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
   const remote = await import('../node_modules/@deepseek-ai/dsh-api-session-controller/lib/typert.remote-client.js')
