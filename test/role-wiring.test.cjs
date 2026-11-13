@@ -656,6 +656,127 @@ test('MS-5: the client role builds the relay pool over the state file, migrates 
   }
 })
 
+// ---- PC-09: the client role ignores any residual peer network cap --------
+// A former peer life leaves `peerNetwork` (with its gateway cap) in the
+// shared state file ON PURPOSE — switching back must find it intact. The
+// CLIENT pairing cap therefore comes from the local configuration alone,
+// decided at the composition root (the pool has no role concept); these
+// tests drive the real apply() wiring, never a hand-built pool.
+
+/** Seed one valid `peerNetwork` block (state-store's normalizePeerNetwork
+ * contract: three non-empty strings + a finite joinedAt) with an optional
+ * residual gateway cap, plus an optional client-era paired server. */
+function seedPeerNetwork(stateFile, { maxPeersFromGateway, withPairedServer = false } = {}) {
+  const state = {
+    version: 1,
+    peerNetwork: {
+      gatewayWsUrl: 'ws://127.0.0.1:9/peer/v1/ws',
+      gatewayHttpOrigin: 'http://127.0.0.1:9',
+      networkId: '0123456789abcdef',
+      joinedAt: 1,
+      ...(maxPeersFromGateway !== undefined ? { maxPeersFromGateway } : {}),
+    },
+  }
+  if (withPairedServer) {
+    state.servers = [{ id: 'deadbeef01', serverUrl: 'http://127.0.0.1:9', token: 'tok-pc09', createdAt: 1 }]
+  }
+  fs.writeFileSync(stateFile, JSON.stringify(state))
+}
+
+test('PC-09: a client row ignores any residual peer network cap — the pairing cap is the local config alone', async () => {
+  const index = await import(INDEX_URL)
+  const stateFile = path.join(TEMP_HOME, 'zen-remote-state.json')
+  try {
+    // Whatever gateway cap the state file remembers (2/16/64), a client row
+    // answers its OWN configuration: the default layer stays at 8 instead of
+    // cap-minus-self (1/15/63).
+    for (const residual of [2, 16, 64]) {
+      seedPeerNetwork(stateFile, { maxPeersFromGateway: residual })
+      const { ctx, effects } = makeCtx()
+      index.apply(ctx, { role: 'client' })
+      try {
+        const pool = index.getRelayPool()
+        assert.ok(pool, `client apply built the pool (residual ${residual})`)
+        assert.equal(pool.maxServers(), 8, `residual maxPeersFromGateway ${residual} must not override the default 8`)
+      } finally {
+        for (const stop of effects) stop()
+      }
+    }
+    // An explicitly chosen row cap answers alone too — neither raised toward
+    // nor lowered by the leftover network fact.
+    seedPeerNetwork(stateFile, { maxPeersFromGateway: 16 })
+    const { ctx, effects } = makeCtx()
+    index.apply(ctx, { role: 'client', maxServers: 20 })
+    try {
+      assert.equal(index.getRelayPool()?.maxServers(), 20, 'an explicit row cap answers alone in client mode')
+    } finally {
+      for (const stop of effects) stop()
+    }
+  } finally {
+    fs.rmSync(stateFile, { force: true })
+  }
+})
+
+test('PC-09: peer→client→peer keeps the pairing and network records; the peer side still rides the live network cap and its explicit local min', async () => {
+  const index = await import(INDEX_URL)
+  const { writePeerNetwork } = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'state-store.js')).href)
+  const stateFile = path.join(TEMP_HOME, 'zen-remote-state.json')
+  // One client-era pairing and one joined network (cap 16): the machine
+  // switched peer→client without leaving the network.
+  seedPeerNetwork(stateFile, { maxPeersFromGateway: 16, withPairedServer: true })
+  try {
+    // 1st leg — client: the leftover network fact stays out of the cap.
+    {
+      const { ctx, effects } = makeCtx()
+      index.apply(ctx, { role: 'client' })
+      try {
+        assert.equal(index.getRelayPool()?.maxServers(), 8, 'client leg answers the default 8')
+      } finally {
+        for (const stop of effects) stop()
+      }
+    }
+    const afterClient = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    assert.equal(afterClient.servers?.length, 1, 'the old pairing survived the client leg')
+    assert.equal(afterClient.peerNetwork?.maxPeersFromGateway, 16, 'the network record survived the client leg')
+
+    // 2nd leg — peer: the network cap applies again (16 - self = 15), an
+    // explicit row min still lowers it, and a fresh gateway announcement
+    // (the engine rewrites the state block on welcome/roster — the same
+    // writePeerNetwork call) moves the live answer: the PC-08b hot update
+    // is intact on the re-joined row.
+    {
+      const { ctx, effects } = makeCtx()
+      index.apply(ctx, { role: 'peer', maxServers: 10 })
+      const pool = index.getRelayPool()
+      assert.ok(pool, 'peer apply built the pool')
+      try {
+        assert.equal(pool.maxServers(), 10, 'peer leg: min(explicit 10, network 15)')
+        const net = JSON.parse(fs.readFileSync(stateFile, 'utf8')).peerNetwork
+        writePeerNetwork(stateFile, { ...net, maxPeersFromGateway: 4 })
+        assert.equal(pool.maxServers(), 3, 'peer leg: the live announcement moves the cap under the explicit min')
+      } finally {
+        for (const stop of effects) stop()
+      }
+    }
+
+    // 3rd leg — client again: back to the local cap alone, records intact.
+    {
+      const { ctx, effects } = makeCtx()
+      index.apply(ctx, { role: 'client' })
+      try {
+        assert.equal(index.getRelayPool()?.maxServers(), 8, 'the second client leg answers 8 again')
+      } finally {
+        for (const stop of effects) stop()
+      }
+    }
+    const afterPeer = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    assert.equal(afterPeer.servers?.length, 1, 'the old pairing survived the peer leg')
+    assert.equal(afterPeer.peerNetwork?.maxPeersFromGateway, 4, 'the network record survived the peer leg')
+  } finally {
+    fs.rmSync(stateFile, { force: true })
+  }
+})
+
 test('T22c-fix: the captured session/event listener refreshes the shared table and ignores id-less sessions', async () => {
   const index = await import(INDEX_URL)
   // MS-1 automatic migration, still verified end to end through apply(): the

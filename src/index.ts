@@ -1573,7 +1573,15 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     const maxServersCap = (): number => resolveConfig(config, readFileConfig(), process.env).values.maxServers
     const maxServersSource = (): ReturnType<typeof resolveConfig>['sources']['maxServers'] =>
       resolveConfig(config, readFileConfig(), process.env).sources.maxServers
-    const peerNetworkCap = (): number | undefined => readPeerNetwork(clientStateFile)?.maxPeersFromGateway
+    // PC-09: the network cap is a PEER fact. The state file keeps a former
+    // peer life's `peerNetwork` block on purpose (switching back must find
+    // it intact), but a client row must pair by its OWN configuration — so
+    // the getter answers undefined outside peer mode, and the pool never
+    // sees a network cap to fold in. The role is a restart field: this
+    // snapshot lives exactly as long as the row, same as `skipPersistedServers`
+    // below; a role change rebuilds the pool through a fresh apply().
+    const peerNetworkCap = (): number | undefined =>
+      effective.values.role === 'peer' ? readPeerNetwork(clientStateFile)?.maxPeersFromGateway : undefined
     // CU-1 lifecycle: the pool's per-server link flips enter the ring —
     // `online` with the entry and its handshake server id, `offline` with
     // the failure code (lastError is a short code by contract, never free
