@@ -59,6 +59,8 @@ const WS_PATH = '/peer/v1/ws';
 const TIMESTAMP_WINDOW_MS = 5 * 60_000;
 const MAX_PATH_REPORTS_PER_NODE = 64;
 const MAX_LAN_ENDPOINTS = 16;
+/** PC-19 第二片：关停末批的收尾轮数上界（追平在途/尾轮 + 写库在途期间的少量新增） */
+const MAX_CLOSE_FLUSH_ROUNDS = 8;
 
 /**
  * path-report 行的合法路径枚举（PC-16a）：节点自报的既有 lan/p2p/relay 三值
@@ -230,6 +232,8 @@ export class PeerWsHub {
   // flushTail 是已承诺给合并调用方的尾轮；尾轮开跑即接管在途身份。
   private flushInFlight: Promise<void> | null = null;
   private flushTail: Promise<void> | null = null;
+  /** PC-19 第二片：close 共享同一真实结果——重复/并发调用不得提前成功 */
+  private closePromise: Promise<void> | null = null;
   private closed = false;
   // In-flight reads may carry pre-disable snapshots (including PostgreSQL queries).
   private admissionEpoch = 0;
@@ -301,7 +305,20 @@ export class PeerWsHub {
     });
   }
 
-  async close(): Promise<void> {
+  /**
+   * 关停（PC-19 第二片）：先停止接收与周期写入（closed 闸 + 定时器 + 摘除全部
+   * 连接），再经 flushTelemetry **同一串行入口**补末批——追平在途轮与已合并
+   * 尾轮，并有界收尾写库在途期间到达的少量新增；末批确认后才 resolve（组合根
+   * 据此保证关 store 前无待确认批次）。末批自身的墙钟预算由调用方施加（见
+   * StartGatewayOptions.closeBudgetMs）；重复/并发 close 共享同一真实结果。
+   */
+  close(): Promise<void> {
+    if (this.closePromise !== null) return this.closePromise;
+    this.closePromise = this.doClose();
+    return this.closePromise;
+  }
+
+  private async doClose(): Promise<void> {
     this.closed = true;
     if (this.rateTimer !== null) clearInterval(this.rateTimer);
     if (this.flushTimer !== null) clearInterval(this.flushTimer);
@@ -322,6 +339,46 @@ export class PeerWsHub {
     this.subscribers.clear();
     this.lastPublishedKbps.clear();
     await new Promise<void>((resolve) => this.wss.close(() => resolve()));
+    await this.finalFlushOnClose();
+  }
+
+  /**
+   * 关停末批（PC-19 shutdown fix1）：循环调用 flushTelemetry 直到待确认归零或
+   * 轮数耗尽——第一轮追平在途轮/合并尾轮并写掉 close 时刻的快照；写库在途期间
+   * 到关的少量新增（字节或 NAT 观测）由后续轮覆盖。全程不 drain、不清零，确认
+   * 仍走批次语义。**轮数耗尽时任何未确认量（含仅 NAT 残余）都如实抛错**——
+   * 成功返回当且仅当末批已全部确认，不存在「部分确认也算成功」的出口。
+   */
+  private async finalFlushOnClose(): Promise<void> {
+    for (let round = 1; ; round++) {
+      try {
+        await this.flushTelemetry();
+      } catch (error) {
+        const summary = this.pendingTelemetrySummary();
+        throw new Error(
+          `final telemetry flush failed during gateway close; unconfirmed: ${summary.bytes} bytes across ${summary.members} members, ${summary.natObservations} NAT observations (${(error as Error).message})`,
+          { cause: error },
+        );
+      }
+      const pending = this.limiter.snapshotAllPending();
+      if (pending.length === 0 && this.pendingNat.size === 0) return;
+      if (round >= MAX_CLOSE_FLUSH_ROUNDS) {
+        const summary = this.pendingTelemetrySummary();
+        throw new Error(
+          `telemetry did not settle during gateway close after ${MAX_CLOSE_FLUSH_ROUNDS} rounds; unconfirmed: ${summary.bytes} bytes across ${summary.members} members, ${summary.natObservations} NAT observations`,
+        );
+      }
+    }
+  }
+
+  /** 待确认遥测摘要（关停失败报告与诊断用）：字节累计、涉及成员数、NAT 观测条数 */
+  pendingTelemetrySummary(): { bytes: number; members: number; natObservations: number } {
+    const pending = this.limiter.snapshotAllPending();
+    return {
+      bytes: pending.reduce((sum, p) => sum + p.bytes, 0),
+      members: pending.length,
+      natObservations: this.pendingNat.size,
+    };
   }
 
   // ------------------------------------------------------------ 连接建立
@@ -763,6 +820,10 @@ export class PeerWsHub {
   // ------------------------------------------------------------ NAT 观察（udp-stun 回调）
 
   applyNatObservation(record: NatObservation): void {
+    // PC-19 shutdown fix1：close 开始后不再接纳观测——关闭后的观测不是「已接收」
+    // 数据（组合根先关 UDP，正常路径不存在此类观测；库级调用方后关 UDP 时在途
+    // 回调的迟到送达在此被拒收，绝不静默积累成未确认残余）
+    if (this.closed) return;
     const key = connKey(record.networkId, record.nodeId);
     const conn = this.conns.get(record.networkId)?.get(record.nodeId) ?? this.hanging.get(key) ?? null;
     if (conn !== null) {

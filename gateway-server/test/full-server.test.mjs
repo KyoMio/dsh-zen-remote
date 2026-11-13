@@ -17,7 +17,7 @@ import { createGatewayApiServer } from '../dist/server.js';
 import { resolveGatewayConfig } from '../dist/config.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { SETTINGS_KEYS } from '../dist/store/types.js';
-import { deriveMasterKeyFromSecret } from '../dist/master-key.js';
+import { deriveMasterKeyFromSecret, hashPassword } from '../dist/master-key.js';
 import { PeerWsHub } from '../dist/peer-hub/ws-hub.js';
 import { UdpStunService } from '../dist/peer-hub/udp-stun.js';
 import WebSocket from 'ws';
@@ -694,6 +694,380 @@ describe('无泄漏关停', () => {
     await gw.close();
     const elapsed = Date.now() - startedAt;
     assert.ok(elapsed < 3000, `close() 不应悬挂（耗时 ${elapsed}ms）`);
+  });
+});
+
+// ---------------------------------------------------------------- PC-19 第二片：停止接收后补末批与有界退出
+//
+// 契约：close 先停止 WS/UDP 摄入与周期写入，再经第一片的同一串行 flush 入口
+// 补末批（追平在途轮/合并尾轮，并有界收尾写库在途期间到达的少量新增），最后
+// 才关 store；写失败/存储不响应时在墙钟预算内如实拒绝、报告未确认累计、停净
+// 自有资源；重复/并发 close 共享同一真实结果。真实 SIGTERM 进程退出码与重开
+// 数据库证据在 test/pc19-shutdown.test.mjs 的受控子进程里验证。
+
+describe('PC-19 第二片：停止接收后补末批与有界退出', () => {
+  /**
+   * 驱动少量真实中转流量：REST 建网（key 模式）+ 两节点入网 + 一帧 A→B 并确认
+   * 到达 B。返回 { net, a, b, sentBytes }——pendingRelayBytes 此时应含 sentBytes，
+   * 且周期刷盘（5s）远未到点，构成「关停前已接收但尚未落库」的场景。
+   */
+  async function driveRelayTraffic(gw) {
+    const cookie = await login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+    const created = await api(gw.base, 'POST', '/api/v1/networks', {
+      body: { name: 'pc19-shutdown-net', admissionMode: 'key' },
+      cookie,
+    });
+    assert.equal(created.status, 200, JSON.stringify(created.json));
+    const net = created.json.data;
+    const a = identity();
+    const b = identity();
+    const wsA = await wsOpen(gw.base);
+    await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey });
+    assert.equal((await wsJson(wsA)).status, 'authorized');
+    const wsB = await wsOpen(gw.base);
+    await authNode(wsB, b, { networkId: net.id, joinKey: net.joinKey });
+    assert.equal((await wsJson(wsB)).status, 'authorized');
+    assert.equal((await wsJson(wsB)).type, 'punch-coordinate');
+    assert.equal((await wsJson(wsA)).type, 'peer-joined');
+    assert.equal((await wsJson(wsA)).type, 'punch-coordinate');
+
+    const header = Buffer.alloc(28);
+    header.writeUInt16BE(0x5a52, 0);
+    header.writeUInt8(0x01, 2);
+    header.writeUInt8(3, 3);
+    header.write(a.nodeId, 4, 'hex');
+    header.write(b.nodeId, 8, 'hex');
+    header.writeUInt32BE(1, 12);
+    header.writeBigUInt64BE(1n, 16);
+    header.writeUInt32BE(0, 24);
+    const frameBuf = Buffer.concat([header, crypto.randomBytes(32 + 16)]);
+    wsA.send(frameBuf);
+    const receivedAtB = await wsJson(wsB);
+    assert.ok(receivedAtB.__raw !== undefined, 'B 应收到二进制帧');
+    return { net, a, b, sentBytes: frameBuf.length };
+  }
+
+  /** 重开同一 sqlite 文件（openStore 用 dataDir/gateway.sqlite）读回成员行 */
+  async function reopenMemberRow(dataDir, netId, nodeId) {
+    const reopened = new SqliteStore({ path: path.join(dataDir, 'gateway.sqlite') });
+    try {
+      return (await reopened.listMembers(netId)).find((m) => m.nodeId === nodeId);
+    } finally {
+      await reopened.close();
+    }
+  }
+
+  test('尚未周期落库的流量经 close 补末批：重开数据库读回最终累计', async () => {
+    const gw = await startGateway(makeConfig(), { closeBudgetMs: 5000 });
+    try {
+      const { net, a, sentBytes } = await driveRelayTraffic(gw);
+      assert.ok(gw.hub.limiter.pendingRelayBytes(net.id, a.nodeId) >= sentBytes, '中转字节应进待刷盘累计');
+      await gw.close();
+      const row = await reopenMemberRow(gw.config.dataDir, net.id, a.nodeId);
+      assert.equal(row.cumulativeRelayBytes, sentBytes, '末批必须在关 store 前落库');
+      assert.ok(row.lastSeenAt !== null, '末批应携带 lastSeenAt');
+    } finally {
+      await gw.close().catch(() => {});
+    }
+  });
+
+  test('慢写在途时 close：关停前追加的数据经后续轮串行落库，不重复计数', async () => {
+    const held = [];
+    let holdWrites = false;
+    const original = SqliteStore.prototype.flushMemberTelemetry;
+    SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
+      if (holdWrites && updates.length > 0) {
+        await new Promise((resolve) => held.push(resolve));
+      }
+      return original.call(this, updates);
+    };
+    let gw;
+    try {
+      gw = await startGateway(makeConfig(), { closeBudgetMs: 10_000 });
+      const { net, a, sentBytes } = await driveRelayTraffic(gw);
+      // 关停前已接收的 NAT 观测（close 开始后的观测会被 closed 闸拒收——
+      // 由「关闭开始后新 NAT 观测不再接纳」用例单独钉住）
+      gw.hub.applyNatObservation({
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'cone',
+        reflexiveIp: '10.9.9.9',
+        reflexivePort: 40001,
+        serverPortRole: 'primary',
+      });
+      holdWrites = true; // 扣住第一轮末批
+      const closing = gw.close();
+      await new Promise((resolve) => setImmediate(resolve));
+      // 关停在途期间追加的字节（对停摄入窗口内尾量的建模）由后续轮串行落库
+      gw.hub.limiter.tryRelay({ networkId: net.id, nodeId: a.nodeId, peerNodeId: 'bbbbbbbb' }, 50, 4096);
+      holdWrites = false;
+      for (const release of held.splice(0)) release();
+      await closing;
+      const row = await reopenMemberRow(gw.config.dataDir, net.id, a.nodeId);
+      assert.equal(row.cumulativeRelayBytes, sentBytes + 50, '两轮串行各落一次，不重计');
+      assert.equal(row.lastIp, '10.9.9.9', '追加的 NAT 观测落库');
+      assert.equal(row.natType, 'cone');
+    } finally {
+      SqliteStore.prototype.flushMemberTelemetry = original;
+      if (gw !== undefined) await gw.close().catch(() => {});
+    }
+  });
+
+  test('flush 失败时 close 拒绝并报告未确认累计，资源停净，并发 close 共享失败', async () => {
+    let failNext = false;
+    const original = SqliteStore.prototype.flushMemberTelemetry;
+    SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
+      if (failNext && updates.length > 0) {
+        failNext = false;
+        throw new Error('controlled pc19 close flush failure');
+      }
+      return original.call(this, updates);
+    };
+    let gw;
+    try {
+      gw = await startGateway(makeConfig(), { closeBudgetMs: 5000 });
+      const { net, a } = await driveRelayTraffic(gw);
+      failNext = true;
+      const first = gw.close();
+      const second = gw.close(); // 并发调用：共享同一真实结果，不得提前成功
+      await assert.rejects(first, /unconfirmed/, 'flush 失败必须让 close 如实拒绝');
+      await assert.rejects(second, /unconfirmed/, '并发 close 共享同一失败');
+      await assert.rejects(() => fetch(gw.base + '/'), undefined, '失败路径资源兜底停净：HTTP 拒连');
+      assert.ok(gw.hub.limiter.pendingRelayBytes(net.id, a.nodeId) > 0, '失败后待写累计不得被清零');
+    } finally {
+      SqliteStore.prototype.flushMemberTelemetry = original;
+      if (gw !== undefined) await gw.close().catch(() => {});
+    }
+  });
+
+  test('存储不响应时 close 在墙钟预算内如实拒绝（进程内版本；真实进程退出见子进程用例）', async () => {
+    // 受控永不完成的写：刻意不解扣——解扣会对已关 store 触发迟到拒绝；
+    // 挂起的 promise 无定时器/无 I/O，不阻碍测试进程退出
+    let holdForever = false;
+    const original = SqliteStore.prototype.flushMemberTelemetry;
+    SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
+      if (holdForever && updates.length > 0) {
+        await new Promise(() => {});
+      }
+      return original.call(this, updates);
+    };
+    let gw;
+    try {
+      gw = await startGateway(makeConfig(), { closeBudgetMs: 400 });
+      await driveRelayTraffic(gw);
+      holdForever = true;
+      const startedAt = Date.now();
+      await assert.rejects(gw.close(), /budget|unconfirmed/, '预算耗尽必须拒绝而非悬挂');
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed < 3000, `close 必须在预算后有界结束（耗时 ${elapsed}ms）`);
+      await assert.rejects(() => fetch(gw.base + '/'), undefined, '失败路径资源兜底停净：HTTP 拒连');
+    } finally {
+      SqliteStore.prototype.flushMemberTelemetry = original;
+      if (gw !== undefined) await gw.close().catch(() => {});
+    }
+  });
+
+  test('已接收的 NAT 观测随末批持久化（重开读回 lastIp/natType）', async () => {
+    const gw = await startGateway(makeConfig(), { closeBudgetMs: 5000 });
+    try {
+      const { net, a, sentBytes } = await driveRelayTraffic(gw);
+      gw.hub.applyNatObservation({
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'cone',
+        reflexiveIp: '10.7.7.7',
+        reflexivePort: 40001,
+        serverPortRole: 'primary',
+      });
+      await gw.close();
+      const row = await reopenMemberRow(gw.config.dataDir, net.id, a.nodeId);
+      assert.equal(row.cumulativeRelayBytes, sentBytes);
+      assert.equal(row.lastIp, '10.7.7.7', '关闭前已接收的 NAT 观测必须在末批落库');
+      assert.equal(row.natType, 'cone');
+    } finally {
+      await gw.close().catch(() => {});
+    }
+  });
+
+  test('关闭开始后新 NAT 观测不再接纳：末批只确认关闭前已接收的数据', async () => {
+    const held = [];
+    let holdWrites = false;
+    const original = SqliteStore.prototype.flushMemberTelemetry;
+    SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
+      if (holdWrites && updates.length > 0) {
+        await new Promise((resolve) => held.push(resolve));
+      }
+      return original.call(this, updates);
+    };
+    let gw;
+    try {
+      gw = await startGateway(makeConfig(), { closeBudgetMs: 10_000 });
+      const { net, a, sentBytes } = await driveRelayTraffic(gw);
+      // 关闭前已接收的观测（必须在末批落库）
+      gw.hub.applyNatObservation({
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'cone',
+        reflexiveIp: '10.0.0.1',
+        reflexivePort: 40001,
+        serverPortRole: 'primary',
+      });
+      holdWrites = true; // 扣住第一轮末批，制造「close 已开始」的窗口
+      const closing = gw.close();
+      await new Promise((resolve) => setImmediate(resolve));
+      // 模拟在途回调此刻才送达的新观测：close 已开始，必须拒收——不进待写、不落库
+      gw.hub.applyNatObservation({
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'symmetric',
+        reflexiveIp: '10.0.0.2',
+        reflexivePort: 40002,
+        serverPortRole: 'primary',
+      });
+      assert.equal(
+        gw.hub.pendingTelemetrySummary().natObservations,
+        1,
+        'close 开始后只保留关闭前那条观测，新观测不得进入待写',
+      );
+      holdWrites = false;
+      for (const release of held.splice(0)) release();
+      await closing;
+      assert.equal(gw.hub.pendingTelemetrySummary().natObservations, 0, '末批确认后无待确认观测');
+      const row = await reopenMemberRow(gw.config.dataDir, net.id, a.nodeId);
+      assert.equal(row.lastIp, '10.0.0.1', '末批只携带关闭前已接收的观测');
+      assert.equal(row.natType, 'cone');
+      assert.equal(row.cumulativeRelayBytes, sentBytes);
+    } finally {
+      SqliteStore.prototype.flushMemberTelemetry = original;
+      if (gw !== undefined) await gw.close().catch(() => {});
+    }
+  });
+
+  test('仅 NAT 的批次写失败时 close 拒绝并报告（不得静默成功）', async () => {
+    let failNatOnly = false;
+    const original = SqliteStore.prototype.flushMemberTelemetry;
+    SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
+      if (failNatOnly && updates.length > 0 && updates.every((u) => u.relayBytesDelta === undefined)) {
+        throw new Error('controlled pc19 nat-only flush failure');
+      }
+      return original.call(this, updates);
+    };
+    let gw;
+    try {
+      gw = await startGateway(makeConfig(), { closeBudgetMs: 5000 });
+      const tenant = await gw.store.createUser({
+        email: 'pc19-nat-only@local',
+        passwordHash: await hashPassword('pc19-nat-only-pass'),
+        role: 'user',
+      });
+      const net = await gw.store.createNetwork({
+        ownerId: tenant.id,
+        name: 'pc19-nat-only',
+        admissionMode: 'key',
+        joinKeyEnc: 'pc19-nat-only-not-read',
+        maxPeers: 8,
+      });
+      await gw.store.upsertMemberJoinAttempt({
+        networkId: net.id,
+        nodeId: 'cc19cccc',
+        publicKeyHex: 'cc'.repeat(32),
+        joinKeyMatched: true,
+      });
+      gw.hub.applyNatObservation({
+        networkId: net.id,
+        nodeId: 'cc19cccc',
+        natType: 'cone',
+        reflexiveIp: '10.8.8.8',
+        reflexivePort: 40001,
+        serverPortRole: 'primary',
+      });
+      failNatOnly = true;
+      await assert.rejects(gw.close(), /unconfirmed/, 'NAT 批次写失败必须让 close 如实拒绝');
+      assert.ok(gw.hub.pendingTelemetrySummary().natObservations > 0, '失败后待确认观测不得被清零');
+    } finally {
+      SqliteStore.prototype.flushMemberTelemetry = original;
+      if (gw !== undefined) await gw.close().catch(() => {});
+    }
+  });
+
+  test('UDP 关闭挂死时 close 在预算内拒绝，失败兜底同样有界', async () => {
+    let hangUdpClose = false;
+    const original = UdpStunService.prototype.close;
+    UdpStunService.prototype.close = async function () {
+      if (hangUdpClose) {
+        await new Promise(() => {}); // 受控永不完成（无定时器无 I/O）
+      }
+      return original.call(this);
+    };
+    let gw;
+    try {
+      gw = await startGateway(makeConfig(), { closeBudgetMs: 400 });
+      hangUdpClose = true; // 第一层关停即卡点
+      const startedAt = Date.now();
+      const outcome = await Promise.race([
+        gw.close().then(
+          () => 'resolved',
+          (err) => ({ err }),
+        ),
+        new Promise((r) => setTimeout(() => r('deadline-exceeded'), 8000)),
+      ]);
+      assert.notEqual(outcome, 'resolved', '卡点路径不得假称成功');
+      assert.notEqual(outcome, 'deadline-exceeded', 'close 失败兜底不得无界挂起（8s 观察窗内必须落定）');
+      assert.match(outcome.err.message, /budget|unconfirmed/, '预算耗尽必须如实拒绝');
+      const elapsed = Date.now() - startedAt;
+      assert.ok(elapsed < 5500, `close 失败路径必须在预算 + 清理宽限内有界结束（实测 ${elapsed}ms，上界 = 400ms 预算 + 4×1000ms 兜底 + 余量）`);
+      await assert.rejects(() => fetch(gw.base + '/'), undefined, '失败路径资源兜底停净：HTTP 拒连');
+    } finally {
+      // 先还原真实 close 再有界收尾：closePromise 可能仍挂在卡点上（RED 形态），
+      // 直接 await 会无界阻塞；真实 dgram socket 与 HTTP 监听句柄必须关闭，
+      // 否则测试进程退不出
+      UdpStunService.prototype.close = original;
+      if (gw !== undefined) {
+        await Promise.race([
+          gw.close().catch(() => {}),
+          new Promise((resolve) => setTimeout(resolve, 1500)),
+        ]);
+        try {
+          gw.udp.primary?.close();
+          gw.udp.alt?.close();
+        } catch {
+          /* 已关闭 */
+        }
+        try {
+          gw.server.closeAllConnections?.();
+          gw.server.close();
+        } catch {
+          /* 已关闭 */
+        }
+      }
+    }
+  });
+
+  test('关停开始即停止 HTTP 新连接接收（不等末批完成）', async () => {
+    const held = [];
+    let holdWrites = false;
+    const original = SqliteStore.prototype.flushMemberTelemetry;
+    SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
+      if (holdWrites && updates.length > 0) {
+        await new Promise((resolve) => held.push(resolve));
+      }
+      return original.call(this, updates);
+    };
+    let gw;
+    try {
+      gw = await startGateway(makeConfig(), { closeBudgetMs: 10_000 });
+      await driveRelayTraffic(gw);
+      holdWrites = true; // 扣住末批，制造「close 已开始但末批未完成」的窗口
+      const closing = gw.close();
+      await new Promise((resolve) => setImmediate(resolve));
+      await assert.rejects(() => fetch(gw.base + '/'), undefined, '关停开始后 HTTP 必须立即拒新连接');
+      holdWrites = false;
+      for (const release of held.splice(0)) release();
+      await closing;
+    } finally {
+      SqliteStore.prototype.flushMemberTelemetry = original;
+      if (gw !== undefined) await gw.close().catch(() => {});
+    }
   });
 });
 

@@ -35,14 +35,29 @@ export interface GatewayInstance {
   readonly udpPorts: { primaryPort: number; altPort: number | null };
   /** 本机回环访问入口（打印与测试用） */
   readonly base: string;
-  /** 逐层关停：WS 连接 → UDP 端口 → HTTP（含活动连接）→ 数据库 */
+  /** 逐层关停（PC-19 第二片）：UDP → WS（末批遥测刷盘确认后才过）→ HTTP → 数据库；共享墙钟预算与同一真实结果 */
   close(): Promise<void>;
 }
 
 export interface StartGatewayOptions {
   /** 控制台静态托管根目录；缺省取 dist/main.js 旁的 dist/public */
   staticRoot?: string;
+  /**
+   * 关停墙钟预算（毫秒，PC-19 第二片），覆盖末批刷盘与 store 关闭在内的整条
+   * 逐层关停链；缺省 5000。预算耗尽即如实拒绝（非零结果，报告未确认累计），
+   * 绝不假称成功——生产信号入口把它映射为非零退出码。
+   */
+  closeBudgetMs?: number;
 }
+
+/** 关停墙钟预算缺省值：末批一小批 + 逐层关闭的正常量级，余量给慢盘 */
+const DEFAULT_CLOSE_BUDGET_MS = 5_000;
+/**
+ * 失败兜底路径上每一步资源停止的独立短预算（PC-19 shutdown fix1）：兜底绝不
+ * 包含无期限 await——任何一步（含原卡点重入）超预算即放弃。清理总宽限上界 =
+ * ABORT_STEP_BUDGET_MS × 关停层数（4），随失败错误一并报告。
+ */
+const ABORT_STEP_BUDGET_MS = 1_000;
 
 function listen(server: http.Server, port: number): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -115,7 +130,95 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
     const address = server.address();
     const port = address !== null && typeof address === 'object' ? address.port : config.port;
     const base = `http://127.0.0.1:${port}`;
-    let closing = false;
+    const closeBudgetMs = options.closeBudgetMs ?? DEFAULT_CLOSE_BUDGET_MS;
+    let closePromise: Promise<void> | null = null;
+
+    // PC-19 第二片：逐层关停（PC-19 第二片顺序）——先停 UDP 摄入（STUN 观测不再
+    // 到达），再停 WS 并由 hub.close 经第一片的同一串行入口补末批（末批确认后
+    // hub.close 才 resolve），随后 HTTP 与 store；末批开跑前全部摄入源已关，
+    // 关 store 前无待确认批次。每层共享同一墙钟预算；重复/并发 close 共享同一
+    // 真实结果（共享 closePromise），绝不因 closing 标志提前成功。
+    const closeGateway = async (): Promise<void> => {
+      const deadline = Date.now() + closeBudgetMs;
+      const bounded = async (label: string, op: () => Promise<void>): Promise<void> => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new Error(`gateway close budget (${closeBudgetMs}ms) exhausted before ${label}`);
+        }
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            op(),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(`${label} did not complete within gateway close budget (${closeBudgetMs}ms)`)),
+                remaining,
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      // PC-19 shutdown fix1：关停开始（t0）即停止 HTTP 新连接接收——server.close()
+      // 的「拒新」效果立即生效，存量连接的收尾等待放在后面的有界 HTTP 层；
+      // 不等末批完成才停接收。
+      let serverClosed: Promise<void> | null = null;
+      const stopAcceptingHttp = (): Promise<void> => {
+        if (serverClosed === null) {
+          serverClosed = new Promise<void>((resolve) => {
+            server.closeIdleConnections?.();
+            server.close(() => resolve());
+          });
+        }
+        return serverClosed;
+      };
+      const closeServer = async (): Promise<void> => {
+        // SSE/keep-alive 存量收尾；WS 升级连接已由 hub.terminate 摘除
+        server.closeAllConnections?.();
+        await stopAcceptingHttp();
+      };
+      stopAcceptingHttp(); // t0 即拒新连接（拒绝效果立即生效，不等任何阶段）
+      // 失败兜底：每一步独立短预算，任何一步（含原卡点重入）超预算即放弃，
+      // 绝不覆盖原始错误；库函数失败不称资源已全部释放（错误里如实注明
+      // best-effort 与清理宽限总上界）。
+      const abortStep = async (label: string, op: () => Promise<void>): Promise<void> => {
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            op(),
+            new Promise<never>((_, reject) => {
+              timer = setTimeout(() => reject(new Error(`${label} exceeded ${ABORT_STEP_BUDGET_MS}ms cleanup cap`)), ABORT_STEP_BUDGET_MS);
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      try {
+        await bounded('udp shutdown', () => udp.close());
+        await bounded('ws hub shutdown (final telemetry flush included)', () => hub.close());
+        await bounded('http server close', closeServer);
+        await bounded('store close', () => store.close());
+        closedStore = true;
+      } catch (error) {
+        const cleanupGraceMs = ABORT_STEP_BUDGET_MS * 4;
+        await abortStep('abort: udp shutdown', () => udp.close()).catch(() => {});
+        // hub.close 的拆除（闸门/定时器/socket terminate）在调用时同步完成，
+        // 即使末批刷盘超预算被放弃，WS 也已全部摘除
+        await abortStep('abort: ws hub shutdown', () => hub.close()).catch(() => {});
+        await abortStep('abort: http server close', closeServer).catch(() => {});
+        // store 可能不可取消（写挂死）——短预算内尝试后如实放弃，挂起查询随
+        // 进程退出消亡，未完成状态由抛出的错误如实报告
+        await abortStep('abort: store close', () => store.close()).catch(() => {});
+        const summary = hub.pendingTelemetrySummary();
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `gateway close failed (budget ${closeBudgetMs}ms, cleanup grace ≤ ${cleanupGraceMs}ms): ${message}; unconfirmed telemetry: ${summary.bytes} bytes across ${summary.members} members, ${summary.natObservations} NAT observations; resources stopped best-effort within cleanup grace`,
+          { cause: error },
+        );
+      }
+    };
 
     return {
       config,
@@ -127,18 +230,9 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       port,
       udpPorts,
       base,
-      close: async (): Promise<void> => {
-        if (closing) return;
-        closing = true;
-        await hub.close();
-        await udp.close();
-        await new Promise<void>((resolve) => {
-          server.closeIdleConnections?.();
-          server.closeAllConnections?.();
-          server.close(() => resolve());
-        });
-        await store.close();
-        closedStore = true;
+      close: (): Promise<void> => {
+        if (closePromise === null) closePromise = closeGateway();
+        return closePromise;
       },
     };
   } catch (err) {
