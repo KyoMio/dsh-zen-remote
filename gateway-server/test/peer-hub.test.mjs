@@ -635,6 +635,58 @@ describe('PeerRateLimiter（令牌桶 + 滑窗）', () => {
     assert.equal(lim.pendingRelayBytes('n', 'a'), 0, 'drain 后清零');
     assert.deepEqual(lim.drainAllPending(), []);
   });
+
+  test('PC-18 无人读取时滑窗仍有界：持续写不读持有量有界，推进时间后释放旧事件', () => {
+    const clock = { now: 1_000_000 };
+    const lim = new PeerRateLimiter({ now: () => clock.now });
+    // 每 1000ms 写 2 条各 1024B，跨 60 个窗口（共 120 条有限合成事件），全程零读取：
+    // 旧实现只在读数路径淘汰，无人订阅时 events 随每次成功转发无限增长（本单缺口）。
+    for (let w = 0; w < 60; w++) {
+      lim.tryRelay({ networkId: 'n', nodeId: 'a', peerNodeId: 'b' }, 1024, 4096);
+      lim.tryRelay({ networkId: 'n', nodeId: 'a', peerNodeId: 'b' }, 1024, 4096);
+      clock.now += 1000;
+    }
+    // 内部存储边界检查（验证的是内存保留而非读数为 0）：events.length 即当前
+    // 实际持有的事件引用数（含待摊销压缩的死引用）。单窗口内容 = 2 条/s × 5s
+    // = 10 条，摊销压缩保证死引用不超过窗口内容量级，上限 40 已有余量。
+    assert.ok(lim.events.length <= 40, `无人读取持续写入后应保持有界，实际持有 ${lim.events.length} 条`);
+    // 推进一个窗口再写一次：旧事件全部过期，写路径淘汰后只持有本次写入的 1 条
+    // （过期事件引用被释放，而不是只跳过却继续持有）。
+    clock.now += 5000;
+    lim.tryRelay({ networkId: 'n', nodeId: 'a', peerNodeId: 'b' }, 5120, 4096);
+    assert.equal(lim.events.length, 1, `过期事件引用应被释放，实际持有 ${lim.events.length} 条`);
+    // 后来读取：读数等于当前窗口已知量 = 5120 / 5s / 1024 = 1 KB/s（PC-17 单位契约）。
+    assert.ok(Math.abs(lim.liveRelayKbpsTotal() - 1) < 1e-9, `total=${lim.liveRelayKbpsTotal()}`);
+  });
+
+  test('PC-18 窗口边界钉子：空窗、同时间戳、恰好 5 秒边界，窗口清理不清 pending 累计', () => {
+    const clock = { now: 2_000_000 };
+    const lim = new PeerRateLimiter({ now: () => clock.now }); // 默认 5000ms 窗口
+    // 空窗：无写入时读数为 0，淘汰为空操作。
+    assert.equal(lim.liveRelayKbpsTotal(), 0);
+    // 同一时间戳两条事件：窗口内一起计，滑出时一起淘汰。
+    lim.tryRelay({ networkId: 'n', nodeId: 'a', peerNodeId: 'b' }, 1024, 4096);
+    lim.tryRelay({ networkId: 'n', nodeId: 'a', peerNodeId: 'b' }, 1024, 4096);
+    // 恰好窗口边界前 1ms：仍在窗内，2048 / 5s / 1024 = 0.4 KB/s。
+    clock.now += 4999;
+    assert.ok(Math.abs(lim.liveRelayKbpsTotal() - 0.4) < 1e-9, `total=${lim.liveRelayKbpsTotal()}`);
+    // 恰好 +5000ms：at <= now-5000 命中边界即淘汰（与原读数路径同一判定，宽度不变）。
+    clock.now += 1;
+    assert.equal(lim.liveRelayKbpsTotal(), 0);
+    // 窗口清理绝不碰待刷盘累计：上面 2048B 早已滑出窗口，pending 仍完整保留。
+    assert.equal(lim.pendingRelayBytes('n', 'a'), 2048);
+    // 再跨一个窗口写入（触发写路径淘汰）后：pending 继续累计、drain 原样取走全部并清零。
+    clock.now += 5000;
+    lim.tryRelay({ networkId: 'n', nodeId: 'c', peerNodeId: 'b' }, 512, 4096);
+    assert.equal(lim.pendingRelayBytes('n', 'a'), 2048, '旧成员累计不受窗口清理影响');
+    assert.equal(lim.pendingRelayBytes('n', 'c'), 512);
+    const drained = lim.drainAllPending();
+    assert.deepEqual(drained.sort((x, y) => x.nodeId.localeCompare(y.nodeId)), [
+      { networkId: 'n', nodeId: 'a', bytes: 2048 },
+      { networkId: 'n', nodeId: 'c', bytes: 512 },
+    ]);
+    assert.deepEqual(lim.drainAllPending(), []);
+  });
 });
 
 describe('挑战应答入网与口令自动放行', () => {

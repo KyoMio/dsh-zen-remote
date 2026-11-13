@@ -4,8 +4,9 @@
 //    relayRateKbps * 1024 bytes/s（每次 tryRelay 现算，管理员改设置即刻生效），
 //    突发桶容量 = 1 秒的量。超限丢弃（背压从发送方 ACK 缺口自然回传），
 //    不做排队——排队只会把打满的带宽延迟变成堆积的内存。
-// 2. 5 秒滑动窗口速率：每次成功转发记一条 (时刻, 字节, 归属) 事件，读数时
-//    先裁掉窗口外的事件再求和。PC-17 单位契约：各 liveRelayKbps* 读数（含
+// 2. 5 秒滑动窗口速率：每次成功转发记一条 (时刻, 字节, 归属) 事件，写入与
+//    读数时都裁掉窗口外的事件（PC-18：无人订阅读取也保持持有量有界）。
+//    PC-17 单位契约：各 liveRelayKbps* 读数（含
 //    API 字段 liveRelayKbps / totalLiveRelayKbps / relayKbps）数值都是
 //    KB/s = 1024 字节/秒（kilobytes，不是 kilobits），与 relayRateKbps
 //    配置和界面 KB/s 文案同单位：读数 = 窗口字节 / (窗口秒) / 1024，不乘 8。
@@ -54,6 +55,8 @@ export class PeerRateLimiter {
   private readonly buckets = new Map<string, TokenBucket>();
   private readonly pending = new Map<string, { member: MemberKey; bytes: number }>();
   private readonly events: WindowEvent[] = [];
+  /** events[head] 起为窗口内事件；head 之前的死引用由摊销压缩统一释放 */
+  private head = 0;
 
   constructor(options: RateLimiterOptions = {}) {
     this.windowMs = options.windowMs ?? 5000;
@@ -81,24 +84,35 @@ export class PeerRateLimiter {
     bucket.tokens -= bytes;
     this.buckets.set(key, bucket);
     this.events.push({ at: now, bytes, networkId: scope.networkId, nodeId: scope.nodeId, peerNodeId: scope.peerNodeId });
+    this.pruneWindow(); // PC-18：写入路径同样淘汰窗口外事件，无人读取也保持有界
     const pending = this.pending.get(key) ?? { member: { networkId: scope.networkId, nodeId: scope.nodeId }, bytes: 0 };
     pending.bytes += bytes;
     this.pending.set(key, pending);
     return true;
   }
 
-  /** 裁掉滑窗外的旧事件，返回窗口内事件（内部复用） */
-  private pruneWindow(): WindowEvent[] {
+  /**
+   * 裁掉滑窗外的旧事件（读路径与写路径共用）。头游标前移跳过过期事件——每个
+   * 事件一生只被跳过一次，无逐包拷贝；死前缀过半时一次性摊销压缩（splice 把
+   * 活事件搬到表头），过期事件引用随之释放，持有量始终有界（约 ≤ 2× 单窗口
+   * 内容），无人订阅持续转发也不会无限增长。
+   */
+  private pruneWindow(): void {
     const cutoff = this.now() - this.windowMs;
-    let drop = 0;
-    while (drop < this.events.length && (this.events[drop] as WindowEvent).at <= cutoff) drop++;
-    if (drop > 0) this.events.splice(0, drop);
-    return this.events;
+    let head = this.head;
+    while (head < this.events.length && (this.events[head] as WindowEvent).at <= cutoff) head++;
+    this.head = head;
+    if (head > 0 && head * 2 >= this.events.length) {
+      this.events.splice(0, head);
+      this.head = 0;
+    }
   }
 
   private sumWhere(filter: (e: WindowEvent) => boolean): number {
+    this.pruneWindow();
     let total = 0;
-    for (const e of this.pruneWindow()) {
+    for (let i = this.head; i < this.events.length; i++) {
+      const e = this.events[i] as WindowEvent;
       if (filter(e)) total += e.bytes;
     }
     return total;
