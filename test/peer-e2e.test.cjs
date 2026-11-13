@@ -85,6 +85,9 @@ async function startGateway() {
   // 零明文断言的观测点：网关侧每条 ws 连接的 send 都抄送一份（只记二进制帧——
   // 控制面文本帧按协议就是明文 JSON，与断言无关）。
   const relayedBinary = []
+  // PC-16a 周期遥测的观测点：每条连接入站的文本控制帧原样抄送一份
+  // （engine→WS→hub 的「hub 已收到」证据；不干扰 hub 自己的监听器）。
+  const inboundControl = []
   // noServer 模式不触发 'connection' 事件——包装在 handleUpgrade 上：
   // 每条被 hub 接纳的连接的 send 都抄送一份二进制帧（零明文断言的观测点）。
   const origHandleUpgrade = hub.wss.handleUpgrade.bind(hub.wss)
@@ -96,6 +99,13 @@ async function startGateway() {
         if (binary) relayedBinary.push(Buffer.from(data))
         return origSend(data, optsOrCb, maybeCb)
       }
+      ws.on('message', (data, isBinary) => {
+        if (isBinary) return
+        try {
+          const msg = JSON.parse(Buffer.from(data).toString('utf8'))
+          if (msg !== null && typeof msg === 'object') inboundControl.push(msg)
+        } catch { /* 非 JSON 文本帧不进观测 */ }
+      })
       cb(ws)
     })
   }
@@ -128,7 +138,7 @@ async function startGateway() {
     })
     await store.close()
   }
-  return { store, hub, stun, udp, natRecords, relayedBinary, base, port, tenantId: tenant.id, adminCookie, tenantCookie, close }
+  return { store, hub, stun, udp, natRecords, relayedBinary, inboundControl, base, port, tenantId: tenant.id, adminCookie, tenantCookie, close }
 }
 
 async function api(base, method, reqPath, { body, cookie } = {}) {
@@ -191,10 +201,11 @@ function openUdp() {
 /**
  * C 节点的「UDP 防火墙」socket：真实绑定（地址是真的），但 blocked 期间
  * 出站全部吞掉、入站全部不上送——模拟该节点在 UDP 层被整体丢弃。
- * 恢复后真实收发，punch 重探即可打通直连。
+ * 恢复后真实收发，punch 重探即可打通直连。initialBlocked=false 时以放行态
+ * 起步（先直连、再 setFirewall(true) 模拟中途断 UDP）。
  */
-function makeFirewallSocket(realSocket) {
-  let blocked = true
+function makeFirewallSocket(realSocket, initialBlocked = true) {
+  let blocked = initialBlocked
   const messageListeners = []
   const api = {
     on(ev, fn) {
@@ -235,13 +246,13 @@ function makeFirewallSocket(realSocket) {
  * 真实 RelayPool + 真实 PeerEngine。宿主 typertGateway 的门扇形与 relay-e2e
  * 相同：`workspace/follow` 是可控的帧队列，`session/list` 等走可编程 invoke。
  */
-async function startNode(gw, { name, firewall = false, shared = [], heartbeatMs = 300, hostFetch } = {}) {
+async function startNode(gw, { name, firewall = false, firewallOpen = false, shared = [], heartbeatMs = 300, hostFetch, punch, pathReportMs, clock } = {}) {
   const home = path.join(ROOT, `node-${name}-${Math.random().toString(36).slice(2, 6)}`)
   fs.mkdirSync(home, { recursive: true })
   const stateFile = path.join(home, 'zen-remote-state.json')
   const identity = ensurePeerIdentity(stateFile)
   const punchReal = await openUdp()
-  const punchSocket = firewall ? makeFirewallSocket(punchReal) : punchReal
+  const punchSocket = firewall || firewallOpen ? makeFirewallSocket(punchReal, !firewallOpen) : punchReal
 
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
   for (const id of shared) store.share(id)
@@ -348,7 +359,9 @@ async function startNode(gw, { name, firewall = false, shared = [], heartbeatMs 
     serverName: () => name,
     udpSocket: punchSocket,
     udpProbe: { primaryPort: gw.udp.primaryPort, altPort: gw.udp.altPort ?? 0 },
-    punch: { punchWindowMs: 1000, punchIntervalMs: 100, punchRounds: 10, reprobeIntervalMs: 60_000 },
+    punch: { punchWindowMs: 1000, punchIntervalMs: 100, punchRounds: 10, reprobeIntervalMs: 60_000, ...(punch ?? {}) },
+    ...(pathReportMs !== undefined ? { pathReportMs } : {}),
+    ...(clock !== undefined ? { clock } : {}),
     log: (line) => logs.push(line),
   })
 
@@ -524,6 +537,11 @@ test('PG-8 #2: UDP 降级走网关 WS（零明文），恢复后热切回直连�
       const snapshot = await getTopology(gw, net.id)
       return snapshot.links.some((l) => l.path === 'relay')
     }, 10000, 'the degraded relay leg was reported to the gateway')
+    // PC-16a：中继腿没有测速协议，RTT 未知必须为 null——不得拿 0 或过期
+    // UDP 测量冒充 WS 延迟（今天 relay 腿报 0 是本单要修的缺口）。
+    for (const relayLink of (await getTopology(gw, net.id)).links.filter((l) => l.path === 'relay')) {
+      assert.equal(relayLink.rttMs, null, `relay 腿 ${relayLink.srcNodeId}→${relayLink.peerNodeId} 的 RTT 必须为 null`)
+    }
 
     const virtualConA = await waitPeerOnline(A, C.identity.nodeId)
     const virtualAonC = await waitPeerOnline(C, A.identity.nodeId)
@@ -586,6 +604,22 @@ test('PG-8 #2: UDP 降级走网关 WS（零明文），恢复后热切回直连�
     const topology = await getTopology(gw, net.id)
     const paths = new Set(topology.links.map((l) => l.path))
     assert.ok(paths.has('lan') || paths.has('p2p'), 'the direct leg is live in the gateway topology after the hot switch')
+    // PC-16a：直连腿的 RTT 是 HELLO-ACK/PING→PONG 的实测数值（回环可为 0），
+    // 不因序列化或默认值被换成 null 之外的形态。
+    const directLinks = topology.links.filter((l) => l.path === 'lan' || l.path === 'p2p')
+    assert.ok(directLinks.length > 0, 'direct links present for the RTT shape assertion')
+    for (const link of directLinks) {
+      assert.equal(typeof link.rttMs, 'number', `直连腿 ${link.srcNodeId}→${link.peerNodeId} 的 RTT 应为实测数值`)
+      assert.ok(Number.isFinite(link.rttMs) && link.rttMs >= 0, '直连 RTT 是有限非负数')
+    }
+    // fix1 R1（自然降级弧线）：热切回直连后，两端引擎的本机 status 都重新
+    // 采用新会话的真实测量——中继期它们的 status 与拓扑一样是 null（C 从
+    // 未测得过 RTT，这里的价值在恢复后）。
+    await waitFor(() => {
+      const aRow = A.engine.status().peers.find((p) => p.nodeId === C.identity.nodeId)
+      const cRow = C.engine.status().peers.find((p) => p.nodeId === A.identity.nodeId)
+      return typeof aRow?.rttMs === 'number' && typeof cRow?.rttMs === 'number'
+    }, 15000, 'both engines report fresh measured RTT in status after the hot switch back')
 
     gate.finish()
     await consuming
@@ -637,6 +671,19 @@ test('PG-8 #3: 本机 TOFU 锚点与网关通告分叉 → 独立阻断，trustP
     }, 8000, 'A marked B identity-mismatch')
     assert.equal(A.relayPool.getByServerId(B.identity.nodeId), undefined, 'no virtual entry for the mismatched peer')
 
+    // PC-16a：本机身份阻断必须以 blocked 原样上报——对端在网关侧仍在线，
+    // blocked 是真实观测，不伪装成 relay/offline；RTT 未知保持 null。
+    const blockedRow = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+    assert.equal(blockedRow.path, 'blocked', '本地阻断成员的路径必须是 blocked，不得停留在 none/relay 伪装')
+    await waitFor(async () => {
+      const snapshot = await getTopology(gw, net.id)
+      const link = snapshot.links.find((l) => l.srcNodeId === A.identity.nodeId && l.peerNodeId === B.identity.nodeId)
+      return link !== undefined && link.path === 'blocked'
+    }, 8000, 'A reported the locally blocked edge (engine→WS→hub)')
+    const blockedLink = (await getTopology(gw, net.id)).links
+      .find((l) => l.srcNodeId === A.identity.nodeId && l.peerNodeId === B.identity.nodeId)
+    assert.equal(blockedLink.rttMs, null, 'blocked 边没有任何 RTT 测量：必须为 null')
+
     // 网关转发的二进制帧里没有 A→B 的任何帧（无握手、无数据）
     const aToB = gw.relayedBinary.filter((buf) => buf.length >= 12
       && buf.subarray(4, 8).toString('hex') === A.identity.nodeId
@@ -658,6 +705,12 @@ test('PG-8 #3: 本机 TOFU 锚点与网关通告分叉 → 独立阻断，trustP
 
     // trustPeer：本机显式重锚到「当前通告的钥」之后放行、恢复互通
     assert.equal(A.engine.trustPeer(B.identity.nodeId), true)
+    // PC-16a：重锚即路径事实变化，blocked 边必须被新的整表快照顶掉
+    await waitFor(async () => {
+      const snapshot = await getTopology(gw, net.id)
+      const link = snapshot.links.find((l) => l.srcNodeId === A.identity.nodeId && l.peerNodeId === B.identity.nodeId)
+      return link !== undefined && link.path !== 'blocked'
+    }, 8000, 'the blocked edge was replaced after trustPeer (full-table report)')
     const virtualBonA = await waitPeerOnline(A, B.identity.nodeId)
     const virtualAonB2 = await waitPeerOnline(B, A.identity.nodeId)
     const peerRow = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
@@ -1775,6 +1828,229 @@ test('PG-8 #9: high-latency WS relay + one-way UDP blackhole + sidebar WS sessio
     for (const node of nodes) node.stop()
     for (const sock of liveSockets) { try { sock.destroy() } catch { /* ignore */ } }
     await Promise.all(servers.map((s) => new Promise((r) => { s.closeAllConnections?.(); s.close(r) })))
+    await gw.close()
+  }
+})
+
+// ---------------------------------------------------------------- PC-16a：路径遥测契约
+
+test('PC-16a #4: 直连建立后 UDP 丢失，过期 UDP RTT 不得随中继腿上报', async () => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key' })
+  const nodes = []
+  try {
+    // A 的 UDP 先放行（防火墙 open 起步）后掐断；keepAlive 缩到 500ms×2 帧，
+    // 断流后约 1s 判定直连丢失——整条用例有界，不等生产默认的 15s。
+    const A = await startNode(gw, {
+      name: 'node-a',
+      firewallOpen: true,
+      punch: { keepAliveMs: 500, keepAliveLostFrames: 2 },
+    })
+    const B = await startNode(gw, { name: 'node-b', punch: { keepAliveMs: 500, keepAliveLostFrames: 2 } })
+    nodes.push(A, B)
+    for (const node of [A, B]) {
+      await node.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+      await waitFor(() => node.engine.status().gatewayState === 'authorized', 8000, `${node.name} authorized`)
+    }
+    await waitFor(() => {
+      const peer = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+      return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
+    }, 15000, 'A↔B direct path established')
+
+    // 前置事实：直连腿带着实测 RTT（HELLO-ACK 已测得，数值形态）进了网关拓扑
+    await waitFor(async () => {
+      const link = (await getTopology(gw, net.id)).links
+        .find((l) => l.srcNodeId === A.identity.nodeId && l.peerNodeId === B.identity.nodeId)
+      return link !== undefined && (link.path === 'lan' || link.path === 'p2p') && typeof link.rttMs === 'number'
+    }, 10000, 'the direct leg reported a measured RTT to the gateway')
+    const directRow = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+    assert.equal(typeof directRow.rttMs, 'number', '直连期本机 status 与上报同一事实：实测数值')
+
+    // 掐断 A 的 UDP：keepalive 截止后直连判丢失 → 路径转 relay。过期 UDP RTT
+    // 必须从上报里消失（null），不得沿用旧值冒充当前路径的延迟。
+    A.setFirewall(true)
+    await waitFor(() => {
+      const row = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+      return row !== undefined && row.path === 'relay'
+    }, 10000, 'A downgraded to relay after the UDP loss')
+    // fix1 R1 鉴别断言：本机 status 与上报同 RTT 事实——降中继后 status 不得
+    // 再报 punch 会话里残留的过期 UDP 值。
+    const downgradedRow = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+    assert.equal(downgradedRow.rttMs, null, '本机 status 对中继路径必须报 null，不得沿用过期 UDP RTT')
+    await waitFor(async () => {
+      const link = (await getTopology(gw, net.id)).links
+        .find((l) => l.srcNodeId === A.identity.nodeId && l.peerNodeId === B.identity.nodeId)
+      return link !== undefined && link.path === 'relay' && link.rttMs === null
+    }, 10000, 'the stale UDP RTT disappeared once the path degraded to relay (engine→WS→hub)')
+    const link = (await getTopology(gw, net.id)).links
+      .find((l) => l.srcNodeId === A.identity.nodeId && l.peerNodeId === B.identity.nodeId)
+    assert.equal(link.rttMs, null, 'relay 腿 RTT 必须为 null（清除过期 UDP 值，不以旧值冒充 WS 延迟）')
+
+    // 恢复 UDP 并重探：重新直连后，status 与拓扑都采用新会话的真实新测量
+    A.setFirewall(false)
+    A.engine.reprobePunch()
+    await waitFor(() => {
+      const row = A.engine.status().peers.find((p) => p.nodeId === B.identity.nodeId)
+      return row !== undefined && (row.path === 'lan' || row.path === 'p2p') && typeof row.rttMs === 'number'
+    }, 20000, 'A recovered to direct with a fresh measured RTT in status')
+    await waitFor(async () => {
+      const fresh = (await getTopology(gw, net.id)).links
+        .find((l) => l.srcNodeId === A.identity.nodeId && l.peerNodeId === B.identity.nodeId)
+      return fresh !== undefined && (fresh.path === 'lan' || fresh.path === 'p2p') && typeof fresh.rttMs === 'number'
+    }, 10000, 'the recovered direct leg reports a fresh measured RTT to the gateway')
+    const freshLink = (await getTopology(gw, net.id)).links
+      .find((l) => l.srcNodeId === A.identity.nodeId && l.peerNodeId === B.identity.nodeId)
+    assert.ok(freshLink.path === 'lan' || freshLink.path === 'p2p')
+    assert.equal(typeof freshLink.rttMs, 'number', '恢复直连后网关拓扑采用新会话的真实测量')
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+/** 真实 setTimeout/clearTimeout 的记录壳：行为 1:1 透传，只多记每只定时器的
+ * 毫秒值与清算事实——stop/leave 的「不留上报 timer」用它做可观察断言。
+ * fireOfMs(ms) 提供受控触发接缝：撤掉真实定时器后同步调用回调（fix1 的
+ * 默认 15s 周期「触发契约」不必真等 15 秒）。 */
+function recordingClock() {
+  const outstanding = new Map()
+  const armedLog = []
+  return {
+    now: () => Date.now(),
+    setTimeout(fn, ms) {
+      const rec = { ms, cleared: false, fn }
+      const handle = setTimeout(() => {
+        outstanding.delete(rec)
+        fn()
+      }, ms)
+      rec.handle = handle
+      outstanding.set(handle, rec)
+      armedLog.push(rec)
+      return handle
+    },
+    clearTimeout(handle) {
+      const rec = outstanding.get(handle)
+      if (rec !== undefined) {
+        rec.cleared = true
+        outstanding.delete(handle)
+      }
+      clearTimeout(handle)
+    },
+    /** 受控触发：撤掉所有 ms 值匹配的在途真实定时器，同步调用其回调，
+     * 返回触发的只数。回调里同步再武装的新定时器不受影响。 */
+    fireOfMs(ms) {
+      const hits = []
+      for (const rec of [...outstanding.values()]) {
+        if (rec.ms !== ms) continue
+        outstanding.delete(rec.handle)
+        clearTimeout(rec.handle)
+        hits.push(rec)
+      }
+      for (const rec of hits) rec.fn()
+      return hits.length
+    },
+    /** 还挂在钟上、未被清算的指定毫秒值定时器（含已触发前与触发中的） */
+    outstandingOfMs: (ms) => [...outstanding.values()].filter((r) => r.ms === ms),
+    /** 某一时间点之后新登记的指定毫秒值定时器总数 */
+    armedSince: (index, ms) => armedLog.slice(index).filter((r) => r.ms === ms),
+    armedCount: () => armedLog.length,
+  }
+}
+
+test('PC-16a #5: 有界周期真实上报到网关；stop/leave 后不留 path-report timer', async () => {
+  const gw = await startGateway()
+  const nodes = []
+  const clocks = []
+  try {
+    // —— 周期触发：单独一台节点，pathReportMs 压到 400ms（真实有界周期），
+    // 网关侧入站文本帧观测点数 path-report 到达数——engine→WS→hub 全链路。
+    const net = await createNetwork(gw, { mode: 'key' })
+    const P = await startNode(gw, { name: 'periodic', pathReportMs: 400 })
+    nodes.push(P)
+    await P.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitFor(() => P.engine.status().gatewayState === 'authorized', 8000, 'P authorized')
+    const reportsBefore = gw.inboundControl.filter((m) => m.type === 'path-report').length
+    await waitFor(() => {
+      const count = gw.inboundControl.filter((m) => m.type === 'path-report').length
+      return count >= reportsBefore + 2
+    }, 3000, 'at least two periodic path-reports arrived at the hub with no path change')
+
+    // —— stop/leave 的 timer 卫生：4444ms 是全系统独一无二的周期值，
+    // recording clock 里它只可能来自 path-report 周期。
+    const net2 = await createNetwork(gw, { mode: 'key' })
+    const clock = recordingClock()
+    clocks.push(clock)
+    const Q = await startNode(gw, { name: 'timer-hygiene', pathReportMs: 4444, clock })
+    nodes.push(Q)
+    await Q.engine.joinNetwork(inviteUri(gw, net2.id, net2.joinKey))
+    await waitFor(() => Q.engine.status().gatewayState === 'authorized', 8000, 'Q authorized')
+    await waitFor(() => clock.outstandingOfMs(4444).length >= 1, 2000, 'the periodic report timer is armed')
+    const armedAtLeave = clock.armedCount()
+
+    // leave：resetActiveSession 同步清算周期 timer，此后不得再武装新的
+    Q.engine.leaveNetwork()
+    assert.equal(clock.outstandingOfMs(4444).length, 0, 'leaveNetwork 清掉了在途的周期上报 timer')
+    await sleep(5000)
+    assert.equal(clock.armedSince(armedAtLeave, 4444).length, 0, 'leave 后 5s 内没有再武装任何周期上报 timer')
+
+    // 再入网 → stop：同样的卫生保证
+    await Q.engine.joinNetwork(inviteUri(gw, net2.id, net2.joinKey))
+    await waitFor(() => Q.engine.status().gatewayState === 'authorized', 8000, 'Q re-authorized')
+    await waitFor(() => clock.outstandingOfMs(4444).length >= 1, 2000, 'the periodic timer re-armed after rejoin')
+    const armedAtStop = clock.armedCount()
+    Q.engine.stop()
+    assert.equal(clock.outstandingOfMs(4444).length, 0, 'stop() 清掉了在途的周期上报 timer')
+    await sleep(5000)
+    assert.equal(clock.armedSince(armedAtStop, 4444).length, 0, 'stop 后 5s 内没有再武装任何周期上报 timer')
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+test('PC-16a #6: 默认（不传 pathReportMs）注册 15_000ms 周期，触发后按 15s 再武装', async () => {
+  const gw = await startGateway()
+  const nodes = []
+  const clocks = []
+  try {
+    const net = await createNetwork(gw, { mode: 'key' })
+    const clock = recordingClock()
+    clocks.push(clock)
+    // fix1 R2：生产缺省证据走真实创建的 engine（startNode 不透传 pathReportMs
+    // 时的缺省接线），触发用受控时钟接缝，不必真等 15 秒。D 独居网络——
+    // punch keepalive 的丢失截止（5000×3）同样是 15s，但它只在有直连会话时
+    // 才武装，独居节点的 15s 在途 timer 只能来自 path-report 周期。
+    const D = await startNode(gw, { name: 'default-period', clock })
+    nodes.push(D)
+    await D.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitFor(() => D.engine.status().gatewayState === 'authorized', 8000, 'D authorized')
+    await waitFor(() => clock.outstandingOfMs(15_000).length >= 1, 2000, 'the default 15s report timer was armed at authorization')
+
+    // 触发契约：受控触发 → 一条真实 path-report 过 WS 到网关 + 授权期间按 15s 再武装
+    const armedAtFire = clock.armedCount()
+    const reportsBefore = gw.inboundControl.filter((m) => m.type === 'path-report').length
+    const firedCount = clock.fireOfMs(15_000)
+    assert.ok(firedCount >= 1, '受控触发命中了在途的 15s 周期 timer')
+    await waitFor(
+      () => gw.inboundControl.filter((m) => m.type === 'path-report').length >= reportsBefore + 1,
+      2000,
+      'the fired tick delivered a real path-report over WS to the hub',
+    )
+    assert.ok(clock.armedSince(armedAtFire, 15_000).length >= 1, 'tick 触发后按 15s 再武装（授权期间周期持续）')
+
+    D.engine.stop()
+    assert.equal(clock.outstandingOfMs(15_000).length, 0, 'stop() 清掉默认周期的在途 timer')
+  } catch (err) {
+    for (const node of nodes) console.error(`[dbg ${node.name}]`, node.logs.join(' | '))
+    throw err
+  } finally {
+    for (const node of nodes) node.stop()
     await gw.close()
   }
 })

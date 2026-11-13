@@ -20,7 +20,9 @@
  *    （`onDirectReady` → mux 路径切 UDP、拓扑记 `lan`/`p2p`）；窗口过期
  *    `onPunchFallback` → mux 起网关 WS 中转握手、路径记 `relay`；直连事后
  *    打通/丢失各自热切换路径，ARQ 在途分片随新路径重传不断流。每 15s 和
- *    任意路径变化向网关发 `path-report` 控制帧（`/topology` 的数据源）。
+ *    任意路径变化向网关发 `path-report` 控制帧（`/topology` 的数据源）：
+ *    本机 TOFU 阻断的对端如实报 `blocked`，RTT 未知为 null、实测 0 原样
+ *    保留，中继路径绝不沿用过期 UDP 延迟（PC-16a）。
  */
 import type { Socket as DgramSocket } from 'node:dgram';
 import type { PeerIdentityKeyPair } from './crypto.js';
