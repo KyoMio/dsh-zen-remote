@@ -443,7 +443,25 @@ Each pair of member machines picks its path in this order:
 2. **`p2p` — UDP hole-punched direct**: the gateway's dual UDP ports (primary + alt, see the gateway deployment docs) exchange punch coordinates and the machines connect directly;
 3. **`relay` — gateway ciphertext relay**: when no direct path is ready within the 1000ms punch window, traffic transparently switches to the gateway's WebSocket — still end-to-end encrypted, unreadable to the gateway.
 
-A silent background re-probe runs every 60 seconds; once a direct path opens, the session upgrades back to it without dropping a byte (the degrade/hot-swap behaviors are pinned by `test/peer-e2e.test.cjs`).
+A background re-probe runs every 60 seconds by default and switches back to direct transport when it succeeds. An established direct path is declared lost 15 seconds after its last valid receive, then falls back to relay. Recovery requires a reachable gateway and peer; these default timings do not guarantee lossless recovery from every outage.
+
+Ordinary known-length peer uploads receive an additional 20-second recovery budget. Isolated functional tests cover mid-upload direct→relay and relay→direct transitions with matching byte counts and SHA256, and a single business forwarding operation. This does not establish acceptance for unknown-length streams, arbitrary file sizes, or every real NAT environment.
+
+### Join readiness and pausing
+
+- The wizard's advanced section accepts a gateway address, a 16-digit hexadecimal network ID and an optional passphrase. Omitting the passphrase uses the existing manual-approval flow. The passphrase is masked; collapsing the advanced section, leaving the form or closing the wizard clears that draft.
+- The third light means the remote handshake is complete and synchronization can begin, not that a particular session has finished synchronizing. No peers means waiting for another device. All-ignored peers, partial connectivity and older responses without readiness facts do not turn all lights green.
+- By default, `peer join` waits for readiness and exits nonzero on timeout while reporting the last state. Successful `--no-wait` means submitted only; JSON distinguishes `submitted` from `ready`. Ctrl-C during the wait returns 130 without withdrawing an already submitted join request.
+- Pausing retains the membership record and stops business connections. Updated nodes retain a restricted control connection and can resume without rejoining. Changed identities still require separate trust decisions at the gateway and affected nodes.
+- The network limit includes this machine. `authorized / paused / mismatch` occupy seats; pending and revoked members do not. Shrinking preserves existing mounts, reports `N > M` honestly and blocks additions; increasing the limit fills eligible slots again.
+
+### Gateway and node upgrade order
+
+Back up the gateway database and `master.key`, upgrade the independently deployed gateway, then upgrade each node. Updated gateways accept `blocked` paths and unknown latency as `null`; older gateways may discard these telemetry rows. A missing console edge is therefore not proof that the business connection is absent. Mixed versions may also lack in-place pause recovery; complete both upgrades before accepting recovery behavior.
+
+Updated handshakes preserve v1 interoperability and add a v2 proof binding both peers. Legacy interoperability does not provide the full v2 binding. Only complete absence of the new proof permits v1 handling; incomplete or invalid new proofs do not downgrade. UDP adds no new time window, while WS retains its existing window.
+
+Unknown latency appears as `—`; only a measured zero appears as `0 ms`. An identity block reported by either end is shown as blocked. Historical API names such as `liveRelayKbps` and `relayKbps` remain, but their values are **1024 bytes per second**, displayed with the existing `KB/s` label.
 
 ### Transport upgrades and resource limits
 
@@ -457,7 +475,7 @@ A silent background re-probe runs every 60 seconds; once a direct path opens, th
 ### Security model & zero-knowledge boundary
 
 - **Self-certifying identity**: `nodeId = sha256(Ed25519 public key)[0..8]` — anyone holding the `(nodeId, public key)` pair can verify it independently; the gateway cannot forge a device it has never seen.
-- **Per-session end-to-end encryption**: for every pair of nodes and every session, both sides exchange ONE **ephemeral** X25519 key pair (signed by their long-term Ed25519 identities, replay/substitution-proof) and derive bidirectional simplex AES-256-GCM AEAD keys via HKDF (forward-secret). The wire protocol's 28-byte routing header is the only plaintext (the gateway routes on it alone); payloads are unreadable to the gateway.
+- **Per-session end-to-end encryption**: for every pair of nodes and every session, both sides exchange ONE **ephemeral** X25519 key pair (verified using long-term Ed25519 signatures and the current handshake round; binding strength follows the mixed-version rules above) and derive bidirectional simplex AES-256-GCM AEAD keys via HKDF (forward-secret). The wire protocol's 28-byte routing header is the only plaintext (the gateway routes on it alone); payloads are unreadable to the gateway.
 - **Independent local TOFU pinning**: each machine pins its network peers' public keys in its own state file (`pinnedPeers` in `~/.dsh/zen-remote-state.json`; `verifyOrPinPeerKey` never auto-overwrites). Even if a gateway administrator resets a device's identity and the console shows `mismatch`, every other machine keeps refusing it locally (`identity-mismatch` — no handshake, no mounting) until someone at that machine explicitly clicks "trust new identity" or runs `dsh-zen-remote peer trust <nodeId>` to re-pin.
 - **Anti `zr~` re-nesting**: a remote session this machine mounts carries a `zr~<serverId>~<id>` virtual id; the share table refuses to register a virtual id as this machine's own shared session — "A mounts B, B re-exports A's sessions to C" chaining cannot happen, so session data crosses at most one hop in the network.
 - **Zero-knowledge gateway**: the gateway sees routing headers and ciphertext frames only, holds no session keys; what an administrator sees in the console is membership and online state, never session content.
