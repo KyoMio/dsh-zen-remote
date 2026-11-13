@@ -618,7 +618,7 @@ describe('PeerRateLimiter（令牌桶 + 滑窗）', () => {
     assert.equal(lim.liveRelayKbpsPair('n1', 'a', 'b'), 0);
   });
 
-  test('pendingRelayBytes 待刷盘累计与 drainAllPending 清零', () => {
+  test('pendingRelayBytes 待刷盘累计：snapshot 不清零，confirmFlushed 只确认批次字节（PC-19）', () => {
     const clock = { now: 0 };
     const lim = new PeerRateLimiter({ now: () => clock.now });
     lim.tryRelay({ networkId: 'n', nodeId: 'a', peerNodeId: 'b' }, 100, 4096);
@@ -627,13 +627,19 @@ describe('PeerRateLimiter（令牌桶 + 滑窗）', () => {
     lim.tryRelay({ networkId: 'n', nodeId: 'a', peerNodeId: 'b' }, 999_999_999, 4096); // 被丢弃，不计
     assert.equal(lim.pendingRelayBytes('n', 'a'), 150);
     assert.equal(lim.pendingRelayBytes('n', 'c'), 10);
-    const drained = lim.drainAllPending();
-    assert.deepEqual(drained.sort((x, y) => x.nodeId.localeCompare(y.nodeId)), [
+    // 稳定批次快照：取走读数但不清零——DB 成功前累计原样保留
+    const batch = lim.snapshotAllPending();
+    assert.deepEqual(batch.sort((x, y) => x.nodeId.localeCompare(y.nodeId)), [
       { networkId: 'n', nodeId: 'a', bytes: 150 },
       { networkId: 'n', nodeId: 'c', bytes: 10 },
     ]);
-    assert.equal(lim.pendingRelayBytes('n', 'a'), 0, 'drain 后清零');
-    assert.deepEqual(lim.drainAllPending(), []);
+    assert.equal(lim.pendingRelayBytes('n', 'a'), 150, '快照后累计原样保留（写库在途）');
+    // 写库在途期间新到字节：确认时只扣该批快照量，新字节留待下批
+    lim.tryRelay({ networkId: 'n', nodeId: 'a', peerNodeId: 'b' }, 25, 4096);
+    lim.confirmFlushed(batch);
+    assert.equal(lim.pendingRelayBytes('n', 'a'), 25, '确认旧批不得吞掉在途新增');
+    assert.equal(lim.pendingRelayBytes('n', 'c'), 0, '确认后该成员本批清零');
+    assert.deepEqual(lim.snapshotAllPending(), [{ networkId: 'n', nodeId: 'a', bytes: 25 }]);
   });
 
   test('PC-18 无人读取时滑窗仍有界：持续写不读持有量有界，推进时间后释放旧事件', () => {
@@ -675,17 +681,20 @@ describe('PeerRateLimiter（令牌桶 + 滑窗）', () => {
     assert.equal(lim.liveRelayKbpsTotal(), 0);
     // 窗口清理绝不碰待刷盘累计：上面 2048B 早已滑出窗口，pending 仍完整保留。
     assert.equal(lim.pendingRelayBytes('n', 'a'), 2048);
-    // 再跨一个窗口写入（触发写路径淘汰）后：pending 继续累计、drain 原样取走全部并清零。
+    // 再跨一个窗口写入（触发写路径淘汰）后：pending 继续累计、快照原样取走全部，
+    // 成功确认后扣减为 0（PC-19：窗口清理与批次确认互不越界）。
     clock.now += 5000;
     lim.tryRelay({ networkId: 'n', nodeId: 'c', peerNodeId: 'b' }, 512, 4096);
     assert.equal(lim.pendingRelayBytes('n', 'a'), 2048, '旧成员累计不受窗口清理影响');
     assert.equal(lim.pendingRelayBytes('n', 'c'), 512);
-    const drained = lim.drainAllPending();
-    assert.deepEqual(drained.sort((x, y) => x.nodeId.localeCompare(y.nodeId)), [
+    const batch = lim.snapshotAllPending();
+    assert.deepEqual(batch.sort((x, y) => x.nodeId.localeCompare(y.nodeId)), [
       { networkId: 'n', nodeId: 'a', bytes: 2048 },
       { networkId: 'n', nodeId: 'c', bytes: 512 },
     ]);
-    assert.deepEqual(lim.drainAllPending(), []);
+    lim.confirmFlushed(batch);
+    assert.equal(lim.pendingRelayBytes('n', 'a'), 0);
+    assert.equal(lim.pendingRelayBytes('n', 'c'), 0);
   });
 });
 
@@ -1546,6 +1555,265 @@ describe('二进制帧中转与源地址防伪造', () => {
       assert.ok(aRow.lastSeenAt !== null);
     } finally {
       await gw.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------- PC-19 第一片：批次确认与串行化 flush
+//
+// 契约：flush 取稳定批次快照 → 写库 → 成功后才确认该批；失败保留可重试累计；
+// 在途新增字节不被确认吞掉；定时/手动入口串行化共享同一 flush，重叠调用不重复
+// 写同批，失败不毒化后续调用。无 WS 流量，直接经公开的 limiter/applyNatObservation
+// 喂待写数据，真实 SqliteStore 断言落库结果。
+
+describe('PC-19 第一片：遥测成功后确认、串行 flush 与失败保留', () => {
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+  /**
+   * 独立 harness：真实 SqliteStore + 真实 hub（flushMs/rateTickMs 关闭），
+   * store.flushMemberTelemetry 经原型委托包装出两个受控注入点：
+   * failNext() 让下一次非空写入立即失败（受控测试错误）；hold() 扣住后续非空
+   * 写入直到 releaseHeld()——用于观察写入在途期间的重叠 flush 行为。
+   */
+  async function startTelemetryHarness() {
+    const store = new SqliteStore({
+      seed: { allowSignup: false, maxNetworksPerUser: 4, defaultMaxPeers: 8, relayRateKbps: 64 },
+    });
+    const tenant = await store.createUser({
+      email: TENANT_EMAIL,
+      passwordHash: await hashPassword(TENANT_PASSWORD),
+      role: 'user',
+    });
+    const net = await store.createNetwork({
+      ownerId: tenant.id,
+      name: 'pc19-net',
+      admissionMode: 'key',
+      joinKeyEnc: 'pc19-enc-not-read-by-these-tests',
+      maxPeers: 8,
+    });
+    for (const nodeId of ['aa19aaaa', 'bb19bbbb']) {
+      const member = await store.upsertMemberJoinAttempt({
+        networkId: net.id,
+        nodeId,
+        publicKeyHex: nodeId.slice(0, 2).repeat(32),
+        joinKeyMatched: true,
+      });
+      assert.equal(member.status, 'authorized');
+    }
+
+    const flushCalls = []; // 每次真实进入 store 的非空批次（值拷贝，供批次顺序断言）
+    let failuresRemaining = 0;
+    let holdWrites = false;
+    const heldReleases = [];
+    const hubStore = Object.create(store);
+    hubStore.flushMemberTelemetry = async (updates) => {
+      flushCalls.push(updates.map((u) => ({ ...u })));
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        throw new Error('controlled pc19 flush failure');
+      }
+      if (holdWrites) {
+        await new Promise((resolve) => heldReleases.push(resolve));
+      }
+      return store.flushMemberTelemetry(updates);
+    };
+
+    const hub = new PeerWsHub({
+      store: hubStore,
+      masterKey: deriveMasterKeyFromSecret('pc19-test'),
+      rateTickMs: null,
+      flushMs: null,
+    });
+    const memberRow = async (nodeId) => {
+      const members = await store.listMembers(net.id);
+      return members.find((m) => m.nodeId === nodeId);
+    };
+    return {
+      store,
+      hub,
+      net,
+      flushCalls,
+      memberRow,
+      failNext() {
+        failuresRemaining += 1;
+      },
+      hold() {
+        holdWrites = true;
+      },
+      releaseHeld() {
+        holdWrites = false;
+        for (const release of heldReleases.splice(0)) release();
+      },
+      close: async () => {
+        await hub.close();
+        await store.close();
+      },
+    };
+  }
+
+  test('写失败保留可重试累计：pending 不丢，恢复后一次 flush 补齐且恰好一次', async () => {
+    const h = await startTelemetryHarness();
+    try {
+      h.hub.limiter.tryRelay({ networkId: h.net.id, nodeId: 'aa19aaaa', peerNodeId: 'bb19bbbb' }, 100, 4096);
+      h.failNext();
+      await assert.rejects(h.hub.flushTelemetry(), /controlled pc19 flush failure/);
+      assert.equal(h.hub.limiter.pendingRelayBytes(h.net.id, 'aa19aaaa'), 100, '失败后待刷盘累计必须保留（不得 drain 后丢弃）');
+      assert.equal((await h.memberRow('aa19aaaa')).cumulativeRelayBytes, 0, '失败批次不落库');
+      // 失败后锁/Promise 已释放：后续正常调用可恢复，补齐且不重复
+      await h.hub.flushTelemetry();
+      assert.equal((await h.memberRow('aa19aaaa')).cumulativeRelayBytes, 100, '恢复后补齐且恰好一次');
+      assert.equal(h.hub.limiter.pendingRelayBytes(h.net.id, 'aa19aaaa'), 0, '成功批次确认清零');
+      assert.equal(h.flushCalls.length, 2, '两次非空写入：失败一次 + 恢复一次');
+    } finally {
+      await h.close();
+    }
+  });
+
+  test('写入在途新增不丢、重叠调用串行：第二批只在第一批确认后落库', async () => {
+    const h = await startTelemetryHarness();
+    try {
+      h.hub.limiter.tryRelay({ networkId: h.net.id, nodeId: 'aa19aaaa', peerNodeId: 'bb19bbbb' }, 100, 4096);
+      h.hold();
+      const flush1 = h.hub.flushTelemetry();
+      await tick();
+      assert.equal(h.flushCalls.length, 1, '第一批已进入 store 且被扣住');
+      // 写入在途期间追加新字节，并发发起第二次 flush：必须排队，不与第一批并发写
+      h.hub.limiter.tryRelay({ networkId: h.net.id, nodeId: 'aa19aaaa', peerNodeId: 'bb19bbbb' }, 50, 4096);
+      const flush2 = h.hub.flushTelemetry();
+      await tick();
+      assert.equal(h.flushCalls.length, 1, '串行化：重叠的第二批必须等第一批确认后才进入 store');
+      h.releaseHeld();
+      await flush1;
+      await flush2;
+      assert.equal((await h.memberRow('aa19aaaa')).cumulativeRelayBytes, 150, '两批各落一次，合计恰好一次');
+      assert.equal(h.hub.limiter.pendingRelayBytes(h.net.id, 'aa19aaaa'), 0, '全部确认清零');
+      assert.equal(h.flushCalls.length, 2, '恰好两次非空写入：第一批 100、第二批在途新增 50');
+      assert.deepEqual(h.flushCalls[0].map((u) => u.relayBytesDelta), [100]);
+      assert.deepEqual(h.flushCalls[1].map((u) => u.relayBytesDelta), [50], '在途新增归第二批，不与第一批混批');
+    } finally {
+      await h.close();
+    }
+  });
+
+  test('重叠调用不重复写同批：无新增字节时第二次 flush 空批不落库', async () => {
+    const h = await startTelemetryHarness();
+    try {
+      h.hub.limiter.tryRelay({ networkId: h.net.id, nodeId: 'aa19aaaa', peerNodeId: 'bb19bbbb' }, 100, 4096);
+      const flush1 = h.hub.flushTelemetry();
+      await tick();
+      const flush2 = h.hub.flushTelemetry(); // 与 flush1 重叠
+      h.releaseHeld();
+      await Promise.all([flush1, flush2]);
+      assert.equal(h.flushCalls.length, 1, '同批只落一次');
+      assert.equal((await h.memberRow('aa19aaaa')).cumulativeRelayBytes, 100, '重复调用不重复计数');
+      assert.equal(h.hub.limiter.pendingRelayBytes(h.net.id, 'aa19aaaa'), 0);
+    } finally {
+      await h.close();
+    }
+  });
+
+  test('NAT 观测同批确认：写失败保留待写 NAT，恢复后补落库', async () => {
+    const h = await startTelemetryHarness();
+    try {
+      h.hub.applyNatObservation({
+        networkId: h.net.id,
+        nodeId: 'aa19aaaa',
+        natType: 'cone',
+        reflexiveIp: '10.0.0.9',
+        reflexivePort: 40001,
+        serverPortRole: 'primary',
+      });
+      h.failNext();
+      await assert.rejects(h.hub.flushTelemetry(), /controlled pc19 flush failure/);
+      assert.equal((await h.memberRow('aa19aaaa')).natType, 'unknown', '失败后 NAT 观测不落库也不丢弃');
+      await h.hub.flushTelemetry();
+      const row = await h.memberRow('aa19aaaa');
+      assert.equal(row.natType, 'cone', '恢复后 NAT 观测补落库');
+      assert.equal(row.lastIp, '10.0.0.9');
+    } finally {
+      await h.close();
+    }
+  });
+
+  test('重复 flush 意图合并：重叠调用共享同一尾轮成败、在途不并发写、失败不毒化且有限轮数收尾', async () => {
+    const h = await startTelemetryHarness();
+    const withDeadline = (promise, ms, label) => {
+      let timer;
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} 超出 ${ms}ms`)), ms);
+        }),
+      ]).finally(() => clearTimeout(timer));
+    };
+    try {
+      h.hub.limiter.tryRelay({ networkId: h.net.id, nodeId: 'aa19aaaa', peerNodeId: 'bb19bbbb' }, 100, 4096);
+      h.hold(); // 存储延迟闸：第一轮扣住在 store 内
+      const caller1 = h.hub.flushTelemetry();
+      await tick();
+      assert.equal(h.flushCalls.length, 1, '第一轮已进入 store 且被扣住');
+      // 模拟 DB 挂死期间定时器持续 tick：新字节与重复 flush 意图交替到达
+      h.hub.limiter.tryRelay({ networkId: h.net.id, nodeId: 'aa19aaaa', peerNodeId: 'bb19bbbb' }, 10, 4096);
+      const caller2 = h.hub.flushTelemetry();
+      h.hub.limiter.tryRelay({ networkId: h.net.id, nodeId: 'aa19aaaa', peerNodeId: 'bb19bbbb' }, 20, 4096);
+      const caller3 = h.hub.flushTelemetry();
+      const caller4 = h.hub.flushTelemetry(); // 无新字节的重复合并
+      const caller5 = h.hub.flushTelemetry();
+      await tick();
+      assert.equal(h.flushCalls.length, 1, '在途期间不得并发写，重复意图不得逐个排队进 store');
+      h.releaseHeld(); // 第一轮（100）成功落库并确认
+      h.failNext(); // 紧随其后的下一次非空写入（合并尾轮）受控失败
+      // 所有调用者有界落定（实现若留下无界队列，此处超时失败）
+      const outcomes = await withDeadline(
+        Promise.allSettled([caller1, caller2, caller3, caller4, caller5]),
+        5000,
+        'flush 调用者全部落定',
+      );
+      const fulfilled = outcomes.filter((o) => o.status === 'fulfilled').length;
+      const rejected = outcomes.filter((o) => o.status === 'rejected').length;
+      assert.equal(fulfilled, 1, '开轮的调用者观察第一轮成功');
+      assert.equal(rejected, 4, '合并进同一尾轮的重叠调用必须共享同一轮成败（不得逐 caller 各自成轮）');
+      assert.equal((await h.memberRow('aa19aaaa')).cumulativeRelayBytes, 100, '尾轮失败不落库、不重复计数');
+      assert.equal(h.hub.limiter.pendingRelayBytes(h.net.id, 'aa19aaaa'), 30, '失败后待写累计保留');
+      assert.equal(h.flushCalls.length, 2, '有限轮数：第一轮 + 一个合并尾轮（不逐 caller 排队多轮空转）');
+      // 失败不毒化后续正常入口：恢复后一次 flush 补齐
+      await h.hub.flushTelemetry();
+      assert.equal((await h.memberRow('aa19aaaa')).cumulativeRelayBytes, 130, '恢复后补齐且恰好一次');
+      assert.equal(h.hub.limiter.pendingRelayBytes(h.net.id, 'aa19aaaa'), 0, '全部确认清零');
+    } finally {
+      await h.close();
+    }
+  });
+
+  test('写在途同值新观测不被确认吞掉：旧批确认后新观测仍留下一批（按观测身份确认）', async () => {
+    const h = await startTelemetryHarness();
+    try {
+      const observation = {
+        networkId: h.net.id,
+        nodeId: 'aa19aaaa',
+        natType: 'cone',
+        reflexiveIp: '10.0.0.9',
+        reflexivePort: 40001,
+        serverPortRole: 'primary',
+      };
+      h.hub.applyNatObservation(observation);
+      h.hold();
+      const flush1 = h.hub.flushTelemetry(); // 批次在途：快照 = cone/10.0.0.9
+      await tick();
+      assert.equal(h.flushCalls.length, 1);
+      // 写入在途期间发生**同值**新观测（周期性 STUN 复探返回同一结果）：
+      // 它的 lastSeen 心跳还没落库，不得被旧批的确认按值相等清掉
+      h.hub.applyNatObservation(observation);
+      h.releaseHeld();
+      await flush1;
+      // 旧批确认后：同值新观测必须仍在待写，下一次 flush 携带它落库
+      await h.hub.flushTelemetry();
+      assert.equal(h.flushCalls.length, 2, '同值新观测必须留待下一批（第二次 flush 不得空批早退）');
+      assert.deepEqual(h.flushCalls[1].map((u) => u.natType), ['cone'], '第二批携带新观测');
+      assert.deepEqual(h.flushCalls[1].map((u) => u.lastIp), ['10.0.0.9']);
+      assert.equal((await h.memberRow('aa19aaaa')).natType, 'cone');
+    } finally {
+      await h.close();
     }
   });
 });

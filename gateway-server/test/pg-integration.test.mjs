@@ -795,3 +795,132 @@ function runTestChild(mode, schema, deadlineMs) {
     assert.equal(joinStatuses.filter((s) => s === 'authorized').length, 2);
   });
 });
+
+// ---------------------------------------------------------------- PC-19 第一片：flushMemberTelemetry 单事务全成/全败（真实 PG）
+
+// 契约（PC-19 第一片）：一次 flushMemberTelemetry 的整批 UPDATE 在同一事务 client
+// 里全成或全败——中途普通 SQL 失败（第二条触发 nat_type CHECK 违反）必须回滚
+// 已执行的前序语句；恢复后重试同一批不重复计数。只验证正常明确失败的回滚边界，
+// 不宣称任意断电/COMMIT 结果不明场景下的 exactly-once。
+(hasPg ? describe : describe.skip)('PC-19 第一片：遥测批次单事务（真实 PG，ZR_TEST_PG_URL_FILE 未设置时 skip）', () => {
+  const SCHEMA_PREFIX_PC19 = 'zr_pc19_test_';
+  const masterKey = Buffer.alloc(32, 0x19);
+  const enc = (s) => encryptSecret(s, masterKey);
+
+  let rawUrl;
+  let ownedSchema = null; // 本轮独占 schema，CREATE 成功即拥有权事实
+  let store;
+  let adminId;
+  let net;
+
+  /** 本轮前缀内的 schema 管理只认本轮变量记录的名字（与 PC-06 同款守卫） */
+  function dropOwnedSchemaPc19(schema) {
+    if (typeof schema !== 'string' || !schema.startsWith(SCHEMA_PREFIX_PC19)) {
+      throw new Error(`refusing to drop schema not owned by this run: ${String(schema)}`);
+    }
+    return withRootClient(rawUrl, (c) => c.query(`DROP SCHEMA "${schema}" CASCADE`));
+  }
+
+  before(async () => {
+    rawUrl = readRawDatabaseUrl();
+    const name = SCHEMA_PREFIX_PC19 + randomBytes(6).toString('hex');
+    // 不带 IF NOT EXISTS：创建失败即本轮失败，绝不把别人已有的 schema 当自己的
+    await withRootClient(rawUrl, (c) => c.query(`CREATE SCHEMA "${name}"`));
+    ownedSchema = name;
+    store = await PgStore.connect(databaseUrlFor(ownedSchema, 'zr_pc19_test_main'));
+    await store.ensureBootstrapAdmin({ email: 'pc19-admin@local', password: 'pc19-admin-pass' });
+    adminId = (await store.findUserByEmail('pc19-admin@local')).id;
+    net = await store.createNetwork({
+      ownerId: adminId,
+      name: 'pc19-telemetry',
+      admissionMode: 'key',
+      joinKeyEnc: enc('pc19-k1'),
+      maxPeers: 4,
+    });
+    for (const nodeId of ['51aaaaaa', '52aaaaaa']) {
+      const joined = await store.upsertMemberJoinAttempt({
+        networkId: net.id,
+        nodeId,
+        name: `node-${nodeId}`,
+        publicKeyHex: nodeId + 'a'.repeat(56),
+        joinKeyMatched: true,
+      });
+      assert.equal(joined.status, 'authorized');
+    }
+  });
+
+  after(async () => {
+    const problems = [];
+    if (store !== undefined) {
+      try {
+        await bounded('pc19 store.close', TEARDOWN_STEP_MS, store.close());
+      } catch (error) {
+        problems.push(`close: ${error.message}`);
+      }
+    }
+    if (ownedSchema !== null) {
+      try {
+        await bounded('drop PC-19 主 schema', TEARDOWN_STEP_MS, dropOwnedSchemaPc19(ownedSchema));
+      } catch (error) {
+        problems.push(`drop schema: ${error.message}`);
+      }
+    }
+    if (problems.length > 0) {
+      throw new Error(`PC-19 收尾失败: ${problems.join('; ')}`);
+    }
+  });
+
+  test('单批两成员同一事务全成：字节累加与 NAT/lastIp/lastSeen 合并落库', { timeout: 30_000 }, async () => {
+    await store.flushMemberTelemetry([
+      {
+        networkId: net.id,
+        nodeId: '51aaaaaa',
+        relayBytesDelta: 100,
+        lastIp: '10.1.1.1',
+        natType: 'cone',
+        lastSeenAt: new Date().toISOString(),
+      },
+      { networkId: net.id, nodeId: '52aaaaaa', relayBytesDelta: 200 },
+    ]);
+    const rows = await store.listMembers(net.id);
+    const a = rows.find((m) => m.nodeId === '51aaaaaa');
+    const b = rows.find((m) => m.nodeId === '52aaaaaa');
+    assert.equal(a.cumulativeRelayBytes, 100);
+    assert.equal(a.natType, 'cone');
+    assert.equal(a.lastIp, '10.1.1.1');
+    assert.ok(a.lastSeenAt !== null, 'lastSeenAt 随批次落库');
+    assert.equal(b.cumulativeRelayBytes, 200);
+    assert.equal(b.natType, 'unknown', '未带 NAT 的行保持原值');
+  });
+
+  test('单批第二条普通 SQL 失败（CHECK 违反）→ 整批回滚，恢复后重试不重复计数', { timeout: 30_000 }, async () => {
+    const before = await store.listMembers(net.id);
+    const a0 = before.find((m) => m.nodeId === '51aaaaaa').cumulativeRelayBytes;
+    const b0 = before.find((m) => m.nodeId === '52aaaaaa').cumulativeRelayBytes;
+
+    // 第二条 UPDATE 带 CHECK 枚举外的 natType → 服务端普通约束错误；此时第一条
+    // 已在事务内执行——没有事务的话 +50 会已经落库（自增提交），回滚后必须原样
+    await assert.rejects(
+      store.flushMemberTelemetry([
+        { networkId: net.id, nodeId: '51aaaaaa', relayBytesDelta: 50 },
+        { networkId: net.id, nodeId: '52aaaaaa', relayBytesDelta: 7, natType: 'bogus' },
+      ]),
+    );
+    const afterFail = await store.listMembers(net.id);
+    assert.equal(
+      afterFail.find((m) => m.nodeId === '51aaaaaa').cumulativeRelayBytes,
+      a0,
+      '第一条已执行的写入必须随事务回滚（不得残留 +50）',
+    );
+    assert.equal(afterFail.find((m) => m.nodeId === '52aaaaaa').cumulativeRelayBytes, b0);
+
+    // 恢复：修正后的同一批重试，两成员各自恰好一次（不重复计数）
+    await store.flushMemberTelemetry([
+      { networkId: net.id, nodeId: '51aaaaaa', relayBytesDelta: 50 },
+      { networkId: net.id, nodeId: '52aaaaaa', relayBytesDelta: 7 },
+    ]);
+    const afterRetry = await store.listMembers(net.id);
+    assert.equal(afterRetry.find((m) => m.nodeId === '51aaaaaa').cumulativeRelayBytes, a0 + 50);
+    assert.equal(afterRetry.find((m) => m.nodeId === '52aaaaaa').cumulativeRelayBytes, b0 + 7);
+  });
+});
