@@ -34,7 +34,7 @@ for (const key of Object.keys(process.env)) {
 }
 
 const { checkGatewayShape } = require('../lib/intercept-shape.js')
-const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS, REMOTE_READ_METHODS, REMOTE_UPLINK_STREAM_METHODS, SESSION_STREAM_HOLD_ENDPOINTS, isRemoteWrite, rewriteRemoteEventFrame } = require('../lib/intercept.js')
+const { installIntercept, behaviorSelfCheck, runSelfCheck, CLIENT_METHOD_FIELDS, OPTIONAL_CLIENT_METHOD_FIELDS, REMOTE_READ_METHODS, REMOTE_UPLINK_STREAM_METHODS, SESSION_STREAM_HOLD_ENDPOINTS, isRemoteWrite, rewriteRemoteEventFrame } = require('../lib/intercept.js')
 const { toVirtual, VIRTUAL_GROUP_NAME_MARK: MARK, encodeServerIdZeroWidth } = require('../lib/virtual-id.js')
 const { encodeSessionReferenceUri, decodeSessionReferenceUri } = require('../lib/relay-server.js')
 const { RelayError } = require('../lib/relay-client.js')
@@ -1577,17 +1577,25 @@ test('uninstall leaves a LATER wrapper alone and goes inert underneath it', asyn
 
 // -- 10. the two method tables agree ---------------------------------------------------
 
-test('CLIENT_METHOD_FIELDS is method-for-method and field-for-field identical to RELAY_METHODS', () => {
+test('CLIENT_METHOD_FIELDS and OPTIONAL_CLIENT_METHOD_FIELDS match RELAY_METHODS', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'relay-access.js'), 'utf8')
   const serverTable = {}
-  for (const [, endpoint, fieldsSrc] of source.matchAll(/^    '([a-zA-Z$/]+)': \{ fields: \[([^\]]*)\]/gm)) {
-    serverTable[endpoint] = fieldsSrc
-      .split(',')
-      .map((raw) => raw.trim().replace(/^'|'$/g, ''))
-      .filter(Boolean)
+  const serverOptionalTable = {}
+  const parseList = (src) => src
+    .split(',')
+    .map((raw) => raw.trim().replace(/^'|'$/g, ''))
+    .filter(Boolean)
+  for (const [, endpoint, fieldsSrc, optionalSrc] of source.matchAll(/^    '([a-zA-Z$/]+)': \{ fields: \[([^\]]*)\](?:, optionalFields: \[([^\]]*)\])?/gm)) {
+    serverTable[endpoint] = parseList(fieldsSrc)
+    if (optionalSrc !== undefined) {
+      serverOptionalTable[endpoint] = parseList(optionalSrc)
+    }
   }
   assert.ok(Object.keys(serverTable).length >= 20, `the regex still finds the server table (${Object.keys(serverTable).length} entries)`)
   assert.deepEqual(CLIENT_METHOD_FIELDS, serverTable)
+  assert.deepEqual(OPTIONAL_CLIENT_METHOD_FIELDS, serverOptionalTable)
+  assert.deepEqual(serverOptionalTable['subagents/prompt'], ['request.parentSessionId'])
+  assert.deepEqual(serverOptionalTable['workspace/insertSessionBefore'], ['request.beforeSessionId'])
   // T41a: the NEW field types are compared too — string equality would hide a
   // typo only if both sides misspelled it the same way, so pin the shapes the
   // registry grew by name.
@@ -1608,7 +1616,7 @@ test('CLIENT_METHOD_FIELDS is method-for-method and field-for-field identical to
     'request.sessionId', 'request.address', 'request.parentSessionId', 'request.childSessionId', 'request.beforeSessionId', 'request.workspaceId',
     'parentSessionId', 'childSessionId', 'sessionId', 'workspaceFileScopeId', 'agentId',
   ])
-  for (const fields of Object.values(serverTable)) {
+  for (const fields of [...Object.values(serverTable), ...Object.values(serverOptionalTable)]) {
     for (const field of fields) assert.ok(KNOWN.has(field), `unknown field type: ${field}`)
   }
 })
