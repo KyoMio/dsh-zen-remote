@@ -126,7 +126,7 @@
  * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
  * forwarding subscription is filtered by relay-server.ts itself — it needs
  * the per-eventId registry, not a pure frame function). */
-export type StreamFilter = 'workspace' | 'control';
+export type StreamFilter = 'workspace' | 'control' | 'forge-states';
 /** Which standing filter the caller must apply to an invoke result before it
  * travels: `session-list` narrows the unscoped `session/list` items
  * (relay-filter.ts), `session-reference-candidates` drops the @-mention
@@ -136,7 +136,7 @@ export type StreamFilter = 'workspace' | 'control';
  * `session/modelCatalog` `failures` array (T52-fix — relay-filter.ts: the
  * host's per-group error texts may carry endpoint or credential details, and
  * the client discards `failures` anyway). */
-export type InvokeFilter = 'session-list' | 'session-reference-candidates' | 'model-catalog';
+export type InvokeFilter = 'session-list' | 'session-reference-candidates' | 'model-catalog' | 'workspace-value' | 'session-search';
 /** One invoke decision: allow (optionally through a standing result filter),
  * or the reason that goes into the 403 body. */
 export type InvokeDenyReason = 'no-session' | 'not-shared' | 'forbidden-method';

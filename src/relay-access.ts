@@ -139,6 +139,7 @@ type SessionField =
   | 'request.address'
   | 'request.parentSessionId'
   | 'request.childSessionId'
+  | 'request.beforeSessionId'
   | 'request.workspaceId'
   | 'parentSessionId'
   | 'childSessionId'
@@ -150,7 +151,7 @@ type SessionField =
  * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
  * forwarding subscription is filtered by relay-server.ts itself — it needs
  * the per-eventId registry, not a pure frame function). */
-export type StreamFilter = 'workspace' | 'control'
+export type StreamFilter = 'workspace' | 'control' | 'forge-states'
 
 /** Which standing filter the caller must apply to an invoke result before it
  * travels: `session-list` narrows the unscoped `session/list` items
@@ -161,7 +162,12 @@ export type StreamFilter = 'workspace' | 'control'
  * `session/modelCatalog` `failures` array (T52-fix — relay-filter.ts: the
  * host's per-group error texts may carry endpoint or credential details, and
  * the client discards `failures` anyway). */
-export type InvokeFilter = 'session-list' | 'session-reference-candidates' | 'model-catalog'
+export type InvokeFilter =
+  | 'session-list'
+  | 'session-reference-candidates'
+  | 'model-catalog'
+  | 'workspace-value'
+  | 'session-search'
 
 interface RelayMethod {
   /** Every field that carries session ownership for this method. ALL of
@@ -172,6 +178,10 @@ interface RelayMethod {
    * scrubs the `failures` array; the groups themselves carry no session
    * data). */
   fields: SessionField[]
+  /** Optional fields checked only when present (not `undefined`). If a key
+   * is present, it must still be a valid non-empty string and pass the same
+   * ownership check as required fields. */
+  optionalFields?: SessionField[]
   /** Stream-delivered methods (`mode: 'stream'` in the wire inventory):
    * callable ONLY through the streaming route — an invoke carrying one is
    * refused, and so is a stream carrying a non-stream method. */
@@ -199,8 +209,8 @@ interface RelayMethod {
  * The registry. Deliberately small: everything not listed here — plugin and
  * account management, settings, credentials, the methods located by other
  * ids (`schedule/update|delete|history`, `goals/create|complete`,
- * `fileUploads/list|resolve`, `agentPresets/list|read`,
- * `permissionPresets/*`, `dynamicCordisRunner/*`) — is refused by default.
+ * `fileUploads/list|resolve`, `permissionPresets/*`, `dynamicCordisRunner/*`) —
+ * is refused by default.
  *
  * T31 registered the five session-creating / agent-scoped calls after
  * verifying their ownership story (see the field notes above): creations
@@ -235,7 +245,7 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   // DSH re-validates the parent-child link on every path; the child id is
   // ALSO share-checked through the parentOf inheritance, so a foreign child
   // refuses before DSH is ever asked
-  'subagents/prompt': { fields: ['request.parentSessionId', 'request.childSessionId'] },
+  'subagents/prompt': { fields: ['request.childSessionId'], optionalFields: ['request.parentSessionId'] },
   'subagents/interruptByParent': { fields: ['parentSessionId', 'childSessionId'] },
   // 0.2.2-rc.2 renamed interruptByParent → interruptByUser and dropped
   // parentSessionId / mode. The child still borrows its ancestor's share
@@ -245,13 +255,21 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   // through the agent registry keyed by session id, so it IS the session id
   'fileUploads/upload': { fields: ['agentId'] },
   'fileReferences/list': { fields: ['agentId'] },
-  // goal panel (T41a) — top-level agentId, same lookup shape as fileUploads;
-  // goals/create|complete stay closed (the UI's goal bar uses only these five)
+  // goal panel (T41a + 0.2.2 P0 goals/create|complete) — top-level agentId
   'goals/get': { fields: ['agentId'] },
+  'goals/create': { fields: ['agentId'] },
   'goals/edit': { fields: ['agentId'] },
+  'goals/complete': { fields: ['agentId'] },
   'goals/pause': { fields: ['agentId'] },
   'goals/resume': { fields: ['agentId'] },
   'goals/clear': { fields: ['agentId'] },
+  // P0 0.2.2 interactive tools / teams / recommendations / tool results
+  'agentTeams/setEnabled': { fields: ['agentId'] },
+  'userQuestions/answer': { fields: ['agentId'] },
+  'userQuestions/attachWait': { fields: ['agentId'], stream: true },
+  'actionCards/act': { fields: ['agentId'] },
+  'pluginRecommendations/describe': { fields: ['agentId'] },
+  'toolResults/watch': { fields: ['request.sessionId'], stream: true },
   // slash commands + the preset switches they drive (T41a) — top-level agentId
   'commands/list': { fields: ['agentId'] },
   'commands/execute': { fields: ['agentId'] },
@@ -371,8 +389,52 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'workspace/unpinSession': { fields: ['request.sessionId'] },
   'workspace/archiveSession': { fields: ['request.sessionId'] },
   'workspace/unarchiveSession': { fields: ['request.sessionId'] },
+  'workspace/insertSessionBefore': { fields: ['request.workspaceId', 'request.sessionId'], optionalFields: ['request.beforeSessionId'], resultFilter: 'workspace-value' },
+  // Global search is row-filtered by the shared table on the server; agent
+  // presets have NO per-row filter — they are privacy-gated only while the
+  // share table is EMPTY (list -> [], read -> 403 not-shared). Once any
+  // session is shared, a paired client can read the machine-wide roster and
+  // any preset's YAML document (system prompt and sub-plugin manifests
+  // included) in full; there is no per-preset or per-share filtering.
+  'session/search': { fields: [], resultFilter: 'session-search' },
+  'agentPresets/list': { fields: [] },
+  'agentPresets/read': { fields: [] },
   // workspace — the global follow stream
   'workspace/follow': { fields: [], stream: true, streamFilter: 'workspace' },
+  // forgePanel — 31 session-scoped endpoints (top-level sessionId)
+  'forgePanel/follow': { fields: ['sessionId'], stream: true },
+  'forgePanel/branches': { fields: ['sessionId'] },
+  'forgePanel/diffBases': { fields: ['sessionId'] },
+  'forgePanel/localCommits': { fields: ['sessionId'] },
+  'forgePanel/localDiff': { fields: ['sessionId'] },
+  'forgePanel/localText': { fields: ['sessionId'] },
+  'forgePanel/changeRequestChecks': { fields: ['sessionId'] },
+  'forgePanel/changeRequestCommits': { fields: ['sessionId'] },
+  'forgePanel/changeRequestDiff': { fields: ['sessionId'] },
+  'forgePanel/changeRequestReview': { fields: ['sessionId'] },
+  'forgePanel/changeRequestText': { fields: ['sessionId'] },
+  'forgePanel/changeRequestViewed': { fields: ['sessionId'] },
+  'forgePanel/reviewerCandidates': { fields: ['sessionId'] },
+  'forgePanel/requestWorktree': { fields: ['sessionId'] },
+  'forgePanel/cancelWorktree': { fields: ['sessionId'] },
+  'forgePanel/continueInProject': { fields: ['sessionId'] },
+  'forgePanel/restoreWorktree': { fields: ['sessionId'] },
+  'forgePanel/retryWorktree': { fields: ['sessionId'] },
+  'forgePanel/stopCreation': { fields: ['sessionId'] },
+  'forgePanel/worktreeCleanup': { fields: ['sessionId'] },
+  'forgePanel/refresh': { fields: ['sessionId'] },
+  'forgePanel/track': { fields: ['sessionId'] },
+  'forgePanel/dismiss': { fields: ['sessionId'] },
+  'forgePanel/setFileViewed': { fields: ['sessionId'] },
+  'forgePanel/changeRequestReviewWrite': { fields: ['sessionId'] },
+  'forgePanel/submitReview': { fields: ['sessionId'] },
+  'forgePanel/requestReviews': { fields: ['sessionId'] },
+  'forgePanel/rerunChecks': { fields: ['sessionId'] },
+  'forgePanel/markReady': { fields: ['sessionId'] },
+  'forgePanel/updateBranch': { fields: ['sessionId'] },
+  'forgePanel/merge': { fields: ['sessionId'] },
+  // forgePanel — global PR badge state stream
+  'forgePanel/changeRequestStates': { fields: [], stream: true, streamFilter: 'forge-states' },
   // the forwarded-event subscription (T32): special entry, no session fields —
   // its frames are judged per `agentId`, its answers per forwarded `eventId`
   '$zr/events': { fields: [], stream: true, events: true },
@@ -427,50 +489,88 @@ const TOP_LEVEL_FIELDS: ReadonlySet<string> = new Set([
   'workspaceFileScopeId',
 ])
 
+const REQUEST_FIELDS: ReadonlySet<string> = new Set([
+  'sessionId',
+  'parentSessionId',
+  'childSessionId',
+  'beforeSessionId',
+])
+
+function readOptionalId(raw: unknown, ids: string[]): InvokeDenyReason | undefined {
+  if (raw === undefined) return undefined
+  const id = ownedId(raw)
+  if (id === undefined) return 'no-session'
+  ids.push(id)
+  return undefined
+}
+
+function collectFieldIds(
+  field: SessionField,
+  args: Record<string, unknown>,
+  required: boolean,
+  ids: string[],
+): InvokeDenyReason | undefined {
+  if (TOP_LEVEL_FIELDS.has(field)) {
+    const raw = args[field]
+    if (!required && raw === undefined) return undefined
+    const id = ownedId(raw)
+    if (id === undefined) return 'no-session'
+    ids.push(id)
+    return undefined
+  }
+  const request = args.request
+  if (request === undefined && !required) return undefined
+  if (!isPlainObject(request)) return 'no-session'
+  if (field === 'request.workspaceId') {
+    if (!required && request.workspaceId === undefined) return undefined
+    // Present and a non-empty string, never share-checked.
+    return ownedId(request.workspaceId) === undefined ? 'no-session' : undefined
+  }
+  if (field === 'request.address') {
+    const address = request.address
+    if (address === undefined && !required) return undefined
+    if (!isPlainObject(address)) return 'no-session'
+    if (address.kind === 'session') {
+      const id = ownedId(address.sessionId)
+      if (id === undefined) return 'no-session'
+      ids.push(id)
+      return undefined
+    }
+    if (address.kind === 'subagent') {
+      const childId = ownedId(address.childSessionId)
+      if (childId === undefined) return 'no-session'
+      ids.push(childId)
+      return readOptionalId(address.parentSessionId, ids)
+    }
+    return 'no-session'
+  }
+  const short = field.slice('request.'.length)
+  if (REQUEST_FIELDS.has(short)) {
+    const raw = request[short]
+    if (!required && raw === undefined) return undefined
+    const id = ownedId(raw)
+    if (id === undefined) return 'no-session'
+    ids.push(id)
+    return undefined
+  }
+  return 'no-session'
+}
+
 function claimedSessionIds(entry: RelayMethod, args: unknown): { ids: string[] } | { reason: InvokeDenyReason } {
   // Field-less entries (the global reads) claim nothing by construction —
   // their safety comes from output filtering, and their wire shape is their
   // own (`session/list` takes `_request`, not `request`).
-  if (entry.fields.length === 0) return { ids: [] }
+  const optional = entry.optionalFields ?? []
+  if (entry.fields.length === 0 && optional.length === 0) return { ids: [] }
   if (!isPlainObject(args)) return { reason: 'no-session' }
   const ids: string[] = []
   for (const field of entry.fields) {
-    // Top-level fields read the argument object itself.
-    if (TOP_LEVEL_FIELDS.has(field)) {
-      const id = ownedId(args[field])
-      if (id === undefined) return { reason: 'no-session' }
-      ids.push(id)
-      continue
-    }
-    const request = args.request
-    if (!isPlainObject(request)) return { reason: 'no-session' }
-    if (field === 'request.sessionId' || field === 'request.parentSessionId' || field === 'request.childSessionId') {
-      const id = ownedId(request[field.slice('request.'.length)])
-      if (id === undefined) return { reason: 'no-session' }
-      ids.push(id)
-      continue
-    }
-    if (field === 'request.workspaceId') {
-      // Present and a non-empty string, but never share-checked — see the
-      // SessionField note.
-      if (ownedId(request.workspaceId) === undefined) return { reason: 'no-session' }
-      continue
-    }
-    // 'request.address'
-    const address = request.address
-    if (!isPlainObject(address)) return { reason: 'no-session' }
-    if (address.kind === 'session') {
-      const id = ownedId(address.sessionId)
-      if (id === undefined) return { reason: 'no-session' }
-      ids.push(id)
-    } else if (address.kind === 'subagent') {
-      const id = ownedId(address.parentSessionId)
-      if (id === undefined) return { reason: 'no-session' }
-      ids.push(id)
-    } else {
-      // Unknown kind — not an address DSH would accept either.
-      return { reason: 'no-session' }
-    }
+    const reason = collectFieldIds(field, args, true, ids)
+    if (reason !== undefined) return { reason }
+  }
+  for (const field of optional) {
+    const reason = collectFieldIds(field, args, false, ids)
+    if (reason !== undefined) return { reason }
   }
   return { ids }
 }

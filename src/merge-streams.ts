@@ -209,7 +209,7 @@ function idList(value: unknown): string[] {
  * prefixed with the server name and — while an annotation is set — suffixed
  * with its status copy. Values are copied — the caller's frame is never
  * mutated. */
-function virtualizeWorkspace(
+export function virtualizeWorkspace(
   record: Record<string, unknown>,
   identity: MergerIdentity,
   annotation: MergerAnnotation,
@@ -1120,19 +1120,18 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
           )
           continue
         }
-        for (const key of Object.keys(values)) {
+        const virtualValues = virtualizeProjectionValues(values, identity.serverId)
+        for (const key of Object.keys(virtualValues)) {
           // The baseline gives one sequence number per projection record
-          // (`asOfSeq`) — every key of that record rides it. A modelSelection
-          // value additionally gets its provider ids virtualized (T52) so the
-          // UI matches it against the merged catalog's virtual groups —
-          // UNCONDITIONALLY (T52-fix3): the host's projection store is
-          // first-write-wins per seq, so a catalog-gated original value would
-          // occupy the seq and the later virtual rewrite could never land.
+          // (`asOfSeq`) — every key of that record rides it. Projection values
+          // that reference server ids (modelSelection, subagentCatalog,
+          // agentTeam) are rewritten unconditionally via virtualizeProjectionValues
+          // (T52-fix3: first-write-wins per seq forbids a catalog gate).
           out.push(
             controlProjectionFrame(
               virtualize(sessionId),
               key,
-              key === 'modelSelection' ? virtualizeModelSelectionValue(values[key], identity.serverId) : values[key],
+              virtualValues[key],
               asOfSeq,
             ),
           )
@@ -1167,10 +1166,7 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
         controlProjectionFrame(
           sessionId,
           key,
-          // The modelSelection update's providers go virtual with the session
-          // id (T52) — same unconditional rewrite as the exploded baseline
-          // above (T52-fix3: first-write-wins per seq forbids a catalog gate).
-          key === 'modelSelection' ? virtualizeModelSelectionValue(value, identity.serverId) : value,
+          virtualizeProjectionValue(key, value, identity.serverId),
           seq,
         ),
       )
@@ -1285,14 +1281,17 @@ export function mergeSessionList(localResult: unknown, remoteResult: unknown, se
     if (!isPlainObject(item) || typeof item.sessionId !== 'string') return item
     const out: Record<string, unknown> = { ...item, sessionId: virtualize(item.sessionId) }
     if (typeof item.parentSessionId === 'string') out.parentSessionId = virtualize(item.parentSessionId)
-    if (
-      isPlainObject(item.projections) &&
-      isPlainObject(item.projections.values) &&
-      Object.hasOwn(item.projections.values, 'modelSelection')
-    ) {
-      const values: Record<string, unknown> = { ...item.projections.values }
-      values.modelSelection = virtualizeModelSelectionValue(values.modelSelection, serverId)
-      out.projections = { ...item.projections, values }
+    if (isPlainObject(item.projections) && isPlainObject(item.projections.values)) {
+      const nextValues = virtualizeProjectionValues(item.projections.values, serverId)
+      if (nextValues !== item.projections.values) {
+        out.projections = { ...item.projections, values: nextValues }
+      }
+    }
+    if (isPlainObject(item.projectionValues)) {
+      const nextValues = virtualizeProjectionValues(item.projectionValues, serverId)
+      if (nextValues !== item.projectionValues) {
+        out.projectionValues = nextValues
+      }
     }
     return out
   })
@@ -1406,6 +1405,167 @@ export function virtualizeModelSelectionValue(value: unknown, serverId: string):
     }
   }
   return out
+}
+
+export interface ForgeStatesMerger {
+  onLocal(frame: unknown): unknown[]
+  onRemote(serverId: string, frame: unknown): unknown[]
+  onRemoteGone(serverId: string): unknown[]
+}
+
+/**
+ * Merge local and remote `forgePanel/changeRequestStates` frames into a
+ * single stream compatible with DSH's `foldStates` reducer (which clears its
+ * map on every `baseline` frame). Remote baselines fold in as `changed` frames
+ * once `localSeen` is established, except when a server shrinks/leaves and a
+ * composed `baseline` is required to evict stale remote URLs.
+ */
+export function createForgeStatesMerger(): ForgeStatesMerger {
+  let localSeen = false
+  const localByUrl = new Map<string, Record<string, unknown>>()
+  const remoteByServer = new Map<string, Map<string, Record<string, unknown>>>()
+
+  const validStatesOf = (raw: unknown): Record<string, unknown>[] => {
+    if (!Array.isArray(raw)) return []
+    const out: Record<string, unknown>[] = []
+    for (const item of raw) {
+      if (isPlainObject(item) && typeof item.url === 'string' && item.url !== '') out.push(item)
+    }
+    return out
+  }
+
+  const composedStates = (): Record<string, unknown>[] => {
+    const merged = new Map<string, Record<string, unknown>>()
+    for (const serverMap of remoteByServer.values()) {
+      for (const [url, state] of serverMap) merged.set(url, state)
+    }
+    for (const [url, state] of localByUrl) merged.set(url, state)
+    return [...merged.values()]
+  }
+
+  const hasRemoteStates = (): boolean => {
+    for (const map of remoteByServer.values()) {
+      if (map.size > 0) return true
+    }
+    return false
+  }
+
+  return {
+    onLocal(frame: unknown): unknown[] {
+      if (!isPlainObject(frame)) return []
+      const states = validStatesOf(frame.states)
+      if (frame.type === 'baseline') {
+        localSeen = true
+        localByUrl.clear()
+        for (const s of states) localByUrl.set(s.url as string, s)
+        return [{ type: 'baseline', states: hasRemoteStates() ? composedStates() : [...localByUrl.values()] }]
+      }
+      if (frame.type === 'changed') {
+        for (const s of states) localByUrl.set(s.url as string, s)
+        if (!localSeen || states.length === 0) return []
+        return [{ type: 'changed', states }]
+      }
+      return []
+    },
+
+    onRemote(serverId: string, frame: unknown): unknown[] {
+      if (!isPlainObject(frame)) return []
+      const states = validStatesOf(frame.states)
+      if (frame.type === 'baseline') {
+        const prev = remoteByServer.get(serverId)
+        const next = new Map<string, Record<string, unknown>>()
+        for (const s of states) next.set(s.url as string, s)
+        let pruned = false
+        if (prev !== undefined) {
+          for (const url of prev.keys()) {
+            if (!next.has(url)) {
+              pruned = true
+              break
+            }
+          }
+        }
+        if (next.size === 0) remoteByServer.delete(serverId)
+        else remoteByServer.set(serverId, next)
+        if (!localSeen) return []
+        if (pruned) return [{ type: 'baseline', states: composedStates() }]
+        const visible = [...next.values()].filter((s) => !localByUrl.has(s.url as string))
+        return visible.length > 0 ? [{ type: 'changed', states: visible }] : []
+      }
+      if (frame.type === 'changed') {
+        let serverMap = remoteByServer.get(serverId)
+        if (serverMap === undefined) {
+          serverMap = new Map<string, Record<string, unknown>>()
+          remoteByServer.set(serverId, serverMap)
+        }
+        for (const s of states) serverMap.set(s.url as string, s)
+        if (!localSeen) return []
+        const visible = states.filter((s) => !localByUrl.has(s.url as string))
+        return visible.length > 0 ? [{ type: 'changed', states: visible }] : []
+      }
+      return []
+    },
+
+    onRemoteGone(serverId: string): unknown[] {
+      const removed = remoteByServer.delete(serverId)
+      if (!removed || !localSeen) return []
+      return [{ type: 'baseline', states: composedStates() }]
+    },
+  }
+}
+
+/**
+ * Rewrite one projection key's value for a remote session so embedded
+ * server-scoped ids (`modelSelection.provider`, `subagentCatalog[].id`,
+ * `agentTeam.tasks[].ownerId`) carry `zr~<serverId>~`. Unrecognized keys and
+ * malformed shapes pass through by identity.
+ */
+export function virtualizeProjectionValue(key: string, value: unknown, serverId: string): unknown {
+  if (key === 'modelSelection') return virtualizeModelSelectionValue(value, serverId)
+  if (key === 'subagentCatalog') {
+    if (!Array.isArray(value)) return value
+    return value.map((entry) =>
+      isPlainObject(entry) && typeof entry.id === 'string' && entry.id !== ''
+        ? { ...entry, id: toVirtual(serverId, entry.id) }
+        : entry,
+    )
+  }
+  if (key === 'agentTeam') {
+    if (!isPlainObject(value) || !Array.isArray(value.tasks)) return value
+    return {
+      ...value,
+      tasks: value.tasks.map((task) =>
+        isPlainObject(task) && typeof task.ownerId === 'string' && task.ownerId !== ''
+          ? { ...task, ownerId: toVirtual(serverId, task.ownerId) }
+          : task,
+      ),
+    }
+  }
+  if (key === 'agentPreset') {
+    return typeof value === 'string' && value !== '' ? toVirtual(serverId, value) : value
+  }
+  return value
+}
+
+/**
+ * Virtualize every rewritable entry in a session projection `values` map
+ * (shared across `session/follow`, `session/projections`, `session/list`, and
+ * `session/control`). Returns the input map unchanged if nothing needed
+ * rewriting.
+ */
+export function virtualizeProjectionValues(
+  values: Record<string, unknown>,
+  serverId: string,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...values }
+  let changed = false
+  for (const key of Object.keys(out)) {
+    const next = virtualizeProjectionValue(key, out[key], serverId)
+    if (next !== out[key]) {
+      out[key] = next
+      changed = true
+    }
+  }
+  return changed ? out : values
 }
 
 /**
@@ -1557,4 +1717,81 @@ export function composeMergedWorkspaceFrames(
     pinned: { type: 'pinned', pinnedSessionIds: pinnedIds },
     workspaces,
   }
+}
+
+/**
+ * Merge one server's filtered `session/search` `{ items, hasMore }` answer
+ * onto the accumulator (local first, then each server), virtualizing every
+ * valid remote hit's `sessionId`.
+ */
+export function mergeSessionSearch(localResult: unknown, remoteResult: unknown, serverId: string): unknown {
+  if (!isPlainObject(localResult) || !Array.isArray(localResult.items)) return localResult
+  if (!isPlainObject(remoteResult) || !Array.isArray(remoteResult.items)) return localResult
+  const remoteItems: Record<string, unknown>[] = []
+  for (const item of remoteResult.items) {
+    if (!isPlainObject(item) || typeof item.sessionId !== 'string' || item.sessionId === '') continue
+    remoteItems.push({ ...item, sessionId: toVirtual(serverId, item.sessionId) })
+  }
+  const hasMore = Boolean(localResult.hasMore) || Boolean(remoteResult.hasMore)
+  if (remoteItems.length === 0 && hasMore === Boolean(localResult.hasMore)) return localResult
+  return { ...localResult, items: [...localResult.items, ...remoteItems], hasMore }
+}
+
+const BUILTIN_PRESET_NAMES: Record<MergerLang, Readonly<Record<string, string>>> = {
+  zh: {
+    standard: '标准模式',
+    ptc: 'PTC 模式',
+    minimal: '极简模式',
+    cordis: '创造模式',
+  },
+  en: {
+    standard: 'Standard mode',
+    ptc: 'PTC mode',
+    minimal: 'Minimal mode',
+    cordis: 'Creator mode',
+  },
+}
+
+/** Format one remote agent preset display name with localized built-in fallback
+ * and `[<serverName>] ` prefix so the origin server stays clear. */
+export function resolveRemotePresetName(
+  presetId: string,
+  rawName: unknown,
+  serverName: string,
+  lang: MergerLang = 'zh',
+): string {
+  const resolvedLang: MergerLang = lang === 'en' ? 'en' : 'zh'
+  const base =
+    typeof rawName === 'string' && rawName.trim() !== ''
+      ? rawName
+      : (BUILTIN_PRESET_NAMES[resolvedLang][presetId] ?? presetId)
+  return `[${serverName}] ${base}`
+}
+
+/**
+ * Merge one server's `agentPresets/list` roster onto the local answer: every
+ * remote preset gets a virtual `id`, `[serverName]`-prefixed display name
+ * (with built-in preset fallback), and `isDefault: false` so local default
+ * settings never accidentally pick a remote preset id.
+ */
+export function mergeAgentPresetRosters(
+  localResult: unknown,
+  remoteResult: unknown,
+  identity: MergerIdentity,
+  lang: MergerLang = 'zh',
+): unknown {
+  if (!isPlainObject(localResult) || !Array.isArray(localResult.presets)) return localResult
+  if (!isPlainObject(remoteResult) || !Array.isArray(remoteResult.presets)) return localResult
+  const remotePresets: Record<string, unknown>[] = []
+  for (const item of remoteResult.presets) {
+    if (!isPlainObject(item) || typeof item.id !== 'string' || item.id === '') continue
+    remotePresets.push({
+      ...item,
+      id: toVirtual(identity.serverId, item.id),
+      name: resolveRemotePresetName(item.id, item.name, identity.serverName, lang),
+      isDefault: false,
+    })
+  }
+  if (remotePresets.length === 0) return localResult
+  return { ...localResult, presets: [...localResult.presets, ...remotePresets] }
 }
