@@ -306,7 +306,7 @@ dsh-zen-remote peer leave          # 退出网络
 | `pushSummary` | 关 | 推送通知正文是否附带本回合最终回复摘要（截断至 120 字） |
 | `pushTool` | 开 | 是否向模型注册 `push_notify` 主动推送工具 |
 | `idleHours` | `48` | 远程共享会话的闲置自动休眠时长（小时，范围 `(0, 8760]`） |
-| `maxServers`（客户端） | `8` | 一个子客户端最多同时配对几台服务端；整数 `1..64`，现场读取（改动无需重载插件行），环境变量 `LAN_GATE_MAX_SERVERS` 优先。peer 模式下网络下发的 `maxPeersFromGateway`：本字段未配置时直接以其为准，配置过则只降不升 |
+| `maxServers`（客户端） | `8` | 一个子客户端最多同时配对几台服务端；整数 `1..64`，现场读取（改动无需重载插件行），环境变量 `LAN_GATE_MAX_SERVERS` 优先。peer 模式下网络上限包含本机：远端挂载上限为 `maxPeersFromGateway - 1`，再受本机显式 `maxServers` 限制；缩容不踢已有挂载 |
 | `autoShareNewSessions` | 关 | 主服务端新建的会话是否自动开启远程共享 |
 | `pluginBridgeConsent` | `{}` | 插件桥整机数据授权表（插件名 → 布尔值） |
 | `serverUrl`（客户端） | 空 | 远端主服务端的网关地址（公网强制 `https://`，内网允许 `http://`）。旧版单服务端字段：已配对列表现存于 `~/.dsh/zen-remote-state.json`（最多 8 台），该行凭证会在首次启动时自动迁入 |
