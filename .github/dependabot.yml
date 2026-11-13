@@ -30,3 +30,9 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "@types/react"
         update-types: ["version-update:semver-major"]
+      # web-push 4 起 ESM-only，而 lib/lan-gate-server.cjs 是 CJS 顶层
+      # require('web-push')：node <20.19/22.12 的老宿主（peer 仍支持 0.1.7）
+      # 升级后网关子进程启动即崩（ERR_REQUIRE_ESM），且 v4 无功能收益（PR #58）。
+      # 等砍掉 0.1.7 peer 或 node 地板抬到 ≥22 再手动升。
+      - dependency-name: "web-push"
+        update-types: ["version-update:semver-major"]

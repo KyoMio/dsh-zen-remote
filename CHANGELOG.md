@@ -16,10 +16,6 @@
 - **远程支持 DSH 0.2.2 的面板与交互 API**（需两端 DSH 0.2.2）：Forge 面板远程可用（31 个会话级方法 + 全局 PR 状态流 `forgePanel/changeRequestStates`，覆盖分支、diff、评审、Worktree 等读写与刷新），并新增全局会话搜索（`session/search`，按共享表逐行过滤）、Agent 预设查看与选择（`agentPresets/list|read|select`）、目标「创建 / 完成」与激活状态实时同步（`goals/create|complete`，goals 共 7 个方法）、提问应答与等待（`userQuestions/answer|attachWait`）、动作卡（`actionCards/act`）、工具结果监视流（`toolResults/watch`）、团队开关（`agentTeams/setEnabled`）、插件推荐（`pluginRecommendations/describe`）与工作区会话排序（`workspace/insertSessionBefore`）；`subagents/prompt` 的父会话参数随官方 0.2.2-rc.2 改为可选。较旧 DSH 上这些方法按「方法不存在」降级，不影响既有功能。
 - **Agent 预设的远程可见范围**：主服务端没有任何共享会话时，已配对设备读不到任何预设（`agentPresets/list` 返回空名册、`read` 直接拒绝）；**一旦共享任意一个会话**，已配对设备即可读取全机预设名册（自定义预设的名称、描述与失效原因），并按预设 id 读取任意预设的完整 YAML 文档（内容含系统提示词与子插件清单）——没有逐预设或按共享会话归属的过滤。共享会话即视为同意开放全部预设资料，请在共享前知情。
 
-### 兼容
-
-- **适配 DSH 0.2.2-rc.2**：远程会话转发官方工作区文件搜索（`workspaceFiles/search`）、办公文档预览（`officeKit/render`，同时保留 0.2.2-rc.1 / npm `latest` 的 `officeToPdf/render`）、子智能体中断（`subagents/interruptByUser`，同时保留 `interruptByParent`），以及 Agent 终端侧栏的会话终端监视流（`terminal/watch`）。两端版本混连时会话 / 文件 / 子智能体等指纹组会显示为「不同」，不会硬拒绝。
-
 ### 修复
 
 - **恢复与就绪状态更准确**：修复自动重探定时器与恢复握手竞争造成的单端直连；直连丢失按最后有效收包后 15 秒判定。向导依据真实远端握手显示就绪，CLI 默认等待超时不再假成功，`--no-wait` 明确只表示提交。
@@ -32,7 +28,24 @@
 - **修复网关禁用账户后的重新准入**：禁用账户不能通过旧身份或邀请重新接入，认证和 STUN 在途结果不会跨撤权或重连生效，其他账户的正常认证不受影响。
 - **修复节点端无正文响应卡住**：204/205/304 与 HEAD 响应正常完成；非法响应元数据明确报错并清理请求，不再永久等待。
 - **修复节点端远程会话只显示历史、后续内容不实时更新**：较大的历史快照或会话状态帧发送后，工具执行、思考、回复及模型选择继续实时同步，无需切换会话刷新；同时修复同一通道的大响应传输停滞。
-- **修复断网恢复后远程连接永久停留在离线**（[#56](https://github.com/KyoMio/dsh-zen-remote/issues/56)，已随 2.4.2 发布）：加入进行中的握手失败后不再丢失自动重试排程，「立即重连」按钮改按真实离线状态启用。
+
+## 2.4.4（2026-11-13）
+
+### 兼容
+
+- **适配 DSH 0.2.2-rc.3**：会话等远程指纹与 0.2.2-rc.2 相同（仍为 `r:c3b0734019c7`，27 个端点）。允许清单未改；新的 DeepSeek 会话导入远程方法（`deepseekChatImport/limits`）按默认不暴露。范围仍覆盖 npm `latest`（0.2.2-rc.1）。
+
+## 2.4.3（2026-11-12）
+
+### 兼容
+
+- **适配 DSH 0.2.2-rc.2**：远程会话转发官方工作区文件搜索（`workspaceFiles/search`）、办公文档预览（`officeKit/render`，同时保留 0.2.2-rc.1 / npm `latest` 的 `officeToPdf/render`）、子智能体中断（`subagents/interruptByUser`，同时保留 `interruptByParent`），以及 Agent 终端侧栏的会话终端监视流（`terminal/watch`）。两端版本混连时会话 / 文件 / 子智能体等指纹组会显示为「不同」，不会硬拒绝。
+
+## 2.4.2（2026-11-11）
+
+### 修复
+
+- **修复断网恢复后远程连接永久停留在离线**（[#56](https://github.com/KyoMio/dsh-zen-remote/issues/56)）：加入进行中的握手失败后不再丢失自动重试排程，「立即重连」按钮改按真实离线状态启用。
 
 ## 2.4.1（2026-11-09）
 
