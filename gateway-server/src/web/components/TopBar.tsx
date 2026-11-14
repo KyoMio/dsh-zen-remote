@@ -7,6 +7,9 @@
 // 全部替换）；账号菜单身份区展示当前用户组与到期（含到期回退提醒），并新增
 // 「账号设置…」入口（打开 AccountSettingsModal）；「网关管理」入口严格仅
 // role === 'admin' 渲染，普通用户不可见、不可点。
+// GC-10b：切换菜单底部展示当前用户组建网额度摘要（管理员显示「不限」），
+// 普通用户达组上限时禁用「新建网络…」并以 title 提示组上限；↑/↓ 焦点循环
+// 与打开预聚焦均跳过禁用项（:not([disabled])），键盘导航不会卡死。
 import { useCallback, useEffect, useRef } from 'react';
 import type { KeyboardEvent } from 'react';
 
@@ -43,10 +46,11 @@ export interface TopBarProps {
   onUi: (patch: Partial<UiLocalState>) => void;
 }
 
-/** 菜单项焦点循环：↑/↓ 移动，越过首尾回绕 */
+/** 菜单项焦点循环：↑/↓ 移动，越过首尾回绕；被禁用的菜单项（GC-10b 建网达上限）
+ * 不参与循环——`:not([disabled])` 过滤，↑/↓ 不会把焦点卡死在禁用按钮上 */
 function cycleMenuFocus(menu: HTMLElement | null, offset: 1 | -1): void {
   if (menu === null) return;
-  const items = Array.from(menu.querySelectorAll<HTMLElement>('[data-menu-item]'));
+  const items = Array.from(menu.querySelectorAll<HTMLElement>('[data-menu-item]:not([disabled])'));
   if (items.length === 0) return;
   const current = document.activeElement instanceof HTMLElement ? items.indexOf(document.activeElement) : -1;
   let next: number;
@@ -77,11 +81,12 @@ function useMenuBehavior(open: boolean, close: () => void) {
     };
   }, [open, close]);
 
-  // 打开即聚焦首项：菜单与本次 effect 同一轮提交，DOM 已就绪，直接 focus 即可
-  // （↑/↓ 的焦点循环从 document.activeElement 出发，预聚焦让键盘路径从首项开始）
+  // 打开即聚焦首个可用项：菜单与本次 effect 同一轮提交，DOM 已就绪，直接 focus
+  // 即可（↑/↓ 的焦点循环从 document.activeElement 出发，预聚焦让键盘路径从首项
+  // 开始；同样跳过禁用项，达上限时键盘用户从网络行开始而不是卡在禁用的新建项）
   useEffect(() => {
     if (!open) return;
-    menuRef.current?.querySelector<HTMLElement>('[data-menu-item]')?.focus();
+    menuRef.current?.querySelector<HTMLElement>('[data-menu-item]:not([disabled])')?.focus();
   }, [open]);
 
   const onKeyDown = useCallback(
@@ -151,6 +156,11 @@ export function TopBar(props: TopBarProps) {
   };
   const selectedCounts = selected !== null ? rowCounts(selected) : null;
 
+  // 建网门槛（GC-10b / ui-ux-spec §3.1）：普通用户建网数达所在组上限时禁用
+  // 「新建网络…」；管理员组上限不限（maxNetworks === null）永远可建。
+  const quotaCreateBlocked =
+    user.role !== 'admin' && quota !== null && quota.maxNetworks !== null && quota.usedNetworks >= quota.maxNetworks;
+
   return (
     <header className="topbar">
       <BrandMark />
@@ -212,11 +222,29 @@ export function TopBar(props: TopBarProps) {
                 );
               })}
               <div className="menu-sep" aria-hidden="true" />
+              {/* 建网额度摘要（GC-10b / ui-ux-spec §3.1）：额度行不是菜单项，
+                  不参与 ↑/↓ 焦点循环；管理员上限不限时显示「不限」 */}
+              {quota !== null && (
+                <div role="presentation" style={{ padding: '2px 10px 6px', fontSize: 12.5, color: 'var(--ink-3)' }}>
+                  {t('account.networkQuotaSummary', {
+                    used: quota.usedNetworks,
+                    limit: quota.maxNetworks === null ? t('common.unlimited') : quota.maxNetworks,
+                  })}
+                  {' · '}
+                  {quota.groupName}
+                </div>
+              )}
               <button
                 type="button"
                 role="menuitem"
                 data-menu-item
                 className="menu-item"
+                disabled={quotaCreateBlocked}
+                title={
+                  quotaCreateBlocked && quota !== null && quota.maxNetworks !== null
+                    ? `${t('network.groupNetworkCap', { n: quota.maxNetworks })}${quota.isExpiredFallback ? ` · ${t('account.groupExpired')}` : ''}`
+                    : undefined
+                }
                 onClick={() => {
                   onCreateNetwork();
                   closeSwitcher();

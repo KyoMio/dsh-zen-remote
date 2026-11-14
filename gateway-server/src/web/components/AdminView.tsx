@@ -1,26 +1,29 @@
 // 网关管理页（GC-10 重构）：页头只读运行态条 + 条件安全告警横幅 +
 // 「用户管理 / 用户组 / 网关与发信设置」三标签页工作台。
 //
-// 数据面：App.tsx 仍按 GC-6b 的接线提供 users（3 秒轮询切片）与 settings
-//（进入视图拉取一次）；本页在此基础上用模块级 ConsoleClient 自行补齐
-// runtime 轮询（ManagedRefreshCycle，同 PC-20 的忙碌跳过纪律）与用户组列表，
-// 面板内的增删改走同一客户端，成功后立即补拍对应列表（补拍结果作为本地
-// 覆盖层显示，App 的下一次轮询落库后自动丢弃，恢复以 store 为准）。
+// 数据面（GC-10b 收口）：runtime / settings / groups / users 四张管理切片全部
+// 由 App.tsx 统一持有并经 props 注入（进入视图拉取 + 3 秒可见性受控轮询 +
+// 面板动作后的补拍都写回 store），本页不再自建 ConsoleClient、不再维护本地
+// 影子状态与自己的 ManagedRefreshCycle——App 是唯一请求源，杜绝双客户端
+// 各拉各的。面板内的增删改走注入的同一客户端，成功后经 onRefresh* 回调由
+// App 补拍对应切片。
 //
 // 安全红线：安全告警只有非阻塞的 warn-tint 提示横幅，绝不提供
 // 「允许不安全连接」开关；运行态展示全部来自 /admin/runtime 的脱敏视图。
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 
 import { formatBytes, formatRate } from '../format';
 import { LOCALE_STORAGE_KEY, resolveLocale } from '../i18n/locales';
 import type { Locale, LocaleKey, TranslateFn } from '../i18n/locales';
-import { ConsoleApiError, ConsoleClient, ManagedRefreshCycle } from '../store/console-store';
+import { ConsoleApiError, ConsoleClient } from '../store/console-store';
 import type {
   AdminSettingsData,
+  AdminSliceKey,
   AdminUserRow,
   GatewayRuntimeStatus,
   SecurityWarning,
+  SliceLoadPhase,
   SystemSettings,
   UiLocalState,
   UserGroup,
@@ -31,9 +34,18 @@ import { AlertIcon } from './Icons';
 
 export interface AdminViewProps {
   t: TranslateFn;
-  users: AdminUserRow[];
-  /** 脱敏设置视图（GC-6b 扩展形态）；管理员数据未拉到前是 null */
+  /** 控制台客户端（GC-10b 起由 App 注入同一实例，本页不再自建第二请求源） */
+  client: ConsoleClient;
+  /** 只读运行态（App 3 秒轮询切片）；未拉到前是 null */
+  runtime: GatewayRuntimeStatus | null;
+  /** 脱敏设置视图（GC-6b 扩展形态，App 进视图拉取 + PATCH 返回值落库）；未拉到前是 null */
   settings: AdminSettingsData | null;
+  /** 用户组列表（App 进视图拉取，组 CRUD / 默认组切换后补拍） */
+  groups: UserGroup[];
+  users: AdminUserRow[];
+  /** 四张管理切片各自的加载阶段与末次错误（GC-10b：App 统一持有） */
+  adminLoad: Readonly<Record<AdminSliceKey, SliceLoadPhase>>;
+  adminError: Readonly<Record<AdminSliceKey, string | null>>;
   currentUserId: string;
   ui: UiLocalState;
   onUi: (patch: Partial<UiLocalState>) => void;
@@ -41,13 +53,15 @@ export interface AdminViewProps {
   onPatchSettings: (patch: Partial<SystemSettings>) => void;
   /** 用户启停：仍走 App 的实现（PATCH 后立即刷新 store 用户切片） */
   onSetUserActive: (userId: string, active: boolean) => void;
+  /** 面板变更用户后立即补拍用户列表（App 写回 store 用户切片） */
+  onRefreshUsers: () => Promise<void>;
+  /** 组 CRUD / 默认组切换后立即补拍组列表 */
+  onRefreshGroups: () => Promise<void>;
+  /** publicUrl 热改后刷新页头运行态条（生效入口与来源标签立即跟随） */
+  onRefreshRuntime: () => Promise<void>;
+  /** 设置 PATCH / 密钥操作成功：App 用返回的最新脱敏视图整体替换设置切片 */
+  onSettingsChanged: (next: AdminSettingsData) => void;
 }
-
-/** 运行态轮询周期：与 App 的用户切片轮询同节拍（PC-20） */
-const RUNTIME_REFRESH_INTERVAL_MS = 3000;
-
-/** 管理工作台共用的同源客户端（模块级单例，与 App.tsx 同型） */
-export const adminClient = new ConsoleClient();
 
 /** 浏览器侧读取当前界面语言（formatQuotaExpiry / formatBytesQuota 的入参）；与 Modal.resolveCloseLabel 同源 */
 export function readLocale(): Locale {
@@ -170,78 +184,32 @@ type AdminTab = (typeof TAB_ORDER)[number];
 // ---------------------------------------------------------------- 主视图
 
 export function AdminView(props: AdminViewProps) {
-  const { t, users, settings, currentUserId, ui, onUi, onSetUserActive } = props;
+  const {
+    t,
+    client,
+    runtime,
+    settings,
+    groups,
+    users,
+    adminLoad,
+    adminError,
+    currentUserId,
+    ui,
+    onUi,
+    onSetUserActive,
+    onRefreshUsers,
+    onRefreshGroups,
+    onRefreshRuntime,
+    onSettingsChanged,
+  } = props;
 
   const [tab, setTab] = useState<AdminTab>('users');
-  const [runtime, setRuntime] = useState<GatewayRuntimeStatus | null>(null);
-  const [groups, setGroups] = useState<UserGroup[]>([]);
-  // 设置的本地镜像：App 进入视图拉一次作为种子；面板内 PATCH 成功后由本页自更新
-  const [settingsLocal, setSettingsLocal] = useState<AdminSettingsData | null>(settings);
-  // 用户列表的本地补拍：面板变更后立即刷新的覆盖层，App 轮询落库后自动丢弃
-  const [usersOverride, setUsersOverride] = useState<AdminUserRow[] | null>(null);
   const tabRefs = useRef<Partial<Record<AdminTab, HTMLButtonElement | null>>>({});
 
-  // props.settings 引用变化（进入视图 / App 重拉）即重新播种本地镜像
-  useEffect(() => {
-    setSettingsLocal(settings);
-  }, [settings]);
-
-  // App 轮询拿到新用户切片即丢弃本地补拍（恢复以 store 为唯一事实）
-  useEffect(() => {
-    setUsersOverride(null);
-  }, [users]);
-  const viewUsers = usersOverride ?? users;
-
-  const refreshUsers = useCallback(async (): Promise<void> => {
-    try {
-      setUsersOverride(await adminClient.listAdminUsers());
-    } catch {
-      /* 补拍失败不致命：App 的 3 秒轮询兜底 */
-    }
-  }, []);
-
-  const refreshGroups = useCallback(async (): Promise<void> => {
-    try {
-      setGroups(await adminClient.listGroups());
-    } catch {
-      /* 保留旧列表兜底 */
-    }
-  }, []);
-
-  const refreshRuntime = useCallback(async (): Promise<void> => {
-    try {
-      setRuntime(await adminClient.getAdminRuntime());
-    } catch {
-      /* 保留旧值兜底 */
-    }
-  }, []);
-
-  useEffect(() => {
-    void refreshGroups();
-  }, [refreshGroups]);
-
-  // 运行态 3 秒轮询：ManagedRefreshCycle（忙碌跳过、卸载停表并 abort 在途拍）
-  useEffect(() => {
-    const cycle = new ManagedRefreshCycle({
-      intervalMs: RUNTIME_REFRESH_INTERVAL_MS,
-      timers: {
-        interval: (handler, ms) => setInterval(handler, ms),
-        cancel: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
-      },
-      load: async (ticket) => {
-        try {
-          const next = await adminClient.getAdminRuntime(ticket.signal);
-          if (ticket.isCurrent()) setRuntime(next);
-        } catch {
-          /* 单拍失败或被取消不致命 */
-        } finally {
-          ticket.settle();
-        }
-      },
-    });
-    cycle.start();
-    return () => cycle.stop();
-  }, []);
+  // 任一管理切片末次刷新失败时给一条非阻塞提示：面板显示的是旧数据兜底，
+  // 不阻塞标签页（成功补拍后 adminError 归 null，提示自动消失）
+  const anySliceError =
+    adminError.runtime !== null || adminError.settings !== null || adminError.groups !== null || adminError.users !== null;
 
   const handleTablistKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
     const current = TAB_ORDER.indexOf(tab);
@@ -280,6 +248,7 @@ export function AdminView(props: AdminViewProps) {
       <h2 className="page-title">{t('view.admin')}</h2>
       <RuntimeStrip t={t} runtime={runtime} />
       {runtime !== null && <SecurityAdvisories t={t} warnings={runtime.securityWarnings} />}
+      {anySliceError && <p className="field-hint">{t('admin.sliceError')}</p>}
 
       <div className="admin-tabs" role="tablist" aria-label={t('view.admin')} onKeyDown={handleTablistKeyDown}>
         {tabs.map((item) => (
@@ -306,15 +275,15 @@ export function AdminView(props: AdminViewProps) {
         <AdminUsersGroups
           t={t}
           mode="users"
-          client={adminClient}
-          users={viewUsers}
+          client={client}
+          users={users}
           currentUserId={currentUserId}
           groups={groups}
           ui={ui}
           onUi={onUi}
           onSetUserActive={onSetUserActive}
-          onRefreshUsers={refreshUsers}
-          onRefreshGroups={refreshGroups}
+          onRefreshUsers={onRefreshUsers}
+          onRefreshGroups={onRefreshGroups}
         />
       </div>
 
@@ -322,32 +291,34 @@ export function AdminView(props: AdminViewProps) {
         <AdminUsersGroups
           t={t}
           mode="groups"
-          client={adminClient}
-          users={viewUsers}
+          client={client}
+          users={users}
           currentUserId={currentUserId}
           groups={groups}
           ui={ui}
           onUi={onUi}
           onSetUserActive={onSetUserActive}
-          onRefreshUsers={refreshUsers}
-          onRefreshGroups={refreshGroups}
+          onRefreshUsers={onRefreshUsers}
+          onRefreshGroups={onRefreshGroups}
         />
       </div>
 
       <div className="admin-tabpanel" role="tabpanel" id="admin-panel-settings" aria-labelledby="admin-tab-settings" hidden={tab !== 'settings'}>
-        {settingsLocal !== null ? (
+        {settings !== null ? (
           <AdminGatewaySettings
             t={t}
-            client={adminClient}
-            settings={settingsLocal}
+            client={client}
+            settings={settings}
             groups={groups}
             runtime={runtime}
             ui={ui}
             onUi={onUi}
-            onSettingsChanged={setSettingsLocal}
-            onRefreshGroups={refreshGroups}
-            onRefreshRuntime={refreshRuntime}
+            onSettingsChanged={onSettingsChanged}
+            onRefreshGroups={onRefreshGroups}
+            onRefreshRuntime={onRefreshRuntime}
           />
+        ) : adminLoad.settings === 'error' ? (
+          <p className="empty-hint">{t('admin.sliceError')}</p>
         ) : (
           <p className="empty-hint">{t('app.loading')}</p>
         )}

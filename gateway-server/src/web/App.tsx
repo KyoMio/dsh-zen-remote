@@ -6,6 +6,14 @@
 // GC-8：登录页三态（登录 / 注册 / 找回密码，含 OTP 与主题/语言切换）、账号
 // 设置弹窗（改密 / 换绑邮箱）、全量错误码映射与 admin 视图防越权守卫都由
 // 这里接线。
+// GC-10b：App 成为管理四切片（runtime / settings / groups / users）的唯一
+// 持有者与唯一请求源——进入 admin 视图独立拉取四张切片，3 秒可见性受控
+// 轮询只轻刷 users 与 runtime（settings / groups 是编辑中的草稿，轮询回写
+// 会冲掉表单）；任一管理请求 401 视为会话失效：清空全部管理切片并回
+// /auth/me 核对会话态；切出 admin 视图同样彻底清场。网络侧补齐设备备注
+// 编辑、建网额度透传（maxPeers / admissionMode）、空态建网 CTA 与配额
+// 门槛，管理变更成功后联动刷新会话配额与网络列表（publicUrl 热改后的
+// joinUri）。
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 
 import { AccountSettingsModal } from './components/AccountSettingsModal';
@@ -14,13 +22,13 @@ import { copyTextToClipboard } from './clipboard';
 import { LoginView } from './components/LoginView';
 import type { LoginMode } from './components/LoginView';
 import { NetworkView, NewNetworkModal } from './components/NetworkView';
-import type { NetworkPatchInput } from './components/NetworkView';
+import type { NetworkPatchInput, NewNetworkInput } from './components/NetworkView';
 import { TopBar } from './components/TopBar';
 import type { ViewKind } from './components/TopBar';
 import { LOCALE_STORAGE_KEY, resolveLocale, translate } from './i18n/locales';
 import type { Locale, LocaleKey, TranslateVars } from './i18n/locales';
 import { ConsoleApiError, ConsoleClient, ConsoleStore, ManagedRefreshCycle } from './store/console-store';
-import type { MemberAction, SystemSettings, UiLocalState } from './store/console-store';
+import type { AdminSliceKey, AdminSettingsData, MemberAction, SystemSettings, UiLocalState } from './store/console-store';
 
 const client = new ConsoleClient();
 const store = new ConsoleStore();
@@ -30,6 +38,16 @@ type Theme = 'light' | 'dark';
 
 /** 管理页在线数/速率的 REST 刷新周期（PC-20） */
 const ADMIN_REFRESH_INTERVAL_MS = 3000;
+
+/** markAdminError 的消息入参：只要可读的失败原因，无 Error 形态时给占位 */
+function adminErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : 'unknown error';
+}
+
+/** 任一被拒绝的请求是不是 401（会话失效 / 权限被收回的管理请求分诊） */
+function isUnauthorized(err: unknown): boolean {
+  return err instanceof ConsoleApiError && err.status === 401;
+}
 
 function readStoredTheme(): Theme {
   try {
@@ -81,10 +99,14 @@ function authErrorToKey(err: unknown): LocaleKey {
       return 'account.quotaReached';
     case 'LIMIT_REACHED':
       return 'error.peerLimitByGroup';
-    // 管理约束（最后管理员 / 默认组 / 组占用 / 组标识码 / API Key）
+    // 管理约束（最后管理员 / 自我保护 / 默认组 / 组占用 / 组标识码 / API Key）
     case 'CANNOT_REMOVE_LAST_ADMIN':
+    case 'CANNOT_DISABLE_SELF':
+    case 'CANNOT_DEMOTE_SELF':
+    case 'CANNOT_DELETE_SELF':
       return 'error.cannotRemoveLastAdmin';
     case 'CANNOT_DELETE_DEFAULT_GROUP':
+    case 'CANNOT_UNSET_DEFAULT_GROUP':
       return 'error.cannotDeleteDefaultGroup';
     case 'GROUP_IN_USE':
       return 'error.groupInUse';
@@ -92,6 +114,9 @@ function authErrorToKey(err: unknown): LocaleKey {
       return 'error.duplicateGroupCode';
     case 'INVALID_API_KEY':
       return 'error.invalidApiKey';
+    // 设备备注超长（GC-10b 起备注编辑接线）
+    case 'NOTE_TOO_LONG':
+      return 'error.noteTooLong';
     case 'NETWORK_ERROR':
     case 'NO_TRANSPORT':
       return 'error.network';
@@ -226,41 +251,154 @@ export function App() {
     };
   }, [signedIn, selectedNetworkId, refreshTopology]);
 
-  // 网关管理页系统设置（配额）：进入视图拉一次，之后的更新由配额动作的 PATCH
-  // 返回值负责（fix1 R1：3 秒轮询只刷在线数/速率——配额是慢变配置，轮询它反而
-  // 会让正在编辑的开关/输入在两次击键之间被服务端旧值回写）。
+  // ------------------------------------------------- 管理四切片（GC-10b 收口）
+
   const isAdmin = state.session !== null && state.session.user.role === 'admin';
 
-  // 路由防越权守卫（GC-8）：普通用户停在 admin 视图（例如本地残留状态或被
-  // 管理员降级后）一律弹回网络视图，并彻底清掉管理员敏感切片。
+  /** 重新拉 /auth/me 落库：换绑邮箱成功后顶栏邮箱、配额摘要与弹窗即时刷新 */
+  const refreshSession = useCallback(async (): Promise<void> => {
+    const me = await client.fetchMe();
+    store.init(me);
+  }, []);
+
+  /** 管理变更后的联动刷新：/auth/me 落库（当前管理员配额与 publicPolicy）+
+   * 网络列表（publicUrl 热改后的 joinUri）。两段各自兜底，失败不致命。 */
+  const refreshSessionAndNetworks = useCallback(async (): Promise<void> => {
+    try {
+      await refreshSession();
+    } catch {
+      /* 会话刷新失败不致命：下一次动作或轮询会补 */
+    }
+    try {
+      store.setNetworks(await client.listNetworks());
+    } catch {
+      /* 列表刷新失败不致命 */
+    }
+  }, [refreshSession]);
+
+  /** 任一管理请求 401：会话已失效或权限被收回——立刻清空全部管理敏感切片
+   * （零残留），再回 /auth/me 核对会话态（后端对失效会话返回匿名策略，
+   * store.init 会自然切回登录前状态；/auth/me 自身失败时切片已清空，
+   * 留给下一次轮询/动作再核对）。 */
+  const handleAdminUnauthorized = useCallback((): void => {
+    store.clearAdminSlices();
+    void refreshSession().catch(() => {
+      /* 会话核对失败不致命 */
+    });
+  }, [refreshSession]);
+
+  /** 管理请求失败分诊：401 走清场路径；其余只记本切片错误态、保留旧数据兜底 */
+  const handleAdminFetchError = useCallback(
+    (key: AdminSliceKey, err: unknown): void => {
+      if (isUnauthorized(err)) {
+        handleAdminUnauthorized();
+        return;
+      }
+      store.markAdminError(key, adminErrorMessage(err));
+    },
+    [handleAdminUnauthorized],
+  );
+
+  /** 用户列表补拍（面板建/改/删用户成功后调用）：写回 store 用户切片；
+   * 用户变更可能涉及当前管理员自己的组/角色，联动刷新会话配额与网络列表 */
+  const refreshAdminUsers = useCallback(async (): Promise<void> => {
+    try {
+      store.applyAdminUsers(await client.listAdminUsers());
+    } catch (err) {
+      handleAdminFetchError('users', err);
+      return;
+    }
+    void refreshSessionAndNetworks();
+  }, [handleAdminFetchError, refreshSessionAndNetworks]);
+
+  /** 用户组列表补拍（组 CRUD / 默认组切换成功后调用）：写回 store 组切片 */
+  const refreshAdminGroups = useCallback(async (): Promise<void> => {
+    try {
+      store.applyAdminGroups(await client.listGroups());
+    } catch (err) {
+      handleAdminFetchError('groups', err);
+      return;
+    }
+    void refreshSessionAndNetworks();
+  }, [handleAdminFetchError, refreshSessionAndNetworks]);
+
+  /** 运行态条补拍（publicUrl 热改后调用）：写回 store 运行态切片 */
+  const refreshAdminRuntime = useCallback(async (): Promise<void> => {
+    try {
+      store.applyAdminRuntime(await client.getAdminRuntime());
+    } catch (err) {
+      handleAdminFetchError('runtime', err);
+    }
+  }, [handleAdminFetchError]);
+
+  /** 设置面板 PATCH / 密钥操作成功：返回的最新脱敏视图整体落库，并联动刷新
+   * 会话配额（allowSignup / 默认组同步会改 publicPolicy）与网络列表（publicUrl
+   * 热改后的 joinUri）。 */
+  const handleSettingsChanged = useCallback(
+    (next: AdminSettingsData): void => {
+      store.applyAdminSettings(next);
+      void refreshSessionAndNetworks();
+    },
+    [refreshSessionAndNetworks],
+  );
+
+  // 路由防越权守卫 + 管理切片清场（GC-8/GC-10b）：切出 admin 视图或失去管理员
+  // 身份（被降级 / 登出 / 会话失效）时，彻底清掉管理员敏感切片（runtime /
+  // settings / groups / users 与各自加载、错误态）；普通用户停在 admin 视图
+  //（本地残留状态）一律弹回网络视图。
   useEffect(() => {
-    if (view === 'admin' && !isAdmin) {
-      setView('networks');
+    if (view !== 'admin' || !isAdmin) {
+      if (view === 'admin') setView('networks');
       store.clearAdminSlices();
     }
   }, [view, isAdmin]);
 
+  // 进入管理视图：四张管理切片独立并行拉取（单张失败只记自己的错误态并保留
+  // 旧数据，互不阻塞）。settings / groups 是慢变配置，只在进入视图拉一次，
+  // 之后的更新由面板 PATCH 的返回值负责（fix1 R1：轮询回写会让正在编辑的
+  // 开关/输入在两次击键之间被服务端旧值冲掉）。
   useEffect(() => {
     if (view !== 'admin' || !isAdmin) return;
     let cancelled = false;
     void (async () => {
-      try {
-        const settings = await client.adminGetSettings();
-        if (!cancelled) store.applyAdminSettings(settings);
-      } catch {
-        /* 下次进入视图再拉 */
+      store.markAdminLoading('runtime');
+      store.markAdminLoading('settings');
+      store.markAdminLoading('groups');
+      store.markAdminLoading('users');
+      const [runtime, settings, groups, users] = await Promise.allSettled([
+        client.getAdminRuntime(),
+        client.getAdminSettings(),
+        client.listGroups(),
+        client.listAdminUsers(),
+      ]);
+      if (cancelled) return;
+      // 任一请求 401 = 会话失效：不再落库任何切片，直接清场并核对会话态
+      const settled = [runtime, settings, groups, users];
+      if (settled.some((r) => r.status === 'rejected' && isUnauthorized(r.reason))) {
+        handleAdminUnauthorized();
+        return;
       }
+      if (runtime.status === 'fulfilled') store.applyAdminRuntime(runtime.value);
+      else handleAdminFetchError('runtime', runtime.reason);
+      if (settings.status === 'fulfilled') store.applyAdminSettings(settings.value);
+      else handleAdminFetchError('settings', settings.reason);
+      if (groups.status === 'fulfilled') store.applyAdminGroups(groups.value);
+      else handleAdminFetchError('groups', groups.reason);
+      if (users.status === 'fulfilled') store.applyAdminUsers(users.value);
+      else handleAdminFetchError('users', users.reason);
     })();
     return () => {
       cancelled = true;
     };
-  }, [view, isAdmin]);
+  }, [view, isAdmin, handleAdminUnauthorized, handleAdminFetchError]);
 
-  // 管理页在线数/速率（PC-20 fix1）：当前视图 + document 可见 + 已登录管理员时，
-  // 固定 3 秒格点轮询 users——原生 interval + 忙碌跳过，慢响应不打漂节拍、不叠加。
-  // 隐藏/离开视图/退出登录停表并 abort 在途请求（旧请求不能永久留在后台）；
-  // 世代守卫兜底不可取消的迟响应。回到可见立即补一次再恢复固定节拍。
-  // 配额弹窗打开期间照常刷新（QuotaModal 的草稿是自身 useState，不随 props 重置）。
+  // 管理页热切片 3 秒轮询（PC-20 fix1）：当前视图 + document 可见 + 已登录管理员
+  // 时，固定 3 秒格点并行轻刷 users 与 runtime 两张实时数据——绝不轮询 settings
+  // 与 groups（编辑中的草稿会被服务端旧值回写冲掉）。单张失败保留旧数据只记
+  // 错误态；任一请求 401 清空管理切片并核对会话态。原生 interval + 忙碌跳过，
+  // 慢响应不打漂节拍、不叠加；隐藏/离开视图/退出登录停表并 abort 在途请求
+  //（旧请求不能永久留在后台）；世代守卫兜底不可取消的迟响应。回到可见立即
+  // 补一次再恢复固定节拍。
   useEffect(() => {
     if (view !== 'admin' || !isAdmin) return;
     const cycle = new ManagedRefreshCycle({
@@ -271,10 +409,20 @@ export function App() {
       },
       load: async (ticket) => {
         try {
-          const users = await client.adminListUsers(ticket.signal);
-          if (ticket.isCurrent()) store.applyAdminUsers(users);
-        } catch {
-          /* 单拍失败或被取消不致命：settle 清在途标记，固定节拍照常继续 */
+          const [users, runtime] = await Promise.allSettled([
+            client.listAdminUsers(ticket.signal),
+            client.getAdminRuntime(ticket.signal),
+          ]);
+          if (!ticket.isCurrent()) return;
+          const settled = [users, runtime];
+          if (settled.some((r) => r.status === 'rejected' && isUnauthorized(r.reason))) {
+            handleAdminUnauthorized();
+            return;
+          }
+          if (users.status === 'fulfilled') store.applyAdminUsers(users.value);
+          else handleAdminFetchError('users', users.reason);
+          if (runtime.status === 'fulfilled') store.applyAdminRuntime(runtime.value);
+          else handleAdminFetchError('runtime', runtime.reason);
         } finally {
           ticket.settle();
         }
@@ -290,7 +438,7 @@ export function App() {
       document.removeEventListener('visibilitychange', syncToVisibility);
       cycle.stop();
     };
-  }, [view, isAdmin]);
+  }, [view, isAdmin, handleAdminUnauthorized, handleAdminFetchError]);
 
   /** 登录 / 注册 / 找回重置（GC-8 三态）；返回是否成功，LoginView 据此整理本页状态 */
   const handleAuth = useCallback(
@@ -381,12 +529,6 @@ export function App() {
     store.patchUi({ dialog: null });
   }, []);
 
-  /** 重新拉 /auth/me 落库：换绑邮箱成功后顶栏邮箱、配额摘要与弹窗即时刷新 */
-  const refreshSession = useCallback(async (): Promise<void> => {
-    const me = await client.fetchMe();
-    store.init(me);
-  }, []);
-
   // 表单回调不吞错：失败原样抛回给弹窗映射成字段文案，成功才在这里 toast
   const handleChangeMyPassword = useCallback(
     async (currentPassword: string, newPassword: string): Promise<void> => {
@@ -426,8 +568,8 @@ export function App() {
         store.patchUi({ confirmTarget: null });
         await refreshTopology(networkId);
         void refreshNetworks();
-      } catch {
-        showToast('error.generic');
+      } catch (err) {
+        showToast(authErrorToKey(err));
       } finally {
         setActionBusy(false);
       }
@@ -443,8 +585,8 @@ export function App() {
         store.patchUi({ confirmTarget: null });
         await refreshTopology(networkId);
         void refreshNetworks();
-      } catch {
-        showToast('error.generic');
+      } catch (err) {
+        showToast(authErrorToKey(err));
       } finally {
         setActionBusy(false);
       }
@@ -459,8 +601,25 @@ export function App() {
         await client.patchMember(networkId, nodeId, { name });
         await refreshTopology(networkId);
         showToast('toast.saved');
-      } catch {
-        showToast('error.generic');
+      } catch (err) {
+        showToast(authErrorToKey(err));
+      } finally {
+        setActionBusy(false);
+      }
+    },
+    [refreshTopology, showToast],
+  );
+
+  /** 设备备注编辑（GC-10b 接线，SPEC 5.5）：复用 PATCH members 的 note 字段 */
+  const handleEditMemberNote = useCallback(
+    async (networkId: string, nodeId: string, note: string): Promise<void> => {
+      setActionBusy(true);
+      try {
+        await client.patchMember(networkId, nodeId, { note });
+        await refreshTopology(networkId);
+        showToast('toast.saved');
+      } catch (err) {
+        showToast(authErrorToKey(err));
       } finally {
         setActionBusy(false);
       }
@@ -476,8 +635,8 @@ export function App() {
         await refreshTopology(networkId);
         await refreshNetworks();
         showToast('toast.saved');
-      } catch {
-        showToast('error.generic');
+      } catch (err) {
+        showToast(authErrorToKey(err));
       } finally {
         setActionBusy(false);
       }
@@ -493,8 +652,8 @@ export function App() {
         store.patchUi({ confirmTarget: null });
         await refreshNetworks();
         showToast('toast.inviteReset');
-      } catch {
-        showToast('error.generic');
+      } catch (err) {
+        showToast(authErrorToKey(err));
       } finally {
         setActionBusy(false);
       }
@@ -510,31 +669,47 @@ export function App() {
         store.patchUi({ dialog: null, confirmTarget: null });
         setSelectedNetworkId(null);
         await refreshNetworks();
+        // 删网后 usedNetworks 变化：/auth/me 落库让顶栏与新建弹窗额度即时刷新
+        try {
+          await refreshSession();
+        } catch {
+          /* 会话刷新失败不致命 */
+        }
         showToast('toast.networkDeleted');
-      } catch {
-        showToast('error.generic');
+      } catch (err) {
+        showToast(authErrorToKey(err));
       } finally {
         setActionBusy(false);
       }
     },
-    [refreshNetworks, showToast],
+    [refreshNetworks, refreshSession, showToast],
   );
 
+  /** 创建网络（GC-9 弹窗扩展形态）：第二参透传设备上限与入网方式，未传按
+   * 后端默认落库；成功后拉 /auth/me 让建网额度（quota.usedNetworks）即时刷新 */
   const handleCreateNetwork = useCallback(
-    async (name: string): Promise<void> => {
+    async (name: string, details?: NewNetworkInput): Promise<void> => {
       setActionBusy(true);
       try {
-        const created = await client.createNetwork({ name: name.trim() });
+        const created = await client.createNetwork({
+          name: name.trim(),
+          ...(details !== undefined ? { maxPeers: details.maxPeers, admissionMode: details.admissionMode } : {}),
+        });
         store.patchUi({ dialog: null, draftNetworkName: '' });
         await refreshNetworks();
+        try {
+          await refreshSession();
+        } catch {
+          /* 会话刷新失败不致命 */
+        }
         setSelectedNetworkId(created.id);
-      } catch {
-        showToast('error.generic');
+      } catch (err) {
+        showToast(authErrorToKey(err));
       } finally {
         setActionBusy(false);
       }
     },
-    [refreshNetworks, showToast],
+    [refreshNetworks, refreshSession, showToast],
   );
 
   const handleCopyField = useCallback(
@@ -558,24 +733,26 @@ export function App() {
       try {
         const updated = await client.adminPatchSettings(patch);
         store.applyAdminSettings(updated);
+        void refreshSessionAndNetworks();
         showToast('toast.saved');
-      } catch {
-        showToast('error.generic');
+      } catch (err) {
+        showToast(authErrorToKey(err));
       }
     },
-    [showToast],
+    [refreshSessionAndNetworks, showToast],
   );
 
   const handleSetUserActive = useCallback(
     async (userId: string, active: boolean): Promise<void> => {
       try {
         await client.adminSetUserActive(userId, active);
-        store.applyAdminUsers(await client.adminListUsers());
-      } catch {
-        showToast('error.generic');
+        store.applyAdminUsers(await client.listAdminUsers());
+        void refreshSessionAndNetworks();
+      } catch (err) {
+        showToast(authErrorToKey(err));
       }
     },
-    [showToast],
+    [refreshSessionAndNetworks, showToast],
   );
 
   // ---------------------------------------------------------------- 渲染
@@ -610,6 +787,10 @@ export function App() {
   }
 
   const selected = state.networks.find((n) => n.id === selectedNetworkId) ?? null;
+  // 空态建网 CTA 的门槛（GC-10b）：普通用户建网数达所在组上限时禁用；
+  // 管理员组上限不限（maxNetworks === null）永远可建
+  const quotaCreateBlocked =
+    !isAdmin && state.quota !== null && state.quota.maxNetworks !== null && state.quota.usedNetworks >= state.quota.maxNetworks;
 
   return (
     <div className="app-shell">
@@ -637,13 +818,22 @@ export function App() {
         {view === 'admin' && isAdmin ? (
           <AdminView
             t={t}
-            users={state.adminUsers}
+            client={client}
+            runtime={state.adminRuntime}
             settings={state.adminSettings}
+            groups={state.adminGroups}
+            users={state.adminUsers}
+            adminLoad={state.adminLoad}
+            adminError={state.adminError}
             currentUserId={state.session.user.id}
             ui={state.ui}
             onUi={handleUi}
             onPatchSettings={(patch) => void handlePatchSettings(patch)}
             onSetUserActive={(userId, active) => void handleSetUserActive(userId, active)}
+            onRefreshUsers={() => refreshAdminUsers()}
+            onRefreshGroups={() => refreshAdminGroups()}
+            onRefreshRuntime={() => refreshAdminRuntime()}
+            onSettingsChanged={handleSettingsChanged}
           />
         ) : selected !== null ? (
           <NetworkView
@@ -655,17 +845,31 @@ export function App() {
             busy={actionBusy}
             onCopyInvite={() => handleCopyInvite(selected.joinUri)}
             onCopyField={handleCopyField}
+            quota={state.quota}
+            locale={locale}
             onPatchNetwork={(patch) => void handlePatchNetwork(selected.id, patch)}
             onDeleteNetwork={() => void handleDeleteNetwork(selected.id)}
             onRotateInviteKey={() => void handleRotateInviteKey(selected.id)}
             onMemberAction={(nodeId, action) => void handleMemberAction(selected.id, nodeId, action)}
             onRenameMember={(nodeId, name) => void handleRenameMember(selected.id, nodeId, name)}
+            onEditNote={(nodeId, note) => void handleEditMemberNote(selected.id, nodeId, note)}
             onRemoveMember={(nodeId) => void handleRemoveMember(selected.id, nodeId)}
           />
         ) : (
           <section className="empty-state">
             <p className="empty-title">{t('network.emptyTitle')}</p>
             <p className="empty-hint">{t('network.emptyHint')}</p>
+            {/* 空态建网 CTA（GC-10b / SPEC 5.5）：达组上限禁用并说明当前组上限
+                （含到期回退说明）；管理员与未达限用户可直接开建 */}
+            <button type="button" className="btn primary" disabled={quotaCreateBlocked} onClick={handleCreateNetworkOpen}>
+              + {t('network.createNew')}
+            </button>
+            {quotaCreateBlocked && state.quota !== null && (
+              <p className="empty-hint">
+                {t('network.groupNetworkCap', { n: state.quota.maxNetworks ?? 0 })}
+                {state.quota.isExpiredFallback ? ` · ${t('account.groupExpired')}` : ''}
+              </p>
+            )}
           </section>
         )}
       </main>
@@ -676,7 +880,8 @@ export function App() {
           ui={state.ui}
           onUi={handleUi}
           busy={actionBusy}
-          onCreate={(name) => void handleCreateNetwork(name)}
+          quota={state.quota}
+          onCreate={(name, details) => void handleCreateNetwork(name, details)}
         />
       )}
 
