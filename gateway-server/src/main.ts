@@ -197,7 +197,11 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       };
       try {
         await bounded('udp shutdown', () => udp.close());
-        await bounded('ws hub shutdown (final telemetry flush included)', () => hub.close());
+        await bounded('ws hub shutdown', () => {
+          const remaining = Math.max(50, deadline - Date.now());
+          const telemetryBudgetMs = Math.max(25, Math.min(remaining - 100, Math.floor(closeBudgetMs * 0.7)));
+          return hub.close(telemetryBudgetMs);
+        });
         await bounded('http server close', closeServer);
         await bounded('store close', () => store.close());
         closedStore = true;

@@ -813,9 +813,12 @@ describe('PC-19 第二片：停止接收后补末批与有界退出', () => {
     }
   });
 
-  test('flush 失败时 close 拒绝并报告未确认累计，资源停净，并发 close 共享失败', async () => {
+  test('flush 失败时 close 降级打印 warning 并正常返回，资源停净，并发 close 共享同一完成', async () => {
     let failNext = false;
     const original = SqliteStore.prototype.flushMemberTelemetry;
+    const origWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.map(String).join(' '));
     SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
       if (failNext && updates.length > 0) {
         failNext = false;
@@ -829,22 +832,29 @@ describe('PC-19 第二片：停止接收后补末批与有界退出', () => {
       const { net, a } = await driveRelayTraffic(gw);
       failNext = true;
       const first = gw.close();
-      const second = gw.close(); // 并发调用：共享同一真实结果，不得提前成功
-      await assert.rejects(first, /unconfirmed/, 'flush 失败必须让 close 如实拒绝');
-      await assert.rejects(second, /unconfirmed/, '并发 close 共享同一失败');
-      await assert.rejects(() => fetch(gw.base + '/'), undefined, '失败路径资源兜底停净：HTTP 拒连');
-      assert.ok(gw.hub.limiter.pendingRelayBytes(net.id, a.nodeId) > 0, '失败后待写累计不得被清零');
+      const second = gw.close(); // 并发调用：共享同一关闭 Promise
+      await Promise.all([first, second]);
+      assert.ok(
+        warnings.some((line) => /final telemetry flush incomplete/i.test(line) && /unconfirmed/i.test(line)),
+        `flush 失败时必须打印包含未确认信息的 warning，实际：${JSON.stringify(warnings)}`,
+      );
+      await assert.rejects(() => fetch(gw.base + '/'), undefined, '关停后资源停净：HTTP 拒连');
+      assert.ok(gw.hub.limiter.pendingRelayBytes(net.id, a.nodeId) > 0, '失败后待写累计不得被误清零');
     } finally {
+      console.warn = origWarn;
       SqliteStore.prototype.flushMemberTelemetry = original;
       if (gw !== undefined) await gw.close().catch(() => {});
     }
   });
 
-  test('存储不响应时 close 在墙钟预算内如实拒绝（进程内版本；真实进程退出见子进程用例）', async () => {
+  test('存储不响应时 close 在预算内打告警日志并正常结束（不因遥测挂起阻塞关停）', async () => {
     // 受控永不完成的写：刻意不解扣——解扣会对已关 store 触发迟到拒绝；
     // 挂起的 promise 无定时器/无 I/O，不阻碍测试进程退出
     let holdForever = false;
     const original = SqliteStore.prototype.flushMemberTelemetry;
+    const origWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.map(String).join(' '));
     SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
       if (holdForever && updates.length > 0) {
         await new Promise(() => {});
@@ -857,11 +867,16 @@ describe('PC-19 第二片：停止接收后补末批与有界退出', () => {
       await driveRelayTraffic(gw);
       holdForever = true;
       const startedAt = Date.now();
-      await assert.rejects(gw.close(), /budget|unconfirmed/, '预算耗尽必须拒绝而非悬挂');
+      await gw.close();
       const elapsed = Date.now() - startedAt;
-      assert.ok(elapsed < 3000, `close 必须在预算后有界结束（耗时 ${elapsed}ms）`);
-      await assert.rejects(() => fetch(gw.base + '/'), undefined, '失败路径资源兜底停净：HTTP 拒连');
+      assert.ok(elapsed < 3000, `close 必须在预算内有界完成（耗时 ${elapsed}ms）`);
+      assert.ok(
+        warnings.some((line) => /final telemetry flush incomplete/i.test(line) && /unconfirmed/i.test(line)),
+        `遥测超时时必须打印包含未确认信息的 warning，实际：${JSON.stringify(warnings)}`,
+      );
+      await assert.rejects(() => fetch(gw.base + '/'), undefined, '关停后资源停净：HTTP 拒连');
     } finally {
+      console.warn = origWarn;
       SqliteStore.prototype.flushMemberTelemetry = original;
       if (gw !== undefined) await gw.close().catch(() => {});
     }
@@ -943,9 +958,12 @@ describe('PC-19 第二片：停止接收后补末批与有界退出', () => {
     }
   });
 
-  test('仅 NAT 的批次写失败时 close 拒绝并报告（不得静默成功）', async () => {
+  test('仅 NAT 的批次写失败时 close 降级打印 warning 并保留待确认观测', async () => {
     let failNatOnly = false;
     const original = SqliteStore.prototype.flushMemberTelemetry;
+    const origWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.map(String).join(' '));
     SqliteStore.prototype.flushMemberTelemetry = async function (updates) {
       if (failNatOnly && updates.length > 0 && updates.every((u) => u.relayBytesDelta === undefined)) {
         throw new Error('controlled pc19 nat-only flush failure');
@@ -982,9 +1000,14 @@ describe('PC-19 第二片：停止接收后补末批与有界退出', () => {
         serverPortRole: 'primary',
       });
       failNatOnly = true;
-      await assert.rejects(gw.close(), /unconfirmed/, 'NAT 批次写失败必须让 close 如实拒绝');
+      await gw.close();
+      assert.ok(
+        warnings.some((line) => /final telemetry flush incomplete/i.test(line) && /unconfirmed/i.test(line)),
+        `NAT 批次写失败时必须打印包含未确认信息的 warning，实际：${JSON.stringify(warnings)}`,
+      );
       assert.ok(gw.hub.pendingTelemetrySummary().natObservations > 0, '失败后待确认观测不得被清零');
     } finally {
+      console.warn = origWarn;
       SqliteStore.prototype.flushMemberTelemetry = original;
       if (gw !== undefined) await gw.close().catch(() => {});
     }

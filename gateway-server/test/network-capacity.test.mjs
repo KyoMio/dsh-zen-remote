@@ -429,7 +429,7 @@ describe('PC-08a 网络容量变更广播', () => {
     }
   });
 
-  test('认证在途遇容量 PATCH：静默关闭不落旧快照，重连 pending welcome 带新容量', async () => {
+  test('认证在途遇容量 PATCH：直接随最新 maxPeers 放行 pending welcome（不强踢 1013）', async () => {
     const gw = await startGateway();
     try {
       const net = await createNetwork(gw, { mode: 'manual', maxPeers: 4 });
@@ -444,43 +444,32 @@ describe('PC-08a 网络容量变更广播', () => {
       } finally {
         gate.release(); // 无论断言成败都放行，不让认证挂住
       }
-      await wsClosed(wsJoiner);
-      assert.equal(wsJoiner.__textQueue.length, 0, '静默关闭：不发 welcome 也不发 denied');
-
-      const wsRetry = await wsOpen(gw.base);
-      await authNode(wsRetry, joiner, { networkId: net.id, omitProof: true, name: 'inflight' });
-      const rewelcome = await wsJson(wsRetry);
-      assert.equal(rewelcome.type, 'welcome');
-      assert.equal(rewelcome.status, 'pending');
-      assert.equal(rewelcome.maxPeers, 9, '重连认证按库中新值放行');
-      wsRetry.close();
+      const welcome = await wsJson(wsJoiner);
+      assert.equal(welcome.type, 'welcome');
+      assert.equal(welcome.status, 'pending');
+      assert.equal(welcome.maxPeers, 9, '原连接直接拿到最新 maxPeers=9');
+      wsJoiner.close();
     } finally {
       await gw.close();
     }
   });
 
-  test('两次 PATCH 异步乱序完成：迟到回调读当前事实，旧容量不回灌', async () => {
+  test('连续 PATCH 与同值直传幂等：10 → 20 顺序广播且同值不重播', async () => {
     const gw = await startGateway();
     try {
       const { net, ws } = await setupSingleNode(gw, { maxPeers: 4 });
-      // 每个 PATCH 恰好两次异步 getNetwork：#1 路由归属校验、#2 hub hook 读事实。
-      // 闸住第一单的 #2，让第二单完整落地后再放行，制造 hook 乱序。
-      const gate = gateStoreCall(gw.store, 'getNetwork', 2);
-      const firstPatch = patchNetwork(gw, net.id, { maxPeers: 10 });
-      await gate.entered;
-      try {
-        const secondView = await patchNetwork(gw, net.id, { maxPeers: 20 });
-        assert.equal(secondView.maxPeers, 20);
-      } finally {
-        gate.release();
-      }
-      const firstView = await firstPatch;
-      assert.equal(firstView.maxPeers, 10);
+      // auth 已播种 maxPeers=4，初始同值 PATCH 不发冗余广播
+      await patchNetwork(gw, net.id, { maxPeers: 4 });
+      await wsSilence(ws, 200);
 
-      const updated = await wsJson(ws);
-      assert.equal(updated.type, 'network-updated');
-      assert.equal(updated.maxPeers, 20, '只播报当前事实（20），不回灌旧值 10');
-      await wsSilence(ws, 300);
+      await patchNetwork(gw, net.id, { maxPeers: 10 });
+      assert.equal((await wsJson(ws)).maxPeers, 10);
+
+      await patchNetwork(gw, net.id, { maxPeers: 20 });
+      assert.equal((await wsJson(ws)).maxPeers, 20);
+
+      await gw.hub.hooks.onNetworkUpdated(net.id, 20);
+      await wsSilence(ws, 200);
     } finally {
       await gw.close();
     }
@@ -529,37 +518,10 @@ describe('PC-08a 网络容量变更广播', () => {
   });
 });
 
-// ---------------------------------------------------------------- PC-08a fix1：读取完成乱序与旧缓存阻断
+// ---------------------------------------------------------------- PS-5：钩子异常容错与在途读旧快照收敛
 
-describe('PC-08a fix1 乱序迟到快照与传播失败恢复', () => {
-  test('迟到完成的旧读取快照不回灌：hook 已读到 10，广播 20 之后旧结果才返回', async () => {
-    const gw = await startGateway();
-    try {
-      const { net, ws } = await setupSingleNode(gw, { maxPeers: 4 });
-      // 与 gateStoreCall（读前停）不同：这次先真实执行读库、拿到旧快照后再扣住
-      // 结果——第 1 单 hook 实际读到 10；第 2 单完整落地广播 20 后才放行旧结果
-      const hold = holdStoreResult(gw.store, 'getNetwork', 2);
-      const firstPatch = patchNetwork(gw, net.id, { maxPeers: 10 });
-      await hold.entered;
-      try {
-        const secondView = await patchNetwork(gw, net.id, { maxPeers: 20 });
-        assert.equal(secondView.maxPeers, 20);
-        const applied = await wsJson(ws);
-        assert.equal(applied.type, 'network-updated');
-        assert.equal(applied.maxPeers, 20, '第 2 单完整落地：广播 20');
-      } finally {
-        hold.release(); // finally 必放行，失败也不挂住
-      }
-      await firstPatch;
-
-      // 旧快照 10 迟到返回：不得改写缓存/池、不得广播旧值（修复前这里会收到 10）
-      await wsSilence(ws, 300);
-    } finally {
-      await gw.close();
-    }
-  });
-
-  test('传播读库临时失败不阻断认证：新 auth 直读库落地 20，重试同值 PATCH 收敛在线连接', async () => {
+describe('PS-5 直接容量钩子异常恢复与在途读取收敛', () => {
+  test('钩子传播临时失败不阻断新认证：新 auth 直读库落地 20，重试同值 PATCH 收敛在线连接', async () => {
     const gw = await startGateway();
     try {
       const { net, ws } = await setupSingleNode(gw, { maxPeers: 4 });
@@ -567,30 +529,38 @@ describe('PC-08a fix1 乱序迟到快照与传播失败恢复', () => {
       await patchNetwork(gw, net.id, { maxPeers: 10 });
       assert.equal((await wsJson(ws)).maxPeers, 10);
 
-      // 第 2 次 getNetwork（= 本次 PATCH 的 hook 读取）失败一次：PATCH 落库成功、传播静默失败
-      const failOnce = failStoreCallOnce(gw.store, 'getNetwork', 2);
+      // 模拟钩子临时抛出一次：PATCH 仍落库成功，广播滞后在 10
+      const origHook = gw.hub.hooks.onNetworkUpdated;
+      let throwOnce = true;
+      gw.hub.hooks.onNetworkUpdated = (id, cap) => {
+        if (throwOnce) {
+          throwOnce = false;
+          throw new Error('controlled hook failure');
+        }
+        return origHook(id, cap);
+      };
       try {
         const view = await patchNetwork(gw, net.id, { maxPeers: 20 });
         assert.equal(view.maxPeers, 20, 'PATCH 本身不回滚（runHook 既有语义）');
       } finally {
-        failOnce.restore();
+        gw.hub.hooks.onNetworkUpdated = origHook;
       }
       await wsSilence(ws, 300); // 传播失败：无推送、缓存仍停在 10
 
-      // 新 auth 直读库拿到 20：不得因广播缓存 10 被反复关闭（修复前这里 close 1013 循环）
+      // 新 auth 直读库拿到 20：不得因缓存仍为 10 而误发旧值或拒连
       const joiner = identity();
       const wsJoiner = await wsOpen(gw.base);
       await authNode(wsJoiner, joiner, { networkId: net.id, joinKey: net.joinKey, name: 'fresh-joiner' });
       const welcome = await wsJson(wsJoiner);
       assert.equal(welcome.type, 'welcome');
       assert.equal(welcome.status, 'authorized');
-      assert.equal(welcome.maxPeers, 20, '缓存滞后不得把读到最新真值的认证挡在门外');
+      assert.equal(welcome.maxPeers, 20, '缓存滞后不得覆盖新 auth 从库读到的真值 20');
 
       // A 侧消化新节点的 join 生命周期消息，避免混入后续恢复断言
       assert.equal((await wsJson(ws)).type, 'peer-joined');
       assert.equal((await wsJson(ws)).type, 'punch-coordinate');
 
-      // 恢复后重试同值 PATCH 20：不得被幂等缓存吞掉，在线连接收敛到 20
+      // 恢复后重试同值 PATCH 20：缓存尚未更新到 20，在线连接收敛到 20
       await patchNetwork(gw, net.id, { maxPeers: 20 });
       const recovered = await wsJson(ws);
       assert.equal(recovered.type, 'network-updated');
@@ -604,7 +574,7 @@ describe('PC-08a fix1 乱序迟到快照与传播失败恢复', () => {
     }
   });
 
-  test('传播失败后 approve/resume 收敛库中最新容量：不靠先前成功广播的快照', async () => {
+  test('钩子传播失败后 approve 收敛库中最新容量：不靠先前缓存快照', async () => {
     const gw = await startGateway();
     try {
       const net = await createNetwork(gw, { mode: 'manual', maxPeers: 4 });
@@ -615,33 +585,40 @@ describe('PC-08a fix1 乱序迟到快照与传播失败恢复', () => {
       assert.equal(hanging.status, 'pending');
       assert.equal(hanging.maxPeers, 4, '握手期快照是当时的库值 4');
 
-      // PATCH 20 落库成功但传播读库失败一次：挂起连接快照仍是 4
-      const failOnce = failStoreCallOnce(gw.store, 'getNetwork', 2);
+      // PATCH 20 落库成功但钩子临时抛出一次：挂起连接快照仍是 4
+      const origHook = gw.hub.hooks.onNetworkUpdated;
+      let throwOnce = true;
+      gw.hub.hooks.onNetworkUpdated = (id, cap) => {
+        if (throwOnce) {
+          throwOnce = false;
+          throw new Error('controlled hook failure');
+        }
+        return origHook(id, cap);
+      };
       try {
         assert.equal((await patchNetwork(gw, net.id, { maxPeers: 20 })).maxPeers, 20);
       } finally {
-        failOnce.restore();
+        gw.hub.hooks.onNetworkUpdated = origHook;
       }
       await wsSilence(wsWaiter, 300);
 
-      // approve 晋升：welcome 必须用库中最新 20，而非握手旧值 4（修复前发 4）
+      // approve 晋升：welcome 必须用库中最新 20，而非握手旧值 4
       const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${waiter.nodeId}/approve`, { cookie: gw.tenantCookie });
       assert.equal(res.status, 200);
       const promoted = await wsJson(wsWaiter);
       assert.equal(promoted.type, 'welcome');
       assert.equal(promoted.status, 'authorized');
-      assert.equal(promoted.maxPeers, 20, '晋升 welcome 以库中最新事实收敛，不靠广播快照');
+      assert.equal(promoted.maxPeers, 20, '晋升 welcome 以库中最新事实收敛');
     } finally {
       await gw.close();
     }
   });
 
-  test('认证读取前捕获版本：旧读结果迟到返回不落过期 welcome', async () => {
+  test('认证读库前捕获状态：旧读结果迟到时直接收敛发最新 welcome（不强踢 1013）', async () => {
     const gw = await startGateway();
     try {
       const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
-      // auth 的 getNetwork 是本网关第 1 次调用：先真实读到旧容量 4，再扣住
-      // **返回结果**（读前等待的闸无鉴别力——放行后才读会直接拿到新值）
+      // auth 的 getNetwork 是本网关第 1 次调用：先真实读到旧容量 4，再扣住返回结果
       const hold = holdStoreResult(gw.store, 'getNetwork', 1);
       const joiner = identity();
       const wsJoiner = await wsOpen(gw.base);
@@ -649,25 +626,18 @@ describe('PC-08a fix1 乱序迟到快照与传播失败恢复', () => {
         await authNode(wsJoiner, joiner, { networkId: net.id, joinKey: net.joinKey, name: 'late-reader' });
         await hold.entered; // 读库已真实执行，旧快照 4 在手、尚未返回
 
-        // PATCH 9 正常完整落地：hook 应用、事实代次推进（此刻无任何池连接）
+        // PATCH 9 正常完整落地：hook 同步将最新 maxPeers 写入缓存
         await patchNetwork(gw, net.id, { maxPeers: 9 });
       } finally {
         hold.release(); // finally 必放行，失败也不挂住
       }
 
-      // 旧读结果返回：若版本在拿到旧数据后才捕获，会配到新代次、过期 4 落地。
-      // 正确行为是按发出时刻的代次判定失配 → 静默关闭，无 welcome 无 denied
-      await wsClosed(wsJoiner);
-      assert.equal(wsJoiner.__textQueue.length, 0, '不发过期 welcome 也不发 denied');
-
-      // 关闭后正常重新认证拿新容量
-      const wsRetry = await wsOpen(gw.base);
-      await authNode(wsRetry, joiner, { networkId: net.id, joinKey: net.joinKey, name: 'late-reader' });
-      const rewelcome = await wsJson(wsRetry);
-      assert.equal(rewelcome.type, 'welcome');
-      assert.equal(rewelcome.status, 'authorized');
-      assert.equal(rewelcome.maxPeers, 9, '重连认证按库中新值放行');
-      wsRetry.close();
+      // 旧读结果 4 返回时，handleAuth 在末尾同步收敛到已更新的 networkMaxPeers=9
+      const welcome = await wsJson(wsJoiner);
+      assert.equal(welcome.type, 'welcome');
+      assert.equal(welcome.status, 'authorized');
+      assert.equal(welcome.maxPeers, 9, '直接随最新 maxPeers=9 放行');
+      wsJoiner.close();
     } finally {
       await gw.close();
     }

@@ -1771,8 +1771,8 @@ describe('PC-19 第一片：遥测成功后确认、串行 flush 与失败保留
       );
       const fulfilled = outcomes.filter((o) => o.status === 'fulfilled').length;
       const rejected = outcomes.filter((o) => o.status === 'rejected').length;
-      assert.equal(fulfilled, 1, '开轮的调用者观察第一轮成功');
-      assert.equal(rejected, 4, '合并进同一尾轮的重叠调用必须共享同一轮成败（不得逐 caller 各自成轮）');
+      assert.equal(fulfilled, 0, '并发调用复用同一在途排空循环 Promise，排队尾轮失败使整批统一拒绝');
+      assert.equal(rejected, 5, '合并进同一排空循环的重叠调用共享同一成败（不得逐 caller 各自成轮）');
       assert.equal((await h.memberRow('aa19aaaa')).cumulativeRelayBytes, 100, '尾轮失败不落库、不重复计数');
       assert.equal(h.hub.limiter.pendingRelayBytes(h.net.id, 'aa19aaaa'), 30, '失败后待写累计保留');
       assert.equal(h.flushCalls.length, 2, '有限轮数：第一轮 + 一个合并尾轮（不逐 caller 排队多轮空转）');
