@@ -10,7 +10,7 @@
 //
 // 全部变更走注入的 ConsoleClient（管理接口），成功后回调父级补拍对应列表；
 // 行内二次确认复用 store 的 ui.confirmTarget（App 的文档级「点外取消」纪律）。
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 
 import { copyTextToClipboard } from '../clipboard';
@@ -74,7 +74,8 @@ export function QuotaBar(props: { used: number; limit: number | null; label?: st
 // ---------------------------------------------------------------- 一次性明文展示（创建用户 / 重置密码 / Admin API Key 共用）
 
 /**
- * 高对比只读区：完整秘密仅本次渲染，附一键复制（成功后按钮变对勾）。
+ * 高对比只读区：完整秘密仅本次渲染，附一键复制（可见已复制态 + 弹窗外 <p role="status"> 状态提示；
+ * 若剪贴板被策略阻止则自动选中明文并提示手动 Ctrl+C / ⌘C）。
  * 绝不提供「再次查看」——父组件关闭弹窗后明文即从界面消失。
  */
 export function OneTimeSecret(props: {
@@ -82,10 +83,55 @@ export function OneTimeSecret(props: {
   hint?: string;
   value: string;
   copyLabel: string;
+  copiedLabel?: string;
+  copiedHint?: string;
+  copyFailedHint?: string;
   doneLabel: string;
   onDone: () => void;
 }) {
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const codeRef = useRef<HTMLElement | null>(null);
+  const resetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setCopyState('idle');
+  }, [props.value]);
+
+  useEffect(() => {
+    return () => {
+      if (resetTimerRef.current !== null) clearTimeout(resetTimerRef.current);
+    };
+  }, []);
+
+  const handleCopy = (): void => {
+    if (resetTimerRef.current !== null) {
+      clearTimeout(resetTimerRef.current);
+      resetTimerRef.current = null;
+    }
+    void copyTextToClipboard(props.value).then((ok) => {
+      if (ok) {
+        setCopyState('copied');
+        resetTimerRef.current = setTimeout(() => {
+          resetTimerRef.current = null;
+          setCopyState('idle');
+        }, 2500);
+        return;
+      }
+      setCopyState('failed');
+      try {
+        const selection = window.getSelection?.();
+        if (selection && codeRef.current !== null) {
+          selection.removeAllRanges();
+          const range = document.createRange();
+          range.selectNodeContents(codeRef.current);
+          selection.addRange(range);
+        }
+      } catch {
+        // 忽略受限环境下的选区操作异常
+      }
+    });
+  };
+
   return (
     <div className="modal-body">
       <p className="section-title" style={{ margin: '0 0 6px' }}>
@@ -97,20 +143,27 @@ export function OneTimeSecret(props: {
         </p>
       )}
       <div className="secret-reveal">
-        <code className="mono">{props.value}</code>
+        <code ref={codeRef} className="mono">
+          {props.value}
+        </code>
         <button
           type="button"
-          className="btn"
-          aria-label={props.copyLabel}
-          aria-pressed={copied}
+          className={copyState === 'copied' ? 'btn primary' : 'btn'}
+          aria-pressed={copyState === 'copied'}
           title={props.copyLabel}
-          onClick={() => {
-            void copyTextToClipboard(props.value).then((ok) => setCopied(ok));
-          }}
+          onClick={handleCopy}
         >
-          {copied ? <CheckIcon /> : <CopyIcon />}
+          {copyState === 'copied' ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+          <span>{copyState === 'copied' ? (props.copiedLabel ?? props.copyLabel) : props.copyLabel}</span>
         </button>
       </div>
+      {copyState !== 'idle' && (
+        <p role="status" className={copyState === 'failed' ? 'form-error' : 'secret-copy-status'}>
+          {copyState === 'copied'
+            ? (props.copiedHint ?? props.copiedLabel ?? '')
+            : (props.copyFailedHint ?? '')}
+        </p>
+      )}
       <div className="modal-foot">
         <button type="button" className="btn primary" onClick={props.onDone}>
           {props.doneLabel}
@@ -171,12 +224,15 @@ function CreateUserModal(props: {
 
   if (generated !== null) {
     return (
-      <Modal title={t('admin.newUser')} onClose={onClose}>
+      <Modal title={t('admin.newUser')} onClose={onDone}>
         <OneTimeSecret
           label={t('admin.tempPassword')}
           hint={t('admin.tempPasswordOnce')}
           value={generated}
           copyLabel={t('common.copy')}
+          copiedLabel={t('common.copied')}
+          copiedHint={t('common.secretCopied')}
+          copyFailedHint={t('common.secretCopyFailed')}
           doneLabel={t('common.done')}
           onDone={onDone}
         />
@@ -486,31 +542,32 @@ function ResetPasswordModal(props: {
   };
 
   return (
-    <Modal title={`${t('admin.resetPassword')} · ${user.email}`} onClose={onClose}>
-      <div className="modal-body">
-        {generated === null ? (
-          <>
-            <p className="field-hint" style={{ margin: '0 0 12px' }}>
-              {t('admin.tempPasswordOnce')}
-            </p>
-            {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
-            <div className="modal-foot">
-              <button type="button" className="btn primary" disabled={busy} onClick={() => void reset()}>
-                {t('admin.resetPassword')}
-              </button>
-            </div>
-          </>
-        ) : (
-          <OneTimeSecret
-            label={t('admin.tempPassword')}
-            hint={t('admin.tempPasswordOnce')}
-            value={generated}
-            copyLabel={t('common.copy')}
-            doneLabel={t('common.done')}
-            onDone={onDone}
-          />
-        )}
-      </div>
+    <Modal title={`${t('admin.resetPassword')} · ${user.email}`} onClose={generated !== null ? onDone : onClose}>
+      {generated === null ? (
+        <div className="modal-body">
+          <p className="field-hint" style={{ margin: '0 0 12px' }}>
+            {t('admin.tempPasswordOnce')}
+          </p>
+          {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
+          <div className="modal-foot">
+            <button type="button" className="btn primary" disabled={busy} onClick={() => void reset()}>
+              {t('admin.resetPassword')}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <OneTimeSecret
+          label={t('admin.tempPassword')}
+          hint={t('admin.tempPasswordOnce')}
+          value={generated}
+          copyLabel={t('common.copy')}
+          copiedLabel={t('common.copied')}
+          copiedHint={t('common.secretCopied')}
+          copyFailedHint={t('common.secretCopyFailed')}
+          doneLabel={t('common.done')}
+          onDone={onDone}
+        />
+      )}
     </Modal>
   );
 }

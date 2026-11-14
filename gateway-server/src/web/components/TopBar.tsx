@@ -11,13 +11,24 @@
 // 普通用户达组上限时禁用「新建网络…」并以 title 提示组上限；↑/↓ 焦点循环
 // 与打开预聚焦均跳过禁用项（:not([disabled])），键盘导航不会卡死。
 import { useCallback, useEffect, useRef } from 'react';
-import type { KeyboardEvent } from 'react';
+import type { KeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
 
 import { effectiveNetworkMaxPeers, formatQuotaExpiry } from '../format';
 import type { Locale, TranslateFn } from '../i18n/locales';
 import { deriveNetworkCounts } from '../store/console-store';
 import type { NetworkView, PublicUser, TopologySnapshot, UiLocalState, UserQuotaSummary } from '../store/console-store';
-import { CheckIcon, ChevronIcon, ServerIcon } from './Icons';
+import {
+  CheckIcon,
+  ChevronIcon,
+  GlobeIcon,
+  LogoutIcon,
+  MoonIcon,
+  NetworkIcon,
+  PlusIcon,
+  ServerIcon,
+  SettingsIcon,
+  UserIcon,
+} from './Icons';
 
 export type ViewKind = 'networks' | 'admin';
 
@@ -34,6 +45,7 @@ export interface TopBarProps {
   selectedNetworkId: string | null;
   onSelectNetwork: (id: string) => void;
   onCreateNetwork: () => void;
+  onGoHome: () => void;
   view: ViewKind;
   onChangeView: (view: ViewKind) => void;
   theme: 'light' | 'dark';
@@ -62,10 +74,11 @@ function cycleMenuFocus(menu: HTMLElement | null, offset: 1 | -1): void {
   items[next]?.focus();
 }
 
-/** 两个菜单共用的行为：触发器/菜单引用、打开即聚焦首项、键盘导航、点击外部关闭 */
-function useMenuBehavior(open: boolean, close: () => void) {
+/** 两个菜单共用的行为：触发器/菜单引用、按打开方式决定首项聚焦、键盘导航、点击外部关闭 */
+function useMenuBehavior(open: boolean, close: () => void, openMenu: () => void) {
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const openedByPointerRef = useRef(false);
 
   useEffect(() => {
     if (!open) return;
@@ -81,13 +94,44 @@ function useMenuBehavior(open: boolean, close: () => void) {
     };
   }, [open, close]);
 
-  // 打开即聚焦首个可用项：菜单与本次 effect 同一轮提交，DOM 已就绪，直接 focus
-  // 即可（↑/↓ 的焦点循环从 document.activeElement 出发，预聚焦让键盘路径从首项
-  // 开始；同样跳过禁用项，达上限时键盘用户从网络行开始而不是卡在禁用的新建项）
+  // 仅当由键盘触发打开时把焦点移入首个可用项（跳过禁用项，达上限时不卡死）；
+  // 指针点击打开保留焦点在触发按钮，避免首项出现显眼焦点框。
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      openedByPointerRef.current = false;
+      return;
+    }
+    if (openedByPointerRef.current) return;
     menuRef.current?.querySelector<HTMLElement>('[data-menu-item]:not([disabled])')?.focus();
   }, [open]);
+
+  const onTriggerPointerDown = useCallback((): void => {
+    openedByPointerRef.current = true;
+  }, []);
+
+  const onTriggerClick = useCallback((event: ReactMouseEvent<HTMLButtonElement>, toggle: () => void): void => {
+    // 键盘 Enter / Space 触发的 click（detail === 0）视作键盘打开，需移入菜单首项
+    if (event.detail === 0) openedByPointerRef.current = false;
+    toggle();
+  }, []);
+
+  const onTriggerKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLButtonElement>): void => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        openedByPointerRef.current = false;
+        if (!open) {
+          openMenu();
+        } else {
+          cycleMenuFocus(menuRef.current, event.key === 'ArrowDown' ? 1 : -1);
+        }
+      } else if (event.key === 'Escape' && open) {
+        event.preventDefault();
+        close();
+      }
+    },
+    [open, openMenu, close],
+  );
 
   const onKeyDown = useCallback(
     (event: KeyboardEvent<HTMLDivElement>): void => {
@@ -106,7 +150,7 @@ function useMenuBehavior(open: boolean, close: () => void) {
     [close],
   );
 
-  return { triggerRef, menuRef, onKeyDown };
+  return { triggerRef, menuRef, onKeyDown, onTriggerPointerDown, onTriggerClick, onTriggerKeyDown };
 }
 
 function avatarInitial(email: string): string {
@@ -123,11 +167,26 @@ function BrandMark() {
 }
 
 export function TopBar(props: TopBarProps) {
-  const { t, locale, user, quota, networks, topology, selectedNetworkId, onSelectNetwork, onCreateNetwork, view, onChangeView } = props;
+  const {
+    t,
+    locale,
+    user,
+    quota,
+    networks,
+    topology,
+    selectedNetworkId,
+    onSelectNetwork,
+    onCreateNetwork,
+    onGoHome,
+    view,
+    onChangeView,
+  } = props;
   const { theme, onToggleTheme, onToggleLocale, onLogout, onOpenAccountSettings, ui, onUi } = props;
 
   const closeSwitcher = useCallback(() => onUi({ networkSwitcherOpen: false }), [onUi]);
   const closeAccount = useCallback(() => onUi({ accountMenuOpen: false }), [onUi]);
+  const openSwitcher = useCallback(() => onUi({ networkSwitcherOpen: true, accountMenuOpen: false }), [onUi]);
+  const openAccount = useCallback(() => onUi({ accountMenuOpen: true, networkSwitcherOpen: false }), [onUi]);
 
   // 两菜单互斥展开：打开其一先关掉另一个（menu 只有一处阴影与一处浮层，视觉上也只允许一个）
   const toggleSwitcher = useCallback(
@@ -139,8 +198,8 @@ export function TopBar(props: TopBarProps) {
     [onUi, ui.accountMenuOpen],
   );
 
-  const switcher = useMenuBehavior(ui.networkSwitcherOpen, closeSwitcher);
-  const account = useMenuBehavior(ui.accountMenuOpen, closeAccount);
+  const switcher = useMenuBehavior(ui.networkSwitcherOpen, closeSwitcher, openSwitcher);
+  const account = useMenuBehavior(ui.accountMenuOpen, closeAccount, openAccount);
 
   const selected = networks.find((n) => n.id === selectedNetworkId) ?? null;
 
@@ -167,8 +226,16 @@ export function TopBar(props: TopBarProps) {
 
   return (
     <header className="topbar">
-      <BrandMark />
-      <span className="brand-title">{t('app.title')}</span>
+      <button
+        type="button"
+        className="brand-home"
+        onClick={onGoHome}
+        title={t('nav.goHome')}
+        aria-label={`${t('app.title')} · ${t('nav.goHome')}`}
+      >
+        <BrandMark />
+        <span className="brand-title">{t('app.title')}</span>
+      </button>
       <span className="topbar-divider" aria-hidden="true" />
 
       {view === 'admin' ? (
@@ -181,7 +248,9 @@ export function TopBar(props: TopBarProps) {
             className="net-switcher"
             aria-haspopup="menu"
             aria-expanded={ui.networkSwitcherOpen}
-            onClick={toggleSwitcher}
+            onPointerDown={switcher.onTriggerPointerDown}
+            onClick={(e) => switcher.onTriggerClick(e, toggleSwitcher)}
+            onKeyDown={switcher.onTriggerKeyDown}
           >
             <span className="net-switcher-name">{selected !== null ? selected.name : t('nav.networks')}</span>
             {selected !== null && selectedCounts !== null && (
@@ -254,8 +323,10 @@ export function TopBar(props: TopBarProps) {
                   closeSwitcher();
                 }}
               >
-                <span className="menu-check" aria-hidden="true" />
-                <span className="menu-item-name">+ {t('network.createNew')}</span>
+                <span className="menu-icon" aria-hidden="true">
+                  <PlusIcon size={14} />
+                </span>
+                <span className="menu-item-name">{t('network.createNew')}</span>
               </button>
             </div>
           )}
@@ -271,7 +342,9 @@ export function TopBar(props: TopBarProps) {
           className="account-button"
           aria-haspopup="menu"
           aria-expanded={ui.accountMenuOpen}
-          onClick={toggleAccount}
+          onPointerDown={account.onTriggerPointerDown}
+          onClick={(e) => account.onTriggerClick(e, toggleAccount)}
+          onKeyDown={account.onTriggerKeyDown}
         >
           <span className="avatar" aria-hidden="true">
             {avatarInitial(user.email)}
@@ -312,8 +385,10 @@ export function TopBar(props: TopBarProps) {
                 closeAccount();
               }}
             >
-              <span className="menu-check" aria-hidden="true" />
-              {t('account.settings')}
+              <span className="menu-icon" aria-hidden="true">
+                <UserIcon size={15} />
+              </span>
+              <span className="menu-item-label">{t('account.settings')}</span>
             </button>
             <div className="menu-sep" aria-hidden="true" />
             <button
@@ -327,10 +402,15 @@ export function TopBar(props: TopBarProps) {
                 closeAccount();
               }}
             >
-              <span className="menu-check" aria-hidden="true">
-                {view === 'networks' ? <CheckIcon size={12} /> : ''}
+              <span className="menu-icon" aria-hidden="true">
+                <NetworkIcon size={15} />
               </span>
-              {t('view.networks')}
+              <span className="menu-item-label">{t('view.networks')}</span>
+              {view === 'networks' && (
+                <span className="menu-item-trailing" aria-hidden="true">
+                  <CheckIcon size={14} />
+                </span>
+              )}
             </button>
             {/* 网关管理入口严格仅管理员渲染：普通用户不可见、不可点（GC-8 权限收口） */}
             {user.role === 'admin' && (
@@ -345,24 +425,37 @@ export function TopBar(props: TopBarProps) {
                   closeAccount();
                 }}
               >
-                <span className="menu-check" aria-hidden="true">
-                  {view === 'admin' ? <CheckIcon size={12} /> : ''}
+                <span className="menu-icon" aria-hidden="true">
+                  <SettingsIcon size={15} />
                 </span>
-                {t('view.admin')}
+                <span className="menu-item-label">{t('view.admin')}</span>
+                {view === 'admin' && (
+                  <span className="menu-item-trailing" aria-hidden="true">
+                    <CheckIcon size={14} />
+                  </span>
+                )}
               </button>
             )}
             <div className="menu-sep" aria-hidden="true" />
             <button type="button" role="menuitem" data-menu-item className="menu-item" onClick={onToggleTheme}>
+              <span className="menu-icon" aria-hidden="true">
+                <MoonIcon size={15} />
+              </span>
               <span className="menu-item-label">{t('account.darkMode')}</span>
               <span className="menu-item-state">{theme === 'dark' ? t('account.on') : t('account.off')}</span>
             </button>
             <button type="button" role="menuitem" data-menu-item className="menu-item" onClick={onToggleLocale}>
+              <span className="menu-icon" aria-hidden="true">
+                <GlobeIcon size={15} />
+              </span>
               <span className="menu-item-label">{t('account.language')}</span>
             </button>
             <div className="menu-sep" aria-hidden="true" />
             <button type="button" role="menuitem" data-menu-item className="menu-item" onClick={onLogout}>
-              <span className="menu-check" aria-hidden="true" />
-              {t('account.logout')}
+              <span className="menu-icon" aria-hidden="true">
+                <LogoutIcon size={15} />
+              </span>
+              <span className="menu-item-label">{t('account.logout')}</span>
             </button>
           </div>
         )}

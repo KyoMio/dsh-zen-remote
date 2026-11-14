@@ -1049,10 +1049,16 @@ describe('PG-6c 新增双语词条', () => {
     assert.equal(LOCALES.zh['admin.disabledTag'], '已停用');
     assert.equal(LOCALES.en['admin.disabledTag'], 'Disabled');
     assert.equal(LOCALES.en['devices.clickHint'], 'Click a device to see how it connects to others');
+    assert.equal(LOCALES.zh['nav.goHome'], '返回默认网络');
+    assert.equal(LOCALES.en['nav.goHome'], 'Back to primary network');
+    assert.equal(LOCALES.zh['common.copied'], '已复制');
+    assert.equal(LOCALES.en['common.copied'], 'Copied');
+    assert.equal(typeof LOCALES.zh['common.secretCopied'], 'string');
+    assert.equal(typeof LOCALES.zh['common.secretCopyFailed'], 'string');
   });
 });
 
-describe('clipboard：非安全上下文 HTTP 剪贴板回退（回归修复）', () => {
+describe('clipboard：非安全上下文 HTTP 与 <dialog>.showModal() 剪贴板回退（回归修复）', () => {
   function makeMockDoc(execResult = true) {
     const appended = [];
     const removed = [];
@@ -1107,6 +1113,131 @@ describe('clipboard：非安全上下文 HTTP 剪贴板回退（回归修复）'
     assert.equal(mock.appended.length, 1);
     assert.equal(mock.removed.length, 1);
     assert.equal(mock.isFocusRestored(), true);
+  });
+
+  test('<dialog>.showModal() 打开时 document.body 处于 inert：textarea 必须挂进 dialog[open] 才能复制', async () => {
+    const dialogAppended = [];
+    const dialogRemoved = [];
+    const bodyAppended = [];
+    let activeTextareaInsideDialog = false;
+    let selectedValue = null;
+    const dialogEl = {
+      appendChild(node) {
+        dialogAppended.push(node);
+        activeTextareaInsideDialog = true;
+        return node;
+      },
+      removeChild(node) {
+        dialogRemoved.push(node);
+        activeTextareaInsideDialog = false;
+        return node;
+      },
+    };
+    const doc = {
+      activeElement: {
+        focus() {},
+        closest(selector) {
+          return selector === 'dialog[open]' ? dialogEl : null;
+        },
+      },
+      body: {
+        appendChild(node) {
+          bodyAppended.push(node);
+          activeTextareaInsideDialog = false;
+          return node;
+        },
+        removeChild() {},
+      },
+      createElement() {
+        return {
+          value: '',
+          readOnly: false,
+          style: { position: '', top: '', left: '', opacity: '', pointerEvents: '' },
+          setAttribute() {},
+          focus() {},
+          select() {
+            // 模拟真实浏览器：只有挂载在非 inert 的 dialog 内的节点才允许成为选区
+            if (activeTextareaInsideDialog) selectedValue = this.value;
+          },
+          setSelectionRange() {},
+        };
+      },
+      execCommand() {
+        return activeTextareaInsideDialog;
+      },
+    };
+    const ok = await copyTextToClipboard('GenPass_16Chars!', {
+      isSecureContext: false,
+      navigator: {},
+      document: doc,
+    });
+    assert.equal(ok, true);
+    assert.equal(selectedValue, 'GenPass_16Chars!');
+    assert.equal(dialogAppended.length, 1);
+    assert.equal(dialogRemoved.length, 1);
+    assert.equal(bodyAppended.length, 0);
+  });
+
+  test('activeElement 不在弹窗内但存在打开的 dialog[open] 时，回退查最后一个 dialog[open]', async () => {
+    const dialogAppended = [];
+    const dialogRemoved = [];
+    const dialogEl = {
+      appendChild(node) {
+        dialogAppended.push(node);
+        return node;
+      },
+      removeChild(node) {
+        dialogRemoved.push(node);
+        return node;
+      },
+    };
+    const ok = await copyTextToClipboard('ResetPass_16Ch!', {
+      isSecureContext: false,
+      navigator: {},
+      document: {
+        activeElement: null,
+        querySelectorAll(selector) {
+          assert.equal(selector, 'dialog[open]');
+          return [dialogEl];
+        },
+        body: { appendChild() {}, removeChild() {} },
+        createElement() {
+          return {
+            value: '',
+            readOnly: false,
+            style: { position: '', top: '', left: '', opacity: '', pointerEvents: '' },
+            setAttribute() {},
+            focus() {},
+            select() {},
+          };
+        },
+        execCommand() {
+          return dialogAppended.length === 1;
+        },
+      },
+    });
+    assert.equal(ok, true);
+    assert.equal(dialogAppended.length, 1);
+    assert.equal(dialogRemoved.length, 1);
+  });
+
+  test('isSecureContext === false 时跳过 navigator.clipboard.writeText 直接同步走 execCommand', async () => {
+    let clipboardCalled = false;
+    const mock = makeMockDoc(true);
+    const ok = await copyTextToClipboard('TempPass_Sync!', {
+      isSecureContext: false,
+      navigator: {
+        clipboard: {
+          async writeText() {
+            clipboardCalled = true;
+          },
+        },
+      },
+      document: mock.doc,
+    });
+    assert.equal(ok, true);
+    assert.equal(clipboardCalled, false);
+    assert.equal(mock.getCopied(), 'TempPass_Sync!');
   });
 
   test('标准 navigator.clipboard.writeText 被权限拒绝时，继续回落 execCommand("copy")', async () => {
