@@ -588,7 +588,7 @@ export declare const zh: {
     readonly 'wizard.peer.syncGatewayHold': "设备网络尚未就绪";
     readonly 'wizard.peer.pendingApproval': "已提交入网申请，等待网络管理员批准";
     readonly 'wizard.peer.joinFailed': "加入网络失败：{reason}";
-    readonly 'wizard.peer.joinInvalid': "邀请链接格式无效，请粘贴完整的 zr-net:// 链接（旧式 zr-nets:// 链接仍可识别）";
+    readonly 'wizard.peer.joinInvalid': "邀请链接格式无效，请粘贴完整的 zr-net:// 链接（旧式 zr-nets://、zr-net+insecure:// 链接仍可识别）";
     readonly 'wizard.peer.joinGatewayInvalid': "网关地址格式无效，请输入如 http://192.168.1.10:19393 或 https://zr.example.com";
     readonly 'wizard.peer.joinGatewayUnreachable': "无法连接到该中继网关，请检查地址、端口及网关容器是否已启动";
     readonly 'wizard.peer.joinNoNetwork': "该网关尚未创建任何虚拟网络，请先在网关控制台创建网络";
