@@ -3445,7 +3445,7 @@ test('PG-9 POSTs without an engine answer 503 peer-unavailable', async () => {
 })
 
 test('peer join by gatewayUrl: single-network auto-join, multi-network 409 select-network, and plain-HTTP public host', async () => {
-  // 1. Single network on plain-HTTP public IP -> synthesizes zr-net+insecure:// and returns manualApproval: true.
+  // 1. Single network on plain-HTTP public IP -> synthesizes zr-net://…?tls=0 and returns manualApproval: true.
   {
     const { engine, calls } = makePeerEngine()
     const fetchCalls = []
@@ -3471,7 +3471,7 @@ test('peer join by gatewayUrl: single-network auto-join, multi-network 409 selec
         manualApproval: true,
       })
       assert.deepEqual(fetchCalls, ['http://203.0.113.99:19393/peer/v1/networks'])
-      assert.deepEqual(calls, [['join', 'zr-net+insecure://203.0.113.99:19393/1122334455667788']])
+      assert.deepEqual(calls, [['join', 'zr-net://203.0.113.99:19393/1122334455667788?tls=0']])
     } finally {
       await closeServer(server)
     }

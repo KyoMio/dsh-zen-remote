@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import { createGatewayApiServer } from '../dist/server.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { deriveMasterKeyFromSecret, hashPassword, decryptSecret } from '../dist/master-key.js';
+import { maskInviteUri } from '../dist/web/format.js';
 
 const MASTER_KEY = deriveMasterKeyFromSecret('rest-api-test');
 const ADMIN_EMAIL = 'admin@local';
@@ -958,7 +959,7 @@ describe('publicUrl 主机与运行时统计注入（独立实例）', () => {
 });
 
 describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口反代）', () => {
-  test('公网 IP 跑明文 http:// 时 joinUri 发出 zr-net+insecure://，避免节点端误连 wss://', async () => {
+  test('公网 IP 跑明文 http:// 时 joinUri 附 ?tls=0 纠偏，避免节点端误连 wss://', async () => {
     const h = await startServer({ publicUrl: 'http://203.0.113.10:19393' });
     try {
       await seedUsers(h.store);
@@ -967,7 +968,7 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
       assert.equal(res.status, 200);
       assert.equal(
         res.json.data.joinUri,
-        `zr-net+insecure://203.0.113.10:19393/${res.json.data.id}#${res.json.data.joinKey}`,
+        `zr-net://203.0.113.10:19393/${res.json.data.id}?tls=0#${res.json.data.joinKey}`,
       );
       assert.equal(res.json.data.gatewayUrl, 'http://203.0.113.10:19393');
     } finally {
@@ -992,6 +993,57 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
     }
   });
 
+  test('https:// 指向私网 IP 时自动补 :443 并附 ?tls=1 纠偏（私网默认推断是明文）', async () => {
+    const h = await startServer({ publicUrl: 'https://192.168.1.10' });
+    try {
+      await seedUsers(h.store);
+      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'https-private' } });
+      assert.equal(res.status, 200);
+      assert.equal(
+        res.json.data.joinUri,
+        `zr-net://192.168.1.10:443/${res.json.data.id}?tls=1#${res.json.data.joinKey}`,
+      );
+      assert.equal(res.json.data.gatewayUrl, 'https://192.168.1.10');
+    } finally {
+      await stopServer(h);
+    }
+  });
+
+  test('http:// 指向私网 IP 时自动补 :80 且不带 query（与私网默认明文一致）', async () => {
+    const h = await startServer({ publicUrl: 'http://192.168.1.10' });
+    try {
+      await seedUsers(h.store);
+      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'http-private' } });
+      assert.equal(res.status, 200);
+      assert.equal(
+        res.json.data.joinUri,
+        `zr-net://192.168.1.10:80/${res.json.data.id}#${res.json.data.joinKey}`,
+      );
+      assert.equal(res.json.data.gatewayUrl, 'http://192.168.1.10');
+    } finally {
+      await stopServer(h);
+    }
+  });
+
+  test('https:// 指向 .local 域名时附 ?tls=1（.local/.lan 与客户端同样视为内网默认明文）', async () => {
+    const h = await startServer({ publicUrl: 'https://nas.local:8443' });
+    try {
+      await seedUsers(h.store);
+      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'https-mdns' } });
+      assert.equal(res.status, 200);
+      assert.equal(
+        res.json.data.joinUri,
+        `zr-net://nas.local:8443/${res.json.data.id}?tls=1#${res.json.data.joinKey}`,
+      );
+      assert.equal(res.json.data.gatewayUrl, 'https://nas.local:8443');
+    } finally {
+      await stopServer(h);
+    }
+  });
+
   test('缺省 publicUrl 但带 X-Forwarded-Proto: https 时 gatewayUrl 返回 https://origin', async () => {
     const h = await startServer();
     try {
@@ -1007,11 +1059,22 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
       assert.equal(res.json.data.gatewayUrl, `https://${host}`);
       assert.equal(
         res.json.data.joinUri,
-        `zr-nets://${host}/${res.json.data.id}#${res.json.data.joinKey}`,
+        `zr-net://${host}/${res.json.data.id}?tls=1#${res.json.data.joinKey}`,
       );
     } finally {
       await stopServer(h);
     }
+  });
+
+  test('maskInviteUri 对 ?tls=0|1 的新格式保留 query、只打码 # 后的 joinKey', () => {
+    assert.equal(
+      maskInviteUri('zr-net://203.0.113.10:19393/0123456789abcdef?tls=0#secret'),
+      'zr-net://203.0.113.10:19393/0123456789abcdef?tls=0#••••••••',
+    );
+    assert.equal(
+      maskInviteUri('zr-net://nas.local:8443/0123456789abcdef?tls=1#secret'),
+      'zr-net://nas.local:8443/0123456789abcdef?tls=1#••••••••',
+    );
   });
 });
 

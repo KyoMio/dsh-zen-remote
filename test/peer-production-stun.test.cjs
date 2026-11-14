@@ -480,7 +480,7 @@ test('PC-01b: 换网重入网 —— 旧探测过期丢弃，新 welcome 重新�
   const staleAlt = altListener.packets[0].parsed.nonce
   const newNetworkId = randomHex(8)
   await node.engine.joinNetwork(
-    `zr-net+insecure://127.0.0.1:${gateway.port}/${newNetworkId}#rejoin-key`,
+    `zr-net://127.0.0.1:${gateway.port}/${newNetworkId}#rejoin-key`,
   )
   await eventually(() => node.engine.status().gatewayState === 'authorized', 3000, 're-authorized on the new network')
   // 新探测（新 punch socket 的新包）
@@ -500,6 +500,14 @@ test('PC-01b: 换网重入网 —— 旧探测过期丢弃，新 welcome 重新�
   altListener.replyNonce(staleAlt, 42000)
   await sleep(2300)
   assert.equal(node.engine.status().natType, 'public', '换网后旧探测的迟到结果被丢弃')
+
+  // GC-1b 向后兼容回归：统一 zr-net:// 输出后，历史遗留的 zr-net+insecure://
+  // 旧邀请链接必须仍能解析并入网（只读兼容，parseInviteUri 按旧前缀取明文传输）。
+  const legacyNetId = randomHex(8)
+  await node.engine.joinNetwork(
+    `zr-net+insecure://127.0.0.1:${gateway.port}/${legacyNetId}#legacy-key`,
+  )
+  await eventually(() => node.engine.status().gatewayState === 'authorized', 3000, 'legacy zr-net+insecure:// invite still joins')
 })
 
 // ---------------------------------------------------------------- 生产接线用例
@@ -660,7 +668,7 @@ test('PC-01b/fix1 生产接线: WS断开重连后网关重新登记反射端点�
   })
   assert.equal(netRes.status, 200, JSON.stringify(netRes.json))
   const net = netRes.json.data
-  const invite = `zr-net+insecure://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
+  const invite = `zr-net://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
 
   const A = await startProdNode('fix1-a')
   nodes.push(A)
@@ -723,7 +731,7 @@ test('PC-01b 生产接线: 真实 startGateway 下发 stun 端口 → 缺省引�
   })
   assert.equal(netRes.status, 200, JSON.stringify(netRes.json))
   const net = netRes.json.data
-  const invite = `zr-net+insecure://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
+  const invite = `zr-net://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
 
   const A = await startProdNode('prod-a', { shared: ['s-a1'] })
   const B = await startProdNode('prod-b')
@@ -799,7 +807,7 @@ test('PC-02 生产接线: 辅助口关闭——主口发布反射端点(unknown)
   })
   assert.equal(netRes.status, 200, JSON.stringify(netRes.json))
   const net = netRes.json.data
-  const invite = `zr-net+insecure://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
+  const invite = `zr-net://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
 
   const A = await startProdNode('pc02-a', { shared: ['s-a1'] })
   const B = await startProdNode('pc02-b')
@@ -891,7 +899,7 @@ test('PC-02-fix1 生产接线: 辅助口真实开启且公布但探测被丢弃�
   })
   assert.equal(netRes.status, 200, JSON.stringify(netRes.json))
   const net = netRes.json.data
-  const invite = `zr-net+insecure://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
+  const invite = `zr-net://127.0.0.1:${gw.port}/${net.id}#${net.joinKey}`
 
   const A = await startProdNode('fix1deaf-a', { shared: ['s-a1'] })
   const B = await startProdNode('fix1deaf-b')
