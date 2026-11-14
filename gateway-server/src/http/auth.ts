@@ -75,8 +75,8 @@ export interface MemberChangedEvent {
 export interface GatewayHooks {
   onMemberChanged?: (event: MemberChangedEvent) => void | Promise<void>;
   onNetworkDeleted?: (networkId: string) => void | Promise<void>;
-  /** PC-08a：网络 PATCH（仅 maxPeers）持久化成功后通知；接收方以库中最新事实为准做幂等收敛 */
-  onNetworkUpdated?: (networkId: string) => void | Promise<void>;
+  /** PC-08a / PS-5：网络 PATCH（仅 maxPeers）持久化成功后直传新上限给 hub */
+  onNetworkUpdated?: (networkId: string, maxPeers: number) => void | Promise<void>;
   onSettingsChanged?: (settings: SystemSettings) => void | Promise<void>;
   onUserDisabled?: (userId: string) => void | Promise<void>;
 }
@@ -325,10 +325,13 @@ function isValidEmail(email: string): boolean {
 // ---------------------------------------------------------------- 钩子
 
 /** 钩子（PG-5 实时层）抛错只影响通知、不回滚已落库的 HTTP 操作 */
-export async function runHook<T>(hook: ((arg: T) => void | Promise<void>) | undefined, arg: T): Promise<void> {
+export async function runHook<Args extends unknown[]>(
+  hook: ((...args: Args) => void | Promise<void>) | undefined,
+  ...args: Args
+): Promise<void> {
   if (hook === undefined) return;
   try {
-    await hook(arg);
+    await hook(...args);
   } catch {
     /* 实时层故障不阻断 HTTP 响应 */
   }

@@ -180,7 +180,7 @@ function waitForExit(child, capture) {
     }
   });
 
-  test('永不完成写：SIGTERM 后生产入口在墙钟预算后非零退出（兜底触发即失败）', { timeout: 60_000 }, async () => {
+  test('永不完成写：SIGTERM 后在预算内降级打 warning 告警并正常 0 退出（兜底触发即失败）', { timeout: 60_000 }, async () => {
     const { schema, url } = await createOwnedSchema();
     const dataDir = makeChildDataDir();
     created.push({ schema, dataDir });
@@ -190,13 +190,13 @@ function waitForExit(child, capture) {
     child.kill('SIGTERM');
     const outcome = await waitForExit(child, capture);
     assert.equal(outcome.fallbackKilled, false, '关停必须自有界退出：父进程兜底 SIGKILL 触发即失败');
-    assert.equal(outcome.signal, null, `存储不响应时应 process.exit 非零（signal=${outcome.signal}）`);
-    assert.notEqual(outcome.code, 0, `关停失败必须非零退出（code=${outcome.code}）`);
+    assert.equal(outcome.signal, null, `应由 process.exit(0) 退出（signal=${outcome.signal}）`);
+    assert.equal(outcome.code, 0, `遥测刷盘挂起时应降级 warning 并正常退出 0（code=${outcome.code}）`);
     assert.ok(
-      outcome.wallMs >= BUDGET_FLOOR_MS,
-      `非零退出必须在墙钟预算（≈5000ms）耗尽后（实测 ${outcome.wallMs}ms）`,
+      outcome.wallMs < 5000,
+      `降级退出应在整体预算（5000ms）内完成（实测 ${outcome.wallMs}ms）`,
     );
-    assert.match(capture.stderr, /shutdown failed|unconfirmed|budget/i, '失败路径必须如实报告未确认状态');
+    assert.match(capture.stderr, /final telemetry flush incomplete.*unconfirmed/i, '降级路径必须打出含未确认累计的 warning');
   });
 
   test('早期关停步骤卡点（UDP 关闭永不完成）：SIGTERM 后仍须预算+清理宽限内非零退出', { timeout: 60_000 }, async () => {

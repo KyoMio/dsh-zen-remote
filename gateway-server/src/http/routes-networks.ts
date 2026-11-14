@@ -194,7 +194,7 @@ async function handlePatchNetwork(ctx: RouteContext, params: Record<string, stri
   // PC-08a：容量变化才通知实时层——仅改 name/admissionMode 不伪造容量事实；
   // 接收方（ws-hub）以库中最新事实为准收敛，重复同值 PATCH 不产生重复推送
   if (patch.maxPeers !== undefined) {
-    await runHook(ctx.hooks.onNetworkUpdated, networkId);
+    await runHook(ctx.hooks.onNetworkUpdated, networkId, updated.maxPeers);
   }
   sendOk(ctx.res, await networkView(ctx, updated));
 }
