@@ -287,9 +287,13 @@ await test('derivePeerWizardLights: the peer node\'s three lights (PG-9 + PC-14a
   for (const amber of ['pending-approval', 'connecting', 'offline', 'unconfigured']) {
     assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: amber, mismatchCount: 0 }).admission, 'pending', amber)
   }
-  for (const red of ['mismatch', 'revoked', 'paused']) {
+  for (const red of ['mismatch', 'revoked', 'paused', 'identity-error']) {
     assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: red, mismatchCount: 0 }).admission, 'fail', red)
   }
+  assert.deepEqual(
+    derivePeerWizardLights({ identityReady: false, gatewayState: 'identity-error', mismatchCount: 0 }),
+    { identity: 'fail', admission: 'fail', discovery: 'pending' },
+  )
   // ③ discovery & sync (PC-14a): ONLY the body's sync fact can turn it green
   // — a non-empty peers list, a lan path or a mounted count never do.
   assert.equal(derivePeerWizardLights({ identityReady: true, gatewayState: 'authorized', mismatchCount: 0, sync: { state: 'ready' } }).discovery, 'pass')

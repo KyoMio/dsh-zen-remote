@@ -1625,8 +1625,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // and the pool's virtual mounts. Created beside the pool (it mounts into
     // it), torn down with it (the SAME disposal effect — the role-wiring
     // contract pins the top-level effect counts, so no new effect appears).
+    let peerIdentityError: string | undefined
     const peerEngine: PeerEngine | undefined = effective.values.role === 'peer'
-      ? createPeerEngine({
+      ? (() => {
+          try {
+            return createPeerEngine({
           stateFile: clientStateFile,
           identity: ensurePeerIdentity(clientStateFile),
           relayPool,
@@ -1643,6 +1646,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           // and is intentionally NOT set here.
           log: (line) => { ring.push('info', 'peer: %s', line) },
         })
+          } catch (error) {
+            peerIdentityError = 'state-file-unreadable'
+            logWarn('dsh-zen-remote: peer identity load failed: %s', message(error))
+            return undefined
+          }
+        })()
       : undefined
     livePeerEngine = peerEngine
     // PG-9 启动自动恢复：state 文件里已有 peerNetwork 记录（本机曾入网）
@@ -2137,6 +2146,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       // network's HTTP origin, both read per request. Undefined engine on a
       // non-peer row — the routes then answer 503 peer-unavailable.
       getPeerEngine: () => peerEngine,
+      getPeerIdentityError: () => peerIdentityError,
       getPeerNetworkOrigin: () => readPeerNetwork(clientStateFile)?.gatewayHttpOrigin,
       getPluginBridgeStatusForServer: pluginBridgeStatusFor,
       getIntercept: interceptDiagnostics,

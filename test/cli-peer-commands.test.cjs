@@ -931,6 +931,40 @@ test('peer status: 未入网与 --json 快照', async () => {
   }
 })
 
+test('PS-2: peer status reports identity-error clearly instead of false not-joined', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('status-peer-identity-error')
+  let handle
+  try {
+    const errClient = {
+      [ROUTES.peerStatus]: {
+        body: () => ({
+          configured: false,
+          nodeId: '',
+          gatewayState: 'identity-error',
+          identityError: 'state-file-unreadable',
+          maxPeers: null,
+          maxServers: 8,
+          mountedCount: 0,
+          limitReached: false,
+          peers: [],
+        }),
+      },
+    }
+    const { handle: h } = await startIpcServer(home, { role: 'peer', client: errClient })
+    handle = h
+    const ctx = makeCtx(mods, { argv: ['peer', 'status'], ipc: mods.createCliIpcClient(handle.socketPath) })
+    assert.equal(await mods.runPeerStatusCommand(ctx), 0)
+    const output = ctx.stdout.text()
+    assert.match(output, /本地身份读取失败/u)
+    assert.match(output, /修复文件权限后重试/u)
+    assert.doesNotMatch(output, /未加入任何虚拟网络/u)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
 // ===========================================================================
 // 验收 5：peer trust
 // ===========================================================================

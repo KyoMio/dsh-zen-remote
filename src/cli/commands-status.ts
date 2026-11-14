@@ -102,6 +102,7 @@ export function gatewayStateLabel(t: CliTranslator, value: unknown): string {
     case 'authorized': return t('peer.gateway.authorized')
     case 'paused': return t('peer.gateway.paused')
     case 'revoked': return t('peer.gateway.revoked')
+    case 'identity-error': return t('peer.gateway.identity-error')
     case 'offline': return t('peer.gateway.offline')
     default: return stringOf(value) === '' ? t('peer.gateway.offline') : String(value)
   }
@@ -335,11 +336,16 @@ function renderClientSection(t: CliTranslator, client: ServerRow): string[] {
  * node id, joined network + gateway, admission state, and one row per
  * network device. A missing engine answer renders nothing (the section title
  * alone) instead of failing the command. */
-function renderPeerSection(t: CliTranslator, peer: ServerRow | null): string[] {
+export function renderPeerSection(t: CliTranslator, peer: ServerRow | null): string[] {
   const lines: string[] = [t('peer.status.title')]
   if (peer === null) return lines
   const nodeId = typeof peer.nodeId === 'string' ? peer.nodeId : ''
   lines.push(`  ${t('peer.status.nodeId', { nodeId })}`)
+  if (peer.gatewayState === 'identity-error') {
+    lines.push(`  ${t('peer.status.gatewayState', { state: gatewayStateLabel(t, peer.gatewayState) })}`)
+    lines.push(`  ${t('peer.status.identityError')}`)
+    return lines
+  }
   if (peer.configured !== true) {
     lines.push(`  ${t('peer.status.notJoined')}`)
     return lines
