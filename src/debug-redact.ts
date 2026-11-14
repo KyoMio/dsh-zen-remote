@@ -174,13 +174,25 @@ function redactUrlQuery(tail: string): string {
  * `sessionId=zr~…` value stays recognisable. This is the URL's only secret
  * pass — the URL was extracted before the text-wide token pass ran.
  *
- * EXCEPT on a peer invite (`zr-net://` and friends, PG-2): there the
- * fragment IS the join key — a credential by definition, and often too short
- * to trip the token-run threshold — so any non-empty `#…` dies to
- * `<token>` unconditionally. The scheme, address class, port and network id
- * survive, exactly like an http(s)/ws(s) URL's shape. */
+ * EXCEPT on a peer invite (`zr-net://` and friends, PG-2; GC-1a adds the
+ * unified `?tls=0|1` query): there the fragment IS the join key — a
+ * credential by definition, and often too short to trip the token-run
+ * threshold — so any non-empty `#…` dies to `<token>` unconditionally, and
+ * the query part before it still goes through the normal per-parameter
+ * pass (`?tls=0` survives, a secret-shaped query value does not). The
+ * scheme, address class, port and network id survive, exactly like an
+ * http(s)/ws(s) URL's shape. The `#` is FOUND, not matched at position 0 —
+ * a `?tls=0#key` tail starts at the `?`, and the old startsWith check let
+ * the key leak verbatim. */
 function redactUrlTail(scheme: string, tail: string): string {
-  if (scheme.startsWith('zr-net') && tail.startsWith('#') && tail.length > 1) return `#${TOKEN_PLACEHOLDER}`
+  if (scheme.toLowerCase().startsWith('zr-net')) {
+    const hashAt = tail.indexOf('#')
+    if (hashAt !== -1) {
+      const query = redactUrlQuery(tail.slice(0, hashAt))
+      const fragment = tail.slice(hashAt)
+      return `${query}${fragment.length > 1 ? `#${TOKEN_PLACEHOLDER}` : fragment}`
+    }
+  }
   return redactUrlQuery(tail)
 }
 

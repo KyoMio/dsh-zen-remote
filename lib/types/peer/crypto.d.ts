@@ -55,16 +55,20 @@ export declare function deriveNodeIdFromPublicKey(publicKeyHex: string): string;
  */
 export declare function verifySelfCertifyingNodeId(nodeId: string, publicKeyHex: string): boolean;
 /**
- * A parsed `zr-net://<host[:port]>/<networkId>[#<joinKey>]` invite.
+ * A parsed `zr-net://<host[:port]>/<networkId>[?tls=0|1][#<joinKey>]` invite.
  *
- * `defaultTls` says which transport the SCHEME alone implies ( callers may
- * still connect the other way, e.g. an explicit local test override):
+ * `defaultTls` says which transport to connect with (GC-1a: one canonical
+ * `zr-net://` scheme; the transport rides an explicit `?tls=0|1` query, and
+ * the legacy read-only prefixes keep parsing for backward compatibility):
  * - `zr-nets://` forces TLS (wss/https) regardless of the host;
  * - `zr-net+insecure://` explicitly selects plaintext for gateways without TLS;
- * - plain `zr-net://` infers from the host: loopback / private v4 / ULA /
- *   link-local / Tailscale CGNAT (100.64.0.0/10) → plaintext, anything
- *   publicly routable → TLS, because a public path needs the reverse
- *   proxy's certificate to be meaningful.
+ * - plain `zr-net://` with `?tls=0|1` uses that flag verbatim (the ONLY query
+ *   the scheme accepts — anything else on the `?` is malformed);
+ * - plain `zr-net://` without a query infers from the host: loopback /
+ *   private v4 / ULA / link-local / Tailscale CGNAT (100.64.0.0/10) /
+ *   mDNS-and-home suffixes (`.local`, `.lan`) → plaintext, anything publicly
+ *   routable → TLS, because a public path needs the reverse proxy's
+ *   certificate to be meaningful.
  *
  * `rawHost` is the host token exactly as written (brackets kept for IPv6);
  * `hostname` is the bracket-stripped lowercase address. `port` defaults to
@@ -88,13 +92,32 @@ export declare function isLoopbackOrPrivateHostname(hostname: string): boolean;
  * users. Blank runs are trimmed; schemes are matched case-insensitively;
  * the networkId may be mixed-case hex and is normalized to lowercase; the
  * joinKey is percent-decoded when it decodes, kept raw when it does not.
+ *
+ * GC-1a: the tail is split at the FIRST `#` (fragment = join key) and the
+ * part before it at the FIRST `?`. The query is only accepted on plain
+ * `zr-net://` and must be EXACTLY `tls=0` or `tls=1` — any other query
+ * content (extra parameters, other values, a bare `?`) is malformed. The
+ * legacy `zr-nets://` / `zr-net+insecure://` prefixes keep parsing but
+ * reject every query.
  */
 export declare function parseInviteUri(input: string): ParsedInviteUri | null;
-/** Build an invite URI (the inverse of {@link parseInviteUri}). Throws on malformed params — the caller composes it from its own validated state. */
+/**
+ * Build an invite URI (the inverse of {@link parseInviteUri}). Throws on
+ * malformed params — the caller composes it from its own validated state.
+ *
+ * GC-1a: the output is ALWAYS `zr-net://` — the transport rides `?tls=0|1`
+ * when the desired TLS differs from what the host implies, so a single
+ * scheme parses everywhere. The legacy `scheme` values are still accepted
+ * and only steer that desired TLS (`zr-nets` → true, `zr-net+insecure` →
+ * false). `host` is validated with {@link parseInviteAuthority} (so an
+ * optional `:port` in 1..65535 is legal) and kept verbatim — a port-less
+ * host stays port-less.
+ */
 export declare function formatInviteUri(params: {
     host: string;
     networkId: string;
     joinKey?: string;
+    tls?: boolean;
     scheme?: 'zr-net' | 'zr-nets' | 'zr-net+insecure';
 }): string;
 export type ParsedGatewayJoinInput = {
@@ -117,9 +140,10 @@ export type ParsedGatewayJoinInput = {
  */
 export declare function parseGatewayJoinInput(input: string): ParsedGatewayJoinInput | null;
 /**
- * Construct a canonical keyless invite URI (`zr-net` / `zr-nets` /
- * `zr-net+insecure`) that round-trips through {@link parseInviteUri} to the
- * exact `tls` transport and `rawHost:port`.
+ * Construct a canonical keyless invite URI that round-trips through
+ * {@link parseInviteUri} to the exact `tls` transport and `rawHost:port`.
+ * GC-1a: always `zr-net://` — a transport that differs from what the host
+ * implies rides `?tls=0|1`; a matching one emits no query at all.
  */
 export declare function buildKeylessInviteUri(params: {
     rawHost: string;
@@ -130,11 +154,14 @@ export declare function buildKeylessInviteUri(params: {
 }): string;
 export type AssembleInviteErrorCode = 'bad-adv-gateway' | 'bad-adv-network-id' | 'bad-adv-join-key';
 /**
- * Assemble a canonical `zr-net*://` invite URI from split advanced-form parts
+ * Assemble a canonical `zr-net://` invite URI from split advanced-form parts
  * (`gatewayAddress` + `networkId` + optional verbatim `joinKey`), reusing
  * `parseGatewayJoinInput` and `isLoopbackOrPrivateHostname` as the single
  * source of truth. Leading/trailing whitespace in `joinKey` is preserved
  * verbatim; lone UTF-16 surrogates are rejected locally as `bad-adv-join-key`.
+ * GC-1a: the transport stated by the address scheme (`https`/`wss` → TLS,
+ * `http`/`ws` → plaintext, bare host → the host's own default) rides
+ * `?tls=0|1` when it differs from that default — never a legacy prefix.
  */
 export declare function assembleInviteUri(input: {
     gatewayAddress: string;
