@@ -44,6 +44,7 @@ export interface NetworkView {
   createdAt: string;
   joinKey: string;
   joinUri: string;
+  gatewayUrl: string;
   onlineDevices: number;
   totalDevices: number;
   pendingCount: number;

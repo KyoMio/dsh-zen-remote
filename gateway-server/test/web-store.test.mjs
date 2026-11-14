@@ -4,6 +4,9 @@
 // 与其余测试相同：.mjs 直接 import 编译产物 ../dist/。
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   LOCALES,
@@ -48,6 +51,7 @@ function makeNetworkView(id, name, overrides = {}) {
     createdAt: '2026-01-01T00:00:00.000Z',
     joinKey: 'a'.repeat(64),
     joinUri: `zr-net://gw.local/${id}#${'a'.repeat(64)}`,
+    gatewayUrl: 'http://gw.local',
     onlineDevices: 1,
     totalDevices: 3,
     pendingCount: 0,
@@ -1195,5 +1199,22 @@ describe('PC-20 fix1：ConsoleClient 把 AbortSignal 透传给底层 fetch', () 
 
     await client.adminListUsers();
     assert.equal(calls[1].init.signal, undefined, '不传 signal 保持旧行为');
+  });
+});
+
+describe('PS-4b：NetworkView 分项快速复制（网关地址 / 网络 ID / 入网口令）', () => {
+  test('渐进披露 <details className="invite-parts"> 不在 DOM 中明文展示 joinKey，并处理 manual 与无网关地址态', () => {
+    const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const source = fs.readFileSync(path.join(pkgDir, 'src/web/components/NetworkView.tsx'), 'utf8');
+    assert.match(source, /<details className="invite-parts">/, '必须包含原生渐进披露细节区');
+    assert.ok(source.includes('{network.gatewayUrl || \'—\'}'), '网关地址行使用后端返回的 gatewayUrl');
+    assert.ok(source.includes('{network.id}'), '网络 ID 行展示 network.id');
+    assert.ok(source.includes('••••••••••••'), '入网口令行必须只显示打码圆点');
+    assert.ok(!source.includes('>{network.joinKey}<'), '不得把明文 joinKey 渲染进可见 DOM 文本');
+    assert.ok(source.includes("network.admissionMode === 'manual'"), '手动审批模式需隐去无用口令复制按钮');
+    assert.ok(
+      source.includes("onCopyField?.(network.joinKey, 'toast.joinPassphraseCopied')"),
+      '点击口令复制按钮时交由回调复制完整 joinKey 并弹独立提示',
+    );
   });
 });

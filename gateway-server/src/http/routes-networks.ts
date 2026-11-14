@@ -62,14 +62,18 @@ function extractHostname(hostHeader: string): string {
  * - 未配 `publicUrl` 时：从 `X-Forwarded-Proto` 与 `Host` 推断；公网 IP 直连跑明文 HTTP（如 Docker 19393 裸跑）
  *   时发出 `zr-net+insecure://`，避免节点端把公网地址误走 `wss://` 握手失败；私网/回环继续保持简短 `zr-net://`。
  */
-function buildJoinEndpoint(ctx: RouteContext): { scheme: 'zr-net' | 'zr-nets' | 'zr-net+insecure'; authority: string } {
+function buildJoinEndpoint(ctx: RouteContext): {
+  scheme: 'zr-net' | 'zr-nets' | 'zr-net+insecure';
+  authority: string;
+  gatewayUrl: string;
+} {
   if (ctx.config.publicUrl !== undefined) {
     const pub = new URL(ctx.config.publicUrl);
     const isTls = pub.protocol === 'https:';
     const isPrivate = isLoopbackOrPrivateHostname(pub.hostname);
     const authority = pub.port !== '' ? pub.host : `${pub.hostname}:${isTls ? '443' : '80'}`;
     const scheme = isTls ? (isPrivate ? 'zr-nets' : 'zr-net') : (isPrivate ? 'zr-net' : 'zr-net+insecure');
-    return { scheme, authority };
+    return { scheme, authority, gatewayUrl: pub.origin };
   }
   const authority = ctx.req.headers['host'] ?? '';
   const hostname = extractHostname(authority);
@@ -77,7 +81,8 @@ function buildJoinEndpoint(ctx: RouteContext): { scheme: 'zr-net' | 'zr-nets' | 
   const isTls = forwardedProto === 'https';
   const isPrivate = hostname === '' || isLoopbackOrPrivateHostname(hostname);
   const scheme = isTls ? (isPrivate ? 'zr-nets' : 'zr-net') : (isPrivate ? 'zr-net' : 'zr-net+insecure');
-  return { scheme, authority };
+  const gatewayUrl = authority !== '' ? `${isTls ? 'https' : 'http'}://${authority}` : '';
+  return { scheme, authority, gatewayUrl };
 }
 
 function parseName(value: unknown): string {
@@ -127,6 +132,7 @@ async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<R
     createdAt: network.createdAt,
     joinKey,
     joinUri: `${endpoint.scheme}://${endpoint.authority}/${network.id}#${joinKey}`,
+    gatewayUrl: endpoint.gatewayUrl,
     onlineDevices: ctx.runtime.getOnlineCountByNetwork(network.id),
     totalDevices,
     pendingCount,

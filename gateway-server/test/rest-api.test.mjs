@@ -401,6 +401,7 @@ describe('REST API /api/v1（主服务器）', () => {
       assert.match(data.joinKey, /^[0-9a-f]{64}$/); // 高熵 joinKey
       const host = new URL(handle.base).host;
       assert.equal(data.joinUri, `zr-net://${host}/${data.id}#${data.joinKey}`);
+      assert.equal(data.gatewayUrl, `http://${host}`);
       tenantNetId = data.id;
       tenantJoinKey = data.joinKey;
     });
@@ -904,6 +905,7 @@ describe('publicUrl 主机与运行时统计注入（独立实例）', () => {
     assert.equal(res.status, 200);
     netId = res.json.data.id;
     assert.equal(res.json.data.joinUri, `zr-net://gw.example.com:8443/${netId}#${res.json.data.joinKey}`);
+    assert.equal(res.json.data.gatewayUrl, 'https://gw.example.com:8443');
   });
 
   test('GET /networks 附带在线/总设备数与待审批数（runtime 注入 + store 统计）', async () => {
@@ -913,6 +915,7 @@ describe('publicUrl 主机与运行时统计注入（独立实例）', () => {
     const res = await api(handle.base, 'GET', '/api/v1/networks', { cookie: tenantCookie });
     assert.equal(res.status, 200);
     const item = res.json.data.find((n) => n.id === netId);
+    assert.equal(item.gatewayUrl, 'https://gw.example.com:8443');
     assert.equal(item.onlineDevices, 2); // runtime 注入
     assert.equal(item.totalDevices, 1); // 占席位成员（authorized+paused+mismatch），pending/revoked 不计
     assert.equal(item.pendingCount, 1);
@@ -966,6 +969,7 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
         res.json.data.joinUri,
         `zr-net+insecure://203.0.113.10:19393/${res.json.data.id}#${res.json.data.joinKey}`,
       );
+      assert.equal(res.json.data.gatewayUrl, 'http://203.0.113.10:19393');
     } finally {
       await stopServer(h);
     }
@@ -981,6 +985,29 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
       assert.equal(
         res.json.data.joinUri,
         `zr-net://zr.example.com:443/${res.json.data.id}#${res.json.data.joinKey}`,
+      );
+      assert.equal(res.json.data.gatewayUrl, 'https://zr.example.com');
+    } finally {
+      await stopServer(h);
+    }
+  });
+
+  test('缺省 publicUrl 但带 X-Forwarded-Proto: https 时 gatewayUrl 返回 https://origin', async () => {
+    const h = await startServer();
+    try {
+      await seedUsers(h.store);
+      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const res = await api(h.base, 'POST', '/api/v1/networks', {
+        cookie,
+        headers: { 'x-forwarded-proto': 'https' },
+        body: { name: 'xfp-https' },
+      });
+      assert.equal(res.status, 200);
+      const host = new URL(h.base).host;
+      assert.equal(res.json.data.gatewayUrl, `https://${host}`);
+      assert.equal(
+        res.json.data.joinUri,
+        `zr-nets://${host}/${res.json.data.id}#${res.json.data.joinKey}`,
       );
     } finally {
       await stopServer(h);

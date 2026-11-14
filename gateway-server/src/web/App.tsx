@@ -420,13 +420,20 @@ export function App() {
     [refreshNetworks, showToast],
   );
 
-  const handleCopyInvite = useCallback(
-    (joinUri: string): void => {
-      void copyTextToClipboard(joinUri).then((copied) => {
-        showToast(copied ? 'toast.inviteCopied' : 'toast.copyFailed');
+  const handleCopyField = useCallback(
+    (value: string, toastKey: LocaleKey): void => {
+      void copyTextToClipboard(value).then((copied) => {
+        showToast(copied ? toastKey : 'toast.copyFailed');
       });
     },
     [showToast],
+  );
+
+  const handleCopyInvite = useCallback(
+    (joinUri: string): void => {
+      handleCopyField(joinUri, 'toast.inviteCopied');
+    },
+    [handleCopyField],
   );
 
   const handlePatchSettings = useCallback(
@@ -520,6 +527,7 @@ export function App() {
             onUi={handleUi}
             busy={actionBusy}
             onCopyInvite={() => handleCopyInvite(selected.joinUri)}
+            onCopyField={handleCopyField}
             onPatchNetwork={(patch) => void handlePatchNetwork(selected.id, patch)}
             onDeleteNetwork={() => void handleDeleteNetwork(selected.id)}
             onRotateInviteKey={() => void handleRotateInviteKey(selected.id)}
