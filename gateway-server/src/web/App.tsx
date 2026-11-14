@@ -3,11 +3,16 @@
 // topology 切片；SSE 订阅跟随选中网络——实时推送只进 topology 切片，绝不
 // 碰 ui 切片（弹窗/菜单/行内二次确认/表单草稿）。Toast 是底部提示条，
 // 2.6s 自动消失，只承载「已复制/已保存」这类非阻塞反馈。
+// GC-8：登录页三态（登录 / 注册 / 找回密码，含 OTP 与主题/语言切换）、账号
+// 设置弹窗（改密 / 换绑邮箱）、全量错误码映射与 admin 视图防越权守卫都由
+// 这里接线。
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
 
+import { AccountSettingsModal } from './components/AccountSettingsModal';
 import { AdminView } from './components/AdminView';
 import { copyTextToClipboard } from './clipboard';
 import { LoginView } from './components/LoginView';
+import type { LoginMode } from './components/LoginView';
 import { NetworkView, NewNetworkModal } from './components/NetworkView';
 import type { NetworkPatchInput } from './components/NetworkView';
 import { TopBar } from './components/TopBar';
@@ -15,7 +20,7 @@ import type { ViewKind } from './components/TopBar';
 import { LOCALE_STORAGE_KEY, resolveLocale, translate } from './i18n/locales';
 import type { Locale, LocaleKey, TranslateVars } from './i18n/locales';
 import { ConsoleApiError, ConsoleClient, ConsoleStore, ManagedRefreshCycle } from './store/console-store';
-import type { MemberAction, SessionMeta, SystemSettings, UiLocalState } from './store/console-store';
+import type { MemberAction, SystemSettings, UiLocalState } from './store/console-store';
 
 const client = new ConsoleClient();
 const store = new ConsoleStore();
@@ -44,7 +49,8 @@ function readStoredLocale(): Locale {
   }
 }
 
-/** 服务端错误码 → 词典键；未知码一律「出了点问题」 */
+/** 服务端错误码 → 词典键；未知码一律「出了点问题」。GC-8 起覆盖全部
+ * OTP / 限流 / 配额 / SMTP / 管理约束错误码，不再全兜底成「出了点问题」。 */
 function authErrorToKey(err: unknown): LocaleKey {
   const code = err instanceof ConsoleApiError ? err.code : '';
   switch (code) {
@@ -56,7 +62,38 @@ function authErrorToKey(err: unknown): LocaleKey {
       return 'error.signupDisabled';
     case 'EMAIL_TAKEN':
       return 'error.emailTaken';
+    // OTP 三态与限流（GC-2/GC-5）
+    case 'OTP_COOLDOWN':
+      return 'error.otpCooldown';
+    case 'OTP_INVALID':
+      return 'error.otpInvalid';
+    case 'OTP_LOCKED':
+      return 'error.otpLocked';
+    case 'RATE_LIMITED':
+      return 'error.rateLimited';
+    // SMTP（发信未配置 / 发送失败）
+    case 'SMTP_NOT_CONFIGURED':
+      return 'error.smtpNotConfigured';
+    case 'SMTP_SEND_FAILED':
+      return 'error.smtpSendFailed';
+    // 配额（建网超额 / 单网设备上限）
+    case 'QUOTA_EXCEEDED':
+      return 'account.quotaReached';
+    case 'LIMIT_REACHED':
+      return 'error.peerLimitByGroup';
+    // 管理约束（最后管理员 / 默认组 / 组占用 / 组标识码 / API Key）
+    case 'CANNOT_REMOVE_LAST_ADMIN':
+      return 'error.cannotRemoveLastAdmin';
+    case 'CANNOT_DELETE_DEFAULT_GROUP':
+      return 'error.cannotDeleteDefaultGroup';
+    case 'GROUP_IN_USE':
+      return 'error.groupInUse';
+    case 'DUPLICATE_GROUP_CODE':
+      return 'error.duplicateGroupCode';
+    case 'INVALID_API_KEY':
+      return 'error.invalidApiKey';
     case 'NETWORK_ERROR':
+    case 'NO_TRANSPORT':
       return 'error.network';
     default:
       return 'error.generic';
@@ -193,6 +230,16 @@ export function App() {
   // 返回值负责（fix1 R1：3 秒轮询只刷在线数/速率——配额是慢变配置，轮询它反而
   // 会让正在编辑的开关/输入在两次击键之间被服务端旧值回写）。
   const isAdmin = state.session !== null && state.session.user.role === 'admin';
+
+  // 路由防越权守卫（GC-8）：普通用户停在 admin 视图（例如本地残留状态或被
+  // 管理员降级后）一律弹回网络视图，并彻底清掉管理员敏感切片。
+  useEffect(() => {
+    if (view === 'admin' && !isAdmin) {
+      setView('networks');
+      store.clearAdminSlices();
+    }
+  }, [view, isAdmin]);
+
   useEffect(() => {
     if (view !== 'admin' || !isAdmin) return;
     let cancelled = false;
@@ -245,26 +292,51 @@ export function App() {
     };
   }, [view, isAdmin]);
 
+  /** 登录 / 注册 / 找回重置（GC-8 三态）；返回是否成功，LoginView 据此整理本页状态 */
   const handleAuth = useCallback(
-    async (mode: 'login' | 'signup', email: string, password: string): Promise<void> => {
+    async (mode: LoginMode, email: string, password: string, otpCode?: string): Promise<boolean> => {
       setAuthBusy(true);
       setAuthError(null);
       try {
-        const result = mode === 'login' ? await client.login(email, password) : await client.signup(email, password);
-        const meta: SessionMeta = {
-          allowSignup: result.allowSignup,
-          maxNetworksPerUser: result.maxNetworksPerUser,
-        };
-        store.setSession(result.user, meta);
+        if (mode === 'forgot') {
+          await client.resetPassword({ email, otpCode: otpCode ?? '', newPassword: password });
+          return true;
+        }
+        const result =
+          mode === 'login' ? await client.login(email, password) : await client.signup(email, password, otpCode);
+        // session + meta + quota + publicPolicy 一次落库（GC-7b 响应体同构）
+        store.applySessionPayload(result);
         store.patchUi({ loginPassword: '' }); // 密码不留在草稿里
         await refreshNetworks();
+        return true;
       } catch (err) {
         setAuthError(authErrorToKey(err));
+        return false;
       } finally {
         setAuthBusy(false);
       }
     },
     [refreshNetworks],
+  );
+
+  /** 发送 6 位验证码（注册 / 找回）；失败返回 null，错因已写入 authError（GC-8） */
+  const handleSendOtp = useCallback(
+    async (
+      purpose: 'signup' | 'reset_password',
+      email: string,
+    ): Promise<{ sent: boolean; cooldownSec: number } | null> => {
+      setAuthBusy(true);
+      setAuthError(null);
+      try {
+        return await client.sendOtp({ email, purpose, locale });
+      } catch (err) {
+        setAuthError(authErrorToKey(err));
+        return null;
+      } finally {
+        setAuthBusy(false);
+      }
+    },
+    [locale],
   );
 
   const handleLogout = useCallback(async (): Promise<void> => {
@@ -298,6 +370,51 @@ export function App() {
   const handleCreateNetworkOpen = useCallback((): void => {
     store.patchUi({ dialog: 'new-network' });
   }, []);
+
+  // ---------------------------------------------------------- 账号设置（GC-8）
+
+  const handleOpenAccountSettings = useCallback((): void => {
+    store.patchUi({ dialog: 'account-settings' });
+  }, []);
+
+  const handleCloseAccountSettings = useCallback((): void => {
+    store.patchUi({ dialog: null });
+  }, []);
+
+  /** 重新拉 /auth/me 落库：换绑邮箱成功后顶栏邮箱、配额摘要与弹窗即时刷新 */
+  const refreshSession = useCallback(async (): Promise<void> => {
+    const me = await client.fetchMe();
+    store.init(me);
+  }, []);
+
+  // 表单回调不吞错：失败原样抛回给弹窗映射成字段文案，成功才在这里 toast
+  const handleChangeMyPassword = useCallback(
+    async (currentPassword: string, newPassword: string): Promise<void> => {
+      await client.changeMyPassword({ currentPassword, newPassword });
+      showToast('accountSettings.passwordSaved');
+    },
+    [showToast],
+  );
+
+  const handleRequestEmailChange = useCallback(
+    async (currentPassword: string, newEmail: string): Promise<{ otpRequired: boolean; cooldownSec: number }> => {
+      return client.requestEmailChange({ currentPassword, newEmail, locale });
+    },
+    [locale],
+  );
+
+  const handleConfirmEmailChange = useCallback(
+    async (currentPassword: string, newEmail: string, otpCode?: string): Promise<void> => {
+      await client.confirmEmailChange({
+        currentPassword,
+        newEmail,
+        ...(otpCode !== undefined ? { otpCode } : {}),
+      });
+      await refreshSession();
+      showToast('accountSettings.emailChanged');
+    },
+    [locale, refreshSession, showToast],
+  );
 
   // ---------------------------------------------------------------- 动作回调
 
@@ -476,11 +593,18 @@ export function App() {
       <LoginView
         t={t}
         meta={state.meta}
+        policy={state.publicPolicy}
         ui={state.ui}
         onUi={handleUi}
         busy={authBusy}
         errorKey={authError ?? (bootFailed ? 'error.network' : null)}
-        onSubmit={(mode, email, password) => void handleAuth(mode, email, password)}
+        onDismissError={() => setAuthError(null)}
+        onSubmit={handleAuth}
+        onSendOtp={handleSendOtp}
+        theme={theme}
+        locale={locale}
+        onToggleTheme={handleToggleTheme}
+        onToggleLocale={handleToggleLocale}
       />
     );
   }
@@ -491,7 +615,9 @@ export function App() {
     <div className="app-shell">
       <TopBar
         t={t}
+        locale={locale}
         user={state.session.user}
+        quota={state.quota}
         networks={state.networks}
         topology={state.topology}
         selectedNetworkId={selectedNetworkId}
@@ -503,6 +629,7 @@ export function App() {
         onToggleTheme={handleToggleTheme}
         onToggleLocale={handleToggleLocale}
         onLogout={() => void handleLogout()}
+        onOpenAccountSettings={handleOpenAccountSettings}
         ui={state.ui}
         onUi={handleUi}
       />
@@ -550,6 +677,20 @@ export function App() {
           onUi={handleUi}
           busy={actionBusy}
           onCreate={(name) => void handleCreateNetwork(name)}
+        />
+      )}
+
+      {state.ui.dialog === 'account-settings' && (
+        <AccountSettingsModal
+          t={t}
+          locale={locale}
+          user={state.session.user}
+          quota={state.quota}
+          smtpConfigured={state.publicPolicy.smtpConfigured}
+          onClose={handleCloseAccountSettings}
+          onChangePassword={handleChangeMyPassword}
+          onRequestEmailChange={handleRequestEmailChange}
+          onConfirmEmailChange={handleConfirmEmailChange}
         />
       )}
 
