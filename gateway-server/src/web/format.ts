@@ -2,7 +2,7 @@
 // 分类与成员状态展示。零 DOM 依赖：后端 tsc 编译进 dist/web/（测试可 import），
 // 浏览器半边经 tsconfig.web.json 类型检查——两边共享同一份实现。
 
-import type { TranslateFn } from './i18n/locales.js';
+import type { Locale, TranslateFn } from './i18n/locales.js';
 import type { MemberStatus, TopologyLink, TopologyMemberRow } from './store/console-store.js';
 
 /**
@@ -28,6 +28,74 @@ export function formatBytes(bytes: number): string {
   if (mb < 1024) return `${mb >= 100 ? Math.round(mb) : Math.round(mb * 10) / 10} MB`;
   const gb = mb / 1024;
   return `${gb >= 100 ? Math.round(gb) : Math.round(gb * 10) / 10} GB`;
+}
+
+// ---------------------------------------------------------------- 配额与用量（GC-7b）
+
+/**
+ * 配额字节的展示串：null（不限）给固定双语「不限 / Unlimited」；整数字节按
+ * KB / MB / GB / TB 升单位，与 formatBytes 的区别是小于 1 KB 也按 KB 口径
+ * （配额语义下不出现 B 档，最小显示 '<1 KB'）。locale 形参是调用面契约
+ * （GC-7c 组件按当前语言传入），但返回值刻意语言无关——单位与数字格式两种
+ * 语言通用，不限额的双语文案也是同一串。
+ */
+export function formatBytesQuota(bytes: number | null, locale: Locale): string {
+  if (bytes === null) return '不限 / Unlimited';
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 KB';
+  const kb = bytes / 1024;
+  if (kb < 1) return '<1 KB';
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb >= 100 ? Math.round(mb) : Math.round(mb * 10) / 10} MB`;
+  const gb = mb / 1024;
+  if (gb < 1024) return `${gb >= 100 ? Math.round(gb) : Math.round(gb * 10) / 10} GB`;
+  const tb = gb / 1024;
+  return `${tb >= 100 ? Math.round(tb) : Math.round(tb * 10) / 10} TB`;
+}
+
+/**
+ * 用量百分比（钳位 0..100，四舍五入到一位小数避免浮点毛刺）。契约：
+ * - limit 为 null（不限额）或非正数 → null，调用方据此不渲染进度条；
+ * - 超限（used >= limit）时钳位显示 100，是否真超限用 isQuotaExceeded 判定，
+ *   进度条档位用 quotaUsageLevel 判定——三者同源不互相臆造。
+ */
+export function computeUsagePercent(used: number, limit: number | null): number | null {
+  if (limit === null || !Number.isFinite(limit) || limit <= 0) return null;
+  if (!Number.isFinite(used) || used <= 0) return 0;
+  const percent = (used / limit) * 100;
+  if (percent <= 0) return 0;
+  return Math.min(100, Math.round(percent * 10) / 10);
+}
+
+/** 超限判定（与 computeUsagePercent 同一契约）：used >= limit 且限额有效时为 true */
+export function isQuotaExceeded(used: number, limit: number | null): boolean {
+  if (limit === null || !Number.isFinite(limit) || limit <= 0) return false;
+  return Number.isFinite(used) && used >= limit;
+}
+
+/** 进度条档位（Dot Rule 之外配额条专用的三档）：>=100% danger，>=80% warn，否则 ok */
+export type UsageLevel = 'ok' | 'warn' | 'danger';
+
+export function quotaUsageLevel(used: number, limit: number | null): UsageLevel {
+  const percent = computeUsagePercent(used, limit);
+  if (percent === null) return 'ok';
+  if (percent >= 100) return 'danger';
+  if (percent >= 80) return 'warn';
+  return 'ok';
+}
+
+/**
+ * 用户组到期时间 → 展示串（日期取 ISO 的 UTC 年月日，与管理端录入口径一致）：
+ * null → 「长期有效 / No expiry」；无法解析 → '—'；已到 nowMs（含当天起算时刻
+ * 之后）→ 日期尾缀「（已到期）/(expired)」。nowMs 缺省取当前时间，测试可注入。
+ */
+export function formatQuotaExpiry(iso: string | null, locale: Locale, nowMs: number = Date.now()): string {
+  if (iso === null) return locale === 'en' ? 'No expiry' : '长期有效';
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return '—';
+  const date = new Date(at).toISOString().slice(0, 10);
+  if (at <= nowMs) return locale === 'en' ? `${date} (expired)` : `${date}（已到期）`;
+  return date;
 }
 
 /**
@@ -127,12 +195,25 @@ export function memberStatusView(status: MemberStatus, online: boolean, t: Trans
 
 /**
  * 邀请链接只掩入网口令：保留 # 之前的 zr-net://<host>/<networkId>（设备名、
- * 网络标识要看得见），# 之后整体换成圆点；不含 # 时原样返回。
+ * 网络标识要看得见），统一链接可带 ?tls=0|1 查询串，同样在 # 之前原样保留；
+ * # 之后整体换成圆点（掩码位数与 NetworkView 口令行的 8 圆点惯例一致）；
+ * 不含 # 时原样返回。老格式输入（无 ?tls、老前缀）天然兼容——一切以第一个
+ * # 为界，界前不动、界后掩码。
  */
 export function maskInviteUri(joinUri: string): string {
   const hashIndex = joinUri.indexOf('#');
   if (hashIndex === -1) return joinUri;
   return `${joinUri.slice(0, hashIndex)}#••••••••`;
+}
+
+/**
+ * 无头接入命令（ui-ux-spec §5.5：网络分项复制的第 4 项）。统一链接放进双引号
+ * 里交给 shell，须先转义双引号内的注入面：反斜杠、双引号、$、反引号，防止
+ * 口令里出现这些字符时命令被截断或展开。
+ */
+export function buildHeadlessJoinCommand(joinUri: string): string {
+  const safe = joinUri.replace(/[\\"$`]/g, (ch) => `\\${ch}`);
+  return `dsh-zen-remote setup --role peer --invite "${safe}"`;
 }
 
 // ---------------------------------------------------------------- 占席位成员
