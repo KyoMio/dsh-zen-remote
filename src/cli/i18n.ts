@@ -54,7 +54,7 @@ const ZH: Readonly<Record<string, string>> = {
   'help.option.hostUrl': '--host-url <url>  远端 host 地址',
   'help.option.code': '--code <8位码>  配对码',
   'help.option.name': '--name <name>  本机显示名',
-  'help.option.invite': '--invite <uri>  虚拟网络邀请链接（zr-net://… 开头，可带 ?tls=0|1；兼容读取旧式 zr-nets:// 链接）',
+  'help.option.invite': '--invite <uri>  虚拟网络邀请链接（zr-net://… 开头，可带 ?tls=0|1；兼容读取旧式 zr-nets:// / zr-net+insecure:// 链接）',
   'help.option.all': '--all  作用于全部（设备 / host 连接）',
   'help.footer': '提示：不带命令运行即显示本帮助；详见 docs/remote-access.md。',
 
@@ -431,7 +431,7 @@ const EN: Readonly<Record<string, string>> = {
   'help.option.hostUrl': '--host-url <url>  remote host address',
   'help.option.code': '--code <8 digits>  pairing code',
   'help.option.name': '--name <name>  this machine\'s display name',
-  'help.option.invite': '--invite <uri>  the virtual network invite link (starts with zr-net://…, optional ?tls=0|1; legacy zr-nets:// links still parse)',
+  'help.option.invite': '--invite <uri>  the virtual network invite link (starts with zr-net://…, optional ?tls=0|1; legacy zr-nets:// / zr-net+insecure:// links still parse)',
   'help.option.all': '--all  apply to everything (devices / host connections)',
   'help.footer': 'Hint: running without a command shows this help; see docs/remote-access.md.',
 
