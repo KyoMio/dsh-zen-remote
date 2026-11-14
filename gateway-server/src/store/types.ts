@@ -2,6 +2,7 @@
 //
 // 入网判定与成员状态迁移的决策逻辑在本文件以纯函数给出（decideJoinAttempt / decideTransition），
 // sqlite-store 与 pg-store 都必须走同一份决策——同一语义不允许两套实现各自漂移。
+import { timingSafeEqual } from 'node:crypto';
 
 export type UserRole = 'admin' | 'user';
 
@@ -34,6 +35,10 @@ export function decodeMemberStatus(value: string): MemberStatus {
  */
 export const SEAT_OCCUPYING_STATUSES: ReadonlyArray<MemberStatus> = ['authorized', 'paused', 'mismatch'];
 
+/**
+ * 对外（HTTP）可见的系统动态设置：只有 4 个基础键。扩展内部字段（SMTP 密文、
+ * admin API 哈希等）绝不出现在这里——getSettings / updateSettings 只读写它们。
+ */
 export interface SystemSettings {
   allowSignup: boolean;
   maxNetworksPerUser: number;
@@ -49,38 +54,124 @@ export const DEFAULT_SETTINGS: SystemSettings = {
   relayRateKbps: 4096,
 };
 
-/** settings 的 camelCase → snake_case 键映射，两个 store 共用 */
-export const SETTINGS_KEYS: Readonly<Record<keyof SystemSettings, string>> = {
+/**
+ * 存储层完整设置（GC-2）：4 个基础键 + 7 个扩展键。扩展键只经
+ * getExtendedSettings / updateExtendedSettings 读写，调用方（GC-6b 起的管理后端）
+ * 自行保证密文/哈希不进 HTTP 响应。
+ */
+export interface ExtendedSystemSettings extends SystemSettings {
+  requireEmailVerification: boolean;
+  publicUrl: string | null;
+  /** 管理端登录会话有效期（天）；钳位 1..90，默认 7（与 auth.ts 的 7 天会话默认一致） */
+  sessionTtlDays: number;
+  smtpConfigEnc: string | null;
+  adminApiKeyHash: string | null;
+  adminApiKeyPrefix: string | null;
+  adminApiKeyCreatedAt: string | null;
+}
+
+export type ExtendedSettingsPatch = Partial<ExtendedSystemSettings>;
+
+/** 扩展键的空库默认值（sessionTtlDays 与 SPEC 5.2.1 / auth.ts 的 7 天一致） */
+export const DEFAULT_EXTENDED_SETTINGS: ExtendedSystemSettings = {
+  ...DEFAULT_SETTINGS,
+  requireEmailVerification: false,
+  publicUrl: null,
+  sessionTtlDays: 7,
+  smtpConfigEnc: null,
+  adminApiKeyHash: null,
+  adminApiKeyPrefix: null,
+  adminApiKeyCreatedAt: null,
+};
+
+/** 三项配额键：settings ↔ 默认组双向同步只同步这三个键 */
+export const QUOTA_SETTINGS_KEYS: ReadonlyArray<keyof SystemSettings> = [
+  'maxNetworksPerUser',
+  'defaultMaxPeers',
+  'relayRateKbps',
+];
+
+/** 基础 4 键的 camelCase → snake_case 映射（getSettings / updateSettings 只碰这些键） */
+export const BASE_SETTINGS_KEYS: Readonly<Record<keyof SystemSettings, string>> = {
   allowSignup: 'allow_signup',
   maxNetworksPerUser: 'max_networks_per_user',
   defaultMaxPeers: 'default_max_peers',
   relayRateKbps: 'relay_rate_kbps',
 };
 
-/** settings 值统一以字符串存 key-value 表 */
-export function encodeSettingsValue(value: boolean | number): string {
-  return typeof value === 'boolean' ? (value ? 'true' : 'false') : String(value);
+/** 全部 11 键的 camelCase → snake_case 键映射，两个 store 共用 */
+export const SETTINGS_KEYS: Readonly<Record<keyof ExtendedSystemSettings, string>> = {
+  ...BASE_SETTINGS_KEYS,
+  requireEmailVerification: 'require_email_verification',
+  publicUrl: 'public_url',
+  sessionTtlDays: 'session_ttl_days',
+  smtpConfigEnc: 'smtp_config_enc',
+  adminApiKeyHash: 'admin_api_key_hash',
+  adminApiKeyPrefix: 'admin_api_key_prefix',
+  adminApiKeyCreatedAt: 'admin_api_key_created_at',
+};
+
+/** settings 值统一以字符串存 key-value 表（null 存空串，读取时空串解析回 null） */
+export function encodeSettingsValue(value: boolean | number | string | null): string {
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (value === null) return '';
+  return String(value);
 }
 
-/** key-value 行 → SystemSettings（缺省键回退 DEFAULT_SETTINGS；pg 的 count/bigint 字符串也在此转 number） */
+/** key-value 行 → SystemSettings（只解析基础 4 键，缺省键回退 DEFAULT_SETTINGS） */
 export function parseSettingsRows(rows: ReadonlyArray<Record<string, unknown>>): SystemSettings {
-  const map = new Map<string, string>();
-  for (const row of rows) {
-    const key = row['key'];
-    if (typeof key === 'string') map.set(key, String(row['value']));
-  }
+  const map = settingsRowMap(rows);
   const num = (key: keyof SystemSettings, fallback: number): number => {
-    const raw = map.get(SETTINGS_KEYS[key]);
+    const raw = map.get(BASE_SETTINGS_KEYS[key]);
     if (raw === undefined) return fallback;
     const parsed = Number(raw);
     return Number.isFinite(parsed) ? parsed : fallback;
   };
   return {
-    allowSignup: map.get(SETTINGS_KEYS.allowSignup) === 'true',
+    allowSignup: map.get(BASE_SETTINGS_KEYS.allowSignup) === 'true',
     maxNetworksPerUser: num('maxNetworksPerUser', DEFAULT_SETTINGS.maxNetworksPerUser),
     defaultMaxPeers: num('defaultMaxPeers', DEFAULT_SETTINGS.defaultMaxPeers),
     relayRateKbps: num('relayRateKbps', DEFAULT_SETTINGS.relayRateKbps),
   };
+}
+
+/**
+ * key-value 行 → ExtendedSystemSettings（全 11 键）。扩展键缺行按
+ * DEFAULT_EXTENDED_SETTINGS 回填；sessionTtlDays 按 SPEC 5.4.3 钳位到 1..90、缺省 7。
+ */
+export function parseExtendedSettingsRows(rows: ReadonlyArray<Record<string, unknown>>): ExtendedSystemSettings {
+  const map = settingsRowMap(rows);
+  const num = (key: keyof ExtendedSystemSettings, fallback: number): number => {
+    const raw = map.get(SETTINGS_KEYS[key]);
+    if (raw === undefined) return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+  // 可空字符串键：缺行或空串都解析为 null（encodeSettingsValue 把 null 编码为空串）
+  const text = (key: keyof ExtendedSystemSettings): string | null => {
+    const raw = map.get(SETTINGS_KEYS[key]);
+    return raw === undefined || raw.length === 0 ? null : raw;
+  };
+  return {
+    ...parseSettingsRows(rows),
+    requireEmailVerification: map.get(SETTINGS_KEYS.requireEmailVerification) === 'true',
+    publicUrl: text('publicUrl'),
+    sessionTtlDays: Math.min(90, Math.max(1, num('sessionTtlDays', DEFAULT_EXTENDED_SETTINGS.sessionTtlDays))),
+    smtpConfigEnc: text('smtpConfigEnc'),
+    adminApiKeyHash: text('adminApiKeyHash'),
+    adminApiKeyPrefix: text('adminApiKeyPrefix'),
+    adminApiKeyCreatedAt: text('adminApiKeyCreatedAt'),
+  };
+}
+
+/** key-value 行 → snake_case → 原始字符串值的 Map（两种解析函数共用） */
+function settingsRowMap(rows: ReadonlyArray<Record<string, unknown>>): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const row of rows) {
+    const key = row['key'];
+    if (typeof key === 'string') map.set(key, String(row['value']));
+  }
+  return map;
 }
 
 export interface UserRecord {
@@ -89,7 +180,180 @@ export interface UserRecord {
   passwordHash: string;
   role: UserRole;
   active: boolean;
+  /** 所属用户组；旧库行/缺省回落 grp_default */
+  groupId: string;
+  /** 组配额的到期时刻（ISO）；到期后有效配额自动回退默认组 */
+  groupExpiresAt: string | null;
+  /** 邮箱验证通过时刻（ISO）；null = 未验证 */
+  emailVerifiedAt: string | null;
   createdAt: string;
+}
+
+// ---------------------------------------------------------------- 用户组与配额（GC-2）
+
+export const DEFAULT_GROUP_ID = 'grp_default';
+export const DEFAULT_GROUP_CODE = 'default';
+export const DEFAULT_GROUP_NAME = '默认用户组';
+
+export interface UserGroupRecord {
+  id: string;
+  /** 小写标识（正则见 validateGroupInput），全库唯一、创建后不可改 */
+  code: string;
+  name: string;
+  description: string;
+  isDefault: boolean;
+  maxNetworks: number;
+  maxPeersPerNetwork: number;
+  relayRateKbps: number;
+  /** null = 不限月度中转流量 */
+  monthlyRelayQuotaBytes: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateUserGroupInput {
+  code: string;
+  name: string;
+  description?: string;
+  /** 置为 true 时取消其余组的默认标记，并把三项配额写回 system_settings */
+  isDefault?: boolean;
+  maxNetworks: number;
+  maxPeersPerNetwork: number;
+  relayRateKbps: number;
+  monthlyRelayQuotaBytes?: number | null;
+}
+
+export interface UpdateUserGroupPatch {
+  name?: string;
+  description?: string;
+  isDefault?: boolean;
+  maxNetworks?: number;
+  maxPeersPerNetwork?: number;
+  relayRateKbps?: number;
+  monthlyRelayQuotaBytes?: number | null;
+}
+
+/** 管理员对用户的字段级修改（updateUserByAdmin） */
+export interface AdminUserPatch {
+  role?: UserRole;
+  active?: boolean;
+  groupId?: string;
+  groupExpiresAt?: string | null;
+  emailVerifiedAt?: string | null;
+}
+
+/** 用户的有效配额解析结果：到期回退默认组后，组 + 当月已用中转字节 */
+export interface EffectiveUserQuota {
+  group: UserGroupRecord;
+  /** 用户行上登记的组 id（回退后与 group.id 不同） */
+  assignedGroupId: string;
+  groupExpiresAt: string | null;
+  /** true = 登记的组配额已到期，本次有效值来自默认组 */
+  isExpiredFallback: boolean;
+  /** UTC 年月（YYYY-MM），monthlyRelayUsedBytes 的统计窗口 */
+  yearMonth: string;
+  monthlyRelayUsedBytes: number;
+}
+
+/**
+ * 组字段校验（纯函数，两个 store 的 createUserGroup / updateUserGroup 共用）：
+ * 违反任一规则直接抛带说明的 Error——这是 API 层的输入校验，不是业务性拒绝（StoreError）。
+ */
+export function validateGroupInput(input: {
+  code: string;
+  name: string;
+  maxNetworks: number;
+  maxPeersPerNetwork: number;
+  relayRateKbps: number;
+  monthlyRelayQuotaBytes?: number | null;
+}): void {
+  const { code, name, maxNetworks, maxPeersPerNetwork, relayRateKbps, monthlyRelayQuotaBytes } = input;
+  if (typeof code !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(code)) {
+    throw new Error('group code must match /^[a-z0-9][a-z0-9_-]{0,31}$/');
+  }
+  if (typeof name !== 'string' || name.length < 1 || name.length > 48) {
+    throw new Error('group name must be 1..48 characters');
+  }
+  const intInRange = (value: number, min: number, max: number, label: string): void => {
+    if (!Number.isSafeInteger(value) || value < min || value > max) {
+      throw new Error(`group ${label} must be a safe integer in ${min}..${max}`);
+    }
+  };
+  intInRange(maxNetworks, 1, 100, 'maxNetworks');
+  intInRange(maxPeersPerNetwork, 2, 64, 'maxPeersPerNetwork');
+  intInRange(relayRateKbps, 64, 1048576, 'relayRateKbps');
+  if (monthlyRelayQuotaBytes !== null && monthlyRelayQuotaBytes !== undefined) {
+    if (!Number.isSafeInteger(monthlyRelayQuotaBytes) || monthlyRelayQuotaBytes < 1) {
+      throw new Error('group monthlyRelayQuotaBytes must be null or a safe integer >= 1');
+    }
+  }
+}
+
+/** UTC 年月（YYYY-MM）；月度中转流量与配额窗口统一用它取月份 */
+export function currentUtcYearMonth(nowMs: number = Date.now()): string {
+  return new Date(nowMs).toISOString().slice(0, 7);
+}
+
+// ---------------------------------------------------------------- 邮箱 OTP（GC-2）
+
+export type EmailOtpPurpose = 'signup' | 'reset_password' | 'change_email';
+
+export interface IssueEmailOtpInput {
+  email: string;
+  purpose: EmailOtpPurpose;
+  /** 调用方对验证码做哈希后的值；store 只比对哈希，永不接触明文 */
+  codeHash: string;
+  ttlMs: number;
+  cooldownMs: number;
+  /** 缺省取当前时间；测试注入确定性时钟 */
+  nowMs?: number;
+}
+
+export interface EmailOtpIssued {
+  id: string;
+  email: string;
+  purpose: EmailOtpPurpose;
+  expiresAt: string;
+  cooldownUntil: string;
+}
+
+export interface VerifyEmailOtpInput {
+  email: string;
+  purpose: EmailOtpPurpose;
+  codeHash: string;
+  /** 连续错输次数达到该值即永久锁定该验证码（随后输入正确码也拒绝） */
+  maxAttempts: number;
+  nowMs?: number;
+}
+
+export type EmailOtpVerifyOutcome = 'ok' | 'invalid' | 'locked';
+
+/**
+ * OTP 校验决策（两个 store 共用，禁止各写一套漂移）：
+ * - 已锁（attempts >= maxAttempts）→ locked，不再比对（正确码也拒之门外），不加次数；
+ * - 哈希一致 → ok（调用方消费该验证码）；
+ * - 不一致 → 本次错输计入（attempts+1）；达到阈值 → locked（该验证码此后永久失效），
+ *   否则 invalid。locked 行保持未消费，锁定持续到它过期或被新签发覆盖。
+ */
+export function decideOtpVerify(
+  row: { codeHash: string; attempts: number },
+  inputCodeHash: string,
+  maxAttempts: number,
+): { outcome: EmailOtpVerifyOutcome; action: 'consume' | 'count-attempt' | 'none' } {
+  if (row.attempts >= maxAttempts) return { outcome: 'locked', action: 'none' };
+  if (constantTimeEqualText(row.codeHash, inputCodeHash)) return { outcome: 'ok', action: 'consume' };
+  return {
+    outcome: row.attempts + 1 >= maxAttempts ? 'locked' : 'invalid',
+    action: 'count-attempt',
+  };
+}
+
+/** 定长比较字符串（长度不同直接不等；等长走 timingSafeEqual 防时序侧信道） */
+export function constantTimeEqualText(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf8');
+  const bb = Buffer.from(b, 'utf8');
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
 }
 
 export interface SessionIssued {
@@ -129,12 +393,8 @@ export interface MemberRecord {
   createdAt: string;
 }
 
-export interface SettingsPatch {
-  allowSignup?: boolean;
-  maxNetworksPerUser?: number;
-  defaultMaxPeers?: number;
-  relayRateKbps?: number;
-}
+/** updateSettings 的部分补丁：只收基础 4 键（扩展键走 ExtendedSettingsPatch） */
+export type SettingsPatch = Partial<SystemSettings>;
 
 export interface NetworkPatch {
   name?: string;
@@ -175,7 +435,16 @@ export type StoreErrorCode =
   | 'invalid-transition'
   | 'member-not-found'
   | 'network-not-found'
-  | 'user-not-found';
+  | 'user-not-found'
+  // GC-2：用户组 / 唯一活跃管理员 / 邮箱 OTP
+  | 'last-admin'
+  | 'duplicate-group-code'
+  | 'group-not-found'
+  | 'cannot-delete-default-group'
+  | 'group-in-use'
+  | 'otp-cooldown'
+  | 'otp-invalid'
+  | 'otp-locked';
 
 export class StoreError extends Error {
   readonly code: StoreErrorCode;
@@ -298,6 +567,10 @@ export interface CreateUserInput {
   email: string;
   passwordHash: string;
   role: UserRole;
+  /** 缺省落默认组（grp_default）；显式给出但组不存在抛 group-not-found */
+  groupId?: string;
+  groupExpiresAt?: string | null;
+  emailVerifiedAt?: string | null;
 }
 
 export interface CreateNetworkInput {
@@ -316,9 +589,15 @@ export interface PublicNetworkSummary {
 }
 
 export interface GatewayStore {
-  // 系统动态设置
+  // 系统动态设置（基础 4 键：HTTP 响应只见这 4 个键，修改配额键时同事务双向同步当前默认组）
   getSettings(): Promise<SystemSettings>;
   updateSettings(patch: SettingsPatch): Promise<SystemSettings>;
+  /**
+   * 存储层完整设置（全 11 键，含 SMTP 密文 / admin API 哈希等扩展内部字段——调用方
+   * 自行保证这些字段不进 HTTP 响应）；修改三项配额任一项同样同事务双向同步当前默认组。
+   */
+  getExtendedSettings(): Promise<ExtendedSystemSettings>;
+  updateExtendedSettings(patch: ExtendedSettingsPatch): Promise<ExtendedSystemSettings>;
 
   // 用户与会话
   ensureBootstrapAdmin(input: BootstrapAdminInput): Promise<BootstrapAdminResult>;
@@ -326,8 +605,58 @@ export interface GatewayStore {
   findUserByEmail(email: string): Promise<UserRecord | null>;
   findUserById(id: string): Promise<UserRecord | null>;
   listUsers(): Promise<UserRecord[]>;
-  /** 置为 inactive 的同时清理该用户全部登录会话 */
+  /**
+   * 置为 inactive 的同时清理该用户全部登录会话。
+   * 停用唯一活跃管理员抛 last-admin（GC-2）。
+   */
   setUserActive(userId: string, active: boolean): Promise<void>;
+
+  /** 管理员字段级修改；把唯一活跃管理员停用/降级抛 last-admin；groupId 不存在抛 group-not-found */
+  updateUserByAdmin(userId: string, patch: AdminUserPatch): Promise<UserRecord>;
+  /** 删除用户（会话/网络/成员/月度用量随外键级联清除）；删唯一活跃管理员抛 last-admin */
+  deleteUser(userId: string): Promise<void>;
+  /** 更新密码哈希；keepTokenHash 对应的会话保留（当前设备不掉线），其余全部吊销 */
+  updateUserPassword(userId: string, passwordHash: string, keepTokenHash?: string): Promise<void>;
+  /** 改邮箱并写验证时刻；撞已有邮箱抛 duplicate-email */
+  updateUserEmail(userId: string, email: string, emailVerifiedAt: string | null): Promise<UserRecord>;
+  /** 删除用户全部会话（exceptTokenHash 除外），返回删除行数 */
+  deleteAllUserSessions(userId: string, exceptTokenHash?: string): Promise<number>;
+
+  // 用户组与配额（GC-2）
+  listUserGroups(): Promise<UserGroupRecord[]>;
+  getUserGroup(id: string): Promise<UserGroupRecord | null>;
+  getUserGroupByCode(code: string): Promise<UserGroupRecord | null>;
+  /** code 重复抛 duplicate-group-code；字段非法抛 Error（validateGroupInput） */
+  createUserGroup(input: CreateUserGroupInput): Promise<UserGroupRecord>;
+  /** 组不存在抛 group-not-found；code 不可改；默认组三项配额同步写回 system_settings */
+  updateUserGroup(id: string, patch: UpdateUserGroupPatch): Promise<UserGroupRecord>;
+  /** 默认组抛 cannot-delete-default-group；仍有用户引用抛 group-in-use */
+  deleteUserGroup(id: string): Promise<void>;
+  /**
+   * 用户的有效配额：登记组不存在或 groupExpiresAt 已到期时回退默认组（isExpiredFallback=true），
+   * 并带出当月（UTC）已用中转字节。用户不存在抛 user-not-found。
+   */
+  resolveEffectiveUserQuota(userId: string, nowMs?: number): Promise<EffectiveUserQuota>;
+  /** 网络属主的有效配额；网络不存在抛 network-not-found */
+  resolveNetworkEffectiveQuota(networkId: string, nowMs?: number): Promise<EffectiveUserQuota>;
+
+  // 月度流量（GC-2）
+  /** 用户在指定 UTC 年月（YYYY-MM）已累计的中转字节；无行返回 0 */
+  getMonthlyRelayUsage(userId: string, yearMonth: string): Promise<number>;
+
+  // 邮箱 OTP（GC-2）
+  /**
+   * 签发验证码：同 (email, purpose) 冷却窗口内已有活跃验证码时抛 otp-cooldown；
+   * 签发把旧的未消费行置为已消费。email 统一 trim + 小写。
+   */
+  issueEmailOtp(input: IssueEmailOtpInput): Promise<EmailOtpIssued>;
+  /**
+   * 校验并消费验证码：错输 attempts+1 必须先提交再抛 otp-invalid / otp-locked
+   * （在事务里直接 throw 会回滚，5 次锁定形同虚设）；锁定后正确码也抛 otp-locked。
+   */
+  verifyAndConsumeEmailOtp(input: VerifyEmailOtpInput): Promise<void>;
+  /** 删除过期验证码行，返回删除行数 */
+  pruneExpiredOtps(nowMs: number): Promise<number>;
 
   createSession(userId: string, ttlMs: number): Promise<SessionIssued>;
   /** token 有效（未过期）且用户 active 才返回用户，否则 null */
@@ -337,7 +666,10 @@ export interface GatewayStore {
   pruneExpiredSessions(now: number): Promise<number>;
 
   // 虚拟网络
-  /** 普通租户建网数超过系统 maxNetworksPerUser 时抛 quota-exceeded；admin 不受限 */
+  /**
+   * 普通租户建网数达到有效用户组的 maxNetworks 时抛 quota-exceeded；admin 不受限。
+   * 有效组 = 登记组（不存在/配额到期时回退默认组，默认组缺行时兜底 system_settings）。
+   */
   createNetwork(input: CreateNetworkInput): Promise<NetworkRecord>;
   listNetworksByOwner(ownerId: string): Promise<NetworkRecord[]>;
   /** 活跃账号名下的网络公开摘要（供节点端按网关地址发现并申请人工审批入网） */

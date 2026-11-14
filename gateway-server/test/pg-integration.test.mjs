@@ -276,16 +276,16 @@ function runTestChild(mode, schema, deadlineMs) {
     }
   });
 
-  test('connect：本轮 schema 内五张表齐全且幂等重建不抛错', { timeout: 30_000 }, async () => {
+  test('connect：本轮 schema 内八张表齐全且幂等重建不抛错', { timeout: 30_000 }, async () => {
     await store.initSchema(); // 二次执行验证幂等
     const { rows } = await withRootClient(rawUrl, (c) =>
       c.query(
-        "SELECT to_regclass(format('%I.%I', $1::text, table_name)) AS reg FROM (VALUES ('system_settings'),('users'),('sessions'),('networks'),('network_members')) AS t(table_name)",
+        "SELECT to_regclass(format('%I.%I', $1::text, table_name)) AS reg FROM (VALUES ('system_settings'),('users'),('sessions'),('networks'),('network_members'),('user_groups'),('monthly_relay_usage'),('email_otps')) AS t(table_name)",
         [ownedSchema],
       ),
     );
     const missing = rows.map((r) => r.reg).filter((r) => r === null);
-    assert.deepEqual(missing, [], `本轮 schema ${ownedSchema} 内五张表必须全部存在`);
+    assert.deepEqual(missing, [], `本轮 schema ${ownedSchema} 内八张表必须全部存在`);
   });
 
   test('隔离：本轮两个 schema 彼此隔离（对照 schema 的同名表与数据不受 store 影响）', { timeout: 30_000 }, async () => {
@@ -294,6 +294,13 @@ function runTestChild(mode, schema, deadlineMs) {
     assert.equal(typeof settings.maxNetworksPerUser, 'number');
     await store.updateSettings({ maxNetworksPerUser: 3, defaultMaxPeers: 4, relayRateKbps: 2048 });
     assert.equal((await store.getSettings()).maxNetworksPerUser, 3);
+    // GC-2：updateSettings 改配额项 → 默认组对应列同步更新（真实 PG）
+    const defaultGroup = await store.getUserGroupByCode('default');
+    assert.ok(defaultGroup, 'connect 播种后 grp_default 必须存在');
+    assert.equal(defaultGroup.isDefault, true);
+    assert.equal(defaultGroup.maxNetworks, 3);
+    assert.equal(defaultGroup.maxPeersPerNetwork, 4);
+    assert.equal(defaultGroup.relayRateKbps, 2048);
     // 对照 schema 里的同名表与对照行原样：store 的 settings 写入没有越界
     assert.equal(await readCanaryValue(rawUrl, canarySchema), 'alive', '对照 schema 的数据不受本轮 store 影响');
   });
@@ -334,6 +341,125 @@ function runTestChild(mode, schema, deadlineMs) {
     const paused = await store.transitionMemberStatus(quotaNet.id, pausedNodeId, 'pause');
     assert.equal(paused.status, 'paused');
     assert.equal((await store.listMembers(quotaNet.id)).length, 1);
+  });
+
+  test('GC-2 新表写入：用户组 CRUD、配额到期回退、月度流量、邮箱 OTP 冷却与一次消费', { timeout: 30_000 }, async () => {
+    // 用户组：创建 + code 唯一 + 默认组禁删
+    const vip = await store.createUserGroup({
+      code: 'pc06vip',
+      name: 'PC06 VIP',
+      maxNetworks: 99,
+      maxPeersPerNetwork: 32,
+      relayRateKbps: 8192,
+      monthlyRelayQuotaBytes: 1_000_000_000,
+    });
+    await assert.rejects(
+      store.createUserGroup({ code: 'pc06vip', name: 'dup', maxNetworks: 1, maxPeersPerNetwork: 2, relayRateKbps: 64 }),
+      (err) => err instanceof StoreError && err.code === 'duplicate-group-code',
+    );
+    const defaultGroup = await store.getUserGroupByCode('default');
+    await assert.rejects(
+      store.deleteUserGroup(defaultGroup.id),
+      (err) => err instanceof StoreError && err.code === 'cannot-delete-default-group',
+    );
+
+    // 配额到期：登记组过期 → 有效组回退默认组；清除到期后回到登记组
+    await store.updateUserByAdmin(tenantId, { groupId: vip.id, groupExpiresAt: '2020-01-01T00:00:00.000Z' });
+    let quota = await store.resolveEffectiveUserQuota(tenantId);
+    assert.equal(quota.isExpiredFallback, true);
+    assert.equal(quota.group.code, 'default');
+    assert.equal(quota.assignedGroupId, vip.id);
+    await store.updateUserByAdmin(tenantId, { groupId: vip.id, groupExpiresAt: null });
+    quota = await store.resolveEffectiveUserQuota(tenantId);
+    assert.equal(quota.isExpiredFallback, false);
+    assert.equal(quota.group.code, 'pc06vip');
+    assert.equal(quota.group.monthlyRelayQuotaBytes, 1_000_000_000);
+
+    // 月度流量：既有网络成员的正向字节按属主、按月累计
+    await store.flushMemberTelemetry([
+      { networkId: quotaNet.id, nodeId: pausedNodeId, relayBytesDelta: 500, lastSeenAt: '2026-10-01T00:00:00.000Z' },
+      { networkId: quotaNet.id, nodeId: pausedNodeId, relayBytesDelta: 250, lastSeenAt: '2026-10-20T00:00:00.000Z' },
+    ]);
+    assert.equal(await store.getMonthlyRelayUsage(tenantId, '2026-10'), 750);
+
+    // 邮箱 OTP：冷却窗口拦截 + 正确码一次消费
+    const T0 = Date.now();
+    const issued = await store.issueEmailOtp({ email: 'PC06-Otp@Local', purpose: 'signup', codeHash: 'hash-pc06', ttlMs: 600_000, cooldownMs: 60_000, nowMs: T0 });
+    assert.equal(issued.email, 'pc06-otp@local'); // trim + 小写后才进库
+    await assert.rejects(
+      store.issueEmailOtp({ email: 'pc06-otp@local', purpose: 'signup', codeHash: 'x', ttlMs: 600_000, cooldownMs: 60_000, nowMs: T0 + 1_000 }),
+      (err) => err instanceof StoreError && err.code === 'otp-cooldown',
+    );
+    await store.verifyAndConsumeEmailOtp({ email: 'pc06-otp@local', purpose: 'signup', codeHash: 'hash-pc06', maxAttempts: 5, nowMs: T0 + 2_000 });
+    await assert.rejects(
+      store.verifyAndConsumeEmailOtp({ email: 'pc06-otp@local', purpose: 'signup', codeHash: 'hash-pc06', maxAttempts: 5, nowMs: T0 + 3_000 }),
+      (err) => err instanceof StoreError && err.code === 'otp-invalid',
+    );
+    assert.equal(await store.pruneExpiredOtps(T0 + 700_000), 1); // 本用例签发的行已全部到期
+
+    // 收尾：tenant 回默认组、删 vip 组，不污染后续配额用例
+    await store.updateUserByAdmin(tenantId, { groupId: defaultGroup.id });
+    await store.deleteUserGroup(vip.id);
+    assert.equal(await store.getUserGroup(vip.id), null);
+  });
+
+  test('GC-2-fix1 默认组跟随：createUser 归入活跃默认组；配额失效回退当前 is_default 组；重连不复活第二个默认组', { timeout: 30_000 }, async () => {
+    const fix1Vip = await store.createUserGroup({
+      code: 'pc06fix1',
+      name: 'PC06 FIX1',
+      isDefault: true, // 活跃默认组从 grp_default 切到本组（三项配额写回 system_settings）
+      maxNetworks: 60,
+      maxPeersPerNetwork: 32,
+      relayRateKbps: 8192,
+    });
+    const grpDefault = await store.getUserGroupByCode('default');
+    assert.equal(grpDefault.isDefault, false, '旧默认组应已让位');
+
+    let fix1UserId = null;
+    let oldGroupUserId = null;
+    try {
+      // 未显式指定组的新用户原子归入当前活跃默认组 pc06fix1（COALESCE 子查询）
+      fix1UserId = (await store.createUser({ email: 'pc06-fix1@local', passwordHash: 'pw', role: 'user' })).id;
+      assert.equal((await store.findUserById(fix1UserId)).groupId, fix1Vip.id);
+
+      // 登记 grp_default（旧默认组、已失活）且配额到期 → 有效组回退当前 is_default 组
+      oldGroupUserId = (await store.createUser({ email: 'pc06-fix1-old@local', passwordHash: 'pw', role: 'user', groupId: grpDefault.id })).id;
+      await store.updateUserByAdmin(oldGroupUserId, { groupExpiresAt: '2020-01-01T00:00:00.000Z' });
+      const quota = await store.resolveEffectiveUserQuota(oldGroupUserId);
+      assert.equal(quota.isExpiredFallback, true);
+      assert.equal(quota.assignedGroupId, grpDefault.id);
+      assert.equal(quota.group.code, 'pc06fix1');
+    } finally {
+      // 收尾恢复状态，不污染后续配额用例：grp_default 重升默认（其 3/4/2048 写回 settings）、
+      // 两个专用用户删除（引用随之消失）、删 pc06fix1 组
+      await store.updateUserByAdmin(oldGroupUserId, { groupId: grpDefault.id, groupExpiresAt: null }).catch(() => {});
+      if (oldGroupUserId !== null) await store.deleteUser(oldGroupUserId);
+      if (fix1UserId !== null) await store.deleteUser(fix1UserId).catch(() => {});
+      await store.updateUserGroup(grpDefault.id, { isDefault: true });
+      await store.deleteUserGroup(fix1Vip.id);
+    }
+
+    // 关闭重连（同一 schema、无 seed）：pc06fix1 已删，活跃默认组是 grp_default，
+    // seedSettings 绝不复活第二个默认组、也不重新插入已删的组
+    await store.close();
+    store = await PgStore.connect(databaseUrlFor(ownedSchema, 'zr_pc06_test_main'));
+    const groups = await store.listUserGroups();
+    assert.deepEqual(
+      groups.filter((g) => g.isDefault).map((g) => g.code),
+      ['default'],
+      '重连后必须恰有一个活跃默认组',
+    );
+    assert.equal(await store.getUserGroupByCode('pc06fix1'), null, '已删的组不得在重连时复活');
+    // 重连后设置配额回到 grp_default 的 3/4/2048（isDefault 写回 settings 的双向同步）
+    const settings = await store.getSettings();
+    assert.deepEqual(settings, { allowSignup: false, maxNetworksPerUser: 3, defaultMaxPeers: 4, relayRateKbps: 2048 });
+    // 重连后未显式指定组的新用户归入 grp_default
+    const after = await store.createUser({ email: 'pc06-fix1-after@local', passwordHash: 'pw', role: 'user' });
+    try {
+      assert.equal(after.groupId, grpDefault.id);
+    } finally {
+      await store.deleteUser(after.id);
+    }
   });
 
   test('配额拒绝回滚：第 4 个网络 quota-exceeded，表计数不变，连接仍健康', { timeout: 30_000 }, async () => {
@@ -544,6 +670,7 @@ function runTestChild(mode, schema, deadlineMs) {
       const cookie = await loginAdmin(gw);
       const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie });
       assert.equal(res.status, 200, JSON.stringify(res.json));
+      // 设置响应严格 4 键（GC-2-fix1：扩展内部字段绝不进 HTTP 响应）
       assert.deepEqual(res.json.data, {
         allowSignup: true,
         maxNetworksPerUser: 7,
@@ -573,6 +700,7 @@ function runTestChild(mode, schema, deadlineMs) {
       // 同一数据目录重开必须复用同一主密钥（不改写、不重建）
       assert.deepEqual(fs.readFileSync(path.join(dataDir, 'master.key')), masterKeySnapshot, '主密钥重开必须稳定');
       const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie: await loginAdmin(gw) });
+      // 设置响应严格 4 键；播种值与控制台值不被不同环境的重开覆盖
       assert.deepEqual(res.json.data, {
         allowSignup: true, // ENV_A 播种值保留（ENV_B 是 false）
         maxNetworksPerUser: 7, // ENV_A 播种值保留（ENV_B 是 50）
@@ -593,6 +721,7 @@ function runTestChild(mode, schema, deadlineMs) {
     const gw = await startGateway(resolveForTest(gatewayEnv(ENV_C)));
     try {
       const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie: await loginAdmin(gw) });
+      // 设置响应严格 4 键；唯一缺失的键按本轮 ENV_C 补齐
       assert.deepEqual(res.json.data, {
         allowSignup: true, // 保留（ENV_C 是 false）
         maxNetworksPerUser: 7, // 保留（ENV_C 是 2）
