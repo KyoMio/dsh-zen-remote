@@ -3,18 +3,28 @@
 //   ↑/↓ 在菜单项间循环移动焦点、Esc 关闭并把焦点还给触发按钮、点击外部关闭。
 // 菜单开关状态存 store 的 ui 切片——SSE 合并不动这个切片，打开中的菜单
 // 不会被实时推送冲掉。样式受 Single Lift Rule 约束：只有菜单带投影。
+// GC-8：图标统一换 Icons.tsx 的 1.5px 线性矢量（裸 ▾ ✓ 与旧 <svg> 品牌标记
+// 全部替换）；账号菜单身份区展示当前用户组与到期（含到期回退提醒），并新增
+// 「账号设置…」入口（打开 AccountSettingsModal）；「网关管理」入口严格仅
+// role === 'admin' 渲染，普通用户不可见、不可点。
 import { useCallback, useEffect, useRef } from 'react';
 import type { KeyboardEvent } from 'react';
 
-import type { TranslateFn } from '../i18n/locales';
+import { formatQuotaExpiry } from '../format';
+import type { Locale, TranslateFn } from '../i18n/locales';
 import { deriveNetworkCounts } from '../store/console-store';
-import type { NetworkView, PublicUser, TopologySnapshot, UiLocalState } from '../store/console-store';
+import type { NetworkView, PublicUser, TopologySnapshot, UiLocalState, UserQuotaSummary } from '../store/console-store';
+import { CheckIcon, ChevronIcon, ServerIcon } from './Icons';
 
 export type ViewKind = 'networks' | 'admin';
 
 export interface TopBarProps {
   t: TranslateFn;
+  /** formatQuotaExpiry 的语言入参 */
+  locale: Locale;
   user: PublicUser;
+  /** 当前登录用户的有效配额视图（账号菜单身份区展示用户组与到期） */
+  quota: UserQuotaSummary | null;
   networks: NetworkView[];
   /** 全部拓扑切片（PC-20）：当前网络的计数改由它的 SSE 快照事实派生，其余网络回落 REST 值 */
   topology: Readonly<Record<string, TopologySnapshot>>;
@@ -27,6 +37,8 @@ export interface TopBarProps {
   onToggleTheme: () => void;
   onToggleLocale: () => void;
   onLogout: () => void;
+  /** 打开「账号设置」弹窗（App 据 ui.dialog === 'account-settings' 渲染） */
+  onOpenAccountSettings: () => void;
   ui: UiLocalState;
   onUi: (patch: Partial<UiLocalState>) => void;
 }
@@ -96,22 +108,18 @@ function avatarInitial(email: string): string {
   return (email.charAt(0) || '?').toUpperCase();
 }
 
-/** 品牌标识：极简双节点连线（替代通用字母色块，去模板感） */
+/** 品牌标识：统一矢量图标集里的网关机架（GC-8 起不再手写裸 <svg>） */
 function BrandMark() {
   return (
     <span className="brand-mark" aria-hidden="true">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none">
-        <path d="M8 16 16 8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-        <circle cx="7" cy="17" r="3" fill="currentColor" />
-        <circle cx="17" cy="7" r="3" fill="currentColor" />
-      </svg>
+      <ServerIcon size={14} />
     </span>
   );
 }
 
 export function TopBar(props: TopBarProps) {
-  const { t, user, networks, topology, selectedNetworkId, onSelectNetwork, onCreateNetwork, view, onChangeView } = props;
-  const { theme, onToggleTheme, onToggleLocale, onLogout, ui, onUi } = props;
+  const { t, locale, user, quota, networks, topology, selectedNetworkId, onSelectNetwork, onCreateNetwork, view, onChangeView } = props;
+  const { theme, onToggleTheme, onToggleLocale, onLogout, onOpenAccountSettings, ui, onUi } = props;
 
   const closeSwitcher = useCallback(() => onUi({ networkSwitcherOpen: false }), [onUi]);
   const closeAccount = useCallback(() => onUi({ accountMenuOpen: false }), [onUi]);
@@ -168,7 +176,7 @@ export function TopBar(props: TopBarProps) {
               </span>
             )}
             <span className="chevron" aria-hidden="true">
-              ▾
+              <ChevronIcon size={12} />
             </span>
           </button>
 
@@ -191,7 +199,7 @@ export function TopBar(props: TopBarProps) {
                     }}
                   >
                     <span className="menu-check" aria-hidden="true">
-                      {isCurrent ? '✓' : ''}
+                      {isCurrent ? <CheckIcon size={12} /> : ''}
                     </span>
                     <span className="menu-item-name">{network.name}</span>
                     <span
@@ -238,7 +246,7 @@ export function TopBar(props: TopBarProps) {
           </span>
           <span className="account-email">{user.email}</span>
           <span className="chevron" aria-hidden="true">
-            ▾
+            <ChevronIcon size={12} />
           </span>
         </button>
 
@@ -249,7 +257,32 @@ export function TopBar(props: TopBarProps) {
               <div className="account-role">
                 {user.role === 'admin' ? t('account.role.admin') : t('account.role.user')}
               </div>
+              {/* 当前用户组与到期（GC-8）：到期回退默认组时给明确提醒 */}
+              {quota !== null && (
+                <div className="account-role">
+                  {t('account.groupLabel')}：{quota.groupName}
+                  {quota.isExpiredFallback
+                    ? ` · ${t('account.groupExpired')}`
+                    : quota.groupExpiresAt !== null
+                      ? ` · ${t('account.groupExpiryAt', { date: formatQuotaExpiry(quota.groupExpiresAt, locale) })}`
+                      : ''}
+                </div>
+              )}
             </div>
+            <div className="menu-sep" aria-hidden="true" />
+            <button
+              type="button"
+              role="menuitem"
+              data-menu-item
+              className="menu-item"
+              onClick={() => {
+                onOpenAccountSettings();
+                closeAccount();
+              }}
+            >
+              <span className="menu-check" aria-hidden="true" />
+              {t('account.settings')}
+            </button>
             <div className="menu-sep" aria-hidden="true" />
             <button
               type="button"
@@ -263,10 +296,11 @@ export function TopBar(props: TopBarProps) {
               }}
             >
               <span className="menu-check" aria-hidden="true">
-                {view === 'networks' ? '✓' : ''}
+                {view === 'networks' ? <CheckIcon size={12} /> : ''}
               </span>
               {t('view.networks')}
             </button>
+            {/* 网关管理入口严格仅管理员渲染：普通用户不可见、不可点（GC-8 权限收口） */}
             {user.role === 'admin' && (
               <button
                 type="button"
@@ -280,7 +314,7 @@ export function TopBar(props: TopBarProps) {
                 }}
               >
                 <span className="menu-check" aria-hidden="true">
-                  {view === 'admin' ? '✓' : ''}
+                  {view === 'admin' ? <CheckIcon size={12} /> : ''}
                 </span>
                 {t('view.admin')}
               </button>
