@@ -427,8 +427,17 @@ describe('完整实例：API + WS + UDP 同进程协同', () => {
       }
 
       // 断开连接后成员行保留（authorized 落库），仅 online 回落为 false
-      const topoAfter = await api(gw.base, 'GET', `/api/v1/networks/${net.id}/topology`, { cookie });
-      assert.equal(topoAfter.json.data.members.find((m) => m.nodeId === node.nodeId)?.online, false);
+      // 客户端 wsClosed 不保证服务端 TCP close 回调在同一微任务完成，有界轮询等待服务端 teardown 落定
+      const deadline = Date.now() + 1000;
+      let memberAfter;
+      for (;;) {
+        const topoAfter = await api(gw.base, 'GET', `/api/v1/networks/${net.id}/topology`, { cookie });
+        memberAfter = topoAfter.json.data.members.find((m) => m.nodeId === node.nodeId);
+        if (memberAfter?.online === false || Date.now() >= deadline) break;
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      assert.equal(memberAfter?.status, 'authorized');
+      assert.equal(memberAfter?.online, false);
     } finally {
       await gw.close();
     }
