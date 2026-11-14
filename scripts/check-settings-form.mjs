@@ -1139,7 +1139,7 @@ test('derivePeerStatusView counts an old list only when every mounted flag is ex
 // only; junk degrades field-by-field to unknown; counts must be finite
 // non-negative safe integers.
 
-test('derivePeerStatusView carries the sync facts verbatim when the body has them', () => {
+test('PS-3a: derivePeerStatusView carries 5 sync counts verbatim and drops junk values field-by-field', () => {
   const view = derivePeerStatusView({
     configured: true,
     nodeId: 'abcd1234',
@@ -1149,70 +1149,66 @@ test('derivePeerStatusView carries the sync facts verbatim when the body has the
     mountedCount: 2,
     peers: [],
     sync: {
-      state: 'partial',
       readyCount: 1,
+      mountedCandidateCount: 2,
       candidateCount: 2,
-      unmountedCount: 0,
       ignoredCount: 1,
       mismatchCount: 0,
-      reason: 'peers-partial',
     },
   })
   assert.deepEqual(view.sync, {
-    state: 'partial',
     readyCount: 1,
+    mountedCandidateCount: 2,
     candidateCount: 2,
-    unmountedCount: 0,
     ignoredCount: 1,
     mismatchCount: 0,
-    reason: 'peers-partial',
   })
 })
 
-test('derivePeerStatusView keeps an old body without sync unknown — never guessed from peers', () => {
+test('PS-3a: derivePeerStatusView keeps an old body without sync unknown — never guessed from peers', () => {
   const view = derivePeerStatusView({
     configured: true,
     gatewayState: 'authorized',
     maxPeers: 8,
     peers: [{ nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 }],
   })
-  assert.equal(view.sync, undefined, 'a non-empty peers list is NOT a ready verdict')
-  // A junk sync field is no sync field at all.
+  assert.equal(view.sync, undefined, 'a non-empty peers list is NOT sync counts')
   for (const junk of [null, 'ready', 42, [], true]) {
     assert.equal(derivePeerStatusView({ peers: [], sync: junk }).sync, undefined, JSON.stringify(junk))
   }
 })
 
-test('derivePeerStatusView degrades junk sync words and counts to unknown', () => {
+test('PS-3a: derivePeerStatusView degrades junk sync counts to undefined', () => {
   const junk = derivePeerStatusView({
     peers: [],
-    sync: { state: 'shiny', readyCount: -1, candidateCount: 1.5, unmountedCount: 'two', ignoredCount: Number.POSITIVE_INFINITY, mismatchCount: 2, reason: 'because' },
+    sync: {
+      readyCount: -1,
+      mountedCandidateCount: 'two',
+      candidateCount: 1.5,
+      ignoredCount: Number.POSITIVE_INFINITY,
+      mismatchCount: 2,
+    },
   })
-  assert.equal(junk.sync.state, undefined, 'an unknown state word is no state')
   assert.equal(junk.sync.readyCount, undefined, 'a negative count is no count')
+  assert.equal(junk.sync.mountedCandidateCount, undefined, 'a non-number count is no count')
   assert.equal(junk.sync.candidateCount, undefined, 'a fractional count is no count')
-  assert.equal(junk.sync.unmountedCount, undefined, 'a non-number count is no count')
   assert.equal(junk.sync.ignoredCount, undefined, 'an infinite count is no count')
   assert.equal(junk.sync.mismatchCount, 2, 'a clean count rides verbatim')
-  assert.equal(junk.sync.reason, undefined, 'an unknown reason word is no reason')
-  // Every state word of the vocabulary passes.
-  for (const state of ['ready', 'partial', 'not-ready', 'waiting-peers', 'ignored', 'blocked', 'unconfigured']) {
-    assert.equal(derivePeerStatusView({ peers: [], sync: { state } }).sync.state, state, state)
-  }
-  // Every reason word of the vocabulary passes. fix1: the unmounted reason is
-  // the NEUTRAL `peers-not-mounted` — the route knows only "not mounted", so
-  // no capacity word exists in the set at all.
-  for (const reason of ['ok', 'waiting-peers', 'ignored', 'identity-mismatch', 'gateway-connecting', 'gateway-pending-approval', 'gateway-mismatch', 'gateway-paused', 'gateway-revoked', 'gateway-offline', 'peers-not-mounted', 'peers-not-online', 'peers-partial', 'unconfigured']) {
-    assert.equal(derivePeerStatusView({ peers: [], sync: { reason } }).sync.reason, reason, reason)
-  }
-  // Zero is a real zero across the board.
-  const zeros = derivePeerStatusView({ peers: [], sync: { state: 'ready', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'ok' } })
-  assert.deepEqual(zeros.sync, { state: 'ready', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'ok' })
-  // A missing field inside sync degrades that field, not the whole block.
-  const partialBlock = derivePeerStatusView({ peers: [], sync: { state: 'ready' } })
-  assert.equal(partialBlock.sync.state, 'ready')
-  assert.equal(partialBlock.sync.readyCount, undefined)
-  assert.equal(partialBlock.sync.reason, undefined)
+  const zeros = derivePeerStatusView({
+    peers: [],
+    sync: { readyCount: 0, mountedCandidateCount: 0, candidateCount: 0, ignoredCount: 0, mismatchCount: 0 },
+  })
+  assert.deepEqual(zeros.sync, {
+    readyCount: 0,
+    mountedCandidateCount: 0,
+    candidateCount: 0,
+    ignoredCount: 0,
+    mismatchCount: 0,
+  })
+  const partialBlock = derivePeerStatusView({ peers: [], sync: { readyCount: 1 } })
+  assert.equal(partialBlock.sync.readyCount, 1)
+  assert.equal(partialBlock.sync.mountedCandidateCount, undefined)
+  assert.equal(partialBlock.sync.candidateCount, undefined)
 })
 
 test('PS-2: derivePeerStatusView carries identityError when gatewayState is identity-error', () => {

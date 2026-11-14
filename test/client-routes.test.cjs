@@ -3072,67 +3072,61 @@ test('PC-14a status: a real pool drives the sync facts live over the HTTP route 
   }
 
   // aaaa1111's mount handshake-online through the real pool client;
-  // bbbb2222's handshake fails → its mount sits offline. One ready of two
-  // candidates is honest PARTIAL; the ignored device counts aside.
+  // bbbb2222's handshake fails → its mount sits offline. Both mounts are counted
+  // in mountedCandidateCount (PS-3a five-count contract).
   assert.deepEqual(await syncOf(), {
-    state: 'partial',
     readyCount: 1,
+    mountedCandidateCount: 2,
     candidateCount: 2,
-    unmountedCount: 0,
     ignoredCount: 1,
     mismatchCount: 0,
-    reason: 'peers-partial',
   })
   assert.ok(!('synced' in (await syncOf())), 'no fabricated sync-completed signal exists')
+  assert.ok(!('state' in (await syncOf())), 'no derived state enum exists')
+  assert.ok(!('reason' in (await syncOf())), 'no derived reason enum exists')
+  assert.ok(!('unmountedCount' in (await syncOf())), 'no redundant unmountedCount exists')
 
-  // The second mount recovers (its network came back): the very next read
-  // answers READY — every candidate handshake-online, nothing blocked.
+  // The second mount recovers (its network came back): readyCount reaches 2.
   env.set('http://zr-peer-bbbb2222.virtual|peer-virtual', { serverId: 'bbbb2222', serverName: '客厅电脑' })
   assert.equal(pool.getByEntryId('bbbb2222').client.reconnect(), true, 'the offline mount redials')
   await settlePool()
   assert.deepEqual(await syncOf(), {
-    state: 'ready',
     readyCount: 2,
+    mountedCandidateCount: 2,
     candidateCount: 2,
-    unmountedCount: 0,
     ignoredCount: 1,
     mismatchCount: 0,
-    reason: 'ok',
   })
 
-  // The first link drops (mux path dies): the read leaves ready immediately.
+  // The first link drops (mux path dies): readyCount drops immediately.
   pool.getByEntryId('aaaa1111').client.drop('offline')
   assert.deepEqual(await syncOf(), {
-    state: 'partial',
     readyCount: 1,
+    mountedCandidateCount: 2,
     candidateCount: 2,
-    unmountedCount: 0,
     ignoredCount: 1,
     mismatchCount: 0,
-    reason: 'peers-partial',
   })
 
-  // A re-dial caught mid-flight (`connecting`) is just as little ready.
+  // A re-dial caught mid-flight (`connecting`) drops readyCount to 0.
   pool.getByEntryId('bbbb2222').client.drop('connecting')
   assert.deepEqual(await syncOf(), {
-    state: 'not-ready',
     readyCount: 0,
+    mountedCandidateCount: 2,
     candidateCount: 2,
-    unmountedCount: 0,
     ignoredCount: 1,
     mismatchCount: 0,
-    reason: 'peers-not-online',
   })
 
-  // Recovery rides the SAME real client: back to partial, never stuck.
+  // Recovery rides the SAME real client: back to 1 ready.
   assert.equal(pool.getByEntryId('aaaa1111').client.reconnect(), true)
   await settlePool()
   const recovered = await syncOf()
-  assert.equal(recovered.state, 'partial')
+  assert.equal(recovered.mountedCandidateCount, 2)
   assert.equal(recovered.readyCount, 1)
 })
 
-test('PC-14a status: the sync state matrix over the engine snapshot and pool client states', async () => {
+test('PS-3a status: the 5-count sync object over the engine snapshot and pool client states', async () => {
   const peer = (nodeId, name, state, mounted) => ({ nodeId, name, state, path: mounted ? 'lan' : 'none', rttMs: mounted ? 2 : null, mounted })
   const entryOf = (nodeId, name, state) => ({
     entryId: nodeId,
@@ -3157,95 +3151,69 @@ test('PC-14a status: the sync state matrix over the engine snapshot and pool cli
     }
   }
 
-  // 1. Not joined: the whole block reads unconfigured, zero everything.
+  // 1. Not joined: zero everything.
   assert.deepEqual(await read(engineOf([], 'unconfigured', null)), {
-    state: 'unconfigured', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'unconfigured',
+    readyCount: 0, mountedCandidateCount: 0, candidateCount: 0, ignoredCount: 0, mismatchCount: 0,
   })
-  // 2. Joined and authorized, nobody else on the network yet: waiting for
-  //    other devices — NOT a sync completion.
+  // 2. Joined and authorized, empty network.
   assert.deepEqual(await read(engineOf([])), {
-    state: 'waiting-peers', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'waiting-peers',
+    readyCount: 0, mountedCandidateCount: 0, candidateCount: 0, ignoredCount: 0, mismatchCount: 0,
   })
-  // 3. Every discovered device actively ignored: an explicit ignored verdict,
-  //    not a wait and never a success.
+  // 3. Every discovered device actively ignored.
   assert.deepEqual(
     await read(engineOf([peer('aaaa1111', '书房电脑', 'disabled', false), peer('bbbb2222', '客厅电脑', 'disabled', false)])),
-    { state: 'ignored', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 2, mismatchCount: 0, reason: 'ignored' },
+    { readyCount: 0, mountedCandidateCount: 0, candidateCount: 0, ignoredCount: 2, mismatchCount: 0 },
   )
-  // 4. Eligible peers but no real mount, while the LOCAL cap has room (the
-  //    pool answers 8, nothing is mounted): the route knows only "not
-  //    mounted" — freshly discovered, punch pending, a full cap or a failed
-  //    mount all look identical here, so the reason must stay NEUTRAL and
-  //    never claim capacity without a cap-vs-occupancy proof (fix1).
+  // 4. Eligible peers without real mounts: candidateCount=2, mountedCandidateCount=0.
   assert.deepEqual(
     await read(engineOf([peer('aaaa1111', '书房电脑', 'eligible', false), peer('bbbb2222', '客厅电脑', 'eligible', false)])),
-    { state: 'not-ready', readyCount: 0, candidateCount: 2, unmountedCount: 2, ignoredCount: 0, mismatchCount: 0, reason: 'peers-not-mounted' },
+    { readyCount: 0, mountedCandidateCount: 0, candidateCount: 2, ignoredCount: 0, mismatchCount: 0 },
   )
-  // 5. Every candidate handshake-online through its pool mount: ready — the
-  //    license to sync.
+  // 5. Every candidate mounted and handshake-online.
   assert.deepEqual(
     await read(
       engineOf([peer('aaaa1111', '书房电脑', 'eligible', true), peer('bbbb2222', '客厅电脑', 'eligible', true)]),
       [entryOf('aaaa1111', '书房电脑', 'online'), entryOf('bbbb2222', '客厅电脑', 'online')],
       ['aaaa1111', 'bbbb2222'],
     ),
-    { state: 'ready', readyCount: 2, candidateCount: 2, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'ok' },
+    { readyCount: 2, mountedCandidateCount: 2, candidateCount: 2, ignoredCount: 0, mismatchCount: 0 },
   )
-  // 6. Mixed: some online, some not — honest partial, never all-green.
+  // 6. Mixed: both mounted, one online, one offline.
   assert.deepEqual(
     await read(
       engineOf([peer('aaaa1111', '书房电脑', 'eligible', true), peer('bbbb2222', '客厅电脑', 'eligible', true)]),
       [entryOf('aaaa1111', '书房电脑', 'online'), entryOf('bbbb2222', '客厅电脑', 'offline')],
       ['aaaa1111', 'bbbb2222'],
     ),
-    { state: 'partial', readyCount: 1, candidateCount: 2, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'peers-partial' },
+    { readyCount: 1, mountedCandidateCount: 2, candidateCount: 2, ignoredCount: 0, mismatchCount: 0 },
   )
-  // 6b. fix1: one mount online, ANOTHER candidate not mounted at all — with
-  //     room under the cap this is still just partial; an unmounted peer must
-  //     never be dressed up as a capacity verdict.
+  // 6b. One candidate mounted and online, another candidate unmounted (e.g. maxServers reached or unselected).
   assert.deepEqual(
     await read(
       engineOf([peer('aaaa1111', '书房电脑', 'eligible', true), peer('bbbb2222', '客厅电脑', 'eligible', false)]),
       [entryOf('aaaa1111', '书房电脑', 'online')],
       ['aaaa1111'],
     ),
-    { state: 'partial', readyCount: 1, candidateCount: 2, unmountedCount: 1, ignoredCount: 0, mismatchCount: 0, reason: 'peers-not-mounted' },
+    { readyCount: 1, mountedCandidateCount: 1, candidateCount: 2, ignoredCount: 0, mismatchCount: 0 },
   )
-  // 7. A local TOFU mismatch blocks the whole verdict even while the rest
-  //    rides online — the trust decision is the real state.
+  // 7. A local TOFU mismatch counts in mismatchCount alongside mounted candidate counts.
   assert.deepEqual(
     await read(
       engineOf([peer('aaaa1111', '书房电脑', 'eligible', true), peer('cccc3333', '换了钥的机器', 'identity-mismatch', false)]),
       [entryOf('aaaa1111', '书房电脑', 'online')],
       ['aaaa1111'],
     ),
-    { state: 'blocked', readyCount: 1, candidateCount: 1, unmountedCount: 0, ignoredCount: 0, mismatchCount: 1, reason: 'identity-mismatch' },
+    { readyCount: 1, mountedCandidateCount: 1, candidateCount: 1, ignoredCount: 0, mismatchCount: 1 },
   )
-  // 8. The historical-pool trap: the gateway WS is gone but the mounts'
-  //    clients still read online. The counts stay honest; the STATE must not
-  //    claim ready off stale pool facts.
+  // 8. Pure counts stay factual regardless of gatewayState (gatewayState gates light/exit separately).
   assert.deepEqual(
     await read(
       engineOf([peer('aaaa1111', '书房电脑', 'eligible', true)], 'offline'),
       [entryOf('aaaa1111', '书房电脑', 'online')],
       ['aaaa1111'],
     ),
-    { state: 'not-ready', readyCount: 1, candidateCount: 1, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason: 'gateway-offline' },
+    { readyCount: 1, mountedCandidateCount: 1, candidateCount: 1, ignoredCount: 0, mismatchCount: 0 },
   )
-  // 9. Every other non-authorized gateway verdict keeps its own reason word
-  //    (the members are gone by then — the engine clears them).
-  for (const [gatewayState, reason] of [
-    ['connecting', 'gateway-connecting'],
-    ['pending-approval', 'gateway-pending-approval'],
-    ['mismatch', 'gateway-mismatch'],
-    ['paused', 'gateway-paused'],
-    ['revoked', 'gateway-revoked'],
-  ]) {
-    const sync = await read(engineOf([], gatewayState))
-    assert.deepEqual(sync, {
-      state: 'not-ready', readyCount: 0, candidateCount: 0, unmountedCount: 0, ignoredCount: 0, mismatchCount: 0, reason,
-    }, gatewayState)
-  }
 })
 
 test('PC-14a status: only real virtual mounts count — an old client pairing never impersonates a peer', async (t) => {
@@ -3295,15 +3263,13 @@ test('PC-14a status: only real virtual mounts count — an old client pairing ne
   const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
   assert.equal(res.status, 200)
   // The ONLINE old pairing must not impersonate the offline peer mount:
-  // ready reads the virtual client (offline), so the verdict is not-ready.
+  // readyCount reads the virtual client (offline -> 0), mountedCandidateCount is 1.
   assert.deepEqual(JSON.parse(res.body).sync, {
-    state: 'not-ready',
     readyCount: 0,
+    mountedCandidateCount: 1,
     candidateCount: 1,
-    unmountedCount: 0,
     ignoredCount: 0,
     mismatchCount: 0,
-    reason: 'peers-not-online',
   })
 })
 

@@ -272,14 +272,11 @@ const ZH: Readonly<Record<string, string>> = {
   // PC-14b：成员同步行的措辞（照 PC-14a 的 sync 事实说话，ready 只是握手
   // 许可，绝不声称任何会话数据已同步完成）。
   'peer.sync.ready': '设备就绪，可开始同步',
-  'peer.sync.partial': '{ready}/{total} 台设备握手就绪',
-  'peer.sync.notMounted': '设备尚未完成会话挂载',
-  'peer.sync.notOnline': '设备尚未完成握手',
+  'peer.sync.partial': '已向 {ready}/{total} 台已挂载设备完成握手',
   'peer.sync.gatewayHold': '等待网关接入完成',
   'peer.sync.waitingPeers': '已入网，等待其他设备加入',
   'peer.sync.ignored': '已入网，其他设备均被设为忽略',
   'peer.sync.blocked': '存在身份异常设备，同步被阻塞',
-  'peer.sync.unknown': '当前后端未提供就绪状态',
   'peer.status.title': '节点端（虚拟网络互通）：',
   'peer.status.notJoined': '未加入任何虚拟网络。',
   'peer.status.nodeId': '本机节点 ID：{nodeId}',
@@ -654,14 +651,11 @@ const EN: Readonly<Record<string, string>> = {
   // ready is the handshake license only — never a claim that any concrete
   // session data finished synchronizing).
   'peer.sync.ready': 'devices ready — syncing may start',
-  'peer.sync.partial': '{ready}/{total} devices handshake-ready',
-  'peer.sync.notMounted': 'devices are not mounted yet',
-  'peer.sync.notOnline': 'devices are not handshake-online yet',
+  'peer.sync.partial': '{ready}/{total} mounted devices handshake-ready',
   'peer.sync.gatewayHold': 'waiting on gateway admission',
   'peer.sync.waitingPeers': 'joined; waiting for other devices to join',
   'peer.sync.ignored': 'joined; every other device is ignored',
   'peer.sync.blocked': 'an identity mismatch blocks syncing',
-  'peer.sync.unknown': 'the backend did not report readiness',
   'peer.status.title': 'Peer node (virtual network):',
   'peer.status.notJoined': 'Not joined to any virtual network.',
   'peer.status.nodeId': 'Local node id: {nodeId}',
