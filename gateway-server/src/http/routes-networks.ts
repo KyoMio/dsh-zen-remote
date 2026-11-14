@@ -21,6 +21,7 @@ import type {
   NetworkRecord,
   TransitionAction,
 } from '../store/types.js';
+import { SEAT_OCCUPYING_STATUSES } from '../store/types.js';
 
 const ADMISSION_MODES: readonly AdmissionMode[] = ['key', 'manual', 'both'];
 
@@ -178,9 +179,30 @@ async function handleCreateNetwork(ctx: RouteContext): Promise<void> {
   const user = await requireUser(ctx);
   const body = await readJsonObjectBody(ctx.req);
   const name = parseName(body['name']);
-  const settings = await ctx.store.getSettings();
   const admissionMode = body['admissionMode'] === undefined ? 'both' : parseAdmissionMode(body['admissionMode']);
-  const maxPeers = body['maxPeers'] === undefined ? settings.defaultMaxPeers : parseMaxPeers(body['maxPeers']);
+  // GC-3：容量按角色取值——admin 用系统 defaultMaxPeers / 自定值；普通用户受所在
+  // 有效组的 maxPeersPerNetwork 约束（省略取组值，显式超组值直接 400）。
+  // 网络数配额仍由 store.createNetwork 事务内校验，超限经 storeErrorToApiError 映射
+  // 409 QUOTA_EXCEEDED（rest-api.test.mjs 的既有断言钉死这个状态码）。
+  let maxPeers: number;
+  if (user.role === 'admin') {
+    const settings = await ctx.store.getSettings();
+    maxPeers = body['maxPeers'] === undefined ? settings.defaultMaxPeers : parseMaxPeers(body['maxPeers']);
+  } else {
+    const quota = await ctx.store.resolveEffectiveUserQuota(user.id);
+    if (body['maxPeers'] === undefined) {
+      maxPeers = quota.group.maxPeersPerNetwork;
+    } else {
+      maxPeers = parseMaxPeers(body['maxPeers']);
+      if (maxPeers > quota.group.maxPeersPerNetwork) {
+        throw new ApiError(
+          400,
+          'PEER_LIMIT_EXCEEDED_BY_GROUP',
+          `maxPeers exceeds the user group limit (${quota.group.maxPeersPerNetwork})`,
+        );
+      }
+    }
+  }
   const joinKey = generateJoinKey();
   const network = await ctx.store.createNetwork({
     ownerId: user.id,
@@ -195,12 +217,29 @@ async function handleCreateNetwork(ctx: RouteContext): Promise<void> {
 async function handlePatchNetwork(ctx: RouteContext, params: Record<string, string>): Promise<void> {
   const user = await requireUser(ctx);
   const networkId = params['id'] ?? '';
-  await loadOwnedNetwork(ctx, user.id, networkId);
+  const existing = await loadOwnedNetwork(ctx, user.id, networkId);
   const body = await readJsonObjectBody(ctx.req);
   const patch: NetworkPatch = {};
   if (body['name'] !== undefined) patch.name = parseName(body['name']);
   if (body['admissionMode'] !== undefined) patch.admissionMode = parseAdmissionMode(body['admissionMode']);
-  if (body['maxPeers'] !== undefined) patch.maxPeers = parseMaxPeers(body['maxPeers']);
+  if (body['maxPeers'] !== undefined) {
+    patch.maxPeers = parseMaxPeers(body['maxPeers']);
+    // GC-3（SPEC 5.2.2 #4 祖父存量保护）：普通用户调容受组上限约束；既有网络
+    // 原本已超出当前组上限时不自动拆网——允许保持或向下缩容（<= 原值），只有
+    // 调高至超过组上限才拒绝。admin 不受限。
+    if (user.role !== 'admin') {
+      const quota = await ctx.store.resolveEffectiveUserQuota(user.id);
+      const groupCap = quota.group.maxPeersPerNetwork;
+      const grandfatheredShrink = existing.maxPeers > groupCap && patch.maxPeers <= existing.maxPeers;
+      if (patch.maxPeers > groupCap && !grandfatheredShrink) {
+        throw new ApiError(
+          400,
+          'PEER_LIMIT_EXCEEDED_BY_GROUP',
+          `maxPeers exceeds the user group limit (${groupCap})`,
+        );
+      }
+    }
+  }
   const updated = await ctx.store.updateNetwork(networkId, patch);
   if (updated === null) {
     throw new ApiError(404, 'NOT_FOUND', 'network not found');
@@ -246,8 +285,23 @@ async function handleMemberTransition(
 ): Promise<void> {
   const user = await requireUser(ctx);
   const networkId = params['id'] ?? '';
-  await loadOwnedNetwork(ctx, user.id, networkId);
+  const network = await loadOwnedNetwork(ctx, user.id, networkId);
   const nodeId = params['nodeId'] ?? '';
+  // GC-3：普通用户批准 pending 成员会新增占席位——有效席位上限取
+  // min(网络容量, 组 maxPeersPerNetwork)。占席内的迁移（resume / repin /
+  // 幂等 approve）与祖父超额存量的既有成员不受影响；admin 不受限。
+  if (action === 'approve' && user.role !== 'admin') {
+    const members = await ctx.store.listMembers(networkId);
+    const target = members.find((m) => m.nodeId === nodeId);
+    if (target !== undefined && target.status === 'pending') {
+      const quota = await ctx.store.resolveEffectiveUserQuota(user.id);
+      const effectiveMax = Math.min(network.maxPeers, quota.group.maxPeersPerNetwork);
+      const occupying = members.filter((m) => SEAT_OCCUPYING_STATUSES.includes(m.status)).length;
+      if (occupying >= effectiveMax) {
+        throw new ApiError(409, 'LIMIT_REACHED', 'network member limit reached');
+      }
+    }
+  }
   const member: MemberRecord = await ctx.store.transitionMemberStatus(networkId, nodeId, action);
   await runHook(ctx.hooks.onMemberChanged, {
     networkId: member.networkId,

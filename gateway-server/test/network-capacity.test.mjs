@@ -205,9 +205,13 @@ async function patchNetwork(gw, networkId, body) {
 
 // ---------------------------------------------------------------- 网关组装（无 STUN：本单不涉 UDP）
 
-async function startGateway() {
+async function startGateway(opts = {}) {
   const store = new SqliteStore({
-    seed: { allowSignup: false, maxNetworksPerUser: 4, defaultMaxPeers: 8, relayRateKbps: 64 },
+    // GC-3：默认组的 maxPeersPerNetwork 同步自 seed.defaultMaxPeers。未传覆盖时取
+    // 32——既有 PC-08a / PS-5 用例以 tenant 身份 PATCH maxPeers 到 20，默认组上限
+    // 必须 ≥ 20 才能保持这些用例一字不改、断言零弱化；需要小上限的 GC-3 用例
+    // 显式传 opts.defaultMaxPeers 收紧。
+    seed: { allowSignup: false, maxNetworksPerUser: 4, defaultMaxPeers: opts.defaultMaxPeers ?? 32, relayRateKbps: 64 },
   });
   const masterKey = deriveMasterKeyFromSecret('network-capacity-test');
   const hub = new PeerWsHub({ store, masterKey, rateTickMs: null, flushMs: null });
@@ -638,6 +642,141 @@ describe('PS-5 直接容量钩子异常恢复与在途读取收敛', () => {
       assert.equal(welcome.status, 'authorized');
       assert.equal(welcome.maxPeers, 9, '直接随最新 maxPeers=9 放行');
       wsJoiner.close();
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------- GC-3：用户组配额接入 HTTP 路由
+
+/**
+ * 登录拿会话 Cookie（network-capacity 的 api() 不回传 setCookies，单独走 fetch）。
+ */
+async function loginCookie(base, email, password) {
+  const res = await fetch(base + '/api/v1/auth/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  assert.equal(res.status, 200, `login ${email} failed`);
+  const raw = res.headers.getSetCookie().find((c) => c.startsWith('zr_gw_session='));
+  assert.ok(raw, 'expected session cookie');
+  return raw.split(';')[0];
+}
+
+describe('GC-3 用户组配额：建网容量与祖父存量', () => {
+  test('非 admin 省略 maxPeers 用组上限；显式超组值 400 PEER_LIMIT_EXCEEDED_BY_GROUP；admin 顶格 64 不受限', async () => {
+    const gw = await startGateway({ defaultMaxPeers: 8 });
+    try {
+      // tenant 在默认组（maxPeersPerNetwork 同步自 seed.defaultMaxPeers=8）
+      const omitted = await api(gw.base, 'POST', '/api/v1/networks', {
+        body: { name: 'grouped-net', admissionMode: 'key' },
+        cookie: gw.tenantCookie,
+      });
+      assert.equal(omitted.status, 200, JSON.stringify(omitted.json));
+      assert.equal(omitted.json.data.maxPeers, 8, '省略 maxPeers 时取所在有效组的上限');
+
+      const over = await api(gw.base, 'POST', '/api/v1/networks', {
+        body: { name: 'over-group', admissionMode: 'key', maxPeers: 9 },
+        cookie: gw.tenantCookie,
+      });
+      assert.equal(over.status, 400, JSON.stringify(over.json));
+      assert.equal(over.json.error.code, 'PEER_LIMIT_EXCEEDED_BY_GROUP');
+
+      const atCap = await api(gw.base, 'POST', '/api/v1/networks', {
+        body: { name: 'at-group-cap', admissionMode: 'key', maxPeers: 8 },
+        cookie: gw.tenantCookie,
+      });
+      assert.equal(atCap.status, 200, '恰好在组上限上仍放行');
+
+      const adminCookie = await loginCookie(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const adminOmitted = await api(gw.base, 'POST', '/api/v1/networks', {
+        body: { name: 'admin-net-default' },
+        cookie: adminCookie,
+      });
+      assert.equal(adminOmitted.status, 200);
+      assert.equal(adminOmitted.json.data.maxPeers, 8, 'admin 省略时仍取系统 defaultMaxPeers');
+      const adminTop = await api(gw.base, 'POST', '/api/v1/networks', {
+        body: { name: 'admin-net-top', admissionMode: 'key', maxPeers: 64 },
+        cookie: adminCookie,
+      });
+      assert.equal(adminTop.status, 200, JSON.stringify(adminTop.json));
+      assert.equal(adminTop.json.data.maxPeers, 64, 'admin 不受普通用户组上限约束');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('PATCH 祖父存量：超额网络允许缩容不许调高；approve 席位按 min(网络, 组) 拒绝', async () => {
+    const gw = await startGateway({ defaultMaxPeers: 16 });
+    try {
+      // tenant 在默认组（16）下建 16 席 manual 网络，播 9 个 pending 成员
+      const net = await createNetwork(gw, { mode: 'manual', maxPeers: 16 });
+      const pendingIds = [];
+      for (let i = 1; i <= 9; i++) {
+        const nodeId = `0bc3000${i}`; // 8 hex
+        const member = await gw.store.upsertMemberJoinAttempt({
+          networkId: net.id,
+          nodeId,
+          publicKeyHex: nodeId.repeat(8),
+          joinKeyMatched: false, // manual 模式无口令 → pending（不占席）
+        });
+        assert.equal(member.status, 'pending');
+        pendingIds.push(nodeId);
+      }
+
+      // 换到低配额组（maxPeersPerNetwork=8）：存量网络 16 席成为祖父超额
+      const tenant = await gw.store.findUserByEmail(TENANT_EMAIL);
+      const lowGroup = await gw.store.createUserGroup({
+        code: 'gc3low',
+        name: '低配额组',
+        maxNetworks: 4,
+        maxPeersPerNetwork: 8,
+        relayRateKbps: 64,
+      });
+      await gw.store.updateUserByAdmin(tenant.id, { groupId: lowGroup.id });
+
+      // 调高超组上限 → 400（祖父保护只许保持或缩容）
+      const raise = await api(gw.base, 'PATCH', `/api/v1/networks/${net.id}`, {
+        body: { maxPeers: 18 },
+        cookie: gw.tenantCookie,
+      });
+      assert.equal(raise.status, 400, JSON.stringify(raise.json));
+      assert.equal(raise.json.error.code, 'PEER_LIMIT_EXCEEDED_BY_GROUP');
+
+      // 祖父缩容允许：16 → 10（仍超组上限 8，但向下缩合法）
+      const shrink = await api(gw.base, 'PATCH', `/api/v1/networks/${net.id}`, {
+        body: { maxPeers: 10 },
+        cookie: gw.tenantCookie,
+      });
+      assert.equal(shrink.status, 200, JSON.stringify(shrink.json));
+      assert.equal(shrink.json.data.maxPeers, 10, '超额存量可保持或向下缩容');
+      assert.equal(shrink.json.data.totalDevices, 0, '缩容不自动删成员');
+
+      // 缩容后再往高调（10 → 16）依旧拒绝
+      const raiseAgain = await api(gw.base, 'PATCH', `/api/v1/networks/${net.id}`, {
+        body: { maxPeers: 16 },
+        cookie: gw.tenantCookie,
+      });
+      assert.equal(raiseAgain.status, 400);
+      assert.equal(raiseAgain.json.error.code, 'PEER_LIMIT_EXCEEDED_BY_GROUP');
+
+      // approve 席位：网络 10 席未满，但 min(10, 组 8) = 8——第 9 个批准被 409 拒绝
+      for (const nodeId of pendingIds.slice(0, 8)) {
+        const res = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${nodeId}/approve`, {
+          cookie: gw.tenantCookie,
+        });
+        assert.equal(res.status, 200, `approve ${nodeId}: ${JSON.stringify(res.json)}`);
+      }
+      const ninth = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${pendingIds[8]}/approve`, {
+        cookie: gw.tenantCookie,
+      });
+      assert.equal(ninth.status, 409, JSON.stringify(ninth.json));
+      assert.equal(ninth.json.error.code, 'LIMIT_REACHED');
+      // 被拒成员保持 pending，可随时重试（不因拒绝被吊销）
+      const members = await gw.store.listMembers(net.id);
+      assert.equal(members.find((m) => m.nodeId === pendingIds[8]).status, 'pending');
     } finally {
       await gw.close();
     }

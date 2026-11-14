@@ -27,7 +27,7 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { RawData, WebSocket } from 'ws';
 
-import { DEFAULT_SETTINGS } from '../store/types.js';
+import { DEFAULT_SETTINGS, currentUtcYearMonth } from '../store/types.js';
 import type {
   GatewayStore,
   MemberRecord,
@@ -61,6 +61,27 @@ const MAX_PATH_REPORTS_PER_NODE = 64;
 const MAX_LAN_ENDPOINTS = 16;
 /** PC-19 第二片：关停末批的收尾轮数上界（追平在途/尾轮 + 写库在途期间的少量新增） */
 const MAX_CLOSE_FLUSH_ROUNDS = 8;
+/** GC-3：中转数据帧类型（relay-frame.ts 的 PeerFrameType.DATA），月度配额门禁只拦这一种 */
+const RELAY_FRAME_TYPE_DATA = 0x03;
+
+/**
+ * GC-3：网络属主的有效配额快照（内存缓存）。relayBinary 是同步热路径，月度
+ * 门禁与按组限速都只读这里的内存值；缓存由首帧/入网注册惰性加载，UTC 月份
+ * 切换、refreshQuota、onSettingsChanged（默认组配额随 settings 双向同步）时
+ * 失效重拉。store 才是事实来源——快照只为避免每帧三次 store 查询。
+ */
+interface OwnerQuotaSnapshot {
+  ownerId: string;
+  isAdmin: boolean;
+  /** 有效组的实时中继速率（admin 同样按所在组速率） */
+  relayRateKbps: number;
+  /** null = 不限月度中转流量；admin 恒不受月度门禁拦截 */
+  monthlyRelayQuotaBytes: number | null;
+  /** 快照时刻该属主当月（UTC）已落库的中转字节 */
+  dbUsedBytes: number;
+  /** 快照对应的 UTC 年月（YYYY-MM），跨月即失效重拉 */
+  yearMonth: string;
+}
 
 /**
  * path-report 行的合法路径枚举（PC-16a）：节点自报的既有 lan/p2p/relay 三值
@@ -239,6 +260,14 @@ export class PeerWsHub {
   private readonly memberEpochs = new Map<string, number>();
   // PS-5：各网络已同步的 maxPeers 缓存（{ maxPeers, seq }：seq 用于抗 A->B->A 并发 PATCH 乱序），网络删除时清理。
   private readonly networkMaxPeers = new Map<string, { maxPeers: number; seq: number }>();
+  // GC-3：networkId → 属主配额快照（OwnerQuotaSnapshot；惰性加载，跨月/refreshQuota/settings 变更失效）
+  private readonly ownerQuotaByNetwork = new Map<string, OwnerQuotaSnapshot>();
+  // GC-3：在途快照加载去重——并发帧与 refreshQuota 共享同一次 store 读，不重复查询
+  private readonly ownerQuotaLoading = new Map<string, Promise<OwnerQuotaSnapshot | null>>();
+  // GC-3：受月度配额约束的属主尚未刷盘的中转字节（relayBinary 放行时累计、flush 落库成功后扣减）
+  private readonly pendingRelayBytesByOwner = new Map<string, number>();
+  // GC-3：月度配额耗尽被静默丢弃的 DATA 帧计数（按网络；单测与排障观测量）
+  private readonly monthlyQuotaDroppedByNetwork = new Map<string, number>();
 
   constructor(options: PeerWsHubOptions) {
     this.store = options.store;
@@ -517,6 +546,8 @@ export class PeerWsHub {
         startAfterMs: 20,
       });
     }
+    // GC-3：入网注册即预热属主配额快照——首条业务帧大概率已可按组速率/月度门禁判定
+    void this.loadOwnerQuota(conn.networkId).then((snapshot) => this.storeOwnerQuota(conn.networkId, snapshot));
     void this.publishTopology(conn.networkId);
   }
 
@@ -731,8 +762,15 @@ export class PeerWsHub {
   /**
    * 零明文转发：只读 28B 明文头做路由判定（magic/version/长度/帧类型 +
    * srcNodeId 严格等于本连接身份——源地址欺骗在这一步被丢弃），载荷
-   * 原样转交，网关永远没有明文。经令牌桶限速，超限丢弃（背压由发送端
+   * 原样转交，网关永远没有明文。经令牌桶限速（速率取属主有效组的
+   * relayRateKbps，快照缺失时回退全局 rateKbps），超限丢弃（背压由发送端
    * 的可靠层负责），转发字节计入滑窗与待刷盘计数。
+   *
+   * GC-3 月度中转门禁：属主非 admin 且组设了 monthlyRelayQuotaBytes 时，
+   * 已落库字节 + 本机未刷盘字节达到上限后**静默丢弃 DATA (0x03) 帧**——
+   * 不转发、不计限速桶、不断开连接（信令与控制帧照常，配额恢复或跨月后
+   * 自行恢复转发）。HELLO/ACK/SACK/PING/PONG/RST 控制帧、WS 文本信令与
+   * UDP STUN 探测完全不受门禁影响。
    */
   private relayBinary(conn: ConnState | null, buf: Buffer): void {
     if (conn === null || conn.state !== 'authorized') return; // 未入网/挂起/已踢连接一律丢弃
@@ -743,10 +781,124 @@ export class PeerWsHub {
     if (header.dstNodeId === conn.nodeId) return; // 自环不发
     const target = this.conns.get(conn.networkId)?.get(header.dstNodeId);
     if (target === undefined) return; // 目标不在线（或非 authorized）
-    if (!this.limiter.tryRelay({ networkId: conn.networkId, nodeId: conn.nodeId, peerNodeId: header.dstNodeId }, buf.length, this.rateKbps)) {
+    const quota = this.currentOwnerQuota(conn.networkId);
+    const isDataFrame = header.frameType === RELAY_FRAME_TYPE_DATA;
+    // 受月度配额约束的属主视图（非 admin 且组设了 monthlyRelayQuotaBytes）；null = 不受约束
+    const meteredQuota =
+      quota !== null && !quota.isAdmin && quota.monthlyRelayQuotaBytes !== null ? quota : null;
+    if (
+      isDataFrame && meteredQuota !== null && meteredQuota.monthlyRelayQuotaBytes !== null &&
+      meteredQuota.dbUsedBytes + (this.pendingRelayBytesByOwner.get(meteredQuota.ownerId) ?? 0) >=
+        meteredQuota.monthlyRelayQuotaBytes
+    ) {
+      // 月度配额耗尽：DATA 静默丢弃（可观测计数），控制帧照常转发
+      this.monthlyQuotaDroppedByNetwork.set(
+        conn.networkId,
+        (this.monthlyQuotaDroppedByNetwork.get(conn.networkId) ?? 0) + 1,
+      );
+      return;
+    }
+    const effectiveRateKbps = quota === null ? this.rateKbps : quota.relayRateKbps;
+    if (!this.limiter.tryRelay({ networkId: conn.networkId, nodeId: conn.nodeId, peerNodeId: header.dstNodeId }, buf.length, effectiveRateKbps)) {
       return;
     }
     target.ws.send(buf, { binary: true }, () => {/* 写失败由 close 事件兜底 */});
+    if (isDataFrame && meteredQuota !== null) {
+      // 仅受月度配额约束的属主维护未刷盘增量（flush 落库成功后扣减，见 doFlushTelemetry）
+      this.pendingRelayBytesByOwner.set(
+        meteredQuota.ownerId,
+        (this.pendingRelayBytesByOwner.get(meteredQuota.ownerId) ?? 0) + buf.length,
+      );
+    }
+  }
+
+  // ------------------------------------------------------------ 属主配额快照（GC-3）
+
+  /** 拉取并返回一个网络的属主配额快照；网络/属主不存在或 store 暂不可用返回 null（不缓存） */
+  private async loadOwnerQuota(networkId: string): Promise<OwnerQuotaSnapshot | null> {
+    const inFlight = this.ownerQuotaLoading.get(networkId);
+    if (inFlight !== undefined) return inFlight;
+    const load = (async (): Promise<OwnerQuotaSnapshot | null> => {
+      try {
+        const network = await this.store.getNetwork(networkId);
+        if (network === null) return null;
+        const owner = await this.store.findUserById(network.ownerId);
+        if (owner === null) return null;
+        const quota = await this.store.resolveEffectiveUserQuota(network.ownerId, this.now());
+        return {
+          ownerId: network.ownerId,
+          isAdmin: owner.role === 'admin',
+          relayRateKbps: quota.group.relayRateKbps,
+          monthlyRelayQuotaBytes: quota.group.monthlyRelayQuotaBytes,
+          dbUsedBytes: quota.monthlyRelayUsedBytes,
+          yearMonth: quota.yearMonth,
+        };
+      } catch {
+        return null; // store 暂不可用：本帧按无快照放行，下一帧重试
+      } finally {
+        this.ownerQuotaLoading.delete(networkId);
+      }
+    })();
+    this.ownerQuotaLoading.set(networkId, load);
+    return load;
+  }
+
+  /** 写回快照；hub 已关停或快照为 null（网络/属主已消失）时不缓存 */
+  private storeOwnerQuota(networkId: string, snapshot: OwnerQuotaSnapshot | null): void {
+    if (snapshot === null || this.closed) return;
+    this.ownerQuotaByNetwork.set(networkId, snapshot);
+  }
+
+  /**
+   * 同步取当前有效快照（relayBinary 热路径用）；缓存缺失或 UTC 月份已切换
+   * （旧月用量对新月无意义）时视作未命中——本帧按无快照放行，同时触发后台
+   * 加载，下一帧起按新值生效。并发帧共享同一在途加载。
+   */
+  private currentOwnerQuota(networkId: string): OwnerQuotaSnapshot | null {
+    const cached = this.ownerQuotaByNetwork.get(networkId);
+    if (cached !== undefined) {
+      if (currentUtcYearMonth(this.now()) === cached.yearMonth) return cached;
+      this.ownerQuotaByNetwork.delete(networkId); // 跨月：作废重拉
+    }
+    void this.loadOwnerQuota(networkId).then((snapshot) => this.storeOwnerQuota(networkId, snapshot));
+    return null;
+  }
+
+  /**
+   * GC-3：管理动作（改组 / 续期 / 改组配额 / 月度限额调整）后的失效入口，供
+   * GC-6a 接线。传 userId 时重拉该属主名下全部已缓存网络的快照，不传时全量
+   * 重拉；await 返回后下一帧即按新速率 / 新月度上限生效。从未加载过的网络
+   * 没有旧值可失效，首帧本就走惰性加载。
+   */
+  async refreshQuota(userId?: string): Promise<void> {
+    const targets: string[] = [];
+    for (const [networkId, entry] of this.ownerQuotaByNetwork) {
+      if (userId === undefined || entry.ownerId === userId) targets.push(networkId);
+    }
+    for (const networkId of targets) this.ownerQuotaByNetwork.delete(networkId);
+    await Promise.all(
+      targets.map((networkId) =>
+        this.loadOwnerQuota(networkId).then((snapshot) => this.storeOwnerQuota(networkId, snapshot)),
+      ),
+    );
+  }
+
+  /**
+   * GC-3：与 onUserDisabled 同语义的公共入口（GC-6a 接线）——递增属主准入
+   * 代次并断开该用户全部名下网络的在线 / 挂起 / 暂停 WS 连接。
+   */
+  async evictUser(userId: string): Promise<void> {
+    this.onUserDisabled(userId);
+  }
+
+  /** GC-3：月度配额耗尽被静默丢弃的 DATA 帧计数；不传 networkId 返回全网关总数 */
+  getMonthlyQuotaDroppedCount(networkId?: string): number {
+    if (networkId === undefined) {
+      let total = 0;
+      for (const count of this.monthlyQuotaDroppedByNetwork.values()) total += count;
+      return total;
+    }
+    return this.monthlyQuotaDroppedByNetwork.get(networkId) ?? 0;
   }
 
   // ------------------------------------------------------------ 路径遥测
@@ -878,6 +1030,9 @@ export class PeerWsHub {
     onNetworkUpdated: (networkId: string, maxPeers: number) => this.onNetworkUpdated(networkId, maxPeers),
     onSettingsChanged: (settings) => {
       this.rateKbps = settings.relayRateKbps;
+      // GC-3：三项配额键在 settings ↔ 默认组间双向同步——settings 变更意味着
+      // 默认组配额可能已变，属主快照一律作废（下一帧惰性重拉新值）
+      this.ownerQuotaByNetwork.clear();
     },
     onUserDisabled: (userId: string) => this.onUserDisabled(userId),
   };
@@ -1118,6 +1273,10 @@ export class PeerWsHub {
     this.subscribers.delete(networkId);
     this.lastPublishedKbps.delete(networkId);
     this.networkMaxPeers.delete(networkId);
+    // GC-3：网络的属主配额快照与丢弃计数随网络消失（loadOwnerQuota 在途完成时
+    // 若网络已删会返回 null，不会把孤儿条目写回）
+    this.ownerQuotaByNetwork.delete(networkId);
+    this.monthlyQuotaDroppedByNetwork.delete(networkId);
   }
 
   private resolveNetworkMaxPeers(
@@ -1396,6 +1555,28 @@ export class PeerWsHub {
     this.limiter.confirmFlushed(byteBatch);
     for (const [key, record] of natBatch) {
       if (this.pendingNat.get(key) === record) this.pendingNat.delete(key);
+    }
+    // GC-3：落库成功后推进配额快照的当月已用字节（dbUsedBytes 按属主聚合，
+    // 同属主全部网络的快照一起推进），并把本批字节从内存未刷盘计数里扣掉——
+    // 月度门禁的判定值（dbUsed + pending）由此保持与库中事实收敛。
+    const confirmedByOwner = new Map<string, number>();
+    for (const item of byteBatch) {
+      const snapshot = this.ownerQuotaByNetwork.get(item.networkId);
+      if (snapshot === undefined) continue;
+      confirmedByOwner.set(snapshot.ownerId, (confirmedByOwner.get(snapshot.ownerId) ?? 0) + item.bytes);
+    }
+    if (confirmedByOwner.size > 0) {
+      for (const entry of this.ownerQuotaByNetwork.values()) {
+        const delta = confirmedByOwner.get(entry.ownerId);
+        if (delta !== undefined) entry.dbUsedBytes += delta;
+      }
+      for (const [ownerId, delta] of confirmedByOwner) {
+        const pending = this.pendingRelayBytesByOwner.get(ownerId);
+        if (pending === undefined) continue;
+        const next = pending - delta;
+        if (next > 0) this.pendingRelayBytesByOwner.set(ownerId, next);
+        else this.pendingRelayBytesByOwner.delete(ownerId);
+      }
     }
   }
 }
