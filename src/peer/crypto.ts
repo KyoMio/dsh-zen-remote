@@ -174,16 +174,20 @@ export function verifySelfCertifyingNodeId(nodeId: string, publicKeyHex: string)
 // -- 2. invite URIs ---------------------------------------------------------------
 
 /**
- * A parsed `zr-net://<host[:port]>/<networkId>[#<joinKey>]` invite.
+ * A parsed `zr-net://<host[:port]>/<networkId>[?tls=0|1][#<joinKey>]` invite.
  *
- * `defaultTls` says which transport the SCHEME alone implies ( callers may
- * still connect the other way, e.g. an explicit local test override):
+ * `defaultTls` says which transport to connect with (GC-1a: one canonical
+ * `zr-net://` scheme; the transport rides an explicit `?tls=0|1` query, and
+ * the legacy read-only prefixes keep parsing for backward compatibility):
  * - `zr-nets://` forces TLS (wss/https) regardless of the host;
  * - `zr-net+insecure://` explicitly selects plaintext for gateways without TLS;
- * - plain `zr-net://` infers from the host: loopback / private v4 / ULA /
- *   link-local / Tailscale CGNAT (100.64.0.0/10) → plaintext, anything
- *   publicly routable → TLS, because a public path needs the reverse
- *   proxy's certificate to be meaningful.
+ * - plain `zr-net://` with `?tls=0|1` uses that flag verbatim (the ONLY query
+ *   the scheme accepts — anything else on the `?` is malformed);
+ * - plain `zr-net://` without a query infers from the host: loopback /
+ *   private v4 / ULA / link-local / Tailscale CGNAT (100.64.0.0/10) /
+ *   mDNS-and-home suffixes (`.local`, `.lan`) → plaintext, anything publicly
+ *   routable → TLS, because a public path needs the reverse proxy's
+ *   certificate to be meaningful.
  *
  * `rawHost` is the host token exactly as written (brackets kept for IPv6);
  * `hostname` is the bracket-stripped lowercase address. `port` defaults to
@@ -202,7 +206,7 @@ export interface ParsedInviteUri {
 
 export const PEER_INVITE_DEFAULT_PORT = 19393
 
-const INVITE_SCHEME_PATTERN = /^(zr-net\+insecure|zr-nets|zr-net):\/\//
+const INVITE_SCHEME_PATTERN = /^(zr-net\+insecure|zr-nets|zr-net):\/\//i
 /** Plain hostname: letters/digits/dots/hyphens/underscores, no colons (IPv6 must be bracketed). */
 const HOSTNAME_PATTERN = /^[A-Za-z0-9._\-]+$/
 const BRACKETED_IPV6_PATTERN = /^\[[0-9A-Fa-f:.]+\]$/
@@ -211,6 +215,7 @@ const PORT_PATTERN = /^\d+$/
 export function isLoopbackOrPrivateHostname(hostname: string): boolean {
   const h = hostname.toLowerCase()
   if (h === 'localhost') return true
+  if (h.endsWith('.local') || h.endsWith('.lan')) return true // mDNS names / home-router suffixes
   const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h)
   if (v4) {
     const [a, b] = v4.slice(1).map((part) => Number(part))
@@ -277,6 +282,13 @@ function parsePortOr(portPart: string | undefined, defaultPort: number = PEER_IN
  * users. Blank runs are trimmed; schemes are matched case-insensitively;
  * the networkId may be mixed-case hex and is normalized to lowercase; the
  * joinKey is percent-decoded when it decodes, kept raw when it does not.
+ *
+ * GC-1a: the tail is split at the FIRST `#` (fragment = join key) and the
+ * part before it at the FIRST `?`. The query is only accepted on plain
+ * `zr-net://` and must be EXACTLY `tls=0` or `tls=1` — any other query
+ * content (extra parameters, other values, a bare `?`) is malformed. The
+ * legacy `zr-nets://` / `zr-net+insecure://` prefixes keep parsing but
+ * reject every query.
  */
 export function parseInviteUri(input: string): ParsedInviteUri | null {
   if (typeof input !== 'string') return null
@@ -292,12 +304,23 @@ export function parseInviteUri(input: string): ParsedInviteUri | null {
   if (authority.length === 0) return null
   const address = parseInviteAuthority(authority)
   if (!address || address.port < 1 || address.port > 65535) return null
-  // tail = `<networkId>[#<joinKey>]` — no further path segments allowed.
+  // tail = `<networkId>[?tls=0|1][#<joinKey>]` — no further path segments.
   const hash = tail.indexOf('#')
-  const networkIdPart = hash === -1 ? tail : tail.slice(0, hash)
+  const beforeHash = hash === -1 ? tail : tail.slice(0, hash)
   const joinKeyPart = hash === -1 ? undefined : tail.slice(hash + 1)
+  const queryAt = beforeHash.indexOf('?')
+  const networkIdPart = queryAt === -1 ? beforeHash : beforeHash.slice(0, queryAt)
+  const queryPart = queryAt === -1 ? undefined : beforeHash.slice(queryAt + 1)
   if (!NETWORK_ID_PATTERN.test(networkIdPart)) return null
   const networkId = networkIdPart.toLowerCase()
+  let explicitTls: boolean | undefined
+  if (queryPart !== undefined) {
+    // The ONLY legal query: exactly `tls=0` / `tls=1`, and only on plain
+    // zr-net — the legacy prefixes carry their transport in the scheme, so
+    // mixing them with a query is malformed, never guessed.
+    if (scheme !== 'zr-net' || (queryPart !== 'tls=0' && queryPart !== 'tls=1')) return null
+    explicitTls = queryPart === 'tls=1'
+  }
   let joinKey: string | undefined
   if (joinKeyPart !== undefined && joinKeyPart !== '') {
     try {
@@ -310,7 +333,9 @@ export function parseInviteUri(input: string): ParsedInviteUri | null {
     ? true
     : scheme === 'zr-net+insecure'
       ? false
-      : !isLoopbackOrPrivateHostname(address.hostname)
+      : explicitTls !== undefined
+        ? explicitTls
+        : !isLoopbackOrPrivateHostname(address.hostname)
   return {
     rawHost: address.rawHost,
     hostname: address.hostname,
@@ -323,25 +348,45 @@ export function parseInviteUri(input: string): ParsedInviteUri | null {
   }
 }
 
-/** Build an invite URI (the inverse of {@link parseInviteUri}). Throws on malformed params — the caller composes it from its own validated state. */
+/**
+ * Build an invite URI (the inverse of {@link parseInviteUri}). Throws on
+ * malformed params — the caller composes it from its own validated state.
+ *
+ * GC-1a: the output is ALWAYS `zr-net://` — the transport rides `?tls=0|1`
+ * when the desired TLS differs from what the host implies, so a single
+ * scheme parses everywhere. The legacy `scheme` values are still accepted
+ * and only steer that desired TLS (`zr-nets` → true, `zr-net+insecure` →
+ * false). `host` is validated with {@link parseInviteAuthority} (so an
+ * optional `:port` in 1..65535 is legal) and kept verbatim — a port-less
+ * host stays port-less.
+ */
 export function formatInviteUri(params: {
   host: string
   networkId: string
   joinKey?: string
+  tls?: boolean
   scheme?: 'zr-net' | 'zr-nets' | 'zr-net+insecure'
 }): string {
   const scheme = params.scheme ?? 'zr-net'
   if (scheme !== 'zr-net' && scheme !== 'zr-nets' && scheme !== 'zr-net+insecure') {
     throw new TypeError(`unknown invite scheme: ${String(params.scheme)}`)
   }
-  const host = params.host
-  const bracketed = typeof host === 'string' && host.startsWith('[') && BRACKETED_IPV6_PATTERN.test(host)
-  if (typeof host !== 'string' || host.length === 0 || (!bracketed && !HOSTNAME_PATTERN.test(host))) {
-    throw new TypeError('host must be a plain hostname or a bracketed IPv6 address')
+  const address = typeof params.host === 'string' ? parseInviteAuthority(params.host) : null
+  if (!address || address.port < 1 || address.port > 65535) {
+    throw new TypeError('host must be a plain hostname, optionally with a :port, or a bracketed IPv6 address')
   }
   const networkId = requireNetworkId(params.networkId, 'networkId')
   const fragment = params.joinKey === undefined || params.joinKey === '' ? '' : `#${encodeURIComponent(params.joinKey)}`
-  return `${scheme}://${host}/${networkId}${fragment}`
+  const inferredTls = !isLoopbackOrPrivateHostname(address.hostname)
+  const desiredTls = params.tls !== undefined
+    ? Boolean(params.tls)
+    : scheme === 'zr-nets'
+      ? true
+      : scheme === 'zr-net+insecure'
+        ? false
+        : inferredTls
+  const query = desiredTls === inferredTls ? '' : desiredTls ? '?tls=1' : '?tls=0'
+  return `zr-net://${params.host}/${networkId}${query}${fragment}`
 }
 
 export type ParsedGatewayJoinInput =
@@ -427,9 +472,10 @@ export function parseGatewayJoinInput(input: string): ParsedGatewayJoinInput | n
 }
 
 /**
- * Construct a canonical keyless invite URI (`zr-net` / `zr-nets` /
- * `zr-net+insecure`) that round-trips through {@link parseInviteUri} to the
- * exact `tls` transport and `rawHost:port`.
+ * Construct a canonical keyless invite URI that round-trips through
+ * {@link parseInviteUri} to the exact `tls` transport and `rawHost:port`.
+ * GC-1a: always `zr-net://` — a transport that differs from what the host
+ * implies rides `?tls=0|1`; a matching one emits no query at all.
  */
 export function buildKeylessInviteUri(params: {
   rawHost: string
@@ -439,21 +485,22 @@ export function buildKeylessInviteUri(params: {
   networkId: string
 }): string {
   const networkId = requireNetworkId(params.networkId, 'networkId')
-  const isPrivate = isLoopbackOrPrivateHostname(params.hostname)
-  const scheme: 'zr-net' | 'zr-nets' | 'zr-net+insecure' = params.tls
-    ? (isPrivate ? 'zr-nets' : 'zr-net')
-    : (isPrivate ? 'zr-net' : 'zr-net+insecure')
-  return `${scheme}://${params.rawHost}:${params.port}/${networkId}`
+  const defaultTls = !isLoopbackOrPrivateHostname(params.hostname)
+  const query = params.tls === defaultTls ? '' : params.tls ? '?tls=1' : '?tls=0'
+  return `zr-net://${params.rawHost}:${params.port}/${networkId}${query}`
 }
 
 export type AssembleInviteErrorCode = 'bad-adv-gateway' | 'bad-adv-network-id' | 'bad-adv-join-key'
 
 /**
- * Assemble a canonical `zr-net*://` invite URI from split advanced-form parts
+ * Assemble a canonical `zr-net://` invite URI from split advanced-form parts
  * (`gatewayAddress` + `networkId` + optional verbatim `joinKey`), reusing
  * `parseGatewayJoinInput` and `isLoopbackOrPrivateHostname` as the single
  * source of truth. Leading/trailing whitespace in `joinKey` is preserved
  * verbatim; lone UTF-16 surrogates are rejected locally as `bad-adv-join-key`.
+ * GC-1a: the transport stated by the address scheme (`https`/`wss` → TLS,
+ * `http`/`ws` → plaintext, bare host → the host's own default) rides
+ * `?tls=0|1` when it differs from that default — never a legacy prefix.
  */
 export function assembleInviteUri(input: {
   gatewayAddress: string
@@ -491,12 +538,14 @@ export function assembleInviteUri(input: {
     return { ok: false, code: 'bad-adv-join-key' }
   }
 
-  const scheme = parsed.schemeMode === 'https'
-    ? 'zr-nets'
+  const defaultTls = !isLoopbackOrPrivateHostname(parsed.hostname)
+  const tls = parsed.schemeMode === 'https'
+    ? true
     : parsed.schemeMode === 'http'
-      ? (isLoopbackOrPrivateHostname(parsed.hostname) ? 'zr-net' : 'zr-net+insecure')
-      : 'zr-net'
-  return { ok: true, inviteUri: `${scheme}://${parsed.rawHost}:${parsed.port}/${networkId}${fragment}` }
+      ? false
+      : defaultTls
+  const query = tls === defaultTls ? '' : tls ? '?tls=1' : '?tls=0'
+  return { ok: true, inviteUri: `zr-net://${parsed.rawHost}:${parsed.port}/${networkId}${query}${fragment}` }
 }
 
 // -- 3. gateway challenge + join-key proof -----------------------------------------

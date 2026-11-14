@@ -203,6 +203,19 @@ const keyLine = redactText(`node identity privateKeyHex=${PG2_PRIVATE_KEY_HEX} l
 assert.ok(!keyLine.includes(PG2_PRIVATE_KEY_HEX), 'the private seed is not recoverable')
 assert.ok(keyLine.includes('<token>'))
 
+// ---- 6g. GC-1a: ?tls=0|1 invites keep the query and fold the fragment -------
+// The unified invite format rides the transport in ?tls=0|1, so the tail no
+// longer STARTS at the `#`. The query must survive (it is not a secret) while
+// the fragment join key dies unconditionally — even when too short to trip
+// the token-run threshold. Previously a `?tls=0#…` tail missed the fragment
+// entirely and the short key leaked verbatim.
+const tlsQuery = redactText('invite zr-net://203.0.113.10:19393/0123456789abcdef?tls=0#short ok', {})
+assert.equal(tlsQuery, 'invite zr-net://public-ip:19393/0123456789abcdef?tls=0#<token> ok', 'a ?tls=0 invite keeps ?tls=0 and folds the short join key')
+assert.ok(!tlsQuery.includes('short'), 'the short join key is not recoverable from the ?tls=0 invite')
+const tlsLan = redactText('invite zr-net://192.168.1.5:8443/0123456789abcdef?tls=1#mykey ok', {})
+assert.equal(tlsLan, 'invite zr-net://lan-ip:8443/0123456789abcdef?tls=1#<token> ok', 'a ?tls=1 invite keeps ?tls=1 and masks the short join key')
+assert.ok(!tlsLan.includes('mykey'), 'the short join key is not recoverable from the ?tls=1 invite')
+
 // ---- 6c. S1: base64url runs (a JWT) die whole --------------------------------
 const JWT_PAYLOAD = 'eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ'
 const JWT_SIG = 'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c'

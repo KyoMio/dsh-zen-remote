@@ -235,18 +235,87 @@ test('formatInviteUri: round-trips through parseInviteUri', () => {
   assert.equal(p.joinKey, 's3cret/key?')
   // No joinKey → no fragment at all.
   assert.equal(formatInviteUri({ host: '10.0.0.2', networkId: '0123456789abcdef' }), 'zr-net://10.0.0.2/0123456789abcdef')
-  // Explicit scheme passthrough.
+  // GC-1a: the output is ALWAYS zr-net:// — the scheme choice only steers the
+  // ?tls flag. zr-nets forces TLS (the host default for a public host → no
+  // query); zr-net+insecure forces plaintext (?tls=0 on a public host).
   assert.equal(
     formatInviteUri({ host: 'peer.example.com', networkId: '0123456789abcdef', scheme: 'zr-nets' }),
-    'zr-nets://peer.example.com/0123456789abcdef',
+    'zr-net://peer.example.com/0123456789abcdef',
   )
   assert.equal(
     formatInviteUri({ host: 'peer.example.com', networkId: '0123456789abcdef', scheme: 'zr-net+insecure' }),
-    'zr-net+insecure://peer.example.com/0123456789abcdef',
+    'zr-net://peer.example.com/0123456789abcdef?tls=0',
   )
+  // GC-1a: an explicit tls flag rides ?tls=0|1 before the fragment; when it
+  // matches the host default no query is emitted at all.
+  assert.equal(
+    formatInviteUri({ host: '192.168.1.10', networkId: '0123456789abcdef', tls: true }),
+    'zr-net://192.168.1.10/0123456789abcdef?tls=1',
+  )
+  assert.equal(
+    formatInviteUri({ host: 'peer.example.com', networkId: '0123456789abcdef', joinKey: 'k', tls: false }),
+    'zr-net://peer.example.com/0123456789abcdef?tls=0#k',
+  )
+  assert.equal(
+    formatInviteUri({ host: '192.168.1.10', networkId: '0123456789abcdef', tls: false }),
+    'zr-net://192.168.1.10/0123456789abcdef',
+  )
+  // GC-1a: a written port survives verbatim; a port-less host stays port-less.
+  assert.equal(
+    formatInviteUri({ host: 'peer.example.com:8443', networkId: '0123456789abcdef' }),
+    'zr-net://peer.example.com:8443/0123456789abcdef',
+  )
+  assert.equal(parseInviteUri(formatInviteUri({ host: 'peer.example.com:8443', networkId: '0123456789abcdef' }))?.port, 8443)
   // Programmer errors throw (parse must never throw; format is call-site driven).
   assert.throws(() => formatInviteUri({ host: 'peer.example.com', networkId: 'short' }), TypeError)
   assert.throws(() => formatInviteUri({ host: '', networkId: '0123456789abcdef' }), TypeError)
+  assert.throws(() => formatInviteUri({ host: 'peer.example.com:0', networkId: '0123456789abcdef' }), TypeError)
+  assert.throws(() => formatInviteUri({ host: 'peer.example.com:65536', networkId: '0123456789abcdef' }), TypeError)
+  assert.throws(() => formatInviteUri({ host: 'peer.example.com:', networkId: '0123456789abcdef' }), TypeError)
+  assert.throws(() => formatInviteUri({ host: 'peer.example.com', networkId: '0123456789abcdef', scheme: 'nope' }), TypeError)
+})
+
+test('GC-1a parseInviteUri: ?tls=0|1 on plain zr-net overrides host inference; legacy schemes refuse any query', () => {
+  // TLS forced onto a private host via the query flag.
+  const tlsOnPrivate = parseInviteUri('zr-net://192.168.1.10/0123456789abcdef?tls=1')
+  assert.equal(tlsOnPrivate?.defaultTls, true)
+  assert.equal(tlsOnPrivate?.wsUrl, 'wss://192.168.1.10:19393')
+  assert.equal(tlsOnPrivate?.httpOrigin, 'https://192.168.1.10:19393')
+  // Plaintext forced onto a public host.
+  const plainOnPublic = parseInviteUri('zr-net://peer.example.com/0123456789abcdef?tls=0')
+  assert.equal(plainOnPublic?.defaultTls, false)
+  assert.equal(plainOnPublic?.wsUrl, 'ws://peer.example.com:19393')
+  assert.equal(plainOnPublic?.httpOrigin, 'http://peer.example.com:19393')
+  // Query rides BEFORE the fragment; the joinKey still percent-decodes.
+  const both = parseInviteUri('zr-net://192.168.1.10:8443/0123456789abcdef?tls=1#my%20key')
+  assert.equal(both?.port, 8443)
+  assert.equal(both?.defaultTls, true)
+  assert.equal(both?.joinKey, 'my key')
+  // A ? AFTER the # is literal join-key text, not a query.
+  const afterHash = parseInviteUri('zr-net://peer.example.com/0123456789abcdef#k?tls=0')
+  assert.equal(afterHash?.joinKey, 'k?tls=0')
+  assert.equal(afterHash?.defaultTls, true, 'no query was parsed; the public host infers TLS')
+  // Schemes match case-insensitively. ('Zr-NeTs' would spell the zr-nets
+  // scheme case-insensitively and force TLS — that is the next assertion's
+  // job; here we vary the case of plain zr-net only.)
+  assert.equal(parseInviteUri('ZR-NET://peer.example.com/0123456789abcdef')?.defaultTls, true)
+  assert.equal(parseInviteUri('Zr-Net://192.168.1.10/0123456789abcdef')?.defaultTls, false)
+  // Anything but EXACTLY ?tls=0 / ?tls=1 on plain zr-net is rejected...
+  for (const bad of [
+    'zr-nets://peer.example.com/0123456789abcdef?tls=1',
+    'zr-net+insecure://192.168.1.10/0123456789abcdef?tls=0',
+    'zr-net://peer.example.com/0123456789abcdef?tls=2',
+    'zr-net://peer.example.com/0123456789abcdef?a=1&tls=0',
+    'zr-net://peer.example.com/0123456789abcdef?',
+    'zr-net://peer.example.com/0123456789abcdef?tls=0&',
+    'zr-net://peer.example.com/0123456789abcdef?TLS=0',
+    'zr-net://peer.example.com/0123456789abcdef?tls=00',
+  ]) {
+    assert.equal(parseInviteUri(bad), null, JSON.stringify(bad))
+  }
+  // ...and the legacy read-only prefixes stay parseable WITHOUT any query.
+  assert.equal(parseInviteUri('zr-nets://192.168.1.10/0123456789abcdef')?.defaultTls, true)
+  assert.equal(parseInviteUri('zr-net+insecure://peer.example.com/0123456789abcdef')?.defaultTls, false)
 })
 
 // -- 3. gateway challenge signature + join-key HMAC ------------------------------
@@ -674,7 +743,8 @@ test('parseGatewayJoinInput & buildKeylessInviteUri: supports gateway addresses 
     schemeMode: 'http',
   })
 
-  // Plain-HTTP on a public IP MUST synthesize zr-net+insecure:// so parseInviteUri uses ws:// rather than wss://.
+  // GC-1a: unified zr-net:// output — a transport that differs from the
+  // host's default rides ?tls=0|1 instead of a legacy scheme prefix.
   const pubKeyless = buildKeylessInviteUri({
     rawHost: '203.0.113.10',
     hostname: '203.0.113.10',
@@ -682,10 +752,42 @@ test('parseGatewayJoinInput & buildKeylessInviteUri: supports gateway addresses 
     tls: false,
     networkId: '0123456789abcdef',
   })
-  assert.equal(pubKeyless, 'zr-net+insecure://203.0.113.10:19393/0123456789abcdef')
+  assert.equal(pubKeyless, 'zr-net://203.0.113.10:19393/0123456789abcdef?tls=0')
   const roundTripped = parseInviteUri(pubKeyless)
   assert.equal(roundTripped?.wsUrl, 'ws://203.0.113.10:19393')
   assert.equal(roundTripped?.joinKey, undefined)
+  // Matching the host default emits no query at all.
+  assert.equal(
+    buildKeylessInviteUri({
+      rawHost: '192.168.1.10',
+      hostname: '192.168.1.10',
+      port: 19393,
+      tls: false,
+      networkId: '0123456789abcdef',
+    }),
+    'zr-net://192.168.1.10:19393/0123456789abcdef',
+  )
+  assert.equal(
+    buildKeylessInviteUri({
+      rawHost: 'peer.example.com',
+      hostname: 'peer.example.com',
+      port: 443,
+      tls: true,
+      networkId: '0123456789abcdef',
+    }),
+    'zr-net://peer.example.com:443/0123456789abcdef',
+  )
+  // TLS forced onto a private host rides ?tls=1 (default port 19393 when omitted).
+  assert.equal(
+    buildKeylessInviteUri({
+      rawHost: '192.168.1.5',
+      hostname: '192.168.1.5',
+      port: 19393,
+      tls: true,
+      networkId: '0123456789abcdef',
+    }),
+    'zr-net://192.168.1.5:19393/0123456789abcdef?tls=1',
+  )
 
   // HTTPS without explicit port defaults to 443, optionally carrying /<16-hex>.
   const httpsDom = parseGatewayJoinInput('https://zr.example.com/ABCDEF0123456789#')
@@ -1056,8 +1158,22 @@ test('PS-4a assembleInviteUri: positive samples round-trip through parseInviteUr
     assert.equal(plain.ok, true, address)
     const parsed = parseInviteUri(plain.inviteUri)
     assert.equal(parsed?.defaultTls, false, address)
-    assert.ok(plain.inviteUri.startsWith('zr-net+insecure://') || plain.inviteUri.startsWith('zr-net://'), address)
+    // GC-1a: unified zr-net:// with the plaintext flag riding ?tls=0.
+    assert.ok(plain.inviteUri.startsWith('zr-net://') && plain.inviteUri.endsWith('?tls=0'), address)
   }
+
+  // GC-1a: an explicit https scheme on a private host rides ?tls=1 instead of zr-nets://.
+  const lanTls = assembleInviteUri({ gatewayAddress: 'https://10.0.0.1:4088', networkId: '0123456789abcdef' })
+  assert.equal(lanTls.inviteUri, 'zr-net://10.0.0.1:4088/0123456789abcdef?tls=1')
+  assert.equal(parseInviteUri(lanTls.inviteUri)?.defaultTls, true, 'the explicit TLS flag overrides the private-host default')
+
+  // GC-1a: mDNS / home-network suffixes count as private — no query needed.
+  const mdns = assembleInviteUri({ gatewayAddress: 'nas.local:19393', networkId: '0123456789abcdef' })
+  assert.equal(mdns.inviteUri, 'zr-net://nas.local:19393/0123456789abcdef')
+  assert.equal(parseInviteUri(mdns.inviteUri)?.defaultTls, false, 'an mDNS name infers plaintext')
+  const homeLan = assembleInviteUri({ gatewayAddress: 'gw.lan', networkId: '0123456789abcdef' })
+  assert.equal(homeLan.inviteUri, 'zr-net://gw.lan:19393/0123456789abcdef')
+  assert.equal(parseInviteUri(homeLan.inviteUri)?.defaultTls, false, 'a .lan name infers plaintext')
 
   const v6 = assembleInviteUri({ gatewayAddress: '[FD00::1]:19393', networkId: '0123456789abcdef' })
   assert.equal(v6.inviteUri, 'zr-net://[FD00::1]:19393/0123456789abcdef')
@@ -1072,7 +1188,7 @@ test('PS-4a assembleInviteUri: positive samples round-trip through parseInviteUr
   }
 
   const publicPlain = assembleInviteUri({ gatewayAddress: 'http://gw.example.com:19393/', networkId: '0123456789abcdef' })
-  assert.equal(publicPlain.inviteUri, 'zr-net+insecure://gw.example.com:19393/0123456789abcdef')
+  assert.equal(publicPlain.inviteUri, 'zr-net://gw.example.com:19393/0123456789abcdef?tls=0')
   assert.equal(parseInviteUri(publicPlain.inviteUri)?.defaultTls, false)
 
   const keyed = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 'p@ss word%#中文' })

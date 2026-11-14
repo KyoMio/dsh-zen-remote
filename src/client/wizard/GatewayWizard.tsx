@@ -2502,11 +2502,25 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                                 const next = event.currentTarget.open
                                 setPeerAdvOpen(next)
                                 if (next && peerAdvGateway === '' && peerAdvNetId === '' && peerAdvJoinKey === '') {
-                                  const match = /^zr-nets?(?:\+insecure)?:\/\/([^/?#]+)\/([0-9a-fA-F]{16})(?:#(.*))?$/i.exec(peerInvite.trim())
+                                  // GC-1a: the unified invite format rides the
+                                  // transport in ?tls=0|1 (plus the legacy scheme
+                                  // prefixes). When TLS is stated explicitly, hand
+                                  // the backend an http(s):// address so a port-less
+                                  // host is not misread as :80/:443 — :19393 is
+                                  // filled in when the host carries no port.
+                                  const match = /^(zr-nets|zr-net\+insecure|zr-net):\/\/([^/?#]+)\/([0-9a-fA-F]{16})(?:\?tls=([01]))?(?:#(.*))?$/i.exec(peerInvite.trim())
                                   if (match !== null) {
-                                    setPeerAdvGateway(match[1] ?? '')
-                                    setPeerAdvNetId((match[2] ?? '').toLowerCase())
-                                    const rawKey = match[3]
+                                    const [, rawScheme, hostPort, advNetId, tlsFlag, fragmentKey] = match
+                                    const scheme = (rawScheme ?? '').toLowerCase()
+                                    const explicitTls = scheme === 'zr-nets' || tlsFlag === '1'
+                                    const explicitPlain = scheme === 'zr-net+insecure' || tlsFlag === '0'
+                                    setPeerAdvGateway(
+                                      explicitTls || explicitPlain
+                                        ? `${explicitTls ? 'https' : 'http'}://${hostPort ?? ''}${/:\d+$/.test(hostPort ?? '') ? '' : ':19393'}`
+                                        : (hostPort ?? ''),
+                                    )
+                                    setPeerAdvNetId((advNetId ?? '').toLowerCase())
+                                    const rawKey = fragmentKey
                                     if (rawKey !== undefined && rawKey !== '') {
                                       try {
                                         setPeerAdvJoinKey(decodeURIComponent(rawKey))
