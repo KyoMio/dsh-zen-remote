@@ -65,7 +65,6 @@ import {
   WIZARD_TUNNEL_STATUS_ROUTE,
   WIZARD_TUNNEL_STOP_ROUTE,
   WIZARD_VERIFY_ROUTE,
-  assemblePeerInviteUri,
   caddyFailureCopy,
   configureReadiness,
   deriveClientOverviewSummary,
@@ -217,9 +216,9 @@ function peerStateCopy(state: string, t: GatewayWizardProps['t'], deniedReason?:
 }
 
 /** The join route's failure copy: the route's own codes plus a generic
- * fallback. `invalid-invite` gets the paste-format copy. PC-15's two
- * `bad-adv-*` codes never leave this component — the advanced split-fill's
- * local refusals, raised before any request. */
+ * fallback. `invalid-invite` gets the paste-format copy; `bad-adv-*`
+ * arrive either from empty-field guards or from the backend `mode: 'advanced'`
+ * assembler on `/client/peer/join`. */
 function peerJoinFailCopy(code: string, t: GatewayWizardProps['t']): string {
   switch (code) {
     case 'invalid-invite': return t('wizard.peer.joinInvalid')
@@ -497,11 +496,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     }
   }, [])
 
-  // PC-15: the advanced split-fill dies whole — the expander collapses and
-  // all three drafts (including the sensitive passphrase) clear on a mode
-  // switch, a success, and every modal close, so a reopen never shows stale
-  // fields and no hidden draft can mix into the active mode. A FAILED join
-  // keeps the form for the fix-and-retry loop.
+  // The modal-close funnel clears both sensitive passphrase/advanced drafts and
+  // the raw invite input on X / cancel / Escape / post-leave close; toggling
+  // `<details>`, clicking 上一步, or switching tabs preserves drafts in-modal.
   const clearPeerAdvancedDrafts = (): void => {
     setPeerAdvOpen(false)
     setPeerAdvGateway('')
@@ -509,58 +506,30 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
     setPeerAdvJoinKey('')
   }
 
-  // PC-15: the close transition (X / cancel / Escape / the post-leave close)
-  // is the one funnel every modal-close path shares.
   useEffect(() => {
     if (modalOpen) return
+    setPeerInvite('')
     clearPeerAdvancedDrafts()
     // eslint-disable-next-line react-hooks/exhaustive-deps -- stable setters only
   }, [modalOpen])
 
-  // PC-15 fix1 R1: leaving the peer configure form by ANY path — 上一步 back
-  // to pick, a role pick on the pick step, a successful join's step change —
-  // clears the sensitive advanced drafts too. Only a FAILED join keeps them
-  // for the fix-and-retry loop; mid-form switches must not wait for the
-  // modal-close effect.
-  const peerAdvFormActive = step === 'configure' && wizardRole === 'peer'
-  const peerAdvFormActiveRef = useRef(false)
-  useEffect(() => {
-    if (peerAdvFormActive) {
-      peerAdvFormActiveRef.current = true
-      return
-    }
-    if (peerAdvFormActiveRef.current) {
-      peerAdvFormActiveRef.current = false
-      clearPeerAdvancedDrafts()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- stable setters only
-  }, [peerAdvFormActive])
-
-  // PG-9: paste-invite OR gateway-address manual-approval join. Switching a
-  // host row into peer mode reloads the plugin first, then the invite or
-  // gatewayUrl travels to the peer join route. PC-15 fix1 R1: with the
-  // advanced split-fill OPEN it is the ONLY active input — an open expander
-  // never falls back to the paste draft (which is cleared and disabled the
-  // moment the expander opens), so a stale paste can never ride a join
-  // meant for the advanced form; a missing part is a LOCAL refusal.
+  // PG-9 + PS-4a: paste-invite, gateway-address manual-approval, OR split
+  // `mode: 'advanced'` join assembled on the backend.
   const runPeerJoin = async (): Promise<void> => {
     setFormError(null)
     setPeerFail(null)
     const peerAdvActive = peerJoinMode === 'invite' && peerAdvOpen
-    let rawInput = (peerJoinMode === 'gateway' ? peerGatewayUrl : peerInvite).trim()
+    const rawInput = (peerJoinMode === 'gateway' ? peerGatewayUrl : peerInvite).trim()
     if (peerAdvActive) {
-      const assembled = assemblePeerInviteUri({
-        gatewayAddress: peerAdvGateway,
-        networkId: peerAdvNetId,
-        ...(peerAdvJoinKey !== '' ? { joinKey: peerAdvJoinKey } : {}),
-      })
-      if (!assembled.ok) {
-        setPeerFail(assembled.error)
+      if (peerAdvGateway.trim() === '') {
+        setPeerFail('bad-adv-gateway')
         return
       }
-      rawInput = assembled.inviteUri
-    }
-    if (rawInput === '') {
+      if (peerAdvNetId.trim() === '') {
+        setPeerFail('bad-adv-network-id')
+        return
+      }
+    } else if (rawInput === '') {
       setPeerFail(peerJoinMode === 'gateway' ? 'invalid-gateway' : 'invalid-invite')
       return
     }
@@ -597,9 +566,16 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           // non-fatal; join still proceeds with current node name
         }
       }
-      const payload = peerJoinMode === 'gateway'
-        ? { gatewayUrl: rawInput, ...(peerSelectedNetId !== '' ? { networkId: peerSelectedNetId } : {}) }
-        : { inviteUri: rawInput }
+      const payload = peerAdvActive
+        ? {
+            mode: 'advanced',
+            gatewayAddress: peerAdvGateway,
+            networkId: peerAdvNetId,
+            ...(peerAdvJoinKey !== '' ? { joinKey: peerAdvJoinKey } : {}),
+          }
+        : peerJoinMode === 'gateway'
+          ? { gatewayUrl: rawInput, ...(peerSelectedNetId !== '' ? { networkId: peerSelectedNetId } : {}) }
+          : { inviteUri: rawInput }
       const response = await fetch(CLIENT_PEER_JOIN_ROUTE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -611,6 +587,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
         networks?: Array<{ id: string; name: string }>
       }
       if (response.ok && body.ok === true) {
+        setPeerInvite('')
+        clearPeerAdvancedDrafts()
         if (!wasEffectivePeer) {
           // First peer activation: the row just reloaded under the page, and
           // its resident global streams opened unwrapped — the same UX-1
@@ -620,10 +598,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
           window.location.reload()
           return
         }
-        setPeerInvite('')
         setPeerCandidateNetworks([])
         setPeerSelectedNetId('')
-        clearPeerAdvancedDrafts()
         await loadPeerStatus()
         setStep('verify')
       } else if (body?.error?.code === 'select-network' && Array.isArray(body.networks) && body.networks.length > 0) {
@@ -2472,7 +2448,6 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                             onClick={() => {
                               setPeerJoinMode('invite')
                               setPeerFail(null)
-                              clearPeerAdvancedDrafts()
                             }}
                           >
                             {t('wizard.peer.modeInvite')}
@@ -2487,7 +2462,6 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                             onClick={() => {
                               setPeerJoinMode('gateway')
                               setPeerFail(null)
-                              clearPeerAdvancedDrafts()
                             }}
                           >
                             {t('wizard.peer.modeGateway')}
@@ -2503,6 +2477,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                                 className="zr-wizard-input"
                                 type="text"
                                 autoComplete="off"
+                                autoCorrect="off"
+                                autoCapitalize="none"
                                 spellCheck={false}
                                 placeholder={t('wizard.peer.inviteUriPlaceholder')}
                                 value={peerInvite}
@@ -2514,27 +2490,33 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                               />
                               <p className="zr-wizard-hint">{peerAdvOpen ? t('wizard.peer.inviteUriPausedHint') : t('wizard.peer.inviteUriHint')}</p>
                             </div>
-                            {/* PC-15: the advanced split-fill — a native
-                                <details> expander (keyboard-toggleable) whose
-                                fields assemble into the SAME invite payload.
-                                PC-15 fix1 R1: OPEN means these fields are the
-                                ONLY active input — opening clears the paste
-                                draft (the field above disables itself with a
-                                paused hint) and collapsing clears the advanced
-                                drafts (a reopened expander never shows the old
-                                masked passphrase); a FAILED join alone keeps
-                                the form. */}
+                            {/* PS-4a: native <details> expander whose split-fill
+                                drafts stay preserved across toggle, back-step,
+                                and tab switches (cleared only on modal close
+                                or join success); toggling open gently prefills
+                                empty split fields from an existing invite URI
+                                without clearing peerInvite. */}
                             <details
                               open={peerAdvOpen}
                               onToggle={(event) => {
                                 const next = event.currentTarget.open
                                 setPeerAdvOpen(next)
-                                if (next) {
-                                  setPeerInvite('')
-                                  if (peerFail !== null) setPeerFail(null)
-                                } else {
-                                  clearPeerAdvancedDrafts()
+                                if (next && peerAdvGateway === '' && peerAdvNetId === '' && peerAdvJoinKey === '') {
+                                  const match = /^zr-nets?(?:\+insecure)?:\/\/([^/?#]+)\/([0-9a-fA-F]{16})(?:#(.*))?$/i.exec(peerInvite.trim())
+                                  if (match !== null) {
+                                    setPeerAdvGateway(match[1] ?? '')
+                                    setPeerAdvNetId((match[2] ?? '').toLowerCase())
+                                    const rawKey = match[3]
+                                    if (rawKey !== undefined && rawKey !== '') {
+                                      try {
+                                        setPeerAdvJoinKey(decodeURIComponent(rawKey))
+                                      } catch {
+                                        setPeerAdvJoinKey(rawKey)
+                                      }
+                                    }
+                                  }
                                 }
+                                if (peerFail !== null) setPeerFail(null)
                               }}
                             >
                               <summary className="zr-wizard-linkBtn">{t('wizard.peer.advancedSummary')}</summary>
@@ -2546,6 +2528,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                                     className="zr-wizard-input"
                                     type="text"
                                     autoComplete="off"
+                                    autoCorrect="off"
+                                    autoCapitalize="none"
                                     spellCheck={false}
                                     placeholder={t('wizard.peer.advancedGatewayPlaceholder')}
                                     value={peerAdvGateway}
@@ -2564,6 +2548,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                                     className="zr-wizard-input"
                                     type="text"
                                     autoComplete="off"
+                                    autoCorrect="off"
+                                    autoCapitalize="none"
                                     spellCheck={false}
                                     placeholder={t('wizard.peer.advancedNetworkIdPlaceholder')}
                                     value={peerAdvNetId}
@@ -2603,6 +2589,8 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                                 className="zr-wizard-input"
                                 type="text"
                                 autoComplete="off"
+                                autoCorrect="off"
+                                autoCapitalize="none"
                                 spellCheck={false}
                                 placeholder={t('wizard.peer.gatewayUrlPlaceholder')}
                                 value={peerGatewayUrl}

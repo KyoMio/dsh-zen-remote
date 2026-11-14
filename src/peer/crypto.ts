@@ -446,6 +446,59 @@ export function buildKeylessInviteUri(params: {
   return `${scheme}://${params.rawHost}:${params.port}/${networkId}`
 }
 
+export type AssembleInviteErrorCode = 'bad-adv-gateway' | 'bad-adv-network-id' | 'bad-adv-join-key'
+
+/**
+ * Assemble a canonical `zr-net*://` invite URI from split advanced-form parts
+ * (`gatewayAddress` + `networkId` + optional verbatim `joinKey`), reusing
+ * `parseGatewayJoinInput` and `isLoopbackOrPrivateHostname` as the single
+ * source of truth. Leading/trailing whitespace in `joinKey` is preserved
+ * verbatim; lone UTF-16 surrogates are rejected locally as `bad-adv-join-key`.
+ */
+export function assembleInviteUri(input: {
+  gatewayAddress: string
+  networkId: string
+  joinKey?: string
+}): { ok: true; inviteUri: string } | { ok: false; code: AssembleInviteErrorCode } {
+  if (typeof input.gatewayAddress !== 'string') {
+    return { ok: false, code: 'bad-adv-gateway' }
+  }
+  const parsed = parseGatewayJoinInput(input.gatewayAddress)
+  if (parsed === null || parsed.kind !== 'gateway' || parsed.networkId !== undefined) {
+    return { ok: false, code: 'bad-adv-gateway' }
+  }
+  try {
+    // Reject grammar-valid authorities that still fail real URL construction (e.g. [aa], 999.168.1.10).
+    // eslint-disable-next-line no-new -- validation via URL constructor throw
+    new URL(`http://${parsed.rawHost}:${parsed.port}/`)
+  } catch {
+    return { ok: false, code: 'bad-adv-gateway' }
+  }
+
+  const networkId = typeof input.networkId === 'string' ? input.networkId.trim().toLowerCase() : ''
+  if (!/^[0-9a-f]{16}$/.test(networkId)) {
+    return { ok: false, code: 'bad-adv-network-id' }
+  }
+
+  if (input.joinKey !== undefined && typeof input.joinKey !== 'string') {
+    return { ok: false, code: 'bad-adv-join-key' }
+  }
+  const key = input.joinKey ?? ''
+  let fragment: string
+  try {
+    fragment = key === '' ? '' : `#${encodeURIComponent(key)}`
+  } catch {
+    return { ok: false, code: 'bad-adv-join-key' }
+  }
+
+  const scheme = parsed.schemeMode === 'https'
+    ? 'zr-nets'
+    : parsed.schemeMode === 'http'
+      ? (isLoopbackOrPrivateHostname(parsed.hostname) ? 'zr-net' : 'zr-net+insecure')
+      : 'zr-net'
+  return { ok: true, inviteUri: `${scheme}://${parsed.rawHost}:${parsed.port}/${networkId}${fragment}` }
+}
+
 // -- 3. gateway challenge + join-key proof -----------------------------------------
 
 const GATEWAY_AUTH_DOMAIN = 'zr-gw-auth-v1'

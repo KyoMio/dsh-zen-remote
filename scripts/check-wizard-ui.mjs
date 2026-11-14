@@ -18,6 +18,9 @@
 //
 // Run: node scripts/check-wizard-ui.mjs
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   caddyFailureCopy,
   configureReadiness,
@@ -40,7 +43,6 @@ import {
   WIZARD_TUNNEL_STATUS_ROUTE,
   WIZARD_TUNNEL_STOP_ROUTE,
   WIZARD_TUNNEL_TOKEN_ROUTE,
-  assemblePeerInviteUri,
   initialStep,
   isWizardConfigured,
   isValidHostname,
@@ -53,7 +55,6 @@ import {
   upstreamPortOf,
 } from '../src/client-data/wizard.ts'
 import { luckySteps, nginxSnippet, caddySnippet } from '../lib/wizard/proxy-snippets.js'
-import { parseInviteUri, parseGatewayJoinInput } from '../src/peer/crypto.ts'
 import { qrMatrix } from '../src/client-data/qr.ts'
 import {
   WIZARD_CF_TOKEN_ROUTE as HOST_CF_TOKEN_ROUTE,
@@ -981,181 +982,17 @@ await test('targetHostSaveRole: the channel-config save keeps a peer a peer (PG-
   assert.equal(targetHostSaveRole(true), 'peer')
 })
 
-// ---- the advanced split-fill's invite assembler (PC-15) -----------------------
-//
-// The browser half cannot import src/peer/crypto.ts (node:crypto), so
-// client-data/wizard.ts carries a mirror assembler. These tests ARE the
-// drift guard: every positive sample must round-trip through the REAL
-// parseInviteUri — the same function the join route's invite branch feeds
-// engine.joinNetwork with — so an assembled invite behaves byte-for-byte
-// like a pasted one (keyless = the existing manual-approval flow).
+// ---- PS-4a: backend invite assembly & wizard draft preservation -------------
 
-await test('assemblePeerInviteUri: positive samples round-trip through the REAL parser (PC-15)', () => {
-  // Bare host: default peer port 19393, plain zr-net lets the parser infer
-  // the transport from the host (public → TLS).
-  const bare = assemblePeerInviteUri({ gatewayAddress: 'gw.example.com', networkId: '0123456789ABCDEF' })
-  assert.deepEqual(bare, { ok: true, inviteUri: 'zr-net://gw.example.com:19393/0123456789abcdef' })
-  const bareParsed = parseInviteUri(bare.inviteUri)
-  assert.ok(bareParsed !== null)
-  assert.equal(bareParsed.hostname, 'gw.example.com')
-  assert.equal(bareParsed.port, 19393)
-  assert.equal(bareParsed.networkId, '0123456789abcdef')
-  assert.equal(bareParsed.joinKey, undefined)
-  assert.equal(bareParsed.defaultTls, true, 'a public host infers TLS — the peer invite rule')
-
-  // host:port, private v4: the parser infers plaintext.
-  const lan = assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef' })
-  assert.equal(lan.inviteUri, 'zr-net://10.0.0.1:4088/0123456789abcdef')
-  assert.equal(parseInviteUri(lan.inviteUri)?.defaultTls, false, 'a private host infers plaintext')
-
-  // Explicit https/wss force TLS on any host.
-  for (const address of ['https://zr.example.com', 'wss://zr.example.com:8443']) {
-    const tls = assemblePeerInviteUri({ gatewayAddress: address, networkId: '0123456789abcdef' })
-    assert.equal(tls.ok, true, address)
-    const parsed = parseInviteUri(tls.inviteUri)
-    assert.equal(parsed?.defaultTls, true, address)
-    assert.equal(parsed?.port, address.includes('8443') ? 8443 : 443, address)
-  }
-
-  // Explicit public http/ws keep the peer rule's plaintext support (this is
-  // NOT the host/client pairing rule, which refuses plain http outright).
-  for (const address of ['http://zr.example.com:19393', 'ws://zr.example.com']) {
-    const plain = assemblePeerInviteUri({ gatewayAddress: address, networkId: '0123456789abcdef' })
-    assert.equal(plain.ok, true, address)
-    const parsed = parseInviteUri(plain.inviteUri)
-    assert.equal(parsed?.defaultTls, false, address)
-    assert.ok(plain.inviteUri.startsWith('zr-net+insecure://') || plain.inviteUri.startsWith('zr-net://'), address)
-  }
-
-  // Bracketed IPv6 (ULA → plaintext via inference), hostname lowercased.
-  const v6 = assemblePeerInviteUri({ gatewayAddress: '[FD00::1]:19393', networkId: '0123456789abcdef' })
-  assert.equal(v6.inviteUri, 'zr-net://[FD00::1]:19393/0123456789abcdef')
-  const v6Parsed = parseInviteUri(v6.inviteUri)
-  assert.equal(v6Parsed?.hostname, 'fd00::1')
-  assert.equal(v6Parsed?.defaultTls, false, 'an IPv6 ULA infers plaintext')
-
-  // A trailing slash and the console SPA path both fold away. The host is
-  // PRIVATE here, so the explicit-plain scheme table lands on plain `zr-net`
-  // (the same scheme buildKeylessInviteUri picks for a private plaintext
-  // gateway) — zr-net+insecure is the PUBLIC-plaintext scheme.
-  for (const address of ['http://10.0.0.1:4088/', 'http://10.0.0.1:4088/peer/v1/ws']) {
-    const folded = assemblePeerInviteUri({ gatewayAddress: address, networkId: '0123456789abcdef' })
-    assert.equal(folded.ok, true, address)
-    assert.equal(folded.inviteUri, 'zr-net://10.0.0.1:4088/0123456789abcdef', address)
-  }
-  // The public-plaintext invite (an explicit http:// PUBLIC host): the one
-  // case that needs the zr-net+insecure scheme.
-  const publicPlain = assemblePeerInviteUri({ gatewayAddress: 'http://gw.example.com:19393/', networkId: '0123456789abcdef' })
-  assert.equal(publicPlain.inviteUri, 'zr-net+insecure://gw.example.com:19393/0123456789abcdef')
-  assert.equal(parseInviteUri(publicPlain.inviteUri)?.defaultTls, false)
-
-  // The passphrase: percent-encoded into the fragment, decoded EXACTLY back,
-  // never trimmed — every character the user typed is meaningful.
-  const keyed = assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 'p@ss word%#中文' })
-  assert.ok(keyed.ok)
-  assert.ok(keyed.inviteUri.includes('#'), 'a join key rides the fragment')
-  assert.ok(!keyed.inviteUri.includes('p@ss word'), 'the raw key never appears in the URI')
-  assert.equal(parseInviteUri(keyed.inviteUri)?.joinKey, 'p@ss word%#中文')
-  const padded = assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: ' padded ' })
-  assert.equal(parseInviteUri(padded.inviteUri)?.joinKey, ' padded ', 'leading/trailing spaces are kept')
-
-  // An empty-string key means NO key — byte-equivalent to the keyless invite
-  // the route's manual-approval path synthesizes for the same gateway.
-  const keyless = assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: '' })
-  assert.equal(keyless.inviteUri, 'zr-net://10.0.0.1:4088/0123456789abcdef')
-  assert.equal(parseInviteUri(keyless.inviteUri)?.joinKey, undefined)
-})
-
-await test('assemblePeerInviteUri: local refusals — a malformed part never reaches a request (PC-15)', () => {
-  // Bad gateway addresses (each of these the REAL parser would also refuse).
-  for (const bad of ['', '   ', 'a b', 'host:', 'host:0', 'host:65536', 'host:abc', '::1', '[fd00::1', 'ftp://x', 'host/?x=1', 'host/#frag']) {
-    assert.deepEqual(
-      assemblePeerInviteUri({ gatewayAddress: bad, networkId: '0123456789abcdef' }),
-      { ok: false, error: 'bad-adv-gateway' },
-      bad,
-    )
-  }
-  // The gateway is checked first (it is the form's first field).
-  assert.equal(
-    assemblePeerInviteUri({ gatewayAddress: 'a b', networkId: 'nothex' }).error,
-    'bad-adv-gateway',
-  )
-  // Bad network IDs: wrong length, non-hex, hex-prefix junk.
-  for (const bad of ['', 'short', '0123456789abcdef0', 'zz23456789abcdef', '0x123456789abcde', '0123456789abcde ']) {
-    assert.deepEqual(
-      assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: bad }),
-      { ok: false, error: 'bad-adv-network-id' },
-      JSON.stringify(bad),
-    )
-  }
-  // The one ambiguity the parser tolerates by design (an explicit empty port
-  // is malformed, never guessed).
-  assert.deepEqual(
-    assemblePeerInviteUri({ gatewayAddress: 'host:/id', networkId: '0123456789abcdef' }),
-    { ok: false, error: 'bad-adv-gateway' },
-  )
-  // And the assembled invite parses as an INVITE for the join route's own
-  // gateway-input classifier (never misread as a gateway address).
-  const ok = assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef' })
-  assert.equal(parseGatewayJoinInput(ok.inviteUri)?.kind, 'invite')
-})
-
-await test('assemblePeerInviteUri: a shape-valid authority must still build a REAL URL (PC-15 fix1 R2)', () => {
-  // `[aa]` passes the bracketed-IPv6 CHARACTERS check but is not a valid
-  // IPv6 literal; the same for IPv4 octets over 255. The REAL parser accepts
-  // most of these BY SHAPE too (only `[::zz]` has a character outside the
-  // set) — that is exactly why the grammar alone is not enough and the
-  // assembler adds one standard-URL construction (no network): a refused
-  // address never becomes an unusable dial target.
-  for (const bad of ['[aa]:19393', '[::zz]:19393', '[1.2.3.4]:19393', '999.168.1.10:19393', '10.0.0.256:19393']) {
-    assert.deepEqual(
-      assemblePeerInviteUri({ gatewayAddress: bad, networkId: '0123456789abcdef' }),
-      { ok: false, error: 'bad-adv-gateway' },
-      bad,
-    )
-  }
-  assert.equal(parseInviteUri('zr-net://[::zz]:19393/0123456789abcdef'), null, 'a non-hex IPv6 literal the real parser refuses')
-  for (const shapeOk of ['[aa]:19393', '999.168.1.10:19393']) {
-    assert.notEqual(
-      parseInviteUri(`zr-net://${shapeOk}/0123456789abcdef`), null,
-      `${shapeOk}: the real parser passes the SHAPE — the assembler must be the stricter gate`,
-    )
-  }
-  // Less-than-4-part IPv4-ish names stay accepted (existing semantics —
-  // the peer grammar always allowed them and the engine dials rawHost).
-  assert.equal(assemblePeerInviteUri({ gatewayAddress: '1.2.3:19393', networkId: '0123456789abcdef' }).ok, true)
-
-  // Usability, not just parser acceptance: the assembled authority must
-  // construct as BOTH a gateway ws URL and an http origin — the two URL
-  // shapes the peer engine and manual-approval path actually dial.
-  for (const sample of [
-    assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef' }),
-    assemblePeerInviteUri({ gatewayAddress: 'gw.example.com', networkId: '0123456789abcdef' }),
-    assemblePeerInviteUri({ gatewayAddress: '[FD00::1]:19393', networkId: '0123456789abcdef' }),
-    assemblePeerInviteUri({ gatewayAddress: 'https://zr.example.com', networkId: '0123456789abcdef' }),
-  ]) {
-    assert.equal(sample.ok, true)
-    const authority = sample.inviteUri.slice(sample.inviteUri.indexOf('://') + 3).split('/')[0]
-    assert.doesNotThrow(() => new URL(`ws://${authority}`), authority)
-    assert.doesNotThrow(() => new URL(`http://${authority}`), authority)
-  }
-})
-
-await test('assemblePeerInviteUri: an unencodable passphrase is a LOCAL refusal, not a crash (PC-15 fix1 R3)', () => {
-  // A lone UTF-16 surrogate makes encodeURIComponent throw URIError; the
-  // assembler must answer a refusal (the component shows its copy) instead
-  // of throwing unhandled before the request try — and must NOT rewrite or
-  // echo the secret.
-  assert.deepEqual(
-    assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 'ok\uD800lone' }),
-    { ok: false, error: 'bad-adv-join-key' },
-  )
-  // The refusal never leaks the key material — the error is the static code.
-  const refused = assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: '\uD800' })
-  assert.equal(JSON.stringify(refused).includes('uD800'), false)
-  // Encodable passphrases (incl. surrogate PAIRS — real emoji) still work.
-  const emoji = assemblePeerInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 'pass 🔑 word' })
-  assert.equal(parseInviteUri(emoji.inviteUri)?.joinKey, 'pass 🔑 word')
+await test('PS-4a: client-data/wizard.ts no longer duplicates invite parsing/assembly', () => {
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const wizardDataSrc = fs.readFileSync(path.join(here, '..', 'src', 'client-data', 'wizard.ts'), 'utf8')
+  const wizardUiSrc = fs.readFileSync(path.join(here, '..', 'src', 'client', 'wizard', 'GatewayWizard.tsx'), 'utf8')
+  assert.equal(wizardDataSrc.includes('assemblePeerInviteUri'), false)
+  assert.equal(wizardDataSrc.includes('peerAdvGatewayOf'), false)
+  assert.equal(wizardUiSrc.includes("mode: 'advanced'"), true)
+  const calls = wizardUiSrc.match(/clearPeerAdvancedDrafts\(/g) ?? []
+  assert.equal(calls.length, 2, 'drafts clear only on modal close and join success')
 })
 
 // PC-11b: the pre-11a capacity wording is retired — the count mixed the

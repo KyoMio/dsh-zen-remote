@@ -3599,3 +3599,46 @@ test('PS-2: identity-error exposes sanitized peer/status and answers 503 identit
     await closeServer(server)
   }
 })
+
+test('PS-4a peer join mode=advanced: assembles invite server-side and returns typed 400 errors on bad fields', async () => {
+  const { engine, calls } = makePeerEngine()
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    // Valid split fields with leading/trailing spaces preserved in joinKey.
+    const keyed = await request(port, {
+      method: 'POST',
+      path: PEER_JOIN_PATH,
+      headers: sameOrigin(port),
+      body: { mode: 'advanced', gatewayAddress: '10.0.0.1:4088', networkId: '0123456789ABCDEF', joinKey: ' padded key ' },
+    })
+    assert.equal(keyed.status, 200)
+    assert.deepEqual(JSON.parse(keyed.body), { ok: true })
+    assert.deepEqual(calls.pop(), ['join', 'zr-net://10.0.0.1:4088/0123456789abcdef#%20padded%20key%20'])
+
+    // Valid keyless manual-approval split fields.
+    const keyless = await request(port, {
+      method: 'POST',
+      path: PEER_JOIN_PATH,
+      headers: sameOrigin(port),
+      body: { mode: 'advanced', gatewayAddress: 'gw.example.com', networkId: '0123456789abcdef' },
+    })
+    assert.equal(keyless.status, 200)
+    assert.deepEqual(calls.pop(), ['join', 'zr-net://gw.example.com:19393/0123456789abcdef'])
+
+    // Invalid gateway / networkId / lone surrogate joinKey return 400 with exact codes and zero engine calls.
+    for (const [body, expectedCode] of [
+      [{ mode: 'advanced', gatewayAddress: 'bad host', networkId: '0123456789abcdef' }, 'bad-adv-gateway'],
+      [{ mode: 'advanced', gatewayAddress: 123, networkId: '0123456789abcdef' }, 'bad-adv-gateway'],
+      [{ mode: 'advanced', gatewayAddress: '10.0.0.1:4088', networkId: 'short' }, 'bad-adv-network-id'],
+      [{ mode: 'advanced', gatewayAddress: '10.0.0.1:4088', networkId: null }, 'bad-adv-network-id'],
+      [{ mode: 'advanced', gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 42 }, 'bad-adv-join-key'],
+    ]) {
+      const res = await request(port, { method: 'POST', path: PEER_JOIN_PATH, headers: sameOrigin(port), body })
+      assert.equal(res.status, 400, expectedCode)
+      assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: expectedCode } }, expectedCode)
+    }
+    assert.equal(calls.length, 0)
+  } finally {
+    await closeServer(server)
+  }
+})
