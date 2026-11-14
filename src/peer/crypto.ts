@@ -554,7 +554,7 @@ export function verifyJoinKeyProof(params: {
 
 // -- 4. PFS handshake + dual-simplex AEAD ------------------------------------------
 
-const PEER_HS_DOMAIN = 'zr-peer-hs-v1'
+const PEER_HS_DOMAIN = 'zr-peer-hs-v2'
 /** HKDF salt carries the canonical (low,high) node pair + their ephemeral keys; info splits the output. */
 const PEER_KDF_SALT_DOMAIN = 'zr-peer-kdf-v1'
 const PEER_KDF_INFO = Buffer.from('zr-peer-txrx-v1', 'utf8')
@@ -611,6 +611,7 @@ export interface PeerHandshakeMessageParams {
   dstNodeId: string
   srcEphPubHex: string
   dstEphPubHex: string
+  nonce: string
   timestamp: number
 }
 
@@ -625,9 +626,10 @@ function peerHandshakeMessage(params: PeerHandshakeMessageParams): Buffer {
   // `hello` carries the all-zero placeholder before the peer's ephemeral
   // key is known; it is an ordinary hex field here, not a special case.
   const dstEphPubHex = requireHex(params.dstEphPubHex, 32, 'dstEphPubHex')
+  const nonce = requireHex(params.nonce, 8, 'nonce')
   const timestamp = requireTimestamp(params.timestamp, 'timestamp')
   return Buffer.from(
-    `${PEER_HS_DOMAIN}|${params.role}|${networkId}|${srcNodeId}|${dstNodeId}|${srcEphPubHex}|${dstEphPubHex}|${timestamp}`,
+    `${PEER_HS_DOMAIN}|${params.role}|${networkId}|${srcNodeId}|${dstNodeId}|${srcEphPubHex}|${dstEphPubHex}|${nonce}|${timestamp}`,
     'utf8',
   )
 }
@@ -635,8 +637,8 @@ function peerHandshakeMessage(params: PeerHandshakeMessageParams): Buffer {
 /**
  * Sign one peer handshake message (hello or ack) with the long-term
  * identity, binding it to the network, both node ids, BOTH ephemeral
- * public keys and the timestamp — a replayed or substituted ephemeral
- * key breaks the signature.
+ * public keys, the challenge nonce and the timestamp — a replayed or
+ * substituted ephemeral key or nonce breaks the signature.
  */
 export function signPeerHandshake(params: PeerHandshakeMessageParams & {
   identityPrivateKeyHex: string
@@ -835,48 +837,15 @@ export function derivePeerSessionCiphers(params: {
   }
 }
 
-// -- 5. handshake envelope contract: dual-signature transition (PC-12) -------------
+// -- 5. handshake envelope contract (zr-peer-hs-v2) --------------------------------
 //
-// UDP 打洞（punch.ts）与网关 WS 中转（mux.ts）共用这一份握手信封契约：新端
-// 发出的每个 HELLO/ACK 同时携带旧域签名（sigHex，`zr-punch-v1` 串逐字节兼容，
-// 保旧端互通）与 v2 完整绑定签名（sig2Hex，`zr-peer-hs-v1`，绑双方 nodeId、
-// 双方临时钥、网络、时间与角色）。这是机会性升级：只有对端也发 dual 信封，
-// v2 完整绑定才成立；v1 档是「旧协议互通保障」，不冒充完整绑定。
-
-/** 旧握手控制包的域分隔前缀（原 punch.ts 的 PUNCH_DOMAIN，下沉至此供两路径共用）。 */
-export const PEER_PUNCH_V1_DOMAIN = 'zr-punch-v1'
+// UDP 打洞（punch.ts）与网关 WS 中转（mux.ts）共用这一份 v2 握手信封契约：
+// 每个 HELLO/ACK 只发单一签名 `sigHex`（`zr-peer-hs-v2`，绑定角色、网络、
+// 双方 nodeId、双方临时钥、挑战 nonce 与时间戳），线上传输零未签名字段，绝不
+// 降级旧版。
 
 /** HELLO 里「应答方临时钥未知」的显式占位：64 个 '0'，是 v2 串中的普通 hex 字段。 */
 export const PEER_HS_ZERO_EPH_PUB = '0'.repeat(64)
-
-export interface PeerPunchV1MessageParams {
-  role: 'hello' | 'ack'
-  networkId: string
-  nodeId: string
-  ephPubHex: string
-  nonce: string
-  timestamp: number
-}
-
-/**
- * 旧 `zr-punch-v1` 签名串的唯一构造点（PC-12：原先 punch.ts/mux.ts 各自手拼的
- * 四份模板收敛于此）。字段值**原样**进入字符串——旧端验证是「写法敏感」的
- * 历史契约，这里保持逐字节兼容，不做大小写规范化。
- */
-export function peerPunchV1Message(params: PeerPunchV1MessageParams): Buffer {
-  if (params.role !== 'hello' && params.role !== 'ack') {
-    throw new TypeError(`role must be 'hello' or 'ack', got ${String(params.role)}`)
-  }
-  if (typeof params.networkId !== 'string' || typeof params.nodeId !== 'string'
-    || typeof params.ephPubHex !== 'string' || typeof params.nonce !== 'string'
-    || typeof params.timestamp !== 'number' || !Number.isInteger(params.timestamp)) {
-    throw new TypeError('peerPunchV1Message requires string fields and an integer timestamp')
-  }
-  return Buffer.from(
-    `${PEER_PUNCH_V1_DOMAIN}|${params.role}|${params.networkId}|${params.nodeId}|${params.ephPubHex}|${params.nonce}|${params.timestamp}`,
-    'utf8',
-  )
-}
 
 export interface PeerHandshakeEnvelopeParams {
   kind: 'hello' | 'ack'
@@ -896,9 +865,8 @@ export interface PeerHandshakeEnvelopeParams {
 }
 
 /**
- * 构造一个 dual 握手信封（HELLO/ACK 通吃）：全部 v1 字段与旧值一字不差，
- * 附加 `hs`（纯信息标记，不作任何判定依据）、`peerNodeId`、`peerEphPubHex`
- * 与 `sig2Hex`。旧端按 v1 半部照常互通；新端按 v2 半部建立完整绑定。
+ * 构造 v2 握手信封（HELLO/ACK 通吃）：全部字段纳入 `zr-peer-hs-v2` 单一签名
+ * `sigHex`，并带 `hs: 2` 版本标记。
  */
 export function buildPeerHandshakeEnvelope(params: PeerHandshakeEnvelopeParams): Buffer {
   if (params.kind !== 'hello' && params.kind !== 'ack') {
@@ -931,15 +899,14 @@ export function buildPeerHandshakeEnvelope(params: PeerHandshakeEnvelopeParams):
       throw new TypeError('ack peerEphPubHex must be a real ephemeral key, not the zero placeholder')
     }
   }
-  const v1Message = peerPunchV1Message({ role: params.kind, networkId, nodeId, ephPubHex: selfEphPubHex, nonce, timestamp })
-  const sigHex = sign(null, v1Message, ed25519PrivateFromRaw(publicKeyHex, privateKeyHex)).toString('hex')
-  const sig2Hex = signPeerHandshake({
+  const sigHex = signPeerHandshake({
     role: params.kind,
     networkId,
     srcNodeId: nodeId,
     dstNodeId: peerNodeId,
     srcEphPubHex: selfEphPubHex,
     dstEphPubHex: peerEphPubHex,
+    nonce,
     timestamp,
     identityPrivateKeyHex: privateKeyHex,
     identityPublicKeyHex: publicKeyHex,
@@ -957,7 +924,6 @@ export function buildPeerHandshakeEnvelope(params: PeerHandshakeEnvelopeParams):
     nonce,
     timestamp,
     sigHex,
-    sig2Hex,
   }), 'utf8')
 }
 
@@ -969,44 +935,38 @@ export interface PeerHandshakeEnvelopeParseOptions {
   nowMs: number
   /**
    * 时间戳新鲜度窗半宽（毫秒）。WS 中转路径传 30_000（既有值不变）；UDP 打洞
-   * 路径传 0 = 不检查新鲜度（PC-12 用户裁定：UDP 保持现状、不新增时间窗）。
+   * 路径传 0 = 不检查新鲜度（timestamp 只进签名）。
    */
   timeWindowMs: number
 }
 
 export interface ParsedPeerHandshakeEnvelope {
-  /**
-   * `'v2'` = 新证明字段完整且验签通过（完整绑定成立）；`'v1'` = 真正不含任何
-   * 新证明字段的旧格式（旧协议互通保障，**不是**完整绑定）。
-   */
-  contract: 'v1' | 'v2'
   kind: 'hello' | 'ack'
   networkId: string
   /** 发送方 nodeId（小写化；自证明绑定已核验）。 */
   nodeId: string
-  /** 发送方长期 Ed25519 公钥（原样）。 */
+  /** 发送方长期 Ed25519 公钥（小写化）。 */
   publicKeyHex: string
-  /** 发送方一次性 X25519 公钥（原样；v1 串按写法敏感的历史契约核验）。 */
+  /** 发送方一次性 X25519 公钥（小写化）。 */
   ephPubHex: string
+  /** 16 位挑战 nonce（小写化）。 */
   nonce: string
   timestamp: number
-  /** v2 专有：指名对象（恒等于接收方本机 nodeId）；v1 为 null。 */
-  peerNodeId: string | null
-  /** v2 专有：HELLO 的零占位 / ACK 回绑的发起方临时钥（小写化）；v1 为 null。 */
-  peerEphPubHex: string | null
+  /** 指名对象（恒等于接收方本机 nodeId，小写化）。 */
+  peerNodeId: string
+  /** HELLO 的零占位 / ACK 回绑的发起方临时钥（小写化）。 */
+  peerEphPubHex: string
 }
 
 const ENVELOPE_HEX64 = /^[0-9a-fA-F]{64}$/
 const ENVELOPE_HEX16 = /^[0-9a-fA-F]{16}$/
 const ENVELOPE_HEX128 = /^[0-9a-fA-F]{128}$/
-const ENVELOPE_LOWER_HEX64 = /^[0-9a-f]{64}$/
 
 /**
- * 解析并验证一个握手信封（UDP 数据报与 WS 中转帧共用；WS 侧补零在函数内
- * 剥除）。返回 null 的情形：JSON/形状坏、networkId 不符、自源信封、nodeId
- * 非自证明、时间窗外（仅当 `timeWindowMs > 0`）、v1 签名无效，以及 **任何
- * 新证明字段在场却不完整/形状错/验签失败**——最后这类按正常验证失败处理，
- * 绝不回退 v1（PC-12 用户裁定）。从不抛异常。
+ * 解析并验证一个 v2 握手信封（UDP 数据报与 WS 中转帧共用；WS 侧补零在函数内
+ * 剥除）。返回 null 的情形：JSON/形状坏、缺 `hs: 2`、networkId 不符、自源或
+ * 非指名本机、nodeId 非自证明、HELLO/ACK 对端临时钥占位不符、时间窗外（仅当
+ * `timeWindowMs > 0`），或 `zr-peer-hs-v2` 验签失败——绝不降级。从不抛异常。
  */
 export function parsePeerHandshakeEnvelope(
   bytes: Uint8Array,
@@ -1017,67 +977,43 @@ export function parsePeerHandshakeEnvelope(
     const obj: unknown = JSON.parse(text)
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null
     const fields = obj as Record<string, unknown>
-    if (fields.zr !== 1) return null
+    if (fields.zr !== 1 || fields.hs !== 2) return null
     const kind = fields.kind === 'zr-hello' ? 'hello' as const : fields.kind === 'zr-hello-ack' ? 'ack' as const : null
     if (kind === null) return null
     if (fields.networkId !== options.networkId) return null
     const nodeId = typeof fields.nodeId === 'string' ? fields.nodeId.toLowerCase() : ''
     if (!NODE_ID_PATTERN.test(nodeId) || nodeId === options.selfNodeId) return null
-    const publicKeyHex = typeof fields.publicKeyHex === 'string' ? fields.publicKeyHex : ''
-    const ephPubHex = typeof fields.ephPubHex === 'string' ? fields.ephPubHex : ''
-    const nonce = typeof fields.nonce === 'string' ? fields.nonce : ''
+    const publicKeyHex = typeof fields.publicKeyHex === 'string' ? fields.publicKeyHex.toLowerCase() : ''
+    const ephPubHex = typeof fields.ephPubHex === 'string' ? fields.ephPubHex.toLowerCase() : ''
+    const nonce = typeof fields.nonce === 'string' ? fields.nonce.toLowerCase() : ''
+    const peerNodeId = typeof fields.peerNodeId === 'string' ? fields.peerNodeId.toLowerCase() : ''
+    const peerEphPubHex = typeof fields.peerEphPubHex === 'string' ? fields.peerEphPubHex.toLowerCase() : ''
     const timestamp = typeof fields.timestamp === 'number' ? fields.timestamp : Number.NaN
     const sigHex = typeof fields.sigHex === 'string' ? fields.sigHex : ''
     if (!ENVELOPE_HEX64.test(publicKeyHex) || !ENVELOPE_HEX64.test(ephPubHex)
-      || !ENVELOPE_HEX16.test(nonce) || !Number.isInteger(timestamp) || !ENVELOPE_HEX128.test(sigHex)) return null
-    if (!verifySelfCertifyingNodeId(nodeId, publicKeyHex)) return null
-    if (options.timeWindowMs > 0 && Math.abs(options.nowMs - timestamp) > options.timeWindowMs) return null
-    // 旧签名是过渡期一切信封的必要条件；串按历史契约以原样字段值构造。
-    const v1Message = peerPunchV1Message({ role: kind, networkId: options.networkId, nodeId, ephPubHex, nonce, timestamp })
-    if (!verify(null, v1Message, ed25519PublicFromRaw(publicKeyHex), Buffer.from(sigHex, 'hex'))) return null
-
-    // 新证明字段的在场判定：`hs`/`peerNodeId`/`peerEphPubHex`/`sig2Hex` 任何一个
-    // 出现即按新信封处理——必须完整、形状正确且 v2 验签通过。单独 `hs` 声明
-    // 不是可信能力依据；不完整的新信封也不当旧端（PC-12 用户裁定）。
-    const hasNewProof = fields.hs !== undefined || fields.peerNodeId !== undefined
-      || fields.peerEphPubHex !== undefined || fields.sig2Hex !== undefined
-    if (!hasNewProof) {
-      return {
-        contract: 'v1',
-        kind,
-        networkId: options.networkId,
-        nodeId,
-        publicKeyHex,
-        ephPubHex,
-        nonce,
-        timestamp,
-        peerNodeId: null,
-        peerEphPubHex: null,
-      }
-    }
-    const peerNodeId = typeof fields.peerNodeId === 'string' ? fields.peerNodeId.toLowerCase() : ''
-    const peerEphPubHex = typeof fields.peerEphPubHex === 'string' ? fields.peerEphPubHex.toLowerCase() : ''
-    const sig2Hex = typeof fields.sig2Hex === 'string' ? fields.sig2Hex : ''
-    if (!NODE_ID_PATTERN.test(peerNodeId) || !ENVELOPE_LOWER_HEX64.test(peerEphPubHex)) return null
-    // v2 信封的指名对象必须是本机；HELLO 的对端临时钥必须是显式零占位，
-    // ACK 必须回绑一个真实临时钥。任一不一致都是验证失败，不降档。
+      || !ENVELOPE_HEX16.test(nonce) || !NODE_ID_PATTERN.test(peerNodeId)
+      || !ENVELOPE_HEX64.test(peerEphPubHex) || !Number.isInteger(timestamp)
+      || !ENVELOPE_HEX128.test(sigHex)) return null
     if (peerNodeId !== options.selfNodeId) return null
+    if (ephPubHex === PEER_HS_ZERO_EPH_PUB) return null
     if (kind === 'hello' && peerEphPubHex !== PEER_HS_ZERO_EPH_PUB) return null
     if (kind === 'ack' && peerEphPubHex === PEER_HS_ZERO_EPH_PUB) return null
-    const v2Verified = verifyPeerHandshake({
+    if (!verifySelfCertifyingNodeId(nodeId, publicKeyHex)) return null
+    if (options.timeWindowMs > 0 && Math.abs(options.nowMs - timestamp) > options.timeWindowMs) return null
+    const verified = verifyPeerHandshake({
       role: kind,
       networkId: options.networkId,
       srcNodeId: nodeId,
       dstNodeId: peerNodeId,
       srcEphPubHex: ephPubHex,
       dstEphPubHex: peerEphPubHex,
+      nonce,
       timestamp,
       identityPublicKeyHex: publicKeyHex,
-      signatureHex: sig2Hex,
+      signatureHex: sigHex,
     })
-    if (!v2Verified) return null
+    if (!verified) return null
     return {
-      contract: 'v2',
       kind,
       networkId: options.networkId,
       nodeId,

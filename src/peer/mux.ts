@@ -17,7 +17,7 @@
  * 新握手尚未完成的瞬态里，底层发送可能未就绪：这里**捕获并丢弃该次发送**，
  * 由 ARQ 重传定时器在路径恢复后自动补发，绝不让同步抛错崩掉流。
  *
- * 网关中转握手沿用 UDP 路径的同一套已签名 `zr-punch-v1` hello/ack JSON，
+ * 网关中转握手沿用 UDP 路径的同一套已签名 `zr-peer-hs-v2` hello/ack JSON，
  * 外面套 28B 路由头（`HELLO`，streamId 0，明文载荷）让网关能路由而无需解密。
  * DATA/SACK/ACK/RST/PING/PONG 永远走密封载荷——`(HELLO, streamId 0)` 形态因此
  * 无歧义。载荷不足 44B（网关中转的最小帧）时补零，接收侧剥掉。
@@ -126,8 +126,6 @@ interface MuxSession {
   myEph: PeerEphemeralKeyPair | null
   nonce: string | null
   peerEphPubHex: string | null
-  /** 本轮中转握手已达成的契约档位（内部诊断；`hsBound` 不是完整绑定以外的任何承诺）。 */
-  hsBound: 'v1' | 'v2' | null
   /** WS 密封帧的 AEAD 序列——每会话一个计数器，永不回绕复用。 */
   seq: bigint
   /** 明文 envelope 头的序列（只需唯一）。 */
@@ -201,7 +199,6 @@ export class PeerMux {
       myEph: null,
       nonce: null,
       peerEphPubHex: null,
-      hsBound: null,
       seq: 0n,
       envelopeSeq: 0n,
       arq: new PeerArqSession({
@@ -337,7 +334,7 @@ export class PeerMux {
 
   /**
    * 网关 WS 中转的一个二进制帧。两种形态：
-   *  - (HELLO, streamId 0)：明文 `zr-punch-v1` 控制信封——WS 中转握手的半边；
+   *  - (HELLO, streamId 0)：明文 `zr-peer-hs-v2` 控制信封——WS 中转握手的半边；
    *  - 其余：中转握手密码器密封的帧，在这里开封。
    */
   handleGatewayFrame(bytes: Uint8Array): void {
@@ -531,7 +528,7 @@ export class PeerMux {
     throw new Error(`no path ready for peer ${session.nodeId}`)
   }
 
-  // ---- 网关中转握手（zr-punch-v1 hello/ack 明文信封） -----------------
+  // ---- 网关中转握手（zr-peer-hs-v2 hello/ack 明文信封） ---------------
 
   private beginHello(session: MuxSession): void {
     if (session.closed || this.closed) return
@@ -559,7 +556,7 @@ export class PeerMux {
     }
   }
 
-  /** `28B 头（HELLO, streamId 0）+ dual 握手信封 JSON`，网关原样路由（只读路由头）。 */
+  /** `28B 头（HELLO, streamId 0）+ v2 握手信封 JSON`，网关原样路由（只读路由头）。 */
   private sendHelloEnvelope(session: MuxSession): void {
     const myEph = session.myEph
     const nonce = session.nonce
@@ -624,21 +621,18 @@ export class PeerMux {
     if (parsed.nodeId !== session.nodeId || parsed.publicKeyHex !== session.peerPublicKeyHex) return
 
     if (parsed.kind === 'hello') {
-      session.hsBound = parsed.contract
       // 先应答——对端正等着 ack 完成握手。
       ensureMyEphemeral(session)
       this.sendHelloAckEnvelope(session, parsed.nonce, parsed.ephPubHex)
       // HELLO is replayable within its TTL. Only a fresh challenge response
-      // may replace the working key; keep our DH key stable for old peers.
+      // may replace the working key; keep our DH key stable when unchanged.
       if (session.peerEphPubHex !== parsed.ephPubHex || session.ciphers === null) this.beginHello(session)
       return
     }
     // 回显 nonce 把 ack 绑定到我们在途的那一轮 hello。
     if (session.nonce === null || parsed.nonce !== session.nonce) return
-    // v2 档纵深复核：回绑的 dstEph 必须是本机当前在途临时钥（v2 签名已覆盖，
-    // 复核零成本）。v1 档沿旧语义采信（nonce 回显 + 锚定公钥 + TTL）。
-    if (parsed.contract === 'v2' && (session.myEph === null || parsed.peerEphPubHex !== session.myEph.publicKeyHex)) return
-    session.hsBound = parsed.contract
+    // 回绑的 dstEph 必须是本机当前在途临时钥（v2 签名已覆盖，复核零成本）。
+    if (session.myEph === null || parsed.peerEphPubHex !== session.myEph.publicKeyHex) return
     this.integratePeerEphemeral(session, parsed.ephPubHex)
   }
 
@@ -669,8 +663,7 @@ export class PeerMux {
     session.ciphers = ciphers
     session.nonce = null // consume only after successful derivation
     this.clearHelloTimer(session)
-    // PC-12：契约档位只标注在正常日志（v1 档是旧协议互通保障，不冒充完整绑定）。
-    this.options.log?.(`mux: relay handshake complete for ${session.nodeId} (path=${session.path}, hs=${session.hsBound ?? 'v1'})`)
+    this.options.log?.(`mux: relay handshake complete for ${session.nodeId} (path=${session.path}, hs=v2)`)
     if (session.path === 'none') {
       session.path = 'ws'
       session.arq.flushInflight()
