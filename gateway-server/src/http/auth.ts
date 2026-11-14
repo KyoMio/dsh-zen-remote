@@ -20,7 +20,7 @@ import { sendMail } from '../mail/smtp-client.js';
 import type { SmtpSecurityMode } from '../mail/smtp-client.js';
 import { renderOtpEmail } from '../mail/templates.js';
 import type { MailLocale } from '../mail/templates.js';
-import { StoreError } from '../store/types.js';
+import { StoreError, constantTimeEqualText, DEFAULT_GROUP_ID } from '../store/types.js';
 import type {
   AdmissionMode,
   EmailOtpPurpose,
@@ -47,9 +47,26 @@ export class ApiError extends Error {
   }
 }
 
+/** 只读运行态元信息（GC-6a）：main.ts 组装网关时注入，/admin/runtime 展示与告警用 */
+export interface GatewayRuntimeMeta {
+  /** HTTP 主端口（配置值；port=0 内核分配时以 GatewayInstance.port 为准） */
+  listenPort: number;
+  /** UDP STUN 主端口（实际绑定值） */
+  udpPort: number;
+  /** UDP 辅助探测端口；0 = 已关闭 */
+  udpAltPort: number;
+  storageDriver: 'sqlite' | 'postgres';
+  /** 主密钥来源：env ZR_GATEWAY_SECRET 派生或 master.key 文件 */
+  secretSource: 'env' | 'file';
+  /** 启动环境变量的对外地址（settings 未配 publicUrl 时的回退） */
+  publicUrlFromEnv?: string;
+}
+
 export interface ApiServerConfig {
-  /** 对外可达基础 URL（缺省时 joinUri 的 host 取请求 Host 头） */
+  /** 对外可达基础 URL（缺省时 joinUri 的 host 取请求 Host 头）；GC-6a 起逐请求热读 settings.publicUrl 覆盖 */
   publicUrl: string | undefined;
+  /** GC-6a 只读运行态元信息；缺省时 /admin/runtime 按保守值呈现 */
+  runtimeMeta?: GatewayRuntimeMeta;
 }
 
 /** PG-5 运行时注入：WS 在线表与实时中继速率的查询口；缺省全 0 */
@@ -84,6 +101,10 @@ export interface GatewayHooks {
   onNetworkUpdated?: (networkId: string, maxPeers: number) => void | Promise<void>;
   onSettingsChanged?: (settings: SystemSettings) => void | Promise<void>;
   onUserDisabled?: (userId: string) => void | Promise<void>;
+  /** GC-6a：配额变化（默认组创建/切换/更新）后通知实时层；userId 缺省 = 全量失效 */
+  onQuotaChanged?: (userId?: string) => void | Promise<void>;
+  /** GC-6a：用户删除后通知实时层断开其全部在线节点 */
+  onUserDeleted?: (userId: string) => void | Promise<void>;
 }
 
 // ---------------------------------------------------------------- 拓扑快照（PG-5）
@@ -189,6 +210,19 @@ export function storeErrorToApiError(err: StoreError): ApiError {
       return new ApiError(400, 'OTP_INVALID', 'verification code is invalid or expired');
     case 'otp-locked':
       return new ApiError(429, 'OTP_LOCKED', 'verification code locked after too many failed attempts');
+    // GC-6a 用户组 / 用户管理（GC-2 的 store 业务码接 HTTP 语义）
+    case 'last-admin':
+      return new ApiError(400, 'CANNOT_REMOVE_LAST_ADMIN', 'cannot remove the last active administrator');
+    case 'duplicate-group-code':
+      return new ApiError(409, 'DUPLICATE_GROUP_CODE', 'group code already exists');
+    case 'group-not-found':
+      return new ApiError(404, 'GROUP_NOT_FOUND', 'user group not found');
+    case 'cannot-delete-default-group':
+      return new ApiError(400, 'CANNOT_DELETE_DEFAULT_GROUP', 'the default user group cannot be deleted');
+    case 'group-in-use':
+      return new ApiError(409, 'GROUP_IN_USE', 'user group still has bound users');
+    case 'user-not-found':
+      return new ApiError(404, 'NOT_FOUND', 'resource not found');
     default:
       return new ApiError(404, 'NOT_FOUND', 'resource not found');
   }
@@ -303,7 +337,48 @@ export async function requireUser(ctx: RouteContext): Promise<UserRecord> {
   throw new ApiError(401, 'UNAUTHENTICATED', 'login required');
 }
 
+// ---------------------------------------------------------------- Bearer API Key 双轨鉴权（GC-6a）
+
+/** Bearer 通道放行的内置系统管理员 id：路由用它区分「真实账号」与「API Key 身份」（如豁免自我保护） */
+export const SYSTEM_API_ADMIN_ID = '__admin_api_key__';
+
+/** Bearer 通道的内置管理员身份：只存在于请求处理期，不落库、无口令可登录 */
+const SYSTEM_API_ADMIN: UserRecord = {
+  id: SYSTEM_API_ADMIN_ID,
+  email: 'api-key@system',
+  passwordHash: '',
+  role: 'admin',
+  active: true,
+  groupId: DEFAULT_GROUP_ID,
+  groupExpiresAt: null,
+  emailVerifiedAt: null,
+  createdAt: '1970-01-01T00:00:00.000Z',
+};
+
+/** 读 Authorization 头里的 Bearer 令牌（前缀不区分大小写）；无该头或非 Bearer 形态返回 null */
+function readBearerToken(req: IncomingMessage): string | null {
+  const header = readHeader(req, 'authorization');
+  if (header === undefined || !/^Bearer\s+/i.test(header)) return null;
+  const token = header.replace(/^Bearer\s+/i, '').trim();
+  return token.length > 0 ? token : null;
+}
+
+/**
+ * 管理员鉴权（GC-6a 双轨）：
+ * 1. `Authorization: Bearer <key>` 在场时只走 API Key 通道——sha256 + 常数时间比对
+ *    extendedSettings.adminApiKeyHash，命中即以内置系统管理员身份放行（免疫 CSRF，
+ *    绝不回退 Cookie）；缺失/未配置/不匹配一律 401 INVALID_API_KEY。
+ * 2. 无 Bearer 头时沿用 Cookie 会话并要求 role === 'admin'。
+ */
 export async function requireAdmin(ctx: RouteContext): Promise<UserRecord> {
+  const bearer = readBearerToken(ctx.req);
+  if (bearer !== null) {
+    const { adminApiKeyHash } = await ctx.store.getExtendedSettings();
+    if (adminApiKeyHash === null || !constantTimeEqualText(hashToken(bearer), adminApiKeyHash)) {
+      throw new ApiError(401, 'INVALID_API_KEY', 'invalid admin API key');
+    }
+    return SYSTEM_API_ADMIN;
+  }
   const user = await requireUser(ctx);
   if (user.role !== 'admin') {
     throw new ApiError(403, 'FORBIDDEN', 'admin role required');
