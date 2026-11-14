@@ -379,39 +379,29 @@ export declare function derivePeerOverviewSummary(peers: readonly PeerDeviceView
  * derived verdicts may render, kept as a literal union so the component's
  * typed `t` accepts it and a typo fails the build instead of rendering
  * #MISSING. Every key here exists in BOTH dictionaries. */
-export type PeerDiscoveryCopyKey = 'wizard.peer.syncReady' | 'wizard.peer.syncWaitingPeers' | 'wizard.peer.syncIgnored' | 'wizard.peer.syncPartialReady' | 'wizard.peer.syncBlocked' | 'wizard.peer.syncNotMounted' | 'wizard.peer.syncNotOnline' | 'wizard.peer.syncGatewayHold' | 'wizard.peer.syncUnknown' | 'wizard.peer.notJoined';
-/** The third peer wizard light's verdict (PC-14a): the light word plus the
- * locale key (and its params) the rendered state line reads from — the
- * copy explains WHY the light is what it is, derived once here so the
- * component only renders. */
+export type PeerDiscoveryCopyKey = 'wizard.peer.syncReady' | 'wizard.peer.syncWaitingPeers' | 'wizard.peer.syncIgnored' | 'wizard.peer.syncPartialReady' | 'wizard.peer.syncBlocked' | 'wizard.peer.syncGatewayHold' | 'wizard.peer.notJoined';
+/** The third peer wizard light's verdict (PS-3a): the light word plus the
+ * locale key (and its params) the rendered state line reads from. */
 export interface PeerDiscoveryLightView {
     light: LightState;
     copyKey: PeerDiscoveryCopyKey;
     copyParams?: Record<string, string>;
 }
 /**
- * The third peer wizard light (设备发现与会话同步) off the body's OWN sync
- * facts (PC-14a): `ready` under an authorized gateway is the ONLY green —
- * never a non-empty peers list, a lan path or a mounted count. `partial` is
- * honestly pending (its KNOWN ready/candidate counts ride the copy; unknown
- * counts never guess 0); a blocked identity — and any locally known
- * mismatch, which is a LOCAL fact that survives even an old body — is red;
- * everything else is amber. An old body without the sync block (or with an
- * unknown state word) reads the explicit UNKNOWN copy: the decided fallback,
- * never "peers non-empty is green". The copy speaks of handshakes completed
- * and syncing MAY START — never that any concrete session data has finished
- * synchronizing.
+ * The third peer wizard light (设备发现与会话同步) off `gatewayState` and
+ * the 5 non-negative sync counts (PS-3a): network admission no longer blocks
+ * when the network is empty or all discovered peers are ignored (`pass`), nor
+ * when `limitReached` leaves extra candidates unmounted after mounted ones
+ * are ready. Active handshakes in progress remain `pending` with counts;
+ * when all candidates are blocked by TOFU mismatch, it stays `fail`.
  */
 export declare function derivePeerDiscoveryLight(input: {
     gatewayState: string;
     mismatchCount: number;
+    limitReached?: boolean | undefined;
     sync?: PeerSyncReadinessView | undefined;
 }): PeerDiscoveryLightView;
-/** The peer node's three wizard lights (PG-9 + PC-14a): ① 本机身份已就绪,
- * ② 网络准入状态 (authorized green, pending-approval amber — the
- * 「等待网络管理员批准」copy), ③ 设备发现与会话同步 — the third light reads
- * the body's sync facts through {@link derivePeerDiscoveryLight}; without
- * them (an old body) it stays pending with the explicit unknown copy. */
+/** The peer node's three wizard lights (PG-9 + PS-3a). */
 export interface PeerWizardLights {
     identity: LightState;
     admission: LightState;
@@ -423,12 +413,13 @@ export interface PeerWizardLights {
  * otherwise while the engine is not wired); admission maps the gateway state
  * (green `authorized`, amber `pending-approval` / `connecting` / `offline` /
  * unconfigured, red `mismatch` / `revoked` / `paused` / `identity-error`);
- * discovery follows the sync facts per {@link derivePeerDiscoveryLight}.
+ * discovery follows {@link derivePeerDiscoveryLight}.
  */
 export declare function derivePeerWizardLights(input: {
     identityReady: boolean;
     gatewayState: string;
     mismatchCount: number;
+    limitReached?: boolean | undefined;
     sync?: PeerSyncReadinessView | undefined;
 }): PeerWizardLights;
 /**

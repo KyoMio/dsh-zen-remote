@@ -435,23 +435,19 @@ const PEER_CLIENT = {
   [ROUTES.peerJoin]: { body: { ok: true } },
 }
 
-/** PC-14a 的 sync 块罐头：与真实 peer/status 契约同形（state + 计数 + reason）。 */
-function syncBlock(state, overrides = {}) {
+/** PS-3a 的 5 计数 sync 块罐头：与真实 peer/status 契约同形（无 derived state/reason）。 */
+function syncBlock(overrides = {}) {
   return {
-    state,
     readyCount: 0,
+    mountedCandidateCount: 0,
     candidateCount: 0,
-    unmountedCount: 0,
     ignoredCount: 0,
     mismatchCount: 0,
-    reason: state === 'ready' ? 'ok' : state,
     ...overrides,
   }
 }
 
-/** PC-14b 的真就绪 join 罐头：authorized + sync ready（两台候选设备全部
- * 握手在线、无身份异常行）——默认等待必须观察到这个组合才允许三盏灯真绿
- * 与 ready:true。PEER_CLIENT 缺 sync 块，留给 peer status 等只读用例。 */
+/** PS-3a 就绪 join 罐头：authorized + nodeId（两台候选设备全部握手在线、无身份异常行）。 */
 const PEER_CLIENT_READY = {
   [ROUTES.peerStatus]: {
     body: () => peerStatusBody('authorized', { extra: {
@@ -459,7 +455,7 @@ const PEER_CLIENT_READY = {
         { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
         { nodeId: 'bb22cc33', name: '书房机', mounted: true, path: 'p2p', rttMs: 12 },
       ],
-      sync: syncBlock('ready', { readyCount: 2, candidateCount: 2 }),
+      sync: syncBlock({ readyCount: 2, mountedCandidateCount: 2, candidateCount: 2 }),
     } }),
   },
   [ROUTES.peerJoin]: { body: { ok: true } },
@@ -691,7 +687,7 @@ test('peer join: 等待批准 —— 轮询预算内转 authorized+sync ready �
           { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
           { nodeId: 'bb22cc33', name: '书房机', mounted: true, path: 'p2p', rttMs: 12 },
         ],
-        sync: syncBlock('ready', { readyCount: 2, candidateCount: 2 }),
+        sync: syncBlock({ readyCount: 2, mountedCandidateCount: 2, candidateCount: 2 }),
       } }),
     ]
     let call = 0
@@ -833,7 +829,7 @@ test('peer join: --json 输出结构化结果（submitted/ready/gatewayState/syn
     assert.equal(parsed.nodeId, 'aa1b2c3d')
     assert.equal(parsed.networkId, 'abcdef1234567890')
     assert.equal(parsed.gatewayState, 'authorized')
-    assert.deepEqual(parsed.sync, syncBlock('ready', { readyCount: 2, candidateCount: 2 }), 'the backend sync block echoes verbatim')
+    assert.deepEqual(parsed.sync, syncBlock({ readyCount: 2, mountedCandidateCount: 2, candidateCount: 2 }), 'the backend sync block echoes verbatim')
     assert.equal(parsed.peers.length, 2)
   } finally {
     if (handle !== undefined) await handle.close()
@@ -1181,7 +1177,7 @@ test('setup --role peer 交互全流程：未入网时提示输入邀请链接�
             { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
             { nodeId: 'bb22cc33', name: '书房机', mounted: true, path: 'p2p', rttMs: 12 },
           ],
-          sync: syncBlock('ready', { readyCount: 2, candidateCount: 2 }),
+          sync: syncBlock({ readyCount: 2, mountedCandidateCount: 2, candidateCount: 2 }),
         } })
       } },
       [ROUTES.peerJoin]: (res) => {
@@ -1533,22 +1529,13 @@ test('PG-10-fix: peer join 已是 peer 角色非交互缺邀请链接——立�
 })
 
 // ===========================================================================
-// PC-14b：等待与退出码反映真实就绪结果
-//
-// 服务端契约（PC-14a）：body.sync 的 ready 只是「远端握手许可」——只有
-// gateway authorized + sync ready 才允许 CLI 宣称成员同步就绪；缺 sync 的
-// 旧响应一律 unknown，绝不从 peers 非空猜成功。CLI 矩阵：
-//   · revoked / paused / mismatch / 身份阻塞 → 立即失败退出 1，不做无意义等待
-//   · 默认等待只在 authorized+sync.ready 达成时退出 0（三盏灯真绿）
-//   · 预算耗尽未达成 → 非零并报告最后实际状态（pending 专属 stillPending）
-//   · --no-wait 只代表已提交：JSON submitted/ready 分离，ready 仅观察为真
-//   · Ctrl-C 约定 130，入网申请保留、绝不自动 leave
-//   · 每次 IPC 轮询受剩余预算约束（timeoutMs），IPC 断连有界结束
+// PS-3a（原 PC-14b）：等待与退出码以网关接入（authorized + nodeId）为准，
+// 不被空网、全忽略、满额部分挂载或对端尚在握手拖住；同时诚实报告 5 计数与异常告警
 // ===========================================================================
 
-test('PC-14b: peer join 连接中→授权未就绪→sync ready —— 预算内观察到真就绪才退出 0（中英一致）', async () => {
+test('PS-3a: peer join 连接中→authorized 立即退出 0（即使尚在握手中也诚实报计数、不误打成员✓）', async () => {
   const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
-  const home = makeHome('pc14b-evolve-ready')
+  const home = makeHome('ps3a-evolve-partial-ready')
   let handle
   try {
     const states = [
@@ -1558,14 +1545,7 @@ test('PC-14b: peer join 连接中→授权未就绪→sync ready —— 预算�
           { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
           { nodeId: 'bb22cc33', name: '书房机', mounted: false, path: 'relay', rttMs: 45 },
         ],
-        sync: syncBlock('partial', { readyCount: 1, candidateCount: 2, unmountedCount: 1, reason: 'peers-not-mounted' }),
-      } }),
-      () => peerStatusBody('authorized', { extra: {
-        peers: [
-          { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
-          { nodeId: 'bb22cc33', name: '书房机', mounted: true, path: 'p2p', rttMs: 12 },
-        ],
-        sync: syncBlock('ready', { readyCount: 2, candidateCount: 2 }),
+        sync: syncBlock({ readyCount: 1, mountedCandidateCount: 2, candidateCount: 2 }),
       } }),
     ]
     let call = 0
@@ -1581,216 +1561,166 @@ test('PC-14b: peer join 连接中→授权未就绪→sync ready —— 预算�
       pollIntervalMs: 15,
     })
     const code = await mods.runPeerJoinCommand(ctx)
-    assert.equal(code, 0, 'observed authorized+sync.ready is the only exit-0 wait outcome')
+    assert.equal(code, 0, 'authorized + non-empty nodeId exits 0 even while handshakes are in flight')
     const text = ctx.stdout.text()
     assert.match(text, /本机身份已生成 ✓/u)
     assert.match(text, /网关准入：已接入 ✓/u)
-    assert.match(text, /成员同步：设备就绪，可开始同步 ✓/u)
-    assert.doesNotMatch(text, /等待预算/u, 'no timeout copy on a achieved wait')
+    assert.match(text, /成员同步：已向 1\/2 台已挂载设备完成握手/u)
+    assert.doesNotMatch(text, /1\/2 台已挂载设备完成握手 ✓/u, 'partial handshake count does not show false ✓')
 
-    // en 同语义：已就绪的第二次 join 直接三盏灯真绿，措辞与 zh 对齐。
-    const en = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '2'],
-      ipc: mods.createCliIpcClient(handle.socketPath),
-      lang: 'en',
-      pollIntervalMs: 15,
-    })
-    assert.equal(await mods.runPeerJoinCommand(en), 0)
-    const enText = en.stdout.text()
-    assert.match(enText, /Local identity created ✓/u)
-    assert.match(enText, /Gateway admission: connected ✓/u)
-    assert.match(enText, /Member sync: devices ready — syncing may start ✓/u)
+    // en 同语义，两台均 ready 时给出三盏 ✓
+    const homeReady = makeHome('ps3a-en-ready')
+    const { handle: h2 } = await startIpcServer(homeReady, { role: 'peer', client: PEER_CLIENT_READY })
+    try {
+      const en = makeCtx(mods, {
+        argv: ['peer', 'join', INVITE, '--wait', '2'],
+        ipc: mods.createCliIpcClient(h2.socketPath),
+        lang: 'en',
+        pollIntervalMs: 15,
+      })
+      assert.equal(await mods.runPeerJoinCommand(en), 0)
+      const enText = en.stdout.text()
+      assert.match(enText, /Local identity created ✓/u)
+      assert.match(enText, /Gateway admission: connected ✓/u)
+      assert.match(enText, /Member sync: devices ready — syncing may start ✓/u)
+    } finally {
+      await h2.close()
+      cleanup(homeReady)
+    }
   } finally {
     if (handle !== undefined) await handle.close()
     cleanup(home)
   }
 })
 
-test('PC-14b: authorized 但设备未就绪（partial 1/2）—— 预算耗尽非零，不打印成员绿灯，报告 1/2', async () => {
+test('PS-3a: 空网、全忽略与 maxServers 满额部分挂载 —— authorized 后立刻退出 0（ready: true）', async () => {
   const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
-  const home = makeHome('pc14b-partial-timeout')
-  let handle
-  try {
-    const partialClient = {
-      [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: {
+  const cases = [
+    {
+      name: 'empty-network',
+      extra: { peers: [], sync: syncBlock() },
+      expectMatch: /已入网，等待其他设备加入 ✓/u,
+    },
+    {
+      name: 'all-ignored',
+      extra: { peers: [], sync: syncBlock({ ignoredCount: 2 }) },
+      expectMatch: /已入网，其他设备均被设为忽略 ✓/u,
+    },
+    {
+      name: 'limit-reached-partial-mount',
+      extra: {
+        limitReached: true,
+        maxServers: 1,
+        mountedCount: 1,
         peers: [
           { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
-          { nodeId: 'bb22cc33', name: '书房机', mounted: false, path: 'relay', rttMs: 45 },
+          { nodeId: 'bb22cc33', name: '备用机', mounted: false, path: 'offline', rttMs: null },
         ],
-        sync: syncBlock('partial', { readyCount: 1, candidateCount: 2, unmountedCount: 1, reason: 'peers-not-mounted' }),
-      } }) },
-      [ROUTES.peerJoin]: { body: { ok: true } },
+        sync: syncBlock({ readyCount: 1, mountedCandidateCount: 1, candidateCount: 2 }),
+      },
+      expectMatch: /成员同步：设备就绪，可开始同步 ✓/u,
+    },
+  ]
+  for (const scenario of cases) {
+    const home = makeHome(`ps3a-${scenario.name}`)
+    let handle
+    try {
+      const client = {
+        [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: scenario.extra }) },
+        [ROUTES.peerJoin]: { body: { ok: true } },
+      }
+      const { handle: h } = await startIpcServer(home, { role: 'peer', client })
+      handle = h
+      const ctx = makeCtx(mods, {
+        argv: ['peer', 'join', INVITE, '--wait', '2', '--json'],
+        ipc: mods.createCliIpcClient(handle.socketPath),
+        pollIntervalMs: 15,
+      })
+      const startedAt = Date.now()
+      const code = await mods.runPeerJoinCommand(ctx)
+      assert.equal(code, 0, scenario.name)
+      assert.ok(Date.now() - startedAt < 1500, `${scenario.name} exited immediately without waiting for timeout`)
+      const parsed = JSON.parse(ctx.stdout.text())
+      assert.equal(parsed.ok, true, scenario.name)
+      assert.equal(parsed.ready, true, scenario.name)
+      assert.match(ctx.stderr.text(), scenario.expectMatch, scenario.name)
+    } finally {
+      if (handle !== undefined) await handle.close()
+      cleanup(home)
     }
-    const { handle: h } = await startIpcServer(home, { role: 'peer', client: partialClient })
-    handle = h
-    const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '1'],
-      ipc: mods.createCliIpcClient(handle.socketPath),
-      pollIntervalMs: 15,
-    })
-    const code = await mods.runPeerJoinCommand(ctx)
-    assert.equal(code, 1, 'partial readiness is not the ready claim — the budget ends non-zero')
-    const text = ctx.stdout.text()
-    assert.match(text, /成员同步：1\/2 台设备握手就绪/u, 'the honest partial counts are reported')
-    assert.doesNotMatch(text, /设备就绪，可开始同步 ✓/u, 'no member-ready green for a partial verdict')
-    assert.match(text, /等待预算/u, 'the timeout names the wait budget')
-    assert.match(text, /网关准入：已接入 ✓/u, 'the authorized gateway fact stays honest')
-  } finally {
-    if (handle !== undefined) await handle.close()
-    cleanup(home)
   }
 })
 
-test('PC-14b: 零对端 waiting-peers —— 已入网等待其他设备明说，预算耗尽非零，不抹掉入网申请', async () => {
+test('PS-3a: paused / mismatch / identity-error —— 立即失败退出 1，不做无意义等待', { timeout: 8000 }, async () => {
   const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
-  const home = makeHome('pc14b-waiting-peers')
-  let handle
-  try {
-    const waitingClient = {
-      [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: { peers: [{ nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 }], sync: syncBlock('waiting-peers') } }) },
-      [ROUTES.peerJoin]: { body: { ok: true } },
+  for (const scenario of [
+    { state: 'paused', extra: {}, expectPattern: /暂停/u, reason: 'paused' },
+    { state: 'mismatch', extra: {}, expectPattern: /peer trust/u, reason: 'mismatch' },
+    {
+      state: 'identity-error',
+      extra: { configured: false, nodeId: '', identityError: 'state-file-unreadable' },
+      expectPattern: /修复文件权限后重试/u,
+      reason: 'identity-error',
+    },
+  ]) {
+    const home = makeHome(`ps3a-blocked-${scenario.state}`)
+    let handle
+    try {
+      const blockedClient = {
+        [ROUTES.peerStatus]: { body: () => peerStatusBody(scenario.state, { extra: scenario.extra }) },
+        [ROUTES.peerJoin]: { body: { ok: true } },
+      }
+      const { handle: h, canned } = await startIpcServer(home, { role: 'peer', client: blockedClient })
+      handle = h
+      const ctx = makeCtx(mods, {
+        argv: ['peer', 'join', INVITE, '--wait', '5', '--json'],
+        ipc: mods.createCliIpcClient(handle.socketPath),
+        pollIntervalMs: 15,
+      })
+      const startedAt = Date.now()
+      const code = await mods.runPeerJoinCommand(ctx)
+      assert.equal(code, 1, scenario.state)
+      assert.ok(Date.now() - startedAt < 4000, `${scenario.state} failed fast (took ${Date.now() - startedAt}ms)`)
+      const parsed = JSON.parse(ctx.stdout.text())
+      assert.equal(parsed.ok, false)
+      assert.equal(parsed.ready, false)
+      assert.equal(parsed.reason, scenario.reason)
+      assert.match(ctx.stderr.text(), scenario.expectPattern, scenario.state)
+      assert.equal(canned.requests.filter((r) => r.path === ROUTES.peerStatus).length <= 2, true, scenario.state)
+    } finally {
+      if (handle !== undefined) await handle.close()
+      cleanup(home)
     }
-    const { handle: h, canned } = await startIpcServer(home, { role: 'peer', client: waitingClient })
-    handle = h
-    const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '1'],
-      ipc: mods.createCliIpcClient(handle.socketPath),
-      pollIntervalMs: 15,
-    })
-    const code = await mods.runPeerJoinCommand(ctx)
-    assert.equal(code, 1, 'zero peers never reads as member-sync ready')
-    const text = ctx.stdout.text()
-    assert.match(text, /已入网，等待其他设备加入/u, 'the joined-and-waiting fact is named, not erased')
-    assert.doesNotMatch(text, /设备就绪，可开始同步 ✓/u)
-    assert.match(text, /等待预算/u)
-    assert.equal(canned.requests.some((r) => r.path === ROUTES.peerLeave), false, 'waiting for peers never leaves the network')
-  } finally {
-    if (handle !== undefined) await handle.close()
-    cleanup(home)
   }
 })
 
-test('PC-14b: 旧端缺 sync 字段（unknown）—— authorized 不伪装就绪，预算耗尽非零并明示未知', async () => {
+test('PS-3a: authorized 但存在对端 identity-mismatch —— 正常退出 0 并提示 peer trust 处理异常对端', { timeout: 8000 }, async () => {
   const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
-  const home = makeHome('pc14b-old-backend')
+  const home = makeHome('ps3a-mismatch-warning')
   let handle
   try {
-    // 旧端罐头：authorized 但整份 body 没有 sync 块（设备行里也没有身份
-    // 异常行——那是另一条立即失败的路径）。
-    const oldBackendClient = {
-      [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: {
-        peers: [
-          { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
-          { nodeId: 'bb22cc33', name: '书房机', mounted: true, path: 'p2p', rttMs: 12 },
-        ],
-      } }) },
-      [ROUTES.peerJoin]: { body: { ok: true } },
-    }
-    const { handle: h } = await startIpcServer(home, { role: 'peer', client: oldBackendClient })
-    handle = h
-    const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '1'],
-      ipc: mods.createCliIpcClient(handle.socketPath),
-      pollIntervalMs: 15,
-    })
-    const code = await mods.runPeerJoinCommand(ctx)
-    assert.equal(code, 1, 'an old body without sync never guesses success from non-empty peers')
-    const text = ctx.stdout.text()
-    assert.match(text, /当前后端未提供就绪状态/u, 'the unknown readiness is named explicitly')
-    assert.doesNotMatch(text, /设备就绪，可开始同步 ✓/u)
-    assert.match(text, /网关准入：已接入 ✓/u, 'the authorized gateway fact stays honest')
-  } finally {
-    if (handle !== undefined) await handle.close()
-    cleanup(home)
-  }
-})
-
-test('PC-14b: paused —— 立即失败退出 1，不做无意义等待', { timeout: 8000 }, async () => {
-  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
-  const home = makeHome('pc14b-paused')
-  let handle
-  try {
-    const pausedClient = {
-      [ROUTES.peerStatus]: { body: () => peerStatusBody('paused') },
-      [ROUTES.peerJoin]: { body: { ok: true } },
-    }
-    const { handle: h, canned } = await startIpcServer(home, { role: 'peer', client: pausedClient })
-    handle = h
-    const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '5'],
-      ipc: mods.createCliIpcClient(handle.socketPath),
-      pollIntervalMs: 15,
-    })
-    const startedAt = Date.now()
-    const code = await mods.runPeerJoinCommand(ctx)
-    assert.equal(code, 1)
-    assert.ok(Date.now() - startedAt < 4000, `a paused admission fails fast instead of burning the budget (took ${Date.now() - startedAt}ms)`)
-    assert.match(ctx.stdout.text(), /暂停/u)
-    assert.equal(canned.requests.filter((r) => r.path === ROUTES.peerStatus).length <= 2, true, 'no pointless polling past the first sight of paused')
-  } finally {
-    if (handle !== undefined) await handle.close()
-    cleanup(home)
-  }
-})
-
-test('PC-14b: 网关 mismatch —— 立即失败退出 1 并指引 peer trust', { timeout: 8000 }, async () => {
-  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
-  const home = makeHome('pc14b-mismatch')
-  let handle
-  try {
-    const mismatchClient = {
-      [ROUTES.peerStatus]: { body: () => peerStatusBody('mismatch') },
-      [ROUTES.peerJoin]: { body: { ok: true } },
-    }
-    const { handle: h } = await startIpcServer(home, { role: 'peer', client: mismatchClient })
-    handle = h
-    const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '5'],
-      ipc: mods.createCliIpcClient(handle.socketPath),
-      pollIntervalMs: 15,
-    })
-    const startedAt = Date.now()
-    const code = await mods.runPeerJoinCommand(ctx)
-    assert.equal(code, 1)
-    assert.ok(Date.now() - startedAt < 4000, `a mismatch admission fails fast (took ${Date.now() - startedAt}ms)`)
-    const text = ctx.stdout.text()
-    assert.match(text, /身份核验/u)
-    assert.match(text, /peer trust/u)
-  } finally {
-    if (handle !== undefined) await handle.close()
-    cleanup(home)
-  }
-})
-
-test('PC-14b: sync blocked（授权但网内身份异常设备）—— 立即失败退出 1 并指引 peer trust', { timeout: 8000 }, async () => {
-  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
-  const home = makeHome('pc14b-sync-blocked')
-  let handle
-  try {
-    const blockedClient = {
+    const mismatchPeerClient = {
       [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: {
         peers: [
           { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
           { nodeId: 'dd44ee55', name: '旧手机', mounted: false, path: 'mismatch', rttMs: null },
         ],
-        sync: syncBlock('blocked', { mismatchCount: 1, reason: 'identity-mismatch' }),
+        sync: syncBlock({ readyCount: 1, mountedCandidateCount: 1, candidateCount: 1, mismatchCount: 1 }),
       } }) },
       [ROUTES.peerJoin]: { body: { ok: true } },
     }
-    const { handle: h } = await startIpcServer(home, { role: 'peer', client: blockedClient })
+    const { handle: h } = await startIpcServer(home, { role: 'peer', client: mismatchPeerClient })
     handle = h
     const ctx = makeCtx(mods, {
       argv: ['peer', 'join', INVITE, '--wait', '5'],
       ipc: mods.createCliIpcClient(handle.socketPath),
       pollIntervalMs: 15,
     })
-    const startedAt = Date.now()
     const code = await mods.runPeerJoinCommand(ctx)
-    assert.equal(code, 1, 'an explicit identity block fails instead of waiting')
-    assert.ok(Date.now() - startedAt < 4000, `the identity block fails fast (took ${Date.now() - startedAt}ms)`)
+    assert.equal(code, 0, 'a per-peer identity mismatch does not fail network admission')
     const text = ctx.stdout.text()
-    assert.match(text, /身份异常/u)
-    assert.match(text, /peer trust/u)
+    assert.match(text, /网关准入：已接入 ✓/u)
+    assert.match(text, /peer trust/u, 'still surfaces clear warning to run peer trust')
   } finally {
     if (handle !== undefined) await handle.close()
     cleanup(home)
@@ -2099,7 +2029,7 @@ test('PC-14b-fix1: 停机网关带历史 sync ready —— 第三行服从判定
       { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
       { nodeId: 'bb22cc33', name: '书房机', mounted: true, path: 'p2p', rttMs: 12 },
     ]
-    const staleSync = syncBlock('ready', { readyCount: 2, candidateCount: 2 })
+    const staleSync = syncBlock({ readyCount: 2, mountedCandidateCount: 2, candidateCount: 2 })
     const offlineClient = {
       [ROUTES.peerStatus]: { body: () => peerStatusBody('offline', { extra: { peers: cleanPeers, sync: staleSync } }) },
       [ROUTES.peerJoin]: { body: { ok: true } },
@@ -2150,7 +2080,7 @@ test('PC-14b-fix1: 停机网关带历史 sync ready —— 第三行服从判定
   }
 })
 
-test('PC-14b-fix1: 非法计数按 PC-14a 口径显示未知 —— 负数/小数不成台数', async () => {
+test('PS-3a: 非法计数按 5 计数校验降级 —— 负数/小数不成台数，authorized 仍退出 0', async () => {
   const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
   const home = makeHome('fix1-bad-counts')
   let handle
@@ -2161,7 +2091,7 @@ test('PC-14b-fix1: 非法计数按 PC-14a 口径显示未知 —— 负数/小�
           { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
           { nodeId: 'bb22cc33', name: '书房机', mounted: false, path: 'relay', rttMs: 45 },
         ],
-        sync: syncBlock('partial', { readyCount: -1, candidateCount: 2.5, reason: 'peers-not-mounted' }),
+        sync: { readyCount: -1, mountedCandidateCount: 1, candidateCount: 2.5 },
       } }) },
       [ROUTES.peerJoin]: { body: { ok: true } },
     }
@@ -2173,10 +2103,9 @@ test('PC-14b-fix1: 非法计数按 PC-14a 口径显示未知 —— 负数/小�
       pollIntervalMs: 15,
     })
     const code = await mods.runPeerJoinCommand(ctx)
-    assert.equal(code, 1)
+    assert.equal(code, 0)
     const text = ctx.stdout.text()
-    assert.match(text, /当前后端未提供就绪状态/u, 'junk counts read as unknown, exactly like the PC-14a parse')
-    assert.doesNotMatch(text, /台设备握手就绪/u)
+    assert.doesNotMatch(text, /握手/u)
     assert.doesNotMatch(text, /-1/u)
     assert.doesNotMatch(text, /2\.5/u)
   } finally {
@@ -2260,20 +2189,14 @@ test('PC-14b-fix1: --json Ctrl-C —— reason:aborted、submitted 保留、退�
   }
 })
 
-test('PC-14b-fix1: --json 已知阻塞与无快照 —— reason 走同一词表，不填假状态', async () => {
+test('PS-3a: --json 已知网关阻塞与无快照 —— reason 走同一词表，不填假状态', async () => {
   const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
   const home = makeHome('fix1-json-blocked')
   let handle
   try {
-    // 身份阻塞：authorized + mismatch 行 + sync blocked。
+    // 网关身份校验阻塞：gatewayState === 'mismatch'。
     const blockedClient = {
-      [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized', { extra: {
-        peers: [
-          { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
-          { nodeId: 'dd44ee55', name: '旧手机', mounted: false, path: 'mismatch', rttMs: null },
-        ],
-        sync: syncBlock('blocked', { mismatchCount: 1, reason: 'identity-mismatch' }),
-      } }) },
+      [ROUTES.peerStatus]: { body: () => peerStatusBody('mismatch') },
       [ROUTES.peerJoin]: { body: { ok: true } },
     }
     const { handle: h } = await startIpcServer(home, { role: 'peer', client: blockedClient })
@@ -2286,7 +2209,7 @@ test('PC-14b-fix1: --json 已知阻塞与无快照 —— reason 走同一词表
     assert.equal(await mods.runPeerJoinCommand(blocked), 1)
     const blockedParsed = JSON.parse(blocked.stdout.text())
     assert.equal(blockedParsed.ok, false)
-    assert.equal(blockedParsed.reason, 'identity-mismatch')
+    assert.equal(blockedParsed.reason, 'mismatch')
     assert.equal(blockedParsed.submitted, true)
     assert.equal(blockedParsed.ready, false)
     await handle.close()

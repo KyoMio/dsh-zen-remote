@@ -273,44 +273,21 @@ export interface ClientConnectionView {
  */
 export declare function deriveClientStatusView(body: ClientStatusBody): ClientConnectionView;
 /**
- * The sync block's overall verdict words (PC-14a). `ready` is the LICENSE to
- * sync — every candidate peer handshake-online, nothing blocked — never a
- * claim that any concrete session data finished synchronizing.
- */
-export type PeerSyncStateView = 'ready' | 'partial' | 'not-ready' | 'waiting-peers' | 'ignored' | 'blocked' | 'unconfigured';
-/**
- * Why the verdict is what it is: `ok` for ready, the gateway admission word
- * (`gateway-<state>`) for a non-authorized gateway, the concrete blocker
- * word otherwise. A closed vocabulary — an unknown word degrades to
- * undefined, never rendered raw. fix1: there is deliberately NO capacity
- * word — `peers-not-mounted` is the neutral fact (a fresh announcement, a
- * pending punch, a full cap and a failed mount all look identical to the
- * snapshot), so the route never claims "capacity" without a proof; the
- * capacity story stays with the body's own PC-11a fields.
- */
-export type PeerSyncReasonView = 'ok' | 'waiting-peers' | 'ignored' | 'identity-mismatch' | 'gateway-connecting' | 'gateway-pending-approval' | 'gateway-mismatch' | 'gateway-paused' | 'gateway-revoked' | 'gateway-offline' | 'peers-not-mounted' | 'peers-not-online' | 'peers-partial' | 'unconfigured';
-/**
- * The peer/status body's sync-readiness block (PC-14a): the counts and the
- * reason word the third wizard light (and any future UI/CLI surface) renders
- * from. Additive and optional — an older body without the block stays
- * `undefined`, never guessed from a non-empty peers list; an unknown word or
- * a junk count degrades field-by-field to unknown.
+ * The peer/status body's sync-readiness counts (PS-3a). Additive and optional —
+ * an older body without the block stays `undefined`; invalid counts degrade
+ * field-by-field to `undefined`.
  */
 export interface PeerSyncReadinessView {
-    state: PeerSyncStateView | undefined;
-    /** Candidates whose pool mount actually completed the remote handshake. */
-    readyCount: number | undefined;
-    /** Eligible (not ignored, not mismatched) peers expected to connect. */
-    candidateCount: number | undefined;
-    /** Candidates lacking a real pool mount — fresh announcement, pending
-     * punch, a full cap or a failed mount all look identical here (fix1: no
-     * reason to assume which). */
-    unmountedCount: number | undefined;
+    /** Mounted candidates whose pool client completed the remote handshake. */
+    readyCount?: number | undefined;
+    /** Eligible peers currently mounted into the pool. */
+    mountedCandidateCount?: number | undefined;
+    /** Eligible (not ignored, not mismatched) peers discovered in the network. */
+    candidateCount?: number | undefined;
     /** User-ignored devices — excluded from the candidates, counted aside. */
-    ignoredCount: number | undefined;
+    ignoredCount?: number | undefined;
     /** Locally blocked identities awaiting the trust decision. */
-    mismatchCount: number | undefined;
-    reason: PeerSyncReasonView | undefined;
+    mismatchCount?: number | undefined;
 }
 /**
  * The `GET /_dsh/zen-remote/client/peer/status` body as the peer section

@@ -582,13 +582,10 @@ export declare const zh: {
     readonly 'wizard.peer.lightDiscovery': "设备发现与会话同步";
     readonly 'wizard.peer.syncReady': "远端握手完成，可开始同步";
     readonly 'wizard.peer.syncWaitingPeers': "已入网，等待其他设备加入";
-    readonly 'wizard.peer.syncIgnored': "发现的设备均已被本机忽略";
+    readonly 'wizard.peer.syncIgnored': "已入网（其余设备已设为忽略）";
     readonly 'wizard.peer.syncPartialReady': "{ready} / {total} 台设备握手就绪";
     readonly 'wizard.peer.syncBlocked': "有设备身份异常，等待本机信任确认";
-    readonly 'wizard.peer.syncNotMounted': "有设备尚未挂载";
-    readonly 'wizard.peer.syncNotOnline': "设备尚未完成握手";
     readonly 'wizard.peer.syncGatewayHold': "设备网络尚未就绪";
-    readonly 'wizard.peer.syncUnknown': "同步状态未知";
     readonly 'wizard.peer.pendingApproval': "已提交入网申请，等待网络管理员批准";
     readonly 'wizard.peer.joinFailed': "加入网络失败：{reason}";
     readonly 'wizard.peer.joinInvalid': "邀请链接格式无效，请粘贴完整的 zr-net:// 或 zr-nets:// 链接";

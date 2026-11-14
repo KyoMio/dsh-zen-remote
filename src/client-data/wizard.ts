@@ -595,113 +595,79 @@ export type PeerDiscoveryCopyKey =
   | 'wizard.peer.syncIgnored'
   | 'wizard.peer.syncPartialReady'
   | 'wizard.peer.syncBlocked'
-  | 'wizard.peer.syncNotMounted'
-  | 'wizard.peer.syncNotOnline'
   | 'wizard.peer.syncGatewayHold'
-  | 'wizard.peer.syncUnknown'
   | 'wizard.peer.notJoined'
 
-/** The third peer wizard light's verdict (PC-14a): the light word plus the
- * locale key (and its params) the rendered state line reads from — the
- * copy explains WHY the light is what it is, derived once here so the
- * component only renders. */
+/** The third peer wizard light's verdict (PS-3a): the light word plus the
+ * locale key (and its params) the rendered state line reads from. */
 export interface PeerDiscoveryLightView {
   light: LightState
   copyKey: PeerDiscoveryCopyKey
   copyParams?: Record<string, string>
 }
 
-/** The `not-ready` reason word's copy key: the unmounted word is the NEUTRAL
- * one (fix1 — a fresh announcement, a pending punch, a full cap and a failed
- * mount all look identical, so no capacity claim), gateway admission words
- * fold into the network-not-ready copy (the admission light next to this one
- * carries the specific gateway state), an unknown word degrades to unknown. */
-function peerNotReadyCopyKey(reason: string): PeerDiscoveryCopyKey {
-  switch (reason) {
-    case 'peers-not-mounted': return 'wizard.peer.syncNotMounted'
-    case 'peers-not-online': return 'wizard.peer.syncNotOnline'
-    case 'identity-mismatch': return 'wizard.peer.syncBlocked'
-    case 'gateway-connecting':
-    case 'gateway-pending-approval':
-    case 'gateway-mismatch':
-    case 'gateway-paused':
-    case 'gateway-revoked':
-    case 'gateway-offline':
-      return 'wizard.peer.syncGatewayHold'
-    default: return 'wizard.peer.syncUnknown'
-  }
-}
-
 /**
- * The third peer wizard light (设备发现与会话同步) off the body's OWN sync
- * facts (PC-14a): `ready` under an authorized gateway is the ONLY green —
- * never a non-empty peers list, a lan path or a mounted count. `partial` is
- * honestly pending (its KNOWN ready/candidate counts ride the copy; unknown
- * counts never guess 0); a blocked identity — and any locally known
- * mismatch, which is a LOCAL fact that survives even an old body — is red;
- * everything else is amber. An old body without the sync block (or with an
- * unknown state word) reads the explicit UNKNOWN copy: the decided fallback,
- * never "peers non-empty is green". The copy speaks of handshakes completed
- * and syncing MAY START — never that any concrete session data has finished
- * synchronizing.
+ * The third peer wizard light (设备发现与会话同步) off `gatewayState` and
+ * the 5 non-negative sync counts (PS-3a): network admission no longer blocks
+ * when the network is empty or all discovered peers are ignored (`pass`), nor
+ * when `limitReached` leaves extra candidates unmounted after mounted ones
+ * are ready. Active handshakes in progress remain `pending` with counts;
+ * when all candidates are blocked by TOFU mismatch, it stays `fail`.
  */
 export function derivePeerDiscoveryLight(input: {
   gatewayState: string
   mismatchCount: number
+  limitReached?: boolean | undefined
   sync?: PeerSyncReadinessView | undefined
 }): PeerDiscoveryLightView {
   const { sync } = input
-  const mismatchBlocked = input.mismatchCount > 0
-  if (input.gatewayState === 'identity-error') {
-    return mismatchBlocked
+  const mismatch = Math.max(input.mismatchCount, sync?.mismatchCount ?? 0)
+  if (input.gatewayState === 'unconfigured') {
+    return { light: 'pending', copyKey: 'wizard.peer.notJoined' }
+  }
+  if (input.gatewayState !== 'authorized') {
+    return mismatch > 0
       ? { light: 'fail', copyKey: 'wizard.peer.syncBlocked' }
       : { light: 'pending', copyKey: 'wizard.peer.syncGatewayHold' }
   }
-  // An old body (or junk): the light stays amber with the explicit unknown
-  // copy — the ONE locally known fact that still fails is a TOFU mismatch.
-  if (sync === undefined || sync.state === undefined) {
-    return mismatchBlocked
+  const readyCount = sync?.readyCount
+  const mountedCandidateCount = sync?.mountedCandidateCount
+  const candidateCount = sync?.candidateCount
+  const ignoredCount = sync?.ignoredCount ?? 0
+  if (
+    sync === undefined
+    || readyCount === undefined
+    || mountedCandidateCount === undefined
+    || candidateCount === undefined
+  ) {
+    return mismatch > 0
       ? { light: 'fail', copyKey: 'wizard.peer.syncBlocked' }
-      : { light: 'pending', copyKey: 'wizard.peer.syncUnknown' }
+      : { light: 'pending', copyKey: 'wizard.peer.syncGatewayHold' }
   }
-  if (sync.state === 'unconfigured') {
-    return { light: 'pending', copyKey: 'wizard.peer.notJoined' }
+  if (candidateCount === 0 && mismatch === 0) {
+    return {
+      light: 'pass',
+      copyKey: ignoredCount > 0 ? 'wizard.peer.syncIgnored' : 'wizard.peer.syncWaitingPeers',
+    }
   }
-  // The gateway admission fact gates every green: a stale `ready` word under
-  // a dead/revoked gateway never passes (no cached-online bypass).
-  if (input.gatewayState !== 'authorized') {
-    if (mismatchBlocked) return { light: 'fail', copyKey: 'wizard.peer.syncBlocked' }
-    return { light: 'pending', copyKey: 'wizard.peer.syncGatewayHold' }
-  }
-  if (sync.state === 'blocked' || mismatchBlocked) {
+  if (mismatch > 0 && mountedCandidateCount === 0) {
     return { light: 'fail', copyKey: 'wizard.peer.syncBlocked' }
   }
-  switch (sync.state) {
-    case 'ready':
-      return { light: 'pass', copyKey: 'wizard.peer.syncReady' }
-    case 'waiting-peers':
-      return { light: 'pending', copyKey: 'wizard.peer.syncWaitingPeers' }
-    case 'ignored':
-      return { light: 'pending', copyKey: 'wizard.peer.syncIgnored' }
-    case 'partial': {
-      const ready = sync.readyCount
-      const total = sync.candidateCount
-      return ready !== undefined && total !== undefined
-        ? { light: 'pending', copyKey: 'wizard.peer.syncPartialReady', copyParams: { ready: String(ready), total: String(total) } }
-        : { light: 'pending', copyKey: 'wizard.peer.syncUnknown' }
-    }
-    case 'not-ready':
-      return { light: 'pending', copyKey: peerNotReadyCopyKey(sync.reason ?? '') }
-    default:
-      return { light: 'pending', copyKey: 'wizard.peer.syncUnknown' }
+  if (
+    (mountedCandidateCount > 0 && readyCount >= mountedCandidateCount)
+    || (candidateCount > 0 && mountedCandidateCount === 0 && input.limitReached === true)
+  ) {
+    return { light: 'pass', copyKey: 'wizard.peer.syncReady' }
+  }
+  const total = mountedCandidateCount > 0 ? mountedCandidateCount : candidateCount
+  return {
+    light: 'pending',
+    copyKey: 'wizard.peer.syncPartialReady',
+    copyParams: { ready: String(readyCount), total: String(total) },
   }
 }
 
-/** The peer node's three wizard lights (PG-9 + PC-14a): ① 本机身份已就绪,
- * ② 网络准入状态 (authorized green, pending-approval amber — the
- * 「等待网络管理员批准」copy), ③ 设备发现与会话同步 — the third light reads
- * the body's sync facts through {@link derivePeerDiscoveryLight}; without
- * them (an old body) it stays pending with the explicit unknown copy. */
+/** The peer node's three wizard lights (PG-9 + PS-3a). */
 export interface PeerWizardLights {
   identity: LightState
   admission: LightState
@@ -718,12 +684,13 @@ const PEER_ADMISSION_DEAD_STATES: ReadonlySet<string> = new Set(['mismatch', 're
  * otherwise while the engine is not wired); admission maps the gateway state
  * (green `authorized`, amber `pending-approval` / `connecting` / `offline` /
  * unconfigured, red `mismatch` / `revoked` / `paused` / `identity-error`);
- * discovery follows the sync facts per {@link derivePeerDiscoveryLight}.
+ * discovery follows {@link derivePeerDiscoveryLight}.
  */
 export function derivePeerWizardLights(input: {
   identityReady: boolean
   gatewayState: string
   mismatchCount: number
+  limitReached?: boolean | undefined
   sync?: PeerSyncReadinessView | undefined
 }): PeerWizardLights {
   const authorized = input.gatewayState === 'authorized'
@@ -739,6 +706,7 @@ export function derivePeerWizardLights(input: {
     discovery: derivePeerDiscoveryLight({
       gatewayState: input.gatewayState,
       mismatchCount: input.mismatchCount,
+      ...(input.limitReached !== undefined ? { limitReached: input.limitReached } : {}),
       ...(input.sync !== undefined ? { sync: input.sync } : {}),
     }).light,
   }

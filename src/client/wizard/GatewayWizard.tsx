@@ -1587,12 +1587,14 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const peerDiscovery = derivePeerDiscoveryLight({
     gatewayState: peerGatewayState,
     mismatchCount: peerSummary.mismatchCount,
+    limitReached: peerSummary.limitReached,
     sync: peerView?.sync,
   })
   const peerLights = derivePeerWizardLights({
     identityReady: (peerView?.nodeId ?? '') !== '',
     gatewayState: peerGatewayState,
     mismatchCount: peerSummary.mismatchCount,
+    limitReached: peerSummary.limitReached,
     sync: peerView?.sync,
   })
   const serverScopeBridges = useMemo(() => bridgeRows.filter((row) => row.hasServerScope), [bridgeRows])
