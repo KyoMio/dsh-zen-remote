@@ -168,7 +168,10 @@ describe('REST API /api/v1（主服务器）', () => {
       assert.deepEqual(res.json.data, {
         authenticated: false,
         allowSignup: false,
+        requireEmailVerification: false,
+        smtpConfigured: false,
         maxNetworksPerUser: 2,
+        defaultMaxPeers: 4,
       });
     });
 
@@ -179,9 +182,26 @@ describe('REST API /api/v1（主服务器）', () => {
       assert.equal(res.status, 200);
       assert.equal(res.json.ok, true);
       assert.deepEqual(res.json.data, {
-        user: { id: tenantId, email: TENANT_EMAIL, role: 'user' },
+        user: { id: tenantId, email: TENANT_EMAIL, role: 'user', emailVerifiedAt: null },
         allowSignup: false,
+        requireEmailVerification: false,
+        smtpConfigured: false,
         maxNetworksPerUser: 2,
+        defaultMaxPeers: 4,
+        quota: {
+          groupId: 'grp_default',
+          assignedGroupId: 'grp_default',
+          groupCode: 'default',
+          groupName: '默认用户组',
+          groupExpiresAt: null,
+          isExpiredFallback: false,
+          maxNetworks: 2,
+          maxPeersPerNetwork: 4,
+          relayRateKbps: 2048,
+          monthlyRelayQuotaBytes: null,
+          usedNetworks: 0,
+          usedMonthlyRelayBytes: 0,
+        },
       });
       const raw = res.setCookies.find((c) => c.startsWith('zr_gw_session='));
       assert.ok(raw, 'expected Set-Cookie zr_gw_session');
@@ -195,7 +215,13 @@ describe('REST API /api/v1（主服务器）', () => {
       const me = await api(handle.base, 'GET', '/api/v1/auth/me', { cookie: tenantCookie });
       assert.equal(me.status, 200);
       assert.equal(me.json.data.authenticated, true);
-      assert.deepEqual(me.json.data.user, { id: tenantId, email: TENANT_EMAIL, role: 'user' });
+      assert.deepEqual(me.json.data.user, { id: tenantId, email: TENANT_EMAIL, role: 'user', emailVerifiedAt: null });
+      // GC-5：登录态 /auth/me 附带有效组配额与公开策略
+      assert.equal(me.json.data.quota.groupId, 'grp_default');
+      assert.equal(me.json.data.quota.maxNetworks, 2);
+      assert.equal(me.json.data.quota.usedMonthlyRelayBytes, 0);
+      assert.equal(me.json.data.smtpConfigured, false);
+      assert.equal(me.json.data.requireEmailVerification, false);
     });
 
     test('X-Forwarded-Proto: https → Cookie 附加 Secure', async () => {
