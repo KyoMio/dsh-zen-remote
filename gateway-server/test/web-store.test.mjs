@@ -1,6 +1,9 @@
 // PG-6a 控制台前端纯逻辑测试：中英词典 100% 键对称、「说人话」黑话扫描、
 // SSE 快照合并只动 topology 切片（绝不碰 UI 本地交互状态：弹窗/下拉菜单/
 // 行内二次确认/表单草稿）、REST 信封解包与 SSE 订阅解析。
+// GC-7b 扩展：配额格式化 / 用量进度档位、配额到期展示、无头接入命令、
+// GC-5/GC-6 认证自助与管理 API 客户端契约、公开策略/配额/管理切片的
+// 状态转移与引用隔离。
 // 与其余测试相同：.mjs 直接 import 编译产物 ../dist/。
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,13 +19,19 @@ import {
   translate,
 } from '../dist/web/i18n/locales.js';
 import {
+  buildHeadlessJoinCommand,
   classifyLinkPath,
+  computeUsagePercent,
   derivePeerConnRow,
   filterJoinedMembers,
+  formatBytesQuota,
   formatLatencyRange,
+  formatQuotaExpiry,
   formatRate,
+  isQuotaExceeded,
   maskInviteUri,
   memberStatusView,
+  quotaUsageLevel,
 } from '../dist/web/format.js';
 import { PeerRateLimiter } from '../dist/peer-hub/rate-limiter.js';
 import { copyTextToClipboard } from '../dist/web/clipboard.js';
@@ -31,11 +40,18 @@ import {
   ConsoleClient,
   ConsoleStore,
   ManagedRefreshCycle,
+  applyAdminGroups,
+  applyAdminRuntime,
   applyNetworks,
+  applyPublicPolicy,
+  applyQuota,
   applySession,
+  applySessionPayload,
   applyTopologySnapshot,
   createInitialState,
   deriveNetworkCounts,
+  markAdminError,
+  markAdminLoading,
   patchUiState,
   setLoggedOut,
 } from '../dist/web/store/console-store.js';
@@ -83,6 +99,130 @@ function makeSnapshot(networkId, overrides = {}) {
 
 const TEST_USER = { id: 'u-1', email: 'owner@local', role: 'user' };
 const TEST_META = { allowSignup: true, maxNetworksPerUser: 3 };
+
+// ---- GC-7b 夹具：镜像后端 GC-5/GC-6a/GC-6b 真实返回形状 ----
+
+/** GET /auth/me 登录态与 login/signup 响应里的配额视图 */
+function makeQuota(overrides = {}) {
+  return {
+    groupId: 'grp_default',
+    assignedGroupId: 'grp_default',
+    groupCode: 'default',
+    groupName: '默认用户组',
+    groupExpiresAt: null,
+    isExpiredFallback: false,
+    maxNetworks: 3,
+    maxPeersPerNetwork: 8,
+    relayRateKbps: 512,
+    monthlyRelayQuotaBytes: 1073741824,
+    usedNetworks: 1,
+    usedMonthlyRelayBytes: 2048,
+    ...overrides,
+  };
+}
+
+/** 登录/注册响应的公开策略段 */
+function makePublicPolicy(overrides = {}) {
+  return {
+    allowSignup: true,
+    requireEmailVerification: false,
+    smtpConfigured: true,
+    maxNetworksPerUser: 3,
+    defaultMaxPeers: 8,
+    ...overrides,
+  };
+}
+
+/** GET /api/v1/admin/runtime 的运行态 */
+function makeRuntimeStatus(overrides = {}) {
+  return {
+    listenPort: 19393,
+    udpPort: 19394,
+    udpAltPort: 19395,
+    storageDriver: 'sqlite',
+    secretSource: 'env',
+    publicUrlEffective: 'https://gw.example.com',
+    publicUrlSource: 'settings',
+    smtpConfigured: true,
+    onlineDevices: 3,
+    totalLiveRelayKbps: 12.5,
+    cumulativeRelayBytes: 1048576,
+    securityWarnings: [],
+    ...overrides,
+  };
+}
+
+/** GET/PATCH /api/v1/admin/settings 的完整脱敏视图 */
+function makeAdminSettings(overrides = {}) {
+  return {
+    allowSignup: true,
+    requireEmailVerification: false,
+    maxNetworksPerUser: 3,
+    defaultMaxPeers: 8,
+    relayRateKbps: 512,
+    publicUrl: null,
+    sessionTtlDays: 7,
+    defaultGroupId: 'grp_default',
+    smtp: {
+      configured: false,
+      host: '',
+      port: 0,
+      security: 'starttls',
+      username: '',
+      hasPassword: false,
+      fromAddress: '',
+      fromName: '',
+      rejectUnauthorized: true,
+    },
+    adminApiKey: { configured: false, prefix: null, createdAt: null },
+    ...overrides,
+  };
+}
+
+/** GET /api/v1/admin/groups 的行（UserGroupRecord + userCount） */
+function makeGroup(id, overrides = {}) {
+  return {
+    id,
+    code: id.replace(/^grp_/, ''),
+    name: `组-${id}`,
+    description: '',
+    isDefault: false,
+    maxNetworks: 3,
+    maxPeersPerNetwork: 8,
+    relayRateKbps: 512,
+    monthlyRelayQuotaBytes: null,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    userCount: 1,
+    ...overrides,
+  };
+}
+
+/** GET /api/v1/admin/users 的 19 键行 */
+function makeAdminUserRow(id, overrides = {}) {
+  return {
+    id,
+    email: `${id}@local`,
+    role: 'user',
+    active: true,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    emailVerifiedAt: null,
+    groupId: 'grp_default',
+    groupCode: 'default',
+    groupName: '默认用户组',
+    effectiveGroupId: 'grp_default',
+    effectiveGroupName: '默认用户组',
+    groupExpiresAt: null,
+    isExpiredFallback: false,
+    maxNetworks: 3,
+    networkCount: 1,
+    onlineDevices: 0,
+    relayKbps: 0,
+    monthlyRelayBytes: 0,
+    monthlyRelayQuotaBytes: null,
+    ...overrides,
+  };
+}
 
 // ---------------------------------------------------------------- i18n 词典
 
@@ -1216,5 +1356,755 @@ describe('PS-4b：NetworkView 分项快速复制（网关地址 / 网络 ID / �
       source.includes("onCopyField?.(network.joinKey, 'toast.joinPassphraseCopied')"),
       '点击口令复制按钮时交由回调复制完整 joinKey 并弹独立提示',
     );
+  });
+});
+
+// ---------------------------------------------------------------- GC-7b：配额格式化与用量档位
+
+describe('GC-7b：formatBytesQuota 配额字节', () => {
+  test('null（不限额）→ 固定双语「不限 / Unlimited」，不随 locale 变', () => {
+    assert.equal(formatBytesQuota(null, 'zh'), '不限 / Unlimited');
+    assert.equal(formatBytesQuota(null, 'en'), '不限 / Unlimited');
+  });
+
+  test('0 与契约外垃圾值（负数 / NaN）→ 0 KB，绝不出 B 档或负数', () => {
+    assert.equal(formatBytesQuota(0, 'zh'), '0 KB');
+    assert.equal(formatBytesQuota(-5, 'zh'), '0 KB');
+    assert.equal(formatBytesQuota(Number.NaN, 'en'), '0 KB');
+  });
+
+  test('整数字节按 KB / MB / GB / TB 升单位，不足 1 KB 显示 <1 KB', () => {
+    assert.equal(formatBytesQuota(512, 'zh'), '<1 KB');
+    assert.equal(formatBytesQuota(1024, 'zh'), '1 KB');
+    assert.equal(formatBytesQuota(2048, 'zh'), '2 KB');
+    assert.equal(formatBytesQuota(1024 * 1024 * 1.5, 'zh'), '1.5 MB');
+    assert.equal(formatBytesQuota(100 * 1024 * 1024, 'zh'), '100 MB');
+    assert.equal(formatBytesQuota(1024 * 1024 * 1024 * 1.5, 'zh'), '1.5 GB');
+    assert.equal(formatBytesQuota(1024 ** 4, 'zh'), '1 TB');
+    assert.equal(formatBytesQuota(1024 ** 4 * 2.5, 'zh'), '2.5 TB');
+  });
+
+  test('数字与单位刻意语言无关：zh / en 输出一致', () => {
+    assert.equal(formatBytesQuota(2048, 'zh'), formatBytesQuota(2048, 'en'));
+    assert.equal(formatBytesQuota(1024 ** 4 * 2.5, 'en'), '2.5 TB');
+  });
+});
+
+describe('GC-7b：computeUsagePercent 钳位百分比', () => {
+  test('0 / 80% / 100% / 超限钳位', () => {
+    assert.equal(computeUsagePercent(0, 100), 0);
+    assert.equal(computeUsagePercent(80, 100), 80);
+    assert.equal(computeUsagePercent(8, 10), 80, '浮点毛刺被一位小数四舍五入吸收');
+    assert.equal(computeUsagePercent(100, 100), 100);
+    assert.equal(computeUsagePercent(150, 100), 100, '超限钳位到 100，超限事实由 isQuotaExceeded 表达');
+    assert.equal(computeUsagePercent(24, 25), 96);
+  });
+
+  test('null 上限（不限额）或 limit <= 0 → null，调用方据此不渲染进度条', () => {
+    assert.equal(computeUsagePercent(50, null), null);
+    assert.equal(computeUsagePercent(0, null), null);
+    assert.equal(computeUsagePercent(50, 0), null);
+    assert.equal(computeUsagePercent(50, -1), null);
+  });
+
+  test('用量侧垃圾值（负数 / NaN）按 0 处理，不产生负百分比', () => {
+    assert.equal(computeUsagePercent(-5, 100), 0);
+    assert.equal(computeUsagePercent(Number.NaN, 100), 0);
+  });
+});
+
+describe('GC-7b：quotaUsageLevel / isQuotaExceeded', () => {
+  test('进度条档位阈值：>=100% danger、>=80% warn、否则 ok', () => {
+    assert.equal(quotaUsageLevel(0, 100), 'ok');
+    assert.equal(quotaUsageLevel(79, 100), 'ok');
+    assert.equal(quotaUsageLevel(80, 100), 'warn');
+    assert.equal(quotaUsageLevel(99, 100), 'warn');
+    assert.equal(quotaUsageLevel(100, 100), 'danger');
+    assert.equal(quotaUsageLevel(500, 100), 'danger');
+  });
+
+  test('不限额（null）或无效上限永远 ok——不限额没有「快用完」', () => {
+    assert.equal(quotaUsageLevel(999, null), 'ok');
+    assert.equal(quotaUsageLevel(999, 0), 'ok');
+    assert.equal(quotaUsageLevel(999, -1), 'ok');
+  });
+
+  test('超限判定与钳位分工：percent 封顶 100，exceeded 独立报真', () => {
+    assert.equal(isQuotaExceeded(99, 100), false);
+    assert.equal(isQuotaExceeded(100, 100), true);
+    assert.equal(isQuotaExceeded(150, 100), true);
+    assert.equal(isQuotaExceeded(150, null), false, '不限额永不超限');
+    assert.equal(isQuotaExceeded(150, 0), false, '无效上限不算超限');
+  });
+});
+
+describe('GC-7b：formatQuotaExpiry 配额到期展示', () => {
+  const future = '2026-06-01T00:00:00.000Z';
+  const before = Date.parse('2026-01-15T00:00:00.000Z');
+  const after = Date.parse('2026-07-01T00:00:00.000Z');
+
+  test('null → 长期有效 / No expiry（按 locale 取词）', () => {
+    assert.equal(formatQuotaExpiry(null, 'zh', before), '长期有效');
+    assert.equal(formatQuotaExpiry(null, 'en', before), 'No expiry');
+  });
+
+  test('未到期 → UTC 年月日；到期（含同刻）→ 尾缀到期标记', () => {
+    assert.equal(formatQuotaExpiry(future, 'zh', before), '2026-06-01');
+    assert.equal(formatQuotaExpiry(future, 'en', before), '2026-06-01');
+    assert.equal(formatQuotaExpiry(future, 'zh', after), '2026-06-01（已到期）');
+    assert.equal(formatQuotaExpiry(future, 'en', after), '2026-06-01 (expired)');
+    assert.equal(formatQuotaExpiry(future, 'zh', Date.parse(future)), '2026-06-01（已到期）', '到期当刻即算已到期');
+  });
+
+  test('无法解析的 ISO → —，绝不抛错或显示 Invalid Date', () => {
+    assert.equal(formatQuotaExpiry('not-a-date', 'zh', before), '—');
+  });
+});
+
+// ---------------------------------------------------------------- GC-7b：邀请链接掩码（?tls 契约）与无头命令
+
+describe('GC-7b：maskInviteUri 保留统一链接查询串', () => {
+  test('?tls=0|1 查询串在 # 之前原样保留，# 之后掩码', () => {
+    assert.equal(
+      maskInviteUri('zr-net://gw.local:19393/0123456789abcdef?tls=0#secret'),
+      'zr-net://gw.local:19393/0123456789abcdef?tls=0#••••••••',
+    );
+    assert.equal(
+      maskInviteUri('zr-net://gw.local:19393/0123456789abcdef?tls=1#secret'),
+      'zr-net://gw.local:19393/0123456789abcdef?tls=1#••••••••',
+    );
+  });
+
+  test('老格式输入（无 ?tls、口令里还有 #）依旧只认第一个 #', () => {
+    assert.equal(maskInviteUri('zr-net://gw.local/0123456789abcdef#a#b'), 'zr-net://gw.local/0123456789abcdef#••••••••');
+    assert.equal(maskInviteUri('zr-net://203.0.113.10:19393/netid?tls=0#a#b'), 'zr-net://203.0.113.10:19393/netid?tls=0#••••••••');
+  });
+});
+
+describe('GC-7b：buildHeadlessJoinCommand 无头接入命令', () => {
+  test('普通统一链接原样包进双引号', () => {
+    assert.equal(
+      buildHeadlessJoinCommand('zr-net://gw.local:19393/0123456789abcdef?tls=0#secret'),
+      'dsh-zen-remote setup --role peer --invite "zr-net://gw.local:19393/0123456789abcdef?tls=0#secret"',
+    );
+  });
+
+  test('双引号 / 反斜杠 / $ / 反引号统一前置反斜杠转义，命令不被截断或展开', () => {
+    assert.equal(
+      buildHeadlessJoinCommand('zr-net://gw.local/n#se"cret'),
+      'dsh-zen-remote setup --role peer --invite "zr-net://gw.local/n#se\\"cret"',
+    );
+    assert.equal(
+      buildHeadlessJoinCommand('zr-net://gw.local/n#x$y`z'),
+      'dsh-zen-remote setup --role peer --invite "zr-net://gw.local/n#x\\$y\\`z"',
+    );
+    assert.equal(
+      buildHeadlessJoinCommand('zr-net://gw.local/n#a\\b'),
+      'dsh-zen-remote setup --role peer --invite "zr-net://gw.local/n#a\\\\b"',
+    );
+  });
+});
+
+// ---------------------------------------------------------------- GC-7b：locales 错误码与管理文案完整性
+
+describe('GC-7b：GC-5/GC-6 新错误码与管理文案键完整性', () => {
+  const errorCodeKeys = [
+    'error.otpCooldown',
+    'error.otpInvalid',
+    'error.otpLocked',
+    'error.rateLimited',
+    'error.smtpNotConfigured',
+    'error.smtpSendFailed',
+    'error.currentPasswordWrong',
+    'error.noteTooLong',
+    'error.peerLimitByGroup',
+    'error.cannotRemoveLastAdmin',
+    'error.cannotDeleteDefaultGroup',
+    'error.groupInUse',
+    'error.duplicateGroupCode',
+    'error.invalidApiKey',
+  ];
+
+  const adminCopyKeys = [
+    'admin.tabUsers',
+    'admin.tabGroups',
+    'admin.tabSettings',
+    'admin.runtimeTcpPort',
+    'admin.runtimeStorage',
+    'admin.runtimeMasterKey',
+    'admin.advisoryTitle',
+    'admin.newUser',
+    'admin.emailVerified',
+    'admin.columnGroup',
+    'admin.columnExpiry',
+    'admin.columnMonthlyTraffic',
+    'admin.newGroup',
+    'admin.groupName',
+    'admin.groupCode',
+    'admin.isDefaultGroup',
+    'admin.groupPeerCap',
+    'admin.monthlyQuotaGb',
+    'admin.quotaThrottleNote',
+    'admin.publicUrl',
+    'admin.requireEmailVerification',
+    'admin.sessionTtlDays',
+    'admin.smtpTitle',
+    'admin.smtpHost',
+    'admin.smtpTestSend',
+    'admin.apiKeyTitle',
+    'admin.apiKeyOnce',
+    'admin.apiKeyPrefixLabel',
+    'network.partHeadlessCommand',
+    'network.headlessCommandHint',
+    'accountSettings.title',
+    'accountSettings.monthlyTraffic',
+    'common.unlimited',
+    'common.usedOfLimit',
+  ];
+
+  test('错误码键中英齐备且都能取词（删键会被钉住）', () => {
+    for (const key of errorCodeKeys) {
+      assert.ok(key in LOCALES.zh, `zh 缺少 ${key}`);
+      assert.ok(key in LOCALES.en, `en 缺少 ${key}`);
+      assert.ok(translate('zh', key).length > 0);
+      assert.ok(translate('en', key).length > 0);
+    }
+  });
+
+  test('管理三标签页 / 运行态 / 设置页关键文案键中英齐备', () => {
+    for (const key of adminCopyKeys) {
+      assert.ok(key in LOCALES.zh, `zh 缺少 ${key}`);
+      assert.ok(key in LOCALES.en, `en 缺少 ${key}`);
+      assert.ok(LOCALES.zh[key].length > 0);
+      assert.ok(LOCALES.en[key].length > 0);
+    }
+  });
+
+  test('带插值的错误/提示词条取词正常', () => {
+    assert.equal(translate('zh', 'admin.smtpTestFailed', { message: '超时' }), '发送失败：超时');
+    assert.equal(translate('zh', 'common.usedOfLimit', { used: 2, limit: 3 }), '已用 2 / 3');
+    assert.equal(translate('en', 'common.usedOfLimit', { used: 2, limit: 3 }), 'Used 2 / 3');
+  });
+});
+
+// ---------------------------------------------------------------- GC-7b：ConsoleClient 新方法契约
+
+describe('GC-7b：ConsoleClient 认证自助方法（路径 / 方法 / 体）', () => {
+  test('sendOtp：POST /auth/send-otp，邮箱归一化，purpose 与 locale 透传', async () => {
+    const data = { sent: true, cooldownSec: 60 };
+    const { calls, impl } = fakeFetch(() => jsonEnvelope(200, { ok: true, data }));
+    const client = new ConsoleClient({ fetchImpl: impl });
+
+    const result = await client.sendOtp({ email: ' Owner@Local ', purpose: 'signup', locale: 'en' });
+    assert.deepEqual(result, data);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, '/api/v1/auth/send-otp');
+    assert.equal(calls[0].init.method, 'POST');
+    assert.deepEqual(JSON.parse(calls[0].init.body), { email: 'owner@local', purpose: 'signup', locale: 'en' });
+
+    await client.sendOtp({ email: 'a@b.c', purpose: 'reset_password' });
+    assert.deepEqual(JSON.parse(calls[1].init.body), { email: 'a@b.c', purpose: 'reset_password' }, 'locale 省略时不占键');
+  });
+
+  test('signup：带 otpCode 与不带两种形态；返回完整 SessionPayload 信封数据', async () => {
+    const data = {
+      user: { ...TEST_USER, emailVerifiedAt: null },
+      quota: makeQuota(),
+      allowSignup: true,
+      requireEmailVerification: true,
+      smtpConfigured: true,
+      maxNetworksPerUser: 3,
+      defaultMaxPeers: 8,
+    };
+    const { calls, impl } = fakeFetch(() => jsonEnvelope(200, { ok: true, data }));
+    const client = new ConsoleClient({ fetchImpl: impl });
+
+    const withOtp = await client.signup('Owner@Local ', 'pw123456', '123456');
+    assert.deepEqual(withOtp, data);
+    assert.deepEqual(JSON.parse(calls[0].init.body), { email: 'owner@local', password: 'pw123456', otpCode: '123456' });
+
+    const withoutOtp = await client.signup('owner@local', 'pw123456');
+    assert.deepEqual(withoutOtp, data);
+    const body = JSON.parse(calls[1].init.body);
+    assert.equal('otpCode' in body, false, '未传验证码时不得发空 otpCode 键');
+  });
+
+  test('resetPassword / changeMyPassword：路径与体逐字段核对', async () => {
+    const { calls, impl } = fakeFetch(() => jsonEnvelope(200, { ok: true, data: { reset: true } }));
+    const client = new ConsoleClient({ fetchImpl: impl });
+
+    await client.resetPassword({ email: ' Owner@Local ', otpCode: '654321', newPassword: 'newpass123' });
+    assert.equal(calls[0].url, '/api/v1/auth/reset-password');
+    assert.equal(calls[0].init.method, 'POST');
+    assert.deepEqual(JSON.parse(calls[0].init.body), { email: 'owner@local', otpCode: '654321', newPassword: 'newpass123' });
+
+    await client.changeMyPassword({ currentPassword: 'old-pass-1', newPassword: 'newpass123' });
+    assert.equal(calls[1].url, '/api/v1/auth/account/password');
+    assert.equal(calls[1].init.method, 'PATCH');
+    assert.deepEqual(JSON.parse(calls[1].init.body), { currentPassword: 'old-pass-1', newPassword: 'newpass123' });
+  });
+
+  test('换绑邮箱两步：request 返回 otpRequired 形态；confirm 未传 otpCode 不占键', async () => {
+    const { calls, impl } = fakeFetch((url) =>
+      jsonEnvelope(200, {
+        ok: true,
+        data: url === '/api/v1/auth/account/email/request' ? { otpRequired: false, cooldownSec: 0 } : { user: { ...TEST_USER, emailVerifiedAt: null } },
+      }),
+    );
+    const client = new ConsoleClient({ fetchImpl: impl });
+
+    const requested = await client.requestEmailChange({ currentPassword: 'pw123456', newEmail: ' New@Local ', locale: 'zh' });
+    assert.deepEqual(requested, { otpRequired: false, cooldownSec: 0 }, 'SMTP 未配置时后端放行直改');
+    assert.equal(calls[0].url, '/api/v1/auth/account/email/request');
+    assert.deepEqual(JSON.parse(calls[0].init.body), { currentPassword: 'pw123456', newEmail: 'new@local', locale: 'zh' });
+
+    await client.confirmEmailChange({ currentPassword: 'pw123456', newEmail: 'new@local' });
+    assert.equal(calls[1].url, '/api/v1/auth/account/email');
+    const body = JSON.parse(calls[1].init.body);
+    assert.equal('otpCode' in body, false, 'SMTP 未配置路径不发验证码键');
+  });
+});
+
+describe('GC-7b：ConsoleClient 管理 API 方法（路径 / 方法 / 体）', () => {
+  test('运行态与设置：GET /admin/runtime、GET/PATCH /admin/settings', async () => {
+    const settings = makeAdminSettings({ publicUrl: 'https://gw.example.com' });
+    const { calls, impl } = fakeFetch((url) =>
+      jsonEnvelope(200, { ok: true, data: url === '/api/v1/admin/runtime' ? makeRuntimeStatus() : settings }),
+    );
+    const client = new ConsoleClient({ fetchImpl: impl });
+
+    const runtime = await client.getAdminRuntime();
+    assert.deepEqual(runtime, makeRuntimeStatus());
+    assert.equal(calls[0].url, '/api/v1/admin/runtime');
+    assert.equal(calls[0].init.method, 'GET');
+    assert.equal(calls[0].init.body, undefined);
+
+    const got = await client.getAdminSettings();
+    assert.deepEqual(got, settings);
+    assert.equal(calls[1].url, '/api/v1/admin/settings');
+
+    const patched = await client.updateAdminSettings({
+      allowSignup: false,
+      publicUrl: null,
+      sessionTtlDays: 30,
+      smtp: { host: 'smtp.local', port: 465, security: 'tls', fromAddress: 'from@x.y' },
+    });
+    assert.deepEqual(patched, settings);
+    assert.equal(calls[2].init.method, 'PATCH');
+    assert.deepEqual(JSON.parse(calls[2].init.body), {
+      allowSignup: false,
+      publicUrl: null,
+      sessionTtlDays: 30,
+      smtp: { host: 'smtp.local', port: 465, security: 'tls', fromAddress: 'from@x.y' },
+    });
+  });
+
+  test('smtp-test / api-key：测试发信草稿透传；rotate 返回一次性明文', async () => {
+    const draft = { host: 'smtp.local', port: 587, security: 'starttls', fromAddress: 'from@x.y' };
+    const { calls, impl } = fakeFetch((url) =>
+      jsonEnvelope(200, {
+        ok: true,
+        data:
+          url === '/api/v1/admin/settings/api-key'
+            ? { apiKey: 'zr_adm_secret', prefix: 'zr_adm_secret', createdAt: '2026-01-01T00:00:00.000Z' }
+            : { sent: true },
+      }),
+    );
+    const client = new ConsoleClient({ fetchImpl: impl });
+
+    const sent = await client.sendSmtpTest({ toEmail: 'me@x.y', locale: 'en', smtp: draft });
+    assert.deepEqual(sent, { sent: true });
+    assert.equal(calls[0].url, '/api/v1/admin/settings/smtp-test');
+    assert.deepEqual(JSON.parse(calls[0].init.body), { toEmail: 'me@x.y', locale: 'en', smtp: draft });
+
+    const rotated = await client.rotateAdminApiKey();
+    assert.deepEqual(rotated, { apiKey: 'zr_adm_secret', prefix: 'zr_adm_secret', createdAt: '2026-01-01T00:00:00.000Z' });
+    assert.equal(calls[1].url, '/api/v1/admin/settings/api-key');
+    assert.equal(calls[1].init.method, 'POST');
+    assert.equal(calls[1].init.body, undefined);
+
+    await client.revokeAdminApiKey();
+    assert.equal(calls[2].init.method, 'DELETE');
+    assert.equal(calls[2].init.body, undefined);
+  });
+
+  test('用户组 CRUD：list/create/update/delete 路径与方法', async () => {
+    const groups = [makeGroup('grp_default', { isDefault: true })];
+    const { calls, impl } = fakeFetch((url, init) =>
+      jsonEnvelope(200, {
+        ok: true,
+        data:
+          init.method === 'GET'
+            ? groups
+            : init.method === 'DELETE'
+              ? { deleted: true }
+              : groups[0],
+      }),
+    );
+    const client = new ConsoleClient({ fetchImpl: impl });
+
+    assert.deepEqual(await client.listGroups(), groups);
+    assert.equal(calls[0].url, '/api/v1/admin/groups');
+
+    const created = await client.createGroup({
+      code: 'vip',
+      name: 'VIP 组',
+      maxNetworks: 10,
+      maxPeersPerNetwork: 16,
+      relayRateKbps: 1024,
+      monthlyRelayQuotaBytes: null,
+    });
+    assert.deepEqual(created, groups[0]);
+    assert.equal(calls[1].init.method, 'POST');
+    assert.deepEqual(JSON.parse(calls[1].init.body), {
+      code: 'vip',
+      name: 'VIP 组',
+      maxNetworks: 10,
+      maxPeersPerNetwork: 16,
+      relayRateKbps: 1024,
+      monthlyRelayQuotaBytes: null,
+    });
+
+    await client.updateGroup('g-1', { isDefault: true, monthlyRelayQuotaBytes: 5368709120 });
+    assert.equal(calls[2].url, '/api/v1/admin/groups/g-1');
+    assert.equal(calls[2].init.method, 'PATCH');
+    assert.deepEqual(JSON.parse(calls[2].init.body), { isDefault: true, monthlyRelayQuotaBytes: 5368709120 });
+
+    await client.deleteGroup('g-1');
+    assert.equal(calls[3].url, '/api/v1/admin/groups/g-1');
+    assert.equal(calls[3].init.method, 'DELETE');
+    assert.equal(calls[3].init.body, undefined);
+  });
+
+  test('用户管理 CRUD：邮箱归一化、generatedPassword 只在响应出现、id 走路径编码', async () => {
+    const row = makeAdminUserRow('u-9');
+    const { calls, impl } = fakeFetch((url, init) => {
+      let data = [row];
+      if (init.method === 'DELETE') data = { deleted: true };
+      if (url.endsWith('/reset-password')) data = JSON.parse(init.body).newPassword === undefined ? { reset: true, generatedPassword: 'gen-pass-16' } : { reset: true };
+      if (init.method === 'POST' && url === '/api/v1/admin/users') data = { ...row, generatedPassword: 'gen-pass-16' };
+      if (init.method === 'PATCH') data = row;
+      return jsonEnvelope(200, { ok: true, data });
+    });
+    const client = new ConsoleClient({ fetchImpl: impl });
+
+    const listed = await client.listAdminUsers();
+    assert.deepEqual(listed, [row]);
+    assert.equal(calls[0].url, '/api/v1/admin/users');
+
+    const created = await client.createAdminUser({ email: ' New@Local ', role: 'user', groupCode: 'default' });
+    assert.equal(created.generatedPassword, 'gen-pass-16');
+    assert.deepEqual(JSON.parse(calls[1].init.body), { email: 'new@local', role: 'user', groupCode: 'default' });
+
+    await client.updateAdminUser('u/1', { active: false, groupId: null });
+    assert.equal(calls[2].url, '/api/v1/admin/users/u%2F1', '路径 id 必须编码');
+    assert.deepEqual(JSON.parse(calls[2].init.body), { active: false, groupId: null });
+
+    await client.deleteAdminUser('u-9');
+    assert.equal(calls[3].url, '/api/v1/admin/users/u-9');
+    assert.equal(calls[3].init.method, 'DELETE');
+
+    const explicit = await client.resetAdminUserPassword('u-9', 'brandnew123');
+    assert.deepEqual(explicit, { reset: true }, '显式密码不返回 generatedPassword');
+    assert.deepEqual(JSON.parse(calls[4].init.body), { newPassword: 'brandnew123' });
+
+    const generated = await client.resetAdminUserPassword('u-9');
+    assert.deepEqual(generated, { reset: true, generatedPassword: 'gen-pass-16' });
+    assert.deepEqual(JSON.parse(calls[5].init.body), {}, '未传密码发空对象，后端按生成路径处理');
+  });
+
+  test('AbortSignal 透传：getAdminRuntime / listGroups 与既有 adminListUsers 一致', async () => {
+    const { calls, impl } = fakeFetch(() => jsonEnvelope(200, { ok: true, data: [] }));
+    const client = new ConsoleClient({ fetchImpl: impl });
+    const controller = new AbortController();
+
+    await client.getAdminRuntime(controller.signal);
+    assert.equal(calls[0].init.signal, controller.signal);
+    await client.listGroups(controller.signal);
+    assert.equal(calls[1].init.signal, controller.signal);
+    await client.listAdminUsers(controller.signal);
+    assert.equal(calls[2].init.signal, controller.signal);
+    await client.getAdminSettings();
+    assert.equal(calls[3].init.signal, undefined, '不传 signal 保持旧行为');
+  });
+});
+
+describe('GC-7b：ConsoleClient 新错误码映射', () => {
+  async function expectCode(run, status, code) {
+    const { impl } = fakeFetch(() => jsonEnvelope(status, { ok: false, error: { code, message: 'boom' } }));
+    const client = new ConsoleClient({ fetchImpl: impl });
+    await assert.rejects(
+      () => run(client),
+      (err) => {
+        assert.ok(err instanceof ConsoleApiError);
+        assert.equal(err.status, status);
+        assert.equal(err.code, code);
+        return true;
+      },
+    );
+  }
+
+  test('发码限流 / 注册关闭 / API Key 无效 / 测试发信失败 / 原密码错误', async () => {
+    await expectCode((c) => c.sendOtp({ email: 'a@b.c', purpose: 'signup' }), 429, 'OTP_COOLDOWN');
+    await expectCode((c) => c.signup('a@b.c', 'pw123456'), 403, 'SIGNUP_DISABLED');
+    await expectCode((c) => c.getAdminRuntime(), 401, 'INVALID_API_KEY');
+    await expectCode((c) => c.sendSmtpTest({ toEmail: 'a@b.c' }), 502, 'SMTP_SEND_FAILED');
+    await expectCode((c) => c.changeMyPassword({ currentPassword: 'x', newPassword: 'y' }), 401, 'INVALID_CREDENTIALS');
+  });
+});
+
+// ---------------------------------------------------------------- GC-7b：ConsoleStore 公开策略 / 配额 / 管理切片
+
+describe('GC-7b：ConsoleStore 公开策略与配额切片', () => {
+  test('init 未登录：publicPolicy 同步写入（含验证 / SMTP 策略），quota 为空', () => {
+    const store = new ConsoleStore();
+    store.init({
+      authenticated: false,
+      allowSignup: true,
+      requireEmailVerification: true,
+      smtpConfigured: false,
+      maxNetworksPerUser: 5,
+      defaultMaxPeers: 16,
+    });
+    const s = store.getState();
+    assert.equal(s.boot, 'ready');
+    assert.equal(s.session, null);
+    assert.deepEqual(s.publicPolicy, {
+      allowSignup: true,
+      requireEmailVerification: true,
+      smtpConfigured: false,
+      maxNetworksPerUser: 5,
+      defaultMaxPeers: 16,
+    });
+    assert.equal(s.quota, null);
+  });
+
+  test('init 登录态：session、quota、publicPolicy 三切片同步写入', () => {
+    const store = new ConsoleStore();
+    const quota = makeQuota({ usedNetworks: 2 });
+    store.init({
+      authenticated: true,
+      user: TEST_USER,
+      quota,
+      allowSignup: false,
+      requireEmailVerification: false,
+      smtpConfigured: true,
+      maxNetworksPerUser: 3,
+      defaultMaxPeers: 8,
+    });
+    const s = store.getState();
+    assert.equal(s.session?.user.id, TEST_USER.id);
+    assert.equal(s.quota, quota, 'quota 切片按引用存入');
+    assert.deepEqual(s.publicPolicy, {
+      allowSignup: false,
+      requireEmailVerification: false,
+      smtpConfigured: true,
+      maxNetworksPerUser: 3,
+      defaultMaxPeers: 8,
+    });
+  });
+
+  test('init 缺省字段兜底（启动降级路径只带旧两键）：关闸 + 内置默认 8 台', () => {
+    const store = new ConsoleStore();
+    store.init({ authenticated: false, allowSignup: false, maxNetworksPerUser: 3 });
+    assert.deepEqual(store.getState().publicPolicy, {
+      allowSignup: false,
+      requireEmailVerification: false,
+      smtpConfigured: false,
+      maxNetworksPerUser: 3,
+      defaultMaxPeers: 8,
+    });
+  });
+
+  test('applySessionPayload（登录/注册响应体）一次写入 session / meta / quota / publicPolicy', () => {
+    const store = new ConsoleStore();
+    store.init({ authenticated: false, allowSignup: true, requireEmailVerification: true, smtpConfigured: true, maxNetworksPerUser: 5, defaultMaxPeers: 16 });
+    const payload = {
+      user: TEST_USER,
+      quota: makeQuota({ usedNetworks: 2 }),
+      ...makePublicPolicy({ allowSignup: true, requireEmailVerification: false, smtpConfigured: true, maxNetworksPerUser: 9, defaultMaxPeers: 32 }),
+    };
+    store.applySessionPayload(payload);
+    const s = store.getState();
+    assert.equal(s.session?.user.id, TEST_USER.id);
+    assert.deepEqual(s.meta, { allowSignup: true, maxNetworksPerUser: 9 }, 'meta 沿旧两键契约同步');
+    assert.equal(s.quota?.usedNetworks, 2);
+    assert.equal(s.publicPolicy.requireEmailVerification, false, '登录成功后策略覆盖旧值');
+    assert.equal(s.publicPolicy.maxNetworksPerUser, 9);
+    assert.equal(s.publicPolicy.defaultMaxPeers, 32);
+  });
+
+  test('applyPublicPolicy / applyQuota 独立刷新且不改源对象', () => {
+    const state = createInitialState();
+    const policy = makePublicPolicy({ maxNetworksPerUser: 7 });
+    const withPolicy = applyPublicPolicy(state, policy);
+    assert.equal(withPolicy.publicPolicy, policy);
+    assert.deepEqual(state.publicPolicy, createInitialState().publicPolicy, '源状态不被原地修改');
+
+    const quota = makeQuota();
+    const withQuota = applyQuota(withPolicy, quota);
+    assert.equal(withQuota.quota, quota);
+    assert.equal(withQuota.publicPolicy, withPolicy.publicPolicy, '配额刷新不碰策略引用');
+
+    const cleared = applyQuota(withQuota, null);
+    assert.equal(cleared.quota, null);
+    assert.equal(cleared.publicPolicy, withPolicy.publicPolicy);
+  });
+});
+
+describe('GC-7b：ConsoleStore 管理员切片与引用隔离', () => {
+  const netA = 'a'.repeat(16);
+
+  function makeStore() {
+    const store = new ConsoleStore();
+    store.init({
+      authenticated: true,
+      user: { ...TEST_USER, role: 'admin' },
+      quota: makeQuota(),
+      allowSignup: true,
+      requireEmailVerification: false,
+      smtpConfigured: true,
+      maxNetworksPerUser: 3,
+      defaultMaxPeers: 8,
+    });
+    store.patchUi({ accountMenuOpen: true, loginEmail: 'a@b.c' });
+    store.setNetworks([makeNetworkView(netA, '家里')]);
+    const snap = makeSnapshot(netA);
+    store.applyTopologySnapshot(snap);
+    return { store, snap };
+  }
+
+  test('applyAdminRuntime / applyAdminGroups 刷新数据并把 phase 推到 ready，绝不污染 ui/topology/session 引用', () => {
+    const { store, snap } = makeStore();
+    const before = store.getState();
+
+    store.markAdminLoading('runtime');
+    let s = store.getState();
+    assert.equal(s.adminLoad.runtime, 'loading');
+    assert.equal(s.ui, before.ui, 'loading 标记也不碰 ui 引用');
+
+    const runtime = makeRuntimeStatus();
+    store.applyAdminRuntime(runtime);
+    s = store.getState();
+    assert.equal(s.adminRuntime, runtime);
+    assert.equal(s.adminLoad.runtime, 'ready');
+    assert.equal(s.adminError.runtime, null);
+    assert.equal(s.ui, before.ui);
+    assert.equal(s.topology[netA], snap, 'topology 切片引用不变');
+    assert.equal(s.networks, before.networks);
+    assert.equal(s.session, before.session);
+    assert.equal(s.quota, before.quota);
+
+    store.markAdminError('groups', 'boom');
+    s = store.getState();
+    assert.equal(s.adminLoad.groups, 'error');
+    assert.equal(s.adminError.groups, 'boom');
+
+    const groups = [makeGroup('grp_default', { isDefault: true })];
+    store.applyAdminGroups(groups);
+    s = store.getState();
+    assert.equal(s.adminGroups, groups);
+    assert.equal(s.adminLoad.groups, 'ready', '成功覆盖旧错误态');
+    assert.equal(s.adminError.groups, null);
+    assert.equal(s.ui, before.ui);
+    assert.equal(s.topology[netA], snap);
+  });
+
+  test('applyAdminSettings / applyAdminUsers 写入新形状（含 smtp 与 adminApiKey）并推 ready', () => {
+    const { store } = makeStore();
+    const settings = makeAdminSettings({
+      publicUrl: 'https://gw.example.com',
+      smtp: { configured: true, host: 'smtp.local', port: 465, security: 'tls', username: 'mailer', hasPassword: true, fromAddress: 'from@x.y', fromName: 'Mailer', rejectUnauthorized: true },
+      adminApiKey: { configured: true, prefix: 'zr_adm_4f9a', createdAt: '2026-01-01T00:00:00.000Z' },
+    });
+    const users = [makeAdminUserRow('u-9'), makeAdminUserRow('u-10', { role: 'admin' })];
+    store.applyAdminSettings(settings);
+    store.applyAdminUsers(users);
+    const s = store.getState();
+    assert.equal(s.adminSettings, settings);
+    assert.equal(s.adminSettings.smtp.configured, true);
+    assert.equal(s.adminSettings.adminApiKey.prefix, 'zr_adm_4f9a');
+    assert.equal(s.adminLoad.settings, 'ready');
+    assert.equal(s.adminUsers, users);
+    assert.equal(s.adminLoad.users, 'ready');
+    assert.equal(s.adminError.users, null);
+  });
+
+  test('纯函数 applyAdminRuntime / applyAdminGroups 不改源状态（新增对象返回）', () => {
+    const state = createInitialState();
+    const runtime = makeRuntimeStatus();
+    const withRuntime = applyAdminRuntime(state, runtime);
+    assert.equal(state.adminRuntime, null, '源状态不被原地修改');
+    assert.equal(withRuntime.adminRuntime, runtime);
+    const groups = [makeGroup('g-1')];
+    const withGroups = applyAdminGroups(withRuntime, groups);
+    assert.deepEqual(withRuntime.adminGroups, [], '中间状态不被原地修改');
+    assert.equal(withGroups.adminGroups, groups);
+  });
+
+  test('logout 清 quota 与管理员四切片（含加载/错误态）；publicPolicy 与 ui 保留', () => {
+    const { store } = makeStore();
+    store.applyAdminRuntime(makeRuntimeStatus());
+    store.applyAdminGroups([makeGroup('g-1')]);
+    store.applyAdminSettings(makeAdminSettings());
+    store.applyAdminUsers([makeAdminUserRow('u-9')]);
+    const before = store.getState();
+
+    store.logout({ allowSignup: false, maxNetworksPerUser: 3 });
+    const s = store.getState();
+    assert.equal(s.session, null);
+    assert.equal(s.quota, null, '配额是会话数据，登出即清');
+    assert.equal(s.adminRuntime, null);
+    assert.equal(s.adminSettings, null);
+    assert.deepEqual(s.adminGroups, []);
+    assert.deepEqual(s.adminUsers, []);
+    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle' });
+    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null });
+    assert.equal(s.ui, before.ui, '表单草稿保留（既有契约）');
+    assert.deepEqual(s.publicPolicy, before.publicPolicy, '公开策略匿名可见，登出不删');
+    assert.deepEqual(s.networks, []);
+    assert.deepEqual(s.topology, {});
+    assert.deepEqual(s.meta, { allowSignup: false, maxNetworksPerUser: 3 });
+  });
+
+  test('clearAdminSlices（切出管理页 / 401）：只清管理切片，session/quota/ui/topology 原样', () => {
+    const { store, snap } = makeStore();
+    store.applyAdminRuntime(makeRuntimeStatus());
+    store.applyAdminGroups([makeGroup('g-1')]);
+    store.applyAdminSettings(makeAdminSettings());
+    store.applyAdminUsers([makeAdminUserRow('u-9')]);
+    store.markAdminError('runtime', 'boom');
+    const before = store.getState();
+
+    store.clearAdminSlices();
+    const s = store.getState();
+    assert.equal(s.adminRuntime, null);
+    assert.equal(s.adminSettings, null);
+    assert.deepEqual(s.adminGroups, []);
+    assert.deepEqual(s.adminUsers, []);
+    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle' });
+    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null });
+    assert.equal(s.session, before.session, '会话不动');
+    assert.equal(s.quota, before.quota, '配额不动');
+    assert.equal(s.ui, before.ui);
+    assert.equal(s.topology[netA], snap);
+    assert.equal(s.networks, before.networks);
+  });
+
+  test('markAdminError 保留旧数据兜底：数据切片不动、错误消息独立记录', () => {
+    const { store } = makeStore();
+    const users = [makeAdminUserRow('u-9')];
+    store.applyAdminUsers(users);
+
+    store.markAdminLoading('users');
+    let s = store.getState();
+    assert.equal(s.adminLoad.users, 'loading');
+    assert.equal(s.adminUsers, users, 'loading 不清数据');
+
+    store.markAdminError('users', 'net down');
+    s = store.getState();
+    assert.equal(s.adminLoad.users, 'error');
+    assert.equal(s.adminError.users, 'net down');
+    assert.equal(s.adminUsers, users, '失败保留旧数据供展示兜底');
   });
 });
