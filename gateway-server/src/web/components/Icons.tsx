@@ -308,3 +308,27 @@ export function LockIcon(props: IconProps) {
     </Icon>
   );
 }
+
+/** 单个账号（头像轮廓） */
+export function UserIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <circle cx="12" cy="8" r="4" />
+      <path d="M5 20a7 7 0 0 1 14 0" />
+    </Icon>
+  );
+}
+
+/** 网络拓扑（三节点互连） */
+export function NetworkIcon(props: IconProps) {
+  return (
+    <Icon {...props}>
+      <circle cx="12" cy="5" r="2.5" />
+      <circle cx="5" cy="19" r="2.5" />
+      <circle cx="19" cy="19" r="2.5" />
+      <path d="M10.8 7.2 6.2 16.8" />
+      <path d="M13.2 7.2l4.6 9.6" />
+      <path d="M7.5 19h9" />
+    </Icon>
+  );
+}

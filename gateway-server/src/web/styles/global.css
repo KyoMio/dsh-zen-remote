@@ -165,6 +165,31 @@ button {
   border-bottom: 1px solid var(--line);
 }
 
+.brand-home {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  padding: 0 6px;
+  margin-left: -6px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  flex: none;
+}
+
+.brand-home:hover {
+  background: var(--surface-2);
+}
+
+.brand-home:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
 .brand-mark {
   display: grid;
   place-items: center;
@@ -287,6 +312,33 @@ button {
 
 .menu-item:hover {
   background: var(--surface-2);
+}
+
+.menu-item:focus-visible {
+  outline: none;
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+
+.menu-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  color: var(--ink-2);
+}
+
+.menu-item[aria-checked='true'] .menu-icon {
+  color: var(--accent);
+}
+
+.menu-item-trailing {
+  margin-left: auto;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  color: var(--accent);
 }
 
 .menu-check {
@@ -1968,12 +2020,21 @@ html[data-theme='dark'] dialog.modal::backdrop {
   word-break: break-all;
   font-size: 13px;
   color: var(--ink);
+  user-select: all;
 }
 
 .secret-reveal .btn {
   flex: none;
   display: inline-flex;
   align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.secret-copy-status {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  color: var(--ok);
 }
 
 /* ---------- 配额进度条（正常 / warn / danger 三档，4px 细线不占格子底色） ---------- */

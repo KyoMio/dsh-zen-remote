@@ -136,6 +136,7 @@ export function App() {
   const [theme, setTheme] = useState<Theme>(readStoredTheme);
   const [view, setView] = useState<ViewKind>('networks');
   const [selectedNetworkId, setSelectedNetworkId] = useState<string | null>(null);
+  const [homeEpoch, setHomeEpoch] = useState(0);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<LocaleKey | null>(null);
   const [bootFailed, setBootFailed] = useState(false);
@@ -756,6 +757,18 @@ export function App() {
     [refreshSessionAndNetworks, showToast],
   );
 
+  /** 点击左上角品牌标识一键回到默认主页面：第一个网络概览（无网络时回空态引导页） */
+  const handleGoHome = useCallback((): void => {
+    setView('networks');
+    setSelectedNetworkId(state.networks[0]?.id ?? null);
+    setHomeEpoch((n) => n + 1);
+    store.patchUi({
+      networkSwitcherOpen: false,
+      accountMenuOpen: false,
+      confirmTarget: null,
+    });
+  }, [state.networks]);
+
   // ---------------------------------------------------------------- 渲染
 
   if (state.boot === 'loading') {
@@ -805,6 +818,7 @@ export function App() {
         selectedNetworkId={selectedNetworkId}
         onSelectNetwork={setSelectedNetworkId}
         onCreateNetwork={handleCreateNetworkOpen}
+        onGoHome={handleGoHome}
         view={view}
         onChangeView={setView}
         theme={theme}
@@ -838,6 +852,7 @@ export function App() {
           />
         ) : selected !== null ? (
           <NetworkView
+            key={`${selected.id}:${homeEpoch}`}
             t={t}
             network={selected}
             topology={state.topology[selected.id] ?? null}

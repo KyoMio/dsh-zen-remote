@@ -30,6 +30,7 @@ export const ZH = {
   'view.admin': '网关管理',
 
   'nav.networks': '网络',
+  'nav.goHome': '返回默认网络',
 
   'network.name': '名称',
   'network.devices': '设备',
@@ -87,6 +88,9 @@ export const ZH = {
   'common.save': '保存',
   'common.create': '创建',
   'common.copy': '复制',
+  'common.copied': '已复制',
+  'common.secretCopied': '已复制到剪贴板',
+  'common.secretCopyFailed': '自动复制受限，已为你选中内容，请按 Ctrl+C 或 ⌘C 复制',
   'common.remove': '移除',
   'common.confirmRemove': '确认移除',
   'common.reset': '重置',
@@ -415,6 +419,7 @@ export const EN: Record<LocaleKey, string> = {
   'view.admin': 'Gateway admin',
 
   'nav.networks': 'Networks',
+  'nav.goHome': 'Back to primary network',
 
   'network.name': 'Name',
   'network.devices': 'Devices',
@@ -471,6 +476,9 @@ export const EN: Record<LocaleKey, string> = {
   'common.save': 'Save',
   'common.create': 'Create',
   'common.copy': 'Copy',
+  'common.copied': 'Copied',
+  'common.secretCopied': 'Copied to clipboard',
+  'common.secretCopyFailed': 'Auto-copy blocked — text selected, press Ctrl+C or ⌘C to copy',
   'common.remove': 'Remove',
   'common.confirmRemove': 'Confirm removal',
   'common.reset': 'Reset',

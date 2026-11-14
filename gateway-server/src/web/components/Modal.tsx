@@ -39,6 +39,7 @@ function resolveCloseLabel(): string {
 
 export function Modal({ title, subtitle, onClose, children }: ModalProps) {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const pointerDownOnDialogRef = useRef(false);
   const titleId = useId();
 
   // 永远指向最新 onClose：effect 只装一次，父组件换引用也照常取到
@@ -75,10 +76,15 @@ export function Modal({ title, subtitle, onClose, children }: ModalProps) {
       closedby="any"
       className="modal"
       aria-labelledby={titleId}
+      onPointerDown={(event) => {
+        pointerDownOnDialogRef.current = event.target === dialogRef.current;
+      }}
       onClick={(event) => {
-        // 点击遮罩关闭：::backdrop 上的点击 target 是 <dialog> 自己，
-        // 点在内容上时 target 是子元素，不会误关
-        if (event.target === dialogRef.current) onCloseRef.current();
+        // 要求按下与松开都在 ::backdrop（<dialog> 本身）才关闭，
+        // 避免用户在弹窗内拖选密码划到遮罩上松手时误关弹窗。
+        const startedOnBackdrop = pointerDownOnDialogRef.current;
+        pointerDownOnDialogRef.current = false;
+        if (startedOnBackdrop && event.target === dialogRef.current) onCloseRef.current();
       }}
     >
       <header className="modal-header">

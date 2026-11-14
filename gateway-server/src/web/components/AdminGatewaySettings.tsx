@@ -700,6 +700,9 @@ function ApiKeySection(props: {
             hint={t('admin.apiKeyOnce')}
             value={revealed.apiKey}
             copyLabel={t('common.copy')}
+            copiedLabel={t('common.copied')}
+            copiedHint={t('common.secretCopied')}
+            copyFailedHint={t('common.secretCopyFailed')}
             doneLabel={t('common.done')}
             onDone={closeReveal}
           />
