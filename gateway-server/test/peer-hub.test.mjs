@@ -12,6 +12,7 @@ import net from 'node:net';
 
 import { createGatewayApiServer } from '../dist/server.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
+import { currentUtcYearMonth } from '../dist/store/types.js';
 import { deriveMasterKeyFromSecret, hashPassword } from '../dist/master-key.js';
 import { PeerRateLimiter } from '../dist/peer-hub/rate-limiter.js';
 import { formatRate } from '../dist/web/format.js';
@@ -480,6 +481,8 @@ async function startGateway(opts = {}) {
     masterKey,
     rateTickMs: opts.rateTickMs ?? null, // 缺省关掉速率跳动定时器，按需开
     flushMs: opts.flushMs ?? null, // 缺省关掉遥测刷盘定时器，按需开
+    // GC-3：注入时钟（令牌桶无回填可精确算术；月度记账与快照年月随之自洽）
+    ...(opts.now !== undefined ? { now: opts.now } : {}),
   });
   const server = createGatewayApiServer({ store, masterKey, runtime: hub, hooks: hub.hooks, topology: hub });
   await new Promise((resolve, reject) => {
@@ -2734,6 +2737,145 @@ describe('PC-03 fix2：初次入网认证的成员代次守卫', () => {
       const topo = await getTopology(gw, net.id);
       assert.equal(topo.members.find((m) => m.nodeId === c.nodeId).status, 'authorized');
       assert.equal(topo.summary.onlineDevices, 2, 'A 与 C 在线，B 受限挂起');
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------- GC-3：按组限速与月度中转配额
+//
+// 注入时钟让令牌桶完全确定（无回填干扰）：64kbps 组的桶容量 65536B，
+// 1200B 帧 × 54 帧恰好耗尽（余 736B），第 55 帧必丢；月度记账年月取自
+// hub 的 now（flushMemberTelemetry 的 lastSeenAt），与配额快照年月自洽。
+
+describe('GC-3 用户组限速与月度中转配额', () => {
+  /** 注入时钟下的 A、B 双节点入网（key 模式），读掉 join 广播返回干净句柄 */
+  async function joinPair(gw, net, clock) {
+    const timestamp = clock !== undefined ? clock.now : Date.now();
+    const a = identity();
+    const b = identity();
+    const wsA = await wsOpen(gw.base);
+    await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey, name: 'alpha', timestamp });
+    assert.equal((await wsJson(wsA)).status, 'authorized');
+    const wsB = await wsOpen(gw.base);
+    await authNode(wsB, b, { networkId: net.id, joinKey: net.joinKey, name: 'bravo', timestamp });
+    assert.equal((await wsJson(wsB)).status, 'authorized');
+    assert.equal((await wsJson(wsB)).type, 'punch-coordinate');
+    assert.equal((await wsJson(wsA)).type, 'peer-joined');
+    assert.equal((await wsJson(wsA)).type, 'punch-coordinate');
+    return { a, b, wsA, wsB };
+  }
+
+  /** 顶格 1200B 的中转帧（28 头 + 1156 载荷 + 16 tag） */
+  function bigFrame(src, dst, seq) {
+    return frame({ src, dst, payloadBytes: 1156, seq });
+  }
+
+  test('不同属主组速率各自生效互不串扰；refreshQuota 后改组立即生效', async () => {
+    const clock = { now: 1_700_000_000_000 }; // 2023-11-14 UTC，auth 窗口内
+    const gw = await startGateway({ now: () => clock.now });
+    try {
+      const slowGroup = await gw.store.createUserGroup({
+        code: 'gc3slow', name: 'slow', maxNetworks: 4, maxPeersPerNetwork: 8, relayRateKbps: 64,
+      });
+      const fastGroup = await gw.store.createUserGroup({
+        code: 'gc3fast', name: 'fast', maxNetworks: 4, maxPeersPerNetwork: 8, relayRateKbps: 512,
+      });
+      const tenant = await gw.store.findUserByEmail(TENANT_EMAIL);
+      await gw.store.updateUserByAdmin(tenant.id, { groupId: slowGroup.id });
+      await gw.store.createUser({
+        email: 'gc3-fast@local',
+        passwordHash: await hashPassword('gc3-fast-pass-1234'),
+        role: 'user',
+        groupId: fastGroup.id,
+      });
+      const fastCookie = await login(gw.base, 'gc3-fast@local', 'gc3-fast-pass-1234');
+
+      const netSlow = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const slow = await joinPair(gw, netSlow, clock);
+      const netFastRes = await api(gw.base, 'POST', '/api/v1/networks', {
+        body: { name: 'gc3-fast-net', admissionMode: 'key', maxPeers: 4 },
+        cookie: fastCookie,
+      });
+      assert.equal(netFastRes.status, 200, JSON.stringify(netFastRes.json));
+      const fast = await joinPair(gw, netFastRes.json.data, clock);
+      await gw.hub.refreshQuota(); // 全量重拉：之后帧按各自属主组速率判定
+
+      // slow 组（64kbps → 桶 65536B）：54 帧 × 1200B 恰好耗尽（时钟不动无回填），第 55 帧丢弃
+      for (let i = 1; i <= 54; i++) {
+        slow.wsA.send(bigFrame(slow.a.nodeId, slow.b.nodeId, BigInt(i)));
+        await wsBinary(slow.wsB);
+      }
+      slow.wsA.send(bigFrame(slow.a.nodeId, slow.b.nodeId, 55n));
+      await wsSilence(slow.wsB, 250);
+
+      // fast 组（512kbps → 桶 524288B）同量流量全过：桶按网络/属主独立，互不串扰
+      for (let i = 1; i <= 55; i++) {
+        fast.wsA.send(bigFrame(fast.a.nodeId, fast.b.nodeId, BigInt(i)));
+        await wsBinary(fast.wsB);
+      }
+
+      // 改组立即生效：tenant 换到 fast 组，refreshQuota 后推进时钟回填新速率桶
+      await gw.store.updateUserByAdmin(tenant.id, { groupId: fastGroup.id });
+      await gw.hub.refreshQuota(tenant.id);
+      clock.now += 200; // 新速率 512kbps × 0.2s ≈ 102KiB 回填，远超单帧 1200B
+      slow.wsA.send(bigFrame(slow.a.nodeId, slow.b.nodeId, 56n));
+      await wsBinary(slow.wsB); // 若仍按 slow 组速率判定（桶余 736B）此帧必丢
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('月度配额耗尽：DATA 静默丢弃、控制帧与文本信令不受影响；调高限额 refreshQuota 后恢复', async () => {
+    const clock = { now: 1_700_000_000_000 };
+    const gw = await startGateway({ now: () => clock.now });
+    try {
+      const meteredGroup = await gw.store.createUserGroup({
+        code: 'gc3metered', name: 'metered', maxNetworks: 4, maxPeersPerNetwork: 8,
+        relayRateKbps: 64, monthlyRelayQuotaBytes: 2000,
+      });
+      const tenant = await gw.store.findUserByEmail(TENANT_EMAIL);
+      await gw.store.updateUserByAdmin(tenant.id, { groupId: meteredGroup.id });
+
+      const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const { a, b, wsA, wsB } = await joinPair(gw, net, clock);
+      await gw.hub.refreshQuota(); // 快照就绪：dbUsedBytes=0
+
+      // 每帧 64B（28+20+16），32 轮「发送 → 到达 → flush 落库」精确耗尽 2000B 上限
+      const dataFrame = (seq) => frame({ src: a.nodeId, dst: b.nodeId, payloadBytes: 20, seq });
+      for (let i = 1; i <= 32; i++) {
+        wsA.send(dataFrame(BigInt(i)));
+        assert.equal((await wsBinary(wsB)).length, 64);
+        await gw.hub.flushTelemetry();
+      }
+      assert.equal(await gw.store.getMonthlyRelayUsage(tenant.id, currentUtcYearMonth(clock.now)), 2048, '32 帧全部落库记账');
+
+      // 配额耗尽后 DATA 帧被静默丢弃：不转发、不断线，且留下可观测量计数
+      wsA.send(dataFrame(33n));
+      await wsSilence(wsB, 250);
+      assert.equal(gw.hub.getMonthlyQuotaDroppedCount(net.id), 1, '恰好丢弃这一帧 DATA');
+
+      // 控制帧完全不受门禁影响：HELLO(0x01) / PING(0x05) / PONG(0x06) 照常转发
+      wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 1, seq: 34n }));
+      assert.equal((await wsBinary(wsB)).readUInt8(3), 1, 'HELLO 在配额耗尽后仍转发');
+      wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 5, seq: 35n }));
+      assert.equal((await wsBinary(wsB)).readUInt8(3), 5, 'PING 在配额耗尽后仍转发');
+      wsB.send(frame({ src: b.nodeId, dst: a.nodeId, type: 6, seq: 36n }));
+      assert.equal((await wsBinary(wsA)).readUInt8(3), 6, 'PONG 反向仍转发');
+
+      // WS 文本信令照常：rename 正常处理并广播——连接未被门禁断开
+      wsSendJson(wsA, { type: 'rename', name: 'quota-starved' });
+      const renamed = await wsJson(wsB);
+      assert.equal(renamed.type, 'peer-renamed');
+      assert.equal(renamed.name, 'quota-starved');
+
+      // 调高限额 + refreshQuota：下一帧 DATA 立即恢复转发，不再新增丢弃
+      await gw.store.updateUserGroup(meteredGroup.id, { monthlyRelayQuotaBytes: 100000 });
+      await gw.hub.refreshQuota(tenant.id);
+      wsA.send(dataFrame(37n));
+      assert.equal((await wsBinary(wsB)).readUInt8(3), 3, '恢复后 DATA 帧重新到达');
+      assert.equal(gw.hub.getMonthlyQuotaDroppedCount(net.id), 1, '恢复后不再新增丢弃');
     } finally {
       await gw.close();
     }
