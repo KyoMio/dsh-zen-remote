@@ -271,6 +271,7 @@ export const ZH = {
   'network.groupPeerCap': '当前用户组每网最多 {n} 台设备',
   'network.groupRateCap': '单台设备中转限速 {rate}',
   'network.groupMonthlyQuota': '本月中转流量上限 {quota}',
+  'network.grandfatheredPeerCap': '当前上限来自历史配置，可继续维持或向下缩容，无法上调超过组上限',
   'network.partHeadlessCommand': '无头命令',
   'network.headlessCommandHint': '在云主机的终端里粘贴这条命令即可加入',
   'overview.monthlyTraffic': '本月网关中转流量',
@@ -294,6 +295,7 @@ export const ZH = {
   'admin.masterKeyFromFile': '本地密钥文件',
   'admin.runtimeRelayRate': '实时中转',
   'admin.advisoryTitle': '安全提示',
+  'admin.sliceError': '部分管理数据刚才没能刷新，当前显示的是最近一次成功的结果',
   'admin.advisoryPublicHttp':
     '当前公网地址未启用 HTTPS，浏览器登录密码与会话存在明文传输风险，建议配置反向代理 HTTPS 并填写公网访问地址',
   'admin.advisoryUdpAlt': '辅助 UDP 端口未开启，无法识别对称型网络',
@@ -627,6 +629,7 @@ export const EN: Record<LocaleKey, string> = {
   'network.groupPeerCap': 'Your group allows up to {n} devices per network',
   'network.groupRateCap': 'Per-device relay limit {rate}',
   'network.groupMonthlyQuota': 'Monthly traffic quota {quota}',
+  'network.grandfatheredPeerCap': 'This limit comes from an earlier configuration — keep it or shrink it, but it cannot be raised past the group cap',
   'network.partHeadlessCommand': 'Headless command',
   'network.headlessCommandHint': 'Paste this command in a terminal on a headless machine to join',
   'overview.monthlyTraffic': "This month's relayed traffic",
@@ -650,6 +653,7 @@ export const EN: Record<LocaleKey, string> = {
   'admin.masterKeyFromFile': 'Local key file',
   'admin.runtimeRelayRate': 'Live relay',
   'admin.advisoryTitle': 'Security notice',
+  'admin.sliceError': 'Some admin data failed to refresh — showing the last successfully fetched values',
   'admin.advisoryPublicHttp':
     'The public URL is not on HTTPS; sign-in passwords and sessions could travel in plaintext. Put a reverse proxy with HTTPS in front and fill in the public URL',
   'admin.advisoryUdpAlt': 'The secondary UDP port is off; symmetric network types cannot be detected',

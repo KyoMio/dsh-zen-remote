@@ -2108,3 +2108,118 @@ describe('GC-7b：ConsoleStore 管理员切片与引用隔离', () => {
     assert.equal(s.adminUsers, users, '失败保留旧数据供展示兜底');
   });
 });
+
+// ---------------------------------------------------------------- GC-10b：grandfathered 词条上移与管理四切片 App 接线后的状态流转
+
+describe('GC-10b：grandfathered 词条与四切片独立失败 / 彻底清理', () => {
+  const netA = 'a'.repeat(16);
+
+  /** 管理员会话 + 业务数据已就绪的 store（镜像 GC-7b makeStore） */
+  function makeAdminStore() {
+    const store = new ConsoleStore();
+    store.init({
+      authenticated: true,
+      user: { ...TEST_USER, role: 'admin' },
+      quota: makeQuota(),
+      allowSignup: true,
+      requireEmailVerification: false,
+      smtpConfigured: true,
+      maxNetworksPerUser: 3,
+      defaultMaxPeers: 8,
+    });
+    store.patchUi({ accountMenuOpen: true, loginEmail: 'a@b.c' });
+    store.setNetworks([makeNetworkView(netA, '家里')]);
+    const snap = makeSnapshot(netA);
+    store.applyTopologySnapshot(snap);
+    return store;
+  }
+
+  test('network.grandfatheredPeerCap 中英双语词条齐备（组件内联双语上移词典）', () => {
+    assert.ok('network.grandfatheredPeerCap' in LOCALES.zh, 'zh 缺少 network.grandfatheredPeerCap');
+    assert.ok('network.grandfatheredPeerCap' in LOCALES.en, 'en 缺少 network.grandfatheredPeerCap');
+    assert.equal(
+      LOCALES.zh['network.grandfatheredPeerCap'],
+      '当前上限来自历史配置，可继续维持或向下缩容，无法上调超过组上限',
+    );
+    assert.equal(
+      LOCALES.en['network.grandfatheredPeerCap'],
+      'This limit comes from an earlier configuration — keep it or shrink it, but it cannot be raised past the group cap',
+    );
+    assert.ok(translate('zh', 'network.grandfatheredPeerCap').length > 0);
+    assert.ok(translate('en', 'network.grandfatheredPeerCap').length > 0);
+  });
+
+  test('admin.sliceError 词条中英齐备（四切片刷新失败的非阻塞提示）', () => {
+    assert.ok('admin.sliceError' in LOCALES.zh, 'zh 缺少 admin.sliceError');
+    assert.ok('admin.sliceError' in LOCALES.en, 'en 缺少 admin.sliceError');
+    assert.ok(LOCALES.zh['admin.sliceError'].length > 0);
+    assert.ok(LOCALES.en['admin.sliceError'].length > 0);
+  });
+
+  test('四张管理切片独立失败：各自 phase=error 且保留旧数据，互不拖累；单张恢复不影响其余错误态', () => {
+    const store = makeAdminStore();
+    const runtime = makeRuntimeStatus();
+    const settings = makeAdminSettings();
+    const groups = [makeGroup('grp_default', { isDefault: true })];
+    const users = [makeAdminUserRow('u-9')];
+    store.applyAdminRuntime(runtime);
+    store.applyAdminSettings(settings);
+    store.applyAdminGroups(groups);
+    store.applyAdminUsers(users);
+    const before = store.getState();
+
+    // 四张切片相继失败：数据切片全部保留旧值，加载/错误态各自独立记录
+    store.markAdminError('runtime', 'rt-down');
+    store.markAdminError('settings', 'st-down');
+    store.markAdminError('groups', 'gr-down');
+    store.markAdminError('users', 'us-down');
+    let s = store.getState();
+    assert.equal(s.adminRuntime, runtime, 'runtime 失败保留旧数据');
+    assert.equal(s.adminSettings, settings, 'settings 失败保留旧数据');
+    assert.equal(s.adminGroups, groups, 'groups 失败保留旧数据');
+    assert.equal(s.adminUsers, users, 'users 失败保留旧数据');
+    assert.deepEqual(s.adminLoad, { runtime: 'error', settings: 'error', groups: 'error', users: 'error' });
+    assert.deepEqual(s.adminError, { runtime: 'rt-down', settings: 'st-down', groups: 'gr-down', users: 'us-down' });
+    assert.equal(s.ui, before.ui, '错误态不碰 ui 引用');
+    assert.equal(s.networks, before.networks, '错误态不碰 networks 引用');
+
+    // 单张恢复（面板补拍成功）：只推自己回 ready 并清错误，其余切片错误态保留
+    const groups2 = [makeGroup('grp_vip')];
+    store.applyAdminGroups(groups2);
+    s = store.getState();
+    assert.equal(s.adminGroups, groups2);
+    assert.equal(s.adminLoad.groups, 'ready', '恢复的切片推回 ready');
+    assert.equal(s.adminError.groups, null);
+    assert.equal(s.adminLoad.users, 'error', '其余切片错误态不受影响');
+    assert.equal(s.adminError.users, 'us-down');
+    assert.equal(s.adminUsers, users, '其余切片数据不受影响');
+  });
+
+  test('clearAdminSlices 在四切片全失败态下彻底清空管理态，session/quota/ui/networks/topology 原样', () => {
+    const store = makeAdminStore();
+    store.applyAdminRuntime(makeRuntimeStatus());
+    store.applyAdminSettings(makeAdminSettings());
+    store.applyAdminGroups([makeGroup('grp_default', { isDefault: true })]);
+    store.applyAdminUsers([makeAdminUserRow('u-9')]);
+    store.markAdminError('runtime', 'rt-down');
+    store.markAdminError('settings', 'st-down');
+    store.markAdminError('groups', 'gr-down');
+    store.markAdminError('users', 'us-down');
+    const before = store.getState();
+
+    // App 侧切出管理视图 / 任一管理请求 401 的统一清场路径
+    store.clearAdminSlices();
+    const s = store.getState();
+    assert.equal(s.adminRuntime, null);
+    assert.equal(s.adminSettings, null);
+    assert.deepEqual(s.adminGroups, []);
+    assert.deepEqual(s.adminUsers, []);
+    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle' });
+    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null });
+    assert.equal(s.session, before.session, '会话不动');
+    assert.equal(s.quota, before.quota, '配额不动');
+    assert.equal(s.ui, before.ui, 'ui（菜单/弹窗/草稿）引用原样');
+    assert.equal(s.networks, before.networks, 'networks 引用原样');
+    assert.ok(s.topology[netA] !== undefined, 'topology 切片原样');
+  });
+});

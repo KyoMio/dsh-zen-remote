@@ -15,6 +15,10 @@
 // 设备列表补最后在线相对时间与实时中转速率。配额视图（quota）是可选 prop：
 // App 未接线（或未拉到 /auth/me）时这些增强段整体不渲染，纯名称创建路径
 // 与旧行为完全一致。
+// GC-10b 对齐：locale 成为正式 prop（formatBytesQuota 的调用面契约，未传时
+// 回落 readUiLocale()），祖父存量提示词条上移 locales.ts 双语词典；新建网络
+// 弹窗只在组上限真的有限（非管理员）时展示组提示，管理员不再把系统硬上限
+// 64 误标成「当前用户组最多 64 台」。
 import { useEffect, useState } from 'react';
 
 import { LOCALE_STORAGE_KEY, resolveLocale } from '../i18n/locales';
@@ -71,6 +75,8 @@ export interface NetworkViewProps {
   onCopyField?: (value: string, toastKey: LocaleKey) => void;
   /** 当前登录用户的有效配额视图（GC-9 组限额指标与月度流量条）；缺省不渲染增强段 */
   quota?: UserQuotaSummary | null;
+  /** formatBytesQuota 的语言实参（GC-10b 起 App 接线真实界面语言）；未传回落 readUiLocale() */
+  locale?: Locale;
   onPatchNetwork: (patch: NetworkPatchInput) => void;
   onDeleteNetwork: () => void;
   onRotateInviteKey: () => void;
@@ -85,17 +91,6 @@ export interface NetworkViewProps {
 /** GC-7b 契约：管理员不受组上限约束（maxNetworks 为 null），单网设备上限可满 64 台 */
 function isQuotaUnlimited(quota: UserQuotaSummary | null): boolean {
   return quota !== null && quota.maxNetworks === null;
-}
-
-/**
- * 祖父超额存量提示（GC-9）：网络当前上限高于所在用户组上限时展示。locales.ts
- * 在本任务修改白名单之外，词条暂以双语字面量放在组件内——读取当前界面语言
- * 沿用 Modal.resolveCloseLabel 的同一 resolveLocale 先例，后续任务再上移词典。
- */
-function grandfatheredPeerCapHint(locale: Locale): string {
-  return locale === 'zh'
-    ? '当前上限来自历史配置，可继续维持或向下缩容，无法上调超过组上限'
-    : 'This limit comes from an earlier configuration — keep it or shrink it, but it cannot be raised past the group cap';
 }
 
 function readUiLocale(): Locale {
@@ -223,7 +218,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
               {t('network.groupRateCap', { rate: formatRate(quota.relayRateKbps) })}
             </p>
           )}
-          {grandfathered && <p className="field-hint">{grandfatheredPeerCapHint(readUiLocale())}</p>}
+          {grandfathered && <p className="field-hint">{t('network.grandfatheredPeerCap')}</p>}
         </div>
 
         <fieldset className="field radio-group">
@@ -400,7 +395,9 @@ export function NewNetworkModal({ t, ui, onUi, busy, onCreate, quota }: NewNetwo
             value={maxPeersDraft}
             onChange={(e) => setMaxPeersDraft(e.target.value)}
           />
-          <p className="field-hint">{t('network.groupPeerCap', { n: peerCeiling })}</p>
+          {/* 组上限提示（GC-10b 门控）：管理员组上限不限，64 只是系统硬上限，
+              不能误标成「当前用户组最多 64 台」；App 未接线配额时同样不展示 */}
+          {!unlimited && quotaView !== null && <p className="field-hint">{t('network.groupPeerCap', { n: peerCeiling })}</p>}
           {!maxPeersValid && <p className="form-error">{t('error.peerLimitByGroup')}</p>}
         </div>
         <fieldset className="field radio-group">
@@ -458,6 +455,7 @@ export function NetworkView(props: NetworkViewProps) {
     onCopyInvite,
     onCopyField,
     quota,
+    locale,
     onPatchNetwork,
     onDeleteNetwork,
     onRotateInviteKey,
@@ -466,6 +464,9 @@ export function NetworkView(props: NetworkViewProps) {
     onEditNote,
     onRemoveMember,
   } = props;
+  // formatBytesQuota 的语言实参跟随真实界面语言（GC-10b：App 接线 locale prop），
+  // 未传时回落本机读取——沿用 Modal.resolveCloseLabel 的同一 resolveLocale 先例
+  const effectiveLocale = locale ?? readUiLocale();
   const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
 
   // 切换网络即退出详情：详情属于具体网络
@@ -733,8 +734,8 @@ export function NetworkView(props: NetworkViewProps) {
                     : t('common.usedOfLimit', {
                         // formatBytesQuota 的返回值刻意语言无关（GC-7b），
                         // locale 实参只是调用面契约
-                        used: formatBytesQuota(quotaView.usedMonthlyRelayBytes, 'zh'),
-                        limit: formatBytesQuota(quotaView.monthlyRelayQuotaBytes, 'zh'),
+                        used: formatBytesQuota(quotaView.usedMonthlyRelayBytes, effectiveLocale),
+                        limit: formatBytesQuota(quotaView.monthlyRelayQuotaBytes, effectiveLocale),
                       })}
                 </span>
               </div>
@@ -744,8 +745,8 @@ export function NetworkView(props: NetworkViewProps) {
                     percent={monthlyPercent}
                     level={monthlyLevel}
                     label={t('common.usedOfLimit', {
-                      used: formatBytesQuota(quotaView.usedMonthlyRelayBytes, 'zh'),
-                      limit: formatBytesQuota(quotaView.monthlyRelayQuotaBytes, 'zh'),
+                      used: formatBytesQuota(quotaView.usedMonthlyRelayBytes, effectiveLocale),
+                      limit: formatBytesQuota(quotaView.monthlyRelayQuotaBytes, effectiveLocale),
                     })}
                   />
                 </div>
