@@ -419,11 +419,11 @@ export interface PeerWizardLights {
 }
 /**
  * Derive the peer node's three lights off the peer status facts: identity is
- * green once the engine reports a node id (amber while the engine is not
- * wired); admission maps the gateway state (green `authorized`, amber
- * `pending-approval` / `connecting` / `offline` / unconfigured, red
- * `mismatch` / `revoked` / `paused`); discovery follows the sync facts per
- * {@link derivePeerDiscoveryLight}.
+ * green once the engine reports a node id (red on `identity-error`, amber
+ * otherwise while the engine is not wired); admission maps the gateway state
+ * (green `authorized`, amber `pending-approval` / `connecting` / `offline` /
+ * unconfigured, red `mismatch` / `revoked` / `paused` / `identity-error`);
+ * discovery follows the sync facts per {@link derivePeerDiscoveryLight}.
  */
 export declare function derivePeerWizardLights(input: {
     identityReady: boolean;

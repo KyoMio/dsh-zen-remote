@@ -305,6 +305,7 @@ function peerStateCopyOf(state: string, t: SectionT, deniedReason?: string): str
     case 'connecting': return t('wizard.peer.connecting')
     case 'offline': return t('wizard.peer.offline')
     case 'mismatch': return t('wizard.peer.mismatch')
+    case 'identity-error': return t('wizard.peer.identityError')
     case 'paused': return t('wizard.peer.revoked')
     case 'revoked': {
       if (deniedReason === 'join key rejected') return t('wizard.peer.deniedBadKey')
@@ -1440,7 +1441,17 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         <div className="zr-settings-card">
           <h3 className="zr-settings-card-title">{t('settings.peer.title')}</h3>
           <p className="zr-settings-hint" style={{ paddingTop: 4 }}>{t('settings.peer.subtitle')}</p>
-          {!peerView?.configured ? (
+          {peerView?.gatewayState === 'identity-error' ? (
+            <div className="zr-settings-field">
+              <div className="zr-settings-head">
+                <span className="zr-settings-head-title">{t('wizard.overview.peerNodeLabel')}</span>
+                <span className="zr-settings-badge" data-invalid="true">
+                  {peerStateCopyOf('identity-error', t)}
+                </span>
+              </div>
+              <p className="zr-settings-hint">{t('wizard.peer.identityError')}</p>
+            </div>
+          ) : !peerView?.configured ? (
             <p className="zr-settings-hint" style={{ padding: '8px 0 12px' }}>{t('settings.peer.notConfigured')}</p>
           ) : (
             <>

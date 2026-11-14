@@ -275,6 +275,9 @@ export interface ClientHandlerOptions {
    * non-peer composition — every peer route then answers 503
    * `peer-unavailable`). Wired only by the connects-role mount. */
   getPeerEngine?: () => PeerEngine | undefined
+  /** PS-2: sanitized identity load error (`'state-file-unreadable'`) when a
+   * peer row failed to read or chmod `zen-remote-state.json` at apply time. */
+  getPeerIdentityError?: () => string | undefined
   /** PG-9: the joined network's HTTP origin for the peer status body, read
    * PER REQUEST off the state file's `peerNetwork` block (absent when not
    * joined). Address-shaped, never a secret. */
@@ -1485,6 +1488,33 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
       if (route.startsWith(CLIENT_PEER_PREFIX)) {
         const engine = options.getPeerEngine?.()
         if (engine === undefined) {
+          const identityError = options.getPeerIdentityError?.()
+          if (identityError !== undefined && identityError !== '') {
+            if (route === CLIENT_PEER_STATUS_ROUTE) {
+              if (method !== 'GET') {
+                res.setHeader('Allow', 'GET')
+                responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
+                return
+              }
+              const maxServers = effectiveMaxServers(options.pool, options)
+              responseJson(res, 200, {
+                configured: false,
+                nodeId: '',
+                gatewayState: 'identity-error',
+                identityError,
+                maxPeers: null,
+                maxServers,
+                mountedCount: 0,
+                limitReached: false,
+                peers: [],
+              })
+              return
+            }
+            if (route === CLIENT_PEER_JOIN_ROUTE || route === CLIENT_PEER_LEAVE_ROUTE || route === CLIENT_PEER_TOGGLE_MOUNT_ROUTE || route === CLIENT_PEER_TRUST_ROUTE || route === CLIENT_PEER_REPROBE_ROUTE) {
+              responseJson(res, 503, { ok: false, error: { code: 'identity-error' } })
+              return
+            }
+          }
           responseJson(res, 503, { ok: false, error: { code: 'peer-unavailable' } })
           return
         }

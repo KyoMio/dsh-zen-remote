@@ -27,7 +27,7 @@ import {
 } from '../client-routes.js'
 import type { CliExecutionContext } from './context.js'
 import type { CliTranslator } from './i18n.js'
-import { fetchBody, plainOf, gatewayStateLabel, peerPathLabelOf, peerCapacityLines } from './commands-status.js'
+import { fetchBody, plainOf, gatewayStateLabel, peerPathLabelOf, renderPeerSection } from './commands-status.js'
 import type { ServerRow } from './commands-status.js'
 
 /** The join wait's poll cadence: frequent by default, tests shrink it. The
@@ -541,28 +541,7 @@ export async function runPeerStatusCommand(ctx: CliExecutionContext): Promise<nu
     ctx.stdout.write(`${JSON.stringify({ ok: true, ...status }, null, 2)}\n`)
     return 0
   }
-  const lines: string[] = [t('peer.status.title'), `  ${t('peer.status.nodeId', { nodeId: stringOf(status, 'nodeId') })}`]
-  if (status.configured === true) {
-    const origin = stringOf(status, 'gatewayOrigin') === '' ? '—' : stringOf(status, 'gatewayOrigin')
-    lines.push(`  ${t('peer.status.joined', { networkId: stringOf(status, 'networkId'), origin })}`)
-    lines.push(`  ${t('peer.status.gatewayState', { state: gatewayStateLabel(t, status.gatewayState) })}`)
-    lines.push(...peerCapacityLines(t, status))
-    const peers = peersOf(status)
-    lines.push(`  ${t('peer.status.deviceCount', { count: peers.length })}`)
-    for (const row of peers) {
-      const rttMs = row.rttMs
-      const rtt = typeof rttMs === 'number' && Number.isFinite(rttMs) ? t('peer.status.rtt', { rttMs }) : '—'
-      lines.push(t('peer.status.deviceLine', {
-        name: stringOf(row, 'name'),
-        nodeId: stringOf(row, 'nodeId'),
-        path: peerPathLabelOf(t, row.path),
-        rtt,
-        mounted: row.mounted === true ? t('peer.mounted.yes') : t('peer.mounted.no'),
-      }))
-    }
-  } else {
-    lines.push(`  ${t('peer.status.notJoined')}`)
-  }
+  const lines = renderPeerSection(t, status)
   ctx.stdout.write(`${lines.join('\n')}\n`)
   return 0
 }

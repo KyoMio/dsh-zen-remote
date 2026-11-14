@@ -204,6 +204,7 @@ function peerStateCopy(state: string, t: GatewayWizardProps['t'], deniedReason?:
     case 'connecting': return t('wizard.peer.connecting')
     case 'offline': return t('wizard.peer.offline')
     case 'mismatch': return t('wizard.peer.mismatch')
+    case 'identity-error': return t('wizard.peer.identityError')
     case 'paused': return t('wizard.peer.revoked')
     case 'revoked': {
       if (deniedReason === 'join key rejected') return t('wizard.peer.deniedBadKey')
@@ -1524,10 +1525,10 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
       // once authorized, amber while joining or reconnecting, red on the
       // terminal verdicts.
       const state = peerView?.gatewayState ?? 'unconfigured'
-      const light = state === 'authorized' ? 'pass' : state === 'mismatch' || state === 'revoked' || state === 'paused' ? 'fail' : 'pending'
+      const light = state === 'authorized' ? 'pass' : state === 'mismatch' || state === 'revoked' || state === 'paused' || state === 'identity-error' ? 'fail' : 'pending'
       return {
         state: light as 'pass' | 'pending' | 'fail',
-        text: peerView?.configured === true ? peerStateCopy(state, t, peerView.deniedReason) : t('wizard.peer.notJoined'),
+        text: (peerView?.configured === true || state === 'identity-error') ? peerStateCopy(state, t, peerView?.deniedReason) : t('wizard.peer.notJoined'),
       }
     }
     if (effectiveClient) {
@@ -1814,7 +1815,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 <p className="zr-wizard-overviewLabel">{t('wizard.overview.peerNetworkLabel')}</p>
                 <p className="zr-wizard-overviewValue">
                   <span className="zr-wizard-dot" data-state={peerLights.admission} />
-                  <span>{peerView?.configured === true ? peerStateCopy(peerView.gatewayState, t, peerView.deniedReason) : t('wizard.overview.peerNetworkNone')}</span>
+                  <span>{(peerView?.configured === true || peerView?.gatewayState === 'identity-error') ? peerStateCopy(peerView!.gatewayState, t, peerView!.deniedReason) : t('wizard.overview.peerNetworkNone')}</span>
                 </p>
                 <p className="zr-wizard-overviewSub">{peerView?.networkId !== undefined ? peerView.networkId : ''}</p>
               </div>
@@ -2776,7 +2777,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                     <>
                       <div className="zr-wizard-serviceInfo">
                         <span className="zr-wizard-dot" data-state={peerLights.admission} />
-                        <span className="zr-wizard-lightName">{peerView?.configured === true ? peerStateCopy(peerView.gatewayState, t, peerView.deniedReason) : t('wizard.peer.notJoined')}</span>
+                        <span className="zr-wizard-lightName">{(peerView?.configured === true || peerView?.gatewayState === 'identity-error') ? peerStateCopy(peerView!.gatewayState, t, peerView?.deniedReason) : t('wizard.peer.notJoined')}</span>
                         <span className="zr-wizard-hint">{peerView?.configured === true && peerView.networkId !== undefined ? peerView.networkId : ''}</span>
                       </div>
                       <ul className="zr-wizard-lights">
@@ -2789,11 +2790,13 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                           // (ready / waiting / ignored / partial with counts
                           // / blocked / not-mounted / unknown) — derived once
                           // off the polled view, never re-guessed here.
-                          const labelText = light === 'admission' && peerView?.gatewayState === 'pending-approval'
-                            ? t('wizard.peer.pendingApproval')
-                            : light === 'discovery'
-                              ? t(peerDiscovery.copyKey, peerDiscovery.copyParams)
-                              : t(LIGHT_LABEL[state])
+                          const labelText = light === 'identity' && peerView?.gatewayState === 'identity-error'
+                            ? t('wizard.peer.identityError')
+                            : light === 'admission' && peerView?.gatewayState === 'pending-approval'
+                              ? t('wizard.peer.pendingApproval')
+                              : light === 'discovery'
+                                ? t(peerDiscovery.copyKey, peerDiscovery.copyParams)
+                                : t(LIGHT_LABEL[state])
                           return (
                             <li key={key} className="zr-wizard-light" data-state={state}>
                               <div className="zr-wizard-lightMain">

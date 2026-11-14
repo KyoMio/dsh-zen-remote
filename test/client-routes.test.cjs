@@ -106,6 +106,7 @@ function startClientServer(row, overrides = {}) {
     // PG-9: the peer engine (peer role only) and the joined network's HTTP
     // origin, both read live per request.
     ...(overrides.getPeerEngine !== undefined ? { getPeerEngine: overrides.getPeerEngine } : {}),
+    ...(overrides.getPeerIdentityError !== undefined ? { getPeerIdentityError: overrides.getPeerIdentityError } : {}),
     ...(overrides.getPeerNetworkOrigin !== undefined ? { getPeerNetworkOrigin: overrides.getPeerNetworkOrigin } : {}),
   })
   const server = http.createServer((req, res) => { void handler(req, res) })
@@ -3588,5 +3589,47 @@ test('peer join by gatewayUrl: single-network auto-join, multi-network 409 selec
     } finally {
       await closeServer(s2)
     }
+  }
+})
+
+test('PS-2: identity-error exposes sanitized peer/status and answers 503 identity-error on mutations', async () => {
+  const { server, port } = await startClientServer(makeRow({ maxServers: 6 }), {
+    getMaxServers: () => 6,
+    getPeerEngine: () => undefined,
+    getPeerIdentityError: () => 'state-file-unreadable',
+  })
+  try {
+    const statusRes = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(statusRes.status, 200)
+    const statusBody = JSON.parse(statusRes.body)
+    assert.deepEqual(statusBody, {
+      configured: false,
+      nodeId: '',
+      gatewayState: 'identity-error',
+      identityError: 'state-file-unreadable',
+      maxPeers: null,
+      maxServers: 6,
+      mountedCount: 0,
+      limitReached: false,
+      peers: [],
+    })
+    assert.equal(statusRes.body.includes('/'), false, 'zero OS path leakage in status body')
+
+    const postStatus = await request(port, { method: 'POST', path: PEER_STATUS_PATH, headers: sameOrigin(port), body: {} })
+    assert.equal(postStatus.status, 405)
+
+    for (const [path, body] of [
+      [PEER_JOIN_PATH, { inviteUri: 'zr-net://10.0.0.1:4088/0123456789abcdef' }],
+      [PEER_LEAVE_PATH, {}],
+      [PEER_TOGGLE_MOUNT_PATH, { nodeId: 'aaaa1111', mounted: false }],
+      [PEER_TRUST_PATH, { nodeId: 'cccc3333' }],
+      [PEER_REPROBE_PATH, {}],
+    ]) {
+      const res = await request(port, { method: 'POST', path, headers: sameOrigin(port), body })
+      assert.equal(res.status, 503, path)
+      assert.deepEqual(JSON.parse(res.body), { ok: false, error: { code: 'identity-error' } }, path)
+    }
+  } finally {
+    await closeServer(server)
   }
 })

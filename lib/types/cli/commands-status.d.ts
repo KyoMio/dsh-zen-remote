@@ -70,6 +70,11 @@ export declare function peerCapacityLines(t: CliTranslator, body: ServerRow | nu
 /** One paired-host row, the exact shape both surfaces print:
  * `[entryId] displayName  serverUrl  state  compat/bridge`. */
 export declare function serverLineText(t: CliTranslator, row: ServerRow): string;
+/** The terminal peer section (PG-10): the node's virtual-network facts —
+ * node id, joined network + gateway, admission state, and one row per
+ * network device. A missing engine answer renders nothing (the section title
+ * alone) instead of failing the command. */
+export declare function renderPeerSection(t: CliTranslator, peer: ServerRow | null): string[];
 /**
  * `dsh-zen-remote status [--json] [--debug [outPath]]`. Identity from one
  * ping; the host surfaces (admin status, wizard status, share list), the

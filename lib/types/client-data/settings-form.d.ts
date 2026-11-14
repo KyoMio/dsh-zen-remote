@@ -326,8 +326,10 @@ export interface PeerStatusView {
     nodeId: string;
     /** The engine's gateway state word verbatim (`authorized`,
      * `pending-approval`, `connecting`, `offline`, `unconfigured`,
-     * `mismatch`, `paused`, `revoked`). */
+     * `mismatch`, `paused`, `revoked`, `identity-error`). */
     gatewayState: string;
+    /** Sanitized identity load failure code when `gatewayState === 'identity-error'`. */
+    identityError?: string | undefined;
     /** Optional gateway denial reason when `gatewayState` is `revoked`/`paused`. */
     deniedReason?: string | undefined;
     networkId: string | undefined;

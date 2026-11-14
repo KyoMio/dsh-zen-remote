@@ -227,6 +227,9 @@ export interface ClientHandlerOptions {
      * non-peer composition — every peer route then answers 503
      * `peer-unavailable`). Wired only by the connects-role mount. */
     getPeerEngine?: () => PeerEngine | undefined;
+    /** PS-2: sanitized identity load error (`'state-file-unreadable'`) when a
+     * peer row failed to read or chmod `zen-remote-state.json` at apply time. */
+    getPeerIdentityError?: () => string | undefined;
     /** PG-9: the joined network's HTTP origin for the peer status body, read
      * PER REQUEST off the state file's `peerNetwork` block (absent when not
      * joined). Address-shaped, never a secret. */

@@ -1560,3 +1560,133 @@ test('peer role registers /_dsh/zen-remote/client exactly once on webServer (no 
     }
   }
 })
+
+test('PS-2: unreadable zen-remote-state.json degrades safely at apply() without losing state or halting IPC/routes', async () => {
+  const { syncBuiltinESMExports } = require('node:module')
+  const index = await import(INDEX_URL)
+  const { ensurePeerIdentity } = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'state-store.js')).href)
+  const stateFile = path.join(TEMP_HOME, 'zen-remote-state.json')
+  fs.rmSync(stateFile, { force: true })
+
+  const seeded = ensurePeerIdentity(stateFile)
+  const beforeBytes = fs.readFileSync(stateFile)
+
+  const realReadFileSync = fs.readFileSync
+  const readError = Object.assign(new Error(`EACCES: permission denied, open '${stateFile}'`), {
+    code: 'EACCES',
+    syscall: 'open',
+    path: stateFile,
+  })
+  const arm = () => {
+    fs.readFileSync = function patchedRead(p, opt) {
+      if (p === stateFile) throw readError
+      return realReadFileSync(p, opt)
+    }
+    syncBuiltinESMExports()
+  }
+  const disarm = () => {
+    fs.readFileSync = realReadFileSync
+    syncBuiltinESMExports()
+  }
+
+  const runPeerApply = () => {
+    const routes = []
+    const stops = []
+    const warns = []
+    const all = {
+      logger: { info() {}, warn: (...a) => warns.push(a) },
+      plugin() {},
+      on() { return () => {} },
+      effect(fn) {
+        const stop = fn()
+        if (typeof stop === 'function') stops.push(stop)
+        return stop
+      },
+      reflect: { get: () => undefined },
+      webServer: {
+        register: (entry) => {
+          routes.push(entry)
+          return () => {}
+        },
+      },
+      connection: { admit: () => ({ peer: {} }) },
+      sessions: { get: () => undefined },
+      sessionQuery: {},
+    }
+    const ctx = {
+      ...all,
+      inject(deps, cb) {
+        if (deps.every((d) => all[d] !== undefined)) cb(Object.assign(Object.create(ctx), all))
+      },
+    }
+    index.apply(ctx, { role: 'peer' })
+    return { routes, stops, warns }
+  }
+
+  let server
+  let first
+  try {
+    arm()
+    assert.doesNotThrow(() => {
+      first = runPeerApply()
+    }, 'apply() must catch unreadable state-file error on role=peer')
+    assert.equal(index.getPeerEngine(), undefined, 'peerEngine stays unmounted when identity cannot load')
+    assert.ok(first.stops.length >= 2, 'restart-watcher + IPC and peer effects still register')
+
+    const clientPrefix = first.routes.find((r) => r.kind === 'prefix' && r.path === '/_dsh/zen-remote/client')
+    assert.ok(clientPrefix, 'client prefix route still mounts')
+    assert.ok(first.routes.some((r) => r.path === index.CLIENT_CONFIG_ROUTE), 'client-config route still mounts')
+
+    server = http.createServer((req, res) => {
+      const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+      if (pathname.startsWith(clientPrefix.path)) {
+        clientPrefix.handler(req, res)
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    })
+    const baseUrl = await listen(server)
+    const port = Number(new URL(baseUrl).port)
+
+    const statusRes = await request(port, { method: 'GET', path: '/_dsh/zen-remote/client/peer/status' })
+    assert.equal(statusRes.status, 200)
+    const statusBody = JSON.parse(statusRes.body)
+    assert.equal(statusBody.gatewayState, 'identity-error')
+    assert.equal(statusBody.identityError, 'state-file-unreadable')
+    assert.equal(statusBody.configured, false)
+    assert.equal(statusBody.nodeId, '')
+    assert.equal(statusRes.body.includes(TEMP_HOME), false, 'HTTP body must never leak OS directory paths')
+    assert.equal(statusRes.body.includes('zen-remote-state.json'), false, 'HTTP body must never leak state filenames')
+
+    const joinRes = await request(port, {
+      method: 'POST',
+      path: '/_dsh/zen-remote/client/peer/join',
+      headers: { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}` },
+      body: { inviteUri: 'zr-net://10.0.0.1:19393/0123456789abcdef' },
+    })
+    assert.equal(joinRes.status, 503)
+    assert.deepEqual(JSON.parse(joinRes.body), { ok: false, error: { code: 'identity-error' } })
+  } finally {
+    disarm()
+    if (server !== undefined) await close(server)
+    if (first !== undefined) {
+      for (const stop of first.stops) stop()
+    }
+  }
+
+  assert.deepEqual(fs.readFileSync(stateFile), beforeBytes, 'unreadable state file must remain byte-for-byte untouched')
+
+  let second
+  try {
+    second = runPeerApply()
+    const recovered = index.getPeerEngine()
+    assert.ok(recovered !== undefined, 'once readable again, apply() mounts peerEngine')
+    assert.equal(recovered.status().nodeId, seeded.nodeId, 'original Ed25519 identity recovers intact')
+  } finally {
+    if (second !== undefined) {
+      for (const stop of second.stops) stop()
+    }
+    fs.rmSync(stateFile, { force: true })
+  }
+})

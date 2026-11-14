@@ -603,6 +603,7 @@ export declare const zh: {
     readonly 'wizard.peer.deniedFull': "该虚拟网络设备数已达上限";
     readonly 'wizard.peer.deniedNoNetwork': "未找到该虚拟网络（可能已被删除）";
     readonly 'wizard.peer.mismatch': "网络身份校验未通过";
+    readonly 'wizard.peer.identityError': "状态文件不可读（请检查 ~/.dsh/zen-remote-state.json 权限后重新加载）";
     readonly 'wizard.peer.notJoined': "尚未加入任何设备网络";
     readonly 'wizard.overview.peerNodeLabel': "本机角色与节点 ID";
     readonly 'wizard.overview.peerNetworkLabel': "当前网络与状态";

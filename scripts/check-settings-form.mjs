@@ -1214,3 +1214,17 @@ test('derivePeerStatusView degrades junk sync words and counts to unknown', () =
   assert.equal(partialBlock.sync.readyCount, undefined)
   assert.equal(partialBlock.sync.reason, undefined)
 })
+
+test('PS-2: derivePeerStatusView carries identityError when gatewayState is identity-error', () => {
+  const view = derivePeerStatusView({
+    configured: false,
+    nodeId: '',
+    gatewayState: 'identity-error',
+    identityError: 'state-file-unreadable',
+    peers: [],
+  })
+  assert.equal(view.configured, false)
+  assert.equal(view.nodeId, '')
+  assert.equal(view.gatewayState, 'identity-error')
+  assert.equal(view.identityError, 'state-file-unreadable')
+})

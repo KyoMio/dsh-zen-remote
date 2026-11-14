@@ -652,6 +652,11 @@ export function derivePeerDiscoveryLight(input: {
 }): PeerDiscoveryLightView {
   const { sync } = input
   const mismatchBlocked = input.mismatchCount > 0
+  if (input.gatewayState === 'identity-error') {
+    return mismatchBlocked
+      ? { light: 'fail', copyKey: 'wizard.peer.syncBlocked' }
+      : { light: 'pending', copyKey: 'wizard.peer.syncGatewayHold' }
+  }
   // An old body (or junk): the light stays amber with the explicit unknown
   // copy — the ONE locally known fact that still fails is a TOFU mismatch.
   if (sync === undefined || sync.state === undefined) {
@@ -705,15 +710,15 @@ export interface PeerWizardLights {
 
 /** The admission verdicts that need the network administrator or a local
  * repair before they come back — red, never amber. */
-const PEER_ADMISSION_DEAD_STATES: ReadonlySet<string> = new Set(['mismatch', 'revoked', 'paused'])
+const PEER_ADMISSION_DEAD_STATES: ReadonlySet<string> = new Set(['mismatch', 'revoked', 'paused', 'identity-error'])
 
 /**
  * Derive the peer node's three lights off the peer status facts: identity is
- * green once the engine reports a node id (amber while the engine is not
- * wired); admission maps the gateway state (green `authorized`, amber
- * `pending-approval` / `connecting` / `offline` / unconfigured, red
- * `mismatch` / `revoked` / `paused`); discovery follows the sync facts per
- * {@link derivePeerDiscoveryLight}.
+ * green once the engine reports a node id (red on `identity-error`, amber
+ * otherwise while the engine is not wired); admission maps the gateway state
+ * (green `authorized`, amber `pending-approval` / `connecting` / `offline` /
+ * unconfigured, red `mismatch` / `revoked` / `paused` / `identity-error`);
+ * discovery follows the sync facts per {@link derivePeerDiscoveryLight}.
  */
 export function derivePeerWizardLights(input: {
   identityReady: boolean
@@ -722,11 +727,14 @@ export function derivePeerWizardLights(input: {
   sync?: PeerSyncReadinessView | undefined
 }): PeerWizardLights {
   const authorized = input.gatewayState === 'authorized'
+  const identity: LightState = input.gatewayState === 'identity-error'
+    ? 'fail'
+    : input.identityReady ? 'pass' : 'pending'
   const admission: LightState = authorized
     ? 'pass'
     : PEER_ADMISSION_DEAD_STATES.has(input.gatewayState) ? 'fail' : 'pending'
   return {
-    identity: input.identityReady ? 'pass' : 'pending',
+    identity,
     admission,
     discovery: derivePeerDiscoveryLight({
       gatewayState: input.gatewayState,

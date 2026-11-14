@@ -543,8 +543,10 @@ export interface PeerStatusView {
   nodeId: string
   /** The engine's gateway state word verbatim (`authorized`,
    * `pending-approval`, `connecting`, `offline`, `unconfigured`,
-   * `mismatch`, `paused`, `revoked`). */
+   * `mismatch`, `paused`, `revoked`, `identity-error`). */
   gatewayState: string
+  /** Sanitized identity load failure code when `gatewayState === 'identity-error'`. */
+  identityError?: string | undefined
   /** Optional gateway denial reason when `gatewayState` is `revoked`/`paused`. */
   deniedReason?: string | undefined
   networkId: string | undefined
@@ -674,6 +676,7 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     configured: safe.configured === true,
     nodeId: asStringSet(safe.nodeId),
     gatewayState: typeof safe.gatewayState === 'string' && safe.gatewayState !== '' ? safe.gatewayState : 'unconfigured',
+    identityError: asStringSet(safe.identityError) || undefined,
     deniedReason: asStringSet(safe.deniedReason) || undefined,
     networkId: asStringSet(safe.networkId) || undefined,
     gatewayOrigin: asStringSet(safe.gatewayOrigin) || undefined,
