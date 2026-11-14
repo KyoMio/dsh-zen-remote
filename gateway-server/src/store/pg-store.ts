@@ -512,11 +512,12 @@ export class PgStore implements GatewayStore {
 
   async createUser(input: CreateUserInput): Promise<UserRecord> {
     // 整段单事务（PC-06）：组存在性预查（users.group_id 无外键约束，坏 id 会静默落库）
-    // 与 INSERT 原子；未显式指定组时 INSERT 内 COALESCE 子查询原子写入当前活跃默认组
-    // （可能与 grp_default 不同）。并发撞 email 唯一约束（23505）统一转 StoreError。
+    // 与 INSERT 原子；未显式指定组（含 groupId: null，GC-fix-batch1 R3）时 INSERT 内
+    // COALESCE 子查询原子写入当前活跃默认组（可能与 grp_default 不同）。并发撞 email
+    // 唯一约束（23505）统一转 StoreError。
     try {
       return await this.inTransaction(async (tx) => {
-        if (input.groupId !== undefined) {
+        if (input.groupId !== undefined && input.groupId !== null) {
           const group = await tx('SELECT id FROM user_groups WHERE id = $1', [input.groupId]);
           if (group.rows.length === 0) {
             throw new StoreError('group-not-found', `user group ${input.groupId} does not exist`);
@@ -605,13 +606,24 @@ export class PgStore implements GatewayStore {
       const nextActive = patch.active ?? (row.active === true || row.active === 1);
       const nextRole: UserRole = patch.role ?? (str(row.role) === 'admin' ? 'admin' : 'user');
       await this.assertNotLastActiveAdminOn(tx, row, nextActive, nextRole);
-      if (patch.groupId !== undefined) {
+      if (typeof patch.groupId === 'string') {
         const group = await tx('SELECT id FROM user_groups WHERE id = $1', [patch.groupId]);
         if (group.rows.length === 0) {
           throw new StoreError('group-not-found', `user group ${patch.groupId} does not exist`);
         }
       }
-      const nextGroupId = patch.groupId ?? (optText(row.group_id) ?? DEFAULT_GROUP_ID);
+      // GC-fix-batch1 R3：string = 显式组；null = 同事务解析当前活跃默认组（可能与
+      // grp_default 不同），绝不硬编码；undefined = 保持原值
+      let nextGroupId: string;
+      if (typeof patch.groupId === 'string') {
+        nextGroupId = patch.groupId;
+      } else if (patch.groupId === null) {
+        const active = await tx('SELECT id FROM user_groups WHERE is_default = TRUE LIMIT 1', []);
+        const activeRow = active.rows[0] as Row | undefined;
+        nextGroupId = activeRow !== undefined ? str(activeRow.id) : DEFAULT_GROUP_ID;
+      } else {
+        nextGroupId = optText(row.group_id) ?? DEFAULT_GROUP_ID;
+      }
       const nextGroupExpiresAt = patch.groupExpiresAt !== undefined ? patch.groupExpiresAt : optIso(row.group_expires_at);
       const nextEmailVerifiedAt = patch.emailVerifiedAt !== undefined ? patch.emailVerifiedAt : optIso(row.email_verified_at);
       const updated = await tx(
@@ -1152,9 +1164,15 @@ export class PgStore implements GatewayStore {
         capacityUsed = toNum((counted.rows[0] as Row | undefined)?.count);
       }
 
+      // GC-fix-batch1 R1：调用方压入的 maxPeersCap 与网络容量取小后作为同一事务内的
+      // 有效席位上限（非管理员属主的用户组 maxPeersPerNetwork 经此原子生效）；
+      // 查询次数与顺序保持不变，只在求值处取小
+      const effectiveMax = input.maxPeersCap !== undefined
+        ? Math.min(toNum(networkRow.max_peers), input.maxPeersCap)
+        : toNum(networkRow.max_peers);
       const decision = decideJoinAttempt({
         admissionMode: str(networkRow.admission_mode) as AdmissionMode,
-        maxPeers: toNum(networkRow.max_peers),
+        maxPeers: effectiveMax,
         existing: decisionExisting,
         incomingPublicKeyHex: input.publicKeyHex,
         joinKeyMatched: input.joinKeyMatched,
@@ -1164,7 +1182,7 @@ export class PgStore implements GatewayStore {
       if (decision === 'reject') return null;
       if (decision === 'limit-reached') {
         // F3：口令匹配但席位满，明确抛错，让上层能把「网络已满」与「口令错误」区分开
-        throw new StoreError('limit-reached', `network ${input.networkId} is at max peers (${toNum(networkRow.max_peers)})`);
+        throw new StoreError('limit-reached', `network ${input.networkId} is at max peers (${effectiveMax})`);
       }
       if (decision === 'keep' && existingRow !== null) return mapMemberRow(existingRow);
       if (decision === 'mismatch' && existingRow !== null) {
@@ -1196,7 +1214,7 @@ export class PgStore implements GatewayStore {
     });
   }
 
-  async transitionMemberStatus(networkId: string, nodeId: string, action: TransitionAction): Promise<MemberRecord> {
+  async transitionMemberStatus(networkId: string, nodeId: string, action: TransitionAction, maxPeersCap?: number): Promise<MemberRecord> {
     return this.inTransaction(async (tx) => {
       // 锁网络行：同网络的容量裁决（approve）与状态迁移串行化
       const network = await tx('SELECT id, max_peers FROM networks WHERE id = $1 FOR UPDATE', [networkId]);
@@ -1224,14 +1242,17 @@ export class PgStore implements GatewayStore {
         throw new StoreError('invalid-transition', `repin requires a stored candidate public key (member ${nodeId})`);
       }
       if (outcome.needsCapacityCheck === true) {
+        // GC-fix-batch1 R1：maxPeersCap 压低有效上限（与网络容量取小），approve 的
+        // 空位判定在同一事务内对照压低后的上限；SQL 查询次数与顺序不变
+        const effectiveMax = maxPeersCap !== undefined ? Math.min(maxPeers, maxPeersCap) : maxPeers;
         // PC-10 统一口径：mismatch 也占席，approve 的空位判定必须把 mismatch 计入
         const counted = await tx(
           `SELECT COUNT(*) AS count FROM network_members WHERE network_id = $1 AND status IN (${OCCUPYING_SQL})`,
           [networkId],
         );
         const used = toNum((counted.rows[0] as Row | undefined)?.count);
-        if (used >= maxPeers) {
-          throw new StoreError('limit-reached', `network ${networkId} is at max peers (${maxPeers})`);
+        if (used >= effectiveMax) {
+          throw new StoreError('limit-reached', `network ${networkId} is at max peers (${effectiveMax})`);
         }
       }
       const nextPublicKey = outcome.promoteCandidate === true ? (candidateHex as string) : str(row.public_key_hex);

@@ -517,12 +517,13 @@ export class SqliteStore implements GatewayStore {
     if (this.getUserRowBy('email', input.email) !== undefined) {
       throw new StoreError('duplicate-email', `user with email ${input.email} already exists`);
     }
-    if (input.groupId !== undefined && this.getGroupRowById(input.groupId) === undefined) {
+    // null 与 undefined 同义（GC-fix-batch1 R3：交给 INSERT 的 COALESCE 子查询绑当前默认组）
+    if (input.groupId !== undefined && input.groupId !== null && this.getGroupRowById(input.groupId) === undefined) {
       throw new StoreError('group-not-found', `user group ${input.groupId} does not exist`);
     }
     const id = randomBytes(12).toString('hex');
-    // 未显式指定组时，COALESCE 子查询在同一条 INSERT 内原子写入当前活跃默认组
-    // （可能与 grp_default 不同），无任何默认组时兜底 grp_default
+    // 未显式指定组（含 groupId: null）时，COALESCE 子查询在同一条 INSERT 内原子写入
+    // 当前活跃默认组（可能与 grp_default 不同），无任何默认组时兜底 grp_default
     this.db
       .prepare(
         `INSERT INTO users (id, email, password_hash, role, active, group_id, group_expires_at, email_verified_at, created_at)
@@ -575,10 +576,20 @@ export class SqliteStore implements GatewayStore {
       const nextActive = patch.active ?? (row.active === 1 || row.active === true);
       const nextRole: UserRole = patch.role ?? (str(row.role) === 'admin' ? 'admin' : 'user');
       this.assertNotLastActiveAdmin(row, nextActive, nextRole);
-      if (patch.groupId !== undefined && this.getGroupRowById(patch.groupId) === undefined) {
+      if (typeof patch.groupId === 'string' && this.getGroupRowById(patch.groupId) === undefined) {
         throw new StoreError('group-not-found', `user group ${patch.groupId} does not exist`);
       }
-      const nextGroupId = patch.groupId ?? (optText(row.group_id) ?? DEFAULT_GROUP_ID);
+      // GC-fix-batch1 R3：string = 显式组；null = 同事务解析当前活跃默认组（可能与
+      // grp_default 不同），绝不硬编码；undefined = 保持原值
+      let nextGroupId: string;
+      if (typeof patch.groupId === 'string') {
+        nextGroupId = patch.groupId;
+      } else if (patch.groupId === null) {
+        const active = this.db.prepare('SELECT id FROM user_groups WHERE is_default = 1 LIMIT 1').get() as Row | undefined;
+        nextGroupId = active !== undefined ? str(active.id) : DEFAULT_GROUP_ID;
+      } else {
+        nextGroupId = optText(row.group_id) ?? DEFAULT_GROUP_ID;
+      }
       const nextGroupExpiresAt = patch.groupExpiresAt !== undefined ? patch.groupExpiresAt : optText(row.group_expires_at);
       const nextEmailVerifiedAt = patch.emailVerifiedAt !== undefined ? patch.emailVerifiedAt : optText(row.email_verified_at);
       this.db
@@ -1021,9 +1032,14 @@ export class SqliteStore implements GatewayStore {
         capacityUsed = toNum(countRow.n);
       }
 
+      // GC-fix-batch1 R1：调用方压入的 maxPeersCap 与网络容量取小后作为同一事务内的
+      // 有效席位上限（非管理员属主的用户组 maxPeersPerNetwork 经此原子生效）
+      const effectiveMax = input.maxPeersCap !== undefined
+        ? Math.min(toNum(network.max_peers), input.maxPeersCap)
+        : toNum(network.max_peers);
       const decision = decideJoinAttempt({
         admissionMode: str(network.admission_mode) as AdmissionMode,
-        maxPeers: toNum(network.max_peers),
+        maxPeers: effectiveMax,
         existing: decisionExisting,
         incomingPublicKeyHex: input.publicKeyHex,
         joinKeyMatched: input.joinKeyMatched,
@@ -1032,7 +1048,7 @@ export class SqliteStore implements GatewayStore {
 
       if (decision === 'reject') return null;
       if (decision === 'limit-reached') {
-        throw new StoreError('limit-reached', `network ${input.networkId} is at max peers (${toNum(network.max_peers)})`);
+        throw new StoreError('limit-reached', `network ${input.networkId} is at max peers (${effectiveMax})`);
       }
       if (decision === 'keep' && existing !== undefined) return mapMemberRow(existing);
       if (decision === 'mismatch' && existing !== undefined) {
@@ -1076,6 +1092,7 @@ export class SqliteStore implements GatewayStore {
     networkId: string,
     nodeId: string,
     action: TransitionAction,
+    maxPeersCap?: number,
   ): Promise<MemberRecord> {
     return this.tx(() => {
       const row = this.db
@@ -1097,12 +1114,15 @@ export class SqliteStore implements GatewayStore {
         throw new StoreError('invalid-transition', `repin requires a stored candidate public key (member ${nodeId})`);
       }
       if (outcome.needsCapacityCheck === true) {
+        // GC-fix-batch1 R1：maxPeersCap 压低有效上限（与网络容量取小），approve 的
+        // 空位判定在同一事务内对照压低后的上限（并发 TOCTOU 超限在此被挡）
+        const effectiveMax = maxPeersCap !== undefined ? Math.min(toNum(row.max_peers), maxPeersCap) : toNum(row.max_peers);
         // PC-10 统一口径：mismatch 也占席，approve 的空位判定必须把 mismatch 计入
         const countRow = this.db
           .prepare(`SELECT COUNT(*) AS n FROM network_members WHERE network_id = ? AND status IN (${OCCUPYING_SQL})`)
           .get(networkId) as Row;
-        if (toNum(countRow.n) >= toNum(row.max_peers)) {
-          throw new StoreError('limit-reached', `network ${networkId} is at max peers (${str(row.max_peers)})`);
+        if (toNum(countRow.n) >= effectiveMax) {
+          throw new StoreError('limit-reached', `network ${networkId} is at max peers (${effectiveMax})`);
         }
       }
       const nextPublicKey = outcome.promoteCandidate === true ? (candidateHex as string) : str(row.public_key_hex);

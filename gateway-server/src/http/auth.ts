@@ -401,13 +401,24 @@ export function authUserPayload(user: UserRecord): {
   return { ...publicUser(user), emailVerifiedAt: user.emailVerifiedAt };
 }
 
-// 未知邮箱时也对一次 scrypt，抹平「邮箱是否存在」的时序侧信道
+// 未知邮箱时也对一次 scrypt，抹平「邮箱是否存在」的时序侧信道（登录路径专用：
+// verifyPassword 对这份 dummy 哈希每次都跑完整 scrypt）
 let dummyHashPromise: Promise<string> | null = null;
 function getDummyPasswordHash(): Promise<string> {
   if (dummyHashPromise === null) {
     dummyHashPromise = hashPassword(`timing-equalizer-${randomBytes(16).toString('hex')}`);
   }
   return dummyHashPromise;
+}
+
+/**
+ * 非缓存的时长均衡器（GC-fix-batch1 R4）：每次调用现算一次真实 scrypt，消耗与
+ * 密码哈希等价的 CPU/时间。getDummyPasswordHash 是进程级单次 Promise，首次之后
+ * await 立即返回、不再有哈希耗时——发码与重置的防枚举分支若复用它，第二次起
+ * 「邮箱不存在」的响应会显著快于真实路径，计时侧信道重新暴露；登录路径仍用缓存版。
+ */
+async function equalizeAuthTiming(): Promise<void> {
+  await hashPassword(randomBytes(16).toString('hex'));
 }
 
 export function isValidEmail(email: string): boolean {
@@ -882,8 +893,9 @@ async function handleSendOtp(ctx: RouteContext): Promise<void> {
   } else {
     const existing = await ctx.store.findUserByEmail(email);
     if (existing === null || !existing.active) {
-      // 防枚举：不做任何写操作，补一次 scrypt 抹平与真实路径的时长差，照样报成功
-      await getDummyPasswordHash();
+      // 防枚举：不做任何写操作，现算一次 scrypt 抹平与真实路径的时长差（每次都跑，
+      // 非缓存），照样报成功
+      await equalizeAuthTiming();
       sendOk(ctx.res, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
       return;
     }
@@ -917,7 +929,7 @@ async function handleResetPassword(ctx: RouteContext): Promise<void> {
   if (user !== null && user.active) {
     await ctx.store.updateUserPassword(user.id, await hashPassword(newPassword));
   } else {
-    await getDummyPasswordHash(); // 与真实改密路径的 scrypt 时长对齐
+    await equalizeAuthTiming(); // 与真实改密路径的 scrypt 时长对齐（每次现算，非缓存）
   }
   sendOk(ctx.res, { reset: true });
 }

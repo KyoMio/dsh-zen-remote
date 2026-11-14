@@ -564,6 +564,34 @@ describe('忘记密码重置与 IP 限流（独立实例 + 假 SMTP）', () => {
     // 这些请求都没触发发信（收件人不存在）
     assert.equal(smtp.state.messages.length, 2);
   });
+
+  test('GC-fix-batch1 R4：停用账号持有效验证码重置 → 通用成功（equalizeAuthTiming 均衡分支）且密码未被改动', async () => {
+    otpSendRateLimiter.clear(); // 甩掉突发用例累计的同 IP 计数
+    // 造一个活跃用户 → 正常收码 → 停用 → 用有效验证码重置：
+    // 走「验证码核销成功但账号已停用」的时长均衡分支（handleResetPassword 的 else 路径）
+    await seedTenant(handle.store, 'r4@example.com', 'r4-pass-123456');
+    const send = await api(handle.base, 'POST', '/api/v1/auth/send-otp', {
+      body: { email: 'r4@example.com', purpose: 'reset_password' },
+    });
+    assert.equal(send.status, 200);
+    assert.equal(smtp.state.messages.length, 3);
+    const real = otpFromMessage(smtp.state.messages[2]);
+    const r4 = await handle.store.findUserByEmail('r4@example.com');
+    await handle.store.setUserActive(r4.id, false);
+
+    const reset = await api(handle.base, 'POST', '/api/v1/auth/reset-password', {
+      body: { email: 'r4@example.com', otpCode: real, newPassword: 'r4-attacker-pass-1' },
+    });
+    assert.equal(reset.status, 200, '停用账号的防枚举重置照样报通用成功');
+    assert.deepEqual(reset.json.data, { reset: true });
+    // 密码未被改动（停用账号不执行改密）：旧密码 + 停用 → 403 ACCOUNT_DISABLED（而非 401）
+    const oldLogin = await api(handle.base, 'POST', '/api/v1/auth/login', {
+      body: { email: 'r4@example.com', password: 'r4-pass-123456' },
+    });
+    assert.equal(oldLogin.status, 403);
+    assertEnvelopeError(oldLogin.json, 'ACCOUNT_DISABLED');
+    assertNoSecrets(reset.json);
+  });
 });
 
 // ---------------------------------------------------------------- 4. 已登录改密

@@ -237,7 +237,11 @@ export interface UpdateUserGroupPatch {
 export interface AdminUserPatch {
   role?: UserRole;
   active?: boolean;
-  groupId?: string;
+  /**
+   * string = 显式组（不存在抛 group-not-found）；null = 绑定当前 is_default 组
+   * （GC-fix-batch1 R3：同一事务内解析，不硬编码 grp_default）；undefined = 保持原值。
+   */
+  groupId?: string | null;
   groupExpiresAt?: string | null;
   emailVerifiedAt?: string | null;
 }
@@ -415,6 +419,12 @@ export interface JoinAttemptInput {
   publicKeyHex: string;
   /** 挑战验签通过后，调用方比对 join key 的结果（HTTP 层职责，store 不碰明文口令） */
   joinKeyMatched: boolean;
+  /**
+   * 调用方压入的有效席位上限（GC-fix-batch1 R1）：非管理员属主的用户组
+   * maxPeersPerNetwork 由 WS 层解析后传入，事务内与 network.max_peers 取小后
+   * 作为容量判定上限；缺省 = 只按 network.max_peers（管理员豁免组上限）。
+   */
+  maxPeersCap?: number;
 }
 
 export interface TelemetryUpdate {
@@ -567,8 +577,11 @@ export interface CreateUserInput {
   email: string;
   passwordHash: string;
   role: UserRole;
-  /** 缺省落默认组（grp_default）；显式给出但组不存在抛 group-not-found */
-  groupId?: string;
+  /**
+   * 缺省或 null 都落默认组（GC-fix-batch1 R3：事务内解析当前 is_default 组，可能与
+   * grp_default 不同）；显式给出字符串但组不存在抛 group-not-found。
+   */
+  groupId?: string | null;
   groupExpiresAt?: string | null;
   emailVerifiedAt?: string | null;
 }
@@ -683,8 +696,12 @@ export interface GatewayStore {
   // 网络成员五态机
   /** 返回 null 表示拒绝不入库 */
   upsertMemberJoinAttempt(input: JoinAttemptInput): Promise<MemberRecord | null>;
-  /** 非法迁移抛 invalid-transition；满额抛 limit-reached；成员不存在抛 member-not-found */
-  transitionMemberStatus(networkId: string, nodeId: string, action: TransitionAction): Promise<MemberRecord>;
+  /**
+   * 非法迁移抛 invalid-transition；满额抛 limit-reached；成员不存在抛 member-not-found。
+   * maxPeersCap（GC-fix-batch1 R1）可选压低 approve 容量判定的有效上限：与行内
+   * max_peers 取小后对照占席数（同事务原子判定，非管理员属主的组上限经此生效）。
+   */
+  transitionMemberStatus(networkId: string, nodeId: string, action: TransitionAction, maxPeersCap?: number): Promise<MemberRecord>;
   /** 修改成员显示名称或备注；成员不存在抛 member-not-found */
   updateMemberProfile(networkId: string, nodeId: string, patch: MemberProfilePatch): Promise<MemberRecord>;
   removeMember(networkId: string, nodeId: string): Promise<void>;

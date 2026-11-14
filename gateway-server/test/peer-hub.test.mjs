@@ -13,7 +13,7 @@ import net from 'node:net';
 import { createGatewayApiServer } from '../dist/server.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { currentUtcYearMonth } from '../dist/store/types.js';
-import { deriveMasterKeyFromSecret, hashPassword } from '../dist/master-key.js';
+import { deriveMasterKeyFromSecret, encryptSecret, hashPassword } from '../dist/master-key.js';
 import { PeerRateLimiter } from '../dist/peer-hub/rate-limiter.js';
 import { formatRate } from '../dist/web/format.js';
 import { UdpStunService } from '../dist/peer-hub/udp-stun.js';
@@ -2876,6 +2876,185 @@ describe('GC-3 用户组限速与月度中转配额', () => {
       wsA.send(dataFrame(37n));
       assert.equal((await wsBinary(wsB)).readUInt8(3), 3, '恢复后 DATA 帧重新到达');
       assert.equal(gw.hub.getMonthlyQuotaDroppedCount(net.id), 1, '恢复后不再新增丢弃');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('GC-fix-batch1 R1：组 maxPeersPerNetwork 原子压低 WS 入网上限（网络容量更大也不放行）；admin 网络豁免', async () => {
+    const clock = { now: 1_700_000_000_000 };
+    const gw = await startGateway({ now: () => clock.now });
+    try {
+      const tinyGroup = await gw.store.createUserGroup({
+        code: 'r1tiny', name: 'tiny', maxNetworks: 4, maxPeersPerNetwork: 2, relayRateKbps: 64,
+      });
+      const tenant = await gw.store.findUserByEmail(TENANT_EMAIL);
+      await gw.store.updateUserByAdmin(tenant.id, { groupId: tinyGroup.id });
+      // 组上限 2 但网络容量 10（祖父存量形态：绕过 REST 建网校验，直经 store 建大容量网）
+      const net = await gw.store.createNetwork({
+        ownerId: tenant.id,
+        name: 'r1-net',
+        admissionMode: 'key',
+        joinKeyEnc: encryptSecret('r1-join-key', gw.masterKey),
+        maxPeers: 10,
+      });
+      const joinOpts = { networkId: net.id, joinKey: 'r1-join-key', timestamp: clock.now };
+      const a = identity();
+      const b = identity();
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, joinOpts);
+      assert.equal((await wsJson(wsA)).status, 'authorized');
+      const wsB = await wsOpen(gw.base);
+      await authNode(wsB, b, joinOpts);
+      assert.equal((await wsJson(wsB)).status, 'authorized');
+      assert.equal((await wsJson(wsB)).type, 'punch-coordinate');
+      assert.equal((await wsJson(wsA)).type, 'peer-joined');
+      assert.equal((await wsJson(wsA)).type, 'punch-coordinate');
+      // 第 3 台：入网事务内按 min(10, 组上限 2) 判满 → denied 'network is full'
+      const wsC = await wsOpen(gw.base);
+      await authNode(wsC, identity(), joinOpts);
+      const denied = await wsJson(wsC);
+      assert.equal(denied.type, 'denied');
+      assert.equal(denied.reason, 'network is full');
+      await wsClosed(wsC);
+      assert.equal((await gw.store.listMembers(net.id)).length, 2, '被拒入网不得留下成员行');
+
+      // admin 属主的网络豁免组上限：4 席内第 3 台正常入网
+      const admin = await gw.store.findUserByEmail(ADMIN_EMAIL);
+      const adminNet = await gw.store.createNetwork({
+        ownerId: admin.id,
+        name: 'r1-admin-net',
+        admissionMode: 'key',
+        joinKeyEnc: encryptSecret('r1-admin-key', gw.masterKey),
+        maxPeers: 4,
+      });
+      const adminJoin = { networkId: adminNet.id, joinKey: 'r1-admin-key', timestamp: clock.now };
+      const n1 = identity();
+      const n2 = identity();
+      const n3 = identity();
+      const ws1 = await wsOpen(gw.base);
+      await authNode(ws1, n1, adminJoin);
+      assert.equal((await wsJson(ws1)).status, 'authorized');
+      const ws2 = await wsOpen(gw.base);
+      await authNode(ws2, n2, adminJoin);
+      assert.equal((await wsJson(ws2)).status, 'authorized');
+      assert.equal((await wsJson(ws2)).type, 'punch-coordinate');
+      assert.equal((await wsJson(ws1)).type, 'peer-joined');
+      assert.equal((await wsJson(ws1)).type, 'punch-coordinate');
+      const ws3 = await wsOpen(gw.base);
+      await authNode(ws3, n3, adminJoin);
+      assert.equal((await wsJson(ws3)).status, 'authorized', 'admin 网络第 3 台不受组上限影响');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('GC-fix-batch1 R2：组配额到期后快照准时失效回落默认组；回退后不再反复重查', async () => {
+    const clock = { now: 1_700_000_000_000 }; // T0
+    const gw = await startGateway({ now: () => clock.now });
+    try {
+      // 回落目标：默认组设月度上限 2000（速率保持 seed 的 64kbps）；vip 组不限月度、T0+1500 到期
+      const def = await gw.store.getUserGroupByCode('default');
+      await gw.store.updateUserGroup(def.id, { monthlyRelayQuotaBytes: 2000 });
+      const vip = await gw.store.createUserGroup({
+        code: 'r2vip', name: 'vip', maxNetworks: 4, maxPeersPerNetwork: 8, relayRateKbps: 512,
+      });
+      const tenant = await gw.store.findUserByEmail(TENANT_EMAIL);
+      await gw.store.updateUserByAdmin(tenant.id, { groupId: vip.id, groupExpiresAt: new Date(clock.now + 1500).toISOString() });
+
+      let quotaReads = 0;
+      const origQuota = gw.store.resolveEffectiveUserQuota.bind(gw.store);
+      gw.store.resolveEffectiveUserQuota = async (userId, nowMs) => {
+        quotaReads += 1;
+        return origQuota(userId, nowMs);
+      };
+
+      const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const { a, b, wsA, wsB } = await joinPair(gw, net, clock);
+      await gw.hub.refreshQuota(); // 快照按 vip 加载：月度不限
+      const dataFrame = (seq) => frame({ src: a.nodeId, dst: b.nodeId, payloadBytes: 20, seq });
+      wsA.send(dataFrame(1n));
+      assert.equal((await wsBinary(wsB)).length, 64, '未到期：vip 不限月度，DATA 正常转发');
+      await gw.hub.flushTelemetry(); // db=64
+
+      // 时钟跨过到期时刻：下一帧的快照检查发现 expiresAtMs 已过 → 作废重拉默认组
+      clock.now += 2000; // T0+2000 > T0+1500
+      wsA.send(dataFrame(2n));
+      assert.equal((await wsBinary(wsB)).length, 64, '到期当帧按无快照放行（作废重拉的窗口）');
+      await gw.hub.refreshQuota(tenant.id); // 与在途加载去重并同步等待：快照=默认组（月度 2000）
+
+      // 回落后默认组月度门禁生效：逐帧 flush 到耗尽（每帧 64B）
+      for (let i = 3; i <= 32; i++) {
+        wsA.send(dataFrame(BigInt(i)));
+        assert.equal((await wsBinary(wsB)).length, 64);
+        await gw.hub.flushTelemetry();
+      }
+      assert.equal(await gw.store.getMonthlyRelayUsage(tenant.id, currentUtcYearMonth(clock.now)), 2048, '回落默认组后照常落库记账');
+      wsA.send(dataFrame(33n));
+      await wsSilence(wsB, 250);
+      assert.equal(gw.hub.getMonthlyQuotaDroppedCount(net.id), 1, '到期回落默认组后月度门禁准时生效');
+
+      // 已回退（isExpiredFallback=true）→ 快照 expiresAtMs=null：命中缓存不再触发重查
+      const readsBefore = quotaReads;
+      for (let i = 0; i < 6; i++) {
+        wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 5, seq: BigInt(50 + i) })); // PING 控制帧
+        await wsBinary(wsB);
+      }
+      await sleep(30);
+      assert.equal(quotaReads, readsBefore, '回退快照 expiresAtMs=null：命中缓存不得每帧重查');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('GC-fix-batch1 R5：冷缓存帧同步记账、flush 对账不泄漏不重复叠加；onUserDisabled 清理配额与断流', async () => {
+    const clock = { now: 1_700_000_000_000 };
+    const gw = await startGateway({ now: () => clock.now });
+    try {
+      const metered = await gw.store.createUserGroup({
+        code: 'r5metered', name: 'metered', maxNetworks: 4, maxPeersPerNetwork: 8,
+        relayRateKbps: 4096, monthlyRelayQuotaBytes: 100000,
+      });
+      const tenant = await gw.store.findUserByEmail(TENANT_EMAIL);
+      await gw.store.updateUserByAdmin(tenant.id, { groupId: metered.id });
+      const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const { a, b, wsA, wsB } = await joinPair(gw, net, clock);
+      const dataFrame = (seq) => frame({ src: a.nodeId, dst: b.nodeId, payloadBytes: 20, seq });
+
+      // 冷缓存：清掉快照，帧在后台加载完成前放行——修复前这里漏记 pending（月度判定值永久偏低）
+      gw.hub.ownerQuotaByNetwork.clear();
+      wsA.send(dataFrame(1n));
+      await wsBinary(wsB);
+      assert.equal(gw.hub.pendingRelayBytesByOwner.get(tenant.id), 64, '冷缓存放行的帧也必须同步记账 pending');
+      await gw.hub.flushTelemetry();
+      assert.equal(gw.hub.pendingRelayBytesByOwner.get(tenant.id) ?? 0, 0, 'flush 后 pending 清零（不泄漏、无负值）');
+      assert.equal(gw.hub.ownerQuotaByNetwork.get(net.id)?.dbUsedBytes, 64, '快照 dbUsed 精确推进一次（不重复叠加）');
+      assert.equal(await gw.store.getMonthlyRelayUsage(tenant.id, currentUtcYearMonth(clock.now)), 64);
+
+      // 快照在位的常规路径：再 20 帧 → flush → dbUsed 累计 64+1280=1344
+      for (let i = 2; i <= 21; i++) {
+        wsA.send(dataFrame(BigInt(i)));
+        await wsBinary(wsB);
+      }
+      assert.equal(gw.hub.pendingRelayBytesByOwner.get(tenant.id), 1280);
+      await gw.hub.flushTelemetry();
+      assert.equal(gw.hub.pendingRelayBytesByOwner.get(tenant.id) ?? 0, 0);
+      assert.equal(gw.hub.ownerQuotaByNetwork.get(net.id)?.dbUsedBytes, 1344);
+      assert.equal(await gw.store.getMonthlyRelayUsage(tenant.id, currentUtcYearMonth(clock.now)), 1344);
+
+      // onUserDisabled：清该属主的配额快照 / 丢弃计数 / 待刷字节，并断开其全部连接
+      wsA.send(dataFrame(22n));
+      await wsBinary(wsB);
+      assert.equal(gw.hub.pendingRelayBytesByOwner.get(tenant.id), 64, '停用前在途帧已记账未刷盘');
+      await gw.hub.hooks.onUserDisabled(tenant.id);
+      assert.ok(!gw.hub.ownerQuotaByNetwork.has(net.id), '停用即清属主配额快照');
+      assert.ok(!gw.hub.monthlyQuotaDroppedByNetwork.has(net.id), '停用即清月度丢弃计数');
+      assert.equal(gw.hub.pendingRelayBytesByOwner.get(tenant.id) ?? 0, 0, '停用即清属主待刷字节');
+      await wsClosed(wsA);
+      await wsClosed(wsB);
+      // 停用前的在途帧最终 flush：pending 已清，扣减不得把账目减成负值
+      await gw.hub.flushTelemetry();
+      assert.equal(await gw.store.getMonthlyRelayUsage(tenant.id, currentUtcYearMonth(clock.now)), 1408);
     } finally {
       await gw.close();
     }
