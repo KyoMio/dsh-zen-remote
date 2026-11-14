@@ -21,8 +21,7 @@ registerHooks({
 })
 const { PeerArqSession } = require('../src/peer/arq.ts')
 const { PeerMux } = require('../src/peer/mux.ts')
-const { generatePeerIdentity, generateEphemeralX25519 } = require('../src/peer/crypto.ts')
-const { ed25519Sign, PUNCH_DOMAIN } = require('../src/peer/punch.ts')
+const { generatePeerIdentity, generateEphemeralX25519, buildPeerHandshakeEnvelope } = require('../src/peer/crypto.ts')
 const { encodeFrameHeader, PeerFrameType, PEER_FRAME_MAGIC, PEER_FRAME_VERSION } = require('../src/peer/wire.ts')
 const immediate = () => new Promise(resolve => setImmediate(resolve))
 function pair(t, handler) {
@@ -43,8 +42,16 @@ test('signed gateway ACK with low-order DH key cannot throw or replace cipher st
   mux.ensureSession(b.nodeId, b.publicKeyHex, 'B')
   mux.enableRelayPath(b.nodeId)
   const nonce = mux.sessions.get(b.nodeId).nonce, timestamp = Date.now(), ephPubHex = '00'.repeat(32)
-  const sigHex = ed25519Sign(Buffer.from(`${PUNCH_DOMAIN}|ack|${networkId}|${b.nodeId}|${ephPubHex}|${nonce}|${timestamp}`), b)
-  const payload = Buffer.from(JSON.stringify({ zr: 1, kind: 'zr-hello-ack', networkId, nodeId: b.nodeId, publicKeyHex: b.publicKeyHex, ephPubHex, nonce, timestamp, sigHex }))
+  const payload = buildPeerHandshakeEnvelope({
+    kind: 'ack',
+    networkId,
+    identity: b,
+    selfEphPubHex: ephPubHex,
+    peerNodeId: a.nodeId,
+    peerEphPubHex: mux.sessions.get(b.nodeId).myEph.publicKeyHex,
+    nonce,
+    timestamp,
+  })
   const header = encodeFrameHeader({ magic: PEER_FRAME_MAGIC, version: PEER_FRAME_VERSION, frameType: PeerFrameType.HELLO, srcNodeId: b.nodeId, dstNodeId: a.nodeId, streamId: 0, seq: 0n, ack: 0 })
   const previous = { existing: true }
   mux.sessions.get(b.nodeId).ciphers = previous
@@ -61,8 +68,16 @@ test('gateway key rotation requires a fresh ACK and cannot roll back via recorde
   const state = mux.sessions.get(b.nodeId)
   function control(kind, ephPubHex, nonce) {
     const timestamp = Date.now()
-    const sigHex = ed25519Sign(Buffer.from(`${PUNCH_DOMAIN}|${kind}|${networkId}|${b.nodeId}|${ephPubHex}|${nonce}|${timestamp}`), b)
-    const payload = Buffer.from(JSON.stringify({ zr: 1, kind: kind === 'hello' ? 'zr-hello' : 'zr-hello-ack', networkId, nodeId: b.nodeId, publicKeyHex: b.publicKeyHex, ephPubHex, nonce, timestamp, sigHex }))
+    const payload = buildPeerHandshakeEnvelope({
+      kind,
+      networkId,
+      identity: b,
+      selfEphPubHex: ephPubHex,
+      peerNodeId: a.nodeId,
+      peerEphPubHex: kind === 'hello' ? null : state.myEph.publicKeyHex,
+      nonce,
+      timestamp,
+    })
     const header = encodeFrameHeader({ magic: PEER_FRAME_MAGIC, version: PEER_FRAME_VERSION, frameType: PeerFrameType.HELLO, srcNodeId: b.nodeId, dstNodeId: a.nodeId, streamId: 0, seq: 0n, ack: 0 })
     return Buffer.concat([header, payload])
   }

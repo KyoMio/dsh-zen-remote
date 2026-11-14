@@ -45,7 +45,6 @@ import {
   buildPeerHandshakeEnvelope,
   derivePeerSessionCiphers,
   generateEphemeralX25519,
-  PEER_PUNCH_V1_DOMAIN,
   parsePeerHandshakeEnvelope,
   verifySelfCertifyingNodeId,
 } from './crypto.js'
@@ -59,10 +58,8 @@ const NODE_ID_PATTERN = /^[0-9a-f]{8}$/
 const NETWORK_ID_PATTERN = /^[0-9a-fA-F]{16}$/
 const HEX64 = /^[0-9a-fA-F]{64}$/
 
-/** 打洞/中转握手控制包的域分隔前缀——UDP 与网关 WS 两条路径共用同一形态。 */
+/** STUN 探针控制包的域分隔前缀。 */
 export const STUN_PROBE_DOMAIN = 'zr-stun-probe-v1'
-/** v1 域常量已下沉 crypto.ts（PC-12）；此处保留同名导出维持既有引用面。 */
-export const PUNCH_DOMAIN = PEER_PUNCH_V1_DOMAIN
 
 /** `os.networkInterfaces()` entries, loosened so hand-built fixtures type-check. */
 export interface LanInterfaceInfo {
@@ -411,11 +408,6 @@ export interface DirectReadyInfo {
   endpoint: string
   /** Handshake RTT when we initiated; 0 when we answered passively. */
   rttMs: number
-  /**
-   * 本条直连握手达成的契约档位（内部诊断，PC-12）：`'v2'` = dual 信封完整绑定
-   * 成立；`'v1'` = 旧协议互通保障（TOFU + nonce 回显），**不是**完整绑定。
-   */
-  hsBound: 'v1' | 'v2'
   ciphers: PeerSessionCiphers
 }
 
@@ -474,8 +466,6 @@ interface PunchSession {
   /** Only an outstanding, unconsumed challenge can authorize a peer key. */
   awaitingAck: boolean
   peerEphPubHex: string | null
-  /** 本轮握手已达成的契约档位（内部诊断；新窗口/新握手时清空重记）。 */
-  hsBound: 'v1' | 'v2' | null
   /** Guard so one derived key pair fires onDirectReady exactly once. */
   derivedPair: string | null
   candidates: string[]
@@ -694,7 +684,6 @@ export class PeerPunchManager {
       nonce: randomBytes(8).toString('hex'),
       awaitingAck: true,
       peerEphPubHex: null,
-      hsBound: null,
       derivedPair: null,
       candidates,
       endpoint: null,
@@ -738,7 +727,6 @@ export class PeerPunchManager {
     session.nonce = randomBytes(8).toString('hex')
     session.awaitingAck = true
     session.peerEphPubHex = null
-    session.hsBound = null
     session.derivedPair = null
     session.ciphers = null
     session.rttMs = null
@@ -898,11 +886,10 @@ export class PeerPunchManager {
       this.clearSessionTimers(session)
       this.startPunchRounds(session)
     }
-    session.hsBound = parsed.contract
     this.sendHelloAck(session, parsed.nonce, parsed.ephPubHex, rinfo)
     // A signed HELLO can be recorded forever. Never adopt its key or endpoint:
     // ask the live identity to sign our fresh nonce instead. Keep the local DH
-    // key stable so simultaneous handshakes and legacy responders converge.
+    // key stable so simultaneous handshakes converge.
     if (session.peerEphPubHex !== parsed.ephPubHex || !session.ciphers) {
       if (!session.awaitingAck) {
         session.nonce = randomBytes(8).toString('hex')
@@ -918,10 +905,8 @@ export class PeerPunchManager {
     if (!session || session.peerPublicKeyHex !== parsed.publicKeyHex) return
     // The echoed nonce binds this ack to OUR current round; stale rounds die here.
     if (!session.awaitingAck || parsed.nonce !== session.nonce) return
-    // v2 档纵深复核：回绑的 dstEph 必须是本机当前在途临时钥（v2 签名已覆盖
-    // 这一等式，解析层复核零成本）。v1 档沿旧语义采信（nonce 回显 + 锚定公钥）。
-    if (parsed.contract === 'v2' && parsed.peerEphPubHex !== session.myEph.publicKeyHex) return
-    session.hsBound = parsed.contract
+    // 回绑的 dstEph 必须是本机当前在途临时钥（v2 签名已覆盖这一等式，解析层复核零成本）。
+    if (parsed.peerEphPubHex !== session.myEph.publicKeyHex) return
     if (typeof session.lastHelloSentAt === 'number') {
       session.rttMs = Math.max(0, this.clock.now() - session.lastHelloSentAt)
     }
@@ -985,7 +970,6 @@ export class PeerPunchManager {
       mode: classifyPunchEndpoint(endpoint, this.localIps),
       endpoint,
       rttMs: session.rttMs ?? 0,
-      hsBound: session.hsBound === 'v2' ? 'v2' : 'v1',
       ciphers,
     })
   }

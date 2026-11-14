@@ -34,7 +34,7 @@ const {
   collectLanEndpoints,
   classifyPunchEndpoint,
 } = require('../lib/peer/punch.js')
-const { generatePeerIdentity } = require('../lib/peer/crypto.js')
+const { generatePeerIdentity, buildPeerHandshakeEnvelope } = require('../lib/peer/crypto.js')
 const { PeerFrameType } = require('../lib/peer/wire.js')
 const { PeerArqSession } = require('../lib/peer/arq.js')
 
@@ -669,21 +669,16 @@ test('handlePacket drops garbage and cross-network control packets without side 
     mgr.handlePacket(randomBytes(64), { address: '127.0.0.1', port: 1 })
     mgr.handlePacket(Buffer.from(JSON.stringify({ zr: 1, kind: 'zr-hello' })), { address: '127.0.0.1', port: 1 })
     // A validly signed HELLO for a DIFFERENT network must be ignored.
-    const eph = randomBytes(32).toString('hex')
-    const nonce = randomBytes(8).toString('hex')
-    const timestamp = 12345
-    const message = Buffer.from(`zr-punch-v1|hello|0000000000000000|${stranger.nodeId}|${eph}|${nonce}|${timestamp}`, 'utf8')
-    mgr.handlePacket(Buffer.from(JSON.stringify({
-      zr: 1,
-      kind: 'zr-hello',
+    mgr.handlePacket(buildPeerHandshakeEnvelope({
+      kind: 'hello',
       networkId: '0000000000000000',
-      nodeId: stranger.nodeId,
-      publicKeyHex: stranger.publicKeyHex,
-      ephPubHex: eph,
-      nonce,
-      timestamp,
-      sigHex: ed25519SignHex(message, stranger),
-    })), { address: '127.0.0.1', port: 1 })
+      identity: stranger,
+      selfEphPubHex: randomBytes(32).toString('hex'),
+      peerNodeId: identity.nodeId,
+      peerEphPubHex: null,
+      nonce: randomBytes(8).toString('hex'),
+      timestamp: 12345,
+    }), { address: '127.0.0.1', port: 1 })
     assert.equal(mgr.sessionCiphers(stranger.nodeId), null, 'no session materialized')
   } finally {
     await closeManager({ mgr, socket })

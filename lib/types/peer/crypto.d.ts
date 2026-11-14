@@ -185,13 +185,14 @@ export interface PeerHandshakeMessageParams {
     dstNodeId: string;
     srcEphPubHex: string;
     dstEphPubHex: string;
+    nonce: string;
     timestamp: number;
 }
 /**
  * Sign one peer handshake message (hello or ack) with the long-term
  * identity, binding it to the network, both node ids, BOTH ephemeral
- * public keys and the timestamp — a replayed or substituted ephemeral
- * key breaks the signature.
+ * public keys, the challenge nonce and the timestamp — a replayed or
+ * substituted ephemeral key or nonce breaks the signature.
  */
 export declare function signPeerHandshake(params: PeerHandshakeMessageParams & {
     identityPrivateKeyHex: string;
@@ -243,24 +244,8 @@ export declare function derivePeerSessionCiphers(params: {
     myEphPublicKeyHex: string;
     peerEphPublicKeyHex: string;
 }): PeerSessionCiphers;
-/** 旧握手控制包的域分隔前缀（原 punch.ts 的 PUNCH_DOMAIN，下沉至此供两路径共用）。 */
-export declare const PEER_PUNCH_V1_DOMAIN = "zr-punch-v1";
 /** HELLO 里「应答方临时钥未知」的显式占位：64 个 '0'，是 v2 串中的普通 hex 字段。 */
 export declare const PEER_HS_ZERO_EPH_PUB: string;
-export interface PeerPunchV1MessageParams {
-    role: 'hello' | 'ack';
-    networkId: string;
-    nodeId: string;
-    ephPubHex: string;
-    nonce: string;
-    timestamp: number;
-}
-/**
- * 旧 `zr-punch-v1` 签名串的唯一构造点（PC-12：原先 punch.ts/mux.ts 各自手拼的
- * 四份模板收敛于此）。字段值**原样**进入字符串——旧端验证是「写法敏感」的
- * 历史契约，这里保持逐字节兼容，不做大小写规范化。
- */
-export declare function peerPunchV1Message(params: PeerPunchV1MessageParams): Buffer;
 export interface PeerHandshakeEnvelopeParams {
     kind: 'hello' | 'ack';
     networkId: string;
@@ -278,9 +263,8 @@ export interface PeerHandshakeEnvelopeParams {
     timestamp: number;
 }
 /**
- * 构造一个 dual 握手信封（HELLO/ACK 通吃）：全部 v1 字段与旧值一字不差，
- * 附加 `hs`（纯信息标记，不作任何判定依据）、`peerNodeId`、`peerEphPubHex`
- * 与 `sig2Hex`。旧端按 v1 半部照常互通；新端按 v2 半部建立完整绑定。
+ * 构造 v2 握手信封（HELLO/ACK 通吃）：全部字段纳入 `zr-peer-hs-v2` 单一签名
+ * `sigHex`，并带 `hs: 2` 版本标记。
  */
 export declare function buildPeerHandshakeEnvelope(params: PeerHandshakeEnvelopeParams): Buffer;
 export interface PeerHandshakeEnvelopeParseOptions {
@@ -291,37 +275,32 @@ export interface PeerHandshakeEnvelopeParseOptions {
     nowMs: number;
     /**
      * 时间戳新鲜度窗半宽（毫秒）。WS 中转路径传 30_000（既有值不变）；UDP 打洞
-     * 路径传 0 = 不检查新鲜度（PC-12 用户裁定：UDP 保持现状、不新增时间窗）。
+     * 路径传 0 = 不检查新鲜度（timestamp 只进签名）。
      */
     timeWindowMs: number;
 }
 export interface ParsedPeerHandshakeEnvelope {
-    /**
-     * `'v2'` = 新证明字段完整且验签通过（完整绑定成立）；`'v1'` = 真正不含任何
-     * 新证明字段的旧格式（旧协议互通保障，**不是**完整绑定）。
-     */
-    contract: 'v1' | 'v2';
     kind: 'hello' | 'ack';
     networkId: string;
     /** 发送方 nodeId（小写化；自证明绑定已核验）。 */
     nodeId: string;
-    /** 发送方长期 Ed25519 公钥（原样）。 */
+    /** 发送方长期 Ed25519 公钥（小写化）。 */
     publicKeyHex: string;
-    /** 发送方一次性 X25519 公钥（原样；v1 串按写法敏感的历史契约核验）。 */
+    /** 发送方一次性 X25519 公钥（小写化）。 */
     ephPubHex: string;
+    /** 16 位挑战 nonce（小写化）。 */
     nonce: string;
     timestamp: number;
-    /** v2 专有：指名对象（恒等于接收方本机 nodeId）；v1 为 null。 */
-    peerNodeId: string | null;
-    /** v2 专有：HELLO 的零占位 / ACK 回绑的发起方临时钥（小写化）；v1 为 null。 */
-    peerEphPubHex: string | null;
+    /** 指名对象（恒等于接收方本机 nodeId，小写化）。 */
+    peerNodeId: string;
+    /** HELLO 的零占位 / ACK 回绑的发起方临时钥（小写化）。 */
+    peerEphPubHex: string;
 }
 /**
- * 解析并验证一个握手信封（UDP 数据报与 WS 中转帧共用；WS 侧补零在函数内
- * 剥除）。返回 null 的情形：JSON/形状坏、networkId 不符、自源信封、nodeId
- * 非自证明、时间窗外（仅当 `timeWindowMs > 0`）、v1 签名无效，以及 **任何
- * 新证明字段在场却不完整/形状错/验签失败**——最后这类按正常验证失败处理，
- * 绝不回退 v1（PC-12 用户裁定）。从不抛异常。
+ * 解析并验证一个 v2 握手信封（UDP 数据报与 WS 中转帧共用；WS 侧补零在函数内
+ * 剥除）。返回 null 的情形：JSON/形状坏、缺 `hs: 2`、networkId 不符、自源或
+ * 非指名本机、nodeId 非自证明、HELLO/ACK 对端临时钥占位不符、时间窗外（仅当
+ * `timeWindowMs > 0`），或 `zr-peer-hs-v2` 验签失败——绝不降级。从不抛异常。
  */
 export declare function parsePeerHandshakeEnvelope(bytes: Uint8Array, options: PeerHandshakeEnvelopeParseOptions): ParsedPeerHandshakeEnvelope | null;
 //# sourceMappingURL=crypto.d.ts.map

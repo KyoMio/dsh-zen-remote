@@ -17,7 +17,7 @@
  * 新握手尚未完成的瞬态里，底层发送可能未就绪：这里**捕获并丢弃该次发送**，
  * 由 ARQ 重传定时器在路径恢复后自动补发，绝不让同步抛错崩掉流。
  *
- * 网关中转握手沿用 UDP 路径的同一套已签名 `zr-punch-v1` hello/ack JSON，
+ * 网关中转握手沿用 UDP 路径的同一套已签名 `zr-peer-hs-v2` hello/ack JSON，
  * 外面套 28B 路由头（`HELLO`，streamId 0，明文载荷）让网关能路由而无需解密。
  * DATA/SACK/ACK/RST/PING/PONG 永远走密封载荷——`(HELLO, streamId 0)` 形态因此
  * 无歧义。载荷不足 44B（网关中转的最小帧）时补零，接收侧剥掉。
@@ -96,7 +96,7 @@ export declare class PeerMux {
     handleOpenedFrame(header: PeerFrameHeader, plaintext: Uint8Array): void;
     /**
      * 网关 WS 中转的一个二进制帧。两种形态：
-     *  - (HELLO, streamId 0)：明文 `zr-punch-v1` 控制信封——WS 中转握手的半边；
+     *  - (HELLO, streamId 0)：明文 `zr-peer-hs-v2` 控制信封——WS 中转握手的半边；
      *  - 其余：中转握手密码器密封的帧，在这里开封。
      */
     handleGatewayFrame(bytes: Uint8Array): void;
@@ -114,7 +114,7 @@ export declare class PeerMux {
     private dispatchFrame;
     private beginHello;
     private clearHelloTimer;
-    /** `28B 头（HELLO, streamId 0）+ dual 握手信封 JSON`，网关原样路由（只读路由头）。 */
+    /** `28B 头（HELLO, streamId 0）+ v2 握手信封 JSON`，网关原样路由（只读路由头）。 */
     private sendHelloEnvelope;
     private sendHelloAckEnvelope;
     private sendEnvelope;
