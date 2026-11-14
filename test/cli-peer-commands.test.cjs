@@ -2393,14 +2393,14 @@ test('peer status: 容量行 —— 本机挂载 N/M 与网络总上限独立成
     assert.equal(await mods.runPeerStatusCommand(zh), 0)
     const zhText = zh.stdout.text()
     assert.match(zhText, /本机已挂载 2 \/ 3 台远端设备/u)
-    assert.match(zhText, /网络设备上限 8 台（含本机）/u, 'the network-total cap rides as its own line, not folded into N/M')
+    assert.doesNotMatch(zhText, /网络设备上限 8 台（含本机）/u, 'the network-total cap stays hidden until full')
     assert.doesNotMatch(zhText, /已达本机挂载上限/u, 'under the cap means no full note')
 
     const en = makeCtx(mods, { argv: ['peer', 'status'], ipc, lang: 'en' })
     assert.equal(await mods.runPeerStatusCommand(en), 0)
     const enText = en.stdout.text()
     assert.match(enText, /2 \/ 3 remote devices mounted on this machine/u)
-    assert.match(enText, /Network device cap 8 \(this machine included\)/u)
+    assert.doesNotMatch(enText, /Network device cap 8 \(this machine included\)/u)
     assert.doesNotMatch(enText, /mount cap .* is reached/u)
   } finally {
     if (handle !== undefined) await handle.close()
@@ -2468,7 +2468,7 @@ test('总 status: peer 板块容量行与 peer status 同口径，热改下次�
     // 第一次：正常 2/3。
     assert.equal(await mods.runStatusCommand(zh), 0)
     assert.match(zh.stdout.text(), /本机已挂载 2 \/ 3 台远端设备/u)
-    assert.match(zh.stdout.text(), /网络设备上限 8 台（含本机）/u)
+    assert.doesNotMatch(zh.stdout.text(), /网络设备上限 8 台（含本机）/u)
     assert.doesNotMatch(zh.stdout.text(), /已达本机挂载上限/u)
     zh.stdout.lines.length = 0
 
@@ -2478,6 +2478,7 @@ test('总 status: peer 板块容量行与 peer status 同口径，热改下次�
     const fullText = zh.stdout.text()
     assert.match(fullText, /本机已挂载 2 \/ 2 台远端设备/u)
     assert.match(fullText, /已达本机挂载上限（2 台）：已有挂载保留，新增挂载前请先取消部分设备的挂载/u)
+    assert.match(fullText, /网络设备上限 8 台（含本机）/u)
     zh.stdout.lines.length = 0
 
     // 热改 → 超额 3/2：超额存量照实显示。
@@ -2518,7 +2519,7 @@ test('peer status: 旧端缺字段 —— 容量未知明示、网络上限仍�
     const text = zh.stdout.text()
     assert.match(text, /本机挂载容量未知/u, 'missing fields say unknown explicitly')
     assert.doesNotMatch(text, /本机已挂载 \d+ \/ \d+ 台远端设备/u, 'no N/M fabricated from maxPeers - 1 or the constant 8')
-    assert.match(text, /网络设备上限 8 台（含本机）/u, 'a known network cap still shows on its own line')
+    assert.doesNotMatch(text, /网络设备上限 8 台（含本机）/u, 'network cap note stays hidden unless limitReached is true')
 
     // 垃圾值（分数上限 / 负数挂载）同样按未知处理，不进文本。
     const junkBody = peerStatusBody('authorized', { extra: { maxServers: 1.5, mountedCount: -1, limitReached: true } })
