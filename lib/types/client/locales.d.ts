@@ -610,7 +610,6 @@ export declare const zh: {
     readonly 'wizard.overview.peerConnNone': "暂无在线设备";
     readonly 'wizard.overview.peerDevicesLabel': "网内设备";
     readonly 'wizard.overview.peerMountCount': "本机已挂载 {count} / {max} 台远端设备";
-    readonly 'wizard.overview.peerMountUnknown': "本机挂载容量未知";
     readonly 'wizard.overview.peerMountFull': "已达本机挂载上限（{max} 台）：已有挂载保留，新增挂载前请先取消部分设备的挂载";
     readonly 'wizard.overview.peerNetworkCapNote': "网络设备上限 {max} 台（含本机）";
     readonly 'wizard.overview.peerMountedDiscovered': "本机已挂载 {count} 台 · 已发现 {total} 台";

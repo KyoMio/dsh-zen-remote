@@ -1865,7 +1865,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                   <span>
                     {peerSummary.mountedCount !== undefined && peerSummary.maxServers !== undefined
                       ? t('wizard.overview.peerMountCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.maxServers) })
-                      : t('wizard.overview.peerMountUnknown')}
+                      : '—'}
                   </span>
                 </p>
                 {peerSummary.limitReached === true || peerSummary.mismatchCount > 0 ? (
@@ -1875,7 +1875,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                       : t('wizard.peer.devicePathMismatch')}
                   </p>
                 ) : null}
-                {peerSummary.maxPeers !== undefined ? (
+                {peerSummary.limitReached === true && peerSummary.maxPeers !== undefined ? (
                   <p className="zr-wizard-overviewSub">
                     {t('wizard.overview.peerNetworkCapNote', { max: String(peerSummary.maxPeers) })}
                   </p>
@@ -3619,9 +3619,9 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                   <p className="zr-wizard-subtitle" data-limit={peerSummary.limitReached ? 'true' : undefined}>
                     {peerSummary.mountedCount !== undefined && peerSummary.maxServers !== undefined
                       ? t('wizard.overview.peerMountCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.maxServers) })
-                      : t('wizard.overview.peerMountUnknown')}
+                      : '—'}
                   </p>
-                  {peerSummary.maxPeers !== undefined ? (
+                  {peerSummary.limitReached === true && peerSummary.maxPeers !== undefined ? (
                     <p className="zr-wizard-subtitle">
                       {t('wizard.overview.peerNetworkCapNote', { max: String(peerSummary.maxPeers) })}
                     </p>

@@ -61,11 +61,9 @@ export interface PeerCapacityFacts {
 /** Normalize one peer status body's capacity facts. Pure, defensive: a junk
  * body yields all-unknown, never a plausible-looking guess. */
 export declare function peerCapacityOf(body: ServerRow | null): PeerCapacityFacts;
-/** The capacity terminal lines, indent included — the mount N/M line (or the
- * explicit unknown), the full note when the local cap is reached (existing
- * mounts stay, new ones wait), and the network-total cap as its own line
- * whenever the body announced one (even while the local capacity is
- * unknown). */
+/** The capacity terminal lines, indent included — only the core N/M mount
+ * line (or explicit unknown fallback) is emitted normally; full / network-cap
+ * warning notes append only when the local mount limit is reached. */
 export declare function peerCapacityLines(t: CliTranslator, body: ServerRow | null): string[];
 /** One paired-host row, the exact shape both surfaces print:
  * `[entryId] displayName  serverUrl  state  compat/bridge`. */

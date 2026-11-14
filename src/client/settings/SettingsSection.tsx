@@ -1486,25 +1486,21 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                     >
                       {peerSummary.mountedCount !== undefined && peerSummary.maxServers !== undefined
                         ? t('wizard.overview.peerMountCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.maxServers) })
-                        : t('wizard.overview.peerMountUnknown')}
+                        : '—'}
                     </span>
                   ) : null}
                 </div>
-                {/* PC-11b + fix1: the full note and the raw network cap are
-                    TWO independent lines — the cap note rides at ALL times
-                    the body carried a maxPeers (full, over-cap stock or
-                    unknown local cap alike), never folded into one long
-                    line. The note only explains; the switches stay the
-                    user's (the engine's mount gate remains the refusal). */}
                 {peerSummary?.limitReached === true ? (
-                  <p className="zr-settings-hint" data-invalid="true" style={{ paddingTop: 4 }}>
-                    {t('wizard.overview.peerMountFull', { max: String(peerSummary.maxServers ?? '') })}
-                  </p>
-                ) : null}
-                {peerSummary?.maxPeers !== undefined ? (
-                  <p className="zr-settings-hint" style={{ paddingTop: 4 }}>
-                    {t('wizard.overview.peerNetworkCapNote', { max: String(peerSummary.maxPeers) })}
-                  </p>
+                  <>
+                    <p className="zr-settings-hint" data-invalid="true" style={{ paddingTop: 4 }}>
+                      {t('wizard.overview.peerMountFull', { max: String(peerSummary.maxServers ?? '') })}
+                    </p>
+                    {peerSummary.maxPeers !== undefined ? (
+                      <p className="zr-settings-hint" style={{ paddingTop: 4 }}>
+                        {t('wizard.overview.peerNetworkCapNote', { max: String(peerSummary.maxPeers) })}
+                      </p>
+                    ) : null}
+                  </>
                 ) : null}
                 {peerView.peers.length === 0 ? (
                   <p className="zr-settings-hint" style={{ padding: '8px 0 12px' }}>{t('wizard.peer.devicesModalEmpty')}</p>
