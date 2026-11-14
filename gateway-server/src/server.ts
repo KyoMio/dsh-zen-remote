@@ -3,7 +3,7 @@
 import http from 'node:http';
 import { IncomingMessage, ServerResponse } from 'node:http';
 
-import { buildAuthRoutes, DEFAULT_SESSION_TTL_MS, isCrossSiteWrite, matchRoute, NOOP_RUNTIME_STATS, sendError, storeErrorToApiError } from './http/auth.js';
+import { buildAuthRoutes, isCrossSiteWrite, matchRoute, NOOP_RUNTIME_STATS, sendError, storeErrorToApiError } from './http/auth.js';
 import type {
   ApiServerConfig,
   GatewayHooks,
@@ -12,6 +12,7 @@ import type {
   RouteDef,
   TopologyProvider,
 } from './http/auth.js';
+import { buildAccountRoutes } from './http/routes-account.js';
 import { buildNetworkRoutes } from './http/routes-networks.js';
 import { buildAdminRoutes } from './http/routes-admin.js';
 import { buildTopologyRoutes } from './http/routes-topology.js';
@@ -27,8 +28,6 @@ export interface GatewayApiServerOptions {
   masterKey: Buffer;
   /** 对外可达基础 URL；缺省时 joinUri 取请求 Host 头 */
   publicUrl?: string;
-  /** 会话 TTL，缺省 7 天 */
-  sessionTtlMs?: number;
   /** PG-5 运行时统计注入（在线设备数 / 实时中转速率）；缺省全 0 */
   runtime?: GatewayRuntimeStats;
   /** PG-5 实时钩子；缺省无钩子 */
@@ -109,11 +108,11 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, deps: Dispatc
 export function createApiRequestHandler(options: GatewayApiServerOptions): (req: IncomingMessage, res: ServerResponse) => void {
   const config: ApiServerConfig = {
     publicUrl: options.publicUrl,
-    sessionTtlMs: options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS,
   };
   const deps: DispatchDeps = {
     routes: [
       ...buildAuthRoutes(),
+      ...buildAccountRoutes(),
       ...buildNetworkRoutes(),
       ...buildAdminRoutes(),
       ...(options.topology !== undefined ? buildTopologyRoutes() : []),
