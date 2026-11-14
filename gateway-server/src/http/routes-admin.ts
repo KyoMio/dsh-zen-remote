@@ -3,7 +3,8 @@
 // 仅 admin 角色可访问（requireAdmin 前置，GC-6a 起支持 Bearer API Key 双轨），
 // 普通用户一律 403 FORBIDDEN。
 // 用户列表永不暴露 passwordHash；停用/改密由 store 原子清除其全部登录会话。
-// settings 仍保持基础 4 键契约（GC-6b 统一切换扩展键，避免破坏既有测试）。
+// settings（GC-6b 起切到扩展设置视图）：HTTP 层给出脱敏视图（含 smtp 已配置态与
+// adminApiKey 前缀），底层 store 仍保持基础 4 键 SystemSettings 契约与钩子签名不变。
 import { randomBytes } from 'node:crypto';
 
 import { sendMail, SmtpClientError } from '../mail/smtp-client.js';
@@ -11,10 +12,11 @@ import type { SmtpSecurityMode } from '../mail/smtp-client.js';
 import { renderSmtpTestEmail } from '../mail/templates.js';
 import type { MailLocale } from '../mail/templates.js';
 import { generatePassword, hashPassword } from '../master-key.js';
-import { validateGroupInput } from '../store/types.js';
+import { DEFAULT_GROUP_ID, validateGroupInput } from '../store/types.js';
 import type {
   AdminUserPatch,
   CreateUserGroupInput,
+  ExtendedSettingsPatch,
   GatewayStore,
   SettingsPatch,
   UpdateUserGroupPatch,
@@ -25,6 +27,7 @@ import type {
 import {
   ApiError,
   decodeSmtpConfig,
+  encodeSmtpConfig,
   hashToken,
   isSmtpConfigured,
   isValidEmail,
@@ -100,10 +103,48 @@ async function groupRowWithCount(ctx: RouteContext, group: UserGroupRecord): Pro
   return { ...group, userCount: counts.get(group.id) ?? 0 };
 }
 
-// ---------------------------------------------------------------- 系统设置（保持 4 键契约，GC-6b 切换）
+// ---------------------------------------------------------------- 系统设置（GC-6b 扩展视图）
 
-/** PATCH /admin/settings 的部分校验：只收四个已知键，范围与 config 解析一致 */
-function parseSettingsPatch(body: Record<string, unknown>): SettingsPatch {
+/**
+ * GET/PATCH /admin/settings 共用的脱敏视图。绝对红线：响应 JSON 严禁出现
+ * password / smtpConfigEnc 密文 / adminApiKeyHash 原文或密文——密码只给
+ * hasPassword 布尔，API Key 只给前缀与创建时刻。
+ */
+async function buildSettingsView(ctx: RouteContext): Promise<Record<string, unknown>> {
+  const [ext, groups] = await Promise.all([ctx.store.getExtendedSettings(), ctx.store.listUserGroups()]);
+  const smtp = decodeSmtpConfig(ext.smtpConfigEnc, ctx.masterKey);
+  return {
+    allowSignup: ext.allowSignup,
+    requireEmailVerification: ext.requireEmailVerification,
+    maxNetworksPerUser: ext.maxNetworksPerUser,
+    defaultMaxPeers: ext.defaultMaxPeers,
+    relayRateKbps: ext.relayRateKbps,
+    publicUrl: ext.publicUrl,
+    sessionTtlDays: ext.sessionTtlDays,
+    // 当前 is_default 组的 id；无默认组行时兜底内置 id（正常初始化流程不会发生）
+    defaultGroupId: groups.find((g) => g.isDefault)?.id ?? DEFAULT_GROUP_ID,
+    smtp: {
+      configured: isSmtpConfigured(smtp),
+      // 未配置时给一份空草稿形态（host/port 明显为空值），控制台可直接渲染表单
+      host: smtp?.host ?? '',
+      port: smtp?.port ?? 0,
+      security: smtp?.security ?? 'starttls',
+      username: smtp?.username ?? '',
+      hasPassword: smtp?.password !== undefined && smtp.password.length > 0,
+      fromAddress: smtp?.fromAddress ?? '',
+      fromName: smtp?.fromName ?? '',
+      rejectUnauthorized: smtp?.rejectUnauthorized ?? true,
+    },
+    adminApiKey: {
+      configured: ext.adminApiKeyHash !== null,
+      prefix: ext.adminApiKeyPrefix,
+      createdAt: ext.adminApiKeyCreatedAt,
+    },
+  };
+}
+
+/** PATCH /admin/settings 的基础 4 键部分校验：范围与默认组字段校验（validateGroupInput）对齐 */
+function parseBaseSettingsPatch(body: Record<string, unknown>): SettingsPatch {
   const patch: SettingsPatch = {};
   if (body['allowSignup'] !== undefined) {
     if (typeof body['allowSignup'] !== 'boolean') {
@@ -112,7 +153,7 @@ function parseSettingsPatch(body: Record<string, unknown>): SettingsPatch {
     patch.allowSignup = body['allowSignup'];
   }
   if (body['maxNetworksPerUser'] !== undefined) {
-    patch.maxNetworksPerUser = parseIntInRange(body['maxNetworksPerUser'], 1, 50, 'maxNetworksPerUser');
+    patch.maxNetworksPerUser = parseIntInRange(body['maxNetworksPerUser'], 1, 100, 'maxNetworksPerUser');
   }
   if (body['defaultMaxPeers'] !== undefined) {
     patch.defaultMaxPeers = parseIntInRange(body['defaultMaxPeers'], 2, 64, 'defaultMaxPeers');
@@ -123,21 +164,184 @@ function parseSettingsPatch(body: Record<string, unknown>): SettingsPatch {
   return patch;
 }
 
+/**
+ * publicUrl 归一化（SPEC 5.4）：传 `""` 或 null 清空；非空串必须解析为 http:/https:
+ * 裸地址——不带路径（仅允许空或 `/`，末尾 `/` 自动去掉）、不带查询串/哈希/控制字符。
+ */
+function parsePublicUrlPatch(value: unknown): string | null {
+  if (value === null || value === '') return null;
+  if (typeof value !== 'string') {
+    throw new ApiError(400, 'INVALID_REQUEST', 'publicUrl must be a string or null');
+  }
+  if (value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'publicUrl must not contain leading/trailing whitespace or control characters');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new ApiError(400, 'INVALID_REQUEST', 'publicUrl must be a valid http(s) URL');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new ApiError(400, 'INVALID_REQUEST', 'publicUrl must use http: or https:');
+  }
+  if (parsed.search.length > 0 || parsed.hash.length > 0 || (parsed.pathname.length > 0 && parsed.pathname !== '/')) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'publicUrl must not contain a path, query, or hash');
+  }
+  return value.endsWith('/') ? value.slice(0, -1) : value;
+}
+
+/** SMTP 字符串字段的邮件头注入防线：\r \n \0 一律拒绝 */
+function rejectSmtpHeaderInjection(value: string, label: string): void {
+  if (/[\r\n\0]/.test(value)) {
+    throw new ApiError(400, 'INVALID_REQUEST', `${label} must not contain CR, LF, or NUL`);
+  }
+}
+
+/** smtp 草稿字段的主字段/别名读取（secure/user/pass/fromEmail 为历史别名） */
+function readSmtpAliasField(draft: Record<string, unknown>, primary: string, alias: string): unknown {
+  return draft[primary] !== undefined ? draft[primary] : draft[alias];
+}
+
+/**
+ * PATCH /admin/settings 的 smtp 对象解析（与 smtp-test 的 parseSmtpDraft 同一套校验，
+ * 另支持别名与安全模式归一化）：
+ * - `security` 归一化 `implicit_tls`→`tls`、`plain`→`none`；
+ * - password 省略或空串时沿用库中已存密码（管理员改 host/port 不必重输密码）；
+ * - 返回合并后的完整配置，由调用方 encodeSmtpConfig 加密落库。
+ */
+function parseSmtpSettingsPatch(value: unknown, savedPassword: string | undefined): StoredSmtpConfig {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'smtp must be an object or null');
+  }
+  const draft = value as Record<string, unknown>;
+  const host = requireStringField(draft, 'host');
+  rejectSmtpHeaderInjection(host, 'smtp.host');
+  const port = parseIntInRange(draft['port'], 1, 65535, 'smtp.port');
+  const rawSecurity = readSmtpAliasField(draft, 'security', 'secure');
+  const security = rawSecurity === 'implicit_tls' ? 'tls' : rawSecurity === 'plain' ? 'none' : rawSecurity;
+  if (security !== 'tls' && security !== 'starttls' && security !== 'none') {
+    throw new ApiError(400, 'INVALID_REQUEST', "smtp.security must be one of: tls, starttls, none");
+  }
+  const rawFromAddress = readSmtpAliasField(draft, 'fromAddress', 'fromEmail');
+  if (typeof rawFromAddress !== 'string' || rawFromAddress.trim().length === 0) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'smtp.fromAddress must be a non-empty string');
+  }
+  const fromAddress = rawFromAddress.trim();
+  rejectSmtpHeaderInjection(fromAddress, 'smtp.fromAddress');
+  const rawUsername = readSmtpAliasField(draft, 'username', 'user');
+  if (rawUsername !== undefined && typeof rawUsername !== 'string') {
+    throw new ApiError(400, 'INVALID_REQUEST', 'smtp.username must be a string');
+  }
+  const username = typeof rawUsername === 'string' && rawUsername.length > 0 ? rawUsername : undefined;
+  const rawPassword = readSmtpAliasField(draft, 'password', 'pass');
+  if (rawPassword !== undefined && rawPassword !== null && typeof rawPassword !== 'string') {
+    throw new ApiError(400, 'INVALID_REQUEST', 'smtp.password must be a string');
+  }
+  const password =
+    typeof rawPassword === 'string' && rawPassword.length > 0 ? rawPassword : savedPassword;
+  const rawFromName = draft['fromName'];
+  if (rawFromName !== undefined && typeof rawFromName !== 'string') {
+    throw new ApiError(400, 'INVALID_REQUEST', 'smtp.fromName must be a string');
+  }
+  const fromName = typeof rawFromName === 'string' && rawFromName.length > 0 ? rawFromName : undefined;
+  const rejectUnauthorized = draft['rejectUnauthorized'];
+  if (rejectUnauthorized !== undefined && typeof rejectUnauthorized !== 'boolean') {
+    throw new ApiError(400, 'INVALID_REQUEST', 'smtp.rejectUnauthorized must be a boolean');
+  }
+  for (const [label, text] of [
+    ['smtp.username', username],
+    ['smtp.password', password],
+    ['smtp.fromName', fromName],
+  ] as const) {
+    if (text !== undefined) rejectSmtpHeaderInjection(text, label);
+  }
+  return {
+    host,
+    port,
+    security: security as SmtpSecurityMode,
+    username,
+    password,
+    fromAddress,
+    fromName,
+    rejectUnauthorized: typeof rejectUnauthorized === 'boolean' ? rejectUnauthorized : undefined,
+  };
+}
+
 async function handleGetSettings(ctx: RouteContext): Promise<void> {
   await requireAdmin(ctx);
-  sendOk(ctx.res, await ctx.store.getSettings());
+  sendOk(ctx.res, await buildSettingsView(ctx));
 }
 
 async function handlePatchSettings(ctx: RouteContext): Promise<void> {
   await requireAdmin(ctx);
   const body = await readJsonObjectBody(ctx.req);
-  const patch = parseSettingsPatch(body);
-  const result = await ctx.store.updateSettings(patch);
-  // 空补丁 = 只读取当前值，不打扰 PG-5 的限速器
-  if (Object.keys(patch).length > 0) {
-    await runHook(ctx.hooks.onSettingsChanged, result);
+
+  // ---- 第一阶段：全部提交字段先校验，任何 400/404 都不落盘
+  const extPatch: ExtendedSettingsPatch = { ...parseBaseSettingsPatch(body) };
+  if (body['requireEmailVerification'] !== undefined) {
+    if (typeof body['requireEmailVerification'] !== 'boolean') {
+      throw new ApiError(400, 'INVALID_REQUEST', 'requireEmailVerification must be a boolean');
+    }
+    extPatch.requireEmailVerification = body['requireEmailVerification'];
   }
-  sendOk(ctx.res, result);
+  if (body['publicUrl'] !== undefined) {
+    extPatch.publicUrl = parsePublicUrlPatch(body['publicUrl']);
+  }
+  if (body['sessionTtlDays'] !== undefined) {
+    extPatch.sessionTtlDays = parseIntInRange(body['sessionTtlDays'], 1, 90, 'sessionTtlDays');
+  }
+  const ext = await ctx.store.getExtendedSettings();
+  const savedSmtp = decodeSmtpConfig(ext.smtpConfigEnc, ctx.masterKey);
+  let smtpProvided = false;
+  if (body['smtp'] !== undefined) {
+    smtpProvided = true;
+    if (body['smtp'] === null) {
+      extPatch.smtpConfigEnc = null; // 显式清空发信配置
+    } else {
+      extPatch.smtpConfigEnc = encodeSmtpConfig(
+        parseSmtpSettingsPatch(body['smtp'], savedSmtp?.password),
+        ctx.masterKey,
+      );
+    }
+  }
+  // 空体或一个已知键都没有 → 400（读取走 GET，不再支持「空补丁读当前值」；
+  // defaultGroupId 也是已知键，只改它时继续走组存在性校验 → 404）
+  const hasDefaultGroupId = body['defaultGroupId'] !== undefined;
+  if (Object.keys(extPatch).length === 0 && !hasDefaultGroupId) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'at least one known setting field is required');
+  }
+  let switchDefaultGroupId: string | undefined;
+  if (hasDefaultGroupId) {
+    if (typeof body['defaultGroupId'] !== 'string' || body['defaultGroupId'].length === 0) {
+      throw new ApiError(400, 'INVALID_REQUEST', 'defaultGroupId must be a non-empty string');
+    }
+    if ((await ctx.store.getUserGroup(body['defaultGroupId'])) === null) {
+      throw new ApiError(404, 'GROUP_NOT_FOUND', 'user group not found');
+    }
+    switchDefaultGroupId = body['defaultGroupId'];
+  }
+
+  // ---- 第二阶段：SMTP 门禁按「更新后的最终结果」判定——本次改了 smtp 就按新值，
+  // 否则按库中现值；防止清空 smtp 或关掉发信后邮箱验证流程卡死
+  const finalRequireVerification = extPatch.requireEmailVerification ?? ext.requireEmailVerification;
+  const finalSmtp = smtpProvided
+    ? decodeSmtpConfig(extPatch.smtpConfigEnc ?? null, ctx.masterKey)
+    : savedSmtp;
+  if (finalRequireVerification && !isSmtpConfigured(finalSmtp)) {
+    throw new ApiError(400, 'SMTP_NOT_CONFIGURED', 'requireEmailVerification requires a configured smtp');
+  }
+
+  // ---- 第三阶段：落盘。先切默认组再写扩展设置——store 对三项配额键的双向同步
+  // 目标是「当前 is_default 组」，这个顺序保证本次 PATCH 的新配额写进新默认组
+  if (switchDefaultGroupId !== undefined) {
+    await ctx.store.updateUserGroup(switchDefaultGroupId, { isDefault: true });
+  }
+  await ctx.store.updateExtendedSettings(extPatch);
+  // 钩子仍按基础 4 键契约通知实时层（PG-5 限速器 / 会话 TTL），配额全量失效刷新
+  await runHook(ctx.hooks.onSettingsChanged, await ctx.store.getSettings());
+  await runHook(ctx.hooks.onQuotaChanged);
+  sendOk(ctx.res, await buildSettingsView(ctx));
 }
 
 // ---------------------------------------------------------------- 只读运行态与安全告警（GC-6a）
