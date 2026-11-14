@@ -354,8 +354,8 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `/v1/handshake` | POST | 握手：交换中继协议版本、服务端 id / 显示名、DSH 版本号、13+1 分组接口指纹表（`session`、`workspace`、`job`、`files`、`subagent`、`goal`、`terminal`、`officeKit`、`agentTeam`、`userQuestions`、`actionCards`、`trajectory`、`forge` 及转发事件组 `events`）。中继协议版本不一致即拒绝连接；回包带 `serverName`（服务端显示名）与 `deviceName`（本设备在服务端记录里的名字） |
 | `/v1/device/name` | POST | 设备改名：**网关自己处理、不转发给 DSH**——只对已配对的桌面应用端开放，只改调用者自己的设备记录；请求体 `{"name":"…"}`（1–40 字），改名经流心跳（约 15 秒）与握手刷新（约 30 秒）同步到对端 |
 | `/v1/invoke` | POST | 在已共享会话上执行一次 DSH 远程调用（单次，JSON 进出；`workspaceFiles/readBytes` 这类二进制结果以 `{"$zr-u8": <base64>}` 标记承载，子客户端还原成 `Uint8Array`——见 `src/invoke-binary.ts`） |
-| `/v1/stream` | POST | 打开一条 DSH 流式订阅。**NDJSON 格式**：响应体每行一条 JSON；`{"type":"ping"}` 心跳行（默认 15 秒一条）防止反代把闲置流掐掉，每条都带当下的 `serverName` / `deviceName`（服务端改名约 15 秒内到达所有客户端）；共享关闭/订阅失效时补一行 `{"type":"error","error":{"code":"unshared"}}` 再结束。**双工流**（TA-1）：方法声明带 uplink 且请求体带 `uplink: true` 时，服务端先写出一行 `{"type":"uplink","streamId":"<32-hex>"}` 握手行再转发任何帧，此后客户端可经 `/v1/stream-uplink` 向这条流上行帧；不认识这行的旧客户端自动忽略，单向流（不带 `uplink: true`）行为一字不变 |
-| `/v1/stream-uplink` | POST | 双工流的上行通道（TA-1）：请求体 `{streamId, seq, items?, end?}`——`items` 是本次批量上行帧（一次网络往返可合批多条），`end: true` 半关闭上行；服务端按 `streamId` 找到活跃流后过四道闸——设备归属（跨设备 404 `unknown-stream`）、会话仍共享（403 `not-shared`）、传输序号严格递增（乱序 409 `out-of-order`）、未消费缓冲不超 256 KiB（超限 413 `uplink-overflow` 并中止该流）。客户端侧是**单飞行合批泵**：同一时刻最多一个上行 POST 在途，飞行期间读到的帧攒成本地批次，既天然严格保序（避免并发请求乱序触发宿主 `Terminal input sequence has a gap`）又把快速输入的往返次数降到最低 |
+| `/v1/stream` | POST | 打开一条 DSH 流式订阅。**NDJSON 格式**：响应体每行一条 JSON；`{"type":"ping"}` 心跳行（默认 15 秒一条）防止反代把闲置流掐掉，每条都带当下的 `serverName` / `deviceName`（服务端改名约 15 秒内到达所有客户端）；共享关闭/订阅失效时补一行 `{"type":"error","error":{"code":"unshared"}}` 再结束。**双工流**：方法声明带 uplink 且请求体带 `uplink: true` 时，服务端先写出一行 `{"type":"uplink","streamId":"<32-hex>"}` 握手行再转发任何帧，此后客户端可经 `/v1/stream-uplink` 向这条流上行帧；不认识这行的旧客户端自动忽略，单向流（不带 `uplink: true`）行为一字不变 |
+| `/v1/stream-uplink` | POST | 双工流的上行通道：请求体 `{streamId, seq, items?, end?}`——`items` 是本次批量上行帧（一次网络往返可合批多条），`end: true` 半关闭上行；服务端按 `streamId` 找到活跃流后过四道闸——设备归属（跨设备 404 `unknown-stream`）、会话仍共享（403 `not-shared`）、传输序号严格递增（乱序 409 `out-of-order`）、未消费缓冲不超 256 KiB（超限 413 `uplink-overflow` 并中止该流）。客户端侧是**单飞行合批泵**：同一时刻最多一个上行 POST 在途，飞行期间读到的帧攒成本地批次，既天然严格保序（避免并发请求乱序触发宿主 `Terminal input sequence has a gap`）又把快速输入的往返次数降到最低 |
 | `/v1/event-result` | POST | 审批/提问这类「需要应答事件」的应答回传（`{eventId, result}`），服务端按转发记录核对归属后转交 |
 | `/v1/http` | POST | 改动摘要 / diff 面板的 plain-HTTP 长尾：请求体 `{route, query}` 只登记 `changes.summary` / `changes.diff` 两条、只转发 GET（查询串是这次调用的坐标，不是要转发的请求体）；查询串按允许清单**规范化重建**——只保留 `sessionId`（恰好一次，过共享表）与 `seq` / `index`（至多一次、十进制非负整数），未知参数丢弃，合成 URL 只由规范化结果拼成（两次解析对控制字符的处理差异曾是越权读取口子）——随后**进程内**交给宿主 `/api` 共享 fetch handler，不走回环 HTTP |
 | `/v1/upload` | POST | 远程会话的**非图片附件**上传：请求体是原始字节流（不是 JSON）；查询串按允许清单规范化重建——只保留 `sessionId`（恰好一次、过共享表，未共享 403）与 `name`（至多一次）；上限 500 MiB，`Content-Length` 预检加流式计数双保险，超限 413（先回拒绝再排空尾部字节）；每设备并发 8（超出 429）；随后与 `/v1/http` 一样**进程内**交给宿主 `/api` 共享 handler——上传回执落进的会话与之后 `session/prompt` 解析附件引用的会话是同一个 |
@@ -372,10 +372,10 @@ sudo cloudflared service install      # 通了再装成常驻服务
 - 中继执行时用的是 DSH 网关服务的公开调用方法，身份是操作者身份，**不在服务端替换任何 DSH 内部方法**；
 - 子智能体/分叉会话不单独落表，可达性按「祖先链上有已共享会话」判定；
 - `dsh-session:` 会话引用也会被扫描：DSH 会在**发消息**（`session/prompt` / `subagents/prompt` 的 content 文本块）、**改写排队消息**（`session/updateQueue` 的 edit 内容）与**斜杠命令**（`commands/execute` 参数里的全部字符串——命令处理器会把原始输入拼进下一条用户消息）这三条路径上注入被引用会话的内容，且注入时不再做权限检查，所以引用指向未共享会话的调用在服务端直接 403；@ 引用候选（`sessionReferenceResolver/candidates`）的答案也只放行已共享会话的行；
-- 终端是有意开放的（桌面应用端是可信设备）：开的是**服务端**的 PTY，以服务端用户身份运行、不受智能体沙箱与审批限制；关闭会话的远程时终端流一并终止。DSH 0.2.2+ 的 `terminal/attach` 是双工流（TA-2）：下行是 `snapshot` / `output` / `state` / `ack` 帧，上行经 `/v1/stream-uplink` 送 `write` / `resize` 命令——拦截器不半关闭宿主的上行收件箱，而是把它和 mux 的上行窗口（形状校验，畸形丢弃）一起交给中继客户端的泵；≤ 0.2.1 的 `terminal/follow|write|resize` 三件套保留登记，两代 DSH 都能远程终端；
+- 终端是有意开放的（桌面应用端是可信设备）：开的是**服务端**的 PTY，以服务端用户身份运行、不受智能体沙箱与审批限制；关闭会话的远程时终端流一并终止。DSH 0.2.2+ 的 `terminal/attach` 是双工流：下行是 `snapshot` / `output` / `state` / `ack` 帧，上行经 `/v1/stream-uplink` 送 `write` / `resize` 命令——拦截器不半关闭宿主的上行收件箱，而是把它和 mux 的上行窗口（形状校验，畸形丢弃）一起交给中继客户端的泵；≤ 0.2.1 的 `terminal/follow|write|resize` 三件套保留登记，两代 DSH 都能远程终端；
 - `workspaceFiles/read` 等文件预览接口不限制在会话目录内（DSH 自身就不限制），服务端进程可读的文件都能读——信任前提与终端相同；
-- 插件桥的整机数据需要主服务端主人逐插件同意——设置页「插件桥」里的开关，缺省全部关闭；回环执行带操作者 cookie，插件接口看到的权限与本机浏览器相同，因此桥接的边界就是声明登记的路径（exact 相等，`prefix: true` 路由含其子路径，前缀尾巴还要过 PB-23b 的原样字节形状红线）加会话共享表，**不做**参数级扫描；
-- **适配器（better-sidebar）**：协作声明之外，zen-remote 为 `dsh-better-sidebar` **0.25.0 至 0.30.1 的九个版本**内置了一个适配器（`src/adapters/`，不配合的第三方插件由它代为桥接，路由按前缀/路径段匹配、会话 id 在 JSON 体与路径段里改写；0.30.1 是 0.30.0 的 wire-identical 补丁版，同一摘要 `394de9f588d37092` 直接登记）。前缀命中的尾巴过形状红线：`?`/`#`/`..`（含编码形态）或空白一律 400 `bad-request`（PB-23b，与协作段同一条）。**同意它的整机数据开关，等于让已配对的桌面应用端读写主服务端整盘文件、执行 git 写操作（提交、推送、回滚……），并通过提交信息生成消耗主服务端的模型额度**——产品上的决定就是「读写都接、不加路径围栏」，主服务端主人应当把它当成给对方一台本机终端级别的信任来开；`open.external`（在宿主机起进程）对远程会话拒绝，`settings.*` 与 `/sidebar/bundle` 留在子客户端本机；三条 WebSocket（`/sidebar/ws/fs-watch` 文件树监视、`/sidebar/ws/agent-opens` 打开推送、`/sidebar/ws/sidechat` 侧聊推送）经字节隧道桥接——前两条的升级 URL 带会话 query，帧原样透传（浏览器不消费推送里的会话 id）；`ws/sidechat` 的升级 URL 不带任何参数，会话 id 在连接建立后的 JSON 文本帧里（`{"op":"watch","threadIds":[…]}`），走逐帧闸门（PB-26b）：客户端把 watch 帧里的虚拟 id 逐个还原成真实 id 再转发（空数组 = 全部退订，原样放行），服务端对每个文本帧先按共享表核对、通过才交给插件（未共享的线程 id 到不了插件，连接即断），插件推回的 `{"threadId":…}` 顶层 id 换算回虚拟 id 才给浏览器（better-sidebar 的订阅比对要求虚拟 id 精确匹配）；侧聊（`sidechat.*`）转发——侧聊子会话带 `meta.parentSession`，按祖先链自动继承父会话的共享，`sidechat.start` 响应里的 `childId` 会换算成虚拟 id 回给浏览器；0.28（alpha.0 与正式版）的 `changes.ops` 长轮询（`wait: true`，最长挂 25 秒，超过中继 15 秒的响应头等待）在服务端去掉 `wait`，远程会话的「本轮文件」退回 0.26 的 2.5 秒轮询；`sidechat.models` 的模型选择器显示的是**子客户端本机**的模型目录，而选择经 `sidechat.model` 作用在**服务端**——两机目录不一致时以服务端实际生效为准；
+- 插件桥的整机数据需要主服务端主人逐插件同意——设置页「插件桥」里的开关，缺省全部关闭；回环执行带操作者 cookie，插件接口看到的权限与本机浏览器相同，因此桥接的边界就是声明登记的路径（exact 相等，`prefix: true` 路由含其子路径，前缀尾巴还要过原样字节形状红线）加会话共享表，**不做**参数级扫描；
+- **适配器（better-sidebar）**：协作声明之外，zen-remote 为 `dsh-better-sidebar` **0.25.0 至 0.30.1 的九个版本**内置了一个适配器（`src/adapters/`，不配合的第三方插件由它代为桥接，路由按前缀/路径段匹配、会话 id 在 JSON 体与路径段里改写；0.30.1 是 0.30.0 的 wire-identical 补丁版，同一摘要 `394de9f588d37092` 直接登记）。前缀命中的尾巴过形状红线：`?`/`#`/`..`（含编码形态）或空白一律 400 `bad-request`（与协作段同一条）。**同意它的整机数据开关，等于让已配对的桌面应用端读写主服务端整盘文件、执行 git 写操作（提交、推送、回滚……），并通过提交信息生成消耗主服务端的模型额度**——产品上的决定就是「读写都接、不加路径围栏」，主服务端主人应当把它当成给对方一台本机终端级别的信任来开；`open.external`（在宿主机起进程）对远程会话拒绝，`settings.*` 与 `/sidebar/bundle` 留在子客户端本机；三条 WebSocket（`/sidebar/ws/fs-watch` 文件树监视、`/sidebar/ws/agent-opens` 打开推送、`/sidebar/ws/sidechat` 侧聊推送）经字节隧道桥接——前两条的升级 URL 带会话 query，帧原样透传（浏览器不消费推送里的会话 id）；`ws/sidechat` 的升级 URL 不带任何参数，会话 id 在连接建立后的 JSON 文本帧里（`{"op":"watch","threadIds":[…]}`），走逐帧闸门：客户端把 watch 帧里的虚拟 id 逐个还原成真实 id 再转发（空数组 = 全部退订，原样放行），服务端对每个文本帧先按共享表核对、通过才交给插件（未共享的线程 id 到不了插件，连接即断），插件推回的 `{"threadId":…}` 顶层 id 换算回虚拟 id 才给浏览器（better-sidebar 的订阅比对要求虚拟 id 精确匹配）；侧聊（`sidechat.*`）转发——侧聊子会话带 `meta.parentSession`，按祖先链自动继承父会话的共享，`sidechat.start` 响应里的 `childId` 会换算成虚拟 id 回给浏览器；0.28（alpha.0 与正式版）的 `changes.ops` 长轮询（`wait: true`，最长挂 25 秒，超过中继 15 秒的响应头等待）在服务端去掉 `wait`，远程会话的「本轮文件」退回 0.26 的 2.5 秒轮询；`sidechat.models` 的模型选择器显示的是**子客户端本机**的模型目录，而选择经 `sidechat.model` 作用在**服务端**——两机目录不一致时以服务端实际生效为准；
 - 每台设备并发流数有上限（32）、同时在途的 invoke 数也有上限（32，超出 429 `too-many-invokes`）；`*/internal` 形状的错误码（`gateway/internal` 等）只回码不带消息——那类消息引用的是服务端内部细节。事件应答按「转发时的订阅 + 设备」核对归属。审批/提问的转发是**先到先得**：服务端自己的界面和子客户端谁先应答谁生效，后答的一方被网关拒绝、同步成「已处理」。中继**不代答**：未共享会话的审批/提问事件不会被转发，服务端界面也不在线时这个审批就一直等待——网关会把仍未应答的事件转交给下一个连上来的订阅，等，而不是替你拒绝（代答会把整批待审批一次性判死，砸掉「推送 → 唤醒 → 审批」链路）。未共享会话的**通知类**事件（EMIT 帧：会话列表摘要、账号到期之类的服务端全局状态）一律不转发；例外仅限已共享会话（含其子会话）的 5 条会话级事件（`api-session/status`、`api-session/activity`、`api-session/error`、`agent-preset/selected`、`goal/activation-changed`），它们只描述单个会话的运行状态、活动时间、错误信息、所选预设与目标激活，逐帧按共享表判定后虚拟化转发（断线期间的运行状态由重连后补拉列表纠正）。
 
 
@@ -402,14 +402,14 @@ sudo cloudflared service install      # 通了再装成常驻服务
 | `x-zr-query` | query 字符串（不带 `?`，会话参数已是真实 id） |
 | `accept`、`range` | 唯二透传给插件的请求头 |
 
-**校验次序**（任一失败即返回，响应带头 `x-zen-remote-error: <code>`）：网关密钥与标记 → 请求体必须为空 → 坐标头形状 → 插件在本机注册表 → 版本与摘要都等于本机 → `x-zr-path` 与声明路由匹配——exact 路由完全相等，`prefix: true` 路由同时收更深子路径（PB-23 起，与适配器段同规则；多条命中按声明次序取第一条，`x-zr-path` 原样不解码），前缀命中的尾巴还要过形状红线（PB-23b，适配器段同一条）：声明路径之后的尾巴（原样字节）出现 `?`、`#`、`..`（含任意 `%2e`/`%2E` 编码点，混合形态 `.%2e.` 一并堵住）或空白 → 400 `bad-request`——尾巴原样进回环请求行，`?` 会破坏 parse-once 纪律，`..` 能否逃出声明子树取决于宿主做不做 URL 规范化（此前提不钉死，故按原样字节出现即拒、不做解码后判：`.` 是无需编码的字符，合法编码器不会产出 `%2e`；`%252e` 放行同理是有意的——它是字面 `%2e` 文件名的唯一合法编码，宿主解码深度 ≤1，解出来就是普通段名）→ query 只解析一次，会话墙按路由的**有效 locator** 判（PB-24 起）：query 约定（2.1 的 `sessionParam` 或显式 `locator: { in: 'query' }`）要求该参数恰好一个且非空，过共享表（含祖先链）查的就是它；v2 locator（路径段 / JSON 体）按与子客户端同一条 adapter-core 定位规则**重定位**，逐个 id 过共享表（一个都定位不到 → 400 `bad-request`），JSON 体就在这一步按路由 `maxBody` 限长缓冲（超限 413、解析失败 400 `bad-query`），回环发送的正是这份已校验缓冲 → `scope:'server'` 路由需 `pluginBridgeConsent[plugin] === true`（现场读行配置）→ 每设备并发预算。通过后用 `URLSearchParams` 把**解析结果重新序列化**成 query 再发出——校验的与发出去的是同一个字符串。
+**校验次序**（任一失败即返回，响应带头 `x-zen-remote-error: <code>`）：网关密钥与标记 → 请求体必须为空 → 坐标头形状 → 插件在本机注册表 → 版本与摘要都等于本机 → `x-zr-path` 与声明路由匹配——exact 路由完全相等，`prefix: true` 路由同时收更深子路径（与适配器段同规则；多条命中按声明次序取第一条，`x-zr-path` 原样不解码），前缀命中的尾巴还要过形状红线（适配器段同一条）：声明路径之后的尾巴（原样字节）出现 `?`、`#`、`..`（含任意 `%2e`/`%2E` 编码点，混合形态 `.%2e.` 一并堵住）或空白 → 400 `bad-request`——尾巴原样进回环请求行，`?` 会破坏 parse-once 纪律，`..` 能否逃出声明子树取决于宿主做不做 URL 规范化（此前提不钉死，故按原样字节出现即拒、不做解码后判：`.` 是无需编码的字符，合法编码器不会产出 `%2e`；`%252e` 放行同理是有意的——它是字面 `%2e` 文件名的唯一合法编码，宿主解码深度 ≤1，解出来就是普通段名）→ query 只解析一次，会话墙按路由的**有效 locator** 判：query 约定（2.1 的 `sessionParam` 或显式 `locator: { in: 'query' }`）要求该参数恰好一个且非空，过共享表（含祖先链）查的就是它；v2 locator（路径段 / JSON 体）按与子客户端同一条 adapter-core 定位规则**重定位**，逐个 id 过共享表（一个都定位不到 → 400 `bad-request`），JSON 体就在这一步按路由 `maxBody` 限长缓冲（超限 413、解析失败 400 `bad-query`），回环发送的正是这份已校验缓冲 → `scope:'server'` 路由需 `pluginBridgeConsent[plugin] === true`（现场读行配置）→ 每设备并发预算。通过后用 `URLSearchParams` 把**解析结果重新序列化**成 query 再发出——校验的与发出去的是同一个字符串。
 
 **错误码与状态**：
 
 | code | 状态 | 条件 |
 | --- | --- | --- |
 | `unsupported` | 501 | 服务端未接线插件桥 |
-| `bad-request` | 400 | 带请求体；坐标头缺失或不成形；前缀命中的尾巴带 `?`/`#`/`..`（含编码形态）或空白（PB-23b） |
+| `bad-request` | 400 | 带请求体；坐标头缺失或不成形；前缀命中的尾巴带 `?`/`#`/`..`（含编码形态）或空白 |
 | `plugin-unknown` | 404 | 本机注册表无此插件 |
 | `plugin-mismatch` | 409 | 版本或摘要与本机声明不等 |
 | `route-undeclared` | 404 | 路径既不等于任何 exact 声明，也不是任何 `prefix: true` 声明的子路径 |
@@ -428,7 +428,7 @@ sudo cloudflared service install      # 通了再装成常驻服务
 
 ### 插件桥的 WebSocket 字节隧道：`POST /v1/plugin-tunnel/{open,send,close}`
 
-声明 `upgrade: true` 的插件路由走这三条路由（声明侧见 `docs/plugin-bridge.md`）。中继**不解析 WebSocket**：服务端→浏览器方向是**一条 NDJSON 流式响应**，浏览器→服务端方向是**按序分块的普通 POST**，双向都是不透明字节——真正的升级握手（101 与每个帧）由插件路由在服务端本机完成，字节原样穿过隧道（`docs/adr/0002`）。唯一例外（PB-26b）：`locator: { in: 'json-body' }` 的升级路由（如 better-sidebar 的 `ws/sidechat`）的升级握手是不带体的 GET、会话 id 在连接后的 JSON 文本帧里，共享表没有开包可查——这类隧道的**上行方向按 RFC 6455 切帧**，每个文本帧先定位其会话 id、逐个按共享表核对（未共享的 id 回 403 `not-shared` 并拆隧道，帧绝不交给插件；空数组退订与无 id 帧放行），通过后帧原样写入上游；下行方向仍是不透明字节。query 定位的升级路由零解析开销，行为不变。
+声明 `upgrade: true` 的插件路由走这三条路由（声明侧见 `docs/plugin-bridge.md`）。中继**不解析 WebSocket**：服务端→浏览器方向是**一条 NDJSON 流式响应**，浏览器→服务端方向是**按序分块的普通 POST**，双向都是不透明字节——真正的升级握手（101 与每个帧）由插件路由在服务端本机完成，字节原样穿过隧道。唯一例外：`locator: { in: 'json-body' }` 的升级路由（如 better-sidebar 的 `ws/sidechat`）的升级握手是不带体的 GET、会话 id 在连接后的 JSON 文本帧里，共享表没有开包可查——这类隧道的**上行方向按 RFC 6455 切帧**，每个文本帧先定位其会话 id、逐个按共享表核对（未共享的 id 回 403 `not-shared` 并拆隧道，帧绝不交给插件；空数组退订与无 id 帧放行），通过后帧原样写入上游；下行方向仍是不透明字节。query 定位的升级路由零解析开销，行为不变。
 
 | 路由 | 请求头 | 请求体 | 成功回答 |
 | --- | --- | --- | --- |
@@ -464,10 +464,11 @@ open 的体上限 1 MiB（超出 413）；每设备并发隧道上限 8，超出
 ### 邀请链接
 
 ```
-zr-net://<host>[:port]/<networkId>[#<joinKey>]
+zr-net://<host>[:port]/<networkId>[?tls=0|1][#<joinKey>]
 ```
 
-- `zr-nets://…` 强制 TLS（wss / https）；`zr-net+insecure://…` 显式使用 HTTP/WS，适用于未配置 TLS 反代的自建网关；裸 `zr-net://` 按主机名推断——回环 / 内网 IPv4 / ULA / `.localhost` 走明文，其余走 TLS。
+- 统一只用 `zr-net://` 一种 scheme，默认按主机名推断传输：回环 / 内网 IPv4 / 链路本地 / IPv6 ULA / CGNAT（Tailscale 的 `100.64.0.0/10`）/ `localhost` / `.local` / `.lan` 走明文，其余公网地址走 TLS。`?tls=0` / `?tls=1` 只在需要推翻主机默认推断时附加——公网明文站（如裸公网 IP 直连网关）的链接必然带 `?tls=0`，私网 IP 挂了 TLS 反代则带 `?tls=1`。省略 `:port` 一律按 19393 处理；经标准端口反代（HTTPS 443 / HTTP 80）的链接会显式带 `:443` / `:80`，避免被误回落到 19393。
+- 历史 scheme `zr-nets://…`（强制 TLS，wss / https）与 `zr-net+insecure://…`（强制明文 HTTP/WS）仍能被解析，旧链接继续可用；但它们只是向后兼容的读取口径，新建链接不再使用这两种前缀——一律以网关控制台输出的 `zr-net://` 链接为准。
 - 网关本身不配置证书，HTTP/WS 直连继续受支持；使用 HTTPS/WSS 时，由反代提供证书，节点校验证书信任链和主机名，失败不会静默改走明文。HTTP/WS 不提供网关控制面的 TLS 身份验证；节点会话内容仍使用独立的端到端加密和本地 TOFU。
 - `#<joinKey>` 只是**首次入网凭证**：入网挑战应答握手用它完成身份绑定，此后从不在 URL 路径里明文传输。
 - 链接在网关 Web 控制台生成；解析实现见 `src/peer/crypto.ts` 的 `parseInviteUri`。

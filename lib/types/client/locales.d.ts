@@ -551,7 +551,7 @@ export declare const zh: {
     readonly 'wizard.peer.modeInvite': "粘贴邀请链接";
     readonly 'wizard.peer.modeGateway': "输入网关地址（手动审批）";
     readonly 'wizard.peer.inviteUri': "邀请链接";
-    readonly 'wizard.peer.inviteUriHint': "在网络管理员（网关所在机器）的管理界面生成，粘贴完整的 zr-net:// 或 zr-nets:// 链接";
+    readonly 'wizard.peer.inviteUriHint': "在网络管理员（网关所在机器）的管理界面生成，粘贴完整的 zr-net:// 链接（公网明文网关的链接会带 ?tls=0）";
     readonly 'wizard.peer.inviteUriPlaceholder': "zr-net://…";
     readonly 'wizard.peer.gatewayUrl': "中继网关地址";
     readonly 'wizard.peer.gatewayUrlHint': "输入自建中继网关的访问地址（无需邀请密钥），提交后在网关控制台点击「批准」即可完成入网";
@@ -588,7 +588,7 @@ export declare const zh: {
     readonly 'wizard.peer.syncGatewayHold': "设备网络尚未就绪";
     readonly 'wizard.peer.pendingApproval': "已提交入网申请，等待网络管理员批准";
     readonly 'wizard.peer.joinFailed': "加入网络失败：{reason}";
-    readonly 'wizard.peer.joinInvalid': "邀请链接格式无效，请粘贴完整的 zr-net:// 或 zr-nets:// 链接";
+    readonly 'wizard.peer.joinInvalid': "邀请链接格式无效，请粘贴完整的 zr-net:// 链接（旧式 zr-nets:// 链接仍可识别）";
     readonly 'wizard.peer.joinGatewayInvalid': "网关地址格式无效，请输入如 http://192.168.1.10:19393 或 https://zr.example.com";
     readonly 'wizard.peer.joinGatewayUnreachable': "无法连接到该中继网关，请检查地址、端口及网关容器是否已启动";
     readonly 'wizard.peer.joinNoNetwork': "该网关尚未创建任何虚拟网络，请先在网关控制台创建网络";
