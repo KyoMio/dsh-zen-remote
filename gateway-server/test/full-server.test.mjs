@@ -1132,6 +1132,26 @@ describe('PC-07 部署配置播种：resolveGatewayConfig → startGateway 生�
   const ENV_B = { allowSignup: false, defaultMaxPeers: 64, maxNetworksPerUser: 50, relayRateKbps: 1048576 };
   const ENV_C = { allowSignup: false, defaultMaxPeers: 32, maxNetworksPerUser: 2, relayRateKbps: 512 };
 
+  // GC-6b 扩展设置视图的公共段（本组测试未配 SMTP / API Key / publicUrl 的初始形态）
+  const EXTENDED_SETTINGS_TAIL = {
+    requireEmailVerification: false,
+    publicUrl: null,
+    sessionTtlDays: 7,
+    defaultGroupId: 'grp_default',
+    smtp: {
+      configured: false,
+      host: '',
+      port: 0,
+      security: 'starttls',
+      username: '',
+      hasPassword: false,
+      fromAddress: '',
+      fromName: '',
+      rejectUnauthorized: true,
+    },
+    adminApiKey: { configured: false, prefix: null, createdAt: null },
+  };
+
   async function adminCookie(gw) {
     return login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
   }
@@ -1143,12 +1163,18 @@ describe('PC-07 部署配置播种：resolveGatewayConfig → startGateway 生�
       const cookie = await adminCookie(gw);
       const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie });
       assert.equal(res.status, 200, JSON.stringify(res.json));
+      // GC-6b 扩展设置视图：基础 4 键 + 脱敏扩展段（响应仍无密文/哈希字段）
       assert.deepEqual(res.json.data, {
         allowSignup: true,
         maxNetworksPerUser: 7,
         defaultMaxPeers: 16,
         relayRateKbps: 128,
+        ...EXTENDED_SETTINGS_TAIL,
       });
+      const raw = JSON.stringify(res.json);
+      assert.ok(!raw.includes('smtpConfigEnc'));
+      assert.ok(!raw.includes('adminApiKeyHash'));
+      assert.ok(!raw.includes('password'));
     } finally {
       await gw.close();
     }
@@ -1178,6 +1204,7 @@ describe('PC-07 部署配置播种：resolveGatewayConfig → startGateway 生�
         maxNetworksPerUser: 7, // ENV_A 播种值，ENV_B 的 50 不得覆盖
         defaultMaxPeers: 24, // 控制台改过
         relayRateKbps: 128, // ENV_A 播种值，ENV_B 的 1048576 不得覆盖
+        ...EXTENDED_SETTINGS_TAIL,
       });
     } finally {
       await gw2.close();
@@ -1219,6 +1246,7 @@ describe('PC-07 部署配置播种：resolveGatewayConfig → startGateway 生�
         maxNetworksPerUser: 5, // 控制台改过的值保留（ENV_C 是 2）
         defaultMaxPeers: 16, // ENV_A 播种值保留（ENV_C 是 32）
         relayRateKbps: 512, // 唯一缺失的键按本轮 ENV_C 补齐
+        ...EXTENDED_SETTINGS_TAIL,
       });
       // admin 与其网络在两次重开后保持（初始化逻辑不得重置业务数据）
       const nets = await api(gw2.base, 'GET', '/api/v1/networks', { cookie: await adminCookie(gw2) });

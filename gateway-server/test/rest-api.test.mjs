@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 
 import { createGatewayApiServer } from '../dist/server.js';
-import { encodeSmtpConfig, hashToken } from '../dist/http/auth.js';
+import { decodeSmtpConfig, encodeSmtpConfig, hashToken } from '../dist/http/auth.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { deriveMasterKeyFromSecret, hashPassword, decryptSecret } from '../dist/master-key.js';
 import { maskInviteUri } from '../dist/web/format.js';
@@ -718,32 +718,56 @@ describe('REST API /api/v1（主服务器）', () => {
   // ---- 管理员路由
 
   describe('管理员路由', () => {
-    test('GET /admin/settings 返回四项系统设置', async () => {
+    test('GET /admin/settings 返回扩展设置视图（GC-6b：脱敏 smtp + adminApiKey）', async () => {
       const res = await api(handle.base, 'GET', '/api/v1/admin/settings', { cookie: adminCookie });
       assert.equal(res.status, 200);
       assert.deepEqual(res.json.data, {
         allowSignup: false,
+        requireEmailVerification: false,
         maxNetworksPerUser: 2,
         defaultMaxPeers: 4,
         relayRateKbps: 2048,
+        publicUrl: null,
+        sessionTtlDays: 7,
+        defaultGroupId: 'grp_default',
+        smtp: {
+          configured: false,
+          host: '',
+          port: 0,
+          security: 'starttls',
+          username: '',
+          hasPassword: false,
+          fromAddress: '',
+          fromName: '',
+          rejectUnauthorized: true,
+        },
+        adminApiKey: { configured: false, prefix: null, createdAt: null },
       });
+      // 脱敏红线：密文与哈希字段绝不出现
+      const raw = JSON.stringify(res.json);
+      assert.ok(!raw.includes('smtpConfigEnc'));
+      assert.ok(!raw.includes('adminApiKeyHash'));
+      assert.ok(!raw.includes('password'));
     });
 
-    test('PATCH /admin/settings 部分热更新 + onSettingsChanged 钩子', async () => {
+    test('PATCH /admin/settings 部分热更新 + onSettingsChanged/onQuotaChanged 钩子', async () => {
       const res = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
         cookie: adminCookie,
         body: { relayRateKbps: 4096 },
       });
       assert.equal(res.status, 200);
-      assert.deepEqual(res.json.data, {
+      assert.equal(res.json.data.relayRateKbps, 4096);
+      // 底层 store 仍保持基础 4 键契约；钩子载荷 = 4 键 SystemSettings（非扩展视图）
+      const base = await handle.store.getSettings();
+      assert.deepEqual(base, {
         allowSignup: false,
         maxNetworksPerUser: 2,
         defaultMaxPeers: 4,
         relayRateKbps: 4096,
       });
-      assert.deepEqual(await handle.store.getSettings(), res.json.data);
       assert.ok(handle.hooks.settingsChanged.length > 0);
-      assert.deepEqual(handle.hooks.settingsChanged.at(-1), res.json.data);
+      assert.deepEqual(handle.hooks.settingsChanged.at(-1), base);
+      assert.ok(handle.hooks.quotaChanged.includes(null)); // GC-6b：配额全量失效钩子
     });
 
     test('PATCH /admin/settings 范围与类型校验 → 400', async () => {
@@ -751,7 +775,7 @@ describe('REST API /api/v1（主服务器）', () => {
         { relayRateKbps: 0 },
         { relayRateKbps: 'high' },
         { maxNetworksPerUser: 0 },
-        { maxNetworksPerUser: 51 },
+        { maxNetworksPerUser: 101 },
         { defaultMaxPeers: 65 },
         { defaultMaxPeers: 1 },
         { allowSignup: 'yes' },
@@ -764,6 +788,25 @@ describe('REST API /api/v1（主服务器）', () => {
         assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}, got ${res.status}`);
         assertEnvelopeError(res.json, 'INVALID_REQUEST');
       }
+    });
+
+    test('PATCH maxNetworksPerUser 提高到 60（1..100）→ 成功且同步当前 is_default 组', async () => {
+      const res = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { maxNetworksPerUser: 60 },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.data.maxNetworksPerUser, 60);
+      const groups = await api(handle.base, 'GET', '/api/v1/admin/groups', { cookie: adminCookie });
+      const def = groups.json.data.find((g) => g.isDefault === true);
+      assert.equal(def.id, 'grp_default');
+      assert.equal(def.maxNetworks, 60); // settings → 默认组双向同步
+      // 还原，避免影响本 describe 后续用例的既有配额断言
+      const restore = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { maxNetworksPerUser: 2 },
+      });
+      assert.equal(restore.status, 200);
     });
 
     test('GET /admin/users：脱敏（无 passwordHash）+ 严格 19 键扩展视图（GC-6a）', async () => {
@@ -2098,5 +2141,303 @@ describe('GC-fix-batch1 R3：/admin/runtime 在未注入 runtimeMeta 时安全',
     } finally {
       await stopServer(h);
     }
+  });
+});
+
+// ---------------------------------------------------------------- GC-6b：扩展设置视图、SMTP 加密配置与 publicUrl / 配额热更新
+
+describe('GC-6b GET/PATCH /admin/settings：扩展设置、SMTP 保存与热更新', () => {
+  const SMTP_PASSWORD = 'gc6b-smtp-secret';
+  const SMTP_DRAFT = {
+    host: '127.0.0.1',
+    port: 25,
+    security: 'none',
+    username: 'mailer',
+    fromAddress: 'gateway@test.local',
+    fromName: 'GC-6b 网关',
+  };
+  const handle = {};
+  let adminCookie;
+  let tenantCookie;
+
+  before(async () => {
+    Object.assign(handle, await startServer({ seed: seedSettings() }));
+    await seedUsers(handle.store);
+    adminCookie = await login(handle.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+    tenantCookie = await login(handle.base, TENANT_EMAIL, TENANT_PASSWORD);
+  });
+
+  after(async () => stopServer(handle));
+
+  async function getSettings() {
+    const res = await api(handle.base, 'GET', '/api/v1/admin/settings', { cookie: adminCookie });
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    return res.json.data;
+  }
+
+  test('PATCH 写入 smtp + publicUrl 落盘；GET 回读 hasPassword: true 且密码明文/密文永不出现', async () => {
+    const patch = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { publicUrl: 'https://gc6b.example.com/', smtp: { ...SMTP_DRAFT, password: SMTP_PASSWORD } },
+    });
+    assert.equal(patch.status, 200, JSON.stringify(patch.json));
+    assert.equal(patch.json.data.publicUrl, 'https://gc6b.example.com'); // 末尾 / 自动去除
+    assert.equal(patch.json.data.smtp.configured, true);
+    assert.equal(patch.json.data.smtp.host, '127.0.0.1');
+    assert.equal(patch.json.data.smtp.hasPassword, true);
+    assert.ok(!JSON.stringify(patch.json).includes(SMTP_PASSWORD), '响应不得回显密码明文');
+
+    const view = await getSettings();
+    assert.equal(view.publicUrl, 'https://gc6b.example.com');
+    assert.equal(view.smtp.hasPassword, true);
+    assert.equal(view.smtp.username, 'mailer');
+    assert.equal(view.smtp.fromName, 'GC-6b 网关');
+    const raw = JSON.stringify(view);
+    assert.ok(!raw.includes(SMTP_PASSWORD), 'GET 响应不得回显密码明文');
+    const ext = await handle.store.getExtendedSettings();
+    assert.ok(ext.smtpConfigEnc !== null && ext.smtpConfigEnc.length > 0, '库中应存加密配置');
+    assert.ok(!raw.includes(ext.smtpConfigEnc), 'GET 响应不得回显密文');
+    // 库中密文可解出原密码（加密存储验证）
+    assert.equal(decodeSmtpConfig(ext.smtpConfigEnc, MASTER_KEY).password, SMTP_PASSWORD);
+  });
+
+  test('只更新 publicUrl 不传 password：SMTP 密码自动沿用，smtp 其余字段原样保留', async () => {
+    const patch = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { publicUrl: 'https://gc6b-2.example.com' },
+    });
+    assert.equal(patch.status, 200);
+    assert.equal(patch.json.data.publicUrl, 'https://gc6b-2.example.com');
+    assert.equal(patch.json.data.smtp.host, '127.0.0.1'); // 本次未触碰 smtp
+    assert.equal(patch.json.data.smtp.hasPassword, true);
+    const ext = await handle.store.getExtendedSettings();
+    assert.equal(decodeSmtpConfig(ext.smtpConfigEnc, MASTER_KEY).password, SMTP_PASSWORD);
+  });
+
+  test('别名兼容：secure/user/pass/fromEmail 与 implicit_tls/plain 归一化', async () => {
+    const patch = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: {
+        smtp: {
+          host: 'smtp.test.local',
+          port: 465,
+          secure: 'implicit_tls',
+          user: 'mailer2',
+          pass: 'gc6b-alias-pass',
+          fromEmail: 'gw2@test.local',
+        },
+      },
+    });
+    assert.equal(patch.status, 200);
+    assert.equal(patch.json.data.smtp.security, 'tls');
+    assert.equal(patch.json.data.smtp.username, 'mailer2');
+    assert.equal(patch.json.data.smtp.fromAddress, 'gw2@test.local');
+    assert.equal(patch.json.data.smtp.hasPassword, true);
+    const ext = await handle.store.getExtendedSettings();
+    const decoded = decodeSmtpConfig(ext.smtpConfigEnc, MASTER_KEY);
+    assert.equal(decoded.security, 'tls');
+    assert.equal(decoded.password, 'gc6b-alias-pass');
+
+    // plain → none 归一化
+    const plain = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { smtp: { ...SMTP_DRAFT, security: 'plain' } },
+    });
+    assert.equal(plain.status, 200);
+    assert.equal(plain.json.data.smtp.security, 'none');
+  });
+
+  test('smtp: null 清空配置 → configured false、库中 smtpConfigEnc 为 null', async () => {
+    const patch = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { smtp: null },
+    });
+    assert.equal(patch.status, 200);
+    assert.equal(patch.json.data.smtp.configured, false);
+    assert.equal(patch.json.data.smtp.hasPassword, false);
+    assert.equal((await handle.store.getExtendedSettings()).smtpConfigEnc, null);
+  });
+
+  test('非法 publicUrl（path/query/hash、javascript:、ftp:、空白与控制字符）→ 400 且不落盘', async () => {
+    const before = await getSettings();
+    const cases = [
+      'https://gw.example.com/console',
+      'https://gw.example.com/?a=b',
+      'https://gw.example.com/#frag',
+      'javascript:alert(1)',
+      'ftp://gw.example.com',
+      'not a url',
+      ' https://gw.example.com',
+      'https://gw.example.com\n',
+    ];
+    for (const publicUrl of cases) {
+      const res = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { publicUrl },
+      });
+      assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(publicUrl)}, got ${res.status}`);
+      assertEnvelopeError(res.json, 'INVALID_REQUEST');
+    }
+    assert.deepEqual(await getSettings(), before); // 全部拒绝，一字节都没落盘
+  });
+
+  test('非法 smtp.port / security / 头注入 / sessionTtlDays 越界 → 400', async () => {
+    const cases = [
+      { smtp: { ...SMTP_DRAFT, port: 0 } },
+      { smtp: { ...SMTP_DRAFT, port: 65536 } },
+      { smtp: { ...SMTP_DRAFT, port: 25.5 } },
+      { smtp: { ...SMTP_DRAFT, security: 'implicit' } },
+      { smtp: { ...SMTP_DRAFT, fromAddress: '' } },
+      { smtp: { host: '127.0.0.1\nBcc: evil@x', port: 25, security: 'none', fromAddress: 'a@b.c' } },
+      { smtp: { host: '127.0.0.1', port: 25, security: 'none', fromAddress: 'a@b.c', password: 'p\0w' } },
+      { sessionTtlDays: 0 },
+      { sessionTtlDays: 91 },
+      { sessionTtlDays: 2.5 },
+    ];
+    for (const body of cases) {
+      const res = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body,
+      });
+      assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(body)}, got ${res.status}`);
+      assertEnvelopeError(res.json, 'INVALID_REQUEST');
+    }
+  });
+
+  test('未配置 SMTP 直接开 requireEmailVerification → 400 SMTP_NOT_CONFIGURED 且不落盘', async () => {
+    const res = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { requireEmailVerification: true },
+    });
+    assert.equal(res.status, 400);
+    assertEnvelopeError(res.json, 'SMTP_NOT_CONFIGURED');
+    assert.equal((await getSettings()).requireEmailVerification, false);
+  });
+
+  test('本次一并提交合法 smtp → requireEmailVerification: true 成功放行', async () => {
+    const res = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: {
+        requireEmailVerification: true,
+        smtp: { host: '127.0.0.1', port: 587, security: 'starttls', fromAddress: 'gw@test.local' },
+      },
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    assert.equal(res.json.data.requireEmailVerification, true);
+    assert.equal(res.json.data.smtp.configured, true);
+    // 无密码草稿（库中已清空）：hasPassword false
+    assert.equal(res.json.data.smtp.hasPassword, false);
+  });
+
+  test('空体 / 未知字段 → 400 INVALID_REQUEST', async () => {
+    const empty = await api(handle.base, 'PATCH', '/api/v1/admin/settings', { cookie: adminCookie, body: {} });
+    assert.equal(empty.status, 400);
+    assertEnvelopeError(empty.json, 'INVALID_REQUEST');
+    const unknown = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { nope: 1 },
+    });
+    assert.equal(unknown.status, 400);
+    assertEnvelopeError(unknown.json, 'INVALID_REQUEST');
+  });
+
+  test('热更新 publicUrl → 紧接着的 joinUri 与 runtime 的 publicUrlEffective / 告警即时切换', async () => {
+    // 先切公网明文地址：joinUri 自动带 ?tls=0，runtime 报 PUBLIC_HTTP_PLAINTEXT
+    const patch = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { publicUrl: 'http://203.0.113.10:19393' },
+    });
+    assert.equal(patch.status, 200);
+    const net = await api(handle.base, 'POST', '/api/v1/networks', {
+      cookie: tenantCookie,
+      body: { name: 'gc6b-hot-net' },
+    });
+    assert.equal(net.status, 200);
+    assert.ok(net.json.data.joinUri.startsWith('zr-net://203.0.113.10:19393/'), net.json.data.joinUri);
+    assert.ok(net.json.data.joinUri.includes('?tls=0#'));
+    const runtime = await api(handle.base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
+    assert.equal(runtime.json.data.publicUrlEffective, 'http://203.0.113.10:19393');
+    assert.equal(runtime.json.data.publicUrlSource, 'settings');
+    assert.ok(runtime.json.data.securityWarnings.includes('PUBLIC_HTTP_PLAINTEXT'));
+
+    // 再切 https 反代域名：?tls=0 消失，明文告警解除
+    const patch2 = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { publicUrl: 'https://gc6b.example.com' },
+    });
+    assert.equal(patch2.status, 200);
+    const net2 = await api(handle.base, 'POST', '/api/v1/networks', {
+      cookie: tenantCookie,
+      body: { name: 'gc6b-hot-net-2' },
+    });
+    assert.equal(net2.status, 200);
+    assert.ok(net2.json.data.joinUri.startsWith('zr-net://gc6b.example.com:443/'), net2.json.data.joinUri);
+    assert.ok(!net2.json.data.joinUri.includes('?tls='));
+    const runtime2 = await api(handle.base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
+    assert.equal(runtime2.json.data.publicUrlEffective, 'https://gc6b.example.com');
+    assert.ok(!runtime2.json.data.securityWarnings.includes('PUBLIC_HTTP_PLAINTEXT'));
+
+    // 传 null 清空 → 回落请求头推断
+    const clear = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { publicUrl: null },
+    });
+    assert.equal(clear.status, 200);
+    assert.equal(clear.json.data.publicUrl, null);
+    const runtime3 = await api(handle.base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
+    assert.equal(runtime3.json.data.publicUrlSource, 'request');
+  });
+
+  test('PATCH 修改基础配额 → 默认组同步变化；defaultGroupId 切默认组且新组拿到新配额', async () => {
+    // 顺手把 requireEmailVerification 关回去，不把状态泄漏进下一用例
+    const res = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: {
+        requireEmailVerification: false,
+        maxNetworksPerUser: 60,
+        defaultMaxPeers: 16,
+        relayRateKbps: 8192,
+      },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json.data.maxNetworksPerUser, 60);
+    const groups = await api(handle.base, 'GET', '/api/v1/admin/groups', { cookie: adminCookie });
+    const def = groups.json.data.find((g) => g.isDefault === true);
+    assert.equal(def.id, 'grp_default');
+    assert.equal(def.maxNetworks, 60);
+    assert.equal(def.maxPeersPerNetwork, 16);
+    assert.equal(def.relayRateKbps, 8192);
+
+    // 未知 defaultGroupId → 404 GROUP_NOT_FOUND（先于任何落盘）
+    const missing = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { defaultGroupId: 'grp_nope' },
+    });
+    assert.equal(missing.status, 404);
+    assertEnvelopeError(missing.json, 'GROUP_NOT_FOUND');
+
+    // 切默认组 + 同一次 PATCH 改配额：新默认组必须拿到新配额（同步顺序正确）
+    const created = await api(handle.base, 'POST', '/api/v1/admin/groups', {
+      cookie: adminCookie,
+      body: { code: 'gc6bdef', name: 'GC-6b 默认组', maxNetworks: 9, maxPeersPerNetwork: 9, relayRateKbps: 999 },
+    });
+    assert.equal(created.status, 200);
+    const newGroupId = created.json.data.id;
+    const before = handle.hooks.quotaChanged.length;
+    const switchPatch = await api(handle.base, 'PATCH', '/api/v1/admin/settings', {
+      cookie: adminCookie,
+      body: { defaultGroupId: newGroupId, maxNetworksPerUser: 21, relayRateKbps: 4096 },
+    });
+    assert.equal(switchPatch.status, 200, JSON.stringify(switchPatch.json));
+    assert.equal(switchPatch.json.data.defaultGroupId, newGroupId);
+    assert.equal(switchPatch.json.data.maxNetworksPerUser, 21);
+    const groups2 = await api(handle.base, 'GET', '/api/v1/admin/groups', { cookie: adminCookie });
+    const def2 = groups2.json.data.find((g) => g.isDefault === true);
+    assert.equal(def2.id, newGroupId);
+    assert.equal(def2.maxNetworks, 21, '新默认组必须拿到本次 PATCH 的新配额');
+    assert.equal(def2.relayRateKbps, 4096);
+    // 旧默认组不再是默认
+    assert.equal(groups2.json.data.find((g) => g.id === 'grp_default').isDefault, false);
+    assert.ok(handle.hooks.quotaChanged.length > before); // 切默认组即触发配额刷新
   });
 });

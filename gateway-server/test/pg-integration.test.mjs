@@ -608,6 +608,26 @@ function runTestChild(mode, schema, deadlineMs) {
     return { ...resolveGatewayConfig(env), port: 0 };
   }
 
+  // GC-6b 扩展设置视图的公共段（本组测试未配 SMTP / API Key / publicUrl 的初始形态）
+  const EXTENDED_SETTINGS_TAIL = {
+    requireEmailVerification: false,
+    publicUrl: null,
+    sessionTtlDays: 7,
+    defaultGroupId: 'grp_default',
+    smtp: {
+      configured: false,
+      host: '',
+      port: 0,
+      security: 'starttls',
+      username: '',
+      hasPassword: false,
+      fromAddress: '',
+      fromName: '',
+      rejectUnauthorized: true,
+    },
+    adminApiKey: { configured: false, prefix: null, createdAt: null },
+  };
+
   async function api(base, method, apiPath, { body, cookie } = {}) {
     const headers = {};
     if (cookie !== undefined) headers.cookie = cookie;
@@ -670,13 +690,18 @@ function runTestChild(mode, schema, deadlineMs) {
       const cookie = await loginAdmin(gw);
       const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie });
       assert.equal(res.status, 200, JSON.stringify(res.json));
-      // 设置响应严格 4 键（GC-2-fix1：扩展内部字段绝不进 HTTP 响应）
+      // GC-6b 扩展设置视图：基础 4 键 + 脱敏扩展段（密文/哈希字段绝不进 HTTP 响应）
       assert.deepEqual(res.json.data, {
         allowSignup: true,
         maxNetworksPerUser: 7,
         defaultMaxPeers: 16,
         relayRateKbps: 128,
+        ...EXTENDED_SETTINGS_TAIL,
       });
+      const raw = JSON.stringify(res.json);
+      assert.ok(!raw.includes('smtpConfigEnc'));
+      assert.ok(!raw.includes('adminApiKeyHash'));
+      assert.ok(!raw.includes('password'));
 
       // 控制台路径改一个键 + 建一个网络，供后续重开/缺键用例验证持久化优先
       const patched = await api(gw.base, 'PATCH', '/api/v1/admin/settings', {
@@ -700,12 +725,13 @@ function runTestChild(mode, schema, deadlineMs) {
       // 同一数据目录重开必须复用同一主密钥（不改写、不重建）
       assert.deepEqual(fs.readFileSync(path.join(dataDir, 'master.key')), masterKeySnapshot, '主密钥重开必须稳定');
       const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie: await loginAdmin(gw) });
-      // 设置响应严格 4 键；播种值与控制台值不被不同环境的重开覆盖
+      // GC-6b 扩展设置视图；播种值与控制台值不被不同环境的重开覆盖
       assert.deepEqual(res.json.data, {
         allowSignup: true, // ENV_A 播种值保留（ENV_B 是 false）
         maxNetworksPerUser: 7, // ENV_A 播种值保留（ENV_B 是 50）
         defaultMaxPeers: 24, // 控制台改过的值保留
         relayRateKbps: 128, // ENV_A 播种值保留（ENV_B 是 1048576）
+        ...EXTENDED_SETTINGS_TAIL,
       });
     } finally {
       await gw.close();
@@ -721,12 +747,13 @@ function runTestChild(mode, schema, deadlineMs) {
     const gw = await startGateway(resolveForTest(gatewayEnv(ENV_C)));
     try {
       const res = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie: await loginAdmin(gw) });
-      // 设置响应严格 4 键；唯一缺失的键按本轮 ENV_C 补齐
+      // GC-6b 扩展设置视图；唯一缺失的键按本轮 ENV_C 补齐
       assert.deepEqual(res.json.data, {
         allowSignup: true, // 保留（ENV_C 是 false）
         maxNetworksPerUser: 7, // 保留（ENV_C 是 2）
         defaultMaxPeers: 24, // 控制台值保留（ENV_C 是 32）
         relayRateKbps: 512, // 唯一缺失的键按本轮 ENV_C 补齐
+        ...EXTENDED_SETTINGS_TAIL,
       });
       // 初始化逻辑不得重置业务数据：admin 可登录、控制台建的网络仍在
       const nets = await api(gw.base, 'GET', '/api/v1/networks', { cookie: await loginAdmin(gw) });
