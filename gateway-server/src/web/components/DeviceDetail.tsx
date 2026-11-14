@@ -12,7 +12,15 @@ import { useEffect, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 
 import type { TranslateFn } from '../i18n/locales';
-import { derivePeerConnRow, displayName, filterJoinedMembers, formatBytes, memberStatusView } from '../format';
+import {
+  derivePeerConnRow,
+  displayName,
+  filterJoinedMembers,
+  formatBytes,
+  memberStatusView,
+  relativeText,
+  relativeTime,
+} from '../format';
 import { ChevronIcon, EditIcon } from './Icons';
 import type {
   MemberAction,
@@ -179,9 +187,16 @@ export function DeviceDetail(props: DeviceDetailProps) {
           ) : (
             <h2 className="detail-name">{displayName(member, t)}</h2>
           )}
-          <span className="dot-row">
-            <span className={`dot ${status.dot}`} aria-hidden="true" />
-            {status.word}
+          <span className="status-inline">
+            <span className="dot-row">
+              <span className={`dot ${status.dot}`} aria-hidden="true" />
+              {status.word}
+            </span>
+            {!member.online && member.lastSeenAt !== null && (
+              <span className="status-last-seen">
+                · {t('devices.lastSeen', { time: relativeText(t, relativeTime(member.lastSeenAt, Date.now())) })}
+              </span>
+            )}
           </span>
         </div>
         <div className="detail-actions">
@@ -189,7 +204,6 @@ export function DeviceDetail(props: DeviceDetailProps) {
             <button
               type="button"
               className="btn"
-              style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
               disabled={busy}
               onClick={() => {
                 setDraftName(member.name ?? displayName(member, t));
@@ -289,7 +303,6 @@ export function DeviceDetail(props: DeviceDetailProps) {
                 <button
                   type="button"
                   className="btn ghost"
-                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
                   disabled={busy}
                   onClick={() => {
                     setDraftNote(member.note ?? '');
@@ -321,32 +334,41 @@ export function DeviceDetail(props: DeviceDetailProps) {
             </tr>
           </thead>
           <tbody>
-            {rows.map((row) => (
-              <tr
-                key={row.other.nodeId}
-                className="device-row"
-                tabIndex={0}
-                aria-label={`${displayName(row.other, t)} — ${row.kindWord}`}
-                onClick={() => onSelectDevice(row.other.nodeId)}
-                onKeyDown={(event) => openByKey(event, row.other.nodeId)}
-              >
-                <td className="device-cell-name">
-                  <div className="device-name">{displayName(row.other, t)}</div>
-                  {row.other.note !== null && <div className="device-note">{row.other.note}</div>}
-                </td>
-                <td className="conn-kind-cell">
-                  <div className="conn-kind">
-                    <span className={`dot ${row.dot}`} aria-hidden="true" />
-                    {row.kindWord}
-                  </div>
-                </td>
-                <td className="conn-reason">{row.reason}</td>
-                <td className="device-cell-latency mono">{row.latency}</td>
-                <td className="row-arrow" aria-hidden="true">
-                  <ChevronIcon direction="right" size={14} />
-                </td>
-              </tr>
-            ))}
+            {rows.map((row) => {
+              const peerStatus = memberStatusView(row.other.status, row.other.online, t);
+              return (
+                <tr
+                  key={row.other.nodeId}
+                  className="device-row"
+                  tabIndex={0}
+                  aria-label={`${displayName(row.other, t)} (${peerStatus.word}) — ${row.kindWord}`}
+                  onClick={() => onSelectDevice(row.other.nodeId)}
+                  onKeyDown={(event) => openByKey(event, row.other.nodeId)}
+                >
+                  <td className="device-cell-name">
+                    <div className="device-name-row">
+                      <span className="device-name">{displayName(row.other, t)}</span>
+                      <span className="dot-row peer-live-status">
+                        <span className={`dot ${peerStatus.dot}`} aria-hidden="true" />
+                        {peerStatus.word}
+                      </span>
+                    </div>
+                    {row.other.note !== null && <div className="device-note">{row.other.note}</div>}
+                  </td>
+                  <td className="conn-kind-cell">
+                    <div className="conn-kind">
+                      <span className={`dot ${row.dot}`} aria-hidden="true" />
+                      {row.kindWord}
+                    </div>
+                  </td>
+                  <td className="conn-reason">{row.reason}</td>
+                  <td className="device-cell-latency mono">{row.latency}</td>
+                  <td className="row-arrow" aria-hidden="true">
+                    <ChevronIcon direction="right" size={14} />
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       )}

@@ -92,7 +92,7 @@ export function Modal({ title, subtitle, onClose, children }: ModalProps) {
           <CloseIcon />
         </button>
       </header>
-      {children}
+      <div className="modal-scroll">{children}</div>
     </dialog>
   );
 }

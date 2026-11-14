@@ -3,7 +3,7 @@
 // 浏览器半边经 tsconfig.web.json 类型检查——两边共享同一份实现。
 
 import type { Locale, TranslateFn } from './i18n/locales.js';
-import type { MemberStatus, TopologyLink, TopologyMemberRow } from './store/console-store.js';
+import type { MemberStatus, TopologyLink, TopologyMemberRow, UserQuotaSummary } from './store/console-store.js';
 
 /**
  * 实时中转速率：'0 KB/s'、'12 KB/s'、'1.5 MB/s'（任务单要求等宽大字展示）。
@@ -226,6 +226,21 @@ export function filterJoinedMembers(members: readonly TopologyMemberRow[]): Topo
   return members.filter((m) => m.status === 'authorized' || m.status === 'paused' || m.status === 'mismatch');
 }
 
+/**
+ * 生效的单网设备上限（网络与用户组联动，GC-9/GC-10 核验）：
+ * 普通用户所属用户组的 maxPeersPerNetwork 下调时，后端立即按
+ * Math.min(network.maxPeers, group.maxPeersPerNetwork) 准入；前端概览与
+ * 切换器统一走同一公式，避免仍展示过期的 network.maxPeers（8）而误以为组上限未生效。
+ * 管理员（quota.maxNetworks === null）或未接线配额时保留网络本身上限。
+ */
+export function effectiveNetworkMaxPeers(
+  rawMaxPeers: number,
+  quota: UserQuotaSummary | null | undefined,
+): number {
+  if (quota === null || quota === undefined || quota.maxNetworks === null) return rawMaxPeers;
+  return Math.min(rawMaxPeers, quota.maxPeersPerNetwork);
+}
+
 // ---------------------------------------------------------------- 设备间连接行
 
 /** 「到其他设备的连接」表的一行：圆点档位 + 连接方式词 + 固定平实原因 + 等宽延迟 */
@@ -271,7 +286,13 @@ export function derivePeerConnRow(
   if (self.status === 'paused') {
     return notConnected(t('device.blockedReasonPaused'));
   }
-  if (!self.online || !other.online) {
+  if (!self.online && !other.online) {
+    return notConnected(t('device.notConnectedBothOffline'));
+  }
+  if (!self.online) {
+    return notConnected(t('device.notConnectedSelfOffline'));
+  }
+  if (!other.online) {
     return notConnected(t('device.notConnectedOffline'));
   }
 

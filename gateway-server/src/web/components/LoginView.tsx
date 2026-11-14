@@ -92,11 +92,22 @@ export function PasswordField(props: {
   t: TranslateFn;
 }) {
   const [visible, setVisible] = useState(false);
+  const [blurred, setBlurred] = useState(false);
+  const hasMinHint = props.minLength !== undefined;
+  const tooShort = hasMinHint && blurred && props.value.length > 0 && props.value.length < props.minLength!;
+  const hintId = hasMinHint ? `${props.id}-hint` : undefined;
+  const errorId = tooShort ? `${props.id}-error` : undefined;
+  const describedBy = [hintId, errorId].filter(Boolean).join(' ') || undefined;
   return (
     <div className="field">
       <label className="field-label" htmlFor={props.id}>
         {props.label}
       </label>
+      {hasMinHint && (
+        <p id={hintId} className="field-hint" style={{ margin: '0 0 6px' }}>
+          {props.t('auth.passwordMinHint', { min: props.minLength! })}
+        </p>
+      )}
       <div style={{ position: 'relative' }}>
         <input
           id={props.id}
@@ -105,8 +116,21 @@ export function PasswordField(props: {
           required={props.required}
           minLength={props.minLength}
           autoComplete={props.autoComplete}
+          aria-invalid={tooShort || undefined}
+          aria-describedby={describedBy}
           value={props.value}
-          onChange={(e) => props.onChange(e.target.value)}
+          onChange={(e) => {
+            const next = e.target.value;
+            if (next === '') setBlurred(false);
+            props.onChange(next);
+          }}
+          onFocus={() => {
+            if (props.value === '') setBlurred(false);
+          }}
+          onBlur={() => {
+            if (props.value.length > 0) setBlurred(true);
+          }}
+          onInvalid={() => setBlurred(true)}
           style={{ paddingRight: 36 }}
         />
         <button
@@ -120,6 +144,11 @@ export function PasswordField(props: {
           {visible ? <EyeOffIcon /> : <EyeIcon />}
         </button>
       </div>
+      {tooShort && (
+        <p id={errorId} className="form-error">
+          {props.t('auth.passwordTooShort', { min: props.minLength! })}
+        </p>
+      )}
     </div>
   );
 }

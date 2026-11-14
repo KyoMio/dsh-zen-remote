@@ -98,6 +98,7 @@ function authErrorToKey(err: unknown): LocaleKey {
     case 'QUOTA_EXCEEDED':
       return 'account.quotaReached';
     case 'LIMIT_REACHED':
+    case 'PEER_LIMIT_EXCEEDED_BY_GROUP':
       return 'error.peerLimitByGroup';
     // 管理约束（最后管理员 / 自我保护 / 默认组 / 组占用 / 组标识码 / API Key）
     case 'CANNOT_REMOVE_LAST_ADMIN':

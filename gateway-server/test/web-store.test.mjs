@@ -23,6 +23,7 @@ import {
   classifyLinkPath,
   computeUsagePercent,
   derivePeerConnRow,
+  effectiveNetworkMaxPeers,
   filterJoinedMembers,
   formatBytesQuota,
   formatLatencyRange,
@@ -785,18 +786,21 @@ describe('format：设备间连接行 derivePeerConnRow', () => {
     assert.equal(translate('en', 'device.reasonPeerPaused'), 'The other device is paused');
   });
 
-  test('任一方离线 → muted「设备当前离线」，优先于已存在的链路', () => {
+  test('任一方离线 → muted + 分清本端/对端/双方离线，优先于已存在的链路', () => {
     const self = makeMember('self', 'authorized');
+    const other = makeMember('other', 'authorized');
     const otherOffline = makeMember('other', 'authorized', { online: false });
+    const selfOffline = { ...self, online: false };
     assert.deepEqual(derivePeerConnRow(tZh, self, otherOffline, []), {
       dot: 'muted',
       kindWord: '未连接',
-      reason: '设备当前离线',
+      reason: '对方设备当前离线',
       latency: '—',
     });
     const lanLink = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 12, liveRelayKbps: 0 };
-    assert.deepEqual(derivePeerConnRow(tZh, self, otherOffline, linksOf(lanLink)).reason, '设备当前离线');
-    assert.equal(derivePeerConnRow(tZh, { ...self, online: false }, makeMember('other', 'authorized'), []).reason, '设备当前离线');
+    assert.equal(derivePeerConnRow(tZh, self, otherOffline, linksOf(lanLink)).reason, '对方设备当前离线');
+    assert.equal(derivePeerConnRow(tZh, selfOffline, other, []).reason, '当前查看的设备离线，无法建立连接');
+    assert.equal(derivePeerConnRow(tZh, selfOffline, otherOffline, []).reason, '双方设备当前均离线');
   });
 
   test('局域网直连 → ok / 局域网直连 / 在同一个局域网内 / 真实延迟；反向登记的链路同样算数', () => {
@@ -1560,6 +1564,14 @@ describe('GC-7b：GC-5/GC-6 新错误码与管理文案键完整性', () => {
     'accountSettings.monthlyTraffic',
     'common.unlimited',
     'common.usedOfLimit',
+    'auth.passwordMinHint',
+    'auth.passwordTooShort',
+    'account.adminQuotaNote',
+    'admin.kpiAccounts',
+    'admin.kpiAccountsSub',
+    'admin.groupCodeImmutable',
+    'admin.groupAdminExemptNote',
+    'admin.smtpVerifyCert',
   ];
 
   test('错误码键中英齐备且都能取词（删键会被钉住）', () => {
@@ -1584,6 +1596,17 @@ describe('GC-7b：GC-5/GC-6 新错误码与管理文案键完整性', () => {
     assert.equal(translate('zh', 'admin.smtpTestFailed', { message: '超时' }), '发送失败：超时');
     assert.equal(translate('zh', 'common.usedOfLimit', { used: 2, limit: 3 }), '已用 2 / 3');
     assert.equal(translate('en', 'common.usedOfLimit', { used: 2, limit: 3 }), 'Used 2 / 3');
+    assert.equal(translate('zh', 'auth.passwordMinHint', { min: 8 }), '至少 8 位字符');
+    assert.equal(translate('en', 'auth.passwordMinHint', { min: 8 }), 'At least 8 characters');
+    assert.equal(translate('zh', 'admin.kpiAccountsSub', { users: 3, groups: 2 }), '3 位用户 · 2 个用户组');
+    assert.equal(translate('en', 'admin.kpiAccountsSub', { users: 3, groups: 2 }), '3 users · 2 groups');
+  });
+
+  test('effectiveNetworkMaxPeers：组上限收紧时与网络上限取较小值，管理员不封顶', () => {
+    assert.equal(effectiveNetworkMaxPeers(8, null), 8);
+    assert.equal(effectiveNetworkMaxPeers(8, makeQuota({ maxNetworks: 1, maxPeersPerNetwork: 3 })), 3);
+    assert.equal(effectiveNetworkMaxPeers(4, makeQuota({ maxNetworks: 1, maxPeersPerNetwork: 8 })), 4);
+    assert.equal(effectiveNetworkMaxPeers(8, makeQuota({ maxNetworks: null, maxPeersPerNetwork: 64 })), 8);
   });
 });
 

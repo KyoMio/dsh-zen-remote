@@ -90,6 +90,8 @@ export function adminErrorToKey(err: unknown): LocaleKey {
       return 'error.duplicateGroupCode';
     case 'EMAIL_TAKEN':
       return 'error.emailTaken';
+    case 'PEER_LIMIT_EXCEEDED_BY_GROUP':
+      return 'error.peerLimitByGroup';
     case 'INVALID_API_KEY':
       return 'error.invalidApiKey';
     case 'SMTP_NOT_CONFIGURED':
@@ -104,30 +106,83 @@ export function adminErrorToKey(err: unknown): LocaleKey {
   }
 }
 
-// ---------------------------------------------------------------- 运行态条
+// ---------------------------------------------------------------- 运行态与概览仪表盘
 
 /** 存储引擎的展示名（脱敏：只有引擎名，绝无连接串） */
 function storageLabel(driver: 'sqlite' | 'postgres'): string {
   return driver === 'sqlite' ? 'SQLite WAL' : 'PostgreSQL';
 }
 
+/** 公网入口来源本地化文案 */
+function publicUrlSourceText(source: GatewayRuntimeStatus['publicUrlSource'], t: TranslateFn): string {
+  switch (source) {
+    case 'env':
+      return t('admin.sourceEnv');
+    case 'settings':
+      return t('admin.sourceSettings');
+    case 'request':
+      return t('admin.sourceRequest');
+    default:
+      return String(source);
+  }
+}
+
 /**
- * 页头只读运行态条：监听端口、生效公网入口（带来源标签）、UDP 探测端口、
- * 存储引擎、主密钥来源、在线设备、实时中转速率与累计中转流量。
+ * 管理端概览仪表盘：
+ * 1) 页头标题 + 公开注册 / 邮件发送实时状态徽章
+ * 2) 4 张核心 KPI 指标卡（在线设备 / 实时中转 / 累计中转 / 账号概况）
+ * 3) 只读技术参数细条（TCP 端口 / 生效公网入口 / UDP 端口 / 存储引擎 / 主密钥来源）
  * runtime 未拉到前整条显示占位破折号，不阻塞标签页渲染。
  */
-export function RuntimeStrip(props: { t: TranslateFn; runtime: GatewayRuntimeStatus | null }) {
-  const { t, runtime } = props;
+export function RuntimeStrip(props: {
+  t: TranslateFn;
+  runtime: GatewayRuntimeStatus | null;
+  title?: string;
+  usersCount?: number;
+  groupsCount?: number;
+  allowSignup?: boolean;
+  smtpConfigured?: boolean;
+}) {
+  const { t, runtime, title, usersCount, groupsCount, allowSignup, smtpConfigured } = props;
   const udpText = (() => {
     if (runtime === null || runtime.udpPort === 0) return '—';
     return runtime.udpAltPort > 0 ? `${runtime.udpPort} / ${runtime.udpAltPort}` : `${runtime.udpPort}`;
   })();
-  const items: Array<{ label: string; value: string; source?: string; mono?: boolean }> = [
+
+  const kpis: Array<{ label: string; value: string; sub?: string; mono?: boolean; accent?: boolean }> = [
+    {
+      label: t('summary.onlineDevices'),
+      value: runtime === null ? '—' : String(runtime.onlineDevices),
+      mono: true,
+      accent: runtime !== null && runtime.onlineDevices > 0,
+    },
+    {
+      label: t('admin.runtimeRelayRate'),
+      value: runtime === null ? '—' : formatRate(runtime.totalLiveRelayKbps),
+      mono: true,
+    },
+    {
+      label: t('devices.totalRelay'),
+      value: runtime === null ? '—' : formatBytes(runtime.cumulativeRelayBytes),
+      mono: true,
+    },
+    {
+      label: t('admin.kpiAccounts'),
+      value: usersCount === undefined ? '—' : String(usersCount),
+      sub:
+        usersCount !== undefined && groupsCount !== undefined
+          ? t('admin.kpiAccountsSub', { users: usersCount, groups: groupsCount })
+          : undefined,
+      mono: true,
+    },
+  ];
+
+  const metaItems: Array<{ label: string; value: string; source?: string; mono?: boolean }> = [
     { label: t('admin.runtimeTcpPort'), value: runtime === null ? '—' : `:${runtime.listenPort}`, mono: true },
     {
       label: t('admin.publicUrl'),
       value: runtime === null || runtime.publicUrlEffective === '' ? '—' : runtime.publicUrlEffective,
-      source: runtime?.publicUrlSource,
+      source: runtime === null ? undefined : publicUrlSourceText(runtime.publicUrlSource, t),
       mono: true,
     },
     { label: t('admin.runtimeUdpPorts'), value: udpText, mono: true },
@@ -141,22 +196,61 @@ export function RuntimeStrip(props: { t: TranslateFn; runtime: GatewayRuntimeSta
             ? t('admin.masterKeyFromEnv')
             : t('admin.masterKeyFromFile'),
     },
-    { label: t('summary.onlineDevices'), value: runtime === null ? '—' : String(runtime.onlineDevices), mono: true },
-    { label: t('admin.runtimeRelayRate'), value: runtime === null ? '—' : formatRate(runtime.totalLiveRelayKbps), mono: true },
-    { label: t('devices.totalRelay'), value: runtime === null ? '—' : formatBytes(runtime.cumulativeRelayBytes), mono: true },
   ];
+
+  const showHeadBar = title !== undefined || allowSignup !== undefined || smtpConfigured !== undefined;
+
   return (
-    <dl className="runtime-strip">
-      {items.map((item) => (
-        <div className="runtime-item" key={item.label}>
-          <dt>{item.label}</dt>
-          <dd className={item.mono === true ? 'mono' : undefined}>
-            {item.value}
-            {item.source !== undefined && <span className="runtime-source mono">{item.source}</span>}
-          </dd>
+    <section className="admin-overview" aria-label={title ?? t('view.admin')}>
+      {showHeadBar && (
+        <div className="admin-head-bar">
+          {title !== undefined && <h2 className="page-title">{title}</h2>}
+          {(allowSignup !== undefined || smtpConfigured !== undefined) && (
+            <div className="admin-head-badges">
+              {allowSignup !== undefined && (
+                <span className="admin-status-pill">
+                  <span className={allowSignup ? 'dot ok' : 'dot muted'} aria-hidden="true" />
+                  {t(allowSignup ? 'admin.signupOpen' : 'admin.signupInviteOnly')}
+                </span>
+              )}
+              {smtpConfigured !== undefined && (
+                <span className="admin-status-pill">
+                  <span className={smtpConfigured ? 'dot ok' : 'dot muted'} aria-hidden="true" />
+                  {t(smtpConfigured ? 'admin.smtpConfiguredTag' : 'admin.smtpUnconfiguredTag')}
+                </span>
+              )}
+            </div>
+          )}
         </div>
-      ))}
-    </dl>
+      )}
+
+      <div className="admin-kpi-grid">
+        {kpis.map((kpi) => (
+          <div className="admin-kpi-card" key={kpi.label}>
+            <div className="admin-kpi-label">{kpi.label}</div>
+            <div className={kpi.mono ? 'admin-kpi-value mono' : 'admin-kpi-value'}>
+              {kpi.accent && <span className="dot ok" aria-hidden="true" />}
+              <span>{kpi.value}</span>
+            </div>
+            {kpi.sub !== undefined && <div className="admin-kpi-sub">{kpi.sub}</div>}
+          </div>
+        ))}
+      </div>
+
+      <dl className="admin-meta-strip">
+        {metaItems.map((item) => (
+          <div className="runtime-item" key={item.label}>
+            <dt>{item.label}</dt>
+            <dd className={item.mono === true ? 'mono' : undefined}>
+              <span className="runtime-val" title={item.value}>
+                {item.value}
+              </span>
+              {item.source !== undefined && <span className="runtime-source">{item.source}</span>}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </section>
   );
 }
 
@@ -245,8 +339,15 @@ export function AdminView(props: AdminViewProps) {
 
   return (
     <section className="admin-view">
-      <h2 className="page-title">{t('view.admin')}</h2>
-      <RuntimeStrip t={t} runtime={runtime} />
+      <RuntimeStrip
+        t={t}
+        runtime={runtime}
+        title={t('view.admin')}
+        usersCount={users.length}
+        groupsCount={groups.length}
+        allowSignup={settings?.allowSignup}
+        smtpConfigured={settings?.smtp.configured ?? runtime?.smtpConfigured}
+      />
       {runtime !== null && <SecurityAdvisories t={t} warnings={runtime.securityWarnings} />}
       {anySliceError && <p className="field-hint">{t('admin.sliceError')}</p>}
 

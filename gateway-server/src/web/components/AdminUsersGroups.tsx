@@ -20,6 +20,7 @@ import type { AdminUserRow, ConsoleClient, UiLocalState, UserGroup, UserRole } f
 import { adminErrorToKey, readLocale } from './AdminView';
 import { CheckIcon, CopyIcon, EditIcon, PlusIcon, TrashIcon, UsersIcon } from './Icons';
 import { Modal } from './Modal';
+import { PasswordField } from './LoginView';
 
 export type AdminPanelMode = 'users' | 'groups';
 
@@ -224,21 +225,15 @@ function CreateUserModal(props: {
           </div>
 
           {!randomPassword && (
-            <div className="field">
-              <label className="field-label" htmlFor="admin-user-password">
-                {t('admin.initialPassword')}
-              </label>
-              <input
-                id="admin-user-password"
-                className="input"
-                type="text"
-                minLength={8}
-                maxLength={128}
-                autoComplete="new-password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
+            <PasswordField
+              id="admin-user-password"
+              label={t('admin.initialPassword')}
+              value={password}
+              minLength={8}
+              autoComplete="new-password"
+              onChange={setPassword}
+              t={t}
+            />
           )}
 
           <fieldset className="radio-group">
@@ -294,7 +289,11 @@ function CreateUserModal(props: {
             <button type="button" className="btn" onClick={onClose}>
               {t('common.cancel')}
             </button>
-            <button type="submit" className="btn primary" disabled={busy}>
+            <button
+              type="submit"
+              className="btn primary"
+              disabled={busy || (!randomPassword && password.length > 0 && password.length < 8)}
+            >
               {t('common.create')}
             </button>
           </div>
@@ -344,6 +343,7 @@ function EditUserModal(props: {
       onSaved();
     } catch (err) {
       setErrorKey(adminErrorToKey(err));
+    } finally {
       setBusy(false);
     }
   };
@@ -549,7 +549,7 @@ function UsersPanel(props: AdminUsersGroupsProps) {
     <div>
       <div className="panel-toolbar">
         <p className="section-title" style={{ margin: 0 }}>
-          {t('admin.tabUsers')}
+          {t('admin.tabUsers')}{' '}
           <span className="muted-count mono">{users.length}</span>
         </p>
         <button type="button" className="btn primary" onClick={() => setDialog({ kind: 'create' })}>
@@ -764,7 +764,7 @@ function GroupFormModal(props: {
   const [rateKbps, setRateKbps] = useState(String(group?.relayRateKbps ?? 1024));
   const initialQuota = quotaDraftFromBytes(group?.monthlyRelayQuotaBytes ?? null);
   const [quotaLimited, setQuotaLimited] = useState(editing ? initialQuota.limited : true);
-  const [quotaValue, setQuotaValue] = useState(initialQuota.value);
+  const [quotaValue, setQuotaValue] = useState(editing ? initialQuota.value : (initialQuota.value || '10'));
   const [quotaUnit, setQuotaUnit] = useState<'MB' | 'GB'>(initialQuota.unit);
   const [busy, setBusy] = useState(false);
   const [errorKey, setErrorKey] = useState<LocaleKey | null>(null);
@@ -801,6 +801,7 @@ function GroupFormModal(props: {
       onSaved();
     } catch (err) {
       setErrorKey(adminErrorToKey(err));
+    } finally {
       setBusy(false);
     }
   };
@@ -842,7 +843,7 @@ function GroupFormModal(props: {
               disabled={editing}
               onChange={(e) => setCode(e.target.value.toLowerCase())}
             />
-            {editing && <p className="field-hint">{t('admin.defaultGroupSynced')}</p>}
+            {editing && <p className="field-hint">{t('admin.groupCodeImmutable')}</p>}
           </div>
 
           <div className="setting-row">
@@ -1016,13 +1017,16 @@ function GroupsPanel(props: AdminUsersGroupsProps) {
     <div>
       <div className="panel-toolbar">
         <p className="section-title" style={{ margin: 0 }}>
-          {t('admin.tabGroups')}
+          {t('admin.tabGroups')}{' '}
           <span className="muted-count mono">{groups.length}</span>
         </p>
         <button type="button" className="btn primary" onClick={() => setDialog({ kind: 'create' })}>
           <PlusIcon /> {t('admin.newGroup')}
         </button>
       </div>
+      <p className="field-hint" style={{ margin: '0 0 12px' }}>
+        {t('admin.groupAdminExemptNote')}
+      </p>
 
       {groups.length === 0 ? (
         <p className="empty-hint">—</p>

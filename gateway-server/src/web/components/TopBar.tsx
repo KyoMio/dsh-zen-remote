@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useRef } from 'react';
 import type { KeyboardEvent } from 'react';
 
-import { formatQuotaExpiry } from '../format';
+import { effectiveNetworkMaxPeers, formatQuotaExpiry } from '../format';
 import type { Locale, TranslateFn } from '../i18n/locales';
 import { deriveNetworkCounts } from '../store/console-store';
 import type { NetworkView, PublicUser, TopologySnapshot, UiLocalState, UserQuotaSummary } from '../store/console-store';
@@ -152,7 +152,11 @@ export function TopBar(props: TopBarProps) {
   const rowCounts = (network: NetworkView): { totalDevices: number; maxPeers: number } => {
     const snapshot = network.id === selectedNetworkId ? selectedSnapshot : undefined;
     const counts = deriveNetworkCounts(network, snapshot);
-    return { totalDevices: counts.totalDevices, maxPeers: snapshot?.network.maxPeers ?? network.maxPeers };
+    const rawMax = snapshot?.network.maxPeers ?? network.maxPeers;
+    return {
+      totalDevices: counts.totalDevices,
+      maxPeers: effectiveNetworkMaxPeers(rawMax, user.role === 'admin' ? null : quota),
+    };
   };
   const selectedCounts = selected !== null ? rowCounts(selected) : null;
 
