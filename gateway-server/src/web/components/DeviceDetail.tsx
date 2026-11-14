@@ -3,11 +3,17 @@
 // mismatch 专属的红色说明条 + 信任新身份；四个技术元数据字段 + 「到其他
 // 设备的连接」表——每一行都是一条固定的平实原因文案，点击整行切换到那台
 // 设备的详情。数据全部来自拓扑快照（SSE 实时推送，不另发请求）。
+//
+// GC-9 增强：基础信息区新增设备备注 note 的行内编辑（0..120 字符，实时
+// 字数计数与超长校验提示，支持取消还原），保存经 onEditNote 回调走既有
+// PATCH /api/v1/networks/:id/members/:nodeId（App 接线；未传时只读展示）；
+// 裸 Unicode 箭头（‹ ›）统一换成 Icons.tsx 的 1.5px 细线 ChevronIcon。
 import { useEffect, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 
 import type { TranslateFn } from '../i18n/locales';
 import { derivePeerConnRow, displayName, filterJoinedMembers, formatBytes, memberStatusView } from '../format';
+import { ChevronIcon, EditIcon } from './Icons';
 import type {
   MemberAction,
   NatType,
@@ -28,8 +34,13 @@ export interface DeviceDetailProps {
   onSelectDevice: (nodeId: string) => void;
   onMemberAction: (nodeId: string, action: MemberAction) => void;
   onRenameMember?: (nodeId: string, name: string) => void;
+  /** 编辑设备备注（PATCH /networks/:id/members/:nodeId 的 note 字段）；缺省时备注只读展示 */
+  onEditNote?: (nodeId: string, note: string) => void;
   onRemoveMember: (nodeId: string) => void;
 }
+
+/** 备注的字数上限（与后端 NOTE_TOO_LONG 校验同界） */
+const NOTE_MAX_LENGTH = 120;
 
 function natWord(natType: NatType, t: TranslateFn): string {
   switch (natType) {
@@ -45,19 +56,23 @@ function natWord(natType: NatType, t: TranslateFn): string {
 }
 
 export function DeviceDetail(props: DeviceDetailProps) {
-  const { t, topology, member, ui, onUi, busy, onBack, onSelectDevice, onMemberAction, onRenameMember, onRemoveMember } = props;
+  const { t, topology, member, ui, onUi, busy, onBack, onSelectDevice, onMemberAction, onRenameMember, onEditNote, onRemoveMember } = props;
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState(member.name ?? '');
+  const [editingNote, setEditingNote] = useState(false);
+  const [draftNote, setDraftNote] = useState(member.note ?? '');
 
   useEffect(() => {
     setEditingName(false);
     setDraftName(member.name ?? '');
-  }, [member.nodeId, member.name]);
+    setEditingNote(false);
+    setDraftNote(member.note ?? '');
+  }, [member.nodeId, member.name, member.note]);
 
-  // Esc 返回全部设备；弹窗打开或改名输入中时让位
+  // Esc 返回全部设备；弹窗打开或名称/备注编辑中时让位
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key !== 'Escape' || ui.dialog !== null || editingName) return;
+      if (event.key !== 'Escape' || ui.dialog !== null || editingName || editingNote) return;
       event.preventDefault();
       onBack();
     };
@@ -65,7 +80,7 @@ export function DeviceDetail(props: DeviceDetailProps) {
     return () => {
       document.removeEventListener('keydown', onKeyDown);
     };
-  }, [onBack, ui.dialog, editingName]);
+  }, [onBack, ui.dialog, editingName, editingNote]);
 
   const commitRename = (): void => {
     const trimmed = draftName.trim();
@@ -77,9 +92,25 @@ export function DeviceDetail(props: DeviceDetailProps) {
     }
   };
 
+  const commitNote = (): void => {
+    setEditingNote(false);
+    // 0..120 字符：空串也是合法值（清空备注）；与当前值一致就不发请求
+    if (draftNote.length <= NOTE_MAX_LENGTH && draftNote !== (member.note ?? '')) {
+      onEditNote?.(member.nodeId, draftNote);
+    } else {
+      setDraftNote(member.note ?? '');
+    }
+  };
+
+  const cancelNote = (): void => {
+    setEditingNote(false);
+    setDraftNote(member.note ?? '');
+  };
+
   const status = memberStatusView(member.status, member.online, t);
   const confirmTarget = `remove-member:${member.nodeId}`;
   const confirmingRemove = ui.confirmTarget === confirmTarget;
+  const noteTooLong = draftNote.length > NOTE_MAX_LENGTH;
   // 连接表只遍历占席位成员（pending 在申请格、revoked 已移除），固定原因文案下沉在 format.ts
   const rows = filterJoinedMembers(topology.members)
     .filter((m) => m.nodeId !== member.nodeId)
@@ -104,7 +135,7 @@ export function DeviceDetail(props: DeviceDetailProps) {
   return (
     <section className="device-detail">
       <button type="button" className="back-link" onClick={onBack}>
-        ‹ {t('devices.back')}
+        <ChevronIcon direction="left" size={12} /> {t('devices.back')}
       </button>
 
       <div className="detail-head">
@@ -158,13 +189,14 @@ export function DeviceDetail(props: DeviceDetailProps) {
             <button
               type="button"
               className="btn"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
               disabled={busy}
               onClick={() => {
                 setDraftName(member.name ?? displayName(member, t));
                 setEditingName(true);
               }}
             >
-              {t('devices.rename')}
+              <EditIcon size={14} /> {t('devices.rename')}
             </button>
           )}
           {(member.status === 'authorized' || member.status === 'paused') && (
@@ -215,6 +247,61 @@ export function DeviceDetail(props: DeviceDetailProps) {
           <dt>{t('devices.totalRelay')}</dt>
           <dd className="mono">{formatBytes(member.cumulativeRelayBytes)}</dd>
         </div>
+        <div className="meta-item">
+          <dt>{t('devices.note')}</dt>
+          {editingNote ? (
+            <dd>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <input
+                  className="input"
+                  type="text"
+                  autoFocus
+                  placeholder={t('devices.notePlaceholder')}
+                  aria-invalid={noteTooLong}
+                  value={draftNote}
+                  onChange={(e) => setDraftNote(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      if (!noteTooLong) commitNote();
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      cancelNote();
+                    }
+                  }}
+                />
+                <span className="mono" style={{ flex: 'none', fontSize: 12, color: noteTooLong ? 'var(--danger)' : 'var(--ink-3)' }}>
+                  {draftNote.length} / {NOTE_MAX_LENGTH}
+                </span>
+                <button type="button" className="btn primary" disabled={busy || noteTooLong} onClick={commitNote}>
+                  {t('common.save')}
+                </button>
+                <button type="button" className="btn" disabled={busy} onClick={cancelNote}>
+                  {t('common.cancel')}
+                </button>
+              </div>
+              {noteTooLong && <p className="form-error">{t('error.noteTooLong')}</p>}
+            </dd>
+          ) : (
+            <dd style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span className={member.note === null ? 'muted' : undefined}>{member.note ?? '—'}</span>
+              {onEditNote !== undefined && (
+                <button
+                  type="button"
+                  className="btn ghost"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                  disabled={busy}
+                  onClick={() => {
+                    setDraftNote(member.note ?? '');
+                    setEditingNote(true);
+                  }}
+                >
+                  <EditIcon size={14} /> {t('devices.editNote')}
+                </button>
+              )}
+            </dd>
+          )}
+        </div>
       </dl>
 
       <h3 className="section-title">{t('devices.connectionsTitle')}</h3>
@@ -256,7 +343,7 @@ export function DeviceDetail(props: DeviceDetailProps) {
                 <td className="conn-reason">{row.reason}</td>
                 <td className="device-cell-latency mono">{row.latency}</td>
                 <td className="row-arrow" aria-hidden="true">
-                  ›
+                  <ChevronIcon direction="right" size={14} />
                 </td>
               </tr>
             ))}
