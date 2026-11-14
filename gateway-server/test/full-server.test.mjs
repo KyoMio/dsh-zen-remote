@@ -3,11 +3,12 @@
 // 并可无泄漏 close()。静态部分钉住：`/` 返回编译后的控制台 HTML 与严格自包含
 // CSP 安全头、`/assets/*` 哈希资源 immutable 且零外部 URL、SPA 回退 no-cache。
 // 与其他测试相同：.mjs 直接 import 编译产物 ../dist/。
-import { after, describe, test } from 'node:test';
+import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
@@ -83,14 +84,14 @@ async function startTestGateway(configOverrides = {}) {
 
 // ---------------------------------------------------------------- REST 客户端
 
-async function api(base, method, apiPath, { body, cookie } = {}) {
-  const headers = {};
+async function api(base, method, apiPath, { body, cookie, headers: extraHeaders } = {}) {
+  const headers = { ...extraHeaders };
   if (cookie !== undefined) headers.cookie = cookie;
   let payload;
   if (body !== undefined) {
     payload = JSON.stringify(body);
     headers['content-type'] = 'application/json';
-    headers.origin = base; // 写请求过同源门（浏览器形态）
+    if (headers['origin'] === undefined) headers.origin = base; // 写请求过同源门（浏览器形态）；Bearer 用例可显式覆盖
   }
   const res = await fetch(base + apiPath, { method, headers, body: payload });
   const text = await res.text();
@@ -1258,5 +1259,438 @@ describe('PC-07 部署配置播种：resolveGatewayConfig → startGateway 生�
     } finally {
       await gw2.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------- GC-10：控制台静态投递与管理全链路
+
+// 假 SMTP（与 auth-otp-account.test.mjs 同一套零依赖 mock：明文会话、EHLO 广告
+// AUTH、逐命令回 250、DATA 收完整 payload 记入 messages）。测试文件各自持有
+// 一份实现，互不 import。
+function createFakeSmtp() {
+  const state = { messages: [], openSockets: new Set() };
+  const server = net.createServer((sock) => {
+    state.openSockets.add(sock);
+    sock.on('error', () => {}); // 客户端 destroy 后的 ECONNRESET 吞掉即可
+    sock.once('close', () => state.openSockets.delete(sock));
+    const conn = { buf: '', inData: false, from: null, to: null };
+    sock.write('220 fake.gateway.local ESMTP fake ready\r\n');
+    sock.on('data', function onData(chunk) {
+      conn.buf += chunk.toString('utf8');
+      while (true) {
+        if (conn.inData) {
+          const end = conn.buf.indexOf('\r\n.\r\n');
+          if (end < 0) return;
+          const payload = conn.buf.slice(0, end + 2); // 含正文尾 CRLF，不含终止符
+          conn.buf = conn.buf.slice(end + 5);
+          conn.inData = false;
+          state.messages.push({ from: conn.from, to: conn.to, payload });
+          sock.write('250 OK message accepted\r\n');
+          continue;
+        }
+        const idx = conn.buf.indexOf('\r\n');
+        if (idx < 0) return;
+        const line = conn.buf.slice(0, idx);
+        conn.buf = conn.buf.slice(idx + 2);
+        const upper = line.toUpperCase();
+        if (upper.startsWith('EHLO')) {
+          sock.write('250-fake.gateway.local\r\n250 AUTH PLAIN LOGIN\r\n');
+        } else if (upper.startsWith('AUTH PLAIN')) {
+          sock.write('235 accepted\r\n');
+        } else if (upper.startsWith('MAIL FROM')) {
+          conn.from = line;
+          sock.write('250 OK\r\n');
+        } else if (upper.startsWith('RCPT TO')) {
+          conn.to = line;
+          sock.write('250 OK\r\n');
+        } else if (upper.startsWith('DATA')) {
+          conn.inData = true;
+          sock.write('354 end with <CRLF>.<CRLF>\r\n');
+        } else if (upper.startsWith('QUIT')) {
+          sock.write('221 bye\r\n');
+          sock.end();
+        } else {
+          sock.write('250 OK\r\n');
+        }
+      }
+    });
+  });
+  return { server, state };
+}
+
+function listen(server) {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      resolve(server.address().port);
+    });
+  });
+}
+
+async function closeServer(server) {
+  await new Promise((resolve) => {
+    server.closeAllConnections?.();
+    server.close(() => resolve());
+  });
+}
+
+/** 从捕获的邮件里取 6 位验证码：主题行（中英双语）都以验证码结尾；中文主题是 RFC 2047 编码词 */
+function otpFromMessage(message) {
+  const subjectLine = message.payload.split('\r\n').find((line) => line.toUpperCase().startsWith('SUBJECT:'));
+  assert.ok(subjectLine, `message must have a Subject header:\n${message.payload}`);
+  const encoded = /=\?UTF-8\?B\?([^?]*)\?=/.exec(subjectLine);
+  const subject = encoded
+    ? Buffer.from(encoded[1], 'base64').toString('utf8')
+    : subjectLine.slice('Subject:'.length).trim();
+  const match = /(\d{6})\s*$/.exec(subject);
+  assert.ok(match, `subject must end with the 6-digit code: ${subjectLine}`);
+  return match[1];
+}
+
+describe('GC-10：控制台静态投递（Observation C）', () => {
+  test('GET /theme-init.js 200 JS；index.html 引用 /theme-init.js、页面内零内联 <script>；CONSOLE_CSP 逐字不变', async () => {
+    const gw = await startTestGateway();
+    try {
+      const themeRes = await fetch(gw.base + '/theme-init.js');
+      assert.equal(themeRes.status, 200);
+      assert.match(themeRes.headers.get('content-type') ?? '', /^text\/javascript/, 'theme-init 必须以 JS 投递');
+      assert.equal(themeRes.headers.get('cache-control'), 'no-cache');
+      const themeJs = await themeRes.text();
+      assert.match(themeJs, /data-theme/, 'theme-init 脚本必须在渲染前写 <html data-theme>');
+
+      const res = await fetch(gw.base + '/');
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
+      assert.equal(res.headers.get('content-security-policy'), CSP_EXPECTED, 'CONSOLE_CSP 必须逐字不变');
+      const html = await res.text();
+      assert.match(html, /<script[^>]*src="\/theme-init\.js"/, 'index.html 必须外链引用 /theme-init.js');
+
+      // 页面内零内联 <script>：每个 script 标签都必须带 src（CSP 禁内联脚本，
+      // 主题防闪走同源静态文件而不是 <script>alert(1)</script> 之类的内联块）
+      const scriptTags = [...html.matchAll(/<script\b([^>]*)>/gi)].map((m) => m[1]);
+      assert.ok(scriptTags.length >= 2, 'index.html 至少含 theme-init 与入口 bundle 两个外链 script');
+      for (const attrs of scriptTags) {
+        assert.match(attrs, /\bsrc=/, `每个 <script> 都必须外链（CSP 禁内联脚本）：${attrs}`);
+      }
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+describe('GC-10：管理全链路（假 SMTP + OTP 注册 + Bearer Key + 改密/找回 + 零秘密泄漏）', () => {
+  const SMTP_SECRET = 'gc10-smtp-secret';
+  const SIGNUP_EMAIL = 'gc10-user@example.com';
+  const SIGNUP_PASSWORD = 'gc10-pass-1234';
+  const AGENT_EMAIL = 'gc10-agent@example.com';
+
+  let gw;
+  let smtp;
+  let smtpPort;
+  let adminCookie;
+  let apiKey = '';
+  let userCookie = '';
+
+  before(async () => {
+    smtp = createFakeSmtp();
+    smtpPort = await listen(smtp.server);
+    gw = await startTestGateway({ allowSignup: true });
+    adminCookie = await login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+  });
+
+  after(async () => {
+    if (gw !== undefined) await gw.close().catch(() => {});
+    if (smtp !== undefined) await closeServer(smtp.server);
+  });
+
+  test('PATCH /admin/settings 配置 SMTP → smtp-test 真实发信，假 SMTP 收到测试邮件', async () => {
+    const patched = await api(gw.base, 'PATCH', '/api/v1/admin/settings', {
+      body: {
+        smtp: {
+          host: '127.0.0.1',
+          port: smtpPort,
+          security: 'none',
+          username: 'mailer@gateway.local',
+          password: SMTP_SECRET,
+          fromAddress: 'gateway@example.com',
+          fromName: 'Zen Remote Gateway',
+        },
+      },
+      cookie: adminCookie,
+    });
+    assert.equal(patched.status, 200, JSON.stringify(patched.json));
+    assert.equal(patched.json.data.smtp.configured, true);
+    assert.equal(patched.json.data.smtp.hasPassword, true, '脱敏视图只给 hasPassword 布尔');
+    assert.equal(patched.json.data.smtp.host, '127.0.0.1');
+
+    const sent = await api(gw.base, 'POST', '/api/v1/admin/settings/smtp-test', {
+      body: { toEmail: 'tester@example.com' },
+      cookie: adminCookie,
+    });
+    assert.equal(sent.status, 200, JSON.stringify(sent.json));
+    assert.deepEqual(sent.json.data, { sent: true });
+    const last = smtp.state.messages.at(-1);
+    assert.ok(last, 'smtp-test 必须产生真实发信');
+    assert.equal(last.to, 'RCPT TO:<tester@example.com>');
+    assert.match(last.payload, /Subject:/);
+  });
+
+  test('POST /admin/settings/api-key 生成 Bearer Key：明文仅本次返回，库里只有前缀与时刻', async () => {
+    const res = await api(gw.base, 'POST', '/api/v1/admin/settings/api-key', { cookie: adminCookie });
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    apiKey = res.json.data.apiKey;
+    assert.match(apiKey, /^zr_adm_[0-9a-f]{48}$/);
+    assert.equal(res.json.data.prefix, apiKey.slice(0, 14));
+    assert.ok(!Number.isNaN(Date.parse(res.json.data.createdAt)));
+
+    const view = await api(gw.base, 'GET', '/api/v1/admin/settings', { cookie: adminCookie });
+    assert.equal(view.json.data.adminApiKey.configured, true);
+    assert.equal(view.json.data.adminApiKey.prefix, apiKey.slice(0, 14));
+    assert.ok(!JSON.stringify(view.json).includes(apiKey), '脱敏设置视图绝不回传密钥明文');
+  });
+
+  test('开启注册邮箱验证：send-otp → 假 SMTP 取码 → signup 建号建网', async () => {
+    const enable = await api(gw.base, 'PATCH', '/api/v1/admin/settings', {
+      body: { requireEmailVerification: true },
+      cookie: adminCookie,
+    });
+    assert.equal(enable.status, 200, JSON.stringify(enable.json));
+    assert.equal(enable.json.data.requireEmailVerification, true);
+
+    const otp = await api(gw.base, 'POST', '/api/v1/auth/send-otp', {
+      body: { email: SIGNUP_EMAIL, purpose: 'signup' },
+    });
+    assert.equal(otp.status, 200, JSON.stringify(otp.json));
+    const code = otpFromMessage(smtp.state.messages.at(-1));
+    assert.match(code, /^\d{6}$/);
+
+    const signed = await api(gw.base, 'POST', '/api/v1/auth/signup', {
+      body: { email: SIGNUP_EMAIL, password: SIGNUP_PASSWORD, otpCode: code },
+    });
+    assert.equal(signed.status, 200, JSON.stringify(signed.json));
+    userCookie = sessionCookie(signed);
+    assert.equal(signed.json.data.user.email, SIGNUP_EMAIL);
+
+    const net = await api(gw.base, 'POST', '/api/v1/networks', {
+      body: { name: 'gc10-net', admissionMode: 'key' },
+      cookie: userCookie,
+    });
+    assert.equal(net.status, 200, JSON.stringify(net.json));
+    assert.match(net.json.data.joinUri, /^zr-net:\/\//);
+  });
+
+  test('管理员建组/改组/到期回退：新组速率与配额经 /auth/me 即时生效', async () => {
+    const group = await api(gw.base, 'POST', '/api/v1/admin/groups', {
+      body: {
+        code: 'gc10pro',
+        name: 'GC10 Pro',
+        maxNetworks: 10,
+        maxPeersPerNetwork: 16,
+        relayRateKbps: 65536,
+        monthlyRelayQuotaBytes: 1073741824,
+      },
+      cookie: adminCookie,
+    });
+    assert.equal(group.status, 200, JSON.stringify(group.json));
+    const groupId = group.json.data.id;
+
+    const users = await api(gw.base, 'GET', '/api/v1/admin/users', { cookie: adminCookie });
+    const target = users.json.data.find((u) => u.email === SIGNUP_EMAIL);
+    assert.ok(target, '用户列表应含新注册用户');
+
+    const moved = await api(gw.base, 'PATCH', `/api/v1/admin/users/${target.id}`, {
+      body: { groupId, groupExpiresAt: new Date(Date.now() + 86_400_000).toISOString() },
+      cookie: adminCookie,
+    });
+    assert.equal(moved.status, 200, JSON.stringify(moved.json));
+    assert.equal(moved.json.data.effectiveGroupId, groupId);
+    assert.equal(moved.json.data.isExpiredFallback, false);
+
+    const me = await api(gw.base, 'GET', '/api/v1/auth/me', { cookie: userCookie });
+    assert.equal(me.json.data.quota.groupId, groupId);
+    assert.equal(me.json.data.quota.relayRateKbps, 65536, '单设备限速必须即时跟随新组');
+    assert.equal(me.json.data.quota.monthlyRelayQuotaBytes, 1073741824);
+
+    const expired = await api(gw.base, 'PATCH', `/api/v1/admin/users/${target.id}`, {
+      body: { groupExpiresAt: new Date(Date.now() - 1000).toISOString() },
+      cookie: adminCookie,
+    });
+    assert.equal(expired.status, 200);
+    assert.equal(expired.json.data.isExpiredFallback, true, '到期必须标记回退');
+    const meAfter = await api(gw.base, 'GET', '/api/v1/auth/me', { cookie: userCookie });
+    assert.notEqual(meAfter.json.data.quota.groupId, groupId, '到期后生效组必须回到默认组');
+
+    const renewed = await api(gw.base, 'PATCH', `/api/v1/admin/users/${target.id}`, {
+      body: { groupExpiresAt: null },
+      cookie: adminCookie,
+    });
+    assert.equal(renewed.status, 200);
+    assert.equal(renewed.json.data.isExpiredFallback, false);
+  });
+
+  test('热改 publicUrl：新建网络的 joinUri 立即使用新域名；清空后回退请求推断', async () => {
+    const setUrl = await api(gw.base, 'PATCH', '/api/v1/admin/settings', {
+      body: { publicUrl: 'https://gc10.example.com' },
+      cookie: adminCookie,
+    });
+    assert.equal(setUrl.status, 200, JSON.stringify(setUrl.json));
+    assert.equal(setUrl.json.data.publicUrl, 'https://gc10.example.com');
+
+    const net = await api(gw.base, 'POST', '/api/v1/networks', {
+      body: { name: 'gc10-hot-url', admissionMode: 'key' },
+      cookie: userCookie,
+    });
+    assert.equal(net.status, 200, JSON.stringify(net.json));
+    // 反代 443/80 未显式写端口时生成器补齐默认端口（buildJoinEndpoint 契约），两种形态都算跟随
+    assert.match(net.json.data.joinUri, /^zr-net:\/\/gc10\.example\.com(:443)?\//, 'joinUri 必须立即跟随新 publicUrl');
+
+    const cleared = await api(gw.base, 'PATCH', '/api/v1/admin/settings', {
+      body: { publicUrl: null },
+      cookie: adminCookie,
+    });
+    assert.equal(cleared.status, 200);
+    assert.equal(cleared.json.data.publicUrl, null);
+    const fallback = await api(gw.base, 'POST', '/api/v1/networks', {
+      body: { name: 'gc10-fallback', admissionMode: 'key' },
+      cookie: userCookie,
+    });
+    assert.equal(fallback.status, 200);
+    assert.doesNotMatch(fallback.json.data.joinUri, /gc10\.example\.com/, '清空后必须回落请求头推断');
+  });
+
+  test('外部 Bearer zr_adm_ Key 直调 /admin/*：无 Cookie 跨站改到期日成功；无效 Key 401', async () => {
+    const list = await api(gw.base, 'GET', '/api/v1/admin/users', {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    assert.equal(list.status, 200, JSON.stringify(list.json));
+    const target = list.json.data.find((u) => u.email === SIGNUP_EMAIL);
+    assert.ok(target);
+
+    const futureIso = new Date(Date.now() + 30 * 86_400_000).toISOString();
+    const patched = await api(gw.base, 'PATCH', `/api/v1/admin/users/${target.id}`, {
+      body: { groupExpiresAt: futureIso },
+      headers: { authorization: `Bearer ${apiKey}`, origin: 'https://billing.example', 'sec-fetch-site': 'cross-site' },
+    });
+    assert.equal(patched.status, 200, JSON.stringify(patched.json));
+    assert.equal(patched.json.data.groupExpiresAt, futureIso);
+
+    const me = await api(gw.base, 'GET', '/api/v1/auth/me', { cookie: userCookie });
+    assert.equal(me.json.data.quota.groupExpiresAt, futureIso, '外部系统的续期必须对用户即刻可见');
+
+    const bad = await api(gw.base, 'GET', '/api/v1/admin/users', {
+      headers: { authorization: `Bearer zr_adm_${'0'.repeat(48)}` },
+    });
+    assert.equal(bad.status, 401);
+    assert.equal(bad.json.error?.code, 'INVALID_API_KEY');
+  });
+
+  test('账户设置改密：当前会话保留、他端会话与旧密码全部失效', async () => {
+    const second = await api(gw.base, 'POST', '/api/v1/auth/login', {
+      body: { email: SIGNUP_EMAIL, password: SIGNUP_PASSWORD },
+    });
+    assert.equal(second.status, 200);
+    const otherSession = sessionCookie(second);
+
+    const changed = await api(gw.base, 'PATCH', '/api/v1/auth/account/password', {
+      body: { currentPassword: SIGNUP_PASSWORD, newPassword: 'gc10-new-pass-456' },
+      cookie: userCookie,
+    });
+    assert.equal(changed.status, 200, JSON.stringify(changed.json));
+    assert.deepEqual(changed.json.data, { changed: true });
+
+    const meStill = await api(gw.base, 'GET', '/api/v1/auth/me', { cookie: userCookie });
+    assert.equal(meStill.status, 200, '改密后当前会话必须保留');
+    assert.equal(meStill.json.data.authenticated, true);
+    // 被吊销的会话访问 /auth/me 回匿名形态（200 + authenticated:false），业务接口才是硬 401
+    const meOther = await api(gw.base, 'GET', '/api/v1/auth/me', { cookie: otherSession });
+    assert.equal(meOther.status, 200);
+    assert.equal(meOther.json.data.authenticated, false, '其他端会话必须被吊销（/auth/me 匿名形态）');
+    const otherNetworks = await api(gw.base, 'GET', '/api/v1/networks', { cookie: otherSession });
+    assert.equal(otherNetworks.status, 401, '其他端会话访问业务接口必须 401');
+    const oldLogin = await api(gw.base, 'POST', '/api/v1/auth/login', {
+      body: { email: SIGNUP_EMAIL, password: SIGNUP_PASSWORD },
+    });
+    assert.equal(oldLogin.status, 401);
+  });
+
+  test('忘记密码重置：全端会话失效，新密码可登录', async () => {
+    const otp = await api(gw.base, 'POST', '/api/v1/auth/send-otp', {
+      body: { email: SIGNUP_EMAIL, purpose: 'reset_password' },
+    });
+    assert.equal(otp.status, 200, JSON.stringify(otp.json));
+    const code = otpFromMessage(smtp.state.messages.at(-1));
+
+    const reset = await api(gw.base, 'POST', '/api/v1/auth/reset-password', {
+      body: { email: SIGNUP_EMAIL, otpCode: code, newPassword: 'gc10-reset-pass-789' },
+    });
+    assert.equal(reset.status, 200, JSON.stringify(reset.json));
+    assert.deepEqual(reset.json.data, { reset: true });
+
+    const meOld = await api(gw.base, 'GET', '/api/v1/auth/me', { cookie: userCookie });
+    assert.equal(meOld.status, 200);
+    assert.equal(meOld.json.data.authenticated, false, '重置后全部历史会话必须失效（/auth/me 匿名形态）');
+    const oldNetworks = await api(gw.base, 'GET', '/api/v1/networks', { cookie: userCookie });
+    assert.equal(oldNetworks.status, 401, '重置后旧会话访问业务接口必须 401');
+    const relogin = await api(gw.base, 'POST', '/api/v1/auth/login', {
+      body: { email: SIGNUP_EMAIL, password: 'gc10-reset-pass-789' },
+    });
+    assert.equal(relogin.status, 200);
+    userCookie = sessionCookie(relogin);
+  });
+
+  test('管理员创建用户（留空密码）与重置密码：generatedPassword 仅本次返回且可登录', async () => {
+    const created = await api(gw.base, 'POST', '/api/v1/admin/users', {
+      body: { email: AGENT_EMAIL, role: 'user' },
+      cookie: adminCookie,
+    });
+    assert.equal(created.status, 200, JSON.stringify(created.json));
+    const firstPassword = created.json.data.generatedPassword;
+    assert.ok(firstPassword, '留空密码必须返回一次性 generatedPassword');
+    assert.equal(firstPassword.length, 16);
+    const loginWith = await api(gw.base, 'POST', '/api/v1/auth/login', {
+      body: { email: AGENT_EMAIL, password: firstPassword },
+    });
+    assert.equal(loginWith.status, 200, '一次性密码必须能立即登录');
+
+    const reset = await api(gw.base, 'POST', `/api/v1/admin/users/${created.json.data.id}/reset-password`, {
+      body: {},
+      cookie: adminCookie,
+    });
+    assert.equal(reset.status, 200, JSON.stringify(reset.json));
+    const secondPassword = reset.json.data.generatedPassword;
+    assert.ok(secondPassword && secondPassword.length === 16 && secondPassword !== firstPassword);
+    const oldAfter = await api(gw.base, 'POST', '/api/v1/auth/login', {
+      body: { email: AGENT_EMAIL, password: firstPassword },
+    });
+    assert.equal(oldAfter.status, 401, '重置后旧密码必须失效');
+  });
+
+  test('零秘密泄漏：/api/v1/admin/*、/auth/me 与全部前端静态资源都不含密钥/密码明文', async () => {
+    const surfaces = [];
+    for (const path of ['/api/v1/admin/users', '/api/v1/admin/settings', '/api/v1/admin/runtime', '/api/v1/admin/groups']) {
+      surfaces.push(await api(gw.base, 'GET', path, { cookie: adminCookie }));
+    }
+    surfaces.push(await api(gw.base, 'GET', '/api/v1/auth/me', { cookie: userCookie }));
+    for (const res of surfaces) {
+      assert.equal(res.status, 200, JSON.stringify(res.json));
+      const raw = JSON.stringify(res.json);
+      for (const secret of [apiKey, SMTP_SECRET, 'passwordHash', 'smtpConfigEnc', 'adminApiKeyHash']) {
+        assert.ok(!raw.includes(secret), `管理/会话响应不得包含 ${secret}`);
+      }
+    }
+
+    const html = await (await fetch(gw.base + '/')).text();
+    const assetRefs = [...html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)].map((m) => m[1]);
+    assert.ok(assetRefs.length > 0);
+    for (const ref of assetRefs) {
+      const asset = await (await fetch(gw.base + ref)).text();
+      for (const secret of [apiKey, SMTP_SECRET, SIGNUP_PASSWORD, 'gc10-reset-pass-789', 'gc10-new-pass-456']) {
+        assert.ok(!asset.includes(secret), `静态资源不得包含运行期秘密：${ref}`);
+      }
+    }
+
+    const themeJs = await (await fetch(gw.base + '/theme-init.js')).text();
+    assert.ok(!themeJs.includes(apiKey) && !themeJs.includes(SMTP_SECRET));
   });
 });

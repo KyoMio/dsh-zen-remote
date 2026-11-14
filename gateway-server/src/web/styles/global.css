@@ -453,6 +453,11 @@ button {
   border-color: var(--accent);
 }
 
+/* 失焦后仍未通过原生校验的输入框：温和红边（延迟到 :user-invalid，不抢焦点） */
+.input:is(:user-invalid) {
+  border-color: var(--danger);
+}
+
 /* ---------- 登录注册页（居中卡片，扁平） ---------- */
 
 .login-view {
@@ -1202,6 +1207,107 @@ html[data-theme='dark'] .modal-overlay {
   margin-top: 16px;
 }
 
+/* ---------- 原生 <dialog> 弹窗（GC-7a Modal × GC-10 Observation A） ---------- */
+
+/* showModal 打开的模态 dialog 才匹配 :modal：滚轮/触摸惯性滚动止于弹层，不再透传给页面 */
+dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog.modal {
+  margin: auto;
+  /* 390px 视口两侧各留 12px，任何断点零横向溢出；1280px+ 桌面居中 420px */
+  width: min(420px, calc(100vw - 24px));
+  max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
+  overscroll-behavior: contain;
+}
+
+dialog.modal::backdrop {
+  background: rgba(15, 20, 30, 0.45);
+}
+
+html[data-theme='dark'] dialog.modal::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+/* 弹层头部：标题 + 可选副标题 + 右上角关闭按钮（Modal.tsx 的固定结构） */
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.modal-heading {
+  min-width: 0;
+  flex: 1;
+}
+
+.modal-header .modal-title {
+  margin: 0;
+}
+
+.modal-subtitle {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+
+.modal-close {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  flex: none;
+}
+
+.modal-close:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+/* 平滑开关过渡；prefers-reduced-motion 下不播动画（尊重前庭无障碍偏好） */
+@media (prefers-reduced-motion: no-preference) {
+  dialog.modal[open] {
+    animation: modal-in 0.16s ease;
+  }
+
+  dialog.modal[open]::backdrop {
+    animation: backdrop-in 0.16s ease;
+  }
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes backdrop-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
 .danger-zone {
   margin-top: 16px;
   padding-top: 12px;
@@ -1265,6 +1371,422 @@ html[data-theme='dark'] .modal-overlay {
   margin: 0;
   font-size: 13px;
   color: var(--ink-3);
+}
+
+/* ============================================================
+   GC-10：网关管理三标签工作台
+   （只读运行态条 / 安全告警横幅 / 标签页 / 管理数据表容器查询 /
+     用户组卡片 / 设置面板 / 一次性明文区 / 配额进度条）
+   ============================================================ */
+
+/* ---------- 只读运行态条 ---------- */
+
+.runtime-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 28px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-2);
+}
+
+.runtime-item {
+  min-width: 0;
+}
+
+.runtime-item dt {
+  margin-bottom: 2px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.runtime-item dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.runtime-strip.compact {
+  gap: 8px 24px;
+  padding: 10px 12px;
+}
+
+/* 生效公网入口的来源标签（settings / env / request） */
+.runtime-source {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--ink-3);
+  vertical-align: 1px;
+}
+
+/* ---------- 非阻塞安全告警横幅（管理页唯一允许的 warn-tint 底色） ---------- */
+
+.warn-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
+  border-radius: 4px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.warn-banner svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--warn);
+}
+
+.warn-banner p {
+  margin: 0;
+  min-width: 0;
+}
+
+/* ---------- 单行标签页（活跃态 ::after 下划线；字重恒定，切换零抖动） ---------- */
+
+.admin-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 16px 0 0;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+
+.admin-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border: none;
+  background: none;
+  color: var(--ink-3);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.admin-tab:hover {
+  color: var(--ink);
+}
+
+.admin-tab[aria-selected='true'] {
+  color: var(--ink);
+}
+
+.admin-tab[aria-selected='true']::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  border-block-end: 2px solid var(--accent-solid);
+}
+
+.admin-tabpanel {
+  padding-top: 16px;
+  min-width: 0;
+}
+
+.panel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 12px;
+}
+
+/* ---------- 管理数据表（@container ≤680px 折成 data-label 卡片堆叠） ---------- */
+
+.table-wrapper {
+  container-type: inline-size;
+  overflow-x: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.data-table th {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-3);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  color: var(--ink);
+  vertical-align: middle;
+  min-width: 0;
+}
+
+.data-table .user-email {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.admin-actions-cell {
+  white-space: normal;
+}
+
+.admin-actions-cell .btn {
+  margin: 2px 6px 2px 0;
+}
+
+/* 容器查询：表格自身宽度 ≤680px 时折成卡片（不依赖视口断点，侧栏/分栏同样成立） */
+@container (max-width: 680px) {
+  .table-wrapper thead {
+    display: none;
+  }
+
+  .table-wrapper table,
+  .table-wrapper tbody {
+    display: block;
+    width: 100%;
+  }
+
+  .table-wrapper tr {
+    display: block;
+    padding: 12px 2px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .table-wrapper tr:last-child {
+    border-bottom: none;
+  }
+
+  .table-wrapper td {
+    display: block;
+    padding: 3px 0;
+    border-bottom: none;
+  }
+
+  .table-wrapper td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 1px;
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+
+  .table-wrapper td.admin-actions-cell .btn {
+    margin: 4px 6px 0 0;
+  }
+}
+
+/* ---------- 用户组卡片 ---------- */
+
+.group-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.group-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.group-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.group-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  min-width: 0;
+}
+
+.group-badge {
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.group-quota-list {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.group-quota-list > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.group-quota-list dt {
+  font-size: 12px;
+  color: var(--ink-3);
+  min-width: 0;
+}
+
+.group-quota-list dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink);
+  text-align: right;
+}
+
+.group-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: 4px;
+}
+
+.group-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.group-actions .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* ---------- 限速快捷预设 ---------- */
+
+.preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 0;
+}
+
+.preset-chip {
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.preset-chip:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+
+/* ---------- 设置面板（网关与发信设置） ---------- */
+
+.settings-stack {
+  min-width: 0;
+}
+
+.settings-section + .settings-section {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 16px;
+}
+
+.smtp-test {
+  padding: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface-2);
+}
+
+/* ---------- 一次性明文区（初始密码 / 临时密码 / Admin API Key 共用） ---------- */
+
+.secret-reveal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface-2);
+}
+
+.secret-reveal code {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.secret-reveal .btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* ---------- 配额进度条（正常 / warn / danger 三档，4px 细线不占格子底色） ---------- */
+
+.quota-bar {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.quota-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.quota-bar.warn .quota-bar-fill {
+  background: var(--warn);
+}
+
+.quota-bar.danger .quota-bar-fill {
+  background: var(--danger);
 }
 
 /* ---------- 响应式：≤1080px 首格独占一行；≤767px 竖排 + 表格变卡片 ---------- */
@@ -1380,5 +1902,24 @@ html[data-theme='dark'] .modal-overlay {
   .device-detail,
   .admin-view {
     padding: 14px 12px;
+  }
+
+  /* GC-10：窄屏运行态条收紧行距；弹层收窄内边距对齐 390px 视口（宽度已由
+     dialog.modal 的 min(420px, 100vw - 24px) 保证零横向溢出） */
+  .runtime-strip {
+    gap: 8px 18px;
+    padding: 10px 12px;
+  }
+
+  dialog.modal {
+    padding: 16px;
+  }
+
+  .warn-banner {
+    margin-top: 10px;
+  }
+
+  .admin-tabs {
+    margin-top: 12px;
   }
 }
