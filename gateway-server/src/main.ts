@@ -119,8 +119,29 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       store,
       masterKey,
       publicUrl: config.publicUrl,
+      // GC-6a：只读运行态元信息（/admin/runtime 展示与安全告警）。UDP 两口取实际
+      // 绑定值（bind 已完成）；HTTP listenPort 用配置值（port=0 内核分配时实际
+      // 端口以 GatewayInstance.port 为准）；主密钥来源与 loadOrCreateMasterKey 的
+      // env 优先判定同源——ZR_GATEWAY_SECRET 非空即 env，否则 master.key 文件。
+      runtimeMeta: {
+        listenPort: config.port,
+        udpPort: udpPorts.primaryPort,
+        udpAltPort: udpPorts.altPort ?? 0,
+        storageDriver: config.databaseUrl !== undefined ? 'postgres' : 'sqlite',
+        secretSource:
+          typeof process.env['ZR_GATEWAY_SECRET'] === 'string' && process.env['ZR_GATEWAY_SECRET'].length > 0
+            ? 'env'
+            : 'file',
+        publicUrlFromEnv: config.publicUrl,
+      },
       runtime: hub,
-      hooks: hub.hooks,
+      // GC-6a：保留 hub 原有回调，叠加配额失效与用户删除两条新钩子（ws-hub 已有
+      // refreshQuota / evictUser 公共入口，无需改动 hub 本体）
+      hooks: {
+        ...hub.hooks,
+        onQuotaChanged: (userId?: string) => hub.refreshQuota(userId),
+        onUserDeleted: (userId: string) => hub.evictUser(userId),
+      },
       topology: hub,
       staticRoot,
     });

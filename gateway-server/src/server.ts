@@ -7,6 +7,7 @@ import { buildAuthRoutes, isCrossSiteWrite, matchRoute, NOOP_RUNTIME_STATS, send
 import type {
   ApiServerConfig,
   GatewayHooks,
+  GatewayRuntimeMeta,
   GatewayRuntimeStats,
   RouteContext,
   RouteDef,
@@ -28,6 +29,8 @@ export interface GatewayApiServerOptions {
   masterKey: Buffer;
   /** 对外可达基础 URL；缺省时 joinUri 取请求 Host 头 */
   publicUrl?: string;
+  /** GC-6a 只读运行态元信息（/admin/runtime 展示与安全告警）；缺省按保守值呈现 */
+  runtimeMeta?: GatewayRuntimeMeta;
   /** PG-5 运行时统计注入（在线设备数 / 实时中转速率）；缺省全 0 */
   runtime?: GatewayRuntimeStats;
   /** PG-5 实时钩子；缺省无钩子 */
@@ -62,6 +65,11 @@ function safeDecodeSegment(segment: string): string {
   }
 }
 
+function readAuthorizationHeader(req: IncomingMessage): string {
+  const value = req.headers.authorization;
+  return Array.isArray(value) ? (value[0] ?? '') : (value ?? '');
+}
+
 interface DispatchDeps {
   routes: readonly RouteDef[];
   ctx: Omit<RouteContext, 'req' | 'res'>;
@@ -74,8 +82,14 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, deps: Dispatc
     .filter((s) => s.length > 0)
     .map(safeDecodeSegment);
 
-  // 同源写保护顶在最前：跨站写请求在读路由、读体之前直接 403
-  if (isCrossSiteWrite(req)) {
+  // 同源写保护顶在最前：跨站写请求在读路由、读体之前直接 403。
+  // GC-6a 豁免：Admin Bearer API Key 通道（Authorization: Bearer 且路径以
+  // /api/v1/admin/ 开头）跳过同源检查——浏览器跨站请求带不上自定义 Authorization
+  // 头（CORS 预检必拦），且 requireAdmin 对 Bearer 绝不回退 Cookie，因此该通道
+  // 天然免疫 CSRF；其余写路由哪怕带 Authorization 仍按原样走同源校验。
+  const isBearerAdminApi =
+    /^Bearer\s+/i.test(readAuthorizationHeader(req)) && url.pathname.startsWith('/api/v1/admin/');
+  if (!isBearerAdminApi && isCrossSiteWrite(req)) {
     sendError(res, 403, 'FORBIDDEN_ORIGIN', 'cross-site write requests are rejected');
     return;
   }
@@ -86,7 +100,15 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, deps: Dispatc
     return;
   }
 
-  const ctx: RouteContext = { req, res, ...deps.ctx };
+  // GC-6a：逐请求热读 settings.publicUrl（管理员改完即刻生效，无需重启）——
+  // 覆盖 env 配置值；settings 未配（null）时回落 options.publicUrl，再回落请求头推断。
+  const ext = await deps.ctx.store.getExtendedSettings();
+  const config: ApiServerConfig =
+    ext.publicUrl !== null && ext.publicUrl.length > 0
+      ? { ...deps.ctx.config, publicUrl: ext.publicUrl }
+      : deps.ctx.config;
+
+  const ctx: RouteContext = { req, res, ...deps.ctx, config };
   try {
     await match.handler(ctx, match.params);
   } catch (err) {
@@ -108,6 +130,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, deps: Dispatc
 export function createApiRequestHandler(options: GatewayApiServerOptions): (req: IncomingMessage, res: ServerResponse) => void {
   const config: ApiServerConfig = {
     publicUrl: options.publicUrl,
+    runtimeMeta: options.runtimeMeta,
   };
   const deps: DispatchDeps = {
     routes: [
