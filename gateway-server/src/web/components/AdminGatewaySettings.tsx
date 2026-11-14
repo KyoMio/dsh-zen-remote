@@ -101,6 +101,7 @@ function HotConfigForm(props: {
       setSaved(true);
     } catch (err) {
       setErrorKey(adminErrorToKey(err));
+    } finally {
       setBusy(false);
     }
   };
@@ -227,7 +228,7 @@ function HotConfigForm(props: {
         {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
         <div className="modal-foot">
           {saved && errorKey === null && (
-            <p className="field-hint" style={{ margin: '0 auto 0 0', alignSelf: 'center' }}>
+            <p className="form-status-ok" role="status">
               {t('toast.saved')}
             </p>
           )}
@@ -296,6 +297,7 @@ function SmtpForm(props: {
       setSaved(true);
     } catch (err) {
       setErrorKey(adminErrorToKey(err));
+    } finally {
       setBusy(false);
     }
   };
@@ -473,8 +475,8 @@ function SmtpForm(props: {
         </div>
 
         <div className="setting-row">
-          <span id="admin-smtp-reject-label" className="mono">
-            rejectUnauthorized
+          <span id="admin-smtp-reject-label">
+            {t('admin.smtpVerifyCert')}
           </span>
           <button
             type="button"
@@ -494,7 +496,7 @@ function SmtpForm(props: {
         {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
         <div className="modal-foot">
           {saved && errorKey === null && (
-            <p className="field-hint" style={{ margin: '0 auto 0 0', alignSelf: 'center' }}>
+            <p className="form-status-ok" role="status">
               {t('toast.saved')}
             </p>
           )}
@@ -707,43 +709,6 @@ function ApiKeySection(props: {
   );
 }
 
-// ---------------------------------------------------------------- 区块 4：只读运行态说明区
-
-function EnvReadonlyStrip(props: { t: TranslateFn; runtime: GatewayRuntimeStatus | null }) {
-  const { t, runtime } = props;
-  const udpText = (() => {
-    if (runtime === null || runtime.udpPort === 0) return '—';
-    return runtime.udpAltPort > 0 ? `${runtime.udpPort} / ${runtime.udpAltPort}` : `${runtime.udpPort}`;
-  })();
-  const items: Array<{ label: string; value: string }> = [
-    { label: t('admin.runtimeTcpPort'), value: runtime === null ? '—' : `:${runtime.listenPort}` },
-    { label: t('admin.runtimeUdpPorts'), value: udpText },
-    {
-      label: t('admin.runtimeStorage'),
-      value: runtime === null ? '—' : runtime.storageDriver === 'sqlite' ? 'SQLite WAL' : 'PostgreSQL',
-    },
-    {
-      label: t('admin.runtimeMasterKey'),
-      value:
-        runtime === null
-          ? '—'
-          : runtime.secretSource === 'env'
-            ? t('admin.masterKeyFromEnv')
-            : t('admin.masterKeyFromFile'),
-    },
-  ];
-  return (
-    <dl className="runtime-strip compact">
-      {items.map((item) => (
-        <div className="runtime-item" key={item.label}>
-          <dt>{item.label}</dt>
-          <dd className="mono">{item.value}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
 // ---------------------------------------------------------------- 面板壳
 
 export function AdminGatewaySettings(props: AdminGatewaySettingsProps) {
@@ -774,10 +739,6 @@ export function AdminGatewaySettings(props: AdminGatewaySettingsProps) {
 
       <section className="settings-section">
         <ApiKeySection t={t} client={client} settings={settings} ui={ui} onUi={onUi} onSettingsChanged={onSettingsChanged} />
-      </section>
-
-      <section className="settings-section">
-        <EnvReadonlyStrip t={t} runtime={runtime} />
       </section>
     </div>
   );

@@ -123,6 +123,12 @@ function QuotaSummarySection(props: { t: TranslateFn; locale: Locale; user: Publ
         </div>
       </dl>
 
+      {user.role === 'admin' && (
+        <p className="field-hint" style={{ margin: '-6px 0 12px' }}>
+          {t('account.adminQuotaNote')}
+        </p>
+      )}
+
       <div className="field-label" style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginBottom: 6 }}>
         <span>{t('accountSettings.monthlyTraffic')}</span>
         <span className="mono">
@@ -167,17 +173,22 @@ function ChangePasswordSection(props: {
   const [current, setCurrent] = useState('');
   const [next, setNext] = useState('');
   const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [formKey, setFormKey] = useState(0);
   const [errorKey, setErrorKey] = useState<LocaleKey | null>(null);
 
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     if (busy) return;
     setBusy(true);
+    setSaved(false);
     setErrorKey(null);
     try {
       await onChangePassword(current, next);
       setCurrent('');
       setNext('');
+      setFormKey((k) => k + 1);
+      setSaved(true);
     } catch (err) {
       setErrorKey(accountErrorToKey(err));
     } finally {
@@ -186,7 +197,7 @@ function ChangePasswordSection(props: {
   };
 
   return (
-    <form onSubmit={(e) => void submit(e)}>
+    <form key={formKey} onSubmit={(e) => void submit(e)}>
       <p className="section-title" style={{ margin: '0 0 10px' }}>
         {t('accountSettings.changePasswordTitle')}
       </p>
@@ -196,7 +207,10 @@ function ChangePasswordSection(props: {
         value={current}
         required
         autoComplete="current-password"
-        onChange={setCurrent}
+        onChange={(v) => {
+          setCurrent(v);
+          setSaved(false);
+        }}
         t={t}
       />
       <PasswordField
@@ -206,11 +220,19 @@ function ChangePasswordSection(props: {
         required
         minLength={8}
         autoComplete="new-password"
-        onChange={setNext}
+        onChange={(v) => {
+          setNext(v);
+          setSaved(false);
+        }}
         t={t}
       />
       {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
       <div className="modal-foot">
+        {saved && errorKey === null && (
+          <p className="form-status-ok" role="status">
+            {t('toast.saved')}
+          </p>
+        )}
         <button type="submit" className="btn primary" disabled={busy || current.length === 0 || next.length < 8}>
           {t('common.save')}
         </button>
@@ -234,6 +256,8 @@ function ChangeEmailSection(props: {
   const [otpStep, setOtpStep] = useState(false);
   const [codeHint, setCodeHint] = useState<LocaleKey | null>(null);
   const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [formKey, setFormKey] = useState(0);
   const [errorKey, setErrorKey] = useState<LocaleKey | null>(null);
   const cooldown = useResendCooldown();
 
@@ -248,12 +272,15 @@ function ChangeEmailSection(props: {
     cooldown.reset();
     setCurrentPassword('');
     setNewEmail('');
+    setFormKey((k) => k + 1);
     setErrorKey(null);
+    setSaved(true);
   };
 
   /** 换邮箱地址 = 旧的验证码作废：退回第一步并清验证码/倒计时 */
   const handleEmailInput = (value: string): void => {
     setNewEmail(value);
+    setSaved(false);
     if (otpStep) {
       setOtpStep(false);
       setOtpCode('');
@@ -266,6 +293,7 @@ function ChangeEmailSection(props: {
     event.preventDefault();
     if (busy) return;
     setBusy(true);
+    setSaved(false);
     setErrorKey(null);
     try {
       if (!smtpConfigured) {
@@ -314,7 +342,7 @@ function ChangeEmailSection(props: {
   };
 
   return (
-    <form onSubmit={(e) => void submit(e)}>
+    <form key={formKey} onSubmit={(e) => void submit(e)}>
       <p className="section-title" style={{ margin: '0 0 10px' }}>
         {t('accountSettings.changeEmailTitle')}
       </p>
@@ -379,6 +407,11 @@ function ChangeEmailSection(props: {
 
       {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
       <div className="modal-foot">
+        {saved && errorKey === null && (
+          <p className="form-status-ok" role="status">
+            {t('toast.saved')}
+          </p>
+        )}
         <button type="submit" className="btn primary" disabled={busy || !emailReady || (otpStep && otpCode.length !== 6)}>
           {smtpConfigured && !otpStep ? t('auth.sendCode') : t('common.save')}
         </button>

@@ -160,7 +160,7 @@ button {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 0 16px;
+  padding: 0 clamp(16px, 2.5vw, 28px);
   background: var(--surface);
   border-bottom: 1px solid var(--line);
 }
@@ -385,6 +385,10 @@ button {
 /* ---------- 按钮（扁平，4px 圆角） ---------- */
 
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   height: 32px;
   padding: 0 14px;
   border: 1px solid var(--line-strong);
@@ -392,6 +396,8 @@ button {
   background: var(--surface);
   color: var(--ink);
   font-size: 13px;
+  white-space: nowrap;
+  flex-shrink: 0;
   cursor: pointer;
 }
 
@@ -510,6 +516,7 @@ button {
   background: none;
   color: var(--ink-3);
   font-size: 13px;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -538,9 +545,9 @@ button {
 }
 
 .app-content {
-  max-width: 960px;
+  max-width: 1360px;
   margin: 0 auto;
-  padding: 24px 16px;
+  padding: 24px clamp(16px, 2.5vw, 28px);
 }
 
 .page-title {
@@ -681,6 +688,10 @@ button {
   color: var(--ink-3);
 }
 
+.invite-parts-anchor {
+  position: relative;
+}
+
 .invite-parts {
   margin-top: 2px;
 }
@@ -691,6 +702,7 @@ button {
   border-radius: 4px;
   font-size: 12px;
   color: var(--ink-2);
+  user-select: none;
   cursor: pointer;
 }
 
@@ -704,19 +716,25 @@ button {
 }
 
 .invite-parts-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 30;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  margin-top: 8px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--surface-2);
+  margin-top: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  box-shadow: var(--shadow-menu);
 }
 
 .invite-part-row {
   display: grid;
-  grid-template-columns: 76px minmax(0, 1fr) auto;
+  grid-template-columns: 80px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -729,8 +747,13 @@ button {
 
 .invite-part-value {
   min-width: 0;
-  overflow-wrap: anywhere;
-  word-break: break-all;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-2);
   font-size: 12px;
   color: var(--ink-2);
 }
@@ -784,6 +807,7 @@ button {
 
 .request-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
 }
@@ -809,6 +833,10 @@ button {
   padding-top: 8px;
   font-size: 12px;
   color: var(--ink-3);
+}
+
+.e2ee-note svg {
+  flex-shrink: 0;
 }
 
 /* ---------- 设备列表 / 连接表（扁平表格，≤767px 变全宽单列卡片） ---------- */
@@ -922,6 +950,33 @@ tr.device-row:hover {
   font-weight: 500;
 }
 
+.device-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.peer-live-status {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.status-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.status-last-seen {
+  font-size: 12px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
 .device-note {
   margin-top: 2px;
   font-size: 12px;
@@ -931,6 +986,7 @@ tr.device-row:hover {
 .conn-summary {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 4px 12px;
 }
 
@@ -964,12 +1020,16 @@ tr.device-row:hover {
 /* ---------- 设备详情 ---------- */
 
 .back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   padding: 0;
   margin-bottom: 12px;
   border: none;
   background: none;
   color: var(--accent);
   font-size: 13px;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -1001,6 +1061,7 @@ tr.device-row:hover {
 
 .detail-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
@@ -1202,9 +1263,17 @@ html[data-theme='dark'] .modal-overlay {
 
 .modal-foot {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 16px;
+}
+
+.form-status-ok {
+  margin: 0 auto 0 0;
+  font-size: 12px;
+  color: var(--ok);
 }
 
 /* ---------- 原生 <dialog> 弹窗（GC-7a Modal × GC-10 Observation A） ---------- */
@@ -1223,6 +1292,15 @@ dialog.modal {
   overscroll-behavior: contain;
 }
 
+/* 仅打开态启用 flex 列布局，绝不覆盖关闭态 dialog 的 UA display:none；
+   header 固定不随内容滚动（贴近视口也不被裁切），滚动限制在 .modal-scroll 内 */
+dialog.modal[open] {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
 dialog.modal::backdrop {
   background: rgba(15, 20, 30, 0.45);
 }
@@ -1237,7 +1315,19 @@ html[data-theme='dark'] dialog.modal::backdrop {
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
-  margin: 0 0 14px;
+  padding: 18px 20px 12px;
+  margin: 0;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.modal-scroll {
+  padding: 16px 20px 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  flex: 1;
+  min-height: 0;
 }
 
 .modal-heading {
@@ -1325,6 +1415,7 @@ html[data-theme='dark'] dialog.modal::backdrop {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 6px 0;
   font-size: 13px;
@@ -1379,7 +1470,117 @@ html[data-theme='dark'] dialog.modal::backdrop {
      用户组卡片 / 设置面板 / 一次性明文区 / 配额进度条）
    ============================================================ */
 
-/* ---------- 只读运行态条 ---------- */
+/* ---------- 只读运行态条与管理概览仪表盘 ---------- */
+
+.admin-overview {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.admin-head-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.admin-head-bar .page-title {
+  margin: 0;
+}
+
+.admin-head-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.admin-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: 12px;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.admin-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.admin-kpi-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.admin-kpi-label {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.admin-kpi-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+.admin-kpi-sub {
+  font-size: 12px;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.admin-meta-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.admin-meta-strip .runtime-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.admin-meta-strip .runtime-item dt {
+  margin: 0;
+}
+
+.admin-meta-strip .runtime-val {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .admin-kpi-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 
 .runtime-strip {
   display: flex;
@@ -1459,6 +1660,12 @@ html[data-theme='dark'] dialog.modal::backdrop {
   margin: 16px 0 0;
   border-bottom: 1px solid var(--line);
   overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.admin-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .admin-tab {
@@ -1473,6 +1680,7 @@ html[data-theme='dark'] dialog.modal::backdrop {
   font-size: 13px;
   font-weight: 500;
   white-space: nowrap;
+  flex-shrink: 0;
   cursor: pointer;
 }
 
@@ -1487,9 +1695,7 @@ html[data-theme='dark'] dialog.modal::backdrop {
 .admin-tab[aria-selected='true']::after {
   content: '';
   position: absolute;
-  left: 0;
-  right: 0;
-  bottom: -1px;
+  inset: auto 0 0;
   border-block-end: 2px solid var(--accent-solid);
 }
 
@@ -1699,6 +1905,8 @@ html[data-theme='dark'] dialog.modal::backdrop {
 }
 
 .preset-chip {
+  display: inline-flex;
+  align-items: center;
   height: 26px;
   padding: 0 10px;
   border: 1px solid var(--line-strong);
@@ -1706,6 +1914,8 @@ html[data-theme='dark'] dialog.modal::backdrop {
   background: var(--surface);
   color: var(--ink-2);
   font-size: 12px;
+  white-space: nowrap;
+  flex-shrink: 0;
   cursor: pointer;
 }
 
@@ -1822,6 +2032,19 @@ html[data-theme='dark'] dialog.modal::backdrop {
     grid-column: auto;
   }
 
+  /* 单列窄屏：分项复制回退到正常文档流，不盖住下方设备表 */
+  .invite-parts-list {
+    position: static;
+    margin-top: 8px;
+    box-shadow: none;
+    background: var(--surface-2);
+    border-color: var(--line);
+  }
+
+  .invite-parts-list .invite-part-value {
+    background: var(--surface);
+  }
+
   /* 表格变全宽单列卡片：tbody 落回 block，每条 tr 自己成一张两列网格卡片 */
   .device-table,
   .device-table tbody {
@@ -1858,7 +2081,7 @@ html[data-theme='dark'] dialog.modal::backdrop {
     justify-self: end;
   }
 
-  .device-table td.conn-summary,
+  .device-table td.device-cell-conn,
   .device-table td.device-cell-latency {
     grid-column: 1 / -1;
   }
@@ -1911,8 +2134,16 @@ html[data-theme='dark'] dialog.modal::backdrop {
     padding: 10px 12px;
   }
 
-  dialog.modal {
-    padding: 16px;
+  dialog.modal[open] {
+    padding: 0;
+  }
+
+  .modal-header {
+    padding: 14px 16px 10px;
+  }
+
+  .modal-scroll {
+    padding: 14px 16px 16px;
   }
 
   .warn-banner {

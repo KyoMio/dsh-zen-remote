@@ -19,7 +19,7 @@
 // 回落 readUiLocale()），祖父存量提示词条上移 locales.ts 双语词典；新建网络
 // 弹窗只在组上限真的有限（非管理员）时展示组提示，管理员不再把系统硬上限
 // 64 误标成「当前用户组最多 64 台」。
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { LOCALE_STORAGE_KEY, resolveLocale } from '../i18n/locales';
 import type { Locale, LocaleKey, TranslateFn } from '../i18n/locales';
@@ -28,6 +28,7 @@ import {
   classifyLinkPath,
   computeUsagePercent,
   displayName,
+  effectiveNetworkMaxPeers,
   filterJoinedMembers,
   formatBytesQuota,
   formatLatencyRange,
@@ -218,6 +219,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
               {t('network.groupRateCap', { rate: formatRate(quota.relayRateKbps) })}
             </p>
           )}
+          {unlimitedPeers && <p className="field-hint">{t('account.adminQuotaNote')}</p>}
           {grandfathered && <p className="field-hint">{t('network.grandfatheredPeerCap')}</p>}
         </div>
 
@@ -468,11 +470,42 @@ export function NetworkView(props: NetworkViewProps) {
   // 未传时回落本机读取——沿用 Modal.resolveCloseLabel 的同一 resolveLocale 先例
   const effectiveLocale = locale ?? readUiLocale();
   const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
+  const partsAnchorRef = useRef<HTMLDivElement | null>(null);
 
-  // 切换网络即退出详情：详情属于具体网络
+  // 切换网络即退出详情并收起分项浮层：详情和链接都属于具体网络
   useEffect(() => {
     setDetailNodeId(null);
+    const details = partsAnchorRef.current?.querySelector('details');
+    if (details) details.open = false;
   }, [network.id]);
+
+  // 桌面浮层「分项复制」点击外部或按 Escape 收起
+  useEffect(() => {
+    const closeDetails = (restoreFocus: boolean): void => {
+      const details = partsAnchorRef.current?.querySelector('details');
+      if (!details || !details.open) return;
+      details.open = false;
+      if (restoreFocus) {
+        details.querySelector<HTMLElement>('summary')?.focus();
+      }
+    };
+    const onPointerDown = (event: PointerEvent): void => {
+      const target = event.target as Node | null;
+      if (target && partsAnchorRef.current?.contains(target)) return;
+      closeDetails(false);
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        closeDetails(true);
+      }
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, []);
 
   const members = topology?.members ?? [];
   const links = topology?.links ?? [];
@@ -482,14 +515,13 @@ export function NetworkView(props: NetworkViewProps) {
   const joinedMembers = filterJoinedMembers(members);
   const mismatched = members.filter((m) => m.status === 'mismatch');
   const pending = members.filter((m) => m.status === 'pending');
-  // 席位计数 = 占席位数（authorized + paused + mismatch）/ 设备上限 maxPeers；
-  // 拓扑未首推时回落到网络列表里的 totalDevices / maxPeers
-  const joinedCount = topology !== null ? joinedMembers.length : network.totalDevices;
-  const maxPeers = topology?.network.maxPeers ?? network.maxPeers;
-  const seatsFull = joinedCount >= maxPeers;
-
   // 组限额派生（GC-9）：quota 缺省（App 未接线）时全部增强段不渲染
   const quotaView = quota ?? null;
+  // 席位计数 = 占席位数（authorized + paused + mismatch）/ 实际生效设备上限（网与组取较小值）；
+  // 拓扑未首推时回落到网络列表里的 totalDevices / maxPeers
+  const joinedCount = topology !== null ? joinedMembers.length : network.totalDevices;
+  const maxPeers = effectiveNetworkMaxPeers(topology?.network.maxPeers ?? network.maxPeers, quotaView);
+  const seatsFull = joinedCount >= maxPeers;
   const unlimitedPeers = isQuotaUnlimited(quotaView);
   const monthlyPercent = quotaView !== null ? computeUsagePercent(quotaView.usedMonthlyRelayBytes, quotaView.monthlyRelayQuotaBytes) : null;
   const monthlyLevel = quotaView !== null ? quotaUsageLevel(quotaView.usedMonthlyRelayBytes, quotaView.monthlyRelayQuotaBytes) : 'ok';
@@ -521,8 +553,14 @@ export function NetworkView(props: NetworkViewProps) {
         ui={ui}
         onUi={onUi}
         busy={busy}
-        onBack={() => setDetailNodeId(null)}
-        onSelectDevice={setDetailNodeId}
+        onBack={() => {
+          onUi({ confirmTarget: null });
+          setDetailNodeId(null);
+        }}
+        onSelectDevice={(id) => {
+          onUi({ confirmTarget: null });
+          setDetailNodeId(id);
+        }}
         onMemberAction={onMemberAction}
         onRenameMember={onRenameMember}
         onEditNote={onEditNote}
@@ -562,12 +600,15 @@ export function NetworkView(props: NetworkViewProps) {
             </button>
           </div>
           <p className="invite-hint">{t(network.admissionMode === 'manual' ? 'network.inviteHintManual' : 'network.inviteHint')}</p>
-          <details className="invite-parts">
-            <summary className="invite-parts-summary">{t('network.copyPartsSummary')}</summary>
-            <div className="invite-parts-list">
-              <div className="invite-part-row">
-                <span className="invite-part-label">{t('network.partGatewayUrl')}</span>
-                <code className="invite-part-value mono">{network.gatewayUrl || '—'}</code>
+          <div ref={partsAnchorRef} className="invite-parts-anchor">
+            <details className="invite-parts">
+              <summary className="invite-parts-summary">{t('network.copyPartsSummary')}</summary>
+              <div className="invite-parts-list">
+                <div className="invite-part-row">
+                  <span className="invite-part-label">{t('network.partGatewayUrl')}</span>
+                  <code className="invite-part-value mono" title={network.gatewayUrl || undefined}>
+                    {network.gatewayUrl || '—'}
+                  </code>
                 <button
                   type="button"
                   className="btn ghost"
@@ -579,7 +620,9 @@ export function NetworkView(props: NetworkViewProps) {
               </div>
               <div className="invite-part-row">
                 <span className="invite-part-label">{t('network.partNetworkId')}</span>
-                <code className="invite-part-value mono">{network.id}</code>
+                <code className="invite-part-value mono" title={network.id}>
+                  {network.id}
+                </code>
                 <button
                   type="button"
                   className="btn ghost"
@@ -605,12 +648,17 @@ export function NetworkView(props: NetworkViewProps) {
                   </>
                 )}
               </div>
-              {/* 第 4 项（GC-9）：无头接入 CLI 命令。界面只展示掩码（# 后口令
+              {/* 第 4 项（GC-9）：一键加入命令行。界面只展示掩码（# 后口令
                   换圆点，与 maskInviteUri 同界），复制按钮交完整命令给 App 的
                   分项复制回调——不以明文破坏 joinKey 隐藏约定。 */}
               <div className="invite-part-row">
                 <span className="invite-part-label">{t('network.partHeadlessCommand')}</span>
-                <code className="invite-part-value mono">{maskHeadlessCommand(headlessCommand)}</code>
+                <code
+                  className="invite-part-value mono"
+                  title={maskHeadlessCommand(headlessCommand)}
+                >
+                  {maskHeadlessCommand(headlessCommand)}
+                </code>
                 <button
                   type="button"
                   className="btn ghost"
@@ -622,6 +670,7 @@ export function NetworkView(props: NetworkViewProps) {
               </div>
             </div>
           </details>
+          </div>
         </section>
 
         {/* 第 2 格：身份异常优先，其次加入申请；都没有则空态（无底色） */}
@@ -819,10 +868,14 @@ export function NetworkView(props: NetworkViewProps) {
                     className={`device-row${member.status === 'paused' ? ' is-paused' : ''}`}
                     tabIndex={0}
                     aria-label={displayName(member, t)}
-                    onClick={() => setDetailNodeId(member.nodeId)}
+                    onClick={() => {
+                      onUi({ confirmTarget: null });
+                      setDetailNodeId(member.nodeId);
+                    }}
                     onKeyDown={(event) => {
                       if (event.key === 'Enter' || event.key === ' ') {
                         event.preventDefault();
+                        onUi({ confirmTarget: null });
                         setDetailNodeId(member.nodeId);
                       }
                     }}
@@ -832,47 +885,51 @@ export function NetworkView(props: NetworkViewProps) {
                       {member.note !== null && <div className="device-note">{member.note}</div>}
                     </td>
                     <td className="device-cell-status">
-                      <span className="dot-row">
-                        <span className={`dot ${status.dot}`} aria-hidden="true" />
-                        {status.word}
+                      <span className="status-inline">
+                        <span className="dot-row">
+                          <span className={`dot ${status.dot}`} aria-hidden="true" />
+                          {status.word}
+                        </span>
+                        {lastSeenText !== null && (
+                          <span className="status-last-seen">
+                            · {t('devices.lastSeen', { time: lastSeenText })}
+                          </span>
+                        )}
                       </span>
-                      {lastSeenText !== null && (
-                        <div style={{ marginTop: 2, fontSize: 12, color: 'var(--ink-3)' }}>
-                          {t('devices.lastSeen', { time: lastSeenText })}
-                        </div>
-                      )}
                     </td>
-                    <td className="conn-summary">
-                      {showConn ? (
-                        <>
-                          {relayingNow && (
-                            <span className="conn-chip">
-                              <span className="dot warn" aria-hidden="true" />
-                              {t('devices.relayingNow', { rate: formatRate(member.liveRelayKbps) })}
-                            </span>
-                          )}
-                          {direct > 0 && (
-                            <span className="conn-chip">
-                              <span className="dot ok" aria-hidden="true" />
-                              {t('devices.directCount', { n: direct })}
-                            </span>
-                          )}
-                          {relay > 0 && (
-                            <span className="conn-chip">
-                              <span className="dot warn" aria-hidden="true" />
-                              {t('devices.relayCount', { n: relay })}
-                            </span>
-                          )}
-                          {blocked > 0 && (
-                            <span className="conn-chip">
-                              <span className="dot danger" aria-hidden="true" />
-                              {t('devices.blockedCount', { n: blocked })}
-                            </span>
-                          )}
-                        </>
-                      ) : (
-                        <span className="muted">—</span>
-                      )}
+                    <td className="device-cell-conn">
+                      <div className="conn-summary">
+                        {showConn ? (
+                          <>
+                            {relayingNow && (
+                              <span className="conn-chip">
+                                <span className="dot warn" aria-hidden="true" />
+                                {t('devices.relayingNow', { rate: formatRate(member.liveRelayKbps) })}
+                              </span>
+                            )}
+                            {direct > 0 && (
+                              <span className="conn-chip">
+                                <span className="dot ok" aria-hidden="true" />
+                                {t('devices.directCount', { n: direct })}
+                              </span>
+                            )}
+                            {relay > 0 && (
+                              <span className="conn-chip">
+                                <span className="dot warn" aria-hidden="true" />
+                                {t('devices.relayCount', { n: relay })}
+                              </span>
+                            )}
+                            {blocked > 0 && (
+                              <span className="conn-chip">
+                                <span className="dot danger" aria-hidden="true" />
+                                {t('devices.blockedCount', { n: blocked })}
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
+                      </div>
                     </td>
                     <td className="device-cell-latency mono">{latency}</td>
                     <td className="row-arrow" aria-hidden="true">
