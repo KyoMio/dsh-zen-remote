@@ -128,6 +128,25 @@ export declare function buildKeylessInviteUri(params: {
     tls: boolean;
     networkId: string;
 }): string;
+export type AssembleInviteErrorCode = 'bad-adv-gateway' | 'bad-adv-network-id' | 'bad-adv-join-key';
+/**
+ * Assemble a canonical `zr-net*://` invite URI from split advanced-form parts
+ * (`gatewayAddress` + `networkId` + optional verbatim `joinKey`), reusing
+ * `parseGatewayJoinInput` and `isLoopbackOrPrivateHostname` as the single
+ * source of truth. Leading/trailing whitespace in `joinKey` is preserved
+ * verbatim; lone UTF-16 surrogates are rejected locally as `bad-adv-join-key`.
+ */
+export declare function assembleInviteUri(input: {
+    gatewayAddress: string;
+    networkId: string;
+    joinKey?: string;
+}): {
+    ok: true;
+    inviteUri: string;
+} | {
+    ok: false;
+    code: AssembleInviteErrorCode;
+};
 /** Sign one gateway admission challenge with the node's long-term identity (64-byte signature → 128 hex). */
 export declare function signGatewayChallenge(params: {
     privateKeyHex: string;

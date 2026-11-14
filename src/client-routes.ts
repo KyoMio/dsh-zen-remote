@@ -35,7 +35,7 @@ import type { LogRingEntry } from './log-ring.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js'
-import { buildKeylessInviteUri, isLoopbackOrPrivateHostname, parseGatewayJoinInput } from './peer/crypto.js'
+import { assembleInviteUri, buildKeylessInviteUri, isLoopbackOrPrivateHostname, parseGatewayJoinInput } from './peer/crypto.js'
 import type { PeerEngine, PeerEngineStatus } from './peer/engine.js'
 import type { PeerMemberPath, PeerMemberState } from './peer/engine.js'
 import { responseJson, sameOriginPost } from './http.js'
@@ -1472,6 +1472,36 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           }
           const body = await readJsonBody(req)
           if (route === CLIENT_PEER_JOIN_ROUTE) {
+            if (body.mode === 'advanced') {
+              if (typeof body.gatewayAddress !== 'string') {
+                responseJson(res, 400, { ok: false, error: { code: 'bad-adv-gateway' } })
+                return
+              }
+              if (typeof body.networkId !== 'string') {
+                responseJson(res, 400, { ok: false, error: { code: 'bad-adv-network-id' } })
+                return
+              }
+              if (body.joinKey !== undefined && typeof body.joinKey !== 'string') {
+                responseJson(res, 400, { ok: false, error: { code: 'bad-adv-join-key' } })
+                return
+              }
+              const assembled = assembleInviteUri({
+                gatewayAddress: body.gatewayAddress,
+                networkId: body.networkId,
+                ...(body.joinKey !== undefined ? { joinKey: body.joinKey } : {}),
+              })
+              if (!assembled.ok) {
+                responseJson(res, 400, { ok: false, error: { code: assembled.code } })
+                return
+              }
+              const outcome = await engine.joinNetwork(assembled.inviteUri)
+              if (outcome.ok) {
+                responseJson(res, 200, { ok: true })
+              } else {
+                responseJson(res, 400, { ok: false, error: { code: outcome.code } })
+              }
+              return
+            }
             const rawInput = (stringOrEmpty(body.inviteUri) || stringOrEmpty(body.gatewayUrl)).trim()
             const requestedNetworkId = stringOrEmpty(body.networkId).trim().toLowerCase()
             if (rawInput === '') {

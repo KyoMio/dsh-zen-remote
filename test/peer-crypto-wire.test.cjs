@@ -26,6 +26,7 @@ const {
   formatInviteUri,
   parseGatewayJoinInput,
   buildKeylessInviteUri,
+  assembleInviteUri,
   signGatewayChallenge,
   verifyGatewayChallenge,
   computeJoinKeyProof,
@@ -1023,4 +1024,127 @@ test('PC-12 size: a real dual ACK measures inside the 1200B gateway frame budget
   assert.ok(bytes.length + 28 <= 1200, `dual ACK (${bytes.length}B) + 28B header fits the 1200B frame budget`)
   assert.ok(bytes.length <= 900, `dual ACK measures ${bytes.length}B — ≥272B headroom under the 1172B payload budget`)
   assert.ok(helloBytes.length <= bytes.length, 'HELLO is no larger than ACK')
+})
+
+// ---- PS-4a: backend invite assembler (migrated from check-wizard-ui.mjs) ------
+
+test('PS-4a assembleInviteUri: positive samples round-trip through parseInviteUri', () => {
+  const bare = assembleInviteUri({ gatewayAddress: 'gw.example.com', networkId: '0123456789ABCDEF' })
+  assert.deepEqual(bare, { ok: true, inviteUri: 'zr-net://gw.example.com:19393/0123456789abcdef' })
+  const bareParsed = parseInviteUri(bare.inviteUri)
+  assert.ok(bareParsed !== null)
+  assert.equal(bareParsed.hostname, 'gw.example.com')
+  assert.equal(bareParsed.port, 19393)
+  assert.equal(bareParsed.networkId, '0123456789abcdef')
+  assert.equal(bareParsed.joinKey, undefined)
+  assert.equal(bareParsed.defaultTls, true, 'a public host infers TLS — the peer invite rule')
+
+  const lan = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef' })
+  assert.equal(lan.inviteUri, 'zr-net://10.0.0.1:4088/0123456789abcdef')
+  assert.equal(parseInviteUri(lan.inviteUri)?.defaultTls, false, 'a private host infers plaintext')
+
+  for (const address of ['https://zr.example.com', 'wss://zr.example.com:8443']) {
+    const tls = assembleInviteUri({ gatewayAddress: address, networkId: '0123456789abcdef' })
+    assert.equal(tls.ok, true, address)
+    const parsed = parseInviteUri(tls.inviteUri)
+    assert.equal(parsed?.defaultTls, true, address)
+    assert.equal(parsed?.port, address.includes('8443') ? 8443 : 443, address)
+  }
+
+  for (const address of ['http://zr.example.com:19393', 'ws://zr.example.com']) {
+    const plain = assembleInviteUri({ gatewayAddress: address, networkId: '0123456789abcdef' })
+    assert.equal(plain.ok, true, address)
+    const parsed = parseInviteUri(plain.inviteUri)
+    assert.equal(parsed?.defaultTls, false, address)
+    assert.ok(plain.inviteUri.startsWith('zr-net+insecure://') || plain.inviteUri.startsWith('zr-net://'), address)
+  }
+
+  const v6 = assembleInviteUri({ gatewayAddress: '[FD00::1]:19393', networkId: '0123456789abcdef' })
+  assert.equal(v6.inviteUri, 'zr-net://[FD00::1]:19393/0123456789abcdef')
+  const v6Parsed = parseInviteUri(v6.inviteUri)
+  assert.equal(v6Parsed?.hostname, 'fd00::1')
+  assert.equal(v6Parsed?.defaultTls, false, 'an IPv6 ULA infers plaintext')
+
+  for (const address of ['http://10.0.0.1:4088/', 'http://10.0.0.1:4088/peer/v1/ws']) {
+    const folded = assembleInviteUri({ gatewayAddress: address, networkId: '0123456789abcdef' })
+    assert.equal(folded.ok, true, address)
+    assert.equal(folded.inviteUri, 'zr-net://10.0.0.1:4088/0123456789abcdef', address)
+  }
+
+  const publicPlain = assembleInviteUri({ gatewayAddress: 'http://gw.example.com:19393/', networkId: '0123456789abcdef' })
+  assert.equal(publicPlain.inviteUri, 'zr-net+insecure://gw.example.com:19393/0123456789abcdef')
+  assert.equal(parseInviteUri(publicPlain.inviteUri)?.defaultTls, false)
+
+  const keyed = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 'p@ss word%#中文' })
+  assert.ok(keyed.ok)
+  assert.ok(keyed.inviteUri.includes('#'), 'a join key rides the fragment')
+  assert.ok(!keyed.inviteUri.includes('p@ss word'), 'the raw key never appears in the URI')
+  assert.equal(parseInviteUri(keyed.inviteUri)?.joinKey, 'p@ss word%#中文')
+  const padded = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: ' padded ' })
+  assert.equal(parseInviteUri(padded.inviteUri)?.joinKey, ' padded ', 'leading/trailing spaces are kept')
+
+  const keyless = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: '' })
+  assert.equal(keyless.inviteUri, 'zr-net://10.0.0.1:4088/0123456789abcdef')
+  assert.equal(parseInviteUri(keyless.inviteUri)?.joinKey, undefined)
+})
+
+test('PS-4a assembleInviteUri: malformed parts return typed local error codes', () => {
+  for (const bad of ['', '   ', 'a b', 'host:', 'host:0', 'host:65536', 'host:abc', '::1', '[fd00::1', 'ftp://x', 'host/?x=1', 'host/#frag', '10.0.0.1:4088/0123456789abcdef', 'zr-net://10.0.0.1:4088/0123456789abcdef']) {
+    assert.deepEqual(
+      assembleInviteUri({ gatewayAddress: bad, networkId: '0123456789abcdef' }),
+      { ok: false, code: 'bad-adv-gateway' },
+      bad,
+    )
+  }
+  assert.equal(
+    assembleInviteUri({ gatewayAddress: 'a b', networkId: 'nothex' }).code,
+    'bad-adv-gateway',
+  )
+  for (const bad of ['', 'short', '0123456789abcdef0', 'zz23456789abcdef', '0x123456789abcde', '0123456789abcde ']) {
+    assert.deepEqual(
+      assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: bad }),
+      { ok: false, code: 'bad-adv-network-id' },
+      JSON.stringify(bad),
+    )
+  }
+  assert.deepEqual(
+    assembleInviteUri({ gatewayAddress: 'host:/id', networkId: '0123456789abcdef' }),
+    { ok: false, code: 'bad-adv-gateway' },
+  )
+  const ok = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef' })
+  assert.equal(parseGatewayJoinInput(ok.inviteUri)?.kind, 'invite')
+})
+
+test('PS-4a assembleInviteUri: shape-valid authority still requires valid standard URL', () => {
+  for (const bad of ['[aa]:19393', '[::zz]:19393', '[1.2.3.4]:19393', '999.168.1.10:19393', '10.0.0.256:19393']) {
+    assert.deepEqual(
+      assembleInviteUri({ gatewayAddress: bad, networkId: '0123456789abcdef' }),
+      { ok: false, code: 'bad-adv-gateway' },
+      bad,
+    )
+  }
+  assert.equal(assembleInviteUri({ gatewayAddress: '1.2.3:19393', networkId: '0123456789abcdef' }).ok, true)
+
+  for (const sample of [
+    assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef' }),
+    assembleInviteUri({ gatewayAddress: 'gw.example.com', networkId: '0123456789abcdef' }),
+    assembleInviteUri({ gatewayAddress: '[FD00::1]:19393', networkId: '0123456789abcdef' }),
+    assembleInviteUri({ gatewayAddress: 'https://zr.example.com', networkId: '0123456789abcdef' }),
+  ]) {
+    assert.equal(sample.ok, true)
+    const authority = sample.inviteUri.slice(sample.inviteUri.indexOf('://') + 3).split('/')[0]
+    assert.doesNotThrow(() => new URL(`ws://${authority}`), authority)
+    assert.doesNotThrow(() => new URL(`http://${authority}`), authority)
+  }
+})
+
+test('PS-4a assembleInviteUri: lone UTF-16 surrogate in joinKey fails cleanly without echoing secret', () => {
+  assert.deepEqual(
+    assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 'ok\uD800lone' }),
+    { ok: false, code: 'bad-adv-join-key' },
+  )
+  const refused = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: '\uD800' })
+  assert.equal(JSON.stringify(refused).includes('uD800'), false)
+  const emoji = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 'pass 🔑 word' })
+  assert.equal(parseInviteUri(emoji.inviteUri)?.joinKey, 'pass 🔑 word')
 })

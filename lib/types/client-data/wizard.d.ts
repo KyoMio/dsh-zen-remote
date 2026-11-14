@@ -422,41 +422,7 @@ export declare function derivePeerWizardLights(input: {
     limitReached?: boolean | undefined;
     sync?: PeerSyncReadinessView | undefined;
 }): PeerWizardLights;
-/**
- * PC-15: assembles a full `zr-net…://` invite from the wizard's advanced
- * split-fill (gateway address + 16-hex network ID + optional passphrase) so
- * the join flow can reuse the EXISTING invite branch unchanged.
- *
- * This module rides in the browser bundle, so it CANNOT import
- * src/peer/crypto.ts (node:crypto). Everything below is a hand mirror of
- * that module's parsing rules — `parseGatewayJoinInput` for the address
- * grammar and scheme handling, `parseInviteAuthority` for host[:port],
- * `isLoopbackOrPrivateHostname` for the private/public inference, and
- * `buildKeylessInviteUri`'s scheme table — with
- * `scripts/check-wizard-ui.mjs` round-tripping positive samples through the
- * REAL parser so the two cannot drift. No cryptography is duplicated: the
- * join key is opaque text, percent-encoded and decoded by the existing
- * parser on the consuming side.
- */
 export type PeerAdvancedJoinError = 'bad-adv-gateway' | 'bad-adv-network-id' | 'bad-adv-join-key';
-/**
- * Assemble the invite. The network ID is normalized to lowercase (the same
- * normalization parseInviteUri applies); the passphrase rides verbatim — no
- * trimming, every typed character is meaningful, and the empty string means
- * NO key (the byte-equivalent of the route's own keyless manual-approval
- * invite). A malformed part is refused locally; the caller never sends it.
- */
-export declare function assemblePeerInviteUri(input: {
-    gatewayAddress: string;
-    networkId: string;
-    joinKey?: string;
-}): {
-    ok: true;
-    inviteUri: string;
-} | {
-    ok: false;
-    error: PeerAdvancedJoinError;
-};
 /** Pairing-code countdown, whole seconds, never negative. */
 export declare function pairingSecondsLeft(expiresAt: number, now: number): number;
 /**
