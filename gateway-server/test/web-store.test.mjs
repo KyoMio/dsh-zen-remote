@@ -954,12 +954,12 @@ describe('clipboard：非安全上下文 HTTP 剪贴板回退（回归修复）'
 
   test('HTTP 部署下 navigator.clipboard 为 undefined 时，不抛 TypeError 并自动走 execCommand("copy")', async () => {
     const mock = makeMockDoc(true);
-    const ok = await copyTextToClipboard('zr-net+insecure://203.0.113.10:19393/0123456789abcdef#secret', {
+    const ok = await copyTextToClipboard('zr-net://203.0.113.10:19393/0123456789abcdef?tls=0#secret', {
       navigator: {}, // 非安全上下文：navigator.clipboard === undefined
       document: mock.doc,
     });
     assert.equal(ok, true);
-    assert.equal(mock.getCopied(), 'zr-net+insecure://203.0.113.10:19393/0123456789abcdef#secret');
+    assert.equal(mock.getCopied(), 'zr-net://203.0.113.10:19393/0123456789abcdef?tls=0#secret');
     assert.equal(mock.appended.length, 1);
     assert.equal(mock.removed.length, 1);
     assert.equal(mock.isFocusRestored(), true);

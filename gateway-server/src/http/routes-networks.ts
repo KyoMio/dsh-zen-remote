@@ -3,9 +3,11 @@
 // 租户数据隔离：所有接口严格校验 network.ownerId === 当前用户 id——admin 也只
 // 管理自己名下的网络，他人网络一律 404（防枚举），不做「admin 可见全网」。
 //
-// joinUri 拼装：`zr-net://<publicHost>/<networkId>#<joinKey>`，publicHost 优先取
-// config.publicUrl 的 host:port（反代后的对外可达地址），缺省取请求 Host 头。
-// 明文 joinKey 只在归属者视角的响应里出现，库中永远是 AES-256-GCM 密文。
+// joinUri 拼装：`zr-net://<publicHost>/<networkId>[?tls=0|1]#<joinKey>`，publicHost
+// 优先取 config.publicUrl 的 host:port（反代后的对外可达地址），缺省取请求 Host 头。
+// GC-1b：一律 `zr-net://`，传输方式只在偏离主机默认推断时以 `?tls=0|1` 附加
+// （与插件端 `src/peer/crypto.ts` 的统一规则对称）。明文 joinKey 只在归属者
+// 视角的响应里出现，库中永远是 AES-256-GCM 密文。
 import { randomBytes } from 'node:crypto';
 
 import { decryptSecret, encryptSecret } from '../master-key.js';
@@ -30,6 +32,7 @@ function generateJoinKey(): string {
 function isLoopbackOrPrivateHostname(hostname: string): boolean {
   const h = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1).toLowerCase() : hostname.toLowerCase();
   if (h === 'localhost' || h === '::1') return true;
+  if (h.endsWith('.local') || h.endsWith('.lan')) return true; // mDNS 名 / 家用路由后缀（与 src/peer/crypto.ts 对齐）
   const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
   if (v4 !== null) {
     const a = Number(v4[1]);
@@ -56,33 +59,44 @@ function extractHostname(hostHeader: string): string {
 }
 
 /**
- * 解析邀请链接的协议头与 authority（对齐插件端 `parseInviteUri` 的默认端口 19393 与公私网 TLS 推断）：
- * - 配置了 `publicUrl` 时：严格遵循其 `https:` / `http:` 协议；若未显式写端口（如反代 443/80），补齐默认端口，
- *   防止节点端把无端口邀请链接误回落到 19393；
- * - 未配 `publicUrl` 时：从 `X-Forwarded-Proto` 与 `Host` 推断；公网 IP 直连跑明文 HTTP（如 Docker 19393 裸跑）
- *   时发出 `zr-net+insecure://`，避免节点端把公网地址误走 `wss://` 握手失败；私网/回环继续保持简短 `zr-net://`。
+ * 拼装 joinUri 的各段（GC-1b：与插件端 `parseInviteUri` / `formatInviteUri` 的统一规则完全对称——
+ * 协议头一律 `zr-net://`，传输方式只在偏离主机默认推断时以 `?tls=0|1` 附加）：
+ * - 主机默认推断（`isLoopbackOrPrivateHostname`）：回环、RFC1918 私网 IPv4、RFC4193 ULA /
+ *   RFC4291 Link-Local IPv6、Tailscale CGNAT（100.64.0.0/10）与 `.local` / `.lan` 后缀视为内网
+ *   （默认明文）；其余公网地址默认 TLS——公网路径需要反代证书才有意义；
+ * - 配置了 `publicUrl` 时：严格遵循其 `https:` / `http:` 协议为实际传输；若未显式写端口
+ *   （如反代 443/80），补齐默认端口，防止节点端把无端口邀请链接误回落到 19393（`zr-net://`
+ *   省略 `:port` 一律默认 19393）；
+ * - 未配 `publicUrl` 时：从 `X-Forwarded-Proto` 与 `Host` 推断实际传输。
+ * 实际传输与主机默认一致时不带 query；相反时附 `?tls=0` 或 `?tls=1`。
  */
 function buildJoinEndpoint(ctx: RouteContext): {
-  scheme: 'zr-net' | 'zr-nets' | 'zr-net+insecure';
+  scheme: 'zr-net';
   authority: string;
   gatewayUrl: string;
+  query: string;
 } {
+  let isTls: boolean;
+  let isPrivate: boolean;
+  let authority: string;
+  let gatewayUrl: string;
   if (ctx.config.publicUrl !== undefined) {
     const pub = new URL(ctx.config.publicUrl);
-    const isTls = pub.protocol === 'https:';
-    const isPrivate = isLoopbackOrPrivateHostname(pub.hostname);
-    const authority = pub.port !== '' ? pub.host : `${pub.hostname}:${isTls ? '443' : '80'}`;
-    const scheme = isTls ? (isPrivate ? 'zr-nets' : 'zr-net') : (isPrivate ? 'zr-net' : 'zr-net+insecure');
-    return { scheme, authority, gatewayUrl: pub.origin };
+    isTls = pub.protocol === 'https:';
+    isPrivate = isLoopbackOrPrivateHostname(pub.hostname);
+    authority = pub.port !== '' ? pub.host : `${pub.hostname}:${isTls ? '443' : '80'}`;
+    gatewayUrl = pub.origin;
+  } else {
+    authority = ctx.req.headers['host'] ?? '';
+    const hostname = extractHostname(authority);
+    const forwardedProto = String(ctx.req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim().toLowerCase();
+    isTls = forwardedProto === 'https';
+    isPrivate = hostname === '' || isLoopbackOrPrivateHostname(hostname);
+    gatewayUrl = authority !== '' ? `${isTls ? 'https' : 'http'}://${authority}` : '';
   }
-  const authority = ctx.req.headers['host'] ?? '';
-  const hostname = extractHostname(authority);
-  const forwardedProto = String(ctx.req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim().toLowerCase();
-  const isTls = forwardedProto === 'https';
-  const isPrivate = hostname === '' || isLoopbackOrPrivateHostname(hostname);
-  const scheme = isTls ? (isPrivate ? 'zr-nets' : 'zr-net') : (isPrivate ? 'zr-net' : 'zr-net+insecure');
-  const gatewayUrl = authority !== '' ? `${isTls ? 'https' : 'http'}://${authority}` : '';
-  return { scheme, authority, gatewayUrl };
+  const inferredTls = !isPrivate;
+  const query = isTls === inferredTls ? '' : isTls ? '?tls=1' : '?tls=0';
+  return { scheme: 'zr-net', authority, gatewayUrl, query };
 }
 
 function parseName(value: unknown): string {
@@ -131,7 +145,7 @@ async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<R
     maxPeers: network.maxPeers,
     createdAt: network.createdAt,
     joinKey,
-    joinUri: `${endpoint.scheme}://${endpoint.authority}/${network.id}#${joinKey}`,
+    joinUri: `${endpoint.scheme}://${endpoint.authority}/${network.id}${endpoint.query}#${joinKey}`,
     gatewayUrl: endpoint.gatewayUrl,
     onlineDevices: ctx.runtime.getOnlineCountByNetwork(network.id),
     totalDevices,
