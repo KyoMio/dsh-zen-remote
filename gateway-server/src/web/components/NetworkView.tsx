@@ -8,7 +8,7 @@
 // 确认与输入中的草稿不会被实时推送冲掉。
 import { useEffect, useState } from 'react';
 
-import type { TranslateFn } from '../i18n/locales';
+import type { LocaleKey, TranslateFn } from '../i18n/locales';
 import { classifyLinkPath, displayName, filterJoinedMembers, formatLatencyRange, formatRate, maskInviteUri, memberStatusView, relativeText, relativeTime } from '../format';
 import { Modal } from './Modal';
 import { DeviceDetail } from './DeviceDetail';
@@ -39,6 +39,8 @@ export interface NetworkViewProps {
   busy: boolean;
   /** 复制完整邀请链接（App 负责剪贴板与 Toast） */
   onCopyInvite: () => void;
+  /** 分项复制（网关地址 / 网络 ID / 入网口令） */
+  onCopyField?: (value: string, toastKey: LocaleKey) => void;
   onPatchNetwork: (patch: NetworkPatchInput) => void;
   onDeleteNetwork: () => void;
   onRotateInviteKey: () => void;
@@ -277,6 +279,7 @@ export function NetworkView(props: NetworkViewProps) {
     onUi,
     busy,
     onCopyInvite,
+    onCopyField,
     onPatchNetwork,
     onDeleteNetwork,
     onRotateInviteKey,
@@ -364,6 +367,51 @@ export function NetworkView(props: NetworkViewProps) {
             </button>
           </div>
           <p className="invite-hint">{t(network.admissionMode === 'manual' ? 'network.inviteHintManual' : 'network.inviteHint')}</p>
+          <details className="invite-parts">
+            <summary className="invite-parts-summary">{t('network.copyPartsSummary')}</summary>
+            <div className="invite-parts-list">
+              <div className="invite-part-row">
+                <span className="invite-part-label">{t('network.partGatewayUrl')}</span>
+                <code className="invite-part-value mono">{network.gatewayUrl || '—'}</code>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  disabled={!network.gatewayUrl}
+                  onClick={() => onCopyField?.(network.gatewayUrl, 'toast.gatewayUrlCopied')}
+                >
+                  {t('common.copy')}
+                </button>
+              </div>
+              <div className="invite-part-row">
+                <span className="invite-part-label">{t('network.partNetworkId')}</span>
+                <code className="invite-part-value mono">{network.id}</code>
+                <button
+                  type="button"
+                  className="btn ghost"
+                  onClick={() => onCopyField?.(network.id, 'toast.networkIdCopied')}
+                >
+                  {t('common.copy')}
+                </button>
+              </div>
+              <div className="invite-part-row">
+                <span className="invite-part-label">{t('network.partJoinPassphrase')}</span>
+                {network.admissionMode === 'manual' ? (
+                  <span className="invite-part-note">{t('network.partPassphraseManualNote')}</span>
+                ) : (
+                  <>
+                    <code className="invite-part-value mono">••••••••••••</code>
+                    <button
+                      type="button"
+                      className="btn ghost"
+                      onClick={() => onCopyField?.(network.joinKey, 'toast.joinPassphraseCopied')}
+                    >
+                      {t('common.copy')}
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </details>
         </section>
 
         {/* 第 2 格：身份异常优先，其次加入申请；都没有则空态（无底色） */}
