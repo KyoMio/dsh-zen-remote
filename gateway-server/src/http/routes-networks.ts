@@ -21,7 +21,6 @@ import type {
   NetworkRecord,
   TransitionAction,
 } from '../store/types.js';
-import { SEAT_OCCUPYING_STATUSES } from '../store/types.js';
 
 const ADMISSION_MODES: readonly AdmissionMode[] = ['key', 'manual', 'both'];
 
@@ -285,24 +284,20 @@ async function handleMemberTransition(
 ): Promise<void> {
   const user = await requireUser(ctx);
   const networkId = params['id'] ?? '';
-  const network = await loadOwnedNetwork(ctx, user.id, networkId);
+  await loadOwnedNetwork(ctx, user.id, networkId);
   const nodeId = params['nodeId'] ?? '';
-  // GC-3：普通用户批准 pending 成员会新增占席位——有效席位上限取
-  // min(网络容量, 组 maxPeersPerNetwork)。占席内的迁移（resume / repin /
-  // 幂等 approve）与祖父超额存量的既有成员不受影响；admin 不受限。
+  // GC-3 / GC-fix-batch1 R1：普通用户批准 pending 成员会新增占席位——有效席位上限
+  // 取 min(网络容量, 组 maxPeersPerNetwork)，经 maxPeersCap 交给 store 在同一事务内
+  // 原子判定（并发 POST /approve 的 TOCTOU 超限在事务里被挡，满额抛 409 LIMIT_REACHED）。
+  // 占席内的迁移（resume / repin / 幂等 approve）与祖父超额存量不受影响；admin 拥有的
+  // 网络传 undefined 豁免组上限。loadOwnedNetwork 已保证 network.ownerId === user.id，
+  // user.role 即网络拥有者角色。
+  let maxPeersCap: number | undefined;
   if (action === 'approve' && user.role !== 'admin') {
-    const members = await ctx.store.listMembers(networkId);
-    const target = members.find((m) => m.nodeId === nodeId);
-    if (target !== undefined && target.status === 'pending') {
-      const quota = await ctx.store.resolveEffectiveUserQuota(user.id);
-      const effectiveMax = Math.min(network.maxPeers, quota.group.maxPeersPerNetwork);
-      const occupying = members.filter((m) => SEAT_OCCUPYING_STATUSES.includes(m.status)).length;
-      if (occupying >= effectiveMax) {
-        throw new ApiError(409, 'LIMIT_REACHED', 'network member limit reached');
-      }
-    }
+    const quota = await ctx.store.resolveEffectiveUserQuota(user.id);
+    maxPeersCap = quota.group.maxPeersPerNetwork;
   }
-  const member: MemberRecord = await ctx.store.transitionMemberStatus(networkId, nodeId, action);
+  const member: MemberRecord = await ctx.store.transitionMemberStatus(networkId, nodeId, action, maxPeersCap);
   await runHook(ctx.hooks.onMemberChanged, {
     networkId: member.networkId,
     nodeId: member.nodeId,

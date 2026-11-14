@@ -11,7 +11,7 @@ import type { SmtpSecurityMode } from '../mail/smtp-client.js';
 import { renderSmtpTestEmail } from '../mail/templates.js';
 import type { MailLocale } from '../mail/templates.js';
 import { generatePassword, hashPassword } from '../master-key.js';
-import { DEFAULT_GROUP_ID, validateGroupInput } from '../store/types.js';
+import { validateGroupInput } from '../store/types.js';
 import type {
   AdminUserPatch,
   CreateUserGroupInput,
@@ -441,11 +441,20 @@ async function handlePatchGroup(ctx: RouteContext, params: Record<string, string
       patch.monthlyRelayQuotaBytes !== undefined ? patch.monthlyRelayQuotaBytes : current.monthlyRelayQuotaBytes,
   });
 
+  // SPEC 5.4.4：任意组（含非默认组）的配额字段实际发生变更都要通知实时层刷新配额快照，
+  // 属主在线节点的速率 / 月度门禁才能立即跟随新值；仅改名称等非配额字段不触发
+  const quotaTouched =
+    (patch.maxNetworks !== undefined && patch.maxNetworks !== current.maxNetworks) ||
+    (patch.maxPeersPerNetwork !== undefined && patch.maxPeersPerNetwork !== current.maxPeersPerNetwork) ||
+    (patch.relayRateKbps !== undefined && patch.relayRateKbps !== current.relayRateKbps) ||
+    (patch.monthlyRelayQuotaBytes !== undefined && patch.monthlyRelayQuotaBytes !== current.monthlyRelayQuotaBytes);
   const updated = await ctx.store.updateUserGroup(id, patch); // 不存在 → 404 GROUP_NOT_FOUND
   if (current.isDefault || patch.isDefault === true) {
     // 更新了默认组（三项配额同事务回写 system_settings）或切换了默认组
     await runHook(ctx.hooks.onSettingsChanged, await ctx.store.getSettings());
-    await runHook(ctx.hooks.onQuotaChanged);
+  }
+  if (current.isDefault || patch.isDefault === true || quotaTouched) {
+    await runHook(ctx.hooks.onQuotaChanged); // 无条件通知 hub 刷新所有在线节点配额
   }
   sendOk(ctx.res, await groupRowWithCount(ctx, updated));
 }
@@ -510,16 +519,22 @@ function parseGroupExpiresAt(value: unknown): string | null {
   throw new ApiError(400, 'INVALID_REQUEST', 'groupExpiresAt must be an ISO timestamp or null');
 }
 
-/** groupId / groupCode 的公共解析：groupId 显式优先，groupCode 经编码查找；组不存在 → 404 */
-async function resolveTargetGroupId(ctx: RouteContext, body: Record<string, unknown>): Promise<string | undefined> {
+/**
+ * groupId / groupCode 的公共解析：groupId 显式优先，groupCode 经编码查找；组不存在 → 404。
+ * 返回 null（GC-fix-batch1 R3）= 绑定当前 is_default 组：交给 store 在事务内解析
+ * （当前默认组可能与 grp_default 不同），这里绝不硬编码 DEFAULT_GROUP_ID；
+ * undefined = 未传，不动用户的组。
+ */
+async function resolveTargetGroupId(ctx: RouteContext, body: Record<string, unknown>): Promise<string | null | undefined> {
   if (body['groupId'] !== undefined) {
-    if (body['groupId'] === null) return DEFAULT_GROUP_ID; // null = 复位回默认组
+    if (body['groupId'] === null) return null; // null = 绑定当前默认组（store 事务内解析）
     if (typeof body['groupId'] !== 'string') {
       throw new ApiError(400, 'INVALID_REQUEST', 'groupId must be a string or null');
     }
     return body['groupId'];
   }
   if (body['groupCode'] !== undefined) {
+    if (body['groupCode'] === null) return null;
     const code = requireStringField(body, 'groupCode');
     const group = await ctx.store.getUserGroupByCode(code);
     if (group === null) {

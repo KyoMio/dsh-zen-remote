@@ -1713,6 +1713,36 @@ describe('GC-6a 用户组管理 /admin/groups CRUD', () => {
     assert.equal(settings.relayRateKbps, 131072);
   });
 
+  test('GC-fix-batch1 R3：修改非默认组配额 → onQuotaChanged 触发且不误触 onSettingsChanged', async () => {
+    // 此 describe 的时序里默认组是 premium 组（spareGroupId）；新建一个非默认组再改它的配额
+    const grp = await api(handle.base, 'POST', '/api/v1/admin/groups', {
+      cookie: adminCookie,
+      body: { code: 'nondef', name: 'NonDefault', maxNetworks: 2, maxPeersPerNetwork: 4, relayRateKbps: 64 },
+    });
+    assert.equal(grp.status, 200);
+    const gid = grp.json.data.id;
+    assert.equal(grp.json.data.isDefault, false);
+    const settingsBefore = handle.hooks.settingsChanged.length;
+    const quotaBefore = handle.hooks.quotaChanged.length;
+    const patched = await api(handle.base, 'PATCH', `/api/v1/admin/groups/${gid}`, {
+      cookie: adminCookie,
+      body: { maxPeersPerNetwork: 6, relayRateKbps: 128 },
+    });
+    assert.equal(patched.status, 200);
+    assert.equal(patched.json.data.maxPeersPerNetwork, 6);
+    assert.equal(handle.hooks.quotaChanged.length, quotaBefore + 1, '非默认组配额变更必须触发 onQuotaChanged');
+    assert.ok(handle.hooks.quotaChanged.slice(quotaBefore).includes(null), '全量失效通知');
+    assert.equal(handle.hooks.settingsChanged.length, settingsBefore, '非默认组变更不得触发 onSettingsChanged');
+    // 仅改名称不触发配额刷新
+    const quotaBeforeRename = handle.hooks.quotaChanged.length;
+    const renamed = await api(handle.base, 'PATCH', `/api/v1/admin/groups/${gid}`, {
+      cookie: adminCookie,
+      body: { name: 'NonDefault v2' },
+    });
+    assert.equal(renamed.status, 200);
+    assert.equal(handle.hooks.quotaChanged.length, quotaBeforeRename, '名称变更不属于配额变更');
+  });
+
   test('DELETE 保护：默认组 400（检查优先于引用）/ 非默认有引用 409 / 空组成功', async () => {
     // 前序测试已把默认组切到 premium 组：删除当前默认组 → 400 CANNOT_DELETE_DEFAULT_GROUP
     const defDel = await api(handle.base, 'DELETE', `/api/v1/admin/groups/${spareGroupId}`, { cookie: adminCookie });
@@ -1844,6 +1874,45 @@ describe('GC-6a 用户管理 /admin/users CRUD 与密码重置', () => {
     assert.equal(reset.json.data.groupExpiresAt, null);
   });
 
+  test('GC-fix-batch1 R3：切换默认组后 groupId/groupCode null 绑定新默认组（而非 grp_default）', async () => {
+    const grp = await api(handle.base, 'POST', '/api/v1/admin/groups', {
+      cookie: adminCookie,
+      body: { code: 'newdef', name: 'New Default', isDefault: true, maxNetworks: 5, maxPeersPerNetwork: 5, relayRateKbps: 64 },
+    });
+    assert.equal(grp.status, 200);
+    const newDefId = grp.json.data.id;
+    assert.notEqual(newDefId, 'grp_default');
+
+    // PATCH groupId: null → 新默认组
+    const byId = await api(handle.base, 'PATCH', `/api/v1/admin/users/${tenantId}`, {
+      cookie: adminCookie,
+      body: { groupId: null },
+    });
+    assert.equal(byId.status, 200);
+    assert.equal(byId.json.data.groupId, newDefId);
+    // PATCH groupCode: null → 新默认组
+    const byCode = await api(handle.base, 'PATCH', `/api/v1/admin/users/${tenantId}`, {
+      cookie: adminCookie,
+      body: { groupCode: null },
+    });
+    assert.equal(byCode.status, 200);
+    assert.equal(byCode.json.data.groupId, newDefId);
+    // POST 新用户 groupId: null → 新默认组
+    const created = await api(handle.base, 'POST', '/api/v1/admin/users', {
+      cookie: adminCookie,
+      body: { email: 'nulldef@local', password: 'nulldef-pass-1', groupId: null },
+    });
+    assert.equal(created.status, 200);
+    assert.equal(created.json.data.groupId, newDefId);
+
+    // 还原默认组，避免影响后续用例
+    const restore = await api(handle.base, 'PATCH', '/api/v1/admin/groups/grp_default', {
+      cookie: adminCookie,
+      body: { isDefault: true },
+    });
+    assert.equal(restore.status, 200);
+  });
+
   test('自我保护：CANNOT_DISABLE_SELF / CANNOT_DEMOTE_SELF / CANNOT_DELETE_SELF', async () => {
     const disable = await api(handle.base, 'PATCH', `/api/v1/admin/users/${adminId}`, {
       cookie: adminCookie,
@@ -1959,6 +2028,73 @@ describe('GC-6a publicUrl 热更新（settings 优先级最高，立即生效）
       const rtAfter = await api(h.base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
       assert.equal(rtAfter.json.data.publicUrlSource, 'settings');
       assert.equal(rtAfter.json.data.publicUrlEffective, 'https://gw.new.example.com');
+    } finally {
+      await stopServer(h);
+    }
+  });
+});
+
+describe('GC-fix-batch1 R1：POST /approve 遵守用户组每网设备上限', () => {
+  test('普通用户网络 maxPeers=4 但组上限 2：第 3 台 approve → 409 LIMIT_REACHED；admin 网络豁免', async () => {
+    const h = await startServer();
+    try {
+      const { tenantId, adminId } = await seedUsers(h.store);
+      const tiny = await h.store.createUserGroup({
+        code: 'r1tiny', name: 'Tiny', maxNetworks: 4, maxPeersPerNetwork: 2, relayRateKbps: 2048,
+      });
+      await h.store.updateUserByAdmin(tenantId, { groupId: tiny.id });
+      // 祖父存量形态：网络容量 4 大于组上限 2（绕过 REST 建网校验，直经 store 造）
+      const net = await h.store.createNetwork({
+        ownerId: tenantId, name: 'r1-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 4,
+      });
+      await seedMember(h.store, net.id, 'd1aaaaaa', 'authorized');
+      await seedMember(h.store, net.id, 'd2aaaaaa', 'authorized');
+      await seedMember(h.store, net.id, 'd3aaaaaa', 'pending');
+      const tenantCookie = await login(h.base, TENANT_EMAIL, TENANT_PASSWORD);
+      const res = await api(h.base, 'POST', `/api/v1/networks/${net.id}/members/d3aaaaaa/approve`, {
+        cookie: tenantCookie,
+        body: {},
+      });
+      assert.equal(res.status, 409);
+      assertEnvelopeError(res.json, 'LIMIT_REACHED');
+      const still = (await h.store.listMembers(net.id)).find((m) => m.nodeId === 'd3aaaaaa');
+      assert.equal(still.status, 'pending', '被拒的 approve 不得改变成员状态');
+
+      // admin 属主的网络无组上限约束：2 席内正常批准
+      const adminNet = await h.store.createNetwork({
+        ownerId: adminId, name: 'r1-admin-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 2,
+      });
+      await seedMember(h.store, adminNet.id, 'd4aaaaaa', 'authorized');
+      await seedMember(h.store, adminNet.id, 'd5aaaaaa', 'pending');
+      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const ok = await api(h.base, 'POST', `/api/v1/networks/${adminNet.id}/members/d5aaaaaa/approve`, {
+        cookie: adminCookie,
+        body: {},
+      });
+      assert.equal(ok.status, 200);
+      assert.equal(ok.json.data.member.status, 'authorized');
+    } finally {
+      await stopServer(h);
+    }
+  });
+});
+
+describe('GC-fix-batch1 R3：/admin/runtime 在未注入 runtimeMeta 时安全', () => {
+  test('meta 缺省 → 200 保守值（端口 0、sqlite/file、request 推断入口），不抛异常', async () => {
+    const h = await startServer(); // 不传 runtimeMeta
+    try {
+      await seedUsers(h.store);
+      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const res = await api(h.base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
+      assert.equal(res.status, 200);
+      const data = res.json.data;
+      assert.equal(data.listenPort, 0);
+      assert.equal(data.udpPort, 0);
+      assert.equal(data.udpAltPort, 0);
+      assert.equal(data.storageDriver, 'sqlite');
+      assert.equal(data.secretSource, 'file');
+      assert.equal(data.publicUrlSource, 'request');
+      assert.ok(data.securityWarnings.includes('UDP_ALT_DISABLED'), '辅助口未确认启用时的保守告警');
     } finally {
       await stopServer(h);
     }

@@ -1133,6 +1133,64 @@ describe('SqliteStore GC-2 扩展', () => {
     }
   });
 
+  test('GC-fix-batch1 R1：maxPeersCap 压低入网与 approve 的有效席位上限（低于网络 maxPeers 时原子拒绝）', async () => {
+    const store = freshStore({ allowSignup: false, maxNetworksPerUser: 3, defaultMaxPeers: 8, relayRateKbps: 512 });
+    try {
+      const admin = await store.createUser({ email: 'cap-admin@local', passwordHash: 'h', role: 'admin' });
+      // 网络容量 4，调用方压入 maxPeersCap=2（非管理员属主的组上限场景）
+      const net = await store.createNetwork({ ownerId: admin.id, name: 'cap-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 4 });
+      const attempt = (nodeId, matched, cap) =>
+        store.upsertMemberJoinAttempt({
+          networkId: net.id,
+          nodeId,
+          name: `node-${nodeId}`,
+          publicKeyHex: `${nodeId}pub`,
+          joinKeyMatched: matched,
+          ...(cap !== undefined ? { maxPeersCap: cap } : {}),
+        });
+      assert.equal((await attempt('caaaaaaa', true, 2))?.status, 'authorized');
+      assert.equal((await attempt('cbbbbbbb', true, 2))?.status, 'authorized');
+      // 第 3 台持有效口令：cap=2 已满 → limit-reached（网络自身 4 席并未满）
+      await rejectsCode(attempt('cccccccc', true, 2), 'limit-reached');
+      // manual 路径仍 pending（不占席），但 approve 在同一事务内受 cap 拒绝
+      assert.equal((await attempt('cccccccc', false))?.status, 'pending');
+      await rejectsCode(store.transitionMemberStatus(net.id, 'cccccccc', 'approve', 2), 'limit-reached');
+      // pending 补交有效口令直升 authorized 的路径同样受 cap 拦截
+      assert.equal((await attempt('cddddddd', false))?.status, 'pending');
+      await rejectsCode(attempt('cddddddd', true, 2), 'limit-reached');
+      // 不传 cap：网络自身 4 席照常生效（既有行为不变）
+      assert.equal((await store.transitionMemberStatus(net.id, 'cccccccc', 'approve'))?.status, 'authorized');
+      assert.equal((await attempt('cddddddd', true))?.status, 'authorized');
+      await rejectsCode(attempt('ceeeeeee', true), 'limit-reached');
+    } finally {
+      await store.close();
+    }
+  });
+
+  test('GC-fix-batch1 R3：groupId null 绑定当前活跃默认组——切换默认组后 createUser / updateUserByAdmin 跟随新默认组', async () => {
+    const store = freshStore({ allowSignup: false, maxNetworksPerUser: 3, defaultMaxPeers: 8, relayRateKbps: 512 });
+    try {
+      const vip = await store.createUserGroup({ code: 'r3vip', name: 'VIP', isDefault: true, maxNetworks: 5, maxPeersPerNetwork: 5, relayRateKbps: 64 });
+      assert.equal(vip.isDefault, true);
+      assert.equal((await store.getUserGroupByCode('default'))?.isDefault, false);
+      // createUser 显式 null 与缺省一样绑定当前活跃默认组（vip，而非 grp_default）
+      const byNull = await store.createUser({ email: 'r3-null@local', passwordHash: 'h', role: 'user', groupId: null });
+      assert.equal(byNull.groupId, vip.id);
+      const byUndefined = await store.createUser({ email: 'r3-undef@local', passwordHash: 'h', role: 'user' });
+      assert.equal(byUndefined.groupId, vip.id);
+      // updateUserByAdmin groupId null 同样绑定当前活跃默认组；undefined 保持原值
+      const member = await store.createUser({ email: 'r3-member@local', passwordHash: 'h', role: 'user', groupId: 'grp_default' });
+      assert.equal((await store.updateUserByAdmin(member.id, { groupId: null })).groupId, vip.id);
+      assert.equal((await store.updateUserByAdmin(member.id, { emailVerifiedAt: '2026-11-14T00:00:00.000Z' })).groupId, vip.id);
+      // 默认组切回 grp_default 后，null 跟随最新默认组
+      const def = await store.getUserGroupByCode('default');
+      await store.updateUserGroup(def.id, { isDefault: true });
+      assert.equal((await store.updateUserByAdmin(member.id, { groupId: null })).groupId, def.id);
+    } finally {
+      await store.close();
+    }
+  });
+
   test('last-admin：停用/降级/删除唯一活跃管理员全部拦截；有两个活跃管理员时可操作其一', async () => {
     const store = freshStore();
     try {
@@ -1698,6 +1756,74 @@ describe('PgStore contract (mock query)', () => {
     const pg = new PgStore(q);
     await rejectsCode(pg.transitionMemberStatus('net1', 'p1', 'repin'), 'invalid-transition');
     assert.deepEqual(q.txStatements(), ['BEGIN', 'ROLLBACK']);
+  });
+
+  test('GC-fix-batch1 R1：maxPeersCap 压低容量判定（SQL 查询次数与顺序不变）', async () => {
+    // upsert：网络 max_peers=4、cap=2、占席 2 → 第 3 台 limit-reached；除业务行外无新增查询
+    const q = mockQuery([
+      [/FROM networks WHERE id = .*FOR UPDATE/, [{ id: 'net1', admission_mode: 'key', max_peers: 4 }]],
+      [/FROM network_members WHERE network_id = \$1 AND node_id = \$2$/, []],
+      [/COUNT\(\*\).*FROM network_members/, [{ count: '2' }]],
+    ]);
+    await rejectsCode(
+      new PgStore(q).upsertMemberJoinAttempt({ networkId: 'net1', nodeId: 'abcd1234', publicKeyHex: 'p', joinKeyMatched: true, maxPeersCap: 2 }),
+      'limit-reached',
+    );
+    assert.deepEqual(q.txStatements(), ['BEGIN', 'ROLLBACK']);
+    assert.equal(q.dataCalls().length, 3, '不得新增 SELECT users 等查询（严格序列契约）');
+    assert.match(q.dataCalls()[0].sql, /FROM networks WHERE id = \$1 FOR UPDATE/);
+    assert.match(q.dataCalls()[1].sql, /FROM network_members WHERE network_id = \$1 AND node_id = \$2$/);
+    assert.match(q.dataCalls()[2].sql, /COUNT\(\*\).*FROM network_members/);
+
+    const pendingRow = {
+      network_id: 'net1', node_id: 'p2', name: 'n', note: null,
+      status: 'pending', public_key_hex: 'pub', candidate_public_key_hex: null,
+      last_ip: null, nat_type: 'unknown', cumulative_relay_bytes: '0', last_seen_at: null, created_at: NOW,
+    };
+    // transition：cap=2、占席 2 → limit-reached（回滚），同样只有 3 条业务查询
+    const q2 = mockQuery([
+      [/FROM networks WHERE id = .*FOR UPDATE/, [{ id: 'net1', max_peers: 4 }]],
+      [/FROM network_members WHERE network_id = \$1 AND node_id = \$2$/, [pendingRow]],
+      [/COUNT\(\*\).*FROM network_members/, [{ count: '2' }]],
+    ]);
+    await rejectsCode(new PgStore(q2).transitionMemberStatus('net1', 'p2', 'approve', 2), 'limit-reached');
+    assert.deepEqual(q2.txStatements(), ['BEGIN', 'ROLLBACK']);
+    assert.equal(q2.dataCalls().length, 3);
+    // cap=3（低于网络 4、高于占席 2）→ 放行，UPDATE 与提交顺序照旧
+    const q3 = mockQuery([
+      [/FROM networks WHERE id = .*FOR UPDATE/, [{ id: 'net1', max_peers: 4 }]],
+      [/FROM network_members WHERE network_id = \$1 AND node_id = \$2$/, [pendingRow]],
+      [/COUNT\(\*\).*FROM network_members/, [{ count: '2' }]],
+      [/UPDATE network_members/, [{ ...pendingRow, status: 'authorized' }]],
+    ]);
+    const approved = await new PgStore(q3).transitionMemberStatus('net1', 'p2', 'approve', 3);
+    assert.equal(approved.status, 'authorized');
+    assert.deepEqual(q3.txStatements(), ['BEGIN', 'COMMIT']);
+    assert.equal(q3.dataCalls().length, 4);
+  });
+
+  test('GC-fix-batch1 R3：updateUserByAdmin groupId null → 同事务解析当前 is_default 组；createUser null 走 COALESCE', async () => {
+    const userRow = { id: 'u7', email: 'r3@local', password_hash: 'h', role: 'user', active: true, group_id: 'grp_old', group_expires_at: null, email_verified_at: null, created_at: NOW };
+    const updatedRow = { ...userRow, group_id: 'grp_vip' };
+    const q = mockQuery([
+      [/FROM users WHERE id = .*FOR UPDATE/, [userRow]],
+      [/SELECT id FROM user_groups WHERE is_default = TRUE LIMIT 1/, [{ id: 'grp_vip' }]],
+      [/UPDATE users SET role/, [updatedRow]],
+    ]);
+    const patched = await new PgStore(q).updateUserByAdmin('u7', { groupId: null });
+    assert.equal(patched.groupId, 'grp_vip', 'null 绑定当前活跃默认组（可能与 grp_default 不同）');
+    assert.deepEqual(q.txStatements(), ['BEGIN', 'COMMIT']);
+    const data = q.dataCalls();
+    assert.match(data[0].sql, /FROM users WHERE id = \$1 FOR UPDATE/);
+    assert.match(data[1].sql, /SELECT id FROM user_groups WHERE is_default = TRUE LIMIT 1/, 'null 应在同事务内解析当前默认组');
+    assert.equal(data.length, 3, 'string 组才做存在性预查；null 只加一次默认组解析');
+
+    // createUser groupId null：跳过存在性预查、$5=null → INSERT 内 COALESCE 子查询绑定当前默认组
+    const q2 = mockQuery([[/INSERT INTO users/, [updatedRow]]]);
+    const created = await new PgStore(q2).createUser({ email: 'r3n@local', passwordHash: 'h', role: 'user', groupId: null });
+    assert.equal(created.groupId, 'grp_vip');
+    assert.equal(q2.dataCalls()[0].params[4], null, 'null 原样传给 COALESCE($5, …)');
+    assert.deepEqual(q2.txStatements(), ['BEGIN', 'COMMIT']);
   });
 
   // PC-06：事务接缝契约。真实 pool 模式下 withTransaction checkout 独立连接（tx），

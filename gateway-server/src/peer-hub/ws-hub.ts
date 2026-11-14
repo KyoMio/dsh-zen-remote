@@ -67,8 +67,9 @@ const RELAY_FRAME_TYPE_DATA = 0x03;
 /**
  * GC-3：网络属主的有效配额快照（内存缓存）。relayBinary 是同步热路径，月度
  * 门禁与按组限速都只读这里的内存值；缓存由首帧/入网注册惰性加载，UTC 月份
- * 切换、refreshQuota、onSettingsChanged（默认组配额随 settings 双向同步）时
- * 失效重拉。store 才是事实来源——快照只为避免每帧三次 store 查询。
+ * 切换、组配额到期（expiresAtMs，GC-fix-batch1 R2）、refreshQuota、
+ * onSettingsChanged（默认组配额随 settings 双向同步）时失效重拉。store 才是
+ * 事实来源——快照只为避免每帧三次 store 查询。
  */
 interface OwnerQuotaSnapshot {
   ownerId: string;
@@ -81,6 +82,19 @@ interface OwnerQuotaSnapshot {
   dbUsedBytes: number;
   /** 快照对应的 UTC 年月（YYYY-MM），跨月即失效重拉 */
   yearMonth: string;
+  /**
+   * 组配额到期时刻的毫秒值（GC-fix-batch1 R2）；null = 不跟踪（未设到期，或
+   * 已是到期回退态——回退后 groupExpiresAt 仍是过去时间，设 null 防止每帧
+   * 都触发过期重查）。
+   */
+  expiresAtMs: number | null;
+  /**
+   * 读取 DB 使用量之前捕获的 flush 提交序号（GC-fix-batch1 R5）：快照的
+   * dbUsedBytes 只包含该序号之前的落库字节；flush 推进时仅当
+   * seqBeforeRead < flushSeq 才叠加本批字节，防止「flush 前查到的旧值 +
+   * flush 后增量」重复叠加。
+   */
+  seqBeforeRead: number;
 }
 
 /**
@@ -268,6 +282,13 @@ export class PeerWsHub {
   private readonly pendingRelayBytesByOwner = new Map<string, number>();
   // GC-3：月度配额耗尽被静默丢弃的 DATA 帧计数（按网络；单测与排障观测量）
   private readonly monthlyQuotaDroppedByNetwork = new Map<string, number>();
+  // GC-fix-batch1 R5：networkId → 属主 id 的最近观测（handleAuth/入网注册/中继/快照加载
+  // 任意路径拿到 ownerId 都回写）。快照缺失（冷缓存/被停用清掉）时 flush 仍能按它找到
+  // 属主扣减 pending；属主被停用后刻意保留，让在途尾批 flush 也能正确对账清零。
+  private readonly networkOwnerById = new Map<string, string>();
+  // GC-fix-batch1 R5：flush 提交序号（每次成功落库 +1）。快照记录读取时的序号，
+  // flush 推进 dbUsedBytes 前比对，防止异步读取与 flush 交错时重复叠加/漏加。
+  private committedFlushSeq = 0;
 
   constructor(options: PeerWsHubOptions) {
     this.store = options.store;
@@ -508,6 +529,8 @@ export class PeerWsHub {
   /** 登记进内存路由表并通知全网（welcome 已由调用方先行下发） */
   private registerAndAnnounce(conn: ConnState): void {
     conn.state = 'authorized';
+    // GC-fix-batch1 R5：属主表随入网注册回写（对账兜底）
+    this.networkOwnerById.set(conn.networkId, conn.ownerId);
     let net = this.conns.get(conn.networkId);
     if (net === undefined) {
       net = new Map();
@@ -610,6 +633,22 @@ export class PeerWsHub {
       deny(ws, 'network not found');
       return null;
     }
+    // GC-fix-batch1 R5：拿到属主即登记（flush 对账与冷缓存扣减依赖这张表）
+    this.networkOwnerById.set(networkId, network.ownerId);
+    // GC-fix-batch1 R1：非管理员属主的用户组每网设备上限原子压进入网事务——
+    // 网络 maxPeers 高于组上限时，超出组额的新席位在这里（同一事务内）被拒。
+    // 管理员属主不传 cap（豁免组上限）。
+    let maxPeersCap: number | undefined;
+    try {
+      const owner = await this.store.findUserById(network.ownerId);
+      if (owner !== null && owner.role !== 'admin') {
+        const quota = await this.store.resolveEffectiveUserQuota(network.ownerId, this.now());
+        maxPeersCap = quota.group.maxPeersPerNetwork;
+      }
+    } catch {
+      deny(ws, 'gateway storage unavailable');
+      return null;
+    }
     if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
     const proof = message['joinKeyProofHex'];
     // PC-03 能力位：节点声明「被暂停时可保留受限控制连接」。旧版节点不带此
@@ -638,6 +677,7 @@ export class PeerWsHub {
         name,
         publicKeyHex,
         joinKeyMatched,
+        maxPeersCap,
       });
     } catch (error) {
       const code = (error as { code?: string }).code;
@@ -803,13 +843,15 @@ export class PeerWsHub {
       return;
     }
     target.ws.send(buf, { binary: true }, () => {/* 写失败由 close 事件兜底 */});
-    if (isDataFrame && meteredQuota !== null) {
-      // 仅受月度配额约束的属主维护未刷盘增量（flush 落库成功后扣减，见 doFlushTelemetry）
-      this.pendingRelayBytesByOwner.set(
-        meteredQuota.ownerId,
-        (this.pendingRelayBytesByOwner.get(meteredQuota.ownerId) ?? 0) + buf.length,
-      );
-    }
+    // GC-fix-batch1 R5：放行的帧无条件记账——不限于 DATA、不要求快照已加载。
+    // 快照缺失（冷缓存）时旧代码漏记，flush 后扣不到、月度门禁判定值永久偏低
+    // （泄漏）；limiter 记账与 flushMemberTelemetry 落库都是全帧类型口径，这里的
+    // 未刷盘增量必须同口径才能与 dbUsedBytes 收敛。
+    this.networkOwnerById.set(conn.networkId, conn.ownerId);
+    this.pendingRelayBytesByOwner.set(
+      conn.ownerId,
+      (this.pendingRelayBytesByOwner.get(conn.ownerId) ?? 0) + buf.length,
+    );
   }
 
   // ------------------------------------------------------------ 属主配额快照（GC-3）
@@ -822,9 +864,23 @@ export class PeerWsHub {
       try {
         const network = await this.store.getNetwork(networkId);
         if (network === null) return null;
+        this.networkOwnerById.set(networkId, network.ownerId);
         const owner = await this.store.findUserById(network.ownerId);
         if (owner === null) return null;
+        // GC-fix-batch1 R5：DB 使用量读取之前捕获 flush 序号与属主停用代次——
+        // 读取在途期间若 flush 提交 / 属主被停用，据此判定快照是否仍然有效
+        const seqBeforeRead = this.committedFlushSeq;
+        const disabledEpochAtRead = this.ownerDisabledEpoch.get(network.ownerId) ?? 0;
         const quota = await this.store.resolveEffectiveUserQuota(network.ownerId, this.now());
+        // 异步读取期间属主被停用/重触发：快照已失效，绝不把过期值写回缓存
+        if ((this.ownerDisabledEpoch.get(network.ownerId) ?? 0) !== disabledEpochAtRead) return null;
+        // GC-fix-batch1 R2：仅「未回退且确实设了到期时刻」时跟踪到期；已回退的
+        // groupExpiresAt 仍是过去时间，设 null 防止每帧都触发过期重查
+        const parsedExpiresAt = quota.groupExpiresAt !== null ? Date.parse(quota.groupExpiresAt) : Number.NaN;
+        const expiresAtMs =
+          !quota.isExpiredFallback && quota.groupExpiresAt !== null && Number.isFinite(parsedExpiresAt)
+            ? parsedExpiresAt
+            : null;
         return {
           ownerId: network.ownerId,
           isAdmin: owner.role === 'admin',
@@ -832,6 +888,8 @@ export class PeerWsHub {
           monthlyRelayQuotaBytes: quota.group.monthlyRelayQuotaBytes,
           dbUsedBytes: quota.monthlyRelayUsedBytes,
           yearMonth: quota.yearMonth,
+          expiresAtMs,
+          seqBeforeRead,
         };
       } catch {
         return null; // store 暂不可用：本帧按无快照放行，下一帧重试
@@ -850,15 +908,19 @@ export class PeerWsHub {
   }
 
   /**
-   * 同步取当前有效快照（relayBinary 热路径用）；缓存缺失或 UTC 月份已切换
-   * （旧月用量对新月无意义）时视作未命中——本帧按无快照放行，同时触发后台
-   * 加载，下一帧起按新值生效。并发帧共享同一在途加载。
+   * 同步取当前有效快照（relayBinary 热路径用）；缓存缺失、UTC 月份已切换
+   * （旧月用量对新月无意义）或组配额已到到期时刻（GC-fix-batch1 R2：回落默认组
+   * 配额必须准时生效）时视作未命中——本帧按无快照放行，同时触发后台加载，
+   * 下一帧起按新值生效。并发帧共享同一在途加载。
    */
   private currentOwnerQuota(networkId: string): OwnerQuotaSnapshot | null {
     const cached = this.ownerQuotaByNetwork.get(networkId);
     if (cached !== undefined) {
-      if (currentUtcYearMonth(this.now()) === cached.yearMonth) return cached;
-      this.ownerQuotaByNetwork.delete(networkId); // 跨月：作废重拉
+      const expired =
+        currentUtcYearMonth(this.now()) !== cached.yearMonth ||
+        (cached.expiresAtMs !== null && this.now() >= cached.expiresAtMs);
+      if (!expired) return cached;
+      this.ownerQuotaByNetwork.delete(networkId); // 跨月 / 组配额已到期：作废重拉
     }
     void this.loadOwnerQuota(networkId).then((snapshot) => this.storeOwnerQuota(networkId, snapshot));
     return null;
@@ -1341,6 +1403,16 @@ export class PeerWsHub {
       this.killConn(conn, 'account disabled');
       affected.add(conn.networkId);
     }
+    // GC-fix-batch1 R5：停用即清该属主的配额快照、月度丢弃计数与待刷字节——
+    // 快照留着会在重新启用后用旧值判定，pending 留着会污染后续月度门禁；
+    // networkOwnerById 刻意保留：停用瞬间 rateLimiter 里可能还有未刷完的在途帧，
+    // 保留让最终 flush 仍能按属主找到账目、把 pending 正确清零。
+    for (const [networkId, entry] of [...this.ownerQuotaByNetwork]) {
+      if (entry.ownerId !== userId) continue;
+      this.ownerQuotaByNetwork.delete(networkId);
+      this.monthlyQuotaDroppedByNetwork.delete(networkId);
+    }
+    this.pendingRelayBytesByOwner.delete(userId);
     for (const networkId of affected) void this.publishTopology(networkId);
   }
 
@@ -1556,27 +1628,38 @@ export class PeerWsHub {
     for (const [key, record] of natBatch) {
       if (this.pendingNat.get(key) === record) this.pendingNat.delete(key);
     }
-    // GC-3：落库成功后推进配额快照的当月已用字节（dbUsedBytes 按属主聚合，
-    // 同属主全部网络的快照一起推进），并把本批字节从内存未刷盘计数里扣掉——
-    // 月度门禁的判定值（dbUsed + pending）由此保持与库中事实收敛。
-    const confirmedByOwner = new Map<string, number>();
+    // GC-3 / GC-fix-batch1 R5：落库成功后（提交序号 +1）按属主对账——
+    // 1) 无条件扣减未刷盘计数：属主经 networkOwnerById 找（快照缺失的冷缓存网络
+    //    也必须扣），减到 <=0 删键，防 Map 泄漏与负值漂移；
+    // 2) 推进配额快照 dbUsedBytes：同属主全部已缓存网络共享月度配额，一起推进；
+    //    仅 entry.seqBeforeRead < flushSeq 时叠加（快照读取早于本批提交才算「旧值
+    //    + 本批增量」，防止与异步加载交错时重复叠加），推进后序号同步前移。
+    const flushSeq = ++this.committedFlushSeq;
+    const confirmedByNetwork = new Map<string, number>();
     for (const item of byteBatch) {
-      const snapshot = this.ownerQuotaByNetwork.get(item.networkId);
-      if (snapshot === undefined) continue;
-      confirmedByOwner.set(snapshot.ownerId, (confirmedByOwner.get(snapshot.ownerId) ?? 0) + item.bytes);
+      confirmedByNetwork.set(item.networkId, (confirmedByNetwork.get(item.networkId) ?? 0) + item.bytes);
     }
-    if (confirmedByOwner.size > 0) {
-      for (const entry of this.ownerQuotaByNetwork.values()) {
-        const delta = confirmedByOwner.get(entry.ownerId);
-        if (delta !== undefined) entry.dbUsedBytes += delta;
-      }
-      for (const [ownerId, delta] of confirmedByOwner) {
-        const pending = this.pendingRelayBytesByOwner.get(ownerId);
-        if (pending === undefined) continue;
-        const next = pending - delta;
-        if (next > 0) this.pendingRelayBytesByOwner.set(ownerId, next);
-        else this.pendingRelayBytesByOwner.delete(ownerId);
-      }
+    const confirmedByOwner = new Map<string, number>();
+    for (const [networkId, bytes] of confirmedByNetwork) {
+      const ownerId = this.networkOwnerById.get(networkId) ?? this.ownerQuotaByNetwork.get(networkId)?.ownerId;
+      if (ownerId === undefined) continue; // 网络/属主均已消失：字节已落库，无内存状态可对账
+      confirmedByOwner.set(ownerId, (confirmedByOwner.get(ownerId) ?? 0) + bytes);
+    }
+    for (const [ownerId, delta] of confirmedByOwner) {
+      const pending = this.pendingRelayBytesByOwner.get(ownerId);
+      if (pending === undefined) continue; // 已被清掉（如属主停用）：不得减成负值
+      const next = pending - delta;
+      if (next > 0) this.pendingRelayBytesByOwner.set(ownerId, next);
+      else this.pendingRelayBytesByOwner.delete(ownerId);
+    }
+    const yearMonth = seenAt.slice(0, 7);
+    for (const entry of this.ownerQuotaByNetwork.values()) {
+      const delta = confirmedByOwner.get(entry.ownerId);
+      if (delta === undefined) continue;
+      if (entry.yearMonth !== yearMonth) continue; // 跨月旧快照：作废重拉时不叠加
+      if (entry.seqBeforeRead >= flushSeq) continue; // 读取晚于本批提交：db 值已含本批
+      entry.dbUsedBytes += delta;
+      entry.seqBeforeRead = flushSeq;
     }
   }
 }
