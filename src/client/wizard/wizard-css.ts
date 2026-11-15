@@ -559,6 +559,56 @@ export const WIZARD_CSS = `
   padding-top: 12px;
   border-top: 1px solid var(--dsw-alias-border-l2);
 }
+[data-zen-remote="wizard"] .zr-wizard-bridgeSection {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+}
+[data-zen-remote="wizard"] .zr-wizard-bridgeHead {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+[data-zen-remote="wizard"] .zr-wizard-bridgeList {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+}
+[data-zen-remote="wizard"] .zr-wizard-bridgeRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-3, var(--dsw-alias-bg-module-platform));
+  min-width: 0;
+}
+[data-zen-remote="wizard"] .zr-wizard-bridgeMeta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+[data-zen-remote="wizard"] .zr-wizard-bridgeName {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+[data-zen-remote="wizard"] .zr-wizard-bridgeDesc {
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+  line-height: 1.35;
+}
+[data-zen-remote="wizard"] .zr-wizard-bridgeRow [role="switch"] {
+  flex: none;
+}
 [data-zen-remote="wizard"] .zr-wizard-footerHint {
   font-size: 12px;
   color: var(--dsw-alias-label-secondary);

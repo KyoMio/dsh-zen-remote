@@ -293,10 +293,13 @@ export const ZH = {
   'devices.notePlaceholder': '给这台设备写点备注（最多 120 字）',
   'devices.editNote': '编辑备注',
 
-  // ---- GC-7a：网关管理 · 三标签页与运行状态条 ----
+  // ---- GC-7a：网关管理 · 多标签页与运行状态条 ----
   'admin.tabUsers': '用户管理',
   'admin.tabGroups': '用户组',
-  'admin.tabSettings': '网关与发信设置',
+  'admin.tabGateway': '网关设置',
+  'admin.tabTls': 'TLS 与证书',
+  'admin.tabEmail': '发信服务',
+  'admin.tabApiKey': '接口密钥',
   'admin.runtimeTcpPort': 'TCP 端口',
   'admin.runtimeUdpPorts': 'UDP 探测端口',
   'admin.runtimeStorage': '存储引擎',
@@ -316,11 +319,11 @@ export const ZH = {
   'admin.advisoryTitle': '安全提示',
   'admin.sliceError': '部分管理数据刚才没能刷新，当前显示的是最近一次成功的结果',
   'admin.advisoryPublicHttp':
-    '当前公网地址未启用 HTTPS，浏览器登录与会话凭证存在明文传输风险，建议在下方开启原生 TLS 并导入证书（或通过反向代理提供 HTTPS 并填写公网访问地址）',
+    '当前公网地址未启用 HTTPS，浏览器登录与会话凭证存在明文传输风险，建议在「TLS 与证书」标签页开启原生 TLS 并导入证书（或通过反向代理提供 HTTPS 并填写公网访问地址）',
   'admin.advisoryUdpAlt': '辅助 UDP 端口未开启，无法识别对称型网络',
 
   // ---- GC-7a：网关管理 · 用户管理 ----
-  'admin.newUser': '+ 新建用户',
+  'admin.newUser': '新建用户',
   'admin.emailVerified': '已验证',
   'admin.emailUnverified': '未验证',
   'admin.columnGroup': '用户组',
@@ -362,7 +365,7 @@ export const ZH = {
   'admin.publicUrlHint': '保存后立即对新的邀请链接生效；留空则自动推断',
   'admin.publicUrlFallback': '当前自动推断为 {url}',
   'admin.requireEmailVerification': '注册必须验证邮箱',
-  'admin.requireEmailVerificationNeedsSmtp': '先在下方配置发信服务才能开启',
+  'admin.requireEmailVerificationNeedsSmtp': '先在「发信服务」标签页配置发信服务才能开启',
   'admin.newUserDefaultGroup': '新用户默认组',
   'admin.sessionTtlDays': '登录态有效期（天，1–90）',
   'admin.smtpTitle': '发信服务',
@@ -725,7 +728,10 @@ export const EN: Record<LocaleKey, string> = {
   // ---- GC-7a：Gateway admin · tabs & runtime strip ----
   'admin.tabUsers': 'Users',
   'admin.tabGroups': 'User groups',
-  'admin.tabSettings': 'Gateway & email',
+  'admin.tabGateway': 'Gateway',
+  'admin.tabTls': 'TLS & certs',
+  'admin.tabEmail': 'Email',
+  'admin.tabApiKey': 'API key',
   'admin.runtimeTcpPort': 'TCP port',
   'admin.runtimeUdpPorts': 'UDP probe ports',
   'admin.runtimeStorage': 'Storage',
@@ -745,11 +751,11 @@ export const EN: Record<LocaleKey, string> = {
   'admin.advisoryTitle': 'Security notice',
   'admin.sliceError': 'Some admin data failed to refresh — showing the last successfully fetched values',
   'admin.advisoryPublicHttp':
-    'The public URL is not on HTTPS; sign-in passwords and sessions could travel in plaintext. Enable native single-port TLS with a certificate below (or place a reverse proxy with HTTPS in front and fill in the public URL)',
+    'The public URL is not on HTTPS; sign-in passwords and sessions could travel in plaintext. Enable native single-port TLS with a certificate in the TLS & certs tab (or place a reverse proxy with HTTPS in front and fill in the public URL)',
   'admin.advisoryUdpAlt': 'The secondary UDP port is off; symmetric network types cannot be detected',
 
   // ---- GC-7a：Gateway admin · users ----
-  'admin.newUser': '+ New user',
+  'admin.newUser': 'New user',
   'admin.emailVerified': 'Verified',
   'admin.emailUnverified': 'Unverified',
   'admin.columnGroup': 'Group',
@@ -791,7 +797,7 @@ export const EN: Record<LocaleKey, string> = {
   'admin.publicUrlHint': 'Applies to new invite links immediately after saving; leave blank to auto-detect',
   'admin.publicUrlFallback': 'Auto-detected for now: {url}',
   'admin.requireEmailVerification': 'Require email verification to sign up',
-  'admin.requireEmailVerificationNeedsSmtp': 'Configure the email service below before enabling this',
+  'admin.requireEmailVerificationNeedsSmtp': 'Configure email delivery in the Email tab first',
   'admin.newUserDefaultGroup': 'Default group for new users',
   'admin.sessionTtlDays': 'Sign-in session lifetime (days, 1–90)',
   'admin.smtpTitle': 'Email delivery',

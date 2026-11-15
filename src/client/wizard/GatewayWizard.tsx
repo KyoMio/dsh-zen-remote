@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import { Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import type {
   AdminStatusBody,
   ClaimRouteBody,
@@ -1875,9 +1876,7 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 </p>
                 <p className="zr-wizard-overviewSub">
                   {peerDevices.length > 0
-                    ? (peerSummary.mountedCount !== undefined
-                      ? t('wizard.overview.peerMountedDiscovered', { count: String(peerSummary.mountedCount), total: String(peerDevices.length) })
-                      : t('wizard.overview.peerDiscoveredCount', { total: String(peerDevices.length) }))
+                    ? t('wizard.overview.peerDiscoveredCount', { total: String(peerDevices.length) })
                     : ''}
                 </p>
               </div>
@@ -1896,20 +1895,19 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                     {t('wizard.peer.devicesModalTitle')}
                   </button>
                 </div>
-                {/* PC-11b + fix1: the mount line reads the body's OWN facts —
-                    本机已挂载 N / M against the LOCAL effective cap; the raw
-                    network cap keeps its OWN sub line at ALL times (known
-                    maxPeers only — never invented), so a full local cap stays
-                    explainable against a larger network; an unknown capacity
-                    says so instead of showing 0 / 8. */}
                 <p className="zr-wizard-overviewValue" data-limit={peerSummary.limitReached ? 'true' : undefined}>
                   <span className="zr-wizard-dot" data-state={peerSummary.devicesLight} />
                   <span>
-                    {peerSummary.mountedCount !== undefined && peerSummary.maxServers !== undefined
-                      ? t('wizard.overview.peerMountCount', { count: String(peerSummary.mountedCount), max: String(peerSummary.maxServers) })
+                    {peerView !== undefined
+                      ? t('wizard.overview.peerNetworkCount', { count: String(peerSummary.totalCount) })
                       : '—'}
                   </span>
                 </p>
+                {peerSummary.mountedCount !== undefined ? (
+                  <p className="zr-wizard-overviewSub">
+                    {t('wizard.overview.peerMountedCount', { count: String(peerSummary.mountedCount) })}
+                  </p>
+                ) : null}
                 {peerSummary.limitReached === true || peerSummary.mismatchCount > 0 ? (
                   <p className="zr-wizard-overviewSub" data-limit={peerSummary.limitReached ? 'true' : undefined}>
                     {peerSummary.limitReached === true
@@ -2031,20 +2029,27 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 </button>
               </div>
               {serverScopeBridges.length > 0 ? (
-                <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--zr-wizard-border, rgba(127, 127, 127, 0.18))' }}>
-                  <p className="zr-wizard-sectionTitle">{t('settings.bridge.title')}</p>
-                  {serverScopeBridges.map((row) => (
-                    <label key={row.plugin} className="zr-wizard-checkRow" style={{ marginTop: 6 }}>
-                      <input
-                        type="checkbox"
-                        checked={row.consent}
-                        disabled={disabled || bridgeBusyPlugin !== null}
-                        onChange={(event) => { void toggleWizardPluginConsent(row.plugin, event.currentTarget.checked) }}
-                      />
-                      <span>{row.plugin} · {t('settings.bridge.consentToggle')}</span>
-                    </label>
-                  ))}
-                  <p className="zr-wizard-hint" style={{ marginTop: 4 }}>{t('settings.bridge.consentHint')}</p>
+                <div className="zr-wizard-bridgeSection">
+                  <div className="zr-wizard-bridgeHead">
+                    <p className="zr-wizard-sectionTitle">{t('settings.bridge.title')}</p>
+                    <p className="zr-wizard-hint">{t('settings.bridge.consentHint')}</p>
+                  </div>
+                  <div className="zr-wizard-bridgeList">
+                    {serverScopeBridges.map((row) => (
+                      <div key={row.plugin} className="zr-wizard-bridgeRow">
+                        <div className="zr-wizard-bridgeMeta">
+                          <span className="zr-wizard-bridgeName">{row.plugin}</span>
+                          <span className="zr-wizard-bridgeDesc">{t('settings.bridge.consentToggle')}</span>
+                        </div>
+                        <Switch
+                          checked={row.consent}
+                          disabled={disabled || bridgeBusyPlugin !== null}
+                          label={`${row.plugin} · ${t('settings.bridge.consentToggle')}`}
+                          onChange={(checked) => { void toggleWizardPluginConsent(row.plugin, checked) }}
+                        />
+                      </div>
+                    ))}
+                  </div>
                 </div>
               ) : null}
             </div>
