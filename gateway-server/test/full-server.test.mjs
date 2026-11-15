@@ -5,9 +5,11 @@
 // 与其他测试相同：.mjs 直接 import 编译产物 ../dist/。
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
+import https from 'node:https';
 import net from 'node:net';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -1692,5 +1694,202 @@ describe('GC-10：管理全链路（假 SMTP + OTP 注册 + Bearer Key + 改密/
 
     const themeJs = await (await fetch(gw.base + '/theme-init.js')).text();
     assert.ok(!themeJs.includes(apiKey) && !themeJs.includes(SMTP_SECRET));
+  });
+});
+
+// ---------------------------------------------------------------- GT-5：原生 TLS 全栈闭环
+
+describe('GT-5：单端口原生 TLS 热切换、HTTPS/WSS 入网与重启持久化全栈闭环', () => {
+  function generateSelfSignedCert(cn = '127.0.0.1') {
+    const work = fs.mkdtempSync(path.join(DATA_ROOT, 'tls-cert-'));
+    try {
+      const conf = path.join(work, 'c.cnf');
+      const key = path.join(work, 'privkey.pem');
+      const cert = path.join(work, 'fullchain.pem');
+      fs.writeFileSync(
+        conf,
+        `[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN=${cn}\n[v3]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n`,
+      );
+      execFileSync(
+        'openssl',
+        ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '10', '-sha256', '-config', conf, '-keyout', key, '-out', cert],
+        { stdio: 'ignore' },
+      );
+      return { certPem: fs.readFileSync(cert, 'utf8'), keyPem: fs.readFileSync(key, 'utf8') };
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true });
+    }
+  }
+
+  function httpsRequestRaw(port, method, reqPath, { ca, body, cookie, headers: extraHeaders } = {}) {
+    return new Promise((resolve, reject) => {
+      const headers = { ...extraHeaders };
+      if (cookie !== undefined) headers.cookie = cookie;
+      let payload;
+      if (body !== undefined) {
+        payload = JSON.stringify(body);
+        headers['content-type'] = 'application/json';
+        headers['content-length'] = Buffer.byteLength(payload, 'utf8');
+        if (headers.origin === undefined) headers.origin = `https://127.0.0.1:${port}`;
+      }
+      const req = https.request(
+        {
+          host: '127.0.0.1',
+          port,
+          path: reqPath,
+          method,
+          headers,
+          ca,
+          agent: false,
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf8');
+            let json = null;
+            if ((res.headers['content-type'] ?? '').includes('application/json') && text.length > 0) {
+              json = JSON.parse(text);
+            }
+            resolve({
+              status: res.statusCode,
+              headers: res.headers,
+              text,
+              json,
+            });
+          });
+        },
+      );
+      req.on('error', reject);
+      if (payload !== undefined) req.write(payload);
+      req.end();
+    });
+  }
+
+  test('冷启动 HTTP → 上传开 TLS 同口热切 HTTPS/302/426/wss:// 入网 → 热切回 HTTP → 重启持久化 HTTPS', async () => {
+    fs.mkdirSync(DATA_ROOT, { recursive: true });
+    const dataDir = makeDataDir();
+    const certDir = path.join(makeDataDir(), 'certs');
+    fs.mkdirSync(certDir, { recursive: true });
+    const { certPem, keyPem } = generateSelfSignedCert('127.0.0.1');
+
+    let gw = await startGateway(makeConfig({ dataDir, certDir }));
+    try {
+      const port = gw.port;
+      // 1) 空目录冷启动为明文 HTTP，CONSOLE_CSP 保持逐字不变
+      const home = await fetch(gw.base + '/');
+      assert.equal(home.status, 200);
+      assert.equal(home.headers.get('content-security-policy'), CSP_EXPECTED);
+
+      const cookie = await login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const initialTls = await api(gw.base, 'GET', '/api/v1/admin/tls', { cookie });
+      assert.equal(initialTls.status, 200);
+      assert.equal(initialTls.json.data.enabled, false);
+      assert.equal(initialTls.json.data.tlsActive, false);
+
+      // 2) 上传 PEM 并开启 TLS（同端口免重启立即生效）
+      const uploaded = await api(gw.base, 'PUT', '/api/v1/admin/tls/certificate', {
+        body: { certPem, keyPem, enableTls: true },
+        cookie,
+      });
+      assert.equal(uploaded.status, 200, JSON.stringify(uploaded.json));
+      assert.equal(uploaded.json.data.enabled, true);
+      assert.equal(uploaded.json.data.tlsActive, true);
+      assert.match(uploaded.json.data.suggestedHttpsUrl ?? '', /^https:\/\/127\.0\.0\.1:/);
+      assert.equal(fs.existsSync(path.join(certDir, 'fullchain.pem')), true);
+      assert.equal(fs.existsSync(path.join(certDir, 'privkey.pem')), true);
+      const uploadRaw = JSON.stringify(uploaded.json);
+      assert.ok(!uploadRaw.includes('BEGIN '), 'TLS 响应不得泄漏 PEM 明文');
+      assert.ok(!uploadRaw.includes(certDir), 'TLS 响应不得泄漏服务端绝对路径');
+
+      // 3) 同一端口直通 HTTPS 与明文分流（302 / 426）
+      const rtHttps = await httpsRequestRaw(port, 'GET', '/api/v1/admin/runtime', { ca: certPem, cookie });
+      assert.equal(rtHttps.status, 200, rtHttps.text);
+      assert.equal(rtHttps.json.data.tlsEnabled, true);
+
+      const tlsHttps = await httpsRequestRaw(port, 'GET', '/api/v1/admin/tls', { ca: certPem, cookie });
+      assert.equal(tlsHttps.status, 200);
+      assert.equal(tlsHttps.json.data.tlsActive, true);
+      assert.ok(tlsHttps.json.data.activeCert !== null);
+
+      const plainHome = await fetch(`http://127.0.0.1:${port}/`, { redirect: 'manual' });
+      assert.equal(plainHome.status, 302);
+      assert.match(plainHome.headers.get('location') ?? '', /^https:\/\/127\.0\.0\.1:/);
+      assert.equal(plainHome.headers.get('cache-control'), 'no-store');
+
+      const plainApi = await api(`http://127.0.0.1:${port}`, 'GET', '/api/v1/admin/tls', { cookie });
+      assert.equal(plainApi.status, 426);
+      assert.equal(plainApi.json.error.code, 'TLS_REQUIRED');
+
+      // 4) 同口 HTTPS 建网产出 ?tls=1 邀请链接，并完成 wss:// 挑战应答入网
+      const netRes = await httpsRequestRaw(port, 'POST', '/api/v1/networks', {
+        ca: certPem,
+        cookie,
+        body: { name: 'gt5-tls-net', admissionMode: 'key' },
+      });
+      assert.equal(netRes.status, 200, netRes.text);
+      const net = netRes.json.data;
+      assert.match(net.joinUri, new RegExp(`^zr-net://127\\.0\\.0\\.1:${port}/${net.id}\\?tls=1#`));
+
+      const node = identity();
+      const ws = await new Promise((resolve, reject) => {
+        const client = new WebSocket(`wss://127.0.0.1:${port}/peer/v1/ws`, { ca: certPem });
+        attachWsDispatcher(client);
+        const timer = setTimeout(() => reject(new Error('wss open timeout')), 2000);
+        client.once('open', () => {
+          clearTimeout(timer);
+          resolve(client);
+        });
+        client.once('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+      try {
+        await authNode(ws, node, { networkId: net.id, joinKey: net.joinKey, name: 'tls-peer' });
+        const welcome = await wsJson(ws);
+        assert.equal(welcome.type, 'welcome');
+        assert.equal(welcome.status, 'authorized');
+      } finally {
+        ws.close();
+        await wsClosed(ws);
+      }
+
+      // 5) 在线关闭 TLS → 同一端口立即可用明文 HTTP，再重新开启以便测重启持久化
+      const offRes = await httpsRequestRaw(port, 'PATCH', '/api/v1/admin/tls', {
+        ca: certPem,
+        cookie,
+        body: { enabled: false },
+      });
+      assert.equal(offRes.status, 200, offRes.text);
+      assert.equal(offRes.json.data.tlsActive, false);
+
+      const rtHttp = await api(`http://127.0.0.1:${port}`, 'GET', '/api/v1/admin/runtime', { cookie });
+      assert.equal(rtHttp.status, 200);
+      assert.equal(rtHttp.json.data.tlsEnabled, false);
+
+      const backOn = await api(`http://127.0.0.1:${port}`, 'PATCH', '/api/v1/admin/tls', {
+        body: { enabled: true },
+        cookie,
+      });
+      assert.equal(backOn.status, 200);
+      assert.equal(backOn.json.data.tlsActive, true);
+    } finally {
+      await gw.close();
+    }
+
+    // 6) 同数据目录与证书目录重启，直接以原生 HTTPS 模式启动且 CSP 不变
+    const gwRestarted = await startGateway(makeConfig({ dataDir, certDir }));
+    try {
+      assert.ok(gwRestarted.base.startsWith('https://'));
+      const homeHttps = await httpsRequestRaw(gwRestarted.port, 'GET', '/', { ca: certPem });
+      assert.equal(homeHttps.status, 200);
+      assert.equal(homeHttps.headers['content-security-policy'], CSP_EXPECTED);
+
+      const plainRestartApi = await api(`http://127.0.0.1:${gwRestarted.port}`, 'GET', '/api/v1/admin/tls');
+      assert.equal(plainRestartApi.status, 426);
+    } finally {
+      await gwRestarted.close();
+    }
   });
 });

@@ -211,8 +211,13 @@ export interface UserGroup {
   userCount: number;
 }
 
-/** 运行态安全告警枚举（SPEC 5.4）：公网明文入口 / 辅助探测口关闭 */
-export type SecurityWarning = 'PUBLIC_HTTP_PLAINTEXT' | 'UDP_ALT_DISABLED';
+/** 运行态安全告警枚举（SPEC 5.4）：公网明文入口 / 辅助探测口关闭 / 原生 TLS 证书异常 */
+export type SecurityWarning =
+  | 'PUBLIC_HTTP_PLAINTEXT'
+  | 'UDP_ALT_DISABLED'
+  | 'TLS_CERT_EXPIRING_SOON'
+  | 'TLS_CERT_EXPIRED'
+  | 'TLS_RELOAD_FAILED';
 
 /** GET /api/v1/admin/runtime 的只读运行态（脱敏红线：绝无数据库串/密钥/绝对路径） */
 export interface GatewayRuntimeStatus {
@@ -224,11 +229,66 @@ export interface GatewayRuntimeStatus {
   publicUrlEffective: string;
   publicUrlSource: 'settings' | 'env' | 'request';
   smtpConfigured: boolean;
+  tlsEnabled: boolean;
   onlineDevices: number;
   /** 全网实时中转速率，KB/s = 1024 字节/秒（PC-17 契约） */
   totalLiveRelayKbps: number;
   cumulativeRelayBytes: number;
   securityWarnings: SecurityWarning[];
+}
+
+export interface TlsCertSummary {
+  subject: string;
+  issuer: string;
+  san: string[];
+  validFrom: string;
+  validTo: string;
+  fingerprint256: string;
+  expired: boolean;
+  expiringSoon: boolean;
+}
+
+export interface TlsDirFileInfo {
+  name: string;
+  kind: 'cert' | 'key' | 'unknown';
+  sizeBytes: number;
+  updatedAt: string;
+}
+
+export interface TlsReloadErrorView {
+  code: string;
+  message: string;
+  at: string;
+}
+
+/** GET/POST /api/v1/admin/tls* 脱敏视图（绝无 PEM 原文、私钥或本地路径） */
+export interface AdminTlsView {
+  enabled: boolean;
+  tlsActive: boolean;
+  certDirConfigured: boolean;
+  certDirWritable: boolean;
+  certFile: string;
+  keyFile: string;
+  availableFiles: TlsDirFileInfo[];
+  activeCert: TlsCertSummary | null;
+  lastReloadAt: string | null;
+  lastReloadError: TlsReloadErrorView | null;
+}
+
+export type AdminTlsMutationResult = AdminTlsView & { suggestedHttpsUrl?: string | null };
+
+export interface AdminTlsCertificateInput {
+  certPem: string;
+  keyPem: string;
+  certFile?: string;
+  keyFile?: string;
+  enableTls?: boolean;
+}
+
+export interface AdminTlsPatchInput {
+  enabled?: boolean;
+  certFile?: string;
+  keyFile?: string;
 }
 
 /** SMTP 加密方式（镜像 SmtpSecurityMode：implicit_tls→tls、plain→none 归一化后的值域） */
@@ -368,8 +428,8 @@ export interface UiLocalState {
 
 // ---------------------------------------------------------------- GC-7b：管理切片的加载/错误态
 
-/** 带独立加载态的四张管理切片 */
-export type AdminSliceKey = 'runtime' | 'settings' | 'groups' | 'users';
+/** 带独立加载态的五张管理切片 */
+export type AdminSliceKey = 'runtime' | 'settings' | 'groups' | 'users' | 'tls';
 
 /** 单张切片的加载阶段：idle（未拉取）/ loading（在途）/ ready（有数据）/ error（末次失败） */
 export type SliceLoadPhase = 'idle' | 'loading' | 'ready' | 'error';
@@ -399,9 +459,11 @@ export interface ConsoleState {
   adminSettings: AdminSettingsData | null;
   adminGroups: UserGroup[];
   adminUsers: AdminUserRow[];
-  /** 四张管理切片各自的加载阶段（独立，互不阻塞） */
+  /** 网关管理页原生 TLS 与证书摘要；未拉到前是 null */
+  adminTls: AdminTlsView | null;
+  /** 五张管理切片各自的加载阶段（独立，互不阻塞） */
   adminLoad: Readonly<Record<AdminSliceKey, SliceLoadPhase>>;
-  /** 四张管理切片各自的末次错误消息（null = 无） */
+  /** 五张管理切片各自的末次错误消息（null = 无） */
   adminError: Readonly<Record<AdminSliceKey, string | null>>;
   ui: UiLocalState;
 }
@@ -421,8 +483,9 @@ export function createInitialState(): ConsoleState {
     adminSettings: null,
     adminGroups: [],
     adminUsers: [],
-    adminLoad: { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle' },
-    adminError: { runtime: null, settings: null, groups: null, users: null },
+    adminTls: null,
+    adminLoad: { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle', tls: 'idle' },
+    adminError: { runtime: null, settings: null, groups: null, users: null, tls: null },
     ui: {
       networkSwitcherOpen: false,
       accountMenuOpen: false,
@@ -471,15 +534,16 @@ export function applySessionPayload(state: ConsoleState, payload: SessionPayload
  */
 export function clearedAdminSlices(): Pick<
   ConsoleState,
-  'adminRuntime' | 'adminSettings' | 'adminGroups' | 'adminUsers' | 'adminLoad' | 'adminError'
+  'adminRuntime' | 'adminSettings' | 'adminGroups' | 'adminUsers' | 'adminTls' | 'adminLoad' | 'adminError'
 > {
   return {
     adminRuntime: null,
     adminSettings: null,
     adminGroups: [],
     adminUsers: [],
-    adminLoad: { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle' },
-    adminError: { runtime: null, settings: null, groups: null, users: null },
+    adminTls: null,
+    adminLoad: { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle', tls: 'idle' },
+    adminError: { runtime: null, settings: null, groups: null, users: null, tls: null },
   };
 }
 
@@ -560,6 +624,16 @@ export function applyAdminUsers(state: ConsoleState, users: AdminUserRow[]): Con
     adminUsers: users,
     adminLoad: withRecordEntry(state.adminLoad, 'users', 'ready'),
     adminError: withRecordEntry(state.adminError, 'users', null),
+  };
+}
+
+/** 管理员 TLS 与证书状态刷新（进入管理页拉取或保存/上传/重载回调更新） */
+export function applyAdminTls(state: ConsoleState, tls: AdminTlsView): ConsoleState {
+  return {
+    ...state,
+    adminTls: tls,
+    adminLoad: withRecordEntry(state.adminLoad, 'tls', 'ready'),
+    adminError: withRecordEntry(state.adminError, 'tls', null),
   };
 }
 
@@ -715,6 +789,10 @@ export class ConsoleStore {
 
   readonly applyAdminUsers = (users: AdminUserRow[]): void => {
     this.setState(applyAdminUsers(this.state, users));
+  };
+
+  readonly applyAdminTls = (tls: AdminTlsView): void => {
+    this.setState(applyAdminTls(this.state, tls));
   };
 
   /** 切出管理页 / 收到 401 时彻底清理管理员敏感切片（不动 session 与业务数据） */
@@ -1162,6 +1240,26 @@ export class ConsoleClient {
   /** 重置用户密码并吊销其全部历史会话；newPassword 省略 = 后端随机生成 */
   async resetAdminUserPassword(id: string, newPassword?: string): Promise<{ reset: boolean; generatedPassword?: string }> {
     return this.request('POST', `/api/v1/admin/users/${encodeURIComponent(id)}/reset-password`, newPassword !== undefined ? { newPassword } : {});
+  }
+
+  /** 原生单端口 TLS 状态与证书目录扫描摘要（绝无私钥或路径） */
+  async getAdminTls(signal?: AbortSignal): Promise<AdminTlsView> {
+    return this.request('GET', '/api/v1/admin/tls', undefined, signal);
+  }
+
+  /** 上传或粘贴 PEM 证书与私钥写入证书目录，并按需开启 TLS */
+  async uploadAdminTlsCertificate(input: AdminTlsCertificateInput): Promise<AdminTlsMutationResult> {
+    return this.request('PUT', '/api/v1/admin/tls/certificate', input);
+  }
+
+  /** 在线切换 TLS 开关或激活目录里的其他证书文件名 */
+  async updateAdminTls(patch: AdminTlsPatchInput): Promise<AdminTlsMutationResult> {
+    return this.request('PATCH', '/api/v1/admin/tls', patch);
+  }
+
+  /** 立即从磁盘重载激活证书并刷新运行期 TLS 上下文 */
+  async reloadAdminTls(): Promise<AdminTlsView> {
+    return this.request('POST', '/api/v1/admin/tls/reload');
   }
 
   // ---- SSE

@@ -20,6 +20,7 @@ import { ConsoleApiError, ConsoleClient } from '../store/console-store';
 import type {
   AdminSettingsData,
   AdminSliceKey,
+  AdminTlsView,
   AdminUserRow,
   GatewayRuntimeStatus,
   SecurityWarning,
@@ -61,6 +62,10 @@ export interface AdminViewProps {
   onRefreshRuntime: () => Promise<void>;
   /** 设置 PATCH / 密钥操作成功：App 用返回的最新脱敏视图整体替换设置切片 */
   onSettingsChanged: (next: AdminSettingsData) => void;
+  /** 原生 TLS 与证书状态切片（App 进视图拉取 + 修改返回落库） */
+  tls: AdminTlsView | null;
+  /** TLS 启停 / 上传 / 选证 / 重载成功：更新 TLS 切片并按需刷新运行态 */
+  onTlsChanged: (next: AdminTlsView) => void;
 }
 
 /** 浏览器侧读取当前界面语言（formatQuotaExpiry / formatBytesQuota 的入参）；与 Modal.resolveCloseLabel 同源 */
@@ -98,6 +103,21 @@ export function adminErrorToKey(err: unknown): LocaleKey {
       return 'error.smtpNotConfigured';
     case 'SMTP_SEND_FAILED':
       return 'error.smtpSendFailed';
+    case 'TLS_INVALID_FILENAME':
+      return 'error.tlsInvalidFilename';
+    case 'TLS_CERT_DIR_READONLY':
+      return 'error.tlsCertDirReadonly';
+    case 'TLS_CERT_MISSING':
+      return 'error.tlsCertMissing';
+    case 'TLS_KEY_MISSING':
+      return 'error.tlsKeyMissing';
+    case 'TLS_CERT_INVALID':
+    case 'TLS_KEY_INVALID':
+      return 'error.tlsCertInvalid';
+    case 'TLS_KEY_ENCRYPTED':
+      return 'error.tlsKeyEncrypted';
+    case 'TLS_CERT_KEY_MISMATCH':
+      return 'error.tlsCertKeyMismatch';
     case 'NETWORK_ERROR':
     case 'NO_TRANSPORT':
       return 'error.network';
@@ -180,6 +200,10 @@ export function RuntimeStrip(props: {
   const metaItems: Array<{ label: string; value: string; source?: string; mono?: boolean }> = [
     { label: t('admin.runtimeTcpPort'), value: runtime === null ? '—' : `:${runtime.listenPort}`, mono: true },
     {
+      label: t('admin.tlsStatus'),
+      value: runtime === null ? '—' : t(runtime.tlsEnabled ? 'admin.tlsStateOn' : 'admin.tlsStateOff'),
+    },
+    {
       label: t('admin.publicUrl'),
       value: runtime === null || runtime.publicUrlEffective === '' ? '—' : runtime.publicUrlEffective,
       source: runtime === null ? undefined : publicUrlSourceText(runtime.publicUrlSource, t),
@@ -198,15 +222,21 @@ export function RuntimeStrip(props: {
     },
   ];
 
-  const showHeadBar = title !== undefined || allowSignup !== undefined || smtpConfigured !== undefined;
+  const showHeadBar = title !== undefined || allowSignup !== undefined || smtpConfigured !== undefined || runtime !== null;
 
   return (
     <section className="admin-overview" aria-label={title ?? t('view.admin')}>
       {showHeadBar && (
         <div className="admin-head-bar">
           {title !== undefined && <h2 className="page-title">{title}</h2>}
-          {(allowSignup !== undefined || smtpConfigured !== undefined) && (
+          {(allowSignup !== undefined || smtpConfigured !== undefined || runtime !== null) && (
             <div className="admin-head-badges">
+              {runtime !== null && (
+                <span className="admin-status-pill">
+                  <span className={runtime.tlsEnabled ? 'dot ok' : 'dot muted'} aria-hidden="true" />
+                  {t(runtime.tlsEnabled ? 'admin.tlsStateOn' : 'admin.tlsStateOff')}
+                </span>
+              )}
               {allowSignup !== undefined && (
                 <span className="admin-status-pill">
                   <span className={allowSignup ? 'dot ok' : 'dot muted'} aria-hidden="true" />
@@ -255,17 +285,35 @@ export function RuntimeStrip(props: {
 }
 
 /** 非阻塞安全告警横幅（warn-tint）：只提示不锁死，绝无「允许不安全连接」开关 */
+function securityWarningView(warning: SecurityWarning): { tone: 'tint-warn' | 'tint-danger'; key: LocaleKey } {
+  switch (warning) {
+    case 'PUBLIC_HTTP_PLAINTEXT':
+      return { tone: 'tint-warn', key: 'admin.advisoryPublicHttp' };
+    case 'UDP_ALT_DISABLED':
+      return { tone: 'tint-warn', key: 'admin.advisoryUdpAlt' };
+    case 'TLS_CERT_EXPIRING_SOON':
+      return { tone: 'tint-warn', key: 'admin.advisoryTlsCertExpiringSoon' };
+    case 'TLS_CERT_EXPIRED':
+      return { tone: 'tint-danger', key: 'admin.advisoryTlsCertExpired' };
+    case 'TLS_RELOAD_FAILED':
+      return { tone: 'tint-danger', key: 'admin.advisoryTlsReloadFailed' };
+  }
+}
+
 function SecurityAdvisories(props: { t: TranslateFn; warnings: SecurityWarning[] }) {
   const { t, warnings } = props;
   if (warnings.length === 0) return null;
   return (
     <>
-      {warnings.map((warning) => (
-        <div className="warn-banner tint-warn" key={warning} role="status">
-          <AlertIcon size={16} />
-          <p>{warning === 'PUBLIC_HTTP_PLAINTEXT' ? t('admin.advisoryPublicHttp') : t('admin.advisoryUdpAlt')}</p>
-        </div>
-      ))}
+      {warnings.map((warning) => {
+        const spec = securityWarningView(warning);
+        return (
+          <div className={`warn-banner ${spec.tone}`} key={warning} role={spec.tone === 'tint-danger' ? 'alert' : 'status'}>
+            <AlertIcon size={16} />
+            <p>{t(spec.key)}</p>
+          </div>
+        );
+      })}
     </>
   );
 }
@@ -285,6 +333,7 @@ export function AdminView(props: AdminViewProps) {
     settings,
     groups,
     users,
+    tls,
     adminLoad,
     adminError,
     currentUserId,
@@ -295,6 +344,7 @@ export function AdminView(props: AdminViewProps) {
     onRefreshGroups,
     onRefreshRuntime,
     onSettingsChanged,
+    onTlsChanged,
   } = props;
 
   const [tab, setTab] = useState<AdminTab>('users');
@@ -303,7 +353,11 @@ export function AdminView(props: AdminViewProps) {
   // 任一管理切片末次刷新失败时给一条非阻塞提示：面板显示的是旧数据兜底，
   // 不阻塞标签页（成功补拍后 adminError 归 null，提示自动消失）
   const anySliceError =
-    adminError.runtime !== null || adminError.settings !== null || adminError.groups !== null || adminError.users !== null;
+    adminError.runtime !== null ||
+    adminError.settings !== null ||
+    adminError.groups !== null ||
+    adminError.users !== null ||
+    adminError.tls !== null;
 
   const handleTablistKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
     const current = TAB_ORDER.indexOf(tab);
@@ -412,9 +466,11 @@ export function AdminView(props: AdminViewProps) {
             settings={settings}
             groups={groups}
             runtime={runtime}
+            tls={tls}
             ui={ui}
             onUi={onUi}
             onSettingsChanged={onSettingsChanged}
+            onTlsChanged={onTlsChanged}
             onRefreshGroups={onRefreshGroups}
             onRefreshRuntime={onRefreshRuntime}
           />
