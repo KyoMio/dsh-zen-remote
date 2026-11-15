@@ -2539,3 +2539,26 @@ describe('GT-4：TLS 词典、Store 状态隔离与 ConsoleClient 方法', () =>
     assert.equal(calls[3].url, '/api/v1/admin/tls/reload');
   });
 });
+
+describe('PAS-2：加入方式收敛为两项与 manual 无口令格式化', () => {
+  test('词典与 NetworkView 仅提供 both / manual 两项单选并保留旧 key 只读提示', () => {
+    assert.equal(LOCALES.zh['network.admissionBoth'], '有邀请链接就自动加入，否则需要手动批准');
+    assert.equal(LOCALES.zh['network.admissionManual'], '所有设备都需要我批准');
+    assert.ok('network.admissionLegacyKeyHint' in LOCALES.zh);
+    assert.ok('network.admissionLegacyKeyHint' in LOCALES.en);
+
+    const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const source = fs.readFileSync(path.join(pkgDir, 'src/web/components/NetworkView.tsx'), 'utf8');
+    assert.ok(!source.includes("['key', t('network.admissionKey')]"), '新建/设置单选组不再提供 key 选项');
+    assert.ok(source.includes("['both', t('network.admissionBoth')]"));
+    assert.ok(source.includes("['manual', t('network.admissionManual')]"));
+    assert.ok(source.includes("network.admissionMode === 'key'"), 'legacy key 网络设置弹窗需展示只读提示');
+    assert.ok(source.includes("t('network.admissionLegacyKeyHint')"));
+  });
+
+  test('maskInviteUri 与 buildHeadlessJoinCommand 对 manual 无 # 链接不加多余掩码后缀', () => {
+    const manualUri = 'zr-net://gw.local:19393/0123456789abcdef';
+    assert.equal(maskInviteUri(manualUri), manualUri);
+    assert.equal(buildHeadlessJoinCommand(manualUri), `dsh-zen-remote setup --role peer --invite "${manualUri}"`);
+  });
+});

@@ -228,7 +228,6 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
           {(
             [
               ['both', t('network.admissionBoth')],
-              ['key', t('network.admissionKey')],
               ['manual', t('network.admissionManual')],
             ] as const
           ).map(([mode, label]) => (
@@ -244,6 +243,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
               <span>{label}</span>
             </label>
           ))}
+          {network.admissionMode === 'key' && <p className="field-hint">{t('network.admissionLegacyKeyHint')}</p>}
         </fieldset>
 
         <div className="danger-zone">
@@ -407,7 +407,6 @@ export function NewNetworkModal({ t, ui, onUi, busy, onCreate, quota }: NewNetwo
           {(
             [
               ['both', t('network.admissionBoth')],
-              ['key', t('network.admissionKey')],
               ['manual', t('network.admissionManual')],
             ] as const
           ).map(([mode, label]) => (

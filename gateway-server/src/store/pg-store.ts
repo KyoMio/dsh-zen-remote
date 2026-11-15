@@ -1177,8 +1177,12 @@ export class PgStore implements GatewayStore {
         incomingPublicKeyHex: input.publicKeyHex,
         joinKeyMatched: input.joinKeyMatched,
         capacityUsed,
+        isReconnect: input.isReconnect,
       });
 
+      if (decision === 'removed') {
+        throw new StoreError('member-removed', `member ${input.nodeId} was removed from network ${input.networkId}`);
+      }
       if (decision === 'reject') return null;
       if (decision === 'limit-reached') {
         // F3：口令匹配但席位满，明确抛错，让上层能把「网络已满」与「口令错误」区分开
@@ -1196,10 +1200,10 @@ export class PgStore implements GatewayStore {
         // 决策值 authorize 落库为状态值 authorized
         const nextStatus: MemberStatus = decision === 'authorize' ? 'authorized' : 'pending';
         if (existingRow !== null) {
-          // revoked 复活：换上来的公钥生效、清候选
+          // revoked 复活或离线退网后在 manual 模式显式重加：换上来的公钥生效、清候选并刷新 created_at 标定新加入纪元
           const updated = await tx(
-            'UPDATE network_members SET status = $3, public_key_hex = $4, candidate_public_key_hex = NULL WHERE network_id = $1 AND node_id = $2 RETURNING *',
-            [input.networkId, input.nodeId, nextStatus, input.publicKeyHex],
+            'UPDATE network_members SET status = $3, public_key_hex = $4, candidate_public_key_hex = NULL, created_at = $5 WHERE network_id = $1 AND node_id = $2 RETURNING *',
+            [input.networkId, input.nodeId, nextStatus, input.publicKeyHex, new Date()],
           );
           return mapMemberRow(updated.rows[0] as Row);
         }

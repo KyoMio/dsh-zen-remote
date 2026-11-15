@@ -446,6 +446,13 @@ export interface JoinAttemptInput {
   /** 挑战验签通过后，调用方比对 join key 的结果（HTTP 层职责，store 不碰明文口令） */
   joinKeyMatched: boolean;
   /**
+   * 节点端声明为已入网后的自动重连（`reconnect: true`）。当成员行缺失或为
+   * `revoked` 时由 store 返回 `'removed'` / 抛 `'member-removed'`，阻断离线
+   * 移除或重启后携旧口令静默复活；同时仅当 `!isReconnect` 时在 `manual`
+   * 模式下要求原 `authorized` 成员重新进 `pending` 审批。
+   */
+  isReconnect?: boolean;
+  /**
    * 调用方压入的有效席位上限（GC-fix-batch1 R1）：非管理员属主的用户组
    * maxPeersPerNetwork 由 WS 层解析后传入，事务内与 network.max_peers 取小后
    * 作为容量判定上限；缺省 = 只按 network.max_peers（管理员豁免组上限）。
@@ -470,6 +477,7 @@ export type StoreErrorCode =
   | 'limit-reached'
   | 'invalid-transition'
   | 'member-not-found'
+  | 'member-removed'
   | 'network-not-found'
   | 'user-not-found'
   // GC-2：用户组 / 唯一活跃管理员 / 邮箱 OTP
@@ -494,7 +502,7 @@ export class StoreError extends Error {
 
 // ---------------------------------------------------------------- 入网判定（共享决策）
 
-export type JoinDecision = 'authorize' | 'pending' | 'reject' | 'keep' | 'mismatch' | 'limit-reached';
+export type JoinDecision = 'authorize' | 'pending' | 'reject' | 'keep' | 'mismatch' | 'limit-reached' | 'removed';
 
 export interface JoinDecisionInput {
   admissionMode: AdmissionMode;
@@ -505,17 +513,21 @@ export interface JoinDecisionInput {
   joinKeyMatched: boolean;
   /** authorized + paused + mismatch 的成员数（mismatch 也占席位） */
   capacityUsed: number;
+  /** 是否为已入网后的自动重连（reconnect: true）；见 JoinAttemptInput.isReconnect */
+  isReconnect?: boolean;
 }
 
 /**
- * 入网状态决策（PG-3 任务单语义 + PG-3-fix F2/F3 + PC-10 统一席位口径 + manual/both 全矩阵校准）：
+ * 入网状态决策（PG-3 任务单语义 + PG-3-fix F2/F3 + PC-10 统一席位口径 + manual/both 全矩阵校准 + PAS-1a 防复活）：
+ * - 已入网重连（isReconnect === true）且行缺失或为 revoked → 'removed'（阻断离线移除/拒批后携旧口令复活）；
  * - 已存在且非 revoked、公钥不同 → 'mismatch'（暂存候选，等管理员裁决）；但 pending（不占席）
  *   换钥滑入 mismatch（占席）是新增席位，满额时同样明确抛 'limit-reached'，不允许借道占席；
  *   authorized/paused → mismatch 是占席内的原位换钥，席位不变、不查容量；
  * - 已存在且非 revoked、公钥相同：
  *   - 若当前为 'pending' 且本次持有效口令（key/both 模式） → 按新准入校验席位升 'authorize' 或 'limit-reached'；
+ *   - 若为 manual 模式、显式新入网（!isReconnect）且旧状态为 'authorized'（离线退网留存旧行） → 回落 'pending' 重批；
  *   - 其余状态 → 'keep'（保持现状，幂等；manual 下持邀请链接重试仍保持 pending）；
- * - 新成员或此前 revoked：
+ * - 新成员或此前 revoked（!isReconnect）：
  *   - 口令匹配（key/both 模式）且席位未满 → 'authorize'；
  *   - 口令匹配（key/both 模式）但席位满 → 'limit-reached'（store 层转 StoreError——上层需要向节点端
  *     明确区分「网络已满」与「口令错误」，两者不能都落成 null）；
@@ -523,7 +535,10 @@ export interface JoinDecisionInput {
  *   - key 模式口令不匹配 → 'reject'，拒绝不入库。
  */
 export function decideJoinAttempt(input: JoinDecisionInput): JoinDecision {
-  const { admissionMode, maxPeers, existing, incomingPublicKeyHex, joinKeyMatched, capacityUsed } = input;
+  const { admissionMode, maxPeers, existing, incomingPublicKeyHex, joinKeyMatched, capacityUsed, isReconnect } = input;
+  if (isReconnect === true && (existing === null || existing.status === 'revoked')) {
+    return 'removed';
+  }
   const keyAdmitted = joinKeyMatched && (admissionMode === 'key' || admissionMode === 'both');
   if (existing !== null && existing.status !== 'revoked') {
     if (existing.publicKeyHex !== incomingPublicKeyHex) {
@@ -534,6 +549,9 @@ export function decideJoinAttempt(input: JoinDecisionInput): JoinDecision {
     }
     if (existing.status === 'pending' && keyAdmitted) {
       return capacityUsed < maxPeers ? 'authorize' : 'limit-reached';
+    }
+    if (admissionMode === 'manual' && isReconnect !== true && existing.status === 'authorized') {
+      return 'pending';
     }
     return 'keep';
   }

@@ -11,6 +11,12 @@
 import { randomBytes } from 'node:crypto';
 
 import { decryptSecret, encryptSecret } from '../master-key.js';
+import {
+  normalizeNetworkId,
+  normalizeNodeId,
+  normalizePublicKeyHex,
+  verifyGatewayLeaveSignature,
+} from '../peer-hub/peer-crypto.js';
 import { ApiError, readJsonObjectBody, requestIsHttps, requireUser, runHook, sendOk } from './auth.js';
 import type { RouteContext, RouteDef } from './auth.js';
 import type {
@@ -137,6 +143,9 @@ async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<R
     }
   }
   const endpoint = buildJoinEndpoint(ctx);
+  // PAS-1b：manual（所有设备都需要批准）模式生成无 #joinKey 邀请链接，避免“带口令即自动入网”的误导；
+  // 仍保留 response 中的 joinKey 字段以便切回 both 时沿用，真正准入逻辑始终以服务端 admissionMode 为准。
+  const uriSuffix = network.admissionMode === 'manual' ? '' : `#${joinKey}`;
   return {
     id: network.id,
     name: network.name,
@@ -144,7 +153,7 @@ async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<R
     maxPeers: network.maxPeers,
     createdAt: network.createdAt,
     joinKey,
-    joinUri: `${endpoint.scheme}://${endpoint.authority}/${network.id}${endpoint.query}#${joinKey}`,
+    joinUri: `${endpoint.scheme}://${endpoint.authority}/${network.id}${endpoint.query}${uriSuffix}`,
     gatewayUrl: endpoint.gatewayUrl,
     onlineDevices: ctx.runtime.getOnlineCountByNetwork(network.id),
     totalDevices,
@@ -367,22 +376,110 @@ async function handleDeleteMember(ctx: RouteContext, params: Record<string, stri
   sendOk(ctx.res, { networkId, nodeId, removed: true });
 }
 
-/**
- * 节点端按网关地址发现可人工审批加入的网络（免 Cookie 公开面）：
- * 只返回允许无口令转人工审批（`manual` / `both`）的网络 `{ id, name }` 与总网络数 `totalNetworks`
- * （供节点端区分「网关尚未建网」与「网络均关闭人工审批」），绝不暴露 `joinKey`、`ownerId` 或成员表。
- */
-async function handleListPeerJoinableNetworks(ctx: RouteContext): Promise<void> {
-  const all = await ctx.store.listPublicNetworks();
-  const networks = all
-    .filter((n) => n.admissionMode === 'manual' || n.admissionMode === 'both')
-    .map((n) => ({ id: n.id, name: n.name }));
-  sendOk(ctx.res, { networks, totalNetworks: all.length });
+const LEAVE_WINDOW_MS = 5 * 60_000;
+const LEAVE_REPLAY_TTL_MS = 10 * 60_000;
+const LEAVE_REPLAY_MAX_ENTRIES = 4096;
+const SIGNATURE_HEX_PATTERN = /^[0-9a-fA-F]{128}$/;
+
+function createLeaveReplayCache(): Map<string, number> {
+  return new Map();
+}
+
+function pruneAndRememberLeaveSignature(cache: Map<string, number>, key: string, now: number): boolean {
+  const cutoff = now - LEAVE_REPLAY_TTL_MS;
+  for (const [k, seenAt] of cache) {
+    if (seenAt < cutoff) cache.delete(k);
+  }
+  if (cache.has(key)) return false;
+  while (cache.size >= LEAVE_REPLAY_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+  cache.set(key, now);
+  return true;
+}
+
+/** 无业务数据探活端点（PAS-1b）：仅用于客户端探测 HTTP/HTTPS 连通性，不暴露任何网络或租户信息 */
+async function handlePeerPing(ctx: RouteContext): Promise<void> {
+  sendOk(ctx.res, { gateway: true });
+}
+
+/** 节点主动退网注销端点（PAS-1b）：Ed25519 自证签名 + 时间窗 + 有界防重放 + createdAt 防过期踢人 */
+function makeHandlePeerLeave(seenLeaveSignatures: Map<string, number>) {
+  return async function handlePeerLeave(ctx: RouteContext): Promise<void> {
+    const body = await readJsonObjectBody(ctx.req);
+    const networkId = normalizeNetworkId(body['networkId']);
+    const nodeId = normalizeNodeId(body['nodeId']);
+    const publicKeyHex = normalizePublicKeyHex(body['publicKeyHex']);
+    const timestamp = body['timestamp'];
+    const signatureRaw = body['signatureHex'];
+    if (
+      networkId === null ||
+      nodeId === null ||
+      publicKeyHex === null ||
+      typeof timestamp !== 'number' ||
+      !Number.isInteger(timestamp) ||
+      typeof signatureRaw !== 'string' ||
+      !SIGNATURE_HEX_PATTERN.test(signatureRaw)
+    ) {
+      throw new ApiError(400, 'INVALID_REQUEST', 'malformed leave payload');
+    }
+
+    const now = Date.now();
+    if (Math.abs(now - timestamp) > LEAVE_WINDOW_MS) {
+      throw new ApiError(400, 'INVALID_TIMESTAMP', 'leave timestamp out of window');
+    }
+
+    const signatureHex = signatureRaw.toLowerCase();
+    if (!verifyGatewayLeaveSignature({ networkId, nodeId, publicKeyHex, timestamp, signatureHex })) {
+      throw new ApiError(401, 'INVALID_SIGNATURE', 'invalid leave signature');
+    }
+
+    const replayKey = `${networkId}:${nodeId}:${signatureHex}`;
+    if (!pruneAndRememberLeaveSignature(seenLeaveSignatures, replayKey, now)) {
+      throw new ApiError(409, 'REPLAYED_SIGNATURE', 'leave signature already used');
+    }
+
+    const network = await ctx.store.getNetwork(networkId);
+    if (network === null) {
+      sendOk(ctx.res, { networkId, nodeId, removed: false });
+      return;
+    }
+
+    const members = await ctx.store.listMembers(networkId);
+    const member = members.find((m) => m.nodeId === nodeId);
+    if (!member) {
+      sendOk(ctx.res, { networkId, nodeId, removed: false });
+      return;
+    }
+
+    const pubLower = publicKeyHex.toLowerCase();
+    const matchesActive = member.publicKeyHex.toLowerCase() === pubLower;
+    const matchesCandidate =
+      member.candidatePublicKeyHex !== null && member.candidatePublicKeyHex.toLowerCase() === pubLower;
+    if (!matchesActive && !matchesCandidate) {
+      throw new ApiError(403, 'KEY_MISMATCH', 'public key does not match member record');
+    }
+
+    // 防止 5 分钟时间窗内重入网产生的新成员记录被旧退网签名包误删
+    const createdMs = Date.parse(member.createdAt);
+    if (Number.isFinite(createdMs) && timestamp < createdMs - 5000) {
+      sendOk(ctx.res, { networkId, nodeId, removed: false, stale: true });
+      return;
+    }
+
+    await ctx.store.removeMember(networkId, nodeId);
+    await runHook(ctx.hooks.onMemberChanged, { networkId, nodeId, action: 'remove', status: 'revoked' });
+    sendOk(ctx.res, { networkId, nodeId, removed: true });
+  };
 }
 
 export function buildNetworkRoutes(): RouteDef[] {
+  const seenLeaveSignatures = createLeaveReplayCache();
   return [
-    { method: 'GET', path: '/peer/v1/networks', handler: handleListPeerJoinableNetworks },
+    { method: 'GET', path: '/peer/v1/ping', handler: handlePeerPing },
+    { method: 'POST', path: '/peer/v1/leave', handler: makeHandlePeerLeave(seenLeaveSignatures) },
     { method: 'GET', path: '/api/v1/networks', handler: handleListNetworks },
     { method: 'POST', path: '/api/v1/networks', handler: handleCreateNetwork },
     { method: 'PATCH', path: '/api/v1/networks/:id', handler: handlePatchNetwork },

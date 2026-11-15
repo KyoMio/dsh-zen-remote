@@ -7,6 +7,7 @@
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
@@ -18,6 +19,7 @@ import { createApiRequestHandler, createGatewayApiServer } from '../dist/server.
 import { TlsManager } from '../dist/tls/tls-manager.js';
 import { ZR_NATIVE_TLS_SYMBOL } from '../dist/tls/dual-protocol-server.js';
 import { decodeSmtpConfig, encodeSmtpConfig, hashToken } from '../dist/http/auth.js';
+import { gatewayLeaveMessage } from '../dist/peer-hub/peer-crypto.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { deriveMasterKeyFromSecret, hashPassword, decryptSecret } from '../dist/master-key.js';
 import { maskInviteUri } from '../dist/web/format.js';
@@ -1035,28 +1037,120 @@ describe('publicUrl 主机与运行时统计注入（独立实例）', () => {
     assert.equal(adminRow.relayKbps, 0);
   });
 
-  test('GET /peer/v1/networks：免登录仅返回可人工审批（both/manual）活跃租户网络，零敏感字段', async () => {
-    await api(handle.base, 'POST', '/api/v1/networks', {
+  test('PAS-1b：下线 /peer/v1/networks（404）、新增无泄漏 /peer/v1/ping（200）且 manual joinUri 省略 #joinKey', async () => {
+    const bothRes = await api(handle.base, 'POST', '/api/v1/networks', {
       cookie: tenantCookie,
-      body: { name: 'key-only-net', admissionMode: 'key' },
+      body: { name: 'both-net-pas1b', admissionMode: 'both' },
     });
+    assert.equal(bothRes.status, 200);
+    assert.ok(bothRes.json.data.joinUri.includes(`#${bothRes.json.data.joinKey}`), 'both 模式邀请链接应附带 #joinKey');
+
     const manualRes = await api(handle.base, 'POST', '/api/v1/networks', {
       cookie: adminCookie,
-      body: { name: 'manual-net', admissionMode: 'manual' },
+      body: { name: 'manual-net-pas1b', admissionMode: 'manual' },
     });
     assert.equal(manualRes.status, 200);
+    assert.ok(!manualRes.json.data.joinUri.includes('#'), 'manual 模式邀请链接应省略 #joinKey');
+    assert.equal(typeof manualRes.json.data.joinKey, 'string');
 
-    const pub = await api(handle.base, 'GET', '/peer/v1/networks');
-    assert.equal(pub.status, 200);
-    assert.equal(pub.json.ok, true);
-    assert.equal(pub.json.data.totalNetworks, 3);
-    assert.deepEqual(
-      pub.json.data.networks.map((n) => n.name),
-      ['via-public-url', 'manual-net'],
-    );
-    for (const row of pub.json.data.networks) {
-      assert.deepEqual(Object.keys(row).sort(), ['id', 'name']);
-    }
+    const legacyPub = await api(handle.base, 'GET', '/peer/v1/networks');
+    assert.equal(legacyPub.status, 404);
+
+    const ping = await api(handle.base, 'GET', '/peer/v1/ping');
+    assert.equal(ping.status, 200);
+    assert.deepEqual(ping.json, { ok: true, data: { gateway: true } });
+  });
+
+  test('PAS-1b：POST /peer/v1/leave 验签、防重放、归属校验、过期退网防踢新与幂等清除', async () => {
+    const netRes = await api(handle.base, 'POST', '/api/v1/networks', {
+      cookie: adminCookie,
+      body: { name: 'leave-rest-net', admissionMode: 'both' },
+    });
+    assert.equal(netRes.status, 200);
+    const netId = netRes.json.data.id;
+
+    const kp1 = generateKeyPairSync('ed25519');
+    const kp2 = generateKeyPairSync('ed25519');
+    const pub1 = kp1.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
+    const pub2 = kp2.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
+    const node1 = createHash('sha256').update(Buffer.from(pub1, 'hex')).digest('hex').slice(0, 8);
+    const signLeave = (ts, kp = kp1, nId = netId, peerId = node1) =>
+      sign(null, gatewayLeaveMessage(nId, peerId, ts), kp.privateKey).toString('hex');
+
+    // 先生成早于入网时间的“旧退网包”（仅早 20s，仍在 ±5min 窗口内）
+    const staleTs = Date.now() - 20_000;
+    const staleSig = signLeave(staleTs);
+
+    await handle.store.upsertMemberJoinAttempt({
+      networkId: netId,
+      nodeId: node1,
+      name: 'leave-dev',
+      publicKeyHex: pub1,
+      joinKeyMatched: true,
+    });
+
+    // 错签名 → 401
+    const badSigRes = await api(handle.base, 'POST', '/peer/v1/leave', {
+      body: { networkId: netId, nodeId: node1, publicKeyHex: pub1, timestamp: Date.now(), signatureHex: '00'.repeat(64) },
+    });
+    assert.equal(badSigRes.status, 401);
+
+    // 超窗时间戳 → 400
+    const oldTs = Date.now() - 10 * 60_000;
+    const oldTsRes = await api(handle.base, 'POST', '/peer/v1/leave', {
+      body: { networkId: netId, nodeId: node1, publicKeyHex: pub1, timestamp: oldTs, signatureHex: signLeave(oldTs) },
+    });
+    assert.equal(oldTsRes.status, 400);
+
+    // 过期退网包不得踢掉刚重入网的成员
+    const staleRes = await api(handle.base, 'POST', '/peer/v1/leave', {
+      body: { networkId: netId, nodeId: node1, publicKeyHex: pub1, timestamp: staleTs, signatureHex: staleSig },
+    });
+    assert.equal(staleRes.status, 200);
+    assert.deepEqual(staleRes.json.data, { networkId: netId, nodeId: node1, removed: false, stale: true });
+    assert.equal((await handle.store.listMembers(netId)).some((m) => m.nodeId === node1), true);
+
+    // 另一把自证钥匙试图替 node1（伪造不存在的 nodeId? 不，用 kp2 对 kp2 的 nodeId 若库里是 pub1 则不命中 node1，因此测试成员 pub 不同而 nodeId 相同的篡改/越权：
+    // nodeId 绑定 sha256(pub)，故给已有 node1 传 pub2 会先被自证 nodeId 拦截为 401；同时合法 pub2 对其自身 node2 走幂等 removed: false）
+    const node2 = createHash('sha256').update(Buffer.from(pub2, 'hex')).digest('hex').slice(0, 8);
+    const tsNow = Date.now();
+    const otherRes = await api(handle.base, 'POST', '/peer/v1/leave', {
+      body: {
+        networkId: netId,
+        nodeId: node2,
+        publicKeyHex: pub2,
+        timestamp: tsNow,
+        signatureHex: signLeave(tsNow, kp2, netId, node2),
+      },
+    });
+    assert.equal(otherRes.status, 200);
+    assert.equal(otherRes.json.data.removed, false);
+
+    // 正常退网 → 200 removed: true + 清库 + 触发 hook
+    handle.hooks.memberChanged.length = 0;
+    const okTs = Date.now();
+    const okSig = signLeave(okTs);
+    const okRes = await api(handle.base, 'POST', '/peer/v1/leave', {
+      body: { networkId: netId, nodeId: node1, publicKeyHex: pub1, timestamp: okTs, signatureHex: okSig },
+    });
+    assert.equal(okRes.status, 200);
+    assert.deepEqual(okRes.json.data, { networkId: netId, nodeId: node1, removed: true });
+    assert.equal((await handle.store.listMembers(netId)).some((m) => m.nodeId === node1), false);
+    assert.deepEqual(handle.hooks.memberChanged, [{ networkId: netId, nodeId: node1, action: 'remove', status: 'revoked' }]);
+
+    // 同一签名重放 → 409 REPLAYED_SIGNATURE
+    const replayRes = await api(handle.base, 'POST', '/peer/v1/leave', {
+      body: { networkId: netId, nodeId: node1, publicKeyHex: pub1, timestamp: okTs, signatureHex: okSig },
+    });
+    assert.equal(replayRes.status, 409);
+
+    // 新时间戳重复退网 → 幂等 200 removed: false
+    const idemTs = okTs + 1;
+    const idemRes = await api(handle.base, 'POST', '/peer/v1/leave', {
+      body: { networkId: netId, nodeId: node1, publicKeyHex: pub1, timestamp: idemTs, signatureHex: signLeave(idemTs) },
+    });
+    assert.equal(idemRes.status, 200);
+    assert.deepEqual(idemRes.json.data, { networkId: netId, nodeId: node1, removed: false });
   });
 });
 

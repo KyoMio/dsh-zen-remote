@@ -1893,3 +1893,41 @@ describe('GT-5：单端口原生 TLS 热切换、HTTPS/WSS 入网与重启持久
     }
   });
 });
+
+describe('PAS-2 全栈：/peer/v1/ping 探活、下线 /peer/v1/networks 与 manual 链接动态切换', () => {
+  test('新建 manual 网络不含 #joinKey，切换 both 后恢复 #joinKey，且 /peer/v1/networks 返回 404', async () => {
+    const gw = await startTestGateway();
+    try {
+      const cookie = await login(gw.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const pingRes = await api(gw.base, 'GET', '/peer/v1/ping');
+      assert.equal(pingRes.status, 200);
+      assert.deepEqual(pingRes.json, { ok: true, data: { gateway: true } });
+
+      const oldRes = await api(gw.base, 'GET', '/peer/v1/networks');
+      assert.equal(oldRes.status, 404);
+
+      const manual = await api(gw.base, 'POST', '/api/v1/networks', {
+        body: { name: 'full-manual', admissionMode: 'manual' },
+        cookie,
+      });
+      assert.equal(manual.status, 200);
+      assert.ok(!manual.json.data.joinUri.includes('#'));
+
+      const patchedBoth = await api(gw.base, 'PATCH', `/api/v1/networks/${manual.json.data.id}`, {
+        body: { admissionMode: 'both' },
+        cookie,
+      });
+      assert.equal(patchedBoth.status, 200);
+      assert.ok(patchedBoth.json.data.joinUri.includes(`#${patchedBoth.json.data.joinKey}`));
+
+      const patchedManual = await api(gw.base, 'PATCH', `/api/v1/networks/${manual.json.data.id}`, {
+        body: { admissionMode: 'manual' },
+        cookie,
+      });
+      assert.equal(patchedManual.status, 200);
+      assert.ok(!patchedManual.json.data.joinUri.includes('#'));
+    } finally {
+      await gw.close();
+    }
+  });
+});
