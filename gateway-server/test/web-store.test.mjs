@@ -145,6 +145,7 @@ function makeRuntimeStatus(overrides = {}) {
     publicUrlEffective: 'https://gw.example.com',
     publicUrlSource: 'settings',
     smtpConfigured: true,
+    tlsEnabled: false,
     onlineDevices: 3,
     totalLiveRelayKbps: 12.5,
     cumulativeRelayBytes: 1048576,
@@ -2212,8 +2213,9 @@ describe('GC-7b：ConsoleStore 管理员切片与引用隔离', () => {
     assert.equal(s.adminSettings, null);
     assert.deepEqual(s.adminGroups, []);
     assert.deepEqual(s.adminUsers, []);
-    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle' });
-    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null });
+    assert.equal(s.adminTls, null);
+    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle', tls: 'idle' });
+    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null, tls: null });
     assert.equal(s.ui, before.ui, '表单草稿保留（既有契约）');
     assert.deepEqual(s.publicPolicy, before.publicPolicy, '公开策略匿名可见，登出不删');
     assert.deepEqual(s.networks, []);
@@ -2236,8 +2238,9 @@ describe('GC-7b：ConsoleStore 管理员切片与引用隔离', () => {
     assert.equal(s.adminSettings, null);
     assert.deepEqual(s.adminGroups, []);
     assert.deepEqual(s.adminUsers, []);
-    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle' });
-    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null });
+    assert.equal(s.adminTls, null);
+    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle', tls: 'idle' });
+    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null, tls: null });
     assert.equal(s.session, before.session, '会话不动');
     assert.equal(s.quota, before.quota, '配额不动');
     assert.equal(s.ui, before.ui);
@@ -2327,13 +2330,14 @@ describe('GC-10b：grandfathered 词条与四切片独立失败 / 彻底清理',
     store.markAdminError('settings', 'st-down');
     store.markAdminError('groups', 'gr-down');
     store.markAdminError('users', 'us-down');
+    store.markAdminError('tls', 'tls-down');
     let s = store.getState();
     assert.equal(s.adminRuntime, runtime, 'runtime 失败保留旧数据');
     assert.equal(s.adminSettings, settings, 'settings 失败保留旧数据');
     assert.equal(s.adminGroups, groups, 'groups 失败保留旧数据');
     assert.equal(s.adminUsers, users, 'users 失败保留旧数据');
-    assert.deepEqual(s.adminLoad, { runtime: 'error', settings: 'error', groups: 'error', users: 'error' });
-    assert.deepEqual(s.adminError, { runtime: 'rt-down', settings: 'st-down', groups: 'gr-down', users: 'us-down' });
+    assert.deepEqual(s.adminLoad, { runtime: 'error', settings: 'error', groups: 'error', users: 'error', tls: 'error' });
+    assert.deepEqual(s.adminError, { runtime: 'rt-down', settings: 'st-down', groups: 'gr-down', users: 'us-down', tls: 'tls-down' });
     assert.equal(s.ui, before.ui, '错误态不碰 ui 引用');
     assert.equal(s.networks, before.networks, '错误态不碰 networks 引用');
 
@@ -2359,6 +2363,7 @@ describe('GC-10b：grandfathered 词条与四切片独立失败 / 彻底清理',
     store.markAdminError('settings', 'st-down');
     store.markAdminError('groups', 'gr-down');
     store.markAdminError('users', 'us-down');
+    store.markAdminError('tls', 'tls-down');
     const before = store.getState();
 
     // App 侧切出管理视图 / 任一管理请求 401 的统一清场路径
@@ -2368,12 +2373,169 @@ describe('GC-10b：grandfathered 词条与四切片独立失败 / 彻底清理',
     assert.equal(s.adminSettings, null);
     assert.deepEqual(s.adminGroups, []);
     assert.deepEqual(s.adminUsers, []);
-    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle' });
-    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null });
+    assert.equal(s.adminTls, null);
+    assert.deepEqual(s.adminLoad, { runtime: 'idle', settings: 'idle', groups: 'idle', users: 'idle', tls: 'idle' });
+    assert.deepEqual(s.adminError, { runtime: null, settings: null, groups: null, users: null, tls: null });
     assert.equal(s.session, before.session, '会话不动');
     assert.equal(s.quota, before.quota, '配额不动');
     assert.equal(s.ui, before.ui, 'ui（菜单/弹窗/草稿）引用原样');
     assert.equal(s.networks, before.networks, 'networks 引用原样');
     assert.ok(s.topology[netA] !== undefined, 'topology 切片原样');
+  });
+});
+
+// ---------------------------------------------------------------- GT-4：原生 TLS 词典、Store 切片与 ConsoleClient 方法
+
+function makeAdminTlsView(overrides = {}) {
+  return {
+    enabled: true,
+    tlsActive: true,
+    certDirConfigured: true,
+    certDirWritable: true,
+    certFile: 'fullchain.pem',
+    keyFile: 'privkey.pem',
+    availableFiles: [
+      { name: 'fullchain.pem', kind: 'cert', sizeBytes: 1200, updatedAt: '2026-11-15T00:00:00.000Z' },
+      { name: 'privkey.pem', kind: 'key', sizeBytes: 1700, updatedAt: '2026-11-15T00:00:00.000Z' },
+    ],
+    activeCert: {
+      subject: 'CN=gw.example.com',
+      issuer: 'CN=Let’s Encrypt',
+      san: ['gw.example.com'],
+      validFrom: '2026-11-01T00:00:00.000Z',
+      validTo: '2027-02-01T00:00:00.000Z',
+      fingerprint256: 'AA:BB:CC:DD',
+      expired: false,
+      expiringSoon: false,
+    },
+    lastReloadAt: '2026-11-15T00:00:00.000Z',
+    lastReloadError: null,
+    ...overrides,
+  };
+}
+
+describe('GT-4：TLS 词典、Store 状态隔离与 ConsoleClient 方法', () => {
+  test('TLS 词条与 error.tls* 中英双语齐备且带 {n} 插值', () => {
+    const keys = [
+      'admin.tlsStatus',
+      'admin.tlsStateOn',
+      'admin.tlsStateOff',
+      'admin.advisoryTlsCertExpiringSoon',
+      'admin.advisoryTlsCertExpired',
+      'admin.advisoryTlsReloadFailed',
+      'admin.tlsSectionTitle',
+      'admin.tlsSelectFormTitle',
+      'admin.tlsUploadFormTitle',
+      'admin.tlsSwitchHttpsBanner',
+      'admin.tlsSwitchHttpsCta',
+      'error.tlsInvalidFilename',
+      'error.tlsCertDirReadonly',
+      'error.tlsCertMissing',
+      'error.tlsKeyMissing',
+      'error.tlsCertInvalid',
+      'error.tlsKeyEncrypted',
+      'error.tlsCertKeyMismatch',
+    ];
+    for (const k of keys) {
+      assert.ok(k in LOCALES.zh && LOCALES.zh[k].length > 0, `zh 缺少 ${k}`);
+      assert.ok(k in LOCALES.en && LOCALES.en[k].length > 0, `en 缺少 ${k}`);
+    }
+    assert.match(translate('zh', 'admin.tlsDaysLeft', { n: 7 }), /7/);
+    assert.match(translate('en', 'admin.tlsDaysLeft', { n: 7 }), /7/);
+  });
+
+  test('applyAdminTls 与 runtime TLS 警告保持引用隔离并随 logout/clearAdminSlices 清空', () => {
+    const store = new ConsoleStore();
+    store.init({
+      authenticated: true,
+      allowSignup: false,
+      requireEmailVerification: false,
+      smtpConfigured: false,
+      maxNetworksPerUser: 3,
+      defaultMaxPeers: 8,
+      user: { id: 'admin-1', email: 'admin@local', role: 'admin', emailVerifiedAt: null },
+      quota: {
+        groupId: 'grp_default',
+        assignedGroupId: 'grp_default',
+        groupCode: 'default',
+        groupName: 'Default',
+        groupExpiresAt: null,
+        isExpiredFallback: false,
+        maxNetworks: null,
+        maxPeersPerNetwork: 8,
+        relayRateKbps: 4096,
+        monthlyRelayQuotaBytes: null,
+        usedNetworks: 0,
+        usedMonthlyRelayBytes: 0,
+      },
+    });
+    const before = store.getState();
+
+    const rt = makeRuntimeStatus({
+      tlsEnabled: true,
+      securityWarnings: ['TLS_CERT_EXPIRING_SOON', 'TLS_RELOAD_FAILED'],
+    });
+    const tlsView = makeAdminTlsView();
+    store.applyAdminRuntime(rt);
+    store.applyAdminTls(tlsView);
+
+    const s = store.getState();
+    assert.equal(s.adminRuntime.tlsEnabled, true);
+    assert.deepEqual(s.adminRuntime.securityWarnings, ['TLS_CERT_EXPIRING_SOON', 'TLS_RELOAD_FAILED']);
+    assert.equal(s.adminTls, tlsView);
+    assert.equal(s.adminLoad.tls, 'ready');
+    assert.equal(s.adminError.tls, null);
+    assert.equal(s.ui, before.ui, 'applyAdminTls 不污染 ui 引用');
+    assert.equal(s.networks, before.networks, 'applyAdminTls 不污染 networks 引用');
+    assert.equal(s.topology, before.topology, 'applyAdminTls 不污染 topology 引用');
+
+    store.clearAdminSlices();
+    assert.equal(store.getState().adminTls, null);
+    assert.equal(store.getState().adminLoad.tls, 'idle');
+
+    store.applyAdminTls(tlsView);
+    store.logout({ allowSignup: false, maxNetworksPerUser: 3 });
+    assert.equal(store.getState().adminTls, null);
+    assert.equal(store.getState().adminLoad.tls, 'idle');
+  });
+
+  test('ConsoleClient 四个 TLS 方法与 TLS_* 错误码解包', async () => {
+    const calls = [];
+    const tlsView = makeAdminTlsView();
+    const customFetch = async (url, init = {}) => {
+      calls.push({ url, method: init.method ?? 'GET', body: init.body ? JSON.parse(init.body) : undefined });
+      if (url.endsWith('/api/v1/admin/tls/certificate') && calls.length === 2) {
+        return jsonEnvelope(400, { ok: false, error: { code: 'TLS_KEY_ENCRYPTED', message: 'encrypted' } });
+      }
+      return jsonEnvelope(200, {
+        ok: true,
+        data: { ...tlsView, suggestedHttpsUrl: 'https://gw.example.com:19393/' },
+      });
+    };
+
+    const client = new ConsoleClient({ fetchImpl: customFetch });
+    const status = await client.getAdminTls();
+    assert.equal(status.certFile, 'fullchain.pem');
+
+    await assert.rejects(
+      () => client.uploadAdminTlsCertificate({ certPem: 'C', keyPem: 'K', enableTls: true }),
+      (err) => err instanceof ConsoleApiError && err.code === 'TLS_KEY_ENCRYPTED',
+    );
+
+    const patched = await client.updateAdminTls({ enabled: true, certFile: 'alt.pem', keyFile: 'alt.key' });
+    assert.equal(patched.suggestedHttpsUrl, 'https://gw.example.com:19393/');
+    const reloaded = await client.reloadAdminTls();
+    assert.equal(reloaded.tlsActive, true);
+
+    assert.equal(calls[0].method, 'GET');
+    assert.equal(calls[0].url, '/api/v1/admin/tls');
+    assert.equal(calls[1].method, 'PUT');
+    assert.equal(calls[1].url, '/api/v1/admin/tls/certificate');
+    assert.deepEqual(calls[1].body, { certPem: 'C', keyPem: 'K', enableTls: true });
+    assert.equal(calls[2].method, 'PATCH');
+    assert.equal(calls[2].url, '/api/v1/admin/tls');
+    assert.deepEqual(calls[2].body, { enabled: true, certFile: 'alt.pem', keyFile: 'alt.key' });
+    assert.equal(calls[3].method, 'POST');
+    assert.equal(calls[3].url, '/api/v1/admin/tls/reload');
   });
 });

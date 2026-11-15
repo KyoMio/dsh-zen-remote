@@ -10,13 +10,14 @@
 // 表单草稿全部本地 state；settings 引用变化（父级补拍）时重新播种，
 // PATCH 成功后经 onSettingsChanged 用返回的脱敏视图整体替换。
 import { useEffect, useState } from 'react';
-import type { FormEvent } from 'react';
+import type { ChangeEvent, FormEvent } from 'react';
 
 import { ConsoleApiError } from '../store/console-store';
 import type {
   AdminSettingsData,
   AdminSettingsPatch,
   AdminSmtpDraft,
+  AdminTlsView,
   ConsoleClient,
   GatewayRuntimeStatus,
   SmtpSecurity,
@@ -35,10 +36,13 @@ export interface AdminGatewaySettingsProps {
   settings: AdminSettingsData;
   groups: UserGroup[];
   runtime: GatewayRuntimeStatus | null;
+  tls: AdminTlsView | null;
   ui: UiLocalState;
   onUi: (patch: Partial<UiLocalState>) => void;
   /** PATCH / 生成 / 吊销成功后：父级用返回的最新脱敏视图整体替换设置镜像 */
   onSettingsChanged: (next: AdminSettingsData) => void;
+  /** TLS 启停 / 选证 / 上传 / 重载成功后：父级更新 TLS 状态切片 */
+  onTlsChanged: (next: AdminTlsView) => void;
   /** 默认组可能被设置面板切换，补拍组列表同步用户组标签页 */
   onRefreshGroups: () => Promise<void>;
   /** publicUrl 热改后刷新页头运行态条（生效入口与来源标签立即跟随） */
@@ -714,8 +718,470 @@ function ApiKeySection(props: {
 
 // ---------------------------------------------------------------- 面板壳
 
+function formatTlsDate(iso: string): string {
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return iso;
+  try {
+    return new Intl.DateTimeFormat(readLocale() === 'zh' ? 'zh-CN' : 'en-US', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    }).format(new Date(ts));
+  } catch {
+    return iso;
+  }
+}
+
+function tlsCertDaysLeft(validToIso: string): number {
+  const ts = Date.parse(validToIso);
+  if (!Number.isFinite(ts)) return 0;
+  return Math.max(0, Math.ceil((ts - Date.now()) / 86_400_000));
+}
+
+function isSafeHttpsUrl(url: string | null | undefined): url is string {
+  return typeof url === 'string' && /^https:\/\/[^\s]+$/i.test(url);
+}
+
+/** 区块 2：原生单端口 TLS 与证书管理（状态卡片 / 目录选证与开关 / 上传粘贴 PEM） */
+function TlsCertSection(props: {
+  t: TranslateFn;
+  client: ConsoleClient;
+  tls: AdminTlsView | null;
+  onTlsChanged: AdminGatewaySettingsProps['onTlsChanged'];
+}) {
+  const { t, client, tls, onTlsChanged } = props;
+
+  const [enabledDraft, setEnabledDraft] = useState(tls?.enabled ?? false);
+  const [certFileDraft, setCertFileDraft] = useState(tls?.certFile ?? 'fullchain.pem');
+  const [keyFileDraft, setKeyFileDraft] = useState(tls?.keyFile ?? 'privkey.pem');
+  const [selectBusy, setSelectBusy] = useState(false);
+  const [reloadBusy, setReloadBusy] = useState(false);
+  const [selectErrorKey, setSelectErrorKey] = useState<LocaleKey | null>(null);
+  const [selectStatusText, setSelectStatusText] = useState<string | null>(null);
+
+  const [certPem, setCertPem] = useState('');
+  const [keyPem, setKeyPem] = useState('');
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadErrorKey, setUploadErrorKey] = useState<LocaleKey | null>(null);
+  const [uploadStatusText, setUploadStatusText] = useState<string | null>(null);
+
+  const [suggestedHttpsUrl, setSuggestedHttpsUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (tls === null) return;
+    setEnabledDraft(tls.enabled);
+    setCertFileDraft(tls.certFile);
+    setKeyFileDraft(tls.keyFile);
+  }, [tls]);
+
+  if (tls === null) {
+    return (
+      <div>
+        <p className="section-title" style={{ margin: '0 0 8px' }}>
+          {t('admin.tlsSectionTitle')}
+        </p>
+        <p className="field-hint">{t('app.loading')}</p>
+      </div>
+    );
+  }
+
+  const certOptions = Array.from(
+    new Set([
+      ...(certFileDraft !== '' ? [certFileDraft] : []),
+      ...tls.availableFiles.filter((f) => f.kind === 'cert').map((f) => f.name),
+    ]),
+  );
+  const keyOptions = Array.from(
+    new Set([
+      ...(keyFileDraft !== '' ? [keyFileDraft] : []),
+      ...tls.availableFiles.filter((f) => f.kind === 'key').map((f) => f.name),
+    ]),
+  );
+
+  const maybeTrackHttpsRedirect = (nextUrl: string | null | undefined, nextActive: boolean): void => {
+    if (isSafeHttpsUrl(nextUrl) && (typeof window === 'undefined' || window.location.protocol === 'http:')) {
+      setSuggestedHttpsUrl(nextUrl);
+    } else if (!nextActive) {
+      setSuggestedHttpsUrl(null);
+    }
+  };
+
+  const submitSelect = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    if (selectBusy || reloadBusy) return;
+    setSelectBusy(true);
+    setSelectErrorKey(null);
+    setSelectStatusText(null);
+    try {
+      const updated = await client.updateAdminTls({
+        enabled: enabledDraft,
+        certFile: certFileDraft,
+        keyFile: keyFileDraft,
+      });
+      onTlsChanged(updated);
+      maybeTrackHttpsRedirect(updated.suggestedHttpsUrl, updated.tlsActive);
+      setSelectStatusText(t('admin.tlsSavedToast'));
+    } catch (err) {
+      setSelectErrorKey(adminErrorToKey(err));
+    } finally {
+      setSelectBusy(false);
+    }
+  };
+
+  const handleReloadNow = async (): Promise<void> => {
+    if (reloadBusy || selectBusy) return;
+    setReloadBusy(true);
+    setSelectErrorKey(null);
+    setSelectStatusText(null);
+    try {
+      const updated = await client.reloadAdminTls();
+      onTlsChanged(updated);
+      setSelectStatusText(t('admin.tlsReloadedToast'));
+    } catch (err) {
+      setSelectErrorKey(adminErrorToKey(err));
+    } finally {
+      setReloadBusy(false);
+    }
+  };
+
+  const handlePickPemFile = (target: 'cert' | 'key') => async (event: ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = event.target.files?.[0];
+    if (file === undefined) return;
+    try {
+      const text = await file.text();
+      if (target === 'cert') setCertPem(text);
+      else setKeyPem(text);
+      setUploadErrorKey(null);
+      setUploadStatusText(null);
+    } finally {
+      event.target.value = '';
+    }
+  };
+
+  const submitUpload = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    if (uploadBusy) return;
+    const submitter = (event.nativeEvent as SubmitEvent | undefined)?.submitter;
+    const enableTls = submitter instanceof HTMLButtonElement && submitter.dataset['enableTls'] === 'true';
+    setUploadBusy(true);
+    setUploadErrorKey(null);
+    setUploadStatusText(null);
+    try {
+      const updated = await client.uploadAdminTlsCertificate({
+        certPem,
+        keyPem,
+        certFile: certFileDraft || 'fullchain.pem',
+        keyFile: keyFileDraft || 'privkey.pem',
+        enableTls,
+      });
+      onTlsChanged(updated);
+      maybeTrackHttpsRedirect(updated.suggestedHttpsUrl, updated.tlsActive);
+      setUploadStatusText(t('admin.tlsSavedToast'));
+      setCertPem('');
+      setKeyPem('');
+    } catch (err) {
+      setUploadErrorKey(adminErrorToKey(err));
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
+  const cert = tls.activeCert;
+  const daysLeft = cert !== null ? tlsCertDaysLeft(cert.validTo) : 0;
+  const reloadErrorText =
+    tls.lastReloadError === null
+      ? null
+      : `${t(adminErrorToKey(new ConsoleApiError(400, tls.lastReloadError.code, tls.lastReloadError.message)))} (${tls.lastReloadError.code})`;
+
+  return (
+    <div>
+      <div className="tls-status-head">
+        <p className="section-title" style={{ margin: 0 }}>
+          {t('admin.tlsSectionTitle')}
+        </p>
+        <span className="admin-status-pill">
+          <span className={tls.tlsActive ? 'dot ok' : 'dot muted'} aria-hidden="true" />
+          {t(tls.tlsActive ? 'admin.tlsStateOn' : 'admin.tlsStateOff')}
+        </span>
+      </div>
+      <p className="field-hint">{t('admin.tlsSectionDesc')}</p>
+      <p className="field-hint">{t(tls.certDirWritable ? 'admin.tlsMountDirHint' : 'admin.tlsDirReadonlyHint')}</p>
+
+      {isSafeHttpsUrl(suggestedHttpsUrl) && (
+        <div className="tls-https-cta" role="status">
+          <p>{t('admin.tlsSwitchHttpsBanner')}</p>
+          <a className="btn primary" href={suggestedHttpsUrl}>
+            {t('admin.tlsSwitchHttpsCta')}
+          </a>
+        </div>
+      )}
+
+      <div className="tls-status-card">
+        <p className="field-label" style={{ margin: 0 }}>
+          {t('admin.tlsActiveCert')}
+        </p>
+        {cert === null ? (
+          <p className="field-hint" style={{ marginTop: 6 }}>
+            {t('admin.tlsNoActiveCert')}
+          </p>
+        ) : (
+          <dl className="tls-meta-grid">
+            <div>
+              <dt>{t('admin.tlsDomains')}</dt>
+              <dd className="mono">{cert.san.length > 0 ? cert.san.join(', ') : cert.subject || '—'}</dd>
+            </div>
+            <div>
+              <dt>{t('admin.tlsIssuer')}</dt>
+              <dd>{cert.issuer || '—'}</dd>
+            </div>
+            <div>
+              <dt>{t('admin.tlsValidUntil')}</dt>
+              <dd>
+                <span className="mono">{formatTlsDate(cert.validTo)}</span>
+                <span className="tls-cert-badges">
+                  {!cert.expired && <span>{t('admin.tlsDaysLeft', { n: daysLeft })}</span>}
+                  {cert.expired && <span className="badge danger">{t('admin.tlsExpiredBadge')}</span>}
+                  {!cert.expired && cert.expiringSoon && <span className="badge">{t('admin.tlsExpiringSoonBadge')}</span>}
+                </span>
+              </dd>
+            </div>
+            <div>
+              <dt>{t('admin.tlsFingerprint')}</dt>
+              <dd className="mono">{cert.fingerprint256}</dd>
+            </div>
+          </dl>
+        )}
+        <dl className="tls-meta-grid">
+          <div>
+            <dt>{t('admin.tlsCertFileLabel')}</dt>
+            <dd className="mono">{tls.certFile}</dd>
+          </div>
+          <div>
+            <dt>{t('admin.tlsKeyFileLabel')}</dt>
+            <dd className="mono">{tls.keyFile}</dd>
+          </div>
+          <div>
+            <dt>{t('admin.tlsLastReload')}</dt>
+            <dd className="mono">{tls.lastReloadAt !== null ? formatTlsDate(tls.lastReloadAt) : '—'}</dd>
+          </div>
+        </dl>
+        {reloadErrorText !== null && (
+          <p className="form-error" role="status">
+            {t('admin.tlsReloadErrorLabel')}: {reloadErrorText}
+          </p>
+        )}
+      </div>
+
+      <form
+        aria-labelledby="tls-select-form-title"
+        onSubmit={(e) => {
+          void submitSelect(e);
+        }}
+      >
+        <h3 className="tls-sub-title" id="tls-select-form-title">
+          {t('admin.tlsSelectFormTitle')}
+        </h3>
+        <div className="setting-row">
+          <span id="admin-tls-enable-label">{t('admin.tlsEnableLabel')}</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={enabledDraft}
+            aria-labelledby="admin-tls-enable-label"
+            className={enabledDraft ? 'switch on' : 'switch'}
+            onClick={() => {
+              setEnabledDraft((v) => !v);
+              setSelectStatusText(null);
+            }}
+          >
+            <span className="switch-knob" aria-hidden="true" />
+          </button>
+        </div>
+
+        <div className="field-grid">
+          <div className="field">
+            <label className="field-label" htmlFor="admin-tls-cert-select">
+              {t('admin.tlsCertFileLabel')}
+            </label>
+            <select
+              id="admin-tls-cert-select"
+              className="input mono"
+              value={certFileDraft}
+              onChange={(e) => {
+                setCertFileDraft(e.target.value);
+                setSelectStatusText(null);
+              }}
+            >
+              {certOptions.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="field">
+            <label className="field-label" htmlFor="admin-tls-key-select">
+              {t('admin.tlsKeyFileLabel')}
+            </label>
+            <select
+              id="admin-tls-key-select"
+              className="input mono"
+              value={keyFileDraft}
+              onChange={(e) => {
+                setKeyFileDraft(e.target.value);
+                setSelectStatusText(null);
+              }}
+            >
+              {keyOptions.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {tls.availableFiles.length === 0 && <p className="field-hint">{t('admin.tlsNoFilesHint')}</p>}
+        {selectErrorKey !== null && <p className="form-error">{t(selectErrorKey)}</p>}
+        <div className="tls-actions-row">
+          {selectStatusText !== null && selectErrorKey === null && (
+            <p className="form-status-ok" role="status">
+              {selectStatusText}
+            </p>
+          )}
+          <button type="button" className="btn" disabled={reloadBusy || selectBusy} onClick={() => void handleReloadNow()}>
+            {t('admin.tlsReloadNowButton')}
+          </button>
+          <button type="submit" className="btn primary" disabled={selectBusy || reloadBusy}>
+            {t('admin.tlsApplySwitchButton')}
+          </button>
+        </div>
+      </form>
+
+      <div className="menu-sep" style={{ margin: '16px 0 14px' }} aria-hidden="true" />
+
+      <form
+        aria-labelledby="tls-upload-form-title"
+        onSubmit={(e) => {
+          void submitUpload(e);
+        }}
+      >
+        <h3 className="tls-sub-title" id="tls-upload-form-title" style={{ marginTop: 0 }}>
+          {t('admin.tlsUploadFormTitle')}
+        </h3>
+        <p className="field-hint" style={{ marginBottom: 10 }}>
+          {t('admin.tlsUploadFileHint')}
+        </p>
+        <div className="field-grid">
+          <div className="field">
+            <label className="field-label" htmlFor="admin-tls-cert-file-input">
+              {t('admin.tlsPickCertFile')}
+            </label>
+            <input
+              id="admin-tls-cert-file-input"
+              className="tls-file-input"
+              type="file"
+              accept=".pem,.crt,.cer,.key"
+              disabled={uploadBusy}
+              onChange={(e) => {
+                void handlePickPemFile('cert')(e);
+              }}
+            />
+          </div>
+          <div className="field">
+            <label className="field-label" htmlFor="admin-tls-key-file-input">
+              {t('admin.tlsPickKeyFile')}
+            </label>
+            <input
+              id="admin-tls-key-file-input"
+              className="tls-file-input"
+              type="file"
+              accept=".pem,.crt,.cer,.key"
+              disabled={uploadBusy}
+              onChange={(e) => {
+                void handlePickPemFile('key')(e);
+              }}
+            />
+          </div>
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="admin-tls-cert-pem">
+            {t('admin.tlsCertPemLabel')}
+          </label>
+          <textarea
+            id="admin-tls-cert-pem"
+            className="input tls-pem-input mono"
+            rows={5}
+            required
+            spellCheck={false}
+            autoCapitalize="none"
+            autoCorrect="off"
+            placeholder={'-----BEGIN CERTIFICATE-----\n...'}
+            value={certPem}
+            onChange={(e) => {
+              setCertPem(e.target.value);
+              setUploadStatusText(null);
+            }}
+          />
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="admin-tls-key-pem">
+            {t('admin.tlsKeyPemLabel')}
+          </label>
+          <textarea
+            id="admin-tls-key-pem"
+            className="input tls-pem-input mono"
+            rows={5}
+            required
+            spellCheck={false}
+            autoCapitalize="none"
+            autoCorrect="off"
+            placeholder={'-----BEGIN PRIVATE KEY-----\n...'}
+            value={keyPem}
+            onChange={(e) => {
+              setKeyPem(e.target.value);
+              setUploadStatusText(null);
+            }}
+          />
+        </div>
+
+        {uploadErrorKey !== null && <p className="form-error">{t(uploadErrorKey)}</p>}
+        <div className="tls-actions-row">
+          {uploadStatusText !== null && uploadErrorKey === null && (
+            <p className="form-status-ok" role="status">
+              {uploadStatusText}
+            </p>
+          )}
+          <button
+            type="submit"
+            className="btn"
+            data-enable-tls="false"
+            disabled={uploadBusy}
+          >
+            {t('admin.tlsUploadSaveButton')}
+          </button>
+          <button
+            type="submit"
+            className="btn primary"
+            data-enable-tls="true"
+            disabled={uploadBusy}
+          >
+            {t('admin.tlsUploadEnableButton')}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 export function AdminGatewaySettings(props: AdminGatewaySettingsProps) {
-  const { t, client, settings, groups, runtime, ui, onUi, onSettingsChanged, onRefreshGroups, onRefreshRuntime } = props;
+  const { t, client, settings, groups, runtime, tls, ui, onUi, onSettingsChanged, onTlsChanged, onRefreshGroups, onRefreshRuntime } =
+    props;
   return (
     <div className="settings-stack">
       <section className="settings-section">
@@ -729,6 +1195,10 @@ export function AdminGatewaySettings(props: AdminGatewaySettingsProps) {
           onRefreshGroups={onRefreshGroups}
           onRefreshRuntime={onRefreshRuntime}
         />
+      </section>
+
+      <section className="settings-section">
+        <TlsCertSection t={t} client={client} tls={tls} onTlsChanged={onTlsChanged} />
       </section>
 
       <section className="settings-section">

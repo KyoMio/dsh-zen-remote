@@ -28,7 +28,7 @@ import type { ViewKind } from './components/TopBar';
 import { LOCALE_STORAGE_KEY, resolveLocale, translate } from './i18n/locales';
 import type { Locale, LocaleKey, TranslateVars } from './i18n/locales';
 import { ConsoleApiError, ConsoleClient, ConsoleStore, ManagedRefreshCycle } from './store/console-store';
-import type { AdminSliceKey, AdminSettingsData, MemberAction, SystemSettings, UiLocalState } from './store/console-store';
+import type { AdminSliceKey, AdminSettingsData, AdminTlsView, MemberAction, SystemSettings, UiLocalState } from './store/console-store';
 
 const client = new ConsoleClient();
 const store = new ConsoleStore();
@@ -344,6 +344,21 @@ export function App() {
     [refreshSessionAndNetworks],
   );
 
+  /** TLS 面板保存 / 上传 / 重载成功：写回 adminTls；若当前页协议与切换后一致则
+   * 同步刷新运行态条与邀请链接，否则保持现状让管理员点击切换至 HTTPS CTA。 */
+  const handleTlsChanged = useCallback(
+    (next: AdminTlsView): void => {
+      store.applyAdminTls(next);
+      const protocolAligned =
+        typeof window === 'undefined' || (window.location.protocol === 'https:' ? next.tlsActive : !next.tlsActive);
+      if (protocolAligned) {
+        void refreshAdminRuntime();
+        void refreshSessionAndNetworks();
+      }
+    },
+    [refreshAdminRuntime, refreshSessionAndNetworks],
+  );
+
   // 路由防越权守卫 + 管理切片清场（GC-8/GC-10b）：切出 admin 视图或失去管理员
   // 身份（被降级 / 登出 / 会话失效）时，彻底清掉管理员敏感切片（runtime /
   // settings / groups / users 与各自加载、错误态）；普通用户停在 admin 视图
@@ -367,15 +382,17 @@ export function App() {
       store.markAdminLoading('settings');
       store.markAdminLoading('groups');
       store.markAdminLoading('users');
-      const [runtime, settings, groups, users] = await Promise.allSettled([
+      store.markAdminLoading('tls');
+      const [runtime, settings, groups, users, tls] = await Promise.allSettled([
         client.getAdminRuntime(),
         client.getAdminSettings(),
         client.listGroups(),
         client.listAdminUsers(),
+        client.getAdminTls(),
       ]);
       if (cancelled) return;
       // 任一请求 401 = 会话失效：不再落库任何切片，直接清场并核对会话态
-      const settled = [runtime, settings, groups, users];
+      const settled = [runtime, settings, groups, users, tls];
       if (settled.some((r) => r.status === 'rejected' && isUnauthorized(r.reason))) {
         handleAdminUnauthorized();
         return;
@@ -388,6 +405,8 @@ export function App() {
       else handleAdminFetchError('groups', groups.reason);
       if (users.status === 'fulfilled') store.applyAdminUsers(users.value);
       else handleAdminFetchError('users', users.reason);
+      if (tls.status === 'fulfilled') store.applyAdminTls(tls.value);
+      else handleAdminFetchError('tls', tls.reason);
     })();
     return () => {
       cancelled = true;
@@ -838,6 +857,7 @@ export function App() {
             settings={state.adminSettings}
             groups={state.adminGroups}
             users={state.adminUsers}
+            tls={state.adminTls}
             adminLoad={state.adminLoad}
             adminError={state.adminError}
             currentUserId={state.session.user.id}
@@ -849,6 +869,7 @@ export function App() {
             onRefreshGroups={() => refreshAdminGroups()}
             onRefreshRuntime={() => refreshAdminRuntime()}
             onSettingsChanged={handleSettingsChanged}
+            onTlsChanged={handleTlsChanged}
           />
         ) : selected !== null ? (
           <NetworkView

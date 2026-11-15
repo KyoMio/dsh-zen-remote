@@ -1693,10 +1693,23 @@ html[data-theme='dark'] dialog.modal::backdrop {
   color: var(--ink-2);
 }
 
+.warn-banner.tint-warn {
+  background: var(--warn-tint);
+}
+
+.warn-banner.tint-danger {
+  border-color: var(--danger);
+  background: var(--danger-tint);
+}
+
 .warn-banner svg {
   flex: none;
   margin-top: 2px;
   color: var(--warn);
+}
+
+.warn-banner.tint-danger svg {
+  color: var(--danger);
 }
 
 .warn-banner p {
@@ -1999,6 +2012,127 @@ html[data-theme='dark'] dialog.modal::backdrop {
   border: 1px dashed var(--line-strong);
   border-radius: 4px;
   background: var(--surface-2);
+}
+
+.badge.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* ---------- TLS 与证书区块 ---------- */
+
+.tls-status-card {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+
+.tls-status-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tls-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px 16px;
+  margin: 12px 0 0;
+}
+
+.tls-meta-grid dt {
+  margin-bottom: 2px;
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.tls-meta-grid dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.tls-cert-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-left: 6px;
+}
+
+.tls-sub-title {
+  margin: 16px 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.tls-pem-input {
+  height: auto;
+  min-height: 112px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.tls-file-input {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+.tls-file-input::file-selector-button {
+  margin-right: 10px;
+  padding: 5px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.tls-file-input::file-selector-button:hover {
+  background: var(--surface-2);
+}
+
+.tls-https-cta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-solid);
+  border-radius: 4px;
+  background: var(--accent-tint);
+  font-size: 13px;
+  color: var(--ink);
+}
+
+.tls-https-cta p {
+  margin: 0;
+  min-width: 0;
+  flex: 1 1 240px;
+}
+
+.tls-actions-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
 }
 
 /* ---------- 一次性明文区（初始密码 / 临时密码 / Admin API Key 共用） ---------- */
