@@ -523,6 +523,43 @@ test('stream: session/control filters foreign projections, then synthesizes them
   } finally { await server.stop() }
 })
 
+test('stream: syncProjections skips share synthesis when session/projections returns asOfSeq < 0 or omits integer asOfSeq', async () => {
+  const parts = makeParts('control-sync-blank', {
+    overrides: {
+      invoke: async (call) => {
+        if (call.namespace === 'session' && call.method === 'projections') {
+          if (call.args.request.sessionId === 'S-blank') {
+            return { asOfSeq: -1, values: { modelSelection: { lastUsed: null, next: null } } }
+          }
+          return { kind: 'migration-required' }
+        }
+        return {}
+      },
+    },
+  })
+  const server = await startServer(parts.handler)
+  try {
+    const open = await openStream(server, { namespace: 'session', method: 'control', args: {} })
+    const gate = parts.streams[0]
+    gate.push({ type: 'baseline', value: { projections: {} } })
+    await waitFor(() => open.lines.some((line) => line.type === 'frame' && line.frame?.type === 'baseline'))
+    const baselineCount = open.lines.length
+
+    parts.store.share('S-blank')
+    parts.store.share('S-mig')
+    await waitFor(() => parts.invokeCalls.length >= 2)
+    await new Promise((resolve) => setTimeout(resolve, 60))
+
+    assert.equal(
+      open.lines.slice(baselineCount).filter((line) => line.type === 'frame').length,
+      0,
+      'zero-event sessions (asOfSeq: -1) and migration-required snapshots must never synthesize negative/non-integer seq projection frames',
+    )
+    gate.finish()
+    await open.done
+  } finally { await server.stop() }
+})
+
 // ---- 8. a session-scoped stream dies loudly on unshare ------------------------------
 
 test('stream: session/follow ends with an unshared error line when its session leaves the table', async () => {

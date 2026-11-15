@@ -447,9 +447,9 @@ export declare function runWithoutIntercept<T>(fn: () => T): T;
  */
 export declare function createLocalOnlyGateway<G extends object>(gateway: G): G;
 /** Rewrite one stream frame's session ids to virtual form. */
-export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown;
+export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string, remoteDefault?: unknown): unknown;
 /** Rewrite one invoke result's session ids to virtual form. */
-export declare function rewriteResult(endpoint: string, value: unknown, serverId: string): unknown;
+export declare function rewriteResult(endpoint: string, value: unknown, serverId: string, remoteDefault?: unknown): unknown;
 /**
  * Rewrite one SERVER-side `$events` frame for the local UI (T32), or `null`
  * to drop it. Wire shapes verified against dsh-api-gateway (frames:

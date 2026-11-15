@@ -454,13 +454,13 @@ test('MS-3 workspace merge: a local baseline after cached remote baselines compo
   assert.equal(baseline.type, 'baseline')
   assert.deepEqual(
     baseline.value.items.map((item) => item.workspaceId),
-    ['ws-local', VA('w-a')],
-    'one baseline; B\'s group is EMPTY (no sessions) so T56 withholds it',
+    ['ws-local', VA('w-a'), VB('w-b')],
+    'one baseline; all workspaces on connected servers (including empty ones) are shown in pairing order',
   )
-  const upserts = await readSome(iterator, 1)
+  const upserts = await readSome(iterator, 2)
   assert.deepEqual(
     upserts.map((frame) => frame.workspace.workspaceId),
-    [VA('w-a')],
+    [VA('w-a'), VB('w-b')],
     'each shown server\'s upserts follow in pairing order',
   )
 
@@ -562,6 +562,74 @@ test('MS-3 control merge: each server\'s control stream virtualizes into the mai
   assert.equal(frameB.sessionId, VB('s2'), 'B\'s projection carries B\'s virtual id')
   // The modelSelection rewrite keys on the frame's OWN server (A).
   assert.equal(frameA.value.lastUsed.provider, VA('prov'))
+
+  await iterator.return?.(undefined)
+  handle.uninstall()
+})
+
+test('MS-3 control merge: local baseline before peer joins pool still forwards late peer live projections immediately', async () => {
+  const pool = createFakePool([])
+  const { gateway, localGate } = createMergeGateway()
+  const { handle } = installPool(gateway, pool)
+  const stream = gateway.wireTap('session/control', { args: {} }, undefined, undefined, undefined, { signal: undefined })
+  const iterator = (await stream)[Symbol.asyncIterator]()
+
+  // Local session/control emits baseline BEFORE any remote peer joins the pool.
+  localGate.push({ type: 'baseline', value: { projections: {} } })
+  const [baseline] = await readSome(iterator, 1)
+  assert.equal(baseline.type, 'baseline')
+
+  // Peer A joins/connects afterward: its control leg opens with localBaselineFrame already seeded,
+  // so seq: 0 live projection frames must forward immediately without another local baseline.
+  const relayA = createMultiRelay(SID_A)
+  pool.add(makeEntry(SID_A, 'A', relayA))
+  handle.notePoolEvent()
+  await settle()
+  const legA = relayA.streams.find((leg) => leg.namespace === 'session' && leg.method === 'control')
+  assert.ok(legA, 'late peer opens its control leg upon joining the pool')
+
+  legA.gate.push({
+    type: 'projection',
+    sessionId: 's-live',
+    key: 'modelSelection',
+    value: { lastUsed: null, next: { provider: 'prov', model: 'm2', reasoningEffort: 'high' } },
+    seq: 0,
+  })
+  legA.gate.push({
+    type: 'projection',
+    sessionId: 's-live',
+    key: 'agentPreset',
+    value: { currentValue: 'preset-a' },
+    seq: 0,
+  })
+
+  const frames = await readSome(iterator, 2)
+  assert.deepEqual(frames[0], {
+    type: 'projection',
+    sessionId: VA('s-live'),
+    key: 'modelSelection',
+    value: { lastUsed: null, next: { provider: VA('prov'), model: 'm2', reasoningEffort: 'high' } },
+    seq: 0,
+    changes: [
+      {
+        key: 'modelSelection',
+        val: { lastUsed: null, next: { provider: VA('prov'), model: 'm2', reasoningEffort: 'high' } },
+      },
+    ],
+  })
+  assert.deepEqual(frames[1], {
+    type: 'projection',
+    sessionId: VA('s-live'),
+    key: 'agentPreset',
+    value: { currentValue: 'preset-a' },
+    seq: 0,
+    changes: [
+      {
+        key: 'agentPreset',
+        val: { currentValue: 'preset-a' },
+      },
+    ],
+  })
 
   await iterator.return?.(undefined)
   handle.uninstall()

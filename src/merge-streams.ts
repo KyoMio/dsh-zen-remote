@@ -88,20 +88,18 @@
  *   never enters the set by construction. The hidden ids are sticky: they
  *   survive even the death of their home workspace until a re-share or the
  *   identity ends.
- * - a workspace with NOTHING to show is not shown at all (T56): the server
- *   keeps every workspace and only narrows `sessionIds` (relay-filter.ts),
- *   so a workspace where nothing is shared would arrive as an empty group
- *   and render as a bare 「服务端名 · 工作区名」 heading. A workspace the UI
- *   has never seen is therefore held back — no baseline item, no upsert, no
- *   order entry — until its forwarded `sessionIds` (live sessions or
- *   tombstones it must carry) first gains content. From that first forward
- *   on it counts as SHOWN and stays shown even when the sessions leave
- *   again: a `remove` would blacklist the id in the UI's ClientWorkspaceModel
- *   and make the group un-revivable, so an emptied group keeps its (empty)
- *   display until the page reload rebuilds the model and this rule hides it
- *   again. Every removal path — the reconnecting baseline diff, an explicit
- *   server remove, {@link WorkspaceMerger.onRemoteGone} — emits a `remove`
- *   only for shown workspaces; never-shown ones leave the state silently.
+ * - workspaces from a CONNECTED server are ALL shown: the server keeps
+ *   every workspace and narrows `sessionIds` to shared sessions (relay-
+ *   filter.ts), so paired clients also see remote workspaces that have no
+ *   active shared sessions yet (for example in the New Session workspace
+ *   picker or sidebar `+` menu). While unpaired or revoked
+ *   (`isPairingDisconnected`), never-shown workspaces stay withheld until the
+ *   connection is active again. Once shown, a workspace stays shown even if
+ *   its sessions leave, and every removal path — the reconnecting baseline
+ *   diff, an explicit server remove, {@link WorkspaceMerger.onRemoteGone} —
+ *   emits a `remove` only for shown workspaces; never-shown ones leave the
+ *   state silently (a `remove` would blacklist the id in the UI's
+ *   ClientWorkspaceModel).
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
@@ -371,15 +369,12 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
   // (re-shared, anywhere — the home moves with it), when its workspace is
   // removed, and with the identity (onRemoteGone).
   let sessionHome = new Map<string, string>()
-  // T56: the workspace ids (originals) the UI has EVER been shown. The UI's
+  // The workspace ids (originals) the UI has EVER been shown. The UI's
   // ClientWorkspaceModel blacklists removed ids for the page's whole life, so
-  // only a shown workspace may ever receive a `remove` — and a workspace the
-  // UI never saw stays invisible while its forwarded sessionIds (live
-  // sessions + tombstones) is empty, instead of rendering as an empty
-  // 「服务端名 · 工作区名」 group. Once shown, a workspace stays shown even
-  // when its last session leaves (no remove — the blacklist would make the
-  // id un-revivable); the page reload rebuilds the model and the emptied
-  // group then never comes back.
+  // only a shown workspace may ever receive a `remove` — and never-shown
+  // workspaces arriving while unpaired/revoked stay withheld until paired.
+  // Once shown, a workspace stays shown even when its sessions leave (no
+  // remove — the blacklist would make the id un-revivable).
   const shown = new Set<string>()
   // T58: the raw session id the UI currently has open, exactly as read from
   // the host's persisted selection store — a virtual id for a remote
@@ -580,28 +575,18 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
     }
     return out
   }
-  /** T56: the forwarded record when the UI may see this workspace, else
-   * undefined — a never-shown workspace is forwarded only once its forwarded
-   * sessionIds first carries VISIBLE content, and forwarding it marks it
-   * shown for good. Only call on paths that actually emit (after the local
-   * baseline has passed): a mark here is a claim that the UI now holds the
-   * group. Visible means NOT hidden (T65): the host draws a group heading
-   * even when every member is archived-invisible under the default filter,
-   * so a group whose members are all hidden must not be first-shown —
-   * the forwarded copy itself still carries the hidden ids. */
+  /** Forwarded workspace record when the UI may see this workspace, else
+   * undefined. Connected servers forward all workspaces (including empty or
+   * hidden-only groups so remote workspaces are selectable everywhere, e.g.
+   * in the New Session workspace picker), and forwarding a group marks it in
+   * {@link shown} for `remove` safety. Only call on paths that actually emit
+   * (after the local baseline has passed). Never-shown groups arriving while
+   * unpaired/revoked are held back until pairing is restored. */
   function forwardVisible(record: Record<string, unknown>): Record<string, unknown> | undefined {
     const id = typeof record.workspaceId === 'string' ? record.workspaceId : undefined
     if (id !== undefined && shown.has(id)) return forwardWorkspace(record)
+    if (isPairingDisconnected()) return undefined
     const out = forwardWorkspace(record)
-    const ids = Array.isArray(out.sessionIds) ? out.sessionIds : []
-    let visible = false
-    for (const virtualId of ids) {
-      const parts = fromVirtual(virtualId)
-      if (parts !== undefined && parts.serverId === identity.serverId && hiddenSessions.has(parts.id)) continue
-      visible = true
-      break
-    }
-    if (!visible) return undefined
     if (id !== undefined) shown.add(id)
     return out
   }
@@ -691,7 +676,10 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
           orderIds: remoteIds(),
           archivedIds: [...remoteArchivedVirtual(), ...[...hiddenSessions].map(virtualize)],
           pinnedIds: remotePinnedVirtual(),
-          workspaces: virtualWorkspaces(),
+          // Pure snapshot: reflect already-shown workspaces without mutating `shown`.
+          workspaces: [...remote.entries()]
+            .filter(([id]) => shown.has(id))
+            .map(([, record]) => forwardWorkspace(record)),
         },
       }
     },
@@ -708,8 +696,8 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
         // in the one frame.
         syncHiddenSessions()
         const shownWorkspaces = virtualWorkspaces()
-        // Nothing VISIBLE (T56 — a remote full of hidden empty groups counts
-        // as nothing) and no lists to merge: the frame passes verbatim.
+        // Nothing visible (e.g. unpaired/revoked or empty remote) and no lists
+        // to merge: the frame passes verbatim.
         if (
           shownWorkspaces.length === 0 &&
           remoteArchived.length === 0 &&
@@ -925,7 +913,9 @@ export function createWorkspaceMerger(options: WorkspaceMergerOptions): Workspac
     onStatusChanged(): unknown[] {
       if (!localSeen || remote.size === 0) return []
       const changed = syncHiddenSessions()
+      const prevShownSize = shown.size
       const out = upsertFrames()
+      if (shown.size > prevShownSize) out.push(mergedOrderFrame())
       if (changed.hidden.length > 0 || changed.revealed.length > 0) out.push(mergedArchivedFrame())
       return out
     },
@@ -1272,7 +1262,12 @@ export function createControlMerger(options: ControlMergerOptions): ControlMerge
  * occupy the seq forever. A missing or malformed remote result means "remote
  * said nothing" — the local result passes back untouched.
  */
-export function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string): unknown {
+export function mergeSessionList(
+  localResult: unknown,
+  remoteResult: unknown,
+  serverId: string,
+  remoteDefault?: unknown,
+): unknown {
   if (!isPlainObject(localResult)) return localResult
   if (!isPlainObject(remoteResult) || !Array.isArray(remoteResult.items)) return localResult
   const localItems = Array.isArray(localResult.items) ? localResult.items : []
@@ -1282,13 +1277,15 @@ export function mergeSessionList(localResult: unknown, remoteResult: unknown, se
     const out: Record<string, unknown> = { ...item, sessionId: virtualize(item.sessionId) }
     if (typeof item.parentSessionId === 'string') out.parentSessionId = virtualize(item.parentSessionId)
     if (isPlainObject(item.projections) && isPlainObject(item.projections.values)) {
-      const nextValues = virtualizeProjectionValues(item.projections.values, serverId)
+      const unselectedDefault = item.projections.asOfSeq === -1 ? remoteDefault : undefined
+      const nextValues = virtualizeProjectionValues(item.projections.values, serverId, unselectedDefault)
       if (nextValues !== item.projections.values) {
         out.projections = { ...item.projections, values: nextValues }
       }
     }
     if (isPlainObject(item.projectionValues)) {
-      const nextValues = virtualizeProjectionValues(item.projectionValues, serverId)
+      const unselectedDefault = !isPlainObject(item.projections) && item.blank === true ? remoteDefault : undefined
+      const nextValues = virtualizeProjectionValues(item.projectionValues, serverId, unselectedDefault)
       if (nextValues !== item.projectionValues) {
         out.projectionValues = nextValues
       }
@@ -1329,12 +1326,14 @@ export function mergeSessionList(localResult: unknown, remoteResult: unknown, se
  *   not travel (dsh-vision-router's settings read the same result and shows
  *   an error state exactly when groups are empty AND failures exist,
  *   lib/client.js:635-647 — dropping remote failures keeps that honest).
- *   KNOWN BOUNDARY (pre-T52 behavior, unchanged): a NEW server session's
- *   projection `next` is null until its first selection or turn, so the UI
- *   shows `catalog.value.default` — the LOCAL default — as that session's
- *   current model (RT dsh-client-ui-model-selection lib/client.js:316,
- *   `projected?.next ?? catalog.value?.default`), which may differ from what
- *   the server would actually run until its first selection lands.
+ *   NOTE: a NEW 0-event (`asOfSeq === -1`) server session's projection
+ *   carries `{ lastUsed: null, next: null }`; when the remote server's
+ *   `modelCatalog.default` is cached on the client, projection virtualization
+ *   seeds `modelSelection.next` from it so the UI displays and targets the
+ *   remote server's default model rather than falling back to
+ *   `catalog.value.default` (the LOCAL default) until the first selection at
+ *   `seq: 0` overwrites it. If the remote catalog has not landed yet, it
+ *   falls back to `catalog.value.default` until a selection or turn lands.
  * - `routableProviders` mirrors the group ids by construction host-side
  *   (RT dsh-api-session-controller lib/index.js:544 — literally
  *   `groups.map(g => g.id)`); no client UI reads it (the dropdown's
@@ -1395,7 +1394,30 @@ export function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, id
  * entries pass through untouched; `model` and `reasoningEffort` are
  * group-agnostic ids and stay as they are.
  */
-export function virtualizeModelSelectionValue(value: unknown, serverId: string): unknown {
+function virtualizeDefaultSelection(remoteDefault: unknown, serverId: string): Record<string, unknown> | undefined {
+  if (
+    !isPlainObject(remoteDefault) ||
+    typeof remoteDefault.provider !== 'string' ||
+    remoteDefault.provider === '' ||
+    typeof remoteDefault.model !== 'string' ||
+    remoteDefault.model === ''
+  ) {
+    return undefined
+  }
+  return {
+    provider: toVirtual(serverId, remoteDefault.provider),
+    model: remoteDefault.model,
+    ...(typeof remoteDefault.reasoningEffort === 'string'
+      ? { reasoningEffort: remoteDefault.reasoningEffort }
+      : {}),
+  }
+}
+
+export function virtualizeModelSelectionValue(
+  value: unknown,
+  serverId: string,
+  unselectedDefault?: unknown,
+): unknown {
   if (!isPlainObject(value)) return value
   const out: Record<string, unknown> = { ...value }
   for (const key of ['lastUsed', 'next'] as const) {
@@ -1403,6 +1425,10 @@ export function virtualizeModelSelectionValue(value: unknown, serverId: string):
     if (isPlainObject(selection) && typeof selection.provider === 'string') {
       out[key] = { ...selection, provider: toVirtual(serverId, selection.provider) }
     }
+  }
+  if (out.lastUsed === null && out.next === null && unselectedDefault !== undefined) {
+    const fallback = virtualizeDefaultSelection(unselectedDefault, serverId)
+    if (fallback !== undefined) out.next = fallback
   }
   return out
 }
@@ -1519,8 +1545,13 @@ export function createForgeStatesMerger(): ForgeStatesMerger {
  * `agentTeam.tasks[].ownerId`) carry `zr~<serverId>~`. Unrecognized keys and
  * malformed shapes pass through by identity.
  */
-export function virtualizeProjectionValue(key: string, value: unknown, serverId: string): unknown {
-  if (key === 'modelSelection') return virtualizeModelSelectionValue(value, serverId)
+export function virtualizeProjectionValue(
+  key: string,
+  value: unknown,
+  serverId: string,
+  unselectedDefault?: unknown,
+): unknown {
+  if (key === 'modelSelection') return virtualizeModelSelectionValue(value, serverId, unselectedDefault)
   if (key === 'subagentCatalog') {
     if (!Array.isArray(value)) return value
     return value.map((entry) =>
@@ -1555,11 +1586,12 @@ export function virtualizeProjectionValue(key: string, value: unknown, serverId:
 export function virtualizeProjectionValues(
   values: Record<string, unknown>,
   serverId: string,
+  unselectedDefault?: unknown,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...values }
   let changed = false
   for (const key of Object.keys(out)) {
-    const next = virtualizeProjectionValue(key, out[key], serverId)
+    const next = virtualizeProjectionValue(key, out[key], serverId, unselectedDefault)
     if (next !== out[key]) {
       out[key] = next
       changed = true
@@ -1575,10 +1607,10 @@ export function virtualizeProjectionValues(
  * for ids the UI has no summary for yet (the sidebar drops a group member
  * without one — RT dsh-client-ui-workspace orderByRecency / groupByWorkspace).
  * Reading the FORWARDED output (not the merger's raw state) is the point:
- * T56 already withheld empty groups and T58 already dropped hidden sessions,
- * so a hidden closed-remote session never reaches here and is never
- * announced. Only virtual ids count — local baseline content rides these
- * frames verbatim and its rows already have summaries.
+ * paired empty groups forward cleanly with `sessionIds: []` (contributing zero
+ * session ids), and T58 already handles hidden sessions while keeping a
+ * one-shot ask gate. Only virtual ids count — local baseline content rides
+ * these frames verbatim and its rows already have summaries.
  */
 export function virtualSessionIdsInWorkspaceFrames(frames: readonly unknown[]): string[] {
   const out = new Set<string>()
@@ -1617,9 +1649,13 @@ export function virtualSessionIdsInWorkspaceFrames(frames: readonly unknown[]): 
  * against the control stream's rewritten frames — T52-fix3). A malformed
  * remote result means "the server said nothing" — no frames.
  */
-export function sessionSummaryAddedFrames(remoteResult: unknown, serverId: string): unknown[] {
+export function sessionSummaryAddedFrames(
+  remoteResult: unknown,
+  serverId: string,
+  remoteDefault?: unknown,
+): unknown[] {
   if (!isPlainObject(remoteResult) || !Array.isArray(remoteResult.items)) return []
-  const merged = mergeSessionList({ items: [] }, remoteResult, serverId)
+  const merged = mergeSessionList({ items: [] }, remoteResult, serverId, remoteDefault)
   if (!isPlainObject(merged) || !Array.isArray(merged.items)) return []
   const frames: unknown[] = []
   for (const row of merged.items) {
