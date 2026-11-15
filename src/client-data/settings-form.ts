@@ -114,6 +114,7 @@ export const CLIENT_PEER_LEAVE_ROUTE = '/_dsh/zen-remote/client/peer/leave'
 export const CLIENT_PEER_TOGGLE_MOUNT_ROUTE = '/_dsh/zen-remote/client/peer/toggle-mount'
 export const CLIENT_PEER_TRUST_ROUTE = '/_dsh/zen-remote/client/peer/trust'
 export const CLIENT_PEER_REPROBE_ROUTE = '/_dsh/zen-remote/client/peer/reprobe'
+export const CLIENT_PEER_DISMISS_REVOKED_ROUTE = '/_dsh/zen-remote/client/peer/dismiss-revoked'
 
 /**
  * MS-6: the paired-server pool's cap — the browser mirror of
@@ -518,6 +519,16 @@ export interface PeerStatusView {
   /** PC-14a: the sync-readiness block (the third light's data). `undefined`
    * on an older body — never guessed from the peers rows. */
   sync: PeerSyncReadinessView | undefined
+  /** Persisted post-admission revocation notice shown until dismissed or re-admitted. */
+  revokedNotice?: PeerRevokedNoticeView | undefined
+}
+
+export interface PeerRevokedNoticeView {
+  deviceName: string
+  gatewayHost: string
+  networkId: string
+  reason: string
+  revokedAt: number
 }
 
 /** One network-device row the peer section renders (wizard's
@@ -611,6 +622,25 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
       ignoredCount: syncCount(syncRaw.ignoredCount),
       mismatchCount: syncCount(syncRaw.mismatchCount),
     }
+  const noticeRaw = safe.revokedNotice !== null && typeof safe.revokedNotice === 'object' && !Array.isArray(safe.revokedNotice)
+    ? (safe.revokedNotice as Record<string, unknown>)
+    : undefined
+  const noticeDeviceName = noticeRaw !== undefined ? asStringSet(noticeRaw.deviceName) : ''
+  const noticeRevokedAt = noticeRaw !== undefined ? noticeRaw.revokedAt : undefined
+  const revokedNotice: PeerRevokedNoticeView | undefined =
+    noticeRaw !== undefined &&
+    noticeDeviceName !== '' &&
+    typeof noticeRevokedAt === 'number' &&
+    Number.isFinite(noticeRevokedAt) &&
+    noticeRevokedAt >= 0
+      ? {
+          deviceName: noticeDeviceName,
+          gatewayHost: asStringSet(noticeRaw.gatewayHost),
+          networkId: asStringSet(noticeRaw.networkId),
+          reason: asStringSet(noticeRaw.reason),
+          revokedAt: noticeRevokedAt,
+        }
+      : undefined
   return {
     configured: safe.configured === true,
     nodeId: asStringSet(safe.nodeId),
@@ -625,6 +655,7 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     limitReached: mountedCount !== undefined && maxServers !== undefined ? mountedCount >= maxServers : undefined,
     peers,
     sync,
+    ...(revokedNotice !== undefined ? { revokedNotice } : {}),
   }
 }
 

@@ -185,6 +185,8 @@ test('args: setup 的全套参数与 --role peer / 非法角色识别', async ()
     '--domain', 'tea.example.com',
     '--cf-token', 'tok',
     '--email', 'tea@example.com',
+    '--password', 'secret-pw',
+    '--network', '1111222233334444',
     '--https-port', '8443',
     '--public-url', 'https://tea.example.com',
     '--tunnel-id', 'tunnel-1',
@@ -203,6 +205,8 @@ test('args: setup 的全套参数与 --role peer / 非法角色识别', async ()
   assert.equal(o.domain, 'tea.example.com')
   assert.equal(o.cfToken, 'tok')
   assert.equal(o.email, 'tea@example.com')
+  assert.equal(o.password, 'secret-pw')
+  assert.equal(o.network, '1111222233334444')
   assert.equal(o.httpsPort, 8443, '--https-port parses a number')
   assert.equal(o.publicUrl, 'https://tea.example.com')
   assert.equal(o.tunnelId, 'tunnel-1')

@@ -199,9 +199,10 @@ async function startIpcServer(home, overrides = {}) {
 }
 
 /** fake prompter：按序吐出预置答案，并把每次提问记录下来供断言。 */
-function fakePrompter({ inputs = [], confirms = [], selects = [] } = {}) {
+function fakePrompter({ inputs = [], secrets = [], confirms = [], selects = [] } = {}) {
   const calls = []
   let inputIndex = 0
+  let secretIndex = 0
   let confirmIndex = 0
   let selectIndex = 0
   return {
@@ -210,6 +211,12 @@ function fakePrompter({ inputs = [], confirms = [], selects = [] } = {}) {
       calls.push({ kind: 'input', question })
       const value = inputs[inputIndex++]
       assert.notEqual(value, undefined, `unexpected extra inputText prompt: ${question}`)
+      return value
+    },
+    async inputSecret(question) {
+      calls.push({ kind: 'secret', question })
+      const value = secrets[secretIndex++]
+      assert.notEqual(value, undefined, `unexpected extra inputSecret prompt: ${question}`)
       return value
     },
     async confirm(question) {
@@ -2315,7 +2322,7 @@ test('i18n: zh/en 键集完全对称；zh 零「互通端」；en 零中文字�
   assert.equal(en('status.role.peer'), 'peer (peer node)')
 })
 
-test('peer join: 支持直接输入中继网关地址（手动审批准入）及多网络交互选择', async () => {
+test('peer join: 支持中继网关账号登录选网及 selectionToken 传递', async () => {
   const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
   const home = makeHome('join-gw-url')
   let handle
@@ -2331,6 +2338,7 @@ test('peer join: 支持直接输入中继网关地址（手动审批准入）及
             const payload = JSON.stringify({
               ok: false,
               error: { code: 'select-network' },
+              selectionToken: 'tok-select-123',
               networks: [
                 { id: '1111222233334444', name: '默认网络' },
                 { id: 'aaaabbbbccccdddd', name: '研发网络' },
@@ -2347,7 +2355,7 @@ test('peer join: 支持直接输入中继网关地址（手动审批准入）及
       },
     })
     handle = h
-    const prompter = fakePrompter({ selects: [1] })
+    const prompter = fakePrompter({ inputs: ['alice@example.com'], secrets: ['Secret!123'], selects: [1] })
     const ctx = makeCtx(mods, {
       argv: ['peer', 'join', 'http://192.168.1.88:19393', '--no-wait'],
       ipc: mods.createCliIpcClient(handle.socketPath),
@@ -2359,8 +2367,9 @@ test('peer join: 支持直接输入中继网关地址（手动审批准入）及
     assert.equal(code, 0)
     const joins = canned.requests.filter((r) => r.path === ROUTES.peerJoin)
     assert.equal(joins.length, 2)
-    assert.deepEqual(joins[0].body, { gatewayUrl: 'http://192.168.1.88:19393' })
-    assert.deepEqual(joins[1].body, { gatewayUrl: 'http://192.168.1.88:19393', networkId: 'aaaabbbbccccdddd' })
+    assert.deepEqual(joins[0].body, { gatewayUrl: 'http://192.168.1.88:19393', email: 'alice@example.com', password: 'Secret!123' })
+    assert.deepEqual(joins[1].body, { selectionToken: 'tok-select-123', networkId: 'aaaabbbbccccdddd' })
+    assert.ok(prompter.calls.some((c) => c.kind === 'secret'), 'password collected via inputSecret')
     assert.match(ctx.stdout.text(), /等待管理员在网关控制台批准/u)
   } finally {
     if (handle !== undefined) await handle.close()
@@ -2585,6 +2594,100 @@ test('JSON: 结构化容量字段原样保留（超额不钳制、limitReached �
     assert.equal(totalParsed.peer.maxServers, 2)
     assert.equal(totalParsed.peer.mountedCount, 3)
     assert.equal(totalParsed.peer.limitReached, true)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
+test('PAS-4b: headless gateway join requires --email/--password, forwards --network, and maps auth-failed', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('pas4b-gw-flags')
+  let handle
+  try {
+    const { handle: h, canned } = await startIpcServer(home, {
+      role: 'peer',
+      client: {
+        [ROUTES.peerStatus]: { body: () => peerStatusBody('authorized') },
+        [ROUTES.peerJoin]: (res, seen) => {
+          if (seen.body.password === 'wrong') {
+            const fail = JSON.stringify({ ok: false, error: { code: 'auth-failed' } })
+            res.writeHead(401, { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(fail)) })
+            res.end(fail)
+            return
+          }
+          const ok = JSON.stringify({ ok: true, networkId: seen.body.networkId })
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(ok)) })
+          res.end(ok)
+        },
+      },
+    })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+
+    // Missing --email in non-interactive mode fails fast without POSTing.
+    const noEmail = makeCtx(mods, { argv: ['peer', 'join', 'https://gw.example.com', '--yes'], ipc })
+    assert.equal(await mods.runPeerJoinCommand(noEmail), 1)
+    assert.match(noEmail.stdout.text(), /--email/u)
+    assert.equal(canned.requests.filter((r) => r.path === ROUTES.peerJoin).length, 0)
+
+    // Missing --password in non-interactive mode fails fast without POSTing.
+    const noPass = makeCtx(mods, { argv: ['peer', 'join', 'https://gw.example.com', '--email', 'u@example.com', '--yes'], ipc })
+    assert.equal(await mods.runPeerJoinCommand(noPass), 1)
+    assert.match(noPass.stdout.text(), /--password/u)
+    assert.equal(canned.requests.filter((r) => r.path === ROUTES.peerJoin).length, 0)
+
+    // 401 auth-failed maps to friendly copy.
+    const badAuth = makeCtx(mods, {
+      argv: ['peer', 'join', 'https://gw.example.com', '--email', 'u@example.com', '--password', 'wrong', '--yes', '--no-wait'],
+      ipc,
+    })
+    assert.equal(await mods.runPeerJoinCommand(badAuth), 1)
+    assert.match(badAuth.stdout.text(), /登录失败/u)
+
+    // --network selects target network directly in headless mode.
+    const okRun = makeCtx(mods, {
+      argv: ['peer', 'join', 'https://gw.example.com', '--email', 'u@example.com', '--password', 'right', '--network', 'net1234567890abc', '--yes', '--no-wait'],
+      ipc,
+      pollIntervalMs: 15,
+    })
+    assert.equal(await mods.runPeerJoinCommand(okRun), 0)
+    const lastJoin = canned.requests.filter((r) => r.path === ROUTES.peerJoin).at(-1)
+    assert.deepEqual(lastJoin.body, {
+      gatewayUrl: 'https://gw.example.com',
+      email: 'u@example.com',
+      password: 'right',
+      networkId: 'net1234567890abc',
+    })
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
+test('PAS-4c: peer leave prints offline note on gatewaySynced:false and keeps --json stdout strictly { ok: true }', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('pas4c-leave-offline')
+  let handle
+  try {
+    const { handle: h } = await startIpcServer(home, {
+      role: 'peer',
+      client: {
+        [ROUTES.peerLeave]: { body: { ok: true, gatewaySynced: false } },
+      },
+    })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+
+    const textRun = makeCtx(mods, { argv: ['peer', 'leave', '--yes'], ipc, lang: 'zh' })
+    assert.equal(await mods.runPeerLeaveCommand(textRun), 0)
+    assert.match(textRun.stdout.text(), /已离开虚拟网络/u)
+    assert.match(textRun.stdout.text(), /网关当前不可达/u)
+
+    const jsonRun = makeCtx(mods, { argv: ['peer', 'leave', '--yes', '--json'], ipc, lang: 'zh' })
+    assert.equal(await mods.runPeerLeaveCommand(jsonRun), 0)
+    assert.deepEqual(JSON.parse(jsonRun.stdout.text()), { ok: true })
+    assert.match(jsonRun.stderr.text(), /网关当前不可达/u)
   } finally {
     if (handle !== undefined) await handle.close()
     cleanup(home)

@@ -197,6 +197,20 @@ export declare function verifyGatewayChallenge(params: {
     timestamp: number;
     signatureHex: string;
 }): boolean;
+/** The canonical byte string signed/verified for proactive gateway leave (`PAS-3`). */
+export declare function gatewayLeaveMessage(params: {
+    networkId: string;
+    nodeId: string;
+    timestamp: number;
+}): Buffer;
+/** Sign one proactive `POST /peer/v1/leave` request with the node's Ed25519 identity. */
+export declare function signGatewayLeave(params: {
+    privateKeyHex: string;
+    publicKeyHex: string;
+    networkId: string;
+    nodeId: string;
+    timestamp: number;
+}): string;
 /**
  * Prove knowledge of the invite join key WITHOUT sending it:
  * HMAC-SHA256(key = joinKey bytes) over the domain-separated challenge

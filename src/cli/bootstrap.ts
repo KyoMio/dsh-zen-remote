@@ -42,6 +42,7 @@ export interface CliPrompter {
   selectOne(question: string, choices: readonly string[], defaultIndex: number): Promise<number>
   selectMulti(question: string, choices: readonly string[], defaultIndices: readonly number[], allowCustomInput?: boolean): Promise<CliMultiSelection>
   inputText(question: string, defaultValue?: string, validate?: (value: string) => string | undefined): Promise<string>
+  inputSecret?(question: string): Promise<string>
   confirm(question: string, defaultYes?: boolean): Promise<boolean>
   close(): void
 }
@@ -158,6 +159,36 @@ export function createReadlinePrompter(input?: Readable, output?: Writable, t?: 
           continue
         }
         if (value === '' && defaultValue === undefined) {
+          write(`${translator('prompt.requiredEmpty')}\n`)
+          continue
+        }
+        return value
+      }
+    },
+
+    async inputSecret(question) {
+      const ttyIn = (input ?? process.stdin) as Partial<NodeJS.ReadStream>
+      if (ttyIn.isTTY !== true) {
+        return await this.inputText(question)
+      }
+      write('\n')
+      while (true) {
+        write(`? ${question} `)
+        const rlInternal = rl as unknown as { _writeToOutput?: (chunk: string) => void }
+        const originalWrite = rlInternal._writeToOutput
+        let value = ''
+        try {
+          if (originalWrite !== undefined) {
+            rlInternal._writeToOutput = () => {}
+          }
+          value = await rl.question('')
+        } finally {
+          if (originalWrite !== undefined) {
+            rlInternal._writeToOutput = originalWrite
+          }
+          write('\n')
+        }
+        if (value === '') {
           write(`${translator('prompt.requiredEmpty')}\n`)
           continue
         }

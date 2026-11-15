@@ -12,8 +12,12 @@
 //
 // Run: node scripts/check-settings-view.mjs   (needs Node >= 23.6 type stripping)
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   canSubmitClientPairing,
+  CLIENT_PEER_DISMISS_REVOKED_ROUTE,
   CLIENT_PEER_JOIN_ROUTE,
   CLIENT_PEER_LEAVE_ROUTE,
   CLIENT_PEER_REPROBE_ROUTE,
@@ -391,6 +395,42 @@ await test('debugExportFileName stamps the peer role into the diagnostic export 
   assert.equal(debugExportFileName('host', now), `zen-remote-debug-host-${stamp}.json`)
   assert.equal(debugExportFileName('client', now), `zen-remote-debug-client-${stamp}.json`)
   assert.equal(debugExportFileName('peer', now), `zen-remote-debug-peer-${stamp}.json`, 'a peer node must not export under the host name')
+})
+
+await test('PAS-6b: revokedNotice survives cleared peerNetwork on settings view and routes are wired in SettingsSection & GatewayWizard', () => {
+  const derived = derivePeerStatusView({
+    ok: true,
+    configured: false,
+    nodeId: 'abcd1234',
+    gatewayState: 'unconfigured',
+    peers: [],
+    revokedNotice: {
+      deviceName: '书房Mac',
+      gatewayHost: 'gw.example.com:19393',
+      networkId: '0123456789abcdef',
+      reason: 'removed from network',
+      revokedAt: 1700000000000,
+    },
+  })
+  assert.equal(derived.configured, false)
+  assert.equal(derived.peers.length, 0)
+  assert.deepEqual(derived.revokedNotice, {
+    deviceName: '书房Mac',
+    gatewayHost: 'gw.example.com:19393',
+    networkId: '0123456789abcdef',
+    reason: 'removed from network',
+    revokedAt: 1700000000000,
+  })
+  assert.equal(CLIENT_PEER_DISMISS_REVOKED_ROUTE, '/_dsh/zen-remote/client/peer/dismiss-revoked')
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const settingsSrc = fs.readFileSync(path.join(here, '..', 'src', 'client', 'settings', 'SettingsSection.tsx'), 'utf8')
+  const wizardSrc = fs.readFileSync(path.join(here, '..', 'src', 'client', 'wizard', 'GatewayWizard.tsx'), 'utf8')
+  assert.equal(settingsSrc.includes('CLIENT_PEER_DISMISS_REVOKED_ROUTE'), true)
+  assert.equal(settingsSrc.includes('wizard.peer.revokedBanner'), true)
+  assert.equal(settingsSrc.includes('wizard.peer.gatewayEmail'), true)
+  assert.equal(wizardSrc.includes('CLIENT_PEER_DISMISS_REVOKED_ROUTE'), true)
+  assert.equal(wizardSrc.includes('wizard.peer.revokedBanner'), true)
+  assert.equal(wizardSrc.includes('wizard.peer.gatewayEmail'), true)
 })
 
 console.log('check-settings-view: ok')

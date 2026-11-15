@@ -24,6 +24,7 @@
  * content type and body travel back verbatim.
  */
 
+import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import type { AdminAdmission } from './admin-routes.js'
@@ -35,7 +36,14 @@ import type { LogRingEntry } from './log-ring.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js'
-import { assembleInviteUri, buildKeylessInviteUri, isLoopbackOrPrivateHostname, parseGatewayJoinInput } from './peer/crypto.js'
+import {
+  assembleInviteUri,
+  buildKeylessInviteUri,
+  formatInviteUri,
+  isLoopbackOrPrivateHostname,
+  parseGatewayJoinInput,
+  parseInviteUri,
+} from './peer/crypto.js'
 import type { PeerEngine, PeerEngineStatus } from './peer/engine.js'
 import type { PeerMemberPath, PeerMemberState } from './peer/engine.js'
 import { responseJson, sameOriginPost } from './http.js'
@@ -149,6 +157,9 @@ export const CLIENT_PEER_TRUST_ROUTE = `${CLIENT_PEER_PREFIX}/trust`
 
 /** POST `{}`: re-run the UDP hole-punch for every eligible device. */
 export const CLIENT_PEER_REPROBE_ROUTE = `${CLIENT_PEER_PREFIX}/reprobe`
+
+/** POST `{}`: dismiss the persisted post-admission gateway revocation banner. */
+export const CLIENT_PEER_DISMISS_REVOKED_ROUTE = `${CLIENT_PEER_PREFIX}/dismiss-revoked`
 
 /** Longest `sessionId` the current-session route accepts (T62): real ids —
  * a local `session-<uuid>` or a `zr~<serverId>~<id>` virtual id — are far
@@ -705,6 +716,7 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     nodeId: status.nodeId,
     gatewayState: status.gatewayState,
     ...(typeof status.deniedReason === 'string' && status.deniedReason !== '' ? { deniedReason: status.deniedReason } : {}),
+    ...(status.revokedNotice !== undefined && status.revokedNotice !== null ? { revokedNotice: status.revokedNotice } : {}),
     ...(status.networkId !== null ? { networkId: status.networkId } : {}),
     ...(gatewayOrigin !== undefined && status.networkId !== null ? { gatewayOrigin } : {}),
     maxPeers: status.maxPeers,
@@ -792,6 +804,136 @@ async function statusBodyOf(options: ClientHandlerOptions): Promise<Record<strin
   }
 }
 
+const GATEWAY_SELECTION_TTL_MS = 5 * 60_000
+const MAX_GATEWAY_SELECTIONS = 32
+
+interface GatewayNetworkCandidate {
+  id: string
+  name: string
+  admissionMode: string
+  joinKey?: string
+}
+
+interface GatewaySelectionEntry {
+  expiresAt: number
+  rawHost: string
+  hostname: string
+  port: number
+  tls: boolean
+  networks: GatewayNetworkCandidate[]
+}
+
+async function isValidGatewayPing(res: Response): Promise<boolean> {
+  if (res.status !== 200) return false
+  try {
+    const rawJson = JSON.parse(await res.text()) as unknown
+    if (rawJson === null || typeof rawJson !== 'object' || Array.isArray(rawJson)) return false
+    const record = rawJson as Record<string, unknown>
+    if (record.ok !== true) return false
+    if (record.gateway === true) return true
+    const data = record.data
+    return data !== null && typeof data === 'object' && !Array.isArray(data) && (data as Record<string, unknown>).gateway === true
+  } catch {
+    return false
+  }
+}
+
+function extractGatewaySessionCookie(headers: Headers): string | undefined {
+  const withGetSetCookie = headers as unknown as { getSetCookie?: () => string[] }
+  const lines = typeof withGetSetCookie.getSetCookie === 'function'
+    ? withGetSetCookie.getSetCookie()
+    : (() => {
+        const single = headers.get('set-cookie')
+        return single !== null && single !== '' ? [single] : []
+      })()
+  for (const line of lines) {
+    const match = /(?:^|[,\s])(zr_gw_session=[^;\s,]+)/u.exec(line)
+    if (match) return match[1]
+  }
+  for (const line of lines) {
+    const first = line.split(';', 1)[0]?.trim()
+    if (first && first.includes('=') && !/^(expires|path|domain|max-age|samesite|secure|httponly)=/i.test(first)) {
+      return first
+    }
+  }
+  return undefined
+}
+
+function parseGatewayNetworkList(rawJson: unknown): GatewayNetworkCandidate[] | null {
+  if (rawJson === null) return null
+  let rawList: unknown
+  if (Array.isArray(rawJson)) {
+    rawList = rawJson
+  } else if (typeof rawJson === 'object') {
+    const record = rawJson as Record<string, unknown>
+    if (record.ok === true && Array.isArray(record.data)) {
+      rawList = record.data
+    } else if (
+      record.ok === true
+      && record.data !== null
+      && typeof record.data === 'object'
+      && !Array.isArray(record.data)
+      && Array.isArray((record.data as Record<string, unknown>).networks)
+    ) {
+      rawList = (record.data as Record<string, unknown>).networks
+    } else if (Array.isArray(record.networks)) {
+      rawList = record.networks
+    }
+  }
+  if (!Array.isArray(rawList)) return null
+  const networks: GatewayNetworkCandidate[] = []
+  for (const item of rawList) {
+    if (
+      item === null
+      || typeof item !== 'object'
+      || Array.isArray(item)
+      || typeof (item as { id?: unknown }).id !== 'string'
+      || !/^[0-9a-f]{16}$/i.test((item as { id: string }).id)
+      || typeof (item as { name?: unknown }).name !== 'string'
+    ) {
+      return null
+    }
+    const row = item as Record<string, unknown>
+    const admissionMode = typeof row.admissionMode === 'string' && row.admissionMode !== '' ? row.admissionMode : 'manual'
+    const joinKey =
+      admissionMode === 'manual'
+        ? undefined
+        : typeof row.joinKey === 'string' && row.joinKey !== ''
+          ? row.joinKey
+          : typeof row.joinUri === 'string'
+            ? parseInviteUri(row.joinUri)?.joinKey
+            : undefined
+    networks.push({
+      id: (row.id as string).toLowerCase(),
+      name: row.name as string,
+      admissionMode,
+      ...(joinKey !== undefined && joinKey !== '' ? { joinKey } : {}),
+    })
+  }
+  return networks
+}
+
+function synthesizeGatewayInvite(
+  host: { rawHost: string; hostname: string; port: number; tls: boolean },
+  network: GatewayNetworkCandidate,
+): string {
+  if (network.admissionMode !== 'manual' && network.joinKey !== undefined && network.joinKey !== '') {
+    return formatInviteUri({
+      host: `${host.rawHost}:${host.port}`,
+      networkId: network.id,
+      tls: host.tls,
+      joinKey: network.joinKey,
+    })
+  }
+  return buildKeylessInviteUri({
+    rawHost: host.rawHost,
+    hostname: host.hostname,
+    port: host.port,
+    tls: host.tls,
+    networkId: network.id,
+  })
+}
+
 /**
  * Build the client route handler for one plugin row. The returned handler
  * owns the full response lifecycle of every request under
@@ -799,6 +941,7 @@ async function statusBodyOf(options: ClientHandlerOptions): Promise<Record<strin
  */
 export function createClientHandler(options: ClientHandlerOptions): ClientHandler {
   const fetchImpl: FetchLike = options.fetchImpl ?? ((url, init) => fetch(url, init))
+  const selectionCache = new Map<string, GatewaySelectionEntry>()
   const resolveLang = (): 'zh' | 'en' => {
     const value = typeof options.lang === 'function' ? options.lang() : options.lang
     return value === 'en' ? 'en' : 'zh'
@@ -1440,7 +1583,14 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
               })
               return
             }
-            if (route === CLIENT_PEER_JOIN_ROUTE || route === CLIENT_PEER_LEAVE_ROUTE || route === CLIENT_PEER_TOGGLE_MOUNT_ROUTE || route === CLIENT_PEER_TRUST_ROUTE || route === CLIENT_PEER_REPROBE_ROUTE) {
+            if (
+              route === CLIENT_PEER_JOIN_ROUTE
+              || route === CLIENT_PEER_LEAVE_ROUTE
+              || route === CLIENT_PEER_TOGGLE_MOUNT_ROUTE
+              || route === CLIENT_PEER_TRUST_ROUTE
+              || route === CLIENT_PEER_REPROBE_ROUTE
+              || route === CLIENT_PEER_DISMISS_REVOKED_ROUTE
+            ) {
               responseJson(res, 503, { ok: false, error: { code: 'identity-error' } })
               return
             }
@@ -1457,7 +1607,14 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
           responseJson(res, 200, peerStatusBodyOf(engine, options))
           return
         }
-        if (route === CLIENT_PEER_JOIN_ROUTE || route === CLIENT_PEER_LEAVE_ROUTE || route === CLIENT_PEER_TOGGLE_MOUNT_ROUTE || route === CLIENT_PEER_TRUST_ROUTE || route === CLIENT_PEER_REPROBE_ROUTE) {
+        if (
+          route === CLIENT_PEER_JOIN_ROUTE
+          || route === CLIENT_PEER_LEAVE_ROUTE
+          || route === CLIENT_PEER_TOGGLE_MOUNT_ROUTE
+          || route === CLIENT_PEER_TRUST_ROUTE
+          || route === CLIENT_PEER_REPROBE_ROUTE
+          || route === CLIENT_PEER_DISMISS_REVOKED_ROUTE
+        ) {
           if (method !== 'POST') {
             res.setHeader('Allow', 'POST')
             responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use POST' } })
@@ -1502,8 +1659,45 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
               }
               return
             }
-            const rawInput = (stringOrEmpty(body.inviteUri) || stringOrEmpty(body.gatewayUrl)).trim()
+
+            const nowMs = Date.now()
+            for (const [token, entry] of selectionCache) {
+              if (entry.expiresAt <= nowMs) selectionCache.delete(token)
+            }
+            const selectionToken = stringOrEmpty(body.selectionToken).trim()
             const requestedNetworkId = stringOrEmpty(body.networkId).trim().toLowerCase()
+            if (selectionToken !== '') {
+              if (!/^[0-9a-f]{16}$/.test(requestedNetworkId)) {
+                responseJson(res, 400, { ok: false, error: { code: 'invalid-invite' } })
+                return
+              }
+              const selectedEntry = selectionCache.get(selectionToken)
+              if (selectedEntry === undefined || selectedEntry.expiresAt <= nowMs) {
+                selectionCache.delete(selectionToken)
+                responseJson(res, 400, { ok: false, error: { code: 'selection-expired' } })
+                return
+              }
+              const matched = selectedEntry.networks.find((n) => n.id === requestedNetworkId)
+              if (!matched) {
+                responseJson(res, 404, { ok: false, error: { code: 'no-network' } })
+                return
+              }
+              selectionCache.delete(selectionToken)
+              const synthesizedUri = synthesizeGatewayInvite(selectedEntry, matched)
+              const outcome = await engine.joinNetwork(synthesizedUri)
+              if (outcome.ok) {
+                responseJson(res, 200, {
+                  ok: true,
+                  networkId: matched.id,
+                  manualApproval: matched.admissionMode === 'manual',
+                })
+              } else {
+                responseJson(res, 400, { ok: false, error: { code: outcome.code } })
+              }
+              return
+            }
+
+            const rawInput = (stringOrEmpty(body.inviteUri) || stringOrEmpty(body.gatewayUrl)).trim()
             if (rawInput === '') {
               responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'inviteUri or gatewayUrl (non-empty string) is required' } })
               return
@@ -1523,125 +1717,209 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
               return
             }
 
-            // Keyless manual-approval join by gateway address: discover joinable
-            // networks on `/peer/v1/networks`, then dial without `#joinKey` so
-            // the node lands in `pending` on the gateway console.
+            // Path A: authenticate transiently with the gateway owner account,
+            // fetch only that account's networks, and logout immediately in
+            // `finally`. Bare public hostnames strictly require HTTPS so
+            // credentials are never sent in plaintext HTTP.
+            const email = stringOrEmpty(body.email).trim()
+            const password = typeof body.password === 'string' ? body.password : ''
+            if (email === '' || password === '') {
+              responseJson(res, 400, { ok: false, error: { code: 'credentials-required' } })
+              return
+            }
+
             const candidates: Array<{ tls: boolean; origin: string }> =
               parsed.schemeMode === 'https'
                 ? [{ tls: true, origin: `https://${parsed.rawHost}:${parsed.port}` }]
                 : parsed.schemeMode === 'http'
                   ? [{ tls: false, origin: `http://${parsed.rawHost}:${parsed.port}` }]
                   : isLoopbackOrPrivateHostname(parsed.hostname)
-                    ? [{ tls: false, origin: `http://${parsed.rawHost}:${parsed.port}` }]
-                    : parsed.port === 443
-                      ? [{ tls: true, origin: `https://${parsed.rawHost}:${parsed.port}` }]
-                      : [
-                          { tls: true, origin: `https://${parsed.rawHost}:${parsed.port}` },
-                          { tls: false, origin: `http://${parsed.rawHost}:${parsed.port}` },
-                        ]
+                    ? [
+                        { tls: true, origin: `https://${parsed.rawHost}:${parsed.port}` },
+                        { tls: false, origin: `http://${parsed.rawHost}:${parsed.port}` },
+                      ]
+                    : [{ tls: true, origin: `https://${parsed.rawHost}:${parsed.port}` }]
 
-            let discovered: {
-              tls: boolean
-              networks: Array<{ id: string; name: string }>
-              totalNetworks: number
-            } | null = null
-
+            let reachable: { tls: boolean; origin: string } | null = null
             for (const candidate of candidates) {
               try {
-                const probeRes = await fetchImpl(`${candidate.origin}/peer/v1/networks`, {
+                const probeRes = await fetchImpl(`${candidate.origin}/peer/v1/ping`, {
                   method: 'GET',
                   redirect: 'manual',
                   signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
                 })
-                if (probeRes.status !== 200) continue
-                const rawJson = JSON.parse(await probeRes.text()) as Record<string, unknown>
-                if (rawJson === null || typeof rawJson !== 'object') continue
-                const payloadObj =
-                  rawJson.ok === true && rawJson.data !== null && typeof rawJson.data === 'object' && !Array.isArray(rawJson.data)
-                    ? (rawJson.data as Record<string, unknown>)
-                    : rawJson
-                if (!Array.isArray(payloadObj.networks)) continue
-                const networks: Array<{ id: string; name: string }> = []
-                let malformed = false
-                for (const item of payloadObj.networks) {
-                  if (
-                    item === null
-                    || typeof item !== 'object'
-                    || typeof (item as { id?: unknown }).id !== 'string'
-                    || !/^[0-9a-f]{16}$/i.test((item as { id: string }).id)
-                    || typeof (item as { name?: unknown }).name !== 'string'
-                  ) {
-                    malformed = true
-                    break
+                if (probeRes.status === 426 && !candidate.tls) {
+                  const upgradedOrigin = `https://${parsed.rawHost}:${parsed.port}`
+                  try {
+                    const upgradedRes = await fetchImpl(`${upgradedOrigin}/peer/v1/ping`, {
+                      method: 'GET',
+                      redirect: 'manual',
+                      signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
+                    })
+                    if (await isValidGatewayPing(upgradedRes)) {
+                      reachable = { tls: true, origin: upgradedOrigin }
+                      break
+                    }
+                  } catch {
+                    // HTTPS upgrade probe failed; fall through.
                   }
-                  networks.push({
-                    id: (item as { id: string }).id.toLowerCase(),
-                    name: (item as { name: string }).name,
-                  })
+                  continue
                 }
-                if (malformed) continue
-                const totalNetworks =
-                  typeof payloadObj.totalNetworks === 'number' && Number.isFinite(payloadObj.totalNetworks)
-                    ? payloadObj.totalNetworks
-                    : networks.length
-                discovered = { tls: candidate.tls, networks, totalNetworks }
-                break
+                if (await isValidGatewayPing(probeRes)) {
+                  reachable = candidate
+                  break
+                }
               } catch {
-                // Try next scheme candidate if available.
+                // Try next transport candidate when permitted.
               }
             }
 
-            if (discovered === null) {
+            if (reachable === null) {
               responseJson(res, 502, { ok: false, error: { code: 'gateway-unreachable' } })
               return
             }
 
+            let loginRes: Response
+            try {
+              loginRes = await fetchImpl(`${reachable.origin}/api/v1/auth/login`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ email, password }),
+                redirect: 'manual',
+                signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
+              })
+            } catch {
+              responseJson(res, 502, { ok: false, error: { code: 'gateway-unreachable' } })
+              return
+            }
+
+            if (loginRes.status === 401 || loginRes.status === 403) {
+              responseJson(res, 401, { ok: false, error: { code: 'auth-failed' } })
+              return
+            }
+            if (loginRes.status === 429) {
+              responseJson(res, 429, { ok: false, error: { code: 'rate-limited' } })
+              return
+            }
+            if (!loginRes.ok) {
+              responseJson(res, 502, { ok: false, error: { code: 'gateway-unreachable' } })
+              return
+            }
+            const sessionCookie = extractGatewaySessionCookie(loginRes.headers)
+            if (sessionCookie === undefined) {
+              responseJson(res, 502, { ok: false, error: { code: 'gateway-unreachable' } })
+              return
+            }
+
+            let networks: GatewayNetworkCandidate[] | null = null
+            let listFailureStatus: number | null = null
+            let listFailureCode: string | null = null
+            try {
+              const listRes = await fetchImpl(`${reachable.origin}/api/v1/networks`, {
+                method: 'GET',
+                headers: { cookie: sessionCookie },
+                redirect: 'manual',
+                signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
+              })
+              if (listRes.status === 401 || listRes.status === 403) {
+                listFailureStatus = 401
+                listFailureCode = 'auth-failed'
+              } else if (!listRes.ok) {
+                listFailureStatus = 502
+                listFailureCode = 'gateway-unreachable'
+              } else {
+                const rawJson = JSON.parse(await listRes.text()) as unknown
+                networks = parseGatewayNetworkList(rawJson)
+                if (networks === null) {
+                  listFailureStatus = 502
+                  listFailureCode = 'gateway-unreachable'
+                }
+              }
+            } catch {
+              listFailureStatus = 502
+              listFailureCode = 'gateway-unreachable'
+            } finally {
+              await fetchImpl(`${reachable.origin}/api/v1/auth/logout`, {
+                method: 'POST',
+                headers: { cookie: sessionCookie },
+                redirect: 'manual',
+                signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
+              }).catch(() => {})
+            }
+
+            if (networks === null) {
+              responseJson(res, listFailureStatus ?? 502, { ok: false, error: { code: listFailureCode ?? 'gateway-unreachable' } })
+              return
+            }
+
             const explicitNetId = requestedNetworkId !== '' ? requestedNetworkId : (parsed.networkId ?? '')
-            let targetNetworkId: string
+            let matched: GatewayNetworkCandidate
             if (explicitNetId !== '') {
               if (!/^[0-9a-f]{16}$/.test(explicitNetId)) {
                 responseJson(res, 400, { ok: false, error: { code: 'invalid-invite' } })
                 return
               }
-              const matched = discovered.networks.find((n) => n.id === explicitNetId)
-              if (!matched) {
-                const code = discovered.totalNetworks > discovered.networks.length ? 'manual-disabled' : 'no-network'
-                responseJson(res, 400, { ok: false, error: { code } })
+              const found = networks.find((n) => n.id === explicitNetId)
+              if (!found) {
+                responseJson(res, 404, { ok: false, error: { code: 'no-network' } })
                 return
               }
-              targetNetworkId = matched.id
-            } else if (discovered.networks.length === 1) {
-              targetNetworkId = discovered.networks[0].id
-            } else if (discovered.networks.length > 1) {
+              matched = found
+            } else if (networks.length === 0) {
+              responseJson(res, 404, { ok: false, error: { code: 'no-network' } })
+              return
+            } else if (networks.length === 1) {
+              matched = networks[0]
+            } else {
+              if (selectionCache.size >= MAX_GATEWAY_SELECTIONS) {
+                const oldestKey = selectionCache.keys().next().value
+                if (oldestKey !== undefined) selectionCache.delete(oldestKey)
+              }
+              const nextToken = randomBytes(24).toString('hex')
+              selectionCache.set(nextToken, {
+                expiresAt: Date.now() + GATEWAY_SELECTION_TTL_MS,
+                rawHost: parsed.rawHost,
+                hostname: parsed.hostname,
+                port: parsed.port,
+                tls: reachable.tls,
+                networks,
+              })
               responseJson(res, 409, {
                 ok: false,
                 error: { code: 'select-network' },
-                networks: discovered.networks,
+                selectionToken: nextToken,
+                networks: networks.map(({ id, name, admissionMode }) => ({ id, name, admissionMode })),
               })
-              return
-            } else {
-              const code = discovered.totalNetworks > 0 ? 'manual-disabled' : 'no-network'
-              responseJson(res, 400, { ok: false, error: { code } })
               return
             }
 
-            const synthesizedUri = buildKeylessInviteUri({
-              rawHost: parsed.rawHost,
-              hostname: parsed.hostname,
-              port: parsed.port,
-              tls: discovered.tls,
-              networkId: targetNetworkId,
-            })
+            const synthesizedUri = synthesizeGatewayInvite(
+              { rawHost: parsed.rawHost, hostname: parsed.hostname, port: parsed.port, tls: reachable.tls },
+              matched,
+            )
             const outcome = await engine.joinNetwork(synthesizedUri)
             if (outcome.ok) {
-              responseJson(res, 200, { ok: true, networkId: targetNetworkId, manualApproval: true })
+              responseJson(res, 200, {
+                ok: true,
+                networkId: matched.id,
+                manualApproval: matched.admissionMode === 'manual',
+              })
             } else {
               responseJson(res, 400, { ok: false, error: { code: outcome.code } })
             }
             return
           }
           if (route === CLIENT_PEER_LEAVE_ROUTE) {
-            engine.leaveNetwork()
+            const out = await engine.leaveNetwork()
+            const gatewaySynced =
+              out !== null && typeof out === 'object' && typeof (out as { gatewaySynced?: unknown }).gatewaySynced === 'boolean'
+                ? (out as { gatewaySynced: boolean }).gatewaySynced
+                : undefined
+            responseJson(res, 200, gatewaySynced !== undefined ? { ok: true, gatewaySynced } : { ok: true })
+            return
+          }
+          if (route === CLIENT_PEER_DISMISS_REVOKED_ROUTE) {
+            engine.dismissRevokedNotice?.()
             responseJson(res, 200, { ok: true })
             return
           }

@@ -46,6 +46,7 @@ import {
   CLIENT_CLAIM_ROUTE,
   CLIENT_CONFIG_ROUTE,
   CLIENT_DEBUG_REPORT_ROUTE,
+  CLIENT_PEER_DISMISS_REVOKED_ROUTE,
   CLIENT_PEER_JOIN_ROUTE,
   CLIENT_PEER_LEAVE_ROUTE,
   CLIENT_PEER_REPROBE_ROUTE,
@@ -585,10 +586,14 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   const [peerActionFailed, setPeerActionFailed] = useState(false)
   const [peerJoinMode, setPeerJoinMode] = useState<'invite' | 'gateway'>('invite')
   const [peerJoinInput, setPeerJoinInput] = useState('')
+  const [peerGatewayEmail, setPeerGatewayEmail] = useState('')
+  const [peerGatewayPassword, setPeerGatewayPassword] = useState('')
+  const [peerSelectionToken, setPeerSelectionToken] = useState('')
   const [peerCandidateNetworks, setPeerCandidateNetworks] = useState<readonly { id: string; name: string }[]>([])
   const [peerSelectedNetId, setPeerSelectedNetId] = useState('')
   const [peerJoinBusy, setPeerJoinBusy] = useState(false)
   const [peerJoinFail, setPeerJoinFail] = useState<string | null>(null)
+  const [peerLeaveNote, setPeerLeaveNote] = useState<string | undefined>()
   // One latest-wins ticket stream dedicated to the peer poll.
   const peerStatusTicket = useMemo(createLatestGate, [])
   const loadPeerStatus = useCallback(() => {
@@ -635,8 +640,12 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       })
-      const body = (await res.json().catch(() => ({}))) as { ok?: boolean }
-      setPeerActionFailed(!res.ok || body.ok !== true)
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; gatewaySynced?: boolean }
+      const ok = res.ok && body.ok === true
+      setPeerActionFailed(!ok)
+      if (ok && route === CLIENT_PEER_LEAVE_ROUTE) {
+        setPeerLeaveNote(body.gatewaySynced === false ? t('wizard.peer.leaveOfflineNote') : undefined)
+      }
     } catch {
       setPeerActionFailed(true)
     } finally {
@@ -645,18 +654,41 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
     loadPeerStatus()
   }
 
+  const dismissSettingsPeerRevoked = async (): Promise<void> => {
+    setPeerActionFailed(false)
+    try {
+      const res = await fetch(CLIENT_PEER_DISMISS_REVOKED_ROUTE, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      })
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean }
+      if (!res.ok || body.ok !== true) setPeerActionFailed(true)
+    } catch {
+      setPeerActionFailed(true)
+    }
+    loadPeerStatus()
+  }
+
   const runSettingsPeerJoin = async (): Promise<void> => {
     setPeerJoinFail(null)
+    const usingSelectionStep = peerJoinMode === 'gateway' && peerSelectionToken !== '' && peerSelectedNetId !== ''
     const raw = peerJoinInput.trim()
-    if (raw === '') {
+    if (!usingSelectionStep && raw === '') {
       setPeerJoinFail(peerJoinMode === 'gateway' ? 'invalid-gateway' : 'invalid-invite')
+      return
+    }
+    if (peerJoinMode === 'gateway' && !usingSelectionStep && (peerGatewayEmail.trim() === '' || peerGatewayPassword === '')) {
+      setPeerJoinFail('credentials-required')
       return
     }
     setPeerJoinBusy(true)
     try {
-      const payload = peerJoinMode === 'gateway'
-        ? { gatewayUrl: raw, ...(peerSelectedNetId !== '' ? { networkId: peerSelectedNetId } : {}) }
-        : { inviteUri: raw }
+      const payload = usingSelectionStep
+        ? { selectionToken: peerSelectionToken, networkId: peerSelectedNetId }
+        : peerJoinMode === 'gateway'
+          ? { gatewayUrl: raw, email: peerGatewayEmail.trim(), password: peerGatewayPassword }
+          : { inviteUri: raw }
       const res = await fetch(CLIENT_PEER_JOIN_ROUTE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -665,19 +697,30 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
       const body = (await res.json().catch(() => ({}))) as {
         ok?: boolean
         error?: { code?: string }
+        selectionToken?: string
         networks?: Array<{ id: string; name: string }>
       }
       if (res.ok && body.ok === true) {
         setPeerJoinInput('')
+        setPeerGatewayPassword('')
+        setPeerSelectionToken('')
         setPeerCandidateNetworks([])
         setPeerSelectedNetId('')
+        setPeerLeaveNote(undefined)
         loadPeerStatus()
       } else if (body?.error?.code === 'select-network' && Array.isArray(body.networks) && body.networks.length > 0) {
+        setPeerGatewayPassword('')
         setPeerJoinMode('gateway')
+        setPeerSelectionToken(typeof body.selectionToken === 'string' ? body.selectionToken : '')
         setPeerCandidateNetworks(body.networks)
         setPeerSelectedNetId(body.networks[0]?.id ?? '')
       } else {
         const code = body?.error?.code ?? 'unexpected'
+        if (code === 'selection-expired') {
+          setPeerSelectionToken('')
+          setPeerCandidateNetworks([])
+          setPeerSelectedNetId('')
+        }
         setPeerJoinFail(code === 'invalid-invite' && peerJoinMode === 'gateway' ? 'invalid-gateway' : code)
       }
     } catch {
@@ -1441,6 +1484,19 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         <div className="zr-settings-card">
           <h3 className="zr-settings-card-title">{t('settings.peer.title')}</h3>
           <p className="zr-settings-hint" style={{ paddingTop: 4 }}>{t('settings.peer.subtitle')}</p>
+          {peerView?.revokedNotice !== undefined && (
+            <div className="zr-settings-row" role="alert" style={{ justifyContent: 'space-between', alignItems: 'center', paddingTop: 8, paddingBottom: 4 }}>
+              <span className="zr-settings-hint" data-invalid="true">
+                {t('wizard.peer.revokedBanner', { name: peerView.revokedNotice.deviceName })}
+              </span>
+              <Button variant="ghost" size="sm" onClick={() => { void dismissSettingsPeerRevoked() }}>
+                {t('wizard.peer.dismissRevoked')}
+              </Button>
+            </div>
+          )}
+          {peerLeaveNote !== undefined && (
+            <p className="zr-settings-hint" style={{ paddingTop: 4 }}>{peerLeaveNote}</p>
+          )}
           {peerView?.gatewayState === 'identity-error' ? (
             <div className="zr-settings-field">
               <div className="zr-settings-head">
@@ -1578,12 +1634,15 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               className="zr-settings-input"
               type="text"
               autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="none"
               spellCheck={false}
               placeholder={peerJoinMode === 'gateway' ? t('wizard.peer.gatewayUrlPlaceholder') : t('wizard.peer.inviteUriPlaceholder')}
               value={peerJoinInput}
               disabled={peerJoinBusy}
               onChange={(e) => {
                 setPeerJoinInput(e.currentTarget.value)
+                setPeerSelectionToken('')
                 setPeerCandidateNetworks([])
                 setPeerSelectedNetId('')
                 if (peerJoinFail !== null) setPeerJoinFail(null)
@@ -1592,6 +1651,54 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
             <p className="zr-settings-hint">
               {peerJoinMode === 'gateway' ? t('wizard.peer.gatewayUrlHint') : t('wizard.peer.inviteUriHint')}
             </p>
+            {peerJoinMode === 'gateway' && (
+              <>
+                <div style={{ paddingTop: 8 }}>
+                  <div className="zr-settings-head">
+                    <label htmlFor="zr-settings-peer-email">{t('wizard.peer.gatewayEmail')}</label>
+                  </div>
+                  <input
+                    id="zr-settings-peer-email"
+                    className="zr-settings-input"
+                    type="email"
+                    autoComplete="username"
+                    autoCorrect="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    placeholder={t('wizard.peer.gatewayEmailPlaceholder')}
+                    value={peerGatewayEmail}
+                    disabled={peerJoinBusy}
+                    onChange={(e) => {
+                      setPeerGatewayEmail(e.currentTarget.value)
+                      setPeerSelectionToken('')
+                      setPeerCandidateNetworks([])
+                      setPeerSelectedNetId('')
+                      if (peerJoinFail !== null) setPeerJoinFail(null)
+                    }}
+                  />
+                </div>
+                {peerSelectionToken === '' && (
+                  <div style={{ paddingTop: 8 }}>
+                    <div className="zr-settings-head">
+                      <label htmlFor="zr-settings-peer-password">{t('wizard.peer.gatewayPassword')}</label>
+                    </div>
+                    <input
+                      id="zr-settings-peer-password"
+                      className="zr-settings-input"
+                      type="password"
+                      autoComplete="current-password"
+                      placeholder={t('wizard.peer.gatewayPasswordPlaceholder')}
+                      value={peerGatewayPassword}
+                      disabled={peerJoinBusy}
+                      onChange={(e) => {
+                        setPeerGatewayPassword(e.currentTarget.value)
+                        if (peerJoinFail !== null) setPeerJoinFail(null)
+                      }}
+                    />
+                  </div>
+                )}
+              </>
+            )}
             {peerJoinMode === 'gateway' && peerCandidateNetworks.length > 1 && (
               <div style={{ paddingTop: 8 }}>
                 <div className="zr-settings-head">
@@ -1614,7 +1721,19 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               </div>
             )}
             <div className="zr-settings-row" style={{ paddingTop: 8, paddingBottom: 8 }}>
-              <Button variant="outline" size="sm" disabled={peerJoinBusy} onClick={() => { void runSettingsPeerJoin() }}>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={
+                  peerJoinBusy ||
+                  (peerJoinMode === 'gateway' && (
+                    peerSelectionToken !== ''
+                      ? peerSelectedNetId.trim() === ''
+                      : (peerJoinInput.trim() === '' || peerGatewayEmail.trim() === '' || peerGatewayPassword === '')
+                  ))
+                }
+                onClick={() => { void runSettingsPeerJoin() }}
+              >
                 {peerJoinBusy
                   ? t('wizard.peer.joining')
                   : peerJoinMode === 'gateway'
@@ -1635,7 +1754,15 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                           ? t('wizard.peer.joinNoNetwork')
                           : peerJoinFail === 'manual-disabled'
                             ? t('wizard.peer.joinManualDisabled')
-                            : t('wizard.peer.joinFailed', { reason: peerJoinFail })}
+                            : peerJoinFail === 'credentials-required'
+                              ? t('wizard.peer.joinCredentialsRequired')
+                              : peerJoinFail === 'auth-failed'
+                                ? t('wizard.peer.joinAuthFailed')
+                                : peerJoinFail === 'selection-expired'
+                                  ? t('wizard.peer.joinSelectionExpired')
+                                  : peerJoinFail === 'rate-limited'
+                                    ? t('wizard.peer.joinRateLimited')
+                                    : t('wizard.peer.joinFailed', { reason: peerJoinFail })}
                 </span>
               )}
             </div>

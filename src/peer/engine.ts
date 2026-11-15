@@ -27,11 +27,13 @@
 
 import { createSocket } from 'node:dgram'
 import type { Socket as DgramSocket } from 'node:dgram'
+import { hostname as osHostname } from 'node:os'
 
 import {
   computeJoinKeyProof,
   parseInviteUri,
   signGatewayChallenge,
+  signGatewayLeave,
 } from './crypto.js'
 import type { PeerIdentityKeyPair } from './crypto.js'
 import { probeStunNatType } from './punch.js'
@@ -43,11 +45,14 @@ import type { PeerPath } from './mux.js'
 import { decodeFrameHeader, PeerFrameType } from './wire.js'
 import {
   readPeerNetwork,
+  readPeerRevokedNotice,
   repinPeerKey,
   setPeerNodeDisabled,
   verifyOrPinPeerKey,
   writePeerNetwork,
+  writePeerRevokedNotice,
 } from '../state-store.js'
+import type { PeerRevokedNotice } from '../state-store.js'
 import type { RelayPool, RelayPoolEntryView } from '../relay-pool.js'
 import { WsClient } from './ws-client.js'
 
@@ -77,6 +82,7 @@ export interface PeerEngineStatus {
   nodeId: string
   gatewayState: PeerGatewayState
   deniedReason?: string | null
+  revokedNotice?: PeerRevokedNotice | null
   networkId: string | null
   maxPeers: number | null
   natType: PeerNatType | null
@@ -121,8 +127,15 @@ export interface PeerEngineOptions {
   wsReconnectMaxMs?: number
   /** Deadline after WS upgrade for an authentication outcome (default 10000ms). */
   wsAuthTimeoutMs?: number
+  /** Optional HTTP fetch implementation (used for proactive gateway leave sync). */
+  fetchImpl?: typeof fetch
   clock?: { now(): number; setTimeout(fn: () => void, ms: number): unknown; clearTimeout(handle: unknown): void }
   log?: (line: string) => void
+}
+
+export interface PeerEngineLeaveResult {
+  ok: true
+  gatewaySynced: boolean
 }
 
 export interface PeerEngine {
@@ -131,7 +144,8 @@ export interface PeerEngine {
    * join 序列（备好打洞 socket 与 mux，再连网关 WS）直接连回，已入网机器
    * 重启 DSH 后无需重新粘贴邀请链接。未入网回答 false，什么也不做。 */
   resumeFromState(): boolean
-  leaveNetwork(): void
+  leaveNetwork(): Promise<PeerEngineLeaveResult>
+  dismissRevokedNotice(): void
   setNodeDisabled(nodeId: string, disabled: boolean): void
   trustPeer(nodeId: string): boolean
   /** 向网关宣告本机最新设备显示名，网关落盘并向同网在线节点广播 `peer-renamed`。 */
@@ -179,7 +193,13 @@ const parseWelcomeStun = (value: unknown): { primaryPort: number; altPort: numbe
 
 export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   const clock = options.clock ?? realClock
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch
   const log = options.log ?? (() => {})
+  const TRANSIENT_DENIED_REASONS = new Set([
+    'gateway storage unavailable',
+    'timestamp out of range',
+    'admission changed',
+  ])
   const identity: PeerIdentityKeyPair = {
     publicKeyHex: options.identity.publicKeyHex,
     privateKeyHex: options.identity.privateKeyHex,
@@ -490,6 +510,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         // PC-03 能力位：被暂停时请求保留受限控制连接（等待管理员 resume 原地
         // 恢复）。旧网关忽略未知字段，仍按 deny + 关闭处理。
         pauseHold: true,
+        // PAS-3：仅当网关曾放行入网（everAdmitted: true）时标定自动重连，
+        // 让网关在离线被移除/拒绝时彻底阻断旧口令自动复活。
+        reconnect: net.everAdmitted === true,
         timestamp,
         signatureHex: signGatewayChallenge({
           privateKeyHex: identity.privateKeyHex,
@@ -512,12 +535,26 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       clearAuthDeadline()
       deniedReason = null
       const announcedCap = message['maxPeers']
-      if (typeof announcedCap === 'number' && Number.isSafeInteger(announcedCap) && announcedCap >= 2) {
-        maxPeers = announcedCap
-        const net = readPeerNetwork(stateFile)
-        if (net !== undefined && net.maxPeersFromGateway !== announcedCap) {
-          writePeerNetwork(stateFile, { ...net, maxPeersFromGateway: announcedCap })
+      const validCap =
+        typeof announcedCap === 'number' && Number.isSafeInteger(announcedCap) && announcedCap >= 2
+          ? announcedCap
+          : undefined
+      if (validCap !== undefined) maxPeers = validCap
+      const markAdmitted = status === 'authorized' || status === 'paused'
+      const net = readPeerNetwork(stateFile)
+      if (net !== undefined) {
+        const needCap = validCap !== undefined && net.maxPeersFromGateway !== validCap
+        const needAdmit = markAdmitted && net.everAdmitted !== true
+        if (needCap || needAdmit) {
+          writePeerNetwork(stateFile, {
+            ...net,
+            ...(validCap !== undefined ? { maxPeersFromGateway: validCap } : {}),
+            ...(markAdmitted ? { everAdmitted: true } : {}),
+          })
         }
+      }
+      if (markAdmitted && readPeerRevokedNotice(stateFile) !== undefined) {
+        writePeerRevokedNotice(stateFile, undefined)
       }
       if (status === 'authorized') {
         gatewayState = 'authorized'
@@ -568,12 +605,49 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       // authorized 闸之前处理，否则挂在 connecting/pending 的连接会把拒绝
       // 静默吞掉，永远停在旧状态；同时卸载全部已挂载的远端工作区。
       const reason = typeof message['reason'] === 'string' ? message['reason'] : ''
+      if (reason.includes('paused')) {
+        deniedReason = reason !== '' ? reason : null
+        wsReconnectable = false
+        gatewayState = 'paused'
+        for (const existingId of [...members.keys()]) memberGone(existingId)
+        log(`peer engine: gateway paused (${reason})`)
+        try { ws?.close() } catch { /* dying */ }
+        return
+      }
+      if (TRANSIENT_DENIED_REASONS.has(reason)) {
+        deniedReason = reason
+        wsReconnectable = true
+        gatewayState = 'offline'
+        for (const existingId of [...members.keys()]) memberGone(existingId)
+        log(`peer engine: gateway transient denial (${reason}) — retaining credentials for retry`)
+        try { ws?.close() } catch { /* dying */ }
+        return
+      }
+      // PAS-3：区分“从未入网首次遭拒”与“已入网后遭撤销/移除”：
+      // 两者都要断开全部对端并清除本地 peerNetwork 凭据防重启复活，但仅后者写入
+      // 非凭据的撤销横幅供设置页/向导提示（“设备 xxx 网关已撤销授权”）。
+      const prevNet = readPeerNetwork(stateFile)
+      const wasAdmitted =
+        prevNet?.everAdmitted === true ||
+        gatewayState === 'authorized' ||
+        gatewayState === 'paused' ||
+        gatewayState === 'mismatch'
+      if (wasAdmitted) {
+        const deviceName = options.serverName().trim() || osHostname().trim() || identity.nodeId
+        writePeerRevokedNotice(stateFile, {
+          deviceName,
+          gatewayHost: prevNet?.gatewayHttpOrigin ?? '',
+          networkId: prevNet?.networkId ?? networkId ?? '',
+          reason: reason || 'revoked',
+          revokedAt: clock.now(),
+        })
+      }
+      resetActiveSession()
+      networkId = null
+      writePeerNetwork(stateFile, undefined)
       deniedReason = reason !== '' ? reason : null
-      wsReconnectable = false
-      gatewayState = reason.includes('paused') ? 'paused' : 'revoked'
-      for (const existingId of [...members.keys()]) memberGone(existingId)
+      gatewayState = 'revoked'
       log(`peer engine: gateway denied (${reason || 'no reason'})`)
-      try { ws?.close() } catch { /* dying */ }
       return
     }
     if (type === 'paused') {
@@ -927,6 +1001,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       const existing = readPeerNetwork(stateFile)
       // 切换网络或重填地址重新入网时，先拆掉上一轮挂起/在线的 WS、mux 与打洞器。
       resetActiveSession()
+      writePeerRevokedNotice(stateFile, undefined)
       writePeerNetwork(stateFile, {
         inviteUri: invite,
         gatewayWsUrl: parsed.wsUrl,
@@ -973,10 +1048,50 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     },
 
     leaveNetwork() {
+      // 必须在首个 await 之前同步完成本地拆除与凭据抹除：保留既往调用方的
+      // 同步断言与并发 joinNetwork 安全，再尽最大努力通知网关注销本机成员。
+      const prevNet = readPeerNetwork(stateFile)
       resetActiveSession()
       networkId = null
       gatewayState = 'unconfigured'
       writePeerNetwork(stateFile, undefined)
+      if (prevNet === undefined) return Promise.resolve({ ok: true as const, gatewaySynced: true })
+      return (async (): Promise<PeerEngineLeaveResult> => {
+        try {
+          const timestamp = clock.now()
+          const signatureHex = signGatewayLeave({
+            privateKeyHex: identity.privateKeyHex,
+            publicKeyHex: identity.publicKeyHex,
+            networkId: prevNet.networkId,
+            nodeId: identity.nodeId,
+            timestamp,
+          })
+          const leaveUrl = `${prevNet.gatewayHttpOrigin.replace(/\/+$/, '')}/peer/v1/leave`
+          const res = await fetchImpl(leaveUrl, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              networkId: prevNet.networkId,
+              nodeId: identity.nodeId,
+              publicKeyHex: identity.publicKeyHex,
+              timestamp,
+              signatureHex,
+            }),
+            signal: AbortSignal.timeout(3000),
+          })
+          return { ok: true, gatewaySynced: res.ok }
+        } catch {
+          return { ok: true, gatewaySynced: false }
+        }
+      })()
+    },
+
+    dismissRevokedNotice() {
+      writePeerRevokedNotice(stateFile, undefined)
+      if (networkId === null && gatewayState === 'revoked') {
+        gatewayState = 'unconfigured'
+        deniedReason = null
+      }
     },
 
     setNodeDisabled(nodeId, disabled) {
@@ -1071,6 +1186,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         nodeId: identity.nodeId,
         gatewayState,
         deniedReason,
+        revokedNotice: readPeerRevokedNotice(stateFile) ?? null,
         networkId,
         maxPeers,
         natType,

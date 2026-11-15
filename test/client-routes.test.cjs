@@ -2597,6 +2597,7 @@ const PEER_LEAVE_PATH = '/_dsh/zen-remote/client/peer/leave'
 const PEER_TOGGLE_MOUNT_PATH = '/_dsh/zen-remote/client/peer/toggle-mount'
 const PEER_TRUST_PATH = '/_dsh/zen-remote/client/peer/trust'
 const PEER_REPROBE_PATH = '/_dsh/zen-remote/client/peer/reprobe'
+const PEER_DISMISS_REVOKED_PATH = '/_dsh/zen-remote/client/peer/dismiss-revoked'
 
 /** A PeerEngine double: records every management call, answers a fixed
  * status() unless the scenario overrides it. */
@@ -2609,7 +2610,11 @@ function makePeerEngine(overrides = {}) {
         calls.push(['join', invite])
         return overrides.joinResult ?? { ok: true }
       },
-      leaveNetwork: () => { calls.push(['leave']) },
+      leaveNetwork: () => {
+        calls.push(['leave'])
+        return overrides.leaveResult
+      },
+      dismissRevokedNotice: () => { calls.push(['dismissRevoked']) },
       setNodeDisabled: (nodeId, disabled) => { calls.push(['disable', nodeId, disabled]) },
       trustPeer: (nodeId) => { calls.push(['trust', nodeId]); return overrides.trustResult ?? true },
       reprobePunch: () => { calls.push(['reprobe']) },
@@ -2638,6 +2643,7 @@ test('PG-9 route constants name the six peer paths under the client prefix', asy
   assert.equal(routes.CLIENT_PEER_TOGGLE_MOUNT_ROUTE, PEER_TOGGLE_MOUNT_PATH)
   assert.equal(routes.CLIENT_PEER_TRUST_ROUTE, PEER_TRUST_PATH)
   assert.equal(routes.CLIENT_PEER_REPROBE_ROUTE, PEER_REPROBE_PATH)
+  assert.equal(routes.CLIENT_PEER_DISMISS_REVOKED_ROUTE, PEER_DISMISS_REVOKED_PATH)
 })
 
 test('PG-9 via wall: a gateway-marked request is refused BEFORE dispatch on every peer route', async () => {
@@ -2654,6 +2660,7 @@ test('PG-9 via wall: a gateway-marked request is refused BEFORE dispatch on ever
       [PEER_TOGGLE_MOUNT_PATH, { nodeId: 'aaaa1111', mounted: false }],
       [PEER_TRUST_PATH, { nodeId: 'cccc3333' }],
       [PEER_REPROBE_PATH, {}],
+      [PEER_DISMISS_REVOKED_PATH, {}],
     ]) {
       const res = await request(port, { method: 'POST', path, headers: { ...sameOrigin(port), ...viaHeaders }, body })
       assert.equal(res.status, 403, path)
@@ -3434,6 +3441,7 @@ test('PG-9 POSTs without an engine answer 503 peer-unavailable', async () => {
       [PEER_TOGGLE_MOUNT_PATH, { nodeId: 'aaaa1111', mounted: true }],
       [PEER_TRUST_PATH, { nodeId: 'cccc3333' }],
       [PEER_REPROBE_PATH, {}],
+      [PEER_DISMISS_REVOKED_PATH, {}],
     ]) {
       const res = await request(port, { method: 'POST', path, headers: sameOrigin(port), body })
       assert.equal(res.status, 503, path)
@@ -3444,19 +3452,51 @@ test('PG-9 POSTs without an engine answer 503 peer-unavailable', async () => {
   }
 })
 
-test('peer join by gatewayUrl: single-network auto-join, multi-network 409 select-network, and plain-HTTP public host', async () => {
-  // 1. Single network on plain-HTTP public IP -> synthesizes zr-net://…?tls=0 and returns manualApproval: true.
+test('PAS-4a peer/status revokedNotice, dismiss-revoked, and leave gatewaySynced passthrough', async () => {
+  const notice = { networkId: '0123456789abcdef', deviceName: 'Office-Mac', reason: 'removed from network', at: '2026-11-15T00:00:00.000Z' }
+  const { engine, calls } = makePeerEngine({
+    status: {
+      nodeId: 'abcd1234',
+      gatewayState: 'revoked',
+      deniedReason: 'removed from network',
+      revokedNotice: notice,
+      networkId: null,
+      maxPeers: null,
+      natType: 'unknown',
+      peers: [],
+    },
+    leaveResult: { ok: true, gatewaySynced: false },
+  })
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const statusRes = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(statusRes.status, 200)
+    const statusBody = JSON.parse(statusRes.body)
+    assert.equal(statusBody.configured, false)
+    assert.deepEqual(statusBody.revokedNotice, notice)
+
+    const dismissRes = await request(port, { method: 'POST', path: PEER_DISMISS_REVOKED_PATH, headers: sameOrigin(port), body: {} })
+    assert.equal(dismissRes.status, 200)
+    assert.deepEqual(JSON.parse(dismissRes.body), { ok: true })
+    assert.equal(calls.some((c) => c[0] === 'dismissRevoked'), true)
+
+    const leaveRes = await request(port, { method: 'POST', path: PEER_LEAVE_PATH, headers: sameOrigin(port), body: {} })
+    assert.equal(leaveRes.status, 200)
+    assert.deepEqual(JSON.parse(leaveRes.body), { ok: true, gatewaySynced: false })
+  } finally {
+    await closeServer(server)
+  }
+})
+
+test('PAS-4a peer join by gatewayUrl (Path A): credentials required, ephemeral login+logout, selectionToken, and scheme safety', async () => {
+  // 1. Missing email/password returns 400 credentials-required without hitting network.
   {
     const { engine, calls } = makePeerEngine()
     const fetchCalls = []
-    const fetchImpl = async (url) => {
-      fetchCalls.push(String(url))
-      return new Response(
-        JSON.stringify({ ok: true, data: { networks: [{ id: '1122334455667788', name: 'Office Mesh' }], totalNetworks: 1 } }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      )
-    }
-    const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl })
+    const { server, port } = await startClientServer(makeRow(), {
+      getPeerEngine: () => engine,
+      fetchImpl: async (url) => { fetchCalls.push(String(url)); throw new Error('should not fetch') },
+    })
     try {
       const res = await request(port, {
         method: 'POST',
@@ -3464,79 +3504,168 @@ test('peer join by gatewayUrl: single-network auto-join, multi-network 409 selec
         headers: sameOrigin(port),
         body: { gatewayUrl: 'http://203.0.113.99:19393' },
       })
+      assert.equal(res.status, 400)
+      assert.equal(JSON.parse(res.body).error.code, 'credentials-required')
+      assert.deepEqual(fetchCalls, [])
+      assert.deepEqual(calls, [])
+    } finally {
+      await closeServer(server)
+    }
+  }
+
+  // 2. Single manual network on explicit HTTP -> ping -> login -> networks -> logout (never leaks joinKey).
+  {
+    const { engine, calls } = makePeerEngine()
+    const fetchCalls = []
+    const fetchImpl = async (url, init) => {
+      fetchCalls.push(`${init?.method ?? 'GET'} ${String(url)}`)
+      if (String(url).endsWith('/peer/v1/ping')) {
+        return new Response(JSON.stringify({ ok: true, data: { gateway: true } }), { status: 200 })
+      }
+      if (String(url).endsWith('/api/v1/auth/login')) {
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'set-cookie': 'zr_gw_session=tok1; HttpOnly; Path=/' },
+        })
+      }
+      if (String(url).endsWith('/api/v1/networks')) {
+        assert.equal(init?.headers?.cookie, 'zr_gw_session=tok1')
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            data: {
+              networks: [{ id: '1122334455667788', name: 'Office Mesh', admissionMode: 'manual', joinUri: 'zr-net://ignored:19393/1122334455667788' }],
+            },
+          }),
+          { status: 200 },
+        )
+      }
+      if (String(url).endsWith('/api/v1/auth/logout')) {
+        assert.equal(init?.headers?.cookie, 'zr_gw_session=tok1')
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }
+    const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl })
+    try {
+      const res = await request(port, {
+        method: 'POST',
+        path: PEER_JOIN_PATH,
+        headers: sameOrigin(port),
+        body: { gatewayUrl: 'http://203.0.113.99:19393', email: 'u@example.com', password: 'pw' },
+      })
       assert.equal(res.status, 200)
       assert.deepEqual(JSON.parse(res.body), {
         ok: true,
         networkId: '1122334455667788',
         manualApproval: true,
       })
-      assert.deepEqual(fetchCalls, ['http://203.0.113.99:19393/peer/v1/networks'])
+      assert.deepEqual(fetchCalls, [
+        'GET http://203.0.113.99:19393/peer/v1/ping',
+        'POST http://203.0.113.99:19393/api/v1/auth/login',
+        'GET http://203.0.113.99:19393/api/v1/networks',
+        'POST http://203.0.113.99:19393/api/v1/auth/logout',
+      ])
       assert.deepEqual(calls, [['join', 'zr-net://203.0.113.99:19393/1122334455667788?tls=0']])
     } finally {
       await closeServer(server)
     }
   }
 
-  // 2. Multiple networks -> first POST returns 409 select-network + networks[]; second POST with networkId joins.
+  // 3. Multiple networks -> 409 select-network + selectionToken (logout already ran, joinKey stripped);
+  //    second POST consumes selectionToken without re-authenticating.
   {
     const { engine, calls } = makePeerEngine()
-    const fetchImpl = async () => new Response(
-      JSON.stringify({
-        ok: true,
-        data: {
-          networks: [
-            { id: 'aaaa111122223333', name: 'Home' },
-            { id: 'bbbb444455556666', name: 'Studio' },
-          ],
-          totalNetworks: 2,
-        },
-      }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    )
+    let logoutCount = 0
+    const fetchImpl = async (url) => {
+      if (String(url).endsWith('/peer/v1/ping')) {
+        if (String(url).startsWith('https://')) throw new Error('ECONNREFUSED')
+        return new Response(JSON.stringify({ ok: true, data: { gateway: true } }), { status: 200 })
+      }
+      if (String(url).endsWith('/api/v1/auth/login')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'set-cookie': 'zr_gw_session=tok2; Path=/' } })
+      }
+      if (String(url).endsWith('/api/v1/networks')) {
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            data: {
+              networks: [
+                { id: 'aaaa111122223333', name: 'Home', admissionMode: 'both', joinUri: 'zr-net://x:19393/aaaa111122223333#secretA' },
+                { id: 'bbbb444455556666', name: 'Studio', admissionMode: 'manual', joinUri: 'zr-net://x:19393/bbbb444455556666' },
+              ],
+            },
+          }),
+          { status: 200 },
+        )
+      }
+      if (String(url).endsWith('/api/v1/auth/logout')) {
+        logoutCount += 1
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }
     const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl })
     try {
       const first = await request(port, {
         method: 'POST',
         path: PEER_JOIN_PATH,
         headers: sameOrigin(port),
-        body: { gatewayUrl: 'http://192.168.1.20:19393' },
+        body: { gatewayUrl: '192.168.1.20:19393', email: 'u@example.com', password: 'pw' },
       })
       assert.equal(first.status, 409)
       const firstBody = JSON.parse(first.body)
       assert.equal(firstBody.error.code, 'select-network')
+      assert.equal(typeof firstBody.selectionToken, 'string')
+      assert.ok(firstBody.selectionToken.length >= 16)
       assert.equal(firstBody.networks.length, 2)
+      assert.equal(first.body.includes('secretA'), false, '409 payload must not expose joinKey')
+      assert.equal(logoutCount, 1, 'logout must complete in finally before returning 409')
       assert.equal(calls.length, 0)
 
       const second = await request(port, {
         method: 'POST',
         path: PEER_JOIN_PATH,
         headers: sameOrigin(port),
-        body: { gatewayUrl: 'http://192.168.1.20:19393', networkId: 'bbbb444455556666' },
+        body: { selectionToken: firstBody.selectionToken, networkId: 'aaaa111122223333' },
       })
       assert.equal(second.status, 200)
-      assert.deepEqual(calls, [['join', 'zr-net://192.168.1.20:19393/bbbb444455556666']])
+      assert.deepEqual(JSON.parse(second.body), { ok: true, networkId: 'aaaa111122223333', manualApproval: false })
+      assert.deepEqual(calls, [['join', 'zr-net://192.168.1.20:19393/aaaa111122223333#secretA']])
+
+      // Consumed selectionToken cannot be replayed.
+      const replay = await request(port, {
+        method: 'POST',
+        path: PEER_JOIN_PATH,
+        headers: sameOrigin(port),
+        body: { selectionToken: firstBody.selectionToken, networkId: 'bbbb444455556666' },
+      })
+      assert.equal(replay.status, 400)
+      assert.equal(JSON.parse(replay.body).error.code, 'selection-expired')
     } finally {
       await closeServer(server)
     }
   }
 
-  // 3. Key-only gateway -> 400 manual-disabled; unreachable gateway -> 502 gateway-unreachable.
+  // 4. Empty account networks -> 404 no-network; unreachable gateway -> 502 gateway-unreachable.
   {
     const { engine } = makePeerEngine()
-    const fetchKeyOnly = async () => new Response(
-      JSON.stringify({ ok: true, data: { networks: [], totalNetworks: 1 } }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    )
-    const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl: fetchKeyOnly })
+    const fetchEmpty = async (url) => {
+      if (String(url).endsWith('/peer/v1/ping')) return new Response(JSON.stringify({ ok: true, data: { gateway: true } }), { status: 200 })
+      if (String(url).endsWith('/api/v1/auth/login')) return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'set-cookie': 'zr_gw_session=tok3; Path=/' } })
+      if (String(url).endsWith('/api/v1/networks')) return new Response(JSON.stringify({ ok: true, data: { networks: [] } }), { status: 200 })
+      return new Response(JSON.stringify({ ok: true }), { status: 200 })
+    }
+    const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine, fetchImpl: fetchEmpty })
     try {
       const res = await request(port, {
         method: 'POST',
         path: PEER_JOIN_PATH,
         headers: sameOrigin(port),
-        body: { gatewayUrl: 'http://192.168.1.20:19393' },
+        body: { gatewayUrl: 'http://192.168.1.20:19393', email: 'u@example.com', password: 'pw' },
       })
-      assert.equal(res.status, 400)
-      assert.equal(JSON.parse(res.body).error.code, 'manual-disabled')
+      assert.equal(res.status, 404)
+      assert.equal(JSON.parse(res.body).error.code, 'no-network')
     } finally {
       await closeServer(server)
     }
@@ -3548,7 +3677,7 @@ test('peer join by gatewayUrl: single-network auto-join, multi-network 409 selec
         method: 'POST',
         path: PEER_JOIN_PATH,
         headers: sameOrigin(p2),
-        body: { gatewayUrl: 'http://192.168.1.20:19393' },
+        body: { gatewayUrl: 'http://192.168.1.20:19393', email: 'u@example.com', password: 'pw' },
       })
       assert.equal(res.status, 502)
       assert.equal(JSON.parse(res.body).error.code, 'gateway-unreachable')
@@ -3590,6 +3719,7 @@ test('PS-2: identity-error exposes sanitized peer/status and answers 503 identit
       [PEER_TOGGLE_MOUNT_PATH, { nodeId: 'aaaa1111', mounted: false }],
       [PEER_TRUST_PATH, { nodeId: 'cccc3333' }],
       [PEER_REPROBE_PATH, {}],
+      [PEER_DISMISS_REVOKED_PATH, {}],
     ]) {
       const res = await request(port, { method: 'POST', path, headers: sameOrigin(port), body })
       assert.equal(res.status, 503, path)

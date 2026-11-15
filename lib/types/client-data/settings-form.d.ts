@@ -102,6 +102,7 @@ export declare const CLIENT_PEER_LEAVE_ROUTE = "/_dsh/zen-remote/client/peer/lea
 export declare const CLIENT_PEER_TOGGLE_MOUNT_ROUTE = "/_dsh/zen-remote/client/peer/toggle-mount";
 export declare const CLIENT_PEER_TRUST_ROUTE = "/_dsh/zen-remote/client/peer/trust";
 export declare const CLIENT_PEER_REPROBE_ROUTE = "/_dsh/zen-remote/client/peer/reprobe";
+export declare const CLIENT_PEER_DISMISS_REVOKED_ROUTE = "/_dsh/zen-remote/client/peer/dismiss-revoked";
 /**
  * MS-6: the paired-server pool's cap — the browser mirror of
  * src/state-store.ts's constant of the same name (the host module cannot be
@@ -336,6 +337,15 @@ export interface PeerStatusView {
     /** PC-14a: the sync-readiness block (the third light's data). `undefined`
      * on an older body — never guessed from the peers rows. */
     sync: PeerSyncReadinessView | undefined;
+    /** Persisted post-admission revocation notice shown until dismissed or re-admitted. */
+    revokedNotice?: PeerRevokedNoticeView | undefined;
+}
+export interface PeerRevokedNoticeView {
+    deviceName: string;
+    gatewayHost: string;
+    networkId: string;
+    reason: string;
+    revokedAt: number;
 }
 /** One network-device row the peer section renders (wizard's
  * {@link PeerDeviceView} shape, mirrored here — settings-form cannot import

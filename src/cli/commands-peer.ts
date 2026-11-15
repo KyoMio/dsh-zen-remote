@@ -395,17 +395,51 @@ export async function runPeerJoinCommand(ctx: CliExecutionContext): Promise<numb
     const resolvedJoin = await resolveInvite(ctx)
     if (resolvedJoin === null) return 1
     const { raw: gatewayAddress, parsed: parsedJoin } = resolvedJoin
+    let gatewayEmail = ''
+    let gatewayPassword = ''
+    if (parsedJoin.kind === 'gateway') {
+      gatewayEmail = (await promptOrFail({
+        optionName: 'email',
+        interactive: ctx.interactive,
+        provided: args.options.email,
+        ask: async () => {
+          if (ctx.prompter === undefined) throw new MissingRequiredOptionError('email')
+          return await ctx.prompter.inputText(t('peer.join.promptEmail'))
+        },
+      })).trim()
+      gatewayPassword = await promptOrFail({
+        optionName: 'password',
+        interactive: ctx.interactive,
+        provided: args.options.password,
+        ask: async () => {
+          if (ctx.prompter === undefined) throw new MissingRequiredOptionError('password')
+          return ctx.prompter.inputSecret !== undefined
+            ? await ctx.prompter.inputSecret(t('peer.join.promptPassword'))
+            : await ctx.prompter.inputText(t('peer.join.promptPassword'))
+        },
+      })
+      if (gatewayEmail === '' || gatewayPassword === '') {
+        human.write(`${t('peer.error.credentialsRequired')}\n`)
+        return 1
+      }
+    }
     if (args.options.name !== undefined && !(await writeDisplayName(ctx, args.options.name))) return 1
 
     // 4. The join POST — invite links send `{ inviteUri }`; gateway addresses
-    // send `{ gatewayUrl }` and handle multi-network selection (`409 select-network`).
+    // send `{ gatewayUrl, email, password }` and handle multi-network selection (`409 select-network`).
     human.write(`${t('peer.join.claiming')}\n`)
+    const networkIdOption = args.options.network?.trim()
     let joined = await ipc.request(
       'POST',
       CLIENT_PEER_JOIN_ROUTE,
       parsedJoin.kind === 'invite'
         ? { inviteUri: parsedJoin.inviteUri }
-        : { gatewayUrl: gatewayAddress },
+        : {
+            gatewayUrl: gatewayAddress,
+            email: gatewayEmail,
+            password: gatewayPassword,
+            ...(networkIdOption !== undefined && networkIdOption !== '' ? { networkId: networkIdOption } : {}),
+          },
     )
     let joinedBody = plainOf(joined.body)
     if (
@@ -418,6 +452,7 @@ export async function runPeerJoinCommand(ctx: CliExecutionContext): Promise<numb
       const candidates = joinedBody.networks
         .map((n) => plainOf(n))
         .filter((n): n is ServerRow => n !== null && typeof n.id === 'string' && typeof n.name === 'string')
+      const selectionToken = typeof joinedBody.selectionToken === 'string' ? joinedBody.selectionToken : ''
       if (candidates.length > 0 && ctx.interactive && ctx.prompter !== undefined) {
         const pickedIndex = await ctx.prompter.selectOne(
           t('peer.join.selectNetwork'),
@@ -427,7 +462,7 @@ export async function runPeerJoinCommand(ctx: CliExecutionContext): Promise<numb
         const chosen = candidates[pickedIndex]
         if (chosen === undefined) return 1
         joined = await ipc.request('POST', CLIENT_PEER_JOIN_ROUTE, {
-          gatewayUrl: gatewayAddress,
+          ...(selectionToken !== '' ? { selectionToken } : { gatewayUrl: gatewayAddress, email: gatewayEmail, password: gatewayPassword }),
           networkId: String(chosen.id),
         })
         joinedBody = plainOf(joined.body)
@@ -440,7 +475,18 @@ export async function runPeerJoinCommand(ctx: CliExecutionContext): Promise<numb
     if (joined.status < 200 || joined.status >= 300 || joinedBody?.ok !== true) {
       const error = plainOf(joinedBody?.error)
       const code = typeof error?.code === 'string' ? error.code : ''
-      human.write(`${code === 'invalid-invite' ? t('peer.error.inviteInvalid') : t('peer.join.failed', { reason: code === '' ? String(joined.status) : code })}\n`)
+      const message = code === 'invalid-invite'
+        ? t('peer.error.inviteInvalid')
+        : code === 'auth-failed'
+          ? t('peer.error.authFailed')
+          : code === 'credentials-required'
+            ? t('peer.error.credentialsRequired')
+            : code === 'no-network'
+              ? t('peer.error.noNetwork')
+              : code === 'selection-expired'
+                ? t('peer.error.selectionExpired')
+                : t('peer.join.failed', { reason: code === '' ? String(joined.status) : code })
+      human.write(`${message}\n`)
       return 1
     }
 
@@ -651,10 +697,13 @@ export async function runPeerLeaveCommand(ctx: CliExecutionContext): Promise<num
       out.write(`${t('peer.leave.failed')}\n`)
       return 1
     }
+    const gatewaySynced = body?.gatewaySynced !== false
     if (args.options.json) {
       out.write(`${JSON.stringify({ ok: true }, null, 2)}\n`)
+      if (!gatewaySynced) (ctx.stderr ?? process.stderr).write(`${t('peer.leave.offlineNote')}\n`)
     } else {
       out.write(`${t('peer.leave.left')}\n`)
+      if (!gatewaySynced) out.write(`${t('peer.leave.offlineNote')}\n`)
     }
     return 0
   } catch (error) {

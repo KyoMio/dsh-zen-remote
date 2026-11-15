@@ -27,6 +27,7 @@
 import type { Socket as DgramSocket } from 'node:dgram';
 import type { PeerIdentityKeyPair } from './crypto.js';
 import type { PeerNatType } from './punch.js';
+import type { PeerRevokedNotice } from '../state-store.js';
 import type { RelayPool } from '../relay-pool.js';
 export type PeerGatewayState = 'unconfigured' | 'connecting' | 'pending-approval' | 'authorized' | 'mismatch' | 'paused' | 'revoked' | 'offline';
 export type PeerMemberState = 'eligible' | 'identity-mismatch' | 'disabled';
@@ -43,6 +44,7 @@ export interface PeerEngineStatus {
     nodeId: string;
     gatewayState: PeerGatewayState;
     deniedReason?: string | null;
+    revokedNotice?: PeerRevokedNotice | null;
     networkId: string | null;
     maxPeers: number | null;
     natType: PeerNatType | null;
@@ -88,12 +90,18 @@ export interface PeerEngineOptions {
     wsReconnectMaxMs?: number;
     /** Deadline after WS upgrade for an authentication outcome (default 10000ms). */
     wsAuthTimeoutMs?: number;
+    /** Optional HTTP fetch implementation (used for proactive gateway leave sync). */
+    fetchImpl?: typeof fetch;
     clock?: {
         now(): number;
         setTimeout(fn: () => void, ms: number): unknown;
         clearTimeout(handle: unknown): void;
     };
     log?: (line: string) => void;
+}
+export interface PeerEngineLeaveResult {
+    ok: true;
+    gatewaySynced: boolean;
 }
 export interface PeerEngine {
     joinNetwork(inviteUri: string): Promise<{
@@ -106,7 +114,8 @@ export interface PeerEngine {
      * join 序列（备好打洞 socket 与 mux，再连网关 WS）直接连回，已入网机器
      * 重启 DSH 后无需重新粘贴邀请链接。未入网回答 false，什么也不做。 */
     resumeFromState(): boolean;
-    leaveNetwork(): void;
+    leaveNetwork(): Promise<PeerEngineLeaveResult>;
+    dismissRevokedNotice(): void;
     setNodeDisabled(nodeId: string, disabled: boolean): void;
     trustPeer(nodeId: string): boolean;
     /** 向网关宣告本机最新设备显示名，网关落盘并向同网在线节点广播 `peer-renamed`。 */

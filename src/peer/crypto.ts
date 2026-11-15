@@ -551,6 +551,7 @@ export function assembleInviteUri(input: {
 // -- 3. gateway challenge + join-key proof -----------------------------------------
 
 const GATEWAY_AUTH_DOMAIN = 'zr-gw-auth-v1'
+const GATEWAY_LEAVE_DOMAIN = 'zr-gw-leave-v1'
 const JOIN_PROOF_DOMAIN = 'zr-join-v1'
 
 interface GatewayChallengeMessageParams {
@@ -611,6 +612,30 @@ export function verifyGatewayChallenge(params: {
   } catch {
     return false
   }
+}
+
+/** The canonical byte string signed/verified for proactive gateway leave (`PAS-3`). */
+export function gatewayLeaveMessage(params: { networkId: string; nodeId: string; timestamp: number }): Buffer {
+  const networkId = requireNetworkId(params.networkId, 'networkId')
+  const nodeId = requireHex(params.nodeId, 4, 'nodeId')
+  const timestamp = requireTimestamp(params.timestamp, 'timestamp')
+  return Buffer.from(`${GATEWAY_LEAVE_DOMAIN}|${networkId}|${nodeId}|${timestamp}`, 'utf8')
+}
+
+/** Sign one proactive `POST /peer/v1/leave` request with the node's Ed25519 identity. */
+export function signGatewayLeave(params: {
+  privateKeyHex: string
+  publicKeyHex: string
+  networkId: string
+  nodeId: string
+  timestamp: number
+}): string {
+  const privateKey = ed25519PrivateFromRaw(
+    requireHex(params.publicKeyHex, 32, 'publicKeyHex'),
+    requireHex(params.privateKeyHex, 32, 'privateKeyHex'),
+  )
+  const message = gatewayLeaveMessage(params)
+  return sign(null, message, privateKey).toString('hex')
 }
 
 function joinKeyProofMessage(params: { networkId: string; nodeId: string; challengeHex: string }): Buffer {

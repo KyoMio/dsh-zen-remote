@@ -29,6 +29,7 @@ export interface CliPrompter {
     selectOne(question: string, choices: readonly string[], defaultIndex: number): Promise<number>;
     selectMulti(question: string, choices: readonly string[], defaultIndices: readonly number[], allowCustomInput?: boolean): Promise<CliMultiSelection>;
     inputText(question: string, defaultValue?: string, validate?: (value: string) => string | undefined): Promise<string>;
+    inputSecret?(question: string): Promise<string>;
     confirm(question: string, defaultYes?: boolean): Promise<boolean>;
     close(): void;
 }
