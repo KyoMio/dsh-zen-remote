@@ -17,7 +17,7 @@ import type { CSSProperties, FormEvent } from 'react';
 
 import type { Locale, LocaleKey, TranslateFn } from '../i18n/locales';
 import type { PublicAuthMeta, SessionMeta, UiLocalState } from '../store/console-store';
-import { EyeIcon, EyeOffIcon, GlobeIcon, MoonIcon, ServerIcon, SunIcon } from './Icons';
+import { BrandMark, EyeIcon, EyeOffIcon, GlobeIcon, MoonIcon, SunIcon } from './Icons';
 
 export type LoginMode = 'login' | 'signup' | 'forgot';
 
@@ -354,9 +354,7 @@ export function LoginView(props: LoginViewProps) {
 
       <div className="login-card">
         <div className="login-brand">
-          <span className="brand-mark" aria-hidden="true">
-            <ServerIcon size={16} />
-          </span>
+          <BrandMark size={36} />
           <span className="login-brand-title">{t('app.title')}</span>
         </div>
 
