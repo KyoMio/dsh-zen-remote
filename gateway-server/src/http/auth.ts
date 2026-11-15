@@ -21,6 +21,8 @@ import type { SmtpSecurityMode } from '../mail/smtp-client.js';
 import { renderOtpEmail } from '../mail/templates.js';
 import type { MailLocale } from '../mail/templates.js';
 import { StoreError, constantTimeEqualText, DEFAULT_GROUP_ID } from '../store/types.js';
+import type { GatewayTlsBridge } from '../tls/dual-protocol-server.js';
+import { ZR_NATIVE_TLS_SYMBOL } from '../tls/dual-protocol-server.js';
 import type {
   AdmissionMode,
   EmailOtpPurpose,
@@ -164,6 +166,8 @@ export interface RouteContext {
   hooks: GatewayHooks;
   /** PG-5 实时层；未装配（无 topology 选项）时拓扑路由不注册 */
   topology?: TopologyProvider;
+  /** GT-3 原生单端口 TLS 控制器；未装配时 /api/v1/admin/tls* 按未配置降级 */
+  tls?: GatewayTlsBridge;
 }
 
 export type RouteHandler = (ctx: RouteContext, params: Record<string, string>) => Promise<void>;
@@ -233,13 +237,16 @@ export function storeErrorToApiError(err: StoreError): ApiError {
 const MAX_BODY_BYTES = 256 * 1024;
 
 /** 读 JSON 对象体；空体返回 {}；非法 JSON / 非对象 → 400 INVALID_JSON */
-export async function readJsonObjectBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+export async function readJsonObjectBody(
+  req: IncomingMessage,
+  maxBytes: number = MAX_BODY_BYTES,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
     const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
     size += buf.length;
-    if (size > MAX_BODY_BYTES) {
+    if (size > maxBytes) {
       throw new ApiError(413, 'PAYLOAD_TOO_LARGE', 'request body too large');
     }
     chunks.push(buf);
@@ -286,11 +293,23 @@ export function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
-function requestIsHttps(req: IncomingMessage): boolean {
-  return (
-    (req.socket instanceof TLSSocket && req.socket.encrypted) ||
-    readHeader(req, 'x-forwarded-proto') === 'https'
-  );
+/**
+ * 判断请求是否经 HTTPS 进入：优先识别直连原生 TLS（TLSSocket / encrypted /
+ * `[ZR_NATIVE_TLS_SYMBOL]`），其次识别反向代理头 `x-forwarded-proto` 首段 `https`。
+ */
+export function requestIsHttps(req: IncomingMessage): boolean {
+  const sock = req.socket as
+    | (IncomingMessage['socket'] & { encrypted?: boolean; [key: symbol]: unknown })
+    | undefined;
+  if (sock instanceof TLSSocket && sock.encrypted) return true;
+  if (sock?.encrypted === true) return true;
+  if (sock !== undefined && sock[ZR_NATIVE_TLS_SYMBOL] === true) return true;
+  const forwarded = readHeader(req, 'x-forwarded-proto');
+  if (forwarded !== undefined) {
+    const first = forwarded.split(',')[0]?.trim().toLowerCase();
+    if (first === 'https') return true;
+  }
+  return false;
 }
 
 export function issueSessionCookie(req: IncomingMessage, token: string): string {
@@ -305,7 +324,7 @@ export function clearSessionCookie(req: IncomingMessage): string {
 
 // ---------------------------------------------------------------- 同源写保护
 
-const WRITE_METHODS = new Set(['POST', 'PATCH', 'DELETE']);
+const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
 /**
  * 可辨认的跨站写请求判定：Sec-Fetch-Site: cross-site，或 Origin host 与请求 Host

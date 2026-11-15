@@ -1,5 +1,6 @@
 // 网关配置解析：env 变量 → GatewayConfig，全部显式默认值与范围校验。
 // 错误一律在启动期抛出（配置错了宁可起不来，也不要带病运行）。
+import path from 'node:path';
 
 export interface GatewayConfig {
   /** 主 HTTP 端口，env `ZR_GATEWAY_PORT`，默认 19393 */
@@ -10,6 +11,12 @@ export interface GatewayConfig {
   publicUrl: string | undefined;
   /** 数据目录，env `ZR_GATEWAY_DATA_DIR`，默认 `./data` */
   dataDir: string;
+  /**
+   * TLS 证书目录，env `ZR_GATEWAY_CERT_DIR`，默认源码运行解析为 `<cwd>/certs`、
+   * Docker 镜像设为 `/certs`；测试直接手工构造 GatewayConfig 缺省时由 startGateway
+   * 隔离回落到 `<dataDir>/certs`。
+   */
+  certDir?: string;
   /** PostgreSQL 连接串，env `ZR_GATEWAY_DATABASE_URL`，可选（缺省用内置 SQLite） */
   databaseUrl: string | undefined;
   /** 初始管理员邮箱，env `ZR_GATEWAY_ADMIN_USER`，默认 `admin@local` */
@@ -43,7 +50,7 @@ function optionalNonEmpty(env: Env, name: string): string | undefined {
   return raw !== undefined && raw !== '' ? raw : undefined;
 }
 
-export function resolveGatewayConfig(env: Env = process.env): GatewayConfig {
+export function resolveGatewayConfig(env: Env = process.env, cwd: string = process.cwd()): GatewayConfig {
   const port = intInRange(env, 'ZR_GATEWAY_PORT', 19393, 1, 65535);
   const udpAltRaw = env['ZR_GATEWAY_UDP_ALT_PORT'];
   let udpAltPort: number;
@@ -56,6 +63,7 @@ export function resolveGatewayConfig(env: Env = process.env): GatewayConfig {
   }
 
   const publicUrlRaw = optionalNonEmpty(env, 'ZR_GATEWAY_PUBLIC_URL');
+  const certDirRaw = optionalNonEmpty(env, 'ZR_GATEWAY_CERT_DIR');
   const allowSignupRaw = env['ZR_GATEWAY_ALLOW_SIGNUP'];
 
   return {
@@ -63,6 +71,7 @@ export function resolveGatewayConfig(env: Env = process.env): GatewayConfig {
     udpAltPort,
     publicUrl: publicUrlRaw !== undefined ? publicUrlRaw.replace(/\/+$/, '') || undefined : undefined,
     dataDir: optionalNonEmpty(env, 'ZR_GATEWAY_DATA_DIR') ?? './data',
+    certDir: certDirRaw !== undefined ? path.resolve(cwd, certDirRaw) : path.resolve(cwd, 'certs'),
     databaseUrl: optionalNonEmpty(env, 'ZR_GATEWAY_DATABASE_URL'),
     adminUser: optionalNonEmpty(env, 'ZR_GATEWAY_ADMIN_USER') ?? 'admin@local',
     adminPassword: optionalNonEmpty(env, 'ZR_GATEWAY_ADMIN_PASSWORD'),

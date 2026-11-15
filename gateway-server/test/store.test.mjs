@@ -46,6 +46,7 @@ describe('resolveGatewayConfig', () => {
       udpAltPort: 19394,
       publicUrl: undefined,
       dataDir: './data',
+      certDir: path.resolve('certs'),
       databaseUrl: undefined,
       adminUser: 'admin@local',
       adminPassword: undefined,
@@ -62,6 +63,7 @@ describe('resolveGatewayConfig', () => {
       ZR_GATEWAY_UDP_ALT_PORT: '0', // 显式 0 表示关闭辅助口
       ZR_GATEWAY_PUBLIC_URL: 'https://gw.example.com/',
       ZR_GATEWAY_DATA_DIR: '/srv/gw-data',
+      ZR_GATEWAY_CERT_DIR: '/certs',
       ZR_GATEWAY_DATABASE_URL: 'postgres://db.local:5432/zr',
       ZR_GATEWAY_ADMIN_USER: 'root@local',
       ZR_GATEWAY_ADMIN_PASSWORD: 's3cret',
@@ -73,6 +75,7 @@ describe('resolveGatewayConfig', () => {
     assert.equal(cfg.port, 20000);
     assert.equal(cfg.udpAltPort, 0);
     assert.equal(cfg.publicUrl, 'https://gw.example.com'); // 去掉末尾 /
+    assert.equal(cfg.certDir, '/certs');
     assert.equal(cfg.databaseUrl, 'postgres://db.local:5432/zr');
     assert.equal(cfg.adminUser, 'root@local');
     assert.equal(cfg.adminPassword, 's3cret');
@@ -862,10 +865,10 @@ describe('SqliteStore GC-2 扩展', () => {
     }
   });
 
-  test('GC-2-fix1 扩展设置：getExtendedSettings 全 11 键；updateExtendedSettings 部分更新 + sessionTtlDays 钳位', async () => {
+  test('GC-2-fix1 扩展设置：getExtendedSettings 全 14 键（含 tls_*）；updateExtendedSettings 部分更新 + sessionTtlDays 钳位', async () => {
     const store = freshStore({ allowSignup: false, maxNetworksPerUser: 4, defaultMaxPeers: 8, relayRateKbps: 512 });
     try {
-      // 空库播种后的完整形状：sessionTtlDays 默认 7（与 auth.ts 的 7 天会话默认一致）
+      // 空库播种后的完整形状：sessionTtlDays 默认 7，tlsEnabled 默认三态 null
       const ext = await store.getExtendedSettings();
       assert.deepEqual(ext, {
         allowSignup: false,
@@ -879,8 +882,11 @@ describe('SqliteStore GC-2 扩展', () => {
         adminApiKeyHash: null,
         adminApiKeyPrefix: null,
         adminApiKeyCreatedAt: null,
+        tlsEnabled: null,
+        tlsCertFile: 'fullchain.pem',
+        tlsKeyFile: 'privkey.pem',
       });
-      // 扩展键部分更新（含可空字符串与时间戳字段的往返）；未在 patch 里的键不受影响
+      // 扩展键部分更新（含可空字符串、时间戳与 TLS 三态字段往返）；未在 patch 里的键不受影响
       const updated = await store.updateExtendedSettings({
         requireEmailVerification: true,
         publicUrl: 'https://gw.example.com',
@@ -889,6 +895,9 @@ describe('SqliteStore GC-2 扩展', () => {
         adminApiKeyHash: 'hash-abc',
         adminApiKeyPrefix: 'zr_abcd',
         adminApiKeyCreatedAt: '2026-11-13T00:00:00.000Z',
+        tlsEnabled: true,
+        tlsCertFile: 'cert.pem',
+        tlsKeyFile: 'key.pem',
       });
       assert.deepEqual(updated, {
         ...ext,
@@ -899,7 +908,13 @@ describe('SqliteStore GC-2 扩展', () => {
         adminApiKeyHash: 'hash-abc',
         adminApiKeyPrefix: 'zr_abcd',
         adminApiKeyCreatedAt: '2026-11-13T00:00:00.000Z',
+        tlsEnabled: true,
+        tlsCertFile: 'cert.pem',
+        tlsKeyFile: 'key.pem',
       });
+      // 三态开关显式关（false）与恢复未配置（null）区分不混淆
+      assert.equal((await store.updateExtendedSettings({ tlsEnabled: false })).tlsEnabled, false);
+      assert.equal((await store.updateExtendedSettings({ tlsEnabled: null })).tlsEnabled, null);
       // 置 null 落空串、读回 null；其余键保持
       const nulled = await store.updateExtendedSettings({ publicUrl: null, smtpConfigEnc: null });
       assert.equal(nulled.publicUrl, null);
@@ -1700,6 +1715,9 @@ describe('PgStore contract (mock query)', () => {
       adminApiKeyHash: 'hash-xyz',
       adminApiKeyPrefix: 'zr_ab12',
       adminApiKeyCreatedAt: '2026-11-13T00:00:00.000Z',
+      tlsEnabled: null,
+      tlsCertFile: 'fullchain.pem',
+      tlsKeyFile: 'privkey.pem',
     });
   });
 

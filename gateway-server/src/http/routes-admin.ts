@@ -37,6 +37,15 @@ import {
   sendOk,
   SYSTEM_API_ADMIN_ID,
 } from './auth.js';
+import { sanitizeRedirectHost } from '../tls/dual-protocol-server.js';
+import {
+  DEFAULT_TLS_CERT_FILE,
+  DEFAULT_TLS_KEY_FILE,
+  MAX_CERT_PEM_BYTES,
+  TlsConfigError,
+} from '../tls/tls-manager.js';
+import type { AdminTlsView } from '../tls/tls-manager.js';
+import { requestIsHttps } from './auth.js';
 import type { RouteContext, RouteDef, StoredSmtpConfig } from './auth.js';
 
 function parseIntInRange(value: unknown, min: number, max: number, label: string): number {
@@ -366,12 +375,9 @@ async function handleGetRuntime(ctx: RouteContext): Promise<void> {
   } else {
     const host = ctx.req.headers['host'];
     const hostHeader = Array.isArray(host) ? host[0] : host;
-    const forwardedProto = String(ctx.req.headers['x-forwarded-proto'] ?? '')
-      .split(',')[0]
-      ?.trim()
-      .toLowerCase();
+    const isHttps = requestIsHttps(ctx.req);
     publicUrlEffective = hostHeader !== undefined && hostHeader.length > 0
-      ? `${forwardedProto === 'https' ? 'https' : 'http'}://${hostHeader}`
+      ? `${isHttps ? 'https' : 'http'}://${hostHeader}`
       : '';
     publicUrlSource = 'request';
   }
@@ -412,6 +418,21 @@ async function handleGetRuntime(ctx: RouteContext): Promise<void> {
     securityWarnings.push('UDP_ALT_DISABLED');
   }
 
+  const tlsFlags = ctx.tls?.getRuntimeFlags() ?? {
+    tlsEnabled: false,
+    activeCertExpired: false,
+    activeCertExpiringSoon: false,
+    reloadFailed: false,
+  };
+  if (tlsFlags.tlsEnabled && tlsFlags.activeCertExpired) {
+    securityWarnings.push('TLS_CERT_EXPIRED');
+  } else if (tlsFlags.tlsEnabled && tlsFlags.activeCertExpiringSoon) {
+    securityWarnings.push('TLS_CERT_EXPIRING_SOON');
+  }
+  if (tlsFlags.reloadFailed) {
+    securityWarnings.push('TLS_RELOAD_FAILED');
+  }
+
   sendOk(ctx.res, {
     listenPort,
     udpPort,
@@ -421,6 +442,7 @@ async function handleGetRuntime(ctx: RouteContext): Promise<void> {
     publicUrlEffective,
     publicUrlSource,
     smtpConfigured: isSmtpConfigured(decodeSmtpConfig(ext.smtpConfigEnc, ctx.masterKey)),
+    tlsEnabled: tlsFlags.tlsEnabled,
     onlineDevices,
     totalLiveRelayKbps,
     cumulativeRelayBytes,
@@ -892,6 +914,169 @@ async function handleDeleteUser(ctx: RouteContext, params: Record<string, string
   sendOk(ctx.res, { deleted: true });
 }
 
+// ---------------------------------------------------------------- GT-3 原生单端口 TLS 与证书管理
+
+function mapTlsConfigError(err: unknown): never {
+  if (!(err instanceof TlsConfigError)) {
+    throw err;
+  }
+  switch (err.code) {
+    case 'TLS_CERT_DIR_READONLY':
+      throw new ApiError(409, 'TLS_CERT_DIR_READONLY', 'certificate directory is read-only');
+    case 'TLS_INVALID_FILENAME':
+      throw new ApiError(400, 'TLS_INVALID_FILENAME', 'invalid certificate or key filename');
+    case 'TLS_CERT_MISSING':
+      throw new ApiError(400, 'TLS_CERT_MISSING', 'certificate file not found in certificate directory');
+    case 'TLS_KEY_MISSING':
+      throw new ApiError(400, 'TLS_KEY_MISSING', 'private key file not found in certificate directory');
+    case 'TLS_KEY_ENCRYPTED':
+      throw new ApiError(400, 'TLS_KEY_ENCRYPTED', 'encrypted private keys with passphrases are not supported');
+    case 'TLS_CERT_KEY_MISMATCH':
+      throw new ApiError(400, 'TLS_CERT_KEY_MISMATCH', 'certificate public key does not match private key');
+    case 'TLS_CERT_INVALID':
+    default:
+      throw new ApiError(400, 'TLS_CERT_INVALID', 'invalid PEM certificate or private key');
+  }
+}
+
+function computeSuggestedHttpsUrl(
+  ctx: RouteContext,
+  extPublicUrl: string | null,
+  view: AdminTlsView,
+): string | null {
+  if (!view.enabled || !view.tlsActive || requestIsHttps(ctx.req)) return null;
+  const configuredPublicUrl = extPublicUrl ?? ctx.config.publicUrl ?? null;
+  if (configuredPublicUrl !== null && configuredPublicUrl.startsWith('https://')) {
+    return configuredPublicUrl.endsWith('/') ? configuredPublicUrl : `${configuredPublicUrl}/`;
+  }
+  const rawHost = ctx.req.headers['host'];
+  const hostHeader = Array.isArray(rawHost) ? rawHost[0] : rawHost;
+  const safeHost = sanitizeRedirectHost(hostHeader);
+  return safeHost !== null ? `https://${safeHost}/` : null;
+}
+
+function parseOptionalFilenameField(body: Record<string, unknown>, key: string): string | undefined {
+  const value = body[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new ApiError(400, 'INVALID_REQUEST', `${key} must be a non-empty filename`);
+  }
+  return value;
+}
+
+async function handleGetTls(ctx: RouteContext): Promise<void> {
+  await requireAdmin(ctx);
+  if (ctx.tls !== undefined) {
+    sendOk(ctx.res, await ctx.tls.getStatus());
+    return;
+  }
+  const ext = await ctx.store.getExtendedSettings();
+  const fallback: AdminTlsView = {
+    enabled: ext.tlsEnabled === true,
+    tlsActive: false,
+    certDirConfigured: false,
+    certDirWritable: false,
+    certFile: ext.tlsCertFile || DEFAULT_TLS_CERT_FILE,
+    keyFile: ext.tlsKeyFile || DEFAULT_TLS_KEY_FILE,
+    availableFiles: [],
+    activeCert: null,
+    lastReloadAt: null,
+    lastReloadError: null,
+  };
+  sendOk(ctx.res, fallback);
+}
+
+async function handlePutTlsCertificate(ctx: RouteContext): Promise<void> {
+  await requireAdmin(ctx);
+  const body = await readJsonObjectBody(ctx.req, 600 * 1024);
+  const certPem = body['certPem'];
+  const keyPem = body['keyPem'];
+  if (typeof certPem !== 'string' || certPem.trim().length === 0) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'certPem must be a non-empty string');
+  }
+  if (typeof keyPem !== 'string' || keyPem.trim().length === 0) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'keyPem must be a non-empty string');
+  }
+  if (
+    Buffer.byteLength(certPem, 'utf8') > MAX_CERT_PEM_BYTES ||
+    Buffer.byteLength(keyPem, 'utf8') > MAX_CERT_PEM_BYTES
+  ) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'PEM certificate and key must each be at most 256 KB');
+  }
+  const certFile = parseOptionalFilenameField(body, 'certFile');
+  const keyFile = parseOptionalFilenameField(body, 'keyFile');
+  const enableTlsRaw = body['enableTls'];
+  if (enableTlsRaw !== undefined && typeof enableTlsRaw !== 'boolean') {
+    throw new ApiError(400, 'INVALID_REQUEST', 'enableTls must be a boolean');
+  }
+  if (ctx.tls === undefined) {
+    throw new ApiError(409, 'TLS_CERT_DIR_READONLY', 'certificate directory is not configured');
+  }
+  let view: AdminTlsView;
+  try {
+    view = await ctx.tls.putCertificate({
+      certPem,
+      keyPem,
+      certFile,
+      keyFile,
+      enableTls: enableTlsRaw,
+    });
+  } catch (err) {
+    mapTlsConfigError(err);
+  }
+  const ext = await ctx.store.getExtendedSettings();
+  sendOk(ctx.res, {
+    ...view,
+    suggestedHttpsUrl: computeSuggestedHttpsUrl(ctx, ext.publicUrl, view),
+  });
+}
+
+async function handlePatchTls(ctx: RouteContext): Promise<void> {
+  await requireAdmin(ctx);
+  const body = await readJsonObjectBody(ctx.req);
+  const enabledRaw = body['enabled'];
+  if (enabledRaw !== undefined && typeof enabledRaw !== 'boolean') {
+    throw new ApiError(400, 'INVALID_REQUEST', 'enabled must be a boolean');
+  }
+  const certFile = parseOptionalFilenameField(body, 'certFile');
+  const keyFile = parseOptionalFilenameField(body, 'keyFile');
+  if (enabledRaw === undefined && certFile === undefined && keyFile === undefined) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'at least one of enabled, certFile, or keyFile is required');
+  }
+  if (ctx.tls === undefined) {
+    throw new ApiError(400, 'TLS_CERT_MISSING', 'certificate directory is not configured');
+  }
+  let view: AdminTlsView;
+  try {
+    view = await ctx.tls.updateSettings({
+      enabled: enabledRaw,
+      certFile,
+      keyFile,
+    });
+  } catch (err) {
+    mapTlsConfigError(err);
+  }
+  const ext = await ctx.store.getExtendedSettings();
+  sendOk(ctx.res, {
+    ...view,
+    suggestedHttpsUrl: computeSuggestedHttpsUrl(ctx, ext.publicUrl, view),
+  });
+}
+
+async function handleReloadTls(ctx: RouteContext): Promise<void> {
+  await requireAdmin(ctx);
+  if (ctx.tls === undefined) {
+    throw new ApiError(400, 'TLS_CERT_MISSING', 'certificate directory is not configured');
+  }
+  let view: AdminTlsView;
+  try {
+    view = await ctx.tls.reload();
+  } catch (err) {
+    mapTlsConfigError(err);
+  }
+  sendOk(ctx.res, view);
+}
+
 export function buildAdminRoutes(): RouteDef[] {
   return [
     { method: 'GET', path: '/api/v1/admin/settings', handler: handleGetSettings },
@@ -900,6 +1085,10 @@ export function buildAdminRoutes(): RouteDef[] {
     { method: 'POST', path: '/api/v1/admin/settings/api-key', handler: handleCreateApiKey },
     { method: 'DELETE', path: '/api/v1/admin/settings/api-key', handler: handleRevokeApiKey },
     { method: 'GET', path: '/api/v1/admin/runtime', handler: handleGetRuntime },
+    { method: 'GET', path: '/api/v1/admin/tls', handler: handleGetTls },
+    { method: 'PUT', path: '/api/v1/admin/tls/certificate', handler: handlePutTlsCertificate },
+    { method: 'PATCH', path: '/api/v1/admin/tls', handler: handlePatchTls },
+    { method: 'POST', path: '/api/v1/admin/tls/reload', handler: handleReloadTls },
     { method: 'GET', path: '/api/v1/admin/groups', handler: handleListGroups },
     { method: 'POST', path: '/api/v1/admin/groups', handler: handleCreateGroup },
     { method: 'PATCH', path: '/api/v1/admin/groups/:id', handler: handlePatchGroup },

@@ -19,9 +19,12 @@ import { buildAdminRoutes } from './http/routes-admin.js';
 import { buildTopologyRoutes } from './http/routes-topology.js';
 import { createStaticHost } from './http/static-host.js';
 import type { StaticHost } from './http/static-host.js';
+import type { GatewayTlsBridge } from './tls/dual-protocol-server.js';
 import { ApiError } from './http/auth.js';
 import { StoreError } from './store/types.js';
 import type { GatewayStore } from './store/types.js';
+
+export type { GatewayTlsBridge } from './tls/dual-protocol-server.js';
 
 export interface GatewayApiServerOptions {
   store: GatewayStore;
@@ -39,6 +42,8 @@ export interface GatewayApiServerOptions {
   topology?: TopologyProvider;
   /** PG-6b 控制台静态托管根目录（vite 产物 dist/public）；缺省不托管，纯 API 语义不变 */
   staticRoot?: string;
+  /** GT-2/GT-3 原生单端口 TLS 控制器（/admin/runtime 与 /admin/tls* 使用） */
+  tls?: GatewayTlsBridge;
 }
 
 /**
@@ -147,6 +152,7 @@ export function createApiRequestHandler(options: GatewayApiServerOptions): (req:
       runtime: options.runtime ?? NOOP_RUNTIME_STATS,
       hooks: options.hooks ?? {},
       topology: options.topology,
+      tls: options.tls,
     },
   };
   const staticHost: StaticHost | null = options.staticRoot !== undefined ? createStaticHost(options.staticRoot) : null;
