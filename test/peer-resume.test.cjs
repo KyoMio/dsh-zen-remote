@@ -12,7 +12,13 @@ const os = require('node:os')
 const path = require('node:path')
 const dgram = require('node:dgram')
 
-const { ensurePeerIdentity, writePeerNetwork } = require('../lib/state-store.js')
+const {
+  ensurePeerIdentity,
+  readPeerNetwork,
+  readPeerRevokedNotice,
+  writePeerNetwork,
+  writePeerRevokedNotice,
+} = require('../lib/state-store.js')
 const { createPeerEngine } = require('../lib/peer/engine.js')
 
 const NETWORK_ID = '0123456789abcdef'
@@ -169,6 +175,102 @@ test('joinNetwork: 自管 UDP socket 连续多次改链接重连或 leave 后再
       assert.equal(engine.status().networkId, '1111222233334444')
     } finally {
       engine.stop()
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('PAS-3：everAdmitted 与 peerRevokedNotice 白名单读写及 leaveNetwork 同步清盘与离线容错', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-pas3-state-'))
+  try {
+    const stateFile = path.join(home, 'zen-remote-state.json')
+    const id = ensurePeerIdentity(stateFile)
+
+    writePeerNetwork(stateFile, {
+      gatewayWsUrl: 'ws://127.0.0.1:9',
+      gatewayHttpOrigin: 'http://127.0.0.1:9',
+      networkId: NETWORK_ID,
+      everAdmitted: true,
+      joinedAt: 100,
+    })
+    assert.equal(readPeerNetwork(stateFile)?.everAdmitted, true)
+
+    const notice = {
+      deviceName: 'MacBook-Test',
+      gatewayHost: 'http://127.0.0.1:19393',
+      networkId: NETWORK_ID,
+      reason: 'removed from network',
+      revokedAt: 200,
+    }
+    writePeerRevokedNotice(stateFile, notice)
+    assert.deepEqual(readPeerRevokedNotice(stateFile), notice)
+    assert.equal(readPeerNetwork(stateFile)?.everAdmitted, true, '写撤销横幅不破坏其他白名单段')
+
+    // 破坏 peerRevokedNotice 字段形状 → 读时自动过滤为 undefined
+    const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    raw.peerRevokedNotice = { deviceName: '   ', gatewayHost: 123 }
+    fs.writeFileSync(stateFile, JSON.stringify(raw))
+    assert.equal(readPeerRevokedNotice(stateFile), undefined)
+
+    // leaveNetwork 在线/离线 fetch 容错：首 await 前已同步清盘
+    const postedUrls = []
+    const engineOnline = createPeerEngine({
+      stateFile,
+      identity: id,
+      relayPool: fakePool(),
+      relayHandler: () => undefined,
+      relaySecret: () => 'secret',
+      serverName: () => 'MacBook-Test',
+      udpProbe: null,
+      clock: fakeClock(),
+      fetchImpl: async (url, init) => {
+        postedUrls.push({ url, body: JSON.parse(String(init?.body ?? '{}')) })
+        return new Response(JSON.stringify({ ok: true, data: { removed: true } }), { status: 200 })
+      },
+    })
+    try {
+      const leavePromise = engineOnline.leaveNetwork()
+      assert.equal(readPeerNetwork(stateFile), undefined, '首 await 前同步清除本地 peerNetwork')
+      assert.equal(engineOnline.status().gatewayState, 'unconfigured')
+      const res = await leavePromise
+      assert.deepEqual(res, { ok: true, gatewaySynced: true })
+      assert.equal(postedUrls.length, 1)
+      assert.equal(postedUrls[0].url, 'http://127.0.0.1:9/peer/v1/leave')
+      assert.equal(postedUrls[0].body.nodeId, id.nodeId)
+      assert.equal(typeof postedUrls[0].body.signatureHex, 'string')
+    } finally {
+      engineOnline.stop()
+    }
+
+    // 网关不可达时 leaveNetwork 不抛错、本地照常清空并返回 gatewaySynced: false
+    writePeerNetwork(stateFile, {
+      gatewayWsUrl: 'ws://127.0.0.1:9',
+      gatewayHttpOrigin: 'http://127.0.0.1:9',
+      networkId: NETWORK_ID,
+      everAdmitted: true,
+      joinedAt: 300,
+    })
+    const engineOffline = createPeerEngine({
+      stateFile,
+      identity: id,
+      relayPool: fakePool(),
+      relayHandler: () => undefined,
+      relaySecret: () => 'secret',
+      serverName: () => 'MacBook-Test',
+      udpProbe: null,
+      clock: fakeClock(),
+      fetchImpl: async () => {
+        throw new Error('ECONNREFUSED')
+      },
+    })
+    try {
+      const res = await engineOffline.leaveNetwork()
+      assert.deepEqual(res, { ok: true, gatewaySynced: false })
+      assert.equal(readPeerNetwork(stateFile), undefined)
+      assert.equal(engineOffline.status().gatewayState, 'unconfigured')
+    } finally {
+      engineOffline.stop()
     }
   } finally {
     fs.rmSync(home, { recursive: true, force: true })

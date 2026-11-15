@@ -118,6 +118,8 @@ export declare const CLIENT_PEER_TOGGLE_MOUNT_ROUTE = "/_dsh/zen-remote/client/p
 export declare const CLIENT_PEER_TRUST_ROUTE = "/_dsh/zen-remote/client/peer/trust";
 /** POST `{}`: re-run the UDP hole-punch for every eligible device. */
 export declare const CLIENT_PEER_REPROBE_ROUTE = "/_dsh/zen-remote/client/peer/reprobe";
+/** POST `{}`: dismiss the persisted post-admission gateway revocation banner. */
+export declare const CLIENT_PEER_DISMISS_REVOKED_ROUTE = "/_dsh/zen-remote/client/peer/dismiss-revoked";
 /** Prefix of the plain-HTTP relay routes (T41b):
  * `GET ${CLIENT_HTTP_ROUTE_PREFIX}<route>?<query>` relays one intercepted
  * `/api/<route>` call (the fetch wrapper's rewrites land here) to the

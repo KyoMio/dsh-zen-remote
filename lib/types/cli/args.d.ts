@@ -44,6 +44,8 @@ export interface CliOptions {
     domain?: string;
     cfToken?: string;
     email?: string;
+    password?: string;
+    network?: string;
     httpsPort?: number;
     publicUrl?: string;
     tunnelId?: string;

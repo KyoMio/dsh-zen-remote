@@ -810,3 +810,187 @@ test('MS-3 events: removing server A cancels only A\'s pending events and leaves
   await iterator.return?.(undefined)
   handle.uninstall()
 })
+
+test('PAS-5: removing server A emits api-session/removed even for list-only sessions and purges A caches', async () => {
+  const { relayA, relayB } = bothRelays()
+  relayA.invokeValues['session/modelCatalog'] = { groups: [{ id: 'prov-a', name: 'ProvA' }], routableProviders: ['prov-a'] }
+  relayB.invokeValues['session/modelCatalog'] = { groups: [{ id: 'prov-b', name: 'ProvB' }], routableProviders: ['prov-b'] }
+  const pool = bothPool(relayA, relayB)
+  const gateway = new FakeTypertGateway({
+    rpc: {
+      'session/list': { ok: true, value: { items: [], hasMore: false } },
+      'session/modelCatalog': { ok: true, value: { groups: [{ id: 'local', name: 'Local' }], routableProviders: ['local'] } },
+    },
+  })
+  const localGate = createGate(undefined)
+  gateway.openWireStream = async function (endpoint, payload, uplink, peer, legSignal, control) {
+    gateway.streamCalls.push({ endpoint, payload, uplink, peer, signal: legSignal, control })
+    return localGate.iterable
+  }
+  const { handle } = installPool(gateway, pool)
+
+  // Seed closedSessions on both A and B via session/follow stream closure (`not-shared`).
+  const drainFollow = async (vid) => {
+    const it = (await gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: vid } } } }, undefined, undefined, undefined, { signal: undefined }))[Symbol.asyncIterator]()
+    const p = it.next().catch(() => {})
+    await settle()
+    return p
+  }
+  const followB = drainFollow(VB('s-closed-b'))
+  await settle()
+  relayB.streams[relayB.streams.length - 1].gate.throwNow(new RelayError('not-shared', 'closed', { reason: 'manual' }))
+  await followB
+  const followA = drainFollow(VA('s-closed-a'))
+  await settle()
+  relayA.streams[relayA.streams.length - 1].gate.throwNow(new RelayError('not-shared', 'closed', { reason: 'manual' }))
+  await followA
+
+  // Seed catalog caches and verify A & B are both present before removal.
+  const catBefore = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, gateway.operatorPeer())
+  assert.ok(catBefore.value.groups.some((g) => g.id === VA('prov-a')))
+
+  // Open $events AFTER ready settles with empty initial session/list on A.
+  const stream = gateway.wireTap('$events', { args: {} }, undefined, undefined, undefined, { signal: undefined })
+  const iterator = (await stream)[Symbol.asyncIterator]()
+  localGate.push({ type: 'ready' })
+  await readSome(iterator, 2) // local ready + llm/adapters-updated
+  await settle()
+
+  const legA = relayA.streams.find((leg) => leg.namespace === '$zr')
+  assert.ok(legA)
+  legA.gate.push(waterfall('w1.p1', 'ag1'))
+  await readSome(iterator, 1)
+
+  // Discover `s-list-only` ONLY through the RPC session/list path (never announced on $events).
+  relayA.invokeValues['session/list'] = {
+    items: [{ sessionId: 's-list-only', updatedAt: 1, running: false, cwd: '/proj/a' }],
+    hasMore: false,
+  }
+  await gateway.rpcBridge('session/list', { args: { _request: { filter: 'all' } } }, undefined, undefined)
+  assert.deepEqual(handle.resolveRemoteFileScope('/proj/a/shot.png'), { serverId: SID_A, sessionId: 's-list-only' })
+
+  // Remove A: pending waterfall cancel comes first, then api-session/removed for A's known sessions.
+  pool.remove(`entry-${SID_A}`)
+  handle.notePoolEvent()
+  const postRemove = await readSome(iterator, 3)
+  assert.deepEqual(postRemove[0], { type: 'cancel', eventId: VA('w1.p1') })
+  const removedEvents = postRemove.slice(1).map((f) => ({ event: f.event, id: f.args?.[0] })).sort((a, b) => a.id.localeCompare(b.id))
+  assert.deepEqual(removedEvents, [
+    { event: 'api-session/removed', id: VA('s-closed-a') },
+    { event: 'api-session/removed', id: VA('s-list-only') },
+  ])
+
+  assert.equal(handle.resolveRemoteFileScope('/proj/a/shot.png'), undefined, 'remoteSessionCwds purged for removed server')
+  assert.deepEqual(
+    handle.diagnostics().closedSessions.map((r) => r.sessionId),
+    [VB('s-closed-b')],
+    'closedSessions purged for A while B remains intact',
+  )
+  const catAfter = await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, gateway.operatorPeer())
+  assert.equal(catAfter.value.groups.some((g) => g.id === VA('prov-a')), false, 'serverCatalogCaches purged for A')
+  assert.equal(catAfter.value.groups.some((g) => g.id === VB('prov-b')), true, 'B catalog stays intact')
+
+  await iterator.return?.(undefined)
+  handle.uninstall()
+})
+
+test('PAS-5: removing server A before local ready defers api-session/removed until after ready', async () => {
+  const { relayA, relayB } = bothRelays()
+  const pool = bothPool(relayA, relayB)
+  const { gateway, localGate } = createMergeGateway()
+  const { handle } = installPool(gateway, pool)
+
+  // Seed a session in knownVirtualSessionsByServer via session/list before $events opens.
+  relayA.invokeValues['session/list'] = {
+    items: [{ sessionId: 's-early', updatedAt: 1, running: false, cwd: '/proj/early' }],
+    hasMore: false,
+  }
+  await gateway.rpcBridge('session/list', { args: { _request: {} } }, undefined, undefined)
+
+  const stream = gateway.wireTap('$events', { args: {} }, undefined, undefined, undefined, { signal: undefined })
+  const iterator = (await stream)[Symbol.asyncIterator]()
+  const firstFramePromise = iterator.next()
+  await settle()
+
+  // Remove A BEFORE localGate sends `ready`.
+  pool.remove(`entry-${SID_A}`)
+  handle.notePoolEvent()
+  await settle()
+
+  // First emitted frame MUST be the local `ready` frame, followed immediately by api-session/removed.
+  localGate.push({ type: 'ready' })
+  const firstResult = await firstFramePromise
+  const [second] = await readSome(iterator, 1)
+  assert.deepEqual(firstResult.value, { type: 'ready' }, 'local ready precedes deferred api-session/removed')
+  assert.deepEqual(second, { type: 'emit', event: 'api-session/removed', args: [VA('s-early')] })
+
+  await iterator.return?.(undefined)
+  handle.uninstall()
+})
+
+test('PAS-5: re-adding the same serverId preserves incremented workspaceEpochs and re-announces sessions', async () => {
+  const relayA1 = createMultiRelay(SID_A)
+  relayA1.invokeValues['session/list'] = { items: [{ sessionId: 's-rejoin', updatedAt: 10, running: false }], hasMore: false }
+  const pool = createFakePool([makeEntry(SID_A, 'A', relayA1)])
+  const gateway = new FakeTypertGateway({ rpc: { 'session/list': { ok: true, value: { items: [], hasMore: false } } } })
+  let nextLocalGate = createGate(undefined)
+  gateway.openWireStream = async function (endpoint, payload, uplink, peer, legSignal, control) {
+    gateway.streamCalls.push({ endpoint, payload, uplink, peer, signal: legSignal, control })
+    if (endpoint === 'workspace/follow') return nextLocalGate.iterable
+    return createGate(undefined).iterable
+  }
+  // Open one workspace/follow and one $events stream on separate controllable gates.
+  const wsLocalGate = nextLocalGate
+  const eventsLocalGate = createGate(undefined)
+  gateway.openWireStream = async function (endpoint, payload, uplink, peer, legSignal, control) {
+    gateway.streamCalls.push({ endpoint, payload, uplink, peer, signal: legSignal, control })
+    return endpoint === '$events' ? eventsLocalGate.iterable : wsLocalGate.iterable
+  }
+  const { handle } = installPool(gateway, pool)
+
+  const wsIter = (await gateway.wireTap('workspace/follow', { args: {} }, undefined, undefined, undefined, { signal: undefined }))[Symbol.asyncIterator]()
+  const evIter = (await gateway.wireTap('$events', { args: {} }, undefined, undefined, undefined, { signal: undefined }))[Symbol.asyncIterator]()
+
+  wsLocalGate.push({ type: 'baseline', value: { items: [], archivedSessionIds: [], pinnedSessionIds: [] } })
+  await readSome(wsIter, 1)
+  eventsLocalGate.push({ type: 'ready' })
+  await readSome(evIter, 3) // ready, llm/adapters-updated, api-session/added (or status)
+  // Drain any remaining status frame from initial sync so channel is quiet before remove.
+  await settle()
+  await evIter.next()
+
+  const legWs1 = relayA1.streams.find((leg) => leg.namespace === 'workspace')
+  legWs1.gate.push(workspaceBaseline('w-1', 'WS1', ['s-rejoin']))
+  const wsFrames1 = await readSome(wsIter, 4)
+  assert.equal(wsFrames1[0].workspace.workspaceId, VA('w-1'))
+
+  // Remove A: workspace removes (epoch increments from 0 -> 1) and session emits api-session/removed.
+  pool.remove(`entry-${SID_A}`)
+  handle.notePoolEvent()
+  const wsRemove = await readSome(wsIter, 4)
+  assert.deepEqual(wsRemove[0], { type: 'remove', workspaceId: VA('w-1') })
+  const [evRemoved] = await readSome(evIter, 1)
+  assert.deepEqual(evRemoved, { type: 'emit', event: 'api-session/removed', args: [VA('s-rejoin')] })
+
+  // Re-add A with fresh client: workspace epoch MUST be preserved (> 0), and session re-announces cleanly.
+  const relayA2 = createMultiRelay(SID_A)
+  relayA2.invokeValues['session/list'] = { items: [{ sessionId: 's-rejoin', updatedAt: 10, running: false }], hasMore: false }
+  pool.add(makeEntry(SID_A, 'A', relayA2))
+  handle.notePoolEvent()
+  await settle()
+
+  const legWs2 = relayA2.streams.find((leg) => leg.namespace === 'workspace')
+  assert.ok(legWs2)
+  legWs2.gate.push(workspaceBaseline('w-1', 'WS1', ['s-rejoin']))
+  const wsFrames2 = await readSome(wsIter, 4)
+  assert.equal(wsFrames2[0].workspace.workspaceId, VA('#1~w-1'), 're-added server must use incremented workspaceEpochs id')
+
+  // On $events, s-rejoin was cleared from `announced` on removal, so it re-announces via api-session/added.
+  const evAfterReadd = await readSome(evIter, 3)
+  const reAdded = evAfterReadd.find((f) => f.type === 'emit' && f.event === 'api-session/added')
+  assert.deepEqual(reAdded?.args?.[0]?.sessionId, VA('s-rejoin'))
+
+  await wsIter.return?.(undefined)
+  await evIter.return?.(undefined)
+  handle.uninstall()
+})

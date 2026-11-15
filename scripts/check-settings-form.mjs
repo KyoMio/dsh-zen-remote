@@ -17,6 +17,7 @@
 // Run: node scripts/check-settings-form.mjs   (needs Node >= 23.6 type stripping)
 import assert from 'node:assert/strict'
 import {
+  CLIENT_PEER_DISMISS_REVOKED_ROUTE,
   CLIENT_RECONNECT_ROUTE,
   CLIENT_STATUS_ROUTE,
   awaitClientStatusReady,
@@ -1223,4 +1224,33 @@ test('PS-2: derivePeerStatusView carries identityError when gatewayState is iden
   assert.equal(view.nodeId, '')
   assert.equal(view.gatewayState, 'identity-error')
   assert.equal(view.identityError, 'state-file-unreadable')
+})
+
+test('PAS-6a: CLIENT_PEER_DISMISS_REVOKED_ROUTE & derivePeerStatusView revokedNotice parsing', () => {
+  assert.equal(CLIENT_PEER_DISMISS_REVOKED_ROUTE, '/_dsh/zen-remote/client/peer/dismiss-revoked')
+  const valid = derivePeerStatusView({
+    configured: false,
+    nodeId: 'aaaa1111',
+    gatewayState: 'unconfigured',
+    revokedNotice: {
+      deviceName: 'MacBook',
+      gatewayHost: 'gw.example.com:19393',
+      networkId: '0123456789abcdef',
+      reason: 'removed by administrator',
+      revokedAt: 1700000000000,
+    },
+    peers: [],
+  })
+  assert.equal(valid.configured, false)
+  assert.deepEqual(valid.revokedNotice, {
+    deviceName: 'MacBook',
+    gatewayHost: 'gw.example.com:19393',
+    networkId: '0123456789abcdef',
+    reason: 'removed by administrator',
+    revokedAt: 1700000000000,
+  })
+  for (const junkNotice of [null, 'bad', [], { deviceName: '', revokedAt: 1 }, { deviceName: 'X', revokedAt: Number.NaN }, { deviceName: 'X', revokedAt: -1 }]) {
+    const view = derivePeerStatusView({ configured: false, revokedNotice: junkNotice, peers: [] })
+    assert.equal(view.revokedNotice, undefined)
+  }
 })

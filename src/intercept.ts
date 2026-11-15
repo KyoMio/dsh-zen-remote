@@ -3642,6 +3642,8 @@ interface MergedEventsStreamMultiDeps {
   summarySync: SessionSummarySync
   getRemoteDefault: (serverId: string) => unknown
   watchPool(fn: () => void): () => void
+  onServerSessionsRemoved?: (fn: (serverId: string, virtualIds: readonly string[]) => void) => () => void
+  rememberSession?: (virtualId: string) => void
 }
 
 /**
@@ -3701,6 +3703,12 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
   const latestLiveStatus = new Map<string, boolean>()
   let statusSeq = 0
   const liveStatusSeq = new Map<string, number>()
+  const pendingRemovedIds = new Set<string>()
+  const noteSessionSeen = (virtualId: unknown): void => {
+    if (typeof virtualId !== 'string' || fromVirtual(virtualId) === undefined) return
+    pendingRemovedIds.delete(virtualId)
+    deps.rememberSession?.(virtualId)
+  }
 
   const scheduleRetry = (): void => {
     if (retryTimer !== undefined || retryAt.size === 0) return
@@ -3772,6 +3780,7 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
           recordFailure('session/list', result.error instanceof RelayError ? result.error.code : 'internal')
           continue
         }
+        if (result.round.slot.removed || slots.get(result.round.slot.serverId) !== result.round.slot) continue
         const frames = sessionSummaryAddedFrames(
           result.value,
           result.round.slot.serverId,
@@ -3782,6 +3791,7 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
           const row = (frame as { args: unknown[] }).args[0]
           const rowId = isPlainObject(row) && typeof row.sessionId === 'string' ? row.sessionId : undefined
           if (rowId === undefined) continue
+          noteSessionSeen(rowId)
           returned.add(rowId)
           if (announced.has(rowId)) continue
           announced.add(rowId)
@@ -3832,15 +3842,17 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
     void slot.client.invoke('session', 'list', { _request: {} }, undefined).then(
       (value) => {
         slot.statusInFlight = false
-        if (!alive) return
+        if (!alive || slot.removed || slots.get(slot.serverId) !== slot) return
         const rows = isPlainObject(value) && Array.isArray(value.items) ? value.items : []
         for (const row of rows) {
           if (!isPlainObject(row) || typeof row.sessionId !== 'string' || row.sessionId === '') continue
           if ((liveStatusSeq.get(row.sessionId) ?? 0) > startSeq) continue
+          const virtualId = toVirtual(slot.serverId, row.sessionId)
+          noteSessionSeen(virtualId)
           channel.push({
             type: 'emit',
             event: 'api-session/status',
-            args: [toVirtual(slot.serverId, row.sessionId), row.running === true],
+            args: [virtualId, row.running === true],
           })
         }
         if (slot.statusPending) {
@@ -3894,6 +3906,23 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
             }
             const rewritten = rewriteRemoteEventFrame(frame, slot.serverId)
             if (rewritten === null) continue
+            if (
+              isPlainObject(rewritten) &&
+              rewritten.type === 'emit' &&
+              typeof rewritten.event === 'string' &&
+              rewritten.event.startsWith('api-session/') &&
+              Array.isArray(rewritten.args)
+            ) {
+              if (
+                rewritten.event === 'api-session/added' &&
+                isPlainObject(rewritten.args[0]) &&
+                typeof rewritten.args[0].sessionId === 'string'
+              ) {
+                noteSessionSeen(rewritten.args[0].sessionId)
+              } else if (rewritten.event !== 'api-session/removed' && typeof rewritten.args[0] === 'string') {
+                noteSessionSeen(rewritten.args[0])
+              }
+            }
             // T75 race guard + PB-26a live status, exactly as the single
             // server stream keeps them — keyed by ids that are already
             // globally unique (virtual or original-then-virtualized).
@@ -3944,6 +3973,54 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
       }
     } catch (error) {
       if (alive) log?.('client events remote leg of %s stopped: %s', slot.serverId, messageOf(error))
+    }
+  }
+
+  const retireSlot = (serverId: string, slot: PoolEventSlot): void => {
+    slots.delete(serverId)
+    slot.removed = true
+    slot.offState()
+    slot.controller?.abort()
+    // Only THIS server's pending prompts get the synthesized cancels.
+    for (const eventId of slot.shownEvents) channel.push({ type: 'cancel', eventId })
+    slot.shownEvents.clear()
+  }
+  const retireServerSessions = (serverId: string, extraVirtualIds: readonly string[]): void => {
+    const belongsHere = (id: string): boolean => fromVirtual(id)?.serverId === serverId
+    const toRemove = new Set<string>()
+    for (const id of extraVirtualIds) {
+      if (belongsHere(id)) toRemove.add(id)
+    }
+    for (const id of [...announced]) {
+      if (belongsHere(id)) {
+        toRemove.add(id)
+        announced.delete(id)
+      }
+    }
+    for (const id of [...askAttempts.keys()]) {
+      if (belongsHere(id)) askAttempts.delete(id)
+    }
+    for (const id of [...askedForGood]) {
+      if (belongsHere(id)) askedForGood.delete(id)
+    }
+    for (const id of [...retryAt.keys()]) {
+      if (belongsHere(id)) retryAt.delete(id)
+    }
+    for (const id of [...latestLiveStatus.keys()]) {
+      if (belongsHere(id)) {
+        toRemove.add(id)
+        latestLiveStatus.delete(id)
+      }
+    }
+    midFlightBatches = midFlightBatches.filter((id) => !belongsHere(id))
+    askingNow = askingNow.filter((id) => !belongsHere(id))
+    if (toRemove.size === 0) return
+    if (!localOpened) {
+      for (const id of toRemove) pendingRemovedIds.add(id)
+      return
+    }
+    for (const id of toRemove) {
+      channel.push({ type: 'emit', event: 'api-session/removed', args: [id] })
     }
   }
 
@@ -4004,13 +4081,8 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
     }
     for (const [serverId, slot] of [...slots]) {
       if (!seen.has(serverId)) {
-        slots.delete(serverId)
-        slot.removed = true
-        slot.offState()
-        slot.controller?.abort()
-        // Only THIS server's pending prompts get the synthesized cancels.
-        for (const eventId of slot.shownEvents) channel.push({ type: 'cancel', eventId })
-        slot.shownEvents.clear()
+        retireSlot(serverId, slot)
+        retireServerSessions(serverId, [])
       }
     }
   }
@@ -4025,6 +4097,12 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
       flushWaiters()
     }
   })
+  const offServerRemoved = deps.onServerSessionsRemoved?.((serverId, ids) => {
+    const slot = slots.get(serverId)
+    if (slot !== undefined) retireSlot(serverId, slot)
+    retireServerSessions(serverId, ids)
+    flushWaiters()
+  }) ?? (() => {})
 
   const onExternalAbort = (): void => {
     alive = false
@@ -4045,6 +4123,12 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
         channel.push(result.value)
         if (!localOpened) {
           localOpened = true
+          if (pendingRemovedIds.size > 0) {
+            for (const id of pendingRemovedIds) {
+              channel.push({ type: 'emit', event: 'api-session/removed', args: [id] })
+            }
+            pendingRemovedIds.clear()
+          }
           if (deferredRefresh) {
             deferredRefresh = false
             channel.push(catalogRefreshFrame())
@@ -4085,6 +4169,7 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
     if (retryTimer !== undefined) clock.clearTimeout(retryTimer)
     offSyncRequest()
     offPool()
+    offServerRemoved()
     if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
     for (const slot of [...slots.values()]) {
       slot.removed = true
@@ -4212,6 +4297,29 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // never record anything.
   type RemoteSessionCwd = { serverId: string; sessionId: string; cwd: string }
   const remoteSessionCwds = new Map<string, RemoteSessionCwd>()
+  const knownVirtualSessionsByServer = new Map<string, Set<string>>()
+  const MAX_KNOWN_VIRTUAL_SESSIONS_PER_SERVER = 2000
+  const rememberVirtualSessionId = (virtualId: unknown): void => {
+    if (typeof virtualId !== 'string') return
+    const parts = fromVirtual(virtualId)
+    if (parts === undefined) return
+    const canonical = toVirtual(parts.serverId, parts.id)
+    let bucket = knownVirtualSessionsByServer.get(parts.serverId)
+    if (bucket === undefined) {
+      bucket = new Set<string>()
+      knownVirtualSessionsByServer.set(parts.serverId, bucket)
+    }
+    bucket.delete(canonical)
+    if (bucket.size >= MAX_KNOWN_VIRTUAL_SESSIONS_PER_SERVER) {
+      const oldest = bucket.keys().next()
+      if (oldest.done !== true) bucket.delete(oldest.value)
+    }
+    bucket.add(canonical)
+  }
+  const eventRemovalSinks = new Set<(serverId: string, virtualIds: readonly string[]) => void>()
+  const offRememberSummary = summarySync.onForwardedSessionIds((ids) => {
+    for (const id of ids) rememberVirtualSessionId(id)
+  })
   const activeRemoteFollows = new Map<symbol, { serverId: string; sessionId: string }>()
   let lastFollowedSession: { kind: 'remote'; serverId: string; sessionId: string } | { kind: 'local' } | undefined
   const MAX_REMOTE_SESSION_CWDS = 200
@@ -4239,6 +4347,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           ? item.id
           : undefined
       if (id === undefined) continue
+      rememberVirtualSessionId(toVirtual(serverId, id))
       recordRemoteSessionCwd(serverId, id, item.cwd)
     }
   }
@@ -4384,6 +4493,44 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // left-behind per-entry subscription would keep firing into this dead
   // generation's caches on every later state change.
   const catalogWatched = new Map<string, () => void>()
+  const entryServerIds = new Map<string, string>()
+  const purgeRemovedServer = (oldServerId: string): void => {
+    const drained = new Set<string>()
+    const known = knownVirtualSessionsByServer.get(oldServerId)
+    if (known !== undefined) {
+      for (const vid of known) drained.add(vid)
+      knownVirtualSessionsByServer.delete(oldServerId)
+    }
+    for (const [vid, rec] of [...remoteSessionCwds]) {
+      if (rec.serverId === oldServerId) {
+        drained.add(vid)
+        remoteSessionCwds.delete(vid)
+      }
+    }
+    let closedCleared = false
+    for (const vid of [...closedSessions.keys()]) {
+      if (fromVirtual(vid)?.serverId === oldServerId) {
+        drained.add(vid)
+        closedSessions.delete(vid)
+        closedCleared = true
+      }
+    }
+    if (closedCleared) {
+      for (const waiter of [...closedClearWaiters]) waiter()
+    }
+    for (const [token, rec] of [...activeRemoteFollows]) {
+      if (rec.serverId === oldServerId) {
+        drained.add(toVirtual(rec.serverId, rec.sessionId))
+        activeRemoteFollows.delete(token)
+      }
+    }
+    if (lastFollowedSession?.kind === 'remote' && lastFollowedSession.serverId === oldServerId) {
+      lastFollowedSession = undefined
+    }
+    catalogGenerations.set(oldServerId, (catalogGenerations.get(oldServerId) ?? 0) + 1)
+    serverCatalogCaches.delete(oldServerId)
+    for (const sink of [...eventRemovalSinks]) sink(oldServerId, [...drained])
+  }
   if (pool === undefined) {
     try {
       offCatalogWatch = singleRelay.subscribe((state) => {
@@ -4416,15 +4563,37 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // install-into-online above).
     offCatalogWatch = watchPool(() => {
       const seen = new Set<string>()
-      for (const entry of pool.entries()) {
+      const entries = pool.entries()
+      for (const entry of entries) {
         seen.add(entry.entryId)
+        if (entry.serverId !== undefined) {
+          const prevServerId = entryServerIds.get(entry.entryId)
+          if (
+            prevServerId !== undefined &&
+            prevServerId !== entry.serverId &&
+            !entries.some((candidate) => candidate.serverId === prevServerId)
+          ) {
+            purgeRemovedServer(prevServerId)
+          }
+          entryServerIds.set(entry.entryId, entry.serverId)
+        }
         if (catalogWatched.has(entry.entryId)) continue
         const unsubscribe = entry.client.subscribe((state) => {
           // The entry's serverId is read LIVE — a re-handshake may have
           // renamed it since this listener attached.
-          const live = pool.entries().find((candidate) => candidate.entryId === entry.entryId)
+          const liveEntries = pool.entries()
+          const live = liveEntries.find((candidate) => candidate.entryId === entry.entryId)
           const serverId = live?.serverId
           if (serverId === undefined) return
+          const prevServerId = entryServerIds.get(entry.entryId)
+          if (
+            prevServerId !== undefined &&
+            prevServerId !== serverId &&
+            !liveEntries.some((candidate) => candidate.serverId === prevServerId)
+          ) {
+            purgeRemovedServer(prevServerId)
+          }
+          entryServerIds.set(entry.entryId, serverId)
           if (state === 'unpaired' || state === 'revoked') {
             catalogGenerations.set(serverId, (catalogGenerations.get(serverId) ?? 0) + 1)
             serverCatalogCaches.delete(serverId)
@@ -4445,6 +4614,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         if (!seen.has(entryId)) {
           unsubscribe()
           catalogWatched.delete(entryId)
+          const oldServerId = entryServerIds.get(entryId)
+          entryServerIds.delete(entryId)
+          if (oldServerId !== undefined && !entries.some((candidate) => candidate.serverId === oldServerId)) {
+            purgeRemovedServer(oldServerId)
+          }
         }
       }
     })
@@ -4738,7 +4912,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         )
         return { ok: true, value: { ...restored, workspace: ws } }
       }
-      return { ok: true, value: rewriteResult(endpoint, restored, serverId, remoteDefaultOf(serverId)) }
+      const rewrittenValue = rewriteResult(endpoint, restored, serverId, remoteDefaultOf(serverId))
+      if ((endpoint === 'session/create' || endpoint === 'session/fork') && isPlainObject(rewrittenValue)) {
+        rememberVirtualSessionId(rewrittenValue.sessionId)
+      }
+      return { ok: true, value: rewrittenValue }
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
       recordFailure(endpoint, code)
@@ -5590,6 +5768,13 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             summarySync,
             getRemoteDefault: remoteDefaultOf,
             watchPool,
+            onServerSessionsRemoved: (fn) => {
+              eventRemovalSinks.add(fn)
+              return () => {
+                eventRemovalSinks.delete(fn)
+              }
+            },
+            rememberSession: rememberVirtualSessionId,
           })
         }
         return mergedEventsStream({
@@ -5821,6 +6006,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // finally, so the map holds exactly the LIVE follows.
     if (endpoint === 'session/follow') {
       const claimed = virtuals[0]
+      rememberVirtualSessionId(toVirtual(claimed.serverId, claimed.id))
       lastFollowedSession = { kind: 'remote', serverId: claimed.serverId, sessionId: claimed.id }
       const token = Symbol()
       activeRemoteFollows.set(token, { serverId: claimed.serverId, sessionId: claimed.id })
@@ -5850,7 +6036,11 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // half reads the wiring's live `interceptHandle` slot, which the
       // uninstall clears, so this is hygiene; a stale map must never
       // outlive the interception that fed it.
+      offRememberSummary()
       remoteSessionCwds.clear()
+      knownVirtualSessionsByServer.clear()
+      eventRemovalSinks.clear()
+      entryServerIds.clear()
       activeRemoteFollows.clear()
       lastFollowedSession = undefined
       for (const listener of [...uninstallListeners]) listener()

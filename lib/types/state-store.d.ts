@@ -103,8 +103,21 @@ export interface PeerNetworkRecord {
     /** The peer cap the gateway announced (`maxPeersFromGateway`); the local
      * `maxServers` config decides whether it wins outright or only lowers. */
     maxPeersFromGateway?: number;
+    /** Whether the gateway has ever admitted this device into the network
+     * (`welcome` with authorized/paused/mismatch). Drives `auth.reconnect` and
+     * distinguishes initial join refusals from post-admission revocations. */
+    everAdmitted?: boolean;
     /** When this machine joined (epoch ms). */
     joinedAt: number;
+}
+/** Non-credential banner persisted when the gateway revokes an already-
+ * admitted device (cleared when dismissed or on next join). */
+export interface PeerRevokedNotice {
+    deviceName: string;
+    gatewayHost: string;
+    networkId: string;
+    reason: string;
+    revokedAt: number;
 }
 /** One TOFU-anchored peer public key (PG-2): the first public key this
  * machine ever saw for `nodeId`, pinned on first sight. A later key for the
@@ -128,6 +141,7 @@ export interface ZenRemoteStateFile {
      * does not understand. */
     peerIdentity?: PeerIdentityRecord;
     peerNetwork?: PeerNetworkRecord;
+    peerRevokedNotice?: PeerRevokedNotice;
     pinnedPeers?: Record<string, PinnedPeerKey>;
 }
 /** The one legal shape of a persisted server id (relay-server.ts mints it). */
@@ -287,6 +301,10 @@ export declare function readPeerNetwork(filePath: string): PeerNetworkRecord | u
  * passthrough contract.
  */
 export declare function writePeerNetwork(filePath: string, net: PeerNetworkRecord | undefined): void;
+/** Read the non-credential revoked banner record (PAS-3), if present and valid. */
+export declare function readPeerRevokedNotice(filePath: string): PeerRevokedNotice | undefined;
+/** Persist or clear (`undefined`) the post-admission revocation notice. */
+export declare function writePeerRevokedNotice(filePath: string, notice: PeerRevokedNotice | undefined): void;
 /**
  * Toggle one node id on `peerNetwork.disabledNodes` — the per-machine
  * "never dial this node" list. Idempotent both ways; without a network

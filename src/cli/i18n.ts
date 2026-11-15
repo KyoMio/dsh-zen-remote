@@ -244,7 +244,13 @@ const ZH: Readonly<Record<string, string>> = {
 
   // ---- peer role（节点端） ----------------------------------------------------------------
   'peer.prompt.invite': '邀请链接或中继网关地址（zr-net://… 或 http(s)://主机:端口）：',
+  'peer.join.promptEmail': '网关登录邮箱：',
+  'peer.join.promptPassword': '网关登录密码：',
   'peer.error.inviteInvalid': '邀请链接或网关地址格式无效：请输入 zr-net://主机[:端口]/网络ID[?tls=0|1]#密钥（公网明文网关用 ?tls=0），或中继网关地址 http(s)://主机:端口。',
+  'peer.error.authFailed': '网关账号或密码错误，登录失败。',
+  'peer.error.credentialsRequired': '使用网关地址加入需要提供网关账号邮箱与密码（--email 与 --password）。',
+  'peer.error.noNetwork': '该网关账号名下暂无可用网络，请先在网关控制台创建网络。',
+  'peer.error.selectionExpired': '选网会话已过期，请重新执行加入命令。',
   'peer.error.nameWriteFailed': '本机显示名写入失败。',
   'peer.error.configWriteFailed': '配置写入失败。',
   'peer.join.selectNetwork': '该网关上有多个可加入的虚拟网络，请选择目标网络：',
@@ -314,6 +320,7 @@ const ZH: Readonly<Record<string, string>> = {
   'peer.trust.selectQuestion': '检测到身份异常的设备，选择要信任新身份的设备：',
   'peer.trust.noMismatch': '网内没有身份异常的设备，无需信任操作。',
   'peer.leave.left': '已离开虚拟网络。',
+  'peer.leave.offlineNote': '已退出本地网络（网关当前不可达，未能在线注销设备席位；可在网关控制台手动移除该设备）。',
   'peer.leave.confirm': '确定离开当前虚拟网络？（本机将断开与网内其他设备的会话互通）',
   'peer.leave.failed': '离开请求失败。',
 
@@ -621,7 +628,13 @@ const EN: Readonly<Record<string, string>> = {
 
   // ---- peer role (peer node) ----------------------------------------------------------------
   'peer.prompt.invite': 'Invite link or relay gateway URL (zr-net://… or http(s)://host:port): ',
+  'peer.join.promptEmail': 'Gateway account email: ',
+  'peer.join.promptPassword': 'Gateway account password: ',
   'peer.error.inviteInvalid': 'Invalid invite link or gateway URL: enter zr-net://host[:port]/networkId[?tls=0|1]#key (use ?tls=0 for a plain-HTTP public gateway), or a gateway address like http(s)://host:port.',
+  'peer.error.authFailed': 'Invalid gateway email or password.',
+  'peer.error.credentialsRequired': 'Joining via gateway address requires account email and password (--email and --password).',
+  'peer.error.noNetwork': 'No networks found under this gateway account; create one in the gateway console first.',
+  'peer.error.selectionExpired': 'Network selection expired; please run the join command again.',
   'peer.error.nameWriteFailed': 'Writing this machine\'s display name failed.',
   'peer.error.configWriteFailed': 'Writing the config failed.',
   'peer.join.selectNetwork': 'Multiple virtual networks accept join requests on this gateway — pick one:',
@@ -695,6 +708,7 @@ const EN: Readonly<Record<string, string>> = {
   'peer.trust.selectQuestion': 'Devices with an identity mismatch detected — pick the one to trust:',
   'peer.trust.noMismatch': 'No device shows an identity mismatch — nothing to trust.',
   'peer.leave.left': 'Left the virtual network.',
+  'peer.leave.offlineNote': 'Left network locally (gateway unreachable, so the device slot was not unregistered online; remove it manually in the gateway console if needed).',
   'peer.leave.confirm': 'Leave the current virtual network? (this machine will disconnect from the other members)',
   'peer.leave.failed': 'The leave request failed.',
 

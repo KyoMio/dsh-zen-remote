@@ -66,6 +66,8 @@ export interface CliOptions {
   domain?: string
   cfToken?: string
   email?: string
+  password?: string
+  network?: string
   httpsPort?: number
   publicUrl?: string
   tunnelId?: string
@@ -95,7 +97,7 @@ export interface ParsedCliArgs {
 }
 
 /** `--flag value` options, mapped onto CliOptions field names. */
-const VALUE_OPTIONS: Readonly<Record<string, 'lang' | 'socket' | 'wait' | 'role' | 'profile' | 'ingress' | 'mode' | 'domain' | 'cfToken' | 'email' | 'httpsPort' | 'publicUrl' | 'tunnelId' | 'proxy' | 'deviceRole' | 'hostUrl' | 'code' | 'name' | 'invite'>> = {
+const VALUE_OPTIONS: Readonly<Record<string, 'lang' | 'socket' | 'wait' | 'role' | 'profile' | 'ingress' | 'mode' | 'domain' | 'cfToken' | 'email' | 'password' | 'network' | 'httpsPort' | 'publicUrl' | 'tunnelId' | 'proxy' | 'deviceRole' | 'hostUrl' | 'code' | 'name' | 'invite'>> = {
   '--lang': 'lang',
   '--socket': 'socket',
   '--wait': 'wait',
@@ -106,6 +108,8 @@ const VALUE_OPTIONS: Readonly<Record<string, 'lang' | 'socket' | 'wait' | 'role'
   '--domain': 'domain',
   '--cf-token': 'cfToken',
   '--email': 'email',
+  '--password': 'password',
+  '--network': 'network',
   '--https-port': 'httpsPort',
   '--public-url': 'publicUrl',
   '--tunnel-id': 'tunnelId',
@@ -170,6 +174,8 @@ function assignValue(field: (typeof VALUE_OPTIONS)[string], raw: string, options
     case 'domain': options.domain = raw; return
     case 'cfToken': options.cfToken = raw; return
     case 'email': options.email = raw; return
+    case 'password': options.password = raw; return
+    case 'network': options.network = raw; return
     case 'publicUrl': options.publicUrl = raw; return
     case 'tunnelId': options.tunnelId = raw; return
     case 'proxy': options.proxy = raw; return

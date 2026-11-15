@@ -29,7 +29,14 @@ const { createHash } = require('node:crypto')
 const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
 const { createRelayPool } = require('../lib/relay-pool.js')
-const { ensurePeerIdentity, readPeerNetwork, readStateFile, upsertPairedServer } = require('../lib/state-store.js')
+const {
+  ensurePeerIdentity,
+  readPeerNetwork,
+  readPeerRevokedNotice,
+  readStateFile,
+  upsertPairedServer,
+  writePeerRevokedNotice,
+} = require('../lib/state-store.js')
 const { createPeerEngine } = require('../lib/peer/engine.js')
 const { toVirtual } = require('../lib/virtual-id.js')
 const { installIntercept, createLocalOnlyGateway } = require('../lib/intercept.js')
@@ -2823,5 +2830,89 @@ test('PC-V1 #5: 生产 startGateway 组装入口承载 STUN 真实绑定、pause
     // 生产入口的逐层有界关停（UDP → WS 末批确认 → HTTP → store）本身就是
     // 被验证对象之一：close() 必须在预算内正常 resolve。
     await inst.close()
+  }
+})
+
+test('PAS-3 端到端：插件退网同步注销网关并卸载对端；在线/离线移除清凭据、阻断旧口令复活并持久化撤销横幅', async () => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'both', maxPeers: 4 })
+  const nodes = []
+  try {
+    const A = await startNode(gw, { name: 'Alpha-PAS3' })
+    const B = await startNode(gw, { name: 'Bravo-PAS3' })
+    nodes.push(A, B)
+
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitFor(() => A.engine.status().gatewayState === 'authorized', 8000, 'A authorized')
+    await waitFor(() => B.engine.status().gatewayState === 'authorized', 8000, 'B authorized')
+    await waitPeerOnline(A, B.identity.nodeId)
+    assert.equal(readPeerNetwork(A.stateFile)?.everAdmitted, true)
+    assert.equal(readPeerNetwork(B.stateFile)?.everAdmitted, true)
+
+    // 1. B 主动调用 leaveNetwork() → 同步向网关发 /peer/v1/leave、删网关成员、A 卸载 B
+    const leaveRes = await B.engine.leaveNetwork()
+    assert.deepEqual(leaveRes, { ok: true, gatewaySynced: true })
+    assert.equal(readPeerNetwork(B.stateFile), undefined)
+    assert.equal(readPeerRevokedNotice(B.stateFile), undefined, '主动退网不误写被撤销横幅')
+    await waitFor(() => A.engine.status().peers.every((p) => p.nodeId !== B.identity.nodeId), 5000, 'A drops leaving B')
+    assert.equal(A.relayPool.getByServerId(B.identity.nodeId), undefined)
+    assert.equal((await getTopology(gw, net.id)).members.some((m) => m.nodeId === B.identity.nodeId), false)
+
+    // 2. 在线被移除（DELETE）：A 在线时被管理员 DELETE → 清空凭据、写撤销横幅（带设备名 Alpha-PAS3）、dismissRevokedNotice 清之
+    const delA = await api(gw.base, 'DELETE', `/api/v1/networks/${net.id}/members/${A.identity.nodeId}`, { cookie: gw.tenantCookie })
+    assert.equal(delA.status, 200, JSON.stringify(delA.json))
+    await waitFor(() => A.engine.status().gatewayState === 'revoked', 5000, 'A sees revoked')
+    assert.equal(readPeerNetwork(A.stateFile), undefined, '在线被移除后必须抹净本地 peerNetwork 与 joinKey')
+    assert.equal(A.engine.status().networkId, null)
+    const noticeA = A.engine.status().revokedNotice
+    assert.ok(noticeA !== null && noticeA !== undefined)
+    assert.equal(noticeA.deviceName, 'Alpha-PAS3')
+    assert.equal(A.engine.resumeFromState(), false, '清盘后重启不得自启恢复')
+    A.engine.dismissRevokedNotice()
+    assert.equal(A.engine.status().revokedNotice, null)
+    assert.equal(A.engine.status().gatewayState, 'unconfigured')
+
+    // 3. 离线被移除防复活：C 持带 joinKey 的 invite 入网成功（落盘 everAdmitted: true + joinKey）后停机，
+    //    网关离线期间 DELETE C；随后用同一 stateFile 拉起新引擎 C2.resumeFromState() —— 发送 reconnect: true，
+    //    网关回 denied('removed from network')，C2 同步清掉本地 joinKey 且写入撤销横幅、严禁复活。
+    const C = await startNode(gw, { name: 'Charlie-Offline' })
+    nodes.push(C)
+    await C.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitFor(() => C.engine.status().gatewayState === 'authorized', 8000, 'C authorized')
+    C.engine.stop()
+
+    const delC = await api(gw.base, 'DELETE', `/api/v1/networks/${net.id}/members/${C.identity.nodeId}`, { cookie: gw.tenantCookie })
+    assert.equal(delC.status, 200)
+
+    const c2Pool = createRelayPool({ maxServers: 8 })
+    const c2Engine = createPeerEngine({
+      stateFile: C.stateFile,
+      identity: C.identity,
+      relayPool: c2Pool,
+      relayHandler: () => undefined,
+      relaySecret: () => 'secret',
+      serverName: () => 'Charlie-Offline',
+      udpProbe: null,
+    })
+    nodes.push({ engine: c2Engine, stop: () => c2Engine.stop() })
+    assert.equal(c2Engine.resumeFromState(), true)
+    await waitFor(() => c2Engine.status().gatewayState === 'revoked', 8000, 'C2 blocked from resurrecting on reconnect')
+    assert.equal(c2Engine.status().deniedReason, 'removed from network')
+    assert.equal(readPeerNetwork(C.stateFile), undefined, '离线移除重启检测后必须彻底清空旧 joinKey')
+    assert.equal(c2Engine.status().revokedNotice?.deviceName, 'Charlie-Offline')
+    assert.equal((await getTopology(gw, net.id)).members.some((m) => m.nodeId === C.identity.nodeId), false)
+
+    // 4. 首次入网即遭拒（从未 admitted）：D 携带错误口令加入 'key' 模式网络 → revoked + 清脏盘 + 不写撤销横幅
+    const keyNet = await createNetwork(gw, { mode: 'key' })
+    const D = await startNode(gw, { name: 'Delta-BadKey' })
+    nodes.push(D)
+    await D.engine.joinNetwork(inviteUri(gw, keyNet.id, 'wrong-key-value'))
+    await waitFor(() => D.engine.status().gatewayState === 'revoked', 8000, 'D denied with wrong key')
+    assert.equal(readPeerNetwork(D.stateFile), undefined)
+    assert.equal(D.engine.status().revokedNotice, null, '初次入网失败不得展示「网关已撤销授权」横幅')
+  } finally {
+    for (const node of nodes) node.stop()
+    await gw.close()
   }
 })

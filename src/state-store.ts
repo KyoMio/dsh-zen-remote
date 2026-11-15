@@ -124,8 +124,22 @@ export interface PeerNetworkRecord {
   /** The peer cap the gateway announced (`maxPeersFromGateway`); the local
    * `maxServers` config decides whether it wins outright or only lowers. */
   maxPeersFromGateway?: number
+  /** Whether the gateway has ever admitted this device into the network
+   * (`welcome` with authorized/paused/mismatch). Drives `auth.reconnect` and
+   * distinguishes initial join refusals from post-admission revocations. */
+  everAdmitted?: boolean
   /** When this machine joined (epoch ms). */
   joinedAt: number
+}
+
+/** Non-credential banner persisted when the gateway revokes an already-
+ * admitted device (cleared when dismissed or on next join). */
+export interface PeerRevokedNotice {
+  deviceName: string
+  gatewayHost: string
+  networkId: string
+  reason: string
+  revokedAt: number
 }
 
 /** One TOFU-anchored peer public key (PG-2): the first public key this
@@ -151,6 +165,7 @@ export interface ZenRemoteStateFile {
    * does not understand. */
   peerIdentity?: PeerIdentityRecord
   peerNetwork?: PeerNetworkRecord
+  peerRevokedNotice?: PeerRevokedNotice
   pinnedPeers?: Record<string, PinnedPeerKey>
 }
 
@@ -210,7 +225,27 @@ function normalizePeerNetwork(value: unknown): PeerNetworkRecord | undefined {
   ) {
     record.maxPeersFromGateway = value.maxPeersFromGateway
   }
+  if (value.everAdmitted === true) {
+    record.everAdmitted = true
+  }
   return record
+}
+
+function normalizePeerRevokedNotice(value: unknown): PeerRevokedNotice | undefined {
+  if (!isPlainObject(value)) return undefined
+  const { deviceName, gatewayHost, networkId, reason, revokedAt } = value
+  if (typeof deviceName !== 'string' || deviceName.trim() === '') return undefined
+  if (typeof gatewayHost !== 'string') return undefined
+  if (typeof networkId !== 'string') return undefined
+  if (typeof reason !== 'string') return undefined
+  if (!isFiniteNumber(revokedAt)) return undefined
+  return {
+    deviceName: deviceName.trim(),
+    gatewayHost,
+    networkId,
+    reason,
+    revokedAt,
+  }
 }
 
 function normalizePinnedPeers(value: unknown): Record<string, PinnedPeerKey> | undefined {
@@ -260,6 +295,8 @@ function readStateFileStrict(filePath: string): ZenRemoteStateFile {
     if (isLegalPeerIdentity(parsed.peerIdentity)) state.peerIdentity = parsed.peerIdentity
     const peerNetwork = normalizePeerNetwork(parsed.peerNetwork)
     if (peerNetwork !== undefined) state.peerNetwork = peerNetwork
+    const peerRevokedNotice = normalizePeerRevokedNotice(parsed.peerRevokedNotice)
+    if (peerRevokedNotice !== undefined) state.peerRevokedNotice = peerRevokedNotice
     const pinnedPeers = normalizePinnedPeers(parsed.pinnedPeers)
     if (pinnedPeers !== undefined) state.pinnedPeers = pinnedPeers
     return state
@@ -348,6 +385,7 @@ export function writeStateFile(filePath: string, updater: (current: ZenRemoteSta
   // validator), so the three-in-one belt covers them exactly like the rest.
   if (merged.peerIdentity !== undefined) out.peerIdentity = merged.peerIdentity
   if (merged.peerNetwork !== undefined) out.peerNetwork = merged.peerNetwork
+  if (merged.peerRevokedNotice !== undefined) out.peerRevokedNotice = merged.peerRevokedNotice
   if (merged.pinnedPeers !== undefined) out.pinnedPeers = merged.pinnedPeers
   mkdirSync(dirname(filePath), { recursive: true })
   writeFileSync(`${filePath}.tmp`, JSON.stringify(out), { mode: 0o600 })
@@ -701,6 +739,16 @@ export function readPeerNetwork(filePath: string): PeerNetworkRecord | undefined
  */
 export function writePeerNetwork(filePath: string, net: PeerNetworkRecord | undefined): void {
   writeStateFile(filePath, (current) => ({ ...current, version: 1, peerNetwork: net }))
+}
+
+/** Read the non-credential revoked banner record (PAS-3), if present and valid. */
+export function readPeerRevokedNotice(filePath: string): PeerRevokedNotice | undefined {
+  return readStateFile(filePath).peerRevokedNotice
+}
+
+/** Persist or clear (`undefined`) the post-admission revocation notice. */
+export function writePeerRevokedNotice(filePath: string, notice: PeerRevokedNotice | undefined): void {
+  writeStateFile(filePath, (current) => ({ ...current, version: 1, peerRevokedNotice: notice }))
 }
 
 /**
