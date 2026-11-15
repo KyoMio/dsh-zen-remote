@@ -1664,7 +1664,10 @@ describe('GC-7b：GC-5/GC-6 新错误码与管理文案键完整性', () => {
   const adminCopyKeys = [
     'admin.tabUsers',
     'admin.tabGroups',
-    'admin.tabSettings',
+    'admin.tabGateway',
+    'admin.tabTls',
+    'admin.tabEmail',
+    'admin.tabApiKey',
     'admin.runtimeTcpPort',
     'admin.runtimeStorage',
     'admin.runtimeMasterKey',

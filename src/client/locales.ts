@@ -658,6 +658,8 @@ export const zh = {
   // 有效上限），网络总上限只作独立标注（含本机），发现数必须叫「已发现」，
   // 满额提示说明是本机挂载上限（已有挂载保留），容量未知就明说未知。
   'wizard.overview.peerMountCount': '本机已挂载 {count} / {max} 台远端设备',
+  'wizard.overview.peerNetworkCount': '网络内 {count} 台设备',
+  'wizard.overview.peerMountedCount': '本机已挂载 {count} 台',
   'wizard.overview.peerMountFull': '已达本机挂载上限（{max} 台）：已有挂载保留，新增挂载前请先取消部分设备的挂载',
   'wizard.overview.peerNetworkCapNote': '网络设备上限 {max} 台（含本机）',
   'wizard.overview.peerMountedDiscovered': '本机已挂载 {count} 台 · 已发现 {total} 台',
@@ -1340,6 +1342,8 @@ export const en: Record<MobileNavKey, string> = {
   // discovered count says "discovered", and the full note blames the local
   // cap with the existing mounts explicitly kept.
   'wizard.overview.peerMountCount': '{count} / {max} remote devices mounted on this machine',
+  'wizard.overview.peerNetworkCount': '{count} devices in network',
+  'wizard.overview.peerMountedCount': '{count} mounted on this machine',
   'wizard.overview.peerMountFull': 'The local mount cap ({max} devices) is reached — existing mounts stay; unmount a device before adding another',
   'wizard.overview.peerNetworkCapNote': 'Network device cap {max} (this machine included)',
   'wizard.overview.peerMountedDiscovered': '{count} mounted · {total} discovered',

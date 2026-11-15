@@ -51,7 +51,7 @@ export interface AdminGatewaySettingsProps {
 
 // ---------------------------------------------------------------- 区块 1：网关热配置
 
-function HotConfigForm(props: {
+export function HotConfigForm(props: {
   t: TranslateFn;
   client: ConsoleClient;
   settings: AdminSettingsData;
@@ -587,7 +587,7 @@ function SmtpTestForm(props: {
 
 // ---------------------------------------------------------------- 区块 3：管理接口密钥（Admin API Key）
 
-function ApiKeySection(props: {
+export function ApiKeySection(props: {
   t: TranslateFn;
   client: ConsoleClient;
   settings: AdminSettingsData;
@@ -745,7 +745,7 @@ function isSafeHttpsUrl(url: string | null | undefined): url is string {
 }
 
 /** 区块 2：原生单端口 TLS 与证书管理（状态卡片 / 目录选证与开关 / 上传粘贴 PEM） */
-function TlsCertSection(props: {
+export function TlsCertSection(props: {
   t: TranslateFn;
   client: ConsoleClient;
   tls: AdminTlsView | null;
@@ -1179,40 +1179,21 @@ function TlsCertSection(props: {
   );
 }
 
-export function AdminGatewaySettings(props: AdminGatewaySettingsProps) {
-  const { t, client, settings, groups, runtime, tls, ui, onUi, onSettingsChanged, onTlsChanged, onRefreshGroups, onRefreshRuntime } =
-    props;
+export function SmtpSettingsSection(props: {
+  t: TranslateFn;
+  client: ConsoleClient;
+  settings: AdminSettingsData;
+  onSettingsChanged: AdminGatewaySettingsProps['onSettingsChanged'];
+}) {
+  const { t, client, settings, onSettingsChanged } = props;
   return (
-    <div className="settings-stack">
-      <section className="settings-section">
-        <HotConfigForm
-          t={t}
-          client={client}
-          settings={settings}
-          groups={groups}
-          runtime={runtime}
-          onSettingsChanged={onSettingsChanged}
-          onRefreshGroups={onRefreshGroups}
-          onRefreshRuntime={onRefreshRuntime}
-        />
-      </section>
-
-      <section className="settings-section">
-        <TlsCertSection t={t} client={client} tls={tls} onTlsChanged={onTlsChanged} />
-      </section>
-
-      <section className="settings-section">
-        <p className="section-title" style={{ margin: '0 0 10px' }}>
-          {t('admin.smtpTitle')}
-        </p>
-        <SmtpForm t={t} client={client} settings={settings} onSettingsChanged={onSettingsChanged} />
-        <div className="menu-sep" style={{ margin: '16px 0 14px' }} aria-hidden="true" />
-        <SmtpTestForm t={t} client={client} settings={settings} />
-      </section>
-
-      <section className="settings-section">
-        <ApiKeySection t={t} client={client} settings={settings} ui={ui} onUi={onUi} onSettingsChanged={onSettingsChanged} />
-      </section>
+    <div>
+      <p className="section-title" style={{ margin: '0 0 10px' }}>
+        {t('admin.smtpTitle')}
+      </p>
+      <SmtpForm t={t} client={client} settings={settings} onSettingsChanged={onSettingsChanged} />
+      <div className="menu-sep" style={{ margin: '16px 0 14px' }} aria-hidden="true" />
+      <SmtpTestForm t={t} client={client} settings={settings} />
     </div>
   );
 }

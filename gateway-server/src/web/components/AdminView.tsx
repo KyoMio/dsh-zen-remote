@@ -29,7 +29,7 @@ import type {
   UiLocalState,
   UserGroup,
 } from '../store/console-store';
-import { AdminGatewaySettings } from './AdminGatewaySettings';
+import { ApiKeySection, HotConfigForm, SmtpSettingsSection, TlsCertSection } from './AdminGatewaySettings';
 import { AdminUsersGroups } from './AdminUsersGroups';
 import { AlertIcon } from './Icons';
 
@@ -318,9 +318,9 @@ function SecurityAdvisories(props: { t: TranslateFn; warnings: SecurityWarning[]
   );
 }
 
-// ---------------------------------------------------------------- 三标签页
+// ---------------------------------------------------------------- 多标签页
 
-const TAB_ORDER = ['users', 'groups', 'settings'] as const;
+const TAB_ORDER = ['users', 'groups', 'gateway', 'tls', 'email', 'apiKey'] as const;
 type AdminTab = (typeof TAB_ORDER)[number];
 
 // ---------------------------------------------------------------- 主视图
@@ -388,7 +388,10 @@ export function AdminView(props: AdminViewProps) {
   const tabs: Array<{ id: AdminTab; label: string }> = [
     { id: 'users', label: t('admin.tabUsers') },
     { id: 'groups', label: t('admin.tabGroups') },
-    { id: 'settings', label: t('admin.tabSettings') },
+    { id: 'gateway', label: t('admin.tabGateway') },
+    { id: 'tls', label: t('admin.tabTls') },
+    { id: 'email', label: t('admin.tabEmail') },
+    { id: 'apiKey', label: t('admin.tabApiKey') },
   ];
 
   return (
@@ -458,22 +461,64 @@ export function AdminView(props: AdminViewProps) {
         />
       </div>
 
-      <div className="admin-tabpanel" role="tabpanel" id="admin-panel-settings" aria-labelledby="admin-tab-settings" hidden={tab !== 'settings'}>
+      <div className="admin-tabpanel" role="tabpanel" id="admin-panel-gateway" aria-labelledby="admin-tab-gateway" hidden={tab !== 'gateway'}>
         {settings !== null ? (
-          <AdminGatewaySettings
-            t={t}
-            client={client}
-            settings={settings}
-            groups={groups}
-            runtime={runtime}
-            tls={tls}
-            ui={ui}
-            onUi={onUi}
-            onSettingsChanged={onSettingsChanged}
-            onTlsChanged={onTlsChanged}
-            onRefreshGroups={onRefreshGroups}
-            onRefreshRuntime={onRefreshRuntime}
-          />
+          <div className="settings-stack">
+            <section className="settings-section">
+              <HotConfigForm
+                t={t}
+                client={client}
+                settings={settings}
+                groups={groups}
+                runtime={runtime}
+                onSettingsChanged={onSettingsChanged}
+                onRefreshGroups={onRefreshGroups}
+                onRefreshRuntime={onRefreshRuntime}
+              />
+            </section>
+          </div>
+        ) : adminLoad.settings === 'error' ? (
+          <p className="empty-hint">{t('admin.sliceError')}</p>
+        ) : (
+          <p className="empty-hint">{t('app.loading')}</p>
+        )}
+      </div>
+
+      <div className="admin-tabpanel" role="tabpanel" id="admin-panel-tls" aria-labelledby="admin-tab-tls" hidden={tab !== 'tls'}>
+        {tls !== null ? (
+          <div className="settings-stack">
+            <section className="settings-section">
+              <TlsCertSection t={t} client={client} tls={tls} onTlsChanged={onTlsChanged} />
+            </section>
+          </div>
+        ) : adminLoad.tls === 'error' ? (
+          <p className="empty-hint">{t('admin.sliceError')}</p>
+        ) : (
+          <p className="empty-hint">{t('app.loading')}</p>
+        )}
+      </div>
+
+      <div className="admin-tabpanel" role="tabpanel" id="admin-panel-email" aria-labelledby="admin-tab-email" hidden={tab !== 'email'}>
+        {settings !== null ? (
+          <div className="settings-stack">
+            <section className="settings-section">
+              <SmtpSettingsSection t={t} client={client} settings={settings} onSettingsChanged={onSettingsChanged} />
+            </section>
+          </div>
+        ) : adminLoad.settings === 'error' ? (
+          <p className="empty-hint">{t('admin.sliceError')}</p>
+        ) : (
+          <p className="empty-hint">{t('app.loading')}</p>
+        )}
+      </div>
+
+      <div className="admin-tabpanel" role="tabpanel" id="admin-panel-apiKey" aria-labelledby="admin-tab-apiKey" hidden={tab !== 'apiKey'}>
+        {settings !== null ? (
+          <div className="settings-stack">
+            <section className="settings-section">
+              <ApiKeySection t={t} client={client} settings={settings} ui={ui} onUi={onUi} onSettingsChanged={onSettingsChanged} />
+            </section>
+          </div>
         ) : adminLoad.settings === 'error' ? (
           <p className="empty-hint">{t('admin.sliceError')}</p>
         ) : (

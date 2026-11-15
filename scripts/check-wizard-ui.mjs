@@ -693,7 +693,8 @@ const WIZARD_KEYS = [
   // PC-11b: the unified mount-capacity wording — 本机已挂载 N / M 台远端设备
   // as the main line, the RAW network cap annotated separately (含本机), the
   // discovered count named 已发现, and the full note blaming the LOCAL cap.
-  'wizard.overview.peerMountCount', 'wizard.overview.peerMountFull',
+  'wizard.overview.peerMountCount', 'wizard.overview.peerNetworkCount', 'wizard.overview.peerMountedCount',
+  'wizard.overview.peerMountFull',
   'wizard.overview.peerNetworkCapNote', 'wizard.overview.peerMountedDiscovered', 'wizard.overview.peerDiscoveredCount',
   'wizard.peer.devicesModalTitle', 'wizard.peer.devicesModalSubtitle', 'wizard.peer.devicesModalEmpty',
   'wizard.peer.devicePathLan', 'wizard.peer.devicePathP2p', 'wizard.peer.devicePathRelay',
