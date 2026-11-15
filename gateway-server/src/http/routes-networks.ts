@@ -11,7 +11,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { decryptSecret, encryptSecret } from '../master-key.js';
-import { ApiError, readJsonObjectBody, requireUser, runHook, sendOk } from './auth.js';
+import { ApiError, readJsonObjectBody, requestIsHttps, requireUser, runHook, sendOk } from './auth.js';
 import type { RouteContext, RouteDef } from './auth.js';
 import type {
   AdmissionMode,
@@ -89,8 +89,7 @@ function buildJoinEndpoint(ctx: RouteContext): {
   } else {
     authority = ctx.req.headers['host'] ?? '';
     const hostname = extractHostname(authority);
-    const forwardedProto = String(ctx.req.headers['x-forwarded-proto'] ?? '').split(',')[0]?.trim().toLowerCase();
-    isTls = forwardedProto === 'https';
+    isTls = requestIsHttps(ctx.req);
     isPrivate = hostname === '' || isLoopbackOrPrivateHostname(hostname);
     gatewayUrl = authority !== '' ? `${isTls ? 'https' : 'http'}://${authority}` : '';
   }

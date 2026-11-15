@@ -6,9 +6,17 @@
 // 与 store.test.mjs 相同：.mjs 直接 import 编译产物 ../dist/。
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { Readable } from 'node:stream';
 
-import { createGatewayApiServer } from '../dist/server.js';
+import { createApiRequestHandler, createGatewayApiServer } from '../dist/server.js';
+import { TlsManager } from '../dist/tls/tls-manager.js';
+import { ZR_NATIVE_TLS_SYMBOL } from '../dist/tls/dual-protocol-server.js';
 import { decodeSmtpConfig, encodeSmtpConfig, hashToken } from '../dist/http/auth.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { deriveMasterKeyFromSecret, hashPassword, decryptSecret } from '../dist/master-key.js';
@@ -1355,6 +1363,7 @@ describe('GC-6a GET /admin/runtime：运行态聚合与安全告警', () => {
       'securityWarnings',
       'smtpConfigured',
       'storageDriver',
+      'tlsEnabled',
       'totalLiveRelayKbps',
       'udpAltPort',
       'udpPort',
@@ -2441,3 +2450,306 @@ describe('GC-6b GET/PATCH /admin/settings：扩展设置、SMTP 保存与热更�
     assert.ok(handle.hooks.quotaChanged.length > before); // 切默认组即触发配额刷新
   });
 });
+
+// ---------------------------------------------------------------- GT-3：原生单端口 TLS 管理接口与请求感知
+
+function generateTlsTestCert({ cn = 'tls-api.test.local', san = 'DNS:tls-api.test.local,IP:127.0.0.1', days = 30, passphrase } = {}) {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-rest-tls-cert-'));
+  const confPath = path.join(work, 'ext.cnf');
+  const keyPath = path.join(work, 'key.pem');
+  const certPath = path.join(work, 'cert.pem');
+  fs.writeFileSync(
+    confPath,
+    `[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n[dn]\nCN=${cn}\n[v3]\nsubjectAltName=${san}\n`,
+  );
+  if (passphrase !== undefined) {
+    execFileSync('openssl', ['genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-aes-256-cbc', '-pass', `pass:${passphrase}`, '-out', keyPath], {
+      stdio: 'ignore',
+    });
+    execFileSync(
+      'openssl',
+      ['req', '-x509', '-new', '-key', keyPath, '-passin', `pass:${passphrase}`, '-days', String(days), '-sha256', '-config', confPath, '-out', certPath],
+      { stdio: 'ignore' },
+    );
+  } else {
+    execFileSync(
+      'openssl',
+      ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', String(days), '-sha256', '-config', confPath, '-keyout', keyPath, '-out', certPath],
+      { stdio: 'ignore' },
+    );
+  }
+  const certPem = fs.readFileSync(certPath, 'utf8');
+  const keyPem = fs.readFileSync(keyPath, 'utf8');
+  fs.rmSync(work, { recursive: true, force: true });
+  return { certPem, keyPem };
+}
+
+function invokeSyntheticNativeTlsRequest(handler, { method, urlPath, host = 'direct-tls.example:19393', cookie, bodyObj } = {}) {
+  return new Promise((resolve, reject) => {
+    const rawBody = bodyObj !== undefined ? Buffer.from(JSON.stringify(bodyObj), 'utf8') : Buffer.alloc(0);
+    const req = new Readable({
+      read() {
+        if (rawBody.length > 0) this.push(rawBody);
+        this.push(null);
+      },
+    });
+    const fakeSocket = { [ZR_NATIVE_TLS_SYMBOL]: true, remoteAddress: '127.0.0.1' };
+    Object.assign(req, {
+      method,
+      url: urlPath,
+      headers: {
+        host,
+        origin: `https://${host}`,
+        ...(cookie !== undefined ? { cookie } : {}),
+        ...(rawBody.length > 0 ? { 'content-type': 'application/json', 'content-length': String(rawBody.length) } : {}),
+      },
+      socket: fakeSocket,
+      connection: fakeSocket,
+    });
+    const chunks = [];
+    const headersOut = {};
+    const res = {
+      statusCode: 200,
+      headersSent: false,
+      setHeader(name, value) {
+        headersOut[name.toLowerCase()] = value;
+      },
+      getHeader(name) {
+        return headersOut[name.toLowerCase()];
+      },
+      writeHead(code, hdrs = {}) {
+        this.statusCode = code;
+        this.headersSent = true;
+        for (const [k, v] of Object.entries(hdrs)) {
+          headersOut[k.toLowerCase()] = v;
+        }
+      },
+      write(chunk) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8'));
+      },
+      end(chunk) {
+        if (chunk !== undefined) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8'));
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve({ status: this.statusCode, headers: headersOut, json: text ? JSON.parse(text) : null });
+      },
+      destroy(err) {
+        if (err) reject(err);
+      },
+    };
+    handler(req, res);
+  });
+}
+
+describe('GT-3: 原生 TLS 管理接口（/api/v1/admin/tls*）与 HTTPS 请求感知', () => {
+  test('权限隔离、CSRF PUT/Bearer、PEM 校验落盘、脱敏红线、运行态告警与原生 TLS 感知', async () => {
+    const certDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-rest-tls-dir-'));
+    let mockNow = Date.now();
+    const store = new SqliteStore({
+      seed: { allowSignup: true, maxNetworksPerUser: 3, defaultMaxPeers: 8, relayRateKbps: 1024 },
+    });
+    const masterKey = deriveMasterKeyFromSecret('rest-tls-secret');
+    await seedUsers(store);
+
+    const manager = new TlsManager({ certDir, now: () => mockNow });
+    await manager.bootstrap(store);
+
+    const tlsBridge = {
+      getRuntimeFlags: () => manager.getRuntimeFlags(),
+      getStatus: () => manager.getStatus(),
+      putCertificate: (input) => manager.applyCertificateUpload(store, input),
+      updateSettings: (input) => manager.applySettings(store, input),
+      reload: () => manager.reloadFromDisk(),
+    };
+
+    const serverOptions = {
+      store,
+      masterKey,
+      tls: tlsBridge,
+      config: { listenPort: 19393, udpPort: 19393, udpAltPort: 19394, storageDriver: 'sqlite', secretSource: 'env' },
+    };
+    const server = createGatewayApiServer(serverOptions);
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    const base = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const adminCookie = await login(base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const userCookie = await login(base, TENANT_EMAIL, TENANT_PASSWORD);
+      const keyRes = await api(base, 'POST', '/api/v1/admin/settings/api-key', { cookie: adminCookie });
+      assert.equal(keyRes.status, 200);
+      const bearerKey = keyRes.json.data.apiKey;
+
+      // 1. 未登录与普通用户全部 401 / 403
+      for (const [m, p] of [
+        ['GET', '/api/v1/admin/tls'],
+        ['PUT', '/api/v1/admin/tls/certificate'],
+        ['PATCH', '/api/v1/admin/tls'],
+        ['POST', '/api/v1/admin/tls/reload'],
+      ]) {
+        const unauth = await api(base, m, p);
+        assert.equal(unauth.status, 401);
+        const nonAdmin = await api(base, m, p, { cookie: userCookie });
+        assert.equal(nonAdmin.status, 403);
+      }
+
+      // 2. CSRF 保护：PUT / PATCH / POST 跨站 Origin 被拦截为 403；Bearer API Key 免疫跨站
+      const pair1 = generateTlsTestCert({ cn: 'gw.unit.test', san: 'DNS:gw.unit.test,IP:127.0.0.1', days: 30 });
+      const csrfPut = await api(base, 'PUT', '/api/v1/admin/tls/certificate', {
+        cookie: adminCookie,
+        origin: 'https://evil.example',
+        body: { certPem: pair1.certPem, keyPem: pair1.keyPem },
+      });
+      assert.equal(csrfPut.status, 403);
+      assert.equal(csrfPut.json.error.code, 'FORBIDDEN_ORIGIN');
+
+      // 3. 无证书时 PATCH enabled:true 被拒绝且状态保持 false
+      const missingEnable = await api(base, 'PATCH', '/api/v1/admin/tls', {
+        cookie: adminCookie,
+        body: { enabled: true },
+      });
+      assert.equal(missingEnable.status, 400);
+      assert.equal(missingEnable.json.error.code, 'TLS_CERT_MISSING');
+      assert.equal((await api(base, 'GET', '/api/v1/admin/tls', { cookie: adminCookie })).json.data.enabled, false);
+
+      // 4. 校验错误码：不匹配私钥 / 加密私钥 / 路径穿越文件名 / 空 PATCH 体
+      const otherPair = generateTlsTestCert({ cn: 'other.unit.test', days: 30 });
+      const mismatchRes = await api(base, 'PUT', '/api/v1/admin/tls/certificate', {
+        cookie: adminCookie,
+        body: { certPem: pair1.certPem, keyPem: otherPair.keyPem },
+      });
+      assert.equal(mismatchRes.status, 400);
+      assert.equal(mismatchRes.json.error.code, 'TLS_CERT_KEY_MISMATCH');
+
+      const encryptedPair = generateTlsTestCert({ cn: 'enc.unit.test', days: 30, passphrase: 'secret' });
+      const encryptedRes = await api(base, 'PUT', '/api/v1/admin/tls/certificate', {
+        cookie: adminCookie,
+        body: { certPem: encryptedPair.certPem, keyPem: encryptedPair.keyPem },
+      });
+      assert.equal(encryptedRes.status, 400);
+      assert.equal(encryptedRes.json.error.code, 'TLS_KEY_ENCRYPTED');
+
+      const badFilenameRes = await api(base, 'PUT', '/api/v1/admin/tls/certificate', {
+        cookie: adminCookie,
+        body: { certPem: pair1.certPem, keyPem: pair1.keyPem, certFile: '../escape.pem' },
+      });
+      assert.equal(badFilenameRes.status, 400);
+      assert.equal(badFilenameRes.json.error.code, 'TLS_INVALID_FILENAME');
+
+      const emptyPatch = await api(base, 'PATCH', '/api/v1/admin/tls', { cookie: adminCookie, body: {} });
+      assert.equal(emptyPatch.status, 400);
+      assert.equal(emptyPatch.json.error.code, 'INVALID_REQUEST');
+
+      // 5. 合法上传并开启 TLS，验证返回结构、suggestedHttpsUrl 与零泄漏
+      const okPut = await api(base, 'PUT', '/api/v1/admin/tls/certificate', {
+        cookie: adminCookie,
+        body: { certPem: pair1.certPem, keyPem: pair1.keyPem, enableTls: true },
+      });
+      assert.equal(okPut.status, 200, JSON.stringify(okPut.json));
+      assert.equal(okPut.json.data.enabled, true);
+      assert.equal(okPut.json.data.certFile, 'fullchain.pem');
+      assert.equal(okPut.json.data.keyFile, 'privkey.pem');
+      assert.match(okPut.json.data.suggestedHttpsUrl, /^https:\/\/127\.0\.0\.1:\d+\/$/);
+      assert.match(okPut.json.data.activeCert.subject, /gw\.unit\.test/);
+      assert.ok(okPut.json.data.activeCert.san.includes('gw.unit.test'));
+      assert.ok(okPut.json.data.availableFiles.some((f) => f.name === 'fullchain.pem' && f.kind === 'cert'));
+
+      const serializedPut = JSON.stringify(okPut.json);
+      assert.equal(serializedPut.includes('PRIVATE KEY'), false);
+      assert.equal(serializedPut.includes('BEGIN CERTIFICATE'), false);
+      assert.equal(serializedPut.includes(certDir), false);
+
+      // Bearer API Key 即使带跨站 Origin 也可调用 /admin/tls/reload 与 GET /admin/tls
+      const reloadRes = await api(base, 'POST', '/api/v1/admin/tls/reload', {
+        origin: 'https://external-billing.example',
+        headers: { authorization: `Bearer ${bearerKey}` },
+      });
+      assert.equal(reloadRes.status, 200);
+      assert.equal(reloadRes.json.data.enabled, true);
+      assert.equal(JSON.stringify(reloadRes.json).includes(certDir), false);
+
+      // 6. runtime 告警联动：即将到期 -> 已过期
+      const runtimeNormal = await api(base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
+      assert.equal(runtimeNormal.status, 200);
+      assert.equal(runtimeNormal.json.data.tlsEnabled, true);
+      assert.equal(runtimeNormal.json.data.securityWarnings.includes('TLS_CERT_EXPIRING_SOON'), false);
+      assert.equal(runtimeNormal.json.data.securityWarnings.includes('TLS_CERT_EXPIRED'), false);
+
+      mockNow = Date.now() + 20 * 24 * 60 * 60 * 1000;
+      const runtimeSoon = await api(base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
+      assert.ok(runtimeSoon.json.data.securityWarnings.includes('TLS_CERT_EXPIRING_SOON'));
+
+      mockNow = Date.now() + 45 * 24 * 60 * 60 * 1000;
+      const runtimeExpired = await api(base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
+      assert.ok(runtimeExpired.json.data.securityWarnings.includes('TLS_CERT_EXPIRED'));
+      assert.equal(runtimeExpired.json.data.securityWarnings.includes('TLS_CERT_EXPIRING_SOON'), false);
+      mockNow = Date.now();
+
+      // 7. 关闭 TLS 恢复明文状态，验证未配置 tls bridge 时上传返回 409 TLS_CERT_DIR_READONLY
+      const disableRes = await api(base, 'PATCH', '/api/v1/admin/tls', {
+        cookie: adminCookie,
+        body: { enabled: false },
+      });
+      assert.equal(disableRes.status, 200);
+      assert.equal(disableRes.json.data.enabled, false);
+      assert.equal(disableRes.json.data.suggestedHttpsUrl, null);
+
+      const noTlsHandler = createApiRequestHandler({
+        store,
+        masterKey,
+        config: serverOptions.config,
+      });
+      const roRes = await invokeSyntheticNativeTlsRequest(noTlsHandler, {
+        method: 'PUT',
+        urlPath: '/api/v1/admin/tls/certificate',
+        cookie: adminCookie,
+        bodyObj: { certPem: pair1.certPem, keyPem: pair1.keyPem },
+      });
+      assert.equal(roRes.status, 409);
+      assert.equal(roRes.json.error.code, 'TLS_CERT_DIR_READONLY');
+
+      // 8. 原生 TLS socket（[ZR_NATIVE_TLS_SYMBOL]: true，无 x-forwarded-proto）→ 登录 Cookie 带 Secure、joinUri 带 ?tls=1
+      const mainHandler = createApiRequestHandler(serverOptions);
+      const nativeLogin = await invokeSyntheticNativeTlsRequest(mainHandler, {
+        method: 'POST',
+        urlPath: '/api/v1/auth/login',
+        bodyObj: { email: TENANT_EMAIL, password: TENANT_PASSWORD },
+      });
+      assert.equal(nativeLogin.status, 200);
+      const setCookie = nativeLogin.headers['set-cookie'];
+      const cookieStr = Array.isArray(setCookie) ? setCookie.join(';') : String(setCookie ?? '');
+      assert.match(cookieStr, /;\s*Secure\b/);
+      const sessionCookiePair = cookieStr.split(';')[0];
+
+      const nativeNet = await invokeSyntheticNativeTlsRequest(mainHandler, {
+        method: 'POST',
+        urlPath: '/api/v1/networks',
+        host: 'native-gw.example:19393',
+        cookie: sessionCookiePair,
+        bodyObj: { name: 'native-tls-net' },
+      });
+      assert.equal(nativeNet.status, 200);
+      assert.equal(nativeNet.json.data.gatewayUrl, 'https://native-gw.example:19393');
+      assert.match(nativeNet.json.data.joinUri, /^zr-net:\/\/native-gw\.example:19393\/[0-9a-f]{16}#/);
+
+      const nativePrivateNet = await invokeSyntheticNativeTlsRequest(mainHandler, {
+        method: 'POST',
+        urlPath: '/api/v1/networks',
+        host: '192.168.10.20:19393',
+        cookie: sessionCookiePair,
+        bodyObj: { name: 'native-tls-lan' },
+      });
+      assert.equal(nativePrivateNet.status, 200);
+      assert.equal(nativePrivateNet.json.data.gatewayUrl, 'https://192.168.10.20:19393');
+      assert.match(nativePrivateNet.json.data.joinUri, /^zr-net:\/\/192\.168\.10\.20:19393\/.*\?tls=1#/);
+    } finally {
+      await new Promise((resolve) => {
+        server.closeAllConnections?.();
+        server.close(resolve);
+      });
+      manager.close();
+      store.close();
+      fs.rmSync(certDir, { recursive: true, force: true });
+    }
+  });
+});
+

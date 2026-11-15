@@ -68,6 +68,17 @@ export interface ExtendedSystemSettings extends SystemSettings {
   adminApiKeyHash: string | null;
   adminApiKeyPrefix: string | null;
   adminApiKeyCreatedAt: string | null;
+  /**
+   * 原生单端口 TLS 三态开关：
+   * - `null`：尚未配置（首次启动若 certDir 存在配对有效默认证书则自动开并持久化为 `true`，否则维持明文）
+   * - `true`：已启用（重启若证书缺失或损坏必须 Fail-Closed 拒绝启动；仅过期证书允许启动 HTTPS）
+   * - `false`：已显式关闭（即使存在证书也保持明文 HTTP，不自动开启）
+   */
+  tlsEnabled: boolean | null;
+  /** 证书目录内激活的证书链文件名（单段安全文件名，默认 `fullchain.pem`） */
+  tlsCertFile: string;
+  /** 证书目录内激活的私钥文件名（单段安全文件名，默认 `privkey.pem`） */
+  tlsKeyFile: string;
 }
 
 export type ExtendedSettingsPatch = Partial<ExtendedSystemSettings>;
@@ -82,6 +93,9 @@ export const DEFAULT_EXTENDED_SETTINGS: ExtendedSystemSettings = {
   adminApiKeyHash: null,
   adminApiKeyPrefix: null,
   adminApiKeyCreatedAt: null,
+  tlsEnabled: null,
+  tlsCertFile: 'fullchain.pem',
+  tlsKeyFile: 'privkey.pem',
 };
 
 /** 三项配额键：settings ↔ 默认组双向同步只同步这三个键 */
@@ -99,7 +113,7 @@ export const BASE_SETTINGS_KEYS: Readonly<Record<keyof SystemSettings, string>> 
   relayRateKbps: 'relay_rate_kbps',
 };
 
-/** 全部 11 键的 camelCase → snake_case 键映射，两个 store 共用 */
+/** 全部扩展设置的 camelCase → snake_case 键映射，两个 store 共用 */
 export const SETTINGS_KEYS: Readonly<Record<keyof ExtendedSystemSettings, string>> = {
   ...BASE_SETTINGS_KEYS,
   requireEmailVerification: 'require_email_verification',
@@ -109,6 +123,9 @@ export const SETTINGS_KEYS: Readonly<Record<keyof ExtendedSystemSettings, string
   adminApiKeyHash: 'admin_api_key_hash',
   adminApiKeyPrefix: 'admin_api_key_prefix',
   adminApiKeyCreatedAt: 'admin_api_key_created_at',
+  tlsEnabled: 'tls_enabled',
+  tlsCertFile: 'tls_cert_file',
+  tlsKeyFile: 'tls_key_file',
 };
 
 /** settings 值统一以字符串存 key-value 表（null 存空串，读取时空串解析回 null） */
@@ -152,6 +169,12 @@ export function parseExtendedSettingsRows(rows: ReadonlyArray<Record<string, unk
     const raw = map.get(SETTINGS_KEYS[key]);
     return raw === undefined || raw.length === 0 ? null : raw;
   };
+  const triBool = (key: keyof ExtendedSystemSettings): boolean | null => {
+    const raw = map.get(SETTINGS_KEYS[key]);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+    return null;
+  };
   return {
     ...parseSettingsRows(rows),
     requireEmailVerification: map.get(SETTINGS_KEYS.requireEmailVerification) === 'true',
@@ -161,6 +184,9 @@ export function parseExtendedSettingsRows(rows: ReadonlyArray<Record<string, unk
     adminApiKeyHash: text('adminApiKeyHash'),
     adminApiKeyPrefix: text('adminApiKeyPrefix'),
     adminApiKeyCreatedAt: text('adminApiKeyCreatedAt'),
+    tlsEnabled: triBool('tlsEnabled'),
+    tlsCertFile: text('tlsCertFile') ?? DEFAULT_EXTENDED_SETTINGS.tlsCertFile,
+    tlsKeyFile: text('tlsKeyFile') ?? DEFAULT_EXTENDED_SETTINGS.tlsKeyFile,
   };
 }
 

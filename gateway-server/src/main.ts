@@ -8,34 +8,39 @@
 // ZR_GATEWAY_ADMIN_PASSWORD 时生成 16 位随机密码，仅在创建成功的输出里
 // 打印一次（result.generatedPassword），已建库重启绝不重复创建或改密。
 import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { resolveGatewayConfig } from './config.js';
 import type { GatewayConfig } from './config.js';
 import { loadOrCreateMasterKey } from './master-key.js';
-import { createGatewayApiServer } from './server.js';
+import { createApiRequestHandler } from './server.js';
+import type { GatewayTlsBridge } from './server.js';
 import { PgStore } from './store/pg-store.js';
 import { SqliteStore } from './store/sqlite-store.js';
 import type { BootstrapAdminResult, GatewayStore, SystemSettings } from './store/types.js';
 import { PeerWsHub } from './peer-hub/ws-hub.js';
 import { UdpStunService } from './peer-hub/udp-stun.js';
+import { createDualProtocolServer } from './tls/dual-protocol-server.js';
+import { TlsManager } from './tls/tls-manager.js';
 
 export interface GatewayInstance {
   readonly config: GatewayConfig;
   readonly store: GatewayStore;
+  readonly tls: TlsManager;
   readonly hub: PeerWsHub;
   readonly udp: UdpStunService;
   readonly server: http.Server;
   /** 引导管理员的结果：created=false 表示复用已有账号（数据库已初始化过） */
   readonly admin: BootstrapAdminResult;
-  /** HTTP 实际监听端口（config.port=0 时为内核分配值） */
+  /** HTTP/TLS 实际监听端口（config.port=0 时为内核分配值） */
   readonly port: number;
   /** UDP 实际端口；altPort=null 表示辅助口已按配置关闭 */
   readonly udpPorts: { primaryPort: number; altPort: number | null };
-  /** 本机回环访问入口（打印与测试用） */
+  /** 本机回环访问入口（打印与测试用，随初始 TLS 状态为 http:// 或 https://） */
   readonly base: string;
-  /** 逐层关停（PC-19 第二片）：UDP → WS（末批遥测刷盘确认后才过）→ HTTP → 数据库；共享墙钟预算与同一真实结果 */
+  /** 逐层关停（PC-19 第二片）：UDP → WS（末批遥测刷盘确认后才过）→ HTTP/TLS → 数据库；共享墙钟预算与同一真实结果 */
   close(): Promise<void>;
 }
 
@@ -59,7 +64,7 @@ const DEFAULT_CLOSE_BUDGET_MS = 5_000;
  */
 const ABORT_STEP_BUDGET_MS = 1_000;
 
-function listen(server: http.Server, port: number): Promise<void> {
+function listen(server: net.Server, port: number): Promise<void> {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, '0.0.0.0', () => {
@@ -91,9 +96,13 @@ async function openStore(config: GatewayConfig): Promise<GatewayStore> {
 export async function startGateway(config: GatewayConfig, options: StartGatewayOptions = {}): Promise<GatewayInstance> {
   const masterKey = loadOrCreateMasterKey(config.dataDir);
   const store = await openStore(config);
+  const certDir = config.certDir ?? path.join(config.dataDir, 'certs');
+  const tlsManager = new TlsManager({ certDir });
   let closedStore = false;
   try {
     const admin = await store.ensureBootstrapAdmin({ email: config.adminUser, password: config.adminPassword });
+    // Fail-Closed：TLS 初始化早于绑定 UDP/TCP 监听口，若已开 TLS 但证书缺失/损坏直接拒起，且 catch 负责关 store
+    await tlsManager.bootstrap(store);
 
     // hub 先于 UDP 构造（PC-01a fix1）：udp-stun 先绑主口并装好 message 回调、
     // 再 await 辅助口绑定，主口绑成后即可投递 UDP 事件——若把 hub 放到
@@ -115,7 +124,14 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
     udpPorts = await udp.bind();
 
     const staticRoot = options.staticRoot ?? fileURLToPath(new URL('./public', import.meta.url));
-    const server = createGatewayApiServer({
+    const tlsBridge: GatewayTlsBridge = {
+      getRuntimeFlags: () => tlsManager.getRuntimeFlags(),
+      getStatus: () => tlsManager.getStatus(),
+      putCertificate: (input) => tlsManager.applyCertificateUpload(store, input),
+      updateSettings: (input) => tlsManager.applySettings(store, input),
+      reload: () => tlsManager.reloadFromDisk(),
+    };
+    const requestHandler = createApiRequestHandler({
       store,
       masterKey,
       publicUrl: config.publicUrl,
@@ -144,22 +160,35 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       },
       topology: hub,
       staticRoot,
+      tls: tlsBridge,
     });
+    const dualServer = createDualProtocolServer({
+      requestHandler,
+      initialMode: {
+        enabled: tlsManager.isEnabled(),
+        secureContext: tlsManager.getSecureContext(),
+      },
+    });
+    tlsManager.setHooks({
+      onContextChange: (next) => dualServer.setMode(next),
+    });
+    const server = dualServer.httpServer;
     hub.attach(server);
-    await listen(server, config.port);
+    await listen(dualServer.netServer, config.port);
+    tlsManager.startWatching();
 
     const address = server.address();
     const port = address !== null && typeof address === 'object' ? address.port : config.port;
-    const base = `http://127.0.0.1:${port}`;
+    const base = `${tlsManager.isEnabled() ? 'https' : 'http'}://127.0.0.1:${port}`;
     const closeBudgetMs = options.closeBudgetMs ?? DEFAULT_CLOSE_BUDGET_MS;
     let closePromise: Promise<void> | null = null;
 
-    // PC-19 第二片：逐层关停（PC-19 第二片顺序）——先停 UDP 摄入（STUN 观测不再
-    // 到达），再停 WS 并由 hub.close 经第一片的同一串行入口补末批（末批确认后
-    // hub.close 才 resolve），随后 HTTP 与 store；末批开跑前全部摄入源已关，
-    // 关 store 前无待确认批次。每层共享同一墙钟预算；重复/并发 close 共享同一
-    // 真实结果（共享 closePromise），绝不因 closing 标志提前成功。
+    // PC-19 第二片：逐层关停（PC-19 第二片顺序）——先停 UDP 摄入与证书 watch，
+    // 再停 WS 并由 hub.close 经第一片的同一串行入口补末批（末批确认后 hub.close 才 resolve），
+    // 随后双协议 HTTP/TLS server 与 store；末批开跑前全部摄入源已关，关 store 前无待确认批次。
+    // 每层共享同一墙钟预算；重复/并发 close 共享同一真实结果（共享 closePromise）。
     const closeGateway = async (): Promise<void> => {
+      tlsManager.close();
       const deadline = Date.now() + closeBudgetMs;
       const bounded = async (label: string, op: () => Promise<void>): Promise<void> => {
         const remaining = deadline - Date.now();
@@ -181,7 +210,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
           clearTimeout(timer);
         }
       };
-      // PC-19 shutdown fix1：关停开始（t0）即停止 HTTP 新连接接收——server.close()
+      // PC-19 shutdown fix1：关停开始（t0）即停止新连接接收——netServer.close()
       // 的「拒新」效果立即生效，存量连接的收尾等待放在后面的有界 HTTP 层；
       // 不等末批完成才停接收。
       let serverClosed: Promise<void> | null = null;
@@ -195,8 +224,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
         return serverClosed;
       };
       const closeServer = async (): Promise<void> => {
-        // SSE/keep-alive 存量收尾；WS 升级连接已由 hub.terminate 摘除
-        server.closeAllConnections?.();
+        await dualServer.close();
         await stopAcceptingHttp();
       };
       stopAcceptingHttp(); // t0 即拒新连接（拒绝效果立即生效，不等任何阶段）
@@ -248,6 +276,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
     return {
       config,
       store,
+      tls: tlsManager,
       hub,
       udp,
       server,
@@ -262,6 +291,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
     };
   } catch (err) {
     // 半组装状态退出前把手头的资源关掉，不留悬挂句柄
+    tlsManager.close();
     if (!closedStore) await store.close().catch(() => {});
     throw err;
   }
@@ -289,9 +319,11 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   console.log('Zen Remote gateway ready');
-  console.log(`  console  http://127.0.0.1:${gw.port}/`);
+  console.log(`  console  ${gw.base}/`);
+  console.log(`  tls      ${gw.tls.isEnabled() ? 'enabled (single-port https/wss)' : 'disabled (http/ws)'}`);
   console.log(`  udp      ${gw.udpPorts.primaryPort}/udp${gw.udpPorts.altPort !== null ? ` + ${gw.udpPorts.altPort}/udp` : ' (alt disabled)'}`);
   console.log(`  data     ${config.dataDir}`);
+  console.log(`  certs    ${gw.config.certDir ?? path.join(config.dataDir, 'certs')}`);
   if (gw.admin.created) {
     console.log(`  admin    ${gw.admin.email}`);
     if (gw.admin.generatedPassword !== undefined) {
