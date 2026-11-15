@@ -173,7 +173,7 @@ function wsSendJson(ws, obj) {
  * 走完挑战应答：读 challenge、（可选）算 join key 证明、签名 auth 上送。
  * 返回收到的 challenge 消息；后续 welcome 由调用方读。
  */
-async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [], timestamp = Date.now(), omitProof = false, badSignature = false, badIdentity = false, pauseHold = false } = {}) {
+async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [], timestamp = Date.now(), omitProof = false, badSignature = false, badIdentity = false, pauseHold = false, reconnect = false } = {}) {
   const challenge = await wsJson(ws);
   assert.equal(challenge.type, 'challenge');
   assert.match(challenge.challengeHex, /^[0-9a-f]{64}$/);
@@ -195,6 +195,7 @@ async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [],
     auth.joinKeyProofHex = joinProof(joinKey, networkId, presentedNodeId, challenge.challengeHex);
   }
   if (pauseHold) auth.pauseHold = true;
+  if (reconnect) auth.reconnect = true;
   wsSendJson(ws, auth);
   return challenge;
 }
@@ -3055,6 +3056,78 @@ describe('GC-3 用户组限速与月度中转配额', () => {
       // 停用前的在途帧最终 flush：pending 已清，扣减不得把账目减成负值
       await gw.hub.flushTelemetry();
       assert.equal(await gw.store.getMonthlyRelayUsage(tenant.id, currentUtcYearMonth(clock.now)), 1408);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('PAS-1b：POST /peer/v1/leave 踢下线并广播 peer-left、reconnect:true 阻断离线移除复活、manual 显式重加进 pending', async () => {
+    const gw = await startGateway();
+    try {
+      const net = await createNetwork(gw, { mode: 'both', maxPeers: 4 });
+      const { a, b, wsA, wsB } = await (async () => {
+        const nodeA = identity();
+        const nodeB = identity();
+        const wA = await wsOpen(gw.base);
+        await authNode(wA, nodeA, { networkId: net.id, joinKey: net.joinKey, name: 'alpha' });
+        assert.equal((await wsJson(wA)).status, 'authorized');
+        const wB = await wsOpen(gw.base);
+        await authNode(wB, nodeB, { networkId: net.id, joinKey: net.joinKey, name: 'bravo' });
+        assert.equal((await wsJson(wB)).status, 'authorized');
+        assert.equal((await wsJson(wB)).type, 'punch-coordinate');
+        assert.equal((await wsJson(wA)).type, 'peer-joined');
+        assert.equal((await wsJson(wA)).type, 'punch-coordinate');
+        return { a: nodeA, b: nodeB, wsA: wA, wsB: wB };
+      })();
+
+      // 1. A 调用签名 POST /peer/v1/leave → WS A 被断开、B 收到 peer-left、库删行
+      const tsLeave = Date.now();
+      const leaveSig = edSign(
+        a.privateKeyHex,
+        a.publicKeyHex,
+        Buffer.from(`zr-gw-leave-v1|${net.id}|${a.nodeId}|${tsLeave}`, 'utf8'),
+      );
+      const leaveRes = await api(gw.base, 'POST', '/peer/v1/leave', {
+        body: { networkId: net.id, nodeId: a.nodeId, publicKeyHex: a.publicKeyHex, timestamp: tsLeave, signatureHex: leaveSig },
+      });
+      assert.equal(leaveRes.status, 200);
+      assert.equal(leaveRes.json.data.removed, true);
+      await wsClosed(wsA);
+      const peerLeft = await wsJson(wsB);
+      assert.equal(peerLeft.type, 'peer-left');
+      assert.equal(peerLeft.nodeId, a.nodeId);
+
+      // 2. A 以 reconnect:true 带旧 joinKey 重连 → 被 denied('removed from network')，严禁复活
+      const wsAReconnect = await wsOpen(gw.base);
+      await authNode(wsAReconnect, a, { networkId: net.id, joinKey: net.joinKey, reconnect: true });
+      const denied = await wsJson(wsAReconnect);
+      assert.equal(denied.type, 'denied');
+      assert.equal(denied.reason, 'removed from network');
+      await wsClosed(wsAReconnect);
+
+      // 3. 把 B 在网关留在 authorized 状态并切换网络为 manual：B 显式重加（reconnect:false）必须退回 pending，而重连（reconnect:true）维持 authorized
+      await api(gw.base, 'PATCH', `/api/v1/networks/${net.id}`, {
+        cookie: gw.tenantCookie,
+        body: { admissionMode: 'manual' },
+      });
+      wsB.close();
+      await wsClosed(wsB);
+
+      const wsBReconnect = await wsOpen(gw.base);
+      await authNode(wsBReconnect, b, { networkId: net.id, reconnect: true });
+      const wbOk = await wsJson(wsBReconnect);
+      assert.equal(wbOk.type, 'welcome');
+      assert.equal(wbOk.status, 'authorized');
+      wsBReconnect.close();
+      await wsClosed(wsBReconnect);
+
+      const wsBExplicitRejoin = await wsOpen(gw.base);
+      await authNode(wsBExplicitRejoin, b, { networkId: net.id, joinKey: net.joinKey, reconnect: false });
+      const wbPending = await wsJson(wsBExplicitRejoin);
+      assert.equal(wbPending.type, 'welcome');
+      assert.equal(wbPending.status, 'pending');
+      wsBExplicitRejoin.close();
+      await wsClosed(wsBExplicitRejoin);
     } finally {
       await gw.close();
     }

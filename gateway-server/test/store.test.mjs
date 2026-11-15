@@ -17,9 +17,11 @@ import {
   verifyPassword,
   generatePassword,
 } from '../dist/master-key.js';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { PgStore } from '../dist/store/pg-store.js';
-import { StoreError } from '../dist/store/types.js';
+import { decideJoinAttempt, StoreError } from '../dist/store/types.js';
+import { gatewayLeaveMessage, verifyGatewayLeaveSignature } from '../dist/peer-hub/peer-crypto.js';
 
 const HEX16 = /^[0-9a-f]{16}$/;
 const HEX8 = /^[0-9a-f]{8}$/;
@@ -2205,5 +2207,255 @@ describe('PgStore contract (mock query)', () => {
       [/DELETE FROM email_otps WHERE expires_at/, [{ id: 'a' }, { id: 'b' }]],
     ]);
     assert.equal(await new PgStore(q).pruneExpiredOtps(0), 2);
+  });
+});
+
+// ---------------------------------------------------------------- PAS-1a: decideJoinAttempt & leave signature
+
+describe('PAS-1a：decideJoinAttempt 重连防复活、manual 强审批与 verifyGatewayLeaveSignature', () => {
+  test('decideJoinAttempt：isReconnect=true 时成员缺失或 revoked 一律返回 removed', () => {
+    assert.equal(
+      decideJoinAttempt({
+        admissionMode: 'both',
+        maxPeers: 4,
+        capacityUsed: 0,
+        joinKeyMatched: true,
+        existing: null,
+        incomingPublicKeyHex: 'aa'.repeat(32),
+        isReconnect: true,
+      }),
+      'removed',
+    );
+    assert.equal(
+      decideJoinAttempt({
+        admissionMode: 'manual',
+        maxPeers: 4,
+        capacityUsed: 0,
+        joinKeyMatched: false,
+        existing: { status: 'revoked', publicKeyHex: 'aa'.repeat(32) },
+        incomingPublicKeyHex: 'aa'.repeat(32),
+        isReconnect: true,
+      }),
+      'removed',
+    );
+    assert.equal(
+      decideJoinAttempt({
+        admissionMode: 'manual',
+        maxPeers: 4,
+        capacityUsed: 1,
+        joinKeyMatched: false,
+        existing: { status: 'authorized', publicKeyHex: 'aa'.repeat(32) },
+        incomingPublicKeyHex: 'aa'.repeat(32),
+        isReconnect: true,
+      }),
+      'keep',
+    );
+    assert.equal(
+      decideJoinAttempt({
+        admissionMode: 'both',
+        maxPeers: 4,
+        capacityUsed: 1,
+        joinKeyMatched: false,
+        existing: { status: 'paused', publicKeyHex: 'aa'.repeat(32) },
+        incomingPublicKeyHex: 'aa'.repeat(32),
+        isReconnect: true,
+      }),
+      'keep',
+    );
+  });
+
+  test('decideJoinAttempt：manual 模式下非重连（含带有效口令）已授权成员也回退 pending', () => {
+    assert.equal(
+      decideJoinAttempt({
+        admissionMode: 'manual',
+        maxPeers: 4,
+        capacityUsed: 1,
+        joinKeyMatched: true,
+        existing: { status: 'authorized', publicKeyHex: 'bb'.repeat(32) },
+        incomingPublicKeyHex: 'bb'.repeat(32),
+        isReconnect: false,
+      }),
+      'pending',
+    );
+    assert.equal(
+      decideJoinAttempt({
+        admissionMode: 'manual',
+        maxPeers: 4,
+        capacityUsed: 0,
+        joinKeyMatched: true,
+        existing: null,
+        incomingPublicKeyHex: 'cc'.repeat(32),
+        isReconnect: false,
+      }),
+      'pending',
+    );
+    assert.equal(
+      decideJoinAttempt({
+        admissionMode: 'both',
+        maxPeers: 4,
+        capacityUsed: 1,
+        joinKeyMatched: false,
+        existing: { status: 'authorized', publicKeyHex: 'dd'.repeat(32) },
+        incomingPublicKeyHex: 'dd'.repeat(32),
+        isReconnect: false,
+      }),
+      'keep',
+    );
+  });
+
+  test('SqliteStore.upsertMemberJoinAttempt：重连遇删行/revoked 抛 member-removed；manual 显式重加转 pending 并刷新 createdAt', async () => {
+    const dir = tmpDir('pas1a');
+    const dbPath = path.join(dir, 'gateway.db');
+    const s = new SqliteStore({
+      path: dbPath,
+      seed: { allowSignup: false, maxNetworksPerUser: 4, defaultMaxPeers: 4, relayRateKbps: 2048 },
+    });
+    try {
+      const pw = await hashPassword('pw-123456');
+      const owner = await s.createUser({ email: 'owner@local', passwordHash: pw, role: 'admin' });
+      const net = await s.createNetwork({
+        ownerId: owner.id,
+        name: 'pas1a-net',
+        admissionMode: 'both',
+        joinKeyEnc: 'enc',
+        maxPeers: 4,
+      });
+
+      // 缺失成员走 isReconnect=true → member-removed
+      await rejectsCode(
+        s.upsertMemberJoinAttempt({
+          networkId: net.id,
+          nodeId: '12345678',
+          name: 'node-a',
+          publicKeyHex: 'aa'.repeat(32),
+          joinKeyMatched: true,
+          isReconnect: true,
+        }),
+        'member-removed',
+      );
+
+      // 首次入网成功，随后切换到 manual 并再次显式入网 → 回退 pending 且刷新 createdAt
+      const joined = await s.upsertMemberJoinAttempt({
+        networkId: net.id,
+        nodeId: '12345678',
+        name: 'node-a',
+        publicKeyHex: 'aa'.repeat(32),
+        joinKeyMatched: true,
+        isReconnect: false,
+      });
+      assert.equal(joined?.status, 'authorized');
+      await s.updateNetwork(net.id, { admissionMode: 'manual' });
+      await new Promise((r) => setTimeout(r, 15));
+      const reExplicit = await s.upsertMemberJoinAttempt({
+        networkId: net.id,
+        nodeId: '12345678',
+        name: 'node-a',
+        publicKeyHex: 'aa'.repeat(32),
+        joinKeyMatched: true,
+        isReconnect: false,
+      });
+      assert.equal(reExplicit?.status, 'pending');
+      assert.ok(reExplicit.createdAt > joined.createdAt, '重新入网应刷新 createdAt 标定本轮加入纪元');
+
+      // 批准后重连仍保持 authorized；被 removeMember 删除后重连抛 member-removed
+      await s.transitionMemberStatus(net.id, '12345678', 'approve');
+      const kept = await s.upsertMemberJoinAttempt({
+        networkId: net.id,
+        nodeId: '12345678',
+        name: 'node-a',
+        publicKeyHex: 'aa'.repeat(32),
+        joinKeyMatched: false,
+        isReconnect: true,
+      });
+      assert.equal(kept?.status, 'authorized');
+
+      await s.removeMember(net.id, '12345678');
+      await rejectsCode(
+        s.upsertMemberJoinAttempt({
+          networkId: net.id,
+          nodeId: '12345678',
+          name: 'node-a',
+          publicKeyHex: 'aa'.repeat(32),
+          joinKeyMatched: true,
+          isReconnect: true,
+        }),
+        'member-removed',
+      );
+
+      // pending 被 reject 成 revoked 后，重连同样抛 member-removed
+      await s.upsertMemberJoinAttempt({
+        networkId: net.id,
+        nodeId: '22345678',
+        name: 'node-b',
+        publicKeyHex: 'bb'.repeat(32),
+        joinKeyMatched: false,
+        isReconnect: false,
+      });
+      await s.transitionMemberStatus(net.id, '22345678', 'reject');
+      await rejectsCode(
+        s.upsertMemberJoinAttempt({
+          networkId: net.id,
+          nodeId: '22345678',
+          name: 'node-b',
+          publicKeyHex: 'bb'.repeat(32),
+          joinKeyMatched: true,
+          isReconnect: true,
+        }),
+        'member-removed',
+      );
+    } finally {
+      await s.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('verifyGatewayLeaveSignature：合法签名通过，篡改/错密钥/畸形输入全部返回 false', () => {
+    const kp1 = generateKeyPairSync('ed25519');
+    const kp2 = generateKeyPairSync('ed25519');
+    const pub1 = kp1.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
+    const pub2 = kp2.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex');
+    const nodeId = createHash('sha256').update(Buffer.from(pub1, 'hex')).digest('hex').slice(0, 8);
+    const networkId = '0123456789abcdef';
+    const timestamp = Date.now();
+    const signatureHex = sign(null, gatewayLeaveMessage(networkId, nodeId, timestamp), kp1.privateKey).toString('hex');
+
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId, nodeId, publicKeyHex: pub1, timestamp, signatureHex }),
+      true,
+    );
+    // 篡改任一字段或换密钥均失败
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId: 'fedcba9876543210', nodeId, publicKeyHex: pub1, timestamp, signatureHex }),
+      false,
+    );
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId, nodeId: '00000000', publicKeyHex: pub1, timestamp, signatureHex }),
+      false,
+    );
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId, nodeId, publicKeyHex: pub1, timestamp: timestamp + 1, signatureHex }),
+      false,
+    );
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId, nodeId, publicKeyHex: pub2, timestamp, signatureHex }),
+      false,
+    );
+    // 畸形输入不抛异常、返回 false
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId: 'bad', nodeId, publicKeyHex: pub1, timestamp, signatureHex }),
+      false,
+    );
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId, nodeId, publicKeyHex: pub1, timestamp: 1.5, signatureHex }),
+      false,
+    );
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId, nodeId, publicKeyHex: 'zz', timestamp, signatureHex }),
+      false,
+    );
+    assert.equal(
+      verifyGatewayLeaveSignature({ networkId, nodeId, publicKeyHex: pub1, timestamp, signatureHex: '00' }),
+      false,
+    );
   });
 });

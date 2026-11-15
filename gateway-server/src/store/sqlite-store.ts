@@ -1044,8 +1044,12 @@ export class SqliteStore implements GatewayStore {
         incomingPublicKeyHex: input.publicKeyHex,
         joinKeyMatched: input.joinKeyMatched,
         capacityUsed,
+        isReconnect: input.isReconnect,
       });
 
+      if (decision === 'removed') {
+        throw new StoreError('member-removed', `member ${input.nodeId} was removed from network ${input.networkId}`);
+      }
       if (decision === 'reject') return null;
       if (decision === 'limit-reached') {
         throw new StoreError('limit-reached', `network ${input.networkId} is at max peers (${effectiveMax})`);
@@ -1059,12 +1063,12 @@ export class SqliteStore implements GatewayStore {
         // 决策值 authorize 落库为状态值 authorized
         const nextStatus: MemberStatus = decision === 'authorize' ? 'authorized' : 'pending';
         if (existing !== undefined) {
-          // revoked 复活：换上来的公钥生效、清候选
+          // revoked 复活或离线退网后在 manual 模式显式重加：换上来的公钥生效、清候选并刷新 created_at 标定新加入纪元
           this.db
             .prepare(
-              'UPDATE network_members SET status = ?, public_key_hex = ?, candidate_public_key_hex = NULL WHERE network_id = ? AND node_id = ?',
+              'UPDATE network_members SET status = ?, public_key_hex = ?, candidate_public_key_hex = NULL, created_at = ? WHERE network_id = ? AND node_id = ?',
             )
-            .run(nextStatus, input.publicKeyHex, input.networkId, input.nodeId);
+            .run(nextStatus, input.publicKeyHex, nowIso(), input.networkId, input.nodeId);
         } else {
           this.db
             .prepare(

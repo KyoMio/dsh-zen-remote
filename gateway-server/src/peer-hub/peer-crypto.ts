@@ -18,6 +18,7 @@ const NODE_ID_PATTERN = /^[0-9a-f]{8}$/;
 const NETWORK_ID_PATTERN = /^[0-9a-fA-F]{16}$/;
 
 const AUTH_DOMAIN = 'zr-gw-auth-v1';
+const LEAVE_DOMAIN = 'zr-gw-leave-v1';
 const JOIN_PROOF_DOMAIN = 'zr-join-v1';
 const STUN_PROBE_DOMAIN = 'zr-stun-probe-v1';
 
@@ -145,5 +146,27 @@ export function verifyStunProbeSignature(params: {
   if (typeof timestamp !== 'number' || !Number.isInteger(timestamp)) return false;
   if (!verifySelfCertifyingNodeId(params.nodeId, params.publicKeyHex)) return false;
   const message = stunProbeMessage(params.networkId.toLowerCase(), params.nodeId.toLowerCase(), nonce.toLowerCase(), timestamp);
+  return verifyEd25519(message, params.publicKeyHex, params.signatureHex);
+}
+
+/** 主动退网规范签名载荷（PAS-1a）：`zr-gw-leave-v1|<networkId>|<nodeId>|<timestamp>` */
+export function gatewayLeaveMessage(networkId: string, nodeId: string, timestamp: number): Buffer {
+  return Buffer.from(`${LEAVE_DOMAIN}|${networkId}|${nodeId}|${timestamp}`, 'utf8');
+}
+
+/** 校验节点退网请求签名：先验自证明 nodeId，再验 Ed25519 签名；畸形输入返回 false */
+export function verifyGatewayLeaveSignature(params: {
+  networkId: string;
+  nodeId: string;
+  publicKeyHex: string;
+  timestamp: number;
+  signatureHex: string;
+}): boolean {
+  const netId = normalizeNetworkId(params.networkId);
+  const nodeId = normalizeNodeId(params.nodeId);
+  if (netId === null || nodeId === null) return false;
+  if (typeof params.timestamp !== 'number' || !Number.isInteger(params.timestamp)) return false;
+  if (!verifySelfCertifyingNodeId(nodeId, params.publicKeyHex)) return false;
+  const message = gatewayLeaveMessage(netId, nodeId, params.timestamp);
   return verifyEd25519(message, params.publicKeyHex, params.signatureHex);
 }

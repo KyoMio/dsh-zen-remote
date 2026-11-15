@@ -665,6 +665,7 @@ export class PeerWsHub {
     }
 
     const name = parseName(message['name']);
+    const isReconnect = message['reconnect'] === true;
     // PC-03 fix2：关键成员读写（upsertMemberJoinAttempt）之前捕获成员代次——
     // 此后到注册之间的所有 await 窗口内，管理员的 pause/remove 等正常操作
     // 都会递增它（见 onMemberChanged），末尾同步复核使过期快照失效。
@@ -677,10 +678,15 @@ export class PeerWsHub {
         name,
         publicKeyHex,
         joinKeyMatched,
+        isReconnect,
         maxPeersCap,
       });
     } catch (error) {
       const code = (error as { code?: string }).code;
+      if (code === 'member-removed') {
+        deny(ws, 'removed from network');
+        return null;
+      }
       deny(ws, code === 'limit-reached' ? 'network is full' : 'join attempt rejected by gateway');
       return null;
     }
