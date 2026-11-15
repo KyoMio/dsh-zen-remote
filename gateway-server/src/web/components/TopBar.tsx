@@ -18,6 +18,7 @@ import type { Locale, TranslateFn } from '../i18n/locales';
 import { deriveNetworkCounts } from '../store/console-store';
 import type { NetworkView, PublicUser, TopologySnapshot, UiLocalState, UserQuotaSummary } from '../store/console-store';
 import {
+  BrandMark,
   CheckIcon,
   ChevronIcon,
   GlobeIcon,
@@ -25,7 +26,6 @@ import {
   MoonIcon,
   NetworkIcon,
   PlusIcon,
-  ServerIcon,
   SettingsIcon,
   UserIcon,
 } from './Icons';
@@ -155,15 +155,6 @@ function useMenuBehavior(open: boolean, close: () => void, openMenu: () => void)
 
 function avatarInitial(email: string): string {
   return (email.charAt(0) || '?').toUpperCase();
-}
-
-/** 品牌标识：统一矢量图标集里的网关机架（GC-8 起不再手写裸 <svg>） */
-function BrandMark() {
-  return (
-    <span className="brand-mark" aria-hidden="true">
-      <ServerIcon size={14} />
-    </span>
-  );
 }
 
 export function TopBar(props: TopBarProps) {

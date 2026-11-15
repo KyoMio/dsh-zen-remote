@@ -36,6 +36,9 @@ html[data-theme='light'] {
   --danger: #c23b3b;
   --danger-tint: #fbeeed;
 
+  --brand-primary: #1b2028;
+  --brand-accent: #3d5cff;
+
   --shadow-menu: 0 8px 24px rgba(15, 20, 30, 0.12);
 }
 
@@ -61,6 +64,9 @@ html[data-theme='dark'] {
   --warn-tint: #2a2416;
   --danger: #e06666;
   --danger-tint: #2e1c1c;
+
+  --brand-primary: #f0f4fa;
+  --brand-accent: #5c7bff;
 
   --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.45);
 }
@@ -191,14 +197,20 @@ button {
 }
 
 .brand-mark {
-  display: grid;
-  place-items: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 24px;
   height: 24px;
-  border-radius: 4px;
-  background: var(--ink);
-  color: var(--surface);
   flex: none;
+}
+
+.brand-mark-primary {
+  fill: var(--brand-primary, #1b2028);
+}
+
+.brand-mark-accent {
+  fill: var(--brand-accent, #3d5cff);
 }
 
 .brand-title {
@@ -543,8 +555,8 @@ button {
 }
 
 .login-brand .brand-mark {
-  width: 28px;
-  height: 28px;
+  width: 36px;
+  height: 36px;
 }
 
 .login-brand-title {

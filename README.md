@@ -1,5 +1,15 @@
-<h1 align="center">dsh-zen-remote</h1>
-<p align="center">One DeepSeek Harness plugin, three roles. The <b>host</b> turns DSH into a phone-reachable PWA (mobile UI, pairing gateway, lock-screen push) and shares chosen sessions to paired desktops. The <b>client</b> runs inside another DSH desktop app and puts the host's shared sessions right into its own sidebar (up to <b>8 hosts</b> connected simultaneously) — full history, live progress, messages, approvals, terminal, everything executes on the host. The <b>peer</b> joins a self-hosted virtual network with a single <code>zr-net://</code> invite link: machines in the network discover each other automatically and mount each other's remote-enabled sessions into their sidebars (LAN / NAT hole-punch direct paths first, a seamless fallback to the gateway's end-to-end-encrypted relay when no direct path exists), while keeping this machine's own phone/browser QR access and lock-screen push.</p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo/dsh-zen-remote-horizontal-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo/dsh-zen-remote-horizontal-color.svg">
+    <img src="assets/logo/dsh-zen-remote-horizontal-color.svg" alt="dsh-zen-remote" width="420">
+  </picture>
+</p>
+
+<p align="center">
+  <b>One DeepSeek Harness plugin, three roles.</b><br>
+  Turn DSH into a phone-ready PWA, mount shared sessions across paired desktops, or link computers into an end-to-end encrypted peer mesh with zero public IPs.
+</p>
 
 <p align="center">
 <a href="https://www.npmjs.com/package/dsh-zen-remote"><img src="https://img.shields.io/npm/v/dsh-zen-remote?style=flat-square&color=5B4CF0&logo=npm&label=npm" alt="npm version"></a>
@@ -129,10 +139,13 @@ cd ~/.dsh/profiles/desktop && pnpm install
 
 ## 2. Quick Start (Unified Setup & Pairing Wizard)
 
-The same plugin supports three roles:
-- **Server (`role: host`, default)**: runs your sessions, spawns the local security gateway and Web Push service, and lets your phone (PWA) or another computer connect.
-- **Desktop Client (`role: client`)**: runs inside another computer's DSH desktop app, connects to **up to 8 hosts simultaneously**, and mounts their shared sessions directly into its own sidebar (without spawning a local gateway or fighting for port 3088).
-- **Peer Node (`role: peer`)**: joins a **self-hosted virtual network** with a single `zr-net://` invite link — machines in the network discover each other automatically in both directions and mount each other's remote-enabled sessions into their sidebars (LAN / UDP hole-punch direct paths preferred, with a 1-second seamless fallback to the gateway's end-to-end-encrypted relay), **while this machine keeps its own phone/browser QR access and lock-screen push**. No public IP or per-machine pairing codes needed; joining a network does not fight for port 3088 either.
+The same plugin switches cleanly between three deployment roles:
+
+| Role | Best for | Session sharing | Phone PWA & Push | Needs public IP? |
+| --- | --- | --- | --- | --- |
+| **Host (`host`, default)** | Always-on workstation / server accessed from phone & paired computers | Shares chosen sessions outbound (`1 → N`) | Yes (gateway + Web Push) | Optional (Caddy / Cloudflare Tunnel / Proxy / LAN) |
+| **Desktop Client (`client`)** | Secondary computer mounting sessions from specific hosts | Connects inbound to up to **8 hosts** (`N → 1`) | No (doesn't bind port `3088`) | No |
+| **Peer Node (`peer`)** | Multiple computers forming a two-way mesh across LANs/NATs | **Bidirectional** — mounts peers' shared sessions & shares yours | **Yes** — full PWA & push stay active | **No** (LAN / UDP hole-punch + E2EE gateway relay) |
 
 Open **Plugins → `dsh-zen-remote`** in DSH. The **Remote Access & Device Pairing** card sits right at the top of the page (or run `npx dsh-zen-remote setup` on a headless server):
 
@@ -188,40 +201,46 @@ On another computer running the DSH desktop app (or via `dsh-zen-remote client p
 
 ### Scenario C: Join a Self-Hosted Virtual Network as a Peer Node
 
-Multiple computers, one mesh, zero public IPs: one person deploys the **self-hosted relay gateway** ([`gateway-server/`](gateway-server/README.md) — a single Docker container with its own web console), creates a virtual network, and hands every member a `zr-net://` invite link. Each machine joins with that one link; there are no per-machine pairing codes to copy around.
+Multiple computers, one bidirectional mesh, zero public IPs or per-machine pairing codes: one person deploys the **self-hosted relay gateway** ([`gateway-server/`](gateway-server/README.md) — a single Docker container with its own web console and built-in native HTTPS/WSS support), creates a virtual network, and invites each computer.
 
-On each computer that should join the network:
+#### Joining from the DSH UI
 
-1. Open **Plugins → `dsh-zen-remote`** and click **Start Setup Wizard**.
-2. **Step 1**: select **Peer Node** and click **Next** (switching to peer keeps this machine's serving halves — phone/browser QR access and lock-screen push keep working exactly as before).
-3. **Step 2**: paste the full invite link (`zr-net://…` / `zr-nets://…`, generated in the gateway's web console) and click **Join Network**. If the network requires manual admission, the wizard shows *"pending approval"* until an administrator approves the device in the gateway console.
-4. **Step 3**: once the three status lights (**Local identity ready**, **Network admission**, **Peer discovery & session sync**) turn green, the other member machines' remote-enabled sessions appear in your sidebar automatically — and your own remote-enabled sessions appear in theirs. No further action per machine.
+Open **Plugins → `dsh-zen-remote`** → **Start Setup Wizard** → **Step 1: select `Peer Node (peer)`**:
 
-Or do it all from the terminal (headless servers):
+1. **Choose how to join (Step 2)** — three supported entry paths:
+   - **Paste Invite Link (`zr-net://…`)**: paste the invite link generated in the gateway web console (`?tls=0` for plaintext gateways; `#join-key` is optional — omit it to submit for manual admin approval; legacy `zr-nets://` and `zr-net+insecure://` links also work). Expand **Advanced split-fill** to enter Gateway URL, 16-hex Network ID, and optional join passphrase separately.
+   - **Sign in with Gateway Account**: enter the gateway URL plus your gateway email and password (used strictly in memory to fetch permitted networks — never saved to disk), select a network, and click **Sign In & Join**.
+   - **Approval Mode**: if the network requires manual approval, the wizard displays *"pending approval"* and activates automatically as soon as an admin approves the device in the gateway console.
+2. **Verify & Auto-Mount (Step 3)**: once all three lights (**Local identity ready**, **Network admission**, **Peer discovery & session sync**) turn green, online peers' remote-enabled sessions automatically appear in your left sidebar under `"Device Name · Workspace Name"` — and sessions you enable for remote access appear in theirs.
+3. **Day-to-Day Peer Controls & Dual PWA Hosting**:
+   - The overview card displays **Network & Peer Interop** (`Devices in network` / `Mounted on this machine`, live `LAN Direct` vs `Gateway Relay` counts) plus your active **Phone / Browser Access (PWA)** section (QR pairing, ingress configuration, paired phone list) and **Plugin Bridge** switches — switching to `peer` never disables your phone access or lock-screen push.
+   - Open **Manage Network Devices** to inspect each peer's path (**LAN Direct**, **P2P Direct**, **Gateway Relay**, **Offline**, or **Identity Anomaly**) and measured RTT (`ms`), toggle **Mount Sessions** vs **Ignore** per peer (bounded by `maxPeers - 1` and optional local `maxServers`), trigger an instant **Re-probe**, or explicitly click **Trust New Identity** if a peer machine reinstalled and triggered a local TOFU `mismatch` block.
+
+#### Joining & Managing from the CLI (Headless Servers)
 
 ```sh
 npx dsh-zen-remote setup --role peer --invite "zr-net://gw.example.com/0123456789abcdef#join-key"
-dsh-zen-remote peer status        # nodeId, admission state, network peers & their live connection paths
-dsh-zen-remote peer trust <nodeId> # explicitly re-trust a peer whose identity changed (after a mismatch warning)
-dsh-zen-remote peer leave         # leave the network
+dsh-zen-remote peer status         # nodeId, admission state, network peers, paths & RTT (--json)
+dsh-zen-remote peer trust <nodeId> # explicitly re-trust a peer after an Ed25519 identity change
+dsh-zen-remote peer leave          # leave the virtual network (phone/browser QR access stays intact)
 ```
 
-How the network moves your data:
+#### Transport & Zero-Knowledge Security
 
-- **Direct first**: sessions ride LAN direct or UDP hole-punched P2P paths whenever possible. The gateway coordinates the hole punch over dual UDP STUN ports.
-- **Seamless fallback**: if no direct path is established within 1 second, traffic transparently switches to the gateway's **end-to-end-encrypted relay** — the gateway only ever forwards ciphertext frames it cannot decrypt. A silent background re-probe (every 60s) upgrades the path automatically when a direct route appears later.
-- **Zero-knowledge identities**: every machine has a self-certifying node identity (`nodeId` = hash of its Ed25519 public key), and each machine pins its peers' public keys locally (TOFU) — a gateway-side identity reset cannot silently impersonate anyone; the machine being impersonated stays blocked until someone at that machine explicitly trusts the new identity.
+- **Direct first (`lan` / `p2p`)**: dual UDP STUN ports (`19393/udp` + `19394/udp`) on the gateway coordinate NAT traversal so member computers talk directly whenever possible.
+- **1s seamless E2EE relay fallback (`relay`)**: if no direct route comes up within 1 second, traffic switches transparently to the gateway relay sealed with per-session ephemeral **X25519 + AES-256-GCM** (only 28-byte routing headers are visible to the gateway — zero plaintext exposure), while a silent **60s background re-probe** upgrades back to a direct path automatically whenever network conditions allow.
+- **Self-certifying TOFU identities**: every machine generates its own Ed25519 identity (`nodeId` = truncated public-key hash) and pins peers locally (`pinnedPeers`). Even a gateway-side credential reset cannot silently spoof an existing machine — other peers block that slot (`mismatch`) until confirmed on each machine.
 
-> Deploying the gateway itself: see [`gateway-server/README.md`](gateway-server/README.md) — one `docker run`, ports `19393/tcp+udp` and `19394/udp`, initial admin credentials printed to the first-boot log.
+> Deploying the gateway itself: see [`gateway-server/README.md`](gateway-server/README.md) — one `docker run`, ports `19393/tcp+udp` and `19394/udp`, initial `admin@local` password printed once to the first-boot container log.
 
 ---
 
 ## 3. Daily Usage: Session Sharing & Cross-Device Workflow
 
-| | **Web App Device (Phone / Tablet / Browser)** | **Desktop Client (Another DSH Desktop App)** |
+| | **Web App Device (Phone / Tablet / Browser)** | **Desktop Client / Peer Node (Another DSH Computer)** |
 | --- | --- | --- |
-| Visible sessions | **All** sessions on the host | **Only** sessions with remote access enabled on the host (enforced server-side) |
-| Credential | Long-lived HttpOnly cookie | Secret device token stored in `~/.dsh/zen-remote-state.json` (`Bearer` token) |
+| Visible sessions | **All** sessions on the host | **Only** sessions with remote access enabled on the serving machine (enforced server-side) |
+| Credential | Long-lived HttpOnly cookie | Host–Client: `Bearer` device token in `~/.dsh/zen-remote-state.json`<br>Peer–Peer: Ed25519 TOFU identity + ephemeral X25519 session key |
 
 ### Enabling or Disabling Remote Access on a Session
 
@@ -238,9 +257,9 @@ Remote access is controlled per session (or automatically enabled for new sessio
 
 4. **Host settings page**: view and close shared sessions individually or all at once under the shared sessions list.
 
-### Working in Remote Sessions on a Desktop Client
+### Working in Remote Sessions (Desktop Client & Peer Node)
 
-- **Sidebar groups**: once a host workspace has at least one remote-enabled session, a **"Server Name · Workspace Name"** group appears in the client's sidebar (up to 8 paired hosts, stacked in pairing order). Click any session to view full history, stream responses, approve tools, use the server terminal, browse files and diffs, preview inline images, download deliverables, or drag/paste/pick files to upload.
+- **Sidebar groups**: once a paired host or mounted peer workspace has at least one remote-enabled session, a **"Device Name · Workspace Name"** group appears in the sidebar. Click any session to view full history, stream responses, approve tools, use the server terminal, browse files and diffs, preview inline images, download deliverables, or drag/paste/pick files to upload.
 
   ![Remote workspace group in the desktop client sidebar](docs/images/client-sidebar.png)
 
@@ -331,7 +350,7 @@ Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_
 <summary>Expand security & state-file details, known limitations, iOS PWA notes & adapted third-party plugins</summary>
 
 **Data & state files**
-- The plugin reports nothing to any third party. Pairing state lives in `~/.dsh/lan-gate-state.json`; the unified state file `~/.dsh/zen-remote-state.json` (`0600`) carries the local `serverId`, the shared-session table `sessions`, and the client's paired servers list `servers` (up to 8 servers, tokens included); Cloudflare tokens live in `0600` files under `~/.dsh/zen-remote-ingress/`.
+- The plugin reports nothing to any third party. Pairing state lives in `~/.dsh/lan-gate-state.json`; the unified state file `~/.dsh/zen-remote-state.json` (`0600`) stores the local `serverId`, shared-session table `sessions`, paired hosts list `servers` (up to 8 in client mode by default), and peer state (`peerIdentity`, `peerNetwork`, `pinnedPeers`); Cloudflare tokens live in `0600` files under `~/.dsh/zen-remote-ingress/`.
 
 **Known limitations**
 - With multiple DSH windows open simultaneously on a client, active-session detection may occasionally dismiss a closed session early.

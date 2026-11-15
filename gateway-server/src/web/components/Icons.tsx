@@ -332,3 +332,30 @@ export function NetworkIcon(props: IconProps) {
     </Icon>
   );
 }
+
+/** 品牌标识矢量（dsh-zen-remote Hex Tunnel，浅/深色随 --brand-primary / --brand-accent 切换） */
+export function BrandMarkIcon({ size = 24, ...rest }: IconProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 256 256"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+      {...rest}
+    >
+      <path className="brand-mark-primary" d="M74 35 H182 L236 128 L218 159 H127 L181 66 H56 Z" />
+      <path className="brand-mark-accent" d="M182 221 H74 L20 128 L38 97 H129 L75 190 H200 Z" />
+    </svg>
+  );
+}
+
+/** 控制台品牌容器（TopBar 与 LoginView 共用） */
+export function BrandMark({ size = 24 }: { size?: number }) {
+  return (
+    <span className="brand-mark" aria-hidden="true">
+      <BrandMarkIcon size={size} />
+    </span>
+  );
+}
