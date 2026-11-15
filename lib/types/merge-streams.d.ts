@@ -88,20 +88,18 @@
  *   never enters the set by construction. The hidden ids are sticky: they
  *   survive even the death of their home workspace until a re-share or the
  *   identity ends.
- * - a workspace with NOTHING to show is not shown at all (T56): the server
- *   keeps every workspace and only narrows `sessionIds` (relay-filter.ts),
- *   so a workspace where nothing is shared would arrive as an empty group
- *   and render as a bare 「服务端名 · 工作区名」 heading. A workspace the UI
- *   has never seen is therefore held back — no baseline item, no upsert, no
- *   order entry — until its forwarded `sessionIds` (live sessions or
- *   tombstones it must carry) first gains content. From that first forward
- *   on it counts as SHOWN and stays shown even when the sessions leave
- *   again: a `remove` would blacklist the id in the UI's ClientWorkspaceModel
- *   and make the group un-revivable, so an emptied group keeps its (empty)
- *   display until the page reload rebuilds the model and this rule hides it
- *   again. Every removal path — the reconnecting baseline diff, an explicit
- *   server remove, {@link WorkspaceMerger.onRemoteGone} — emits a `remove`
- *   only for shown workspaces; never-shown ones leave the state silently.
+ * - workspaces from a CONNECTED server are ALL shown: the server keeps
+ *   every workspace and narrows `sessionIds` to shared sessions (relay-
+ *   filter.ts), so paired clients also see remote workspaces that have no
+ *   active shared sessions yet (for example in the New Session workspace
+ *   picker or sidebar `+` menu). While unpaired or revoked
+ *   (`isPairingDisconnected`), never-shown workspaces stay withheld until the
+ *   connection is active again. Once shown, a workspace stays shown even if
+ *   its sessions leave, and every removal path — the reconnecting baseline
+ *   diff, an explicit server remove, {@link WorkspaceMerger.onRemoteGone} —
+ *   emits a `remove` only for shown workspaces; never-shown ones leave the
+ *   state silently (a `remove` would blacklist the id in the UI's
+ *   ClientWorkspaceModel).
  *
  * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
  * never clearing during a page's life (a reload rebuilds the model from
@@ -370,7 +368,7 @@ export declare function createControlMerger(options: ControlMergerOptions): Cont
  * occupy the seq forever. A missing or malformed remote result means "remote
  * said nothing" — the local result passes back untouched.
  */
-export declare function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string): unknown;
+export declare function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string, remoteDefault?: unknown): unknown;
 /**
  * Fold the relay's `session/modelCatalog` answer into the local one (T52).
  * The result shape is RT dsh-api-session-controller
@@ -402,12 +400,14 @@ export declare function mergeSessionList(localResult: unknown, remoteResult: unk
  *   not travel (dsh-vision-router's settings read the same result and shows
  *   an error state exactly when groups are empty AND failures exist,
  *   lib/client.js:635-647 — dropping remote failures keeps that honest).
- *   KNOWN BOUNDARY (pre-T52 behavior, unchanged): a NEW server session's
- *   projection `next` is null until its first selection or turn, so the UI
- *   shows `catalog.value.default` — the LOCAL default — as that session's
- *   current model (RT dsh-client-ui-model-selection lib/client.js:316,
- *   `projected?.next ?? catalog.value?.default`), which may differ from what
- *   the server would actually run until its first selection lands.
+ *   NOTE: a NEW 0-event (`asOfSeq === -1`) server session's projection
+ *   carries `{ lastUsed: null, next: null }`; when the remote server's
+ *   `modelCatalog.default` is cached on the client, projection virtualization
+ *   seeds `modelSelection.next` from it so the UI displays and targets the
+ *   remote server's default model rather than falling back to
+ *   `catalog.value.default` (the LOCAL default) until the first selection at
+ *   `seq: 0` overwrites it. If the remote catalog has not landed yet, it
+ *   falls back to `catalog.value.default` until a selection or turn lands.
  * - `routableProviders` mirrors the group ids by construction host-side
  *   (RT dsh-api-session-controller lib/index.js:544 — literally
  *   `groups.map(g => g.id)`); no client UI reads it (the dropdown's
@@ -419,31 +419,7 @@ export declare function mergeSessionList(localResult: unknown, remoteResult: unk
  * local result passes back untouched, like {@link mergeSessionList}.
  */
 export declare function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, identity: MergerIdentity): unknown;
-/**
- * Virtualize the provider ids inside one `modelSelection` projection value —
- * `{lastUsed: {provider, model, reasoningEffort?} | null, next: …}` (RT
- * dsh-api-session-controller lib/types/model-selection-projection.js:12-15,
- * wire shapes at lib/typert.remote-client.js:83-94). The UI resolves the
- * current model's display name by matching `(provider, model)` against the
- * catalog groups (dsh-client-ui-model-selection lib/client.js:334, 520); for
- * a remote session the provider is a SERVER group id, so it must become the
- * virtual group id to be found in the merged catalog — and while the relay
- * serves, the merged catalog always carries it, so the composer trigger
- * shows the model NAME instead of the raw `provider/model` fallback string
- * (lib/client.js:700).
- *
- * UNCONDITIONAL by decision (T52-fix3, reverting T52-fix2's catalog gate):
- * the host's projection store is first-write-wins per sequence number
- * (lib/client.js:986-994), so whether a value is rewritten may not depend on
- * WHEN the catalog happened to arrive — an original written pre-catalog
- * occupies the seq and the later virtual value is dropped, leaving the
- * server group unchecked and the next reasoning-effort submit refused.
- * Accepted cost: a provider the server's own catalog does not list renders
- * the `zr~<serverId>~provider/model` fallback string. Nulls and malformed
- * entries pass through untouched; `model` and `reasoningEffort` are
- * group-agnostic ids and stay as they are.
- */
-export declare function virtualizeModelSelectionValue(value: unknown, serverId: string): unknown;
+export declare function virtualizeModelSelectionValue(value: unknown, serverId: string, unselectedDefault?: unknown): unknown;
 export interface ForgeStatesMerger {
     onLocal(frame: unknown): unknown[];
     onRemote(serverId: string, frame: unknown): unknown[];
@@ -463,14 +439,14 @@ export declare function createForgeStatesMerger(): ForgeStatesMerger;
  * `agentTeam.tasks[].ownerId`) carry `zr~<serverId>~`. Unrecognized keys and
  * malformed shapes pass through by identity.
  */
-export declare function virtualizeProjectionValue(key: string, value: unknown, serverId: string): unknown;
+export declare function virtualizeProjectionValue(key: string, value: unknown, serverId: string, unselectedDefault?: unknown): unknown;
 /**
  * Virtualize every rewritable entry in a session projection `values` map
  * (shared across `session/follow`, `session/projections`, `session/list`, and
  * `session/control`). Returns the input map unchanged if nothing needed
  * rewriting.
  */
-export declare function virtualizeProjectionValues(values: Record<string, unknown>, serverId: string): Record<string, unknown>;
+export declare function virtualizeProjectionValues(values: Record<string, unknown>, serverId: string, unselectedDefault?: unknown): Record<string, unknown>;
 /**
  * T63: the virtual session ids a set of FORWARDED workspace frames carries —
  * the `sessionIds` of `upsert` records and of baseline `value.items`. The
@@ -478,10 +454,10 @@ export declare function virtualizeProjectionValues(values: Record<string, unknow
  * for ids the UI has no summary for yet (the sidebar drops a group member
  * without one — RT dsh-client-ui-workspace orderByRecency / groupByWorkspace).
  * Reading the FORWARDED output (not the merger's raw state) is the point:
- * T56 already withheld empty groups and T58 already dropped hidden sessions,
- * so a hidden closed-remote session never reaches here and is never
- * announced. Only virtual ids count — local baseline content rides these
- * frames verbatim and its rows already have summaries.
+ * paired empty groups forward cleanly with `sessionIds: []` (contributing zero
+ * session ids), and T58 already handles hidden sessions while keeping a
+ * one-shot ask gate. Only virtual ids count — local baseline content rides
+ * these frames verbatim and its rows already have summaries.
  */
 export declare function virtualSessionIdsInWorkspaceFrames(frames: readonly unknown[]): string[];
 /**
@@ -502,7 +478,7 @@ export declare function virtualSessionIdsInWorkspaceFrames(frames: readonly unkn
  * against the control stream's rewritten frames — T52-fix3). A malformed
  * remote result means "the server said nothing" — no frames.
  */
-export declare function sessionSummaryAddedFrames(remoteResult: unknown, serverId: string): unknown[];
+export declare function sessionSummaryAddedFrames(remoteResult: unknown, serverId: string, remoteDefault?: unknown): unknown[];
 /** The cumulative LOCAL lists one workspace merger's `local` side holds. */
 export interface LocalWorkspaceLists {
     orderIds: string[];

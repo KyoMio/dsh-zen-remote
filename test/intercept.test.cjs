@@ -4348,6 +4348,73 @@ test('T52: remote projections and follow snapshots carry the virtual group id; l
   handle.uninstall()
 })
 
+test('blank remote session (asOfSeq: -1) seeds virtualized modelSelection.next from cached remote catalog default while settled sessions stay untouched', async () => {
+  const gateway = new FakeTypertGateway({
+    rpc: { 'session/list': { ok: true, value: { items: [] } } },
+  })
+  const relay = createFakeRelay()
+  const remoteDefault = { provider: 'deepseek-account', model: 'deepseek-chat', reasoningEffort: 'high' }
+  relay.invokeValues = {
+    'session/modelCatalog': {
+      groups: [{ id: 'deepseek-account', name: 'DeepSeek' }],
+      default: remoteDefault,
+    },
+  }
+  const { handle } = install(gateway, relay)
+  await gateway.rpcBridge('session/modelCatalog', { args: {} }, undefined, undefined)
+
+  const expectedDefault = {
+    provider: toVirtual(SERVER_ID, 'deepseek-account'),
+    model: 'deepseek-chat',
+    reasoningEffort: 'high',
+  }
+
+  // 1) session/follow snapshot at asOfSeq: -1
+  relay.streamFrames = [
+    {
+      type: 'snapshot',
+      header: { version: 4, id: LOCAL_ID, cwd: '/tmp' },
+      cursor: 0,
+      records: [],
+      projections: { kind: 'sequenced', asOfSeq: -1, values: { modelSelection: { lastUsed: null, next: null } } },
+    },
+  ]
+  const followFrames = await drained(
+    gateway.wireTap('session/follow', { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } }, undefined, undefined, undefined, { signal: undefined }),
+  )
+  assert.deepEqual(followFrames[0].projections.values.modelSelection, { lastUsed: null, next: expectedDefault })
+
+  // 2) session/projections RPC at asOfSeq: -1 vs settled asOfSeq >= 0
+  relay.invokeValue = { asOfSeq: -1, values: { modelSelection: { lastUsed: null, next: null } } }
+  const blankProj = await gateway.rpcBridge('session/projections', { args: { request: { sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  assert.deepEqual(blankProj.value.values.modelSelection, { lastUsed: null, next: expectedDefault })
+
+  relay.invokeValue = { asOfSeq: 6, values: { modelSelection: { lastUsed: { provider: 'codex', model: 'sol' }, next: null } } }
+  const settledProj = await gateway.rpcBridge('session/projections', { args: { request: { sessionId: VIRTUAL_ID } } }, undefined, undefined)
+  assert.deepEqual(settledProj.value.values.modelSelection, { lastUsed: { provider: toVirtual(SERVER_ID, 'codex'), model: 'sol' }, next: null })
+
+  // 3) session/list RPC: blank (asOfSeq: -1) gets next seeded; settled (asOfSeq: 6) keeps next: null
+  relay.invokeValue = {
+    items: [
+      {
+        sessionId: 'blank-1',
+        updatedAt: 2,
+        projections: { kind: 'sequenced', asOfSeq: -1, values: { modelSelection: { lastUsed: null, next: null } } },
+      },
+      {
+        sessionId: 'settled-1',
+        updatedAt: 1,
+        projections: { kind: 'sequenced', asOfSeq: 6, values: { modelSelection: { lastUsed: { provider: 'codex', model: 'sol' }, next: null } } },
+      },
+    ],
+  }
+  const listRes = await gateway.rpcBridge('session/list', { args: { _request: {} } }, undefined, gateway.operatorPeer())
+  assert.deepEqual(listRes.value.items[0].projections.values.modelSelection, { lastUsed: null, next: expectedDefault })
+  assert.deepEqual(listRes.value.items[1].projections.values.modelSelection, { lastUsed: { provider: toVirtual(SERVER_ID, 'codex'), model: 'sol' }, next: null })
+
+  handle.uninstall()
+})
+
 test('T52: the merged $events leg emits the catalog-refresh frame on serving transitions, deduped per identity, deferred past the local ready', async () => {
   const REFRESH = { type: 'emit', event: 'llm/adapters-updated', args: [] }
   // Deferred: the relay is ALREADY online when the stream opens, but the

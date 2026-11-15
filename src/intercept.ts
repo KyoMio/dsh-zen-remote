@@ -1359,7 +1359,7 @@ function restoreSessionReferences(
 }
 
 /** Rewrite one stream frame's session ids to virtual form. */
-export function rewriteFrame(endpoint: string, frame: unknown, serverId: string): unknown {
+export function rewriteFrame(endpoint: string, frame: unknown, serverId: string, remoteDefault?: unknown): unknown {
   const virtualize = (id: string): string => toVirtual(serverId, id)
   if (endpoint === 'session/follow') {
     if (!isPlainObject(frame) || frame.type !== 'snapshot' || !isPlainObject(frame.header)) return frame
@@ -1381,7 +1381,8 @@ export function rewriteFrame(endpoint: string, frame: unknown, serverId: string)
     // control stream, never from folding events client-side
     // (dsh-api-session-controller lib/client.js:1616-1628).
     if (isPlainObject(frame.projections) && isPlainObject(frame.projections.values)) {
-      const nextValues = virtualizeProjectionValues(frame.projections.values, serverId)
+      const unselectedDefault = frame.projections.asOfSeq === -1 ? remoteDefault : undefined
+      const nextValues = virtualizeProjectionValues(frame.projections.values, serverId, unselectedDefault)
       if (nextValues !== frame.projections.values) {
         out.projections = { ...frame.projections, values: nextValues }
       }
@@ -1407,7 +1408,7 @@ export function rewriteFrame(endpoint: string, frame: unknown, serverId: string)
 }
 
 /** Rewrite one invoke result's session ids to virtual form. */
-export function rewriteResult(endpoint: string, value: unknown, serverId: string): unknown {
+export function rewriteResult(endpoint: string, value: unknown, serverId: string, remoteDefault?: unknown): unknown {
   const virtualize = (id: string): string => toVirtual(serverId, id)
   if (endpoint === 'session/create' || endpoint === 'session/fork') {
     // The one session id the result carries is the NEW session's, minted
@@ -1477,7 +1478,8 @@ export function rewriteResult(endpoint: string, value: unknown, serverId: string
     // :381-428, and list rows travel the merged route's
     // mergeSessionList rewrite instead, merge-streams.ts.)
     if (!isPlainObject(value) || !isPlainObject(value.values)) return value
-    const nextValues = virtualizeProjectionValues(value.values, serverId)
+    const unselectedDefault = value.asOfSeq === -1 ? remoteDefault : undefined
+    const nextValues = virtualizeProjectionValues(value.values, serverId, unselectedDefault)
     // alpha.2 clients validate list/control projections with kind:'cached'|'sequenced'.
     // Older hosts (rc.2) omit it on the session/projections control-key result — synthesize.
     const withKind = typeof value.kind === 'string'
@@ -2216,6 +2218,7 @@ interface MergedEventsStreamDeps {
   /** T63: the summary-sync hub — the workspace route's nudges arrive here
    * and this leg runs the fetch-and-announce (see runSummarySync below). */
   summarySync: SessionSummarySync
+  getRemoteDefault: (serverId: string) => unknown
 }
 
 /**
@@ -2421,7 +2424,7 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
         if (!alive) return
         const round = askingNow
         askingNow = []
-        const frames = sessionSummaryAddedFrames(value, identity.serverId)
+        const frames = sessionSummaryAddedFrames(value, identity.serverId, deps.getRemoteDefault(identity.serverId))
         const returned = new Set<string>()
         for (const frame of frames) {
           const row = (frame as { args: unknown[] }).args[0]
@@ -3280,6 +3283,8 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
   }
   const pushLocalControl = (frame: unknown): void => {
     if (isPlainObject(frame) && frame.type === 'baseline') {
+      localSeen = true
+      localBaselineFrame = frame
       pushOut([frame])
       // Each slot's buffered pre-baseline projections flush behind it (the
       // slots' own baseline copies are the SAME frame object — skip those).
@@ -3635,6 +3640,7 @@ interface MergedEventsStreamMultiDeps {
   log: ((format: string, ...args: unknown[]) => void) | undefined
   clock: RelayClock
   summarySync: SessionSummarySync
+  getRemoteDefault: (serverId: string) => unknown
   watchPool(fn: () => void): () => void
 }
 
@@ -3766,7 +3772,11 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
           recordFailure('session/list', result.error instanceof RelayError ? result.error.code : 'internal')
           continue
         }
-        const frames = sessionSummaryAddedFrames(result.value, result.round.slot.serverId)
+        const frames = sessionSummaryAddedFrames(
+          result.value,
+          result.round.slot.serverId,
+          deps.getRemoteDefault(result.round.slot.serverId),
+        )
         const returned = new Set<string>()
         for (const frame of frames) {
           const row = (frame as { args: unknown[] }).args[0]
@@ -4312,6 +4322,15 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * takes its cache with it (its groups must not outlive the pairing). */
   const serverCatalogCaches = new Map<string, { identity: MergerIdentity; value: unknown }>()
   const catalogGenerations = new Map<string, number>()
+  const remoteDefaultOf = (serverId: string): unknown => {
+    if (pool !== undefined) {
+      const cached = serverCatalogCaches.get(serverId)
+      return isPlainObject(cached?.value) ? cached.value.default : undefined
+    }
+    return serverCatalogCache?.identity.serverId === serverId && isPlainObject(serverCatalogCache.value)
+      ? serverCatalogCache.value.default
+      : undefined
+  }
   /** One server-catalog fetch whose answer only feeds the cache (T52-fix2):
    * the proactive pull that runs as soon as the relay serves — and once at
    * install when the relay already serves (subscribe replays no state —
@@ -4705,7 +4724,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         const extracted = extractResultAttachments(restored)
         return {
           ok: true,
-          value: rewriteResult(endpoint, extracted.value, serverId),
+          value: rewriteResult(endpoint, extracted.value, serverId, remoteDefaultOf(serverId)),
           ...(extracted.attachments.length > 0 ? { attachments: extracted.attachments } : {}),
         }
       }
@@ -4719,7 +4738,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         )
         return { ok: true, value: { ...restored, workspace: ws } }
       }
-      return { ok: true, value: rewriteResult(endpoint, restored, serverId) }
+      return { ok: true, value: rewriteResult(endpoint, restored, serverId, remoteDefaultOf(serverId)) }
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
       recordFailure(endpoint, code)
@@ -4902,7 +4921,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           if (endpoint === 'session/follow' && isPlainObject(frame) && frame.type === 'snapshot' && isPlainObject(frame.header)) {
             recordRemoteSessionCwd(serverId, frame.header.id, frame.header.cwd)
           }
-          yield rewriteFrame(endpoint, frame, serverId)
+          yield rewriteFrame(endpoint, frame, serverId, remoteDefaultOf(serverId))
         }
         return
       } catch (error) {
@@ -5046,7 +5065,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         // P55-2: the RAW remote rows (original ids) feed the /api/file cwd
         // registry before the merge virtualizes them.
         noteRemoteSessionListCwds(result.value, result.serverId)
-        value = mergeSessionList(value, result.value, result.serverId)
+        value = mergeSessionList(value, result.value, result.serverId, remoteDefaultOf(result.serverId))
       }
       return { ok: true, value }
     }
@@ -5055,7 +5074,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     try {
       const remote = await singleRelay.invoke('session', 'list', isPlainObject(args) ? args : {}, signal)
       noteRemoteSessionListCwds(remote, identity.serverId)
-      return { ok: true, value: mergeSessionList(localEnvelope.value, remote, identity.serverId) }
+      return { ok: true, value: mergeSessionList(localEnvelope.value, remote, identity.serverId, remoteDefaultOf(identity.serverId)) }
     } catch (error) {
       recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
       return localEnvelope
@@ -5561,9 +5580,28 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control, uplinkWindow)
         if (!isAsyncIterable(local)) return local
         if (pool !== undefined) {
-          return mergedEventsStreamMulti({ local, pool, signal, recordFailure, log, clock, summarySync, watchPool })
+          return mergedEventsStreamMulti({
+            local,
+            pool,
+            signal,
+            recordFailure,
+            log,
+            clock,
+            summarySync,
+            getRemoteDefault: remoteDefaultOf,
+            watchPool,
+          })
         }
-        return mergedEventsStream({ local, relay: singleRelay, signal, recordFailure, log, clock, summarySync })
+        return mergedEventsStream({
+          local,
+          relay: singleRelay,
+          signal,
+          recordFailure,
+          log,
+          clock,
+          summarySync,
+          getRemoteDefault: remoteDefaultOf,
+        })
       })()
     }
     const args = argsOf(payload)

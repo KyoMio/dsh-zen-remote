@@ -1158,58 +1158,71 @@ test('T52-fix3 control merger: modelSelection projection frames get their provid
   )
 })
 
-// -- 10. T56: server workspaces with nothing shared stay hidden ----------------------
+// -- 10. remote workspaces visibility & remove safety ------------------------------
 
 const EMPTY_WS = remoteWorkspace('w-empty', '空组', [])
 const T56_BASELINE = { type: 'baseline', value: { items: [W1, EMPTY_WS], archivedSessionIds: [], pinnedSessionIds: [] } }
 
-test('T56: a baseline workspace with no shared sessions is not forwarded — no upsert, no order entry, no baseline item', () => {
+test('T56: connected empty workspaces are forwarded in baseline, order, and live frames so New Session sees all workspaces', () => {
   const m = merger()
   m.onLocal(LOCAL_BASELINE)
   const out = m.onRemote(T56_BASELINE)
   assert.deepEqual(out, [
     { type: 'upsert', workspace: { ...W1, workspaceId: V('w-1'), title: `${NAME} · 远端一`, sessionIds: [V('s1'), V('s2')] } },
-    { type: 'order', workspaceIds: ['ws-local', V('w-1')] },
+    { type: 'upsert', workspace: { ...EMPTY_WS, workspaceId: V('w-empty'), title: `${NAME} · 空组`, sessionIds: [] } },
+    { type: 'order', workspaceIds: ['ws-local', V('w-1'), V('w-empty')] },
     { type: 'archived', archivedSessionIds: [] },
     { type: 'pinned', pinnedSessionIds: [] },
   ])
-  // later local frames keep excluding the hidden group
+  // later local frames keep including the empty group
   assert.deepEqual(m.onLocal({ type: 'order', workspaceIds: ['ws-local'] }), [
-    { type: 'order', workspaceIds: ['ws-local', V('w-1')] },
+    { type: 'order', workspaceIds: ['ws-local', V('w-1'), V('w-empty')] },
   ])
   const local = m.onLocal({ ...LOCAL_BASELINE })
-  assert.deepEqual(local[0].value.items.map((w) => w.workspaceId), ['ws-local', V('w-1')], 'the baseline items too')
+  assert.deepEqual(local[0].value.items.map((w) => w.workspaceId), ['ws-local', V('w-1'), V('w-empty')], 'the baseline items too')
 })
 
-test('T56: a cached baseline hides its empty workspaces at the flush — an all-hidden remote keeps the local frame verbatim', () => {
+test('T56: a cached baseline forwards empty workspaces when connected, while unpaired hides never-shown workspaces', () => {
   const m = merger()
   assert.deepEqual(m.onRemote(T56_BASELINE), [])
   const out = m.onLocal(LOCAL_BASELINE)
-  assert.equal(out.length, 2, 'the merged baseline plus only the shown group restated')
-  assert.deepEqual(out[0].value.items.map((w) => w.workspaceId), ['ws-local', V('w-1')])
+  assert.equal(out.length, 3, 'the merged baseline plus both workspaces restated')
+  assert.deepEqual(out[0].value.items.map((w) => w.workspaceId), ['ws-local', V('w-1'), V('w-empty')])
   assert.deepEqual(out[1], { type: 'upsert', workspace: { ...W1, workspaceId: V('w-1'), title: `${NAME} · 远端一`, sessionIds: [V('s1'), V('s2')] } })
+  assert.deepEqual(out[2], { type: 'upsert', workspace: { ...EMPTY_WS, workspaceId: V('w-empty'), title: `${NAME} · 空组`, sessionIds: [] } })
 
-  // nothing VISIBLE at all: the local baseline passes as the same object
+  // unpaired/revoked: never-shown workspaces stay withheld, so the local baseline passes verbatim
   const fresh = merger()
+  fresh.setStatus('unpaired')
   fresh.onRemote({ type: 'baseline', value: { items: [EMPTY_WS], archivedSessionIds: [], pinnedSessionIds: [] } })
   assert.deepEqual(fresh.onLocal(LOCAL_BASELINE), [LOCAL_BASELINE])
 })
 
-test('T56: the first live upsert of a hidden workspace forwards it together with its order position', () => {
+test('T56: workspaces withheld while unpaired are revealed with their order position when pairing is restored', () => {
   const m = merger()
   m.onLocal(LOCAL_BASELINE)
-  m.onRemote(T56_BASELINE)
-  // refreshes while hidden stay invisible
+  m.setStatus('unpaired')
+  assert.deepEqual(
+    m.onRemote({ type: 'baseline', value: { items: [EMPTY_WS], archivedSessionIds: [], pinnedSessionIds: [] } }),
+    [
+      { type: 'order', workspaceIds: ['ws-local'] },
+      { type: 'archived', archivedSessionIds: [] },
+      { type: 'pinned', pinnedSessionIds: [] },
+    ],
+  )
+  // refreshes while unpaired stay invisible
   assert.deepEqual(m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-empty', '改名了', []) }), [])
-  const out = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-empty', '空组', ['s9']) })
-  assert.deepEqual(out, [
-    { type: 'upsert', workspace: { ...remoteWorkspace('w-empty', '空组', ['s9']), workspaceId: V('w-empty'), title: `${NAME} · 空组`, sessionIds: [V('s9')] } },
-    { type: 'order', workspaceIds: ['ws-local', V('w-1'), V('w-empty')] },
+
+  // restoring pairing reveals the held workspace together with its order position
+  m.setStatus('none')
+  assert.deepEqual(m.onStatusChanged(), [
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-empty', '改名了', []), workspaceId: V('w-empty'), title: `${NAME} · 改名了`, sessionIds: [] } },
+    { type: 'order', workspaceIds: ['ws-local', V('w-empty')] },
   ])
   // from the first forward on it is a known group: content refreshes ride alone
-  const again = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-empty', '空组', ['s9', 's4']) })
+  const again = m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-empty', '空组', ['s9']) })
   assert.deepEqual(again, [
-    { type: 'upsert', workspace: { ...remoteWorkspace('w-empty', '空组', ['s9', 's4']), workspaceId: V('w-empty'), title: `${NAME} · 空组`, sessionIds: [V('s9'), V('s4')] } },
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-empty', '空组', ['s9']), workspaceId: V('w-empty'), title: `${NAME} · 空组`, sessionIds: [V('s9')] } },
   ])
 })
 
@@ -1239,10 +1252,13 @@ test('T56: a shown workspace whose sessions all leave keeps showing — no remov
 test('T56: a reconnecting baseline removes only SHOWN workspaces — a never-shown one leaves silently', () => {
   const m = merger()
   m.onLocal(LOCAL_BASELINE)
-  m.onRemote(T56_BASELINE)
+  m.onRemote({ type: 'baseline', value: { items: [W1], archivedSessionIds: [], pinnedSessionIds: [] } })
+  m.setStatus('unpaired')
+  assert.deepEqual(m.onRemote({ type: 'upsert', workspace: EMPTY_WS }), [])
+  m.setStatus('none')
   m.onRemoteDown()
   // The new baseline drops BOTH w-1 and w-empty: only the shown one removes,
-  // and no frame mentions the hidden one.
+  // and no frame mentions the never-shown one.
   const out = m.onRemote({ type: 'baseline', value: { items: [W2], archivedSessionIds: [], pinnedSessionIds: [] } })
   assert.deepEqual(out, [
     { type: 'upsert', workspace: { ...W2, workspaceId: V('w-2'), title: `${NAME} · 远端二`, sessionIds: [V('s3')] } },
@@ -1253,45 +1269,49 @@ test('T56: a reconnecting baseline removes only SHOWN workspaces — a never-sho
   ])
 })
 
-test('T56: onRemoteGone removes only the shown workspaces; an all-hidden remote is a silent no-op', () => {
+test('T56: onRemoteGone removes only the shown workspaces; an all-hidden unpaired remote is a silent no-op', () => {
   const m = merger()
   m.onLocal(LOCAL_BASELINE)
   m.onRemote(T56_BASELINE)
   assert.deepEqual(m.onRemoteGone(), [
     { type: 'remove', workspaceId: V('w-1') },
+    { type: 'remove', workspaceId: V('w-empty') },
     { type: 'order', workspaceIds: ['ws-local'] },
     { type: 'archived', archivedSessionIds: [] },
     { type: 'pinned', pinnedSessionIds: [] },
   ])
 
-  // only-hidden remote state: the UI knows no ids — nothing to emit at all
+  // only-unshown remote state while unpaired: the UI knows no ids — nothing to emit at all
   const fresh = merger()
   fresh.onLocal(LOCAL_BASELINE)
+  fresh.setStatus('unpaired')
   fresh.onRemote({ type: 'baseline', value: { items: [EMPTY_WS], archivedSessionIds: [], pinnedSessionIds: [] } })
   assert.deepEqual(fresh.onRemoteGone(), [])
 
-  // the shown set dies with the identity: a NEW server reusing the same
-  // original workspace id starts clean (its empty same-id group stays hidden)
+  // a NEW connected server reusing the same original workspace id shows its empty group normally
   m.retarget({ serverId: 'ffffffff', serverName: '新服务器' })
   const reborn = m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', [])], archivedSessionIds: [], pinnedSessionIds: [] } })
   assert.deepEqual(reborn, [
-    { type: 'order', workspaceIds: ['ws-local'] },
+    { type: 'upsert', workspace: { ...remoteWorkspace('w-1', '远端一', []), workspaceId: 'zr~ffffffff~w-1', title: '新服务器 · 远端一', sessionIds: [] } },
+    { type: 'order', workspaceIds: ['ws-local', 'zr~ffffffff~w-1'] },
     { type: 'archived', archivedSessionIds: [] },
     { type: 'pinned', pinnedSessionIds: [] },
   ])
 })
 
-test('T56: a server rename and a status annotation re-upsert only the shown groups', () => {
+test('T56: a server rename and a status annotation re-upsert all shown groups', () => {
   const m = merger()
   m.onLocal(LOCAL_BASELINE)
   m.onRemote(T56_BASELINE)
   m.retarget({ serverId: SID, serverName: '改名的服务器' })
   assert.deepEqual(m.onServerRenamed(), [
-    { type: 'upsert', workspace: { ...W1, workspaceId: V('w-1'), title: `改名的服务器 · 远端一`, sessionIds: [V('s1'), V('s2')] } },
+    { type: 'upsert', workspace: { ...W1, workspaceId: V('w-1'), title: '改名的服务器 · 远端一', sessionIds: [V('s1'), V('s2')] } },
+    { type: 'upsert', workspace: { ...EMPTY_WS, workspaceId: V('w-empty'), title: '改名的服务器 · 空组', sessionIds: [] } },
   ])
   m.setStatus('offline')
   assert.deepEqual(m.onStatusChanged(), [
-    { type: 'upsert', workspace: { ...W1, workspaceId: V('w-1'), title: `改名的服务器 · 远端一（离线）`, sessionIds: [V('s1'), V('s2')] } },
+    { type: 'upsert', workspace: { ...W1, workspaceId: V('w-1'), title: '改名的服务器 · 远端一（离线）', sessionIds: [V('s1'), V('s2')] } },
+    { type: 'upsert', workspace: { ...EMPTY_WS, workspaceId: V('w-empty'), title: '改名的服务器 · 空组（离线）', sessionIds: [] } },
   ])
 })
 
@@ -1299,24 +1319,27 @@ test('T56: an explicit server remove of a never-shown workspace is silent — th
   const m = merger()
   const ui = createUiModel()
   m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
+  m.setStatus('unpaired')
   m.onRemote({ type: 'baseline', value: { items: [EMPTY_WS], archivedSessionIds: [], pinnedSessionIds: [] } }).forEach(ui.apply)
   assert.deepEqual(m.onRemote({ type: 'remove', workspaceId: 'w-empty' }), [], 'nothing the UI knows — silence')
   assert.equal(ui.ids(), 'ws-local')
-  // a later re-share of the same workspace id shows up normally (a remove
+  // restoring pairing and re-adding the same workspace id shows up normally (a remove
   // would have blacklisted the id in the model forever)
+  m.setStatus('none')
   m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-empty', '空组', ['s9']) }).forEach(ui.apply)
   assert.equal(ui.ids(), `ws-local,${V('w-empty')}`)
 })
 
-test('T56 RT UI model: an empty server workspace never renders; its first live session brings the group in', () => {
+test('T56 RT UI model: an empty server workspace renders immediately when connected and keeps its slot on first live session', () => {
   const m = merger()
   const ui = createUiModel()
   m.onLocal(LOCAL_BASELINE).forEach(ui.apply)
   m.onRemote(T56_BASELINE).forEach(ui.apply)
-  assert.equal(ui.ids(), `ws-local,${V('w-1')}`, 'the empty group never reached the UI')
+  assert.equal(ui.ids(), `ws-local,${V('w-1')},${V('w-empty')}`, 'the empty group renders immediately on connected baseline')
+  assert.deepEqual(ui.model.items.find((item) => item.workspaceId === V('w-empty')).sessionIds, [])
 
   m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-empty', '空组', ['s9']) }).forEach(ui.apply)
-  assert.equal(ui.ids(), `ws-local,${V('w-1')},${V('w-empty')}`, 'the first live session reveals the group at its position')
+  assert.equal(ui.ids(), `ws-local,${V('w-1')},${V('w-empty')}`, 'live session updates the workspace in place')
   const group = ui.model.items.find((item) => item.workspaceId === V('w-empty'))
   assert.deepEqual(group.sessionIds, [V('s9')])
 })
@@ -1553,27 +1576,30 @@ test('T58-fix: a local archived frame and a local baseline merge instead of pass
   assert.ok(ui.model.archivedSessionIds.includes(V('s3')))
 })
 
-test('T65: a group whose only session is hidden is not first-shown; revealing the session updates only the archived set', () => {
+test('T65: a group whose only session is hidden still forwards with its tombstone; revealing the session updates only the archived set', () => {
   const { m, advance } = clockedMerger()
   // everything remote lands BEFORE the local baseline: w-1 arrives, closes,
-  // and hides while still cached — the UI never sees the group
+  // and hides while still cached — w-1 forwards with the tombstone kept intact
   m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', ['s1'])], archivedSessionIds: [], pinnedSessionIds: [] } })
   m.setCurrentSession('session-l2') // readable while still pre-baseline
   m.onRemote({ type: 'upsert', workspace: remoteWorkspace('w-1', '远端一', []) }) // s1 closed while cached
   advance(2_001) // the cached close's grace passes before the page's first frame
-  // the flush hides s1 and never shows w-1: its only member is hidden, and
-  // the host draws a bare group heading even when every member is
-  // archived-invisible — so the first-show gate counts visible content only
+  const expectedW1 = {
+    ...remoteWorkspace('w-1', '远端一', ['s1']),
+    workspaceId: V('w-1'),
+    title: `${NAME} · 远端一`,
+    sessionIds: [V('s1')],
+  }
   const flushed = m.onLocal(LOCAL_BASELINE)
   assert.deepEqual(flushed, [
-    { type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: [V('s1')], pinnedSessionIds: [] } },
+    { type: 'baseline', value: { items: [LOCAL_WS, expectedW1], archivedSessionIds: [V('s1')], pinnedSessionIds: [] } },
+    { type: 'upsert', workspace: expectedW1 },
   ])
   assert.equal(m.hasPendingHide, false)
 
   // the user opens s1 (restoreSelection): the reveal updates ONLY the
   // archived set — no group upsert, no order frame. The group membership
-  // never changed (the tombstone rode the record all along); w-1 stays
-  // unshown until a real frame of its own.
+  // never changed (the tombstone rode the record all along).
   const out = m.setCurrentSession(V('s1'))
   assert.deepEqual(out, [{ type: 'archived', archivedSessionIds: [] }])
   assert.equal(m.hasPendingHide, true, 'kept because CURRENT — the poll watches for the next navigate-away')
@@ -1758,13 +1784,65 @@ test('MS-3 parts(): exposes the locally observed lists and this server\'s virtua
   assert.deepEqual(m.parts().remote.orderIds, [V('w-1'), V('w-2')])
 })
 
-test('MS-3 parts(): a local-only frame never marks this server shown and keeps remote workspaces empty until carried', () => {
+test('MS-3 parts(): a local-only frame keeps remote workspaces empty until carried; connected empty workspaces forward while unpaired stay withheld', () => {
   const m = merger()
   m.onLocal({ type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: ['session-l1'], pinnedSessionIds: ['session-l1'] } })
+  assert.deepEqual(m.parts().remote.orderIds, [], 'before any remote frame arrives, remote orderIds stay empty')
+  assert.deepEqual(m.parts().remote.workspaces, [], 'before any remote frame arrives, remote workspaces stay empty')
+
   m.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', [])], archivedSessionIds: [], pinnedSessionIds: [] } })
-  // T56: an empty group is held back — the parts must reflect that.
-  assert.deepEqual(m.parts().remote.orderIds, [], 'a never-shown workspace has no order position')
-  assert.deepEqual(m.parts().remote.workspaces, [], 'a never-shown workspace is not forwarded')
+  assert.equal(m.parts().remote.orderIds.length, 1, 'connected empty workspace gets its order position')
+  assert.equal(m.parts().remote.workspaces.length, 1, 'connected empty workspace is forwarded')
+  assert.deepEqual(m.parts().remote.workspaces[0].sessionIds, [])
+
+  const unpaired = merger()
+  unpaired.onLocal({ type: 'baseline', value: { items: [LOCAL_WS], archivedSessionIds: [], pinnedSessionIds: [] } })
+  unpaired.setStatus('unpaired')
+  unpaired.onRemote({ type: 'baseline', value: { items: [remoteWorkspace('w-1', '远端一', [])], archivedSessionIds: [], pinnedSessionIds: [] } })
+  assert.deepEqual(unpaired.parts().remote.orderIds, [], 'an unpaired server never-shown workspace has no order position')
+  assert.deepEqual(unpaired.parts().remote.workspaces, [], 'an unpaired server never-shown workspace is withheld')
+})
+
+test('virtualizeModelSelectionValue & mergeSessionList: remoteDefault seeds only 0-event blank sessions (asOfSeq === -1 or blank: true)', () => {
+  const { virtualizeModelSelectionValue, mergeSessionList } = require('../lib/merge-streams.js')
+  const { toVirtual } = require('../lib/virtual-id.js')
+  const SID = 'a1b2c3d4'
+  const remoteDefault = { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' }
+  const expectedNext = { provider: toVirtual(SID, 'deepseek'), model: 'deepseek-chat', reasoningEffort: 'high' }
+
+  // Direct virtualizeModelSelectionValue with unselectedDefault
+  assert.deepEqual(
+    virtualizeModelSelectionValue({ lastUsed: null, next: null }, SID, remoteDefault),
+    { lastUsed: null, next: expectedNext },
+  )
+  // Does not clobber non-null next or non-null lastUsed
+  assert.deepEqual(
+    virtualizeModelSelectionValue({ lastUsed: null, next: { provider: 'codex', model: 'sol' } }, SID, remoteDefault),
+    { lastUsed: null, next: { provider: toVirtual(SID, 'codex'), model: 'sol' } },
+  )
+  assert.deepEqual(
+    virtualizeModelSelectionValue({ lastUsed: { provider: 'codex', model: 'sol' }, next: null }, SID, remoteDefault),
+    { lastUsed: { provider: toVirtual(SID, 'codex'), model: 'sol' }, next: null },
+  )
+
+  // mergeSessionList gates unselectedDefault strictly by asOfSeq === -1 (or legacy blank: true without projections)
+  const merged = mergeSessionList(
+    { items: [] },
+    {
+      items: [
+        { sessionId: 's-seq-blank', updatedAt: 4, projections: { asOfSeq: -1, values: { modelSelection: { lastUsed: null, next: null } } } },
+        { sessionId: 's-settled', updatedAt: 3, projections: { asOfSeq: 5, values: { modelSelection: { lastUsed: null, next: null } } } },
+        { sessionId: 's-legacy-blank', updatedAt: 2, blank: true, projectionValues: { modelSelection: { lastUsed: null, next: null } } },
+        { sessionId: 's-legacy-nonblank', updatedAt: 1, blank: false, projectionValues: { modelSelection: { lastUsed: null, next: null } } },
+      ],
+    },
+    SID,
+    remoteDefault,
+  )
+  assert.deepEqual(merged.items[0].projections.values.modelSelection, { lastUsed: null, next: expectedNext })
+  assert.deepEqual(merged.items[1].projections.values.modelSelection, { lastUsed: null, next: null })
+  assert.deepEqual(merged.items[2].projectionValues.modelSelection, { lastUsed: null, next: expectedNext })
+  assert.deepEqual(merged.items[3].projectionValues.modelSelection, { lastUsed: null, next: null })
 })
 
 test('MS-3 localWorkspaceLists(): reads the cumulative local lists one workspace/follow frame observes', () => {
