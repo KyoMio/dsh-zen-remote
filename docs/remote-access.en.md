@@ -428,11 +428,11 @@ Role resolution discipline: `resolveRole` accepts only the exact strings `client
 ### The invite link
 
 ```
-zr-net://<host>[:port]/<networkId>[#<joinKey>]
+zr-net://<host>[:port]/<networkId>[?tls=0|1][#<joinKey>]
 ```
 
-- `zr-nets://…` forces TLS (wss / https); `zr-net+insecure://…` explicitly uses HTTP/WS for a self-hosted gateway without a TLS reverse proxy; plain `zr-net://` infers from the hostname — loopback / private IPv4 / ULA / `.localhost` go plaintext, everything else TLS.
-- The gateway does not configure certificates itself, and direct HTTP/WS remains supported. For HTTPS/WSS, the reverse proxy supplies the certificate; nodes verify its trust chain and hostname and never silently fall back to plaintext. HTTP/WS lacks TLS authentication of the gateway control plane; session content still has separate end-to-end encryption and local TOFU.
+- All newly generated invite links use the unified `zr-net://` scheme and infer transport from the host by default (loopback / private IPv4 / link-local / IPv6 ULA / CGNAT `100.64.0.0/10` / `localhost` / `.local` / `.lan` default to plaintext; other public hosts default to TLS), attaching `?tls=0` or `?tls=1` only when overriding the host default. Legacy `zr-nets://…` and `zr-net+insecure://…` links remain readable for backward compatibility.
+- Self-hosted `gateway-server` natively supports **single-port (`19393/tcp`) TLS** alongside direct HTTP/WS and optional Nginx/Caddy reverse proxies: mount `/certs` (`ZR_GATEWAY_CERT_DIR`) or upload/select certificates in **Gateway admin → Gateway & mail settings → TLS & Certificates** to enable HTTPS/WSS without splitting `19393/tcp` or the `19393/udp` + `19394/udp` STUN ports. TLS mode strictly verifies the trust chain and hostname and never silently falls back to plaintext; HTTP/WS lacks TLS authentication of the gateway control plane, while session content still has separate end-to-end encryption and local TOFU.
 - `#<joinKey>` is a **first-join credential only**: the join challenge-response handshake binds the identity with it once, and it never travels as a plaintext URL path afterwards.
 - Links are generated in the gateway's web console; the parser lives in `parseInviteUri` in `src/peer/crypto.ts`.
 - CLI joining: `npx dsh-zen-remote setup --role peer --invite "zr-net://…"`, or `dsh-zen-remote peer join <uri>`; `peer status` shows this machine's nodeId, admission state, and the network's peers with their live connection paths; `peer trust <nodeId>` explicitly re-trusts a changed identity after a mismatch block; `peer leave` leaves the network.
@@ -467,7 +467,7 @@ Unknown latency appears as `—`; only a measured zero appears as `0 ms`. An ide
 
 ### Transport upgrades and resource limits
 
-- Both direct HTTP/WS and reverse-proxied HTTPS/WSS remain supported. TLS verifies certificates and never silently falls back to plaintext.
+- Direct HTTP/WS, built-in single-port (`19393/tcp`) native TLS, and reverse-proxied HTTPS/WSS all remain supported. TLS verifies certificates and never silently falls back to plaintext.
 - Updated nodes retain the existing binary frame types and work through existing relay gateways. Ordinary requests and large responses interoperate with older nodes; upgrade both nodes for cancellation acknowledgements, state reclamation and receive flow control on both sides.
 - Cancellation is acknowledged and retried for a bounded period. Older nodes do not acknowledge cancellation, so mixed versions cannot guarantee remote subscription cleanup after packet loss. Retries of a completed legacy stream after the final-ack cache expires (60 seconds by default) may receive a reset instead of a final acknowledgement; the request is never re-executed.
 - Budgets limit queued/in-flight bytes, not total file size. Large responses and uploads use a segmented pipeline. Progressing long transfers and quiet live sessions without outstanding data are not closed based on total duration; outstanding data that makes no progress for the transport deadline (30 seconds by default) fails explicitly and releases resources.

@@ -15,7 +15,8 @@ RUN pnpm build
 
 FROM node:22-alpine AS runner
 ENV NODE_ENV=production \
-    ZR_GATEWAY_DATA_DIR=/data
+    ZR_GATEWAY_DATA_DIR=/data \
+    ZR_GATEWAY_CERT_DIR=/certs
 WORKDIR /app
 RUN addgroup -S zr && adduser -S -G zr zr
 COPY --from=builder /app/package.json /app/pnpm-lock.yaml ./
@@ -23,10 +24,10 @@ RUN corepack enable && corepack prepare pnpm@11 --activate \
     && pnpm install --prod --no-frozen-lockfile \
     && corepack disable
 COPY --from=builder /app/dist ./dist
-# /data 卷的属主必须在切到非 root 之前建好：匿名卷首挂时会原样拷贝这一层
-# 的属主信息，否则 USER zr 写不了 master.key / gateway.sqlite（Linux 上必现）
-RUN mkdir -p /data && chown -R zr:zr /data
-VOLUME /data
+# /data 与 /certs 卷的属主必须在切到非 root 之前建好：匿名卷首挂时会原样拷贝这一层
+# 的属主信息，否则 USER zr 写不了 master.key / gateway.sqlite / 上传证书（Linux 上必现）
+RUN mkdir -p /data /certs && chown -R zr:zr /data /certs
+VOLUME ["/data", "/certs"]
 EXPOSE 19393/tcp 19393/udp 19394/udp
 USER zr
 CMD ["node", "--experimental-sqlite", "dist/main.js"]

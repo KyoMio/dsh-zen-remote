@@ -116,3 +116,39 @@ describe('UI/UX 静态守卫（PG-6c）', () => {
     }
   });
 });
+
+describe('GT-6：容器 /certs 挂载、零新增依赖与发布隔离守卫', () => {
+  test('Dockerfile 配置 ZR_GATEWAY_CERT_DIR=/certs、USER zr 之前赋权 /certs、声明卷且仅暴露单端口 + 双 UDP', () => {
+    const dockerfile = read('Dockerfile');
+    const userIndex = dockerfile.search(/^USER zr$/m);
+    assert.notEqual(userIndex, -1, 'Dockerfile 必须包含 USER zr');
+
+    assert.match(dockerfile, /\bZR_GATEWAY_CERT_DIR=\/certs\b/, '必须设置 ENV ZR_GATEWAY_CERT_DIR=/certs');
+    const mkdirCertIndex = dockerfile.indexOf('mkdir -p /data /certs');
+    const chownCertIndex = dockerfile.indexOf('chown -R zr:zr /data /certs');
+    assert.notEqual(mkdirCertIndex, -1, '必须建好 /data 与 /certs 目录');
+    assert.notEqual(chownCertIndex, -1, '必须给 /data 与 /certs 设置 zr:zr 属主');
+    assert.ok(mkdirCertIndex < userIndex && chownCertIndex < userIndex, '/certs 建目录与 chown 必须在 USER zr 之前');
+
+    assert.match(dockerfile, /^VOLUME\s+.*\/certs/m, 'Dockerfile VOLUME 必须声明 /certs');
+    assert.match(
+      dockerfile,
+      /^EXPOSE\s+19393\/tcp\s+19393\/udp\s+19394\/udp\s*$/m,
+      'Dockerfile EXPOSE 必须严格保持单 TCP 端口与双 UDP 端口',
+    );
+  });
+
+  test('gateway-server 保持私有子包与零新增运行时依赖，不污染主仓 npm 发布白名单', () => {
+    const gwPkg = JSON.parse(read('package.json'));
+    assert.equal(gwPkg.private, true);
+    assert.deepEqual(Object.keys(gwPkg.dependencies ?? {}).sort(), ['pg', 'react', 'react-dom', 'ws']);
+
+    const rootPkg = JSON.parse(fs.readFileSync(path.join(pkgDir, '..', 'package.json'), 'utf8'));
+    assert.ok(Array.isArray(rootPkg.files), '主包 package.json 必须保留 files 白名单');
+    assert.equal(
+      rootPkg.files.some((entry) => entry.includes('gateway-server')),
+      false,
+      '主包发布白名单不得引入 gateway-server',
+    );
+  });
+});
