@@ -1,19 +1,19 @@
-# Zen Remote 自建中继网关（gateway-server）
+# Zen Remote Self-Hosted Relay Gateway (`gateway-server`)
 
-> [English](README.en.md)
+> [中文文档](README.zh-CN.md)
 
-`dsh-zen-remote` 插件的**独立自建网关**：一台自托管的虚拟网络中继服务 + Web 管理控制台。只在你要为自己的多台电脑（或一个团队）搭一条自建组网通道时才需要部署它；只用插件本体的手机扫码 / 桌面配对功能不需要这个服务。
+The **standalone self-hosted gateway** for the `dsh-zen-remote` plugin: a self-hosted virtual-network relay server + Web management console. Deploy this only when you want to link multiple computers (or a team) into a self-hosted peer mesh; the plugin's built-in phone QR pairing and desktop-client host pairing work without this service.
 
-它做四件事：
+It performs four core jobs:
 
-- **虚拟网络管理**：Web 控制台里创建虚拟网络、生成 `zr-net://` 邀请链接、管理成员；每个网络有独立的成员上限（默认 8，可配 2–64），并支持在控制台或环境变量中设置默认成员上限与中转限速。
-- **五态成员准入**：每个成员处于 `待审批` / `已授权` / `已暂停` / `身份变更` / `已吊销` 五种状态之一；新设备入网支持口令邀请、人工审批或两者组合，控制台实时显示在线状态与每对设备间的连接路径（局域网直连 / 打洞直连 / 网关中转）。
-- **打洞协调**：双 UDP 端口（主口 + 辅口）做 STUN 式探测与 NAT 打洞协调，帮网内设备尽量建立直连；直连打不通的流量才落到网关中转。
-- **零知识密文中转**：网关只看到密文帧的路由头（28 字节），会话内容是节点之间端到端加密的（临时 X25519 + AES-256-GCM），**网关不持有任何会话密钥，看不到任何会话内容**——管理员在控制台里看到的是成员与连接状态，不是数据本身。
+- **Virtual network management**: create virtual networks in the Web console, generate `zr-net://` invite links, and manage devices; each network carries an independent peer limit (default `8`, configurable `2–64`), with defaults and relay rate limits configurable via console or environment variables.
+- **Five-state member admission**: every member sits in `pending`, `authorized`, `paused`, `mismatch`, or `revoked`; new machines join by invite passphrase, manual approval, or both, while the console displays live online states and per-pair connection paths (`LAN direct` / `P2P direct` / `Gateway relay`).
+- **NAT hole-punch coordination**: dual UDP ports (primary + secondary) perform STUN-style reflection and NAT hole-punch coordination so peers establish direct connections whenever possible; only unpunchable traffic falls back to the relay.
+- **Zero-knowledge ciphertext relay**: the gateway only sees the 28-byte cleartext routing header on relayed frames; session payloads are end-to-end encrypted between peers (ephemeral X25519 + AES-256-GCM), so **the gateway holds no session keys and cannot read any session content**.
 
 ---
 
-## 快速部署（Docker，推荐）
+## Quick Deploy (Docker, Recommended)
 
 ```sh
 docker build -t zr-gateway ./gateway-server
@@ -29,15 +29,14 @@ docker run -d --name zr-gateway \
   zr-gateway
 ```
 
-- `-e ZR_GATEWAY_PUBLIC_URL`：按实际对外访问地址填写（走外部 HTTPS 反代 443 时填 `https://zr.example.com`；走网关自带 19393 原生 TLS 时填 `https://zr.example.com:19393`；若先局域网测试或打算之后在控制台热修改，也可省略此变量）。
-
-- 端口：`19393/tcp`（Web 控制台 + WebSocket，可直接内置 HTTPS/WSS）、`19393/udp`（STUN 主口）、`19394/udp`（STUN 辅口）。**TCP 与 UDP 分别映射**。主 UDP 口用于反射地址发现，辅口用于补充 NAT 分类；缺辅口时分类可能为未知，仍会尝试直连并以中转兜底。节点读取网关欢迎消息中的实际绑定探测端口，改端口时需同时调整配置、映射与防火墙；TCP 反代不代替 UDP 转发。
-- 数据卷与证书目录：镜像以非 root 用户（`zr`，`uid=100:gid=101`）运行，数据目录固定为 `/data`，证书目录固定为 `/certs`。推荐使用命名卷 `-v zr-gateway-data:/data`（Docker 首挂自动继承镜像内 `zr:zr` 属主）；若在 Linux 宿主机改用目录挂载（`-v $(pwd)/data:/data`），请先执行 `mkdir -p ./data && sudo chown 100:101 ./data`。升级镜像时保留该卷或目录即可，SQLite 库与自动生成的 `master.key`（权限 `0600`）都在里面。
-- **证书挂载权限说明（`-v $(pwd)/certs:/certs`）**：
-  - 若需要通过管理面板「上传 / 粘贴 PEM 证书」或在线保存写入 `fullchain.pem` / `privkey.pem`，宿主机证书目录同样需让容器用户可写：`mkdir -p ./certs && sudo chown 100:101 ./certs`；
-  - 若由宿主机上的 `acme.sh` / `certbot` 等工具自动续期证书，也可以 `:ro` 只读挂载（`-v /path/to/live/domain:/certs:ro`），在管理面板下拉选中已有文件并开启 TLS；宿主机续期覆盖文件后网关会自动检测并热重载；
-  - 首次空目录启动默认按明文 HTTP 启动；若首次空库启动时 `/certs` 内已经放好成对有效的 `fullchain.pem` + `privkey.pem`，网关会自动开启原生 TLS。
-- **首次启动看日志拿管理员密码**：
+- `-e ZR_GATEWAY_PUBLIC_URL`: set this to the external URL peers and browsers will use to reach the gateway (for an external HTTPS reverse proxy on port `443`, use `https://zr.example.com`; for built-in single-port native TLS on `19393`, use `https://zr.example.com:19393`; you can also omit it for local LAN testing or hot-configure it later in the Web console).
+- **Ports**: `19393/tcp` (Web console + WebSocket, supports built-in HTTPS/WSS), `19393/udp` (primary STUN port), and `19394/udp` (secondary STUN port). **Map TCP and UDP separately.** The primary UDP port handles reflexive address discovery; the secondary UDP port refines NAT classification (without the secondary port, classification falls back to unknown while direct hole-punching and relay fallback still work). Peers discover the advertised probe ports from the gateway's welcome message — keep config, port mappings, and firewall rules aligned when changing ports; TCP reverse proxies do not forward UDP.
+- **Data volume & certificate directory**: the container runs as non-root (`zr`, `uid=100:gid=101`) with `/data` and `/certs`. A named volume (`-v zr-gateway-data:/data`) is recommended (Docker initializes volume ownership automatically). When bind-mounting a host directory on Linux (`-v $(pwd)/data:/data`), run `mkdir -p ./data && sudo chown 100:101 ./data` first. Preserve `/data` across upgrades: it holds both the SQLite database and the auto-generated `master.key` (`0600`).
+- **Certificate mount permissions (`-v $(pwd)/certs:/certs`)**:
+  - To upload or paste PEM certificates in the Web console and save `fullchain.pem` / `privkey.pem`, make `./certs` writable by `100:101` (`mkdir -p ./certs && sudo chown 100:101 ./certs`).
+  - If certificates are managed externally on the host (e.g. `acme.sh` / `certbot`), a read-only mount (`-v /path/to/live/domain:/certs:ro`) works as well: select the certificate files in the console and enable TLS, and the gateway will hot-reload automatically whenever renewed files overwrite disk copies.
+  - On first boot against an empty directory, the gateway starts in plain HTTP unless a valid `fullchain.pem` + `privkey.pem` pair already exists in `/certs`, in which case native TLS activates automatically.
+- **Retrieve the initial admin password from container logs**:
 
   ```sh
   docker logs zr-gateway
@@ -45,14 +44,14 @@ docker run -d --name zr-gateway \
   #   console  http://127.0.0.1:19393/
   #   udp      19393/udp + 19394/udp
   #   admin    admin@local
-  #   initial password (shown once, change it after login): <16 位随机密码>
+  #   initial password (shown once, change it after login): <16-char password>
   ```
 
-  初始密码**只打印这一次**，登录后请立即在控制台里改掉。想自己指定，见下方 `ZR_GATEWAY_ADMIN_PASSWORD`。
+  The initial password is **printed once** — change it inside the console right after signing in (or pre-set `ZR_GATEWAY_ADMIN_PASSWORD`).
 
-## 源码构建启动（Node.js 22.5+）
+## Source Build (Node.js 22.5+)
 
-不用 Docker 时，在本目录（`gateway-server/`）里：
+Without Docker, inside `gateway-server/`:
 
 ```sh
 pnpm install
@@ -60,140 +59,127 @@ pnpm build
 node --experimental-sqlite dist/main.js
 ```
 
-- 需要 Node.js **22.5 或更高**（内置 `node:sqlite` 模块）；较早的 Node 22 版本需要 `--experimental-sqlite`，较新的 Node 22 可直接运行。
-- 控制台前端已随 `pnpm build` 一并编译进 `dist/public`，由网关进程自己托管，不需要额外的静态服务器。
-- 若配置了 `ZR_GATEWAY_DATABASE_URL` 走 PostgreSQL，`--experimental-sqlite` 标志留着也无害。
+- Requires Node.js **22.5+** (uses built-in `node:sqlite`; older Node 22 releases require `--experimental-sqlite`).
+- `pnpm build` compiles the console frontend into `dist/public`, served directly by the gateway process with no external web server required.
+- Keeping `--experimental-sqlite` when passing `ZR_GATEWAY_DATABASE_URL` for PostgreSQL is harmless.
 
 ---
 
-## 环境变量
+## Environment Variables
 
-全部可选；不设就用默认值。配置错了（比如整数越界）网关会**启动期直接报错退出**，不会带病运行。
+All optional; defaults apply when omitted. Invalid configuration values fail fast on startup rather than running degraded.
 
-| 环境变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `ZR_GATEWAY_PORT` | `19393` | 主端口（1–65535）：TCP 承载 Web 控制台与 `/peer/v1/ws` WebSocket，同端口号的 UDP 承载 STUN 主口 |
-| `ZR_GATEWAY_UDP_ALT_PORT` | 主端口 + 1（即 `19394`） | 辅助 UDP 口（1–65535）：用于对端 NAT 类型探测；设 `0` 关闭（关闭后打洞成功率下降，不推荐） |
-| `ZR_GATEWAY_PUBLIC_URL` | （空） | 反向代理后的对外 URL（不带末尾斜杠，如 `https://zr.example.com`）；设置后邀请链接用这个域名拼接。不设则用本机地址 |
-| `ZR_GATEWAY_DATA_DIR` | `./data` | 数据目录：SQLite 库与 `0600` 权限的 `master.key`。Docker 镜像里固定为 `/data` |
-| `ZR_GATEWAY_CERT_DIR` | `./certs`（Docker 内固定为 `/certs`） | TLS 证书目录：存放 `fullchain.pem` / `privkey.pem` 或其他可选证书文件，管理面板上传与宿主机续期共用 |
-| `ZR_GATEWAY_DATABASE_URL` | （空） | PostgreSQL 连接串；未设则使用内置 SQLite（WAL 模式）。小规模部署用默认 SQLite 即可 |
-| `ZR_GATEWAY_ADMIN_USER` | `admin@local` | 初始管理员登录名 |
-| `ZR_GATEWAY_ADMIN_PASSWORD` | （空） | 初始管理员密码；未设则首次初始化随机生成 16 位并打印到启动日志（只显示一次）。仅在**空库首次启动**时生效，已有库不受影响 |
-| `ZR_GATEWAY_ALLOW_SIGNUP` | `false` | 设 `true` 或 `1` 开放自助注册；之后也可以在 Web 控制台里随时开关 |
-| `ZR_GATEWAY_MAX_PEERS` | `8`（范围 2–64） | **新建**虚拟网络的默认成员上限（建网时可在控制台单独调整） |
-| `ZR_GATEWAY_MAX_NETWORKS_PER_USER` | `3`（范围 1–50） | 普通账号可创建的虚拟网络数上限 |
-| `ZR_GATEWAY_RELAY_RATE_KBPS` | `4096`（范围 64–1048576） | 单成员的中转限速（KB/s），只限制经网关中转的流量，直连流量不经过网关 |
+| `ZR_GATEWAY_PORT` | `19393` | Primary port (`1–65535`): TCP serves the Web console & `/peer/v1/ws` WebSocket; UDP on the same port is the primary STUN socket |
+| `ZR_GATEWAY_UDP_ALT_PORT` | primary + 1 (`19394`) | Secondary UDP port (`1–65535`) for NAT classification; set `0` to disable (lowers direct hole-punch success rate, not recommended) |
+| `ZR_GATEWAY_PUBLIC_URL` | *(empty)* | External public URL without a trailing slash (e.g. `https://zr.example.com` or `https://zr.example.com:19393`), used to build `zr-net://` invite links |
+| `ZR_GATEWAY_DATA_DIR` | `./data` (`/data` in Docker) | Data directory storing SQLite DB and `0600` `master.key` |
+| `ZR_GATEWAY_CERT_DIR` | `./certs` (`/certs` in Docker) | TLS certificate directory (`fullchain.pem` / `privkey.pem` or other selectable PEM files) |
+| `ZR_GATEWAY_DATABASE_URL` | *(empty)* | PostgreSQL connection string; omit to use built-in SQLite (WAL mode) |
+| `ZR_GATEWAY_ADMIN_USER` | `admin@local` | Initial administrator login email / username |
+| `ZR_GATEWAY_ADMIN_PASSWORD` | *(empty)* | Initial admin password; omit on first empty-DB boot to generate a random 16-char password once in startup logs |
+| `ZR_GATEWAY_ALLOW_SIGNUP` | `false` | Set `true` or `1` to enable self-service signup (also toggleable live in the console) |
+| `ZR_GATEWAY_MAX_PEERS` | `8` (`2–64`) | Default max members per **newly created** virtual network |
+| `ZR_GATEWAY_MAX_NETWORKS_PER_USER` | `3` (`1–50`) | Initial max virtual networks per standard account |
+| `ZR_GATEWAY_RELAY_RATE_KBPS` | `4096` (`64–1048576`) | Per-member relay rate cap (KB/s, `1024 B/s`); direct peer traffic does not traverse the gateway |
 
 ---
 
-## 初始配置、容量与遥测
+## Initial Configuration, Capacity & Telemetry
 
-注册开关、每账号网络数、新网络默认席位与中转限速的环境值只在数据库缺少对应设置键时写入。控制台已经保存的值优先；改环境变量并重启不会覆盖它们，运行时调整请使用控制台。SQLite 与 PostgreSQL 使用同一规则。
+Environment defaults for signup, max networks per user, default max peers, and relay rate only populate database settings when those keys do not yet exist. Values saved in the Web console take precedence across restarts (`SQLite` and `PostgreSQL` behave identically).
 
-网络 `maxPeers` 包含本机。节点默认最多挂载 `maxPeers - 1` 个远端，本机显式 `maxServers` 还能进一步限制挂载。已授权、暂停、身份异常成员占席位；待审批、已吊销不占。缩容不踢已有挂载，但限制新加入或新增挂载；扩容后补位。修改“新网络默认席位”不批量改动已有网络。
+Network `maxPeers` counts the local machine itself: a peer mounts up to `maxPeers - 1` remote devices by default, further bounded by any local `maxServers` cap. Authorized, paused, and identity-blocked (`mismatch`) members occupy seats; pending and revoked entries do not. Lowering `maxPeers` keeps existing mounts intact while blocking new seats; changing the default max peers applies only to newly created networks.
 
-每个网络还有一个「**直连延迟上限**」（`peerDirectMaxRttMs`，控制台网络详情里编辑，0–10000 毫秒整数，默认 300，0 = 不限制）：节点实测的直连 RTT 持续超过它就走网关中转，低延迟样本连中两次再升回直连。该值由网关随入网欢迎与网络更新广播实时下发，改完即刻生效，无需节点重新入网；节点端没有各自的本地设置，全网始终用同一个值。
+Each network also defines a **Direct Max RTT** (`peerDirectMaxRttMs`, editable per network in the console; integer `0–10000` ms, default `300`, `0` = unlimited): when measured direct RTT stays above this threshold, traffic demotes to gateway ciphertext relay, and upgrades back only after two consecutive samples `≤ 0.7×` the cap. The gateway pushes this threshold in welcome payloads and live network updates so all peers apply the same rule without rejoining or maintaining separate local overrides.
 
-控制台将本地身份阻断显示为“已阻断”，未知延迟为 `—`，实测零延迟才是 `0 ms`。拓扑概览、设备列表与设备详情统一按**双向直连**判定连接态：仅当双方链路均报直连时才显示直连与延迟区间；单侧直连而对侧报中转或尚未上报时统一显示「经网关中转」（延迟 `—`），无中转连接时不再同时显示「正在中转」。速率以 5 秒窗口统计，`KB/s` 表示 1024 字节/秒；历史 API 字段中的 `Kbps` 后缀保留，但不表示千比特/秒。当前网络顶栏跟随 SSE；管理页可见时每 3 秒刷新在线数和速率，慢请求不重叠，隐藏或离开时取消轮询。其他未订阅网络不保证实时。
+The console displays locally rejected identities as *"Blocked"* (*已阻断*), unknown RTT as `—`, and measured sub-millisecond RTT as `0 ms`. Overview cards, device list rows, and device details apply **strict bilateral direct merging**: a pair counts as direct only when both sides report direct links; if one side reports relay or has not yet reported while the other reports direct, both display *"Relayed via gateway"* with `—` latency, and fully direct devices never show a simultaneous *"Relaying"* badge. Rates use 5-second sliding windows where `KB/s` = `1024 B/s` (legacy `Kbps` API field names are retained for compatibility and do not denote kilobits/s). The active network's header stays live over SSE; visible admin pages poll online counts and relay rates every 3 seconds without overlapping slow requests and cancel polling when hidden or closed.
 
-## 原生 TLS（推荐）与反向代理注意事项
+## Native TLS (Recommended) & Reverse Proxy Notes
 
-### 1. 内置单端口原生 TLS（无需反代，保留 `19393` 控制口与双 UDP 口）
+### 1. Built-In Single-Port Native TLS (No Proxy Needed, Keeps `19393` + Dual UDP Ports)
 
-`gateway-server` 内置单端口原生 TLS（同一 `19393/tcp` 端口自动复用明文 / TLS）：无需单独折腾 Nginx / Caddy 或拆改 `19393/udp` + `19394/udp` 探测端口，也不影响原有节点默认配置：
+`gateway-server` includes single-port native TLS on `19393/tcp` (auto-multiplexing plaintext HTTP and TLS on the same TCP port without needing an external Nginx/Caddy layer or changing `19393/udp` + `19394/udp`):
 
-1. **两种配证通道**：
-   - **挂载证书目录**：将包含 `fullchain.pem` 与 `privkey.pem`（或其他证书/私钥文件）的宿主机目录挂载到容器 `/certs`（或源码运行时放到 `ZR_GATEWAY_CERT_DIR`，默认 `./certs`）。首次空库启动时若默认配对文件有效，会自动开启 HTTPS/WSS；宿主机续期工具覆盖证书后，网关会自动防抖热重载。
-   - **控制台在线上传与开关**：登录 Web 控制台，在「**网关管理 → TLS 与证书**」直接选择本地证书文件或粘贴 PEM 文本保存到目录并开启（需容器对 `/certs` 拥有写权限），支持**在线热切换 HTTP / HTTPS**、下拉选用目录里已有文件与手动重载，全程免重启容器。
-2. **明文与加密分流规则**：开启 TLS 后，同一 `19393/tcp` 端口遇到浏览器明文 `http://` 访问会自动响应 `302 Found`（无永久缓存、无 HSTS，日后关停 TLS 不会锁死浏览器）引导跳到 `https://`；明文调用 `/api/*`、`/peer/*` 或明文 WebSocket 升级会明确返回 `426 TLS_REQUIRED`，绝不悄悄降级明文。
-3. **Fail-Closed 启动守卫**：已开启 TLS 后，若重启时发现激活证书缺失或损坏，网关会直接报错退出并打清晰日志（防公网网关退回明文裸奔；若仅证书时间过期，仍允许以 HTTPS 启动以便管理员登录控制台更换证书）。
+1. **Two ways to supply certificates**:
+   - **Mount a cert directory**: mount `fullchain.pem` and `privkey.pem` (or other PEM files) into `/certs` (`ZR_GATEWAY_CERT_DIR`). If both default files are valid on first empty boot, HTTPS/WSS enables automatically; overwriting renewed certificates triggers debounced hot reload.
+   - **Upload & toggle live in the console**: sign in → **Gateway Admin → TLS & Certificates**, upload/paste PEM certs into `/certs` (requires write access), switch active files from the dropdown, or **hot-toggle HTTP / HTTPS without restarting the container**.
+2. **Cleartext & encrypted routing**: when TLS is enabled, browser `http://` visits to `19393/tcp` receive `302 Found` redirects to `https://` (no HSTS / permanent cache, so disabling TLS later never locks browsers out), while cleartext calls to `/api/*`, `/peer/*`, or plain WebSocket upgrades are rejected with `426 TLS_REQUIRED`.
+3. **Fail-closed startup guard**: if TLS is enabled and the active certificate files are missing or corrupt on restart, the gateway exits with a clear error rather than silently downgrading to plaintext HTTP (expired certificates still permit HTTPS startup so an administrator can sign in and replace them).
 
-### 2. 外置反向代理（可选高级场景）与防火墙直通
+### 2. Optional External Reverse Proxy & UDP Firewall Pass-Through
 
-如果必须复用宿主机的 443 标准端口共享单一公网域名，也可以在网关前面继续套外置 Nginx / Caddy 反代并保持网关内置 TLS 关闭（`ZR_GATEWAY_PUBLIC_URL` 填外部 `https://…` 地址），注意以下要点：
+If you must share port `443` behind an external Nginx/Caddy proxy, keep built-in TLS off and set `ZR_GATEWAY_PUBLIC_URL` to the public `https://…` URL:
 
-1. **WebSocket 要放行升级**：节点端连网关走 `/peer/v1/ws`。Nginx 示例：
-
+1. **Allow WebSocket upgrades (`/peer/v1/ws`)**:
    ```nginx
    location /peer/v1/ws {
        proxy_pass http://127.0.0.1:19393;
        proxy_http_version 1.1;
        proxy_set_header Upgrade $http_upgrade;
        proxy_set_header Connection "upgrade";
-       proxy_read_timeout 3600s;   # 长连接，别让默认 60s 掐断
+       proxy_read_timeout 3600s;   # keep persistent WS alive past Nginx's 60s default
    }
    ```
-
-   Caddy 的 `reverse_proxy` 天然支持 WebSocket，无需额外配置。
-
-2. **SSE 别开缓冲**：控制台的实时拓扑走 `/api/v1/networks/<网络id>/events`（`text/event-stream`）。Nginx 对这条路径要 `proxy_buffering off;`，否则状态刷新会卡住不动。Caddy 默认不缓冲，无需处理。
-
-3. **UDP 防火墙直通**：无论是否启用原生 TLS 或外置反代，宿主机防火墙与云厂商安全组都必须放行 `19393/udp` 与 `19394/udp`，容器端口映射也要保留 UDP；TCP 反代不代替 UDP 探测转发。
-
-4. **设置对外地址**：配置域名或反代入口后，建议在控制台「网关热配置」或环境变量 `ZR_GATEWAY_PUBLIC_URL` 填入完整公网访问 URL，控制台会立即按该地址与 TLS 状态生成正确 `zr-net://` 邀请链接（如内置 TLS 为 `19393` 可填 `https://zr.example.com:19393`）。
+   Caddy's `reverse_proxy` handles WebSockets out of the box.
+2. **Disable proxy buffering on SSE**: live topology updates use `/api/v1/networks/<networkId>/events` (`text/event-stream`). In Nginx, add `proxy_buffering off;` on that location (Caddy streams SSE unbuffered by default).
+3. **Open UDP in the host firewall / cloud security group**: `19393/udp` and `19394/udp` must remain reachable directly (and mapped in Docker) regardless of whether TLS terminates on the gateway or an external proxy — TCP proxies cannot forward UDP STUN probes.
+4. **Set the public URL**: configure `ZR_GATEWAY_PUBLIC_URL` (or set it live under **Gateway Settings**) so generated `zr-net://` links carry the exact external origin and port.
 
 ---
 
-## 部署之后：三步建起一张网
+## Three Steps After Deployment
 
-1. **登录控制台**：浏览器打开 `http://<主机>:19393/`，用初始管理员账号登录（密码在首次启动日志里；登录后改掉）。
-2. **创建虚拟网络**：选好成员上限与准入方式（口令邀请 / 人工审批 / 两者组合），创建后生成一条 `zr-net://…` 邀请链接。
-3. **把邀请链接发给成员**：每台电脑在 `dsh-zen-remote` 插件的配置向导里选「节点端」并粘贴这条链接即可入网；开启人工审批的网络，新设备会出现在控制台的待审批列表里，点批准后自动上线。
+1. **Sign in to the console**: open `http://<host>:19393/` and log in with `admin@local` and the initial password printed in container logs (change it after logging in).
+2. **Create a virtual network**: choose the peer seat limit and admission policy (invite passphrase / manual approval / both) to obtain a `zr-net://…` invite link.
+3. **Share the link with your machines**: in each computer's `dsh-zen-remote` setup wizard, pick **Peer Node** and paste the link (for manual approval networks, approve pending machines from the network page).
 
-插件侧的入网步骤与数据如何加密传输，见主仓库 `README.zh-CN.md` 的「场景 C」与 `docs/remote-access.md` 的「节点端（peer）与虚拟网络组网」。
+For plugin-side setup and E2EE transport details, see **Scenario C** in [../README.md](../README.md) and [../docs/remote-access.en.md](../docs/remote-access.en.md).
 
 ---
 
-## 邀请链接格式（`zr-net://`）
+## Invite Link Format (`zr-net://`)
 
-控制台为每个网络生成的邀请链接统一只有 `zr-net://` 一种格式：
+The console issues a single canonical URI format:
 
 ```
-zr-net://<主机>[:<端口>]/<网络ID>[?tls=0|1][#<入网口令>]
+zr-net://<host>[:<port>]/<networkId>[?tls=0|1][#<joinKey>]
 ```
 
-- `<网络ID>` 固定 16 位小写十六进制。每个网络（含仅人工审批的）创建时都会生成一个入网口令，控制台复制的完整链接始终带 `#<入网口令>` 后缀。在口令邀请 / 两者组合的准入方式下，`#<入网口令>` 是首次入网的免审凭证；在仅人工审批方式下口令不参与准入判定，手工删去 `#...` 也能正常提交入网申请（控制台的分项复制区会提示「手动审批模式无需入网口令」）。
-- **省略端口时按 19393 处理**。站点走标准端口反代（HTTPS 443 / HTTP 80）时，控制台生成的链接会显式带上 `:443` / `:80`，避免被节点误回落到 19393；写了其他端口则原样保留。
-- `?tls=0|1` 只在传输方式与主机默认推断**不一致**时出现：回环、私网 IPv4（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`）、链路本地、IPv6 ULA、CGNAT/Tailscale（`100.64.0.0/10`）与 `.local` / `.lan` 域名默认走明文，其余公网地址默认走 TLS。因此公网裸 IP 跑明文会带 `?tls=0`（如 `zr-net://203.0.113.10:19393/<网络ID>?tls=0#<口令>`），私网 IP 挂了 TLS 反代则会带 `?tls=1`（如 `zr-net://192.168.1.10/<网络ID>?tls=1#<口令>`）。
-- 节点端仍兼容**读取**旧式 `zr-net+insecure://`（等价默认明文）与 `zr-nets://`（等价默认 TLS）前缀，但新链接一律输出 `zr-net://`；手写链接也请统一用 `zr-net://` 加 `?tls=0|1`，不要再输出这两种旧前缀。
-- **网关没有「关闭安全校验」的全局开关**：链接按主机推断为 TLS 时，节点只接受 `wss://` / `https://`，证书验证失败绝不自动降级明文。当前对外地址为明文 HTTP、或辅助 UDP 端口关闭时，「网关管理」页会显示一条**非阻断**的安全提示条提醒你处理（见下方「网关管理面板」）。
+- `<networkId>` is always 16 lowercase hex characters. Copying the full link includes `#<joinKey>`, while manual-approval networks also work without the `#<joinKey>` fragment.
+- **Omitting the port defaults to `19393`**. When behind standard ports (`https://` `443` or `http://` `80`), generated links explicitly include `:443` or `:80`.
+- `?tls=0|1` appears whenever transport differs from default host inference: loopback, RFC 1918 private IPv4 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local, IPv6 ULA, CGNAT/Tailscale (`100.64.0.0/10`), and `.local` / `.lan` default to cleartext (`?tls=1` if fronted by TLS); public hosts/domains default to TLS (`?tls=0` for cleartext public IP).
+- Peers still accept legacy `zr-net+insecure://` and `zr-nets://` links on input, while all generated links use `zr-net://`.
+- **No insecure-TLS bypass**: whenever a link resolves to TLS, peers require verified `wss://` / `https://` and never fall back silently. Non-blocking security banners appear in **Gateway Admin** if the public URL lacks HTTPS, the secondary UDP port is disabled, or TLS certificates are expiring/invalid.
 
-## 管理员账号与账号设置
+## Admin Account & Account Settings
 
-首次启动自动创建初始管理员（登录名默认 `admin@local`，可用 `ZR_GATEWAY_ADMIN_USER` 改），密码随机生成并只打印一次到启动日志（也可用 `ZR_GATEWAY_ADMIN_PASSWORD` 预先指定）。
+A default admin account (`admin@local` or `ZR_GATEWAY_ADMIN_USER`) is created automatically on first empty boot. Use **Account Settings…** in the top-right user menu to:
 
-登录后，右上角头像菜单里的「**账号设置…**」可以：
+- **Change password**: immediately revokes all other active sessions for your account while keeping your current browser signed in.
+- **Change email**: changes directly with your current password when SMTP is unconfigured, or via a 6-digit verification code sent to the new address once SMTP is configured.
 
-- **修改密码**：保存后其他已登录设备全部自动退出，当前浏览器保持登录；
-- **更换邮箱**：网关未配置发信服务（SMTP）时，输入当前密码即可直接换绑；已配置发信服务后，需要输入发到新邮箱的 6 位验证码确认。
+## Web Admin Console
 
-## 网关管理面板
+Admins access **Gateway Admin** from the top bar, organized into six functional tabs alongside a read-only runtime header and security banners:
 
-管理员登录后从顶栏进入「**网关管理**」，按功能划分为六个标签页（页头附只读运行态与安全提示条）：
+- **Users**: create accounts (with optional auto-generated 16-char password shown once), reset passwords (shown once and clears all old sessions), enable/disable/delete accounts, and manage group assignment & expiration.
+- **User Groups**: create/edit user groups and switch the default signup group (default and in-use groups cannot be deleted).
+- **Gateway Settings**: hot-edit the public URL (`publicUrl`, takes effect immediately on new invite links without restart; falls back to `ZR_GATEWAY_PUBLIC_URL`, then request headers), self-signup toggle, email verification toggle, default group, and session TTL (`1–90` days).
+- **TLS & Certificates**: inspect active certificate domain, issuer, remaining validity, and SHA-256 fingerprint; hot-toggle single-port native TLS; select files from `ZR_GATEWAY_CERT_DIR` or reload from disk; or upload/paste `fullchain.pem` and `privkey.pem` directly.
+- **Email Service**: live SMTP configuration and test-email delivery (`TLS` / `STARTTLS` / plaintext; SMTP credentials are encrypted at rest with AES-256-GCM and never echoed back).
+- **API Keys**: generate, rotate, or revoke the administrator API key for programmatic management.
 
-- **用户管理**：新建账号（可指定用户组与组到期时间；不填密码时生成 16 位随机初始密码，仅显示一次）、重置密码（同样只显示一次，并立即清除该账号所有旧会话）、停用 / 删除账号、调整所属用户组与到期时间；
-- **用户组**：新建 / 编辑用户组与配额、切换新用户默认组；默认组和仍有账号绑定的组不可删除；
-- **网关设置**：
-  - **公网访问地址**：在线热修改对外地址，保存后立即作用于之后生成的邀请链接，无需重启网关；留空则回落到环境变量 `ZR_GATEWAY_PUBLIC_URL`，两者都没设时从请求头推断；
-  - 开放注册开关、注册必须验证邮箱开关、新用户默认组与登录态有效期（1–90 天）；
-- **TLS 与证书**：查看当前激活证书域名、颁发者、剩余有效期与 SHA-256 指纹；在线切换单端口原生 TLS 开关、下拉选用 `ZR_GATEWAY_CERT_DIR` 目录中已有文件或立即从磁盘重载，并可直接选择文件/粘贴 PEM 文本写入 `fullchain.pem` 与 `privkey.pem`；
-- **发信服务**：在线配置 SMTP 并发送测试邮件，无需重启；支持 TLS（465）/ STARTTLS（587）/ 明文三种加密方式，发信账号口令以 AES-256-GCM 加密后落库，界面不回显；
-- **接口密钥**：生成 / 重置 / 吊销供外部系统调用的管理员 API Key；
+## Upgrades & Graceful Recovery
 
-此外，页头持续展示以下状态：
-- **只读运行态**：TCP 端口、原生 TLS 启停状态、UDP 探测端口、存储引擎（SQLite / PostgreSQL）、主密钥来源、实时中转速率与累计流量等；
-- 页面顶部的**安全提示条**（非阻断，只是提醒）：对外公网地址未启用 HTTPS、辅助 UDP 端口已关闭，或 TLS 证书即将过期 / 已过期 / 磁盘重载异常。网关刻意不提供忽略这些问题的开关——修复方式分别是开启原生 TLS（或配外部反代 HTTPS）、保持辅助 UDP 口开启或及时更新有效证书。
+Back up both the database and `master.key` before upgrading the gateway, then upgrade peer plugins machine by machine (updating the desktop plugin alone does not update the standalone gateway container).
 
-## 升级与正常恢复
+Paused peers keep a restricted control connection alive so resuming does not require re-joining. Initial hole-punching falls back to relay after ~1s, lost direct routes detect timeouts after 15s from the last valid packet, and relayed sessions re-probe for direct paths with `5s → 15s → 60s` progressive backoff. The WebSocket control plane runs `10s` Ping / `15s` Pong keepalives to reap half-open connections quickly and propagates monotonic `connSeq` epochs so both sides symmetrically re-anchor after reconnects. Known-length uploads allow an extra 20s recovery window subject to reachability.
 
-先备份数据库与 `master.key`，升级网关，再逐台升级节点。仅更新桌面插件不会替换独立网关。旧网关可能不接受新版 `blocked` / `null` 遥测；旧节点也不具备所有暂停恢复、取消确认与握手绑定能力，混合版本期间不要把缺失状态当作连接事实。
+On `SIGTERM` / `SIGINT`, the gateway stops accepting new connections, flushes final telemetry within a 5s shutdown budget (up to 4s extra cleanup grace on error), and closes the database cleanly; set container stop grace periods accordingly.
 
-新版节点暂停时停止业务而保留受限控制连接，恢复不必重新入网。首次打洞默认约 1 秒后降级中转，已有直连丢失按最后有效收包后 15 秒判定，中转时按 `5s → 15s → 60s` 递增退避自动重探。网关与节点控制面 WebSocket 通过 `10s` Ping / `15s` Pong 心跳自动清理半开断网连接，并在连接重建时随 `connSeq` 纪元同步触发两端对称自愈重锚。普通已知长度上传有额外 20 秒恢复预算，但恢复仍取决于可达性，不保证任意断网无损。
+## Data & Backups
 
-正常 SIGTERM/SIGINT 会停止接收、补写末批遥测，再关闭数据库。默认关闭预算为 5 秒；错误清理最多另留 4 秒宽限，失败非零退出并报告未确认累计。容器停止宽限应覆盖这段时间并留调度余量。数据库正常回滚后可重试；突然断电、强制终止或 COMMIT 结果不明不保证遥测零损失或恰好一次。
-
-## 数据与备份
-
-- 默认数据都在数据目录（Docker 里是 `/data`）：SQLite 库 + `master.key`（`0600`，首次启动自动生成）。备份 = 停服后整目录拷走；`master.key` 丢失会导致已有凭据失效，务必随库一起备份。
-- 走 PostgreSQL 时，备份交给你的 PostgreSQL 例程即可，数据目录里只剩 `master.key`（仍需保留）。
+- By default, `/data` stores both the SQLite database (`WAL` mode) and `master.key` (`0600`). Back up by stopping the container and copying the entire directory; losing `master.key` invalidates stored credentials.
+- With PostgreSQL (`ZR_GATEWAY_DATABASE_URL`), back up PostgreSQL using standard DB tooling and preserve `master.key` from the data directory.

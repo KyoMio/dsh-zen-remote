@@ -7,8 +7,8 @@
 </p>
 
 <p align="center">
-  <b>One DeepSeek Harness plugin, three roles.</b><br>
-  Turn DSH into a phone-ready PWA, mount shared sessions across paired desktops, or link computers into an end-to-end encrypted peer mesh with zero public IPs.
+  <b>One DeepSeek Harness plugin, three roles — built for cross-machine peer mesh.</b><br>
+  Link computers into an end-to-end encrypted virtual mesh with zero public IPs, keep phone PWA &amp; lock-screen push active, or pair specific hosts and desktop clients.
 </p>
 
 <p align="center">
@@ -19,68 +19,98 @@
 <br>
 <img src="https://img.shields.io/badge/DeepSeek%20Harness-0.1.7%20%E2%80%93%200.2.x-4D6BFE?style=flat-square" alt="DeepSeek Harness 0.1.7 – 0.2.x">
 <img src="https://img.shields.io/node/v/dsh-zen-remote?style=flat-square&color=339933&logo=nodedotjs&logoColor=white" alt="Node">
-<a href="https://www.npmjs.com/package/dsh-zen-remote#provenance"><img src="https://img.shields.io/badge/npm-provenance%20signed-CB3837?style=flat-square&logo=npm&logoColor=white" alt="npm provenance"></a>
+<img src="https://img.shields.io/badge/E2EE-X25519%20%2B%20AES--GCM-0D9488?style=flat-square" alt="E2EE X25519 + AES-GCM">
+<img src="https://img.shields.io/badge/P2P%20Mesh-UDP%20%2B%20Relay-5B4CF0?style=flat-square" alt="P2P Mesh UDP + Relay">
 <img src="https://img.shields.io/badge/PWA-Web%20Push-5A0FC8?style=flat-square&logo=pwa&logoColor=white" alt="PWA + Web Push">
-<img src="https://img.shields.io/badge/TypeScript-strict-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript strict">
 </p>
 
 <p align="center"><a href="README.zh-CN.md">中文文档</a></p>
 
-| Session list home | Session page | Session info card |
-| --- | --- | --- |
-| ![Session list home](assets/home.png) | ![Session page](assets/session.png) | ![Session info card](assets/info.png) |
+```mermaid
+flowchart LR
+  subgraph Mesh["Peer Virtual Mesh (Zero Public IP)"]
+    A["Peer Node A<br/>(Desktop / Server)"] <-->|"1. LAN / UDP Hole-Punch Direct<br/>(60s silent re-probe)"| B["Peer Node B<br/>(Desktop / Server)"]
+    A -.->|"2. 1s E2EE Fallback<br/>(X25519 + AES-256-GCM)"| GW["Self-Hosted Gateway<br/>(gateway-server · Docker)"]
+    B -.->|"2. Blind Ciphertext Relay<br/>+ Dual-UDP STUN"| GW
+  end
+  A -->|"Dual PWA Hosting<br/>Caddy / Tunnel / Proxy / LAN"| Phone["Phone / Browser PWA<br/>(All Sessions + Web Push)"]
+  Client["Desktop Client<br/>(Up to 8 Hosts)"] -->|"Direct Relay<br/>(Pairing Code)"| A
+```
 
-| Composer permission sheet | Pairing page a public visitor sees |
+| Role | Best for | Session sharing | Phone PWA &amp; Push | Needs public IP? |
+| --- | --- | --- | --- | --- |
+| **Peer Node (`peer`)** | Multiple computers forming a two-way mesh across LANs / NATs | **Bidirectional** — mounts peers' shared sessions &amp; shares yours | **Yes** — full PWA &amp; push stay active | **No** (LAN / UDP hole-punch + E2EE relay) |
+| **Host (`host`, default)** | Always-on workstation / server accessed from phone &amp; paired desktops | Shares chosen sessions outbound (`1 → N`) | Yes (gateway + Web Push) | Optional (Caddy / Tunnel / Proxy / LAN) |
+| **Desktop Client (`client`)** | Secondary computer mounting sessions from specific hosts | Connects inbound to up to **8 hosts** (`N → 1`) | No (doesn't bind port `3088`) | No |
+
+| Gateway Web Console (`Studio-Mesh`) | Peer Network Device Manager |
 | --- | --- |
-| ![Composer permission sheet](assets/sheet.png) | ![Pairing page](assets/pairing.png) |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/gateway-console-dark.png"><source media="(prefers-color-scheme: light)" srcset="docs/images/gateway-console.png"><img src="docs/images/gateway-console.png" alt="Gateway Web Console showing Studio-Mesh network and bilateral direct/relay links"></picture> | ![Manage Network Devices modal](docs/images/peer-devices-modal.png) |
 
-> Screenshots are a 390×844 phone viewport in the light theme; both themes are supported. The pairing page is drawn by the gateway in DSH's official style, following the system light / dark appearance.
+<details>
+<summary>Watch Peer Mesh &amp; Setup Walkthrough (animated demo)</summary>
+
+<p align="center">
+  <img src="docs/images/peer-mesh-demo.gif" alt="Peer Mesh and Setup Wizard Walkthrough" width="880">
+</p>
+
+</details>
+
+| Mobile session list | Mobile session view | Session info card | Pairing page |
+| --- | --- | --- | --- |
+| ![Session list home](assets/home.png) | ![Session page](assets/session.png) | ![Session info card](assets/info.png) | ![Pairing page](assets/pairing.png) |
+
+> Mobile screenshots show a 390×844 viewport in the light theme; both light and dark themes are supported across the gateway console, mobile UI, and pairing page.
 
 ---
 
 ## Contents
 
 1. [Install](#1-install)
-2. [Quick Start (Unified Setup & Pairing Wizard)](#2-quick-start-unified-setup--pairing-wizard)
-   - [Scenario A: Set up as Host (Phone & Desktop Access)](#scenario-a-set-up-as-host-phone--desktop-access)
-   - [Scenario B: Set up as Desktop Client (Connect up to 8 Hosts)](#scenario-b-set-up-as-desktop-client-connect-up-to-8-hosts)
-   - [Scenario C: Join a Self-Hosted Virtual Network as a Peer Node](#scenario-c-join-a-self-hosted-virtual-network-as-a-peer-node)
-3. [Daily Usage: Session Sharing & Cross-Device Workflow](#3-daily-usage-session-sharing--cross-device-workflow)
-4. [Lock-Screen Push: When Notifications Fire](#4-lock-screen-push-when-notifications-fire)
-5. [Features](#5-features)
-6. [Advanced Settings & Field Reference](#6-advanced-settings--field-reference)
-7. [Security Model, Version Tolerance & Known Notes](#7-security-model-version-tolerance--known-notes)
+2. [Pairing &amp; Deployment Modes](#2-pairing--deployment-modes)
+   - [Mode A: Peer Node Virtual Mesh (`peer`, Recommended)](#mode-a-peer-node-virtual-mesh-peer-recommended)
+   - [Mode B: Standalone Host (`host`, Phone PWA &amp; Point-to-Point)](#mode-b-standalone-host-host-phone-pwa--point-to-point)
+   - [Mode C: Desktop Client (`client`, Connect up to 8 Hosts)](#mode-c-desktop-client-client-connect-up-to-8-hosts)
+3. [Cross-Device Usage, Official API Coverage &amp; Sidebar Compatibility](#3-cross-device-usage-official-api-coverage--sidebar-compatibility)
+4. [Plugin Bridge Protocol](#4-plugin-bridge-protocol)
+5. [Mobile PWA &amp; Lock-Screen Push](#5-mobile-pwa--lock-screen-push)
+6. [Advanced Settings &amp; Field Reference](#6-advanced-settings--field-reference)
+7. [Security Model, Version Tolerance &amp; Known Notes](#7-security-model-version-tolerance--known-notes)
 
 ---
 
 ## 1. Install
 
-### Install from the UI (Recommended, Desktop App & Web UI)
+### Install from the UI (Recommended, Desktop App &amp; Web UI)
 
-Open the **Plugins** page in the DSH sidebar → click **Add plugin** → type `dsh-zen-remote` → click **Enable now** when the install finishes, then restart the DSH desktop app (or `dsh web`).
+Open **Plugins** in the DSH sidebar → click **Add plugin** → enter `dsh-zen-remote` → click **Enable now** after installation completes, then restart the DSH desktop app (or `dsh web`).
 
 ### Install from the CLI (Headless `dsh web` server)
 
 ```sh
 dsh plugin --profile web add dsh-zen-remote
-# then restart dsh web (or run `npx dsh-zen-remote setup` to install, start, and configure in one go)
+# or run the interactive CLI wizard directly (installs, starts DSH, and configures in one go):
+npx dsh-zen-remote setup
+dsh-zen-remote status
 ```
 
 > `dsh plugin` requires `--profile` to name the target profile. The desktop app's `desktop` profile is managed exclusively by the app (`--profile desktop` is refused on the CLI), so use the UI install above on the desktop app.
 
-### Headless Server CLI Wizard (`dsh-zen-remote`)
-
-The plugin ships a bundled CLI tool so remote VPS / headless servers (`dsh web`) can complete the entire setup, ingress configuration, three-light verification, and QR / desktop pairing flow in a terminal without opening a browser:
-
-```sh
-npx dsh-zen-remote setup        # 3-step interactive wizard: role → ingress → verify + terminal QR & desktop pairing
-dsh-zen-remote status           # current role, gateway & connection state (--json; --debug exports redacted diagnostics)
-```
-
 <details>
-<summary>Expand full CLI subcommand reference (<code>host</code> / <code>client</code> / <code>peer</code> / non-interactive flags)</summary>
+<summary>Advanced: Full CLI subcommands (<code>peer</code> / <code>host</code> / <code>client</code>), manual <code>link:</code> profile setup, upgrading &amp; uninstall</summary>
+
+#### Bundled Headless CLI (`dsh-zen-remote`)
+
+The CLI communicates with the running plugin over a `0600` local IPC socket (`~/.dsh/zen-remote-cli.sock`); Caddy and `cloudflared` remain managed by the plugin process. Pass `--lang zh|en` to switch output language, or `--yes` with flags for unattended scripts.
 
 ```sh
+# Peer commands (when role is peer, join a self-hosted virtual network)
+npx dsh-zen-remote setup --role peer --invite "zr-net://gw.example.com/0123456789abcdef#join-key" [--yes]
+dsh-zen-remote peer join "zr-net://gw.example.com/0123456789abcdef#join-key" [--name My-Mac] [--yes]
+dsh-zen-remote peer status                                     # nodeId, admission state, peers, paths & RTT (--json)
+dsh-zen-remote peer trust <nodeId>                             # explicitly trust a peer's new identity after a mismatch
+dsh-zen-remote peer leave [--yes]                              # leave the network (phone/browser QR access stays intact)
+
 # Host commands (when role is host)
 dsh-zen-remote host device pair --device-role web              # mint a phone/browser pairing code + terminal QR (or desktop-client)
 dsh-zen-remote host device list                                # list paired devices (--json supported)
@@ -92,266 +122,278 @@ dsh-zen-remote host ingress snippet [--proxy nginx|caddy|lucky] # print reverse-
 
 # Client commands (when role is client, up to 8 paired hosts)
 dsh-zen-remote client pair http://192.168.1.2:3088 --code 12345678 [--name My-Mac]
-dsh-zen-remote client list                                     # list all paired hosts (up to 8) and connection states
+dsh-zen-remote client list                                     # list paired hosts (up to 8) and connection states
 dsh-zen-remote client unpair <hostUrl|entryId|--all> [--yes]   # remove one or all paired hosts
 
-# Peer commands (when role is peer, join a self-hosted virtual network)
-npx dsh-zen-remote setup --role peer --invite "zr-net://gw.example.com/0123456789abcdef#join-key" [--yes]
-dsh-zen-remote peer join "zr-net://gw.example.com/0123456789abcdef#join-key" [--name My-Mac] [--yes]
-dsh-zen-remote peer status                                     # nodeId, admission state, network peers & their connection paths (--json)
-dsh-zen-remote peer trust <nodeId>                             # explicitly trust a peer's new identity after a mismatch
-dsh-zen-remote peer leave [--yes]                              # leave the network (phone/browser QR access is not affected)
+# Diagnostics
+dsh-zen-remote status --debug                                  # export redacted diagnostics report
 ```
 
-- **Preflight & non-interactive automation**: `setup` automatically scans candidate profiles for multi-select plugin installation (`desktop` is skipped) and launches the DSH daemon / app before starting the wizard. Pass `--yes` with the required flags (e.g. `setup --role host --ingress lan --no-wait --yes`) for unattended scripts.
-- **Architecture**: the CLI communicates with the running plugin over a `0600` local IPC socket (`~/.dsh/zen-remote-cli.sock`); Caddy and `cloudflared` stay managed by the plugin process. Use `--lang zh|en` to switch output language.
+#### Manual Profile Edit / Local Development (`link:`)
 
-</details>
-
-<details>
-<summary>Manual Profile Edit / Local Development (<code>link:</code>), Upgrading & Uninstall</summary>
-
-**Editing the profile by hand** (local development, `link:` installs): add the dependency to the profile's `package.json` (`~/.dsh/profiles/desktop` for the desktop app, `~/.dsh/profiles/web` for the web service) and append `"dsh-zen-remote"` to the `dsh.profile.bundles` array:
+Add the dependency to the profile's `package.json` (`~/.dsh/profiles/desktop` for the desktop app, `~/.dsh/profiles/web` for the web service) and append `"dsh-zen-remote"` to the `dsh.profile.bundles` array:
 
 ```jsonc
 // ~/.dsh/profiles/desktop/package.json
 {
   "dependencies": {
-    "dsh-zen-remote": "^2.4.1"        // for local development: "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^2.4.4"        // for local development: "link:/path/to/dsh-zen-remote"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": ["dsh-zen-remote"]
+    }
   }
 }
 ```
 
 ```sh
 cd ~/.dsh/profiles/desktop && pnpm install
-# For a link: checkout, also run `npm install --omit=dev` inside the repository so the gateway subprocess can resolve `web-push`.
+# For a link: checkout, also run `npm install --omit=dev` inside the repository so the gateway subprocess resolves `web-push`.
 ```
 
-**Upgrading & migration notes**:
+#### Upgrading &amp; Uninstall
+
 - **Upgrading with HMR on**: remove `dsh-zen-remote` first, then install the new version (`dsh plugin --profile <name> remove dsh-zen-remote` → `add dsh-zen-remote`, or Uninstall → Add in the Plugins page).
 - **DSH 0.2.1-alpha.3+ profile reset**: `dsh --profile <name> --from-default-profile <template>` replaces an existing custom profile with a fresh copy; back up `~/.dsh/profiles/<name>` first.
-- **Upgrading from 1.x**: since 2.0.0 the composition layer is a single row (`dsh-zen-remote`). Remove any legacy `dsh-zen-remote-gateway`, `dsh-zen-remote-push`, or manual `dsh-push.mjs` lines from `cordis.patch.yml`. Existing `~/.dsh/lan-gate.config.json` settings and paired devices carry over automatically.
-- **Uninstalling**: click **Uninstall** on the `dsh-zen-remote` plugin page and restart. To also wipe pairing and share state, delete `~/.dsh/lan-gate-state.json`, `~/.dsh/lan-gate.config.json`, and `~/.dsh/zen-remote-state.json` (older versions also kept `~/.dsh/zen-remote-shares.json` and `~/.dsh/zen-remote-server.json` — they migrate into the state file automatically on first start and are then deleted).
+- **Upgrading from 1.x**: since 2.0.0 the composition layer is a single row (`dsh-zen-remote`). Remove legacy `dsh-zen-remote-gateway`, `dsh-zen-remote-push`, or manual `dsh-push.mjs` lines from `cordis.patch.yml`. Existing `~/.dsh/lan-gate.config.json` and paired devices carry over automatically.
+- **Uninstalling**: click **Uninstall** on the `dsh-zen-remote` plugin page and restart. To wipe pairing and share state too, delete `~/.dsh/lan-gate-state.json`, `~/.dsh/lan-gate.config.json`, and `~/.dsh/zen-remote-state.json`.
 
 </details>
 
 ---
 
-## 2. Quick Start (Unified Setup & Pairing Wizard)
+## 2. Pairing &amp; Deployment Modes
 
-The same plugin switches cleanly between three deployment roles:
-
-| Role | Best for | Session sharing | Phone PWA & Push | Needs public IP? |
-| --- | --- | --- | --- | --- |
-| **Host (`host`, default)** | Always-on workstation / server accessed from phone & paired computers | Shares chosen sessions outbound (`1 → N`) | Yes (gateway + Web Push) | Optional (Caddy / Cloudflare Tunnel / Proxy / LAN) |
-| **Desktop Client (`client`)** | Secondary computer mounting sessions from specific hosts | Connects inbound to up to **8 hosts** (`N → 1`) | No (doesn't bind port `3088`) | No |
-| **Peer Node (`peer`)** | Multiple computers forming a two-way mesh across LANs/NATs | **Bidirectional** — mounts peers' shared sessions & shares yours | **Yes** — full PWA & push stay active | **No** (LAN / UDP hole-punch + E2EE gateway relay) |
-
-Open **Plugins → `dsh-zen-remote`** in DSH. The **Remote Access & Device Pairing** card sits right at the top of the page (or run `npx dsh-zen-remote setup` on a headless server):
+Open **Plugins → `dsh-zen-remote`** in DSH. The **Remote Access &amp; Device Pairing** overview card sits at the top of the page (or run `npx dsh-zen-remote setup` on a headless server).
 
 ![Remote Access & Device Pairing overview card on the plugin detail page](docs/images/wizard-overview.png)
 
+### Mode A: Peer Node Virtual Mesh (`peer`, Recommended)
+
+Link multiple computers across LANs, home routers, and NATs into one bidirectional mesh — **zero public IPs on member computers** and **no per-machine pairing codes**, while keeping each computer's own Phone / Browser PWA and Web Push fully active.
+
+#### 1. Deploy the Self-Hosted Relay Gateway (`gateway-server/`, Once per Team or Self)
+
+> [!IMPORTANT]
+> `gateway-server/` lives in this repository for source co-maintenance and is **excluded from the `dsh-zen-remote` npm package**. Deploying it is only needed for `peer` virtual networks (`host` and `client` modes work standalone without it).
+
+```sh
+docker build -t zr-gateway ./gateway-server
+
+docker run -d --name zr-gateway \
+  --restart unless-stopped \
+  -p 19393:19393/tcp \
+  -p 19393:19393/udp \
+  -p 19394:19394/udp \
+  -e ZR_GATEWAY_PUBLIC_URL=https://zr.example.com \
+  -v zr-gateway-data:/data \
+  -v $(pwd)/certs:/certs \
+  zr-gateway
+```
+
+- **First boot**: check `docker logs zr-gateway` for the one-time initial password of `admin@local`, sign in at `http://<host>:19393/`, create a virtual network, and copy the `zr-net://…` invite link.
+- **Native TLS &amp; full operations**: supports single-port built-in HTTPS/WSS on `19393/tcp`, five-state member admission (`pending` / `authorized` / `paused` / `mismatch` / `revoked`), dual-UDP STUN coordination (`19393/udp` + `19394/udp`), and gateway-pushed direct RTT caps (`peerDirectMaxRttMs`). See [`gateway-server/README.md`](gateway-server/README.md).
+
+#### 2. Join from DSH UI or Headless CLI
+
+In **Plugins → `dsh-zen-remote` → Start Setup Wizard → Step 1**, select **Peer Node (`peer`)**:
+
+1. **Step 2 — Choose how to join**:
+   - **Paste Invite Link (`zr-net://…`)**: paste the link from the gateway console (`?tls=0` for plaintext gateways; `#join-key` is optional when manual approval is enabled; legacy `zr-nets://` and `zr-net+insecure://` links still parse). Expand **Advanced split-fill** to enter Gateway URL, 16-hex Network ID, and optional join passphrase separately.
+   - **Sign in with Gateway Account**: enter the gateway URL, email, and password (used strictly in memory to list permitted networks — never saved to disk), pick a network, and click **Sign In &amp; Join**.
+   - **Manual Approval**: if required by the network, the wizard waits in *"pending approval"* and activates automatically once an admin approves the device.
+2. **Step 3 — Verify &amp; Auto-Mount**: once all three lights (**Local identity ready**, **Network admission**, **Peer discovery &amp; session sync**) turn green, online peers' remote-enabled sessions mount automatically into your sidebar under `"Device Name · Workspace Name"` — and sessions you share appear in theirs.
+3. **Day-to-Day Peer &amp; Dual-PWA Controls**:
+   - The overview card shows **Network &amp; Peer Interop** (`Mounted X / M remote devices`, live `LAN Direct` vs `Gateway Relay` counts) alongside your **Phone / Browser Access (PWA)** section and **Plugin Bridge** toggles.
+   - Click **Manage Network Devices** to inspect each peer's path (**LAN Direct**, **P2P Direct**, **Gateway Relay**, **Offline**, **Identity Anomaly**) and RTT (`ms`), toggle **Mount Sessions / Ignore** per peer, trigger a **Re-probe**, or explicitly **Trust New Identity** after a local TOFU `mismatch` block.
+
+| Step 1: Choose Peer Node | Step 2: Paste `zr-net://` Invite | Step 3: Peer Readiness Lights |
+| --- | --- | --- |
+| ![Wizard Step 1: Choose Peer Node](docs/images/wizard-step1-role-path.png) | ![Wizard Step 2: Join with zr-net:// invite](docs/images/wizard-step2-peer-join.png) | ![Wizard Step 3: Peer 3-light verification](docs/images/wizard-step3-verify-pair.png) |
+
+```sh
+# Headless server one-liner
+npx dsh-zen-remote setup --role peer --invite "zr-net://gw.example.com/0123456789abcdef#join-key"
+dsh-zen-remote peer status         # nodeId, admission state, peer paths & RTT (--json)
+```
+
+#### 3. Transport Paths &amp; End-to-End Blind Relay
+
+| Priority | Path | How it works |
+| --- | --- | --- |
+| **1st** | **LAN Direct (`lan`)** | Direct socket on shared local subnets (excludes CGNAT `100.64.0.0/10` tunnel ranges from misdetection as LAN) |
+| **2nd** | **UDP Hole-Punch P2P (`p2p`)** | Coordinated via the gateway's dual UDP STUN ports (`19393/udp` + `19394/udp`) with adaptive sliding-window ARQ |
+| **3rd** | **E2EE Gateway Relay (`relay`)** | **1-second seamless fallback** if direct setup doesn't land (or if measured direct RTT stays above the gateway's `peerDirectMaxRttMs` cap); background **5s → 15s → 60s** re-probe upgrades back automatically |
+
+- **Ciphertext-only relay**: traffic between peers is sealed end-to-end with per-session ephemeral **X25519 + AES-256-GCM** bound to each machine's Ed25519 identity. The gateway only sees a 28-byte routing header and holds no decryption keys.
+
 ---
 
-### Scenario A: Set up as Host (Phone & Desktop Access)
+### Mode B: Standalone Host (`host`, Phone PWA &amp; Point-to-Point)
 
-Click **Start Setup Wizard** (or **Reconfigure Wizard**) to complete setup in three guided steps:
-
-#### Step 1: Choose "Act as Server (Host)" & an Access Method
-
-![Wizard Step 1: Choose machine role and server access method](docs/images/wizard-step1-role-path.png)
+Choose **Act as Server (`host`)** in Step 1 if you only need phone/browser access or direct `1 → N` pairing without running a virtual-network gateway:
 
 | Access method | Best for | What the wizard automates |
 | --- | --- | --- |
-| **Managed Caddy (Recommended)** | Public IP (or router port forwarding) + domain on Cloudflare | Downloads prebuilt `Caddy + caddy-dns/cloudflare` and issues/renews TLS certificates via DNS-01 (`127.0.0.1:3088`) |
-| **Existing Reverse Proxy** | Already running Nginx, Caddy, or Lucky | Generates ready-to-paste proxy snippets + one-click `trustedProxies` registration ([manual guide](docs/remote-access.en.md)) |
-| **Cloudflare Tunnel** | No public IP / no port forwarding + domain on Cloudflare | Downloads `cloudflared`, creates/reuses a tunnel, configures CNAME, and starts the tunnel (`127.0.0.1:3088`) |
+| **Managed Caddy (Recommended)** | Public IP / port forwarding + domain on Cloudflare | Downloads prebuilt `Caddy + caddy-dns/cloudflare`, issues/renews TLS certs via DNS-01 (`127.0.0.1:3088`) |
+| **Existing Reverse Proxy** | Already running Nginx, Caddy, or Lucky | Generates proxy snippets + one-click `trustedProxies` registration ([manual guide](docs/remote-access.en.md)) |
+| **Cloudflare Tunnel** | No public IP / no port forwarding + domain on Cloudflare | Downloads `cloudflared`, creates/reuses tunnel, configures CNAME, and starts tunnel (`127.0.0.1:3088`) |
 | **LAN / Tailscale Direct** | Same Wi-Fi / LAN or shared Tailscale network | Auto-detects LAN / Tailscale IPv4 and binds `0.0.0.0:3088` behind the built-in **private-IP wall** (`403 public-direct-forbidden`) |
 
-#### Step 2: Fill in Connection Parameters
-- **Managed Caddy / Cloudflare Tunnel**: enter your public domain (e.g. `dsh.example.com`) and paste your Cloudflare API Token.
-- **Existing Reverse Proxy**: enter the external `https://` URL and copy the generated Nginx / Caddy / Lucky configuration snippet.
-- **LAN / Tailscale Direct**: confirm the auto-detected `http://<your-LAN-or-Tailscale-IP>:3088` address.
-
-#### Step 3: Verify Connectivity & Pair Devices
-
-![Wizard Step 3: Automatic connectivity check, phone QR pairing, and desktop client pairing](docs/images/wizard-step3-verify-pair.png)
-
-1. **Start Ingress Service & Auto-Probe**: click **Start Caddy** or **Create & Start Tunnel** if applicable; the wizard automatically checks **Local gateway ready** and **Access URL reachable**.
-2. **Pair Phone / Browser (Web App)**: on the **Pair Phone / Browser (QR)** tab, click **Generate Pairing QR**, scan with your phone, enter the 8-character code, and use **"Add to Home Screen"** to install DSH as a standalone PWA with lock-screen push.
-3. **Pair Another Computer (Desktop Client)**: switch to the **Pair Desktop Client** tab, click **Generate Desktop Pairing Code**, and click **Copy Server URL & Code**.
-
-> **Quick actions after setup**: once configured, you can directly click **Pair Phone (QR)**, **Pair Desktop Client**, or **Manage Devices** right from the overview card footer without re-running the wizard.
+In Step 3, verify connectivity and open **Pair Phone / Browser (QR)** to scan &amp; install the PWA, or switch to **Pair Desktop Client** to mint an 8-character pairing code.
 
 ---
 
-### Scenario B: Set up as Desktop Client (Connect up to 8 Hosts)
+### Mode C: Desktop Client (`client`, Connect up to 8 Hosts)
 
-On another computer running the DSH desktop app (or via `dsh-zen-remote client pair <hostUrl> --code <8-char-code>` on the CLI):
+Choose **Desktop Client (`client`)** on a secondary DSH computer (or run `dsh-zen-remote client pair <hostUrl> --code <8-char-code>`) to mount remote-enabled sessions from specific hosts without exposing a local gateway:
 
-1. Open **Plugins → `dsh-zen-remote`** and click **Start Setup Wizard** (or **+ Add Server** if already in client mode).
-2. **Step 1**: select **Desktop Client** and click **Next**.
-3. **Step 2**: enter this computer's display name (e.g. `Living-Room-Mac`), the host's gateway URL (`https://` for public URLs, or `http://192.168.x.x:3088` / `http://100.x.x.x:3088` for LAN / Tailscale), and the 8-character desktop pairing code from the host, then click **Pair & Connect**.
-4. **Step 3**: once all three status lights (**Pairing token**, **Server connection**, **Session & plugin sync**) turn green, the host's shared workspaces and sessions appear in your left sidebar immediately.
-5. **Multi-Server Management (up to 8 hosts)**:
-   - Click **+ Add Another Server** in Step 3, **+ Add Server** on the overview card, or **Manage Servers** to view per-server status, **Reconnect**, **Re-pair**, **Remove**, or **Remove All** (when all `8 / 8` slots are full, a red limit notice appears; re-pairing an existing URL still overwrites in place).
-   - Sidebar groups from all paired hosts merge **in pairing order** after your local workspaces. Duplicate host names are automatically numbered `Name-1`, `Name-2`; model pickers, connection status icons, read-only banners, plugin bridges, and file uploads are strictly isolated per host `serverId`.
+- Pair up to **8 hosts** by default (adjustable via `maxServers` `1..64` or `LAN_GATE_MAX_SERVERS`).
+- Remote workspace groups merge into the sidebar **in pairing order** after local workspaces; duplicate host names auto-number (`Name-1`, `Name-2`).
+- Model catalogs, connection badges, read-only banners, plugin bridges, and file uploads stay strictly isolated per `serverId`.
 
 ---
 
-### Scenario C: Join a Self-Hosted Virtual Network as a Peer Node
+## 3. Cross-Device Usage, Official API Coverage &amp; Sidebar Compatibility
 
-Multiple computers, one bidirectional mesh, zero public IPs or per-machine pairing codes: one person deploys the **self-hosted relay gateway** ([`gateway-server/`](gateway-server/README.md) — a single Docker container with its own web console and built-in native HTTPS/WSS support), creates a virtual network, and invites each computer.
-
-#### Joining from the DSH UI
-
-Open **Plugins → `dsh-zen-remote`** → **Start Setup Wizard** → **Step 1: select `Peer Node (peer)`**:
-
-1. **Choose how to join (Step 2)** — three supported entry paths:
-   - **Paste Invite Link (`zr-net://…`)**: paste the invite link generated in the gateway web console (`?tls=0` for plaintext gateways; `#join-key` is optional — omit it to submit for manual admin approval; legacy `zr-nets://` and `zr-net+insecure://` links also work). Expand **Advanced split-fill** to enter Gateway URL, 16-hex Network ID, and optional join passphrase separately.
-   - **Sign in with Gateway Account**: enter the gateway URL plus your gateway email and password (used strictly in memory to fetch permitted networks — never saved to disk), select a network, and click **Sign In & Join**.
-   - **Approval Mode**: if the network requires manual approval, the wizard displays *"pending approval"* and activates automatically as soon as an admin approves the device in the gateway console.
-2. **Verify & Auto-Mount (Step 3)**: once all three lights (**Local identity ready**, **Network admission**, **Peer discovery & session sync**) turn green, online peers' remote-enabled sessions automatically appear in your left sidebar under `"Device Name · Workspace Name"` — and sessions you enable for remote access appear in theirs.
-3. **Day-to-Day Peer Controls & Dual PWA Hosting**:
-   - The overview card displays **Network & Peer Interop** (`Devices in network` / `Mounted on this machine`, live `LAN Direct` vs `Gateway Relay` counts) plus your active **Phone / Browser Access (PWA)** section (QR pairing, ingress configuration, paired phone list) and **Plugin Bridge** switches — switching to `peer` never disables your phone access or lock-screen push.
-   - Open **Manage Network Devices** to inspect each peer's path (**LAN Direct**, **P2P Direct**, **Gateway Relay**, **Offline**, or **Identity Anomaly**) and measured RTT (`ms`), toggle **Mount Sessions** vs **Ignore** per peer (bounded by `maxPeers - 1` and optional local `maxServers`), trigger an instant **Re-probe**, or explicitly click **Trust New Identity** if a peer machine reinstalled and triggered a local TOFU `mismatch` block.
-
-#### Joining & Managing from the CLI (Headless Servers)
-
-```sh
-npx dsh-zen-remote setup --role peer --invite "zr-net://gw.example.com/0123456789abcdef#join-key"
-dsh-zen-remote peer status         # nodeId, admission state, network peers, paths & RTT (--json)
-dsh-zen-remote peer trust <nodeId> # explicitly re-trust a peer after an Ed25519 identity change
-dsh-zen-remote peer leave          # leave the virtual network (phone/browser QR access stays intact)
-```
-
-#### Transport & Zero-Knowledge Security
-
-- **Direct first (`lan` / `p2p`)**: dual UDP STUN ports (`19393/udp` + `19394/udp`) on the gateway coordinate NAT traversal so member computers talk directly whenever possible.
-- **1s seamless E2EE relay fallback (`relay`)**: if no direct route comes up within 1 second, traffic switches transparently to the gateway relay sealed with per-session ephemeral **X25519 + AES-256-GCM** (only 28-byte routing headers are visible to the gateway — zero plaintext exposure), while a silent **60s background re-probe** upgrades back to a direct path automatically whenever network conditions allow.
-- **Self-certifying TOFU identities**: every machine generates its own Ed25519 identity (`nodeId` = truncated public-key hash) and pins peers locally (`pinnedPeers`). Even a gateway-side credential reset cannot silently spoof an existing machine — other peers block that slot (`mismatch`) until confirmed on each machine.
-
-> Deploying the gateway itself: see [`gateway-server/README.md`](gateway-server/README.md) — one `docker run`, ports `19393/tcp+udp` and `19394/udp`, initial `admin@local` password printed once to the first-boot container log.
-
----
-
-## 3. Daily Usage: Session Sharing & Cross-Device Workflow
-
-| | **Web App Device (Phone / Tablet / Browser)** | **Desktop Client / Peer Node (Another DSH Computer)** |
+| | **Web App Device (Phone / Tablet / Browser)** | **Peer Node / Desktop Client (Another DSH Computer)** |
 | --- | --- | --- |
 | Visible sessions | **All** sessions on the host | **Only** sessions with remote access enabled on the serving machine (enforced server-side) |
-| Credential | Long-lived HttpOnly cookie | Host–Client: `Bearer` device token in `~/.dsh/zen-remote-state.json`<br>Peer–Peer: Ed25519 TOFU identity + ephemeral X25519 session key |
+| Credential | Long-lived HttpOnly cookie | **Peer**: Ed25519 TOFU identity + ephemeral X25519 session key<br>**Client**: `Bearer` device token in `~/.dsh/zen-remote-state.json` |
 
-### Enabling or Disabling Remote Access on a Session
+### Session Sharing Controls &amp; Lifecycle
 
-Remote access is controlled per session (or automatically enabled for new sessions if you turn on *Auto-share new sessions*). You can toggle it from four places:
+Remote access is toggled per session (or automatically for new sessions when `autoShareNewSessions` is enabled) from four places:
+1. **Sidebar `"…"` menu** → **Enable / Disable remote**
+2. **Session title bar** → globe icon (shows remaining idle time on hover; green dot = active remote viewer)
+3. **Phone session info card (`ⓘ`)** → **Remote access** toggle
+4. **Plugin settings page** → shared sessions list (close individually or all at once)
 
-1. **Host sidebar**: open a session's `"…"` menu and click **开启远程 / 关闭远程** (Enable / Disable remote);
+Shared sessions auto-close remote access after **48 hours** (`idleHours`) of inactivity (running or waiting sessions never sleep). Unshared or revoked sessions disappear from remote sidebars automatically, and any currently open tab displays a *"remote closed"* banner until re-enabled.
 
-   ![Enabling remote access from a session's menu on the host](docs/images/host-share-menu.png)
-
-2. **Host session header**: click the globe icon in the session title row (hover to see remaining idle time; a green dot indicates a desktop client is currently viewing it);
-3. **Phone (Web App) session info card**: open the `ⓘ` info card at the top right of a session and toggle **远程访问** (Remote access);
-
-   <p align="center"><img src="docs/images/mobile-info-remote.png" alt="Remote access toggle inside the phone session info card" width="320"></p>
-
-4. **Host settings page**: view and close shared sessions individually or all at once under the shared sessions list.
-
-### Working in Remote Sessions (Desktop Client & Peer Node)
-
-- **Sidebar groups**: once a paired host or mounted peer workspace has at least one remote-enabled session, a **"Device Name · Workspace Name"** group appears in the sidebar. Click any session to view full history, stream responses, approve tools, use the server terminal, browse files and diffs, preview inline images, download deliverables, or drag/paste/pick files to upload.
-
-  ![Remote workspace group in the desktop client sidebar](docs/images/client-sidebar.png)
-
-- **Closing & idle sleep**: a shared session automatically closes remote access after **48 hours** (`idleHours`) of inactivity (running or waiting sessions never sleep). Closed or unpaired sessions are automatically archived/hidden from the sidebar; an actively open session displays a "remote closed" banner and recovers automatically if re-shared.
-
-  ![Banner shown when remote access is closed on an open session](docs/images/client-remote-closed.png)
-
----
-
-## 4. Lock-Screen Push: When Notifications Fire
-
-Notifications fire only when **you are actually needed**, along two independent paths (all payloads are end-to-end encrypted with `aes128gcm`; toggle `pushEnabled` to disable all notifications and unregister `push_notify`, or enable `pushSessionName` to show `Session: <name>` on the first line of the notification body):
-
-1. **System-triggered (always on when `pushEnabled` is on, never suppressed by debounce)**:
-   - **Tool waiting for approval**: pushes *"DSH needs your approval"* with the tool name after `DSH_PUSH_APPROVAL_GRACE_MS` (default 5s, so fast auto-approvers can answer first without buzzing your phone).
-   - **`ask_user_question` waiting for your answer**: pushes *"DSH is waiting for your answer"*.
-2. **Model-triggered (`push_notify` tool)**:
-   - Called by the agent when you asked to be notified upon completion, or when it hits a blocker that requires your decision. Ordinary turn completions do not push by default (enable `pushTurnEnd` if wanted; enable `pushSummary` to include up to 120 characters of the final reply).
-
----
-
-## 5. Features
-
-- **Mobile PWA UI (Host)**: two-level page stack (session list home + session page with swipe-back and Android back-gesture support, first-frame boot skeleton, immutable asset caching), auto-discovered plugin entry chips, compact mobile composer with bottom sheets and phone attachment uploads, and a session info card (6-tile stats with `tok/s` output speed, log export, rename, fork, archive, one-tap full-conversation PNG share image, and remote access switch).
-- **Unified Setup Wizard & Headless CLI (`dsh-zen-remote`)**: top-of-page 2×2 live overview card, 3-step modal wizard, and a full-featured terminal CLI (`setup` / `status` / `host` / `client` / `peer`) covering all four host ingress modes (Managed Caddy, Existing Reverse Proxy, Cloudflare Tunnel, LAN / Tailscale Direct with private-IP wall), client pairing, and peer network joining (`peer join` / `status` / `trust` / `leave`).
-- **Cross-Desktop Remote Sessions & Multi-Server Pool (Client)**: connect up to **8 main servers** simultaneously in pairing order; supports full history & live streaming, approval/question sync, per-server isolated model catalog, file tree & Git diffs, duplex server-side terminal (`terminal/attach`), inline Markdown image & media forwarding, windowed artifact downloads, server-side LibreOffice PDF preview, up to 500 MiB file uploads (drag-and-drop, paperclip picker, and paste), and one-click redacted diagnostics export.
-- **Peer Virtual Networking (`peer`) & Self-Hosted Gateway (`gateway-server/`)**: join a self-hosted virtual network with one `zr-net://` invite link; automatic two-way discovery mounts member machines' remote-enabled sessions into each sidebar over LAN / UDP hole-punch direct paths (1-second seamless fallback to the gateway's end-to-end-encrypted relay, silent 60s re-probe upgrades); self-certifying node identities with independent local TOFU pinning; the gateway ships as a separate single-container deployment with a web console (virtual network management, five-state member admission, dual-port UDP STUN coordination, zero-plaintext relay).
-- **Plugin Bridge**: cooperative plugins and built-in adapters (such as `dsh-better-sidebar` `0.25.0`–`0.30.1`) route their panel HTTP and WebSocket requests in remote sessions to the host machine (with explicit owner consent for whole-machine data). See [Plugin Bridge Guide](docs/plugin-bridge.md).
-
-In depth: [Interface Design](docs/interface.md) · [Public Access & Relay Protocol](docs/remote-access.en.md)
-
----
-
-## 6. Advanced Settings & Field Reference
-
-Day-to-day setup and device management are handled entirely by the **Remote Access & Device Pairing Wizard** (or `npx dsh-zen-remote setup`). To fine-tune individual low-level fields, click `dsh-zen-remote` a second time under **Included components** on the plugin detail page.
-
-| Host Role & Pairing Cards | Shared Sessions List | Client Settings & Diagnostics |
+| Enable from sidebar menu | Toggle on mobile info card | Remote-closed banner |
 | --- | --- | --- |
-| ![Host role](docs/images/host-settings-role.png) ![Host pairing](docs/images/host-pairing.png) | ![Shared sessions](docs/images/host-settings-shares.png) | ![Client settings](docs/images/client-settings.png) |
+| ![Enable remote from sidebar](docs/images/host-share-menu.png) | <img src="docs/images/mobile-info-remote.png" alt="Mobile info remote switch" width="240"> | ![Remote closed banner](docs/images/client-remote-closed.png) |
+
+### Supported Official DSH Interfaces
+
+Every remote RPC/stream/HTTP route is guarded by a strict **per-method allowlist** (`src/relay-access.ts` + `src/fetch-route-intercept.ts`) rather than generic parameter scanning:
+
+| Surface | Supported Official DSH Interfaces | Isolation &amp; Notes |
+| --- | --- | --- |
+| **Sessions, Queue &amp; Subagents** | `session/follow`, `page`, `projections`, `list`, `control`, `search`, `create`, `fork`, `rename`, `selectModel`, `modelCatalog`, `prompt`, `cancel`, `updateQueue`, `attachment`, `sessionFeedback/record`; `subagents/prompt`, `interruptByUser` / `interruptByParent`; `$zr/events` (approval &amp; question forwarding); `workspace/follow`, `pinSession`, `unpinSession`, `archiveSession`, `unarchiveSession`, `insertSessionBefore` | Global streams/lists (`list`, `search`, `follow`, `control`, `@` candidates) are row-filtered by the share table; `dsh-session:` references in prompts, queue edits, and slash commands are validated server-side; `modelCatalog` isolates per-server groups and clears host `failures` |
+| **Workspace Files, Diffs &amp; Previews** | `workspaceFiles/list`, `changes`, `read`, `readBytes`, `stat`, `search`; `officeKit/render` &amp; `officeToPdf/render` (server-side LibreOffice PDF preview); HTTP `/api/changes.summary`, `/api/changes.diff`, `/api/session/uploadFileBinary`, `/api/file` (inline Markdown images/media) | Host-local OS actions (`/api/session.export`, `/api/changes.open`, `/api/present.open`, `/api/present.host`) are intentionally disabled/hidden in remote sessions |
+| **Server Terminal** | `terminal/attach` (0.2.2+ full-duplex PTY), `watch`, `environment`, `shells`, `create`, `write`, `resize`, `rename`, `close`, `follow`, `list`, `retain` | Runs on the serving machine as its OS user; closing remote access on a session terminates its remote terminal streams immediately |
+| **Forge Panel (Git / PR / Worktree)** *(DSH 0.2.2+)* | All 31 session-scoped `forgePanel/*` endpoints (`follow`, `branches`, `diffBases`, `localCommits`, `localDiff`, `localText`, `changeRequest*`, `*Worktree`, `review*`, `merge`, …) + global `forgePanel/changeRequestStates` stream | PR badge stream is filtered per workspace/session; older DSH hosts degrade gracefully without breaking core chat |
+| **Goals, Commands, Presets &amp; Interactive Tools** | `goals/get\|create\|edit\|complete\|pause\|resume\|clear`; `commands/list\|execute`; `agentPresets/list\|read\|select`; `sessionReferenceResolver/candidates`; `userQuestions/answer\|attachWait`; `actionCards/act`; `toolResults/watch`; `agentTeams/setEnabled`; `pluginRecommendations/describe`; `job/list\|follow\|kill`; `skills/list`; `messageFeedback/*`; `schedule/list` | When at least one session is shared, `agentPresets` exposes the serving machine's preset roster/YAML; when zero sessions are shared, `agentPresets/list` returns empty and `read` refuses |
+
+### `dsh-better-sidebar` Compatibility
+
+`dsh-zen-remote` ships a dedicated built-in adapter (`src/adapters/dsh-better-sidebar/`) for **`dsh-better-sidebar`** with wire-surface digest matching, so compatible releases bridge automatically without requiring `dsh-zen-remote` updates on every minor patch:
+
+- **Bridged surfaces**: `/sidebar/api/*` (file browser, editor, Git graph/history, tasks, sidechat), `/sidebar/file`, `/sidebar/sidechat-image`, `/sidebar/archive`, `/sidebar/upload`, `/sidebar/write`, `/sidebar/html` preview, plus all three WebSocket feeds (`/sidebar/ws/agent-opens`, `/sidebar/ws/fs-watch`, and frame-rewritten `/sidebar/ws/sidechat`).
+- **Safety boundaries**: classified as whole-machine data (requires explicit per-plugin owner consent under **Plugin Bridge**, default **OFF**); strips client-supplied `cwd` server-side so paths always resolve from the verified session; blocks `open.external` in remote sessions; keeps `/sidebar/bundle` local.
+- **Unbridged fallback**: if `dsh-better-sidebar` is on an unsupported version or consent is disabled, its host-file panels return fail-closed `503` rather than silently reading your local machine's disk.
+
+---
+
+## 4. Plugin Bridge Protocol
+
+Third-party DSH plugins whose session panels query their own backend routes on DSH's `webServer` can work seamlessly across remote sessions via the **Plugin Bridge Protocol** — **without taking any runtime dependency on `dsh-zen-remote`**.
+
+```mermaid
+flowchart LR
+  Browser["Remote Session UI<br/>(Virtual ID zr~server~id)"] -->|"HTTP / WebSocket"| Intercept["Client Route Interceptor<br/>(Check Handshake Digest + Rewrite IDs)"]
+  Intercept -->|"Mismatch / Consent Off / Deny"| Fail["503 x-zen-remote: unbridged<br/>(Never hits local plugin)"]
+  Intercept -->|"POST /_dsh/zen-remote/relay/v1/plugin<br/>or WS Byte Tunnel"| Relay["Relay Server<br/>(Verify Share Table + Consent)"]
+  Relay -->|"127.0.0.1 Loopback + Operator Cookie"| Target["Target Plugin Route<br/>(Serving Machine)"]
+```
+
+### How It Works
+
+1. **Two Integration Paths**:
+   - **Cooperative Declaration (Recommended for plugin authors)**: inject the optional `zenRemote` service (`ctx.inject(['zenRemote'], ...)`) and call `bridge.bridge({ plugin, version, routes })` with types imported from `dsh-zen-remote`. Supports `GET`/`HEAD`/`POST`/`PUT`/`PATCH`/`DELETE`, `stream`, `upgrade: true` (WebSocket byte or JSON-frame tunneling), `prefix: true`, `locator` (`query` / `path-segment` / `json-body`), `deny: true` (block local-only routes remotely), and `rewriteIds` (`true` or `{ fields }`). When `dsh-zen-remote` is not installed, `inject` simply never fires.
+   - **Built-in Pluggable Adapters (`src/adapters/`)**: maintained inside `dsh-zen-remote` for existing uncooperative plugins (such as `dsh-better-sidebar`); cooperative declarations always take precedence over adapters.
+2. **Handshake Digest Verification**: at connect time, both machines exchange `{ plugin, version, digest16 }` (a 16-hex SHA-256 of the normalized declaration). Both ends must match on plugin name, exact version, and declaration digest.
+3. **Session vs. Whole-Machine Scope**:
+   - `scope: 'session'` — authorized automatically per request against the share table.
+   - `scope: 'server'` — requires explicit host-owner consent in **Settings → Plugin Bridge** (default **OFF**).
+4. **Fail-Closed Guarantee**: any failure (`not-on-server`, `version-mismatch`, `declaration-mismatch`, `consent-off`, `route-denied`, `bad-query`, `offline`, etc.) returns a uniform `503` (`x-zen-remote: unbridged`) — remote panels **never** fall back to local machine data.
+
+See the full specification in [Plugin Bridge Guide](docs/plugin-bridge.md).
+
+---
+
+## 5. Mobile PWA &amp; Lock-Screen Push
+
+Both `peer` and `host` roles run the built-in mobile web experience and Web Push engine:
+
+- **Mobile App Shell**: two-level page stack (session list home + session page with edge swipe-back and Android back-gesture support, inline boot skeleton, content-hashed asset caching), auto-discovered plugin home chips, compact mobile composer with bottom sheets &amp; camera/file attachment uploads, and a session info card (6-tile stats with `tok/s` output speed, log export, rename, fork, archive, one-tap full-conversation PNG share image, and remote access switch).
+- **Lock-Screen Web Push** *(end-to-end encrypted `aes128gcm`; toggle `pushEnabled` globally or enable `pushSessionName` to prepend `Session: <name>`)*:
+  1. **System-triggered (always active when `pushEnabled` is on, never suppressed by debounce)**:
+     - **Tool waiting for approval**: pushes *"DSH needs your approval"* after `DSH_PUSH_APPROVAL_GRACE_MS` (default `5s` so fast auto-approvers handle it without buzzing your phone).
+     - **`ask_user_question` waiting for input**: pushes *"DSH is waiting for your answer"*.
+  2. **Model-triggered (`push_notify` tool)**: called by the agent when you asked to be notified on completion or when it hits a blocker requiring your decision (ordinary turn ends stay silent unless `pushTurnEnd` is turned on; `pushSummary` appends up to 120 chars of the final reply).
+
+---
+
+## 6. Advanced Settings &amp; Field Reference
+
+Day-to-day setup and device management are handled in the **Remote Access &amp; Device Pairing Wizard** (or `npx dsh-zen-remote setup`). To fine-tune individual low-level fields, click `dsh-zen-remote` a second time under **Included components** on the plugin detail page.
 
 <details>
-<summary>Expand full configuration field reference table & environment variables</summary>
+<summary>Expand full configuration field reference table &amp; environment variables</summary>
 
-Each field resolves in order: **environment variable > plugin row settings > `~/.dsh/lan-gate.config.json` > default**. Saving a field that requires a gateway/push restart reloads the plugin row automatically without restarting the app.
+Each field resolves in order: **environment variable &gt; plugin row settings &gt; `~/.dsh/lan-gate.config.json` &gt; default**. Saving a field that requires a gateway/push restart reloads the plugin row automatically without restarting DSH.
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `role` | `host` | `host` runs gateway + push + sharing; `client` connects to remote hosts; `peer` joins a self-hosted virtual network while keeping the serving halves (gateway, push, sharing) mounted |
-| `serverName` | computer name | **Device name** (≤ 40 chars): sidebar group title on a host, registered device name on a client; renaming on a client broadcasts the new name to all its paired servers (one-way — the server never rewrites it) |
-| `port` | `3088` | Gateway port; retries upward (up to +20) if occupied |
+| `role` | `host` | `peer` joins a self-hosted virtual network while keeping serving halves (gateway, push, sharing) mounted; `host` runs gateway + push + sharing; `client` connects to paired hosts only |
+| `serverName` | computer name | **Device name** (≤ 40 chars): sidebar group title on a serving machine, registered name on a client (renaming on a client broadcasts one-way to paired servers) |
+| `port` | `3088` | Gateway port; retries upward (up to `+20`) if occupied |
 | `host` | `127.0.0.1` | Gateway bind address (`127.0.0.1` for local proxy/tunnel, `0.0.0.0` for LAN/Tailscale direct) |
-| `targetPort` | *(auto)* | Local DSH Web UI port; leave empty to auto-discover the host's listening port |
+| `targetPort` | *(auto)* | Local DSH Web UI port; leave empty to auto-discover |
 | `rateLimit` | `120` | Per-minute cap on unpaired requests per client IP |
 | `trustedProxies` | empty | Comma-separated trusted proxy IPs when the reverse proxy runs on another machine |
 | `vapidSubject` | `mailto:admin@localhost` | Web Push contact (**must be a real `mailto:` or `https://` URL for iOS delivery**) |
-| `lang` | `auto` | Gateway & notification language: `auto` (browser `Accept-Language`), `zh`, or `en` |
-| `pushEnabled` | on | Master switch for session notifications; off stops every automatic push and unregisters the `push_notify` tool and its system-prompt hint |
-| `pushSessionName` | off | Open the notification body with `Session: <name>` (the source session's name; the title keeps the fixed event heading) |
-| `pushTurnEnd` | off | Also send a push when an ordinary turn finishes (approvals/questions always push) |
-| `pushEvents` | `agent/turn-stopping` | Comma-separated events that count as turn end when `pushTurnEnd` is on |
+| `lang` | `auto` | Gateway &amp; notification language: `auto` (browser `Accept-Language`), `zh`, or `en` |
+| `pushEnabled` | on | Master switch for session notifications; off stops automatic pushes and unregisters `push_notify` |
+| `pushSessionName` | off | Prepend `Session: <name>` to notification bodies |
+| `pushTurnEnd` | off | Also push when ordinary turns finish (approvals/questions always push) |
+| `pushEvents` | `agent/turn-stopping` | Comma-separated events treated as turn end when `pushTurnEnd` is on |
 | `pushDebounceMs` | `15000` | Minimum interval (ms) between automatic pushes |
 | `pushSummary` | off | Include up to 120 chars of the final reply in notification bodies |
 | `pushTool` | on | Register the model-callable `push_notify` tool |
 | `idleHours` | `48` | Idle-sleep window in hours for shared sessions; range `(0, 8760]` |
-| `maxServers` *(client)* | `8` | How many servers one sub-client may keep paired at once; integer `1..64`, read live (no reload needed); env `LAN_GATE_MAX_SERVERS` outranks it. In peer mode the network limit includes this machine: the remote mount limit is `maxPeersFromGateway - 1`, further capped by an explicit local `maxServers`; shrinking does not disconnect existing mounts |
-| `logLevel` | `info` | Logging threshold for `ctx.logger` and the diagnostic log ring: `info` / `debug` / `warn`; `debug` additionally records per-request detail lines. Read live — env `LAN_GATE_LOG_LEVEL` outranks it |
-| `autoShareNewSessions` | off | Automatically enable remote access on new sessions created on the host |
-| `pluginBridgeConsent` | `{}` | Whole-machine data consent map (`pluginName -> boolean`) for the plugin bridge |
-| `serverUrl` *(client)* | empty | Remote server gateway URL (`https://` required for public hosts; `http://` allowed on private LAN/Tailscale ranges). Legacy single-server field: the paired list now lives in `~/.dsh/zen-remote-state.json` (up to 8 servers) and these row credentials migrate into it automatically on first start |
-| `deviceToken` *(client)* | empty | Paired client token (secret field, redacted everywhere). Legacy single-server field, migrated into `~/.dsh/zen-remote-state.json` like `serverUrl`; new pairings go through the settings card / wizard and never echo the token back to the browser |
+| `maxServers` | `8` | Paired host limit (`1..64`, live read; env `LAN_GATE_MAX_SERVERS` outranks). In `peer` mode, remote mounts are bounded by `min(maxPeers - 1, maxServers)` |
+| `logLevel` | `info` | Logging threshold (`info` / `debug` / `warn`, live read; env `LAN_GATE_LOG_LEVEL` outranks) |
+| `autoShareNewSessions` | off | Automatically enable remote access on newly created sessions |
+| `pluginBridgeConsent` | `{}` | Whole-machine data consent map (`pluginName -> boolean`) for the Plugin Bridge |
+| `serverUrl` / `deviceToken` | empty | Legacy single-server client fields, auto-migrated into `~/.dsh/zen-remote-state.json` on first start |
 | `turnFoldDesktop` | off | Enable turn-process folding on desktop widths as well as mobile |
-| `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` | `0.42` / `400` / `15` | Soft-keyboard lift calibration fallback for environments where the OS hides keyboard height |
-| `maxUploadBytes` | 20 MB | Mobile attachment upload cap |
+| `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` | `0.42` / `400` / `15` | Soft-keyboard lift calibration fallback |
+| `maxUploadBytes` | `20 MB` | Mobile attachment upload cap |
 
-Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_HOST`, `LAN_GATE_TARGET_PORT`, `LAN_GATE_RATE_LIMIT`, `LAN_GATE_TRUSTED_PROXIES`, `LAN_GATE_VAPID_SUBJECT`, `LAN_GATE_LANG`, `LAN_GATE_LOG_LEVEL`, `DSH_PUSH_ENABLED`, `DSH_PUSH_SESSION_NAME`, `DSH_PUSH_TURN_END`, `DSH_PUSH_EVENTS`, `DSH_PUSH_DEBOUNCE_MS`, `DSH_PUSH_SUMMARY`, `DSH_PUSH_TOOL`, `DSH_PUSH_LANG`, `DSH_PUSH_APPROVAL_GRACE_MS`.
+Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_HOST`, `LAN_GATE_TARGET_PORT`, `LAN_GATE_RATE_LIMIT`, `LAN_GATE_TRUSTED_PROXIES`, `LAN_GATE_VAPID_SUBJECT`, `LAN_GATE_LANG`, `LAN_GATE_LOG_LEVEL`, `LAN_GATE_MAX_SERVERS`, `DSH_PUSH_ENABLED`, `DSH_PUSH_SESSION_NAME`, `DSH_PUSH_TURN_END`, `DSH_PUSH_EVENTS`, `DSH_PUSH_DEBOUNCE_MS`, `DSH_PUSH_SUMMARY`, `DSH_PUSH_TOOL`, `DSH_PUSH_LANG`, `DSH_PUSH_APPROVAL_GRACE_MS`.
 
 </details>
 
 ---
 
-## 7. Security Model, Version Tolerance & Known Notes
+## 7. Security Model, Version Tolerance &amp; Known Notes
 
-- **Trusted client & strict session isolation**: a paired desktop client runs terminals and file previews as the host's OS user, while unshared sessions are strictly filtered and refused at the relay layer. Even when binding `0.0.0.0` for LAN/Tailscale, the gateway's private-IP wall rejects any unproxied public internet IP (`403 public-direct-forbidden`), and all admin/wizard mutations are restricted to the host machine itself.
-- **Peer networking is zero-knowledge & end-to-end encrypted**: traffic between two member machines is sealed with per-session ephemeral X25519 + AES-256-GCM ciphers (forward-secret, identities signed); the gateway only routes opaque ciphertext frames and never holds session keys. Node identities are self-certifying (`nodeId` = hash of the Ed25519 public key), and each machine pins its peers' keys independently (TOFU): even a gateway-side identity reset stays blocked on every other machine (`mismatch`) until someone at that machine explicitly re-trusts the new identity.
-- **Version tolerance**: both ends must run the same `dsh-zen-remote` version; DSH host versions may differ (interface fingerprints are compared at handshake and degrade only mismatched panels).
+- **End-to-end encrypted peer mesh &amp; TOFU identity pinning**: peer-to-peer session traffic uses ephemeral **X25519 + AES-256-GCM** ciphers (forward-secret, bound to Ed25519 signatures); the relay gateway sees only 28-byte routing headers and holds no decryption keys. Each node derives a self-certifying `nodeId` from its public key and pins peers locally (`pinnedPeers`): even a gateway-side credential reset stays blocked (`mismatch`) until explicitly trusted on each peer machine.
+- **Trusted client &amp; strict session isolation**: paired desktop clients/peers run remote terminals and file previews as the serving machine's OS user, while unshared sessions are filtered and refused at the relay layer. In LAN mode (`0.0.0.0`), the gateway's private-IP wall rejects unproxied public internet IPs (`403 public-direct-forbidden`), and admin/wizard mutations stay loopback-only.
+- **Version tolerance**: both sides must run the same `dsh-zen-remote` version; DSH host versions may differ (interface fingerprints are compared at handshake and degrade only mismatched panels).
+
+In depth: [Public Access &amp; Relay Protocol](docs/remote-access.en.md) · [Interface Design](docs/interface.md) · [Plugin Bridge Guide](docs/plugin-bridge.md) · [Self-Hosted Gateway](gateway-server/README.md)
 
 <details>
-<summary>Expand security & state-file details, known limitations, iOS PWA notes & adapted third-party plugins</summary>
+<summary>Expand state files, known limitations, iOS PWA notes &amp; adapted third-party plugins</summary>
 
-**Data & state files**
-- The plugin reports nothing to any third party. Pairing state lives in `~/.dsh/lan-gate-state.json`; the unified state file `~/.dsh/zen-remote-state.json` (`0600`) stores the local `serverId`, shared-session table `sessions`, paired hosts list `servers` (up to 8 in client mode by default), and peer state (`peerIdentity`, `peerNetwork`, `pinnedPeers`); Cloudflare tokens live in `0600` files under `~/.dsh/zen-remote-ingress/`.
+**Data &amp; state files**
+- The plugin reports nothing to any third party. Pairing state lives in `~/.dsh/lan-gate-state.json`; the unified state file `~/.dsh/zen-remote-state.json` (`0600`) stores local `serverId`, `sessions` share table, `servers` list, and peer state (`peerIdentity`, `peerNetwork`, `pinnedPeers`); managed Cloudflare tokens live in `0600` files under `~/.dsh/zen-remote-ingress/`.
 
 **Known limitations**
 - With multiple DSH windows open simultaneously on a client, active-session detection may occasionally dismiss a closed session early.
@@ -363,22 +405,48 @@ Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_
 - **iOS 26.x viewport shrinkage**: home-screen PWAs may lose a status-bar height at the bottom (an iOS WebKit bug); three mitigation layers are built in, and restarting the PWA restores full height.
 - **iOS 26+ top progressive blur**: opening from the home screen may show a system `WKScrollPocket` blur across the top ~95px; entering any session and navigating back to the list clears it.
 
-**Third-party plugins with mobile & bridge adaptations**
+**Third-party plugins with mobile &amp; bridge adaptations**
 
 | Plugin | Adaptation summary | Version tested |
 | --- | --- | --- |
-| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | Full-screen mobile right-sidebar drawer with notch safe-area padding and swipe-back; **Plugin Bridge** built-in adapter for `0.25.0` through `0.30.1` (nine versions) (reads/writes host file/Git/task panels in remote sessions with host owner consent) | 0.19.1 / adapter 0.25–0.30.1 |
+| [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) | Full-screen mobile right-sidebar drawer with notch safe-area padding and swipe-back; **Plugin Bridge** built-in adapter with wire-surface matching | Built-in adapter |
 | [@nanmicoder/dsh-agent-teams](https://github.com/NanmiCoder/dsh-agent-teams) | Repositions AgentTeams floating pill below session header and preserves parent session back-link | 0.1.9 |
-| [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | Moves usage & balance entry into the mobile home chips bar | 0.2.9 |
+| [@ychris12138/dsh-usage-stats](https://github.com/Ychris12138/dsh-usage-stats) | Moves usage &amp; balance entry into the mobile home chips bar | 0.2.9 |
 | [@opendsh/dsh-plugin-scheduled-tasks](https://github.com/Ceelog/dsh-plugins) | Moves scheduled tasks entry into the mobile home chips bar | 0.2.3 |
 | dsh-at-file | Deduplicates `.dsh-uploads/` attachment rows on mobile | 0.6.7 |
 | [@ace-zone/dsh-market](https://www.npmjs.com/package/@ace-zone/dsh-market) | Compacts marketplace modal header on mobile so the close button stays reachable | 0.1.66 |
-| [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit) | Works with mobile attachment uploads for image Q&A/OCR | — |
+| [dsh-vision-toolkit](https://www.npmjs.com/package/@anionex/dsh-vision-toolkit) | Works with mobile attachment uploads for image Q&amp;A/OCR | — |
 | [dsh-web-ui bundle](https://www.npmjs.com/package/@linxin666/dsh-web-ui-all) | Mobile width-constrained centered overlays for file tree / preview | — |
 
 </details>
 
 ---
+
+## npm Downloads
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/dsh-zen-remote"><img src="https://img.shields.io/npm/dt/dsh-zen-remote?style=flat-square&color=0B7285&label=total%20downloads&logo=npm&logoColor=white" alt="npm total downloads"></a>
+  <a href="https://www.npmjs.com/package/dsh-zen-remote"><img src="https://img.shields.io/npm/dm/dsh-zen-remote?style=flat-square&color=5B4CF0&label=monthly%20downloads" alt="npm monthly downloads"></a>
+</p>
+
+<p align="center">
+  <a href="https://npm-history.com/#dsh-zen-remote">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://npm-history.com/api/svg?packages=dsh-zen-remote&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://npm-history.com/api/svg?packages=dsh-zen-remote" />
+      <img alt="npm Weekly Download History" src="https://npm-history.com/api/svg?packages=dsh-zen-remote" />
+    </picture>
+  </a>
+</p>
+
+## Documentation Index
+
+| Document | Scope |
+| --- | --- |
+| [Public Access &amp; Relay Protocol](docs/remote-access.en.md) | Reverse proxy snippets, device roles &amp; pairing, relay methods, peer virtual networking, security boundaries |
+| [Interface Design](docs/interface.md) | Responsive breakpoints, settings &amp; wizard components, mobile safe-area system, compatible plugins |
+| [Plugin Bridge Guide](docs/plugin-bridge.md) | Bridge declaration API, WebSocket byte/JSON-frame tunneling, fail-closed `503` contract |
+| [Self-Hosted Relay Gateway](gateway-server/README.md) | Docker / Node.js deployment, native TLS, environment variables, web console &amp; `zr-net://` links |
 
 ## Upstream credits
 
@@ -387,3 +455,5 @@ This plugin's interface layer derives from [mexiaosqwq/dsh-web-mobile](https://g
 ## License
 
 [MIT](LICENSE)
+
+<p align="right"><a href="#contents">⬆ Back to Top</a></p>
