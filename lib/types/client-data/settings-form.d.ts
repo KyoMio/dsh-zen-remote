@@ -334,6 +334,10 @@ export interface PeerStatusView {
      * cap is unknown — `false` would claim room that may not exist. */
     limitReached: boolean | undefined;
     peers: PeerStatusDeviceView[];
+    /** T4: the effective direct-RTT cap (ms, 0 = uncapped), verbatim from the
+     * body when it carried a safe integer ≥ 0; `undefined` on an older body —
+     * the demoted note's cap display falls back to '—' then. */
+    directCapMs: number | undefined;
     /** PC-14a: the sync-readiness block (the third light's data). `undefined`
      * on an older body — never guessed from the peers rows. */
     sync: PeerSyncReadinessView | undefined;
@@ -705,7 +709,7 @@ export declare function boolField(field: string): SettingsFieldSpec;
  */
 export declare function consentField(field: string): SettingsFieldSpec;
 /** Names of the row fields the settings page edits, in group order. */
-export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushEnabled' | 'pushSessionName' | 'pushDebounceMs' | 'lang' | 'logLevel' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'pluginBridgeConsent' | 'peerDirectMaxRttMs';
+export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushEnabled' | 'pushSessionName' | 'pushDebounceMs' | 'lang' | 'logLevel' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'pluginBridgeConsent';
 /** Longest legal `serverName`, mirroring src/config.ts's cap. */
 export declare const SERVER_NAME_MAX = 40;
 /** Upper bound of `idleHours`, mirroring src/config.ts. */
@@ -834,8 +838,6 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
      * 插件桥 toggles stage the next map wholesale — but its `invalid` flag
      * (a malformed draft) still gates the save like any field's. */
     pluginBridgeConsent: SettingsFieldState;
-    /** The peer card's direct-RTT cap (ms, 0 = no cap); rendered only on a peer page. */
-    peerDirectMaxRttMs: SettingsFieldState;
     deviceToken: SettingsSecretFieldState;
     /** A restart-required field ({@link RESTART_FIELDS}) has a staged change a
      * save would actually write: the save will move the row and the host

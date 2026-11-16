@@ -549,6 +549,7 @@ test('writePeerNetwork / readPeerNetwork round-trip; undefined clears; every oth
     joinKey: 'join-secret',
     disabledNodes: ['deadbeef'],
     maxPeersFromGateway: 12,
+    peerDirectMaxRttMsFromGateway: 150,
     joinedAt: 1000,
   }
   writePeerNetwork(file, net)
@@ -569,6 +570,37 @@ test('writePeerNetwork / readPeerNetwork round-trip; undefined clears; every oth
 function listLength(file) {
   return mod.listPairedServers(file).length
 }
+
+test('readPeerNetwork drops a malformed peerDirectMaxRttMsFromGateway, keeps the rest (T4)', (t) => {
+  const { writePeerNetwork, readPeerNetwork } = mod
+  const file = tempStateFile(t)
+  for (const junk of [-1, 10001, 1.5, '300', NaN]) {
+    writePeerNetwork(file, {
+      gatewayWsUrl: 'wss://gw.example.com:19393',
+      gatewayHttpOrigin: 'https://gw.example.com:19393',
+      networkId: '9f4e2a1088c3b001',
+      peerDirectMaxRttMsFromGateway: junk,
+      joinedAt: 1,
+    })
+    assert.equal(
+      readPeerNetwork(file).peerDirectMaxRttMsFromGateway,
+      undefined,
+      `${String(junk)} fails the 0..10000 integer gate and is dropped, not kept`,
+    )
+    assert.equal(readPeerNetwork(file).networkId, '9f4e2a1088c3b001', 'the record itself survived')
+  }
+  // The legal band edges read back verbatim (0 = the documented "no cap").
+  for (const good of [0, 10000]) {
+    writePeerNetwork(file, {
+      gatewayWsUrl: 'wss://gw.example.com:19393',
+      gatewayHttpOrigin: 'https://gw.example.com:19393',
+      networkId: '9f4e2a1088c3b001',
+      peerDirectMaxRttMsFromGateway: good,
+      joinedAt: 1,
+    })
+    assert.equal(readPeerNetwork(file).peerDirectMaxRttMsFromGateway, good)
+  }
+})
 
 test('setPeerNodeDisabled toggles a nodeId in peerNetwork.disabledNodes (PG-2)', (t) => {
   const { writePeerNetwork, setPeerNodeDisabled, readPeerNetwork } = mod

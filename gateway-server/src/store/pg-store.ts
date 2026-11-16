@@ -23,6 +23,7 @@ import {
   parseExtendedSettingsRows,
   parseSettingsRows,
   validateGroupInput,
+  PEER_DIRECT_MAX_RTT_MS_DEFAULT,
 } from './types.js';
 import type {
   AdmissionMode,
@@ -88,9 +89,12 @@ const PG_SCHEMA_STATEMENTS: ReadonlyArray<string> = [
     admission_mode TEXT NOT NULL CHECK (admission_mode IN ('key','manual','both')),
     join_key_enc TEXT NOT NULL,
     max_peers INTEGER NOT NULL CHECK (max_peers BETWEEN 1 AND 64),
+    peer_direct_max_rtt_ms INTEGER NOT NULL DEFAULT 300 CHECK (peer_direct_max_rtt_ms BETWEEN 0 AND 10000),
     created_at TIMESTAMPTZ NOT NULL
   )`,
   'CREATE INDEX IF NOT EXISTS idx_networks_owner_id ON networks(owner_id)',
+  // 旧库平滑迁移：与下方 users 三条同款 ADD COLUMN IF NOT EXISTS（peer-network-switch T3）
+  `ALTER TABLE networks ADD COLUMN IF NOT EXISTS peer_direct_max_rtt_ms INTEGER NOT NULL DEFAULT ${PEER_DIRECT_MAX_RTT_MS_DEFAULT}`,
   `CREATE TABLE IF NOT EXISTS network_members (
     network_id TEXT NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
     node_id TEXT NOT NULL,
@@ -237,6 +241,9 @@ function mapNetworkRow(row: Row): NetworkRecord {
     admissionMode: str(row.admission_mode) as AdmissionMode,
     joinKeyEnc: str(row.join_key_enc),
     maxPeers: toNum(row.max_peers),
+    peerDirectMaxRttMs: row.peer_direct_max_rtt_ms === null || row.peer_direct_max_rtt_ms === undefined
+      ? PEER_DIRECT_MAX_RTT_MS_DEFAULT
+      : toNum(row.peer_direct_max_rtt_ms),
     createdAt: toIso(row.created_at),
   };
 }
@@ -1077,8 +1084,8 @@ export class PgStore implements GatewayStore {
       }
       const id = randomBytes(8).toString('hex');
       const inserted = await tx(
-        'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-        [id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, new Date()],
+        'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+        [id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, PEER_DIRECT_MAX_RTT_MS_DEFAULT, new Date()],
       );
       return mapNetworkRow(inserted.rows[0] as Row);
     });
@@ -1113,12 +1120,14 @@ export class PgStore implements GatewayStore {
       name: patch.name ?? existing.name,
       admissionMode: patch.admissionMode ?? existing.admissionMode,
       maxPeers: patch.maxPeers ?? existing.maxPeers,
+      peerDirectMaxRttMs: patch.peerDirectMaxRttMs ?? existing.peerDirectMaxRttMs,
     };
-    await this.query('UPDATE networks SET name = $2, admission_mode = $3, max_peers = $4 WHERE id = $1', [
+    await this.query('UPDATE networks SET name = $2, admission_mode = $3, max_peers = $4, peer_direct_max_rtt_ms = $5 WHERE id = $1', [
       id,
       next.name,
       next.admissionMode,
       next.maxPeers,
+      next.peerDirectMaxRttMs,
     ]);
     return this.getNetwork(id);
   }

@@ -25,6 +25,7 @@ import {
   parseExtendedSettingsRows,
   parseSettingsRows,
   validateGroupInput,
+  PEER_DIRECT_MAX_RTT_MS_DEFAULT,
 } from './types.js';
 import type {
   AdmissionMode,
@@ -121,6 +122,7 @@ CREATE TABLE IF NOT EXISTS networks (
   admission_mode TEXT NOT NULL CHECK (admission_mode IN ('key','manual','both')),
   join_key_enc TEXT NOT NULL,
   max_peers INTEGER NOT NULL CHECK (max_peers BETWEEN 1 AND 64),
+  peer_direct_max_rtt_ms INTEGER NOT NULL DEFAULT 300 CHECK (peer_direct_max_rtt_ms BETWEEN 0 AND 10000),
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_networks_owner_id ON networks(owner_id);
@@ -219,6 +221,9 @@ function mapNetworkRow(row: Row): NetworkRecord {
     admissionMode: str(row.admission_mode) as AdmissionMode,
     joinKeyEnc: str(row.join_key_enc),
     maxPeers: toNum(row.max_peers),
+    peerDirectMaxRttMs: row.peer_direct_max_rtt_ms === null || row.peer_direct_max_rtt_ms === undefined
+      ? PEER_DIRECT_MAX_RTT_MS_DEFAULT
+      : toNum(row.peer_direct_max_rtt_ms),
     createdAt: str(row.created_at),
   };
 }
@@ -255,6 +260,7 @@ export class SqliteStore implements GatewayStore {
     this.db.exec('PRAGMA busy_timeout = 5000;');
     this.db.exec(SQLITE_SCHEMA);
     this.migrateUserColumns();
+    this.migrateNetworkColumns();
     // 无 seed 的重开也做缺键补齐 + 默认组兜底（INSERT OR IGNORE 不会覆盖已有值）
     this.seedSettings(options.seed ?? {});
   }
@@ -272,6 +278,17 @@ export class SqliteStore implements GatewayStore {
     }
     if (!present.has('email_verified_at')) {
       this.db.exec('ALTER TABLE users ADD COLUMN email_verified_at TEXT');
+    }
+  }
+
+  /** 旧库平滑迁移：networks 缺列即补（peer-network-switch T3 新增 RTT 上限） */
+  private migrateNetworkColumns(): void {
+    const columns = this.db.prepare('PRAGMA table_info(networks)').all() as Array<Row>;
+    const present = new Set(columns.map((column) => str(column.name)));
+    if (!present.has('peer_direct_max_rtt_ms')) {
+      this.db.exec(
+        `ALTER TABLE networks ADD COLUMN peer_direct_max_rtt_ms INTEGER NOT NULL DEFAULT ${PEER_DIRECT_MAX_RTT_MS_DEFAULT} CHECK (peer_direct_max_rtt_ms BETWEEN 0 AND 10000)`,
+      );
     }
   }
 
@@ -944,9 +961,9 @@ export class SqliteStore implements GatewayStore {
       }
       this.db
         .prepare(
-          'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         )
-        .run(id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, nowIso());
+        .run(id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, PEER_DIRECT_MAX_RTT_MS_DEFAULT, nowIso());
     });
     const row = this.getNetworkRow(id);
     if (row === undefined) throw new StoreError('network-not-found', 'created network disappeared');
@@ -986,10 +1003,11 @@ export class SqliteStore implements GatewayStore {
       name: patch.name ?? current.name,
       admissionMode: patch.admissionMode ?? current.admissionMode,
       maxPeers: patch.maxPeers ?? current.maxPeers,
+      peerDirectMaxRttMs: patch.peerDirectMaxRttMs ?? current.peerDirectMaxRttMs,
     };
     this.db
-      .prepare('UPDATE networks SET name = ?, admission_mode = ?, max_peers = ? WHERE id = ?')
-      .run(next.name, next.admissionMode, next.maxPeers, id);
+      .prepare('UPDATE networks SET name = ?, admission_mode = ?, max_peers = ?, peer_direct_max_rtt_ms = ? WHERE id = ?')
+      .run(next.name, next.admissionMode, next.maxPeers, next.peerDirectMaxRttMs, id);
     const updated = this.getNetworkRow(id);
     return updated === undefined ? null : mapNetworkRow(updated);
   }

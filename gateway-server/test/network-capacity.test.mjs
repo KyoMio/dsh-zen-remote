@@ -349,13 +349,15 @@ describe('PC-08a 网络容量变更广播', () => {
       const first = await setupSingleNode(gw, { maxPeers: 4, name: 'alpha' });
       const second = await setupSingleNode(gw, { maxPeers: 4, name: 'bravo' });
 
-      const view = await patchNetwork(gw, first.net.id, { maxPeers: 10 });
+      const view = await patchNetwork(gw, first.net.id, { maxPeers: 10, peerDirectMaxRttMs: 150 });
       assert.equal(view.maxPeers, 10, 'PATCH 响应携带新容量');
+      assert.equal(view.peerDirectMaxRttMs, 150, 'PATCH 响应携带新 RTT 上限');
 
       const updated = await wsJson(first.ws);
       assert.equal(updated.type, 'network-updated');
       assert.equal(updated.networkId, first.net.id);
       assert.equal(updated.maxPeers, 10, '增量消息携带网络总席位原始值');
+      assert.equal(updated.peerDirectMaxRttMs, 150, '增量消息携带 RTT 上限');
       assert.equal('joinKey' in updated, false, '控制消息不携带 joinKey 等设置');
 
       await wsSilence(second.ws, 300);
@@ -394,6 +396,7 @@ describe('PC-08a 网络容量变更广播', () => {
       assert.equal(hanging.type, 'welcome');
       assert.equal(hanging.status, 'pending');
       assert.equal(hanging.maxPeers, 4);
+      assert.equal(hanging.peerDirectMaxRttMs, 300, 'pending welcome 同样携带 RTT 上限默认值');
 
       await patchNetwork(gw, net.id, { maxPeers: 12 });
       await wsSilence(wsPending, 300); // 挂起连接只更新快照，不收增量消息
@@ -404,6 +407,7 @@ describe('PC-08a 网络容量变更广播', () => {
       assert.equal(promoted.type, 'welcome');
       assert.equal(promoted.status, 'authorized');
       assert.equal(promoted.maxPeers, 12, 'approve welcome 用最新容量而非握手旧值');
+      assert.equal(promoted.peerDirectMaxRttMs, 300, 'approve welcome 携带 RTT 上限');
     } finally {
       await gw.close();
     }
@@ -472,7 +476,7 @@ describe('PC-08a 网络容量变更广播', () => {
       await patchNetwork(gw, net.id, { maxPeers: 20 });
       assert.equal((await wsJson(ws)).maxPeers, 20);
 
-      await gw.hub.hooks.onNetworkUpdated(net.id, 20);
+      await gw.hub.hooks.onNetworkUpdated(net.id, 20, 300);
       await wsSilence(ws, 200);
     } finally {
       await gw.close();
@@ -514,8 +518,42 @@ describe('PC-08a 网络容量变更广播', () => {
       const rewelcome = await wsJson(wsA2);
       assert.equal(rewelcome.status, 'authorized');
       assert.equal(rewelcome.maxPeers, 15, '重连 welcome 带最新 maxPeers');
+      assert.equal(rewelcome.peerDirectMaxRttMs, 300, '重连 welcome 带 RTT 上限');
       wsA2.close();
       wsB.close();
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('peerDirectMaxRttMs 仅值广播与双字段幂等：单改 RTT 有推送、双同值跳过、再仅改 maxPeers 有推送', async () => {
+    const gw = await startGateway();
+    try {
+      const { net, ws } = await setupSingleNode(gw, { maxPeers: 4 });
+      // auth 已播种 {4, 300}：同值 PATCH 不发冗余广播
+      await patchNetwork(gw, net.id, { peerDirectMaxRttMs: 300 });
+      await wsSilence(ws, 200);
+
+      // 仅改 RTT：去重必须含新字段，不能因 maxPeers 未变就跳过
+      const view = await patchNetwork(gw, net.id, { peerDirectMaxRttMs: 120 });
+      assert.equal(view.peerDirectMaxRttMs, 120);
+      const updated = await wsJson(ws);
+      assert.equal(updated.type, 'network-updated');
+      assert.equal(updated.maxPeers, 4, '未变的 maxPeers 按库值透传');
+      assert.equal(updated.peerDirectMaxRttMs, 120);
+
+      // 双字段都同值 → 幂等跳过
+      await patchNetwork(gw, net.id, { peerDirectMaxRttMs: 120 });
+      await patchNetwork(gw, net.id, { maxPeers: 4 });
+      await gw.hub.hooks.onNetworkUpdated(net.id, 4, 120);
+      await wsSilence(ws, 200);
+
+      // 再仅改 maxPeers：仍然推送（去重是双字段与运算）
+      await patchNetwork(gw, net.id, { maxPeers: 6 });
+      const cap = await wsJson(ws);
+      assert.equal(cap.type, 'network-updated');
+      assert.equal(cap.maxPeers, 6);
+      assert.equal(cap.peerDirectMaxRttMs, 120, 'RTT 上限按库中最新值透传');
     } finally {
       await gw.close();
     }
@@ -536,12 +574,12 @@ describe('PS-5 直接容量钩子异常恢复与在途读取收敛', () => {
       // 模拟钩子临时抛出一次：PATCH 仍落库成功，广播滞后在 10
       const origHook = gw.hub.hooks.onNetworkUpdated;
       let throwOnce = true;
-      gw.hub.hooks.onNetworkUpdated = (id, cap) => {
+      gw.hub.hooks.onNetworkUpdated = (id, cap, rtt) => {
         if (throwOnce) {
           throwOnce = false;
           throw new Error('controlled hook failure');
         }
-        return origHook(id, cap);
+        return origHook(id, cap, rtt);
       };
       try {
         const view = await patchNetwork(gw, net.id, { maxPeers: 20 });
@@ -592,12 +630,12 @@ describe('PS-5 直接容量钩子异常恢复与在途读取收敛', () => {
       // PATCH 20 落库成功但钩子临时抛出一次：挂起连接快照仍是 4
       const origHook = gw.hub.hooks.onNetworkUpdated;
       let throwOnce = true;
-      gw.hub.hooks.onNetworkUpdated = (id, cap) => {
+      gw.hub.hooks.onNetworkUpdated = (id, cap, rtt) => {
         if (throwOnce) {
           throwOnce = false;
           throw new Error('controlled hook failure');
         }
-        return origHook(id, cap);
+        return origHook(id, cap, rtt);
       };
       try {
         assert.equal((await patchNetwork(gw, net.id, { maxPeers: 20 })).maxPeers, 20);
@@ -613,6 +651,7 @@ describe('PS-5 直接容量钩子异常恢复与在途读取收敛', () => {
       assert.equal(promoted.type, 'welcome');
       assert.equal(promoted.status, 'authorized');
       assert.equal(promoted.maxPeers, 20, '晋升 welcome 以库中最新事实收敛');
+      assert.equal(promoted.peerDirectMaxRttMs, 300);
     } finally {
       await gw.close();
     }

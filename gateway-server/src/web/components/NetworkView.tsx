@@ -58,6 +58,7 @@ export interface NetworkPatchInput {
   name?: string;
   admissionMode?: AdmissionMode;
   maxPeers?: number;
+  peerDirectMaxRttMs?: number;
 }
 
 export interface NetworkViewProps {
@@ -141,6 +142,7 @@ interface SettingsModalProps {
 function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPatch, onDelete, onRotate }: SettingsModalProps) {
   const [name, setName] = useState(network.name);
   const [maxPeersDraft, setMaxPeersDraft] = useState(String(network.maxPeers));
+  const [rttCapDraft, setRttCapDraft] = useState(String(network.peerDirectMaxRttMs));
   // 危险按钮的两击确认统一走 ui.confirmTarget：同一时刻只有一个处于确认态，
   // 且点弹窗外任何位置都会被 App 的 document 级监听取消
   const confirmingRotate = ui.confirmTarget === 'rotate-key';
@@ -170,6 +172,15 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
       onPatch({ maxPeers: value });
     } else {
       setMaxPeersDraft(String(network.maxPeers));
+    }
+  };
+  // 直连 RTT 上限无组限额：仅做区间校验，非法值回滚服务端真值（与 maxPeers 同款提交时机）
+  const commitRttCap = (): void => {
+    const value = Number(rttCapDraft);
+    if (Number.isInteger(value) && value >= 0 && value <= 10000 && value !== network.peerDirectMaxRttMs) {
+      onPatch({ peerDirectMaxRttMs: value });
+    } else {
+      setRttCapDraft(String(network.peerDirectMaxRttMs));
     }
   };
   const submitOnEnter = (event: { key: string; preventDefault: () => void }, commit: () => void): void => {
@@ -221,6 +232,25 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
           )}
           {unlimitedPeers && <p className="field-hint">{t('account.adminQuotaNote')}</p>}
           {grandfathered && <p className="field-hint">{t('network.grandfatheredPeerCap')}</p>}
+        </div>
+
+        <div className="field">
+          <label className="field-label" htmlFor="network-settings-rtt-cap">
+            {t('network.directRttCap')}
+          </label>
+          <input
+            id="network-settings-rtt-cap"
+            className="input input-narrow mono"
+            type="number"
+            min={0}
+            max={10000}
+            step={1}
+            value={rttCapDraft}
+            onChange={(e) => setRttCapDraft(e.target.value)}
+            onBlur={commitRttCap}
+            onKeyDown={(e) => submitOnEnter(e, commitRttCap)}
+          />
+          <p className="field-hint">{t('network.directRttCapHint')}</p>
         </div>
 
         <fieldset className="field radio-group">

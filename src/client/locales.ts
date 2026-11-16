@@ -693,9 +693,6 @@ export const zh = {
   'settings.peer.title': '网络与设备互通',
   'settings.peer.subtitle': '作为节点端与其他电脑互挂会话；下方保留手机 / 浏览器接入的配置',
   'settings.peer.notConfigured': '尚未加入设备网络——可直接在下方粘贴邀请链接或输入中继网关地址（由网关侧手动审批）加入',
-  'settings.fieldPeerDirectMaxRttMs': '直连延迟上限（毫秒）',
-  'settings.fieldPeerDirectMaxRttMsHint': 'UDP 直连实测延迟超过该值时自动走网关中转，降至上限七成后回切直连。默认 300；0 表示不设上限（始终直连）。0–10000。',
-  'settings.invalidRtt': '需要 0–10000 的整数（0 = 不限制）',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -1386,9 +1383,6 @@ export const en: Record<MobileNavKey, string> = {
   'settings.peer.title': 'Network & device mesh',
   'settings.peer.subtitle': 'As a peer node this machine shares sessions with the other computers; the phone / browser access settings stay below',
   'settings.peer.notConfigured': 'No device network joined yet — paste an invite link or enter the relay gateway address below to request approval',
-  'settings.fieldPeerDirectMaxRttMs': 'Direct RTT cap (ms)',
-  'settings.fieldPeerDirectMaxRttMsHint': 'Traffic falls back to gateway relay when the measured UDP RTT exceeds this cap, and returns to direct once it stays under 70% of it. Default 300; 0 means no cap (always direct). 0–10000.',
-  'settings.invalidRtt': 'Enter an integer 0–10000 (0 = no cap)',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

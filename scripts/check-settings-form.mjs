@@ -73,7 +73,7 @@ const VALUES = {
   vapidSubject: 'mailto:admin@example.net', lang: 'zh', logLevel: 'debug', pushSummary: true,
   pushTurnEnd: false, pushTool: true, pushEnabled: true, pushSessionName: false,
   pushDebounceMs: 5000, serverName: 'studio',
-  idleHours: 24, autoShareNewSessions: false, peerDirectMaxRttMs: 0,
+  idleHours: 24, autoShareNewSessions: false,
 }
 
 const SOURCES = {
@@ -81,7 +81,7 @@ const SOURCES = {
   vapidSubject: 'row', lang: 'default', logLevel: 'env', pushSummary: 'row', pushTurnEnd: 'default',
   pushTool: 'env', pushEnabled: 'default', pushSessionName: 'row',
   pushDebounceMs: 'row', serverName: 'row', idleHours: 'default',
-  autoShareNewSessions: 'default', peerDirectMaxRttMs: 'row',
+  autoShareNewSessions: 'default',
 }
 
 const STATUS = {
@@ -134,9 +134,7 @@ assert.equal(view.fields.pushSessionName.savedRowInvalid, false, 'the row layer 
 assert.equal(view.fields.logLevel.value, 'debug', 'logLevel is a first-class settings field')
 assert.equal(view.fields.logLevel.source, 'env')
 assert.equal(view.fields.logLevel.locked, true, 'an env-supplied logLevel locks the control')
-assert.equal(view.fields.peerDirectMaxRttMs.value, 0, 'peerDirectMaxRttMs is a first-class settings field')
-assert.equal(view.fields.peerDirectMaxRttMs.source, 'row')
-assert.equal(view.fields.peerDirectMaxRttMs.locked, false)
+assert.equal('peerDirectMaxRttMs' in view.fields, false, 'T4: the direct-RTT cap is gateway-owned, not a settings field')
 
 // Devices and the pairing code are read from the NESTED gateway payload.
 assert.deepEqual(view.devices.map((d) => [d.id, d.role, d.kind, d.hasPush]), [
@@ -342,22 +340,9 @@ test('validation: out-of-range drafts block the save instead of being dropped', 
   form.stage('rateLimit', '0')
   assert.equal(form.getSnapshot().rateLimit.invalid, true, 'rateLimit is a positive integer')
 
-  // T6: logLevel only accepts its three words; peerDirectMaxRttMs is the
-  // 0..10000 integer band the engine caps at (SPEC: 0 = no limit).
+  // T6: logLevel only accepts its three words.
   form.stage('logLevel', 'trace')
   assert.equal(form.getSnapshot().logLevel.invalid, true, 'logLevel accepts info | debug | warn only')
-  form.stage('peerDirectMaxRttMs', '-1')
-  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, true, 'the RTT cap is 0 or a positive integer')
-  form.stage('peerDirectMaxRttMs', '10001')
-  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, true, 'the RTT cap tops out at 10000 ms')
-  form.stage('peerDirectMaxRttMs', '1.5')
-  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, true, 'the RTT cap is a whole number')
-  form.stage('peerDirectMaxRttMs', '0')
-  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, false, '0 is legal — it is the documented "no cap"')
-  form.stage('peerDirectMaxRttMs', '300')
-  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, false)
-  form.stage('peerDirectMaxRttMs', '')
-  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, false, 'an empty draft stages as a clear, not an invalid value')
 
   // A junk effective value formats back to the first option — 'info' must
   // lead options[0] for oneOfField's fallback. (A junk STORED value never
@@ -404,9 +389,8 @@ test('a legal draft plans a set; a draft equal to the current value plans nothin
   form.stage('pushSummary', 'true')
   form.stage('lang', 'zh')
   form.stage('role', 'client')
-  // T6: both new fields take the same save path as every other staged field.
+  // T6: logLevel takes the same save path as every other staged field.
   form.stage('logLevel', 'warn')
-  form.stage('peerDirectMaxRttMs', '450')
   assert.equal(form.canSave(), true)
 
   form.stage('host', '127.0.0.1') // equals the display baseline: no phantom override
@@ -417,7 +401,6 @@ test('a legal draft plans a set; a draft equal to the current value plans nothin
   assert.deepEqual(ops, [
     { op: 'set', path: ['lang'], value: 'zh' },
     { op: 'set', path: ['logLevel'], value: 'warn' },
-    { op: 'set', path: ['peerDirectMaxRttMs'], value: 450 },
     { op: 'set', path: ['port'], value: 4001 },
     { op: 'set', path: ['pushSummary'], value: true },
     { op: 'set', path: ['role'], value: 'client' },

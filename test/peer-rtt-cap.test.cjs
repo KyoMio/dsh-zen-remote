@@ -1,19 +1,25 @@
 /* dsh-zen-remote · peer-resilience T5 (tasks/peer-resilience/todo.md)
  *
- * src/peer/engine.ts — the direct-path RTT cap policy:
- *   - `peerDirectMaxRttMs` (default 300, env LAN_GATE_PEER_DIRECT_MAX_RTT_MS,
- *     0..10000) gates the post-handshake UDP switch: cap 0 keeps the legacy
- *     "ready means direct" behaviour; cap > 0 holds the member on the relay
- *     path until the first measured keepalive PONG proves rtt <= cap.
+ * src/peer/engine.ts — the direct-path RTT cap policy (2.5.x re-anchored):
+ *   - the cap is GATEWAY-OWNED since T4 (peer-network-switch): welcome and
+ *     `network-updated` carry `peerDirectMaxRttMs` (0..10000), it persists as
+ *     `peerNetwork.peerDirectMaxRttMsFromGateway`, and the effective cap
+ *     resolves `capFromGateway ?? options.directMaxRttMs?.() ?? 300` —
+ *     options stays a test-injection channel; production wires nothing.
+ *   - cap 0 keeps the legacy "ready means direct" behaviour; cap > 0 pins
+ *     the member at 'relay' until TWO consecutive keepalive samples
+ *     <= cap*0.7 promote it.
  *   - once direct, a demotion needs the CURRENT sample AND the pre-update
  *     EWMA (alpha 0.3) both over the cap — one 2000ms spike over a healthy
- *     baseline must not relay the path.
- *   - demoted members recover only on a streak of 3 consecutive samples at
- *     rtt <= cap * 0.7; a single in-streak high sample resets the count.
+ *     baseline must not relay the path — or two consecutive unanswered PINGs
+ *     (one over-limit sample equivalent).
+ *   - promotion (first chain AND post-demotion alike) needs a streak of 2
+ *     consecutive samples at rtt <= cap * 0.7; a single in-streak high
+ *     sample or unanswered PING resets the count.
  *   - the cap getter is read live per sample: flipping it to 0 promotes the
  *     member on the next sample.
  *   - onDirectLost wipes measurement/demotion state; a re-established
- *     session walks the first-sample gate again.
+ *     session walks the 2-sample gate again.
  *   - status peers rows carry directRttMs (rounded EWMA) + directDemoted,
  *     and a demoted member reports path 'relay' with rttMs null.
  *
@@ -61,7 +67,7 @@ const source = file => loadSource(path.resolve(__dirname, '../src', file))
 const { createPeerEngine } = source('peer/engine.ts')
 const { PeerPunchManager } = source('peer/punch.ts')
 const { generatePeerIdentity } = source('peer/crypto.ts')
-const { ensurePeerIdentity, writePeerNetwork } = source('state-store.ts')
+const { ensurePeerIdentity, writePeerNetwork, readPeerNetwork } = source('state-store.ts')
 const { PeerFrameType } = source('peer/wire.ts')
 
 const NET_ID = '0123456789abcdef'
@@ -164,6 +170,10 @@ function makeGate(realSocket) {
   const gate = {
     pongDelayMs: PONG_DELAY_MS,
     dropAll: false,
+    // Only eat PONG replies: A's keepalives go unanswered while B's own PINGs
+    // still reach A — lastSeen keeps refreshing, so the loss deadline does not
+    // race the missed-PING counter the way dropAll would.
+    dropPongs: false,
     // dgram.send is overloaded: punch.ts always uses the 3-arg
     // (buf, port, host) form — normalize it into (buf, 0, len, port, host).
     send(buf, offset, length, port, host, cb) {
@@ -174,11 +184,11 @@ function makeGate(realSocket) {
         offset = 0
         length = buf.length
       }
-      if (gate.dropAll) {
+      const isPong = length >= 4 && buf[offset + 3] === PeerFrameType.PONG
+      if (gate.dropAll || (isPong && gate.dropPongs)) {
         if (typeof cb === 'function') cb()
         return
       }
-      const isPong = length >= 4 && buf[offset + 3] === PeerFrameType.PONG
       if (isPong && gate.pongDelayMs > 0) {
         const packet = Buffer.from(buf.slice(offset, offset + length))
         const dstPort = port
@@ -266,7 +276,7 @@ function wsFrame(value) {
   return Buffer.concat([header, body])
 }
 
-async function startGateway({ peers }) {
+async function startGateway({ peers, rttCap }) {
   const server = http.createServer()
   const sockets = []
   server.on('upgrade', (req, socket) => {
@@ -288,6 +298,9 @@ async function startGateway({ peers }) {
             type: 'welcome',
             status: 'authorized',
             maxPeers: 8,
+            // T4: the field is absent unless the test opts in — an "old
+            // gateway" exercises the options/300 fallback chain.
+            ...(rttCap !== undefined ? { peerDirectMaxRttMs: rttCap } : {}),
             peers: peers(),
           }))
         }
@@ -304,6 +317,11 @@ async function startGateway({ peers }) {
   return {
     httpPort: port,
     wsUrl: `ws://127.0.0.1:${port}`,
+    /** Push a server→client control message to every live ws connection. */
+    send: (value) => {
+      const frame = wsFrame(value)
+      for (const socket of sockets) socket.write(frame)
+    },
     close: async () => {
       for (const socket of sockets) socket.destroy()
       await new Promise((resolve) => server.close(resolve))
@@ -349,7 +367,7 @@ function makePingSniffer(realSocket, clock) {
   return sniff
 }
 
-async function buildPair(t, { cap }) {
+async function buildPair(t, { cap, rttCap }) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-rtt-cap-'))
   const clock = manualClock()
   const logs = []
@@ -374,6 +392,7 @@ async function buildPair(t, { cap }) {
   const identityB = generatePeerIdentity()
 
   const gateway = await startGateway({
+    rttCap,
     peers: () => [{
       nodeId: identityB.nodeId,
       publicKeyHex: identityB.publicKeyHex,
@@ -491,7 +510,20 @@ async function buildPair(t, { cap }) {
     assert.fail('the delayed PONG after 4 keepalive ticks')
   }
 
-  return { engine, mgrB, gateB, gateway, clock, logs, capRef, peerOf, waitReady, waitLost, sample, identityB }
+  /**
+   * Advance the virtual clock in small steps, sleeping between each so real
+   * datagrams (keepalive PINGs, replies, handshake rounds) can interleave —
+   * advance() fires timers synchronously and packets in flight must land
+   * between steps for lastSeen refreshes and deliveries to happen.
+   */
+  const drain = async (ms, step = 25, pause = 2) => {
+    for (let left = ms; left > 0; left -= step) {
+      clock.advance(Math.min(step, left))
+      await sleep(pause)
+    }
+  }
+
+  return { engine, mgrB, gateB, gateway, clock, logs, capRef, peerOf, waitReady, waitLost, sample, drain, identityB, identityA, socketB, stateFileA }
 }
 
 // -- the cap contract -------------------------------------------------------------
@@ -509,18 +541,36 @@ test('cap 0 keeps the legacy behaviour: punch ready switches to UDP immediately'
   assert.equal(after.directDemoted, false)
 })
 
-test('cap 300: a low first sample promotes lan → direct; status carries the EWMA', async (t) => {
+test('cap 300: the first-sample chain needs 2 consecutive samples <= cap*0.7', async (t) => {
   const env = await buildPair(t, { cap: 300 })
   await env.waitReady()
   const pending = env.peerOf()
-  assert.equal(pending.path, 'none', 'the UDP switch waits for the first sample')
+  assert.equal(pending.path, 'relay', 'path is pinned to relay while the switch waits for the streak')
   assert.equal(pending.directDemoted, false)
   await env.sample(60)
+  assert.equal(env.peerOf().path, 'relay', 'one qualifying sample does not promote')
+  assert.equal(env.peerOf().directDemoted, false)
+  await env.sample(60)
   const peer = env.peerOf()
-  assert.equal(peer.path, 'lan', 'first sample 60 <= 300 promotes')
+  assert.equal(peer.path, 'lan', 'two consecutive samples <= 210 promote')
   assert.equal(peer.directDemoted, false)
   assert.equal(peer.directRttMs, 60)
   assert.equal(typeof peer.rttMs, 'number', 'direct path reports the punch RTT')
+})
+
+test('cap 300: a sample under cap but over cap*0.7 does not promote and resets the streak', async (t) => {
+  const env = await buildPair(t, { cap: 300 })
+  await env.waitReady()
+  assert.equal(env.peerOf().path, 'relay')
+  await env.sample(100) // streak 1
+  await env.sample(250) // 250 <= 300 yet > 210 — neither demotion nor promotion material
+  const peer = env.peerOf()
+  assert.equal(peer.path, 'relay', 'samples between cap*0.7 and cap never promote')
+  assert.equal(peer.directDemoted, false, 'a sub-cap sample is not a demotion')
+  await env.sample(100) // streak restarts at 1 — still not enough alone
+  assert.equal(env.peerOf().path, 'relay', 'the reset streak does not promote early')
+  await env.sample(100) // streak 2 → promote
+  assert.equal(env.peerOf().path, 'lan')
 })
 
 test('cap 300: a high first sample stays relayed and reports directDemoted', async (t) => {
@@ -541,7 +591,8 @@ test('cap 300: a high first sample stays relayed and reports directDemoted', asy
 test('cap 300: a lone 2000ms spike does not demote; sustained highs do', async (t) => {
   const env = await buildPair(t, { cap: 300 })
   await env.waitReady()
-  await env.sample(50) // promote
+  await env.sample(50)
+  await env.sample(50) // two qualifying samples → promote
   assert.equal(env.peerOf().path, 'lan')
 
   // EWMA after the spike: 50*0.7 + 2000*0.3 = 635 — over cap, yet the
@@ -561,29 +612,27 @@ test('cap 300: a lone 2000ms spike does not demote; sustained highs do', async (
   assert.equal(demoted.rttMs, null)
 })
 
-test('demoted: recovery needs a 3-sample streak under cap*0.7 and resets on highs', async (t) => {
+test('demoted: recovery needs a 2-sample streak under cap*0.7 and resets on highs', async (t) => {
   const env = await buildPair(t, { cap: 300 })
   await env.waitReady()
-  await env.sample(3000) // first-sample deny → demoted
+  await env.sample(3000) // first-chain deny → demoted
   assert.equal(env.peerOf().path, 'relay')
 
-  // Two qualifying samples are not enough.
+  // One qualifying sample is not enough.
   await env.sample(100)
-  await env.sample(100)
-  assert.equal(env.peerOf().path, 'relay', 'two low samples must not re-promote')
+  assert.equal(env.peerOf().path, 'relay', 'one low sample must not re-promote')
   assert.equal(env.peerOf().directDemoted, true)
 
   // A high sample inside the streak zeroes the count.
-  await env.sample(900)
-  assert.equal(env.peerOf().path, 'relay')
   await env.sample(100)
+  await env.sample(900)
   await env.sample(100)
   assert.equal(env.peerOf().path, 'relay', 'the broken streak does not promote')
 
-  // Three in a row → promote.
+  // Two in a row → promote.
   await env.sample(100)
   const peer = env.peerOf()
-  assert.equal(peer.path, 'lan', '3 consecutive samples <= 210 promote')
+  assert.equal(peer.path, 'lan', '2 consecutive samples <= 210 promote')
   assert.equal(peer.directDemoted, false)
 })
 
@@ -601,33 +650,251 @@ test('flipping the cap getter to 0 promotes on the next sample (live read)', asy
   assert.equal(peer.directRttMs > 0, true)
 })
 
-test('onDirectLost clears measurement state; the re-established session re-gates', async (t) => {
+// -- T4: the cap is gateway-owned ---------------------------------------------
+
+test('welcome peerDirectMaxRttMs=100 wins over the injected getter, persists, and gates at 100', async (t) => {
+  const env = await buildPair(t, { cap: 0, rttCap: 100 })
+  await env.waitReady()
+  // The gateway's word outranks the options injection (which says 0 = uncapped).
+  assert.equal(env.engine.status().directCapMs, 100)
+  assert.equal(env.engine.status().directCapSource, 'gateway')
+  await waitFor(
+    () => readPeerNetwork(env.stateFileA)?.peerDirectMaxRttMsFromGateway === 100,
+    'the cap persisted to the peer network record',
+  )
+  assert.equal(env.peerOf().path, 'relay', 'a real cap pins the path until samples qualify')
+  // Two samples <= 70 (cap*0.7) promote.
+  await env.sample(50)
+  assert.equal(env.peerOf().path, 'relay', 'one qualifying sample does not promote')
+  await env.sample(50)
+  assert.equal(env.peerOf().path, 'lan', 'two consecutive samples <= 70 promote')
+})
+
+test('a welcome without peerDirectMaxRttMs leaves the options getter in charge (old gateway)', async (t) => {
+  const env = await buildPair(t, { cap: 300 })
+  await env.waitReady()
+  assert.equal(env.engine.status().directCapMs, 300)
+  assert.equal(env.engine.status().directCapSource, 'default')
+  assert.equal(env.peerOf().path, 'relay', 'the injected cap still gates')
+})
+
+test('a welcome with neither the field nor an injection falls back to 300', async (t) => {
+  const env = await buildPair(t, { cap: undefined })
+  await env.waitReady()
+  assert.equal(env.engine.status().directCapMs, 300)
+  assert.equal(env.engine.status().directCapSource, 'default')
+  assert.equal(env.peerOf().path, 'relay', 'the default 300 pins until samples qualify')
+})
+
+test('network-updated peerDirectMaxRttMs applies live on the next sample', async (t) => {
+  const env = await buildPair(t, { cap: 300 })
+  await env.waitReady()
+  // 250ms is in the dead band under cap 300 (> 210, ≤ 300): it neither
+  // promotes nor demotes — under the OLD cap it could never qualify.
+  await env.sample(250)
+  assert.equal(env.peerOf().path, 'relay')
+  env.gateway.send({ type: 'network-updated', networkId: NET_ID, maxPeers: 8, peerDirectMaxRttMs: 400 })
+  await waitFor(
+    () => readPeerNetwork(env.stateFileA)?.peerDirectMaxRttMsFromGateway === 400,
+    'the live cap persisted',
+  )
+  assert.equal(env.engine.status().directCapMs, 400)
+  assert.equal(env.engine.status().directCapSource, 'gateway')
+  // Under cap 400 the same 250ms qualifies (≤ 280): the update took effect live.
+  await env.sample(250)
+  assert.equal(env.peerOf().path, 'relay', 'one qualifying sample does not promote')
+  await env.sample(250)
+  assert.equal(env.peerOf().path, 'lan', 'the second <= 280 sample promotes under the new cap')
+})
+
+test('an invalid network-updated peerDirectMaxRttMs is ignored but a valid maxPeers still lands', async (t) => {
+  const env = await buildPair(t, { cap: 300 })
+  await env.waitReady()
+  env.gateway.send({ type: 'network-updated', networkId: NET_ID, maxPeers: 12, peerDirectMaxRttMs: -5 })
+  await waitFor(() => env.engine.status().maxPeers === 12, 'maxPeers updated independently')
+  assert.equal(env.engine.status().directCapMs, 300, 'a malformed RTT value is rejected, not applied')
+  assert.equal(env.engine.status().directCapSource, 'default')
+  assert.equal(readPeerNetwork(env.stateFileA)?.peerDirectMaxRttMsFromGateway, undefined, 'nothing bogus persisted')
+})
+
+test('a resume seeds the cap from the persisted record before any welcome lands', async (t) => {
+  const env = await buildPair(t, { cap: 0, rttCap: 100 })
+  await env.waitReady()
+  await waitFor(
+    () => readPeerNetwork(env.stateFileA)?.peerDirectMaxRttMsFromGateway === 100,
+    'the cap persisted',
+  )
+  const engine2 = createPeerEngine({
+    stateFile: env.stateFileA,
+    identity: env.identityA,
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (input) => ({ entryId: input.entryId, serverId: input.serverId, serverName: input.serverName }),
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+    },
+    relayHandler: () => undefined,
+    relaySecret: () => 'test',
+    serverName: () => 'node-A',
+    clock: env.clock,
+    log: () => {},
+    directMaxRttMs: () => env.capRef.value, // 0 = "uncapped" — the disk record must win
+    punch: { keepAliveMs: KEEPALIVE_MS, keepAliveLostFrames: 3, reprobeIntervalMs: 800 },
+  })
+  t.after(() => engine2.stop())
+  assert.equal(engine2.status().directCapMs, 0, 'unjoined engine still follows the options getter')
+  engine2.resumeFromState()
+  // Synchronous seeding: the assert runs before the resumed WS can carry a
+  // welcome, so 100 can only come from the peerNetwork record on disk.
+  assert.equal(engine2.status().directCapMs, 100, 'resume seeds the cap from the peer network record')
+  assert.equal(engine2.status().directCapSource, 'gateway')
+})
+
+test('two consecutive unanswered PINGs demote a direct member; loss then re-gates the re-established session', async (t) => {
   const env = await buildPair(t, { cap: 300 })
   await env.waitReady()
   await env.sample(50)
+  await env.sample(50)
   assert.equal(env.peerOf().path, 'lan')
+  assert.equal(env.peerOf().directDemoted, false)
 
-  // Kill the link: A advances past the 3-cycle loss deadline while B's
-  // outbound traffic is blocked entirely.
+  // Kill only B's PONGs: A's keepalives go unanswered (miss#1 @+14000,
+  // miss#2 @+17500 → demote — the first post-promote tick does not count:
+  // the matched PONG cleared the pending PING) while B's own PINGs still
+  // refresh A's lastSeen, keeping the loss deadline (~28000) clear of the
+  // assertion window. pongDelayMs→0: the 200ms delay would otherwise let a
+  // queued PONG slip past a mid-drain dropAll flip and poison the streak.
+  env.gateB.pongDelayMs = 0
+  env.gateB.dropPongs = true
+  await env.drain(11000) // stepped advance — real packets land between steps
+  const demoted = env.peerOf()
+  assert.equal(demoted.path, 'relay', 'two unanswered PINGs demote like an over-cap sample')
+  assert.equal(demoted.directDemoted, true)
+  assert.ok(
+    env.logs.some((line) => /direct .+ keepalive unanswered ×2 — relaying/.test(line)),
+    'the demotion log names the unanswered keepalives',
+  )
+
+  // Total silence: the 3×keepalive loss deadline still fires behind the
+  // demotion and wipes the flag.
+  env.gateB.dropPongs = false
   env.gateB.dropAll = true
-  env.clock.advance(11000)
-  await sleep(100)
+  await env.drain(14000) // past lastSeen(~10500) + 10500
+  assert.ok(env.logs.some((line) => /direct lost .+ — relaying/.test(line)), 'onDirectLost logs its own line')
   await env.waitLost()
   const lost = env.peerOf()
   assert.equal(lost.path, 'relay')
   assert.equal(lost.directDemoted, false, 'loss wipes the demotion flag')
 
   // Restore the link: the armed reprobe re-punches and the member walks
-  // the first-sample gate again.
+  // the 2-sample gate again.
   env.gateB.dropAll = false
+  env.gateB.pongDelayMs = PONG_DELAY_MS // restore the scripted-sample delay
   env.gateB.dropFirstPing = true // same cipher race on the fresh session
   env.logs.length = 0
-  env.clock.advance(1000) // fire the reprobe → fresh handshake
+  env.clock.advance(5000) // fire the first-tier reprobe → fresh handshake
   await env.waitReady()
   assert.equal(env.peerOf().path, 'relay', 'the lost path stays relayed until the fresh session proves itself')
+  await env.sample(150)
+  assert.equal(env.peerOf().path, 'relay', 'one qualifying sample does not re-promote')
   await env.sample(150)
   const peer = env.peerOf()
   assert.equal(peer.path, 'lan')
   assert.equal(peer.directRttMs, 150, 'EWMA restarts from the fresh sample')
   assert.equal(peer.directDemoted, false)
+})
+
+// -- endpoint re-anchoring (announcePeer endpoint-set diff) --------------------------
+
+test('announcePeer with a changed endpoint set re-anchors: relay first, old endpoint goes silent, new session punches', async (t) => {
+  const env = await buildPair(t, { cap: 300 })
+  await env.waitReady()
+  await env.sample(50)
+  await env.sample(50)
+  assert.equal(env.peerOf().path, 'lan')
+
+  // Count frames still landing on B's OLD socket after the re-announce.
+  let oldEpFrames = 0
+  env.socketB.on('message', () => { oldEpFrames += 1 })
+
+  // First re-announce a dead endpoint: path drops to relay instantly and
+  // the window expiry lands onPunchFallback with the same relay pinning.
+  env.logs.length = 0
+  env.gateway.send({
+    type: 'punch-coordinate',
+    peerNodeId: env.identityB.nodeId,
+    publicKeyHex: env.identityB.publicKeyHex,
+    lanEndpoints: ['127.0.0.1:1'], // dead: a port nobody hears
+    reflexiveEndpoint: null,
+  })
+  await waitFor(() => env.logs.some((line) => line.includes('re-anchored')), 're-anchored log')
+  const staged = env.peerOf()
+  assert.equal(staged.path, 'relay', 'path falls back to relay the moment endpoints change')
+  assert.equal(staged.directDemoted, false)
+  assert.equal(staged.directRttMs, null, 'measurement state is wiped with the old session')
+  assert.ok(
+    env.logs.some((line) => new RegExp(`re-anchored ${env.identityB.nodeId} \\(endpoints changed\\)`).test(line)),
+    'the re-anchor log names the peer',
+  )
+  env.clock.advance(1200) // 1000ms punch window expires on the dead endpoint
+  await sleep(30)
+  assert.ok(env.logs.some((line) => /punch fallback .+ \(window expired\)/.test(line)), 'the window-expiry fallback fires')
+  assert.equal(env.peerOf().path, 'relay', 'onPunchFallback keeps path pinned at relay')
+
+  // B resurfaces on a new socket (new LAN port — the "switched network" peer).
+  const socketB2 = await openUdp()
+  const gateB2 = makeGate(socketB2)
+  const mgrB2 = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: env.identityB,
+    socket: gateB2,
+    clock: env.clock,
+    keepAliveMs: KEEPALIVE_MS,
+    keepAliveLostFrames: 3,
+    reprobeIntervalMs: 800,
+  })
+  await mgrB2.ready()
+  t.after(async () => {
+    const closing = waitClose(socketB2)
+    mgrB2.close()
+    await closing
+  })
+  mgrB2.beginPunch({ peerNodeId: env.identityA.nodeId, peerPublicKeyHex: env.identityA.publicKeyHex, lanEndpoints: [] })
+
+  env.gateway.send({
+    type: 'punch-coordinate',
+    peerNodeId: env.identityB.nodeId,
+    publicKeyHex: env.identityB.publicKeyHex,
+    lanEndpoints: [endpointOf(socketB2)],
+    reflexiveEndpoint: null,
+  })
+  await env.waitReady()
+  assert.equal(env.peerOf().path, 'relay', 'cap 300 keeps the fresh session relayed until samples prove it')
+
+  const framesAfterReady = oldEpFrames
+  env.clock.advance(6000) // a keepalive tick plus slack — all aimed at B2 now
+  await sleep(80)
+  assert.equal(oldEpFrames, framesAfterReady, 'no frames reach the dead endpoint after re-anchoring')
+})
+
+test('announcePeer with an unchanged endpoint set leaves the direct session untouched', async (t) => {
+  const env = await buildPair(t, { cap: 0 })
+  await env.waitReady()
+  assert.equal(env.peerOf().path, 'lan')
+
+  env.logs.length = 0
+  env.gateway.send({
+    type: 'punch-coordinate',
+    peerNodeId: env.identityB.nodeId,
+    publicKeyHex: env.identityB.publicKeyHex,
+    lanEndpoints: [endpointOf(env.socketB)], // identical to the welcome set
+    reflexiveEndpoint: null,
+  })
+  await sleep(200)
+  assert.equal(env.peerOf().path, 'lan', 'the session is not torn down')
+  assert.equal(
+    env.logs.some((line) => line.includes('re-anchored')),
+    false,
+    'an identical re-announce must not re-anchor',
+  )
 })

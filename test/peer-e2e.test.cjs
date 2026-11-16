@@ -180,7 +180,16 @@ async function createNetwork(gw, { mode = 'key' } = {}) {
     cookie: gw.tenantCookie,
   })
   assert.equal(res.status, 200, JSON.stringify(res.json))
-  return res.json.data // { id, joinKey, maxPeers, joinUri? ... }
+  const net = res.json.data
+  // T4：建网缺省 peerDirectMaxRttMs=300 会由 welcome 下发并盖过测试注入
+  // （capFromGateway 优先），把「打通即直连」的门全变成样本闸——本文件验
+  // mux/传输机制，一律 PATCH 0（不限制）；上限策略归 peer-rtt-cap.test.cjs。
+  const patch = await api(gw.base, 'PATCH', `/api/v1/networks/${net.id}`, {
+    body: { peerDirectMaxRttMs: 0 },
+    cookie: gw.tenantCookie,
+  })
+  assert.equal(patch.status, 200, JSON.stringify(patch.json))
+  return net // { id, joinKey, maxPeers, joinUri? ... }
 }
 
 async function getTopology(gw, networkId) {
@@ -378,6 +387,10 @@ async function startNode(gw, { name, firewall = false, firewallOpen = false, sha
     ...(punch !== undefined ? { punch } : {}),
     ...(pathReportMs !== undefined ? { pathReportMs } : {}),
     ...(clock !== undefined ? { clock } : {}),
+    // T4: directMaxRttMs 缺省现按 300 解析（网关不下发即生效）——这些用例
+    // 验的是 mux/打洞/传输机制，不是上限策略，钉 0（不限制）保住
+    // 「打通即直连」的旧语义；上限策略归 peer-rtt-cap.test.cjs。
+    directMaxRttMs: () => 0,
     log: (line) => logs.push(line),
     debug: (line) => debugs.push(line),
   })
@@ -1010,6 +1023,8 @@ async function startFullPeerNode(gw, { name, shared = [], localWorkspaceId = 'ws
     udpSocket: punchSocket,
     udpProbe: { primaryPort: gw.udp.primaryPort, altPort: gw.udp.altPort ?? 0 },
     punch: { punchWindowMs: 1000, punchIntervalMs: 100, punchRounds: 10, reprobeIntervalMs: 60_000 },
+    // T4: 缺省上限按 300 解析，会等样本判定——本文件用例验传输机制，钉 0。
+    directMaxRttMs: () => 0,
   })
 
   return {
@@ -1370,6 +1385,7 @@ test('PG-8 #8: peer 模式下 dsh-better-sidebar 远程会话请求默认桥接 
         udpSocket: punchSocket,
         udpProbe: null,
         punch: { punchWindowMs: 400, punchIntervalMs: 100, punchRounds: 4, reprobeIntervalMs: 60_000 },
+        directMaxRttMs: () => 0,
       })
 
       return {
@@ -1700,6 +1716,7 @@ test('PG-8 #9: high-latency WS relay + one-way UDP blackhole + sidebar WS sessio
         udpSocket: punchSocket,
         udpProbe: null,
         punch: { punchWindowMs: 400, punchIntervalMs: 100, punchRounds: 4, reprobeIntervalMs: 60_000 },
+        directMaxRttMs: () => 0,
       })
 
       return {
@@ -2543,7 +2560,7 @@ test('PC-V1 #2: PATCH /admin/settings 热改全局容量，即时生效且存量
   }
 })
 
-test('PC-V1 #3: 生产默认计时——约1s降级后，防火墙恢复在 ~60s 默认重探节拍上自动复原直连（唯一有界长测试）', async (t) => {
+test('PC-V1 #3: 生产默认计时——约1s降级后，防火墙恢复在静默重探退避节拍上自动复原直连（唯一有界长测试）', async (t) => {
   const gw = await startGateway()
   const net = await createNetwork(gw, { mode: 'key' })
   const nodes = []
@@ -2552,7 +2569,7 @@ test('PC-V1 #3: 生产默认计时——约1s降级后，防火墙恢复在 ~60s
     nodes.push(A) // 节点成功创建即纳入清理集合——C 初始化失败也不留 A
     // C 起步即 UDP 全丢（真实 socket + 阻断阀）。startNode 不再注入任何 punch
     // 旋钮（PC-V1 fix1 R1）——本用例观测的是 PeerPunchManager 生产缺省本身
-    // （punch.ts:1000ms 窗口 / 100ms×10 轮 / 60s 重探），生产默认一改即被钉住。
+    // （punch.ts:1000ms 窗口 / 100ms×10 轮 / 5s/15s/60s 重探退避），生产默认一改即被钉住。
     const C = await startNode(gw, { name: 'node-c', firewall: true, shared: ['s-c1'] })
     nodes.push(C)
     for (const node of [A, C]) {
@@ -2577,21 +2594,23 @@ test('PC-V1 #3: 生产默认计时——约1s降级后，防火墙恢复在 ~60s
     await waitPeerOnline(A, C.identity.nodeId)
     await waitPeerOnline(C, A.identity.nodeId)
 
-    // 恢复 UDP 通路，不调 reprobePunch——只等生产默认 60s 静默重探自己开轮。
+    // 恢复 UDP 通路，不调 reprobePunch——只等生产默认静默重探自己开轮
+    // （退避第一档 5s，之后 15s/60s）。
     C.setFirewall(false)
     const tUnblocked = Date.now()
     await waitFor(() => {
       const peer = C.engine.status().peers.find((p) => p.nodeId === A.identity.nodeId)
       return peer !== undefined && (peer.path === 'lan' || peer.path === 'p2p')
-    }, 90_000, 'C→A auto-recovered to direct on the default 60s reprobe cadence')
+    }, 90_000, 'C→A auto-recovered to direct on the silent reprobe backoff')
     const tDirect = Date.now()
     const sinceUnblocked = tDirect - tUnblocked
     const sinceDowngrade = tDirect - tDowngrade
     t.diagnostic(`pc-v1#3 auto-reprobe recovery: ${sinceUnblocked}ms after unblock, ${sinceDowngrade}ms after downgrade`)
 
-    // 复原确实等了 ~60s 节拍（不是别的快速通路），且确实在本测试内发生。
-    assert.ok(sinceDowngrade >= 55_000, `recovery waited for the default 60s reprobe cadence (got ${sinceDowngrade}ms since downgrade)`)
-    assert.ok(sinceUnblocked < 78_000, `auto recovery happened within the bounded budget (got ${sinceUnblocked}ms since unblock)`)
+    // 复原确实等了重探节拍（不是别的快速通路），且确实在本测试内发生：
+    // 第一档 5s 起，90s 预算内必然命中某一轮。
+    assert.ok(sinceDowngrade >= 3_000, `recovery waited for a reprobe round, not an instant path (got ${sinceDowngrade}ms since downgrade)`)
+    assert.ok(sinceUnblocked < 90_000, `auto recovery happened within the bounded budget (got ${sinceUnblocked}ms since unblock)`)
     // A 侧同样收敛，且直连 RTT 是真实测量。
     await waitFor(() => {
       const peer = A.engine.status().peers.find((p) => p.nodeId === C.identity.nodeId)
@@ -2899,6 +2918,7 @@ test('PAS-3 端到端：插件退网同步注销网关并卸载对端；在线/�
     const c2Pool = createRelayPool({ maxServers: 8 })
     const c2Engine = createPeerEngine({
       stateFile: C.stateFile,
+      directMaxRttMs: () => 0,
       identity: C.identity,
       relayPool: c2Pool,
       relayHandler: () => undefined,

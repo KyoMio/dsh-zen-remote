@@ -92,6 +92,12 @@ export interface PeerEngineStatus {
   maxPeers: number | null
   natType: PeerNatType | null
   peers: PeerEnginePeerStatus[]
+  /** T4：当前生效的直连 RTT 上限（ms），解析序同 {@link PeerEngineOptions.directMaxRttMs}
+   *  ——`0` = 不限制。排障用；判定逻辑读同一解析。 */
+  directCapMs: number
+  /** T4：`directCapMs` 的来源——`gateway` = 网关 welcome/network-updated 下发；
+   *  `default` = 网关没说过话时的本地值（options 注入或回落 300）。 */
+  directCapSource: 'gateway' | 'default'
 }
 
 export interface PeerEnginePunchTimings {
@@ -138,10 +144,13 @@ export interface PeerEngineOptions {
   log?: (line: string) => void
   /** 透传给 mux 的逐请求噪声通道（T3）。 */
   debug?: (line: string) => void
-  /** T5：直连 RTT 上限（ms）的现场读法——每次判定都调用，非法值（非有限、
-   *  负数）按 0 处理；缺省视为 `() => 0`（不限制，保留旧行为）。上限大于
-   *  0 时 onDirectReady 不再立即切 UDP，等首个保活样本 ≤ 上限才升直连；
-   *  已直连的会话在「当前样本与 EWMA 双双超限」时才降级回中转。 */
+  /** 直连 RTT 上限（ms）的测试注入通道——生产不接：上限的唯一来源是网关
+   *  下发（welcome / network-updated 落 `peerNetwork.peerDirectMaxRttMsFromGateway`）。
+   *  解析序 `capFromGateway ?? options.directMaxRttMs?.() ?? 300`；每次样本
+   *  现场调用，非法值（非整数、负数、>10000）按 300。上限大于 0 时
+   *  onDirectReady 不再立即切 UDP，等保活样本连续达标才升直连；已直连的
+   *  会话在「当前样本与 EWMA 双双超限」时才降级回中转；0 = 不限制（保留
+   *  旧行为）。 */
   directMaxRttMs?: () => number
 }
 
@@ -189,6 +198,8 @@ interface MemberRec {
   directDemoted: boolean
   /** mux 当前是否走 UDP（降级中 keepalive 继续采样但不承载流量）。 */
   directActive: boolean
+  /** 连续未回 PING 数；收到匹配样本/丢直连/重锚归零，满 2 按一次超限样本处理。 */
+  directMissedPings: number
 }
 
 const realClock = {
@@ -201,7 +212,15 @@ const realClock = {
 // 恢复所需的连续样本数。
 const DIRECT_EWMA_ALPHA = 0.3
 const DIRECT_PROMOTE_RATIO = 0.7
-const DIRECT_PROMOTE_STREAK = 3
+const DIRECT_PROMOTE_STREAK = 2
+
+/** 公告端点集的可比形态：lanEndpoints ∪ reflexiveEndpoint，排序去重成串。 */
+const canonicalEndpoints = (lan: string[], reflexive: string | null): string => {
+  const set = new Set<string>()
+  for (const ep of lan) if (typeof ep === 'string' && ep !== '') set.add(ep)
+  if (typeof reflexive === 'string' && reflexive !== '') set.add(reflexive)
+  return [...set].sort().join(' ')
+}
 
 /**
  * authorized welcome 的可选 `stun` 字段（PC-01a 网关契约：真实 UDP bind
@@ -249,6 +268,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let deniedReason: string | null = null
   let maxPeers: number | null = null
   let natType: PeerNatType | null = null
+  /** T4：网关下发的直连 RTT 上限快照（welcome / network-updated 现场更新，
+   *  joinNetwork / resumeFromState 从落盘的 peerNetwork 记录恢复）。会话级
+   *  事实——resetActiveSession 不清它（换代只拆连接，网络事实留到下一次
+   *  join 或 leave 才换代），null = 网关（旧版）没说过话。 */
+  let capFromGateway: number | null = null
   /** 网关连接/授权代次：每次连接结束（WS close / resetActiveSession）或授权
    * 事实被撤销（PC-03 在线被暂停）即 +1。STUN 的「探测一次」以当前已获准的
    * 代次为单位，不是整个 joinNetwork 生命周期——网关侧重连即全新 ConnState
@@ -359,6 +383,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     const net = readPeerNetwork(stateFile)
     const disabled = net?.disabledNodes?.includes(nodeId) === true
     let member = members.get(nodeId)
+    const oldEndpointSet = member !== undefined
+      ? canonicalEndpoints(member.lastLanEndpoints, member.lastReflexive)
+      : null
     if (member === undefined) {
       member = {
         nodeId,
@@ -374,12 +401,15 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         directGoodStreak: 0,
         directDemoted: false,
         directActive: false,
+        directMissedPings: 0,
       }
       members.set(nodeId, member)
     }
     if (typeof info.name === 'string' && info.name.trim() !== '') member.name = info.name.trim()
     member.lastLanEndpoints = Array.isArray(info.lanEndpoints) ? info.lanEndpoints.filter((e) => typeof e === 'string') : member.lastLanEndpoints
     member.lastReflexive = typeof info.reflexiveEndpoint === 'string' ? info.reflexiveEndpoint : member.lastReflexive
+    const endpointsChanged = oldEndpointSet !== null
+      && canonicalEndpoints(member.lastLanEndpoints, member.lastReflexive) !== oldEndpointSet
 
     if (disabled) {
       member.state = 'disabled'
@@ -405,6 +435,22 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (member.mounted) options.relayPool.updateVirtualName(nodeId, member.name)
     if (!info.deferMount) refreshMounts()
     if (info.startPunch && punch !== null) {
+      // 换网重锚（2.5.x）：公告端点集变了说明旧直连端点已死——先丢旧会话、
+      // 落回中转、清空测量，再照常 beginPunch 重新打洞；端点集不变的重复
+      // 公告靠 beginPunch 的早退守卫照原样合并候选，不打断现有直连。
+      if (endpointsChanged) {
+        punch.dropPeer(nodeId)
+        mux.setRelayPath(nodeId)
+        member.path = 'relay'
+        member.directMode = null
+        member.directSmoothedRtt = null
+        member.directGoodStreak = 0
+        member.directDemoted = false
+        member.directActive = false
+        member.directMissedPings = 0
+        log(`peer engine: re-anchored ${nodeId} (endpoints changed)`)
+        schedulePathReport()
+      }
       try {
         punch.beginPunch({
           peerNodeId: nodeId,
@@ -574,15 +620,25 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           ? announcedCap
           : undefined
       if (validCap !== undefined) maxPeers = validCap
+      // T4：直连 RTT 上限同样随 welcome 下发（四种 status 共用这段解析）。
+      // 旧版网关不带字段 → 保留旧值/缺省（解析序 options ?? 300 兜住）。
+      const announcedRtt = message['peerDirectMaxRttMs']
+      const validRtt =
+        typeof announcedRtt === 'number' && Number.isSafeInteger(announcedRtt) && announcedRtt >= 0 && announcedRtt <= 10_000
+          ? announcedRtt
+          : undefined
+      if (validRtt !== undefined) capFromGateway = validRtt
       const markAdmitted = status === 'authorized' || status === 'paused'
       const net = readPeerNetwork(stateFile)
       if (net !== undefined) {
         const needCap = validCap !== undefined && net.maxPeersFromGateway !== validCap
+        const needRtt = validRtt !== undefined && net.peerDirectMaxRttMsFromGateway !== validRtt
         const needAdmit = markAdmitted && net.everAdmitted !== true
-        if (needCap || needAdmit) {
+        if (needCap || needRtt || needAdmit) {
           writePeerNetwork(stateFile, {
             ...net,
             ...(validCap !== undefined ? { maxPeersFromGateway: validCap } : {}),
+            ...(validRtt !== undefined ? { peerDirectMaxRttMsFromGateway: validRtt } : {}),
             ...(markAdmitted ? { everAdmitted: true } : {}),
           })
         }
@@ -748,20 +804,37 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     if (type === 'network-updated') {
       // PC-08b：网关管理员改容量的增量广播（PC-08a REST PATCH → ws-hub）。
-      // 只消费当前网络、2..64 的有限整数；跨网络的旧消息与形状坏的一律忽略
-      // ——不改内存状态、不落盘、不重排挂载。同值幂等：welcome 已把该值写进
-      // peerNetwork.maxPeersFromGateway 时直接早退，不重复写盘也不重排挂载。
-      // 落盘复用 welcome 的同一事实源；pool.maxServers() 每次调用现场读它，
-      // 升容后 refreshMounts 立即补位，缩容不踢既有挂载（mountPeer 的上限闸
-      // 只挡新增），本机显式 maxServers 由 pool 的 min 规则继续压住。
+      // 只消费当前网络；maxPeers 要 2..64 的有限整数、peerDirectMaxRttMs 要
+      // 0..10000 的有限整数（T4，两字段独立判——一个形状坏不挡另一个）。
+      // 跨网络的旧消息一律忽略——不改内存状态、不落盘、不重排挂载。同值幂等：
+      // welcome 已把该值写进 peerNetwork.*FromGateway 时直接早退，不重复写盘
+      // 也不重排挂载。落盘复用 welcome 的同一事实源；pool.maxServers() 每次
+      // 调用现场读它，升容后 refreshMounts 立即补位，缩容不踢既有挂载
+      // （mountPeer 的上限闸只挡新增），本机显式 maxServers 由 pool 的 min
+      // 规则继续压住。RTT 上限现场生效：directCap() 每个样本都重新解析，
+      // 新值从下一个样本起参与判定。
       if (message['networkId'] !== networkId) return
       const announced = message['maxPeers']
-      if (typeof announced !== 'number' || !Number.isSafeInteger(announced) || announced < 2 || announced > 64) return
-      if (announced === maxPeers) return
-      maxPeers = announced
+      const capOk = typeof announced === 'number' && Number.isSafeInteger(announced) && announced >= 2 && announced <= 64
+      const announcedRtt = message['peerDirectMaxRttMs']
+      const rttOk = typeof announcedRtt === 'number' && Number.isSafeInteger(announcedRtt) && announcedRtt >= 0 && announcedRtt <= 10_000
+      if (!capOk && !rttOk) return
+      const capChanged = capOk && announced !== maxPeers
+      const rttChanged = rttOk && announcedRtt !== capFromGateway
+      if (!capChanged && !rttChanged) return
+      if (capChanged) maxPeers = announced as number
+      if (rttChanged) capFromGateway = announcedRtt as number
       const net = readPeerNetwork(stateFile)
-      if (net !== undefined && net.networkId === networkId && net.maxPeersFromGateway !== announced) {
-        writePeerNetwork(stateFile, { ...net, maxPeersFromGateway: announced })
+      if (net !== undefined && net.networkId === networkId) {
+        const needCap = capChanged && net.maxPeersFromGateway !== announced
+        const needRtt = rttChanged && net.peerDirectMaxRttMsFromGateway !== announcedRtt
+        if (needCap || needRtt) {
+          writePeerNetwork(stateFile, {
+            ...net,
+            ...(needCap ? { maxPeersFromGateway: announced as number } : {}),
+            ...(needRtt ? { peerDirectMaxRttMsFromGateway: announcedRtt as number } : {}),
+          })
+        }
       }
       refreshMounts()
       return
@@ -899,6 +972,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directGoodStreak = 0
     member.directDemoted = false
     member.directActive = false
+    member.directMissedPings = 0
     if (directCap() <= 0) {
       // 上限关闭：与旧行为一致，打通即直连。
       member.path = info.mode
@@ -908,7 +982,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       }
     } else {
       // 上限开启：先保证中转可用（握手在途时 beginHello，已有会话则
-      // 切回 ws 路径），member.path 维持现值，等首个样本裁决。
+      // 切回 ws 路径），path 口径钉死 relay——实际还走着中转，等连续
+      // 两个达标样本升直连。
+      member.path = 'relay'
       mux?.enableRelayPath(nodeId)
     }
     schedulePathReport()
@@ -918,15 +994,19 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     log(`peer engine: punch fallback ${nodeId} (window expired)`)
     const member = members.get(nodeId)
     if (member === undefined) return
-    if (member.path !== 'lan' && member.path !== 'p2p') member.path = 'relay'
+    member.path = 'relay'
     mux?.enableRelayPath(nodeId)
     schedulePathReport()
   }
 
-  /** T5：上限判定的现场读法——每次样本都调，非法值按 0（= 不限制）。 */
+  /** 直连 RTT 上限的单一解析点：网关下发值优先（T4），options 注入是
+   *  测试通道（生产不传），都没有回落 300——网关侧建网默认与 PATCH 校验
+   *  共用同一默认。每次样本现场解析，network-updated 的新值下个样本即生效；
+   *  注入值非法（非整数、负数、>10000）按 300。0 表示不限制。 */
   const directCap = (): number => {
+    if (capFromGateway !== null) return capFromGateway
     const raw = options.directMaxRttMs?.()
-    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0
+    return typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0 && raw <= 10_000 ? raw : 300
   }
 
   /** 升直连：mux 切 UDP、路径回填握手模式、清降级标记。 */
@@ -941,12 +1021,38 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     schedulePathReport()
   }
 
+  /** 降级回中转的单一出口：超上限样本与连 miss 都走这里。 */
+  const demoteDirect = (member: MemberRec, why: string): void => {
+    mux?.setRelayPath(member.nodeId)
+    member.path = 'relay'
+    member.directActive = false
+    member.directDemoted = true
+    member.directGoodStreak = 0
+    log(`peer engine: direct ${member.nodeId} ${why} — relaying`)
+    schedulePathReport()
+  }
+
+  /** 连续 ≥2 个未回 PING 按一次超上限样本处理：直连中直接降级，
+   *  未激活/升级计数中清 streak。 */
+  const onPingUnanswered = (nodeId: string): void => {
+    const member = members.get(nodeId.toLowerCase())
+    if (member === undefined || member.state !== 'eligible') return
+    member.directMissedPings += 1
+    if (member.directMissedPings < 2) return
+    if (member.directActive) {
+      demoteDirect(member, 'keepalive unanswered ×2')
+    } else {
+      member.directGoodStreak = 0
+    }
+  }
+
   /** T5：保活 PONG 样本驱动上限策略。成员不存在或非 eligible 忽略；
    *  EWMA 永远更新（降级中也采样），降级判断用的是更新前的平滑值——
    *  单个尖峰只把 EWMA 推过线一次，下一次样本前它仍是旧基线。 */
   const onRttSample = (nodeId: string, rtt: number): void => {
     const member = members.get(nodeId.toLowerCase())
     if (member === undefined || member.state !== 'eligible') return
+    member.directMissedPings = 0 // 匹配 PONG 到达即证明链路活着，连 miss 归零
     const prevSmoothed = member.directSmoothedRtt
     member.directSmoothedRtt =
       prevSmoothed === null ? rtt : prevSmoothed * (1 - DIRECT_EWMA_ALPHA) + rtt * DIRECT_EWMA_ALPHA
@@ -957,40 +1063,31 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     if (member.directActive) {
       if (rtt > cap && prevSmoothed !== null && prevSmoothed > cap) {
-        mux?.setRelayPath(member.nodeId)
-        member.path = 'relay'
-        member.directActive = false
-        member.directDemoted = true
-        member.directGoodStreak = 0
-        log(`peer engine: direct ${member.nodeId} rtt ${rtt}ms over cap ${cap}ms — relaying`)
-        schedulePathReport()
+        demoteDirect(member, `rtt ${rtt}ms over cap ${cap}ms`)
       }
       return
     }
-    if (!member.directDemoted) {
-      // 等首个样本：达标升直连，超标保持中转并记降级。
-      if (rtt <= cap) {
-        promoteDirect(member)
-      } else {
-        member.path = 'relay'
-        member.directDemoted = true
-        log(`peer engine: direct ${member.nodeId} rtt ${rtt}ms over cap ${cap}ms — relaying`)
-        schedulePathReport()
-      }
-      return
-    }
-    // 已降级：连续 ≤ cap×0.7 的样本攒满 3 个才升回；中间一个高样本归零。
+    // 未激活（首样本期或已降级）统一口径：连续 DIRECT_PROMOTE_STREAK 个
+    // 样本 ≤ cap×0.7 才升直连；超 cap 的样本记降级并把 streak 归零，
+    // 介于阈值与 cap 之间的只重置 streak。
     if (rtt <= cap * DIRECT_PROMOTE_RATIO) {
       member.directGoodStreak += 1
       if (member.directGoodStreak >= DIRECT_PROMOTE_STREAK) promoteDirect(member)
-    } else {
-      member.directGoodStreak = 0
+      return
+    }
+    member.directGoodStreak = 0
+    if (!member.directDemoted && rtt > cap) {
+      member.directDemoted = true
+      member.path = 'relay'
+      log(`peer engine: direct ${member.nodeId} rtt ${rtt}ms over cap ${cap}ms — relaying`)
+      schedulePathReport()
     }
   }
 
   const onDirectLost = (nodeId: string): void => {
     const member = members.get(nodeId)
     if (member === undefined) return
+    log(`peer engine: direct lost ${nodeId} — relaying`)
     member.path = 'relay'
     mux?.setRelayPath(nodeId)
     // T5：旧会话的测量与降级状态一起作废，重打通后重走首样本判定。
@@ -999,6 +1096,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directGoodStreak = 0
     member.directDemoted = false
     member.directActive = false
+    member.directMissedPings = 0
     schedulePathReport()
   }
 
@@ -1050,6 +1148,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       onPunchFallback,
       onDirectLost,
       onRttSample,
+      onPingUnanswered,
       onEncryptedFrame: (header, plaintext) => {
         mux?.handleOpenedFrame(header, plaintext)
       },
@@ -1134,7 +1233,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         ...(parsed.joinKey !== undefined ? { joinKey: parsed.joinKey } : {}),
         ...(existing?.disabledNodes !== undefined ? { disabledNodes: existing.disabledNodes } : {}),
         ...(existing?.maxPeersFromGateway !== undefined ? { maxPeersFromGateway: existing.maxPeersFromGateway } : {}),
+        ...(existing?.peerDirectMaxRttMsFromGateway !== undefined ? { peerDirectMaxRttMsFromGateway: existing.peerDirectMaxRttMsFromGateway } : {}),
       })
+      capFromGateway = existing?.peerDirectMaxRttMsFromGateway ?? null
       networkId = parsed.networkId
       wsReconnectable = true
       wsAttempt = 0
@@ -1150,6 +1251,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       if (stopped) return false
       const net = readPeerNetwork(stateFile)
       if (net === undefined) return false
+      capFromGateway = net.peerDirectMaxRttMsFromGateway ?? null
       networkId = net.networkId
       wsReconnectable = true
       wsAttempt = 0
@@ -1317,6 +1419,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         maxPeers,
         natType,
         peers,
+        directCapMs: directCap(),
+        directCapSource: capFromGateway === null ? 'default' : 'gateway',
       }
     },
 

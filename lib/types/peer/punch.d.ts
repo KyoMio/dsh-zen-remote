@@ -19,11 +19,13 @@
  *    candidate with a fresh X25519 key; an admitted peer's valid HELLO is
  *    answered immediately, and its signed ACK to our fresh nonce derives
  *    `PeerSessionCiphers` (PG-1 dual-simplex AEAD). The endpoint that
- *    worked is classified `lan` (RFC1918/CGNAT subnet or loopback match
- *    against our own interfaces) or `p2p`, with a measured RTT. If the
+ *    worked is classified `lan` (loopback, exact own-IP, or RFC1918
+ *    subnet match — CGNAT/Tailscale always lands on `p2p`), with a
+ *    measured RTT. If the
  *    1000ms window expires the caller gets `onPunchFallback` — go use
- *    the gateway WS relay NOW — while a silent reprobe keeps retrying
- *    every 60s and hot-upgrades to direct on the first later success.
+ *    the gateway WS relay NOW — while a silent reprobe retries on a
+ *    5s/15s/60s backoff and hot-upgrades to direct on the first later
+ *    success.
  *    Established paths are kept alive with 5s encrypted PING/PONG;
  *    the path is declared lost (`onDirectLost`) exactly `keepAliveMs` *
  *    `keepAliveLostFrames` (15s) after the last authenticated receive —
@@ -56,10 +58,12 @@ export interface LanInterfaceInfo {
 export declare function collectLanEndpoints(interfaces: Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>, port: number): string[];
 /**
  * Which KIND of path does this endpoint represent? `lan` when it is
- * loopback, one of `localIps` exactly, or a private/CGNAT address that
- * shares a /24 with one of our interfaces — i.e. a same-subnet path we
- * can usually reach without any NAT help. Everything else is `p2p`
- * (public reflexive mapping or foreign private nets). Unparseable
+ * loopback, one of `localIps` exactly, or a private (RFC1918) address
+ * that shares a /24 with one of our interfaces — i.e. a same-subnet
+ * path we can usually reach without any NAT help. Everything else is
+ * `p2p` (public reflexive mapping, foreign private nets, and CGNAT
+ * 100.64/10: a Tailscale overlay peer sharing our /24 is still a
+ * virtual tunnel, possibly DERP-relayed — never lan). Unparseable
  * candidates answer `p2p` — never promoted on a guess.
  */
 export declare function classifyPunchEndpoint(endpoint: string, localIps: string[]): 'lan' | 'p2p';
@@ -155,7 +159,8 @@ export interface PeerPunchOptions {
     punchRounds?: number;
     /** The priority window itself (spec: 1000ms). */
     punchWindowMs?: number;
-    /** Silent background reprobe cadence after a fallback/loss. */
+    /** Silent reprobe interval from the 3rd retry on (the first two fire
+     *  at 5s/15s so a dead endpoint is abandoned quickly). */
     reprobeIntervalMs?: number;
     /** Encrypted PING cadence once direct (spec: 5s). */
     keepAliveMs?: number;
@@ -167,6 +172,9 @@ export interface PeerPunchOptions {
     /** Each measured PING→PONG round trip, including the immediate handshake
      *  PING sent from `completeDirect` (T4/T5: engine RTT policy samples). */
     onRttSample?: (peerNodeId: string, rttMs: number) => void;
+    /** A keepalive PING stayed unanswered for a full `keepAliveMs` cycle —
+     *  fires once per consecutive silent tick while a PING is outstanding. */
+    onPingUnanswered?: (peerNodeId: string) => void;
     /** NIC enumeration, injectable for tests; production reads the OS live. */
     interfaces?: () => Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>;
     /** Opened application frames from the peer (PING/PONG stay internal). */
@@ -247,6 +255,13 @@ export declare class PeerPunchManager {
     private onPunchWindowExpired;
     private scheduleReprobe;
     private startKeepalive;
+    /**
+     * Fire one keepalive PING with a fresh random payload. If the PREVIOUS
+     * PING is still unanswered we count one consecutive miss and report it
+     * (the engine uses ≥2 misses as an over-cap signal) — then overwrite
+     * the outstanding payload so a late PONG for the old one never counts.
+     */
+    private sendPing;
     private sendHellos;
     private sendHelloAck;
     private handleControlPacket;

@@ -255,7 +255,7 @@ test('POST /config 写 lan-gate.config.json、解除 row 与 cordis.patch.yml �
   assert.equal(ENV_VAR_BY_FIELD.pushEnabled, 'DSH_PUSH_ENABLED')
   assert.equal(ENV_VAR_BY_FIELD.pushSessionName, 'DSH_PUSH_SESSION_NAME')
   assert.equal(ENV_VAR_BY_FIELD.logLevel, 'LAN_GATE_LOG_LEVEL')
-  assert.equal(ENV_VAR_BY_FIELD.peerDirectMaxRttMs, 'LAN_GATE_PEER_DIRECT_MAX_RTT_MS')
+  assert.equal(ENV_VAR_BY_FIELD.peerDirectMaxRttMs, undefined, 'T4 deleted the local RTT cap — the gateway owns the value')
 
   const home = makeHome('config')
   const patchPath = path.join(home, 'profiles', 'web', 'cordis.patch.yml')

@@ -361,11 +361,14 @@ export function renderPeerSection(t: CliTranslator, peer: ServerRow | null): str
     const rttMs = row.rttMs
     const rtt = typeof rttMs === 'number' && Number.isFinite(rttMs) ? t('peer.status.rtt', { rttMs }) : '—'
     // A demoted peer reads the plain relay path — with the measured direct
-    // RTT and the fact it crossed the configured cap (the cap itself lives
-    // in config, not the status body, so the line never invents a number).
+    // RTT and the cap it crossed (T4: directCapMs is a status fact).
     const directRtt = typeof row.directRttMs === 'number' && Number.isFinite(row.directRttMs) ? row.directRttMs : undefined
+    // T5: the cap is a real status fact now (directCapMs, gateway-owned);
+    // absent on older daemons — render the suffix only when it is readable.
+    const capMs = typeof peer.directCapMs === 'number' && Number.isFinite(peer.directCapMs) ? peer.directCapMs : undefined
+    const capSuffix = capMs === undefined ? '' : t('peer.path.capSuffix', { cap: String(capMs) })
     const path = row.directDemoted === true && directRtt !== undefined
-      ? t('peer.path.relayDemoted', { rtt: String(directRtt) })
+      ? t('peer.path.relayDemoted', { rtt: String(directRtt), cap: capSuffix })
       : peerPathLabelOf(t, row.path)
     lines.push(t('peer.status.deviceLine', {
       name: typeof row.name === 'string' ? row.name : '',

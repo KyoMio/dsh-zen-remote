@@ -27,7 +27,12 @@ import type { Duplex } from 'node:stream';
 import { WebSocketServer } from 'ws';
 import type { RawData, WebSocket } from 'ws';
 
-import { DEFAULT_SETTINGS, currentUtcYearMonth } from '../store/types.js';
+import {
+  DEFAULT_SETTINGS,
+  PEER_DIRECT_MAX_RTT_MS_MAX,
+  PEER_DIRECT_MAX_RTT_MS_MIN,
+  currentUtcYearMonth,
+} from '../store/types.js';
 import type {
   GatewayStore,
   MemberRecord,
@@ -138,6 +143,8 @@ interface ConnState {
   nodeId: string;
   ownerId: string;
   maxPeers: number;
+  /** welcome / network-updated 下发的节点直连 RTT 上限（ms）；与 maxPeers 同一份网络行快照 */
+  peerDirectMaxRttMs: number;
   /** 认证通过的 64 hex 公钥；repin 晋级时随 store 同步为新公钥 */
   publicKeyHex: string;
   name: string | null;
@@ -272,8 +279,8 @@ export class PeerWsHub {
   // 「从未变化」（0）重新相等，放过过期快照；增长上界是本进程见过的
   // (network|node) 身份数，不落库、进程重启即清零。
   private readonly memberEpochs = new Map<string, number>();
-  // PS-5：各网络已同步的 maxPeers 缓存（{ maxPeers, seq }：seq 用于抗 A->B->A 并发 PATCH 乱序），网络删除时清理。
-  private readonly networkMaxPeers = new Map<string, { maxPeers: number; seq: number }>();
+  // PS-5：各网络已同步的 (maxPeers, peerDirectMaxRttMs) 缓存（seq 抗 A->B->A 并发 PATCH 乱序），网络删除时清理。
+  private readonly networkMaxPeers = new Map<string, { maxPeers: number; peerDirectMaxRttMs: number; seq: number }>();
   // GC-3：networkId → 属主配额快照（OwnerQuotaSnapshot；惰性加载，跨月/refreshQuota/settings 变更失效）
   private readonly ownerQuotaByNetwork = new Map<string, OwnerQuotaSnapshot>();
   // GC-3：在途快照加载去重——并发帧与 refreshQuota 共享同一次 store 读，不重复查询
@@ -584,6 +591,7 @@ export class PeerWsHub {
       type: 'welcome',
       status: 'authorized',
       maxPeers: conn.maxPeers,
+      peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
       peers,
       ...(stunPorts !== null ? { stun: stunPorts } : {}),
     });
@@ -707,7 +715,10 @@ export class PeerWsHub {
       ws.close(1013, 'membership changed during authentication');
       return null;
     }
-    const effectiveMaxPeers = this.resolveNetworkMaxPeers(networkId, preReadSeq, network.maxPeers, network.maxPeers);
+    const limits = this.resolveNetworkLimits(networkId, preReadSeq, network, {
+      maxPeers: network.maxPeers,
+      peerDirectMaxRttMs: network.peerDirectMaxRttMs,
+    });
     this.replaceExisting(networkId, nodeId);
     const conn: ConnState = {
       ws,
@@ -716,7 +727,8 @@ export class PeerWsHub {
       networkId,
       nodeId,
       ownerId: network.ownerId,
-      maxPeers: effectiveMaxPeers,
+      maxPeers: limits.maxPeers,
+      peerDirectMaxRttMs: limits.peerDirectMaxRttMs,
       publicKeyHex,
       name: member.name ?? name,
       lanEndpoints: parseLanEndpoints(message['lanEndpoints']),
@@ -734,13 +746,13 @@ export class PeerWsHub {
         return conn;
       }
       case 'pending': {
-        sendJson(ws, { type: 'welcome', status: 'pending', maxPeers: conn.maxPeers });
+        sendJson(ws, { type: 'welcome', status: 'pending', maxPeers: conn.maxPeers, peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
         this.hanging.set(connKey(networkId, nodeId), conn);
         void this.publishTopology(networkId);
         return conn;
       }
       case 'mismatch': {
-        sendJson(ws, { type: 'welcome', status: 'mismatch' });
+        sendJson(ws, { type: 'welcome', status: 'mismatch', peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
         this.hanging.set(connKey(networkId, nodeId), conn);
         void this.publishTopology(networkId);
         return conn;
@@ -754,7 +766,7 @@ export class PeerWsHub {
           return null;
         }
         conn.state = 'paused';
-        sendJson(ws, { type: 'welcome', status: 'paused', maxPeers: conn.maxPeers });
+        sendJson(ws, { type: 'welcome', status: 'paused', maxPeers: conn.maxPeers, peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
         this.pausedConns.set(connKey(networkId, nodeId), conn);
         return conn;
       }
@@ -1095,7 +1107,8 @@ export class PeerWsHub {
   readonly hooks: GatewayHooks = {
     onMemberChanged: (event: MemberChangedEvent) => this.onMemberChanged(event),
     onNetworkDeleted: (networkId: string) => this.onNetworkDeleted(networkId),
-    onNetworkUpdated: (networkId: string, maxPeers: number) => this.onNetworkUpdated(networkId, maxPeers),
+    onNetworkUpdated: (networkId: string, maxPeers: number, peerDirectMaxRttMs: number) =>
+      this.onNetworkUpdated(networkId, maxPeers, peerDirectMaxRttMs),
     onSettingsChanged: (settings) => {
       this.rateKbps = settings.relayRateKbps;
       // GC-3：三项配额键在 settings ↔ 默认组间双向同步——settings 变更意味着
@@ -1206,9 +1219,9 @@ export class PeerWsHub {
       this.killConn(conn, 'gateway storage unavailable');
       return;
     }
-    let freshCapacity: number | null = null;
+    let freshCapacity: NetworkRecord | null = null;
     try {
-      freshCapacity = (await this.store.getNetwork(event.networkId))?.maxPeers ?? null;
+      freshCapacity = await this.store.getNetwork(event.networkId);
     } catch {
       freshCapacity = null;
     }
@@ -1219,7 +1232,12 @@ export class PeerWsHub {
         conn.state !== 'hanging' || this.hanging.get(key) !== conn ||
         (this.memberEpochs.get(key) ?? 0) !== memberEpoch) return;
     this.hanging.delete(key);
-    conn.maxPeers = this.resolveNetworkMaxPeers(event.networkId, preReadSeq, freshCapacity, conn.maxPeers);
+    const limits = this.resolveNetworkLimits(event.networkId, preReadSeq, freshCapacity, {
+      maxPeers: conn.maxPeers,
+      peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
+    });
+    conn.maxPeers = limits.maxPeers;
+    conn.peerDirectMaxRttMs = limits.peerDirectMaxRttMs;
     this.welcomeAuthorized(conn);
     this.registerAndAnnounce(conn);
   }
@@ -1251,9 +1269,9 @@ export class PeerWsHub {
       return true;
     }
     if (member.status === 'paused') return true; // 新一轮暂停已生效：保持受限挂起
-    let freshCapacity: number | null = null;
+    let freshCapacity: NetworkRecord | null = null;
     try {
-      freshCapacity = (await this.store.getNetwork(event.networkId))?.maxPeers ?? null;
+      freshCapacity = await this.store.getNetwork(event.networkId);
     } catch {
       freshCapacity = null;
     }
@@ -1266,7 +1284,12 @@ export class PeerWsHub {
     this.pausedConns.delete(key);
     // 与挂起晋级同款：从库再同步一次公钥，防判定路径变化
     conn.publicKeyHex = member.publicKeyHex;
-    conn.maxPeers = this.resolveNetworkMaxPeers(event.networkId, preReadSeq, freshCapacity, conn.maxPeers);
+    const limits = this.resolveNetworkLimits(event.networkId, preReadSeq, freshCapacity, {
+      maxPeers: conn.maxPeers,
+      peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
+    });
+    conn.maxPeers = limits.maxPeers;
+    conn.peerDirectMaxRttMs = limits.peerDirectMaxRttMs;
     // fix1：恢复即新的授权事实——换发 STUN 准入代次（与节点 connEpoch 的暂停
     // 换代一致）。恢复前在途观察的迟到回包按旧 token 复查不匹配，不落新观察；
     // 恢复后的探测以新 token 登记，主辅槽不跨暂停混配
@@ -1347,43 +1370,59 @@ export class PeerWsHub {
     this.monthlyQuotaDroppedByNetwork.delete(networkId);
   }
 
-  private resolveNetworkMaxPeers(
+  private resolveNetworkLimits(
     networkId: string,
     preReadSeq: number,
-    dbMaxPeers: number | null,
-    fallback: number,
-  ): number {
+    db: NetworkRecord | null,
+    fallback: { maxPeers: number; peerDirectMaxRttMs: number },
+  ): { maxPeers: number; peerDirectMaxRttMs: number } {
     const currentCached = this.networkMaxPeers.get(networkId);
     if (currentCached !== undefined && currentCached.seq !== preReadSeq) {
-      return currentCached.maxPeers;
+      return { maxPeers: currentCached.maxPeers, peerDirectMaxRttMs: currentCached.peerDirectMaxRttMs };
     }
-    if (currentCached === undefined && dbMaxPeers !== null) {
-      this.networkMaxPeers.set(networkId, { maxPeers: dbMaxPeers, seq: 0 });
+    if (currentCached === undefined && db !== null) {
+      this.networkMaxPeers.set(networkId, { maxPeers: db.maxPeers, peerDirectMaxRttMs: db.peerDirectMaxRttMs, seq: 0 });
     }
-    return dbMaxPeers ?? currentCached?.maxPeers ?? fallback;
+    return db !== null
+      ? { maxPeers: db.maxPeers, peerDirectMaxRttMs: db.peerDirectMaxRttMs }
+      : (currentCached ?? fallback);
   }
 
   /**
-   * PS-5：网络容量变更（PATCH maxPeers 持久化成功后同一 event-loop turn 同步
-   * 直传）。同值幂等去重；authorized 连接收增量 {type:'network-updated'}，
-   * hanging/paused 池同步刷新快照。
+   * PS-5：网络容量/RTT 上限变更（PATCH 持久化成功后同一 event-loop turn 同步
+   * 直传）。同值幂等去重——两个字段都一致才跳过；authorized 连接收增量
+   * {type:'network-updated'}，hanging/paused 池同步刷新快照。
    */
-  private onNetworkUpdated(networkId: string, maxPeers: number): void {
-    if (this.closed || typeof maxPeers !== 'number' || !Number.isInteger(maxPeers) || maxPeers < 2) return;
+  private onNetworkUpdated(networkId: string, maxPeers: number, peerDirectMaxRttMs: number): void {
+    if (
+      this.closed
+      || typeof maxPeers !== 'number' || !Number.isInteger(maxPeers) || maxPeers < 2
+      || typeof peerDirectMaxRttMs !== 'number' || !Number.isInteger(peerDirectMaxRttMs)
+      || peerDirectMaxRttMs < PEER_DIRECT_MAX_RTT_MS_MIN || peerDirectMaxRttMs > PEER_DIRECT_MAX_RTT_MS_MAX
+    ) return;
     const prev = this.networkMaxPeers.get(networkId);
-    if (prev?.maxPeers === maxPeers) return;
-    this.networkMaxPeers.set(networkId, { maxPeers, seq: (prev?.seq ?? 0) + 1 });
+    if (prev?.maxPeers === maxPeers && prev?.peerDirectMaxRttMs === peerDirectMaxRttMs) return;
+    this.networkMaxPeers.set(networkId, { maxPeers, peerDirectMaxRttMs, seq: (prev?.seq ?? 0) + 1 });
     const net = this.conns.get(networkId);
     if (net !== undefined) {
-      for (const conn of net.values()) conn.maxPeers = maxPeers;
+      for (const conn of net.values()) {
+        conn.maxPeers = maxPeers;
+        conn.peerDirectMaxRttMs = peerDirectMaxRttMs;
+      }
     }
     for (const [, conn] of this.hanging) {
-      if (conn.networkId === networkId) conn.maxPeers = maxPeers;
+      if (conn.networkId === networkId) {
+        conn.maxPeers = maxPeers;
+        conn.peerDirectMaxRttMs = peerDirectMaxRttMs;
+      }
     }
     for (const [, conn] of this.pausedConns) {
-      if (conn.networkId === networkId) conn.maxPeers = maxPeers;
+      if (conn.networkId === networkId) {
+        conn.maxPeers = maxPeers;
+        conn.peerDirectMaxRttMs = peerDirectMaxRttMs;
+      }
     }
-    this.broadcast(networkId, { type: 'network-updated', networkId, maxPeers });
+    this.broadcast(networkId, { type: 'network-updated', networkId, maxPeers, peerDirectMaxRttMs });
   }
 
   private onUserDisabled(userId: string): void {

@@ -113,12 +113,6 @@ export interface ZenRemoteConfig {
      * a flip applies without reloading the row; deliberately NOT in
      * RESTART_FIELDS. */
     logLevel: 'info' | 'debug' | 'warn';
-    /** Direct-path RTT cap in ms (peer-resilience T5): once the measured
-     * keepalive RTT exceeds it the member falls back to the gateway relay;
-     * `0` disables the cap (legacy behaviour — punch ready means direct).
-     * Integer [0, 10000]. Live-read by the engine's getter per sample;
-     * deliberately NOT in RESTART_FIELDS. */
-    peerDirectMaxRttMs: number;
 }
 /** Defaults, one per field — exactly what layer 4 hands back. */
 export declare const DEFAULTS: ZenRemoteConfig;
@@ -241,7 +235,6 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     ingressAcmeEmail: z<any, any, "volatile">;
     ingressPublicUrl: z<any, any, "volatile">;
     logLevel: z<any, any, "volatile">;
-    peerDirectMaxRttMs: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;
@@ -276,7 +269,6 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     ingressAcmeEmail: z<any, any, "volatile">;
     ingressPublicUrl: z<any, any, "volatile">;
     logLevel: z<any, any, "volatile">;
-    peerDirectMaxRttMs: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;
