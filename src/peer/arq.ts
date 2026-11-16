@@ -232,8 +232,8 @@ export class PeerArqSession {
 
   private readonly clock: ArqClock
   private readonly chunkSize: number
-  private readonly windowSize: number
-  private readonly rtoMs: number
+  private windowSize: number
+  private rtoMs: number
   private readonly rtoMaxMs: number
   private readonly onStreamData: PeerArqOptions['onStreamData']
   private readonly onStreamReset: PeerArqOptions['onStreamReset']
@@ -463,6 +463,37 @@ export class PeerArqSession {
     let total = 0
     for (const tx of this.txStreams.values()) total += tx.queue.length
     return total
+  }
+
+  /**
+   * Dynamically adjust send window [1..64] and initial RTO [120..rtoMaxMs]
+   * for the active transport leg without tearing down in-flight frames.
+   */
+  setTransportProfile(profile: { windowSize?: number; rtoMs?: number }): void {
+    if (this.closed) return
+    let nextWindow = this.windowSize
+    let nextRto = this.rtoMs
+    if (profile.windowSize !== undefined) {
+      if (!Number.isInteger(profile.windowSize)) {
+        throw new RangeError('windowSize must be a finite integer')
+      }
+      nextWindow = Math.min(ARQ_DEFAULT_WINDOW, Math.max(1, profile.windowSize))
+    }
+    if (profile.rtoMs !== undefined) {
+      if (!Number.isInteger(profile.rtoMs)) {
+        throw new RangeError('rtoMs must be a finite integer')
+      }
+      const floor = Math.min(ARQ_DEFAULT_RTO_MS, this.rtoMaxMs)
+      nextRto = Math.min(this.rtoMaxMs, Math.max(floor, profile.rtoMs))
+    }
+    const grew = nextWindow > this.windowSize
+    this.windowSize = nextWindow
+    this.rtoMs = nextRto
+    if (grew) {
+      for (const [sid, tx] of this.txStreams) {
+        this.pump(sid, tx)
+      }
+    }
   }
 
   /**

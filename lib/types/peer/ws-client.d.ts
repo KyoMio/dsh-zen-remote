@@ -38,8 +38,15 @@ export declare class WsClient extends EventEmitter {
     private closeTimer;
     private request;
     private handshakeTimer;
+    private readonly pingIntervalMs;
+    private readonly pongTimeoutMs;
+    private lastActivityAt;
+    private pingTimer;
+    private pongTimer;
     constructor(url: string, headers?: Record<string, string>, options?: {
         handshakeTimeoutMs?: number;
+        pingIntervalMs?: number;
+        pongTimeoutMs?: number;
     });
     /** 文本或二进制消息：字符串发 TEXT 帧，字节发 BINARY 帧（引擎的控制面靠
      * 文本/二进制分流——发错帧型网关会把 auth 当中转载荷丢掉）。 */
@@ -52,6 +59,10 @@ export declare class WsClient extends EventEmitter {
     private onSocketClosed;
     private fail;
     private clearHandshake;
+    private startKeepalive;
+    private tickKeepalive;
+    private touchActivity;
+    private clearKeepalive;
     private finish;
 }
 //# sourceMappingURL=ws-client.d.ts.map

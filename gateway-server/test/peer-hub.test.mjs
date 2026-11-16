@@ -484,6 +484,8 @@ async function startGateway(opts = {}) {
     flushMs: opts.flushMs ?? null, // 缺省关掉遥测刷盘定时器，按需开
     // GC-3：注入时钟（令牌桶无回填可精确算术；月度记账与快照年月随之自洽）
     ...(opts.now !== undefined ? { now: opts.now } : {}),
+    ...(opts.pingIntervalMs !== undefined ? { pingIntervalMs: opts.pingIntervalMs } : {}),
+    ...(opts.pongTimeoutMs !== undefined ? { pongTimeoutMs: opts.pongTimeoutMs } : {}),
   });
   const server = createGatewayApiServer({ store, masterKey, runtime: hub, hooks: hub.hooks, topology: hub });
   await new Promise((resolve, reject) => {
@@ -3128,6 +3130,168 @@ describe('GC-3 用户组限速与月度中转配额', () => {
       assert.equal(wbPending.status, 'pending');
       wsBExplicitRejoin.close();
       await wsClosed(wsBExplicitRejoin);
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+describe('T1：WS 控制面双向保活与 connSeq 代次分发', () => {
+  test('PeerWsHub 心跳超时主动 terminate 不回 pong 的半开客户端并广播 peer-left，正常客户端保持在线', async () => {
+    const gw = await startGateway({ pingIntervalMs: 40, pongTimeoutMs: 60 });
+    try {
+      const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const a = identity();
+      const b = identity();
+
+      // A 使用标准 ws 库（自动回 pong）保持活跃
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey, name: 'alpha' });
+      const welcomeA = await wsJson(wsA);
+      assert.equal(welcomeA.status, 'authorized');
+
+      // B 使用 rawWsConnect（故意忽略 0x9 ping，不回 pong）
+      const port = Number(new URL(gw.base).port);
+      const rawB = await rawWsConnect(port);
+      const chB = await rawB.nextJson();
+      assert.equal(chB.type, 'challenge');
+      const ts = Date.now();
+      rawB.sendText({
+        type: 'auth',
+        networkId: net.id,
+        nodeId: b.nodeId,
+        publicKeyHex: b.publicKeyHex,
+        name: 'bravo-silent',
+        lanEndpoints: [],
+        timestamp: ts,
+        signatureHex: edSign(b.privateKeyHex, b.publicKeyHex, authMessage(net.id, b.nodeId, chB.challengeHex, ts)),
+        joinKeyProofHex: joinProof(net.joinKey, net.id, b.nodeId, chB.challengeHex),
+      });
+      const welcomeB = await rawB.nextJson();
+      assert.equal(welcomeB.status, 'authorized');
+      const punchAtB = await rawB.nextJson();
+      assert.equal(punchAtB.type, 'punch-coordinate');
+
+      const joinedAtA = await wsJson(wsA);
+      assert.equal(joinedAtA.type, 'peer-joined');
+      const punchAtA = await wsJson(wsA);
+      assert.equal(punchAtA.type, 'punch-coordinate');
+
+      // 等待超时：网关应强拆 rawB 并向 wsA 广播 peer-left；wsA 仍在线
+      await rawB.waitClosed({ timeoutMs: 1000 });
+      const leftAtA = await wsJson(wsA, { timeoutMs: 1000 });
+      assert.equal(leftAtA.type, 'peer-left');
+      assert.equal(leftAtA.nodeId, b.nodeId);
+      assert.equal(wsA.readyState, WebSocket.OPEN);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('welcome / peer-joined / punch-coordinate 携带单调递增 connSeq，含 replaceExisting 抢占与 pending 晋升', async () => {
+    const gw = await startGateway();
+    try {
+      const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const a = identity();
+      const b = identity();
+
+      const wsA1 = await wsOpen(gw.base);
+      await authNode(wsA1, a, { networkId: net.id, joinKey: net.joinKey, name: 'alpha' });
+      const wA1 = await wsJson(wsA1);
+      assert.equal(Number.isInteger(wA1.connSeq) && wA1.connSeq >= 1, true, `welcome.connSeq=${wA1.connSeq}`);
+
+      const wsB = await wsOpen(gw.base);
+      await authNode(wsB, b, { networkId: net.id, joinKey: net.joinKey, name: 'bravo' });
+      const wB = await wsJson(wsB);
+      assert.equal(Number.isInteger(wB.connSeq) && wB.connSeq > wA1.connSeq, true);
+      assert.equal(wB.peers[0].connSeq, wA1.connSeq);
+      const punchB1 = await wsJson(wsB);
+      assert.equal(punchB1.type, 'punch-coordinate');
+      assert.equal(punchB1.connSeq, wA1.connSeq);
+
+      const joinedB = await wsJson(wsA1);
+      assert.equal(joinedB.type, 'peer-joined');
+      assert.equal(joinedB.connSeq, wB.connSeq);
+      const punchA1 = await wsJson(wsA1);
+      assert.equal(punchA1.type, 'punch-coordinate');
+      assert.equal(punchA1.connSeq, wB.connSeq);
+
+      // replaceExisting 抢占 A 的连接：A 新连接拿到更大的 connSeq，且 B 收到的 peer-joined/punch-coordinate 也带新 connSeq
+      const wsA2 = await wsOpen(gw.base);
+      await authNode(wsA2, a, { networkId: net.id, joinKey: net.joinKey, name: 'alpha' });
+      const wA2 = await wsJson(wsA2);
+      assert.equal(wA2.status, 'authorized');
+      assert.equal(Number.isInteger(wA2.connSeq) && wA2.connSeq > wB.connSeq, true, `expected wA2.connSeq (${wA2.connSeq}) > wB.connSeq (${wB.connSeq})`);
+      assert.equal(wA2.peers[0].connSeq, wB.connSeq);
+      const punchA2 = await wsJson(wsA2);
+      assert.equal(punchA2.connSeq, wB.connSeq);
+
+      const joinedA2 = await wsJson(wsB);
+      assert.equal(joinedA2.type, 'peer-joined');
+      assert.equal(joinedA2.nodeId, a.nodeId);
+      assert.equal(joinedA2.connSeq, wA2.connSeq);
+      const punchB2 = await wsJson(wsB);
+      assert.equal(punchB2.type, 'punch-coordinate');
+      assert.equal(punchB2.peerNodeId, a.nodeId);
+      assert.equal(punchB2.connSeq, wA2.connSeq);
+
+      // STUN 补发 punch-coordinate 也带 connSeq
+      const udpA = await udpSocket();
+      const stunPort = gw.udp.primaryPort;
+      udpProbe(udpA, stunPort, a, { networkId: net.id });
+      await udpRecv(udpA);
+      const stunPunchAtB = await wsJson(wsB);
+      assert.equal(stunPunchAtB.type, 'punch-coordinate');
+      assert.equal(stunPunchAtB.peerNodeId, a.nodeId);
+      assert.equal(stunPunchAtB.connSeq, wA2.connSeq);
+      udpA.close();
+      await wsClosed(wsA1);
+
+      // pending 节点经 REST approve 晋升时同样携带单调 connSeq
+      const manualNet = await createNetwork(gw, { mode: 'manual', maxPeers: 4 });
+      const c = identity();
+      const wsC = await wsOpen(gw.base);
+      await authNode(wsC, c, { networkId: manualNet.id, name: 'charlie' });
+      const wCPending = await wsJson(wsC);
+      assert.equal(wCPending.status, 'pending');
+      const approveRes = await api(gw.base, 'POST', `/api/v1/networks/${manualNet.id}/members/${c.nodeId}/approve`, {
+        cookie: gw.tenantCookie,
+        body: {},
+      });
+      assert.equal(approveRes.status, 200);
+      const wCApproved = await wsJson(wsC);
+      assert.equal(wCApproved.status, 'authorized');
+      assert.equal(Number.isInteger(wCApproved.connSeq) && wCApproved.connSeq > wA2.connSeq, true);
+
+      // paused 节点经 REST resume 原地晋升时同步递增 connSeq，并带入 welcome / peer-joined / punch-coordinate
+      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
+      assert.equal(pauseRes.status, 200);
+      const pausedAtB = await wsJson(wsB);
+      assert.equal(pausedAtB.type, 'paused');
+      const pausedAtA = await wsJson(wsA2);
+      assert.equal(pausedAtA.type, 'peer-paused');
+
+      const resumeRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
+      assert.equal(resumeRes.status, 200);
+      const wBResumed = await wsJson(wsB);
+      assert.equal(wBResumed.type, 'welcome');
+      assert.equal(wBResumed.status, 'authorized');
+      assert.equal(
+        Number.isInteger(wBResumed.connSeq) && wBResumed.connSeq > wCApproved.connSeq,
+        true,
+        `expected resumed welcome.connSeq (${wBResumed.connSeq}) > ${wCApproved.connSeq}`,
+      );
+      assert.equal(wBResumed.peers[0].connSeq, wA2.connSeq);
+      const joinedBResumed = await wsJson(wsA2);
+      assert.equal(joinedBResumed.type, 'peer-joined');
+      assert.equal(joinedBResumed.connSeq, wBResumed.connSeq);
+      const punchBResumed = await wsJson(wsA2);
+      assert.equal(punchBResumed.type, 'punch-coordinate');
+      assert.equal(punchBResumed.connSeq, wBResumed.connSeq);
+
+      wsA2.close();
+      wsB.close();
+      wsC.close();
     } finally {
       await gw.close();
     }

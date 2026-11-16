@@ -61,13 +61,15 @@ import {
 import type { PeerFrameHeader } from './wire.js'
 
 const NODE_ID_PATTERN = /^[0-9a-f]{8}$/
-/** hello/ack envelope 的时间戳新鲜度窗口（PC-12 起移入共同契约解析，数值不变）。 */
-const ENVELOPE_TTL_MS = 30_000
+/** hello/ack envelope 的时间戳新鲜度窗口（±5min，与网关 auth 窗口对齐）。 */
+const ENVELOPE_TTL_MS = 300_000
 /** 网关中转的最小帧长：28B 头 + 16B（AEAD tag 起步）。明文 envelope 也必须够长。 */
 const GATEWAY_MIN_FRAME_BYTES = 44
 /** WS hello envelope 的重发节奏（TCP 可靠，这里只兜握手竞态与迟到坐标）。 */
 const HELLO_RETRY_MS = 400
 const HELLO_RETRY_MAX = 6
+/** dispatchFrame 无密码器按需自愈拉起 beginHello 的最小冷却间隔（ms）。 */
+const AUTO_HELLO_COOLDOWN_MS = 2_000
 const BODY_HIGH_WATER_BYTES = 64 * 1024
 const ADMISSION_CHUNK_BYTES = 16 * 1024
 const MAX_META_BYTES = 65_536
@@ -136,6 +138,8 @@ interface MuxSession {
   nextStreamId: number
   helloTimer: unknown
   helloTries: number
+  lastAutoHelloAt: number
+  relayRequested: boolean
   closed: boolean
 }
 
@@ -224,6 +228,8 @@ export class PeerMux {
       nextStreamId: this.nextStreamIds.get(id) ?? (id < this.options.identity.nodeId ? 1 : 2),
       helloTimer: null,
       helloTries: 0,
+      lastAutoHelloAt: -AUTO_HELLO_COOLDOWN_MS,
+      relayRequested: false,
       closed: false,
     }
     this.sessions.set(id, session)
@@ -235,23 +241,51 @@ export class PeerMux {
     if (session && peerName.trim() !== '') session.peerName = peerName.trim()
   }
 
-  /** 拆掉一个对端的会话（peer-left / mismatch / 本机禁用）：流中止、表清理。 */
-  dropSession(nodeId: string): void {
+  /** 动态调整对端 ARQ 发送档案（p2p 收窄窗口、提升初始 RTO 防突发拥塞）。 */
+  setPeerTransportProfile(nodeId: string, profile: { windowSize?: number; rtoMs?: number }): void {
     const session = this.sessions.get(nodeId.toLowerCase())
-    if (!session) return
+    if (!session || session.closed || this.closed) return
+    session.arq.setTransportProfile(profile)
+  }
+
+  private teardownSession(session: MuxSession, reason: string): void {
     this.nextStreamIds.set(session.nodeId, session.nextStreamId)
     this.clearHelloTimer(session)
     session.closed = true
-    session.arq.closeAll()
     for (const stream of [...session.streams.values()]) {
-      this.abortStream(session, stream, new Error('peer session closed'))
+      this.abortStream(session, stream, new Error(reason))
     }
     session.streams.clear()
+    session.arq.closeAll()
+    session.ciphers = null
+    session.myEph = null
+    session.nonce = null
+    session.peerEphPubHex = null
+    session.seq = 0n
+    session.envelopeSeq = 0n
+    session.punchSender = null
     this.sessions.delete(session.nodeId)
     if (session.path !== 'none') {
       session.path = 'none'
       this.options.onPathChanged?.(session.nodeId, 'none')
     }
+  }
+
+  /** 拆掉一个对端的会话（peer-left / mismatch / 本机禁用）：流中止、表清理。 */
+  dropSession(nodeId: string): void {
+    const session = this.sessions.get(nodeId.toLowerCase())
+    if (!session) return
+    this.teardownSession(session, 'peer session closed')
+  }
+
+  /** 对称重置对端会话：中止旧流、清空密钥与 ARQ、保留单调 nextStreamId 并立即重建干净会话。 */
+  resetSession(nodeId: string): void {
+    const id = nodeId.toLowerCase()
+    const session = this.sessions.get(id)
+    if (!session || this.closed) return
+    const { peerPublicKeyHex, peerName } = session
+    this.teardownSession(session, 'peer session reset')
+    this.ensureSession(id, peerPublicKeyHex, peerName)
   }
 
   hasSession(nodeId: string): boolean {
@@ -528,6 +562,13 @@ export class PeerMux {
       this.options.sendGatewayBinary?.(frame)
       return
     }
+    if (session.relayRequested && session.path !== 'udp' && session.helloTimer === null) {
+      const now = this.clock.now()
+      if (now - session.lastAutoHelloAt >= AUTO_HELLO_COOLDOWN_MS) {
+        session.lastAutoHelloAt = now
+        this.beginHello(session)
+      }
+    }
     throw new Error(`no path ready for peer ${session.nodeId}`)
   }
 
@@ -535,6 +576,7 @@ export class PeerMux {
 
   private beginHello(session: MuxSession): void {
     if (session.closed || this.closed) return
+    session.relayRequested = true
     if (session.helloTimer !== null) return // 握手已在途
     ensureMyEphemeral(session)
     if (session.nonce === null) session.nonce = randomBytes(8).toString('hex')

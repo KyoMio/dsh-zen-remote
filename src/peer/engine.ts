@@ -200,6 +200,15 @@ interface MemberRec {
   directActive: boolean
   /** 连续未回 PING 数；收到匹配样本/丢直连/重锚归零，满 2 按一次超限样本处理。 */
   directMissedPings: number
+  /** 对端上次通告的连接代次（来自网关 welcome.peers / peer-joined / punch-coordinate）。 */
+  lastConnSeq: number | null
+  /** 该成员最近一次完成同步重锚时的本机控制 WS 纪元。 */
+  reanchoredAtSelfWsEpoch: number
+  /** 该成员最近一次完成同步重锚时的本机局域网接口纪元。 */
+  reanchoredAtSelfLanEpoch: number
+  /** 最近一次下发给 PeerMux/ARQ 的发送窗口与初始 RTO（防抖用）。 */
+  lastArqWindow: number | null
+  lastArqRtoMs: number | null
 }
 
 const realClock = {
@@ -220,6 +229,35 @@ const canonicalEndpoints = (lan: string[], reflexive: string | null): string => 
   for (const ep of lan) if (typeof ep === 'string' && ep !== '') set.add(ep)
   if (typeof reflexive === 'string' && reflexive !== '') set.add(reflexive)
   return [...set].sort().join(' ')
+}
+
+const hasRemovedOrReplacedEndpoint = (
+  oldLan: string[],
+  oldReflexive: string | null,
+  newLan: string[],
+  newReflexive: string | null,
+): boolean => {
+  const nextSet = new Set<string>()
+  for (const ep of newLan) if (typeof ep === 'string' && ep !== '') nextSet.add(ep)
+  if (typeof newReflexive === 'string' && newReflexive !== '') nextSet.add(newReflexive)
+  for (const ep of oldLan) {
+    if (typeof ep === 'string' && ep !== '' && !nextSet.has(ep)) return true
+  }
+  if (typeof oldReflexive === 'string' && oldReflexive !== '' && !nextSet.has(oldReflexive)) return true
+  return false
+}
+
+const parseConnSeq = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : null
+
+const arqProfileForPath = (
+  mode: 'lan' | 'p2p' | 'relay',
+  smoothedRttMs: number | null,
+): { windowSize: number; rtoMs: number } => {
+  if (mode !== 'p2p') return { windowSize: 64, rtoMs: 120 }
+  const rtt = smoothedRttMs ?? 50
+  const rtoMs = Math.min(1000, Math.max(120, Math.ceil(rtt * 2 + 50)))
+  return { windowSize: 16, rtoMs }
 }
 
 /**
@@ -290,6 +328,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let wsReconnectTimer: unknown = null
   let wsAuthTimer: unknown = null
   let wsReconnectable = true
+  let wsHadOpen = false
+  let wsClosedAfterOpen = false
+  let selfWsReanchorEpoch = 0
+  let selfLanReanchorEpoch = 0
+  let lastSelfLanKey: string | null = null
   let punch: PeerPunchManager | null = null
   /** 打洞与 STUN 共用的 socket：注入的（引擎不关）或自建的（引擎关）。 */
   let punchSocket: DgramSocket | undefined
@@ -366,6 +409,54 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     log(`peer engine: TOFU key-mismatch for ${member.nodeId} — blocked locally until trustPeer()`)
   }
 
+  const selfLanIpSignature = (): string => {
+    if (punch === null) return ''
+    const ips = new Set<string>()
+    for (const ep of punch.lanEndpoints()) {
+      const colon = ep.lastIndexOf(':')
+      if (colon > 0) ips.add(ep.slice(0, colon))
+    }
+    return [...ips].sort().join(' ')
+  }
+
+  const syncSelfLanKey = (): boolean => {
+    if (punch === null) return false
+    const cur = selfLanIpSignature()
+    if (lastSelfLanKey === null) {
+      lastSelfLanKey = cur
+      return false
+    }
+    if (cur !== lastSelfLanKey) {
+      lastSelfLanKey = cur
+      selfLanReanchorEpoch += 1
+      return true
+    }
+    return false
+  }
+
+  const resetPeerForReanchor = (member: MemberRec, reason: string, resetMux: boolean): void => {
+    punch?.dropPeer(member.nodeId)
+    if (resetMux) {
+      mux?.resetSession(member.nodeId)
+    }
+    member.path = 'relay'
+    member.directMode = null
+    member.directSmoothedRtt = null
+    member.directGoodStreak = 0
+    member.directDemoted = false
+    member.directActive = false
+    member.directMissedPings = 0
+    member.lastArqWindow = null
+    member.lastArqRtoMs = null
+    if (resetMux) {
+      mux?.enableRelayPath(member.nodeId)
+    } else {
+      mux?.setRelayPath(member.nodeId)
+    }
+    log(`peer engine: re-anchored ${member.nodeId} (${reason})`)
+    schedulePathReport()
+  }
+
   /** 一条对端公告（welcome.peers / peer-joined / punch-coordinate 共用）。 */
   const announcePeer = (info: {
     nodeId: string
@@ -373,6 +464,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     name?: string | null
     lanEndpoints?: string[] | null
     reflexiveEndpoint?: string | null
+    connSeq?: number | null
     startPunch: boolean
     deferMount?: boolean
   }): void => {
@@ -380,11 +472,15 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     const nodeId = info.nodeId.toLowerCase()
     if (nodeId === identity.nodeId) return
     if (mux === null) return
+    const selfLanChanged = syncSelfLanKey()
     const net = readPeerNetwork(stateFile)
     const disabled = net?.disabledNodes?.includes(nodeId) === true
     let member = members.get(nodeId)
-    const oldEndpointSet = member !== undefined
-      ? canonicalEndpoints(member.lastLanEndpoints, member.lastReflexive)
+    const isNewMember = member === undefined
+    const oldLan = member !== undefined ? member.lastLanEndpoints : []
+    const oldReflexive = member !== undefined ? member.lastReflexive : null
+    const oldEndpointSet = !isNewMember
+      ? canonicalEndpoints(oldLan, oldReflexive)
       : null
     if (member === undefined) {
       member = {
@@ -402,12 +498,28 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         directDemoted: false,
         directActive: false,
         directMissedPings: 0,
+        lastConnSeq: null,
+        reanchoredAtSelfWsEpoch: selfWsReanchorEpoch,
+        reanchoredAtSelfLanEpoch: selfLanReanchorEpoch,
+        lastArqWindow: null,
+        lastArqRtoMs: null,
       }
       members.set(nodeId, member)
     }
     if (typeof info.name === 'string' && info.name.trim() !== '') member.name = info.name.trim()
     member.lastLanEndpoints = Array.isArray(info.lanEndpoints) ? info.lanEndpoints.filter((e) => typeof e === 'string') : member.lastLanEndpoints
-    member.lastReflexive = typeof info.reflexiveEndpoint === 'string' ? info.reflexiveEndpoint : member.lastReflexive
+    if ('reflexiveEndpoint' in info && info.reflexiveEndpoint !== undefined) {
+      member.lastReflexive = typeof info.reflexiveEndpoint === 'string' && info.reflexiveEndpoint !== ''
+        ? info.reflexiveEndpoint
+        : null
+    }
+    const incomingConnSeq = parseConnSeq(info.connSeq)
+    const connSeqChanged = !isNewMember && incomingConnSeq !== null && member.lastConnSeq !== null && incomingConnSeq !== member.lastConnSeq
+    if (incomingConnSeq !== null) member.lastConnSeq = incomingConnSeq
+    const selfWsEpochChanged = !isNewMember && member.reanchoredAtSelfWsEpoch !== selfWsReanchorEpoch
+    const selfLanEpochChanged = !isNewMember && member.reanchoredAtSelfLanEpoch !== selfLanReanchorEpoch
+    member.reanchoredAtSelfWsEpoch = selfWsReanchorEpoch
+    member.reanchoredAtSelfLanEpoch = selfLanReanchorEpoch
     const endpointsChanged = oldEndpointSet !== null
       && canonicalEndpoints(member.lastLanEndpoints, member.lastReflexive) !== oldEndpointSet
 
@@ -435,21 +547,27 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (member.mounted) options.relayPool.updateVirtualName(nodeId, member.name)
     if (!info.deferMount) refreshMounts()
     if (info.startPunch && punch !== null) {
-      // 换网重锚（2.5.x）：公告端点集变了说明旧直连端点已死——先丢旧会话、
-      // 落回中转、清空测量，再照常 beginPunch 重新打洞；端点集不变的重复
-      // 公告靠 beginPunch 的早退守卫照原样合并候选，不打断现有直连。
-      if (endpointsChanged) {
-        punch.dropPeer(nodeId)
-        mux.setRelayPath(nodeId)
-        member.path = 'relay'
-        member.directMode = null
-        member.directSmoothedRtt = null
-        member.directGoodStreak = 0
-        member.directDemoted = false
-        member.directActive = false
-        member.directMissedPings = 0
-        log(`peer engine: re-anchored ${nodeId} (endpoints changed)`)
-        schedulePathReport()
+      const keepAliveMs = options.punch?.keepAliveMs ?? 5_000
+      const pState = punch.peerState(nodeId)
+      const keepDirectOrPunching =
+        pState !== null &&
+        (pState.state === 'punching' ||
+          (pState.state === 'direct' && pState.recentRxAgeMs !== null && pState.recentRxAgeMs <= keepAliveMs))
+      const endpointReplacedOrRemoved = endpointsChanged
+        && hasRemovedOrReplacedEndpoint(oldLan, oldReflexive, member.lastLanEndpoints, member.lastReflexive)
+      const shouldReanchor = selfWsEpochChanged
+        || selfLanEpochChanged
+        || connSeqChanged
+        || endpointReplacedOrRemoved
+        || (endpointsChanged && pState?.state === 'direct' && !keepDirectOrPunching)
+      if (shouldReanchor) {
+        const reason = connSeqChanged
+          ? 'connSeq changed'
+          : selfWsEpochChanged || selfLanEpochChanged
+            ? 'local network changed'
+            : 'endpoints changed'
+        const resetMux = connSeqChanged || selfWsEpochChanged
+        resetPeerForReanchor(member, reason, resetMux)
       }
       try {
         punch.beginPunch({
@@ -461,6 +579,21 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         log(`peer engine: beginPunch(${nodeId}) candidates=${member.lastLanEndpoints.length + (member.lastReflexive !== null ? 1 : 0)} ours=${punch.lanEndpoints().length}`)
       } catch (err) {
         log(`peer engine: beginPunch refused for ${nodeId}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    if (selfLanChanged && !info.deferMount && punch !== null) {
+      for (const other of members.values()) {
+        if (other === member || other.state !== 'eligible' || other.reanchoredAtSelfLanEpoch === selfLanReanchorEpoch) continue
+        other.reanchoredAtSelfLanEpoch = selfLanReanchorEpoch
+        resetPeerForReanchor(other, 'local network changed', false)
+        try {
+          punch.beginPunch({
+            peerNodeId: other.nodeId,
+            peerPublicKeyHex: other.publicKeyHex,
+            lanEndpoints: other.lastLanEndpoints,
+            ...(other.lastReflexive !== null ? { reflexiveEndpoint: other.lastReflexive } : {}),
+          } satisfies PunchPeerInfo)
+        } catch { /* next coordinate will retry */ }
       }
     }
   }
@@ -507,6 +640,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     let authTimedOut = false
     client.on('open', () => {
       if (ws !== client) return
+      if (wsClosedAfterOpen) {
+        wsClosedAfterOpen = false
+        selfWsReanchorEpoch += 1
+      }
+      wsHadOpen = true
       // Upgrade head may already contain a valid welcome before open fires.
       if (gatewayState !== 'connecting') return
       wsAuthTimer = clock.setTimeout(() => {
@@ -546,6 +684,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       if (ws !== client) return
       clearAuthDeadline()
       ws = null
+      if (wsHadOpen) wsClosedAfterOpen = true
       // 连接结束即换代（PC-01b fix1）：本连接在途探测的迟到结果随之作废，
       // 重连后的新连接按新代次重新探测登记反射端点。
       connEpoch += 1
@@ -611,6 +750,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (type === 'welcome') {
       const status = message['status']
       if (status !== 'authorized' && status !== 'pending' && status !== 'mismatch' && status !== 'paused') return
+      if (wsClosedAfterOpen) {
+        wsClosedAfterOpen = false
+        selfWsReanchorEpoch += 1
+      }
+      wsHadOpen = true
       wsAttempt = 0
       clearAuthDeadline()
       deniedReason = null
@@ -648,6 +792,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       }
       if (status === 'authorized') {
         gatewayState = 'authorized'
+        syncSelfLanKey()
         const livePeerIds = new Set<string>()
         for (const peer of Array.isArray(message['peers']) ? (message['peers'] as Array<Record<string, unknown>>) : []) {
           if (typeof peer?.nodeId !== 'string' || typeof peer?.publicKeyHex !== 'string') continue
@@ -659,6 +804,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
             name: typeof peer.name === 'string' ? peer.name : null,
             lanEndpoints: Array.isArray(peer.lanEndpoints) ? (peer.lanEndpoints as string[]) : null,
             reflexiveEndpoint: typeof peer.reflexiveEndpoint === 'string' ? peer.reflexiveEndpoint : null,
+            connSeq: parseConnSeq(peer.connSeq),
             startPunch: true,
             deferMount: true,
           })
@@ -763,6 +909,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         name: typeof message['name'] === 'string' ? message['name'] : null,
         lanEndpoints: Array.isArray(message['lanEndpoints']) ? (message['lanEndpoints'] as string[]) : null,
         reflexiveEndpoint: typeof message['reflexiveEndpoint'] === 'string' ? message['reflexiveEndpoint'] : null,
+        connSeq: parseConnSeq(message['connSeq']),
         startPunch: true,
       })
       return
@@ -798,6 +945,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         name: null,
         lanEndpoints: Array.isArray(message['lanEndpoints']) ? (message['lanEndpoints'] as string[]) : null,
         reflexiveEndpoint: typeof message['reflexiveEndpoint'] === 'string' ? message['reflexiveEndpoint'] : null,
+        connSeq: parseConnSeq(message['connSeq']),
         startPunch: true,
       })
       return
@@ -960,6 +1108,22 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
 
   // ------------------------------------------------------------ 打洞回调
 
+  const applyArqProfile = (member: MemberRec, mode: 'lan' | 'p2p' | 'relay', force = false): void => {
+    if (mux === null) return
+    const profile = arqProfileForPath(mode, member.directSmoothedRtt)
+    if (
+      !force
+      && member.lastArqWindow === profile.windowSize
+      && member.lastArqRtoMs !== null
+      && Math.abs(profile.rtoMs - member.lastArqRtoMs) < 25
+    ) {
+      return
+    }
+    member.lastArqWindow = profile.windowSize
+    member.lastArqRtoMs = profile.rtoMs
+    mux.setPeerTransportProfile(member.nodeId, profile)
+  }
+
   const onDirectReady = (nodeId: string, info: DirectReadyInfo): void => {
     log(`peer engine: direct ready ${nodeId} via ${info.mode} ${info.endpoint} rtt=${info.rttMs}`)
     const member = members.get(nodeId)
@@ -973,10 +1137,13 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directDemoted = false
     member.directActive = false
     member.directMissedPings = 0
+    member.lastArqWindow = null
+    member.lastArqRtoMs = null
     if (directCap() <= 0) {
       // 上限关闭：与旧行为一致，打通即直连。
       member.path = info.mode
       member.directActive = true
+      applyArqProfile(member, info.mode, true)
       if (mux !== null && punch !== null) {
         mux.setDirectPath(nodeId, punch.frameSenderFor(nodeId))
       }
@@ -985,6 +1152,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       // 切回 ws 路径），path 口径钉死 relay——实际还走着中转，等连续
       // 两个达标样本升直连。
       member.path = 'relay'
+      applyArqProfile(member, 'relay', true)
       mux?.enableRelayPath(nodeId)
     }
     schedulePathReport()
@@ -1012,8 +1180,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   /** 升直连：mux 切 UDP、路径回填握手模式、清降级标记。 */
   const promoteDirect = (member: MemberRec): void => {
     if (mux === null || punch === null) return
+    const mode = member.directMode ?? 'p2p'
+    applyArqProfile(member, mode, true)
     mux.setDirectPath(member.nodeId, punch.frameSenderFor(member.nodeId))
-    member.path = member.directMode ?? 'p2p'
+    member.path = mode
     member.directActive = true
     member.directDemoted = false
     member.directGoodStreak = 0
@@ -1023,6 +1193,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
 
   /** 降级回中转的单一出口：超上限样本与连 miss 都走这里。 */
   const demoteDirect = (member: MemberRec, why: string): void => {
+    applyArqProfile(member, 'relay', true)
     mux?.setRelayPath(member.nodeId)
     member.path = 'relay'
     member.directActive = false
@@ -1059,12 +1230,15 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     const cap = directCap()
     if (cap <= 0) {
       if (!member.directActive) promoteDirect(member)
+      else if (member.directMode === 'p2p') applyArqProfile(member, 'p2p', false)
       return
     }
     if (member.directActive) {
       if (rtt > cap && prevSmoothed !== null && prevSmoothed > cap) {
         demoteDirect(member, `rtt ${rtt}ms over cap ${cap}ms`)
+        return
       }
+      if (member.directMode === 'p2p') applyArqProfile(member, 'p2p', false)
       return
     }
     // 未激活（首样本期或已降级）统一口径：连续 DIRECT_PROMOTE_STREAK 个
@@ -1089,6 +1263,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (member === undefined) return
     log(`peer engine: direct lost ${nodeId} — relaying`)
     member.path = 'relay'
+    applyArqProfile(member, 'relay', true)
     mux?.setRelayPath(nodeId)
     // T5：旧会话的测量与降级状态一起作废，重打通后重走首样本判定。
     member.directMode = null
@@ -1166,6 +1341,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       relayHandler: options.relayHandler,
       relaySecret: options.relaySecret,
       clock,
+      onPathChanged: (peerNodeId, path) => {
+        if (path === 'ws' || path === 'udp') {
+          void options.relayPool.reconnect?.(peerNodeId)
+        }
+      },
       log,
       debug: options.debug,
     })
@@ -1193,6 +1373,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       pathReportArmed.timer = null
     }
     wsReconnectable = false
+    wsHadOpen = false
+    wsClosedAfterOpen = false
+    selfWsReanchorEpoch = 0
+    selfLanReanchorEpoch = 0
+    lastSelfLanKey = null
     try { ws?.close() } catch { /* dying */ }
     ws = null
     mux?.close()
@@ -1221,6 +1406,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       const parsed = parseInviteUri(invite)
       if (parsed === null) return { ok: false, code: 'invalid-invite' }
       const existing = readPeerNetwork(stateFile)
+      const sameNet = existing?.networkId === parsed.networkId
       // 切换网络或重填地址重新入网时，先拆掉上一轮挂起/在线的 WS、mux 与打洞器。
       resetActiveSession()
       writePeerRevokedNotice(stateFile, undefined)
@@ -1231,11 +1417,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         networkId: parsed.networkId,
         joinedAt: clock.now(),
         ...(parsed.joinKey !== undefined ? { joinKey: parsed.joinKey } : {}),
-        ...(existing?.disabledNodes !== undefined ? { disabledNodes: existing.disabledNodes } : {}),
-        ...(existing?.maxPeersFromGateway !== undefined ? { maxPeersFromGateway: existing.maxPeersFromGateway } : {}),
-        ...(existing?.peerDirectMaxRttMsFromGateway !== undefined ? { peerDirectMaxRttMsFromGateway: existing.peerDirectMaxRttMsFromGateway } : {}),
+        ...(sameNet && existing?.disabledNodes !== undefined ? { disabledNodes: existing.disabledNodes } : {}),
+        ...(sameNet && existing?.maxPeersFromGateway !== undefined ? { maxPeersFromGateway: existing.maxPeersFromGateway } : {}),
+        ...(sameNet && existing?.peerDirectMaxRttMsFromGateway !== undefined ? { peerDirectMaxRttMsFromGateway: existing.peerDirectMaxRttMsFromGateway } : {}),
       })
-      capFromGateway = existing?.peerDirectMaxRttMsFromGateway ?? null
+      capFromGateway = sameNet ? (existing?.peerDirectMaxRttMsFromGateway ?? null) : null
       networkId = parsed.networkId
       wsReconnectable = true
       wsAttempt = 0

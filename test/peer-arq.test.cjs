@@ -828,3 +828,44 @@ test('survives throwing sendFrame while path is none, flushes immediately on flu
     sessionB.closeAll()
   }
 })
+
+test('T4: setTransportProfile dynamically bounds inflight window and initial RTO', async () => {
+  // 1. Defaults preserve 64 window and 120ms RTO.
+  {
+    const { session, sent, clock } = makeSession({ chunkSize: 100 })
+    const p = session.write(1, Buffer.alloc(64 * 100, 0xaa))
+    p.catch(() => {})
+    assert.equal(session.inflightTotal(), 64, 'default windowSize allows 64 fragments inflight')
+    assert.equal(sent.length, 64)
+    clock.advance(119)
+    assert.equal(sent.length, 64, 'no retransmit before default 120ms RTO')
+    clock.advance(1)
+    assert.equal(sent.length, 128, 'retransmits at default 120ms RTO')
+    session.closeAll()
+  }
+
+  // 2. Switching to { windowSize: 16, rtoMs: 320 } caps inflight at 16 and delays first RTO to 320ms.
+  {
+    const { session, sent, clock } = makeSession({ chunkSize: 100 })
+    session.setTransportProfile({ windowSize: 16, rtoMs: 320 })
+    const p = session.write(1, Buffer.alloc(64 * 100, 0xbb))
+    p.catch(() => {})
+    assert.equal(session.inflightTotal(), 16, 'at most 16 fragments inflight under p2p profile')
+    assert.equal(session.queuedTotal(), 48)
+    assert.equal(sent.length, 16)
+
+    clock.advance(200)
+    assert.equal(sent.length, 16, '200ms must not trigger premature retransmission under 320ms RTO')
+
+    clock.advance(150) // total 350ms >= 320ms
+    assert.equal(sent.length, 32, 'all 16 inflight fragments retransmit once after 320ms RTO')
+
+    // Clamping bounds and invalid inputs:
+    assert.throws(() => session.setTransportProfile({ windowSize: 1.5 }), RangeError)
+    assert.throws(() => session.setTransportProfile({ rtoMs: NaN }), RangeError)
+    session.setTransportProfile({ windowSize: 200, rtoMs: 2500 }) // clamps to [1..64] and [120..1000]
+    assert.equal(session.inflightTotal(), 64, 'widening window back to 64 immediately pumps queued fragments')
+    assert.equal(session.queuedTotal(), 0)
+    session.closeAll()
+  }
+})

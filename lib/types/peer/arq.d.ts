@@ -118,8 +118,8 @@ export declare class PeerArqSession {
     sendFrame: ArqFrameSender;
     private readonly clock;
     private readonly chunkSize;
-    private readonly windowSize;
-    private readonly rtoMs;
+    private windowSize;
+    private rtoMs;
     private readonly rtoMaxMs;
     private readonly onStreamData;
     private readonly onStreamReset;
@@ -176,6 +176,14 @@ export declare class PeerArqSession {
     inflightTotal(): number;
     /** Fragments queued but not yet admitted to the send window. */
     queuedTotal(): number;
+    /**
+     * Dynamically adjust send window [1..64] and initial RTO [120..rtoMaxMs]
+     * for the active transport leg without tearing down in-flight frames.
+     */
+    setTransportProfile(profile: {
+        windowSize?: number;
+        rtoMs?: number;
+    }): void;
     /**
      * Immediately retransmit all unacked in-flight fragments and reset their RTO
      * timers to `rtoMs` (called when a physical path transitions from `'none'` to

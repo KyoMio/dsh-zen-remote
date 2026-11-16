@@ -442,11 +442,11 @@ zr-net://<host>[:port]/<networkId>[?tls=0|1][#<joinKey>]
 
 Each pair of member machines picks its path in this order:
 
-1. **`lan` — LAN direct**: the peer's address is in the same subnet (RFC1918 / CGNAT /24, or loopback);
+1. **`lan` — LAN direct**: the peer's address is in the same subnet (RFC1918 /24, or loopback; excludes CGNAT virtual tunnel ranges such as `100.64.0.0/10`);
 2. **`p2p` — UDP hole-punched direct**: the gateway's dual UDP ports (primary + alt, see the gateway deployment docs) exchange punch coordinates and the machines connect directly;
 3. **`relay` — gateway ciphertext relay**: when no direct path is ready within the 1000ms punch window, traffic transparently switches to the gateway's WebSocket — still end-to-end encrypted, unreadable to the gateway.
 
-A background re-probe runs every 60 seconds by default and switches back to direct transport when it succeeds. An established direct path is declared lost 15 seconds after its last valid receive, then falls back to relay. Recovery requires a reachable gateway and peer; these default timings do not guarantee lossless recovery from every outage.
+Background re-probing uses a `5s → 15s → 60s` progressive backoff and upgrades back to direct once reachable. An established direct path is declared lost 15 seconds after its last valid receive (or after 2 consecutive unanswered PINGs) and falls back to relay. The control-plane WebSocket runs a `10s` Ping / `15s` Pong heartbeat to reap half-open connections; when a node reconnects, changes local LAN interfaces, or observes a peer's gateway connection epoch (`connSeq`) advance, both ends symmetrically reset peer sessions onto relay first and re-punch, with automatic `mux` handshake self-healing and bounded `p2p` ARQ flow control (`windowSize = 16`, RTT-adaptive RTO `120–1000ms`). Recovery requires a reachable gateway and peer; these default timings do not guarantee lossless recovery from every outage.
 
 Ordinary known-length peer uploads receive an additional 20-second recovery budget. Isolated functional tests cover mid-upload direct→relay and relay→direct transitions with matching byte counts and SHA256, and a single business forwarding operation. This does not establish acceptance for unknown-length streams, arbitrary file sizes, or every real NAT environment.
 
@@ -462,9 +462,9 @@ Ordinary known-length peer uploads receive an additional 20-second recovery budg
 
 Back up the gateway database and `master.key`, upgrade the independently deployed gateway, then upgrade each node. Updated gateways accept `blocked` paths and unknown latency as `null`; older gateways may discard these telemetry rows. A missing console edge is therefore not proof that the business connection is absent. Mixed versions may also lack in-place pause recovery; complete both upgrades before accepting recovery behavior.
 
-Updated handshakes preserve v1 interoperability and add a v2 proof binding both peers. Legacy interoperability does not provide the full v2 binding. Only complete absence of the new proof permits v1 handling; incomplete or invalid new proofs do not downgrade. UDP adds no new time window, while WS retains its existing window.
+Peers and the gateway control plane use the mutually bound `zr-peer-hs-v2` handshake protocol exclusively (no downgrade to unbound legacy handshakes); both `HELLO` handshake envelopes and the gateway WS control-plane auth enforce a symmetric `±5 minute` clock tolerance window, so keep machine clocks within 5 minutes of the gateway.
 
-Unknown latency appears as `—`; only a measured zero appears as `0 ms`. An identity block reported by either end is shown as blocked. Historical API names such as `liveRelayKbps` and `relayKbps` remain, but their values are **1024 bytes per second**, displayed with the existing `KB/s` label.
+Unknown latency appears as `—`; only a measured zero appears as `0 ms`. An identity block reported by either end is shown as blocked. Console topology and device rows apply **strict bilateral direct merging**: a pair counts as direct (showing the RTT range) only when both directions report a direct path (`lan` / `p2p`); if one side reports relay or has not yet reported while the other still reports direct, both sides display *"Relayed via gateway"* with `—` latency, and fully direct devices never show a conflicting *"Relaying"* indicator. Historical API names such as `liveRelayKbps` and `relayKbps` remain, but their values are **1024 bytes per second**, displayed with the existing `KB/s` label.
 
 ### Transport upgrades and resource limits
 

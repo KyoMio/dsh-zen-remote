@@ -22,6 +22,8 @@ import { EventEmitter } from 'node:events'
 const WS_MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const MAX_PENDING_BYTES = 1024 * 1024
 const CONTROL_RESERVE_BYTES = 64 * 1024
+const DEFAULT_PING_INTERVAL_MS = 10_000
+const DEFAULT_PONG_TIMEOUT_MS = 15_000
 
 /** 一个客户端帧头（payload ≤ 64KB 用 16 位长度；更大用 64 位）。 */
 function encodeClientFrame(opcode: number, payload: Buffer): Buffer {
@@ -72,8 +74,17 @@ export class WsClient extends EventEmitter {
   private closeTimer: ReturnType<typeof setTimeout> | null = null
   private request: http.ClientRequest | null = null
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null
+  private readonly pingIntervalMs: number
+  private readonly pongTimeoutMs: number
+  private lastActivityAt = 0
+  private pingTimer: ReturnType<typeof setInterval> | null = null
+  private pongTimer: ReturnType<typeof setTimeout> | null = null
 
-  constructor(url: string, headers: Record<string, string> = {}, options: { handshakeTimeoutMs?: number } = {}) {
+  constructor(
+    url: string,
+    headers: Record<string, string> = {},
+    options: { handshakeTimeoutMs?: number; pingIntervalMs?: number; pongTimeoutMs?: number } = {},
+  ) {
     super()
     this.url = url
     const parsed = new URL(url)
@@ -85,6 +96,16 @@ export class WsClient extends EventEmitter {
     if (!Number.isInteger(handshakeTimeoutMs) || handshakeTimeoutMs < 1 || handshakeTimeoutMs > 2_147_483_647) {
       throw new TypeError('ws client: invalid handshakeTimeoutMs')
     }
+    const pingIntervalMs = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS
+    if (!Number.isInteger(pingIntervalMs) || pingIntervalMs < 0 || pingIntervalMs > 2_147_483_647) {
+      throw new TypeError('ws client: invalid pingIntervalMs')
+    }
+    const pongTimeoutMs = options.pongTimeoutMs ?? DEFAULT_PONG_TIMEOUT_MS
+    if (!Number.isInteger(pongTimeoutMs) || pongTimeoutMs < 1 || pongTimeoutMs > 2_147_483_647) {
+      throw new TypeError('ws client: invalid pongTimeoutMs')
+    }
+    this.pingIntervalMs = pingIntervalMs
+    this.pongTimeoutMs = pongTimeoutMs
     const key = randomBytes(16).toString('base64')
     const req = this.request = (secure ? https : http).request({
       host: parsed.hostname,
@@ -116,12 +137,22 @@ export class WsClient extends EventEmitter {
         return
       }
       this.socket = socket
+      const netSocket = socket as {
+        setKeepAlive?: (enable: boolean, initialDelay?: number) => unknown
+        setNoDelay?: (noDelay?: boolean) => unknown
+      }
+      netSocket.setKeepAlive?.(true, 10_000)
+      netSocket.setNoDelay?.(true)
       socket.on('data', (chunk: Buffer) => this.onData(chunk))
       socket.on('error', (err: Error) => this.fail(err))
       socket.on('close', () => this.onSocketClosed())
       this.state = 'open'
+      this.lastActivityAt = Date.now()
       if (head.length > 0) this.onData(head)
-      this.emit('open')
+      if (this.state === 'open') {
+        this.startKeepalive()
+        this.emit('open')
+      }
     })
     req.on('response', (res) => {
       // 非 101：网关（或反代）拒绝升级——读完错误体让 socket 收尾。
@@ -219,12 +250,17 @@ export class WsClient extends EventEmitter {
       return
     }
     if (opcode === 0x9) {
+      this.touchActivity()
       // ping → pong（回显载荷）。
       try { this.socket?.write(encodeClientFrame(0xa, payload)) } catch { /* dying */ }
       return
     }
-    if (opcode === 0xa) return // pong：无保活时钟，忽略即可
+    if (opcode === 0xa) {
+      this.touchActivity()
+      return
+    }
     if (opcode === 0x1 || opcode === 0x2) {
+      this.touchActivity()
       if (fin) {
         this.deliver(opcode, payload)
         return
@@ -234,6 +270,7 @@ export class WsClient extends EventEmitter {
       return
     }
     if (opcode === 0x0) {
+      this.touchActivity()
       // continuation：并入当前分片流。
       this.fragments.push(payload)
       if (fin) {
@@ -269,9 +306,61 @@ export class WsClient extends EventEmitter {
     this.request = null
   }
 
+  private startKeepalive(): void {
+    if (this.pingIntervalMs === 0 || this.state !== 'open') return
+    this.pingTimer = setInterval(() => this.tickKeepalive(), this.pingIntervalMs)
+    this.pingTimer.unref?.()
+  }
+
+  private tickKeepalive(): void {
+    if (this.state !== 'open' || this.socket === null) return
+    const elapsed = Date.now() - this.lastActivityAt
+    const deadlineMs = this.pingIntervalMs + this.pongTimeoutMs
+    if (elapsed > deadlineMs) {
+      this.fail(new Error('ws client: keepalive pong timeout'))
+      return
+    }
+    try {
+      this.socket.write(encodeClientFrame(0x9, Buffer.alloc(0)))
+    } catch {
+      /* socket error/close will handle */
+    }
+    if (this.pongTimer === null && this.state === 'open') {
+      const waitMs = Math.max(1, deadlineMs - elapsed + 5)
+      this.pongTimer = setTimeout(() => {
+        this.pongTimer = null
+        if (this.state !== 'open') return
+        if (Date.now() - this.lastActivityAt > this.pingIntervalMs + this.pongTimeoutMs) {
+          this.fail(new Error('ws client: keepalive pong timeout'))
+        }
+      }, waitMs)
+      this.pongTimer.unref?.()
+    }
+  }
+
+  private touchActivity(): void {
+    this.lastActivityAt = Date.now()
+    if (this.pongTimer !== null) {
+      clearTimeout(this.pongTimer)
+      this.pongTimer = null
+    }
+  }
+
+  private clearKeepalive(): void {
+    if (this.pingTimer !== null) {
+      clearInterval(this.pingTimer)
+      this.pingTimer = null
+    }
+    if (this.pongTimer !== null) {
+      clearTimeout(this.pongTimer)
+      this.pongTimer = null
+    }
+  }
+
   private finish(code: number, reason: string): void {
     if (this.state === 'closed') return
     this.state = 'closed'
+    this.clearKeepalive()
     this.request?.destroy()
     this.clearHandshake()
     if (this.closeTimer !== null) {

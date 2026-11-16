@@ -492,12 +492,16 @@ interface PunchSession {
   lastPingSentAt: number | null
   /** Payload of the PING awaiting its PONG (always paired with lastPingSentAt). */
   lastPingPayload: Uint8Array | null
+  /** Whether an unanswered in-flight PING counts as a keepalive miss (false for completeDirect's immediate probe). */
+  lastPingCountsForMiss: boolean
   /** Consecutive keepalive ticks that fired while a PING was outstanding. */
   missedPings: number
   /** Silent reprobe retries armed for this session (drives the 5s/15s/60s backoff). */
   reprobeAttempts: number
   lastSeen: number
   timers: Set<unknown>
+  /** Bounded HELLO retry timer when a peer re-handshakes while we are already in direct state. */
+  directRetryTimer: unknown | null
   /** AEAD frame sequence for THIS peer — one counter, never reused. */
   frameSeq: bigint
 }
@@ -634,6 +638,17 @@ export class PeerPunchManager {
         }
         return
       }
+      if (existing.state === 'punching' && existing.peerPublicKeyHex === peer.peerPublicKeyHex) {
+        const added: string[] = []
+        for (const ep of candidates) {
+          if (!existing.candidates.includes(ep)) {
+            existing.candidates.push(ep)
+            added.push(ep)
+          }
+        }
+        if (added.length > 0) this.sendHellos(existing, added)
+        return
+      }
       this.clearSessionTimers(existing)
       this.sessions.delete(nodeId)
     }
@@ -686,6 +701,16 @@ export class PeerPunchManager {
     return this.sessions.get(peerNodeId.toLowerCase())?.rttMs ?? null
   }
 
+  /** Current punch state and age since last authenticated direct activity (null outside direct). */
+  peerState(peerNodeId: string): { state: PunchState; recentRxAgeMs: number | null } | null {
+    const session = this.sessions.get(peerNodeId.toLowerCase())
+    if (!session) return null
+    return {
+      state: session.state,
+      recentRxAgeMs: session.state === 'direct' ? Math.max(0, this.clock.now() - session.lastSeen) : null,
+    }
+  }
+
   /** Revoke gateway/local admission and discard all UDP state for this peer. */
   dropPeer(peerNodeId: string): void {
     const nodeId = peerNodeId.toLowerCase()
@@ -726,10 +751,12 @@ export class PeerPunchManager {
       lastHelloSentAt: null,
       lastPingSentAt: null,
       lastPingPayload: null,
+      lastPingCountsForMiss: true,
       missedPings: 0,
       reprobeAttempts: 0,
       lastSeen: this.clock.now(),
       timers: new Set(),
+      directRetryTimer: null,
       frameSeq: 0n,
     }
     this.sessions.set(nodeId, session)
@@ -747,6 +774,41 @@ export class PeerPunchManager {
   private clearSessionTimers(session: PunchSession): void {
     for (const handle of session.timers) this.clock.clearTimeout(handle)
     session.timers.clear()
+    session.directRetryTimer = null
+  }
+
+  private clearDirectRetryTimer(session: PunchSession): void {
+    if (session.directRetryTimer !== null) {
+      this.clock.clearTimeout(session.directRetryTimer)
+      session.timers.delete(session.directRetryTimer)
+      session.directRetryTimer = null
+    }
+  }
+
+  private startDirectChallengeRetry(session: PunchSession, target: string): void {
+    this.clearDirectRetryTimer(session)
+    this.sendHellos(session, [target])
+    let retries = 0
+    const step = (): void => {
+      session.directRetryTimer = null
+      if (this.closed || session.state !== 'direct' || !session.awaitingAck) return
+      retries += 1
+      this.sendHellos(session, [target])
+      if (retries < 5) {
+        const handle = this.clock.setTimeout(() => {
+          session.timers.delete(handle)
+          step()
+        }, 100)
+        session.directRetryTimer = handle
+        session.timers.add(handle)
+      }
+    }
+    const handle = this.clock.setTimeout(() => {
+      session.timers.delete(handle)
+      step()
+    }, 100)
+    session.directRetryTimer = handle
+    session.timers.add(handle)
   }
 
   private refreshLanEndpoints(port: number): void {
@@ -845,7 +907,7 @@ export class PeerPunchManager {
     this.armTimer(session, onLossDeadline, Math.max(1, initialRemaining))
     const tick = (): void => {
       if (this.closed || session.state !== 'direct') return
-      this.sendPing(session)
+      this.sendPing(session, true)
       this.armTimer(session, tick, this.keepAliveMsOrDefault())
     }
     this.armTimer(session, tick, this.keepAliveMsOrDefault())
@@ -853,12 +915,13 @@ export class PeerPunchManager {
 
   /**
    * Fire one keepalive PING with a fresh random payload. If the PREVIOUS
-   * PING is still unanswered we count one consecutive miss and report it
-   * (the engine uses ≥2 misses as an over-cap signal) — then overwrite
-   * the outstanding payload so a late PONG for the old one never counts.
+   * PING is still unanswered and counted (`countsForMiss`), we count one
+   * consecutive miss and report it (the engine uses ≥2 misses as an over-cap
+   * signal) — then overwrite the outstanding payload so a late PONG for the
+   * old one never counts.
    */
-  private sendPing(session: PunchSession): void {
-    if (session.lastPingSentAt !== null) {
+  private sendPing(session: PunchSession, countsForMiss = true): void {
+    if (session.lastPingSentAt !== null && session.lastPingCountsForMiss) {
       session.missedPings += 1
       try {
         this.options.onPingUnanswered?.(session.peerNodeId)
@@ -868,6 +931,7 @@ export class PeerPunchManager {
     }
     session.lastPingPayload = randomBytes(8)
     session.lastPingSentAt = this.clock.now()
+    session.lastPingCountsForMiss = countsForMiss
     try {
       this.sendEncryptedTo(session, PeerFrameType.PING, 0, session.lastPingPayload, 0)
     } catch {
@@ -956,7 +1020,12 @@ export class PeerPunchManager {
         session.nonce = randomBytes(8).toString('hex')
         session.awaitingAck = true
       }
-      this.sendHellos(session, [`${rinfo.address}:${rinfo.port}`])
+      const target = `${rinfo.address}:${rinfo.port}`
+      if (session.state === 'direct') {
+        this.startDirectChallengeRetry(session, target)
+      } else {
+        this.sendHellos(session, [target])
+      }
     }
   }
 
@@ -973,6 +1042,7 @@ export class PeerPunchManager {
     }
     if (!this.integratePeerEphemeral(session, parsed.ephPubHex, rinfo)) return
     session.awaitingAck = false
+    this.clearDirectRetryTimer(session)
     // completeDirect (reached via integratePeerEphemeral above) sends the
     // one immediate PING — nothing more here or a handshake emits two.
   }
@@ -1008,6 +1078,7 @@ export class PeerPunchManager {
       session.ciphers = ciphers
     }
     session.endpoint = `${rinfo.address}:${rinfo.port}`
+    this.clearDirectRetryTimer(session)
     const pairKey = `${session.myEph.publicKeyHex}|${peerEphPubHex}`
     if (session.state === 'direct' && session.derivedPair === pairKey) return true
     session.derivedPair = pairKey
@@ -1024,6 +1095,7 @@ export class PeerPunchManager {
     session.reprobeAttempts = 0
     session.lastPingSentAt = null
     session.lastPingPayload = null
+    session.lastPingCountsForMiss = true
     session.missedPings = 0
     this.clearSessionTimers(session) // punch rounds / window / pending reprobe all die
     this.startKeepalive(session)
@@ -1039,7 +1111,8 @@ export class PeerPunchManager {
     // Both directions complete here (initiator via onHelloAck, responder
     // via onOpenedFrame) — ONE immediate encrypted PING measures the
     // session RTT inside the first round trip, no keepalive wait (T4).
-    this.sendPing(session)
+    // Does not count toward missedPings if lost in the cipher derivation race.
+    this.sendPing(session, false)
   }
 
   private onOpenedFrame(
@@ -1083,6 +1156,7 @@ export class PeerPunchManager {
         session.rttMs = Math.max(0, this.clock.now() - session.lastPingSentAt!)
         session.lastPingSentAt = null
         session.lastPingPayload = null
+        session.lastPingCountsForMiss = true
         session.missedPings = 0
         try {
           this.options.onRttSample?.(session.peerNodeId, session.rttMs)

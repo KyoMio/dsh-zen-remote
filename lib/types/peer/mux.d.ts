@@ -74,8 +74,16 @@ export declare class PeerMux {
     ensureSession(nodeId: string, peerPublicKeyHex: string, peerName: string): void;
     /** 更新已建会话记录的对端设备名（入站虚拟请求 x-zen-remote-device-name 跟随最新名称）。 */
     setPeerName(nodeId: string, peerName: string): void;
+    /** 动态调整对端 ARQ 发送档案（p2p 收窄窗口、提升初始 RTO 防突发拥塞）。 */
+    setPeerTransportProfile(nodeId: string, profile: {
+        windowSize?: number;
+        rtoMs?: number;
+    }): void;
+    private teardownSession;
     /** 拆掉一个对端的会话（peer-left / mismatch / 本机禁用）：流中止、表清理。 */
     dropSession(nodeId: string): void;
+    /** 对称重置对端会话：中止旧流、清空密钥与 ARQ、保留单调 nextStreamId 并立即重建干净会话。 */
+    resetSession(nodeId: string): void;
     hasSession(nodeId: string): boolean;
     sessionPath(nodeId: string): PeerPath;
     /** 存活会话 id（诊断用）。 */

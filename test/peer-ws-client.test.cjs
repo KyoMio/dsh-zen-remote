@@ -166,3 +166,111 @@ test('upgrade wait expires and closes a silent HTTP connection', async t => {
   assert.match(errors[0], /handshake timeout/);
   assert.equal(socket.destroyed, true);
 });
+
+test('keepalive options reject invalid bounds before dialing and accept zero to disable', async t => {
+  for (const pingIntervalMs of [-1, NaN, Infinity, 0.5, 2_147_483_648]) {
+    assert.throws(() => new WsClient('ws://localhost:1', {}, { pingIntervalMs }), /invalid pingIntervalMs/);
+  }
+  for (const pongTimeoutMs of [0, -1, NaN, Infinity, 0.5, 2_147_483_648]) {
+    assert.throws(() => new WsClient('ws://localhost:1', {}, { pongTimeoutMs }), /invalid pongTimeoutMs/);
+  }
+  const server = await serverFor(t);
+  server.on('upgrade', (req, socket) => {
+    upgrade(req, socket);
+    socket.on('data', () => {});
+  });
+  const client = dial(t, server, 'ws', 'localhost', { pingIntervalMs: 0, pongTimeoutMs: 20 });
+  await once(client, 'open');
+  await delay(100);
+  assert.equal(client.state, 'open');
+});
+
+test('keepalive closes a silent server connection after ping/pong timeout', async t => {
+  const server = await serverFor(t);
+  let pings = 0;
+  server.on('upgrade', (req, socket) => {
+    upgrade(req, socket);
+    let buf = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (buf.length >= 2) {
+        const opcode = buf[0] & 0x0f;
+        const masked = (buf[1] & 0x80) !== 0;
+        const len = buf[1] & 0x7f;
+        const need = 2 + (masked ? 4 : 0) + len;
+        if (len >= 126 || buf.length < need) break;
+        buf = buf.subarray(need);
+        if (opcode === 0x9) pings++;
+      }
+    });
+  });
+  const client = dial(t, server, 'ws', 'localhost', { pingIntervalMs: 40, pongTimeoutMs: 60 });
+  const errors = [];
+  client.on('error', err => errors.push(err.message));
+  const closed = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('close timeout')), 1000);
+    client.once('close', code => { clearTimeout(timer); resolve(code); });
+  });
+  await once(client, 'open');
+  const closeCode = await closed;
+  assert.equal(closeCode, 1006);
+  assert.equal(client.state, 'closed');
+  assert.ok(pings >= 1, `expected at least 1 ping, got ${pings}`);
+  assert.ok(errors.some(msg => /keepalive pong timeout/.test(msg)), `expected keepalive pong timeout error, got ${JSON.stringify(errors)}`);
+});
+
+test('keepalive stays open when server replies with RFC6455 pong or sends data frames', async t => {
+  const server = await serverFor(t);
+  let pongsSent = 0;
+  server.on('upgrade', (req, socket) => {
+    upgrade(req, socket);
+    let buf = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (buf.length >= 2) {
+        const opcode = buf[0] & 0x0f;
+        const masked = (buf[1] & 0x80) !== 0;
+        const len = buf[1] & 0x7f;
+        const maskOff = 2;
+        const need = 2 + (masked ? 4 : 0) + len;
+        if (len >= 126 || buf.length < need) break;
+        const payload = Buffer.from(buf.subarray(maskOff + (masked ? 4 : 0), need));
+        if (masked) {
+          const mask = buf.subarray(maskOff, maskOff + 4);
+          for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+        }
+        buf = buf.subarray(need);
+        if (opcode === 0x9) {
+          socket.write(Buffer.concat([Buffer.from([0x8a, payload.length]), payload]));
+          pongsSent++;
+        }
+      }
+    });
+  });
+  const client = dial(t, server, 'ws', 'localhost', { pingIntervalMs: 30, pongTimeoutMs: 45 });
+  await once(client, 'open');
+  await delay(180);
+  assert.equal(client.state, 'open');
+  assert.ok(pongsSent >= 3, `expected >=3 pongs, got ${pongsSent}`);
+});
+
+test('keepalive stays open when server sends application frames without pong', async t => {
+  const server = await serverFor(t);
+  let serverSocket = null;
+  server.on('upgrade', (req, socket) => {
+    serverSocket = socket;
+    upgrade(req, socket);
+    socket.on('data', () => {});
+  });
+  const client = dial(t, server, 'ws', 'localhost', { pingIntervalMs: 35, pongTimeoutMs: 55 });
+  await once(client, 'open');
+  const timer = setInterval(() => {
+    if (serverSocket && !serverSocket.destroyed) {
+      const msg = Buffer.from('hi');
+      serverSocket.write(Buffer.concat([Buffer.from([0x81, msg.length]), msg]));
+    }
+  }, 25);
+  t.after(() => clearInterval(timer));
+  await delay(180);
+  assert.equal(client.state, 'open');
+});

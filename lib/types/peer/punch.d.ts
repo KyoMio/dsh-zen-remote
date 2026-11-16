@@ -180,6 +180,7 @@ export interface PeerPunchOptions {
     /** Opened application frames from the peer (PING/PONG stay internal). */
     onEncryptedFrame?: (header: PeerFrameHeader, plaintext: Uint8Array, rinfo: PunchRemoteInfo) => void;
 }
+type PunchState = 'punching' | 'direct' | 'idle';
 /**
  * One UDP socket, many peers. See the module doc for the state machine.
  * After `onDirectReady`, hand `frameSenderFor(peerNodeId)` to an ARQ
@@ -237,6 +238,11 @@ export declare class PeerPunchManager {
     sessionCiphers(peerNodeId: string): PeerSessionCiphers | null;
     /** Last PING→PONG round trip for the peer, or null before the first PONG. */
     sessionRttMs(peerNodeId: string): number | null;
+    /** Current punch state and age since last authenticated direct activity (null outside direct). */
+    peerState(peerNodeId: string): {
+        state: PunchState;
+        recentRxAgeMs: number | null;
+    } | null;
     /** Revoke gateway/local admission and discard all UDP state for this peer. */
     dropPeer(peerNodeId: string): void;
     /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
@@ -244,6 +250,8 @@ export declare class PeerPunchManager {
     private createSession;
     private armTimer;
     private clearSessionTimers;
+    private clearDirectRetryTimer;
+    private startDirectChallengeRetry;
     private refreshLanEndpoints;
     private startPunchRounds;
     private punchIntervalMsOrDefault;
@@ -257,9 +265,10 @@ export declare class PeerPunchManager {
     private startKeepalive;
     /**
      * Fire one keepalive PING with a fresh random payload. If the PREVIOUS
-     * PING is still unanswered we count one consecutive miss and report it
-     * (the engine uses ≥2 misses as an over-cap signal) — then overwrite
-     * the outstanding payload so a late PONG for the old one never counts.
+     * PING is still unanswered and counted (`countsForMiss`), we count one
+     * consecutive miss and report it (the engine uses ≥2 misses as an over-cap
+     * signal) — then overwrite the outstanding payload so a late PONG for the
+     * old one never counts.
      */
     private sendPing;
     private sendHellos;
@@ -279,4 +288,5 @@ export declare class PeerPunchManager {
     private onOpenedFrame;
     private sendEncryptedTo;
 }
+export {};
 //# sourceMappingURL=punch.d.ts.map
