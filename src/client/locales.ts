@@ -130,6 +130,11 @@ export const zh = {
   'settings.langAuto': '自动（auto）',
   'settings.langZh': '中文（zh）',
   'settings.langEn': 'English（en）',
+  'settings.fieldLogLevel': '日志级别',
+  'settings.fieldLogLevelHint': '控制写入诊断日志环的明细量。默认信息级记录生命周期与警告；仅警告只记警告；调试另记逐请求明细。',
+  'settings.logLevelInfo': '信息（默认）',
+  'settings.logLevelDebug': '调试（含逐请求明细）',
+  'settings.logLevelWarn': '仅警告',
   'settings.invalidNonNegativeInt': '需要不小于 0 的整数',
   'settings.pushTestLabel': '测试推送',
   'settings.pushTestRun': '发送测试推送',
@@ -670,6 +675,7 @@ export const zh = {
   'wizard.peer.devicePathLan': '局域网直连',
   'wizard.peer.devicePathP2p': '直连',
   'wizard.peer.devicePathRelay': '经网关中转',
+  'wizard.peer.devicePathRelayDemoted': '经网关中转（直连 {rtt}ms，超过上限 {cap}ms）',
   'wizard.peer.devicePathOffline': '离线',
   'wizard.peer.devicePathMismatch': '身份异常',
   'wizard.peer.deviceRtt': '延迟 {ms} ms',
@@ -687,6 +693,9 @@ export const zh = {
   'settings.peer.title': '网络与设备互通',
   'settings.peer.subtitle': '作为节点端与其他电脑互挂会话；下方保留手机 / 浏览器接入的配置',
   'settings.peer.notConfigured': '尚未加入设备网络——可直接在下方粘贴邀请链接或输入中继网关地址（由网关侧手动审批）加入',
+  'settings.fieldPeerDirectMaxRttMs': '直连延迟上限（毫秒）',
+  'settings.fieldPeerDirectMaxRttMsHint': 'UDP 直连实测延迟超过该值时自动走网关中转，降至上限七成后回切直连。默认 300；0 表示不设上限（始终直连）。0–10000。',
+  'settings.invalidRtt': '需要 0–10000 的整数（0 = 不限制）',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -817,6 +826,11 @@ export const en: Record<MobileNavKey, string> = {
   'settings.langAuto': 'Auto (auto)',
   'settings.langZh': '中文 (zh)',
   'settings.langEn': 'English (en)',
+  'settings.fieldLogLevel': 'Log level',
+  'settings.fieldLogLevelHint': 'How much detail lands in the diagnostic log ring. Info (default) records lifecycle events and warnings; warn keeps warnings only; debug adds per-request lines.',
+  'settings.logLevelInfo': 'Info (default)',
+  'settings.logLevelDebug': 'Debug (per-request lines)',
+  'settings.logLevelWarn': 'Warnings only',
   'settings.invalidNonNegativeInt': 'Enter an integer of at least 0',
   'settings.pushTestLabel': 'Test push',
   'settings.pushTestRun': 'Send test push',
@@ -1354,6 +1368,7 @@ export const en: Record<MobileNavKey, string> = {
   'wizard.peer.devicePathLan': 'LAN direct',
   'wizard.peer.devicePathP2p': 'Direct',
   'wizard.peer.devicePathRelay': 'Via gateway relay',
+  'wizard.peer.devicePathRelayDemoted': 'Via gateway relay (direct {rtt} ms, over the {cap} ms cap)',
   'wizard.peer.devicePathOffline': 'Offline',
   'wizard.peer.devicePathMismatch': 'Identity mismatch',
   'wizard.peer.deviceRtt': '{ms} ms RTT',
@@ -1371,6 +1386,9 @@ export const en: Record<MobileNavKey, string> = {
   'settings.peer.title': 'Network & device mesh',
   'settings.peer.subtitle': 'As a peer node this machine shares sessions with the other computers; the phone / browser access settings stay below',
   'settings.peer.notConfigured': 'No device network joined yet — paste an invite link or enter the relay gateway address below to request approval',
+  'settings.fieldPeerDirectMaxRttMs': 'Direct RTT cap (ms)',
+  'settings.fieldPeerDirectMaxRttMsHint': 'Traffic falls back to gateway relay when the measured UDP RTT exceeds this cap, and returns to direct once it stays under 70% of it. Default 300; 0 means no cap (always direct). 0–10000.',
+  'settings.invalidRtt': 'Enter an integer 0–10000 (0 = no cap)',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

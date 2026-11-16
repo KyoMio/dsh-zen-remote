@@ -53,6 +53,9 @@ export interface PeerMuxOptions {
     /** 会话有效路径变化时回调（engine 由此发 path-report）。 */
     onPathChanged?: (nodeId: string, path: PeerPath) => void;
     log?: (line: string) => void;
+    /** 逐请求噪声通道（T3）：inbound request / body 生命周期行量太大，
+     * 走它而不是 `log`，由 logLevel=debug 时才落环。 */
+    debug?: (line: string) => void;
 }
 export interface MuxClock {
     now(): number;

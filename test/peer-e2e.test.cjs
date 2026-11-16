@@ -361,6 +361,7 @@ async function startNode(gw, { name, firewall = false, firewallOpen = false, sha
   })
 
   const logs = []
+  const debugs = [] // T3: per-request mux noise lands here, never in logs
   const engine = createPeerEngine({
     stateFile,
     identity,
@@ -378,6 +379,7 @@ async function startNode(gw, { name, firewall = false, firewallOpen = false, sha
     ...(pathReportMs !== undefined ? { pathReportMs } : {}),
     ...(clock !== undefined ? { clock } : {}),
     log: (line) => logs.push(line),
+    debug: (line) => debugs.push(line),
   })
 
   return {
@@ -390,6 +392,7 @@ async function startNode(gw, { name, firewall = false, firewallOpen = false, sha
     relayPool,
     engine,
     logs,
+    debugs,
     invokeCalls,
     followGates,
     listResults,
@@ -498,6 +501,14 @@ test('PG-8 #1: 入网、自动准入、双向共享与 mux 三类通道', async 
     const uploadBody = JSON.parse(uploadResult.body)
     assert.equal(uploadBody.ok, true)
     assert.equal(uploadBody.echoedBytes, payload.length, 'upload bytes survived the mux round trip')
+
+    // T3：逐请求日志行走 debug 通道——服务侧 mux 的 inbound 行不该再占
+    // info 环（诊断环 300 条曾被这些行灌满），lifecycle 行留在 logs。
+    await waitFor(() => A.debugs.some((line) => line.includes('mux: inbound request')), 8000, 'A logged the inbound request on the debug channel')
+    assert.ok(A.debugs.some((line) => line.includes('mux: inbound req body ended')), 'body end line on debug')
+    assert.ok(!A.logs.some((line) => line.includes('mux: inbound request')), 'per-request lines left the info ring')
+    assert.ok(!A.logs.some((line) => line.includes('mux: inbound req')), 'no inbound lifecycle line on info either')
+    assert.ok(A.logs.length > 0, 'lifecycle lines still ride info')
 
     // —— 防套娃守卫 ——
     assert.equal(B.store.share(`zr~${A.identity.nodeId}~s-a1`), false, '二次共享虚拟 id 被拒绝')

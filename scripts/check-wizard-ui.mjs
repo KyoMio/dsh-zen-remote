@@ -698,6 +698,7 @@ const WIZARD_KEYS = [
   'wizard.overview.peerNetworkCapNote', 'wizard.overview.peerMountedDiscovered', 'wizard.overview.peerDiscoveredCount',
   'wizard.peer.devicesModalTitle', 'wizard.peer.devicesModalSubtitle', 'wizard.peer.devicesModalEmpty',
   'wizard.peer.devicePathLan', 'wizard.peer.devicePathP2p', 'wizard.peer.devicePathRelay',
+  'wizard.peer.devicePathRelayDemoted',
   'wizard.peer.devicePathOffline', 'wizard.peer.devicePathMismatch', 'wizard.peer.deviceRtt',
   'wizard.peer.deviceMount', 'wizard.peer.deviceIgnore',
   'wizard.peer.mismatchNote', 'wizard.peer.trustNew', 'wizard.peer.trustOk', 'wizard.peer.actionFailed',

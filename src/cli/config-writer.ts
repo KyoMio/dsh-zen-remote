@@ -57,6 +57,8 @@ export const ENV_VAR_BY_FIELD: Readonly<Partial<Record<keyof ZenRemoteConfig, st
   // PG-2: the pairing cap has an env layer, so a CLI write must refuse when
   // the variable shadows the file layer.
   maxServers: 'LAN_GATE_MAX_SERVERS',
+  logLevel: 'LAN_GATE_LOG_LEVEL',
+  peerDirectMaxRttMs: 'LAN_GATE_PEER_DIRECT_MAX_RTT_MS',
 }
 
 export interface WriteCliConfigOptions {

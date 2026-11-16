@@ -164,6 +164,11 @@ export interface PeerPunchOptions {
     onDirectReady?: (peerNodeId: string, info: DirectReadyInfo) => void;
     onPunchFallback?: (peerNodeId: string) => void;
     onDirectLost?: (peerNodeId: string) => void;
+    /** Each measured PING→PONG round trip, including the immediate handshake
+     *  PING sent from `completeDirect` (T4/T5: engine RTT policy samples). */
+    onRttSample?: (peerNodeId: string, rttMs: number) => void;
+    /** NIC enumeration, injectable for tests; production reads the OS live. */
+    interfaces?: () => Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>;
     /** Opened application frames from the peer (PING/PONG stay internal). */
     onEncryptedFrame?: (header: PeerFrameHeader, plaintext: Uint8Array, rinfo: PunchRemoteInfo) => void;
 }
@@ -182,7 +187,7 @@ export declare class PeerPunchManager {
     private readonly identity;
     private readonly socket;
     private readonly ownsSocket;
-    private readonly localIps;
+    private readonly readInterfaces;
     private readonly sessions;
     private lanEndpointList;
     private closed;
@@ -190,7 +195,10 @@ export declare class PeerPunchManager {
     constructor(options: PeerPunchOptions);
     /** Resolves once the socket has a bound port (immediately for pre-bound sockets). */
     ready(): Promise<void>;
-    /** This machine's non-loopback IPv4 addresses with our bound port. */
+    /** This machine's non-loopback IPv4 addresses with our bound port,
+     *  enumerated LIVE each call (T4): a hot-plugged NIC is a punch
+     *  candidate on the very next query. Falls back to the last known
+     *  list while the socket has no bound port. */
     lanEndpoints(): string[];
     /**
      * Start (or restart) the 1000ms priority punch toward a peer: fresh

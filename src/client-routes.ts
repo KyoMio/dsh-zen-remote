@@ -706,6 +706,8 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     mounted: peer.mounted,
     path: peerViewPath(peer.state, peer.path),
     rttMs: peer.rttMs,
+    directRttMs: peer.directRttMs,
+    directDemoted: peer.directDemoted,
   }))
   const gatewayOrigin = options.getPeerNetworkOrigin?.()
   const maxServers = effectiveMaxServers(options.pool, options)
@@ -1195,6 +1197,8 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
             pushTool: values.pushTool,
             pushEnabled: values.pushEnabled,
             pushSessionName: values.pushSessionName,
+            logLevel: values.logLevel,
+            peerDirectMaxRttMs: values.peerDirectMaxRttMs,
             serverUrl: stringOrEmpty(unwrapVolatile(record.serverUrl)).trim(),
           },
           statusBody: await statusBodyOf(options),

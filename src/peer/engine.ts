@@ -76,6 +76,11 @@ export interface PeerEnginePeerStatus {
   path: PeerMemberPath
   rttMs: number | null
   mounted: boolean
+  /** T5：直连实测 RTT 的 EWMA（α=0.3，四舍五入）；从未测得为 null。
+   *  与 `rttMs` 口径不同——它只描述 UDP 链路质量，降级为中转后仍如实上报。 */
+  directRttMs: number | null
+  /** T5：RTT 超上限被降级到中转（首样本被拒或直连中持续超标），恢复后回 false。 */
+  directDemoted: boolean
 }
 
 export interface PeerEngineStatus {
@@ -131,6 +136,13 @@ export interface PeerEngineOptions {
   fetchImpl?: typeof fetch
   clock?: { now(): number; setTimeout(fn: () => void, ms: number): unknown; clearTimeout(handle: unknown): void }
   log?: (line: string) => void
+  /** 透传给 mux 的逐请求噪声通道（T3）。 */
+  debug?: (line: string) => void
+  /** T5：直连 RTT 上限（ms）的现场读法——每次判定都调用，非法值（非有限、
+   *  负数）按 0 处理；缺省视为 `() => 0`（不限制，保留旧行为）。上限大于
+   *  0 时 onDirectReady 不再立即切 UDP，等首个保活样本 ≤ 上限才升直连；
+   *  已直连的会话在「当前样本与 EWMA 双双超限」时才降级回中转。 */
+  directMaxRttMs?: () => number
 }
 
 export interface PeerEngineLeaveResult {
@@ -166,6 +178,17 @@ interface MemberRec {
   mounted: boolean
   lastLanEndpoints: string[]
   lastReflexive: string | null
+  // ---- T5：直连 RTT 上限策略状态（onDirectLost / 成员移除时清空） ----
+  /** onDirectReady 记下的本次会话路径模式，恢复升直连时原样回填。 */
+  directMode: 'lan' | 'p2p' | null
+  /** 直连实测 RTT 的 EWMA；从未测得为 null。 */
+  directSmoothedRtt: number | null
+  /** 降级后连续 ≤ cap×0.7 的样本计数，满 3 升回直连。 */
+  directGoodStreak: number
+  /** RTT 超上限被降级到中转。 */
+  directDemoted: boolean
+  /** mux 当前是否走 UDP（降级中 keepalive 继续采样但不承载流量）。 */
+  directActive: boolean
 }
 
 const realClock = {
@@ -173,6 +196,12 @@ const realClock = {
   setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms),
   clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 }
+
+// T5：直连 RTT 上限策略常数——EWMA 权重、降级恢复阈值（cap 的 0.7 倍）与
+// 恢复所需的连续样本数。
+const DIRECT_EWMA_ALPHA = 0.3
+const DIRECT_PROMOTE_RATIO = 0.7
+const DIRECT_PROMOTE_STREAK = 3
 
 /**
  * authorized welcome 的可选 `stun` 字段（PC-01a 网关契约：真实 UDP bind
@@ -340,6 +369,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         mounted: false,
         lastLanEndpoints: [],
         lastReflexive: null,
+        directMode: null,
+        directSmoothedRtt: null,
+        directGoodStreak: 0,
+        directDemoted: false,
+        directActive: false,
       }
       members.set(nodeId, member)
     }
@@ -857,9 +891,25 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     log(`peer engine: direct ready ${nodeId} via ${info.mode} ${info.endpoint} rtt=${info.rttMs}`)
     const member = members.get(nodeId)
     if (member === undefined) return
-    member.path = info.mode
-    if (mux !== null && punch !== null) {
-      mux.setDirectPath(nodeId, punch.frameSenderFor(nodeId))
+    // T5：新会话重走测量——握手自报 RTT 只反映 HELLO/ACK 单程，不信它；
+    // 等保活样本判定。directActive 置 false：上限 >0 时 mux 还没切到 UDP，
+    // 切的时候 promoteDirect 自己置 true。
+    member.directMode = info.mode
+    member.directSmoothedRtt = null
+    member.directGoodStreak = 0
+    member.directDemoted = false
+    member.directActive = false
+    if (directCap() <= 0) {
+      // 上限关闭：与旧行为一致，打通即直连。
+      member.path = info.mode
+      member.directActive = true
+      if (mux !== null && punch !== null) {
+        mux.setDirectPath(nodeId, punch.frameSenderFor(nodeId))
+      }
+    } else {
+      // 上限开启：先保证中转可用（握手在途时 beginHello，已有会话则
+      // 切回 ws 路径），member.path 维持现值，等首个样本裁决。
+      mux?.enableRelayPath(nodeId)
     }
     schedulePathReport()
   }
@@ -873,11 +923,82 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     schedulePathReport()
   }
 
+  /** T5：上限判定的现场读法——每次样本都调，非法值按 0（= 不限制）。 */
+  const directCap = (): number => {
+    const raw = options.directMaxRttMs?.()
+    return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0
+  }
+
+  /** 升直连：mux 切 UDP、路径回填握手模式、清降级标记。 */
+  const promoteDirect = (member: MemberRec): void => {
+    if (mux === null || punch === null) return
+    mux.setDirectPath(member.nodeId, punch.frameSenderFor(member.nodeId))
+    member.path = member.directMode ?? 'p2p'
+    member.directActive = true
+    member.directDemoted = false
+    member.directGoodStreak = 0
+    log(`peer engine: direct ${member.nodeId} rtt ok — switching to ${member.path}`)
+    schedulePathReport()
+  }
+
+  /** T5：保活 PONG 样本驱动上限策略。成员不存在或非 eligible 忽略；
+   *  EWMA 永远更新（降级中也采样），降级判断用的是更新前的平滑值——
+   *  单个尖峰只把 EWMA 推过线一次，下一次样本前它仍是旧基线。 */
+  const onRttSample = (nodeId: string, rtt: number): void => {
+    const member = members.get(nodeId.toLowerCase())
+    if (member === undefined || member.state !== 'eligible') return
+    const prevSmoothed = member.directSmoothedRtt
+    member.directSmoothedRtt =
+      prevSmoothed === null ? rtt : prevSmoothed * (1 - DIRECT_EWMA_ALPHA) + rtt * DIRECT_EWMA_ALPHA
+    const cap = directCap()
+    if (cap <= 0) {
+      if (!member.directActive) promoteDirect(member)
+      return
+    }
+    if (member.directActive) {
+      if (rtt > cap && prevSmoothed !== null && prevSmoothed > cap) {
+        mux?.setRelayPath(member.nodeId)
+        member.path = 'relay'
+        member.directActive = false
+        member.directDemoted = true
+        member.directGoodStreak = 0
+        log(`peer engine: direct ${member.nodeId} rtt ${rtt}ms over cap ${cap}ms — relaying`)
+        schedulePathReport()
+      }
+      return
+    }
+    if (!member.directDemoted) {
+      // 等首个样本：达标升直连，超标保持中转并记降级。
+      if (rtt <= cap) {
+        promoteDirect(member)
+      } else {
+        member.path = 'relay'
+        member.directDemoted = true
+        log(`peer engine: direct ${member.nodeId} rtt ${rtt}ms over cap ${cap}ms — relaying`)
+        schedulePathReport()
+      }
+      return
+    }
+    // 已降级：连续 ≤ cap×0.7 的样本攒满 3 个才升回；中间一个高样本归零。
+    if (rtt <= cap * DIRECT_PROMOTE_RATIO) {
+      member.directGoodStreak += 1
+      if (member.directGoodStreak >= DIRECT_PROMOTE_STREAK) promoteDirect(member)
+    } else {
+      member.directGoodStreak = 0
+    }
+  }
+
   const onDirectLost = (nodeId: string): void => {
     const member = members.get(nodeId)
     if (member === undefined) return
     member.path = 'relay'
     mux?.setRelayPath(nodeId)
+    // T5：旧会话的测量与降级状态一起作废，重打通后重走首样本判定。
+    member.directMode = null
+    member.directSmoothedRtt = null
+    member.directGoodStreak = 0
+    member.directDemoted = false
+    member.directActive = false
     schedulePathReport()
   }
 
@@ -928,6 +1049,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       onDirectReady,
       onPunchFallback,
       onDirectLost,
+      onRttSample,
       onEncryptedFrame: (header, plaintext) => {
         mux?.handleOpenedFrame(header, plaintext)
       },
@@ -946,6 +1068,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       relaySecret: options.relaySecret,
       clock,
       log,
+      debug: options.debug,
     })
     return mux
   }
@@ -1180,6 +1303,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           path: member.path,
           rttMs: currentPathRttMs(member),
           mounted: member.mounted,
+          directRttMs:
+            member.directSmoothedRtt === null ? null : Math.round(member.directSmoothedRtt),
+          directDemoted: member.directDemoted,
         })
       }
       return {

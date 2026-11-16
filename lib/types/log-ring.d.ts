@@ -16,9 +16,15 @@
  * id shapes and counters — never payloads. The redactor (debug-redact.ts)
  * is the second layer, not the license to log secrets here.
  */
-/** Severity of one ring entry. The ring only distinguishes what the report
- * renders: info lines and warnings. */
-export type LogLevel = 'info' | 'warn';
+/** Severity of one ring entry. `debug` joined info/warn for the
+ * logLevel threshold (peer-resilience T2): per-request noise lines use it
+ * and drop out at the default `'info'` threshold. */
+export type LogLevel = 'debug' | 'info' | 'warn';
+/** Live-read level getter: the threshold can flip while the process runs
+ * (the config field is volatile), so it is asked per line. Anything that
+ * is not a legal level — a throw, a bogus string, no getter — falls back
+ * to `'info'`, the ring's historic floor. */
+export type LogLevelGetter = () => LogLevel;
 /** One ring entry: ISO timestamp, level, fully interpolated message. */
 export interface LogRingEntry {
     t: string;
@@ -38,10 +44,11 @@ export interface LogRing {
  * session of lifecycle lines plus a healthy share of warnings, while keeping
  * the report a fixed small size. A cap below 1 is clamped to 1.
  */
-export declare function createLogRing(cap?: number): LogRing;
-/** The logger face this module needs: the cordis context logger's two
+export declare function createLogRing(cap?: number, minLevel?: LogLevelGetter): LogRing;
+/** The logger face this module needs: the cordis context logger's
  * methods, each optional (test fakes carry none). */
 export interface PluginLogLike {
+    debug?(format: string, ...args: unknown[]): void;
     info?(format: string, ...args: unknown[]): void;
     warn?(format: string, ...args: unknown[]): void;
 }
@@ -49,8 +56,11 @@ export interface PluginLogLike {
  * line reaches the context logger (unchanged behavior, unchanged call
  * sites) AND the ring (the debug report's source). A ring failure is
  * swallowed; a logger failure propagates exactly as it did before this
- * module existed. */
-export declare function createPluginLog(ring: LogRing, logger: PluginLogLike | undefined): {
+ * module existed. `minLevel` gates a whole line — below the threshold it
+ * reaches NEITHER the logger nor the ring; the same getter drives the
+ * ring's own push filter, so the two paths can never disagree. */
+export declare function createPluginLog(ring: LogRing, logger: PluginLogLike | undefined, minLevel?: LogLevelGetter): {
+    debug(format: string, ...args: unknown[]): void;
     info(format: string, ...args: unknown[]): void;
     warn(format: string, ...args: unknown[]): void;
 };

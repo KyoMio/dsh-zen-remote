@@ -19,9 +19,27 @@
 
 import { format } from 'node:util'
 
-/** Severity of one ring entry. The ring only distinguishes what the report
- * renders: info lines and warnings. */
-export type LogLevel = 'info' | 'warn'
+/** Severity of one ring entry. `debug` joined info/warn for the
+ * logLevel threshold (peer-resilience T2): per-request noise lines use it
+ * and drop out at the default `'info'` threshold. */
+export type LogLevel = 'debug' | 'info' | 'warn'
+
+/** Severity ranks: keep an entry whose rank ≥ the threshold's. */
+const LEVEL_RANK: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2 }
+
+/** Live-read level getter: the threshold can flip while the process runs
+ * (the config field is volatile), so it is asked per line. Anything that
+ * is not a legal level — a throw, a bogus string, no getter — falls back
+ * to `'info'`, the ring's historic floor. */
+export type LogLevelGetter = () => LogLevel
+
+function effectiveLevel(minLevel: LogLevelGetter | undefined): LogLevel {
+  try {
+    const level = minLevel?.()
+    if (level !== undefined && LEVEL_RANK[level] !== undefined) return level
+  } catch { /* a broken getter must not silence the ring */ }
+  return 'info'
+}
 
 /** One ring entry: ISO timestamp, level, fully interpolated message. */
 export interface LogRingEntry {
@@ -48,11 +66,12 @@ export interface LogRing {
  * session of lifecycle lines plus a healthy share of warnings, while keeping
  * the report a fixed small size. A cap below 1 is clamped to 1.
  */
-export function createLogRing(cap = 300): LogRing {
+export function createLogRing(cap = 300, minLevel?: LogLevelGetter): LogRing {
   const capacity = Number.isFinite(cap) && cap >= 1 ? Math.floor(cap) : 1
   const entries: LogRingEntry[] = []
   return {
     push(level, formatText, ...args) {
+      if (LEVEL_RANK[level] < LEVEL_RANK[effectiveLevel(minLevel)]) return
       let msg: string
       try {
         msg = args.length === 0 ? String(formatText) : format(formatText, ...args)
@@ -71,9 +90,10 @@ export function createLogRing(cap = 300): LogRing {
   }
 }
 
-/** The logger face this module needs: the cordis context logger's two
+/** The logger face this module needs: the cordis context logger's
  * methods, each optional (test fakes carry none). */
 export interface PluginLogLike {
+  debug?(format: string, ...args: unknown[]): void
   info?(format: string, ...args: unknown[]): void
   warn?(format: string, ...args: unknown[]): void
 }
@@ -82,20 +102,20 @@ export interface PluginLogLike {
  * line reaches the context logger (unchanged behavior, unchanged call
  * sites) AND the ring (the debug report's source). A ring failure is
  * swallowed; a logger failure propagates exactly as it did before this
- * module existed. */
-export function createPluginLog(ring: LogRing, logger: PluginLogLike | undefined): { info(format: string, ...args: unknown[]): void, warn(format: string, ...args: unknown[]): void } {
+ * module existed. `minLevel` gates a whole line — below the threshold it
+ * reaches NEITHER the logger nor the ring; the same getter drives the
+ * ring's own push filter, so the two paths can never disagree. */
+export function createPluginLog(ring: LogRing, logger: PluginLogLike | undefined, minLevel?: LogLevelGetter): { debug(format: string, ...args: unknown[]): void, info(format: string, ...args: unknown[]): void, warn(format: string, ...args: unknown[]): void } {
+  const write = (level: LogLevel, method: 'debug' | 'info' | 'warn', formatText: string, args: unknown[]): void => {
+    if (LEVEL_RANK[level] < LEVEL_RANK[effectiveLevel(minLevel)]) return
+    logger?.[method]?.(formatText, ...args)
+    try {
+      ring.push(level, formatText, ...args)
+    } catch { /* the ring must never break logging */ }
+  }
   return {
-    info(formatText, ...args) {
-      logger?.info?.(formatText, ...args)
-      try {
-        ring.push('info', formatText, ...args)
-      } catch { /* the ring must never break logging */ }
-    },
-    warn(formatText, ...args) {
-      logger?.warn?.(formatText, ...args)
-      try {
-        ring.push('warn', formatText, ...args)
-      } catch { /* the ring must never break logging */ }
-    },
+    debug(formatText, ...args) { write('debug', 'debug', formatText, args) },
+    info(formatText, ...args) { write('info', 'info', formatText, args) },
+    warn(formatText, ...args) { write('warn', 'warn', formatText, args) },
   }
 }

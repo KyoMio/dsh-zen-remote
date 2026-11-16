@@ -994,3 +994,243 @@ test('PAS-5: re-adding the same serverId preserves incremented workspaceEpochs a
   await evIter.return?.(undefined)
   handle.uninstall()
 })
+
+// -- 7. pool client swap: the held session/follow follows the CURRENT client -----
+// peer-resilience T1: a held SESSION_STREAM_HOLD endpoint bound its wait and
+// its reopen to the client object captured at open time. A dead leg's pool
+// swap (peer-left → unmount → peer-joined → new client under the same
+// serverId) left the old client waiting on a `stopped` relay that can never
+// go online again — the remote session page froze on 正在加载 until a DSH
+// restart. The hold now follows `pool.getByServerId(serverId)` per iteration.
+
+/** A manual clock for the hold's reopen backoff (the serve-again wait costs
+ * one backoff step when the re-resolved client already reads online). */
+function fakeClock() {
+  let now = 1_700_000_000_000
+  const timers = []
+  return {
+    now: () => now,
+    random: () => 0,
+    setTimeout(fn, ms) {
+      const timer = { fn, at: now + ms }
+      timers.push(timer)
+      return timer
+    },
+    clearTimeout(timer) {
+      const index = timers.indexOf(timer)
+      if (index >= 0) timers.splice(index, 1)
+    },
+    advance(ms) {
+      now += ms
+      const due = timers.filter((t) => t.at <= now).sort((a, b) => a.at - b.at)
+      for (const timer of due) {
+        const index = timers.indexOf(timer)
+        if (index >= 0) {
+          timers.splice(index, 1)
+          timer.fn()
+        }
+      }
+    },
+    get pending() { return timers.length },
+  }
+}
+
+/** Drive the hold's serve-again path to completion: keep settling until the
+ * generator arms its backoff timer, fire it, repeat — the generator's
+ * re-entry into waitServeAgain spans many microtask turns (IteratorClose on
+ * the dead gate + async-generator queue draining), so a fixed settle count
+ * races it. `done` marks success: either a stream leg appears on `watchRelay`
+ * or nothing more can arm. */
+async function driveRecovery(clock, watchRelay) {
+  for (let i = 0; i < 40; i += 1) {
+    if (watchRelay !== undefined && watchRelay.streams.length > 0) return
+    if (clock.pending > 0) clock.advance(10_000)
+    await settle()
+  }
+}
+
+/** A pending `next()` promise that must NOT settle within `ms` — used where
+ * the hold is supposed to keep the UI stream open and silent. */
+async function expectSilent(pending, ms = 80) {
+  let timer
+  const raced = await Promise.race([
+    pending.then(() => 'settled'),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve('pending'), ms)
+    }),
+  ]).finally(() => clearTimeout(timer))
+  assert.equal(raced, 'pending', 'the held stream must stay open and silent')
+}
+
+test('peer-resilience: a held session/follow whose pool entry swaps to a NEW client reopens on the new one (first frame still owed)', async () => {
+  const relayA1 = createMultiRelay(SID_A)
+  const pool = createFakePool([makeEntry(SID_A, 'A', relayA1)])
+  const gateway = new FakeTypertGateway()
+  const clock = fakeClock()
+  const { handle } = installPool(gateway, pool, { clock })
+  const iterable = gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VA('s1') } } } },
+    undefined, undefined, undefined, { signal: undefined },
+  )
+  const iterator = (await iterable)[Symbol.asyncIterator]()
+  const pending = iterator.next()
+  await settle()
+  assert.equal(relayA1.streams.length, 1, 'the leg opened on A1')
+
+  // The leg dies offline; the peer-left path then swaps the pool entry to a
+  // fresh client under the same serverId.
+  relayA1.transition('offline')
+  relayA1.streams[0].gate.throwNow(new RelayError('offline', 'transport died'))
+  await settle()
+  const relayA2 = createMultiRelay(SID_A)
+  pool.remove(`entry-${SID_A}`)
+  pool.add(makeEntry(SID_A, 'A', relayA2))
+  handle.notePoolEvent()
+  await settle()
+  await driveRecovery(clock, relayA2)
+
+  const legA2 = relayA2.streams.find((leg) => leg.namespace === 'session' && leg.method === 'follow')
+  assert.ok(legA2, 'the hold reopened on the NEW client')
+  assert.equal(relayA1.streams.length, 1, 'the dead client never saw another openStream')
+  legA2.gate.push({ type: 'snapshot', header: { id: 's1' } })
+  const result = await pending
+  assert.equal(result.done, false)
+  assert.equal(result.value.header.id, VA('s1'), 'the snapshot arrived virtualized through the new leg')
+
+  await iterator.return?.(undefined)
+  handle.uninstall()
+})
+
+test('peer-resilience: a held session/follow past its first frame ends cleanly once the new client serves', async () => {
+  const relayA1 = createMultiRelay(SID_A)
+  const pool = createFakePool([makeEntry(SID_A, 'A', relayA1)])
+  const gateway = new FakeTypertGateway()
+  const clock = fakeClock()
+  const { handle } = installPool(gateway, pool, { clock })
+  const iterable = gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VA('s1') } } } },
+    undefined, undefined, undefined, { signal: undefined },
+  )
+  const iterator = (await iterable)[Symbol.asyncIterator]()
+  const pending = iterator.next()
+  await settle()
+  relayA1.streams[0].gate.push({ type: 'snapshot', header: { id: 's1' } })
+  const first = await pending
+  assert.equal(first.value.header.id, VA('s1'))
+
+  relayA1.transition('offline')
+  relayA1.streams[0].gate.throwNow(new RelayError('offline', 'transport died'))
+  await settle()
+  const relayA2 = createMultiRelay(SID_A)
+  pool.remove(`entry-${SID_A}`)
+  pool.add(makeEntry(SID_A, 'A', relayA2))
+  handle.notePoolEvent()
+  // Serve-again runs the backoff inside the generator, which resumes over
+  // many turns; drive it until the clean end lands (no new leg to watch).
+  const donePump = (async () => { for (let i = 0; i < 40; i += 1) { if (clock.pending > 0) clock.advance(10_000); await settle() } })()
+  const done = await Promise.race([iterator.next(), donePump.then(() => ({ timedOut: true }))])
+  if (done.timedOut === true) throw new Error('held stream never ended after the pool swap')
+
+  // The accepted-generation clean end: the UI retries on a carrier failure,
+  // and ITS reopen goes through validate → the new client.
+  assert.equal(done.done, true, 'the delivered generation ends cleanly on recovery')
+  assert.equal(relayA1.streams.length, 1, 'the dead client never saw another openStream')
+
+  handle.uninstall()
+})
+
+test('peer-resilience: a held session/follow outlives a pool entry ABSENCE and resumes on the re-added client', async () => {
+  const relayA1 = createMultiRelay(SID_A)
+  const pool = createFakePool([makeEntry(SID_A, 'A', relayA1)])
+  const gateway = new FakeTypertGateway()
+  const clock = fakeClock()
+  const { handle } = installPool(gateway, pool, { clock })
+  const iterable = gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VA('s1') } } } },
+    undefined, undefined, undefined, { signal: undefined },
+  )
+  const iterator = (await iterable)[Symbol.asyncIterator]()
+  const pending = iterator.next()
+  await settle()
+
+  relayA1.transition('offline')
+  relayA1.streams[0].gate.throwNow(new RelayError('offline', 'transport died'))
+  await settle()
+  // The server is gone from the pool entirely for a while — the hold must
+  // neither end nor error, just wait.
+  pool.remove(`entry-${SID_A}`)
+  handle.notePoolEvent()
+  await settle()
+  await expectSilent(pending)
+
+  const relayA2 = createMultiRelay(SID_A)
+  pool.add(makeEntry(SID_A, 'A', relayA2))
+  handle.notePoolEvent()
+  await settle()
+  await driveRecovery(clock, relayA2)
+  const legA2 = relayA2.streams[0]
+  assert.ok(legA2, 'the re-added client received the reopen')
+  legA2.gate.push({ type: 'snapshot', header: { id: 's1' } })
+  const result = await pending
+  assert.equal(result.value.header.id, VA('s1'))
+
+  await iterator.return?.(undefined)
+  handle.uninstall()
+})
+
+test('peer-resilience: an aborted held wait releases BOTH subscriptions and never reopens', async () => {
+  const relayA1 = createMultiRelay(SID_A)
+  // Count live state listeners on the old client — install adds one
+  // (catalog watcher) in pool mode, the hold adds one more while waiting.
+  let liveSubs = 0
+  const realSubscribe = relayA1.subscribe.bind(relayA1)
+  relayA1.subscribe = (listener) => {
+    liveSubs += 1
+    const off = realSubscribe(listener)
+    return () => { liveSubs -= 1; off() }
+  }
+  const pool = createFakePool([makeEntry(SID_A, 'A', relayA1)])
+  const gateway = new FakeTypertGateway()
+  const { handle } = installPool(gateway, pool)
+  const installSubs = liveSubs
+
+  const controller = new AbortController()
+  const iterable = gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VA('s1') } } } },
+    undefined, undefined, undefined, { signal: controller.signal },
+  )
+  const iterator = (await iterable)[Symbol.asyncIterator]()
+  const pending = iterator.next()
+  await settle()
+
+  relayA1.transition('offline')
+  relayA1.streams[0].gate.throwNow(new RelayError('offline', 'transport died'))
+  await settle()
+  assert.equal(liveSubs, installSubs + 1, 'the hold parked one listener on the old client')
+
+  // The page closes while the serverId is gone from the pool entirely.
+  pool.remove(`entry-${SID_A}`)
+  handle.notePoolEvent()
+  await settle()
+  await expectSilent(pending)
+  controller.abort()
+  const result = await pending
+  assert.equal(result.done, true, 'abort ends the held wait')
+  // The catalog watcher's own listener leaves with the entry (the rescan
+  // unsubscribes it) — post-abort the count is one below the install baseline.
+  assert.equal(liveSubs, installSubs - 1, 'the state listener was released on abort')
+
+  // The pool watch was released too: re-adding a fresh client must not wake
+  // anything — no new openStream, no pending work.
+  const relayA2 = createMultiRelay(SID_A)
+  pool.add(makeEntry(SID_A, 'A', relayA2))
+  handle.notePoolEvent()
+  await settle()
+  assert.equal(relayA2.streams.length, 0, 'no waiter leaked to the new client')
+
+  handle.uninstall()
+})

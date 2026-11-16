@@ -901,6 +901,54 @@ test('peer status: 文本输出 —— 五种连接方式、延迟、挂载、�
   }
 })
 
+test('peer status: 降级直连标注——超上限走中转的行写明原因（中英）', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('status-peer-demoted')
+  let handle
+  try {
+    const demotedClient = {
+      [ROUTES.peerStatus]: {
+        body: () => peerStatusBody('authorized', {
+          extra: {
+            peers: [
+              { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3, directRttMs: 3, directDemoted: false },
+              { nodeId: 'fc825640', name: 'imac', mounted: false, path: 'relay', rttMs: null, directRttMs: 3454, directDemoted: true },
+              { nodeId: 'dd44ee55', name: '备用机', mounted: false, path: 'relay', rttMs: null, directRttMs: null, directDemoted: false },
+            ],
+          },
+        }),
+      },
+    }
+    const { handle: h } = await startIpcServer(home, { role: 'peer', client: demotedClient })
+    handle = h
+    for (const lang of ['zh', 'en']) {
+      const ctx = makeCtx(mods, { argv: ['peer', 'status'], ipc: mods.createCliIpcClient(handle.socketPath), lang })
+      assert.equal(await mods.runPeerStatusCommand(ctx), 0)
+      const text = ctx.stdout.text()
+      const line = text.split('\n').find((l) => l.includes('fc825640'))
+      assert.ok(line !== undefined, `${lang}: the demoted row appears`)
+      if (lang === 'zh') {
+        assert.match(line, /经网关中转（直连 3454ms 超过上限）/u)
+      } else {
+        assert.match(line, /via gateway relay \(direct 3454ms over the cap\)/u)
+      }
+      assert.ok(!line.includes('超过上限 300'), `${lang}: the CLI never invents a cap it cannot read`)
+      const plain = text.split('\n').find((l) => l.includes('dd44ee55'))
+      assert.ok(plain !== undefined)
+      assert.ok(!plain.includes('直连'), `${lang}: a plain relay row carries no demotion note`)
+    }
+    const json = makeCtx(mods, { argv: ['peer', 'status', '--json'], ipc: mods.createCliIpcClient(handle.socketPath) })
+    assert.equal(await mods.runPeerStatusCommand(json), 0)
+    const parsed = JSON.parse(json.stdout.text())
+    const imac = parsed.peers.find((row) => row.nodeId === 'fc825640')
+    assert.equal(imac.directDemoted, true)
+    assert.equal(imac.directRttMs, 3454)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})
+
 test('peer status: 未入网与 --json 快照', async () => {
   const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
   const home = makeHome('status-peer-json')

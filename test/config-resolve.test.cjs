@@ -130,6 +130,36 @@ test('lang and role only accept their enum members', async () => {
   assert.equal(resolveConfig({}, { role: 'peer' }, {}).values.role, 'peer', 'the file layer carries peer too')
 })
 
+test('logLevel defaults to info, accepts only its enum members, and reads every layer (peer-resilience T2)', async () => {
+  const { resolveConfig } = await load()
+  assert.equal(resolveConfig({}, {}, {}).values.logLevel, 'info')
+  assert.equal(resolveConfig({}, {}, {}).sources.logLevel, 'default')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_LOG_LEVEL: 'debug' }).values.logLevel, 'debug')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_LOG_LEVEL: 'debug' }).sources.logLevel, 'env')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_LOG_LEVEL: 'trace' }).values.logLevel, 'info', 'an off-enum env falls to default')
+  assert.equal(resolveConfig({ logLevel: 'warn' }, {}, {}).values.logLevel, 'warn')
+  assert.equal(resolveConfig({ logLevel: 'warn' }, {}, {}).sources.logLevel, 'row')
+  assert.equal(resolveConfig({ logLevel: 'verbose' }, { logLevel: 'debug' }, {}).values.logLevel, 'debug', 'an invalid row value is rescued by the file')
+  assert.equal(resolveConfig({}, { logLevel: 'warn' }, {}).values.logLevel, 'warn', 'the file layer carries it too')
+  assert.equal(resolveConfig({ logLevel: 'trace' }, {}, { LAN_GATE_LOG_LEVEL: 'warn' }).values.logLevel, 'warn', 'env beats a bad row value')
+})
+
+test('peerDirectMaxRttMs defaults to 300, clamps to int 0..10000, and reads every layer (peer-resilience T5)', async () => {
+  const { resolveConfig } = await load()
+  assert.equal(resolveConfig({}, {}, {}).values.peerDirectMaxRttMs, 300)
+  assert.equal(resolveConfig({}, {}, {}).sources.peerDirectMaxRttMs, 'default')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_PEER_DIRECT_MAX_RTT_MS: '800' }).values.peerDirectMaxRttMs, 800)
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_PEER_DIRECT_MAX_RTT_MS: '800' }).sources.peerDirectMaxRttMs, 'env')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_PEER_DIRECT_MAX_RTT_MS: '10001' }).values.peerDirectMaxRttMs, 300, 'an out-of-range env falls to default')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_PEER_DIRECT_MAX_RTT_MS: '-1' }).values.peerDirectMaxRttMs, 300)
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_PEER_DIRECT_MAX_RTT_MS: '1.5' }).values.peerDirectMaxRttMs, 300)
+  assert.equal(resolveConfig({ peerDirectMaxRttMs: 0 }, {}, {}).values.peerDirectMaxRttMs, 0)
+  assert.equal(resolveConfig({ peerDirectMaxRttMs: 0 }, {}, {}).sources.peerDirectMaxRttMs, 'row')
+  assert.equal(resolveConfig({ peerDirectMaxRttMs: 12000 }, { peerDirectMaxRttMs: 400 }, {}).values.peerDirectMaxRttMs, 400, 'an invalid row value is rescued by the file')
+  assert.equal(resolveConfig({}, { peerDirectMaxRttMs: 5000 }, {}).values.peerDirectMaxRttMs, 5000, 'the file layer carries it too')
+  assert.equal(resolveConfig({ peerDirectMaxRttMs: 'x' }, {}, { LAN_GATE_PEER_DIRECT_MAX_RTT_MS: '200' }).values.peerDirectMaxRttMs, 200, 'env beats a bad row value')
+})
+
 test('servesRole / connectsRole answer the role truth table', async () => {
   const { servesRole, connectsRole } = await load()
   // Serving = the gateway/relay/push halves mount. Dialing = the relay
@@ -481,6 +511,7 @@ test('a fully populated Config row resolves with EVERY source = row (T17)', asyn
     pluginBridgeConsent: { '@acme/panel': true },
     ingressMode: 'caddy', ingressDomain: 'dsh.example.com', ingressHttpsPort: 8443,
     ingressAcmeEmail: 'acme@example.com', ingressPublicUrl: 'https://dsh.example.com:8443',
+    logLevel: 'debug', peerDirectMaxRttMs: 800,
     serverUrl: 'https://gw.example', deviceToken: 'tok',
     turnFoldDesktop: true, keyboardLiftRatio: 0.5, keyboardLiftMaxPx: 300, keyboardSafetyPadPx: 10, maxUploadBytes: 1024,
   }

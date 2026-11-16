@@ -540,6 +540,11 @@ export interface PeerStatusDeviceView {
   mounted: boolean
   path: PeerDevicePathView
   rttMs: number | null
+  /** The smoothed UDP measurement while a peer is (or was) direct-ready —
+   *  null before the first sample. Rides the demoted note. */
+  directRttMs: number | null
+  /** The engine demoted this peer to relay for exceeding the RTT cap. */
+  directDemoted: boolean
 }
 
 /** The device row's path word (the wizard module's `PeerDevicePath`). */
@@ -574,6 +579,8 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
         mounted: record.mounted === true,
         path: peerViewPathOf(record.path),
         rttMs: typeof record.rttMs === 'number' && Number.isFinite(record.rttMs) ? record.rttMs : null,
+        directRttMs: typeof record.directRttMs === 'number' && Number.isFinite(record.directRttMs) && record.directRttMs >= 0 ? record.directRttMs : null,
+        directDemoted: record.directDemoted === true,
       }
     })
     .filter((row): row is PeerStatusDeviceView => row !== undefined)
@@ -1196,10 +1203,12 @@ export type SettingsFieldName =
   | 'pushSessionName'
   | 'pushDebounceMs'
   | 'lang'
+  | 'logLevel'
   | 'serverName'
   | 'idleHours'
   | 'autoShareNewSessions'
   | 'pluginBridgeConsent'
+  | 'peerDirectMaxRttMs'
 
 /** Longest legal `serverName`, mirroring src/config.ts's cap. */
 export const SERVER_NAME_MAX = 40
@@ -1222,10 +1231,14 @@ export const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
   boolField('pushTool'),
   intField('pushDebounceMs', 0, Number.MAX_SAFE_INTEGER),
   oneOfField('lang', ['auto', 'zh', 'en']),
+  oneOfField('logLevel', ['info', 'debug', 'warn']),
   nameField('serverName', SERVER_NAME_MAX),
   hoursField('idleHours', IDLE_HOURS_MAX),
   boolField('autoShareNewSessions'),
   consentField('pluginBridgeConsent'),
+  // The peer card's RTT cap: 0 = no cap (the pre-T5 behaviour), capped at
+  // 10 000 ms like the config schema itself.
+  intField('peerDirectMaxRttMs', 0, 10_000),
 ]
 
 // --- the status -> view mapping ---------------------------------------------
@@ -1439,6 +1452,7 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
   pushSessionName: SettingsFieldState
   pushDebounceMs: SettingsFieldState
   lang: SettingsFieldState
+  logLevel: SettingsFieldState
   serverName: SettingsFieldState
   idleHours: SettingsFieldState
   autoShareNewSessions: SettingsFieldState
@@ -1446,6 +1460,8 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
    * 插件桥 toggles stage the next map wholesale — but its `invalid` flag
    * (a malformed draft) still gates the save like any field's. */
   pluginBridgeConsent: SettingsFieldState
+  /** The peer card's direct-RTT cap (ms, 0 = no cap); rendered only on a peer page. */
+  peerDirectMaxRttMs: SettingsFieldState
   deviceToken: SettingsSecretFieldState
   /** A restart-required field ({@link RESTART_FIELDS}) has a staged change a
    * save would actually write: the save will move the row and the host
