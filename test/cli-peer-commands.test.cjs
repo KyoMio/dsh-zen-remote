@@ -906,10 +906,14 @@ test('peer status: 降级直连标注——超上限走中转的行写明原因�
   const home = makeHome('status-peer-demoted')
   let handle
   try {
+    // T4: the gateway-owned cap is a status fact; the demotion line prints
+    // the real value. Flipped false for the old-daemon fallback below.
+    let withCap = true
     const demotedClient = {
       [ROUTES.peerStatus]: {
         body: () => peerStatusBody('authorized', {
           extra: {
+            ...(withCap ? { directCapMs: 300, directCapSource: 'gateway' } : {}),
             peers: [
               { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3, directRttMs: 3, directDemoted: false },
               { nodeId: 'fc825640', name: 'imac', mounted: false, path: 'relay', rttMs: null, directRttMs: 3454, directDemoted: true },
@@ -928,11 +932,11 @@ test('peer status: 降级直连标注——超上限走中转的行写明原因�
       const line = text.split('\n').find((l) => l.includes('fc825640'))
       assert.ok(line !== undefined, `${lang}: the demoted row appears`)
       if (lang === 'zh') {
-        assert.match(line, /经网关中转（直连 3454ms 超过上限）/u)
+        assert.match(line, /经网关中转（直连 3454ms 超过上限 300ms）/u)
       } else {
-        assert.match(line, /via gateway relay \(direct 3454ms over the cap\)/u)
+        assert.match(line, /via gateway relay \(direct 3454ms over the cap of 300ms\)/u)
       }
-      assert.ok(!line.includes('超过上限 300'), `${lang}: the CLI never invents a cap it cannot read`)
+      assert.ok(line.includes('300ms'), `${lang}: the real status cap is printed`)
       const plain = text.split('\n').find((l) => l.includes('dd44ee55'))
       assert.ok(plain !== undefined)
       assert.ok(!plain.includes('直连'), `${lang}: a plain relay row carries no demotion note`)
@@ -943,6 +947,17 @@ test('peer status: 降级直连标注——超上限走中转的行写明原因�
     const imac = parsed.peers.find((row) => row.nodeId === 'fc825640')
     assert.equal(imac.directDemoted, true)
     assert.equal(imac.directRttMs, 3454)
+    assert.equal(parsed.directCapMs, 300, '--json carries the gateway cap fact (T4)')
+    assert.equal(parsed.directCapSource, 'gateway')
+    // Old daemon (no directCapMs in the body): the line must NOT invent one —
+    // the suffix drops instead of printing a guessed 300.
+    withCap = false
+    const oldCtx = makeCtx(mods, { argv: ['peer', 'status'], ipc: mods.createCliIpcClient(handle.socketPath), lang: 'zh' })
+    assert.equal(await mods.runPeerStatusCommand(oldCtx), 0)
+    const oldLine = oldCtx.stdout.text().split('\n').find((l) => l.includes('fc825640'))
+    assert.ok(oldLine !== undefined)
+    assert.match(oldLine, /经网关中转（直连 3454ms 超过上限）/u)
+    assert.ok(!oldLine.includes('300'), 'no cap fact → no invented number')
   } finally {
     if (handle !== undefined) await handle.close()
     cleanup(home)

@@ -58,7 +58,6 @@ export const ENV_VAR_BY_FIELD: Readonly<Partial<Record<keyof ZenRemoteConfig, st
   // the variable shadows the file layer.
   maxServers: 'LAN_GATE_MAX_SERVERS',
   logLevel: 'LAN_GATE_LOG_LEVEL',
-  peerDirectMaxRttMs: 'LAN_GATE_PEER_DIRECT_MAX_RTT_MS',
 }
 
 export interface WriteCliConfigOptions {

@@ -324,7 +324,7 @@ function peerStateCopyOf(state: string, t: SectionT, deniedReason?: string): str
 function PeerDeviceRow(props: {
   device: PeerStatusDeviceView
   busy: boolean
-  /** The displayed direct-RTT cap (the field's draft text), for the demoted note. */
+  /** The displayed direct-RTT cap (the engine's effective value), for the demoted note. */
   cap: string
   onToggle: (mounted: boolean) => void
   onTrust: () => void
@@ -1574,7 +1574,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                     <PeerDeviceRow
                       key={device.nodeId}
                       device={device}
-                      cap={form.peerDirectMaxRttMs.text}
+                      cap={peerView?.directCapMs !== undefined ? String(peerView.directCapMs) : '—'}
                       busy={peerBusyNode !== null}
                       onToggle={(mounted) => { void runPeerNodeAction(CLIENT_PEER_TOGGLE_MOUNT_ROUTE, device.nodeId, { nodeId: device.nodeId, mounted }) }}
                       onTrust={() => { void runPeerNodeAction(CLIENT_PEER_TRUST_ROUTE, device.nodeId, { nodeId: device.nodeId }) }}
@@ -1601,9 +1601,6 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                 </div>
               </div>
 
-              {/* T6: the direct-RTT cap — the same staged-field path as the
-                  first card's fields, just rendered inside the mesh card. */}
-              {text(form.peerDirectMaxRttMs, 'peerDirectMaxRttMs', t('settings.fieldPeerDirectMaxRttMs'), t('settings.fieldPeerDirectMaxRttMsHint'), t('settings.invalidRtt'), true)}
             </>
           )}
 

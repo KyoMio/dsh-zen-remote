@@ -428,10 +428,10 @@ await test('PAS-6b: revokedNotice survives cleared peerNetwork on settings view 
   assert.equal(settingsSrc.includes('CLIENT_PEER_DISMISS_REVOKED_ROUTE'), true)
   assert.equal(settingsSrc.includes('wizard.peer.revokedBanner'), true)
   assert.equal(settingsSrc.includes('wizard.peer.gatewayEmail'), true)
-  // T6: the log-level select and the direct-RTT cap box are rendered, and the
-  // demoted-relay copy rides with them.
+  // T6: the log-level select is rendered and the demoted-relay copy rides
+  // with it (T4 removed the local RTT-cap box — the gateway owns the value now).
   assert.equal(settingsSrc.includes('settings.fieldLogLevel'), true, 'the settings page renders the logLevel select')
-  assert.equal(settingsSrc.includes('settings.fieldPeerDirectMaxRttMs'), true, 'the peer card renders the direct-RTT cap field')
+  assert.equal(settingsSrc.includes('settings.fieldPeerDirectMaxRttMs'), false, 'the peer card no longer renders a local direct-RTT cap field')
   assert.equal(settingsSrc.includes('wizard.peer.devicePathRelayDemoted'), true, 'a demoted peer shows the "over the cap" note')
   assert.equal(wizardSrc.includes('CLIENT_PEER_DISMISS_REVOKED_ROUTE'), true)
   assert.equal(wizardSrc.includes('wizard.peer.revokedBanner'), true)

@@ -403,6 +403,8 @@ export interface NetworkRecord {
   /** AES-256-GCM 密文（master-key.encryptSecret），库里永不存明文口令 */
   joinKeyEnc: string;
   maxPeers: number;
+  /** 节点端直连 RTT 上限（ms）：超此值的 direct 路径按不可信处理；0 = 不设上限 */
+  peerDirectMaxRttMs: number;
   createdAt: string;
 }
 
@@ -430,7 +432,13 @@ export interface NetworkPatch {
   name?: string;
   admissionMode?: AdmissionMode;
   maxPeers?: number;
+  peerDirectMaxRttMs?: number;
 }
+
+/** peer_direct_max_rtt_ms 的全网统一默认与合法区间（DB 默认值、建网初始值、HTTP 校验共用） */
+export const PEER_DIRECT_MAX_RTT_MS_DEFAULT = 300;
+export const PEER_DIRECT_MAX_RTT_MS_MIN = 0;
+export const PEER_DIRECT_MAX_RTT_MS_MAX = 10000;
 
 export interface MemberProfilePatch {
   name?: string | null;

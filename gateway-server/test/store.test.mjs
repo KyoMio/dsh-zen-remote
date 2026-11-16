@@ -831,6 +831,47 @@ describe('SqliteStore GC-2 扩展', () => {
     }
   });
 
+  test('旧库迁移：networks 缺 peer_direct_max_rtt_ms 列时打开后补齐，旧行回落默认 300', async () => {
+    const dir = tmpDir('net-rtt-migrate');
+    const dbPath = path.join(dir, 'legacy.db');
+    // 旧版形：networks 没有 peer_direct_max_rtt_ms（其余列照 T3 之前形）
+    const legacy = new DatabaseSync(dbPath);
+    try {
+      legacy.exec(`
+        CREATE TABLE networks (
+          id TEXT PRIMARY KEY,
+          owner_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          admission_mode TEXT NOT NULL CHECK (admission_mode IN ('key','manual','both')),
+          join_key_enc TEXT NOT NULL,
+          max_peers INTEGER NOT NULL CHECK (max_peers BETWEEN 1 AND 64),
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, created_at)
+        VALUES ('netlegacy1', 'legacy-owner', 'old net', 'key', 'not-a-real-ciphertext', 8, '2026-01-01T00:00:00.000Z');
+      `);
+    } finally {
+      legacy.close();
+    }
+    const store = new SqliteStore({ path: dbPath });
+    try {
+      const net = await store.getNetwork('netlegacy1');
+      assert.ok(net !== null);
+      assert.equal(net.maxPeers, 8);
+      assert.equal(net.peerDirectMaxRttMs, 300, '旧行由列默认值回落 300ms');
+      const raw = new DatabaseSync(dbPath);
+      try {
+        const cols = raw.prepare('PRAGMA table_info(networks)').all().map((c) => c.name);
+        assert.ok(cols.includes('peer_direct_max_rtt_ms'));
+      } finally {
+        raw.close();
+      }
+    } finally {
+      await store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('默认组与 system_settings 双向同步', async () => {
     const store = freshStore({ allowSignup: false, maxNetworksPerUser: 4, defaultMaxPeers: 8, relayRateKbps: 512 });
     try {
@@ -1443,6 +1484,7 @@ describe('PgStore contract (mock query)', () => {
       admission_mode: 'both',
       join_key_enc: 'enc-payload',
       max_peers: 6,
+      peer_direct_max_rtt_ms: 300,
       created_at: NOW,
     };
     const q = mockQuery([
@@ -1458,14 +1500,15 @@ describe('PgStore contract (mock query)', () => {
       admissionMode: 'both',
       joinKeyEnc: 'enc-payload',
       maxPeers: 6,
+      peerDirectMaxRttMs: 300,
       createdAt: '2026-11-10T08:00:00.000Z',
     });
     assert.deepEqual(q.txStatements(), ['BEGIN', 'COMMIT']); // admin 不查配额但仍走事务
     const data = q.dataCalls();
     const insert = data[1];
-    assert.match(insert.sql, /INSERT INTO networks \(id, owner_id, name, admission_mode, join_key_enc, max_peers, created_at\)/);
+    assert.match(insert.sql, /INSERT INTO networks \(id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at\)/);
     assert.match(insert.params[0], /^[0-9a-f]{16}$/); // id 由 store 生成
-    assert.deepEqual(insert.params.slice(1, 6), ['admin1', 'a-net', 'both', 'enc-payload', 6]);
+    assert.deepEqual(insert.params.slice(1, 7), ['admin1', 'a-net', 'both', 'enc-payload', 6, 300]);
   });
 
   test('upsertMemberJoinAttempt：口令匹配 + 容量未满 → INSERT authorized（参数核对）', async () => {

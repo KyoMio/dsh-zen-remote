@@ -656,9 +656,6 @@ export declare const zh: {
     readonly 'settings.peer.title': "网络与设备互通";
     readonly 'settings.peer.subtitle': "作为节点端与其他电脑互挂会话；下方保留手机 / 浏览器接入的配置";
     readonly 'settings.peer.notConfigured': "尚未加入设备网络——可直接在下方粘贴邀请链接或输入中继网关地址（由网关侧手动审批）加入";
-    readonly 'settings.fieldPeerDirectMaxRttMs': "直连延迟上限（毫秒）";
-    readonly 'settings.fieldPeerDirectMaxRttMsHint': "UDP 直连实测延迟超过该值时自动走网关中转，降至上限七成后回切直连。默认 300；0 表示不设上限（始终直连）。0–10000。";
-    readonly 'settings.invalidRtt': "需要 0–10000 的整数（0 = 不限制）";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

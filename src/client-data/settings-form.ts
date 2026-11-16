@@ -516,6 +516,10 @@ export interface PeerStatusView {
    * cap is unknown — `false` would claim room that may not exist. */
   limitReached: boolean | undefined
   peers: PeerStatusDeviceView[]
+  /** T4: the effective direct-RTT cap (ms, 0 = uncapped), verbatim from the
+   * body when it carried a safe integer ≥ 0; `undefined` on an older body —
+   * the demoted note's cap display falls back to '—' then. */
+  directCapMs: number | undefined
   /** PC-14a: the sync-readiness block (the third light's data). `undefined`
    * on an older body — never guessed from the peers rows. */
   sync: PeerSyncReadinessView | undefined
@@ -585,6 +589,9 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     })
     .filter((row): row is PeerStatusDeviceView => row !== undefined)
   const maxPeers = finiteOrUndefined(safe.maxPeers)
+  const directCapMs = typeof safe.directCapMs === 'number' && Number.isSafeInteger(safe.directCapMs) && safe.directCapMs >= 0
+    ? safe.directCapMs
+    : undefined
   // PC-11a-fix1: the capacity facts count DEVICES — safe integers only. A
   // fractional cap (1.5) or a 65th slot is protocol junk and stays UNKNOWN,
   // never rounded or clamped into a plausible-looking lie; the cap mirrors
@@ -657,6 +664,7 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     networkId: asStringSet(safe.networkId) || undefined,
     gatewayOrigin: asStringSet(safe.gatewayOrigin) || undefined,
     maxPeers,
+    directCapMs,
     maxServers,
     mountedCount,
     limitReached: mountedCount !== undefined && maxServers !== undefined ? mountedCount >= maxServers : undefined,
@@ -1208,7 +1216,6 @@ export type SettingsFieldName =
   | 'idleHours'
   | 'autoShareNewSessions'
   | 'pluginBridgeConsent'
-  | 'peerDirectMaxRttMs'
 
 /** Longest legal `serverName`, mirroring src/config.ts's cap. */
 export const SERVER_NAME_MAX = 40
@@ -1236,9 +1243,6 @@ export const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
   hoursField('idleHours', IDLE_HOURS_MAX),
   boolField('autoShareNewSessions'),
   consentField('pluginBridgeConsent'),
-  // The peer card's RTT cap: 0 = no cap (the pre-T5 behaviour), capped at
-  // 10 000 ms like the config schema itself.
-  intField('peerDirectMaxRttMs', 0, 10_000),
 ]
 
 // --- the status -> view mapping ---------------------------------------------
@@ -1460,8 +1464,6 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
    * 插件桥 toggles stage the next map wholesale — but its `invalid` flag
    * (a malformed draft) still gates the save like any field's. */
   pluginBridgeConsent: SettingsFieldState
-  /** The peer card's direct-RTT cap (ms, 0 = no cap); rendered only on a peer page. */
-  peerDirectMaxRttMs: SettingsFieldState
   deviceToken: SettingsSecretFieldState
   /** A restart-required field ({@link RESTART_FIELDS}) has a staged change a
    * save would actually write: the save will move the row and the host

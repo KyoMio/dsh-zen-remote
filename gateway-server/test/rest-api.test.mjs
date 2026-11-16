@@ -529,27 +529,32 @@ describe('REST API /api/v1（主服务器）', () => {
   // ---- 网络 CRUD
 
   describe('网络 CRUD 与 rotate-key', () => {
-    test('PATCH 部分更新：name/admissionMode/maxPeers 生效，joinKey 不变', async () => {
+    test('PATCH 部分更新：name/admissionMode/maxPeers/peerDirectMaxRttMs 生效，joinKey 不变', async () => {
       const res = await api(handle.base, 'PATCH', `/api/v1/networks/${tenantNetId}`, {
         cookie: tenantCookie,
-        body: { name: 'renamed', admissionMode: 'both', maxPeers: 2 },
+        body: { name: 'renamed', admissionMode: 'both', maxPeers: 2, peerDirectMaxRttMs: 450 },
       });
       assert.equal(res.status, 200);
       const data = res.json.data;
       assert.equal(data.name, 'renamed');
       assert.equal(data.admissionMode, 'both');
       assert.equal(data.maxPeers, 2);
+      assert.equal(data.peerDirectMaxRttMs, 450);
       assert.equal(data.joinKey, tenantJoinKey); // patch 不动 join key
       const host = new URL(handle.base).host;
       assert.equal(data.joinUri, `zr-net://${host}/${tenantNetId}#${data.joinKey}`);
     });
 
-    test('PATCH 参数校验：maxPeers 2..64、name 1..32、admissionMode 枚举 → 400', async () => {
+    test('PATCH 参数校验：maxPeers 2..64、peerDirectMaxRttMs 0..10000、name 1..32、admissionMode 枚举 → 400', async () => {
       const cases = [
         { maxPeers: 65 },
         { maxPeers: 1 },
         { maxPeers: 2.5 },
         { maxPeers: '8' },
+        { peerDirectMaxRttMs: -1 },
+        { peerDirectMaxRttMs: 10001 },
+        { peerDirectMaxRttMs: 1.5 },
+        { peerDirectMaxRttMs: '300' },
         { admissionMode: 'open' },
         { name: '' },
         { name: 'x'.repeat(33) },

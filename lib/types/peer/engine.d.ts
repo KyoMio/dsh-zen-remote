@@ -54,6 +54,12 @@ export interface PeerEngineStatus {
     maxPeers: number | null;
     natType: PeerNatType | null;
     peers: PeerEnginePeerStatus[];
+    /** T4：当前生效的直连 RTT 上限（ms），解析序同 {@link PeerEngineOptions.directMaxRttMs}
+     *  ——`0` = 不限制。排障用；判定逻辑读同一解析。 */
+    directCapMs: number;
+    /** T4：`directCapMs` 的来源——`gateway` = 网关 welcome/network-updated 下发；
+     *  `default` = 网关没说过话时的本地值（options 注入或回落 300）。 */
+    directCapSource: 'gateway' | 'default';
 }
 export interface PeerEnginePunchTimings {
     punchIntervalMs?: number;
@@ -105,10 +111,13 @@ export interface PeerEngineOptions {
     log?: (line: string) => void;
     /** 透传给 mux 的逐请求噪声通道（T3）。 */
     debug?: (line: string) => void;
-    /** T5：直连 RTT 上限（ms）的现场读法——每次判定都调用，非法值（非有限、
-     *  负数）按 0 处理；缺省视为 `() => 0`（不限制，保留旧行为）。上限大于
-     *  0 时 onDirectReady 不再立即切 UDP，等首个保活样本 ≤ 上限才升直连；
-     *  已直连的会话在「当前样本与 EWMA 双双超限」时才降级回中转。 */
+    /** 直连 RTT 上限（ms）的测试注入通道——生产不接：上限的唯一来源是网关
+     *  下发（welcome / network-updated 落 `peerNetwork.peerDirectMaxRttMsFromGateway`）。
+     *  解析序 `capFromGateway ?? options.directMaxRttMs?.() ?? 300`；每次样本
+     *  现场调用，非法值（非整数、负数、>10000）按 300。上限大于 0 时
+     *  onDirectReady 不再立即切 UDP，等保活样本连续达标才升直连；已直连的
+     *  会话在「当前样本与 EWMA 双双超限」时才降级回中转；0 = 不限制（保留
+     *  旧行为）。 */
     directMaxRttMs?: () => number;
 }
 export interface PeerEngineLeaveResult {

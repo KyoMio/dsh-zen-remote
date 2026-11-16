@@ -19,6 +19,7 @@ import {
 } from '../peer-hub/peer-crypto.js';
 import { ApiError, readJsonObjectBody, requestIsHttps, requireUser, runHook, sendOk } from './auth.js';
 import type { RouteContext, RouteDef } from './auth.js';
+import { PEER_DIRECT_MAX_RTT_MS_MAX, PEER_DIRECT_MAX_RTT_MS_MIN } from '../store/types.js';
 import type {
   AdmissionMode,
   MemberProfilePatch,
@@ -129,6 +130,20 @@ function parseMaxPeers(value: unknown): number {
   return value;
 }
 
+function parsePeerDirectMaxRttMs(value: unknown): number {
+  if (
+    typeof value !== 'number' || !Number.isInteger(value)
+    || value < PEER_DIRECT_MAX_RTT_MS_MIN || value > PEER_DIRECT_MAX_RTT_MS_MAX
+  ) {
+    throw new ApiError(
+      400,
+      'INVALID_REQUEST',
+      `peerDirectMaxRttMs must be an integer in [${PEER_DIRECT_MAX_RTT_MS_MIN}, ${PEER_DIRECT_MAX_RTT_MS_MAX}]`,
+    );
+  }
+  return value;
+}
+
 /** 归属者视角的网络视图：解密 joinKey 拼完整 joinUri，附带设备统计 */
 async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<Record<string, unknown>> {
   const joinKey = decryptSecret(network.joinKeyEnc, ctx.masterKey);
@@ -151,6 +166,7 @@ async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<R
     name: network.name,
     admissionMode: network.admissionMode,
     maxPeers: network.maxPeers,
+    peerDirectMaxRttMs: network.peerDirectMaxRttMs,
     createdAt: network.createdAt,
     joinKey,
     joinUri: `${endpoint.scheme}://${endpoint.authority}/${network.id}${endpoint.query}${uriSuffix}`,
@@ -247,14 +263,18 @@ async function handlePatchNetwork(ctx: RouteContext, params: Record<string, stri
       }
     }
   }
+  if (body['peerDirectMaxRttMs'] !== undefined) {
+    // 全网统一下发的 RTT 上限：无组限额语义，任一角色按区间校验即可
+    patch.peerDirectMaxRttMs = parsePeerDirectMaxRttMs(body['peerDirectMaxRttMs']);
+  }
   const updated = await ctx.store.updateNetwork(networkId, patch);
   if (updated === null) {
     throw new ApiError(404, 'NOT_FOUND', 'network not found');
   }
-  // PC-08a：容量变化才通知实时层——仅改 name/admissionMode 不伪造容量事实；
+  // PC-08a：容量/RTT 上限变化才通知实时层——仅改 name/admissionMode 不伪造容量事实；
   // 接收方（ws-hub）以库中最新事实为准收敛，重复同值 PATCH 不产生重复推送
-  if (patch.maxPeers !== undefined) {
-    await runHook(ctx.hooks.onNetworkUpdated, networkId, updated.maxPeers);
+  if (patch.maxPeers !== undefined || patch.peerDirectMaxRttMs !== undefined) {
+    await runHook(ctx.hooks.onNetworkUpdated, networkId, updated.maxPeers, updated.peerDirectMaxRttMs);
   }
   sendOk(ctx.res, await networkView(ctx, updated));
 }

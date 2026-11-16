@@ -15,7 +15,9 @@
  *     60s reprobe that hot-upgrades to direct later, 5s encrypted
  *     PING/PONG keepalive with lost-direct detection 15s after the last
  *     authenticated receive (3 silent cycles, decoupled from the PING
- *     tick), and close() that clears every timer and socket handle.
+ *     tick), payload-matched PONG sampling with unanswered-PING
+ *     counting, a 5s/15s/60s silent-reprobe backoff, and close() that
+ *     clears every timer and socket handle.
  *
  * Everything here drives the BUILT lib/peer/punch.js like every other
  * wiring test in this repo. The punch tests run REAL loopback UDP
@@ -35,7 +37,7 @@ const {
   classifyPunchEndpoint,
 } = require('../lib/peer/punch.js')
 const { generatePeerIdentity, buildPeerHandshakeEnvelope } = require('../lib/peer/crypto.js')
-const { PeerFrameType, decodeFrameHeader } = require('../lib/peer/wire.js')
+const { PeerFrameType, decodeFrameHeader, packEncryptedFrame, unpackEncryptedFrame } = require('../lib/peer/wire.js')
 const { PeerArqSession } = require('../lib/peer/arq.js')
 
 const NET_ID = 'a1b2c3d4e5f60718'
@@ -304,10 +306,13 @@ test('collectLanEndpoints keeps non-loopback IPv4 (RFC1918 + CGNAT + public), dr
 test('classifyPunchEndpoint: LAN subnets + loopback + exact local ips → lan, everything else → p2p', () => {
   const localIps = ['192.168.1.10', '100.64.2.5']
   assert.equal(classifyPunchEndpoint('192.168.1.77:1234', localIps), 'lan', 'same /24 RFC1918')
+  assert.equal(classifyPunchEndpoint('192.168.1.5:9', ['192.168.1.9']), 'lan', 'RFC1918 same /24 stays lan')
   assert.equal(classifyPunchEndpoint('192.168.9.77:1234', localIps), 'p2p', 'RFC1918 different subnet')
   assert.equal(classifyPunchEndpoint('10.0.0.5:1', ['10.0.0.5']), 'lan', 'exact 10/8 match')
   assert.equal(classifyPunchEndpoint('172.16.5.5:1', ['172.16.5.5']), 'lan', 'exact 172.16/12 match')
-  assert.equal(classifyPunchEndpoint('100.64.2.99:1', localIps), 'lan', 'CGNAT same /24 (Tailscale)')
+  assert.equal(classifyPunchEndpoint('100.64.2.99:1', localIps), 'p2p', 'CGNAT same /24 is still a tunnel (Tailscale) — never lan')
+  assert.equal(classifyPunchEndpoint('100.64.0.3:41641', ['100.64.0.9']), 'p2p', 'the real-machine Tailscale pair from the incident stays p2p')
+  assert.equal(classifyPunchEndpoint('100.64.2.5:1', localIps), 'lan', 'but our own tailnet IP verbatim still is')
   assert.equal(classifyPunchEndpoint('100.64.99.99:1', localIps), 'p2p', 'CGNAT different subnet')
   assert.equal(classifyPunchEndpoint('127.0.0.1:1', []), 'lan', 'loopback is the most LAN there is')
   assert.equal(classifyPunchEndpoint('8.8.8.8:53', localIps), 'p2p', 'public endpoint')
@@ -710,13 +715,22 @@ test('fallback fires exactly once, at exactly 1000ms of virtual time', async () 
     assert.deepEqual(fallbacks, [peer.nodeId], 'fallback at exactly 1000ms')
     clock.advance(2000)
     assert.equal(fallbacks.length, 1, 'fallback fires exactly once per window')
-    // The 60s reprobe fires at t=61000 and runs its OWN 1000ms window.
-    clock.advance(58_000) // → 61000: reprobe HELLOs fly
+    // The silent reprobe backs off 5s/15s/60s: the first retry fires at
+    // t=6000 and runs its OWN 1000ms window.
+    clock.advance(3_000) // → 6000: reprobe HELLOs fly (5s after the first fallback)
     assert.equal(fallbacks.length, 1, 'reprobe start is silent')
-    clock.advance(999) // → 61999: still inside the reprobe window
+    clock.advance(999) // → 6999: still inside the reprobe window
     assert.equal(fallbacks.length, 1)
-    clock.advance(1) // → 62000
+    clock.advance(1) // → 7000
     assert.equal(fallbacks.length, 2, 'the reprobe round has its own window')
+    clock.advance(15_000) // → 22000: the second retry fires 15s after the first retry's window
+    assert.equal(fallbacks.length, 2, 'second reprobe start is silent')
+    clock.advance(1_000) // → 23000
+    assert.equal(fallbacks.length, 3, 'the second reprobe round fires fallback once')
+    clock.advance(60_000) // → 83000: the third retry lands on the option cadence (60s)
+    assert.equal(fallbacks.length, 3, 'third reprobe start is silent')
+    clock.advance(1_000) // → 84000
+    assert.equal(fallbacks.length, 4, 'the third reprobe round fires fallback once')
   } finally {
     await closeManager({ mgr, socket })
   }
@@ -758,8 +772,8 @@ test('silent reprobe after fallback upgrades to direct once the endpoint comes a
   mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
   assert.equal(sockB.address().port, deadPort)
 
-  // The 60s silent reprobe fires and the fresh HELLO reaches B.
-  clockA.advance(60_000)
+  // The first silent reprobe (5s tier) fires and the fresh HELLO reaches B.
+  clockA.advance(5_000)
   const aInfo = await withTimeout(readyDefer.promise, 250, 'reprobe upgraded to direct')
   const bInfo = await withTimeout(bReady.promise, 250, 'B saw the reprobe too')
   assert.equal(events.fallback, 1, 'no extra fallback fired')
@@ -806,7 +820,7 @@ test('keepalive: pings are answered; 3 unanswered cycles trigger onDirectLost; r
     const raw = await openSocket('127.0.0.1', bPort)
     const helloDefer = defer()
     raw.once('message', (buf) => helloDefer.resolve(JSON.parse(buf.toString('utf8'))))
-    clockA.advance(60_000)
+    clockA.advance(5_000) // first reprobe tier fires 5s after the loss
     const hello = await withTimeout(helloDefer.promise, 250, 'reprobe HELLO after direct lost')
     assert.equal(hello.kind, 'zr-hello')
     assert.equal(hello.nodeId, A.nodeId)
@@ -909,9 +923,9 @@ test('asymmetric one-way UDP (A -> B arrives, B -> A dropped) never puts B into 
       'B MUST NOT enter direct on unconfirmed inbound zr-hello alone (otherwise B blackholes all outbound stream frames!)',
     )
 
-    // Now unblock B -> A and trigger A's reprobe: 3-way confirmation completes on both sides!
+    // Now unblock B -> A and trigger A's first-tier reprobe: 3-way confirmation completes on both sides!
     blockBtoA = false
-    clockA.advance(60_000)
+    clockA.advance(5_000)
     await withTimeout(
       (async () => {
         while (readyA.length === 0 || readyB.length === 0) await sleep(10)
@@ -1043,7 +1057,7 @@ test('a keepalive loss fires exactly once; the silent reprobe never re-enters di
     await closeManager({ mgr: mgrB, socket: sockB })
     clockA.advance(15_000)
     assert.deepEqual(events.aLost.map((entry) => entry.id), [B.nodeId], 'loss declared once at the deadline')
-    clockA.advance(60_000) // → 75000: the silent reprobe fires HELLOs at the dead endpoint
+    clockA.advance(5_000) // → 20000: the first-tier reprobe fires HELLOs at the dead endpoint
     assert.equal(events.aLost.length, 1, 'loss never fires twice for one direct epoch')
     assert.equal(events.aReady.length, 1, 'no direct re-entry without a successful handshake')
     assert.equal(events.aFallback, 0, 'reprobe HELLOs alone stay silent (window not yet expired)')
@@ -1169,8 +1183,8 @@ test('PC-V1: incoming recovery handshake survives the local reprobe deadline', a
     clockA.advance(1000)
     clockB.advance(1000)
     packets.length = 0
-    clockA.advance(59_999)
-    clockB.advance(60_000)
+    clockA.advance(4_999)
+    clockB.advance(5_000)
     deliver() // B's fresh HELLO reaches A just before A's scheduled reprobe.
     deliver() // A's ACK reaches B; B now has a confirmed path.
     assert.equal(readyB, 1)
@@ -1187,6 +1201,146 @@ test('PC-V1: incoming recovery handshake survives the local reprobe deadline', a
     b.close()
     assert.equal(clockA.pendingCount(), 0)
     assert.equal(clockB.pendingCount(), 0)
+  }
+})
+
+// -- T1: payload-matched PONG sampling, unanswered-PING counting ----------------------
+
+/**
+ * Crafted-frame harness: spies A's outbound PINGs, decrypts them under B's
+ * session ciphers, and injects arbitrary B→A frames straight into
+ * mgrA.handlePacket (bypassing the socket so timing stays deterministic).
+ * Returns the pair plus a `frameOf` builder whose seq stays ahead of every
+ * real B→A sequence number so the replay window always admits it.
+ */
+async function craftedPair(hooksA = {}) {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const clockA = manualClock()
+  const clockB = manualClock()
+  const aPings = []
+  const sockA = await openSocket('127.0.0.1')
+  const sockB = await openSocket('127.0.0.1')
+  const origSend = sockA.send.bind(sockA)
+  sockA.send = (buf, ...rest) => {
+    const header = decodeFrameHeader(buf)
+    if (header && header.frameType === PeerFrameType.PING) aPings.push(Buffer.from(buf))
+    return origSend(buf, ...rest)
+  }
+  const readyA = defer()
+  const readyB = defer()
+  const mgrA = new PeerPunchManager({ networkId: NET_ID, identity: A, socket: sockA, clock: clockA, onDirectReady: readyA.resolve, ...hooksA })
+  const mgrB = new PeerPunchManager({ networkId: NET_ID, identity: B, socket: sockB, clock: clockB, onDirectReady: readyB.resolve })
+  await mgrA.ready(); await mgrB.ready()
+  mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
+  mgrA.beginPunch({ peerNodeId: B.nodeId, peerPublicKeyHex: B.publicKeyHex, lanEndpoints: [endpointOf(sockB)], reflexiveEndpoint: null })
+  await withTimeout(readyA.promise, 1000, 'A ready')
+  await withTimeout(readyB.promise, 1000, 'B ready')
+  const bCiphers = mgrB.sessionCiphers(A.nodeId)
+  assert.ok(bCiphers, 'B derived session ciphers for A')
+  let seq = 10_000n
+  const frameOf = (frameType, payload) => packEncryptedFrame(
+    { frameType, srcNodeId: B.nodeId, dstNodeId: A.nodeId, streamId: 0, seq: seq++, ack: 0 },
+    payload,
+    bCiphers,
+  )
+  const rinfoB = { address: '127.0.0.1', port: 65534 } // unseen endpoint — also pins the re-anchor path
+  const lastPingPayload = () => {
+    const opened = unpackEncryptedFrame(aPings[aPings.length - 1], bCiphers)
+    assert.ok(opened, 'A\'s keepalive PING decrypts under B\'s ciphers')
+    return opened.plaintext
+  }
+  return { A, B, clockA, mgrA, mgrB, sockA, sockB, aPings, bCiphers, frameOf, rinfoB, lastPingPayload }
+}
+
+test('T1: a PONG only samples when it echoes the in-flight PING payload; stale and foreign PONGs are ignored', async () => {
+  const samples = []
+  const unanswered = []
+  const env = await craftedPair({
+    onRttSample: (_id, rtt) => samples.push(rtt),
+    onPingUnanswered: (id) => unanswered.push(id),
+  })
+  const { B, clockA, mgrA, mgrB, sockB, aPings, frameOf, rinfoB, lastPingPayload } = env
+  try {
+    assert.ok(aPings.length >= 1, 'the immediate handshake PING was captured')
+    // Anchor determinism: an echo of the immediate PING clears whatever may
+    // still be outstanding (or is ignored if already answered) — afterwards
+    // no PING is in flight for sure.
+    mgrA.handlePacket(frameOf(PeerFrameType.PONG, lastPingPayload()), rinfoB)
+    await sleep(10)
+    const baseline = samples.length
+
+    // A forged PONG while nothing is in flight: ignored, no sample.
+    mgrA.handlePacket(frameOf(PeerFrameType.PONG, randomBytes(8)), rinfoB)
+    await sleep(10)
+    assert.equal(samples.length, baseline, 'a PONG with nothing outstanding never samples')
+
+    // B dies; the next tick sends PING#1, nothing answers it.
+    await closeManager({ mgr: mgrB, socket: sockB })
+    clockA.advance(5_000)
+    assert.deepEqual(unanswered, [], 'no miss while the first PING is merely in flight')
+    const payload1 = lastPingPayload()
+    assert.equal(payload1.length, 8, 'the PING payload is the stored 8-byte random')
+
+    // Wrong payload for the in-flight PING: ignored — PING#1 stays outstanding.
+    mgrA.handlePacket(frameOf(PeerFrameType.PONG, randomBytes(8)), rinfoB)
+    await sleep(10)
+    assert.equal(samples.length, baseline, 'a wrong-payload PONG never produces a sample')
+    clockA.advance(5_000) // tick 2 sees PING#1 still unanswered → one miss, PING#2 flies
+    assert.deepEqual(unanswered, [B.nodeId], 'the uncleared PING counts as one unanswered tick')
+
+    // A late PONG echoing PING#1 (superseded by PING#2): ignored too.
+    mgrA.handlePacket(frameOf(PeerFrameType.PONG, payload1), rinfoB)
+    await sleep(10)
+    assert.equal(samples.length, baseline, 'a stale PONG echoing a superseded PING is ignored')
+
+    // The PONG echoing the current in-flight PING#2 finally samples.
+    clockA.advance(4_000) // sit 4s past PING#2's send time
+    mgrA.handlePacket(frameOf(PeerFrameType.PONG, lastPingPayload()), rinfoB)
+    await sleep(10)
+    assert.equal(samples.length, baseline + 1, 'only the matching PONG samples')
+    assert.equal(samples[samples.length - 1], 4_000, 'RTT measured against the matching PING send time')
+    clockA.advance(1_000) // next tick: PING#2 was answered → no further miss
+    assert.equal(unanswered.length, 1, 'the answered PING cleared the outstanding marker')
+  } finally {
+    await closeManager({ mgr: mgrA, socket: env.sockA })
+  }
+})
+
+test('T1: each silent keepalive tick reports onPingUnanswered; a matching PONG clears the outstanding PING', async () => {
+  const samples = []
+  const unanswered = []
+  const env = await craftedPair({
+    onRttSample: (_id, rtt) => samples.push(rtt),
+    onPingUnanswered: (id) => unanswered.push(id),
+  })
+  const { B, clockA, mgrA, mgrB, sockB, frameOf, rinfoB, lastPingPayload } = env
+  try {
+    // Drain the immediate PING the same deterministic way, then kill B.
+    mgrA.handlePacket(frameOf(PeerFrameType.PONG, lastPingPayload()), rinfoB)
+    await closeManager({ mgr: mgrB, socket: sockB })
+
+    clockA.advance(5_000)  // t=5000: PING#1 outstanding
+    clockA.advance(5_000)  // t=10000: PING#1 missed → report #1, PING#2 out
+    // Any authenticated frame refreshes the loss clock without answering the
+    // PING — a crafted peer PING keeps the session alive past the 15s loss
+    // deadline so a second miss can be observed.
+    mgrA.handlePacket(frameOf(PeerFrameType.PING, randomBytes(8)), rinfoB)
+    clockA.advance(5_000)  // t=15000: PING#2 missed → report #2, PING#3 out
+    assert.deepEqual(unanswered, [B.nodeId, B.nodeId], 'one unanswered report per silent tick')
+
+    // The matching PONG for PING#3 lands → the outstanding marker clears.
+    mgrA.handlePacket(frameOf(PeerFrameType.PONG, lastPingPayload()), rinfoB)
+    await sleep(10)
+    clockA.advance(5_000)  // t=20000: PING#3 was answered → NO miss report, PING#4 out
+    assert.equal(unanswered.length, 2, 'a matching PONG cleared the outstanding marker')
+    // Refresh the loss clock again (any authenticated frame does it) so the
+    // 15s deadline does not race the next tick.
+    mgrA.handlePacket(frameOf(PeerFrameType.PING, randomBytes(8)), rinfoB)
+    clockA.advance(5_000)  // t=25000: PING#4 missed → a fresh miss reports again
+    assert.equal(unanswered.length, 3, 'the next silence reports as a new miss, not a reset-immune counter')
+  } finally {
+    await closeManager({ mgr: mgrA, socket: env.sockA })
   }
 })
 

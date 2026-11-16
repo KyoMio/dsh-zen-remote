@@ -99,8 +99,8 @@ export interface MemberChangedEvent {
 export interface GatewayHooks {
   onMemberChanged?: (event: MemberChangedEvent) => void | Promise<void>;
   onNetworkDeleted?: (networkId: string) => void | Promise<void>;
-  /** PC-08a / PS-5：网络 PATCH（仅 maxPeers）持久化成功后直传新上限给 hub */
-  onNetworkUpdated?: (networkId: string, maxPeers: number) => void | Promise<void>;
+  /** PC-08a / PS-5：网络 PATCH（maxPeers / peerDirectMaxRttMs）持久化成功后直传新值给 hub */
+  onNetworkUpdated?: (networkId: string, maxPeers: number, peerDirectMaxRttMs: number) => void | Promise<void>;
   onSettingsChanged?: (settings: SystemSettings) => void | Promise<void>;
   onUserDisabled?: (userId: string) => void | Promise<void>;
   /** GC-6a：配额变化（默认组创建/切换/更新）后通知实时层；userId 缺省 = 全量失效 */

@@ -124,6 +124,11 @@ export interface PeerNetworkRecord {
   /** The peer cap the gateway announced (`maxPeersFromGateway`); the local
    * `maxServers` config decides whether it wins outright or only lowers. */
   maxPeersFromGateway?: number
+  /** The direct-path RTT cap the gateway announced (welcome / network-updated,
+   * integer 0..10000, 0 = uncapped). The engine resolves the effective cap as
+   * `peerDirectMaxRttMsFromGateway ?? options.directMaxRttMs?.() ?? 300` —
+   * the gateway's word wins whenever it has spoken (T4 peer-network-switch). */
+  peerDirectMaxRttMsFromGateway?: number
   /** Whether the gateway has ever admitted this device into the network
    * (`welcome` with authorized/paused/mismatch). Drives `auth.reconnect` and
    * distinguishes initial join refusals from post-admission revocations. */
@@ -224,6 +229,14 @@ function normalizePeerNetwork(value: unknown): PeerNetworkRecord | undefined {
     && value.maxPeersFromGateway >= 1
   ) {
     record.maxPeersFromGateway = value.maxPeersFromGateway
+  }
+  if (
+    isFiniteNumber(value.peerDirectMaxRttMsFromGateway)
+    && Number.isInteger(value.peerDirectMaxRttMsFromGateway)
+    && value.peerDirectMaxRttMsFromGateway >= 0
+    && value.peerDirectMaxRttMsFromGateway <= 10_000
+  ) {
+    record.peerDirectMaxRttMsFromGateway = value.peerDirectMaxRttMsFromGateway
   }
   if (value.everAdmitted === true) {
     record.everAdmitted = true

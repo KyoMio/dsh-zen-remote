@@ -122,12 +122,6 @@ export interface ZenRemoteConfig {
    * a flip applies without reloading the row; deliberately NOT in
    * RESTART_FIELDS. */
   logLevel: 'info' | 'debug' | 'warn'
-  /** Direct-path RTT cap in ms (peer-resilience T5): once the measured
-   * keepalive RTT exceeds it the member falls back to the gateway relay;
-   * `0` disables the cap (legacy behaviour — punch ready means direct).
-   * Integer [0, 10000]. Live-read by the engine's getter per sample;
-   * deliberately NOT in RESTART_FIELDS. */
-  peerDirectMaxRttMs: number
 }
 
 function defaultServerName(): string {
@@ -162,7 +156,6 @@ export const DEFAULTS: ZenRemoteConfig = {
   ingressAcmeEmail: '',
   ingressPublicUrl: '',
   logLevel: 'info',
-  peerDirectMaxRttMs: 300,
 }
 
 // --- per-field validators -------------------------------------------------
@@ -412,9 +405,6 @@ const FIELDS: { [K in keyof ZenRemoteConfig]: FieldResolver<ZenRemoteConfig[K]> 
   // LAN_GATE_* convention. Live-read by the ring getter — not in
   // RESTART_FIELDS.
   logLevel: { env: envOneOf('LAN_GATE_LOG_LEVEL', 'info', 'debug', 'warn'), row: oneOf('info', 'debug', 'warn'), file: oneOf('info', 'debug', 'warn') },
-  // T5: the direct-path RTT cap, same integer-in-range shape as maxServers.
-  // Read live per keepalive sample by the engine getter — not RESTART_FIELDS.
-  peerDirectMaxRttMs: { env: envNumber('LAN_GATE_PEER_DIRECT_MAX_RTT_MS', intIn(0, 10000)), row: intIn(0, 10000), file: lenientFileNumber(intIn(0, 10000)) },
 }
 
 /**
@@ -508,7 +498,6 @@ export function resolveConfig(
     ingressAcmeEmail: resolveField('ingressAcmeEmail', safeRow, safeFile, env, sources),
     ingressPublicUrl: resolveField('ingressPublicUrl', safeRow, safeFile, env, sources),
     logLevel: resolveField('logLevel', safeRow, safeFile, env, sources),
-    peerDirectMaxRttMs: resolveField('peerDirectMaxRttMs', safeRow, safeFile, env, sources),
   }
   return { values, sources }
 }
@@ -641,9 +630,6 @@ export const Config = z.object({
   // The log threshold (T2): read live by the ring's level getter — a flip
   // must apply to the next line without reloading the row.
   logLevel: z.any().volatile(),
-  // The direct-path RTT cap (T5): read live by the engine's getter per
-  // keepalive sample — a flip applies to the next sample, no row reload.
-  peerDirectMaxRttMs: z.any().volatile(),
   // Client-half knobs (T16): where the phone finds the gateway, and the
   // pairing token it presents. `role('secret')` keeps the token out of every
   // settings wire surface, like the verifier plugin's API key.

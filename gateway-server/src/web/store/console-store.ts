@@ -50,6 +50,8 @@ export interface NetworkView {
   name: string;
   admissionMode: AdmissionMode;
   maxPeers: number;
+  /** 节点端直连 RTT 上限（ms），0 = 不设上限（T3 peer-network-switch） */
+  peerDirectMaxRttMs: number;
   createdAt: string;
   joinKey: string;
   joinUri: string;
@@ -1110,7 +1112,7 @@ export class ConsoleClient {
     return this.request('POST', '/api/v1/networks', input);
   }
 
-  async patchNetwork(id: string, patch: { name?: string; admissionMode?: AdmissionMode; maxPeers?: number }): Promise<NetworkView> {
+  async patchNetwork(id: string, patch: { name?: string; admissionMode?: AdmissionMode; maxPeers?: number; peerDirectMaxRttMs?: number }): Promise<NetworkView> {
     return this.request('PATCH', `/api/v1/networks/${encodeURIComponent(id)}`, patch);
   }
 

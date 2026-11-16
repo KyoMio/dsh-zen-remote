@@ -326,7 +326,6 @@ dsh-zen-remote peer leave          # 退出当前虚拟网络（不影响本机�
 | `pushTool` | 开 | 是否向模型注册 `push_notify` 主动推送工具 |
 | `idleHours` | `48` | 远程共享会话的闲置自动休眠时长（小时，范围 `(0, 8760]`） |
 | `maxServers`（客户端） | `8` | 一个子客户端最多同时配对几台服务端；整数 `1..64`，现场读取（改动无需重载插件行），环境变量 `LAN_GATE_MAX_SERVERS` 优先。peer 模式下网络上限包含本机：远端挂载上限为 `maxPeersFromGateway - 1`，再受本机显式 `maxServers` 限制；缩容不踢已有挂载 |
-| `peerDirectMaxRttMs`（节点端） | `300` | 直连链路平滑 RTT 上限（毫秒）；整数 `0..10000`，现场读取。直连路径持续超过上限就降级走网关端到端加密中转（连续 3 个样本低于上限 70% 再升回直连）；`0` 表示不限制，直连可用就走直连 |
 | `logLevel` | `info` | `ctx.logger` 与诊断日志环的日志级别：`info` / `debug` / `warn`；`debug` 额外记录逐请求明细行。现场读取——环境变量 `LAN_GATE_LOG_LEVEL` 优先 |
 | `autoShareNewSessions` | 关 | 主服务端新建的会话是否自动开启远程共享 |
 | `pluginBridgeConsent` | `{}` | 插件桥整机数据授权表（插件名 → 布尔值） |
@@ -336,7 +335,7 @@ dsh-zen-remote peer leave          # 退出当前虚拟网络（不影响本机�
 | `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` | `0.42` / `400` / `15` | 软键盘高度不可见环境下的输入框抬升校准参数 |
 | `maxUploadBytes` | 20 MB | 手机端单次附件上传大小上限 |
 
-历史环境变量（优先级高于插件行）：`LAN_GATE_PORT`、`LAN_GATE_HOST`、`LAN_GATE_TARGET_PORT`、`LAN_GATE_RATE_LIMIT`、`LAN_GATE_TRUSTED_PROXIES`、`LAN_GATE_VAPID_SUBJECT`、`LAN_GATE_LANG`、`LAN_GATE_LOG_LEVEL`、`LAN_GATE_PEER_DIRECT_MAX_RTT_MS`、`DSH_PUSH_ENABLED`、`DSH_PUSH_SESSION_NAME`、`DSH_PUSH_TURN_END`、`DSH_PUSH_EVENTS`、`DSH_PUSH_DEBOUNCE_MS`、`DSH_PUSH_SUMMARY`、`DSH_PUSH_TOOL`、`DSH_PUSH_LANG`、`DSH_PUSH_APPROVAL_GRACE_MS`。
+历史环境变量（优先级高于插件行）：`LAN_GATE_PORT`、`LAN_GATE_HOST`、`LAN_GATE_TARGET_PORT`、`LAN_GATE_RATE_LIMIT`、`LAN_GATE_TRUSTED_PROXIES`、`LAN_GATE_VAPID_SUBJECT`、`LAN_GATE_LANG`、`LAN_GATE_LOG_LEVEL`、`DSH_PUSH_ENABLED`、`DSH_PUSH_SESSION_NAME`、`DSH_PUSH_TURN_END`、`DSH_PUSH_EVENTS`、`DSH_PUSH_DEBOUNCE_MS`、`DSH_PUSH_SUMMARY`、`DSH_PUSH_TOOL`、`DSH_PUSH_LANG`、`DSH_PUSH_APPROVAL_GRACE_MS`。
 
 </details>
 

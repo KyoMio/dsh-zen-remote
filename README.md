@@ -326,7 +326,6 @@ Each field resolves in order: **environment variable > plugin row settings > `~/
 | `pushTool` | on | Register the model-callable `push_notify` tool |
 | `idleHours` | `48` | Idle-sleep window in hours for shared sessions; range `(0, 8760]` |
 | `maxServers` *(client)* | `8` | How many servers one sub-client may keep paired at once; integer `1..64`, read live (no reload needed); env `LAN_GATE_MAX_SERVERS` outranks it. In peer mode the network limit includes this machine: the remote mount limit is `maxPeersFromGateway - 1`, further capped by an explicit local `maxServers`; shrinking does not disconnect existing mounts |
-| `peerDirectMaxRttMs` *(peer)* | `300` | Smoothed direct-link RTT cap in ms; integer `0..10000`, read live. A peer whose direct path stays over the cap is demoted to end-to-end encrypted gateway relay (promoted back after 3 consecutive samples under 70% of the cap); `0` disables the cap and keeps direct whenever available |
 | `logLevel` | `info` | Logging threshold for `ctx.logger` and the diagnostic log ring: `info` / `debug` / `warn`; `debug` additionally records per-request detail lines. Read live — env `LAN_GATE_LOG_LEVEL` outranks it |
 | `autoShareNewSessions` | off | Automatically enable remote access on new sessions created on the host |
 | `pluginBridgeConsent` | `{}` | Whole-machine data consent map (`pluginName -> boolean`) for the plugin bridge |
@@ -336,7 +335,7 @@ Each field resolves in order: **environment variable > plugin row settings > `~/
 | `keyboardLiftRatio` / `keyboardLiftMaxPx` / `keyboardSafetyPadPx` | `0.42` / `400` / `15` | Soft-keyboard lift calibration fallback for environments where the OS hides keyboard height |
 | `maxUploadBytes` | 20 MB | Mobile attachment upload cap |
 
-Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_HOST`, `LAN_GATE_TARGET_PORT`, `LAN_GATE_RATE_LIMIT`, `LAN_GATE_TRUSTED_PROXIES`, `LAN_GATE_VAPID_SUBJECT`, `LAN_GATE_LANG`, `LAN_GATE_LOG_LEVEL`, `LAN_GATE_PEER_DIRECT_MAX_RTT_MS`, `DSH_PUSH_ENABLED`, `DSH_PUSH_SESSION_NAME`, `DSH_PUSH_TURN_END`, `DSH_PUSH_EVENTS`, `DSH_PUSH_DEBOUNCE_MS`, `DSH_PUSH_SUMMARY`, `DSH_PUSH_TOOL`, `DSH_PUSH_LANG`, `DSH_PUSH_APPROVAL_GRACE_MS`.
+Legacy environment variables (outrank row settings): `LAN_GATE_PORT`, `LAN_GATE_HOST`, `LAN_GATE_TARGET_PORT`, `LAN_GATE_RATE_LIMIT`, `LAN_GATE_TRUSTED_PROXIES`, `LAN_GATE_VAPID_SUBJECT`, `LAN_GATE_LANG`, `LAN_GATE_LOG_LEVEL`, `DSH_PUSH_ENABLED`, `DSH_PUSH_SESSION_NAME`, `DSH_PUSH_TURN_END`, `DSH_PUSH_EVENTS`, `DSH_PUSH_DEBOUNCE_MS`, `DSH_PUSH_SUMMARY`, `DSH_PUSH_TOOL`, `DSH_PUSH_LANG`, `DSH_PUSH_APPROVAL_GRACE_MS`.
 
 </details>
 
