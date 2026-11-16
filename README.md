@@ -26,16 +26,13 @@
 
 <p align="center"><a href="README.zh-CN.md">中文文档</a></p>
 
-```mermaid
-flowchart LR
-  subgraph Mesh["Peer Virtual Mesh (Zero Public IP)"]
-    A["Peer Node A<br/>(Desktop / Server)"] <-->|"1. LAN / UDP Hole-Punch Direct<br/>(60s silent re-probe)"| B["Peer Node B<br/>(Desktop / Server)"]
-    A -.->|"2. 1s E2EE Fallback<br/>(X25519 + AES-256-GCM)"| GW["Self-Hosted Gateway<br/>(gateway-server · Docker)"]
-    B -.->|"2. Blind Ciphertext Relay<br/>+ Dual-UDP STUN"| GW
-  end
-  A -->|"Dual PWA Hosting<br/>Caddy / Tunnel / Proxy / LAN"| Phone["Phone / Browser PWA<br/>(All Sessions + Web Push)"]
-  Client["Desktop Client<br/>(Up to 8 Hosts)"] -->|"Direct Relay<br/>(Pairing Code)"| A
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/arch-mesh-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/arch-mesh-light.png">
+    <img src="docs/images/arch-mesh-light.png" alt="dsh-zen-remote Peer Mesh and Three-Role Architecture" width="920">
+  </picture>
+</p>
 
 | Role | Best for | Session sharing | Phone PWA &amp; Push | Needs public IP? |
 | --- | --- | --- | --- | --- |
@@ -307,13 +304,13 @@ Every remote RPC/stream/HTTP route is guarded by a strict **per-method allowlist
 
 Third-party DSH plugins whose session panels query their own backend routes on DSH's `webServer` can work seamlessly across remote sessions via the **Plugin Bridge Protocol** — **without taking any runtime dependency on `dsh-zen-remote`**.
 
-```mermaid
-flowchart LR
-  Browser["Remote Session UI<br/>(Virtual ID zr~server~id)"] -->|"HTTP / WebSocket"| Intercept["Client Route Interceptor<br/>(Check Handshake Digest + Rewrite IDs)"]
-  Intercept -->|"Mismatch / Consent Off / Deny"| Fail["503 x-zen-remote: unbridged<br/>(Never hits local plugin)"]
-  Intercept -->|"POST /_dsh/zen-remote/relay/v1/plugin<br/>or WS Byte Tunnel"| Relay["Relay Server<br/>(Verify Share Table + Consent)"]
-  Relay -->|"127.0.0.1 Loopback + Operator Cookie"| Target["Target Plugin Route<br/>(Serving Machine)"]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/arch-bridge-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/arch-bridge-light.png">
+    <img src="docs/images/arch-bridge-light.png" alt="Plugin Bridge Protocol Request Flow" width="920">
+  </picture>
+</p>
 
 ### How It Works
 

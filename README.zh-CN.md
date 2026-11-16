@@ -26,16 +26,13 @@
 
 <p align="center"><a href="README.md">English</a></p>
 
-```mermaid
-flowchart LR
-  subgraph Mesh["节点端虚拟网络（零公网 IP）"]
-    A["节点 A<br/>（桌面端 / 服务器）"] <-->|"1. 局域网 / UDP 打洞直连<br/>（后台 60s 静默重探）"| B["节点 B<br/>（桌面端 / 服务器）"]
-    A -.->|"2. 1 秒无感加密中转兜底<br/>（X25519 + AES-256-GCM）"| GW["自建中继网关<br/>（gateway-server · Docker）"]
-    B -.->|"2. 纯密文盲转（网关不可读明文）<br/>+ 双口 UDP STUN"| GW
-  end
-  A -->|"双栖保留手机接入<br/>Caddy / Tunnel / 反代 / 局域网"| Phone["手机 / 浏览器 PWA<br/>（全量会话 + 锁屏推送）"]
-  Client["桌面客户端<br/>（最多连 8 台主机）"] -->|"点对点直连中继<br/>（8 位配对码）"| A
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/arch-mesh-zh-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/arch-mesh-zh-light.png">
+    <img src="docs/images/arch-mesh-zh-light.png" alt="dsh-zen-remote 节点虚拟组网与三角色架构" width="920">
+  </picture>
+</p>
 
 | 角色 | 适用场景 | 会话共享方向 | 手机 PWA 与锁屏推送 | 需要公网 IP？ |
 | --- | --- | --- | --- | --- |
@@ -307,13 +304,13 @@ dsh-zen-remote peer status         # 查看 nodeId、准入状态、网内设备
 
 第三方 DSH 插件若在会话页内渲染自定义面板并请求自己在 DSH `webServer` 上注册的路由，可通过**插件桥协议**在远程会话中透明读取**服务方机器**的数据——且**完全无需把 `dsh-zen-remote` 列为运行时依赖**。
 
-```mermaid
-flowchart LR
-  Browser["远程会话界面<br/>（虚拟 ID zr~server~id）"] -->|"HTTP / WebSocket"| Intercept["客户端改道拦截器<br/>（核对握手摘要 + 改写会话 ID）"]
-  Intercept -->|"未登记 / 版本或摘要不符 / 未授权"| Fail["503 x-zen-remote: unbridged<br/>（绝不回落本机插件）"]
-  Intercept -->|"POST /_dsh/zen-remote/relay/v1/plugin<br/>或 WS 字节隧道"| Relay["服务端中继校验<br/>（查共享表 + 整机同意开关）"]
-  Relay -->|"127.0.0.1 回环 + 宿主 Cookie"| Target["服务方目标插件路由"]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/arch-bridge-zh-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/arch-bridge-zh-light.png">
+    <img src="docs/images/arch-bridge-zh-light.png" alt="插件桥协议请求流转" width="920">
+  </picture>
+</p>
 
 ### 协议机制
 
