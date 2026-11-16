@@ -39,6 +39,11 @@ export interface PeerEnginePeerStatus {
     path: PeerMemberPath;
     rttMs: number | null;
     mounted: boolean;
+    /** T5：直连实测 RTT 的 EWMA（α=0.3，四舍五入）；从未测得为 null。
+     *  与 `rttMs` 口径不同——它只描述 UDP 链路质量，降级为中转后仍如实上报。 */
+    directRttMs: number | null;
+    /** T5：RTT 超上限被降级到中转（首样本被拒或直连中持续超标），恢复后回 false。 */
+    directDemoted: boolean;
 }
 export interface PeerEngineStatus {
     nodeId: string;
@@ -98,6 +103,13 @@ export interface PeerEngineOptions {
         clearTimeout(handle: unknown): void;
     };
     log?: (line: string) => void;
+    /** 透传给 mux 的逐请求噪声通道（T3）。 */
+    debug?: (line: string) => void;
+    /** T5：直连 RTT 上限（ms）的现场读法——每次判定都调用，非法值（非有限、
+     *  负数）按 0 处理；缺省视为 `() => 0`（不限制，保留旧行为）。上限大于
+     *  0 时 onDirectReady 不再立即切 UDP，等首个保活样本 ≤ 上限才升直连；
+     *  已直连的会话在「当前样本与 EWMA 双双超限」时才降级回中转。 */
+    directMaxRttMs?: () => number;
 }
 export interface PeerEngineLeaveResult {
     ok: true;

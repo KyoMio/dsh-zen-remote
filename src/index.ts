@@ -600,10 +600,29 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // every line below reaches the context logger exactly as before and the
   // ring besides, so the debug report (CU-2) can answer "what did the plugin
   // actually log" without a log file (the desktop app writes none).
-  const ring = createLogRing()
-  const pluginLog = createPluginLog(ring, ctx.logger as Parameters<typeof createPluginLog>[1])
+  // The log threshold (peer-resilience T2) is volatile: resolve it PER
+  // line so a settings flip applies without a row reload. A broken read
+  // degrades to 'info' — the ring's historic floor.
+  // ponytail: 1s memo — resolveConfig reads lan-gate.config.json synchronously,
+  // and this getter runs on every line (twice via createPluginLog), including
+  // dropped per-request debug lines. A flip still lands within a second.
+  let levelMemo: { at: number; level: 'debug' | 'info' | 'warn' } | undefined
+  const getLevel = (): 'debug' | 'info' | 'warn' => {
+    const now = Date.now()
+    if (levelMemo !== undefined && now - levelMemo.at < 1000) return levelMemo.level
+    let level: 'debug' | 'info' | 'warn' = 'info'
+    try {
+      level = resolveConfig(config, readFileConfig(), process.env).values.logLevel
+    } catch { /* keep 'info' */ }
+    levelMemo = { at: now, level }
+    return level
+  }
+  const ring = createLogRing(undefined, getLevel)
+  const pluginLog = createPluginLog(ring, ctx.logger as Parameters<typeof createPluginLog>[1], getLevel)
   const logWarn = pluginLog.warn
   const logInfo = pluginLog.info
+  // T3 routes per-request noise through this channel.
+  const logDebug = pluginLog.debug
   const effective = resolveConfig(config, readFileConfig(), process.env)
   // Lifecycle: the row came up. Role and both versions are the first things
   // an issue report needs.
@@ -1639,12 +1658,25 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           relayHandler: () => servingRelayHandler,
           relaySecret: () => servingRelaySecret ?? '',
           serverName: () => resolveConfig(config, readFileConfig(), process.env).values.serverName,
+          // T5: the direct-path RTT cap — a volatile field resolved per
+          // keepalive sample by the engine's own getter, so a config flip
+          // applies to the next sample without restarting the engine. A
+          // resolve failure degrades to 0 (uncapped), same as getLevel's
+          // fallback to 'info'.
+          directMaxRttMs: () => {
+            try {
+              return resolveConfig(config, readFileConfig(), process.env).values.peerDirectMaxRttMs
+            } catch {
+              return 0
+            }
+          },
           // STUN probing derives its ports from the gateway's authorized
           // welcome (`stun`, the real UDP bind results since PC-01a) and runs
           // on the punch socket; an old gateway without the field degrades to
           // `unknown`. Explicit `udpProbe` stays a controlled-caller override
           // and is intentionally NOT set here.
           log: (line) => { ring.push('info', 'peer: %s', line) },
+          debug: (line) => { ring.push('debug', 'peer: %s', line) },
         })
           } catch (error) {
             peerIdentityError = 'state-file-unreadable'
@@ -2120,6 +2152,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
         // frame — hand it to the summary sync so the sidebar row appears.
         onMintedVirtualIds: (ids) => { interceptHandle?.nudgeSummarySync(ids) },
         log: (format, ...args) => { logInfo(`dsh-zen-remote ${format}`, ...args) },
+        debug: (format, ...args) => { logDebug(`dsh-zen-remote ${format}`, ...args) },
       })
       pluginRouteHandle = handle
       wsCtx.effect(() => () => {

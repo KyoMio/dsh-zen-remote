@@ -106,6 +106,19 @@ export interface ZenRemoteConfig {
     /** The public origin the final verification reached (scheme + host +
      * optional port, root path only). Empty until verified. */
     ingressPublicUrl: string;
+    /** Logging threshold for BOTH the context logger path (createPluginLog)
+     * and the diagnostic ring (peer-resilience T2): `'debug'` keeps
+     * everything, `'info'` drops per-request detail lines, `'warn'` keeps
+     * warnings only. Volatile — the log-ring getter resolves it per line, so
+     * a flip applies without reloading the row; deliberately NOT in
+     * RESTART_FIELDS. */
+    logLevel: 'info' | 'debug' | 'warn';
+    /** Direct-path RTT cap in ms (peer-resilience T5): once the measured
+     * keepalive RTT exceeds it the member falls back to the gateway relay;
+     * `0` disables the cap (legacy behaviour — punch ready means direct).
+     * Integer [0, 10000]. Live-read by the engine's getter per sample;
+     * deliberately NOT in RESTART_FIELDS. */
+    peerDirectMaxRttMs: number;
 }
 /** Defaults, one per field — exactly what layer 4 hands back. */
 export declare const DEFAULTS: ZenRemoteConfig;
@@ -227,6 +240,8 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     ingressHttpsPort: z<any, any, "volatile">;
     ingressAcmeEmail: z<any, any, "volatile">;
     ingressPublicUrl: z<any, any, "volatile">;
+    logLevel: z<any, any, "volatile">;
+    peerDirectMaxRttMs: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;
@@ -260,6 +275,8 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     ingressHttpsPort: z<any, any, "volatile">;
     ingressAcmeEmail: z<any, any, "volatile">;
     ingressPublicUrl: z<any, any, "volatile">;
+    logLevel: z<any, any, "volatile">;
+    peerDirectMaxRttMs: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;

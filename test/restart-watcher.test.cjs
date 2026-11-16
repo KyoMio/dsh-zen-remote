@@ -54,7 +54,7 @@ test('restartKey is sensitive to exactly the restart-required fields', async () 
     // The live-read fields: changing any of these must NOT move the key.
     serverName: 'box', idleHours: 48, autoShareNewSessions: false,
     serverUrl: 'https://gw.example', deviceToken: 'tok',
-    turnFoldDesktop: true, maxUploadBytes: 1024,
+    turnFoldDesktop: true, maxUploadBytes: 1024, logLevel: 'info',
   }
   const baseline = restartKey(base)
 
@@ -66,6 +66,7 @@ test('restartKey is sensitive to exactly the restart-required fields', async () 
   assert.equal(restartKey({ ...base, deviceToken: 'tok2' }), baseline, 'deviceToken is live-read')
   assert.equal(restartKey({ ...base, turnFoldDesktop: false }), baseline, 'turnFoldDesktop is live-read')
   assert.equal(restartKey({ ...base, maxUploadBytes: 1 }), baseline, 'maxUploadBytes is live-read')
+  assert.equal(restartKey({ ...base, logLevel: 'debug' }), baseline, 'logLevel is live-read (T2)')
 
   // Every restart-required field moves the key.
   const flips = {

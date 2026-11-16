@@ -35,7 +35,7 @@ const {
   classifyPunchEndpoint,
 } = require('../lib/peer/punch.js')
 const { generatePeerIdentity, buildPeerHandshakeEnvelope } = require('../lib/peer/crypto.js')
-const { PeerFrameType } = require('../lib/peer/wire.js')
+const { PeerFrameType, decodeFrameHeader } = require('../lib/peer/wire.js')
 const { PeerArqSession } = require('../lib/peer/arq.js')
 
 const NET_ID = 'a1b2c3d4e5f60718'
@@ -1187,5 +1187,105 @@ test('PC-V1: incoming recovery handshake survives the local reprobe deadline', a
     b.close()
     assert.equal(clockA.pendingCount(), 0)
     assert.equal(clockB.pendingCount(), 0)
+  }
+})
+
+// -- T4: immediate PING, RTT samples, live interface refresh -------------------------
+
+test('T4: the responder gets an immediate onRttSample; every keepalive PONG samples again; a throwing callback is swallowed', async () => {
+  const aSamples = []
+  const bSamples = []
+  let aThrowOnce = true
+  const pair = await establishPair(
+    { onRttSample: (id, rtt) => {
+        if (aThrowOnce) { aThrowOnce = false; throw new Error('listener exploded') }
+        aSamples.push(rtt)
+      } },
+    { onRttSample: (id, rtt) => { bSamples.push(rtt) } },
+  )
+  try {
+    // B's immediate completeDirect PING → A's PONG: a sample inside the
+    // first RTT, no clock advance — the responder never had one before.
+    await withTimeout((async () => { while (bSamples.length === 0) await sleep(5) })(), 2000, 'B first RTT sample')
+    assert.ok(bSamples[0] >= 0)
+    // A's immediate PING can lose the race to B's cipher derivation
+    // (B decrypts only after A's HELLO-ACK lands) — its sample then
+    // arrives on a keepalive tick. The FIRST call to A's hook throws and
+    // is consumed silently; wait for it, then the next tick must land a
+    // real sample (state machine survived the listener bug). Two PINGs
+    // in flight would yield only ONE sample — advance, observe, advance.
+    pair.clockA.advance(5000)
+    await withTimeout((async () => { while (aThrowOnce) await sleep(5) })(), 2000, 'A first sample call arrived (and threw)')
+    pair.clockA.advance(5000)
+    await withTimeout((async () => { while (aSamples.length === 0) await sleep(5) })(), 2000, 'A sample after a throwing listener')
+    // One more keepalive cycle: every PONG produces exactly one sample.
+    pair.clockB.advance(5000)
+    await withTimeout((async () => { while (bSamples.length < 2) await sleep(5) })(), 2000, 'B second keepalive sample')
+    assert.ok(bSamples.every((rtt) => rtt >= 0))
+  } finally {
+    await closeManager({ mgr: pair.mgrA, socket: pair.sockA })
+    await closeManager({ mgr: pair.mgrB, socket: pair.sockB })
+  }
+})
+
+test('T4: one handshake sends exactly ONE immediate PING from each side', async () => {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const clockA = manualClock()
+  const clockB = manualClock()
+  const sockA = await openSocket('127.0.0.1')
+  const sockB = await openSocket('127.0.0.1')
+  const pingsSentByA = []
+  const pingsSentByB = []
+  const spy = (socket, sink) => {
+    const orig = socket.send.bind(socket)
+    socket.send = (buf, ...rest) => {
+      const header = decodeFrameHeader(buf)
+      if (header && header.frameType === PeerFrameType.PING) sink.push(buf)
+      return orig(buf, ...rest)
+    }
+  }
+  spy(sockA, pingsSentByA)
+  spy(sockB, pingsSentByB)
+  const readyA = defer()
+  const readyB = defer()
+  const mgrA = new PeerPunchManager({ networkId: NET_ID, identity: A, socket: sockA, clock: clockA, onDirectReady: readyA.resolve })
+  const mgrB = new PeerPunchManager({ networkId: NET_ID, identity: B, socket: sockB, clock: clockB, onDirectReady: readyB.resolve })
+  await mgrA.ready(); await mgrB.ready()
+  try {
+    mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
+    mgrA.beginPunch({ peerNodeId: B.nodeId, peerPublicKeyHex: B.publicKeyHex, lanEndpoints: [endpointOf(sockB)], reflexiveEndpoint: null })
+    await withTimeout(readyA.promise, 1000, 'A ready')
+    await withTimeout(readyB.promise, 1000, 'B ready')
+    await sleep(50) // let the in-flight immediate PINGs land
+    assert.equal(pingsSentByA.length, 1, `initiator sent exactly one immediate PING, got ${pingsSentByA.length}`)
+    assert.equal(pingsSentByB.length, 1, `responder sent exactly one immediate PING, got ${pingsSentByB.length}`)
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
+    await closeManager({ mgr: mgrB, socket: sockB })
+  }
+})
+
+test('T4: lanEndpoints() recomputes from live interfaces each call (injected interfaces)', async () => {
+  let ifaces = { en0: [{ address: '10.0.0.5', family: 'IPv4', internal: false }] }
+  const socket = await openSocket('127.0.0.1')
+  const mgr = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: generatePeerIdentity(),
+    socket,
+    clock: manualClock(),
+    interfaces: () => ifaces,
+  })
+  await mgr.ready()
+  try {
+    const port = socket.address().port
+    assert.deepEqual(mgr.lanEndpoints(), [`10.0.0.5:${port}`])
+    ifaces = {
+      en0: [{ address: '10.0.0.5', family: 'IPv4', internal: false }],
+      en9: [{ address: '192.168.31.9', family: 'IPv4', internal: false }],
+    }
+    assert.deepEqual(mgr.lanEndpoints(), [`10.0.0.5:${port}`, `192.168.31.9:${port}`], 'a hot-plugged NIC shows up without re-creating the manager')
+  } finally {
+    await closeManager({ mgr, socket })
   }
 })

@@ -360,10 +360,17 @@ export function renderPeerSection(t: CliTranslator, peer: ServerRow | null): str
   for (const row of peers) {
     const rttMs = row.rttMs
     const rtt = typeof rttMs === 'number' && Number.isFinite(rttMs) ? t('peer.status.rtt', { rttMs }) : '—'
+    // A demoted peer reads the plain relay path — with the measured direct
+    // RTT and the fact it crossed the configured cap (the cap itself lives
+    // in config, not the status body, so the line never invents a number).
+    const directRtt = typeof row.directRttMs === 'number' && Number.isFinite(row.directRttMs) ? row.directRttMs : undefined
+    const path = row.directDemoted === true && directRtt !== undefined
+      ? t('peer.path.relayDemoted', { rtt: String(directRtt) })
+      : peerPathLabelOf(t, row.path)
     lines.push(t('peer.status.deviceLine', {
       name: typeof row.name === 'string' ? row.name : '',
       nodeId: typeof row.nodeId === 'string' ? row.nodeId : '',
-      path: peerPathLabelOf(t, row.path),
+      path,
       rtt,
       mounted: row.mounted === true ? t('peer.mounted.yes') : t('peer.mounted.no'),
     }))

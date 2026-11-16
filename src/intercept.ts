@@ -4943,9 +4943,15 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * aborted (`aborted`), or the pairing wall came down while waiting —
    * `revoked`/`unpaired`, carried as their own verdict so the held stream can
    * die a terminal death instead of waiting out a pairing that will not
-   * return on its own (CP5).
+   * return on its own (CP5). MS-3 pool mode adds `swapped`: the serverId's
+   * pool entry now points at a DIFFERENT RelayClient (peer-left stopped the
+   * old one silently, peer-joined mounted a fresh one — the stopped client's
+   * `scheduleRetry` never fires, so it can never go `online` again), or one
+   * appeared where none was. The caller re-resolves the current client and
+   * decides what to wait on next; a serverId simply absent from the pool is
+   * NOT a verdict — the wait keeps listening for the re-add.
    */
-  type ServeWait = 'online' | 'aborted' | 'revoked' | 'unpaired'
+  type ServeWait = 'online' | 'aborted' | 'revoked' | 'unpaired' | 'swapped'
 
   /**
    * Resolve when the relay next serves (`online`), or the wait is cut — the
@@ -4955,11 +4961,61 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * The listener removes itself on every exit; a throwing relay listener loop
    * can never reach us (subscribe's contract keeps listener faults contained
    * on the client side).
+   *
+   * Pool mode (MS-3, peer-resilience T1): when `serverId` is given the wait
+   * also watches the pool-event hub — every verdict belongs to the serverId's
+   * CURRENT client, never to the object captured at stream-open time. A
+   * detached client (its entry is gone) keeps no state listener: its
+   * transitions could not legally reopen anyway.
    */
-  function waitForOnline(client: RelayClient, signal: AbortSignal | undefined): Promise<ServeWait> {
+  function waitForOnline(client: RelayClient, signal: AbortSignal | undefined, serverId?: string): Promise<ServeWait> {
     return new Promise<ServeWait>((resolve) => {
       if (signal?.aborted === true) {
         resolve('aborted')
+        return
+      }
+      if (pool !== undefined && serverId !== undefined) {
+        const current = pool.getByServerId(serverId)?.client
+        // The pool already serves this serverId through a different client —
+        // the wait's whole premise (this object is the leg) is stale.
+        if (current !== undefined && current !== client) {
+          resolve('swapped')
+          return
+        }
+        if (current === client && client.state === 'online') {
+          resolve('online')
+          return
+        }
+        if (current === client && (client.state === 'revoked' || client.state === 'unpaired')) {
+          resolve(client.state)
+          return
+        }
+        // current === client && non-online: the normal wait below.
+        // current === undefined: the serverId left the pool — keep waiting
+        // for a re-add without subscribing the detached client.
+        let settled = false
+        let off: (() => void) | undefined
+        let offPool: (() => void) | undefined
+        const settle = (verdict: ServeWait): void => {
+          if (settled) return
+          settled = true
+          off?.()
+          offPool?.()
+          signal?.removeEventListener('abort', onAbort)
+          resolve(verdict)
+        }
+        const onAbort = (): void => settle('aborted')
+        if (current === client) {
+          off = client.subscribe((state) => {
+            if (state === 'online') settle('online')
+            else if (state === 'revoked' || state === 'unpaired') settle(state)
+          })
+        }
+        offPool = watchPool(() => {
+          const now = pool.getByServerId(serverId)?.client
+          if (now !== undefined && now !== client) settle('swapped')
+        })
+        signal?.addEventListener('abort', onAbort, { once: true })
         return
       }
       if (client.state === 'online') {
@@ -5012,9 +5068,29 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * keeps contradicting an `online` state would otherwise spin the in-place
    * reopen in a hot microtask loop, so every retry costs at least the
    * current backoff step. `aborted` only on caller abort; `revoked` /
-   * `unpaired` when the pairing wall came down (CP5).
+   * `unpaired` when the pairing wall came down (CP5). Pool mode passes the
+   * target serverId so every state question is asked of the entry's CURRENT
+   * client — a swap or re-add surfaces as `swapped` for the caller to
+   * re-resolve, never as the stale object's own transition.
    */
-  async function waitServeAgain(client: RelayClient, signal: AbortSignal | undefined, backoffMs: number): Promise<ServeWait> {
+  async function waitServeAgain(client: RelayClient, signal: AbortSignal | undefined, backoffMs: number, serverId?: string): Promise<ServeWait> {
+    if (pool !== undefined && serverId !== undefined) {
+      const current = pool.getByServerId(serverId)?.client
+      if (current !== undefined && current !== client) return 'swapped'
+      if (current !== undefined) client = current
+      // current === undefined: the serverId left the pool — waitForOnline's
+      // pool branch holds until a re-add without subscribing the stale leg.
+      if (client.state === 'online' && current === client) {
+        await delayWait(signal, backoffMs)
+        if (signal?.aborted === true) return 'aborted'
+        const after = pool.getByServerId(serverId)?.client
+        if (after !== undefined && after !== client) return 'swapped'
+        if (after === undefined) return waitForOnline(client, signal, serverId)
+        if (client.state !== 'online') return waitForOnline(client, signal, serverId)
+        return 'online'
+      }
+      return waitForOnline(client, signal, serverId)
+    }
     if (client.state === 'online') {
       await delayWait(signal, backoffMs)
       if (signal?.aborted === true) return 'aborted'
@@ -5066,13 +5142,19 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    */
   async function* rewriteUpstream(
     endpoint: string,
-    client: RelayClient,
+    initialClient: RelayClient,
     upstream: AsyncIterable<unknown>,
     serverId: string,
     claimed: VirtualParts[],
     signal: AbortSignal | undefined,
-    reopen: () => AsyncIterable<unknown>,
+    reopen: (client: RelayClient) => AsyncIterable<unknown>,
   ): AsyncGenerator<unknown> {
+    // Pool mode (peer-resilience T1): the serving client is re-resolved from
+    // the pool by serverId after every wait — a peer-left/peer-joined swap
+    // installs a NEW RelayClient under the same serverId while the old one
+    // is stopped forever. `client` below always names the current leg; the
+    // single-server path never moves off the initial one.
+    let client = initialClient
     let first = true
     let current = upstream
     // The in-place reopen backoff (CP4, the merged pumps' discipline): starts
@@ -5169,7 +5251,16 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         if (!SESSION_STREAM_HOLD_ENDPOINTS.has(endpoint)) {
           throw new CodedStreamError(code, messageOf(error))
         }
-        const serve = await waitServeAgain(client, signal, reopenDelayMs)
+        let serve = await waitServeAgain(client, signal, reopenDelayMs, serverId)
+        while (serve === 'swapped') {
+          // The pool answered for this serverId with a DIFFERENT client
+          // (peer-left/peer-joined) — re-resolve and wait on the new leg.
+          // A bare absence kept waiting inside waitForOnline and only lands
+          // here once a client exists again.
+          const next = pool?.getByServerId(serverId)?.client ?? client
+          client = next
+          serve = await waitServeAgain(client, signal, reopenDelayMs, serverId)
+        }
         if (serve === 'aborted') return
         // The pairing wall came down while held (CP5): no ladder climbs back
         // from `revoked`/`unpaired` — only the settings page can — so the
@@ -5186,7 +5277,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         }
         if (callerAborted()) return
         if (!first) return // the accepted-generation clean end the UI retries
-        current = reopen()
+        current = reopen(client)
         reopenDelayMs = Math.min(reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
       }
     }
@@ -5996,8 +6087,8 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // the endpoints OUTSIDE the list end with the original code at once,
     // their consumers rendering a clean end as a terminal (CP5,
     // SESSION_STREAM_HOLD_ENDPOINTS).
-    const held = rewriteUpstream(endpoint, client, upstream, serverId, virtuals, signal, () =>
-      client.openStream(namespace, method, clone, signal),
+    const held = rewriteUpstream(endpoint, client, upstream, serverId, virtuals, signal, (serving) =>
+      serving.openStream(namespace, method, clone, signal),
     )
     // P55-2: a remote session/follow is recorded the instant the wrap is
     // reached (before any frame, before any browser report) — the first

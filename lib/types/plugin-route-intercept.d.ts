@@ -181,6 +181,9 @@ export interface InstallPluginRouteInterceptOptions {
     loopbackSecret?: string;
     /** Progress logging, wired to the context logger by index.ts. */
     log?: (format: string, ...args: unknown[]) => void;
+    /** Per-request forwards lines (T3): volume is one line per request, so
+     * they ride the debug channel and only surface at logLevel=debug. */
+    debug?: (format: string, ...args: unknown[]) => void;
 }
 export interface PluginRouteInterceptHandle {
     /** Restore `match` — ONLY while the instance still holds our wrapper

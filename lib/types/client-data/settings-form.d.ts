@@ -356,6 +356,11 @@ export interface PeerStatusDeviceView {
     mounted: boolean;
     path: PeerDevicePathView;
     rttMs: number | null;
+    /** The smoothed UDP measurement while a peer is (or was) direct-ready —
+     *  null before the first sample. Rides the demoted note. */
+    directRttMs: number | null;
+    /** The engine demoted this peer to relay for exceeding the RTT cap. */
+    directDemoted: boolean;
 }
 /** The device row's path word (the wizard module's `PeerDevicePath`). */
 export type PeerDevicePathView = 'lan' | 'p2p' | 'relay' | 'mismatch' | 'offline';
@@ -700,7 +705,7 @@ export declare function boolField(field: string): SettingsFieldSpec;
  */
 export declare function consentField(field: string): SettingsFieldSpec;
 /** Names of the row fields the settings page edits, in group order. */
-export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushEnabled' | 'pushSessionName' | 'pushDebounceMs' | 'lang' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'pluginBridgeConsent';
+export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushEnabled' | 'pushSessionName' | 'pushDebounceMs' | 'lang' | 'logLevel' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'pluginBridgeConsent' | 'peerDirectMaxRttMs';
 /** Longest legal `serverName`, mirroring src/config.ts's cap. */
 export declare const SERVER_NAME_MAX = 40;
 /** Upper bound of `idleHours`, mirroring src/config.ts. */
@@ -821,6 +826,7 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
     pushSessionName: SettingsFieldState;
     pushDebounceMs: SettingsFieldState;
     lang: SettingsFieldState;
+    logLevel: SettingsFieldState;
     serverName: SettingsFieldState;
     idleHours: SettingsFieldState;
     autoShareNewSessions: SettingsFieldState;
@@ -828,6 +834,8 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
      * 插件桥 toggles stage the next map wholesale — but its `invalid` flag
      * (a malformed draft) still gates the save like any field's. */
     pluginBridgeConsent: SettingsFieldState;
+    /** The peer card's direct-RTT cap (ms, 0 = no cap); rendered only on a peer page. */
+    peerDirectMaxRttMs: SettingsFieldState;
     deviceToken: SettingsSecretFieldState;
     /** A restart-required field ({@link RESTART_FIELDS}) has a staged change a
      * save would actually write: the save will move the row and the host

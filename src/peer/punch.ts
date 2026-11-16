@@ -450,6 +450,11 @@ export interface PeerPunchOptions {
   onDirectReady?: (peerNodeId: string, info: DirectReadyInfo) => void
   onPunchFallback?: (peerNodeId: string) => void
   onDirectLost?: (peerNodeId: string) => void
+  /** Each measured PING→PONG round trip, including the immediate handshake
+   *  PING sent from `completeDirect` (T4/T5: engine RTT policy samples). */
+  onRttSample?: (peerNodeId: string, rttMs: number) => void
+  /** NIC enumeration, injectable for tests; production reads the OS live. */
+  interfaces?: () => Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>
   /** Opened application frames from the peer (PING/PONG stay internal). */
   onEncryptedFrame?: (header: PeerFrameHeader, plaintext: Uint8Array, rinfo: PunchRemoteInfo) => void
 }
@@ -495,7 +500,7 @@ export class PeerPunchManager {
   private readonly identity: PeerIdentityKeyPair
   private readonly socket: DgramSocket
   private readonly ownsSocket: boolean
-  private readonly localIps: string[]
+  private readonly readInterfaces: () => Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>
   private readonly sessions = new Map<string, PunchSession>()
   private lanEndpointList: string[] = []
   private closed = false
@@ -517,7 +522,8 @@ export class PeerPunchManager {
     knob(options.keepAliveMs, 5000, 'keepAliveMs')
     knob(options.keepAliveLostFrames, 3, 'keepAliveLostFrames')
     this.clock = options.clock ?? realClock
-    this.localIps = collectLocalIps()
+    this.readInterfaces = options.interfaces
+      ?? (() => os.networkInterfaces() as unknown as Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>)
 
     if (options.socket) {
       this.socket = options.socket
@@ -558,8 +564,19 @@ export class PeerPunchManager {
     return this.readyPromise
   }
 
-  /** This machine's non-loopback IPv4 addresses with our bound port. */
+  /** This machine's non-loopback IPv4 addresses with our bound port,
+   *  enumerated LIVE each call (T4): a hot-plugged NIC is a punch
+   *  candidate on the very next query. Falls back to the last known
+   *  list while the socket has no bound port. */
   lanEndpoints(): string[] {
+    try {
+      const port = this.socket.address().port
+      if (port > 0) {
+        this.lanEndpointList = collectLanEndpoints(this.readInterfaces(), port)
+      }
+    } catch {
+      // Socket between close calls — answer the last known list.
+    }
     return [...this.lanEndpointList]
   }
 
@@ -713,10 +730,7 @@ export class PeerPunchManager {
   }
 
   private refreshLanEndpoints(port: number): void {
-    this.lanEndpointList = collectLanEndpoints(
-      os.networkInterfaces() as unknown as Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>,
-      port,
-    )
+    this.lanEndpointList = collectLanEndpoints(this.readInterfaces(), port)
   }
 
   private startPunchRounds(session: PunchSession): void {
@@ -912,14 +926,8 @@ export class PeerPunchManager {
     }
     if (!this.integratePeerEphemeral(session, parsed.ephPubHex, rinfo)) return
     session.awaitingAck = false
-    // Immediately send an encrypted PING so the responder confirms round-trip
-    // (us → peer HELLO, peer → us ACK, us → peer sealed PING) in 0.5 RTT.
-    try {
-      session.lastPingSentAt = this.clock.now()
-      this.sendEncryptedTo(session, PeerFrameType.PING, 0, randomBytes(8), 0)
-    } catch {
-      // Transient send failure; keepalive will retry.
-    }
+    // completeDirect (reached via integratePeerEphemeral above) sends the
+    // one immediate PING — nothing more here or a handshake emits two.
   }
 
   /**
@@ -967,11 +975,22 @@ export class PeerPunchManager {
     this.startKeepalive(session)
     const endpoint = session.endpoint ?? ''
     this.options.onDirectReady?.(session.peerNodeId, {
-      mode: classifyPunchEndpoint(endpoint, this.localIps),
+      // NICs change under a running process — classify against a LIVE
+      // read, not the constructor's snapshot (T4).
+      mode: classifyPunchEndpoint(endpoint, collectLocalIps(this.readInterfaces())),
       endpoint,
       rttMs: session.rttMs ?? 0,
       ciphers,
     })
+    // Both directions complete here (initiator via onHelloAck, responder
+    // via onOpenedFrame) — ONE immediate encrypted PING measures the
+    // session RTT inside the first round trip, no keepalive wait (T4).
+    try {
+      session.lastPingSentAt = this.clock.now()
+      this.sendEncryptedTo(session, PeerFrameType.PING, 0, randomBytes(8), 0)
+    } catch {
+      // Transient send failure; keepalive retries.
+    }
   }
 
   private onOpenedFrame(
@@ -1005,6 +1024,11 @@ export class PeerPunchManager {
       if (session.lastPingSentAt !== null) {
         session.rttMs = Math.max(0, this.clock.now() - session.lastPingSentAt)
         session.lastPingSentAt = null
+        try {
+          this.options.onRttSample?.(session.peerNodeId, session.rttMs)
+        } catch {
+          // A listener bug must never wound the state machine.
+        }
       }
       return
     }
@@ -1045,9 +1069,11 @@ export class PeerPunchManager {
   }
 }
 
-function collectLocalIps(): string[] {
+function collectLocalIps(
+  interfaces: Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>,
+): string[] {
   const ips: string[] = []
-  for (const list of Object.values(os.networkInterfaces())) {
+  for (const list of Object.values(interfaces)) {
     for (const entry of list ?? []) {
       if (isIPv4Family(entry.family) && !entry.internal) ips.push(entry.address)
     }

@@ -327,13 +327,16 @@ test('PB-4: a virtual id on a bridged route forwards through the relay and strea
   const relay = await startFakeRelay()
   const registry = createBridgeRegistry()
   registry.register(DECLARED)
+  const logs = []
+  const debugs = []
   const handle = installPluginRouteIntercept({
     webServer: host.raw,
     registry,
     relay: fakeRelayClient(relay.__port),
     getServerId: () => SERVER_ID,
     getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
-    log: () => {},
+    log: (format, ...args) => logs.push([format, ...args]),
+    debug: (format, ...args) => debugs.push([format, ...args]),
   })
   try {
     const res = await host.get(`/panel/stream?sessionId=${encodeURIComponent(VIRTUAL)}`, { headers: { accept: 'application/x-ndjson' } })
@@ -354,6 +357,10 @@ test('PB-4: a virtual id on a bridged route forwards through the relay and strea
     assert.equal(diag.installed, true)
     assert.equal(diag.forwarded, 1)
     assert.equal(diag.refused, 0)
+
+    // T3: the per-request forwards line rides the debug channel, not log.
+    assert.ok(debugs.some(([format]) => format === 'plugin route %s forwards for %s'), 'forwards line on debug')
+    assert.ok(!logs.some(([format]) => format === 'plugin route %s forwards for %s'), 'forwards line left info')
   } finally {
     handle.uninstall()
     await relay.stop()
@@ -469,6 +476,8 @@ test('PB-5-fix: a LOCAL session request logs NOTHING; only forwards and refusals
     getServerId: () => SERVER_ID,
     getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
     log: (format, ...args) => logLines.push(`${format} ${args.join(' ')}`),
+    // T3: forwards ride the debug channel — counted here too.
+    debug: (format, ...args) => logLines.push(`${format} ${args.join(' ')}`),
   })
   try {
     // The local panel's own polling shape: declared route, local id, over

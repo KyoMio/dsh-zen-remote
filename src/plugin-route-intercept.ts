@@ -405,6 +405,9 @@ export interface InstallPluginRouteInterceptOptions {
   loopbackSecret?: string
   /** Progress logging, wired to the context logger by index.ts. */
   log?: (format: string, ...args: unknown[]) => void
+  /** Per-request forwards lines (T3): volume is one line per request, so
+   * they ride the debug channel and only surface at logLevel=debug. */
+  debug?: (format: string, ...args: unknown[]) => void
 }
 
 export interface PluginRouteInterceptHandle {
@@ -506,7 +509,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       },
     }
   }
-  const { webServer, registry, log } = options
+  const { webServer, registry, log, debug } = options
   const adapters = options.adapters ?? []
   const getCurrentSession = options.getCurrentSession
   const getKnownRealIds = options.getKnownRealIds
@@ -777,7 +780,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       // polling its route every second must not log a line a second — the
       // bridge only speaks when a request actually leaves for the relay (or
       // is refused below, which answerUnbridged logs).
-      log?.('plugin route %s forwards for %s', declared.path, declared.plugin)
+      debug?.('plugin route %s forwards for %s', declared.path, declared.plugin)
       // The session id rides the CHECKED parse, restored to its ORIGINAL
       // form, re-serialized once — what was judged is what is forwarded.
       searchParams.set(declared.locator.name, parts.id)
@@ -1103,7 +1106,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // a prefix route's full matched path, never the declared base.
         const rewrite = rewriteAdapterRequest(declared.view, pathname, searchParams, bodyGiven ? parsedBody : undefined, verdict.hits, (virtualId) => fromVirtual(virtualId)!.id)
         forwarded += 1
-        log?.('plugin route %s forwards for %s', rewrite.pathname, plugin)
+        debug?.('plugin route %s forwards for %s', rewrite.pathname, plugin)
         controller = new AbortController()
         const forwardSignal = AbortSignal.any([controller.signal, bodyAbort.signal])
         const accept = typeof req.headers.accept === 'string' ? req.headers.accept : undefined

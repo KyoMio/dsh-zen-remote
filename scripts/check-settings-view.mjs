@@ -283,7 +283,7 @@ await test('derivePeerStatusView parses the peer/status body: configured, gatewa
     gatewayOrigin: 'http://10.0.0.1:4088',
     maxPeers: 8,
     peers: [
-      { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 },
+      { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3, directRttMs: 3, directDemoted: false },
       { nodeId: 'cccc3333', name: '换了钥的机器', mounted: false, path: 'mismatch', rttMs: null },
       'garbage',
       null,
@@ -296,8 +296,8 @@ await test('derivePeerStatusView parses the peer/status body: configured, gatewa
   assert.equal(view.gatewayOrigin, 'http://10.0.0.1:4088')
   assert.equal(view.maxPeers, 8)
   assert.equal(view.peers.length, 2, 'junk rows drop whole')
-  assert.deepEqual(view.peers[0], { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3 })
-  assert.deepEqual(view.peers[1], { nodeId: 'cccc3333', name: '换了钥的机器', mounted: false, path: 'mismatch', rttMs: null })
+  assert.deepEqual(view.peers[0], { nodeId: 'aaaa1111', name: '书房电脑', mounted: true, path: 'lan', rttMs: 3, directRttMs: 3, directDemoted: false })
+  assert.deepEqual(view.peers[1], { nodeId: 'cccc3333', name: '换了钥的机器', mounted: false, path: 'mismatch', rttMs: null, directRttMs: null, directDemoted: false })
 })
 
 await test('derivePeerStatusView degrades tolerantly: junk bodies, unknown states, missing numbers', () => {
@@ -428,6 +428,11 @@ await test('PAS-6b: revokedNotice survives cleared peerNetwork on settings view 
   assert.equal(settingsSrc.includes('CLIENT_PEER_DISMISS_REVOKED_ROUTE'), true)
   assert.equal(settingsSrc.includes('wizard.peer.revokedBanner'), true)
   assert.equal(settingsSrc.includes('wizard.peer.gatewayEmail'), true)
+  // T6: the log-level select and the direct-RTT cap box are rendered, and the
+  // demoted-relay copy rides with them.
+  assert.equal(settingsSrc.includes('settings.fieldLogLevel'), true, 'the settings page renders the logLevel select')
+  assert.equal(settingsSrc.includes('settings.fieldPeerDirectMaxRttMs'), true, 'the peer card renders the direct-RTT cap field')
+  assert.equal(settingsSrc.includes('wizard.peer.devicePathRelayDemoted'), true, 'a demoted peer shows the "over the cap" note')
   assert.equal(wizardSrc.includes('CLIENT_PEER_DISMISS_REVOKED_ROUTE'), true)
   assert.equal(wizardSrc.includes('wizard.peer.revokedBanner'), true)
   assert.equal(wizardSrc.includes('wizard.peer.gatewayEmail'), true)

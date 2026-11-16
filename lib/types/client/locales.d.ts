@@ -128,6 +128,11 @@ export declare const zh: {
     readonly 'settings.langAuto': "自动（auto）";
     readonly 'settings.langZh': "中文（zh）";
     readonly 'settings.langEn': "English（en）";
+    readonly 'settings.fieldLogLevel': "日志级别";
+    readonly 'settings.fieldLogLevelHint': "控制写入诊断日志环的明细量。默认信息级记录生命周期与警告；仅警告只记警告；调试另记逐请求明细。";
+    readonly 'settings.logLevelInfo': "信息（默认）";
+    readonly 'settings.logLevelDebug': "调试（含逐请求明细）";
+    readonly 'settings.logLevelWarn': "仅警告";
     readonly 'settings.invalidNonNegativeInt': "需要不小于 0 的整数";
     readonly 'settings.pushTestLabel': "测试推送";
     readonly 'settings.pushTestRun': "发送测试推送";
@@ -633,6 +638,7 @@ export declare const zh: {
     readonly 'wizard.peer.devicePathLan': "局域网直连";
     readonly 'wizard.peer.devicePathP2p': "直连";
     readonly 'wizard.peer.devicePathRelay': "经网关中转";
+    readonly 'wizard.peer.devicePathRelayDemoted': "经网关中转（直连 {rtt}ms，超过上限 {cap}ms）";
     readonly 'wizard.peer.devicePathOffline': "离线";
     readonly 'wizard.peer.devicePathMismatch': "身份异常";
     readonly 'wizard.peer.deviceRtt': "延迟 {ms} ms";
@@ -650,6 +656,9 @@ export declare const zh: {
     readonly 'settings.peer.title': "网络与设备互通";
     readonly 'settings.peer.subtitle': "作为节点端与其他电脑互挂会话；下方保留手机 / 浏览器接入的配置";
     readonly 'settings.peer.notConfigured': "尚未加入设备网络——可直接在下方粘贴邀请链接或输入中继网关地址（由网关侧手动审批）加入";
+    readonly 'settings.fieldPeerDirectMaxRttMs': "直连延迟上限（毫秒）";
+    readonly 'settings.fieldPeerDirectMaxRttMsHint': "UDP 直连实测延迟超过该值时自动走网关中转，降至上限七成后回切直连。默认 300；0 表示不设上限（始终直连）。0–10000。";
+    readonly 'settings.invalidRtt': "需要 0–10000 的整数（0 = 不限制）";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

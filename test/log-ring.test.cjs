@@ -112,3 +112,84 @@ test('createPluginLog survives a logger-free fake context and a method-less logg
   const log2 = createPluginLog(createLogRing(), {})
   log2.info('no methods')
 })
+
+// -- logLevel threshold (peer-resilience T2) ------------------------------------
+// One threshold gates BOTH sinks: the ring drops below-threshold entries on
+// push, and createPluginLog's three channels only reach the logger when the
+// live-read level allows. warn always survives.
+
+test('threshold info drops debug lines, keeps info and warn', () => {
+  const ring = createLogRing(10, () => 'info')
+  ring.push('debug', 'mux: inbound request %s', 'x')
+  ring.push('info', 'kept')
+  ring.push('warn', 'also kept')
+  assert.deepEqual(ring.snapshot().map((e) => e.msg), ['kept', 'also kept'])
+})
+
+test('threshold warn keeps only warn; threshold debug keeps everything', () => {
+  const ring = createLogRing(10, () => 'warn')
+  ring.push('debug', 'd')
+  ring.push('info', 'i')
+  ring.push('warn', 'w')
+  assert.deepEqual(ring.snapshot().map((e) => e.msg), ['w'])
+  const all = createLogRing(10, () => 'debug')
+  all.push('debug', 'd')
+  all.push('info', 'i')
+  all.push('warn', 'w')
+  assert.deepEqual(all.snapshot().map((e) => e.msg), ['d', 'i', 'w'])
+})
+
+test('the level is read live per push — a changed getter gates the next line', () => {
+  let level = 'info'
+  const ring = createLogRing(10, () => level)
+  ring.push('debug', 'dropped')
+  level = 'debug'
+  ring.push('debug', 'kept')
+  level = 'warn'
+  ring.push('info', 'dropped too')
+  ring.push('warn', 'still here')
+  assert.deepEqual(ring.snapshot().map((e) => e.msg), ['kept', 'still here'])
+})
+
+test('a missing, throwing or illegal getter falls back to info', () => {
+  const ring = createLogRing(10) // no getter: info threshold
+  ring.push('debug', 'd')
+  ring.push('info', 'i')
+  assert.deepEqual(ring.snapshot().map((e) => e.msg), ['i'])
+  const bad = createLogRing(10, () => { throw new Error('config broke') })
+  bad.push('debug', 'd')
+  bad.push('warn', 'w')
+  assert.deepEqual(bad.snapshot().map((e) => e.msg), ['w'])
+  const weird = createLogRing(10, () => 'bogus')
+  weird.push('debug', 'd')
+  weird.push('info', 'i')
+  assert.deepEqual(weird.snapshot().map((e) => e.msg), ['i'])
+})
+
+test('createPluginLog debug channel writes logger.debug and the ring, all under the threshold', () => {
+  let level = 'info'
+  // The real wiring shares ONE getter between the ring and the writer.
+  const ring = createLogRing(10, () => level)
+  const seen = []
+  const log = createPluginLog(ring, {
+    debug: (...args) => seen.push(['debug', ...args]),
+    info: (...args) => seen.push(['info', ...args]),
+    warn: (...args) => seen.push(['warn', ...args]),
+  }, () => level)
+  log.debug('mux: inbound request')
+  assert.deepEqual(seen, [], 'info threshold silences the debug channel entirely')
+  assert.equal(ring.snapshot().length, 0)
+  level = 'debug'
+  log.debug('mux: inbound request %s', 'GET /x')
+  log.info('lifecycle')
+  assert.deepEqual(seen, [
+    ['debug', 'mux: inbound request %s', 'GET /x'],
+    ['info', 'lifecycle'],
+  ])
+  assert.deepEqual(ring.snapshot().map((e) => e.level), ['debug', 'info'])
+  level = 'warn'
+  log.info('silenced')
+  log.warn('loud')
+  assert.deepEqual(seen.slice(-1), [['warn', 'loud']])
+  assert.equal(ring.snapshot().at(-1).msg, 'loud')
+})

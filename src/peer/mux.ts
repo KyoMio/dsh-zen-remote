@@ -152,6 +152,9 @@ export interface PeerMuxOptions {
   /** 会话有效路径变化时回调（engine 由此发 path-report）。 */
   onPathChanged?: (nodeId: string, path: PeerPath) => void
   log?: (line: string) => void
+  /** 逐请求噪声通道（T3）：inbound request / body 生命周期行量太大，
+   * 走它而不是 `log`，由 logLevel=debug 时才落环。 */
+  debug?: (line: string) => void
 }
 
 export interface MuxClock {
@@ -760,7 +763,7 @@ export class PeerMux {
       }
       stream.inboundMetaDone = true
       stream.inboundMetaBuf = Buffer.alloc(0)
-      this.options.log?.(`mux: inbound request ${meta.m} ${meta.p} from ${session.nodeId} on stream ${stream.streamId}`)
+      this.options.debug?.(`mux: inbound request ${meta.m} ${meta.p} from ${session.nodeId} on stream ${stream.streamId}`)
       this.materializeInboundRequest(session, stream, meta)
       if (remainder.length > 0 && stream.req !== null) {
         stream.req.push(Buffer.from(remainder))
@@ -896,8 +899,8 @@ export class PeerMux {
       }
     })
 
-    req.on('end', () => this.options.log?.(`mux: inbound req body ended for ${session.nodeId} stream ${stream.streamId}`))
-    req.on('error', (e) => this.options.log?.(`mux: inbound req error ${String(e)}`))
+    req.on('end', () => this.options.debug?.(`mux: inbound req body ended for ${session.nodeId} stream ${stream.streamId}`))
+    req.on('error', (e) => this.options.debug?.(`mux: inbound req error ${String(e)}`))
     const handler = this.options.relayHandler()
     if (handler === undefined) {
       // 服务半边未挂载（无 webServer 的组合）：如实应答并收尾。

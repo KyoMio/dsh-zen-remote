@@ -324,11 +324,13 @@ function peerStateCopyOf(state: string, t: SectionT, deniedReason?: string): str
 function PeerDeviceRow(props: {
   device: PeerStatusDeviceView
   busy: boolean
+  /** The displayed direct-RTT cap (the field's draft text), for the demoted note. */
+  cap: string
   onToggle: (mounted: boolean) => void
   onTrust: () => void
   t: SectionT
 }): ReactNode {
-  const { device, busy, onToggle, onTrust, t } = props
+  const { device, busy, cap, onToggle, onTrust, t } = props
   const usable = device.path === 'lan' || device.path === 'p2p' || device.path === 'relay'
   return (
     <div className="zr-settings-device">
@@ -339,7 +341,11 @@ function PeerDeviceRow(props: {
           data-live={usable ? 'true' : undefined}
           data-invalid={device.path === 'mismatch' ? 'true' : undefined}
         >
-          {peerDevicePathCopyOf(device.path, t)}
+          {/* A demoted peer names the measured RTT and the cap it crossed
+              (T6); without a measurement the plain relay copy stands. */}
+          {device.directDemoted && device.directRttMs !== null
+            ? t('wizard.peer.devicePathRelayDemoted', { rtt: String(device.directRttMs), cap })
+            : peerDevicePathCopyOf(device.path, t)}
         </span>
         {usable && device.rttMs !== null ? (
           <span className="zr-settings-badge">{t('wizard.peer.deviceRtt', { ms: String(device.rttMs) })}</span>
@@ -1424,6 +1430,9 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
               {select(form.lang, 'lang', t('settings.fieldLang'), t('settings.fieldLangHint'), ['auto', 'zh', 'en'], (option) => (
                 option === 'auto' ? t('settings.langAuto') : option === 'zh' ? t('settings.langZh') : t('settings.langEn')
               ))}
+              {select(form.logLevel, 'logLevel', t('settings.fieldLogLevel'), t('settings.fieldLogLevelHint'), ['info', 'debug', 'warn'], (option) => (
+                option === 'debug' ? t('settings.logLevelDebug') : option === 'warn' ? t('settings.logLevelWarn') : t('settings.logLevelInfo')
+              ))}
 
               <h3 className="zr-settings-card-title">{t('settings.shareTitle')}</h3>
               {text(form.idleHours, 'idleHours', t('settings.fieldIdleHours'), t('settings.fieldIdleHoursHint'), t('settings.invalidHours'), true)}
@@ -1565,6 +1574,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                     <PeerDeviceRow
                       key={device.nodeId}
                       device={device}
+                      cap={form.peerDirectMaxRttMs.text}
                       busy={peerBusyNode !== null}
                       onToggle={(mounted) => { void runPeerNodeAction(CLIENT_PEER_TOGGLE_MOUNT_ROUTE, device.nodeId, { nodeId: device.nodeId, mounted }) }}
                       onTrust={() => { void runPeerNodeAction(CLIENT_PEER_TRUST_ROUTE, device.nodeId, { nodeId: device.nodeId }) }}
@@ -1590,6 +1600,10 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   </Button>
                 </div>
               </div>
+
+              {/* T6: the direct-RTT cap — the same staged-field path as the
+                  first card's fields, just rendered inside the mesh card. */}
+              {text(form.peerDirectMaxRttMs, 'peerDirectMaxRttMs', t('settings.fieldPeerDirectMaxRttMs'), t('settings.fieldPeerDirectMaxRttMsHint'), t('settings.invalidRtt'), true)}
             </>
           )}
 

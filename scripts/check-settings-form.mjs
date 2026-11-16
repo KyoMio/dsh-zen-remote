@@ -70,18 +70,18 @@ const GATEWAY = {
 
 const VALUES = {
   role: 'host', port: 4000, host: '0.0.0.0', trustedProxies: '', rateLimit: 60,
-  vapidSubject: 'mailto:admin@example.net', lang: 'zh', pushSummary: true,
+  vapidSubject: 'mailto:admin@example.net', lang: 'zh', logLevel: 'debug', pushSummary: true,
   pushTurnEnd: false, pushTool: true, pushEnabled: true, pushSessionName: false,
   pushDebounceMs: 5000, serverName: 'studio',
-  idleHours: 24, autoShareNewSessions: false,
+  idleHours: 24, autoShareNewSessions: false, peerDirectMaxRttMs: 0,
 }
 
 const SOURCES = {
   role: 'row', port: 'file', host: 'row', trustedProxies: 'default', rateLimit: 'env',
-  vapidSubject: 'row', lang: 'default', pushSummary: 'row', pushTurnEnd: 'default',
+  vapidSubject: 'row', lang: 'default', logLevel: 'env', pushSummary: 'row', pushTurnEnd: 'default',
   pushTool: 'env', pushEnabled: 'default', pushSessionName: 'row',
   pushDebounceMs: 'row', serverName: 'row', idleHours: 'default',
-  autoShareNewSessions: 'default',
+  autoShareNewSessions: 'default', peerDirectMaxRttMs: 'row',
 }
 
 const STATUS = {
@@ -130,6 +130,13 @@ assert.equal(view.fields.pushEnabled.locked, false)
 assert.equal(view.fields.pushSessionName.value, false)
 assert.equal(view.fields.pushSessionName.source, 'row')
 assert.equal(view.fields.pushSessionName.savedRowInvalid, false, 'the row layer IS the winner for pushSessionName')
+// T6: the two peer-resilience knobs ride the same field pipeline.
+assert.equal(view.fields.logLevel.value, 'debug', 'logLevel is a first-class settings field')
+assert.equal(view.fields.logLevel.source, 'env')
+assert.equal(view.fields.logLevel.locked, true, 'an env-supplied logLevel locks the control')
+assert.equal(view.fields.peerDirectMaxRttMs.value, 0, 'peerDirectMaxRttMs is a first-class settings field')
+assert.equal(view.fields.peerDirectMaxRttMs.source, 'row')
+assert.equal(view.fields.peerDirectMaxRttMs.locked, false)
 
 // Devices and the pairing code are read from the NESTED gateway payload.
 assert.deepEqual(view.devices.map((d) => [d.id, d.role, d.kind, d.hasPush]), [
@@ -334,6 +341,32 @@ test('validation: out-of-range drafts block the save instead of being dropped', 
 
   form.stage('rateLimit', '0')
   assert.equal(form.getSnapshot().rateLimit.invalid, true, 'rateLimit is a positive integer')
+
+  // T6: logLevel only accepts its three words; peerDirectMaxRttMs is the
+  // 0..10000 integer band the engine caps at (SPEC: 0 = no limit).
+  form.stage('logLevel', 'trace')
+  assert.equal(form.getSnapshot().logLevel.invalid, true, 'logLevel accepts info | debug | warn only')
+  form.stage('peerDirectMaxRttMs', '-1')
+  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, true, 'the RTT cap is 0 or a positive integer')
+  form.stage('peerDirectMaxRttMs', '10001')
+  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, true, 'the RTT cap tops out at 10000 ms')
+  form.stage('peerDirectMaxRttMs', '1.5')
+  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, true, 'the RTT cap is a whole number')
+  form.stage('peerDirectMaxRttMs', '0')
+  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, false, '0 is legal — it is the documented "no cap"')
+  form.stage('peerDirectMaxRttMs', '300')
+  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, false)
+  form.stage('peerDirectMaxRttMs', '')
+  assert.equal(form.getSnapshot().peerDirectMaxRttMs.invalid, false, 'an empty draft stages as a clear, not an invalid value')
+
+  // A junk effective value formats back to the first option — 'info' must
+  // lead options[0] for oneOfField's fallback. (A junk STORED value never
+  // reaches format: resolveConfig rejects it and the field either shows the
+  // next layer's value or, flagged savedRowInvalid, the raw text.)
+  const junk = fakeScope()
+  const junkForm = new ZenRemoteSettingsForm(junk.scope)
+  junkForm.setBaseline({ ...VALUES, logLevel: 'noise' })
+  assert.equal(junkForm.getSnapshot().logLevel.text, 'info', 'a non-option effective value falls back to info')
 })
 
 test('an empty draft plans an unset for a field the user layer carries', async () => {
@@ -371,6 +404,9 @@ test('a legal draft plans a set; a draft equal to the current value plans nothin
   form.stage('pushSummary', 'true')
   form.stage('lang', 'zh')
   form.stage('role', 'client')
+  // T6: both new fields take the same save path as every other staged field.
+  form.stage('logLevel', 'warn')
+  form.stage('peerDirectMaxRttMs', '450')
   assert.equal(form.canSave(), true)
 
   form.stage('host', '127.0.0.1') // equals the display baseline: no phantom override
@@ -380,6 +416,8 @@ test('a legal draft plans a set; a draft equal to the current value plans nothin
   const ops = state.mutateCalls[0].ops.sort((a, b) => a.path[0].localeCompare(b.path[0]))
   assert.deepEqual(ops, [
     { op: 'set', path: ['lang'], value: 'zh' },
+    { op: 'set', path: ['logLevel'], value: 'warn' },
+    { op: 'set', path: ['peerDirectMaxRttMs'], value: 450 },
     { op: 'set', path: ['port'], value: 4001 },
     { op: 'set', path: ['pushSummary'], value: true },
     { op: 'set', path: ['role'], value: 'client' },
@@ -1253,4 +1291,25 @@ test('PAS-6a: CLIENT_PEER_DISMISS_REVOKED_ROUTE & derivePeerStatusView revokedNo
     const view = derivePeerStatusView({ configured: false, revokedNotice: junkNotice, peers: [] })
     assert.equal(view.revokedNotice, undefined)
   }
+})
+
+test('T6: derivePeerStatusView carries directRttMs/directDemoted, junk reads conservative', () => {
+  const view = derivePeerStatusView({
+    configured: true,
+    peers: [
+      { nodeId: 'aaaa1111', name: '慢直连', mounted: true, path: 'relay', rttMs: null, directRttMs: 3454, directDemoted: true },
+      { nodeId: 'bbbb2222', name: '旧端', mounted: true, path: 'lan', rttMs: 3 },
+      { nodeId: 'cccc3333', name: '怪行', mounted: false, path: 'relay', rttMs: null, directRttMs: 'fast', directDemoted: 1 },
+      { nodeId: 'dddd4444', name: '负延迟', mounted: false, path: 'lan', rttMs: 1, directRttMs: -9 },
+    ],
+  })
+  const [demoted, old, odd, neg] = view.peers
+  assert.equal(demoted.directDemoted, true)
+  assert.equal(demoted.directRttMs, 3454, 'the measured direct RTT rides through for the demoted note')
+  assert.equal(demoted.rttMs, null, 'a demoted peer reports no relay RTT — path/rttMs口径不变')
+  assert.equal(old.directDemoted, false, 'an older body without the flag reads as not demoted')
+  assert.equal(old.directRttMs, null, 'an older body without the measurement reads as unmeasured')
+  assert.equal(odd.directDemoted, false, 'a non-boolean flag never reads as demoted')
+  assert.equal(odd.directRttMs, null, 'a non-finite measurement reads as unmeasured')
+  assert.equal(neg.directRttMs, null, 'a negative measurement reads as unmeasured (非负口径)')
 })
