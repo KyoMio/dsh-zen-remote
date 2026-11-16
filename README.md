@@ -272,9 +272,14 @@ Remote access is toggled per session (or automatically for new sessions when `au
 
 Shared sessions auto-close remote access after **48 hours** (`idleHours`) of inactivity (running or waiting sessions never sleep). Unshared or revoked sessions disappear from remote sidebars automatically, and any currently open tab displays a *"remote closed"* banner until re-enabled.
 
-| Enable from sidebar menu | Toggle on mobile info card | Remote-closed banner |
-| --- | --- | --- |
-| ![Enable remote from sidebar](docs/images/host-share-menu.png) | <img src="docs/images/mobile-info-remote.png" alt="Mobile info remote switch" width="240"> | ![Remote closed banner](docs/images/client-remote-closed.png) |
+| Enable from sidebar menu | Remote-closed banner |
+| --- | --- |
+| ![Enable remote from sidebar](docs/images/host-share-menu.png) | ![Remote closed banner](docs/images/client-remote-closed.png) |
+
+<p align="center">
+  <img src="docs/images/mobile-info-remote.png" alt="Remote access toggle inside the phone session info card" width="280"><br>
+  <sub>Remote access toggle inside the phone session info card (<code>ⓘ</code>)</sub>
+</p>
 
 ### Supported Official DSH Interfaces
 
