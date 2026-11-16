@@ -272,9 +272,14 @@ dsh-zen-remote peer status         # 查看 nodeId、准入状态、网内设备
 
 开启远程的会话连续 **48 小时**（`idleHours` 可调）无回合活动后会自动休眠关闭（运行中或等待审批/回答的会话不休眠）。关闭或吊销后，侧边栏会自动隐藏该会话，已打开标签页显示「远程已关闭」横幅并在恢复共享后自动重连。
 
-| 从侧边栏开启远程 | 手机信息卡快捷开关 | 远程已关闭横幅 |
-| --- | --- | --- |
-| ![侧边栏开启远程](docs/images/host-share-menu.png) | <img src="docs/images/mobile-info-remote.png" alt="手机信息卡远程开关" width="240"> | ![远程已关闭横幅](docs/images/client-remote-closed.png) |
+| 从侧边栏开启远程 | 远程已关闭横幅 |
+| --- | --- |
+| ![侧边栏开启远程](docs/images/host-share-menu.png) | ![远程已关闭横幅](docs/images/client-remote-closed.png) |
+
+<p align="center">
+  <img src="docs/images/mobile-info-remote.png" alt="手机会话信息卡片里的「远程访问」开关" width="280"><br>
+  <sub>手机端会话信息卡（<code>ⓘ</code>）内的「远程访问」快捷开关</sub>
+</p>
 
 ### 已接入的 DSH 官方接口一览
 
