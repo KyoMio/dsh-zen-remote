@@ -251,18 +251,166 @@ export interface PeerConnRow {
   latency: string;
 }
 
-/** 两设备间的全部路径观测（每个方向各一条自报，两条都算事实） */
-function linksBetween(links: readonly TopologyLink[], a: string, b: string): TopologyLink[] {
-  return links.filter(
+/** 双向归并连接状态（概览、设备表行与设备详情三处共用唯一真值） */
+export type PairLinkState = 'lan' | 'direct' | 'relay' | 'blocked' | 'unknown' | 'not-connected';
+
+export type PairNotConnectedReason =
+  | 'other-paused'
+  | 'self-paused'
+  | 'both-offline'
+  | 'self-offline'
+  | 'other-offline'
+  | 'idle';
+
+export interface ResolvedPairLink {
+  state: PairLinkState;
+  blockedBy?: 'mismatch' | 'node';
+  notConnectedReason?: PairNotConnectedReason;
+  /** 仅双端均上报 lan/p2p 时保留两方向有效 RTT；中转/阻断/未连接为空 */
+  rttMsValues: readonly (number | null)[];
+  /** 中转态下取双侧观测到的最大有限非负速率 */
+  relayKbps: number;
+}
+
+/**
+ * 双向连接归并唯一真值（SPEC §5.8）：
+ * 1. mismatch / paused / !online 成员门禁优先于链路观测；
+ * 2. 双方均 authorized && online 时，任一方 blocked → blocked（最高优先）；
+ * 3. 仅当 A→B 与 B→A 两条观测均存在且均属 {'lan','direct'} 时才算直连
+ *    （双 lan → lan，否则 → direct，延迟取双方向实测）；
+ * 4. 任一方向为 relay，或仅单侧上报 lan/direct（过渡态）→ relay（延迟强制 —）；
+ * 5. 仅含 unknown 路径 → unknown；无链路 → not-connected('idle')。
+ */
+export function resolvePairLink(
+  self: TopologyMemberRow,
+  other: TopologyMemberRow,
+  links: readonly TopologyLink[],
+): ResolvedPairLink {
+  if (self.status === 'mismatch' || other.status === 'mismatch') {
+    return { state: 'blocked', blockedBy: 'mismatch', rttMsValues: [], relayKbps: 0 };
+  }
+  if (other.status === 'paused') {
+    return { state: 'not-connected', notConnectedReason: 'other-paused', rttMsValues: [], relayKbps: 0 };
+  }
+  if (self.status === 'paused') {
+    return { state: 'not-connected', notConnectedReason: 'self-paused', rttMsValues: [], relayKbps: 0 };
+  }
+  if (!self.online && !other.online) {
+    return { state: 'not-connected', notConnectedReason: 'both-offline', rttMsValues: [], relayKbps: 0 };
+  }
+  if (!self.online) {
+    return { state: 'not-connected', notConnectedReason: 'self-offline', rttMsValues: [], relayKbps: 0 };
+  }
+  if (!other.online) {
+    return { state: 'not-connected', notConnectedReason: 'other-offline', rttMsValues: [], relayKbps: 0 };
+  }
+  if (self.status !== 'authorized' || other.status !== 'authorized') {
+    return { state: 'not-connected', notConnectedReason: 'idle', rttMsValues: [], relayKbps: 0 };
+  }
+
+  const ab = links.find((l) => l.srcNodeId === self.nodeId && l.peerNodeId === other.nodeId);
+  const ba = links.find((l) => l.srcNodeId === other.nodeId && l.peerNodeId === self.nodeId);
+  if (ab === undefined && ba === undefined) {
+    return { state: 'not-connected', notConnectedReason: 'idle', rttMsValues: [], relayKbps: 0 };
+  }
+
+  const kindA = ab !== undefined ? classifyLinkPath(ab.path) : null;
+  const kindB = ba !== undefined ? classifyLinkPath(ba.path) : null;
+
+  if (kindA === 'blocked' || kindB === 'blocked') {
+    return { state: 'blocked', blockedBy: 'node', rttMsValues: [], relayKbps: 0 };
+  }
+
+  const isDirectKind = (k: LinkKind | null): boolean => k === 'lan' || k === 'direct';
+  if (ab !== undefined && ba !== undefined && isDirectKind(kindA) && isDirectKind(kindB)) {
+    return {
+      state: kindA === 'lan' && kindB === 'lan' ? 'lan' : 'direct',
+      rttMsValues: [ab.rttMs, ba.rttMs],
+      relayKbps: 0,
+    };
+  }
+
+  if (kindA === 'relay' || kindB === 'relay' || isDirectKind(kindA) || isDirectKind(kindB)) {
+    const kbpsA = ab !== undefined && Number.isFinite(ab.liveRelayKbps) && ab.liveRelayKbps > 0 ? ab.liveRelayKbps : 0;
+    const kbpsB = ba !== undefined && Number.isFinite(ba.liveRelayKbps) && ba.liveRelayKbps > 0 ? ba.liveRelayKbps : 0;
+    return {
+      state: 'relay',
+      rttMsValues: [],
+      relayKbps: Math.max(kbpsA, kbpsB),
+    };
+  }
+
+  return { state: 'unknown', rttMsValues: [], relayKbps: 0 };
+}
+
+function hasAnyLinkBetween(links: readonly TopologyLink[], a: string, b: string): boolean {
+  return links.some(
     (l) => (l.srcNodeId === a && l.peerNodeId === b) || (l.srcNodeId === b && l.peerNodeId === a),
   );
 }
 
+/** 概览第 3 格统计：对占席位在线/观测到的无序设备对按双向口径统计 total 与 direct */
+export function summarizeNetworkPairs(
+  members: readonly TopologyMemberRow[],
+  links: readonly TopologyLink[],
+): { total: number; direct: number } {
+  let total = 0;
+  let direct = 0;
+  for (let i = 0; i < members.length; i += 1) {
+    for (let j = i + 1; j < members.length; j += 1) {
+      const a = members[i]!;
+      const b = members[j]!;
+      if (a.nodeId === b.nodeId) continue;
+      if (!hasAnyLinkBetween(links, a.nodeId, b.nodeId)) continue;
+      const resolved = resolvePairLink(a, b, links);
+      if (resolved.state === 'not-connected') continue;
+      total += 1;
+      if (resolved.state === 'lan' || resolved.state === 'direct') {
+        direct += 1;
+      }
+    }
+  }
+  return { total, direct };
+}
+
+/** 设备列表行连接汇总：仅在线 authorized 成员统计 direct / relay / blocked 与双向直连延迟 */
+export function summarizeMemberConnections(
+  member: TopologyMemberRow,
+  allMembers: readonly TopologyMemberRow[],
+  links: readonly TopologyLink[],
+): { direct: number; relay: number; blocked: number; latency: string } {
+  if (member.status !== 'authorized' || !member.online) {
+    return { direct: 0, relay: 0, blocked: 0, latency: '—' };
+  }
+  let direct = 0;
+  let relay = 0;
+  let blocked = 0;
+  const directRttValues: (number | null)[] = [];
+  for (const other of allMembers) {
+    if (other.nodeId === member.nodeId) continue;
+    if (!hasAnyLinkBetween(links, member.nodeId, other.nodeId)) continue;
+    const resolved = resolvePairLink(member, other, links);
+    if (resolved.state === 'lan' || resolved.state === 'direct') {
+      direct += 1;
+      directRttValues.push(...resolved.rttMsValues);
+    } else if (resolved.state === 'relay') {
+      relay += 1;
+    } else if (resolved.state === 'blocked') {
+      blocked += 1;
+    }
+  }
+  return {
+    direct,
+    relay,
+    blocked,
+    latency: formatLatencyRange(directRttValues),
+  };
+}
+
 /**
  * 固定原因文案表（对齐 ui-ux-spec §3.5）：身份异常阻断最优先，其次对方暂停 /
- * 本机暂停 / 离线，再才是链路观测（节点本机阻断 / 局域网 / 直连 / 中转 /
- * 未知路径），最后是空闲未连接。判序即语义：有链路但任一方离线时仍显示
- * 「设备当前离线」。
+ * 本机暂停 / 离线，再才是双向归并的链路观测（节点本机阻断 / 局域网 / 直连 /
+ * 中转 / 未知路径），最后是空闲未连接。
  */
 export function derivePeerConnRow(
   t: TranslateFn,
@@ -277,63 +425,55 @@ export function derivePeerConnRow(
     latency: '—',
   });
 
-  if (self.status === 'mismatch' || other.status === 'mismatch') {
-    return { dot: 'danger', kindWord: t('device.blocked'), reason: t('device.reasonMismatchBlocked'), latency: '—' };
-  }
-  if (other.status === 'paused') {
-    return notConnected(t('device.reasonPeerPaused'));
-  }
-  if (self.status === 'paused') {
-    return notConnected(t('device.blockedReasonPaused'));
-  }
-  if (!self.online && !other.online) {
-    return notConnected(t('device.notConnectedBothOffline'));
-  }
-  if (!self.online) {
-    return notConnected(t('device.notConnectedSelfOffline'));
-  }
-  if (!other.online) {
-    return notConnected(t('device.notConnectedOffline'));
-  }
-
-  const pairLinks = linksBetween(links, self.nodeId, other.nodeId);
-  // 任一方向自报 blocked（节点本机 TOFU 阻断，双方在网关侧仍是正常成员）就按
-  // 阻断呈现——单向 blocked + 反向正常不能被「优选直连」合并掩盖。阻断路径没有
-  // 测速，延迟一律未知：不用反向链路或旧 last RTT 冒充当前阻断延迟。
-  if (pairLinks.some((l) => classifyLinkPath(l.path) === 'blocked')) {
-    return { dot: 'danger', kindWord: t('device.blocked'), reason: t('device.reasonNodeBlocked'), latency: '—' };
-  }
-  const link =
-    pairLinks.find((l) => classifyLinkPath(l.path) === 'lan') ??
-    pairLinks.find((l) => classifyLinkPath(l.path) === 'direct') ??
-    pairLinks.find((l) => classifyLinkPath(l.path) === 'relay') ??
-    pairLinks.find((l) => classifyLinkPath(l.path) === 'unknown');
-  if (link !== undefined) {
-    if (classifyLinkPath(link.path) === 'unknown') {
-      // 白名单外的自报：如实显示「未知」，不伪装成任何已知连接方式
-      return { dot: 'muted', kindWord: t('path.unknown'), reason: t('device.reasonUnknownPath'), latency: '—' };
-    }
-    const latency = formatLatencyRange([link.rttMs]);
-    switch (classifyLinkPath(link.path)) {
-      case 'lan':
-        return { dot: 'ok', kindWord: t('path.lan'), reason: t('device.reasonLan'), latency };
-      case 'direct':
-        return { dot: 'ok', kindWord: t('path.direct'), reason: t('device.reasonDirect'), latency };
-      case 'relay': {
-        const rate = formatRate(link.liveRelayKbps);
-        const reason =
-          self.natType === 'symmetric'
-            ? t('device.reasonRelaySelf', { rate })
-            : other.natType === 'symmetric'
-              ? t('device.reasonRelayPeer', { rate })
-              : t('device.reasonRelay', { rate });
-        return { dot: 'warn', kindWord: t('path.relay'), reason, latency };
+  const resolved = resolvePairLink(self, other, links);
+  switch (resolved.state) {
+    case 'blocked':
+      return {
+        dot: 'danger',
+        kindWord: t('device.blocked'),
+        reason: resolved.blockedBy === 'mismatch' ? t('device.reasonMismatchBlocked') : t('device.reasonNodeBlocked'),
+        latency: '—',
+      };
+    case 'not-connected':
+      switch (resolved.notConnectedReason) {
+        case 'other-paused':
+          return notConnected(t('device.reasonPeerPaused'));
+        case 'self-paused':
+          return notConnected(t('device.blockedReasonPaused'));
+        case 'both-offline':
+          return notConnected(t('device.notConnectedBothOffline'));
+        case 'self-offline':
+          return notConnected(t('device.notConnectedSelfOffline'));
+        case 'other-offline':
+          return notConnected(t('device.notConnectedOffline'));
+        default:
+          return notConnected(t('device.notConnectedIdle'));
       }
-      case 'blocked':
-      case 'unknown':
-        // blocked 已在上面统一返回，这两个分支只为穷尽联合类型的兜底（不可达）
-        return { dot: 'muted', kindWord: t('path.unknown'), reason: t('device.reasonUnknownPath'), latency: '—' };
+    case 'lan':
+      return {
+        dot: 'ok',
+        kindWord: t('path.lan'),
+        reason: t('device.reasonLan'),
+        latency: formatLatencyRange(resolved.rttMsValues),
+      };
+    case 'direct':
+      return {
+        dot: 'ok',
+        kindWord: t('path.direct'),
+        reason: t('device.reasonDirect'),
+        latency: formatLatencyRange(resolved.rttMsValues),
+      };
+    case 'relay': {
+      const rate = formatRate(resolved.relayKbps);
+      const reason =
+        self.natType === 'symmetric'
+          ? t('device.reasonRelaySelf', { rate })
+          : other.natType === 'symmetric'
+            ? t('device.reasonRelayPeer', { rate })
+            : t('device.reasonRelay', { rate });
+      return { dot: 'warn', kindWord: t('path.relay'), reason, latency: '—' };
     }
+    case 'unknown':
+      return { dot: 'muted', kindWord: t('path.unknown'), reason: t('device.reasonUnknownPath'), latency: '—' };
   }
-  return notConnected(t('device.notConnectedIdle'));
 }

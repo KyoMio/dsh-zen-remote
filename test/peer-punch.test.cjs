@@ -1443,3 +1443,165 @@ test('T4: lanEndpoints() recomputes from live interfaces each call (injected int
     await closeManager({ mgr, socket })
   }
 })
+
+test('T3: completeDirect immediate PING loss does not trigger onPingUnanswered; subsequent periodic misses count', async () => {
+  const unanswered = []
+  const env = await craftedPair({
+    onPingUnanswered: (id) => unanswered.push(id),
+  })
+  const { B, clockA, mgrA, mgrB, sockB, frameOf, rinfoB, lastPingPayload } = env
+  try {
+    // Immediate PING from completeDirect was sent, but B never replies with PONG.
+    assert.ok(env.aPings.length >= 1)
+    await closeManager({ mgr: mgrB, socket: sockB })
+
+    // First keepalive tick (+5000): immediate PING was unanswered, MUST NOT count as a miss!
+    clockA.advance(5_000)
+    assert.deepEqual(unanswered, [], 'dropped immediate PING must not count toward missedPings')
+
+    // Refresh loss clock so we stay within 15s deadline while testing two periodic misses.
+    mgrA.handlePacket(frameOf(PeerFrameType.PING, randomBytes(8)), rinfoB)
+    clockA.advance(5_000) // periodic PING #1 unanswered -> miss #1
+    assert.deepEqual(unanswered, [B.nodeId])
+    mgrA.handlePacket(frameOf(PeerFrameType.PING, randomBytes(8)), rinfoB)
+    clockA.advance(5_000) // periodic PING #2 unanswered -> miss #2
+    assert.deepEqual(unanswered, [B.nodeId, B.nodeId])
+
+    // Confirm lastPingPayload echoes periodic PING #2 properly.
+    assert.equal(lastPingPayload().length, 8)
+  } finally {
+    await closeManager({ mgr: mgrA, socket: env.sockA })
+  }
+})
+
+test('T3: direct state onHello retries bounded challenge HELLOs when first reply HELLO drops', async () => {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const clockA = manualClock()
+  const clockB = manualClock()
+  const sockA = await openSocket('127.0.0.1')
+  const sockB = await openSocket('127.0.0.1')
+  let dropNextHelloFromB = false
+  const origSendB = sockB.send.bind(sockB)
+  sockB.send = (buf, ...rest) => {
+    if (dropNextHelloFromB && buf[0] === 123) {
+      try {
+        const parsed = JSON.parse(buf.toString('utf8'))
+        if (parsed.kind === 'zr-hello') {
+          dropNextHelloFromB = false
+          return
+        }
+      } catch { /* ignore */ }
+    }
+    return origSendB(buf, ...rest)
+  }
+  const readyA = defer()
+  const readyB = defer()
+  const dataAtA = []
+  const mgrA = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: A,
+    socket: sockA,
+    clock: clockA,
+    onDirectReady: () => readyA.resolve(),
+    onEncryptedFrame: (_h, p) => dataAtA.push(Buffer.from(p).toString('utf8')),
+  })
+  const mgrB = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: B,
+    socket: sockB,
+    clock: clockB,
+    onDirectReady: () => readyB.resolve(),
+  })
+  await mgrA.ready()
+  await mgrB.ready()
+  try {
+    mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
+    mgrA.beginPunch({ peerNodeId: B.nodeId, peerPublicKeyHex: B.publicKeyHex, lanEndpoints: [endpointOf(sockB)], reflexiveEndpoint: null })
+    await withTimeout(readyA.promise, 1000, 'A direct ready')
+    await withTimeout(readyB.promise, 1000, 'B direct ready')
+
+    // Simulate A restarting its punch manager with a new ephemeral key while B is still in 'direct' state.
+    const oldBCipherTx = mgrB.sessionCiphers(A.nodeId).txKeyHex
+    const sockA2 = await openSocket('127.0.0.1')
+    const mgrA2 = new PeerPunchManager({
+      networkId: NET_ID,
+      identity: A,
+      socket: sockA2,
+      clock: clockA,
+      punchIntervalMs: 1000, // pause A2's own HELLO rounds long enough to test B's 100ms challenge retry
+      punchRounds: 1,
+      punchWindowMs: 2000,
+      onEncryptedFrame: (_h, p) => dataAtA.push(Buffer.from(p).toString('utf8')),
+    })
+    await mgrA2.ready()
+    try {
+      // Drop the very first challenge HELLO B sends in direct state; B must retry at +100ms.
+      dropNextHelloFromB = true
+      mgrA2.beginPunch({ peerNodeId: B.nodeId, peerPublicKeyHex: B.publicKeyHex, lanEndpoints: [endpointOf(sockB)], reflexiveEndpoint: null })
+      await sleep(30)
+      clockB.advance(100) // B's bounded 100ms challenge retry fires!
+      await withTimeout((async () => {
+        while (mgrB.sessionCiphers(A.nodeId)?.txKeyHex === oldBCipherTx) await sleep(10)
+      })(), 1000, 'B rotated ciphers via direct-state HELLO retry')
+      await sleep(30)
+      mgrB.frameSenderFor(A.nodeId)(PeerFrameType.DATA, 9, Buffer.from('after-retry'), 0)
+      await withTimeout((async () => {
+        while (!dataAtA.includes('after-retry')) await sleep(10)
+      })(), 1000, 'A2 decrypted frame after key convergence')
+    } finally {
+      await closeManager({ mgr: mgrA2, socket: sockA2 })
+    }
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
+    await closeManager({ mgr: mgrB, socket: sockB })
+  }
+})
+
+test('T3: beginPunch while punching merges new candidates without rotating keys and peerState reports live state', async () => {
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const clockA = manualClock()
+  const sockA = await openSocket('127.0.0.1')
+  const sockB = await openSocket('127.0.0.1')
+  const sentHellos = []
+  const origSendA = sockA.send.bind(sockA)
+  sockA.send = (buf, port, host, ...rest) => {
+    if (buf[0] === 123) {
+      const parsed = JSON.parse(buf.toString('utf8'))
+      if (parsed.kind === 'zr-hello') sentHellos.push({ port, nonce: parsed.nonce, eph: parsed.ephPubHex })
+    }
+    return origSendA(buf, port, host, ...rest)
+  }
+  const mgrA = new PeerPunchManager({ networkId: NET_ID, identity: A, socket: sockA, clock: clockA })
+  await mgrA.ready()
+  try {
+    assert.equal(mgrA.peerState(B.nodeId), null)
+    const deadSock = await openSocket('127.0.0.1')
+    const deadPort = deadSock.address().port
+    deadSock.close()
+    await waitClose(deadSock)
+
+    mgrA.beginPunch({ peerNodeId: B.nodeId, peerPublicKeyHex: B.publicKeyHex, lanEndpoints: [`127.0.0.1:${deadPort}`], reflexiveEndpoint: null })
+    assert.equal(mgrA.peerState(B.nodeId)?.state, 'punching')
+    const firstHello = sentHellos[0]
+    assert.equal(firstHello.port, deadPort)
+
+    // Additive STUN enrichment while punching: must keep same nonce/eph and immediately HELLO the added port.
+    mgrA.beginPunch({
+      peerNodeId: B.nodeId,
+      peerPublicKeyHex: B.publicKeyHex,
+      lanEndpoints: [`127.0.0.1:${deadPort}`],
+      reflexiveEndpoint: endpointOf(sockB),
+    })
+    assert.equal(mgrA.peerState(B.nodeId)?.state, 'punching')
+    const addedHello = sentHellos.find(h => h.port === sockB.address().port)
+    assert.ok(addedHello, 'added candidate receives immediate HELLO')
+    assert.equal(addedHello.nonce, firstHello.nonce, 'nonce preserved while punching')
+    assert.equal(addedHello.eph, firstHello.eph, 'ephemeral key preserved while punching')
+  } finally {
+    await closeManager({ mgr: mgrA, socket: sockA })
+    sockB.close()
+    await waitClose(sockB)
+  }
+})

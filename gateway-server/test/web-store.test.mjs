@@ -33,6 +33,9 @@ import {
   maskInviteUri,
   memberStatusView,
   quotaUsageLevel,
+  resolvePairLink,
+  summarizeMemberConnections,
+  summarizeNetworkPairs,
 } from '../dist/web/format.js';
 import { PeerRateLimiter } from '../dist/peer-hub/rate-limiter.js';
 import { copyTextToClipboard } from '../dist/web/clipboard.js';
@@ -804,28 +807,53 @@ describe('format：设备间连接行 derivePeerConnRow', () => {
     assert.equal(derivePeerConnRow(tZh, selfOffline, otherOffline, []).reason, '双方设备当前均离线');
   });
 
-  test('局域网直连 → ok / 局域网直连 / 在同一个局域网内 / 真实延迟；反向登记的链路同样算数', () => {
+  test('双向局域网直连 → ok / 局域网直连 / 双向延迟区间；单侧直连过渡态 → 经网关中转 / —', () => {
     const self = makeMember('self', 'authorized');
     const other = makeMember('other', 'authorized');
     const forward = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 12, liveRelayKbps: 0 };
-    const expected = { dot: 'ok', kindWord: '局域网直连', reason: '在同一个局域网内', latency: '12 ms' };
-    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(forward)), expected);
-    const backward = { srcNodeId: 'other', peerNodeId: 'self', path: 'lan', rttMs: 12, liveRelayKbps: 0 };
-    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(backward)), expected);
+    const backward = { srcNodeId: 'other', peerNodeId: 'self', path: 'lan', rttMs: 18, liveRelayKbps: 0 };
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(forward, backward)), {
+      dot: 'ok',
+      kindWord: '局域网直连',
+      reason: '在同一个局域网内',
+      latency: '12–18 ms',
+    });
+    // 仅单侧上报 lan（对侧未报或报 relay）→ 过渡态统一归中转且延迟强制 —
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(forward)), {
+      dot: 'warn',
+      kindWord: '经网关中转',
+      reason: '这台设备/对方网络不支持直连，已自动中转 · 0 KB/s',
+      latency: '—',
+    });
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(backward)), {
+      dot: 'warn',
+      kindWord: '经网关中转',
+      reason: '这台设备/对方网络不支持直连，已自动中转 · 0 KB/s',
+      latency: '—',
+    });
   });
 
-  test('直连 → ok / 直连 / 已打通直连，不经过网关', () => {
+  test('双向直连 → ok / 直连 / 已打通直连，不经过网关（含一侧 lan + 一侧 p2p）', () => {
     const self = makeMember('self', 'authorized');
     const other = makeMember('other', 'authorized');
     for (const path of ['p2p', 'direct']) {
-      const link = { srcNodeId: 'self', peerNodeId: 'other', path, rttMs: 5, liveRelayKbps: 0 };
-      assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(link)), {
+      const fwd = { srcNodeId: 'self', peerNodeId: 'other', path, rttMs: 5, liveRelayKbps: 0 };
+      const bwd = { srcNodeId: 'other', peerNodeId: 'self', path, rttMs: 9, liveRelayKbps: 0 };
+      assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(fwd, bwd)), {
         dot: 'ok',
         kindWord: '直连',
         reason: '已打通直连，不经过网关',
-        latency: '5 ms',
+        latency: '5–9 ms',
       });
     }
+    const lanFwd = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 4, liveRelayKbps: 0 };
+    const p2pBwd = { srcNodeId: 'other', peerNodeId: 'self', path: 'p2p', rttMs: 11, liveRelayKbps: 0 };
+    assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(lanFwd, p2pBwd)), {
+      dot: 'ok',
+      kindWord: '直连',
+      reason: '已打通直连，不经过网关',
+      latency: '4–11 ms',
+    });
   });
 
   test('中转按对称型网络区分原因：本机对称 / 对方对称 / 普通中转', () => {
@@ -998,16 +1026,18 @@ describe('PC-16b：derivePeerConnRow 阻断与未知路径', () => {
   test('正常呈现保持：lan 实测 0 显示 0 ms，relay（rttMs null）显示 —，负延迟视作未知', () => {
     const self = makeMember('self', 'authorized');
     const other = makeMember('other', 'authorized');
-    const lan0 = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 0, liveRelayKbps: 0 };
-    const rowLan = derivePeerConnRow(tZh, self, other, linksOf(lan0));
+    const lan0A = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: 0, liveRelayKbps: 0 };
+    const lan0B = { srcNodeId: 'other', peerNodeId: 'self', path: 'lan', rttMs: 0, liveRelayKbps: 0 };
+    const rowLan = derivePeerConnRow(tZh, self, other, linksOf(lan0A, lan0B));
     assert.deepEqual(rowLan, { dot: 'ok', kindWord: '局域网直连', reason: '在同一个局域网内', latency: '0 ms' });
     const relayNull = { srcNodeId: 'self', peerNodeId: 'other', path: 'relay', rttMs: null, liveRelayKbps: 8 };
     const rowRelay = derivePeerConnRow(tZh, self, other, linksOf(relayNull));
     assert.equal(rowRelay.dot, 'warn');
     assert.equal(rowRelay.kindWord, '经网关中转');
     assert.equal(rowRelay.latency, '—');
-    const junkRtt = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: -3, liveRelayKbps: 0 };
-    assert.equal(derivePeerConnRow(tZh, self, other, linksOf(junkRtt)).latency, '—', '契约外 junk 值按未知处理，不当 0');
+    const junkRttA = { srcNodeId: 'self', peerNodeId: 'other', path: 'lan', rttMs: -3, liveRelayKbps: 0 };
+    const junkRttB = { srcNodeId: 'other', peerNodeId: 'self', path: 'lan', rttMs: -1, liveRelayKbps: 0 };
+    assert.equal(derivePeerConnRow(tZh, self, other, linksOf(junkRttA, junkRttB)).latency, '—', '契约外 junk 值按未知处理，不当 0');
   });
 });
 
@@ -2563,5 +2593,113 @@ describe('PAS-2：加入方式收敛为两项与 manual 无口令格式化', () 
     const manualUri = 'zr-net://gw.local:19393/0123456789abcdef';
     assert.equal(maskInviteUri(manualUri), manualUri);
     assert.equal(buildHeadlessJoinCommand(manualUri), `dsh-zen-remote setup --role peer --invite "${manualUri}"`);
+  });
+});
+
+describe('T5：双向直连归并（resolvePairLink / summarizeNetworkPairs / summarizeMemberConnections）', () => {
+  test('resolvePairLink：一侧直连 + 对侧中转/未报 → relay 且延迟清空；blocked 最高优先', () => {
+    const a = makeMember('aaaa', 'authorized');
+    const b = makeMember('bbbb', 'authorized');
+
+    const oneSided = resolvePairLink(a, b, [{ srcNodeId: 'aaaa', peerNodeId: 'bbbb', path: 'lan', rttMs: 5, liveRelayKbps: 12 }]);
+    assert.equal(oneSided.state, 'relay');
+    assert.deepEqual(oneSided.rttMsValues, []);
+    assert.equal(oneSided.relayKbps, 12);
+
+    const asymmetric = resolvePairLink(a, b, [
+      { srcNodeId: 'aaaa', peerNodeId: 'bbbb', path: 'p2p', rttMs: 30, liveRelayKbps: 0 },
+      { srcNodeId: 'bbbb', peerNodeId: 'aaaa', path: 'relay', rttMs: null, liveRelayKbps: 20 },
+    ]);
+    assert.equal(asymmetric.state, 'relay');
+    assert.deepEqual(asymmetric.rttMsValues, []);
+    assert.equal(asymmetric.relayKbps, 20);
+
+    const biLan = resolvePairLink(a, b, [
+      { srcNodeId: 'aaaa', peerNodeId: 'bbbb', path: 'lan', rttMs: 10, liveRelayKbps: 0 },
+      { srcNodeId: 'bbbb', peerNodeId: 'aaaa', path: 'lan', rttMs: 14, liveRelayKbps: 0 },
+    ]);
+    assert.equal(biLan.state, 'lan');
+    assert.deepEqual(biLan.rttMsValues, [10, 14]);
+
+    const mixedDirect = resolvePairLink(a, b, [
+      { srcNodeId: 'aaaa', peerNodeId: 'bbbb', path: 'lan', rttMs: 10, liveRelayKbps: 0 },
+      { srcNodeId: 'bbbb', peerNodeId: 'aaaa', path: 'p2p', rttMs: 42, liveRelayKbps: 0 },
+    ]);
+    assert.equal(mixedDirect.state, 'direct');
+    assert.deepEqual(mixedDirect.rttMsValues, [10, 42]);
+
+    const blockedOverLan = resolvePairLink(a, b, [
+      { srcNodeId: 'aaaa', peerNodeId: 'bbbb', path: 'lan', rttMs: 5, liveRelayKbps: 0 },
+      { srcNodeId: 'bbbb', peerNodeId: 'aaaa', path: 'blocked', rttMs: null, liveRelayKbps: 0 },
+    ]);
+    assert.equal(blockedOverLan.state, 'blocked');
+    assert.deepEqual(blockedOverLan.rttMsValues, []);
+  });
+
+  test('summarizeNetworkPairs 与 summarizeMemberConnections：全直连残留 liveRelayKbps>0 不出中转；单侧直连两边一致计中转', () => {
+    const a = makeMember('aaaa', 'authorized', { liveRelayKbps: 18 }); // 5s 滑窗残余速率
+    const b = makeMember('bbbb', 'authorized', { liveRelayKbps: 12 });
+    const c = makeMember('cccc', 'authorized', { online: false });
+
+    // 1. 全双向直连：liveRelayKbps>0 残余时 relay 必须为 0
+    const directLinks = [
+      { srcNodeId: 'aaaa', peerNodeId: 'bbbb', path: 'lan', rttMs: 10, liveRelayKbps: 0 },
+      { srcNodeId: 'bbbb', peerNodeId: 'aaaa', path: 'p2p', rttMs: 15, liveRelayKbps: 0 },
+      { srcNodeId: 'aaaa', peerNodeId: 'cccc', path: 'relay', rttMs: null, liveRelayKbps: 0 }, // c 离线：不计入
+    ];
+    assert.deepEqual(summarizeNetworkPairs([a, b, c], directLinks), { total: 1, direct: 1 });
+    assert.deepEqual(summarizeMemberConnections(a, [a, b, c], directLinks), {
+      direct: 1,
+      relay: 0,
+      blocked: 0,
+      latency: '10–15 ms',
+    });
+    assert.deepEqual(summarizeMemberConnections(c, [a, b, c], directLinks), {
+      direct: 0,
+      relay: 0,
+      blocked: 0,
+      latency: '—',
+    });
+
+    // 2. 单侧直连 + 对侧中转：概览 direct=0，双端设备行都显示 relay=1、latency='—'
+    const splitLinks = [
+      { srcNodeId: 'aaaa', peerNodeId: 'bbbb', path: 'p2p', rttMs: 25, liveRelayKbps: 0 },
+      { srcNodeId: 'bbbb', peerNodeId: 'aaaa', path: 'relay', rttMs: null, liveRelayKbps: 16 },
+    ];
+    assert.deepEqual(summarizeNetworkPairs([a, b], splitLinks), { total: 1, direct: 0 });
+    assert.deepEqual(summarizeMemberConnections(a, [a, b], splitLinks), {
+      direct: 0,
+      relay: 1,
+      blocked: 0,
+      latency: '—',
+    });
+    assert.deepEqual(summarizeMemberConnections(b, [a, b], splitLinks), {
+      direct: 0,
+      relay: 1,
+      blocked: 0,
+      latency: '—',
+    });
+
+    // 3. blocked 最高优先
+    const blockedLinks = [
+      { srcNodeId: 'aaaa', peerNodeId: 'bbbb', path: 'lan', rttMs: 8, liveRelayKbps: 0 },
+      { srcNodeId: 'bbbb', peerNodeId: 'aaaa', path: 'blocked', rttMs: null, liveRelayKbps: 0 },
+    ];
+    assert.deepEqual(summarizeNetworkPairs([a, b], blockedLinks), { total: 1, direct: 0 });
+    assert.deepEqual(summarizeMemberConnections(a, [a, b], blockedLinks), {
+      direct: 0,
+      relay: 0,
+      blocked: 1,
+      latency: '—',
+    });
+  });
+
+  test('NetworkView.tsx 消费 summarizeNetworkPairs/summarizeMemberConnections 且绝不在 relay===0 时渲染正在中转', () => {
+    const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const source = fs.readFileSync(path.join(pkgDir, 'src/web/components/NetworkView.tsx'), 'utf8');
+    assert.ok(source.includes('summarizeNetworkPairs('), '概览第 3 格必须消费 summarizeNetworkPairs');
+    assert.ok(source.includes('summarizeMemberConnections('), '设备列表行必须消费 summarizeMemberConnections');
+    assert.ok(!source.includes('relayingNow'), '必须移除独立的 relayingNow 芯片');
+    assert.ok(!source.includes("t('devices.relayingNow'"), '禁止独立渲染 devices.relayingNow 与直连共存');
   });
 });

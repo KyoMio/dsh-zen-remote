@@ -50,10 +50,39 @@ async function setup(t, { head, timeout = 1234, replyClose = true } = {}) {
   server.on('upgrade', (req, socket) => {
     sockets.push(socket);
     socket.on('error', () => {});
+    let buf = Buffer.alloc(0);
     socket.on('data', data => {
-      if ((data[0] & 15) === 8) {
-        if (replyClose) socket.end(Buffer.from([0x88, 0]));
-      } else authFrames++;
+      buf = Buffer.concat([buf, data]);
+      while (buf.length >= 2) {
+        const opcode = buf[0] & 0x0f;
+        const masked = (buf[1] & 0x80) !== 0;
+        let len = buf[1] & 0x7f;
+        let off = 2;
+        if (len === 126) {
+          if (buf.length < 4) break;
+          len = buf.readUInt16BE(2);
+          off = 4;
+        } else if (len === 127) {
+          if (buf.length < 10) break;
+          len = Number(buf.readBigUInt64BE(2));
+          off = 10;
+        }
+        const maskLen = masked ? 4 : 0;
+        if (buf.length < off + maskLen + len) break;
+        const payload = Buffer.from(buf.subarray(off + maskLen, off + maskLen + len));
+        if (masked) {
+          const mask = buf.subarray(off, off + 4);
+          for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+        }
+        buf = buf.subarray(off + maskLen + len);
+        if (opcode === 8) {
+          if (replyClose) socket.end(Buffer.from([0x88, 0]));
+        } else if (opcode === 9 && payload.length < 126) {
+          socket.write(Buffer.concat([Buffer.from([0x8a, payload.length]), payload]));
+        } else if (opcode === 1 || opcode === 2) {
+          authFrames++;
+        }
+      }
     });
     const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
     const response = Buffer.from(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);

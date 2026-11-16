@@ -75,7 +75,7 @@ function frame(value) {
 }
 
 /** 最小 fake WS 网关：每次 upgrade 回 101 后下发 `welcome`（逐测试可换），
- * 忽略客户端一切非 close 帧。引擎不校验 welcome 签名，授权态由消息驱动。 */
+ * 响应客户端 ping/close 帧，忽略其余数据帧。引擎不校验 welcome 签名，授权态由消息驱动。 */
 async function startFakeGateway() {
   const sockets = []
   let welcome = null
@@ -85,8 +85,39 @@ async function startFakeGateway() {
     upgrades += 1
     sockets.push(socket)
     socket.on('error', () => {})
-    socket.on('data', (data) => {
-      if ((data[0] & 15) === 8) socket.end(Buffer.from([0x88, 0]))
+    let buf = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      while (buf.length >= 2) {
+        const opcode = buf[0] & 0x0f
+        const masked = (buf[1] & 0x80) !== 0
+        let len = buf[1] & 0x7f
+        let off = 2
+        if (len === 126) {
+          if (buf.length < 4) break
+          len = buf.readUInt16BE(2)
+          off = 4
+        } else if (len === 127) {
+          if (buf.length < 10) break
+          len = Number(buf.readBigUInt64BE(2))
+          off = 10
+        }
+        const maskLen = masked ? 4 : 0
+        if (buf.length < off + maskLen + len) break
+        const payload = Buffer.from(buf.subarray(off + maskLen, off + maskLen + len))
+        if (masked) {
+          const mask = buf.subarray(off, off + 4)
+          for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3]
+        }
+        buf = buf.subarray(off + maskLen + len)
+        if (opcode === 8) {
+          socket.end(Buffer.from([0x88, 0]))
+          return
+        }
+        if (opcode === 9 && payload.length < 126) {
+          socket.write(Buffer.concat([Buffer.from([0x8a, payload.length]), payload]))
+        }
+      }
     })
     const accept = createHash('sha1')
       .update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')

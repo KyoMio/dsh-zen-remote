@@ -25,13 +25,11 @@ import { LOCALE_STORAGE_KEY, resolveLocale } from '../i18n/locales';
 import type { Locale, LocaleKey, TranslateFn } from '../i18n/locales';
 import {
   buildHeadlessJoinCommand,
-  classifyLinkPath,
   computeUsagePercent,
   displayName,
   effectiveNetworkMaxPeers,
   filterJoinedMembers,
   formatBytesQuota,
-  formatLatencyRange,
   formatRate,
   isQuotaExceeded,
   maskInviteUri,
@@ -39,6 +37,8 @@ import {
   quotaUsageLevel,
   relativeText,
   relativeTime,
+  summarizeMemberConnections,
+  summarizeNetworkPairs,
 } from '../format';
 import type { UsageLevel } from '../format';
 import { Modal } from './Modal';
@@ -48,7 +48,6 @@ import type {
   AdmissionMode,
   MemberAction,
   NetworkView as NetworkSummary,
-  TopologyLink,
   TopologySnapshot,
   UiLocalState,
   UserQuotaSummary,
@@ -557,20 +556,8 @@ export function NetworkView(props: NetworkViewProps) {
   const monthlyExceeded = quotaView !== null ? isQuotaExceeded(quotaView.usedMonthlyRelayBytes, quotaView.monthlyRelayQuotaBytes) : false;
   const headlessCommand = buildHeadlessJoinCommand(network.joinUri);
 
-  // 连接对统计（cell 3）：A→B 与 B→A 是同一条连接
-  const pairs = new Map<string, { direct: boolean; blocked: boolean }>();
-  for (const link of links) {
-    const key = link.srcNodeId < link.peerNodeId ? `${link.srcNodeId}|${link.peerNodeId}` : `${link.peerNodeId}|${link.srcNodeId}`;
-    const entry = pairs.get(key) ?? { direct: false, blocked: false };
-    // 只有真实直连路径算「直连」：blocked / unknown 既不是直连也不是中转。
-    // 任一方向自报 blocked 的对整体不算直连——单向 blocked + 反向正常
-    // 不能被「反向能直连」合并成一条正常直连（PC16b）。
-    const kind = classifyLinkPath(link.path);
-    if (kind === 'lan' || kind === 'direct') entry.direct = true;
-    if (kind === 'blocked') entry.blocked = true;
-    pairs.set(key, entry);
-  }
-  const directPairs = [...pairs.values()].filter((p) => p.direct && !p.blocked).length;
+  // 连接对统计（cell 3）：严格按双向直连归并口径
+  const pairSummary = summarizeNetworkPairs(joinedMembers, links);
 
   const detailMember = detailNodeId !== null ? (members.find((m) => m.nodeId === detailNodeId) ?? null) : null;
   if (detailMember !== null && topology !== null) {
@@ -597,8 +584,6 @@ export function NetworkView(props: NetworkViewProps) {
       />
     );
   }
-
-  const selfLinks = (nodeId: string): TopologyLink[] => links.filter((l) => l.srcNodeId === nodeId);
 
   return (
     <section className="network-view">
@@ -800,7 +785,7 @@ export function NetworkView(props: NetworkViewProps) {
         <section className="overview-cell cell-relay">
           <p className="cell-label">{t('overview.gatewayRelay')}</p>
           <p className="rate mono">{formatRate(summary?.totalLiveRelayKbps ?? 0)}</p>
-          <p className="cell-sub">{t('overview.connections', { total: pairs.size, direct: directPairs })}</p>
+          <p className="cell-sub">{t('overview.connections', { total: pairSummary.total, direct: pairSummary.direct })}</p>
           {/* 月度流量条（GC-9）：组设了月度上限才出进度条；管理员标不限 */}
           {quotaView !== null && (
             <div style={{ marginTop: 10 }}>
@@ -880,15 +865,8 @@ export function NetworkView(props: NetworkViewProps) {
             <tbody>
               {joinedMembers.map((member) => {
                 const status = memberStatusView(member.status, member.online, t);
-                const own = selfLinks(member.nodeId);
-                const ownKinds = own.map((l) => classifyLinkPath(l.path));
-                const direct = ownKinds.filter((k) => k === 'lan' || k === 'direct').length;
-                const relay = ownKinds.filter((k) => k === 'relay').length;
-                const blocked = ownKinds.filter((k) => k === 'blocked').length;
-                const latency = formatLatencyRange(own.map((l) => l.rttMs));
-                const showConn = member.status === 'authorized' && member.online && own.length > 0;
-                // 正在经网关中转的设备高亮实时速率（GC-9，作为发送方的自报值）
-                const relayingNow = member.online && member.liveRelayKbps > 0;
+                const { direct, relay, blocked, latency } = summarizeMemberConnections(member, joinedMembers, links);
+                const showConn = member.status === 'authorized' && member.online && (direct + relay + blocked > 0);
                 // 离线设备补最后在线相对时间（GC-9）
                 const lastSeenText = member.online ? null : relativeText(t, relativeTime(member.lastSeenAt, Date.now()));
                 return (
@@ -930,12 +908,6 @@ export function NetworkView(props: NetworkViewProps) {
                       <div className="conn-summary">
                         {showConn ? (
                           <>
-                            {relayingNow && (
-                              <span className="conn-chip">
-                                <span className="dot warn" aria-hidden="true" />
-                                {t('devices.relayingNow', { rate: formatRate(member.liveRelayKbps) })}
-                              </span>
-                            )}
                             {direct > 0 && (
                               <span className="conn-chip">
                                 <span className="dot ok" aria-hidden="true" />
@@ -945,7 +917,7 @@ export function NetworkView(props: NetworkViewProps) {
                             {relay > 0 && (
                               <span className="conn-chip">
                                 <span className="dot warn" aria-hidden="true" />
-                                {t('devices.relayCount', { n: relay })}
+                                {`${t('devices.relayCount', { n: relay })}${member.liveRelayKbps > 0 ? ` · ${formatRate(member.liveRelayKbps)}` : ''}`}
                               </span>
                             )}
                             {blocked > 0 && (

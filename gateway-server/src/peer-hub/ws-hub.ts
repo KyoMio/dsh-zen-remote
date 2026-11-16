@@ -62,6 +62,8 @@ import type { NatObservation } from './udp-stun.js';
 const WS_PATH = '/peer/v1/ws';
 /** auth/path-report 时间戳的新鲜度窗口（±） */
 const TIMESTAMP_WINDOW_MS = 5 * 60_000;
+const DEFAULT_WS_PING_INTERVAL_MS = 10_000;
+const DEFAULT_WS_PONG_TIMEOUT_MS = 15_000;
 const MAX_PATH_REPORTS_PER_NODE = 64;
 const MAX_LAN_ENDPOINTS = 16;
 /** PC-19 第二片：关停末批的收尾轮数上界（追平在途/尾轮 + 写库在途期间的少量新增） */
@@ -121,6 +123,10 @@ export interface PeerWsHubOptions {
   flushMs?: number | null;
   /** 时间戳窗口，缺省 ±5 分钟 */
   timestampWindowMs?: number;
+  /** 控制面 WS 心跳发送间隔（ms）；默认 10_000，传 0 禁用 */
+  pingIntervalMs?: number;
+  /** 控制面 WS 心跳 Pong 超时（ms）；默认 15_000 */
+  pongTimeoutMs?: number;
   now?: () => number;
   /** 生产实例的真实 UDP STUN 端口供给器：组合根在 UdpStunService.bind() 完成后才返回
    * 实际绑定值（不得用配置值或 HTTP 端口冒充）；返回 null 或缺省时 welcome 不带 stun 字段 */
@@ -138,6 +144,11 @@ interface ConnState {
   ws: WebSocket;
   /** Opaque STUN generation; replacements with the same identity get a new token. */
   stunAdmission: symbol;
+  /** 进程内单调递增的连接代次（auth 通过生成 ConnState 时分配，含 replaceExisting） */
+  connSeq: number;
+  lastAliveAt: number;
+  pingTimer: NodeJS.Timeout | null;
+  pongTimer: NodeJS.Timeout | null;
   state: 'hanging' | 'authorized' | 'paused' | 'closed';
   networkId: string;
   nodeId: string;
@@ -164,6 +175,7 @@ interface PeerView {
   lanEndpoints: string[];
   natType: NatType;
   reflexiveEndpoint: string | null;
+  connSeq: number;
 }
 
 const connKey = (networkId: string, nodeId: string): string => `${networkId}|${nodeId}`;
@@ -180,6 +192,7 @@ function peerView(conn: ConnState): PeerView {
     lanEndpoints: conn.lanEndpoints,
     natType: conn.natType,
     reflexiveEndpoint: endpointString(conn.reflexive),
+    connSeq: conn.connSeq,
   };
 }
 
@@ -239,7 +252,10 @@ export class PeerWsHub {
   private readonly store: GatewayStore;
   private readonly masterKey: Buffer;
   private readonly timestampWindowMs: number;
+  private readonly pingIntervalMs: number;
+  private readonly pongTimeoutMs: number;
   private readonly now: () => number;
+  private nextConnSeq = 0;
   /** 真实 UDP STUN 端口供给器；null 表示组合根未接入（welcome 不带 stun 字段） */
   private readonly stunPorts: (() => { primaryPort: number; altPort: number | null } | null) | null;
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
@@ -301,6 +317,16 @@ export class PeerWsHub {
     this.store = options.store;
     this.masterKey = options.masterKey;
     this.timestampWindowMs = options.timestampWindowMs ?? TIMESTAMP_WINDOW_MS;
+    const pingIntervalMs = options.pingIntervalMs ?? DEFAULT_WS_PING_INTERVAL_MS;
+    if (!Number.isInteger(pingIntervalMs) || pingIntervalMs < 0 || pingIntervalMs > 2_147_483_647) {
+      throw new TypeError('PeerWsHub: invalid pingIntervalMs');
+    }
+    const pongTimeoutMs = options.pongTimeoutMs ?? DEFAULT_WS_PONG_TIMEOUT_MS;
+    if (!Number.isInteger(pongTimeoutMs) || pongTimeoutMs < 1 || pongTimeoutMs > 2_147_483_647) {
+      throw new TypeError('PeerWsHub: invalid pongTimeoutMs');
+    }
+    this.pingIntervalMs = pingIntervalMs;
+    this.pongTimeoutMs = pongTimeoutMs;
     this.now = options.now ?? Date.now;
     this.stunPorts = options.stunPorts ?? null;
     this.limiter = new PeerRateLimiter({ now: this.now });
@@ -339,6 +365,7 @@ export class PeerWsHub {
         socket.destroy();
         return;
       }
+      (socket as { setKeepAlive?: (enable: boolean, initialDelay?: number) => unknown }).setKeepAlive?.(true, 10_000);
       const remoteIp = req.socket.remoteAddress ?? null;
       this.wss.handleUpgrade(req, socket, head, (ws) => this.setupConnection(ws, remoteIp));
     });
@@ -368,10 +395,19 @@ export class PeerWsHub {
     for (const ws of this.acceptedSockets) ws.terminate();
     this.acceptedSockets.clear();
     for (const net of this.conns.values()) {
-      for (const conn of net.values()) conn.ws.terminate();
+      for (const conn of net.values()) {
+        this.clearConnHeartbeat(conn);
+        conn.ws.terminate();
+      }
     }
-    for (const conn of this.hanging.values()) conn.ws.terminate();
-    for (const conn of this.pausedConns.values()) conn.ws.terminate();
+    for (const conn of this.hanging.values()) {
+      this.clearConnHeartbeat(conn);
+      conn.ws.terminate();
+    }
+    for (const conn of this.pausedConns.values()) {
+      this.clearConnHeartbeat(conn);
+      conn.ws.terminate();
+    }
     this.conns.clear();
     this.hanging.clear();
     this.pausedConns.clear();
@@ -468,6 +504,7 @@ export class PeerWsHub {
     ws.on('message', (data: RawData, isBinary: boolean) => {
       if (phase !== 'preauth' && phase !== 'authed') return;
       if (conn !== null && conn.state === 'closed') return; // 终态连接（close 握手窗口内）一律拒收
+      if (conn !== null) this.touchConnAlive(conn);
       if (isBinary) {
         this.relayBinary(conn, toBuffer(data));
         return;
@@ -492,19 +529,80 @@ export class PeerWsHub {
       // 其余类型（含已认证后再发 auth）一律忽略
     });
 
+    ws.on('pong', () => {
+      if (conn !== null && conn.state !== 'closed') this.touchConnAlive(conn);
+    });
+
     ws.on('error', () => {
       ws.terminate();
     });
 
     ws.on('close', () => {
       phase = 'closed';
+      if (conn !== null) this.clearConnHeartbeat(conn);
       this.teardown(conn);
     });
+  }
+
+  private clearConnHeartbeat(conn: ConnState): void {
+    if (conn.pingTimer !== null) {
+      clearInterval(conn.pingTimer);
+      conn.pingTimer = null;
+    }
+    if (conn.pongTimer !== null) {
+      clearTimeout(conn.pongTimer);
+      conn.pongTimer = null;
+    }
+  }
+
+  private touchConnAlive(conn: ConnState): void {
+    conn.lastAliveAt = this.now();
+    if (conn.pongTimer !== null) {
+      clearTimeout(conn.pongTimer);
+      conn.pongTimer = null;
+    }
+  }
+
+  private startConnHeartbeat(conn: ConnState): void {
+    if (this.pingIntervalMs === 0 || this.closed || conn.state === 'closed' || conn.ws.readyState !== conn.ws.OPEN) return;
+    conn.lastAliveAt = this.now();
+    const checkTimeout = (): void => {
+      if (this.closed || conn.state === 'closed' || conn.ws.readyState !== conn.ws.OPEN) return;
+      if (this.now() - conn.lastAliveAt > this.pingIntervalMs + this.pongTimeoutMs) {
+        console.warn(`[gateway] ws keepalive timeout; terminating peer=${conn.nodeId} net=${conn.networkId}`);
+        this.clearConnHeartbeat(conn);
+        conn.ws.terminate();
+      }
+    };
+    conn.pingTimer = setInterval(() => {
+      if (this.closed || conn.state === 'closed' || conn.ws.readyState !== conn.ws.OPEN) return;
+      const elapsed = this.now() - conn.lastAliveAt;
+      const deadlineMs = this.pingIntervalMs + this.pongTimeoutMs;
+      if (elapsed > deadlineMs) {
+        checkTimeout();
+        return;
+      }
+      try {
+        conn.ws.ping();
+      } catch {
+        /* close/error handler will clean up */
+      }
+      if (conn.pongTimer === null) {
+        const waitMs = Math.max(1, deadlineMs - elapsed + 5);
+        conn.pongTimer = setTimeout(() => {
+          conn.pongTimer = null;
+          checkTimeout();
+        }, waitMs);
+        conn.pongTimer.unref?.();
+      }
+    }, this.pingIntervalMs);
+    conn.pingTimer.unref?.();
   }
 
   /** 连接断开：路由表/挂起池/暂停池摘除、离线广播、对方拓扑里的过期路径清掉 */
   private teardown(conn: ConnState | null): void {
     if (conn === null) return; // preauth 就断开，无状态可清
+    this.clearConnHeartbeat(conn);
     if (conn.state === 'authorized') {
       const net = this.conns.get(conn.networkId);
       if (net !== undefined && net.get(conn.nodeId) === conn) {
@@ -553,6 +651,7 @@ export class PeerWsHub {
       lanEndpoints: conn.lanEndpoints,
       natType: conn.natType,
       reflexiveEndpoint: endpointString(conn.reflexive),
+      connSeq: conn.connSeq,
     }, conn.nodeId);
     // 打洞协调：向配对节点对（新节点 ↔ 每个在线成员）同时下发；
     // publicKeyHex 供对端做 TOFU 锚定与 E2EE 握手
@@ -564,6 +663,7 @@ export class PeerWsHub {
         lanEndpoints: other.lanEndpoints,
         reflexiveEndpoint: endpointString(other.reflexive),
         natType: other.natType,
+        connSeq: other.connSeq,
         startAfterMs: 20,
       });
       sendJson(other.ws, {
@@ -573,6 +673,7 @@ export class PeerWsHub {
         lanEndpoints: conn.lanEndpoints,
         reflexiveEndpoint: endpointString(conn.reflexive),
         natType: conn.natType,
+        connSeq: conn.connSeq,
         startAfterMs: 20,
       });
     }
@@ -590,6 +691,7 @@ export class PeerWsHub {
     sendJson(conn.ws, {
       type: 'welcome',
       status: 'authorized',
+      connSeq: conn.connSeq,
       maxPeers: conn.maxPeers,
       peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
       peers,
@@ -723,6 +825,10 @@ export class PeerWsHub {
     const conn: ConnState = {
       ws,
       stunAdmission: Symbol(),
+      connSeq: ++this.nextConnSeq,
+      lastAliveAt: this.now(),
+      pingTimer: null,
+      pongTimer: null,
       state: 'hanging',
       networkId,
       nodeId,
@@ -743,17 +849,20 @@ export class PeerWsHub {
       case 'authorized': {
         this.welcomeAuthorized(conn);
         this.registerAndAnnounce(conn);
+        this.startConnHeartbeat(conn);
         return conn;
       }
       case 'pending': {
         sendJson(ws, { type: 'welcome', status: 'pending', maxPeers: conn.maxPeers, peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
         this.hanging.set(connKey(networkId, nodeId), conn);
+        this.startConnHeartbeat(conn);
         void this.publishTopology(networkId);
         return conn;
       }
       case 'mismatch': {
         sendJson(ws, { type: 'welcome', status: 'mismatch', peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
         this.hanging.set(connKey(networkId, nodeId), conn);
+        this.startConnHeartbeat(conn);
         void this.publishTopology(networkId);
         return conn;
       }
@@ -768,6 +877,7 @@ export class PeerWsHub {
         conn.state = 'paused';
         sendJson(ws, { type: 'welcome', status: 'paused', maxPeers: conn.maxPeers, peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
         this.pausedConns.set(connKey(networkId, nodeId), conn);
+        this.startConnHeartbeat(conn);
         return conn;
       }
       default: {
@@ -1072,6 +1182,7 @@ export class PeerWsHub {
             lanEndpoints: conn.lanEndpoints,
             reflexiveEndpoint: nextEndpoint,
             natType: conn.natType,
+            connSeq: conn.connSeq,
             startAfterMs: 20,
           });
         }
@@ -1294,6 +1405,7 @@ export class PeerWsHub {
     // 换代一致）。恢复前在途观察的迟到回包按旧 token 复查不匹配，不落新观察；
     // 恢复后的探测以新 token 登记，主辅槽不跨暂停混配
     conn.stunAdmission = Symbol();
+    conn.connSeq = ++this.nextConnSeq;
     this.welcomeAuthorized(conn);
     this.registerAndAnnounce(conn);
     return true;
@@ -1333,6 +1445,7 @@ export class PeerWsHub {
   private killConn(conn: ConnState, reason: string): void {
     if (conn.state === 'closed') return;
     conn.state = 'closed';
+    this.clearConnHeartbeat(conn);
     this.removeFromRouting(conn);
     const key = connKey(conn.networkId, conn.nodeId);
     if (this.hanging.get(key) === conn) this.hanging.delete(key);

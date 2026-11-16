@@ -174,21 +174,23 @@ async function login(base, email, password) {
   return raw.split(';')[0]
 }
 
-async function createNetwork(gw, { mode = 'key' } = {}) {
+async function createNetwork(gw, { mode = 'key', keepDefaultCap = false } = {}) {
   const res = await api(gw.base, 'POST', '/api/v1/networks', {
     body: { name: `net-${Math.random().toString(36).slice(2, 8)}`, admissionMode: mode },
     cookie: gw.tenantCookie,
   })
   assert.equal(res.status, 200, JSON.stringify(res.json))
   const net = res.json.data
-  // T4：建网缺省 peerDirectMaxRttMs=300 会由 welcome 下发并盖过测试注入
-  // （capFromGateway 优先），把「打通即直连」的门全变成样本闸——本文件验
-  // mux/传输机制，一律 PATCH 0（不限制）；上限策略归 peer-rtt-cap.test.cjs。
-  const patch = await api(gw.base, 'PATCH', `/api/v1/networks/${net.id}`, {
-    body: { peerDirectMaxRttMs: 0 },
-    cookie: gw.tenantCookie,
-  })
-  assert.equal(patch.status, 200, JSON.stringify(patch.json))
+  if (!keepDefaultCap) {
+    // T4：建网缺省 peerDirectMaxRttMs=300 会由 welcome 下发并盖过测试注入
+    // （capFromGateway 优先），把「打通即直连」的门全变成样本闸——本文件验
+    // mux/传输机制，一律 PATCH 0（不限制）；上限策略归 peer-rtt-cap.test.cjs。
+    const patch = await api(gw.base, 'PATCH', `/api/v1/networks/${net.id}`, {
+      body: { peerDirectMaxRttMs: 0 },
+      cookie: gw.tenantCookie,
+    })
+    assert.equal(patch.status, 200, JSON.stringify(patch.json))
+  }
   return net // { id, joinKey, maxPeers, joinUri? ... }
 }
 
@@ -266,13 +268,32 @@ function makeFirewallSocket(realSocket, initialBlocked = true) {
  * 真实 RelayPool + 真实 PeerEngine。宿主 typertGateway 的门扇形与 relay-e2e
  * 相同：`workspace/follow` 是可控的帧队列，`session/list` 等走可编程 invoke。
  */
-async function startNode(gw, { name, firewall = false, firewallOpen = false, shared = [], heartbeatMs = 300, hostFetch, punch, pathReportMs, clock } = {}) {
+async function startNode(gw, { name, firewall = false, firewallOpen = false, udpDelayMs = 0, directMaxRttMs, shared = [], heartbeatMs = 300, hostFetch, punch, pathReportMs, clock } = {}) {
   const home = path.join(ROOT, `node-${name}-${Math.random().toString(36).slice(2, 6)}`)
   fs.mkdirSync(home, { recursive: true })
   const stateFile = path.join(home, 'zen-remote-state.json')
   const identity = ensurePeerIdentity(stateFile)
   const punchReal = await openUdp()
-  const punchSocket = firewall || firewallOpen ? makeFirewallSocket(punchReal, !firewallOpen) : punchReal
+  let punchSocket = firewall || firewallOpen ? makeFirewallSocket(punchReal, !firewallOpen) : punchReal
+  if (udpDelayMs > 0) {
+    const inner = punchSocket
+    const realSend = inner.send.bind(inner)
+    punchSocket = {
+      address: () => inner.address(),
+      on: (...a) => inner.on(...a),
+      once: (...a) => inner.once(...a),
+      removeListener: (...a) => inner.removeListener(...a),
+      bind: (...a) => inner.bind(...a),
+      close: (...a) => inner.close(...a),
+      setBlocked: inner.setBlocked ? (v) => inner.setBlocked(v) : undefined,
+      send(bytes, port, host, cb) {
+        const copy = Buffer.from(bytes)
+        setTimeout(() => {
+          try { realSend(copy, port, host, cb) } catch { /* socket closed */ }
+        }, udpDelayMs)
+      },
+    }
+  }
 
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
   for (const id of shared) store.share(id)
@@ -389,8 +410,8 @@ async function startNode(gw, { name, firewall = false, firewallOpen = false, sha
     ...(clock !== undefined ? { clock } : {}),
     // T4: directMaxRttMs 缺省现按 300 解析（网关不下发即生效）——这些用例
     // 验的是 mux/打洞/传输机制，不是上限策略，钉 0（不限制）保住
-    // 「打通即直连」的旧语义；上限策略归 peer-rtt-cap.test.cjs。
-    directMaxRttMs: () => 0,
+    // 「打通即直连」的旧语义；上限策略归 peer-rtt-cap.test.cjs 与 T4 默认 300 E2E。
+    ...(directMaxRttMs === null ? {} : { directMaxRttMs: directMaxRttMs ?? (() => 0) }),
     log: (line) => logs.push(line),
     debug: (line) => debugs.push(line),
   })
@@ -2942,6 +2963,160 @@ test('PAS-3 端到端：插件退网同步注销网关并卸载对端；在线/�
     await waitFor(() => D.engine.status().gatewayState === 'revoked', 8000, 'D denied with wrong key')
     assert.equal(readPeerNetwork(D.stateFile), undefined)
     assert.equal(D.engine.status().revokedNotice, null, '初次入网失败不得展示「网关已撤销授权」横幅')
+  } finally {
+    for (const node of nodes) node.stop()
+    await gw.close()
+  }
+})
+
+test('T4 E2E：真实网关默认 cap=300ms + 跨网延迟 + 模拟换网与 >128KB 会话历史加载不抖动不超时', async (t) => {
+  const gw = await startGateway()
+  const net = await createNetwork(gw, { mode: 'key', keepDefaultCap: true }) // 使用默认 peerDirectMaxRttMs=300
+  assert.equal(net.peerDirectMaxRttMs, 300)
+  const nodes = []
+  try {
+    // 构造 >128KB 会话历史载荷（~160KB JSON）
+    const bigMessages = Array.from({ length: 400 }, (_, i) => ({
+      id: `msg-${i}`,
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      text: `history-line-${i}-` + 'x'.repeat(350),
+    }))
+    const expectedHistoryJson = JSON.stringify({ sessionId: 's-hist', messages: bigMessages })
+    assert.ok(Buffer.byteLength(expectedHistoryJson, 'utf8') > 128 * 1024)
+
+    const A = await startNode(gw, {
+      name: 'Alpha-T4',
+      directMaxRttMs: null,
+      udpDelayMs: 40, // 单程 40ms → ~80ms RTT（<= 210ms 达标线）
+      punch: { keepAliveMs: 400, keepAliveLostFrames: 3, reprobeIntervalMs: 1200 },
+    })
+    const B = await startNode(gw, {
+      name: 'Bravo-T4',
+      directMaxRttMs: null,
+      udpDelayMs: 40,
+      shared: ['s-hist'],
+      punch: { keepAliveMs: 400, keepAliveLostFrames: 3, reprobeIntervalMs: 1200 },
+    })
+    nodes.push(A, B)
+    B.invokeImpl = async (call) => {
+      if (call.namespace === 'session' && call.method === 'page') {
+        return { sessionId: 's-hist', messages: bigMessages }
+      }
+      if (call.namespace === 'session' && call.method === 'list') {
+        return { items: [{ id: 's-hist', title: 'Large History' }] }
+      }
+      return { ok: true }
+    }
+
+    for (const node of [A, B]) {
+      await node.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+      await waitFor(() => node.engine.status().gatewayState === 'authorized', 8000, `${node.name} authorized`)
+    }
+    assert.equal(A.engine.status().directCapMs, 300)
+    assert.equal(A.engine.status().directCapSource, 'gateway')
+
+    // 阶段 1：默认 cap=300 经两次 ~80ms 样本升直连，并在直连上拉取 >128KB 会话历史
+    await waitFor(() => {
+      const p = A.engine.status().peers.find((x) => x.nodeId === B.identity.nodeId)
+      return p !== undefined && (p.path === 'lan' || p.path === 'p2p')
+    }, 10_000, 'A→B promoted to direct under default cap=300')
+    const virtualB = await waitPeerOnline(A, B.identity.nodeId)
+
+    const hist1 = await virtualB.client.invoke('session', 'page', { request: { address: { kind: 'session', sessionId: 's-hist' } } })
+    assert.equal(JSON.stringify(hist1), expectedHistoryJson, '阶段 1 直连拉取 >128KB 历史必须字节完整')
+    assert.equal(A.engine.status().peers.find((x) => x.nodeId === B.identity.nodeId)?.directDemoted, false, '不得误触发 demoteDirect 抖动')
+
+    // 阶段 2：模拟 B 换网（同身份 B2 以新 UDP socket + replaceExisting 新 WS 顶替旧 B，起步阻断 UDP 走中转）
+    // 故意先不调 B.stop()（模拟旧网卡半开挂起），让 B2 直接连接网关触发 replaceExisting + 新 connSeq，然后再清理旧 B
+    const B2 = await startNode(gw, {
+      name: 'Bravo-T4-Switched',
+      directMaxRttMs: null,
+      firewall: true,
+      udpDelayMs: 40,
+      shared: ['s-hist'],
+      punch: { keepAliveMs: 400, keepAliveLostFrames: 3, reprobeIntervalMs: 1200 },
+    })
+    // 让 B2 复用 B 的身份（等价于同一台设备换网后重连，触发网关 replaceExisting + 新 connSeq）
+    fs.copyFileSync(B.stateFile, B2.stateFile)
+    const b2Identity = ensurePeerIdentity(B2.stateFile)
+    assert.equal(b2Identity.nodeId, B.identity.nodeId)
+    B2.stop()
+
+    // 用 B2 的身份重新构建引擎（直接复用 startNode 结构太重，直接新建同身份引擎）
+    const punchReal2 = await openUdp()
+    const punchSock2 = makeFirewallSocket(punchReal2, true)
+    const punchDelay2 = {
+      address: () => punchSock2.address(),
+      on: (...a) => punchSock2.on(...a),
+      once: (...a) => punchSock2.once(...a),
+      removeListener: (...a) => punchSock2.removeListener(...a),
+      bind: (...a) => punchSock2.bind(...a),
+      close: (...a) => punchSock2.close(...a),
+      send(bytes, port, host, cb) {
+        const copy = Buffer.from(bytes)
+        setTimeout(() => { try { punchSock2.send(copy, port, host, cb) } catch {} }, 40)
+      },
+    }
+    const store2 = createShareStore({ file: path.join(B2.home, 'shares-2.json'), idleHours: 48 })
+    store2.share('s-hist')
+    const relayHandler2 = createRelayHandler({
+      secret: SECRET,
+      store: store2,
+      gateway: {
+        invoke: async (call) => {
+          if (call.namespace === 'session' && call.method === 'page') return { sessionId: 's-hist', messages: bigMessages }
+          if (call.namespace === 'session' && call.method === 'list') return { items: [{ id: 's-hist', title: 'Large History' }] }
+          return { ok: true }
+        },
+        stream: async () => (async function* () {})(),
+        wireStream: { open: async () => { throw new Error('no wireStream') } },
+        dispatchRpc: async () => ({ ok: true, value: undefined }),
+      },
+      serverInfo: { serverId: loadServerId(B2.home), serverName: () => 'Bravo-T4-Switched', dshVersion: '0.0.0', fingerprints: () => ({}), plugins: () => ({}) },
+      heartbeatMs: 300,
+    })
+    const pool2 = createRelayPool({ stateFile: B2.stateFile, computeOwnFingerprints: () => ({}) })
+    const engine2 = createPeerEngine({
+      stateFile: B2.stateFile,
+      identity: b2Identity,
+      relayPool: pool2,
+      relayHandler: () => relayHandler2,
+      relaySecret: () => SECRET,
+      serverName: () => 'Bravo-T4-Switched',
+      udpSocket: punchDelay2,
+      udpProbe: { primaryPort: gw.udp.primaryPort, altPort: gw.udp.altPort ?? 0 },
+      punch: { keepAliveMs: 400, keepAliveLostFrames: 3, reprobeIntervalMs: 1200 },
+      log: (l) => B2.logs.push(l),
+    })
+    nodes.push({ engine: engine2, stop: () => { engine2.stop(); pool2.stop(); try { punchSock2.close() } catch {} } })
+
+    await engine2.joinNetwork(inviteUri(gw, net.id, net.joinKey))
+    await waitFor(() => engine2.status().gatewayState === 'authorized', 8000, 'B2 authorized')
+    B.stop()
+
+    // A 收到 B2 新 connSeq：立刻回落中转且 RelayPool 在数秒内恢复 online
+    await waitFor(() => A.logs.some((l) => l.includes('re-anchored') && l.includes('connSeq changed')), 5000, 'A re-anchored on B2 connSeq change')
+    await waitPeerOnline(A, b2Identity.nodeId, 8000)
+
+    // 中转期立即拉取 >128KB 会话历史：无 15s 超时、无 45s 僵死
+    const tRelayStart = Date.now()
+    const histRelay = await virtualB.client.invoke('session', 'page', { request: { address: { kind: 'session', sessionId: 's-hist' } } })
+    assert.equal(JSON.stringify(histRelay), expectedHistoryJson, '换网中转期 >128KB 历史必须完整到达')
+    assert.ok(Date.now() - tRelayStart < 8000, '中转加载不应触及 15s 超时或 45s 挂死')
+
+    // 放开 B2 防火墙并等待重打洞恢复直连（且 STUN 补齐不误拆）
+    punchSock2.setBlocked(false)
+    await waitFor(() => {
+      const p = A.engine.status().peers.find((x) => x.nodeId === b2Identity.nodeId)
+      return p !== undefined && (p.path === 'lan' || p.path === 'p2p')
+    }, 15_000, 'A→B2 re-promoted to direct after network switch')
+
+    const histDirect2 = await virtualB.client.invoke('session', 'page', { request: { address: { kind: 'session', sessionId: 's-hist' } } })
+    assert.equal(JSON.stringify(histDirect2), expectedHistoryJson, '重打洞直连恢复后 >128KB 历史必须完整到达')
+    assert.equal(A.engine.status().peers.find((x) => x.nodeId === b2Identity.nodeId)?.directDemoted, false)
+  } catch (err) {
+    for (const node of nodes) if (node.logs) console.error(`[dbg ${node.name ?? 'node'}]`, node.logs.join(' | '))
+    throw err
   } finally {
     for (const node of nodes) node.stop()
     await gw.close()

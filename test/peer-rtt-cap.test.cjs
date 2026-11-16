@@ -69,6 +69,7 @@ const { PeerPunchManager } = source('peer/punch.ts')
 const { generatePeerIdentity } = source('peer/crypto.ts')
 const { ensurePeerIdentity, writePeerNetwork, readPeerNetwork } = source('state-store.ts')
 const { PeerFrameType } = source('peer/wire.ts')
+const { createRelayPool } = source('relay-pool.ts')
 
 const NET_ID = '0123456789abcdef'
 const KEEPALIVE_MS = 3500
@@ -290,6 +291,11 @@ async function startGateway({ peers, rttCap }) {
         if (parsed === null) break
         buf = parsed.rest
         if (parsed.opcode === 8) { socket.end(); return }
+        if (parsed.opcode === 9) {
+          const head = Buffer.from([0x8a, parsed.payload.length])
+          socket.write(Buffer.concat([head, parsed.payload]))
+          continue
+        }
         if (parsed.opcode !== 1) continue // binary relay frames: no-op
         let msg
         try { msg = JSON.parse(parsed.payload.toString('utf8')) } catch { continue }
@@ -321,6 +327,9 @@ async function startGateway({ peers, rttCap }) {
     send: (value) => {
       const frame = wsFrame(value)
       for (const socket of sockets) socket.write(frame)
+    },
+    dropConnections: () => {
+      for (const socket of sockets.splice(0)) socket.destroy()
     },
     close: async () => {
       for (const socket of sockets) socket.destroy()
@@ -401,6 +410,7 @@ async function buildPair(t, { cap, rttCap }) {
     }],
   })
 
+  const reconnectCalls = []
   const engine = createPeerEngine({
     stateFile: stateFileA,
     identity: identityA,
@@ -409,6 +419,7 @@ async function buildPair(t, { cap, rttCap }) {
       mountVirtual: (input) => ({ entryId: input.entryId, serverId: input.serverId, serverName: input.serverName, displayName: input.serverName }),
       unmountVirtual: () => true,
       updateVirtualName: () => true,
+      reconnect: (id) => { reconnectCalls.push(id); return Promise.resolve(true) },
     },
     relayHandler: () => undefined,
     relaySecret: () => 'test',
@@ -523,7 +534,7 @@ async function buildPair(t, { cap, rttCap }) {
     }
   }
 
-  return { engine, mgrB, gateB, gateway, clock, logs, capRef, peerOf, waitReady, waitLost, sample, drain, identityB, identityA, socketB, stateFileA }
+  return { engine, mgrB, gateB, gateway, clock, logs, capRef, peerOf, waitReady, waitLost, sample, drain, identityB, identityA, socketB, stateFileA, reconnectCalls }
 }
 
 // -- the cap contract -------------------------------------------------------------
@@ -897,4 +908,288 @@ test('announcePeer with an unchanged endpoint set leaves the direct session unto
     false,
     'an identical re-announce must not re-anchor',
   )
+})
+
+test('T3: additive STUN punch-coordinate (null -> ip:port) under same connSeq preserves live direct session', async (t) => {
+  const env = await buildPair(t, { cap: 0 })
+  await env.waitReady()
+  assert.equal(env.peerOf().path, 'lan')
+
+  env.logs.length = 0
+  env.gateway.send({
+    type: 'punch-coordinate',
+    peerNodeId: env.identityB.nodeId,
+    publicKeyHex: env.identityB.publicKeyHex,
+    lanEndpoints: [endpointOf(env.socketB)],
+    reflexiveEndpoint: '203.0.113.5:4000',
+    connSeq: 1,
+  })
+  await sleep(150)
+  assert.equal(env.peerOf().path, 'lan', 'additive STUN enrichment must not tear down active direct session')
+  assert.equal(
+    env.logs.some((line) => line.includes('re-anchored')),
+    false,
+    'additive STUN must not log re-anchored',
+  )
+})
+
+test('T3: pure UDP rebind preserves active MuxSession while connSeq change or WS reconnect resets MuxSession', async (t) => {
+  let currentPeerConnSeq = 10
+  const peersData = () => [{
+    nodeId: envRef.identityB.nodeId,
+    publicKeyHex: envRef.identityB.publicKeyHex,
+    name: 'peer-B',
+    lanEndpoints: [endpointOf(envRef.socketB)],
+    reflexiveEndpoint: null,
+    connSeq: currentPeerConnSeq,
+  }]
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-t3-seq-'))
+  const clock = manualClock()
+  const logs = []
+  const stateFileA = path.join(home, 'a-state.json')
+  const socketA = await openUdp()
+  const identityA = ensurePeerIdentity(stateFileA)
+  const socketB = await openUdp()
+  const identityB = generatePeerIdentity()
+  const envRef = { identityB, socketB }
+
+  // Custom gateway that speaks connSeq and records binary frames.
+  const sockets = []
+  const server = http.createServer()
+  server.on('upgrade', (req, socket) => {
+    sockets.push(socket)
+    socket.on('error', () => {})
+    let buf = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      for (;;) {
+        const parsed = readClientFrame(buf)
+        if (parsed === null) break
+        buf = parsed.rest
+        if (parsed.opcode === 8) { socket.end(); return }
+        if (parsed.opcode === 9) {
+          socket.write(Buffer.concat([Buffer.from([0x8a, parsed.payload.length]), parsed.payload]))
+          continue
+        }
+        if (parsed.opcode !== 1) continue
+        let msg
+        try { msg = JSON.parse(parsed.payload.toString('utf8')) } catch { continue }
+        if (msg?.type === 'auth') {
+          socket.write(wsFrame({
+            type: 'welcome',
+            status: 'authorized',
+            connSeq: 1,
+            maxPeers: 8,
+            peers: peersData(),
+          }))
+        }
+      }
+    })
+    const accept = createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write(Buffer.concat([
+      Buffer.from(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`),
+      wsFrame({ type: 'challenge', challengeHex: 'a1b2c3d4e5f60718' }),
+    ]))
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  const reconnectCalls = []
+  let mountedFetch = null
+  const engine = createPeerEngine({
+    stateFile: stateFileA,
+    identity: identityA,
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (input) => {
+        mountedFetch = input.fetchImpl
+        return { entryId: input.entryId, serverId: input.serverId, serverName: input.serverName, displayName: input.serverName }
+      },
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+      reconnect: (id) => { reconnectCalls.push(id); return Promise.resolve(true) },
+    },
+    relayHandler: () => undefined,
+    relaySecret: () => 'test',
+    serverName: () => 'node-A',
+    udpSocket: socketA,
+    udpProbe: null,
+    clock,
+    log: (line) => logs.push(line),
+    directMaxRttMs: () => 0,
+    punch: { keepAliveMs: KEEPALIVE_MS, keepAliveLostFrames: 3, reprobeIntervalMs: 800 },
+  })
+  const mgrB = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: identityB,
+    socket: socketB,
+    clock,
+    keepAliveMs: KEEPALIVE_MS,
+    keepAliveLostFrames: 3,
+    reprobeIntervalMs: 800,
+  })
+  await mgrB.ready()
+  writePeerNetwork(stateFileA, { gatewayWsUrl: `ws://127.0.0.1:${port}`, gatewayHttpOrigin: `http://127.0.0.1:${port}`, networkId: NET_ID, joinedAt: 1 })
+  t.after(async () => {
+    mgrB.close()
+    engine.stop()
+    for (const s of sockets) s.destroy()
+    await new Promise(resolve => server.close(resolve))
+    fs.rmSync(home, { recursive: true, force: true })
+  })
+
+  mgrB.beginPunch({ peerNodeId: identityA.nodeId, peerPublicKeyHex: identityA.publicKeyHex, lanEndpoints: [] })
+  engine.resumeFromState()
+  await waitFor(() => logs.some(l => l.includes('direct ready')), 'initial direct ready')
+  assert.ok(reconnectCalls.includes(identityB.nodeId), 'onPathChanged(udp) triggers relayPool.reconnect')
+  assert.ok(mountedFetch, 'virtual fetch mounted')
+
+  // Open a pending fetch on the active mux session.
+  let hangingSettled = false
+  const hangingFetch = mountedFetch('http://peer/hang')
+  hangingFetch.then(() => { hangingSettled = true }, () => { hangingSettled = true })
+  await sleep(10)
+
+  // (a) Pure UDP endpoint replacement (connSeq unchanged, WS not reconnected) must re-anchor UDP
+  // without tearing down or aborting the active MuxSession stream.
+  const rebindFrame = wsFrame({
+    type: 'punch-coordinate',
+    peerNodeId: identityB.nodeId,
+    publicKeyHex: identityB.publicKeyHex,
+    lanEndpoints: ['127.0.0.1:19999'],
+    reflexiveEndpoint: null,
+    connSeq: 10,
+  })
+  for (const s of sockets) if (!s.destroyed) s.write(rebindFrame)
+  await waitFor(() => logs.some(l => l.includes('re-anchored') && l.includes('endpoints changed')), 'pure UDP rebind logged')
+  await sleep(40)
+  assert.equal(hangingSettled, false, 'pure UDP rebind must keep active MuxSession stream alive')
+  assert.equal(engine.status().peers.find(p => p.nodeId === identityB.nodeId)?.path, 'relay', 'pure UDP rebind switches path to relay during re-punch')
+
+  // (b1) Peer connSeq change MUST reset MuxSession and abort open streams immediately.
+  currentPeerConnSeq = 11
+  const frame = wsFrame({
+    type: 'punch-coordinate',
+    peerNodeId: identityB.nodeId,
+    publicKeyHex: identityB.publicKeyHex,
+    lanEndpoints: [endpointOf(socketB)],
+    reflexiveEndpoint: null,
+    connSeq: 11,
+  })
+  for (const s of sockets) if (!s.destroyed) s.write(frame)
+
+  await assert.rejects(
+    Promise.race([
+      hangingFetch,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('hangingFetch did not reset promptly')), 500)),
+    ]),
+    /peer session reset/,
+    'connSeq change must reset MuxSession and abort open streams',
+  )
+  assert.equal(engine.status().peers.find(p => p.nodeId === identityB.nodeId)?.path, 'relay', 'path resets to relay on connSeq change')
+  assert.ok(logs.some(l => l.includes('re-anchored') && l.includes('connSeq changed')), 're-anchored logged on connSeq change')
+
+  // (b2) Local WS reconnect MUST also reset MuxSession even when peer connSeq stays 11.
+  const hangingFetchAfterWs = mountedFetch('http://peer/hang-ws')
+  hangingFetchAfterWs.catch(() => {})
+  await sleep(10)
+  logs.length = 0
+  for (const s of sockets) s.destroy()
+  await waitFor(() => engine.status().gatewayState === 'offline', 'ws offline before reconnect')
+  clock.advance(1100)
+  await waitFor(() => engine.status().gatewayState === 'authorized', 'ws reconnected')
+  await assert.rejects(
+    Promise.race([
+      hangingFetchAfterWs,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('hangingFetchAfterWs did not reset promptly')), 500)),
+    ]),
+    /peer session reset/,
+    'local WS reconnect must reset MuxSession and abort open streams',
+  )
+  assert.ok(logs.some(l => l.includes('re-anchored') && l.includes('local network changed')), 're-anchored logged on WS reconnect')
+})
+
+test('T3: local WS reconnect welcome re-anchors unchanged direct peer, clears stale reflexiveEndpoint:null, and wakes relayPool', async (t) => {
+  const env = await buildPair(t, { cap: 0 })
+  await env.waitReady()
+  assert.equal(env.peerOf().path, 'lan')
+  assert.ok(env.reconnectCalls.includes(env.identityB.nodeId), 'initial direct ready woke relayPool')
+
+  // Seed a stale reflexiveEndpoint first (additive so direct stays up).
+  env.gateway.send({
+    type: 'punch-coordinate',
+    peerNodeId: env.identityB.nodeId,
+    publicKeyHex: env.identityB.publicKeyHex,
+    lanEndpoints: [endpointOf(env.socketB)],
+    reflexiveEndpoint: '203.0.113.99:5555',
+  })
+  await sleep(50)
+
+  env.logs.length = 0
+  env.reconnectCalls.length = 0
+  // Hold UDP briefly so we can observe the intermediate path === 'relay' before fast loopback re-punch finishes.
+  env.gateB.dropAll = true
+  // Simulate local WS drop -> reconnect -> welcome with SAME endpoints and reflexiveEndpoint: null.
+  env.gateway.dropConnections()
+  await waitFor(() => env.engine.status().gatewayState === 'offline', 'ws offline after drop')
+  env.clock.advance(1100) // wsReconnectBaseMs = 1000
+  await waitFor(() => env.engine.status().gatewayState === 'authorized', 'ws reconnected')
+
+  assert.ok(env.logs.some(l => l.includes('re-anchored')), 'WS reconnect welcome must re-anchor existing direct peer even with unchanged endpoints')
+  assert.equal(env.peerOf().path, 'relay', 'path falls back to relay while re-punching after WS reconnect')
+  // Check beginPunch candidates count: 1 LAN endpoint only (stale reflexiveEndpoint cleared by explicit null).
+  const bpLog = env.logs.filter(l => l.includes(`beginPunch(${env.identityB.nodeId})`)).at(-1)
+  assert.match(bpLog, /candidates=1 /, 'stale reflexiveEndpoint cleared on explicit null')
+
+  // Unblock UDP and confirm re-punch recovers direct path and wakes relayPool.
+  env.gateB.dropAll = false
+  env.clock.advance(5000)
+  await waitFor(() => env.peerOf().path === 'lan', 'direct path recovers after WS reconnect')
+  assert.ok(env.reconnectCalls.includes(env.identityB.nodeId), 'post-reconnect path recovery wakes relayPool')
+})
+
+test('T3: joinNetwork switching networkId does not inherit disabledNodes or gateway caps from previous network', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-t3-netiso-'))
+  const stateFile = path.join(home, 'state.json')
+  const identity = ensurePeerIdentity(stateFile)
+  const pool = createRelayPool({
+    stateFile,
+    skipPersistedServers: true,
+    computeOwnFingerprints: () => ({}),
+    createClient: () => ({ state: 'online', subscribe: () => () => {}, connect: async () => {}, stop() {} }),
+  })
+  const engine = createPeerEngine({
+    stateFile,
+    identity,
+    relayPool: pool,
+    relayHandler: () => undefined,
+    relaySecret: () => 'test',
+    serverName: () => 'node-iso',
+    udpProbe: null,
+  })
+  t.after(() => {
+    engine.stop()
+    pool.stop()
+    fs.rmSync(home, { recursive: true, force: true })
+  })
+
+  writePeerNetwork(stateFile, {
+    gatewayWsUrl: 'ws://127.0.0.1:1',
+    gatewayHttpOrigin: 'http://127.0.0.1:1',
+    networkId: '1111111111111111',
+    joinedAt: 1,
+    disabledNodes: ['deadbeef'],
+    maxPeersFromGateway: 12,
+    peerDirectMaxRttMsFromGateway: 80,
+  })
+
+  // Join a DIFFERENT networkId: old disabledNodes/maxPeersFromGateway/peerDirectMaxRttMsFromGateway must NOT carry over.
+  const otherInvite = `zr-net://127.0.0.1:1/2222222222222222#secret`
+  assert.deepEqual(await engine.joinNetwork(otherInvite), { ok: true })
+  const afterOther = readPeerNetwork(stateFile)
+  assert.equal(afterOther.networkId, '2222222222222222')
+  assert.equal(afterOther.disabledNodes, undefined)
+  assert.equal(afterOther.maxPeersFromGateway, undefined)
+  assert.equal(afterOther.peerDirectMaxRttMsFromGateway, undefined)
+  assert.equal(engine.status().directCapMs, 300)
+  assert.equal(engine.status().directCapSource, 'default')
 })

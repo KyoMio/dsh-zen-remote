@@ -92,7 +92,9 @@ Environment defaults for signup, max networks per user, default max peers, and r
 
 Network `maxPeers` counts the local machine itself: a peer mounts up to `maxPeers - 1` remote devices by default, further bounded by any local `maxServers` cap. Authorized, paused, and identity-blocked (`mismatch`) members occupy seats; pending and revoked entries do not. Lowering `maxPeers` keeps existing mounts intact while blocking new seats; changing the default max peers applies only to newly created networks.
 
-The console displays locally rejected identities as *"Blocked"* (*已阻断*), unknown RTT as `—`, and measured sub-millisecond RTT as `0 ms`. Rates use 5-second sliding windows where `KB/s` = `1024 B/s` (legacy `Kbps` API field names are retained for compatibility and do not denote kilobits/s). The active network's header stays live over SSE; visible admin pages poll online counts and relay rates every 3 seconds without overlapping slow requests and cancel polling when hidden or closed.
+Each network also defines a **Direct Max RTT** (`peerDirectMaxRttMs`, editable per network in the console; integer `0–10000` ms, default `300`, `0` = unlimited): when measured direct RTT stays above this threshold, traffic demotes to gateway ciphertext relay, and upgrades back only after two consecutive samples `≤ 0.7×` the cap. The gateway pushes this threshold in welcome payloads and live network updates so all peers apply the same rule without rejoining or maintaining separate local overrides.
+
+The console displays locally rejected identities as *"Blocked"* (*已阻断*), unknown RTT as `—`, and measured sub-millisecond RTT as `0 ms`. Overview cards, device list rows, and device details apply **strict bilateral direct merging**: a pair counts as direct only when both sides report direct links; if one side reports relay or has not yet reported while the other reports direct, both display *"Relayed via gateway"* with `—` latency, and fully direct devices never show a simultaneous *"Relaying"* badge. Rates use 5-second sliding windows where `KB/s` = `1024 B/s` (legacy `Kbps` API field names are retained for compatibility and do not denote kilobits/s). The active network's header stays live over SSE; visible admin pages poll online counts and relay rates every 3 seconds without overlapping slow requests and cancel polling when hidden or closed.
 
 ## Native TLS (Recommended) & Reverse Proxy Notes
 
@@ -173,7 +175,7 @@ Admins access **Gateway Admin** from the top bar, organized into six functional 
 
 Back up both the database and `master.key` before upgrading the gateway, then upgrade peer plugins machine by machine (updating the desktop plugin alone does not update the standalone gateway container).
 
-Paused peers keep a restricted control connection alive so resuming does not require re-joining. Initial hole-punching falls back to relay after ~1s, lost direct routes detect timeouts after 15s from the last valid packet, and relayed sessions re-probe for direct paths every 60s. Known-length uploads allow an extra 20s recovery window subject to reachability.
+Paused peers keep a restricted control connection alive so resuming does not require re-joining. Initial hole-punching falls back to relay after ~1s, lost direct routes detect timeouts after 15s from the last valid packet, and relayed sessions re-probe for direct paths with `5s → 15s → 60s` progressive backoff. The WebSocket control plane runs `10s` Ping / `15s` Pong keepalives to reap half-open connections quickly and propagates monotonic `connSeq` epochs so both sides symmetrically re-anchor after reconnects. Known-length uploads allow an extra 20s recovery window subject to reachability.
 
 On `SIGTERM` / `SIGINT`, the gateway stops accepting new connections, flushes final telemetry within a 5s shutdown budget (up to 4s extra cleanup grace on error), and closes the database cleanly; set container stop grace periods accordingly.
 
