@@ -1,5 +1,8 @@
 # Build and push the standalone gateway-server multi-arch Docker image to Docker Hub.
-# Triggers on version tag pushes (v*) and manual workflow_dispatch runs.
+# Versioned independently from the root dsh-zen-remote plugin package:
+#   - Automatic release on tag push matching `gateway-v*` (e.g. `gateway-v0.1.0`),
+#     checked against gateway-server/package.json#version.
+#   - Manual runs via workflow_dispatch (defaults to `edge` on branches).
 #
 # Required repository secrets:
 #   DOCKERHUB_USERNAME   Docker Hub username (e.g. kyomio)
@@ -10,7 +13,7 @@ name: gateway-docker
 
 on:
   push:
-    tags: ['v*']
+    tags: ['gateway-v*']
   workflow_dispatch:
     inputs:
       tag:
@@ -38,23 +41,66 @@ jobs:
       contents: read
 
     steps:
-      - name: Check Docker Hub credentials and resolve image name
+      - uses: actions/checkout@v7
+
+      - name: Check credentials and resolve image tags
         id: target
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+          INPUT_TAG: ${{ inputs.tag }}
+          ALSO_LATEST: ${{ inputs.also_latest }}
         run: |
           if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
             echo "Missing secrets: please configure DOCKERHUB_USERNAME and DOCKERHUB_TOKEN in repository Actions secrets." >&2
             exit 1
           fi
+
           raw_repo="${DOCKERHUB_REPOSITORY:-${DOCKERHUB_USERNAME}/zr-gateway}"
           image="$(printf '%s' "$raw_repo" | tr '[:upper:]' '[:lower:]')"
           echo "image=$image" >> "$GITHUB_OUTPUT"
-          echo "Resolved target image: docker.io/$image"
 
-      - uses: actions/checkout@v7
+          tags=""
+          append_tag() {
+            local t="$1"
+            if [ -n "$tags" ]; then
+              tags="${tags}"$'\n'"${image}:${t}"
+            else
+              tags="${image}:${t}"
+            fi
+          }
+
+          if [ -z "$INPUT_TAG" ] && [[ "$GITHUB_REF" == refs/tags/gateway-v* ]]; then
+            pkg_ver="$(node -p "require('./gateway-server/package.json').version")"
+            expected="gateway-v${pkg_ver}"
+            if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+              echo "Tag $GITHUB_REF_NAME does not match gateway-server/package.json ($expected)" >&2
+              exit 1
+            fi
+            append_tag "$pkg_ver"
+            if [[ "$pkg_ver" =~ ^([0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+              append_tag "${BASH_REMATCH[1]}"
+              append_tag "latest"
+            fi
+          else
+            if [ -n "$INPUT_TAG" ]; then
+              append_tag "$INPUT_TAG"
+            else
+              append_tag "edge"
+            fi
+            if [ "$ALSO_LATEST" = "true" ]; then
+              append_tag "latest"
+            fi
+          fi
+
+          {
+            echo "tags<<EOF"
+            printf '%s\n' "$tags"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved image tags:"
+          printf '%s\n' "$tags"
 
       - uses: docker/setup-qemu-action@v3
 
@@ -66,17 +112,12 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract Docker metadata
+      - name: Extract OCI labels
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ steps.target.outputs.image }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag == '' && !startsWith(github.ref, 'refs/tags/') }}
-            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
-            type=raw,value=latest,enable=${{ (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')) || (github.event_name == 'workflow_dispatch' && inputs.also_latest) }}
+          flavor: latest=false
 
       - name: Build and push gateway-server image
         uses: docker/build-push-action@v6
@@ -85,7 +126,7 @@ jobs:
           file: ./gateway-server/Dockerfile
           platforms: ${{ inputs.platforms || 'linux/amd64,linux/arm64' }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.target.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
