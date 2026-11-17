@@ -122,6 +122,12 @@ export interface ZenRemoteConfig {
    * a flip applies without reloading the row; deliberately NOT in
    * RESTART_FIELDS. */
   logLevel: 'info' | 'debug' | 'warn'
+  /** Hide remote workspaces (`zr~...`) that currently have no active
+   * (non-archived, non-blank) shared sessions from the sidebar tree and
+   * mobile workspace filter drawer, while keeping all workspaces available
+   * in New Session workspace pickers. Volatile — read live per request,
+   * deliberately NOT in RESTART_FIELDS. Default: true. */
+  hideInactiveRemoteWorkspaces: boolean
 }
 
 function defaultServerName(): string {
@@ -156,6 +162,7 @@ export const DEFAULTS: ZenRemoteConfig = {
   ingressAcmeEmail: '',
   ingressPublicUrl: '',
   logLevel: 'info',
+  hideInactiveRemoteWorkspaces: true,
 }
 
 // --- per-field validators -------------------------------------------------
@@ -405,6 +412,7 @@ const FIELDS: { [K in keyof ZenRemoteConfig]: FieldResolver<ZenRemoteConfig[K]> 
   // LAN_GATE_* convention. Live-read by the ring getter — not in
   // RESTART_FIELDS.
   logLevel: { env: envOneOf('LAN_GATE_LOG_LEVEL', 'info', 'debug', 'warn'), row: oneOf('info', 'debug', 'warn'), file: oneOf('info', 'debug', 'warn') },
+  hideInactiveRemoteWorkspaces: { row: boolLike, file: boolLike },
 }
 
 /**
@@ -498,6 +506,7 @@ export function resolveConfig(
     ingressAcmeEmail: resolveField('ingressAcmeEmail', safeRow, safeFile, env, sources),
     ingressPublicUrl: resolveField('ingressPublicUrl', safeRow, safeFile, env, sources),
     logLevel: resolveField('logLevel', safeRow, safeFile, env, sources),
+    hideInactiveRemoteWorkspaces: resolveField('hideInactiveRemoteWorkspaces', safeRow, safeFile, env, sources),
   }
   return { values, sources }
 }
@@ -630,6 +639,9 @@ export const Config = z.object({
   // The log threshold (T2): read live by the ring's level getter — a flip
   // must apply to the next line without reloading the row.
   logLevel: z.any().volatile(),
+  // Hide empty/inactive remote workspaces in the sidebar while keeping them
+  // selectable in New Session workspace pickers (live-read, default true).
+  hideInactiveRemoteWorkspaces: z.any().volatile(),
   // Client-half knobs (T16): where the phone finds the gateway, and the
   // pairing token it presents. `role('secret')` keeps the token out of every
   // settings wire surface, like the verifier plugin's API key.

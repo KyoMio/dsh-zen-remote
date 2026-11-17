@@ -1279,6 +1279,7 @@ test('T17: the client-config route re-reads volatile row fields and the effectiv
     const first = JSON.parse((await request(server.address().port, { method: 'GET', path: '/_dsh/mobile-nav/client-config' })).body)
     assert.equal(first.role, 'host', 'the effective role rides the response (T17 role probe)')
     assert.equal(first.turnFoldDesktop, false)
+    assert.equal(first.hideInactiveRemoteWorkspaces, true)
     assert.ok(!('keyboardLiftRatio' in first), 'an unset knob is omitted, not zeroed')
 
     // Same process, same route, same row object: only the volatile getters
@@ -1286,8 +1287,10 @@ test('T17: the client-config route re-reads volatile row fields and the effectiv
     turnFold = true
     liftRatio = 0.9
     row.role = 'client'
+    row.hideInactiveRemoteWorkspaces = false
     const second = JSON.parse((await request(server.address().port, { method: 'GET', path: '/_dsh/mobile-nav/client-config' })).body)
     assert.equal(second.turnFoldDesktop, true)
+    assert.equal(second.hideInactiveRemoteWorkspaces, false)
     assert.equal(second.keyboardLiftRatio, 0.9)
     assert.equal(second.role, 'client', 'the role follows the row without a reload')
   } finally {

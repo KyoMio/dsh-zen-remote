@@ -37,6 +37,7 @@ import type { ReactNode } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { Button, SettingsForm, SettingsValueField, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SettingsFormLabels } from '@deepseek-ai/dsh-client-ui-primitives'
+import { notifyClientConfigChanged } from '../client-config.ts'
 import {
   ADMIN_ACTION_ROUTE,
   ADMIN_PAIR_ROUTE,
@@ -1372,6 +1373,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
             const streamInterceptAlreadyActive = clientView?.intercept?.installed === true
             void config.save().then((landed) => {
               if (!landed) return
+              notifyClientConfigChanged()
               if (shouldReloadAfterClientActivation({
                 wasEffectiveClient,
                 nowClientRole: config.savedRoleIsClient() || config.savedRoleIsPeer(),
@@ -1405,6 +1407,12 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
             t('settings.fieldServerName'),
             t(clientRole ? 'settings.fieldServerNameHintClient' : 'settings.fieldServerNameHint'),
             t('settings.invalidName'),
+          )}
+          {(clientRole || peerRole) && bool(
+            form.hideInactiveRemoteWorkspaces,
+            'hideInactiveRemoteWorkspaces',
+            t('settings.fieldHideInactiveRemoteWorkspaces'),
+            t('settings.fieldHideInactiveRemoteWorkspacesHint'),
           )}
           {reloadPending && <p className="zr-settings-status-line">{t('settings.reloadNote')}</p>}
 

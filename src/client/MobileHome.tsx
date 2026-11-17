@@ -22,6 +22,8 @@ import type { WorkspaceFilter } from './nav-store.ts'
 import type { MobileNavKey } from './locales.ts'
 import { dotState } from './session-dot.ts'
 import { decideNewSessionAction } from '../client-data/new-session.ts'
+import { hiddenRemoteWorkspaceIds } from '../client-data/remote-workspace-visibility.ts'
+import { CLIENT_CONFIG_CHANGED_EVENT, clientConfig } from './client-config.ts'
 import { MobileHomeChips, MobileHomeChipsSheetBody } from './MobileHomeChips.tsx'
 
 /** Full props for the phone home screen (shell.overlay entry). */
@@ -282,6 +284,21 @@ export function MobileHome({
   const sessions = useSessions((s) => s)
   const workspaces = useWorkspaces((s) => s)
   const [sheet, setSheet] = useState<'filter' | 'chips' | 'new-session' | null>(null)
+  const [hideInactiveRemote, setHideInactiveRemote] = useState(true)
+  useEffect(() => {
+    let cancelled = false
+    const load = (): void => {
+      void clientConfig().then((cfg) => {
+        if (!cancelled) setHideInactiveRemote(cfg.hideInactiveRemoteWorkspaces)
+      })
+    }
+    load()
+    window.addEventListener(CLIENT_CONFIG_CHANGED_EVENT, load)
+    return () => {
+      cancelled = true
+      window.removeEventListener(CLIENT_CONFIG_CHANGED_EVENT, load)
+    }
+  }, [])
   /** The one row whose archive action is swiped open (null = none). */
   const [swipeOpen, setSwipeOpen] = useState<SessionId | null>(null)
   // 0.1.2 的待处理交互来源；0.1.1 没有这个标准 prop，读到 undefined 时用一个
@@ -314,6 +331,20 @@ export function MobileHome({
   const selectedWorkspace = selected === 'all'
     ? undefined
     : workspaces.items.find((item) => item.workspaceId === selected)
+
+  const hiddenFilterWorkspaceIds = useMemo(() => {
+    if (!hideInactiveRemote) return new Set<string>()
+    return hiddenRemoteWorkspaceIds(workspaces.items, {
+      archivedIds: workspaces.archivedSessionIds,
+      sessionsById: sessions.byId,
+      currentSessionId: current,
+    })
+  }, [hideInactiveRemote, workspaces.items, workspaces.archivedSessionIds, sessions.byId, current])
+
+  const filterWorkspaces = useMemo(
+    () => workspaces.items.filter((item) => !hiddenFilterWorkspaceIds.has(item.workspaceId) || selected === item.workspaceId),
+    [workspaces.items, hiddenFilterWorkspaceIds, selected],
+  )
 
   const rows = useMemo(() => {
     const archived = new Set(workspaces.archivedSessionIds)
@@ -630,7 +661,7 @@ export function MobileHome({
                 >
                   {t('allWorkspaces')}
                 </button>
-                {workspaces.items.map((item) => (
+                {filterWorkspaces.map((item) => (
                   <button
                     key={item.workspaceId}
                     type="button"

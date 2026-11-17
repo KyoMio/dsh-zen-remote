@@ -1172,3 +1172,32 @@ test('PB-5 plugin bridge UI pure helpers and consentField', () => {
     assert.equal(readAdminBridgeRow(bad), undefined)
   }
 })
+
+test('hideInactiveRemoteWorkspaces defaults to true in client mode and writes false cleanly on toggle', async () => {
+  let savedOps = null
+  const scope = {
+    getSnapshot: () => ({
+      status: 'ready',
+      value: { role: 'client' },
+      base: {},
+      user: { role: 'client' },
+      revision: 1,
+      writable: true,
+    }),
+    subscribe: () => () => {},
+    mutate: async (ops) => {
+      savedOps = ops
+      return true
+    },
+  }
+  const ctrl = new ZenRemoteSettingsForm(scope)
+  assert.equal(ctrl.getSnapshot().hideInactiveRemoteWorkspaces.text, 'true')
+  assert.equal(ctrl.getSnapshot().dirty, false)
+
+  ctrl.stage('hideInactiveRemoteWorkspaces', 'false')
+  assert.equal(ctrl.getSnapshot().dirty, true)
+  assert.equal(ctrl.getSnapshot().restartPending, false)
+  const landed = await ctrl.save()
+  assert.equal(landed, true)
+  assert.deepEqual(savedOps, [{ op: 'set', path: ['hideInactiveRemoteWorkspaces'], value: false }])
+})

@@ -50,6 +50,8 @@ export const KEYBOARD_DEFAULTS: KeyboardTuning = {
 export interface ClientConfig {
   /** Fold each turn's process at every width, not just below the phone breakpoint. */
   turnFoldDesktop: boolean
+  /** Hide remote workspaces without active shared sessions in sidebars. Default: true. */
+  hideInactiveRemoteWorkspaces: boolean
   keyboard: KeyboardTuning
 }
 
@@ -66,6 +68,7 @@ export function parseClientConfig(body: unknown): ClientConfig {
     : {}
   return {
     turnFoldDesktop: row['turnFoldDesktop'] === true,
+    hideInactiveRemoteWorkspaces: row['hideInactiveRemoteWorkspaces'] !== false,
     keyboard: {
       liftRatio: num(row['keyboardLiftRatio'], KEYBOARD_DEFAULTS.liftRatio),
       liftMaxPx: num(row['keyboardLiftMaxPx'], KEYBOARD_DEFAULTS.liftMaxPx),
@@ -74,13 +77,27 @@ export function parseClientConfig(body: unknown): ClientConfig {
   }
 }
 
+export const CLIENT_CONFIG_CHANGED_EVENT = 'zr:client-config-changed'
+
 let cached: Promise<ClientConfig> | undefined
 
-/** The row config, fetched at most once per page load. Never rejects. */
-export function clientConfig(): Promise<ClientConfig> {
-  cached ??= fetch(CLIENT_CONFIG_ROUTE, { cache: 'no-store' })
+function fetchClientConfig(): Promise<ClientConfig> {
+  return fetch(CLIENT_CONFIG_ROUTE, { cache: 'no-store' })
     .then((res) => (res.ok ? res.json() as Promise<unknown> : undefined))
     .catch(() => undefined)
     .then(parseClientConfig)
+}
+
+/** The row config, fetched at most once per page load until invalidated. Never rejects. */
+export function clientConfig(): Promise<ClientConfig> {
+  cached ??= fetchClientConfig()
   return cached
+}
+
+/** Invalidate the cached client config and notify live subscribers (e.g. after settings save). */
+export function notifyClientConfigChanged(): void {
+  cached = undefined
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+    window.dispatchEvent(new CustomEvent(CLIENT_CONFIG_CHANGED_EVENT))
+  }
 }

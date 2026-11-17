@@ -253,6 +253,10 @@ export interface MobileNavConfig {
    * itself in via `?mobile-nav-turn-fold=1` when this is off. Volatile:
    * re-read per request through `unwrapVolatile`. */
   turnFoldDesktop?: unknown
+  /** Hide remote workspaces with no active sessions from the sidebar tree and
+   * mobile workspace filter drawer while keeping New Session pickers complete.
+   * Default true. Volatile: re-read per request. */
+  hideInactiveRemoteWorkspaces?: unknown
   /** Calibration for the composer lift used when a phone's keyboard is
    * invisible to the browser (src/client/effects/keyboard-avoid.ts). Leave
    * every one of these unset to keep the shipped estimate — the route omits
@@ -2344,8 +2348,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } })
           return
         }
+        const resolved = resolveConfig(config, readFileConfig(), process.env)
         responseJson(res, 200, {
-          role: resolveConfig(config, readFileConfig(), process.env).values.role,
+          role: resolved.values.role,
+          hideInactiveRemoteWorkspaces: resolved.values.hideInactiveRemoteWorkspaces,
           turnFoldDesktop: unwrapVolatile(config.turnFoldDesktop) === true,
           ...clamped('keyboardLiftRatio', unwrapVolatile(config.keyboardLiftRatio) as number | undefined, 0, 1),
           ...clamped('keyboardLiftMaxPx', unwrapVolatile(config.keyboardLiftMaxPx) as number | undefined, 0, 2000),

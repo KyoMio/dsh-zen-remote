@@ -183,6 +183,8 @@ export declare const zh: {
     readonly 'settings.fieldIdleHoursHint': "超过该时长无新活动时，自动关闭远程连接。运行中或等待中的会话不计时。默认 48，取值大于 0 且不超过 8760。";
     readonly 'settings.fieldAutoShare': "自动共享新会话";
     readonly 'settings.fieldAutoShareHint': "新建的会话自动共享给已配对的设备。";
+    readonly 'settings.fieldHideInactiveRemoteWorkspaces': "侧栏隐藏无活跃会话的远程工作区";
+    readonly 'settings.fieldHideInactiveRemoteWorkspacesHint': "开启后，没有活跃共享会话的远程工作区不在侧栏显示，但新建会话选择工作区时仍可看到。";
     readonly 'settings.invalidName': "名称需要 1–40 个字符";
     readonly 'settings.invalidHours': "需要大于 0 且不超过 8760 的数字";
     readonly 'settings.remoteNotice': "配对与设备管理只能在服务端本机操作";
