@@ -72,6 +72,10 @@ export interface MobileNavConfig {
      * itself in via `?mobile-nav-turn-fold=1` when this is off. Volatile:
      * re-read per request through `unwrapVolatile`. */
     turnFoldDesktop?: unknown;
+    /** Hide remote workspaces with no active sessions from the sidebar tree and
+     * mobile workspace filter drawer while keeping New Session pickers complete.
+     * Default true. Volatile: re-read per request. */
+    hideInactiveRemoteWorkspaces?: unknown;
     /** Calibration for the composer lift used when a phone's keyboard is
      * invisible to the browser (src/client/effects/keyboard-avoid.ts). Leave
      * every one of these unset to keep the shipped estimate — the route omits

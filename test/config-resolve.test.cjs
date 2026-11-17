@@ -506,6 +506,7 @@ test('a fully populated Config row resolves with EVERY source = row (T17)', asyn
     ingressMode: 'caddy', ingressDomain: 'dsh.example.com', ingressHttpsPort: 8443,
     ingressAcmeEmail: 'acme@example.com', ingressPublicUrl: 'https://dsh.example.com:8443',
     logLevel: 'debug',
+    hideInactiveRemoteWorkspaces: false,
     serverUrl: 'https://gw.example', deviceToken: 'tok',
     turnFoldDesktop: true, keyboardLiftRatio: 0.5, keyboardLiftMaxPx: 300, keyboardSafetyPadPx: 10, maxUploadBytes: 1024,
   }
@@ -607,4 +608,16 @@ test('writeCliConfig writes maxServers to the file layer and refuses under the e
   } finally {
     fs.rmSync(home, { recursive: true, force: true })
   }
+})
+
+test('hideInactiveRemoteWorkspaces: default true, volatile, not a restart field', async () => {
+  const { resolveConfig, DEFAULTS, Config } = await load()
+  const { RESTART_FIELDS } = await import(RESTART_FIELDS_URL)
+  assert.equal(DEFAULTS.hideInactiveRemoteWorkspaces, true)
+  assert.equal(resolveConfig({}, {}, {}).values.hideInactiveRemoteWorkspaces, true)
+  assert.equal(resolveConfig({ hideInactiveRemoteWorkspaces: false }, {}, {}).values.hideInactiveRemoteWorkspaces, false)
+  assert.equal(resolveConfig({}, { hideInactiveRemoteWorkspaces: false }, {}).values.hideInactiveRemoteWorkspaces, false)
+  assert.equal(resolveConfig({ hideInactiveRemoteWorkspaces: 'bad' }, {}, {}).values.hideInactiveRemoteWorkspaces, true)
+  assert.ok(!RESTART_FIELDS.includes('hideInactiveRemoteWorkspaces'))
+  assert.equal(Config.dict.hideInactiveRemoteWorkspaces.meta?.volatile, true)
 })

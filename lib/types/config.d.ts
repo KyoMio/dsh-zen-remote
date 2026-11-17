@@ -113,6 +113,12 @@ export interface ZenRemoteConfig {
      * a flip applies without reloading the row; deliberately NOT in
      * RESTART_FIELDS. */
     logLevel: 'info' | 'debug' | 'warn';
+    /** Hide remote workspaces (`zr~...`) that currently have no active
+     * (non-archived, non-blank) shared sessions from the sidebar tree and
+     * mobile workspace filter drawer, while keeping all workspaces available
+     * in New Session workspace pickers. Volatile — read live per request,
+     * deliberately NOT in RESTART_FIELDS. Default: true. */
+    hideInactiveRemoteWorkspaces: boolean;
 }
 /** Defaults, one per field — exactly what layer 4 hands back. */
 export declare const DEFAULTS: ZenRemoteConfig;
@@ -235,6 +241,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     ingressAcmeEmail: z<any, any, "volatile">;
     ingressPublicUrl: z<any, any, "volatile">;
     logLevel: z<any, any, "volatile">;
+    hideInactiveRemoteWorkspaces: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;
@@ -269,6 +276,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     ingressAcmeEmail: z<any, any, "volatile">;
     ingressPublicUrl: z<any, any, "volatile">;
     logLevel: z<any, any, "volatile">;
+    hideInactiveRemoteWorkspaces: z<any, any, "volatile">;
     serverUrl: z<any, any, "volatile">;
     deviceToken: z<string, string, "volatile">;
     turnFoldDesktop: z<any, any, "volatile">;

@@ -1135,10 +1135,10 @@ export function oneOfField(field: string, options: readonly string[]): SettingsF
 }
 
 /** Boolean field staged as 'true'/'false' draft text (rendered as a checkbox). */
-export function boolField(field: string): SettingsFieldSpec {
+export function boolField(field: string, defaultValue = false): SettingsFieldSpec {
   return {
     field,
-    format: (value) => (value === true ? 'true' : 'false'),
+    format: (value) => ((defaultValue ? value !== false : value === true) ? 'true' : 'false'),
     parse: (text) => (text === 'true' || text === 'false' ? { kind: 'set', value: text === 'true' } : undefined),
   }
 }
@@ -1203,6 +1203,7 @@ export type SettingsFieldName =
   | 'serverName'
   | 'idleHours'
   | 'autoShareNewSessions'
+  | 'hideInactiveRemoteWorkspaces'
   | 'pluginBridgeConsent'
 
 /** Longest legal `serverName`, mirroring src/config.ts's cap. */
@@ -1230,6 +1231,7 @@ export const SETTINGS_FIELDS: readonly SettingsFieldSpec[] = [
   nameField('serverName', SERVER_NAME_MAX),
   hoursField('idleHours', IDLE_HOURS_MAX),
   boolField('autoShareNewSessions'),
+  boolField('hideInactiveRemoteWorkspaces', true),
   consentField('pluginBridgeConsent'),
 ]
 
@@ -1448,6 +1450,7 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
   serverName: SettingsFieldState
   idleHours: SettingsFieldState
   autoShareNewSessions: SettingsFieldState
+  hideInactiveRemoteWorkspaces: SettingsFieldState
   /** The consent map's staged state (PB-5). No text control renders it — the
    * 插件桥 toggles stage the next map wholesale — but its `invalid` flag
    * (a malformed draft) still gates the save like any field's. */

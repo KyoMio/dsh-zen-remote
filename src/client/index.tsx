@@ -44,6 +44,7 @@ import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
 import { installModelGroupSide } from './effects/model-group-side.ts'
+import { installRemoteWorkspaceVisibility } from './effects/remote-workspace-visibility.ts'
 import { DeliverableDownload, DocumentDownload } from './RemoteFileDownload.tsx'
 import { createSaveRemoteFile } from './remote-file-save.ts'
 
@@ -176,6 +177,12 @@ export function apply(ctx: ClientContext): void {
   // client-data/model-group-side.ts），CSS 按标隐藏。同样必须在桌面门之前挂载：
   // 桌面端子客户端的模型选单一样要分侧，桌面无手机外壳不影响它。
   installModelGroupSide(ctx)
+
+  // 侧栏隐藏无活跃共享会话的远程工作区（client / peer 角色，默认开启，见
+  // effects/remote-workspace-visibility.ts）：必须在桌面门之前挂载，桌面壳
+  // 内的子客户端 / 节点端同样生效；新建会话选工作区菜单（role="menu"）
+  // 不受影响，仍可见全部工作区。
+  installRemoteWorkspaceVisibility(ctx)
 
   // 2.2.6 远程会话产物下载：子客户端最常见的诉求是「把服务端工作区里刚产出的
   // 文件拿到本机」。DSH 官方的产物卡片只有预览，打开类动作（present.open /

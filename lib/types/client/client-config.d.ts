@@ -42,10 +42,15 @@ export declare const KEYBOARD_DEFAULTS: KeyboardTuning;
 export interface ClientConfig {
     /** Fold each turn's process at every width, not just below the phone breakpoint. */
     turnFoldDesktop: boolean;
+    /** Hide remote workspaces without active shared sessions in sidebars. Default: true. */
+    hideInactiveRemoteWorkspaces: boolean;
     keyboard: KeyboardTuning;
 }
 /** Parse one route body. Exported for test/mobile-viewport-compat.test.mjs. */
 export declare function parseClientConfig(body: unknown): ClientConfig;
-/** The row config, fetched at most once per page load. Never rejects. */
+export declare const CLIENT_CONFIG_CHANGED_EVENT = "zr:client-config-changed";
+/** The row config, fetched at most once per page load until invalidated. Never rejects. */
 export declare function clientConfig(): Promise<ClientConfig>;
+/** Invalidate the cached client config and notify live subscribers (e.g. after settings save). */
+export declare function notifyClientConfigChanged(): void;
 //# sourceMappingURL=client-config.d.ts.map

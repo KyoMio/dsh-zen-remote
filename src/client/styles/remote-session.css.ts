@@ -362,4 +362,12 @@ html[data-zr-remote-session="1"] .zr-download-action[data-phase="error"] {
   color: var(--dsw-alias-state-error-primary, #dc2626);
   border-color: var(--dsw-alias-state-error-primary, #dc2626);
 }
+
+/* ---------- hide inactive remote workspaces in the sidebar tree ----------
+   Only targets sidebar [role="tree"] workspace rows stamped by
+   effects/remote-workspace-visibility.ts; never touches New Session
+   workspace pickers (role="menu") or local workspaces. */
+[role="tree"] [role="treeitem"][data-row-key^="workspace:zr~"][data-zr-hidden-ws="1"] {
+  display: none !important;
+}
 `

@@ -686,7 +686,7 @@ export declare function claimDeviceNameOf(displayText: string, fallback: string)
 /** One-of field over a fixed vocabulary (rendered as a select). */
 export declare function oneOfField(field: string, options: readonly string[]): SettingsFieldSpec;
 /** Boolean field staged as 'true'/'false' draft text (rendered as a checkbox). */
-export declare function boolField(field: string): SettingsFieldSpec;
+export declare function boolField(field: string, defaultValue?: boolean): SettingsFieldSpec;
 /**
  * `pluginBridgeConsent` (PB-5): a name → boolean map staged as its canonical
  * JSON draft. Nothing renders it as text — the 插件桥 toggles stage the NEXT
@@ -700,7 +700,7 @@ export declare function boolField(field: string): SettingsFieldSpec;
  */
 export declare function consentField(field: string): SettingsFieldSpec;
 /** Names of the row fields the settings page edits, in group order. */
-export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushEnabled' | 'pushSessionName' | 'pushDebounceMs' | 'lang' | 'logLevel' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'pluginBridgeConsent';
+export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushEnabled' | 'pushSessionName' | 'pushDebounceMs' | 'lang' | 'logLevel' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'hideInactiveRemoteWorkspaces' | 'pluginBridgeConsent';
 /** Longest legal `serverName`, mirroring src/config.ts's cap. */
 export declare const SERVER_NAME_MAX = 40;
 /** Upper bound of `idleHours`, mirroring src/config.ts. */
@@ -825,6 +825,7 @@ export interface ZenRemoteFormState extends SettingsFormShellState {
     serverName: SettingsFieldState;
     idleHours: SettingsFieldState;
     autoShareNewSessions: SettingsFieldState;
+    hideInactiveRemoteWorkspaces: SettingsFieldState;
     /** The consent map's staged state (PB-5). No text control renders it — the
      * 插件桥 toggles stage the next map wholesale — but its `invalid` flag
      * (a malformed draft) still gates the save like any field's. */

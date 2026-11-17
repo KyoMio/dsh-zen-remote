@@ -74,6 +74,10 @@ test('keyboard-avoid geometry, safetyPad, composerLift, CSS _root transform targ
   assert.equal(parseClientConfig({ keyboardLiftRatio: 0.5 }).keyboard.liftRatio, 0.5)
   assert.equal(parseClientConfig({ keyboardSafetyPadPx: 0 }).keyboard.safetyPadPx, 0)
   assert.equal(parseClientConfig({ turnFoldDesktop: true }).turnFoldDesktop, true)
+  assert.equal(parseClientConfig(undefined).hideInactiveRemoteWorkspaces, true)
+  assert.equal(parseClientConfig({}).hideInactiveRemoteWorkspaces, true)
+  assert.equal(parseClientConfig({ hideInactiveRemoteWorkspaces: false }).hideInactiveRemoteWorkspaces, false)
+  assert.equal(parseClientConfig({ hideInactiveRemoteWorkspaces: 'false' }).hideInactiveRemoteWorkspaces, true)
 
   assert.deepEqual(clamped('keyboardLiftRatio', 5, 0, 1), { keyboardLiftRatio: 1 })
   assert.deepEqual(clamped('keyboardLiftRatio', -2, 0, 1), { keyboardLiftRatio: 0 })
