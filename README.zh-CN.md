@@ -1,8 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo/dsh-zen-remote-horizontal-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/logo/dsh-zen-remote-horizontal-color.svg">
-    <img src="assets/logo/dsh-zen-remote-horizontal-color.svg" alt="dsh-zen-remote" width="420">
+    <img src="assets/logo/dsh-zen-remote-horizontal-adaptive.svg" alt="dsh-zen-remote" width="420">
   </picture>
 </p>
 

@@ -15,8 +15,8 @@
 | Small-size symbol (16–24 px) | `dsh-zen-remote-symbol-small.svg` | Favicons, tray icons, tight toolbars (widened tunnel gap) |
 | One-colour symbol | `dsh-zen-remote-symbol-black.svg`, `-white.svg`, `-mono-3d5cff.svg` | Monochrome print, embossed tiles, single-ink overlays |
 | Containers | `dsh-zen-remote-symbol-square.svg`, `-favicon.svg`, `-app-icon.svg` | Avatars, browser tabs, rounded launcher tiles (`#3D5CFF` + `#FFFFFF`) |
-| Horizontal lockup | `dsh-zen-remote-horizontal-{color,dark,black,white}.svg` | README header, docs banner, desktop top bar |
-| Stacked lockup | `dsh-zen-remote-stacked-{color,dark,black,white}.svg` | Narrow viewports, social/hero cards, splash screens |
+| Horizontal lockup | `dsh-zen-remote-horizontal-{color,dark,adaptive,black,white}.svg` | README header, docs banner, desktop top bar (`adaptive` stays legible on both `#FFFFFF` & `#0D1117`) |
+| Stacked lockup | `dsh-zen-remote-stacked-{color,dark,adaptive,black,white}.svg` | Narrow viewports, social/hero cards, splash screens |
 | Wordmark only | `dsh-zen-remote-wordmark-{color,black,white}.svg` | Contexts where the symbol is already anchored nearby |
 | Raster & Web/PWA bundle | `png/*-512|1024.png`, `web/favicon.ico`, `web/icon-*.png`, `web/site.webmanifest` | Production HTML `<head>`, PWA manifest, documentation previews |
 
